@@ -1,4 +1,5 @@
 """Bounded full-model correctness on the existing SP5-SP7 serving group."""
+from contextlib import contextmanager
 import datetime as dt
 import hashlib
 import json
@@ -7,6 +8,7 @@ from pathlib import Path
 import signal
 import subprocess
 import time
+import traceback
 
 from serving_verdicts import verdict, compare
 
@@ -131,17 +133,48 @@ def collect_logs(c, out, before):
     for node in c.recovery.NODES:
         name = c.NAMES[list(c.recovery.NODES).index(node)]
         path = out / (name + '-engine.log')
-        with path.open('xb') as stream:
-            result = subprocess.run(['ssh', '-o', 'BatchMode=yes', '-o', 'ConnectTimeout=10',
-                                     'chris@' + node, 'docker', 'logs', '--tail=100000',
-                                     before[node]['id']], stdout=stream, stderr=subprocess.STDOUT, timeout=60)
-        data = path.read_bytes()
-        assert result.returncode == 0 and len(data) < 32 * 2**20, name + ': incomplete engine log'
-        text = data.decode(errors='replace')
-        assert not any(marker in text for marker in ('Traceback (most recent call last)',
-                       'CUDA error:', 'illegal memory access', 'device-side assert', 'EngineCore encountered a fatal error')), name + ': engine fault'
-        records[name] = {'bytes': len(data), 'sha256': hashlib.sha256(data).hexdigest()}
+        row = {'container': before[node]['id'], 'exit': None, 'issues': []}
+        try:
+            with path.open('xb') as stream:
+                result = subprocess.run(['ssh', '-o', 'BatchMode=yes', '-o', 'ConnectTimeout=10',
+                                         'chris@' + node, 'docker', 'logs', '--tail=100000',
+                                         before[node]['id']], stdout=stream, stderr=subprocess.STDOUT, timeout=60)
+            row['exit'] = result.returncode
+            if result.returncode:
+                row['issues'].append('log command failed')
+        except Exception as error:
+            row['issues'].append(repr(error))
+        if path.exists():
+            data = path.read_bytes()
+            row.update(bytes=len(data), sha256=hashlib.sha256(data).hexdigest())
+            if len(data) >= 32 * 2**20:
+                row['issues'].append('log size limit reached')
+            text = data.decode(errors='replace')
+            row['fault_markers'] = [marker for marker in ('Traceback (most recent call last)',
+                'CUDA error:', 'illegal memory access', 'device-side assert',
+                'EngineCore encountered a fatal error') if marker in text]
+            if row['fault_markers']:
+                row['issues'].append('engine fault')
+        else:
+            row['issues'].append('log file missing')
+        records[name] = row
     (out / 'engine-logs.json').write_text(json.dumps(records, indent=2) + '\n')
+    assert all(not row['issues'] for row in records.values()), records
+
+
+@contextmanager
+def retained_engine_logs(c, out, before):
+    """Retain every rank's log before recovery, preserving the original failure."""
+    try:
+        yield
+    except BaseException:
+        try:
+            collect_logs(c, out, before)
+        except BaseException:
+            (out / 'engine-log-collection-error.txt').write_text(traceback.format_exc())
+        raise
+    else:
+        collect_logs(c, out, before)
 
 
 def run_cohort(c, token, out, commit, held, heartbeat_errors):
@@ -169,23 +202,23 @@ def run_cohort(c, token, out, commit, held, heartbeat_errors):
         previous = before
         (arm / 'identity-before.json').write_text(json.dumps(before, indent=2) + '\n')
         arms[label] = {}
-        for stem, script, arguments in PROBES:
-            assert not heartbeat_errors
-            cool(c, token, arm, stem)
-            command = ['taskset', '-c', '4', 'python3', '-B', str(EXP / 'record_requests.py'),
-                       '--out', str(arm / (stem + '-requests')), '--token', token,
-                       str(ROOT / script), 'http://127.0.0.1:8000', *arguments]
-            run(c, token, command, arm, stem, floor_gib=3, timeout=900)
-            value = verdict(arm / (stem + '.txt'), stem)
-            arms[label][stem] = value
-            (arm / (stem + '-verdict.json')).write_text(json.dumps(value, indent=2) + '\n')
-            print(json.dumps({'arm': label, 'gate': stem, 'passed': value['passed'], 'issues': value['issues']}), flush=True)
-            # Negative functional results remain failures. Further correctness-only
-            # arms may characterize them; this controller has no timing path.
-        after = identity(c, commit, profile, IMAGES[kind])
-        assert all(after[node]['id'] == before[node]['id'] for node in before), 'container changed during requests'
-        (arm / 'identity-after.json').write_text(json.dumps(after, indent=2) + '\n')
-        collect_logs(c, arm, before)
+        with retained_engine_logs(c, arm, before):
+            for stem, script, arguments in PROBES:
+                assert not heartbeat_errors
+                cool(c, token, arm, stem)
+                command = ['taskset', '-c', '4', 'python3', '-B', str(EXP / 'record_requests.py'),
+                           '--out', str(arm / (stem + '-requests')), '--token', token,
+                           str(ROOT / script), 'http://127.0.0.1:8000', *arguments]
+                run(c, token, command, arm, stem, floor_gib=3, timeout=900)
+                value = verdict(arm / (stem + '.txt'), stem)
+                arms[label][stem] = value
+                (arm / (stem + '-verdict.json')).write_text(json.dumps(value, indent=2) + '\n')
+                print(json.dumps({'arm': label, 'gate': stem, 'passed': value['passed'], 'issues': value['issues']}), flush=True)
+                # Negative functional results remain failures. Further correctness-only
+                # arms may characterize them; this controller has no timing path.
+            after = identity(c, commit, profile, IMAGES[kind])
+            assert all(after[node]['id'] == before[node]['id'] for node in before), 'container changed during requests'
+            (arm / 'identity-after.json').write_text(json.dumps(after, indent=2) + '\n')
     final = compare(arms)
     final.update(arms=arms, scope='full-model correctness only; any failed gate blocks performance and selection')
     (out / 'functional-verdict.json').write_text(json.dumps(final, indent=2) + '\n')

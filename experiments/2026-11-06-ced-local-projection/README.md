@@ -507,7 +507,7 @@ its manifest, complete sizing attempts and CPU run receipt are retained under
 
 ## Prepared full-model correctness cohort
 
-The unexecuted serving mode runs C36 twice and the combined CED candidate twice
+The serving mode runs C36 twice and the combined CED candidate twice
 on the same existing SP5-SP7 group, with identical C36 serving arguments and
 separate fresh containers. It reuses the published CED cross-shape, temperature-0
 wide determinism (with and without logprobs), and seeded temperature-1 clients.
@@ -529,3 +529,35 @@ published C37 restore profile (`{home}/projects/spark-ds41f/cache`), while all
 serving source authority remains in the clean private deployment checkout. No
 cache data or ignored files are deployed. The first dry plans retained their
 expected publication/synchronization and missing-cache-path refusals.
+
+Window `f6fcd3eec45847d698778927a493167c`, controller `0b71390d`, synchronized
+SP5-SP7 and booted the first C36 control arm (`control-1`, image `3795255f`)
+with startup memory guards active (`5,488,353` KV tokens; minimum host memory
+available `8.77 GiB` on SP5, `10.59 GiB` on SP6 and `10.34 GiB` on SP7; hottest
+zone during startup `60.7 C`). Pre-probe passive cooling started below `55 C`
+(`50.7 C` on SP5, `51.3 C` on SP6 and `49.3 C` on SP7). During `control-1`'s
+first CED probe (`ced_cross_shape.py`), `/tokenize` and the first three
+completion requests (`8208` repeat 0/1 and `16352` repeat 0; the two `8208`
+repeats matched token and logprob hashes `2b5ef3a8d5f79900` /
+`d75204d9af786ff7`) completed before SP5's `thermal_zone0` and `thermal_zone4`
+reached `73.2 C` on the fourth completion request (`16352` repeat 1; GPU
+`63.0 C`, SP6 hottest `66.3 C`, SP7 hottest `63.1 C`, minimum host memory
+available `7.27 GiB` on SP5).
+
+The `70 C` thermal guard terminated the active client (`-15`) and triggered
+coordinated restoration. C37 (`e9eab460`,
+`experiments/2026-11-04-token-lsa/paged/restore.json`, image `e1ee7b19`) was
+restored, independently verified across all three nodes, and all holds were
+removed at `2026-11-06 03:59:22 UTC`. Neither `control-2` nor the candidate
+arms ran; this records a stock-cooling thermal limit on SP5 under sustained 16K
+prefill rather than a candidate correctness result. All three `control-1`
+engine logs were recovered and archived with the five recorded HTTP request
+bodies, startup/probe telemetry and restoration receipts in
+`receipts/sp567-window-5/` (no pre-shutdown engine fault markers; only
+post-failure `SIGTERM` shutdown traces when restoration began at `03:57:18 UTC`).
+
+`serving_gate.py` now wraps probe execution in `retained_engine_logs` so every
+rank's bounded engine log and `engine-logs.json` are collected before recovery
+replaces the containers, without masking the original probe exception or
+stopping on the first rank with an issue (`receipts/serving-guard-tests-4.txt`,
+22 guard tests passing).

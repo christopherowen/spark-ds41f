@@ -77,6 +77,49 @@ class ServingGuards(unittest.TestCase):
         with self.assertRaisesRegex(AssertionError, 'lease changed'):
             serving_gate.state(c, 'token', 3)
 
+    def test_failed_probe_retains_logs_before_original_error_returns(self):
+        with tempfile.TemporaryDirectory() as d:
+            with patch.object(serving_gate, 'collect_logs') as collect:
+                with self.assertRaisesRegex(ValueError, 'probe failure'):
+                    with serving_gate.retained_engine_logs(None, Path(d), {}):
+                        raise ValueError('probe failure')
+                collect.assert_called_once()
+
+    def test_log_failure_does_not_mask_failed_probe(self):
+        with tempfile.TemporaryDirectory() as d:
+            with patch.object(serving_gate, 'collect_logs', side_effect=OSError('log unavailable')):
+                with self.assertRaisesRegex(ValueError, 'probe failure'):
+                    with serving_gate.retained_engine_logs(None, Path(d), {}):
+                        raise ValueError('probe failure')
+            self.assertIn('log unavailable', (Path(d) / 'engine-log-collection-error.txt').read_text())
+
+    def test_successful_probe_still_fails_if_logs_are_unavailable(self):
+        with tempfile.TemporaryDirectory() as d:
+            with patch.object(serving_gate, 'collect_logs', side_effect=OSError('log unavailable')):
+                with self.assertRaisesRegex(OSError, 'log unavailable'):
+                    with serving_gate.retained_engine_logs(None, Path(d), {}):
+                        pass
+
+    def test_first_rank_fault_does_not_discard_other_rank_logs(self):
+        nodes = ['node5', 'node6', 'node7']
+        c = types.SimpleNamespace(NAMES=['sp5', 'sp6', 'sp7'],
+                                  recovery=types.SimpleNamespace(NODES=nodes))
+        before = {node: {'id': node + '-container'} for node in nodes}
+        calls = []
+        def run(command, *, stdout, **kwargs):
+            calls.append(command[-1])
+            stdout.write(b'CUDA error: retained failure' if len(calls) == 1 else b'healthy worker')
+            return types.SimpleNamespace(returncode=0)
+        with tempfile.TemporaryDirectory() as d:
+            with patch.object(serving_gate.subprocess, 'run', side_effect=run):
+                with self.assertRaises(AssertionError):
+                    serving_gate.collect_logs(c, Path(d), before)
+            records = json.loads((Path(d) / 'engine-logs.json').read_text())
+            self.assertEqual(len(calls), 3)
+            self.assertIn('engine fault', records['sp5']['issues'])
+            self.assertFalse(records['sp6']['issues'])
+            self.assertFalse(records['sp7']['issues'])
+
 
 if __name__ == '__main__':
     unittest.main()
