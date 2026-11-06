@@ -7,7 +7,7 @@ from front_variants import attention_front_kernel, attention_q_kernel, attention
 
 for factory, threads, partition in ((attention_front_kernel,64,0),(attention_front_kernel,128,0),(attention_front_kernel,256,0),(attention_q_kernel,128,1),(attention_kv_kernel,128,2)):
     factory.target = "cuda -arch=sm_121"
-    function = factory.get_tir(1e-6,256,"int64",threads,partition)
+    function = factory.get_tir(1e-20,256,"int64",threads,partition)
     module = tvm.IRModule.from_expr(function)
     tilelang.transform.CanonicalizeLegacyReducer()(module)
     with tvm.target.Target({"kind":"cuda","arch":"sm_121"}), tvm.transform.PassContext(config=factory.pass_configs):

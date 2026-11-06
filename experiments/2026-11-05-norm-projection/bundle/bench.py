@@ -26,7 +26,7 @@ from vllm.models.glm5next.nvidia.tilelang.l2_prefetch import l2_prefetch_kernel
 ROWS = (1, 6, 9, 16, 24, 48, 96)
 VARIANTS = ("fused", "fused64", "fused128", "fused256", "split_qkv", "split_kvq", "split_parallel", "split_q", "standalone", "projection_only")
 MODES = ("l2", "cold", "prefetch")
-EPS, PAGE, PAGES = 1e-6, 256, 2
+EPS, PAGE, PAGES = 1e-20, 256, 2
 
 
 def emit(**record):
@@ -153,7 +153,7 @@ def main():
     torch.manual_seed(517)
     emit(identity={"image_vllm_tree": "c061e5f6931306fa4655ba531428f639c365bf10",
                    "torch": torch.__version__, "gpu": torch.cuda.get_device_name(),
-                   "rows": ROWS, "variants": VARIANTS, "sm_count": torch.cuda.get_device_properties(0).multi_processor_count, "weights": "seeded synthetic checkpoint shapes",
+                   "norm_eps": EPS, "rows": ROWS, "variants": VARIANTS, "sm_count": torch.cuda.get_device_properties(0).multi_processor_count, "weights": "seeded synthetic checkpoint shapes",
                    "evict_bytes": 128 << 20, "reset_persisting_l2_before_eviction": True, "prefetch_grid": 2,
                    "prefetch_block": 128, "prefetch_chunk": 4096})
     evict = torch.ones((128 << 20) // 4, device="cuda", dtype=torch.int32)
