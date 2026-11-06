@@ -250,7 +250,15 @@ class ModelBarrierTest(unittest.TestCase):
                 evidence.bounded_fingerprints(path)
             self.assertNotEqual(caught.exception.receipt["exit"], 0)
             self.assertIn("actual_limits", caught.exception.receipt)
-            self.assertIn("EOFError" if name == "truncated" else "RecursionError", caught.exception.receipt["parse_error"])
+            if name == "truncated":
+                self.assertIn("EOFError", caught.exception.receipt["parse_error"])
+            else:
+                # CPython decoders differ in when they reject deep arrays.
+                # Either bounded decoding failure or the model-schema check
+                # must fail closed; resource/recursion exception handling is
+                # independently exercised below.
+                self.assertTrue(caught.exception.receipt["parse_error"].startswith(
+                    ("RecursionError:", "ValueError: model result schema differs")))
 
     def test_evaluate_records_eof_memory_and_recursion_failures_without_hash_scan(self):
         prepared = evidence.prepare(self.binding, self.DEFINITION, suite.digest(self.DEFINITION), "candidate", self.metadata)
