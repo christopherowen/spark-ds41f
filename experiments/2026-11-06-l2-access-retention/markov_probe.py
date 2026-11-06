@@ -62,7 +62,8 @@ def graph_windows(graph):
         value = check(cu.cuGraphKernelNodeGetAttribute(
             node, cu.CUkernelNodeAttrID.CU_KERNEL_NODE_ATTRIBUTE_ACCESS_POLICY_WINDOW))
         w = value.accessPolicyWindow
-        result.append([int(w.num_bytes), float(w.hitRatio), int(w.hitProp)])
+        result.append([int(w.num_bytes), float(w.hitRatio), int(w.hitProp),
+                       int(w.base_ptr), int(w.missProp)])
     return result
 
 
@@ -209,6 +210,13 @@ def main():
                         attrs[name] = graph_windows(graph)
                         assert attrs[name], name
                         assert all(a[0] == (b if uses_window else 0) for a in attrs[name]), (name, attrs[name])
+                        if uses_window:
+                            expected_ratio = min(1.0, actual / b)
+                            assert all(abs(a[1] - expected_ratio) < 1e-6
+                                       and a[2] == int(cu.CUaccessProperty.CU_ACCESS_PROPERTY_PERSISTING)
+                                       and a[3] == packed.values.data_ptr()
+                                       and a[4] == int(cu.CUaccessProperty.CU_ACCESS_PROPERTY_NORMAL)
+                                       for a in attrs[name]), (name, attrs[name])
                         graph.instantiate()
                         window(stream)
                         graph.replay()

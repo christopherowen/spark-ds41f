@@ -75,6 +75,8 @@ Preparation: `bin/spark doctor` initially refused the new checkout because it
 has no ignored site map. No GPU operation or serving change was attempted.
 CPU-only container introspection first used nonexistent `python`; repeated
 with `python3` and succeeded. These are preparation errors, not GPU results.
+The publication review's bytecode-cache write hit local disk exhaustion;
+compiling the Python sources in memory without writing cache files passed.
 
 Prepared in a separate clean deployment checkout on dgx4, detached at each
 published experiment commit. The capability binary was compiled without GPU
@@ -103,7 +105,9 @@ The checkpoint hub is mounted at its original path so blob symlinks resolve.
 The native graph probe records captured attributes before any intervention;
 if inheritance is absent it explicitly sets and verifies kernel-node windows
 before graph instantiation, and records both versions. No policy API is called
-on a timed replay path.
+on a timed replay path. Verification includes the exact payload address, size,
+hit fraction, persisting hit property and normal miss property. The capability
+process has a separate 30-second deadline.
 
 Once preceding requests have run, the controller is invoked from a clean,
 published checkout on dgx1 using its full 40-character revision:
@@ -127,6 +131,12 @@ runtime image is part of this experiment.
 
 GPU results: pending. No speedup, correctness improvement, or performance
 preservation is claimed.
+
+The request-file waiter was stopped on November 6 to preserve the explicit
+collective-qualification then verification-budget reservation order. This
+experiment has no active request or hold. Its two bounded component runs await
+an exclusive handoff; an empty hold file alone does not supersede the reserved
+turns.
 
 `analyze.py <boot-1.json> <boot-2.json> --output <summary.json>` reports each
 arm and cache-aftereffect comparison. Independent units are fresh processes;

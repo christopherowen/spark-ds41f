@@ -61,7 +61,8 @@ thermal > "$out/thermal-start.txt"
 cat /proc/meminfo > "$out/memory-before.txt"
 docker image inspect "$image" --format '{{.Id}}' > "$out/image.txt"
 git -C "$checkout" rev-parse HEAD > "$out/revision.txt"
-"$out/capability" > "$out/capability.jsonl" 2> "$out/capability-errors.txt"
+timeout --signal=TERM --kill-after=5 30 "$out/capability" \
+  > "$out/capability.jsonl" 2> "$out/capability-errors.txt"
 checkpoint=/home/swank/.cache/huggingface/hub/models--deepseek-ai--DeepSeek-V4.1-Flash-1017/snapshots/1bae0e1088993b9b82de08f59de5be5a34e42170
 set +e
 timeout --signal=TERM --kill-after=20 480 docker run --rm --name "$name" \
