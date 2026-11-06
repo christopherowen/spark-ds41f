@@ -64,24 +64,30 @@ def state(c, token, floor_gib):
     return records
 
 
-def cool(c, token, out, stem):
+def cool(c, token, out, stem, *, below_c=50, settle_polls=2):
     began = time.monotonic()
     observations = []
+    settled = 0
     failure = None
     try:
         while True:
             current = state(c, token, 3)
             observations.append(current)
-            if all(max(row['thermal_zones_c'].values()) < 55 for row in current.values()):
-                return
+            if all(max(row['thermal_zones_c'].values()) < below_c and row['gpu_temperature_c'] < below_c
+                   for row in current.values()):
+                settled += 1
+                if settled >= settle_polls:
+                    return
+            else:
+                settled = 0
             assert time.monotonic() - began < 600, 'passive cooling deadline'
-            time.sleep(5)
+            time.sleep(3 if settled else 5)
     except BaseException as error:
         failure={'error':repr(error),'failed_observation':getattr(error,'observations',None)}
         raise
     finally:
         (out / (stem + '-cooling.json')).write_text(json.dumps(
-            {'observations':observations,'failure':failure}, indent=2) + '\n')
+            {'below_c':below_c,'settle_polls':settle_polls,'observations':observations,'failure':failure}, indent=2) + '\n')
 
 
 def run(c, token, command, out, stem, *, floor_gib, timeout):
@@ -209,7 +215,7 @@ def run_cohort(c, token, out, commit, held, heartbeat_errors):
                 command = ['taskset', '-c', '4', 'python3', '-B', str(EXP / 'record_requests.py'),
                            '--out', str(arm / (stem + '-requests')), '--token', token,
                            str(ROOT / script), 'http://127.0.0.1:8000', *arguments]
-                run(c, token, command, arm, stem, floor_gib=3, timeout=900)
+                run(c, token, command, arm, stem, floor_gib=3, timeout=1800)
                 value = verdict(arm / (stem + '.txt'), stem)
                 arms[label][stem] = value
                 (arm / (stem + '-verdict.json')).write_text(json.dumps(value, indent=2) + '\n')

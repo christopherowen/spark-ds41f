@@ -561,3 +561,11 @@ rank's bounded engine log and `engine-logs.json` are collected before recovery
 replaces the containers, without masking the original probe exception or
 stopping on the first rank with an issue (`receipts/serving-guard-tests-4.txt`,
 22 guard tests passing).
+
+To prevent back-to-back 8K/16K cold prefills and concurrent determinism batches
+from stacking thermal rise past `70 C` on stock-cooled SP5, `serving_gate.py`
+and `record_requests.py` now require two consecutive `< 50 C` thermal-zone and
+GPU readings across SP5-SP7 before each probe, after each `ced_cross_shape.py`
+completion request (outside the request's timed bracket), after each
+`together(...)` concurrent batch join, and after long or warm sequential
+requests (`receipts/serving-guard-tests-5.txt`, 25 guard tests passing).

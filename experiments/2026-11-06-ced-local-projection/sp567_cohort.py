@@ -287,7 +287,7 @@ def main():
     state = holds(); assert not any(any(v.values()) for v in state.values()), state
     token = uuid.uuid4().hex
     held = {'holder': HOLDER, 'token': token, 'since': stamp(), 'heartbeat': stamp(),
-            'expected_end': (dt.datetime.now(dt.timezone.utc)+dt.timedelta(minutes=120 if args.job=='serving' else 90 if args.job=='collective' else 45)).isoformat(),
+            'expected_end': (dt.datetime.now(dt.timezone.utc)+dt.timedelta(minutes=180 if args.job=='serving' else 90 if args.job=='collective' else 45)).isoformat(),
             'nodes': NAMES, 'rule': 'exclusive correctness only; coordinated exact C37 restoration before release',
             'phase': 'preparing', 'job':args.job, 'controller_commit': commit, 'source_commit': '51c1a32cd78cfb0a14087e34dfcc06be30928a0e',
             'restore_commit': RESTORE_COMMIT, 'production_config': RESTORE_PROFILE,

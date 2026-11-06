@@ -11,7 +11,8 @@ from unittest.mock import patch
 EXP = Path(__file__).resolve().parent
 sys.path.insert(0, str(EXP))
 import serving_gate
-from serving_verdicts import verdict
+from serving_verdicts import verdict, compare
+import record_requests
 from record_requests import RequestArchive
 import urllib.request
 
@@ -119,6 +120,70 @@ class ServingGuards(unittest.TestCase):
             self.assertIn('engine fault', records['sp5']['issues'])
             self.assertFalse(records['sp6']['issues'])
             self.assertFalse(records['sp7']['issues'])
+
+    def test_cool_requires_settled_sub_50c_readings(self):
+        samples = [
+            {'sp5': {'thermal_zones_c': {'z0': 52.0}, 'gpu_temperature_c': 46.0}},
+            {'sp5': {'thermal_zones_c': {'z0': 49.2}, 'gpu_temperature_c': 46.0}},
+            {'sp5': {'thermal_zones_c': {'z0': 48.8}, 'gpu_temperature_c': 45.0}},
+        ]
+        with tempfile.TemporaryDirectory() as d:
+            with patch.object(serving_gate, 'state', side_effect=samples), patch.object(serving_gate.time, 'sleep'):
+                serving_gate.cool(None, 'token', Path(d), 'ced')
+            receipt = json.loads((Path(d) / 'ced-cooling.json').read_text())
+            self.assertEqual(receipt['below_c'], 50)
+            self.assertEqual(receipt['settle_polls'], 2)
+            self.assertEqual(len(receipt['observations']), 3)
+
+    def test_request_archive_cool_waits_for_settled_sub_50c_and_records_cooldown(self):
+        hot = {node: {'thermal_zones_c': {'z0': 58.4}, 'gpu_temperature_c': 51.0} for node in record_requests.NODES}
+        cool1 = {node: {'thermal_zones_c': {'z0': 49.1}, 'gpu_temperature_c': 45.0} for node in record_requests.NODES}
+        cool2 = {node: {'thermal_zones_c': {'z0': 48.3}, 'gpu_temperature_c': 44.0} for node in record_requests.NODES}
+        with tempfile.TemporaryDirectory() as d:
+            archive = RequestArchive(Path(d) / 'requests', token='tok', below_c=50.0, settle_polls=2, poll_sleep=0.0)
+            with patch.object(record_requests, 'read_nodes', side_effect=[hot, cool1, cool2]):
+                archive.cool('ced-16352-0')
+            saved = json.loads((archive.directory / 'cooldowns.json').read_text())['cooldowns']
+            self.assertEqual(len(saved), 1)
+            self.assertEqual(saved[0]['reason'], 'ced-16352-0')
+            self.assertEqual(saved[0]['polls'], 3)
+            self.assertEqual(saved[0]['peak_hottest_c'], 58.4)
+
+    def test_compare_summarizes_ced_boundary_latencies(self):
+        ced_summary = {
+            'summary': 'ced cross-shape',
+            'passed': True,
+            'lengths': {
+                '8208': {'prompt': '1'*16, 'tokens': '2'*16, 'logprobs': '3'*16, 'repeats_identical': True, 'cold': True},
+                '16352': {'prompt': '4'*16, 'tokens': '5'*16, 'logprobs': '6'*16, 'repeats_identical': True, 'cold': True},
+            },
+        }
+        det_summary = {'reference_sha256': 'a'*64, 'long_sha256': 'b'*64,
+                       'reference_text_sha256': 'c'*64, 'long_text_sha256': 'd'*64}
+        samp_summary = {'reference_sha256': 'e'*64}
+        arms = {}
+        for label, s8, s16 in (('control-1', 2.8, 3.9), ('control-2', 2.7, 3.8),
+                               ('candidate-1', 2.6, 3.6), ('candidate-2', 2.6, 3.5)):
+            arms[label] = {
+                'ced': {
+                    'passed': True, 'issues': [], 'summary': ced_summary,
+                    'requests': [
+                        {'length': 8208, 'repeat': 0, 'seconds': s8},
+                        {'length': 8208, 'repeat': 1, 'seconds': s8},
+                        {'length': 16352, 'repeat': 0, 'seconds': s16},
+                        {'length': 16352, 'repeat': 1, 'seconds': s16},
+                    ],
+                },
+                'determinism': {'passed': True, 'issues': [], 'summary': det_summary},
+                'greedy': {'passed': True, 'issues': [], 'summary': det_summary},
+                'sampled': {'passed': True, 'issues': [], 'summary': samp_summary},
+            }
+        out = compare(arms)
+        self.assertTrue(out['passed'])
+        self.assertAlmostEqual(out['ced_latencies']['8208']['control_mean_seconds'], 2.75)
+        self.assertAlmostEqual(out['ced_latencies']['8208']['candidate_mean_seconds'], 2.60)
+        self.assertAlmostEqual(out['ced_latencies']['16352']['control_mean_seconds'], 3.85)
+        self.assertAlmostEqual(out['ced_latencies']['16352']['candidate_mean_seconds'], 3.55)
 
 
 if __name__ == '__main__':

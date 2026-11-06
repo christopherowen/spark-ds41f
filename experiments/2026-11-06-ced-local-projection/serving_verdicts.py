@@ -70,6 +70,16 @@ def verdict(path, kind):
                 check(isinstance(value.get(key), str) and len(value[key]) == 16, name + '/' + key + ' missing')
         requests = [row for row in rows if 'summary' not in row]
         check(len(requests) == 4, 'CED request count differs')
+        return {
+            'passed': not issues,
+            'issues': issues,
+            'summary': summary,
+            'requests': [
+                {k: row[k] for k in ('length', 'repeat', 'prompt', 'tokens', 'logprobs',
+                                     'cached_tokens', 'prompt_tokens', 'seconds') if k in row}
+                for row in requests
+            ],
+        }
     else:
         raise ValueError(kind)
     return {'passed': not issues, 'issues': issues, 'summary': summary}
@@ -97,4 +107,27 @@ def compare(arms):
         a, b = gates.get('determinism', {}).get('summary'), gates.get('greedy', {}).get('summary')
         if a and b and any(a.get(key) != b.get(key) for key in ('reference_text_sha256', 'long_text_sha256')):
             issues.append(label + ' logprob and greedy texts differ')
-    return {'passed': not issues, 'issues': issues}
+    ced_latencies = {}
+    for length in (8208, 16352):
+        by_arm = {}
+        for label in expected:
+            reqs = [r['seconds'] for r in arms.get(label, {}).get('ced', {}).get('requests', [])
+                    if r.get('length') == length and isinstance(r.get('seconds'), (int, float))]
+            if len(reqs) == 2:
+                by_arm[label] = {'repeats_seconds': reqs, 'mean_seconds': round(sum(reqs) / len(reqs), 6)}
+        if len(by_arm) == 4:
+            ctrl = [by_arm['control-1']['mean_seconds'], by_arm['control-2']['mean_seconds']]
+            cand = [by_arm['candidate-1']['mean_seconds'], by_arm['candidate-2']['mean_seconds']]
+            ctrl_mean = sum(ctrl) / 2.0
+            cand_mean = sum(cand) / 2.0
+            delta = cand_mean - ctrl_mean
+            ced_latencies[str(length)] = {
+                'arms': by_arm,
+                'control_boot_means_seconds': ctrl,
+                'candidate_boot_means_seconds': cand,
+                'control_mean_seconds': round(ctrl_mean, 6),
+                'candidate_mean_seconds': round(cand_mean, 6),
+                'delta_seconds': round(delta, 6),
+                'delta_percent': round(100.0 * delta / ctrl_mean, 4) if ctrl_mean else None,
+            }
+    return {'passed': not issues, 'issues': issues, 'ced_latencies': ced_latencies}
