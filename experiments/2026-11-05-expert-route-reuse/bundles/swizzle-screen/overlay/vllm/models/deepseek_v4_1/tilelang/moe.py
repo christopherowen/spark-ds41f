@@ -1395,7 +1395,7 @@ class MoeExpertsV41Plan:
         decode_block_M=16,
         block_M=32,
         prefill_block_M=64,
-        prefill_swizzle_panel=0,
+        prefill_swizzle_panel=2,
         block_N=128,
         num_stages=3,
         down_num_stages=2,
@@ -1518,7 +1518,7 @@ class MoeExpertsV41Plan:
         which trigger after their K loop (calls of ``LATE_TRIGGER_ROWS`` rows or
         more); with a ``mid_`` prefix at ``block_M`` and a ``prefill_`` prefix at
         ``prefill_block_M``, whose GEMMs trigger late and optionally swizzle across
-        ``prefill_swizzle_panel`` consecutive M-tiles (disabled by default)."""
+        ``prefill_swizzle_panel`` consecutive M-tiles (default 2; decode/mid keep 0)."""
         config = dict(
             block_N=self.block_N,
             coded_scales=True,

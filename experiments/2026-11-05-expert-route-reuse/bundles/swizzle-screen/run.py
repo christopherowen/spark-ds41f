@@ -44,7 +44,7 @@ elif args.mode == 'gate':
                '-v', '-o', 'addopts=', '--junitxml=/receipt/gate.xml']
 else:
     command = [python, '/experiment/benchmark_swizzle.py',
-               '--source-commit', 'f3bfdf8b8c08870754cc3c756b75faa9156595e0',
+               '--source-commit', '444aa1853396389d2422f9fcc4c32e61bda66f36',
                '--source-sha256', manifest['/opt/spark-ds41f/candidate/vllm/vllm/models/deepseek_v4_1/tilelang/moe.py'],
                '--process-id', args.process_id]
     if args.mode == 'smoke':

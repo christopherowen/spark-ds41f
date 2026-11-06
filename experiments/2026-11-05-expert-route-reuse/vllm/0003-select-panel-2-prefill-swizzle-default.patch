@@ -1,0 +1,99 @@
+From 444aa1853396389d2422f9fcc4c32e61bda66f36 Mon Sep 17 00:00:00 2001
+From: Christopher Owen <3221756+christopherowen@users.noreply.github.com>
+Date: Fri, 6 Nov 2026 08:20:20 +0000
+Subject: [PATCH] perf(dsv41): select prefill_swizzle_panel=2 after 2-boot GB10
+ screen
+
+Across two independent container processes on DGX4 (48 balanced replays per
+shape, TP3 intermediate 768 and TP4 intermediate 576), prefill_swizzle_panel=2
+delivers 17/22 statistically significant 2-boot wins and 0/22 2-boot losses
+across all native M=64 shapes (2048..16384 rows), averaging -2.29%/-2.38% overall
+and -2.82%/-2.93% on multi-tile chunks (4096..16384 rows: -3.4% to -5.6% at
+TP3 6144, -0.7% to -1.2% at TP4 16384) with exact bit equality. Decode (M=16)
+and mid (M=32) tiers retain swizzle_panel=0.
+
+Upstream-base: 19f2c20ed4d64ae22bd009ceacadd85e2a81e354
+Prepared-base: 1f33102547e4da5c64712390604695d1abd577c4
+Parent: f3bfdf8b8c08870754cc3c756b75faa9156595e0
+Quality: exact bit parity with panel 0 across all 20 GPU equality cases and
+38x2 paired screen cases; batch invariance verified on first 17 rows.
+Tests: 24 native GPU pytest cases (2 independent processes) + 2-process paired
+screen across panels (0, 2, 3, 4, 8, 16).
+---
+ .../moe/test_deepseek_v41_tilelang_moe.py       | 17 ++++++++++++-----
+ vllm/models/deepseek_v4_1/tilelang/moe.py       |  4 ++--
+ 2 files changed, 14 insertions(+), 7 deletions(-)
+
+diff --git a/tests/kernels/moe/test_deepseek_v41_tilelang_moe.py b/tests/kernels/moe/test_deepseek_v41_tilelang_moe.py
+index eed22bfa2..54e69763d 100644
+--- a/tests/kernels/moe/test_deepseek_v41_tilelang_moe.py
++++ b/tests/kernels/moe/test_deepseek_v41_tilelang_moe.py
+@@ -628,7 +628,7 @@ def test_prefill_swizzle_panel_matches_unswizzled_bits(
+     ids, route_weights = _routes(rows, num_experts, topk, 18, idx_dtype)
+     tokens = cast_mxfp8(x)
+     outs = {}
+-    for swizzle_panel in (0, 3):
++    for swizzle_panel in (0, 2, 3):
+         plan = _plan(
+             num_experts,
+             topk,
+@@ -641,6 +641,7 @@ def test_prefill_swizzle_panel_matches_unswizzled_bits(
+         weights = plan.prepare_weights(w13_packed, w13_sf, w2_packed, w2_sf)
+         outs[swizzle_panel] = torch.empty_like(x)
+         plan.run(tokens, ids, route_weights, weights, outs[swizzle_panel])
++    assert torch.equal(outs[2].view(torch.int16), outs[0].view(torch.int16))
+     assert torch.equal(outs[3].view(torch.int16), outs[0].view(torch.int16))
+ 
+ 
+@@ -842,16 +843,22 @@ def test_narrow_and_wide_codes_give_the_uncoded_gemm_bits(rows, n, k, gather):
+ @pytest.mark.parametrize("intermediate", [576, 768])
+ @pytest.mark.parametrize("stage", ["gate_up", "down"])
+ def test_grouped_gemm_emits_requested_prefill_swizzle(intermediate, stage):
+-    """The opt-in must change code; the default keeps the prior unswizzled path."""
++    """Prefill defaults to panel 2, keeps decode/mid unswizzled, and honors explicit panels."""
+     sources = {}
+-    for panel in (None, 0, 3):
++    for panel in (None, 0, 2, 3):
+         options = {} if panel is None else {"prefill_swizzle_panel": panel}
+         plan = MoeExpertsV41Plan(384, 6, 5120, intermediate, **options)
+-        factory, args, kwargs = plan.kernels()[f"prefill_{stage}"]
++        calls = plan.kernels()
++        for key in ("gate_up", "down", "late_gate_up", "late_down", "mid_gate_up", "mid_down"):
++            _, _, d_kwargs = calls[key]
++            assert d_kwargs.get("swizzle_panel", 0) == 0
++        factory, args, kwargs = calls[f"prefill_{stage}"]
+         source = factory(*args, **kwargs).get_kernel_source()
++        assert ("rasterization2DRow<2>" in source) == (panel in (None, 2))
+         assert ("rasterization2DRow<3>" in source) == (panel == 3)
+         sources[panel] = source
+-    assert sources[None] == sources[0]
++    assert sources[None] == sources[2]
++    assert sources[0] != sources[2]
+ 
+ 
+ def test_grouped_fp8_fp4_gemm_defers_barrier_init_and_down_stages():
+diff --git a/vllm/models/deepseek_v4_1/tilelang/moe.py b/vllm/models/deepseek_v4_1/tilelang/moe.py
+index fb5277511..3dc403366 100644
+--- a/vllm/models/deepseek_v4_1/tilelang/moe.py
++++ b/vllm/models/deepseek_v4_1/tilelang/moe.py
+@@ -1395,7 +1395,7 @@ class MoeExpertsV41Plan:
+         decode_block_M=16,
+         block_M=32,
+         prefill_block_M=64,
+-        prefill_swizzle_panel=0,
++        prefill_swizzle_panel=2,
+         block_N=128,
+         num_stages=3,
+         down_num_stages=2,
+@@ -1518,7 +1518,7 @@ class MoeExpertsV41Plan:
+         which trigger after their K loop (calls of ``LATE_TRIGGER_ROWS`` rows or
+         more); with a ``mid_`` prefix at ``block_M`` and a ``prefill_`` prefix at
+         ``prefill_block_M``, whose GEMMs trigger late and optionally swizzle across
+-        ``prefill_swizzle_panel`` consecutive M-tiles (disabled by default)."""
++        ``prefill_swizzle_panel`` consecutive M-tiles (default 2; decode/mid keep 0)."""
+         config = dict(
+             block_N=self.block_N,
+             coded_scales=True,
+-- 
+2.43.0
+
