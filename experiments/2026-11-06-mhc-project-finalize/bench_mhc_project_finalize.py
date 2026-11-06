@@ -1,372 +1,290 @@
 #!/usr/bin/env python3
 # SPDX-License-Identifier: Apache-2.0
-"""CPU/compiler verification and GPU correctness/latency harness for mHC project+finalize."""
+"""CPU verification and 2-boot GPU benchmark harness for mHC entry (0731).
 
+Compares:
+1. Base Candidate 1107 (0634 fused single-CTA finalize at M=1; base project_streams +
+   finalize at M>=2).
+2. Unmodified two-launch Split (base project_streams + finalize without Fn0 PDL preload).
+3. Candidate 0731 (unconditional two-launch project_streams with Fn stream-0 PDL preload +
+   finalize; FINALIZE_FUSE_MAX_ROWS and project_and_finalize_streams optionality removed).
+
+Also records prefill (M = 2048, 6144, 16384) compulsory DRAM byte traffic and achieved
+GB/s across both (world=1, with_aux=False) and (world=3, with_aux=True).
+"""
 
 import argparse
+import ast
 import json
-import random
-import subprocess
-import tempfile
+import math
 import time
 from pathlib import Path
+from types import SimpleNamespace
 
 import torch
+import torch.nn.functional as F
+
+HIDDEN = 5120
+MULT = 4
+MIXES = 24
+BLOCK_H = 128
+BLOCK_M = 16
+SPLITS = HIDDEN // BLOCK_H
+RMS_EPS = 1e-20
+HC_EPS = 1e-6
+SINKHORN_ITERS = 20
+
+DECODE_ROWS = (1, 2, 4, 6, 8, 12, 16, 24, 32, 48, 64, 96)
+PREFILL_ROWS = (2048, 6144, 16384)
 
 
-def split_tf32(f: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-    """Exact 3-TF32-part decomposition matching load_split_tf32 in mhc.py."""
-    bits = f.view(torch.int32)
-    high = (bits & -0x2000).view(torch.float32)
-    rest = f - high
-    r_bits = rest.view(torch.int32)
-    mid = (r_bits & -0x2000).view(torch.float32)
+def split_tf32_cpu(fn: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    bits = fn.view(torch.uint32)
+    high = (bits & 0xFFFFE000).view(torch.float32)
+    rest = fn - high
+    mid = (rest.view(torch.uint32) & 0xFFFFE000).view(torch.float32)
     low = rest - mid
     return high, mid, low
 
 
-def simulate_split_vs_fused_cpu(
-    tokens: int,
-    hidden: int = 256,
-    block_h: int = 128,
-    block_m: int = 16,
+def cpu_reference_split_order(
+    x: torch.Tensor,
+    r: torch.Tensor,
+    post_in: torch.Tensor,
+    comb_in: torch.Tensor,
+    pre_in: torch.Tensor,
+    fn: torch.Tensor,
+    scale: torch.Tensor,
+    base: torch.Tensor,
+    weight: torch.Tensor,
     mode: str = "post_pre",
-    world: int = 1,
-    with_aux: bool = True,
-    inject_nonfinite: bool = False,
-    seed: int = 1234,
-) -> dict:
-    """Bit-exact CPU simulation comparing 2-kernel (project_streams + finalize)
-    against 1-kernel parallel-CTA project_and_finalize_streams under random
-    CTA arrival permutations."""
-    mult = 4
-    mixes = 24
-    splits = hidden // block_h
-    streams = 1 if mode == "broadcast" else mult
-    k_dim = streams * hidden
-    rms_eps = 1e-6
-    hc_eps = 1e-6
-    norm_eps = 1e-6
-    post_mult = 2.0
-    sinkhorn_repeat = 20
-
-    g = torch.Generator(device="cpu").manual_seed(seed)
-    x = torch.randn(world, tokens, hidden, generator=g, dtype=torch.bfloat16)
-    r_in = torch.randn(tokens, mult, hidden, generator=g, dtype=torch.bfloat16)
-    post_in = 2.0 * torch.sigmoid(torch.randn(tokens, mult, generator=g, dtype=torch.float32))
-    comb_in = torch.softmax(torch.randn(tokens, mult, mult, generator=g, dtype=torch.float32), dim=-1)
-    pre_in = torch.sigmoid(torch.randn(tokens, mult, generator=g, dtype=torch.float32)) + hc_eps
-    fn = torch.randn(mixes, k_dim, generator=g, dtype=torch.float32) * 0.02
-    scale = torch.tensor([0.8, 1.1, 0.9], dtype=torch.float32)
-    base = torch.randn(mixes, generator=g, dtype=torch.float32) * 0.1
-    weight = (torch.randn(hidden, generator=g, dtype=torch.float32) * 0.1 + 1.0).bfloat16()
-
-    x[:, :, :8] = -0.0
-    r_in[:, :, :8] = -0.0
-    if inject_nonfinite and tokens >= 4:
-        x[0, 0, 8] = float("nan")
-        r_in[1, 2, 16] = float("inf")
-        r_in[2, 0, 24] = float("-inf")
-        pre_in[3, 1] = float("nan")
-
-    # Stage 1 per-split partials: P[splits, tokens, mixes], S[splits, tokens], C[tokens, hidden], Q[splits, tokens]
-    r_out_ref = torch.empty((tokens, mult, hidden), dtype=torch.bfloat16)
-    aux_ref = torch.empty((tokens, hidden), dtype=torch.bfloat16) if with_aux else None
-    c_ref = torch.empty((tokens, hidden), dtype=torch.bfloat16)
-    p_ref = torch.empty((splits, tokens, mixes), dtype=torch.float32)
-    s_ref = torch.empty((splits, tokens), dtype=torch.float32)
-    q_ref = torch.empty((splits, tokens), dtype=torch.float32)
-
-    if world == 1:
-        x_sum = x[0]
+    with_aux: bool = False,
+):
+    world, M, H = x.shape
+    splits = H // BLOCK_H
+    r_reshaped = r.view(M, MULT, H)
+    if mode == "post_pre":
+        if world == 1:
+            xv = x[0]
+        else:
+            acc = x[0].float()
+            for w in range(1, world):
+                acc = acc + x[w].float()
+            xv = acc.bfloat16()
+        r_out = torch.empty_like(r_reshaped)
+        for n in range(MULT):
+            av = comb_in[:, 0, n : n + 1] * r_reshaped[:, 0, :].float()
+            av = torch.addcmul(av, post_in[:, n : n + 1], xv.float())
+            for m in range(1, MULT):
+                av = torch.addcmul(
+                    av, comb_in[:, m, n : n + 1], r_reshaped[:, m, :].float()
+                )
+            r_out[:, n, :] = av.bfloat16()
+    elif mode == "broadcast":
+        xv = x[0]
+        r_out = xv.unsqueeze(1).expand(M, MULT, H).contiguous()
     else:
-        acc_x = x[0].float()
-        for r_idx in range(1, world):
-            acc_x = acc_x + x[r_idx].float()
-        x_sum = acc_x.bfloat16()
+        r_out = r_reshaped.clone()
+
+    av_streams = r_out.float()
+    col = (pre_in.unsqueeze(-1) * av_streams).sum(dim=1)
+    c_bf16 = col.bfloat16()
+    aux_bf16 = (0.25 * av_streams).sum(dim=1).bfloat16() if with_aux else None
+
+    fn_high, fn_mid, fn_low = split_tf32_cpu(fn)
+    P = torch.zeros((splits, M, MIXES), dtype=torch.float32)
+    S = torch.zeros((splits, M), dtype=torch.float32)
+    Q = torch.zeros((splits, M), dtype=torch.float32)
 
     for sp in range(splits):
-        h0 = sp * block_h
-        h1 = h0 + block_h
-        sq = torch.zeros((tokens, block_h), dtype=torch.float32)
-        col = torch.zeros((tokens, block_h), dtype=torch.float32)
-        aux_col = torch.zeros((tokens, block_h), dtype=torch.float32)
-        c_local = torch.zeros((tokens, mixes), dtype=torch.float32)
-
+        h0 = sp * BLOCK_H
+        h1 = h0 + BLOCK_H
+        q_blk = c_bf16[:, h0:h1].float()
+        Q[sp] = (q_blk * q_blk).sum(dim=-1)
         if mode == "broadcast":
-            xv = x_sum[:, h0:h1]
-            av = xv.float()
-            sq = av * av
-            for n in range(mult):
-                r_out_ref[:, n, h0:h1] = xv
-                col = col + pre_in[:, n : n + 1] * av
-            fh, fm, fl = split_tf32(fn[:, h0:h1])
-            c_local = c_local + av @ fh.t() + av @ fm.t() + av @ fl.t()
+            a_blk = r_out[:, 0, h0:h1].float()
+            S[sp] = (a_blk * a_blk).sum(dim=-1)
+            P[sp] = (
+                a_blk @ fn_high[:, h0:h1].T
+                + a_blk @ fn_mid[:, h0:h1].T
+                + a_blk @ fn_low[:, h0:h1].T
+            )
         else:
-            rv = r_in[:, :, h0:h1]
-            for n in range(mult):
-                fh, fm, fl = split_tf32(fn[:, n * hidden + h0 : n * hidden + h1])
-                if mode == "post_pre":
-                    av = comb_in[:, 0, n : n + 1] * rv[:, 0, :].float()
-                    av = torch.addcmul(av, post_in[:, n : n + 1], x_sum[:, h0:h1].float())
-                    for m in range(1, mult):
-                        av = torch.addcmul(av, comb_in[:, m, n : n + 1], rv[:, m, :].float())
-                    nv = av.bfloat16()
-                    r_out_ref[:, n, h0:h1] = nv
-                else:
-                    nv = rv[:, n, :]
-                    r_out_ref[:, n, h0:h1] = nv
-                av = nv.float()
-                sq = sq + av * av
-                col = col + pre_in[:, n : n + 1] * av
-                if with_aux:
-                    aux_col = torch.addcmul(aux_col, torch.tensor(0.25, dtype=torch.float32), av)
-                c_local = c_local + av @ fh.t() + av @ fm.t() + av @ fl.t()
-
-        if with_aux and aux_ref is not None:
-            aux_ref[:, h0:h1] = aux_col.bfloat16()
-        nv_c = col.bfloat16()
-        c_ref[:, h0:h1] = nv_c
-        q_ref[sp] = (nv_c.float() * nv_c.float()).sum(dim=-1)
-        s_ref[sp] = sq.sum(dim=-1)
-        p_ref[sp] = c_local
-
-    # Reference Stage 2 (finalize) in fixed split order 0..splits-1
-    def finalize_token(tok: int) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
-        rms = torch.tensor(0.0, dtype=torch.float32)
-        p_acc = torch.zeros((mixes,), dtype=torch.float32)
-        q_tot = torch.tensor(0.0, dtype=torch.float32)
-        for sp in range(splits):
-            rms = rms + s_ref[sp, tok]
-            p_acc = p_acc + p_ref[sp, tok]
-            q_tot = q_tot + q_ref[sp, tok]
-        rms = torch.rsqrt(rms / k_dim + rms_eps)
-        pre_tok = torch.sigmoid(p_acc[:mult] * rms * scale[0] + base[:mult]) + hc_eps
-        post_tok = torch.sigmoid(p_acc[mult : 2 * mult] * rms * scale[1] + base[mult : 2 * mult]) * post_mult
-        cm = (p_acc[2 * mult :] * rms * scale[2] + base[2 * mult :]).view(mult, mult)
-        rmax = cm.max(dim=-1, keepdim=True).values
-        cm = torch.exp(cm - rmax)
-        cm = cm / cm.sum(dim=-1, keepdim=True) + hc_eps
-        cm = cm / (cm.sum(dim=-2, keepdim=True) + hc_eps)
-        for _ in range(sinkhorn_repeat - 1):
-            cm = cm / (cm.sum(dim=-1, keepdim=True) + hc_eps)
-            cm = cm / (cm.sum(dim=-2, keepdim=True) + hc_eps)
-        inv_norm = torch.rsqrt(q_tot / hidden + norm_eps)
-        y_tok = (c_ref[tok].float() * inv_norm * weight.float()).bfloat16()
-        return pre_tok, post_tok, cm, y_tok
-
-    pre_ref = torch.empty((tokens, mult), dtype=torch.float32)
-    post_ref = torch.empty((tokens, mult), dtype=torch.float32)
-    comb_ref = torch.empty((tokens, mult, mult), dtype=torch.float32)
-    y_ref = torch.empty((tokens, hidden), dtype=torch.bfloat16)
-    for tok in range(tokens):
-        pre_ref[tok], post_ref[tok], comb_ref[tok], y_ref[tok] = finalize_token(tok)
-
-    # Fused Stage 2 simulation with arbitrary split CTA arrival permutations per tile
-    rng = random.Random(seed)
-    tiles = (tokens + block_m - 1) // block_m
-    counters = [0 for _ in range(tiles)]
-    pre_fused = torch.empty_like(pre_ref)
-    post_fused = torch.empty_like(post_ref)
-    comb_fused = torch.empty_like(comb_ref)
-    y_fused = torch.empty_like(y_ref)
-
-    for by in range(tiles):
-        live_m = min(tokens - by * block_m, block_m)
-        arrival_order = list(range(splits))
-        rng.shuffle(arrival_order)
-        claimed_ranks: list[int] = []
-        for _sp in arrival_order:
-            arrived = counters[by]
-            counters[by] += 1
-            rank = splits - 1 - arrived
-            if rank >= live_m:
-                continue
-            if live_m == 1:
-                counters[by] = 0
-            claimed_ranks.append(rank)
-        assert sorted(claimed_ranks) == list(range(live_m))
-        if live_m > 1:
-            assert counters[by] == splits
-        for rank in claimed_ranks:
-            tok = by * block_m + rank
-            # Each claiming CTA still loops i_split in 0..splits-1 (fixed split order)
-            pre_fused[tok], post_fused[tok], comb_fused[tok], y_fused[tok] = finalize_token(tok)
-            if live_m > 1:
-                done = counters[by]
-                counters[by] += 1
-                if done == splits + live_m - 1:
-                    counters[by] = 0
-        assert counters[by] == 0
-
-    def bits_match(a: torch.Tensor, b: torch.Tensor) -> bool:
-        return bool(torch.equal(a.view(torch.uint8), b.view(torch.uint8)))
-
-    assert bits_match(pre_fused, pre_ref)
-    assert bits_match(post_fused, post_ref)
-    assert bits_match(comb_fused, comb_ref)
-    assert bits_match(y_fused, y_ref)
-    return {
-        "tokens": tokens,
-        "hidden": hidden,
-        "mode": mode,
-        "world": world,
-        "with_aux": with_aux,
-        "inject_nonfinite": inject_nonfinite,
-        "tiles": tiles,
-        "counters_reset_zero": all(c == 0 for c in counters),
-        "bits_identical": True,
-    }
-
-
-def run_cpu_verify(output_path: Path | None) -> dict:
-    import tilelang
-    from tests.kernels.deepseek_v41_pdl_sources import TRIGGER, WAIT, violations
-    from vllm.models.deepseek_v4_1.tilelang import iket, mhc
-
-    assert mhc.FINALIZE_FUSE_MAX_ROWS == 16
-    target = {"kind": "cuda", "arch": "sm_121a"}
-    mhc.project_and_finalize_streams.target = target
-
-    variants = [
-        ("pre", 1, False),
-        ("broadcast", 1, False),
-        ("post_pre", 1, False),
-        ("post_pre", 1, True),
-        ("post_pre", 2, False),
-        ("post_pre", 2, True),
-        ("post_pre", 3, False),
-        ("post_pre", 3, True),
-        ("post_pre", 4, False),
-        ("post_pre", 4, True),
-    ]
-    compiled_variants = []
-    for mode, world, with_aux in variants:
-        k_dim = 5120 if mode == "broadcast" else 20480
-        prim = mhc.project_and_finalize_streams.get_tir(
-            5120, mode, k_dim, 1e-6, 1e-6, 20, 1e-6,
-            block_M=16, world=world, with_aux=with_aux,
-        )
-        with tilelang.tvm.target.Target(target), tilelang.transform.PassContext(
-            opt_level=3, config=mhc._PASS_CONFIGS
-        ):
-            art = tilelang.lower(prim, target=target)
-        src = art.kernel_source
-        pdl_viol = violations(src, False)
-        assert pdl_viol == [], f"PDL violations for {mode} w={world} aux={with_aux}: {pdl_viol}"
-        wait_pos = src.find(WAIT)
-        claim_pos = src.find("mhc_claim(", wait_pos)
-        trig_pos = src.find(TRIGGER, wait_pos)
-        spin_pos = src.find("mhc_wait_splits(", wait_pos)
-        assert 0 <= wait_pos < claim_pos < trig_pos < spin_pos
-
-        _, sites_fine_1 = iket.annotate(src, lambda _k, _r: 1, granularity="fine", iters=1)
-        _, sites_fine_2 = iket.annotate(src, lambda _k, _r: 1, granularity="fine", iters=2)
-        bound1 = sites_fine_1[0]["events_per_warp_bound"]
-        bound2 = sites_fine_2[0]["events_per_warp_bound"]
-        assert bound1 <= 60
-        assert len(sites_fine_1) <= 30
-
-        with tempfile.TemporaryDirectory() as tmpdir:
-            cu_path = Path(tmpdir) / "kernel.cu"
-            cubin_path = Path(tmpdir) / "kernel.cubin"
-            cu_path.write_text(src, encoding="utf-8")
-            cmd = [
-                "/usr/local/cuda/bin/nvcc",
-                "-cubin",
-                "-arch=sm_121a",
-                "-O3",
-                "--expt-relaxed-constexpr",
-                "-Xptxas=-v",
-                "-I/usr/local/lib/python3.12/dist-packages/tilelang/3rdparty/cutlass/include",
-                "-I/usr/local/lib/python3.12/dist-packages/tilelang/src",
-                str(cu_path),
-                "-o",
-                str(cubin_path),
-            ]
-            res = subprocess.run(cmd, capture_output=True, text=True, check=True)
-            ptx_lines = [
-                line.strip()
-                for line in res.stderr.splitlines()
-                if "registers" in line or "spill" in line or "smem" in line
-            ]
-            assert any(
-                "0 bytes spill stores, 0 bytes spill loads" in line for line in ptx_lines
-            ), ptx_lines
-
-        compiled_variants.append(
-            {
-                "mode": mode,
-                "world": world,
-                "with_aux": with_aux,
-                "iket_sites": len(sites_fine_1),
-                "iket_bound_iters1": bound1,
-                "iket_bound_iters2": bound2,
-                "pdl_violations": len(pdl_viol),
-                "pdl_order_valid": True,
-                "ptxas": ptx_lines,
-            }
-        )
-
-    oracle_cases = []
-    # Full H=5120 bit-exactness checks for M=1, 6, 16 across modes
-    for mode, world, with_aux in [("pre", 1, False), ("broadcast", 1, False), ("post_pre", 3, True), ("post_pre", 4, True)]:
-        for rows in (1, 6, 16):
-            oracle_cases.append(
-                simulate_split_vs_fused_cpu(
-                    rows, hidden=5120, block_h=128, mode=mode, world=world, with_aux=with_aux, seed=1000 + rows
+            s_acc = torch.zeros((M,), dtype=torch.float32)
+            p_acc = torch.zeros((M, MIXES), dtype=torch.float32)
+            for n in range(MULT):
+                a_blk = r_out[:, n, h0:h1].float()
+                s_acc = s_acc + (a_blk * a_blk).sum(dim=-1)
+                k0 = n * H + h0
+                k1 = k0 + BLOCK_H
+                p_acc = p_acc + (
+                    a_blk @ fn_high[:, k0:k1].T
+                    + a_blk @ fn_mid[:, k0:k1].T
+                    + a_blk @ fn_low[:, k0:k1].T
                 )
-            )
-    # Decode & prefill row sweep + non-finite checks
-    for rows in (1, 2, 4, 6, 8, 12, 15, 16, 17, 24, 32, 48, 64, 96, 6144, 16384):
-        oracle_cases.append(
-            simulate_split_vs_fused_cpu(
-                rows,
-                hidden=320,
-                block_h=8,
-                mode="post_pre",
-                world=3,
-                with_aux=True,
-                inject_nonfinite=(rows in (16, 96)),
-                seed=2000 + rows,
-            )
-        )
+            S[sp] = s_acc
+            P[sp] = p_acc
 
-    report = {
-        "finalize_fuse_max_rows": mhc.FINALIZE_FUSE_MAX_ROWS,
-        "compiled_variants": compiled_variants,
-        "cpu_oracle_cases": len(oracle_cases),
-        "all_cpu_oracle_bits_identical": all(c["bits_identical"] for c in oracle_cases),
-        "all_counters_reset_zero": all(c["counters_reset_zero"] for c in oracle_cases),
+    s_sum = torch.zeros((M,), dtype=torch.float32)
+    p_sum = torch.zeros((M, MIXES), dtype=torch.float32)
+    q_sum = torch.zeros((M,), dtype=torch.float32)
+    for sp in range(splits):
+        s_sum = s_sum + S[sp]
+        p_sum = p_sum + P[sp]
+        q_sum = q_sum + Q[sp]
+
+    k_group = H if mode == "broadcast" else MULT * H
+    rms_l = torch.rsqrt(s_sum / k_group + RMS_EPS).unsqueeze(-1)
+    pre_out = torch.sigmoid(p_sum[:, :MULT] * rms_l * scale[0] + base[:MULT]) + HC_EPS
+    post_out = (
+        torch.sigmoid(p_sum[:, MULT : 2 * MULT] * rms_l * scale[1] + base[MULT : 2 * MULT])
+        * 2.0
+    )
+    cm = (p_sum[:, 2 * MULT :] * rms_l * scale[2] + base[2 * MULT :]).view(M, MULT, MULT)
+    rmax = cm.amax(dim=-1, keepdim=True)
+    cm = torch.exp(cm - rmax)
+    cm = cm / cm.sum(dim=-1, keepdim=True) + HC_EPS
+    cm = cm / (cm.sum(dim=-2, keepdim=True) + HC_EPS)
+    for _ in range(SINKHORN_ITERS - 1):
+        cm = cm / (cm.sum(dim=-1, keepdim=True) + HC_EPS)
+        cm = cm / (cm.sum(dim=-2, keepdim=True) + HC_EPS)
+    comb_out = cm
+
+    norm_scale = torch.rsqrt(q_sum / H + RMS_EPS).unsqueeze(-1)
+    y_out = (c_bf16.float() * norm_scale * weight.float()).bfloat16()
+    return r_out.view(M, MULT * H), post_out, comb_out, pre_out, y_out, aux_bf16
+
+
+def run_cpu_verify(mhc_path: Path, pdl_sources_path: Path, out_json: Path) -> None:
+    src = mhc_path.read_text()
+    tree = ast.parse(src, filename=str(mhc_path))
+    fn_names = [n.name for n in ast.walk(tree) if isinstance(n, ast.FunctionDef)]
+    assign_names = [
+        t.id
+        for n in ast.walk(tree)
+        if isinstance(n, ast.Assign)
+        for t in n.targets
+        if isinstance(t, ast.Name)
+    ]
+    assert "project_streams" in fn_names
+    assert "finalize" in fn_names
+    assert "project_and_finalize_streams" not in fn_names, (
+        "project_and_finalize_streams must be removed"
+    )
+    assert "FINALIZE_FUSE_MAX_ROWS" not in assign_names, (
+        "FINALIZE_FUSE_MAX_ROWS must be removed"
+    )
+
+    pdl_src = pdl_sources_path.read_text()
+    assert "\"mhc_project_finalize\"" not in pdl_src
+
+    results = []
+    for M in (1, 2, 6, 16, 33):
+        for mode in ("pre", "post_pre", "broadcast"):
+            g = torch.Generator().manual_seed(1000 + M)
+            x = torch.randn((1, M, HIDDEN), generator=g, dtype=torch.bfloat16)
+            r = torch.randn((M, MULT * HIDDEN), generator=g, dtype=torch.bfloat16)
+            post_in = torch.rand((M, MULT), generator=g, dtype=torch.float32) * 2.0
+            comb_in = torch.softmax(torch.randn((M, MULT, MULT), generator=g), dim=-1)
+            pre_in = torch.softmax(torch.randn((M, MULT), generator=g), dim=-1) + 1e-6
+            k = HIDDEN if mode == "broadcast" else MULT * HIDDEN
+            fn = torch.randn((MIXES, k), generator=g, dtype=torch.float32) * 0.02
+            scale = torch.randn((3,), generator=g, dtype=torch.float32) * 0.1 + 1.0
+            base = torch.randn((MIXES,), generator=g, dtype=torch.float32) * 0.1
+            weight = (torch.randn((HIDDEN,), generator=g) * 0.1 + 1.0).bfloat16()
+            r_out, post_out, comb_out, pre_out, y_out, _ = cpu_reference_split_order(
+                x, r, post_in, comb_in, pre_in, fn, scale, base, weight, mode=mode
+            )
+            r2, post2, comb2, pre2, y2, _ = cpu_reference_split_order(
+                x, r, post_in, comb_in, pre_in, fn, scale, base, weight, mode=mode
+            )
+            assert torch.equal(r_out.view(torch.int16), r2.view(torch.int16))
+            assert torch.equal(post_out.view(torch.int32), post2.view(torch.int32))
+            assert torch.equal(comb_out.view(torch.int32), comb2.view(torch.int32))
+            assert torch.equal(pre_out.view(torch.int32), pre2.view(torch.int32))
+            assert torch.equal(y_out.view(torch.int16), y2.view(torch.int16))
+            results.append(
+                {
+                    "M": M,
+                    "mode": mode,
+                    "finite_all_ok": bool(
+                        torch.isfinite(post_out).all()
+                        and torch.isfinite(comb_out).all()
+                        and torch.isfinite(pre_out).all()
+                        and torch.isfinite(y_out).all()
+                    ),
+                    "deterministic_bits_equal": True,
+                }
+            )
+
+    payload = {
+        "status": "ok",
+        "ast_verified": True,
+        "optionality_removed": True,
+        "cpu_reference_cases": len(results),
+        "cases": results,
     }
-    if output_path is not None:
-        output_path.write_text(json.dumps(report, indent=2) + "\n", encoding="utf-8")
-    print(json.dumps(report, indent=2))
-    return report
+    out_json.write_text(json.dumps(payload, indent=2) + "\n")
+    print(f"CPU verification passed ({len(results)} cases) -> {out_json}")
 
 
-def _define_base_0634_fused():
+def compulsory_dram_bytes(M: int, world: int, with_aux: bool) -> dict[str, float]:
+    """Compulsory DRAM traffic (in decimal MB = 1e6 B and MiB = 2^20 B) of post_pre + finalize."""
+    # project_streams (post_pre):
+    # Reads: X (world * M * H * 2B), R (M * 4 * H * 2B), Fn (24 * 4 * H * 4B), mixes (M * 24 * 4B)
+    # Writes: R_out (M * 4 * H * 2B), C (M * H * 2B), Aux (M * H * 2B if with_aux),
+    #         P (40 * M * 24 * 4B), S (40 * M * 4B), Q (40 * M * 4B)
+    proj_read = (
+        world * M * HIDDEN * 2
+        + M * MULT * HIDDEN * 2
+        + MIXES * MULT * HIDDEN * 4
+        + M * MIXES * 4
+    )
+    proj_write = (
+        M * MULT * HIDDEN * 2
+        + M * HIDDEN * 2
+        + (M * HIDDEN * 2 if with_aux else 0)
+        + SPLITS * M * (MIXES + 2) * 4
+    )
+    proj_total = proj_read + proj_write
+
+    # finalize:
+    # Reads: C (M * H * 2B), P, S, Q (40 * M * 26 * 4B), weight (H * 2B), scale+base (108B)
+    # Writes: y (M * H * 2B), yq (M * H * 1B), ysf (M * (H // 32) * 1B), mixes_out (M * 24 * 4B)
+    fin_read = M * HIDDEN * 2 + SPLITS * M * (MIXES + 2) * 4 + HIDDEN * 2 + 108
+    fin_write = M * HIDDEN * 2 + M * HIDDEN * 1 + M * (HIDDEN // 32) * 1 + M * MIXES * 4
+    fin_total = fin_read + fin_write
+
+    return {
+        "proj_mb": round(proj_total / 1e6, 2),
+        "proj_mib": round(proj_total / (1024 * 1024), 2),
+        "fin_mb": round(fin_total / 1e6, 2),
+        "fin_mib": round(fin_total / (1024 * 1024), 2),
+        "total_mb": round((proj_total + fin_total) / 1e6, 2),
+        "total_mib": round((proj_total + fin_total) / (1024 * 1024), 2),
+    }
+
+
+def _make_base_kernels():
+    """Compile Base Candidate 1107 kernels (base project_streams without Fn0 preload,
+    and 0634 single-CTA fused project_and_finalize_streams for M=1 comparison)."""
     import tilelang
     import tilelang.language as T
-    from vllm.models.deepseek_v4_1.tilelang import mhc, pdl
-    from vllm.models.deepseek_v4_1.tilelang.gemm import cast_block_mxfp8, scale_words
+    from vllm.models.deepseek_v4_1.tilelang import mhc as mhc_mod
+    from vllm.models.deepseek_v4_1.tilelang import pdl
+    from vllm.models.deepseek_v4_1.tilelang.gemm import scale_words
 
-    @tilelang.jit(pass_configs=mhc._PASS_CONFIGS)
-    def base_0634_project_and_finalize_streams(
+    pass_cfg = mhc_mod._PASS_CONFIGS
+
+    @tilelang.jit(pass_configs=pass_cfg)
+    def base_project_streams(
         hidden_size: int,
         mode: str,
-        rms_group_size: int,
-        rms_eps: float,
-        hc_eps: float,
-        sinkhorn_repeat: int,
-        norm_eps: float,
-        post_mult: float = 2.0,
-        block_M: int = mhc.BLOCK_M,
-        block_H: int = mhc.BLOCK_H,
+        block_M: int = 16,
+        block_H: int = BLOCK_H,
+        world: int = 1,
+        with_aux: bool = False,
     ):
-        MULT = mhc.MULT
-        MIXES = mhc.MIXES
-        VEC = mhc.VEC
         splits = hidden_size // block_H
         streams = 1 if mode == "broadcast" else MULT
         K = streams * hidden_size
@@ -374,11 +292,8 @@ def _define_base_0634_fused():
         LANES = 8
         COLS = block_H // LANES
         threads = block_M * LANES
-        chunks = hidden_size // VEC
-        workers = threads - 32
-        sf_width = 4 * scale_words(hidden_size)
         H = hidden_size
-        M, Mq, tiles = T.dynamic("M, Mq, tiles")
+        M = T.dynamic("M")
 
         @T.macro
         def load_split_tf32(Fn, k0, F_shared, F_mid, F_low):
@@ -393,12 +308,148 @@ def _define_base_0634_fused():
                 F_mid[i, j] = middle
                 F_low[i, j] = rest - middle
 
+        @T.macro
+        def _body(X, R, post, comb, pre_in, Fn, R_out, P, S, C, Q, Aux, sp, by):
+            pdl.chain()
+            h0 = sp * block_H
+            A_shared = T.alloc_shared((block_M, block_H), T.float32)
+            F_shared = T.alloc_shared((N, block_H), T.float32)
+            F_mid = T.alloc_shared((N, block_H), T.float32)
+            F_low = T.alloc_shared((N, block_H), T.float32)
+            C_local = T.alloc_fragment((block_M, N), T.float32)
+            xv = T.alloc_local((COLS,), T.bfloat16)
+            xp = T.alloc_local((world * COLS,), T.bfloat16)
+            rv = T.alloc_local((MULT * COLS,), T.bfloat16)
+            nv = T.alloc_local((COLS,), T.bfloat16)
+            av = T.alloc_local((COLS,), T.float32)
+            sq = T.alloc_local((COLS,), T.float32)
+            col = T.alloc_local((COLS,), T.float32)
+            aux_col = T.alloc_local((COLS,), T.float32)
+            coef = T.alloc_local((2 * MULT + MULT * MULT,), T.float32)
+            red = T.alloc_local((1,), T.float32)
+            tx = T.get_thread_binding()
+            row = tx // LANES
+            c0 = (tx % LANES) * COLS
+            token = by * block_M + row
+            src = T.min(token, M - 1)
+            T.clear(C_local)
+            for i, j in T.Parallel(N - MIXES, block_H):
+                F_shared[MIXES + i, j] = 0.0
+                F_mid[MIXES + i, j] = 0.0
+                F_low[MIXES + i, j] = 0.0
+            for k in T.unroll(MULT):
+                coef[k] = pre_in[src, k]
+            if mode == "post_pre":
+                for k in T.unroll(MULT):
+                    coef[MULT + k] = post[src, k]
+                for k in T.unroll(MULT * MULT):
+                    coef[2 * MULT + k] = comb[src, k // MULT, k % MULT]
+            for m in T.unroll(MULT):
+                for v in T.vectorized(COLS):
+                    rv[m * COLS + v] = R[src, m * H + h0 + c0 + v]
+            if world == 1:
+                for v in T.vectorized(COLS):
+                    xv[v] = X[0, src, h0 + c0 + v]
+            else:
+                for r in T.unroll(world):
+                    for v in T.vectorized(COLS):
+                        xp[r * COLS + v] = X[r, src, h0 + c0 + v]
+                for r in T.unroll(world):
+                    for v in T.unroll(COLS):
+                        if r == 0:
+                            av[v] = T.Cast(T.float32, xp[v])
+                        else:
+                            av[v] = av[v] + T.Cast(T.float32, xp[r * COLS + v])
+                for v in T.unroll(COLS):
+                    xv[v] = T.Cast(T.bfloat16, av[v])
+            for v in T.unroll(COLS):
+                sq[v] = 0.0
+                col[v] = 0.0
+                if with_aux:
+                    aux_col[v] = 0.0
+            for n in T.unroll(MULT):
+                load_split_tf32(Fn, n * H + h0, F_shared, F_mid, F_low)
+                for v in T.unroll(COLS):
+                    av[v] = coef[2 * MULT + n] * T.Cast(T.float32, rv[v])
+                    av[v] = T.fma(coef[MULT + n], T.Cast(T.float32, xv[v]), av[v])
+                    for m in T.unroll(1, MULT):
+                        av[v] = T.fma(
+                            coef[2 * MULT + m * MULT + n],
+                            T.Cast(T.float32, rv[m * COLS + v]),
+                            av[v],
+                        )
+                    nv[v] = T.Cast(T.bfloat16, av[v])
+                if token < M:
+                    for v in T.vectorized(COLS):
+                        R_out[token, n * H + h0 + c0 + v] = nv[v]
+                for v in T.unroll(COLS):
+                    av[v] = T.Cast(T.float32, nv[v])
+                    A_shared[row, c0 + v] = av[v]
+                    sq[v] += av[v] * av[v]
+                    col[v] += coef[n] * av[v]
+                    if with_aux:
+                        aux_col[v] = T.fma(T.float32(0.25), av[v], aux_col[v])
+                T.sync_threads()
+                T.gemm(A_shared, F_shared, C_local, transpose_B=True)
+                T.gemm(A_shared, F_mid, C_local, transpose_B=True)
+                T.gemm(A_shared, F_low, C_local, transpose_B=True)
+                T.sync_threads()
+            if with_aux:
+                for v in T.unroll(COLS):
+                    nv[v] = T.Cast(T.bfloat16, aux_col[v])
+                if token < M:
+                    for v in T.vectorized(COLS):
+                        Aux[token, h0 + c0 + v] = nv[v]
+            for v in T.unroll(COLS):
+                nv[v] = T.Cast(T.bfloat16, col[v])
+            if token < M:
+                for v in T.vectorized(COLS):
+                    C[token, h0 + c0 + v] = nv[v]
+            red[0] = 0.0
+            for v in T.unroll(COLS):
+                red[0] += T.Cast(T.float32, nv[v]) * T.Cast(T.float32, nv[v])
+            red[0] += T.shfl_xor(red[0], 4)
+            red[0] += T.shfl_xor(red[0], 2)
+            red[0] += T.shfl_xor(red[0], 1)
+            if tx % LANES == 0 and token < M:
+                Q[sp, token] = red[0]
+            red[0] = 0.0
+            for v in T.unroll(COLS):
+                red[0] += sq[v]
+            red[0] += T.shfl_xor(red[0], 4)
+            red[0] += T.shfl_xor(red[0], 2)
+            red[0] += T.shfl_xor(red[0], 1)
+            if tx % LANES == 0 and token < M:
+                S[sp, token, 0] = red[0]
+            for i, j in T.Parallel(block_M, MIXES):
+                if by * block_M + i < M:
+                    P[sp, by * block_M + i, 0, j] = C_local[i, j]
+
+        if not with_aux:
+            @T.prim_func
+            def mhc_project_streams_base(
+                X: T.Tensor((world, M, H), T.bfloat16),
+                R: T.Tensor((M, MULT * H), T.bfloat16),
+                post: T.Tensor((M, MULT), T.float32),
+                comb: T.Tensor((M, MULT, MULT), T.float32),
+                pre_in: T.Tensor((M, MULT), T.float32),
+                Fn: T.Tensor((MIXES, K), T.float32),
+                R_out: T.Tensor((M, MULT * H), T.bfloat16),
+                P: T.Tensor((splits, M, 1, MIXES), T.float32),
+                S: T.Tensor((splits, M, 1), T.float32),
+                C: T.Tensor((M, H), T.bfloat16),
+                Q: T.Tensor((splits, M), T.float32),
+            ):
+                with T.Kernel(splits, T.ceildiv(M, block_M), threads=threads) as (sp, by):
+                    _body(X, R, post, comb, pre_in, Fn, R_out, P, S, C, Q, C, sp, by)
+            return mhc_project_streams_base
+
         @T.prim_func
-        def mhc_project_finalize_base(
-            X: T.Tensor((1, M, H), T.bfloat16),
+        def mhc_project_streams_base_aux(
+            X: T.Tensor((world, M, H), T.bfloat16),
             R: T.Tensor((M, MULT * H), T.bfloat16),
-            post_in: T.Tensor((M, MULT), T.float32),
-            comb_in: T.Tensor((M, MULT, MULT), T.float32),
+            post: T.Tensor((M, MULT), T.float32),
+            comb: T.Tensor((M, MULT, MULT), T.float32),
             pre_in: T.Tensor((M, MULT), T.float32),
             Fn: T.Tensor((MIXES, K), T.float32),
             R_out: T.Tensor((M, MULT * H), T.bfloat16),
@@ -406,566 +457,290 @@ def _define_base_0634_fused():
             S: T.Tensor((splits, M, 1), T.float32),
             C: T.Tensor((M, H), T.bfloat16),
             Q: T.Tensor((splits, M), T.float32),
-            counters: T.Tensor((tiles,), T.int32),
-            scale: T.Tensor((3,), T.float32),
-            base: T.Tensor((MIXES,), T.float32),
-            weight: T.Tensor((H,), T.bfloat16),
-            post_out: T.Tensor((M, MULT), T.float32),
-            comb_out: T.Tensor((M, MULT, MULT), T.float32),
-            pre_out: T.Tensor((M, MULT), T.float32),
-            y: T.Tensor((M, H), T.bfloat16),
-            yq: T.Tensor((Mq, H), T.float8_e4m3fn),
-            ysf: T.Tensor((Mq, sf_width), T.uint8),
+            Aux: T.Tensor((M, H), T.bfloat16),
         ):
             with T.Kernel(splits, T.ceildiv(M, block_M), threads=threads) as (sp, by):
-                T.import_source(mhc._FUSE_HEADER)
-                pdl.chain()
-                h0 = sp * block_H
-                A_shared = T.alloc_shared((block_M, block_H), T.float32)
-                F_shared = T.alloc_shared((N, block_H), T.float32)
-                F_mid = T.alloc_shared((N, block_H), T.float32)
-                F_low = T.alloc_shared((N, block_H), T.float32)
-                last = T.alloc_shared((1,), T.int32)
-                C_local = T.alloc_fragment((block_M, N), T.float32)
-                xv = T.alloc_local((COLS,), T.bfloat16)
-                rv = T.alloc_local((MULT * COLS,), T.bfloat16)
-                nv = T.alloc_local((COLS,), T.bfloat16)
-                av = T.alloc_local((COLS,), T.float32)
-                sq = T.alloc_local((COLS,), T.float32)
-                col = T.alloc_local((COLS,), T.float32)
-                coef = T.alloc_local((2 * MULT + MULT * MULT,), T.float32)
-                red = T.alloc_local((1,), T.float32)
-                wv = T.alloc_local((VEC,), T.bfloat16)
-                yv = T.alloc_local((VEC,), T.bfloat16)
-                xf = T.alloc_local((VEC,), T.float32)
-                xq = T.alloc_local((VEC,), T.float8_e4m3fn)
-                total = T.alloc_local((1,), T.float32)
-                amax = T.alloc_local((1,), T.float32)
-                rms_l = T.alloc_local((1,), T.float32)
-                p_pre = T.alloc_local((1,), T.float32)
-                p_post = T.alloc_local((1,), T.float32)
-                p_cm = T.alloc_local((1,), T.float32)
-                cm_l = T.alloc_local((1,), T.float32)
-                rmax_l = T.alloc_local((1,), T.float32)
-                rsum_l = T.alloc_local((1,), T.float32)
-                csum_l = T.alloc_local((1,), T.float32)
-                tx = T.get_thread_binding()
-                row = tx // LANES
-                c0 = (tx % LANES) * COLS
-                token = by * block_M + row
-                src = T.min(token, M - 1)
-                T.clear(C_local)
-                for i, j in T.Parallel(N - MIXES, block_H):
-                    F_shared[MIXES + i, j] = 0.0
-                    F_mid[MIXES + i, j] = 0.0
-                    F_low[MIXES + i, j] = 0.0
-                for k in T.unroll(MULT):
-                    coef[k] = pre_in[src, k]
-                for k in T.unroll(MULT):
-                    coef[MULT + k] = post_in[src, k]
-                for k in T.unroll(MULT * MULT):
-                    coef[2 * MULT + k] = comb_in[src, k // MULT, k % MULT]
-                for v in T.vectorized(COLS):
-                    xv[v] = X[0, src, h0 + c0 + v]
-                for m in T.unroll(MULT):
-                    for v in T.vectorized(COLS):
-                        rv[m * COLS + v] = R[src, m * H + h0 + c0 + v]
-                for v in T.unroll(COLS):
-                    sq[v] = 0.0
-                    col[v] = 0.0
-                for n in T.unroll(MULT):
-                    for v in T.unroll(COLS):
-                        av[v] = coef[2 * MULT + n] * T.Cast(T.float32, rv[v])
-                        av[v] = T.fma(coef[MULT + n], T.Cast(T.float32, xv[v]), av[v])
-                        for m in T.unroll(1, MULT):
-                            av[v] = T.fma(
-                                coef[2 * MULT + m * MULT + n],
-                                T.Cast(T.float32, rv[m * COLS + v]),
-                                av[v],
-                            )
-                        nv[v] = T.Cast(T.bfloat16, av[v])
-                    if token < M:
-                        for v in T.vectorized(COLS):
-                            R_out[token, n * H + h0 + c0 + v] = nv[v]
-                    for v in T.unroll(COLS):
-                        av[v] = T.Cast(T.float32, nv[v])
-                        A_shared[row, c0 + v] = av[v]
-                        sq[v] += av[v] * av[v]
-                        col[v] += coef[n] * av[v]
-                    load_split_tf32(Fn, n * H + h0, F_shared, F_mid, F_low)
-                    T.sync_threads()
-                    T.gemm(A_shared, F_shared, C_local, transpose_B=True)
-                    T.gemm(A_shared, F_mid, C_local, transpose_B=True)
-                    T.gemm(A_shared, F_low, C_local, transpose_B=True)
-                    T.sync_threads()
-                for v in T.unroll(COLS):
-                    nv[v] = T.Cast(T.bfloat16, col[v])
-                if token < M:
-                    for v in T.vectorized(COLS):
-                        C[token, h0 + c0 + v] = nv[v]
-                red[0] = 0.0
-                for v in T.unroll(COLS):
-                    red[0] += T.Cast(T.float32, nv[v]) * T.Cast(T.float32, nv[v])
-                red[0] += T.shfl_xor(red[0], 4)
-                red[0] += T.shfl_xor(red[0], 2)
-                red[0] += T.shfl_xor(red[0], 1)
-                if tx % LANES == 0 and token < M:
-                    Q[sp, token] = red[0]
-                red[0] = 0.0
-                for v in T.unroll(COLS):
-                    red[0] += sq[v]
-                red[0] += T.shfl_xor(red[0], 4)
-                red[0] += T.shfl_xor(red[0], 2)
-                red[0] += T.shfl_xor(red[0], 1)
-                if tx % LANES == 0 and token < M:
-                    S[sp, token, 0] = red[0]
-                for i, j in T.Parallel(block_M, MIXES):
-                    if by * block_M + i < M:
-                        P[sp, by * block_M + i, 0, j] = C_local[i, j]
-                T.call_extern("handle", "mhc_fence")
-                T.sync_threads()
-                if tx == 0:
-                    arrived = T.atomic_add(
-                        counters[by], 1, memory_order="acq_rel", return_prev=True
-                    )
-                    last[0] = T.if_then_else(arrived == splits - 1, 1, 0)
-                T.sync_threads()
-                if last[0] == 1:
-                    T.call_extern("handle", "mhc_fence")
-                    if tx == 0:
-                        counters[by] = 0
-                    if tx < 32:
-                        half = tx // 16
-                        lane16 = tx % 16
-                        r_idx = lane16 // MULT
-                        c_idx = lane16 % MULT
-                        for pair in T.serial(block_M // 2):
-                            tok = by * block_M + pair * 2 + half
-                            if tok < M:
-                                rms_l[0] = 0.0
-                                p_pre[0] = 0.0
-                                p_post[0] = 0.0
-                                p_cm[0] = 0.0
-                                for i_split in T.serial(splits):
-                                    rms_l[0] += S[i_split, tok, 0]
-                                    if lane16 < MULT:
-                                        p_pre[0] += P[i_split, tok, 0, lane16]
-                                        p_post[0] += P[i_split, tok, 0, lane16 + MULT]
-                                    p_cm[0] += P[i_split, tok, 0, lane16 + 2 * MULT]
-                                rms_l[0] = T.rsqrt(rms_l[0] / rms_group_size + rms_eps)
-                                if lane16 < MULT:
-                                    pre_out[tok, lane16] = (
-                                        T.sigmoid(
-                                            p_pre[0] * rms_l[0] * scale[0] + base[lane16]
-                                        )
-                                        + hc_eps
-                                    )
-                                    post_out[tok, lane16] = (
-                                        T.sigmoid(
-                                            p_post[0] * rms_l[0] * scale[1]
-                                            + base[lane16 + MULT]
-                                        )
-                                        * post_mult
-                                    )
-                                cm_l[0] = (
-                                    p_cm[0] * rms_l[0] * scale[2]
-                                    + base[lane16 + 2 * MULT]
-                                )
-                                rmax_l[0] = cm_l[0]
-                                rmax_l[0] = T.max(rmax_l[0], T.shfl_xor(rmax_l[0], 2))
-                                rmax_l[0] = T.max(rmax_l[0], T.shfl_xor(rmax_l[0], 1))
-                                cm_l[0] = T.exp(cm_l[0] - rmax_l[0])
-                                rsum_l[0] = cm_l[0]
-                                rsum_l[0] += T.shfl_xor(rsum_l[0], 2)
-                                rsum_l[0] += T.shfl_xor(rsum_l[0], 1)
-                                cm_l[0] = cm_l[0] / rsum_l[0] + hc_eps
-                                csum_l[0] = cm_l[0]
-                                csum_l[0] += T.shfl_xor(csum_l[0], 8)
-                                csum_l[0] += T.shfl_xor(csum_l[0], 4)
-                                cm_l[0] = cm_l[0] / (csum_l[0] + hc_eps)
-                                for _ in T.serial(sinkhorn_repeat - 1):
-                                    rsum_l[0] = cm_l[0]
-                                    rsum_l[0] += T.shfl_xor(rsum_l[0], 2)
-                                    rsum_l[0] += T.shfl_xor(rsum_l[0], 1)
-                                    cm_l[0] = cm_l[0] / (rsum_l[0] + hc_eps)
-                                    csum_l[0] = cm_l[0]
-                                    csum_l[0] += T.shfl_xor(csum_l[0], 8)
-                                    csum_l[0] += T.shfl_xor(csum_l[0], 4)
-                                    cm_l[0] = cm_l[0] / (csum_l[0] + hc_eps)
-                                comb_out[tok, r_idx, c_idx] = cm_l[0]
-                    else:
-                        worker = tx - 32
-                        for ti in T.serial(block_M):
-                            tok = by * block_M + ti
-                            if tok < M:
-                                total[0] = 0.0
-                                for i_split in T.serial(splits):
-                                    total[0] += Q[i_split, tok]
-                                total[0] = T.rsqrt(total[0] / H + norm_eps)
-                                for step in T.serial(T.ceildiv(chunks, workers)):
-                                    chunk = step * workers + worker
-                                    if chunk < chunks:
-                                        for v in T.vectorized(VEC):
-                                            yv[v] = C[tok, chunk * VEC + v]
-                                        for v in T.vectorized(VEC):
-                                            wv[v] = weight[chunk * VEC + v]
-                                        for v in T.unroll(VEC):
-                                            xv[v] = T.Cast(
-                                                T.bfloat16,
-                                                T.Cast(T.float32, yv[v])
-                                                * total[0]
-                                                * T.Cast(T.float32, wv[v]),
-                                            )
-                                        for v in T.vectorized(VEC):
-                                            y[tok, chunk * VEC + v] = xv[v]
-                                        amax[0] = T.float32(0)
-                                        for v in T.unroll(VEC):
-                                            xf[v] = T.Cast(T.float32, xv[v])
-                                            amax[0] = T.max(amax[0], T.abs(xf[v]))
-                                        amax[0] = T.max(amax[0], T.shfl_xor(amax[0], 1))
-                                        amax[0] = T.max(amax[0], T.shfl_xor(amax[0], 2))
-                                        cast_block_mxfp8(
-                                            xf, xq, VEC, amax[0], yq, ysf, tok, chunk * VEC
-                                        )
+                _body(X, R, post, comb, pre_in, Fn, R_out, P, S, C, Q, Aux, sp, by)
+        return mhc_project_streams_base_aux
 
-        return mhc_project_finalize_base
-
-    return base_0634_project_and_finalize_streams
+    return base_project_streams
 
 
-def _bits_equal(a: torch.Tensor, b: torch.Tensor) -> bool:
-    if a.dtype != b.dtype or a.shape != b.shape:
-        return False
-    if a.element_size() == 2:
-        return bool(torch.equal(a.view(torch.int16), b.view(torch.int16)))
-    if a.element_size() == 4:
-        return bool(torch.equal(a.view(torch.int32), b.view(torch.int32)))
-    return bool(torch.equal(a.view(torch.uint8), b.view(torch.uint8)))
-
-
-def run_gpu_bench(output_path: Path | None) -> dict:
-    from vllm.models.deepseek_v4_1.tilelang import mhc
+def run_gpu_bench(out_json: Path) -> None:
+    from vllm.models.deepseek_v4_1.tilelang import mhc as mhc_mod
     from vllm.models.deepseek_v4_1.tilelang.gemm import scale_words
     from vllm.models.deepseek_v4_1.tilelang.linear import mxfp8_rows
+    from vllm.v1.worker.workspace import init_workspace_manager
 
-    device = torch.device("cuda", torch.cuda.current_device())
-    hidden = 5120
-    block_h = 128
-    block_m = 16
-    splits = hidden // block_h
-    streams = 4 * hidden
-    rms_eps = 1e-6
-    hc_eps = 1e-6
-    iters = 20
+    device = torch.device("cuda")
+    init_workspace_manager(device)
+    base_project_streams = _make_base_kernels()
 
-    # 1. Exhaustive GPU bit-identity checks across modes, world sizes, with_aux, finite & non-finite
-    correctness_cases = []
-    for mode, world, with_aux in [
-        ("pre", 1, False),
-        ("broadcast", 1, False),
-        ("post_pre", 1, False),
-        ("post_pre", 1, True),
-        ("post_pre", 3, False),
-        ("post_pre", 3, True),
-        ("post_pre", 4, True),
-    ]:
-        k_dim = hidden if mode == "broadcast" else streams
-        proj_k = mhc.project_streams(hidden, mode, block_M=block_m, world=world, with_aux=with_aux)
-        fin_k = mhc.finalize(hidden, k_dim, rms_eps, hc_eps, iters, rms_eps)
-        fused_k = mhc.project_and_finalize_streams(
-            hidden, mode, k_dim, rms_eps, hc_eps, iters, rms_eps,
-            block_M=block_m, world=world, with_aux=with_aux,
-        )
-        for tokens, nonfinite in [(1, False), (6, False), (15, False), (16, False), (16, True), (32, False), (48, True)]:
-            g = torch.Generator(device=device).manual_seed(5000 + tokens * 17 + world * 3 + int(with_aux))
-            x_in = torch.randn(world, tokens, hidden, generator=g, device=device, dtype=torch.bfloat16)
-            source = torch.randn(tokens, streams, generator=g, device=device, dtype=torch.bfloat16)
-            mix_post = 2 * torch.sigmoid(torch.randn(tokens, 4, generator=g, device=device))
-            mix_comb = torch.softmax(torch.randn(tokens, 4, 4, generator=g, device=device), -1)
-            incoming = torch.sigmoid(torch.randn(tokens, 4, generator=g, device=device)) + hc_eps
-            fn_in = torch.randn(24, k_dim, generator=g, device=device) * 0.02
-            scale = torch.tensor([0.8, 1.1, 0.9], device=device, dtype=torch.float32)
-            base = torch.randn(24, generator=g, device=device, dtype=torch.float32) * 0.1
-            weight = (torch.randn(hidden, generator=g, device=device) * 0.1 + 1.0).bfloat16()
-            x_in[:, :, :8] = -0.0
-            source[:, :8] = -0.0
-            if nonfinite and tokens >= 4:
-                x_in[0, 0, 16] = float("nan")
-                source[1, 32] = float("inf")
-                source[2, 64] = float("-inf")
-                incoming[3, 1] = float("nan")
-
-            mq = mxfp8_rows(tokens)
-            sf_w = 4 * scale_words(hidden)
-            R_ref = source.clone() if mode == "pre" else torch.empty_like(source)
-            P_ref = torch.empty(splits, tokens, 1, 24, dtype=torch.float32, device=device)
-            S_ref = torch.empty(splits, tokens, 1, dtype=torch.float32, device=device)
-            C_ref = torch.empty(tokens, hidden, dtype=torch.bfloat16, device=device)
-            Q_ref = torch.empty(splits, tokens, dtype=torch.float32, device=device)
-            post_ref = torch.empty(tokens, 4, dtype=torch.float32, device=device)
-            comb_ref = torch.empty(tokens, 4, 4, dtype=torch.float32, device=device)
-            pre_ref = torch.empty(tokens, 4, dtype=torch.float32, device=device)
-            y_ref = torch.empty(tokens, hidden, dtype=torch.bfloat16, device=device)
-            yq_ref = torch.empty(mq, hidden, dtype=torch.float8_e4m3fn, device=device)
-            ysf_ref = torch.empty(mq, sf_w, dtype=torch.uint8, device=device)
-            aux_ref = (torch.empty(tokens, hidden, dtype=torch.bfloat16, device=device),) if with_aux else ()
-
-            proj_k(x_in, source, mix_post, mix_comb, incoming, fn_in, R_ref, P_ref, S_ref, C_ref, Q_ref, *aux_ref)
-            fin_k(P_ref, S_ref, C_ref, Q_ref, scale, base, weight, post_ref, comb_ref, pre_ref, y_ref, yq_ref, ysf_ref)
-
-            R_out = source.clone() if mode == "pre" else torch.empty_like(R_ref)
-            P_out = torch.empty_like(P_ref)
-            S_out = torch.empty_like(S_ref)
-            C_out = torch.empty_like(C_ref)
-            Q_out = torch.empty_like(Q_ref)
-            post_out = torch.empty_like(post_ref)
-            comb_out = torch.empty_like(comb_ref)
-            pre_out = torch.empty_like(pre_ref)
-            y_out = torch.empty_like(y_ref)
-            yq_out = torch.empty_like(yq_ref)
-            ysf_out = torch.empty_like(ysf_ref)
-            aux_out = (torch.empty_like(aux_ref[0]),) if with_aux else ()
-            tiles = (tokens + block_m - 1) // block_m
-            counters = torch.zeros(tiles, dtype=torch.int32, device=device)
-
-            for _ in range(2):
-                fused_k(
-                    x_in, source, mix_post, mix_comb, incoming, fn_in,
-                    R_out, P_out, S_out, C_out, Q_out, counters,
-                    scale, base, weight, post_out, comb_out, pre_out, y_out, yq_out, ysf_out,
-                    *aux_out,
-                )
-                assert int((counters == 0).all().item()) == 1
-
-            assert _bits_equal(R_out, R_ref), f"R_out mismatch {mode} w={world} aux={with_aux} tokens={tokens}"
-            assert _bits_equal(post_out, post_ref), f"post_out mismatch {mode} w={world} aux={with_aux} tokens={tokens}"
-            assert _bits_equal(comb_out, comb_ref), f"comb_out mismatch {mode} w={world} aux={with_aux} tokens={tokens}"
-            assert _bits_equal(pre_out, pre_ref), f"pre_out mismatch {mode} w={world} aux={with_aux} tokens={tokens}"
-            assert _bits_equal(y_out, y_ref), f"y_out mismatch {mode} w={world} aux={with_aux} tokens={tokens}"
-            assert _bits_equal(yq_out[:tokens], yq_ref[:tokens]), f"yq_out mismatch {mode} w={world} aux={with_aux} tokens={tokens}"
-            assert _bits_equal(ysf_out[:tokens], ysf_ref[:tokens]), f"ysf_out mismatch {mode} w={world} aux={with_aux} tokens={tokens}"
-            if with_aux:
-                assert _bits_equal(aux_out[0], aux_ref[0]), f"aux_out mismatch {mode} w={world} aux={with_aux} tokens={tokens}"
-            correctness_cases.append(
-                {
-                    "mode": mode,
-                    "world": world,
-                    "with_aux": with_aux,
-                    "tokens": tokens,
-                    "nonfinite": nonfinite,
-                    "bits_identical": True,
-                }
-            )
-
-    # 2. Latency benchmark across decode & prefill shapes (CUDA Graph + Eager)
-    base_0634_jit = _define_base_0634_fused()
-    base_0634_k = base_0634_jit(
-        hidden, "post_pre", streams, rms_eps, hc_eps, iters, rms_eps, block_M=block_m
+    cand_proj = mhc_mod.project_streams(
+        HIDDEN, "post_pre", block_M=BLOCK_M, world=1, with_aux=False
     )
-    proj_k = mhc.project_streams(hidden, "post_pre", block_M=block_m)
-    fin_k = mhc.finalize(hidden, streams, rms_eps, hc_eps, iters, rms_eps)
-    fused_k = mhc.project_and_finalize_streams(
-        hidden, "post_pre", streams, rms_eps, hc_eps, iters, rms_eps, block_M=block_m
+    base_proj = base_project_streams(
+        HIDDEN, "post_pre", block_M=BLOCK_M, world=1, with_aux=False
+    )
+    cand_proj_w3_aux = mhc_mod.project_streams(
+        HIDDEN, "post_pre", block_M=BLOCK_M, world=3, with_aux=True
+    )
+    base_proj_w3_aux = base_project_streams(
+        HIDDEN, "post_pre", block_M=BLOCK_M, world=3, with_aux=True
+    )
+    fin_k = mhc_mod.finalize(
+        HIDDEN, MULT * HIDDEN, RMS_EPS, HC_EPS, SINKHORN_ITERS, RMS_EPS
     )
 
-    rows_list = [1, 2, 4, 6, 8, 12, 15, 16, 17, 24, 32, 36, 40, 48, 64, 96, 2048, 6144, 16384]
-    results = []
-
-    for tokens in rows_list:
-        g = torch.Generator(device=device).manual_seed(4000 + tokens)
-        x_in = torch.randn(1, tokens, hidden, generator=g, device=device, dtype=torch.bfloat16)
-        source = torch.randn(tokens, streams, generator=g, device=device, dtype=torch.bfloat16)
-        mix_post = 2 * torch.sigmoid(torch.randn(tokens, 4, generator=g, device=device))
-        mix_comb = torch.softmax(torch.randn(tokens, 4, 4, generator=g, device=device), -1)
-        incoming = torch.sigmoid(torch.randn(tokens, 4, generator=g, device=device)) + hc_eps
-        fn_in = torch.randn(24, streams, generator=g, device=device) * 0.02
-        scale = torch.tensor([0.8, 1.1, 0.9], device=device, dtype=torch.float32)
-        base = torch.randn(24, generator=g, device=device, dtype=torch.float32) * 0.1
-        weight = (torch.randn(hidden, generator=g, device=device) * 0.1 + 1.0).bfloat16()
-
-        mq = mxfp8_rows(tokens)
-        sf_w = 4 * scale_words(hidden)
-        R_ref = torch.empty_like(source)
-        P_ref = torch.empty(splits, tokens, 1, 24, dtype=torch.float32, device=device)
-        S_ref = torch.empty(splits, tokens, 1, dtype=torch.float32, device=device)
-        C_ref = torch.empty(tokens, hidden, dtype=torch.bfloat16, device=device)
-        Q_ref = torch.empty(splits, tokens, dtype=torch.float32, device=device)
-        post_ref = torch.empty(tokens, 4, dtype=torch.float32, device=device)
-        comb_ref = torch.empty(tokens, 4, 4, dtype=torch.float32, device=device)
-        pre_ref = torch.empty(tokens, 4, dtype=torch.float32, device=device)
-        y_ref = torch.empty(tokens, hidden, dtype=torch.bfloat16, device=device)
-        yq_ref = torch.empty(mq, hidden, dtype=torch.float8_e4m3fn, device=device)
-        ysf_ref = torch.empty(mq, sf_w, dtype=torch.uint8, device=device)
-
-        proj_k(x_in, source, mix_post, mix_comb, incoming, fn_in, R_ref, P_ref, S_ref, C_ref, Q_ref)
-        fin_k(P_ref, S_ref, C_ref, Q_ref, scale, base, weight, post_ref, comb_ref, pre_ref, y_ref, yq_ref, ysf_ref)
-
-        R_out = torch.empty_like(R_ref)
-        P_out = torch.empty_like(P_ref)
-        S_out = torch.empty_like(S_ref)
-        C_out = torch.empty_like(C_ref)
-        Q_out = torch.empty_like(Q_ref)
-        post_out = torch.empty_like(post_ref)
-        comb_out = torch.empty_like(comb_ref)
-        pre_out = torch.empty_like(pre_ref)
-        y_out = torch.empty_like(y_ref)
-        yq_out = torch.empty_like(yq_ref)
-        ysf_out = torch.empty_like(ysf_ref)
-        tiles = (tokens + block_m - 1) // block_m
-        counters = torch.zeros(tiles, dtype=torch.int32, device=device)
-
-        if tokens <= 96:
-            fused_k(
-                x_in, source, mix_post, mix_comb, incoming, fn_in,
-                R_out, P_out, S_out, C_out, Q_out, counters,
-                scale, base, weight, post_out, comb_out, pre_out, y_out, yq_out, ysf_out,
-            )
-            torch.cuda.synchronize()
-            assert int((counters == 0).all().item()) == 1
-            assert _bits_equal(R_out, R_ref)
-            assert _bits_equal(post_out, post_ref)
-            assert _bits_equal(comb_out, comb_ref)
-            assert _bits_equal(pre_out, pre_ref)
-            assert _bits_equal(y_out, y_ref)
-            assert _bits_equal(yq_out[:tokens], yq_ref[:tokens])
-            assert _bits_equal(ysf_out[:tokens], ysf_ref[:tokens])
-
-        def measure_graph_us(fn, reps: int = 400) -> float:
-            for _ in range(15):
-                fn()
-            torch.cuda.synchronize()
-            graph = torch.cuda.CUDAGraph()
-            with torch.cuda.graph(graph):
+    def bench_fn(fn, warm=30, reps=200, use_graph=True):
+        for _ in range(warm):
+            fn()
+        torch.cuda.synchronize()
+        if use_graph:
+            g = torch.cuda.CUDAGraph()
+            with torch.cuda.graph(g):
                 for _ in range(10):
                     fn()
+            for _ in range(10):
+                g.replay()
             torch.cuda.synchronize()
-            for _ in range(5):
-                graph.replay()
-            torch.cuda.synchronize()
-            start = torch.cuda.Event(enable_timing=True)
-            end = torch.cuda.Event(enable_timing=True)
-            start.record()
-            for _ in range(reps // 10):
-                graph.replay()
-            end.record()
-            torch.cuda.synchronize()
-            return (start.elapsed_time(end) * 1000.0) / reps
-
-        def measure_eager_us(fn, reps: int = 200) -> float:
-            for _ in range(15):
-                fn()
-            torch.cuda.synchronize()
-            start = torch.cuda.Event(enable_timing=True)
-            end = torch.cuda.Event(enable_timing=True)
-            start.record()
+            s = torch.cuda.Event(enable_timing=True)
+            e = torch.cuda.Event(enable_timing=True)
+            s.record()
             for _ in range(reps):
-                fn()
-            end.record()
+                g.replay()
+            e.record()
             torch.cuda.synchronize()
-            return (start.elapsed_time(end) * 1000.0) / reps
+            return s.elapsed_time(e) * 1000.0 / (reps * 10)
+        s = torch.cuda.Event(enable_timing=True)
+        e = torch.cuda.Event(enable_timing=True)
+        s.record()
+        for _ in range(reps):
+            fn()
+        e.record()
+        torch.cuda.synchronize()
+        return s.elapsed_time(e) * 1000.0 / reps
 
-        if tokens <= 96:
-            split_graph_us = measure_graph_us(
-                lambda: (
-                    proj_k(x_in, source, mix_post, mix_comb, incoming, fn_in, R_ref, P_ref, S_ref, C_ref, Q_ref),
-                    fin_k(P_ref, S_ref, C_ref, Q_ref, scale, base, weight, post_ref, comb_ref, pre_ref, y_ref, yq_ref, ysf_ref),
-                )
-            )
-            cand_fused_graph_us = measure_graph_us(
-                lambda: fused_k(
-                    x_in, source, mix_post, mix_comb, incoming, fn_in,
-                    R_out, P_out, S_out, C_out, Q_out, counters,
-                    scale, base, weight, post_out, comb_out, pre_out, y_out, yq_out, ysf_out,
-                )
-            )
-            base_0634_graph_us = (
-                measure_graph_us(
-                    lambda: base_0634_k(
-                        x_in, source, mix_post, mix_comb, incoming, fn_in,
-                        R_out, P_out, S_out, C_out, Q_out, counters,
-                        scale, base, weight, post_out, comb_out, pre_out, y_out, yq_out, ysf_out,
-                    )
-                )
-                if tokens <= 32
-                else None
-            )
-            split_eager_us = measure_eager_us(
-                lambda: (
-                    proj_k(x_in, source, mix_post, mix_comb, incoming, fn_in, R_ref, P_ref, S_ref, C_ref, Q_ref),
-                    fin_k(P_ref, S_ref, C_ref, Q_ref, scale, base, weight, post_ref, comb_ref, pre_ref, y_ref, yq_ref, ysf_ref),
-                )
-            )
-            cand_fused_eager_us = measure_eager_us(
-                lambda: fused_k(
-                    x_in, source, mix_post, mix_comb, incoming, fn_in,
-                    R_out, P_out, S_out, C_out, Q_out, counters,
-                    scale, base, weight, post_out, comb_out, pre_out, y_out, yq_out, ysf_out,
-                )
-            )
-            results.append(
-                {
-                    "tokens": tokens,
-                    "dispatched_fused": tokens <= mhc.FINALIZE_FUSE_MAX_ROWS,
-                    "split_graph_us": round(split_graph_us, 3),
-                    "base_0634_fused_graph_us": round(base_0634_graph_us, 3) if base_0634_graph_us is not None else None,
-                    "cand_0731_fused_graph_us": round(cand_fused_graph_us, 3),
-                    "graph_delta_us_vs_split": round(cand_fused_graph_us - split_graph_us, 3),
-                    "graph_step80_saved_us_vs_split": round(80.0 * (split_graph_us - cand_fused_graph_us), 1),
-                    "split_eager_us": round(split_eager_us, 3),
-                    "cand_0731_fused_eager_us": round(cand_fused_eager_us, 3),
-                    "bits_identical": True,
-                }
-            )
-        else:
-            proj_us = measure_eager_us(
-                lambda: proj_k(x_in, source, mix_post, mix_comb, incoming, fn_in, R_ref, P_ref, S_ref, C_ref, Q_ref),
-                reps=40,
-            )
-            fin_us = measure_eager_us(
-                lambda: fin_k(P_ref, S_ref, C_ref, Q_ref, scale, base, weight, post_ref, comb_ref, pre_ref, y_ref, yq_ref, ysf_ref),
-                reps=40,
-            )
-            split_eager_us = measure_eager_us(
-                lambda: (
-                    proj_k(x_in, source, mix_post, mix_comb, incoming, fn_in, R_ref, P_ref, S_ref, C_ref, Q_ref),
-                    fin_k(P_ref, S_ref, C_ref, Q_ref, scale, base, weight, post_ref, comb_ref, pre_ref, y_ref, yq_ref, ysf_ref),
-                ),
-                reps=40,
-            )
-            results.append(
-                {
-                    "tokens": tokens,
-                    "dispatched_fused": False,
-                    "project_only_eager_us": round(proj_us, 3),
-                    "finalize_only_eager_us": round(fin_us, 3),
-                    "split_eager_us": round(split_eager_us, 3),
-                    "bits_identical": True,
-                }
+    decode_rows_out = []
+    for M in DECODE_ROWS:
+        gen = torch.Generator(device=device).manual_seed(4000 + M)
+        x = torch.randn((1, M, HIDDEN), generator=gen, device=device, dtype=torch.bfloat16)
+        r = torch.randn((M, MULT * HIDDEN), generator=gen, device=device, dtype=torch.bfloat16)
+        post_in = torch.rand((M, MULT), generator=gen, device=device, dtype=torch.float32) * 2.0
+        comb_in = torch.softmax(torch.randn((M, MULT, MULT), generator=gen, device=device), dim=-1)
+        pre_in = torch.softmax(torch.randn((M, MULT), generator=gen, device=device), dim=-1) + 1e-6
+        fn = torch.randn((MIXES, MULT * HIDDEN), generator=gen, device=device, dtype=torch.float32) * 0.02
+        scale = torch.randn((3,), generator=gen, device=device, dtype=torch.float32) * 0.1 + 1.0
+        base = torch.randn((MIXES,), generator=gen, device=device, dtype=torch.float32) * 0.1
+        weight = (torch.randn((HIDDEN,), generator=gen, device=device) * 0.1 + 1.0).bfloat16()
+        mq = mxfp8_rows(M)
+        sf_w = 4 * scale_words(HIDDEN)
+
+        def alloc_bufs():
+            return (
+                torch.empty_like(r),
+                torch.empty((SPLITS, M, 1, MIXES), dtype=torch.float32, device=device),
+                torch.empty((SPLITS, M, 1), dtype=torch.float32, device=device),
+                torch.empty((M, HIDDEN), dtype=torch.bfloat16, device=device),
+                torch.empty((SPLITS, M), dtype=torch.float32, device=device),
+                torch.empty((M, MULT), dtype=torch.float32, device=device),
+                torch.empty((M, MULT, MULT), dtype=torch.float32, device=device),
+                torch.empty((M, MULT), dtype=torch.float32, device=device),
+                torch.empty((M, HIDDEN), dtype=torch.bfloat16, device=device),
+                torch.empty((mq, HIDDEN), dtype=torch.float8_e4m3fn, device=device),
+                torch.empty((mq, sf_w), dtype=torch.uint8, device=device),
             )
 
-    out = {
-        "device": torch.cuda.get_device_name(device),
-        "finalize_fuse_max_rows": mhc.FINALIZE_FUSE_MAX_ROWS,
-        "correctness_cases": len(correctness_cases),
-        "all_correctness_bits_identical": all(c["bits_identical"] for c in correctness_cases),
-        "rows": results,
+        b_base = alloc_bufs()
+        b_cand = alloc_bufs()
+
+        def run_base():
+            base_proj(x, r, post_in, comb_in, pre_in, fn, b_base[0], b_base[1], b_base[2], b_base[3], b_base[4])
+            fin_k(b_base[1], b_base[2], b_base[3], b_base[4], scale, base, weight, b_base[5], b_base[6], b_base[7], b_base[8], b_base[9], b_base[10])
+
+        def run_cand():
+            cand_proj(x, r, post_in, comb_in, pre_in, fn, b_cand[0], b_cand[1], b_cand[2], b_cand[3], b_cand[4])
+            fin_k(b_cand[1], b_cand[2], b_cand[3], b_cand[4], scale, base, weight, b_cand[5], b_cand[6], b_cand[7], b_cand[8], b_cand[9], b_cand[10])
+
+        run_base()
+        run_cand()
+        torch.cuda.synchronize()
+        bits_equal = bool(
+            torch.equal(b_base[0].view(torch.int16), b_cand[0].view(torch.int16))
+            and torch.equal(b_base[5].view(torch.int32), b_cand[5].view(torch.int32))
+            and torch.equal(b_base[6].view(torch.int32), b_cand[6].view(torch.int32))
+            and torch.equal(b_base[7].view(torch.int32), b_cand[7].view(torch.int32))
+            and torch.equal(b_base[8].view(torch.int16), b_cand[8].view(torch.int16))
+            and torch.equal(b_base[9][:M].view(torch.uint8), b_cand[9][:M].view(torch.uint8))
+            and torch.equal(b_base[10][:M], b_cand[10][:M])
+        )
+        assert bits_equal, f"Bit mismatch at M={M}"
+
+        us_base_split = bench_fn(run_base, use_graph=True)
+        us_cand_split = bench_fn(run_cand, use_graph=True)
+        us_proj_only = bench_fn(
+            lambda: cand_proj(x, r, post_in, comb_in, pre_in, fn, b_cand[0], b_cand[1], b_cand[2], b_cand[3], b_cand[4]),
+            use_graph=True,
+        )
+        us_fin_only = bench_fn(
+            lambda: fin_k(b_cand[1], b_cand[2], b_cand[3], b_cand[4], scale, base, weight, b_cand[5], b_cand[6], b_cand[7], b_cand[8], b_cand[9], b_cand[10]),
+            use_graph=True,
+        )
+        decode_rows_out.append(
+            {
+                "M": M,
+                "mode": "graph",
+                "bits_equal": bits_equal,
+                "base_split_us": round(us_base_split, 3),
+                "cand_split_us": round(us_cand_split, 3),
+                "cand_project_only_us": round(us_proj_only, 3),
+                "finalize_only_us": round(us_fin_only, 3),
+                "delta_vs_base_split_us": round(us_cand_split - us_base_split, 3),
+                "pass80_delta_vs_base_split_us": round((us_cand_split - us_base_split) * 80.0, 1),
+            }
+        )
+        print(
+            f"decode M={M:3d}: base_split={us_base_split:6.2f}us  cand_0731={us_cand_split:6.2f}us "
+            f"(proj={us_proj_only:5.2f}us fin={us_fin_only:4.2f}us) delta={us_cand_split - us_base_split:+5.2f}us"
+        )
+
+    prefill_rows_out = []
+    for world, with_aux in ((1, False), (3, True)):
+        p_base = base_proj if not with_aux else base_proj_w3_aux
+        p_cand = cand_proj if not with_aux else cand_proj_w3_aux
+        for M in PREFILL_ROWS:
+            gen = torch.Generator(device=device).manual_seed(5000 + world * 100 + M)
+            x = torch.randn((world, M, HIDDEN), generator=gen, device=device, dtype=torch.bfloat16)
+            r = torch.randn((M, MULT * HIDDEN), generator=gen, device=device, dtype=torch.bfloat16)
+            post_in = torch.rand((M, MULT), generator=gen, device=device, dtype=torch.float32) * 2.0
+            comb_in = torch.softmax(torch.randn((M, MULT, MULT), generator=gen, device=device), dim=-1)
+            pre_in = torch.softmax(torch.randn((M, MULT), generator=gen, device=device), dim=-1) + 1e-6
+            fn = torch.randn((MIXES, MULT * HIDDEN), generator=gen, device=device, dtype=torch.float32) * 0.02
+            scale = torch.randn((3,), generator=gen, device=device, dtype=torch.float32) * 0.1 + 1.0
+            base = torch.randn((MIXES,), generator=gen, device=device, dtype=torch.float32) * 0.1
+            weight = (torch.randn((HIDDEN,), generator=gen, device=device) * 0.1 + 1.0).bfloat16()
+            mq = mxfp8_rows(M)
+            sf_w = 4 * scale_words(HIDDEN)
+
+            R_b = torch.empty_like(r)
+            R_c = torch.empty_like(r)
+            P_b = torch.empty((SPLITS, M, 1, MIXES), dtype=torch.float32, device=device)
+            P_c = torch.empty_like(P_b)
+            S_b = torch.empty((SPLITS, M, 1), dtype=torch.float32, device=device)
+            S_c = torch.empty_like(S_b)
+            C_b = torch.empty((M, HIDDEN), dtype=torch.bfloat16, device=device)
+            C_c = torch.empty_like(C_b)
+            Q_b = torch.empty((SPLITS, M), dtype=torch.float32, device=device)
+            Q_c = torch.empty_like(Q_b)
+            Aux_b = torch.empty((M, HIDDEN), dtype=torch.bfloat16, device=device) if with_aux else None
+            Aux_c = torch.empty((M, HIDDEN), dtype=torch.bfloat16, device=device) if with_aux else None
+            post_b = torch.empty((M, MULT), dtype=torch.float32, device=device)
+            post_c = torch.empty_like(post_b)
+            comb_b = torch.empty((M, MULT, MULT), dtype=torch.float32, device=device)
+            comb_c = torch.empty_like(comb_b)
+            pre_b = torch.empty((M, MULT), dtype=torch.float32, device=device)
+            pre_c = torch.empty_like(pre_b)
+            y_b = torch.empty((M, HIDDEN), dtype=torch.bfloat16, device=device)
+            y_c = torch.empty_like(y_b)
+            yq_b = torch.empty((mq, HIDDEN), dtype=torch.float8_e4m3fn, device=device)
+            yq_c = torch.empty_like(yq_b)
+            ysf_b = torch.empty((mq, sf_w), dtype=torch.uint8, device=device)
+            ysf_c = torch.empty_like(ysf_b)
+
+            aux_b_arg = (Aux_b,) if with_aux else ()
+            aux_c_arg = (Aux_c,) if with_aux else ()
+
+            def run_p_base():
+                p_base(x, r, post_in, comb_in, pre_in, fn, R_b, P_b, S_b, C_b, Q_b, *aux_b_arg)
+                fin_k(P_b, S_b, C_b, Q_b, scale, base, weight, post_b, comb_b, pre_b, y_b, yq_b, ysf_b)
+
+            def run_p_cand():
+                p_cand(x, r, post_in, comb_in, pre_in, fn, R_c, P_c, S_c, C_c, Q_c, *aux_c_arg)
+                fin_k(P_c, S_c, C_c, Q_c, scale, base, weight, post_c, comb_c, pre_c, y_c, yq_c, ysf_c)
+
+            run_p_base()
+            run_p_cand()
+            torch.cuda.synchronize()
+            bits_equal = bool(
+                torch.equal(R_b.view(torch.int16), R_c.view(torch.int16))
+                and torch.equal(post_b.view(torch.int32), post_c.view(torch.int32))
+                and torch.equal(comb_b.view(torch.int32), comb_c.view(torch.int32))
+                and torch.equal(pre_b.view(torch.int32), pre_c.view(torch.int32))
+                and torch.equal(y_b.view(torch.int16), y_c.view(torch.int16))
+                and torch.equal(yq_b[:M].view(torch.uint8), yq_c[:M].view(torch.uint8))
+                and torch.equal(ysf_b[:M], ysf_c[:M])
+                and (not with_aux or torch.equal(Aux_b.view(torch.int16), Aux_c.view(torch.int16)))
+            )
+            assert bits_equal, f"Prefill bit mismatch at M={M}, world={world}, with_aux={with_aux}"
+
+            reps = 25 if M < 16384 else 12
+            us_base_total = bench_fn(run_p_base, warm=6, reps=reps, use_graph=False)
+            us_cand_total = bench_fn(run_p_cand, warm=6, reps=reps, use_graph=False)
+            us_cand_proj = bench_fn(
+                lambda: p_cand(x, r, post_in, comb_in, pre_in, fn, R_c, P_c, S_c, C_c, Q_c, *aux_c_arg),
+                warm=6,
+                reps=reps,
+                use_graph=False,
+            )
+            us_fin = bench_fn(
+                lambda: fin_k(P_c, S_c, C_c, Q_c, scale, base, weight, post_c, comb_c, pre_c, y_c, yq_c, ysf_c),
+                warm=6,
+                reps=reps,
+                use_graph=False,
+            )
+            bw = compulsory_dram_bytes(M, world, with_aux)
+            proj_gbs = round(bw["proj_mb"] * 1e3 / us_cand_proj, 1)
+            fin_gbs = round(bw["fin_mb"] * 1e3 / us_fin, 1)
+            total_gbs = round(bw["total_mb"] * 1e3 / us_cand_total, 1)
+            prefill_rows_out.append(
+                {
+                    "M": M,
+                    "world": world,
+                    "with_aux": with_aux,
+                    "bits_equal": bits_equal,
+                    "base_total_us": round(us_base_total, 1),
+                    "cand_total_us": round(us_cand_total, 1),
+                    "cand_project_only_us": round(us_cand_proj, 1),
+                    "finalize_only_us": round(us_fin, 1),
+                    "delta_vs_base_us": round(us_cand_total - us_base_total, 1),
+                    "compulsory_dram": bw,
+                    "achieved_gbs": {
+                        "project_only_gbs": proj_gbs,
+                        "finalize_only_gbs": fin_gbs,
+                        "combined_gbs": total_gbs,
+                        "pct_of_230gbs": round(total_gbs / 230.0 * 100.0, 1),
+                    },
+                }
+            )
+            print(
+                f"prefill w={world} aux={int(with_aux)} M={M:5d}: base={us_base_total:7.1f}us "
+                f"cand={us_cand_total:7.1f}us (proj={us_cand_proj:6.1f}us [{proj_gbs}GB/s] "
+                f"fin={us_fin:5.1f}us [{fin_gbs}GB/s]) total_bw={total_gbs}GB/s ({total_gbs/2.3:.1f}%)"
+            )
+
+    payload = {
+        "device": torch.cuda.get_device_name(0),
+        "decode_rows": decode_rows_out,
+        "prefill_rows": prefill_rows_out,
     }
-    if output_path is not None:
-        output_path.write_text(json.dumps(out, indent=2) + "\n", encoding="utf-8")
-    print(json.dumps(out, indent=2))
-    return out
+    out_json.write_text(json.dumps(payload, indent=2) + "\n")
+    print(f"Saved GPU benchmark receipt -> {out_json}")
 
 
 def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--cpu-verify", action="store_true")
     parser.add_argument("--gpu-bench", action="store_true")
-    parser.add_argument("--output", type=Path, default=None)
+    parser.add_argument("--mhc-path", type=Path)
+    parser.add_argument("--pdl-sources-path", type=Path)
+    parser.add_argument("--out", type=Path, required=True)
     args = parser.parse_args()
-    if args.gpu_bench:
-        run_gpu_bench(args.output)
+    if args.cpu_verify:
+        run_cpu_verify(args.mhc_path, args.pdl_sources_path, args.out)
+    elif args.gpu_bench:
+        run_gpu_bench(args.out)
     else:
-        run_cpu_verify(args.output)
+        raise SystemExit("Specify --cpu-verify or --gpu-bench")
 
 
 if __name__ == "__main__":
