@@ -23,10 +23,17 @@ from this experiment; no acquisition waiter or request has been started here.
 
 ## Follow-up component screen, ready specification
 
-- Published source code has been syntax-checked on SP8. Three host-publication
-  tests pass there: appends leave replacement generations alone, same-size and
-  empty replacements advance them, publication follows IDs/counts, and exhaustion
-  fails before staging. These are CPU checks, not GPU validation.
+- Published source code has been syntax-checked on SP8. Seven CPU tests in
+  `bundle/test_host.py` pass there: three host-publication checks (appends leave
+  replacement generations alone, same-size and empty replacements advance them,
+  publication follows IDs/counts, and exhaustion fails before staging) and four
+  worker-bound/ownership checks (rendered container commands enforce `--cpus=2`,
+  `--memory=16g`, `--memory-swap=16g`, `--pids-limit=512`, read-only mounts, and
+  compile/thread caps across both fresh boots; in-container cgroup v2 verification
+  fails closed when `cpu.max`, `memory.max`, `memory.swap.max=0`, `pids.max` or
+  thread caps are missing or exceeded; bounds are preserved and recorded across
+  both fresh correctness/benchmark boots; and host launch requires exact window
+  ownership and locked image identity). These are CPU checks, not GPU validation.
 - `bundle/test_gpu.py` defines 55 GPU gates covering the five context labels at
   c1/c8/c16, integer IDs, expanded kernel blocks, holes, non-aligned widths, padded
   rows, compaction, preemption, same-size/shorter/empty reuse, alternate-output
@@ -39,16 +46,24 @@ from this experiment; no acquisition waiter or request has been started here.
   completion time for steady, page-crossing and overwrite preparation. Each
   comparison retains all eight pairs and a 95% interval. Every host timing
   retires the prior step before UVA storage can be reused.
-- `components.json` names one node, dgx1, under an exclusive coordinated window.
-  Its bundle uses the inspected candidate-40 image ID
+- `components.json` and `bundle/candidate.json` name one node, dgx1, under an
+  exclusive coordinated window, with explicit container cgroup bounds (`--cpus=2`,
+  `--memory=16g`, `--memory-swap=16g` for zero swap, `--pids-limit=512`) and
+  compile-worker/thread limits (`MAX_JOBS=2`, `CMAKE_BUILD_PARALLEL_LEVEL=2`,
+  `OMP_NUM_THREADS=2`, `TVM_NUM_THREADS=2`, `TORCHINDUCTOR_COMPILE_THREADS=2`,
+  `OPENBLAS_NUM_THREADS=1`, `MKL_NUM_THREADS=1`, `NUMEXPR_MAX_THREADS=1`).
+  The bundle uses the inspected candidate-40 image ID
   `sha256:7ae96e98e361601d8232cd99e6af1c6044b7c282bf6904c989e6ad033c147f82`,
   matching the locked source head and tree above. No released build is rerun.
 - Estimated bounded window: **35–45 minutes**, including cooling/restoration.
-  The harness runs two fresh benchmark processes, each preceded by a fresh GPU
-  correctness process. Per round: host gate 30 s, GPU gates 300 s, benchmark
-  600 s maximum. It stops at the first failure, preserves partial receipts, and
-  refuses to overwrite an existing output directory. This is two component
-  rounds, not two serving boots.
+  `bundle/run.py` renders and launches two fresh bounded worker containers (or
+  verifies active `/sys/fs/cgroup/{cpu.max,memory.max,memory.swap.max,pids.max}`
+  and thread caps inside the worker before every step across both boots, recording
+  `bounds.json` and per-step bounds in `steps.json`). Each fresh benchmark process
+  is preceded by a fresh GPU correctness process. Per round: host gate 30 s, GPU
+  gates 300 s, benchmark 600 s maximum. It stops at the first failure, preserves
+  partial receipts, and refuses to overwrite an existing output directory. This
+  is two component rounds, not two serving boots.
 - Before execution: wait for the named reservations and earlier legitimate
   claims; acquire an actual exclusive lease; inspect the current serving commit,
   profile and all-rank image identity; publish/sync the exact experiment revision
