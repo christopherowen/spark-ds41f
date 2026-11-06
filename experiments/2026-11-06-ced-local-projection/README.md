@@ -246,3 +246,11 @@ and verified against the parent ID; an existing mismatched tag is an error.
 Build once, then distribute the same verified OCI identity to all configured
 ranks through the coordinated tools. These profiles do not authorize a shape
 change or substitute for the original A/B source pins and evidence.
+
+
+The first apply attempt on Spaceport stopped at the normal build lock because
+another image build held it. No image was assembled and the lock was not bypassed;
+see `receipts/native-reuse-image-1.txt`. An independent bounded CPU check then
+verified all 7810 parent source files against the frozen Git tree and retained the
+two compiled-extension hashes in `receipts/parent-source-check-1.txt`. The candidate
+image and its GPU smoke remain pending.
