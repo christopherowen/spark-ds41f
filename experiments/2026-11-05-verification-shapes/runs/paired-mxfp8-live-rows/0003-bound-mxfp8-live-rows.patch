@@ -1,0 +1,189 @@
+From 2541c9a1372f7f35589b0aafc343b00711999de9 Mon Sep 17 00:00:00 2001
+From: Christopher Owen <3221756+christopherowen@users.noreply.github.com>
+Date: Thu, 5 Nov 2026 23:29:15 +0100
+Subject: [PATCH] Read live activation rows in padded MXFP8 decode tiles
+
+Base: candidate-40 source 5f926df6d3126266a9c88c82c06544060008c33c,
+replayed from upstream 19f2c20ed4d64ae22bd009ceacadd85e2a81e354 plus
+its ordered 574-patch series.
+
+Rationale: padded activation and scale workspaces can contain unwritten
+rows. Clamp inactive decode and split-K lanes to the final live row so
+those consumer loads never depend on scratch contents outside live rows.
+
+Quality: live rows retain their original inputs and accumulation order;
+weights, quantization, token policy and output stores are unchanged.
+Unused MMA lanes repeat a valid input. The changed copy lowering may
+increase latency and must be measured before adoption.
+
+Tests: canonical source replay, Python parsing and whitespace checks.
+Adds odd/boundary cases, initially unwritten tails, then poisoned-tail
+CUDA graph replay against an independent unpadded path. GPU compilation,
+initcheck, memcheck, exact output and repeat timing remain unvalidated.
+
+Upstream status: unsubmitted experimental prototype, not approved for
+adoption. Hardware proof must precede an acceptance claim.
+---
+ .../test_deepseek_v41_tilelang_linear.py      | 74 +++++++++++++++++++
+ vllm/models/deepseek_v4_1/tilelang/gemm.py    | 28 ++++---
+ 2 files changed, 93 insertions(+), 9 deletions(-)
+
+diff --git a/tests/kernels/quantization/test_deepseek_v41_tilelang_linear.py b/tests/kernels/quantization/test_deepseek_v41_tilelang_linear.py
+index 66a178f01..9e657408a 100644
+--- a/tests/kernels/quantization/test_deepseek_v41_tilelang_linear.py
++++ b/tests/kernels/quantization/test_deepseek_v41_tilelang_linear.py
+@@ -155,6 +155,80 @@ def test_mxfp8_decode_tile_repeats(n=2048, k=2048, runs=100):
+         assert torch.equal(out, want), f"run {run} differs"
+ 
+ 
++@pytest.mark.parametrize(
++    "rows",
++    [1, 3, 5, 7, 11, 15, 16, 17, 31, 32, 33, 47, 48, 63, 64, 65, 95, 96, 97, 127, 128],
++)
++@pytest.mark.parametrize("split", [False, True])
++def test_mxfp8_decode_reads_only_live_rows(rows, split):
++    """Also run with compute-sanitizer initcheck: padding is never initialized.
++
++    Comparing live results alone cannot detect an unused MMA lane's uninitialized
++    read. Initcheck must see the first call before the later poisoned-tail replay.
++    Both paths must preserve the prefill path's exact per-row accumulation.
++    """
++    from vllm.models.deepseek_v4_1.tilelang.gemm import (
++        mxfp8_gemm_partials,
++        split_row_tile,
++    )
++
++    n, k, shards = 64, 256, 2 if split else 1
++    tile = split_row_tile(rows)
++    padded = -(-rows // tile) * tile
++    weight, exps, _ = _block32_weight(n, k, 41)
++    weight_sf = pack_scale_words(exps)
++    x = torch.randn((rows, k), generator=_gen(42), device=DEVICE).bfloat16()
++    xq, sf, _ = _mxfp8(x)
++    a = torch.empty((padded, k), dtype=xq.dtype, device=DEVICE)
++    scales = torch.empty((padded, sf.shape[1]), dtype=sf.dtype, device=DEVICE)
++    a[:rows].copy_(xq)
++    scales[:rows].copy_(sf)
++    out = torch.empty((rows, n), dtype=torch.bfloat16, device=DEVICE)
++    expected = torch.empty_like(out)
++    mxfp8_gemm(n, k, block_M=64, block_N=64, block_K=64, num_stages=2, shards=shards)(
++        xq, weight, sf.view(torch.uint32), weight_sf, expected
++    )
++    if split:
++        partials = torch.empty((shards, rows, n), device=DEVICE)
++        kernel = mxfp8_gemm_partials(
++            n, k, shards, block_M=tile, block_N=64, block_K=64, num_stages=2
++        )
++        reduce = splitk_reduce(n, shards)
++
++        def run():
++            kernel(a, weight, scales.view(torch.uint32), weight_sf, partials)
++            reduce(partials, out)
++    else:
++        kernel = mxfp8_gemm_decode(
++            n,
++            k,
++            block_M=tile,
++            block_N=64,
++            block_K=64,
++            num_stages=2,
++            padded_rows=True,
++        )
++
++        def run():
++            kernel(a, weight, scales.view(torch.uint32), weight_sf, out)
++
++    run()
++    assert torch.equal(out, expected)
++    # Reuse the captured graph with different live input and NaN padding. The
++    # exact reference is a separate unpadded prefill call on the new live rows.
++    graph = torch.cuda.CUDAGraph()
++    with torch.cuda.graph(graph):
++        run()
++    a[:rows].copy_(-xq.float())
++    a[rows:].view(torch.uint8).fill_(0x7F)
++    scales[rows:].fill_(0xFF)
++    mxfp8_gemm(n, k, block_M=64, block_N=64, block_K=64, num_stages=2, shards=shards)(
++        a[:rows], weight, scales[:rows].view(torch.uint32), weight_sf, expected
++    )
++    graph.replay()
++    assert torch.equal(out, expected)
++
++
+ @pytest.mark.parametrize("out_dtype", [torch.bfloat16, torch.float32])
+ # The router (384 x 5120) splits K eight ways; (100, 200) cannot split.
+ @pytest.mark.parametrize("n, k", [(32, 4096), (384, 512), (384, 5120), (100, 200)])
+diff --git a/vllm/models/deepseek_v4_1/tilelang/gemm.py b/vllm/models/deepseek_v4_1/tilelang/gemm.py
+index 2fb106e02..346ede1f1 100644
+--- a/vllm/models/deepseek_v4_1/tilelang/gemm.py
++++ b/vllm/models/deepseek_v4_1/tilelang/gemm.py
+@@ -122,10 +122,9 @@ def _mxfp8_gemm(
+     no operand is padded.
+ 
+     With ``padded_rows``, ``A`` and ``SFA`` have ``Mp >= M`` rows, a multiple
+-    of ``block_M`` (the decode workspace): every activation tile is loaded
+-    whole and only the ``M`` live rows are stored. A partial tile's missing
+-    rows otherwise cost about 0.4 us each on SM121, which made one decode row
+-    nearly three times slower than 64.
++    of ``block_M`` (the decode workspace). Producers need write only the ``M``
++    live rows: unused MMA lanes repeat the last live activation and scale row,
++    and only live results are stored. No padded scratch contents are read.
+ 
+     Each output accumulates over K in the same order whatever the tile shape
+     or padding, so a row's result does not depend on M or the configuration.
+@@ -207,7 +206,14 @@ def _mxfp8_gemm(
+             if shards > 1:
+                 T.clear(C_total)
+             for ko in T.Pipelined(k_blocks, num_stages=num_stages):
+-                T.copy(A[by * block_M, a_k + ko * block_K], A_shared)
++                if padded_rows:
++                    for i, k in T.Parallel(block_M, block_K):
++                        A_shared[i, k] = A[
++                            T.min(by * block_M + i, M - 1),
++                            a_k + ko * block_K + k,
++                        ]
++                else:
++                    T.copy(A[by * block_M, a_k + ko * block_K], A_shared)
+                 if not tile_contiguous:
+                     T.copy(B[bx * block_N, ko * block_K], B_shared)
+                 elif sub_tiles_k == 1:
+@@ -241,7 +247,7 @@ def _mxfp8_gemm(
+                 word0 = ko * block_K // SF_WORD_K
+                 for i, w in T.Parallel(block_M, block_words):
+                     SFA_shared[i, w] = SFA[
+-                        T.min(by * block_M + i, Mp - 1),
++                        T.min(by * block_M + i, M - 1),
+                         a_word + T.min(word0 + w, sf_words - 1),
+                     ]
+                 for j, w in T.Parallel(block_N, block_words):
+@@ -298,7 +304,8 @@ def _mxfp8_gemm_partials(
+ ):
+     """Split-K MXFP8 GEMM for decode rows: FP32 ``P[s] = (A * SFA) @ (B * SFB)^T``
+     over K shard ``s``, A and SFA padded to whole ``block_M`` tiles (the decode
+-    workspace). A narrow projection has few N tiles; its shards fill the GPU.
++    workspace). Only live rows are read; unused MMA lanes repeat the last live
++    row. A narrow projection has few N tiles; its shards fill the GPU.
+     """
+     assert K % block_K == 0 and block_K % 64 == 0 and (K // block_K) % shards == 0
+     assert N % 32 == 0, "block scales are one row per 32 output rows"
+@@ -329,12 +336,15 @@ def _mxfp8_gemm_partials(
+             T.clear(C_local)
+             for kb in T.Pipelined(shard_blocks, num_stages=num_stages):
+                 ko = s * shard_blocks + kb
+-                T.copy(A[by * block_M, ko * block_K], A_shared)
++                for i, k in T.Parallel(block_M, block_K):
++                    A_shared[i, k] = A[
++                        T.min(by * block_M + i, M - 1), ko * block_K + k
++                    ]
+                 T.copy(B[bx * block_N, ko * block_K], B_shared)
+                 word0 = ko * block_K // SF_WORD_K
+                 for i, w in T.Parallel(block_M, block_words):
+                     SFA_shared[i, w] = SFA[
+-                        T.min(by * block_M + i, Mp - 1),
++                        T.min(by * block_M + i, M - 1),
+                         T.min(word0 + w, sf_words - 1),
+                     ]
+                 for j, w in T.Parallel(block_N, block_words):
+-- 
+2.43.0
+

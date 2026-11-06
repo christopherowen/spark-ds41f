@@ -372,6 +372,8 @@ def main():
                 "TILELANG_CACHE_DIR=/c/tilelang",
                 "-v",
                 f"{cache}:/c",
+                "-v",
+                f"{EXP / 'runs/paired-mxfp8-live-rows/gemm.py'}:{root}/vllm/vllm/models/deepseek_v4_1/tilelang/gemm.py:ro",
                 "-w",
                 root + "/vllm",
             ]
