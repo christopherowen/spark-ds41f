@@ -1,25 +1,64 @@
 # Block-table update audit
 
-Status, 2026-11-06: the GPU gather question is reopened for an experiment.
+Status, 2026-11-06: **component screen completed on `dgx1` across two fresh
+bounded container boots ([`boot-1.json`](runs/27453e5b-dgx1/boot-1.json),
+[`boot-2.json`](runs/27453e5b-dgx1/boot-2.json),
+[`comparison.json`](runs/27453e5b-dgx1/comparison.json)) — do not promote or
+include in Candidate `1107`.**
+
 Producer-driven incremental page-table staging already covers the host
-construction and upload opportunity. The batch-order GPU gather still rewrites
-its configured capacity. Historical costs prioritize this opportunity but do not
-rule out an improvement. The initial audit's stopping decision was too broad.
+construction and upload opportunity. While the batch-order GPU gather rewrites
+its configured capacity, the two-boot component screen on `dgx1` (`27453e5b`)
+shows that adding per-CTA `(owner, epoch, count)` cache state and barrier
+synchronization introduces a net negative/mixed tradeoff:
+- **Correctness and bounds**: All 7 CPU contract tests (`bundle/test_host.py`)
+  and all 55 GPU parity/transition gates (`bundle/test_gpu.py`) passed in both
+  fresh bounded worker containers ([`steps.json`](runs/27453e5b-dgx1/steps.json),
+  [`bounds.json`](runs/27453e5b-dgx1/bounds.json)).
+- **Captured GPU gather (`gpu.steady` & `gpu.reorder`)**: The existing full-copy
+  TileLang gather is already ~`1.86 µs` at `c1` and ~`8.0–9.3 µs` at `c16` across
+  the 17-group runner geometry. While static-order `c16` steady gathers save
+  ~`0.9–4.2 µs` at 512K–1M, `c1` steady gathers regress by up to **+1.25 µs**
+  (`+64%` in `span` 512K `c1`: `+1.24 µs` in both boots; `span` 1M `c1`:
+  `+1.15 µs` / `+1.20 µs`) or flip sign across boots, and **batch-reordered
+  gathers (`gpu.reorder`) regress across all 45 cases in both boots (+0.27 to
+  +2.01 µs)** because reordered rows incur both a full reset rewrite and per-CTA
+  state check/barrier/update overhead.
+- **Preparation (`preparation.*`)**: Uncaptured `page_crossing` and `overwrite`
+  host-enqueue and completion 95% confidence intervals span zero in all 45 cases
+  across both boots (`0/15` reproducibly faster in every mode).
+- **Memory observations**: Peak two-arm GPU allocation is `29,930,496` bytes
+  (~`28.54 MiB`) in both boots; the candidate adds `36,480` bytes of GPU cache
+  state (`gather_state`) and `384` bytes of host UVA epoch buffers. Host peak
+  RSS inside the bounded worker container was `1,501,952 KiB` (boot 1) and
+  `1,500,288 KiB` (boot 2). Pre-boot `dgx1` `MemAvailable` was `10,101,504 KiB`
+  (boot 1, `47 °C`, `0%` GPU util) and `10,098,400 KiB` (boot 2, `44 °C`, `0%`
+  GPU util).
 
-`bundle/incremental.py` is an unvalidated component prototype. It
-compares copying a changed row, coalescing appended IDs to 1024-column chunks,
-and writing exact appended spans. GPU cache records retain owner, overwrite
-generation and previous count per chunk; overwrite generations come from the
-producer rather than a host scan. It keeps the normal gather for explicit output
-destinations, invalidates default-cache state on dummy writes, and rebuilds that
-state when layout tensors are rebuilt. It is not installed in serving and still
-needs GPU compilation, execution of the GPU correctness gates and timing, followed by real runtime
-integration and serving validation if it survives the component screen.
+## Two-boot component screen summary (`runs/27453e5b-dgx1/`)
 
-The original audit and its receipts remain below. No runtime correctness fix or
-performance gain has been established. The hardware handoff remains collective
-qualification, then the reserved verification-budget arm, before any request
-from this experiment; no acquisition waiter or request has been started here.
+| Mode | Cases | `gpu.steady` both boots sig. faster | `gpu.steady` both boots sig. slower | `gpu.steady` sign-flip / inconclusive | `gpu.reorder` both boots sig. slower | `prep.page_crossing` completion both boots sig. faster |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| `row` | 15 | 3 | 1 | 11 | **15 / 15** | 0 / 15 |
+| `chunk` | 15 | 6 | 4 | 5 | **15 / 15** | 0 / 15 |
+| `span` | 15 | 4 | 5 | 6 | **15 / 15** | 0 / 15 |
+
+Selected 512K / 1M paired mean changes (`µs`, candidate minus control, `[95% CI]`):
+
+| Mode / Case | `gpu.steady` boot 1 | `gpu.steady` boot 2 | `gpu.reorder` boot 1 | `gpu.reorder` boot 2 |
+| --- | ---: | ---: | ---: | ---: |
+| `row` 1M `c1` | −0.15 `[−0.16, −0.15]` | +1.17 `[+1.16, +1.17]` | +0.50 `[+0.50, +0.51]` | +1.69 `[+1.67, +1.70]` |
+| `row` 1M `c16` | −4.22 `[−4.74, −3.70]` | −2.20 `[−2.67, −1.73]` | +0.61 `[+0.39, +0.83]` | +0.59 `[+0.25, +0.94]` |
+| `chunk` 1M `c1` | −0.11 `[−0.11, −0.10]` | +1.14 `[+1.14, +1.15]` | +0.50 `[+0.50, +0.51]` | +1.72 `[+1.70, +1.74]` |
+| `chunk` 1M `c16` | −2.61 `[−3.03, −2.19]` | −2.65 `[−3.00, −2.30]` | +1.24 `[+1.06, +1.41]` | +1.10 `[+0.91, +1.29]` |
+| `span` 512K `c1` | +1.24 `[+1.23, +1.26]` | +1.24 `[+1.23, +1.25]` | +1.77 `[+1.76, +1.79]` | +1.75 `[+1.75, +1.76]` |
+| `span` 1M `c1` | +1.15 `[+1.13, +1.17]` | +1.20 `[+1.19, +1.20]` | +1.70 `[+1.69, +1.70]` | +1.40 `[+0.78, +2.02]` |
+| `span` 1M `c16` | −3.93 `[−4.43, −3.42]` | −0.94 `[−1.67, −0.21]` | +0.98 `[+0.66, +1.30]` | +0.78 `[+0.14, +1.43]` |
+
+`bundle/incremental.py` remains a harness-only prototype and is not installed in
+the serving runtime. Because `c1` and `reorder` gathers regress and `page_crossing`
+preparation shows no significant gain, the prototype does not survive the
+component screen and should not be integrated into vLLM or Candidate `1107`.
 
 ## Follow-up component screen, ready specification
 
