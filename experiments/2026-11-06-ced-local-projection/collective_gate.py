@@ -3,6 +3,7 @@ import argparse
 import datetime as dt
 import json
 import resource
+import os
 import types
 
 parser=argparse.ArgumentParser(description=__doc__)
@@ -15,6 +16,7 @@ assert args.rank in (0,1,2)
 import torch
 import tilelang
 from vllm.distributed import get_tp_group
+from vllm.config import VllmConfig, ParallelConfig, set_current_vllm_config
 from vllm.distributed.parallel_state import init_distributed_environment, initialize_model_parallel, destroy_model_parallel, destroy_distributed_environment
 from vllm.models.deepseek_v4_1 import ced
 from vllm.models.deepseek_v4_1.attention import DeepseekV4Attention
@@ -92,24 +94,28 @@ def projection_gate(tokens,nonfinite):
                     'split':method._split(layer),'compact_guard':compact,'passed':True})
     print(json.dumps({'rank':args.rank,**records[-1]}),flush=True)
 
-torch.cuda.set_device(0)
-try:
-    init_distributed_environment(world_size=WORLD,rank=args.rank,local_rank=0,
-        distributed_init_method=f'tcp://{args.master}:{args.port}',backend='nccl',timeout=dt.timedelta(seconds=120))
-    initialize_model_parallel(tensor_model_parallel_size=WORLD,backend='nccl')
-    group=get_tp_group();comm=group.device_communicator.pynccl_comm
-    assert group.world_size==WORLD and group.rank_in_group==args.rank
-    assert comm is not None and not comm.disabled,'native grouped PyNCCL path is required'
-    print(json.dumps({'rank':args.rank,'world':WORLD,'device_communicator':type(group.device_communicator).__name__,
-                      'pynccl_enabled':not comm.disabled,'scope':'actual TP3 synthetic correctness; no serving/timing claim'}),flush=True)
-    for tokens in (385,390,391,1025,16384):
-        for raw in (False,True):row_gate(tokens,raw)
-        for nonfinite in (False,True):projection_gate(tokens,nonfinite)
-        torch.distributed.barrier()
-    torch.cuda.synchronize()
-    print(json.dumps({'rank':args.rank,'passed':len(records),'peak_allocated_bytes':torch.cuda.max_memory_allocated(),
-                      'peak_reserved_bytes':torch.cuda.max_memory_reserved(),
-                      'process_maxrss_kib':resource.getrusage(resource.RUSAGE_SELF).ru_maxrss}),flush=True)
-finally:
-    destroy_model_parallel()
-    destroy_distributed_environment()
+os.environ['RANK']=str(args.rank)
+config=VllmConfig(parallel_config=ParallelConfig(
+    tensor_parallel_size=WORLD, distributed_executor_backend='external_launcher'))
+with set_current_vllm_config(config):
+    torch.cuda.set_device(0)
+    try:
+        init_distributed_environment(world_size=WORLD,rank=args.rank,local_rank=0,
+            distributed_init_method=f'tcp://{args.master}:{args.port}',backend='nccl',timeout=dt.timedelta(seconds=120))
+        initialize_model_parallel(tensor_model_parallel_size=WORLD,backend='nccl')
+        group=get_tp_group();comm=group.device_communicator.pynccl_comm
+        assert group.world_size==WORLD and group.rank_in_group==args.rank
+        assert comm is not None and not comm.disabled,'native grouped PyNCCL path is required'
+        print(json.dumps({'rank':args.rank,'world':WORLD,'device_communicator':type(group.device_communicator).__name__,
+                          'pynccl_enabled':not comm.disabled,'scope':'actual TP3 synthetic correctness; no serving/timing claim'}),flush=True)
+        for tokens in (385,390,391,1025,16384):
+            for raw in (False,True):row_gate(tokens,raw)
+            for nonfinite in (False,True):projection_gate(tokens,nonfinite)
+            torch.distributed.barrier()
+        torch.cuda.synchronize()
+        print(json.dumps({'rank':args.rank,'passed':len(records),'peak_allocated_bytes':torch.cuda.max_memory_allocated(),
+                          'peak_reserved_bytes':torch.cuda.max_memory_reserved(),
+                          'process_maxrss_kib':resource.getrusage(resource.RUSAGE_SELF).ru_maxrss}),flush=True)
+    finally:
+        destroy_model_parallel()
+        destroy_distributed_environment()

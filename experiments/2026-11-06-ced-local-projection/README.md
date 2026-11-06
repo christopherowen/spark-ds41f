@@ -438,3 +438,19 @@ remaining for its bounds and restoration; pending requests yield after the curre
 complete batch. Every command, output, error and thermal/memory sample is retained.
 The follow-on has been prepared but has not yet run; its actual outcomes must be
 recorded before claiming image smoke or cross-rank qualification.
+
+
+## Complete image smoke and first TP3 collective setup
+
+Window `124def42f3f7495ab9c768f98ab9452a` distributed and verified the complete
+immutable candidate image on SP5-SP7. The unchanged standard GPU smoke passed
+on every node. All three first collective processes failed during initialization
+because the standalone harness lacked a current VllmConfig; no candidate byte
+check ran, and the repeat boot was not attempted. The original C37 service was
+independently verified restored on all three nodes at 03:04:08 UTC, with leases
+removed. All raw attempts and recovery evidence are in `receipts/sp567-window-3/`.
+
+The repaired harness enters an explicit TP3 external-launcher configuration
+context and resolves transport settings from the published SP5-SP7 profile and
+node map. It retains native PyNCCL, byte equality and thermal/memory guards.
+The repair has not yet passed a GPU collective run.

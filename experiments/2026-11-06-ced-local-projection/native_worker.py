@@ -90,11 +90,18 @@ command_env = dict(os.environ)
 if args.job == 'collective':
     assert args.rank in (0,1,2) and socket.gethostname() == ['spark-0013','spark-0014','spark-0015'][args.rank]
     assert Path('/dev/infiniband').is_dir()
-    command += ['--device=/dev/infiniband','--ulimit=memlock=-1','--cap-add=IPC_LOCK',
-                '-e','NCCL_SOCKET_IFNAME=enp1s0f0np0','-e','GLOO_SOCKET_IFNAME=enp1s0f0np0',
-                '-e','NCCL_IB_HCA=rocep1s0f0,roceP2p1s0f0','-e','NCCL_IB_GID_INDEX=3',
-                '--entrypoint','python3',selected_image,'/check/collective_gate.py',
-                '--rank',str(args.rank),'--master','10.30.0.13','--port','29571']
+    from spark_ds41f.config import expected_environment
+    cluster,node_map,_=spark.configuration(argparse.Namespace(
+        cluster_config=str(EXP.relative_to(ROOT)/'sp567-image.json')))
+    node=node_map['nodes'][args.rank]
+    assert node['name']==NODES[args.rank]
+    transport={key:value for key,value in expected_environment(cluster,node).items()
+               if key.startswith(('NCCL_','GLOO_','SPARKNET_','TORCH_NCCL_'))
+               or key in ('VLLM_DISABLE_PYNCCL','VLLM_SHARE_PYNCCL_COMMS','VLLM_ENABLE_PCIE_ALLREDUCE')}
+    command += ['--device=/dev/infiniband','--ulimit=memlock=-1','--cap-add=IPC_LOCK']
+    for key,value in sorted(transport.items()):command += ['-e',key+'='+str(value)]
+    command += ['--entrypoint','python3',selected_image,'/check/collective_gate.py',
+                '--rank',str(args.rank),'--master',cluster['distributed']['master_addr'],'--port','29571']
 elif args.job == 'smoke':
     command = [str(ROOT/'bin/spark'),'--cluster-config',str(EXP.relative_to(ROOT)/'sp567-image.json'),
                'build','smoke','--image',selected_image]
