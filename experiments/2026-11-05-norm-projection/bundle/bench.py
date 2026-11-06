@@ -38,14 +38,14 @@ def byte_equal(a, b):
 
 
 def capture(fn, calls=1):
-    side = torch.cuda.Stream()
+    side = WARMUP_STREAM
     side.wait_stream(torch.cuda.current_stream())
     with torch.cuda.stream(side):
         fn()
     torch.cuda.current_stream().wait_stream(side)
     torch.cuda.synchronize()
     graph = torch.cuda.CUDAGraph()
-    with torch.cuda.graph(graph):
+    with torch.cuda.graph(graph, stream=CAPTURE_STREAM):
         for _ in range(calls):
             fn()
     return graph
@@ -85,7 +85,7 @@ def make_case(n, m, padded):
                         dtype=torch.int64, device="cuda")
     outputs, functions = {}, {}
     for variant in VARIANTS[:-1]:
-        auxiliary = torch.cuda.Stream()
+        auxiliary = AUXILIARY_STREAM
         q = torch.empty((m, 1280), device="cuda", dtype=torch.bfloat16)
         cast = empty_mxfp8(q)
         # Explicit poison in unread row padding: live outputs must ignore it.
@@ -146,6 +146,10 @@ def make_case(n, m, padded):
 
 
 def main():
+    global WARMUP_STREAM, CAPTURE_STREAM, AUXILIARY_STREAM
+    WARMUP_STREAM = torch.cuda.Stream()
+    CAPTURE_STREAM = torch.cuda.Stream()
+    AUXILIARY_STREAM = torch.cuda.Stream()
     torch.manual_seed(517)
     emit(identity={"image_vllm_tree": "c061e5f6931306fa4655ba531428f639c365bf10",
                    "torch": torch.__version__, "gpu": torch.cuda.get_device_name(),
@@ -155,6 +159,8 @@ def main():
     evict = torch.ones((128 << 20) // 4, device="cuda", dtype=torch.int32)
     prefetch = l2_prefetch_kernel(2, 128, 4096)
     side = torch.cuda.Stream()
+    assert len({stream.cuda_stream for stream in (WARMUP_STREAM,CAPTURE_STREAM,AUXILIARY_STREAM,side)}) == 4
+    emit(distinct_graph_streams=True)
     ordering = random.Random(517)
     saved = {}
     for n, padded in ((8192, False), (12288, False), (12288, True)):
