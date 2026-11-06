@@ -1,4 +1,7 @@
 import json
+import hashlib
+from pathlib import Path
+import tempfile
 import unittest
 
 import run_hardware as runner
@@ -6,6 +9,18 @@ import tool_schema_gate
 
 
 class GateTests(unittest.TestCase):
+    def test_parent_corpus_requires_the_saved_bytes(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            path = Path(temporary) / "corpus.gz"
+            expected = hashlib.sha256(b"saved corpus").hexdigest()
+            with self.assertRaises(FileNotFoundError):
+                runner.verify_corpus(path, expected)
+            path.write_bytes(b"saved corpus")
+            self.assertEqual(runner.verify_corpus(path, expected), path)
+            path.write_bytes(b"different corpus")
+            with self.assertRaises(ValueError):
+                runner.verify_corpus(path, expected)
+
     def test_resume_accepts_only_restored_ordered_handoff_at_identical_inputs(self):
         arms = [{"label": "row010-a", "config": "row010.json"},
                 {"label": "control035-a", "config": "control.json"}]

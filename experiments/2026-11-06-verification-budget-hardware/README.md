@@ -136,6 +136,14 @@ run commands, cooling/fan state, thermal and memory observations stay under
 Preserve all unsuccessful arms and guard failures; never silently restart an
 already-recorded stage.
 
+The published C40 comparison omits generated model text. Qualification must use
+the retained native `results/private/suites/candidate-40-release-tp3/candidate-40/model.json.gz`,
+verified as 15,166,113 bytes with SHA-256
+`b13ed140c68f0b6b135fe8c2e7d2eba6dbe625832aa8bd0e8dffa10820f04a87`
+against C40's published `source-receipt.json`. This file was verified on dgx1
+before execution. Missing or changed corpus bytes fail before a qualification
+boot; no silent self-generated replacement is permitted. Raw text stays private.
+
 Compare both boots with the two control boots using prompt-paired results and
 boot variability. Report throughput, completion/errors, per-output-token
 latency and TTFT (including tail latency), admitted/accepted drafts and memory.

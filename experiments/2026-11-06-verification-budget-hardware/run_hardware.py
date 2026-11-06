@@ -25,7 +25,10 @@ EXPERIMENT = Path(__file__).resolve().parent.relative_to(ROOT).as_posix()
 RESTORE = "experiments/2026-10-26-spark-ds41f-candidate/candidate-36/tp3-dev.json"
 HOLDER = "spark-lab: verification budget hardware"
 IMAGE = "sha256:7ae96e98e361601d8232cd99e6af1c6044b7c282bf6904c989e6ad033c147f82"
-PARENT = "experiments/2026-11-04-topk-live-qualification/runs/2026-11-04-dgx/attempt-2/performance/candidate-40"
+# The published comparison omits generated text; use the retained native corpus.
+# Identity is recorded in that qualification's immutable source-receipt.json.
+PARENT_CORPUS = "results/private/suites/candidate-40-release-tp3/candidate-40/model.json.gz"
+PARENT_CORPUS_SHA = "b13ed140c68f0b6b135fe8c2e7d2eba6dbe625832aa8bd0e8dffa10820f04a87"
 GATES = [
     ("greedy", "experiments/2026-10-12-r6g/token_determinism_text.py", ["--tokens", "192", "--long-lines", "700", "--wide"]),
     ("greedy-fast", "experiments/2026-10-12-r6g/token_determinism_text.py", ["--tokens", "192", "--long-lines", "700", "--wide", "--no-logprobs"]),
@@ -94,6 +97,12 @@ def gate_summary(text, name):
 def owns(hold, window):
     return bool(hold and hold.get("holder") == HOLDER and hold.get("window") == window
                 and hold.get("production_config") == RESTORE)
+
+
+def verify_corpus(path, expected):
+    if hashlib.sha256(path.read_bytes()).hexdigest() != expected:
+        raise ValueError("the saved parent model corpus checksum differs")
+    return path
 
 
 def validate_plan(text, operation):
@@ -239,6 +248,8 @@ def main():
                 raise ValueError("resume artifacts must be native receipts for the same stage")
             return path
         if args.stage.startswith("qualify"):
+            parent_corpus = verify_corpus(ROOT / PARENT_CORPUS, PARENT_CORPUS_SHA)
+            receipt["parent_corpus"] = {"path": PARENT_CORPUS, "sha256": PARENT_CORPUS_SHA}
             source = (Path(args.screen_from).resolve() if args.screen_from
                       else out.parent / "screen/receipt.json")
             screen = stage_path(source.parent, "screen")
@@ -364,8 +375,10 @@ def main():
                         "--compare", "none", "--label", label, "--output", str(output)]
                 first_screen = stage_path(completed[0]["source_run"], args.stage) if completed else out
                 corpus = (first_screen / arms[0]["label"] / stem / "model.json.gz" if args.stage == "screen"
-                          else ROOT / PARENT / suite / "model.json.gz")
-                if corpus.exists() and output != corpus.parent:
+                          else parent_corpus if suite == "release-tp3" else None)
+                if corpus is not None and output != corpus.parent:
+                    if not corpus.is_file():
+                        raise ValueError("the shared model corpus is missing; refusing a new self-corpus")
                     argv += ["--corpus", str(corpus)]
                 with lab.Telemetry(str(output) + "-telemetry", config):
                     command(argv, label + "-" + stem)
