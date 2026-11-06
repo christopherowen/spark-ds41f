@@ -1257,6 +1257,7 @@ class StepFailureTest(unittest.TestCase):
                         mock.patch.object(lab, "spark_cli", return_value=1), \
                         mock.patch.object(lab, "save_engine_logs"), \
                         mock.patch.object(lab, "sync_checkouts", return_value=True) as later, \
+                        mock.patch.object(lab, "checkout_commit", return_value=lab.COMMIT_AT_START), \
                         mock.patch.object(lab, "window_close", return_value=True) as close, \
                         contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
                     code = lab.execute({"experiment": "experiments/x", "run": "r", "jobs": []},
