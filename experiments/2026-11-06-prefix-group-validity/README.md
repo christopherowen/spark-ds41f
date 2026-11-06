@@ -61,6 +61,17 @@ attempts could not import the CUDA-specific code. Both arms' four HiSparse
 cases failed identically at device inference; these are unavailable-platform
 results, not functional passes or evidence of a candidate regression.
 
+The serving probe now also cancels a producer by its exact request ID, requires
+the server's abort counter to increase and its queue to become idle, and then
+compares a same-prefix follower with uninterrupted execution. Cached tokens are
+required to qualify that reuse case. Its 24 harness tests passed remotely at
+deployment commit `ac6e1f2f9500d30964b915e5fa3e080b45f43f44`; the receipt is
+`runs/cancellation-harness.json`. This verifies probe controls, not serving
+behavior. The native runbook separates the unchanged-API old-source reproducer
+from candidate metadata tests and records the required test/compiled-package
+mount layout. Actual DSpark context storage and full-checkpoint recovery remain
+hardware gates.
+
 The first fresh 573-patch preparation applied the source but found a committer
 identity mismatch. The source commit was normalized to the repository's fixed
 build committer, yielding the reproduced head `3fe3dfe937c67ee26e3a73d514f4ade73f62ec9e`.
