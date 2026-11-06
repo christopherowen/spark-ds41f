@@ -1,0 +1,1108 @@
+diff --git a/experiments/2026-11-04-lossless-memory/engram/check_live_cache.py b/experiments/2026-11-04-lossless-memory/engram/check_live_cache.py
+--- a/experiments/2026-11-04-lossless-memory/engram/check_live_cache.py
++++ b/experiments/2026-11-04-lossless-memory/engram/check_live_cache.py
+@@ -5,6 +5,8 @@
+ import concurrent.futures
+ import hashlib
+ import json
++import importlib.util
++import os
+ from pathlib import Path
+ import re
+ import shlex
+@@ -15,6 +17,10 @@
+ sys.path.insert(0, str(ROOT))
+ import spark_ds41f as spark
+ from spark_ds41f import lab
++_spec=importlib.util.spec_from_file_location("lossless_observer_component",Path(__file__).resolve().parents[1]/"run_component.py")
++component=importlib.util.module_from_spec(_spec)
++_spec.loader.exec_module(component)
++observer=component.observer_support
+ 
+ HOLDER = "spark-lab: owner-authorized lossless memory qualification"
+ RESTORE = "experiments/2026-10-26-spark-ds41f-candidate/candidate-36/tp3-dev.json"
+@@ -28,14 +34,15 @@
+     parser.add_argument("--config", required=True)
+     parser.add_argument("--run", required=True)
+     parser.add_argument("--label", required=True)
++    parser.add_argument("--window",default=os.environ.get("SPARK_DS41F_LOSSLESS_OBSERVER_WINDOW"))
+     args = parser.parse_args()
+-    hold = lab.read_hold()
+-    if (not hold or hold.get("holder") != HOLDER or hold.get("production_config") != RESTORE
+-            or not all(re.fullmatch(r"[A-Za-z0-9._-]{1,100}", v) for v in (args.run, args.label))):
++    config, nodes, _ = spark.configuration(argparse.Namespace(cluster_config=args.config))
++    def guard():component.scoped_window.observer_scope(lab,spark,nodes,args.window)
++    guard()
++    if (not all(re.fullmatch(r"[A-Za-z0-9._-]{1,100}", v) for v in (args.run, args.label))):
+         raise SystemExit("outside the exact authorized lossless window; no node operation")
+     if lab.requests_in_flight(args.url) != 0:
+         raise SystemExit("verification requires an idle candidate")
+-    config, nodes, _ = spark.configuration(argparse.Namespace(cluster_config=args.config))
+     directory = config["environment"].get("SPARK_DS41F_ENGRAM_PACKED_DIR")
+     if not directory or len(nodes["nodes"]) != 3:
+         raise SystemExit("not the TP3 packed-row candidate")
+@@ -44,41 +51,69 @@
+     print(json.dumps({"doctor_exit": doctor.returncode, "stdout": doctor.stdout, "stderr": doctor.stderr}), flush=True)
+     if doctor.returncode:
+         return 1
+-    source = Path(__file__).with_name("verify_cache.py").read_text()
++    source = observer.PROC_IDENTITY+"\n"+Path(__file__).with_name("verify_cache.py").read_text()
+     expected_sha = hashlib.sha256(source.encode()).hexdigest()
+     # Hash the actual stdin bytes. A separate CPU-only, memory-limited container
+     # reads the checkpoint/cache and joins the serving PID namespace only to
+     # inspect reader FDs. It cannot charge verification buffers to serving's cap.
+-    wrapper = ("import sys,hashlib; s=sys.stdin.read(); "
+-               "g={'__name__':'__main__','__file__':'<published-cache-verifier>',"
+-               "'SOURCE_SHA256':hashlib.sha256(s.encode()).hexdigest()}; "
+-               "exec(compile(s,g['__file__'],'exec'),g)")
+ 
+     def one(node):
+         rank = node["rank"]
+-        inspection = spark.run_ssh(nodes, node, "docker", "image", "inspect", config["container"]["image"],
+-                                   "--format", "{{.Id}}")
+-        image = inspection.stdout.strip()
+-        if inspection.returncode or not re.fullmatch(r"sha256:[0-9a-f]{64}", image):
+-            raise ValueError("candidate image identity missing")
++        record={"node":node["name"],"passed":False,"metadata":[],"lifecycle":{}}
++        directory_path=(ROOT/"results/private/lossless-observers"/
++            hashlib.sha256(args.window.encode()).hexdigest()/args.run)
++        receipt_path=directory_path/(args.label+"-"+node["name"]+".json")
++        receipt_created=False
++        def save():lab.write_json_atomic(receipt_path,record)
++        transport=observer.ssh_transport(spark,nodes,node)
++        def metadata(*argv):
++            guard();process=transport(list(argv),timeout=30)
++            record["metadata"].append({"argv":list(argv),"exit":process.returncode,"stdout":process.stdout,"stderr":process.stderr})
++            if process.returncode:raise RuntimeError("observer identity read failed")
++            return process.stdout
++        try:
++            directory_path.mkdir(parents=True,exist_ok=True)
++            with receipt_path.open("x") as file:json.dump(record,file)
++            receipt_created=True
++            record["lifecycle_receipt"]=str(receipt_path)
++            image=metadata("docker","image","inspect",config["container"]["image"],"--format","{{.Id}}").strip()
++            target=observer.capture_target(metadata,config["container"]["name"],component.io_process_ids,image)
++            record["target"]=target
++            image=target["image"]
++            wrapper=("import sys,hashlib; s=sys.stdin.read(); "
++                "g={'__name__':'__main__','__file__':'<published-cache-verifier>',"
++                "'EXPECTED_OBSERVER_TARGET':"+repr(observer.namespace_target(target))+","
++                "'SOURCE_SHA256':hashlib.sha256(s.encode()).hexdigest()}; "
++                "exec(compile(s,g['__file__'],'exec'),g)")
++            return verify(node,rank,image,wrapper,target,record,transport,metadata,save)
++        except Exception as error:
++            record["error"]=f"{type(error).__name__}: {error}"
++            if receipt_created:save()
++            return record
++
++    def verify(node,rank,image,wrapper,target,record,transport,metadata,save):
+         mounts = []
+         for bind in spark.expected_binds(config):
+-            source_path, target, _ = bind.rsplit(":", 2)
+-            if target in ("/hub", "/cache"):
+-                mounts += ["--volume", f"{source_path}:{target}:ro"]
++            source_path, mount_target, _ = bind.rsplit(":", 2)
++            if mount_target in ("/hub", "/cache"):
++                mounts += ["--volume", f"{source_path}:{mount_target}:ro"]
+         if len(mounts) != 4:
+             raise ValueError("expected exactly the checkpoint hub and cache mounts")
+         # The serving root process has IPC_LOCK. /proc FD inspection requires
+         # matching its UID and permitted capability set, even for read access.
+-        remote = ["docker", "run", "--rm", "-i", "--user=0", "--cap-add=IPC_LOCK",
++        remote = ["docker", "run", "--rm", "-i", "--runtime=runc", "--user=0", "--cap-add=IPC_LOCK",
+                   "--memory=1g", "--memory-swap=1g",
+-                  "--network=none", f"--pid=container:{config['container']['name']}",
++                  "--cpus=1","--pids-limit=64","--read-only","--tmpfs=/tmp:rw,nosuid,nodev,size=64m",
++                  "--security-opt=no-new-privileges","--network=none", f"--pid=container:{target['container_id']}",
+                   "--env", "CUDA_VISIBLE_DEVICES=", "--env", "NVIDIA_VISIBLE_DEVICES=void",
++                  "--env","OMP_NUM_THREADS=1","--env","OPENBLAS_NUM_THREADS=1","--env","MAX_JOBS=1",
+                   *mounts, "--entrypoint", "python3", image, "-c", wrapper,
+                   SNAPSHOT, "--revision", REVISION, "--directory", directory, "--tp", "3", "--rank", str(rank),
+                   "--out", f"/tmp/lossless-cache-{args.run}-{args.label}-rank{rank}.json"]
+-        argv = ["ssh", *spark.ssh_options(), spark.ssh_target(nodes, node), shlex.join(remote)]
+-        process = subprocess.run(argv, input=source, text=True, capture_output=True, timeout=1800)
++        process=observer.owned_observer(transport,remote,image=image,window=args.window,guard=guard,
++            latch_review=lambda reason:component.scoped_window.observer_review(lab,args.window,reason),
++            trace=record["lifecycle"],input_text=source,timeout=1800,persist=save)
++        observer.verify_target(metadata,target,component.io_process_ids)
+         receipts = []
+         for line in process.stdout.splitlines():
+             try:
+@@ -93,8 +128,10 @@
+                   and receipts[0].get("model_revision") == REVISION
+                   and receipts[0].get("rank") == rank and receipts[0].get("tp") == 3
+                   and len(receipts[0].get("files", [])) == 2)
+-        return {"node": node["name"], "argv": argv, "exit": process.returncode, "passed": passed,
+-                "raw_stdout": process.stdout, "stderr": process.stderr, "receipts": receipts}
++        record.update(argv=remote,exit=process.returncode,passed=passed,raw_stdout=process.stdout,
++                      stderr=process.stderr,receipts=receipts)
++        save()
++        return record
+ 
+     with concurrent.futures.ThreadPoolExecutor(max_workers=3) as pool:
+         futures = {pool.submit(one, node): node["name"] for node in nodes["nodes"]}
+diff --git a/experiments/2026-11-04-lossless-memory/engram/observer_control.py b/experiments/2026-11-04-lossless-memory/engram/observer_control.py
+--- a/experiments/2026-11-04-lossless-memory/engram/observer_control.py
++++ b/experiments/2026-11-04-lossless-memory/engram/observer_control.py
+@@ -17,24 +17,28 @@
+  result[pid]=[int(x) for x in line.split()[1:]]
+ print(json.dumps(result))
+ '''
+-INSPECT_FORMAT = '{"Id":{{json .Id}},"Image":{{json .Image}},"State":{"Running":{{json .State.Running}},"StartedAt":{{json .State.StartedAt}}},"User":{{json .Config.User}},"Privileged":{{json .HostConfig.Privileged}},"CapAdd":{{json .HostConfig.CapAdd}}}'
+-FD_PROGRAM=r'''
++INSPECT_FORMAT = component.observer_support.TARGET_FORMAT
++FD_PROGRAM=component.observer_support.PROC_IDENTITY+r'''
+ import json,os,pathlib,sys
++target=json.loads(sys.argv[1])
++init=observer_proc_identity(target['init_pid'])
++observer_check_identity(init,target['processes'][str(target['init_pid'])]['start_ticks'],init,target['container_id'])
+ result={}
+-for pid in sys.argv[1:]:
++for pid,expected in target['processes'].items():
+  root=pathlib.Path("/proc")/pid
+- stat=(root/"stat").read_text()
+- row={"start_ticks":int(stat[stat.rfind(")")+2:].split()[19]),"fds":[],"closed_during_observation":[]}
++ before=observer_proc_identity(pid)
++ observer_check_identity(before,expected['start_ticks'],init,target['container_id'])
++ row={**before,"fds":[],"closed_during_observation":[]}
+  for p in sorted((root/"fd").iterdir(),key=lambda p:int(p.name)):
+   try:
+-   target=os.readlink(p);identity=p.stat()
++   fd_target=os.readlink(p);identity=p.stat()
+   except FileNotFoundError:
+    row["closed_during_observation"].append(p.name);continue
+-  row["fds"].append({"fd":int(p.name),"target":target,"device":identity.st_dev,"inode":identity.st_ino})
++  row["fds"].append({"fd":int(p.name),"target":fd_target,"device":identity.st_dev,"inode":identity.st_ino})
+  assert row["fds"],"serving process has no readable FDs"
+- after=(root/"stat").read_text()
+- assert row["start_ticks"]==int(after[after.rfind(")")+2:].split()[19]),"PID identity changed"
++ observer_assert_stable(before,observer_proc_identity(pid))
+  result[pid]=row
++observer_assert_stable(init,observer_proc_identity(target['init_pid']))
+ print(json.dumps({"processes":result,"all_inspected_fds_readable":True}))
+ '''
+ 
+@@ -47,13 +51,11 @@
+  if not out.is_relative_to(ROOT/"results/private"):p.error("control receipts must remain private")
+  if not args.apply:
+   print(json.dumps({"scope":"CPU-only metadata reads on each TP3 rank; no model requests or serving lifecycle operations","config":component.RESTORE,"window":args.window,"out":str(out),"io_memory_mib":128,"fd_memory_mib":128,"cpus_per_observer":1}));return 0
+- def guard():
+-  h=lab.read_hold()
+-  if not (h and h.get("holder")==component.HOLDER and h.get("window")==args.window and h.get("production_config")==component.RESTORE):raise RuntimeError("foreign window; no observation")
++ cluster,nodes,_=spark.configuration(argparse.Namespace(cluster_config=component.RESTORE))
++ def guard():component.scoped_window.observer_scope(lab,spark,nodes,args.window)
+  if os.uname().nodename!="dgx1" or out.exists():raise SystemExit("wrong host or prior output; no operation")
+  guard()
+  if subprocess.check_output(["git","status","--porcelain"],cwd=ROOT).strip():raise SystemExit("dirty source; no operation")
+- cluster,nodes,_=spark.configuration(argparse.Namespace(cluster_config=component.RESTORE))
+  if len(nodes["nodes"])!=3:raise SystemExit("only configured TP3 ranks are authorized")
+  out.mkdir(parents=True);receipt={"scope":"native CPU-only /proc I/O and FD permission controls; no serving qualification or baseline timing","window":args.window,"commit":subprocess.check_output(["git","rev-parse","HEAD"],cwd=ROOT,text=True).strip(),"started":lab.now(),"nodes":[],"passed":False}
+  def save():lab.write_json_atomic(out/"receipt.json",receipt)
+@@ -67,24 +69,33 @@
+   for node in nodes["nodes"]:
+    lab.beat("lossless Engram native observer controls: "+node["name"])
+    receipt["nodes"].append({"node":node["name"],"steps":[],"passed":False});save()
+-   inspected=json.loads(run(node,"docker","inspect",cluster["container"]["name"],"--format",INSPECT_FORMAT))
+-   image=inspected["Image"];assert inspected["State"]["Running"] and inspected["User"] in ("","root","0")
+-   assert not inspected["Privileged"] and set(inspected.get("CapAdd") or []) <= {"IPC_LOCK","CAP_IPC_LOCK"}
+-   pids=component.io_process_ids(run(node,"docker","top",cluster["container"]["name"],"-eo","pid"))
+-   io=json.loads(run(node,*component.io_command(image,cluster["container"]["name"],pids)))
+-   component.io_gate(io,cluster["container"]["name"],expected_pids=pids)
++   target=component.observer_support.capture_target(lambda *argv:run(node,*argv),cluster["container"]["name"],component.io_process_ids,
++       expected_image=lab.read_hold()["resource_scope"]["restore"]["image"])
++   image=target["image"];pids=list(target["processes"])
++   transport=component.observer_support.ssh_transport(spark,nodes,node)
++   receipt["nodes"][-1]["io_lifecycle"]={}
++   io_process=component.observer_support.owned_observer(transport,component.io_command(image,cluster["container"]["name"],target=target),
++       image=image,window=args.window,guard=guard,latch_review=lambda reason:component.scoped_window.observer_review(lab,args.window,reason),
++       trace=receipt["nodes"][-1]["io_lifecycle"],timeout=30,persist=save)
++   if io_process.returncode:raise RuntimeError("owned I/O control failed")
++   io=json.loads(io_process.stdout)
++   component.io_gate(io,cluster["container"]["name"],expected_pids=pids,target=target)
+    ns=json.loads(run(node,"python3","-c",NS_PROGRAM,*pids))
+-   assert set(ns)==set(pids) and all(ns[pid] and ns[pid][0]==int(pid) and ns[pid][-1]>0 for pid in pids)
++   assert set(ns)==set(pids) and all(ns[pid]==target["processes"][pid]["namespace_pids"] for pid in pids)
+    namespace_pids=[str(ns[pid][-1]) for pid in pids];assert len(namespace_pids)==len(set(namespace_pids))
+-   fdargs=component.io_command(image,cluster["container"]["name"],pids)
+-   fdargs[fdargs.index("--pid=host")]="--pid=container:"+cluster["container"]["name"]
+-   i=fdargs.index("-c");fdargs=fdargs[:i]+["-c",FD_PROGRAM,*namespace_pids]
+-   fd=json.loads(run(node,*fdargs))
++   fdargs=component.io_command(image,cluster["container"]["name"],target=target)
++   fdargs[fdargs.index("--pid=host")]="--pid=container:"+target["container_id"]
++   i=fdargs.index("-c");fdargs=fdargs[:i]+["-c",FD_PROGRAM,json.dumps(component.observer_support.namespace_target(target),sort_keys=True)]
++   receipt["nodes"][-1]["fd_lifecycle"]={}
++   fd_process=component.observer_support.owned_observer(transport,fdargs,image=image,window=args.window,guard=guard,
++       latch_review=lambda reason:component.scoped_window.observer_review(lab,args.window,reason),
++       trace=receipt["nodes"][-1]["fd_lifecycle"],timeout=30,persist=save)
++   if fd_process.returncode:raise RuntimeError("owned FD control failed")
++   fd=json.loads(fd_process.stdout)
+    assert fd["all_inspected_fds_readable"] is True and set(fd["processes"])==set(namespace_pids)
+    for pid in pids:assert io["processes"][pid]["start_ticks"]==fd["processes"][str(ns[pid][-1])]["start_ticks"]
+-   after=json.loads(run(node,"docker","inspect",cluster["container"]["name"],"--format",INSPECT_FORMAT))
+-   assert all(after[key]==inspected[key] for key in ["Id","Image"]) and after["State"]["StartedAt"]==inspected["State"]["StartedAt"] and after["State"]["Running"]
+-   receipt["nodes"][-1].update(passed=True,image_id=image,serving_id=inspected["Id"],serving_started=inspected["State"]["StartedAt"],host_pids=pids,namespace_pids=namespace_pids,io_program_sha256=hashlib.sha256(component.IO_PROGRAM.encode()).hexdigest(),fd_program_sha256=hashlib.sha256(FD_PROGRAM.encode()).hexdigest(),io=io,fd=fd);save()
++   component.observer_support.verify_target(lambda *argv:run(node,*argv),target,component.io_process_ids)
++   receipt["nodes"][-1].update(passed=True,image_id=image,serving_id=target["container_id"],serving_started=target["started_at"],target=target,host_pids=pids,namespace_pids=namespace_pids,io_program_sha256=hashlib.sha256(component.IO_PROGRAM.encode()).hexdigest(),fd_program_sha256=hashlib.sha256(FD_PROGRAM.encode()).hexdigest(),io=io,fd=fd);save()
+   receipt["passed"]=True
+  except Exception as error:
+   receipt["error"]=type(error).__name__+": "+str(error)
+diff --git a/experiments/2026-11-04-lossless-memory/engram/observer_support.py b/experiments/2026-11-04-lossless-memory/engram/observer_support.py
+new file mode 100644
+--- /dev/null
++++ b/experiments/2026-11-04-lossless-memory/engram/observer_support.py
+@@ -0,0 +1,233 @@
++"""Exact-target metadata and owned CPU-observer lifecycle; no implicit dispatch."""
++import hashlib
++import json
++import re
++import shlex
++import subprocess
++import uuid
++
++OWNER = "lossless-memory-engram-observer"
++LABEL_PREFIX = "local.spark-ds41f.observer."
++TARGET_FORMAT = '{"Id":{{json .Id}},"Image":{{json .Image}},"State":{"Running":{{json .State.Running}},"Pid":{{json .State.Pid}},"StartedAt":{{json .State.StartedAt}}},"User":{{json .Config.User}},"Privileged":{{json .HostConfig.Privileged}},"CapAdd":{{json .HostConfig.CapAdd}}}'
++OWN_FORMAT = '{"Id":{{json .Id}},"Name":{{json .Name}},"Image":{{json .Image}},"ConfigImage":{{json .Config.Image}},"Labels":{{json .Config.Labels}},"Running":{{json .State.Running}}}'
++
++# The SSH UID can read birth ticks/NSpid even when root-owned io/FD access is
++# protected. No privileged operation occurs while this target is captured.
++HOST_SNAPSHOT = r'''
++import json,pathlib,sys
++result={}
++for pid in sys.argv[1:]:
++ root=pathlib.Path('/proc')/pid
++ def ticks():
++  value=(root/'stat').read_text()
++  return int(value[value.rfind(')')+2:].split()[19])
++ before=ticks()
++ line=next(v for v in (root/'status').read_text().splitlines() if v.startswith('NSpid:'))
++ ns=[int(v) for v in line.split()[1:]]
++ if not ns or ns[0]!=int(pid) or before!=ticks():raise RuntimeError('target PID identity changed during capture')
++ result[pid]={'start_ticks':before,'namespace_pids':ns}
++print(json.dumps(result))
++'''
++
++# Prepended to both the I/O probe and FD verifier, so their exact stdin/program
++# hash covers the common checks. All comparisons use one observer's cgroup view.
++PROC_IDENTITY = r'''
++import hashlib,json,os,pathlib
++def observer_proc_identity(pid):
++ root=pathlib.Path('/proc')/str(pid)
++ stat=(root/'stat').read_text()
++ return {'start_ticks':int(stat[stat.rfind(')')+2:].split()[19]),
++         'pid_namespace':os.readlink(root/'ns/pid'),
++         'cgroup':(root/'cgroup').read_text().splitlines()}
++def observer_check_identity(value,expected_ticks,init,container_id):
++ if (value['start_ticks']!=expected_ticks or value['pid_namespace']!=init['pid_namespace']
++     or value['cgroup']!=init['cgroup'] or not any(container_id in row for row in init['cgroup'])):
++  raise RuntimeError('PID reuse or namespace/cgroup membership changed')
++def observer_assert_stable(before,after):
++ if before!=after:raise RuntimeError('PID identity changed during observation')
++'''
++
++
++def require(condition, message):
++    if not condition:
++        raise ValueError(message)
++
++
++def valid_target(target, image=None):
++    require(isinstance(target, dict) and re.fullmatch(r"[0-9a-f]{64}", target.get("container_id", "")),
++            "inspected immutable container ID is required")
++    require(re.fullmatch(r"sha256:[0-9a-f]{64}", target.get("image", ""))
++            and (image is None or target["image"] == image), "target image differs")
++    init = str(target.get("init_pid", "")); pids = target.get("processes", {})
++    require(init in pids and 1 <= len(pids) <= 1024 and target.get("started_at"), "target init/PID set is missing")
++    for pid, row in pids.items():
++        require(pid.isascii() and pid.isdecimal() and int(pid) > 0
++                and type(row.get("start_ticks")) is int and row["start_ticks"] > 0,
++                "target PID birth identity is invalid")
++        ns = row.get("namespace_pids")
++        require(isinstance(ns, list) and ns and ns[0] == int(pid)
++                and all(type(v) is int and v > 0 for v in ns), "target PID namespace map is invalid")
++    require(len({row["namespace_pids"][-1] for row in pids.values()}) == len(pids),
++            "target namespace PIDs are duplicated")
++    return target
++
++
++def capture_target(run, container, parse_pids, expected_image=None):
++    inspected = json.loads(run("docker", "inspect", container, "--format", TARGET_FORMAT))
++    require(inspected["State"]["Running"] is True and inspected["User"] in ("", "root", "0")
++            and inspected["Privileged"] is False
++            and set(inspected.get("CapAdd") or []) <= {"IPC_LOCK", "CAP_IPC_LOCK"},
++            "serving container permissions/running state differ")
++    pids = parse_pids(run("docker", "top", inspected["Id"], "-eo", "pid"))
++    require(str(inspected["State"]["Pid"]) in pids, "inspected container init is not in docker top")
++    births = json.loads(run("python3", "-c", HOST_SNAPSHOT, *pids))
++    require(set(births) == set(pids), "captured serving PID set differs")
++    return valid_target({"container": container, "container_id": inspected["Id"],
++        "image": inspected["Image"], "init_pid": inspected["State"]["Pid"],
++        "started_at": inspected["State"]["StartedAt"], "processes": births}, expected_image)
++
++
++def verify_target(run, target, parse_pids):
++    valid_target(target)
++    now = capture_target(run, target["container_id"], parse_pids, target["image"])
++    # capture by immutable ID changes only the descriptive container argument.
++    now["container"] = target["container"]
++    require(now == target, "serving container/PID births changed after observation")
++
++
++def namespace_target(target):
++    valid_target(target)
++    return {"container_id": target["container_id"],
++            "init_pid": target["processes"][str(target["init_pid"])]["namespace_pids"][-1],
++            "processes": {str(row["namespace_pids"][-1]): {"start_ticks": row["start_ticks"]}
++                          for row in target["processes"].values()}}
++
++
++class CleanupUnknown(RuntimeError):
++    pass
++
++
++def ssh_transport(spark, nodes, node):
++    def run(argv, *, input_text=None, timeout=30):
++        return subprocess.run(["ssh", *spark.ssh_options(), spark.ssh_target(nodes, node), shlex.join(argv)],
++            input=input_text, text=True, capture_output=True, timeout=timeout)
++    return run
++
++
++def owned_observer(transport, run_argv, *, image, window, guard, latch_review, trace,
++                   input_text=None, timeout=30, nonce=None, persist=None):
++    """Create/start an owned peer; inspect its exact ID/labels before any stop/rm.
++
++    A timed-out SSH client never constitutes cleanup. Unknown cleanup latches a
++    sticky review hold through the existing exact-owner controller callback.
++    """
++    require(run_argv[:2] == ["docker", "run"] and re.fullmatch(r"sha256:[0-9a-f]{64}", image),
++            "owned observer requires a fixed run plan and immutable image")
++    require(not any(v == "--name" or v.startswith("--name=") or v.startswith("--label")
++                    for v in run_argv[2:]), "observer plan must not supply lifecycle identity")
++    nonce = nonce or uuid.uuid4().hex
++    require(re.fullmatch(r"[0-9a-f]{32}", nonce) and isinstance(window, str) and window,
++            "observer owner token is missing")
++    name = "lossless-obs-" + hashlib.sha256(window.encode()).hexdigest()[:12] + "-" + nonce[:12]
++    labels = {LABEL_PREFIX + "owner": OWNER, LABEL_PREFIX + "window": window, LABEL_PREFIX + "nonce": nonce}
++    require(type(timeout) is int and 1 <= timeout <= 1800, "observer lifetime must be explicitly bounded")
++    child_lifetime = min(timeout, 600)
++    # The alarm is armed inside the container, independent of the SSH client or
++    # controller lifetime. Ten minutes leaves margin before the scoped window's
++    # fifteen-minute stale-heartbeat watchdog, even with its 30-second beat.
++    # These fixed observers execute one Python process; a deadline never passes
++    # a partial observation. The transport may retain its longer timeout.
++    image_index = run_argv.index(image)
++    require(run_argv[image_index - 2:image_index] == ["--entrypoint", "python3"]
++            and run_argv[image_index + 1] == "-c", "unexpected observer entrypoint")
++    program_index = image_index + 2
++    bounded_argv = list(run_argv)
++    bounded_argv[program_index] = ("import signal; signal.signal(signal.SIGALRM,signal.SIG_DFL); "
++        f"signal.alarm({child_lifetime});\n" + bounded_argv[program_index])
++    trace.update(name=name, image=image, window=window, nonce=nonce, commands=[], cleanup_known=False,
++                 child_lifetime_seconds=child_lifetime,transport_timeout_seconds=timeout)
++    cid, outcome, failure, create_attempted = None, None, None, False
++
++    def save():
++        if persist is not None:
++            persist()
++
++    save()
++
++    def command(argv, *, source=None, seconds=30):
++        row = {"argv": argv, "timeout": seconds,
++               "stdin_sha256": hashlib.sha256(source.encode()).hexdigest() if source is not None else None}
++        trace["commands"].append(row)
++        save()
++        try:
++            result = transport(argv, input_text=source, timeout=seconds)
++            row.update(exit=result.returncode, stdout=result.stdout, stderr=result.stderr)
++            save()
++            require(len((result.stdout + result.stderr).encode()) <= 512 * 1024,
++                    "observer output exceeded its retained bound")
++            return result
++        except BaseException as error:
++            row["error"] = type(error).__name__ + ": " + str(error)
++            if isinstance(error, subprocess.TimeoutExpired):
++                for key in ("stdout", "stderr"):
++                    partial = getattr(error, key, None)
++                    row[key] = partial.decode(errors="replace") if isinstance(partial, bytes) else partial
++            save()
++            raise
++
++    def inspected(reference):
++        result = command(["docker", "inspect", reference, "--format", OWN_FORMAT], seconds=15)
++        if result.returncode:
++            require(result.returncode == 1 and ("No such object" in result.stderr or "No such container" in result.stderr),
++                    "observer cleanup identity is unreadable")
++            return None
++        value = json.loads(result.stdout)
++        require(value.get("Name") == "/" + name and value.get("Image") == image
++                and value.get("ConfigImage") == image
++                and re.fullmatch(r"[0-9a-f]{64}", value.get("Id", ""))
++                and (cid is None or value["Id"] == cid)
++                and all((value.get("Labels") or {}).get(k) == v for k, v in labels.items()),
++                "refusing foreign container cleanup")
++        return value
++
++    try:
++        guard()
++        create = ["docker", "create", "--name", name, "--stop-timeout=5"]
++        for key, value in labels.items():
++            create += ["--label", key + "=" + value]
++        create += [arg for arg in bounded_argv[2:] if arg != "--rm"]
++        create_attempted = True
++        created = command(create)
++        require(created.returncode == 0 and re.fullmatch(r"[0-9a-f]{64}", created.stdout.strip()),
++                "observer create did not return an immutable CID")
++        cid = created.stdout.strip(); trace["cid"] = cid
++        save()
++        require(inspected(cid) is not None, "created observer disappeared")
++        guard()
++        outcome = command(["docker", "start", "--attach", "--interactive", cid],
++                          source=input_text, seconds=timeout)
++    except BaseException as error:
++        failure = error
++        trace["failure"] = type(error).__name__ + ": " + str(error)
++        save()
++    finally:
++        try:
++            actual = inspected(cid or name) if create_attempted else None
++            if actual is not None:
++                if actual["Running"]:
++                    stopped = command(["docker", "stop", "--time", "5", actual["Id"]], seconds=15)
++                    require(stopped.returncode == 0, "owned observer stop failed")
++                    actual = inspected(actual["Id"])
++                    require(actual is not None and actual["Running"] is False, "owned observer is still running or unknown")
++                removed = command(["docker", "rm", actual["Id"]], seconds=15)
++                require(removed.returncode == 0 and inspected(actual["Id"]) is None, "owned observer removal is unverified")
++            trace["cleanup_known"] = True
++            save()
++        except BaseException as error:
++            trace["cleanup_error"] = type(error).__name__ + ": " + str(error)
++            latch_review(trace["cleanup_error"])
++            save()
++            raise CleanupUnknown("observer cleanup is unknown; exact scope retained for review") from error
++    if failure is not None:
++        raise failure
++    return outcome
+diff --git a/experiments/2026-11-04-lossless-memory/engram/verify_cache.py b/experiments/2026-11-04-lossless-memory/engram/verify_cache.py
+--- a/experiments/2026-11-04-lossless-memory/engram/verify_cache.py
++++ b/experiments/2026-11-04-lossless-memory/engram/verify_cache.py
+@@ -116,9 +116,20 @@
+ def open_by_serving_process(paths):
+     owners = {str(p): [] for p in paths}
+     identities = {str(p): (p.stat().st_dev, p.stat().st_ino) for p in paths}
+-    for process in Path("/proc").glob("[0-9]*"):
++    expected=globals().get("EXPECTED_OBSERVER_TARGET")
++    if expected is not None:
++        init=observer_proc_identity(expected["init_pid"])
++        observer_check_identity(init,expected["processes"][str(expected["init_pid"])]["start_ticks"],init,expected["container_id"])
++        processes=[Path('/proc')/pid for pid in expected["processes"]]
++    else:
++        processes=Path("/proc").glob("[0-9]*")
++    for process in processes:
+         if process.name == str(os.getpid()):
++            if expected is not None:raise RuntimeError("serving PID was reused by the observer")
+             continue
++        if expected is not None:
++            before=observer_proc_identity(process.name)
++            observer_check_identity(before,expected["processes"][process.name]["start_ticks"],init,expected["container_id"])
+         for fd in (process / "fd").glob("*"):
+             try:
+                 target = os.readlink(fd)
+@@ -132,6 +143,10 @@
+                 if (info.st_dev, info.st_ino) == identity:
+                     owners[path].append({"pid": int(process.name), "fd": fd.name,
+                                          "observed_path": target})
++        if expected is not None:
++            observer_assert_stable(before,observer_proc_identity(process.name))
++    if expected is not None:
++        observer_assert_stable(init,observer_proc_identity(expected["init_pid"]))
+     if not owners or not all(owners.values()):
+         raise ValueError("the running reader does not hold every verified packed file")
+     return owners
+diff --git a/experiments/2026-11-04-lossless-memory/run_component.py b/experiments/2026-11-04-lossless-memory/run_component.py
+--- a/experiments/2026-11-04-lossless-memory/run_component.py
++++ b/experiments/2026-11-04-lossless-memory/run_component.py
+@@ -22,6 +22,9 @@
+ _scope_spec = importlib.util.spec_from_file_location("lossless_scoped_window_runtime", HERE / "scoped_window.py")
+ scoped_window = importlib.util.module_from_spec(_scope_spec)
+ _scope_spec.loader.exec_module(scoped_window)
++_observer_spec = importlib.util.spec_from_file_location("lossless_observer_support_runtime", HERE / "engram/observer_support.py")
++observer_support = importlib.util.module_from_spec(_observer_spec)
++_observer_spec.loader.exec_module(observer_support)
+ 
+ HOLDER = "spark-lab: owner-authorized lossless memory qualification"
+ STREAM_POLICY = "recorded-1030"
+@@ -30,17 +33,24 @@
+                      "connection timed out during banner exchange", "memory telemetry stopped reporting",
+                      "memory telemetry did not start")
+ 
+-IO_PROGRAM = r'''
++IO_PROGRAM = observer_support.PROC_IDENTITY + r'''
+ import datetime, json, pathlib, re, sys, time
+ started = time.monotonic_ns()
++target=json.loads(sys.argv[2])
++init_pid=str(target['init_pid'])
++init=observer_proc_identity(init_pid)
++observer_check_identity(init,target['processes'][init_pid]['start_ticks'],init,target['container_id'])
+ processes = {}
+-for value in sys.argv[2:]:
++for value,expected in target['processes'].items():
+     pid = int(value)
+     root = pathlib.Path("/proc") / str(pid)
+-    stat = (root / "stat").read_text()
++    before=observer_proc_identity(pid)
++    observer_check_identity(before,expected['start_ticks'],init,target['container_id'])
+     counters = {key: int(value) for key, value in
+                 (line.split(":", 1) for line in (root / "io").read_text().splitlines())}
+-    processes[str(pid)] = {"start_ticks": int(stat[stat.rfind(")") + 2:].split()[19]), "io": counters}
++    observer_assert_stable(before,observer_proc_identity(pid))
++    processes[str(pid)] = {**before, "io": counters}
++observer_assert_stable(init,observer_proc_identity(init_pid))
+ disks = {}
+ for line in pathlib.Path("/proc/diskstats").read_text().splitlines():
+     fields = line.split()
+@@ -48,11 +58,12 @@
+         disks[fields[2]] = [int(value) for value in fields[3:]]
+ print(json.dumps({"utc": datetime.datetime.now(datetime.timezone.utc).isoformat(),
+                   "monotonic_start_ns": started, "monotonic_end_ns": time.monotonic_ns(),
+-                  "container": sys.argv[1], "processes": processes, "nvme_diskstats": disks}))
++                  "container": sys.argv[1], "container_id":target['container_id'],
++                  "init":init,"processes": processes, "nvme_diskstats": disks}))
+ '''
+ 
+ 
+-def io_gate(value, container, *, expected_pids=None):
++def io_gate(value, container, *, expected_pids=None, target=None):
+     required = {"rchar", "wchar", "syscr", "syscw", "read_bytes", "write_bytes", "cancelled_write_bytes"}
+     if value.get("container") != container or not value.get("processes") or not value.get("nvme_diskstats"):
+         raise ValueError("I/O observation omits serving processes or NVMe counters")
+@@ -68,6 +79,19 @@
+     for row in value["nvme_diskstats"].values():
+         if len(row) < 11 or any(type(number) is not int or number < 0 for number in row):
+             raise ValueError("invalid NVMe disk counter")
++    if target is not None:
++        observer_support.valid_target(target)
++        init=value.get("init",{})
++        if (value.get("container_id")!=target["container_id"]
++                or init.get("start_ticks")!=target["processes"][str(target["init_pid"])]["start_ticks"]
++                or set(value["processes"])!=set(target["processes"])
++                or not init.get("pid_namespace") or not isinstance(init.get("cgroup"),list)
++                or not any(target["container_id"] in row for row in init["cgroup"])):
++            raise ValueError("I/O container/init identity differs")
++        for pid,row in value["processes"].items():
++            if (row["start_ticks"]!=target["processes"][pid]["start_ticks"]
++                    or row.get("pid_namespace")!=init["pid_namespace"] or row.get("cgroup")!=init["cgroup"]):
++                raise ValueError("I/O PID reuse or namespace/cgroup membership differs")
+ 
+ 
+ def io_process_ids(text):
+@@ -80,18 +104,21 @@
+     return pids
+ 
+ 
+-def io_command(image, container, pids):
++def io_command(image, container, pids=None, *, target=None):
+     if (not image.startswith("sha256:") or len(image) != 71
+             or any(c not in "0123456789abcdef" for c in image[7:])):
+         raise ValueError("I/O observer requires the inspected immutable image identity")
++    observer_support.valid_target(target,image)
++    if pids is not None and set(pids)!=set(target["processes"]):
++        raise ValueError("inspected serving process set differs")
+     # Serving is root with IPC_LOCK. Matching its permitted capabilities is
+     # necessary for Linux's /proc read checks; the SSH account cannot read io.
+     # This separate CPU container reads only the explicitly inspected host PIDs.
+-    return ["docker", "run", "--rm", "--user=0", "--pid=host", "--cap-add=IPC_LOCK",
++    return ["docker", "run", "--rm", "--runtime=runc", "--user=0", "--pid=host", "--cap-add=IPC_LOCK",
+             "--memory=128m", "--memory-swap=128m", "--cpus=1", "--pids-limit=32",
+             "--network=none", "--read-only", "--security-opt=no-new-privileges",
+             "--env", "CUDA_VISIBLE_DEVICES=", "--env", "NVIDIA_VISIBLE_DEVICES=void",
+-            "--entrypoint", "python3", image, "-c", IO_PROGRAM, container, *pids]
++            "--entrypoint", "python3", image, "-c", IO_PROGRAM, container, json.dumps(target,sort_keys=True)]
+ 
+ 
+ def preflight(arm, through):
+@@ -393,8 +420,10 @@
+         receipt["steps"].append(row)
+         save()
+         with (out / row["log"]).open("x") as log:
++            environment=os.environ.copy()
++            if args.component=="engram":environment["SPARK_DS41F_LOSSLESS_OBSERVER_WINDOW"]=args.window
+             process = subprocess.run(argv, cwd=ROOT, input=input_text, text=True,
+-                                     stdout=log, stderr=subprocess.STDOUT)
++                                     stdout=log, stderr=subprocess.STDOUT,env=environment)
+         row.update(exit=process.returncode, ended=lab.now())
+         text = (out / row["log"]).read_text(errors="replace").lower()
+         management_lost |= any(marker in text for marker in MANAGEMENT_ERRORS)
+@@ -449,26 +478,42 @@
+         for node in nodes["nodes"]:
+             if not owns():
+                 raise RuntimeError("window changed before I/O observation")
+-            top = spark.run_ssh(nodes, node, "docker", "top", cluster["container"]["name"], "-eo", "pid")
+-            record = {"node": node["name"], "top": {"exit": top.returncode, "stdout": top.stdout, "stderr": top.stderr},
++            record = {"node": node["name"],"metadata":[],"lifecycle":{},
+                       "program_sha256": hashlib.sha256(IO_PROGRAM.encode()).hexdigest()}
+-            management_lost |= top.returncode == 255 or any(
+-                marker in (top.stdout + top.stderr).lower() for marker in MANAGEMENT_ERRORS)
++            receipt.setdefault("io_lifecycles",[]).append({"label":active_label,"stage":stage,"record":record})
++            save()
++            transport=observer_support.ssh_transport(spark,nodes,node)
++            def scope_guard():scoped_window.observer_scope(lab,spark,nodes,args.window)
++            def metadata(*argv):
++                nonlocal management_lost
++                scope_guard()
++                result=transport(list(argv),timeout=30)
++                record["metadata"].append({"argv":list(argv),"exit":result.returncode,
++                                           "stdout":result.stdout,"stderr":result.stderr})
++                management_lost |= result.returncode==255 or any(marker in (result.stdout+result.stderr).lower() for marker in MANAGEMENT_ERRORS)
++                if result.returncode or len((result.stdout+result.stderr).encode())>65536:
++                    raise ValueError("serving identity capture failed")
++                return result.stdout
+             try:
+-                if top.returncode:
+-                    raise ValueError("serving process inspection failed")
+-                pids = io_process_ids(top.stdout)
+-                argv = io_command(receipt["images"][node["name"]]["Id"], cluster["container"]["name"], pids)
+-                process = spark.run_ssh(nodes, node, *argv)
++                image=receipt["images"][node["name"]]["Id"]
++                target=observer_support.capture_target(metadata,cluster["container"]["name"],io_process_ids,image)
++                record["target"]=target
++                argv = io_command(image, cluster["container"]["name"],target=target)
++                process=observer_support.owned_observer(transport,argv,image=image,window=args.window,
++                    guard=scope_guard,latch_review=lambda reason:scoped_window.observer_review(lab,args.window,reason),
++                    trace=record["lifecycle"],timeout=30,persist=save)
+                 record.update(argv=argv, exit=process.returncode, stdout=process.stdout, stderr=process.stderr)
+                 raw = process.stdout + process.stderr
+                 management_lost |= process.returncode == 255 or any(marker in raw.lower() for marker in MANAGEMENT_ERRORS)
+                 if process.returncode or len(raw.encode()) > 65536:
+                     raise ValueError("I/O observation failed or exceeded its output bound")
+                 record["observation"] = json.loads(process.stdout)
+-                io_gate(record["observation"], cluster["container"]["name"], expected_pids=pids)
+-            except (ValueError, KeyError, TypeError) as error:
++                io_gate(record["observation"], cluster["container"]["name"],expected_pids=list(target["processes"]),target=target)
++                observer_support.verify_target(metadata,target,io_process_ids)
++            except Exception as error:
+                 record["error"] = f"{type(error).__name__}: {error}"
++                management_lost |= any(
++                    marker in str(error).lower() for marker in MANAGEMENT_ERRORS)
+                 failed = True
+             records.append(record)
+         path = out / f"io-{active_label}-{stage}.json"
+diff --git a/experiments/2026-11-04-lossless-memory/scoped_window.py b/experiments/2026-11-04-lossless-memory/scoped_window.py
+--- a/experiments/2026-11-04-lossless-memory/scoped_window.py
++++ b/experiments/2026-11-04-lossless-memory/scoped_window.py
+@@ -53,6 +53,42 @@
+         except (ValueError,KeyError,TypeError) as error:
+             problems.append(node["name"]+": "+str(error))
+     return rows,problems
++
++
++def observer_scope(lab,spark,nodes,window):
++    """Privileged peers need the exact captured lease and resolved physical group."""
++    hold=lab.read_hold()
++    if not window or not owns(hold,window):
++        raise RuntimeError("missing or foreign exact observer lease")
++    restore=hold["resource_scope"]["restore"]
++    if (not isinstance(restore.get("commit"),str) or len(restore["commit"])!=40
++            or any(c not in "0123456789abcdef" for c in restore["commit"])
++            or restore.get("image")!="sha256:b0522146640a7d852c017ec8c99423224492b7c2c4951eb3a64005ab4555ab11"):
++        raise RuntimeError("observer restoration identity is incomplete")
++    _,original,_=spark.configuration(argparse.Namespace(cluster_config=RESTORE))
++    def group(value):
++        rows=value.get("nodes",[])
++        if (len(rows)!=3 or {row.get("name") for row in rows}!=NAMES
++                or not isinstance(value.get("ssh_user"),str) or not value["ssh_user"]
++                or any(not isinstance(row.get("management_ip"),str) or not row["management_ip"] for row in rows)):
++            raise RuntimeError("observer is outside the exact DGX1-3 lease")
++        return value["ssh_user"],{row["name"]:(row["management_ip"],row.get("control_ip"),
++            row.get("rank"),row.get("head")) for row in rows}
++    if group(nodes)!=group(original):
++        raise RuntimeError("observer resolved node map differs from the captured restore group")
++    rows,problems=node_hold_observations(spark,nodes,window)
++    if problems:raise RuntimeError("; ".join(problems))
++    return rows
++
++
++def observer_review(lab,window,reason):
++    """Latch only this exact owned scope; never replace a foreign hold."""
++    hold=lab.read_hold()
++    if owns(hold,window):
++        hold.update(holder="lossless-memory-observer-review",
++                    rule="owned observer cleanup unknown; no restoration, release or new launch until reviewed: "+reason)
++        hold["resource_scope"]["holder"]=hold["holder"]
++        lab.write_json_atomic(lab.HOLD,hold)
+ 
+ 
+ def main():
+diff --git a/tests/test_lossless_component_runner.py b/tests/test_lossless_component_runner.py
+--- a/tests/test_lossless_component_runner.py
++++ b/tests/test_lossless_component_runner.py
+@@ -323,7 +323,10 @@
+ 
+     def test_io_cpu_probe_uses_the_gated_image_and_matching_peer_permissions(self):
+         image = "sha256:" + "a" * 64
+-        argv = runner.io_command(image, "serving", ["42"])
++        target = {"container": "serving", "container_id": "b" * 64, "image": image,
++                  "init_pid": 42, "started_at": "boot", "processes": {
++                      "42": {"start_ticks": 100, "namespace_pids": [42, 1]}}}
++        argv = runner.io_command(image, "serving", ["42"], target=target)
+         self.assertIn("--user=0", argv)
+         self.assertIn("--cap-add=IPC_LOCK", argv)
+         self.assertIn("--pid=host", argv)
+@@ -332,7 +335,10 @@
+         self.assertIn("NVIDIA_VISIBLE_DEVICES=void", argv)
+         self.assertNotIn("--gpus", argv)
+         self.assertEqual(argv[argv.index("python3") + 1], image)
+-        self.assertEqual(argv[-2:], ["serving", "42"])
++        self.assertEqual(argv[-2], "serving")
++        self.assertEqual(json.loads(argv[-1]), target)
++        with self.assertRaisesRegex(ValueError, "immutable container"):
++            runner.io_command(image, "serving", ["42"])
+         with self.assertRaisesRegex(ValueError, "immutable image"):
+             runner.io_command("candidate:mutable", "serving", ["42"])
+ 
+diff --git a/tests/test_lossless_observer_scope.py b/tests/test_lossless_observer_scope.py
+new file mode 100644
+--- /dev/null
++++ b/tests/test_lossless_observer_scope.py
+@@ -0,0 +1,340 @@
++"""Source-only CPU mocks: exact observer scope, process binding and owned cleanup.
++
++No test in this file connects to a node, opens host /proc, or starts Docker.
++"""
++import copy
++import importlib.util
++import json
++from pathlib import Path
++import subprocess
++from types import SimpleNamespace
++import unittest
++from unittest.mock import patch
++
++HERE = Path(__file__).resolve().parents[1] / "experiments/2026-11-04-lossless-memory"
++
++
++def load(name, path):
++    spec = importlib.util.spec_from_file_location(name, path)
++    module = importlib.util.module_from_spec(spec)
++    spec.loader.exec_module(module)
++    return module
++
++
++observer = load("lossless_observer_scope_test_support", HERE / "engram/observer_support.py")
++scope = load("lossless_observer_scope_test_window", HERE / "scoped_window.py")
++IMAGE = "sha256:" + "a" * 64
++CID = "b" * 64
++WINDOW = "dgx1-exact-captured-token"
++
++
++def target():
++    return {"container": "serving", "container_id": CID, "image": IMAGE,
++            "init_pid": 42, "started_at": "first-boot", "processes": {
++                "42": {"start_ticks": 100, "namespace_pids": [42, 1]},
++                "73": {"start_ticks": 200, "namespace_pids": [73, 9]}}}
++
++
++def hold():
++    return {"holder": scope.HOLDER, "window": WINDOW, "nodes": sorted(scope.NAMES),
++            "production_config": scope.RESTORE, "resource_scope": {
++                "holder": scope.HOLDER, "kind": "nodes", "token": WINDOW,
++                "nodes": sorted(scope.NAMES), "restore": {
++                    "nodes": sorted(scope.NAMES), "profile": scope.RESTORE,
++                    "commit": "c" * 40,
++                    "image": "sha256:b0522146640a7d852c017ec8c99423224492b7c2c4951eb3a64005ab4555ab11"}}}
++
++
++def nodes():
++    return {"ssh_user": "swank", "nodes": [
++        {"name": "dgx" + str(i), "rank": i - 1, "head": i == 1,
++         "management_ip": "192.0.2." + str(i)} for i in (1, 2, 3)]}
++
++
++class ScopeTests(unittest.TestCase):
++    def setUp(self):
++        self.current = hold()
++        self.writes = []
++        self.lab = SimpleNamespace(HOLD="hold-path", read_hold=lambda: copy.deepcopy(self.current),
++            write_json_atomic=lambda path, value: self.writes.append((path, copy.deepcopy(value))))
++        self.spark = SimpleNamespace(configuration=lambda args: ({}, nodes(), {}))
++        self.snapshots = [{"node": "dgx1", "exit": 0}]
++
++    def check(self, actual=None, token=WINDOW):
++        with patch.object(scope, "node_hold_observations", return_value=(self.snapshots, [])):
++            return scope.observer_scope(self.lab, self.spark, actual or nodes(), token)
++
++    def test_exact_lease_and_resolved_group_pass_without_mutation(self):
++        self.assertEqual(self.check(), self.snapshots)
++        self.assertEqual(self.writes, [])
++
++    def test_missing_unscoped_or_wrong_token_refuses_before_node_inspection(self):
++        for change in ("missing", "unscoped", "holder", "token", "restore"):
++            self.current = hold()
++            if change == "missing":
++                self.current = None
++            elif change == "unscoped":
++                self.current.pop("resource_scope")
++            elif change == "holder":
++                self.current["holder"] = "another holder"
++            elif change == "token":
++                self.current["resource_scope"]["token"] = "another window"
++            else:
++                self.current["resource_scope"]["restore"]["commit"] = ""
++            with self.subTest(change=change), patch.object(scope, "node_hold_observations") as read:
++                with self.assertRaises(RuntimeError):
++                    scope.observer_scope(self.lab, self.spark, nodes(), WINDOW)
++                read.assert_not_called()
++        self.current = hold()
++        with self.assertRaises(RuntimeError):
++            self.check(token="")
++
++    def test_three_nodes_are_insufficient_when_resolved_group_or_user_differs(self):
++        for change in ("name", "management_ip", "rank", "head", "ssh_user"):
++            actual = nodes()
++            if change == "ssh_user":
++                actual[change] = "other"
++            else:
++                actual["nodes"][0][change] = "other"
++            with self.subTest(change=change), self.assertRaises(RuntimeError):
++                self.check(actual)
++
++    def test_foreign_or_unreadable_participating_hold_refuses(self):
++        with patch.object(scope, "node_hold_observations", return_value=([], ["dgx2: foreign hold"])):
++            with self.assertRaisesRegex(RuntimeError, "foreign hold"):
++                scope.observer_scope(self.lab, self.spark, nodes(), WINDOW)
++
++    def test_unknown_cleanup_latches_only_exact_owned_scope(self):
++        before = hold()
++        scope.observer_review(self.lab, WINDOW, "unreachable observer cleanup")
++        self.assertEqual(len(self.writes), 1)
++        _, after = self.writes[0]
++        self.assertEqual(after["holder"], "lossless-memory-observer-review")
++        self.assertEqual(after["resource_scope"]["token"], WINDOW)
++        self.assertEqual(after["resource_scope"]["restore"], before["resource_scope"]["restore"])
++        self.assertEqual(after["resource_scope"]["nodes"], before["resource_scope"]["nodes"])
++        self.assertFalse(scope.owns(after, WINDOW))
++        self.current = {"holder": "foreign", "window": "foreign"}
++        scope.observer_review(self.lab, WINDOW, "must not overwrite a foreign hold")
++        self.assertEqual(len(self.writes), 1)
++
++
++class TargetTests(unittest.TestCase):
++    def metadata(self, value=None):
++        value = copy.deepcopy(value or target())
++        calls = []
++        def run(*argv):
++            calls.append(argv)
++            if argv[:2] == ("docker", "inspect"):
++                return json.dumps({"Id": value["container_id"], "Image": value["image"],
++                    "State": {"Running": True, "Pid": value["init_pid"], "StartedAt": value["started_at"]},
++                    "User": "0", "Privileged": False, "CapAdd": ["IPC_LOCK"]})
++            if argv[:2] == ("docker", "top"):
++                return "PID\n" + "\n".join(value["processes"]) + "\n"
++            return json.dumps(value["processes"])
++        return run, calls
++
++    def test_capture_top_is_bound_to_inspected_immutable_id(self):
++        run, calls = self.metadata()
++        actual = observer.capture_target(run, "serving", lambda text: text.split()[1:], IMAGE)
++        self.assertEqual(actual, target())
++        self.assertEqual(next(row for row in calls if row[:2] == ("docker", "top"))[2], CID)
++        self.assertEqual(observer.namespace_target(actual), {"container_id": CID, "init_pid": 1,
++            "processes": {"1": {"start_ticks": 100}, "9": {"start_ticks": 200}}})
++
++    def test_post_observation_rejects_birth_boot_image_and_pid_set_changes(self):
++        for change in ("birth", "boot", "image", "pid", "container"):
++            changed = target()
++            if change == "birth":
++                changed["processes"]["73"]["start_ticks"] += 1
++            elif change == "boot":
++                changed["started_at"] = "repeat-boot"
++            elif change == "image":
++                changed["image"] = "sha256:" + "c" * 64
++            elif change == "container":
++                changed["container_id"] = "d" * 64
++            else:
++                changed["processes"].pop("73")
++            run, _ = self.metadata(changed)
++            with self.subTest(change=change), self.assertRaises(ValueError):
++                observer.verify_target(run, target(), lambda text: text.split()[1:])
++
++    def test_proc_contract_rejects_birth_namespace_and_cgroup_changes(self):
++        namespace = {}
++        exec(observer.PROC_IDENTITY, namespace)
++        init = {"start_ticks": 100, "pid_namespace": "pid:[101]", "cgroup": ["0::/docker/" + CID]}
++        namespace["observer_check_identity"](copy.deepcopy(init), 100, init, CID)
++        for field, bad in (("start_ticks", 101), ("pid_namespace", "pid:[102]"),
++                           ("cgroup", ["0::/docker/" + "d" * 64])):
++            changed = {**init, field: bad}
++            with self.subTest(field=field), self.assertRaisesRegex(RuntimeError, "PID reuse"):
++                namespace["observer_check_identity"](changed, 100, init, CID)
++            with self.assertRaisesRegex(RuntimeError, "identity changed"):
++                namespace["observer_assert_stable"](init, changed)
++        unrelated = {**init, "cgroup": ["0::/docker/other"]}
++        with self.assertRaises(RuntimeError):
++            namespace["observer_check_identity"](unrelated, 100, unrelated, CID)
++
++
++class FakeDocker:
++    """In-memory daemon response script; never dispatches a subprocess."""
++    def __init__(self, *, failure=None, foreign=None, cleanup_unreadable=False):
++        self.calls, self.actual = [], None
++        self.failure, self.foreign, self.cleanup_unreadable = failure, foreign, cleanup_unreadable
++        self.started = False
++
++    def __call__(self, argv, *, input_text=None, timeout=30):
++        self.calls.append({"argv": list(argv), "timeout": timeout, "input_text": input_text})
++        action = argv[1]
++        if action == "create":
++            labels = {argv[i + 1].split("=", 1)[0]: argv[i + 1].split("=", 1)[1]
++                      for i, value in enumerate(argv[:-1]) if value == "--label"}
++            self.actual = {"Id": CID, "Name": "/" + argv[argv.index("--name") + 1],
++                           "Image": IMAGE, "ConfigImage": IMAGE, "Labels": labels, "Running": False}
++            if self.failure == "create-timeout":
++                raise subprocess.TimeoutExpired(argv, timeout, output=b"create reply lost")
++            return SimpleNamespace(returncode=0, stdout=CID + "\n", stderr="")
++        if action == "inspect":
++            if self.cleanup_unreadable and self.started:
++                return SimpleNamespace(returncode=255, stdout="", stderr="SSH connection lost")
++            if self.actual is None:
++                return SimpleNamespace(returncode=1, stdout="", stderr="Error: No such object: " + argv[2])
++            value = copy.deepcopy(self.actual)
++            if self.foreign == "image":
++                value["Image"] = "sha256:" + "d" * 64
++            elif self.foreign == "label":
++                value["Labels"][observer.LABEL_PREFIX + "nonce"] = "foreign"
++            elif self.foreign == "id":
++                value["Id"] = "e" * 64
++            return SimpleNamespace(returncode=0, stdout=json.dumps(value), stderr="")
++        if action == "start":
++            self.started = True
++            self.actual["Running"] = True
++            if self.failure == "timeout":
++                raise subprocess.TimeoutExpired(argv, timeout, output=b"partial output", stderr=b"partial stderr")
++            self.actual["Running"] = False
++            return SimpleNamespace(returncode=7 if self.failure == "exit" else 0,
++                                   stdout="native verdict\n", stderr="native error" if self.failure else "")
++        if action == "stop":
++            self.actual["Running"] = False
++            return SimpleNamespace(returncode=0, stdout=CID + "\n", stderr="")
++        if action == "rm":
++            self.actual = None
++            return SimpleNamespace(returncode=0, stdout=CID + "\n", stderr="")
++        raise AssertionError("unexpected mocked Docker operation")
++
++
++class LifecycleTests(unittest.TestCase):
++    def invoke(self, docker, *, guard=lambda: None, trace=None, review=None, saved=None, timeout=30):
++        trace = {} if trace is None else trace
++        argv = ["docker", "run", "--rm", "-i", "--runtime=runc", "--cpus=1",
++                "--memory=128m", "--memory-swap=128m", "--network=none", "--read-only",
++                "--env", "NVIDIA_VISIBLE_DEVICES=void", "--entrypoint", "python3", IMAGE,
++                "-c", "print('fixed read-only observer')"]
++        return observer.owned_observer(docker, argv, image=IMAGE, window=WINDOW,
++            guard=guard, latch_review=(review if review is not None else []).append, trace=trace,
++            nonce="c" * 32, timeout=timeout, input_text="published verifier source",
++            persist=(lambda: saved.append(copy.deepcopy(trace))) if saved is not None else None)
++
++    def test_normal_cleanup_and_cid_are_persisted_before_start(self):
++        docker, trace, saved, review = FakeDocker(), {}, [], []
++        result = self.invoke(docker, trace=trace, saved=saved, review=review)
++        self.assertEqual(result.returncode, 0)
++        self.assertTrue(trace["cleanup_known"])
++        self.assertEqual(review, [])
++        self.assertIsNone(docker.actual)
++        create = docker.calls[0]["argv"]
++        self.assertNotIn("--rm", create)
++        self.assertIn("signal.alarm(30)", create[create.index("-c") + 1])
++        self.assertTrue(any(row.get("cid") == CID and not any(
++            c["argv"][1] == "start" for c in row["commands"]) for row in saved))
++        self.assertEqual([row["argv"][-1] for row in docker.calls if row["argv"][1] in ("start", "rm")], [CID, CID])
++        self.assertTrue(all(row["timeout"] <= 30 for row in docker.calls))
++
++    def test_ssh_timeout_retains_partial_output_and_stops_only_owned_cid(self):
++        docker, trace, review = FakeDocker(failure="timeout"), {}, []
++        with self.assertRaises(subprocess.TimeoutExpired):
++            self.invoke(docker, trace=trace, review=review)
++        self.assertEqual(review, [])
++        self.assertTrue(trace["cleanup_known"])
++        self.assertIsNone(docker.actual)
++        self.assertIn("TimeoutExpired", trace["failure"])
++        started = next(row for row in trace["commands"] if row["argv"][1] == "start")
++        self.assertEqual(started["stdout"], "partial output")
++        self.assertEqual(started["stderr"], "partial stderr")
++        self.assertEqual([row["argv"][-1] for row in docker.calls if row["argv"][1] in ("stop", "rm")], [CID, CID])
++
++    def test_lost_create_reply_recovers_only_exact_name_and_labels(self):
++        docker, trace = FakeDocker(failure="create-timeout"), {}
++        with self.assertRaises(subprocess.TimeoutExpired):
++            self.invoke(docker, trace=trace)
++        self.assertTrue(trace["cleanup_known"])
++        self.assertIsNone(docker.actual)
++        self.assertFalse(any(row["argv"][1] == "start" for row in docker.calls))
++
++    def test_foreign_image_labels_or_id_never_stop_or_remove(self):
++        for foreign in ("image", "label", "id"):
++            docker, trace, review = FakeDocker(foreign=foreign), {}, []
++            with self.subTest(foreign=foreign), self.assertRaises(observer.CleanupUnknown):
++                self.invoke(docker, trace=trace, review=review)
++            self.assertFalse(any(row["argv"][1] in ("start", "stop", "rm") for row in docker.calls))
++            self.assertFalse(trace["cleanup_known"])
++            self.assertEqual(len(review), 1)
++
++    def test_unreachable_cleanup_keeps_original_timeout_and_latches_review(self):
++        docker = FakeDocker(failure="timeout", cleanup_unreadable=True)
++        trace, review = {}, []
++        with self.assertRaises(observer.CleanupUnknown):
++            self.invoke(docker, trace=trace, review=review)
++        self.assertIn("TimeoutExpired", trace["failure"])
++        self.assertIn("cleanup_error", trace)
++        self.assertFalse(trace["cleanup_known"])
++        self.assertEqual(len(review), 1)
++        self.assertFalse(any(row["argv"][1] in ("stop", "rm") for row in docker.calls))
++
++    def test_failed_scope_before_create_dispatches_nothing(self):
++        docker, trace, review = FakeDocker(), {}, []
++        def refuse():
++            raise RuntimeError("foreign exact scope")
++        with self.assertRaisesRegex(RuntimeError, "foreign exact scope"):
++            self.invoke(docker, guard=refuse, trace=trace, review=review)
++        self.assertEqual(docker.calls, [])
++        self.assertEqual(review, [])
++        self.assertTrue(trace["cleanup_known"])
++
++    def test_scope_change_after_create_cleans_owned_container_without_start(self):
++        docker, review = FakeDocker(), []
++        count = 0
++        def guard():
++            nonlocal count
++            count += 1
++            if count == 2:
++                raise RuntimeError("scope changed")
++        with self.assertRaisesRegex(RuntimeError, "scope changed"):
++            self.invoke(docker, guard=guard, review=review)
++        self.assertIsNone(docker.actual)
++        self.assertEqual(review, [])
++        self.assertFalse(any(row["argv"][1] == "start" for row in docker.calls))
++
++    def test_native_nonzero_exit_is_preserved_without_retry(self):
++        docker, trace = FakeDocker(failure="exit"), {}
++        result = self.invoke(docker, trace=trace)
++        self.assertEqual(result.returncode, 7)
++        self.assertTrue(trace["cleanup_known"])
++        self.assertEqual(sum(row["argv"][1] == "start" for row in docker.calls), 1)
++
++    def test_long_transport_does_not_extend_child_past_watchdog_margin(self):
++        docker, trace = FakeDocker(failure="exit"), {}
++        result = self.invoke(docker, trace=trace, timeout=1800)
++        self.assertEqual(result.returncode, 7)
++        self.assertEqual(trace["transport_timeout_seconds"], 1800)
++        self.assertEqual(trace["child_lifetime_seconds"], 600)
++        self.assertLess(trace["child_lifetime_seconds"] + 30, 900)
++        create = docker.calls[0]["argv"]
++        self.assertIn("signal.alarm(600)", create[create.index("-c") + 1])
++        self.assertEqual(next(row for row in docker.calls if row["argv"][1] == "start")["timeout"], 1800)
++        self.assertTrue(trace["cleanup_known"])
++
++
++if __name__ == "__main__":
++    unittest.main()

@@ -1,0 +1,72 @@
+{
+  "schema_version": 1,
+  "review_date": "2026-11-06",
+  "pr": 932,
+  "deployment_head": "6f3bbdbe5692d739e66a11efa884be8f404c85e9",
+  "deployment_base": "00e523654b767b475f7aa2f326fc4e204201bd1d",
+  "head_rechecked_unchanged": true,
+  "purpose": "performance enhancement: avoid unchanged GPU block-table destination writes",
+  "status": "harness-only prototype; no serving runtime patch and no new GPU timing or correctness result",
+  "provided_control_identity": {
+    "base": "unreleased corrected default-enabled C40",
+    "source_head": "5f926df6d3126266a9c88c82c06544060008c33c",
+    "source_tree": "ca1496c6481dc5bc4b4234b743e4ca023a6c7597",
+    "image": "sha256:7ae96e98e361601d8232cd99e6af1c6044b7c282bf6904c989e6ad033c147f82",
+    "classification": "PR-declared immutable identity; no image or hardware inspected in this review"
+  },
+  "intended_invariants": [
+    "Destination ownership changes, replacement generation changes and count shrinkage force correct row/tail reconstruction.",
+    "Append-only growth updates the required span or coalesced chunks without scanning the full host page table.",
+    "Overwrite generations and counts are published after the corresponding source IDs.",
+    "Dummy writes, alternate destinations that may alias the default, and layout rebuilds invalidate cached destination state.",
+    "Capture-visible destination addresses remain stable and downstream consumers observe the current row contents."
+  ],
+  "provided_evidence": {
+    "classification": "PR-provided CPU/offline summaries, not independently repeated or raw-audited here",
+    "original_offline_transition_cases": 150,
+    "original_offline_exact_row_comparisons": 7500,
+    "new_host_publication_tests": 3,
+    "native_gpu_correctness_gates_authored_not_run": 55,
+    "component_matrix_authored_not_run": "row/chunk/span by 32K/64K/256K/512K/1M by c1/c8/c16; two fresh benchmark processes with independent correctness processes",
+    "old_fails_new_passes_runtime_evidence": false,
+    "limits": [
+      "The original operation screen uses actual extracted producer/staging functions but Python reference device/gather operations; it does not execute the new GPU kernel.",
+      "The three host tests exercise prototype method bodies with a fake base and fake UVA publication; they are not device or model evidence.",
+      "Historical Triton-to-TileLang gather savings and historical profiled exposure are retained references, not measurements of this cache prototype.",
+      "No new component performance, preserved-performance, native-output, rank agreement, full-step or end-to-end serving result exists.",
+      "The missing-prepared-input build-check exit is an unfinished preparation result, not a performance rejection."
+    ]
+  },
+  "prototype_source_review": {
+    "confirmed_new_cache_algorithm_defect": false,
+    "finding": "The inspected owner/generation/count reset protocol, per-CTA state publication barrier, dummy invalidation, alternate-output fallback and layout reset address the named invalidations. This limited review cannot establish GPU memory safety or native correctness.",
+    "remaining_runtime_integration": "A surviving variant still needs an actual source-fork patch, prepared-kernel declarations, all direct source/destination writers accounted for, and integration with real input-buffer lifetimes. The prototype itself explicitly does not claim those steps are complete.",
+    "protocol_source": "https://github.com/christopherowen/spark-ds41f/blob/6f3bbdbe5692d739e66a11efa884be8f404c85e9/experiments/2026-11-06-block-metadata/bundle/incremental.py#L48",
+    "publication_and_invalidation_source": "https://github.com/christopherowen/spark-ds41f/blob/6f3bbdbe5692d739e66a11efa884be8f404c85e9/experiments/2026-11-06-block-metadata/bundle/incremental.py#L133"
+  },
+  "focused_execution_packet_rework": [
+    {
+      "priority": "P1 before launch under the owner's explicit resource-bounds requirement",
+      "issue": "The published component bundle and its inherited bundle_command have no actual CPU or memory/no-extra-swap cgroup bounds and no compile-worker/thread cap. The subprocess wall-clock timeouts bound elapsed time only, despite the packet describing a bounded component screen.",
+      "minimum_fix": "Use the normal exact-owned coordinated controller and an explicitly bounded component container/job, with CPU, memory, swap and worker/thread limits applied to the actual worker and recorded/inspected before execution. Keep existing hardware/thermal limits, shared queue order and native tests unchanged; no new cache implementation is needed for this control repair.",
+      "regression_needed": "Verify the rendered launch applies actual worker/container bounds and preserves them across both fresh correctness/benchmark processes, without relying on client-only caps or elapsed timeouts.",
+      "bundle_source": "https://github.com/christopherowen/spark-ds41f/blob/6f3bbdbe5692d739e66a11efa884be8f404c85e9/experiments/2026-11-06-block-metadata/bundle/candidate.json#L4",
+      "actual_docker_dispatch_source": "https://github.com/christopherowen/spark-ds41f/blob/6f3bbdbe5692d739e66a11efa884be8f404c85e9/spark_ds41f/lab.py#L2223"
+    }
+  ],
+  "ownership_and_overlay_review": {
+    "finding": "The specification does not acquire a window or alter serving. Its documented queue order yields to the collective and verification-budget reservations and earlier legitimate claims. A future run still requires an actual exact-owned lease, all-rank identity/guards and verified restoration before release.",
+    "overlay_adopted": false,
+    "runtime_installed": false,
+    "limitations": "Two fresh component processes are not two serving boots. Historical few-microsecond gather costs and aggregate exposure cannot establish the current long-context opportunity or predict end-to-end benefit."
+  },
+  "disposition": "Retain the unique unmeasured enhancement and its active implementation. Correct the bounded execution packet before hardware screening; do not reject the cache idea for missing build inputs or substitute historical savings for a new result. A component survivor requires separate native/runtime and boot-repeat serving qualification.",
+  "serving_performance": "unmeasured, not neutral",
+  "review_scope": "Lightweight primary prototype/harness, inherited dispatch and provided small-summary review only",
+  "tests_or_replay_run": false,
+  "native_or_bulk_raw_audit_performed": false,
+  "ssh_jobs_or_hardware_operations": false,
+  "runtime_or_overlay_changes_made": false,
+  "active_implementation_duplicated": false,
+  "promotion": false
+}

@@ -21,6 +21,18 @@ spec = importlib.util.spec_from_file_location("c45_feature_gate_controls_target"
 gate = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(gate)
 
+control_spec = importlib.util.spec_from_file_location("c45_build_control_target", HERE / "c45_build_control.py")
+build_control = importlib.util.module_from_spec(control_spec)
+control_spec.loader.exec_module(build_control)
+
+cache_spec = importlib.util.spec_from_file_location("c45_cache_target", HERE / "c45_cache.py")
+c45_cache = importlib.util.module_from_spec(cache_spec)
+cache_spec.loader.exec_module(c45_cache)
+
+mgmt_spec = importlib.util.spec_from_file_location("c45_management_target", HERE / "c45_management.py")
+c45_management = importlib.util.module_from_spec(mgmt_spec)
+mgmt_spec.loader.exec_module(c45_management)
+
 
 class GateControls(unittest.TestCase):
     def setUp(self):
@@ -243,9 +255,12 @@ class GateControls(unittest.TestCase):
                 with self.assertRaises(ValueError):
                     self.installed_identity(fixture)
 
-    def test_host_refuses_draft_without_any_subprocess(self):
-        with mock.patch.object(gate.subprocess, "check_output") as command, self.assertRaises(ValueError):
-            gate.host(self.directory / "out", Path("/unused"), Path("/unused"), "0" * 64)
+    def test_host_refuses_draft_or_missing_control_without_any_subprocess(self):
+        with mock.patch.object(gate.subprocess, "check_output") as command:
+            with self.assertRaises(ValueError):
+                gate.host(self.directory / "out", Path("/unused"), Path("/unused"), "0" * 64)
+            with self.assertRaises(ValueError):
+                gate.host(self.directory / "out", Path("/unused"), Path("/unused"), "0" * 64, control=mock.Mock())
         command.assert_not_called()
 
     def test_existing_output_refusal_preserves_original_receipt(self):
@@ -254,7 +269,7 @@ class GateControls(unittest.TestCase):
         plan = copy.deepcopy(gate.load(HERE / "gpu-gate-plan.json")); plan["dispatch_ready"] = True
         with mock.patch.object(gate, "load", return_value=plan), \
              mock.patch.object(gate.subprocess, "check_output") as command, self.assertRaises(ValueError):
-            gate.host(output, Path("/unused"), Path("/unused"), "0" * 64)
+            gate.host(output, Path("/unused"), Path("/unused"), "0" * 64, control=mock.Mock())
         command.assert_not_called()
         self.assertEqual(original.read_text(), "original native verdict\n")
 
@@ -276,13 +291,67 @@ class GateControls(unittest.TestCase):
                     if argv[:3] == ["docker", "image", "inspect"]:
                         return json.dumps([inspected])
                     self.fail("unexpected command: " + repr(argv))
+                control = mock.Mock()
                 with mock.patch.object(gate, "load", return_value=plan), \
                      mock.patch.object(gate, "source_binding", return_value=binding), \
                      mock.patch.object(gate, "authority", return_value=value), \
                      mock.patch.object(gate.subprocess, "check_output", side_effect=command), \
                      mock.patch.object(gate.subprocess, "run") as launched, self.assertRaises(ValueError):
-                    gate.host(self.directory / ("out-" + wrong), Path("/unused"), Path("/unused"), "0" * 64)
+                    gate.host(self.directory / ("out-" + wrong), Path("/unused"), Path("/unused"), "0" * 64,
+                              control=control)
                 launched.assert_not_called()
+                control.run_container.assert_not_called()
+
+    def test_build_control_binds_locks_scope_and_owned_container_stops(self):
+        locks = {}
+        for name in ("gpu", "cpu-work", "cpu-offline"):
+            path = self.directory / f"{name}.lock"
+            handle = path.open("a+")
+            self.addCleanup(handle.close)
+            locks[name] = handle
+        commit, window, holder, token = "2" * 40, "dgx1-test", "spark-lab: exact C45", "a" * 32
+        state = {"passed": True, "commit": commit, "window": window, "holder": holder, "owner_token": token}
+        watch = mock.Mock()
+        management = c45_management.ManagementLatch()
+        receipt = {}
+        control = build_control.BuildControl(
+            commit=commit, window=window, holder=holder, token=token, locks=locks,
+            watch=watch, scope_check=lambda: dict(state), management=management,
+            receipt=receipt, output=self.directory / "build-out", save=lambda: None)
+        scope = control.assert_scope(dict(state))
+        self.assertEqual(set(scope["held_locks"]), {"gpu", "cpu-work", "cpu-offline"})
+        watch.check.assert_called_once()
+        with self.assertRaises(RuntimeError):
+            control.assert_scope(dict(state, owner_token="b" * 32))
+        with self.assertRaises(ValueError):
+            control.register_container("foreign-container", "tok", "sha256:" + "1" * 64)
+        image = "sha256:" + "1" * 64
+        control.register_container("compiler-c45-features-1", "own-tok", image)
+        inspected = {"Id": "c" * 64, "Image": image, "Config": {"Labels": {"spark.qualification-token": "own-tok"}}}
+        with mock.patch.object(build_control.subprocess, "run", side_effect=[
+            subprocess.CompletedProcess([], 0, json.dumps([inspected]), ""),
+            subprocess.CompletedProcess([], 0, "c" * 64 + "\n", ""),
+        ]) as command:
+            control.stop_owned_containers()
+        self.assertEqual(command.call_args_list[-1].args[0], ["docker", "stop", "--time", "15", "c" * 64])
+        self.assertFalse(management.latched)
+
+    def test_serving_cache_mapping_and_rank_collector(self):
+        root = HERE.parents[1]
+        for rel in ("experiments/2026-10-26-spark-ds41f-candidate/candidate-45/tp3-qualification.json",
+                    "experiments/2026-10-26-spark-ds41f-candidate/candidate-45/tp3-qualification-dev.json"):
+            cluster = json.loads((root / rel).read_text())
+            mapping = c45_cache.mapped_namespace(cluster, lambda _cluster, src: "/home/swank/" + src.removeprefix("${HOME}/"))
+            self.assertEqual(mapping["host_root"], "/home/swank/.cache/vllm/tilelang")
+            self.assertEqual(mapping["namespace"], c45_cache.NAMESPACE)
+        management = mock.Mock()
+        management.ssh.side_effect = [json.dumps({"passed": True, "node": n}) for n in ("dgx1", "dgx2", "dgx3")]
+        out = self.directory / "serving-first-use.json"
+        result = c45_cache.collect(management, lambda: None, "profile.json", "sha256:" + "1" * 64, "2" * 40, out)
+        self.assertTrue(result["passed"])
+        self.assertEqual(set(result["ranks"]), {"dgx1", "dgx2", "dgx3"})
+        with self.assertRaises(FileExistsError):
+            c45_cache.collect(management, lambda: None, "profile.json", "sha256:" + "1" * 64, "2" * 40, out)
 
     def test_native_failure_exit_and_original_log_are_preserved(self):
         output = self.directory / "failed-native"; output.mkdir()

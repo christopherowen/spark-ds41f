@@ -412,7 +412,7 @@ def cleanup_owned(boot, image, token, name):
     return inspected
 
 
-def host(output, source, receipt_path, receipt_sha):
+def host(output, source, receipt_path, receipt_sha, control=None):
     plan = load(HERE / "gpu-gate-plan.json")
     require(plan.get("dispatch_ready") is True, "draft feature controls await remote checks/root integration")
     require(not output.exists(), "preserve every prior gate output; never rerun a completed point")
@@ -429,6 +429,8 @@ def host(output, source, receipt_path, receipt_sha):
         "local.spark-ds41f.tilelang.tree": TREE, "local.spark-ds41f.tilelang.patch-head": HEAD,
         "local.spark-ds41f.vllm.tree": VLLM_TREE, "local.spark-ds41f.vllm.patch-head": VLLM_HEAD}.items()),
         "actual immutable new image/source labels differ")
+    require(control is not None, "live C45 BuildControl guard is required before staging or container launch")
+    control.assert_scope(expected)
     output.mkdir(parents=True)
     save(output / "source-binding.json", binding)
     save(output / "pre-feature-authority.json", expected)
@@ -481,7 +483,7 @@ def host(output, source, receipt_path, receipt_sha):
             result["boots"].append(row)
             try:
                 with (output / ("boot" + str(number) + ".log")).open("x") as stream:
-                    process = subprocess.run(argv, stdout=stream, stderr=subprocess.STDOUT)
+                    process = control.run_container(argv, stream, boot, image, token, name)
                 row["exit"] = process.returncode
             finally:
                 state = cleanup_owned(boot, image, token, name)
@@ -539,10 +541,8 @@ def main():
                    load(Path("/packet/pre-feature-authority.json")))
             return 0
         return child_main(args, binding)
-    require(args.apply and args.output and args.source and args.image_receipt,
-            "draft host dispatch needs --apply/source/new output/frozen authority; live parent guard integration remains mandatory")
-    host(args.output, args.source, args.image_receipt, args.image_receipt_sha256)
-    return 0
+    require(False, "direct CLI host dispatch is disabled; invoke compiler_gate.host through build_gate.py with live BuildControl")
+    return 1
 
 
 if __name__ == "__main__":

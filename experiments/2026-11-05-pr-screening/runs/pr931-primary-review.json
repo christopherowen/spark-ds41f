@@ -1,0 +1,94 @@
+{
+  "schema_version": 1,
+  "review_date": "2026-11-06",
+  "pr": 931,
+  "deployment_head": "d5a33e846627acd0aa22fb5df6ecfaf39b0a5c9d",
+  "deployment_base": "00e523654b767b475f7aa2f326fc4e204201bd1d",
+  "head_rechecked_unchanged": true,
+  "source_pr": "https://github.com/christopherowen/vllm/pull/6",
+  "source_head": "c229ab4d2c4d18b3dcd157ff8a3ec7255108164e",
+  "source_tree": "11d1cf3e6ac525173683dbfcd3b08de1c945934d",
+  "source_base": "1f33102547e4da5c64712390604695d1abd577c4",
+  "purpose": "correctness repair hypothesis: fixed-prompt private decoder recovery after preemption",
+  "intended_invariants": [
+    "Accepted generated rows remain part of the original request after private decoder/drafter state is discarded.",
+    "Prefix reuse cannot skip the original prompt replay floor or the accepted output history needed by deeper decoder layers.",
+    "Ordinary prompt/decode policy is retained; additional recovery work is intentional.",
+    "Actual streaming-input sessions retain their previous behavior, including after the final input sentinel; durable streaming_queue identity is carried to the worker.",
+    "Group eviction, request cancellation/freeing, reordering and slot reuse cannot substitute another request's private history."
+  ],
+  "provided_evidence": {
+    "classification": "PR-provided results, not independently executed or raw-audited here",
+    "current_group_and_identity_cpu_passes": 183,
+    "initial_causal_cpu_control": {"candidate_passed": 168, "locked_control_passed": 162, "locked_control_recovery_boundary_failures": 6},
+    "other_cpu_checks": {
+      "broader_prior_cache_passes": 395,
+      "hisparse_cases_unqualified": 4,
+      "isolated_policy_cases": 45,
+      "mathematical_dependency_cases": 27,
+      "streaming_phase_model_cases": 6,
+      "probe_harness_cases": 24
+    },
+    "limits": [
+      "These overlapping and historical counts are not additive independent trials.",
+      "The six control failures establish a CPU recovery-boundary policy difference; they are not an observed old-fails/new-passes native decoder or checkpoint result.",
+      "The mathematical and streaming-phase models are explicitly non-native. HiSparse platform/import failures remain unqualified rather than passes or candidate regressions.",
+      "The proposed native three-layer witness fixes encoder rows and does not execute actual DSpark context projection/storage, the complete checkpoint or all private-state reconstruction. It has not run.",
+      "Full-model outputs/logprobs, cancellation/preemption, native old-fails/new-passes and boot/repeat performance preservation remain pending."
+    ]
+  },
+  "runtime_source_review": {
+    "confirmed_new_runtime_defect": false,
+    "finding": "No concrete new defect in the fixed-prompt replay-floor or durable streaming-input scope was confirmed by this limited source review. Native and checkpoint correctness are unresolved.",
+    "source_base_limit": "The proposal is C38-based. Eventual adoption must preserve the validated default-enabled corrected C40 base rather than replace it with this C38 lock/profile."
+  },
+  "focused_control_rework": [
+    {
+      "priority": "P1",
+      "file": "experiments/2026-11-06-prefix-group-validity/branch_watchdog.py",
+      "line": 123,
+      "issue": "A RuntimeError from the initial live doctor or restoration snapshot is swallowed as merely not-already-restored. A transient management-path failure can therefore be followed by stop/sync/start after a later probe recovers; there is no sticky management/telemetry-loss veto.",
+      "minimum_fix": "Distinguish ordinary candidate/live mismatch from management or telemetry loss, persist the latter in the exact owned hold, and forbid restoration launch after it. Do not clear the latch on recovery. Propagate guard-loss evidence from guarded_probe.py rather than only saving it in conditions.json.",
+      "regression_needed": "A transient management or guard-telemetry failure followed by successful reads must retain a review hold and issue no restoration mutation.",
+      "source": "https://github.com/christopherowen/spark-ds41f/blob/d5a33e846627acd0aa22fb5df6ecfaf39b0a5c9d/experiments/2026-11-06-prefix-group-validity/branch_watchdog.py#L119"
+    },
+    {
+      "priority": "P1",
+      "file": "experiments/2026-11-06-prefix-group-validity/branch_watchdog.py",
+      "line": 144,
+      "issue": "Unresolved build/probe activity markers are checked only after possible stop/sync/start. The code explicitly anticipates a crashed coordinator leaving a child alive, but the late check protects hold removal only, not the live child's runtime/source from restoration changes.",
+      "minimum_fix": "Before any restoration mutation, establish that owned source/GPU/probe jobs have exited. If unresolved, retain the exact hold and defer; terminate only an independently identified owned job when permitted, then verify its exit before proceeding.",
+      "regression_needed": "An active or unresolved owned-job marker must cause no stop, sync or start, not merely prevent final hold release.",
+      "source": "https://github.com/christopherowen/spark-ds41f/blob/d5a33e846627acd0aa22fb5df6ecfaf39b0a5c9d/experiments/2026-11-06-prefix-group-validity/branch_watchdog.py#L125"
+    },
+    {
+      "priority": "P1",
+      "file": "experiments/2026-11-06-prefix-group-validity/branch_watchdog.py",
+      "line": 148,
+      "issue": "The last own() check precedes the final remote snapshot. A foreign replacement arriving during that snapshot or subsequent marker inspection can be unlinked at hold_path.unlink(). The private operation lock does not bind unrelated hold writers.",
+      "minimum_fix": "Revalidate the exact holder/window and any owner token immediately before release, under the ownership mutation discipline, preserving a foreign replacement. Reuse the already reviewed exact-lifecycle approach rather than a broad watchdog path.",
+      "regression_needed": "Replace the hold during final verification and require its bytes to remain unchanged with no release or foreign-process action.",
+      "source": "https://github.com/christopherowen/spark-ds41f/blob/d5a33e846627acd0aa22fb5df6ecfaf39b0a5c9d/experiments/2026-11-06-prefix-group-validity/branch_watchdog.py#L136"
+    }
+  ],
+  "ownership_and_overlay_review": {
+    "positive_controls": [
+      "Window checks compare the exact recorded holder and window rather than granting authority from a broad holder prefix.",
+      "All-rank restoration snapshots require original clean checkouts, image ID/tag, profile, origin and API readiness, beyond doctor --live alone.",
+      "The source verifier distinguishes the immutable parent OCI image from four candidate Python overlays, hashes those files on all ranks and requires the candidate mounts to be read-only.",
+      "The runbook preserves earlier Engram and expert-routing reservations and does not start an acquisition waiter."
+    ],
+    "limits": "These are source-reviewed controls and an unexecuted plan. No overlay was adopted, serving source loaded, reservation reconciled or restoration independently observed in this review.",
+    "source_verifier": "https://github.com/christopherowen/spark-ds41f/blob/d5a33e846627acd0aa22fb5df6ecfaf39b0a5c9d/experiments/2026-11-06-prefix-group-validity/source_overlay.py",
+    "guard_loss_path": "https://github.com/christopherowen/spark-ds41f/blob/d5a33e846627acd0aa22fb5df6ecfaf39b0a5c9d/experiments/2026-11-06-prefix-group-validity/guarded_probe.py#L44"
+  },
+  "disposition": "Retain the unique correctness investigation. Focused execution-control rework is required before its hardware run; the unbuilt runtime idea is not rejected. Preserve all earlier failures and native gaps, then qualify the affected path and ordinary performance preservation.",
+  "serving_performance": "unmeasured, not neutral; extra recovery work is expected and must be reported separately",
+  "review_scope": "Lightweight primary source/diff, runbook and provided small-summary review only",
+  "tests_or_replay_run": false,
+  "native_or_bulk_raw_audit_performed": false,
+  "ssh_jobs_or_hardware_operations": false,
+  "runtime_or_overlay_changes_made": false,
+  "active_implementation_duplicated": false,
+  "promotion": false
+}
