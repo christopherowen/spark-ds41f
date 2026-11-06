@@ -9,6 +9,12 @@ import tool_schema_gate
 
 
 class GateTests(unittest.TestCase):
+    def test_one_arm_reservation_finishes_current_arm_then_yields_without_a_request(self):
+        self.assertIsNone(runner.handoff_reason(0, 1, "pending request"))
+        self.assertEqual(runner.handoff_reason(1, 1, None), runner.ARM_LIMIT)
+        self.assertIsNone(runner.handoff_reason(1, 2, None))
+        self.assertEqual(runner.handoff_reason(1, None, "pending request"), runner.HANDOFF_REQUEST)
+
     def test_parent_corpus_requires_the_saved_bytes(self):
         with tempfile.TemporaryDirectory() as temporary:
             path = Path(temporary) / "corpus.gz"
@@ -30,6 +36,8 @@ class GateTests(unittest.TestCase):
                     "error": "RuntimeError: handoff requested after completed arm",
                     "completed_arms": [{"label": "row010-a", "config": f"{runner.EXPERIMENT}/row010.json"}]}
         self.assertEqual(runner.resume_arms(previous, identity, arms), previous["completed_arms"])
+        self.assertEqual(runner.resume_arms({**previous, "error": f"RuntimeError: {runner.ARM_LIMIT}"},
+                                           identity, arms), previous["completed_arms"])
         for change in ({"completed": True}, {"restored": False}, {"error": "gate failed"},
                        {"commit": "b" * 40}, {"gate_sources": {}}, {"images": {}},
                        {"completed_arms": []}, {"completed_arms": [{"label": "control035-a"}]},

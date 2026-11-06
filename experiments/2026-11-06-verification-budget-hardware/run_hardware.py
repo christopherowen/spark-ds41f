@@ -29,6 +29,8 @@ IMAGE = "sha256:7ae96e98e361601d8232cd99e6af1c6044b7c282bf6904c989e6ad033c147f82
 # Identity is recorded in that qualification's immutable source-receipt.json.
 PARENT_CORPUS = "results/private/suites/candidate-40-release-tp3/candidate-40/model.json.gz"
 PARENT_CORPUS_SHA = "b13ed140c68f0b6b135fe8c2e7d2eba6dbe625832aa8bd0e8dffa10820f04a87"
+HANDOFF_REQUEST = "handoff requested after completed arm"
+ARM_LIMIT = "arm limit reached after completed arm"
 GATES = [
     ("greedy", "experiments/2026-10-12-r6g/token_determinism_text.py", ["--tokens", "192", "--long-lines", "700", "--wide"]),
     ("greedy-fast", "experiments/2026-10-12-r6g/token_determinism_text.py", ["--tokens", "192", "--long-lines", "700", "--wide", "--no-logprobs"]),
@@ -105,6 +107,14 @@ def verify_corpus(path, expected):
     return path
 
 
+def handoff_reason(completed, limit, requested):
+    if not completed:
+        return None
+    if limit is not None and completed >= limit:
+        return ARM_LIMIT
+    return HANDOFF_REQUEST if requested else None
+
+
 def validate_plan(text, operation):
     if "--apply would refuse" in text or re.search(r"shape:\s+CHANGE[DS]", text):
         raise ValueError("cluster plan refused; no shape bypass")
@@ -118,7 +128,7 @@ def validate_plan(text, operation):
 def resume_arms(previous, current, arms):
     """Only a clean, restored handoff may supply an ordered measured prefix."""
     if (previous.get("completed") is not False or previous.get("restored") is not True
-            or previous.get("error") != "RuntimeError: handoff requested after completed arm"
+            or previous.get("error") not in {f"RuntimeError: {HANDOFF_REQUEST}", f"RuntimeError: {ARM_LIMIT}"}
             or previous.get("restore_error")):
         raise ValueError("resume requires a restored handoff, not a failed or completed stage")
     for key in ("commit", "gate_sources", "images", "restore_profile", "stage", "screen_receipt_sha256"):
@@ -141,9 +151,12 @@ def main():
     parser.add_argument("--restore-commit", help="exact original deployment SHA captured before branch sync")
     parser.add_argument("--resume-from", help="same-stage receipt from a restored handoff at this exact commit")
     parser.add_argument("--screen-from", help="completed causal screen receipt for qualification after a handoff")
+    parser.add_argument("--max-arms", type=int, help="maximum fresh arms in this window before restoring and handing off")
     parser.add_argument("--keep-open", action="store_true")
     parser.add_argument("--apply", action="store_true")
     args = parser.parse_args()
+    if args.max_arms is not None and args.max_arms < 1:
+        parser.error("--max-arms must be positive")
     spec = json.loads((ROOT / EXPERIMENT / "screen.json").read_text())
     arms = spec["jobs"][0]["arms"]
     suites = [f"{EXPERIMENT}/screen-suite.json"]
@@ -162,6 +175,7 @@ def main():
                           "restore_profile": RESTORE, "image": IMAGE,
                           "resume_from": args.resume_from,
                           "screen_from": args.screen_from,
+                          "max_arms": args.max_arms,
                           "requires_owned_window": HOLDER, "shape_change": False}, indent=2))
         return 0
     if os.uname().nodename != "dgx1" or not owns(lab.read_hold(), args.window):
@@ -178,6 +192,7 @@ def main():
         raise SystemExit("prior stage receipts exist; preserve and review before retrying")
     out.mkdir(parents=True)
     receipt = {"started": lab.now(), "window": args.window, "stage": args.stage,
+               "max_arms": args.max_arms,
                "commit": lab.checkout_commit(), "restore_commit": args.restore_commit,
                "restore_profile": RESTORE, "steps": [], "restored": False,
                "gate_sources": {name: {"path": script, "sha256": hashlib.sha256((ROOT / script).read_bytes()).hexdigest()}
@@ -290,8 +305,9 @@ def main():
         for index, arm in enumerate(arms[len(completed):]):
             # A window's first arm includes its preceding coordinated sync.
             # Finish that job on a new request, then hand off before the next arm.
-            if index and lab.window_should_close(lab.read_hold()):
-                raise RuntimeError("handoff requested after completed arm")
+            reason = handoff_reason(index, args.max_arms, lab.window_should_close(lab.read_hold()))
+            if reason:
+                raise RuntimeError(reason)
             config, label = f"{EXPERIMENT}/{arm['config']}", arm["label"]
             active_arm = label
             # Record the profile before a partial start can fail, for coordinated cleanup.

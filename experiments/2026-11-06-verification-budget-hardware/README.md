@@ -97,6 +97,12 @@ also validates through `scripts/lab.py run <experiment>/screen.json --dry-run`,
 but **do not execute that spec with the main-syncing queue**. The guarded
 runner adds the functional gates and exact restoration sequence.
 
+For the coordinator-reserved first turn, use `--max-arms 1` and omit
+`--keep-open`. The limit counts newly completed arms in that invocation; it
+finishes the current arm, restores the original commit/service, and records a
+resumable bounded handoff even if no other request has arrived. Later turns
+resume the ordered remaining arms at the identical published revision.
+
 After a request interrupts a stage at an arm boundary, `--resume-from` may
 reference that stage's native `receipt.json` in a later owned window. It
 requires a successfully restored handoff, the identical published commit,
