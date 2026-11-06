@@ -3,7 +3,65 @@
 Base: `6d152f4a15ed539f402fc264bc089cf77f4f94fb`. The owner authorized hardware
 testing on 2026-11-06, including coordinated replacement and restoration. This
 extends the offline `2026-11-05-verification-budget-replay` experiment. No
-hardware result or speedup is claimed yet.
+speedup is claimed. The first candidate boot failed its declared sampled
+batch-invariance gate before any throughput measurement; see the retained result
+below. The row-cost alternatives remain unqualified.
+
+## First hardware result: required sampled gate failed
+
+Window `dgx1-1793927589` ran the published controller at
+`1160621844bae0f681318d812e1e11f384844767`, with `--max-arms 1` and no
+`--keep-open`. Only `row010-a` booted: the immutable C40 image and row cost 0.01.
+API readiness took 107.4 seconds. Both six-scenario greedy gates passed, with
+exact token/logprob equality on the native-logprob path and matching text digests
+between that path and ordinary greedy verification.
+
+The unchanged `sampled_digest.py --tokens 192` collector then reported
+`identical:false`: c8 cases 0, 2, 3, 4 and 6 differed from their solo references;
+all eight repeated solo requests matched. Requests used temperature 1, seed
+20261024 plus the prompt index, `ignore_eos:true`, fresh cache salts, logprobs,
+and thinking off. The controller rejected that false verdict despite the
+collector's exit 0. Controls, tools/schema, model corpus and timed suites did
+not run. There is no throughput result, candidate repeat, confidence interval,
+or performance comparison from this attempt. The failed arm cannot use the
+successful-handoff resume path and was not repeated.
+
+Startup minimum available memory was 7.594/9.918/10.270 GiB on dgx1/2/3;
+functional-traffic minima were 7.43/10.30/10.12 GiB, with zero swap growth,
+no guard halt and no fan-restoration failure. The controller stopped the arm,
+synchronized every node to original commit
+`2c4b23afcd834ba2adf6a15ca434e59fa4f49f74`, and restored the exact C36 profile
+and digest. Native live doctor passed and the hold was removed at
+2026-11-06 01:25:40 UTC. Independent all-rank checks at 01:26:16–19 UTC
+confirmed clean original checkouts and C36 running; the earlier Engram request
+was preserved. During this window the holder explicitly recorded dgx1/2/3 as
+its node scope after checking the restore map and watchdog targets; the scope
+survived native heartbeats. No other pool was used.
+
+Evidence is in `runs/hardware-dgx1-1793927589/`: native receipts, both passing
+greedy reports, the failed sampled report, memory/condition records, original
+and restored identities, and a complete raw-file hash inventory. Full engine
+logs stay in the native private directory; their hashes, warnings and fault
+scan are exported. `export_attempt2.py` reproduces this bounded export. The
+legacy sampled collector did not retain HTTP request/response IDs or per-case
+token/logprob arrays. Those data are unavailable for this attempt; aggregate
+digests do not reveal whether a case differed in tokens, logprobs, or both.
+
+The saved C40 control and repeat already report the same failed batch-invariance
+observation (all eight c8 cases differ; repeated solo outputs match), with the
+same script, seed and length. Both raw files match their published SHA-256
+`101c40d681f6693ede8f0a774dddf114d17ef03d91ec2e8322726024889a0a25`.
+The comparison retains both files and the immutable source receipt identity.
+C40's historical offline audit explicitly records sampled batch variation as a
+limitation and requires isolated-repeat equality; it did **not** claim sampled
+batch invariance. Do not rewrite that history as a false pass. The exact C40
+sampler keys block-verification draws by request seed, position and local
+speculative step, so a changed block layout can change a seeded trajectory.
+This evidence establishes neither row-cost causality nor a runtime sampling
+defect. It does not retroactively pass this experiment's stricter declared gate.
+Any future qualification contract must distinguish native arithmetic and output
+distribution from exact RNG-input/trajectory identity, with sufficient request
+recording, before another hardware turn. No further turn is assigned.
 
 Remote preflight at `3014f382` passed eight runner tests, all three profile
 doctors, the native six-arm dry run and the guarded runner's read-only plan.
@@ -26,6 +84,10 @@ At `965abfc4`, eleven remote tests, all three doctors and both plans passed
 after rejecting the legacy greedy script's silent text-only fallback and
 requiring ordinary greedy output to match its logprob path. The tests took
 0.11 s / 26,064 KiB; see `runs/preflight/native-gates-965abfc4/`.
+The final hardware controller at `11606218` passed thirteen remote runner tests,
+all three doctors and both dry plans (0.11 s / 26,048 KiB maximum test RSS);
+the native preflight receipts remain on sp8 under
+`~/spark-lab/verification-budget-replay/logs/bounded-arm-11606218/`.
 
 The first window, `dgx1-1793922050`, subsequently opened from the captured
 original commit `2c4b23af` and synchronized the three clean checkouts to
