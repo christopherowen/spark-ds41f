@@ -31,6 +31,7 @@ def measure_plan(plan, q, s, w, pool, table, lengths, active, source):
         kwargs["candidate_out_lengths"] = counts
     graph = graph_of(lambda: plan.run(q, s, w, pool, table, lengths, active, **kwargs))
     stats = sample(graph)
+    stats["median_us"] = stats["median_ms"] * 1000.0
     del graph
     return stats, out, blocks, counts
 
@@ -60,6 +61,7 @@ def run_actual_captures(inputs: Path, replay_receipt: Path):
         sum_stats = sample(
             graph_of(lambda: sum_fn(lsa_pool, lsa_pool.view(torch.bfloat16), slots))
         )
+        sum_stats["median_us"] = sum_stats["median_ms"] * 1000.0
 
         q, s, w = [data[k].cuda() for k in ("q", "scales", "weights")]
         table = torch.zeros(rows, width // page, dtype=torch.int32, device="cuda")
@@ -184,6 +186,7 @@ def run_synthetic_length_matrix(lengths_tokens=(32768, 65536, 131072, 262144, 52
                 ("decode_r1", 1, native_decode_plan, native_decode_plan, 1048576 if source else 524288),
                 ("decode_r8", 8, native_decode_plan, lsa_decode_plan, 1048576 if source else 524288),
                 ("decode_r24", 24, native_decode_plan, lsa_decode_plan, 1048576 if source else 524288),
+                ("decode_r96", 96, native_decode_plan, lsa_decode_plan, 1048576 if source else 524288),
             ]:
                 q = torch.randint(
                     0, 256, (rows, 32, 64), dtype=torch.uint8, device="cuda", generator=g
@@ -228,7 +231,7 @@ def run_synthetic_length_matrix(lengths_tokens=(32768, 65536, 131072, 262144, 52
             else:
                 entry["dense_layer"] = layer_res
 
-        for mode_name in ("prefill_r64", "decode_r1", "decode_r8", "decode_r24"):
+        for mode_name in ("prefill_r64", "decode_r1", "decode_r8", "decode_r24", "decode_r96"):
             nat_total = (
                 3.0 * entry["dense_layer"]["modes"][mode_name]["native_median_us"]
                 + 1.0 * entry["source_layer"]["modes"][mode_name]["native_median_us"]
