@@ -1,9 +1,10 @@
 # Worker-test lazy-reference isolation rework
 
 Candidate46 is reserved for a focused correction of C43's release-test failure.
-This packet is a **reviewed patch draft, not a prepared or qualified source**.
-CPU fixture proof, canonical replay, source head/tree, image, native gates and
-both metric boots remain pending safe remote capacity. No C43 gate or image is
+This packet now has a **canonical source proof, with native qualification pending**.
+The remote 576-patch replay reproduced exact C43, then independently reapplied
+only the one-file fixture correction. Actual-image CPU fixture proof, a new
+image, native gates and both metric boots remain pending safe remote capacity. No C43 gate or image is
 rerun or resumed. Its original failed verdict remains unchanged.
 
 C43 built successfully. The native gate recorded8103 passes,360 skips and one
@@ -61,3 +62,10 @@ resolves then restores an attribute, while the [current implementation](https://
 adds dictionary-state handling. The actual image's pytest version/source hash
 and the drafted fixture witness must still be captured before calling native
 causality proven. No pytest dependency was installed on the host.
+
+The source-only job ended with actual wait exit0 at2026-11-06 01:12:22 UTC.
+All1767 recorded source steps exited0; metadata audit independently verified
+every prefix patch byte and the resulting577-patch identity. Head `d92f9c26e7e749ed15850d24a9e419ebad90a91f`,
+tree `8056f1ef9761065bf9c66cb82b008ff71b6f310a`. Both temporary CPU claims were removed normally.
+No test package was installed, no native gate/serving point was rerun and no
+performance or native-causality claim follows from this source proof.
