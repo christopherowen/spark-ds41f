@@ -131,7 +131,7 @@ class ServingGuards(unittest.TestCase):
             with patch.object(serving_gate, 'state', side_effect=samples), patch.object(serving_gate.time, 'sleep'):
                 serving_gate.cool(None, 'token', Path(d), 'ced')
             receipt = json.loads((Path(d) / 'ced-cooling.json').read_text())
-            self.assertEqual(receipt['below_c'], 50.0)
+            self.assertEqual(receipt['below_c'], 49.5)
             self.assertEqual(receipt['settle_polls'], 2)
             self.assertEqual(len(receipt['observations']), 3)
 
@@ -140,7 +140,7 @@ class ServingGuards(unittest.TestCase):
         cool1 = {node: {'thermal_zones_c': {'z0': 48.1}, 'gpu_temperature_c': 45.0} for node in record_requests.NODES}
         cool2 = {node: {'thermal_zones_c': {'z0': 48.3}, 'gpu_temperature_c': 44.0} for node in record_requests.NODES}
         with tempfile.TemporaryDirectory() as d:
-            archive = RequestArchive(Path(d) / 'requests', token='tok', below_c=50.0, settle_polls=2, poll_sleep=0.0)
+            archive = RequestArchive(Path(d) / 'requests', token='tok', below_c=49.5, settle_polls=2, poll_sleep=0.0)
             with patch.object(record_requests, 'read_nodes', side_effect=[hot, cool1, cool2]):
                 archive.cool('ced-16352-0')
             saved = json.loads((archive.directory / 'cooldowns.json').read_text())['cooldowns']

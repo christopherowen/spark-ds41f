@@ -65,7 +65,7 @@ def state(c, token, floor_gib):
     return records
 
 
-def cool(c, token, out, stem, *, below_c=50.0, settle_polls=2):
+def cool(c, token, out, stem, *, below_c=49.5, sp5_below_c=48.5, settle_polls=2):
     began = time.monotonic()
     observations = []
     settled = 0
@@ -74,8 +74,8 @@ def cool(c, token, out, stem, *, below_c=50.0, settle_polls=2):
         while True:
             current = state(c, token, 3)
             observations.append(current)
-            if all(max(row['thermal_zones_c'].values()) < below_c and row['gpu_temperature_c'] < below_c
-                   for row in current.values()):
+            if all(max(row['thermal_zones_c'].values()) < (sp5_below_c if node in ('10.30.0.13', 'sp5') else below_c) and row['gpu_temperature_c'] < below_c
+                   for node, row in current.items()):
                 settled += 1
                 if settled >= settle_polls:
                     return

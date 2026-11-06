@@ -23,8 +23,7 @@ SSH_OPTS = (
     '-o', 'ControlPath=/tmp/spark-ssh-%C',
     '-o', 'ControlPersist=600',
 )
-WAVE1_SIZE = 8
-SINGLE_WAVE_MAX = 9
+WAVE_SIZE = 6
 NODE_READ = """from pathlib import Path
 import json,subprocess,time
 h=json.loads((Path.home()/'spark-hold.json').read_text())
@@ -85,7 +84,7 @@ class TimedResponse:
 
 
 class RequestArchive:
-    def __init__(self, directory, *, token=None, below_c=50.0, settle_polls=2, poll_sleep=3.0):
+    def __init__(self, directory, *, token=None, below_c=49.5, sp5_below_c=48.5, settle_polls=2, poll_sleep=3.0):
         self.directory = Path(directory)
         self.directory.mkdir(parents=True, exist_ok=False)
         self.lock = threading.Lock()
@@ -93,6 +92,7 @@ class RequestArchive:
         self.cooldowns = []
         self.token = token
         self.below_c = below_c
+        self.sp5_below_c = sp5_below_c
         self.settle_polls = settle_polls
         self.poll_sleep = poll_sleep
 
@@ -150,7 +150,8 @@ class RequestArchive:
             gpus = {node: row['gpu_temperature_c'] for node, row in current.items()}
             peak_hottest = max(peak_hottest, max(hottest.values()))
             peak_gpu = max(peak_gpu, max(gpus.values()))
-            if all(hottest[node] < self.below_c and gpus[node] < self.below_c for node in NODES):
+            if all(hottest[node] < (self.sp5_below_c if node == '10.30.0.13' else self.below_c)
+                   and gpus[node] < self.below_c for node in NODES):
                 settled += 1
                 if settled >= needed:
                     final_hottest = hottest
@@ -169,6 +170,7 @@ class RequestArchive:
                 'polls': polls,
                 'settle_polls': needed,
                 'below_c': self.below_c,
+                'sp5_below_c': self.sp5_below_c,
                 'peak_hottest_c': peak_hottest,
                 'peak_gpu_c': peak_gpu,
                 'final_hottest_c': final_hottest,
@@ -182,7 +184,7 @@ class RequestArchive:
             return
         if body_bytes > 4096:
             self.cool('main-long-request', settle_polls=self.settle_polls)
-        elif local_hottest_c() >= self.below_c - 1.0:
+        elif local_hottest_c() >= self.sp5_below_c:
             self.cool('main-short-request', settle_polls=1)
 
 
@@ -203,7 +205,9 @@ def main():
     identity = {'script': str(script), 'script_sha256': hashlib.sha256(script.read_bytes()).hexdigest(),
                 'arguments': args.arguments, 'token': args.token, 'cpu_affinity': sorted(os.sched_getaffinity(0)),
                 'address_space_limit_bytes': 1024**3, 'cooldown_below_c': archive.below_c,
+                'cooldown_sp5_below_c': archive.sp5_below_c,
                 'cooldown_settle_polls': archive.settle_polls,
+                'wave_size': WAVE_SIZE,
                 'scope': 'request correctness; stock-cooled inter-request pacing; no timing qualification'}
     (args.out / 'client.json').write_text(json.dumps(identity, indent=2) + '\n')
     original_request_init = urllib.request.Request.__init__
@@ -214,23 +218,24 @@ def main():
     worker_threads = []
     worker_lock = threading.Condition()
     batch_all_started = False
-    wave1_remaining = 0
-    wave2_released = False
+    wave_remaining = {}
+    current_wave = 0
 
-    def complete_wave1_slot():
-        nonlocal wave1_remaining, wave2_released
+    def complete_wave_slot(my_wave):
+        nonlocal current_wave
         should_cool_wave = False
+        next_wave = my_wave + 1
         with worker_lock:
-            if wave1_remaining > 0:
-                wave1_remaining -= 1
-                if wave1_remaining == 0 and len(worker_threads) > SINGLE_WAVE_MAX and not wave2_released:
+            if wave_remaining.get(my_wave, 0) > 0:
+                wave_remaining[my_wave] -= 1
+                if wave_remaining[my_wave] == 0 and next_wave in wave_remaining:
                     should_cool_wave = True
         if should_cool_wave:
             try:
-                archive.cool('batch-wave')
+                archive.cool(f'batch-wave-{next_wave}')
             finally:
                 with worker_lock:
-                    wave2_released = True
+                    current_wave = next_wave
                     worker_lock.notify_all()
 
     def recorded_init(request, *positional, **keyword):
@@ -242,32 +247,30 @@ def main():
         request = url if isinstance(url, urllib.request.Request) else None
         body_bytes = len(request.data) if request is not None and request.data is not None else 0
         batch_index = getattr(current, '_batch_index', None)
-        is_wave1 = False
+        my_wave = None
         if current is not threading.main_thread() and batch_index is not None and script.name != 'ced_cross_shape.py':
-            if batch_index < WAVE1_SIZE:
-                is_wave1 = True
-            else:
-                need_long_delay = False
-                with worker_lock:
-                    worker_lock.wait_for(lambda: batch_all_started, timeout=5.0)
-                    if len(worker_threads) > SINGLE_WAVE_MAX:
-                        worker_lock.wait_for(lambda: wave2_released, timeout=900.0)
-                        need_long_delay = body_bytes > 4096
-                if need_long_delay:
-                    time.sleep(0.3)
+            my_wave = batch_index // WAVE_SIZE
+            need_long_delay = False
+            with worker_lock:
+                worker_lock.wait_for(lambda: batch_all_started, timeout=5.0)
+                if my_wave > 0:
+                    worker_lock.wait_for(lambda: current_wave >= my_wave, timeout=1800.0)
+                    need_long_delay = body_bytes > 4096
+            if need_long_delay:
+                time.sleep(0.3)
         started = time.monotonic()
         try:
             response = original_urlopen(url, *positional, **keyword)
         except BaseException:
-            if is_wave1:
-                complete_wave1_slot()
+            if my_wave is not None:
+                complete_wave_slot(my_wave)
             raise
 
         def finish(ok):
             if request is not None:
                 archive.complete(request, started, ok)
-            if is_wave1:
-                complete_wave1_slot()
+            if my_wave is not None:
+                complete_wave_slot(my_wave)
             if (ok and script.name != 'ced_cross_shape.py'
                     and current is threading.main_thread()
                     and body_bytes > 0):
@@ -276,20 +279,22 @@ def main():
         return TimedResponse(response, finish)
 
     def tracked_start(thread, *positional, **keyword):
-        nonlocal wave1_remaining
         if threading.current_thread() is threading.main_thread():
             with worker_lock:
                 thread._batch_index = len(worker_threads)
                 worker_threads.append(thread)
-                if len(worker_threads) <= WAVE1_SIZE:
-                    wave1_remaining += 1
         return original_thread_start(thread, *positional, **keyword)
 
     def tracked_join(thread, *positional, **keyword):
-        nonlocal batch_all_started, wave1_remaining, wave2_released
+        nonlocal batch_all_started, current_wave
         if threading.current_thread() is threading.main_thread() and script.name != 'ced_cross_shape.py':
             with worker_lock:
                 if not batch_all_started:
+                    wave_remaining.clear()
+                    for idx in range(len(worker_threads)):
+                        w = idx // WAVE_SIZE
+                        wave_remaining[w] = wave_remaining.get(w, 0) + 1
+                    current_wave = 0
                     batch_all_started = True
                     worker_lock.notify_all()
         result = original_thread_join(thread, *positional, **keyword)
@@ -298,9 +303,9 @@ def main():
             with worker_lock:
                 if worker_threads and all(not t.is_alive() for t in worker_threads):
                     worker_threads.clear()
+                    wave_remaining.clear()
+                    current_wave = 0
                     batch_all_started = False
-                    wave1_remaining = 0
-                    wave2_released = False
                     should_cool = True
             if should_cool:
                 archive.cool('batch-join')
