@@ -57,7 +57,7 @@ def logged_run(command, out, stem, *, allow_failure=False):
     with (out/(stem+'.txt')).open('w') as log:
         try:
             result = subprocess.run(command, cwd=RESTORE_ROOT, stdout=log, stderr=subprocess.STDOUT,
-                                    timeout=1500 if stem.startswith('boot-') else 900)
+                                    timeout=1500 if stem.startswith(('boot-','smoke-')) else 900)
             code = result.returncode
         except subprocess.TimeoutExpired:
             code = 124
@@ -237,6 +237,7 @@ def main():
     parser.add_argument('--out', type=Path, required=True)
     parser.add_argument('--watchdog')
     parser.add_argument('--apply', action='store_true')
+    parser.add_argument('--job', choices=('native','collective'), default='native')
     route = parser.add_mutually_exclusive_group(required=True)
     route.add_argument('--global-host', help='verified reachable management address of dgx1')
     route.add_argument('--global-observation', type=Path, help='continuously refreshed authenticated DGX1 observation')
@@ -279,9 +280,9 @@ def main():
     state = holds(); assert not any(any(v.values()) for v in state.values()), state
     token = uuid.uuid4().hex
     held = {'holder': HOLDER, 'token': token, 'since': stamp(), 'heartbeat': stamp(),
-            'expected_end': (dt.datetime.now(dt.timezone.utc)+dt.timedelta(minutes=45)).isoformat(),
+            'expected_end': (dt.datetime.now(dt.timezone.utc)+dt.timedelta(minutes=90 if args.job=='collective' else 45)).isoformat(),
             'nodes': NAMES, 'rule': 'exclusive native correctness only; coordinated exact C37 restoration before release',
-            'phase': 'preparing', 'controller_commit': commit, 'source_commit': '51c1a32cd78cfb0a14087e34dfcc06be30928a0e',
+            'phase': 'preparing', 'job':args.job, 'controller_commit': commit, 'source_commit': '51c1a32cd78cfb0a14087e34dfcc06be30928a0e',
             'restore_commit': RESTORE_COMMIT, 'production_config': RESTORE_PROFILE,
             'controller_output': str(out)}
     acquired = []
@@ -345,8 +346,7 @@ print('true')
         # Execute the exact phase writer while service is still healthy.
         recovery.each(PHASE, {'token':token,'phase':'preparing'})
         recovery.run(command+['--apply'], out, 'stop-apply')
-        recovery.each(PHASE, {'token':token,'phase':'native'})
-        for boot in ('boot-1','boot-2'):
+        def batch(boot,job):
             remaining=(dt.datetime.fromisoformat(held['expected_end'])-dt.datetime.now(dt.timezone.utc)).total_seconds()
             if remaining < 35*60:
                 raise RuntimeError('insufficient time for another bounded batch plus restoration')
@@ -355,15 +355,28 @@ print('true')
             state=holds()
             if any(v['spark-request.json'] or v['spark3-request.json'] for v in state.values()):
                 raise RuntimeError('cohort requested; yield after completed batch')
-            def one(node):
+            def one(pair):
+                rank,node=pair
                 argv=['ssh','-o','BatchMode=yes','-o','ConnectTimeout=10','chris@'+node,
-                      'python3',str(EXP/'native_worker.py'),'--token',token,'--boot',boot,'--source',SOURCE]
+                      'python3',str(EXP/'native_worker.py'),'--token',token,'--boot',boot,'--source',SOURCE,
+                      '--job',job,'--rank',str(rank)]
                 return recovery.run(argv,out,boot+'-'+node.replace('.','-'),allow_failure=True)
             with concurrent.futures.ThreadPoolExecutor(max_workers=3) as pool:
-                results=list(pool.map(one,recovery.NODES))
+                results=list(pool.map(one,enumerate(recovery.NODES)))
             assert results==[0,0,0], results
+        if args.job=='collective':
+            recovery.each(PHASE, {'token':token,'phase':'copying'})
+            command=['ssh','-o','BatchMode=yes','-o','ConnectTimeout=10','chris@10.30.0.16',
+                     'systemd-run','--user','--scope','-p','MemoryMax=4G','-p','CPUQuota=100%',
+                     'taskset','-c','4','flock','-n','/tmp/spark-cpu-analysis.lock','python3','-B',
+                     '/home/chris/spark-lab/ced-local-boundary/deployment/experiments/2026-11-06-ced-local-projection/distribute_sp567.py',
+                     '--token',token,'--commit',commit,'--apply']
+            recovery.run(command,out,'image-distribution')
+        recovery.each(PHASE, {'token':token,'phase':'native'})
+        if args.job=='collective':batch('smoke','smoke')
+        for boot in ('boot-1','boot-2'):batch(boot,args.job)
         (out/'native-complete.json').write_text(json.dumps({'at':stamp(),'boots':2,'nodes':NAMES,
-                                                          'scope':'native bit checks only'},indent=2)+'\n')
+                                                          'scope':args.job+' correctness only; no serving or performance claim'},indent=2)+'\n')
     except BaseException:
         (out/'error.txt').write_text(traceback.format_exc())
         raise

@@ -403,3 +403,38 @@ was created only if absent and verified against immutable parent `3795255f`.
 Exact identities and receipts are in `image-native-reuse.json` and
 `receipts/native-reuse-image-5-*`. The image has not been distributed, GPU-smoked
 or served; these gates remain required.
+
+## Image smoke and actual TP3 collective follow-on
+
+`sp567_cohort.py --job collective` selects a separately recorded 90-minute maximum
+window. It uses the same exact all-node C37 recovery authority, lease handshake,
+fresh global scope relay, idle guard, watchdog and verification before release.
+After a coordinated stop, SP8 streams the one verified image to every SP5-SP7 node
+with `bin/spark --cluster-config .../sp567-image.json build distribute --apply`.
+The profile selects the existing TP3 switched node map and disables serving
+launches. The transfer checks portable ordered-layer/runtime-Config identity,
+refuses a conflicting existing immutable tag, checks every owned lease and the
+48 GiB memory reserve while copying, and stops at 780 seconds. SP8 uses one CPU
+and 4 GiB behind the shared CPU lock and never opens a GPU. The CLI's text plan
+omits the head, so the guarded helper also records the actual missing targets
+from all three image inspections; the normal apply verifies all three copies.
+
+Each participant then runs the standard `bin/spark build smoke --image ...`
+command. A published Docker wrapper adds only the exact token/name, one CPU,
+network isolation and a process limit to the standard 16 GiB GPU-smoke container.
+The normal import/native checks are unchanged. Two fresh three-rank containers
+then run `collective_gate.py`, using native PyNCCL grouped gathers and the actual
+compressor projection factory at 385, 390, 391, 1025 and 16384 rows. Every rank
+checks compact carry bytes against independent indexed copies, including arbitrary
+NaN/signed-zero bit patterns, padding, invalid/duplicate selections and empty
+selection. The projection compares local rows plus real all-gather against the
+full-row native prefill projection, finite and nonfinite, while checking the TP3
+byte-cost crossover. This is synthetic collective correctness, not whole-model
+serving or a timing benchmark. No source or precision parameter changes.
+
+Workers retain the 55 C start, 70 C stop, 48 GiB memory floor, 16 GiB container
+limit and bounded cooling/process waits. No new batch starts without 35 minutes
+remaining for its bounds and restoration; pending requests yield after the current
+complete batch. Every command, output, error and thermal/memory sample is retained.
+The follow-on has been prepared but has not yet run; its actual outcomes must be
+recorded before claiming image smoke or cross-rank qualification.
