@@ -157,8 +157,7 @@ def main():
                            "torch_peak_allocated_bytes_two_arms": torch.cuda.max_memory_allocated(),
                            "records": records}
                 args.output.write_text(json.dumps(receipt, indent=2) + "\n")
-                print(json.dumps({"mode": mode, "context": context, "concurrency": concurrency,
-                                  "completed_cases": len(records)}), flush=True)
+                print(json.dumps({"completed_cases": len(records), "case_result": result}), flush=True)
                 del case
     print("45 component cases completed; no serving-performance conclusion", flush=True)
 

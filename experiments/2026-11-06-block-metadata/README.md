@@ -6,20 +6,63 @@ construction and upload opportunity. The batch-order GPU gather still rewrites
 its configured capacity. Historical costs prioritize this opportunity but do not
 rule out an improvement. The initial audit's stopping decision was too broad.
 
-`bundle/incremental.py` is an unfinished, unvalidated component prototype. It
+`bundle/incremental.py` is an unvalidated component prototype. It
 compares copying a changed row, coalescing appended IDs to 1024-column chunks,
 and writing exact appended spans. GPU cache records retain owner, overwrite
 generation and previous count per chunk; overwrite generations come from the
 producer rather than a host scan. It keeps the normal gather for explicit output
 destinations, invalidates default-cache state on dummy writes, and rebuilds that
 state when layout tensors are rebuilt. It is not installed in serving and still
-needs compilation, GPU correctness tests and timing, followed by real runtime
+needs GPU compilation, execution of the GPU correctness gates and timing, followed by real runtime
 integration and serving validation if it survives the component screen.
 
 The original audit and its receipts remain below. No runtime correctness fix or
 performance gain has been established. The hardware handoff remains collective
 qualification, then the reserved verification-budget arm, before any request
 from this experiment; no acquisition waiter or request has been started here.
+
+## Follow-up component screen, ready specification
+
+- Published source code has been syntax-checked on SP8. Three host-publication
+  tests pass there: appends leave replacement generations alone, same-size and
+  empty replacements advance them, publication follows IDs/counts, and exhaustion
+  fails before staging. These are CPU checks, not GPU validation.
+- `bundle/test_gpu.py` defines 55 GPU gates covering the five context labels at
+  c1/c8/c16, integer IDs, expanded kernel blocks, holes, non-aligned widths, padded
+  rows, compaction, preemption, same-size/shorter/empty reuse, alternate-output
+  aliasing, layout rebuild, int32/int64 request mappings and captured consumers
+  across shape changes. The source-file guard requires the audited control.
+- `bundle/bench.py` compares the full gather with three reuse modes. Its
+  17-group geometry follows the recorded runner benchmark; the receipt spells
+  out live counts and does not claim an observed serving allocation. It records
+  paired captured GPU times for steady/reordered batches and CPU enqueue plus
+  completion time for steady, page-crossing and overwrite preparation. Each
+  comparison retains all eight pairs and a 95% interval. Every host timing
+  retires the prior step before UVA storage can be reused.
+- `components.json` names one node, dgx1, under an exclusive coordinated window.
+  Its bundle uses the inspected candidate-40 image ID
+  `sha256:7ae96e98e361601d8232cd99e6af1c6044b7c282bf6904c989e6ad033c147f82`,
+  matching the locked source head and tree above. No released build is rerun.
+- Estimated bounded window: **35–45 minutes**, including cooling/restoration.
+  The harness runs two fresh benchmark processes, each preceded by a fresh GPU
+  correctness process. Per round: host gate 30 s, GPU gates 300 s, benchmark
+  600 s maximum. It stops at the first failure, preserves partial receipts, and
+  refuses to overwrite an existing output directory. This is two component
+  rounds, not two serving boots.
+- Before execution: wait for the named reservations and earlier legitimate
+  claims; acquire an actual exclusive lease; inspect the current serving commit,
+  profile and all-rank image identity; publish/sync the exact experiment revision
+  with the explicit configuration; inspect `live:` and `shape:`; use normal
+  memory/thermal/watchdog guards and restore the recorded original state. No
+  request file has been written and no GPU access is scheduled by these files.
+- A surviving mode still needs an upstream runtime patch with prepared-kernel
+  declarations and all destination writers accounted for, followed by native
+  output/batch/cross-rank gates and full-step/end-to-end serving measurements
+  over a boot and repeat boot. A component win cannot make this work ready.
+
+Remote scratch: `/home/chris/spark-work/block-metadata/` on SP8, with a clean
+detached published deployment checkout. CPU receipts remain under its `results/`
+directory. No model, image, or prepared-source copy was created locally.
 
 This is a source audit and an offline operation-count screen. It is not the
 32K–1M c1/c8/c16 serving-hardware comparison that a new candidate would require.

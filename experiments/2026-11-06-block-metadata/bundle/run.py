@@ -8,7 +8,9 @@ import sys
 
 
 out = Path(os.environ.get("BLOCK_METADATA_OUTPUT", "/c/block-metadata"))
-out.mkdir(parents=True, exist_ok=True)
+# A retry needs a new, explicitly named output directory. Never replace a failed
+# qualification's partial receipts with a later run's results.
+out.mkdir(parents=True, exist_ok=False)
 steps = []
 for boot in (1, 2):
     for label, args, timeout in [
