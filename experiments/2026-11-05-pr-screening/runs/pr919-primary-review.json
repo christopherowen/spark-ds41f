@@ -1,0 +1,89 @@
+{
+  "schema_version": 1,
+  "review_date": "2026-11-06",
+  "pr": 919,
+  "deployment_head": "c6b6d6b297c62132500915068870dadb74cd2e9e",
+  "deployment_base": "6e45978caabba27200e301dc99b8e80f7f78705a",
+  "source_pr": "https://github.com/christopherowen/vllm/pull/3",
+  "source_head": "a2b0ea500dc5022e23c4d6fc667254a806c984dc",
+  "source_tree": "e11945731049bb810c69644d91b0740fb3ca3680",
+  "authored_source_base": "1f33102547e4da5c64712390604695d1abd577c4",
+  "purpose": "performance enhancement",
+  "intended_variable": "Capture the unchanged integer drafter-metadata kernel inside supported FULL query graphs instead of rebuilding its metadata eagerly before replay.",
+  "correctness_classification": "No affected-path old-fails/new-passes defect is demonstrated. The existing eager path passes; the new component checks establish equivalence of placement.",
+  "provided_component_results": {
+    "classification": "PR-provided GPU measurements, not independently repeated here",
+    "fixture": "8 requests, 5 query rows per request, 8K prefix, one metadata group and one integer consumer; no model weights or serving workload",
+    "boots": [
+      {
+        "boot": 1,
+        "isolated_eager_us": 218.154,
+        "isolated_candidate_us": 5.128,
+        "isolated_saved_us": 213.026,
+        "isolated_saved_ci95_us": [212.471, 213.585],
+        "queued_gpu_head_us": 775.234,
+        "queued_eager_us": 782.652,
+        "queued_candidate_us": 779.711,
+        "queued_saved_us": 2.940,
+        "queued_saved_ci95_us": [2.578, 3.308],
+        "queued_saving_percent": 0.376
+      },
+      {
+        "boot": 2,
+        "isolated_eager_us": 225.644,
+        "isolated_candidate_us": 5.096,
+        "isolated_saved_us": 220.547,
+        "isolated_saved_ci95_us": [220.016, 221.092],
+        "queued_gpu_head_us": 775.536,
+        "queued_eager_us": 783.171,
+        "queued_candidate_us": 780.508,
+        "queued_saved_us": 2.663,
+        "queued_saved_ci95_us": [2.418, 2.905],
+        "queued_saving_percent": 0.340
+      }
+    ],
+    "limits": [
+      "Intervals describe paired within-boot trials; preserve independent boot variation.",
+      "Preceding GPU work hides most isolated host overhead. Neither saving is a serving-throughput forecast or a value to multiply by model metadata-group count.",
+      "The integer fixture does not exercise integrated model graph capture, sampling, rank agreement, cancellation or incremental serving memory.",
+      "Serving comparisons with 1030, C36 and C40 remain unmeasured, not performance-neutral."
+    ]
+  },
+  "source_review": {
+    "confirmed_new_bug": false,
+    "finding": "No concrete new stale-buffer, capture-order, fallback or invalidation defect was confirmed in the inspected diff. This limited review does not prove full-model correctness.",
+    "observations": [
+      "Captured updates reference persistent input views and execute before the query forward.",
+      "Dummy and actual block-table/slot-mapping paths use the same persistent device buffers.",
+      "CP, model-state overrides and unsupported builders retain the eager fallback.",
+      "Reset invalidates the cached guard and inherited query-graph manager.",
+      "The builder hook retains the existing integer kernel and arguments."
+    ]
+  },
+  "disposition": "Retain for C40-based transfer and serving qualification. No additional kernel implementation rework is justified by the small exposed component saving alone.",
+  "c40_transfer": "Transfer only the exact authored patch onto the validated corrected default-enabled C40 source. Do not replace C40 with PR919's C38-derived lock or profile.",
+  "artifact": {
+    "path": "experiments/2026-11-05-pr-screening/sources/pr-919/0688-replay-drafter-metadata.patch",
+    "sha256": "23ff853ce80250edb63eeea9ab5f0c3f9d104ca8ac933841076ef82bf86835a7",
+    "bytes": 18107,
+    "lines": 425,
+    "preserved_unmodified": true
+  },
+  "evidence": {
+    "deployment_pr": "https://github.com/christopherowen/spark-ds41f/pull/919",
+    "measurements": "https://github.com/christopherowen/spark-ds41f/blob/c6b6d6b297c62132500915068870dadb74cd2e9e/experiments/2026-11-05-drafter-metadata-replay/micro-results.md",
+    "timing_harness": "https://github.com/christopherowen/spark-ds41f/blob/c6b6d6b297c62132500915068870dadb74cd2e9e/experiments/2026-11-05-drafter-metadata-replay/measure_metadata.py",
+    "capture_order": "https://github.com/christopherowen/vllm/blob/a2b0ea500dc5022e23c4d6fc667254a806c984dc/vllm/v1/worker/gpu/spec_decode/dflash/cudagraph.py#L115",
+    "guards_and_reset": "https://github.com/christopherowen/vllm/blob/a2b0ea500dc5022e23c4d6fc667254a806c984dc/vllm/v1/worker/gpu/spec_decode/dflash/speculator.py#L469",
+    "persistent_buffers": "https://github.com/christopherowen/vllm/blob/a2b0ea500dc5022e23c4d6fc667254a806c984dc/vllm/v1/worker/gpu/block_table.py#L218",
+    "base_comparison": "https://github.com/christopherowen/vllm/compare/1f33102547e4da5c64712390604695d1abd577c4...5f926df6d3126266a9c88c82c06544060008c33c"
+  },
+  "independent_work": "Read-only primary source, diff and harness review; exact small patch retrieval and byte hash only.",
+  "source_replay_performed": false,
+  "tests_run": false,
+  "raw_gpu_samples_independently_audited": false,
+  "ssh_or_native_jobs_run": false,
+  "source_runtime_changes_made": false,
+  "serving_or_hardware_changes_made": false,
+  "promotion": false
+}
