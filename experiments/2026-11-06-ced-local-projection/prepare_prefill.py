@@ -6,7 +6,6 @@ import inspect
 import json
 from pathlib import Path
 import random
-import subprocess
 import sys
 
 
@@ -18,6 +17,7 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--deployment', type=Path, required=True)
     parser.add_argument('--snapshot', type=Path, required=True)
+    parser.add_argument('--deployment-commit', required=True)
     parser.add_argument('--out', type=Path, required=True)
     parser.add_argument('--model', required=True)
     parser.add_argument('--seed', type=int, default=0)
@@ -25,6 +25,7 @@ def main():
     parser.add_argument('--sizes', default='32768,131072,262144,524288,1048000')
     args = parser.parse_args()
     assert args.snapshot.name == '1bae0e1088993b9b82de08f59de5be5a34e42170'
+    assert len(args.deployment_commit) == 40 and all(c in '0123456789abcdef' for c in args.deployment_commit)
     sizes = list(map(int, args.sizes.split(',')))
     assert len(sizes) == len(set(sizes)) and all(0 < n < 1048576 - 64 for n in sizes)
     assert args.repeats >= 2
@@ -40,9 +41,7 @@ def main():
         'scope': 'CPU fixture preparation only; no requests or timing measurements',
         'model_revision': args.snapshot.name,
         'model': args.model,
-        'deployment_commit': subprocess.check_output(
-            ['git', '-c', 'safe.directory=' + str(args.deployment), 'rev-parse', 'HEAD'],
-            cwd=args.deployment, text=True).strip(),
+        'deployment_commit': args.deployment_commit,
         'bench_source_sha256': digest(Path(bench.__file__).read_bytes()),
         'suite_prefill_function_sha256': digest(inspect.getsource(bench.suite_prefill).encode()),
         'tokenizer_sha256': {name: digest((args.snapshot / name).read_bytes())

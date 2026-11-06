@@ -1,8 +1,9 @@
 # CED row-local global-KV projection
 
-Status: experimental alternative; two native GPU boots each passed 367 checks with
-one skipped. Schedule timing refinement and serving results are pending. Source
-commit `51c1a32cd78cfb0a14087e34dfcc06be30928a0e` is published on
+Status: experimental alternative. The complete image passed standard GPU smoke
+on SP5-SP7, and two actual TP3 collective boots each passed 20 checks per rank.
+Six standalone native runs each passed 368 checks without skips. Full-model
+quality, batch invariance and qualified performance remain pending. Source commit `51c1a32cd78cfb0a14087e34dfcc06be30928a0e` is published on
 `https://github.com/christopherowen/vllm/tree/feat/ced-local-projection`.
 The source review now includes both compact carry and local projection:
 https://github.com/christopherowen/vllm/pull/4; deployment review is
@@ -95,7 +96,7 @@ attempts; a large failed-copy log is compressed without dropping its contents.
 - Default and candidate doctors pass. Complete build inputs pass `build check`.
   A first cached-input copy requested mandatory reflinks on a filesystem without
   support and failed; an ordinary bounded copy recovered it before preparation.
-  No image has been built or GPU-smoked for this source.
+  No image had been built at that stage; complete-image evidence is recorded below.
 - The six-arm TP3 plan now resolves. An initial compact-carry arm used a relative
   path interpreted from repository root and was rejected; the full repository
   path corrects it. TP4 planning still refuses without the site's qualified ring
@@ -465,3 +466,25 @@ The top requested size is 1,048,000 so it fits the standard 1M-context size filt
 actual token counts are authoritative. Cache salts must be fresh for every replay.
 This is CPU-only fixture preparation, not a benchmark; it does not reconstruct
 the unavailable historical prompt bytes. The first preparation run is pending.
+
+The first preparation attempt stopped before writing prompts because the frozen
+CPU dependency image does not include Git. Its log and capped-run receipt are
+retained. The script now receives the exact revision from the host runner, which
+verifies a clean published checkout before mounting it read-only.
+
+
+## Two successful actual TP3 collective boots
+
+Window `1c7f2a1738db457ea5ffabfaf2b2373a`, controller `a0524276`, passed
+the complete-image smoke on all three nodes, followed by 20 synthetic checks
+per rank in each of two fresh containers. The gate used native grouped PyNCCL
+and the ordinary vLLM TP3 communicator with the published transport settings.
+It checked five carry tensors with finite and arbitrary BF16/FP32 bit patterns,
+invalid/duplicate/empty selections, padding and the 385/390/391-row byte guard,
+plus 1025 and 16384 rows. Actual compressor projection factories matched full-row
+results byte for byte, including nonfinite values and five blocked K parts.
+
+All nine process receipts, raw output and recovery records are retained in
+`receipts/sp567-window-4/`. C37 was independently verified restored at
+03:14:20 UTC on SP5-SP7 and all leases were removed. These are synthetic native
+correctness results; they establish neither full-model invariance nor throughput.
