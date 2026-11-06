@@ -19,6 +19,7 @@ IMAGES = {
     'control': 'sha256:3795255f485ea5c1a9db54c742921dd9b2917daad0799361e5c6f56a70119713',
     'candidate': 'sha256:b1dac2d1ecf9bde9a2412befa40b081745d69d1bc86f76f66bc99e53eb0765bf',
 }
+SSH_OPTS = ['-o', 'BatchMode=yes', '-o', 'ConnectTimeout=10', '-o', 'ControlMaster=auto', '-o', 'ControlPath=/tmp/spark-ssh-%C', '-o', 'ControlPersist=600']
 PROBES = [
     ('ced', 'experiments/2026-10-26-spark-ds41f-candidate/ced_cross_shape.py', []),
     ('determinism', 'experiments/2026-10-12-r6g/token_determinism_text.py',
@@ -64,7 +65,7 @@ def state(c, token, floor_gib):
     return records
 
 
-def cool(c, token, out, stem, *, below_c=50, settle_polls=2):
+def cool(c, token, out, stem, *, below_c=48.5, settle_polls=2):
     began = time.monotonic()
     observations = []
     settled = 0
@@ -142,8 +143,7 @@ def collect_logs(c, out, before):
         row = {'container': before[node]['id'], 'exit': None, 'issues': []}
         try:
             with path.open('xb') as stream:
-                result = subprocess.run(['ssh', '-o', 'BatchMode=yes', '-o', 'ConnectTimeout=10',
-                                         'chris@' + node, 'docker', 'logs', '--tail=100000',
+                result = subprocess.run(['ssh', *SSH_OPTS, 'chris@' + node, 'docker', 'logs', '--tail=100000',
                                          before[node]['id']], stdout=stream, stderr=subprocess.STDOUT, timeout=60)
             row['exit'] = result.returncode
             if result.returncode:

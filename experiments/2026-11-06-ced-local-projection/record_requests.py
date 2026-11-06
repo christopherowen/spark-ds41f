@@ -16,6 +16,15 @@ import urllib.request
 NODES = ('10.30.0.13', '10.30.0.14', '10.30.0.15')
 HOLDER = 'ced-sp567-native-correctness'
 NAMES = ['sp5', 'sp6', 'sp7']
+SSH_OPTS = (
+    '-o', 'BatchMode=yes',
+    '-o', 'ConnectTimeout=10',
+    '-o', 'ControlMaster=auto',
+    '-o', 'ControlPath=/tmp/spark-ssh-%C',
+    '-o', 'ControlPersist=600',
+)
+WAVE1_SIZE = 8
+SINGLE_WAVE_MAX = 9
 NODE_READ = """from pathlib import Path
 import json,subprocess,time
 h=json.loads((Path.home()/'spark-hold.json').read_text())
@@ -35,7 +44,7 @@ def read_nodes(token, floor_gib=3):
     records = {}
     for node in NODES:
         out = subprocess.check_output(
-            ['ssh', '-o', 'BatchMode=yes', '-o', 'ConnectTimeout=10', 'chris@' + node, 'python3 -'],
+            ['ssh', *SSH_OPTS, 'chris@' + node, 'python3 -'],
             input=NODE_READ,
             text=True,
             timeout=30,
@@ -76,7 +85,7 @@ class TimedResponse:
 
 
 class RequestArchive:
-    def __init__(self, directory, *, token=None, below_c=50.0, settle_polls=2, poll_sleep=3.0):
+    def __init__(self, directory, *, token=None, below_c=48.5, settle_polls=2, poll_sleep=3.0):
         self.directory = Path(directory)
         self.directory.mkdir(parents=True, exist_ok=False)
         self.lock = threading.Lock()
@@ -156,8 +165,8 @@ class RequestArchive:
                 'ended_at': time.time(),
                 'elapsed_seconds': round(time.monotonic() - began, 3),
                 'polls': polls,
-                'below_c': self.below_c,
                 'settle_polls': needed,
+                'below_c': self.below_c,
                 'peak_hottest_c': peak_hottest,
                 'peak_gpu_c': peak_gpu,
                 'final_hottest_c': final_hottest,
@@ -171,8 +180,8 @@ class RequestArchive:
             return
         if body_bytes > 4096:
             self.cool('main-long-request', settle_polls=self.settle_polls)
-        elif local_hottest_c() >= self.below_c - 1.5:
-            self.cool('main-short-request', settle_polls=1)
+        elif local_hottest_c() >= self.below_c:
+            self.cool('main-short-request', settle_polls=self.settle_polls)
 
 
 def main():
@@ -201,41 +210,95 @@ def main():
     original_thread_join = threading.Thread.join
     original_print = builtins.print
     worker_threads = []
-    worker_lock = threading.Lock()
+    worker_lock = threading.Condition()
+    batch_all_started = False
+    wave1_remaining = 0
+    wave2_released = False
+
+    def complete_wave1_slot():
+        nonlocal wave1_remaining, wave2_released
+        should_cool_wave = False
+        with worker_lock:
+            if wave1_remaining > 0:
+                wave1_remaining -= 1
+                if wave1_remaining == 0 and len(worker_threads) > SINGLE_WAVE_MAX and not wave2_released:
+                    should_cool_wave = True
+        if should_cool_wave:
+            try:
+                archive.cool('batch-wave')
+            finally:
+                with worker_lock:
+                    wave2_released = True
+                    worker_lock.notify_all()
 
     def recorded_init(request, *positional, **keyword):
         original_request_init(request, *positional, **keyword)
         archive.add(request)
 
     def recorded_urlopen(url, *positional, **keyword):
-        started = time.monotonic()
-        response = original_urlopen(url, *positional, **keyword)
+        current = threading.current_thread()
         request = url if isinstance(url, urllib.request.Request) else None
         body_bytes = len(request.data) if request is not None and request.data is not None else 0
+        batch_index = getattr(current, '_batch_index', None)
+        is_wave1 = False
+        if current is not threading.main_thread() and batch_index is not None and script.name != 'ced_cross_shape.py':
+            if batch_index < WAVE1_SIZE:
+                is_wave1 = True
+            else:
+                need_long_delay = False
+                with worker_lock:
+                    worker_lock.wait_for(lambda: batch_all_started, timeout=5.0)
+                    if len(worker_threads) > SINGLE_WAVE_MAX:
+                        worker_lock.wait_for(lambda: wave2_released, timeout=900.0)
+                        need_long_delay = body_bytes > 4096
+                if need_long_delay:
+                    time.sleep(0.3)
+        started = time.monotonic()
+        try:
+            response = original_urlopen(url, *positional, **keyword)
+        except BaseException:
+            if is_wave1:
+                complete_wave1_slot()
+            raise
 
         def finish(ok):
             if request is not None:
                 archive.complete(request, started, ok)
+            if is_wave1:
+                complete_wave1_slot()
             if (ok and script.name != 'ced_cross_shape.py'
-                    and threading.current_thread() is threading.main_thread()
+                    and current is threading.main_thread()
                     and body_bytes > 0):
                 archive.after_main_request(body_bytes)
 
         return TimedResponse(response, finish)
 
     def tracked_start(thread, *positional, **keyword):
+        nonlocal wave1_remaining
         if threading.current_thread() is threading.main_thread():
             with worker_lock:
+                thread._batch_index = len(worker_threads)
                 worker_threads.append(thread)
+                if len(worker_threads) <= WAVE1_SIZE:
+                    wave1_remaining += 1
         return original_thread_start(thread, *positional, **keyword)
 
     def tracked_join(thread, *positional, **keyword):
+        nonlocal batch_all_started, wave1_remaining, wave2_released
+        if threading.current_thread() is threading.main_thread() and script.name != 'ced_cross_shape.py':
+            with worker_lock:
+                if not batch_all_started:
+                    batch_all_started = True
+                    worker_lock.notify_all()
         result = original_thread_join(thread, *positional, **keyword)
         if threading.current_thread() is threading.main_thread() and script.name != 'ced_cross_shape.py':
             should_cool = False
             with worker_lock:
                 if worker_threads and all(not t.is_alive() for t in worker_threads):
                     worker_threads.clear()
+                    batch_all_started = False
+                    wave1_remaining = 0
+                    wave2_released = False
                     should_cool = True
             if should_cool:
                 archive.cool('batch-join')

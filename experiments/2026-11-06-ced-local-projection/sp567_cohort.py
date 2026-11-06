@@ -25,6 +25,7 @@ NAMES = ['sp5', 'sp6', 'sp7']
 SOURCE = '/home/chris/spark-lab/ced-sp567/vllm'
 GLOBAL_HOST = None
 GLOBAL_OBSERVATION = None
+SSH_OPTS = ['-o', 'BatchMode=yes', '-o', 'ConnectTimeout=10', '-o', 'ControlMaster=auto', '-o', 'ControlPath=/tmp/spark-ssh-%C', '-o', 'ControlPersist=600']
 
 
 def output(*command, cwd=None):
@@ -71,8 +72,7 @@ def logged_run(command, out, stem, *, allow_failure=False):
 
 def remote(node, program, data=None):
     code = 'DATA='+repr(data)+'\n'+program
-    result = subprocess.run(['ssh', '-o', 'BatchMode=yes', '-o', 'ConnectTimeout=10',
-                             'chris@'+node, 'python3 -'], input=code, text=True,
+    result = subprocess.run(['ssh', *SSH_OPTS, 'chris@'+node, 'python3 -'], input=code, text=True,
                             capture_output=True, timeout=45)
     if result.returncode:
         raise RuntimeError(node+': '+result.stderr[-2000:])
@@ -89,8 +89,7 @@ def global_scope():
         held = observed['hold']
     else:
         code = "from pathlib import Path; import json; p=Path.home()/'spark-hold.json'; print(p.read_text() if p.exists() else 'null')"
-        result = subprocess.run(['ssh', '-o', 'BatchMode=yes', '-o', 'ConnectTimeout=10',
-                                 'swank@'+GLOBAL_HOST, 'python3 -'], input=code, text=True,
+        result = subprocess.run(['ssh', *SSH_OPTS, 'swank@'+GLOBAL_HOST, 'python3 -'], input=code, text=True,
                                 capture_output=True, timeout=30)
         if result.returncode:
             raise RuntimeError('cannot verify the DGX global hold scope')
@@ -369,7 +368,7 @@ print('true')
                 raise RuntimeError('cohort requested; yield after completed batch')
             def one(pair):
                 rank,node=pair
-                argv=['ssh','-o','BatchMode=yes','-o','ConnectTimeout=10','chris@'+node,
+                argv=['ssh',*SSH_OPTS,'chris@'+node,
                       'python3',str(EXP/'native_worker.py'),'--token',token,'--boot',boot,'--source',SOURCE,
                       '--job',job,'--rank',str(rank)]
                 return recovery.run(argv,out,boot+'-'+node.replace('.','-'),allow_failure=True)
@@ -383,7 +382,7 @@ print('true')
         else:
             if args.job=='collective':
                 recovery.each(PHASE, {'token':token,'phase':'copying'})
-                command=['ssh','-o','BatchMode=yes','-o','ConnectTimeout=10','chris@10.30.0.16',
+                command=['ssh',*SSH_OPTS,'chris@10.30.0.16',
                          'systemd-run','--user','--scope','-p','MemoryMax=4G','-p','CPUQuota=100%',
                          'taskset','-c','4','flock','-n','/tmp/spark-cpu-analysis.lock','python3','-B',
                          '/home/chris/spark-lab/ced-local-boundary/deployment/experiments/2026-11-06-ced-local-projection/distribute_sp567.py',
