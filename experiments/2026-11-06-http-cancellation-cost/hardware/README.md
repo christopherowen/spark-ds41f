@@ -23,6 +23,10 @@ source-overlay tests, not a claim that a new OCI image has been qualified.
 The API copies are generated artifacts of the recorded source commits; the
 ordered patch series remains the source authority.
 
+Effective argument receipts assert that only the port and middleware differ
+from the resolved parent arguments. The added middleware requires an explicit
+argument list because `serve_options` only replaces existing flags.
+
 Both profiles preserve all parent mounts, use the same TP3 triangle and node
 map, enable the same development RPC for the standard screen, and expose only
 the experiment on port 18001. Both mount identical deadline fault injection;
