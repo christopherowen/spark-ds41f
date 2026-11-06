@@ -65,7 +65,9 @@ is in preparation as C46. Native failed evidence stays failed and immutable.
 C45 compiler correction is source-ready with22 CPU controls, awaiting its final
 validated runtime base and native qualification. C40 remains the qualified base.
 
-The queue now includes25 open PRs, including eight new unique proposals916–923.
+The latest primary inventory has28 open PRs, including the new924–926 work.
+Evidence-only925 is under review; active studies remain separate. The earlier
+inventory added eight unique proposals916–923.
 Do not merge an active hardware study mid-round: #917 has expanded from its
 prior offline evidence-only head to a separate row-cost hardware screen. No
 modeled3percent benefit is credited as measured throughput. New proposals and
