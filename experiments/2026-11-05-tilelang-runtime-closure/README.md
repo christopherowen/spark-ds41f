@@ -31,6 +31,14 @@ unfavorable and inconclusive variants and tooling failures.
 The built image, real-weight quality/throughput, untraced production features
 (including Engram/vision) and physical networking remain release gates. The
 physical matrix and authorization boundary are in `fabric-qualification.md`.
+Static deployment preflight against available Spaceport files does not pass.
+The TP4 map uses switched-rail fields while the selected profile requires cabled
+peer mappings, and its API-head address differs. The switched TP3 profile also
+requires a missing local overlay. Build inputs are unprepared. These observations
+are retained in `checks-final.json`; they require site/profile reconciliation
+before deployment. Existing node-local maps were copied only into this isolated
+review checkout and remain ignored; no site configuration was promoted.
+
 No promoted configuration, immutable baseline or serving process was changed.
 
 

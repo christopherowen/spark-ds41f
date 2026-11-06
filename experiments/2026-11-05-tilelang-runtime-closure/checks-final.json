@@ -1,15 +1,101 @@
 {
-  "doctor": {
+  "prior_attempts": {
+    "prior_attempts": {
+      "initial_missing_site_map": {
+        "doctor": {
+          "exit": 1,
+          "output": "no site node map is configured: copy one of the site templates and edit it for your nodes (docs/setup.md, Site configuration):\n  4-node switched: cp config/examples/nodes-switched.json config/nodes-switched.local.json\n  4-node ring:     cp config/examples/nodes-ring4.json config/nodes-ring4.local.json\n  3-node triangle: cp config/nodes.example.json config/nodes.json"
+        },
+        "build_check": {
+          "exit": 1,
+          "output": "no site node map is configured: copy one of the site templates and edit it for your nodes (docs/setup.md, Site configuration):\n  4-node switched: cp config/examples/nodes-switched.json config/nodes-switched.local.json\n  4-node ring:     cp config/examples/nodes-ring4.json config/nodes-ring4.local.json\n  3-node triangle: cp config/nodes.example.json config/nodes.json"
+        },
+        "diff_check": {
+          "exit": 0,
+          "output": ""
+        },
+        "note": "The isolated remote review checkout has no node-local site map, so doctor/build check cannot resolve it. Existing pre-interruption checks and fresh 602-patch source proof remain retained. No image build or release promotion is claimed."
+      },
+      "node_map": {
+        "source": "/home/chris/projects/spark-ds41f/config/nodes.json",
+        "sha256": "e4642503d13c84c68e1aeeaedf14f1264e1c4b6c75e23f20e0e65b345793a8d4",
+        "note": "Existing node-local site map; linked only inside the isolated review checkout. Never committed or deployed."
+      },
+      "doctor": {
+        "exit": 1,
+        "output": "configuration paths must remain relative to the repository root"
+      },
+      "build_check": {
+        "exit": 1,
+        "output": "configuration paths must remain relative to the repository root"
+      },
+      "diff_check": {
+        "exit": 0,
+        "output": ""
+      }
+    },
+    "node_map": {
+      "source": "/home/chris/projects/spark-ds41f/config/nodes.json",
+      "sha256": "e4642503d13c84c68e1aeeaedf14f1264e1c4b6c75e23f20e0e65b345793a8d4",
+      "note": "Existing node-local map copied within this same host into the isolated configuration root; ignored by Git, never deployed."
+    },
+    "doctor": {
+      "exit": 1,
+      "output": "ERROR: sp5: roce_hcas describes a switched rail; cabled fabrics use roce_peer_hcas\nERROR: sp5: roce_peer_hcas must name peers [1, 2] in cable/rank order\nERROR: sp6: roce_hcas describes a switched rail; cabled fabrics use roce_peer_hcas\nERROR: sp6: roce_peer_hcas must name peers [0, 2] in cable/rank order\nERROR: sp7: roce_hcas describes a switched rail; cabled fabrics use roce_peer_hcas\nERROR: sp7: roce_peer_hcas must name peers [0, 1] in cable/rank order"
+    },
+    "build_check": {
+      "exit": 1,
+      "output": "WARN: .work/build/vllm-19f2c20ed4d6-b12x-236ddff04a5f-31ac0765 is not prepared; run bin/spark build prepare"
+    },
+    "diff_check": {
+      "exit": 0,
+      "output": ""
+    }
+  },
+  "node_maps": {
+    "nodes-ring4.local.json": {
+      "source": "/home/chris/projects/spark-ds41f/config/nodes-ring4.local.json",
+      "sha256": "cd0a37119b8c50df2e7f0bbc8ed99db014d36b35cfdb658b3f7ee4c88ce319f7"
+    },
+    "nodes-switched3.local.json": {
+      "source": "/home/chris/projects/spark-ds41f/config/nodes-switched3.local.json",
+      "sha256": "0c5085332439a15c4529ab3cdef429ed5872be01029f3e01bf069a6e6dd545d7"
+    },
+    "nodes-switched.local.json": {
+      "source": "/home/chris/projects/spark-ds41f/config/nodes-switched.local.json",
+      "sha256": "cd0a37119b8c50df2e7f0bbc8ed99db014d36b35cfdb658b3f7ee4c88ce319f7"
+    }
+  },
+  "note": "Validate the actual candidate-38 Spaceport profiles against existing node-local maps. Map copies stay ignored on this host; no recipe, topology or serving change.",
+  "doctor_tp4": {
+    "command": [
+      "bin/spark",
+      "--cluster-config",
+      "experiments/2026-10-26-spark-ds41f-candidate/candidate-38/tp4.json",
+      "doctor"
+    ],
     "exit": 1,
-    "output": "no site node map is configured: copy one of the site templates and edit it for your nodes (docs/setup.md, Site configuration):\n  4-node switched: cp config/examples/nodes-switched.json config/nodes-switched.local.json\n  4-node ring:     cp config/examples/nodes-ring4.json config/nodes-ring4.local.json\n  3-node triangle: cp config/nodes.example.json config/nodes.json"
+    "output": "ERROR: sp1: roce_hcas describes a switched rail; cabled fabrics use roce_peer_hcas\nERROR: sp1: roce_peer_hcas must name peers [1, 3] in cable/rank order\nERROR: sp2: roce_hcas describes a switched rail; cabled fabrics use roce_peer_hcas\nERROR: sp2: roce_peer_hcas must name peers [0, 2] in cable/rank order\nERROR: sp3: roce_hcas describes a switched rail; cabled fabrics use roce_peer_hcas\nERROR: sp3: roce_peer_hcas must name peers [1, 3] in cable/rank order\nERROR: sp4: roce_hcas describes a switched rail; cabled fabrics use roce_peer_hcas\nERROR: sp4: roce_peer_hcas must name peers [0, 2] in cable/rank order\nERROR: distributed.master_addr must match the API head's management_ip"
   },
-  "build_check": {
+  "doctor_tp3_switched": {
+    "command": [
+      "bin/spark",
+      "--cluster-config",
+      "experiments/2026-10-26-spark-ds41f-candidate/candidate-38/tp3-switched-dev.json",
+      "doctor"
+    ],
     "exit": 1,
-    "output": "no site node map is configured: copy one of the site templates and edit it for your nodes (docs/setup.md, Site configuration):\n  4-node switched: cp config/examples/nodes-switched.json config/nodes-switched.local.json\n  4-node ring:     cp config/examples/nodes-ring4.json config/nodes-ring4.local.json\n  3-node triangle: cp config/nodes.example.json config/nodes.json"
+    "output": "configuration file does not exist: config/candidate-38-tp3-switched-dev.local.json"
   },
-  "diff_check": {
-    "exit": 0,
-    "output": ""
-  },
-  "note": "The isolated remote review checkout has no node-local site map, so doctor/build check cannot resolve it. Existing pre-interruption checks and fresh 602-patch source proof remain retained. No image build or release promotion is claimed."
+  "build_check_tp4": {
+    "command": [
+      "bin/spark",
+      "--cluster-config",
+      "experiments/2026-10-26-spark-ds41f-candidate/candidate-38/tp4.json",
+      "build",
+      "check"
+    ],
+    "exit": 1,
+    "output": "WARN: .work/build/vllm-19f2c20ed4d6-b12x-236ddff04a5f-05dd5db6 is not prepared; run bin/spark build prepare"
+  }
 }

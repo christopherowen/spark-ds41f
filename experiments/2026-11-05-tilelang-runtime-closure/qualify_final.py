@@ -175,6 +175,7 @@ result = dict(candidate=read(HERE / "candidate.json"), run_map=run_map, passed=p
               iket=iket, full_model=full,
               scope="Changed GPU paths, complete changed-path CPU result transfers, and the recorded 43-layer dummy-weight request. Both boots must pass a five-standard-error upper ratio <=1 or proven identical GPU program/bindings.",
               remaining_release_gates=["built image", "real-weight quality and throughput",
+                                      "Spaceport site/profile reconciliation: TP4 fabric/master address and TP3 local overlay",
                                       "physical multi-node networking, including bulk NCCL",
                                       "untraced production features/workloads, including Engram and vision"])
 a.out.write_text(json.dumps(result, indent=2) + "\n")
