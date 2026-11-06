@@ -34,7 +34,7 @@ def tokenize(url, model, messages, tools):
         return json.load(r)["tokens"]
 
 
-def request(url, model, prompt, salt, label, cancel=False):
+def request(url, model, prompt, salt, label, cancel=False, server_abort=False):
     started = time.monotonic()
     receipt = {"label": label, "prompt_tokens": len(prompt), "prompt_sha256": digest(prompt),
                "cache_salt": salt, "client_request_id": f"prefix-{salt}-{label}", "token_ids": [], "logprobs": [], "ttft_s": None}
@@ -50,6 +50,12 @@ def request(url, model, prompt, salt, label, cancel=False):
                 time.sleep(0.2)
                 receipt["cancelled_by_client"] = True
             else:
+                if server_abort:
+                    time.sleep(0.2)
+                    external_id = f"cmpl-{receipt['client_request_id']}-0"
+                    with post(url + "/abort_requests", {"request_ids": [external_id]}) as aborted:
+                        receipt['abort_response'] = json.load(aborted)
+                    receipt['abort_external_id'] = external_id
                 for line in response:
                     if not line.startswith(b"data: ") or line.strip() == b"data: [DONE]":
                         continue
@@ -59,6 +65,8 @@ def request(url, model, prompt, salt, label, cancel=False):
                     if data.get("usage"):
                         receipt["usage"] = data["usage"]
                     for choice in data.get("choices", []):
+                        if choice.get('finish_reason'):
+                            receipt.setdefault('finish_reasons', []).append(choice['finish_reason'])
                         ids = choice.get("token_ids") or []
                         if receipt["ttft_s"] is None and (ids or choice.get("text")):
                             receipt["ttft_s"] = time.monotonic() - started
@@ -72,8 +80,13 @@ def request(url, model, prompt, salt, label, cancel=False):
             receipt["uncached_tokens"] = usage["prompt_tokens"] - receipt["cached_tokens"]
             assert usage["prompt_tokens"] == len(prompt)
             assert 0 <= receipt["cached_tokens"] <= len(prompt)
-            assert len(receipt["token_ids"]) == len(receipt["logprobs"]) == 64
-            assert receipt["ttft_s"] is not None
+            if server_abort:
+                assert receipt.get('finish_reasons') == ['abort'], 'server did not confirm request abort'
+                assert receipt['token_ids'] == receipt['logprobs'] == [], 'request emitted output before abort'
+                receipt['server_confirmed_abort_before_output'] = True
+            else:
+                assert len(receipt["token_ids"]) == len(receipt["logprobs"]) == 64
+                assert receipt["ttft_s"] is not None
     except Exception as error:
         receipt["error"] = repr(error)
     receipt["wall_s"] = time.monotonic() - started
@@ -214,6 +227,8 @@ def main():
     compare(changed_result, save(request(args.url, args.model, changed_ids, nonce + "-changed-cold", "changed-prefix-cold")))
     save(request(args.url, args.model, prompts[-1], nonce + "-cancel", "cancel-prefill", cancel=True))
     compare(cold[-1], save(request(args.url, args.model, prompts[-1], nonce + "-cancel", "after-cancel")))
+    save(request(args.url, args.model, prompts[-1], nonce + "-server-abort", "server-abort-prefill", server_abort=True))
+    compare(cold[-1], save(request(args.url, args.model, prompts[-1], nonce + "-server-abort", "after-server-abort")))
     compare(cold[1], save(request(args.url, args.model, prompts[1], nonce + "-warm", "before-pressure-prime")))
     pressure_baseline = save(request(args.url, args.model, prompts[1], nonce + "-warm", "pressure-baseline"))
     compare(cold[1], pressure_baseline)

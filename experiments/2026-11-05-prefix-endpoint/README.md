@@ -160,3 +160,9 @@ The window-aware harness and restoration helper pass 20 CPU tests; the current
 comparison plan and offline TP3 doctor also pass. These are preparation checks, not
 hardware gains. Heartbeats must be written atomically so concurrent request checks
 never see a partial hold file.
+
+The cancellation gate also aborts one named request through the existing developer
+endpoint. It requires the stream itself to finish with `abort` before any output
+token, then retries the same cached prompt and compares exact output. An HTTP
+acknowledgement alone is insufficient. This confirms server-side cancellation
+before output; the receipt does not by itself prove how many prefill rows executed.

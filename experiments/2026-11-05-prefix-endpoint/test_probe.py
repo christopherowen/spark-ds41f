@@ -42,5 +42,24 @@ class ProbeTest(unittest.TestCase):
         self.assertEqual(probe.common_prefix([1,2],[1,2,3]),2)
 
 
+    def test_server_abort_requires_stream_confirmation_before_output(self):
+        response = events({'choices': [{'finish_reason': 'abort', 'token_ids': []}],
+                           'usage': {'prompt_tokens': 256, 'prompt_tokens_details': {'cached_tokens': 0}}})
+        with patch.object(probe, 'post', side_effect=[response, io.BytesIO(b'{"status":"aborted","aborted":1}')]) as post, patch.object(probe.time, 'sleep'):
+            r = probe.request('http://unused', 'model', list(range(256)), 'salt', 'abort', server_abort=True)
+        self.assertNotIn('error', r)
+        self.assertTrue(r['server_confirmed_abort_before_output'])
+        self.assertEqual(post.call_args.args[1], {'request_ids': ['cmpl-prefix-salt-abort-0']})
+        self.assertIsNone(r['ttft_s'])
+
+    def test_abort_http_ack_alone_is_not_confirmation(self):
+        response = events({'choices': [{'finish_reason': 'length', 'token_ids': []}],
+                           'usage': {'prompt_tokens': 2, 'prompt_tokens_details': {'cached_tokens': 0}}})
+        with patch.object(probe, 'post', side_effect=[response, io.BytesIO(b'{"status":"aborted","aborted":1}')]), patch.object(probe.time, 'sleep'):
+            r = probe.request('http://unused', 'model', [1, 2], 'salt', 'abort', server_abort=True)
+        self.assertIn('error', r)
+        self.assertNotIn('server_confirmed_abort_before_output', r)
+
+
 if __name__=='__main__':
     unittest.main()
