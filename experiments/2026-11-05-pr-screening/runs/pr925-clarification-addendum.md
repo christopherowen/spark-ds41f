@@ -39,3 +39,19 @@ Archive integrity and offline performance reproduction are separate from model
 report revalidation and release acceptance. The three model reports remain
 outside the archive and require their own safe node-local verification; this
 addendum grants no serving access, measurement rerun or promotion.
+
+## Subsequent integrity verification, 2026-11-06 03:35 UTC
+
+All three private model reports now independently match their published sizes
+and SHA256 identities at the original DGX1 paths. The recovery snapshot paths
+were absent; the first failed path-only attempt is retained. The second bounded
+hash job read the original files without decoding, copying their text, sending
+model requests or repeating a measurement. It used one CPU,256MiB memory and
+zero swap; actual wait exit0,8MiB peak memory,0 swap. Its matching CPU claim was
+removed and both shared CPU locks were independently available afterward.
+
+This closes the private-byte integrity gap, not an independent repetition of
+the model comparison or native gates. The archive and saved performance analysis
+were independently checked as recorded above. PR925 was merged at
+`48c6fa1538a8afd261247b249ee9180baece8340` as evidence only; the runtime, release
+and all original limitations are unchanged.

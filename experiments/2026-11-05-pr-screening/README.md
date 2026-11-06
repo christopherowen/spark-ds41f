@@ -84,8 +84,10 @@ pass both static example-map doctors and retain the corrected compiler identity.
 
 Evidence-only925's187 archive members pass independent size/hash verification,
 and its original performance analysis/core summary reproduce exactly on SP8.
-Three private model files are absent there and remain pending separate safe
-verification. Its memory finding is not an incremental C36 gain; C36 already
+The three private model reports subsequently passed independent hash checks
+at their original DGX1 paths under a bounded CPU-only job; the absent snapshot
+path failure remains preserved. PR925 is merged as evidence only. No native
+gate, model comparison or serving measurement was repeated. Its memory finding is not an incremental C36 gain; C36 already
 selects expert-scale compaction, while packed Engram support and selection are
 distinct. The addendum retains original scripts/results and all adverse rows.
 Active studies remain separate. The earlier inventory added eight proposals916–923.
