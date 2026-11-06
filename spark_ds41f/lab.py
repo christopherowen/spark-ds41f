@@ -73,6 +73,7 @@ ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 import spark_ds41f as spark
+from spark_ds41f import functional_evidence
 _agentx_loader = importlib.machinery.SourceFileLoader("agentx", str(ROOT / "scripts" / "agentx.py"))
 agentx = importlib.util.module_from_spec(importlib.util.spec_from_loader("agentx", _agentx_loader))
 _agentx_loader.exec_module(agentx)
@@ -897,8 +898,13 @@ def measure_steps(spec: dict, job: dict) -> list[dict]:
     profile = dict(PROFILES[job.get("profile", "lean")])
     if "extras" in job:  # [[script, [args...], stem], ...]: the job's own workloads
         profile["extras"] = [tuple(extra) for extra in job["extras"]]
+    contracts = functional_evidence.contracts_for_extras(job, profile["extras"])
+    if contracts and job.get("bench", True):
+        raise ValueError("declared evidence requires bench:false; run timing after the functional phase succeeds")
     arms = list(job["arms"])
     if "suite" in job:
+        if contracts:
+            raise ValueError("extra evidence contracts cannot be attached to a suite job")
         return suite_steps(spec, job, arms)
     if job.get("bracket") and len(arms) > 1:
         first = dict(arms[0])
@@ -922,9 +928,14 @@ def measure_steps(spec: dict, job: dict) -> list[dict]:
             # A bare name is the experiment's own script; a path is repository-relative.
             # "{label}" and "{run}" in an argument become the arm's label and the run's name.
             extra = [str(a).replace("{label}", label).replace("{run}", run) for a in extra]
-            steps.append({"kind": "script", "label": label, "telemetry": job.get("telemetry", True),
-                          "argv": [arm_config_path(experiment, script), head_url(), *extra],
-                          "out": f"{out}/{stem}-{label}.jsonl"})
+            step = {"kind": "script", "label": label, "telemetry": job.get("telemetry", True),
+                    "argv": [arm_config_path(experiment, script), head_url(), *extra],
+                    "out": f"{out}/{stem}-{label}.jsonl"}
+            if stem in contracts:
+                step["evidence"] = contracts[stem]
+                if contracts[stem].get("record_requests"):
+                    step["argv"] += ["--record-dir", f"{out}/{stem}-{label}.requests"]
+            steps.append(step)
     table = profile.get("table", f"{experiment}/tables_arms.py")
     steps.append({"kind": "table", "argv": [table, run, *[a["label"] for a in arms]],
                   "out": f"results/private/lab/{run}-table.txt",
@@ -1294,6 +1305,16 @@ def plan_problems(steps: list[dict]) -> list[str]:
         if step["kind"] not in ("script", "profile"):
             continue
         script, args = step["argv"][0], step["argv"][1:]
+        if "evidence" in step:
+            try:
+                functional_evidence.validate_contract(step["evidence"])
+            except (TypeError, ValueError) as error:
+                problems.append(f"{script}: invalid evidence contract: {error}")
+            prior = [ROOT / step["out"], ROOT / (step["out"] + ".evidence.json")]
+            if isinstance(step["evidence"], dict) and step["evidence"].get("record_requests"):
+                prior.append((ROOT / step["out"]).with_suffix(".requests"))
+            if any(path.exists() for path in prior):
+                problems.append(f"{step['out']}: prior required evidence exists; use a distinct run")
         if not (ROOT / script).is_file():
             problems.append(f"script {script} does not exist")
         elif script in SERVEBENCH_SHIMS:
@@ -1409,9 +1430,25 @@ def describe_step(step: dict) -> str:
 def run_script(step: dict) -> int:
     out = ROOT / step["out"]
     out.parent.mkdir(parents=True, exist_ok=True)
-    with out.open("w") as handle:
-        return subprocess.run([sys.executable, *step["argv"]], cwd=ROOT, stdout=handle,
+    declared = "evidence" in step
+    evidence_out = Path(str(out) + ".evidence.json")
+    if declared and evidence_out.exists():
+        raise FileExistsError(f"prior evidence exists: {evidence_out}")
+    with out.open("x" if declared else "w") as handle:
+        code = subprocess.run([sys.executable, *step["argv"]], cwd=ROOT, stdout=handle,
                               stderr=subprocess.STDOUT).returncode
+    if not declared:
+        return code
+    result = functional_evidence.evaluate(out, step["evidence"])
+    result["process_exit"] = code
+    if code:
+        result["errors"].append(f"collector exited {code}")
+        result.update(required_evidence_passed=False, status="failed")
+    write_json_atomic(evidence_out, result)
+    if not result["required_evidence_passed"]:
+        log(f"required evidence failed: {evidence_out}: {'; '.join(result['errors'])}")
+        return code or 1
+    return 0
 
 
 def run_logged(argv: list[str], log_path: str) -> int:
@@ -1975,6 +2012,9 @@ def execute(spec: dict, dry: bool, keep_open: bool, close_on_failure: bool = Tru
                 log(f"{Path(step['argv'][0]).name} {step.get('label', '')} exit {code}")
                 if code:
                     save_engine_logs(step["out"], config=booted)
+                    if "evidence" in step:
+                        failed = f"required evidence failed for {step['out']} (exit {code})"
+                        break
             elif step["kind"] == "agentx_prepare":
                 if agentx_prepared(step):
                     log(f"{step['dataset']} seed {step['seed']} already rebuilt on this host")
