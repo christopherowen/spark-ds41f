@@ -88,6 +88,17 @@ The final hardware controller at `11606218` passed thirteen remote runner tests,
 all three doctors and both dry plans (0.11 s / 26,048 KiB maximum test RSS);
 the native preflight receipts remain on sp8 under
 `~/spark-lab/verification-budget-replay/logs/bounded-arm-11606218/`.
+After merging `main` (`297c0663e`, including `functional_evidence.py` and
+`sampled_digest.py --record-dir` from PR #934), the updated controller at
+`e151ea35` passed sixteen runner tests (0.25 s / 29,716 KiB maximum RSS, zero
+swaps), fifteen functional-evidence tests (0.19 s / 28,196 KiB maximum RSS,
+zero swaps), `bin/spark doctor` on default and all three profiles, both dry
+plans, and `git diff --check` on `sp8` under one CPU core and 2 GiB; see
+`runs/preflight/sampled-contract-e151ea35/`. An initial test run at `7741fcf2`
+failed in the unit-test mock (`mock-attempt-7741fcf2-tests.txt`) because
+`ThreadPoolExecutor(max_workers=1)` runs `c1` on a worker thread while the
+mock used `threading.main_thread()` to distinguish `c1` from `c8`/`c16`; indexing
+mock passes by request count resolved that test-fixture bug.
 
 The first window, `dgx1-1793922050`, subsequently opened from the captured
 original commit `2c4b23af` and synchronized the three clean checkouts to
