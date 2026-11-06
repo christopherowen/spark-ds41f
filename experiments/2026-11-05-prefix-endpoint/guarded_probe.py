@@ -50,6 +50,8 @@ def main():
         peak = None
         code = 1
         try:
+            if identity['client_dirty'] or any(row['checkout'] != identity['client_commit'] for row in identity['nodes'].values()):
+                raise RuntimeError('Client or serving-rank checkout differs from the clean published experiment')
             if identity['live_problems']:
                 raise RuntimeError('; '.join(identity['live_problems']))
             memory = MemoryWatch(nodes, float(cluster['host']['memguard_gib']) + 1, halt)

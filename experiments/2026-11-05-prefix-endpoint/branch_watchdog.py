@@ -9,6 +9,7 @@ import datetime as dt
 import fcntl
 import json
 import subprocess
+import sys
 import time
 from pathlib import Path
 
@@ -51,6 +52,52 @@ def verify_plan(action, text):
             raise RuntimeError('start: missing or changed shape')
 
 
+def validate_restored_snapshot(state, snapshot):
+    rows = snapshot['nodes']
+    if set(rows) != set(state['restore_nodes']):
+        raise RuntimeError('Restore snapshot has a missing or unexpected rank')
+    for name, row in rows.items():
+        if row['checkout'] != state['restore_commit'] or row['dirty']:
+            raise RuntimeError(f'{name}: original clean checkout is not restored')
+        if not row['running']:
+            raise RuntimeError(f'{name}: original service is not running')
+        if row['image_id'] != state['restore_image_id'] or row['image_tag'] != state['restore_image_tag']:
+            raise RuntimeError(f'{name}: original image is not restored')
+        if row['profile'] != state['restore_profile'] or not row['origin_matches']:
+            raise RuntimeError(f'{name}: original profile/repository is not restored')
+    if not snapshot['api_ready']:
+        raise RuntimeError('Original API is not ready')
+
+
+def verify_restored(state, controller, output):
+    # Load the captured controller's own recipe and SSH helpers. doctor --live
+    # alone permits missing containers as warnings and does not verify checkouts.
+    script = r"""
+import argparse, json, sys
+from spark_ds41f.config import configuration, head_node, run_ssh
+from spark_ds41f.cluster import remote_repository_state, normalized_repository_url
+state = json.loads(sys.argv[1])
+cluster, nodes, _ = configuration(argparse.Namespace(cluster_config=state['restore_profile']))
+record = {'nodes': {}}
+for node in nodes['nodes']:
+    revision, origin, dirty = remote_repository_state(cluster, nodes, node)
+    inspected = run_ssh(nodes, node, 'docker', 'inspect', cluster['container']['name'])
+    if inspected.returncode:
+        raise RuntimeError(f"{node['name']}: original container is absent or inaccessible")
+    container = json.loads(inspected.stdout)[0]
+    record['nodes'][node['name']] = {
+        'checkout': revision, 'dirty': dirty, 'running': container['State']['Running'],
+        'image_id': container['Image'], 'image_tag': container['Config']['Image'],
+        'profile': (container['Config'].get('Labels') or {}).get('spark.cluster-config'),
+        'origin_matches': normalized_repository_url(origin) == normalized_repository_url(cluster['deployment']['repository'])}
+ready = run_ssh(nodes, head_node(nodes), 'curl', '--fail', '--silent', '--show-error', '--max-time', '5', cluster['deployment']['ready_url'])
+record['api_ready'] = ready.returncode == 0
+print(json.dumps(record))
+"""
+    snapshot = json.loads(checked([sys.executable, '-c', script, json.dumps(state)], controller, output))
+    validate_restored_snapshot(state, snapshot)
+
+
 def restore(state, hold_path, output):
     controller = Path(state['restore_controller'])
     output.mkdir(parents=True, exist_ok=False)
@@ -71,6 +118,7 @@ def restore(state, hold_path, output):
     already_restored = False
     try:
         checked([*base, 'doctor', '--live'], controller, output / 'doctor-before.txt')
+        verify_restored(state, controller, output / 'snapshot-before.json')
         already_restored = True
     except RuntimeError:
         pass
@@ -86,6 +134,7 @@ def restore(state, hold_path, output):
         own()
         checked([*base, 'doctor', '--live'], controller, output / 'doctor-live.txt')
     own()
+    verify_restored(state, controller, output / 'snapshot-final.json')
     (output / 'restored.json').write_text(json.dumps({
         'window': state['window'], 'commit': state['restore_commit'],
         'profile': state['restore_profile'], 'image': actual, 'restored': True}, indent=2) + '\n')

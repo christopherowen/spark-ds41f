@@ -107,9 +107,12 @@ valid outcomes; neither PR becomes ready on CPU results alone.
 `branch_watchdog.py` restores through a separate clean controller pinned to the
 captured original SHA. Its state file records `window`, exact `holder`, `hold_path`,
 `restore_controller`, `restore_commit`, `restore_profile`, `restore_image_tag`,
-`restore_image_id`, `operation_lock`, `restore_receipts` and `activity_markers`.
+`restore_image_id`, `restore_nodes`, `operation_lock`, `restore_receipts` and `activity_markers`.
 The restore controller runs on the head so its local Docker image is the captured
-source for coordinated distribution. Preserve the sites selected node map there.nnStart the new watchdog and verify its ready receipt/PID before replacing the ordinarynwatchdog for this same window. Never stop another windows watchdog. Hold the named
+source for coordinated distribution. Preserve the site's selected node map there.
+
+Start the new watchdog and verify its ready receipt/PID before replacing the ordinary
+watchdog for this same window. Never stop another window's watchdog. Hold the named
 operation lock around every coordinated mutation. Create an activity marker before
 a build, smoke or probe and remove it only after confirming that job exited. The
 watchdog restores service after a stale heartbeat, but retains the hold if any job
@@ -156,3 +159,8 @@ inconclusive; including zero alone does not establish preservation. Report the
 applicable repository margin/noise bound, observed repeat drift and any residual
 uncertainty. Do not let unproved optional dense-retention or private-snapshot tuning
 block an otherwise evidenced repair.
+
+The final restore check additionally requires every recorded rank to be running
+the exact original image/profile, a clean checkout at the original SHA, matching
+repository origins, and a ready API. A successful doctor alone cannot release the
+hold: a missing serving container can be a doctor warning.
