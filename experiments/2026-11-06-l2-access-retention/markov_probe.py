@@ -45,7 +45,7 @@ def window(stream, tensor=None, fraction=1.0):
     w.missProp = cu.CUaccessProperty.CU_ACCESS_PROPERTY_NORMAL
     check(cu.cuStreamSetAttribute(
         cu.CUstream(stream.cuda_stream),
-        cu.CUstreamAttrID.CU_STREAM_ATTRIBUTE_ACCESS_POLICY_WINDOW, value))
+        cu.CUstreamAttrID.CU_LAUNCH_ATTRIBUTE_ACCESS_POLICY_WINDOW, value))
 
 
 def graph_kernels(graph):
@@ -60,7 +60,7 @@ def graph_windows(graph):
     result = []
     for node in graph_kernels(graph):
         value = check(cu.cuGraphKernelNodeGetAttribute(
-            node, cu.CUkernelNodeAttrID.CU_KERNEL_NODE_ATTRIBUTE_ACCESS_POLICY_WINDOW))
+            node, cu.CUkernelNodeAttrID.CU_LAUNCH_ATTRIBUTE_ACCESS_POLICY_WINDOW))
         w = value.accessPolicyWindow
         result.append([int(w.num_bytes), float(w.hitRatio), int(w.hitProp),
                        int(w.base_ptr), int(w.missProp)])
@@ -77,7 +77,7 @@ def explicit_graph_window(graph, tensor, fraction):
     w.missProp = cu.CUaccessProperty.CU_ACCESS_PROPERTY_NORMAL
     for node in graph_kernels(graph):
         check(cu.cuGraphKernelNodeSetAttribute(
-            node, cu.CUkernelNodeAttrID.CU_KERNEL_NODE_ATTRIBUTE_ACCESS_POLICY_WINDOW, value))
+            node, cu.CUkernelNodeAttrID.CU_LAUNCH_ATTRIBUTE_ACCESS_POLICY_WINDOW, value))
 
 
 def main():
@@ -100,11 +100,14 @@ def main():
         '2026-10-25-moe-overlap/bundles/l2-policy/l2_policy_probe.py')
     prior = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(prior)
+    dev = check(cu.cuDeviceGet(0))
+    ctx = check(cu.cuDevicePrimaryCtxRetain(dev))
+    check(cu.cuCtxSetCurrent(ctx))
     read = prior.read_kernel('default')
     pref = l2_prefetch_kernel(2, 128, 4096)
+    check(cu.cuCtxSetCurrent(ctx))
     limit = cu.CUlimit.CU_LIMIT_PERSISTING_L2_CACHE_SIZE
     original = int(check(cu.cuCtxGetLimit(limit)))
-    dev = check(cu.cuDeviceGet(0))
     maximum = int(check(cu.cuDeviceGetAttribute(
         cu.CUdevice_attribute.CU_DEVICE_ATTRIBUTE_MAX_PERSISTING_L2_CACHE_SIZE, dev)))
     maximum_window = int(check(cu.cuDeviceGetAttribute(
@@ -148,6 +151,7 @@ def main():
                 n, 256, packed.exponent_base, block_M=16, out_dtype=T.float32, **config)
             tiles = (n + config['block_N'] - 1) // config['block_N']
             finish = finish_vocab_greedy_pairs(tiles, pair_width=4, top2=True)
+            check(cu.cuCtxSetCurrent(ctx))
             b = packed.values.numel()
             assert b <= maximum_window
             segs = torch.tensor([packed.values.data_ptr(), b], device='cuda', dtype=torch.int64)
