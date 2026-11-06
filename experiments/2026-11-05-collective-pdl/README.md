@@ -121,7 +121,11 @@ below 55 C and maintains the window
 heartbeat. Management uncertainty stops further launches and retains the hold.
 
 The synthetic matrix has 7 row counts, all-reduce/all-gather/mixed chains and
-0/4/32 MiB of concurrent copy work. Each case has 40 samples of 16 graph chains.
+0/4/32 MiB of concurrent copy work. Each case has 40 samples of 16 graph chains. External CUDA event-record
+nodes inside the captured graph exclude host enqueue gaps from the timer.
+Each process must first distinguish short and long captured device delays, so
+stale or ineffective timing-event handles cannot supply accepted samples.
+That timer check still requires its first GPU execution.
 Two fresh process runs reverse the variant order. All rank samples, exact-output
 checks, graph/compile warmup, memory and thermal evidence are retained. Background
 cases fork a side stream after the producer, so that event orders the producer;

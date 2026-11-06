@@ -296,6 +296,8 @@ def main():
                                     "rank":item["node"]["rank"],"world_size":3}
                         if any(data.get(key) != value for key,value in expected.items()):
                             problems.append("benchmark identity differs")
+                        if data.get("timer_check",{}).get("long_delay_distinguished") is not True:
+                            problems.append("captured timing events were not validated")
                         matrix = {(r,o,b) for r in (1,6,9,16,24,48,96) for o in ("all_reduce","all_gather","mixed") for b in (0,4,32)}
                         cases = data.get("cases",[])
                         if len(cases) != len(matrix) or {(r["rows"],r["operation"],r["background_mib"]) for r in cases} != matrix:

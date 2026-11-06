@@ -39,6 +39,30 @@ def copy_kernel(fixed_grid: int):
     return copy
 
 
+def check_captured_timer(stream):
+    """A long device delay must change the replayed event interval, not a stale handle."""
+    measured={}
+    for cycles in (1<<20,32<<20):
+        begin,end=(torch.cuda.Event(enable_timing=True,external=True),
+                   torch.cuda.Event(enable_timing=True,external=True))
+        begin.record(stream);end.record(stream);end.synchronize()
+        graph=torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph,stream=stream):
+            begin.record(stream)
+            torch.cuda._sleep(cycles)
+            end.record(stream)
+        for _ in range(3): graph.replay()
+        end.synchronize()
+        samples=[]
+        for _ in range(3):
+            graph.replay();end.synchronize()
+            samples.append(begin.elapsed_time(end))
+        measured[cycles]=samples
+    assert min(measured[32<<20]) > 2*max(measured[1<<20]), measured
+    return {"cycles_to_ms":measured,"long_delay_distinguished":True,
+            "scope":"timer integrity check, not candidate performance"}
+
+
 def cpu_stat():
     values={key:int(value) for key,value in (line.split() for line in Path("/sys/fs/cgroup/cpu.stat").read_text().splitlines())}
     if "nr_throttled" not in values: raise RuntimeError("cgroup CPU throttling counters unavailable")
@@ -68,6 +92,8 @@ def main():
     runtime.prepare((torch.bfloat16,), padded_gather=True)
     copier, side_copy = copy_kernel(0), copy_kernel(64)
     stream, side = torch.cuda.Stream(), torch.cuda.Stream()
+    timer_check=check_captured_timer(stream)
+    dist.barrier()
     scratch = torch.full((16<<20,), 0.5, dtype=torch.bfloat16, device="cuda")
     scratch_out = torch.empty_like(scratch)
     records = []
@@ -107,17 +133,25 @@ def main():
                     torch.cuda.synchronize();dist.barrier()
                     assert torch.equal(output,expected), (rows,operation,background_mib,"warmup")
                     graph = torch.cuda.CUDAGraph()
+                    start,end = (torch.cuda.Event(enable_timing=True,external=True),
+                                 torch.cuda.Event(enable_timing=True,external=True))
+                    # Initialize handles before capture. Record nodes inside the
+                    # graph exclude the host's event-to-graph enqueue gap.
+                    start.record(stream);end.record(stream);end.synchronize()
                     with torch.cuda.graph(graph,stream=stream),runtime.capture(stream=stream):
+                        start.record(stream)
                         for _ in range(args.calls_per_graph): chain()
+                        end.record(stream)
                     for _ in range(3): graph.replay()
                     torch.cuda.synchronize();dist.barrier()
                     samples=[]
                     cpu_before=cpu_stat()
                     for sample in range(args.samples):
                         dist.barrier()
-                        start,end = torch.cuda.Event(enable_timing=True),torch.cuda.Event(enable_timing=True)
-                        start.record();graph.replay();end.record();end.synchronize()
-                        samples.append(start.elapsed_time(end)*1000/args.calls_per_graph)
+                        graph.replay();end.synchronize()
+                        elapsed=start.elapsed_time(end)*1000/args.calls_per_graph
+                        assert elapsed > 0, "captured timing events produced no interval"
+                        samples.append(elapsed)
                     cpu_after=cpu_stat()
                     cpu_delta={key:cpu_after[key]-cpu_before[key] for key in cpu_before}
                     rank_cpu_deltas=[None]*world
@@ -142,11 +176,12 @@ def main():
         torch.cuda.synchronize()
         result={"variant":args.variant,"source_commit":args.source_commit,"run":args.run,
                 "rank":rank,"world_size":world,"kernel_hashes":kernels,"cases":records,
+                "timer_check":timer_check,
                 "process":{"pid":os.getpid(),"started_unix":started,"ended_unix":time.time()},
                 "workload":{"width":5120,"dtype":"bfloat16","samples":args.samples,
                             "calls_per_graph":args.calls_per_graph,"eager_warmup":4,"graph_warmup":3,
                             "cache_policy":"fresh process; image cache plus source-hash JIT; no explicit eviction; data and side-copy buffers reused across replays",
-                            "timing":"CUDA events per replay; Gloo barrier before each sample; slowest rank per sample"},
+                            "timing":"external CUDA event-record nodes inside the captured graph; host enqueue gap excluded; Gloo barrier before each replay; slowest rank per sample"},
                 "software":{"torch":torch.__version__,"cuda":torch.version.cuda,
                             "tilelang":getattr(tilelang,"__version__",None)},
                 "device":{"name":torch.cuda.get_device_name(0),"capability":torch.cuda.get_device_capability(0)},
