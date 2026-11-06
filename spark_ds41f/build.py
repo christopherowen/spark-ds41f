@@ -213,6 +213,8 @@ BUILD_MEMORY_PER_JOB_GIB = 8
 BUILD_NVCC_THREADS = 2
 BUILD_CPU_RESERVE = 4
 BUILD_MAX_JOBS = 10
+# docker/Dockerfile's unchanged default when no explicit cap is requested.
+BUILD_NCCL_JOBS = 4
 SMOKE_MEMORY_GIB = 16
 BUILD_LOCK = Path("/tmp/spark-build.lock")
 SMOKE_SCRIPT = """\
@@ -1047,7 +1049,9 @@ def available_memory_gib() -> float:
     raise SystemExit("cannot read host MemAvailable")
 
 
-def compile_jobs(available_gib: float) -> int:
+def compile_jobs(available_gib: float, max_jobs: int | None = None) -> int:
+    if max_jobs is not None and (type(max_jobs) is not int or max_jobs < 1):
+        raise SystemExit("--max-compile-jobs must be a positive integer")
     if available_gib < BUILD_MIN_AVAILABLE_GIB:
         raise SystemExit(
             f"the build needs {BUILD_MIN_AVAILABLE_GIB} GiB MemAvailable to start; "
@@ -1055,7 +1059,8 @@ def compile_jobs(available_gib: float) -> int:
         )
     cpu_jobs = max(1, (len(os.sched_getaffinity(0)) - BUILD_CPU_RESERVE) // BUILD_NVCC_THREADS)
     memory_jobs = int((available_gib - BUILD_RESERVE_GIB) // BUILD_MEMORY_PER_JOB_GIB)
-    return min(BUILD_MAX_JOBS, cpu_jobs, memory_jobs)
+    limits = (BUILD_MAX_JOBS, cpu_jobs, memory_jobs)
+    return min(*limits, max_jobs) if max_jobs is not None else min(limits)
 
 
 def cancel_process_group(process: subprocess.Popen) -> None:
@@ -1139,19 +1144,21 @@ def image_labels(tag: str) -> dict | None:
     return {"id": inspection["Id"], "labels": inspection["Config"].get("Labels") or {}}
 
 
-def smoke_image(cluster: dict, tag: str, script: str = SMOKE_SCRIPT) -> None:
+def smoke_image(cluster: dict, tag: str, script: str = SMOKE_SCRIPT, max_cpus: int | None = None) -> None:
+    if max_cpus is not None and (type(max_cpus) is not int or max_cpus < 1):
+        raise SystemExit("smoke CPU limit must be a positive integer")
     require_idle_build_host(cluster)
     available = available_memory_gib()
     if available < SMOKE_MEMORY_GIB + 8:
         raise SystemExit(
             f"the GPU import smoke needs {SMOKE_MEMORY_GIB + 8} GiB MemAvailable; found {available:.1f} GiB"
         )
+    command = ["docker", "run", "--rm", "-i", "--gpus", "all", "--ulimit=core=0",
+               f"--memory={SMOKE_MEMORY_GIB}g", f"--memory-swap={SMOKE_MEMORY_GIB}g"]
+    if max_cpus is not None:
+        command += ["--cpus", str(max_cpus)]
     subprocess.run(
-        [
-            "docker", "run", "--rm", "-i", "--gpus", "all", "--ulimit=core=0",
-            f"--memory={SMOKE_MEMORY_GIB}g", f"--memory-swap={SMOKE_MEMORY_GIB}g",
-            "--entrypoint", "/usr/bin/python3", tag, "-",
-        ],
+        command + ["--entrypoint", "/usr/bin/python3", tag, "-"],
         input=script,
         text=True,
         check=True,
@@ -1159,6 +1166,9 @@ def smoke_image(cluster: dict, tag: str, script: str = SMOKE_SCRIPT) -> None:
 
 
 def command_build_image(args: argparse.Namespace) -> int:
+    max_jobs = getattr(args, "max_compile_jobs", None)
+    if max_jobs is not None and (type(max_jobs) is not int or max_jobs < 1):
+        raise SystemExit("--max-compile-jobs must be a positive integer")
     require_named_profile(args)
     cluster, _, upstreams = configuration(args)
     inputs = build_inputs(upstreams)
@@ -1192,6 +1202,11 @@ def command_build_image(args: argparse.Namespace) -> int:
             "VLLM_COMPILE_JOBS": str(jobs),
             "VLLM_NVCC_THREADS": str(BUILD_NVCC_THREADS),
         }
+        if max_jobs is not None:
+            nccl_jobs = min(BUILD_NCCL_JOBS, max_jobs)
+            if isinstance(jobs, int):
+                nccl_jobs = min(nccl_jobs, jobs)
+            build_args["NCCL_COMPILE_JOBS"] = str(nccl_jobs)
         for name in build_projects(inputs):
             record = inputs[name]
             prefix = name.upper()
@@ -1215,7 +1230,8 @@ def command_build_image(args: argparse.Namespace) -> int:
         return rendered + [str(context / "empty")]
 
     if not args.apply:
-        print(shlex.join(command("<sized from MemAvailable>")))
+        sized = "<sized from MemAvailable>" if max_jobs is None else f"<at most {max_jobs}; sized from MemAvailable>"
+        print(shlex.join(command(sized)))
         print("plan only; pass --apply on an idle build host to build and smoke-test")
         return 0
     lock = BUILD_LOCK.open("w")
@@ -1227,7 +1243,7 @@ def command_build_image(args: argparse.Namespace) -> int:
     if image_labels(tag) is not None:
         raise SystemExit(f"{tag} already exists here; pass --tag with a new tag rather than overwrite it")
     available = available_memory_gib()
-    jobs = compile_jobs(available)
+    jobs = compile_jobs(available, max_jobs)
     print(
         f"building {tag} from {directory.relative_to(ROOT)}: {jobs} compile jobs x "
         f"{BUILD_NVCC_THREADS} NVCC threads, {available:.1f} GiB available, "
@@ -1245,7 +1261,11 @@ def command_build_image(args: argparse.Namespace) -> int:
         if label != inputs[name]["expected_tree"]:
             raise SystemExit(f"{tag}: label {source_labels.key(image['labels'], f'{name}.tree')} is {label!r}")
     print(f"built {tag} {image['id']} in {elapsed:.0f}s; lowest MemAvailable {minimum:.1f} GiB", flush=True)
-    smoke_image(cluster, tag, smoke_script(upstreams))
+    smoke_cpus = min(max_jobs, 2) if max_jobs is not None else None
+    if smoke_cpus is None:
+        smoke_image(cluster, tag, smoke_script(upstreams))
+    else:
+        smoke_image(cluster, tag, smoke_script(upstreams), max_cpus=smoke_cpus)
     receipts = directory / "images"
     receipts.mkdir(exist_ok=True)
     receipt = {
@@ -1253,6 +1273,9 @@ def command_build_image(args: argparse.Namespace) -> int:
         "image_id": image["id"],
         "deployment_commit": deployment_commit,
         "compile_jobs": jobs,
+        "max_compile_jobs": max_jobs,
+        "nccl_compile_jobs": min(BUILD_NCCL_JOBS, jobs) if max_jobs is not None else BUILD_NCCL_JOBS,
+        "smoke_cpu_limit": smoke_cpus,
         "elapsed_seconds": round(elapsed),
         "min_available_gib": round(minimum, 1),
         "built_utc": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),

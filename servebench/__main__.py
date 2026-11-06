@@ -12,7 +12,7 @@ import sys
 import time
 import urllib.request
 
-from . import SCHEMA, __version__, behaviour, engine, load, prefill, prompts, report, stall, suite
+from . import SCHEMA, __version__, behaviour, engine, load, model_evidence, prefill, prompts, report, stall, suite
 
 _SCALAR_ARRAY_RE = re.compile(
     r"\[\n\s+((?:(?:-?\d+(?:\.\d+)?(?:e[+-]?\d+)?|true|false|null|\"[^\"\\\n]*\"),?\n\s+)+)\]"
@@ -299,8 +299,11 @@ def command_suite(args: argparse.Namespace) -> int:
         with open(args.metadata, encoding="utf-8") as handle:
             metadata = json.load(handle)
     index = suite.run(main, args.url, definition, args.out, label=args.label, corpus=args.corpus,
-                      metadata=metadata, log=lambda message: print(message, file=sys.stderr, flush=True))
+                      metadata=metadata, log=lambda message: print(message, file=sys.stderr, flush=True),
+                      model_evidence=model_evidence.from_environment())
     failed = [step["id"] for step in index["steps"] if step["exit"] != 0]
+    if index.get("model_evidence", {}).get("required_evidence_passed") is False and "model" not in failed:
+        failed.append("model-required-evidence")
     print(json.dumps({"summary": "servebench suite", "suite": definition["name"],
                       "suite_sha256": index["suite_sha256"][:12], "label": args.label, "out": args.out,
                       "seconds": {step["id"]: step["seconds"] for step in index["steps"]}, "failed": failed}),

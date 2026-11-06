@@ -1,0 +1,40 @@
+diff --git a/tests/v1/worker/test_gpu_tilelang_logprob_softmax.py b/tests/v1/worker/test_gpu_tilelang_logprob_softmax.py
+--- a/tests/v1/worker/test_gpu_tilelang_logprob_softmax.py
++++ b/tests/v1/worker/test_gpu_tilelang_logprob_softmax.py
+@@ -445,17 +445,22 @@
+         calls.append(args)
+         launch(*args)
+ 
+-    # A launch of the Triton kernel would fail.
+-    monkeypatch.setattr(logprob, "_topk_log_softmax_kernel", None)
+-    monkeypatch.setattr(tilelang_logprob, "topk_log_softmax", spy)
+-    _assert_same(logprob.compute_token_logprobs(logits, ids), expected, "logprobs")
+-    # int32 ids are widened, as before.
+-    _assert_same(
+-        logprob.compute_token_logprobs(logits, ids.int()), expected, "int32 ids"
+-    )
+-    assert len(calls) == 2
+-    # No requested token, or no row: nothing to launch.
+-    empty = logprob.compute_token_logprobs(logits, ids[:, :0])
+-    assert empty.shape == (5, 0)
+-    none = logprob.compute_token_logprobs(logits[:0], ids[:0])
+-    assert none.shape == (0, 21)
++    # A launch of the Triton kernel would fail. Patch the dictionary so
++    # teardown removes the poison without resolving and retaining a lazy ref.
++    with monkeypatch.context() as patch:
++        patch.setitem(logprob.__dict__, "_topk_log_softmax_kernel", None)
++        patch.setattr(tilelang_logprob, "topk_log_softmax", spy)
++        _assert_same(logprob.compute_token_logprobs(logits, ids), expected, "logprobs")
++        # int32 ids are widened, as before.
++        _assert_same(
++            logprob.compute_token_logprobs(logits, ids.int()), expected, "int32 ids"
++        )
++        assert len(calls) == 2
++        # No requested token, or no row: nothing to launch.
++        empty = logprob.compute_token_logprobs(logits, ids[:, :0])
++        assert empty.shape == (5, 0)
++        none = logprob.compute_token_logprobs(logits[:0], ids[:0])
++        assert none.shape == (0, 21)
++
++    # The routing probe must leave the normal lazy-reference contract intact.
++    assert "_topk_log_softmax_kernel" not in logprob.__dict__

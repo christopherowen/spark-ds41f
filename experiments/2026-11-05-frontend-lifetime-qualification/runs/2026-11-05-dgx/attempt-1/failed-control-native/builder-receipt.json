@@ -1,0 +1,223 @@
+{
+  "started": "2026-11-05T22:20:41Z",
+  "commit": "2c4b23afcd834ba2adf6a15ca434e59fa4f49f74",
+  "steps": [
+    {
+      "argv": [
+        "/usr/bin/python3",
+        "bin/spark",
+        "--cluster-config",
+        "experiments/2026-10-26-spark-ds41f-candidate/candidate-43/image-dgx4.json",
+        "build",
+        "prepare"
+      ],
+      "started": "2026-11-05T22:20:42Z",
+      "log": "build-prepare.log",
+      "exit": 0,
+      "ended": "2026-11-05T22:22:57Z"
+    },
+    {
+      "argv": [
+        "/usr/bin/python3",
+        "bin/spark",
+        "--cluster-config",
+        "experiments/2026-10-26-spark-ds41f-candidate/candidate-43/image-dgx4.json",
+        "build",
+        "check"
+      ],
+      "started": "2026-11-05T22:22:57Z",
+      "log": "build-check.log",
+      "exit": 0,
+      "ended": "2026-11-05T22:23:00Z"
+    },
+    {
+      "argv": [
+        "/usr/bin/python3",
+        "bin/spark",
+        "--cluster-config",
+        "experiments/2026-10-26-spark-ds41f-candidate/candidate-43/image-dgx4.json",
+        "build",
+        "image"
+      ],
+      "started": "2026-11-05T22:23:00Z",
+      "log": "build-image.log",
+      "exit": 0,
+      "ended": "2026-11-05T22:23:04Z"
+    },
+    {
+      "argv": [
+        "/usr/bin/python3",
+        "bin/spark",
+        "--cluster-config",
+        "experiments/2026-10-26-spark-ds41f-candidate/candidate-43/image-dgx4.json",
+        "build",
+        "image",
+        "--apply"
+      ],
+      "started": "2026-11-05T22:23:04Z",
+      "log": "build-image-apply.log",
+      "exit": 0,
+      "ended": "2026-11-05T22:30:55Z"
+    },
+    {
+      "argv": [
+        "/usr/bin/python3",
+        "scripts/release_tests.py",
+        "gate",
+        "/home/swank/projects/spark-ds41f-copy-default/.work/build/vllm-19f2c20ed4d6-b12x-236ddff04a5f-52523c57/src/vllm",
+        "99029e6cbdb966ff198dd13902a0825e8d507e27",
+        "/home/swank/projects/spark-ds41f-copy-default/results/private/candidate-rounds/candidate-43-image/gate-manifest.json",
+        "/home/swank/projects/spark-ds41f-copy-default/experiments/2026-11-05-frontend-lifetime-qualification/release-tests.json"
+      ],
+      "started": "2026-11-05T22:30:55Z",
+      "log": "gate-manifest.log",
+      "exit": 0,
+      "ended": "2026-11-05T22:30:56Z"
+    },
+    {
+      "argv": [
+        "/usr/bin/python3",
+        "scripts/release_tests.py",
+        "bundle",
+        "/home/swank/projects/spark-ds41f-copy-default/results/private/candidate-rounds/candidate-43-image/gate-manifest.json",
+        "spark-ds41f:candidate-43",
+        "/home/swank/projects/spark-ds41f-copy-default/results/private/candidate-rounds/candidate-43-image/bundle",
+        "candidate-43"
+      ],
+      "started": "2026-11-05T22:30:56Z",
+      "log": "gate-bundle.log",
+      "exit": 0,
+      "ended": "2026-11-05T22:30:57Z"
+    },
+    {
+      "argv": [
+        "docker",
+        "run",
+        "--name",
+        "frontend-c43-gate",
+        "--rm",
+        "--gpus",
+        "all",
+        "--ipc=host",
+        "--ulimit=core=0",
+        "-e",
+        "DIRECT_IO_TEST_DIR=/c/direct-io-test",
+        "-e",
+        "ENGRAM_ROWS_TEST_DIR=/c/engram-rows-test",
+        "-e",
+        "HF_HUB_OFFLINE=1",
+        "-e",
+        "PYTHONPATH=/b",
+        "-e",
+        "TILELANG_CACHE_DIR=/c/tilelang-release-tests",
+        "--security-opt=seccomp=unconfined",
+        "--ulimit=memlock=-1:-1",
+        "-v",
+        "/home/swank/projects/spark-ds41f-copy-default/results/private/candidate-rounds/candidate-43-image/bundle/manifest.json:/b/manifest.json:ro",
+        "-v",
+        "/home/swank/projects/spark-ds41f-copy-default/results/private/candidate-rounds/candidate-43-image/bundle/release_test_runner.py:/b/release_test_runner.py:ro",
+        "-v",
+        "/home/swank/projects/spark-ds41f-copy-default/results/private/candidate-rounds/candidate-43-image/bundle/tblib_stub.py:/b/tblib_stub.py:ro",
+        "-v",
+        "/home/swank/projects/spark-ds41f-copy-default/results/private/candidate-rounds/candidate-43-image/bundle/offline_skip.py:/b/offline_skip.py:ro",
+        "-v",
+        "/home/swank/.cache/spark-lab/qualification/candidate-43-ac3c5a2ca2e934295ca7be60d69566d4c406aff22057b0a911661d49e5664905:/c",
+        "-w",
+        "/opt/spark-ds41f/candidate/vllm",
+        "--entrypoint",
+        "python3",
+        "spark-ds41f:candidate-43",
+        "/b/release_test_runner.py",
+        "/b/manifest.json",
+        "/c/release-tests/candidate-43"
+      ],
+      "started": "2026-11-05T22:30:57Z",
+      "log": "release-tests.log",
+      "exit": 1,
+      "ended": "2026-11-05T23:36:50Z"
+    }
+  ],
+  "conditions": {
+    "halted": [],
+    "cooling": [
+      {
+        "node": "dgx4",
+        "start_c": 39.7,
+        "cooled": false,
+        "seconds": 0.0,
+        "final_c": 39.7
+      }
+    ],
+    "fan_curve": [
+      {
+        "node": "dgx4",
+        "service": "inactive",
+        "started": true,
+        "stopped": true
+      }
+    ],
+    "thermal": {
+      "dgx4": {
+        "max_gpu_c": 64.0,
+        "min_headroom_c": 23.0,
+        "max_system_c": 75.0,
+        "max_power_w": 99.37,
+        "thermal_slowdown_ms": 0.0,
+        "power_cap_ms": 420674.1
+      }
+    },
+    "memory": {
+      "dgx4": {
+        "min_available_gib": 78.4,
+        "swap_growth_gib": 0.0
+      }
+    },
+    "fan_stop_failures": []
+  },
+  "source": {
+    "vllm_head": "99029e6cbdb966ff198dd13902a0825e8d507e27",
+    "expected_labels": {
+      "local.spark-ds41f.vllm.tree": "082bda0f13e94290f462eaf55d143cdb7931f9e5",
+      "local.spark-ds41f.b12x.tree": "1a647a311ca55d45070ab83d60668d9c8fb8886c",
+      "local.spark-ds41f.nccl.tree": "6af10aa730a64fcee8781d62340a9c9184e79469",
+      "local.spark-ds41f.tilelang.tree": "222b895d04ee6cd75179155d06e0c0d450636f51",
+      "local.spark-ds41f.tile_kernels.tree": "cb2fa41c8af290204c81c547ed678ebf957cca53",
+      "local.spark-ds41f.sparknet.tree": "8cc28a5cd3e683c1f114ed843453e3ce34f323e0"
+    },
+    "tilelang_head": "a0e66d71fe7617216f2de5d86c3b088595367387"
+  },
+  "image": "sha256:ac3c5a2ca2e934295ca7be60d69566d4c406aff22057b0a911661d49e5664905",
+  "gate_manifest": {
+    "sha256": "9fb39d8853b13a50991a5b0c1cbb2a8902c038ecbc86e722ed22725939f05c75",
+    "files": 138,
+    "required_frontend_files": [
+      "tests/v1/engine/test_request_submission_cleanup.py",
+      "tests/v1/engine/test_utility_call_cleanup.py"
+    ]
+  },
+  "release_cache": {
+    "host_root": "/home/swank/.cache/spark-lab/qualification/candidate-43-ac3c5a2ca2e934295ca7be60d69566d4c406aff22057b0a911661d49e5664905",
+    "absent_before": true,
+    "image": "sha256:ac3c5a2ca2e934295ca7be60d69566d4c406aff22057b0a911661d49e5664905",
+    "generated_bundle_sha256": "f4da62396d3dff1677b68a45089f4341e2b6d005596b9f8dc1c3bf884073e6e9",
+    "actual_bundle_sha256": "93a80dc412c6308817cf0a408c7354cc34395afcb1aa7bc5ba9af3f65667eb20"
+  },
+  "gate": {
+    "passed": false,
+    "summary": "1 failed, 8103 passed, 360 skipped",
+    "failed": [
+      "tests/v1/worker/test_gpu_verified_logprob_token_ids.py::test_tilelang_worker_modules_hold_no_live_triton_reference_kernels"
+    ],
+    "batch_variant": [],
+    "bits_unequal": [],
+    "errors": [
+      "tests/v1/worker/test_gpu_verified_logprob_token_ids.py::test_tilelang_worker_modules_hold_no_live_triton_reference_kernels"
+    ],
+    "groups": [],
+    "bits": [],
+    "timings": []
+  },
+  "gate_native_results": "/home/swank/.cache/spark-lab/qualification/candidate-43-ac3c5a2ca2e934295ca7be60d69566d4c406aff22057b0a911661d49e5664905/release-tests/candidate-43",
+  "error": "RuntimeError: release-test gate failed; exit=1, verdict={'passed': False, 'summary': '1 failed, 8103 passed, 360 skipped', 'failed': ['tests/v1/worker/test_gpu_verified_logprob_token_ids.py::test_tilelang_worker_modules_hold_no_live_triton_reference_kernels'], 'batch_variant': [], 'bits_unequal': [], 'errors': ['tests/v1/worker/test_gpu_verified_logprob_token_ids.py::test_tilelang_worker_modules_hold_no_live_triton_reference_kernels'], 'groups': [], 'bits': [], 'timings': []}",
+  "ended": "2026-11-05T23:36:50Z"
+}

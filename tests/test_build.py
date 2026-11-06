@@ -80,7 +80,7 @@ class LockWithoutB12xTest(unittest.TestCase):
         self.without = copy.deepcopy(self.lock)
         del self.without["sources"]["b12x"]
 
-    def plan(self, lock: dict) -> str:
+    def plan(self, lock: dict, max_compile_jobs=None) -> str:
         import argparse
         import contextlib
         import io
@@ -93,7 +93,8 @@ class LockWithoutB12xTest(unittest.TestCase):
                 mock.patch.object(spark, "repository_dirty", return_value=""), \
                 mock.patch.object(spark, "repository_revision", return_value="0" * 40), \
                 contextlib.redirect_stdout(output):
-            spark.command_build_image(argparse.Namespace(cluster_config="c.json", tag=None, apply=False))
+            spark.command_build_image(argparse.Namespace(cluster_config="c.json", tag=None, apply=False,
+                                                         max_compile_jobs=max_compile_jobs))
         return output.getvalue()
 
     def test_inputs_contexts_and_directory_leave_b12x_out(self) -> None:
@@ -126,6 +127,15 @@ class LockWithoutB12xTest(unittest.TestCase):
         self.assertIn("TILELANG_BASE_STAGE=runtime-core", without)
         for absent in ("b12x-source", "B12X_"):
             self.assertNotIn(absent, without)
+
+    def test_opt_in_job_cap_covers_nccl_without_changing_default(self) -> None:
+        original, capped = self.plan(self.lock), self.plan(self.lock, 2)
+        self.assertNotIn("NCCL_COMPILE_JOBS=", original)
+        self.assertIn("NCCL_COMPILE_JOBS=2", capped)
+        self.assertIn("VLLM_COMPILE_JOBS=", capped)
+        self.assertIn("TILELANG_COMPILE_JOBS=", capped)
+        self.assertIn("at most 2; sized from MemAvailable", capped)
+
 
     def test_smoke_imports_no_b12x_module_and_checks_it_is_absent(self) -> None:
         promoted, without = spark.smoke_script(self.lock), spark.smoke_script(self.without)
@@ -178,6 +188,75 @@ class LockWithoutB12xTest(unittest.TestCase):
             self.assertIn("local.spark-ds41f.vllm.tree", text)
             self.assertIn("arm notes cite vllm tree 88468fc7, expected 354fd6e6", text)
             self.assertIn("arm notes cite vLLM 0568..0636", text)
+
+
+class BuildResourcePolicyTest(unittest.TestCase):
+    def test_cap_preserves_cpu_sizing_and_memory_floor(self) -> None:
+        with mock.patch.object(spark.os, "sched_getaffinity", return_value=set(range(24))):
+            self.assertEqual(spark.compile_jobs(64), 5)
+            self.assertEqual(spark.compile_jobs(64, 2), 2)
+            self.assertEqual(spark.compile_jobs(64, 20), 5)
+            with self.assertRaises(SystemExit):
+                spark.compile_jobs(63, 1)
+        with mock.patch.object(spark.os, "sched_getaffinity", return_value=set(range(6))):
+            self.assertEqual(spark.compile_jobs(96, 2), 1)
+
+    def test_invalid_caps_fail_before_build_configuration_or_dispatch(self) -> None:
+        import argparse
+        for cap in (0, -1, True, "2", 1.5):
+            with self.subTest(cap=cap), mock.patch.object(spark, "configuration") as configure:
+                with self.assertRaises(SystemExit):
+                    spark.command_build_image(argparse.Namespace(max_compile_jobs=cap))
+                configure.assert_not_called()
+
+    def test_cli_requires_a_positive_integer_and_keeps_default_optional(self) -> None:
+        import contextlib
+        import io
+        self.assertIsNone(spark.parser().parse_args(["build", "image"]).max_compile_jobs)
+        self.assertEqual(spark.parser().parse_args(["build", "image", "--max-compile-jobs", "2"]).max_compile_jobs, 2)
+        for value in ("0", "-1", "1.5", "bad"):
+            with self.subTest(value=value), contextlib.redirect_stderr(io.StringIO()), self.assertRaises(SystemExit):
+                spark.parser().parse_args(["build", "image", "--max-compile-jobs", value])
+
+    def test_actual_build_argv_receipt_and_smoke_bind_effective_cap(self) -> None:
+        import argparse
+        import contextlib
+        import io
+        lock = spark.read_json("upstreams.lock.json")
+        inputs = spark.build_inputs(lock)
+        cluster = spark.read_json("config/cluster.json")
+        labels = {f"local.spark-ds41f.{name}.tree": inputs[name]["expected_tree"]
+                  for name in spark.build_projects(inputs)}
+        with tempfile.TemporaryDirectory() as temporary, contextlib.ExitStack() as stack:
+            root = Path(temporary)
+            directory = root / "build"
+            directory.mkdir()
+            stack.enter_context(mock.patch.object(spark, "ROOT", root))
+            lock_file = stack.enter_context((root / "build.lock").open("w"))
+            lock_path = mock.Mock(spec=Path)
+            lock_path.open.return_value = lock_file
+            stack.enter_context(mock.patch.object(spark, "BUILD_LOCK", lock_path))
+            returns = {"configuration": (cluster, None, lock), "build_inputs": inputs,
+                       "build_directory": directory, "read_json": {}, "arm_source_problems": [],
+                       "build_problems": [], "repository_dirty": "", "repository_revision": "b" * 40,
+                       "require_idle_build_host": None, "available_memory_gib": 96, "smoke_script": "pass"}
+            for name, value in returns.items():
+                stack.enter_context(mock.patch.object(spark, name, return_value=value))
+            stack.enter_context(mock.patch.object(spark.os, "sched_getaffinity", return_value=set(range(24))))
+            stack.enter_context(mock.patch.object(spark, "image_labels", side_effect=[None, {"id": "sha256:" + "a" * 64, "labels": labels}]))
+            build = stack.enter_context(mock.patch.object(spark, "run_memory_guarded", return_value=90))
+            smoke = stack.enter_context(mock.patch.object(spark, "smoke_image"))
+            stack.enter_context(contextlib.redirect_stdout(io.StringIO()))
+            self.assertEqual(spark.command_build_image(argparse.Namespace(cluster_config="named.json", tag="example:capped", apply=True, max_compile_jobs=2)), 0)
+            argv = build.call_args.args[0]
+            for value in ("VLLM_COMPILE_JOBS=2", "TILELANG_COMPILE_JOBS=2", "NCCL_COMPILE_JOBS=2"):
+                self.assertIn(value, argv)
+            self.assertEqual(build.call_args.args[1], spark.BUILD_RESERVE_GIB)
+            self.assertEqual(smoke.call_args.kwargs["max_cpus"], 2)
+            receipt = json.loads(next((directory / "images").glob("*.json")).read_text())
+            self.assertEqual({k: receipt[k] for k in ("compile_jobs", "max_compile_jobs", "nccl_compile_jobs", "smoke_cpu_limit")},
+                             {"compile_jobs": 2, "max_compile_jobs": 2, "nccl_compile_jobs": 2, "smoke_cpu_limit": 2})
+
 
 
 class BuildEvidenceTest(unittest.TestCase):

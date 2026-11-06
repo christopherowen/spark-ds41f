@@ -1,0 +1,24 @@
+{
+  "scope": "static authoritative source tree; no claim of live file-descriptor attestation",
+  "runtime_tree": "cc0fdf582d0bddff71c6a853e237bc9e87587832",
+  "source_repository_on_dgx4": "/home/swank/projects/spark-ds41f/.work/build/vllm-19f2c20ed4d6-b12x-236ddff04a5f-0868f2e6/src/vllm",
+  "functions": [
+    {
+      "path": "vllm/models/deepseek_v4_1/common/engram.py",
+      "sha256": "b9c1f3836e6da84b2a77097bd044fbd25ef52189fe2c90ce1100fd51c9fdc346",
+      "function": "open_disk_rows",
+      "line": 630,
+      "end_line": 652,
+      "source": "    def open_disk_rows(self) -> None:\n        \"\"\"Start reading this rank's shard of the table from the checkpoint, once.\"\"\"\n        if self.table_memory != \"disk\" or self.disk_rows is not None:\n            return\n        planes = sorted(scale for _, _, scale in self._disk_sources)\n        if planes != [False, True]:\n            raise ValueError(\n                \"Disk Engram needs the table's weight and scale planes, once each\"\n            )\n        rows = EngramDiskRows(\n            device=self.caps.device,\n            table_rows=self.table_rows,\n            **self._disk_shard(),\n            rows_timeout_s=ENGRAM_ROWS_TIMEOUT_S,\n            delay_s=ENGRAM_READ_DELAY_S,\n            check_early=ENGRAM_CHECK_EARLY_IDS,\n            timeline=ENGRAM_TIMELINE,\n        )\n        for path, offset, scale in self._disk_sources:\n            rows.add_source(path, offset, scale=scale)\n        self.disk_rows = rows\n        if ENGRAM_TIMELINE:\n            _record_timeline(rows, self.caps.tp_rank, self.caps.layer_id)\n"
+    },
+    {
+      "path": "vllm/models/deepseek_v4_1/engram_rows/rows.py",
+      "sha256": "8c091c4f6bbb42a47214bfaca0d5bf5d3f20df9a85893e10fbd51b8dbd021609",
+      "function": "add_source",
+      "line": 241,
+      "end_line": 244,
+      "source": "    def add_source(self, path: str, offset: int, *, scale: bool) -> None:\n        \"\"\"Register the table's E4M3 rows (``scale=False``) or E8M0 scale rows, which\n        start at ``offset`` in the immutable file ``path``.\"\"\"\n        self.native.add(self._reader, str(path), int(offset), bool(scale))\n"
+    }
+  ],
+  "conclusion": "C36 contains packed-reader support, but open_disk_rows registers the original separate value and scale sources. Symbol presence alone did not mean packed storage was selected."
+}

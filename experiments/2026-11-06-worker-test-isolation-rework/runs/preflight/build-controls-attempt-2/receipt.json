@@ -1,0 +1,217 @@
+{
+  "started": "2026-11-06T01:46:19.215599+00:00",
+  "commit": "31168a1cc654952124ec301bb28867ce5c9481d3",
+  "steps": [
+    {
+      "name": "GPU-readonly-precondition",
+      "argv": [
+        "nvidia-smi",
+        "--query-compute-apps=pid",
+        "--format=csv,noheader"
+      ],
+      "exit": 0,
+      "stdout": "GPU-readonly-precondition.stdout",
+      "stderr": "GPU-readonly-precondition.stderr"
+    },
+    {
+      "name": "clean-reused-offline-checkout",
+      "argv": [
+        "git",
+        "-c",
+        "gc.auto=0",
+        "-c",
+        "maintenance.auto=false",
+        "-c",
+        "pack.threads=1",
+        "-C",
+        "/home/chris/spark-work/worker-test-isolation/c46-build-controls-attempt-1/checkout",
+        "status",
+        "--porcelain"
+      ],
+      "exit": 0,
+      "stdout": "clean-reused-offline-checkout.stdout",
+      "stderr": "clean-reused-offline-checkout.stderr"
+    },
+    {
+      "name": "fetch-exact-corrected-control-source",
+      "argv": [
+        "git",
+        "-c",
+        "gc.auto=0",
+        "-c",
+        "maintenance.auto=false",
+        "-c",
+        "pack.threads=1",
+        "-C",
+        "/home/chris/spark-work/worker-test-isolation/c46-build-controls-attempt-1/checkout",
+        "fetch",
+        "--no-tags",
+        "--depth=1",
+        "--filter=blob:none",
+        "deployment",
+        "31168a1cc654952124ec301bb28867ce5c9481d3"
+      ],
+      "exit": 0,
+      "stdout": "fetch-exact-corrected-control-source.stdout",
+      "stderr": "fetch-exact-corrected-control-source.stderr"
+    },
+    {
+      "name": "sparse-patterns",
+      "argv": [
+        "git",
+        "-c",
+        "gc.auto=0",
+        "-c",
+        "maintenance.auto=false",
+        "-c",
+        "pack.threads=1",
+        "-C",
+        "/home/chris/spark-work/worker-test-isolation/c46-build-controls-attempt-1/checkout",
+        "sparse-checkout",
+        "set",
+        "--no-cone",
+        "--stdin"
+      ],
+      "exit": 0,
+      "stdout": "sparse-patterns.stdout",
+      "stderr": "sparse-patterns.stderr"
+    },
+    {
+      "name": "exact-published-checkout",
+      "argv": [
+        "git",
+        "-c",
+        "gc.auto=0",
+        "-c",
+        "maintenance.auto=false",
+        "-c",
+        "pack.threads=1",
+        "-C",
+        "/home/chris/spark-work/worker-test-isolation/c46-build-controls-attempt-1/checkout",
+        "checkout",
+        "-b",
+        "feat/c46-build-control-check-2",
+        "31168a1cc654952124ec301bb28867ce5c9481d3"
+      ],
+      "exit": 0,
+      "stdout": "exact-published-checkout.stdout",
+      "stderr": "exact-published-checkout.stderr"
+    },
+    {
+      "name": "verify-commit",
+      "argv": [
+        "git",
+        "-c",
+        "gc.auto=0",
+        "-c",
+        "maintenance.auto=false",
+        "-c",
+        "pack.threads=1",
+        "-C",
+        "/home/chris/spark-work/worker-test-isolation/c46-build-controls-attempt-1/checkout",
+        "rev-parse",
+        "HEAD"
+      ],
+      "exit": 0,
+      "stdout": "verify-commit.stdout",
+      "stderr": "verify-commit.stderr"
+    },
+    {
+      "name": "corrected-targeted-build-tests",
+      "argv": [
+        "python3",
+        "-B",
+        "-c",
+        "import sys,unittest;sys.path.insert(0,'tests');import test_build;s=unittest.TestSuite(unittest.defaultTestLoader.loadTestsFromName(n,test_build) for n in ['LockWithoutB12xTest.test_build_commands_refuse_misaligned_arm_notes_and_labels','BuildResourcePolicyTest.test_actual_build_argv_receipt_and_smoke_bind_effective_cap']);r=unittest.TextTestRunner(verbosity=2).run(s);raise SystemExit(0 if r.wasSuccessful() else 1)"
+      ],
+      "exit": 0,
+      "stdout": "corrected-targeted-build-tests.stdout",
+      "stderr": "corrected-targeted-build-tests.stderr"
+    },
+    {
+      "name": "doctor-tp3",
+      "argv": [
+        "python3",
+        "-B",
+        "bin/spark",
+        "--cluster-config",
+        "experiments/2026-10-26-spark-ds41f-candidate/candidate-46/tp3.json",
+        "doctor"
+      ],
+      "exit": 1,
+      "stdout": "doctor-tp3.stdout",
+      "stderr": "doctor-tp3.stderr"
+    },
+    {
+      "name": "doctor-tp4",
+      "argv": [
+        "python3",
+        "-B",
+        "bin/spark",
+        "--cluster-config",
+        "experiments/2026-10-26-spark-ds41f-candidate/candidate-46/tp4.json",
+        "doctor"
+      ],
+      "exit": 1,
+      "stdout": "doctor-tp4.stdout",
+      "stderr": "doctor-tp4.stderr"
+    },
+    {
+      "name": "whitespace",
+      "argv": [
+        "git",
+        "-c",
+        "gc.auto=0",
+        "-c",
+        "maintenance.auto=false",
+        "-c",
+        "pack.threads=1",
+        "-C",
+        "/home/chris/spark-work/worker-test-isolation/c46-build-controls-attempt-1/checkout",
+        "diff",
+        "--check"
+      ],
+      "exit": 0,
+      "stdout": "whitespace.stdout",
+      "stderr": "whitespace.stderr"
+    }
+  ],
+  "purpose": "offline build-resource controls and static profile doctor",
+  "GPU_serving_or_existing_checkout_changes": false,
+  "effective_limits": {
+    "cpu.max": "100000 100000",
+    "memory.max": "8589934592",
+    "memory.swap.max": "0"
+  },
+  "sparse_patterns": [
+    "/.gitignore",
+    "/AGENTS.md",
+    "/README.md",
+    "/pyproject.toml",
+    "/upstreams.lock.json",
+    "/bin/",
+    "/spark_ds41f/",
+    "/scripts/",
+    "/tests/",
+    "/config/",
+    "/docker/",
+    "/requirements/",
+    "/patches/",
+    "/manifests/",
+    "/docs/",
+    "/experiments/*/*.json",
+    "/experiments/**/source.json",
+    "/experiments/**/upstreams.lock.json",
+    "/experiments/**/series",
+    "/experiments/**/*.patch",
+    "/experiments/2026-10-26-spark-ds41f-candidate/*/*.json",
+    "/experiments/2026-11-06-worker-test-isolation-rework/*.py"
+  ],
+  "existing_reference_checkout_untouched": true,
+  "unit_exit": 0,
+  "ignored_map_fixture_scope": "Documentation examples only; no real node maps, hardware qualification or deployment authority.",
+  "doctor_tp3_exit": 1,
+  "doctor_tp4_exit": 1,
+  "passed": false,
+  "ended": "2026-11-06T01:46:22.266047+00:00"
+}

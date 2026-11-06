@@ -1,5 +1,14 @@
 # Frontend lifetime cleanup qualification
 
+**Current: C43 failed its release gate before serving or performance.** Actual
+wait exit1 and independently verified C36 restoration are preserved. Native
+recorded counts are8103 passed/360 skipped/one failed worker lazy-reference
+assertion. Focused source review identifies a likely test-pollution mechanism
+from changed process grouping; no runtime cause or speed verdict is inferred.
+Candidate46 is reserved for a minimal, assertion-preserving fixture correction.
+The original C43 image/gate is not resumed or repeated. See current results and
+decision; the source preparation/launch narrative below is retained history.
+
 Prepare PR890's two existing request/utility cleanup patches on the corrected,
 default-enabled C40 vLLM source. Purpose: correctness and bounded ownership on
 failed sends/cancellation, with neutral serving performance acceptable and no
@@ -72,7 +81,15 @@ image/gate exits are required before distribution. A failed release gate keeps
 its native verdict and copied XML/JSONL before the coordinator refuses serving.
 
 Both functional boots require all40 ordered script exits to pass independently
-of their parent exit. The unchanged full release-tp3, single-stream and sampled
+of their parent exit. The functional spec additionally declares the three greedy
+collectors' `identical` and expected logprob mode as required evidence. Seeded
+sampling requires a matching isolated repeat while retaining batch differences
+as observations, consistent with the historical audit. Missing or malformed
+declared evidence blocks the lab before the controller can start performance.
+Sampled requests now retain private per-case tokens/logprobs, controls and IDs;
+native logit positions and speculative-step grouping remain unavailable via HTTP.
+These changes qualify the evidence contract, not the unmeasured runtime.
+The unchanged full release-tp3, single-stream and sampled
 families run on a fresh boot and repeat (six suites/26 ordered steps). Explicit
 current stream policy matches the saved full protocol; no lean/full mixing.
 The coordinator owns heartbeat/guard checks and restores named C36 once at the
@@ -84,7 +101,8 @@ plans and Python3.12 parsing passed. Identity-only normalization confirms both
 workload specs match the prior complete protocol; actual prepared top-k bytes
 match the intended hash. Original preparation/setup failures stay recorded.
 Full Linux preparation/build checks, actual image gates and serving measurements
-remain pending. No C43 controller or image has started.
+were pending at the prepared control packet. The sole C43 controller has now
+started as recorded below; the actual image and all gate results are pending.
 
 The sole planned command, after publishing and guarded all-node source staging,
 is `python3 -u experiments/2026-11-05-frontend-lifetime-qualification/run_round.py --apply`.
@@ -95,3 +113,19 @@ DGX4 checkout. Actual launch/exit receipts must use fresh paths under
 `~/tl-logs/frontend-lifetime-qualification/setup/`. Never repeat a completed gate
 or measured arm. A safely scheduled passed-gate-only handoff may use the tested
 immutable receipt resume in a distinct attempt; a failed or measured arm cannot.
+
+## Current execution
+
+Attempt1 started2026-11-05T22:20:01UTC on DGX1, controller1125694 and
+supervisor1125693. Exact clean published execution commit is
+2c4b23afcd834ba2adf6a15ca434e59fa4f49f74 on all three serving checkouts and the
+owned DGX4 build checkout. Windowdgx1-1793917240 opened22:20:40UTC. Initial
+compact check has live heartbeat, both processes alive, image-and-gate running,
+no final exit or serving measurements. No duplicate or active checkout sync.
+
+Source staging used its own window, retained both the expected existing-container
+plan refusal and the local operator parse error, then used the named sync command.
+Independent C36 doctor and unchanged all-rank container IDs passed before closing
+without a serving restart. All11 native setup receipts and hashes are in the
+attempt directory. Control-packet hashes describe the prepared snapshot at the
+execution commit; later status/analysis evidence does not change active nodes.

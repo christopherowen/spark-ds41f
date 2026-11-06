@@ -1,0 +1,47 @@
+{
+  "pr": 851,
+  "head": "c15e2c699277dc65f40e42f80758f12d0af33582",
+  "tested_on": "PR source merged locally with main3c7b455e, no commit/runtime action",
+  "scenario": "Worker has identical ordered layers but stale source labels and different runtime Config; plan should select it for repair.",
+  "expected_differ": [
+    "dgx2"
+  ],
+  "actual_differ": [],
+  "problem": null,
+  "source_content_equal": false,
+  "mark_met": false,
+  "ssh_or_docker_executed": false,
+  "inputs": {
+    "local": {
+      "RootFS": {
+        "Layers": [
+          "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+        ]
+      },
+      "Config": {
+        "Labels": {
+          "vllm.tree": "correct"
+        },
+        "Env": [
+          "MODE=correct"
+        ]
+      }
+    },
+    "worker": {
+      "RootFS": {
+        "Layers": [
+          "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+        ]
+      },
+      "Config": {
+        "Labels": {
+          "vllm.tree": "stale"
+        },
+        "Env": [
+          "MODE=stale"
+        ]
+      }
+    }
+  },
+  "conclusion": "New sync image matching compares layers only, so stale Config/labels are skipped; the start fix hint cannot repair this case. Focused correction required."
+}

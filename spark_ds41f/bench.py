@@ -9,6 +9,7 @@ import fcntl
 import functools
 import hashlib
 import json
+import math
 import os
 import random
 import re
@@ -854,6 +855,7 @@ def parse_thermal(text: str) -> dict:
         return sum(known) if known else None
 
     return {
+        "complete": all(value is not None and math.isfinite(value) for value in values[:len(THERMAL_FIELDS) + 1]),
         "gpu_c": gpu,
         "headroom_c": headroom,
         "sm_mhz": clock,
@@ -889,6 +891,9 @@ class MemoryWatch:
         self.lock = threading.Lock()
         self.state: dict[str, dict] = {}
         self.thermal: dict[str, dict] = {}
+        self.strict_thermal = os.environ.get("SPARK_DS41F_STRICT_TELEMETRY") == "1"
+        self.thermal_last: dict[str, float | None] = {}
+        self.thermal_errors: dict[str, str] = {}
         self.processes: list[subprocess.Popen] = []
         for node in nodes["nodes"]:
             process = subprocess.Popen(
@@ -904,6 +909,7 @@ class MemoryWatch:
             self.processes.append(process)
             self.state[node["name"]] = {"last": None}
             self.thermal[node["name"]] = {}
+            self.thermal_last[node["name"]] = None
             threading.Thread(
                 target=self._read, args=(node["name"], process), daemon=True
             ).start()
@@ -934,6 +940,20 @@ class MemoryWatch:
             )
 
     def _temperature(self, name: str, sample: dict) -> None:
+        if self.strict_thermal:
+            required = ("gpu_c", "headroom_c", "sm_mhz", "power_w", "system_c",
+                        "thermal_slowdown_us", "power_cap_us")
+            valid = sample.get("complete") is True and all(
+                type(sample.get(key)) in (int, float) and math.isfinite(sample[key]) for key in required)
+            with self.lock:
+                if valid:
+                    self.thermal_last[name] = time.monotonic()
+                else:
+                    self.thermal_errors.setdefault(name, f"{name}: thermal telemetry is missing, malformed or non-finite")
+                problem = self.thermal_errors.get(name)
+            if problem:
+                self.halt(problem)
+                return
         with self.lock:
             state = self.thermal[name]
             for key, better in (("gpu_c", max), ("system_c", max), ("power_w", max), ("headroom_c", min)):
@@ -960,17 +980,26 @@ class MemoryWatch:
         deadline = time.monotonic() + timeout
         while time.monotonic() < deadline:
             with self.lock:
-                if all(state["last"] is not None for state in self.state.values()):
+                if self.thermal_errors:
+                    raise BenchAbort(next(iter(self.thermal_errors.values())))
+                if (all(state["last"] is not None for state in self.state.values())
+                        and (not self.strict_thermal or all(value is not None for value in self.thermal_last.values()))):
                     return
             time.sleep(0.5)
-        raise BenchAbort("memory telemetry did not start on every node")
+        raise BenchAbort(("memory/thermal" if self.strict_thermal else "memory") + " telemetry did not start on every node")
 
     def check(self) -> None:
         now = time.monotonic()
         with self.lock:
+            if self.thermal_errors:
+                raise BenchAbort(next(iter(self.thermal_errors.values())))
             for name, state in self.state.items():
                 if state["last"] is None or now - state["last"] > 15:
                     raise BenchAbort(f"{name}: memory telemetry stopped reporting")
+                if self.strict_thermal and (self.thermal_last[name] is None or now - self.thermal_last[name] > 45):
+                    reason = f"{name}: thermal telemetry stopped reporting"
+                    self.thermal_errors.setdefault(name, reason)
+                    raise BenchAbort(reason)
 
     def thermal_summary(self) -> dict:
         summary = {}

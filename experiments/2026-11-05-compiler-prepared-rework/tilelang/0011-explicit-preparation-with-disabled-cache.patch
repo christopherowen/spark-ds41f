@@ -1,0 +1,469 @@
+From 2eb3e70abcb3ba523ef2d77549fb14646b704196 Mon Sep 17 00:00:00 2001
+From: Christopher Owen <3221756+christopherowen@users.noreply.github.com>
+Date: Thu, 5 Nov 2026 23:17:59 +0100
+Subject: [PATCH] Preserve explicit preparation while kernel caching is
+ disabled
+
+Upstream base: tile-ai/tilelang@2123e412ce2217b324c50c4ec967213906456ac5
+with the unchanged ten-patch compiler prefix, head454202b2ba8d0cf10b8caf434a956755e039483f
+and treebae5fe12b58cdf364efeccbabc04cd08205c43b9.
+
+Rationale: wrapper-cache bypass for disabled caching must not discard an
+explicitly prepared kernel after freeze. Default IKET mode disables caching;
+its required release test exposed this retained-feature regression.
+
+Quality: ordinary disabled-cache calls still compile afresh while thawed.
+Only explicit, successful preparations may run frozen, with matching call
+key, wrapper object, function/code and compile context. Missing calls and
+ordinary wrapper hits remain refused. Failed fresh preparation revokes the
+old permission. Repreparation clears stale call-form shortcuts. No compiler
+passes, arithmetic, kernel scheduling or numerical contract change.
+
+Tests:22 CPU controls execute real extracted JIT/prepare/freeze methods
+with binding and compile-result doubles, without TileLang/TVM/Torch imports.
+The positive regression fails on the original prefix while its ordinary
+cache-bypass negative control passes. Native IKET, all cache-bypass tests,
+full image/release/fix/functional gates and both metric boots remain required.
+No GPU or serving qualification is claimed by these controls.
+
+Upstream status: local focused integration correction; not submitted.
+---
+ .../test_tilelang_prepared_disabled_cache.py  | 302 ++++++++++++++++++
+ tilelang/jit/__init__.py                      |  63 +++-
+ 2 files changed, 360 insertions(+), 5 deletions(-)
+ create mode 100644 testing/python/cache/test_tilelang_prepared_disabled_cache.py
+
+diff --git a/testing/python/cache/test_tilelang_prepared_disabled_cache.py b/testing/python/cache/test_tilelang_prepared_disabled_cache.py
+new file mode 100644
+index 00000000..0079d72b
+--- /dev/null
++++ b/testing/python/cache/test_tilelang_prepared_disabled_cache.py
+@@ -0,0 +1,302 @@
++"""CPU control tests of real extracted JIT/prepare methods; no compiler import.
++
++Objects returned by compilation and argument binding are doubles. The methods
++under test are parsed from source without rewriting. Native IKET, cache-bypass
++and full release tests remain mandatory; this is not GPU qualification.
++"""
++
++from __future__ import annotations
++
++import ast
++import concurrent.futures
++from dataclasses import dataclass, field
++import inspect
++import os
++from pathlib import Path
++import threading
++from types import SimpleNamespace
++import unittest
++
++
++SOURCE = Path(os.environ.get("TILELANG_PREPARED_REWORK_SOURCE", Path(__file__).resolve().parents[3]))
++
++
++def load_controls():
++    jit = ast.parse((SOURCE / "tilelang/jit/__init__.py").read_text())
++    cache = ast.parse((SOURCE / "tilelang/cache/kernel_cache.py").read_text())
++    wrapper = next(n for n in jit.body if isinstance(n, ast.ClassDef) and n.name == "JITImpl")
++    wanted = {
++        "__post_init__", "__call__", "is_lazy_mode", "_can_use_call_form_cache",
++        "_preparation_context", "_get_prepared_kernel", "_record_prepared_kernel",
++    }
++    methods = [n for n in wrapper.body if isinstance(n, ast.FunctionDef) and n.name in wanted]
++    standin = ast.ClassDef(name="Wrapper", bases=[], keywords=[], body=methods, decorator_list=[])
++    functions = [n for n in cache.body if isinstance(n, ast.FunctionDef) and n.name in {
++        "freeze", "thaw", "frozen", "_refuse_if_frozen",
++    }]
++    controls = [n for n in jit.body if isinstance(n, ast.ClassDef) and n.name == "_CallFormCache"]
++    controls += [n for n in jit.body if isinstance(n, ast.FunctionDef) and n.name == "prepare"]
++    module = ast.fix_missing_locations(ast.Module(body=[
++        ast.ImportFrom(module="__future__", names=[ast.alias(name="annotations")], level=0),
++        *functions, *controls, standin,
++    ], type_ignores=[]))
++    state = SimpleNamespace(cache_enabled=False, target="cuda", backend="tvm_ffi", fail=False, attempts=0, kernels=[])
++
++    class KernelNotPreparedError(RuntimeError):
++        pass
++
++    class Kernel:
++        def __call__(self, *args, **kwargs):
++            return args, kwargs
++
++    scope = {
++        "dataclass": dataclass, "field": field, "concurrent": concurrent,
++        "threading": threading, "path": os.path, "__file__": str(SOURCE / "tilelang/jit/__init__.py"),
++        "_frozen_reason": None, "_freeze_lock": threading.Lock(),
++        "KernelNotPreparedError": KernelNotPreparedError,
++        "_CALL_FORM_CACHE_MISS": object(), "_make_jit_key": lambda value: value,
++        "is_cache_enabled": lambda: state.cache_enabled,
++        "get_available_cpu_count": lambda: 2,
++        "get_prim_func_name": lambda func, default: "prepared_test",
++        "env": SimpleNamespace(
++            get_default_target=lambda: state.target,
++            get_default_execution_backend=lambda: state.backend,
++        ),
++        "logger": SimpleNamespace(warning=lambda *a: None),
++    }
++    exec(compile(module, "<actual TileLang source controls>", "exec"), scope)
++
++    def compile_kernel(*args, **kwargs):
++        state.attempts += 1
++        scope["_refuse_if_frozen"](kwargs.get("func"))
++        if state.fail:
++            raise RuntimeError("controlled preparation failure")
++        result = Kernel()
++        state.kernels.append(result)
++        return result
++
++    scope["compile"] = compile_kernel
++
++    def factory(n, threads=128):
++        return None
++
++    class Function:
++        orig_func = staticmethod(factory)
++        __name__ = "factory"
++        tensor_args = {}
++
++        def parse_args(self, *args, **kwargs):
++            bound = inspect.signature(self.orig_func).bind(*args, **kwargs)
++            bound.apply_defaults()
++            return (tuple(bound.arguments.items()), None), {}
++
++    scope["JITFunc"] = Function
++
++    def new_wrapper():
++        impl = scope["Wrapper"]()
++        impl.func = Function()
++        impl.mode = "lazy"
++        for name in ("out_idx", "target", "target_host", "execution_backend", "pass_configs", "compile_flags", "debug_root_path", "verbose"):
++            setattr(impl, name, None)
++        impl.__post_init__()
++        impl.initialize_jit_mode = lambda *a, **k: impl.mode
++        impl.get_tir = lambda *a, **k: SimpleNamespace(key=impl.func.parse_args(*a, **k)[0])
++        impl.compile = lambda *a, **k: compile_kernel(func=impl.get_tir(*a, **k))
++        return impl
++
++    return scope, state, new_wrapper
++
++
++class PreparedDisabledCacheTests(unittest.TestCase):
++    def setUp(self):
++        self.scope, self.state, self.new = load_controls()
++        self.impl = self.new()
++
++    def prepare(self, n=1024, **kwargs):
++        return self.scope["prepare"]([(self.impl, (n,), kwargs)])[0]
++
++    def freeze(self):
++        self.scope["freeze"]("test")
++
++    def assert_missing(self, *args, **kwargs):
++        with self.assertRaises(self.scope["KernelNotPreparedError"]):
++            self.impl(*args, **kwargs)
++
++    def test_disabled_ordinary_calls_bypass_both_wrapper_caches(self):
++        self.state.cache_enabled = True
++        old = self.impl(1024)
++        self.assertIs(old, self.impl(1024))
++        self.state.cache_enabled = False
++        first, second = self.impl(1024), self.impl(1024)
++        self.assertIsNot(first, old)
++        self.assertIsNot(second, first)
++        self.assertEqual(len(self.state.kernels), 3)
++
++    def test_frozen_implicit_wrapper_entry_is_not_prepared(self):
++        self.state.cache_enabled = True
++        self.impl(1024)
++        self.state.cache_enabled = False
++        self.freeze()
++        self.assert_missing(1024)
++
++    def test_explicit_disabled_preparation_runs_after_freeze(self):
++        prepared = self.prepare()
++        self.freeze()
++        self.assertIs(self.impl(1024), prepared)
++        self.assertIs(self.impl(n=1024), prepared)
++        self.assertEqual(self.state.attempts, 1)
++
++    def test_missing_or_different_specialization_still_refused(self):
++        self.prepare()
++        self.freeze()
++        self.assert_missing(2048)
++        self.assert_missing(1024, threads=64)
++
++    def test_prepare_deduplicates_normalized_call_forms(self):
++        result = self.scope["prepare"]([
++            (self.impl, (1024,), {}),
++            (self.impl, (), {"n": 1024, "threads": 128}),
++        ])
++        self.assertIs(result[0], result[1])
++        self.assertEqual(len(self.state.kernels), 1)
++
++    def test_tuning_arguments_use_the_call_key(self):
++        prepared = self.prepare(__tune_params={"threads": 64})
++        self.freeze()
++        self.assertIs(self.impl(1024, __tune_params={"threads": 64}), prepared)
++        self.assert_missing(1024)
++
++    def test_implicit_entry_does_not_replace_explicit_disabled_preparation(self):
++        self.state.cache_enabled = True
++        old = self.impl(1024)
++        self.state.cache_enabled = False
++        prepared = self.prepare()
++        self.assertIsNot(old, prepared)
++        self.freeze()
++        self.assertIs(self.impl(1024), prepared)
++
++    def test_explicit_preparation_clears_stale_call_form_objects(self):
++        self.state.cache_enabled = True
++        old = self.impl(1024)
++        self.state.cache_enabled = False
++        prepared = self.prepare()
++        self.state.cache_enabled = True
++        self.assertIsNot(prepared, old)
++        self.assertIs(self.impl(1024), prepared)
++
++    def test_thaw_keeps_ordinary_disabled_calls_fresh(self):
++        prepared = self.prepare()
++        self.freeze()
++        self.assertIs(self.impl(1024), prepared)
++        self.scope["thaw"]()
++        self.assertIsNot(self.impl(1024), prepared)
++        self.assertIsNot(self.impl(1024), self.impl(1024))
++
++    def test_explicit_disabled_reprepare_is_fresh(self):
++        old = self.prepare()
++        prepared = self.prepare()
++        self.assertIsNot(old, prepared)
++        self.freeze()
++        self.assertIs(self.impl(1024), prepared)
++
++    def test_valid_frozen_explicit_preparation_is_idempotent(self):
++        prepared = self.prepare()
++        self.freeze()
++        self.assertIs(self.prepare(), prepared)
++        self.assertEqual(self.state.attempts, 1)
++
++    def test_failed_reprepare_revokes_old_explicit_permission(self):
++        self.prepare()
++        self.state.fail = True
++        with self.assertRaisesRegex(RuntimeError, "controlled preparation failure"):
++            self.prepare()
++        self.state.fail = False
++        self.freeze()
++        self.assert_missing(1024)
++
++    def test_cleared_wrapper_entry_is_not_resurrected(self):
++        self.prepare()
++        self.impl._kernel_cache.clear()
++        self.freeze()
++        self.assert_missing(1024)
++
++    def test_replaced_wrapper_entry_is_not_prepared(self):
++        self.prepare()
++        key = self.impl.func.parse_args(1024)[0]
++        self.impl._kernel_cache[key] = object()
++        self.freeze()
++        self.assert_missing(1024)
++
++    def test_wrapper_reset_and_new_wrapper_cannot_inherit_permission(self):
++        self.prepare()
++        self.impl.__post_init__()
++        self.freeze()
++        self.assert_missing(1024)
++        with self.assertRaises(self.scope["KernelNotPreparedError"]):
++            self.new()(1024)
++
++    def test_nested_compile_option_mutation_requires_repreparation(self):
++        self.impl.pass_configs = {"test": {"value": 1}}
++        old = self.prepare()
++        self.impl.pass_configs["test"]["value"] = 2
++        self.freeze()
++        self.assert_missing(1024)
++        self.scope["thaw"]()
++        self.state.cache_enabled = True
++        prepared = self.prepare()
++        self.assertIsNot(old, prepared)
++        self.state.cache_enabled = False
++        self.freeze()
++        self.assertIs(self.impl(1024), prepared)
++
++    def test_function_and_default_target_changes_are_not_prepared(self):
++        for mutation in (lambda: setattr(self.state, "target", "llvm"),
++                         lambda: setattr(self.state, "backend", "cython"),
++                         lambda: setattr(self.impl.func, "orig_func", lambda n, threads=128: None)):
++            self.setUp()
++            self.prepare()
++            mutation()
++            self.freeze()
++            self.assert_missing(1024)
++
++    def test_replaced_python_code_is_not_prepared(self):
++        self.prepare()
++        self.impl.func.orig_func.__code__ = (lambda n, threads=128: "changed").__code__
++        self.freeze()
++        self.assert_missing(1024)
++
++    def test_compile_flags_and_output_indices_are_context_bound(self):
++        for attribute, value in (("compile_flags", ["--changed"]), ("out_idx", [-1]),
++                                 ("target", "llvm"), ("target_host", "llvm"),
++                                 ("execution_backend", "cython")):
++            self.setUp()
++            self.prepare()
++            setattr(self.impl, attribute, value)
++            self.freeze()
++            self.assert_missing(1024)
++
++    def test_enabled_repeat_preparation_keeps_valid_prepared_object(self):
++        self.state.cache_enabled = True
++        prepared = self.prepare()
++        self.assertIs(self.prepare(), prepared)
++        self.state.cache_enabled = False
++        self.freeze()
++        self.assertIs(self.impl(1024), prepared)
++        self.assertEqual(self.state.attempts, 1)
++
++    def test_launch_arguments_and_stream_are_not_rewritten(self):
++        prepared = self.prepare()
++        self.freeze()
++        kernel = self.impl(1024)
++        stream = object()
++        self.assertIs(kernel, prepared)
++        self.assertEqual(kernel("operand", stream=stream), (("operand",), {"stream": stream}))
++
++    def test_prepare_still_rejects_eager_mode(self):
++        self.impl.mode = "eager"
++        with self.assertRaisesRegex(ValueError, "lazy-mode"):
++            self.prepare()
++
++
++if __name__ == "__main__":
++    unittest.main()
+diff --git a/tilelang/jit/__init__.py b/tilelang/jit/__init__.py
+index a809a996..e72e9575 100644
+--- a/tilelang/jit/__init__.py
++++ b/tilelang/jit/__init__.py
+@@ -20,14 +20,14 @@ from typing import (
+ from collections.abc import Callable
+ from collections.abc import Iterable
+ 
+-from tilelang import tvm as tvm
++from tilelang import env, tvm as tvm
+ from tilelang.language.eager import PrimFunc, prim_func, JITFunc
+ from tilelang.language.eager.builder import _make_jit_key
+ from tvm.target import Target
+ from contextlib import nullcontext
+ 
+ from tilelang.jit.kernel import JITKernel
+-from tilelang.cache import KernelNotPreparedError, cached
++from tilelang.cache import KernelNotPreparedError, cached, frozen
+ from tilelang.env import is_cache_enabled
+ from tilelang.utils.device import get_available_cpu_count
+ from os import path, makedirs
+@@ -367,9 +367,47 @@ class JITImpl(Generic[_P, _KP, _T, _Ret]):
+             except NameError:
+                 self.debug_root_path = path.abspath(self.debug_root_path)
+         self._kernel_cache: dict[tuple, Kernel] = {}
++        self._prepared_kernel_cache: dict[tuple, tuple[Kernel, tuple]] = {}
+         self._call_form_cache: _CallFormCache = _CallFormCache()
+         self._tuner_cache: dict[tuple, Kernel] = {}
+ 
++    def _preparation_context(self) -> tuple:
++        original = getattr(self.func, "orig_func", self.func)
++        return (
++            self.func,
++            original,
++            getattr(original, "__code__", None),
++            repr(
++                (
++                    self.mode, self.out_idx, self.target, self.target_host,
++                    self.execution_backend, self.pass_configs, self.compile_flags,
++                    self.debug_root_path, env.get_default_target(),
++                    env.get_default_execution_backend(),
++                )
++            ),
++        )
++
++    def _get_prepared_kernel(self, key):
++        entry = self._prepared_kernel_cache.get(key)
++        if entry is None:
++            return None
++        kernel, context = entry
++        current = self._preparation_context()
++        if (
++            kernel is self._kernel_cache.get(key)
++            and all(before is after for before, after in zip(context[:3], current[:3]))
++            and context[3] == current[3]
++        ):
++            return kernel
++        self._prepared_kernel_cache.pop(key, None)
++        return None
++
++    def _record_prepared_kernel(self, key, kernel) -> None:
++        self._kernel_cache[key] = kernel
++        self._prepared_kernel_cache[key] = (kernel, self._preparation_context())
++        # A fresh explicit preparation can replace a prior call-form entry.
++        self._call_form_cache.clear()
++
+     def _get_frontend_target_context(self):
+         if self.target is None:
+             return nullcontext()
+@@ -581,6 +619,10 @@ class JITImpl(Generic[_P, _KP, _T, _Ret]):
+ 
+         key, kernel_args = self.func.parse_args(*args, **kwargs)
+         kernel = self._kernel_cache.get(key, None) if cache_enabled else None
++        if not cache_enabled and frozen() is not None:
++            # Explicitly prepared kernels are startup state, not implicit reuse.
++            # Do not admit an ordinary wrapper hit merely because we are frozen.
++            kernel = self._get_prepared_kernel(key)
+         if kernel is None:
+             try:
+                 kernel = self.compile(*args, **kwargs)
+@@ -615,7 +657,12 @@ def prepare(
+     disk cache) on a shared thread pool (lowering releases the GIL and nvcc is a
+     subprocess), and its kernel is kept under the key ``__call__`` computes for the same
+     call, so the call itself is a cache hit. ``progress(done, total)`` is called as
+-    kernels finish.
++    kernels finish. With caching disabled, preparation compiles afresh and records
++    the resulting objects explicitly. Only those objects may be used after freeze;
++    ordinary cache-disabled calls still compile afresh while thawed. Changed
++    compile options require preparation again. A function's meaning, captured
++    Python globals and external compiler callbacks must stay unchanged, as for
++    the existing frontend/JIT caches; use a new wrapper when changing them.
+ 
+     Parameters
+     ----------
+@@ -634,13 +681,19 @@ def prepare(
+     calls = [(impl, tuple(args), dict(kwargs)) for impl, args, kwargs in calls]
+     keys = []
+     pending: dict[tuple[int, Any], tuple[JITImpl, Any, PrimFunc]] = {}
++    cache_enabled = is_cache_enabled()
+     for impl, args, kwargs in calls:
++        kwargs.update(kwargs.pop("__tune_params", {}))
+         impl.initialize_jit_mode(*args, **kwargs)
+         if not impl.is_lazy_mode():
+             raise ValueError("prepare() compiles lazy-mode kernels (functions that return a PrimFunc)")
+         key = impl.func.parse_args(*args, **kwargs)[0]
+         keys.append((impl, key))
+-        if key not in impl._kernel_cache and (id(impl), key) not in pending:
++        if impl._get_prepared_kernel(key) is not None and (cache_enabled or frozen() is not None):
++            continue
++        if (id(impl), key) not in pending:
++            # Failed or invalidated preparation must not leave an old permission.
++            impl._prepared_kernel_cache.pop(key, None)
+             pending[(id(impl), key)] = (impl, key, impl.get_tir(*args, **kwargs))
+     total = len(pending)
+     if progress is not None:
+@@ -664,7 +717,7 @@ def prepare(
+             }
+             for done, future in enumerate(concurrent.futures.as_completed(futures), 1):
+                 impl, key = futures[future]
+-                impl._kernel_cache[key] = future.result()
++                impl._record_prepared_kernel(key, future.result())
+                 if progress is not None:
+                     progress(done, total)
+     return [impl._kernel_cache[key] for impl, key in keys]
+-- 
+2.54.0 (Apple Git-157)

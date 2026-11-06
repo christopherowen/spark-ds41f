@@ -52,3 +52,49 @@ scratch-read fix. All three declared files per PR match their authored hashes.
 Their source checks do not qualify the outstanding TP1 timing or full-model
 inventories, and a TP3 repeat cannot establish a TP1 benefit. They remain draft;
 no topology, hardware or serving change is made for these source reviews.
+
+## Current follow-up
+
+C43 built, then failed one lazy-reference assertion at its138-file release gate
+(8103pass/360skip/1fail). No serving/performance phase ran. Independent C36
+restoration passed before the subsequent foreign window. Source review finds a
+test setter that can restore a lazily resolved reference into module globals
+after the extra test files changed process grouping; worker runtime bytes are
+unchanged from C40. The actual frozen C43 image's pytest9.1.1 CPU witness now
+reproduces the original failure, passes the corrected fixture and still detects
+preexisting pollution. Canonical577-patch replay and both offline example-map
+profile doctors pass. C46's new image, native gates and both metric boots remain
+pending; native C43 failed evidence stays failed and immutable.
+C45 compiler correction is source-ready with22 CPU controls, awaiting its final
+validated runtime base and native qualification. C40 remains the qualified base.
+The compiler refresh is maintenance and retained-feature preservation: a neutral
+performance outcome can pass with correctness and no material core/serving cost.
+No performance rejection is inferred from a compile, preparation or gate error.
+
+The primary inventory at02:32UTC has35 open PRs, including the new927–933 work.
+PR934's declared functional-evidence enforcement is merged after source review;
+it preserves C40's sampled isolated-repeat requirement and batch limitation.
+C46 adopts its API alongside the remaining C40 semantic predicates and a
+complete-suite audit. The existing first model operation must pass before its
+engine grid; no model workload is duplicated. All67 unique new/affected controls
+are covered by passing bounded remote checks, with original setup failures
+preserved. Software is ready for normal guarded scheduling; no hardware lease
+or C46 image/serving qualification follows. C45's independent draft profiles also
+pass both static example-map doctors and retain the corrected compiler identity.
+
+Evidence-only925's187 archive members pass independent size/hash verification,
+and its original performance analysis/core summary reproduce exactly on SP8.
+The three private model reports subsequently passed independent hash checks
+at their original DGX1 paths under a bounded CPU-only job; the absent snapshot
+path failure remains preserved. PR925 is merged as evidence only. No native
+gate, model comparison or serving measurement was repeated. Its memory finding
+is not an incremental C36 gain; C36 already
+selects expert-scale compaction, while packed Engram support and selection are
+distinct. The addendum retains original scripts/results and all adverse rows.
+Active studies remain separate. The earlier inventory added eight proposals916–923.
+Do not merge an active hardware study mid-round: #917 has expanded from its
+prior offline evidence-only head to a separate row-cost hardware screen. No
+modeled3percent benefit is credited as measured throughput. New proposals and
+other owners' hardware authorizations remain separate from our qualification.
+All further substantial preparation, testing and bulk analysis run remotely
+with explicit CPU/memory limits and shared capacity; the Mac stays lightweight.

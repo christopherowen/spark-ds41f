@@ -1,0 +1,163 @@
+{
+  "recorded": "2026-11-05T23:59:57.087228+00:00",
+  "status": "source_fixture_isolation_hypothesis_supported_actual_image_pytest_witness_and_canonical_replay_pending",
+  "candidate_reserved": 46,
+  "source_only": true,
+  "C43": {
+    "execution_commit": "2c4b23afcd834ba2adf6a15ca434e59fa4f49f74",
+    "image": "sha256:ac3c5a2ca2e934295ca7be60d69566d4c406aff22057b0a911661d49e5664905",
+    "vllm_head": "99029e6cbdb966ff198dd13902a0825e8d507e27",
+    "vllm_tree": "082bda0f13e94290f462eaf55d143cdb7931f9e5",
+    "patchset": "05586bfb7487c6436f75bc240e934ff7d1c2b81877f8c0014ae985a9f9d6245a",
+    "series": "experiments/2026-10-26-spark-ds41f-candidate/candidate-43/vllm/series",
+    "runtime_base": 40,
+    "native_gate_failed": true,
+    "native_counts_reported": {
+      "files": 138,
+      "passed": 8103,
+      "skipped": 360,
+      "failed": 1,
+      "error": 0
+    },
+    "serving_or_performance_phases": false,
+    "native_verdict_unchanged": true
+  },
+  "independent_read_only_source_findings": {
+    "C40_head": "5f926df6d3126266a9c88c82c06544060008c33c",
+    "C43_delta_files": [
+      "tests/v1/engine/test_request_submission_cleanup.py",
+      "tests/v1/engine/test_utility_call_cleanup.py",
+      "vllm/v1/engine/async_llm.py",
+      "vllm/v1/engine/core_client.py"
+    ],
+    "C40_C43_byte_identical_files": {
+      "tests/v1/worker/test_gpu_verified_logprob_token_ids.py": "6913e608464a89e7c95a2cd32a3e031f9ef092c6c0cb9a777d56f754ad177332",
+      "vllm/v1/worker/gpu/sample/logprob.py": "b68f947dec1d59939c9a71510955c246a3705bbe393acf6395a2e8988fca1126",
+      "vllm/v1/worker/gpu/_triton_refs.py": "d76d743de0492897b64f3672d1341b21e3c472bee5d0beb28d8d4f6d4a0b5c79"
+    },
+    "producer_file": "tests/v1/worker/test_gpu_tilelang_logprob_softmax.py",
+    "producer_file_sha256": "36ebabc33c3870b19355f89ce56d35d4d8137f4b20d22b19ba62317c32111f66",
+    "producer_function": "test_compute_token_logprobs_launches_tilelang",
+    "producer_setter_line": 449,
+    "producer_setter": "monkeypatch.setattr(logprob, \"_topk_log_softmax_kernel\", None)",
+    "consumer_file": "tests/v1/worker/test_gpu_verified_logprob_token_ids.py",
+    "consumer_function": "test_tilelang_worker_modules_hold_no_live_triton_reference_kernels",
+    "consumer_assertion_line": 508,
+    "runtime_getattr": "Returns getattr(_triton_refs,name); it does not assign a real worker module global.",
+    "all_worker_files_scanned": 78,
+    "scan_scope": "All worker-test module-resolved lazy-reference setters plus all kernel-named and dynamic setattr calls inspected against the complete consumer lazy-reference map.",
+    "matching_lazy_reference_setter_count": 1,
+    "other_matching_or_unresolved_lazy_reference_setters_found": false,
+    "source_proof_limit": "This is bounded static inspection, not a universal reflection/mutation proof or an executed native/pytest regression."
+  },
+  "recorded_grouping": {
+    "CHUNK": 10,
+    "CHUNK_TIMEOUT": 1800,
+    "FILE_TIMEOUT": 600,
+    "C40_manifest": {
+      "files": 136,
+      "sha256": "497ad736ec09365f64a046dac388c6c913cad65fa43939928580449ca5ebdf85",
+      "producer_index": 118,
+      "producer_chunk": 11,
+      "consumer_index": 125,
+      "consumer_chunk": 12
+    },
+    "C43_manifest": {
+      "files": 138,
+      "sha256": "9fb39d8853b13a50991a5b0c1cbb2a8902c038ecbc86e722ed22725939f05c75",
+      "producer_index": 120,
+      "producer_chunk": 12,
+      "consumer_index": 127,
+      "consumer_chunk": 12
+    },
+    "C43_chunk012_order": [
+      "tests/v1/worker/test_gpu_tilelang_logprob_softmax.py",
+      "tests/v1/worker/test_gpu_tilelang_sampling.py",
+      "tests/v1/worker/test_gpu_tilelang_structured.py",
+      "tests/v1/worker/test_gpu_tilelang_topk_ids.py",
+      "tests/v1/worker/test_gpu_tilelang_topk_topp.py",
+      "tests/v1/worker/test_gpu_trace_replay.py",
+      "tests/v1/worker/test_gpu_ubatch_slicing.py",
+      "tests/v1/worker/test_gpu_verified_logprob_token_ids.py",
+      "tests/v1/worker/test_gpu_warmup_blocks.py",
+      "tests/v1/worker/test_gpu_worker.py"
+    ]
+  },
+  "recorded_native_cases_read_without_rerun": {
+    "C40/chunk011.xml": {
+      "sha256": "537454234426e92e35d891ac816e604cb22f80316d108bcc2a0e10b872ed9f71",
+      "producer_fp32": "passed",
+      "producer_bf16": "passed"
+    },
+    "C40/chunk012.xml": {
+      "sha256": "898a1380c33ba9320302c6545a32fe925a96ba4d6ba7918d5e68730d0244e33c",
+      "consumer": "passed"
+    },
+    "C43/chunk012.xml": {
+      "sha256": "8b49af684037d4965c59b8f8405f588a00186e38202f9640274929ef45fe64ee",
+      "producer_fp32": "passed",
+      "producer_bf16": "passed",
+      "consumer": "failure",
+      "message": "vllm.v1.worker.gpu.sample.logprob._topk_log_softmax_kernel should be lazy"
+    },
+    "C43/results.jsonl_sha256": "56d95da99082d24b3f8f4f73a1f36f6a654c1aa91d339aac95fad5ce2f4d83b3",
+    "new_frontend_files": [
+      {
+        "file": "tests/v1/engine/test_request_submission_cleanup.py",
+        "status": "ok",
+        "passed": 10,
+        "failed": 0,
+        "error": 0,
+        "skipped": 0
+      },
+      {
+        "file": "tests/v1/engine/test_utility_call_cleanup.py",
+        "status": "ok",
+        "passed": 20,
+        "failed": 0,
+        "error": 0,
+        "skipped": 0
+      }
+    ]
+  },
+  "pytest_semantics_basis": {
+    "official_8_4_source": "https://docs.pytest.org/en/8.4.x/_modules/_pytest/monkeypatch.html",
+    "official_current_source": "https://docs.pytest.org/en/stable/_modules/_pytest/monkeypatch.html",
+    "qualification": "8.4.x setter resolves the old attribute using getattr and undo restores it. Current stable adds dictionary-state handling. Actual C43 installed version and source hash have NOT been captured yet; source causality is not fully proven until the image-specific witness runs."
+  },
+  "draft_correction": {
+    "path": "draft/fixture-cleanup.diff",
+    "sha256": "e7950e488a1b874427a65e3e57e9efdf252a593e5679d93a4d6a1d3433020b92",
+    "target_files": [
+      "tests/v1/worker/test_gpu_tilelang_logprob_softmax.py"
+    ],
+    "expected_producer_after_sha256": "7c15eb3a5704e43b08ca06f91f7a4145d59efdbf3e7084f0dce025b09b6a91c0",
+    "scope": "Context-scoped dictionary poisoning with post-context laziness regression. All original numerical/routing/shape/launch assertions remain; no runtime code or consumer assertion change.",
+    "manifest_files_remain": 138,
+    "file_grouping_or_deselection_changed": false,
+    "git_apply_check": "passed on exact C43 source, read-only; initial hunk EOF-format error retained",
+    "witness_and_proposed_file_Python312_syntax": "passed via bounded remote AST inspection; no execution"
+  },
+  "pending": [
+    "Capture actual C43 pytest version/source hash in isolated CPU-only immutable-image reuse after safe capacity checks.",
+    "Run fixture_witness.py against original and corrected source; old red/new green plus preexisting-pollution negative control. No GPU arithmetic or native gate replay.",
+    "Fresh named canonical replay of unchanged C43 series plus this one correction in safely reserved remote CPU area. No source head/tree/patchset claim before it.",
+    "New clean published candidate identity, image and full native gates/functional/two metric boots if focused source proof passes."
+  ],
+  "scope": {
+    "remote_read_only_inspection_limits": {
+      "host": "dgx4",
+      "CPU_affinity_count": 1,
+      "address_space_gib": 4,
+      "CPU_work_lock": "~/spark-cpu-work.lock nonblocking"
+    },
+    "CPU_fixture_or_native_tests_run": false,
+    "Docker_or_GPU_operations": false,
+    "canonical_replay_or_source_application": false,
+    "deployment_commit_or_push": false,
+    "main_or_serving_profile_changes": false,
+    "native_or_runtime_checkout_changes": false,
+    "new_host_CPU_claim_created": false,
+    "capacity_defer": "Foreign verification-budget window observed; then pending ced-local-boundary DGX4 request. No new CPU/Docker/source-preparation job was placed ahead of it."
+  }
+}

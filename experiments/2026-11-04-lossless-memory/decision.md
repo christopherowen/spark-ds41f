@@ -2,7 +2,7 @@
 
 No variable qualifies for release. Reject all ten measured hot-FP8 layouts
 (three Huffman, three fixed-field and four independent-plane LZ4); retain the
-isolated expert-scale and Engram arms for target measurement.
+Engram arm for target measurement. The expert-scale two-boot experiment is complete.
 Cold prefix storage needs a model-compatible restoration path before timing.
 
 - FP8: all six fresh GPU containers reconstructed every sampled weight byte and
@@ -20,15 +20,15 @@ Cold prefix storage needs a model-compatible restoration path before timing.
   first/repeat ratio interval is above 1. The families use different consumer
   widths, so their absolute times are not a cross-family comparison. Complete
   native evidence is retained in each family's `gpu-results.json` archive map.
-- Expert scales: reuse the existing exact compaction design in an isolated
-  promoted-base arm. Prior persistent-memory observations are hypotheses for this
-  arm. The corrected full gate passes on all three ranks (7,337 passed, 355 skipped
-  each). The complete initial primary matches all 256 recorded generated sequences
-  and 65,536 returned score vectors exactly. Its newer stream collector prevents
-  treating it as the matched 1030 performance comparison. The deliberate handoff
-  restored C36; all observations and errors remain in
-  `expert-scales/first-primary-results.json`. Unchanged scale words, kernel/output
-  bits, two matched serving boots and the remaining functional gates are required.
+- Expert scales: the matched two-boot cohort completed all rank, exact-model and
+  functional gates. All 256 sequences and 65,536 returned score vectors match
+  the recorded reference exactly on each boot. The framework model-load CUDA
+  allocation counter is 92.62–92.63 GiB per rank against the saved 93.95 GiB scalar,
+  about 1.32–1.33 GiB lower. This is not a host-RSS or extra-KV-capacity measurement.
+  There is no repeatable serving speedup; retain the C8 slowdown flags and all
+  unfavorable rows. The existing C36 stack already uses the scale representation.
+  Do not release this historical-base arm as an incremental C36 improvement.
+  See `expert-scales/recorded-results.json` and `expert-scales/recorded-results.md`.
 - Engram: the packed-row arm now rejects negative column deltas before signed
   subtraction. The portable C fixture reproduced the old overflow and passed
   the corrected guard plus 1,025 valid rows. Native reader tests, packing time,
