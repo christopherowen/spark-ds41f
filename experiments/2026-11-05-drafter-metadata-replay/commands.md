@@ -92,3 +92,22 @@ Here `.venv/bin/python` is the prepared source environment at
 invoked from the deployment checkout. Each archived `command.json` contains the
 exact container command, mounts, environment and resource limits.
 `runs/micro-20261106/archives.json` hashes the retained raw outputs and summary.
+
+## Complete build inputs, 2026-11-06
+
+On Spaceport at deployment `99e3852b7a3aea56ba00c24575937c0680908159`, under the
+shared CPU lock, CPU affinity 0,1, nice 10 and an 8-GiB virtual-memory limit:
+
+```sh
+/home/chris/spark-lab/inputs/drafter-tools-20261105/uv venv --python /usr/bin/python3 /home/chris/spark-lab/inputs/drafter-tools-20261105/build-venv
+/home/chris/spark-lab/inputs/drafter-tools-20261105/uv pip install --python /home/chris/spark-lab/inputs/drafter-tools-20261105/build-venv/bin/python pip==25.2
+/home/chris/spark-lab/inputs/drafter-tools-20261105/build-venv/bin/python bin/spark --cluster-config experiments/2026-11-05-drafter-metadata-replay/candidate.json build prepare
+/home/chris/spark-lab/inputs/drafter-tools-20261105/build-venv/bin/python bin/spark --cluster-config experiments/2026-11-05-drafter-metadata-replay/candidate.json build check
+```
+
+Git pack threads were limited to two via process-local Git configuration;
+`MAX_JOBS=2 OMP_NUM_THREADS=2`. About 2.4 TiB was free on the remote scratch
+volume before preparation. The initial attempt used the source lint environment
+and stopped because it had no pip module; all prepared sources were retained and
+reused. Both attempts, environment setup, the passing check and exact prepared
+inputs are archived under `runs/build-20261106/`. This is CPU preparation only.

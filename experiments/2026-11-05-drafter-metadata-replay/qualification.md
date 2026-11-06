@@ -26,8 +26,9 @@ active frontend qualification hold and another task's request existed.
    rebuild is absent. Record graph memory before/after and startup compilation.
    If a gate fails, retain it and investigate before another candidate.
 
-2. Complete all pinned build inputs on an idle DGX/Spaceport builder; run the
-   candidate's `bin/spark build check`. If an image is built, build once and record
+2. Full pinned build inputs were prepared on Spaceport and the candidate's
+   `bin/spark build check` passed (`runs/build-20261106/`). The image build and
+   its gate remain pending. Build once and record
    its digest, source labels and whole release-gate result. Never overwrite an
    image tag or infer source identity from it.
 

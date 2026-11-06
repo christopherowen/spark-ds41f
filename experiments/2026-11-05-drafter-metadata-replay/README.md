@@ -41,8 +41,9 @@ recovery ran on Spaceport with a two-CPU/8-GiB limit and the shared CPU lock.
 `runs/` retains the unsuccessful setup and checks as well as the passing runs.
 `commands.md` gives reproduction and limitations; `qualification.md` gives the
 remaining gates. `results.json` distinguishes host checks, measured component
-results and unmeasured serving outcomes. No source-complete image build or build
-check has run because only vLLM inputs were prepared.
+results and unmeasured serving outcomes. The complete pinned build
+inputs now pass `bin/spark build check` on Spaceport; native receipts are in
+`runs/build-20261106/`. No candidate image build or serving qualification has run.
 
 The owner accepts a demonstrated correctness improvement with preserved
 performance; a speedup is not mandatory for such a repair. That route requires a

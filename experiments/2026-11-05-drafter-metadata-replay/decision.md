@@ -13,8 +13,9 @@ queued first, the measured saving is 2.940 us (95% CI 2.578–3.308) on boot 1 a
 sequence. Neither the isolated 97.6–97.7% component reduction nor the overlap
 percentage is a serving-throughput prediction. See [micro-results.md](micro-results.md).
 
-No serving run, source-complete image build, target sampling/rank validation or
-promotion has occurred. Keep launch disabled and both PRs draft. Full serving
+Full pinned build preparation and `build check` now pass. No serving run,
+source-complete image build, target sampling/rank validation or promotion has
+occurred. Keep launch disabled and both PRs draft. Full serving
 qualification remains necessary before claiming a user-visible performance gain.
 The owner explicitly allowed the isolated Spaceport screen; it respected the
 local GPU/CPU reservations, yielded between boots, and released its hold. The
