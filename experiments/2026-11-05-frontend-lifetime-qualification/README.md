@@ -81,7 +81,15 @@ image/gate exits are required before distribution. A failed release gate keeps
 its native verdict and copied XML/JSONL before the coordinator refuses serving.
 
 Both functional boots require all40 ordered script exits to pass independently
-of their parent exit. The unchanged full release-tp3, single-stream and sampled
+of their parent exit. The functional spec additionally declares the three greedy
+collectors' `identical` and expected logprob mode as required evidence. Seeded
+sampling requires a matching isolated repeat while retaining batch differences
+as observations, consistent with the historical audit. Missing or malformed
+declared evidence blocks the lab before the controller can start performance.
+Sampled requests now retain private per-case tokens/logprobs, controls and IDs;
+native logit positions and speculative-step grouping remain unavailable via HTTP.
+These changes qualify the evidence contract, not the unmeasured runtime.
+The unchanged full release-tp3, single-stream and sampled
 families run on a fresh boot and repeat (six suites/26 ordered steps). Explicit
 current stream policy matches the saved full protocol; no lean/full mixing.
 The coordinator owns heartbeat/guard checks and restores named C36 once at the
