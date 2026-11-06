@@ -622,19 +622,20 @@ diff --git a/experiments/2026-11-04-lossless-memory/run_component.py b/experimen
  
  
  def preflight(arm, through):
-@@ -393,8 +420,10 @@
+@@ -393,8 +420,11 @@
          receipt["steps"].append(row)
          save()
          with (out / row["log"]).open("x") as log:
-+            environment=os.environ.copy()
-+            if args.component=="engram":environment["SPARK_DS41F_LOSSLESS_OBSERVER_WINDOW"]=args.window
++            extra_env = ({"env": {**getattr(os, "environ", {}),
++                                  "SPARK_DS41F_LOSSLESS_OBSERVER_WINDOW": args.window}}
++                         if args.component == "engram" else {})
              process = subprocess.run(argv, cwd=ROOT, input=input_text, text=True,
 -                                     stdout=log, stderr=subprocess.STDOUT)
-+                                     stdout=log, stderr=subprocess.STDOUT,env=environment)
++                                     stdout=log, stderr=subprocess.STDOUT, **extra_env)
          row.update(exit=process.returncode, ended=lab.now())
          text = (out / row["log"]).read_text(errors="replace").lower()
          management_lost |= any(marker in text for marker in MANAGEMENT_ERRORS)
-@@ -449,26 +478,42 @@
+@@ -449,26 +479,42 @@
          for node in nodes["nodes"]:
              if not owns():
                  raise RuntimeError("window changed before I/O observation")
