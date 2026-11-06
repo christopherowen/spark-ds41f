@@ -71,7 +71,13 @@ site map and shape on all ranks. Install and test `branch_watchdog.py` against
 that captured state before changing any checkout. It restores through a separate
 clean controller at the original commit. Each operation runs under the recorded
 operation lock; each long-running child has an activity marker until confirmed
-exited. Never remove the hold with unresolved children or failed restoration.
+exited, and unresolved markers block any `stop`/`sync`/`start` restoration
+mutation as well as final hold release. Management or guard-telemetry failures
+(including halts and fan-stop failures propagated from `guarded_probe.py`) latch
+a sticky review state in the owned hold and forbid automatic restoration
+mutations even after subsequent reads recover. Revalidate exact window, holder
+and owner-token ownership under the hold-mutation lock immediately before
+unlinking the hold so a foreign replacement is never touched.
 
 Publish this experiment commit, then inspect the coordinated sync plan:
 

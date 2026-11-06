@@ -153,6 +153,125 @@ class WatchdogTest(unittest.TestCase):
             self.assertTrue(hold.exists())
             self.assertEqual([a[a.index('cluster') + 1] for a in calls if '--apply' in a], ['stop', 'sync', 'start'])
 
+    def test_transient_management_loss_latches_review_hold_and_forbids_restoration(self):
+        with tempfile.TemporaryDirectory() as d:
+            root = Path(d)
+            state = {'window': 'ours', 'holder': 'prefix-recovery', 'owner_token': 'tok-1',
+                     'restore_controller': d, 'restore_commit': 'original',
+                     'restore_image_id': 'image', 'restore_nodes': ['rank0'],
+                     'restore_image_tag': 'tag', 'restore_profile': 'profile'}
+            hold = root / 'hold'
+            hold.write_text(json.dumps(state))
+            calls = []
+            first_live = True
+            def fake(argv, cwd, output=None):
+                nonlocal first_live
+                calls.append(argv)
+                if argv[:2] == ['git', 'rev-parse']:
+                    return 'original\n'
+                if argv[0] == 'docker':
+                    return 'image\n'
+                if argv[-2:] == ['doctor', '--live'] and first_live:
+                    first_live = False
+                    raise RuntimeError('ssh: connect to host dgx2 port 22: Connection timed out')
+                return 'live: stopped\nshape: unchanged\n' if 'cluster' in argv else ''
+            with patch.object(guard, 'checked', side_effect=fake), patch.object(guard, 'verify_restored'):
+                with self.assertRaisesRegex(RuntimeError, 'Connection timed out'):
+                    guard.restore(state, hold, root / 'out1')
+                self.assertFalse(any('cluster' in argv for argv in calls))
+                latched = json.loads(hold.read_text())
+                self.assertTrue(latched['management_loss_latched'])
+                self.assertEqual(latched['original_holder'], 'prefix-recovery')
+                self.assertEqual(latched['holder'], 'prefix-recovery-hardware-review')
+                calls.clear()
+                # Subsequent reads recover, but the sticky latch must forbid any restoration command.
+                with self.assertRaisesRegex(RuntimeError, 'Sticky management/telemetry loss latch'):
+                    guard.restore(state, hold, root / 'out2')
+                self.assertEqual(calls, [])
+                self.assertTrue(hold.exists())
+                self.assertTrue(json.loads(hold.read_text())['management_loss_latched'])
+
+    def test_guard_loss_from_guarded_probe_latches_hold_and_blocks_restore_and_requests(self):
+        import guarded_probe
+        with tempfile.TemporaryDirectory() as d:
+            root = Path(d)
+            hold = root / 'hold'
+            state_path = root / 'state.json'
+            state = {'window': 'ours', 'holder': 'prefix-recovery', 'owner_token': 'tok-1',
+                     'hold_path': str(hold), 'restore_controller': d,
+                     'restore_commit': 'original', 'restore_image_id': 'image',
+                     'restore_nodes': ['rank0'], 'restore_image_tag': 'tag',
+                     'restore_profile': 'profile'}
+            state_path.write_text(json.dumps(state))
+            foreign_bytes = b'{"window": "theirs", "holder": "foreign", "owner_token": "tok-2"}\n'
+            hold.write_bytes(foreign_bytes)
+            self.assertFalse(guarded_probe.propagate_guard_loss(
+                state_path, {'halted': ['memguard telemetry lost on dgx3'], 'fan_stop_failures': []}))
+            self.assertEqual(hold.read_bytes(), foreign_bytes)
+
+            hold.write_text(json.dumps({**state, 'heartbeat': '2099-01-01T00:00:00Z'}))
+            self.assertTrue(guarded_probe.propagate_guard_loss(
+                state_path, {'halted': ['memguard telemetry lost on dgx3'], 'fan_stop_failures': ['dgx3: fan stop failed']}))
+            latched = json.loads(hold.read_text())
+            self.assertTrue(latched['management_loss_latched'])
+            self.assertEqual(latched['management_loss_phase'], 'guarded_probe')
+            with self.assertRaisesRegex(RuntimeError, 'telemetry loss latched'):
+                require_window(state_path)
+            with patch.object(guard, 'checked') as command, patch.object(guard, 'verify_restored'):
+                with self.assertRaisesRegex(RuntimeError, 'Sticky management/telemetry loss latch'):
+                    guard.restore(state, hold, root / 'out')
+                command.assert_not_called()
+
+    def test_active_job_marker_blocks_stop_sync_start_before_any_mutation(self):
+        with tempfile.TemporaryDirectory() as d:
+            root = Path(d)
+            marker = root / 'active-probe.marker'
+            marker.write_text('running\n')
+            state = {'window': 'ours', 'holder': 'prefix-recovery', 'restore_controller': d,
+                     'restore_commit': 'original', 'restore_image_id': 'image', 'restore_nodes': ['rank0'],
+                     'restore_image_tag': 'tag', 'restore_profile': 'profile',
+                     'activity_markers': [str(marker)]}
+            hold = root / 'hold'
+            hold.write_text(json.dumps(state))
+            with patch.object(guard, 'checked') as command, patch.object(guard, 'verify_restored'):
+                with self.assertRaisesRegex(RuntimeError, 'Unresolved owned job markers block restoration'):
+                    guard.restore(state, hold, root / 'out')
+                command.assert_not_called()
+            self.assertTrue(hold.exists())
+
+    def test_foreign_hold_replacement_during_final_verification_is_preserved_untouched(self):
+        for replacement in (
+            b'{"window": "foreign-window", "holder": "other-agent", "owner_token": "foreign-token"}\n',
+            b'{"window": "ours", "holder": "prefix-recovery", "owner_token": "replaced-token"}\n',
+        ):
+            with self.subTest(replacement=replacement.decode().strip()), tempfile.TemporaryDirectory() as d:
+                root = Path(d)
+                state = {'window': 'ours', 'holder': 'prefix-recovery', 'owner_token': 'our-token',
+                         'restore_controller': d, 'restore_commit': 'original',
+                         'restore_image_id': 'image', 'restore_nodes': ['rank0'],
+                         'restore_image_tag': 'saved-tag', 'restore_profile': 'saved-profile.json'}
+                hold = root / 'hold'
+                hold.write_text(json.dumps(state))
+                calls = []
+                def fake(argv, cwd, output=None):
+                    calls.append(argv)
+                    if argv[:2] == ['git', 'rev-parse']:
+                        return 'original\n'
+                    if argv[0] == 'docker':
+                        return 'image\n'
+                    if argv[-2:] == ['doctor', '--live'] and not any('start' in call for call in calls):
+                        raise RuntimeError('candidate is live')
+                    return 'live: stopped\nshape: unchanged\n' if 'cluster' in argv else ''
+                def replace_on_final(_state, _controller, output):
+                    if output.name == 'snapshot-final.json':
+                        hold.write_bytes(replacement)
+                with patch.object(guard, 'checked', side_effect=fake), \
+                     patch.object(guard, 'verify_restored', side_effect=replace_on_final):
+                    with self.assertRaisesRegex(RuntimeError, 'ownership changed'):
+                        guard.restore(state, hold, root / 'out')
+                self.assertTrue(hold.exists())
+                self.assertEqual(hold.read_bytes(), replacement)
+
 
 if __name__ == '__main__':
     unittest.main()

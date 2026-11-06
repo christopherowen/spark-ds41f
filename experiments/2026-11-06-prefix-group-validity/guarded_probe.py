@@ -6,6 +6,7 @@ import signal
 import subprocess
 import sys
 from pathlib import Path
+from branch_watchdog import latch_management_loss
 from window_lease import require_window
 from source_overlay import verify as verify_source
 
@@ -16,6 +17,23 @@ from spark_ds41f.bench import (
     MemoryWatch, PeakWatch, bench_identity, cool_nodes, fan_control_enabled,
     fan_curve_problems, start_fan_curve, stop_fan_curve,
 )
+
+
+def propagate_guard_loss(window_state_path, conditions):
+    reasons = [*conditions.get('halted', []), *conditions.get('fan_stop_failures', [])]
+    if not reasons or window_state_path is None:
+        return False
+    state = json.loads(Path(window_state_path).read_text())
+    return latch_management_loss(
+        state,
+        Path(state['hold_path']),
+        '; '.join(str(r) for r in reasons),
+        phase='guarded_probe',
+        details={
+            'halted': list(conditions.get('halted', [])),
+            'fan_stop_failures': list(conditions.get('fan_stop_failures', [])),
+        },
+    )
 
 
 def main():
@@ -44,6 +62,7 @@ def main():
         def halt(reason):
             if reason not in conditions['halted']:
                 conditions['halted'].append(reason)
+            propagate_guard_loss(args.window_state, conditions)
             if child is not None and child.poll() is None:
                 child.send_signal(signal.SIGINT)
         memory = None
@@ -97,6 +116,7 @@ def main():
                 conditions['memory'] = memory.close()
             if peak is not None:
                 conditions['peak'] = peak.finish()
+            conditions['management_loss_latched'] = propagate_guard_loss(args.window_state, conditions)
             conditions['exit_code'] = code
             conditions['passed'] = code == 0 and not conditions['halted'] and not conditions['fan_stop_failures']
             json.dump(conditions, record, indent=2)
