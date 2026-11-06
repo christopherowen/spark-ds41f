@@ -50,6 +50,16 @@ def int_list(value: str) -> list[int]:
         raise argparse.ArgumentTypeError(f"expected comma-separated integers: {value!r}") from error
 
 
+def positive_compile_jobs(value: str) -> int:
+    try:
+        result = int(value)
+    except ValueError as error:
+        raise argparse.ArgumentTypeError("expected a positive integer") from error
+    if result < 1:
+        raise argparse.ArgumentTypeError("expected a positive integer")
+    return result
+
+
 def parser() -> argparse.ArgumentParser:
     root = argparse.ArgumentParser(prog="spark")
     root.add_argument(
@@ -179,6 +189,10 @@ def parser() -> argparse.ArgumentParser:
     )
     build_image.add_argument(
         "--tag", help="image tag (default: container.image from the cluster config)"
+    )
+    build_image.add_argument(
+        "--max-compile-jobs", type=positive_compile_jobs, metavar="N",
+        help="cap vLLM, TileLang and NCCL compile jobs without relaxing host memory or CPU sizing",
     )
     build_image.add_argument(
         "--apply", action="store_true", help="build under the memory guard, then run the GPU smoke"

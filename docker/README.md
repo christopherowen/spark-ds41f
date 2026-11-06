@@ -146,6 +146,15 @@ the base image's layers still hold the files. Any other runtime is refused
   reserve, four CPUs reserved, two NVCC threads per job, at most ten jobs.
 - It samples MemAvailable every second and cancels the build below 24 GiB.
 
+`build image --max-compile-jobs N` can lower the computed compilation parallelism
+for vLLM, TileLang and NCCL; it never raises the host-derived limit or relaxes
+the memory floor. With no option, the existing sizing and NCCL's four-job
+Dockerfile default stay unchanged. The receipt records the requested cap and
+effective job counts; with the option, its separate16GiB/no-extra-swap GPU smoke
+also has a CPU limit of at most two. This caps compiler jobs, not the Docker daemon's resources;
+an experiment that needs a hard compilation CPU/memory bound must also select
+and verify a resource-limited BuildKit worker.
+
 After the build it checks the tree labels, then imports the DS4.1 serving
 modules on the GPU in a 16 GiB container. It writes a receipt with the image
 ID, job count, elapsed time, and lowest MemAvailable.

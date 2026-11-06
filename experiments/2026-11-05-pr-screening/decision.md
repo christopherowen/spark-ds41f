@@ -11,6 +11,21 @@ metadata-only proposal remains withdrawn. The [update and scope](runs/compiler-r
 supersede the historical idea-drop and closure decisions below. C40 remains the
 validated default-enabled base. C43 frontend cleanup stays independent on C40.
 
+C45's focused compiler correction is source-ready with22 CPU controls. The
+compiler stack's purpose is maintenance and retained-feature preservation;
+correctness plus neutral performance without a material core/serving regression
+can qualify it. Source/build trouble is unfinished work, not a performance loss
+or grounds to abandon an otherwise unmeasured idea.
+
+C46's canonical source and actual-C43-image CPU fixture proof now pass; original
+C43 native failure remains failed. Native image/gates and metrics are pending
+control integration, bounded remote checks and fair scheduling. PR934's
+declared-evidence API is merged; its scope is explicit consumer requirements,
+not a retrospective demand for sampled batch invariance. Complete semantic,
+model-before-grid and six-suite completion barriers are required for C46.
+PR925's archive and offline analysis are independently verified within the
+published limits; its three external model files remain pending safe access.
+
 ## Previous decisions retained as history
 
 # Current decision

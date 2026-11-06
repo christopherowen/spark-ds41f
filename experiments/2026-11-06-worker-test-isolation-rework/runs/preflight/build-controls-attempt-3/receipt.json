@@ -1,0 +1,170 @@
+{
+  "started": "2026-11-06T01:55:15.099048+00:00",
+  "commit": "3de1bbba2a7b715c047f97825f132bf23b3da615",
+  "steps": [
+    {
+      "name": "GPU-readonly-precondition",
+      "argv": [
+        "nvidia-smi",
+        "--query-compute-apps=pid",
+        "--format=csv,noheader"
+      ],
+      "exit": 0,
+      "stdout": "GPU-readonly-precondition.stdout",
+      "stderr": "GPU-readonly-precondition.stderr"
+    },
+    {
+      "name": "clean-reused-offline-checkout",
+      "argv": [
+        "git",
+        "-c",
+        "gc.auto=0",
+        "-c",
+        "maintenance.auto=false",
+        "-c",
+        "pack.threads=1",
+        "-C",
+        "/home/chris/spark-work/worker-test-isolation/c46-build-controls-attempt-1/checkout",
+        "status",
+        "--porcelain"
+      ],
+      "exit": 0,
+      "stdout": "clean-reused-offline-checkout.stdout",
+      "stderr": "clean-reused-offline-checkout.stderr"
+    },
+    {
+      "name": "fetch-exact-corrected-control-source",
+      "argv": [
+        "git",
+        "-c",
+        "gc.auto=0",
+        "-c",
+        "maintenance.auto=false",
+        "-c",
+        "pack.threads=1",
+        "-C",
+        "/home/chris/spark-work/worker-test-isolation/c46-build-controls-attempt-1/checkout",
+        "fetch",
+        "--no-tags",
+        "--depth=1",
+        "--filter=blob:none",
+        "deployment",
+        "3de1bbba2a7b715c047f97825f132bf23b3da615"
+      ],
+      "exit": 0,
+      "stdout": "fetch-exact-corrected-control-source.stdout",
+      "stderr": "fetch-exact-corrected-control-source.stderr"
+    },
+    {
+      "name": "sparse-patterns",
+      "argv": [
+        "git",
+        "-c",
+        "gc.auto=0",
+        "-c",
+        "maintenance.auto=false",
+        "-c",
+        "pack.threads=1",
+        "-C",
+        "/home/chris/spark-work/worker-test-isolation/c46-build-controls-attempt-1/checkout",
+        "sparse-checkout",
+        "set",
+        "--no-cone",
+        "--stdin"
+      ],
+      "exit": 0,
+      "stdout": "sparse-patterns.stdout",
+      "stderr": "sparse-patterns.stderr"
+    },
+    {
+      "name": "exact-published-checkout",
+      "argv": [
+        "git",
+        "-c",
+        "gc.auto=0",
+        "-c",
+        "maintenance.auto=false",
+        "-c",
+        "pack.threads=1",
+        "-C",
+        "/home/chris/spark-work/worker-test-isolation/c46-build-controls-attempt-1/checkout",
+        "checkout",
+        "-b",
+        "feat/c46-build-control-check-3",
+        "3de1bbba2a7b715c047f97825f132bf23b3da615"
+      ],
+      "exit": 0,
+      "stdout": "exact-published-checkout.stdout",
+      "stderr": "exact-published-checkout.stderr"
+    },
+    {
+      "name": "verify-commit",
+      "argv": [
+        "git",
+        "-c",
+        "gc.auto=0",
+        "-c",
+        "maintenance.auto=false",
+        "-c",
+        "pack.threads=1",
+        "-C",
+        "/home/chris/spark-work/worker-test-isolation/c46-build-controls-attempt-1/checkout",
+        "rev-parse",
+        "HEAD"
+      ],
+      "exit": 0,
+      "stdout": "verify-commit.stdout",
+      "stderr": "verify-commit.stderr"
+    },
+    {
+      "name": "offline-fixture-master-addresses",
+      "argv": [
+        "python3",
+        "-B",
+        "-c",
+        "import json,pathlib,spark_ds41f as s;root=pathlib.Path.cwd();before={};after={};exec(\"for name,local in [('tp3.json','config/nodes.json'),('tp4.json','config/nodes-ring4.local.json')]:\\n p=root/local;d=json.loads(p.read_text());before[local]=d.copy();cfg=s.read_cluster('experiments/2026-10-26-spark-ds41f-candidate/candidate-46/'+name);head=next(n for n in d['nodes'] if n['head']);head['management_ip']=cfg['distributed']['master_addr'];p.write_text(json.dumps(d,indent=2)+'\\n');after[local]=d\");print(json.dumps({'scope':'ignored offline documentation examples only; never deployment authority','after':after}))"
+      ],
+      "exit": 1,
+      "stdout": "offline-fixture-master-addresses.stdout",
+      "stderr": "offline-fixture-master-addresses.stderr"
+    }
+  ],
+  "purpose": "offline build-resource controls and static profile doctor",
+  "GPU_serving_or_existing_checkout_changes": false,
+  "effective_limits": {
+    "cpu.max": "100000 100000",
+    "memory.max": "8589934592",
+    "memory.swap.max": "0"
+  },
+  "sparse_patterns": [
+    "/.gitignore",
+    "/AGENTS.md",
+    "/README.md",
+    "/pyproject.toml",
+    "/upstreams.lock.json",
+    "/bin/",
+    "/spark_ds41f/",
+    "/scripts/",
+    "/tests/",
+    "/config/",
+    "/docker/",
+    "/requirements/",
+    "/patches/",
+    "/manifests/",
+    "/docs/",
+    "/releases/",
+    "/experiments/*/*.json",
+    "/experiments/**/source.json",
+    "/experiments/**/upstreams.lock.json",
+    "/experiments/**/series",
+    "/experiments/**/*.patch",
+    "/experiments/2026-10-26-spark-ds41f-candidate/*/*.json",
+    "/experiments/2026-11-06-worker-test-isolation-rework/*.py"
+  ],
+  "existing_reference_checkout_untouched": true,
+  "unit_tests": "Not rerun: original19 checks plus corrected2 targeted checks already cover all19 unique tests.",
+  "ignored_map_fixture_scope": "Documentation examples only; no real node maps, hardware qualification or deployment authority.",
+  "passed": false,
+  "error": "RuntimeError: offline-fixture-master-addresses exited 1",
+  "ended": "2026-11-06T01:55:17.016175+00:00"
+}
