@@ -1,0 +1,289 @@
+........................................................................ [ 42%]
+........................................................................ [ 85%]
+..................FFFFFF                                                 [100%]
+=================================== FAILURES ===================================
+________ test_preemption_does_not_skip_private_generated_history[0-129] ________
+
+generated = 129, order = 0
+
+    @pytest.mark.parametrize("generated", [129, 257, 513])
+    @pytest.mark.parametrize("order", [0, 31])
+    def test_preemption_does_not_skip_private_generated_history(generated, order):
+        manager, roles = make_manager(None, order)
+        prompt = list(range(1024))
+        req = request("resumed", prompt)
+        assert manager.allocate_slots(req, len(prompt)) is not None
+        req.num_computed_tokens = len(prompt)
+        req.append_output_token_ids(list(range(1024, 1024 + generated)))
+        assert manager.allocate_slots(req, generated) is not None
+        req.num_computed_tokens = req.num_tokens
+        manager.free(req)
+        req.num_computed_tokens = 0
+        req.status = RequestStatus.PREEMPTED
+    
+        # A genuinely new prompt can reuse later encoder pages; an interrupted
+        # continuation must reconstruct decoder history from its original prompt.
+        fresh_prompt = request("fresh", req.all_token_ids)
+        _, later_hit = verify_hit(manager, roles, fresh_prompt)
+        assert later_hit > len(prompt) - WINDOW
+>       blocks, hit = verify_hit(manager, roles, req, cap=len(prompt) - WINDOW)
+                      ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+tests/v1/core/test_prefix_group_validity.py:313: 
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
+
+manager = <vllm.v1.core.kv_cache_manager.KVCacheManager object at 0x143e4b4d0>
+roles = {'encoder-b': 0, 'index-r2': 1, 'encoder-c': 2, 'global-r1': 3, ...}
+req = <vllm.v1.request.Request object at 0x143e48f80>, cap = 896
+
+    def verify_hit(manager, roles, req, *, cap=None):
+        pages = resident_pages(manager, roles, req)
+        assert all(not pages[role] for role in PRIVATE)
+        expected = complete_prefix(
+            pages, max(0, req.num_tokens - WINDOW) if cap is None else max(0, cap)
+        )
+        blocks, actual, _ = manager.get_computed_blocks(req)
+>       assert actual == expected
+E       assert 1024 == 768
+
+tests/v1/core/test_prefix_group_validity.py:125: AssertionError
+________ test_preemption_does_not_skip_private_generated_history[0-257] ________
+
+generated = 257, order = 0
+
+    @pytest.mark.parametrize("generated", [129, 257, 513])
+    @pytest.mark.parametrize("order", [0, 31])
+    def test_preemption_does_not_skip_private_generated_history(generated, order):
+        manager, roles = make_manager(None, order)
+        prompt = list(range(1024))
+        req = request("resumed", prompt)
+        assert manager.allocate_slots(req, len(prompt)) is not None
+        req.num_computed_tokens = len(prompt)
+        req.append_output_token_ids(list(range(1024, 1024 + generated)))
+        assert manager.allocate_slots(req, generated) is not None
+        req.num_computed_tokens = req.num_tokens
+        manager.free(req)
+        req.num_computed_tokens = 0
+        req.status = RequestStatus.PREEMPTED
+    
+        # A genuinely new prompt can reuse later encoder pages; an interrupted
+        # continuation must reconstruct decoder history from its original prompt.
+        fresh_prompt = request("fresh", req.all_token_ids)
+        _, later_hit = verify_hit(manager, roles, fresh_prompt)
+        assert later_hit > len(prompt) - WINDOW
+>       blocks, hit = verify_hit(manager, roles, req, cap=len(prompt) - WINDOW)
+                      ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+tests/v1/core/test_prefix_group_validity.py:313: 
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
+
+manager = <vllm.v1.core.kv_cache_manager.KVCacheManager object at 0x14427e900>
+roles = {'encoder-b': 0, 'index-r2': 1, 'encoder-c': 2, 'global-r1': 3, ...}
+req = <vllm.v1.request.Request object at 0x14427eb10>, cap = 896
+
+    def verify_hit(manager, roles, req, *, cap=None):
+        pages = resident_pages(manager, roles, req)
+        assert all(not pages[role] for role in PRIVATE)
+        expected = complete_prefix(
+            pages, max(0, req.num_tokens - WINDOW) if cap is None else max(0, cap)
+        )
+        blocks, actual, _ = manager.get_computed_blocks(req)
+>       assert actual == expected
+E       assert 1024 == 768
+
+tests/v1/core/test_prefix_group_validity.py:125: AssertionError
+________ test_preemption_does_not_skip_private_generated_history[0-513] ________
+
+generated = 513, order = 0
+
+    @pytest.mark.parametrize("generated", [129, 257, 513])
+    @pytest.mark.parametrize("order", [0, 31])
+    def test_preemption_does_not_skip_private_generated_history(generated, order):
+        manager, roles = make_manager(None, order)
+        prompt = list(range(1024))
+        req = request("resumed", prompt)
+        assert manager.allocate_slots(req, len(prompt)) is not None
+        req.num_computed_tokens = len(prompt)
+        req.append_output_token_ids(list(range(1024, 1024 + generated)))
+        assert manager.allocate_slots(req, generated) is not None
+        req.num_computed_tokens = req.num_tokens
+        manager.free(req)
+        req.num_computed_tokens = 0
+        req.status = RequestStatus.PREEMPTED
+    
+        # A genuinely new prompt can reuse later encoder pages; an interrupted
+        # continuation must reconstruct decoder history from its original prompt.
+        fresh_prompt = request("fresh", req.all_token_ids)
+        _, later_hit = verify_hit(manager, roles, fresh_prompt)
+        assert later_hit > len(prompt) - WINDOW
+>       blocks, hit = verify_hit(manager, roles, req, cap=len(prompt) - WINDOW)
+                      ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+tests/v1/core/test_prefix_group_validity.py:313: 
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
+
+manager = <vllm.v1.core.kv_cache_manager.KVCacheManager object at 0x14427fc80>
+roles = {'encoder-b': 0, 'index-r2': 1, 'encoder-c': 2, 'global-r1': 3, ...}
+req = <vllm.v1.request.Request object at 0x14427fec0>, cap = 896
+
+    def verify_hit(manager, roles, req, *, cap=None):
+        pages = resident_pages(manager, roles, req)
+        assert all(not pages[role] for role in PRIVATE)
+        expected = complete_prefix(
+            pages, max(0, req.num_tokens - WINDOW) if cap is None else max(0, cap)
+        )
+        blocks, actual, _ = manager.get_computed_blocks(req)
+>       assert actual == expected
+E       assert 1280 == 768
+
+tests/v1/core/test_prefix_group_validity.py:125: AssertionError
+_______ test_preemption_does_not_skip_private_generated_history[31-129] ________
+
+generated = 129, order = 31
+
+    @pytest.mark.parametrize("generated", [129, 257, 513])
+    @pytest.mark.parametrize("order", [0, 31])
+    def test_preemption_does_not_skip_private_generated_history(generated, order):
+        manager, roles = make_manager(None, order)
+        prompt = list(range(1024))
+        req = request("resumed", prompt)
+        assert manager.allocate_slots(req, len(prompt)) is not None
+        req.num_computed_tokens = len(prompt)
+        req.append_output_token_ids(list(range(1024, 1024 + generated)))
+        assert manager.allocate_slots(req, generated) is not None
+        req.num_computed_tokens = req.num_tokens
+        manager.free(req)
+        req.num_computed_tokens = 0
+        req.status = RequestStatus.PREEMPTED
+    
+        # A genuinely new prompt can reuse later encoder pages; an interrupted
+        # continuation must reconstruct decoder history from its original prompt.
+        fresh_prompt = request("fresh", req.all_token_ids)
+        _, later_hit = verify_hit(manager, roles, fresh_prompt)
+        assert later_hit > len(prompt) - WINDOW
+>       blocks, hit = verify_hit(manager, roles, req, cap=len(prompt) - WINDOW)
+                      ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+tests/v1/core/test_prefix_group_validity.py:313: 
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
+
+manager = <vllm.v1.core.kv_cache_manager.KVCacheManager object at 0x14439cf20>
+roles = {'encoder-b': 0, 'encoder-c': 1, 'global-r1': 2, 'index-r2': 3, ...}
+req = <vllm.v1.request.Request object at 0x14439d190>, cap = 896
+
+    def verify_hit(manager, roles, req, *, cap=None):
+        pages = resident_pages(manager, roles, req)
+        assert all(not pages[role] for role in PRIVATE)
+        expected = complete_prefix(
+            pages, max(0, req.num_tokens - WINDOW) if cap is None else max(0, cap)
+        )
+        blocks, actual, _ = manager.get_computed_blocks(req)
+>       assert actual == expected
+E       assert 1024 == 768
+
+tests/v1/core/test_prefix_group_validity.py:125: AssertionError
+_______ test_preemption_does_not_skip_private_generated_history[31-257] ________
+
+generated = 257, order = 31
+
+    @pytest.mark.parametrize("generated", [129, 257, 513])
+    @pytest.mark.parametrize("order", [0, 31])
+    def test_preemption_does_not_skip_private_generated_history(generated, order):
+        manager, roles = make_manager(None, order)
+        prompt = list(range(1024))
+        req = request("resumed", prompt)
+        assert manager.allocate_slots(req, len(prompt)) is not None
+        req.num_computed_tokens = len(prompt)
+        req.append_output_token_ids(list(range(1024, 1024 + generated)))
+        assert manager.allocate_slots(req, generated) is not None
+        req.num_computed_tokens = req.num_tokens
+        manager.free(req)
+        req.num_computed_tokens = 0
+        req.status = RequestStatus.PREEMPTED
+    
+        # A genuinely new prompt can reuse later encoder pages; an interrupted
+        # continuation must reconstruct decoder history from its original prompt.
+        fresh_prompt = request("fresh", req.all_token_ids)
+        _, later_hit = verify_hit(manager, roles, fresh_prompt)
+        assert later_hit > len(prompt) - WINDOW
+>       blocks, hit = verify_hit(manager, roles, req, cap=len(prompt) - WINDOW)
+                      ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+tests/v1/core/test_prefix_group_validity.py:313: 
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
+
+manager = <vllm.v1.core.kv_cache_manager.KVCacheManager object at 0x14427f830>
+roles = {'encoder-b': 0, 'encoder-c': 1, 'global-r1': 2, 'index-r2': 3, ...}
+req = <vllm.v1.request.Request object at 0x14427f380>, cap = 896
+
+    def verify_hit(manager, roles, req, *, cap=None):
+        pages = resident_pages(manager, roles, req)
+        assert all(not pages[role] for role in PRIVATE)
+        expected = complete_prefix(
+            pages, max(0, req.num_tokens - WINDOW) if cap is None else max(0, cap)
+        )
+        blocks, actual, _ = manager.get_computed_blocks(req)
+>       assert actual == expected
+E       assert 1024 == 768
+
+tests/v1/core/test_prefix_group_validity.py:125: AssertionError
+_______ test_preemption_does_not_skip_private_generated_history[31-513] ________
+
+generated = 513, order = 31
+
+    @pytest.mark.parametrize("generated", [129, 257, 513])
+    @pytest.mark.parametrize("order", [0, 31])
+    def test_preemption_does_not_skip_private_generated_history(generated, order):
+        manager, roles = make_manager(None, order)
+        prompt = list(range(1024))
+        req = request("resumed", prompt)
+        assert manager.allocate_slots(req, len(prompt)) is not None
+        req.num_computed_tokens = len(prompt)
+        req.append_output_token_ids(list(range(1024, 1024 + generated)))
+        assert manager.allocate_slots(req, generated) is not None
+        req.num_computed_tokens = req.num_tokens
+        manager.free(req)
+        req.num_computed_tokens = 0
+        req.status = RequestStatus.PREEMPTED
+    
+        # A genuinely new prompt can reuse later encoder pages; an interrupted
+        # continuation must reconstruct decoder history from its original prompt.
+        fresh_prompt = request("fresh", req.all_token_ids)
+        _, later_hit = verify_hit(manager, roles, fresh_prompt)
+        assert later_hit > len(prompt) - WINDOW
+>       blocks, hit = verify_hit(manager, roles, req, cap=len(prompt) - WINDOW)
+                      ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+tests/v1/core/test_prefix_group_validity.py:313: 
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
+
+manager = <vllm.v1.core.kv_cache_manager.KVCacheManager object at 0x14439dbe0>
+roles = {'encoder-b': 0, 'encoder-c': 1, 'global-r1': 2, 'index-r2': 3, ...}
+req = <vllm.v1.request.Request object at 0x14439c620>, cap = 896
+
+    def verify_hit(manager, roles, req, *, cap=None):
+        pages = resident_pages(manager, roles, req)
+        assert all(not pages[role] for role in PRIVATE)
+        expected = complete_prefix(
+            pages, max(0, req.num_tokens - WINDOW) if cap is None else max(0, cap)
+        )
+        blocks, actual, _ = manager.get_computed_blocks(req)
+>       assert actual == expected
+E       assert 1280 == 768
+
+tests/v1/core/test_prefix_group_validity.py:125: AssertionError
+=============================== warnings summary ===============================
+vllm/__init__.py:7
+  /Users/christopherowen/projects/spark-ds41f-prefix-validity/.work/vllm-control/vllm/__init__.py:7: RuntimeWarning: Failed to read commit hash:
+  No module named 'vllm._version'
+    from .version import __version__, __version_tuple__  # isort:skip
+
+-- Docs: https://docs.pytest.org/en/stable/how-to/capture-warnings.html
+=========================== short test summary info ============================
+FAILED tests/v1/core/test_prefix_group_validity.py::test_preemption_does_not_skip_private_generated_history[0-129]
+FAILED tests/v1/core/test_prefix_group_validity.py::test_preemption_does_not_skip_private_generated_history[0-257]
+FAILED tests/v1/core/test_prefix_group_validity.py::test_preemption_does_not_skip_private_generated_history[0-513]
+FAILED tests/v1/core/test_prefix_group_validity.py::test_preemption_does_not_skip_private_generated_history[31-129]
+FAILED tests/v1/core/test_prefix_group_validity.py::test_preemption_does_not_skip_private_generated_history[31-257]
+FAILED tests/v1/core/test_prefix_group_validity.py::test_preemption_does_not_skip_private_generated_history[31-513]
+6 failed, 162 passed, 1 warning in 3.23s

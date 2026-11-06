@@ -1,0 +1,317 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+"""A reusable prefix needs every persistent group and fresh private state.
+
+The oracle enumerates page-set coverage, independent of the coordinator's
+fixed-point search. It observes retained hash entries rather than assuming any
+particular retention policy or that a published endpoint survives eviction.
+"""
+
+import random
+from dataclasses import replace
+
+import pytest
+import torch
+
+from tests.v1.core.test_prefix_caching import make_kv_cache_manager, make_request
+from vllm.utils.hashing import sha256
+from vllm.v1.core.kv_cache_utils import init_none_hash
+from vllm.v1.kv_cache_interface import (
+    KVCacheConfig,
+    KVCacheGroupSpec,
+    MLAAttentionSpec,
+    SlidingWindowMLASpec,
+)
+from vllm.v1.request import RequestStatus
+
+pytestmark = pytest.mark.cpu_test
+
+HASH = 128
+PAGE = 256
+WINDOW = 128
+GLOBAL = {"global-r2", "index-r2", "global-r1"}
+ENCODER = {"encoder-a", "encoder-b", "encoder-c"}
+PRIVATE = {"decoder", "draft"}
+
+
+@pytest.fixture(autouse=True)
+def initialize_hashes():
+    init_none_hash(sha256)
+
+
+def make_manager(retention, order):
+    global_spec = MLAAttentionSpec(
+        block_size=PAGE,
+        num_kv_heads=1,
+        head_size=512,
+        tokens_per_state=2,
+        dtype=torch.uint8,
+    )
+    encoder_spec = SlidingWindowMLASpec(
+        block_size=HASH,
+        num_kv_heads=1,
+        head_size=512,
+        dtype=torch.uint8,
+        sliding_window=WINDOW,
+    )
+    decoder_spec = replace(
+        encoder_spec, prefix_cache_enabled=False, prefill_replay_window=WINDOW
+    )
+    groups = [
+        KVCacheGroupSpec(["global-r2"], global_spec),
+        KVCacheGroupSpec(["index-r2"], replace(global_spec, head_size=68)),
+        KVCacheGroupSpec(["global-r1"], replace(global_spec, tokens_per_state=1)),
+        KVCacheGroupSpec(["encoder-a"], encoder_spec),
+        # Equal specs exercise several group IDs inside one lookup; the third
+        # distinct spec exercises convergence between separate attention types.
+        KVCacheGroupSpec(["encoder-b"], encoder_spec),
+        KVCacheGroupSpec(["encoder-c"], replace(encoder_spec, head_size=256)),
+        KVCacheGroupSpec(["decoder"], decoder_spec),
+        KVCacheGroupSpec(["draft"], replace(decoder_spec, extra_retained_tokens=1)),
+    ]
+    random.Random(order).shuffle(groups)
+    config = KVCacheConfig(
+        num_blocks=2048,
+        kv_cache_tensors=[],
+        kv_cache_groups=groups,
+        prefix_cache_retention_interval=retention,
+    )
+    manager = make_kv_cache_manager(config, max_model_len=8192, hash_block_size=HASH)
+    return manager, {group.layer_names[0]: i for i, group in enumerate(groups)}
+
+
+def request(name, tokens):
+    req = make_request(name, list(tokens), HASH, sha256)
+    req.max_tokens = 2048
+    req.sampling_params.max_tokens = 2048
+    return req
+
+
+def resident_pages(manager, roles, req):
+    """Read exact hash membership; do not call any prefix lookup algorithm."""
+    pages = {}
+    for role, group_id in roles.items():
+        block_size = PAGE if role in GLOBAL else HASH
+        available = {}
+        for page in range(req.num_tokens // block_size):
+            end = (page + 1) * block_size
+            block_hash = req.block_hashes[end // HASH - 1]
+            found = manager.block_pool.get_cached_block(block_hash, [group_id])
+            if found:
+                available[page] = found[0]
+        pages[role] = available
+    return pages
+
+
+def complete_prefix(pages, cap):
+    """Largest page boundary with all global history and all encoder tails."""
+    for boundary in range(cap // PAGE * PAGE, 0, -PAGE):
+        globals_needed = set(range(boundary // PAGE))
+        tail_needed = set(range((boundary - WINDOW) // HASH, boundary // HASH))
+        if all(globals_needed <= pages[name].keys() for name in GLOBAL) and all(
+            tail_needed <= pages[name].keys() for name in ENCODER
+        ):
+            return boundary
+    return 0
+
+
+def verify_hit(manager, roles, req, *, cap=None):
+    pages = resident_pages(manager, roles, req)
+    assert all(not pages[role] for role in PRIVATE)
+    expected = complete_prefix(
+        pages, max(0, req.num_tokens - WINDOW) if cap is None else max(0, cap)
+    )
+    blocks, actual, _ = manager.get_computed_blocks(req)
+    assert actual == expected
+    for role, group_id in roles.items():
+        group_blocks = blocks.blocks[group_id]
+        if role in PRIVATE:
+            assert not group_blocks
+        elif role in GLOBAL:
+            assert [b.block_id for b in group_blocks] == [
+                pages[role][page].block_id for page in range(actual // PAGE)
+            ]
+        elif actual:
+            tail = actual // HASH - 1
+            assert group_blocks[tail].block_id == pages[role][tail].block_id
+            assert all(
+                b.is_null or b.block_id == pages[role][page].block_id
+                for page, b in enumerate(group_blocks)
+            )
+    return blocks, actual
+
+
+def evict(manager, pages, selection):
+    """Invalidate chosen group pages, retaining other groups at the same tokens."""
+    selected = set()
+    if selection == "global-head":
+        selected = {("global-r2", 0)}
+    elif selection == "global-middle":
+        selected = {("global-r1", 3)}
+    elif selection == "index-tail":
+        selected = {("index-r2", max(pages["index-r2"]))}
+    elif selection == "index-all":
+        selected = {("index-r2", page) for page in pages["index-r2"]}
+    elif selection == "encoder-tail":
+        selected = {("encoder-b", max(pages["encoder-b"]))}
+    elif selection == "encoder-all":
+        selected = {("encoder-c", page) for page in pages["encoder-c"]}
+    elif selection == "staggered":
+        # No single per-group maximum describes validity: distinct groups lose
+        # different candidate tails and a global group loses an interior page.
+        selected = {("encoder-a", page) for page in sorted(pages["encoder-a"])[::2]}
+        selected |= {
+            ("encoder-c", page) for page in sorted(pages["encoder-c"])[1::2]
+        }
+        selected.add(("index-r2", 5))
+    elif selection != "none":
+        raise AssertionError(selection)
+    ids = {
+        pages[role][page].block_id for role, page in selected if page in pages[role]
+    }
+    manager.evict_blocks(ids)
+    assert all(manager.block_pool.blocks[i].block_hash is None for i in ids)
+    return ids
+
+
+def assert_fresh_private(manager, roles, req, producer_private):
+    for role in PRIVATE:
+        group = manager.coordinator.single_type_managers[roles[role]]
+        allocated = [b for b in group.req_to_blocks[req.request_id] if not b.is_null]
+        assert allocated
+        assert all(b.ref_cnt == 1 and b.block_hash is None for b in allocated)
+        assert producer_private.isdisjoint(b.block_id for b in allocated)
+
+
+@pytest.mark.parametrize("retention", [None, 0, 512], ids=["dense", "latest", "512"])
+@pytest.mark.parametrize("order", [0, 7, 31])
+@pytest.mark.parametrize("producer_live", [False, True], ids=["free", "live"])
+@pytest.mark.parametrize(
+    "selection",
+    [
+        "none",
+        "global-head",
+        "global-middle",
+        "index-tail",
+        "index-all",
+        "encoder-tail",
+        "encoder-all",
+        "staggered",
+    ],
+)
+def test_independent_group_eviction_matches_complete_state_oracle(
+    retention, order, producer_live, selection
+):
+    manager, roles = make_manager(retention, order)
+    tokens = list(range(2432))
+    producer = request("producer", tokens)
+    assert manager.allocate_slots(producer, len(tokens)) is not None
+    producer.num_computed_tokens = len(tokens)
+    private_ids = {
+        b.block_id
+        for role in PRIVATE
+        for b in manager.coordinator.single_type_managers[roles[role]].req_to_blocks[
+            producer.request_id
+        ]
+        if not b.is_null
+    }
+    if not producer_live:
+        manager.free(producer)
+        # Freed private pages may be recycled, but never returned as cache hits.
+        private_ids = set()
+    before = resident_pages(manager, roles, producer)
+    evicted = evict(manager, before, selection)
+    after = resident_pages(manager, roles, producer)
+    for role in roles:
+        assert {p: b.block_id for p, b in after[role].items()} == {
+            p: b.block_id for p, b in before[role].items() if b.block_id not in evicted
+        }
+
+    consumer = request("consumer", tokens)
+    blocks, hit = verify_hit(manager, roles, consumer)
+    assert manager.allocate_slots(consumer, len(tokens) - hit, hit, blocks) is not None
+    assert_fresh_private(manager, roles, consumer, private_ids)
+    # Cancelling a consumer must not free pages still owned by a live producer.
+    manager.free(consumer)
+    for group in manager.coordinator.single_type_managers:
+        assert consumer.request_id not in group.req_to_blocks
+        if producer_live:
+            assert all(
+                b.is_null or b.ref_cnt > 0
+                for b in group.req_to_blocks[producer.request_id]
+            )
+    if producer_live:
+        manager.free(producer)
+    assert manager.block_pool.get_num_free_blocks() == 2047
+
+
+@pytest.mark.parametrize("retention", [None, 0, 512], ids=["dense", "latest", "512"])
+@pytest.mark.parametrize("junction", [1375, 1536, 2177])
+@pytest.mark.parametrize("reverse_finish", [False, True])
+def test_branches_and_cancellation_do_not_complete_each_others_state(
+    retention, junction, reverse_finish
+):
+    manager, roles = make_manager(retention, int(reverse_finish) + junction)
+    trunk = list(range(2432))
+    producer = request("trunk", trunk)
+    assert manager.allocate_slots(producer, len(trunk)) is not None
+    producer.num_computed_tokens = len(trunk)
+    manager.free(producer)
+
+    branches = []
+    for branch in (1, 2):
+        tokens = trunk[:junction] + [10000 * branch + i for i in range(513)]
+        req = request(f"branch-{branch}", tokens)
+        blocks, hit = verify_hit(manager, roles, req)
+        assert hit <= junction // PAGE * PAGE
+        # Stage allocation separately from computation, then cancel after only
+        # 129 new rows. Reserved pages past the completed prefix must not publish.
+        assert (
+            manager.allocate_slots(
+                req, len(tokens) - hit, hit, blocks, delay_cache_blocks=True
+            )
+            is not None
+        )
+        req.num_computed_tokens = min(hit + 129, req.num_tokens)
+        manager.cache_blocks(req, req.num_computed_tokens)
+        branches.append(req)
+
+    for req in branches[:: -1 if reverse_finish else 1]:
+        completed = req.num_computed_tokens
+        manager.free(req)
+        retry = request("retry-" + req.request_id, req.all_token_ids)
+        blocks, hit = verify_hit(manager, roles, retry)
+        assert hit <= max(junction, completed) // PAGE * PAGE
+        assert (
+            manager.allocate_slots(retry, retry.num_tokens - hit, hit, blocks)
+            is not None
+        )
+        manager.free(retry)
+    assert manager.block_pool.get_num_free_blocks() == 2047
+
+
+@pytest.mark.parametrize("generated", [129, 257, 513])
+@pytest.mark.parametrize("order", [0, 31])
+def test_preemption_does_not_skip_private_generated_history(generated, order):
+    manager, roles = make_manager(None, order)
+    prompt = list(range(1024))
+    req = request("resumed", prompt)
+    assert manager.allocate_slots(req, len(prompt)) is not None
+    req.num_computed_tokens = len(prompt)
+    req.append_output_token_ids(list(range(1024, 1024 + generated)))
+    assert manager.allocate_slots(req, generated) is not None
+    req.num_computed_tokens = req.num_tokens
+    manager.free(req)
+    req.num_computed_tokens = 0
+    req.status = RequestStatus.PREEMPTED
+
+    # A genuinely new prompt can reuse later encoder pages; an interrupted
+    # continuation must reconstruct decoder history from its original prompt.
+    fresh_prompt = request("fresh", req.all_token_ids)
+    _, later_hit = verify_hit(manager, roles, fresh_prompt)
+    assert later_hit > len(prompt) - WINDOW
+    blocks, hit = verify_hit(manager, roles, req, cap=len(prompt) - WINDOW)
+    assert hit == 768
+    assert manager.allocate_slots(req, req.num_tokens - hit, hit, blocks) is not None
+    manager.free(req)
+    assert manager.block_pool.get_num_free_blocks() == 2047

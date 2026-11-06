@@ -1,0 +1,1639 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+
+import itertools
+import time
+from collections.abc import Sequence
+from dataclasses import dataclass
+from typing import Literal, overload
+
+import vllm.envs as envs
+from vllm.distributed.kv_events import BlockStored, KVCacheEvent
+from vllm.logger import init_logger
+from vllm.utils.math_utils import cdiv
+from vllm.v1.core.boundary_checkpoint import (
+    INSTRUCTION_CHECKPOINT_SLOT,
+    PREFILL_TAIL_CHECKPOINT_SLOT,
+    PROMPT_CHECKPOINT_SLOT,
+    RESPONSE_CHECKPOINT_SLOT,
+    BoundaryCheckpoint,
+    BoundaryCheckpointCache,
+    BoundaryCheckpointKind,
+    boundary_checkpoint_slots,
+    checkpoint_end_allowed,
+)
+from vllm.v1.core.kv_cache_coordinator import (
+    HybridKVCacheCoordinator,
+    get_kv_cache_coordinator,
+)
+from vllm.v1.core.kv_cache_metrics import KVCacheMetricsCollector
+from vllm.v1.core.kv_cache_utils import KVCacheBlock, KVCacheBlockCopy
+from vllm.v1.core.single_type_kv_cache_manager import (
+    MambaManager,
+    SingleTypeKVCacheManager,
+)
+from vllm.v1.kv_cache_interface import (
+    AttentionSpec,
+    ChunkedLocalAttentionSpec,
+    CrossAttentionSpec,
+    EncoderOnlyAttentionSpec,
+    KVCacheConfig,
+    MambaSpec,
+    SlidingWindowSpec,
+    get_kv_cache_spec_kind,
+    get_kv_cache_spec_sliding_window,
+    iter_layer_specs,
+)
+from vllm.v1.metrics.stats import PrefixCacheStats
+from vllm.v1.request import Request, RequestStatus
+
+logger = init_logger(__name__)
+
+
+@dataclass
+class _BoundaryImportAdmission:
+    request: Request
+    checkpoint: BoundaryCheckpoint
+    remaining_blocks: int
+    ready: bool = False
+    admitted: bool = False
+
+
+@dataclass
+class _BoundaryImportWaiter:
+    need: int
+    since: float
+
+
+@dataclass
+class KVCacheBlocks:
+    """
+    The allocation result of KVCacheManager, work as the interface between
+    Scheduler and KVCacheManager, to hide KVCacheManager's internal data
+    structure from the Scheduler.
+    """
+
+    blocks: tuple[Sequence[KVCacheBlock], ...]
+    """
+    `blocks[i][j]` refers to the i-th kv_cache_group
+    and the j-th block of tokens.We don't use block of
+    tokens as the outer dimension because it assumes all
+    kv_cache_groups have the same number of blocks, which is true for now but
+    will be broken if we want to give different block_size to different
+    kv_cache_groups in the future.
+
+    Each single type KVCacheBlocks could be represented as:
+    - list[KVCacheBlock] for more than one KVCacheBlock
+    - an empty tuple for requests without KVCacheBlock
+      (a precomputed KVCacheBlocks is in KVCacheManager to avoid GC overhead)
+    """
+
+    def __add__(self, other: "KVCacheBlocks") -> "KVCacheBlocks":
+        """Adds two KVCacheBlocks instances."""
+        return KVCacheBlocks(
+            tuple(
+                list(itertools.chain(blk1, blk2))
+                for blk1, blk2 in zip(self.blocks, other.blocks)
+            )
+        )
+
+    @overload
+    def get_block_ids(
+        self,
+        allow_none: Literal[False] = False,
+        *,
+        group_ids: Sequence[int] | None = None,
+    ) -> tuple[list[int], ...]: ...
+
+    @overload
+    def get_block_ids(
+        self,
+        allow_none: Literal[True] = True,
+        *,
+        group_ids: Sequence[int] | None = None,
+    ) -> tuple[list[int], ...] | None: ...
+
+    def get_block_ids(
+        self,
+        allow_none: bool = False,
+        *,
+        group_ids: Sequence[int] | None = None,
+    ) -> tuple[list[int], ...] | None:
+        """
+        Converts the KVCacheBlocks instance to block_ids.
+
+        Args:
+            allow_none: Return None when every selected group is empty.
+            group_ids: KV cache groups to include. Includes all groups by default.
+
+        Returns:
+            tuple[list[int], ...]: A tuple of lists where:
+                - the outer tuple corresponds to KV cache groups
+                - each inner list contains the block_ids of the blocks in that
+                  group
+        """
+        groups = (
+            self.blocks
+            if group_ids is None
+            else tuple(self.blocks[group_id] for group_id in group_ids)
+        )
+        if allow_none and all(len(group) == 0 for group in groups):
+            return None
+        return tuple([blk.block_id for blk in group] for group in groups)
+
+    def get_unhashed_block_ids(self) -> list[int]:
+        """Get block_ids of unhashed blocks from KVCacheBlocks instance."""
+        assert len(self.blocks) == 1, "Only one group is supported"
+        return [block.block_id for block in self.blocks[0] if block.block_hash is None]
+
+    def get_unhashed_block_ids_all_groups(self) -> list[list[int]]:
+        """Get block_ids of unhashed blocks from KVCacheBlocks instance."""
+        # Skip padding blocks.
+        return [
+            [
+                block.block_id
+                for block in group
+                if block.block_hash is None and not block.is_null
+            ]
+            for group in self.blocks
+        ]
+
+    def new_empty(self) -> "KVCacheBlocks":
+        """
+        Creates a new KVCacheBlocks instance with no blocks.
+        """
+        return KVCacheBlocks(tuple(() for _ in range(len(self.blocks))))
+
+
+class KVCacheManager:
+    def __init__(
+        self,
+        kv_cache_config: KVCacheConfig,
+        max_model_len: int,
+        scheduler_block_size: int,
+        hash_block_size: int,
+        max_in_flight_tokens: int | None = None,
+        enable_caching: bool = True,
+        use_eagle: bool = False,
+        num_prefill_lookahead: int = 0,
+        log_stats: bool = False,
+        enable_kv_cache_events: bool = False,
+        dcp_world_size: int = 1,
+        pcp_world_size: int = 1,
+        metrics_collector: KVCacheMetricsCollector | None = None,
+        watermark: float = 0.0,
+        enable_mamba_fine_grained_prefix_cache: bool = False,
+        enable_boundary_checkpoints: bool = False,
+        num_lookahead_tokens: int = 0,
+    ) -> None:
+        self.max_model_len = max_model_len
+        # When unset, fall back to `max_model_len` so the recycling-aware cap
+        # collapses to the prior (uncapped) admission behavior. The scheduler
+        # always supplies the real value at runtime.
+        if max_in_flight_tokens is None:
+            max_in_flight_tokens = max_model_len
+        self._boundary_max_in_flight_tokens = max_in_flight_tokens
+
+        self.enable_caching = enable_caching
+        self.enable_kv_cache_events = enable_kv_cache_events
+        self.use_eagle = use_eagle
+        self.log_stats = log_stats
+        self.metrics_collector = metrics_collector
+        # FIXME: make prefix cache stats conditional on log_stats. We still need
+        # this comment because when the log stats is enabled there are still
+        # potential configs we could expose in the future.
+        self.prefix_cache_stats = PrefixCacheStats() if log_stats else None
+
+        self.coordinator = get_kv_cache_coordinator(
+            kv_cache_config=kv_cache_config,
+            max_model_len=self.max_model_len,
+            max_in_flight_tokens=max_in_flight_tokens,
+            use_eagle=self.use_eagle,
+            enable_caching=self.enable_caching,
+            enable_kv_cache_events=enable_kv_cache_events,
+            dcp_world_size=dcp_world_size,
+            pcp_world_size=pcp_world_size,
+            scheduler_block_size=scheduler_block_size,
+            hash_block_size=hash_block_size,
+            metrics_collector=self.metrics_collector,
+            num_prefill_lookahead=num_prefill_lookahead,
+        )
+        # One predicate, read by both sides of the feature, so the scheduler
+        # cannot end a chunk at a junction the manager would refuse -- a refused
+        # junction costs a forward pass and displaces the block-boundary stop.
+        # Multi-module MTP is excluded because ``cache_blocks`` then hands the
+        # manager ``num_computed - num_reprefillable`` rather than the chunk end.
+        self.mamba_fine_grained_prefix_cache = (
+            enable_mamba_fine_grained_prefix_cache
+            and bool(self.coordinator.eagle_group_ids)
+            and self.coordinator.enable_partial_hash_hits
+            and self.coordinator.num_reprefillable_tokens == 0
+        )
+        if self.mamba_fine_grained_prefix_cache:
+            for manager in self.coordinator.single_type_managers:
+                if isinstance(manager, MambaManager):
+                    manager.fine_grained_prefix_cache = True
+        self.num_kv_cache_groups = len(kv_cache_config.kv_cache_groups)
+        self.block_pool = self.coordinator.block_pool
+        self.retained_hit_group_ids = tuple(
+            manager.kv_cache_group_id
+            for manager in self.coordinator.single_type_managers
+            if manager.retains_longer_hit
+        )
+        self.kv_cache_config = kv_cache_config
+
+        # Watermark: minimum number of KV cache blocks to keep free when
+        # admitting waiting/preempted requests, to avoid frequent preemptions.
+        assert watermark >= 0.0, "watermark must be non-negative"
+        self.watermark_blocks = int(watermark * kv_cache_config.num_blocks)
+        self.kv_cache_event_metadata = tuple(
+            (
+                get_kv_cache_spec_kind(group.kv_cache_spec).value,
+                get_kv_cache_spec_sliding_window(group.kv_cache_spec),
+            )
+            for group in kv_cache_config.kv_cache_groups
+        )
+
+        # Pre-constructed KVCacheBlocks with no blocks, callers should use this
+        # via create_kv_cache_blocks instead of creating new ones to avoid GC
+        # overhead.
+        #
+        # We use nested tuples to ensure the empty KVCacheBlocks is immutable.
+        self.empty_kv_cache_blocks = KVCacheBlocks(
+            tuple(() for _ in range(self.num_kv_cache_groups))
+        )
+
+        self.boundary_checkpoints = (
+            BoundaryCheckpointCache(self.block_pool)
+            if enable_boundary_checkpoints and enable_caching
+            else None
+        )
+        self._boundary_imports: set[int] = set()
+        self._boundary_import_admissions: dict[str, _BoundaryImportAdmission] = {}
+        self._boundary_import_waiters: dict[str, _BoundaryImportWaiter] = {}
+        # Requests whose restore outwaited its capacity bound. They recompute
+        # the prompt instead of restoring until they are admitted.
+        self._boundary_import_expired: set[str] = set()
+        # The first restore refused for capacity in this scheduler step and
+        # the blocks it needs. Admissions considered after it must leave them.
+        self._boundary_import_barrier: tuple[str, int] | None = None
+        self._boundary_import_max_wait = envs.VLLM_CHECKPOINT_RESTORE_MAX_WAIT_S
+        self._external_admission_slots: int | None = None
+        self._external_admission_reserved_blocks = 0
+        self._external_admission_has_scheduled_reqs = False
+        self._boundary_allocations: dict[str, list[KVCacheBlock]] = {}
+        self._boundary_readers: dict[str, BoundaryCheckpoint] = {}
+        self._boundary_restore_lookahead = max(
+            num_lookahead_tokens,
+            max(
+                (
+                    manager.kv_cache_spec.num_speculative_blocks + 1
+                    for manager in self.coordinator.single_type_managers
+                    if isinstance(manager.kv_cache_spec, MambaSpec)
+                ),
+                default=0,
+            ),
+        )
+        if self.boundary_checkpoints is not None:
+            logger.info(
+                "Request-boundary recurrent checkpoint caching is enabled. "
+                "Supported chat requests retain leading instructions, the "
+                "complete prompt, and the response endpoint."
+            )
+
+    @property
+    def usage(self) -> float:
+        """Get the KV cache usage.
+
+        Returns:
+            The KV cache usage (between 0.0 and 1.0).
+        """
+        return self.block_pool.get_usage()
+
+    def make_prefix_cache_stats(self) -> PrefixCacheStats | None:
+        """Get (and reset) the prefix cache stats.
+
+        Returns:
+            The current prefix caching stats, or None if logging is disabled.
+        """
+        if not self.log_stats:
+            return None
+        stats = self.prefix_cache_stats
+        self.prefix_cache_stats = PrefixCacheStats()
+        return stats
+
+    def prefix_cache_lookup_enabled(self, request: Request) -> bool:
+        """Whether a local prefix cache lookup may be run for this request."""
+        return self.enable_caching and not request.skip_reading_prefix_cache
+
+    def record_prefix_cache_stats(self, request: Request, num_hits: int) -> None:
+        # Don't count a request that skipped the cache lookup.
+        if not self.log_stats or not self.prefix_cache_lookup_enabled(request):
+            return
+        assert self.prefix_cache_stats is not None
+        self.prefix_cache_stats.record(
+            num_tokens=request.num_tokens,
+            num_hits=num_hits,
+            preempted=request.num_preemptions > 0,
+        )
+
+    def get_computed_blocks(self, request: Request) -> tuple[KVCacheBlocks, int, int]:
+        """Get the computed (cached) blocks for the request.
+        Note that the computed blocks must be full.
+
+        Args:
+            request: The request to get the computed blocks.
+
+        Returns:
+            A tuple containing:
+                - A list of blocks that are computed for the request.
+                - The number of computed tokens.
+                - ``shared_prefix_boundary``: the block-aligned token position of
+                  a shared prefix that a sparse-retention group (Mamba / sliding
+                  window) has not cached yet (Marconi-style APC), or 0 if none.
+                  Pinned so sparse prefix-cache retention does not drop
+                  the junction and defeat cross-request reuse.
+        """
+        # We skip finding the prefix cache hit when prefix caching is
+        # disabled or the request is marked as skipping kv cache read
+        # (which happens when the request requires prompt logprobs
+        # or calls a pooling model with all pooling).
+        boundary_cache = self.boundary_checkpoints
+        if (
+            self.enable_caching
+            and boundary_cache is not None
+            and boundary_cache.supports_request(request)
+        ):
+            request.use_boundary_checkpoints = True
+        if not self.prefix_cache_lookup_enabled(request):
+            return self.empty_kv_cache_blocks, 0, 0
+
+        if boundary_cache is not None and boundary_cache.supports_request(request):
+            admission = self._boundary_import_admissions.get(request.request_id)
+            checkpoint = (
+                admission.checkpoint
+                if admission is not None and admission.ready and not admission.admitted
+                else boundary_cache.find(request, request.num_tokens)
+            )
+            request.boundary_checkpoint = checkpoint
+            if checkpoint is not None:
+                checkpoint_blocks = tuple(
+                    [self.block_pool.blocks[i] for i in group]
+                    for group in checkpoint.block_ids
+                )
+                return (
+                    self.create_kv_cache_blocks(checkpoint_blocks),
+                    checkpoint.num_tokens,
+                    0,
+                )
+            return self.empty_kv_cache_blocks, 0, 0
+
+        # Recompute at least one token for logits, or the configured suffix
+        # needed to rebuild request-private decoder state. Lookup may round
+        # this boundary down further to the cache-hit alignment.
+        replay_tokens = self.coordinator.prefill_replay_tokens
+        # After preemption the generated suffix is still part of the same
+        # request. Private decoder windows must be reconstructed from the
+        # original prompt boundary, not from a new boundary at the output end.
+        # Otherwise their deeper layers consume a different decoder history.
+        replay_end = request.num_prompt_tokens if replay_tokens else request.num_tokens
+        max_cache_hit_length = max(0, replay_end - max(1, replay_tokens))
+        computed_blocks, num_new_computed_tokens, num_uncached = (
+            self.coordinator.find_longest_cache_hit(
+                request.block_hashes, max_cache_hit_length
+            )
+        )
+
+        # When kv_cache_report_mode is "full", emit BlockStored events
+        # for the reused prefix cache blocks so that external consumers
+        # (e.g. gateway) can learn about them.
+        if (
+            num_new_computed_tokens > 0
+            and self.enable_kv_cache_events
+            and getattr(request, "kv_cache_report_mode", "incremental") == "full"
+        ):
+            self.coordinator.emit_cached_block_events(
+                request, computed_blocks, num_new_computed_tokens
+            )
+
+        # The junction to pin is where the lagging sparse-retention group stops
+        # (``num_new_computed_tokens``) plus the uncached shared prefix -- i.e.
+        # the longest single-group hit. Sub-block gaps are left to the mask,
+        # which floors to the alignment boundary (a no-op there).
+        shared_prefix_boundary = (
+            num_new_computed_tokens + num_uncached if num_uncached else 0
+        )
+
+        blocks = self.create_kv_cache_blocks(computed_blocks)
+        return blocks, num_new_computed_tokens, shared_prefix_boundary
+
+    def get_computed_blocks_for_connector(
+        self, request: Request
+    ) -> tuple[KVCacheBlocks, int, int, bool]:
+        """Local prefix-cache lookup for a request scheduled with a KV connector.
+
+        Hybrid (Mamba + full-attention) models can have per-group prefix hits
+        diverge under block pressure: the full-attention tail may be evicted
+        while a deeper Mamba state survives, or vice versa. Report the
+        full-attention hit as the local prefix - the connector transfers the
+        remaining suffix and the Mamba state is transferred unconditionally by
+        nixl's ``_apply_prefix_caching`` - and flag when that hit ran deeper
+        than a lagging group. Such a hit only has a valid Mamba state at its
+        boundary if the connector supplies it, so the caller must fall back to
+        ``get_computed_blocks`` to reconcile when no external tokens are found.
+
+        Non-hybrid models and already-convergent hits use ``get_computed_blocks``.
+
+        Returns:
+            The ``get_computed_blocks`` triple (blocks, number of local computed
+            tokens, shared-prefix boundary) plus ``hit_diverged``.
+        """
+        coordinator = self.coordinator
+        if not (
+            self.kv_cache_config.has_mamba_layers
+            and isinstance(coordinator, HybridKVCacheCoordinator)
+            and coordinator.full_attention_group_id is not None
+        ):
+            return *self.get_computed_blocks(request), False
+
+        if not self.prefix_cache_lookup_enabled(request):
+            return self.empty_kv_cache_blocks, 0, 0, False
+
+        fa_group_id = coordinator.full_attention_group_id
+        computed, per_group_hits = coordinator.find_longest_cache_hit_per_group(
+            request.block_hashes,
+            max(0, request.num_tokens - max(1, coordinator.prefill_replay_tokens)),
+        )
+        if any(hit > per_group_hits[fa_group_id] for hit in per_group_hits):
+            # A lagging group hit deeper than full attention means its
+            # full-attention blocks were evicted; use the reconciled boundary
+            # that every group agrees on.
+            return *self.get_computed_blocks(request), False
+
+        num_local = per_group_hits[fa_group_id]
+        blocks = self.create_kv_cache_blocks(computed)
+        # Per-group lookups do not detect an uncached shared prefix (boundary 0).
+        return blocks, num_local, 0, min(per_group_hits) < num_local
+
+    def allocate_slots(
+        self,
+        request: Request,
+        num_new_tokens: int,
+        num_new_computed_tokens: int = 0,
+        new_computed_blocks: KVCacheBlocks | None = None,
+        num_lookahead_tokens: int = 0,
+        num_external_computed_tokens: int = 0,
+        delay_cache_blocks: bool = False,
+        num_encoder_tokens: int = 0,
+        full_sequence_must_fit: bool = False,
+        reserved_blocks: int = 0,
+        has_scheduled_reqs: bool = True,
+    ) -> KVCacheBlocks | None:
+        """Add slots for a request with new tokens to append.
+
+        Args:
+            request: The request to allocate slots.
+            num_new_tokens: The number of new tokens to be allocated and computed.
+            num_new_computed_tokens: The number of new computed tokens just
+                hitting the prefix caching, excluding external tokens.
+            new_computed_blocks: The cached blocks for the above new computed
+                tokens, grouped as a tuple by kv cache groups.
+            num_lookahead_tokens: The number of speculative tokens to allocate.
+                This is used by spec decode proposers with kv-cache such
+                as eagle.
+            num_external_computed_tokens: The number of tokens that their
+                KV caches are not cached by vLLM but cached by the connector.
+            delay_cache_blocks: Whether to skip caching the blocks. This is
+                used by P/D when allocating blocks used in a KV transfer
+                which will complete in a future step.
+            num_encoder_tokens: The number of encoder tokens to allocate for
+                cross-attention in encoder-decoder models(e.g., Whisper).
+                For decoder-only models, this should be 0.
+            full_sequence_must_fit: Only allocate blocks if the KV cache has enough
+                free blocks to hold the full sequence, accounting for prefix cache hits
+                and sliding window. Used as an admission gate to prevent over-admitting
+                requests when chunked prefill would otherwise only check the first chunk
+            reserved_blocks: Number of free blocks that must be left available for
+                other in-flight sequences to complete. The actual allocation is only
+                made if it fits within (free blocks - reserved_blocks). Used to gate
+                async KV-connector loads so their initial allocation cannot consume
+                blocks an already in-flight (prefilling) sequence is relying on.
+            has_scheduled_reqs: Whether any requests are already scheduled to run
+                this step, controls whether watermark is applied.
+
+        Blocks layout:
+        ```
+        ----------------------------------------------------------------------
+        | < comp > | < new_comp > | < ext_comp >  | < new >  | < lookahead > |
+        ----------------------------------------------------------------------
+                                                  |   < to be computed >     |
+        ----------------------------------------------------------------------
+                                  |            < to be allocated >           |
+        ----------------------------------------------------------------------
+                                  | < to be cached (roughly, |
+                                  | details below)>          |
+        ----------------------------------------------------------------------
+        | Prefix-cached tokens from either vLLM   |
+        | or connector. Can be safely removed if  |
+        | they are outside sliding window.        |
+        ----------------------------------------------------------------------
+        |   < cached by vLLM >    | not cached by |
+                                  | vLLM, but     |
+        | ref_cnt  | ref_cnt not  | cached by     |
+        | increased| increased yet| connector     |
+        ----------------------------------------------------------------------
+        ```
+
+        Abbrivations:
+
+        ```
+        comp      = request.num_computed_tokens
+        new_comp  = num_new_computed_tokens
+                  = len(new_computed_blocks) * block_size
+        ext_comp  = num_external_computed_tokens, cached by the connector
+        new       = num_new_tokens, including unverified draft tokens
+        lookahead = num_lookahead_tokens
+        ```
+
+        NOTE: for new tokens which include both verified and unverified draft
+        tokens, we only cache the verified tokens (by capping the number at
+        `request.num_tokens`).
+
+        The allocation has three stages:
+        - Free unnecessary blocks in `comp` and check
+           if we have sufficient free blocks (return None if not).
+        - Handle prefix tokens (`comp + new_comp + ext_comp`):
+            - Free unnecessary blocks (e.g. outside sliding window)
+            - Allocate new blocks for `ext_comp` tokens inside
+              sliding window
+        - Allocate new blocks for tokens to be computed (`new + lookahead`)
+
+        Returns:
+            A list of new allocated blocks.
+        """
+        # When loading KV data asynchronously, we may have zero new tokens to
+        # compute while still allocating slots for externally computed tokens.
+        if num_new_tokens == 0 and num_external_computed_tokens == 0:
+            raise ValueError(
+                "num_new_tokens must be greater than 0 when there are no "
+                "external computed tokens"
+            )
+
+        if new_computed_blocks is not None:
+            new_computed_block_list = new_computed_blocks.blocks
+            if self.retained_hit_group_ids:
+                # Only retain the prefix covered by the local and external hits.
+                reused = num_new_computed_tokens + num_external_computed_tokens
+                groups = list(new_computed_block_list)
+                for group_id in self.retained_hit_group_ids:
+                    manager = self.coordinator.single_type_managers[group_id]
+                    groups[group_id] = groups[group_id][
+                        : cdiv(reused, manager.block_size)
+                    ]
+                new_computed_block_list = tuple(groups)
+        else:
+            new_computed_block_list = self.empty_kv_cache_blocks.blocks
+
+        # The number of computed tokens is the number of computed tokens plus
+        # the new prefix caching hits
+        num_local_computed_tokens = (
+            request.num_computed_tokens + num_new_computed_tokens
+        )
+        total_computed_tokens = min(
+            num_local_computed_tokens + num_external_computed_tokens,
+            self.max_model_len,
+        )
+
+        watermark_blocks = 0
+        boundary_blocks = 0
+        boundary_replay_managers = []
+        if request.use_boundary_checkpoints:
+            boundary_blocks = self._boundary_capture_blocks(request)
+            if request.boundary_checkpoint is not None:
+                boundary_blocks += sum(
+                    self.block_pool.blocks[i].ref_cnt == 0
+                    for i in request.boundary_checkpoint.auxiliary_block_ids
+                )
+                if (
+                    self.use_eagle
+                    and new_computed_blocks is not None
+                    and num_local_computed_tokens > 0
+                ):
+                    boundary_replay_managers = self._boundary_replay_managers(
+                        num_local_computed_tokens
+                    )
+                    boundary_blocks += len(boundary_replay_managers)
+        # The watermark is applied to waiting/preempted requests only, and only
+        # when there's at least one request already scheduled.
+        new_admission = request.status in (
+            RequestStatus.WAITING,
+            RequestStatus.PREEMPTED,
+        )
+        if has_scheduled_reqs and new_admission:
+            watermark_blocks = self.watermark_blocks
+        # Import reservations hold back new admissions only. Running requests
+        # keep growing and resolve pressure through ordinary preemption.
+        import_reserve = (
+            self._blocks_reserved_for_imports(request) if new_admission else 0
+        )
+
+        if full_sequence_must_fit:
+            # First check and fail if the full request sequence won't fit.
+            full_num_tokens = min(request.num_tokens, self.max_model_len)
+
+            num_blocks_to_allocate = self.coordinator.get_num_blocks_to_allocate(
+                request_id=request.request_id,
+                num_tokens=full_num_tokens,
+                new_computed_blocks=new_computed_block_list,
+                num_encoder_tokens=num_encoder_tokens,
+                total_computed_tokens=total_computed_tokens,
+                num_local_computed_tokens=num_local_computed_tokens,
+                num_tokens_main_model=full_num_tokens,
+                apply_admission_cap=True,
+            )
+            required_blocks = (
+                num_blocks_to_allocate + watermark_blocks + boundary_blocks
+            )
+            if required_blocks > self.block_pool.get_num_free_blocks() - import_reserve:
+                return None
+
+        num_tokens_main_model = total_computed_tokens + num_new_tokens
+        num_tokens_need_slot = min(
+            num_tokens_main_model + num_lookahead_tokens, self.max_model_len
+        )
+
+        # Free the blocks that are skipped during the attention computation
+        # (e.g., tokens outside the sliding window).
+        # We can do this even if we cannot schedule this request due to
+        # insufficient free blocks.
+        # Should call this function before allocating new blocks to reduce
+        # the number of evicted blocks.
+        # Free on the processed-token basis: in-flight steps' attention windows
+        # still read blocks below the optimistic boundary, and rejected spec
+        # tokens can roll it back.
+        self.coordinator.remove_skipped_blocks(
+            request.request_id,
+            max(0, total_computed_tokens - request.num_in_flight_tokens),
+            num_prompt_tokens=request.num_prompt_tokens,
+        )
+
+        num_blocks_to_allocate = self.coordinator.get_num_blocks_to_allocate(
+            request_id=request.request_id,
+            num_tokens=num_tokens_need_slot,
+            new_computed_blocks=new_computed_block_list,
+            num_encoder_tokens=num_encoder_tokens,
+            total_computed_tokens=num_local_computed_tokens
+            + num_external_computed_tokens,
+            num_local_computed_tokens=num_local_computed_tokens,
+            num_tokens_main_model=num_tokens_main_model,
+        )
+
+        # Keep `reserved_blocks` free for other in-flight sequences, and an
+        # additional watermark of headroom for waiting/preempted admissions.
+        available_blocks = (
+            self.block_pool.get_num_free_blocks() - reserved_blocks - import_reserve
+        )
+        required_blocks = num_blocks_to_allocate + watermark_blocks + boundary_blocks
+        if required_blocks > available_blocks:
+            # Cannot allocate new blocks
+            return None
+
+        if (
+            request.boundary_checkpoint is not None
+            and request.request_id not in self._boundary_readers
+        ):
+            assert self.boundary_checkpoints is not None
+            admission = self._boundary_import_admissions.get(request.request_id)
+            if admission is not None and admission.ready and not admission.admitted:
+                checkpoint: BoundaryCheckpoint | None = admission.checkpoint
+                admission.admitted = True
+            else:
+                checkpoint = self.boundary_checkpoints.acquire(
+                    request.boundary_checkpoint.checkpoint_id
+                )
+            if checkpoint is None:
+                request.boundary_checkpoint = None
+                return None
+            self._boundary_readers[request.request_id] = checkpoint
+
+        if (
+            new_computed_block_list is not self.empty_kv_cache_blocks.blocks
+            or num_external_computed_tokens > 0
+        ):
+            # Append the new computed blocks to the request blocks until now to
+            # avoid the case where the new blocks cannot be allocated.
+            self.coordinator.allocate_new_computed_blocks(
+                request_id=request.request_id,
+                new_computed_blocks=new_computed_block_list,
+                num_local_computed_tokens=num_local_computed_tokens,
+                num_external_computed_tokens=num_external_computed_tokens,
+            )
+
+        for manager in boundary_replay_managers:
+            manager.prepare_boundary_replay(
+                request.request_id, num_local_computed_tokens
+            )
+        new_blocks = self.coordinator.allocate_new_blocks(
+            request.request_id,
+            num_tokens_need_slot,
+            num_tokens_main_model,
+            num_encoder_tokens,
+        )
+        if request.use_boundary_checkpoints and (
+            request.request_id not in self._boundary_allocations
+        ):
+            width = self.num_kv_cache_groups + 1
+            slots = boundary_checkpoint_slots(request)
+            allocation = self.block_pool.get_new_blocks(len(slots) * width)
+            self._boundary_allocations[request.request_id] = allocation
+            by_slot = {
+                slot: tuple(
+                    block.block_id
+                    for block in allocation[index * width : (index + 1) * width]
+                )
+                for index, slot in enumerate(slots)
+            }
+            request.boundary_checkpoint_blocks = tuple(
+                by_slot.get(slot, (0,) * width) for slot in range(max(slots) + 1)
+            )
+
+        admission = self._boundary_import_admissions.get(request.request_id)
+        if admission is not None and admission.admitted:
+            if num_tokens_main_model >= request.num_tokens:
+                del self._boundary_import_admissions[request.request_id]
+            else:
+                admission.remaining_blocks = self._external_boundary_execution_blocks(
+                    request,
+                    num_tokens_main_model,
+                    self.empty_kv_cache_blocks.blocks,
+                    restoring=False,
+                )
+        self._boundary_import_waiters.pop(request.request_id, None)
+        self._boundary_import_expired.discard(request.request_id)
+
+        # P/D: delay caching blocks if we have to recv from
+        # remote. Update state for locally cached blocks.
+        if delay_cache_blocks:
+            return self.create_kv_cache_blocks(new_blocks)
+
+        # NOTE(woosuk): We want to commit (cache) up to num_local_computed_tokens
+        # + num_external_computed_tokens + num_new_tokens, but must exclude
+        # "non-committable" tokens (e.g., draft tokens that could be rejected).
+        # Therefore, we cap the number at `request.num_tokens`, ensuring only
+        # "finalized" tokens are cached.
+        num_tokens_to_cache = min(
+            total_computed_tokens + num_new_tokens,
+            request.num_tokens,
+        )
+        self.coordinator.cache_blocks(request, num_tokens_to_cache)
+
+        return self.create_kv_cache_blocks(new_blocks)
+
+    def free(self, request: Request) -> None:
+        """Free the blocks allocated for the request.
+        We free the blocks in reverse order so that the tail blocks are evicted
+        first when caching is enabled.
+
+        Args:
+            request: The request to free the blocks.
+        """
+        boundary_blocks = self._pop_boundary_blocks(request)
+        self.block_pool.free_blocks(boundary_blocks)
+        self.coordinator.free(request.request_id)
+
+    def _pop_boundary_blocks(self, request: Request) -> list[KVCacheBlock]:
+        self.release_external_boundary_admission(request.request_id)
+        blocks = self._boundary_allocations.pop(request.request_id, [])
+        reader = self._boundary_readers.pop(request.request_id, None)
+        if reader is not None:
+            blocks.extend(self.block_pool.blocks[i] for i in reader.dependencies)
+        request.boundary_checkpoint = None
+        request.boundary_checkpoint_blocks = None
+        return blocks
+
+    def publish_boundary_checkpoint(
+        self, request: Request, num_tokens: int, *, kind: BoundaryCheckpointKind
+    ) -> BoundaryCheckpoint | None:
+        """Publish a validated endpoint after all workers completed their copies."""
+        cache = self.boundary_checkpoints
+        allocation = request.boundary_checkpoint_blocks
+        if cache is None or allocation is None or num_tokens <= 0:
+            return None
+        if not checkpoint_end_allowed(request, num_tokens):
+            return None
+        if kind == "response":
+            if (
+                request.status
+                not in (
+                    RequestStatus.FINISHED_STOPPED,
+                    RequestStatus.FINISHED_LENGTH_CAPPED,
+                )
+                or num_tokens != request.num_tokens - 1
+            ):
+                return None
+            slot = RESPONSE_CHECKPOINT_SLOT
+        elif kind == "prompt":
+            if num_tokens != request.num_prompt_tokens:
+                return None
+            slot = PROMPT_CHECKPOINT_SLOT
+        elif kind == "instruction":
+            if num_tokens != request.recurrent_instruction_boundary:
+                return None
+            slot = INSTRUCTION_CHECKPOINT_SLOT
+        elif kind == "prefill_tail":
+            if num_tokens != request.recurrent_prefill_tail_boundary:
+                return None
+            slot = PREFILL_TAIL_CHECKPOINT_SLOT
+        else:
+            return None
+        if slot >= len(allocation):
+            return None
+        grouped_blocks = []
+        for group_id, manager in enumerate(self.coordinator.single_type_managers):
+            count = cdiv(num_tokens, manager.block_size)
+            if all(
+                isinstance(spec, MambaSpec)
+                for spec in iter_layer_specs(manager.kv_cache_spec)
+            ):
+                blocks = [0] * (count - 1)
+            else:
+                # A sliding-window group can legitimately evict its leading
+                # pages. Retain the window required to replay the final row,
+                # and reject holes only inside that reachable range.
+                skipped = min(
+                    manager.get_num_skipped_tokens(num_tokens - 1)
+                    // manager.block_size,
+                    count - 1,
+                )
+                tail = [
+                    block.block_id
+                    for block in manager.req_to_blocks[request.request_id][
+                        skipped : count - 1
+                    ]
+                ]
+                if len(tail) != count - 1 - skipped or 0 in tail:
+                    return None
+                blocks = [0] * skipped + tail
+            blocks.append(allocation[slot][group_id])
+            grouped_blocks.append(tuple(blocks))
+        checkpoint = BoundaryCheckpoint(
+            cache.next_id(),
+            num_tokens,
+            tuple(grouped_blocks),
+            (allocation[slot][-1],),
+            draft_prefix_len=max(num_tokens - 1, 0) if self.use_eagle else num_tokens,
+            kind=kind,
+        )
+        cache.stage(request, checkpoint, num_ranks=1)
+        cache.acknowledge(checkpoint.checkpoint_id, 0)
+        return checkpoint
+
+    def boundary_checkpoint_page_positions(
+        self, num_tokens: int
+    ) -> tuple[tuple[int, ...], ...]:
+        """Describe the live logical pages required by a committed prefix.
+
+        Attention spans include each group's DCP geometry. Recurrent groups
+        retain one endpoint state, and sliding-window groups retain only their
+        visible suffix. Returned indices are logical positions, not GPU IDs.
+        """
+        if not 0 < num_tokens <= self.max_model_len:
+            raise ValueError("Boundary token count is outside the model context")
+        groups = []
+        for manager in self.coordinator.single_type_managers:
+            count = cdiv(num_tokens, manager.block_size)
+            if all(
+                isinstance(spec, MambaSpec)
+                for spec in iter_layer_specs(manager.kv_cache_spec)
+            ):
+                first = count - 1
+            else:
+                first = min(
+                    manager.get_num_skipped_tokens(num_tokens - 1)
+                    // manager.block_size,
+                    count - 1,
+                )
+            groups.append(tuple(range(first, count)))
+        return tuple(groups)
+
+    def reserve_external_boundary_checkpoint(
+        self,
+        request: Request,
+        num_tokens: int,
+        page_positions: tuple[tuple[int, ...], ...],
+        *,
+        draft_prefix_len: int,
+        kind: BoundaryCheckpointKind,
+        num_ranks: int,
+        reserve_admission: bool = False,
+    ) -> BoundaryCheckpoint | None:
+        """Reserve private destinations for an externally stored checkpoint.
+
+        The imported state is invisible to prefix lookup until every worker
+        acknowledges its completed H2D copies. Destinations are pinned in the
+        ordinary KV pool, including one page for target/draft auxiliary state.
+
+        With reserve_admission, also reserve a running slot and continuation
+        credits that later new admissions must leave free. Successful
+        publication retains the consumer pin until ordinary allocation takes
+        ownership. The scheduler must refresh admission context whenever it
+        admits a request; cancellation releases credits and the slot at once,
+        while staged pages stay pinned until their copies drain.
+
+        Returns None for temporary resource pressure or unavailable caching.
+        A restore refused for VLLM_CHECKPOINT_RESTORE_MAX_WAIT_S keeps getting
+        None, and the scheduler admits its request to recompute the prompt.
+        Raises ValueError for incompatible geometry or an import whose checkpoint
+        and execution state cannot fit even an otherwise empty pool.
+        """
+        cache = self.boundary_checkpoints
+        if (
+            cache is None
+            or not cache.supports_request(request)
+            or not self.prefix_cache_lookup_enabled(request)
+        ):
+            return None
+        if not 0 < num_tokens <= request.num_tokens:
+            raise ValueError("Imported boundary must cover an existing request prefix")
+        if not checkpoint_end_allowed(request, num_tokens):
+            if reserve_admission:
+                raise ValueError(
+                    "Imported checkpoint ends inside an unauthenticated span"
+                )
+            return None
+        if not 0 <= draft_prefix_len <= num_tokens:
+            raise ValueError("Imported draft prefix exceeds the target prefix")
+        if (
+            kind not in ("instruction", "prompt", "response", "prefill_tail")
+            or num_ranks < 1
+        ):
+            raise ValueError("Invalid external checkpoint kind or rank count")
+        if page_positions != self.boundary_checkpoint_page_positions(num_tokens):
+            raise ValueError("External checkpoint does not cover every live cache page")
+        count = sum(len(group) for group in page_positions) + 1
+        execution_blocks = 0
+        if reserve_admission:
+            if (
+                request.request_id in self._boundary_import_admissions
+                or request.request_id in self._boundary_import_expired
+            ):
+                return None
+            if not self.can_admit_external_boundary_request(request.request_id):
+                return None
+            # Estimation must not evict cached pages or mutate real block metadata.
+            pinned = KVCacheBlock(block_id=-1, ref_cnt=1)
+            prospective = tuple(
+                tuple(
+                    pinned if i in positions else self.block_pool.null_block
+                    for i in range(positions[-1] + 1)
+                )
+                for positions in page_positions
+            )
+            execution_blocks = self._external_boundary_execution_blocks(
+                request,
+                num_tokens,
+                prospective,
+                restoring=True,
+            )
+            if count + execution_blocks > self.block_pool.num_gpu_blocks - 1:
+                raise ValueError("Checkpoint and execution state exceed the GPU pool")
+            reserved = (
+                self._blocks_reserved_for_imports(request)
+                + self._external_admission_reserved_blocks
+            )
+            if self._external_admission_has_scheduled_reqs:
+                reserved += self.watermark_blocks
+        else:
+            reserved = self.external_boundary_reserved_blocks()
+        if count + execution_blocks + reserved > self.block_pool.get_num_free_blocks():
+            if reserve_admission:
+                self._wait_for_import_capacity(request, count + execution_blocks)
+            return None
+        allocation = self.block_pool.get_new_blocks(count)
+        try:
+            sources = iter(allocation)
+            groups = []
+            for positions in page_positions:
+                blocks = [0] * (positions[-1] + 1)
+                for position in positions:
+                    blocks[position] = next(sources).block_id
+                groups.append(tuple(blocks))
+            checkpoint = BoundaryCheckpoint(
+                cache.next_id(),
+                num_tokens,
+                tuple(groups),
+                (next(sources).block_id,),
+                draft_prefix_len=draft_prefix_len,
+                kind=kind,
+            )
+            cache.stage(request, checkpoint, num_ranks=num_ranks)
+            self._boundary_imports.add(checkpoint.checkpoint_id)
+            if reserve_admission:
+                self._boundary_import_waiters.pop(request.request_id, None)
+                self._boundary_import_admissions[request.request_id] = (
+                    _BoundaryImportAdmission(request, checkpoint, execution_blocks)
+                )
+            return checkpoint
+        finally:
+            # stage() owns a separate pin on every dependency until publication
+            # or discard. Failed staging releases the original allocation here.
+            self.block_pool.free_blocks(allocation)
+
+    def acknowledge_external_boundary_checkpoint(
+        self, checkpoint_id: int, rank: int
+    ) -> bool:
+        """Publish imported state only after all ranks finish their GPU copies."""
+        cache = self.boundary_checkpoints
+        if cache is None or checkpoint_id not in self._boundary_imports:
+            return False
+        published = cache.acknowledge(checkpoint_id, rank)
+        if not cache.is_pending(checkpoint_id):
+            self._boundary_imports.remove(checkpoint_id)
+            for request_id, admission in tuple(
+                self._boundary_import_admissions.items()
+            ):
+                if admission.checkpoint.checkpoint_id != checkpoint_id:
+                    continue
+                if published:
+                    # No scheduler allocation may intervene between publication
+                    # and acquiring the consumer's ownership.
+                    acquired = cache.acquire(checkpoint_id)
+                    assert acquired is not None
+                    admission.ready = True
+                    admission.request.boundary_checkpoint = admission.checkpoint
+                else:
+                    del self._boundary_import_admissions[request_id]
+        return published
+
+    def discard_external_boundary_checkpoint(self, checkpoint_id: int) -> None:
+        """Release an unsuccessful import after every submitted GPU copy drains.
+
+        Calling this while any worker may still write its destinations would
+        make those pages reusable too early. The connector owns that barrier.
+        """
+        if checkpoint_id in self._boundary_imports:
+            assert self.boundary_checkpoints is not None
+            self.boundary_checkpoints.discard(checkpoint_id)
+            self._boundary_imports.remove(checkpoint_id)
+            for request_id, admission in tuple(
+                self._boundary_import_admissions.items()
+            ):
+                if admission.checkpoint.checkpoint_id == checkpoint_id:
+                    del self._boundary_import_admissions[request_id]
+
+    def set_external_boundary_admission_context(
+        self,
+        available_slots: int,
+        reserved_blocks: int,
+        *,
+        has_scheduled_reqs: bool = False,
+    ) -> None:
+        """Refresh scheduler capacity before polling candidates.
+
+        The scheduler refreshes it again after every admission in its pass.
+
+        Args:
+            available_slots: Slots remaining after running and paused sessions.
+            reserved_blocks: Remaining needs of prefills without import tickets.
+            has_scheduled_reqs: Apply the normal admission watermark when true.
+        """
+        self._external_admission_slots = available_slots
+        self._external_admission_reserved_blocks = reserved_blocks
+        self._external_admission_has_scheduled_reqs = has_scheduled_reqs
+
+    def has_external_boundary_admission(self, request_id: str) -> bool:
+        """Whether this request already owns import continuation credits."""
+        return request_id in self._boundary_import_admissions
+
+    def external_boundary_reserved_blocks(self, owner: str | None = None) -> int:
+        """Return outstanding import credits, excluding the allocating owner."""
+        return sum(
+            admission.remaining_blocks
+            for request_id, admission in self._boundary_import_admissions.items()
+            if request_id != owner
+        )
+
+    def _blocks_reserved_for_imports(self, request: Request) -> int:
+        """Blocks a new admission must leave free for imports ahead of it."""
+        reserved = self.external_boundary_reserved_blocks(request.request_id)
+        barrier = self._boundary_import_barrier
+        if (
+            barrier is not None
+            and barrier[0] != request.request_id
+            and request.num_computed_tokens == 0
+            and request.request_id not in self._boundary_import_admissions
+        ):
+            reserved += barrier[1]
+        return reserved
+
+    def _wait_for_import_capacity(self, request: Request, need: int) -> None:
+        """Record a capacity refusal and bound how long the restore may wait."""
+        now = time.monotonic()
+        waiter = self._boundary_import_waiters.get(request.request_id)
+        if waiter is None:
+            waiter = _BoundaryImportWaiter(need, now)
+            self._boundary_import_waiters[request.request_id] = waiter
+        waited = now - waiter.since
+        if waited >= self._boundary_import_max_wait:
+            self._forget_import_waiter(request.request_id)
+            self._boundary_import_expired.add(request.request_id)
+            logger.warning(
+                "Checkpoint restore for request %s waited %.1f s for %d GPU "
+                "blocks; recomputing its prompt instead",
+                request.request_id,
+                waited,
+                need,
+            )
+            return
+        waiter.need = need
+        # Later candidates in this step are behind the waiter; earlier ones,
+        # and requests considered first in the next step, are not.
+        if self._boundary_import_barrier is None:
+            self._boundary_import_barrier = (request.request_id, need)
+
+    def _forget_import_waiter(self, request_id: str) -> None:
+        self._boundary_import_waiters.pop(request_id, None)
+        barrier = self._boundary_import_barrier
+        if barrier is not None and barrier[0] == request_id:
+            self._boundary_import_barrier = None
+
+    def can_admit_external_boundary_request(self, request_id: str) -> bool:
+        """Whether a candidate can use a running slot without stealing a ticket."""
+        if request_id in self._boundary_import_admissions:
+            return True
+        return (
+            self._external_admission_slots is None
+            or sum(
+                not admission.admitted
+                for admission in self._boundary_import_admissions.values()
+            )
+            < self._external_admission_slots
+        )
+
+    def has_pending_external_boundary_admissions(self) -> bool:
+        """Whether an import still needs ordinary scheduler admission."""
+        return any(not a.admitted for a in self._boundary_import_admissions.values())
+
+    def external_boundary_admission_ready(self, request_id: str) -> bool:
+        """Whether a waiting import has finished copying and owns its checkpoint."""
+        admission = self._boundary_import_admissions.get(request_id)
+        return admission is not None and admission.ready and not admission.admitted
+
+    def external_boundary_wait_expired(self, request_id: str) -> bool:
+        """Whether a restore outwaited its capacity bound, so the prompt recomputes."""
+        return request_id in self._boundary_import_expired
+
+    def ready_external_boundary_requests(self) -> list[Request]:
+        """Waiting consumers whose imports finished copying, in reservation order."""
+        return [
+            admission.request
+            for admission in self._boundary_import_admissions.values()
+            if admission.ready and not admission.admitted
+        ]
+
+    def release_external_boundary_admission(self, request_id: str) -> None:
+        """Release an import's credits and slot, or end its capacity wait.
+
+        A copy that is still in flight keeps only its staged pages pinned, until
+        the connector acknowledges or discards it.
+        """
+        self._forget_import_waiter(request_id)
+        self._boundary_import_expired.discard(request_id)
+        admission = self._boundary_import_admissions.pop(request_id, None)
+        if admission is None or not admission.ready or admission.admitted:
+            return
+        assert self.boundary_checkpoints is not None
+        self.boundary_checkpoints.release(admission.checkpoint)
+        if admission.request.boundary_checkpoint is admission.checkpoint:
+            admission.request.boundary_checkpoint = None
+
+    def _external_boundary_execution_blocks(
+        self,
+        request: Request,
+        prefix: int,
+        blocks: tuple[Sequence[KVCacheBlock], ...],
+        *,
+        restoring: bool,
+    ) -> int:
+        full = min(request.num_tokens + 1, self.max_model_len)
+        needed = self.coordinator.get_num_blocks_to_allocate(
+            request_id=request.request_id,
+            num_tokens=min(full + self._boundary_restore_lookahead, self.max_model_len),
+            new_computed_blocks=blocks,
+            num_encoder_tokens=0,
+            total_computed_tokens=prefix,
+            num_local_computed_tokens=prefix,
+            num_tokens_main_model=full,
+            apply_admission_cap=True,
+        )
+        reader = self._boundary_readers.get(request.request_id)
+        dependencies = set(reader.dependencies) if reader is not None else set()
+        for group, manager in zip(blocks, self.coordinator.single_type_managers):
+            spec = manager.kv_cache_spec
+            if isinstance(spec, MambaSpec) and spec.mamba_cache_mode == "align":
+                # Continuation overlaps running/previous states while the
+                # imported source stays pinned.
+                peak = (
+                    2 + spec.num_speculative_blocks + spec.num_prefill_checkpoint_blocks
+                )
+            elif isinstance(spec, (SlidingWindowSpec, ChunkedLocalAttentionSpec)):
+                # Logical tables retain null positions after a window moves;
+                # only private physical pages can satisfy the continuation peak.
+                peak = spec.max_admission_blocks_per_request(
+                    self._boundary_max_in_flight_tokens, self.max_model_len
+                )
+            else:
+                continue
+            owned = sum(
+                not block.is_null and block.block_id not in dependencies
+                for block in manager.req_to_blocks.get(request.request_id, ())
+            )
+            endpoint_need = manager.get_num_blocks_to_allocate(
+                request.request_id,
+                min(full + self._boundary_restore_lookahead, self.max_model_len),
+                group,
+                prefix,
+                prefix,
+                full,
+                apply_admission_cap=True,
+            )
+            remaining = max(0, peak - owned)
+            if isinstance(spec, (SlidingWindowSpec, ChunkedLocalAttentionSpec)):
+                # A short suffix may never fill a complete private window.
+                suffix_need = manager.get_num_blocks_to_allocate(
+                    request.request_id,
+                    min(full + self._boundary_restore_lookahead, self.max_model_len),
+                    group,
+                    prefix,
+                    prefix,
+                    full,
+                )
+                remaining = min(remaining, suffix_need)
+            needed += max(0, remaining - endpoint_need)
+        needed += self._boundary_capture_blocks(request)
+        if restoring and self.use_eagle:
+            needed += len(self._boundary_replay_managers(prefix))
+        return needed
+
+    def _boundary_capture_blocks(self, request: Request) -> int:
+        if request.request_id in self._boundary_allocations:
+            return 0
+        return len(boundary_checkpoint_slots(request)) * (self.num_kv_cache_groups + 1)
+
+    def _boundary_replay_managers(self, prefix: int) -> list[SingleTypeKVCacheManager]:
+        return [
+            manager
+            for manager in self.coordinator.single_type_managers
+            if prefix % manager.block_size == 0
+            and not any(
+                isinstance(spec, MambaSpec)
+                for spec in iter_layer_specs(manager.kv_cache_spec)
+            )
+        ]
+
+    def remove_skipped_blocks(
+        self,
+        request_id: str,
+        processed_computed_tokens: int,
+        num_prompt_tokens: int | None = None,
+    ) -> None:
+        """Remove the blocks that are no longer needed from `blocks` and replace
+        the removed blocks with null_block.
+
+        Args:
+            request_id: The request ID.
+            processed_computed_tokens: Computed-token prefix length covering
+                fully processed and committed tokens only (safe to free).
+            num_prompt_tokens: Optional prompt length for R-SWA gap eviction.
+        """
+        self.coordinator.remove_skipped_blocks(
+            request_id, processed_computed_tokens, num_prompt_tokens
+        )
+
+    def pop_blocks_for_free(self, request: Request) -> list[KVCacheBlock]:
+        """Pop the request's bookkeeping and return its blocks without
+        returning them to the block pool. The caller must eventually free
+        them in reverse order (so that tail blocks are evicted first).
+
+        Args:
+            request: The request to pop the blocks for.
+
+        Returns:
+            The request's blocks in allocation order.
+        """
+        blocks = self.coordinator.pop_blocks_for_free(request.request_id)
+        blocks.extend(self._pop_boundary_blocks(request))
+        return blocks
+
+    def evict_blocks(self, block_ids: set[int]) -> None:
+        """evict blocks from the prefix cache by their block IDs.
+
+        Args:
+            block_ids: Set of block IDs to evict from cache.
+        """
+        self.block_pool.evict_blocks(block_ids)
+
+    def reset_prefix_cache(self) -> bool:
+        """Reset prefix cache. This function may be used in RLHF
+        flows to invalidate prefix caching after the weights are updated,
+        or used for resetting prefix caching status for benchmarking.
+
+        Returns:
+            bool: True if the prefix cache is successfully reset,
+            False otherwise.
+        """
+        # Capture pins are not request-owned; the pool reset releases them
+        # even while stores are still pending.
+        for mgr in self.coordinator.single_type_managers:
+            mgr.release_all_boundary_captures()
+        if not self.coordinator.reset_prefix_cache():
+            return False
+        if self.log_stats:
+            assert self.prefix_cache_stats is not None
+            self.prefix_cache_stats.reset = True
+        return True
+
+    def get_num_common_prefix_blocks(self, running_request_id: str) -> list[int]:
+        """Calculate the number of common prefix blocks for each kv cache group.
+
+        The function selects a running request and iterates through its blocks.
+        A block is considered a common prefix block if ALL requests with
+        allocated KV cache share it (i.e., ref_cnt equals the number of entries
+        in req_to_blocks).
+
+        NOTE(woosuk): The number of requests with allocated KV cache is **greater
+        than or equal to** the number of requests scheduled in the current step.
+        This is because having allocated KV cache only indicates that:
+        1. The request has not yet finished, and
+        2. The request holds its blocks unfreed.
+
+        While all scheduled requests must have allocated KV cache, the inverse
+        is not necessarily true. There may be requests with allocated KV cache
+        that are not scheduled in the current step.
+
+        This can result in an edge case where the number of common prefix blocks
+        is 0, even though all scheduled requests share a common prefix. This
+        occurs because there may be unscheduled requests that do not share the
+        common prefix. Currently, this case cannot be easily detected, so the
+        function returns 0 in such cases.
+
+        Args:
+            running_request_id: The request ID of any running request, used to
+                identify the common prefix blocks.
+
+        Returns:
+            list[int]: The number of common prefix blocks for each kv cache
+            group.
+        """
+        return self.coordinator.get_num_common_prefix_blocks(running_request_id)
+
+    def take_events(self) -> list[KVCacheEvent]:
+        """Take the KV cache events from the block pool.
+
+        Returns:
+            A list of KV cache events.
+        """
+        events = self.block_pool.take_events()
+        for event in events:
+            if not isinstance(event, BlockStored):
+                continue
+            if event.group_idx is None:
+                continue
+            if event.group_idx < 0 or event.group_idx >= len(
+                self.kv_cache_event_metadata
+            ):
+                logger.warning(
+                    "Group index `%s` not in KV cache metadata", event.group_idx
+                )
+                continue
+            # Annotate here so BlockPool can keep emitting structural cache
+            # events without owning semantic KV cache spec metadata.
+            kind, sliding_window = self.kv_cache_event_metadata[event.group_idx]
+            event.kv_cache_spec_kind = kind
+            event.kv_cache_spec_sliding_window = sliding_window
+        return events
+
+    def get_blocks(self, request_id: str) -> KVCacheBlocks:
+        """Get the blocks of a request."""
+        return self.create_kv_cache_blocks(self.coordinator.get_blocks(request_id))
+
+    def get_block_ids(self, request_id: str) -> tuple[list[int], ...]:
+        """Get the block ids of a request."""
+        return self.get_blocks(request_id).get_block_ids()
+
+    def get_block_ids_for_computed_tokens(
+        self,
+        request_id: str,
+        num_computed_tokens: int,
+    ) -> tuple[list[int], ...]:
+        """Get block ids covering the request's computed tokens."""
+        block_ids = self.get_block_ids(request_id)
+        clipped_block_ids: list[list[int]] = []
+        for group, ids in zip(self.kv_cache_config.kv_cache_groups, block_ids):
+            spec = group.kv_cache_spec
+            if not isinstance(spec, AttentionSpec) or isinstance(
+                spec, (CrossAttentionSpec, EncoderOnlyAttentionSpec)
+            ):
+                clipped_block_ids.append(ids)
+                continue
+
+            num_valid_blocks = cdiv(num_computed_tokens, spec.block_size)
+            clipped_block_ids.append(ids[:num_valid_blocks])
+        return tuple(clipped_block_ids)
+
+    def estimate_cached_tokens(self, request: Request) -> int:
+        """Estimate the number of tokens cached by the request."""
+        cached_tokens: int | None = None
+        for group, blocks in zip(
+            self.kv_cache_config.kv_cache_groups,
+            self.get_blocks(request.request_id).blocks,
+        ):
+            if not group.kv_cache_spec.prefix_cacheable:
+                continue
+            if isinstance(
+                group.kv_cache_spec,
+                (CrossAttentionSpec, EncoderOnlyAttentionSpec),
+            ):
+                # Cross-attention and encoder-only groups are not prefix cached.
+                continue
+
+            group_cached_tokens = 0
+            for block in blocks:
+                group_cached_tokens = max(
+                    group_cached_tokens,
+                    block.block_hash_num_tokens or 0,
+                )
+
+            cached_tokens = (
+                group_cached_tokens
+                if cached_tokens is None
+                else min(cached_tokens, group_cached_tokens)
+            )
+
+        return cached_tokens or 0
+
+    def cache_blocks(self, request: Request, num_computed_tokens: int) -> None:
+        """Cache the blocks for the request, if enabled.
+
+        Args:
+            request: The request to cache the blocks.
+            num_computed_tokens: The number of computed tokens, including tokens
+                that are already cached and tokens to be cached.
+        """
+        if self.enable_caching:
+            self.coordinator.cache_blocks(request, num_computed_tokens)
+
+    def create_kv_cache_blocks(
+        self, blocks: tuple[list[KVCacheBlock], ...]
+    ) -> KVCacheBlocks:
+        # Only create new KVCacheBlocks for non-empty blocks
+        return KVCacheBlocks(blocks) if any(blocks) else self.empty_kv_cache_blocks
+
+    def truncate_computed_blocks(
+        self, blocks: KVCacheBlocks, num_computed_tokens: int
+    ) -> KVCacheBlocks:
+        """Return a lookup-result view truncated at an aligned token endpoint.
+
+        An external hit can supply the final Mamba state even when the local
+        Mamba group ends before this endpoint. Other groups must cover it.
+        Pure slicing: refcounts are untouched and ``blocks`` is not mutated.
+        """
+        truncated: list[list[KVCacheBlock]] = []
+        for group_blocks, manager, group in zip(
+            blocks.blocks,
+            self.coordinator.single_type_managers,
+            self.kv_cache_config.kv_cache_groups,
+            strict=True,
+        ):
+            if not group.kv_cache_spec.prefix_cacheable:
+                # Scratch groups (e.g. the CSA compressor ring) hold a fixed
+                # block covering no token range, so a lookup result never
+                # carries computed blocks for them and their block size does
+                # not divide the endpoint.
+                assert not group_blocks
+                truncated.append([])
+                continue
+            assert num_computed_tokens % manager.block_size == 0
+            num_blocks = num_computed_tokens // manager.block_size
+            if isinstance(group.kv_cache_spec, MambaSpec):
+                num_blocks = min(num_blocks, len(group_blocks))
+            else:
+                assert num_blocks <= len(group_blocks)
+            truncated.append(list(group_blocks[:num_blocks]))
+        return self.create_kv_cache_blocks(tuple(truncated))
+
+    def take_new_block_ids(self) -> list[int]:
+        """Drain and return new attention block IDs for zeroing."""
+        ids: list[int] = []
+        for mgr in self.coordinator.single_type_managers:
+            ids.extend(mgr.take_new_block_ids())
+        return ids
+
+    def get_zeroing_block_ids_in_range(
+        self, request_id: str, start_token: int, end_token: int
+    ) -> list[int]:
+        """The request's block ids covering [start_token, end_token), from
+        the groups whose new blocks are zeroed by the worker."""
+        ids: list[int] = []
+        for mgr in self.coordinator.single_type_managers:
+            if mgr.records_new_block_ids:
+                start_idx = start_token // mgr.block_size
+                end_idx = cdiv(end_token, mgr.block_size)
+                blocks = mgr.req_to_blocks[request_id]
+                ids.extend(blk.block_id for blk in blocks[start_idx:end_idx])
+        return ids
+
+    def record_blocks_for_zeroing(self, request_id: str, start_token: int) -> None:
+        """Re-record the request's blocks from start_token onwards for
+        zeroing, e.g. blocks a failed async KV load left unwritten.
+
+        start_token must be block-aligned: zeroing a partially-valid block
+        would wipe its valid prefix.
+        """
+        for mgr in self.coordinator.single_type_managers:
+            if mgr.records_new_block_ids:
+                assert start_token % mgr.block_size == 0
+                start_idx = start_token // mgr.block_size
+                blocks = mgr.req_to_blocks[request_id]
+                mgr.new_block_ids.extend(blk.block_id for blk in blocks[start_idx:])
+
+    def take_kv_cache_block_copies(
+        self,
+    ) -> tuple[list[KVCacheBlockCopy], list[KVCacheBlock]]:
+        """Drain pending copies and return their retained endpoints."""
+        pending_copies: list[tuple[KVCacheBlock, KVCacheBlock]] = []
+        for mgr in self.coordinator.single_type_managers:
+            pending_copies.extend(mgr.take_pending_cow_copies())
+        copies = [
+            KVCacheBlockCopy(
+                src_block_id=source_block.block_id,
+                dst_block_id=cow_block.block_id,
+            )
+            for source_block, cow_block in pending_copies
+        ]
+        retained_blocks = [block for pair in pending_copies for block in pair]
+        return copies, retained_blocks
+
+    def take_boundary_state_offloads(
+        self,
+    ) -> dict[str, list[tuple[int, int, int]]]:
+        """Drain this step's boundary-state hand-offs for a KV connector.
+
+        Returns ``{request_id: [(group_id, block_id, boundary_tokens), ...]}``
+        for mamba "align" boundary states: the
+        request's committed boundary-state snapshots and, on a sub-block partial
+        hit, the CoW copy of its last-prompt-boundary state. Only mamba "align"
+        groups contribute; empty otherwise. A connector reads the referenced
+        blocks — never resolving them positionally — and offloads them so a
+        later request can hit that prefix.
+        """
+        offloads: dict[str, list[tuple[int, int, int]]] = {}
+        for mgr in self.coordinator.single_type_managers:
+            for (
+                req_id,
+                group_id,
+                block,
+                boundary_tokens,
+            ) in mgr.take_pending_boundary_state_offloads():
+                offloads.setdefault(req_id, []).append(
+                    (group_id, block.block_id, boundary_tokens)
+                )
+        return offloads
+
+    def release_boundary_capture(self, block_id: int) -> None:
+        """Release a frozen capture block's manager pin (store ack / drop).
+
+        Only the Mamba manager that pinned ``block_id`` acts; the call is a
+        no-op for every other manager and for block ids never pinned, so a
+        connector may pass it fenced ids from any store kind.
+        """
+        for mgr in self.coordinator.single_type_managers:
+            mgr.release_boundary_capture(block_id)
+
+    def finalize_partial_tail_offloads(
+        self, request: Request
+    ) -> list[tuple[int, int, int]]:
+        """Consume safe producer partial tails when a request finishes.
+
+        A mamba align table block is a valid boundary source only if no later
+        token was forwarded. The connector pins and queues the exact table
+        block before request cleanup, then releases the pin when every worker
+        reports the store job complete.
+        """
+        offloads: list[tuple[int, int, int]] = []
+        for mgr in self.coordinator.single_type_managers:
+            finalized = mgr.finalize_partial_tail_offload(
+                request.request_id,
+                request.num_computed_tokens,
+                request.num_in_flight_tokens,
+            )
+            if finalized is None:
+                continue
+            group_id, block, boundary_tokens = finalized
+            offloads.append((group_id, block.block_id, boundary_tokens))
+        return offloads
+
+    def new_step_starts(self) -> None:
+        """Notify the coordinator that a new step is starting."""
+        self._boundary_import_barrier = None
+        self.coordinator.new_step_starts()

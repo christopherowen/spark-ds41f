@@ -1,0 +1,775 @@
+From 3fe3dfe937c67ee26e3a73d514f4ade73f62ec9e Mon Sep 17 00:00:00 2001
+From: Christopher Owen <root@your.mom>
+Date: Fri, 6 Nov 2026 01:22:23 +0100
+Subject: [PATCH] Reconstruct private decoder history after preemption
+
+Base: candidate-38 1f33102547e4da5c64712390604695d1abd577c4, built from upstream 19f2c20ed4d64ae22bd009ceacadd85e2a81e354 and its ordered series.
+
+Recovery keeps the original prompt replay floor and every accepted generated row. The shared encoder prefix cannot skip the private decoder history needed by deeper sliding-window layers. Normal prompt and decode arithmetic is unchanged; recovery deliberately does more work after private state is lost.
+
+Tests: independent group eviction and lifecycle oracle, original-boundary allocation regressions, metadata/reordering cases, and native three-layer TileLang recovery reproducer. CPU cache suite: 395 passed, four known HiSparse cases deselected; 45 isolated policy cases passed. Native GPU and full serving validation remain pending. Upstream status: experimental fork proposal, not submitted upstream or promoted.
+---
+ .../attention/test_deepseek_v41_ced_replay.py |  88 ++++-
+ tests/models/test_deepseek_v4_1_glp.py        |   4 +-
+ .../attention/test_b12x_v41_ced_metadata.py   |  56 +++-
+ tests/v1/core/test_prefix_group_validity.py   | 313 ++++++++++++++++++
+ vllm/models/deepseek_v4_1/ced.py              |  32 +-
+ .../deepseek_v4_1/nvidia/model_state.py       |  18 +-
+ vllm/v1/core/kv_cache_manager.py              |  10 +-
+ 7 files changed, 497 insertions(+), 24 deletions(-)
+ create mode 100644 tests/v1/core/test_prefix_group_validity.py
+
+diff --git a/tests/kernels/attention/test_deepseek_v41_ced_replay.py b/tests/kernels/attention/test_deepseek_v41_ced_replay.py
+index ca37d0321a..8bfcbbf52a 100644
+--- a/tests/kernels/attention/test_deepseek_v41_ced_replay.py
++++ b/tests/kernels/attention/test_deepseek_v41_ced_replay.py
+@@ -64,13 +64,36 @@ def aligned_chunks(threshold, start, end):
+     return chunks
+ 
+ 
+-def model_state_stager(prefix):
++def model_state_stager(prefix, *, original_prompt_end=None, prefill_end=None):
+     """Stages each chunk as serving does: the model state's ``_stage_ced``."""
+     from vllm.models.deepseek_v4_1.nvidia.model_state import DeepseekV41ModelState
+ 
+     state = DeepseekV41ModelState.__new__(DeepseekV41ModelState)
+     state.ced_state = CEDState(4, 8192, (128, 256, 384, 512, 8192), DEVICE)
+     state._ced_prompt_logprobs, state._ced_prefix_start = set(), {"prompt": prefix}
++    state._ced_recovery_prompt_end = {}
++    if original_prompt_end is not None:
++        # Exercise the real request admission hook: a resumed request keeps the
++        # original prompt length while its prefill ids include accepted outputs.
++        from vllm.v1.core.sched.output import NewRequestData
++
++        state.rope_state = state.prompt_embeds_state = None
++        state.steering = state.steered_requests = None
++        state.disk_engram_models, state._prefill_tokens = (), {}
++        state.add_request(
++            0,
++            NewRequestData(
++                req_id="prompt",
++                prompt_token_ids=list(range(original_prompt_end)),
++                mm_features=[],
++                sampling_params=None,
++                pooling_params=None,
++                block_ids=(),
++                num_computed_tokens=prefix,
++                lora_request=None,
++                prefill_token_ids=list(range(prefill_end)),
++            ),
++        )
+ 
+     def stage(start, rows, prompt_end, starts, seq):
+         state._stage_ced(
+@@ -80,8 +103,12 @@ def model_state_stager(prefix):
+                 query_start_loc=starts,
+                 seq_lens=seq,
+                 num_scheduled_tokens=np.array([rows]),
+-                num_computed_prefill_tokens_np=np.array([start]),
+-                prefill_len_np=np.array([prompt_end]),
++                num_computed_prefill_tokens_np=np.array(
++                    [min(start, prompt_end if prefill_end is None else prefill_end)]
++                ),
++                prefill_len_np=np.array(
++                    [prompt_end if prefill_end is None else prefill_end]
++                ),
+             )
+         )
+         return state.ced_state
+@@ -89,12 +116,14 @@ def model_state_stager(prefix):
+     return stage
+ 
+ 
+-def decoder_stack(prompt_end, chunks, stage, seed=5):
++def decoder_stack(prompt_end, chunks, stage, seed=5, encoder=None):
+     """The stack's last-layer rows for the kept positions of every step, in
+     ``{position: row}``, the last step's kept row winning."""
+     gen = torch.Generator(device=DEVICE).manual_seed(seed)
+     # The encoder's output: one fixed row a position, whatever the chunking.
+-    encoder = torch.randn((prompt_end, HEAD_DIM), generator=gen, device=DEVICE)
++    if encoder is None:
++        encoder = torch.randn((prompt_end, HEAD_DIM), generator=gen, device=DEVICE)
++    assert encoder.shape == (prompt_end, HEAD_DIM)
+     scales = torch.linspace(0.5, 1.5, HEADS, device=DEVICE)
+     sinks = torch.linspace(-1.0, 1.0, HEADS, device=DEVICE)
+     pages = prompt_end // PAGE + 2
+@@ -107,7 +136,7 @@ def decoder_stack(prompt_end, chunks, stage, seed=5):
+     rope = rope_table(prompt_end + 1)
+     plan = SparseMlaV41Plan(
+         HEADS, CED_WINDOW, 0, 128, swa_page_size=PAGE,
+-        max_rows=256, decode_max_rows=256, split_max_rows=256,
++        max_rows=512, decode_max_rows=256, split_max_rows=512,
+     )  # fmt: skip
+     outputs = {}
+     for start, rows in chunks:
+@@ -176,3 +205,50 @@ def test_chunkings_give_the_same_decoder_rows(final_rows):
+             prompt_end,
+         )
+         assert torch.equal(rows, reference), (threshold, prefix, chunks)
++
++
++@pytest.mark.parametrize("generated_rows", [129, 257])
++@pytest.mark.parametrize("resumed_chunk", [64, 512])
++def test_preempted_decode_rebuilds_original_decoder_history(
++    generated_rows, resumed_chunk
++):
++    """Losing private windows must not change an in-flight continuation.
++
++    The first run completes one prompt and then computes accepted generated rows
++    one at a time. The second run has lost every private decoder page; its worker
++    input contains the same original prompt plus the accepted output suffix, as
++    MRV2 sends after preemption. All encoder rows are identical and untouched.
++    Comparing the final row traverses three real TileLang SWA layers, so dropping
++    the early generated rows cannot hide behind one layer's 128-token horizon.
++    """
++    original_end = 1024
++    total = original_end + generated_rows
++    # Values are deterministic dyadic fractions; no random sampler or model
++    # weights participate. Both executions receive the exact same encoder rows.
++    positions = torch.arange(total, device=DEVICE, dtype=torch.float32)[:, None]
++    columns = torch.arange(HEAD_DIM, device=DEVICE, dtype=torch.float32)[None, :]
++    encoder = ((positions % 17) - 8) / 512 + ((columns % 11) - 5) / 1024
++    uninterrupted = decoder_stack(
++        total,
++        [(0, original_end), *((p, 1) for p in range(original_end, total))],
++        model_state_stager(
++            0, original_prompt_end=original_end, prefill_end=original_end
++        ),
++        encoder=encoder,
++    )
++    expected = uninterrupted[total - 1]
++    assert torch.isfinite(expected).all()
++
++    # Last legal 256-token encoder hit before the ORIGINAL prompt replay floor.
++    # This deliberately provides enough encoder history to reconstruct the exact
++    # continuation; changing only the cache-hit cap cannot make this test pass.
++    hit = (original_end - CED_WINDOW) // 256 * 256
++    resumed = decoder_stack(
++        total,
++        aligned_chunks(resumed_chunk, hit, total),
++        model_state_stager(hit, original_prompt_end=original_end, prefill_end=total),
++        encoder=encoder,
++    )
++    actual = resumed[total - 1]
++    assert torch.isfinite(actual).all()
++    torch.testing.assert_close(actual, expected, atol=0, rtol=0)
+diff --git a/tests/models/test_deepseek_v4_1_glp.py b/tests/models/test_deepseek_v4_1_glp.py
+index 0fd27afba8..80f8ffa4c3 100644
+--- a/tests/models/test_deepseek_v4_1_glp.py
++++ b/tests/models/test_deepseek_v4_1_glp.py
+@@ -420,6 +420,7 @@ def test_model_state_skips_mark_rows_when_no_steered_request_is_scheduled(monkey
+     state._steering_rows_dirty_len = 0
+     state._ced_prompt_logprobs = set()
+     state._ced_prefix_start = {}
++    state._ced_recovery_prompt_end = {}
+     state._ced_streaming_prefix_start = None
+     state._prefill_tokens = {}
+     state.disk_engram_models = ()
+@@ -466,7 +467,8 @@ def test_model_state_skips_mark_rows_when_no_steered_request_is_scheduled(monkey
+     assert state._steering_rows_dirty_len == 12
+     assert bool((state.steering.rows[:12] == 1).all())
+ 
+-    # 3. Next step schedules only stock-0: clears the 12 dirty rows once without mark_rows.
++    # 3. Next step schedules only stock-0: clears the 12 dirty rows once,
++    # without mark_rows.
+     state.prepare_inputs(_batch(["stock-0"], [0], 6), None)
+     assert len(marked_calls) == 1
+     assert len(uva_copies) == 1
+diff --git a/tests/v1/attention/test_b12x_v41_ced_metadata.py b/tests/v1/attention/test_b12x_v41_ced_metadata.py
+index f15aab4ed2..297834dbac 100644
+--- a/tests/v1/attention/test_b12x_v41_ced_metadata.py
++++ b/tests/v1/attention/test_b12x_v41_ced_metadata.py
+@@ -78,6 +78,49 @@ def test_replay_rows_anchor_at_the_prompt_end():
+     assert replay_rows([4096], [0], [8192], [64], [True]) == ([64], [KEEP_ALL])
+ 
+ 
++@pytest.mark.parametrize("generated", [1, 127, 128, 129, 255, 256, 257, 8193])
++@pytest.mark.parametrize("chunk_size", [64, 128, 256, 512, 4096])
++def test_recovery_keeps_all_rows_from_original_prompt_floor(generated, chunk_size):
++    # Original prompt and accepted outputs belong to one execution. A new
++    # private decoder cache needs the original prompt tail AND every output row,
++    # even when recovery's prefill is much longer than its sliding window.
++    prompt_end, prefix = 1024, 768
++    total = prompt_end + generated
++    required = set(range(prompt_end - CED_WINDOW, total))
++    written = set()
++    for start in range(prefix, total, chunk_size):
++        rows = min(chunk_size, total - start)
++        floors, limits = replay_rows(
++            [rows], [start], [total], [prefix], [False], [prompt_end]
++        )
++        plan = plan_ced([rows], [False], (16384,), limits)
++        kept = rows if plan is None else plan.num_tokens
++        first = start + rows - kept
++        floor = min(floors[0], first)
++        for position in range(first, start + rows):
++            if position in required:
++                assert floor == prompt_end - CED_WINDOW
++                # Earlier required state is either in this step or was written
++                # by a prior step, independently of the chosen chunk size.
++                visible = set(range(max(position - 127, floor), position))
++                assert visible <= written | set(range(first, position))
++        written.update(range(first, start + rows))
++    assert required <= written
++
++
++def test_recovery_limits_survive_mixed_batch_reordering():
++    inputs = [(6, 5000, 5000, 256, 5000), (512, 768, 1281, 768, 1024)]
++    for order in ((0, 1), (1, 0)):
++        rows, computed, totals, prefixes, prompts = zip(*(inputs[i] for i in order))
++        floors, limits = replay_rows(
++            rows, computed, totals, prefixes, [False, False], prompts
++        )
++        plan = plan_ced(rows, [False, False], (128, 256, 512, 1024), limits)
++        assert plan.num_tokens == 390  # six decode rows, 384 recovery rows
++        assert [floors[order.index(i)] for i in range(2)] == [256, 896]
++        assert [limits[order.index(i)] for i in range(2)] == [128, 384]
++
++
+ def _aligned_chunks(threshold, start, end):
+     """The scheduler's aligned prefill chunks ``(start, rows)`` of a prompt computed
+     from ``start``, when every step has room for a whole chunk."""
+@@ -167,6 +210,7 @@ def test_compacted_short_chunks_run_eagerly():
+     state.ced_state = object()
+     state._ced_prompt_logprobs = set()
+     state._ced_prefix_start = {"decode": 0, "hit": 16256}
++    state._ced_recovery_prompt_end = {}
+ 
+     def batch(rows, prompt_end, prefilling=True):
+         return SimpleNamespace(
+@@ -283,6 +327,7 @@ def test_prompt_logprobs_zero_keeps_every_prompt_row(monkeypatch):
+     state.ced_state, starts, seq = _state([4096, 4096])
+     state._ced_prompt_logprobs = set()
+     state._ced_prefix_start = {}
++    state._ced_recovery_prompt_end = {}
+     state.disk_engram_models, state._prefill_tokens = (), {}
+     batch = SimpleNamespace(
+         num_reqs=2,
+@@ -297,6 +342,7 @@ def test_prompt_logprobs_zero_keeps_every_prompt_row(monkeypatch):
+         0,
+         SimpleNamespace(
+             req_id="logprobs",
++            prefill_token_ids=None,
+             num_computed_tokens=0,
+             sampling_params=SimpleNamespace(prompt_logprobs=0),
+             mm_features=[],
+@@ -423,11 +469,16 @@ def test_prompt_chunks_replay_from_the_prompt_end(monkeypatch, prompt_end, steps
+     state.steering, state.steered_requests = None, None
+     state.ced_state = CEDState(4, 8192, (128, 256, 384, 512, 8192), "cuda")
+     state._ced_prompt_logprobs, state._ced_prefix_start = set(), {}
++    state._ced_recovery_prompt_end = {}
+     state.disk_engram_models, state._prefill_tokens = (), {}
+     state.add_request(
+         0,
+         SimpleNamespace(
+-            req_id="long", num_computed_tokens=0, sampling_params=None, mm_features=[]
++            req_id="long",
++            num_computed_tokens=0,
++            sampling_params=None,
++            mm_features=[],
++            prefill_token_ids=None,
+         ),
+     )
+     staged = []
+@@ -749,6 +800,7 @@ def test_streaming_update_preserves_private_decoder_history(monkeypatch):
+     state.ced_state, starts, seq = _state([1], [1025])
+     state._ced_prompt_logprobs = set()
+     state._ced_prefix_start = {"stream": 256}
++    state._ced_recovery_prompt_end = {}
+     state.disk_engram_models, state._prefill_tokens = (), {}
+     # The update's one new prompt token, at 1024.
+     batch = SimpleNamespace(
+@@ -762,6 +814,7 @@ def test_streaming_update_preserves_private_decoder_history(monkeypatch):
+     )
+     updated = SimpleNamespace(
+         req_id="stream",
++        prefill_token_ids=None,
+         num_computed_tokens=1024,
+         sampling_params=None,
+         mm_features=[],
+@@ -793,6 +846,7 @@ def test_large_full_capture_decodes_small_live_prefix(monkeypatch):
+     state.ced_state, starts, seq = _state([256])
+     state._ced_prompt_logprobs = set()
+     state._ced_prefix_start = {}
++    state._ced_recovery_prompt_end = {}
+     state.lookback_token_ids = None
+     state.disk_engram_models = ()
+     state.device = torch.device("cuda")
+diff --git a/tests/v1/core/test_prefix_group_validity.py b/tests/v1/core/test_prefix_group_validity.py
+new file mode 100644
+index 0000000000..fa667209da
+--- /dev/null
++++ b/tests/v1/core/test_prefix_group_validity.py
+@@ -0,0 +1,313 @@
++# SPDX-License-Identifier: Apache-2.0
++# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
++"""A reusable prefix needs every persistent group and fresh private state.
++
++The oracle enumerates page-set coverage, independent of the coordinator's
++fixed-point search. It observes retained hash entries rather than assuming any
++particular retention policy or that a published endpoint survives eviction.
++"""
++
++import random
++from dataclasses import replace
++
++import pytest
++import torch
++
++from tests.v1.core.test_prefix_caching import make_kv_cache_manager, make_request
++from vllm.utils.hashing import sha256
++from vllm.v1.core.kv_cache_utils import init_none_hash
++from vllm.v1.kv_cache_interface import (
++    KVCacheConfig,
++    KVCacheGroupSpec,
++    MLAAttentionSpec,
++    SlidingWindowMLASpec,
++)
++from vllm.v1.request import RequestStatus
++
++pytestmark = pytest.mark.cpu_test
++
++HASH = 128
++PAGE = 256
++WINDOW = 128
++GLOBAL = {"global-r2", "index-r2", "global-r1"}
++ENCODER = {"encoder-a", "encoder-b", "encoder-c"}
++PRIVATE = {"decoder", "draft"}
++
++
++@pytest.fixture(autouse=True)
++def initialize_hashes():
++    init_none_hash(sha256)
++
++
++def make_manager(retention, order):
++    global_spec = MLAAttentionSpec(
++        block_size=PAGE,
++        num_kv_heads=1,
++        head_size=512,
++        tokens_per_state=2,
++        dtype=torch.uint8,
++    )
++    encoder_spec = SlidingWindowMLASpec(
++        block_size=HASH,
++        num_kv_heads=1,
++        head_size=512,
++        dtype=torch.uint8,
++        sliding_window=WINDOW,
++    )
++    decoder_spec = replace(
++        encoder_spec, prefix_cache_enabled=False, prefill_replay_window=WINDOW
++    )
++    groups = [
++        KVCacheGroupSpec(["global-r2"], global_spec),
++        KVCacheGroupSpec(["index-r2"], replace(global_spec, head_size=68)),
++        KVCacheGroupSpec(["global-r1"], replace(global_spec, tokens_per_state=1)),
++        KVCacheGroupSpec(["encoder-a"], encoder_spec),
++        # Equal specs exercise several group IDs inside one lookup; the third
++        # distinct spec exercises convergence between separate attention types.
++        KVCacheGroupSpec(["encoder-b"], encoder_spec),
++        KVCacheGroupSpec(["encoder-c"], replace(encoder_spec, head_size=256)),
++        KVCacheGroupSpec(["decoder"], decoder_spec),
++        KVCacheGroupSpec(["draft"], replace(decoder_spec, extra_retained_tokens=1)),
++    ]
++    random.Random(order).shuffle(groups)
++    config = KVCacheConfig(
++        num_blocks=2048,
++        kv_cache_tensors=[],
++        kv_cache_groups=groups,
++        prefix_cache_retention_interval=retention,
++    )
++    manager = make_kv_cache_manager(config, max_model_len=8192, hash_block_size=HASH)
++    return manager, {group.layer_names[0]: i for i, group in enumerate(groups)}
++
++
++def request(name, tokens):
++    req = make_request(name, list(tokens), HASH, sha256)
++    req.max_tokens = 2048
++    req.sampling_params.max_tokens = 2048
++    return req
++
++
++def resident_pages(manager, roles, req):
++    """Read exact hash membership; do not call any prefix lookup algorithm."""
++    pages = {}
++    for role, group_id in roles.items():
++        block_size = PAGE if role in GLOBAL else HASH
++        available = {}
++        for page in range(req.num_tokens // block_size):
++            end = (page + 1) * block_size
++            block_hash = req.block_hashes[end // HASH - 1]
++            found = manager.block_pool.get_cached_block(block_hash, [group_id])
++            if found:
++                available[page] = found[0]
++        pages[role] = available
++    return pages
++
++
++def complete_prefix(pages, cap):
++    """Largest page boundary with all global history and all encoder tails."""
++    for boundary in range(cap // PAGE * PAGE, 0, -PAGE):
++        globals_needed = set(range(boundary // PAGE))
++        tail_needed = set(range((boundary - WINDOW) // HASH, boundary // HASH))
++        if all(globals_needed <= pages[name].keys() for name in GLOBAL) and all(
++            tail_needed <= pages[name].keys() for name in ENCODER
++        ):
++            return boundary
++    return 0
++
++
++def verify_hit(manager, roles, req, *, cap=None):
++    pages = resident_pages(manager, roles, req)
++    assert all(not pages[role] for role in PRIVATE)
++    expected = complete_prefix(
++        pages, max(0, req.num_tokens - WINDOW) if cap is None else max(0, cap)
++    )
++    blocks, actual, _ = manager.get_computed_blocks(req)
++    assert actual == expected
++    for role, group_id in roles.items():
++        group_blocks = blocks.blocks[group_id]
++        if role in PRIVATE:
++            assert not group_blocks
++        elif role in GLOBAL:
++            assert [b.block_id for b in group_blocks] == [
++                pages[role][page].block_id for page in range(actual // PAGE)
++            ]
++        elif actual:
++            tail = actual // HASH - 1
++            assert group_blocks[tail].block_id == pages[role][tail].block_id
++            assert all(
++                b.is_null or b.block_id == pages[role][page].block_id
++                for page, b in enumerate(group_blocks)
++            )
++    return blocks, actual
++
++
++def evict(manager, pages, selection):
++    """Invalidate chosen group pages, retaining other groups at the same tokens."""
++    selected = set()
++    if selection == "global-head":
++        selected = {("global-r2", 0)}
++    elif selection == "global-middle":
++        selected = {("global-r1", 3)}
++    elif selection == "index-tail":
++        selected = {("index-r2", max(pages["index-r2"]))}
++    elif selection == "index-all":
++        selected = {("index-r2", page) for page in pages["index-r2"]}
++    elif selection == "encoder-tail":
++        selected = {("encoder-b", max(pages["encoder-b"]))}
++    elif selection == "encoder-all":
++        selected = {("encoder-c", page) for page in pages["encoder-c"]}
++    elif selection == "staggered":
++        # No single per-group maximum describes validity: distinct groups lose
++        # different candidate tails and a global group loses an interior page.
++        selected = {("encoder-a", page) for page in sorted(pages["encoder-a"])[::2]}
++        selected |= {("encoder-c", page) for page in sorted(pages["encoder-c"])[1::2]}
++        selected.add(("index-r2", 5))
++    elif selection != "none":
++        raise AssertionError(selection)
++    ids = {pages[role][page].block_id for role, page in selected if page in pages[role]}
++    manager.evict_blocks(ids)
++    assert all(manager.block_pool.blocks[i].block_hash is None for i in ids)
++    return ids
++
++
++def assert_fresh_private(manager, roles, req, producer_private):
++    for role in PRIVATE:
++        group = manager.coordinator.single_type_managers[roles[role]]
++        allocated = [b for b in group.req_to_blocks[req.request_id] if not b.is_null]
++        assert allocated
++        assert all(b.ref_cnt == 1 and b.block_hash is None for b in allocated)
++        assert producer_private.isdisjoint(b.block_id for b in allocated)
++
++
++@pytest.mark.parametrize("retention", [None, 0, 512], ids=["dense", "latest", "512"])
++@pytest.mark.parametrize("order", [0, 7, 31])
++@pytest.mark.parametrize("producer_live", [False, True], ids=["free", "live"])
++@pytest.mark.parametrize(
++    "selection",
++    [
++        "none",
++        "global-head",
++        "global-middle",
++        "index-tail",
++        "index-all",
++        "encoder-tail",
++        "encoder-all",
++        "staggered",
++    ],
++)
++def test_independent_group_eviction_matches_complete_state_oracle(
++    retention, order, producer_live, selection
++):
++    manager, roles = make_manager(retention, order)
++    tokens = list(range(2432))
++    producer = request("producer", tokens)
++    assert manager.allocate_slots(producer, len(tokens)) is not None
++    producer.num_computed_tokens = len(tokens)
++    private_ids = {
++        b.block_id
++        for role in PRIVATE
++        for b in manager.coordinator.single_type_managers[roles[role]].req_to_blocks[
++            producer.request_id
++        ]
++        if not b.is_null
++    }
++    if not producer_live:
++        manager.free(producer)
++        # Freed private pages may be recycled, but never returned as cache hits.
++        private_ids = set()
++    before = resident_pages(manager, roles, producer)
++    evicted = evict(manager, before, selection)
++    after = resident_pages(manager, roles, producer)
++    for role in roles:
++        assert {p: b.block_id for p, b in after[role].items()} == {
++            p: b.block_id for p, b in before[role].items() if b.block_id not in evicted
++        }
++
++    consumer = request("consumer", tokens)
++    blocks, hit = verify_hit(manager, roles, consumer)
++    assert manager.allocate_slots(consumer, len(tokens) - hit, hit, blocks) is not None
++    assert_fresh_private(manager, roles, consumer, private_ids)
++    # Cancelling a consumer must not free pages still owned by a live producer.
++    manager.free(consumer)
++    for group in manager.coordinator.single_type_managers:
++        assert consumer.request_id not in group.req_to_blocks
++        if producer_live:
++            assert all(
++                b.is_null or b.ref_cnt > 0
++                for b in group.req_to_blocks[producer.request_id]
++            )
++    if producer_live:
++        manager.free(producer)
++    assert manager.block_pool.get_num_free_blocks() == 2047
++
++
++@pytest.mark.parametrize("retention", [None, 0, 512], ids=["dense", "latest", "512"])
++@pytest.mark.parametrize("junction", [1375, 1536, 2177])
++@pytest.mark.parametrize("reverse_finish", [False, True])
++def test_branches_and_cancellation_do_not_complete_each_others_state(
++    retention, junction, reverse_finish
++):
++    manager, roles = make_manager(retention, int(reverse_finish) + junction)
++    trunk = list(range(2432))
++    producer = request("trunk", trunk)
++    assert manager.allocate_slots(producer, len(trunk)) is not None
++    producer.num_computed_tokens = len(trunk)
++    manager.free(producer)
++
++    branches = []
++    for branch in (1, 2):
++        tokens = trunk[:junction] + [10000 * branch + i for i in range(513)]
++        req = request(f"branch-{branch}", tokens)
++        blocks, hit = verify_hit(manager, roles, req)
++        assert hit <= junction // PAGE * PAGE
++        # Stage allocation separately from computation, then cancel after only
++        # 129 new rows. Reserved pages past the completed prefix must not publish.
++        assert (
++            manager.allocate_slots(
++                req, len(tokens) - hit, hit, blocks, delay_cache_blocks=True
++            )
++            is not None
++        )
++        req.num_computed_tokens = min(hit + 129, req.num_tokens)
++        manager.cache_blocks(req, req.num_computed_tokens)
++        branches.append(req)
++
++    for req in branches[:: -1 if reverse_finish else 1]:
++        completed = req.num_computed_tokens
++        manager.free(req)
++        retry = request("retry-" + req.request_id, req.all_token_ids)
++        blocks, hit = verify_hit(manager, roles, retry)
++        assert hit <= max(junction, completed) // PAGE * PAGE
++        assert (
++            manager.allocate_slots(retry, retry.num_tokens - hit, hit, blocks)
++            is not None
++        )
++        manager.free(retry)
++    assert manager.block_pool.get_num_free_blocks() == 2047
++
++
++@pytest.mark.parametrize("generated", [129, 257, 513])
++@pytest.mark.parametrize("order", [0, 31])
++def test_preemption_does_not_skip_private_generated_history(generated, order):
++    manager, roles = make_manager(None, order)
++    prompt = list(range(1024))
++    req = request("resumed", prompt)
++    assert manager.allocate_slots(req, len(prompt)) is not None
++    req.num_computed_tokens = len(prompt)
++    req.append_output_token_ids(list(range(1024, 1024 + generated)))
++    assert manager.allocate_slots(req, generated) is not None
++    req.num_computed_tokens = req.num_tokens
++    manager.free(req)
++    req.num_computed_tokens = 0
++    req.status = RequestStatus.PREEMPTED
++
++    # A genuinely new prompt can reuse later encoder pages; an interrupted
++    # continuation must reconstruct decoder history from its original prompt.
++    fresh_prompt = request("fresh", req.all_token_ids)
++    _, later_hit = verify_hit(manager, roles, fresh_prompt)
++    assert later_hit > len(prompt) - WINDOW
++    blocks, hit = verify_hit(manager, roles, req, cap=len(prompt) - WINDOW)
++    assert hit == 768
++    assert manager.allocate_slots(req, req.num_tokens - hit, hit, blocks) is not None
++    manager.free(req)
++    assert manager.block_pool.get_num_free_blocks() == 2047
+diff --git a/vllm/models/deepseek_v4_1/ced.py b/vllm/models/deepseek_v4_1/ced.py
+index 88db39de40..b0bcf1a2ec 100644
+--- a/vllm/models/deepseek_v4_1/ced.py
++++ b/vllm/models/deepseek_v4_1/ced.py
+@@ -68,12 +68,15 @@ def plan_ced(
+ ) -> CEDPlan | None:
+     """The CPU bounds of a step's decoder rows: each request's last ``CED_WINDOW``
+     rows, or every row where ``keep_full``. ``limits`` (``replay_rows``) lowers a
+-    request's kept rows further. None when every request keeps all its rows;
+-    ``max_query_len`` keeps the window bound, so the decoder runs in the mode it
+-    would without the limits."""
++    request's kept rows further, or expands them while recovering accepted
++    outputs after preemption. None when every request keeps all its rows;
++    ``max_query_len`` keeps at least the window bound, so short limited chunks
++    retain their original decoder mode."""
+     bounds = tuple(
+-        int(q) if full else min(int(q), CED_WINDOW)
+-        for q, full in zip(query_lengths, keep_full)
++        int(q)
++        if full
++        else min(int(q), max(CED_WINDOW, int(limits[i]) if limits is not None else 0))
++        for i, (q, full) in enumerate(zip(query_lengths, keep_full))
+     )
+     kept = (
+         bounds
+@@ -92,7 +95,7 @@ def plan_ced(
+ 
+ 
+ def replay_rows(
+-    query_lengths, computed, prefill_lens, prefix_start, keep_full
++    query_lengths, computed, prefill_lens, prefix_start, keep_full, prompt_lens=None
+ ) -> tuple[list[int], list[int]]:
+     """Each request's replay floor and kept-row limit, anchored at its prompt end.
+ 
+@@ -104,25 +107,30 @@ def replay_rows(
+     logits the runner discards (a chunked prefill samples no token); the requests
+     kernel replays that row from itself. Wherever the prompt's chunks end, each
+     replayed row then sees the same decoder rows, and the drafter, whose context
+-    rows are the kept rows, the same context. ``prefill_len`` is what the runner
+-    prefills: the prompt, and the outputs a resumed request recomputes.
++    rows are the kept rows, the same context. ``prefill_len`` includes accepted
++    outputs after preemption; ``prompt_lens`` preserves the original prompt end.
++    Recovery must replay every generated row after that original floor: bounding
++    recovery to the final window would change the earlier rows that deeper
++    decoder layers consume.
+ 
+     A decoding request keeps up to ``CED_WINDOW`` rows from its prefix start: its
+     rows lie past the prompt's floor, whose window no longer reaches it. A
+     ``keep_full`` request (prompt logprobs) keeps every row from its prefix start.
+     """
+     floors, limits = [], []
+-    for q, start, total, prefix, full in zip(
+-        query_lengths, computed, prefill_lens, prefix_start, keep_full
++    for i, (q, start, total, prefix, full) in enumerate(
++        zip(query_lengths, computed, prefill_lens, prefix_start, keep_full)
+     ):
+         start, total, prefix = int(start), int(total), int(prefix)
++        prompt_end = total if prompt_lens is None else int(prompt_lens[i])
+         if full:
+             floors.append(prefix)
+             limits.append(KEEP_ALL)
+         elif start < total:
+-            floor = max(prefix, total - CED_WINDOW)
++            floor = max(prefix, prompt_end - CED_WINDOW)
+             floors.append(floor)
+-            limits.append(min(max(start + int(q) - floor, 1), CED_WINDOW))
++            limit = max(start + int(q) - floor, 1)
++            limits.append(limit if prompt_end < total else min(limit, CED_WINDOW))
+         else:
+             floors.append(prefix)
+             limits.append(CED_WINDOW)
+diff --git a/vllm/models/deepseek_v4_1/nvidia/model_state.py b/vllm/models/deepseek_v4_1/nvidia/model_state.py
+index c697d2f48c..b30ceeb847 100644
+--- a/vllm/models/deepseek_v4_1/nvidia/model_state.py
++++ b/vllm/models/deepseek_v4_1/nvidia/model_state.py
+@@ -16,8 +16,8 @@ from vllm.models.deepseek_v4_1.ced import (
+     ced_decoder_start,
+     replay_rows,
+ )
+-from vllm.models.deepseek_v4_1.tilelang import ced as ced_kernels
+ from vllm.models.deepseek_v4_1.sparse_mla import DeepseekV41B12xMetadata
++from vllm.models.deepseek_v4_1.tilelang import ced as ced_kernels
+ from vllm.v1.core.sched.output import NewRequestData
+ from vllm.v1.kv_cache_interface import KVCacheConfig
+ from vllm.v1.worker.gpu.buffer_utils import UvaBackedTensor
+@@ -57,6 +57,7 @@ class DeepseekV41ModelState(DefaultModelState):
+         self.ced_state: CEDState | None = None
+         self._ced_prompt_logprobs: set[str] = set()
+         self._ced_prefix_start: dict[str, int] = {}
++        self._ced_recovery_prompt_end: dict[str, int] = {}
+         self._ced_batch: InputBatch | None = None
+         self.max_cudagraph_query_len: int | None = None
+         if ced_decoder_start(self.model_config.hf_config) is not None:
+@@ -196,12 +197,18 @@ class DeepseekV41ModelState(DefaultModelState):
+         prefix_start = pending[1] if streaming else new_req_data.num_computed_tokens
+         self._ced_streaming_prefix_start = None
+         self._ced_prefix_start[new_req_data.req_id] = prefix_start
++        prefill_ids = new_req_data.prefill_token_ids
++        if prefill_ids is not None and len(prefill_ids) > new_req_data.prompt_len:
++            self._ced_recovery_prompt_end[new_req_data.req_id] = new_req_data.prompt_len
++        else:
++            self._ced_recovery_prompt_end.pop(new_req_data.req_id, None)
+ 
+     def remove_request(self, req_id: str) -> None:
+         super().remove_request(req_id)
+         self._prefill_tokens.pop(req_id, None)
+         self._ced_prompt_logprobs.discard(req_id)
+         self._ced_prefix_start.pop(req_id, None)
++        self._ced_recovery_prompt_end.pop(req_id, None)
+         steered_ids = getattr(self, "_steered_req_ids", None)
+         if steered_ids is not None:
+             steered_ids.discard(req_id)
+@@ -226,6 +233,7 @@ class DeepseekV41ModelState(DefaultModelState):
+             and num_reqs == 1
+             and num_tokens == self.single_request_prefill_cudagraph_tokens
+             and not any(req in self._ced_prompt_logprobs for req in req_ids)
++            and not any(req in self._ced_recovery_prompt_end for req in req_ids)
+         )
+ 
+     def finalize_cudagraph_inputs(self, model_inputs, cg_mode):
+@@ -250,6 +258,14 @@ class DeepseekV41ModelState(DefaultModelState):
+             batch.prefill_len_np[:nr],
+             [self._ced_prefix_start.get(req_id, 0) for req_id in req_ids],
+             keep_full,
++            (
++                [
++                    self._ced_recovery_prompt_end.get(req_id, total)
++                    for req_id, total in zip(req_ids, batch.prefill_len_np[:nr])
++                ]
++                if self._ced_recovery_prompt_end
++                else None
++            ),
+         )
+         return keep_full, floors, limits
+ 
+diff --git a/vllm/v1/core/kv_cache_manager.py b/vllm/v1/core/kv_cache_manager.py
+index 4877682e80..ad42cbdec0 100644
+--- a/vllm/v1/core/kv_cache_manager.py
++++ b/vllm/v1/core/kv_cache_manager.py
+@@ -391,9 +391,13 @@ class KVCacheManager:
+         # Recompute at least one token for logits, or the configured suffix
+         # needed to rebuild request-private decoder state. Lookup may round
+         # this boundary down further to the cache-hit alignment.
+-        max_cache_hit_length = max(
+-            0, request.num_tokens - max(1, self.coordinator.prefill_replay_tokens)
+-        )
++        replay_tokens = self.coordinator.prefill_replay_tokens
++        # After preemption the generated suffix is still part of the same
++        # request. Private decoder windows must be reconstructed from the
++        # original prompt boundary, not from a new boundary at the output end.
++        # Otherwise their deeper layers consume a different decoder history.
++        replay_end = request.num_prompt_tokens if replay_tokens else request.num_tokens
++        max_cache_hit_length = max(0, replay_end - max(1, replay_tokens))
+         computed_blocks, num_new_computed_tokens, num_uncached = (
+             self.coordinator.find_longest_cache_hit(
+                 request.block_hashes, max_cache_hit_length
+-- 
+2.54.0 (Apple Git-157)
+
