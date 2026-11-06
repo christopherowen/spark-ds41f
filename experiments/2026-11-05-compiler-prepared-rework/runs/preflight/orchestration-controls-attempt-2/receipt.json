@@ -1,0 +1,224 @@
+{
+  "remote_workdir": "/home/chris/spark-work/compiler-prepared-rework/c45-orchestration-controls-attempt-2",
+  "ssh_exit": 1,
+  "stderr": "",
+  "result": {
+    "wait": {
+      "started": "2026-11-06T06:58:47.534303+00:00",
+      "ended": "2026-11-06T06:58:50.505009+00:00",
+      "argv": [
+        "systemd-run",
+        "--user",
+        "--wait",
+        "--pipe",
+        "--unit=c45-orchestration-controls-2",
+        "-p",
+        "CPUQuota=100%",
+        "-p",
+        "MemoryMax=4G",
+        "-p",
+        "MemorySwapMax=0",
+        "-p",
+        "TasksMax=128",
+        "-p",
+        "RuntimeMaxSec=600s",
+        "python3",
+        "-B",
+        "/home/chris/spark-work/compiler-prepared-rework/c45-orchestration-controls-attempt-2/driver.py",
+        "/home/chris/spark-work/compiler-prepared-rework/c45-orchestration-controls-attempt-2",
+        "16b15f2d2a6349e095a225a6afcd6b15e4680885"
+      ],
+      "actual_wait_exit": 1,
+      "actual_exit_not_dispatch": true
+    },
+    "receipt": {
+      "started": "2026-11-06T06:58:47.587173+00:00",
+      "commit": "16b15f2d2a6349e095a225a6afcd6b15e4680885",
+      "steps": [
+        {
+          "name": "GPU-readonly-precondition",
+          "argv": [
+            "nvidia-smi",
+            "--query-compute-apps=pid",
+            "--format=csv,noheader"
+          ],
+          "exit": 0,
+          "stdout": "GPU-readonly-precondition.stdout",
+          "stderr": "GPU-readonly-precondition.stderr"
+        },
+        {
+          "name": "clean-private-checkout",
+          "argv": [
+            "git",
+            "-c",
+            "gc.auto=0",
+            "-c",
+            "maintenance.auto=false",
+            "-c",
+            "pack.threads=1",
+            "-C",
+            "/home/chris/spark-work/worker-test-isolation/c46-build-controls-attempt-1/checkout",
+            "status",
+            "--porcelain"
+          ],
+          "exit": 0,
+          "stdout": "clean-private-checkout.stdout",
+          "stderr": "clean-private-checkout.stderr"
+        },
+        {
+          "name": "fetch-exact-control-source",
+          "argv": [
+            "git",
+            "-c",
+            "gc.auto=0",
+            "-c",
+            "maintenance.auto=false",
+            "-c",
+            "pack.threads=1",
+            "-C",
+            "/home/chris/spark-work/worker-test-isolation/c46-build-controls-attempt-1/checkout",
+            "fetch",
+            "--no-tags",
+            "--depth=1",
+            "--filter=blob:none",
+            "deployment",
+            "16b15f2d2a6349e095a225a6afcd6b15e4680885"
+          ],
+          "exit": 0,
+          "stdout": "fetch-exact-control-source.stdout",
+          "stderr": "fetch-exact-control-source.stderr"
+        },
+        {
+          "name": "sparse-patterns",
+          "argv": [
+            "git",
+            "-c",
+            "gc.auto=0",
+            "-c",
+            "maintenance.auto=false",
+            "-c",
+            "pack.threads=1",
+            "-C",
+            "/home/chris/spark-work/worker-test-isolation/c46-build-controls-attempt-1/checkout",
+            "sparse-checkout",
+            "set",
+            "--no-cone",
+            "--stdin"
+          ],
+          "exit": 0,
+          "stdout": "sparse-patterns.stdout",
+          "stderr": "sparse-patterns.stderr"
+        },
+        {
+          "name": "exact-published-checkout",
+          "argv": [
+            "git",
+            "-c",
+            "gc.auto=0",
+            "-c",
+            "maintenance.auto=false",
+            "-c",
+            "pack.threads=1",
+            "-C",
+            "/home/chris/spark-work/worker-test-isolation/c46-build-controls-attempt-1/checkout",
+            "checkout",
+            "-B",
+            "feat/c45-orchestration-control-2",
+            "16b15f2d2a6349e095a225a6afcd6b15e4680885"
+          ],
+          "exit": 0,
+          "stdout": "exact-published-checkout.stdout",
+          "stderr": "exact-published-checkout.stderr"
+        },
+        {
+          "name": "verify-commit",
+          "argv": [
+            "git",
+            "-c",
+            "gc.auto=0",
+            "-c",
+            "maintenance.auto=false",
+            "-c",
+            "pack.threads=1",
+            "-C",
+            "/home/chris/spark-work/worker-test-isolation/c46-build-controls-attempt-1/checkout",
+            "rev-parse",
+            "HEAD"
+          ],
+          "exit": 0,
+          "stdout": "verify-commit.stdout",
+          "stderr": "verify-commit.stderr"
+        },
+        {
+          "name": "c45-orchestration-and-feature-controls",
+          "argv": [
+            "python3",
+            "-B",
+            "-m",
+            "unittest",
+            "test_compiler_gate_controls",
+            "test_controls",
+            "test_orchestration",
+            "test_semantic_barriers",
+            "test_native_regression",
+            "-v"
+          ],
+          "exit": 1,
+          "stdout": "c45-orchestration-and-feature-controls.stdout",
+          "stderr": "c45-orchestration-and-feature-controls.stderr"
+        },
+        {
+          "name": "c45-source-parsing",
+          "argv": [
+            "python3",
+            "-B",
+            "-c",
+            "import ast,pathlib;[ast.parse(p.read_text(),filename=str(p)) for p in sorted(pathlib.Path('experiments/2026-11-05-compiler-prepared-rework').glob('*.py'))]"
+          ],
+          "exit": 0,
+          "stdout": "c45-source-parsing.stdout",
+          "stderr": "c45-source-parsing.stderr"
+        },
+        {
+          "name": "spark-doctor",
+          "argv": [
+            "./bin/spark",
+            "doctor"
+          ],
+          "exit": 0,
+          "stdout": "spark-doctor.stdout",
+          "stderr": "spark-doctor.stderr"
+        },
+        {
+          "name": "whitespace",
+          "argv": [
+            "git",
+            "-c",
+            "gc.auto=0",
+            "-c",
+            "maintenance.auto=false",
+            "-c",
+            "pack.threads=1",
+            "-C",
+            "/home/chris/spark-work/worker-test-isolation/c46-build-controls-attempt-1/checkout",
+            "diff",
+            "--check"
+          ],
+          "exit": 0,
+          "stdout": "whitespace.stdout",
+          "stderr": "whitespace.stderr"
+        }
+      ],
+      "purpose": "Offline C45 orchestration, build-control, serving-cache, semantic-barrier, native-regression and feature-gate unit controls",
+      "GPU_serving_or_existing_checkout_changes": false,
+      "effective_limits": {
+        "cpu.max": "100000 100000",
+        "memory.max": "4294967296",
+        "memory.swap.max": "0"
+      },
+      "passed": false,
+      "ended": "2026-11-06T06:58:50.494853+00:00"
+    },
+    "stderr": "Running as unit: c45-orchestration-controls-2.service; invocation ID: bf908986d9aa445bb11e3a9f1b8f9860\nFinished with result: exit-code\nMain processes terminated with: code=exited/status=1\nService runtime: 2.947s\nCPU time consumed: 1.760s\nMemory peak: 256.0K\nMemory swap peak: 0B\n"
+  }
+}

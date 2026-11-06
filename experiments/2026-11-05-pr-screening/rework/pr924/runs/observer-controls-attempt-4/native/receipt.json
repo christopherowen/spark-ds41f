@@ -1,0 +1,179 @@
+{
+  "started": "2026-11-06T07:05:09.307626+00:00",
+  "commit": "e26f814f536227b7222e55cbcb4524551fbbb70a",
+  "pr924_base_commit": "e893def6f8363760b5e4af88bf99239dd7a52bd4",
+  "steps": [
+    {
+      "name": "GPU-readonly-precondition",
+      "argv": [
+        "nvidia-smi",
+        "--query-compute-apps=pid",
+        "--format=csv,noheader"
+      ],
+      "exit": 0,
+      "stdout": "GPU-readonly-precondition.stdout",
+      "stderr": "GPU-readonly-precondition.stderr"
+    },
+    {
+      "name": "clean-private-checkout",
+      "argv": [
+        "git",
+        "-c",
+        "gc.auto=0",
+        "-c",
+        "maintenance.auto=false",
+        "-c",
+        "pack.threads=1",
+        "-C",
+        "/home/chris/spark-work/worker-test-isolation/c46-build-controls-attempt-1/checkout",
+        "status",
+        "--porcelain"
+      ],
+      "exit": 0,
+      "stdout": "clean-private-checkout.stdout",
+      "stderr": "clean-private-checkout.stderr"
+    },
+    {
+      "name": "verify-commit",
+      "argv": [
+        "git",
+        "-c",
+        "gc.auto=0",
+        "-c",
+        "maintenance.auto=false",
+        "-c",
+        "pack.threads=1",
+        "-C",
+        "/home/chris/spark-work/worker-test-isolation/c46-build-controls-attempt-1/checkout",
+        "rev-parse",
+        "HEAD"
+      ],
+      "exit": 0,
+      "stdout": "verify-commit.stdout",
+      "stderr": "verify-commit.stderr"
+    },
+    {
+      "name": "fetch-pr924-base",
+      "argv": [
+        "git",
+        "-c",
+        "gc.auto=0",
+        "-c",
+        "maintenance.auto=false",
+        "-c",
+        "pack.threads=1",
+        "-C",
+        "/home/chris/spark-work/worker-test-isolation/c46-build-controls-attempt-1/checkout",
+        "fetch",
+        "--no-tags",
+        "--depth=1",
+        "--filter=blob:none",
+        "deployment",
+        "refs/pull/924/head"
+      ],
+      "exit": 0,
+      "stdout": "fetch-pr924-base.stdout",
+      "stderr": "fetch-pr924-base.stderr"
+    },
+    {
+      "name": "verify-pr924-head",
+      "argv": [
+        "git",
+        "-c",
+        "gc.auto=0",
+        "-c",
+        "maintenance.auto=false",
+        "-c",
+        "pack.threads=1",
+        "-C",
+        "/home/chris/spark-work/worker-test-isolation/c46-build-controls-attempt-1/checkout",
+        "rev-parse",
+        "FETCH_HEAD"
+      ],
+      "exit": 0,
+      "stdout": "verify-pr924-head.stdout",
+      "stderr": "verify-pr924-head.stderr"
+    },
+    {
+      "name": "git-apply-check",
+      "argv": [
+        "git",
+        "apply",
+        "--check",
+        "/home/chris/spark-work/worker-test-isolation/c46-build-controls-attempt-1/checkout/experiments/2026-11-05-pr-screening/rework/pr924/observer-scope-identity-lifecycle.diff"
+      ],
+      "exit": 0,
+      "stdout": "git-apply-check.stdout",
+      "stderr": "git-apply-check.stderr"
+    },
+    {
+      "name": "git-apply",
+      "argv": [
+        "git",
+        "apply",
+        "/home/chris/spark-work/worker-test-isolation/c46-build-controls-attempt-1/checkout/experiments/2026-11-05-pr-screening/rework/pr924/observer-scope-identity-lifecycle.diff"
+      ],
+      "exit": 0,
+      "stdout": "git-apply.stdout",
+      "stderr": "git-apply.stderr"
+    },
+    {
+      "name": "test-lossless-observer-scope",
+      "argv": [
+        "python3",
+        "-B",
+        "-m",
+        "unittest",
+        "tests.test_lossless_observer_scope",
+        "-v"
+      ],
+      "exit": 0,
+      "stdout": "test-lossless-observer-scope.stdout",
+      "stderr": "test-lossless-observer-scope.stderr"
+    },
+    {
+      "name": "test-lossless-component-runner",
+      "argv": [
+        "python3",
+        "-B",
+        "-m",
+        "unittest",
+        "tests.test_lossless_component_runner",
+        "-v"
+      ],
+      "exit": 1,
+      "stdout": "test-lossless-component-runner.stdout",
+      "stderr": "test-lossless-component-runner.stderr"
+    }
+  ],
+  "purpose": "Isolated patch application and offline CPU unit tests for PR #924 observer scope, identity and lifecycle rework",
+  "GPU_serving_or_existing_checkout_changes": false,
+  "effective_limits": {
+    "cpu.max": "100000 100000",
+    "memory.max": "4294967296",
+    "memory.swap.max": "0"
+  },
+  "verified_hashes": {
+    "diff_sha256": "57e7bdaa59aaca080504f45a03a7dc456cc6b9027f88c30164b770ad5bd588e7",
+    "original_sha256": {
+      "experiments/2026-11-04-lossless-memory/engram/check_live_cache.py": "e2b61196dd73c5dd8d6426b058236d6ee361b50b0fb316cf2821a2cb34c4f010",
+      "experiments/2026-11-04-lossless-memory/engram/observer_control.py": "d22b3886338167b8a003575444ad46a89a01e3fb6330541c2c4c69d7aac88b00",
+      "experiments/2026-11-04-lossless-memory/engram/verify_cache.py": "cf9c38cc8dc2e064779df6ece8ee5b42d346222fbea5fe7edaf2b980667c6a9e",
+      "experiments/2026-11-04-lossless-memory/run_component.py": "df7316f092c7144a8668d1fd70bb1f206ad630cb00aefeaffd23cbcaae78ddb9",
+      "experiments/2026-11-04-lossless-memory/scoped_window.py": "06e108f7f64e22c0635cacdc572bc59f2fe661f6ef627e6bdf12af4458d6b9e8",
+      "tests/test_lossless_component_runner.py": "806beabd0ab3493c4a10ef0c30278d5bb92a8c4c1ddc0e20c72067d305d25aa2"
+    },
+    "proposed_sha256": {
+      "experiments/2026-11-04-lossless-memory/engram/check_live_cache.py": "5bedde8b8fabfedd7425ea3e7023c0623517c15481909479f1e88f630c78a659",
+      "experiments/2026-11-04-lossless-memory/engram/observer_control.py": "36260dd423d6f47921e8094b6bfe3fe47e836328a847f67e0275428bd7fed328",
+      "experiments/2026-11-04-lossless-memory/engram/observer_support.py": "a359349606989b0681efc3b1cd8132c0f2ad87f6e09ef1140b24812cd439b263",
+      "experiments/2026-11-04-lossless-memory/engram/verify_cache.py": "d81b1fbbd0636237494b96973a1d8345afb5c2839106d3011f08f38cc3420ce9",
+      "experiments/2026-11-04-lossless-memory/run_component.py": "6328410a61107eaef765e5da722c5034e8d155cacf49637e155018ae3759afdf",
+      "experiments/2026-11-04-lossless-memory/scoped_window.py": "15caa934dd9adeef619ad8e76d4dbbed8f441b12e367d4c12845c059c576a5ce",
+      "tests/test_lossless_component_runner.py": "0ae89244c5aba469ebb9f1dd408af351a49692183f4a7ac7bf9fa1628281733a",
+      "tests/test_lossless_observer_scope.py": "0aa3d611ebd1c82843fdb27825df52bcca2af6ab48284ff42cde0625496624e7"
+    }
+  },
+  "passed": false,
+  "ended": "2026-11-06T07:05:11.162922+00:00"
+}

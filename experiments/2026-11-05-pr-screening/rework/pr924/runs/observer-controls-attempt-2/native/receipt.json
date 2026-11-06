@@ -1,0 +1,108 @@
+{
+  "started": "2026-11-06T07:01:31.206875+00:00",
+  "commit": "e26f814f536227b7222e55cbcb4524551fbbb70a",
+  "pr924_base_commit": "911cd4b522df2feae21b7205dc8ec911a0848a04",
+  "steps": [
+    {
+      "name": "GPU-readonly-precondition",
+      "argv": [
+        "nvidia-smi",
+        "--query-compute-apps=pid",
+        "--format=csv,noheader"
+      ],
+      "exit": 0,
+      "stdout": "GPU-readonly-precondition.stdout",
+      "stderr": "GPU-readonly-precondition.stderr"
+    },
+    {
+      "name": "clean-private-checkout",
+      "argv": [
+        "git",
+        "-c",
+        "gc.auto=0",
+        "-c",
+        "maintenance.auto=false",
+        "-c",
+        "pack.threads=1",
+        "-C",
+        "/home/chris/spark-work/worker-test-isolation/c46-build-controls-attempt-1/checkout",
+        "status",
+        "--porcelain"
+      ],
+      "exit": 0,
+      "stdout": "clean-private-checkout.stdout",
+      "stderr": "clean-private-checkout.stderr"
+    },
+    {
+      "name": "verify-commit",
+      "argv": [
+        "git",
+        "-c",
+        "gc.auto=0",
+        "-c",
+        "maintenance.auto=false",
+        "-c",
+        "pack.threads=1",
+        "-C",
+        "/home/chris/spark-work/worker-test-isolation/c46-build-controls-attempt-1/checkout",
+        "rev-parse",
+        "HEAD"
+      ],
+      "exit": 0,
+      "stdout": "verify-commit.stdout",
+      "stderr": "verify-commit.stderr"
+    },
+    {
+      "name": "fetch-pr924-base",
+      "argv": [
+        "git",
+        "-c",
+        "gc.auto=0",
+        "-c",
+        "maintenance.auto=false",
+        "-c",
+        "pack.threads=1",
+        "-C",
+        "/home/chris/spark-work/worker-test-isolation/c46-build-controls-attempt-1/checkout",
+        "fetch",
+        "--no-tags",
+        "--depth=1",
+        "--filter=blob:none",
+        "deployment",
+        "refs/pull/924/head"
+      ],
+      "exit": 0,
+      "stdout": "fetch-pr924-base.stdout",
+      "stderr": "fetch-pr924-base.stderr"
+    },
+    {
+      "name": "verify-pr924-head",
+      "argv": [
+        "git",
+        "-c",
+        "gc.auto=0",
+        "-c",
+        "maintenance.auto=false",
+        "-c",
+        "pack.threads=1",
+        "-C",
+        "/home/chris/spark-work/worker-test-isolation/c46-build-controls-attempt-1/checkout",
+        "rev-parse",
+        "FETCH_HEAD"
+      ],
+      "exit": 0,
+      "stdout": "verify-pr924-head.stdout",
+      "stderr": "verify-pr924-head.stderr"
+    }
+  ],
+  "purpose": "Isolated patch application and offline CPU unit tests for PR #924 observer scope, identity and lifecycle rework",
+  "GPU_serving_or_existing_checkout_changes": false,
+  "effective_limits": {
+    "cpu.max": "100000 100000",
+    "memory.max": "4294967296",
+    "memory.swap.max": "0"
+  },
+  "passed": false,
+  "error": "AssertionError: ",
+  "ended": "2026-11-06T07:01:32.619821+00:00"
+}

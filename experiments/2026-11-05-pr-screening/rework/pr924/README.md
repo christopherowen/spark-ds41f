@@ -1,6 +1,6 @@
 # PR924 observer scope and lifetime rework
 
-This is an untested source draft against PR924 head
+This is a CPU-verified source rework against PR924 head
 `e893def6f8363760b5e4af88bf99239dd7a52bd4`. It changes validation tooling,
 not the Engram implementation, serving workload, hardware limits, or runtime
 profiles. There is no performance verdict.
@@ -59,17 +59,28 @@ PID births/namespaces/cgroups, container replacement, exact owned cleanup,
 partial timeout receipts, lost create replies, foreign-container refusal,
 pre-start scope change, nonzero exit preservation and child/watchdog margin.
 
+## Remote CPU verification
+
+Applied and verified in an isolated sparse checkout of PR924 head
+`e893def6f8363760b5e4af88bf99239dd7a52bd4` on `sp8` under bounded
+`systemd-run --user` (`CPUQuota=100%`, `MemoryMax=4G`, `MemorySwapMax=0`,
+`TasksMax=128`, `RuntimeMaxSec=600s`) at rework commit
+`985ad90b8761f0b124b855224b26664c74fe67cc`
+(`runs/observer-controls-attempt-7/receipt.json`):
+
+- Verified all 6 original SHA256s, `git apply --check`, `git apply`,
+  `git diff --check`, all 8 proposed SHA256s, and AST parsing of all 8 files.
+- Passed `tests.test_lossless_observer_scope` (17 tests) and
+  `tests.test_lossless_component_runner` (29 tests), then restored the private
+  checkout cleanly.
+
 ## Still required
 
-No code parsing, tests, source replay, build, Docker, SSH, node operation or
-hardware work was executed for this rework. Shared live source files were not
-edited; the source export and proposal live only in ignored scratch.
+No build, Docker, SSH, node operation or hardware work was executed on the
+serving cluster for this rework.
 
-The parent must review and apply the patch to an isolated PR924-derived source,
-check whitespace, run bounded remote CPU checks (the new mock tests and affected
-component/scoped-window/cache tests), then schedule native CPU permission and
-owned-timeout/removal controls under an exact authorized lease. Those native
-controls must confirm the actual PID-namespace/cgroup rendering, durable CID
-receipts and cleanup. Source/mock tests cannot prove native permissions or
-daemon cleanup. No existing completed native point or failed receipt is to be
-replaced or rerun by this draft.
+Native CPU permission and owned-timeout/removal controls must still be scheduled
+under an exact authorized lease to confirm the actual PID-namespace/cgroup
+rendering, durable CID receipts and daemon cleanup. Source/mock tests cannot
+prove native permissions or daemon cleanup. No existing completed native point
+or failed receipt is to be replaced or rerun by this rework.
