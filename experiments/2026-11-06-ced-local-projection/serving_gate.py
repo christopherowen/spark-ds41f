@@ -65,7 +65,7 @@ def state(c, token, floor_gib):
     return records
 
 
-def cool(c, token, out, stem, *, below_c=48.5, settle_polls=2):
+def cool(c, token, out, stem, *, below_c=50.0, settle_polls=2):
     began = time.monotonic()
     observations = []
     settled = 0
@@ -215,7 +215,7 @@ def run_cohort(c, token, out, commit, held, heartbeat_errors):
                 command = ['taskset', '-c', '4', 'python3', '-B', str(EXP / 'record_requests.py'),
                            '--out', str(arm / (stem + '-requests')), '--token', token,
                            str(ROOT / script), 'http://127.0.0.1:8000', *arguments]
-                run(c, token, command, arm, stem, floor_gib=3, timeout=1800)
+                run(c, token, command, arm, stem, floor_gib=3, timeout=3600)
                 value = verdict(arm / (stem + '.txt'), stem)
                 arms[label][stem] = value
                 (arm / (stem + '-verdict.json')).write_text(json.dumps(value, indent=2) + '\n')

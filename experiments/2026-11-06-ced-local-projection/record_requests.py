@@ -85,7 +85,7 @@ class TimedResponse:
 
 
 class RequestArchive:
-    def __init__(self, directory, *, token=None, below_c=48.5, settle_polls=2, poll_sleep=3.0):
+    def __init__(self, directory, *, token=None, below_c=50.0, settle_polls=2, poll_sleep=3.0):
         self.directory = Path(directory)
         self.directory.mkdir(parents=True, exist_ok=False)
         self.lock = threading.Lock()
@@ -141,6 +141,8 @@ class RequestArchive:
         peak_gpu = 0.0
         final_hottest = {}
         final_gpu = {}
+        if self.poll_sleep > 0:
+            time.sleep(self.poll_sleep)
         while True:
             current = read_nodes(self.token)
             polls += 1
@@ -180,8 +182,8 @@ class RequestArchive:
             return
         if body_bytes > 4096:
             self.cool('main-long-request', settle_polls=self.settle_polls)
-        elif local_hottest_c() >= self.below_c:
-            self.cool('main-short-request', settle_polls=self.settle_polls)
+        elif local_hottest_c() >= self.below_c - 1.0:
+            self.cool('main-short-request', settle_polls=1)
 
 
 def main():
