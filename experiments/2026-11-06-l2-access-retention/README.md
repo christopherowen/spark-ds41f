@@ -129,17 +129,83 @@ Local checks: `bin/spark doctor` passes after initializing ignored site maps;
 check` reports the pinned build tree is not prepared. No upstream patch or new
 runtime image is part of this experiment.
 
-GPU results: pending. No speedup, correctness improvement, or performance
-preservation is claimed.
+### Hardware execution on GB10 (`dgx4`)
 
-The request-file waiter was stopped on November 6 to preserve the explicit
-collective-qualification then verification-budget reservation order. This
-experiment has no active request or hold. Its two bounded component runs await
-an exclusive handoff; an empty hold file alone does not supersede the reserved
-turns.
+Executed under an exclusive node-scoped `dgx4-single` hold (`~/spark-hold.json` on
+`dgx4`, `nodes: ["dgx4"]`) with a 15-minute stale-heartbeat watchdog and 20-second
+heartbeat updates while `dgx1` had no conflicting global hold.
 
-`analyze.py <boot-1.json> <boot-2.json> --output <summary.json>` reports each
-arm and cache-aftereffect comparison. Independent units are fresh processes;
-the two-boot 95% Student interval uses df=1, not 62 independent trials. Both
-boot means and all original samples remain available. An interval spanning
-zero cannot establish performance preservation.
+1. **Initial Boot 1 attempt (`7626c1007efcdc9caf51f588124863fe54d35c23`)**:
+   - `capability.cu` passed on GB10 (`SM 12.1`, driver/runtime `13000`,
+     `l2_bytes = 25,165,824` [24 MiB], `persisting_max_bytes = 18,874,368`
+     [18 MiB], `window_max_bytes = 134,217,728` [128 MiB], driver default
+     `original_bytes = 4,718,592` [4.5 MiB], `1,048,576` requested -> `1,572,864`
+     [1.5 MiB] applied; `capture_inherits: true`, `graph_node: true`,
+     `extended_launch: true`, `extended_capture: true`, `restored_bytes: 4,718,592`).
+   - `markov_probe.py` failed before timing with `CUDA_ERROR_INVALID_CONTEXT (201)`
+     at `cuCtxGetLimit` because `torch.cuda.init()` + TileLang compilation had not
+     bound the device primary context to the host thread, and CUDA 13's Python
+     driver bindings expose the stream/kernel-node attribute ID under the
+     `CU_LAUNCH_ATTRIBUTE_ACCESS_POLICY_WINDOW` enum alias. Preserved in
+     `/home/swank/spark-lab/l2-access-retention/boot-1-7626c1007efcdc9caf51f588124863fe54d35c23/`.
+
+2. **Initial 16-arm 2-boot screen (`13fabf4966e445a014ad11ffd99faf7dc72353f4`, `summary-initial-13fabf49.json`)**:
+   - Bound the primary context via `cuDevicePrimaryCtxRetain` + `cuCtxSetCurrent`
+     and ran two fresh-process boots (`boot 1` and `boot 2`, 31 randomized trials
+     per case per boot).
+   - **Correctness**: 100% bit-identical outputs (`all_bits_equal: true`) across all
+     16 arms, `TP in {3, 4}`, `rows in {1, 8, 16}`, and `stress in {False, True}`.
+     Original `4,718,592`-byte persisting limit restored on exit.
+   - **Memory & thermals**: Peak allocated GPU memory `249,259,008` bytes (~238 MiB),
+     peak reserved `299,892,736` bytes (~286 MiB), host `MemAvailable` ~121 GiB,
+     starting thermal zone 39.7 C, peak 45.1 C (well below the 85 C guard).
+   - **Results**:
+     - Fractional windows at the driver-default 4.5 MiB budget (`window_default`,
+       `hitRatio = 0.285` on TP3 / `0.380` on TP4) and 1.5 MiB budget (`window_small`)
+       showed no gain over `driver_default` (2-boot 95% CIs span zero in 11/12 cases)
+       and were slower than `prefetch_default` (including `+11.86 us` / `+3.84%`,
+       95% CI `[+7.52, +16.21] us` at `TP=3, rows=16, stress=False`).
+     - Full-shard persisting partitions (`window_fit`, applying `17,301,504` bytes
+       [16.5 MiB] on TP3 and `12,582,912` bytes [12.0 MiB] on TP4) beat the
+       partition-only control (`partition_fit -> window_fit` `-38.21` to `-75.58 us`
+       on TP3 because `partition_fit` shrinks normal L2 to 7.5 MiB and regresses
+       demand reads by `+9.1%` to `+15.6%`), but `driver_default -> window_fit`
+       still spans zero in 5/6 TP3 cases and `prefetch_default -> window_fit` spans
+       zero in 11/12 cases across TP3/TP4. On TP4, `partition_fit -> window_fit`
+       spans zero in all 6 cases (`-0.54` to `-5.78 us`). Moreover, a 16.5 MiB
+       context-wide partition is already ruled out by PR 766's 18–24% prefill
+       regression.
+
+3. **Reworked 24-arm 2-boot screen (`2cc085cb8f24dba69a176de4ae4de9af37f08101`, `summary-reworked-2cc085cb.json`)**:
+   - Tested contiguous `hitRatio = 1.0` windows phase-scoped to `partial` only
+     (`contig_default` at 4.5 MiB, `contig_mid` at 9.0 MiB applied, plus `prefetch`
+     combinations `both_contig_default`, `both_contig_mid`), position-0-only
+     windows (`pos0_default`, `pos0_fit`), and `STREAMING` windows on the one-use
+     `Base` logits (`base_stream_default`, `both_base_stream_default`).
+   - **Correctness**: 100% bit-identical outputs (`all_bits_equal: true`) across all
+     24 arms on both boots (`capability-boot1.jsonl`, `capability-boot2.jsonl`).
+   - **Results**:
+     - Under `stress=True` (96 MiB intervening expert-stream traffic between draft
+       positions), every TP3 window arm—including `pos0_fit` (`-24.78` to `-34.68 us`,
+       95% CIs `[-269.15, +219.59]`, `[-141.03, +76.67]`, `[-91.79, +22.43] us`) and
+       `window_fit`—has a 2-boot 95% CI spanning zero against `driver_default`.
+     - Against `prefetch_default` at the safe 4.5 MiB default budget, `contig_default`
+       spans zero in 10/12 cases, `both_contig_default` spans zero in 11/12 cases
+       (and loses at `TP=3, rows=16, stress=False` by `+11.93 us`, 95% CI
+       `[+10.62, +13.24] us`), and `both_base_stream_default` spans zero in 11/12
+       cases.
+     - Only arms that expand the context-wide persisting partition to 9.0–16.5 MiB
+       (`contig_mid`, `both_contig_mid`, `pos0_fit`, `window_fit`) achieve isolated
+       10–40 us component reductions (~2–8 us per draft position), and even those
+       remain inconclusive across boots under `stress=True` while carving 37.5–68.8%
+       out of GB10's 24 MiB L2 cache.
+
+### Conclusion
+
+**Negative / do not promote.** Bounded L2 access-policy retention windows on the
+packed Markov/greedy path do not deliver a reliable 2-boot speedup over the
+existing driver-default (4.5 MiB) + side-stream evict-last prefetch configuration
+at safe partition sizes, and full-shard partitions (12.0–16.5 MiB out of 24 MiB L2)
+impose unacceptable context-wide normal-L2 shrinkage for a ~2–8 us/position
+component effect that does not survive intervening expert-stream traffic with
+2-boot statistical significance. Keep the promoted serving configuration unchanged.
