@@ -47,11 +47,12 @@ for the original boundary including its compressor gather, or 196.05 MiB for
 the compact-carry candidate. At one replay row it is about 16.20 MiB.
 None of those ratios predicts whole-model throughput.
 
-`screen_projection.py` compares the native column projection with twelve local
+`screen_projection.py` compares the native column projection with eighteen local
 projection schedules: M tiles 32/64/128, N tiles 64/128, and two to four pipeline
-stages, retaining K tiles of 64, five blocked K parts and 128 threads. Every
+stages, retaining K tiles of 64 and five blocked K parts. Twelve schedules use
+128 threads; six larger-tile schedules also test 256 threads. Every
 schedule must first match native finite and nonfinite output bits. The 128-by-128
-128-thread combination is omitted because three FP32 tile accumulators alone
+128-thread combination is omitted (its 256-thread version is tested) because three FP32 tile accumulators alone
 would require 384 registers per thread before operand/pipeline state. The screen
 retains compiler failures, failed equality checks and all timing samples. It
 measures warm reuse and a 128 MiB cache wash, separately at the TP3 6144-row and
@@ -141,3 +142,10 @@ identity limitation cannot be repaired retroactively. Report absolute and percen
 changes with 95% intervals and receipt links; distinguish within-boot repeat
 variation from between-boot variation. No throughput benefit or promotion is
 claimed before those measurements.
+
+The acceptance criterion also permits a demonstrated correctness repair with
+preserved performance. Such a repair needs an old-fails/new-passes reproducer on
+the actual path and appropriate before/after evidence excluding a material loss.
+These layout candidates do not claim an existing correctness defect. The recorded
+prefill comparator uses a 0.5% tolerance and Welch intervals; an interval that
+still admits a material regression is inconclusive, not proof of no loss.

@@ -13,14 +13,18 @@ from vllm.models.deepseek_v4_1.tilelang.gemm import bf16_gemm
 p = argparse.ArgumentParser(description=__doc__)
 p.add_argument("--boot", required=True)
 p.add_argument("--repeats", type=int, default=15)
-p.add_argument("--schedules", help="Comma-separated MxNxstages; default is the full screen")
+p.add_argument("--schedules", help="Comma-separated MxNxstagesxthreads; default is the full screen")
 a = p.parse_args()
 assert a.repeats >= 3
 schedules = [(64, 64, 3), (32, 64, 2), (32, 64, 3), (32, 64, 4),
              (64, 64, 2), (64, 64, 4), (128, 64, 2), (128, 64, 3),
              (32, 128, 2), (32, 128, 3), (64, 128, 2), (64, 128, 3)]
+schedules = [(*item, 128) for item in schedules]
+schedules += [(m, n, stages, 256) for m, n in ((64, 128), (128, 64), (128, 128))
+              for stages in (2, 3)]
 if a.schedules:
     schedules = [tuple(map(int, item.split("x"))) for item in a.schedules.split(",")]
+    schedules = [item if len(item) == 4 else (*item, 128) for item in schedules]
 
 
 def emit(**record):
@@ -28,10 +32,10 @@ def emit(**record):
                       **record}), flush=True)
 
 
-def kernel(columns, schedule=(64, 64, 3)):
-    m, n, stages = schedule
+def kernel(columns, schedule=(64, 64, 3, 128)):
+    m, n, stages, threads = schedule
     return bf16_gemm(columns, 5120, block_M=m, block_N=n, block_K=64,
-                     num_stages=stages, threads=128, shards=5, blocked=True,
+                     num_stages=stages, threads=threads, shards=5, blocked=True,
                      out_dtype="bfloat16")
 
 
@@ -60,7 +64,7 @@ emit(kind="identity", gpu=torch.cuda.get_device_name(), capability=torch.cuda.ge
      torch=torch.__version__, cuda=torch.version.cuda, seed=3643, repeats=a.repeats,
      cache_modes=["warm", "128MiB wash before timed kernel"],
      scope="one rank's projection only; no collective, normalization, or serving time",
-     fixed={"K": 5120, "block_K": 64, "shards": 5, "blocked": True, "threads": 128})
+     fixed={"K": 5120, "block_K": 64, "shards": 5, "blocked": True})
 failures = []
 for world, tokens in ((3, 6144), (4, 16384)):
     rows = math.ceil(tokens / world)
