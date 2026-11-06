@@ -1,0 +1,83 @@
+Running as unit: run-rc54e40a0782b48618ef90e9e3fdef1be.scope; invocation ID: 7bf9b4c9ca33434eb6391c59f5b22958
+{
+  "command": [
+    "docker",
+    "build",
+    "--network=none",
+    "--memory=4g",
+    "--memory-swap=4g",
+    "--cpu-period=100000",
+    "--cpu-quota=100000",
+    "--cpuset-cpus=4",
+    "--file",
+    "/home/chris/spark-lab/ced-local-boundary/deployment/experiments/2026-11-06-ced-local-projection/Dockerfile.native-reuse",
+    "--tag",
+    "spark-ds41f:ced-projection-51c1a32cd78c-reuse-3795255f",
+    "--build-arg",
+    "PARENT_IMAGE=sha256:3795255f485ea5c1a9db54c742921dd9b2917daad0799361e5c6f56a70119713",
+    "--build-arg",
+    "DEPLOYMENT_COMMIT=ac777ffa017a203d6c2ff2c0b60bc01797519d95",
+    "--build-arg",
+    "VLLM_PATCH_HEAD=51c1a32cd78cfb0a14087e34dfcc06be30928a0e",
+    "--build-arg",
+    "VLLM_TREE=5d8d1d1778c83a41d6dfb7364d1a18dad07df021",
+    "/home/chris/spark-lab/ced-local-boundary/deployment/.work/build/vllm-19f2c20ed4d6-b12x-236ddff04a5f-0856d14a/context/vllm-source"
+  ],
+  "parent": "sha256:3795255f485ea5c1a9db54c742921dd9b2917daad0799361e5c6f56a70119713",
+  "tag": "spark-ds41f:ced-projection-51c1a32cd78c-reuse-3795255f",
+  "gpu_smoke": "required later in an owned window; not run by this CPU recipe"
+}
+DEPRECATED: The legacy builder is deprecated and will be removed in a future release.
+            BuildKit is currently disabled; enable it by removing the DOCKER_BUILDKIT=0
+            environment-variable.
+
+Sending build context to Docker daemon  132.7MB
+Step 1/8 : ARG PARENT_IMAGE
+Step 2/8 : FROM ${PARENT_IMAGE}
+ ---> 3795255f485e
+Step 3/8 : ARG DEPLOYMENT_COMMIT
+ ---> Running in 6661b5667d97
+ ---> Removed intermediate container 6661b5667d97
+ ---> 75beeabecae2
+Step 4/8 : ARG VLLM_PATCH_HEAD
+ ---> Running in 40a34399862f
+ ---> Removed intermediate container 40a34399862f
+ ---> 2ca71d58d81e
+Step 5/8 : ARG VLLM_TREE
+ ---> Running in 47a829a440f2
+ ---> Removed intermediate container 47a829a440f2
+ ---> 87e90818cc79
+Step 6/8 : ARG PARENT_IMAGE
+ ---> Running in b9c9e9e8d8b4
+ ---> Removed intermediate container b9c9e9e8d8b4
+ ---> 81cdcaf9b818
+Step 7/8 : COPY . /opt/spark-ds41f/candidate/vllm/
+ ---> ba681523d8f7
+Step 8/8 : LABEL org.opencontainers.image.revision="${DEPLOYMENT_COMMIT}"       local.spark-ds41f.vllm.patch-head="${VLLM_PATCH_HEAD}"       local.spark-ds41f.vllm.tree="${VLLM_TREE}"       local.spark-ds41f.native-reuse.parent-image="${PARENT_IMAGE}"       local.spark-ds41f.native-reuse.scope="Python-only; native source and binaries unchanged"
+ ---> Running in 244c12de11ca
+ ---> Removed intermediate container 244c12de11ca
+ ---> 539193702d10
+Successfully built 539193702d10
+Successfully tagged spark-ds41f:ced-projection-51c1a32cd78c-reuse-3795255f
+Traceback (most recent call last):
+  File "/check/verify_image_source.py", line 23, in <module>
+    assert not failures, failures[:20]
+           ^^^^^^^^^^^^
+AssertionError: [['.dockerignore', '9b72c9f5cbbb755e205196fa16305d26e88461e3', 'a8c8e3cfd9b1f86c5840eb1fb248aebd365168bd']]
+receipt /home/chris/spark-lab/ced-local-boundary/deployment/results/private/ced-local-projection/image-20261106T015729Z
+Traceback (most recent call last):
+  File "/home/chris/spark-lab/ced-local-boundary/deployment/experiments/2026-11-06-ced-local-projection/image_native_reuse.py", line 125, in <module>
+    record['candidate_check'] = check_image(built['Id'], identity['candidate']['patch_head'], 'candidate')
+                                ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/chris/spark-lab/ced-local-boundary/deployment/experiments/2026-11-06-ced-local-projection/image_native_reuse.py", line 111, in check_image
+    raw = output(*command)
+          ^^^^^^^^^^^^^^^^
+  File "/home/chris/spark-lab/ced-local-boundary/deployment/experiments/2026-11-06-ced-local-projection/image_native_reuse.py", line 32, in output
+    return subprocess.check_output(cmd, cwd=cwd, text=True).strip()
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/usr/lib/python3.12/subprocess.py", line 466, in check_output
+    return run(*popenargs, stdout=PIPE, timeout=timeout, check=True,
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/usr/lib/python3.12/subprocess.py", line 571, in run
+    raise CalledProcessError(retcode, process.args,
+subprocess.CalledProcessError: Command '('docker', 'run', '--rm', '--runtime=runc', '--cpus=1', '--memory=4g', '--memory-swap=4g', '--pids-limit=128', '--network=none', '-e', 'NVIDIA_VISIBLE_DEVICES=void', '-e', 'CUDA_VISIBLE_DEVICES=', '-v', '/home/chris/spark-lab/ced-local-boundary/deployment/experiments/2026-11-06-ced-local-projection:/check:ro', '-v', '/home/chris/spark-lab/ced-local-boundary/deployment/results/private/ced-local-projection/image-20261106T015729Z:/receipts:ro', '--entrypoint', 'python3', 'sha256:539193702d10d93c2b2dd0d591cac66f97b316f37d24a54e3b5106834a78efc8', '/check/verify_image_source.py', '/receipts/candidate-source.json')' returned non-zero exit status 1.

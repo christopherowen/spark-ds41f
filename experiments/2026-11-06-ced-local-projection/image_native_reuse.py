@@ -70,15 +70,18 @@ for change in changes.splitlines():
 context = directory / 'context/vllm-source'
 assert not (context / '.git').exists(), 'build only the checked Git export'
 head = output('git', 'rev-parse', 'HEAD')
-tag = cluster['container']['image'] + '-reuse-' + PARENT[7:15]
+tag = cluster['container']['image'] + '-reuse-' + PARENT[7:15] + '-git'
 command = ['docker', 'build', '--network=none', '--memory=4g', '--memory-swap=4g',
            '--cpu-period=100000', '--cpu-quota=100000', '--cpuset-cpus=4',
-           '--file', str(EXP / 'Dockerfile.native-reuse'), '--tag', tag,
+           '--file', 'Dockerfile', '--tag', tag,
            '--build-arg', 'PARENT_IMAGE='+PARENT,
            '--build-arg', 'DEPLOYMENT_COMMIT='+head,
            '--build-arg', 'VLLM_PATCH_HEAD='+identity['candidate']['patch_head'],
-           '--build-arg', 'VLLM_TREE='+identity['candidate']['expected_tree'], str(context)]
-print(json.dumps({'command': command, 'parent': PARENT, 'tag': tag,
+           '--build-arg', 'VLLM_TREE='+identity['candidate']['expected_tree'], '-']
+stream_command = [sys.executable, str(EXP/'stream_image_context.py'), '--source', str(source),
+                  '--head', identity['candidate']['patch_head'], '--dockerfile', str(EXP/'Dockerfile.native-reuse'),
+                  '--', *command]
+print(json.dumps({'command': command, 'stream_command': stream_command, 'parent': PARENT, 'tag': tag,
                   'gpu_smoke': 'required later in an owned window; not run by this CPU recipe'}, indent=2))
 if not args.apply:
     raise SystemExit(0)
@@ -95,7 +98,7 @@ receipt_dir = ROOT / 'results/private/ced-local-projection' / ('image-'+stamp)
 receipt_dir.mkdir(parents=True)
 record = {'source_head': identity['candidate']['patch_head'], 'deployment_commit': head,
           'parent_image': PARENT, 'parent_labels': labels, 'changes': changes.splitlines(),
-          'command': command, 'build_kind': 'Python-only immutable native reuse',
+          'command': command, 'stream_command': stream_command, 'build_kind': 'Python-only immutable native reuse',
           'gpu_smoke': 'pending', 'serving_qualification': 'pending'}
 
 
@@ -119,7 +122,7 @@ try:
     # The legacy builder exposes explicit per-container memory/CPU limits and
     # accepts this host's immutable image ID without another large image copy.
     os.environ['DOCKER_BUILDKIT'] = '0'
-    record['min_available_gib'] = spark.run_memory_guarded(command, 48)
+    record['min_available_gib'] = spark.run_memory_guarded(stream_command, 48)
     built = image(tag)
     record['image_id'] = built['Id']
     record['candidate_check'] = check_image(built['Id'], identity['candidate']['patch_head'], 'candidate')

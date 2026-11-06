@@ -355,3 +355,14 @@ leases. Complete receipts are retained under `receipts/sp567-window-1/`. The pha
 writer is now exercised before the stop operation as well as covered by CPU tests.
 Six CPU-only grader controls also pass; these validate grading behavior, not model
 quality, and are retained in `receipts/needle-grader-controls-1.txt`.
+
+The second image attempt built immutable image `539193702d10`, but its complete
+source check rejected the generated build-export `.dockerignore` (the only tracked
+file mismatch). The image has not been distributed or used for GPU work. Both the
+full log and failure receipt remain in `receipts/native-reuse-image-2.*`. The
+corrected recipe uses `git archive` at the pinned source head, streaming its exact
+tracked files beneath a `source/` context prefix plus the published Dockerfile.
+That preserves the original `.dockerignore` without treating it as a context
+filter, requires no additional source tree or image archive on disk, and retains
+the same source/native checks and resource bounds. The corrected unique tag adds
+`-git`; the rejected tag is never overwritten.
