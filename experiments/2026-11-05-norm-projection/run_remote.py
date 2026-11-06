@@ -44,7 +44,7 @@ def reservation(action):
         "        try:\n" +
         "            with p.open('x') as f: json.dump(data,f,indent=2)\n" +
         "            if req.exists() and json.loads(req.read_text()).get('who')==holder: req.unlink()\n" +
-        "            print(json.dumps({'acquired':True}))\n" +
+        "            print(json.dumps({'acquired':True,'since':now}))\n" +
         "        except FileExistsError: print(json.dumps({'acquired':False}))\n" +
         "elif action=='request':\n" +
         "    if requester: print(json.dumps({'queued':False,'request':requester}))\n" +
@@ -85,8 +85,32 @@ def cleanup():
     reservation('release')
     held=False
 
-atexit.register(cleanup)
-signal.signal(signal.SIGTERM, lambda signum, frame: sys.exit('Runner terminated; cleaning up its own kernel container'))
+if '--watchdog' not in sys.argv:
+    atexit.register(cleanup)
+    signal.signal(signal.SIGTERM, lambda signum, frame: sys.exit('Runner terminated; cleaning up its own kernel container'))
+
+def watchdog(since):
+    while True:
+        try:
+            record=head("import json,pathlib\np=pathlib.Path.home()/'spark-hold.json'\nprint(p.read_text() if p.exists() else 'null')\n")
+        except Exception as error:
+            print('Watchdog reservation read failed; retaining the hold:',error,flush=True)
+            time.sleep(30)
+            continue
+        if not record or record.get('holder')!=HOLDER or record.get('since')!=since:
+            return
+        if not record.get('serving_untouched'):
+            raise RuntimeError('Kernel watchdog refuses a serving window')
+        stamp=datetime.datetime.fromisoformat(record['heartbeat'].replace('Z','+00:00'))
+        age=(datetime.datetime.now(datetime.timezone.utc)-stamp).total_seconds()
+        if age>900:
+            print('Stale kernel-window heartbeat; stopping only the owned screen',flush=True)
+            subprocess.run(['systemctl','--user','stop','norm-projection-screen.service'],check=True,timeout=60)
+            stop_owned_container()
+            reservation('release')
+            return
+        time.sleep(30)
+
 
 def telemetry(gpu=False):
     data={}
@@ -138,6 +162,10 @@ def main():
         reservation('request')
         time.sleep(30)
     if not held: raise RuntimeError('GPU window unavailable after one hour; no GPU work ran')
+    subprocess.run(['systemd-run','--user','--collect',f'--unit=norm-projection-watchdog-{os.getpid()}',
+                    '--property=CPUQuota=10%','--property=MemoryMax=256M','--property=TasksMax=64',
+                    '--property=StandardOutput=append:'+str(EXP/'runs/watchdog.txt'),'--property=StandardError=inherit',
+                    sys.executable,str(Path(__file__).resolve()),'--watchdog',claim['since']],check=True)
     thread=threading.Thread(target=heartbeat,daemon=True); thread.start()
     try:
         if subprocess.check_output(['docker','ps','-q'],text=True).strip():
@@ -173,4 +201,6 @@ def main():
         stop.set(); thread.join(timeout=25)
         reservation('release'); held=False
 
-if __name__=='__main__': main()
+if __name__=='__main__':
+    if '--watchdog' in sys.argv: watchdog(sys.argv[2])
+    else: main()
