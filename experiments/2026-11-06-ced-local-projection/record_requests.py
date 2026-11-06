@@ -216,6 +216,7 @@ def main():
     original_thread_join = threading.Thread.join
     original_print = builtins.print
     worker_threads = []
+    joined_threads = set()
     worker_lock = threading.Condition()
     batch_all_started = False
     wave_remaining = {}
@@ -279,34 +280,41 @@ def main():
         return TimedResponse(response, finish)
 
     def tracked_start(thread, *positional, **keyword):
+        nonlocal batch_all_started, current_wave
         if threading.current_thread() is threading.main_thread():
             with worker_lock:
-                thread._batch_index = len(worker_threads)
+                if not worker_threads:
+                    batch_all_started = False
+                    current_wave = 0
+                    wave_remaining.clear()
+                    joined_threads.clear()
+                idx = len(worker_threads)
+                thread._batch_index = idx
                 worker_threads.append(thread)
+                w = idx // WAVE_SIZE
+                wave_remaining[w] = wave_remaining.get(w, 0) + 1
         return original_thread_start(thread, *positional, **keyword)
 
     def tracked_join(thread, *positional, **keyword):
         nonlocal batch_all_started, current_wave
         if threading.current_thread() is threading.main_thread() and script.name != 'ced_cross_shape.py':
             with worker_lock:
-                if not batch_all_started:
-                    wave_remaining.clear()
-                    for idx in range(len(worker_threads)):
-                        w = idx // WAVE_SIZE
-                        wave_remaining[w] = wave_remaining.get(w, 0) + 1
-                    current_wave = 0
+                if worker_threads and not batch_all_started:
                     batch_all_started = True
                     worker_lock.notify_all()
         result = original_thread_join(thread, *positional, **keyword)
         if threading.current_thread() is threading.main_thread() and script.name != 'ced_cross_shape.py':
             should_cool = False
             with worker_lock:
-                if worker_threads and all(not t.is_alive() for t in worker_threads):
-                    worker_threads.clear()
-                    wave_remaining.clear()
-                    current_wave = 0
-                    batch_all_started = False
-                    should_cool = True
+                if worker_threads:
+                    joined_threads.add(id(thread))
+                    if len(joined_threads) >= len(worker_threads):
+                        worker_threads.clear()
+                        joined_threads.clear()
+                        wave_remaining.clear()
+                        current_wave = 0
+                        batch_all_started = False
+                        should_cool = True
             if should_cool:
                 archive.cool('batch-join')
         return result

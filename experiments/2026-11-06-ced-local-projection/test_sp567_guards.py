@@ -82,7 +82,7 @@ class Guards(unittest.TestCase):
                 path.write_text(json.dumps(value));self.assertIsNone(c.global_scope())
                 for bad in (dict(value,success=False),dict(value,source='other'),
                             dict(value,observed_at='2000-01-01T00:00:00+00:00'),
-                            dict(value,read_duration_seconds=11)):
+                            dict(value,read_duration_seconds=21)):
                     path.write_text(json.dumps(bad))
                     with self.assertRaises(AssertionError):c.global_scope()
 

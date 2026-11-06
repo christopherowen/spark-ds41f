@@ -186,5 +186,52 @@ class ServingGuards(unittest.TestCase):
         self.assertAlmostEqual(out['ced_latencies']['16352']['candidate_mean_seconds'], 3.55)
 
 
+    def test_consecutive_multi_wave_batches_complete_when_workers_finish_before_final_join(self):
+        script_code = """import threading, urllib.request
+def batch(n):
+    def worker(i):
+        req = urllib.request.Request("http://127.0.0.1:8000/v1/completions", data=b"{}")
+        with urllib.request.urlopen(req) as resp:
+            resp.read()
+    threads = [threading.Thread(target=worker, args=(i,)) for i in range(n)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
+batch(9)
+batch(16)
+"""
+        class FakeResp:
+            status = 200
+            def read(self, *a):
+                return b"{\"choices\":[{\"text\":\"ok\"}]}"
+            def __enter__(self):
+                return self
+            def __exit__(self, *a):
+                return False
+
+        cool_reasons = []
+        with tempfile.TemporaryDirectory() as d:
+            root = Path(d)
+            script = root / "probe.py"
+            script.write_text(script_code)
+            out = root / "out"
+            hold = {"token": "tok", "holder": record_requests.HOLDER, "nodes": record_requests.NAMES, "phase": "serving"}
+            with patch.object(Path, "home", return_value=root), \
+                 patch.object(record_requests.os, "sched_getaffinity", return_value={0}), \
+                 patch.object(record_requests.resource, "setrlimit"), \
+                 patch.object(urllib.request, "urlopen", side_effect=lambda *a, **k: FakeResp()), \
+                 patch.object(RequestArchive, "cool", side_effect=lambda reason, **k: cool_reasons.append(reason)):
+                (root / "spark-hold.json").write_text(json.dumps(hold))
+                with patch.object(sys, "argv", ["record_requests.py", "--out", str(out), "--token", "tok", str(script)]):
+                    record_requests.main()
+            finished = json.loads((out / "finished.json").read_text())
+            self.assertEqual(finished["requests"], 25)
+            self.assertEqual(cool_reasons, [
+                "batch-wave-1", "batch-join",
+                "batch-wave-1", "batch-wave-2", "batch-join",
+            ])
+
+
 if __name__ == '__main__':
     unittest.main()
