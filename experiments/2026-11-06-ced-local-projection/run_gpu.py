@@ -6,7 +6,9 @@ import json
 import os
 from pathlib import Path
 import socket
+import signal
 import subprocess
+import sys
 import time
 
 p = argparse.ArgumentParser(description=__doc__)
@@ -18,6 +20,9 @@ p.add_argument('--schedules')
 a = p.parse_args()
 exp = Path(__file__).resolve().parent
 root = exp.parents[1]
+sys.path.insert(0, str(root))
+from cooling import helpers
+
 source = a.source.resolve()
 identity = json.loads((exp / 'identity.json').read_text())
 image = 'sha256:b0522146640a7d852c017ec8c99423224492b7c2c4951eb3a64005ab4555ab11'
@@ -44,6 +49,19 @@ print(json.dumps(d))
                              shlex.quote(a.window), 'beat' if beat else 'read'))
 
 
+def thermal_zones():
+    zones = {path.parent.name: int(path.read_text().strip()) / 1000
+             for path in Path('/sys/class/thermal').glob('thermal_zone*/temp')}
+    if not zones:
+        raise RuntimeError('cannot read the hottest thermal zone')
+    return zones
+
+
+def fan_active():
+    return subprocess.run(['systemctl', 'is-active', '--quiet', 'dgx-fan-control.service'],
+                          check=False, timeout=15).returncode == 0
+
+
 def telemetry():
     available = int(next(line.split()[1] for line in Path('/proc/meminfo').read_text().splitlines()
                          if line.startswith('MemAvailable:'))) * 1024
@@ -55,7 +73,7 @@ def telemetry():
             return float(value)
         except ValueError:
             return None  # GB10 does not expose every discrete-GPU telemetry field.
-    return {'raw_gpu_fields': [field.strip() for field in fields], 'time': time.time(), 'host_available_bytes': available, 'gpu_uuid': fields[0].strip(),
+    return {'thermal_zones_c': thermal_zones(), 'performance_fan_active': fan_active(), 'raw_gpu_fields': [field.strip() for field in fields], 'time': time.time(), 'host_available_bytes': available, 'gpu_uuid': fields[0].strip(),
             'temperature_c': float(fields[1]), 'graphics_mhz': number(fields[2]),
             'memory_mhz': number(fields[3]), 'gpu_used_mib': number(fields[4]), 'power_w': number(fields[5])}
 
@@ -104,17 +122,68 @@ receipt = {'window': window, 'host': socket.gethostname(), 'source': identity['c
            'observations': [first], 'cache': str(cache), 'cache_policy': 'retained across process boots; first cache state recorded in log directory',
            'cache_files_before': sum(1 for path in cache.rglob('*') if path.is_file()),
            'scope': 'native kernel test environment; no serving image or throughput qualification'}
+receipt['qualification_policy'] = {
+    'hottest_zone_start_below_c': 55.0,
+    'fan_service': 'dgx-fan-control.service',
+    'fan_active_required_during_run': True,
+    'host_memory_floor_gib': 48,
+    'gpu_temperature_stop_above_c': 80,
+    'transport': 'production cooling helpers with private local command adapter',
+}
+receipt['fan_commands'] = []
+receipt['fan_curve'] = []
+receipt['cooling'] = []
+local_node = {'name': socket.gethostname()}
+
+
+def local_command(nodes, node, *command):
+    assert node == local_node, 'kernel cooling must only touch its local host'
+    hold(beat=True)
+    run = subprocess.run(command, capture_output=True, text=True, check=False, timeout=45)
+    receipt['fan_commands'].append({'utc': dt.datetime.now(dt.timezone.utc).isoformat(),
+                                    'command': list(command), 'returncode': run.returncode,
+                                    'stdout': run.stdout, 'stderr': run.stderr})
+    return run
+
+
+cooling = helpers(local_command)
 started = time.monotonic()
 end = dt.datetime.fromisoformat(window['expected_end'].replace('Z', '+00:00')) if window['expected_end'] else None
 process = None
+
+
+def terminate(signum, frame):
+    raise SystemExit(128 + signum)
+
+
+signal.signal(signal.SIGTERM, terminate)
+signal.signal(signal.SIGINT, terminate)
 try:
     hold(beat=True)
+    receipt['cooling'] = cooling.cool_nodes({}, [local_node], 55.0, 600.0)
+    receipt['fan_curve'] = cooling.start_fan_curve({}, [local_node])
+    problems = cooling.fan_curve_problems(receipt['fan_curve'])
+    if problems:
+        raise RuntimeError('; '.join(problems))
+    ready = telemetry()
+    receipt['observations'].append(ready)
+    assert ready['performance_fan_active'], 'performance fan curve is not active'
+    assert max(ready['thermal_zones_c'].values()) < 55, ready
+    assert ready['host_available_bytes'] >= 48 * 2**30, ready
+    receipt['fan_unit'] = local_command({}, local_node, 'systemctl', 'cat',
+                                         'dgx-fan-control.service').stdout
+    receipt['performance_state_before'] = local_command(
+        {}, local_node, 'nvidia-smi', '-q', '-d', 'PERFORMANCE').stdout
+    if end and dt.datetime.now(dt.timezone.utc) >= end - dt.timedelta(seconds=60):
+        raise RuntimeError('window deadline reached during cooling')
     with (result / 'output.txt').open('w') as log:
         process = subprocess.Popen(command, stdout=log, stderr=subprocess.STDOUT)
         last_beat = time.monotonic()
         while process.poll() is None:
             time.sleep(5)
             sample = telemetry();receipt['observations'].append(sample)
+            if not sample['performance_fan_active']:
+                raise RuntimeError('performance fan curve stopped during measurement')
             if sample['host_available_bytes'] < 48 * 2**30 or sample['temperature_c'] > 80:
                 raise RuntimeError('memory/cooling guard reached')
             if time.monotonic() - last_beat >= 30:
@@ -122,11 +191,36 @@ try:
             if time.monotonic() - started > 1500 or (end and dt.datetime.now(dt.timezone.utc) >= end - dt.timedelta(seconds=60)):
                 raise RuntimeError('bounded GPU job/window deadline reached')
         receipt['exit_code'] = process.returncode
+        final = telemetry()
+        receipt['observations'].append(final)
+        if not final['performance_fan_active']:
+            raise RuntimeError('performance curve absent at measurement completion')
+except BaseException as error:
+    receipt['failure'] = repr(error)
+    receipt.setdefault('exit_code', 1)
+    raise
 finally:
-    if process is not None and process.poll() is None:
-        subprocess.run(['docker', 'stop', '--time', '15', name], check=False)
-        process.wait(timeout=30)
-        receipt['exit_code'] = process.returncode
+    try:
+        if process is not None and process.poll() is None:
+            subprocess.run(['docker', 'stop', '--time', '15', name], check=False, timeout=30)
+            process.wait(timeout=30)
+            receipt['exit_code'] = process.returncode or 1
+    except BaseException as error:
+        receipt['container_stop_error'] = repr(error)
+        receipt['exit_code'] = 1
+    try:
+        receipt['performance_state_after'] = output('nvidia-smi', '-q', '-d', 'PERFORMANCE')
+    except BaseException as error:
+        receipt['performance_state_after_error'] = repr(error)
+        receipt['exit_code'] = 1
+    try:
+        receipt['fan_curve_restore_failures'] = cooling.stop_fan_curve(
+            {}, [local_node], receipt['fan_curve'])
+        if receipt['fan_curve_restore_failures']:
+            receipt['exit_code'] = 1
+    except BaseException as error:
+        receipt['fan_curve_restore_error'] = repr(error)
+        receipt['exit_code'] = 1
     receipt['seconds'] = time.monotonic() - started
     (result / 'receipt.json').write_text(json.dumps(receipt, indent=2) + '\n')
     print('receipt', result, flush=True)

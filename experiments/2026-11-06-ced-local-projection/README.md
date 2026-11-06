@@ -4,7 +4,7 @@ Status: experimental alternative; two native GPU boots each passed 367 checks wi
 one skipped. Schedule timing refinement and serving results are pending. Source
 commit `51c1a32cd78cfb0a14087e34dfcc06be30928a0e` is published on
 `https://github.com/christopherowen/vllm/tree/feat/ced-local-projection`.
-The focused compact-carry source review remains
+The source review now includes both compact carry and local projection:
 https://github.com/christopherowen/vllm/pull/4; deployment review is
 https://github.com/christopherowen/spark-ds41f/pull/922.
 
@@ -87,7 +87,7 @@ attempts; a large failed-copy log is compressed without dropping its contents.
 - New lines pass Ruff 0.14.0 and whitespace checks. Inherited diagnostics remain
   unchanged. Native GPU tests were added for full-versus-local TP3/TP4 projection
   and rank-order mHC entry, including padding, row-dispatch boundaries and
-  nonfinite payloads. They have not run yet.
+  nonfinite payloads. They passed in both native boots documented below.
 - A fresh upstream checkout replays all 560 patches and reproduces candidate head
   `51c1a32cd78cfb0a14087e34dfcc06be30928a0e`, tree
   `5d8d1d1778c83a41d6dfb7364d1a18dad07df021`. The full series passes whitespace
@@ -177,5 +177,37 @@ Python enqueues the kernel; the raw timings contain substantial outliers. The
 parent callable additionally formed a weight view during that bracket. Those
 results remain discovery data, not the basis of a throughput claim. The corrected
 screen pre-binds the parent view and captures external CUDA timing-event nodes
-inside graph replay, with any cache wash before the timed kernel. Two corrected
-process boots are required before schedule selection.
+inside graph replay, with any cache wash before the timed kernel. Both corrected process boots completed, and every schedule passed its bit gates.
+They still do not qualify performance: the runner recorded GPU temperature but
+did not enforce or record the required hottest-zone baseline and installed
+performance fan curve. All three screens remain exploratory. The gap does not
+invalidate native equality results. The service journal showed the fan service
+starting at 00:20:06 UTC, after these screens had finished; the policy cannot be
+established retroactively.
+
+The raw discovery and two corrected runs are retained in
+`receipts/screen-discovery-1/`, `receipts/screen-corrected-1/` and
+`receipts/screen-corrected-2/`. `screen-comparisons.json` uses independent process
+means with Welch 95% intervals, retaining every raw sample and outlier. It does
+not pool within-process samples as independent boots. The 64-by-128 tile with
+256 threads and three stages is a provisional follow-up candidate, not a selected
+winner. In particular, the corrected TP4 comparison with the default still
+admits a material regression, even without the fan-policy gap.
+
+The next runner uses the unchanged production cooling helpers through a private
+local command transport, touches only the owned idle kernel host, requires its
+hottest zone below 55 C before launch, and verifies the installed performance
+curve remains active. It records service actions, thermal zones, graphics clocks,
+performance/throttle state and memory. A curve it starts is stopped on exit;
+restoration failures fail the run. Every local policy action rechecks the owned
+window. No timing run bypass is exposed. Five CPU failure-path tests pass, covering a
+missing/failed curve, hot-host timeout restoration, preexisting active service,
+ordinary start/stop restoration, and stop failure; see
+`receipts/cooling-tests-1.log`.
+
+The first window closed at 00:19:47 UTC with candidate-36/tp3-dev verified still
+serving and the hold removed; see `receipts/window-close.txt`. No serving container
+was replaced. The next requested job is a 25-minute DGX4-only timing screen,
+including four fresh test-container processes, all eighteen schedules at both
+chunk shapes, finite/nonfinite gates, and cooling before each process. It will
+follow the explicit shared-hardware reservations; no request waiter is active.
