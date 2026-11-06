@@ -140,6 +140,11 @@ def run_stage(stage_name: str, job_dir_name: str, token: str, commit: str, refre
 
 
 def main():
+    import argparse
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--stages", type=str, default="")
+    args = ap.parse_args()
+    selected = [s.strip() for s in args.stages.split(",") if s.strip()] if args.stages else None
     OUT_DIR.mkdir(parents=True, exist_ok=True)
     commit = git_head("HEAD")
     pub_commit = git_head("origin/latent-sparse-attention")
@@ -210,7 +215,8 @@ def main():
             ("bench-boot2", "sp8-bench-boot2"),
         ]
         for s_name, j_dir in stages:
-            run_stage(s_name, j_dir, token, commit, refresh_heartbeat)
+            if selected is None or s_name in selected:
+                run_stage(s_name, j_dir, token, commit, refresh_heartbeat)
 
         (OUT_DIR / "memory-after.json").write_text(json.dumps(memory_snapshot()) + "\n")
     finally:

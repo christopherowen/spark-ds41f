@@ -1,10 +1,10 @@
 # Upstream base: C36 vLLM 6d4e49d1cdbb6513819e47145e0e52fdab327b6b.
 # Requires the ordered thirteen shortlist/wide-coarse/cooperative-summary patches.
-# Rationale: make TileLang LSA a strict opt-in choice (zero overhead when off),
-# disable downward-quantized compact8 summaries in favor of exact BF16 block8
-# summaries with 512-thread cooperative maintenance, wire raw-wide/direct coarse
-# selection and full PDL chaining into QueryReusePlan, and enable adaptive
-# prefill_short (32K dense), source_short (64K source), and multi-row decode.
+# Rationale: make TileLang LSA a strict opt-in choice via VLLM_DS41_LSA=1 (zero
+# overhead when off), remove internal mode/compact8 sub-optionality in favor of
+# exact BF16 block8 summaries with 512-thread cooperative maintenance, wire
+# raw-wide/direct coarse selection and full PDL chaining into QueryReusePlan,
+# and unify score_width routing across 32K-1M prefill and multi-row decode.
 # Quality: default path is 100% unchanged native indexing (68-byte keys); opt-in
 # path preserves full BF16 block means and FP32 accumulation without downward
 # quantization.
@@ -13,20 +13,10 @@
 # score/recall checks, strict unwritten-suffix initcheck, and 2-boot matrix.
 # Upstream status: unpromoted experiment, not submitted upstream.
 diff --git a/vllm/models/deepseek_v4_1/attention.py b/vllm/models/deepseek_v4_1/attention.py
+index 5ec7e71af..bb48b4d5f 100644
 --- a/vllm/models/deepseek_v4_1/attention.py
 +++ b/vllm/models/deepseek_v4_1/attention.py
-@@ -103,15 +103,32 @@
-         # sparse MLA never loads a masked entry, the indexer reads no key past the
-         # visible positions, and the compressor reads only a slot it wrote.
-         # Reused blocks need no zeros.
-+        if (
-+            os.environ.get("VLLM_DS41_PAGE_SHORTLIST") == "1"
-+            and os.environ.get("VLLM_DS41_PAGE_MODE") == "compact8"
-+        ):
-+            raise ValueError(
-+                "downward-quantized compact8 summaries are disabled; use block8 BF16 summaries"
-+            )
-         common = dict(
+@@ -107,11 +107,12 @@ class _Cache(nn.Module, AttentionLayerBase):
              block_size=self.block_size,
              num_kv_heads=1,
              head_size=512 if self.kind == "swa" else 68,
@@ -35,34 +25,75 @@ diff --git a/vllm/models/deepseek_v4_1/attention.py b/vllm/models/deepseek_v4_1/
 -                                 (80 if os.environ.get("VLLM_DS41_PAGE_MODE") == "compact8" else
 -                                  100 if os.environ.get("VLLM_DS41_PAGE_MODE") == "block8" else 73)
 -                                 if "VLLM_DS41_PAGE_SHORTLIST" in os.environ else 68),
-+            # Optional shortlist storage is admitted only when explicitly enabled.
++            # Optional BF16 block-mean shortlist storage is admitted only when enabled.
 +            state_content_bytes=(
 +                528
 +                if self.kind == "swa"
-+                else (
-+                    (
-+                        73
-+                        if os.environ.get("VLLM_DS41_PAGE_MODE", "block8")
-+                        in ("page64", "direct")
-+                        else 100
-+                    )
-+                    if os.environ.get("VLLM_DS41_PAGE_SHORTLIST") == "1"
-+                    else 68
-+                )
++                else (100 if os.environ.get("VLLM_DS41_LSA") == "1" else 68)
 +            ),
              dtype=torch.uint8,
              tokens_per_state=self.ratio,
              cache_dtype_str="b12x_dsv41",
+@@ -1385,9 +1386,10 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase):
+             index_mode = "decode" if mode == "decode" else "prefill"
+             *query, split, reference = index_query
+             im = self._query_metadata(metadata[self.indexer.k_cache.prefix])
++            lsa_enabled = os.environ.get("VLLM_DS41_LSA") == "1"
+             score_width = None
+             if (
+-                mode == "extend"
++                (mode == "extend" or lsa_enabled)
+                 and self.layer_id <= self.candidate_source_layer
+                 and not torch.cuda.is_current_stream_capturing()
+             ):
+@@ -1397,17 +1399,31 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase):
+                 )
+             chunk_rows = self.DECODE_CHUNK if mode == "decode" else self.INDEX_CHUNK
+             index_pages = self._index_pages
++            decode_mode = "decode"
++            decode_pages = self._index_pages
+             if (
+-                mode == "extend"
+-                and score_width is not None
++                score_width is not None
+                 and score_width <= 16384
+                 and self._short_index_shape is not None
+             ):
+-                index_mode = "prefill_short"
+-                chunk_rows = self._short_index_shape[0]
+-                index_pages = self._short_index_pages
++                if mode == "extend" or (lsa_enabled and rows >= 2):
++                    index_mode = "prefill_short"
++                    chunk_rows = (
++                        self.DECODE_CHUNK
++                        if mode == "decode"
++                        else self._short_index_shape[0]
++                    )
++                    index_pages = self._short_index_pages
++                if lsa_enabled and decode_rows >= 2:
++                    decode_mode = "prefill_short"
++                    decode_pages = self._short_index_pages
+             rest = (index_mode, chunk_rows, index_pages, score_width)
+-            decode = ("decode", self.DECODE_CHUNK, self._index_pages, None)
++            decode = (
++                decode_mode,
++                self.DECODE_CHUNK,
++                decode_pages,
++                score_width if lsa_enabled else None,
++            )
+ 
+             def select(query, first, selected):
+                 # Decode requests' rows (global rows below decode_rows) take the
 diff --git a/vllm/models/deepseek_v4_1/tilelang/attention.py b/vllm/models/deepseek_v4_1/tilelang/attention.py
+index d395b844b..acc186e5a 100644
 --- a/vllm/models/deepseek_v4_1/tilelang/attention.py
 +++ b/vllm/models/deepseek_v4_1/tilelang/attention.py
-@@ -26,21 +26,8 @@
+@@ -26,21 +26,7 @@ from vllm.v1.worker.workspace import (
  )
  
  from . import prepare
 -from .paged_shortlist import PageShortlistPlan, summarize_pages, STATE_BYTES
-+from .block_shortlist import STATE_BYTES as BLOCK_STATE_BYTES, summarize_blocks
- from .direct_shortlist import DirectPageShortlistPlan
+-from .direct_shortlist import DirectPageShortlistPlan
 -from .block_shortlist import summarize_blocks, STATE_BYTES as BLOCK_STATE_BYTES
 -from .query_reuse import QueryReusePlan as BlockMeanShortlistPlan
 -from .compact_shortlist import CompactShortlistPlan, summarize_compact, STATE_BYTES as COMPACT_STATE_BYTES
@@ -76,97 +107,61 @@ diff --git a/vllm/models/deepseek_v4_1/tilelang/attention.py b/vllm/models/deeps
 -    if os.environ.get("VLLM_DS41_PAGE_MODE") == "compact8":
 -        return summarize_compact
 -    return summarize_blocks if os.environ.get("VLLM_DS41_PAGE_MODE") == "block8" else summarize_pages
++from .block_shortlist import STATE_BYTES, summarize_blocks
  from .indexer import (
      CANDIDATE_BLOCK,
      CANDIDATE_BLOCKS,
-@@ -52,7 +39,51 @@
+@@ -52,9 +38,15 @@ from .indexer import (
      quantize_mxfp4,
      write_index_keys,
  )
-+from .paged_shortlist import (
-+    STATE_BYTES as PAGE_STATE_BYTES,
-+    PageShortlistPlan,
-+    summarize_pages,
-+)
++from .paged_shortlist import PageShortlistPlan
 +from .query_reuse import QueryReusePlan as BlockMeanShortlistPlan
  from .sparse_mla import SparseMlaV41Plan
-+
-+
-+def _shortlist_enabled() -> bool:
-+    return os.environ.get("VLLM_DS41_PAGE_SHORTLIST") == "1"
-+
-+
-+def _shortlist_mode() -> str:
-+    mode = os.environ.get("VLLM_DS41_PAGE_MODE", "block8")
-+    if mode == "compact8":
-+        raise ValueError(
-+            "downward-quantized compact8 summaries are disabled; use block8 BF16 summaries"
-+        )
-+    if mode not in ("block8", "page64", "direct"):
-+        raise ValueError("unknown page shortlist mode")
-+    return mode
-+
-+
-+def _state_bytes() -> int:
-+    return (
-+        PAGE_STATE_BYTES
-+        if _shortlist_mode() in ("page64", "direct")
-+        else BLOCK_STATE_BYTES
-+    )
-+
-+
-+STATE_BYTES = (
-+    PAGE_STATE_BYTES
-+    if os.environ.get("VLLM_DS41_PAGE_MODE", "block8") in ("page64", "direct")
-+    else BLOCK_STATE_BYTES
-+)
-+
-+
-+def _summary_kernel():
-+    return (
-+        summarize_pages
-+        if _shortlist_mode() in ("page64", "direct")
-+        else summarize_blocks
-+    )
  
  
++def _lsa_enabled() -> bool:
++    return os.environ.get("VLLM_DS41_LSA") == "1"
++
++
  class DeepseekV41TileLangBackend(DeepseekV41B12xBackend):
-@@ -84,30 +115,53 @@
+     """The V4.1 cache layout and metadata builder, under the TileLang name."""
+ 
+@@ -84,47 +76,63 @@ def _mla_calls(*shape) -> list:
  
  
  def _shortlist_options(width, candidates, candidate_blocks):
 -    if (os.environ.get("VLLM_DS41_PAGE_SHORTLIST") != "1" or candidates
 -            or width <= (32768 if candidate_blocks else 16384)
 -            or (candidate_blocks and os.environ.get("VLLM_DS41_PAGE_NATIVE_SOURCE") == "1")):
-+    if (
-+        not _shortlist_enabled()
-+        or candidates
-+        or (
-+            candidate_blocks
-+            and os.environ.get("VLLM_DS41_PAGE_NATIVE_SOURCE") == "1"
-+        )
-+    ):
++    if not _lsa_enabled() or candidates:
++        return None
++    budget = 1024 if candidate_blocks else 64
++    if width <= budget * 64:
          return None
 -    name = "VLLM_DS41_PAGE_SOURCE_BUDGET" if candidate_blocks else "VLLM_DS41_PAGE_DENSE_BUDGET"
 -    budget = int(os.environ.get(name, "512" if candidate_blocks else "64"))
-+    _shortlist_mode()
-+    name = (
-+        "VLLM_DS41_PAGE_SOURCE_BUDGET"
-+        if candidate_blocks
-+        else "VLLM_DS41_PAGE_DENSE_BUDGET"
-+    )
-+    budget = int(os.environ.get(name, "1024" if candidate_blocks else "64"))
-     if budget <= 0 or budget % 8:
-         raise ValueError("shortlist budget must be a positive multiple of eight")
+-    if budget <= 0 or budget % 8:
+-        raise ValueError("shortlist budget must be a positive multiple of eight")
 -    row_cap = int(os.environ.get("VLLM_DS41_PAGE_ROWS", "8"))
-+    if width <= budget * 64:
-+        return None
-+    row_cap = int(os.environ.get("VLLM_DS41_PAGE_ROWS", "256"))
-     if row_cap <= 0 or row_cap > 256:
-         raise ValueError("shortlist row capacity must be between1 and256")
-     return dict(candidate_blocks=candidate_blocks, budget=budget, row_cap=row_cap)
- 
- 
+-    if row_cap <= 0 or row_cap > 256:
+-        raise ValueError("shortlist row capacity must be between1 and256")
+-    return dict(candidate_blocks=candidate_blocks, budget=budget, row_cap=row_cap)
+-
+-
+-def _shortlist_class():
+-    mode = os.environ.get("VLLM_DS41_PAGE_MODE", "")
+-    if mode == "compact8":
+-        return CompactShortlistPlan
+-    if mode == "block8":
+-        return BlockMeanShortlistPlan
+-    if mode:
+-        raise ValueError("unknown page shortlist mode")
+-    return (DirectPageShortlistPlan if os.environ.get("VLLM_DS41_PAGE_DIRECT") == "1"
+-            else PageShortlistPlan)
++    return dict(candidate_blocks=candidate_blocks, budget=budget, row_cap=256)
++
++
 +def _source_short_options(width, candidates, candidate_blocks):
 +    options = _shortlist_options(width, candidates, candidate_blocks)
 +    if (
@@ -177,32 +172,15 @@ diff --git a/vllm/models/deepseek_v4_1/tilelang/attention.py b/vllm/models/deeps
 +    ):
 +        return None
 +    return {**options, "budget": 512}
-+
-+
- def _shortlist_class():
--    mode = os.environ.get("VLLM_DS41_PAGE_MODE", "")
--    if mode == "compact8":
--        return CompactShortlistPlan
-+    mode = _shortlist_mode()
-     if mode == "block8":
-         return BlockMeanShortlistPlan
--    if mode:
--        raise ValueError("unknown page shortlist mode")
--    return (DirectPageShortlistPlan if os.environ.get("VLLM_DS41_PAGE_DIRECT") == "1"
--            else PageShortlistPlan)
-+    return (
-+        DirectPageShortlistPlan
-+        if mode == "direct" or os.environ.get("VLLM_DS41_PAGE_DIRECT") == "1"
-+        else PageShortlistPlan
-+    )
  
  
  @functools.cache
-@@ -115,16 +169,38 @@
+ def _index_plan(width, page_size, candidates, candidate_blocks):
      options = _shortlist_options(width, candidates, candidate_blocks)
      if options is not None:
-         return _shortlist_class()(width, page_size, **options)
+-        return _shortlist_class()(width, page_size, **options)
 -    return IndexerV41Plan(width, page_size, candidates=candidates, candidate_blocks=candidate_blocks)
++        return BlockMeanShortlistPlan(width, page_size, **options)
 +    return IndexerV41Plan(
 +        width, page_size, candidates=candidates, candidate_blocks=candidate_blocks
 +    )
@@ -213,7 +191,7 @@ diff --git a/vllm/models/deepseek_v4_1/tilelang/attention.py b/vllm/models/deeps
 +    options = _source_short_options(width, candidates, candidate_blocks)
 +    if options is None:
 +        return None
-+    return _shortlist_class()(width, page_size, **options)
++    return BlockMeanShortlistPlan(width, page_size, **options)
  
  
  def _index_calls(width, page_size, candidates, candidate_blocks) -> list:
@@ -224,7 +202,7 @@ diff --git a/vllm/models/deepseek_v4_1/tilelang/attention.py b/vllm/models/deeps
 -                                      candidate_blocks=candidate_blocks)]
 -    return IndexerV41Plan.calls(width, page_size, candidates=candidates, candidate_blocks=candidate_blocks)
 +        calls = [
-+            *_shortlist_class().calls(width, page_size, **options),
++            *BlockMeanShortlistPlan.calls(width, page_size, **options),
 +            *IndexerV41Plan.calls(
 +                width,
 +                page_size,
@@ -234,7 +212,7 @@ diff --git a/vllm/models/deepseek_v4_1/tilelang/attention.py b/vllm/models/deeps
 +        ]
 +        short_options = _source_short_options(width, candidates, candidate_blocks)
 +        if short_options is not None:
-+            calls.extend(_shortlist_class().calls(width, page_size, **short_options))
++            calls.extend(BlockMeanShortlistPlan.calls(width, page_size, **short_options))
 +        return calls
 +    return IndexerV41Plan.calls(
 +        width, page_size, candidates=candidates, candidate_blocks=candidate_blocks
@@ -242,7 +220,7 @@ diff --git a/vllm/models/deepseek_v4_1/tilelang/attention.py b/vllm/models/deeps
  
  
  class DeepseekV41TileLangAttention(DeepseekV4Attention):
-@@ -193,10 +269,15 @@
+@@ -193,11 +201,12 @@ class DeepseekV41TileLangAttention(DeepseekV4Attention):
                      rope_dim=self.rotary_emb.cos_sin_cache.shape[1],
                  )
              )  # _quantize_index_query
@@ -250,40 +228,36 @@ diff --git a/vllm/models/deepseek_v4_1/tilelang/attention.py b/vllm/models/deeps
 -                and os.environ.get("VLLM_DS41_PAGE_SHORTLIST") == "1"
 -                and not (self.layer_id == self.candidate_source_layer
 -                         and os.environ.get("VLLM_DS41_PAGE_NATIVE_SOURCE") == "1")):
+-            calls.append(prepare.call(_summary_kernel(), self._index_page))
 +        if (
 +            self.compressor is not None
 +            and self.indexer is not None
-+            and _shortlist_enabled()
-+            and not (
-+                self.layer_id == self.candidate_source_layer
-+                and os.environ.get("VLLM_DS41_PAGE_NATIVE_SOURCE") == "1"
-+            )
++            and _lsa_enabled()
 +        ):
-             calls.append(prepare.call(_summary_kernel(), self._index_page))
++            calls.append(prepare.call(summarize_blocks, self._index_page))
          if self.compressor is not None:
              from .gemm import bf16_shards
-@@ -228,10 +309,16 @@
+ 
+@@ -227,11 +236,13 @@ class DeepseekV41TileLangAttention(DeepseekV4Attention):
+             self._prepare(self.rotary_emb.cos_sin_cache.device)
          self._tilelang_plans = self._build_tilelang_plans()
          self._page_summary = (
-             _summary_kernel()(self._index_page)
+-            _summary_kernel()(self._index_page)
 -            if (self.compressor is not None and self.indexer is not None
 -                and os.environ.get("VLLM_DS41_PAGE_SHORTLIST") == "1"
 -                and not (self.layer_id == self.candidate_source_layer
 -                         and os.environ.get("VLLM_DS41_PAGE_NATIVE_SOURCE") == "1")) else None
++            summarize_blocks(self._index_page)
 +            if (
 +                self.compressor is not None
 +                and self.indexer is not None
-+                and _shortlist_enabled()
-+                and not (
-+                    self.layer_id == self.candidate_source_layer
-+                    and os.environ.get("VLLM_DS41_PAGE_NATIVE_SOURCE") == "1"
-+                )
++                and _lsa_enabled()
 +            )
 +            else None
          )
  
      def _tilelang(self) -> SimpleNamespace:
-@@ -266,9 +353,13 @@
+@@ -266,9 +277,13 @@ class DeepseekV41TileLangAttention(DeepseekV4Attention):
              caches.append(("indexed", self._owner().kv_cache, self._main_page * 288))
          if self.indexer is not None:
              caches.append(
@@ -293,14 +267,14 @@ diff --git a/vllm/models/deepseek_v4_1/tilelang/attention.py b/vllm/models/deeps
 +                (
 +                    "index K",
 +                    self.indexer.k_cache.kv_cache,
-+                    self._index_page * _state_bytes()
-+                    if _shortlist_enabled()
++                    self._index_page * STATE_BYTES
++                    if _lsa_enabled()
 +                    else page_bytes(self._index_page),
 +                )
              )
          for name, cache, page in caches:
              if cache.dim() != 2 or cache.dtype != torch.uint8 or cache.shape[1] != page:
-@@ -281,9 +372,17 @@
+@@ -281,9 +296,17 @@ class DeepseekV41TileLangAttention(DeepseekV4Attention):
          mla_args, index_args, chunks = self._plan_args()
          mla = _mla_plan(*mla_args)
          index = {mode: _index_plan(*args) for mode, args in index_args.items()}
@@ -320,7 +294,7 @@ diff --git a/vllm/models/deepseek_v4_1/tilelang/attention.py b/vllm/models/deeps
          }
          # The largest scratch each phase borrows: indexing, then the attention
          # metadata arena with the decode route's segment workspace. They are
-@@ -293,13 +392,20 @@
+@@ -293,13 +316,20 @@ class DeepseekV41TileLangAttention(DeepseekV4Attention):
          split_rows = min(mla.decode_max_rows, self.capacity)
          self._scratch_reservations = (
              *(plan.scratch_specs(chunks[mode]) for mode, plan in index.items()),
@@ -342,19 +316,16 @@ diff --git a/vllm/models/deepseek_v4_1/tilelang/attention.py b/vllm/models/deeps
  
      def reserve_profile_scratch(self) -> None:
          """Reserve this layer's largest borrows (``_build_tilelang_plans``) in the
-@@ -369,14 +475,27 @@
+@@ -369,14 +399,23 @@ class DeepseekV41TileLangAttention(DeepseekV4Attention):
      ):
          plans = self._tilelang()
          plan = plans.index[mode]
 -        if (mode == "decode" and os.environ.get("VLLM_DS41_PAGE_NATIVE_DECODE") == "1"
 -                and isinstance(plan, PageShortlistPlan)):
--            plan = plans.native_index[mode]
-+        if mode == "decode" and isinstance(plan, PageShortlistPlan):
-+            if os.environ.get("VLLM_DS41_PAGE_NATIVE_DECODE") == "1" or rows < int(
-+                os.environ.get("VLLM_DS41_PAGE_DECODE_MIN_ROWS", "2")
-+            ):
-+                plan = plans.native_index[mode]
-         # Outside graph capture, the existing conservative prefill extent can
++        if mode == "decode" and isinstance(plan, PageShortlistPlan) and rows < 2:
+             plan = plans.native_index[mode]
+-        # Outside graph capture, the existing conservative prefill extent can
++        # Outside graph capture, the existing conservative extent can
          # prove that every key would be kept. Avoid the entire coarse pipeline.
 -        if (score_width is not None and isinstance(plan, PageShortlistPlan)
 -                and score_width <= plan.budget * 64 + plan.page - 1):
@@ -366,8 +337,7 @@ diff --git a/vllm/models/deepseek_v4_1/tilelang/attention.py b/vllm/models/deeps
 +        ):
 +            short = getattr(plans, "source_short", None)
 +            if (
-+                mode == "prefill"
-+                and short is not None
++                short is not None
 +                and score_width > short.budget * 64 + short.page - 1
 +            ):
 +                plan = short
@@ -377,9 +347,10 @@ diff --git a/vllm/models/deepseek_v4_1/tilelang/attention.py b/vllm/models/deeps
              *plan.scratch_specs(rows)
          )
 diff --git a/vllm/models/deepseek_v4_1/tilelang/block_shortlist.py b/vllm/models/deepseek_v4_1/tilelang/block_shortlist.py
+index 2c63a027a..5bf2e328a 100644
 --- a/vllm/models/deepseek_v4_1/tilelang/block_shortlist.py
 +++ b/vllm/models/deepseek_v4_1/tilelang/block_shortlist.py
-@@ -7,16 +7,18 @@
+@@ -7,16 +7,18 @@ import tilelang
  import tilelang.language as T
  import torch
  
@@ -400,10 +371,11 @@ diff --git a/vllm/models/deepseek_v4_1/tilelang/block_shortlist.py b/vllm/models
      rows,pool_pages,stride = T.dynamic('rows, pool_pages, stride')
      blocks = page//8
  
-@@ -41,6 +43,34 @@
+@@ -40,6 +42,34 @@ def summarize_blocks(page: int, slot_dtype: str = 'int64'):
+     return update
  
  
- @tilelang.jit
++@tilelang.jit
 +def summarize_blocks(page: int, slot_dtype: str = 'int64'):
 +    rows,pool_pages,stride = T.dynamic('rows, pool_pages, stride')
 +    groups = (page//8)*4
@@ -431,11 +403,10 @@ diff --git a/vllm/models/deepseek_v4_1/tilelang/block_shortlist.py b/vllm/models
 +    return update
 +
 +
-+@tilelang.jit
+ @tilelang.jit
  def block_scores(width: int, page: int, budget: int, block_c: int = 64):
      rows,pool_pages,stride = T.dynamic('rows, pool_pages, stride')
-     n = width//8
-@@ -54,6 +84,7 @@
+@@ -54,6 +84,7 @@ def block_scores(width: int, page: int, budget: int, block_c: int = 64):
                Active: T.Tensor([1],T.int32), Score: T.Tensor([rows,n],T.bfloat16),
                Count: T.Tensor([rows],T.int32)):
          with T.Kernel(ctas,rows,threads=128) as (cta,row):
@@ -443,7 +414,7 @@ diff --git a/vllm/models/deepseek_v4_1/tilelang/block_shortlist.py b/vllm/models
              a = T.alloc_shared([block_c,128],T.bfloat16)
              b = T.alloc_shared([32,128],T.bfloat16)
              acc = T.alloc_fragment([block_c,32],T.float32)
-@@ -98,6 +129,7 @@
+@@ -98,6 +129,7 @@ def block_candidates(width: int, page: int, budget: int):
                   Candidates: T.Tensor([rows,capacity],T.int32),
                   CandidateLength: T.Tensor([rows],T.int32)):
          with T.Kernel(rows,threads=128) as row:
@@ -451,7 +422,7 @@ diff --git a/vllm/models/deepseek_v4_1/tilelang/block_shortlist.py b/vllm/models
              search = T.alloc_local([2],T.int32)
              extent = T.min(T.max(Length[row],0),T.max(T.min(Active[0],width),0))
              visible = T.ceildiv(extent,8)
-@@ -136,7 +168,9 @@
+@@ -136,7 +168,9 @@ class BlockMeanShortlistPlan(PageShortlistPlan):
          self.block_budget = self.budget*8
          self.capacity = (self.budget+8)*64
          self.score = block_scores(width,page,self.block_budget)
@@ -462,7 +433,7 @@ diff --git a/vllm/models/deepseek_v4_1/tilelang/block_shortlist.py b/vllm/models
          self.assemble = block_candidates(width,page,self.block_budget)
          self.final = IndexerV41Plan(self.capacity,page,candidates=True)
          if self.source:
-@@ -146,8 +180,11 @@
+@@ -146,8 +180,11 @@ class BlockMeanShortlistPlan(PageShortlistPlan):
      @staticmethod
      def calls(width,page,*,candidate_blocks=False,budget=None,row_cap=256):
          b = budget or (512 if candidate_blocks else 64)
@@ -476,6 +447,7 @@ diff --git a/vllm/models/deepseek_v4_1/tilelang/block_shortlist.py b/vllm/models
                   *IndexerV41Plan.calls(capacity,page,candidates=True)]
          if candidate_blocks:
 diff --git a/vllm/models/deepseek_v4_1/tilelang/query_reuse.py b/vllm/models/deepseek_v4_1/tilelang/query_reuse.py
+index 02d17e1a9..930569278 100644
 --- a/vllm/models/deepseek_v4_1/tilelang/query_reuse.py
 +++ b/vllm/models/deepseek_v4_1/tilelang/query_reuse.py
 @@ -1,10 +1,28 @@
@@ -509,7 +481,7 @@ diff --git a/vllm/models/deepseek_v4_1/tilelang/query_reuse.py b/vllm/models/dee
  
  @tilelang.jit
  def prepared_scores(width: int, page: int, budget: int, block_c: int = 64):
-@@ -20,6 +38,7 @@
+@@ -20,6 +38,7 @@ def prepared_scores(width: int, page: int, budget: int, block_c: int = 64):
                Active: T.Tensor([1],T.int32), Score: T.Tensor([rows,n],T.bfloat16),
                Count: T.Tensor([rows],T.int32)):
          with T.Kernel(ctas,rows,threads=128) as (cta,row):
@@ -517,7 +489,7 @@ diff --git a/vllm/models/deepseek_v4_1/tilelang/query_reuse.py b/vllm/models/dee
              a = T.alloc_shared([block_c,128],T.bfloat16)
              b = T.alloc_shared([32,128],T.bfloat16)
              acc = T.alloc_fragment([block_c,32],T.float32)
-@@ -64,19 +83,12 @@
+@@ -64,6 +83,7 @@ def prepare_queries(width:int,page:int,budget:int):
                 Length:T.Tensor([rows],T.int32),Active:T.Tensor([1],T.int32),
                 Decoded:T.Tensor([rows,32,128],T.bfloat16)):
          with T.Kernel(rows,threads=128) as row:
@@ -525,20 +497,21 @@ diff --git a/vllm/models/deepseek_v4_1/tilelang/query_reuse.py b/vllm/models/dee
              extent = T.min(T.max(Length[row],0),T.max(T.min(Active[0],width),0))
              if extent//page*(page//8) > budget:
                  for h,d in T.Parallel(32,128):
-                     Decoded[row,h,d] = T.cast(decode(Q[row,h,d//2],Scale[row,h,d//32],d),T.bfloat16)
+@@ -71,21 +91,15 @@ def prepare_queries(width:int,page:int,budget:int):
      return unpack
--
--
+ 
+ 
 -import math
 -import torch
 -from vllm.models.deepseek_v4_1.tilelang import prepare
 -from vllm.models.deepseek_v4_1.tilelang.block_shortlist import BlockMeanShortlistPlan,block_candidates
 -from vllm.models.deepseek_v4_1.tilelang.indexer import IndexerTopK,IndexerV41Plan,CANDIDATE_BLOCKS,CANDIDATE_BLOCK
 -from vllm.models.deepseek_v4_1.tilelang.shortlist_indexer import remap_blocks
- 
- 
+-
+-
  class QueryReusePlan(BlockMeanShortlistPlan):
-@@ -85,7 +97,9 @@
+     def __init__(self,width,page,*,candidate_blocks=False,budget=None,row_cap=256):
+         self.width,self.page,self.source,self.row_cap = width,page,candidate_blocks,row_cap
          self.budget = budget or (512 if candidate_blocks else 64)
          self.block_budget = self.budget*8
          self.capacity = (self.budget+8)*64
@@ -550,9 +523,10 @@ diff --git a/vllm/models/deepseek_v4_1/tilelang/query_reuse.py b/vllm/models/dee
          self.final = IndexerV41Plan(self.capacity,page,candidates=True)
          if self.source:
 diff --git a/vllm/models/deepseek_v4_1/tilelang/shortlist_indexer.py b/vllm/models/deepseek_v4_1/tilelang/shortlist_indexer.py
+index fd0348d7f..19e3655e7 100644
 --- a/vllm/models/deepseek_v4_1/tilelang/shortlist_indexer.py
 +++ b/vllm/models/deepseek_v4_1/tilelang/shortlist_indexer.py
-@@ -11,6 +11,7 @@
+@@ -11,6 +11,7 @@ import tilelang
  import tilelang.language as T
  import torch
  
@@ -560,7 +534,7 @@ diff --git a/vllm/models/deepseek_v4_1/tilelang/shortlist_indexer.py b/vllm/mode
  from .indexer import IndexerTopK, IndexerV41Plan, INDEX_TOPK, CANDIDATE_BLOCKS
  
  CHUNK = 512
-@@ -189,6 +190,7 @@
+@@ -189,6 +190,7 @@ def remap_blocks(capacity: int):
                Candidates: T.Tensor([rows,capacity//BLOCK],T.int32),
                Original: T.Tensor([rows,CANDIDATE_BLOCKS],T.int32)):
          with T.Kernel(tilelang.cdiv(CANDIDATE_BLOCKS,128),rows,threads=128) as (tile,row):

@@ -26,8 +26,7 @@ from vllm.v1.worker.workspace import (
 )
 
 from . import prepare
-from .block_shortlist import STATE_BYTES as BLOCK_STATE_BYTES, summarize_blocks
-from .direct_shortlist import DirectPageShortlistPlan
+from .block_shortlist import STATE_BYTES, summarize_blocks
 from .indexer import (
     CANDIDATE_BLOCK,
     CANDIDATE_BLOCKS,
@@ -39,51 +38,13 @@ from .indexer import (
     quantize_mxfp4,
     write_index_keys,
 )
-from .paged_shortlist import (
-    STATE_BYTES as PAGE_STATE_BYTES,
-    PageShortlistPlan,
-    summarize_pages,
-)
+from .paged_shortlist import PageShortlistPlan
 from .query_reuse import QueryReusePlan as BlockMeanShortlistPlan
 from .sparse_mla import SparseMlaV41Plan
 
 
-def _shortlist_enabled() -> bool:
-    return os.environ.get("VLLM_DS41_PAGE_SHORTLIST") == "1"
-
-
-def _shortlist_mode() -> str:
-    mode = os.environ.get("VLLM_DS41_PAGE_MODE", "block8")
-    if mode == "compact8":
-        raise ValueError(
-            "downward-quantized compact8 summaries are disabled; use block8 BF16 summaries"
-        )
-    if mode not in ("block8", "page64", "direct"):
-        raise ValueError("unknown page shortlist mode")
-    return mode
-
-
-def _state_bytes() -> int:
-    return (
-        PAGE_STATE_BYTES
-        if _shortlist_mode() in ("page64", "direct")
-        else BLOCK_STATE_BYTES
-    )
-
-
-STATE_BYTES = (
-    PAGE_STATE_BYTES
-    if os.environ.get("VLLM_DS41_PAGE_MODE", "block8") in ("page64", "direct")
-    else BLOCK_STATE_BYTES
-)
-
-
-def _summary_kernel():
-    return (
-        summarize_pages
-        if _shortlist_mode() in ("page64", "direct")
-        else summarize_blocks
-    )
+def _lsa_enabled() -> bool:
+    return os.environ.get("VLLM_DS41_LSA") == "1"
 
 
 class DeepseekV41TileLangBackend(DeepseekV41B12xBackend):
@@ -115,30 +76,12 @@ def _mla_calls(*shape) -> list:
 
 
 def _shortlist_options(width, candidates, candidate_blocks):
-    if (
-        not _shortlist_enabled()
-        or candidates
-        or (
-            candidate_blocks
-            and os.environ.get("VLLM_DS41_PAGE_NATIVE_SOURCE") == "1"
-        )
-    ):
+    if not _lsa_enabled() or candidates:
         return None
-    _shortlist_mode()
-    name = (
-        "VLLM_DS41_PAGE_SOURCE_BUDGET"
-        if candidate_blocks
-        else "VLLM_DS41_PAGE_DENSE_BUDGET"
-    )
-    budget = int(os.environ.get(name, "1024" if candidate_blocks else "64"))
-    if budget <= 0 or budget % 8:
-        raise ValueError("shortlist budget must be a positive multiple of eight")
+    budget = 1024 if candidate_blocks else 64
     if width <= budget * 64:
         return None
-    row_cap = int(os.environ.get("VLLM_DS41_PAGE_ROWS", "256"))
-    if row_cap <= 0 or row_cap > 256:
-        raise ValueError("shortlist row capacity must be between1 and256")
-    return dict(candidate_blocks=candidate_blocks, budget=budget, row_cap=row_cap)
+    return dict(candidate_blocks=candidate_blocks, budget=budget, row_cap=256)
 
 
 def _source_short_options(width, candidates, candidate_blocks):
@@ -153,22 +96,11 @@ def _source_short_options(width, candidates, candidate_blocks):
     return {**options, "budget": 512}
 
 
-def _shortlist_class():
-    mode = _shortlist_mode()
-    if mode == "block8":
-        return BlockMeanShortlistPlan
-    return (
-        DirectPageShortlistPlan
-        if mode == "direct" or os.environ.get("VLLM_DS41_PAGE_DIRECT") == "1"
-        else PageShortlistPlan
-    )
-
-
 @functools.cache
 def _index_plan(width, page_size, candidates, candidate_blocks):
     options = _shortlist_options(width, candidates, candidate_blocks)
     if options is not None:
-        return _shortlist_class()(width, page_size, **options)
+        return BlockMeanShortlistPlan(width, page_size, **options)
     return IndexerV41Plan(
         width, page_size, candidates=candidates, candidate_blocks=candidate_blocks
     )
@@ -179,14 +111,14 @@ def _source_short_plan(width, page_size, candidates, candidate_blocks):
     options = _source_short_options(width, candidates, candidate_blocks)
     if options is None:
         return None
-    return _shortlist_class()(width, page_size, **options)
+    return BlockMeanShortlistPlan(width, page_size, **options)
 
 
 def _index_calls(width, page_size, candidates, candidate_blocks) -> list:
     options = _shortlist_options(width, candidates, candidate_blocks)
     if options is not None:
         calls = [
-            *_shortlist_class().calls(width, page_size, **options),
+            *BlockMeanShortlistPlan.calls(width, page_size, **options),
             *IndexerV41Plan.calls(
                 width,
                 page_size,
@@ -196,7 +128,7 @@ def _index_calls(width, page_size, candidates, candidate_blocks) -> list:
         ]
         short_options = _source_short_options(width, candidates, candidate_blocks)
         if short_options is not None:
-            calls.extend(_shortlist_class().calls(width, page_size, **short_options))
+            calls.extend(BlockMeanShortlistPlan.calls(width, page_size, **short_options))
         return calls
     return IndexerV41Plan.calls(
         width, page_size, candidates=candidates, candidate_blocks=candidate_blocks
@@ -272,13 +204,9 @@ class DeepseekV41TileLangAttention(DeepseekV4Attention):
         if (
             self.compressor is not None
             and self.indexer is not None
-            and _shortlist_enabled()
-            and not (
-                self.layer_id == self.candidate_source_layer
-                and os.environ.get("VLLM_DS41_PAGE_NATIVE_SOURCE") == "1"
-            )
+            and _lsa_enabled()
         ):
-            calls.append(prepare.call(_summary_kernel(), self._index_page))
+            calls.append(prepare.call(summarize_blocks, self._index_page))
         if self.compressor is not None:
             from .gemm import bf16_shards
 
@@ -308,15 +236,11 @@ class DeepseekV41TileLangAttention(DeepseekV4Attention):
             self._prepare(self.rotary_emb.cos_sin_cache.device)
         self._tilelang_plans = self._build_tilelang_plans()
         self._page_summary = (
-            _summary_kernel()(self._index_page)
+            summarize_blocks(self._index_page)
             if (
                 self.compressor is not None
                 and self.indexer is not None
-                and _shortlist_enabled()
-                and not (
-                    self.layer_id == self.candidate_source_layer
-                    and os.environ.get("VLLM_DS41_PAGE_NATIVE_SOURCE") == "1"
-                )
+                and _lsa_enabled()
             )
             else None
         )
@@ -356,8 +280,8 @@ class DeepseekV41TileLangAttention(DeepseekV4Attention):
                 (
                     "index K",
                     self.indexer.k_cache.kv_cache,
-                    self._index_page * _state_bytes()
-                    if _shortlist_enabled()
+                    self._index_page * STATE_BYTES
+                    if _lsa_enabled()
                     else page_bytes(self._index_page),
                 )
             )
@@ -475,12 +399,9 @@ class DeepseekV41TileLangAttention(DeepseekV4Attention):
     ):
         plans = self._tilelang()
         plan = plans.index[mode]
-        if mode == "decode" and isinstance(plan, PageShortlistPlan):
-            if os.environ.get("VLLM_DS41_PAGE_NATIVE_DECODE") == "1" or rows < int(
-                os.environ.get("VLLM_DS41_PAGE_DECODE_MIN_ROWS", "2")
-            ):
-                plan = plans.native_index[mode]
-        # Outside graph capture, the existing conservative prefill extent can
+        if mode == "decode" and isinstance(plan, PageShortlistPlan) and rows < 2:
+            plan = plans.native_index[mode]
+        # Outside graph capture, the existing conservative extent can
         # prove that every key would be kept. Avoid the entire coarse pipeline.
         if (
             score_width is not None
@@ -489,8 +410,7 @@ class DeepseekV41TileLangAttention(DeepseekV4Attention):
         ):
             short = getattr(plans, "source_short", None)
             if (
-                mode == "prefill"
-                and short is not None
+                short is not None
                 and score_width > short.budget * 64 + short.page - 1
             ):
                 plan = short

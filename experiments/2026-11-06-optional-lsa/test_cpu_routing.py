@@ -1,4 +1,4 @@
-"""CPU-only verification of default-off bit-identity, no downward quantization, and 32K-1M routing."""
+"""CPU-only verification of VLLM_DS41_LSA default-off bit-identity, no downward quantization, and 32K-1M routing."""
 import ast
 import json
 import os
@@ -67,11 +67,28 @@ class DummyQueryReusePlan(DummyShortlistBase):
 
 
 def check_ast_invariants():
-    tl_attn_tree = ast.parse((OVERLAY / "attention.py").read_text())
+    attn_text = (OVERLAY / "attention.py").read_text()
+    model_attn_text = (OVERLAY / "model_attention.py").read_text()
+    tl_attn_tree = ast.parse(attn_text)
     imported_modules = [
         n.module for n in ast.walk(tl_attn_tree) if isinstance(n, ast.ImportFrom) and n.module
     ]
-    assert "compact_shortlist" not in imported_modules, "compact_shortlist must not be imported in attention.py"
+    assert "compact_shortlist" not in imported_modules
+    assert "direct_shortlist" not in imported_modules
+    for legacy in (
+        "VLLM_DS41_PAGE_SHORTLIST",
+        "VLLM_DS41_PAGE_MODE",
+        "VLLM_DS41_PAGE_NATIVE_DECODE",
+        "VLLM_DS41_PAGE_NATIVE_SOURCE",
+        "VLLM_DS41_PAGE_SOURCE_BUDGET",
+        "VLLM_DS41_PAGE_DENSE_BUDGET",
+        "VLLM_DS41_PAGE_ROWS",
+        "VLLM_DS41_PAGE_DECODE_MIN_ROWS",
+        "compact8",
+        "page64",
+    ):
+        assert legacy not in attn_text, f"{legacy} still present in attention.py"
+        assert legacy not in model_attn_text, f"{legacy} still present in model_attention.py"
 
     bs_text = (OVERLAY / "block_shortlist.py").read_text()
     qr_text = (OVERLAY / "query_reuse.py").read_text()
@@ -114,6 +131,8 @@ def check_ast_invariants():
     ]
     assert threads_vals == [512], f"Expected threads=512 in summarize_blocks, got {threads_vals}"
     return {
+        "single_env_knob": "VLLM_DS41_LSA",
+        "no_legacy_page_env_vars": True,
         "no_compact_imports_in_attention": True,
         "no_downward_quantization_in_block8": True,
         "summarize_blocks_threads": 512,
@@ -129,12 +148,9 @@ def build_dispatch_harness():
         "os": os,
         "functools": __import__("functools"),
         "SimpleNamespace": types.SimpleNamespace,
-        "BLOCK_STATE_BYTES": 100,
-        "PAGE_STATE_BYTES": 73,
+        "STATE_BYTES": 100,
         "summarize_blocks": "summarize_blocks",
-        "summarize_pages": "summarize_pages",
         "BlockMeanShortlistPlan": DummyQueryReusePlan,
-        "DirectPageShortlistPlan": DummyShortlistBase,
         "PageShortlistPlan": DummyShortlistBase,
         "IndexerV41Plan": DummyNativePlan,
         "current_workspace_manager": lambda: types.SimpleNamespace(
@@ -143,13 +159,9 @@ def build_dispatch_harness():
         "retain_cuda_graph_capture_resource": lambda *args: None,
     }
     for fn_name in (
-        "_shortlist_enabled",
-        "_shortlist_mode",
-        "_state_bytes",
-        "_summary_kernel",
+        "_lsa_enabled",
         "_shortlist_options",
         "_source_short_options",
-        "_shortlist_class",
         "_index_plan",
         "_source_short_plan",
         "_index_chunk",
@@ -173,17 +185,16 @@ def build_dispatch_harness():
 
 def test_default_off(scope, model_scope):
     for env_val in (None, "0"):
-        os.environ.pop("VLLM_DS41_PAGE_SHORTLIST", None)
-        os.environ.pop("VLLM_DS41_PAGE_MODE", None)
+        os.environ.pop("VLLM_DS41_LSA", None)
         if env_val is not None:
-            os.environ["VLLM_DS41_PAGE_SHORTLIST"] = env_val
+            os.environ["VLLM_DS41_LSA"] = env_val
         scope["_index_plan"].cache_clear()
         scope["_source_short_plan"].cache_clear()
 
         dummy_cache = types.SimpleNamespace(block_size=128, kind="index", ratio=2, window=0, draft=False, prefix="layers.2")
         spec = model_scope["get_kv_cache_spec"](dummy_cache, None)
         assert spec["state_content_bytes"] == 68, f"Expected 68 bytes when off, got {spec['state_content_bytes']}"
-        assert not scope["_shortlist_enabled"]()
+        assert not scope["_lsa_enabled"]()
         for args in [(16384, 128, False, False), (524288, 128, False, False), (1048576, 256, False, True)]:
             plan = scope["_index_plan"](*args)
             assert isinstance(plan, DummyNativePlan)
@@ -191,32 +202,8 @@ def test_default_off(scope, model_scope):
     return {"default_off_state_bytes": 68, "default_off_all_native_plans": True}
 
 
-def test_compact8_rejected(scope, model_scope):
-    os.environ["VLLM_DS41_PAGE_SHORTLIST"] = "1"
-    os.environ["VLLM_DS41_PAGE_MODE"] = "compact8"
-    dummy_cache = types.SimpleNamespace(block_size=128, kind="index", ratio=2, window=0, draft=False, prefix="layers.2")
-    rejected_cache = False
-    try:
-        model_scope["get_kv_cache_spec"](dummy_cache, None)
-    except ValueError as exc:
-        rejected_cache = "downward-quantized compact8" in str(exc)
-    assert rejected_cache
-
-    rejected_mode = False
-    try:
-        scope["_shortlist_options"](524288, False, False)
-    except ValueError as exc:
-        rejected_mode = "downward-quantized compact8" in str(exc)
-    assert rejected_mode
-    os.environ.pop("VLLM_DS41_PAGE_MODE", None)
-    return {"compact8_rejected_in_cache_spec": True, "compact8_rejected_in_runtime_options": True}
-
-
 def test_opt_in_routing(scope, model_scope):
-    os.environ["VLLM_DS41_PAGE_SHORTLIST"] = "1"
-    os.environ.pop("VLLM_DS41_PAGE_MODE", None)
-    os.environ.pop("VLLM_DS41_PAGE_NATIVE_DECODE", None)
-    os.environ.pop("VLLM_DS41_PAGE_DECODE_MIN_ROWS", None)
+    os.environ["VLLM_DS41_LSA"] = "1"
     scope["_index_plan"].cache_clear()
     scope["_source_short_plan"].cache_clear()
 
@@ -224,7 +211,6 @@ def test_opt_in_routing(scope, model_scope):
     spec = model_scope["get_kv_cache_spec"](dummy_cache, None)
     assert spec["state_content_bytes"] == 100
 
-    # Build dense layer (layers 2, 8, 14) plans and source layer (layer 20) plans
     dense_short = scope["_index_plan"](16384, 128, False, False)
     dense_full = scope["_index_plan"](524288, 128, False, False)
     assert isinstance(dense_short, DummyQueryReusePlan) and dense_short.budget == 64 and dense_short.coarse_kind == "IndexerTopK"
@@ -235,35 +221,58 @@ def test_opt_in_routing(scope, model_scope):
     assert isinstance(source_full, DummyQueryReusePlan) and source_full.budget == 1024 and source_full.coarse_kind == "RawWideCoarseTopK"
     assert isinstance(source_short, DummyQueryReusePlan) and source_short.budget == 512 and source_short.coarse_kind == "DirectCoarseTopK"
 
-    # Simulate _index_chunk dispatch across 4K, 8K, 16K, 32K, 64K, 131K, 262K, 524K, 1M
-    recorded = []
-    def run_dispatch(plans_ns, mode, rows, score_width):
-        called = {}
-        class RecordingPlan:
-            def __init__(self, inner, label):
-                self.inner = inner
-                self.label = label
-                self.budget = getattr(inner, "budget", 0)
-                self.page = inner.page
-            def scratch_specs(self, r):
-                return self.inner.scratch_specs(r)
-            def run(self, *a, **kw):
-                called["label"] = self.label
-                called["budget"] = getattr(self.inner, "budget", None)
-                called["coarse"] = getattr(self.inner, "coarse_kind", "native")
-        # Wrap plans
-        wrapped = types.SimpleNamespace(
-            index={k: ( type("WrapShort", (DummyShortlistBase, RecordingPlan), {})(v, f"shortlist_{k}_{v.budget}") if isinstance(v, DummyShortlistBase) else RecordingPlan(v, f"native_{k}") ) for k, v in plans_ns.index.items()},
-            native_index={k: RecordingPlan(v, f"native_{k}") for k, v in plans_ns.native_index.items()},
-            source_short=(type("WrapShort", (DummyShortlistBase, RecordingPlan), {})(plans_ns.source_short, f"source_short_{plans_ns.source_short.budget}") if plans_ns.source_short else None),
+    def make_recording_plan(plan, label):
+        p = types.SimpleNamespace(
+            label=label,
+            kind=plan.kind,
+            width=plan.width,
+            page=plan.page,
+            budget=getattr(plan, "budget", None),
+            coarse_kind=getattr(plan, "coarse_kind", None),
+            scratch_specs=plan.scratch_specs,
         )
-        layer = types.SimpleNamespace(
-            _tilelang=lambda: wrapped,
-            indexer=types.SimpleNamespace(k_cache=types.SimpleNamespace(kv_cache="pool")),
+        return p
+
+    def wrap_shortlist(plan, label):
+        class Wrapped(DummyShortlistBase):
+            def __init__(self):
+                self.label = label
+                self.kind = plan.kind
+                self.width = plan.width
+                self.page = plan.page
+                self.budget = plan.budget
+                self.coarse_kind = plan.coarse_kind
+                self.scratch_specs = plan.scratch_specs
+
+        return Wrapped()
+
+    dense_full = wrap_shortlist(dense_full, "shortlist_full_64")
+    dense_short = wrap_shortlist(dense_short, "shortlist_short_64")
+    source_full = wrap_shortlist(source_full, "shortlist_source_1024")
+    source_short = wrap_shortlist(source_short, "source_short_512")
+
+    def run_dispatch(layer_plans, mode, rows, score_width):
+        called = {}
+        for d in (layer_plans.index, layer_plans.native_index):
+            for k, v in list(d.items()):
+                if not hasattr(v, "label"):
+                    d[k] = make_recording_plan(v, f"native_{k}")
+                v_obj = d[k]
+                v_obj.run = lambda *a, _v=v_obj, **kw: called.update(
+                    label=_v.label, width=_v.width, budget=_v.budget, coarse=_v.coarse_kind
+                )
+        if layer_plans.source_short is not None:
+            ss = layer_plans.source_short
+            ss.run = lambda *a, _v=ss, **kw: called.update(
+                label=_v.label, width=_v.width, budget=_v.budget, coarse=_v.coarse_kind
+            )
+        dummy_self = types.SimpleNamespace(
+            _tilelang=lambda: layer_plans,
+            indexer=types.SimpleNamespace(k_cache=types.SimpleNamespace(kv_cache="kv")),
             _active="active",
         )
         scope["_index_chunk"](
-            layer,
+            dummy_self,
             mode,
             rows,
             output_indices="out",
@@ -295,6 +304,7 @@ def test_opt_in_routing(scope, model_scope):
     )
 
     prefill_routes = {}
+    decode_r8_routes = {}
     for tokens in (4096, 8192, 16384, 32768, 65536, 131072, 262144, 524288, 1048576):
         dense_sw = tokens // 2
         dense_mode = "prefill_short" if dense_sw <= 16384 else "prefill"
@@ -302,40 +312,40 @@ def test_opt_in_routing(scope, model_scope):
         s_res = run_dispatch(source_plans, "prefill", 64, tokens)
         prefill_routes[str(tokens)] = {"dense_layers_2_8_14": d_res, "source_layer_20": s_res}
 
-    # Verify expected prefill routes:
-    # At 4K and 8K: dense_sw = 2048, 4096 <= 4223 -> native
+        dense_dec_mode = "prefill_short" if dense_sw <= 16384 else "decode"
+        d_dec_res = run_dispatch(dense_plans, dense_dec_mode, 8, dense_sw)
+        s_dec_res = run_dispatch(source_plans, "decode", 8, tokens)
+        decode_r8_routes[str(tokens)] = {"dense_layers_2_8_14": d_dec_res, "source_layer_20": s_dec_res}
+
     assert prefill_routes["4096"]["dense_layers_2_8_14"]["label"] == "native_prefill_short"
     assert prefill_routes["8192"]["dense_layers_2_8_14"]["label"] == "native_prefill_short"
-    # At 16K and 32K: dense_sw = 8192, 16384 -> shortlist_prefill_short_64!
-    assert prefill_routes["16384"]["dense_layers_2_8_14"]["label"] == "shortlist_prefill_short_64"
-    assert prefill_routes["32768"]["dense_layers_2_8_14"]["label"] == "shortlist_prefill_short_64"
+    assert prefill_routes["16384"]["dense_layers_2_8_14"]["label"] == "shortlist_short_64"
+    assert prefill_routes["32768"]["dense_layers_2_8_14"]["label"] == "shortlist_short_64"
     assert prefill_routes["32768"]["source_layer_20"]["label"] == "native_prefill"
-    # At 64K: dense uses shortlist_prefill_64, source uses source_short_512 (DirectCoarseTopK)!
-    assert prefill_routes["65536"]["dense_layers_2_8_14"]["label"] == "shortlist_prefill_64"
-    assert prefill_routes["65536"]["source_layer_20"]["label"] == "source_short_512"
-    assert prefill_routes["65536"]["source_layer_20"]["coarse"] == "DirectCoarseTopK"
-    # At 131K..1M: dense uses shortlist_prefill_64, source uses shortlist_prefill_1024 (RawWideCoarseTopK)!
-    for tok in ("131072", "262144", "524288", "1048576"):
-        assert prefill_routes[tok]["dense_layers_2_8_14"]["label"] == "shortlist_prefill_64"
-        assert prefill_routes[tok]["source_layer_20"]["label"] == "shortlist_prefill_1024"
-        assert prefill_routes[tok]["source_layer_20"]["coarse"] == "RawWideCoarseTopK"
+    assert decode_r8_routes["32768"]["dense_layers_2_8_14"]["label"] == "shortlist_short_64"
+    assert decode_r8_routes["32768"]["source_layer_20"]["label"] == "native_decode"
 
-    # Verify decode routes:
-    decode_routes = {}
-    for rows in (1, 2, 6, 8, 24, 64):
-        d_dec = run_dispatch(dense_plans, "decode", rows, None)
-        s_dec = run_dispatch(source_plans, "decode", rows, None)
-        decode_routes[str(rows)] = {"dense_layers_2_8_14": d_dec, "source_layer_20": s_dec}
-    assert decode_routes["1"]["dense_layers_2_8_14"]["label"] == "native_decode"
-    assert decode_routes["1"]["source_layer_20"]["label"] == "native_decode"
-    for r_str in ("2", "6", "8", "24", "64"):
-        assert decode_routes[r_str]["dense_layers_2_8_14"]["label"] == "shortlist_decode_64"
-        assert decode_routes[r_str]["source_layer_20"]["label"] == "shortlist_decode_1024"
+    assert prefill_routes["65536"]["dense_layers_2_8_14"]["label"] == "shortlist_full_64"
+    assert prefill_routes["65536"]["source_layer_20"]["label"] == "source_short_512"
+    assert decode_r8_routes["65536"]["dense_layers_2_8_14"]["label"] == "shortlist_full_64"
+    assert decode_r8_routes["65536"]["source_layer_20"]["label"] == "source_short_512"
+
+    for tok in ("131072", "262144", "524288", "1048576"):
+        assert prefill_routes[tok]["dense_layers_2_8_14"]["label"] == "shortlist_full_64"
+        assert prefill_routes[tok]["source_layer_20"]["label"] == "shortlist_source_1024"
+        assert decode_r8_routes[tok]["dense_layers_2_8_14"]["label"] == "shortlist_full_64"
+        assert decode_r8_routes[tok]["source_layer_20"]["label"] == "shortlist_source_1024"
+
+    # Single-row decode always uses native
+    d_r1 = run_dispatch(dense_plans, "decode", 1, 16384)
+    s_r1 = run_dispatch(source_plans, "decode", 1, 32768)
+    assert d_r1["label"] == "native_decode"
+    assert s_r1["label"] == "native_decode"
 
     return {
         "opt_in_state_bytes": 100,
         "prefill_routes": prefill_routes,
-        "decode_routes": decode_routes,
+        "decode_r8_routes": decode_r8_routes,
     }
 
 
@@ -343,13 +353,11 @@ def main():
     ast_res = check_ast_invariants()
     scope, model_scope = build_dispatch_harness()
     def_res = test_default_off(scope, model_scope)
-    comp_res = test_compact8_rejected(scope, model_scope)
     opt_res = test_opt_in_routing(scope, model_scope)
     report = {
         "passed": True,
         "ast_invariants": ast_res,
         "default_off": def_res,
-        "compact8_rejection": comp_res,
         "opt_in_routing": opt_res,
     }
     out_path = EXP / "runs/local/cpu-routing-check.json"

@@ -62,8 +62,6 @@ def main():
     sha = lambda path: hashlib.sha256(path.read_bytes()).hexdigest()
     replay = json.loads(args.replay_receipt.read_text())
     assert replay["passed"]
-    os.environ.pop("VLLM_DS41_PAGE_NATIVE_DECODE", None)
-    os.environ["VLLM_DS41_PAGE_DECODE_MIN_ROWS"] = "2"
     report = {
         "passed": False,
         "state_bytes": STATE_BYTES,

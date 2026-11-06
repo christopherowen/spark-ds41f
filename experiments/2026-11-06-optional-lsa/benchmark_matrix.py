@@ -167,26 +167,20 @@ def run_synthetic_length_matrix(lengths_tokens=(32768, 65536, 131072, 262144, 52
                     )
                     prefill_route = f"QueryReusePlan(width={plan_width}, budget=1024, RawWideCoarseTopK)"
 
-            lsa_decode_plan = QueryReusePlan(
-                1048576 if source else 524288,
-                page,
-                candidate_blocks=source,
-                budget=1024 if source else 64,
-                row_cap=256,
-            )
+            lsa_decode_plan = lsa_prefill_plan
             native_decode_plan = (
                 native_plan
                 if plan_width == (1048576 if source else 524288)
                 else IndexerV41Plan(1048576 if source else 524288, page, candidate_blocks=source)
             )
 
-            layer_res = {"score_width": score_width, "prefill_route": prefill_route, "modes": {}}
-            for mode_name, rows, n_plan, l_plan, width_for_table in [
-                ("prefill_r64", 64, native_plan, lsa_prefill_plan, plan_width),
-                ("decode_r1", 1, native_decode_plan, native_decode_plan, 1048576 if source else 524288),
-                ("decode_r8", 8, native_decode_plan, lsa_decode_plan, 1048576 if source else 524288),
-                ("decode_r24", 24, native_decode_plan, lsa_decode_plan, 1048576 if source else 524288),
-                ("decode_r96", 96, native_decode_plan, lsa_decode_plan, 1048576 if source else 524288),
+            layer_res = {"score_width": score_width, "route": prefill_route, "modes": {}}
+            for mode_name, rows, n_plan, l_plan, n_table_w, l_table_w in [
+                ("prefill_r64", 64, native_plan, lsa_prefill_plan, plan_width, plan_width),
+                ("decode_r1", 1, native_decode_plan, native_decode_plan, 1048576 if source else 524288, 1048576 if source else 524288),
+                ("decode_r8", 8, native_decode_plan, lsa_decode_plan, 1048576 if source else 524288, plan_width),
+                ("decode_r24", 24, native_decode_plan, lsa_decode_plan, 1048576 if source else 524288, plan_width),
+                ("decode_r96", 96, native_decode_plan, lsa_decode_plan, 1048576 if source else 524288, plan_width),
             ]:
                 q = torch.randint(
                     0, 256, (rows, 32, 64), dtype=torch.uint8, device="cuda", generator=g
@@ -195,25 +189,33 @@ def run_synthetic_length_matrix(lengths_tokens=(32768, 65536, 131072, 262144, 52
                     123, 129, (rows, 32, 4), dtype=torch.uint8, device="cuda", generator=g
                 )
                 w = (torch.randn(rows, 32, device="cuda", generator=g) / 64).bfloat16()
-                table = torch.zeros(
-                    rows, width_for_table // page, dtype=torch.int32, device="cuda"
+                n_table = torch.zeros(
+                    rows, n_table_w // page, dtype=torch.int32, device="cuda"
                 )
-                table[:, :num_pages] = torch.arange(
+                n_table[:, :num_pages] = torch.arange(
                     num_pages, dtype=torch.int32, device="cuda"
                 ).unsqueeze(0)
+                l_table = (
+                    n_table
+                    if l_table_w == n_table_w
+                    else n_table[:, : l_table_w // page].contiguous()
+                )
                 lengths = torch.full(
                     (rows,), score_width, dtype=torch.int32, device="cuda"
                 )
-                active = torch.tensor(
-                    [width_for_table], dtype=torch.int32, device="cuda"
+                n_active = torch.tensor(
+                    [n_table_w], dtype=torch.int32, device="cuda"
+                )
+                l_active = torch.tensor(
+                    [l_table_w], dtype=torch.int32, device="cuda"
                 )
 
                 n_stats, n_out, _, _ = measure_plan(
-                    n_plan, q, s, w, native_pool, table, lengths, active, source
+                    n_plan, q, s, w, native_pool, n_table, lengths, n_active, source
                 )
                 use_pool = native_pool if l_plan is n_plan else lsa_pool
                 l_stats, l_out, _, _ = measure_plan(
-                    l_plan, q, s, w, use_pool, table, lengths, active, source
+                    l_plan, q, s, w, use_pool, l_table, lengths, l_active, source
                 )
                 if l_plan is n_plan:
                     torch.testing.assert_close(l_out, n_out, atol=0, rtol=0)
@@ -254,6 +256,10 @@ def run_synthetic_length_matrix(lengths_tokens=(32768, 65536, 131072, 262144, 52
                     "prefill_r64_speedup": entry["combined_4layer"]["prefill_r64"]["speedup"],
                     "decode_r8_speedup": entry["combined_4layer"]["decode_r8"]["speedup"],
                     "decode_r24_speedup": entry["combined_4layer"]["decode_r24"]["speedup"],
+                    "decode_r96_speedup": entry["combined_4layer"]["decode_r96"]["speedup"],
+                    "dense_modes": entry["dense_layer"]["modes"],
+                    "source_modes": entry["source_layer"]["modes"],
+                    "combined_4layer": entry["combined_4layer"],
                 }
             ),
             flush=True,
@@ -284,7 +290,7 @@ def main():
         },
     }
     args.out.write_text(json.dumps(report, indent=2) + "\n")
-    print("RESULT " + json.dumps({"passed": True, "boot": args.boot}), flush=True)
+    print("RESULT " + json.dumps(report), flush=True)
 
 
 if __name__ == "__main__":
