@@ -1,0 +1,423 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Christopher Owen <3221756+christopherowen@users.noreply.github.com>
+Date: Thu, 5 Nov 2026 22:57:54 +0000
+Subject: [PATCH 735/743] perf: replay DSpark drafter metadata inside query
+ graphs
+
+Upstream base: local-inference-lab/vllm 19f2c20ed4d64ae22bd009ceacadd85e2a81e354
+Experiment base: candidate-38 1f33102547e4da5c64712390604695d1abd577c4
+
+Capture the existing DS41 integer metadata builder before the DFlash query
+forward. Reuse the fixed graph shape and persistent device input/output
+buffers so FULL replay can omit its eager Python metadata rebuild.
+Context parallelism, model-state overrides and unsupported builders retain
+that eager rebuild. No target verification, sampling, collective, scheduler
+or copy-draft budget changes are intended.
+
+Quality implications: the metadata kernel and its integer arithmetic are
+unchanged. GPU graph equivalence, rank agreement, sampled output, cancellation,
+streaming and two-boot performance remain qualification gates; no speedup is
+claimed. Added CPU replay-order/guard regressions and a frozen-cache GPU
+regression for changed lengths, padding and slot reuse.
+
+Tests: 35 host graph tests passed in a CPU-only candidate-38 container;
+focused new coverage: 9 passed, 3 CUDA tests skipped. Full pre-commit checks
+pass after adapting two test calls to accelerator APIs. Preserve exact GPU
+validation requirements in the companion deployment experiment.
+
+Upstream status: experimental source-fork draft, not submitted to canonical
+upstream; no deployment or promotion approval.
+
+Signed-off-by: Christopher Owen <3221756+christopherowen@users.noreply.github.com>
+---
+ .../attention/test_b12x_v41_ced_metadata.py   | 84 ++++++++++++++++-
+ tests/v1/cudagraph/test_cudagraph_manager.py  | 91 ++++++++++++++++++-
+ vllm/models/deepseek_v4_1/sparse_mla.py       | 33 ++++++-
+ .../gpu/spec_decode/dflash/cudagraph.py       | 48 ++++++++--
+ .../gpu/spec_decode/dflash/speculator.py      | 14 ++-
+ 5 files changed, 247 insertions(+), 23 deletions(-)
+
+diff --git a/tests/v1/attention/test_b12x_v41_ced_metadata.py b/tests/v1/attention/test_b12x_v41_ced_metadata.py
+index 6462a05f1..8256a0eee 100644
+--- a/tests/v1/attention/test_b12x_v41_ced_metadata.py
++++ b/tests/v1/attention/test_b12x_v41_ced_metadata.py
+@@ -23,6 +23,88 @@ from vllm.models.deepseek_v4_1.sparse_mla import DeepseekV41B12xMetadata
+ cuda = pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
+ 
+ 
++@cuda
++@pytest.mark.parametrize("ratio,circular", [(1, False), (4, False), (1, True)])
++def test_draft_metadata_graph_matches_eager_after_slot_reuse(
++    monkeypatch, ratio, circular
++):
++    """Replay refreshes every readable integer row after padding and request reuse,
++    with the kernel cache frozen before capture."""
++    import importlib
++
++    import tilelang.cache
++
++    from vllm.models.deepseek_v4_1.sparse_mla import DeepseekV41B12xMetadataBuilder
++    from vllm.models.deepseek_v4_1.tilelang import metadata, prepare
++
++    cache_module = importlib.import_module(tilelang.cache.freeze.__module__)
++    monkeypatch.setattr(cache_module, "_frozen_reason", None)
++    names = (
++        "starts",
++        "request_positions",
++        "counts",
++        "positions",
++        "reqs",
++        "slots",
++        "lengths",
++    )
++    shapes = (5, 4, 2, 128, 128, 128, 128)
++    dtypes = (
++        torch.int32,
++        torch.int64,
++        torch.int32,
++        torch.int64,
++        torch.int32,
++        torch.int64,
++        torch.int32,
++    )
++
++    def builder():
++        obj = DeepseekV41B12xMetadataBuilder.__new__(DeepseekV41B12xMetadataBuilder)
++        obj.page, obj.ratio, obj.circular = 128, ratio, circular
++        for name, shape, dtype in zip(names, shapes, dtypes):
++            setattr(obj, name, torch.full((shape,), -101, dtype=dtype, device="cuda"))
++        return obj
++
++    captured, eager = builder(), builder()
++    starts = torch.arange(5, dtype=torch.int32, device="cuda") * 5
++    seq = torch.ones(4, dtype=torch.int32, device="cuda") * 10
++    table = torch.ones((4, 4), dtype=torch.int32, device="cuda")
++    slots = torch.ones(20, dtype=torch.int64, device="cuda")
++    cm = SimpleNamespace(
++        query_start_loc=starts,
++        seq_lens=seq,
++        slot_mapping=slots,
++        num_reqs=4,
++        num_actual_tokens=20,
++    )
++    metadata.builder_kernel(4, 128, ratio, circular)
++    captured._build_tilelang(cm, table)
++    torch.accelerator.synchronize()
++    prepare.freeze("drafter metadata replay test")
++    graph = torch.cuda.CUDAGraph()
++    with torch.cuda.graph(graph):
++        captured.prepare_cudagraph_replay(starts, seq, table, slots, 4, 20)
++
++    for lengths, blocks in (
++        ([133, 301, 75, 202], [1, 5, 9, 13]),
++        ([134, 0, 76, 0], [1, 0, 9, 0]),
++        ([135, 7, 77, 51], [1, 17, 9, 21]),
++    ):
++        seq.copy_(torch.tensor(lengths, dtype=torch.int32))
++        table.copy_(torch.tensor(blocks, dtype=torch.int32)[:, None].expand(4, 4))
++        graph.replay()
++        eager._build_tilelang(cm, table)
++        for name in names:
++            assert torch.equal(getattr(captured, name), getattr(eager, name)), name
++        expected = [
++            p
++            for length in lengths
++            for p in (range(length - 5, length) if length else [-1] * 5)
++        ]
++        assert captured.positions[:20].tolist() == expected
++
++
+ def test_boundary_is_full_resolution_source_after_encoder():
+     config = SimpleNamespace(
+         num_hidden_layers=40,
+@@ -531,7 +613,7 @@ def test_packing_trailing_dimensions_invalid_rows_and_scatter(transpose):
+ @cuda
+ def test_scaled_row_address_above_signed_int32():
+     # High row IDs must be converted BEFORE multiplying the row/page stride.
+-    if torch.cuda.mem_get_info()[0] < 3 * 1024**3:
++    if torch.accelerator.memory.get_memory_info()[0] < 3 * 1024**3:
+         pytest.skip("Needs a 2 GiB address-span allocation")
+     source = torch.empty((2**23 + 2, 256), dtype=torch.uint8, device="cuda")
+     source[2**23 + 1].fill_(173)
+diff --git a/tests/v1/cudagraph/test_cudagraph_manager.py b/tests/v1/cudagraph/test_cudagraph_manager.py
+index 28d685b38..5804144de 100644
+--- a/tests/v1/cudagraph/test_cudagraph_manager.py
++++ b/tests/v1/cudagraph/test_cudagraph_manager.py
+@@ -26,6 +26,92 @@ from vllm.v1.worker.gpu.pcp_manager import PCPManager
+ pytestmark = pytest.mark.cpu_test
+ 
+ 
++@pytest.mark.parametrize("mode", [CUDAGraphMode.FULL, CUDAGraphMode.PIECEWISE])
++@pytest.mark.parametrize("enabled", [False, True])
++def test_dflash_metadata_refresh_precedes_query_and_keeps_live_inputs(
++    monkeypatch, mode, enabled
++):
++    """Only opted-in FULL graphs refresh metadata, from the same mutable buffers."""
++    from vllm.v1.worker.gpu.spec_decode.dflash import cudagraph
++
++    inputs = SimpleNamespace(
++        query_start_loc=torch.arange(5, dtype=torch.int32) * 5,
++        seq_lens=torch.tensor([11, 21, 0, 0], dtype=torch.int32),
++    )
++    tables = SimpleNamespace(
++        input_block_tables=[torch.ones(4, 2, dtype=torch.int32)],
++        slot_mappings=torch.ones(1, 20, dtype=torch.int64),
++    )
++    events: list[object] = []
++
++    def refresh(starts, seq, table, slots, nr, nt):
++        assert (nr, nt) == (2, 10)
++        assert starts.shape == (3,) and seq.shape == (2,)
++        assert table.shape == (2, 2) and slots.shape == (10,)
++        events.append(("refresh", seq[1].item(), table[1, 0].item(), slots[5].item()))
++
++    group = SimpleNamespace(
++        get_metadata_builder=lambda: SimpleNamespace(prepare_cudagraph_replay=refresh)
++    )
++    monkeypatch.setattr(
++        cudagraph, "_prepare_dflash_inputs_to_capture", lambda *a, **kw: ({}, {})
++    )
++
++    def capture(self, create_forward, progress_bar_desc):
++        desc = BatchExecutionDescriptor(mode, 10, 2, 5)
++        forward = create_forward(desc, warmup=False)
++        forward(mode)
++        # A completed/cancelled request's slot is reused before the next query.
++        inputs.seq_lens[1] = 7
++        tables.input_block_tables[0][1, 0] = 3
++        tables.slot_mappings[0, 5] = 17
++        forward(mode)
++
++    monkeypatch.setattr(cudagraph.CudaGraphManager, "capture", capture)
++    manager = cudagraph.DFlashCudaGraphManager.__new__(cudagraph.DFlashCudaGraphManager)
++    manager.max_num_reqs, manager.dp_size = 4, 1
++    manager.capture(
++        lambda *a: events.append("query"),
++        inputs,
++        tables,
++        [[group]],
++        None,
++        1024,
++        causal=False,
++        capture_attn_metadata=enabled,
++    )
++    assert events == (
++        [("refresh", 21, 1, 1), "query", ("refresh", 7, 3, 17), "query"]
++        if enabled and mode == CUDAGraphMode.FULL
++        else ["query", "query"]
++    )
++
++
++@pytest.mark.parametrize("guard", [None, "draft_cp", "table_cp", "model", "builder"])
++def test_dflash_metadata_replay_retains_eager_fallback_guards(guard):
++    from vllm.v1.worker.gpu.model_states.interface import ModelState
++    from vllm.v1.worker.gpu.spec_decode.dflash.speculator import DFlashSpeculator
++
++    class Model:
++        prepare_draft_attn_metadata = ModelState.prepare_draft_attn_metadata
++
++    if guard == "model":
++        Model.prepare_draft_attn_metadata = lambda *a, **kw: {}
++    builder = SimpleNamespace(prepare_cudagraph_replay=lambda *a: None)
++    groups = [[SimpleNamespace(get_metadata_builder=lambda: builder)]]
++    if guard == "builder":
++        groups[0].append(SimpleNamespace(get_metadata_builder=lambda: object()))
++    speculator = SimpleNamespace(
++        draft_cp_size=2 if guard == "draft_cp" else 1,
++        block_tables=SimpleNamespace(cp_size=2 if guard == "table_cp" else 1),
++        model_state=Model(),
++        attn_groups=groups,
++    )
++    assert DFlashSpeculator._compute_full_cg_needs_attn_metadata_build(speculator) == (
++        guard is not None
++    )
++
++
+ def test_exact_single_request_prefill_descriptor_does_not_pad_other_batches(
+     monkeypatch,
+ ):
+@@ -542,10 +628,7 @@ def test_varlen_decode_captures_dense_low_concurrency_product(monkeypatch):
+             for num_reqs in (1, 2)
+             for num_tokens in range(num_reqs, num_reqs * decode_query_len + 1)
+         ),
+-        *(
+-            (num_reqs, num_reqs * decode_query_len)
+-            for num_reqs in (3, 4)
+-        ),
++        *((num_reqs, num_reqs * decode_query_len) for num_reqs in (3, 4)),
+     }
+     captured_shapes = {(desc.num_reqs, desc.num_tokens) for desc in full_descs}
+     assert dense_shapes <= captured_shapes
+diff --git a/vllm/models/deepseek_v4_1/sparse_mla.py b/vllm/models/deepseek_v4_1/sparse_mla.py
+index 4e494875f..a01247b64 100644
+--- a/vllm/models/deepseek_v4_1/sparse_mla.py
++++ b/vllm/models/deepseek_v4_1/sparse_mla.py
+@@ -112,13 +112,36 @@ class DeepseekV41B12xMetadataBuilder(AttentionMetadataBuilder):
+     def _build_tilelang(self, cm, table) -> None:
+         """The step's request starts and positions, then each token's request,
+         position, slot and visible length, in one launch."""
+-        from vllm.models.deepseek_v4_1.tilelang import metadata as tl_metadata
+-
+-        tl_metadata.builder(
++        self.prepare_cudagraph_replay(
+             cm.query_start_loc,
+             cm.seq_lens,
+             table,
+             cm.slot_mapping,
++            cm.num_reqs,
++            cm.num_actual_tokens,
++        )
++
++    def prepare_cudagraph_replay(
++        self,
++        query_start_loc: torch.Tensor,
++        seq_lens: torch.Tensor,
++        block_table: torch.Tensor,
++        slot_mapping: torch.Tensor,
++        num_reqs: int,
++        num_tokens: int,
++    ) -> None:
++        """Refresh captured metadata from device inputs at a fixed graph shape.
++
++        This hook launches only the already prepared integer kernel; it neither
++        reads host sequence lengths nor replaces a captured output buffer.
++        """
++        from vllm.models.deepseek_v4_1.tilelang import metadata as tl_metadata
++
++        tl_metadata.builder(
++            query_start_loc,
++            seq_lens,
++            block_table,
++            slot_mapping,
+             self.starts,
+             self.request_positions,
+             self.counts,
+@@ -126,8 +149,8 @@ class DeepseekV41B12xMetadataBuilder(AttentionMetadataBuilder):
+             self.reqs,
+             self.slots,
+             self.lengths,
+-            cm.num_reqs,
+-            cm.num_actual_tokens,
++            num_reqs,
++            num_tokens,
+             page=self.page,
+             ratio=self.ratio,
+             circular=self.circular,
+diff --git a/vllm/v1/worker/gpu/spec_decode/dflash/cudagraph.py b/vllm/v1/worker/gpu/spec_decode/dflash/cudagraph.py
+index 725714fcd..4dd728c21 100644
+--- a/vllm/v1/worker/gpu/spec_decode/dflash/cudagraph.py
++++ b/vllm/v1/worker/gpu/spec_decode/dflash/cudagraph.py
+@@ -1,6 +1,7 @@
+ # SPDX-License-Identifier: Apache-2.0
+ # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+ from collections.abc import Callable, Mapping
++from functools import partial
+ 
+ import torch
+ 
+@@ -84,6 +85,8 @@ class DFlashCudaGraphManager(CudaGraphManager):
+         max_model_len: int,
+         causal: bool | Mapping[int, bool],
+         progress_bar_desc: str = "Capturing CUDA graphs",
++        *,
++        capture_attn_metadata: bool = False,
+     ) -> None:
+         def create_forward_fn(
+             desc: BatchExecutionDescriptor,
+@@ -109,13 +112,42 @@ class DFlashCudaGraphManager(CudaGraphManager):
+             )
+             attn_metadata, slot_mappings = attn_state
+ 
+-            return lambda cg_mode: forward_fn(
+-                num_reqs,
+-                num_tokens,
+-                attn_metadata,
+-                slot_mappings,
+-                num_tokens_across_dp,
+-                cg_mode,
+-            )
++            metadata_updates = []
++            if capture_attn_metadata and desc.cg_mode == CUDAGraphMode.FULL:
++                for group_id, groups in enumerate(attn_groups):
++                    for group in groups:
++                        prepare = getattr(
++                            group.get_metadata_builder(),
++                            "prepare_cudagraph_replay",
++                            None,
++                        )
++                        if callable(prepare):
++                            metadata_updates.append(
++                                partial(
++                                    prepare,
++                                    input_buffers.query_start_loc[: num_reqs + 1],
++                                    input_buffers.seq_lens[:num_reqs],
++                                    block_tables.input_block_tables[group_id][
++                                        :num_reqs
++                                    ],
++                                    block_tables.slot_mappings[group_id, :num_tokens],
++                                    num_reqs,
++                                    num_tokens,
++                                )
++                            )
++
++            def forward(cg_mode: CUDAGraphMode) -> None:
++                for update in metadata_updates:
++                    update()
++                forward_fn(
++                    num_reqs,
++                    num_tokens,
++                    attn_metadata,
++                    slot_mappings,
++                    num_tokens_across_dp,
++                    cg_mode,
++                )
++
++            return forward
+ 
+         super().capture(create_forward_fn, progress_bar_desc)
+diff --git a/vllm/v1/worker/gpu/spec_decode/dflash/speculator.py b/vllm/v1/worker/gpu/spec_decode/dflash/speculator.py
+index c3d83bf25..758b8c5df 100644
+--- a/vllm/v1/worker/gpu/spec_decode/dflash/speculator.py
++++ b/vllm/v1/worker/gpu/spec_decode/dflash/speculator.py
+@@ -184,6 +184,7 @@ class DFlashSpeculator(DraftModelSpeculator):
+             self.max_model_len,
+             causal=self._group_causal,
+             progress_bar_desc=f"Capturing {self._speculator_name.lower()} CUDA graphs",
++            capture_attn_metadata=not self._full_cg_needs_attn_metadata_build,
+         )
+         # Only V4.1 DSpark supplies this hook. Other draft models retain their
+         # existing eager context path and graph policy.
+@@ -482,6 +483,10 @@ class DFlashSpeculator(DraftModelSpeculator):
+         for groups in self.attn_groups:
+             for group in groups:
+                 builder = group.get_metadata_builder()
++                if callable(getattr(builder, "prepare_cudagraph_replay", None)):
++                    # The query graph refreshes this builder's device buffers
++                    # before attention reads them, including padded requests.
++                    continue
+                 if (
+                     type(builder).__name__ != "FlashAttentionMetadataBuilder"
+                     or getattr(builder, "aot_schedule", True)
+@@ -744,10 +749,8 @@ class DFlashSpeculator(DraftModelSpeculator):
+             cp_size = self.draft_cp_size
+             cp_interleave = self.draft_cp_interleave
+         else:
+-            cp_rank, cp_size, cp_interleave = (
+-                self.block_tables.get_group_cp_parameters(
+-                    self.draft_kv_cache_group_id
+-                )
++            cp_rank, cp_size, cp_interleave = self.block_tables.get_group_cp_parameters(
++                self.draft_kv_cache_group_id
+             )
+         if len(self.draft_kv_cache_group_ids) == 1:
+             gid = self.draft_kv_cache_group_ids[0]
+@@ -831,7 +834,8 @@ class DFlashSpeculator(DraftModelSpeculator):
+                     for slots in self._context_slot_mappings
+                 ]
+             # Each layer uses the context slots of its own KV-cache group. V4.1 can
+-            # replay bounded decode context graphs; compact prefills use eager projection.
++            # replay bounded decode context graphs; compact prefills use eager
++            # projection.
+             # Dummy runs reserve workspace without clobbering real cache entries.
+             if dummy_run:
+                 context_slots: torch.Tensor | list[torch.Tensor | None] | None = None

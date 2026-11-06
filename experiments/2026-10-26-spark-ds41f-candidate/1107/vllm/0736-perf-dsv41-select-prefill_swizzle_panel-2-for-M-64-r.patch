@@ -1,0 +1,130 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Christopher Owen <3221756+christopherowen@users.noreply.github.com>
+Date: Fri, 6 Nov 2026 11:01:32 +0000
+Subject: [PATCH 736/743] perf(dsv41): select prefill_swizzle_panel=2 for M=64
+ routed MoE GEMM
+
+Honor swizzle_panel in grouped_fp8_fp4_gemm and set prefill_swizzle_panel=2 as
+the default for M=64 prefill routed MoE grouped GEMM while keeping decode
+(M=16) and mid (M=32) tiers at swizzle_panel=0.
+
+Upstream-base: 19f2c20ed4d64ae22bd009ceacadd85e2a81e354
+Quality: exact bit parity with panel 0 across all 20 GPU equality cases and
+38x2 paired screen cases; batch invariance verified on first 17 rows.
+Tests: 24 native GPU pytest cases across 2 boots + 2-boot paired screen on DGX4.
+---
+ .../moe/test_deepseek_v41_tilelang_moe.py     | 31 +++++++++++++++++--
+ vllm/models/deepseek_v4_1/tilelang/moe.py     | 13 +++++---
+ 2 files changed, 36 insertions(+), 8 deletions(-)
+
+diff --git a/tests/kernels/moe/test_deepseek_v41_tilelang_moe.py b/tests/kernels/moe/test_deepseek_v41_tilelang_moe.py
+index 281bcd09c..54e69763d 100644
+--- a/tests/kernels/moe/test_deepseek_v41_tilelang_moe.py
++++ b/tests/kernels/moe/test_deepseek_v41_tilelang_moe.py
+@@ -608,11 +608,14 @@ def test_prefill_tiles_give_the_decode_tiles_bits(
+     assert torch.equal(tiered_out.view(torch.int16), outs[32].view(torch.int16))
+ 
+ 
+-@pytest.mark.parametrize("hidden, intermediate", [(512, 256), (384, 576), (384, 768)])
++@pytest.mark.parametrize(
++    "hidden, intermediate, num_experts",
++    [(512, 256, 32), (384, 576, 32), (384, 768, 32), (5120, 576, 8), (5120, 768, 8)],
++)
+ @pytest.mark.parametrize("rows", [171, 500])
+ @pytest.mark.parametrize("idx_dtype", [torch.int32, torch.int64])
+ def test_prefill_swizzle_panel_matches_unswizzled_bits(
+-    rows, idx_dtype, hidden, intermediate, num_experts=32, topk=6
++    rows, idx_dtype, hidden, intermediate, num_experts, topk=6
+ ):
+     """Swizzling the prefill grouped-GEMM CTA grid across ``prefill_swizzle_panel=3``
+     consecutive M-tiles changes only CTA scheduling order and keeps every output
+@@ -625,7 +628,7 @@ def test_prefill_swizzle_panel_matches_unswizzled_bits(
+     ids, route_weights = _routes(rows, num_experts, topk, 18, idx_dtype)
+     tokens = cast_mxfp8(x)
+     outs = {}
+-    for swizzle_panel in (0, 3):
++    for swizzle_panel in (0, 2, 3):
+         plan = _plan(
+             num_experts,
+             topk,
+@@ -638,6 +641,7 @@ def test_prefill_swizzle_panel_matches_unswizzled_bits(
+         weights = plan.prepare_weights(w13_packed, w13_sf, w2_packed, w2_sf)
+         outs[swizzle_panel] = torch.empty_like(x)
+         plan.run(tokens, ids, route_weights, weights, outs[swizzle_panel])
++    assert torch.equal(outs[2].view(torch.int16), outs[0].view(torch.int16))
+     assert torch.equal(outs[3].view(torch.int16), outs[0].view(torch.int16))
+ 
+ 
+@@ -836,6 +840,27 @@ def test_narrow_and_wide_codes_give_the_uncoded_gemm_bits(rows, n, k, gather):
+     )
+ 
+ 
++@pytest.mark.parametrize("intermediate", [576, 768])
++@pytest.mark.parametrize("stage", ["gate_up", "down"])
++def test_grouped_gemm_emits_requested_prefill_swizzle(intermediate, stage):
++    """Prefill defaults to panel 2, keeps decode/mid unswizzled, and honors explicit panels."""
++    sources = {}
++    for panel in (None, 0, 2, 3):
++        options = {} if panel is None else {"prefill_swizzle_panel": panel}
++        plan = MoeExpertsV41Plan(384, 6, 5120, intermediate, **options)
++        calls = plan.kernels()
++        for key in ("gate_up", "down", "late_gate_up", "late_down", "mid_gate_up", "mid_down"):
++            _, _, d_kwargs = calls[key]
++            assert d_kwargs.get("swizzle_panel", 0) == 0
++        factory, args, kwargs = calls[f"prefill_{stage}"]
++        source = factory(*args, **kwargs).get_kernel_source()
++        assert ("rasterization2DRow<2>" in source) == (panel in (None, 2))
++        assert ("rasterization2DRow<3>" in source) == (panel == 3)
++        sources[panel] = source
++    assert sources[None] == sources[2]
++    assert sources[0] != sources[2]
++
++
+ def test_grouped_fp8_fp4_gemm_defers_barrier_init_and_down_stages():
+     """Empty CTAs return before barrier initialization, and decode down GEMMs use
+     two stages (2 CTAs/SM) with identical bits to three stages."""
+diff --git a/vllm/models/deepseek_v4_1/tilelang/moe.py b/vllm/models/deepseek_v4_1/tilelang/moe.py
+index fc4eb8ff7..3dc403366 100644
+--- a/vllm/models/deepseek_v4_1/tilelang/moe.py
++++ b/vllm/models/deepseek_v4_1/tilelang/moe.py
+@@ -664,8 +664,9 @@ def grouped_fp8_fp4_gemm(
+     rasterizes the ``(N / block_N, tiles)`` grid in panels of ``swizzle_panel``
+     consecutive M-tiles, stepping M-tiles first within each column block ``bx``
+     and reversing ``bx`` on odd panels, so consecutive M-tiles of the same
+-    expert share each ``bx`` weight slab in L2 while keeping unused padding
+-    tiles (``t >= used_tiles``) at the tail of the grid.
++    expert can access each ``bx`` weight slab closer together. Cache benefit
++    depends on occupancy and panel boundaries. Empty logical tiles still return
++    early but can interleave with live CTAs inside a partial panel.
+     """
+     block_K = FP4_TMA_K
+     tail = K % block_K
+@@ -807,6 +808,8 @@ def grouped_fp8_fp4_gemm(
+     @T.macro
+     def body(A, SFA, B, BT, SFB, SFBase, Order, TileExpert, C, SFB8=None, Narrow=None):
+         with T.Kernel(T.ceildiv(N, block_N), tiles, threads=threads) as (bx, t):
++            if swizzle_panel > 0:
++                T.use_swizzle(panel_size=swizzle_panel)
+             if gather or trigger_after_loop:
+                 if trigger_after_loop:
+                     pdl.wait()
+@@ -1392,7 +1395,7 @@ class MoeExpertsV41Plan:
+         decode_block_M=16,
+         block_M=32,
+         prefill_block_M=64,
+-        prefill_swizzle_panel=3,
++        prefill_swizzle_panel=2,
+         block_N=128,
+         num_stages=3,
+         down_num_stages=2,
+@@ -1514,8 +1517,8 @@ class MoeExpertsV41Plan:
+         ``decode_block_M``; at the same height ``late_gate_up`` and ``late_down``,
+         which trigger after their K loop (calls of ``LATE_TRIGGER_ROWS`` rows or
+         more); with a ``mid_`` prefix at ``block_M`` and a ``prefill_`` prefix at
+-        ``prefill_block_M``, whose GEMMs trigger late and swizzle their CTA grid across
+-        ``prefill_swizzle_panel`` consecutive M-tiles."""
++        ``prefill_block_M``, whose GEMMs trigger late and optionally swizzle across
++        ``prefill_swizzle_panel`` consecutive M-tiles (default 2; decode/mid keep 0)."""
+         config = dict(
+             block_N=self.block_N,
+             coded_scales=True,

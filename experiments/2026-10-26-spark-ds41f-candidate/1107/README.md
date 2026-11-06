@@ -8,7 +8,7 @@ across the vLLM serving stack and the `C45` TileLang compiler stack.
 
 | Component | Base Revision | Patch Series | Patch Count | Patch Head | Expected Tree | Patchset SHA-256 |
 |---|---|---|---:|---|---|---|
-| `vllm` | `19f2c20ed4d64ae22bd009ceacadd85e2a81e354` | `experiments/2026-10-26-spark-ds41f-candidate/1107/vllm/series` (`0001..0730`) | `615` | `c47b54ae471a24b830e3515212b8c0bf5ee14604` | `13e4781d19bc4a18b0d3d4daad7921c465e3355e` | `9ef866d85a989b41354a3ee4536f32ff31740d4e2063e2298a1c656f8c0da8aa` |
+| `vllm` | `19f2c20ed4d64ae22bd009ceacadd85e2a81e354` | `experiments/2026-10-26-spark-ds41f-candidate/1107/vllm/series` (`0001..0743`) | `615` | `a75357bba81e31e4f3085700f94b6a0b29aed44a` | `45757842cce62c7da54f3873918839866e8c040d` | `9ef866d85a989b41354a3ee4536f32ff31740d4e2063e2298a1c656f8c0da8aa` |
 | `tilelang` | `2123e412ce2217b324c50c4ec967213906456ac5` | `experiments/2026-11-05-compiler-prepared-rework/tilelang/series` (`0001..0012`) | `12` | `a470d5daf8529fcf2b661f1119c8f4bb1aecc5e2` | `80fcfc4521b06e0c9776bbf1b5419849557e1090` | `2018cea5190861fd1ebaf51a5ed95289debdcba4b2f931fd333af95794a90fff` |
 | `sparknet` | `b61660f47a3f5c8f9369f21f92a75313e9b39579` | `experiments/2026-10-24-sparknet-all-to-all/sparknet/series` (`0001..0010`) | `10` | `5ce8c94218f8ce352d36c0d3995f896957e5052f` | `6602287e7f5a60de22fa1533e70e8e73eb7b4713` | `99cd8469f3b490c7361fc54ef481e0621417eb6ab3632cb6614fb55c31e36374` |
 
