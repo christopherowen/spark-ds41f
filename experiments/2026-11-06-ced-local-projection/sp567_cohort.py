@@ -119,7 +119,7 @@ import json,os,fcntl
 lock=(Path.home()/'.ced-hold.lock').open('a');fcntl.flock(lock,fcntl.LOCK_EX)
 p=Path.home()/'spark-hold.json';h=json.loads(p.read_text())
 assert h.get('token')==DATA['token'] and h.get('holder')=='ced-sp567-native-correctness'
-h['phase']=DATA['phase'];q=p.with_name('.ced-hold-'+DATA['token']);q.write_text(json.dumps(h,indent=2)+'\n');os.replace(q,p)
+h['phase']=DATA['phase'];q=p.with_name('.ced-hold-'+DATA['token']);q.write_text(json.dumps(h,indent=2)+chr(10));os.replace(q,p)
 print('true')
 """
 CLEANUP = """import json,subprocess
@@ -182,27 +182,29 @@ def restore(token, out, finish=None):
             if finish:
                 finish()
             return
-        assert owns(token), 'cohort lease changed; no foreign holder may be overwritten'
-        recovery.each(PHASE, {'token': token, 'phase': 'restoring'})
-        cleanup = recovery.each(CLEANUP, token)
-        (out/'native-cleanup.json').write_text(json.dumps(cleanup, indent=2)+'\n')
-        # The serving checkouts were never changed. Refuse checkout drift rather
-        # than attempting an unplanned sync during recovery.
-        check = recovery.each("""import subprocess,json
+        try:
+            assert owns(token), 'cohort lease changed; no foreign holder may be overwritten'
+            recovery.each(PHASE, {'token': token, 'phase': 'restoring'})
+            cleanup = recovery.each(CLEANUP, token)
+            (out/'native-cleanup.json').write_text(json.dumps(cleanup, indent=2)+'\n')
+            # The serving checkouts were never changed. Refuse checkout drift rather
+            # than attempting an unplanned sync during recovery.
+            check = recovery.each("""import subprocess,json
 p='/home/chris/spark-lab/checkouts/clustered-serving'
 print(json.dumps({'commit':subprocess.check_output(['git','rev-parse','HEAD'],cwd=p,text=True).strip(),
 'dirty':subprocess.check_output(['git','status','--porcelain'],cwd=p,text=True).strip()}))
+
 """)
-        assert all(v['commit']==RESTORE_COMMIT and not v['dirty'] for v in check.values()), check
-        # The published function owns coordinated start, live doctor, image/mount
-        # verification, heartbeat join before unlink, and token-specific release.
-        def before_release():
-            final = identity()
-            (out/'independent-restoration.json').write_text(json.dumps(final, indent=2)+'\n')
-            if finish:
-                finish()
-        try:
+            assert all(v['commit']==RESTORE_COMMIT and not v['dirty'] for v in check.values()), check
+            # The published function owns coordinated start, live doctor, image/mount
+            # verification, heartbeat join before unlink, and token-specific release.
+            def before_release():
+                final = identity()
+                (out/'independent-restoration.json').write_text(json.dumps(final, indent=2)+'\n')
+                if finish:
+                    finish()
             recovery.restore(token, out, 'restore', finish_heartbeat=before_release)
+
         except BaseException:
             (out/'restore-failed.txt').write_text(traceback.format_exc())
             if finish:
@@ -340,6 +342,8 @@ print('true')
         (out/'resource-scope.json').write_text(json.dumps(scope,indent=2)+'\n')
         assert owns(token) and guard.poll() is None and not errors
         global_scope()
+        # Execute the exact phase writer while service is still healthy.
+        recovery.each(PHASE, {'token':token,'phase':'preparing'})
         recovery.run(command+['--apply'], out, 'stop-apply')
         recovery.each(PHASE, {'token':token,'phase':'native'})
         for boot in ('boot-1','boot-2'):

@@ -1,4 +1,7 @@
 """CPU-only lease and recovery failure-path checks; no host action is executed."""
+import ast
+import contextlib
+import io
 import copy
 import importlib.util
 import json
@@ -21,6 +24,25 @@ def rows(token='owned'):
 
 
 class Guards(unittest.TestCase):
+    def test_remote_programs_compile_after_string_interpolation(self):
+        tree=ast.parse(path.read_text())
+        count=0
+        for node in ast.walk(tree):
+            if isinstance(node,ast.Constant) and isinstance(node.value,str) and node.value.startswith(('from pathlib import Path\n','import json,subprocess\n','import subprocess,json\n')):
+                compile(node.value,'remote program','exec');count+=1
+        self.assertGreaterEqual(count,3)
+
+    def test_actual_phase_program_preserves_owner_and_changes_only_phase(self):
+        with tempfile.TemporaryDirectory() as name:
+            home=Path(name);hold=home/'spark-hold.json'
+            original={'holder':c.HOLDER,'token':'owned','nodes':c.NAMES,'phase':'preparing','heartbeat':'original'}
+            hold.write_text(json.dumps(original))
+            with patch.object(Path,'home',return_value=home),contextlib.redirect_stdout(io.StringIO()):
+                state={'DATA':{'token':'owned','phase':'native'}}
+                exec(compile(c.PHASE,'phase','exec'),state)
+                state['lock'].close()
+            self.assertEqual(json.loads(hold.read_text()),dict(original,phase='native'))
+
     def test_matching_owner_is_required_on_every_rank(self):
         value=rows()
         with patch.object(c,'holds',return_value=value):

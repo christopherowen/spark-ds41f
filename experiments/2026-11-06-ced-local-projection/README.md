@@ -311,7 +311,7 @@ functions, selecting the exact live restore-profile name. It adds exact-token
 holds on every participant, fresh scope and idle checks, an independent watchdog
 with a verified startup handshake, native-container cleanup, a restoration lock,
 and independent all-rank identity verification before heartbeat join and release.
-Seven CPU guard tests cover foreign/legacy holds, mismatched scope, incorrect global
+Nine CPU guard tests cover foreign/legacy holds, mismatched scope, incorrect global
 holder tokens, recovery targets, verification-before-release and retained recovery
 failure. Restoration failure retains ownership and prevents an automatic restart
 loop. Both start-plan live/shape lines are reviewed by the published recovery
@@ -336,3 +336,22 @@ observation on SP5. Acquisition, stop and each batch refuse failed observations,
 reads taking over ten seconds, observations older than fifteen seconds, or a
 foreign unscoped/overlapping hold. The independent restoration watchdog runs on
 SP5 and does not depend on the relay. Relay loss cannot authorize a new batch.
+
+The first SP5-SP7 attempt acquired token `fe8cfe50be3540da97479c63784138f5`
+and stopped C37, then failed before GPU execution because the generated remote
+phase-update string contained an unescaped newline. That same phase update also
+blocked its automatic restoration. The retained failure prompted immediate
+recovery through the unchanged published C37 recovery functions, retaining the
+owned leases until independent verification. The fix uses an unambiguous newline
+expression, compiles every embedded remote program, and executes the actual phase
+program against a temporary hold in CPU tests. Recovery now records and stops its
+heartbeat on failures anywhere in the recovery path. No native result is claimed
+for this failed attempt.
+
+The failed attempt restored C37 at 2026-11-06 01:54:06 UTC. The live doctor and
+independent checks verified all three clean `e9eab460` checkouts, exact C37 digest,
+exact paged restore profile, and no extra running containers before releasing the
+leases. Complete receipts are retained under `receipts/sp567-window-1/`. The phase
+writer is now exercised before the stop operation as well as covered by CPU tests.
+Six CPU-only grader controls also pass; these validate grading behavior, not model
+quality, and are retained in `receipts/needle-grader-controls-1.txt`.
