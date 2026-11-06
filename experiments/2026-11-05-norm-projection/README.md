@@ -130,3 +130,53 @@ segment experiment, and neither it nor a kernel-only gain proves serving gains.
 The full c1/c8/c16 and distinct-agent traffic, cold 32K–1M prefill, candidate boot
 and repeat boot remain required wherever applicable before claiming a serving
 improvement. No runtime/source PR or promotion is warranted by the current data.
+
+## Completed two-process campaigns and conclusion
+
+Both the unchanged second process at `c51e824b876c45df79bca0c3c44415a4ed69f0b9`
+(`runs/original-c51e824b/`) and a separate two-process refined campaign at
+`b20452fd18579902cf88e5c98e2ad0e73d0c39ff` (`runs/run-1`, `runs/run-2`,
+`runs/refined-two-boot-summary.json`) completed on idle `dgx4` under a scoped
+`dgx4:~/spark-hold.json` reservation (`dgx1:~/spark-hold.json` verified absent).
+The two measurement methods are archived and analyzed separately without pooling.
+
+1. **Unchanged two-process campaign (`c51e824b`, `runs/original-c51e824b/two-boot-summary.json`)**:
+   - `run-2` passed all 21 cases in 26.0 seconds with bit-exact outputs.
+   - Across both processes, the identical-code control (`fused128` vs native `fused`)
+     ranged from `-3.31%` to `+8.12%` in L2 (`mean +0.75%, median +0.51%`), confirming
+     that distinct output buffer addresses and host-side event recording caused up to
+     `~8-12%` systematic timing shifts in L2.
+2. **Refined two-process campaign (`b20452fd`, `runs/refined-two-boot-summary.json`)**:
+   - `run-1` (26.0s) and `run-2` (27.0s) passed all 21 cases in both independent-buffer
+     and shared-buffer oracle modes.
+   - Capturing `external=True` CUDA events inside the graph and sharing output buffer
+     addresses across timed arms collapsed the identical-code `fused128` L2 control
+     band to `[-0.50%, +1.18%]` (`mean +0.33%, median +0.36%`, `0/21` cases 95% CI faster,
+     `1/21` slower).
+   - **CTA thread packing (`fused64`, `fused256`)**: `fused64` is flat against `fused`
+     within the control band: L2 `mean -0.68%, median -0.69%` (`[-2.46%, +0.87%]`,
+     `-0.02` to `-0.34 us` on a `10.8-44.5 us` chain; 15/21 95% CIs straddle zero),
+     cold `mean -0.43%, median -0.27%` (`0/21` cases 95% CI faster), and prefetch
+     `mean -0.03%, median +0.26%` (`1/21` faster, `1/21` slower). `fused256` regresses
+     L2 by `+1.87%` mean (`10/21` cases 95% CI slower, `0/21` faster).
+   - **Boundary splits and stream overlap (`split_qkv`, `split_kvq`, `split_parallel`, `split_q`, `standalone`)**:
+     Every boundary split regresses L2 and cold execution because the entire fused
+     attention front (`attention_front`: Q RMSNorm + BF16 round + MXFP8 cast + KV RMSNorm
+     + RoPE + paged SWA cache write) adds only `1.09-2.76 us` (median `1.39 us`) over
+     `projection_only` (`_block32_gemm`). Splitting Q and KV adds an extra kernel launch
+     (`+6.39%` / `+5.73%` L2, `+1.55%` / `+2.12%` cold), dual-stream overlap (`split_parallel`)
+     pays stream fork/join event overhead (`+2.09%` L2, `+1.33%` cold, `+2.65%` prefetch),
+     and standalone PDL ops (`split_q`, `standalone`) add 3-4 launches (`+20.02%` / `+24.17%`
+     L2, `+10.55%` / `+12.69%` cold). In the isolated prefetch race, multi-kernel fronts
+     appear negative only because their slower front delays `_block32_gemm`, giving the
+     concurrent side-stream weight prefetch extra head start (`projection_only` is
+     correspondingly `+8.58%` slower in that synthetic race).
+
+### Conclusion
+
+Negative / flat hardware ceiling. The current single-kernel fused `attention_front`
+already executes the entire Q+KV normalization, RoPE, MXFP8 quantization, and cache
+write in `~1.1-1.8 us` on GB10, leaving no room to amortize extra kernel launches or
+stream fork/join synchronization, and 64/128/256-thread CTA packing is flat within
+`~0.1-0.3 us`. Keep the current promoted `attention_front` unchanged; no runtime or
+vLLM patch is warranted.
