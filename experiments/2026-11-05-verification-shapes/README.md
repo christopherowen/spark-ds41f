@@ -221,3 +221,52 @@ layers, runtime configuration, source labels and clean prepared source, and
 accepted only qualification/evidence changes after the build commit.
 `runs/image-transfer-1/` preserves the commands, stream receipts, loader logs
 and validation record. No GPU operation was run by this transfer or validation.
+
+
+### DGX4 2-boot GPU screen and shape replay benchmark (2026-11-06)
+
+Executed the 2-boot GPU kernel screen and native-depth verification shape
+replay benchmark on `dgx4` under the `dgx4-single` node-scoped hold
+(`token: dgx4-verification-shapes-20261106`) against the verified image
+`sha256:3e03ac089d50d1408272aac0dc32ab134109e228a1d8dc8f8310688ccdb16209`:
+
+- **Initial screen attempt (`runs/screen-attempt-1/`)**: `gpu-smoke` passed,
+  `graph-replay` passed (108/108 in 21.63s), and `memcheck` passed (108/108 in
+  10.48s, `ERROR SUMMARY: 0 errors`), exposing a log-parser bug in `gpu_gate.py`
+  where `suite_verdict` matched `"0 errors"` on the trailing
+  `compute-sanitizer` summary line instead of the pytest summary line. Fixed in
+  `98e1f70c44fbd80194c48ee97e0e35619a0f01cd` (`sanitizer_passed`).
+- **2-boot GPU screen (`runs/dgx4-gpu-screen-2boot/boot-1/` and `boot-2/`)**:
+  - `gpu-smoke`: passed on both boots (`exit 0`).
+  - `graph-replay`: 108/108 passed on both boots (`21.6s`, exact output match
+    across all 36 boundary row counts for `dspark_context.context_inputs` and
+    `mxfp8` decode/split-K kernels, including poisoned-tail CUDA graph replay).
+  - `memcheck`: 108/108 passed with `ERROR SUMMARY: 0 errors` on both boots.
+  - `initcheck` on `test_context_inputs_replay` (`initcheck-context-inputs.log`):
+    36/36 passed with `ERROR SUMMARY: 0 errors` on both boots (`6.36s`),
+    confirming zero uninitialized reads in `dspark_context.context_inputs`.
+  - Full `initcheck` (`initcheck.log`): 108/108 pytest output assertions passed
+    on both boots, while `compute-sanitizer --tool initcheck` exited `97` with
+    `27,288` uninitialized global-memory reads of size 8 bytes in
+    `gemm_mxfp8_kernel` (`tl::cp_async_gs_conditional<(int)8>` at `copy.h:68`,
+    launched at `test_graph_replay.py:160` `mxfp8_gemm_decode(..., padded_rows=True)`).
+    As specified in `lab-plan.md`, this pre-existing MXFP8 padded-tail read
+    blocks full gate promotion until paired with the separate live-row bound fix
+    (`experiments/2026-11-05-mxfp8-live-rows`).
+- **2-boot CUDA graph replay benchmark (`shape-benchmark-boot-1.json`, `shape-benchmark-boot-2.json`)**:
+  - All repaired verification request counts (`num_reqs = 3, 5, 6, 7`,
+    `native_rows = 18, 30, 36, 42` vs `wider_padded_rows = 20, 32, 40, 48`)
+    verified bit-identical output (`exact_match: true`) across both boots.
+  - Median CUDA graph replay latency on `dgx4` (Boot 1 / Boot 2):
+    - `num_reqs=3` (`18` vs `20` rows): `context_inputs` `3.35 / 3.35 us` vs
+      `3.35 / 3.35 us`; `mxfp8_decode` `3.96 / 3.96 us` vs `3.92 / 3.95 us`;
+      `mxfp8_splitk` `4.08 / 4.09 us` vs `4.09 / 4.09 us`.
+    - `num_reqs=5` (`30` vs `32` rows): `context_inputs` `4.09 / 4.09 us` vs
+      `4.09 / 4.09 us`; `mxfp8_decode` `3.95 / 3.96 us` vs `3.95 / 4.05 us`;
+      `mxfp8_splitk` `4.09 / 4.09 us` vs `4.09 / 4.09 us`.
+    - `num_reqs=6` (`36` vs `40` rows): `context_inputs` `4.10 / 4.10 us` vs
+      `4.09 / 4.09 us`; `mxfp8_decode` `4.09 / 4.09 us` vs `4.09 / 4.09 us`;
+      `mxfp8_splitk` `4.09 / 4.09 us` vs `4.09 / 4.09 us`.
+    - `num_reqs=7` (`42` vs `48` rows): `context_inputs` `4.10 / 4.11 us` vs
+      `4.11 / 4.12 us`; `mxfp8_decode` `4.09 / 4.09 us` vs `4.10 / 4.10 us`;
+      `mxfp8_splitk` `4.10 / 4.10 us` vs `4.09 / 4.09 us`.
