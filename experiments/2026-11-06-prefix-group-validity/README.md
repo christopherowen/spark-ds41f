@@ -39,6 +39,7 @@ this experiment. No retention policy is changed here.
 ## Status
 
 Draft investigation. No serving change, GPU measurement, or performance claim.
+Source proposal: https://github.com/christopherowen/vllm/pull/6 (draft).
 The source branch is `feat/prefix-group-validity`; `base.json`, `source.json` and
 `overlay.json` record its exact identities. The initial recovery policy covers a
 fixed original prompt; streaming input can advance that prompt boundary and is
@@ -57,7 +58,12 @@ identity mismatch. The source commit was normalized to the repository's fixed
 build committer, yielding the reproduced head `3fe3dfe937c67ee26e3a73d514f4ade73f62ec9e`.
 After adding the finite-cone tests, the 574-patch retry failed during fetch with
 `No space left on device`. Its receipt is preserved. Final-head preparation and
-tests must be repeated remotely; neither failure is a successful build check.
+preparation and unfinished tests moved remotely; neither failure is a successful
+build check. The remote 574-patch fresh application subsequently reproduced head
+`2b7790c8fdbf9031560950ce3e7280d0cd2b609d` and tree
+`24f540f78abb4f88019427d72d65c7ad94a3aba8`. All three experiment profiles passed
+`doctor`. Full build inputs are not prepared; no complete image-build check is
+claimed or required for this Python-only screen.
 
 On owner instruction, the disposable local build tree, Python environment and
 control checkout were removed. `runs/mac-cleanup.json` records the exact paths
