@@ -8,6 +8,7 @@ import subprocess
 import sys
 
 from check_quality import check
+from timing_conditions import fan_curve_ready
 
 HERE=Path(__file__).resolve().parent
 spec=importlib.util.spec_from_file_location('boot_intervals',HERE.parent/'2026-11-05-answer-quality/summarize.py')
@@ -60,6 +61,8 @@ def main():
         conditions={label:json.loads((root/('answers-'+label+'-conditions.json')).read_text()) for label in LABELS}
         report['conditions_passed']=all(not c['halted'] and not c['fan_stop_failures'] and len(c['thermal'])==4
             and not any(t.get('thermal_slowdown_ms') for t in c['thermal'].values()) for c in conditions.values())
+        report['timing_qualified']=report['conditions_passed'] and all(fan_curve_ready(c.get('fan_curve',[]),c['thermal']) for c in conditions.values())
+        report['timing_qualification_scope']='requires the repository performance fan curve on every measured node; historical guard success alone is insufficient'
         report['memory']={label:c['memory'] for label,c in conditions.items()}
         report['conclusion']='Inspect every quality loss, latency distribution, workload and condition before a superiority decision.'
     target.write_text(json.dumps(report,indent=2)+'\n');print(json.dumps(report,indent=2))

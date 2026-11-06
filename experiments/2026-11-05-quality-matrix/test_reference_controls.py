@@ -14,7 +14,7 @@ class RecordedControls(unittest.TestCase):
         else:run={'complete':True,'manifest_sha256':'screen','full_manifest_sha256':'full','protocol':{'temperature':0,'max_tokens':65536},'split':'pilot','stage':'screen','records':[row]}
         day=datetime.datetime.now(datetime.timezone.utc).date().isoformat()
         for label in ('native-a','native-b'):
-            for name,data in [('answers-'+label+'.json',run),('answers-'+label+'-conditions.json',{'halted':[],'fan_stop_failures':[],'thermal':{'node':{'thermal_slowdown_ms':0}}}),('benchmark-'+label+'-exit.json',{'exit':0,'started_at':day+'T12:00:00+00:00'})]:
+            for name,data in [('answers-'+label+'.json',run),('answers-'+label+'-conditions.json',{'halted':[],'fan_stop_failures':[],'fan_curve':[{'node':'node','service':'active','started':False}],'thermal':{'node':{'thermal_slowdown_ms':0}}}),('benchmark-'+label+'-exit.json',{'exit':0,'started_at':day+'T12:00:00+00:00'})]:
                 (folder/name).write_text(json.dumps(data))
         return folder
     def load(self,root,benchmark='longbench',old=b'current\n'):
@@ -41,15 +41,18 @@ class RecordedControls(unittest.TestCase):
             root=Path(folder);self.fixture(root)
             with self.assertRaisesRegex(AssertionError,'fresh native controls'):self.load(root,old=b'different')
     def test_old_failed_or_incomplete_controls_are_rejected(self):
-        for kind in ('date','exit','incomplete','thermal','restoration','different_answer','protocol','topology','split'):
+        for kind in ('date','exit','incomplete','thermal','fan_absent','fan_missing','fan_duplicate','restoration','different_answer','protocol','topology','split'):
             with tempfile.TemporaryDirectory() as folder:
                 root=Path(folder);reference=self.fixture(root)
-                name={'date':'benchmark-native-a-exit.json','exit':'benchmark-native-a-exit.json','thermal':'answers-native-a-conditions.json','restoration':'restored.json','topology':'source.json','split':'source.json'}.get(kind,'answers-native-b.json')
+                name={'date':'benchmark-native-a-exit.json','exit':'benchmark-native-a-exit.json','thermal':'answers-native-a-conditions.json','fan_absent':'answers-native-a-conditions.json','fan_missing':'answers-native-a-conditions.json','fan_duplicate':'answers-native-a-conditions.json','restoration':'restored.json','topology':'source.json','split':'source.json'}.get(kind,'answers-native-b.json')
                 p=reference/name;data=json.loads(p.read_text())
                 if kind=='date':data['started_at']='2000-01-01T12:00:00+00:00'
                 elif kind=='exit':data['exit']=1
                 elif kind=='incomplete':data['complete']=False
                 elif kind=='thermal':data['thermal']['node']['thermal_slowdown_ms']=1
+                elif kind=='fan_absent':data['fan_curve'][0]['service']='absent'
+                elif kind=='fan_missing':data.pop('fan_curve')
+                elif kind=='fan_duplicate':data['fan_curve']*=2
                 elif kind=='restoration':data['holds_removed']=False
                 elif kind=='different_answer':data['phases'][0]['records'][0]['predicted']='B'
                 elif kind=='protocol':data['protocol']['max_tokens']=1

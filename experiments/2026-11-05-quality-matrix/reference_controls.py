@@ -4,6 +4,7 @@ import hashlib
 import json
 from pathlib import Path
 import subprocess
+from timing_conditions import fan_curve_ready
 
 
 def dependency_paths(root,benchmark):
@@ -20,7 +21,7 @@ def dependency_paths(root,benchmark):
     for source,*_ in cluster['container']['mounts']:
         if source.startswith('{checkout}/'):paths.add(source.removeprefix('{checkout}/'))
     paths.update(['spark_ds41f/config.py','scripts/recipe.py','scripts/topology.py','spark_ds41f/bench.py',
-                  'experiments/2026-11-05-quality-matrix/measure.py','experiments/2026-11-05-answer-quality/api_metrics.py'])
+                  'experiments/2026-11-05-quality-matrix/measure.py','experiments/2026-11-05-quality-matrix/timing_conditions.py','experiments/2026-11-05-answer-quality/api_metrics.py'])
     folder='2026-11-05-answer-quality' if benchmark=='longbench' else '2026-11-05-context-quality'
     paths.add('experiments/'+folder+'/evaluate.py')
     if benchmark=='longbench':
@@ -74,6 +75,7 @@ def load(root,reference,benchmark,split,stage,nodes):
         conditions=json.loads(files['answers-'+label+'-conditions.json'])
         assert not conditions['halted'] and not conditions['fan_stop_failures'] and len(conditions['thermal'])==len(nodes)
         assert not any(t.get('thermal_slowdown_ms') for t in conditions['thermal'].values())
+        assert fan_curve_ready(conditions.get('fan_curve',[]),conditions['thermal']),'reference controls lack the required performance fan curve; fresh qualified controls required'
         runs[label]=json.loads(files['answers-'+label+'.json'])
     assert signature(runs['native-a'],benchmark)==signature(runs['native-b'],benchmark),'unstable or mismatched native controls'
     provenance={'source':str(relative),'source_commit':source['commit'],'same_utc_day':date,
