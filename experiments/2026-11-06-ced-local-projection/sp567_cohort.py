@@ -96,12 +96,17 @@ def global_scope():
             raise RuntimeError('cannot verify the DGX global hold scope')
         held = json.loads(result.stdout)
     if held is not None:
-        assert held.get('nodes') == ['dgx1', 'dgx2', 'dgx3'], held
+        nodes = held.get('nodes')
+        assert isinstance(nodes, list) and nodes and set(nodes) <= {'dgx1', 'dgx2', 'dgx3', 'dgx4'}, held
+        assert not set(nodes) & set(NAMES), held
         scope = held.get('resource_scope')
-        assert scope and scope.get('kind') == 'nodes', held
-        assert scope.get('holder') == held['holder'] and scope.get('token') == held['window'], held
-        assert scope.get('nodes') == held['nodes'] and scope['restore']['nodes'] == held['nodes'], held
-        assert scope['watchdog']['nodes'] == held['nodes'] and not set(held['nodes']) & set(NAMES), held
+        if scope is not None:
+            assert scope.get('kind') == 'nodes', held
+            assert scope.get('holder') == held.get('holder') and scope.get('token') == (held.get('window') or held.get('token')), held
+            assert scope.get('nodes') == nodes and scope.get('restore', {}).get('nodes') == nodes, held
+            assert scope.get('watchdog', {}).get('nodes') == nodes, held
+        else:
+            assert held.get('holder') and (held.get('window') or held.get('token')) and held.get('production_config'), held
     return held
 
 

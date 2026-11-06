@@ -64,7 +64,11 @@ class Guards(unittest.TestCase):
                              'restore':{'nodes':h['nodes']},'watchdog':{'nodes':h['nodes']}}
         with patch.object(c.subprocess,'run',return_value=subprocess.CompletedProcess([],0,json.dumps(h),'')):
             self.assertEqual(c.global_scope(),h)
-        for bad in ({'holder':'unscoped'},dict(h,resource_scope=dict(h['resource_scope'],token='other')),
+        dgx1_only={'holder':'screen','window':'dgx1-1','nodes':['dgx1'],'production_config':'cfg.json'}
+        with patch.object(c.subprocess,'run',return_value=subprocess.CompletedProcess([],0,json.dumps(dgx1_only),'')):
+            self.assertEqual(c.global_scope(),dgx1_only)
+        for bad in ({'holder':'unscoped'},{'holder':'bad','window':'w','nodes':['sp5'],'production_config':'cfg.json'},
+                    dict(h,resource_scope=dict(h['resource_scope'],token='other')),
                     dict(h,resource_scope=dict(h['resource_scope'],restore={'nodes':['sp5']}))):
             with patch.object(c.subprocess,'run',return_value=subprocess.CompletedProcess([],0,json.dumps(bad),'')):
                 with self.assertRaises(AssertionError):c.global_scope()
