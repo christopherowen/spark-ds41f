@@ -149,3 +149,36 @@ The 2026-11-06 DGX4 attempt used published deployment `f51288df1b30793f7cac0d1da
 The minimal correction is the existing recipe’s `--security-opt=seccomp=unconfined`; no host setting or serving container changed. Both hosts report `kernel.io_uring_disabled=0`. Fresh CPU-only containers use the pinned image, runc, no NVIDIA devices, one CPU and 1 GiB. Both layouts pass all 36 native-reader cases with that single security-option correction, including actual direct reads and failure handling. An earlier check also matched the recipe’s IPC_LOCK/label/stack options; its separate receipts remain. GPU retry is still pending. The runner now requires 43 actual passed tests per candidate, without skips, before accepting GPU gates, and requires the matching gate receipt before timing.
 
 Window `dgx1-1793924574` was closed at 00:28:29 UTC after the failed bounded job. The original C36 service was already serving, no restart was needed, and DGX4’s originally inactive fan service was restored to inactive. The waiting collective qualification and reserved verification-budget arm retain precedence. No generic request waiter is active.
+
+## Independent retry cleanup
+
+The retry requires `watch-hardware.py` in a separate user service before
+`run-hardware.py` starts. Both receive the same `--window`, `--run` and
+`--unit` (the primary service's full name). The runner refuses a missing,
+stale, mismatched or fixture-mode watcher. Its local heartbeat is atomic;
+the watchdog cancels only containers bearing both this window and run label.
+It handles primary death, a heartbeat older than 60 seconds, and changed window
+ownership. Fan restoration requires verified ownership. Each container also
+has its own deadline, independent of the Docker client.
+
+CPU-only fault injection passes for all three failures and confirms that a
+differently labeled control container keeps running. The first fault-test
+assertion was too strict about Docker immediately deleting a stopped container:
+the preserved inspection says `Running: false`, `Status: removing`, PID 0.
+The corrected tests check that the process stopped, and the watcher independently
+verifies no matching container remains running. The pinned image's in-container
+deadline also returns the expected timeout status. These tests use runc with no
+NVIDIA devices and do not alter any fan policy or serving state.
+
+Hardware gates and timing are separate bounded phases. The `gates` phase requires
+exactly 43 passed native tests per final variant, with no failures, errors or
+skips. The `screen` phase additionally requires `--gates-receipt` naming the
+matching successful source/image gate receipt. They remain unexecuted after the
+container correction and must wait for a legitimate hardware handoff.
+
+The Mac's isolated worktree was removed after the two changed source files matched
+the remote published source and all local evidence was archived on Spaceport.
+The cleanup records account for 579,403,776 allocated bytes removed; they do not
+attribute concurrent filesystem-wide recovery to this task. Substantial source,
+build and test work remains remote. The prepared C38 Git object store is retained:
+the three remote source worktrees depend on it through alternates.

@@ -8,11 +8,13 @@ import subprocess
 import tarfile
 import time
 import argparse
+import signal
 import xml.etree.ElementTree as ET
 
 home = Path.home()
 parser = argparse.ArgumentParser()
 parser.add_argument('--window', required=True)
+parser.add_argument('--unit', required=True)
 parser.add_argument('--run', required=True)
 parser.add_argument('--phase', choices=('gates', 'screen'), required=True)
 parser.add_argument('--deployment', required=True)
@@ -47,6 +49,23 @@ if args.phase == 'screen':
         'gates-aligned': 43, 'gates-filter': 43}
     report['gates_receipt_sha256'] = hashlib.sha256(args.gates_receipt.read_bytes()).hexdigest()
 
+ready_path = home / ('.engram-watch-' + args.run + '.json')
+ready = json.loads(ready_path.read_text())
+assert ready['window'] == window and ready['unit'] == args.unit and ready['mode'] == 'production'
+assert time.time() - ready_path.stat().st_mtime < 30
+os.kill(ready['pid'], 0)
+watch = {'window': window, 'unit': args.unit, 'heartbeat_unix': time.time(),
+         'fan_restore_required': False, 'complete': False}
+def save_watch():
+    watch['heartbeat_unix'] = time.time()
+    temporary = root / 'watch.tmp'
+    temporary.write_text(json.dumps(watch) + '\n')
+    os.replace(temporary, root / 'watch.json')
+save_watch()
+def cancel(signum, frame):
+    raise SystemExit('Received signal ' + str(signum))
+signal.signal(signal.SIGTERM, cancel)
+
 def run(argv, check=True):
     result = subprocess.run(argv, capture_output=True, text=True, timeout=30)
     report['commands'].append({'argv': argv, 'exit': result.returncode, 'stdout': result.stdout, 'stderr': result.stderr})
@@ -66,6 +85,7 @@ def beat(note):
                             input=script, capture_output=True, text=True, timeout=15)
     if result.returncode:
         raise RuntimeError('Lost exclusive window: ' + result.stderr)
+    save_watch()
 
 def thermal(label):
     zones = {p.parent.name: int(p.read_text()) / 1000 for p in Path('/sys/class/thermal').glob('thermal_zone*/temp')}
@@ -90,13 +110,14 @@ def docker_job(name, variant, command, timeout=600):
     output.mkdir()
     container = 'engram-' + name
     argv = ['docker', 'run', '--rm', '--name', container, '--gpus', 'all', '--cpus', '4',
+            '--label', 'local.engram.window=' + window, '--label', 'local.engram.run=' + args.run,
             '--memory', '16g', '--memory-swap', '16g', '--ulimit', 'memlock=-1', '--ipc', 'host',
             '--security-opt=seccomp=unconfined', '--cpuset-cpus=5-9,15-19',
             '--network', 'none', '-v', str(native / variant) + ':/opt/spark-ds41f/candidate/vllm/vllm/models/deepseek_v4_1/engram_rows:ro',
             '-v', str(root) + ':/input:ro', '-v', str(output) + ':/out',
             '-e', 'OMP_NUM_THREADS=1', '-e', 'OPENBLAS_NUM_THREADS=1', '-e', 'MAX_JOBS=1',
             '-e', 'XDG_CACHE_HOME=/out/cache', '-e', 'ENGRAM_ROWS_TEST_DIR=/out/direct-tables',
-            '--entrypoint', 'python3', image, *command]
+            '--entrypoint', '/usr/bin/timeout', image, '--kill-after=10', str(timeout), 'python3', *command]
     started = time.monotonic()
     receipt = {'name': name, 'argv': argv, 'started_unix': time.time()}
     report['commands'].append(receipt)
@@ -132,9 +153,11 @@ try:
     report['fan_original_active'] = active
     run(['systemctl', 'cat', 'dgx-fan-control.service'])
     if not active:
+        watch['fan_restore_required'] = True
+        save_watch()
+        fan_started = True
         run(['sudo', '-n', 'systemctl', 'reset-failed', 'dgx-fan-control.service'])
         run(['sudo', '-n', 'systemctl', 'start', 'dgx-fan-control.service'])
-        fan_started = True
     run(['nvidia-smi', '-q', '-x'])
     if args.phase == 'gates':
         for variant in ('aligned', 'filter'):
@@ -157,3 +180,8 @@ finally:
     report['fan_final_active'] = run(['systemctl', 'is-active', '--quiet', 'dgx-fan-control.service'], check=False).returncode == 0
     report['finished_unix'] = time.time()
     (root / 'receipt.json').write_text(json.dumps(report, indent=2) + '\n')
+    if 'fan_original_active' in report:
+        assert report['fan_final_active'] == report['fan_original_active'], 'Fan state not restored'
+    watch['complete'] = True
+    watch['fan_restore_required'] = False
+    save_watch()
