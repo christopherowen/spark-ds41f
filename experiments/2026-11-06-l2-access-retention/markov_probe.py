@@ -138,9 +138,15 @@ def main():
             # Row offsets and exceptions stay at their ordinary native addresses.
             arms = [('driver_default', original, False, 0),
                     ('driver_null', original, False, 0),
+                    ('prefetch_default', original, False, 1),
+                    ('prefetch_default_each', original, False, 2),
+                    ('window_default', original, True, 0),
+                    ('both_default', original, True, 1),
                     ('demand', 0, False, 0), ('null', 0, False, 0),
                     ('prefetch_once', 0, False, 1), ('prefetch_each', 0, False, 2),
+                    ('partition_small', 1 << 20, False, 0),
                     ('window_small', 1 << 20, True, 0), ('both_small', 1 << 20, True, 1),
+                    ('partition_fit', min(b, maximum), False, 0),
                     ('window_fit', min(b, maximum), True, 0),
                     ('both_fit', min(b, maximum), True, 1)]
             for rows in (1, 8, 16):

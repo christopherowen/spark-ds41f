@@ -46,6 +46,9 @@ Only after capability passes, compare the existing native fused Markov kernel
 under ordinary demand, explicit prefetch, access window, and both; include a
 separate null arm, multiple partition sizes and TP3/TP4 dimensions at 1/8/16
 requests. Run with cold-start and intervening expert-sized streaming traffic.
+The retention mechanism tests the interaction of reservation and window:
+partition-only arms distinguish their costs, and driver-default prefetch arms
+avoid conflating the native prefetch operation with a forced-zero reservation.
 Record every sample, exact output comparison, memory and failure. Any positive
 component result requires current serving traces and a full-path c1/c8/c16,
 prefill and coexistence comparison across two boots before a runtime PR.
