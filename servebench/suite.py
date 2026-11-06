@@ -23,7 +23,7 @@ import math
 import time
 from pathlib import Path
 
-from . import report
+from . import model_evidence as model_evidence_api, report
 
 SCHEMA = "servebench-suite/1"
 BUILTIN = Path(__file__).with_name("suites")
@@ -90,10 +90,25 @@ def output_name(step: dict) -> str:
 
 
 def run(main, url: str, suite: dict, out_dir: str, *, label: str | None = None, corpus: str | None = None,
-        metadata: dict | None = None, log=print) -> dict:
+        metadata: dict | None = None, log=print, model_evidence: dict | None = None) -> dict:
     """Run every step through servebench's ``main`` and write ``suite.json``."""
     out = Path(out_dir)
     out.mkdir(parents=True, exist_ok=True)
+    prepared_model = None
+    if model_evidence and suite["name"] == model_evidence["contract"]["suite"]:
+        prior = [out / "suite.json", out / "model.json.gz", out / "model.json.gz.evidence.json",
+                 out / "model.preflight.evidence.json"]
+        if any(path.exists() for path in prior):
+            raise FileExistsError("prior opted-in model evidence exists; preserve it and use a distinct run")
+        try:
+            prepared_model = model_evidence_api.prepare(model_evidence, suite, digest(suite), label, metadata)
+        except Exception as error:
+            with (out / "model.preflight.evidence.json").open("x") as stream:
+                json.dump({"schema": model_evidence_api.SCHEMA, "status": "preflight-failed",
+                    "contract": {"path": model_evidence["path"], "sha256": model_evidence["sha256"]},
+                    "model_requests_started": False, "errors": [f"{type(error).__name__}: {error}"]}, stream, indent=2)
+                stream.write("\n")
+            raise
     index = {"schema": SCHEMA, "suite": suite, "suite_sha256": digest(suite), "label": label, "corpus": corpus,
              "started_utc": datetime.datetime.now(datetime.timezone.utc).isoformat(timespec="seconds"), "steps": []}
     if metadata is not None:
@@ -108,6 +123,19 @@ def run(main, url: str, suite: dict, out_dir: str, *, label: str | None = None, 
             code = f"{type(error).__name__}: {error}"[:300]
         index["steps"].append({"id": step["id"], "command": step["command"], "output": output_name(step),
                                "exit": code, "seconds": round(time.monotonic() - began, 1)})
+        if prepared_model is not None and step["command"] == "model":
+            evidence = model_evidence_api.evaluate(output, code, prepared_model)
+            evidence_path = Path(output + ".evidence.json")
+            with evidence_path.open("x") as stream:
+                json.dump(evidence, stream, indent=2, allow_nan=False)
+                stream.write("\n")
+            index["model_evidence"] = {"output": evidence_path.name,
+                "required_evidence_passed": evidence["required_evidence_passed"],
+                "contract_sha256": prepared_model["binding"]["sha256"]}
+            if not evidence["required_evidence_passed"]:
+                index["stopped_before_timing"] = True
+                log("required model evidence failed; remaining suite steps were not run")
+                break
         (out / "suite.json").write_text(json.dumps(index, indent=1) + "\n")
     index["finished_utc"] = datetime.datetime.now(datetime.timezone.utc).isoformat(timespec="seconds")
     (out / "suite.json").write_text(json.dumps(index, indent=1) + "\n")

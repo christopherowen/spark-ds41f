@@ -956,6 +956,8 @@ def suite_steps(spec: dict, job: dict, arms: list[dict]) -> list[dict]:
     single-stream) on the same boot, each in results/private/suites/<run>-<suite>/<label> with
     its own table, so the release suite and its recorded references stay unchanged."""
     experiment, run = spec["experiment"], spec["run"]
+    if type(job.get("fail_on_suite_error", False)) is not bool:
+        raise ValueError("fail_on_suite_error must be boolean")
     suites = [job["suite"]] if isinstance(job["suite"], str) else list(job["suite"])
 
     def run_of(name: str) -> str:
@@ -976,6 +978,8 @@ def suite_steps(spec: dict, job: dict, arms: list[dict]) -> list[dict]:
             suffix = "" if name == suites[0] else f"-{name}"
             steps.append({"kind": "cli", "label": label, "argv": argv, "suite": name,
                           "telemetry_out": f"results/private/determinism/{run}/suite-{label}{suffix}"})
+            if job.get("fail_on_suite_error"):
+                steps[-1]["fail_on_suite_error"] = True
     labels = [a["label"] for a in arms]
     reference, unresolved = (recorded_reference(experiment, job["reference"], arms[0]["config"])
                              if "reference" in job else (None, None))
@@ -2003,6 +2007,9 @@ def execute(spec: dict, dry: bool, keep_open: bool, close_on_failure: bool = Tru
                     # A suite step failed or the run was halted: keep its other results and
                     # measure the remaining arms.
                     save_engine_logs(f"results/private/suites/{spec['run']}/{step['label']}", config=booted)
+                    if step.get("fail_on_suite_error"):
+                        failed = f"required suite {step['suite']} for {step['label']} exited {code}"
+                        break
                 elif code:
                     failed = f"bench {step['label']} exited {code}"
                     break
