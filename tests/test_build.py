@@ -231,8 +231,11 @@ class BuildResourcePolicyTest(unittest.TestCase):
             root = Path(temporary)
             directory = root / "build"
             directory.mkdir()
-            for name, value in {"ROOT": root, "BUILD_LOCK": root / "build.lock"}.items():
-                stack.enter_context(mock.patch.object(spark, name, value))
+            stack.enter_context(mock.patch.object(spark, "ROOT", root))
+            lock_file = stack.enter_context((root / "build.lock").open("w"))
+            lock_path = mock.Mock(spec=Path)
+            lock_path.open.return_value = lock_file
+            stack.enter_context(mock.patch.object(spark, "BUILD_LOCK", lock_path))
             returns = {"configuration": (cluster, None, lock), "build_inputs": inputs,
                        "build_directory": directory, "read_json": {}, "arm_source_problems": [],
                        "build_problems": [], "repository_dirty": "", "repository_revision": "b" * 40,
