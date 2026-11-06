@@ -63,19 +63,28 @@ was run and validated here.
 All of it ran offline, in throwaway CPU containers from the `spark-ds41f:1030` image (no network, outside the engine's
 cores), with the patched `vllm/parser` mounted over the image's. Nothing was deployed.
 
-**Replay of the live fixtures** ([`replay_fixtures.py`](replay_fixtures.py)):
-- each output token stream goes through `ParserManager`'s deepseek_v41 parsers with the real tokenizer;
-- whole, and streamed at 1, 7 and all tokens a delta, the text decoded cumulatively with an incomplete UTF-8 tail held
+**Replay of the live fixtures** ([`replay_fixtures.py`](replay_fixtures.py)) runs each output token stream the way
+1030's chat handler does:
+- the parser is built per request, with its tools and its effective chat-template kwargs;
+- a whole reply is `parse(text, request, enable_auto_tools=True, model_output_token_ids=ids)`, with the IDs as
+  generated (end-of-sentence included) and the text decoded with `skip_special_tokens=True`. That is the handler's
+  call;
+- a stream is `parse_delta` at 1, 7 and all tokens a delta, decoded the same way, with an incomplete UTF-8 tail held
   back.
+
+Fixtures: [`fixtures/live-1030.json`](fixtures/live-1030.json) (thinking off) and
+[`fixtures/live-1030-thinking.json`](fixtures/live-1030-thinking.json). The second has thinking on, with the effort
+left out or max: a plain answer, two tool calls, and `th_n2_python_line`.
 
 | | 1030 ([`runs/replay-1030.jsonl`](runs/replay-1030.jsonl)) | patched ([`runs/replay-patched.jsonl`](runs/replay-patched.jsonl)) |
 |---|---|---|
 | `n1_file_of_closers` | fails in 4 of 4 runs | all 4: the three lines intact (the model ends the file with a newline) |
-| `n2_python_line` | fails in 4 of 4 | all 4 intact |
+| `n2_python_line`, `th_n2_python_line` (thinking on) | fail in 8 of 8 | all 8 intact |
 | `q876_no_tools` | fails in 4 of 4 | all 4: the sample and FINISHED kept |
-| `ok_two_params`, `q876_tools` | equal to the live server, 8 of 8 | still equal to the live server, byte for byte, content and raw arguments, 8 of 8 |
+| `ok_two_params`, `q876_tools`, `th_plain`, `th_tool`, `th_tool_max` | reasoning, content and raw arguments equal to the live server, 20 of 20 | still equal to the live server, byte for byte, 20 of 20 |
 
-The 1030 replay reproduces what the live server returned, so the harness models the serving path.
+The 1030 replay reproduces what the live server returned, thinking on and off, so the harness models the serving
+path.
 
 **vLLM tests:**
 - New: `tests/parser/engine/test_deepseek_v41_dsml_provenance.py`. A mock tokenizer in which the atom is an added
@@ -94,9 +103,15 @@ The 1030 replay reproduces what the live server returned, so the harness models 
   - The errors are offline downloads and modules this image does not install: Cohere's `cohere_melody` and
     Harmony's vocabulary. The root conftest's `tblib` was stubbed.
 
+**Not done:**
+- No image was built from `vllm/series`. The patch applies to rc14's head (`git apply`), but a build has not applied
+  it.
+- No soak, and no live traffic.
+
 ## Files
 
 - `vllm/series`, `vllm/0001-deepseek-v41-dsml-token-provenance.patch`;
-- `fixtures/live-1030.json`: requests, prompt and output token IDs, and live results, whole and streamed;
+- `fixtures/live-1030.json` and `fixtures/live-1030-thinking.json`: requests, prompt and output token IDs, and live
+  results, whole and streamed;
 - `capture_fixtures.py`, `replay_fixtures.py`;
 - `runs/replay-1030.jsonl`, `runs/replay-patched.jsonl`.
