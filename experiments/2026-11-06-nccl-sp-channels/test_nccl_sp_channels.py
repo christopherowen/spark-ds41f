@@ -79,35 +79,20 @@ class TestNcclSpChannelsAndMlaOccupancy(unittest.TestCase):
         self.assertEqual(env["NCCL_BUFFSIZE"], "1048576")
         self.assertNotIn("NCCL_SWITCHLESS_BIDIRECTIONAL", env)
 
-    def test_candidate_matches_tp4_and_switchless_oneshot_direct_policy(self) -> None:
+    def test_candidate_matches_winning_c6_8m_bidir_tp3_policy(self) -> None:
         cand = read_cluster("experiments/2026-11-06-nccl-sp-channels/candidate.json")
-        tp4 = read_cluster(TP4_1107)
         env = cand["environment"]
-        tp4_env = tp4["environment"]
 
         # Zero container rebuild needed for the NCCL candidate arm.
         self.assertEqual(cand["container"]["image"], "spark-ds41f:1107")
-
-        keys = (
-            "NCCL_ALGO",
-            "NCCL_MIN_NCHANNELS",
-            "NCCL_MAX_NCHANNELS",
-            "NCCL_BUFFSIZE",
-            "NCCL_SWITCHLESS_BIDIRECTIONAL",
-            "NCCL_MIN_TRAFFIC_PER_CHANNEL",
-            "NCCL_THREAD_THRESHOLDS",
-        )
-        for key in keys:
-            self.assertEqual(env[key], tp4_env[key], key)
-
-        # Also check alignment with scripts/topology.py oneshot-direct rendering for 3 nodes.
-        nodes_example = json.loads((ROOT / "config/nodes.example.json").read_text())
-        rendered = topology.candidate(cand, nodes_example, "config/nodes.example.json")
-        for key in keys:
-            self.assertEqual(env[key], rendered["environment"][key], key)
-
-        # P2P chunk size (NCCL_BUFFSIZE / 8 steps) is unclamped to GB10s 256 KiB default.
-        self.assertEqual(int(env["NCCL_BUFFSIZE"]) // 8, 524288)
+        self.assertEqual(env["NCCL_ALGO"], "Ring")
+        self.assertEqual(env["NCCL_MIN_NCHANNELS"], "6")
+        self.assertEqual(env["NCCL_MAX_NCHANNELS"], "6")
+        self.assertEqual(env["NCCL_BUFFSIZE"], "8388608")
+        self.assertEqual(env["NCCL_P2P_NET_CHUNKSIZE"], "262144")
+        self.assertEqual(env["NCCL_SWITCHLESS_BIDIRECTIONAL"], "1")
+        self.assertEqual(env["NCCL_MIN_TRAFFIC_PER_CHANNEL"], "512")
+        self.assertEqual(env["NCCL_THREAD_THRESHOLDS"], "-2 -2 -2 1 1 1")
 
     def test_sp_prefill_collectives_exceed_oneshot_4mib_cap_and_preserve_bit_identity(self) -> None:
         # At TP3 prefill chunk = 6144 tokens (L = 2048 rows/rank), verify every SP

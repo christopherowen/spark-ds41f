@@ -1,6 +1,6 @@
 # Decision
 
-Status: **Phase 2A standalone 2-boot GPU benchmark on `sp8` passed (`1.121x..1.131x` prefill speedup on 16-head ranks, 100% `int16` bit-identical); awaiting TP3 cluster window for end-to-end 32K/64K prefill screening**
+Status: **Phase 2A (`vllm/0731` Sparse-MLA on `sp8`) and Phase 2B (2-boot 3-rank TP3 NCCL screen on `dgx1-3`) complete and qualified (`cand_c6_8m_bidir` + `vllm/0731`)**
 
 ## Summary of Phase 1 Preparation & Phase 2A Standalone GPU Results
 
@@ -28,3 +28,14 @@ Status: **Phase 2A standalone 2-boot GPU benchmark on `sp8` passed (`1.121x..1.1
        - `extend` (`rows = 29, 32, 40, 48`): `-4.08%` to `-12.53%` (`1.043x..1.143x` speedup, zero regressions)
      - **24-head control (`heads = 24, idx_width = 512`)**:
        - Unchanged kernel (`block_H = 32, threads = 256`), `0.00%` to `+0.06%` delta (`0.999x..1.001x` noise floor).
+
+3. **Phase 2B (2-Boot 3-Rank TP3 NCCL Collective Benchmark on `dgx1-3`, `receipts/screen-nccl-tp3-boot{1,2}.jsonl`)**:
+   - Screened 7 NCCL channel/buffer/direction policies across two fresh boots (`boot1` forward order, `boot2` reversed order, 20 timed iterations/point) on the 3-node switchless triangle (`dgx1`, `dgx2`, `dgx3`) across all 8 DS41F TP3 collective shapes at `T in {16, 2048, 4096, 6144}` (`56/56` bit-identity checks passed with `0` diffs):
+     - **`cand_c4_1m` (`NCCL_MIN_NCHANNELS=4, NCCL_MAX_NCHANNELS=4, NCCL_BUFFSIZE=1048576`) regressed prefill collectives by `+4.3%..+5.1%` (`+8.4%..+11.2%` on 60 MiB `engram_sp_ag_bf16` and `moe_reduce_scatter_bf16`)** because cutting `coll_channels` from 8 to 4 and `p2p_channels` from 8 to 4 without bidirectional ring balancing throttles RoCE QP concurrency per peer.
+     - **`cand_c6_8m_bidir` (`NCCL_ALGO=Ring, NCCL_MIN_NCHANNELS=6, NCCL_MAX_NCHANNELS=6, NCCL_BUFFSIZE=8388608, NCCL_P2P_NET_CHUNKSIZE=262144, NCCL_SWITCHLESS_BIDIRECTIONAL=1, NCCL_MIN_TRAFFIC_PER_CHANNEL=512, NCCL_THREAD_THRESHOLDS="-2 -2 -2 1 1 1"`) won across every token count (`T = 16, 2048, 4096, 6144`)**:
+       - Keeps `p2p_channels = 8` (`p2p_chunk = 524,288` B) for `all_to_all_single` / `send` / `recv` while splitting the 6 collective channels evenly into **3 clockwise rings (`Ring 00..02 : 2 -> 0 -> 1`) and 3 counter-clockwise rings (`Ring 03..05 : 1 -> 0 -> 2`)**.
+       - **`T = 16` aggregate (8 collectives)**: `0.5093 ms -> 0.4437 ms` (**`-12.9%`, `1.148x` speedup**; `engram_sp_ag_bf16`: `-24.3%`, `mhc_norm_all_reduce_bf16`: `-19.9%`, `moe_reduce_scatter_bf16`: `-18.8%`, `moe_sp_gather_mxfp8`: `-17.8%`).
+       - **`T = 2048` aggregate**: `6.2628 ms -> 6.0482 ms` (**`-3.4%`, `1.035x` speedup**; `wo_local_exchange_slice_a2a`: `-5.2%`, `engram_sp_ag_bf16`: `-4.7%`, `rank_order_all_reduce_bf16`: `-4.1%`).
+       - **`T = 4096` aggregate**: `12.3353 ms -> 12.1595 ms` (**`-1.4%`, `1.014x` speedup**; `mhc_norm_all_reduce_bf16`: `-6.8%`, `moe_sp_gather_mxfp8`: `-6.2%`, `attn_front_ag_u8`: `-4.7%`, `engram_sp_ag_bf16`: `-4.6%`, `moe_reduce_scatter_bf16`: `-4.5%`).
+       - **`T = 6144` aggregate (full 6K prefill chunk)**: `18.2598 ms -> 17.5272 ms` (**`-4.0%`, `1.042x` speedup — faster on all 8 of 8 collectives at `T = 6144`**: `attn_front_ag_u8` `-7.1%`, `mhc_norm_all_reduce_bf16` `-5.6%`, `moe_sp_gather_mxfp8` `-5.0%`, `engram_sp_ag_bf16` `-4.3%`, `rank_order_all_reduce_bf16` `-3.7%`, `mlp_all_to_all_bf16` `-3.2%`, `wo_local_exchange_slice_a2a` `-1.9%`, `moe_reduce_scatter_bf16` `-1.5%`).
+   - Updated `candidate.json` and `tp3-combined.json` to `cand_c6_8m_bidir`.

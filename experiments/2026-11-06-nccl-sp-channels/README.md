@@ -81,6 +81,24 @@
 3. **100% Bit-Identity Proof (`vllm/0731`)**:
    - `segment_chunks` (`4`), `block_I` (`32`), FP32 partial accumulators, the explicit `FOLD` expression (`L = T.fma(l, b, T.fmul(L, a))`), and `wo_input` rotation/quantization are unchanged; `extend`, `decode`, and `split` at `block_H = 16` and `block_H = 32` are bit-identical (`differ == 0` in `int16` view).
 
+
+### 3. Phase 2B 2-Boot 3-Rank TP3 NCCL Collective Benchmark (`dgx1-3`, `receipts/screen-nccl-tp3-boot{1,2}.jsonl`)
+
+- **Bit-identity**: `56/56` checks across `boot1` and `boot2` passed (`differ_ag == 0`, `differ_a2a == 0`, `differ_rank_order_ar == 0`).
+- **Rank-0 NCCL Init Topology (`receipts/nccl-init-boot1-*-rank0.txt`)**:
+  - `control_c8_1m`: `coll_channels=8, p2p_channels=8, p2p_chunk=131072`, 8 unidirectional rings (`Ring 00..07 : 2 -> 0 -> 1`).
+  - `cand_c4_1m`: `coll_channels=4, p2p_channels=4, p2p_chunk=131072`, 4 unidirectional rings (`Ring 00..03 : 2 -> 0 -> 1`).
+  - `cand_c4_4m_bidir`: `coll_channels=4, p2p_channels=4, p2p_chunk=262144`, 2 CW + 2 CCW rings (`Ring 00,03: 2->0->1`, `Ring 01,02: 1->0->2`).
+  - `cand_c4_8m_bidir`: `coll_channels=4, p2p_channels=4, p2p_chunk=524288`, 2 CW + 2 CCW rings (`8 MiB` buffer).
+  - `cand_c6_8m_bidir` (**winner**, updated in `candidate.json` and `tp3-combined.json`): `coll_channels=6, p2p_channels=8, p2p_chunk=524288`, **3 CW rings (`Ring 00..02 : 2 -> 0 -> 1`) + 3 CCW rings (`Ring 03..05 : 1 -> 0 -> 2`)** (`8 MiB` buffer).
+- **Aggregate Latency Across All 8 Collectives (2-boot mean of 3-rank synchronized medians)**:
+  | Token Count `T` | `control_c8_1m` (ms) | `cand_c4_1m` | `cand_c4_4m_bidir` | `cand_c4_8m` | `cand_c4_8m_bidir` | `cand_c6_8m` | `cand_c6_8m_bidir` (**Winner**) |
+  | ---: | ---: | --- | --- | --- | --- | --- | --- |
+  | `16` | `0.5093` | `0.6248` (`+22.7%`) | `0.4575` (`-10.2%`) | `0.4436` (`-12.9%`) | `0.4431` (`-13.0%`) | `0.5172` (`+1.6%`) | **`0.4437` (`-12.9%`, `1.148x`)** |
+  | `2048` | `6.2628` | `6.5331` (`+4.3%`) | `6.2981` (`+0.6%`) | `6.4950` (`+3.7%`) | `6.3034` (`+0.6%`) | `6.2630` (`+0.0%`) | **`6.0482` (`-3.4%`, `1.035x`)** |
+  | `4096` | `12.3353` | `12.9647` (`+5.1%`) | `12.3654` (`+0.2%`) | `12.6670` (`+2.7%`) | `12.2967` (`-0.3%`) | `12.3262` (`-0.1%`) | **`12.1595` (`-1.4%`, `1.014x`)** |
+  | `6144` | `18.2598` | `19.1130` (`+4.7%`) | `18.4717` (`+1.2%`) | `18.8095` (`+3.0%`) | `18.3293` (`+0.4%`) | `18.3633` (`+0.6%`) | **`17.5272` (`-4.0%`, `1.042x`)** |
+
 ## Hypothesis
 
 1. **Arm 1 (`tp3-c4-ring.json` and `candidate.json`)**: Replacing TP3s default 8-channel unidirectional NCCL policy (1 MiB buffer) with 4 Ring channels (`tp3-c4-ring.json`) and the full balanced bidirectional 4-channel Ring + 4 MiB switchless policy (`candidate.json`) will reduce PyNCCL SP collective latency and SM contention during cooled 32K and 64K prefill without regressing decode throughput or altering output bits.
