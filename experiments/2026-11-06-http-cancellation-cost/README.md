@@ -1,6 +1,6 @@
 # HTTP cancellation cost and repeated cancellation
 
-This is a CPU-only follow-up to the [request ownership experiment](../2026-11-05-http-cancellation/README.md).
+This begins with a CPU-only follow-up to the [request ownership experiment](../2026-11-05-http-cancellation/README.md).
 It tests the useful-capacity consequence of abandoned work and closes a further
 cleanup defect. The only causal variable is the exact `api_utils.py` implementation.
 The base deployment commit is `0c91cc7da2b5b689291289dfb190257a52fcf9f9`.
@@ -121,13 +121,15 @@ remaining cost measured here and would change exception propagation semantics.
 Native model arithmetic, batching, scheduler policy, admission capacity, context
 limits and response payloads are unchanged by the source diff. No new arithmetic
 or batch-invariance claim is made: GPU quality, production mixed-agent traffic,
-KV release and model throughput were not exercised. A built candidate image and
-an authorized serving window are required to quantify those effects. This is
+KV release and model throughput were not exercised. A serving comparison is required to quantify those effects. The owner has now
+authorized that comparison; the existing immutable image supports the isolated
+source-overlay procedure described in [hardware/README.md](hardware/README.md). This is
 the strongest tested cleanup implementation among these alternatives, not proof
 of a global optimum or completed serving qualification.
 
-The new source patch and the full 574-patch candidate are recorded here. Both
-profiles remain launch-disabled and unbuilt. Retain the source improvement for
+The new source patch and the full 574-patch candidate are recorded here. The original new-image
+profiles remain launch-disabled and unbuilt. The separate hardware-overlay
+profiles are enabled only for the authorized, exclusively held experiment. Retain the source improvement for
 review; do not promote it from these CPU results alone.
 
 ## Reproduction
@@ -147,3 +149,26 @@ used `run_audit.py`, the saved 15-case `runs/audit-test_api_cancellation.py` sta
 as `test_api_cancellation.py`, and `test_repeated_cancellation.py` together.
 `runs/replay-commands.json` records the fresh full-series replay. No command in
 this experiment authorizes a serving-cluster operation.
+
+## Hardware preparation, not yet GPU evidence
+
+The complete 574-patch source has been freshly prepared and `build check` now
+passes. `runs/build-input-reuse.json`, `runs/build-prepare.log` and
+`runs/build-check-prepared.log` retain the exact prepared inputs and checks; the
+earlier missing-input check remains in the record. No new image was built.
+
+Both hardware profiles use the same already gated, unpromoted candidate-38
+image and the same deadline injection. The full candidate source differs from
+that image's source only in the API helper and its test file. A physical mount
+over the image's actual helper passes all 18 lifetime and 12 boundary cases.
+The actual hardware client and middleware pass two CPU transport checks, and
+two negative window checks prevent foreign ownership or a changed shape from
+reaching an applied operation. Raw commands and receipts are retained.
+
+The planned hardware order is candidate, control, repeat candidate, with native
+engine cancellation observations and the unchanged `screen-tp3` suite. An
+ordinary disconnect and an injected server timeout are separate workloads.
+Correctness with preserved performance is acceptable; an interval containing
+zero is not evidence of preservation if it still permits a material loss.
+The shared hardware is currently reserved; no serving operation or GPU test
+has been performed for this experiment.

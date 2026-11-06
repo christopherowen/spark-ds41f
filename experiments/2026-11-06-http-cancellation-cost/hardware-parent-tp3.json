@@ -1,0 +1,49 @@
+{
+  "notes": "Experimental parent HTTP cleanup on the unchanged candidate-38 image, with identical isolated deadline injection; source overlays are explicitly hashed in hardware/identity.json. Not a new-image qualification. Development RPC is enabled identically for the standard screen suite.",
+  "extends": {
+    "config": "experiments/2026-10-26-spark-ds41f-candidate/candidate-38/tp3.json"
+  },
+  "set": {
+    "container": {
+      "mounts": [
+        [
+          "{home}/.cache/huggingface/hub",
+          "/hub",
+          "ro"
+        ],
+        [
+          "{checkout}/cache",
+          "/cache",
+          "rw"
+        ],
+        [
+          "{home}/.cache/huggingface/hub/models--msuiche--DeepSeek-V4.1-Flash-1017-abliterated-cyber-GLP-39-L1-39-a0.75/snapshots/2715ffd51f59899115853e1118db080536966c44/glp.deepseek-v41-flash-1017-GLP-39-L1-39-a0.75.gguf",
+          "/glp/vector.gguf",
+          "ro"
+        ],
+        [
+          "{checkout}/experiments/2026-11-06-http-cancellation-cost/hardware/parent_api.py",
+          "/opt/spark-ds41f/candidate/vllm/vllm/entrypoints/serve/utils/api_utils.py",
+          "ro"
+        ],
+        [
+          "{checkout}/experiments/2026-11-06-http-cancellation-cost/hardware/http_cancellation_deadline.py",
+          "/opt/spark-ds41f/candidate/vllm/vllm/entrypoints/serve/middleware/http_cancellation_deadline.py",
+          "ro"
+        ]
+      ]
+    },
+    "serve_options": {
+      "--port": "18001",
+      "--middleware": "vllm.entrypoints.serve.middleware.http_cancellation_deadline.DeadlineMiddleware"
+    },
+    "deployment": {
+      "branch": "feat/http-cancellation",
+      "ready_url": "http://127.0.0.1:18001/v1/models",
+      "launch_enabled": true
+    },
+    "environment": {
+      "VLLM_SERVER_DEV_MODE": "1"
+    }
+  }
+}
