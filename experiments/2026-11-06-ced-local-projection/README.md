@@ -277,3 +277,54 @@ come from the existing model runner. `check_needle.py` decodes returned token ID
 on CPU and requires both exact prompt-ID identity and the exact expected JSON
 mapping; it retains raw output text and individual value-presence diagnostics.
 Fixture creation and grader checks are preparation only, not model-quality proof.
+
+
+## Independent SP5-SP7 correctness cohort
+
+The ready bounded payload is two fresh native-test boots on each of SP5, SP6 and
+SP7. Each uses source `51c1a32`, the already-present immutable C36 dependency image
+`3795255f`, six read-only Python mounts and the same native test set used on DGX4.
+This proves native bits on each rank's hardware; it does not prove a distributed
+collective or whole-model prefill performance. There is no timing mode. Containers
+are limited to one CPU/16 GiB, host memory must remain at least 48 GiB, every boot
+starts with the hottest zone below 55 C, and GPU or thermal-zone readings above
+70 C stop only the owned test container. A process is bounded at 600 seconds;
+passive cooling waits are separately bounded at 600 seconds. Every stop and all
+observations are retained. A new batch starts only with sufficient time for its
+bounds and 15 minutes reserved for coordinated recovery, within a 45-minute window.
+
+The existing published recovery authority is
+`sp5:/home/chris/spark-lab/checkouts/clustered-serving` at
+`e9eab4604cf4e46996d28c0bfba8c9fe75f7d282`, clean and identical on all three nodes.
+`experiments/2026-11-04-token-lsa/paged/restore.json` extends the tracked
+`experiments/2026-11-04-clustered-indexer/serving/restore.json`. Its node map selects
+SP5/rank0 (10.30.0.13), SP6/rank1 (10.30.0.14), SP7/rank2 (10.30.0.15) on the existing
+TP3 switched group. Restore image is
+`sha256:e1ee7b1953b1131320746f87fe0cb11a673b53e9702bda63048ea3922768c15a`,
+vLLM tree `af0fb1525fc6aa4149b18dee7d8c3ae5120b6f33`, sparknet tree
+`8cc28a5cd3e683c1f114ed843453e3ce34f323e0`. The unrelated default checkout at
+`806c5797` is not this deployment's authority. No serving checkout is changed by
+the kernel cohort and no new topology is introduced.
+
+`sp567_cohort.py` reuses that exact published controller's coordinated recovery
+functions, selecting the exact live restore-profile name. It adds exact-token
+holds on every participant, fresh scope and idle checks, an independent watchdog
+with a verified startup handshake, native-container cleanup, a restoration lock,
+and independent all-rank identity verification before heartbeat join and release.
+Six CPU guard tests cover foreign/legacy holds, mismatched scope, incorrect global
+holder tokens, recovery targets, verification-before-release and retained recovery
+failure. Restoration failure retains ownership and prevents an automatic restart
+loop. Both start-plan live/shape lines are reviewed by the published recovery
+function; no change-shape bypass is used. The ordinary startup memory guard remains
+in effect. Requests are honored after the current native batch.
+
+Ownership reconciliation and fresh live checks remain mandatory before acquisition.
+The DGX global hold must be absent or explicitly scoped, by its holder, to DGX1-3
+with matching recovery/watchdog targets; another scope blocks this controller.
+All four local hold/request names are checked on every Spaceport, and 30 seconds
+must pass with no running/waiting requests or changed completion counters. SP1-4
+is a separate active cohort and is never touched. The prior stock-cooled SP7 native
+run that stopped after 32/45 requests remains negative evidence, not a completed
+quality reference. Fan-control is absent on these Spaceports, so there is no
+compatible qualified timing reference for this job; immutable 1030 runs remain
+recorded only. Further model/prefill qualification is still outstanding.
