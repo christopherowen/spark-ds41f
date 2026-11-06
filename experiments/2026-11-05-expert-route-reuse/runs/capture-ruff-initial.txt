@@ -1,0 +1,155 @@
+E501 Line too long (90 > 88)
+  --> vllm/models/deepseek_v4_1/route_capture.py:24:89
+   |
+22 |     if len(starts) != nr + 1 or starts[0] != 0:
+23 |         raise ValueError('query-start shape/origin mismatch')
+24 |     if any(a > b for a, b in zip(starts, starts[1:])) or starts[-1] > len(full_positions):
+   |                                                                                         ^^
+25 |         raise ValueError('query starts outside allocated rows')
+26 |     if len(full_positions) != len(full_padding) or len(prefill_lengths) != nr:
+   |
+
+E501 Line too long (99 > 88)
+  --> vllm/models/deepseek_v4_1/route_capture.py:40:89
+   |
+38 |     for selected, request, pos in zip(ids, req_slots, positions):
+39 |         live = [expert for expert in selected if expert >= 0]
+40 |         if len(live) != len(set(live)) or any(expert < -1 or expert >= 384 for expert in selected):
+   |                                                                                         ^^^^^^^^^^^
+41 |             raise ValueError('invalid exact consumed expert IDs')
+42 |         if len(selected) != 6:
+   |
+
+E501 Line too long (92 > 88)
+   --> vllm/models/deepseek_v4_1/route_capture.py:98:89
+    |
+ 96 |                 'limit_reached': self.limited,
+ 97 |                 'timing_usable': False, 'pid': os.getpid()}
+ 98 |         self.path.with_suffix('.summary.json').write_text(json.dumps(data, indent=2) + '\n')
+    |                                                                                         ^^^^
+ 99 |
+100 |     def begin(self, batch, cg_mode, dummy, bonus_tokens, unsupported):
+    |
+
+E501 Line too long (103 > 88)
+   --> vllm/models/deepseek_v4_1/route_capture.py:109:89
+    |
+107 |             raise RuntimeError('route capture requires eager graph mode NONE')
+108 |         if unsupported or bonus_tokens != 1:
+109 |             raise RuntimeError('capture does not support DBO/PCP/batch sharding or multi-anchor steps')
+    |                                                                                         ^^^^^^^^^^^^^^^
+110 |         flags = [bool(v) for v in batch.is_prefilling_np[:batch.num_reqs]]
+111 |         phase = 'prefill' if all(flags) else ('mixed' if any(flags) else 'decode')
+    |
+
+E501 Line too long (92 > 88)
+   --> vllm/models/deepseek_v4_1/route_capture.py:112:89
+    |
+110 |         flags = [bool(v) for v in batch.is_prefilling_np[:batch.num_reqs]]
+111 |         phase = 'prefill' if all(flags) else ('mixed' if any(flags) else 'decode')
+112 |         limits = self.config.get('steps_by_phase', {'prefill': 2, 'mixed': 4, 'decode': 16})
+    |                                                                                         ^^^^
+113 |         if self.limited or self.phases[phase] >= limits[phase]:
+114 |             return
+    |
+
+E501 Line too long (90 > 88)
+   --> vllm/models/deepseek_v4_1/route_capture.py:116:89
+    |
+114 |             return
+115 |         if batch.num_tokens_after_padding > self.config.get('max_rows', 16384):
+116 |             raise RuntimeError('capture row budget exceeded; no invocation was truncated')
+    |                                                                                         ^^
+117 |         names = []
+118 |         for request in batch.req_ids:
+    |
+
+E501 Line too long (104 > 88)
+   --> vllm/models/deepseek_v4_1/route_capture.py:155:89
+    |
+153 |         rows = ids.shape[0]
+154 |         compact = bool(is_decoder and selected is not original_metadata)
+155 |         expected_rows = selected.num_actual_tokens if compact else self.active['full_positions'].numel()
+    |                                                                                         ^^^^^^^^^^^^^^^^
+156 |         if rows != expected_rows or min(selected.positions.numel(), selected.req_id_per_token.numel()) < rows:
+157 |             raise RuntimeError('consumer rows differ from selected attention metadata')
+    |
+
+E501 Line too long (110 > 88)
+   --> vllm/models/deepseek_v4_1/route_capture.py:156:89
+    |
+154 |         compact = bool(is_decoder and selected is not original_metadata)
+155 |         expected_rows = selected.num_actual_tokens if compact else self.active['full_positions'].numel()
+156 |         if rows != expected_rows or min(selected.positions.numel(), selected.req_id_per_token.numel()) < rows:
+    |                                                                                         ^^^^^^^^^^^^^^^^^^^^^^
+157 |             raise RuntimeError('consumer rows differ from selected attention metadata')
+158 |         if layer not in self.scale_cache:
+    |
+
+E501 Line too long (98 > 88)
+   --> vllm/models/deepseek_v4_1/route_capture.py:190:89
+    |
+188 |                       for name, flag in zip(('gate_up', 'down'), flags)}
+189 |             record = {key: self.config[key] for key in
+190 |                       ('workload', 'capture', 'source_tree', 'model_revision', 'workload_sha256')}
+    |                                                                                         ^^^^^^^^^^
+191 |             record.update(evidence_kind='captured', step=item['step'], layer=item['layer'],
+192 |                           phase=active['phase'], experts=384, topk=6, hidden=5120,
+    |
+
+E501 Line too long (91 > 88)
+   --> vllm/models/deepseek_v4_1/route_capture.py:191:89
+    |
+189 |             record = {key: self.config[key] for key in
+190 |                       ('workload', 'capture', 'source_tree', 'model_revision', 'workload_sha256')}
+191 |             record.update(evidence_kind='captured', step=item['step'], layer=item['layer'],
+    |                                                                                         ^^^
+192 |                           phase=active['phase'], experts=384, topk=6, hidden=5120,
+193 |                           tp=tp, decoder_layout=item['decoder_layout'],
+    |
+
+E501 Line too long (90 > 88)
+   --> vllm/models/deepseek_v4_1/route_capture.py:198:89
+    |
+196 |                           scale_bits={str(tp): widths},
+197 |                           scheduler_query_starts=starts,
+198 |                           rows=map_rows(ids.tolist(), req_slots, positions, starts=starts,
+    |                                                                                         ^^
+199 |                               full_positions=full_positions, full_padding=full_padding,
+200 |                               request_names=active['request_names'],
+    |
+
+E501 Line too long (126 > 88)
+   --> vllm/models/deepseek_v4_1/route_capture.py:204:89
+    |
+202 |             line = json.dumps(record, separators=(',', ':')) + '\n'
+203 |             size = len(line.encode())
+204 |             if self.count >= self.config.get('max_records', 96) or self.bytes + size > self.config.get('max_bytes', 67108864):
+    |                                                                                         ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+205 |                 self.limited = True
+206 |                 break
+    |
+
+E702 Multiple statements on one line (semicolon)
+   --> vllm/models/deepseek_v4_1/route_capture.py:207:36
+    |
+205 |                 self.limited = True
+206 |                 break
+207 |             self.handle.write(line); self.handle.flush()
+    |                                    ^
+208 |             self.count += 1; self.bytes += size
+209 |         self.pending.clear()
+    |
+
+E702 Multiple statements on one line (semicolon)
+   --> vllm/models/deepseek_v4_1/route_capture.py:208:28
+    |
+206 |                 break
+207 |             self.handle.write(line); self.handle.flush()
+208 |             self.count += 1; self.bytes += size
+    |                            ^
+209 |         self.pending.clear()
+210 |         self.summary()
+    |
+
+Found 16 errors (2 fixed, 14 remaining).

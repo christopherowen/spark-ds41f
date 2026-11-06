@@ -1,7 +1,7 @@
 # Exact grouped-expert reuse accounting
 
 Status: offline investigation and an unqualified scheduling fix. No GPU execution,
-model boot, performance gain, or promotion is claimed. No real route-ID capture
+model boot, preserved hardware performance, performance gain, or promotion is claimed. No real route-ID capture
 for the requested current code, prose, and distinct agent workloads was found.
 The synthetic unit tests are contract checks, not evidence of those workloads.
 
@@ -167,9 +167,55 @@ from native GPU compilation, bit equality, batch invariance, and model evaluatio
 The task checkout does not have complete build inputs; a complete image build
 check is still required when those inputs are prepared.
 
-Before any performance claim, obtain the real route captures described in
+Before any faster-expert-reuse claim, obtain the real route captures described in
 `lab-plan.md`, analyze code, prose, and distinct agent requests separately, and
 qualify the source patch on idle hardware. Candidate measurements require a boot
 and repeat boot with confidence intervals, compared with immutable recorded
 references. Do not rerun a released baseline. If the remaining loads or measured
 cost do not improve, reject the scheduling change. No promotion is proposed.
+
+
+## Correctness acceptance and separate optional tuning
+
+Before hardware execution, the owner clarified that a correctness improvement
+with no performance loss is acceptable. This does not turn the ordering audit
+into a speed claim. The required behavior repair is that an explicitly positive
+swizzle panel actually takes effect, while the default remains unchanged.
+
+The `contract-before` bundle mode runs the final four generated-code assertions
+against the untouched candidate-38 file. It accepts only four AssertionErrors
+containing the swizzle marker, with no import, compiler, device or skipped-test
+failure. The `gate` mode runs those assertions and the 20 native output-bit
+cases against the fix. Expected old failures and all new outputs remain raw
+receipts. The final default comparison loads both actual source modules in one
+process, shares prepared weights/inputs/output/workspace, verifies native
+compiled-source equality, and compares full output bits before timing.
+
+Run `default` twice in fresh processes on a qualified node. There are 30
+synthetic geometry/routing cases across both shard widths; each has eight input
+blocks, six timing replays and three whole-MoE calls per graph. Across the 48
+replays each of two arms appears first 24 times; the six-panel screen likewise
+places each arm at each position eight times. A CPU test protects this balance.
+The initial rotate-plus-reverse formula would have cancelled ordering changes
+for two arms; this was corrected before any hardware run.
+
+Predeclared component preservation screen: in each run, every case's paired
+95% upper bound on added latency must be below 1%, with unchanged workspace
+size and exact output bits. Report repeat variation and per-case intervals; a
+wide interval containing a meaningful regression is inconclusive, not neutral.
+This is a conservative experiment threshold, not a replacement for the
+repository's serving comparison/noise bounds. Two process runs do not claim two
+serving boots. Default native-code identity supports a proportionate component
+qualification; optional panel speed, model boot/throughput and actual-route
+claims remain separate and unproved until their own evidence exists.
+
+The dual-module CPU rehearsal covers all 16 grouped-GEMM tiers/widths and passes.
+The unchanged SwiGLU helper asks the real GPU for vector width, so the first
+CPU-only attempt stopped with a missing-driver error. Its failed log is kept;
+CPU checks skip that unchanged helper, while native default mode compares it.
+
+The capture prototype now has exact consumer hooks and ten CPU row-join tests.
+It uses each layer's actual attention metadata key and explicit CED tag, the
+GPU query starts, and request/position coordinates. Native integration and a
+published serving capture profile remain pending. `capture/README.md` records
+its separate source identity and limits; it is not part of source PR #5.

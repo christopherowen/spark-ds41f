@@ -1,0 +1,39 @@
+Using CPython 3.12.3 interpreter at: /usr/bin/python3
+Creating virtual environment at: /tmp/route-venv
+WARNING 11-06 00:01:33 [interface.py:369] Failed to import from vllm._C: ModuleNotFoundError("No module named 'vllm._C'")
+W1106 00:01:33.111000 11 torch/utils/cpp_extension.py:178] No CUDA runtime is found, using CUDA_HOME='/usr/local/cuda'
+[00:01:34] /workspace/tilelang/src/transform/legalize_vectorized_loop.cc:85: Warning: T.vectorized loop over `vec` with extent 2 is lowered as a serial loop because TileLang could not find a valid vectorization plan. Scalar accumulator updates inside the loop are a common cause; move reductions to T.unroll or T.serial if this is intended.
+[00:01:35] /workspace/tilelang/src/transform/legalize_vectorized_loop.cc:85: Warning: T.vectorized loop over `vec` with extent 2 is lowered as a serial loop because TileLang could not find a valid vectorization plan. Scalar accumulator updates inside the loop are a common cause; move reductions to T.unroll or T.serial if this is intended.
+[00:01:35] /workspace/tilelang/src/transform/legalize_vectorized_loop.cc:85: Warning: T.vectorized loop over `vec` with extent 2 is lowered as a serial loop because TileLang could not find a valid vectorization plan. Scalar accumulator updates inside the loop are a common cause; move reductions to T.unroll or T.serial if this is intended.
+[00:01:36] /workspace/tilelang/src/transform/legalize_vectorized_loop.cc:85: Warning: T.vectorized loop over `vec` with extent 2 is lowered as a serial loop because TileLang could not find a valid vectorization plan. Scalar accumulator updates inside the loop are a common cause; move reductions to T.unroll or T.serial if this is intended.
+Traceback (most recent call last):
+  File "/experiment/check_default_pair.py", line 25, in <module>
+    tir = factory.get_tir(*args, **kwargs)
+          ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/usr/local/lib/python3.12/dist-packages/tilelang/jit/__init__.py", line 388, in get_tir
+    tir = self.func(*args, **kwargs)
+          ^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/usr/local/lib/python3.12/dist-packages/tilelang/language/eager/builder.py", line 1719, in __call__
+    return self.get_tir(*args, **kwargs)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/usr/local/lib/python3.12/dist-packages/tilelang/language/eager/builder.py", line 1711, in get_tir
+    self.p1_cache[bound.p1_key] = self._build_tir_template(**bound.compile_kwargs)
+                                  ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/usr/local/lib/python3.12/dist-packages/tilelang/language/eager/builder.py", line 1679, in _build_tir_template
+    return TirTemplate.from_lazy_style(self.orig_func.__name__, self.orig_func(*args, **kwargs))
+                                                                ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/experiment/bundles/swizzle-screen/control_moe.py", line 1179, in moe_swiglu_cast
+    math.gcd(intermediate, get_best_vectorize_size(in_dtype) * warp) // warp, 1
+                           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/opt/spark-ds41f/candidate/vllm/vllm/models/deepseek_v4_1/tilelang/quant_common.py", line 86, in get_best_vectorize_size
+    major, _ = torch.cuda.get_device_capability()
+               ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/usr/local/lib/python3.12/dist-packages/torch/cuda/__init__.py", line 720, in get_device_capability
+    prop = get_device_properties(device)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/usr/local/lib/python3.12/dist-packages/torch/cuda/__init__.py", line 737, in get_device_properties
+    _lazy_init()  # will define _get_device_properties
+    ^^^^^^^^^^^^
+  File "/usr/local/lib/python3.12/dist-packages/torch/cuda/__init__.py", line 529, in _lazy_init
+    torch._C._cuda_init()
+RuntimeError: Found no NVIDIA driver on your system. Please check that you have an NVIDIA GPU and installed a driver from http://www.nvidia.com/Download/index.aspx

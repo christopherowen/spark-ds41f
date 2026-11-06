@@ -6,8 +6,9 @@ A process repeat is not a serving boot; no serving-performance claim is made.
 """
 import argparse
 import hashlib
+import importlib.util
+import sys
 import json
-import math
 from pathlib import Path
 import statistics
 import subprocess
@@ -17,10 +18,11 @@ import tile_kernels
 from vllm.config import VllmConfig, set_current_vllm_config
 from vllm.models.deepseek_v4_1.tilelang import moe
 from vllm.models.deepseek_v4_1.tilelang.linear import cast_mxfp8
+from screen_statistics import arm_order, interval
 
 E, TOPK, H = 384, 6, 5120
 PANELS = (0, 1, 2, 3, 4, 8)
-SAMPLES, REPLAYS, CALLS = 8, 5, 3
+SAMPLES, REPLAYS, CALLS = 8, 6, 3
 
 
 def emit(kind, **values):
@@ -92,15 +94,11 @@ def elapsed(capture):
     return a.elapsed_time(b) * 1000 / CALLS
 
 
-def interval(values):
-    mean = statistics.fmean(values)
-    half = 2.365 * statistics.stdev(values) / math.sqrt(len(values))  # t(7), eight input blocks
-    return [mean - half, mean + half]
-
-
 def case(plans, prepared, rows, routing, tp, process_id):
-    workspace = torch.empty(max(moe.workspace_bytes(p.workspace_specs(rows, torch.int32))
-                                for p in plans.values()), dtype=torch.uint8, device='cuda')
+    workspace_sizes = {arm: moe.workspace_bytes(p.workspace_specs(rows, torch.int32))
+                       for arm, p in plans.items()}
+    assert len(set(workspace_sizes.values())) == 1, ('workspace changed', workspace_sizes)
+    workspace = torch.empty(workspace_sizes[0], dtype=torch.uint8, device='cuda')
     times = {p: [] for p in plans}
     route_hashes = []
     for sample in range(SAMPLES):
@@ -138,10 +136,7 @@ def case(plans, prepared, rows, routing, tp, process_id):
         raw = {p: [] for p in plans}
         panels = list(plans)
         for repeat in range(REPLAYS):
-            offset = (sample + repeat) % len(panels)
-            order = panels[offset:] + panels[:offset]
-            if (sample + repeat) % 2:
-                order.reverse()
+            order = arm_order(panels, sample * REPLAYS + repeat)
             for panel in order:
                 raw[panel].append(elapsed(captures[panel]))
         medians = {p: statistics.median(v) for p, v in raw.items()}
@@ -157,7 +152,7 @@ def case(plans, prepared, rows, routing, tp, process_id):
     for panel in plans:
         differences = [b-a for a, b in zip(times[0], times[panel])]
         ratios = [100*(b/a-1) for a, b in zip(times[0], times[panel])]
-        result.append({'panel': panel, 'before_us': statistics.fmean(times[0]),
+        result.append({'arm': panel, 'before_us': statistics.fmean(times[0]),
                        'after_us': statistics.fmean(times[panel]),
                        'difference_us': statistics.fmean(differences),
                        'difference_95_interval_us': interval(differences),
@@ -165,7 +160,7 @@ def case(plans, prepared, rows, routing, tp, process_id):
                        'change_95_interval_percent': interval(ratios)})
     emit('case', process_id=process_id, tp_projection=tp, rows=rows, routing=routing,
          evidence_kind='synthetic', tile_height=plans[0].tile_height(rows),
-         route_hashes=route_hashes, comparisons=result, gpu=gpu_state())
+         route_hashes=route_hashes, workspace_bytes=workspace_sizes, comparisons=result, gpu=gpu_state())
     del workspace
 
 
@@ -175,24 +170,54 @@ def main():
     parser.add_argument('--source-commit', required=True)
     parser.add_argument('--source-sha256', required=True)
     parser.add_argument('--smoke', action='store_true')
+    parser.add_argument('--default-comparison', action='store_true')
+    parser.add_argument('--control-source-sha256')
     args = parser.parse_args()
     source_hash = hashlib.sha256(Path(moe.__file__).read_bytes()).hexdigest()
     assert source_hash == args.source_sha256, 'source differs from the published candidate'
+    control = None
+    if args.default_comparison:
+        path = Path('/b/control_moe.py')
+        assert hashlib.sha256(path.read_bytes()).hexdigest() == args.control_source_sha256
+        spec = importlib.util.spec_from_file_location(
+            'vllm.models.deepseek_v4_1.tilelang._control_moe', path)
+        control = importlib.util.module_from_spec(spec)
+        sys.modules[spec.name] = control
+        spec.loader.exec_module(control)
     torch.set_num_threads(2)
     emit('identity', process_id=args.process_id, source_commit=args.source_commit,
          source_sha256=source_hash, torch=torch.__version__, cuda=torch.version.cuda,
          cache_policy='two warmups per arm; three repeated calls per CUDA graph; no explicit L2 flush',
-         samples=SAMPLES, replays=REPLAYS, calls=CALLS, control='unreleased same-commit panel 0',
+         samples=SAMPLES, replays=REPLAYS, calls=CALLS, control=('unreleased candidate-38 default' if control else 'unreleased same-commit panel 0'),
          timing_scope='whole routed-MoE plan, one GPU; not serving throughput or physical TP topology',
+         arms=({'0': 'untouched candidate-38 default', '1': 'fixed default'}
+               if args.default_comparison else {str(p): 'explicit panel ' + str(p) for p in PANELS}),
+         control_source_commit=('1f33102547e4da5c64712390604695d1abd577c4' if control else args.source_commit),
+         control_source_sha256=args.control_source_sha256,
          gpu=gpu_state())
     with set_current_vllm_config(VllmConfig()):
         for tp in ((4,) if args.smoke else (3, 4)):
             inter = 2304 // tp
             panels = (0, 2, 3) if args.smoke else PANELS
-            plans = {panel: moe.MoeExpertsV41Plan(E, TOPK, H, inter, swiglu_limit=10.,
-                                                prefill_swizzle_panel=panel) for panel in panels}
+            if control is None:
+                plans = {panel: moe.MoeExpertsV41Plan(E, TOPK, H, inter, swiglu_limit=10.,
+                                                    prefill_swizzle_panel=panel) for panel in panels}
+            else:
+                plans = {0: control.MoeExpertsV41Plan(E, TOPK, H, inter, swiglu_limit=10.),
+                         1: moe.MoeExpertsV41Plan(E, TOPK, H, inter, swiglu_limit=10.)}
             for plan in plans.values():
                 plan.declare_kernels()
+            if control is not None:
+                generated = []
+                for name, (factory, call_args, kwargs) in plans[0].kernels().items():
+                    old = factory(*call_args, **kwargs).get_kernel_source()
+                    new_factory, new_args, new_kwargs = plans[1].kernels()[name]
+                    new = new_factory(*new_args, **new_kwargs).get_kernel_source()
+                    assert old == new, ('default compiled source differs', tp, name)
+                    assert factory.pass_configs == new_factory.pass_configs
+                    generated.append({'kernel': name, 'sha256': hashlib.sha256(old.encode()).hexdigest()})
+                emit('default_native_compilation', tp_projection=tp,
+                     equal_generated_sources=generated, compilation_settings_equal=True)
             tile_kernels.config.set_token_alignment(32)
             prepared = weights(plans[0])
             points = [(2048, 'uniform')] if args.smoke else (

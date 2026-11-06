@@ -37,8 +37,8 @@ The current saved captures inspected on dgx1 do not contain the consumed expert
 IDs needed here. They contain earlier gate/fingerprint, shared-projection, or
 transport data. They cannot establish current route overlap. A new collector
 needs both post-mask route IDs at `RoutedExperts.run` and the scheduler's actual
-row-to-request/anchor/draft mapping. This integration is not implemented yet;
-there is no executable capture profile to approve at this stage.
+row-to-request/anchor/draft mapping. The experiment-only integration is now prepared with ten CPU mapping tests;
+native integration and a published serving capture profile remain pending.
 
 The collector must preserve native IDs and weights, record actual allocated rows
 including graph padding, identify target/drafter and layer, hash the source tree
@@ -99,3 +99,18 @@ the full path: representative cold 32K through 1M prefill, decode concurrency
 95% intervals, exact workload/source/image identities and cooling/fan receipts.
 Use immutable recorded release references for release comparisons. A full-path
 regression, neutral result or remaining hardware block must remain explicit.
+
+
+## Correctness-first completion criterion
+
+The owner accepts a correctness repair with preserved performance. Therefore
+finish the explicit-swizzle reproducer, native correctness and default
+preservation comparison independently of optional faster-panel selection.
+The prior ignored option must fail exactly the relevant four assertions; the
+fixed implementation must pass them and native output equality. Paired default
+mode uses the unreleased old source and fixed source side by side with shared
+weights and buffers. Run it twice with the repository cooling/fan policy and
+retain all cases, uncertainty and failures. The predeclared component screen
+requires every paired 95% upper added-latency bound below 1% and unchanged
+workspace. Wide intervals are inconclusive. Do not call process repeats model
+boots or extrapolate component evidence to serving throughput.

@@ -10,6 +10,7 @@ import json
 import os
 from pathlib import Path
 import re
+import socket
 import subprocess
 import sys
 import threading
@@ -17,7 +18,7 @@ import time
 
 ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(ROOT))
-from spark_ds41f import lab
+from spark_ds41f import bench, lab
 
 
 def command(*args):
@@ -40,7 +41,7 @@ def available():
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument('--mode', choices=('gate', 'smoke', 'full'), required=True)
+    parser.add_argument('--mode', choices=('gate', 'contract-before', 'default', 'smoke', 'full'), required=True)
     parser.add_argument('--process-id', required=True)
     parser.add_argument('--holder', required=True)
     parser.add_argument('--window', required=True)
@@ -58,7 +59,12 @@ def main():
     original = lab.bundle_command
     def bounded(bundle, candidate, out):
         result = original(bundle, candidate, out)
-        result[2:2] = ['--name', name, '--network', 'none', '--cpus', '2',
+        if args.mode == 'contract-before':
+            destination = ':/opt/spark-ds41f/candidate/vllm/vllm/models/deepseek_v4_1/tilelang/moe.py:ro'
+            hits = [i for i, value in enumerate(result) if value.endswith(destination)]
+            assert len(hits) == 1
+            result[hits[0]] = str(bundle / 'control_moe.py') + destination
+        result[2:2] = ['--name', name, '--label', 'expert-route-window=' + args.window, '--network', 'none', '--cpus', '2',
                        '--memory', '16g', '--memory-swap', '16g']
         return result + ['--mode', args.mode, '--process-id', args.process_id]
     lab.bundle_command = bounded
@@ -80,21 +86,32 @@ def main():
         raise RuntimeError('serving container present')
     fan = subprocess.run(['systemctl', 'is-active', 'dgx-fan-control.service'],
                          capture_output=True, text=True, timeout=15)
-    if args.mode != 'gate' and (fan.returncode or fan.stdout.strip() != 'active'):
-        raise RuntimeError('performance screen requires the existing performance fan curve')
-    if thermal() >= 55:
-        raise RuntimeError('cool below 55 C before starting this process')
+    performance = args.mode not in ('gate', 'contract-before')
+    if not performance and thermal() >= 55:
+        raise RuntimeError('cool below 55 C before starting this correctness process')
+    if command('nvidia-smi', '--query-compute-apps=pid', '--format=csv,noheader').strip():
+        raise RuntimeError('another GPU compute process is present')
     if available() < 24 * 1024**3:
         raise RuntimeError('less than 24 GiB host memory available')
+    # Use the repository's existing fan/cooling implementation on this node.
+    # Only its SSH transport is replaced with a checked local subprocess.
+    node = {'name': socket.gethostname()}
+    nodes = {'nodes': [node]}
+    def local_transport(_nodes, target, *argv):
+        if target['name'] != node['name']:
+            raise RuntimeError('fan transport must stay on this node')
+        return subprocess.run(argv, capture_output=True, text=True, timeout=30)
+    bench.run_ssh = local_transport
     out = Path(args.out).resolve()
     out.mkdir(parents=True, exist_ok=False)
     state = {'deployment_commit': revision, 'process_id': args.process_id,
              'mode': args.mode, 'holder': args.holder, 'window': args.window,
              'cpu_limit': 2, 'memory_limit_gib': 16,
-             'fan_service': fan.stdout.strip(), 'start_c': thermal(),
+             'fan_service': fan.stdout.strip(), 'fan_service_before': fan.stdout.strip(),
+             'performance_mode': performance, 'start_c': thermal(),
              'host_boot_id': Path('/proc/sys/kernel/random/boot_id').read_text().strip(),
              'started': dt.datetime.now(dt.timezone.utc).isoformat(),
-             'stop_reason': None, 'samples': []}
+             'stop_reason': None, 'samples': [], 'fan_curve': [], 'cooling': []}
     stop = threading.Event()
     def monitor():
         while not stop.is_set():
@@ -124,6 +141,14 @@ def main():
     watcher = threading.Thread(target=monitor, daemon=True)
     watcher.start()
     try:
+        if performance:
+            state['cooling'] = bench.cool_nodes(nodes, [node], 55, 600)
+            state['fan_curve'] = bench.start_fan_curve(nodes, [node])
+            problems = bench.fan_curve_problems(state['fan_curve'])
+            if problems:
+                raise RuntimeError('; '.join(problems))
+            state['fan_service'] = 'active'
+        own_hold()
         if state['stop_reason']:
             raise RuntimeError(state['stop_reason'])
         result = lab.kernel_local(str(bundle), str(out), False)
@@ -140,9 +165,12 @@ def main():
                 raise RuntimeError('native gate did not pass tests: ' + str(gate))
         return result
     finally:
+        state['fan_stop_failures'] = bench.stop_fan_curve(nodes, [node], state['fan_curve'])
         stop.set(); watcher.join(timeout=25)
         state['finished'] = dt.datetime.now(dt.timezone.utc).isoformat()
         (out / 'resources.json').write_text(json.dumps(state, indent=2) + '\n')
+        if state['fan_stop_failures']:
+            raise RuntimeError('fan restoration failed: ' + str(state['fan_stop_failures']))
 
 
 if __name__ == '__main__':

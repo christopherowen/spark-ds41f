@@ -173,8 +173,8 @@ The wrapper retains `kernel-local`'s serving refusal and shared GPU lock, makes
 lock acquisition nonblocking, caps Docker at two CPUs/16 GiB/no swap, and records
 five-second host thermal/memory readings. It aborts its own container at 85 C,
 below 12 GiB available memory, lost ownership, or 45 minutes. It starts below
-55 C with at least 24 GiB available. Performance modes require the existing
-performance fan service active. No fan software is installed by this experiment.
+55 C with at least 24 GiB available. Performance modes invoke the repository cooling and performance fan helpers
+and require their success, restoring the prior fan-service state afterward. No fan software is installed by this experiment.
 The first host inspection found no fan service on sp8; performance there remains
 blocked unless the established fan policy is clarified. Correctness alone does
 not establish a speedup. The controller reads the dgx1 hold immediately before
@@ -189,7 +189,7 @@ python3 experiments/2026-11-05-expert-route-reuse/run_screen.py \
 Remove `--dry-run` only after publication, exclusive handoff and the documented
 hold/resource checks. Run gate, smoke, full A and full B as separate processes;
 these are process repeats, not serving boots. Full serving qualification remains
-separate. The paired screen uses eight input blocks, five timing replays per arm
+separate. The paired screen uses eight input blocks, six timing replays per arm
 and three whole-plan calls per CUDA graph. Arm order rotates/reverses; all arms
 share weights, activations, routes, workspace and output address. It compares
 panels 0/1/2/3/4/8, TP3/TP4 shard geometry on one GPU, low-overlap synthetic
@@ -206,3 +206,42 @@ fresh index at the candidate-38 base. The earlier full 572-patch preparation is
 retained rather than repeated. `screen-dry-run.txt` records the exact bounded
 Docker plan. Complete task build inputs are still absent, so a full build check
 is deferred until preparation of a serving image.
+
+
+## Correctness preservation comparison, before hardware execution
+
+The acceptance criterion is now a demonstrated correctness repair with no
+material performance loss; a speedup is optional. `default` loads the untouched
+candidate-38 module and the fixed module in one process, with one shared weight
+copy. This avoids the previously recorded memory-placement confound. All 16
+CPU grouped-GEMM default sources match (`default-pair-cpu.txt`). The first probe
+also attempted the unchanged SwiGLU helper, which queries the real GPU's vector
+width; `default-pair-cpu-no-driver-failed.txt` retains that setup failure. No GPU
+access was enabled to evade the shared hold. Native mode checks every plan
+kernel, including that helper, on the actual hardware.
+
+The wrapper uses the existing bench fan/cooling functions through a local
+transport for the selected node. DGX4 has the required fan service installed
+(read-only inspection); sp8 does not. An independently launched `watch_screen.py`
+user unit stops only the exact named/container-window-labelled job if the main
+unit ends or its hold heartbeat ages beyond 120 seconds. It is separate from
+the global lab watchdog, which still owns production restoration. Watchdog
+output and resource receipts remain beside each job. Start the watchdog as a
+separate user unit immediately after the bounded main unit, before leaving the
+job unattended. Both need the same holder/window/process identity.
+
+```sh
+python3 experiments/2026-11-05-expert-route-reuse/run_screen.py \
+  --mode contract-before --process-id contract-before --holder HOLDER \
+  --window WINDOW --out /node-local/contract-before --dry-run
+# After exclusive handoff: contract-before, gate-a, default-a, gate-b, default-b.
+# Run each under a remote user unit with CPUQuota=200%, MemoryMax=8G,
+# TasksMax=128; Docker additionally has 2 CPUs/16 GiB/no swap.
+python3 experiments/2026-11-05-expert-route-reuse/watch_screen.py \
+  --unit MAIN_UNIT.service --process-id PROCESS --holder HOLDER \
+  --window WINDOW --out /node-local/PROCESS
+```
+
+The mode/order specification above is a plan, not a receipt of GPU execution.
+All `--apply` serving operations remain separate coordinated commands with the
+named committed profile; this isolated kernel phase requires none.
