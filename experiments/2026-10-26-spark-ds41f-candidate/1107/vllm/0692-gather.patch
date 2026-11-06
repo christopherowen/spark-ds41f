@@ -1,0 +1,622 @@
+From 6ee0d76e987ab5a13a64032582bc3da945ce3eae Mon Sep 17 00:00:00 2001
+From: Christopher Owen <3221756+christopherowen@users.noreply.github.com>
+Date: Wed, 4 Nov 2026 12:35:06 +0100
+Subject: [PATCH] perf(tilelang): gather column shards directly into serving
+ buffers
+
+Upstream base: local-inference-lab/vllm 19f2c20ed4d64ae22bd009ceacadd85e2a81e354 plus candidate-38 (1f33102547e4da5c64712390604695d1abd577c4).
+
+The compressor materializes concatenated gathered columns before copying them into its value/gate buffers. Sharded vision additionally copies unpadded column slices. Gather rank-major rows and fuse layout conversion, unpadding and final stores into one TileLang launch. Preserve exact payload bits, output ownership and stream order. Validate layouts explicitly and declare both scalar and aligned-vector kernels before cache freeze.
+
+Quality: no projection or accumulation arithmetic changes. Collective payload bytes are unchanged; requested gather layout changes to dim zero and still requires distributed serving qualification. Tests cover independent concatenation, one/two outputs, topology widths, tails, striding, NaN/signed-zero bits, poisoned padding, large row grids and CUDA replay. Native receipts are retained with the deployment experiment. Upstream status: local candidate, not submitted.
+---
+ .../kernels/test_deepseek_v41_gather_into.py  | 113 +++++++++++++
+ tests/models/test_deepseek_v4_1_compressor.py |  10 +-
+ vllm/models/deepseek_v4_1/compressor.py       |  33 +++-
+ .../deepseek_v4_1/nvidia/tilelang_vision.py   |  55 ++++--
+ .../deepseek_v4_1/tilelang/collectives.py     |  68 ++++++--
+ vllm/models/deepseek_v4_1/tilelang/gather.py  | 156 ++++++++++++++++++
+ 6 files changed, 399 insertions(+), 36 deletions(-)
+ create mode 100644 tests/kernels/test_deepseek_v41_gather_into.py
+ create mode 100644 vllm/models/deepseek_v4_1/tilelang/gather.py
+
+diff --git a/tests/kernels/test_deepseek_v41_gather_into.py b/tests/kernels/test_deepseek_v41_gather_into.py
+new file mode 100644
+index 0000000000..49a70709fc
+--- /dev/null
++++ b/tests/kernels/test_deepseek_v41_gather_into.py
+@@ -0,0 +1,113 @@
++# SPDX-License-Identifier: Apache-2.0
++# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
++"""Rank-major gather to final buffers, against an independent concatenation."""
++
++import pytest
++import torch
++
++pytest.importorskip("tilelang")
++from vllm.models.deepseek_v4_1.tilelang.gather import gather_columns_into
++
++pytestmark = pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
++CASES = [
++    (1, 1, 7, 17, 17),
++    (2, 1, 7, 16, 29),
++    (3, 1, 9, 32, 91),
++    (4, 2, 7, 128, 512),
++    (8, 2, 17, 64, 512),
++    (4, 2, 0, 128, 512),
++    (3, 1, 65537, 16, 48),
++]
++
++
++@pytest.mark.parametrize("case", CASES)
++@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float32])
++@pytest.mark.parametrize("layout", ["dense", "padded", "offset"])
++def test_gather_bits_and_output_bounds(case, dtype, layout):
++    world, parts, rows, local, full = case
++    src = torch.randn((world * parts * rows, local), dtype=dtype, device="cuda")
++    reference = src.view(world, parts, rows, local)
++    expected = [
++        torch.cat([reference[r, p] for r in range(world)], dim=1)[:, :full]
++        for p in range(parts)
++    ]
++    padding = (
++        16 + (-full) % (16 // src.element_size())
++        if layout == "padded"
++        else 3
++        if layout == "offset"
++        else 0
++    )
++    offset = 1 if layout == "offset" else 0
++    storage = [
++        torch.full((rows, full + padding), -123, dtype=dtype, device="cuda")
++        for _ in range(parts)
++    ]
++    outputs = tuple(t[:, offset : offset + full] for t in storage)
++    gather_columns_into(src, outputs, world)
++    bit_dtype = torch.int16 if dtype == torch.bfloat16 else torch.int32
++    for backing, out, want in zip(storage, outputs, expected):
++        assert torch.equal(out.view(bit_dtype), want.view(bit_dtype))
++        assert (backing[:, :offset] == -123).all()
++        assert (backing[:, offset + full :] == -123).all()
++
++
++def test_floating_point_payloads_survive_the_copy():
++    src = torch.randn((12, 16), device="cuda")
++    src.view(torch.int32)[0, :4] = torch.tensor(
++        [0, -2147483648, 2143289345, 2139095040], dtype=torch.int32, device="cuda"
++    )
++    out = torch.empty((3, 64), device="cuda")
++    gather_columns_into(src, (out,), 4)
++    expected = torch.cat(list(src.view(4, 3, 16)), dim=1)
++    assert torch.equal(out.view(torch.int32), expected.view(torch.int32))
++
++
++def test_graph_replay_reads_new_payloads():
++    src = torch.randn((4 * 2 * 7, 128), device="cuda")
++    outputs = tuple(torch.empty((7, 512), device="cuda") for _ in range(2))
++    gather_columns_into(src, outputs, 4)
++    graph = torch.cuda.CUDAGraph()
++    with torch.cuda.graph(graph):
++        gather_columns_into(src, outputs, 4)
++    for seed in (1, 2, 3):
++        torch.manual_seed(seed)
++        src.normal_()
++        graph.replay()
++        torch.cuda.synchronize()
++        for part, out in enumerate(outputs):
++            expected = torch.cat(
++                [src.view(4, 2, 7, 128)[r, part] for r in range(4)], dim=1
++            )
++            assert torch.equal(out, expected)
++
++
++def test_bad_layouts_fail_explicitly():
++    src = torch.empty((8, 16), device="cuda")
++    with pytest.raises(ValueError, match="overlap"):
++        gather_columns_into(src, (src,), 1)
++    with pytest.raises(ValueError, match="source shape"):
++        gather_columns_into(src, (torch.empty((3, 32), device="cuda"),), 2)
++    with pytest.raises(ValueError, match="contiguous"):
++        gather_columns_into(src.t(), (torch.empty((8, 32), device="cuda"),), 2)
++
++
++@pytest.mark.parametrize(
++    "dtype", [torch.bfloat16, torch.float32, torch.int64, torch.complex64]
++)
++@pytest.mark.parametrize("width", [1, 5, 17])
++def test_collective_tail_rows_use_tilelang_and_preserve_bytes(dtype, width):
++    from vllm.models.deepseek_v4_1.tilelang.collectives import concat_rank_shards
++
++    src = torch.arange(3 * 7 * width, device="cuda").to(dtype).view(21, width)
++    expected = torch.cat(list(src.view(3, 7, width)), dim=1)
++    got = concat_rank_shards(src, 3, (7, width))
++    assert got is not None
++    assert torch.equal(got.view(torch.uint8), expected.view(torch.uint8))
++
++
++def test_overlapping_output_rows_are_rejected_before_launch():
++    src = torch.empty((8, 16), device="cuda")
++    output = torch.empty((1, 32), device="cuda").expand(4, 32)
++    with pytest.raises(ValueError, match="rows must not overlap"):
++        gather_columns_into(src, (output,), 2)
+diff --git a/tests/models/test_deepseek_v4_1_compressor.py b/tests/models/test_deepseek_v4_1_compressor.py
+index 01b45c20b1..c29906e61e 100644
+--- a/tests/models/test_deepseek_v4_1_compressor.py
++++ b/tests/models/test_deepseek_v4_1_compressor.py
+@@ -564,12 +564,14 @@ def test_compressor_tp_sharded_fused_wkv_wgate_matches_tp1(monkeypatch, ratio):
+                 local = comp._local_shards[: ratio * rows].view(ratio, rows, 128)
+                 project_parts(comp.fused_wkv_wgate, inp, tuple(local), rows)
+                 shards.append(local.clone())
+-            gathered = torch.cat(shards, dim=-1)
++            def all_gather_rows(tensor, dim=-1, rows=rows, shards=shards):
++                assert dim == 0
++                assert tensor.shape == (ratio * rows, 128)
++                assert torch.equal(tensor.view(ratio, rows, 128), shards[0])
++                return torch.cat([s.view(ratio * rows, 128) for s in shards], dim=0)
+ 
+             monkeypatch.setattr(
+-                comp_mod,
+-                "tensor_model_parallel_all_gather",
+-                lambda tensor, dim=-1: gathered,
++                comp_mod, "tensor_model_parallel_all_gather", all_gather_rows
+             )
+             ranks[0]._project(inp)
+             assert torch.equal(ranks[0]._values[:rows], ref_values), f"rows={rows}"
+diff --git a/vllm/models/deepseek_v4_1/compressor.py b/vllm/models/deepseek_v4_1/compressor.py
+index 7fc8a08435..cf1df4c395 100644
+--- a/vllm/models/deepseek_v4_1/compressor.py
++++ b/vllm/models/deepseek_v4_1/compressor.py
+@@ -169,7 +169,7 @@ class DeepseekCompressor(nn.Module):
+         dev = torch.device(device)
+         if dev.type == "cuda" and dev.index is None:
+             dev = torch.device("cuda", torch.cuda.current_device())
+-        tp_size = int(getattr(self.fused_wkv_wgate, "tp_size", 1))
++        tp_size = int(getattr(getattr(self, "fused_wkv_wgate", None), "tp_size", 1))
+         key = (dev, int(t), int(r), int(self.compress_ratio), tp_size)
+         shared = _SHARED_BUFFERS.get(key)
+         if shared is None:
+@@ -194,7 +194,7 @@ class DeepseekCompressor(nn.Module):
+         from vllm.models.deepseek_v4_1.tilelang.linear import project_parts
+ 
+         rows = hidden_states.shape[0]
+-        tp_size = int(getattr(self.fused_wkv_wgate, "tp_size", 1))
++        tp_size = int(getattr(getattr(self, "fused_wkv_wgate", None), "tp_size", 1))
+         if tp_size <= 1:
+             project_parts(
+                 self.fused_wkv_wgate,
+@@ -213,10 +213,15 @@ class DeepseekCompressor(nn.Module):
+             tuple(local),
+             rows,
+         )
+-        gathered = tensor_model_parallel_all_gather(local, dim=-1)
+-        self._values[:rows].copy_(gathered[0])
++        from vllm.models.deepseek_v4_1.tilelang.gather import gather_columns_into
++
++        gathered = tensor_model_parallel_all_gather(
++            local.view(self.compress_ratio * rows, part_cols), dim=0
++        )
++        outputs = (self._values[:rows],)
+         if self.compress_ratio == 2:
+-            self._gates[:rows].copy_(gathered[1])
++            outputs += (self._gates[:rows],)
++        gather_columns_into(gathered, outputs, tp_size)
+ 
+     def _tilelang_calls(self) -> list:
+         """The TileLang compression kernels ``_forward_tilelang`` launches, as
+@@ -226,8 +231,22 @@ class DeepseekCompressor(nn.Module):
+ 
+         main_page = getattr(self, "_main_page", 64 // self.compress_ratio)
+         rope_dim = getattr(self, "_rope_dim", 64)
++        from vllm.models.deepseek_v4_1.tilelang.gather import gather_call
++
++        tp_size = int(getattr(getattr(self, "fused_wkv_wgate", None), "tp_size", 1))
++        dtype = torch.bfloat16 if self.compress_ratio == 1 else torch.float32
++        gather_calls = (
++            [
++                gather_call(
++                    tp_size, 512 // tp_size, 512, self.compress_ratio, dtype, packed
++                )
++                for packed in (False, True)
++            ]
++            if tp_size > 1
++            else []
++        )
+         if self.compress_ratio == 1:
+-            return [
++            return gather_calls + [
+                 prepare.call(tl.compress_kernel, 1, self.requests, 1),
+                 prepare.call(
+                     tl.compress_kernel,
+@@ -242,7 +261,7 @@ class DeepseekCompressor(nn.Module):
+         # The ring holds one state per token, so its metadata's page
+         # (``state_metadata.block_size``) is its block size.
+         page = self.state_cache.block_size
+-        return [
++        return gather_calls + [
+             prepare.call(tl.gather_partial_state_kernel, self.requests, page),
+             prepare.call(tl.compress_kernel, 2, self.requests, page),
+             prepare.call(
+diff --git a/vllm/models/deepseek_v4_1/nvidia/tilelang_vision.py b/vllm/models/deepseek_v4_1/nvidia/tilelang_vision.py
+index ff2d317ec7..798305029d 100644
+--- a/vllm/models/deepseek_v4_1/nvidia/tilelang_vision.py
++++ b/vllm/models/deepseek_v4_1/nvidia/tilelang_vision.py
+@@ -86,13 +86,14 @@ def _local_width(full_width: int, tp_size: int) -> int:
+     return -(-full_width // quantum) * quantum // tp_size
+ 
+ 
+-def _gather_columns(local: torch.Tensor, dst: torch.Tensor) -> torch.Tensor:
++def _gather_columns(local: torch.Tensor, dst: torch.Tensor, world: int) -> torch.Tensor:
+     """All-gather column-sharded ``local [rows, local_width]`` across TP ranks and
+     copy the unpadded ``dst.shape[1]`` columns into ``dst``."""
+     from vllm import distributed
++    from vllm.models.deepseek_v4_1.tilelang.gather import gather_columns_into
+ 
+-    gathered = distributed.tensor_model_parallel_all_gather(local, dim=-1)
+-    dst.copy_(gathered[:, : dst.shape[1]])
++    gathered = distributed.tensor_model_parallel_all_gather(local, dim=0)
++    gather_columns_into(gathered, (dst,), world)
+     return dst
+ 
+ 
+@@ -386,7 +387,7 @@ class DeepseekV4ViT(nn.Module):
+             self.local_inter,
+         )
+         patch = 3 * config.vision_patch_size**2
+-        return {
++        calls = {
+             "pad": kernels.pad_call(patch),
+             "patch": kernels.linear_call(
+                 hidden, kernels.padded_width(patch), bias=True
+@@ -407,6 +408,20 @@ class DeepseekV4ViT(nn.Module):
+             "mlp_out_rows": kernels.gemv_call(local_hidden, inter_full, "none"),
+         }
+ 
++        if self.tp_size > 1:
++            from vllm.models.deepseek_v4_1.tilelang.gather import gather_call
++
++            for role, local, full in (
++                ("attended", qkv_width, hidden),
++                ("branch", local_hidden, hidden),
++                ("activated", inter, inter_full),
++            ):
++                for packed in (False, True):
++                    calls[f"gather_{role}_{packed}"] = gather_call(
++                        self.tp_size, local, full, 1, torch.bfloat16, packed
++                    )
++        return calls
++
+     def declare_kernels(self) -> None:
+         calls = self.kernel_calls()
+         prepare.declare(lambda: list(calls.values()), bind=lambda: self._bind(calls))
+@@ -483,20 +498,20 @@ class DeepseekV4ViT(nn.Module):
+             launch["rope"](qkv, ws.inv_freq, n_vit_w)
+             launch["attention"](qkv, local_attended)
+             attended = (
+-                _gather_columns(local_attended, normalized)
++                _gather_columns(local_attended, normalized, self.tp_size)
+                 if sharded
+                 else local_attended
+             )
+             project["wo"](attended, attn.wo.weight, attn.wo.bias, local_branch)
+             if sharded:
+-                _gather_columns(local_branch, branch)
++                _gather_columns(local_branch, branch, self.tp_size)
+             launch["add_norm"](state, branch, block.norm2.weight, residual, normalized)
+             project["mlp_in"](normalized, mlp.w1.weight, local_activated)
+             if sharded:
+-                _gather_columns(local_activated, activated)
++                _gather_columns(local_activated, activated, self.tp_size)
+             project["mlp_out"](activated, mlp.w2.weight, local_branch)
+             if sharded:
+-                _gather_columns(local_branch, branch)
++                _gather_columns(local_branch, branch, self.tp_size)
+             last = index + 1 == len(self.blocks)
+             launch["add_norm"](
+                 residual, branch, norms[index + 1], state, out if last else normalized
+@@ -577,16 +592,28 @@ class DeepseekV4Aligner(nn.Module):
+     def kernel_calls(self) -> dict[str, prepare.TileLangCall]:
+         r = self.downsample_ratio
+         merged = self.hidden_size * r * r
+-        return {
++        calls = {
+             "merge": kernels.merge_call(self.hidden_size, r),
+             "w1": kernels.linear_call(self.local_out_dim, merged, bias=True, gelu=True),
+-            "w2": kernels.linear_call(
+-                self.local_out_dim, self.out_dim, bias=True
+-            ),
++            "w2": kernels.linear_call(self.local_out_dim, self.out_dim, bias=True),
+             "w1_rows": kernels.gemv_call(self.local_out_dim, merged, "gelu"),
+             "w2_rows": kernels.gemv_call(self.local_out_dim, self.out_dim, "bias"),
+         }
+ 
++        if self.tp_size > 1:
++            from vllm.models.deepseek_v4_1.tilelang.gather import gather_call
++
++            for packed in (False, True):
++                calls[f"gather_out_{packed}"] = gather_call(
++                    self.tp_size,
++                    self.local_out_dim,
++                    self.out_dim,
++                    1,
++                    torch.bfloat16,
++                    packed,
++                )
++        return calls
++
+     def declare_kernels(self) -> None:
+         calls = self.kernel_calls()
+         prepare.declare(lambda: list(calls.values()), bind=lambda: self._bind(calls))
+@@ -635,9 +662,9 @@ class DeepseekV4Aligner(nn.Module):
+         launch["merge"](x, merged, n_vit_h, n_vit_w)
+         if self.tp_size > 1:
+             project["w1"](merged, self.w1.weight, self.w1.bias, local_out)
+-            _gather_columns(local_out, hidden)
++            _gather_columns(local_out, hidden, self.tp_size)
+             project["w2"](hidden, self.w2.weight, self.w2.bias, local_out)
+-            _gather_columns(local_out, out)
++            _gather_columns(local_out, out, self.tp_size)
+         else:
+             project["w1"](merged, self.w1.weight, self.w1.bias, hidden)
+             project["w2"](hidden, self.w2.weight, self.w2.bias, out)
+diff --git a/vllm/models/deepseek_v4_1/tilelang/collectives.py b/vllm/models/deepseek_v4_1/tilelang/collectives.py
+index af5ef85713..b2e2df42ac 100644
+--- a/vllm/models/deepseek_v4_1/tilelang/collectives.py
++++ b/vllm/models/deepseek_v4_1/tilelang/collectives.py
+@@ -234,12 +234,42 @@ def rank_rows_kernel():
+     return collectives_rank_rows
+ 
+ 
++@tilelang.jit(pass_configs={tilelang.PassConfigKey.TL_DISABLE_WARP_SPECIALIZED: True})
++def rank_rows_bytes_kernel():
++    """The tail/unaligned all-gather layout conversion, as exact payload bytes."""
++    source_bytes, output_bytes = T.dynamic("source_bytes, output_bytes")
++
++    @T.prim_func
++    def collectives_rank_rows_bytes(
++        src: T.Tensor((source_bytes,), T.uint8),
++        dst: T.Tensor((output_bytes,), T.uint8),
++        world: T.int32,
++        rows: T.int32,
++        row_bytes: T.int32,
++    ):
++        with T.Kernel(rows, T.ceildiv(world * row_bytes, 256), threads=256) as (
++            row,
++            block,
++        ):
++            col = block * 256 + T.get_thread_binding()
++            if col < world * row_bytes:
++                dst[row * (world * row_bytes) + col] = src[
++                    ((col // row_bytes) * rows + row) * row_bytes + col % row_bytes
++                ]
++
++    return collectives_rank_rows_bytes
++
++
+ def rank_rows_calls() -> list[prepare.TileLangCall]:
+     """The rank-major-to-concatenated launch of the TP group's last-dimension
+     all-gathers that NCCL carries (``concat_rank_shards``)."""
+     from vllm.distributed import get_tp_group
+ 
+-    return [] if get_tp_group().world_size < 2 else [prepare.call(rank_rows_kernel)]
++    return (
++        []
++        if get_tp_group().world_size < 2
++        else [prepare.call(rank_rows_kernel), prepare.call(rank_rows_bytes_kernel)]
++    )
+ 
+ 
+ def concat_rank_shards(
+@@ -247,22 +277,38 @@ def concat_rank_shards(
+ ) -> torch.Tensor | None:
+     """An all-gather's rank-major output (``[world * rows, ...]``, each rank's shard
+     of ``shard_shape``) as the shards concatenated along their last dimension, in
+-    one launch, or None when a shard row is not whole 16-byte packs (torch's
+-    movedim and reshape copy then)."""
++    one TileLang launch. Whole aligned 16-byte packs retain the vector path;
++    tails and unaligned rows use byte copies, including opaque complex payloads.
++    CPU and rank-one callers retain None for their reference/view-only path."""
+     width = shard_shape[-1]
+     row_bytes = width * gathered.element_size()
+-    if len(shard_shape) < 2 or row_bytes % 16 or gathered.data_ptr() % 16:
++    if len(shard_shape) < 2 or not gathered.is_cuda:
+         return None
++    if (
++        not gathered.is_contiguous()
++        or world < 1
++        or gathered.numel() != world * math.prod(shard_shape)
++    ):
++        raise ValueError("rank shards must be contiguous and match the declared shape")
+     rows = math.prod(shard_shape[:-1])
+     out = gathered.new_empty(*shard_shape[:-1], world * width)
+     if rows and width:
+-        rank_rows_kernel()(
+-            gathered.view(world * rows, width).view(torch.int32),
+-            out.view(rows, world * width).view(torch.int32),
+-            world,
+-            rows,
+-            row_bytes // 16,
+-        )
++        if row_bytes % 16 == 0 and gathered.data_ptr() % 16 == 0:
++            rank_rows_kernel()(
++                gathered.view(world * rows, width).view(torch.int32),
++                out.view(rows, world * width).view(torch.int32),
++                world,
++                rows,
++                row_bytes // 16,
++            )
++        else:
++            rank_rows_bytes_kernel()(
++                gathered.view(-1).view(torch.uint8),
++                out.view(-1).view(torch.uint8),
++                world,
++                rows,
++                row_bytes,
++            )
+     return out
+ 
+ 
+diff --git a/vllm/models/deepseek_v4_1/tilelang/gather.py b/vllm/models/deepseek_v4_1/tilelang/gather.py
+new file mode 100644
+index 0000000000..b463a5ba5b
+--- /dev/null
++++ b/vllm/models/deepseek_v4_1/tilelang/gather.py
+@@ -0,0 +1,156 @@
++# SPDX-License-Identifier: Apache-2.0
++# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
++"""Write rank-major gathered column shards directly into persistent outputs."""
++
++from functools import cache
++
++import torch
++
++from vllm.models.deepseek_v4_1.tilelang import prepare
++from vllm.tilelang_utils import T, tilelang
++
++_DTYPES = {
++    torch.bfloat16: "bfloat16",
++    torch.float16: "float16",
++    torch.float32: "float32",
++    torch.int32: "int32",
++}
++_PASS = {
++    tilelang.PassConfigKey.TL_DISABLE_WARP_SPECIALIZED: True,
++    tilelang.PassConfigKey.TL_DISABLE_SAFE_MEMORY_ACCESS: True,
++}
++_HEADER = r"""
++__device__ __forceinline__ void vllm_gather_b128(const void* d, const void* s) {
++  *reinterpret_cast<uint4*>(const_cast<void*>(d)) = *reinterpret_cast<const uint4*>(s);
++}
++"""
++
++
++@tilelang.jit(pass_configs=_PASS)
++def gather_columns_kernel(
++    world: int, local_width: int, width: int, parts: int, dtype: str, packed: bool
++):
++    """Gather ordering, optional unpadding and one/two output stores in one pass."""
++    assert world >= 1 and parts in (1, 2) and 0 < width <= world * local_width
++    vector = 16 // {"bfloat16": 2, "float16": 2, "float32": 4, "int32": 4}[dtype]
++    run = vector if packed else 1
++    if packed:
++        assert local_width % vector == 0
++    source_rows, rows, stride0, stride1 = T.dynamic(
++        "source_rows, rows, stride0, stride1"
++    )
++
++    @T.macro
++    def store(src, dst, part, row, col):
++        rank = col // local_width
++        source_row = (rank * parts + part) * rows + row
++        if packed:
++            if col + vector <= width:
++                T.call_extern(
++                    "handle",
++                    "vllm_gather_b128",
++                    T.address_of(dst[row, col]),
++                    T.address_of(src[source_row, col % local_width]),
++                )
++            else:
++                for k in T.unroll(vector):
++                    if col + k < width:
++                        dst[row, col + k] = src[source_row, col % local_width + k]
++        else:
++            dst[row, col] = src[source_row, col % local_width]
++
++    @T.prim_func
++    def gather_columns_into(
++        src: T.Tensor((source_rows, local_width), dtype),
++        out0: T.StridedTensor((rows, width), (stride0, 1), dtype),
++        out1: T.StridedTensor((rows, width), (stride1, 1), dtype),
++    ):
++        with T.Kernel(rows, T.ceildiv(width, 128 * run), threads=128) as (row, block):
++            T.import_source(_HEADER)
++            col = (block * 128 + T.get_thread_binding()) * run
++            if col < width:
++                store(src, out0, 0, row, col)
++                if parts == 2:
++                    store(src, out1, 1, row, col)
++
++    return gather_columns_into
++
++
++@cache
++def _bound(*key):
++    return gather_columns_kernel(*key)
++
++
++def gather_call(
++    world: int,
++    local_width: int,
++    width: int,
++    parts: int,
++    dtype: torch.dtype,
++    packed: bool,
++):
++    return prepare.call(
++        gather_columns_kernel, world, local_width, width, parts, _DTYPES[dtype], packed
++    )
++
++
++def _range(tensor):
++    begin = tensor.data_ptr()
++    extent = sum((n - 1) * s for n, s in zip(tensor.shape, tensor.stride())) + 1
++    return begin, begin + extent * tensor.element_size()
++
++
++def gather_columns_into(
++    gathered: torch.Tensor, outputs: tuple[torch.Tensor, ...], world: int
++) -> None:
++    """A dim-0 gather of [parts * rows, local_width] into full column rows.
++
++    Every output has the same shape and dtype. Optional padding at the end of
++    the global columns is discarded. No transpose, intermediate full-width
++    allocation or subsequent copy is needed. Unsupported layouts fail explicitly.
++    """
++    if len(outputs) not in (1, 2) or gathered.ndim != 2 or world < 1:
++        raise ValueError(
++            "gather_columns_into needs one/two outputs and a positive world"
++        )
++    first = outputs[0]
++    if first.ndim != 2 or not gathered.is_contiguous():
++        raise ValueError("gather input must be contiguous and outputs must be matrices")
++    if not first.is_cuda or first.dtype not in _DTYPES:
++        raise ValueError("gather outputs require a supported CUDA dtype")
++    rows, width = first.shape
++    local_width = gathered.shape[1]
++    if (
++        gathered.shape[0] != world * len(outputs) * rows
++        or width > world * local_width
++        or width <= 0
++    ):
++        raise ValueError("gather source shape does not match output shards")
++    for tensor in (gathered, *outputs):
++        if (
++            tensor.dtype != first.dtype
++            or tensor.device != first.device
++            or tensor.ndim != 2
++            or tensor.stride(1) != 1
++        ):
++            raise ValueError(
++                "gather tensors need unit-stride columns, one dtype and device"
++            )
++    if any(t.shape != first.shape for t in outputs):
++        raise ValueError("gather outputs must have equal shapes")
++    if rows > 1 and any(t.stride(0) < width for t in outputs):
++        raise ValueError("gather output rows must not overlap")
++    if not rows:
++        return
++    ranges = [_range(t) for t in (gathered, *outputs)]
++    for i, (begin, end) in enumerate(ranges):
++        if any(begin < hi and lo < end for lo, hi in ranges[i + 1 :]):
++            raise ValueError("gather source and outputs must not overlap")
++    vector = 16 // first.element_size()
++    packed = local_width % vector == 0 and all(
++        t.data_ptr() % 16 == 0 and t.stride(0) % vector == 0
++        for t in (gathered, *outputs)
++    )
++    _bound(world, local_width, width, len(outputs), _DTYPES[first.dtype], packed)(
++        gathered, first, outputs[1] if len(outputs) == 2 else first
++    )
+-- 
+2.54.0 (Apple Git-157)
+

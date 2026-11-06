@@ -1,0 +1,203 @@
+From fe3caf6fefaeef8aa0bb093a1b75fa11fac2eb7d Mon Sep 17 00:00:00 2001
+From: Christopher Owen <root@your.mom>
+Date: Wed, 4 Nov 2026 20:31:49 +0100
+Subject: [PATCH] Specialize native score addressing without an output-buffer
+ round trip
+
+Upstream-base: d9f9a0076af0dfcd64f675eac006547d73b29483, after candidate-38 and selected-logit source c88a692e98.
+
+Rationale: the controlled v4 run exposes a BF16 large-batch penalty from gathering through output before normalization. Read selected logits once at the final store, and derive addressing from the input's existing compact, row-padded, column-sliced or transposed layout. Keep general strides for other valid views. This changes address expressions only, not storage, and prepares every specialization before cache freeze.
+
+Quality: no dtype/layout materialization, extra allocation or precision change; the score reduction and final arithmetic retain their original order. All views read their original token-id buffer.
+
+Tests: expand native-input numerical and startup-freeze coverage to padded and fully general views. Full GPU correctness, repeated paired timing and IKET qualification remain required; results are recorded by the deployment experiment.
+
+Upstream-status: local candidate, not submitted upstream.
+---
+ .../test_gpu_tilelang_logprob_softmax.py      | 37 +++++++++-----
+ vllm/v1/worker/gpu/sample/tilelang_logprob.py | 49 ++++++++++---------
+ 2 files changed, 53 insertions(+), 33 deletions(-)
+
+diff --git a/tests/v1/worker/test_gpu_tilelang_logprob_softmax.py b/tests/v1/worker/test_gpu_tilelang_logprob_softmax.py
+index 7922573712..0d7fa3eedb 100644
+--- a/tests/v1/worker/test_gpu_tilelang_logprob_softmax.py
++++ b/tests/v1/worker/test_gpu_tilelang_logprob_softmax.py
+@@ -531,14 +531,14 @@ def test_runner_declares_the_launched_calls(logits_mode):
+         (
+             id(tilelang_logprob.topk_log_softmax_kernel),
+             tilelang_logprob.topk_log_softmax_key(
+-                dtype, run, masked, id_dtype, compact_ids
++                dtype, run, masked, id_dtype, id_layout
+             ),
+         )
+         for dtype in (torch.bfloat16, torch.float32)
+         for run in tls._runs(dtype)
+         for masked in (False, True)
+         for id_dtype in (torch.int32, torch.int64)
+-        for compact_ids in (True, False)
++        for id_layout in ("compact", "row", "column", "transpose", "general")
+     }
+     declared = _declared(registry)
+     softmax = {
+@@ -709,7 +709,9 @@ def test_prompt_logits_cross_chunk_boundary(mode, num_logprobs, id_dtype):
+ 
+ @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16, torch.float32])
+ @pytest.mark.parametrize("id_dtype", [torch.int32, torch.int64])
+-@pytest.mark.parametrize("layout", ["dense", "sliced", "transposed"])
++@pytest.mark.parametrize(
++    "layout", ["dense", "padded", "sliced", "transposed", "general"]
++)
+ @pytest.mark.parametrize("masked", [False, True])
+ def test_logprobs_read_native_ids(dtype, id_dtype, layout, masked):
+     """ID strides change addressing, never log-softmax arithmetic."""
+@@ -721,6 +723,12 @@ def test_logprobs_read_native_ids(dtype, id_dtype, layout, masked):
+         ids = torch.stack((ids, ids), dim=-1)[..., 0]
+     elif layout == "transposed":
+         ids = ids.t().contiguous().t()
++    elif layout in ("padded", "general"):
++        step = 1 if layout == "padded" else 2
++        storage = ids.new_empty((rows + 2, cols * step + 7))
++        view = storage[1 : rows + 1, 1 : cols * step + 1 : step]
++        view.copy_(ids)
++        ids = view
+     before = ids.clone()
+     mask = valid if masked else None
+     expected = logprob.compute_token_logprobs(
+@@ -797,11 +805,18 @@ def test_native_score_inputs_work_after_startup_freeze(monkeypatch):
+     for dtype, _ in pairs:
+         logits = torch.randn(3, 264, device=DEVICE, dtype=dtype)[:, :257]
+         for id_dtype in (torch.int32, torch.int64):
+-            ids = torch.randint(257, (3, 18), device=DEVICE, dtype=id_dtype)[:, ::2]
+-            valid = ids % 3 != 0
+-            for mask in (None, valid):
+-                actual = logprob.compute_token_logprobs(logits, ids, mask)
+-                assert actual.shape == ids.shape
+-            for topk in (0, 5):
+-                actual = logprob.compute_topk_scores(logits, topk, ids[:, 0])
+-                assert torch.equal(actual.logprob_token_ids[:, 0], ids[:, 0])
++            storage = torch.randint(257, (3, 18), device=DEVICE, dtype=id_dtype)
++            for ids in (
++                storage,
++                storage[:, :9],
++                storage[:, ::2],
++                storage.t().contiguous().t(),
++                storage[:, 1:17:2],
++            ):
++                valid = ids % 3 != 0
++                for mask in (None, valid):
++                    actual = logprob.compute_token_logprobs(logits, ids, mask)
++                    assert actual.shape == ids.shape
++                for topk in (0, 5):
++                    actual = logprob.compute_topk_scores(logits, topk, ids[:, 0])
++                    assert torch.equal(actual.logprob_token_ids[:, 0], ids[:, 0])
+diff --git a/vllm/v1/worker/gpu/sample/tilelang_logprob.py b/vllm/v1/worker/gpu/sample/tilelang_logprob.py
+index 93eb5a2722..05a0f98d23 100644
+--- a/vllm/v1/worker/gpu/sample/tilelang_logprob.py
++++ b/vllm/v1/worker/gpu/sample/tilelang_logprob.py
+@@ -196,7 +196,7 @@ def topk_log_softmax_kernel(
+     run: int,
+     masked: bool = False,
+     id_dtype: str = "int64",
+-    compact_ids: bool = True,
++    id_layout: str = "compact",
+ ):
+     """The selected tokens' log-softmax (the module's Eq. 5): one block of 1024
+     threads a row, whose ``topk`` selected tokens' log probabilities it writes;
+@@ -209,8 +209,13 @@ def topk_log_softmax_kernel(
+     rows, vocab, topk = T.dynamic("rows, vocab, topk")
+     logits_stride = T.dynamic("logits_stride", "int64")
+     id_row, id_col = T.dynamic("id_row, id_col", "int64")
+-    id_strides = (topk, 1) if compact_ids else (id_row, id_col)
+-    gather_first = not compact_ids
++    id_strides = {
++        "compact": (topk, 1),
++        "row": (id_row, 1),
++        "column": (topk * id_col, id_col),
++        "transpose": (1, T.cast(rows, T.int64)),
++        "general": (id_row, id_col),
++    }[id_layout]
+     valid_rows, valid_cols = T.dynamic("valid_rows, valid_cols")
+     threads = _SOFTMAX_THREADS
+     loads = _SOFTMAX_LOADS
+@@ -286,16 +291,6 @@ def topk_log_softmax_kernel(
+         with T.Kernel(rows, threads=threads) as row:
+             T.import_source(_HEADER)
+             tx = T.get_thread_binding()
+-            if gather_first:
+-                # Retire native-id pointers and strides before the row reduction.
+-                # The output is also the selected-value scratch; no extra buffer.
+-                row64 = T.cast(row, T.int64)
+-                for c in T.serial(T.ceildiv(topk, threads)):
+-                    col = c * threads + tx
+-                    if col < topk:
+-                        output[row64, col] = T.cast(
+-                            logits[row, token_ids[row64, col]], T.float32
+-                        )
+             raw = T.alloc_local((per,), logits_dtype)
+             peak = T.alloc_local((loads,), T.float32)
+             total = T.alloc_local((loads,), T.float32)
+@@ -364,10 +359,7 @@ def topk_log_softmax_kernel(
+             for c in T.serial(T.ceildiv(topk, threads)):
+                 col = c * threads + tx
+                 if col < topk:
+-                    if gather_first:
+-                        picked = output[row64, col]
+-                    else:
+-                        picked = T.cast(logits[row, token_ids[row64, col]], T.float32)
++                    picked = T.cast(logits[row, token_ids[row64, col]], T.float32)
+                     value = T.call_extern(
+                         "float32",
+                         "vllm_sub",
+@@ -388,9 +380,22 @@ def topk_log_softmax_key(
+     run: int = 1,
+     masked: bool = False,
+     id_dtype: torch.dtype = torch.int64,
+-    compact_ids: bool = True,
++    id_layout: str = "compact",
+ ) -> tuple:
+-    return (_DTYPES[logits_dtype], run, masked, _DTYPES[id_dtype], compact_ids)
++    return (_DTYPES[logits_dtype], run, masked, _DTYPES[id_dtype], id_layout)
++
++
++def _id_layout(ids: torch.Tensor) -> str:
++    if ids.is_contiguous():
++        return "compact"
++    row, col = ids.stride()
++    if col == 1:
++        return "row"
++    if row == 1 and col == ids.shape[0]:
++        return "transpose"
++    if row == ids.shape[1] * col:
++        return "column"
++    return "general"
+ 
+ 
+ def log_softmax_calls(logits_dtypes: Sequence[torch.dtype]) -> list:
+@@ -399,13 +404,13 @@ def log_softmax_calls(logits_dtypes: Sequence[torch.dtype]) -> list:
+     return [
+         _call(
+             topk_log_softmax_kernel,
+-            *topk_log_softmax_key(dtype, run, masked, id_dtype, compact_ids),
++            *topk_log_softmax_key(dtype, run, masked, id_dtype, id_layout),
+         )
+         for dtype in dict.fromkeys(logits_dtypes)
+         for run in _runs(dtype)
+         for masked in (False, True)
+         for id_dtype in (torch.int32, torch.int64)
+-        for compact_ids in (True, False)
++        for id_layout in ("compact", "row", "column", "transpose", "general")
+     ]
+ 
+ 
+@@ -436,7 +441,7 @@ def topk_log_softmax(
+             _triton_run(logits),
+             valid is not None,
+             token_ids.dtype,
+-            token_ids.is_contiguous(),
++            _id_layout(token_ids),
+         ),
+     )
+     # The unmasked specialization never reads the dummy validity tensor.
+-- 
+2.54.0 (Apple Git-157)
+

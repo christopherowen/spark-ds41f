@@ -1,0 +1,53 @@
+From 317a4ec60b6794a46d3f400d5f74abbdde7aac9c Mon Sep 17 00:00:00 2001
+From: Christopher Owen <root@your.mom>
+Date: Thu, 5 Nov 2026 12:52:17 +0100
+Subject: [PATCH] Check partial-pack gather payloads in the combined collective
+ suite
+
+Upstream base: d9fe59752be7d2e8abad2a2295e6c95bedd58252. Rationale: the pre-existing collective test required the removed ATen fallback, contradicting the newly implemented TileLang tail path. Quality: test-only update to assert exact opaque payload bits. Tests: combined GPU suite pending repeat. Upstream status: local experiment, not submitted.
+---
+ .../test_deepseek_v41_tilelang_collectives.py     | 15 ++++++++++-----
+ 1 file changed, 10 insertions(+), 5 deletions(-)
+
+diff --git a/tests/kernels/test_deepseek_v41_tilelang_collectives.py b/tests/kernels/test_deepseek_v41_tilelang_collectives.py
+index d6a1ce7169..5447b2aef5 100644
+--- a/tests/kernels/test_deepseek_v41_tilelang_collectives.py
++++ b/tests/kernels/test_deepseek_v41_tilelang_collectives.py
+@@ -116,7 +116,6 @@ def topology(monkeypatch):
+     ring4_relay.cache_clear()
+ 
+ 
+-
+ def _run(inputs, collective=None, fabric=None):
+     world = len(inputs)
+     fabric = fabric or _Fabric(world)
+@@ -244,7 +243,6 @@ def test_every_other_topology_keeps_the_ring_relay(topology, value):
+         assert torch.equal(out[rank], _reference([x[rows] for x in inputs]))
+ 
+ 
+-
+ @pytest.mark.parametrize("world", WORLDS)
+ @pytest.mark.parametrize("rows", [1, 5, 8, 13])
+ def test_all_reduce_adds_as_the_one_shot_all_reduce(world, rows):
+@@ -437,8 +435,15 @@ def test_rank_shards_concatenate_like_movedim(world, shard, dtype):
+ 
+ 
+ @pytest.mark.skipif(not torch.cuda.is_available(), reason="needs a CUDA device")
+-def test_rank_shards_of_partial_packs_are_left_to_torch():
++def test_rank_shards_of_partial_packs_preserve_payload_bits():
+     from vllm.models.deepseek_v4_1.tilelang.collectives import concat_rank_shards
+ 
+-    gathered = torch.zeros(8, 5, dtype=torch.bfloat16, device="cuda")
+-    assert concat_rank_shards(gathered, 2, (4, 5)) is None
++    gathered = (
++        torch.arange(40, dtype=torch.int16, device="cuda")
++        .view(torch.bfloat16)
++        .view(8, 5)
++    )
++    expected = gathered.view(2, 4, 5).movedim(0, 1).reshape(4, 10)
++    got = concat_rank_shards(gathered, 2, (4, 5))
++    assert got is not None and got.is_contiguous()
++    assert torch.equal(got.view(torch.int16), expected.view(torch.int16))
+-- 
+2.54.0 (Apple Git-157)
+

@@ -1,0 +1,1726 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Christopher Owen <3221756+christopherowen@users.noreply.github.com>
+Date: Fri, 6 Nov 2026 09:38:52 +0000
+Subject: [PATCH 738/743] Sequence-parallel Engram prefill column exchange and
+ sliced projection
+
+Under sequence-parallel prefill (sp_rows is not None) on a disk-sharded Engram
+layer with a column-parallel wkv projection (_PaddedColumnParallelLinear),
+exchange each rank's gathered hash columns by row block (interleaved_sp_rows)
+so each rank interleaves, casts to MXFP8 once, and projects only its real_rows
+local tokens through the gathered wkv column blocks (local_sp_product) into
+[N, L, C] without a second collective after wkv.
+
+When wkv SP shards are not gathered or the table is row-sharded across ranks,
+slice wkv across ENGRAM_SLICE_TOKENS=2048 token slices via
+SPRows.project_exchange_rows, writing each rank's local row block in place
+while overlapping peer PyNCCL row exchanges, RankOrderParts reduction, and
+pad-row mHC post / copy_columns. Replicated wkv projections under SP slice the
+input rows to the rank's real_rows before projecting.
+
+Upstream base: 19f2c20ed4d64ae22bd009ceacadd85e2a81e354 (patch head c47b54ae471a)
+Quality: bit-identical to full-row Engram forward across TP3 and TP4; no dtype,
+quantization, or accumulation order change; decode (sp_rows is None) is
+unchanged.
+Tests: tests/models/test_deepseek_v4_1_sp_prefill.py,
+tests/models/test_deepseek_v41_sp_project_reduce_scatter.py, and
+tests/models/test_deepseek_v4_1_engram.py.
+Upstream status: local DeepSeek V4.1 sequence-parallel prefill optimization.
+---
+ ..._deepseek_v41_sp_project_reduce_scatter.py |  70 ++
+ tests/models/test_deepseek_v4_1_sp_prefill.py | 900 ++++++++++++++++++
+ .../device_communicators/pynccl.py            |  16 +-
+ vllm/models/deepseek_v4_1/common/engram.py    | 242 ++++-
+ vllm/models/deepseek_v4_1/sp_prefill.py       | 119 ++-
+ vllm/models/deepseek_v4_1/tilelang/linear.py  | 157 ++-
+ 6 files changed, 1449 insertions(+), 55 deletions(-)
+
+diff --git a/tests/models/test_deepseek_v41_sp_project_reduce_scatter.py b/tests/models/test_deepseek_v41_sp_project_reduce_scatter.py
+index d8226e49c..e7d3ac77f 100644
+--- a/tests/models/test_deepseek_v41_sp_project_reduce_scatter.py
++++ b/tests/models/test_deepseek_v41_sp_project_reduce_scatter.py
+@@ -411,3 +411,73 @@ def test_row_all_to_all_over_cabled_pairs(topology, world, short, rows=10):
+             assert fabric.pairs <= ring, sorted(map(sorted, fabric.pairs - ring))
+         else:
+             assert fabric.pairs - ring, "no pair two apart exchanged directly"
++
++
++
++def test_engram_slices():
++    assert sp_prefill.engram_slices(2047) == 1
++    assert sp_prefill.engram_slices(2048) == 2
++
++
++@pytest.mark.parametrize("world", [3, 4])
++@pytest.mark.parametrize("short", [0, 3, 9, 25])
++@pytest.mark.parametrize("slices", [1, 2])
++def test_project_exchange_rows_over_cabled_pairs(
++    monkeypatch, topology, world, short, slices, rows=10
++):
++    """``SPRows.project_exchange_rows`` over ``_Fabric`` on CUDA streams: each rank
++    projects peer blocks into send slots, exchanges them on the side stream with
++    ``copy_self=False``, projects its own block straight into ``out[rank]``, and
++    produces the exact same BF16 blocks as ``all_to_all_rows``."""
++    from types import SimpleNamespace
++
++    total = max(1, world * rows - short)
++    fabric = _Fabric(world)
++    inputs = [
++        torch.randn(total, 6, device="cuda", dtype=torch.bfloat16)
++        for _ in range(world)
++    ]
++    outputs: list[torch.Tensor | None] = [None] * world
++    local_comm = threading.local()
++    monkeypatch.setattr(
++        sp_prefill,
++        "get_tp_group",
++        lambda: SimpleNamespace(
++            device_communicator=SimpleNamespace(
++                pynccl_comm=local_comm.comm, b12x_ar_comm=None
++            )
++        ),
++    )
++    errors = []
++
++    def run(rank: int) -> None:
++        try:
++            local_comm.comm = fabric.comm(rank)
++            sp = sp_prefill.SPRows(num_tokens=total, world_size=world, rank=rank)
++            outputs[rank] = sp.project_exchange_rows(
++                lambda start, stop, dest: dest.copy_(inputs[rank][start:stop]),
++                (6,),
++                torch.bfloat16,
++                inputs[rank].device,
++                slices=slices,
++            )
++            torch.cuda.synchronize()
++        except BaseException as error:
++            errors.append((rank, error))
++            fabric.barrier.abort()
++
++    threads = [threading.Thread(target=run, args=(r,)) for r in range(world)]
++    for thread in threads:
++        thread.start()
++    for thread in threads:
++        thread.join()
++    assert not errors, errors
++    local = sp_prefill.SPRows(num_tokens=total, world_size=world, rank=0).local_rows
++    for me in range(world):
++        real = max(0, min(local, total - me * local))
++        for source in range(world):
++            got = outputs[me][source]
++            assert torch.equal(
++                got[:real].view(torch.int16),
++                inputs[source][me * local : me * local + real].view(torch.int16),
++            )
+diff --git a/tests/models/test_deepseek_v4_1_sp_prefill.py b/tests/models/test_deepseek_v4_1_sp_prefill.py
+index eef2cfc19..022407b84 100644
+--- a/tests/models/test_deepseek_v4_1_sp_prefill.py
++++ b/tests/models/test_deepseek_v4_1_sp_prefill.py
+@@ -1077,3 +1077,903 @@ def test_model_forward_sp_sink_columns_with_rank_order_parts(monkeypatch):
+     for out, sink in results:
+         assert out.shape == (9, 2)
+         assert sink.abs().sum() > 0
++
++
++
++def test_engram_slices():
++    assert sp_prefill.engram_slices(2047) == 1
++    assert sp_prefill.engram_slices(2048) == 2
++    assert sp_prefill.engram_slices(8192) == 2
++    assert sp_prefill.engram_slices(16384) == 2
++
++
++class _RowExchangeFabric:
++    """Lockstep multi-rank PyNcclCommunicator harness for CPU threads."""
++
++    def __init__(self, world: int):
++        import collections
++
++        self.world = world
++        self.barrier = threading.Barrier(world, timeout=30)
++        self.ops: list[list] = [[] for _ in range(world)]
++        self.pairs: set[frozenset] = set()
++        self._collections = collections
++
++    def comm(self, rank: int, events: list | None = None):
++        from vllm.distributed.device_communicators.pynccl import PyNcclCommunicator
++
++        comm = PyNcclCommunicator.__new__(PyNcclCommunicator)
++        comm.disabled, comm.world_size, comm.rank = False, self.world, rank
++        comm.group_start = lambda: None
++        comm.send = lambda t, peer, stream: self.ops[rank].append(("send", peer, t))
++        comm.recv = lambda t, peer, stream: self.ops[rank].append(("recv", peer, t))
++        comm.group_end = lambda: self._end(rank)
++        orig_a2a = comm.all_to_all_rows
++
++        def tracked_a2a(output, input_, rows, stream=None, *, copy_self=True):
++            assert not copy_self, "project_exchange_rows must pass copy_self=False"
++            lo = output.storage_offset() // output.stride(1)
++            hi = lo + output.shape[1]
++            if events is not None:
++                events.append(("exchange", lo, hi))
++            return orig_a2a(output, input_, rows, stream=stream or object(), copy_self=copy_self)
++
++        comm.all_to_all_rows = tracked_a2a
++        return comm
++
++    def _end(self, rank: int) -> None:
++        self.barrier.wait()
++        if rank == 0:
++            sends = self._collections.defaultdict(self._collections.deque)
++            for source, ops in enumerate(self.ops):
++                for kind, peer, tensor in ops:
++                    if kind == "send":
++                        sends[(source, peer)].append(tensor.clone())
++            for destination, ops in enumerate(self.ops):
++                for kind, peer, tensor in ops:
++                    if kind == "recv":
++                        sent = sends[(peer, destination)].popleft()
++                        assert sent.shape == tensor.shape, (peer, destination)
++                        tensor.copy_(sent)
++                        self.pairs.add(frozenset((peer, destination)))
++            assert not any(sends.values()), "a send nobody received"
++            self.ops = [[] for _ in range(self.world)]
++        self.barrier.wait()
++
++
++@pytest.mark.parametrize("topology", [None, "direct"])
++@pytest.mark.parametrize("world", [3, 4])
++@pytest.mark.parametrize("short", [0, 3, 9, 10, 25])
++@pytest.mark.parametrize("slices", [1, 2, 3])
++def test_project_exchange_rows_bit_identical_and_overlapped(
++    monkeypatch, topology, world, short, slices
++):
++    """``SPRows.project_exchange_rows`` projects only real rows, exchanges each slice's
++    peer blocks before projecting this rank's own block directly into ``out[rank]``
++    with ``copy_self=False``, runs ``then()`` after the last projection, and yields
++    bit-identical BF16 blocks to a full-row projection + ``all_to_all_rows`` across
++    TP3 and TP4 (both ring4 relay and direct topologies, including padded/empty tail
++    blocks)."""
++    from vllm.distributed.device_communicators.pynccl import ring4_relay
++
++    if topology is None:
++        monkeypatch.delenv("SPARKNET_ROCE_TOPOLOGY", raising=False)
++    else:
++        monkeypatch.setenv("SPARKNET_ROCE_TOPOLOGY", topology)
++    ring4_relay.cache_clear()
++
++    rows_per_rank = 10
++    total = max(1, world * rows_per_rank - short)
++    block_cols = 6
++    gen = torch.Generator().manual_seed(100 + world * 17 + short * 3 + slices)
++    inputs = [
++        torch.randn((total, block_cols), generator=gen, dtype=torch.bfloat16)
++        for _ in range(world)
++    ]
++    fabric = _RowExchangeFabric(world)
++    local_comm = threading.local()
++    monkeypatch.setattr(
++        sp_prefill,
++        "get_tp_group",
++        lambda: SimpleNamespace(
++            device_communicator=SimpleNamespace(
++                pynccl_comm=local_comm.comm, b12x_ar_comm=None
++            )
++        ),
++    )
++
++    outputs: list[torch.Tensor | None] = [None] * world
++    events_by_rank: list[list] = [[] for _ in range(world)]
++    then_at: list[int] = [-1] * world
++    errors = []
++
++    def run(rank: int) -> None:
++        try:
++            events = events_by_rank[rank]
++            local_comm.comm = fabric.comm(rank, events)
++            sp = sp_prefill.SPRows(num_tokens=total, world_size=world, rank=rank)
++
++            def project(start: int, stop: int, out: torch.Tensor) -> None:
++                events.append(("project", start, stop))
++                out.copy_(inputs[rank][start:stop])
++
++            outputs[rank] = sp.project_exchange_rows(
++                project,
++                (block_cols,),
++                torch.bfloat16,
++                torch.device("cpu"),
++                slices=slices,
++                then=lambda: then_at.__setitem__(rank, len(events)),
++            )
++        except BaseException as exc:
++            errors.append((rank, exc))
++            fabric.barrier.abort()
++
++    threads = [threading.Thread(target=run, args=(r,)) for r in range(world)]
++    for t in threads:
++        t.start()
++    for t in threads:
++        t.join()
++    ring4_relay.cache_clear()
++    assert not errors, errors
++
++    for me in range(world):
++        sp = sp_prefill.SPRows(num_tokens=total, world_size=world, rank=me)
++        local = sp.local_rows
++        real = sp.real_rows
++        got = outputs[me]
++        assert got is not None and got.dtype == torch.bfloat16
++        assert got.shape == (world, local, block_cols)
++        for source in range(world):
++            expected = inputs[source][me * local : me * local + real]
++            assert torch.equal(got[source, :real].view(torch.int16), expected.view(torch.int16))
++        events = events_by_rank[me]
++        calls = [(s, e) for kind, s, e in events if kind == "project"]
++        projected = sorted(i for s, e in calls for i in range(s, e))
++        assert projected == list(range(total))
++        assert then_at[me] == len(events)
++        for kind, lo, hi in events:
++            if kind != "exchange":
++                continue
++            at = events.index((kind, lo, hi))
++            for owner in range(world):
++                start = owner * local + lo
++                stop = min(owner * local + hi, total)
++                if stop > start:
++                    idx = events.index(("project", start, stop))
++                    assert (idx > at) == (owner == me), (me, owner, lo, hi)
++
++
++@pytest.mark.parametrize("world", [3, 4])
++@pytest.mark.parametrize("tokens", [5, 10, 12])
++@pytest.mark.parametrize("blocked_wkv", [False, True])
++@pytest.mark.parametrize("with_previous_output", [False, True])
++def test_engram_sp_forward_bit_identical_blocked_and_replicated(
++    monkeypatch, world, tokens, blocked_wkv, with_previous_output
++):
++    """Under ``sp_rows``, ``Engram.forward`` produces bit-identical BF16 outputs to
++    the full-row non-SP forward across TP3 and TP4 in both blocked column-parallel
++    mode (``_PaddedColumnParallelLinear`` via ``project_exchange_rows``) and
++    replicated mode, with and without ``previous_output=RankOrderParts``, including
++    padded and wholly empty tail ranks and ``IMAGE_SENTINEL`` tokens."""
++    pytest.importorskip("b12x")
++    from vllm.models.deepseek_v4_1.common import engram as engram_ops
++    from vllm.models.deepseek_v4_1.tilelang import columns
++    from vllm.models.deepseek_v4_1.tilelang import engram as tl_engram
++    from vllm.models.deepseek_v4_1.tilelang import mhc as tl_mhc
++    from vllm.models.deepseek_v4_1.tilelang.collectives import RankOrderParts
++    from vllm.models.deepseek_v4_1.tilelang.engram_hash import IMAGE_SENTINEL
++
++    streams, width = 2, 4
++    in_cols = 6
++    block_cols = 4
++    logical_cols = world * block_cols
++
++    def gate_ref(state, kv_rows, token_ids):
++        text = (token_ids != IMAGE_SENTINEL)[:, None].to(state.dtype)
++        return (state.float() + kv_rows[:, : state.shape[1]].float() * text.float()).to(
++            torch.bfloat16
++        )
++
++    def fake_gate(state, kv, norm_weights, token_ids, out, eps, hc_mult):
++        assert state.dtype == torch.bfloat16 and kv.dtype == torch.bfloat16
++        out.copy_(gate_ref(state, kv, token_ids))
++
++    def fake_gate_blocked(state, kv, norm_weights, token_ids, out, eps, hc_mult):
++        assert state.dtype == torch.bfloat16 and kv.dtype == torch.bfloat16
++        n = state.shape[0]
++        flat_kv = (
++            kv[:, :n, :]
++            .permute(1, 0, 2)
++            .contiguous()
++            .view(n, world * block_cols)[:, :logical_cols]
++        )
++        out.copy_(gate_ref(state, flat_kv, token_ids))
++
++    def fake_mhc_post(prev, res, post_m, res_m, out):
++        recon = (
++            res.float() * res_m[:, :, 0:1]
++            + prev[:, None, :].float() * post_m[:, :, None]
++        ).to(torch.bfloat16)
++        out.copy_(recon)
++
++    def fake_post_gate(
++        prev, res, post_m, res_m, kv, norm_weights, token_ids, out, eps, hc_mult
++    ):
++        recon = torch.empty_like(res)
++        fake_mhc_post(prev, res, post_m, res_m, recon)
++        fake_gate(
++            recon.flatten(1),
++            kv,
++            norm_weights,
++            token_ids,
++            out.view(-1, streams * width),
++            eps,
++            hc_mult,
++        )
++
++    def fake_post_gate_blocked(
++        prev, res, post_m, res_m, kv, norm_weights, token_ids, out, eps, hc_mult
++    ):
++        recon = torch.empty_like(res)
++        fake_mhc_post(prev, res, post_m, res_m, recon)
++        fake_gate_blocked(
++            recon.flatten(1),
++            kv,
++            norm_weights,
++            token_ids,
++            out.view(-1, streams * width),
++            eps,
++            hc_mult,
++        )
++
++    monkeypatch.setattr(tl_engram, "engram_gate", fake_gate)
++    monkeypatch.setattr(tl_engram, "engram_gate_blocked", fake_gate_blocked)
++    monkeypatch.setattr(tl_engram, "engram_post_gate", fake_post_gate)
++    monkeypatch.setattr(tl_engram, "engram_post_gate_blocked", fake_post_gate_blocked)
++    monkeypatch.setattr(tl_mhc, "_mhc_post", fake_mhc_post)
++    monkeypatch.setattr(columns, "copy_columns", lambda src, dst: dst.copy_(src))
++    monkeypatch.setattr(engram_ops, "tensor_model_parallel_all_reduce", lambda x: x)
++    monkeypatch.setattr(sp_prefill, "ENGRAM_SLICE_TOKENS", 4)
++
++    gen = torch.Generator().manual_seed(200 + world * 13 + tokens)
++    staged = torch.randn((tokens, in_cols), generator=gen, dtype=torch.bfloat16)
++    weight_full = torch.randn(
++        (logical_cols, in_cols), generator=gen, dtype=torch.bfloat16
++    )
++    hidden = torch.randn((tokens, streams, width), generator=gen, dtype=torch.bfloat16)
++    prev_a = torch.randn((tokens, width), generator=gen, dtype=torch.bfloat16)
++    prev_b = torch.randn((tokens, width), generator=gen, dtype=torch.bfloat16)
++    prev_sum = (prev_a.float() + prev_b.float()).to(torch.bfloat16)
++    post_mix = torch.rand((tokens, streams), generator=gen, dtype=torch.float32)
++    res_mix = torch.rand((tokens, streams, streams), generator=gen, dtype=torch.float32)
++    hash_ids = torch.zeros((tokens, 24), dtype=torch.int64)
++    token_ids = torch.where(
++        torch.arange(tokens) % 3 != 1,
++        torch.tensor(7, dtype=torch.int32),
++        torch.tensor(IMAGE_SENTINEL, dtype=torch.int32),
++    )
++
++    ref_engram = SimpleNamespace(
++        embed_tokens=SimpleNamespace(table_memory="device", columns=None),
++        staged_rows=staged,
++        wkv=lambda r: (r.float() @ weight_full.float().T).to(torch.bfloat16),
++        l2_prefetch_after_projection=None,
++        norm_weights=None,
++        eps=1e-6,
++        hc_mult=streams,
++    )
++    if with_previous_output:
++        full = engram_ops.Engram.forward(
++            ref_engram,
++            hidden,
++            hash_ids,
++            token_ids,
++            previous_output=prev_sum,
++            post_mix=post_mix,
++            res_mix=res_mix,
++        )
++    else:
++        full = engram_ops.Engram.forward(ref_engram, hidden, hash_ids, token_ids)
++
++    if not blocked_wkv:
++        for rank in range(world):
++            layout = sp_prefill.SPRows(tokens, world, rank)
++            wkv_rows_seen = []
++            prefetch_seen = []
++
++            def rep_wkv(r, seen=wkv_rows_seen):
++                seen.append(r.shape[0])
++                return (r.float() @ weight_full.float().T).to(torch.bfloat16)
++
++            engram = SimpleNamespace(
++                embed_tokens=SimpleNamespace(table_memory="device", columns=None),
++                staged_rows=staged,
++                wkv=rep_wkv,
++                l2_prefetch_after_projection=lambda n, ps=prefetch_seen: ps.append(n),
++                norm_weights=None,
++                eps=1e-6,
++                hc_mult=streams,
++            )
++            local_h = layout.local_slice(hidden)
++            if with_previous_output:
++                local_parts = RankOrderParts(
++                    torch.stack(
++                        (layout.local_slice(prev_a), layout.local_slice(prev_b))
++                    )
++                )
++                local_post = layout.local_slice(post_mix)
++                local_res = layout.local_slice(res_mix)
++                out = engram_ops.Engram.forward(
++                    engram,
++                    local_h,
++                    hash_ids,
++                    token_ids,
++                    sp_rows=layout,
++                    previous_output=local_parts,
++                    post_mix=local_post,
++                    res_mix=local_res,
++                )
++            else:
++                out = engram_ops.Engram.forward(
++                    engram, local_h, hash_ids, token_ids, sp_rows=layout
++                )
++            real = layout.real_rows
++            assert out.dtype == torch.bfloat16 and out.shape == local_h.shape
++            assert torch.equal(
++                out[:real].view(torch.int16),
++                full[layout.start : layout.start + real].view(torch.int16),
++            )
++            if real > 0:
++                assert wkv_rows_seen == [real]
++                assert prefetch_seen == [real]
++            else:
++                assert wkv_rows_seen == []
++                assert prefetch_seen == [0]
++        return
++
++    # Blocked column-parallel mode across lockstep ranks.
++    fabric = _RowExchangeFabric(world)
++    local_comm = threading.local()
++    monkeypatch.setattr(
++        sp_prefill,
++        "get_tp_group",
++        lambda: SimpleNamespace(
++            device_communicator=SimpleNamespace(
++                pynccl_comm=local_comm.comm, b12x_ar_comm=None
++            )
++        ),
++    )
++
++    class _FakeBlockedWKV(engram_ops._PaddedColumnParallelLinear):
++        def __init__(self, rank: int):
++            nn.Module.__init__(self)
++            self.output_size_per_partition = block_cols
++            self.logical_output_size = logical_cols
++            self.padded_output_size = logical_cols
++            self.weight = nn.Parameter(
++                weight_full[rank * block_cols : (rank + 1) * block_cols],
++                requires_grad=False,
++            )
++            self.direct_into_calls = 0
++
++        def local_product(self, input_, out=None):
++            prod = (input_.float() @ self.weight.float().T).to(torch.bfloat16)
++            if out is not None:
++                self.direct_into_calls += 1
++                out.copy_(prod)
++                return out
++            return prod
++
++    outputs: list[torch.Tensor | None] = [None] * world
++    direct_calls: list[int] = [0] * world
++    prefetch_calls: list[list[int]] = [[] for _ in range(world)]
++    errors = []
++
++    def run_blocked(rank: int) -> None:
++        try:
++            local_comm.comm = fabric.comm(rank)
++            layout = sp_prefill.SPRows(tokens, world, rank)
++            wkv = _FakeBlockedWKV(rank)
++            engram = SimpleNamespace(
++                embed_tokens=SimpleNamespace(table_memory="device", columns=None),
++                staged_rows=staged,
++                wkv=wkv,
++                l2_prefetch_after_projection=lambda n, r=rank: prefetch_calls[r].append(
++                    n
++                ),
++                norm_weights=None,
++                eps=1e-6,
++                hc_mult=streams,
++            )
++            local_h = layout.local_slice(hidden)
++            if with_previous_output:
++                local_parts = RankOrderParts(
++                    torch.stack(
++                        (layout.local_slice(prev_a), layout.local_slice(prev_b))
++                    )
++                )
++                local_post = layout.local_slice(post_mix)
++                local_res = layout.local_slice(res_mix)
++                out = engram_ops.Engram.forward(
++                    engram,
++                    local_h,
++                    hash_ids,
++                    token_ids,
++                    sp_rows=layout,
++                    previous_output=local_parts,
++                    post_mix=local_post,
++                    res_mix=local_res,
++                )
++            else:
++                out = engram_ops.Engram.forward(
++                    engram, local_h, hash_ids, token_ids, sp_rows=layout
++                )
++            outputs[rank] = out
++            direct_calls[rank] = wkv.direct_into_calls
++        except BaseException as exc:
++            errors.append((rank, exc))
++            fabric.barrier.abort()
++
++    threads = [threading.Thread(target=run_blocked, args=(r,)) for r in range(world)]
++    for t in threads:
++        t.start()
++    for t in threads:
++        t.join()
++    assert not errors, errors
++
++    for rank in range(world):
++        layout = sp_prefill.SPRows(tokens, world, rank)
++        real = layout.real_rows
++        out = outputs[rank]
++        assert out is not None and out.dtype == torch.bfloat16
++        assert torch.equal(
++            out[:real].view(torch.int16),
++            full[layout.start : layout.start + real].view(torch.int16),
++        )
++        assert direct_calls[rank] > 0
++        assert prefetch_calls[rank] == [tokens]
++        if real < layout.local_rows:
++            local_h = layout.local_slice(hidden)
++            if with_previous_output:
++                expected_pad = torch.empty_like(local_h[real:])
++                fake_mhc_post(
++                    layout.local_slice(prev_sum)[real:],
++                    local_h[real:],
++                    layout.local_slice(post_mix)[real:],
++                    layout.local_slice(res_mix)[real:],
++                    expected_pad,
++                )
++                assert torch.equal(
++                    out[real:].view(torch.int16), expected_pad.view(torch.int16)
++                )
++            else:
++                assert torch.equal(
++                    out[real:].view(torch.int16), local_h[real:].view(torch.int16)
++                )
++
++
++@pytest.mark.parametrize("world", [3, 4, 5])
++@pytest.mark.parametrize("tokens", [9, 7, 5])
++def test_interleaved_sp_rows_matches_interleaved_rows_slice(
++    monkeypatch, world: int, tokens: int
++) -> None:
++    """Exchanging gathered disk hash columns by row block and interleaving only
++    each rank's local rows matches slicing the full ``interleaved_rows`` result
++    bit for bit across TP3, TP4, and TP5 (including ``24 % tp != 0`` and empty
++    trailing ranks)."""
++    from vllm.models.deepseek_v4_1.common import engram as engram_ops
++
++    max_cols = (24 + world - 1) // world
++    gen = torch.Generator().manual_seed(700 + 31 * world + tokens)
++    rank_locals = [
++        torch.randn((tokens, max_cols * 256), generator=gen, dtype=torch.bfloat16)
++        for _ in range(world)
++    ]
++
++    # Reference: full interleaved_rows via dim=-1 all-gather.
++    gathered_flat = torch.cat(
++        [loc.view(-1, 256) for loc in rank_locals], dim=-1
++    )
++    full_rows = gathered_flat.view(tokens, -1)[:, : 24 * 256].contiguous()
++
++    def fake_all_to_all_rows(tensor: torch.Tensor, local_rows: int) -> torch.Tensor:
++        raise AssertionError("handled per-rank via exchange_rows")
++
++    for rank in range(world):
++        layout = sp_prefill.SPRows(tokens, world, rank)
++        real = layout.real_rows
++
++        def exchange_for_rank(
++            _self, _tensor: torch.Tensor, r: int = rank, l: int = layout.local_rows
++        ) -> torch.Tensor:
++            out = torch.zeros(
++                (world, l, max_cols * 256), dtype=torch.bfloat16
++            )
++            rr = sp_prefill.SPRows(tokens, world, r).real_rows
++            start = r * l
++            if rr > 0:
++                for s in range(world):
++                    out[s, :rr].copy_(rank_locals[s][start : start + rr])
++            return out
++
++        monkeypatch.setattr(sp_prefill.SPRows, "exchange_rows", exchange_for_rank)
++        local_interleaved = engram_ops.interleaved_sp_rows(
++            rank_locals[rank], layout
++        )
++        expected = full_rows[layout.start : layout.start + real]
++        assert local_interleaved.shape == (real, 24 * 256)
++        assert local_interleaved.dtype == torch.bfloat16
++        assert torch.equal(
++            local_interleaved.view(torch.int16), expected.view(torch.int16)
++        )
++
++
++@pytest.mark.parametrize("world", [3, 4])
++@pytest.mark.parametrize("tokens", [9, 5])
++@pytest.mark.parametrize("with_previous_output", [False, True])
++def test_engram_forward_sp_disk_columns_local_sp_product_bit_exact(
++    monkeypatch, world: int, tokens: int, with_previous_output: bool
++) -> None:
++    """With disk hash-column sharding and gathered ``wkv`` SP shards, ``Engram.forward``
++    exchanges only the gathered hash columns (one collective per layer, zero after
++    ``wkv``), projects only ``sp_rows.real_rows`` rows locally, and matches full-row
++    ``Engram.forward`` bit for bit across TP3 and TP4."""
++    from vllm.models.deepseek_v4_1.common import engram as engram_ops
++    from vllm.models.deepseek_v4_1.tilelang import columns as tl_columns
++    from vllm.models.deepseek_v4_1.tilelang import engram as tl_engram
++    from vllm.models.deepseek_v4_1.tilelang import mhc as tl_mhc
++    from vllm.models.deepseek_v4_1.tilelang.collectives import RankOrderParts
++
++    gen = torch.Generator().manual_seed(
++        900 + 29 * world + 7 * tokens + int(with_previous_output)
++    )
++    streams, dim = 4, 8
++    max_cols = (24 + world - 1) // world
++    block_cols = 32
++    logical_cols = (streams + 1) * dim
++
++    rank_staged = [
++        torch.randn((tokens, max_cols * 256), generator=gen, dtype=torch.bfloat16)
++        for _ in range(world)
++    ]
++    full_rows = (
++        torch.cat([loc.view(-1, 256) for loc in rank_staged], dim=-1)
++        .view(tokens, -1)[:, : 24 * 256]
++        .contiguous()
++    )
++
++    hidden = torch.randn((tokens, streams, dim), generator=gen, dtype=torch.bfloat16)
++    prev_a = torch.randn((tokens, dim), generator=gen, dtype=torch.bfloat16)
++    prev_b = torch.randn((tokens, dim), generator=gen, dtype=torch.bfloat16)
++    prev_sum = (prev_a.float() + prev_b.float()).to(torch.bfloat16)
++    post_mix = torch.randn((tokens, streams), generator=gen, dtype=torch.float32)
++    res_mix = torch.randn((tokens, streams, streams), generator=gen, dtype=torch.float32)
++    hash_ids = torch.zeros((tokens, 24), dtype=torch.int64)
++    token_ids = torch.arange(tokens, dtype=torch.int32)
++    if tokens >= 3:
++        token_ids[2] = tl_engram.IMAGE_SENTINEL
++
++    weight_full = torch.randn(
++        (world * block_cols, 24 * 256), generator=gen, dtype=torch.bfloat16
++    )
++
++    def fake_mhc_post(l_out, x_in, p_mix, r_mix, out):
++        mixed = torch.einsum("tsr,trd->tsd", r_mix, x_in.float())
++        mixed = mixed + p_mix.unsqueeze(-1) * l_out.float().unsqueeze(1)
++        out.copy_(mixed.to(torch.bfloat16))
++
++    def fake_gate(state, kv, _nw, mask, out, _eps, _hc):
++        s2d = state.view(state.shape[0], -1)
++        gated = s2d.float() + kv[:, : s2d.shape[1]].float() * 0.125
++        res = gated.to(torch.bfloat16)
++        if mask is not None:
++            keep = (mask == tl_engram.IMAGE_SENTINEL).unsqueeze(-1)
++            res = torch.where(keep, s2d, res)
++        out.view_as(s2d).copy_(res)
++
++    def fake_gate_blocked(state, kv_blocks, _nw, mask, out, _eps, _hc):
++        real = state.shape[0]
++        kv_cat = kv_blocks[:, :real, :].permute(1, 0, 2).reshape(real, -1)
++        fake_gate(state, kv_cat[:, : logical_cols], _nw, mask, out, _eps, _hc)
++
++    def fake_post_gate(prev, res_in, p_mix, r_mix, kv, _nw, mask, out, _eps, _hc):
++        rec = torch.empty_like(res_in)
++        fake_mhc_post(prev, res_in, p_mix, r_mix, rec)
++        fake_gate(rec, kv, _nw, mask, out, _eps, _hc)
++
++    def fake_post_gate_blocked(
++        prev, res_in, p_mix, r_mix, kv_blocks, _nw, mask, out, _eps, _hc
++    ):
++        rec = torch.empty_like(res_in)
++        fake_mhc_post(prev, res_in, p_mix, r_mix, rec)
++        fake_gate_blocked(rec, kv_blocks, _nw, mask, out, _eps, _hc)
++
++    monkeypatch.setattr(tl_mhc, "_mhc_post", fake_mhc_post)
++    monkeypatch.setattr(
++        tl_columns, "copy_columns", lambda src, dst: dst.copy_(src)
++    )
++    monkeypatch.setattr(tl_engram, "engram_gate", fake_gate)
++    monkeypatch.setattr(tl_engram, "engram_gate_blocked", fake_gate_blocked)
++    monkeypatch.setattr(tl_engram, "engram_post_gate", fake_post_gate)
++    monkeypatch.setattr(
++        tl_engram, "engram_post_gate_blocked", fake_post_gate_blocked
++    )
++
++    # Full-row reference output.
++    kv_full = (
++        (full_rows.float() @ weight_full.float().T)
++        .to(torch.bfloat16)[:, :logical_cols]
++        .contiguous()
++    )
++    expected_full = torch.empty_like(hidden)
++    if with_previous_output:
++        fake_post_gate(
++            prev_sum,
++            hidden,
++            post_mix,
++            res_mix,
++            kv_full,
++            None,
++            token_ids,
++            expected_full,
++            1e-6,
++            streams,
++        )
++    else:
++        fake_gate(
++            hidden.flatten(1),
++            kv_full,
++            None,
++            token_ids,
++            expected_full.flatten(1),
++            1e-6,
++            streams,
++        )
++
++    class _FakeQuantMethod:
++        def __init__(self):
++            self.cast_rows: list[int] = []
++
++        def apply_shards(self, _layer, x, shards, out):
++            self.cast_rows.append(x.shape[0])
++            for s, shard in enumerate(shards):
++                w_s = shard[0] if isinstance(shard, tuple) else shard
++                out[s, : x.shape[0]].copy_(
++                    (x.float() @ w_s.float().T).to(torch.bfloat16)
++                )
++            return out
++
++    class _FakeSPShardedWKV(engram_ops._PaddedColumnParallelLinear):
++        def __init__(self, rank: int):
++            nn.Module.__init__(self)
++            self.tp_size = world
++            self.tp_rank = rank
++            self.output_size_per_partition = block_cols
++            self.logical_output_size = logical_cols
++            self.padded_output_size = world * block_cols
++            self.weight = nn.Parameter(
++                weight_full[rank * block_cols : (rank + 1) * block_cols].clone(),
++                requires_grad=False,
++            )
++            self.tilelang_weight = self.weight.data
++            self.tilelang_weight_sf = torch.full(
++                (block_cols // 32, 48), rank + 1, dtype=torch.uint32
++            )
++            self.quant_method = _FakeQuantMethod()
++            self.sp_shards = None
++
++    # Verify gather_sp_shards aliases local shard and clones remote shards.
++    gather_rank = SimpleNamespace(val=0)
++    all_w_stack = torch.stack(
++        [weight_full[r * block_cols : (r + 1) * block_cols] for r in range(world)],
++        dim=0,
++    )
++    all_sf_stack = torch.stack(
++        [
++            torch.full((block_cols // 32, 48), r + 1, dtype=torch.uint32)
++            for r in range(world)
++        ],
++        dim=0,
++    )
++
++    def fake_all_gather(tensor: torch.Tensor, dim: int = -1) -> torch.Tensor:
++        assert dim == 0
++        if tensor.dtype == torch.uint32:
++            return all_sf_stack.clone()
++        return all_w_stack.clone()
++
++    import vllm.distributed as vllm_dist
++
++    monkeypatch.setattr(vllm_dist, "model_parallel_is_initialized", lambda: True)
++    monkeypatch.setattr(
++        engram_ops, "tensor_model_parallel_all_gather", fake_all_gather
++    )
++
++    exchange_calls: list[list[tuple[int, ...]]] = [[] for _ in range(world)]
++    prefetch_calls: list[list[int]] = [[] for _ in range(world)]
++
++    for rank in range(world):
++        layout = sp_prefill.SPRows(tokens, world, rank)
++        wkv = _FakeSPShardedWKV(rank)
++        engram = SimpleNamespace(
++            embed_tokens=SimpleNamespace(
++                table_memory="device",
++                columns=tuple(range(rank, 24, world)),
++                caps=SimpleNamespace(max_tokens=64),
++                open_disk_rows=lambda: None,
++            ),
++            staged_rows=rank_staged[rank],
++            wkv=wkv,
++            q_weight=torch.ones((streams, dim), dtype=torch.bfloat16),
++            k_weight=torch.ones((streams, dim), dtype=torch.bfloat16),
++            norm_weights=torch.empty(streams * dim, dtype=torch.float32),
++            prefill_sp_min_rows=1,
++            l2_prefetch_after_projection=lambda n, r=rank: prefetch_calls[r].append(n),
++            eps=1e-6,
++            hc_mult=streams,
++        )
++        engram_ops.Engram.process_weights_after_loading(engram)
++        assert wkv.sp_shards is not None and len(wkv.sp_shards) == world
++        # Own shard must alias in place (0 extra bytes).
++        assert wkv.sp_shards[rank][0].data_ptr() == wkv.tilelang_weight.data_ptr()
++        assert (
++            wkv.sp_shards[rank][1].data_ptr() == wkv.tilelang_weight_sf.data_ptr()
++        )
++
++        def fake_exchange(
++            _self, tensor: torch.Tensor, r: int = rank, l: int = layout.local_rows
++        ) -> torch.Tensor:
++            exchange_calls[r].append(tuple(tensor.shape))
++            out = torch.zeros(
++                (world, l, max_cols * 256), dtype=torch.bfloat16
++            )
++            rr = sp_prefill.SPRows(tokens, world, r).real_rows
++            start = r * l
++            if rr > 0:
++                for s in range(world):
++                    out[s, :rr].copy_(rank_staged[s][start : start + rr])
++            return out
++
++        monkeypatch.setattr(sp_prefill.SPRows, "exchange_rows", fake_exchange)
++
++        local_h = layout.local_slice(hidden)
++        if with_previous_output:
++            local_parts = RankOrderParts(
++                torch.stack((layout.local_slice(prev_a), layout.local_slice(prev_b)))
++            )
++            out = engram_ops.Engram.forward(
++                engram,
++                local_h,
++                hash_ids,
++                token_ids,
++                sp_rows=layout,
++                previous_output=local_parts,
++                post_mix=layout.local_slice(post_mix),
++                res_mix=layout.local_slice(res_mix),
++            )
++        else:
++            out = engram_ops.Engram.forward(
++                engram, local_h, hash_ids, token_ids, sp_rows=layout
++            )
++
++        real = layout.real_rows
++        assert out.dtype == torch.bfloat16
++        assert torch.equal(
++            out[:real].view(torch.int16),
++            expected_full[layout.start : layout.start + real].view(torch.int16),
++        )
++        # Exactly one collective (staged_rows exchange) and zero after wkv!
++        assert exchange_calls[rank] == [(tokens, max_cols * 256)]
++        assert prefetch_calls[rank] == [tokens]
++        if real > 0:
++            assert wkv.quant_method.cast_rows == [real]
++        else:
++            assert wkv.quant_method.cast_rows == []
++        if real < layout.local_rows:
++            if with_previous_output:
++                expected_pad = torch.empty_like(local_h[real:])
++                fake_mhc_post(
++                    layout.local_slice(prev_sum)[real:],
++                    local_h[real:],
++                    layout.local_slice(post_mix)[real:],
++                    layout.local_slice(res_mix)[real:],
++                    expected_pad,
++                )
++                assert torch.equal(
++                    out[real:].view(torch.int16), expected_pad.view(torch.int16)
++                )
++            else:
++                assert torch.equal(
++                    out[real:].view(torch.int16), local_h[real:].view(torch.int16)
++                )
++
++
++@pytest.mark.parametrize("world", [3, 4])
++@pytest.mark.parametrize("rows", [1, 6, 65])
++def test_tilelang_linear_apply_shards_single_cast_and_bit_exact(
++    monkeypatch, world: int, rows: int
++) -> None:
++    """``TileLangFP8LinearMethod.apply_shards`` casts the local ``rows`` to MXFP8
++    only once and invokes the exact same GEMM arithmetic per shard as ``apply``."""
++    from vllm.models.deepseek_v4_1.tilelang import linear as tl_linear
++
++    k, n_shard = 64, 32
++    gen = torch.Generator().manual_seed(1100 + 19 * world + rows)
++    x = torch.randn((rows, k), generator=gen, dtype=torch.bfloat16)
++    weights = [
++        torch.randn((n_shard, k), generator=gen, dtype=torch.bfloat16).to(
++            torch.float8_e4m3fn
++        )
++        for _ in range(world)
++    ]
++    scales = [
++        torch.randint(1, 200, (n_shard // 32, 2), generator=gen, dtype=torch.uint32)
++        for _ in range(world)
++    ]
++    shards = tuple((weights[r], scales[r]) for r in range(world))
++
++    cast_calls: list[int] = []
++
++    def fake_scratch(specs, _scratch):
++        return tuple(torch.zeros(shape, dtype=dtype) for shape, dtype in specs)
++
++    def fake_per_token_cast(inp, _fmt, _blk, *, round_sf, use_packed_ue8m0, out):
++        assert round_sf and use_packed_ue8m0
++        cast_calls.append(inp.shape[0])
++        xq, sf = out
++        xq.copy_(inp.to(torch.float8_e4m3fn))
++        sf.fill_(127)
++
++    def fake_gemm(xq, w, sf_u32, w_sf, out):
++        m = out.shape[0]
++        prod = (xq[:m].float() @ w.float().T) * (
++            (sf_u32[:m, :1].float() + w_sf[:, :1].float().T) * 1e-3
++        )
++        out.copy_(prod.to(torch.bfloat16))
++
++    monkeypatch.setattr(tl_linear, "_scratch", fake_scratch)
++    monkeypatch.setattr(tl_linear.pdl, "per_token_cast", fake_per_token_cast)
++
++    method = tl_linear.TileLangFP8LinearMethod(SimpleNamespace(weight_block_size=[32, 32], scale_fmt="ue8m0"))
++    decode_table = {b: fake_gemm for b in (16, 32, 64)}
++
++    # Reference: run apply() per shard independently.
++    expected = torch.empty((world, rows, n_shard), dtype=torch.bfloat16)
++    for r in range(world):
++        layer_r = SimpleNamespace(
++            weight=weights[r],
++            tilelang_weight=weights[r],
++            tilelang_weight_sf=scales[r],
++            tilelang_groups=1,
++            tilelang_mxfp8_input=False,
++            tilelang_shards=1,
++            tilelang_split_rows=0,
++            tilelang_decode_rows=64,
++            tilelang_wide={},
++            tilelang_prefill=fake_gemm,
++            tilelang_decode=decode_table,
++        )
++        expected[r].copy_(method.apply(layer_r, x))
++
++    cast_calls.clear()
++    layer0 = SimpleNamespace(
++        weight=weights[0],
++        tilelang_weight=weights[0],
++        tilelang_weight_sf=scales[0],
++        tilelang_groups=1,
++        tilelang_mxfp8_input=False,
++        tilelang_shards=1,
++        tilelang_split_rows=0,
++        tilelang_decode_rows=64,
++        tilelang_wide={},
++        tilelang_prefill=fake_gemm,
++        tilelang_decode=decode_table,
++    )
++    actual = torch.empty((world, rows + 3, n_shard), dtype=torch.bfloat16)
++    method.apply_shards(layer0, x, shards, actual)
++
++    assert cast_calls == [rows]
++    assert torch.equal(
++        actual[:, :rows].view(torch.int16), expected.view(torch.int16)
++    )
+diff --git a/vllm/distributed/device_communicators/pynccl.py b/vllm/distributed/device_communicators/pynccl.py
+index 893ae14b5..54f7f936a 100644
+--- a/vllm/distributed/device_communicators/pynccl.py
++++ b/vllm/distributed/device_communicators/pynccl.py
+@@ -575,14 +575,22 @@ class PyNcclCommunicator:
+         )
+ 
+     def all_to_all_rows(
+-        self, output: torch.Tensor, input_: torch.Tensor, rows: int, stream=None
++        self,
++        output: torch.Tensor,
++        input_: torch.Tensor,
++        rows: int,
++        stream=None,
++        *,
++        copy_self: bool = True,
+     ):
+         """Row blocks of ``rows``: rank r receives ``input_``'s rows
+         ``[r * rows, (r + 1) * rows)``, the last ranks' blocks short or empty when
+         ``input_`` has fewer rows; ``output[s, :n]`` receives rank s's block for this
+         rank (n its real rows, the same from every rank), and later rows are not
+-        written. One grouped send/recv per peer; at four ranks, neighbours only
+-        (``_all_to_all_rows_ring``) unless the fabric is ``direct`` (``ring4_relay``)."""
++        written. With ``copy_self=False``, ``output[me, :mine]`` is already written in
++        place by the caller and is not copied from ``input_``. One grouped send/recv
++        per peer; at four ranks, neighbours only (``_all_to_all_rows_ring``) unless the
++        fabric is ``direct`` (``ring4_relay``)."""
+         if self.disabled:
+             return
+         world, me, total = self.world_size, self.rank, input_.shape[0]
+@@ -598,7 +606,7 @@ class PyNcclCommunicator:
+         if stream is None:
+             stream = current_stream()
+         mine = real(me)
+-        if mine:
++        if copy_self and mine:
+             output[me, :mine].copy_(input_[me * rows : me * rows + mine])
+         if world == 4 and ring4_relay():
+             self._all_to_all_rows_ring(output, input_, rows, real, stream)
+diff --git a/vllm/models/deepseek_v4_1/common/engram.py b/vllm/models/deepseek_v4_1/common/engram.py
+index c357f6e5a..9b2092617 100644
+--- a/vllm/models/deepseek_v4_1/common/engram.py
++++ b/vllm/models/deepseek_v4_1/common/engram.py
+@@ -46,6 +46,7 @@ class _PaddedColumnParallelLinear(ColumnParallelLinear):
+         padded = -(-output_size // quantum) * quantum
+         self.logical_output_size = output_size
+         self.padded_output_size = padded
++        self.sp_shards = None
+         super().__init__(input_size, padded, **kwargs)
+         if self.bias is not None or self.return_bias:
+             raise ValueError("the padded Engram projection is bias-free")
+@@ -68,9 +69,71 @@ class _PaddedColumnParallelLinear(ColumnParallelLinear):
+             return output
+         return output[..., : self.logical_output_size].contiguous()
+ 
+-    def local_product(self, input_):
+-        """This rank's column block of the product, not gathered."""
+-        return self.quant_method.apply(self, input_, None)
++    def local_product(self, input_, out=None):
++        """This rank's column block of the product, not gathered; written into ``out``
++        when given."""
++        if out is None:
++            return self.quant_method.apply(self, input_, None)
++        apply_into = getattr(self.quant_method, "apply_into", None)
++        if apply_into is not None:
++            return apply_into(self, input_, out)
++        out.copy_(self.quant_method.apply(self, input_, None))
++        return out
++
++    def gather_sp_shards(self) -> None:
++        """Gather every TP rank's column block of the projection so a sequence-parallel
++        prefill step can project only this rank's rows locally into ``[N, L, C]``."""
++        from vllm.distributed import model_parallel_is_initialized
++
++        if self.tp_size <= 1 or not model_parallel_is_initialized():
++            return
++        if (
++            getattr(self, "weight_scale_inv", None) is not None
++            and not hasattr(self, "tilelang_weight_sf")
++            and hasattr(self.quant_method, "process_weights_after_loading")
++        ):
++            self.quant_method.process_weights_after_loading(self)
++        w_me = getattr(self, "tilelang_weight", self.weight)
++        sf_me = getattr(self, "tilelang_weight_sf", None)
++        all_w = tensor_model_parallel_all_gather(w_me.unsqueeze(0), dim=0)
++        if sf_me is not None:
++            all_sf = tensor_model_parallel_all_gather(sf_me.unsqueeze(0), dim=0)
++            self.sp_shards = tuple(
++                (w_me, sf_me)
++                if r == self.tp_rank
++                else (all_w[r].clone(), all_sf[r].clone())
++                for r in range(self.tp_size)
++            )
++            del all_w, all_sf
++        else:
++            self.sp_shards = tuple(
++                w_me if r == self.tp_rank else all_w[r].clone()
++                for r in range(self.tp_size)
++            )
++            del all_w
++
++    def local_sp_product(
++        self, local_rows: torch.Tensor, local_capacity: int
++    ) -> torch.Tensor:
++        """Project this rank's ``local_rows`` (``[real, K]``) through every TP rank's
++        column block into ``[N, local_capacity, C]`` locally, without a collective."""
++        shards = self.sp_shards
++        assert shards is not None
++        out = torch.empty(
++            (len(shards), local_capacity, self.output_size_per_partition),
++            dtype=local_rows.dtype,
++            device=local_rows.device,
++        )
++        real = local_rows.shape[0]
++        if real == 0:
++            return out
++        apply_shards = getattr(self.quant_method, "apply_shards", None)
++        if apply_shards is not None:
++            return apply_shards(self, local_rows, shards, out)
++        for s, shard in enumerate(shards):
++            w_s = shard[0] if isinstance(shard, tuple) else shard
++            torch.matmul(local_rows, w_s.t(), out=out[s, :real])
++        return out
+ 
+ 
+ def project_rows(wkv, rows, after_projection=None):
+@@ -405,6 +468,36 @@ def interleaved_rows(local: torch.Tensor) -> torch.Tensor:
+     return rows[:, : 24 * 256].contiguous()
+ 
+ 
++def interleaved_sp_rows(local: torch.Tensor, sp_rows) -> torch.Tensor:
++    """This rank's sequence-parallel rows ``[real, 24 * 256]`` in column order from
++    every rank's columns: ``local`` is this rank's ``[T, ceil(24 / tp) * 256]``,
++    columns ``rank, rank + tp, ...`` side by side. Exchanged all-to-all by row block
++    so each rank receives only its ``real`` local rows from every rank, then placed
++    side by side as 256-wide column blocks."""
++    blocks = sp_rows.exchange_rows(local)
++    real = sp_rows.real_rows
++    if real == 0:
++        return local.new_empty((0, 24 * 256))
++    if real < sp_rows.local_rows:
++        blocks = blocks[:, :real].contiguous()
++    world_size = blocks.shape[0]
++    shard_shape = (real * (blocks.shape[2] // 256), 256)
++    flat = blocks.view(world_size * shard_shape[0], 256)
++    from vllm.models.deepseek_v4_1.tilelang.collectives import concat_rank_shards
++
++    concatenated = concat_rank_shards(flat, world_size, shard_shape)
++    if concatenated is None:
++        concatenated = (
++            flat.view(world_size, *shard_shape)
++            .movedim(0, 1)
++            .reshape(shard_shape[0], world_size * 256)
++        )
++    rows = concatenated.view(real, -1)
++    if rows.shape[1] == 24 * 256:
++        return rows
++    return rows[:, : 24 * 256].contiguous()
++
++
+ class ParallelEngramEmbedding(nn.Module):
+     def __init__(self, plan, caps, geometry, table_memory="device"):
+         super().__init__()
+@@ -860,6 +953,11 @@ class Engram(nn.Module):
+             (self.q_weight.float() * self.k_weight.float()).flatten()
+         )
+         self.embed_tokens.open_disk_rows()
++        sequence_parallel = (
++            0 < self.prefill_sp_min_rows <= self.embed_tokens.caps.max_tokens
++        )
++        if sequence_parallel and isinstance(self.wkv, _PaddedColumnParallelLinear):
++            self.wkv.gather_sp_shards()
+ 
+     def stage_rows(self, tokens, stream, early=None):
+         """Queue the disk rows of this step's ``tokens`` tokens (their row IDs in
+@@ -905,62 +1003,130 @@ class Engram(nn.Module):
+ 
+         With ``sp_rows`` (prefill sequence parallelism) ``hidden_states`` holds
+         this rank's rows while ``hash_ids`` and ``token_mask`` cover every
+-        token; the lookup and projection still run on every row, and with a
+-        column-parallel projection each rank receives only its own rows of the
+-        product (an all-to-all instead of an all-gather of every row).
++        token; the lookup runs on every row, and with a column-parallel
++        projection each rank receives only its own rows (exchanging disk hash
++        columns before projecting locally through ``wkv``'s column blocks, or
++        exchanging ``wkv``'s column blocks all-to-all).
+         """
++        num_tokens = hash_ids.shape[0]
+         if self.embed_tokens.table_memory == "disk" and (
+-            not self._disk_prepared or self._disk_prepared_tokens < hash_ids.shape[0]
++            not self._disk_prepared or self._disk_prepared_tokens < num_tokens
+         ):
+             raise RuntimeError("Disk Engram output is not prepared")
+         if self.embed_tokens.table_memory == "disk":
+-            self.embed_tokens.gather_rows(self.staged_rows[: hash_ids.shape[0]])
+-        if self.embed_tokens.columns is not None:
+-            # This rank's gathered rows are its hash columns, every tp-th.
+-            rows = interleaved_rows(self.staged_rows[: hash_ids.shape[0]])
+-        else:
+-            rows = tensor_model_parallel_all_reduce(
+-                self.staged_rows[: hash_ids.shape[0]]
+-            )
++            self.embed_tokens.gather_rows(self.staged_rows[:num_tokens])
+         # With SP and a column-parallel projection, kv is every rank's column block
+         # of this rank's rows, [N, L, C]: the gate reads the blocks in place.
+         blocked = sp_rows is not None and isinstance(
+             self.wkv, _PaddedColumnParallelLinear
+         )
+-        if blocked:
+-            local_kv = self.wkv.local_product(rows)
++        sp_local_wkv = (
++            blocked
++            and self.embed_tokens.columns is not None
++            and getattr(self.wkv, "sp_shards", None) is not None
++        )
++        if sp_local_wkv:
++            # Each rank exchanges its hash columns by row block and interleaves
++            # only its own sequence-parallel rows before projecting locally.
++            rows = interleaved_sp_rows(self.staged_rows[:num_tokens], sp_rows)
++        elif self.embed_tokens.columns is not None:
++            # This rank's gathered rows are its hash columns, every tp-th.
++            rows = interleaved_rows(self.staged_rows[:num_tokens])
++        else:
++            rows = tensor_model_parallel_all_reduce(
++                self.staged_rows[:num_tokens]
++            )
++        state = (
++            hidden_states if previous_output is not None else hidden_states.flatten(1)
++        )
++        out = None
++
++        def prepare_local():
++            nonlocal previous_output, out
++            if previous_output is not None:
++                from vllm.models.deepseek_v4_1.tilelang.collectives import (
++                    RankOrderParts,
++                )
++
++                if isinstance(previous_output, RankOrderParts):
++                    previous_output = previous_output.sum()
++            out = torch.empty_like(state)
++            if sp_rows is not None:
++                real = sp_rows.real_rows
++                if real < state.shape[0]:
++                    if previous_output is not None:
++                        from vllm.models.deepseek_v4_1.tilelang.mhc import _mhc_post
++
++                        _mhc_post(
++                            previous_output[real:],
++                            hidden_states[real:],
++                            post_mix[real:],
++                            res_mix[real:],
++                            out[real:],
++                        )
++                    else:
++                        from vllm.models.deepseek_v4_1.tilelang import columns
++
++                        columns.copy_columns(state[real:], out[real:])
++
++        if sp_local_wkv:
++            kv = self.wkv.local_sp_product(rows, sp_rows.local_rows)
++            del rows
++            if self.l2_prefetch_after_projection is not None:
++                self.l2_prefetch_after_projection(num_tokens)
++            prepare_local()
++            kv_start = 0
++        elif blocked:
++            from vllm.models.deepseek_v4_1 import sp_prefill
++
++            block_cols = (
++                getattr(self.wkv, "output_size_per_partition", None)
++                or self.wkv.weight.shape[0]
++            )
++            after_proj = self.l2_prefetch_after_projection
++
++            def after_blocked():
++                if after_proj is not None:
++                    after_proj(num_tokens)
++                prepare_local()
++
++            kv = sp_rows.project_exchange_rows(
++                lambda start, stop, dest: self.wkv.local_product(
++                    rows[start:stop], out=dest
++                ),
++                (block_cols,),
++                rows.dtype,
++                rows.device,
++                slices=sp_prefill.engram_slices(num_tokens),
++                then=after_blocked,
++            )
+             del rows
+-            kv = sp_rows.exchange_rows(local_kv)
+-            del local_kv
+             kv_start = 0
+         else:
+-            kv = project_rows(self.wkv, rows, self.l2_prefetch_after_projection)
++            if sp_rows is not None and not isinstance(self.wkv, ColumnParallelLinear):
++                # Replicated projection under SP: each rank projects only its real rows.
++                rows = rows[sp_rows.start : sp_rows.start + sp_rows.real_rows]
++                kv_start = 0
++            else:
++                kv_start = 0 if sp_rows is None else sp_rows.start
++            if rows.shape[0] > 0 or sp_rows is None:
++                kv = project_rows(self.wkv, rows, self.l2_prefetch_after_projection)
++            else:
++                if self.l2_prefetch_after_projection is not None:
++                    self.l2_prefetch_after_projection(0)
++                kv = None
+             del rows
+-            kv_start = 0 if sp_rows is None else sp_rows.start
++            prepare_local()
+         if previous_output is not None:
+-            from vllm.models.deepseek_v4_1.tilelang.collectives import RankOrderParts
+             from vllm.models.deepseek_v4_1.tilelang.engram import (
+                 engram_post_gate,
+                 engram_post_gate_blocked,
+             )
+ 
+-            if isinstance(previous_output, RankOrderParts):
+-                previous_output = previous_output.sum()
+-            out = torch.empty_like(hidden_states)
+             residual_in = hidden_states
+             mix_out = out
+             if sp_rows is not None:
+                 start, real = sp_rows.start, sp_rows.real_rows
+-                if real < hidden_states.shape[0]:
+-                    from vllm.models.deepseek_v4_1.tilelang.mhc import _mhc_post
+-
+-                    _mhc_post(
+-                        previous_output[real:],
+-                        hidden_states[real:],
+-                        post_mix[real:],
+-                        res_mix[real:],
+-                        out[real:],
+-                    )
+                 if real == 0:
+                     return out
+                 previous_output = previous_output[:real]
+@@ -986,16 +1152,10 @@ class Engram(nn.Module):
+                 self.hc_mult,
+             )
+             return out
+-        state = hidden_states.flatten(1)
+-        out = torch.empty_like(state)
+         mix_out = out
+         if sp_rows is not None:
+             # Gate the real local rows; the trailing pad rows pass through.
+             start, real = sp_rows.start, sp_rows.real_rows
+-            if real < state.shape[0]:
+-                from vllm.models.deepseek_v4_1.tilelang import columns
+-
+-                columns.copy_columns(state[real:], out[real:])
+             if real == 0:
+                 return out.view_as(hidden_states)
+             state, mix_out = state[:real], out[:real]
+diff --git a/vllm/models/deepseek_v4_1/sp_prefill.py b/vllm/models/deepseek_v4_1/sp_prefill.py
+index 0815a0273..4b9d8191f 100644
+--- a/vllm/models/deepseek_v4_1/sp_prefill.py
++++ b/vllm/models/deepseek_v4_1/sp_prefill.py
+@@ -49,9 +49,10 @@ row and then compacts.
+ - Local rows (L): the residual carry, mHC pre / post / post_pre / collapse,
+   attn_norm, ffn_norm, the Engram gate (``run_engram_mix``), the MoE gate and
+   top-k routing, and the final norm.
+-- Gathered rows (T): the Engram lookup reduction and ``wkv`` (each rank keeps
+-  only its own rows of ``wkv``'s product, exchanged all-to-all; the TileLang
+-  gate reads the exchanged column blocks in place), attention
++- Gathered rows (T): the Engram table lookup (for disk column shards, each rank
++  exchanges its gathered hash columns all-to-all so it interleaves and projects
++  only its own L rows locally through ``wkv``'s column blocks; resident row
++  shards slice ``wkv`` and exchange the blocks all-to-all), attention
+   (``wq_b``, indexer, compressor, KV cache writes, sparse MLA, WO), and the
+   MoE routed and shared experts.
+ - In attention layers without a compressor, the row-wise front
+@@ -303,6 +304,89 @@ class SPRows:
+             )
+         return tensor_model_parallel_all_to_all_rows(local, self.local_rows)
+ 
++    def project_exchange_rows(
++        self,
++        project,
++        row_shape: tuple[int, ...],
++        dtype: torch.dtype,
++        device: torch.device,
++        slices: int = 1,
++        then=None,
++    ) -> torch.Tensor:
++        """Every rank's column block of this rank's rows of a column-parallel product
++        of all T rows, ``[N, L, *row_shape]``, [s] from rank s.
++
++        ``project(start, stop, out)`` writes this rank's column block of rows
++        ``start:stop`` into ``out``. Each slice's peer blocks are projected into a send
++        buffer and exchanged into ``out[:, lo:hi]`` on a side stream (``copy_self=False``)
++        while this rank's own block of the slice is projected straight into
++        ``out[rank, lo : lo + real]`` without allocating a full-row intermediate or
++        copying the self-block. ``then()`` runs on the current stream after the last
++        projection, before the last exchange is awaited. Rows past this rank's real
++        rows are not written."""
++        local, world, tokens = self.local_rows, self.world_size, self.num_tokens
++        comm = _tp_pynccl_comm()
++        if comm is None:
++            local_kv = torch.empty((tokens, *row_shape), dtype=dtype, device=device)
++            if tokens:
++                project(0, tokens, local_kv)
++            if then is not None:
++                then()
++            return self.exchange_rows(local_kv)
++        slices = max(slices, 1)
++        out = torch.empty((world, local, *row_shape), dtype=dtype, device=device)
++        send = torch.empty((world * local, *row_shape), dtype=dtype, device=device)
++        bounds = [local * i // slices for i in range(slices + 1)]
++        use_cuda_streams = device.type == "cuda" and torch.cuda.is_available()
++        main = torch.cuda.current_stream(device) if use_cuda_streams else None
++        side = _side_stream(device) if use_cuda_streams else None
++        for lo, hi in zip(bounds, bounds[1:]):
++            slice_rows = hi - lo
++            if slice_rows == 0:
++                continue
++            send_slice = send[world * lo : world * hi].view(
++                world, slice_rows, *row_shape
++            )
++            slice_total = 0
++            for owner in range(world):
++                real = max(0, min(hi, tokens - owner * local) - lo)
++                slice_total += real
++                if owner != self.rank and real:
++                    start = owner * local + lo
++                    project(start, start + real, send_slice[owner, :real])
++            if slice_total:
++                flat_send = send_slice.view(world * slice_rows, *row_shape)[
++                    :slice_total
++                ]
++                if use_cuda_streams:
++                    side.wait_stream(main)
++                    with torch.cuda.stream(side):
++                        comm.all_to_all_rows(
++                            out[:, lo:hi],
++                            flat_send,
++                            slice_rows,
++                            stream=side,
++                            copy_self=False,
++                        )
++                else:
++                    comm.all_to_all_rows(
++                        out[:, lo:hi],
++                        flat_send,
++                        slice_rows,
++                        stream=None,
++                        copy_self=False,
++                    )
++            real_me = max(0, min(hi, tokens - self.rank * local) - lo)
++            if real_me:
++                start = self.rank * local + lo
++                project(start, start + real_me, out[self.rank, lo : lo + real_me])
++        if then is not None:
++            then()
++        if use_cuda_streams:
++            # send and out are freed only after this wait, on this stream.
++            main.wait_stream(side)
++        return out
++
+     def empty_padded(
+         self, row_shape: tuple[int, ...], dtype: torch.dtype, device: torch.device
+     ) -> torch.Tensor:
+@@ -479,6 +563,16 @@ def wo_slices(num_tokens: int) -> int:
+     return 2 if num_tokens >= WO_SLICE_TOKENS else 1
+ 
+ 
++# The Engram projection's row exchange runs in two slices from this many tokens,
++# so each slice's peer exchange runs under this rank's own block and the next slice.
++ENGRAM_SLICE_TOKENS = 2048
++
++
++def engram_slices(num_tokens: int) -> int:
++    """Slices of a sequence-parallel Engram projection of ``num_tokens`` tokens."""
++    return 2 if num_tokens >= ENGRAM_SLICE_TOKENS else 1
++
++
+ # The MoE output is exchanged in one slice per this many tokens: each slice's
+ # exchange runs under the combine of the next. A slice's message to a peer is at
+ # least 1,024 rows at TP4, so an exchange's fixed cost stays small beside it.
+@@ -545,6 +639,25 @@ def project_reduce_scatter_current(
+ _SIDE_STREAMS: dict = {}
+ 
+ 
++def _tp_pynccl_comm():
++    """The TP group's PyNCCL communicator when active, else None."""
++    try:
++        dev_comm = get_tp_group().device_communicator
++    except Exception:
++        return None
++    roce_comm = getattr(dev_comm, "b12x_ar_comm", None)
++    if (
++        roce_comm is not None
++        and not getattr(roce_comm, "disabled", False)
++        and getattr(roce_comm, "should_all_to_all_rows", None) is not None
++    ):
++        return None
++    comm = getattr(dev_comm, "pynccl_comm", None)
++    if comm is None or getattr(comm, "disabled", False):
++        return None
++    return comm
++
++
+ def _side_stream(device: torch.device) -> torch.cuda.Stream:
+     """One stream per device for the reduce-scatters of sliced projections."""
+     if device not in _SIDE_STREAMS:
+diff --git a/vllm/models/deepseek_v4_1/tilelang/linear.py b/vllm/models/deepseek_v4_1/tilelang/linear.py
+index 64bd3413b..0e6068087 100644
+--- a/vllm/models/deepseek_v4_1/tilelang/linear.py
++++ b/vllm/models/deepseek_v4_1/tilelang/linear.py
+@@ -299,6 +299,24 @@ def _block32_linear(
+     _block32_gemm(layer, xq, sf, out, rows)
+ 
+ 
++def _block32_gemm_weights(
++    layer,
++    xq: torch.Tensor,
++    sf: torch.Tensor,
++    weight: torch.Tensor,
++    weight_sf: torch.Tensor,
++    out: torch.Tensor,
++    rows: int,
++) -> None:
++    if rows > layer.tilelang_decode_rows:
++        gemm = layer.tilelang_prefill
++        # A producer pads rows that another projection's decode tiles read.
++        xq, sf = xq[:rows], sf[:rows]
++    else:
++        gemm = layer.tilelang_decode[decode_tile_rows(rows, layer.tilelang_wide)]
++    gemm(xq, weight, sf.view(torch.uint32), weight_sf, out)
++
++
+ def _block32_gemm(layer, xq, sf, out, rows: int) -> None:
+     """The GEMM of a block-32 projection without split-K on its MXFP8 activations
+     (``_activation_specs`` buffers or a producer's ``MXFP8Rows``, the first ``rows``
+@@ -316,14 +334,78 @@ def _block32_gemm(layer, xq, sf, out, rows: int) -> None:
+             out,
+         )
+         return
+-    if rows > layer.tilelang_decode_rows:
+-        gemm = layer.tilelang_prefill
+-        # A producer pads rows that another projection's decode tiles read.
+-        xq, sf = xq[:rows], sf[:rows]
+-    else:
+-        gemm = layer.tilelang_decode[decode_tile_rows(rows, layer.tilelang_wide)]
+     weight = getattr(layer, "tilelang_weight", layer.weight)
+-    gemm(xq, weight, sf.view(torch.uint32), layer.tilelang_weight_sf, out)
++    _block32_gemm_weights(
++        layer, xq, sf, weight, layer.tilelang_weight_sf, out, rows
++    )
++
++
++def _block32_linear_shards(
++    layer,
++    x: torch.Tensor,
++    shards: tuple[tuple[torch.Tensor, torch.Tensor], ...],
++    out: torch.Tensor,
++    scratch: torch.Tensor | None,
++) -> None:
++    """Project ``x`` (``[rows, K]`` BF16) through every rank's ``(weight, weight_sf)``
++    shard into ``out[:, :rows]`` (``[world_size, local_rows, N]`` BF16), casting ``x``
++    to MXFP8 once."""
++    k = layer.weight.shape[1] * layer.tilelang_groups
++    if x.ndim != 2:
++        x = x.reshape(-1, k)
++    rows = x.shape[0]
++    if rows == 0:
++        return
++    provided = (
++        provided_mxfp8(x)
++        if layer.tilelang_mxfp8_input
++        else (optional_provided_mxfp8(x) if layer.tilelang_groups == 1 else None)
++    )
++    if provided is not None:
++        xq, sf = provided.values, provided.scales
++        if layer.tilelang_shards > 1 and rows <= layer.tilelang_split_rows:
++            tile = split_row_tile(rows)
++            padded = -(-rows // tile) * tile
++            (partials,) = _scratch(
++                (((layer.tilelang_shards, rows, out.shape[-1]), torch.float32),),
++                scratch,
++            )
++            kernel = layer.tilelang_partials[split_bucket(rows)]
++            sf_u32 = sf[:padded].view(torch.uint32)
++            for s, (w_s, sf_s) in enumerate(shards):
++                kernel(xq[:padded], w_s, sf_u32, sf_s, partials)
++                layer.tilelang_reduce(partials, out[s, :rows])
++        else:
++            for s, (w_s, sf_s) in enumerate(shards):
++                _block32_gemm_weights(layer, xq, sf, w_s, sf_s, out[s, :rows], rows)
++        return
++    if layer.tilelang_shards > 1 and rows <= layer.tilelang_split_rows:
++        xq, sf, partials = _scratch(_split_specs(layer, rows), scratch)
++        pdl.per_token_cast(
++            x,
++            "e4m3",
++            SF_BLOCK,
++            round_sf=True,
++            use_packed_ue8m0=True,
++            out=(xq[:rows], sf[:rows]),
++        )
++        kernel = layer.tilelang_partials[split_bucket(rows)]
++        sf_u32 = sf.view(torch.uint32)
++        for s, (w_s, sf_s) in enumerate(shards):
++            kernel(xq, w_s, sf_u32, sf_s, partials)
++            layer.tilelang_reduce(partials, out[s, :rows])
++        return
++    xq, sf = _scratch(_activation_specs(rows, k, layer.tilelang_decode_rows), scratch)
++    pdl.per_token_cast(
++        x,
++        "e4m3",
++        SF_BLOCK,
++        round_sf=True,
++        use_packed_ue8m0=True,
++        out=(xq[:rows], sf[:rows]),
++    )
++    for s, (w_s, sf_s) in enumerate(shards):
++        _block32_gemm_weights(layer, xq, sf, w_s, sf_s, out[s, :rows], rows)
+ 
+ 
+ def _split_specs(layer, rows: int):
+@@ -393,6 +475,33 @@ def _bf16_linear(
+         layer.tilelang_gemm(x, layer.weight, out)
+ 
+ 
++def _bf16_linear_shards(
++    layer,
++    x: torch.Tensor,
++    shards: tuple[torch.Tensor, ...],
++    out: torch.Tensor,
++    scratch: torch.Tensor | None,
++) -> None:
++    _, k = layer.weight.shape
++    if x.ndim != 2:
++        x = x.reshape(-1, k)
++    rows = x.shape[0]
++    if rows == 0:
++        return
++    specs = _partial_specs(layer, rows)
++    if specs:
++        (partials,) = _scratch(specs, scratch)
++        kernel = partials_kernel(layer, rows)
++        for s, shard in enumerate(shards):
++            w_s = shard[0] if isinstance(shard, tuple) else shard
++            kernel(x, w_s, partials)
++            layer.tilelang_reduce(partials, out[s, :rows])
++    else:
++        for s, shard in enumerate(shards):
++            w_s = shard[0] if isinstance(shard, tuple) else shard
++            layer.tilelang_gemm(x, w_s, out[s, :rows])
++
++
+ def project_bf16_partials(layer: nn.Module, x: torch.Tensor) -> torch.Tensor:
+     """Project ``x`` through a BF16 layer, returning 3D FP32 split-K ``partials``
+     (``[shards, rows, N]``) at decode sizes so a fused consumer (``norm_rope_write_index_keys``)
+@@ -691,6 +800,22 @@ class TileLangFP8LinearMethod(Block32FP8LinearMethod):
+             raise ValueError("V4.1 block32 projections require bias-free weights")
+         return _apply_block32(layer, x)
+ 
++    def apply_into(self, layer, x: torch.Tensor, out: torch.Tensor) -> torch.Tensor:
++        _block32_linear(layer, x, out, current_preallocated_workspace())
++        return out
++
++    def apply_shards(
++        self,
++        layer,
++        x: torch.Tensor,
++        shards: tuple[tuple[torch.Tensor, torch.Tensor], ...],
++        out: torch.Tensor,
++    ) -> torch.Tensor:
++        _block32_linear_shards(
++            layer, x, shards, out, current_preallocated_workspace()
++        )
++        return out
++
+ 
+ class TileLangBlock32Rows:
+     """Output rows ``start:`` of a loaded block-32 FP8 projection as their own GEMM.
+@@ -781,6 +906,24 @@ class TileLangLinearMethod(UnquantizedLinearMethod):
+         _bf16_linear(layer, x, out, current_preallocated_workspace())
+         return out
+ 
++    def apply_into(
++        self, layer: nn.Module, x: torch.Tensor, out: torch.Tensor
++    ) -> torch.Tensor:
++        _bf16_linear(layer, x, out, current_preallocated_workspace())
++        return out
++
++    def apply_shards(
++        self,
++        layer: nn.Module,
++        x: torch.Tensor,
++        shards: tuple[torch.Tensor, ...],
++        out: torch.Tensor,
++    ) -> torch.Tensor:
++        _bf16_linear_shards(
++            layer, x, shards, out, current_preallocated_workspace()
++        )
++        return out
++
+     def get_workspace_size(self, layer, num_tokens: int) -> int:
+         return _spec_bytes(_partial_specs(layer, num_tokens))
+ 

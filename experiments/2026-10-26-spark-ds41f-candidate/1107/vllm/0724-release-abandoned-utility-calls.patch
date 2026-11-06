@@ -1,0 +1,296 @@
+From 07733cc7611ad3822b313778bc3504f4233709d0 Mon Sep 17 00:00:00 2001
+From: Christopher Owen <3221756+christopherowen@users.noreply.github.com>
+Date: Wed, 4 Nov 2026 17:00:56 +0100
+Subject: [PATCH] Release utility futures when callers stop waiting
+
+Base: candidate-39 plus request-submission cleanup (0cff1109940f15d08f2e893ae06e0a527fde438a). The affected utility code is unchanged in candidate-38.
+
+Rationale: encoding errors, failed sends and cancellations before any reply can leave entries in utility_results indefinitely. Bound each entry to its caller lifetime and tolerate late responses. Handle the synchronous cancellation race without stopping the output receiver.
+
+Quality: preserve utility results and original exceptions; decoding and GPU work are unchanged. Tests cover all send stages, cancellation, repetition, late replies, concurrent callers and ordinary success/error responses.
+
+Upstream status: local, not submitted.
+---
+ tests/v1/engine/test_utility_call_cleanup.py | 186 +++++++++++++++++++
+ vllm/v1/engine/core_client.py                |  44 +++--
+ 2 files changed, 217 insertions(+), 13 deletions(-)
+ create mode 100644 tests/v1/engine/test_utility_call_cleanup.py
+
+diff --git a/tests/v1/engine/test_utility_call_cleanup.py b/tests/v1/engine/test_utility_call_cleanup.py
+new file mode 100644
+index 0000000000..5977cad87d
+--- /dev/null
++++ b/tests/v1/engine/test_utility_call_cleanup.py
+@@ -0,0 +1,186 @@
++# SPDX-License-Identifier: Apache-2.0
++# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
++"""Every utility caller releases its slot, including when no reply can arrive."""
++
++import asyncio
++from concurrent.futures import Future
++from types import SimpleNamespace
++
++import pytest
++
++from vllm.v1.engine import UtilityOutput, UtilityResult
++from vllm.v1.engine.core_client import (
++    AsyncMPClient,
++    SyncMPClient,
++    _process_utility_output,
++)
++
++pytestmark = pytest.mark.cpu_test
++
++
++def reply(call_id, failure=False):
++    return UtilityOutput(
++        call_id=call_id,
++        failure_message="utility failed" if failure else None,
++        result=None if failure else UtilityResult("ok"),
++    )
++
++
++def make_client(asynchronous, stage=None, failure=False):
++    cls = AsyncMPClient if asynchronous else SyncMPClient
++    client = cls.__new__(cls)
++    client.resources = SimpleNamespace(engine_dead=False)
++    client.client_index = 0
++    client.core_engine = b"\x00\x00"
++    client.utility_results = {}
++    client.entered = asyncio.Event() if asynchronous else None
++    client.call_id = None
++
++    def encode(value):
++        client.call_id = value[1]
++        if stage == "encode":
++            raise ValueError("encode failed")
++        return [b"utility"]
++
++    client.encoder = SimpleNamespace(encode=encode)
++
++    async def send_async(message, engine):
++        if stage == "send":
++            raise RuntimeError("send failed")
++        if stage == "block_send":
++            client.entered.set()
++            await asyncio.Future()
++        if stage != "wait_reply" and stage != "output_task":
++            _process_utility_output(reply(client.call_id, failure), client.utility_results)
++
++    def send_sync(message, copy=False):
++        if stage == "send":
++            raise RuntimeError("send failed")
++        _process_utility_output(reply(client.call_id, failure), client.utility_results)
++
++    def ensure_output():
++        if stage == "output_task":
++            raise RuntimeError("output task failed")
++        client.entered.set()
++
++    client._send_input_message = send_async
++    client.input_socket = SimpleNamespace(send_multipart=send_sync)
++    client._ensure_output_queue_task = ensure_output
++    return client
++
++
++@pytest.mark.parametrize("stage", ["encode", "send", "output_task"])
++def test_async_utility_failure_releases_pending_future(stage):
++    async def run():
++        client = make_client(True, stage)
++        with pytest.raises((ValueError, RuntimeError), match="failed"):
++            await client.call_utility_async("echo", "payload")
++        assert not client.utility_results
++
++    asyncio.run(run())
++
++
++@pytest.mark.parametrize("stage", ["encode", "send"])
++def test_sync_utility_failure_releases_pending_future(stage):
++    client = make_client(False, stage)
++    with pytest.raises((ValueError, RuntimeError), match="failed"):
++        client.call_utility("echo", "payload")
++    assert not client.utility_results
++
++
++@pytest.mark.parametrize("stage", ["block_send", "wait_reply"])
++def test_cancellation_releases_slot_and_late_reply_is_harmless(stage):
++    async def run():
++        client = make_client(True, stage)
++        task = asyncio.create_task(client.call_utility_async("echo"))
++        await asyncio.wait_for(client.entered.wait(), 2)
++        call_id = client.call_id
++        task.cancel()
++        with pytest.raises(asyncio.CancelledError):
++            await task
++        assert not client.utility_results
++        _process_utility_output(reply(call_id), client.utility_results)
++        assert not client.utility_results
++        # A delayed response must not kill the output receiver or another call.
++        healthy = make_client(True)
++        healthy.utility_results = client.utility_results
++        assert await healthy.call_utility_async("echo") == "ok"
++        assert not healthy.utility_results
++
++    asyncio.run(run())
++
++
++@pytest.mark.parametrize("asynchronous", [False, True])
++def test_repeated_failed_utility_calls_do_not_accumulate(asynchronous):
++    async def run():
++        client = make_client(asynchronous, "send")
++        for _ in range(64):
++            with pytest.raises(RuntimeError, match="send failed"):
++                if asynchronous:
++                    await client.call_utility_async("echo")
++                else:
++                    client.call_utility("echo")
++        assert not client.utility_results
++
++    asyncio.run(run())
++
++
++@pytest.mark.parametrize("asynchronous", [False, True])
++@pytest.mark.parametrize("failure", [False, True])
++def test_normal_utility_reply_keeps_result_and_cleanup(asynchronous, failure):
++    async def run():
++        client = make_client(asynchronous, failure=failure)
++
++        async def call():
++            if asynchronous:
++                return await client.call_utility_async("echo")
++            return client.call_utility("echo")
++
++        if failure:
++            with pytest.raises(Exception, match="utility failed"):
++                await call()
++        else:
++            assert await call() == "ok"
++        assert not client.utility_results
++
++    asyncio.run(run())
++
++
++@pytest.mark.parametrize("failure", [False, True])
++def test_unknown_or_duplicate_utility_reply_does_not_stop_receiver(failure):
++    _process_utility_output(reply(123, failure), {})
++
++
++@pytest.mark.parametrize("asynchronous", [False, True])
++@pytest.mark.parametrize("failure", [False, True])
++def test_reply_racing_with_cancelled_future_does_not_stop_receiver(asynchronous, failure):
++    async def run():
++        future = asyncio.get_running_loop().create_future() if asynchronous else Future()
++        results = {123: future}
++        future.cancel()
++        _process_utility_output(reply(123, failure), results)
++        assert not results
++
++    asyncio.run(run())
++
++
++def test_cancelling_one_utility_does_not_remove_another_pending_call():
++    async def run():
++        client = make_client(True, "wait_reply")
++        first = asyncio.create_task(client.call_utility_async("first"))
++        await asyncio.wait_for(client.entered.wait(), 2)
++        first_id = client.call_id
++        client.entered.clear()
++        second = asyncio.create_task(client.call_utility_async("second"))
++        await asyncio.wait_for(client.entered.wait(), 2)
++        second_id = client.call_id
++        first.cancel()
++        with pytest.raises(asyncio.CancelledError):
++            await first
++        assert set(client.utility_results) == {second_id}
++        _process_utility_output(reply(first_id), client.utility_results)
++        _process_utility_output(reply(second_id), client.utility_results)
++        assert await second == "ok"
++        assert not client.utility_results
++
++    asyncio.run(run())
+diff --git a/vllm/v1/engine/core_client.py b/vllm/v1/engine/core_client.py
+index 865da27635..422fb8cfd9 100644
+--- a/vllm/v1/engine/core_client.py
++++ b/vllm/v1/engine/core_client.py
+@@ -9,7 +9,7 @@ import weakref
+ from abc import ABC, abstractmethod
+ from collections import Counter, defaultdict
+ from collections.abc import Awaitable, Callable, Sequence
+-from concurrent.futures import Future
++from concurrent.futures import Future, InvalidStateError
+ from dataclasses import dataclass
+ from multiprocessing.connection import Connection
+ from multiprocessing.queues import Queue
+@@ -878,7 +878,12 @@ def _process_utility_output(
+     output: UtilityOutput, utility_results: dict[int, AnyFuture]
+ ):
+     """Set the result from a utility method in the waiting future."""
+-    future = utility_results.pop(output.call_id)
++    future = utility_results.pop(output.call_id, None)
++    if future is None:
++        # A failed or cancelled caller no longer owns this reply. It may
++        # already have reached the engine before the caller stopped waiting.
++        logger.debug("Ignoring late utility output for call %s", output.call_id)
++        return
+     failure_message = output.failure_message
+     try:
+         if failure_message is not None:
+@@ -886,7 +891,7 @@ def _process_utility_output(
+         else:
+             assert output.result is not None
+             future.set_result(output.result.result)
+-    except asyncio.InvalidStateError:
++    except (asyncio.InvalidStateError, InvalidStateError):
+         # This can happen if the future is cancelled due to the
+         # original calling task being cancelled.
+         if failure_message is not None:
+@@ -996,9 +1001,14 @@ class SyncMPClient(MPClient):
+         call_id = uuid.uuid1().int >> 64
+         future: Future[Any] = Future()
+         self.utility_results[call_id] = future
+-        self._send_input(EngineCoreRequestType.UTILITY, (0, call_id, method, args))
+-
+-        return future.result()
++        try:
++            self._send_input(EngineCoreRequestType.UTILITY, (0, call_id, method, args))
++            return future.result()
++        finally:
++            self.utility_results.pop(call_id, None)
++            future.cancel()
++            if not future.cancelled():
++                future.exception()
+ 
+     def get_supported_tasks(self) -> tuple[SupportedTask, ...]:
+         return self.call_utility("get_supported_tasks")
+@@ -1241,13 +1251,21 @@ class AsyncMPClient(MPClient):
+         call_id = uuid.uuid1().int >> 64
+         future = asyncio.get_running_loop().create_future()
+         self.utility_results[call_id] = future
+-        message = (
+-            EngineCoreRequestType.UTILITY.value,
+-            *self.encoder.encode((self.client_index, call_id, method, args)),
+-        )
+-        await self._send_input_message(message, engine)
+-        self._ensure_output_queue_task()
+-        return await future
++        try:
++            message = (
++                EngineCoreRequestType.UTILITY.value,
++                *self.encoder.encode((self.client_index, call_id, method, args)),
++            )
++            await self._send_input_message(message, engine)
++            self._ensure_output_queue_task()
++            return await future
++        finally:
++            self.utility_results.pop(call_id, None)
++            future.cancel()
++            if not future.cancelled():
++                # A reply may arrive while the send is still awaiting. Retrieve
++                # its error even when the caller exits with a different failure.
++                future.exception()
+ 
+     async def get_supported_tasks_async(self) -> tuple[SupportedTask, ...]:
+         return await self.call_utility_async("get_supported_tasks")
+-- 
+2.54.0 (Apple Git-157)
+

@@ -1,0 +1,467 @@
+From 2b793793e9bcf17eed4bc6c288d572933de75797 Mon Sep 17 00:00:00 2001
+From: Christopher Owen <root@your.mom>
+Date: Wed, 4 Nov 2026 17:48:05 +0100
+Subject: [PATCH] Consume native token-id dtypes and strides in score kernels
+
+Upstream-base: local-inference-lab/vllm 19f2c20ed4d64ae22bd009ceacadd85e2a81e354, candidate-38 source 1f33102547e4da5c64712390604695d1abd577c4, then selected-logit source c88a692e989c391d2c8478f0f7c2069d21d6f25b.
+
+Rationale: remove repeated int64 casts and contiguous materializations around token-score and top-k calls. Their consumers read native int32/int64 ids, row/column strides and strided masks. Prompt ids no longer widen before scoring; top-k writes its int64 result directly from either sampled-id type.
+
+Quality: preserve FP32 score arithmetic, token values, ordering, ranks and serialized Python ids. A zero-top-k result retains its native id view; top-k results remain int64. No model precision change.
+
+Tests: extend native-id and layout comparisons, FP64 score checks, graph and prompt paths, wire conversion, and cold-cache preparation. Deployment experiment records two-boot GPU, allocation, profiling and timing evidence.
+
+Upstream-status: local candidate, not submitted upstream.
+---
+ .../test_gpu_tilelang_logprob_softmax.py      | 122 +++++++++++++++++-
+ tests/v1/worker/test_gpu_tilelang_topk_ids.py |  24 +++-
+ vllm/v1/worker/gpu/sample/logprob.py          |   1 -
+ vllm/v1/worker/gpu/sample/prompt_logprob.py   |   1 -
+ vllm/v1/worker/gpu/sample/tilelang_logprob.py |  42 ++++--
+ .../v1/worker/gpu/sample/tilelang_topk_ids.py |  33 ++++-
+ 6 files changed, 189 insertions(+), 34 deletions(-)
+
+diff --git a/tests/v1/worker/test_gpu_tilelang_logprob_softmax.py b/tests/v1/worker/test_gpu_tilelang_logprob_softmax.py
+index 78cfa84f2c..3edc3e4f46 100644
+--- a/tests/v1/worker/test_gpu_tilelang_logprob_softmax.py
++++ b/tests/v1/worker/test_gpu_tilelang_logprob_softmax.py
+@@ -449,7 +449,7 @@ def test_compute_token_logprobs_launches_tilelang(dtype, monkeypatch):
+     monkeypatch.setattr(logprob, "_topk_log_softmax_kernel", None)
+     monkeypatch.setattr(tilelang_logprob, "topk_log_softmax", spy)
+     _assert_same(logprob.compute_token_logprobs(logits, ids), expected, "logprobs")
+-    # int32 ids are widened, as before.
++    # int32 ids are consumed directly, with the same scores.
+     _assert_same(
+         logprob.compute_token_logprobs(logits, ids.int()), expected, "int32 ids"
+     )
+@@ -530,11 +530,12 @@ def test_runner_declares_the_launched_calls(logits_mode):
+     expected = {
+         (
+             id(tilelang_logprob.topk_log_softmax_kernel),
+-            tilelang_logprob.topk_log_softmax_key(dtype, run, masked),
++            tilelang_logprob.topk_log_softmax_key(dtype, run, masked, id_dtype),
+         )
+         for dtype in (torch.bfloat16, torch.float32)
+         for run in tls._runs(dtype)
+         for masked in (False, True)
++        for id_dtype in (torch.int32, torch.int64)
+     }
+     declared = _declared(registry)
+     softmax = {
+@@ -681,18 +682,125 @@ def test_selected_logits_are_prepared_before_cache_freeze(monkeypatch):
+                 assert torch.equal(actual, logits.gather(1, ids.long()).float())
+ 
+ 
+-@pytest.mark.parametrize("mode", ["raw_logits", "processed_logits"])
++@pytest.mark.parametrize(
++    "mode", ["raw_logits", "processed_logits", "raw_logprobs", "processed_logprobs"]
++)
+ @pytest.mark.parametrize("num_logprobs", [0, 5])
+-def test_prompt_logits_cross_chunk_boundary(mode, num_logprobs):
++@pytest.mark.parametrize("id_dtype", [torch.int32, torch.int64])
++def test_prompt_logits_cross_chunk_boundary(mode, num_logprobs, id_dtype):
+     from vllm.v1.worker.gpu.sample.prompt_logprob import (
+         compute_prompt_logprobs_with_chunking,
+     )
+ 
+     logits = torch.randn(1027, 257, device=DEVICE)
+-    ids = torch.arange(1027, device=DEVICE) % 257
++    ids = (torch.arange(2054, device=DEVICE, dtype=id_dtype) % 257)[::2]
+     out_ids, scores, ranks = compute_prompt_logprobs_with_chunking(
+         ids, logits, lambda hidden: hidden, num_logprobs, mode
+     )
+     assert torch.equal(out_ids[:, 0], ids)
+-    assert torch.equal(scores, logits.gather(1, out_ids))
+-    assert torch.equal(ranks, (logits >= logits.gather(1, ids[:, None])).sum(-1))
++    reference = logits if mode.endswith("_logits") else logits.double().log_softmax(-1)
++    expected = reference.gather(1, out_ids.long()).float()
++    torch.testing.assert_close(scores, expected, rtol=2e-6, atol=1e-6)
++    assert torch.equal(ranks, (logits >= logits.gather(1, ids[:, None].long())).sum(-1))
++
++
++@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16, torch.float32])
++@pytest.mark.parametrize("id_dtype", [torch.int32, torch.int64])
++@pytest.mark.parametrize("layout", ["dense", "sliced", "transposed"])
++@pytest.mark.parametrize("masked", [False, True])
++def test_logprobs_read_native_ids_and_masks(dtype, id_dtype, layout, masked):
++    """ID and mask strides change addressing, never log-softmax arithmetic."""
++    rows, cols, vocab = 5, 33, 8193
++    logits = torch.randn(rows, vocab + 7, device=DEVICE, dtype=dtype)[:, :vocab]
++    ids = torch.randint(vocab, (rows, cols), device=DEVICE, dtype=id_dtype)
++    valid = torch.rand(rows, cols, device=DEVICE) > 0.3
++    if layout == "sliced":
++        ids = torch.stack((ids, ids), dim=-1)[..., 0]
++        valid = torch.stack((valid, valid), dim=-1)[..., 0]
++    elif layout == "transposed":
++        ids = ids.t().contiguous().t()
++        valid = valid.t().contiguous().t()
++    before = ids.clone()
++    mask = valid if masked else None
++    expected = logprob.compute_token_logprobs(
++        logits, ids.long().contiguous(), valid.contiguous() if masked else None
++    )
++    actual = logprob.compute_token_logprobs(logits, ids, mask)
++    _assert_same(actual, expected, f"native {id_dtype} {layout} mask={masked}")
++    fp64 = logits.double().log_softmax(-1).gather(1, ids.long()).float()
++    if masked:
++        fp64.masked_fill_(~valid, -torch.inf)
++    torch.testing.assert_close(actual, fp64, rtol=2e-6, atol=1e-6)
++    assert torch.equal(ids, before)
++
++
++@pytest.mark.parametrize("id_dtype", [torch.int32, torch.int64])
++@pytest.mark.parametrize("logits_mode", [False, True])
++@pytest.mark.parametrize("topk", [0, 5])
++def test_native_sampled_ids_keep_score_values_and_wire_ids(id_dtype, logits_mode, topk):
++    logits = torch.randn(3, 257, device=DEVICE)
++    sampled = torch.tensor([0, -1, 256, -1, 17, -1], device=DEVICE, dtype=id_dtype)[::2]
++    actual = logprob.compute_topk_scores(logits, topk, sampled, logits_mode=logits_mode)
++    ids = actual.logprob_token_ids
++    assert torch.equal(ids[:, 0], sampled)
++    if topk == 0:
++        assert ids.data_ptr() == sampled.data_ptr()
++        assert ids.dtype == sampled.dtype
++    else:
++        assert ids.dtype == torch.int64
++    expected = (
++        logits.gather(1, ids.long())
++        if logits_mode
++        else logprob.compute_token_logprobs(logits, ids.long().contiguous())
++    )
++    _assert_same(actual.logprobs, expected, "native sampled ids")
++    assert torch.equal(
++        actual.selected_token_ranks,
++        (logits >= logits.gather(1, sampled[:, None].long())).sum(-1),
++    )
++    # The engine serializes either NumPy integer width to ordinary Python ints.
++    cpu = actual.to_cpu_nonblocking()
++    torch.cuda.synchronize()
++    wire = cpu.tolists().logprob_token_ids.tolist()
++    assert [row[0] for row in wire] == [0, 256, 17]
++    assert all(type(value) is int for row in wire for value in row)
++
++
++def test_native_score_inputs_work_after_startup_freeze(monkeypatch):
++    import importlib
++
++    import tilelang.cache
++
++    from vllm.model_executor.warmup.jit_warmup import JitWarmupRegistry
++    from vllm.models.deepseek_v4_1.tilelang import prepare
++    from vllm.v1.worker.gpu.sample import tilelang_topk_ids
++
++    cache_module = importlib.import_module(tilelang.cache.freeze.__module__)
++    monkeypatch.setattr(cache_module, "_frozen_reason", None)
++    monkeypatch.setattr(tls, "_KERNELS", {})
++    for kernel in (
++        tilelang_logprob.topk_log_softmax_kernel,
++        tilelang_logprob.ranks_kernel,
++        tilelang_topk_ids.topk_ids_kernel,
++    ):
++        monkeypatch.setattr(kernel, "_kernel_cache", {})
++        monkeypatch.setattr(kernel, "_call_form_cache", type(kernel._call_form_cache)())
++    pairs = [(dtype, 264) for dtype in (torch.float16, torch.bfloat16, torch.float32)]
++    registry = JitWarmupRegistry(None)
++    with registry.activate():
++        logprob.register_topk_scores_warmup(
++            logits=pairs, vocab_size=257, logits_mode=False
++        )
++    prepare.prepare_declared(registry)
++    prepare.freeze("native score inputs warmup test")
++    for dtype, _ in pairs:
++        logits = torch.randn(3, 264, device=DEVICE, dtype=dtype)[:, :257]
++        for id_dtype in (torch.int32, torch.int64):
++            ids = torch.randint(257, (3, 18), device=DEVICE, dtype=id_dtype)[:, ::2]
++            valid = ids % 3 != 0
++            for mask in (None, valid):
++                actual = logprob.compute_token_logprobs(logits, ids, mask)
++                assert actual.shape == ids.shape
++            for topk in (0, 5):
++                actual = logprob.compute_topk_scores(logits, topk, ids[:, 0])
++                assert torch.equal(actual.logprob_token_ids[:, 0], ids[:, 0])
+diff --git a/tests/v1/worker/test_gpu_tilelang_topk_ids.py b/tests/v1/worker/test_gpu_tilelang_topk_ids.py
+index c13dd24586..27c94c3c2a 100644
+--- a/tests/v1/worker/test_gpu_tilelang_topk_ids.py
++++ b/tests/v1/worker/test_gpu_tilelang_topk_ids.py
+@@ -402,7 +402,9 @@ def test_bounds():
+ 
+ 
+ @pytest.mark.parametrize("dtype", DTYPES, ids=str)
+-def test_sampled_column(dtype):
++@pytest.mark.parametrize("id_dtype", [torch.int32, torch.int64])
++@pytest.mark.parametrize("strided", [False, True])
++def test_sampled_column(dtype, id_dtype, strided):
+     """The fast path's rows are torch.cat((sampled[:, None], indices), 1), int64,
+     for int64 and int32 sampled tokens."""
+     values = _values(9, VOCAB, "rounded", seed=3)
+@@ -411,10 +413,14 @@ def test_sampled_column(dtype):
+     expected = torch.cat(
+         (sampled.unsqueeze(-1), torch.topk(logits, 20, dim=-1).indices), dim=1
+     )
+-    for tokens in (sampled, sampled.int()):
+-        rows = tki.logprob_token_ids(logits, 20, tokens)
+-        assert rows.dtype == expected.dtype
+-        _assert_ids(rows, expected, logits, f"{dtype} sampled {tokens.dtype}")
++    tokens = sampled.to(id_dtype)
++    if strided:
++        tokens = torch.stack((tokens, tokens), dim=1)[:, 0]
++    before = tokens.clone()
++    rows = tki.logprob_token_ids(logits, 20, tokens)
++    assert rows.dtype == expected.dtype
++    _assert_ids(rows, expected, logits, f"{dtype} sampled {tokens.dtype}")
++    assert torch.equal(tokens, before)
+ 
+ 
+ @pytest.mark.parametrize("dtype", DTYPES, ids=str)
+@@ -562,10 +568,16 @@ def test_runner_declares_the_launched_calls():
+         if function is tki.topk_ids_kernel
+     }
+     assert declared == {
+-        (id(tki.topk_ids_kernel), tki.topk_ids_key(dtype, ids_dtype, run))
++        (
++            id(tki.topk_ids_kernel),
++            tki.topk_ids_key(dtype, ids_dtype, run, sampled_dtype),
++        )
+         for dtype in (torch.bfloat16, torch.float32)
+         for ids_dtype in (torch.int64, torch.int32)
+         for run in tls._runs(dtype)
++        for sampled_dtype in (
++            (torch.int32, torch.int64) if ids_dtype == torch.int64 else (torch.int64,)
++        )
+     }
+     prepare.prepare_declared(registry)
+     for dtype in (torch.bfloat16, torch.float32):
+diff --git a/vllm/v1/worker/gpu/sample/logprob.py b/vllm/v1/worker/gpu/sample/logprob.py
+index 1fa3436fc3..ab2a6e4a01 100644
+--- a/vllm/v1/worker/gpu/sample/logprob.py
++++ b/vllm/v1/worker/gpu/sample/logprob.py
+@@ -56,7 +56,6 @@ def compute_token_logprobs(
+     from vllm.v1.worker.gpu.sample.tilelang_logprob import topk_log_softmax
+ 
+     batch_size = logits.shape[0]
+-    token_ids = token_ids.to(torch.int64).contiguous()
+     num_logprobs = token_ids.shape[1]
+     logprobs = logits.new_empty((batch_size, num_logprobs), dtype=torch.float32)
+     # The requested count is runtime data, including the single selected token
+diff --git a/vllm/v1/worker/gpu/sample/prompt_logprob.py b/vllm/v1/worker/gpu/sample/prompt_logprob.py
+index b8bd9357dd..3aae474ba7 100644
+--- a/vllm/v1/worker/gpu/sample/prompt_logprob.py
++++ b/vllm/v1/worker/gpu/sample/prompt_logprob.py
+@@ -191,7 +191,6 @@ def compute_prompt_logprobs_with_chunking(
+     scores = []
+     ranks = []
+     logits_mode = logprobs_mode in ("raw_logits", "processed_logits")
+-    prompt_token_ids = prompt_token_ids.to(torch.int64)
+     for start_idx in range(0, prompt_token_ids.shape[0], CHUNK_SIZE):
+         end_idx = start_idx + CHUNK_SIZE
+         # NOTE(woosuk): logits_fn can be slow because it involves all-gather.
+diff --git a/vllm/v1/worker/gpu/sample/tilelang_logprob.py b/vllm/v1/worker/gpu/sample/tilelang_logprob.py
+index c9b4dfe715..c6ad4740b1 100644
+--- a/vllm/v1/worker/gpu/sample/tilelang_logprob.py
++++ b/vllm/v1/worker/gpu/sample/tilelang_logprob.py
+@@ -75,11 +75,12 @@ _BLOCK = 8192
+ @tilelang.jit(pass_configs=_PASS)
+ def ranks_kernel(vocab: int, stride: int, dtype: str, id_dtype: str, threads: int):
+     rows = T.symbolic("rows")
++    id_stride = T.dynamic("id_stride", "int64")
+ 
+     @T.prim_func
+     def token_ranks(
+         logits: T.StridedTensor((rows, vocab), (stride, 1), dtype),
+-        token_ids: T.Tensor((rows,), id_dtype),
++        token_ids: T.StridedTensor((rows,), (id_stride,), id_dtype),
+         output: T.Tensor((rows,), "int64"),
+     ):
+         with T.Kernel(rows, threads=threads) as row:
+@@ -190,7 +191,9 @@ def _row_reduce(value, partial, tx, combine):
+ 
+ 
+ @tilelang.jit(pass_configs=tilelang_sampling._PASS)
+-def topk_log_softmax_kernel(logits_dtype: str, run: int, masked: bool = False):
++def topk_log_softmax_kernel(
++    logits_dtype: str, run: int, masked: bool = False, id_dtype: str = "int64"
++):
+     """The selected tokens' log-softmax (the module's Eq. 5): one block of 1024
+     threads a row, whose ``topk`` selected tokens' log probabilities it writes;
+     with ``masked``, -inf where ``valid`` is false (the custom-ids path's
+@@ -201,7 +204,9 @@ def topk_log_softmax_kernel(logits_dtype: str, run: int, masked: bool = False):
+     row, the columns past it masked."""
+     rows, vocab, topk = T.dynamic("rows, vocab, topk")
+     logits_stride = T.dynamic("logits_stride", "int64")
++    id_row, id_col = T.dynamic("id_row, id_col", "int64")
+     valid_rows, valid_cols = T.dynamic("valid_rows, valid_cols")
++    valid_row, valid_col = T.dynamic("valid_row, valid_col", "int64")
+     threads = _SOFTMAX_THREADS
+     loads = _SOFTMAX_LOADS
+     per = loads * run
+@@ -270,8 +275,10 @@ def topk_log_softmax_kernel(logits_dtype: str, run: int, masked: bool = False):
+     def topk_log_softmax(
+         output: T.Tensor((rows, topk), T.float32),
+         logits: T.StridedTensor((rows, vocab), (logits_stride, 1), logits_dtype),
+-        token_ids: T.Tensor((rows, topk), T.int64),
+-        valid: T.Tensor((valid_rows, valid_cols), T.bool),
++        token_ids: T.StridedTensor((rows, topk), (id_row, id_col), id_dtype),
++        valid: T.StridedTensor(
++            (valid_rows, valid_cols), (valid_row, valid_col), T.bool
++        ),
+     ):
+         with T.Kernel(rows, threads=threads) as row:
+             T.import_source(_HEADER)
+@@ -361,19 +368,26 @@ def topk_log_softmax_kernel(logits_dtype: str, run: int, masked: bool = False):
+ 
+ 
+ def topk_log_softmax_key(
+-    logits_dtype: torch.dtype, run: int = 1, masked: bool = False
++    logits_dtype: torch.dtype,
++    run: int = 1,
++    masked: bool = False,
++    id_dtype: torch.dtype = torch.int64,
+ ) -> tuple:
+-    return (_DTYPES[logits_dtype], run, masked)
++    return (_DTYPES[logits_dtype], run, masked, _DTYPES[id_dtype])
+ 
+ 
+ def log_softmax_calls(logits_dtypes: Sequence[torch.dtype]) -> list:
+     """``topk_log_softmax``'s calls for logits of each of ``logits_dtypes``, in both
+     layouts a launch may take (``_runs``), unmasked and masked (custom ids)."""
+     return [
+-        _call(topk_log_softmax_kernel, *topk_log_softmax_key(dtype, run, masked))
++        _call(
++            topk_log_softmax_kernel,
++            *topk_log_softmax_key(dtype, run, masked, id_dtype),
++        )
+         for dtype in dict.fromkeys(logits_dtypes)
+         for run in _runs(dtype)
+         for masked in (False, True)
++        for id_dtype in (torch.int32, torch.int64)
+     ]
+ 
+ 
+@@ -387,24 +401,28 @@ def register_log_softmax(logits: Sequence[tuple[torch.dtype, int]]) -> None:
+ 
+ def topk_log_softmax(
+     logits: torch.Tensor,  # [rows, vocab_size]
+-    token_ids: torch.Tensor,  # [rows, topk], int64, contiguous
++    token_ids: torch.Tensor,  # [rows, topk], int32/int64, strided
+     output: torch.Tensor,  # [rows, topk], FP32, contiguous
+-    valid: torch.Tensor | None = None,  # [rows, topk], bool, contiguous
++    valid: torch.Tensor | None = None,  # [rows, topk], bool, strided
+ ) -> None:
+     """Each row's log-softmax (Eq. 5) at its ``token_ids``, into ``output``: the
+     launch ``_topk_log_softmax_kernel`` took."""
+     if logits.shape[0] == 0 or token_ids.shape[1] == 0:
+         return
++    if token_ids.dtype not in (torch.int32, torch.int64):
++        raise TypeError("token_ids must be int32 or int64")
+     kernel = _kernel(
+         topk_log_softmax_kernel,
+-        *topk_log_softmax_key(logits.dtype, _triton_run(logits), valid is not None),
++        *topk_log_softmax_key(
++            logits.dtype, _triton_run(logits), valid is not None, token_ids.dtype
++        ),
+     )
+-    # Unmasked, the kernel does not read ``valid``: the ids' first row stands in.
++    # The unmasked specialization never reads the dummy validity tensor.
+     kernel(
+         output,
+         logits,
+         token_ids,
+-        token_ids[:1].view(torch.bool) if valid is None else valid,
++        output.view(torch.bool) if valid is None else valid,
+     )
+ 
+ 
+diff --git a/vllm/v1/worker/gpu/sample/tilelang_topk_ids.py b/vllm/v1/worker/gpu/sample/tilelang_topk_ids.py
+index bb53be3ba2..0bc898495c 100644
+--- a/vllm/v1/worker/gpu/sample/tilelang_topk_ids.py
++++ b/vllm/v1/worker/gpu/sample/tilelang_topk_ids.py
+@@ -214,7 +214,9 @@ __device__ __forceinline__ int vllm_tki_order(unsigned long long entry, int k) {
+ 
+ 
+ @tilelang.jit(pass_configs=_PASS)
+-def topk_ids_kernel(logits_dtype: str, ids_dtype: str, run: int):
++def topk_ids_kernel(
++    logits_dtype: str, ids_dtype: str, run: int, sampled_dtype: str = "int64"
++):
+     """A block a row: its ``k = width - first`` top columns in ``torch.topk``'s order,
+     at ``out[row, first:]``. int64 ids take the sampled token at column 0 (``first``
+     1); int32 ids have no sampled column. A thread loads its elements of a tile in
+@@ -222,6 +224,7 @@ def topk_ids_kernel(logits_dtype: str, ids_dtype: str, run: int):
+     alignment, or one element)."""
+     rows, vocab, width = T.dynamic("rows, vocab, width")
+     logits_stride = T.dynamic("logits_stride", "int64")
++    sampled_stride = T.dynamic("sampled_stride", "int64")
+     with_sampled = ids_dtype == "int64"
+     first = 1 if with_sampled else 0
+     vectors = _PER // run
+@@ -362,7 +365,7 @@ def topk_ids_kernel(logits_dtype: str, ids_dtype: str, run: int):
+         @T.prim_func
+         def topk_ids(
+             logits: T.StridedTensor((rows, vocab), (logits_stride, 1), logits_dtype),
+-            sampled: T.Tensor((rows,), T.int64),
++            sampled: T.StridedTensor((rows,), (sampled_stride,), sampled_dtype),
+             out: T.Tensor((rows, width), T.int64),
+         ):
+             with T.Kernel(rows, threads=_THREADS) as row:
+@@ -391,8 +394,13 @@ def topk_ids_kernel(logits_dtype: str, ids_dtype: str, run: int):
+     return topk_ids_only
+ 
+ 
+-def topk_ids_key(logits_dtype: torch.dtype, ids_dtype: torch.dtype, run: int) -> tuple:
+-    return (_DTYPES[logits_dtype], _DTYPES[ids_dtype], run)
++def topk_ids_key(
++    logits_dtype: torch.dtype,
++    ids_dtype: torch.dtype,
++    run: int,
++    sampled_dtype: torch.dtype = torch.int64,
++) -> tuple:
++    return (_DTYPES[logits_dtype], _DTYPES[ids_dtype], run, _DTYPES[sampled_dtype])
+ 
+ 
+ # The ids each path writes: the fast path's int64 rows with the sampled token, the
+@@ -404,10 +412,13 @@ def topk_ids_calls(logits_dtypes: Sequence[torch.dtype]) -> list:
+     """The calls for logits of each of ``logits_dtypes``: both ids layouts, in both
+     load layouts a launch may take (``_runs``)."""
+     return [
+-        _call(topk_ids_kernel, *topk_ids_key(dtype, ids_dtype, run))
++        _call(topk_ids_kernel, *topk_ids_key(dtype, ids_dtype, run, sampled_dtype))
+         for dtype in dict.fromkeys(logits_dtypes)
+         for ids_dtype in _IDS_DTYPES
+         for run in _runs(dtype)
++        for sampled_dtype in (
++            (torch.int32, torch.int64) if ids_dtype == torch.int64 else (torch.int64,)
++        )
+     ]
+ 
+ 
+@@ -435,7 +446,13 @@ def _launch(
+     if logits.stride(1) != 1:
+         raise ValueError("top-k ids read logits rows with a unit column stride")
+     kernel = _kernel(
+-        topk_ids_kernel, *topk_ids_key(logits.dtype, out.dtype, _triton_run(logits))
++        topk_ids_kernel,
++        *topk_ids_key(
++            logits.dtype,
++            out.dtype,
++            _triton_run(logits),
++            torch.int64 if sampled is None else sampled.dtype,
++        ),
+     )
+     if sampled is None:
+         kernel(logits, out)
+@@ -453,9 +470,11 @@ def logprob_token_ids(
+     ``TOPK_IDS_MAX``."""
+     _check(logits, num_logprobs)
+     rows = logits.shape[0]
++    if sampled.dtype not in (torch.int32, torch.int64):
++        raise TypeError("sampled token ids must be int32 or int64")
+     out = torch.empty((rows, 1 + num_logprobs), dtype=torch.int64, device=logits.device)
+     if rows:
+-        _launch(logits, out, sampled.to(torch.int64).contiguous())
++        _launch(logits, out, sampled)
+     return out
+ 
+ 
+-- 
+2.54.0 (Apple Git-157)
+

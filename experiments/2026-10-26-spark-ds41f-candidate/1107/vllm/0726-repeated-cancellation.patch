@@ -1,0 +1,175 @@
+From 6ca2b7daa3e8ab3e857004569fbc351ea8eb7446 Mon Sep 17 00:00:00 2001
+From: Christopher Owen <3221756+christopherowen@users.noreply.github.com>
+Date: Thu, 5 Nov 2026 23:18:41 +0000
+Subject: [PATCH] Keep request cleanup alive through repeated cancellation
+
+A second Task.cancel() during handler abort or response handoff propagates
+through gather() and interrupts the cleanup that the route owns. Wait for
+both children without forwarding further cancellation, retrieve their
+outcomes, then propagate the pending cancellation to the route caller.
+
+Upstream base: 19f2c20ed4d64ae22bd009ceacadd85e2a81e354, following local
+HTTP lifetime commit 385a31417f9d484dd130ccedd868bc7c88615734.
+Quality: no model arithmetic, scheduler, context, sampling or response-byte
+change. Cleanup remains cooperative and may wait for an unresponsive child.
+Tests: 18 lifetime cases and 12 native HTTP boundary cases pass in the
+pinned candidate-38 runtime. Repeated-cancellation cases fail the prior fix.
+Both wait-based and shielded-gather alternatives pass; wait avoids the
+extra shield future. CPU probes repeat across fresh containers; no GPU
+throughput or serving qualification claim.
+Upstream status: local qualification in christopherowen/vllm#1; overlaps
+canonical vllm-project/vllm#55790 and #49526, with additional edge coverage.
+---
+ .../serve/utils/test_api_cancellation.py      | 98 ++++++++++++++++++-
+ vllm/entrypoints/serve/utils/api_utils.py     | 15 ++-
+ 2 files changed, 108 insertions(+), 5 deletions(-)
+
+diff --git a/tests/entrypoints/serve/utils/test_api_cancellation.py b/tests/entrypoints/serve/utils/test_api_cancellation.py
+index 7c4fae99b..d4f2c2b8f 100644
+--- a/tests/entrypoints/serve/utils/test_api_cancellation.py
++++ b/tests/entrypoints/serve/utils/test_api_cancellation.py
+@@ -313,6 +313,8 @@ async def test_four_long_requests_short_traffic_and_immediate_retry():
+ async def test_cancel_during_response_handoff_releases_load():
+     request = Request()
+     cleanup_started = asyncio.Event()
++    finish_cleanup = asyncio.Event()
++    cleanup_closed = asyncio.Event()
+ 
+     async def receive():
+         request.listening.set()
+@@ -320,7 +322,8 @@ async def test_cancel_during_response_handoff_releases_load():
+             await asyncio.Event().wait()
+         finally:
+             cleanup_started.set()
+-            await asyncio.Event().wait()
++            await finish_cleanup.wait()
++            cleanup_closed.set()
+ 
+     request.receive = receive
+ 
+@@ -332,6 +335,93 @@ async def test_cancel_during_response_handoff_releases_load():
+     task = asyncio.create_task(handle(None, request))
+     await cleanup_started.wait()
+     task.cancel()
+-    with pytest.raises(asyncio.CancelledError):
+-        await task
+-    assert request.app.state.server_load_metrics == 0
++    try:
++        await asyncio.sleep(0)
++        assert not task.done()
++        finish_cleanup.set()
++        with pytest.raises(asyncio.CancelledError):
++            await task
++        assert cleanup_closed.is_set()
++        assert request.app.state.server_load_metrics == 0
++    finally:
++        finish_cleanup.set()
++        await asyncio.gather(task, return_exceptions=True)
++
++
++@run_async
++@pytest.mark.parametrize("repeats", [1, 3])
++async def test_repeated_cancellation_waits_for_abort(repeats):
++    request = Request()
++    started, abort_started, finish_abort, closed = (asyncio.Event() for _ in range(4))
++
++    @route
++    async def handle(_, raw_request):
++        started.set()
++        try:
++            await asyncio.Event().wait()
++        finally:
++            abort_started.set()
++            await finish_abort.wait()
++            closed.set()
++
++    parent = asyncio.create_task(handle(None, request))
++    await started.wait()
++    await request.listening.wait()
++    parent.cancel("first timeout")
++    await abort_started.wait()
++    for i in range(repeats):
++        parent.cancel(f"repeat timeout {i}")
++        await asyncio.sleep(0)
++    try:
++        await asyncio.sleep(0.01)
++        assert not parent.done(), "second cancellation interrupted owned abort cleanup"
++        finish_abort.set()
++        with pytest.raises(asyncio.CancelledError):
++            await parent
++        assert closed.is_set()
++        assert request.listener_closed.is_set()
++        assert request.app.state.server_load_metrics == 0
++    finally:
++        finish_abort.set()
++        await asyncio.gather(parent, return_exceptions=True)
++
++
++@run_async
++async def test_repeated_cancellation_during_response_handoff():
++    from fastapi.responses import JSONResponse
++
++    request = Request()
++    cleanup_started, finish_cleanup, closed = (asyncio.Event() for _ in range(3))
++
++    async def receive():
++        request.listening.set()
++        try:
++            await asyncio.Event().wait()
++        finally:
++            cleanup_started.set()
++            await finish_cleanup.wait()
++            closed.set()
++
++    request.receive = receive
++
++    @route
++    async def handle(_, raw_request):
++        await raw_request.listening.wait()
++        return JSONResponse({"ok": True})
++
++    parent = asyncio.create_task(handle(None, request))
++    await cleanup_started.wait()
++    try:
++        for i in range(3):
++            parent.cancel(f"handoff timeout {i}")
++            await asyncio.sleep(0)
++        await asyncio.sleep(0.01)
++        assert not parent.done()
++        finish_cleanup.set()
++        with pytest.raises(asyncio.CancelledError):
++            await parent
++        assert closed.is_set()
++        assert request.app.state.server_load_metrics == 0
++    finally:
++        finish_cleanup.set()
++        await asyncio.gather(parent, return_exceptions=True)
+diff --git a/vllm/entrypoints/serve/utils/api_utils.py b/vllm/entrypoints/serve/utils/api_utils.py
+index 90aa7398b..293469bda 100644
+--- a/vllm/entrypoints/serve/utils/api_utils.py
++++ b/vllm/entrypoints/serve/utils/api_utils.py
+@@ -93,7 +93,20 @@ def with_cancellation(handler_func):
+                 # Starlette middleware may cancel an AnyIO scope. Keep asynchronous
+                 # cleanup alive inside that scope, and retrieve both task outcomes.
+                 with anyio.CancelScope(shield=True):
+-                    await asyncio.gather(*tasks, return_exceptions=True)
++                    interrupted = None
++                    while True:
++                        try:
++                            # wait() does not cancel children when its caller is
++                            # cancelled again while their cleanup is running.
++                            await asyncio.wait(tasks)
++                            break
++                        except asyncio.CancelledError as exc:
++                            interrupted = exc
++                    for task in tasks:
++                        if not task.cancelled():
++                            task.exception()
++                    if interrupted is not None:
++                        raise interrupted
+         except BaseException:
+             # A response produced by the handler may be abandoned while we
+             # join the listener. No response background task will release it.
+-- 
+2.43.0
+

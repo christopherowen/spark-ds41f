@@ -1,0 +1,67 @@
+From c47b54ae471a24b830e3515212b8c0bf5ee14604 Mon Sep 17 00:00:00 2001
+From: Christopher Owen <3221756+christopherowen@users.noreply.github.com>
+Date: Fri, 6 Nov 2026 00:00:00 +0000
+Subject: [PATCH] test(logprob): isolate Triton reference monkeypatch in
+ routing probe
+
+Avoid resolving and restoring the lazy _topk_log_softmax_kernel reference into
+vllm.v1.worker.gpu.sample.logprob.__dict__ when testing TileLang routing so
+worker-module Triton-free assertions remain order-independent across pytest
+worker groupings.
+
+Upstream base: 19f2c20ed4d64ae22bd009ceacadd85e2a81e354
+Quality: test-only fixture isolation; no runtime or model arithmetic change.
+Tests: tests/v1/worker/test_gpu_tilelang_logprob_softmax.py and
+tests/v1/worker/test_gpu_verified_logprob_token_ids.py.
+Upstream status: local test-suite isolation fix for TileLang logprob tests.
+---
+ .../test_gpu_tilelang_logprob_softmax.py      | 33 +++++++++++--------
+ 1 file changed, 19 insertions(+), 14 deletions(-)
+
+diff --git a/tests/v1/worker/test_gpu_tilelang_logprob_softmax.py b/tests/v1/worker/test_gpu_tilelang_logprob_softmax.py
+index 3aa34d0a4..e97982e68 100644
+--- a/tests/v1/worker/test_gpu_tilelang_logprob_softmax.py
++++ b/tests/v1/worker/test_gpu_tilelang_logprob_softmax.py
+@@ -445,20 +445,25 @@ def test_compute_token_logprobs_launches_tilelang(dtype, monkeypatch):
+         calls.append(args)
+         launch(*args)
+ 
+-    # A launch of the Triton kernel would fail.
+-    monkeypatch.setattr(logprob, "_topk_log_softmax_kernel", None)
+-    monkeypatch.setattr(tilelang_logprob, "topk_log_softmax", spy)
+-    _assert_same(logprob.compute_token_logprobs(logits, ids), expected, "logprobs")
+-    # int32 ids are consumed directly, with the same scores.
+-    _assert_same(
+-        logprob.compute_token_logprobs(logits, ids.int()), expected, "int32 ids"
+-    )
+-    assert len(calls) == 2
+-    # No requested token, or no row: nothing to launch.
+-    empty = logprob.compute_token_logprobs(logits, ids[:, :0])
+-    assert empty.shape == (5, 0)
+-    none = logprob.compute_token_logprobs(logits[:0], ids[:0])
+-    assert none.shape == (0, 21)
++    # A launch of the Triton kernel would fail. Patch the dictionary so
++    # teardown removes the poison without resolving and retaining a lazy ref.
++    with monkeypatch.context() as patch:
++        patch.setitem(logprob.__dict__, "_topk_log_softmax_kernel", None)
++        patch.setattr(tilelang_logprob, "topk_log_softmax", spy)
++        _assert_same(logprob.compute_token_logprobs(logits, ids), expected, "logprobs")
++        # int32 ids are consumed directly, with the same scores.
++        _assert_same(
++            logprob.compute_token_logprobs(logits, ids.int()), expected, "int32 ids"
++        )
++        assert len(calls) == 2
++        # No requested token, or no row: nothing to launch.
++        empty = logprob.compute_token_logprobs(logits, ids[:, :0])
++        assert empty.shape == (5, 0)
++        none = logprob.compute_token_logprobs(logits[:0], ids[:0])
++        assert none.shape == (0, 21)
++
++    # The routing probe must leave the normal lazy-reference contract intact.
++    assert "_topk_log_softmax_kernel" not in logprob.__dict__
+ 
+ 
+ @pytest.mark.parametrize("num_logprobs", [0, 5, 20])
+-- 
+2.43.0
+

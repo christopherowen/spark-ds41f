@@ -1,0 +1,1060 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Christopher Owen <3221756+christopherowen@users.noreply.github.com>
+Date: Fri, 6 Nov 2026 00:00:00 +0000
+Subject: [PATCH 737/743] perf(dsv41): exchange WO-A MXFP8 rows and project
+ WO-B on local SP rows
+
+Under sequence-parallel prefill on encoder attention layers, run WO-A once on
+all T rows into its native MXFP8 (xq, sf) buffers, exchange those narrower
+o_lora rows across ranks while projecting this rank's own WO-B shard on the L
+local rows, and project each peer rank's WO-B shard on the L local rows into
+parts ([world, L, 5120] BF16).
+
+This cuts per-layer SP WO collective payload by 69.06% on TP3 Ranks 0/1 and
+79.38% on TP3 Rank 2 (72.50% cluster-wide average) and by 79.38% on TP4 across
+all 20 encoder layers, while eliminating repeated per-slice/per-owner WO-A and
+WO-B weight re-reads.
+
+Upstream base: 19f2c20ed4d64ae22bd009ceacadd85e2a81e354
+Immediate base: c47b54ae471a24b830e3515212b8c0bf5ee14604
+Quality: bit-identical to the full-row SP WO path across all finite, signed-zero,
+and non-finite inputs; no precision or rounding change anywhere.
+Tests: tests/models/test_deepseek_v4_1_attention.py,
+tests/models/test_deepseek_v4_1_sp_prefill.py, and
+tests/models/test_deepseek_v4_1_l2_schedule.py.
+Upstream status: local DeepSeek-V4.1 sequence-parallel prefill optimization.
+---
+ tests/models/test_deepseek_v4_1_attention.py | 543 +++++++++++++++++++
+ vllm/models/deepseek_v4_1/attention.py       |  40 +-
+ vllm/models/deepseek_v4_1/sp_prefill.py      |  46 +-
+ vllm/models/deepseek_v4_1/tilelang/gemm.py   |   7 +-
+ vllm/models/deepseek_v4_1/tilelang/wo.py     | 251 ++++++++-
+ 5 files changed, 860 insertions(+), 27 deletions(-)
+
+diff --git a/tests/models/test_deepseek_v4_1_attention.py b/tests/models/test_deepseek_v4_1_attention.py
+index 1ad9ab09b..672e47016 100644
+--- a/tests/models/test_deepseek_v4_1_attention.py
++++ b/tests/models/test_deepseek_v4_1_attention.py
+@@ -877,3 +877,546 @@ def test_tp3_rank2_trims_zero_padded_output_group(monkeypatch):
+     assert layer_r2.wo_b.weight.shape == (5120, 2048)
+     assert layer_r2.wo_b.weight_scale_inv.shape == (5120 // 32, 2048 // 32)
+     assert layer_r2._wo_projection_weights.groups == 2
++
++
++@pytest.mark.parametrize("world_size", [1, 3, 4])
++def test_sp_wo_rank_groups_and_declaration_binds_peer_shards(monkeypatch, world_size):
++    """Encoder attention layers record every TP rank's trimmed WO group count,
++    declare all distinct peer WO-B prefill GEMM widths before cache freeze, bind
++    trimmed peer WO-B shards while reusing this rank's own shard in place, and
++    leave CED decoder / draft layers on their single local shard."""
++    from torch import nn
++
++    from vllm.models.deepseek_v4_1 import attention
++    from vllm.models.deepseek_v4_1.tilelang import prepare
++    from vllm.models.deepseek_v4_1.tilelang import wo as tl_wo
++
++    monkeypatch.setattr(
++        attention, "get_tensor_model_parallel_world_size", lambda: world_size
++    )
++    orig_groups = 8
++    padded_groups = 9 if world_size == 3 else orig_groups
++    per_rank_padded = padded_groups // world_size
++
++    def make_layer(rank: int, *, is_ced_decoder: bool = False, is_draft: bool = False):
++        module = _tilelang_layer(layer_id=20 if is_ced_decoder else 0)
++        module.config.model_config = SimpleNamespace(
++            hf_config=SimpleNamespace(
++                original_o_groups=orig_groups, o_groups=padded_groups
++            )
++        )
++        module.is_ced_decoder = is_ced_decoder
++        module.is_draft = is_draft
++        module.n_groups = padded_groups
++        module.n_local_groups = per_rank_padded
++        module.n_local_heads = per_rank_padded * 8
++        module.head_dim = 64
++        module.o_lora_rank = 128
++        module.hidden_size = 256
++        module.attn_sink = nn.Parameter(
++            torch.arange(module.n_local_heads, dtype=torch.float32),
++            requires_grad=False,
++        )
++        module.wq_b = nn.Module()
++        module.wq_b.weight = nn.Parameter(
++            torch.zeros((module.n_local_heads * 64, 128), dtype=torch.float8_e4m3fn),
++            requires_grad=False,
++        )
++        module.wq_b.weight_scale_inv = nn.Parameter(
++            torch.ones(
++                (module.n_local_heads * 64 // 32, 128 // 32), dtype=torch.uint8
++            ),
++            requires_grad=False,
++        )
++        w_a = torch.full(
++            (per_rank_padded * 128, 8 * 64), rank + 1, dtype=torch.uint8
++        ).view(torch.float8_e4m3fn)
++        s_a = torch.full(
++            (per_rank_padded * 128 // 32, 8 * 64 // 32),
++            120 + rank,
++            dtype=torch.uint8,
++        )
++        w_b = torch.full(
++            (256, per_rank_padded * 128), 10 + rank, dtype=torch.uint8
++        ).view(torch.float8_e4m3fn)
++        s_b = torch.full(
++            (256 // 32, per_rank_padded * 128 // 32),
++            124 + rank,
++            dtype=torch.uint8,
++        )
++        module.wo_a = nn.Module()
++        module.wo_a.weight = nn.Parameter(w_a, requires_grad=False)
++        module.wo_a.weight_scale_inv = nn.Parameter(s_a, requires_grad=False)
++        module.wo_b = nn.Module()
++        module.wo_b.weight = nn.Parameter(w_b, requires_grad=False)
++        module.wo_b.weight_scale_inv = nn.Parameter(s_b, requires_grad=False)
++        return module
++
++    for flag in ("is_ced_decoder", "is_draft"):
++        monkeypatch.setattr(attention, "get_tensor_model_parallel_rank", lambda: 0)
++        non_sp = make_layer(0, **{flag: True})
++        non_sp.setup_wo_projection()
++        assert non_sp._wo_projection_weights.sp_rank_groups == ()
++        assert non_sp._wo_projection_weights.sp_shards is None
++
++    expected_groups = (
++        ()
++        if world_size == 1
++        else ((3, 3, 2) if world_size == 3 else (2, 2, 2, 2))
++    )
++    layers = []
++    declared_by_rank = []
++    for rank in range(world_size):
++        monkeypatch.setattr(attention, "get_tensor_model_parallel_rank", lambda r=rank: r)
++        layer = make_layer(rank)
++        layer.setup_wo_projection()
++        proj = layer._wo_projection_weights
++        assert proj.sp_rank_groups == expected_groups
++        regs = []
++        monkeypatch.setattr(
++            prepare,
++            "declare",
++            lambda calls=None, bind=None, warm=None, regs=regs: regs.append(
++                (calls, bind)
++            ),
++        )
++        proj.declare_kernels()
++        layers.append(layer)
++        declared_by_rank.append(regs)
++
++    if world_size == 1:
++        assert len(declared_by_rank[0]) == 2
++        return
++
++    monkeypatch.setattr(
++        prepare,
++        "launch",
++        lambda entry: ("launched", getattr(entry[0], "__name__", type(entry[0]).__name__), entry[1], entry[2]),
++    )
++    max_cols = max(expected_groups) * 128
++    max_sf_words = max_cols // 128
++    padded_weights = []
++    padded_sfs = []
++    for rank, layer in enumerate(layers):
++        b = layer._wo_projection_weights.b
++        w = torch.zeros((256, max_cols), dtype=b.weight.dtype)
++        w[:, : b.weight.shape[1]].copy_(b.weight)
++        sf = torch.zeros((256 // 32, max_sf_words), dtype=b.tilelang_weight_sf.dtype)
++        sf[:, : b.tilelang_weight_sf.shape[1]].copy_(b.tilelang_weight_sf)
++        padded_weights.append(w)
++        padded_sfs.append(sf)
++    all_w = torch.cat(padded_weights, dim=0)
++    all_sf = torch.cat(padded_sfs, dim=0)
++
++    def fake_all_gather(tensor, dim=0):
++        assert dim == 0
++        if tensor.dtype == torch.uint32:
++            return all_sf.clone()
++        return all_w.clone()
++
++    monkeypatch.setattr(tl_wo, "tensor_model_parallel_all_gather", fake_all_gather)
++
++    expected_cols = {g * 128 for g in expected_groups}
++    for rank, (layer, regs) in enumerate(zip(layers, declared_by_rank)):
++        assert len(regs) == 3
++        extra_calls = list(regs[2][0]())
++        gemm_cols = {
++            call[1][1]
++            for call in extra_calls
++            if call[0] is tl_wo.mxfp8_gemm
++        }
++        assert gemm_cols == expected_cols
++        monkeypatch.setattr(
++            tl_wo, "get_tensor_model_parallel_rank", lambda r=rank: r
++        )
++        for _, bind in regs:
++            if bind is not None:
++                bind()
++        proj = layer._wo_projection_weights
++        assert proj.sp_shards is not None and len(proj.sp_shards) == world_size
++        assert proj.sp_shards[rank] is proj.b
++        for peer, g in enumerate(expected_groups):
++            shard = proj.sp_shards[peer]
++            assert shard.weight.shape == (256, g * 128)
++            assert shard.tilelang_weight_sf.shape == (256 // 32, g * 128 // 128)
++            assert torch.equal(
++                shard.weight.view(torch.uint8),
++                layers[peer]._wo_projection_weights.b.weight.view(torch.uint8),
++            )
++            assert torch.equal(
++                shard.tilelang_weight_sf,
++                layers[peer]._wo_projection_weights.b.tilelang_weight_sf,
++            )
++
++
++@pytest.mark.parametrize("world_size", [3, 4])
++@pytest.mark.parametrize("tokens", [10, 12, 205])
++@pytest.mark.parametrize("unreduced", [True, False])
++@pytest.mark.parametrize("nonfinite", [False, True])
++def test_sp_wo_local_exchange_matches_full_row_parts_and_rank_order_sum(
++    monkeypatch, world_size, tokens, unreduced, nonfinite
++):
++    """Exchanging WO-A's native MXFP8 ``(xq, sf)`` output and running each rank's
++    WO-B shard on local rows reproduces every rank slot of ``parts`` and its
++    rank-order sum bit-for-bit across finite, signed-zero, and non-finite inputs,
++    while running WO-A once per rank and zeroing pad rows only through
++    ``columns.zero_``."""
++    from torch import nn
++
++    from vllm.models.deepseek_v4_1 import attention, l2_prefetch, sp_prefill
++    from vllm.models.deepseek_v4_1.tilelang import collectives, columns
++    from vllm.models.deepseek_v4_1.tilelang import wo as tl_wo
++
++    groups_by_rank = (3, 3, 2) if world_size == 3 else (2, 2, 2, 2)
++    rank_width = 512
++    head_dim = 64
++    hidden = 1280
++
++    zero_calls = []
++
++    def cpu_zero_(out: torch.Tensor) -> torch.Tensor:
++        nbytes = out.numel() * out.element_size()
++        assert out.is_contiguous() and nbytes % 16 == 0
++        zero_calls.append(tuple(out.shape))
++        out.view(torch.uint8).fill_(0)
++        return out
++
++    monkeypatch.setattr(columns, "zero_", cpu_zero_)
++
++    def refuse_torch_zero(self, *args, **kwargs):
++        raise AssertionError("a pad row was zeroed by torch.Tensor.zero_")
++
++    monkeypatch.setattr(torch.Tensor, "zero_", refuse_torch_zero)
++
++    gen = torch.Generator().manual_seed(4100 + world_size * 100 + tokens)
++    layers = []
++    inputs = []
++    wo_a_calls = {r: [] for r in range(world_size)}
++
++    def run_wo_b_ref(xq, weight, sf_u32, weight_sf, out):
++        # Exact block-32 FP32 accumulation per rank shard, rounded once to BF16.
++        m = out.shape[0]
++        k = xq.shape[1]
++        xq = xq[:m]
++        n = weight.shape[0]
++        sf_a = sf_u32.view(torch.uint8)[:m, : k // 32]
++        sf_b = weight_sf.view(torch.uint8)[:, : k // 32]
++        scale_a = torch.ldexp(
++            torch.ones((m, k // 32), dtype=torch.float32),
++            sf_a.to(torch.int32) - 127,
++        ).repeat_interleave(32, dim=1)
++        scale_b = (
++            torch.ldexp(
++                torch.ones((n // 32, k // 32), dtype=torch.float32),
++                sf_b.to(torch.int32) - 127,
++            )
++            .repeat_interleave(32, dim=0)
++            .repeat_interleave(32, dim=1)
++        )
++        a_fp32 = xq.to(torch.float32) * scale_a
++        b_fp32 = weight.to(torch.float32) * scale_b
++        acc = torch.zeros((m, n), dtype=torch.float32)
++        for k0 in range(0, k, 128):
++            acc = acc + a_fp32[:, k0 : k0 + 128] @ b_fp32[:, k0 : k0 + 128].T
++        out.copy_(acc.to(torch.bfloat16))
++
++    for rank, groups in enumerate(groups_by_rank):
++        cols = groups * rank_width
++        heads = groups * 8
++        layer = _tilelang_layer(layer_id=0)
++        layer.hidden_size = hidden
++        layer._l2pf_ffn = f"ffn_{rank}"
++        wo_a = nn.Module()
++        wo_a.weight = nn.Parameter(
++            torch.randint(
++                0, 120, (cols, 8 * head_dim), generator=gen, dtype=torch.uint8
++            ).view(torch.float8_e4m3fn),
++            requires_grad=False,
++        )
++        wo_a.weight_scale_inv = nn.Parameter(
++            torch.randint(
++                125,
++                129,
++                (cols // 32, 8 * head_dim // 32),
++                generator=gen,
++                dtype=torch.uint8,
++            ),
++            requires_grad=False,
++        )
++        wo_b = nn.Module()
++        wo_b.weight = nn.Parameter(
++            torch.randint(
++                0, 120, (hidden, cols), generator=gen, dtype=torch.uint8
++            ).view(torch.float8_e4m3fn),
++            requires_grad=False,
++        )
++        wo_b.weight_scale_inv = nn.Parameter(
++            torch.randint(
++                125,
++                129,
++                (hidden // 32, cols // 32),
++                generator=gen,
++                dtype=torch.uint8,
++            ),
++            requires_grad=False,
++        )
++        proj = tl_wo.TileLangWOProjection(wo_a, wo_b, groups=groups)
++        proj.enable_sp(groups_by_rank)
++        proj.b.tilelang_decode_rows = 128
++        proj.b.tilelang_prefill = run_wo_b_ref
++        proj.b.tilelang_decode = {16: run_wo_b_ref, 32: run_wo_b_ref, 64: run_wo_b_ref, 96: run_wo_b_ref}
++        proj.b.tilelang_wide = {96: 96}
++
++        def make_a_call(r, cols_r):
++            def a_call(x, xq, sf, partials=None):
++                m = x.shape[0]
++                wo_a_calls[r].append(m)
++                vals = x[:, :cols_r].to(torch.float8_e4m3fn)
++                xq.copy_(vals)
++                sf.fill_(127 + (r % 2))
++
++            return a_call
++
++        a_fn = make_a_call(rank, cols)
++
++        class _FakeA:
++            columns = cols
++            partial_specs = staticmethod(lambda rows: ())
++
++            def __call__(self, x, xq, sf, partials=None, _fn=a_fn):
++                return _fn(x, xq, sf, partials)
++
++        proj.a = _FakeA()
++        layer._wo_projection_weights = proj
++        layers.append(layer)
++
++        o_r = (torch.randn((tokens, heads, head_dim), generator=gen) * 0.5).bfloat16()
++        o_r[0, 0, 0] = -0.0
++        if nonfinite:
++            o_r[1, 0, 0] = float("nan")
++            o_r[2, 0, 1] = float("inf")
++            o_r[3, 0, 2] = -float("inf")
++        inputs.append(o_r)
++
++    for rank, layer in enumerate(layers):
++        proj = layer._wo_projection_weights
++        proj.sp_shards = tuple(
++            proj.b
++            if peer == rank
++            else tl_wo._PeerWeight(
++                layers[peer]._wo_projection_weights.b.weight.clone(),
++                layers[peer]._wo_projection_weights.b.tilelang_weight_sf.clone(),
++                run_wo_b_ref,
++            )
++            for peer in range(world_size)
++        )
++
++    ws = torch.empty(16 * 1024 * 1024, dtype=torch.uint8)
++    monkeypatch.setattr(tl_wo, "current_preallocated_workspace", lambda: ws)
++
++    # Full-row reference on each rank before collective exchange / reduction.
++    padded_rows = sp_prefill.SPRows(tokens, world_size, 0).padded_rows
++    local_rows = padded_rows // world_size
++    full_rank_outputs = []
++    for rank, layer in enumerate(layers):
++        padded = torch.zeros((padded_rows, hidden), dtype=torch.bfloat16)
++        layer._wo_projection_weights(inputs[rank], padded[:tokens])
++        full_rank_outputs.append(padded.view(world_size, local_rows, hidden))
++    for r in wo_a_calls:
++        wo_a_calls[r].clear()
++
++    # Simulate the two-step collective exchange (xq and sf) across all ranks.
++    sent_xq = {}
++    sent_sf = {}
++    for rank, layer in enumerate(layers):
++        proj = layer._wo_projection_weights
++        cols_r = proj.a.columns
++        sf_bytes_r = cols_r // 32
++        xq_s = torch.empty((world_size, local_rows, cols_r), dtype=torch.float8_e4m3fn)
++        sf_s = torch.empty((world_size, local_rows, sf_bytes_r), dtype=torch.uint8)
++        proj.a(
++            inputs[rank].view(tokens, -1),
++            xq_s.view(padded_rows, cols_r)[:tokens],
++            sf_s.view(padded_rows, sf_bytes_r)[:tokens],
++            None,
++        )
++        if tokens < padded_rows:
++            cpu_zero_(xq_s.view(padded_rows, cols_r)[tokens:])
++            cpu_zero_(sf_s.view(padded_rows, sf_bytes_r)[tokens:])
++        sent_xq[rank] = xq_s
++        sent_sf[rank] = sf_s
++    for r in wo_a_calls:
++        wo_a_calls[r].clear()
++    zero_calls.clear()
++
++    exchanged_bytes = {r: 0 for r in range(world_size)}
++
++    def fake_exchange_into(self, send, recv):
++        r = self.rank
++        src_table = sent_xq if send.dtype == torch.float8_e4m3fn else sent_sf
++        for peer in range(self.world_size):
++            if peer != r:
++                exchanged_bytes[r] += send[peer].numel() * send.element_size()
++                recv[peer].copy_(src_table[peer][r])
++
++    monkeypatch.setattr(sp_prefill.SPRows, "exchange_into", fake_exchange_into)
++    prefetched = []
++    monkeypatch.setattr(
++        l2_prefetch, "issue", lambda plan, rows: prefetched.append((plan, rows))
++    )
++
++    for rank, layer in enumerate(layers):
++        sp = sp_prefill.SPRows(tokens, world_size, rank, unreduced=unreduced)
++        actual = layer._o_proj(inputs[rank], sp_rows=sp)
++        expected_parts = torch.stack(
++            [full_rank_outputs[peer][rank] for peer in range(world_size)], dim=0
++        )
++        assert wo_a_calls[rank] == [tokens]
++        cols_r = groups_by_rank[rank] * rank_width
++        expected_wire = (world_size - 1) * local_rows * (cols_r + cols_r // 32)
++        assert exchanged_bytes[rank] == expected_wire
++        baseline_wire = (world_size - 1) * local_rows * hidden * 2
++        assert exchanged_bytes[rank] < baseline_wire
++        if unreduced:
++            assert actual.shape == (world_size, local_rows, hidden)
++            assert torch.equal(
++                actual.view(torch.int16), expected_parts.view(torch.int16)
++            )
++            summed = collectives.RankOrderParts(actual).sum()
++            expected_sum = collectives.RankOrderParts(expected_parts).sum()
++            assert torch.equal(
++                summed.view(torch.int16), expected_sum.view(torch.int16)
++            )
++        else:
++            expected_sum = collectives.rank_order_sum(list(expected_parts.unbind(0)))
++            assert actual.shape == (local_rows, hidden)
++            assert torch.equal(
++                actual.view(torch.int16), expected_sum.view(torch.int16)
++            )
++    assert prefetched == [(f"ffn_{r}", tokens) for r in range(world_size)]
++
++
++@pytest.mark.parametrize("world_size", [3, 4])
++def test_sp_wo_local_exchange_matches_native_tilelang_kernels_on_sm12x(monkeypatch, world_size):
++    if not torch.cuda.is_available() or torch.cuda.get_device_capability()[0] != 12:
++        pytest.skip("DeepSeek-V4.1 TileLang WO kernels require SM12x")
++    pytest.importorskip("tilelang")
++    from torch import nn
++
++    from vllm.models.deepseek_v4_1 import sp_prefill
++    from vllm.models.deepseek_v4_1.tilelang import collectives
++    from vllm.models.deepseek_v4_1.tilelang import wo as tl_wo
++
++    groups_by_rank = (3, 3, 2) if world_size == 3 else (2, 2, 2, 2)
++    rank_width = 1024
++    head_dim = 512
++    hidden = 5120
++    gen = torch.Generator(device="cuda").manual_seed(4200 + world_size)
++
++    projections = []
++    for rank, groups in enumerate(groups_by_rank):
++        cols = groups * rank_width
++        wo_a = nn.Module()
++        wo_a.weight = nn.Parameter(
++            torch.randint(
++                0, 120, (cols, 8 * head_dim), generator=gen, device="cuda", dtype=torch.uint8
++            ).view(torch.float8_e4m3fn),
++            requires_grad=False,
++        )
++        wo_a.weight_scale_inv = nn.Parameter(
++            torch.randint(
++                118,
++                124,
++                (cols // 32, 8 * head_dim // 32),
++                generator=gen,
++                device="cuda",
++                dtype=torch.uint8,
++            ),
++            requires_grad=False,
++        )
++        wo_b = nn.Module()
++        wo_b.weight = nn.Parameter(
++            torch.randint(
++                0, 120, (hidden, cols), generator=gen, device="cuda", dtype=torch.uint8
++            ).view(torch.float8_e4m3fn),
++            requires_grad=False,
++        )
++        wo_b.weight_scale_inv = nn.Parameter(
++            torch.randint(
++                118,
++                124,
++                (hidden // 32, cols // 32),
++                generator=gen,
++                device="cuda",
++                dtype=torch.uint8,
++            ),
++            requires_grad=False,
++        )
++        proj = tl_wo.TileLangWOProjection(wo_a, wo_b, groups=groups)
++        proj.enable_sp(groups_by_rank)
++        proj.a.kernels = {
++            b: c[0](*c[1], **c[2]) for b, c in proj.a._kernels()["kernels"].items()
++        }
++        r_call = proj.a._kernels()["reduce"]
++        proj.a.reduce = r_call[0](*r_call[1], **r_call[2])
++        p_calls = {
++            c: call[0](*call[1], **call[2])
++            for c, call in proj._sp_prefill_calls().items()
++        }
++        proj.b.tilelang_prefill = p_calls[cols]
++        proj.b.tilelang_decode_rows = 128
++        projections.append((proj, p_calls))
++
++    for rank, (proj, p_calls) in enumerate(projections):
++        proj.sp_shards = tuple(
++            proj.b
++            if peer == rank
++            else tl_wo._PeerWeight(
++                projections[peer][0].b.weight,
++                projections[peer][0].b.tilelang_weight_sf,
++                p_calls[groups_by_rank[peer] * rank_width],
++            )
++            for peer in range(world_size)
++        )
++
++    ws = torch.empty(128 * 1024 * 1024, dtype=torch.uint8, device="cuda")
++    monkeypatch.setattr(tl_wo, "current_preallocated_workspace", lambda: ws)
++
++    for tokens in (205, 206, 207, 2048):
++        padded = sp_prefill.SPRows(tokens, world_size, 0).padded_rows
++        local = padded // world_size
++        o_inputs = [
++            (torch.randn((tokens, g * 8, head_dim), generator=gen, device="cuda") * 0.25).bfloat16()
++            for g in groups_by_rank
++        ]
++        for o_r in o_inputs:
++            o_r[0, 0, 0] = -0.0
++            o_r[1, 0, 1] = float("nan")
++            o_r[2, 0, 2] = float("inf")
++            o_r[3, 0, 3] = -float("inf")
++        ref_blocks = []
++        for rank, (proj, _) in enumerate(projections):
++            full_out = torch.zeros((padded, hidden), dtype=torch.bfloat16, device="cuda")
++            proj(o_inputs[rank], full_out[:tokens])
++            ref_blocks.append(full_out.view(world_size, local, hidden))
++        for rank, (proj, _) in enumerate(projections):
++            sp = sp_prefill.SPRows(tokens, world_size, rank, unreduced=True)
++            real = sp.real_rows
++            parts = torch.empty((world_size, local, hidden), dtype=torch.bfloat16, device="cuda")
++            for peer, (peer_proj, _) in enumerate(projections):
++                cols_p = peer_proj.a.columns
++                xq = torch.zeros((padded, cols_p), dtype=torch.float8_e4m3fn, device="cuda")
++                sf = torch.zeros((padded, cols_p // 32), dtype=torch.uint8, device="cuda")
++                peer_proj.a(o_inputs[peer].view(tokens, -1), xq[:tokens], sf[:tokens], None)
++                xq_local = xq.view(world_size, local, cols_p)[rank]
++                sf_local = sf.view(world_size, local, cols_p // 32)[rank]
++                proj._project_sp_shard(peer, xq_local, sf_local, parts[peer], real, local)
++            expected = torch.stack([ref_blocks[peer][rank] for peer in range(world_size)], dim=0)
++            assert torch.equal(parts.view(torch.int16), expected.view(torch.int16)), (
++                world_size,
++                tokens,
++                rank,
++            )
++            actual_sum = collectives.RankOrderParts(parts).sum()
++            expected_sum = collectives.RankOrderParts(expected).sum()
++            assert torch.equal(actual_sum.view(torch.int16), expected_sum.view(torch.int16))
+diff --git a/vllm/models/deepseek_v4_1/attention.py b/vllm/models/deepseek_v4_1/attention.py
+index c00e159b9..6a0688030 100644
+--- a/vllm/models/deepseek_v4_1/attention.py
++++ b/vllm/models/deepseek_v4_1/attention.py
+@@ -1813,6 +1813,26 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase):
+         self.n_local_groups = real_groups
+         self.n_local_heads = real_heads
+ 
++    def _sp_wo_rank_groups(self) -> tuple[int, ...]:
++        """Trimmed WO group counts per TP rank on SP-capable attention layers."""
++        tp_size = get_tensor_model_parallel_world_size()
++        if (
++            tp_size <= 1
++            or getattr(self, "is_draft", False)
++            or getattr(self, "is_ced_decoder", False)
++        ):
++            return ()
++        n_groups = getattr(self, "n_groups", self.n_local_groups * tp_size)
++        hf = getattr(getattr(self.config, "model_config", None), "hf_config", None)
++        orig_groups = getattr(hf, "original_o_groups", n_groups)
++        padded_groups = n_groups // tp_size
++        if orig_groups >= n_groups:
++            return (self.n_local_groups,) * tp_size
++        return tuple(
++            max(0, min(orig_groups - r * padded_groups, padded_groups))
++            for r in range(tp_size)
++        )
++
+     def setup_wo_projection(self):
+         self._trim_padded_groups()
+         groups = self.n_local_groups
+@@ -1846,18 +1866,30 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase):
+         self._wo_projection_weights = TileLangWOProjection(
+             self.wo_a, self.wo_b, groups=groups
+         )
++        enable_sp = getattr(self._wo_projection_weights, "enable_sp", None)
++        if enable_sp is not None:
++            enable_sp(self._sp_wo_rank_groups())
+ 
+     def _o_proj(self, o, sp_rows=None):
+         """The TileLang WO projection of WO-A's input ``o``, which the attention
+         kernels store already rotated back and through ``act_quant``.
+ 
+-        A sequence-parallel step projects through ``project_reduce_scatter``: in
+-        slices, and as unreduced rank-order parts when the step keeps them, so a
+-        row's sum over ranks is the non-SP step's all-reduce."""
++        A sequence-parallel step on an encoder layer exchanges WO-A's native MXFP8
++        ``o_lora`` output and projects each rank's WO-B shard on local rows into
++        rank-order parts; layers without bound SP shards fall back to
++        ``project_reduce_scatter``."""
+         rows, hidden = o.shape[0], self.hidden_size
+         if sp_rows is not None:
+             if rows != sp_rows.num_tokens:
+                 raise ValueError(f"V4.1 SP WO expects {sp_rows.num_tokens} rows")
++            then = lambda: l2_prefetch.issue(self._l2pf_ffn, rows)
++            can_project_sp = getattr(
++                self._wo_projection_weights, "can_project_sp", None
++            )
++            if can_project_sp is not None and can_project_sp(sp_rows):
++                return self._wo_projection_weights.project_sp(
++                    o, sp_rows, then=then
++                )
+ 
+             def project(start, stop, out):
+                 self._wo_projection_weights(o[start:stop], out)
+@@ -1868,7 +1900,7 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase):
+                 torch.bfloat16,
+                 o.device,
+                 slices=sp_prefill.wo_slices(rows),
+-                then=lambda: l2_prefetch.issue(self._l2pf_ffn, rows),
++                then=then,
+             )
+         local = torch.empty((rows, hidden), dtype=torch.bfloat16, device=o.device)
+         self._wo_projection_weights(o, local)
+diff --git a/vllm/models/deepseek_v4_1/sp_prefill.py b/vllm/models/deepseek_v4_1/sp_prefill.py
+index ed03400d2..0815a0273 100644
+--- a/vllm/models/deepseek_v4_1/sp_prefill.py
++++ b/vllm/models/deepseek_v4_1/sp_prefill.py
+@@ -57,6 +57,10 @@ row and then compacts.
+ - In attention layers without a compressor, the row-wise front
+   (``fused_wqa_wkv``, the q/kv norms and the index weights) runs on local
+   rows and its narrower product is gathered instead of the hidden state.
++- In encoder attention layers, ``WO-A`` projects all ``T`` rows into its
++  native MXFP8 ``o_lora`` activations, exchanges those narrower rows across
++  ranks while projecting this rank's own ``WO-B`` shard on local rows, and
++  projects the peer ``WO-B`` shards on local rows into the rank-order parts.
+ - In MoE layers, ``mhc.post_pre`` already writes the local rows' MXFP8 cast and
+   the router routes the local BF16 rows; one grouped all-gather exchanges the
+   MXFP8 values, scales and local top-k routes instead of gathering the BF16
+@@ -405,17 +409,6 @@ class SPRows:
+         local, world, tokens = self.local_rows, self.world_size, self.num_tokens
+         send = torch.empty((world, local, *row_shape), dtype=dtype, device=device)
+         parts = torch.empty_like(send)
+-        dev_comm = get_tp_group().device_communicator
+-        comm = dev_comm.pynccl_comm
+-        roce_comm = getattr(dev_comm, "b12x_ar_comm", None)
+-        should_ex = getattr(roce_comm, "should_exchange", None)
+-        ex_into = getattr(roce_comm, "exchange_into", None)
+-        use_roce_ex = (
+-            roce_comm is not None
+-            and not roce_comm.disabled
+-            and should_ex is not None
+-            and ex_into is not None
+-        )
+         slices = max(slices, 1)
+         if slices == 1 and not per_block:
+             flat = send.view(world * local, *row_shape)
+@@ -424,10 +417,7 @@ class SPRows:
+             parts[self.rank].copy_(send[self.rank])
+             if then is not None:
+                 then()
+-            if use_roce_ex and should_ex(send):
+-                ex_into(send, parts)
+-            else:
+-                exchange_into(comm, send, parts, self.rank, world)
++            self.exchange_into(send, parts)
+             return parts
+ 
+         def write(owner, lo, hi):
+@@ -449,10 +439,7 @@ class SPRows:
+                     write(owner, lo, hi)
+             side.wait_stream(main)
+             with torch.cuda.stream(side):
+-                if use_roce_ex and should_ex(send[:, lo:hi]):
+-                    ex_into(send[:, lo:hi], parts[:, lo:hi])
+-                else:
+-                    exchange_into(comm, send[:, lo:hi], parts[:, lo:hi], self.rank, world)
++                self.exchange_into(send[:, lo:hi], parts[:, lo:hi])
+             write(self.rank, lo, hi)
+         if then is not None:
+             then()
+@@ -460,6 +447,27 @@ class SPRows:
+         main.wait_stream(side)
+         return parts
+ 
++    def exchange_into(self, send: torch.Tensor, recv) -> None:
++        """Exchange ``send[peer]`` into ``recv[peer]`` for every peer ``!= rank``."""
++        from vllm.models.deepseek_v4_1.tilelang.collectives import exchange_into
++
++        dev_comm = get_tp_group().device_communicator
++        comm = dev_comm.pynccl_comm
++        roce_comm = getattr(dev_comm, "b12x_ar_comm", None)
++        should_ex = getattr(roce_comm, "should_exchange", None)
++        ex_into = getattr(roce_comm, "exchange_into", None)
++        if (
++            isinstance(recv, torch.Tensor)
++            and roce_comm is not None
++            and not roce_comm.disabled
++            and should_ex is not None
++            and ex_into is not None
++            and should_ex(send)
++        ):
++            ex_into(send, recv)
++            return
++        exchange_into(comm, send, recv, self.rank, self.world_size)
++
+ 
+ # The attention's WO projection is reduce-scattered in two slices from this many
+ # tokens, so half its reduce-scatter runs under the other half's projection.
+diff --git a/vllm/models/deepseek_v4_1/tilelang/gemm.py b/vllm/models/deepseek_v4_1/tilelang/gemm.py
+index 346ede1f1..e5213fb40 100644
+--- a/vllm/models/deepseek_v4_1/tilelang/gemm.py
++++ b/vllm/models/deepseek_v4_1/tilelang/gemm.py
+@@ -1566,8 +1566,11 @@ def fp8_prefill_config(N: int, K: int, groups: int = 1) -> dict:
+     tiles made a 33 MB projection's 4096-row GEMM three times faster. Smaller
+     weights stay in L2 either way and run fastest unswizzled.
+     """
+-    device = torch.cuda.current_device()
+-    l2_bytes = torch.cuda.get_device_properties(device).L2_cache_size
++    if torch.cuda.is_available():
++        device = torch.cuda.current_device()
++        l2_bytes = torch.cuda.get_device_properties(device).L2_cache_size
++    else:
++        l2_bytes = 24 * 1024 * 1024
+     swizzle_panel = 8 if l2_bytes < groups * N * K else 0
+     return dict(default_config(DECODE_ROWS + 1, K), swizzle_panel=swizzle_panel)
+ 
+diff --git a/vllm/models/deepseek_v4_1/tilelang/wo.py b/vllm/models/deepseek_v4_1/tilelang/wo.py
+index 9a2bd9277..24c898158 100644
+--- a/vllm/models/deepseek_v4_1/tilelang/wo.py
++++ b/vllm/models/deepseek_v4_1/tilelang/wo.py
+@@ -20,19 +20,33 @@ one UE8M0 scale per 32), as the reference's ``linear`` quantizes them. WO-A's la
+ kernel (the GEMM's epilogue, or the split-K reduce at decode) rounds ``a`` to BF16 and
+ applies that cast itself, so ``a`` never reaches memory in BF16: the bytes are those
+ of ``per_token_cast`` on the BF16 ``a``. The checkpoint tensors are read in place.
++
++Under sequence-parallel prefill on encoder layers, each rank runs WO-A once on all
++``T`` rows into its native MXFP8 ``(xq, sf)`` buffers, exchanges those narrower
++``o_lora`` rows across ranks while projecting its own WO-B shard on the ``L`` local
++rows, and then projects each peer rank's WO-B shard on the ``L`` local rows into
++``parts`` (``[world, L, hidden]`` BF16), keeping every rank shard's BF16 rounding and
++the rank-order FP32 sum identical to the full-row path.
+ """
+ 
+ import torch
+ from torch import nn
+ 
++from vllm.distributed import (
++    get_tensor_model_parallel_rank,
++    tensor_model_parallel_all_gather,
++)
+ from vllm.v1.worker.workspace import current_preallocated_workspace
+ 
+ from .. import l2_prefetch
+ from . import prepare
+ from .gemm import (
+     SPLIT_FP8,
++    fp8_prefill_config,
+     fp8w_bf16_gemm_cast,
+     fp8w_bf16_gemm_partials,
++    mxfp8_gemm,
++    scale_words,
+     splitk_reduce_cast,
+ )
+ from .linear import (
+@@ -83,6 +97,22 @@ class _Weight:
+         self.tilelang_decode_rows = 128
+ 
+ 
++class _PeerWeight:
++    """A peer TP rank's WO-B shard and its prepared prefill GEMM."""
++
++    __slots__ = ("weight", "tilelang_weight_sf", "tilelang_prefill")
++
++    def __init__(
++        self,
++        weight: torch.Tensor,
++        tilelang_weight_sf: torch.Tensor,
++        tilelang_prefill,
++    ) -> None:
++        self.weight = weight
++        self.tilelang_weight_sf = tilelang_weight_sf
++        self.tilelang_prefill = tilelang_prefill
++
++
+ class _GroupedBF16:
+     """WO-A for the W8A16 GEMM: the FP8 weight, its UE8M0 exponents (also what the L2
+     prefetch reads beside it, as ``tilelang_weight_sf``) and one kernel per row tile."""
+@@ -165,18 +195,235 @@ class TileLangWOProjection:
+         if SPLIT_FP8.get(tuple(self.b.weight.shape)):
+             raise ValueError("WO-B takes WO-A's MXFP8 output: no split-K path")
+         self.hidden = wo_b.weight.shape[0]
++        self.sp_rank_groups: tuple[int, ...] = ()
++        self.sp_shards: tuple[_Weight | _PeerWeight, ...] | None = None
++
++    def enable_sp(self, rank_groups: tuple[int, ...]) -> None:
++        """Record every TP rank's trimmed WO group count for SP local projection."""
++        self.sp_rank_groups = tuple(int(g) for g in rank_groups)
++
++    def _sp_prefill_calls(self) -> dict[int, prepare.TileLangCall]:
++        if not self.sp_rank_groups:
++            return {}
++        rank_width = self.a.columns // self.a.groups
++        calls: dict[int, prepare.TileLangCall] = {}
++        for groups in dict.fromkeys(self.sp_rank_groups):
++            cols = groups * rank_width
++            calls[cols] = prepare.call(
++                mxfp8_gemm,
++                self.hidden,
++                cols,
++                **fp8_prefill_config(self.hidden, cols, 1),
++                groups=1,
++            )
++        return calls
+ 
+     def declare_kernels(self) -> None:
+-        """Declare WO-A's and WO-B's kernels."""
++        """Declare WO-A's and WO-B's kernels, plus SP peer WO-B shards when enabled."""
+         self.a.declare_kernels()
+         self.b.declare_kernels()
++        if not self.sp_rank_groups:
++            return
++        from . import collectives, columns
++
++        sp_calls = self._sp_prefill_calls()
++        world = len(self.sp_rank_groups)
++        extra_calls = [
++            *sp_calls.values(),
++            prepare.call(columns.zero_packs_kernel),
++            prepare.call(collectives.rank_order_sum_kernel, world),
++        ]
++
++        def bind() -> None:
++            # Decode and non-SP steps retain their original TP shard and kernels.
++            # SP encoder layers gather peer WO-B shards once before memory profiling
++            # and reuse this rank's own shard in place.
++            rank = get_tensor_model_parallel_rank()
++            rank_width = self.a.columns // self.a.groups
++            max_cols = max(self.sp_rank_groups) * rank_width
++            max_sf_words = scale_words(max_cols)
++            device = self.b.weight.device
++            w = self.b.weight
++            if w.shape[1] < max_cols:
++                padded_w = torch.zeros(
++                    (self.hidden, max_cols), dtype=w.dtype, device=device
++                )
++                padded_w[:, : w.shape[1]].copy_(w)
++            else:
++                padded_w = w
++            sf = self.b.tilelang_weight_sf
++            if sf.shape[1] < max_sf_words:
++                padded_sf = torch.zeros(
++                    (self.hidden // 32, max_sf_words), dtype=sf.dtype, device=device
++                )
++                padded_sf[:, : sf.shape[1]].copy_(sf)
++            else:
++                padded_sf = sf
++            gathered_w = tensor_model_parallel_all_gather(padded_w, dim=0).view(
++                world, self.hidden, max_cols
++            )
++            gathered_sf = tensor_model_parallel_all_gather(padded_sf, dim=0).view(
++                world, self.hidden // 32, max_sf_words
++            )
++            prefill_by_cols = {
++                cols: prepare.launch(call) for cols, call in sp_calls.items()
++            }
++            shards: list[_Weight | _PeerWeight] = []
++            for peer, peer_groups in enumerate(self.sp_rank_groups):
++                if peer == rank:
++                    shards.append(self.b)
++                    continue
++                cols = peer_groups * rank_width
++                sf_words = scale_words(cols)
++                shards.append(
++                    _PeerWeight(
++                        gathered_w[peer, :, :cols].contiguous(),
++                        gathered_sf[peer, :, :sf_words].contiguous(),
++                        prefill_by_cols[cols],
++                    )
++                )
++            self.sp_shards = tuple(shards)
++
++        prepare.declare(lambda: extra_calls, bind=bind)
+ 
+     def l2_segments(self) -> list:
+-        """The bytes both GEMMs read, WO-A first: each weight and its scale words."""
++        """The bytes both GEMMs read at decode, WO-A first: each weight and its scale words."""
+         return l2_prefetch.linear_segments(
+             "wo_a", self.a
+         ) + l2_prefetch.linear_segments("wo_b", self.b)
+ 
++    def can_project_sp(self, sp_rows) -> bool:
++        """Whether SP local WO-B shards are bound for ``sp_rows``."""
++        return (
++            self.sp_shards is not None
++            and len(self.sp_shards) == sp_rows.world_size
++            and 0 <= sp_rows.rank < sp_rows.world_size
++        )
++
++    def _project_sp_shard(
++        self,
++        shard_rank: int,
++        xq: torch.Tensor,
++        sf: torch.Tensor,
++        out: torch.Tensor,
++        real: int,
++        local: int,
++    ) -> None:
++        from . import columns
++
++        assert self.sp_shards is not None
++        shard = self.sp_shards[shard_rank]
++        if real:
++            weight = getattr(shard, "tilelang_weight", shard.weight)
++            # Always use the prefill GEMM, even for a short local slice: it keeps
++            # the global prefill's K reduction and reads only the real rows.
++            shard.tilelang_prefill(
++                xq[:real],
++                weight,
++                sf[:real].view(torch.uint32),
++                shard.tilelang_weight_sf,
++                out[:real],
++            )
++        if real < local:
++            columns.zero_(out[real:local])
++
++    def project_sp(self, o: torch.Tensor, sp_rows, *, then=None) -> torch.Tensor:
++        """Project ``o`` on all ``T`` rows through WO-A, exchange the native MXFP8
++        ``o_lora`` rows across ranks while projecting this rank's own WO-B shard on
++        local rows, and project the peer WO-B shards on local rows into rank-order
++        ``parts`` (``[world, L, hidden]`` BF16, or their rank-order sum when
++        ``sp_rows.unreduced`` is False)."""
++        from .. import sp_prefill
++        from . import collectives, columns
++
++        rows = o.shape[0]
++        if rows != sp_rows.num_tokens:
++            raise ValueError(f"V4.1 SP WO expects {sp_rows.num_tokens} rows")
++        if not self.can_project_sp(sp_rows):
++            raise RuntimeError("SP WO shards must be bound before project_sp")
++        assert self.sp_shards is not None
++        world, rank = sp_rows.world_size, sp_rows.rank
++        local, padded = sp_rows.local_rows, sp_rows.padded_rows
++        real = sp_rows.real_rows
++        device = o.device
++        cols_r = self.a.columns
++        sf_bytes_r = 4 * scale_words(cols_r)
++        xq_send = torch.empty(
++            (world, local, cols_r), dtype=torch.float8_e4m3fn, device=device
++        )
++        sf_send = torch.empty(
++            (world, local, sf_bytes_r), dtype=torch.uint8, device=device
++        )
++        xq_flat = xq_send.view(padded, cols_r)
++        sf_flat = sf_send.view(padded, sf_bytes_r)
++        if rows:
++            partial_specs = self.a.partial_specs(rows)
++            partials = (
++                _scratch(partial_specs, current_preallocated_workspace())[0]
++                if partial_specs
++                else None
++            )
++            self.a(o.view(rows, -1), xq_flat[:rows], sf_flat[:rows], partials)
++        if rows < padded:
++            columns.zero_(xq_flat[rows:])
++            columns.zero_(sf_flat[rows:])
++
++        if len(set(self.sp_rank_groups)) == 1:
++            xq_recv: torch.Tensor | list[torch.Tensor] = torch.empty_like(xq_send)
++            sf_recv: torch.Tensor | list[torch.Tensor] = torch.empty_like(sf_send)
++        else:
++            xq_recv = [
++                xq_send[rank]
++                if peer == rank
++                else torch.empty(
++                    (local, self.sp_shards[peer].weight.shape[1]),
++                    dtype=torch.float8_e4m3fn,
++                    device=device,
++                )
++                for peer in range(world)
++            ]
++            sf_recv = [
++                sf_send[rank]
++                if peer == rank
++                else torch.empty(
++                    (local, 4 * scale_words(self.sp_shards[peer].weight.shape[1])),
++                    dtype=torch.uint8,
++                    device=device,
++                )
++                for peer in range(world)
++            ]
++
++        parts = torch.empty(
++            (world, local, self.hidden), dtype=torch.bfloat16, device=device
++        )
++        if device.type == "cuda":
++            main = torch.cuda.current_stream(device)
++            side = sp_prefill._side_stream(device)
++            side.wait_stream(main)
++            with torch.cuda.stream(side):
++                sp_rows.exchange_into(xq_send, xq_recv)
++                sp_rows.exchange_into(sf_send, sf_recv)
++            self._project_sp_shard(
++                rank, xq_send[rank], sf_send[rank], parts[rank], real, local
++            )
++            main.wait_stream(side)
++        else:
++            sp_rows.exchange_into(xq_send, xq_recv)
++            sp_rows.exchange_into(sf_send, sf_recv)
++            self._project_sp_shard(
++                rank, xq_send[rank], sf_send[rank], parts[rank], real, local
++            )
++        for peer in range(world):
++            if peer != rank:
++                self._project_sp_shard(
++                    peer, xq_recv[peer], sf_recv[peer], parts[peer], real, local
++                )
++        if then is not None:
++            then()
++        if sp_rows.unreduced:
++            return parts
++        return collectives.rank_order_sum(list(parts.unbind(0)))
++
+     def __call__(self, o: torch.Tensor, out: torch.Tensor) -> torch.Tensor:
+         """Project WO-A's input ``o`` ([T, heads, head_dim] contiguous BF16, as the
+         sparse MLA kernels store it) into ``out`` ([T, hidden] BF16)."""

@@ -1,0 +1,417 @@
+From c88a692e989c391d2c8478f0f7c2069d21d6f25b Mon Sep 17 00:00:00 2001
+From: Christopher Owen <root@your.mom>
+Date: Wed, 4 Nov 2026 17:26:35 +0100
+Subject: [PATCH] Fuse selected-logit gather, FP32 conversion and masking in
+ TileLang
+
+Upstream-base: local-inference-lab/vllm 19f2c20ed4d64ae22bd009ceacadd85e2a81e354 plus candidate-38 source 1f33102547e4da5c64712390604695d1abd577c4.
+
+Rationale: raw_logits and processed_logits still launch ATen gather, cast and mask kernels. Emit selected FP32 values in one TileLang store and declare all dtype, id-type and masking variants before the cache freezes.
+
+Quality: preserve selected logits, signed zeros, infinities, NaNs, token ranks and score ordering; invalid custom-id columns stay negative infinity and are not dereferenced. No change to sampling or log-softmax arithmetic.
+
+Tests: extend selected-score GPU coverage for dtype/stride/mask contracts, CUDA graphs and frozen-cache warmup; exercise prompt chunks, speculative chunks, custom ids and all score modes. Native qualification and benchmark receipts belong to the deployment experiment.
+
+Upstream-status: local candidate, not submitted upstream.
+---
+ .../test_gpu_rejection_sampler_chunking.py    |  30 +++-
+ .../test_gpu_tilelang_logprob_softmax.py      | 144 ++++++++++++++++++
+ .../test_gpu_verified_logprob_token_ids.py    |   9 ++
+ vllm/v1/worker/gpu/sample/logprob.py          |  16 +-
+ vllm/v1/worker/gpu/sample/tilelang_logprob.py |  90 +++++++++++
+ 5 files changed, 280 insertions(+), 9 deletions(-)
+
+diff --git a/tests/v1/worker/test_gpu_rejection_sampler_chunking.py b/tests/v1/worker/test_gpu_rejection_sampler_chunking.py
+index d67bf3955e..9043b91bd6 100644
+--- a/tests/v1/worker/test_gpu_rejection_sampler_chunking.py
++++ b/tests/v1/worker/test_gpu_rejection_sampler_chunking.py
+@@ -28,7 +28,8 @@ def test_iter_request_chunks_preserves_request_boundaries():
+ 
+ @pytest.mark.skipif(not current_platform.is_cuda(), reason="Requires CUDA")
+ @pytest.mark.parametrize("logprobs_mode", get_args(LogprobsMode))
+-def test_chunked_scores_match_full_batch(logprobs_mode: str):
++@pytest.mark.parametrize("custom_ids", [False, True])
++def test_chunked_scores_match_full_batch(logprobs_mode: str, custom_ids: bool):
+     device = torch.device("cuda")
+     cu_num_logits_np = np.array([0, 3, 4, 8, 10], dtype=np.int32)
+     num_logits_per_req = np.diff(cu_num_logits_np)
+@@ -50,9 +51,21 @@ def test_chunked_scores_match_full_batch(logprobs_mode: str):
+         ).to(device),
+     )
+     rejection_sampler = object.__new__(RejectionSampler)
++    id_state = None
++    if custom_ids:
++        counts = torch.zeros(10, device=device, dtype=torch.int32)
++        counts[7], counts[9] = 1, 3
++        tokens = torch.zeros(10, 3, device=device, dtype=torch.int32)
++        tokens[7, 0] = 16
++        tokens[9] = torch.tensor([3, 11, 5], device=device)
++        id_state = SimpleNamespace(
++            num_token_ids=SimpleNamespace(gpu=counts),
++            token_ids=SimpleNamespace(gpu=tokens),
++        )
+     rejection_sampler.sampler = SimpleNamespace(
+-        logprobs_mode=logprobs_mode, logprob_token_ids_state=None
++        logprobs_mode=logprobs_mode, logprob_token_ids_state=id_state
+     )
++    dims = (2, 3 if custom_ids else 0)
+     rejection_sampler.num_speculative_steps = 3
+     rejection_sampler.num_draft_steps = 3
+     rejection_sampler.enable_adaptive_verification = False
+@@ -85,7 +98,7 @@ def test_chunked_scores_match_full_batch(logprobs_mode: str):
+         draft_sampled=torch.arange(10, device=device),
+         pos=torch.arange(10, device=device),
+         max_chunk_logits=5,
+-        logprobs_dims=(2, 0),
++        logprobs_dims=dims,
+     )
+     score_logits = logits + 1 if logprobs_mode in PROCESSED_LOGPROBS_MODES else logits
+     full_logprobs = rejection_sampler._get_logprobs_tensors(
+@@ -95,7 +108,7 @@ def test_chunked_scores_match_full_batch(logprobs_mode: str):
+         input_batch.cu_num_logits,
+         input_batch.cu_num_logits_np,
+         input_batch.expanded_idx_mapping,
+-        logprobs_dims=(2, 0),
++        logprobs_dims=dims,
+     )
+ 
+     # Chunks (0, 2), (2, 3), (3, 4): the first chunk's offsets are a view of the
+@@ -113,6 +126,15 @@ def test_chunked_scores_match_full_batch(logprobs_mode: str):
+         full_logprobs.logprob_token_ids,
+     )
+     assert torch.equal(chunked_logprobs.logprobs, full_logprobs.logprobs)
++    if logprobs_mode in ("raw_logits", "processed_logits"):
++        expected = score_logits.gather(1, full_logprobs.logprob_token_ids)
++        if custom_ids:
++            widths = torch.tensor([1, 2, 3, 2], device=device).repeat_interleave(
++                torch.tensor(num_logits_per_req, device=device)
++            )
++            valid = torch.arange(4, device=device)[None, :] <= widths[:, None]
++            expected.masked_fill_(~valid, -torch.inf)
++        assert torch.equal(full_logprobs.logprobs, expected)
+     assert torch.equal(
+         chunked_logprobs.selected_token_ranks,
+         full_logprobs.selected_token_ranks,
+diff --git a/tests/v1/worker/test_gpu_tilelang_logprob_softmax.py b/tests/v1/worker/test_gpu_tilelang_logprob_softmax.py
+index c1ae68722f..78cfa84f2c 100644
+--- a/tests/v1/worker/test_gpu_tilelang_logprob_softmax.py
++++ b/tests/v1/worker/test_gpu_tilelang_logprob_softmax.py
+@@ -552,3 +552,147 @@ def test_runner_declares_the_launched_calls(logits_mode):
+         for layout in ("aligned", "odd_stride"):
+             logits = _logits(values, dtype, layout)
+             _check(logits, _ids(values, 21, 9), f"declared {dtype} {layout}")
++
++
++@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16, torch.float32])
++@pytest.mark.parametrize("id_dtype", [torch.int32, torch.int64])
++@pytest.mark.parametrize("masked", [False, True])
++@pytest.mark.parametrize("layout", ["dense", "padded", "strided"])
++def test_selected_logits_preserve_values_and_strides(dtype, id_dtype, masked, layout):
++    """Gather, FP32 conversion and invalid-column masking share one store."""
++    rows, vocab, cols = {
++        "dense": (1, VOCAB, 1),
++        "padded": (17, 8193, 21),
++        "strided": (3, VOCAB, 2100),
++    }[layout]
++    step = 2 if layout == "strided" else 1
++    backing = torch.randn(rows, vocab * step + 7, device=DEVICE, dtype=dtype)
++    logits = backing[:, 1 : 1 + vocab * step : step]
++    logits[:, :7] = torch.tensor(
++        [-0.0, 0.0, -torch.inf, torch.inf, torch.nan, 1.0, -1.0],
++        dtype=dtype,
++        device=DEVICE,
++    )
++    if dtype == torch.float32:
++        logits[:, 7] = 2.0**-149
++    before = backing.view(
++        torch.int16 if dtype != torch.float32 else torch.int32
++    ).clone()
++    raw_ids = torch.randint(
++        vocab, (rows, cols * step + 3), device=DEVICE, dtype=id_dtype
++    )
++    ids = raw_ids[:, 1 : 1 + cols * step : step]
++    ids[:, : min(cols, 8)] = torch.arange(min(cols, 8), device=DEVICE, dtype=id_dtype)
++    raw_valid = torch.rand(rows, cols * step + 3, device=DEVICE) > 0.3
++    valid = raw_valid[:, 1 : 1 + cols * step : step] if masked else None
++    expected = logits.gather(1, ids.long()).float()
++    if masked:
++        expected.masked_fill_(~valid, -torch.inf)
++        # Invalid slots may contain any bits: the kernel must not dereference them.
++        ids.masked_fill_(~valid, -2147483648)
++    ids_before = raw_ids.clone()
++    valid_before = raw_valid.clone()
++    actual = tilelang_logprob.gather_logits(logits, ids, valid)
++    assert actual.dtype == torch.float32 and actual.is_contiguous()
++    assert torch.equal(actual.isnan(), expected.isnan())
++    finite_or_inf = ~expected.isnan()
++    assert torch.equal(_bits(actual)[finite_or_inf], _bits(expected)[finite_or_inf])
++    assert torch.equal(backing.view(before.dtype), before)
++    assert torch.equal(raw_ids, ids_before)
++    assert torch.equal(raw_valid, valid_before)
++
++
++def test_selected_logits_graph_replays_new_values_ids_and_masks():
++    logits = torch.randn(96, VOCAB + 7, device=DEVICE)[:, :VOCAB]
++    ids = torch.randint(VOCAB, (96, 33), device=DEVICE)
++    valid = torch.rand(ids.shape, device=DEVICE) > 0.3
++    tilelang_logprob.gather_logits(logits, ids, valid)
++    graph = torch.cuda.CUDAGraph()
++    with torch.cuda.graph(graph):
++        output = tilelang_logprob.gather_logits(logits, ids, valid)
++    logits.normal_()
++    ids.random_(VOCAB)
++    valid.logical_not_()
++    graph.replay()
++    expected = logits.gather(1, ids).masked_fill(~valid, -torch.inf)
++    assert torch.equal(output.view(torch.int32), expected.view(torch.int32))
++
++
++@pytest.mark.parametrize("shape", [(0, 21), (3, 0)])
++def test_selected_logits_empty_dimensions(shape):
++    logits = torch.empty(shape[0], VOCAB, device=DEVICE)
++    ids = torch.empty(shape, device=DEVICE, dtype=torch.int64)
++    result = tilelang_logprob.gather_logits(logits, ids)
++    assert result.shape == shape and result.dtype == torch.float32
++
++
++def test_selected_logits_reject_unsupported_inputs():
++    logits = torch.empty(2, 17, device=DEVICE)
++    ids = torch.zeros(2, 3, device=DEVICE, dtype=torch.int64)
++    for bad in (logits.double(), logits.int()):
++        with pytest.raises(TypeError, match="logits"):
++            tilelang_logprob.gather_logits(bad, ids)
++    with pytest.raises(TypeError, match="token_ids"):
++        tilelang_logprob.gather_logits(logits, ids.float())
++    with pytest.raises(ValueError, match="row count"):
++        tilelang_logprob.gather_logits(logits, ids[:1])
++    with pytest.raises(ValueError, match="valid"):
++        tilelang_logprob.gather_logits(logits, ids, torch.ones_like(ids))
++    with pytest.raises(ValueError, match="CUDA"):
++        tilelang_logprob.gather_logits(logits.cpu(), ids.cpu())
++
++
++def test_selected_logits_are_prepared_before_cache_freeze(monkeypatch):
++    import importlib
++
++    import tilelang.cache
++
++    from vllm.model_executor.warmup.jit_warmup import JitWarmupRegistry
++    from vllm.models.deepseek_v4_1.tilelang import prepare
++
++    cache_module = importlib.import_module(tilelang.cache.freeze.__module__)
++    monkeypatch.setattr(cache_module, "_frozen_reason", None)
++    kernel = tilelang_logprob.gather_logits_kernel
++    monkeypatch.setattr(kernel, "_kernel_cache", {})
++    monkeypatch.setattr(kernel, "_call_form_cache", type(kernel._call_form_cache)())
++    monkeypatch.setattr(tls, "_KERNELS", {})
++    registry = JitWarmupRegistry(None)
++    pairs = [(dtype, VOCAB) for dtype in (torch.float16, torch.bfloat16, torch.float32)]
++    with registry.activate():
++        logprob.register_topk_scores_warmup(
++            logits=pairs, vocab_size=VOCAB, logits_mode=True
++        )
++    calls = [
++        call
++        for call in prepare.declared_calls(registry)
++        if call[0] is tilelang_logprob.gather_logits_kernel
++    ]
++    assert len(calls) == 12
++    prepare.prepare_declared(registry)
++    # The worker freezes this cache at startup: every runtime call must be declared.
++    prepare.freeze("selected logits warmup test")
++    for dtype, _ in pairs:
++        for id_dtype in (torch.int32, torch.int64):
++            logits = torch.randn(3, 257, device=DEVICE, dtype=dtype)
++            ids = torch.randint(257, (3, 9), device=DEVICE, dtype=id_dtype)
++            valid = torch.ones_like(ids, dtype=torch.bool)
++            for mask in (None, valid):
++                actual = tilelang_logprob.gather_logits(logits, ids, mask)
++                assert torch.equal(actual, logits.gather(1, ids.long()).float())
++
++
++@pytest.mark.parametrize("mode", ["raw_logits", "processed_logits"])
++@pytest.mark.parametrize("num_logprobs", [0, 5])
++def test_prompt_logits_cross_chunk_boundary(mode, num_logprobs):
++    from vllm.v1.worker.gpu.sample.prompt_logprob import (
++        compute_prompt_logprobs_with_chunking,
++    )
++
++    logits = torch.randn(1027, 257, device=DEVICE)
++    ids = torch.arange(1027, device=DEVICE) % 257
++    out_ids, scores, ranks = compute_prompt_logprobs_with_chunking(
++        ids, logits, lambda hidden: hidden, num_logprobs, mode
++    )
++    assert torch.equal(out_ids[:, 0], ids)
++    assert torch.equal(scores, logits.gather(1, out_ids))
++    assert torch.equal(ranks, (logits >= logits.gather(1, ids[:, None])).sum(-1))
+diff --git a/tests/v1/worker/test_gpu_verified_logprob_token_ids.py b/tests/v1/worker/test_gpu_verified_logprob_token_ids.py
+index b7d799aff4..ade21b3b7c 100644
+--- a/tests/v1/worker/test_gpu_verified_logprob_token_ids.py
++++ b/tests/v1/worker/test_gpu_verified_logprob_token_ids.py
+@@ -162,6 +162,15 @@ def host_runner(monkeypatch: pytest.MonkeyPatch) -> None:
+         ),
+     )
+     monkeypatch.setattr(tilelang_logprob, "token_ranks", _token_ranks)
++    monkeypatch.setattr(
++        tilelang_logprob,
++        "gather_logits",
++        lambda logits, ids, valid=None: (
++            logits.gather(1, ids.long()).float()
++            if valid is None
++            else logits.gather(1, ids.long()).float().masked_fill(~valid, -torch.inf)
++        ),
++    )
+     monkeypatch.setattr(logprob, "compute_token_logprobs", _compute_token_logprobs)
+     # The TileLang launches the samplers reach, as torch on the host.
+     monkeypatch.setattr(tilelang_inputs, "flatten_sampled", _flatten_sampled_rows)
+diff --git a/vllm/v1/worker/gpu/sample/logprob.py b/vllm/v1/worker/gpu/sample/logprob.py
+index ecae13a04c..1fa3436fc3 100644
+--- a/vllm/v1/worker/gpu/sample/logprob.py
++++ b/vllm/v1/worker/gpu/sample/logprob.py
+@@ -20,9 +20,10 @@ def register_topk_scores_warmup(
+ ) -> None:
+     """Register ``compute_topk_scores`` for ``vocab_size``-wide logits given as
+     ``(dtype, row stride)`` pairs: the top-k token ids (both paths' layouts), the
+-    selected tokens' ranks, and their log-softmax unless ``logits_mode``."""
++    selected tokens' ranks, and their log-softmax or FP32 gathered logits."""
+     from vllm.config import get_current_vllm_config_or_none
+     from vllm.v1.worker.gpu.sample.tilelang_logprob import (
++        register_gather_logits,
+         register_log_softmax,
+         register_ranks,
+     )
+@@ -40,7 +41,9 @@ def register_topk_scores_warmup(
+         )
+     tilelang_topk_ids.register_topk_ids(logits)
+     register_ranks(logits, vocab_size)
+-    if not logits_mode:
++    if logits_mode:
++        register_gather_logits(logits)
++    else:
+         register_log_softmax(logits)
+ 
+ 
+@@ -87,7 +90,9 @@ def compute_topk_scores(
+         else:
+             logprob_token_ids = sampled_token_ids.unsqueeze(-1)
+         if logits_mode:
+-            scores = logits.gather(-1, logprob_token_ids).to(torch.float32)
++            from vllm.v1.worker.gpu.sample.tilelang_logprob import gather_logits
++
++            scores = gather_logits(logits, logprob_token_ids)
+         else:
+             scores = compute_token_logprobs(logits, logprob_token_ids)
+     else:
+@@ -119,8 +124,9 @@ def compute_topk_scores(
+             num_logprobs,
+         )
+         if logits_mode:
+-            scores = logits.gather(-1, logprob_token_ids).to(torch.float32)
+-            scores = scores.masked_fill(~valid_mask, float("-inf"))
++            from vllm.v1.worker.gpu.sample.tilelang_logprob import gather_logits
++
++            scores = gather_logits(logits, logprob_token_ids, valid_mask)
+         else:
+             scores = compute_token_logprobs(logits, logprob_token_ids, valid_mask)
+ 
+diff --git a/vllm/v1/worker/gpu/sample/tilelang_logprob.py b/vllm/v1/worker/gpu/sample/tilelang_logprob.py
+index 12ddaf5328..c9b4dfe715 100644
+--- a/vllm/v1/worker/gpu/sample/tilelang_logprob.py
++++ b/vllm/v1/worker/gpu/sample/tilelang_logprob.py
+@@ -406,3 +406,93 @@ def topk_log_softmax(
+         token_ids,
+         token_ids[:1].view(torch.bool) if valid is None else valid,
+     )
++
++
++@tilelang.jit(pass_configs=_PASS)
++def gather_logits_kernel(dtype: str, id_dtype: str, masked: bool):
++    rows, vocab, cols = T.dynamic("rows, vocab, cols")
++    logit_row, logit_col = T.dynamic("logit_row, logit_col", "int64")
++    id_row, id_col = T.dynamic("id_row, id_col", "int64")
++    valid_rows, valid_cols = T.dynamic("valid_rows, valid_cols")
++    valid_row, valid_col = T.dynamic("valid_row, valid_col", "int64")
++    block = 256
++
++    @T.prim_func
++    def gather_logits(
++        output: T.Tensor((rows, cols), "float32"),
++        logits: T.StridedTensor((rows, vocab), (logit_row, logit_col), dtype),
++        token_ids: T.StridedTensor((rows, cols), (id_row, id_col), id_dtype),
++        valid: T.StridedTensor(
++            (valid_rows, valid_cols), (valid_row, valid_col), "bool"
++        ),
++    ):
++        with T.Kernel(T.ceildiv(rows * cols, block), threads=block) as bx:
++            for lane in T.Parallel(block):
++                index = bx * block + lane
++                if index < rows * cols:
++                    row = T.cast(index // cols, "int64")
++                    col = T.cast(index % cols, "int64")
++                    take = T.alloc_var("bool", init=True)
++                    if masked:
++                        take = valid[row, col]
++                    value = T.alloc_var("float32", init=-T.infinity("float32"))
++                    if take:
++                        value = T.cast(logits[row, token_ids[row, col]], "float32")
++                    output[row, col] = value
++
++    return gather_logits
++
++
++def register_gather_logits(logits: Sequence[tuple[torch.dtype, int]]) -> None:
++    """Prepare both id types and validity layouts; shapes and strides are dynamic."""
++    dtypes = tuple(dict.fromkeys(dtype for dtype, _ in logits))
++    declare(
++        lambda: [
++            _call(gather_logits_kernel, _DTYPES[dtype], _DTYPES[id_dtype], masked)
++            for dtype in dtypes
++            for id_dtype in (torch.int32, torch.int64)
++            for masked in (False, True)
++        ]
++    )
++
++
++def gather_logits(
++    logits: torch.Tensor, token_ids: torch.Tensor, valid: torch.Tensor | None = None
++) -> torch.Tensor:
++    """Gather selected logits as FP32, storing -inf in invalid custom-id columns.
++
++    Invalid columns do not dereference their token ids. Valid ids have already
++    passed the request's vocabulary-bound validation.
++    """
++    if logits.ndim != 2 or token_ids.ndim != 2:
++        raise ValueError("logits and token_ids must be matrices")
++    if logits.shape[0] != token_ids.shape[0]:
++        raise ValueError("logits and token_ids must have the same row count")
++    if logits.dtype not in (torch.float16, torch.bfloat16, torch.float32):
++        raise TypeError("logits must be FP16, BF16 or FP32")
++    if token_ids.dtype not in (torch.int32, torch.int64):
++        raise TypeError("token_ids must be int32 or int64")
++    if not logits.is_cuda or token_ids.device != logits.device:
++        raise ValueError("logits and token_ids must be on the same CUDA device")
++    if valid is not None and (
++        valid.shape != token_ids.shape
++        or valid.dtype != torch.bool
++        or valid.device != logits.device
++    ):
++        raise ValueError("valid must be a boolean CUDA matrix matching token_ids")
++    output = torch.empty(token_ids.shape, dtype=torch.float32, device=logits.device)
++    if output.numel():
++        kernel = _kernel(
++            gather_logits_kernel,
++            _DTYPES[logits.dtype],
++            _DTYPES[token_ids.dtype],
++            valid is not None,
++        )
++        # The unmasked specialization never reads the dummy validity tensor.
++        kernel(
++            output,
++            logits,
++            token_ids,
++            output.view(torch.bool) if valid is None else valid,
++        )
++    return output
+-- 
+2.54.0 (Apple Git-157)
+
