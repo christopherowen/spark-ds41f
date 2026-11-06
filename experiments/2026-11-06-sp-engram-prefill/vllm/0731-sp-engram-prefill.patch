@@ -1,4 +1,4 @@
-From b7cb5ccd2d3694a2ebf85d5f95138caf1616ce2c Mon Sep 17 00:00:00 2001
+From 1f457d1f3e5b835781e18437da8cb527ffd97cd5 Mon Sep 17 00:00:00 2001
 From: Christopher Owen <3221756+christopherowen@users.noreply.github.com>
 Date: Fri, 6 Nov 2026 09:38:52 +0000
 Subject: [PATCH] Sequence-parallel Engram prefill column exchange and sliced
@@ -27,19 +27,19 @@ tests/models/test_deepseek_v41_sp_project_reduce_scatter.py, and
 tests/models/test_deepseek_v4_1_engram.py.
 Upstream status: local DeepSeek V4.1 sequence-parallel prefill optimization.
 ---
- ..._deepseek_v41_sp_project_reduce_scatter.py |  69 ++
+ ..._deepseek_v41_sp_project_reduce_scatter.py |  70 ++
  tests/models/test_deepseek_v4_1_sp_prefill.py | 900 ++++++++++++++++++
  .../device_communicators/pynccl.py            |  16 +-
  vllm/models/deepseek_v4_1/common/engram.py    | 242 ++++-
  vllm/models/deepseek_v4_1/sp_prefill.py       | 119 ++-
  vllm/models/deepseek_v4_1/tilelang/linear.py  | 157 ++-
- 6 files changed, 1448 insertions(+), 55 deletions(-)
+ 6 files changed, 1449 insertions(+), 55 deletions(-)
 
 diff --git a/tests/models/test_deepseek_v41_sp_project_reduce_scatter.py b/tests/models/test_deepseek_v41_sp_project_reduce_scatter.py
-index d8226e49c..7b6eeac93 100644
+index d8226e49c..e7d3ac77f 100644
 --- a/tests/models/test_deepseek_v41_sp_project_reduce_scatter.py
 +++ b/tests/models/test_deepseek_v41_sp_project_reduce_scatter.py
-@@ -411,3 +411,72 @@ def test_row_all_to_all_over_cabled_pairs(topology, world, short, rows=10):
+@@ -411,3 +411,73 @@ def test_row_all_to_all_over_cabled_pairs(topology, world, short, rows=10):
              assert fabric.pairs <= ring, sorted(map(sorted, fabric.pairs - ring))
          else:
              assert fabric.pairs - ring, "no pair two apart exchanged directly"
@@ -104,13 +104,14 @@ index d8226e49c..7b6eeac93 100644
 +    for thread in threads:
 +        thread.join()
 +    assert not errors, errors
++    local = sp_prefill.SPRows(num_tokens=total, world_size=world, rank=0).local_rows
 +    for me in range(world):
-+        real = max(0, min(rows, total - me * rows))
++        real = max(0, min(local, total - me * local))
 +        for source in range(world):
 +            got = outputs[me][source]
 +            assert torch.equal(
 +                got[:real].view(torch.int16),
-+                inputs[source][me * rows : me * rows + real].view(torch.int16),
++                inputs[source][me * local : me * local + real].view(torch.int16),
 +            )
 diff --git a/tests/models/test_deepseek_v4_1_sp_prefill.py b/tests/models/test_deepseek_v4_1_sp_prefill.py
 index eef2cfc19..022407b84 100644
