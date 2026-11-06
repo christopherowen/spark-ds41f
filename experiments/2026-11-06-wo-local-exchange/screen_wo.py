@@ -3,15 +3,13 @@
 Verifies 100% bit-identical outputs (int16 view equality across finite, signed-zero,
 and non-finite NaN/+Inf/-Inf inputs) between the baseline full-row SP WO path and
 the candidate MXFP8 o_lora local-exchange path on real sm_121a TileLang kernels,
-and measures per-rank local compute latency under warm-L2 and 128 MiB L2-wash modes.
+and measures per-rank local compute latency under warm-L2 and 128 MiB L2-wash modes
+across TP3 (2048, 4096, 6144, 8192) and TP4 (2048, 4096, 8192, 16384) prefill shapes.
 """
 import argparse
 import json
-import math
 import statistics
 import time
-import traceback
-from types import SimpleNamespace
 
 import torch
 from torch import nn
@@ -165,7 +163,12 @@ def main() -> int:
     group_input_width = 4096  # 8 heads/group * 512 head_dim
     gen = torch.Generator(device=device).manual_seed(4106)
 
-    for world, tokens in ((3, 6144), (4, 16384)):
+    shapes_by_world = {
+        3: (2048, 4096, 6144, 8192),
+        4: (2048, 4096, 8192, 16384),
+    }
+
+    for world, token_shapes in shapes_by_world.items():
         sp_rank_groups = (3, 3, 2) if world == 3 else (2, 2, 2, 2)
         projs: list[TileLangWOProjection] = []
         for r, groups in enumerate(sp_rank_groups):
@@ -229,8 +232,12 @@ def main() -> int:
                 for peer in range(world)
             )
 
-        # 1. Bit-exactness verification across aligned and unaligned/non-finite token counts
-        for probe_tokens, nonfinite in ((tokens, False), (205 if world == 4 else 206, True)):
+        # 1. Bit-exactness verification across aligned, unaligned, and non-finite token counts
+        gate_probes = [
+            (206 if world == 3 else 205, True),
+            *((t, False) for t in token_shapes),
+        ]
+        for probe_tokens, nonfinite in gate_probes:
             sp0 = sp_prefill.SPRows(probe_tokens, world, 0)
             padded_rows = sp0.padded_rows
             local_rows = sp0.local_rows
@@ -304,6 +311,7 @@ def main() -> int:
             finally:
                 sp_prefill.SPRows.exchange_into = orig_exchange
 
+            del inputs, full_outputs, sent_xq, sent_sf
             emit(
                 kind="gate",
                 world=world,
@@ -312,96 +320,124 @@ def main() -> int:
                 bits_equal=True,
             )
 
-        # 2. Per-rank compute timing: baseline sliced full-row WO vs candidate local-shard WO
-        local_rows = tokens // world
-        for r in sorted(set(range(world)), key=lambda idx: (sp_rank_groups[idx], idx)):
-            # Measure distinct rank profiles (Rank 0 [3 groups] and Rank 2 [2 groups] on TP3; Rank 0 [2 groups] on TP4)
-            if world == 3 and r == 1:
-                continue
-            if world == 4 and r > 0:
-                continue
+        # 2. Per-rank compute timing across all token shapes
+        distinct_ranks = (0, 2) if world == 3 else (0,)
+        for r in distinct_ranks:
             proj = projs[r]
             groups = sp_rank_groups[r]
             cols_r = groups * rank_width
             sf_bytes_r = 4 * scale_words(cols_r)
-            o_r = (
-                torch.randn((tokens, groups * 8, 512), generator=gen, device=device) * 0.5
+            max_tokens = max(token_shapes)
+            o_full = (
+                torch.randn((max_tokens, groups * 8, 512), generator=gen, device=device) * 0.5
             ).bfloat16()
 
-            # Baseline compute: 2 slices * world owners = 2*world calls to proj(o[start:stop], dest)
-            base_send = torch.empty((world, local_rows, hidden), dtype=torch.bfloat16, device=device)
-            base_parts = torch.empty_like(base_send)
-            bounds = [local_rows * i // 2 for i in range(3)]
+            for tokens in token_shapes:
+                sp_r = sp_prefill.SPRows(tokens, world, r)
+                local_rows = sp_r.local_rows
+                padded_rows = sp_r.padded_rows
+                real_rows = sp_r.real_rows
+                o_r = o_full[:tokens]
 
-            def run_baseline():
-                for lo, hi in zip(bounds, bounds[1:]):
-                    for owner in range(world):
-                        dest = base_parts if owner == r else base_send
-                        start, stop = owner * local_rows + lo, owner * local_rows + hi
-                        proj(o_r[start:stop], dest[owner, lo:hi])
+                base_send = torch.empty((world, local_rows, hidden), dtype=torch.bfloat16, device=device)
+                base_parts = torch.empty_like(base_send)
+                bounds = [local_rows * i // 2 for i in range(3)]
 
-            # Candidate compute: 1 call to proj.a on all T rows + world calls to _project_sp_shard on local_rows
-            xq_send = torch.empty((world, local_rows, cols_r), dtype=torch.float8_e4m3fn, device=device)
-            sf_send = torch.empty((world, local_rows, sf_bytes_r), dtype=torch.uint8, device=device)
-            xq_peers = [
-                xq_send[r]
-                if peer == r
-                else torch.empty(
-                    (local_rows, sp_rank_groups[peer] * rank_width),
-                    dtype=torch.float8_e4m3fn,
-                    device=device,
-                )
-                for peer in range(world)
-            ]
-            sf_peers = [
-                sf_send[r]
-                if peer == r
-                else torch.empty(
-                    (local_rows, 4 * scale_words(sp_rank_groups[peer] * rank_width)),
-                    dtype=torch.uint8,
-                    device=device,
-                )
-                for peer in range(world)
-            ]
-            cand_parts = torch.empty((world, local_rows, hidden), dtype=torch.bfloat16, device=device)
+                def run_baseline(
+                    o_r=o_r,
+                    base_send=base_send,
+                    base_parts=base_parts,
+                    bounds=bounds,
+                    local_rows=local_rows,
+                    tokens=tokens,
+                ):
+                    for lo, hi in zip(bounds, bounds[1:]):
+                        for owner in range(world):
+                            dest = base_parts if owner == r else base_send
+                            start, stop = owner * local_rows + lo, owner * local_rows + hi
+                            real = max(0, min(stop, tokens) - start)
+                            if real:
+                                proj(o_r[start : start + real], dest[owner, lo : lo + real])
+                            if lo + real < hi:
+                                columns.zero_(dest[owner, lo + real : hi])
 
-            def run_candidate():
-                proj.a(
-                    o_r.view(tokens, -1),
-                    xq_send.view(tokens, cols_r),
-                    sf_send.view(tokens, sf_bytes_r),
-                    None,
-                )
-                proj._project_sp_shard(r, xq_send[r], sf_send[r], cand_parts[r], local_rows, local_rows)
-                for peer in range(world):
-                    if peer != r:
-                        proj._project_sp_shard(
-                            peer, xq_peers[peer], sf_peers[peer], cand_parts[peer], local_rows, local_rows
-                        )
-
-            variants = [("parent_sliced_full_rows", run_baseline), ("candidate_wo_local_exchange", run_candidate)]
-            if a.boot.endswith("2"):
-                variants = list(reversed(variants))
-
-            for cache_mode, wash_buf in (("warm", None), ("128MiB_wash", flush)):
-                for vname, fn in variants:
-                    samples = timings(fn, wash_buf)
-                    emit(
-                        kind="timing",
-                        world=world,
-                        rank=r,
-                        groups=groups,
-                        tokens=tokens,
-                        local_rows=local_rows,
-                        cache_mode=cache_mode,
-                        variant=vname,
-                        mean_ms=statistics.mean(samples),
-                        median_ms=statistics.median(samples),
-                        stdev_ms=statistics.stdev(samples),
-                        min_ms=min(samples),
-                        max_ms=max(samples),
-                        samples_ms=samples,
+                xq_send = torch.empty((world, local_rows, cols_r), dtype=torch.float8_e4m3fn, device=device)
+                sf_send = torch.empty((world, local_rows, sf_bytes_r), dtype=torch.uint8, device=device)
+                xq_peers = [
+                    xq_send[r]
+                    if peer == r
+                    else torch.empty(
+                        (local_rows, sp_rank_groups[peer] * rank_width),
+                        dtype=torch.float8_e4m3fn,
+                        device=device,
                     )
+                    for peer in range(world)
+                ]
+                sf_peers = [
+                    sf_send[r]
+                    if peer == r
+                    else torch.empty(
+                        (local_rows, 4 * scale_words(sp_rank_groups[peer] * rank_width)),
+                        dtype=torch.uint8,
+                        device=device,
+                    )
+                    for peer in range(world)
+                ]
+                cand_parts = torch.empty((world, local_rows, hidden), dtype=torch.bfloat16, device=device)
+
+                def run_candidate(
+                    o_r=o_r,
+                    xq_send=xq_send,
+                    sf_send=sf_send,
+                    xq_peers=xq_peers,
+                    sf_peers=sf_peers,
+                    cand_parts=cand_parts,
+                    padded_rows=padded_rows,
+                    local_rows=local_rows,
+                    real_rows=real_rows,
+                    tokens=tokens,
+                ):
+                    xq_flat = xq_send.view(padded_rows, cols_r)
+                    sf_flat = sf_send.view(padded_rows, sf_bytes_r)
+                    proj.a(o_r.view(tokens, -1), xq_flat[:tokens], sf_flat[:tokens], None)
+                    if tokens < padded_rows:
+                        columns.zero_(xq_flat[tokens:])
+                        columns.zero_(sf_flat[tokens:])
+                    proj._project_sp_shard(r, xq_send[r], sf_send[r], cand_parts[r], real_rows, local_rows)
+                    for peer in range(world):
+                        if peer != r:
+                            proj._project_sp_shard(
+                                peer, xq_peers[peer], sf_peers[peer], cand_parts[peer], real_rows, local_rows
+                            )
+
+                variants = [("parent_sliced_full_rows", run_baseline), ("candidate_wo_local_exchange", run_candidate)]
+                if a.boot.endswith("2"):
+                    variants = list(reversed(variants))
+
+                for cache_mode, wash_buf in (("warm", None), ("128MiB_wash", flush)):
+                    for vname, fn in variants:
+                        samples = timings(fn, wash_buf)
+                        emit(
+                            kind="timing",
+                            world=world,
+                            rank=r,
+                            groups=groups,
+                            tokens=tokens,
+                            local_rows=local_rows,
+                            real_rows=real_rows,
+                            cache_mode=cache_mode,
+                            variant=vname,
+                            mean_ms=statistics.mean(samples),
+                            median_ms=statistics.median(samples),
+                            stdev_ms=statistics.stdev(samples),
+                            min_ms=min(samples),
+                            max_ms=max(samples),
+                            samples_ms=samples,
+                        )
+                del base_send, base_parts, xq_send, sf_send, xq_peers, sf_peers, cand_parts
+            del o_full
+        del projs
+        torch.cuda.empty_cache()
 
     return 0
 

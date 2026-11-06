@@ -1,4 +1,4 @@
-From b622187409c9916868da76407007abd79a7570d7 Mon Sep 17 00:00:00 2001
+From 9e916868edcec75548e869ce7e835802464a0967 Mon Sep 17 00:00:00 2001
 From: Christopher Owen <3221756+christopherowen@users.noreply.github.com>
 Date: Fri, 6 Nov 2026 00:00:00 +0000
 Subject: [PATCH 731/731] perf(dsv41): exchange WO-A MXFP8 rows and project
@@ -24,18 +24,18 @@ tests/models/test_deepseek_v4_1_sp_prefill.py, and
 tests/models/test_deepseek_v4_1_l2_schedule.py.
 Upstream status: local DeepSeek-V4.1 sequence-parallel prefill optimization.
 ---
- tests/models/test_deepseek_v4_1_attention.py | 539 +++++++++++++++++++
+ tests/models/test_deepseek_v4_1_attention.py | 543 +++++++++++++++++++
  vllm/models/deepseek_v4_1/attention.py       |  40 +-
  vllm/models/deepseek_v4_1/sp_prefill.py      |  46 +-
  vllm/models/deepseek_v4_1/tilelang/gemm.py   |   7 +-
  vllm/models/deepseek_v4_1/tilelang/wo.py     | 251 ++++++++-
- 5 files changed, 856 insertions(+), 27 deletions(-)
+ 5 files changed, 860 insertions(+), 27 deletions(-)
 
 diff --git a/tests/models/test_deepseek_v4_1_attention.py b/tests/models/test_deepseek_v4_1_attention.py
-index 1ad9ab09b..dde86aff3 100644
+index 1ad9ab09b..672e47016 100644
 --- a/tests/models/test_deepseek_v4_1_attention.py
 +++ b/tests/models/test_deepseek_v4_1_attention.py
-@@ -877,3 +877,542 @@ def test_tp3_rank2_trims_zero_padded_output_group(monkeypatch):
+@@ -877,3 +877,546 @@ def test_tp3_rank2_trims_zero_padded_output_group(monkeypatch):
      assert layer_r2.wo_b.weight.shape == (5120, 2048)
      assert layer_r2.wo_b.weight_scale_inv.shape == (5120 // 32, 2048 // 32)
      assert layer_r2._wo_projection_weights.groups == 2
@@ -459,7 +459,7 @@ index 1ad9ab09b..dde86aff3 100644
 +
 +
 +@pytest.mark.parametrize("world_size", [3, 4])
-+def test_sp_wo_local_exchange_matches_native_tilelang_kernels_on_sm12x(world_size):
++def test_sp_wo_local_exchange_matches_native_tilelang_kernels_on_sm12x(monkeypatch, world_size):
 +    if not torch.cuda.is_available() or torch.cuda.get_device_capability()[0] != 12:
 +        pytest.skip("DeepSeek-V4.1 TileLang WO kernels require SM12x")
 +    pytest.importorskip("tilelang")
@@ -526,6 +526,7 @@ index 1ad9ab09b..dde86aff3 100644
 +            for c, call in proj._sp_prefill_calls().items()
 +        }
 +        proj.b.tilelang_prefill = p_calls[cols]
++        proj.b.tilelang_decode_rows = 128
 +        projections.append((proj, p_calls))
 +
 +    for rank, (proj, p_calls) in enumerate(projections):
@@ -539,6 +540,9 @@ index 1ad9ab09b..dde86aff3 100644
 +            )
 +            for peer in range(world_size)
 +        )
++
++    ws = torch.empty(128 * 1024 * 1024, dtype=torch.uint8, device="cuda")
++    monkeypatch.setattr(tl_wo, "current_preallocated_workspace", lambda: ws)
 +
 +    for tokens in (205, 206, 207, 2048):
 +        padded = sp_prefill.SPRows(tokens, world_size, 0).padded_rows
