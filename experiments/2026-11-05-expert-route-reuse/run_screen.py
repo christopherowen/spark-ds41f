@@ -101,7 +101,7 @@ def main():
         if target['name'] != node['name']:
             raise RuntimeError('fan transport must stay on this node')
         return subprocess.run(argv, capture_output=True, text=True, timeout=30)
-    bench.run_ssh = local_transport
+    bench.hottest_zone_c.__globals__["run_ssh"] = bench.run_ssh = local_transport
     out = Path(args.out).resolve()
     out.mkdir(parents=True, exist_ok=False)
     state = {'deployment_commit': revision, 'process_id': args.process_id,
