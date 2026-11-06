@@ -254,3 +254,26 @@ see `receipts/native-reuse-image-1.txt`. An independent bounded CPU check then
 verified all 7810 parent source files against the frozen Git tree and retained the
 two compiled-extension hashes in `receipts/parent-source-check-1.txt`. The candidate
 image and its GPU smoke remain pending.
+
+
+## Fixed long-context retrieval companion
+
+`prepare_needle.py` prepares the immutable corpus on CPU with the exact checkpoint
+1017 native `deepseek_v41` tokenizer. It archives UTF-8 prompt bytes, little-endian
+32-bit chat token IDs, source/tokenizer hashes, sizing attempts, expected values,
+and actual prefix token depths. Three independently seeded prompts per size each
+contain three unique registry values, at 10%, 50% and 90% of document characters.
+The requested lengths are 32768, 131072, 262144, 524288 and 1048576. Actual token
+counts are recorded; the largest reserves 256 context positions for generation.
+The generator refuses an existing output directory instead of changing fixtures.
+Bulk corpus files stay in remote results storage, outside Git.
+
+`needle-suite.json` uses the existing servebench model step, concurrency one,
+128 output tokens, greedy decoding and thinking disabled, through
+`bin/spark bench --suite`. This retains the ordinary live-identity, cooling, fan
+curve and memory gates. It is a quality companion, not a substitute for the
+release suite's streamed prefill rates or mixed-request TTFT. Fresh cache salts
+come from the existing model runner. `check_needle.py` decodes returned token IDs
+on CPU and requires both exact prompt-ID identity and the exact expected JSON
+mapping; it retains raw output text and individual value-presence diagnostics.
+Fixture creation and grader checks are preparation only, not model-quality proof.
