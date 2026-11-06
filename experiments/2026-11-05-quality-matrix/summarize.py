@@ -24,8 +24,9 @@ def main():
     if benchmark=='longbench':
         subprocess.run([sys.executable,str(HERE.parent/'2026-11-05-answer-quality/summarize.py'),str(root)],check=True)
         report=json.loads(target.read_text())
-        conditions=[json.loads((root/('answers-'+label+'-conditions.json')).read_text()) for label in LABELS]
-        report['timing_qualified']=all(not c['halted'] and not c['fan_stop_failures']
+        paths=[root/('answers-'+label+'-conditions.json') for label in LABELS]
+        conditions=[json.loads(p.read_text()) for p in paths if p.exists()]
+        report['timing_qualified']=bool(report.get('complete')) and len(conditions)==len(LABELS) and all(not c['halted'] and not c['fan_stop_failures']
             and not any(t.get('thermal_slowdown_ms') for t in c['thermal'].values())
             and fan_curve_ready(c.get('fan_curve',[]),c['thermal']) for c in conditions)
         report['timing_qualification_scope']='requires the repository performance fan curve on every measured node; historical guard success alone is insufficient'

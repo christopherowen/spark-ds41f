@@ -30,4 +30,12 @@ class TimingConditions(unittest.TestCase):
             with patch('sys.argv',['summarize.py',str(root)]),patch.object(summarize.subprocess,'run',side_effect=delegate):summarize.main()
             self.assertFalse(json.loads((root/'comparison.json').read_text())['timing_qualified'])
 
+    def test_incomplete_longbench_has_no_timing_qualification(self):
+        import summarize
+        with tempfile.TemporaryDirectory() as d:
+            root=Path(d);(root/'source.json').write_text(json.dumps({'benchmark':'longbench'}))
+            def delegate(*args,**kwargs):(root/'comparison.json').write_text(json.dumps({'complete':False}))
+            with patch('sys.argv',['summarize.py',str(root)]),patch.object(summarize.subprocess,'run',side_effect=delegate):summarize.main()
+            self.assertFalse(json.loads((root/'comparison.json').read_text())['timing_qualified'])
+
 if __name__=='__main__':unittest.main()
