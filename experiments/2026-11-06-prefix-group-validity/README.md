@@ -38,7 +38,8 @@ this experiment. No retention policy is changed here.
 
 ## Status
 
-Draft investigation. No serving change, GPU measurement, or performance claim.
+Draft investigation. Native SM121 GPU kernel and metadata verification completed on
+`dgx4`; full-model TP=3 serving recovery remains a multi-node hardware gate.
 Source proposal: https://github.com/christopherowen/vllm/pull/6 (draft).
 Deployment/evidence proposal: https://github.com/christopherowen/spark-ds41f/pull/931 (draft).
 The source branch is `feat/prefix-group-validity`; `base.json`, `source.json` and
@@ -134,3 +135,58 @@ credentials. The exact same commit was published through the existing
 authenticated GitHub API connection after matching every blob, the tree and
 commit hash. No credentials were copied to the node; `runs/source-publication.json`
 records the resulting identity.
+
+## Native SM121 GPU Verification and 2-Boot Benchmark (`dgx4`)
+
+Under an exclusive node-scoped lease on `dgx4` (`pool: dgx4-single`,
+`window: dgx4-prefix-group-validity-20261106`), the native SM121 TileLang 3-layer
+CED + SparseMLA reproducer, GPU metadata suites, HiSparse admission checks, and
+a 2-boot CED replay latency/accuracy benchmark (`bench_ced_replay.py`) ran inside
+the locked candidate-38 container (`sha256:213ba4df68d06665add7a26260c2321d55854a75b8a51ae71c72d0b97eac814b`)
+on `NVIDIA GB10` (`compute capability 12.1`) at deployment commit
+`2c3c406de461458184fcf29e655968a455eb3674` and source commit
+`c229ab4d2c4d18b3dcd157ff8a3ec7255108164e` (tree
+`11d1cf3e6ac525173683dbfcd3b08de1c945934d`). Complete receipts are recorded in
+`runs/step-b6-summary.json` and `runs/gpu-*.{json,txt}`.
+
+### GPU Test Suites
+
+| Arm | Step | Suite / Filter | Result | Wall Time | Receipt |
+| --- | --- | --- | --- | --- | --- |
+| Control | `gpu-control-ced-reproducer` | `test_deepseek_v41_ced_replay.py -k test_preempted_decode_rebuilds_original_decoder_history` | **4 failed** (expected old-fails finite mismatch) | 11.814 s | `runs/gpu-control-ced-reproducer.json` |
+| Control | `gpu-control-hisparse` | `test_prefix_caching.py -k hisparse_async_admission_requires_only_import_destinations` | **4 passed** | 12.295 s | `runs/gpu-control-hisparse.json` |
+| Candidate Boot 1 (`candidate-a`) | `gpu-candidate-a-ced-reproducer` | `test_deepseek_v41_ced_replay.py -k test_preempted_decode_rebuilds_original_decoder_history` | **4 passed** | 11.753 s | `runs/gpu-candidate-a-ced-reproducer.json` |
+| Candidate Boot 1 (`candidate-a`) | `gpu-candidate-a-ced-replay-full` | `test_deepseek_v41_ced_replay.py` | **32 passed** | 16.680 s | `runs/gpu-candidate-a-ced-replay-full.json` |
+| Candidate Boot 1 (`candidate-a`) | `gpu-candidate-a-ced-metadata` | `test_b12x_v41_ced_metadata.py` | **82 passed** | 11.338 s | `runs/gpu-candidate-a-ced-metadata.json` |
+| Candidate Boot 1 (`candidate-a`) | `gpu-candidate-a-glp` | `test_deepseek_v4_1_glp.py` | **48 passed, 1 skipped** (`GLP_TEST_FILE` unset) | 7.910 s | `runs/gpu-candidate-a-glp.json` |
+| Candidate Boot 1 (`candidate-a`) | `gpu-candidate-a-prefix-group-validity` | `test_prefix_group_validity.py` | **183 passed** | 7.000 s | `runs/gpu-candidate-a-prefix-group-validity.json` |
+| Candidate Boot 1 (`candidate-a`) | `gpu-candidate-a-hisparse` | `test_prefix_caching.py -k hisparse_async_admission_requires_only_import_destinations` | **4 passed** | 11.974 s | `runs/gpu-candidate-a-hisparse.json` |
+| Candidate Boot 2 (`candidate-b`) | `gpu-candidate-b-ced-reproducer` | `test_deepseek_v41_ced_replay.py -k test_preempted_decode_rebuilds_original_decoder_history` | **4 passed** | 23.562 s | `runs/gpu-candidate-b-ced-reproducer.json` |
+| Candidate Boot 2 (`candidate-b`) | `gpu-candidate-b-ced-replay-full` | `test_deepseek_v41_ced_replay.py` | **32 passed** | 16.485 s | `runs/gpu-candidate-b-ced-replay-full.json` |
+| Candidate Boot 2 (`candidate-b`) | `gpu-candidate-b-ced-metadata` | `test_b12x_v41_ced_metadata.py` | **82 passed** | 28.061 s | `runs/gpu-candidate-b-ced-metadata.json` |
+| Candidate Boot 2 (`candidate-b`) | `gpu-candidate-b-glp` | `test_deepseek_v4_1_glp.py` | **48 passed, 1 skipped** (`GLP_TEST_FILE` unset) | 7.912 s | `runs/gpu-candidate-b-glp.json` |
+| Candidate Boot 2 (`candidate-b`) | `gpu-candidate-b-prefix-group-validity` | `test_prefix_group_validity.py` | **183 passed** | 7.066 s | `runs/gpu-candidate-b-prefix-group-validity.json` |
+| Candidate Boot 2 (`candidate-b`) | `gpu-candidate-b-hisparse` | `test_prefix_caching.py -k hisparse_async_admission_requires_only_import_destinations` | **4 passed** | 11.844 s | `runs/gpu-candidate-b-hisparse.json` |
+
+### 2-Boot Native 3-Layer CED + SparseMLA Benchmark (`bench_ced_replay.py`)
+
+Each benchmark point runs 10 warmup iterations and 25 CUDA-event timed iterations
+on `NVIDIA GB10`.
+
+| Workload | Shape | Control Median (ms) | Control `exact_match` (`max_abs_diff`) | Candidate Boot 1 Median (ms) | Candidate Boot 2 Median (ms) | Candidate `exact_match` (`max_abs_diff`) |
+| --- | --- | --- | --- | --- | --- | --- |
+| Ordinary prompt/prefix chunking (`prompt_end=1152`) | `chunk=512, prefix=0` | 3.3498 | `true` (`0.0`) | 3.3414 | 3.3409 | `true` (`0.0`) |
+| Ordinary prompt/prefix chunking (`prompt_end=1152`) | `chunk=384, prefix=0` | 3.3921 | `true` (`0.0`) | 3.3847 | 3.3898 | `true` (`0.0`) |
+| Ordinary prompt/prefix chunking (`prompt_end=1152`) | `chunk=512, prefix=448` | 3.3357 | `true` (`0.0`) | 3.3307 | 3.3363 | `true` (`0.0`) |
+| Preempted decode recovery (`original_end=1024, hit=768`) | `gen=129, chunk=64` | 7.5623 | **`false` (`0.0029297`)** | 7.5266 | 7.5482 | **`true` (`0.0`)** |
+| Preempted decode recovery (`original_end=1024, hit=768`) | `gen=129, chunk=512` | 2.3666 | **`false` (`0.0029297`)** | 2.3856 | 2.3971 | **`true` (`0.0`)** |
+| Preempted decode recovery (`original_end=1024, hit=768`) | `gen=257, chunk=64` | 9.7148 | **`false` (`0.0024414`)** | 9.6954 | 9.7068 | **`true` (`0.0`)** |
+| Preempted decode recovery (`original_end=1024, hit=768`) | `gen=257, chunk=512` | 2.3835 | **`false` (`0.0024414`)** | 2.8455 | 2.8451 | **`true` (`0.0`)** |
+
+Ordinary prompt/prefix chunking is bit-identical and latency-neutral (`-0.07%` to
+`-0.26%` median delta). Under preempted decode recovery across the 256-token
+global-page and 128-token CED replay boundaries, the control produces finite
+corrupted decoder output (`max_abs_diff = 0.0029297` at `generated_rows=129` and
+`0.0024414` at `generated_rows=257`), whereas both candidate boots reconstruct
+bit-exact uninterrupted decoder output (`max_abs_diff = 0.0`) across all tested
+chunk sizes and generated suffixes.

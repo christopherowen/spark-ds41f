@@ -1,0 +1,238 @@
+FFFF                                                                     [100%]
+=================================== FAILURES ===================================
+_______ test_preempted_decode_rebuilds_original_decoder_history[64-129] ________
+
+generated_rows = 129, resumed_chunk = 64
+
+    @pytest.mark.parametrize("generated_rows", [129, 257])
+    @pytest.mark.parametrize("resumed_chunk", [64, 512])
+    def test_preempted_decode_rebuilds_original_decoder_history(
+        generated_rows, resumed_chunk
+    ):
+        """Losing private windows must not change an in-flight continuation.
+    
+        The first run completes one prompt and then computes accepted generated rows
+        one at a time. The second run has lost every private decoder page; its worker
+        input contains the same original prompt plus the accepted output suffix, as
+        MRV2 sends after preemption. All encoder rows are identical and untouched.
+        Comparing the final row traverses three real TileLang SWA layers, so dropping
+        the early generated rows cannot hide behind one layer's 128-token horizon.
+        """
+        original_end = 1024
+        total = original_end + generated_rows
+        # Values are deterministic dyadic fractions; no random sampler or model
+        # weights participate. Both executions receive the exact same encoder rows.
+        positions = torch.arange(total, device=DEVICE, dtype=torch.float32)[:, None]
+        columns = torch.arange(HEAD_DIM, device=DEVICE, dtype=torch.float32)[None, :]
+        encoder = ((positions % 17) - 8) / 512 + ((columns % 11) - 5) / 1024
+        uninterrupted = decoder_stack(
+            total,
+            [(0, original_end), *((p, 1) for p in range(original_end, total))],
+            model_state_stager(
+                0, original_prompt_end=original_end, prefill_end=original_end
+            ),
+            encoder=encoder,
+        )
+        expected = uninterrupted[total - 1]
+        assert torch.isfinite(expected).all()
+    
+        # Last legal 256-token encoder hit before the ORIGINAL prompt replay floor.
+        # This deliberately provides enough encoder history to reconstruct the exact
+        # continuation; changing only the cache-hit cap cannot make this test pass.
+        hit = (original_end - CED_WINDOW) // 256 * 256
+        resumed = decoder_stack(
+            total,
+            aligned_chunks(resumed_chunk, hit, total),
+            model_state_stager(hit, original_prompt_end=original_end, prefill_end=total),
+            encoder=encoder,
+        )
+        actual = resumed[total - 1]
+        assert torch.isfinite(actual).all()
+>       torch.testing.assert_close(actual, expected, atol=0, rtol=0)
+E       AssertionError: Tensor-likes are not equal!
+E       
+E       Mismatched elements: 340 / 512 (66.4%)
+E       Greatest absolute difference: 0.0029296875 at index (0,)
+E       Greatest relative difference: 1.376854658126831 at index (482,)
+
+tests/kernels/attention/test_deepseek_v41_ced_replay.py:338: AssertionError
+_______ test_preempted_decode_rebuilds_original_decoder_history[64-257] ________
+
+generated_rows = 257, resumed_chunk = 64
+
+    @pytest.mark.parametrize("generated_rows", [129, 257])
+    @pytest.mark.parametrize("resumed_chunk", [64, 512])
+    def test_preempted_decode_rebuilds_original_decoder_history(
+        generated_rows, resumed_chunk
+    ):
+        """Losing private windows must not change an in-flight continuation.
+    
+        The first run completes one prompt and then computes accepted generated rows
+        one at a time. The second run has lost every private decoder page; its worker
+        input contains the same original prompt plus the accepted output suffix, as
+        MRV2 sends after preemption. All encoder rows are identical and untouched.
+        Comparing the final row traverses three real TileLang SWA layers, so dropping
+        the early generated rows cannot hide behind one layer's 128-token horizon.
+        """
+        original_end = 1024
+        total = original_end + generated_rows
+        # Values are deterministic dyadic fractions; no random sampler or model
+        # weights participate. Both executions receive the exact same encoder rows.
+        positions = torch.arange(total, device=DEVICE, dtype=torch.float32)[:, None]
+        columns = torch.arange(HEAD_DIM, device=DEVICE, dtype=torch.float32)[None, :]
+        encoder = ((positions % 17) - 8) / 512 + ((columns % 11) - 5) / 1024
+        uninterrupted = decoder_stack(
+            total,
+            [(0, original_end), *((p, 1) for p in range(original_end, total))],
+            model_state_stager(
+                0, original_prompt_end=original_end, prefill_end=original_end
+            ),
+            encoder=encoder,
+        )
+        expected = uninterrupted[total - 1]
+        assert torch.isfinite(expected).all()
+    
+        # Last legal 256-token encoder hit before the ORIGINAL prompt replay floor.
+        # This deliberately provides enough encoder history to reconstruct the exact
+        # continuation; changing only the cache-hit cap cannot make this test pass.
+        hit = (original_end - CED_WINDOW) // 256 * 256
+        resumed = decoder_stack(
+            total,
+            aligned_chunks(resumed_chunk, hit, total),
+            model_state_stager(hit, original_prompt_end=original_end, prefill_end=total),
+            encoder=encoder,
+        )
+        actual = resumed[total - 1]
+        assert torch.isfinite(actual).all()
+>       torch.testing.assert_close(actual, expected, atol=0, rtol=0)
+E       AssertionError: Tensor-likes are not equal!
+E       
+E       Mismatched elements: 507 / 512 (99.0%)
+E       Greatest absolute difference: 0.00244140625 at index (484,)
+E       Greatest relative difference: 0.8151658773422241 at index (6,)
+
+tests/kernels/attention/test_deepseek_v41_ced_replay.py:338: AssertionError
+_______ test_preempted_decode_rebuilds_original_decoder_history[512-129] _______
+
+generated_rows = 129, resumed_chunk = 512
+
+    @pytest.mark.parametrize("generated_rows", [129, 257])
+    @pytest.mark.parametrize("resumed_chunk", [64, 512])
+    def test_preempted_decode_rebuilds_original_decoder_history(
+        generated_rows, resumed_chunk
+    ):
+        """Losing private windows must not change an in-flight continuation.
+    
+        The first run completes one prompt and then computes accepted generated rows
+        one at a time. The second run has lost every private decoder page; its worker
+        input contains the same original prompt plus the accepted output suffix, as
+        MRV2 sends after preemption. All encoder rows are identical and untouched.
+        Comparing the final row traverses three real TileLang SWA layers, so dropping
+        the early generated rows cannot hide behind one layer's 128-token horizon.
+        """
+        original_end = 1024
+        total = original_end + generated_rows
+        # Values are deterministic dyadic fractions; no random sampler or model
+        # weights participate. Both executions receive the exact same encoder rows.
+        positions = torch.arange(total, device=DEVICE, dtype=torch.float32)[:, None]
+        columns = torch.arange(HEAD_DIM, device=DEVICE, dtype=torch.float32)[None, :]
+        encoder = ((positions % 17) - 8) / 512 + ((columns % 11) - 5) / 1024
+        uninterrupted = decoder_stack(
+            total,
+            [(0, original_end), *((p, 1) for p in range(original_end, total))],
+            model_state_stager(
+                0, original_prompt_end=original_end, prefill_end=original_end
+            ),
+            encoder=encoder,
+        )
+        expected = uninterrupted[total - 1]
+        assert torch.isfinite(expected).all()
+    
+        # Last legal 256-token encoder hit before the ORIGINAL prompt replay floor.
+        # This deliberately provides enough encoder history to reconstruct the exact
+        # continuation; changing only the cache-hit cap cannot make this test pass.
+        hit = (original_end - CED_WINDOW) // 256 * 256
+        resumed = decoder_stack(
+            total,
+            aligned_chunks(resumed_chunk, hit, total),
+            model_state_stager(hit, original_prompt_end=original_end, prefill_end=total),
+            encoder=encoder,
+        )
+        actual = resumed[total - 1]
+        assert torch.isfinite(actual).all()
+>       torch.testing.assert_close(actual, expected, atol=0, rtol=0)
+E       AssertionError: Tensor-likes are not equal!
+E       
+E       Mismatched elements: 340 / 512 (66.4%)
+E       Greatest absolute difference: 0.0029296875 at index (0,)
+E       Greatest relative difference: 1.376854658126831 at index (482,)
+
+tests/kernels/attention/test_deepseek_v41_ced_replay.py:338: AssertionError
+_______ test_preempted_decode_rebuilds_original_decoder_history[512-257] _______
+
+generated_rows = 257, resumed_chunk = 512
+
+    @pytest.mark.parametrize("generated_rows", [129, 257])
+    @pytest.mark.parametrize("resumed_chunk", [64, 512])
+    def test_preempted_decode_rebuilds_original_decoder_history(
+        generated_rows, resumed_chunk
+    ):
+        """Losing private windows must not change an in-flight continuation.
+    
+        The first run completes one prompt and then computes accepted generated rows
+        one at a time. The second run has lost every private decoder page; its worker
+        input contains the same original prompt plus the accepted output suffix, as
+        MRV2 sends after preemption. All encoder rows are identical and untouched.
+        Comparing the final row traverses three real TileLang SWA layers, so dropping
+        the early generated rows cannot hide behind one layer's 128-token horizon.
+        """
+        original_end = 1024
+        total = original_end + generated_rows
+        # Values are deterministic dyadic fractions; no random sampler or model
+        # weights participate. Both executions receive the exact same encoder rows.
+        positions = torch.arange(total, device=DEVICE, dtype=torch.float32)[:, None]
+        columns = torch.arange(HEAD_DIM, device=DEVICE, dtype=torch.float32)[None, :]
+        encoder = ((positions % 17) - 8) / 512 + ((columns % 11) - 5) / 1024
+        uninterrupted = decoder_stack(
+            total,
+            [(0, original_end), *((p, 1) for p in range(original_end, total))],
+            model_state_stager(
+                0, original_prompt_end=original_end, prefill_end=original_end
+            ),
+            encoder=encoder,
+        )
+        expected = uninterrupted[total - 1]
+        assert torch.isfinite(expected).all()
+    
+        # Last legal 256-token encoder hit before the ORIGINAL prompt replay floor.
+        # This deliberately provides enough encoder history to reconstruct the exact
+        # continuation; changing only the cache-hit cap cannot make this test pass.
+        hit = (original_end - CED_WINDOW) // 256 * 256
+        resumed = decoder_stack(
+            total,
+            aligned_chunks(resumed_chunk, hit, total),
+            model_state_stager(hit, original_prompt_end=original_end, prefill_end=total),
+            encoder=encoder,
+        )
+        actual = resumed[total - 1]
+        assert torch.isfinite(actual).all()
+>       torch.testing.assert_close(actual, expected, atol=0, rtol=0)
+E       AssertionError: Tensor-likes are not equal!
+E       
+E       Mismatched elements: 507 / 512 (99.0%)
+E       Greatest absolute difference: 0.00244140625 at index (484,)
+E       Greatest relative difference: 0.8151658773422241 at index (6,)
+
+tests/kernels/attention/test_deepseek_v41_ced_replay.py:338: AssertionError
+=============================== warnings summary ===============================
+tests/kernels/attention/test_deepseek_v41_ced_replay.py::test_preempted_decode_rebuilds_original_decoder_history[64-129]
+  /opt/spark-ds41f/candidate/vllm/tests/kernels/attention/test_deepseek_v41_tilelang.py:857: UserWarning: Specified kernel cache directory could not be created! This disables kernel caching. Specified directory is /tmp/cache/torch/kernels. This warning will appear only once per process. (Triggered internally at /__w/pytorch/pytorch/aten/src/ATen/native/cuda/jit_utils.cpp:1504.)
+    (groups / torch.exp2(exponent).unsqueeze(-1))
+
+-- Docs: https://docs.pytest.org/en/stable/how-to/capture-warnings.html
+=========================== short test summary info ============================
+FAILED tests/kernels/attention/test_deepseek_v41_ced_replay.py::test_preempted_decode_rebuilds_original_decoder_history[64-129]
+FAILED tests/kernels/attention/test_deepseek_v41_ced_replay.py::test_preempted_decode_rebuilds_original_decoder_history[64-257]
+FAILED tests/kernels/attention/test_deepseek_v41_ced_replay.py::test_preempted_decode_rebuilds_original_decoder_history[512-129]
+FAILED tests/kernels/attention/test_deepseek_v41_ced_replay.py::test_preempted_decode_rebuilds_original_decoder_history[512-257]
+4 failed, 28 deselected, 1 warning in 8.31s
