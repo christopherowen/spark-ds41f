@@ -28,7 +28,7 @@ if args.mode == 'contract-before':
     # assertions may fail. An import/compiler/device failure is never accepted.
     sys.path.insert(0, '/experiment')
     from screen_contract import verify_contract_before
-    command = [python, '-m', 'pytest', 'tests/kernels/moe/test_deepseek_v41_tilelang_moe.py',
+    command = [python, '-m', 'pytest', '--noconftest', 'tests/kernels/moe/test_deepseek_v41_tilelang_moe.py',
                '-k', 'emits_requested_prefill_swizzle', '-v', '-o', 'addopts=',
                '--junitxml=/receipt/contract-before.xml']
     result = subprocess.run(command)
@@ -38,7 +38,7 @@ if args.mode == 'contract-before':
                       'status': 'reproduced'}), flush=True)
     raise SystemExit(0)
 elif args.mode == 'gate':
-    command = [python, '-m', 'pytest',
+    command = [python, '-m', 'pytest', '--noconftest',
                'tests/kernels/moe/test_deepseek_v41_tilelang_moe.py',
                '-k', 'emits_requested_prefill_swizzle or prefill_swizzle_panel_matches_unswizzled_bits',
                '-v', '-o', 'addopts=', '--junitxml=/receipt/gate.xml']

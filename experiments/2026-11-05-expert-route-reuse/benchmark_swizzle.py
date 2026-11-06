@@ -21,7 +21,7 @@ from vllm.models.deepseek_v4_1.tilelang.linear import cast_mxfp8
 from screen_statistics import arm_order, interval
 
 E, TOPK, H = 384, 6, 5120
-PANELS = (0, 1, 2, 3, 4, 8)
+PANELS = (0, 2, 3, 4, 8, 16)
 SAMPLES, REPLAYS, CALLS = 8, 6, 3
 
 
@@ -49,6 +49,8 @@ def route_ids(rows, routing, generator):
         ids = groups[:, None] * TOPK + torch.arange(TOPK, device='cuda')
     elif routing == 'balanced':
         ids = torch.arange(rows * TOPK, device='cuda').reshape(rows, TOPK) % E
+    elif routing == 'prefill-m64':
+        ids = torch.arange(rows * TOPK, device='cuda').reshape(rows, TOPK) % 8
     else:
         scores = torch.rand((rows, E), generator=generator, device='cuda')
         if routing == 'skewed':
@@ -95,6 +97,11 @@ def elapsed(capture):
 
 
 def case(plans, prepared, rows, routing, tp, process_id):
+    for p in plans.values():
+        if routing == 'prefill-m64':
+            p.tile_height = lambda r, _p=p: 64 if r == rows else moe.MoeExpertsV41Plan.tile_height(_p, r)
+        elif 'tile_height' in p.__dict__:
+            del p.__dict__['tile_height']
     workspace_sizes = {arm: moe.workspace_bytes(p.workspace_specs(rows, torch.int32))
                        for arm, p in plans.items()}
     assert len(set(workspace_sizes.values())) == 1, ('workspace changed', workspace_sizes)
@@ -206,6 +213,8 @@ def main():
                 plans = {0: control.MoeExpertsV41Plan(E, TOPK, H, inter, swiglu_limit=10.),
                          1: moe.MoeExpertsV41Plan(E, TOPK, H, inter, swiglu_limit=10.)}
             for plan in plans.values():
+                if control is None:
+                    plan.prefill_dispatch[torch.int32].min_routes = 0
                 plan.declare_kernels()
             if control is not None:
                 generated = []
@@ -224,6 +233,12 @@ def main():
                 [(48, 'disjoint'), (48, 'independent-groups'), (96, 'uniform')]
                 + [(r, 'uniform') for r in (1023, 1024, 2047)]
                 + [(r, routing) for r in (2048, 4096, 8192, 16384) for routing in ('uniform', 'skewed')]
+                + [(8192, 'balanced')]
+                if control is not None else
+                [(48, 'disjoint'), (48, 'independent-groups'), (96, 'uniform')]
+                + [(r, 'prefill-m64') for r in (171, 500)]
+                + [(r, 'uniform') for r in (171, 500, 1023, 1024, 2047)]
+                + [(r, routing) for r in (2048, 4096, 6144, 8192, 16384) for routing in ('uniform', 'skewed')]
                 + [(8192, 'balanced')])
             for rows, routing in points:
                 case(plans, prepared, rows, routing, tp, args.process_id)
