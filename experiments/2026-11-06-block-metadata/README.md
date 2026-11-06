@@ -1,11 +1,25 @@
 # Block-table update audit
 
-Decision, 2026-11-06: retain the current runtime. Producer-driven incremental
-page-table staging already covers the host construction and upload opportunity.
-The batch-order GPU gather still rewrites its configured capacity, but the
-recorded kernel costs do not justify a new persistent destination cache without
-evidence of an exposed serving bottleneck. No runtime candidate, correctness fix,
-performance claim, deployment, or PR results from this audit.
+Status, 2026-11-06: the GPU gather question is reopened for an experiment.
+Producer-driven incremental page-table staging already covers the host
+construction and upload opportunity. The batch-order GPU gather still rewrites
+its configured capacity. Historical costs prioritize this opportunity but do not
+rule out an improvement. The initial audit's stopping decision was too broad.
+
+`bundle/incremental.py` is an unfinished, unvalidated component prototype. It
+compares copying a changed row, coalescing appended IDs to 1024-column chunks,
+and writing exact appended spans. GPU cache records retain owner, overwrite
+generation and previous count per chunk; overwrite generations come from the
+producer rather than a host scan. It keeps the normal gather for explicit output
+destinations, invalidates default-cache state on dummy writes, and rebuilds that
+state when layout tensors are rebuilt. It is not installed in serving and still
+needs compilation, GPU correctness tests and timing, followed by real runtime
+integration and serving validation if it survives the component screen.
+
+The original audit and its receipts remain below. No runtime correctness fix or
+performance gain has been established. The hardware handoff remains collective
+qualification, then the reserved verification-budget arm, before any request
+from this experiment; no acquisition waiter or request has been started here.
 
 This is a source audit and an offline operation-count screen. It is not the
 32K–1M c1/c8/c16 serving-hardware comparison that a new candidate would require.
@@ -74,9 +88,9 @@ independently. Block ID zero and unwritten tails retain their current treatment.
    so fewer spans do not automatically mean fewer launches.
 4. **Producer-driven incremental GPU destination:** could avoid some gather
    stores without a host scan, but requires destination ownership and generation
-   tracking, not just page counts. It was not implemented or GPU timed. The
-   remaining recorded gather cost is a reason to screen this out for now, not
-   proof that every possible implementation is slower.
+   tracking, not just page counts. It was not implemented or GPU timed during
+   the initial audit. The follow-up component prototype above tests this idea;
+   no timing or correctness result is available yet.
 
 Same-size slot reuse replaces pages without changing counts. Batch compaction
 changes the source slot for a destination row without changing the request's
@@ -216,3 +230,15 @@ performance or preserved-performance evidence. A persistent GPU cache should be
 reopened only with a demonstrated exposed cost and a design that survives the
 listed invalidations, then tested on serving hardware with two boots and the
 normal correctness, native-output, all-rank, memory and restoration gates.
+
+## Local resource cleanup
+
+At the owner's request, the clean disposable `.work/vllm` prepared tree was
+removed after checking its status and locked identity. The isolated deployment
+checkout now sparsely contains this experiment. Its allocated footprint fell
+from 536,304 KiB to 636 KiB (548,524,032 bytes reclaimed across the two operations).
+No source, evidence or unfinished changes were removed; no shared object store
+or other task's checkout was touched. The audit's prepared source can be
+reproduced from its pins and series on a remote host. Further compilation,
+dependencies, tests and bulk artifacts belong on the DGX/Spaceports; local work
+is limited to lightweight edits and Git. [Cleanup receipt](runs/local-cleanup-20261106.json).
