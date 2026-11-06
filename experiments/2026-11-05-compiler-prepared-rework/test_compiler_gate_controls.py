@@ -344,7 +344,7 @@ class GateControls(unittest.TestCase):
                     "experiments/2026-10-26-spark-ds41f-candidate/candidate-45/tp3-qualification-dev.json"):
             cluster = config.read_cluster(rel)
             mapping = c45_cache.mapped_namespace(cluster, config.host_path)
-            self.assertEqual(mapping["host_root"], "/home/swank/.cache/vllm/tilelang")
+            self.assertEqual(mapping["host_root"], "/home/swank/projects/spark-ds41f/cache/spark-ds41f/jit/tilelang")
             self.assertEqual(mapping["namespace"], c45_cache.NAMESPACE)
         management = mock.Mock()
         management.ssh.side_effect = [json.dumps({"passed": True, "node": n}) for n in ("dgx1", "dgx2", "dgx3")]
