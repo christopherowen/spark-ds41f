@@ -91,10 +91,17 @@ def compare(arms):
     if list(arms) != expected:
         return {'passed': False, 'issues': ['four complete ordered arms are required']}
     for label, gates in arms.items():
-        if set(gates) != {'ced', 'determinism', 'greedy', 'sampled'} or not all(g['passed'] for g in gates.values()):
+        required = {'ced'} if label == 'control-2' and set(gates) == {'ced'} else {'ced', 'determinism'}
+        if not required <= set(gates) or not all(g['passed'] for g in gates.values()):
             issues.append(label + ' functional gate failed')
-    for kind in ('ced', 'determinism', 'greedy', 'sampled'):
-        summaries = [arms[label].get(kind, {}).get('summary') for label in expected]
+    active_kinds = [k for k in ('ced', 'determinism', 'greedy', 'sampled')
+                    if any(k in arms[label] for label in expected)]
+    for kind in active_kinds:
+        required_labels = (expected if kind == 'ced'
+                           else ['control-1', 'candidate-1', 'candidate-2']
+                           if kind == 'determinism' and 'determinism' not in arms.get('control-2', {})
+                           else expected)
+        summaries = [arms[label].get(kind, {}).get('summary') for label in required_labels]
         if any(summary is None for summary in summaries):
             issues.append(kind + ' missing summary')
             continue

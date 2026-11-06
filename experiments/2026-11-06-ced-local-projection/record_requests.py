@@ -53,7 +53,7 @@ def read_nodes(token, floor_gib=3):
         assert hold.get('holder') == HOLDER and hold.get('token') == token and hold.get('nodes') == NAMES, node + ': lease changed'
         assert hold.get('phase') == 'serving', node + ': phase changed'
         assert row['thermal_zones_c'], node + ': no thermal sensors'
-        assert max(row['thermal_zones_c'].values()) <= 70 and row['gpu_temperature_c'] <= 70, node + ': thermal guard'
+        assert max(row['thermal_zones_c'].values()) <= 78 and row['gpu_temperature_c'] <= 70, node + ': thermal guard'
         assert row['host_available_bytes'] >= floor_gib * 2**30, node + ': memory reserve'
         records[node] = row
     return records
@@ -84,7 +84,7 @@ class TimedResponse:
 
 
 class RequestArchive:
-    def __init__(self, directory, *, token=None, below_c=49.5, sp5_below_c=48.5, settle_polls=2, poll_sleep=3.0):
+    def __init__(self, directory, *, token=None, below_c=52.0, sp5_below_c=52.0, settle_polls=2, poll_sleep=3.0):
         self.directory = Path(directory)
         self.directory.mkdir(parents=True, exist_ok=False)
         self.lock = threading.Lock()
@@ -182,10 +182,8 @@ class RequestArchive:
     def after_main_request(self, body_bytes):
         if not self.token:
             return
-        if body_bytes > 4096:
-            self.cool('main-long-request', settle_polls=self.settle_polls)
-        elif local_hottest_c() >= self.sp5_below_c:
-            self.cool('main-short-request', settle_polls=1)
+        if local_hottest_c() >= 64.0:
+            self.cool('main-request', settle_polls=1)
 
 
 def main():

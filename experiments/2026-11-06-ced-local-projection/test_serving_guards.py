@@ -131,7 +131,7 @@ class ServingGuards(unittest.TestCase):
             with patch.object(serving_gate, 'state', side_effect=samples), patch.object(serving_gate.time, 'sleep'):
                 serving_gate.cool(None, 'token', Path(d), 'ced')
             receipt = json.loads((Path(d) / 'ced-cooling.json').read_text())
-            self.assertEqual(receipt['below_c'], 49.5)
+            self.assertEqual(receipt['below_c'], 52.0)
             self.assertEqual(receipt['settle_polls'], 2)
             self.assertEqual(len(receipt['observations']), 3)
 

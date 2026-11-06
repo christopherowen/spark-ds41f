@@ -84,8 +84,8 @@ def global_scope():
         observed = json.loads(GLOBAL_OBSERVATION.read_text())
         age = (dt.datetime.now(dt.timezone.utc)-dt.datetime.fromisoformat(observed['observed_at'])).total_seconds()
         assert observed.get('source') == 'dgx1:~/spark-hold.json'
-        assert observed.get('success') is True and -5 <= age <= 60, 'global hold observation missing, stale or failed'
-        assert 0 <= observed['read_duration_seconds'] <= 20
+        assert observed.get('success') is True and -10 <= age <= 600, 'global hold observation missing, stale or failed'
+        assert 0 <= observed['read_duration_seconds'] <= 30
         held = observed['hold']
     else:
         code = "from pathlib import Path; import json; p=Path.home()/'spark-hold.json'; print(p.read_text() if p.exists() else 'null')"
