@@ -86,7 +86,7 @@ reads, early-staging overlap, and short-read/missing-source/timeout failure
 checks. The exact final headers also pass 152 combined ASan/UBSan planner
 cases. Their complete ordered patch stacks apply freshly to the recorded
 heads/trees, and TP3/TP4 static doctor checks pass. These are not live topology
-or GPU qualifications. Complete image inputs and image tests are still pending.
+or GPU qualifications. Complete inputs now pass `bin/spark build check` for both variants; image and GPU tests are still pending.
 
 ## Remaining bottleneck and hardware plan
 

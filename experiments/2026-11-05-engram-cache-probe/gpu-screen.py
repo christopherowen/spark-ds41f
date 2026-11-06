@@ -133,6 +133,24 @@ def main():
                                             'before': before, 'after': after})
                     for index, r in enumerate(readers):
                         case['timeline'].extend({'layer': index, **entry} for entry in r.timeline())
+                # After timing, compare the same rows in singleton batches on the
+                # actual gather path. This does not alter any measured cache state.
+                expected_batch = [value.cpu().clone() for value in output]
+                gate_indices = sorted({0, 1, tokens // 2, tokens - 1})
+                single_live = torch.tensor([1], dtype=torch.int32, device='cuda')
+                single_output = [torch.empty((1, len(owned) * 256), dtype=torch.bfloat16, device='cuda')
+                                 for _ in readers]
+                for index in gate_indices:
+                    single_ids = ids_gpu[index:index + 1].contiguous()
+                    for r in readers:
+                        r.stage(stream, single_ids, columns)
+                    for r, value in zip(readers, single_output):
+                        r.gather(value, single_ids, single_live)
+                    torch.cuda.synchronize()
+                    for r, value, expected in zip(readers, single_output, expected_batch):
+                        idle(r)
+                        assert torch.equal(value.cpu().view(torch.int16), expected[index:index + 1].view(torch.int16))
+                case['batch_invariance_rows'] = gate_indices
                 print(tp, tokens, hot, early, 'passed', flush=True)
             finally:
                 torch.cuda.synchronize()
