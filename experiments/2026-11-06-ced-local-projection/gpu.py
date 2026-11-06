@@ -6,7 +6,7 @@ sys.path.insert(0, "/src")
 import pytest
 
 status = pytest.main([
-    "--noconftest", "-p", "no:cacheprovider", "-q",
+    "--noconftest", "-p", "no:cacheprovider", "-q", "-ra",
     "/src/tests/kernels/test_deepseek_v41_tilelang_ced.py",
     "/src/tests/kernels/test_deepseek_v41_tilelang_mhc.py",
     "/src/tests/models/test_deepseek_v4_1_compressor.py",

@@ -1,6 +1,7 @@
 # CED row-local global-KV projection
 
-Status: experimental alternative; no native GPU or serving result yet. Source
+Status: experimental alternative; first native GPU boot passed 367 checks with
+one skipped. Repeat, schedule screen and serving results are pending. Source
 commit `51c1a32cd78cfb0a14087e34dfcc06be30928a0e` is published on
 `https://github.com/christopherowen/vllm/tree/feat/ced-local-projection`.
 The focused compact-carry source review remains
@@ -149,3 +150,14 @@ the actual path and appropriate before/after evidence excluding a material loss.
 These layout candidates do not claim an existing correctness defect. The recorded
 prefill comparator uses a 0.5% tolerance and Welch intervals; an interval that
 still admits a material regression is inconclusive, not proof of no loss.
+
+## Native GPU boot 1
+
+On dgx4 in exclusively owned window `dgx1-1793922629`, the published source
+passed 367 native CED, mHC and compressor tests with one skipped in 286.98 s.
+This includes full-versus-local native projection bits at TP3/TP4 shapes and
+rank-order mHC entry across real chunk sizes, padding and nonfinite inputs.
+The test process peaked at 3633984 KiB RSS. Full commands, mounted-file hashes,
+dependency image identity and five-second memory/clock/temperature samples are
+in `receipts/native-boot-1/`. This is one kernel-test process boot, not a serving
+benchmark, and it does not certify actual multi-node collective behavior.
