@@ -366,3 +366,9 @@ That preserves the original `.dockerignore` without treating it as a context
 filter, requires no additional source tree or image archive on disk, and retains
 the same source/native checks and resource bounds. The corrected unique tag adds
 `-git`; the rejected tag is never overwritten.
+
+The third image attempt stopped before Docker build when the stream guard did
+not accept Git archive's `source` root-directory entry. No corrected-tag image
+was produced; its failure receipt is retained. The guard now explicitly accepts
+that directory and a CPU-only consumer independently verifies every streamed
+file's Git blob, file mode, symlink, file count and Dockerfile before another build.
