@@ -98,8 +98,7 @@ normal-path confidence intervals overlap, so this is not a claim of a statistica
 proved direct speed difference between them. The selected design has fewer
 future objects on the successful path and no detected normal-path penalty in
 its two runs. The changes to either alternative, relative to the first fix, are
-preserved in `alternatives/`; no unsuccessful run was discarded. The earlier
-canonical-proposal comparison remains in the preceding experiment.
+preserved in `alternatives/`; no unsuccessful run was discarded.
 
 The first audit also exposed an inadequate old test fixture: its listener's
 cleanup waited forever and depended on a second cancellation to kill it. Both

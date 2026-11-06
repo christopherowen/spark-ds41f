@@ -19,23 +19,6 @@ appends that patch to candidate-38; both TP3 and TP4 profiles are launch-disable
 and name an unbuilt image. This is independent of the failed-engine-submission
 and utility-future changes in deployment PR890 (different files and lifetimes).
 
-## Existing upstream work
-
-Canonical vLLM already has pending PRs
-[55790](https://github.com/vllm-project/vllm/pull/55790) (parent-cancellation task
-cleanup) and [49526](https://github.com/vllm-project/vllm/pull/49526) (disconnect
-load accounting). This fork draft is local qualification on our pinned source,
-not a competing canonical submission or a claim that those core bugs are new.
-
-A local adaptation combining their mechanisms on the pinned file passes 12 of
-our 15 cases. It still fails asynchronous cleanup inside an AnyIO cancellation
-scope, propagation of receive errors, and load release when cancellation
-interrupts response handoff. The final patch passes all 15. The adaptation and
-receipt are retained under `runs/pending-upstream/`; it is not a test of either
-original PR on its own base. Reconcile with those PRs before upstream submission
-or pin advancement. The fork draft is for owner review; nothing is merged into
-the integration branch.
-
 ## Identity and source validation
 
 `base.json` names the deployment commit, candidate-36 and candidate-38 pins,
