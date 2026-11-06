@@ -19,7 +19,7 @@ allocated. The risk to test is scheduling/resource contention and generated
 memory ordering, not a different arithmetic formula.
 
 The source starts at candidate-36/38's sparknet `1fd6a1f` / tree `8cc28a5c`,
-and the entry candidate pins `fb027b4` / tree `1e1720f0`. The first
+and the entry candidate pins `9c8d89d` / tree `aadd3cdd`. The first
 `1a1205e` revision was replaced only to correct generated-source inspection
 of a forward declaration; the kernel implementation did not change. Candidate-38's vLLM
 series was freshly applied: 572 patches reproduce head `1f331025` and tree
@@ -229,3 +229,24 @@ authority. Re-read the live profile, hold and node map before any operation.
 
 Conclusion: [retain for hardware evidence](decision.md). No measured speed gain
 is claimed.
+
+## First native gate (2026-11-06)
+
+Window `dgx1-1793926719` ran entry source `fb027b4` with harness `e0630878`.
+Each of three ranks passed 23 native cases, then the eager fail-stop child
+failed its Gloo rendezvous: torchrun's inherited agent-store setting made
+rank zero a client on the probe's separate port. No server existed there.
+The new PDL cases and fabric probe were not reached, so the source gate failed.
+All rank logs, conditions and restoration are retained under
+`runs/native-entry-20261106/`; no benchmark or serving candidate ran.
+
+The probe now creates an explicit TCPStore, with rank zero as server. A real
+CPU Gloo regression through its setup fails before and passes after, without
+initializing CUDA. The change is identical in all three variants and leaves
+all collective kernel files unchanged. This repairs qualification tooling;
+it is not evidence of an old serving correctness bug or a PDL speedup.
+
+C36 was restored and passed live doctor at 01:06:43 UTC. All canonical
+checkouts remained clean at `2c4b23af`; all three running ranks retained image
+`sha256:b0522146640a7d852c017ec8c99423224492b7c2c4951eb3a64005ab4555ab11`.
+The hold was released for the reserved verification-budget job before any retry.

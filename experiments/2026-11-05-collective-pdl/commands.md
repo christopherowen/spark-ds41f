@@ -63,3 +63,21 @@ Every applied source gate needs the exact owned window and clean published
 checkouts on all ranks. Benchmark mode additionally needs that variant's
 passing gate receipt and verifies each log hash. Applied hardware commands
 will be recorded in their own per-run receipt; none has run yet.
+
+### Native entry attempt and rendezvous repair (2026-11-06)
+
+The exact three-rank gate plan is `runs/native-entry-20261106/gate-plan.json`;
+`controller.log` retains the guarded C36 restoration. Its immutable gate receipt
+names harness `e0630878` and source `fb027b4`; the repair does not rewrite them.
+The CPU-only old-fails/new-passes Gloo fixture runs in the exact C38 image with
+`--runtime=runc --network=none`, empty CUDA visibility, CPU 2, memory 8 GiB,
+no extra swap and 256 PIDs. The fixture replaces only the GPU fault scenario
+with a CPU collective and asserts CUDA remains uninitialized; it exercises
+the real probe rendezvous. Its code and the bounded check scripts are archived
+in `runs/commands/`, with hashes in `receipt-native-rendezvous.json`.
+All three source variants passed `make check` (98 cases each); deployment
+checks passed 755 cases and five source-controller controls. The revised source
+was freshly prepared and both profile doctors passed. Full image preparation
+is deferred until selection; the current build check correctly warns that the
+new context is incomplete. No candidate image exists.
+The controller now keeps its owned-window heartbeat alive through restoration.

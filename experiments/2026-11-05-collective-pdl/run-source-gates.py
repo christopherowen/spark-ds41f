@@ -15,8 +15,8 @@ import time
 HERE = Path(__file__).resolve().parent
 PHASE = "entry"
 SOURCE = Path("/home/swank/spark-lab/collective-pdl/sparknet")
-PIN = "fb027b4b80e5262416bb6db2b95b671498f6de74"
-TREE = "1e1720f0bbeeded1efcb9ce02b535d2981b38ca6"
+PIN = "9c8d89d1c1c95547c1d228600d6d5949224dbc45"
+TREE = "aadd3cddfa390fbd44c622848a157ff3962ba4b5"
 IMAGE = "sha256:213ba4df68d06665add7a26260c2321d55854a75b8a51ae71c72d0b97eac814b"
 RESTORE = "experiments/2026-10-26-spark-ds41f-candidate/candidate-36/tp3-dev.json"
 HOLDER_NOTE = "collective-pdl TP3 qualification"
@@ -375,32 +375,34 @@ def main():
                 fan_errors = spark.stop_fan_curve(nodes, nodes["nodes"], fan)
                 if fan_errors: raise RuntimeError(fan_errors)
             except Exception as exc: receipt.setdefault("cleanup_errors",[]).append(str(exc))
-        halt.set(); thread.join(timeout=35)
         receipt["ended"] = now()
         save()
-        if receipt.get("cleanup_errors"):
-            receipt["passed"] = False
-            receipt["restored"] = False
-            receipt["attention"] = "Cleanup could not be verified. Hold retained; watchdog remains active. Do not retry hardware work."
-            save()
-            raise RuntimeError(receipt["attention"])
-        if not receipt["passed"]:
-            owned()
-            receipt["restored"] = lab.window_close("collective source gates ended without a pass")
-            save()
-        else:
-            hold=owned()
-            lab.beat(f"{PHASE} {args.mode} passed; checking the next request")
-            reason=lab.window_should_close(hold)
-            if reason:
-                receipt["restored"]=lab.window_close(reason)
-                receipt["handoff_reason"]=reason
+        try:
+            if receipt.get("cleanup_errors"):
+                receipt["passed"] = False
+                receipt["restored"] = False
+                receipt["attention"] = "Cleanup could not be verified. Hold retained; watchdog remains active. Do not retry hardware work."
                 save()
-                if not receipt["restored"]:
-                    raise RuntimeError("source job passed but restoration failed; hold retained")
-                print(f"{PHASE} {args.mode} passed; production restored and window released for the waiting request.",flush=True)
+                raise RuntimeError(receipt["attention"])
+            if not receipt["passed"]:
+                owned()
+                receipt["restored"] = lab.window_close("collective source gates ended without a pass")
+                save()
             else:
-                print(f"{PHASE} {args.mode} passed. Window retained for the next step; watchdog remains active.", flush=True)
+                hold=owned()
+                lab.beat(f"{PHASE} {args.mode} passed; checking the next request")
+                reason=lab.window_should_close(hold)
+                if reason:
+                    receipt["restored"]=lab.window_close(reason)
+                    receipt["handoff_reason"]=reason
+                    save()
+                    if not receipt["restored"]:
+                        raise RuntimeError("source job passed but restoration failed; hold retained")
+                    print(f"{PHASE} {args.mode} passed; production restored and window released for the waiting request.",flush=True)
+                else:
+                    print(f"{PHASE} {args.mode} passed. Window retained for the next step; watchdog remains active.", flush=True)
+        finally:
+            halt.set(); thread.join(timeout=35)
 
 if __name__ == "__main__":
     main()

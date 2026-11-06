@@ -1,0 +1,149 @@
+============================= test session starts ==============================
+platform linux -- Python 3.12.3, pytest-9.1.1, pluggy-1.6.0 -- /usr/bin/python3
+rootdir: /sparknet-tests/gpu
+plugins: anyio-4.15.1
+collecting ... collected 107 items
+
+../sparknet-tests/gpu/test_oneshot_gpu.py::test_source_gids_are_found_by_address PASSED [  0%]
+../sparknet-tests/gpu/test_oneshot_gpu.py::test_payload_is_striped_across_every_hca PASSED [  1%]
+../sparknet-tests/gpu/test_oneshot_gpu.py::test_matches_nccl_and_is_rank_identical[16-dtype0] PASSED [  2%]
+../sparknet-tests/gpu/test_oneshot_gpu.py::test_matches_nccl_and_is_rank_identical[16-dtype1] PASSED [  3%]
+../sparknet-tests/gpu/test_oneshot_gpu.py::test_matches_nccl_and_is_rank_identical[16-dtype2] PASSED [  4%]
+../sparknet-tests/gpu/test_oneshot_gpu.py::test_matches_nccl_and_is_rank_identical[4096-dtype0] PASSED [  5%]
+../sparknet-tests/gpu/test_oneshot_gpu.py::test_matches_nccl_and_is_rank_identical[4096-dtype1] PASSED [  6%]
+../sparknet-tests/gpu/test_oneshot_gpu.py::test_matches_nccl_and_is_rank_identical[4096-dtype2] PASSED [  7%]
+../sparknet-tests/gpu/test_oneshot_gpu.py::test_matches_nccl_and_is_rank_identical[49152-dtype0] PASSED [  8%]
+../sparknet-tests/gpu/test_oneshot_gpu.py::test_matches_nccl_and_is_rank_identical[49152-dtype1] PASSED [  9%]
+../sparknet-tests/gpu/test_oneshot_gpu.py::test_matches_nccl_and_is_rank_identical[49152-dtype2] PASSED [ 10%]
+../sparknet-tests/gpu/test_oneshot_gpu.py::test_matches_nccl_and_is_rank_identical[262144-dtype0] PASSED [ 11%]
+../sparknet-tests/gpu/test_oneshot_gpu.py::test_matches_nccl_and_is_rank_identical[262144-dtype1] PASSED [ 12%]
+../sparknet-tests/gpu/test_oneshot_gpu.py::test_matches_nccl_and_is_rank_identical[262144-dtype2] PASSED [ 13%]
+../sparknet-tests/gpu/test_oneshot_gpu.py::test_matches_nccl_and_is_rank_identical[1048576-dtype0] PASSED [ 14%]
+../sparknet-tests/gpu/test_oneshot_gpu.py::test_matches_nccl_and_is_rank_identical[1048576-dtype1] PASSED [ 14%]
+../sparknet-tests/gpu/test_oneshot_gpu.py::test_matches_nccl_and_is_rank_identical[1048576-dtype2] PASSED [ 15%]
+../sparknet-tests/gpu/test_oneshot_gpu.py::test_rejects_ineligible_inputs PASSED [ 16%]
+../sparknet-tests/gpu/test_oneshot_gpu.py::test_cuda_graph_replay PASSED [ 17%]
+../sparknet-tests/gpu/test_oneshot_gpu.py::test_cuda_graph_replay_with_alternating_grid_sizes PASSED [ 18%]
+../sparknet-tests/gpu/test_oneshot_gpu.py::test_proxy_catches_up_after_missed_doorbell PASSED [ 19%]
+../sparknet-tests/gpu/test_oneshot_gpu.py::test_alternating_eager_streams_are_ordered PASSED [ 20%]
+../sparknet-tests/gpu/test_oneshot_gpu.py::test_adapter_path_graph_replay PASSED [ 21%]
+../sparknet-tests/gpu/test_oneshot_gpu.py::test_fail_stop_on_timeout_eager FAILED [ 22%]
+
+=================================== FAILURES ===================================
+_______________________ test_fail_stop_on_timeout_eager ________________________
+
+runtime = <sparknet.oneshot.runtime.RoceOneshotAllReduce object at 0xfb78074b3020>
+
+    def test_fail_stop_on_timeout_eager(runtime):
+        """Rank 1 stops its proxy; every rank's wait then times out and stops its GPU,
+        and reports whom it waited for. This process's runtime keeps working."""
+>       _assert_stopped(_fail_stop("eager"))
+                        ^^^^^^^^^^^^^^^^^^^
+
+/sparknet-tests/gpu/test_oneshot_gpu.py:457: 
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
+
+scenario = 'eager'
+
+    def _fail_stop(scenario: str) -> dict:
+        """Run ``sparknet.probe.failstop`` on this rank and return its report.
+    
+        The scenario stops the child's GPU, so it gets a process (and a gloo group
+        on its own port) of its own; this process's runtime is untouched.
+        """
+        port = int(os.environ.get("MASTER_PORT", "29650")) + 7
+        child = subprocess.run(
+            [sys.executable, "-m", "sparknet.probe.failstop", scenario,
+             "--rank", os.environ["RANK"], "--world-size", os.environ["WORLD_SIZE"],
+             "--master-addr", os.environ["MASTER_ADDR"], "--master-port", str(port)],
+            capture_output=True, text=True, timeout=300,
+        )
+        lines = [line for line in child.stdout.splitlines() if line.startswith("{")]
+>       assert lines, f"no report (exit {child.returncode}): {child.stderr[-2000:]}"
+E       AssertionError: no report (exit 1): l + 0x4c (0x4c37fc in /usr/bin/python3)
+E         frame #28: _PyEval_EvalFrameDefault + 0x8a0 (0x564354 in /usr/bin/python3)
+E         frame #29: /usr/bin/python3() [0x68b428]
+E         frame #30: Py_RunMain + 0x1ac (0x68aaec in /usr/bin/python3)
+E         frame #31: Py_BytesMain + 0x28 (0x68a7d8 in /usr/bin/python3)
+E         frame #32: <unknown function> + 0x284c4 (0xea3e81f884c4 in /lib/aarch64-linux-gnu/libc.so.6)
+E         frame #33: __libc_start_main + 0x98 (0xea3e81f88598 in /lib/aarch64-linux-gnu/libc.so.6)
+E         frame #34: _start + 0x30 (0x5f6270 in /usr/bin/python3)
+E         
+E         Traceback (most recent call last):
+E           File "<frozen runpy>", line 198, in _run_module_as_main
+E           File "<frozen runpy>", line 88, in _run_code
+E           File "/usr/local/lib/python3.12/dist-packages/sparknet/probe/failstop.py", line 160, in <module>
+E             sys.exit(main(sys.argv[1:]))
+E                      ^^^^^^^^^^^^^^^^^^
+E           File "/usr/local/lib/python3.12/dist-packages/sparknet/probe/failstop.py", line 143, in main
+E             dist.init_process_group(
+E           File "/usr/local/lib/python3.12/dist-packages/torch/distributed/c10d_logger.py", line 83, in wrapper
+E             return func(*args, **kwargs)
+E                    ^^^^^^^^^^^^^^^^^^^^^
+E           File "/usr/local/lib/python3.12/dist-packages/torch/distributed/c10d_logger.py", line 97, in wrapper
+E             func_return = func(*args, **kwargs)
+E                           ^^^^^^^^^^^^^^^^^^^^^
+E           File "/usr/local/lib/python3.12/dist-packages/torch/distributed/distributed_c10d.py", line 1892, in init_process_group
+E             store, rank, world_size = next(rendezvous_iterator)
+E                                       ^^^^^^^^^^^^^^^^^^^^^^^^^
+E           File "/usr/local/lib/python3.12/dist-packages/torch/distributed/rendezvous.py", line 232, in _tcp_rendezvous_handler
+E             store = _create_c10d_store(
+E                     ^^^^^^^^^^^^^^^^^^^
+E           File "/usr/local/lib/python3.12/dist-packages/torch/distributed/rendezvous.py", line 190, in _create_c10d_store
+E             return TCPStore(
+E                    ^^^^^^^^^
+E         torch.distributed.DistNetworkError: The client socket has timed out after 120000ms while trying to connect to (10.0.1.71, 29658).
+E         
+E       assert []
+
+/sparknet-tests/gpu/test_oneshot_gpu.py:446: AssertionError
+=============================== warnings summary ===============================
+test_oneshot_gpu.py::test_payload_is_striped_across_every_hca
+test_oneshot_gpu.py::test_cuda_graph_replay
+test_oneshot_gpu.py::test_cuda_graph_replay_with_alternating_grid_sizes
+test_oneshot_gpu.py::test_proxy_catches_up_after_missed_doorbell
+test_oneshot_gpu.py::test_alternating_eager_streams_are_ordered
+test_oneshot_gpu.py::test_adapter_path_graph_replay
+test_oneshot_gpu.py::test_fail_stop_on_timeout_eager
+  /usr/local/lib/python3.12/dist-packages/torch/distributed/c10d_logger.py:83: UserWarning: barrier(): using the device under current context. You can specify `device_id` in `init_process_group` to mute this warning.
+    return func(*args, **kwargs)
+
+-- Docs: https://docs.pytest.org/en/stable/how-to/capture-warnings.html
+=========================== short test summary info ============================
+FAILED ../sparknet-tests/gpu/test_oneshot_gpu.py::test_fail_stop_on_timeout_eager
+!!!!!!!!!!!!!!!!!!!!!!!!!! stopping after 1 failures !!!!!!!!!!!!!!!!!!!!!!!!!!!
+============= 1 failed, 23 passed, 7 warnings in 258.25s (0:04:18) =============
+E1106 01:04:37.529000 56 torch/distributed/elastic/multiprocessing/api.py:1002] failed (exitcode: 1) local_rank: 0 (pid: 60) of binary: /usr/bin/python3
+Traceback (most recent call last):
+  File "<frozen runpy>", line 198, in _run_module_as_main
+  File "<frozen runpy>", line 88, in _run_code
+  File "/usr/local/lib/python3.12/dist-packages/torch/distributed/run.py", line 1032, in <module>
+    main()
+  File "/usr/local/lib/python3.12/dist-packages/torch/distributed/elastic/multiprocessing/errors/__init__.py", line 367, in wrapper
+    return f(*args, **kwargs)
+           ^^^^^^^^^^^^^^^^^^
+  File "/usr/local/lib/python3.12/dist-packages/torch/distributed/run.py", line 1028, in main
+    run(args)
+  File "/usr/local/lib/python3.12/dist-packages/torch/distributed/run.py", line 1019, in run
+    elastic_launch(
+  File "/usr/local/lib/python3.12/dist-packages/torch/distributed/launcher/api.py", line 194, in __call__
+    return launch_agent(
+           ^^^^^^^^^^^^^
+  File "/usr/local/lib/python3.12/dist-packages/torch/distributed/launcher/api.py", line 383, in launch_agent
+    raise ChildFailedError(
+torch.distributed.elastic.multiprocessing.errors.ChildFailedError: 
+============================================================
+pytest FAILED
+------------------------------------------------------------
+Failures:
+  <NO_OTHER_FAILURES>
+------------------------------------------------------------
+Root Cause (first observed failure):
+[0]:
+  time      : 2026-11-06_01:04:37
+  host      : localhost
+  rank      : 0 (local_rank: 0)
+  exitcode  : 1 (pid: 60) 
+  error_file: <N/A>
+  traceback : To enable traceback see: https://pytorch.org/docs/stable/elastic/errors.html
+============================================================

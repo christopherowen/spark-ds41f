@@ -1,5 +1,5 @@
 {
-  "status": "offline-passed-hardware-pending",
+  "status": "native-gate-failed-rendezvous-repair-pending",
   "cpu_tests": {
     "host": "dgx4",
     "count": 98,
@@ -103,14 +103,17 @@
   },
   "current_source_cpu_tests": {
     "passed": true,
-    "commit": "fb027b4b80e5262416bb6db2b95b671498f6de74",
+    "commit": "9c8d89d1c1c95547c1d228600d6d5949224dbc45",
     "count": 98,
-    "log": "runs/source-recheck.log"
+    "log": "runs/rendezvous-checks/source-checks.log"
   },
   "current_build_inputs": {
-    "passed": true,
-    "directory": ".work/build/vllm-19f2c20ed4d6-b12x-236ddff04a5f-37df39d5",
-    "log": "runs/prepare-current.log",
+    "passed": false,
+    "source_prepared": true,
+    "complete_image_inputs": false,
+    "directory": ".work/build/vllm-19f2c20ed4d6-b12x-236ddff04a5f-edb650de",
+    "log": "runs/rendezvous-deployment-checks/build-check.log",
+    "reason": "Only changed sparknet source prepared; full image inputs deferred until a hardware-qualified placement is selected.",
     "image_built": false
   },
   "cuda_compilation": {
@@ -133,10 +136,10 @@
   },
   "current_source_ci": {
     "passed": true,
-    "commit": "fb027b4b80e5262416bb6db2b95b671498f6de74",
+    "commit": "9c8d89d1c1c95547c1d228600d6d5949224dbc45",
     "runs": [
-      "https://github.com/christopherowen/dgx-spark-networking/actions/runs/42128284312",
-      "https://github.com/christopherowen/dgx-spark-networking/actions/runs/42128292286"
+      "https://github.com/christopherowen/dgx-spark-networking/actions/runs/42141960784",
+      "https://github.com/christopherowen/dgx-spark-networking/actions/runs/42141954114"
     ]
   },
   "alternative_ci": [
@@ -156,21 +159,21 @@
   "source_gate_controls": {
     "passed": true,
     "count": 5,
-    "log": "runs/handoff-checks/controls.log"
+    "log": "runs/rendezvous-deployment-checks/controls.log"
   },
   "authorization": "Owner authorized necessary coordinated hardware testing and service operations; existing holds/requests retain precedence. No merge, promotion or topology change is authorized.",
   "claims": {
     "classification": "performance optimization with correctness preservation",
     "pre_existing_correctness_failure": null,
-    "gpu_correctness": "unmeasured",
+    "gpu_correctness": "not qualified; first gate failed in probe rendezvous",
     "performance": "unmeasured",
     "correctness_acceptance": "A concrete old-fails/new-passes repair may qualify with performance preserved within meaningful bounds. This patch has not established that kind of repair."
   },
   "latest_deployment_tests": {
     "passed": true,
     "count": 755,
-    "seconds": 36.589,
-    "log": "runs/handoff-checks/deployment-tests.log"
+    "seconds": 36.928,
+    "log": "runs/rendezvous-deployment-checks/deployment-tests.log"
   },
   "timing_controls": {
     "gpu_container_cpu_limit": 4,
@@ -180,5 +183,46 @@
     "event_placement": "external event-record nodes inside captured graph",
     "native_timer_check": "prepared, unrun; distinguish 1M-cycle and 32M-cycle captured delays before measuring",
     "earlier_host_event_plan": "superseded before any GPU timing; original receipts retained"
+  },
+  "native_attempts": [
+    {
+      "source_commit": "fb027b4b80e5262416bb6db2b95b671498f6de74",
+      "harness_commit": "e0630878a7e04f68fdc3011d68350d313422c4f3",
+      "receipt": "runs/native-entry-20261106/gates/receipt.json",
+      "passed": false,
+      "per_rank_passed": 23,
+      "per_rank_failed": 1,
+      "new_pdl_cases_reached": false,
+      "fabric_probe_reached": false,
+      "restored_and_released": true,
+      "memory_min_available_gib": {
+        "dgx1": 113.4,
+        "dgx2": 115.13,
+        "dgx3": 114.82
+      },
+      "swap_growth_gib": 0.0
+    }
+  ],
+  "prior_build_inputs": {
+    "passed": true,
+    "directory": ".work/build/vllm-19f2c20ed4d6-b12x-236ddff04a5f-37df39d5",
+    "log": "runs/prepare-current.log",
+    "image_built": false
+  },
+  "prior_source_ci": {
+    "passed": true,
+    "commit": "fb027b4b80e5262416bb6db2b95b671498f6de74",
+    "runs": [
+      "https://github.com/christopherowen/dgx-spark-networking/actions/runs/42128284312",
+      "https://github.com/christopherowen/dgx-spark-networking/actions/runs/42128292286"
+    ]
+  },
+  "rendezvous_reproducer": {
+    "gpu_initialized": false,
+    "before_passed": false,
+    "after_passed": true,
+    "before_log": "runs/rendezvous-checks/before.log",
+    "after_log": "runs/rendezvous-checks/after.log",
+    "scope": "Two native CPU Gloo ranks through the fail-stop probe setup; no GPU fault phase"
   }
 }
