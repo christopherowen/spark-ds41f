@@ -221,12 +221,19 @@ def main():
         if problems:
             raise RuntimeError("fan curve refused: " + "; ".join(problems))
         memory.wait_ready()
+        memory.check()
+        if conditions["halted"]:
+            raise RuntimeError(conditions["halted"][0])
         hold()
         with (output / "client.log").open("w") as log:
             process = subprocess.Popen(
                 argv, cwd=ROOT, stdout=log, stderr=subprocess.STDOUT
             )
             while process.poll() is None:
+                try:
+                    memory.check()
+                except bench.BenchAbort as error:
+                    halt(str(error))
                 if conditions["halted"]:
                     try:
                         process.wait(timeout=10)
@@ -242,6 +249,12 @@ def main():
     except BaseException as error:
         conditions["error"] = repr(error)
         halt(repr(error))
+        if process is not None and process.poll() is None:
+            try:
+                process.wait(timeout=10)
+            except subprocess.TimeoutExpired:
+                subprocess.run(["docker", "kill", client_name], capture_output=True)
+                process.wait(timeout=15)
         raise
     finally:
         done.set()
