@@ -1,0 +1,137 @@
+{"kind": "verified_inputs", "sha256": {"/opt/spark-ds41f/candidate/vllm/vllm/models/deepseek_v4_1/tilelang/moe.py": "dd8b24df39fb112a0a549bd5126322ef890cd37a7bf52abe8be3b29bd6c519d1", "/opt/spark-ds41f/candidate/vllm/tests/kernels/moe/test_deepseek_v41_tilelang_moe.py": "4b4cf39a49469bbca693239d9360da29176d787ff26f24efdc850ed3328695ad", "/experiment/benchmark_swizzle.py": "e6e3cbafb37d72f3914132f2f5575ed61d37d7aac796510f018e907fda0c1bef", "/b/control_moe.py": "dd8b24df39fb112a0a549bd5126322ef890cd37a7bf52abe8be3b29bd6c519d1", "/experiment/screen_statistics.py": "1b3e4661f30a4cc3d9493f8cf7e527ef2c79c928563ed0e537530ddb9b4bd355", "/experiment/screen_contract.py": "336371544fbf5251de076d0eadf2baefa2b10e86c5874e545c2586b4b97cbe5e"}, "mode": "contract-before", "process_id": "contract-before"}
+Using CPython 3.12.3 interpreter at: /usr/bin/python3
+Creating virtual environment at: /tmp/expert-venv
+============================= test session starts ==============================
+platform linux -- Python 3.12.3, pytest-9.1.1, pluggy-1.6.0 -- /tmp/expert-venv/bin/python
+cachedir: .pytest_cache
+rootdir: /opt/spark-ds41f/candidate/vllm
+configfile: pyproject.toml
+plugins: anyio-4.15.1
+collecting ... collected 138 items / 134 deselected / 4 selected
+
+tests/kernels/moe/test_deepseek_v41_tilelang_moe.py::test_grouped_gemm_emits_requested_prefill_swizzle[gate_up-576] FAILED [ 25%]
+tests/kernels/moe/test_deepseek_v41_tilelang_moe.py::test_grouped_gemm_emits_requested_prefill_swizzle[gate_up-768] FAILED [ 50%]
+tests/kernels/moe/test_deepseek_v41_tilelang_moe.py::test_grouped_gemm_emits_requested_prefill_swizzle[down-576] FAILED [ 75%]
+tests/kernels/moe/test_deepseek_v41_tilelang_moe.py::test_grouped_gemm_emits_requested_prefill_swizzle[down-768] FAILED [100%]
+
+=================================== FAILURES ===================================
+________ test_grouped_gemm_emits_requested_prefill_swizzle[gate_up-576] ________
+
+intermediate = 576, stage = 'gate_up'
+
+    @pytest.mark.parametrize("intermediate", [576, 768])
+    @pytest.mark.parametrize("stage", ["gate_up", "down"])
+    def test_grouped_gemm_emits_requested_prefill_swizzle(intermediate, stage):
+        """The opt-in must change code; the default keeps the prior unswizzled path."""
+        sources = {}
+        for panel in (None, 0, 3):
+            options = {} if panel is None else {"prefill_swizzle_panel": panel}
+            plan = MoeExpertsV41Plan(384, 6, 5120, intermediate, **options)
+            factory, args, kwargs = plan.kernels()[f"prefill_{stage}"]
+            source = factory(*args, **kwargs).get_kernel_source()
+>           assert ("rasterization2DRow<3>" in source) == (panel == 3)
+E           assert ('rasterization2DRow<3>' in '#if defined(_MSC_VER) && !defined(__clang__) && _MSC_VER < 1940\n#define _tl_orig_alignas alignas\n#define alignas(N) _tl_orig_alignas((N) <= 64 ? (N) : 64)\n#include <cuda.h>\n#undef alignas\n#define alignas _tl_orig_alignas\n#endif\n#include <tl_templates/cuda/instruction/mma_block_scale.h>\n#include <tl_templates/cuda/intrin.h>\n#include <tl_templates/cuda/barrier.h>\n#include <tl_templates/cuda/copy.h>\n#include <tl_templates/cuda/copy_sm90.h>\n#include <tl_templates/cuda/cuda_fp8.h>\n#include <tl_templates/cuda/reduce.h>\n#include <tl_templates/cuda/scan.h>\n#include <tl_templates/cuda/ldsm.h>\n#include <tl_templates/cuda/threadblock_swizzle.h>\n#include <tl_templates/cuda/debug.h>\n#ifdef ENABLE_BF16\n#include <tl_templates/cuda/cuda_bf16_fallbacks.cuh>\n#endif\n\nextern "C" __global__ void moe_grouped_fp8_fp4_gemm_kernel(const fp8_e4_t* A, __grid_constant__ const CUtensorMap B_desc, bfloat16_t* C, const ushort* Narrow, const int* Order, const uint* SFA, const ushort* SFB, const uchar* SFB8, const uchar* SFBase, const int* TileExpert, int code_rows, int tiles, int tokens);\nextern "C" __global__ void __launch_bounds__(128, 1) moe_grouped_fp8_fp4_gemm_kernel(const fp8_e4_t*...(i_4 >> 4) * 16)) + ((i_4 & 1) * 8)) + ((((int)threadIdx.x) & 31) >> 2))], ((int*)rows_shared)[((((((((int)threadIdx.x) & 63) >> 5) * 32) + ((i_4 >> 4) * 16)) + ((i_4 & 1) * 8)) + ((((int)threadIdx.x) & 31) >> 2))]);\n    }\n    for (int vec = 0; vec < 2; ++vec) {\n      if (0 <= rows_shared_local_cast_1[vec]) {\n        C_local_cast[vec] = ((bfloat16_t)C_local[((i_4 * 2) + vec)]);\n      }\n    }\n    if (0 <= ((int*)rows_shared)[((((((((int)threadIdx.x) & 63) >> 5) * 32) + ((i_4 >> 4) * 16)) + ((i_4 & 1) * 8)) + ((((int)threadIdx.x) & 31) >> 2))]) {\n      *(uint1*)(C + (((((((((((int64_t)((int)blockIdx.y)) * (int64_t)73728) + (((((int64_t)((int)threadIdx.x)) & (int64_t)63) >> (int64_t)5) * (int64_t)36864)) + ((((int64_t)i_4) >> (int64_t)4) * (int64_t)18432)) + ((((int64_t)i_4) & (int64_t)1) * (int64_t)9216)) + (((((int64_t)((int)threadIdx.x)) & (int64_t)31) >> (int64_t)2) * (int64_t)1152)) + (((int64_t)((int)blockIdx.x)) * (int64_t)128)) + ((((int64_t)((int)threadIdx.x)) >> (int64_t)6) * (int64_t)64)) + (((((int64_t)i_4) & (int64_t)15) >> (int64_t)1) * (int64_t)8)) + ((((int64_t)((int)threadIdx.x)) & (int64_t)3) * (int64_t)2))) = *(uint1*)(C_local_cast + 0);\n    }\n  }\n}\n\n') == (3 == 3)
+
+tests/kernels/moe/test_deepseek_v41_tilelang_moe.py:852: AssertionError
+----------------------------- Captured stdout call -----------------------------
+2026-11-06 07:46:48  [TileLang:tilelang.jit.kernel:INFO] (kernel.py:137): TileLang begins to compile kernel `moe_grouped_fp8_fp4_gemm` with `out_idx=None`
+2026-11-06 07:46:49  [TileLang:tilelang.jit.kernel:INFO] (kernel.py:145): TileLang completes to compile kernel `moe_grouped_fp8_fp4_gemm`
+2026-11-06 07:46:49  [TileLang:tilelang.cache.kernel_cache:WARNING] (kernel_cache.py:421): Found kernel 'moe_grouped_fp8_fp4_gemm' in memory cache. For better performance, consider using `@tilelang.jit` instead of direct kernel caching.
+----------------------------- Captured stderr call -----------------------------
+[07:46:48] /workspace/tilelang/src/transform/legalize_vectorized_loop.cc:85: Warning: T.vectorized loop over `vec` with extent 2 is lowered as a serial loop because TileLang could not find a valid vectorization plan. Scalar accumulator updates inside the loop are a common cause; move reductions to T.unroll or T.serial if this is intended.
+------------------------------ Captured log call -------------------------------
+INFO     tilelang.jit.kernel:kernel.py:137 TileLang begins to compile kernel `moe_grouped_fp8_fp4_gemm` with `out_idx=None`
+INFO     tilelang.jit.kernel:kernel.py:145 TileLang completes to compile kernel `moe_grouped_fp8_fp4_gemm`
+WARNING  tilelang.cache.kernel_cache:kernel_cache.py:421 Found kernel 'moe_grouped_fp8_fp4_gemm' in memory cache. For better performance, consider using `@tilelang.jit` instead of direct kernel caching.
+________ test_grouped_gemm_emits_requested_prefill_swizzle[gate_up-768] ________
+
+intermediate = 768, stage = 'gate_up'
+
+    @pytest.mark.parametrize("intermediate", [576, 768])
+    @pytest.mark.parametrize("stage", ["gate_up", "down"])
+    def test_grouped_gemm_emits_requested_prefill_swizzle(intermediate, stage):
+        """The opt-in must change code; the default keeps the prior unswizzled path."""
+        sources = {}
+        for panel in (None, 0, 3):
+            options = {} if panel is None else {"prefill_swizzle_panel": panel}
+            plan = MoeExpertsV41Plan(384, 6, 5120, intermediate, **options)
+            factory, args, kwargs = plan.kernels()[f"prefill_{stage}"]
+            source = factory(*args, **kwargs).get_kernel_source()
+>           assert ("rasterization2DRow<3>" in source) == (panel == 3)
+E           assert ('rasterization2DRow<3>' in '#if defined(_MSC_VER) && !defined(__clang__) && _MSC_VER < 1940\n#define _tl_orig_alignas alignas\n#define alignas(N) _tl_orig_alignas((N) <= 64 ? (N) : 64)\n#include <cuda.h>\n#undef alignas\n#define alignas _tl_orig_alignas\n#endif\n#include <tl_templates/cuda/instruction/mma_block_scale.h>\n#include <tl_templates/cuda/intrin.h>\n#include <tl_templates/cuda/barrier.h>\n#include <tl_templates/cuda/copy.h>\n#include <tl_templates/cuda/copy_sm90.h>\n#include <tl_templates/cuda/cuda_fp8.h>\n#include <tl_templates/cuda/reduce.h>\n#include <tl_templates/cuda/scan.h>\n#include <tl_templates/cuda/ldsm.h>\n#include <tl_templates/cuda/threadblock_swizzle.h>\n#include <tl_templates/cuda/debug.h>\n#ifdef ENABLE_BF16\n#include <tl_templates/cuda/cuda_bf16_fallbacks.cuh>\n#endif\n\nextern "C" __global__ void moe_grouped_fp8_fp4_gemm_kernel(const fp8_e4_t* A, __grid_constant__ const CUtensorMap B_desc, bfloat16_t* C, const ushort* Narrow, const int* Order, const uint* SFA, const ushort* SFB, const uchar* SFB8, const uchar* SFBase, const int* TileExpert, int code_rows, int tiles, int tokens);\nextern "C" __global__ void __launch_bounds__(128, 1) moe_grouped_fp8_fp4_gemm_kernel(const fp8_e4_t*...i_4 >> 4) * 16)) + ((i_4 & 1) * 8)) + ((((int)threadIdx.x) & 31) >> 2))], ((int*)rows_shared)[((((((((int)threadIdx.x) & 63) >> 5) * 32) + ((i_4 >> 4) * 16)) + ((i_4 & 1) * 8)) + ((((int)threadIdx.x) & 31) >> 2))]);\n    }\n    for (int vec = 0; vec < 2; ++vec) {\n      if (0 <= rows_shared_local_cast_1[vec]) {\n        C_local_cast[vec] = ((bfloat16_t)C_local[((i_4 * 2) + vec)]);\n      }\n    }\n    if (0 <= ((int*)rows_shared)[((((((((int)threadIdx.x) & 63) >> 5) * 32) + ((i_4 >> 4) * 16)) + ((i_4 & 1) * 8)) + ((((int)threadIdx.x) & 31) >> 2))]) {\n      *(uint1*)(C + (((((((((((int64_t)((int)blockIdx.y)) * (int64_t)98304) + (((((int64_t)((int)threadIdx.x)) & (int64_t)63) >> (int64_t)5) * (int64_t)49152)) + ((((int64_t)i_4) >> (int64_t)4) * (int64_t)24576)) + ((((int64_t)i_4) & (int64_t)1) * (int64_t)12288)) + (((((int64_t)((int)threadIdx.x)) & (int64_t)31) >> (int64_t)2) * (int64_t)1536)) + (((int64_t)((int)blockIdx.x)) * (int64_t)128)) + ((((int64_t)((int)threadIdx.x)) >> (int64_t)6) * (int64_t)64)) + (((((int64_t)i_4) & (int64_t)15) >> (int64_t)1) * (int64_t)8)) + ((((int64_t)((int)threadIdx.x)) & (int64_t)3) * (int64_t)2))) = *(uint1*)(C_local_cast + 0);\n    }\n  }\n}\n\n') == (3 == 3)
+
+tests/kernels/moe/test_deepseek_v41_tilelang_moe.py:852: AssertionError
+----------------------------- Captured stdout call -----------------------------
+2026-11-06 07:46:49  [TileLang:tilelang.jit.kernel:INFO] (kernel.py:137): TileLang begins to compile kernel `moe_grouped_fp8_fp4_gemm` with `out_idx=None`
+2026-11-06 07:46:50  [TileLang:tilelang.jit.kernel:INFO] (kernel.py:145): TileLang completes to compile kernel `moe_grouped_fp8_fp4_gemm`
+2026-11-06 07:46:50  [TileLang:tilelang.cache.kernel_cache:WARNING] (kernel_cache.py:421): Found kernel 'moe_grouped_fp8_fp4_gemm' in memory cache. For better performance, consider using `@tilelang.jit` instead of direct kernel caching.
+----------------------------- Captured stderr call -----------------------------
+[07:46:49] /workspace/tilelang/src/transform/legalize_vectorized_loop.cc:85: Warning: T.vectorized loop over `vec` with extent 2 is lowered as a serial loop because TileLang could not find a valid vectorization plan. Scalar accumulator updates inside the loop are a common cause; move reductions to T.unroll or T.serial if this is intended.
+------------------------------ Captured log call -------------------------------
+INFO     tilelang.jit.kernel:kernel.py:137 TileLang begins to compile kernel `moe_grouped_fp8_fp4_gemm` with `out_idx=None`
+INFO     tilelang.jit.kernel:kernel.py:145 TileLang completes to compile kernel `moe_grouped_fp8_fp4_gemm`
+WARNING  tilelang.cache.kernel_cache:kernel_cache.py:421 Found kernel 'moe_grouped_fp8_fp4_gemm' in memory cache. For better performance, consider using `@tilelang.jit` instead of direct kernel caching.
+_________ test_grouped_gemm_emits_requested_prefill_swizzle[down-576] __________
+
+intermediate = 576, stage = 'down'
+
+    @pytest.mark.parametrize("intermediate", [576, 768])
+    @pytest.mark.parametrize("stage", ["gate_up", "down"])
+    def test_grouped_gemm_emits_requested_prefill_swizzle(intermediate, stage):
+        """The opt-in must change code; the default keeps the prior unswizzled path."""
+        sources = {}
+        for panel in (None, 0, 3):
+            options = {} if panel is None else {"prefill_swizzle_panel": panel}
+            plan = MoeExpertsV41Plan(384, 6, 5120, intermediate, **options)
+            factory, args, kwargs = plan.kernels()[f"prefill_{stage}"]
+            source = factory(*args, **kwargs).get_kernel_source()
+>           assert ("rasterization2DRow<3>" in source) == (panel == 3)
+E           assert ('rasterization2DRow<3>' in '#if defined(_MSC_VER) && !defined(__clang__) && _MSC_VER < 1940\n#define _tl_orig_alignas alignas\n#define alignas(N) _tl_orig_alignas((N) <= 64 ? (N) : 64)\n#include <cuda.h>\n#undef alignas\n#define alignas _tl_orig_alignas\n#endif\n#include <tl_templates/cuda/instruction/mma_block_scale.h>\n#include <tl_templates/cuda/intrin.h>\n#include <tl_templates/cuda/barrier.h>\n#include <tl_templates/cuda/copy.h>\n#include <tl_templates/cuda/copy_sm90.h>\n#include <tl_templates/cuda/cuda_fp8.h>\n#include <tl_templates/cuda/reduce.h>\n#include <tl_templates/cuda/scan.h>\n#include <tl_templates/cuda/ldsm.h>\n#include <tl_templates/cuda/threadblock_swizzle.h>\n#include <tl_templates/cuda/debug.h>\n#ifdef ENABLE_BF16\n#include <tl_templates/cuda/cuda_bf16_fallbacks.cuh>\n#endif\n\nextern "C" __global__ void moe_grouped_fp8_fp4_gemm_kernel(const fp8_e4_t* A, const uchar* BT, __grid_constant__ const CUtensorMap B_desc, bfloat16_t* C, const ushort* Narrow, const int* Order, const uint* SFA, const ushort* SFB, const uchar* SFB8, const uchar* SFBase, const int* TileExpert, int code_rows, int tiles);\nextern "C" __global__ void __launch_bounds__(128, 1) moe_grouped_fp8_fp4_gemm_kernel(const fp8_...7 >> 4) * 16)) + ((i_7 & 1) * 8)) + ((((int)threadIdx.x) & 31) >> 2))], ((int*)rows_shared)[((((((((int)threadIdx.x) & 63) >> 5) * 32) + ((i_7 >> 4) * 16)) + ((i_7 & 1) * 8)) + ((((int)threadIdx.x) & 31) >> 2))]);\n    }\n    for (int vec = 0; vec < 2; ++vec) {\n      if (0 <= rows_shared_local_cast_1[vec]) {\n        C_local_cast[vec] = ((bfloat16_t)C_local[((i_7 * 2) + vec)]);\n      }\n    }\n    if (0 <= ((int*)rows_shared)[((((((((int)threadIdx.x) & 63) >> 5) * 32) + ((i_7 >> 4) * 16)) + ((i_7 & 1) * 8)) + ((((int)threadIdx.x) & 31) >> 2))]) {\n      *(uint1*)(C + (((((((((((int64_t)((int)blockIdx.y)) * (int64_t)327680) + (((((int64_t)((int)threadIdx.x)) & (int64_t)63) >> (int64_t)5) * (int64_t)163840)) + ((((int64_t)i_7) >> (int64_t)4) * (int64_t)81920)) + ((((int64_t)i_7) & (int64_t)1) * (int64_t)40960)) + (((((int64_t)((int)threadIdx.x)) & (int64_t)31) >> (int64_t)2) * (int64_t)5120)) + (((int64_t)((int)blockIdx.x)) * (int64_t)128)) + ((((int64_t)((int)threadIdx.x)) >> (int64_t)6) * (int64_t)64)) + (((((int64_t)i_7) & (int64_t)15) >> (int64_t)1) * (int64_t)8)) + ((((int64_t)((int)threadIdx.x)) & (int64_t)3) * (int64_t)2))) = *(uint1*)(C_local_cast + 0);\n    }\n  }\n}\n\n') == (3 == 3)
+
+tests/kernels/moe/test_deepseek_v41_tilelang_moe.py:852: AssertionError
+----------------------------- Captured stdout call -----------------------------
+2026-11-06 07:46:50  [TileLang:tilelang.jit.kernel:INFO] (kernel.py:137): TileLang begins to compile kernel `moe_grouped_fp8_fp4_gemm` with `out_idx=None`
+2026-11-06 07:46:51  [TileLang:tilelang.jit.kernel:INFO] (kernel.py:145): TileLang completes to compile kernel `moe_grouped_fp8_fp4_gemm`
+2026-11-06 07:46:52  [TileLang:tilelang.cache.kernel_cache:WARNING] (kernel_cache.py:421): Found kernel 'moe_grouped_fp8_fp4_gemm' in memory cache. For better performance, consider using `@tilelang.jit` instead of direct kernel caching.
+----------------------------- Captured stderr call -----------------------------
+[07:46:51] /workspace/tilelang/src/transform/legalize_vectorized_loop.cc:85: Warning: T.vectorized loop over `vec` with extent 2 is lowered as a serial loop because TileLang could not find a valid vectorization plan. Scalar accumulator updates inside the loop are a common cause; move reductions to T.unroll or T.serial if this is intended.
+------------------------------ Captured log call -------------------------------
+INFO     tilelang.jit.kernel:kernel.py:137 TileLang begins to compile kernel `moe_grouped_fp8_fp4_gemm` with `out_idx=None`
+INFO     tilelang.jit.kernel:kernel.py:145 TileLang completes to compile kernel `moe_grouped_fp8_fp4_gemm`
+WARNING  tilelang.cache.kernel_cache:kernel_cache.py:421 Found kernel 'moe_grouped_fp8_fp4_gemm' in memory cache. For better performance, consider using `@tilelang.jit` instead of direct kernel caching.
+_________ test_grouped_gemm_emits_requested_prefill_swizzle[down-768] __________
+
+intermediate = 768, stage = 'down'
+
+    @pytest.mark.parametrize("intermediate", [576, 768])
+    @pytest.mark.parametrize("stage", ["gate_up", "down"])
+    def test_grouped_gemm_emits_requested_prefill_swizzle(intermediate, stage):
+        """The opt-in must change code; the default keeps the prior unswizzled path."""
+        sources = {}
+        for panel in (None, 0, 3):
+            options = {} if panel is None else {"prefill_swizzle_panel": panel}
+            plan = MoeExpertsV41Plan(384, 6, 5120, intermediate, **options)
+            factory, args, kwargs = plan.kernels()[f"prefill_{stage}"]
+            source = factory(*args, **kwargs).get_kernel_source()
+>           assert ("rasterization2DRow<3>" in source) == (panel == 3)
+E           assert ('rasterization2DRow<3>' in '#if defined(_MSC_VER) && !defined(__clang__) && _MSC_VER < 1940\n#define _tl_orig_alignas alignas\n#define alignas(N) _tl_orig_alignas((N) <= 64 ? (N) : 64)\n#include <cuda.h>\n#undef alignas\n#define alignas _tl_orig_alignas\n#endif\n#include <tl_templates/cuda/instruction/mma_block_scale.h>\n#include <tl_templates/cuda/intrin.h>\n#include <tl_templates/cuda/barrier.h>\n#include <tl_templates/cuda/copy.h>\n#include <tl_templates/cuda/copy_sm90.h>\n#include <tl_templates/cuda/cuda_fp8.h>\n#include <tl_templates/cuda/reduce.h>\n#include <tl_templates/cuda/scan.h>\n#include <tl_templates/cuda/ldsm.h>\n#include <tl_templates/cuda/threadblock_swizzle.h>\n#include <tl_templates/cuda/debug.h>\n#ifdef ENABLE_BF16\n#include <tl_templates/cuda/cuda_bf16_fallbacks.cuh>\n#endif\n\nextern "C" __global__ void moe_grouped_fp8_fp4_gemm_kernel(const fp8_e4_t* A, __grid_constant__ const CUtensorMap B_desc, bfloat16_t* C, const ushort* Narrow, const int* Order, const uint* SFA, const ushort* SFB, const uchar* SFB8, const uchar* SFBase, const int* TileExpert, int code_rows, int tiles);\nextern "C" __global__ void __launch_bounds__(128, 1) moe_grouped_fp8_fp4_gemm_kernel(const fp8_e4_t* A, __grid_c...4 >> 4) * 16)) + ((i_4 & 1) * 8)) + ((((int)threadIdx.x) & 31) >> 2))], ((int*)rows_shared)[((((((((int)threadIdx.x) & 63) >> 5) * 32) + ((i_4 >> 4) * 16)) + ((i_4 & 1) * 8)) + ((((int)threadIdx.x) & 31) >> 2))]);\n    }\n    for (int vec = 0; vec < 2; ++vec) {\n      if (0 <= rows_shared_local_cast_1[vec]) {\n        C_local_cast[vec] = ((bfloat16_t)C_local[((i_4 * 2) + vec)]);\n      }\n    }\n    if (0 <= ((int*)rows_shared)[((((((((int)threadIdx.x) & 63) >> 5) * 32) + ((i_4 >> 4) * 16)) + ((i_4 & 1) * 8)) + ((((int)threadIdx.x) & 31) >> 2))]) {\n      *(uint1*)(C + (((((((((((int64_t)((int)blockIdx.y)) * (int64_t)327680) + (((((int64_t)((int)threadIdx.x)) & (int64_t)63) >> (int64_t)5) * (int64_t)163840)) + ((((int64_t)i_4) >> (int64_t)4) * (int64_t)81920)) + ((((int64_t)i_4) & (int64_t)1) * (int64_t)40960)) + (((((int64_t)((int)threadIdx.x)) & (int64_t)31) >> (int64_t)2) * (int64_t)5120)) + (((int64_t)((int)blockIdx.x)) * (int64_t)128)) + ((((int64_t)((int)threadIdx.x)) >> (int64_t)6) * (int64_t)64)) + (((((int64_t)i_4) & (int64_t)15) >> (int64_t)1) * (int64_t)8)) + ((((int64_t)((int)threadIdx.x)) & (int64_t)3) * (int64_t)2))) = *(uint1*)(C_local_cast + 0);\n    }\n  }\n}\n\n') == (3 == 3)
+
+tests/kernels/moe/test_deepseek_v41_tilelang_moe.py:852: AssertionError
+----------------------------- Captured stdout call -----------------------------
+2026-11-06 07:46:52  [TileLang:tilelang.jit.kernel:INFO] (kernel.py:137): TileLang begins to compile kernel `moe_grouped_fp8_fp4_gemm` with `out_idx=None`
+2026-11-06 07:46:53  [TileLang:tilelang.jit.kernel:INFO] (kernel.py:145): TileLang completes to compile kernel `moe_grouped_fp8_fp4_gemm`
+2026-11-06 07:46:53  [TileLang:tilelang.cache.kernel_cache:WARNING] (kernel_cache.py:421): Found kernel 'moe_grouped_fp8_fp4_gemm' in memory cache. For better performance, consider using `@tilelang.jit` instead of direct kernel caching.
+----------------------------- Captured stderr call -----------------------------
+[07:46:52] /workspace/tilelang/src/transform/legalize_vectorized_loop.cc:85: Warning: T.vectorized loop over `vec` with extent 2 is lowered as a serial loop because TileLang could not find a valid vectorization plan. Scalar accumulator updates inside the loop are a common cause; move reductions to T.unroll or T.serial if this is intended.
+------------------------------ Captured log call -------------------------------
+INFO     tilelang.jit.kernel:kernel.py:137 TileLang begins to compile kernel `moe_grouped_fp8_fp4_gemm` with `out_idx=None`
+INFO     tilelang.jit.kernel:kernel.py:145 TileLang completes to compile kernel `moe_grouped_fp8_fp4_gemm`
+WARNING  tilelang.cache.kernel_cache:kernel_cache.py:421 Found kernel 'moe_grouped_fp8_fp4_gemm' in memory cache. For better performance, consider using `@tilelang.jit` instead of direct kernel caching.
+--------------- generated xml file: /receipt/contract-before.xml ---------------
+=========================== short test summary info ============================
+FAILED tests/kernels/moe/test_deepseek_v41_tilelang_moe.py::test_grouped_gemm_emits_requested_prefill_swizzle[gate_up-576]
+FAILED tests/kernels/moe/test_deepseek_v41_tilelang_moe.py::test_grouped_gemm_emits_requested_prefill_swizzle[gate_up-768]
+FAILED tests/kernels/moe/test_deepseek_v41_tilelang_moe.py::test_grouped_gemm_emits_requested_prefill_swizzle[down-576]
+FAILED tests/kernels/moe/test_deepseek_v41_tilelang_moe.py::test_grouped_gemm_emits_requested_prefill_swizzle[down-768]
+====================== 4 failed, 134 deselected in 12.07s ======================
+{"kind": "contract_before", "expected_contract_failures": 4, "source_commit": "1f33102547e4da5c64712390604695d1abd577c4", "status": "reproduced"}

@@ -283,3 +283,16 @@ sequence is contract-before, gate-a, default-a, gate-b, default-b, estimated
 process has a 45-minute safety cap. An optional non-timing SP8 correctness subjob
 is permitted only when an actual holder owns and executes it. The coordination
 record never overrides a live hold. No GPU results exist at this checkpoint.
+
+
+## DGX4 execution receipts (2026-11-06)
+
+Executed on `dgx4` under scoped hold `dgx4-expert-route-reuse-1793950700` (`nodes: ["dgx4"]`):
+- `runs/contract-before-attempt1-conftest-tblib/` (exit 1: `tests/conftest.py` missing `tblib`; fixed with `--noconftest`)
+- `runs/contract-before/` (exit 0: 4 expected `AssertionError`s reproduced in `14.3 s`)
+- `runs/gate-a/` (`82.7 s`, `24 passed`) and `runs/gate-b/` (`18.5 s`, `24 passed`)
+- `runs/default-a-attempt1-run-ssh-binding/` (exit 1: package-global `run_ssh` binding; fixed in `run_screen.py`)
+- `runs/default-a/` (`170.2 s`, 30 cases) and `runs/default-b/` (`150.9 s`, 30 cases)
+- `runs/full-a/` (`521.6 s`, 38 cases across panels `0, 2, 3, 4, 8, 16`) and `runs/full-b/` (`508.4 s`, 38 cases)
+- `runs/gate-panel2-a/` (`28.0 s`, `24 passed`) and `runs/gate-panel2-b/` (`19.5 s`, `24 passed`)
+Fan state restored to `automatic` (`dgx-fan-control.service` `inactive`) and `dgx4:~/spark-hold.json` released.

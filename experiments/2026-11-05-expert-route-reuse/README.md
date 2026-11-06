@@ -222,3 +222,30 @@ It uses each layer's actual attention metadata key and explicit CED tag, the
 GPU query starts, and request/position coordinates. Native integration and a
 published serving capture profile remain pending. `capture/README.md` records
 its separate source identity and limits; it is not part of source PR #5.
+
+
+## DGX4 hardware qualification and `prefill_swizzle_panel=2` selection (2026-11-06)
+
+Under an isolated scoped reservation on `dgx4` (`dgx4-expert-route-reuse-1793950700`, disjoint from the `dgx1-3` triangle), all native GPU correctness and paired timing screens ran against `sha256:213ba4df68d06665add7a26260c2321d55854a75b8a51ae71c72d0b97eac814b` with cooling below 55 C and active fan-curve control:
+
+1. **Failed setup attempts retained**:
+   - `runs/contract-before-attempt1-conftest-tblib/`: `pytest` loaded `tests/conftest.py`, which imports `tblib` (absent from the serving image); fixed by passing `--noconftest` in `bundles/swizzle-screen/run.py`.
+   - `runs/default-a-attempt1-run-ssh-binding/`: `spark_ds41f/__init__.py` rebinds submodule functions to package globals, so `bench.hottest_zone_c.__globals__["run_ssh"]` also needed `local_transport`.
+2. **Old-contract reproduction & native gates**:
+   - `runs/contract-before/`: reproduced the exact 4 expected `AssertionError`s on untouched `candidate-38` `moe.py` (`14.3 s`).
+   - `runs/gate-a/` (`82.7 s`) and `runs/gate-b/` (`18.5 s`): `24 passed, 0 skipped` on `f3bfdf8b8c08870754cc3c756b75faa9156595e0` (`0001`+`0002`).
+   - `runs/gate-panel2-a/` (`28.0 s`) and `runs/gate-panel2-b/` (`19.5 s`): `24 passed, 0 skipped` on `444aa1853396389d2422f9fcc4c32e61bda66f36` (`0001`–`0003`, `prefill_swizzle_panel=2` default, decode/mid `swizzle_panel=0`, bit-equality across `0, 2, 3`).
+3. **Paired default preservation (`runs/default-a/`, `runs/default-b/`)**:
+   - All 9 kernel factories per TP shard width (`TP3` intermediate 768, `TP4` intermediate 576), including `swiglu`, emitted byte-identical CUDA source and compilation settings between untouched `candidate-38` and `panel=0`.
+   - Across all 30 cases per process (48 balanced replays each), output bits and first-17-row batch invariance were 100% identical, with overall mean change `-0.059%` (`default-a`) and `+0.017%` (`default-b`). Four `4096`/`8192` cases had 95% CIs straddling 0 whose upper bound reached `+1.08%` to `+1.60%` due to replay jitter on identical compiled kernels.
+4. **Two-process positive `prefill_swizzle_panel` screen (`runs/full-a/`, `runs/full-b/`)**:
+   - Screened `PANELS = (0, 2, 3, 4, 8, 16)` across 38 cases per process (`TP3` and `TP4`, rows `48, 96, 171, 500, 1023, 1024, 2047, 2048, 4096, 6144, 8192, 16384`), with 100% bit equality and first-17-row batch invariance on every sample.
+   - Decode/mid shapes (`rows <= 2047`, `M=16` and `M=32`) keep `swizzle_panel=0` and are unchanged (`-0.04%` to `+0.05%`). Forced `M=64` on tiny hot-expert inputs (`171`/`500` `prefill-m64`) is `+3.1%` to `+12.1%` slower for every positive panel, confirming `M=16` tier selection and `swizzle_panel=0` below `2048` rows.
+   - Across all 22 native `M=64` prefill cases (`2048, 4096, 6144, 8192, 16384` rows on `TP3` and `TP4`), **`prefill_swizzle_panel=2` is the only positive panel with 17/22 statistically significant 2-boot wins and 0/22 2-boot losses** (mean `-2.29%` in `full-a`, `-2.38%` in `full-b`; `-2.82%` / `-2.93%` across multi-tile chunks `4096..16384`):
+     - `TP3 6144` (TP3 prefill budget): `-5.58%` / `-5.51%` (`uniform`), `-3.43%` / `-3.10%` (`skewed`).
+     - `TP4 6144`: `-3.80%` / `-4.69%` (`uniform`), `-2.64%` / `-2.18%` (`skewed`).
+     - `TP3 8192`: `-4.57%` / `-4.30%` (`uniform`), `-3.99%` / `-4.49%` (`skewed`), `-4.20%` / `-4.09%` (`balanced`).
+     - `TP4 8192`: `-3.21%` / `-3.27%` (`uniform`), `-3.14%` / `-3.33%` (`skewed`), `-3.45%` / `-3.45%` (`balanced`).
+     - `TP3 16384`: `-1.46%` / `-1.39%` (`uniform`), `-1.63%` / `-1.67%` (`skewed`).
+     - `TP4 16384` (TP4 prefill budget): `-0.72%` / `-0.90%` (`uniform`), `-1.03%` / `-1.15%` (`skewed`).
+   - Patch `vllm/0003-select-panel-2-prefill-swizzle-default.patch` (`444aa1853396389d2422f9fcc4c32e61bda66f36`) selects `prefill_swizzle_panel=2` while keeping decode (`M=16`) and mid (`M=32`) at `swizzle_panel=0`.
