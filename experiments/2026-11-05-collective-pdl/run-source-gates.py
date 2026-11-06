@@ -129,7 +129,7 @@ def plans(nodes, run=1):
         benchmark = shared + ["--signal=TERM", "--kill-after=15s", "1200s", "python3", "-m",
                     "torch.distributed.run", "--nnodes=3", "--nproc-per-node=1",
                     f"--node-rank={node['rank']}", f"--master-addr={head['management_ip']}",
-                    "--master-port=29652", "/collective/benchmark_launch_chain.py",
+                    "--master-port=29652", "--", "/collective/benchmark_launch_chain.py",
                     "--variant",PHASE,"--source-commit",PIN,"--run",str(run)]
         result.append({"node": node, "tests": tests, "probe": probe, "benchmark":benchmark})
     return result
