@@ -95,7 +95,8 @@ def run(main, url: str, suite: dict, out_dir: str, *, label: str | None = None, 
     out = Path(out_dir)
     out.mkdir(parents=True, exist_ok=True)
     prepared_model = None
-    if model_evidence and suite["name"] == model_evidence["contract"]["suite"]:
+    if model_evidence and (suite["name"] == model_evidence["contract"]["suite"]
+                           or any(step["command"] == "model" for step in suite["steps"])):
         prior = [out / "suite.json", out / "model.json.gz", out / "model.json.gz.evidence.json",
                  out / "model.preflight.evidence.json"]
         if any(path.exists() for path in prior):
@@ -106,7 +107,8 @@ def run(main, url: str, suite: dict, out_dir: str, *, label: str | None = None, 
             with (out / "model.preflight.evidence.json").open("x") as stream:
                 json.dump({"schema": model_evidence_api.SCHEMA, "status": "preflight-failed",
                     "contract": {"path": model_evidence["path"], "sha256": model_evidence["sha256"]},
-                    "model_requests_started": False, "errors": [f"{type(error).__name__}: {error}"]}, stream, indent=2)
+                    "model_requests_started": False, "parser_worker": getattr(error, "receipt", None),
+                    "errors": [f"{type(error).__name__}: {error}"]}, stream, indent=2)
                 stream.write("\n")
             raise
     index = {"schema": SCHEMA, "suite": suite, "suite_sha256": digest(suite), "label": label, "corpus": corpus,
@@ -123,8 +125,18 @@ def run(main, url: str, suite: dict, out_dir: str, *, label: str | None = None, 
             code = f"{type(error).__name__}: {error}"[:300]
         index["steps"].append({"id": step["id"], "command": step["command"], "output": output_name(step),
                                "exit": code, "seconds": round(time.monotonic() - began, 1)})
+        # Native process outcome must survive any later parser/resource failure.
+        (out / "suite.json").write_text(json.dumps(index, indent=1) + "\n")
         if prepared_model is not None and step["command"] == "model":
-            evidence = model_evidence_api.evaluate(output, code, prepared_model)
+            try:
+                evidence = model_evidence_api.evaluate(output, code, prepared_model)
+            except Exception as error:
+                evidence = {"schema": model_evidence_api.SCHEMA, "status": "failed",
+                    "contract": prepared_model["binding"], "process_exit": code,
+                    "reference_provenance": prepared_model.get("reference_provenance"),
+                    "references": prepared_model.get("references", []),
+                    "required_evidence_passed": False,
+                    "errors": [f"{type(error).__name__}: {error}"]}
             evidence_path = Path(output + ".evidence.json")
             with evidence_path.open("x") as stream:
                 json.dump(evidence, stream, indent=2, allow_nan=False)
@@ -136,7 +148,6 @@ def run(main, url: str, suite: dict, out_dir: str, *, label: str | None = None, 
                 index["stopped_before_timing"] = True
                 log("required model evidence failed; remaining suite steps were not run")
                 break
-        (out / "suite.json").write_text(json.dumps(index, indent=1) + "\n")
     index["finished_utc"] = datetime.datetime.now(datetime.timezone.utc).isoformat(timespec="seconds")
     (out / "suite.json").write_text(json.dumps(index, indent=1) + "\n")
     return index

@@ -1,7 +1,9 @@
 """Compact native completion audit; no timing-output analysis on serving hosts."""
 import json
 from pathlib import Path
+import re
 from servebench import suite
+from c46_native import conditions_pass
 
 ROOT = Path(__file__).resolve().parents[2]
 NODES = {"dgx1", "dgx2", "dgx3"}
@@ -17,9 +19,10 @@ def read(path):
     return json.loads(path.read_text())
 
 
-def validate(spec, image, commit):
+def validate(spec, image, commit, model_contract_sha256):
     job, summaries, boots, total = spec["jobs"][0], [], [], 0
     require(job.get("fail_on_suite_error") is True, "suite failure must stop the remaining cohort")
+    require(re.fullmatch(r"[0-9a-f]{64}", model_contract_sha256 or ""), "frozen model contract hash required")
     require(job["suite"] == ["release-tp3", "single-stream", "sampled"], "performance families changed")
     for arm in job["arms"]:
         started = None
@@ -34,6 +37,17 @@ def validate(spec, image, commit):
                     f"incomplete/failed/ordered suite: {arm['label']}/{name}")
             require([s["output"] for s in index["steps"]] == [suite.output_name(s) for s in definition["steps"]],
                     "suite output names changed")
+            if name == "release-tp3":
+                model = index.get("model_evidence", {})
+                require(model.get("required_evidence_passed") is True
+                        and model.get("output") == "model.json.gz.evidence.json"
+                        and model.get("contract_sha256") == model_contract_sha256,
+                        "required model barrier missing, failed or bound to another contract")
+                evidence = read(directory / model["output"])
+                require(evidence.get("required_evidence_passed") is True and evidence.get("process_exit") == 0
+                        and not evidence.get("errors")
+                        and evidence.get("contract", {}).get("sha256") == model_contract_sha256,
+                        "native model evidence failed or differs from frozen contract")
             identity = index["metadata"]["identity"]
             require(not identity["live_problems"] and not identity["client_dirty"]
                     and identity["client_commit"] == commit and identity["cluster_config"] == arm["config"]
@@ -50,16 +64,7 @@ def validate(spec, image, commit):
             started = times if started is None else started
             require(started == times, "companion suite reused another boot")
             conditions = read(directory / "conditions.json")
-            require(not conditions["halted"] and not conditions["fan_stop_failures"], "suite condition/fan halt")
-            require(all(set(conditions[field]) == NODES for field in ("memory", "thermal")), "guard ranks missing")
-            require({r["node"] for r in conditions["cooling"]} == NODES
-                    and all(r["final_c"] < 55 for r in conditions["cooling"]), "suite cold guard incomplete")
-            require({r["node"] for r in conditions["fan_curve"]} == NODES, "fan coverage incomplete")
-            for node in NODES:
-                memory, thermal = conditions["memory"][node], conditions["thermal"][node]
-                require(memory["min_available_gib"] >= 3 and memory["swap_growth_gib"] == 0,
-                        f"suite memory/swap: {node}")
-                require(thermal["thermal_slowdown_ms"] == 0, f"suite thermal slowdown: {node}")
+            require(conditions_pass(conditions, NODES, 3), "suite guard evidence is incomplete or adverse")
             telemetry = read(ROOT / "results/private/determinism" / spec["run"]
                              / f"suite-{arm['label']}{suffix}.telemetry.json")
             require(set(telemetry["nodes"]) == NODES and all(r["samples"] > 0 for r in telemetry["nodes"].values()),

@@ -32,7 +32,10 @@ fails before the candidate model starts and keeps a preflight error receipt.
 
 The saved source is C40 head5f926df6/treeca1496c6, image7ae96e98, execution1f134c7a.
 Root supplied the immutable native paths, byte sizes and hashes from its published
-export receipt. Their expected corpus is
+export receipt. The template additionally freezes
+`runs/preflight/model-reference-provenance.json` by exact hash. That small record
+binds both artifacts to the published analysis/export hashes and all three rank
+start timestamps per boot; reusing any rank's boot is refused. Their expected corpus is
 `5f7d25fcf89f62ce2877a941d3eabf9ca0c8f77587e35a7b989e24cf02385a60`,
 with256 sequences and65,536 scored positions. Only those small metadata records
 were read on the workstation; the15MB saved model files were not accessed.
@@ -42,9 +45,13 @@ and output and writes `model.json.gz.evidence.json`. It requires complete unique
 prompt IDs, generated/scored token agreement, complete finite score arrays,
 valid corpus identity, exact workload and generation/score equality with both
 saved C40 boots. The compact score digest includes the existing comparison's
-given-token probabilities and top-token distributions, plus their tokens/ranks;
-there is no invented epsilon or new sampled-batch requirement. The raw output
-hash is retained even for semantic or process failure where output exists.
+given-token probabilities and ordered top-token distributions, plus token IDs.
+Rank shape, validity and digest are observations and do not enter equality.
+Finite numbers use exact integer-ratio normalization, so signed zero and
+equivalent integer/float values match the existing comparator without a new
+epsilon. Self-agreement metadata is not compared: the repeat normally scores
+the first boot's corpus and records null. Raw output and native exits are
+preserved; an incomplete parse truthfully records that its full hash was not completed.
 
 Either a nonzero/exceptional model exit or zero-exit semantic failure stops before
 grid, records `stopped_before_timing`, and returns a failed suite result. The lab
@@ -58,3 +65,20 @@ functional evidence API independently handles the three greedy requirements and
 sampled isolated repeat while retaining C8 batch differences as observations.
 Root's private C46 post-functional audit still covers the remaining C40 contract
 and the final six-suite/26-step/conditions/identity audit remains required.
+
+## Parser and failure corrections awaiting remote checks
+
+The earlier nine-case remote CPU proof is retained. These subsequent corrections
+have not been executed. Production parsing now runs only in fresh Linux parser
+subprocesses, leaving the benchmark client's affinity and limits unchanged. Each
+parser uses one allowed CPU, at most4GiB virtual address space (or a stricter
+inherited limit),30/35 CPU seconds and60 wall seconds. Encoded files are limited
+to32MiB before decoding and while reading; decoded reads stop at256MiB. Output
+receipts are bounded too. These are parser-process VMS/CPU/read bounds, not an
+RSS, cgroup or no-swap claim; the existing host memory/swap guards remain required.
+
+The native model step outcome is written before evaluation. EOF, memory,
+recursion, timeout or signal failures become failed evidence and stop before
+grid; the parent performs no unbounded fallback scan. A model-containing suite
+with a mismatched contract fails before requests. Model-free companion suites
+remain allowed, and suites without the opt-in keep their prior behavior.
