@@ -187,18 +187,36 @@ not a change to active capacity. The first arm's model corpus is scored by
 later arms. The control is explicitly an unreleased C40 causal control on this
 new workload; it is not a rerun of the released 1030 reference.
 
-Before timing each arm, require the existing wide greedy token/logprob gate
-without silent text-only fallback, a matching ordinary no-logprob greedy
-path, the seeded temperature-1 batch/repeat gate, and complete sampling-control
-digests. The
-separate tool/schema gate sends 16 distinct requests in each combination of
-forced tool versus strict JSON schema, temperature 0 versus 1, and c1/c8/c16.
-It checks exact generated values and native token IDs across batching and
-policy arms. It also requires rejection of an invalid request followed by a
-successful ordinary request.
-False summary verdicts fail even when an old script exits zero. Signatures
-must agree across arms/boots; subsequent qualification also compares to the
-screen's control signatures. Native logs, source hashes, image identities,
+Before timing each arm, require the predeclared functional evidence contracts
+in `run_hardware.py` (`spark_ds41f/functional_evidence.py`):
+- the wide greedy token/logprob gate (`greedy`) without silent text-only
+  fallback, plus per-request native logprob equality;
+- the ordinary no-logprob greedy gate (`greedy-fast`) with text digests
+  matching the native-logprob greedy path;
+- the seeded temperature-1 gate (`sampled`, `sampled_digest.py --tokens 192
+  --record-dir`) requiring isolated-repeat (`again` / `repeat_alone`) equality
+  while recording `c8` cross-batch trajectory variation as an observation with
+  full private per-case token/logprob arrays, request/response IDs, controls
+  and a hash-verified 24-request manifest;
+- the sampling-controls gate (`controls`) requiring `alone == c8` for all
+  temperature-0 controls and valid rejections for `min-p`/`logit-bias`, while
+  recording `penalties-sampled/c8` as an observed temperature-1 batch digest;
+- the tool/schema gate (`tool-schema`) sending 16 distinct requests in each
+  combination of forced tool versus strict JSON schema, temperature 0 versus 1,
+  and c1/c8/c16 (plus an isolated c1 repeat at temperature 1), requiring exact
+  generated values, finish reasons and native token IDs across every request,
+  c1/c8/c16 token-ID invariance at temperature 0, isolated-repeat token-ID
+  invariance at temperature 1, and rejection of an invalid request followed by
+  a successful ordinary request.
+
+False, missing or malformed required verdicts fail even when a collector exits
+zero, writing `<gate>.jsonl.evidence.json` before requesting restoration.
+Deterministic temperature-0 and rejection signatures must agree across all arms
+and boots; isolated c1 temperature-1 signatures (`sampled` `reference_sha256`,
+`penalties-sampled/alone`, and `tool-schema` `t1.0/c1`) must also agree across
+repeat boots of the same row-cost configuration; subsequent qualification
+compares against both the screen's control signatures and the candidate's
+same-config signatures. Native logs, source hashes, image identities,
 run commands, cooling/fan state, thermal and memory observations stay under
 `results/private/lab/verification-budget-hardware/<window>/<stage>/`.
 Preserve all unsuccessful arms and guard failures; never silently restart an

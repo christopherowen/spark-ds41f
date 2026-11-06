@@ -19,7 +19,7 @@ import time
 
 ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(ROOT))
-from spark_ds41f import lab, bench
+from spark_ds41f import functional_evidence as evidence, lab, bench
 
 EXPERIMENT = Path(__file__).resolve().parent.relative_to(ROOT).as_posix()
 RESTORE = "experiments/2026-10-26-spark-ds41f-candidate/candidate-36/tp3-dev.json"
@@ -38,9 +38,63 @@ GATES = [
     ("controls", "experiments/2026-10-24-tilelang-completion/controls_digest.py", ["--tokens", "96"]),
     ("tool-schema", f"{EXPERIMENT}/tool_schema_gate.py", []),
 ]
+SAMPLED_CONTRACT = {
+    "kind": "sampled",
+    "batch_invariance": "observe",
+    "isolated_repeat": "require",
+    "tokens": 192,
+    "seed": 20261024,
+    "cases": 8,
+    "record_requests": True,
+}
+EVIDENCE_CONTRACTS = {
+    "greedy": {
+        "kind": "summary",
+        "label": "temperature-0 determinism",
+        "require": {"identical": True, "logprobs": True, "tokens": 192},
+    },
+    "greedy-fast": {
+        "kind": "summary",
+        "label": "temperature-0 determinism",
+        "require": {"identical": True, "logprobs": False, "tokens": 192},
+    },
+    "sampled": SAMPLED_CONTRACT,
+    "controls": {
+        "kind": "summary",
+        "label": "controls digests",
+        "require": {"failed": [], "tokens": 96, "seed": 20261024},
+        "observe": ["digests.penalties-sampled/c8"],
+    },
+    "tool-schema": {
+        "kind": "summary",
+        "label": "tool-schema gate",
+        "require": {"passed": True},
+        "observe": ["signatures"],
+    },
+}
 
 
-def gate_summary(text, name):
+def validate_declared_contracts():
+    if set(EVIDENCE_CONTRACTS) != {name for name, _, _ in GATES}:
+        raise ValueError("every functional gate must declare an evidence contract")
+    for name, script, extra in GATES:
+        contract = EVIDENCE_CONTRACTS[name]
+        evidence.validate_contract(contract)
+        if contract.get("record_requests"):
+            if script != evidence.SAMPLED_COLLECTOR:
+                raise ValueError("request recording is supported only by the sampled collector")
+            if any(str(arg).split("=", 1)[0] == "--record-dir" for arg in extra):
+                raise ValueError("the runner supplies the sampled request record directory")
+
+
+def gate_argv(name, script, extra, log):
+    argv = [sys.executable, script, lab.head_url(), *extra]
+    if EVIDENCE_CONTRACTS[name].get("record_requests"):
+        argv += ["--record-dir", str(Path(log).with_suffix(".requests"))]
+    return argv
+
+
+def gate_summary(text, name, log=None):
     records = []
     scenarios = []
     for line in text.splitlines():
@@ -56,34 +110,65 @@ def gate_summary(text, name):
         raise ValueError(f"{name}: missing or ambiguous gate summary")
     result = records[0]
     if name == "tool-schema":
-        if result.get("passed") is not True or len(result.get("signatures", {})) != 13:
+        signatures = result.get("signatures")
+        if result.get("passed") is not True or not isinstance(signatures, dict) or len(signatures) != 13:
             raise ValueError("tool/schema gate is incomplete or failed")
-        return result["signatures"]
-    if name in ("greedy", "greedy-fast", "sampled"):
-        if result.get("identical") is not True or not re.fullmatch(r"[0-9a-f]{64}", result.get("reference_sha256", "")):
+        if signatures.get("invalid_request_status") not in (400, 422) or any(
+                key != "invalid_request_status" and (not isinstance(val, str) or not re.fullmatch(r"[0-9a-f]{64}", val))
+                for key, val in signatures.items()):
+            raise ValueError("tool/schema gate signatures are malformed")
+        return signatures
+    if name in ("greedy", "greedy-fast"):
+        if result.get("identical") is not True or not re.fullmatch(r"[0-9a-f]{64}", result.get("reference_text_sha256", "")):
             raise ValueError(f"{name}: batch/seed invariance failed")
-        if name.startswith("greedy"):
-            expected = {"c8", "staggered", "mixed", "cached", "again", "mixed15"}
-            if set(result.get("scenarios", {})) != expected or {r["scenario"] for r in scenarios} != expected:
-                raise ValueError(f"{name}: missing mixed/cache/batch coverage")
-            if result.get("logprobs") is not (name == "greedy"):
-                raise ValueError(f"{name}: silently changed the requested logprob path")
-            if name == "greedy" and any(not r.get("requests") or any(
-                    row.get("logprobs_equal") is not True for row in r["requests"]) for r in scenarios):
-                raise ValueError("greedy: native logprob comparison is missing")
-            keys = ("reference_text_sha256", "long_text_sha256")
-            if name == "greedy":
-                keys += ("reference_sha256", "long_sha256")
-            if any(not re.fullmatch(r"[0-9a-f]{64}", result.get(key, "")) for key in keys):
-                raise ValueError(f"{name}: native/text digest is missing")
-            return {key: result[key] for key in keys}
-        return {"reference_sha256": result["reference_sha256"]}
+        expected = {"c8", "staggered", "mixed", "cached", "again", "mixed15"}
+        if set(result.get("scenarios", {})) != expected or {r["scenario"] for r in scenarios} != expected:
+            raise ValueError(f"{name}: missing mixed/cache/batch coverage")
+        if result.get("logprobs") is not (name == "greedy"):
+            raise ValueError(f"{name}: silently changed the requested logprob path")
+        if name == "greedy" and any(not r.get("requests") or any(
+                row.get("logprobs_equal") is not True for row in r["requests"]) for r in scenarios):
+            raise ValueError("greedy: native logprob comparison is missing")
+        keys = ("reference_text_sha256", "long_text_sha256")
+        if name == "greedy":
+            keys += ("reference_sha256", "long_sha256")
+        if any(not re.fullmatch(r"[0-9a-f]{64}", result.get(key, "")) for key in keys):
+            raise ValueError(f"{name}: native/text digest is missing")
+        return {key: result[key] for key in keys}
+    if name == "sampled":
+        if log is not None:
+            report = evidence.evaluate(Path(log), SAMPLED_CONTRACT)
+        else:
+            report = {"required": {}, "observed": {}, "errors": []}
+            try:
+                evidence._sampled([*scenarios, result], result, dict(SAMPLED_CONTRACT, record_requests=False), report)
+            except (ValueError, TypeError, KeyError) as error:
+                report["errors"].append(str(error))
+        if report["errors"]:
+            raise ValueError("sampled: " + "; ".join(report["errors"]))
+        c8 = next(r for r in scenarios if r["scenario"] == "c8")
+        again = next(r for r in scenarios if r["scenario"] == "again")
+        summary_out = {
+            "reference_sha256": result["reference_sha256"],
+            "isolated_repeat_sha256": again["sha256"],
+            "observed_c8_sha256": c8["sha256"],
+            "observed_c8_differing": c8["differing"],
+        }
+        if "token_differing" in c8:
+            summary_out["observed_c8_token_differing"] = c8["token_differing"]
+        if "logprob_differing" in c8:
+            summary_out["observed_c8_logprob_differing"] = c8["logprob_differing"]
+        if "request_records" in report:
+            summary_out["request_manifest_sha256"] = report["request_records"]["manifest_sha256"]
+        return summary_out
     if result.get("failed") != [] or not result.get("digests"):
         raise ValueError("controls: failed or absent results")
     digests = result["digests"]
     expected = {"penalties", "penalties-sampled", "min-p", "logit-bias", "bad-words", "thinking-budget", "logprob-ids"}
     if {key.split("/")[0] for key in digests} != expected:
         raise ValueError("controls: scenario coverage is incomplete")
+    if any(not isinstance(val, str) or not re.fullmatch(r"[0-9a-f]{64}", val) for val in digests.values()):
+        raise ValueError("controls: malformed digest")
     for scenario in expected:
         if f"{scenario}/rejected" in digests:
             if scenario not in ("min-p", "logit-bias"):
@@ -91,9 +176,55 @@ def gate_summary(text, name):
         elif not {f"{scenario}/alone", f"{scenario}/c8"} <= digests.keys():
             raise ValueError(f"controls: missing batch mode for {scenario}")
     for key, value in digests.items():
-        if key.endswith("/alone") and digests.get(key.removesuffix("/alone") + "/c8") != value:
+        if key.endswith("/alone") and key != "penalties-sampled/alone" and (
+                digests.get(key.removesuffix("/alone") + "/c8") != value):
             raise ValueError(f"controls: batch mismatch for {key}")
     return digests
+
+
+def evaluate_gate(log, name, code, halted):
+    path = Path(log)
+    evidence_path = Path(f"{path}.evidence.json")
+    report = evidence.evaluate(path, EVIDENCE_CONTRACTS[name])
+    report["process_exit"] = code
+    if code:
+        report["errors"].append(f"collector exited {code}")
+    if halted:
+        report["errors"].append(f"guard halted: {'; '.join(halted)}")
+    summary = None
+    if not report["errors"]:
+        try:
+            summary = gate_summary(path.read_text(), name, log=path)
+        except ValueError as error:
+            report["errors"].append(str(error))
+    report["required_evidence_passed"] = not report["errors"]
+    if report["errors"]:
+        report["status"] = "failed"
+    lab.write_json_atomic(evidence_path, report)
+    if not report["required_evidence_passed"]:
+        raise RuntimeError(f"{path.stem}: {'; '.join(report['errors'])}")
+    return summary, report
+
+
+def cross_arm_signature(signatures):
+    """Deterministic temperature-0 and rejection signatures must match across every arm and boot."""
+    return {
+        "greedy": signatures["greedy"],
+        "greedy-fast": signatures["greedy-fast"],
+        "controls": {k: v for k, v in signatures["controls"].items() if not k.startswith("penalties-sampled/")},
+        "tool-schema": {k: v for k, v in signatures["tool-schema"].items() if "/t1.0/" not in k},
+    }
+
+
+def same_config_signature(signatures):
+    """Isolated c1 temperature-1 trajectories must also match across repeat boots of the same row-cost config."""
+    return {
+        **cross_arm_signature(signatures),
+        "sampled": {"reference_sha256": signatures["sampled"]["reference_sha256"]},
+        "controls_sampled_alone": signatures["controls"].get("penalties-sampled/alone"),
+        "tool_schema_sampled_c1": {k: v for k, v in signatures["tool-schema"].items()
+                                   if k in ("schema/t1.0/c1", "tool/t1.0/c1")},
+    }
 
 
 def owns(hold, window):
@@ -131,7 +262,7 @@ def resume_arms(previous, current, arms):
             or previous.get("error") not in {f"RuntimeError: {HANDOFF_REQUEST}", f"RuntimeError: {ARM_LIMIT}"}
             or previous.get("restore_error")):
         raise ValueError("resume requires a restored handoff, not a failed or completed stage")
-    for key in ("commit", "gate_sources", "images", "restore_profile", "stage", "screen_receipt_sha256"):
+    for key in ("commit", "evidence_contracts", "gate_sources", "images", "restore_profile", "stage", "screen_receipt_sha256"):
         if previous.get(key) != current.get(key):
             raise ValueError(f"resume {key} differs")
     completed = previous.get("completed_arms", [])
@@ -145,6 +276,7 @@ def resume_arms(previous, current, arms):
 
 
 def main():
+    validate_declared_contracts()
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--stage", choices=("screen", "qualify010", "qualify020", "restore"), default="screen")
     parser.add_argument("--window")
@@ -173,6 +305,7 @@ def main():
     if not args.apply:
         print(json.dumps({"stage": args.stage, "arms": arms, "suites": suites,
                           "restore_profile": RESTORE, "image": IMAGE,
+                          "evidence_contracts": EVIDENCE_CONTRACTS,
                           "resume_from": args.resume_from,
                           "screen_from": args.screen_from,
                           "max_arms": args.max_arms,
@@ -195,6 +328,7 @@ def main():
                "max_arms": args.max_arms,
                "commit": lab.checkout_commit(), "restore_commit": args.restore_commit,
                "restore_profile": RESTORE, "steps": [], "restored": False,
+               "evidence_contracts": EVIDENCE_CONTRACTS,
                "gate_sources": {name: {"path": script, "sha256": hashlib.sha256((ROOT / script).read_bytes()).hexdigest()}
                                 for name, script, _ in GATES}}
     done = threading.Event()
@@ -255,6 +389,7 @@ def main():
             identities[node["name"]] = result.stdout.strip()
         receipt["images"] = identities; save()
         signatures = None
+        config_signatures = {}
         completed = []
         def stage_path(value, stage):
             path = Path(value).resolve()
@@ -271,12 +406,19 @@ def main():
             screen_receipt = json.loads(source.read_text())
             if screen_receipt.get("completed") is not True:
                 raise RuntimeError("qualification needs a completed causal screen")
-            for key in ("commit", "gate_sources", "images", "restore_profile"):
+            for key in ("commit", "evidence_contracts", "gate_sources", "images", "restore_profile"):
                 if screen_receipt.get(key) != receipt.get(key):
                     raise ValueError(f"qualification screen {key} differs")
             control = next(arm for arm in screen_receipt["completed_arms"] if arm["label"] == "control035-a")
             control_screen = stage_path(control.get("source_run", str(screen)), "screen")
-            signatures = json.loads((control_screen / "control035-a-signatures.json").read_text())
+            control_recorded = json.loads((control_screen / "control035-a-signatures.json").read_text())
+            signatures = cross_arm_signature(control_recorded)
+            candidate_arm = next((arm for arm in screen_receipt["completed_arms"]
+                                  if arm["label"] == f"row{args.stage[-3:]}-a"), None)
+            if candidate_arm is not None:
+                candidate_screen = stage_path(candidate_arm.get("source_run", str(screen)), "screen")
+                candidate_recorded = json.loads((candidate_screen / f"{candidate_arm['label']}-signatures.json").read_text())
+                config_signatures[f"{EXPERIMENT}/row{args.stage[-3:]}.json"] = same_config_signature(candidate_recorded)
             receipt.update(screen_receipt=str(source),
                            screen_receipt_sha256=hashlib.sha256(source.read_bytes()).hexdigest())
             save()
@@ -292,9 +434,14 @@ def main():
                 recorded = json.loads((origin / f"{measured['label']}-signatures.json").read_text())
                 if set(recorded) != {name for name, _, _ in GATES}:
                     raise ValueError("resume signatures lack a required gate")
-                if signatures is not None and recorded != signatures:
+                cross = cross_arm_signature(recorded)
+                same = same_config_signature(recorded)
+                if signatures is not None and cross != signatures:
                     raise ValueError("resume signatures changed between completed arms")
-                signatures = recorded
+                if measured["config"] in config_signatures and same != config_signatures[measured["config"]]:
+                    raise ValueError("resume config signatures changed between repeat boots")
+                signatures = cross
+                config_signatures[measured["config"]] = same
             if args.stage == "screen":
                 corpus = stage_path(completed[0]["source_run"], "screen") / arms[0]["label"] / "screen-suite/model.json.gz"
                 if not corpus.is_file():
@@ -345,8 +492,13 @@ def main():
                     if not owns(lab.read_hold(), args.window):
                         raise RuntimeError("window ownership changed")
                     log = out / f"{label}-{name}.jsonl"
-                    argv = [sys.executable, script, lab.head_url(), *extra]
-                    with log.open("w") as stream:
+                    evidence_path = Path(f"{log}.evidence.json")
+                    request_dir = log.with_suffix(".requests")
+                    if log.exists() or evidence_path.exists() or (
+                            EVIDENCE_CONTRACTS[name].get("record_requests") and request_dir.exists()):
+                        raise FileExistsError(f"prior required evidence exists for {label}/{name}")
+                    argv = gate_argv(name, script, extra, log)
+                    with log.open("x") as stream:
                         child["process"] = subprocess.Popen(argv, cwd=ROOT, stdout=stream, stderr=subprocess.STDOUT)
                         while child["process"].poll() is None:
                             try:
@@ -360,14 +512,17 @@ def main():
                             time.sleep(1)
                         code = child["process"].returncode
                     watch.check()
-                    if code or halted:
-                        raise RuntimeError(f"{label}/{name}: failed or guard halted")
-                    current[name] = gate_summary(log.read_text(), name)
+                    current[name], _ = evaluate_gate(log, name, code, halted)
                 if current["greedy-fast"] != {key: current["greedy"][key] for key in current["greedy-fast"]}:
                     raise RuntimeError("ordinary greedy output differs from the logprob path")
-                if signatures is not None and current != signatures:
+                cross = cross_arm_signature(current)
+                same = same_config_signature(current)
+                if signatures is not None and cross != signatures:
                     raise RuntimeError("functional signatures changed between arms/boots")
-                signatures = current
+                if config in config_signatures and same != config_signatures[config]:
+                    raise RuntimeError("same-config functional signatures changed between repeat boots")
+                signatures = cross
+                config_signatures[config] = same
                 lab.write_json_atomic(out / f"{label}-signatures.json", current)
             finally:
                 if "process" in child and child["process"].poll() is None:

@@ -68,12 +68,25 @@ def run(base):
             for concurrency in (1, 8, 16):
                 with ThreadPoolExecutor(max_workers=concurrency) as pool:
                     results = list(pool.map(request, range(16)))
-                if reference is not None and results != reference:
-                    raise ValueError(f"{mode}/{temperature}: output changed at c{concurrency}")
-                reference = results
+                if reference is None:
+                    reference = results
+                else:
+                    if [(r["value"], r["finish_reason"]) for r in results] != [
+                            (r["value"], r["finish_reason"]) for r in reference]:
+                        raise ValueError(f"{mode}/{temperature}: value or finish reason changed at c{concurrency}")
+                    if temperature == 0.0 and results != reference:
+                        raise ValueError(f"{mode}/{temperature}: output changed at c{concurrency}")
                 key = f"{mode}/t{temperature}/c{concurrency}"
                 signatures[key] = hashlib.sha256(json.dumps(results, sort_keys=True).encode()).hexdigest()
-                print(json.dumps({"case": key, "requests": 16, "sha256": signatures[key]}), flush=True)
+                print(json.dumps({"case": key, "requests": 16, "sha256": signatures[key],
+                                  "matches_c1": results == reference}), flush=True)
+            if temperature == 1.0:
+                again = [request(index) for index in range(16)]
+                if again != reference:
+                    raise ValueError(f"{mode}/{temperature}: isolated repeat changed")
+                print(json.dumps({"case": f"{mode}/t{temperature}/again", "requests": 16,
+                                  "sha256": signatures[f"{mode}/t{temperature}/c1"],
+                                  "matches_c1": True}), flush=True)
     # A rejected request must not poison the next ordinary request.
     bad = {"model": model, "messages": [{"role": "user", "content": "Hello"}], "max_tokens": -1}
     try:
