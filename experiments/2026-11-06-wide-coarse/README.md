@@ -9,3 +9,5 @@ Fresh twelve-patch application equals all affected overlays. Commands and source
 Adversarial checks cover24 batches at8193/16384/32768/131072 widths, each with12 lengths crossing4096/8192/16384 boundaries, ties/mixed scores and active-key caps. Both the prior generic route and an independent stable sort must match indices and BF16 score bits. Unwritten suffixes remain unwritten under initialization checking; six quick batches also run under race checking. Coarse scratch bytes are checked independently at full width.
 
 Two fresh timing processes use every frozen source capture at1/8/64 rows. Identical coarse score matrices are generated once outside timers; the generic route brackets the raw route with CUDA graph samples. Output comparisons, score preparation, hashing and mean construction are outside timers. These measure only coarse selection on captured prefill queries, not actual decode queries, whole attention, maintenance or request performance.
+
+Component checks and two fresh timing processes now pass; see `results.md`. Full-request and final-answer qualification remain separate.
