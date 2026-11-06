@@ -69,10 +69,25 @@ class GateTests(unittest.TestCase):
                 runner.gate_summary(json.dumps({"summary": "controls", **result}), "controls")
 
     def test_valid_signature_is_preserved_for_cross_arm_comparison(self):
-        text = json.dumps({"summary": "greedy", "identical": True,
-                           "reference_sha256": "a" * 64, "long_sha256": "b" * 64})
-        self.assertEqual(runner.gate_summary(text, "greedy"),
-                         {"reference_sha256": "a" * 64, "long_sha256": "b" * 64})
+        text = json.dumps({"summary": "sampled", "identical": True,
+                           "reference_sha256": "a" * 64})
+        self.assertEqual(runner.gate_summary(text, "sampled"), {"reference_sha256": "a" * 64})
+
+    def test_greedy_rejects_silent_logprob_fallback_and_missing_native_comparison(self):
+        scenarios = ["c8", "staggered", "mixed", "cached", "again", "mixed15"]
+        result = {"summary": "greedy", "identical": True, "logprobs": True,
+                  "scenarios": {name: {} for name in scenarios},
+                  **{key: "a" * 64 for key in ("reference_sha256", "long_sha256",
+                                               "reference_text_sha256", "long_text_sha256")}}
+        def log(summary, matched=True):
+            return "\n".join([*(json.dumps({"scenario": name, "requests": [{"logprobs_equal": matched}]})
+                                for name in scenarios), json.dumps(summary)])
+        self.assertEqual(len(runner.gate_summary(log(result), "greedy")), 4)
+        self.assertEqual(len(runner.gate_summary(log({**result, "logprobs": False}, None), "greedy-fast")), 2)
+        for summary, matched in (({**result, "logprobs": False}, True), (result, None),
+                                 ({**result, "scenarios": {}}, True)):
+            with self.assertRaises(ValueError):
+                runner.gate_summary(log(summary, matched), "greedy")
 
     def test_foreign_holder_window_or_restore_profile_is_not_ours(self):
         ours = {"holder": runner.HOLDER, "window": "window-1", "production_config": runner.RESTORE}

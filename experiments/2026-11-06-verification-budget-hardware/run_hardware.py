@@ -28,6 +28,7 @@ IMAGE = "sha256:7ae96e98e361601d8232cd99e6af1c6044b7c282bf6904c989e6ad033c147f82
 PARENT = "experiments/2026-11-04-topk-live-qualification/runs/2026-11-04-dgx/attempt-2/performance/candidate-40"
 GATES = [
     ("greedy", "experiments/2026-10-12-r6g/token_determinism_text.py", ["--tokens", "192", "--long-lines", "700", "--wide"]),
+    ("greedy-fast", "experiments/2026-10-12-r6g/token_determinism_text.py", ["--tokens", "192", "--long-lines", "700", "--wide", "--no-logprobs"]),
     ("sampled", "experiments/2026-10-24-tilelang-completion/sampled_digest.py", ["--tokens", "192"]),
     ("controls", "experiments/2026-10-24-tilelang-completion/controls_digest.py", ["--tokens", "96"]),
     ("tool-schema", f"{EXPERIMENT}/tool_schema_gate.py", []),
@@ -36,6 +37,7 @@ GATES = [
 
 def gate_summary(text, name):
     records = []
+    scenarios = []
     for line in text.splitlines():
         try:
             value = json.loads(line)
@@ -43,6 +45,8 @@ def gate_summary(text, name):
             continue
         if isinstance(value, dict) and "summary" in value:
             records.append(value)
+        if isinstance(value, dict) and "scenario" in value:
+            scenarios.append(value)
     if len(records) != 1:
         raise ValueError(f"{name}: missing or ambiguous gate summary")
     result = records[0]
@@ -50,13 +54,37 @@ def gate_summary(text, name):
         if result.get("passed") is not True or len(result.get("signatures", {})) != 13:
             raise ValueError("tool/schema gate is incomplete or failed")
         return result["signatures"]
-    if name in ("greedy", "sampled"):
+    if name in ("greedy", "greedy-fast", "sampled"):
         if result.get("identical") is not True or not re.fullmatch(r"[0-9a-f]{64}", result.get("reference_sha256", "")):
             raise ValueError(f"{name}: batch/seed invariance failed")
-        return {k: result[k] for k in ("reference_sha256", "long_sha256") if k in result}
+        if name.startswith("greedy"):
+            expected = {"c8", "staggered", "mixed", "cached", "again", "mixed15"}
+            if set(result.get("scenarios", {})) != expected or {r["scenario"] for r in scenarios} != expected:
+                raise ValueError(f"{name}: missing mixed/cache/batch coverage")
+            if result.get("logprobs") is not (name == "greedy"):
+                raise ValueError(f"{name}: silently changed the requested logprob path")
+            if name == "greedy" and any(not r.get("requests") or any(
+                    row.get("logprobs_equal") is not True for row in r["requests"]) for r in scenarios):
+                raise ValueError("greedy: native logprob comparison is missing")
+            keys = ("reference_text_sha256", "long_text_sha256")
+            if name == "greedy":
+                keys += ("reference_sha256", "long_sha256")
+            if any(not re.fullmatch(r"[0-9a-f]{64}", result.get(key, "")) for key in keys):
+                raise ValueError(f"{name}: native/text digest is missing")
+            return {key: result[key] for key in keys}
+        return {"reference_sha256": result["reference_sha256"]}
     if result.get("failed") != [] or not result.get("digests"):
         raise ValueError("controls: failed or absent results")
     digests = result["digests"]
+    expected = {"penalties", "penalties-sampled", "min-p", "logit-bias", "bad-words", "thinking-budget", "logprob-ids"}
+    if {key.split("/")[0] for key in digests} != expected:
+        raise ValueError("controls: scenario coverage is incomplete")
+    for scenario in expected:
+        if f"{scenario}/rejected" in digests:
+            if scenario not in ("min-p", "logit-bias"):
+                raise ValueError(f"controls: unsupported rejection for {scenario}")
+        elif not {f"{scenario}/alone", f"{scenario}/c8"} <= digests.keys():
+            raise ValueError(f"controls: missing batch mode for {scenario}")
     for key, value in digests.items():
         if key.endswith("/alone") and digests.get(key.removesuffix("/alone") + "/c8") != value:
             raise ValueError(f"controls: batch mismatch for {key}")
@@ -308,6 +336,8 @@ def main():
                     if code or halted:
                         raise RuntimeError(f"{label}/{name}: failed or guard halted")
                     current[name] = gate_summary(log.read_text(), name)
+                if current["greedy-fast"] != {key: current["greedy"][key] for key in current["greedy-fast"]}:
+                    raise RuntimeError("ordinary greedy output differs from the logprob path")
                 if signatures is not None and current != signatures:
                     raise RuntimeError("functional signatures changed between arms/boots")
                 signatures = current
