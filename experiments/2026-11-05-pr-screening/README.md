@@ -60,15 +60,32 @@ C43 built, then failed one lazy-reference assertion at its138-file release gate
 restoration passed before the subsequent foreign window. Source review finds a
 test setter that can restore a lazily resolved reference into module globals
 after the extra test files changed process grouping; worker runtime bytes are
-unchanged from C40. Actual-image pytest source and a CPU witness are still
-required before attributing the native failure to that mechanism. A focused, assertion-preserving fixture correction
-is in preparation as C46. Native failed evidence stays failed and immutable.
+unchanged from C40. The actual frozen C43 image's pytest9.1.1 CPU witness now
+reproduces the original failure, passes the corrected fixture and still detects
+preexisting pollution. Canonical577-patch replay and both offline example-map
+profile doctors pass. C46's new image, native gates and both metric boots remain
+pending; native C43 failed evidence stays failed and immutable.
 C45 compiler correction is source-ready with22 CPU controls, awaiting its final
 validated runtime base and native qualification. C40 remains the qualified base.
+The compiler refresh is maintenance and retained-feature preservation: a neutral
+performance outcome can pass with correctness and no material core/serving cost.
+No performance rejection is inferred from a compile, preparation or gate error.
 
-The latest primary inventory has28 open PRs, including the new924–926 work.
-Evidence-only925 is under review; active studies remain separate. The earlier
-inventory added eight unique proposals916–923.
+The primary inventory at02:32UTC has35 open PRs, including the new927–933 work.
+PR934's declared functional-evidence enforcement is merged after source review;
+it preserves C40's sampled isolated-repeat requirement and batch limitation.
+C46 adopts its API alongside the remaining C40 semantic predicates and a
+complete-suite audit. The existing first model operation must pass before its
+engine grid; no model workload is duplicated. New orchestration controls remain
+under bounded remote testing and exact-window lifecycle review, not launch-ready.
+
+Evidence-only925's187 archive members pass independent size/hash verification,
+and its original performance analysis/core summary reproduce exactly on SP8.
+Three private model files are absent there and remain pending separate safe
+verification. Its memory finding is not an incremental C36 gain; C36 already
+selects expert-scale compaction, while packed Engram support and selection are
+distinct. The addendum retains original scripts/results and all adverse rows.
+Active studies remain separate. The earlier inventory added eight proposals916–923.
 Do not merge an active hardware study mid-round: #917 has expanded from its
 prior offline evidence-only head to a separate row-cost hardware screen. No
 modeled3percent benefit is credited as measured throughput. New proposals and

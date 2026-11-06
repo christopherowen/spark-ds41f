@@ -1,0 +1,180 @@
+{
+  "started": "2026-11-06T01:40:16.406064+00:00",
+  "commit": "4ad9cca37fa05d44af2fa87d17a42b018425ab65",
+  "steps": [
+    {
+      "name": "GPU-readonly-precondition",
+      "argv": [
+        "nvidia-smi",
+        "--query-compute-apps=pid",
+        "--format=csv,noheader"
+      ],
+      "exit": 0,
+      "stdout": "GPU-readonly-precondition.stdout",
+      "stderr": "GPU-readonly-precondition.stderr"
+    },
+    {
+      "name": "clone-sparse-packet",
+      "argv": [
+        "git",
+        "-c",
+        "gc.auto=0",
+        "-c",
+        "maintenance.auto=false",
+        "-c",
+        "pack.threads=1",
+        "clone",
+        "--no-checkout",
+        "--filter=blob:none",
+        "--depth=1",
+        "--single-branch",
+        "--branch",
+        "feat/remote-source-proof",
+        "--origin",
+        "deployment",
+        "--reference-if-able",
+        "/home/chris/projects/spark-ds41f",
+        "https://github.com/christopherowen/spark-ds41f.git",
+        "/home/chris/spark-work/worker-test-isolation/c46-build-controls-attempt-1/checkout"
+      ],
+      "exit": 0,
+      "stdout": "clone-sparse-packet.stdout",
+      "stderr": "clone-sparse-packet.stderr"
+    },
+    {
+      "name": "sparse-init",
+      "argv": [
+        "git",
+        "-c",
+        "gc.auto=0",
+        "-c",
+        "maintenance.auto=false",
+        "-c",
+        "pack.threads=1",
+        "-C",
+        "/home/chris/spark-work/worker-test-isolation/c46-build-controls-attempt-1/checkout",
+        "sparse-checkout",
+        "init",
+        "--no-cone"
+      ],
+      "exit": 0,
+      "stdout": "sparse-init.stdout",
+      "stderr": "sparse-init.stderr"
+    },
+    {
+      "name": "sparse-patterns",
+      "argv": [
+        "git",
+        "-c",
+        "gc.auto=0",
+        "-c",
+        "maintenance.auto=false",
+        "-c",
+        "pack.threads=1",
+        "-C",
+        "/home/chris/spark-work/worker-test-isolation/c46-build-controls-attempt-1/checkout",
+        "sparse-checkout",
+        "set",
+        "--no-cone",
+        "--stdin"
+      ],
+      "exit": 0,
+      "stdout": "sparse-patterns.stdout",
+      "stderr": "sparse-patterns.stderr"
+    },
+    {
+      "name": "exact-published-checkout",
+      "argv": [
+        "git",
+        "-c",
+        "gc.auto=0",
+        "-c",
+        "maintenance.auto=false",
+        "-c",
+        "pack.threads=1",
+        "-C",
+        "/home/chris/spark-work/worker-test-isolation/c46-build-controls-attempt-1/checkout",
+        "checkout",
+        "-b",
+        "feat/c46-build-control-check",
+        "4ad9cca37fa05d44af2fa87d17a42b018425ab65"
+      ],
+      "exit": 0,
+      "stdout": "exact-published-checkout.stdout",
+      "stderr": "exact-published-checkout.stderr"
+    },
+    {
+      "name": "verify-commit",
+      "argv": [
+        "git",
+        "-c",
+        "gc.auto=0",
+        "-c",
+        "maintenance.auto=false",
+        "-c",
+        "pack.threads=1",
+        "-C",
+        "/home/chris/spark-work/worker-test-isolation/c46-build-controls-attempt-1/checkout",
+        "rev-parse",
+        "HEAD"
+      ],
+      "exit": 0,
+      "stdout": "verify-commit.stdout",
+      "stderr": "verify-commit.stderr"
+    },
+    {
+      "name": "build-unit-tests",
+      "argv": [
+        "python3",
+        "-B",
+        "-m",
+        "unittest",
+        "discover",
+        "-s",
+        "tests",
+        "-p",
+        "test_build.py",
+        "-v"
+      ],
+      "exit": 1,
+      "stdout": "build-unit-tests.stdout",
+      "stderr": "build-unit-tests.stderr"
+    }
+  ],
+  "purpose": "offline build-resource controls and static profile doctor",
+  "GPU_serving_or_existing_checkout_changes": false,
+  "effective_limits": {
+    "cpu.max": "100000 100000",
+    "memory.max": "8589934592",
+    "memory.swap.max": "0"
+  },
+  "sparse_patterns": [
+    "/.gitignore",
+    "/AGENTS.md",
+    "/README.md",
+    "/pyproject.toml",
+    "/upstreams.lock.json",
+    "/bin/",
+    "/spark_ds41f/",
+    "/scripts/",
+    "/tests/",
+    "/config/",
+    "/docker/",
+    "/requirements/",
+    "/patches/",
+    "/manifests/",
+    "/docs/",
+    "/experiments/*/*.json",
+    "/experiments/**/source.json",
+    "/experiments/**/upstreams.lock.json",
+    "/experiments/**/series",
+    "/experiments/**/*.patch",
+    "/experiments/2026-10-26-spark-ds41f-candidate/candidate-*/*.json",
+    "/experiments/2026-11-06-worker-test-isolation-rework/*.py"
+  ],
+  "existing_reference_checkout_untouched": true,
+  "unit_exit": 1,
+  "passed": false,
+  "error": "RuntimeError: build unit checks failed; preserve original diagnostics",
+  "ended": "2026-11-06T01:40:19.199181+00:00"
+}
