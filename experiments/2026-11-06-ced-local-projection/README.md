@@ -488,3 +488,11 @@ All nine process receipts, raw output and recovery records are retained in
 `receipts/sp567-window-4/`. C37 was independently verified restored at
 03:14:20 UTC on SP5-SP7 and all leases were removed. These are synthetic native
 correctness results; they establish neither full-model invariance nor throughput.
+
+The standard fixture preparation completed with 15 prompts; all archived file
+hashes, payload text and token-file lengths verified. Actual token lengths are
+recorded in `receipts/prefill-standard-fixtures-summary.json`; the standard text
+recipe can fall materially below its nominal length. `--sizing exact` therefore
+adds an explicitly separate companion, adjusting only document length to land
+within 64 tokens below each requested size. It records every sizing attempt and
+keeps the standard corpus unchanged. Exact-size preparation is pending.

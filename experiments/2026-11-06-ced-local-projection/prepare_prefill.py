@@ -21,6 +21,7 @@ def main():
     parser.add_argument('--out', type=Path, required=True)
     parser.add_argument('--model', required=True)
     parser.add_argument('--seed', type=int, default=0)
+    parser.add_argument('--sizing', choices=('standard','exact'), default='standard')
     parser.add_argument('--repeats', type=int, default=3)
     parser.add_argument('--sizes', default='32768,131072,262144,524288,1048000')
     args = parser.parse_args()
@@ -50,6 +51,7 @@ def main():
         'python': sys.version,
         'recipe': 'suite_prefill source_text(int(size * 0.97), rng.randrange(1 << 30)) plus its exact suffix',
         'seed': args.seed, 'repeats': args.repeats, 'requested_sizes': sizes,
+        'sizing': args.sizing, 'exact_size_tolerance_tokens': 64 if args.sizing == 'exact' else None,
         'add_special_tokens': add_special_tokens,
         'cache_policy': 'Use a fresh cache_salt for every replay; salts do not change prompt bytes or tokens.',
         'cases': [],
@@ -58,9 +60,18 @@ def main():
     for repeat in range(args.repeats):
         for size in rng.sample(sizes, len(sizes)):
             prompt_seed = rng.randrange(1 << 30)
-            prompt = bench.source_text(int(size * 0.97), prompt_seed) + '\n\nReply with the word ok.'
+            text_size = int(size * 0.97)
+            attempts = []
+            for attempt in range(8):
+                prompt = bench.source_text(text_size, prompt_seed) + '\n\nReply with the word ok.'
+                ids = tokenizer.encode(prompt, add_special_tokens=add_special_tokens)
+                attempts.append({'source_text_size': text_size, 'actual_tokens': len(ids)})
+                if args.sizing == 'standard' or size - 64 <= len(ids) <= size:
+                    break
+                text_size = max(1, int(text_size * (size - 16) / len(ids)))
+            else:
+                raise RuntimeError(f'exact sizing did not converge: {size}, {prompt_seed}, {attempts}')
             raw = prompt.encode('utf-8')
-            ids = tokenizer.encode(prompt, add_special_tokens=add_special_tokens)
             name = f'prefill-{size}-r{repeat}'
             (args.out / (name + '.txt')).write_bytes(raw)
             tokens = array.array('I', ids)
@@ -75,6 +86,7 @@ def main():
             (args.out / (name + '.payload.json')).write_bytes(payload_bytes)
             case = {'id': name, 'order': len(manifest['cases']), 'repeat': repeat,
                     'requested_size': size, 'prompt_seed': prompt_seed, 'prompt_tokens': len(ids),
+                    'sizing_attempts': attempts,
                     'prompt_file': name + '.txt', 'token_file': name + '.tokens.u32le',
                     'payload_file': name + '.payload.json', 'endpoint': '/v1/completions',
                     'prompt_sha256': digest(raw), 'token_ids_sha256': digest(token_bytes),
