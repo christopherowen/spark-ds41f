@@ -59,8 +59,9 @@ replace immutable recorded measurements. The probe uses uninterrupted cold A/A,
 ordinary reuse, explicit preemption after 129/257/1025 observed output tokens,
 and two concurrent admission orders. A successful reset plus the server's
 preemption delta is required. Unstable uninterrupted A/A makes exact output
-comparison inconclusive, not a pass. Streaming-input recovery needs an additional
-gate because it can move the prompt boundary.
+comparison inconclusive, not a pass. Actual streaming-input sessions retain baseline behavior; the candidate does
+not claim their recovery correctness. Native metadata gates must verify that
+this exclusion survives the final input sentinel.
 
 On both candidate boots, run `runtime-guard-suite.json` with the existing
 `bin/spark bench --suite` under `window_run.py`, named profile, `--compare none`

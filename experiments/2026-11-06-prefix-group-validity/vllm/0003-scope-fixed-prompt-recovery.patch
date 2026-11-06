@@ -1,0 +1,176 @@
+From c229ab4d2c4d18b3dcd157ff8a3ec7255108164e Mon Sep 17 00:00:00 2001
+From: Christopher Owen <3221756+christopherowen@users.noreply.github.com>
+Date: Fri, 6 Nov 2026 02:13:47 +0100
+Subject: [PATCH] Scope original-prompt recovery to fixed input requests
+
+Base: candidate-38 private decoder recovery. Actual streaming-input sessions can change CED floors and per-request settings across phases. A single original or current prompt boundary does not reproduce that history, so retain their existing recovery policy. Ordinary stateless chat turns and output-only streaming retain the fix.
+
+Carry the durable streaming-queue identity to the worker even after the final input sentinel clears resumable. Add cache admission and worker-policy tests for active and ended input streams. Numerical phase tests cover append lengths 1/2/127/128/129/256. Native and full-model qualification remain pending; this does not claim streaming-input recovery correctness. Upstream status: draft fork PR6.
+---
+ .../attention/test_b12x_v41_ced_metadata.py   | 39 +++++++++++++++++++
+ tests/v1/core/test_prefix_group_validity.py   | 24 ++++++++++--
+ .../deepseek_v4_1/nvidia/model_state.py       |  6 ++-
+ vllm/v1/core/kv_cache_manager.py              |  9 ++++-
+ vllm/v1/core/sched/output.py                  |  3 ++
+ 5 files changed, 76 insertions(+), 5 deletions(-)
+
+diff --git a/tests/v1/attention/test_b12x_v41_ced_metadata.py b/tests/v1/attention/test_b12x_v41_ced_metadata.py
+index 1facd79..6462a05 100644
+--- a/tests/v1/attention/test_b12x_v41_ced_metadata.py
++++ b/tests/v1/attention/test_b12x_v41_ced_metadata.py
+@@ -1015,3 +1015,42 @@ def test_startup_warmup_covers_live_compaction_without_jit(monkeypatch):
+         # The decoder's routing mask gathers the step's padding mask.
+         is_padding = torch.zeros(sum(lengths), dtype=torch.bool, device="cuda")
+         assert not gather_rows(is_padding, indices).any()
++
++
++@pytest.mark.parametrize("is_streaming_input", [False, True])
++def test_original_prompt_recovery_excludes_input_stream_sessions(is_streaming_input):
++    from vllm.models.deepseek_v4_1.nvidia.model_state import DeepseekV41ModelState
++    from vllm.v1.core.sched.output import NewRequestData
++
++    state = DeepseekV41ModelState.__new__(DeepseekV41ModelState)
++    state.rope_state = state.prompt_embeds_state = None
++    state.steering = state.steered_requests = None
++    state.disk_engram_models, state._prefill_tokens = (), {}
++    state._ced_prompt_logprobs, state._ced_prefix_start = set(), {}
++    state._ced_recovery_prompt_end = {}
++    state._ced_streaming_prefix_start = None
++    data = NewRequestData(
++        req_id="resumed",
++        prompt_token_ids=list(range(1024)),
++        prefill_token_ids=list(range(1281)),
++        mm_features=[],
++        sampling_params=None,
++        pooling_params=None,
++        block_ids=(),
++        num_computed_tokens=768,
++        lora_request=None,
++        is_streaming_input=is_streaming_input,
++    )
++    state.add_request(0, data)
++    batch = SimpleNamespace(
++        req_ids=["resumed"],
++        num_scheduled_tokens=[512],
++        num_computed_prefill_tokens_np=[768],
++        prefill_len_np=[1281],
++    )
++    full, floors, limits = state._ced_rows(batch)
++    assert full == [False]
++    assert floors == ([1153] if is_streaming_input else [896])
++    assert limits == ([127] if is_streaming_input else [384])
++    state.remove_request("resumed")
++    assert state._ced_recovery_prompt_end == {}
+diff --git a/tests/v1/core/test_prefix_group_validity.py b/tests/v1/core/test_prefix_group_validity.py
+index fa66720..7915c57 100644
+--- a/tests/v1/core/test_prefix_group_validity.py
++++ b/tests/v1/core/test_prefix_group_validity.py
+@@ -8,6 +8,7 @@ particular retention policy or that a published endpoint survives eviction.
+ """
+ 
+ import random
++from collections import deque
+ from dataclasses import replace
+ 
+ import pytest
+@@ -288,10 +289,14 @@ def test_branches_and_cancellation_do_not_complete_each_others_state(
+ 
+ @pytest.mark.parametrize("generated", [129, 257, 513])
+ @pytest.mark.parametrize("order", [0, 31])
+-def test_preemption_does_not_skip_private_generated_history(generated, order):
++@pytest.mark.parametrize("input_stream", [None, "active", "final-input"])
++def test_preemption_recovery_scopes_fixed_prompts(generated, order, input_stream):
+     manager, roles = make_manager(None, order)
+     prompt = list(range(1024))
+     req = request("resumed", prompt)
++    if input_stream is not None:
++        req.streaming_queue = deque()
++        req.resumable = input_stream == "active"
+     assert manager.allocate_slots(req, len(prompt)) is not None
+     req.num_computed_tokens = len(prompt)
+     req.append_output_token_ids(list(range(1024, 1024 + generated)))
+@@ -306,8 +311,21 @@ def test_preemption_does_not_skip_private_generated_history(generated, order):
+     fresh_prompt = request("fresh", req.all_token_ids)
+     _, later_hit = verify_hit(manager, roles, fresh_prompt)
+     assert later_hit > len(prompt) - WINDOW
+-    blocks, hit = verify_hit(manager, roles, req, cap=len(prompt) - WINDOW)
+-    assert hit == 768
++    cap = len(prompt) - WINDOW if input_stream is None else req.num_tokens - WINDOW
++    blocks, hit = verify_hit(manager, roles, req, cap=cap)
++    assert hit == (768 if input_stream is None else later_hit)
+     assert manager.allocate_slots(req, req.num_tokens - hit, hit, blocks) is not None
+     manager.free(req)
+     assert manager.block_pool.get_num_free_blocks() == 2047
++
++
++@pytest.mark.parametrize("input_stream", [None, "active", "final-input"])
++def test_worker_receives_durable_input_stream_identity(input_stream):
++    from vllm.v1.core.sched.output import NewRequestData
++
++    req = request("identity", list(range(1024)))
++    if input_stream is not None:
++        req.streaming_queue = deque()
++        req.resumable = input_stream == "active"
++    data = NewRequestData.from_request(req, (), prefill_token_ids=req.all_token_ids)
++    assert data.is_streaming_input is (input_stream is not None)
+diff --git a/vllm/models/deepseek_v4_1/nvidia/model_state.py b/vllm/models/deepseek_v4_1/nvidia/model_state.py
+index b30ceeb..0a6fdf4 100644
+--- a/vllm/models/deepseek_v4_1/nvidia/model_state.py
++++ b/vllm/models/deepseek_v4_1/nvidia/model_state.py
+@@ -198,7 +198,11 @@ class DeepseekV41ModelState(DefaultModelState):
+         self._ced_streaming_prefix_start = None
+         self._ced_prefix_start[new_req_data.req_id] = prefix_start
+         prefill_ids = new_req_data.prefill_token_ids
+-        if prefill_ids is not None and len(prefill_ids) > new_req_data.prompt_len:
++        if (
++            prefill_ids is not None
++            and len(prefill_ids) > new_req_data.prompt_len
++            and not new_req_data.is_streaming_input
++        ):
+             self._ced_recovery_prompt_end[new_req_data.req_id] = new_req_data.prompt_len
+         else:
+             self._ced_recovery_prompt_end.pop(new_req_data.req_id, None)
+diff --git a/vllm/v1/core/kv_cache_manager.py b/vllm/v1/core/kv_cache_manager.py
+index ad42cbd..4b11528 100644
+--- a/vllm/v1/core/kv_cache_manager.py
++++ b/vllm/v1/core/kv_cache_manager.py
+@@ -396,7 +396,14 @@ class KVCacheManager:
+         # request. Private decoder windows must be reconstructed from the
+         # original prompt boundary, not from a new boundary at the output end.
+         # Otherwise their deeper layers consume a different decoder history.
+-        replay_end = request.num_prompt_tokens if replay_tokens else request.num_tokens
++        # Input streams can change CED floors between phases. A single prompt
++        # anchor cannot reproduce that history; retain their existing policy.
++        fixed_prompt = request.streaming_queue is None
++        replay_end = (
++            request.num_prompt_tokens
++            if replay_tokens and fixed_prompt
++            else request.num_tokens
++        )
+         max_cache_hit_length = max(0, replay_end - max(1, replay_tokens))
+         computed_blocks, num_new_computed_tokens, num_uncached = (
+             self.coordinator.find_longest_cache_hit(
+diff --git a/vllm/v1/core/sched/output.py b/vllm/v1/core/sched/output.py
+index f1e1dd6..63abeb9 100644
+--- a/vllm/v1/core/sched/output.py
++++ b/vllm/v1/core/sched/output.py
+@@ -51,6 +51,8 @@ class NewRequestData:
+ 
+     # Only used for v2 model runner.
+     prefill_token_ids: list[int] | None = None
++    # Durable even after the final input sentinel clears Request.resumable.
++    is_streaming_input: bool = False
+     boundary_checkpoint: BoundaryCheckpoint | None = None
+     boundary_checkpoint_blocks: tuple[tuple[int, ...], ...] | None = None
+     recurrent_instruction_boundary: int | None = None
+@@ -80,6 +82,7 @@ class NewRequestData:
+             prompt_embeds=request.prompt_embeds,
+             prompt_is_token_ids=request.prompt_is_token_ids,
+             prefill_token_ids=prefill_token_ids,
++            is_streaming_input=request.streaming_queue is not None,
+             boundary_checkpoint=request.boundary_checkpoint,
+             boundary_checkpoint_blocks=request.boundary_checkpoint_blocks,
+             recurrent_instruction_boundary=request.recurrent_instruction_boundary,
+-- 
+2.43.0
+

@@ -198,7 +198,11 @@ class DeepseekV41ModelState(DefaultModelState):
         self._ced_streaming_prefix_start = None
         self._ced_prefix_start[new_req_data.req_id] = prefix_start
         prefill_ids = new_req_data.prefill_token_ids
-        if prefill_ids is not None and len(prefill_ids) > new_req_data.prompt_len:
+        if (
+            prefill_ids is not None
+            and len(prefill_ids) > new_req_data.prompt_len
+            and not new_req_data.is_streaming_input
+        ):
             self._ced_recovery_prompt_end[new_req_data.req_id] = new_req_data.prompt_len
         else:
             self._ced_recovery_prompt_end.pop(new_req_data.req_id, None)

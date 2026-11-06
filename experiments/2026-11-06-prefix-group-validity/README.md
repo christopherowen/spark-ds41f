@@ -42,17 +42,24 @@ Draft investigation. No serving change, GPU measurement, or performance claim.
 Source proposal: https://github.com/christopherowen/vllm/pull/6 (draft).
 Deployment/evidence proposal: https://github.com/christopherowen/spark-ds41f/pull/931 (draft).
 The source branch is `feat/prefix-group-validity`; `base.json`, `source.json` and
-`overlay.json` record its exact identities. The initial recovery policy covers a
-fixed original prompt; streaming input can advance that prompt boundary and is
-an additional correctness gate still under investigation.
+`overlay.json` record its exact identities. The recovery policy is explicitly limited to
+fixed input requests. Actual streaming-input sessions retain their existing
+cache-hit and worker replay behavior; their recovery correctness remains
+unresolved. Stateless multi-turn prompts and output-only streaming remain
+eligible for the candidate.
 
-The independent group suite passed 168 cases; the locked control failed the six
+The initial independent group suite passed 168 cases; the locked control failed the six
 preemption-boundary cases and passed the other 162. A broader CPU cache suite
 passed 395 cases with four HiSparse admission cases deselected. Attempts to check
 those four separately first failed at a missing `tblib` dependency and then were
 interrupted; they are not validated here. Isolated policy functions passed 45
 cases. The separately labeled NumPy dependency model passed 27 cases. Native
-kernel cases remain unrun. Seventeen harness tests and six subtests passed.
+kernel cases remain unrun. The current scoped head passed 183 group/identity
+cases on DGX4. Seventeen harness tests and six subtests passed, followed by three
+all-rank source-identity rejection tests. The remote GPU-less native-module
+attempts could not import the CUDA-specific code. Both arms' four HiSparse
+cases failed identically at device inference; these are unavailable-platform
+results, not functional passes or evidence of a candidate regression.
 
 The first fresh 573-patch preparation applied the source but found a committer
 identity mismatch. The source commit was normalized to the repository's fixed
@@ -64,7 +71,10 @@ build check. The remote 574-patch fresh application subsequently reproduced head
 `2b7790c8fdbf9031560950ce3e7280d0cd2b609d` and tree
 `24f540f78abb4f88019427d72d65c7ad94a3aba8`. All three experiment profiles passed
 `doctor`. Full build inputs are not prepared; no complete image-build check is
-claimed or required for this Python-only screen.
+claimed or required for this Python-only screen. The subsequent scope patch
+continued that same fresh series to 575 patches, reproducing current head
+`c229ab4d2c4d18b3dcd157ff8a3ec7255108164e` and tree
+`11d1cf3e6ac525173683dbfcd3b08de1c945934d`.
 
 On owner instruction, the disposable local build tree, Python environment and
 control checkout were removed. `runs/mac-cleanup.json` records the exact paths
@@ -72,7 +82,7 @@ and 1,217,118,208 allocated bytes removed. Source changes and all available
 evidence were preserved. Further builds, dependencies and tests run remotely.
 
 `screen-tp3.json` follows the repository's Python-only screening procedure:
-three exact source files from the published commit are mounted read-only over
+four exact source files from the published commit are mounted read-only over
 the unchanged candidate-38 image. `source_overlay.py` verifies the image digest,
 every changed file hash and the mounts on every rank before a serving probe.
 `tp3.json` separately describes a future complete candidate image, which has not
@@ -83,3 +93,16 @@ the borrowed read-only Python dependency set. A separate environment was created
 under `.work/cpu`; neither serving images nor the neighboring task's environment
 were modified. The candidate-38 existing CED cache tests then passed: 6 passed,
 200 deselected, in 9.06 s. These are allocator tests, not serving evidence.
+
+## Streaming-input scope
+
+The scalar numerical model in `streaming_replay.py` passes six phase checks with
+append lengths 1, 2, 127, 128, 129 and 256. A one-token append can retain decoder
+inputs produced under an older floor; a longer append can deliberately truncate
+that history. Neither a permanently first anchor nor a mutable latest anchor
+reproduces all these cases. This is dependency evidence, not a native kernel or
+checkpoint result. Exact input-session recovery would need phase history and
+historical model-affecting settings, including steering and prompt-logprob mode.
+The candidate transmits the durable input-session identity to the worker and
+leaves that path unchanged, including after the final input sentinel clears
+`resumable`. No new immutable first-prompt field was added.
