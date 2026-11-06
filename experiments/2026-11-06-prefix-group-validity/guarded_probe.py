@@ -29,7 +29,6 @@ def main():
     cluster, nodes, _ = configuration(args)
     if not cluster['deployment']['launch_enabled']:
         raise SystemExit('Candidate launch is disabled; serving qualification is not enabled')
-    identities = json.loads(Path(__file__).with_name('base.json').read_text())
     profiles = {'screen-tp3.json': 'candidate', 'control-tp3.json': 'control'}
     policy = profiles.get(Path(args.cluster_config).name)
     if policy is None:

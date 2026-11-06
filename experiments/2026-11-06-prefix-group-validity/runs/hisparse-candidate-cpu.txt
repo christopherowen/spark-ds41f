@@ -1,0 +1,252 @@
+FFFF                                                                     [100%]
+=================================== FAILURES ===================================
+_ test_hisparse_async_admission_requires_only_import_destinations[True-2-False] _
+
+full_sequence_must_fit = True, host_num_blocks = 2, admitted = False
+tmp_path = PosixPath('/tmp/pytest-of-root/pytest-0/test_hisparse_async_admission_0')
+
+    @pytest.mark.parametrize(
+        "full_sequence_must_fit,host_num_blocks,admitted",
+        [(True, 2, False), (True, 3, True), (False, 2, False), (False, 3, True)],
+    )
+    def test_hisparse_async_admission_requires_only_import_destinations(
+        full_sequence_must_fit, host_num_blocks, admitted, tmp_path
+    ):
+        """Imports need host destinations, but do not reserve future prefill pages."""
+        from .utils import create_scheduler, mock_kv
+    
+        (tmp_path / "config.json").write_text(
+            '{"architectures": ["OPTForCausalLM"], "model_type": "opt"}'
+        )
+>       scheduler = create_scheduler(
+            model=str(tmp_path),
+            skip_tokenizer_init=True,
+            max_model_len=128,
+            use_kv_connector=mock_kv(matched_tokens=HISPARSE_BLOCK_SIZE, is_async=True),
+        )
+
+tests/v1/core/test_prefix_caching.py:713: 
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
+tests/v1/core/utils.py:212: in create_scheduler
+    device_config=DeviceConfig(device=device),
+                  ^^^^^^^^^^^^^^^^^^^^^^^^^^^
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
+
+self = DeviceConfig(device='auto', device_type='')
+
+    def __post_init__(self):
+        if self.device == "auto":
+            # Automated device type detection
+            from vllm.platforms import current_platform
+    
+            self.device_type = current_platform.device_type
+            if not self.device_type:
+>               raise RuntimeError(
+                    "Failed to infer device type, please set "
+                    "the environment variable `VLLM_LOGGING_LEVEL=DEBUG` "
+                    "to turn on verbose logging to help debug the issue."
+                )
+E               RuntimeError: Failed to infer device type, please set the environment variable `VLLM_LOGGING_LEVEL=DEBUG` to turn on verbose logging to help debug the issue.
+
+vllm/config/device.py:56: RuntimeError
+----------------------------- Captured stdout call -----------------------------
+INFO 11-06 01:03:44 [model.py:693] Resolved architecture: OPTForCausalLM
+INFO 11-06 01:03:44 [model.py:2397] Downcasting torch.float32 to torch.float16.
+INFO 11-06 01:03:44 [model.py:2066] Using max model len 128
+INFO 11-06 01:03:44 [scheduler.py:436] Chunked prefill is enabled with max_num_batched_tokens=8192.
+WARNING 11-06 01:03:44 [scheduler.py:465] max_num_batched_tokens (8192) exceeds max_num_seqs * max_model_len (2048). This may lead to unexpected behavior.
+------------------------------ Captured log call -------------------------------
+INFO     vllm.config.model:model.py:693 Resolved architecture: OPTForCausalLM
+INFO     vllm.config.model:model.py:2397 Downcasting torch.float32 to torch.float16.
+INFO     vllm.config.model:model.py:2066 Using max model len 128
+INFO     vllm.config.scheduler:scheduler.py:436 Chunked prefill is enabled with max_num_batched_tokens=8192.
+WARNING  vllm.config.scheduler:scheduler.py:465 max_num_batched_tokens (8192) exceeds max_num_seqs * max_model_len (2048). This may lead to unexpected behavior.
+_ test_hisparse_async_admission_requires_only_import_destinations[True-3-True] _
+
+full_sequence_must_fit = True, host_num_blocks = 3, admitted = True
+tmp_path = PosixPath('/tmp/pytest-of-root/pytest-0/test_hisparse_async_admission_1')
+
+    @pytest.mark.parametrize(
+        "full_sequence_must_fit,host_num_blocks,admitted",
+        [(True, 2, False), (True, 3, True), (False, 2, False), (False, 3, True)],
+    )
+    def test_hisparse_async_admission_requires_only_import_destinations(
+        full_sequence_must_fit, host_num_blocks, admitted, tmp_path
+    ):
+        """Imports need host destinations, but do not reserve future prefill pages."""
+        from .utils import create_scheduler, mock_kv
+    
+        (tmp_path / "config.json").write_text(
+            '{"architectures": ["OPTForCausalLM"], "model_type": "opt"}'
+        )
+>       scheduler = create_scheduler(
+            model=str(tmp_path),
+            skip_tokenizer_init=True,
+            max_model_len=128,
+            use_kv_connector=mock_kv(matched_tokens=HISPARSE_BLOCK_SIZE, is_async=True),
+        )
+
+tests/v1/core/test_prefix_caching.py:713: 
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
+tests/v1/core/utils.py:212: in create_scheduler
+    device_config=DeviceConfig(device=device),
+                  ^^^^^^^^^^^^^^^^^^^^^^^^^^^
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
+
+self = DeviceConfig(device='auto', device_type='')
+
+    def __post_init__(self):
+        if self.device == "auto":
+            # Automated device type detection
+            from vllm.platforms import current_platform
+    
+            self.device_type = current_platform.device_type
+            if not self.device_type:
+>               raise RuntimeError(
+                    "Failed to infer device type, please set "
+                    "the environment variable `VLLM_LOGGING_LEVEL=DEBUG` "
+                    "to turn on verbose logging to help debug the issue."
+                )
+E               RuntimeError: Failed to infer device type, please set the environment variable `VLLM_LOGGING_LEVEL=DEBUG` to turn on verbose logging to help debug the issue.
+
+vllm/config/device.py:56: RuntimeError
+----------------------------- Captured stdout call -----------------------------
+INFO 11-06 01:03:44 [model.py:693] Resolved architecture: OPTForCausalLM
+INFO 11-06 01:03:44 [model.py:2397] Downcasting torch.float32 to torch.float16.
+INFO 11-06 01:03:44 [model.py:2066] Using max model len 128
+WARNING 11-06 01:03:44 [scheduler.py:465] max_num_batched_tokens (8192) exceeds max_num_seqs * max_model_len (2048). This may lead to unexpected behavior.
+------------------------------ Captured log call -------------------------------
+INFO     vllm.config.model:model.py:693 Resolved architecture: OPTForCausalLM
+INFO     vllm.config.model:model.py:2397 Downcasting torch.float32 to torch.float16.
+INFO     vllm.config.model:model.py:2066 Using max model len 128
+WARNING  vllm.config.scheduler:scheduler.py:465 max_num_batched_tokens (8192) exceeds max_num_seqs * max_model_len (2048). This may lead to unexpected behavior.
+_ test_hisparse_async_admission_requires_only_import_destinations[False-2-False] _
+
+full_sequence_must_fit = False, host_num_blocks = 2, admitted = False
+tmp_path = PosixPath('/tmp/pytest-of-root/pytest-0/test_hisparse_async_admission_2')
+
+    @pytest.mark.parametrize(
+        "full_sequence_must_fit,host_num_blocks,admitted",
+        [(True, 2, False), (True, 3, True), (False, 2, False), (False, 3, True)],
+    )
+    def test_hisparse_async_admission_requires_only_import_destinations(
+        full_sequence_must_fit, host_num_blocks, admitted, tmp_path
+    ):
+        """Imports need host destinations, but do not reserve future prefill pages."""
+        from .utils import create_scheduler, mock_kv
+    
+        (tmp_path / "config.json").write_text(
+            '{"architectures": ["OPTForCausalLM"], "model_type": "opt"}'
+        )
+>       scheduler = create_scheduler(
+            model=str(tmp_path),
+            skip_tokenizer_init=True,
+            max_model_len=128,
+            use_kv_connector=mock_kv(matched_tokens=HISPARSE_BLOCK_SIZE, is_async=True),
+        )
+
+tests/v1/core/test_prefix_caching.py:713: 
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
+tests/v1/core/utils.py:212: in create_scheduler
+    device_config=DeviceConfig(device=device),
+                  ^^^^^^^^^^^^^^^^^^^^^^^^^^^
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
+
+self = DeviceConfig(device='auto', device_type='')
+
+    def __post_init__(self):
+        if self.device == "auto":
+            # Automated device type detection
+            from vllm.platforms import current_platform
+    
+            self.device_type = current_platform.device_type
+            if not self.device_type:
+>               raise RuntimeError(
+                    "Failed to infer device type, please set "
+                    "the environment variable `VLLM_LOGGING_LEVEL=DEBUG` "
+                    "to turn on verbose logging to help debug the issue."
+                )
+E               RuntimeError: Failed to infer device type, please set the environment variable `VLLM_LOGGING_LEVEL=DEBUG` to turn on verbose logging to help debug the issue.
+
+vllm/config/device.py:56: RuntimeError
+----------------------------- Captured stdout call -----------------------------
+INFO 11-06 01:03:44 [model.py:693] Resolved architecture: OPTForCausalLM
+INFO 11-06 01:03:44 [model.py:2397] Downcasting torch.float32 to torch.float16.
+INFO 11-06 01:03:44 [model.py:2066] Using max model len 128
+WARNING 11-06 01:03:44 [scheduler.py:465] max_num_batched_tokens (8192) exceeds max_num_seqs * max_model_len (2048). This may lead to unexpected behavior.
+------------------------------ Captured log call -------------------------------
+INFO     vllm.config.model:model.py:693 Resolved architecture: OPTForCausalLM
+INFO     vllm.config.model:model.py:2397 Downcasting torch.float32 to torch.float16.
+INFO     vllm.config.model:model.py:2066 Using max model len 128
+WARNING  vllm.config.scheduler:scheduler.py:465 max_num_batched_tokens (8192) exceeds max_num_seqs * max_model_len (2048). This may lead to unexpected behavior.
+_ test_hisparse_async_admission_requires_only_import_destinations[False-3-True] _
+
+full_sequence_must_fit = False, host_num_blocks = 3, admitted = True
+tmp_path = PosixPath('/tmp/pytest-of-root/pytest-0/test_hisparse_async_admission_3')
+
+    @pytest.mark.parametrize(
+        "full_sequence_must_fit,host_num_blocks,admitted",
+        [(True, 2, False), (True, 3, True), (False, 2, False), (False, 3, True)],
+    )
+    def test_hisparse_async_admission_requires_only_import_destinations(
+        full_sequence_must_fit, host_num_blocks, admitted, tmp_path
+    ):
+        """Imports need host destinations, but do not reserve future prefill pages."""
+        from .utils import create_scheduler, mock_kv
+    
+        (tmp_path / "config.json").write_text(
+            '{"architectures": ["OPTForCausalLM"], "model_type": "opt"}'
+        )
+>       scheduler = create_scheduler(
+            model=str(tmp_path),
+            skip_tokenizer_init=True,
+            max_model_len=128,
+            use_kv_connector=mock_kv(matched_tokens=HISPARSE_BLOCK_SIZE, is_async=True),
+        )
+
+tests/v1/core/test_prefix_caching.py:713: 
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
+tests/v1/core/utils.py:212: in create_scheduler
+    device_config=DeviceConfig(device=device),
+                  ^^^^^^^^^^^^^^^^^^^^^^^^^^^
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
+
+self = DeviceConfig(device='auto', device_type='')
+
+    def __post_init__(self):
+        if self.device == "auto":
+            # Automated device type detection
+            from vllm.platforms import current_platform
+    
+            self.device_type = current_platform.device_type
+            if not self.device_type:
+>               raise RuntimeError(
+                    "Failed to infer device type, please set "
+                    "the environment variable `VLLM_LOGGING_LEVEL=DEBUG` "
+                    "to turn on verbose logging to help debug the issue."
+                )
+E               RuntimeError: Failed to infer device type, please set the environment variable `VLLM_LOGGING_LEVEL=DEBUG` to turn on verbose logging to help debug the issue.
+
+vllm/config/device.py:56: RuntimeError
+----------------------------- Captured stdout call -----------------------------
+INFO 11-06 01:03:44 [model.py:693] Resolved architecture: OPTForCausalLM
+INFO 11-06 01:03:44 [model.py:2397] Downcasting torch.float32 to torch.float16.
+INFO 11-06 01:03:44 [model.py:2066] Using max model len 128
+WARNING 11-06 01:03:44 [scheduler.py:465] max_num_batched_tokens (8192) exceeds max_num_seqs * max_model_len (2048). This may lead to unexpected behavior.
+------------------------------ Captured log call -------------------------------
+INFO     vllm.config.model:model.py:693 Resolved architecture: OPTForCausalLM
+INFO     vllm.config.model:model.py:2397 Downcasting torch.float32 to torch.float16.
+INFO     vllm.config.model:model.py:2066 Using max model len 128
+WARNING  vllm.config.scheduler:scheduler.py:465 max_num_batched_tokens (8192) exceeds max_num_seqs * max_model_len (2048). This may lead to unexpected behavior.
+=============================== warnings summary ===============================
+../../../../usr/local/lib/python3.12/dist-packages/torch/jit/_script.py:365: 14 warnings
+  /usr/local/lib/python3.12/dist-packages/torch/jit/_script.py:365: DeprecationWarning: `torch.jit.script_method` is deprecated. Please switch to `torch.compile` or `torch.export`.
+    warnings.warn(
+
+-- Docs: https://docs.pytest.org/en/stable/how-to/capture-warnings.html
+=========================== short test summary info ============================
+FAILED tests/v1/core/test_prefix_caching.py::test_hisparse_async_admission_requires_only_import_destinations[True-2-False]
+FAILED tests/v1/core/test_prefix_caching.py::test_hisparse_async_admission_requires_only_import_destinations[True-3-True]
+FAILED tests/v1/core/test_prefix_caching.py::test_hisparse_async_admission_requires_only_import_destinations[False-2-False]
+FAILED tests/v1/core/test_prefix_caching.py::test_hisparse_async_admission_requires_only_import_destinations[False-3-True]
+4 failed, 202 deselected, 14 warnings in 9.47s
