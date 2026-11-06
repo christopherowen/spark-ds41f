@@ -141,3 +141,11 @@ Hardware operations are authorized, but require a legitimate exclusive cluster
 handoff. Existing holds and requests are preserved. Branch testing uses exact
 published commits and coordinated node operations; the main-only lab queue guard
 is not weakened. No merge or promotion is authorized.
+
+## First GPU window and container correction
+
+The 2026-11-06 DGX4 attempt used published deployment `f51288df1b30793f7cac0d1dac9bc3cfae4492de` and the pinned C38 image. It ended with 35 failures and 8 passes in 27.72 seconds. The native reader failed to initialize io_uring with EPERM because the test invocation omitted the serving recipe’s seccomp setting. No component performance run executed. The original commands, source fingerprints, thermal/fan records and full pytest output are preserved under `runs/gpu-attempt-1/`.
+
+The minimal correction is the existing recipe’s `--security-opt=seccomp=unconfined`; no host setting or serving container changed. Both hosts report `kernel.io_uring_disabled=0`. Fresh CPU-only containers use the pinned image, runc, no NVIDIA devices, one CPU and 1 GiB. Both layouts pass all 36 native-reader cases with that single security-option correction, including actual direct reads and failure handling. An earlier check also matched the recipe’s IPC_LOCK/label/stack options; its separate receipts remain. GPU retry is still pending. The runner now requires 43 actual passed tests per candidate, without skips, before accepting GPU gates, and requires the matching gate receipt before timing.
+
+Window `dgx1-1793924574` was closed at 00:28:29 UTC after the failed bounded job. The original C36 service was already serving, no restart was needed, and DGX4’s originally inactive fan service was restored to inactive. The waiting collective qualification and reserved verification-budget arm retain precedence. No generic request waiter is active.
