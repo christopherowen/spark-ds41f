@@ -79,7 +79,12 @@ continued that same fresh series to 575 patches, reproducing current head
 On owner instruction, the disposable local build tree, Python environment and
 control checkout were removed. `runs/mac-cleanup.json` records the exact paths
 and 1,217,118,208 allocated bytes removed. Source changes and all available
-evidence were preserved. Further builds, dependencies and tests run remotely.
+evidence were preserved. Further builds, dependencies and tests run remotely. After independently
+recovering the published source on DGX4, all 7,812 tracked local paths matched
+the published snapshot and no extra files, registered worktrees or known
+alternates dependents remained. The retained local source was then removed too;
+`runs/mac-source-recovery.json` records another 155,832,320 allocated bytes,
+bringing the total removed allocation to 1,372,950,528 bytes.
 
 `screen-tp3.json` follows the repository's Python-only screening procedure:
 four exact source files from the published commit are mounted read-only over
@@ -106,3 +111,9 @@ historical model-affecting settings, including steering and prompt-logprob mode.
 The candidate transmits the durable input-session identity to the worker and
 leaves that path unchanged, including after the final input sentinel clears
 `resumable`. No new immutable first-prompt field was added.
+
+The remote source push initially failed because DGX4 had no GitHub publishing
+credentials. The exact same commit was published through the existing
+authenticated GitHub API connection after matching every blob, the tree and
+commit hash. No credentials were copied to the node; `runs/source-publication.json`
+records the resulting identity.
