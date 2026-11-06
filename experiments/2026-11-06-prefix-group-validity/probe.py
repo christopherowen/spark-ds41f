@@ -31,6 +31,20 @@ def preemptions(text):
     return sum(float(value) for value in values)
 
 
+def cancellation_metrics(text):
+    def total(name, label=None):
+        rows = re.findall(r'^' + re.escape(name) + r'(\{[^\n]*\})?\s+(\S+)', text, re.M)
+        values = [float(value) for labels, value in rows if label is None or label in labels]
+        if not values or not all(math.isfinite(value) and value >= 0 for value in values):
+            raise RuntimeError(f'Server lacks valid cancellation metric {name}')
+        return sum(values)
+    return {
+        'aborted': total('vllm:request_success_total', 'finished_reason="abort"'),
+        'running': total('vllm:num_requests_running'),
+        'waiting': total('vllm:num_requests_waiting'),
+    }
+
+
 class Client:
     def __init__(self, url, model, window_state):
         self.url, self.model, self.window_state = url.rstrip('/'), model, window_state
@@ -54,16 +68,19 @@ class Client:
             return response.read().decode()
 
     def request(self, prompt, salt, label, tokens, reset_at=None, barrier=None,
-                minimum_preemptions=1):
+                minimum_preemptions=1, cancel_at=None):
         record = {
             'label': label, 'prompt_tokens': len(prompt), 'prompt_sha256': digest(prompt),
             'cache_salt': salt, 'request_id': f'recovery-{salt}-{label}',
             'token_ids': [], 'logprobs': [], 'token_times_s': [], 'reset_at': reset_at,
+            'cancel_at': cancel_at,
         }
-        if barrier is not None:
-            barrier.wait(timeout=60)
         started = time.monotonic()
         try:
+            if cancel_at is not None and (reset_at is not None or not 0 < cancel_at < tokens):
+                raise ValueError('Cancellation needs an intermediate threshold and no reset')
+            if barrier is not None:
+                barrier.wait(timeout=60)
             with self.open('/v1/completions', {
                 'model': self.model, 'prompt': prompt, 'cache_salt': salt,
                 'temperature': 0, 'max_tokens': tokens, 'ignore_eos': True,
@@ -77,6 +94,10 @@ class Client:
                     event = json.loads(line[6:])
                     if event.get('error'):
                         raise RuntimeError(event['error'])
+                    if event.get('id'):
+                        if record.get('response_id', event['id']) != event['id']:
+                            raise RuntimeError('Completion response identity changed')
+                        record['response_id'] = event['id']
                     if event.get('usage'):
                         record['usage'] = event['usage']
                     for choice in event.get('choices', []):
@@ -99,6 +120,47 @@ class Client:
                         }
                         if result != {'success': True}:
                             raise RuntimeError(f'Reset did not succeed: {result!r}')
+                    if cancel_at is not None and len(record['token_ids']) >= cancel_at:
+                        if len(record['token_ids']) >= tokens or record.get('finish_reason'):
+                            raise RuntimeError('Producer finished before cancellation')
+                        response_id = record.get('response_id')
+                        if response_id != 'cmpl-' + record['request_id']:
+                            raise RuntimeError('Cannot identify the exact producer to cancel')
+                        before = self.metrics()
+                        cancellation_metrics(before)
+                        # Completion serving appends the prompt index to its
+                        # response id. This workload always has exactly one prompt.
+                        engine_id = response_id + '-0'
+                        result = self.json('/abort_requests', {'request_ids': [engine_id]})
+                        record['cancel'] = {
+                            'observed_output_tokens': len(record['token_ids']),
+                            'engine_request_id': engine_id, 'response': result,
+                            'metrics_before': before,
+                        }
+                        if result != {'status': 'aborted', 'aborted': 1}:
+                            raise RuntimeError(f'Cancellation was not acknowledged: {result!r}')
+                        break
+            if cancel_at is not None:
+                if 'cancel' not in record:
+                    raise RuntimeError('No cancellation occurred')
+                before = cancellation_metrics(record['cancel']['metrics_before'])
+                for _ in range(60):
+                    after = self.metrics()
+                    counts = cancellation_metrics(after)
+                    delta = counts['aborted'] - before['aborted']
+                    if delta >= 1 and counts['running'] == counts['waiting'] == 0:
+                        break
+                    time.sleep(0.5)
+                record['cancel'].update(metrics_after=after, aborted_delta=delta,
+                                        running=counts['running'], waiting=counts['waiting'])
+                if delta < 1 or counts['running'] != 0 or counts['waiting'] != 0:
+                    raise RuntimeError('Cancellation did not finish and return the server to idle')
+                if len(record['token_ids']) != len(record['logprobs']) or not all(
+                    value is not None and math.isfinite(value) for value in record['logprobs']
+                ):
+                    raise RuntimeError('Cancelled producer has incomplete or non-finite scores')
+                record['cancel']['confirmed'] = True
+                return record
             if reset_at is not None:
                 if 'reset' not in record:
                     raise RuntimeError('No reset occurred')
@@ -124,10 +186,11 @@ class Client:
             record['cached_tokens'] = usage['prompt_tokens_details']['cached_tokens']
         except Exception as error:
             record['error'] = repr(error)
-        record['wall_s'] = time.monotonic() - started
-        if record['token_times_s']:
-            record['ttft_s'] = record['token_times_s'][0]
-            record['output_tokens_per_s'] = len(record['token_ids']) / record['wall_s']
+        finally:
+            record['wall_s'] = time.monotonic() - started
+            if record['token_times_s']:
+                record['ttft_s'] = record['token_times_s'][0]
+                record['output_tokens_per_s'] = len(record['token_ids']) / record['wall_s']
         return record
 
 
@@ -208,6 +271,19 @@ def main():
                 recovered = save(client.request(prompt, salt, f'recover-{i}-{threshold}',
                                                 args.output_tokens, reset_at=threshold))
                 comparisons.append(compare(baseline[-1], recovered, 'recovery'))
+            # A new salt makes this producer the sole source of its prefix. Its
+            # follower must reuse actual cached tokens after confirmed cancellation.
+            cancel_salt = salt + '-cancelled-producer'
+            cancelled = save(client.request(prompt, cancel_salt, f'cancelled-{i}',
+                                            args.output_tokens, cancel_at=args.reset_at[0]))
+            follower = save(client.request(prompt, cancel_salt, f'after-cancel-{i}',
+                                           args.output_tokens))
+            comparison = compare(baseline[-1], follower, 'cancelled-producer-prefix')
+            comparison['cancellation_confirmed'] = (
+                'error' not in cancelled and cancelled.get('cancel', {}).get('confirmed', False))
+            comparison['prefix_reused'] = follower.get('cached_tokens', 0) > 0
+            comparison['passed'] &= comparison['cancellation_confirmed'] and comparison['prefix_reused']
+            comparisons.append(comparison)
         # Two admission orders, distinct traffic, and one global reset that
         # preempts every admitted request. Each prompt is compared with its
         # own solo baseline; only one stream initiates the reset.
