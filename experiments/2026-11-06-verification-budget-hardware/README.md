@@ -22,6 +22,10 @@ the harness and profile preparation; the HTTP gate still needs real hardware.
 At `5db59423` and `2b959786`, ten remote tests, all three doctors and both plans
 passed after adding handoff resumption and per-rank engine-log capture. The
 last test run took 0.10 s / 25,820 KiB maximum RSS. Both receipts are retained.
+At `965abfc4`, eleven remote tests, all three doctors and both plans passed
+after rejecting the legacy greedy script's silent text-only fallback and
+requiring ordinary greedy output to match its logprob path. The tests took
+0.11 s / 26,064 KiB; see `runs/preflight/native-gates-965abfc4/`.
 
 The first window, `dgx1-1793922050`, subsequently opened from the captured
 original commit `2c4b23af` and synchronized the three clean checkouts to
@@ -115,8 +119,10 @@ not a change to active capacity. The first arm's model corpus is scored by
 later arms. The control is explicitly an unreleased C40 causal control on this
 new workload; it is not a rerun of the released 1030 reference.
 
-Before timing each arm, require the existing wide greedy token/logprob gate,
-seeded temperature-1 batch/repeat gate, and sampling-control digests. The
+Before timing each arm, require the existing wide greedy token/logprob gate
+without silent text-only fallback, a matching ordinary no-logprob greedy
+path, the seeded temperature-1 batch/repeat gate, and complete sampling-control
+digests. The
 separate tool/schema gate sends 16 distinct requests in each combination of
 forced tool versus strict JSON schema, temperature 0 versus 1, and c1/c8/c16.
 It checks exact generated values and native token IDs across batching and
