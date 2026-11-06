@@ -3,11 +3,10 @@
 ## Summary
 
 - **Status**: Passed all 7 `sp8` GPU correctness and sanitizer stages (`summary-initcheck`, `summary-racecheck`, `summary-timing`, `registration`, `actual`, `initcheck`, `graph`) and 2 independent cold-container benchmark boots (`bench-boot1`, `bench-boot2`).
-- **Default Path (`VLLM_DS41_PAGE_SHORTLIST=0` or unset)**:
-  - Executes the **100% unchanged, bit-identical native indexer** (`state_content_bytes = 68`, `declared_kernel_count = 0`, `extra_scratch_bytes = 0`).
-  - Verified bit-identical (`atol = 0, rtol = 0`) against the baseline native indexer across all 12 captured rank-0 batches and all synthetic prefill/decode configurations on both boots.
+- **Single Opt-In Knob (`VLLM_DS41_LSA`)**:
+  - **Default-Off (`VLLM_DS41_LSA=0` or unset)**: Executes the **100% unchanged, bit-identical native indexer** (`state_content_bytes = 68`, `declared_kernel_count = 0`, `extra_scratch_bytes = 0`). Verified bit-identical (`atol = 0, rtol = 0`) against the baseline native indexer across all 12 captured rank-0 batches and all synthetic prefill/decode configurations on both boots.
+  - **Opt-In (`VLLM_DS41_LSA=1`)**: Enables the single non-quantized BF16 `block8` (`STATE_BYTES = 100`) TileLang LSA implementation with zero sub-options.
 - **Precision & No Downward Quantization**:
-  - Rejects `VLLM_DS41_PAGE_MODE=compact8` (`uint8` + `fp8_e4m3fn`) with a clear `ValueError`.
   - Uses only `block8` (`STATE_BYTES = 100`): 8-key `bfloat16` block means accumulated in `float32` via the 512-thread cooperative `summarize_blocks` kernel, scored in `bfloat16` with `float32` accumulation (`QueryReusePlan`), followed by exact `bfloat16`/`float32` fine scoring on shortlisted blocks (`RawWideCoarseTopK` for `budget = 1024`, `DirectCoarseTopK` for `budget = 512`, `PageShortlistPlan` for `budget = 64`).
 
 ## GPU Correctness & Sanitizer Gate Receipts (`runs/gpu-gates-01/`)
@@ -35,39 +34,39 @@
 
 | Capture | Case | Layer | Budget | Rows | Boot 1 Speedup | Boot 2 Speedup | 2-Boot Mean Speedup | Top-512 Recall (Mean / Min) |
 | --- | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
-| `fit-a-rank-0-dense-0.pt` | `fit-a` | 2 | 64 | 64 | 2.2718x | 2.2616x | **2.2667x** | 80.25% / 68.36% |
-| `fit-a-rank-0-dense-1.pt` | `fit-a` | 8 | 64 | 64 | 2.2582x | 2.2493x | **2.2538x** | 88.23% / 77.34% |
-| `fit-a-rank-0-dense-2.pt` | `fit-a` | 14 | 64 | 64 | 2.2480x | 2.2517x | **2.2499x** | 90.25% / 76.76% |
-| `fit-a-rank-0-source-0.pt` | `fit-a` | 20 | 1024 | 64 | 1.1259x | 1.1055x | **1.1157x** | 97.92% / 94.34% |
-| `fit-b-rank-0-dense-0.pt` | `fit-b` | 2 | 64 | 64 | 2.2514x | 2.2606x | **2.2560x** | 84.89% / 72.27% |
-| `fit-b-rank-0-dense-1.pt` | `fit-b` | 8 | 64 | 64 | 2.2536x | 2.2621x | **2.2578x** | 91.95% / 83.20% |
-| `fit-b-rank-0-dense-2.pt` | `fit-b` | 14 | 64 | 64 | 2.2544x | 2.2642x | **2.2593x** | 96.05% / 90.62% |
-| `fit-b-rank-0-source-0.pt` | `fit-b` | 20 | 1024 | 64 | 1.2060x | 1.2014x | **1.2037x** | 97.98% / 94.92% |
-| `validation-a-rank-0-dense-0.pt` | `validation-a` | 2 | 64 | 64 | 2.2546x | 2.2552x | **2.2549x** | 77.67% / 65.43% |
-| `validation-a-rank-0-dense-1.pt` | `validation-a` | 8 | 64 | 64 | 2.2549x | 2.2544x | **2.2547x** | 86.76% / 68.55% |
-| `validation-a-rank-0-dense-2.pt` | `validation-a` | 14 | 64 | 64 | 2.2496x | 2.2633x | **2.2564x** | 89.15% / 77.15% |
-| `validation-a-rank-0-source-0.pt` | `validation-a` | 20 | 1024 | 64 | 1.1481x | 1.1467x | **1.1474x** | 97.87% / 96.09% |
+| `fit-a-rank-0-dense-0.pt` | `fit-a` | 2 | 64 | 64 | 2.2674x | 2.2554x | **2.2614x** | 80.25% / 68.36% |
+| `fit-a-rank-0-dense-1.pt` | `fit-a` | 8 | 64 | 64 | 2.2555x | 2.2410x | **2.2483x** | 88.23% / 77.34% |
+| `fit-a-rank-0-dense-2.pt` | `fit-a` | 14 | 64 | 64 | 2.2505x | 2.2643x | **2.2574x** | 90.25% / 76.76% |
+| `fit-a-rank-0-source-0.pt` | `fit-a` | 20 | 1024 | 64 | 1.1367x | 1.1242x | **1.1305x** | 97.92% / 94.34% |
+| `fit-b-rank-0-dense-0.pt` | `fit-b` | 2 | 64 | 64 | 2.2593x | 2.2590x | **2.2591x** | 84.89% / 72.27% |
+| `fit-b-rank-0-dense-1.pt` | `fit-b` | 8 | 64 | 64 | 2.2583x | 2.2542x | **2.2563x** | 91.95% / 83.20% |
+| `fit-b-rank-0-dense-2.pt` | `fit-b` | 14 | 64 | 64 | 2.2512x | 2.2503x | **2.2508x** | 96.05% / 90.62% |
+| `fit-b-rank-0-source-0.pt` | `fit-b` | 20 | 1024 | 64 | 1.1993x | 1.1991x | **1.1992x** | 97.98% / 94.92% |
+| `validation-a-rank-0-dense-0.pt` | `validation-a` | 2 | 64 | 64 | 2.2600x | 2.2481x | **2.2540x** | 77.67% / 65.43% |
+| `validation-a-rank-0-dense-1.pt` | `validation-a` | 8 | 64 | 64 | 2.2515x | 2.2652x | **2.2584x** | 86.76% / 68.55% |
+| `validation-a-rank-0-dense-2.pt` | `validation-a` | 14 | 64 | 64 | 2.2168x | 2.2503x | **2.2336x** | 89.15% / 77.15% |
+| `validation-a-rank-0-source-0.pt` | `validation-a` | 20 | 1024 | 64 | 1.1615x | 1.1506x | **1.1561x** | 97.87% / 96.09% |
 
 ## Full `32K-1M` Combined 4-Layer (`3x Dense + 1x Source`) 2-Boot Speedup Matrix
 
 Combined 4-layer indexer latency per step (`3 * dense_layer_us + 1 * source_layer_us`), mirroring the 3:1 ratio of compressed layers (`2, 8, 14`, `compress_ratio = 2`) to source layer (`20`, `compress_ratio = 1`):
 
-| Context Tokens | Prefill (`r=64`) B1 / B2 | Prefill (`r=64`) Mean | Decode (`r=8`) B1 / B2 | Decode (`r=8`) Mean | Decode (`r=24`) B1 / B2 | Decode (`r=24`) Mean |
-| ---: | ---: | ---: | ---: | ---: | ---: | ---: |
-| 32,768 | 1.2674x / 1.2646x | **1.2660x** | 0.9814x / 0.9717x | **0.9766x** | 1.0949x / 1.0991x | **1.0970x** |
-| 65,536 | 1.6736x / 1.6708x | **1.6722x** | 1.1915x / 1.1735x | **1.1825x** | 1.3022x / 1.2979x | **1.3001x** |
-| 131,072 | 1.8948x / 1.8888x | **1.8918x** | 1.4758x / 1.4827x | **1.4793x** | 1.7401x / 1.7540x | **1.7471x** |
-| 262,144 | 2.8140x / 2.8397x | **2.8268x** | 2.1321x / 2.0136x | **2.0729x** | 2.6113x / 2.6032x | **2.6073x** |
-| 524,288 | 4.2204x / 4.2496x | **4.2350x** | 3.2257x / 3.2340x | **3.2298x** | 4.0588x / 4.0699x | **4.0644x** |
-| 1,048,576 | 4.1140x / 4.0969x | **4.1055x** | 3.7837x / 3.7798x | **3.7818x** | 4.0594x / 4.0517x | **4.0555x** |
+| Context Tokens | Prefill (`r=64`) B1 / B2 | Prefill (`r=64`) Mean | Decode (`r=8`) B1 / B2 | Decode (`r=8`) Mean | Decode (`r=24`) B1 / B2 | Decode (`r=24`) Mean | Decode (`r=96`) B1 / B2 | Decode (`r=96`) Mean |
+| ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| 32,768 | 1.2668x / 1.2644x | **1.2656x** | 1.0536x / 1.0765x | **1.0651x** | 1.2191x / 1.2154x | **1.2172x** | 1.3404x / 1.3432x | **1.3418x** |
+| 65,536 | 1.6743x / 1.6729x | **1.6736x** | 1.3054x / 1.2984x | **1.3019x** | 1.5613x / 1.5643x | **1.5628x** | 1.7029x / 1.7052x | **1.7041x** |
+| 131,072 | 1.8992x / 1.9089x | **1.9041x** | 1.4693x / 1.4741x | **1.4717x** | 1.7314x / 1.7560x | **1.7437x** | 1.9486x / 1.9555x | **1.9521x** |
+| 262,144 | 2.8156x / 2.8406x | **2.8281x** | 2.1297x / 2.1330x | **2.1314x** | 2.5398x / 2.5781x | **2.5590x** | 2.8844x / 2.8975x | **2.8910x** |
+| 524,288 | 4.2714x / 4.1593x | **4.2153x** | 3.2586x / 3.2019x | **3.2302x** | 4.1002x / 3.9548x | **4.0275x** | 4.3499x / 4.2107x | **4.2803x** |
+| 1,048,576 | 4.0492x / 4.0813x | **4.0652x** | 3.7346x / 3.7646x | **3.7496x** | 3.9823x / 4.0055x | **3.9939x** | 4.0634x / 4.1023x | **4.0828x** |
 
 ## Key Conclusions
 
 1. **Default-Off Is Zero-Risk and 100% Bit-Identical**:
-   - Leaving `VLLM_DS41_PAGE_SHORTLIST` unset or `0` keeps `state_content_bytes = 68`, compiles zero shortlist kernels, allocates zero shortlist scratch, and matches baseline native output with `max_abs_diff = 0` across every tested shape.
-2. **Zero Downward Quantization**:
-   - All summary storage (`block8`, `STATE_BYTES = 100`) and coarse scoring stay in native `bfloat16` with `float32` accumulation. Downward-quantized `compact8` is rejected at initialization.
-3. **Full `32K-1M` Prefill & Multi-Row Decode Coverage**:
-   - Lowering the dense-layer `prefill_short` floor from `16,385` to `16,384` engages `budget = 64` coarse selection on layers `2, 8, 14` at `32K` (`score_width = 16,384`), delivering **1.62x** dense-layer prefill speedup (`416.8 us -> 257.6 us`) and **1.27x** combined 4-layer prefill speedup at `32K` (previously `1.00x`).
-   - Adding `source_short` (`budget = 512`, `DirectCoarseTopK`) at `64K` (`score_width = 65,536`) and lowering `RawWideCoarseTopK` (`budget = 1024`) floor from `65,664` to `131,072` engages coarse selection across `64K-1M` on layer `20`, delivering **1.67x** combined prefill speedup at `64K`, **1.89x** at `131K`, **2.83x** at `262K`, **4.24x** at `524K`, and **4.11x** at `1M`.
-   - Multi-row decode (`rows >= 2`, e.g. MTP / batched decode) engages coarse selection across `32K-1M` (`1.10x` at `32K`, `1.30x` at `64K`, `1.75x` at `131K`, `2.61x` at `262K`, `4.06x` at `524K-1M`), while single-row decode (`rows == 1`) stays on native indexing where the tiny 1-row native kernel is already memory-latency bound (`43-348 us`).
+   - Leaving `VLLM_DS41_LSA` unset or `0` keeps `state_content_bytes = 68`, compiles zero shortlist kernels, allocates zero shortlist scratch, and matches baseline native output with `max_abs_diff = 0` across every tested shape.
+2. **Zero Downward Quantization & Single Clean Knob**:
+   - All summary storage (`block8`, `STATE_BYTES = 100`) and coarse scoring stay in native `bfloat16` with `float32` accumulation, controlled by the single `VLLM_DS41_LSA` environment variable.
+3. **Every Single `32K-1M` Prefill & Multi-Row Decode Cell Is a Full Win (`> 1.00x` Across Both Boots)**:
+   - Passing `score_width` outside CUDA graph capture in both `extend` and `decode` routes `32K` dense layers (`2, 8, 14`, `score_width = 16,384`) to `prefill_short` (`width = 16,384`, 1-stage `IndexerTopK`) and `32K` layer `20` (`score_width = 32,768 <= 33,023`) to `native_index` (`5` kernels instead of a 12-kernel no-op coarse pass), lifting `32,768` `Decode (r=8)` from `0.9766x` (`0.9814x / 0.9717x`) to **`1.0651x` (`1.0536x / 1.0765x`)** and `32,768` `Decode (r=24)` from `1.0970x` to **`1.2172x` (`1.2191x / 1.2154x`)**.
+   - At `65,536` (`64K`), unified `score_width` routing engages `source_short` (`budget = 512`, `DirectCoarseTopK`) on layer `20` during multi-row decode as well as prefill, lifting `64K` `Decode (r=8)` from `1.1825x` to **`1.3019x` (`1.3054x / 1.2984x`)** and `64K` `Decode (r=24)` from `1.3001x` to **`1.5628x` (`1.5613x / 1.5643x`)**.
+   - Across `32K-1M`, combined 4-layer speedups reach **`1.27x-4.22x`** in prefill (`r=64`), **`1.07x-3.75x`** in `r=8` decode, **`1.22x-4.03x`** in `r=24` decode, and **`1.34x-4.28x`** in `r=96` decode.
