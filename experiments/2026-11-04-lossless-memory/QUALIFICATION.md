@@ -229,8 +229,9 @@ The saved C36 screen has one boot and uses the newer token-ID/empty-delta progre
 collector. Its client throughput, TTFT, TPOT and event gaps are not a matched
 comparison to this cohort's recorded policy. C36 can provide context through
 independently compatible engine counters or unchanged prefill workloads, with
-its missing repeat stated. It already contains both storage ideas, so a gain
-against 1030 cannot be called an incremental improvement to C36.
+its missing repeat stated. Its scale compaction is already present. Packed Engram reader support also exists,
+but C36's source selects the original separate planes; presence of its API is not
+activation. A gain against 1030 still cannot establish an incremental C36 gain.
 
 `functional-reference.json` pins the two original 1030 functional JSONL records
 and their unchanged probe scripts. The selected deterministic-control scenarios
@@ -339,3 +340,24 @@ The declared functional requirements are unchanged: actual quality, prefix and
 admission verdicts, exact model comparisons and required deterministic digests
 are checked. A process exit is not substituted for those verdicts. This cohort
 does not add a universal seeded sampled-batch identity requirement.
+
+## Native observer, build and recovery evidence
+
+The November 6 DGX1–3 window passed the CPU-only metadata controls on every
+rank and built the immutable Engram image once with four compile jobs and two
+NVCC threads. The original build receipt reports 840 seconds and 88.6 GiB
+minimum available host memory. This is build evidence, not serving performance.
+
+The serving controller then refused its PR-only deployment commit because
+lab.published_problems requires ancestry on origin/main. No component/full
+GPU test or candidate serving boot ran. Its actual exit is 1; C36 was restored
+on all three clean node checkouts at the exact captured deployment, live doctor
+passed and the scoped hold was removed. The 104 original native files, including
+preparation failures, the duplicate own queue request, the refusal and recovery,
+are byte-verified in runs/engram-native-window-20261106/. See
+engram/native-window-20261106.json for exact identities and commands.
+
+Land the reviewed tooling while retaining the tested commit in main ancestry,
+then request the next window in the existing order. Use a new controller output
+directory and the already-built immutable image; preserve the original receipt
+and do not overwrite the tag. Full two-boot Engram qualification remains pending.
