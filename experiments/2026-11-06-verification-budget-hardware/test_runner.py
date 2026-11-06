@@ -88,23 +88,28 @@ class GateTests(unittest.TestCase):
 
     def test_tool_schema_gate_enforces_isolated_repeat_and_observes_t1_batch_tokens(self):
         def make_post(fail_repeat=False, fail_t0_batch=False):
-            calls = []
+            counts = {}
+            lock = threading.Lock()
             def fake_post(base, body):
                 if body.get("max_tokens") == -1:
                     raise tool_schema_gate.urllib.error.HTTPError(base, 400, "bad", {}, io.BytesIO(b"{}"))
                 if body.get("max_tokens") == 1:
                     return {"choices": [{"message": {"content": "ok"}, "finish_reason": "stop"}]}
                 index = body["seed"] - 20261106
+                mode = "schema" if "response_format" in body else "tool"
+                key = (mode, body["temperature"], index)
+                with lock:
+                    pass_num = counts.get(key, 0)
+                    counts[key] = pass_num + 1
+                # pass_num: 0 is c1, 1 is c8, 2 is c16, 3 is isolated repeat (again)
+                batched = pass_num in (1, 2)
                 expected = {"label": f"record-{index}", "value": index + 7}
-                batched = threading.current_thread() is not threading.main_thread()
-                calls.append((body["temperature"], batched, index))
-                repeat_count = sum(1 for t, b, i in calls if t == body["temperature"] and not b and i == index)
                 tokens = [10, 20, index]
                 if body["temperature"] == 1.0 and batched:
                     tokens = [10, 21, index]
                 if fail_t0_batch and body["temperature"] == 0.0 and batched:
                     tokens = [10, 99, index]
-                if fail_repeat and body["temperature"] == 1.0 and not batched and repeat_count > 1:
+                if fail_repeat and body["temperature"] == 1.0 and pass_num == 3:
                     tokens = [10, 88, index]
                 message = {"content": json.dumps(expected), "tool_calls": [{"function": {
                     "name": "record", "arguments": json.dumps(expected)}}]}
