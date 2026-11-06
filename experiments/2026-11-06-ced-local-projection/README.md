@@ -454,3 +454,14 @@ The repaired harness enters an explicit TP3 external-launcher configuration
 context and resolves transport settings from the published SP5-SP7 profile and
 node map. It retains native PyNCCL, byte equality and thermal/memory guards.
 The repair has not yet passed a GPU collective run.
+
+
+## Fixed cold-prefill inputs
+
+`prepare_prefill.py` freezes three prompts at each requested size, using the
+standard source-text cold-prefill recipe and seeded order. It archives complete
+UTF-8 prompts, native completion token IDs, payloads, tokenizer and source hashes.
+The top requested size is 1,048,000 so it fits the standard 1M-context size filter;
+actual token counts are authoritative. Cache salts must be fresh for every replay.
+This is CPU-only fixture preparation, not a benchmark; it does not reconstruct
+the unavailable historical prompt bytes. The first preparation run is pending.
