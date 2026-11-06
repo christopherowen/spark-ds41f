@@ -1,0 +1,217 @@
+============================= test session starts ==============================
+platform linux -- Python 3.12.3, pytest-9.1.1, pluggy-1.6.0 -- /usr/bin/python3
+rootdir: /sparknet-tests/gpu
+plugins: anyio-4.15.1
+collecting ... collected 107 items
+
+../sparknet-tests/gpu/test_oneshot_gpu.py::test_source_gids_are_found_by_address PASSED [  0%]
+../sparknet-tests/gpu/test_oneshot_gpu.py::test_payload_is_striped_across_every_hca PASSED [  1%]
+../sparknet-tests/gpu/test_oneshot_gpu.py::test_matches_nccl_and_is_rank_identical[16-dtype0] PASSED [  2%]
+../sparknet-tests/gpu/test_oneshot_gpu.py::test_matches_nccl_and_is_rank_identical[16-dtype1] PASSED [  3%]
+../sparknet-tests/gpu/test_oneshot_gpu.py::test_matches_nccl_and_is_rank_identical[16-dtype2] PASSED [  4%]
+../sparknet-tests/gpu/test_oneshot_gpu.py::test_matches_nccl_and_is_rank_identical[4096-dtype0] PASSED [  5%]
+../sparknet-tests/gpu/test_oneshot_gpu.py::test_matches_nccl_and_is_rank_identical[4096-dtype1] PASSED [  6%]
+../sparknet-tests/gpu/test_oneshot_gpu.py::test_matches_nccl_and_is_rank_identical[4096-dtype2] PASSED [  7%]
+../sparknet-tests/gpu/test_oneshot_gpu.py::test_matches_nccl_and_is_rank_identical[49152-dtype0] PASSED [  8%]
+../sparknet-tests/gpu/test_oneshot_gpu.py::test_matches_nccl_and_is_rank_identical[49152-dtype1] PASSED [  9%]
+../sparknet-tests/gpu/test_oneshot_gpu.py::test_matches_nccl_and_is_rank_identical[49152-dtype2] PASSED [ 10%]
+../sparknet-tests/gpu/test_oneshot_gpu.py::test_matches_nccl_and_is_rank_identical[262144-dtype0] PASSED [ 11%]
+../sparknet-tests/gpu/test_oneshot_gpu.py::test_matches_nccl_and_is_rank_identical[262144-dtype1] PASSED [ 12%]
+../sparknet-tests/gpu/test_oneshot_gpu.py::test_matches_nccl_and_is_rank_identical[262144-dtype2] PASSED [ 13%]
+../sparknet-tests/gpu/test_oneshot_gpu.py::test_matches_nccl_and_is_rank_identical[1048576-dtype0] PASSED [ 14%]
+../sparknet-tests/gpu/test_oneshot_gpu.py::test_matches_nccl_and_is_rank_identical[1048576-dtype1] PASSED [ 14%]
+../sparknet-tests/gpu/test_oneshot_gpu.py::test_matches_nccl_and_is_rank_identical[1048576-dtype2] PASSED [ 15%]
+../sparknet-tests/gpu/test_oneshot_gpu.py::test_rejects_ineligible_inputs PASSED [ 16%]
+../sparknet-tests/gpu/test_oneshot_gpu.py::test_cuda_graph_replay PASSED [ 17%]
+../sparknet-tests/gpu/test_oneshot_gpu.py::test_cuda_graph_replay_with_alternating_grid_sizes PASSED [ 18%]
+../sparknet-tests/gpu/test_oneshot_gpu.py::test_proxy_catches_up_after_missed_doorbell PASSED [ 19%]
+../sparknet-tests/gpu/test_oneshot_gpu.py::test_alternating_eager_streams_are_ordered PASSED [ 20%]
+../sparknet-tests/gpu/test_oneshot_gpu.py::test_adapter_path_graph_replay PASSED [ 21%]
+../sparknet-tests/gpu/test_oneshot_gpu.py::test_fail_stop_on_timeout_eager FAILED [ 22%]
+
+=================================== FAILURES ===================================
+_______________________ test_fail_stop_on_timeout_eager ________________________
+
+runtime = <sparknet.oneshot.runtime.RoceOneshotAllReduce object at 0xf23ba8c793a0>
+
+    def test_fail_stop_on_timeout_eager(runtime):
+        """Rank 1 stops its proxy; every rank's wait then times out and stops its GPU,
+        and reports whom it waited for. This process's runtime keeps working."""
+>       _assert_stopped(_fail_stop("eager"))
+                        ^^^^^^^^^^^^^^^^^^^
+
+/sparknet-tests/gpu/test_oneshot_gpu.py:457: 
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
+
+scenario = 'eager'
+
+    def _fail_stop(scenario: str) -> dict:
+        """Run ``sparknet.probe.failstop`` on this rank and return its report.
+    
+        The scenario stops the child's GPU, so it gets a process (and a gloo group
+        on its own port) of its own; this process's runtime is untouched.
+        """
+        port = int(os.environ.get("MASTER_PORT", "29650")) + 7
+        child = subprocess.run(
+            [sys.executable, "-m", "sparknet.probe.failstop", scenario,
+             "--rank", os.environ["RANK"], "--world-size", os.environ["WORLD_SIZE"],
+             "--master-addr", os.environ["MASTER_ADDR"], "--master-port", str(port)],
+            capture_output=True, text=True, timeout=300,
+        )
+        lines = [line for line in child.stdout.splitlines() if line.startswith("{")]
+>       assert lines, f"no report (exit {child.returncode}): {child.stderr[-2000:]}"
+E       AssertionError: no report (exit 1): ]:47861, remote=[127.0.0.1]:25936$0, error=SO_ERROR: Connection refused, remote=[127.0.0.1]:25936$0
+E         [/__w/pytorch/pytorch/third_party/gloo/gloo/transport/tcp/debug_logger.cc:9] ERROR failed to connect, willRetry=0, retry=4, retryLimit=3, rank=0, size=3, local=[127.0.0.1]:48885, remote=[127.0.0.1]:25936$0, error=SO_ERROR: Connection refused, remote=[127.0.0.1]:25936$0
+E         [E1106 07:37:13.205280277 ProcessGroupGloo.cpp:67] Gloo connectFullMesh failed with [/__w/pytorch/pytorch/third_party/gloo/gloo/transport/tcp/pair.cc:152] timed out connecting: SO_ERROR: Connection refused, remote=[127.0.0.1]:25936$0
+E         Traceback (most recent call last):
+E           File "<frozen runpy>", line 198, in _run_module_as_main
+E           File "<frozen runpy>", line 88, in _run_code
+E           File "/usr/local/lib/python3.12/dist-packages/sparknet/probe/failstop.py", line 166, in <module>
+E             sys.exit(main(sys.argv[1:]))
+E                      ^^^^^^^^^^^^^^^^^^
+E           File "/usr/local/lib/python3.12/dist-packages/sparknet/probe/failstop.py", line 149, in main
+E             dist.init_process_group(
+E           File "/usr/local/lib/python3.12/dist-packages/torch/distributed/c10d_logger.py", line 83, in wrapper
+E             return func(*args, **kwargs)
+E                    ^^^^^^^^^^^^^^^^^^^^^
+E           File "/usr/local/lib/python3.12/dist-packages/torch/distributed/c10d_logger.py", line 97, in wrapper
+E             func_return = func(*args, **kwargs)
+E                           ^^^^^^^^^^^^^^^^^^^^^
+E           File "/usr/local/lib/python3.12/dist-packages/torch/distributed/distributed_c10d.py", line 1899, in init_process_group
+E             default_pg, _ = _new_process_group_helper(
+E                             ^^^^^^^^^^^^^^^^^^^^^^^^^^
+E           File "/usr/local/lib/python3.12/dist-packages/torch/distributed/distributed_c10d.py", line 2169, in _new_process_group_helper
+E             backend_class = ProcessGroupGloo(
+E                             ^^^^^^^^^^^^^^^^^
+E         RuntimeError: Gloo connectFullMesh failed with [/__w/pytorch/pytorch/third_party/gloo/gloo/transport/tcp/pair.cc:152] timed out connecting: SO_ERROR: Connection refused, remote=[127.0.0.1]:25936$0
+E         
+E       assert []
+
+/sparknet-tests/gpu/test_oneshot_gpu.py:446: AssertionError
+--------------------------- Captured stderr teardown ---------------------------
+[rank0]:[E1106 07:38:13.461047656 ProcessGroupNCCL.cpp:730] [Rank 0] Watchdog caught collective operation timeout: WorkNCCL(SeqNum=323, OpType=ALLREDUCE, NumelIn=1, NumelOut=1, Timeout(ms)=60000) ran for 60047 milliseconds before timing out.
+[rank0]:[E1106 07:38:13.462247283 ProcessGroupNCCL.cpp:2372] [PG ID 0 PG GUID 0(default_pg) Rank 0]  failure detected by watchdog at work sequence id: 323 PG status: last enqueued work: 323, last started work: -1 (), last completed work: 322
+[rank0]:[E1106 07:38:13.746484288 ProcessGroupNCCL.cpp:774] Stack trace of the failed collective: 
+#0 barrier from /usr/local/lib/python3.12/dist-packages/torch/distributed/distributed_c10d.py:5349
+#1 wrapper from /usr/local/lib/python3.12/dist-packages/torch/distributed/c10d_logger.py:83
+#2 runtime from /sparknet-tests/gpu/test_oneshot_gpu.py:56
+#3 _teardown_yield_fixture from /usr/local/lib/python3.12/dist-packages/_pytest/fixtures.py:1014
+#4 finish from /usr/local/lib/python3.12/dist-packages/_pytest/fixtures.py:1156
+#5 teardown_exact from /usr/local/lib/python3.12/dist-packages/_pytest/runner.py:568
+#6 pytest_runtest_teardown from /usr/local/lib/python3.12/dist-packages/_pytest/runner.py:199
+#7 _multicall from /usr/local/lib/python3.12/dist-packages/pluggy/_callers.py:121
+#8 _hookexec from /usr/local/lib/python3.12/dist-packages/pluggy/_manager.py:120
+#9 __call__ from /usr/local/lib/python3.12/dist-packages/pluggy/_hooks.py:512
+#10 <lambda> from /usr/local/lib/python3.12/dist-packages/_pytest/runner.py:250
+#11 from_call from /usr/local/lib/python3.12/dist-packages/_pytest/runner.py:361
+#12 call_and_report from /usr/local/lib/python3.12/dist-packages/_pytest/runner.py:249
+#13 runtestprotocol from /usr/local/lib/python3.12/dist-packages/_pytest/runner.py:144
+#14 pytest_runtest_protocol from /usr/local/lib/python3.12/dist-packages/_pytest/runner.py:118
+#15 _multicall from /usr/local/lib/python3.12/dist-packages/pluggy/_callers.py:121
+#16 _hookexec from /usr/local/lib/python3.12/dist-packages/pluggy/_manager.py:120
+#17 __call__ from /usr/local/lib/python3.12/dist-packages/pluggy/_hooks.py:512
+#18 pytest_runtestloop from /usr/local/lib/python3.12/dist-packages/_pytest/main.py:408
+#19 _multicall from /usr/local/lib/python3.12/dist-packages/pluggy/_callers.py:121
+#20 _hookexec from /usr/local/lib/python3.12/dist-packages/pluggy/_manager.py:120
+#21 __call__ from /usr/local/lib/python3.12/dist-packages/pluggy/_hooks.py:512
+#22 _main from /usr/local/lib/python3.12/dist-packages/_pytest/main.py:384
+#23 wrap_session from /usr/local/lib/python3.12/dist-packages/_pytest/main.py:330
+#24 pytest_cmdline_main from /usr/local/lib/python3.12/dist-packages/_pytest/main.py:377
+#25 _multicall from /usr/local/lib/python3.12/dist-packages/pluggy/_callers.py:121
+#26 _hookexec from /usr/local/lib/python3.12/dist-packages/pluggy/_manager.py:120
+#27 __call__ from /usr/local/lib/python3.12/dist-packages/pluggy/_hooks.py:512
+#28 _main from /usr/local/lib/python3.12/dist-packages/_pytest/config/__init__.py:229
+#29 _console_main from /usr/local/lib/python3.12/dist-packages/_pytest/config/__init__.py:253
+#30 <module> from /usr/local/lib/python3.12/dist-packages/pytest/__main__.py:9
+#31 _run_code from <frozen runpy>:88
+#32 _run_module_as_main from <frozen runpy>:198
+
+[rank0]:[E1106 07:38:13.746595569 ProcessGroupNCCL.cpp:2714] [PG ID 0 PG GUID 0(default_pg) Rank 0] First PG on this rank to signal dumping.
+[rank0]:[E1106 07:38:14.357774920 ProcessGroupNCCL.cpp:1964] [PG ID 0 PG GUID 0(default_pg) Rank 0] Received a dump signal due to a collective timeout from this local rank and we will try our best to dump the debug info. Last enqueued NCCL work: 323, last completed NCCL work: 322.This is most likely caused by incorrect usages of collectives, e.g., wrong sizes used across ranks, the order of collectives is not same for all ranks or the scheduled collective, for some reason, didn't run. Additionally, this can be caused by GIL deadlock or other reasons such as network errors or bugs in the communications library (e.g. NCCL), etc. 
+[rank0]:[E1106 07:38:14.358227244 ProcessGroupNCCL.cpp:1677] [PG ID 0 PG GUID 0(default_pg) Rank 0] ProcessGroupNCCL preparing to dump debug info. Include stack trace: 1, only active collectives: 0
+=============================== warnings summary ===============================
+test_oneshot_gpu.py::test_payload_is_striped_across_every_hca
+test_oneshot_gpu.py::test_cuda_graph_replay
+test_oneshot_gpu.py::test_cuda_graph_replay_with_alternating_grid_sizes
+test_oneshot_gpu.py::test_proxy_catches_up_after_missed_doorbell
+test_oneshot_gpu.py::test_alternating_eager_streams_are_ordered
+test_oneshot_gpu.py::test_adapter_path_graph_replay
+test_oneshot_gpu.py::test_fail_stop_on_timeout_eager
+  /usr/local/lib/python3.12/dist-packages/torch/distributed/c10d_logger.py:83: UserWarning: barrier(): using the device under current context. You can specify `device_id` in `init_process_group` to mute this warning.
+    return func(*args, **kwargs)
+
+-- Docs: https://docs.pytest.org/en/stable/how-to/capture-warnings.html
+=========================== short test summary info ============================
+FAILED ../sparknet-tests/gpu/test_oneshot_gpu.py::test_fail_stop_on_timeout_eager
+!!!!!!!!!!!!!!!!!!!!!!!!!! stopping after 1 failures !!!!!!!!!!!!!!!!!!!!!!!!!!!
+============= 1 failed, 23 passed, 7 warnings in 130.06s (0:02:10) =============
+[rank0]:[E1106 07:39:14.869210799 ProcessGroupNCCL.cpp:791] [Rank 0] Some NCCL operations have failed or timed out. Due to the asynchronous nature of CUDA kernels, subsequent GPU operations might run on corrupted/incomplete data.
+[rank0]:[E1106 07:39:14.869230319 ProcessGroupNCCL.cpp:805] [Rank 0] To avoid data inconsistency, we are taking the entire process down.
+[rank0]:[E1106 07:39:14.870139079 ProcessGroupNCCL.cpp:2174] [PG ID 0 PG GUID 0(default_pg) Rank 0] Process group watchdog thread terminated with exception: [Rank 0] Watchdog caught collective operation timeout: WorkNCCL(SeqNum=323, OpType=ALLREDUCE, NumelIn=1, NumelOut=1, Timeout(ms)=60000) ran for 60047 milliseconds before timing out.
+Exception raised from checkTimeout at /__w/pytorch/pytorch/torch/csrc/distributed/c10d/ProcessGroupNCCL.cpp:733 (most recent call first):
+frame #0: c10::Error::Error(c10::SourceLocation, std::__cxx11::basic_string<char, std::char_traits<char>, std::allocator<char> >) + 0xc8 (0xf23bb1e2e158 in /usr/local/lib/python3.12/dist-packages/torch/lib/libc10.so)
+frame #1: c10::DistError::DistError(c10::SourceLocation, std::__cxx11::basic_string<char, std::char_traits<char>, std::allocator<char> >) + 0x78 (0xf23bb1e2ed48 in /usr/local/lib/python3.12/dist-packages/torch/lib/libc10.so)
+frame #2: c10::DistBackendError::DistBackendError(c10::SourceLocation, std::__cxx11::basic_string<char, std::char_traits<char>, std::allocator<char> >) + 0x78 (0xf23bb1e2ee28 in /usr/local/lib/python3.12/dist-packages/torch/lib/libc10.so)
+frame #3: c10d::ProcessGroupNCCL::WorkNCCL::checkTimeout(std::optional<std::chrono::duration<long, std::ratio<1l, 1000l> > >) + 0x210 (0xf23bb2d6fb90 in /usr/local/lib/python3.12/dist-packages/torch/lib/libtorch_cuda.so)
+frame #4: c10d::ProcessGroupNCCL::Watchdog::runLoop() + 0xe7c (0xf23bb2d8363c in /usr/local/lib/python3.12/dist-packages/torch/lib/libtorch_cuda.so)
+frame #5: c10d::ProcessGroupNCCL::Watchdog::run() + 0x108 (0xf23bb2d84958 in /usr/local/lib/python3.12/dist-packages/torch/lib/libtorch_cuda.so)
+frame #6: <unknown function> + 0xe1ae0 (0xf23c595a1ae0 in /lib/aarch64-linux-gnu/libstdc++.so.6)
+frame #7: <unknown function> + 0x8582c (0xf23c5b77582c in /lib/aarch64-linux-gnu/libc.so.6)
+frame #8: <unknown function> + 0xeb8dc (0xf23c5b7db8dc in /lib/aarch64-linux-gnu/libc.so.6)
+
+terminate called after throwing an instance of 'c10::DistBackendError'
+  what():  [PG ID 0 PG GUID 0(default_pg) Rank 0] Process group watchdog thread terminated with exception: [Rank 0] Watchdog caught collective operation timeout: WorkNCCL(SeqNum=323, OpType=ALLREDUCE, NumelIn=1, NumelOut=1, Timeout(ms)=60000) ran for 60047 milliseconds before timing out.
+Exception raised from checkTimeout at /__w/pytorch/pytorch/torch/csrc/distributed/c10d/ProcessGroupNCCL.cpp:733 (most recent call first):
+frame #0: c10::Error::Error(c10::SourceLocation, std::__cxx11::basic_string<char, std::char_traits<char>, std::allocator<char> >) + 0xc8 (0xf23bb1e2e158 in /usr/local/lib/python3.12/dist-packages/torch/lib/libc10.so)
+frame #1: c10::DistError::DistError(c10::SourceLocation, std::__cxx11::basic_string<char, std::char_traits<char>, std::allocator<char> >) + 0x78 (0xf23bb1e2ed48 in /usr/local/lib/python3.12/dist-packages/torch/lib/libc10.so)
+frame #2: c10::DistBackendError::DistBackendError(c10::SourceLocation, std::__cxx11::basic_string<char, std::char_traits<char>, std::allocator<char> >) + 0x78 (0xf23bb1e2ee28 in /usr/local/lib/python3.12/dist-packages/torch/lib/libc10.so)
+frame #3: c10d::ProcessGroupNCCL::WorkNCCL::checkTimeout(std::optional<std::chrono::duration<long, std::ratio<1l, 1000l> > >) + 0x210 (0xf23bb2d6fb90 in /usr/local/lib/python3.12/dist-packages/torch/lib/libtorch_cuda.so)
+frame #4: c10d::ProcessGroupNCCL::Watchdog::runLoop() + 0xe7c (0xf23bb2d8363c in /usr/local/lib/python3.12/dist-packages/torch/lib/libtorch_cuda.so)
+frame #5: c10d::ProcessGroupNCCL::Watchdog::run() + 0x108 (0xf23bb2d84958 in /usr/local/lib/python3.12/dist-packages/torch/lib/libtorch_cuda.so)
+frame #6: <unknown function> + 0xe1ae0 (0xf23c595a1ae0 in /lib/aarch64-linux-gnu/libstdc++.so.6)
+frame #7: <unknown function> + 0x8582c (0xf23c5b77582c in /lib/aarch64-linux-gnu/libc.so.6)
+frame #8: <unknown function> + 0xeb8dc (0xf23c5b7db8dc in /lib/aarch64-linux-gnu/libc.so.6)
+
+Exception raised from run at /__w/pytorch/pytorch/torch/csrc/distributed/c10d/ProcessGroupNCCL.cpp:2180 (most recent call first):
+frame #0: c10::Error::Error(c10::SourceLocation, std::__cxx11::basic_string<char, std::char_traits<char>, std::allocator<char> >) + 0xc8 (0xf23bb1e2e158 in /usr/local/lib/python3.12/dist-packages/torch/lib/libc10.so)
+frame #1: c10::DistError::DistError(c10::SourceLocation, std::__cxx11::basic_string<char, std::char_traits<char>, std::allocator<char> >) + 0x78 (0xf23bb1e2ed48 in /usr/local/lib/python3.12/dist-packages/torch/lib/libc10.so)
+frame #2: c10::DistBackendError::DistBackendError(c10::SourceLocation, std::__cxx11::basic_string<char, std::char_traits<char>, std::allocator<char> >) + 0x78 (0xf23bb1e2ee28 in /usr/local/lib/python3.12/dist-packages/torch/lib/libc10.so)
+frame #3: c10d::ProcessGroupNCCL::Watchdog::run() + 0x5b8 (0xf23bb2d84e08 in /usr/local/lib/python3.12/dist-packages/torch/lib/libtorch_cuda.so)
+frame #4: <unknown function> + 0xe1ae0 (0xf23c595a1ae0 in /lib/aarch64-linux-gnu/libstdc++.so.6)
+frame #5: <unknown function> + 0x8582c (0xf23c5b77582c in /lib/aarch64-linux-gnu/libc.so.6)
+frame #6: <unknown function> + 0xeb8dc (0xf23c5b7db8dc in /lib/aarch64-linux-gnu/libc.so.6)
+
+E1106 07:39:54.267000 55 torch/distributed/elastic/multiprocessing/api.py:1002] failed (exitcode: -6) local_rank: 0 (pid: 59) of binary: /usr/bin/python3
+Traceback (most recent call last):
+  File "<frozen runpy>", line 198, in _run_module_as_main
+  File "<frozen runpy>", line 88, in _run_code
+  File "/usr/local/lib/python3.12/dist-packages/torch/distributed/run.py", line 1032, in <module>
+    main()
+  File "/usr/local/lib/python3.12/dist-packages/torch/distributed/elastic/multiprocessing/errors/__init__.py", line 367, in wrapper
+    return f(*args, **kwargs)
+           ^^^^^^^^^^^^^^^^^^
+  File "/usr/local/lib/python3.12/dist-packages/torch/distributed/run.py", line 1028, in main
+    run(args)
+  File "/usr/local/lib/python3.12/dist-packages/torch/distributed/run.py", line 1019, in run
+    elastic_launch(
+  File "/usr/local/lib/python3.12/dist-packages/torch/distributed/launcher/api.py", line 194, in __call__
+    return launch_agent(
+           ^^^^^^^^^^^^^
+  File "/usr/local/lib/python3.12/dist-packages/torch/distributed/launcher/api.py", line 383, in launch_agent
+    raise ChildFailedError(
+torch.distributed.elastic.multiprocessing.errors.ChildFailedError: 
+===================================================
+pytest FAILED
+---------------------------------------------------
+Failures:
+  <NO_OTHER_FAILURES>
+---------------------------------------------------
+Root Cause (first observed failure):
+[0]:
+  time      : 2026-11-06_07:39:54
+  host      : localhost
+  rank      : 0 (local_rank: 0)
+  exitcode  : -6 (pid: 59)  (SIGABRT)
+  error_file: <N/A>
+  traceback : Signal 6 (SIGABRT) received by PID 59
+===================================================

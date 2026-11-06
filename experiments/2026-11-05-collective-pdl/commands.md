@@ -81,3 +81,27 @@ was freshly prepared and both profile doctors passed. Full image preparation
 is deferred until selection; the current build check correctly warns that the
 new context is incomplete. No candidate image exists.
 The controller now keeps its owned-window heartbeat alive through restoration.
+
+## 2026-11-06 TP3 Retry Windows (`dgx1-dgx3`)
+
+```bash
+# Window dgx1-1793950542: exposed missing management_interface=enP7s7 in default site map
+python3 /home/swank/spark-lab/collective-pdl/deployment/experiments/2026-11-05-collective-pdl/run-source-gates.py \
+  --map /home/swank/projects/spark-ds41f/config/nodes.json \
+  --output-dir /home/swank/spark-lab/collective-pdl/window-20261106-retry \
+  --step entry-gates
+
+# Window dgx1-1793951262: 106/106 collective tests per rank + TP3 oneshot-direct fabric probe passed on entry, staged, arrived
+python3 /home/swank/spark-lab/collective-pdl/deployment/experiments/2026-11-05-collective-pdl/run-source-gates.py \
+  --map /home/swank/spark-lab/collective-pdl/nodes-tp3.json \
+  --output-dir /home/swank/spark-lab/collective-pdl/window-20261106-enP7s7 \
+  --step entry-gates --step staged-gates --step arrived-gates
+
+# Window dgx1-1793951855: two-round reversed synthetic launch-chain screen + analyzer
+python3 /home/swank/spark-lab/collective-pdl/deployment/experiments/2026-11-05-collective-pdl/run-source-gates.py \
+  --map /home/swank/spark-lab/collective-pdl/nodes-tp3.json \
+  --output-dir /home/swank/spark-lab/collective-pdl/window-20261106-benchmarks \
+  --step entry-bench-1 --step staged-bench-1 --step arrived-bench-1 \
+  --step arrived-bench-2 --step staged-bench-2 --step entry-bench-2 \
+  --step analyze-benchmarks
+```
