@@ -34,6 +34,10 @@ region. No changes to weights, arithmetic, topology or promoted configuration.
   metadata is produced immediately before use and has no demonstrated exposed
   eviction cost. A whole-model arena window would retain unrelated streaming
   data and is excluded.
+- Candidate-38's available November 4 Nsight/IKET trace is a one-GPU dummy-weight
+  run with TP4-shaped dimensions, no distributed peers and no TP>1 fused Markov
+  path. It does not replace a real serving trace or establish this component's
+  critical-path share. A positive result still needs the latter measurement.
 
 ## Gates
 
@@ -123,3 +127,9 @@ runtime image is part of this experiment.
 
 GPU results: pending. No speedup, correctness improvement, or performance
 preservation is claimed.
+
+`analyze.py <boot-1.json> <boot-2.json> --output <summary.json>` reports each
+arm and cache-aftereffect comparison. Independent units are fresh processes;
+the two-boot 95% Student interval uses df=1, not 62 independent trials. Both
+boot means and all original samples remain available. An interval spanning
+zero cannot establish performance preservation.
