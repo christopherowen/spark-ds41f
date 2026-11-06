@@ -257,9 +257,9 @@ def main():
             hold = owned()
             if heartbeat_errors or guard_errors: raise RuntimeError(heartbeat_errors+guard_errors)
             watch.check()
-            reason = lab.window_should_close(hold)
-            if reason: raise RuntimeError(f"yielding before {kind}: {reason}")
-            current[0] = f"collective PDL source {kind}"
+            # This invocation is one already-started job. A new request is
+            # honored after its complete source gate, not between its steps.
+            current[0] = f"collective PDL {PHASE} {args.mode}: {kind}"
             lab.beat(current[0])
             began = time.monotonic()
             def run(item):
@@ -389,8 +389,18 @@ def main():
             receipt["restored"] = lab.window_close("collective source gates ended without a pass")
             save()
         else:
-            owned(); lab.beat(f"{PHASE} {args.mode} passed; awaiting reviewed next step")
-            print(f"{PHASE} {args.mode} passed. Window retained for the next step; watchdog remains active.", flush=True)
+            hold=owned()
+            lab.beat(f"{PHASE} {args.mode} passed; checking the next request")
+            reason=lab.window_should_close(hold)
+            if reason:
+                receipt["restored"]=lab.window_close(reason)
+                receipt["handoff_reason"]=reason
+                save()
+                if not receipt["restored"]:
+                    raise RuntimeError("source job passed but restoration failed; hold retained")
+                print(f"{PHASE} {args.mode} passed; production restored and window released for the waiting request.",flush=True)
+            else:
+                print(f"{PHASE} {args.mode} passed. Window retained for the next step; watchdog remains active.", flush=True)
 
 if __name__ == "__main__":
     main()

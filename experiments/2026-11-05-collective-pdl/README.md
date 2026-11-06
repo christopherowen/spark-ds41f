@@ -119,6 +119,13 @@ The controller requires 40 GiB free before launch, keeps the existing 24 GiB
 memory floor and thermal limits, retains raw memory/thermal samples, cools
 below 55 C and maintains the window
 heartbeat. Management uncertainty stops further launches and retains the hold.
+Each invocation is one bounded job: a source gate includes the all-rank GPU
+suite and fabric probe; a benchmark invocation is one process round. The operator
+checks the queue before starting each new job. Requests arriving during the
+current job are honored at its completion, with production restored once and
+the window released. This source-screen controller runs before any canonical
+deployment switch; serving-phase restoration must also restore the captured
+deployment commit.
 
 The synthetic matrix has 7 row counts, all-reduce/all-gather/mixed chains and
 0/4/32 MiB of concurrent copy work. Each case has 40 samples of 16 graph chains. External CUDA event-record
