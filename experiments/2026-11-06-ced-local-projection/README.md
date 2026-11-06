@@ -1,7 +1,7 @@
 # CED row-local global-KV projection
 
-Status: experimental alternative; first native GPU boot passed 367 checks with
-one skipped. Repeat, schedule screen and serving results are pending. Source
+Status: experimental alternative; two native GPU boots each passed 367 checks with
+one skipped. Schedule timing refinement and serving results are pending. Source
 commit `51c1a32cd78cfb0a14087e34dfcc06be30928a0e` is published on
 `https://github.com/christopherowen/vllm/tree/feat/ced-local-projection`.
 The focused compact-carry source review remains
@@ -161,3 +161,21 @@ The test process peaked at 3633984 KiB RSS. Full commands, mounted-file hashes,
 dependency image identity and five-second memory/clock/temperature samples are
 in `receipts/native-boot-1/`. This is one kernel-test process boot, not a serving
 benchmark, and it does not certify actual multi-node collective behavior.
+
+## Native GPU boot 2 and timing refinement
+
+The second clean test-container boot again passed 367 checks, with one skipped,
+in 284.90 s. The skipped existing partial-state offset test requires just over
+8 GiB of additional GPU allocation and did not fit the bounded 16 GiB container;
+none of the new CED/local-projection cases skipped. Peak PyTorch allocation was
+4115485696 bytes, reserved storage 5802819584 bytes, and process RSS 3681024 KiB.
+See `receipts/native-boot-2/` for exact identities and telemetry.
+
+The discovery screen passed finite/nonfinite bit equality for all eighteen
+layouts at both chunk shapes. Its ordinary event brackets also include gaps while
+Python enqueues the kernel; the raw timings contain substantial outliers. The
+parent callable additionally formed a weight view during that bracket. Those
+results remain discovery data, not the basis of a throughput claim. The corrected
+screen pre-binds the parent view and captures external CUDA timing-event nodes
+inside graph replay, with any cache wash before the timed kernel. Two corrected
+process boots are required before schedule selection.

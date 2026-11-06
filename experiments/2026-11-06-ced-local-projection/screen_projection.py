@@ -43,15 +43,21 @@ def timings(call, wash):
     for _ in range(5):
         call()
     torch.cuda.synchronize()
-    times = []
-    for _ in range(a.repeats):
+    # External event nodes record timestamps inside replay, removing Python
+    # launch gaps. A wash, when selected, precedes the timed kernel in the graph.
+    begin = torch.cuda.Event(enable_timing=True, external=True)
+    end = torch.cuda.Event(enable_timing=True, external=True)
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
         if wash:
             flush.add_(1)
-        begin, end = torch.cuda.Event(enable_timing=True), torch.cuda.Event(enable_timing=True)
         begin.record()
         call()
         end.record()
-        end.synchronize()
+    times = []
+    for _ in range(a.repeats):
+        graph.replay()
+        torch.cuda.synchronize()
         times.append(begin.elapsed_time(end))
     return times
 
@@ -64,6 +70,7 @@ emit(kind="identity", gpu=torch.cuda.get_device_name(), capability=torch.cuda.ge
      torch=torch.__version__, cuda=torch.version.cuda, seed=3643, repeats=a.repeats,
      cache_modes=["warm", "128MiB wash before timed kernel"],
      scope="one rank's projection only; no collective, normalization, or serving time",
+     timer="external CUDA event nodes inside graph replay; host launch gaps excluded",
      fixed={"K": 5120, "block_K": 64, "shards": 5, "blocked": True})
 failures = []
 for world, tokens in ((3, 6144), (4, 16384)):
@@ -78,7 +85,8 @@ for world, tokens in ((3, 6144), (4, 16384)):
         native(x, weight[start:start + cols], native_out)
         reference.append(native_out[:rows].clone())
     expected = torch.cat(reference, dim=-1)
-    variants = [("parent", lambda: native(x, weight[:cols], native_out))]
+    native_weight = weight[:cols]
+    variants = [("parent", lambda: native(x, native_weight, native_out))]
     outputs = []
     for schedule in schedules:
         name = "local-" + "x".join(map(str, schedule))
