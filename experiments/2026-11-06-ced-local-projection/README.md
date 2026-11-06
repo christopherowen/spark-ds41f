@@ -211,3 +211,38 @@ was replaced. The next requested job is a 25-minute DGX4-only timing screen,
 including four fresh test-container processes, all eighteen schedules at both
 chunk shapes, finite/nonfinite gates, and cooling before each process. It will
 follow the explicit shared-hardware reservations; no request waiter is active.
+
+
+## Python-only image preparation
+
+`image_native_reuse.py` is an experimental CPU-only image recipe for these six
+Python changes. It uses the already available immutable Spaceport C36 image
+`sha256:3795255f485ea5c1a9db54c742921dd9b2917daad0799361e5c6f56a70119713`.
+That image has the same locked source identities as the DGX4 native-test parent,
+but a different image digest. Its control must therefore be this exact parent,
+not the DGX4 image or a historical timing run.
+
+The recipe first runs the normal complete build-input check, verifies every
+tracked parent source file against the frozen control Git tree, and refuses any
+source change outside Python implementation/tests. It copies the existing exact
+candidate Git export with required license files, verifies every tracked source
+file again, compares both compiled vLLM extension hashes, and checks that the
+candidate inherits the parent's entire layer chain. Other dependency tree labels
+must remain equal. The unique tag is never overwritten. This is deliberate reuse
+of unchanged native binaries, not a native rebuild.
+
+Preparation and verification use one CPU and 4 GiB on Spaceport, with a 48 GiB host
+reserve and the normal image-build lock. The Dockerfile has no RUN step and no
+package installation. CPU verification explicitly uses runtime runc with no GPU
+exposure. The existing checked build context is reused instead of copying another
+source tree or base-image archive. `--apply` refuses an unpublished or dirty
+recipe. A successful CPU build still requires the normal `bin/spark build smoke`
+in an exclusively owned hardware window before any serving qualification.
+
+`native-reuse-tp3.json`/`native-reuse-tp4.json` select the resulting candidate tag;
+`native-control-tp3.json`/`native-control-tp4.json` select an immutable alias of that
+exact parent digest. Before distribution, the alias must be created only if absent
+and verified against the parent ID; an existing mismatched tag is an error.
+Build once, then distribute the same verified OCI identity to all configured
+ranks through the coordinated tools. These profiles do not authorize a shape
+change or substitute for the original A/B source pins and evidence.
