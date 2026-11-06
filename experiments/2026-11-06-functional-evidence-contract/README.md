@@ -34,9 +34,59 @@ records whether the timing step was reached and whether failure restoration was
 requested. A request/response fixture also exercises all 24 sampled records,
 separate token/logprob differences and manifest tamper detection in the unit tests.
 
-Validation runs on Spaceport8, in a clean published checkout, under the shared CPU
-locks with one core and a 2 GiB limit. Exact commands, all exits and memory
-observations will be retained under `runs/`; no GPU operation is part of this work.
+Validation passed on Spaceport8 (`spark-0016`) at clean published implementation
+commit `2176e3d60283ae6a2f3165be5f84dcd6939c74c9`, on 2026-11-06 at 01:53 UTC.
+All 146 tests passed: 15 evidence/recorder, 114 lab, 9 C43 controller and 8 C40
+compatibility tests. `bin/spark doctor` returned `configuration OK` and
+`git diff --check` passed. No upstream series changed. The owned checkout has no
+complete `inputs.json` build preparation, so a full build check was not applicable.
+
+The [counterfactual receipt](runs/2176e3d6-attempt-1/before-after.json) preserves
+all six old/new cases, collector output, runner logs and new evidence receipts:
+
+| Input from a zero-exit collector | Base reaches timing | New reaches timing | New requests restore |
+| --- | --- | --- | --- |
+| Required verdict false | Yes | No | Yes |
+| Required verdict missing | Yes | No | Yes |
+| Required verdict malformed | Yes | No | Yes |
+| Required isolated repeat differs | Yes | No | Yes |
+| Observed batch difference, isolated repeat matches | Yes | Yes | No |
+| Required verdict passes | Yes | Yes | No |
+
+These are CPU fixtures, not serving measurements. The old runner did not consume
+the new declarations; this demonstrates the missing enforcement mechanism, not
+a historical audit falsely claiming sampled batch invariance. No validation
+command failed. An initial read-only inventory used the unavailable SSH alias
+`spaceport8` (name resolution failed before connection); `sp8` is the valid alias.
+
+Every command, exit, log and `/usr/bin/time -v` resource observation is retained in
+[runs/2176e3d6-attempt-1](runs/2176e3d6-attempt-1). The highest recorded maximum RSS
+was 41,708 KiB (lab tests); every command recorded zero swaps. The counterfactual
+used 37,456 KiB and took 0.176 seconds internally. There was no GPU operation.
+The commands ran serially under:
+
+```sh
+systemd-run --user --scope --quiet -p MemoryMax=2G -p CPUQuota=100% \
+  taskset -c 0 flock -w 60 /home/chris/spark-lab/offline-cpu.lock \
+  flock -w 60 /home/chris/spark-cpu-work.lock bash -s
+```
+
+Working directory: `/home/chris/spark-lab/verification-budget-replay/checkout`.
+`OMP_NUM_THREADS=1`, `OPENBLAS_NUM_THREADS=1`, `MAX_JOBS=1`.
+The Python executable is `/home/chris/spark-lab/verification-budget-replay/env/bin/python`
+(3.12). The `.command.txt` files contain each exact command; for example:
+
+```sh
+/home/chris/spark-lab/verification-budget-replay/env/bin/python \
+  experiments/2026-11-06-functional-evidence-contract/run_cpu_proof.py \
+  --output /home/chris/spark-lab/verification-budget-replay/logs/functional-evidence/2176e3d6-attempt-1/before-after.json
+```
+
+Conclusion: declared failures now stop advancement and request the existing
+restoration path, while declared observations retain their meaning. Request
+recordings are checked for complete case coverage, IDs, generation controls,
+token/logprob lengths, hashes and agreement with the collector's aggregate
+digests. This is a validation/diagnostic improvement with no serving-speed claim.
 
 ## Future row-cost qualification contract
 
