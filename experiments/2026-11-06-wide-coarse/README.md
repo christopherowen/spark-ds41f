@@ -1,0 +1,7 @@
+# Exact raw wide coarse selection
+
+Base `f48423d50b97878f5c74bc2637ec60dbd7da8d5f`. One intended variable relative to the source1024/dense64/native-generation recipe: replace the all-entry4096-key segment pass and following select-all8192-key merge with a raw16384-key to8192-key selection. Remaining exact wide merges are unchanged. The first useful selection sees the same entries and retains the same BF16 thresholds, score bits and ascending-entry ties. The full-width coarse route removes two launches and reduces its ping-pong scratch by four; these are structural counts, not measured request-speed gains.
+
+The parent answer comparison is still running. This optimization cannot repair a parent selection-quality loss. Retention, cache geometry, score arithmetic, phase policy, weights and final-answer protocol remain unchanged. Independent prior-route/stable-sort, strict initialization/race, actual native-score, declared-call and graph checks must pass from a clean published commit. Two fresh component timing processes and independent model request/answer gates remain required before any speed or quality claim.
+
+Fresh twelve-patch application equals all affected overlays. Commands and source hashes remain in `runs/local`; preparation uses one CPU/4 GiB and one worker remotely. Complete image-build inputs are unavailable. All reference calculations remain outside serving, raw operands remain private on nodes, and no production promotion is claimed.
