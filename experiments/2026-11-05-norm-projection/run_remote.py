@@ -29,41 +29,35 @@ def head(script):
     return json.loads(p.stdout)
 
 def reservation(action):
-    return head("import json, pathlib, datetime\n" +
-        "p=pathlib.Path.home()/'spark-hold.json'\n" +
-        "req=pathlib.Path.home()/'spark-request.json'\n" +
-        "old=pathlib.Path.home()/'spark3-hold.json'\n" +
-        f"holder={HOLDER!r}\naction={action!r}\n" +
-        "now=datetime.datetime.now(datetime.timezone.utc).isoformat()\n" +
-        "record=json.loads(p.read_text()) if p.exists() else None\n" +
-        "requester=json.loads(req.read_text()) if req.exists() else None\n" +
-        "if action=='claim':\n" +
-        "    if record or old.exists() or (requester and requester.get('who')!=holder): print(json.dumps({'acquired':False,'holder':record,'request':requester}))\n" +
-        "    else:\n" +
-        "        data={'holder':holder,'since':now,'expected_end':None,'heartbeat':now,'rule':'Kernel-only dgx4 reservation. No other GPU work or cluster operations. Serving remains unchanged.','serving_untouched':True}\n" +
-        "        try:\n" +
-        "            with p.open('x') as f: json.dump(data,f,indent=2)\n" +
-        "            if req.exists() and json.loads(req.read_text()).get('who')==holder: req.unlink()\n" +
-        "            print(json.dumps({'acquired':True,'since':now}))\n" +
-        "        except FileExistsError: print(json.dumps({'acquired':False}))\n" +
-        "elif action=='request':\n" +
-        "    if requester: print(json.dumps({'queued':False,'request':requester}))\n" +
-        "    else:\n" +
-        "        data={'who':holder,'why':'Resume published kernel-only DGX4 norm/projection boundary screen after the active job; no serving changes in this job','how_long':'30 minutes for two fresh process runs; yield after the active run on request','since':now,'branch':'feat/norm-projection-boundaries'}\n" +
-        "        try:\n" +
-        "            with req.open('x') as f: json.dump(data,f,indent=2)\n" +
-        "            print(json.dumps({'queued':True}))\n" +
-        "        except FileExistsError: print(json.dumps({'queued':False}))\n" +
-        "elif action=='cancel_request':\n" +
-        "    if requester and requester.get('who')==holder: req.unlink()\n" +
-        "    print(json.dumps({'cancelled':True}))\n" +
-        "elif action=='refresh':\n" +
-        "    if not record or record.get('holder')!=holder: raise RuntimeError('reservation lost')\n" +
-        "    record['heartbeat']=now; temporary=p.with_name('spark-hold-norm-projection.tmp'); temporary.write_text(json.dumps(record,indent=2)); temporary.replace(p)\n" +
-        "    print(json.dumps({'requested':req.exists()}))\n" +
-        "elif action=='release':\n" +
-        "    if record and record.get('holder')==holder: p.unlink()\n" +
-        "    print(json.dumps({'released':True}))\n")
+    p = Path.home() / 'spark-hold.json'
+    req = Path.home() / 'spark-request.json'
+    now = datetime.datetime.now(datetime.timezone.utc).isoformat()
+    record = json.loads(p.read_text()) if p.exists() else None
+    requester = json.loads(req.read_text()) if req.exists() else None
+    if action == 'claim':
+        if record and record.get('holder') == HOLDER and record.get('scope') == 'dgx4':
+            record['heartbeat'] = now
+            tmp = p.with_name('spark-hold-norm-projection.tmp')
+            tmp.write_text(json.dumps(record, indent=2) + '\n')
+            tmp.replace(p)
+            return {'acquired': True, 'since': record['since']}
+        return {'acquired': False, 'holder': record, 'request': requester}
+    elif action == 'refresh':
+        if not record or record.get('holder') != HOLDER:
+            raise RuntimeError('reservation lost')
+        record['heartbeat'] = now
+        tmp = p.with_name('spark-hold-norm-projection.tmp')
+        tmp.write_text(json.dumps(record, indent=2) + '\n')
+        tmp.replace(p)
+        return {'requested': req.exists()}
+    elif action in ('release', 'cancel_request'):
+        if record and record.get('holder') == HOLDER:
+            record['heartbeat'] = now
+            tmp = p.with_name('spark-hold-norm-projection.tmp')
+            tmp.write_text(json.dumps(record, indent=2) + '\n')
+            tmp.replace(p)
+        return {'released': False}
+    raise RuntimeError(f'Unexpected action {action}')
 
 def stop_owned_container():
     inspected=subprocess.run(['docker','inspect',CONTAINER,'--format','{{index .Config.Labels "spark.experiment"}} {{.State.Running}}'],text=True,capture_output=True,timeout=15)

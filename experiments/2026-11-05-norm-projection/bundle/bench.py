@@ -45,13 +45,16 @@ def capture(fn, calls=1):
     torch.cuda.current_stream().wait_stream(side)
     torch.cuda.synchronize()
     graph = torch.cuda.CUDAGraph()
+    start, end = (torch.cuda.Event(enable_timing=True, external=True) for _ in range(2))
     with torch.cuda.graph(graph, stream=CAPTURE_STREAM):
+        start.record()
         for _ in range(calls):
             fn()
-    return graph
+        end.record()
+    return SimpleNamespace(replay=graph.replay, graph=graph, start=start, end=end, calls=calls)
 
 
-def make_case(n, m, padded):
+def make_case(n, m, padded, shared_outputs=False):
     gen = torch.Generator(device="cuda").manual_seed(517)
     # Generate maximum rows first so every row has the same input in every batch.
     raw = (torch.randn((96, 1792), generator=gen, device="cuda") * 3).bfloat16()[:m]
@@ -86,14 +89,19 @@ def make_case(n, m, padded):
     outputs, functions = {}, {}
     for variant in VARIANTS[:-1]:
         auxiliary = AUXILIARY_STREAM
-        q = torch.empty((m, 1280), device="cuda", dtype=torch.bfloat16)
-        cast = empty_mxfp8(q)
-        # Explicit poison in unread row padding: live outputs must ignore it.
-        cast.values.view(torch.uint8).fill_(127)
-        cast.scales.fill_(255)
-        kv = torch.empty((m, 512), device="cuda", dtype=torch.bfloat16)
-        cache = torch.full((PAGES, PAGE * RECORD_BYTES["swa"]), 91, device="cuda", dtype=torch.uint8)
-        projected = torch.empty((m, n), device="cuda", dtype=torch.bfloat16)
+        if shared_outputs and outputs:
+            q, _, _, kv, cache, projected = outputs["fused"]
+            cast = shared_cast
+        else:
+            q = torch.empty((m, 1280), device="cuda", dtype=torch.bfloat16)
+            cast = empty_mxfp8(q)
+            # Explicit poison in unread row padding: live outputs must ignore it.
+            cast.values.view(torch.uint8).fill_(127)
+            cast.scales.fill_(255)
+            kv = torch.empty((m, 512), device="cuda", dtype=torch.bfloat16)
+            cache = torch.full((PAGES, PAGE * RECORD_BYTES["swa"]), 91, device="cuda", dtype=torch.uint8)
+            projected = torch.empty((m, n), device="cuda", dtype=torch.bfloat16)
+            shared_cast = cast
 
         def front(variant=variant, q=q, cast=cast, kv=kv, cache=cache, auxiliary=auxiliary):
             if variant == "fused":
@@ -153,6 +161,7 @@ def main():
     torch.manual_seed(517)
     emit(identity={"image_vllm_tree": "c061e5f6931306fa4655ba531428f639c365bf10",
                    "torch": torch.__version__, "gpu": torch.cuda.get_device_name(),
+                   "timing_method": "external events captured inside graph; same output addresses for all arms",
                    "norm_eps": EPS, "rows": ROWS, "variants": VARIANTS, "sm_count": torch.cuda.get_device_properties(0).multi_processor_count, "weights": "seeded synthetic checkpoint shapes",
                    "evict_bytes": 128 << 20, "reset_persisting_l2_before_eviction": True, "prefetch_grid": 2,
                    "prefetch_block": 128, "prefetch_chunk": 4096})
@@ -207,7 +216,16 @@ def main():
                         assert all(byte_equal(outputs[variant][i],clean[i]) for i in unaffected)
                 raw[0, column] = original
                 for fn in functions.values(): fn()
-            del clean
+            # Keep the independent-buffer correctness pass above. Timing uses
+            # identical output addresses for every arm, checked against a frozen
+            # oracle after EACH call; sharing can never make equality vacuous.
+            oracle = tuple(x.clone() for x in outputs["fused"])
+            del clean, functions, outputs
+            functions, outputs, segs, raw, slots = make_case(n, m, padded, shared_outputs=True)
+            assert len({tuple(x.data_ptr() for x in out) for out in outputs.values()}) == 1
+            for variant, fn in functions.items():
+                fn()
+                assert all(byte_equal(a,b) for a,b in zip(outputs[variant],oracle)), ("shared-buffer eager",variant)
             prefetch(segs)
             graphs = {v: capture(fn) for v, fn in functions.items()}
             warm = {v: capture(fn, 20) for v, fn in functions.items()}
@@ -222,14 +240,12 @@ def main():
                     torch.cuda.current_stream().wait_stream(side)
                 return capture(call)
             racing = {v: race(fn) for v, fn in functions.items()}
-            reference = {v: tuple(x.clone() for x in out) for v, out in outputs.items()}
             samples = {mode: {v: [] for v in VARIANTS} for mode in MODES}
             for mode in MODES:
                 for trial in range(31):
                     order = list(VARIANTS)
                     ordering.shuffle(order)
                     for variant in order:
-                        start, end = (torch.cuda.Event(enable_timing=True) for _ in range(2))
                         if mode != "l2":
                             # GB10 evict-last lines survive a normal scrub. Reset
                             # their priority in this benchmark's current context
@@ -241,20 +257,19 @@ def main():
                             # Prime this exact chain immediately before its timed
                             # 20-call graph, independent of the preceding arm.
                             warm[variant].replay()
-                        start.record()
-                        {"l2": warm, "cold": graphs, "prefetch": racing}[mode][variant].replay()
-                        end.record()
+                        timed = {"l2": warm, "cold": graphs, "prefetch": racing}[mode][variant]
+                        timed.replay()
                         torch.cuda.current_stream().wait_stream(side)
                         torch.cuda.synchronize()
-                        samples[mode][variant].append(start.elapsed_time(end) * 1000 / (20 if mode == "l2" else 1))
-                        assert all(byte_equal(a, b) for a, b in zip(outputs[variant], reference[variant]))
+                        samples[mode][variant].append(timed.start.elapsed_time(timed.end) * 1000 / timed.calls)
+                        assert all(byte_equal(a, b) for a, b in zip(outputs[variant], oracle))
             emit(n=n, rows=m, tp3_last_rank=padded, exact=True, batch_invariant=True,
                  finite_contract=True, samples_us=samples,
                  medians_us={mode: {v: statistics.median(xs) for v, xs in arms.items()}
                              for mode, arms in samples.items()},
                  memory_allocated=torch.cuda.memory_allocated(),
                  memory_reserved=torch.cuda.memory_reserved())
-            del functions, outputs, graphs, warm, racing, reference
+            del functions, outputs, graphs, warm, racing, oracle
     emit(passed=True, max_memory_allocated=torch.cuda.max_memory_allocated(),
          max_memory_reserved=torch.cuda.max_memory_reserved())
 
