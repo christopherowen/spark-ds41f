@@ -1,0 +1,112 @@
+--- a/vllm/models/deepseek_v4_1/engram_rows/_row_plan.h
++++ b/vllm/models/deepseek_v4_1/engram_rows/_row_plan.h
+@@ -16,15 +16,14 @@
+ #define PLE_PACKED_ROW_BYTES 264u
+ #define PLE_PACKED_ROWS_PER_PAGE 15u
+ #define PLE_CACHE_WAYS 4u
++#define PLE_SPLIT_TAGS 1
++#define PLE_SOA_CACHE 1
+ #define PLE_DEFAULT_CACHE_ROWS 65536
+ #define PLE_CACHE_MAX_TOKENS 64u
+ #define PLE_CACHE_MAX_LOOKUPS (PLE_CACHE_MAX_TOKENS * PLE_COLUMNS)
+ 
+ typedef struct {
+-    int64_t ids[PLE_CACHE_WAYS];
+     uint8_t clock;
+-    char weights[PLE_CACHE_WAYS][256];
+-    char scales[PLE_CACHE_WAYS][8];
+ } ple_cache_set_t;
+ 
+ typedef struct {
+@@ -74,6 +73,8 @@
+     uint64_t unique_blocks, coalesced_reads, submit_calls;
+     double execution_seconds, planning_seconds;
+     ple_cache_set_t *cache;
++    int64_t *cache_ids;
++    char *cache_weights, *cache_scales;
+     size_t cache_sets, cache_set_mask;
+     uint64_t cache_populated;
+     uint32_t *miss_lookups;
+@@ -97,6 +98,7 @@
+     free(reader->fragments);
+     free(reader->jobs);
+     free(reader->cache);
++    free(reader->cache_ids);
+     free(reader->miss_lookups);
+     free(reader->miss_ids);
+     free(reader->miss_weights);
+@@ -143,16 +145,23 @@
+         reader->cache_sets = sets;
+         reader->cache_set_mask = sets - 1;
+         reader->cache = calloc(sets, sizeof(*reader->cache));
++        if (sets > SIZE_MAX / (PLE_CACHE_WAYS * 272u)) return EOVERFLOW;
++        if (posix_memalign((void **)&reader->cache_ids, 64, sets * PLE_CACHE_WAYS * 272u))
++            reader->cache_ids = NULL;
++        else {
++            reader->cache_weights = (char *)(reader->cache_ids + sets * PLE_CACHE_WAYS);
++            reader->cache_scales = reader->cache_weights + sets * PLE_CACHE_WAYS * 256u;
++        }
+         reader->miss_lookups = malloc(miss_cap * sizeof(*reader->miss_lookups));
+         reader->miss_ids = malloc(miss_cap * sizeof(*reader->miss_ids));
+         reader->miss_weights = malloc((size_t)PLE_CACHE_MAX_LOOKUPS * 256u);
+         reader->miss_scales = malloc((size_t)PLE_CACHE_MAX_LOOKUPS * 8u);
+-        if (!reader->cache || !reader->miss_lookups || !reader->miss_ids ||
++        if (!reader->cache || !reader->cache_ids || !reader->miss_lookups || !reader->miss_ids ||
+             !reader->miss_weights || !reader->miss_scales)
+             return ENOMEM;
+         for (size_t s = 0; s < sets; s++) {
+             for (unsigned w = 0; w < PLE_CACHE_WAYS; w++) {
+-                reader->cache[s].ids[w] = -1;
++                reader->cache_ids[s * PLE_CACHE_WAYS + w] = -1;
+             }
+         }
+     }
+@@ -402,13 +411,13 @@
+     size_t set_idx = ple_cache_set_index(id, reader->cache_set_mask);
+     ple_cache_set_t *set = &reader->cache[set_idx];
+     for (unsigned w = 0; w < PLE_CACHE_WAYS; w++) {
+-        if (set->ids[w] == id) return;
++        if (reader->cache_ids[set_idx * PLE_CACHE_WAYS + w] == id) return;
+     }
+     unsigned w = set->clock & (PLE_CACHE_WAYS - 1);
+     set->clock = (uint8_t)((w + 1) & (PLE_CACHE_WAYS - 1));
+-    set->ids[w] = id;
+-    memcpy(set->weights[w], weight_src, 256u);
+-    memcpy(set->scales[w], scale_src, 8u);
++    reader->cache_ids[set_idx * PLE_CACHE_WAYS + w] = id;
++    memcpy(reader->cache_weights + (set_idx * PLE_CACHE_WAYS + w) * 256u, weight_src, 256u);
++    memcpy(reader->cache_scales + (set_idx * PLE_CACHE_WAYS + w) * 8u, scale_src, 8u);
+     reader->cache_populated++;
+ }
+ 
+@@ -438,7 +447,8 @@
+     reader->fragment_count = reader->job_count = 0;
+     reader->miss_count = 0;
+     bool use_cache = reader->cache_sets > 0 && (count <= PLE_CACHE_MAX_LOOKUPS || dst_is_cached);
+-    bool check_cache = use_cache && reader->cache_populated > 0;
++    bool check_cache = reader->cache_sets > 0 && reader->cache_populated > 0 &&
++                       (count <= 96u * PLE_COLUMNS || dst_is_cached);
+     bool fill_cache = use_cache;
+     reader->miss_src_weights = dst_is_cached ? dst_weights : NULL;
+     reader->miss_src_scales = dst_is_cached ? dst_scales : NULL;
+@@ -464,17 +474,16 @@
+         }
+         if (check_cache) {
+             size_t set_idx = ple_cache_set_index(id, reader->cache_set_mask);
+-            ple_cache_set_t *set = &reader->cache[set_idx];
+             int hit_way = -1;
+             for (unsigned w = 0; w < PLE_CACHE_WAYS; w++) {
+-                if (set->ids[w] == id) {
++                if (reader->cache_ids[set_idx * PLE_CACHE_WAYS + w] == id) {
+                     hit_way = (int)w;
+                     break;
+                 }
+             }
+             if (hit_way >= 0) {
+-                memcpy(dst_weights + i * 256u, set->weights[hit_way], 256u);
+-                memcpy(dst_scales + i * 8u, set->scales[hit_way], 8u);
++                memcpy(dst_weights + i * 256u, reader->cache_weights + (set_idx * PLE_CACHE_WAYS + hit_way) * 256u, 256u);
++                memcpy(dst_scales + i * 8u, reader->cache_scales + (set_idx * PLE_CACHE_WAYS + hit_way) * 8u, 8u);
+                 reader->cache_hits++;
+                 continue;
+             }

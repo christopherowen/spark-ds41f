@@ -1,0 +1,117 @@
+From 745da6586fdebf8d48133639002ed41858831e13 Mon Sep 17 00:00:00 2001
+From: Christopher Owen <3221756+christopherowen@users.noreply.github.com>
+Date: Thu, 5 Nov 2026 23:58:51 +0000
+Subject: [PATCH] Reduce Engram cache lookup cost with aligned metadata
+
+Upstream base: local-inference-lab/vllm
+19f2c20ed4d64ae22bd009ceacadd85e2a81e354, after candidate-38
+1f33102547e4da5c64712390604695d1abd577c4.
+
+Rationale: probing IDs interleaved with cached payloads costs CPU
+time on populated-cache misses.
+Keep the four exact row IDs in a compact aligned array and align the
+immutable weight/scales payload sets to 64 bytes. The default cache
+allocations increase from 17.125 MiB to 17.5 MiB per reader.
+
+Quality: preserve row bytes, exact ID matching, capacity, four-way
+replacement, admission/probe limits and the reader schedule. No
+model arithmetic, quantization or batch-dependent numerical change.
+
+Tests: thirteen-layout native CPU screen on GB10, forward and reverse
+process order, including TP3 6/48-row and TP4 96-row points, cold
+lookups and eviction-heavy cache states. The final source is queued
+for exact-source native reader, sanitizer and GPU validation; serving
+boot/repeat qualification is pending. No serving gain is claimed.
+
+Upstream status: experimental local patch; not submitted upstream.
+---
+ .../deepseek_v4_1/engram_rows/_row_plan.h     | 25 +++++++++++++------
+ 1 file changed, 17 insertions(+), 8 deletions(-)
+
+diff --git a/vllm/models/deepseek_v4_1/engram_rows/_row_plan.h b/vllm/models/deepseek_v4_1/engram_rows/_row_plan.h
+index 9c9546985..20374992e 100644
+--- a/vllm/models/deepseek_v4_1/engram_rows/_row_plan.h
++++ b/vllm/models/deepseek_v4_1/engram_rows/_row_plan.h
+@@ -21,10 +21,11 @@
+ #define PLE_CACHE_MAX_LOOKUPS (PLE_CACHE_MAX_TOKENS * PLE_COLUMNS)
+ 
+ typedef struct {
+-    int64_t ids[PLE_CACHE_WAYS];
+-    uint8_t clock;
+     char weights[PLE_CACHE_WAYS][256];
+     char scales[PLE_CACHE_WAYS][8];
++    uint8_t clock;
++    /* Keep every payload set on a cache-line boundary. */
++    char padding[64u - ((PLE_CACHE_WAYS * 264u + 1u) % 64u)];
+ } ple_cache_set_t;
+ 
+ typedef struct {
+@@ -74,6 +75,7 @@ typedef struct {
+     uint64_t unique_blocks, coalesced_reads, submit_calls;
+     double execution_seconds, planning_seconds;
+     ple_cache_set_t *cache;
++    int64_t *cache_ids;
+     size_t cache_sets, cache_set_mask;
+     uint64_t cache_populated;
+     uint32_t *miss_lookups;
+@@ -97,6 +99,7 @@ static inline void ple_plan_release(ple_plan_t *reader) {
+     free(reader->fragments);
+     free(reader->jobs);
+     free(reader->cache);
++    free(reader->cache_ids);
+     free(reader->miss_lookups);
+     free(reader->miss_ids);
+     free(reader->miss_weights);
+@@ -142,17 +145,23 @@ static inline int ple_plan_init(ple_plan_t *reader, int64_t shard_rows,
+                               : (size_t)PLE_CACHE_MAX_LOOKUPS;
+         reader->cache_sets = sets;
+         reader->cache_set_mask = sets - 1;
+-        reader->cache = calloc(sets, sizeof(*reader->cache));
++        _Static_assert(sizeof(*reader->cache) % 64u == 0, "aligned cache payload stride");
++        if (sets > SIZE_MAX / sizeof(*reader->cache)) return EOVERFLOW;
++        if (posix_memalign((void **)&reader->cache, 64, sets * sizeof(*reader->cache)))
++            reader->cache = NULL;
++        else memset(reader->cache, 0, sets * sizeof(*reader->cache));
++        if (posix_memalign((void **)&reader->cache_ids, 64, sets * PLE_CACHE_WAYS * sizeof(*reader->cache_ids)))
++            reader->cache_ids = NULL;
+         reader->miss_lookups = malloc(miss_cap * sizeof(*reader->miss_lookups));
+         reader->miss_ids = malloc(miss_cap * sizeof(*reader->miss_ids));
+         reader->miss_weights = malloc((size_t)PLE_CACHE_MAX_LOOKUPS * 256u);
+         reader->miss_scales = malloc((size_t)PLE_CACHE_MAX_LOOKUPS * 8u);
+-        if (!reader->cache || !reader->miss_lookups || !reader->miss_ids ||
++        if (!reader->cache || !reader->cache_ids || !reader->miss_lookups || !reader->miss_ids ||
+             !reader->miss_weights || !reader->miss_scales)
+             return ENOMEM;
+         for (size_t s = 0; s < sets; s++) {
+             for (unsigned w = 0; w < PLE_CACHE_WAYS; w++) {
+-                reader->cache[s].ids[w] = -1;
++                reader->cache_ids[s * PLE_CACHE_WAYS + w] = -1;
+             }
+         }
+     }
+@@ -402,11 +411,11 @@ static inline void ple_cache_insert(ple_plan_t *reader, int64_t id,
+     size_t set_idx = ple_cache_set_index(id, reader->cache_set_mask);
+     ple_cache_set_t *set = &reader->cache[set_idx];
+     for (unsigned w = 0; w < PLE_CACHE_WAYS; w++) {
+-        if (set->ids[w] == id) return;
++        if (reader->cache_ids[set_idx * PLE_CACHE_WAYS + w] == id) return;
+     }
+     unsigned w = set->clock & (PLE_CACHE_WAYS - 1);
+     set->clock = (uint8_t)((w + 1) & (PLE_CACHE_WAYS - 1));
+-    set->ids[w] = id;
++    reader->cache_ids[set_idx * PLE_CACHE_WAYS + w] = id;
+     memcpy(set->weights[w], weight_src, 256u);
+     memcpy(set->scales[w], scale_src, 8u);
+     reader->cache_populated++;
+@@ -467,7 +476,7 @@ static inline bool ple_plan(ple_plan_t *reader, const char *ids, size_t count,
+             ple_cache_set_t *set = &reader->cache[set_idx];
+             int hit_way = -1;
+             for (unsigned w = 0; w < PLE_CACHE_WAYS; w++) {
+-                if (set->ids[w] == id) {
++                if (reader->cache_ids[set_idx * PLE_CACHE_WAYS + w] == id) {
+                     hit_way = (int)w;
+                     break;
+                 }
+-- 
+2.43.0
+

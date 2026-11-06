@@ -1,0 +1,84 @@
+--- a/vllm/models/deepseek_v4_1/engram_rows/_row_plan.h
++++ b/vllm/models/deepseek_v4_1/engram_rows/_row_plan.h
+@@ -16,6 +16,7 @@
+ #define PLE_PACKED_ROW_BYTES 264u
+ #define PLE_PACKED_ROWS_PER_PAGE 15u
+ #define PLE_CACHE_WAYS 4u
++#define PLE_FILTER_TAGS 1
+ #define PLE_DEFAULT_CACHE_ROWS 65536
+ #define PLE_CACHE_MAX_TOKENS 64u
+ #define PLE_CACHE_MAX_LOOKUPS (PLE_CACHE_MAX_TOKENS * PLE_COLUMNS)
+@@ -74,6 +75,7 @@
+     uint64_t unique_blocks, coalesced_reads, submit_calls;
+     double execution_seconds, planning_seconds;
+     ple_cache_set_t *cache;
++    uint64_t *cache_filter;
+     size_t cache_sets, cache_set_mask;
+     uint64_t cache_populated;
+     uint32_t *miss_lookups;
+@@ -97,6 +99,7 @@
+     free(reader->fragments);
+     free(reader->jobs);
+     free(reader->cache);
++    free(reader->cache_filter);
+     free(reader->miss_lookups);
+     free(reader->miss_ids);
+     free(reader->miss_weights);
+@@ -143,11 +146,12 @@
+         reader->cache_sets = sets;
+         reader->cache_set_mask = sets - 1;
+         reader->cache = calloc(sets, sizeof(*reader->cache));
++        reader->cache_filter = calloc(sets, sizeof(*reader->cache_filter));
+         reader->miss_lookups = malloc(miss_cap * sizeof(*reader->miss_lookups));
+         reader->miss_ids = malloc(miss_cap * sizeof(*reader->miss_ids));
+         reader->miss_weights = malloc((size_t)PLE_CACHE_MAX_LOOKUPS * 256u);
+         reader->miss_scales = malloc((size_t)PLE_CACHE_MAX_LOOKUPS * 8u);
+-        if (!reader->cache || !reader->miss_lookups || !reader->miss_ids ||
++        if (!reader->cache || !reader->cache_filter || !reader->miss_lookups || !reader->miss_ids ||
+             !reader->miss_weights || !reader->miss_scales)
+             return ENOMEM;
+         for (size_t s = 0; s < sets; s++) {
+@@ -397,6 +401,11 @@
+     job->saved_buffer = NULL;
+ }
+ 
++static inline uint64_t ple_cache_filter_bit(int64_t id) {
++    uint64_t h = (uint64_t)id * 0x9E3779B97F4A7C15ULL;
++    return UINT64_C(1) << ((h >> 48) & 63);
++}
++
+ static inline void ple_cache_insert(ple_plan_t *reader, int64_t id,
+         const char *weight_src, const char *scale_src) {
+     size_t set_idx = ple_cache_set_index(id, reader->cache_set_mask);
+@@ -407,6 +416,11 @@
+     unsigned w = set->clock & (PLE_CACHE_WAYS - 1);
+     set->clock = (uint8_t)((w + 1) & (PLE_CACHE_WAYS - 1));
+     set->ids[w] = id;
++    uint64_t bits = 0;
++    for (unsigned k = 0; k < PLE_CACHE_WAYS; k++) {
++        if (set->ids[k] >= 0) bits |= ple_cache_filter_bit(set->ids[k]);
++    }
++    reader->cache_filter[set_idx] = bits;
+     memcpy(set->weights[w], weight_src, 256u);
+     memcpy(set->scales[w], scale_src, 8u);
+     reader->cache_populated++;
+@@ -438,7 +452,8 @@
+     reader->fragment_count = reader->job_count = 0;
+     reader->miss_count = 0;
+     bool use_cache = reader->cache_sets > 0 && (count <= PLE_CACHE_MAX_LOOKUPS || dst_is_cached);
+-    bool check_cache = use_cache && reader->cache_populated > 0;
++    bool check_cache = reader->cache_sets > 0 && reader->cache_populated > 0 &&
++                       (count <= 96u * PLE_COLUMNS || dst_is_cached);
+     bool fill_cache = use_cache;
+     reader->miss_src_weights = dst_is_cached ? dst_weights : NULL;
+     reader->miss_src_scales = dst_is_cached ? dst_scales : NULL;
+@@ -462,7 +477,8 @@
+             }
+             phys_id = id - reader->col_delta[col];
+         }
+-        if (check_cache) {
++        if (check_cache && (reader->cache_filter[ple_cache_set_index(id, reader->cache_set_mask)] &
++                            ple_cache_filter_bit(id))) {
+             size_t set_idx = ple_cache_set_index(id, reader->cache_set_mask);
+             ple_cache_set_t *set = &reader->cache[set_idx];
+             int hit_way = -1;

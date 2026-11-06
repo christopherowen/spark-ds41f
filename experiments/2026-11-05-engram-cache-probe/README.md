@@ -1,202 +1,143 @@
-# Bounded Engram cache probes
+# Engram row-cache locality
 
-Status: unbuilt, unpromoted source experiment. The CPU planner checks pass;
-CUDA, physical I/O, output/quality gates and serving boot/repeat qualification
-are pending. There is no measured serving improvement and no release comparison.
+Status: unpromoted source experiments. Thirteen native planner designs have been
+screened; two cache-metadata layouts are awaiting exact-source hardware checks.
+There is no measured serving improvement, correctness repair, or promotion.
+The initial wider-probe work is retained in [bounded-probe.md](bounded-probe.md).
 
-## Identity and one variable
+## Scope and identities
 
-- Deployment base: `2c4b23afcd834ba2adf6a15ca434e59fa4f49f74`.
-- Canonical vLLM base: `19f2c20ed4d64ae22bd009ceacadd85e2a81e354`.
-- Candidate-38 ordered source head: `1f33102547e4da5c64712390604695d1abd577c4`,
-  tree `c061e5f6931306fa4655ba531428f639c365bf10`.
-- Experimental source head: `f3c6d0fe262f1ed061d825d6cc3b851d4760a912`,
-  tree `d2f16b4f0697452766593281f7412b5f72a59073`.
-- Variable: allow direct-to-mapped steps of 65–128 rows to probe already
-  populated Engram cache entries. Keep the existing admission limit, cache
-  capacity, immutable bytes, row ordering, arithmetic and worker behavior.
+The deployment base is `2c4b23afcd834ba2adf6a15ca434e59fa4f49f74`.
+Every source variant starts from candidate 38's ordered vLLM head
+`1f33102547e4da5c64712390604695d1abd577c4` (tree
+`c061e5f6931306fa4655ba531428f639c365bf10`), after canonical upstream
+`19f2c20ed4d64ae22bd009ceacadd85e2a81e354`. Each final layout changes only
+`engram_rows/_row_plan.h`; arithmetic, row bytes, capacity, admission, replacement,
+probe limits, coalescing and worker scheduling remain the same.
 
-The source stack and overlays are confined to this directory. `tp3.json` and
-`tp4.json` inherit their candidate-38 profiles. Their image tag is a reservation;
-no image with these inputs has been built or distributed. No promoted recipe,
-release baseline, existing benchmark, node checkout or service was changed.
+| Layout | Source head | Source tree | Default cache allocation per reader |
+| --- | --- | --- | ---: |
+| Existing interleaved layout | `1f33102547e4da5c64712390604695d1abd577c4` | `c061e5f6931306fa4655ba531428f639c365bf10` | 17.125 MiB |
+| Separate IDs, aligned payloads | `745da6586fdebf8d48133639002ed41858831e13` | `98ea1c85791a093f9a95179a4dd13dee9415fc52` | 17.5 MiB |
+| Compact per-set miss filter | `e6fe9fb614d1b6488bb1310044a408822feaa6f6` | `d55e502217ea8b8752f999c47cb546dc5c98cd3c` | 17.25 MiB |
 
-## Source findings
+The aligned layout keeps exact IDs in a compact array and aligns payload sets to
+64 bytes. The filter keeps the original layout and adds one 64-bit summary per
+set. Every inserted ID is represented; a collision falls through to exact ID
+comparison. It does not approximate a hit or change the row chosen.
 
-Candidate 38 already has asynchronous direct I/O, sorted/coalesced page reads,
-one layer-order worker queue, host-ID read-ahead, cached early staging and a
-four-way row cache. Adding another worker policy is not justified by this screen.
+The `aligned/` and `filter/` directories own separate ordered patch series, locks,
+source manifests and TP3/TP4 overlays. Their deployment branch is
+`feat/engram-cache-probe-20261105`; their image tags are reservations until a build
+receipt says otherwise. The older top-level profiles retain the initial 128-row
+probe hypothesis. No promoted configuration or immutable baseline is changed.
 
-Its direct-to-mapped path admits and probes cache rows only through 64 rows.
-Cached early staging has a separate existing exception. Thus a direct step of
-96 rows, the TP4 maximum sequence count, can bypass already cached rows. This
-patch separates probing from admission and caps the additional probe range.
-Ordinary direct steps through 64 rows and above 128 rows retain their policy.
+## Search and measurements
 
-Packed-row helpers and native tests also exist, using 15 rows of 264 bytes per
-4 KiB page. However, `common/engram.py:open_disk_rows` registers the original
-disk sources; it does not call `pack_engram_columns` or select packed files.
-Reader support alone is not evidence that serving uses packed layout. Packing
-is a separate variable and is not enabled here.
+The finite screen compares the original 64-row probe limit, 96/128-row limits,
+separate IDs, aligned payloads, a miss filter, a hit-rate-adaptive filter, and
+separate weight/scale planes. Layout variants at both 64 and 96 rows explicitly
+test the interaction with probe coverage. The final candidates keep the original
+64-row policy so their layout effect is isolated.
 
-## Fixture and measurement boundary
+The production-flag screens use GCC `-O2`, matching `_native.py`, and actual
+`_row_plan.h` code. They compare the same seeded IDs in forward and reverse process
+orders. The earlier Clang `-O3` screen is preliminary and retained separately.
+The final 72-case screens include TP3 and TP4, 6/8/48/96 token rows, requested hot
+fractions of 0/50/75/100%, 1,024/16,384 seeded rows per column, empty cache,
+65/129-row boundaries, and 6,144-row chunks. Large warm pools exceed the cache's
+capacity, so requested hot fractions are not measured hit rates. Actual cache
+hits, misses, planned bytes, jobs, process RSS and every sample are retained.
 
-`probe.c` includes the actual source `_row_plan.h`. It creates no files and
-performs no disk, CUDA, io_uring or serving operation. "Planned jobs" counts the
-native planner's coalesced requests, not issued I/O, device completions or GPU
-wait. The original header is a CPU fixture control, not a repeated benchmark
-of a released build.
+The extended fixture independently encodes the full row ID in both payload
+planes. The original preliminary fixture's simple byte pattern could alias IDs
+modulo 256; its receipts remain, but its oracle is not claimed to exclude that
+class of error. All extended screens preserve exact byte, admission and job-count
+checks. The final-source sanitizer run additionally checks the cleaned patch
+headers rather than the generated search headers.
 
-The fixture uses 24 columns, rank-1 TP3/TP4 masks, 16 million rows per column,
-where each token row contributes 24 lookups before masking. Batch row counts
-in this document mean token rows, rather than individual column lookups. It uses
-unaligned original weight/scale offsets of 4093/123, 256/8 bytes per row, and
-the production default cache capacity of 65,536 rows. A fixed xorshift seed
-generates identical IDs for each header. Warm trials seed 1,024 IDs per owned
-column through the real cache insertion code. Hot percentages are requested
-ID distributions, not assumed hit rates; set conflicts can leave misses.
-Every 97th lookup is dead. The byte oracle independently checks all destination
-bytes, untouched unowned/dead slots, unchanged cache storage, no admission of
-large-step misses, and rejection of a missing source on an uncached row.
+Illustrative mean planner times in microseconds, TP3, 1,024 seeded rows per column:
 
-Each final process covers 26 paired fixtures: TP3/TP4 crossed with 16, 64, 65,
-96, 128, 129, 512, 6,144 and 16,384 rows, including fully hot, 75%-hot, all-miss
-and empty-cache cases. Each optimized fixture has 11 steps; summaries omit
-only the first warmup. All samples are retained. The two processes replay
-identical IDs. Their intervals describe ten synthetic ID batches within each
-process, not independent production boots or real request traffic.
+| Token rows / requested hot IDs | Original A/B | Aligned A/B | Filter A/B |
+| --- | ---: | ---: | ---: |
+| 6 / 0% | 4.40 / 4.39 | 3.13 / 2.75 | 2.91 / 2.71 |
+| 6 / 100% | 1.68 / 1.60 | 1.43 / 1.39 | 1.59 / 1.57 |
+| 48 / 0% | 38.32 / 38.85 | 29.70 / 27.77 | 26.69 / 26.04 |
+| 48 / 75% | 18.34 / 18.14 | 17.32 / 17.48 | 18.11 / 17.80 |
+| 48 / 100% | 11.09 / 11.50 | 10.26 / 10.06 | 11.37 / 11.17 |
 
-## Results
+`sweep-results.json` contains matched 95% Student-t intervals over distinct seeded
+batches. These are CPU fixture intervals, not independent serving boots. They do
+not establish GPU wait or request throughput. The filter favors cold lookups;
+aligned payloads are more consistent on warm and partially warm batches. The
+unaligned split, adaptive filter, and separate weight/scale planes did not justify
+their additional tradeoffs. No global optimum is claimed.
 
-Both final CPU processes produced the same job counts. The table gives mean
-jobs per step; 95% Student-t intervals are for paired jobs saved across the
-ten non-warmup batches. Full timing intervals and memory records are in
-`results.json`; raw commands, standard output, errors and every sample are in
-`runs/*/receipt.json`.
+Wider probing has a separate limit: TP3's eight streams with five speculative
+drafts use 48 verification token rows, already covered by the original policy.
+TP4's 16 streams reach 96 token rows. The original 128-row probe candidate therefore
+does not target full TP3 verification. Broad long-prefill probing was rejected:
+coalescing already removed most repeated pages, while probing added CPU work.
 
-| 96-row fixture | Control jobs | Candidate jobs | Reduction | Jobs saved, 95% interval |
-| --- | ---: | ---: | ---: | ---: |
-| TP3, 75% warm IDs | 492.6 | 375.5 | 23.77% | 117.1 [115.73, 118.47] |
-| TP4, 75% warm IDs | 359.1 | 272.4 | 24.14% | 86.7 [81.97, 91.43] |
-| TP3, all warm IDs | 96.5 | 0 | 100% | 96.5 [93.24, 99.76] |
-| TP4, all warm IDs | 71.0 | 0.4 | 99.44% | 70.6 [68.33, 72.87] |
-| TP3, all misses | 1517.0 | 1517.0 | 0% | 0 [0, 0] |
-| TP4, all misses | 1137.6 | 1137.6 | 0% | 0 [0, 0] |
+## Exact-source correctness checks
 
-The CPU cost is material. At 96 rows with 75% warm IDs, extra planning time
-was 43.28/8.99 microseconds in TP3 process A/B and 25.05/9.38 microseconds in
-TP4 A/B. All-miss extra time was 36.90/19.09 microseconds for TP3 and
-24.61/15.89 microseconds for TP4. Even the fully warm planner was slower in
-process A and faster in B. This drift prevents a CPU speedup claim. The
-tradeoff only helps serving if actual avoided I/O outweighs probing and
-copying under the real warm-row distribution and worker schedule.
+Both final layouts pass 36 native CPU reader cases each, with real O_DIRECT
+reads, early-staging overlap, and short-read/missing-source/timeout failure
+checks. The exact final headers also pass 152 combined ASan/UBSan planner
+cases. Their complete ordered patch stacks apply freshly to the recorded
+heads/trees, and TP3/TP4 static doctor checks pass. These are not live topology
+or GPU qualifications. Complete image inputs and image tests are still pending.
 
-All long direct-step fixtures retained identical planned job counts. The
-rejected unbounded variant saved almost no planned I/O in the long 75%-hot
-fixture because the planner had already coalesced repeated hot pages, while
-adding CPU work on misses. Its runs are retained rather than substituted by
-the bounded result.
+## Remaining bottleneck and hardware plan
 
-Cache allocation is exactly 17,956,864 bytes (17.125 MiB) per reader in both
-headers, including set metadata and padding. The fixture's peak process RSS
-was about 36 MiB for short steps, and up to about 158 MiB for the largest
-TP3 fixture. This includes fixture destinations, metadata and cache snapshots;
-it is not model or serving memory. There is no claimed allocation reduction,
-device-memory reduction or extra cache. Systemd's implausibly small reported
-memory peaks are not used; the fixture records `getrusage` RSS. GPU and CPU
-memory remain shared physical memory on the target hardware.
+The pinned model snapshot `dba1be0a40aa45a94ad051997016db3960a90277` has Engram
+layers `[1, 14]`. Recorded C38 default TP3 steps are 19.536/19.428 ms for 1x6
+verification and 28.436/28.456 ms for 8x48 verification. Simply adding the two
+largest observed CPU planner savings gives only about 0.1% of the latter step.
+This is an optimistic screening estimate, not a bound on CUDA-mapped memory or
+an end-to-end performance claim. Actual exposed I/O and GPU wait must decide
+whether either layout warrants serving qualification.
 
-## Run ledger and failures
+`gpu-screen.py` is an unreleased component fixture for that decision. It uses two
+readers, the exact native source snapshots, real direct reads, CUDA write-combined
+mapped destinations and the production GPU gather. It records issued reads,
+cache hits/misses, planning/publication times and GPU waits, with bitwise BF16
+checks. Cases include single-stream/full TP3 verification, full TP4 verification,
+and 129/6,144-row chunks with both early and GPU-provided IDs. Changing the native
+source in a fixed environment is component evidence; it is not a qualified image
+or a new measurement of a released serving build.
 
-| Record | Outcome |
-| --- | --- |
-| `runs/local-interruption.json` | Workstation crash interrupted the initial local attempt. No complete measurement receipt and no accepted local timing. No surviving local jobs after recovery. |
-| Initial remote launch | Failed before compilation because the service working directory was omitted; Python looked for `/home/chris/run.py`, exit 2. Retried with an explicit working directory. |
-| `sp8-a`, `sp8-b` | Two complete broad-probe screens, 18 paired fixtures each; rejected variant preserved in `runs/inputs/rejected-unbounded.diff`. |
-| `bounded-a` | Initial bounded screen, 26 paired fixtures; not CPU-pinned. Retained as preliminary. |
-| `pinned-a`, `pinned-b` | Final bounded screen and repeat, 26 paired fixtures each, CPU 19; byte, cache and missing-source assertions pass. |
-| `sanitizers` | Clang compilation failed because its AArch64 ASan runtime libraries were absent. Exact error retained. No packages installed. |
-| `gcc-sanitizers` | GCC 13.3 ASan + UBSan, 26 paired fixtures with two steps each; all pass. |
-| `runs/setup/doctor-initial.log` | Spaceport's switched node map did not match the inherited cabled topology. Isolated ignored fixture maps were replaced with the tracked examples. |
-| `runs/setup/lock.log` | Candidate series locked and freshly applied successfully; candidate doctor then caught the example head address differing from the inherited master address. |
-| `runs/setup/doctor-tp3.log`, `doctor-tp4.log` | Pass after aligning only the isolated ignored fixture maps' head address to the inherited profile. Configuration validation, not live hardware qualification. |
-| Deployment commit first attempt | Git index preloading exceeded the service's 16-task cap (`unable to create threaded lstat`); failed before staging or committing. Retry disables index preloading and uses one index thread, retaining the resource limits. |
-| Publication export first attempt | The remote commit succeeded, but its metadata export used an invalid root-tree path (`HEAD^:.`). Corrected to the parent commit's tree expression; no source change or measurement rerun. |
+If the affected-path result justifies it, the selected source needs an image
+built from complete verified inputs, all native Engram gates, then a boot and
+repeat boot with the recorded C38 workload identity: distinct traffic at C1/C8/C16,
+32K through 1M cold prefill, correctness/batch invariance, memory, failure and
+cooling checks. Compare compatible recorded runs; never rerun a released serving
+build to manufacture a control. Preserve adverse outcomes and intervals. A
+confidence interval spanning zero alone does not demonstrate preservation.
 
-The fresh historical source stack emits an inherited blank-line-at-EOF warning
-while applying an earlier patch. Its final tree passes the source diff check;
-the new two-file patch passes its own diff check and reproduces the recorded
-head/tree. Complete non-vLLM build inputs are absent in this isolated checkout,
-so `build check`, image smoke tests and full build validation have not passed.
+Packed-row reader helpers are already present, but the model loader still
+registers original planes. This experiment does not enable packing or claim its
+benefits. Candidate 38 already coalesces direct reads and uses one layer-order
+worker with early staging; no new scheduling policy is warranted by these CPU
+results.
 
-The pre-RSS preliminary probe revision was not archived byte for byte; its
-receipt records the hash, and the earlier runners and broad header diff are
-retained. Reproduction uses the final committed probe. Do not present the
-preliminary timings as fully reproducible final evidence.
+## Evidence and resource record
 
-## Reproduction and resource limits
+All heavy work after the workstation interruption runs remotely on `sp8`.
+Measured CPU screens used core 19 (2 MiB L2), one CPU and 1 GiB, with isolated
+output directories. The final correctness-only reader/sanitizer checks can run
+alongside another bounded build, still capped at one CPU and 1 GiB; their timings
+are not performance evidence. Source preparation is capped at one CPU and 2 GiB.
+Systemd's implausibly small memory peaks are not used; C/Python receipts record
+process `getrusage` RSS. No GPU tests or serving changes are implied by CPU checks.
 
-After the workstation interruption, compilation, source preparation, checks,
-analysis and Git commits ran on `sp8` over SSH under
-`/home/chris/projects/engram-cache-probe`. CPU probes used one CPU, a 1 GiB
-memory cap, eight tasks, a 240-second timeout and the shared build lock.
-Source preparation used one CPU, 2 GiB and 32 tasks, with one build thread
-and Git packing thread. No local fallback, GPU work, node synchronization,
-cluster operation, hold replacement or queued-request replacement occurred.
+Compressed raw receipts are byte-preserving gzip archives; `evidence-index.json`
+records compressed and original SHA-256 hashes. Inputs include the exact generated
+headers, fixture source, commands and all output/errors. Historical failures,
+including the workstation interruption, missing Clang sanitizer runtime, initial
+configuration mismatches and the build-lock refusal, remain in the ledger.
 
-The exact native compile and execution arguments are in each receipt. This
-wrapper reproduces the final resource limits with the final committed runner
-and a fresh output directory:
-
-```sh
-systemd-run --user --unit=engram-reproduce-a --collect --wait --pipe \
-  --working-directory=/home/chris/projects/engram-cache-probe \
-  -p CPUQuota=100% -p MemoryMax=1G -p TasksMax=8 \
-  /usr/bin/timeout 240 /usr/bin/flock -n /tmp/spark-build.lock \
-  /usr/bin/taskset -c 19 /usr/bin/python3 \
-  deployment/experiments/2026-11-05-engram-cache-probe/run.py \
-  --base base --candidate bounded --out runs/reproduce-a
-```
-
-The repeat used a distinct unit and `runs/pinned-b`. The sanitizer run used
-`run-sanitizers.py --base base --candidate bounded --out runs/gcc-sanitizers
---sanitize --cc cc` under the same limits. `run.py` here is that final runner.
-Header directories must contain the original/candidate `_row_plan.h`; their
-SHA-256 fingerprints are recorded in the receipts. The source commits above
-identify both versions without relying on running containers or image tags.
-Run `python3 analyze.py` remotely to regenerate `results.json` from the two
-final receipts. `runs/inputs/` records the source preparation/locking scripts.
-
-Fresh application and static configuration checks:
-
-```sh
-bin/spark --cluster-config experiments/2026-11-05-engram-cache-probe/tp3.json \
-  build prepare --lock --only vllm
-bin/spark --cluster-config experiments/2026-11-05-engram-cache-probe/tp3.json doctor
-bin/spark --cluster-config experiments/2026-11-05-engram-cache-probe/tp4.json doctor
-git diff --check
-```
-
-## Qualification still required
-
-The patch includes 12 CUDA regression cases at 65, 96 and 128 rows, with full
-and TP3 column masks and both host-known and GPU-provided IDs. They compare
-cached/uncached output bits, check the mathematical reference, exercise dead
-IDs and verify that repeated large misses do not evict the small warm set.
-Python syntax passed; these GPU cases have not run.
-
-Once an authorized shared window is available, first build/verify the image
-and run the native Engram test file, including reader failure/short-read,
-timeout, early-staging, packed/original layout and cache cases. Then qualify
-the candidate on a boot and a repeat boot, retaining every run, output/quality
-and batch-invariance gates, worker and GPU wait, actual read calls/bytes,
-cache hit/miss counts, shared-memory observations, errors and confidence
-intervals. Compare to compatible recorded release runs; never remeasure a
-released build. Candidate-38 TP3 recorded evidence lives under
-`experiments/2026-11-03-candidate-38-tp3-qualification`; it is not a TP4 or
-per-reader I/O reference and cannot establish the benefit claimed by this
-synthetic TP4 fixture. Preserve workload identity before comparing throughput.
-
-Conclusion: retain the bounded patch as a reviewable hypothesis and reject
-the unbounded variant. Do not promote on planned-read reductions. Current
-production performance and memory are unchanged.
+Hardware operations are authorized, but require a legitimate exclusive cluster
+handoff. Existing holds and requests are preserved. Branch testing uses exact
+published commits and coordinated node operations; the main-only lab queue guard
+is not weakened. No merge or promotion is authorized.
