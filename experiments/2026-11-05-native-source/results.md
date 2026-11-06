@@ -1,3 +1,5 @@
+Timing qualification correction,2026-11-06: these stock-fan measurements are exploratory. The documented performance fan curve was not verified; recorded below55C starts and no thermal-guard interruption do not satisfy that requirement. Answer/kernel correctness evidence remains separate. All original numbers and receipts are unchanged. See `../2026-11-06-timing-conditions/README.md`.
+
 # Four-boot retrieval screen
 
 Source `821b5ec5`, C36 Native68 versus compact80 dense selection with native

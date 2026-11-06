@@ -1,3 +1,5 @@
+Timing qualification correction,2026-11-06: these stock-fan measurements are exploratory. The documented performance fan curve was not verified; recorded below55C starts and no thermal-guard interruption do not satisfy that requirement. Answer/kernel correctness evidence remains separate. All original numbers and receipts are unchanged. See `../2026-11-06-timing-conditions/README.md`.
+
 # Source1024 with native generation: repeated request screen
 
 Source `17b9e81e1716c8266076293c0c78e43b2a99701e`, sp1–sp4 TP4, immutable unreleased C36 fixture. Same frozen RULER26 tasks, temperature0, seed0, high thinking and65536 generation tokens. Source-prefill budget1024 retains65536 fine source keys; dense budget64 and native generation/verification are fixed. This recovers the earlier128K QA loss in both candidate boots. No prompts, grader, expected answers or weights changed.

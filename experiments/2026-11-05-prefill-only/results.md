@@ -1,3 +1,5 @@
+Timing qualification correction,2026-11-06: these stock-fan measurements are exploratory. The documented performance fan curve was not verified; recorded below55C starts and no thermal-guard interruption do not satisfy that requirement. Answer/kernel correctness evidence remains separate. All original numbers and receipts are unchanged. See `../2026-11-06-timing-conditions/README.md`.
+
 # Native generation with compact dense prefill
 
 Source `f625c58c80619e69ca901af9d888daa931da38a7`, immutable C36 image, sp1–sp4 TP4.

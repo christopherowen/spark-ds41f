@@ -1,3 +1,5 @@
+Timing qualification correction,2026-11-06: these stock-fan measurements are exploratory. The documented performance fan curve was not verified; recorded below55C starts and no thermal-guard interruption do not satisfy that requirement. Answer/kernel correctness evidence remains separate. All original numbers and receipts are unchanged. See `../2026-11-06-timing-conditions/README.md`.
+
 # Raw-wide coarse component results
 
 Source `4ac35e2505550e8f2bec9e08617320d74eaa403c`; one exact selection scheduling variable relative to the source1024/dense64/native-generation parent. All24 adversarial batches (12 length/cap cases each), six race batches,78 declared calls,12 captured runtime batches, four strict initialization cases and72 graph routes pass. Initialization and race reports contain zero errors/hazards. All comparison/reference work remains outside serving and timers.

@@ -1,3 +1,5 @@
+Timing qualification correction,2026-11-06: these stock-fan measurements are exploratory. The documented performance fan curve was not verified; recorded below55C starts and no thermal-guard interruption do not satisfy that requirement. Answer/kernel correctness evidence remains separate. All original numbers and receipts are unchanged. See `../2026-11-06-timing-conditions/README.md`.
+
 # Four-node completed-answer pilot
 
 Source `7b631ce12fbdb183a9f56a7013bd3bea1819fd88`, C36 immutable image

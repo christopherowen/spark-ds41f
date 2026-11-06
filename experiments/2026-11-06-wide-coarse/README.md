@@ -11,3 +11,5 @@ Adversarial checks cover24 batches at8193/16384/32768/131072 widths, each with12
 Two fresh timing processes use every frozen source capture at1/8/64 rows. Identical coarse score matrices are generated once outside timers; the generic route brackets the raw route with CUDA graph samples. Output comparisons, score preparation, hashing and mean construction are outside timers. These measure only coarse selection on captured prefill queries, not actual decode queries, whole attention, maintenance or request performance.
 
 Component checks and two fresh timing processes now pass; see `results.md`. Full-request and final-answer qualification remain separate.
+
+The repeated request screen preserves26/26 answers on both candidate boots; see `model-results.md`. Its stock-fan timings are exploratory. The documented performance fan curve is now mandatory for future timed clients and recorded-control reuse. No promotion.
