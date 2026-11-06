@@ -13,6 +13,7 @@ import hashlib
 import json
 import os
 import re
+import shlex
 import signal
 import subprocess
 import sys
@@ -129,6 +130,34 @@ class Round:
             argv = [*argv, "--apply"]
         return self.run(argv, repo=repo, closing=closing)
 
+    def stop_gate(self):
+        remote = self.state.get("remote_gate")
+        if not remote:
+            return
+        unit = "verification-shapes-gate-" + self.state["window"]
+        if (remote.get("host"), remote.get("unit"), remote.get("container")) != (
+            "dgx4",
+            unit,
+            unit,
+        ):
+            raise RuntimeError("remote gate identity differs from this window")
+        script = (
+            Path(remote["checkout"])
+            / "experiments/2026-11-05-verification-shapes/stop_gate.py"
+        )
+        self.run(
+            [
+                "ssh",
+                "-o",
+                "BatchMode=yes",
+                "-o",
+                "ConnectTimeout=8",
+                "dgx4",
+                shlex.join(["python3", str(script), unit, unit]),
+            ],
+            closing=True,
+        )
+
     def restore(self, reason="round ended", dry=False):
         if dry:
             raise RuntimeError("restoration is never simulated by an executing round")
@@ -139,6 +168,7 @@ class Round:
         if clean_revision(self.restore_repo) != self.state["restore_revision"]:
             raise RuntimeError("saved restoration checkout changed")
         config = self.state["restore_config"]
+        self.stop_gate()
         # Stop covers every configured node and the same serving container name.
         # If sync never started, the verified original service needs no restart.
         if self.state.get("sync_started"):
@@ -280,8 +310,8 @@ def validate_gate(gate: dict, config: dict, revision: str) -> None:
             ["docker", "image", "inspect", config["container"]["image"]], text=True
         )
     )[0]
-    if inspection["Id"] != gate["image"]:
-        raise RuntimeError("local image differs from the qualified image")
+    if lab.spark.image_content_identity(inspection) != gate.get("image_content"):
+        raise RuntimeError("local image content differs from the qualified image")
     for key, value in config["container"]["expected_labels"].items():
         if inspection["Config"].get("Labels", {}).get(key) != value:
             raise RuntimeError(f"qualified image label differs: {key}")
@@ -417,7 +447,11 @@ def main():
             "candidate and restoration controller disagree on topology or engine shape"
         )
     validate_gate(json.loads(args.qualified_receipt.read_text()), cluster, revision)
-    image_gate = json.loads(args.qualified_receipt.read_text())
+    local_image_id = json.loads(
+        subprocess.check_output(
+            ["docker", "image", "inspect", cluster["container"]["image"]], text=True
+        )
+    )[0]["Id"]
     for spec in specs:
         for job in spec["jobs"]:
             for script, arguments, _label in job.get("extras", []):
@@ -425,7 +459,7 @@ def main():
                     index = arguments.index("--image-receipt")
                     arguments[index : index + 2] = [
                         "--expected-image-id",
-                        image_gate["image"],
+                        local_image_id,
                     ]
     for node in nodes["nodes"]:
         remote, _, dirty = lab.spark.remote_repository_state(cluster, nodes, node)

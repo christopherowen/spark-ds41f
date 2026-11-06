@@ -178,3 +178,34 @@ def test_incomplete_gate_never_inspects_or_launches_image(monkeypatch):
             {"passed": True}, {"container": {"expected_labels": {}}}, "a" * 40
         )
     action.assert_not_called()
+
+
+def test_remote_gate_stops_before_restoration_checks(tmp_path, monkeypatch):
+    round = controller(tmp_path)
+    round.state["window"] = "dgx1-123"
+    round.state["remote_gate"] = {
+        "host": "dgx4",
+        "unit": "verification-shapes-gate-dgx1-123",
+        "container": "verification-shapes-gate-dgx1-123",
+        "checkout": "/remote/checkout",
+    }
+    action = Mock()
+    monkeypatch.setattr(round, "run", action)
+    round.stop_gate()
+    argv = action.call_args.args[0]
+    assert argv[0] == "ssh" and argv[-2] == "dgx4"
+    assert (
+        "/remote/checkout/experiments/2026-11-05-verification-shapes/stop_gate.py"
+        in argv[-1]
+    )
+    assert action.call_args.kwargs["closing"] is True
+
+
+def test_remote_gate_refuses_other_task_names(tmp_path, monkeypatch):
+    round = controller(tmp_path)
+    round.state["remote_gate"] = {"host": "dgx4", "unit": "other", "container": "other"}
+    action = Mock()
+    monkeypatch.setattr(round, "run", action)
+    with pytest.raises(RuntimeError, match="identity differs"):
+        round.stop_gate()
+    action.assert_not_called()

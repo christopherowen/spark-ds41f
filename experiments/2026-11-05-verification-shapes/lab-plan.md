@@ -36,7 +36,7 @@ norm-kernel request.
    thermal/cooling evidence, per-rank startup free memory, and graph capture-pool
    high-water marks. Confirm no request changes output when batched with other
    requests, including copy and non-copy requests together.
-5. First screen the native-row-only and union alternatives in `alternatives.md`
+5. Separately screen the native-row-only and union alternatives in `alternatives.md`
    against this proposal, one capture policy per candidate. Include an every-row
    ladder if measured graph memory permits. Preserve each result. On both
    candidate boots, also measure the repaired full-depth request counts
@@ -75,8 +75,8 @@ scripts/lab.py run experiments/2026-11-05-verification-shapes/performance.json -
 ```
 
 Acceptance requires exact outputs, no unwritten or invalid accesses, a fitting
-memory budget on every rank, and a repeatable useful improvement beyond the
-recorded noise. Otherwise retain the unfavorable evidence and leave the source
+memory budget on every rank, and preserved performance within the predeclared comparison bounds. A
+speedup is optional for this capture-coverage repair. Otherwise retain the unfavorable evidence and leave the source
 PR unadopted. No merge, baseline rewrite, or promotion is authorized by this plan.
 
 ## Published branch and exclusive ownership
@@ -145,3 +145,70 @@ Native exact-shape restoration remains distinct from the optional row-only and
 union tuning trials. Report a correctness/coverage reproducer on the affected
 path and repeatable latency/throughput/memory preservation. An interval that
 merely contains zero while allowing a meaningful regression is inconclusive.
+
+
+## Predeclared preservation checks
+
+For the capture-coverage repair, use independent boot-level observations and
+retain all reference/candidate boot pairings. The material regression bounds
+are the existing comparison defaults: 3% for serving metrics, 0.5% for the
+engine grid. Report repeat ranges separately; these bounds do not turn a
+component gain into a serving claim. `preservation.py` requires the adverse
+95% boot-level interval and every observed boot pairing to stay inside the
+applicable bound. A wide interval, missing reference repeat, incompatible
+workload identity, or absent affected cell is inconclusive. Do not count
+within-boot replays as independent boots. Preserve memory/correctness failures
+regardless of timing.
+
+The GPU screen uses `test_graph_replay.py` from a read-only test mount against
+the actual image's unchanged source. It first checks native context preparation
+and MXFP8 boundary replay, then memcheck/initcheck with CUDA allocator caching
+disabled. Unwritten source/activation tails precede poisoned-tail replay.
+This is a kernel-path gate, not full-model graph proof. A pre-existing tail
+read blocks this gate and is recorded separately; no prototype kernel is
+silently substituted. After that screen survives, `gpu_gate.py` runs every
+applicable release test against the image. It uses the normal GPU lock,
+exact holder/window checks, cooling/fan/memory guards, and two-CPU/32-GiB
+test containers. Every stage records exact commands and outcomes.
+
+`boundary_grid.py` measures the real server's dummy model step at native
+depth for the repaired request counts 3/5/6/7 at 4K and 64K, with standard cooling and
+condition receipts. These measurements expose the repaired 3/5/6/7-request
+cells; they contain no draft acceptance or scheduler effects. Real serving
+suites and distinct requests remain separate mandatory evidence.
+
+The CPU image build records its deployment commit. Qualification-only scripts,
+docs and evidence may be committed afterwards without rebuilding: the gate
+refuses any other post-build change, checks ancestry, original build inspection,
+all source labels, ordered image layers and runtime configuration. Docker
+stores may use different local image IDs for identical content. The serving
+controller checks content identity and records its own local ID for runtime
+collection.
+
+The first hardware turn is a separate `gpu_gate.py --screen-only` run, expected
+to take 20–30 minutes and bounded at roughly 45 minutes including cooling:
+two minutes for smoke, ten each for replay/memcheck/initcheck, plus ten minutes
+for cooling and bounded process cleanup. It cannot produce a passing full gate.
+A later turn may use `--screen-receipt` to reuse that exact successful screen
+without rerunning it; unchanged execution commit, image content, required checks
+and all four log hashes are mandatory. The full release tests remain a separate
+later job (the saved C40 gate took 36 minutes; this two-CPU run has a three-hour
+hard cap). Restore/release at the agreed handoff after each job. No acquisition
+waiter is installed; the recorded coordinator order takes precedence over
+request-file races.
+
+
+The repaired request-count cells have no matching saved C40 grid. If a causal
+comparison needs a new control, use only that unreleased parent and the newly
+specified cells under the owner's explicit control-measurement authorization.
+Keep both control boots and their exact identities, and label them new
+workloads; existing C40 and released workload measurements are never refreshed.
+The candidate's separate client-load extra records c1/c8/c16 on both performance
+boots, in addition to the fixed release, sampled and distinct-request checks.
+
+`gate_window.py` runs one bounded remote gate unit from a clean published
+checkout. Its separate guardian stops that exact unit/container before checking
+the untouched production service and releasing the hold. The gate process
+also monitors exact ownership and has a systemd runtime cap. A failed remote
+cleanup or restoration retains the hold. This is a job runner, not an automatic
+lease-acquisition waiter; invoke it only after the recorded handoff.

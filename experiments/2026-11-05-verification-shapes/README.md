@@ -80,8 +80,8 @@ configurations. Its padding histogram is not weighted by serving traffic.
   objects from remote caches, verifies heads/trees/submodules, and copies only
   hash-verified wheels; the normal preparation command then exports and hashes
   the contexts. `runs/build-preparation-commands.json` records each command and
-  outcome. The initial missing-context check is retained. No image build or GPU
-  smoke test has run under the foreign hold.
+  outcome. The initial missing-context check is retained. A bounded CPU-only image build is in progress; no GPU smoke or
+  serving work has run under a foreign hold.
 - The first cache-seeding attempt encountered an empty nested `.gitmodules`
   file; Git returns status 1 for its empty path query. The seeder now accepts
   that empty result and safely resumes only exact clean checkouts. Both initial
@@ -135,8 +135,8 @@ CPU commands. The actual test container argv is recorded in
 The source fix is supported by dispatch/warmup checks and is ready for review.
 It is not ready for runtime adoption. See `lab-plan.md` for the concrete gate
 and coordinated boot/repeat sequence. The added graph captures need a measured
-memory budget, exact outputs under mixed batches, and performance beyond the
-recorded noise. c1/c8/c16 alone do not isolate the repaired 3/5/6/7-request full-
+memory budget, exact outputs under mixed batches, and performance preservation within the
+predeclared comparison bounds. c1/c8/c16 alone do not isolate the repaired 3/5/6/7-request full-
 depth cases, so those boundary cases are included in the plan too.
 
 The follow-up [alternatives audit](alternatives.md) compares eight capture policies
@@ -163,3 +163,25 @@ entitlement/CDI, and a mandatory worker device probe. Its output remains
 unqualified until the owned-window GPU smoke, image tests, sanitizers and
 serving checks finish. See `lab-plan.md` for the complete ownership, restoration
 and resource contract.
+
+
+The pending hardware path now has a bounded kernel-screen stage and a separate
+full release-gate stage. Their resume checks bind the execution commit, source
+labels, immutable image content, four required checks and log hashes. The
+serving controller accepts faithful Docker-store copies by ordered layers and
+runtime configuration, while recording each host's local image ID.
+
+The latest controller/evidence preflight has **41 passing CPU checks**, clean
+lint and a passing doctor. It tests image-copy drift, incomplete/replaced screen
+receipts, remote cleanup identities, all boot pairings and non-inferiority
+bounds. Initial lint and guardian-source-generation failures are retained in
+`runs/gate-preflight*`; neither ran on hardware. Boundary replay probes remain
+GPU-unvalidated. The candidate performance spec includes new 3/5/6/7-request
+full-model dummy steps and c1/c8/c16 client load on both performance boots.
+See `lab-plan.md` for the distinction between those paths and their bounds.
+
+The task's disposable Mac checkout was removed after its untracked source and
+evidence were copied and hash-verified on SP8, and both original commits were
+verified there. That removed 578,605,056 allocated bytes. The shared local
+checkout and caches were not changed. Bulk preparation, tests, build data and
+unfinished work remain remote.

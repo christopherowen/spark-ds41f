@@ -1,0 +1,326 @@
+I001 [*] Import block is un-sorted or un-formatted
+ --> spark-work/verification-shapes/deployment-gates/experiments/2026-11-05-verification-shapes/boundary_grid.py:3:1
+  |
+1 |   """Record the actual model path at the repaired native verification shapes."""
+2 |
+3 | / import argparse
+4 | | import json
+5 | | from pathlib import Path
+6 | | import sys
+  | |__________^
+7 |
+8 |   ROOT = Path(__file__).resolve().parents[2]
+  |
+help: Organize imports
+  |
+4 | import json
+5 + import sys
+6 | from pathlib import Path
+  - import sys
+7 |
+  |
+
+I001 [*] Import block is un-sorted or un-formatted
+  --> spark-work/verification-shapes/deployment-gates/experiments/2026-11-05-verification-shapes/gpu_gate.py:3:1
+   |
+ 1 |   """Gate one built immutable image on idle DGX4 inside this task's window."""
+ 2 |
+ 3 | / from __future__ import annotations
+ 4 | |
+ 5 | | import argparse
+ 6 | | import fcntl
+ 7 | | import hashlib
+ 8 | | import json
+ 9 | | import os
+10 | | from pathlib import Path
+11 | | import re
+12 | | import shutil
+13 | | import signal
+14 | | import subprocess
+15 | | import sys
+16 | | import time
+   | |___________^
+17 |
+18 |   ROOT = Path(__file__).resolve().parents[2]
+   |
+help: Organize imports
+   |
+9  | import os
+   - from pathlib import Path
+10 | import re
+--------------------------------------------------------------------------------
+15 | import time
+16 + from pathlib import Path
+17 |
+   |
+
+SIM115 Use a context manager for opening files
+   --> spark-work/verification-shapes/deployment-gates/experiments/2026-11-05-verification-shapes/gpu_gate.py:145:12
+    |
+143 |     ).strip():
+144 |         raise RuntimeError("DGX4 has active compute processes")
+145 |     lock = open("/tmp/spark-lab-gpu.lock", "a")
+    |            ^^^^
+146 |     fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+147 |     revision = git("rev-parse", "HEAD")
+    |
+
+BLE001 Do not catch blind exception: `BaseException`
+   --> spark-work/verification-shapes/deployment-gates/experiments/2026-11-05-verification-shapes/gpu_gate.py:250:24
+    |
+248 |                     if time.monotonic() - started > timeout:
+249 |                         raise RuntimeError(f"{name} exceeded {timeout}s")
+250 |                 except BaseException as error:
+    |                        ^^^^^^^^^^^^^
+251 |                     halt(f"{type(error).__name__}: {error}")
+252 |                 if cancelled:
+    |
+
+PLW1510 `subprocess.run` without explicit `check` argument
+   --> spark-work/verification-shapes/deployment-gates/experiments/2026-11-05-verification-shapes/gpu_gate.py:254:21
+    |
+252 |                 if cancelled:
+253 |                     # Only our named container/process can be stopped.
+254 |                     subprocess.run(
+    |                     ^^^^^^^^^^^^^^
+255 |                         ["docker", "stop", "--time", "10", container],
+256 |                         stdout=subprocess.DEVNULL,
+    |
+help: Add explicit `check=False`
+    |
+255 |                         ["docker", "stop", "--time", "10", container],
+    -                         stdout=subprocess.DEVNULL,
+256 +                         check=False, stdout=subprocess.DEVNULL,
+257 |                         stderr=subprocess.DEVNULL,
+    |
+note: This suggestion may be incorrect or produce invalid syntax. It requires manual review and cannot be applied automatically
+
+BLE001 Do not catch blind exception: `BaseException`
+   --> spark-work/verification-shapes/deployment-gates/experiments/2026-11-05-verification-shapes/gpu_gate.py:453:12
+    |
+451 |         receipt["passed"] = True
+452 |         code = 0
+453 |     except BaseException as error:
+    |            ^^^^^^^^^^^^^
+454 |         receipt["error"] = f"{type(error).__name__}: {error}"
+455 |         print(receipt["error"], flush=True)
+    |
+
+PLW1510 `subprocess.run` without explicit `check` argument
+   --> spark-work/verification-shapes/deployment-gates/experiments/2026-11-05-verification-shapes/gpu_gate.py:457:9
+    |
+455 |         print(receipt["error"], flush=True)
+456 |     finally:
+457 |         subprocess.run(
+    |         ^^^^^^^^^^^^^^
+458 |             ["docker", "stop", "--time", "10", container],
+459 |             stdout=subprocess.DEVNULL,
+    |
+help: Add explicit `check=False`
+    |
+458 |             ["docker", "stop", "--time", "10", container],
+    -             stdout=subprocess.DEVNULL,
+459 +             check=False, stdout=subprocess.DEVNULL,
+460 |             stderr=subprocess.DEVNULL,
+    |
+note: This suggestion may be incorrect or produce invalid syntax. It requires manual review and cannot be applied automatically
+
+I001 [*] Import block is un-sorted or un-formatted
+ --> spark-work/verification-shapes/deployment-gates/experiments/2026-11-05-verification-shapes/test_gpu_gate.py:3:1
+  |
+1 |   """CPU validation of immutable-image and post-build identity checks."""
+2 |
+3 | / import copy
+4 | | import importlib.util
+5 | | from pathlib import Path
+6 | | import pytest
+  | |_____________^
+7 |
+8 |   spec = importlib.util.spec_from_file_location(
+  |
+help: Organize imports
+  |
+5 | from pathlib import Path
+6 +
+7 | import pytest
+  |
+
+I001 [*] Import block is un-sorted or un-formatted
+  --> spark-work/verification-shapes/deployment-gates/experiments/2026-11-05-verification-shapes/test_graph_replay.py:5:1
+   |
+ 3 |   """Hardware-only boundary probes; no model source is replaced by this module."""
+ 4 |
+ 5 | / import pytest
+ 6 | | import torch
+ 7 | |
+ 8 | | from vllm.models.deepseek_v4_1.tilelang import dspark_context
+ 9 | | from vllm.v1.attention.backends.utils import PAD_SLOT_ID
+   | |________________________________________________________^
+10 |
+11 |   ROWS = [
+   |
+help: Organize imports
+  |
+6 | import torch
+  -
+7 | from vllm.models.deepseek_v4_1.tilelang import dspark_context
+  |
+
+B023 Function definition does not bind loop variable `aux`
+  --> spark-work/verification-shapes/deployment-gates/experiments/2026-11-05-verification-shapes/test_graph_replay.py:77:17
+   |
+75 |         def run():
+76 |             dspark_context.context_inputs(
+77 |                 aux, sources, positions, slots, rows, capacity
+   |                 ^^^
+78 |             )
+   |
+
+B023 Function definition does not bind loop variable `positions`
+  --> spark-work/verification-shapes/deployment-gates/experiments/2026-11-05-verification-shapes/test_graph_replay.py:77:31
+   |
+75 |         def run():
+76 |             dspark_context.context_inputs(
+77 |                 aux, sources, positions, slots, rows, capacity
+   |                               ^^^^^^^^^
+78 |             )
+   |
+
+B023 Function definition does not bind loop variable `slots`
+  --> spark-work/verification-shapes/deployment-gates/experiments/2026-11-05-verification-shapes/test_graph_replay.py:77:42
+   |
+75 |         def run():
+76 |             dspark_context.context_inputs(
+77 |                 aux, sources, positions, slots, rows, capacity
+   |                                          ^^^^^
+78 |             )
+   |
+
+B023 Function definition does not bind loop variable `capacity`
+  --> spark-work/verification-shapes/deployment-gates/experiments/2026-11-05-verification-shapes/test_graph_replay.py:77:55
+   |
+75 |         def run():
+76 |             dspark_context.context_inputs(
+77 |                 aux, sources, positions, slots, rows, capacity
+   |                                                       ^^^^^^^^
+78 |             )
+   |
+
+B023 Function definition does not bind loop variable `aux`
+  --> spark-work/verification-shapes/deployment-gates/experiments/2026-11-05-verification-shapes/test_graph_replay.py:81:40
+   |
+80 |         def check():
+81 |             expected = torch.full_like(aux, 7)
+   |                                        ^^^
+82 |             for index, source in enumerate(sources):
+83 |                 expected[:rows, index * width : (index + 1) * width].copy_(
+   |
+
+B023 Function definition does not bind loop variable `capacity`
+  --> spark-work/verification-shapes/deployment-gates/experiments/2026-11-05-verification-shapes/test_graph_replay.py:86:27
+   |
+84 |                     source[:rows]
+85 |                 )
+86 |             expected[rows:capacity].zero_()
+   |                           ^^^^^^^^
+87 |             pos = torch.full_like(positions, 99)
+88 |             pos[rows:capacity].zero_()
+   |
+
+B023 Function definition does not bind loop variable `positions`
+  --> spark-work/verification-shapes/deployment-gates/experiments/2026-11-05-verification-shapes/test_graph_replay.py:87:35
+   |
+85 |                 )
+86 |             expected[rows:capacity].zero_()
+87 |             pos = torch.full_like(positions, 99)
+   |                                   ^^^^^^^^^
+88 |             pos[rows:capacity].zero_()
+89 |             slot = torch.full_like(slots, 77)
+   |
+
+B023 Function definition does not bind loop variable `capacity`
+  --> spark-work/verification-shapes/deployment-gates/experiments/2026-11-05-verification-shapes/test_graph_replay.py:88:22
+   |
+86 |             expected[rows:capacity].zero_()
+87 |             pos = torch.full_like(positions, 99)
+88 |             pos[rows:capacity].zero_()
+   |                      ^^^^^^^^
+89 |             slot = torch.full_like(slots, 77)
+90 |             slot[:, rows:capacity].fill_(PAD_SLOT_ID)
+   |
+
+B023 Function definition does not bind loop variable `slots`
+  --> spark-work/verification-shapes/deployment-gates/experiments/2026-11-05-verification-shapes/test_graph_replay.py:89:36
+   |
+87 |             pos = torch.full_like(positions, 99)
+88 |             pos[rows:capacity].zero_()
+89 |             slot = torch.full_like(slots, 77)
+   |                                    ^^^^^
+90 |             slot[:, rows:capacity].fill_(PAD_SLOT_ID)
+91 |             torch.cuda.synchronize()
+   |
+
+B023 Function definition does not bind loop variable `capacity`
+  --> spark-work/verification-shapes/deployment-gates/experiments/2026-11-05-verification-shapes/test_graph_replay.py:90:26
+   |
+88 |             pos[rows:capacity].zero_()
+89 |             slot = torch.full_like(slots, 77)
+90 |             slot[:, rows:capacity].fill_(PAD_SLOT_ID)
+   |                          ^^^^^^^^
+91 |             torch.cuda.synchronize()
+92 |             assert torch.equal(aux.view(torch.int16), expected.view(torch.int16))
+   |
+
+B023 Function definition does not bind loop variable `aux`
+  --> spark-work/verification-shapes/deployment-gates/experiments/2026-11-05-verification-shapes/test_graph_replay.py:92:32
+   |
+90 |             slot[:, rows:capacity].fill_(PAD_SLOT_ID)
+91 |             torch.cuda.synchronize()
+92 |             assert torch.equal(aux.view(torch.int16), expected.view(torch.int16))
+   |                                ^^^
+93 |             assert torch.equal(positions, pos)
+94 |             assert torch.equal(slots, slot)
+   |
+
+B023 Function definition does not bind loop variable `positions`
+  --> spark-work/verification-shapes/deployment-gates/experiments/2026-11-05-verification-shapes/test_graph_replay.py:93:32
+   |
+91 |             torch.cuda.synchronize()
+92 |             assert torch.equal(aux.view(torch.int16), expected.view(torch.int16))
+93 |             assert torch.equal(positions, pos)
+   |                                ^^^^^^^^^
+94 |             assert torch.equal(slots, slot)
+   |
+
+B023 Function definition does not bind loop variable `slots`
+  --> spark-work/verification-shapes/deployment-gates/experiments/2026-11-05-verification-shapes/test_graph_replay.py:94:32
+   |
+92 |             assert torch.equal(aux.view(torch.int16), expected.view(torch.int16))
+93 |             assert torch.equal(positions, pos)
+94 |             assert torch.equal(slots, slot)
+   |                                ^^^^^
+95 |
+96 |         run()
+   |
+
+I001 [*] Import block is un-sorted or un-formatted
+ --> spark-work/verification-shapes/deployment-gates/experiments/2026-11-05-verification-shapes/test_preservation.py:3:1
+  |
+1 |   """Reject wide zero-crossing intervals and preserve adverse boot pairings."""
+2 |
+3 | / import importlib.util
+4 | | from pathlib import Path
+5 | | import pytest
+  | |_____________^
+6 |
+7 |   spec = importlib.util.spec_from_file_location(
+  |
+help: Organize imports
+  |
+4 | from pathlib import Path
+5 +
+6 | import pytest
+  |
+
+Found 23 errors.
+[*] 5 fixable with `--fix`.
