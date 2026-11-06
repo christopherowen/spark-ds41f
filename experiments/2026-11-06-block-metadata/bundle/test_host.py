@@ -5,7 +5,6 @@ establish device correctness; that is the separate GPU gate.
 """
 import ast
 from pathlib import Path
-from types import SimpleNamespace
 import unittest
 
 

@@ -56,10 +56,10 @@ class Case:
         for tables in (self.control, self.candidate):
             tables.apply_staged_writes()
 
-    def check(self, active=None, rows=None):
+    def check(self, active=None, rows=None, idx_dtype=torch.int32):
         active = self.active if active is None else active
         rows = self.rows if rows is None else rows
-        idx = torch.tensor(active, dtype=torch.int32, device="cuda")
+        idx = torch.tensor(active, dtype=idx_dtype, device="cuda")
         expected = self.control.gather_block_tables(idx, rows)
         actual = self.candidate.gather_block_tables(idx, rows)
         torch.cuda.synchronize()
@@ -105,6 +105,13 @@ def test_transitions(mode, concurrency, context):
     case.publish()
     case.check()
     case.check([], 0)
+
+
+@pytest.mark.parametrize("mode", ["row", "chunk", "span"])
+def test_int64_mapping(mode):
+    case = Case(mode, 8, 32768)
+    case.check(idx_dtype=torch.int64)
+    case.check(list(reversed(case.active)), idx_dtype=torch.int64)
 
 
 @pytest.mark.parametrize("mode", ["row", "chunk", "span"])
