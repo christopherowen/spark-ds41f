@@ -14,7 +14,12 @@ name=l2-access-retention-boot-$boot
 out=$run_root/boot-$boot-$revision
 test "$(git -C "$checkout" rev-parse HEAD)" = "$revision"
 test -z "$(git -C "$checkout" status --porcelain)"
-ssh -n dgx1 cat /home/swank/spark-hold.json | python3 -c 'import json,sys; assert json.load(sys.stdin)["holder"]==sys.argv[1]' "$holder"
+if test -f /home/swank/spark-hold.json; then
+  python3 -c 'import json,sys; h=json.load(open("/home/swank/spark-hold.json")); assert h["holder"]==sys.argv[1] and h.get("pool")=="dgx4-single" and h.get("nodes")==["dgx4"]' "$holder"
+  ssh -n dgx1 'if test -f /home/swank/spark-hold.json; then cat /home/swank/spark-hold.json; else printf "null\n"; fi' | python3 -c 'import json,sys; g=json.load(sys.stdin); assert g is None or (isinstance(g.get("nodes"), list) and "dgx4" not in g["nodes"])'
+else
+  ssh -n dgx1 cat /home/swank/spark-hold.json | python3 -c 'import json,sys; assert json.load(sys.stdin)["holder"]==sys.argv[1]' "$holder"
+fi
 exec 9>/tmp/spark-lab-gpu.lock
 flock -n 9
 test -z "$(docker ps -q)"
