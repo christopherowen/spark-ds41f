@@ -22,6 +22,12 @@ test -z "$(nvidia-smi --query-compute-apps=pid --format=csv,noheader)"
 test "$(awk '/MemAvailable:/ {print $2}' /proc/meminfo)" -gt 25165824
 mkdir "$out"
 mkdir -p "$out/cache"
+# Compile the exact published source before cooling and GPU measurements.
+flock -n /tmp/spark-cpu-analysis.lock taskset -c 0,1 \
+  /usr/local/cuda/bin/nvcc -std=c++17 -O2 -arch=sm_121 \
+  "$checkout/$experiment/capability.cu" -o "$out/capability" \
+  > "$out/capability-build.txt" 2>&1
+sha256sum "$checkout/$experiment/capability.cu" "$out/capability" > "$out/capability-hashes.txt"
 systemctl cat dgx-fan-control >/dev/null
 fan_before=$(systemctl is-active dgx-fan-control || true)
 printf '%s\n' "$fan_before" > "$out/fan-before.txt"
@@ -53,12 +59,9 @@ sudo -n systemctl start dgx-fan-control
 systemctl is-active --quiet dgx-fan-control
 thermal > "$out/thermal-start.txt"
 cat /proc/meminfo > "$out/memory-before.txt"
-# Compiled from the unchanged published capability source, outside GPU timing.
-printf '%s  %s\n' 99760b979db6dceea6a3f4f2f495be5e16b3c8ca376fc5d583d6a6dc850e5127 \
-  "$run_root/bin/capability-6ad22720" | sha256sum --check > "$out/capability-binary-check.txt"
 docker image inspect "$image" --format '{{.Id}}' > "$out/image.txt"
 git -C "$checkout" rev-parse HEAD > "$out/revision.txt"
-"$run_root/bin/capability-6ad22720" > "$out/capability.jsonl" 2> "$out/capability-errors.txt"
+"$out/capability" > "$out/capability.jsonl" 2> "$out/capability-errors.txt"
 checkpoint=/home/swank/.cache/huggingface/hub/models--deepseek-ai--DeepSeek-V4.1-Flash-1017/snapshots/1bae0e1088993b9b82de08f59de5be5a34e42170
 set +e
 timeout --signal=TERM --kill-after=20 480 docker run --rm --name "$name" \

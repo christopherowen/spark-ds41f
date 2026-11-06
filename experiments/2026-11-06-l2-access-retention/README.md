@@ -83,15 +83,23 @@ flock -n /tmp/spark-cpu-analysis.lock taskset -c 0,1 \
   -o /home/swank/spark-lab/l2-access-retention/bin/capability-6ad22720
 ```
 
-Its SHA-256 is
+That initial preparation binary's SHA-256 is
 `99760b979db6dceea6a3f4f2f495be5e16b3c8ca376fc5d583d6a6dc850e5127`.
-The node runner verifies that binary, the clean checkout revision, exact hold
+The subsequent capability revision separately reports whether stream capture
+inherits its policy and verifies explicit graph-node attributes. The runner
+builds the current published source using the same compiler command before
+cooling, saves source and binary hashes, and executes that version. It verifies
+the clean checkout revision, exact hold
 ownership, GPU lock, an empty GPU, memory floor and cooling/fan curve before
 execution. It retains every output, failure and thermal/memory sample under
 `/home/swank/spark-lab/l2-access-retention/boot-<boot>-<revision>/` on dgx4.
 Each process has an 8-minute deadline, a fresh compilation cache, a two-CPU and
 8 GiB container bound, a 16 GiB host memory floor and an 85 C thermal ceiling.
 The checkpoint hub is mounted at its original path so blob symlinks resolve.
+The native graph probe records captured attributes before any intervention;
+if inheritance is absent it explicitly sets and verifies kernel-node windows
+before graph instantiation, and records both versions. No policy API is called
+on a timed replay path.
 
 Once preceding requests have run, the controller is invoked from a clean,
 published checkout on dgx1 using its full 40-character revision:

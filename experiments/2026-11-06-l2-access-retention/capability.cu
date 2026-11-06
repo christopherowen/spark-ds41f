@@ -75,8 +75,8 @@ int main() {
   CK(cudaGraphKernelNodeGetAttribute(nodes[0], cudaKernelNodeAttributeAccessPolicyWindow, &node_attr));
   std::printf("{\"case\":\"capture\",\"window_bytes\":%zu,\"hit_property\":%d}\n",
               node_attr.accessPolicyWindow.num_bytes, int(node_attr.accessPolicyWindow.hitProp));
-  if (node_attr.accessPolicyWindow.num_bytes != 128 ||
-      node_attr.accessPolicyWindow.hitProp != cudaAccessPropertyPersisting) return 8;
+  const bool inherited = node_attr.accessPolicyWindow.num_bytes == 128 &&
+      node_attr.accessPolicyWindow.hitProp == cudaAccessPropertyPersisting;
   // Prove the graph carries its own attribute after its stream is cleared.
   attr.accessPolicyWindow.num_bytes = 0;
   CK(cudaStreamSetAttribute(stream, cudaStreamAttributeAccessPolicyWindow, &attr));
@@ -86,6 +86,10 @@ int main() {
   node_attr.accessPolicyWindow = window;
   node_attr.accessPolicyWindow.hitRatio = 0.5;
   CK(cudaGraphKernelNodeSetAttribute(nodes[0], cudaKernelNodeAttributeAccessPolicyWindow, &node_attr));
+  CK(cudaGraphKernelNodeGetAttribute(nodes[0], cudaKernelNodeAttributeAccessPolicyWindow, &node_attr));
+  if (node_attr.accessPolicyWindow.num_bytes != 128 ||
+      node_attr.accessPolicyWindow.hitRatio != 0.5 ||
+      node_attr.accessPolicyWindow.hitProp != cudaAccessPropertyPersisting) return 8;
   CK(cudaGraphInstantiate(&exec, graph, 0));
   CK(cudaGraphLaunch(exec, stream)); CK(cudaStreamSynchronize(stream)); verify(out);
   CK(cudaGraphExecDestroy(exec)); CK(cudaGraphDestroy(graph));
@@ -115,8 +119,8 @@ int main() {
   CK(cudaStreamDestroy(stream)); CK(cudaFree(out)); CK(cudaFree(in));
   size_t free_after = 0;
   CK(cudaMemGetInfo(&free_after, &total));
-  std::printf("{\"case\":\"verdict\",\"stream\":true,\"capture\":true,"
+  std::printf("{\"case\":\"verdict\",\"stream\":true,\"capture_inherits\":%s,"
               "\"graph_node\":true,\"extended_launch\":true,\"extended_capture\":true,"
               "\"exact\":true,\"restored_bytes\":%zu,\"free_before\":%zu,\"free_after\":%zu}\n",
-              actual, free_before, free_after);
+              inherited ? "true" : "false", actual, free_before, free_after);
 }

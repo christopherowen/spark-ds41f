@@ -48,19 +48,35 @@ def window(stream, tensor=None, fraction=1.0):
         cu.CUstreamAttrID.CU_STREAM_ATTRIBUTE_ACCESS_POLICY_WINDOW, value))
 
 
-def graph_windows(graph):
+def graph_kernels(graph):
     handle = cu.CUgraph(graph.raw_cuda_graph())
     _, count = check(cu.cuGraphGetNodes(handle, 0))
     nodes, actual = check(cu.cuGraphGetNodes(handle, count))
+    return [node for node in nodes[:actual]
+            if check(cu.cuGraphNodeGetType(node)) == cu.CUgraphNodeType.CU_GRAPH_NODE_TYPE_KERNEL]
+
+
+def graph_windows(graph):
     result = []
-    for node in nodes[:actual]:
-        kind = check(cu.cuGraphNodeGetType(node))
-        if kind == cu.CUgraphNodeType.CU_GRAPH_NODE_TYPE_KERNEL:
-            value = check(cu.cuGraphKernelNodeGetAttribute(
-                node, cu.CUkernelNodeAttrID.CU_KERNEL_NODE_ATTRIBUTE_ACCESS_POLICY_WINDOW))
-            w = value.accessPolicyWindow
-            result.append([int(w.num_bytes), float(w.hitRatio), int(w.hitProp)])
+    for node in graph_kernels(graph):
+        value = check(cu.cuGraphKernelNodeGetAttribute(
+            node, cu.CUkernelNodeAttrID.CU_KERNEL_NODE_ATTRIBUTE_ACCESS_POLICY_WINDOW))
+        w = value.accessPolicyWindow
+        result.append([int(w.num_bytes), float(w.hitRatio), int(w.hitProp)])
     return result
+
+
+def explicit_graph_window(graph, tensor, fraction):
+    value = cu.CUkernelNodeAttrValue()
+    w = value.accessPolicyWindow
+    w.base_ptr = tensor.data_ptr()
+    w.num_bytes = tensor.numel() * tensor.element_size()
+    w.hitRatio = fraction
+    w.hitProp = cu.CUaccessProperty.CU_ACCESS_PROPERTY_PERSISTING
+    w.missProp = cu.CUaccessProperty.CU_ACCESS_PROPERTY_NORMAL
+    for node in graph_kernels(graph):
+        check(cu.cuGraphKernelNodeSetAttribute(
+            node, cu.CUkernelNodeAttrID.CU_KERNEL_NODE_ATTRIBUTE_ACCESS_POLICY_WINDOW, value))
 
 
 def main():
@@ -158,6 +174,7 @@ def main():
                 for stress in (False, True):
                     graphs = {}
                     attrs = {}
+                    captured_attrs = {}
                     reference = None
                     for name, budget, uses_window, prefetch in arms:
                         torch.cuda.synchronize()
@@ -186,6 +203,9 @@ def main():
                         graph = torch.cuda.CUDAGraph(keep_graph=True)
                         with torch.cuda.graph(graph, stream=stream):
                             step()
+                        captured_attrs[name] = graph_windows(graph)
+                        if uses_window and any(a[0] != b for a in captured_attrs[name]):
+                            explicit_graph_window(graph, packed.values, min(1.0, actual / b))
                         attrs[name] = graph_windows(graph)
                         assert attrs[name], name
                         assert all(a[0] == (b if uses_window else 0) for a in attrs[name]), (name, attrs[name])
@@ -224,6 +244,7 @@ def main():
                     case = {'tp': tp, 'rows': rows, 'expert_stream_stress': stress,
                             'weight_sha256': weight_hash, 'payload_bytes': b,
                             'exception_count': packed.exceptions, 'graph_attributes': attrs,
+                            'captured_graph_attributes': captured_attrs,
                             'all_bits_equal': True, 'samples': samples}
                     case['median_us'] = {a[0]: statistics.median(s['us'] for s in samples if s['arm'] == a[0]) for a in arms}
                     result['cases'].append(case)
