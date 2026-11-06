@@ -24,6 +24,7 @@ HOLDER = 'ced-sp567-native-correctness'
 NAMES = ['sp5', 'sp6', 'sp7']
 SOURCE = '/home/chris/spark-lab/ced-sp567/vllm'
 GLOBAL_HOST = None
+GLOBAL_OBSERVATION = None
 
 
 def output(*command, cwd=None):
@@ -43,6 +44,7 @@ def load_recovery():
     spec.loader.exec_module(module)
     # Reuse the published recovery functions with the exact live profile name.
     module.REL = str(Path(RESTORE_PROFILE).parent)
+    module.HOLD_CODE = module.HOLD_CODE.replace('import json,os', "import json,os,fcntl\nlock=(Path.home()/'.ced-hold.lock').open('a');fcntl.flock(lock,fcntl.LOCK_EX)")
     return module
 
 
@@ -78,13 +80,21 @@ def remote(node, program, data=None):
 
 
 def global_scope():
-    code = "from pathlib import Path; import json; p=Path.home()/'spark-hold.json'; print(p.read_text() if p.exists() else 'null')"
-    result = subprocess.run(['ssh', '-o', 'BatchMode=yes', '-o', 'ConnectTimeout=10',
-                             'swank@'+GLOBAL_HOST, 'python3 -'], input=code, text=True,
-                            capture_output=True, timeout=30)
-    if result.returncode:
-        raise RuntimeError('cannot verify the DGX global hold scope')
-    held = json.loads(result.stdout)
+    if GLOBAL_OBSERVATION is not None:
+        observed = json.loads(GLOBAL_OBSERVATION.read_text())
+        age = (dt.datetime.now(dt.timezone.utc)-dt.datetime.fromisoformat(observed['observed_at'])).total_seconds()
+        assert observed.get('source') == 'dgx1:~/spark-hold.json'
+        assert observed.get('success') is True and 0 <= age <= 15, 'global hold observation missing, stale or failed'
+        assert 0 <= observed['read_duration_seconds'] <= 10
+        held = observed['hold']
+    else:
+        code = "from pathlib import Path; import json; p=Path.home()/'spark-hold.json'; print(p.read_text() if p.exists() else 'null')"
+        result = subprocess.run(['ssh', '-o', 'BatchMode=yes', '-o', 'ConnectTimeout=10',
+                                 'swank@'+GLOBAL_HOST, 'python3 -'], input=code, text=True,
+                                capture_output=True, timeout=30)
+        if result.returncode:
+            raise RuntimeError('cannot verify the DGX global hold scope')
+        held = json.loads(result.stdout)
     if held is not None:
         assert held.get('nodes') == ['dgx1', 'dgx2', 'dgx3'], held
         scope = held.get('resource_scope')
@@ -105,7 +115,8 @@ print(json.dumps({'commit':subprocess.check_output(['git','rev-parse','HEAD'],cw
  'containers':subprocess.check_output(['docker','ps','--format','{{.Names}}'],text=True).splitlines()}))
 """
 PHASE = """from pathlib import Path
-import json,os
+import json,os,fcntl
+lock=(Path.home()/'.ced-hold.lock').open('a');fcntl.flock(lock,fcntl.LOCK_EX)
 p=Path.home()/'spark-hold.json';h=json.loads(p.read_text())
 assert h.get('token')==DATA['token'] and h.get('holder')=='ced-sp567-native-correctness'
 h['phase']=DATA['phase'];q=p.with_name('.ced-hold-'+DATA['token']);q.write_text(json.dumps(h,indent=2)+'\n');os.replace(q,p)
@@ -202,7 +213,12 @@ print(json.dumps({'commit':subprocess.check_output(['git','rev-parse','HEAD'],cw
 def watchdog(token, out):
     while not (out/'restored.json').exists() and not (out/'restore-failed.txt').exists():
         time.sleep(15)
-        state = holds()
+        try:
+            state = holds()
+        except Exception as error:
+            with (out/'watchdog-read-errors.jsonl').open('a') as stream:
+                stream.write(json.dumps({'at':stamp(),'error':repr(error)})+'\n')
+            continue
         owned = [v['spark-hold.json'] for v in state.values()
                  if v['spark-hold.json'] and v['spark-hold.json'].get('token') == token]
         if not owned:
@@ -214,14 +230,17 @@ def watchdog(token, out):
 
 
 def main():
-    global recovery, GLOBAL_HOST
+    global recovery, GLOBAL_HOST, GLOBAL_OBSERVATION
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--out', type=Path, required=True)
     parser.add_argument('--watchdog')
     parser.add_argument('--apply', action='store_true')
-    parser.add_argument('--global-host', required=True, help='verified management address of dgx1')
+    route = parser.add_mutually_exclusive_group(required=True)
+    route.add_argument('--global-host', help='verified reachable management address of dgx1')
+    route.add_argument('--global-observation', type=Path, help='continuously refreshed authenticated DGX1 observation')
     args = parser.parse_args()
     GLOBAL_HOST = args.global_host
+    GLOBAL_OBSERVATION = args.global_observation
     assert socket.gethostname() == 'spark-0013', 'controller must run on SP5'
     recovery = load_recovery()
     recovery.remote = remote
@@ -242,6 +261,14 @@ def main():
     recovery.run(recovery.spark('restore', 'doctor', '--live'), out, 'preflight-doctor')
     command = recovery.spark('restore', 'cluster', 'stop')
     recovery.run(command, out, 'stop-plan')
+    stop_plan=(out/'stop-plan.txt').read_text()
+    live=next((line for line in stop_plan.splitlines() if line.startswith('live:')),None)
+    assert live and all(name+': stop exact container spark-ds41f' in stop_plan for name in NAMES), stop_plan
+    recovery.run(recovery.spark('restore','cluster','start','--replace'),out,'recovery-plan')
+    plan=(out/'recovery-plan.txt').read_text()
+    shape=next((line for line in plan.splitlines() if line.startswith('shape:')),None)
+    assert shape and 'unchanged' in shape and '--apply would refuse:' not in plan, plan
+    (out/'plan-review.json').write_text(json.dumps({'stop_live':live,'restore_shape':shape},indent=2)+'\n')
     idle(out)
     if not args.apply:
         print('preflight passed; no ownership or serving state changed', flush=True)
@@ -286,8 +313,9 @@ print('true')
         assert not writer.is_alive(), 'heartbeat writer still active; retain holds'
     try:
         writer.start()
+        route_args = ['--global-observation', str(GLOBAL_OBSERVATION)] if GLOBAL_OBSERVATION else ['--global-host', GLOBAL_HOST]
         with (out/'watchdog.txt').open('w') as log:
-            guard = subprocess.Popen([sys.executable, __file__, '--out', str(out), '--watchdog', token, '--global-host', GLOBAL_HOST],
+            guard = subprocess.Popen([sys.executable, __file__, '--out', str(out), '--watchdog', token]+route_args,
                                      cwd=ROOT, stdout=log, stderr=subprocess.STDOUT,
                                      stdin=subprocess.DEVNULL, start_new_session=True)
         (out/'watchdog.json').write_text(json.dumps({'pid':guard.pid,'token':token,'targets':NAMES,
@@ -303,13 +331,15 @@ print('true')
                'restore':{'commit':RESTORE_COMMIT,'profile':RESTORE_PROFILE,'image':recovery.IMAGE,'nodes':NAMES},
                'watchdog':{'pid':guard.pid,'nodes':NAMES,'stale_seconds':900}}
         recovery.each("""from pathlib import Path
-import json,os
+import json,os,fcntl
+lock=(Path.home()/'.ced-hold.lock').open('a');fcntl.flock(lock,fcntl.LOCK_EX)
 p=Path.home()/'spark-hold.json';h=json.loads(p.read_text());assert h.get('token')==DATA['token']
 h['resource_scope']=DATA;q=p.with_name('.ced-scope-'+DATA['token']);q.write_text(json.dumps(h,indent=2)+'\\n');os.replace(q,p)
 print('true')
 """,scope)
         (out/'resource-scope.json').write_text(json.dumps(scope,indent=2)+'\n')
         assert owns(token) and guard.poll() is None and not errors
+        global_scope()
         recovery.run(command+['--apply'], out, 'stop-apply')
         recovery.each(PHASE, {'token':token,'phase':'native'})
         for boot in ('boot-1','boot-2'):
@@ -317,6 +347,7 @@ print('true')
             if remaining < 35*60:
                 raise RuntimeError('insufficient time for another bounded batch plus restoration')
             assert owns(token) and not errors
+            global_scope()
             state=holds()
             if any(v['spark-request.json'] or v['spark3-request.json'] for v in state.values()):
                 raise RuntimeError('cohort requested; yield after completed batch')

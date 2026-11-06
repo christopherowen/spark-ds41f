@@ -36,6 +36,7 @@ class Guards(unittest.TestCase):
 
     def test_global_scope_requires_exact_holder_token_and_recovery_targets(self):
         c.GLOBAL_HOST='verified-address'
+        c.GLOBAL_OBSERVATION=None
         h={'holder':'budget','window':'window','nodes':['dgx1','dgx2','dgx3']}
         h['resource_scope']={'kind':'nodes','nodes':h['nodes'],'holder':'budget','token':'window',
                              'restore':{'nodes':h['nodes']},'watchdog':{'nodes':h['nodes']}}
@@ -45,6 +46,19 @@ class Guards(unittest.TestCase):
                     dict(h,resource_scope=dict(h['resource_scope'],restore={'nodes':['sp5']}))):
             with patch.object(c.subprocess,'run',return_value=subprocess.CompletedProcess([],0,json.dumps(bad),'')):
                 with self.assertRaises(AssertionError):c.global_scope()
+
+    def test_relay_accepts_only_a_fresh_successful_authenticated_read(self):
+        with tempfile.TemporaryDirectory() as name:
+            path=Path(name)/'observation.json'
+            value={'source':'dgx1:~/spark-hold.json','success':True,'observed_at':c.stamp(),
+                   'read_duration_seconds':0.5,'hold':None}
+            with patch.object(c,'GLOBAL_OBSERVATION',path):
+                path.write_text(json.dumps(value));self.assertIsNone(c.global_scope())
+                for bad in (dict(value,success=False),dict(value,source='other'),
+                            dict(value,observed_at='2000-01-01T00:00:00+00:00'),
+                            dict(value,read_duration_seconds=11)):
+                    path.write_text(json.dumps(bad))
+                    with self.assertRaises(AssertionError):c.global_scope()
 
     def test_restore_does_not_act_on_foreign_lease(self):
         with tempfile.TemporaryDirectory() as name, patch.object(c,'owns',return_value=False):

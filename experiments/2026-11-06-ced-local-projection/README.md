@@ -311,7 +311,7 @@ functions, selecting the exact live restore-profile name. It adds exact-token
 holds on every participant, fresh scope and idle checks, an independent watchdog
 with a verified startup handshake, native-container cleanup, a restoration lock,
 and independent all-rank identity verification before heartbeat join and release.
-Six CPU guard tests cover foreign/legacy holds, mismatched scope, incorrect global
+Seven CPU guard tests cover foreign/legacy holds, mismatched scope, incorrect global
 holder tokens, recovery targets, verification-before-release and retained recovery
 failure. Restoration failure retains ownership and prevents an automatic restart
 loop. Both start-plan live/shape lines are reviewed by the published recovery
@@ -328,3 +328,11 @@ run that stopped after 32/45 requests remains negative evidence, not a completed
 quality reference. Fan-control is absent on these Spaceports, so there is no
 compatible qualified timing reference for this job; immutable 1030 runs remain
 recorded only. Further model/prefill qualification is still outstanding.
+
+The SP5 controller has no route to DGX1. `observe_global.py` is a lightweight
+management relay running on the coordinator Mac: every three seconds it reads
+DGX1's live hold over authenticated SSH and atomically writes a timestamped
+observation on SP5. Acquisition, stop and each batch refuse failed observations,
+reads taking over ten seconds, observations older than fifteen seconds, or a
+foreign unscoped/overlapping hold. The independent restoration watchdog runs on
+SP5 and does not depend on the relay. Relay loss cannot authorize a new batch.
