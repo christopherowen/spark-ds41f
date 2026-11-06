@@ -20,4 +20,14 @@ class TimingConditions(unittest.TestCase):
                 launch.assert_not_called();watch.close.assert_called_once()
             self.assertFalse(out.exists());self.assertTrue(json.loads(out.with_name('answers-conditions.json').read_text())['fan_warnings'])
 
+    def test_longbench_adapter_marks_stock_fan_history_exploratory(self):
+        import summarize
+        with tempfile.TemporaryDirectory() as d:
+            root=Path(d);(root/'source.json').write_text(json.dumps({'benchmark':'longbench'}))
+            c={'halted':[],'fan_stop_failures':[],'thermal':{'a':{'thermal_slowdown_ms':0}},'fan_curve':[{'node':'a','service':'absent'}]}
+            for label in summarize.LABELS:(root/('answers-'+label+'-conditions.json')).write_text(json.dumps(c))
+            def delegate(*args,**kwargs):(root/'comparison.json').write_text(json.dumps({'complete':True,'promotion_qualified':False}))
+            with patch('sys.argv',['summarize.py',str(root)]),patch.object(summarize.subprocess,'run',side_effect=delegate):summarize.main()
+            self.assertFalse(json.loads((root/'comparison.json').read_text())['timing_qualified'])
+
 if __name__=='__main__':unittest.main()
