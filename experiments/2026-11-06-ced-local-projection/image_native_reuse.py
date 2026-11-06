@@ -125,6 +125,8 @@ try:
     record['min_available_gib'] = spark.run_memory_guarded(stream_command, 48)
     built = image(tag)
     record['image_id'] = built['Id']
+    assert built['Config']['Labels']['org.opencontainers.image.revision'] == head
+    assert built['Config']['Labels']['local.spark-ds41f.vllm.patch-head'] == identity['candidate']['patch_head']
     record['candidate_check'] = check_image(built['Id'], identity['candidate']['patch_head'], 'candidate')
     assert record['parent_check']['native_sha256'] == record['candidate_check']['native_sha256']
     layers = parent['RootFS']['Layers']

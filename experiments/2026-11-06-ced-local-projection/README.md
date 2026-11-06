@@ -391,3 +391,15 @@ C37 was independently verified at clean `e9eab460` on all nodes and the leases
 released at 2026-11-06 02:10:24 UTC. These are native correctness results only;
 distributed collectives, whole-model serving and qualified performance remain
 unmeasured for this candidate.
+
+The fifth image attempt passed complete CPU identity verification. Immutable
+image `sha256:b1dac2d1ecf9bde9a2412befa40b081745d69d1bc86f76f66bc99e53eb0765bf`
+contains all 7,811 tracked files at source `51c1a32`/tree `5d8d1d17`, preserves
+both compiled-extension SHA-256 values and all 57 parent layers, and adds one source
+layer. It records published deployment `4e399935`; its labels were independently
+checked against that commit and source head. The CPU build kept at least 115.11
+GiB host memory available. The control alias `spark-ds41f:ced-control-3795255f485e`
+was created only if absent and verified against immutable parent `3795255f`.
+Exact identities and receipts are in `image-native-reuse.json` and
+`receipts/native-reuse-image-5-*`. The image has not been distributed, GPU-smoked
+or served; these gates remain required.
