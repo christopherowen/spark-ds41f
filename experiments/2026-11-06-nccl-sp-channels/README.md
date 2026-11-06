@@ -52,9 +52,31 @@
      - `DeepseekV4Attention._trim_padded_groups()` (`vllm/models/deepseek_v4_1/attention.py:1755-1815`) trims the zero-padded 3rd group on TP3 Rank 2 (`tp_rank = 2`), so TP3 has `n_local_heads = 24` on Ranks 0 & 1 and `n_local_heads = 16` on Rank 2 (and TP4 has `n_local_heads = 16` on all 4 ranks).
      - `SparseMlaV41Plan.routes` previously hardcoded `block_H = 32, threads = 256` (8 warps) for `extend` and `decode` even when `heads = 16`, where `head_blocks = cdiv(16, 32) = 1` (same as `cdiv(16, 16) = 1`) and 4 of the 8 warps in every CTA executed `Q*K^T` and `P*V` MMAs, softmax, and `wo_input` on zero-padded dummy heads `16..31` and discarded them.
      - Capping `block_H = min(block_H, tilelang.cdiv(heads, 16) * 16)` and scaling `threads` accordingly switches 16-head `extend` and `decode` to `block_H = 16, threads = 128` (4 warps), cutting tensor-core MMA and warp work by 50% and dynamic shared memory by `18.4` KiB/CTA on TP3 Rank 2 and all TP4 ranks. Adding `skip_inactive: bool = True` to `sparse_mla_fwd_v41` preserves inactive-segment and dead-row skipping on `decode` at `block_H = 16` while keeping single-wave `split` (`skip_inactive=False`) branch-free.
-   - **Under-Filled `< 1` Wave Transition (`rows = 29..47`) on Indexed Layers**:
-     - `DECODE_MAX_WAVES = 3` previously set `decode_max_rows = 3 * 48 // (5 * 1) = 28` on 5-segment indexed layers. For `rows = 29..47` (short prefill tails, prefix-cached chunks, or mixed batches), `SparseMlaV41Plan` switched from segment-split `decode` (`5 * rows = 145..235` CTAs) to unsplit `extend` (`1 * rows = 29..47` CTAs < 48 SMs), leaving up to 19 SMs idle while each active SM ran all 5 KV segments serially.
-     - Setting `decode_max_rows = max(DECODE_MAX_WAVES * sms // (segments * head_blocks), sms // head_blocks if segments > 1 else 0)` raises `decode_max_rows` on 5-segment indexed layers from `28` to `48` (keeping segment-split `decode` until unsplit `extend` fills a full wave of 48 SMs) while leaving 1-segment SWA layers (including the DSpark drafter in `_draft_workspace_lane`) unchanged at `144`. Peak workspace memory across both lanes changes by `0` bytes.
+   - **Wave-Boundary Ablation (`rows = 29..48`, `DECODE_MAX_WAVES = 3` vs `5`, `receipts/screen-mla-waves5-boot{1,2}.jsonl`)**:
+     - We tested raising `decode_max_rows` on 5-segment indexed layers from `28` (`DECODE_MAX_WAVES = 3`) to `48` (`sms // head_blocks`, 5 waves). Across two fresh container boots on GB10 (`sp8`), `decode_max_rows = 48` sped up `rows = 29..48` when only 2 of 5 segments were active (`partial_256`: `1.32x..1.95x`), **but regressed `rows = 29..48` when all 5 segments were active (`full_640`: `+28%..+105%` slower)** because single-wave `extend` (`29..48` CTAs <= 48 SMs) folds all 5 segments in registers (`0.049 ms` warm / `0.061..0.069 ms` cold) without writing `2.36 MiB` `Partial` to global memory or launching the 24-wave merge kernel (`0.056..0.105 ms` warm / `0.095..0.128 ms` cold).
+     - Therefore, refined `vllm/0731` (`609f622114a9ddac55ef5ab329294a71c5a061d2`, tree `74723c61264412617284b752d87ee1db4348c3de`) retains `DECODE_MAX_WAVES = 3` (`decode_max_rows = 28`) and isolates the strictly beneficial `block_H = 16, threads = 128` (`heads <= 16`) + `skip_inactive: bool = True` change.
+
+4. **Phase 2A Standalone 2-Boot GPU Benchmark Results on GB10 (`sp8`, `receipts/screen-mla-boot{1,2}.jsonl`)**:
+   - **GPU `pytest` contracts**: `20 passed` on `boot1` (`11.58s`, `receipts/gpu-pytest-boot1.txt`) and `boot2` (`11.52s`, `receipts/gpu-pytest-boot2.txt`), `0` PDL violations.
+   - **100% `int16` bit-identity**: `86/86` checks across `boot1` and `boot2` passed with `int16_differ == 0` across all shapes and explicit `extend`/`decode`/`split` routes.
+   - **2-Boot Median Latency Summary (`screen_mla.py`, 15 timed iterations/point, alternating order on `boot2`)**:
+     | Heads | `idx_width` | `rows` | Context Mode | Cache Mode | Route | Control `boot1` / `boot2` (ms) | Candidate `0731` `boot1` / `boot2` (ms) | Delta % | Speedup |
+     | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |
+     | `16` | `512` | `24` | `full_640` | `warm` | `decode` | `0.0444` / `0.0407` | `0.0387` / `0.0370` | **`-11.09%`** | **`1.125x`** |
+     | `16` | `512` | `28` | `full_640` | `warm` | `decode` | `0.0410` / `0.0410` | `0.0389` / `0.0388` | **`-5.23%`** | **`1.055x`** |
+     | `16` | `512` | `29` | `full_640` | `warm` | `extend` | `0.0493` / `0.0491` | `0.0434` / `0.0430` | **`-12.22%`** | **`1.139x`** |
+     | `16` | `512` | `48` | `full_640` | `warm` | `extend` | `0.0510` / `0.0512` | `0.0451` / `0.0449` | **`-12.05%`** | **`1.137x`** |
+     | `16` | `512` | `1024` | `full_640` | `64MiB_wash` | `extend` | `1.0749` / `1.0769` | `0.9611` / `0.9592` | **`-10.76%`** | **`1.121x`** |
+     | `16` | `512` | `1024` | `full_640` | `warm` | `extend` | `1.0628` / `1.0630` | `0.9459` / `0.9459` | **`-11.01%`** | **`1.124x`** |
+     | `16` | `512` | `2048` | `full_640` | `64MiB_wash` | `extend` | `2.1081` / `2.1071` | `1.8728` / `1.8624` | **`-11.39%`** | **`1.129x`** |
+     | `16` | `512` | `2048` | `full_640` | `warm` | `extend` | `2.0893` / `2.0929` | `1.8613` / `1.8415` | **`-11.46%`** | **`1.129x`** |
+     | `16` | `512` | `4096` | `full_640` | `64MiB_wash` | `extend` | `4.1766` / `4.1756` | `3.7013` / `3.6996` | **`-11.39%`** | **`1.129x`** |
+     | `16` | `512` | `4096` | `full_640` | `warm` | `extend` | `4.1719` / `4.1634` | `3.6883` / `3.6846` | **`-11.55%`** | **`1.131x`** |
+     | `16` | `512` | `6144` | `full_640` | `64MiB_wash` | `extend` | `6.2228` / `6.2227` | `5.5211` / `5.5262` | **`-11.23%`** | **`1.127x`** |
+     | `16` | `512` | `6144` | `full_640` | `warm` | `extend` | `6.2114` / `6.2124` | `5.5080` / `5.5077` | **`-11.33%`** | **`1.128x`** |
+     | `16` | `0` | `6144` | `full_640` | `64MiB_wash` | `extend` | `1.7958` / `1.7804` | `1.5941` / `1.5937` | **`-10.86%`** | **`1.122x`** |
+     | `24` | `512` | `6144` | `full_640` | `64MiB_wash` | `extend` | `6.3280` / `6.3246` | `6.3281` / `6.3260` | `+0.01%` | `1.000x` |
+   - Across 40 indexed layers (`-0.699 ms/layer`) + 38 SWA-only layers (`-0.194 ms/layer`), `vllm/0731` saves **`35.34 ms` per 6,144-token prefill chunk** (`~212 ms` at 32K/36K prefill, `~389 ms` at 64K prefill) on TP3 Rank 2 and all TP4 ranks.
 
 3. **100% Bit-Identity Proof (`vllm/0731`)**:
    - `segment_chunks` (`4`), `block_I` (`32`), FP32 partial accumulators, the explicit `FOLD` expression (`L = T.fma(l, b, T.fmul(L, a))`), and `wo_input` rotation/quantization are unchanged; `extend`, `decode`, and `split` at `block_H = 16` and `block_H = 32` are bit-identical (`differ == 0` in `int16` view).

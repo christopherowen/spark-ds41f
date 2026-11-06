@@ -38,10 +38,7 @@ def _simulate_routes(
     head_blocks = _cdiv(heads, block_H)
     chunks = _cdiv(swa_width, block_I) + _cdiv(idx_width, block_I)
     segments = _cdiv(chunks, segment_chunks)
-    decode_max_rows = max(
-        decode_max_waves * sms // (segments * head_blocks),
-        sms // head_blocks if segments > 1 else 0,
-    )
+    decode_max_rows = decode_max_waves * sms // (segments * head_blocks)
     split_max_rows = (
         sms // (segments * _cdiv(heads, split_block_H)) if split_block_H else 0
     )
@@ -138,8 +135,8 @@ class TestNcclSpChannelsAndMlaOccupancy(unittest.TestCase):
         actual_sha = patchset_sha256(vllm_u)
         self.assertEqual(vllm_u["patchset_sha256"], actual_sha)
         self.assertEqual(vllm_s["patchset_sha256"], actual_sha)
-        self.assertEqual(vllm_u["patch_head"], "ec74bbbca3ada2b879024b1d8c4703e152f789ed")
-        self.assertEqual(vllm_u["expected_tree"], "f72aeb6e5a305cf59005f7a14e69b172c637b1d1")
+        self.assertEqual(vllm_u["patch_head"], "609f622114a9ddac55ef5ab329294a71c5a061d2")
+        self.assertEqual(vllm_u["expected_tree"], "74723c61264412617284b752d87ee1db4348c3de")
         self.assertEqual(vllm_s["patch_count"], 616)
 
         mla_arm = read_cluster("experiments/2026-11-06-nccl-sp-channels/tp3-mla-occupancy.json")
@@ -155,7 +152,7 @@ class TestNcclSpChannelsAndMlaOccupancy(unittest.TestCase):
         self.assertEqual(r16["threads"], 128)
         self.assertEqual(r16["head_blocks"], 1)
         self.assertEqual(r16["split_max_rows"], 9)
-        self.assertEqual(r16["decode_max_rows"], 48)
+        self.assertEqual(r16["decode_max_rows"], 28)
 
         # 24-head ranks (TP3 ranks 0 & 1):
         r24 = _simulate_routes(24, 128, 512)
@@ -163,7 +160,7 @@ class TestNcclSpChannelsAndMlaOccupancy(unittest.TestCase):
         self.assertEqual(r24["threads"], 256)
         self.assertEqual(r24["head_blocks"], 1)
         self.assertEqual(r24["split_max_rows"], 4)
-        self.assertEqual(r24["decode_max_rows"], 48)
+        self.assertEqual(r24["decode_max_rows"], 28)
 
         # Verify that for every row count > decode_max_rows (rows >= 49), unsplit extend
         # launches >= 49 CTAs (> 1 full wave of 48 SMs on GB10).
