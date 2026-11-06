@@ -1,0 +1,39 @@
+# Executed in /Users/christopherowen/projects/spark-ds41f-block-metadata
+# Local source preparation; no serving or build state on cluster nodes changed.
+git clone --shared --no-checkout /Users/christopherowen/projects/spark-ds41f/.work/native-score-inputs-vllm .work/vllm
+git -C .work/vllm remote set-url origin https://github.com/christopherowen/vllm.git
+git -C .work/vllm remote add upstream https://github.com/local-inference-lab/vllm.git
+git -C .work/vllm switch -c metadata-base 19f2c20ed4d64ae22bd009ceacadd85e2a81e354
+python3 - <<'PY'
+from pathlib import Path
+import subprocess
+root = Path.cwd()
+exp = root / 'experiments/2026-11-06-block-metadata'
+(exp / 'runs').mkdir(parents=True, exist_ok=True)
+p = root / 'experiments/2026-10-26-spark-ds41f-candidate/candidate-40/vllm/series'
+patches = [str((p.parent / s.strip()).resolve()) for s in p.read_text().splitlines()
+           if s.strip() and not s.startswith('#')]
+with (exp / 'runs/fresh-series.log').open('w') as f:
+    r = subprocess.run(['git', '-c', 'user.name=Christopher Owen', '-c',
+                        'user.email=3221756+christopherowen@users.noreply.github.com',
+                        'am', '--committer-date-is-author-date', *patches],
+                       cwd=root / '.work/vllm', stdout=f, stderr=subprocess.STDOUT)
+print('patch_count', len(patches), 'exit', r.returncode)
+print(subprocess.check_output(['git', 'rev-parse', 'HEAD', 'HEAD^{tree}'],
+                              cwd=root / '.work/vllm', text=True))
+PY
+
+# Read-only retrieval of existing measurements. These commands do not run a GPU job.
+ssh -o BatchMode=yes -o ConnectTimeout=8 dgx4 'cat ~/spark-lab/agents/kernel-audit/out/audit-attention-6/output.txt' > experiments/2026-11-06-block-metadata/runs/recorded-audit-attention-6.log
+ssh -o BatchMode=yes -o ConnectTimeout=8 dgx1 'cat ~/spark-lab/results/tilelang-integration-kernels-26/integration-runner-dgx1/output.txt' > experiments/2026-11-06-block-metadata/runs/recorded-integration-runner-26.log
+
+# V1 ran with min(context // 256, width - 2); its output/log are retained as *-v1.*.
+# V2 changed only this fixture bound to width - 1 and reran this command.
+/usr/bin/time -l python3 experiments/2026-11-06-block-metadata/screen.py --source .work/vllm --output experiments/2026-11-06-block-metadata/runs/operation-screen.json > experiments/2026-11-06-block-metadata/runs/operation-screen.log 2>&1
+python3 experiments/2026-11-06-block-metadata/audit.py --source .work/vllm --recorded-root /Users/christopherowen/projects/spark-ds41f --output experiments/2026-11-06-block-metadata/runs/source-and-recorded-costs.json
+python3 -m py_compile experiments/2026-11-06-block-metadata/screen.py experiments/2026-11-06-block-metadata/audit.py
+bin/spark doctor
+bin/spark --cluster-config experiments/2026-10-26-spark-ds41f-candidate/candidate-40/tp3.json doctor
+bin/spark --cluster-config experiments/2026-10-26-spark-ds41f-candidate/candidate-40/tp3.json build check
+git diff --check
+git diff --cached --check
