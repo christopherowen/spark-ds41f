@@ -29,7 +29,23 @@
       ],
       "limitations": "Whole screen including compilation, caches and all five arms; not incremental serving-graph memory. Driver free-memory deltas on unified-memory host are not attribution."
     },
-    "note": "CPU container cgroup memory.peak observed after tests; no inference about graph or serving memory."
+    "note": "CPU container cgroup memory.peak observed after tests; no inference about graph or serving memory.",
+    "gpu_graph_and_suite_observations": {
+      "receipt": "runs/gates-20261106/summary.json",
+      "graph_pool_allocated_diff_bytes_each_boot": [
+        0,
+        0
+      ],
+      "graph_capture_allocated_delta_bytes_before_after": [
+        5120,
+        5120
+      ],
+      "container_peak_bytes": [
+        2670313472,
+        2669654016
+      ],
+      "note": "Measured across before/after DFlashCudaGraphManager captures for shapes (5,1), (10,2), (20,4), (40,8), (80,16); in-place metadata refresh adds 0 bytes to the CUDA graph pool."
+    }
   },
   "gpu_runs": [
     {
@@ -108,5 +124,58 @@
     "serving_memory_preservation": "unmeasured",
     "regressions": "none_observed_in_exercised_component_scope; broader_behavior_unresolved",
     "no_loss_evidence": "Requires bounds excluding a meaningful regression; an interval merely including zero is inconclusive."
+  },
+  "broader_gpu_gates": {
+    "status": "pass",
+    "receipt": "runs/gates-20261106/summary.json",
+    "archives": "runs/gates-20261106/archives.json",
+    "attempts_retained": [
+      "runs/gates-20261106/attempt-1/identity.json",
+      "runs/gates-20261106/attempt-2/identity.json",
+      "runs/gates-20261106/attempt-3/identity.json"
+    ],
+    "boots": [
+      {
+        "boot": 1,
+        "status": "pass",
+        "total_cold_compile_ms": 94391.503922,
+        "total_warm_lookup_us": 47.088,
+        "incremental_specializations_added": 0,
+        "late_compilation_misses": 0,
+        "graph_pool_allocated_diff_bytes": 0,
+        "metadata_kernel_in_before_graph": false,
+        "metadata_kernel_in_after_graph": true,
+        "before_eager_build_calls": 27,
+        "after_eager_build_calls": 0,
+        "exact_bitwise_comparisons": 192,
+        "pytest_passed": 388,
+        "pytest_failed": 0,
+        "receipt": "runs/gates-20261106/boot-1/trace.json",
+        "log": "runs/gates-20261106/boot-1/output.log.gz"
+      },
+      {
+        "boot": 2,
+        "status": "pass",
+        "total_cold_compile_ms": 93430.649395,
+        "total_warm_lookup_us": 47.136,
+        "incremental_specializations_added": 0,
+        "late_compilation_misses": 0,
+        "graph_pool_allocated_diff_bytes": 0,
+        "metadata_kernel_in_before_graph": false,
+        "metadata_kernel_in_after_graph": true,
+        "before_eager_build_calls": 27,
+        "after_eager_build_calls": 0,
+        "exact_bitwise_comparisons": 192,
+        "pytest_passed": 388,
+        "pytest_failed": 0,
+        "receipt": "runs/gates-20261106/boot-2/trace.json",
+        "log": "runs/gates-20261106/boot-2/output.log.gz"
+      }
+    ],
+    "multi_step_loop_inspection": {
+      "dspark_generate_draft": "Both parallel backbone forward across all N draft query rows and sequential N-step Markov sampling (_sample_sequential) are already captured inside the single FULL query CUDA graph.",
+      "overlap_explanation": "With 775.3 us of GPU work queued ahead on the same stream, the ~215 us of asynchronous CPU work in eager_full finishes ~557 us before the GPU finishes sleeping, hiding the CPU host saving and leaving only the 2.66-2.94 us GPU-side kernel launch delta.",
+      "remaining_pre_graph_ops": "prepare_dflash_inputs feeds the separate num_target_tokens-keyed context KV graph (_context_preparer.run), and tilelang_inputs.padding_rows depends on the runtime unpadded live token count when num_reqs is padded to a captured graph descriptor."
+    }
   }
 }

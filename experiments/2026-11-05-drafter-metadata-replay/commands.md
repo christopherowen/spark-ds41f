@@ -111,3 +111,36 @@ volume before preparation. The initial attempt used the source lint environment
 and stopped because it had no pip module; all prepared sources were retained and
 reused. Both attempts, environment setup, the passing check and exact prepared
 inputs are archived under `runs/build-20261106/`. This is CPU preparation only.
+
+## Broader GPU suites and CUDA graph replay trace, 2026-11-06
+
+On Spaceport (`sp8`) at deployment `c6b6d6b297c62132500915068870dadb74cd2e9e`
+and clean source `a2b0ea500dc5022e23c4d6fc667254a806c984dc`, under a scoped
+`sp8:~/spark-hold.json` lease, `taskset -c 0,1`, `nice -n 10`, and container
+limits `--cpus=2 --memory=8g --memory-swap=8g --pids-limit=256 --network=none`:
+
+```sh
+nice -n 10 taskset -c 0,1 python3 experiments/2026-11-05-drafter-metadata-replay/run_gates.py \
+  --deployment-commit c6b6d6b297c62132500915068870dadb74cd2e9e \
+  --output /home/chris/spark-lab/results/drafter-gates-20261106/run-4
+```
+
+Each boot ran four stages in a fresh container and empty cache:
+1. `trace_and_gates.py`: cold-cache compilation of the 5 `metadata_builder`
+   specializations, warm-cache lookup timing, `prepare.freeze()`, before/after
+   `DFlashCudaGraphManager` capture memory comparison, `cudaGraphDebugDotPrint`
+   (`.dot`) graph export, `torch.profiler` replay trace, and 192 exact bitwise
+   tensor comparisons across exact and padded shapes.
+2. Focused `test_b12x_v41_ced_metadata.py -k draft_metadata_graph` in its own
+   process (`3 passed`).
+3. Full V4.1 CED metadata, DFlash input, causality, DCP, CUDA graph manager,
+   DSpark context, and DSpark Markov/sampling suites (`201 passed` + `9 passed`
+   in `test_dspark_topk.py -k "not [True]"`).
+4. Focused TileLang DFlash inputs (`46 passed`) and greedy/Markov sampling
+   kernels (`129 passed`).
+
+All three earlier setup/collection runs (`attempt-1` missing `keep_graph=True`
+for `.dot` export; `attempt-2` including legacy V4.0 metadata, FP64 gumbel, and
+unmounted `benchmarks.kernels.ced_reference`; `attempt-3` changing directory to
+`/source` ahead of `/opt/spark-ds41f/candidate/vllm`) are preserved alongside
+the passing two-boot run (`boot-1` and `boot-2`) in `runs/gates-20261106/`.

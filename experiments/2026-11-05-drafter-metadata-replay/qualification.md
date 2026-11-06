@@ -5,26 +5,29 @@ Before any GPU job or node operation, read dgx1 `~/spark-hold.json`; yield to it
 holder. Preserve an existing `~/spark-request.json`. At preparation time both an
 active frontend qualification hold and another task's request existed.
 
-1. The three focused GPU metadata cases and the small placement screen passed
-   on two fresh Spaceport boots; see `micro-results.md`. The remaining broader
-   gates below have not run. For any further job, verify the clean source
-   checkout is exactly the `candidate_source` commit in `base.json`. Use the
-   immutable candidate-38 image with only this committed source delta overlaid,
-   or a newly built candidate image with matching source labels. Keep resource
-   limits explicit, a fresh task cache, and every exit/log. Run the new metadata
-   graph cases in two separate processes, then the existing DFlash input,
-   causality, DCP, CED metadata and sampling gates. The focused command inside
-   the prepared environment is:
-
-   ```sh
-   .venv/bin/python -m pytest --noconftest -q tests/v1/attention/test_b12x_v41_ced_metadata.py -k draft_metadata_graph
-   ```
-
-   Require all three cases to execute and pass, exact integer equality on every
-   readable row, and no compilation miss after cache freeze. Add a graph replay
-   trace to confirm metadata kernels are inside the query graph and the eager
-   rebuild is absent. Record graph memory before/after and startup compilation.
-   If a gate fails, retain it and investigate before another candidate.
+1. Completed on two fresh Spaceport boots (`runs/micro-20261106/` and
+   `runs/gates-20261106/`). Using the clean `candidate_source` checkout
+   (`a2b0ea500dc5022e23c4d6fc667254a806c984dc`) overlaid onto the immutable
+   candidate-38 image (`sha256:213ba4df68d06665add7a26260c2321d55854a75b8a51ae71c72d0b97eac814b`)
+   under explicit 2-CPU/8-GiB limits and a scoped `sp8` hold:
+   - `trace_and_gates.py` measured cold-cache startup compilation across all five
+     exercised `metadata_builder` specializations (`94,391.504 ms` on boot 1,
+     `93,430.649 ms` on boot 2; warm lookups `47.088 us` and `47.136 us`; zero
+     incremental specializations added by the candidate; zero late compilation
+     misses after `prepare.freeze()`).
+   - Before/after `DFlashCudaGraphManager` capture across `(5,1), (10,2), (20,4), (40,8), (80,16)`
+     recorded `0` incremental bytes in the CUDA graph pool and `0` bytes difference
+     in allocated tensor memory (`5,120` bytes in both arms).
+   - `cudaGraphDebugDotPrint` dumps (`graph-before-req8.dot` vs `graph-after-req8.dot`)
+     and `torch.profiler` replay traces confirmed `metadata_builder_kernel<<<2,128,0>>>`
+     is captured inside the FULL query graph, `eager_build_calls` dropped from
+     `27` to `0`, host `cuLaunchKernelEx` launches disappeared during replay, and
+     all `192/192` exact bitwise comparisons passed on each boot.
+   - Focused `draft_metadata_graph` (3 passed) and broader GPU suites (388 passed,
+     0 failed per boot across CED metadata, DFlash inputs, DFlash causality,
+     DFlash DCP, CUDA graph manager, DSpark context, and DSpark/TileLang Markov
+     sampling) passed on both fresh boots. All three earlier runner/collection
+     attempts are retained in `runs/gates-20261106/attempt-1..3/`.
 
 2. Full pinned build inputs were prepared on Spaceport and the candidate's
    `bin/spark build check` passed (`runs/build-20261106/`). The image build and

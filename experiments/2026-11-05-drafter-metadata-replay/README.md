@@ -19,7 +19,11 @@ DFlash captures it before attention, then uses the existing FULL-graph fast path
 Context parallelism, model-state metadata overrides, unsupported builders and
 non-FULL execution retain eager metadata construction. Other supported builders
 keep their prior behavior. Graph count and compiler specialization keys do not
-change by design; startup memory and compilation still need measurement.
+change by design. Two-boot Spaceport measurements (`runs/gates-20261106/`) confirm
+zero incremental compiler specializations, zero incremental CUDA graph-pool
+memory (0 bytes difference across captured shapes), and cold-cache compilation of
+the five exercised `metadata_builder` specializations in 94.39 s (boot 1) and
+93.43 s (boot 2), with warm cache lookups completing in 47.09 us and 47.14 us.
 
 Host regressions check refresh-before-query order, mutable buffer contents,
 padded capture shapes, mode/opt-in boundaries and fallback guards. The added CUDA
@@ -29,6 +33,12 @@ reuse, with compilation frozen before capture. All three CUDA cases passed on
 each of two fresh boots; 192 additional exact metadata/consumer comparisons
 passed per boot. [micro-results.md](micro-results.md) records before/after
 timings, alternative placements, the overlap challenge and memory observations.
+Broader GPU suites and CUDA graph replay traces (`runs/gates-20261106/`) also
+passed across two fresh boots (388 passed, 0 failed per boot across DFlash
+inputs, causality, DCP, CED metadata, CUDA graph manager, DSpark context, and
+TileLang/DSpark Markov sampling, plus `.dot` graph dumps and `torch.profiler`
+traces confirming `metadata_builder_kernel` executes inside the FULL query
+graph with zero eager host rebuild calls).
 
 Historical rank-0 traces in
 `experiments/2026-10-26-core-metrics-plan/runs/trace-waits-ports-rank0.txt` show
