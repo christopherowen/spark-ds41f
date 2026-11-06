@@ -245,3 +245,41 @@ python3 experiments/2026-11-05-expert-route-reuse/watch_screen.py \
 The mode/order specification above is a plan, not a receipt of GPU execution.
 All `--apply` serving operations remain separate coordinated commands with the
 named committed profile; this isolated kernel phase requires none.
+
+
+## Test-report interface audit (CPU only)
+
+Before any native execution, review identified that pytest's JUnit report does
+not guarantee a `failure.type` attribute. The expected-old-failure checker now
+requires the exact test identities, exit code 1, four failures, the swizzle
+marker in each failure message and AssertionError in its text. It rejects
+compiler/setup errors and skipped tests. A real CPU pytest fixture intentionally
+emits four matching failures solely to verify the report format; this is not
+an execution of the native source regression. Its XML and output are retained
+as `pytest-format-probe.*`. Four parser tests include corrupted compiler/error,
+skip, count and identity cases. The full preparation suite passes 31 tests.
+
+The report probe ran without GPU/network access, with one CPU/2 GiB inside the
+existing image and a system-site-packages uv environment. The first attempt
+could not use the image's root-owned uv cache; the second could not write the
+report because a guessed container UID differed from the host UID. Both failed
+logs, and the resulting four missing-report unit errors, are retained. The
+successful attempt uses a container-local `UV_CACHE_DIR` and the actual remote
+UID/GID (1002/1002). This changes no serving environment or credentials.
+
+Native runs now retain their JUnit files under each receipt directory. The
+fixed native gate requires all 24 selected tests to pass without skips. The
+kernel source remains f3bfdf8; only the experiment's report handling changed.
+Pinned checkpoint metadata was also verified remotely: revision 1bae0e10,
+config SHA-256 8be45ce0476004a3f529fd896115a4a2e800a129ad2d3ec05b16050f52e21879;
+text geometry and SwiGLU limit match the screen. `checkpoint-geometry.json`
+retains the observed values without weights or prompt data.
+
+Hardware coordination now preserves the explicit Engram, collective-pdl and
+verification-budget reservations in that order. This task has no acquisition
+waiter and no GPU hold/request file. After those reservations, its ready native
+sequence is contract-before, gate-a, default-a, gate-b, default-b, estimated
+30–45 minutes on idle DGX4 with standard cooling/fan control. Each individual
+process has a 45-minute safety cap. An optional non-timing SP8 correctness subjob
+is permitted only when an actual holder owns and executes it. The coordination
+record never overrides a live hold. No GPU results exist at this checkpoint.

@@ -64,7 +64,7 @@ def main():
             hits = [i for i, value in enumerate(result) if value.endswith(destination)]
             assert len(hits) == 1
             result[hits[0]] = str(bundle / 'control_moe.py') + destination
-        result[2:2] = ['--name', name, '--label', 'expert-route-window=' + args.window, '--network', 'none', '--cpus', '2',
+        result[2:2] = ['-v', str(out) + ':/receipt', '--name', name, '--label', 'expert-route-window=' + args.window, '--network', 'none', '--cpus', '2',
                        '--memory', '16g', '--memory-swap', '16g']
         return result + ['--mode', args.mode, '--process-id', args.process_id]
     lab.bundle_command = bounded
@@ -157,6 +157,8 @@ def main():
         if args.mode == 'gate':
             lines = (out / 'output.txt').read_text().splitlines()
             gate = lab.suite_verdict(lines)
+            gate['passed'] = bool(gate['passed'] and re.search(r'\b24 passed\b', gate['summary'])
+                                  and not re.search(r'\b\d+ skipped\b', gate['summary']))
             receipt = json.loads((out / 'verdict.json').read_text())
             receipt.update(gate)
             receipt['passed'] = gate['passed'] and receipt['exit'] == 0

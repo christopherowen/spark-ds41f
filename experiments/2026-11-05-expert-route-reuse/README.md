@@ -209,7 +209,10 @@ serving boots. Default native-code identity supports a proportionate component
 qualification; optional panel speed, model boot/throughput and actual-route
 claims remain separate and unproved until their own evidence exists.
 
-The dual-module CPU rehearsal covers all 16 grouped-GEMM tiers/widths and passes.
+Preparation now passes 31 CPU tests, including an actual pytest-report format
+probe and strict rejection of unrelated failures. Native gates retain JUnit
+receipts and require all 24 selected tests without skips. The dual-module CPU
+rehearsal covers all 16 grouped-GEMM tiers/widths and passes.
 The unchanged SwiGLU helper asks the real GPU for vector width, so the first
 CPU-only attempt stopped with a missing-driver error. Its failed log is kept;
 CPU checks skip that unchanged helper, while native default mode compares it.
