@@ -10,6 +10,7 @@ import os
 from pathlib import Path
 import resource
 import sys
+import traceback
 from types import ModuleType
 
 NAME = '_topk_log_softmax_kernel'
@@ -124,18 +125,56 @@ def run_case(source, setter, consumer, pytest, preexisting=False, postcondition=
                 'consumer_outcome': outcome, 'producer_postcondition': post_outcome}
 
 
+def metadata_first(args):
+    """Persist actual dependency identity before any source/witness assertion."""
+    metadata = {'kind': 'actual_image_pytest_metadata', 'python': sys.version,
+                'executable': sys.executable, 'platform': sys.platform,
+                'witness_sha256': digest(Path(__file__)),
+                'expected_image_id': os.environ.get('EXPECTED_IMAGE_ID'),
+                'gpu_device_paths': sorted(str(p) for p in Path('/dev').glob('nvidia*')),
+                'GPU_or_native_gate_replay': False}
+    try:
+        import pytest
+        import _pytest.monkeypatch
+        metadata.update({'status': 'captured',
+                         'pytest_version': importlib.metadata.version('pytest'),
+                         'pytest_module': {'path': pytest.__file__,
+                                           'sha256': digest(Path(pytest.__file__))},
+                         'pytest_monkeypatch_source': {
+                             'path': _pytest.monkeypatch.__file__,
+                             'sha256': digest(Path(_pytest.monkeypatch.__file__))}})
+    except Exception as error:
+        metadata.update({'status': 'dependency_capture_failed',
+                         'error': type(error).__name__ + ': ' + str(error)})
+    if args.metadata_output:
+        with args.metadata_output.open('x') as stream:
+            json.dump(metadata, stream, indent=2)
+            stream.write('\n')
+    print(json.dumps(metadata), flush=True)
+    if metadata['status'] != 'captured':
+        raise RuntimeError(metadata['error'])
+    if metadata['gpu_device_paths']:
+        raise RuntimeError('CPU witness refuses visible NVIDIA device paths')
+    return pytest, metadata
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument('--before-source', type=Path, required=True)
-    parser.add_argument('--after-source', type=Path, required=True)
+    parser.add_argument('--before-source', type=Path)
+    parser.add_argument('--after-source', type=Path)
+    parser.add_argument('--metadata-only', action='store_true')
+    parser.add_argument('--metadata-output', type=Path)
     parser.add_argument('--output', type=Path)
     args = parser.parse_args()
     if sys.platform != 'linux':
         raise SystemExit('remote Linux CPU area only; no workstation test fallback')
     resource.setrlimit(resource.RLIMIT_AS, (4 * 1024**3, 4 * 1024**3))
     os.sched_setaffinity(0, sorted(os.sched_getaffinity(0))[:1])
-    import pytest
-    import _pytest.monkeypatch
+    pytest, metadata = metadata_first(args)
+    if args.metadata_only:
+        return
+    if args.before_source is None or args.after_source is None:
+        raise RuntimeError('--before-source and --after-source are required for fixture proof')
     before, after = args.before_source.resolve(), args.after_source.resolve()
     for path in UNCHANGED:
         assert (before / path).read_bytes() == (after / path).read_bytes(), path
@@ -158,27 +197,38 @@ def main():
     red = run_case(before, old, consumer, pytest)
     green = run_case(after, new, consumer, pytest, postcondition=postcondition)
     not_hidden = run_case(after, new, consumer, pytest, preexisting=True, postcondition=postcondition)
+    cases = {'original_cleanup_red': red, 'corrected_cleanup_green': green,
+             'preexisting_pollution_not_hidden': not_hidden}
+    # Preserve modern-pytest/non-reproducing outcomes before verdict assertions.
+    print(json.dumps({'kind': 'fixture_case_outcomes', 'cases': cases}), flush=True)
     assert red['real_global_after_cleanup'] and red['consumer_outcome'].startswith('AssertionError:')
     assert not green['real_global_after_cleanup'] and green['consumer_outcome'] == 'pass'
     assert green['producer_postcondition'] == 'pass'
     assert not_hidden['real_global_after_cleanup'] and not_hidden['consumer_outcome'].startswith('AssertionError:')
     assert not_hidden['producer_postcondition'] == 'AssertionError'
-    result = {'status': 'source_fixture_cleanup_witness_passed', 'pytest_version': importlib.metadata.version('pytest'),
-              'pytest_monkeypatch_source': {'path': _pytest.monkeypatch.__file__,
-                                           'sha256': digest(Path(_pytest.monkeypatch.__file__))},
+    result = {'status': 'source_fixture_cleanup_witness_passed',
+              'pytest_version': metadata['pytest_version'],
+              'pytest_monkeypatch_source': metadata['pytest_monkeypatch_source'],
               'source': {'producer_before_sha256': digest(before / PRODUCER),
                          'producer_after_sha256': digest(after / PRODUCER),
                          'runtime_sha256': digest(before / RUNTIME), 'consumer_sha256': digest(before / CONSUMER)},
-              'cases': {'original_cleanup_red': red, 'corrected_cleanup_green': green,
-                        'preexisting_pollution_not_hidden': not_hidden},
+              'cases': cases,
               'GPU_or_native_gate_replay': False,
               'limits': 'Exact setter/getattr/consumer source with real pytest cleanup; fake module/reference objects, no numerical or GPU execution.'}
     if args.output:
         with args.output.open('x') as stream:
             json.dump(result, stream, indent=2)
             stream.write('\n')
-    print(json.dumps(result))
+    print(json.dumps(result), flush=True)
 
 
 if __name__ == '__main__':
-    main()
+    try:
+        main()
+    except Exception as error:
+        # Metadata has already been flushed if dependency capture was reached.
+        print(json.dumps({'status': 'fixture_witness_failed',
+                          'error': type(error).__name__ + ': ' + str(error),
+                          'GPU_or_native_gate_replay': False}), flush=True)
+        traceback.print_exc()
+        raise SystemExit(1)

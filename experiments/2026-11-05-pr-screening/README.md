@@ -57,10 +57,11 @@ no topology, hardware or serving change is made for these source reviews.
 
 C43 built, then failed one lazy-reference assertion at its138-file release gate
 (8103pass/360skip/1fail). No serving/performance phase ran. Independent C36
-restoration passed before the subsequent foreign window. Source review ties the
-failure to a test setter restoring a lazily resolved reference into module
-globals after the extra test files changed process grouping; worker runtime
-bytes are unchanged from C40. A focused, assertion-preserving fixture correction
+restoration passed before the subsequent foreign window. Source review finds a
+test setter that can restore a lazily resolved reference into module globals
+after the extra test files changed process grouping; worker runtime bytes are
+unchanged from C40. Actual-image pytest source and a CPU witness are still
+required before attributing the native failure to that mechanism. A focused, assertion-preserving fixture correction
 is in preparation as C46. Native failed evidence stays failed and immutable.
 C45 compiler correction is source-ready with22 CPU controls, awaiting its final
 validated runtime base and native qualification. C40 remains the qualified base.
