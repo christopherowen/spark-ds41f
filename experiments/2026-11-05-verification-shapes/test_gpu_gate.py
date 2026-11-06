@@ -108,3 +108,38 @@ def test_screen_resume_requires_same_identity_and_untouched_logs(tmp_path, damag
     else:
         with pytest.raises(RuntimeError):
             g.validated_screen(path, "a" * 40, image)
+
+
+def test_boundary_grid_rejects_missing_full_model_path():
+    import copy
+    import importlib.util
+
+    path = Path(__file__).with_name("boundary_grid.py")
+    spec = importlib.util.spec_from_file_location("boundary_grid", path)
+    boundary = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(boundary)
+    shapes = [{"kind": "decode", "num_reqs": 3, "num_tokens": 18, "context_len": 4096}]
+    raw = {
+        "workers": 3,
+        "replays": 2,
+        "shapes": shapes,
+        "grid": [
+            {
+                "shape": {k: v for k, v in shapes[0].items() if k != "kind"},
+                "step_ms": [2.0, 2.1],
+                "forward_ms": [1.0, 1.1],
+                "drafter_ms": [0.5, 0.5],
+                "modes": [[True, 18, 3]] * 2,
+            }
+        ],
+    }
+    boundary.validate_grid(raw, shapes, 2, 3)
+    for modes in ([], [[False, 18, 3]] * 2, [[True, 20, 3]] * 2):
+        wrong = copy.deepcopy(raw)
+        wrong["grid"][0]["modes"] = modes
+        with pytest.raises(RuntimeError, match="full-graph"):
+            boundary.validate_grid(wrong, shapes, 2, 3)
+    wrong = copy.deepcopy(raw)
+    wrong["grid"][0]["drafter_ms"] = []
+    with pytest.raises(RuntimeError, match="samples"):
+        boundary.validate_grid(wrong, shapes, 2, 3)

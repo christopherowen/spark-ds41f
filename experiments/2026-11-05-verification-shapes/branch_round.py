@@ -44,6 +44,51 @@ def check_plan(action: str, output: str, status: int) -> None:
         raise RuntimeError("start plan lacks an unchanged or new engine shape")
 
 
+def validate_script_verdict(step: dict, output: str) -> None:
+    """Some legacy probes report failures in JSON while returning status zero."""
+    scripts = {
+        "experiments/2026-10-12-r6g/token_determinism_text.py": "temperature-0 determinism",
+        "experiments/2026-10-24-tilelang-completion/sampled_digest.py": "seeded temperature-1 digest",
+    }
+    name = step["argv"][0]
+    if name not in scripts:
+        return
+    records = []
+    for line in output.splitlines():
+        try:
+            record = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        if isinstance(record, dict) and record.get("summary") == scripts[name]:
+            records.append(record)
+    if len(records) != 1:
+        raise RuntimeError(f"functional verdict failed or missing: {name}")
+    record = records[0]
+    if name.endswith("token_determinism_text.py"):
+        if record.get("identical") is not True:
+            raise RuntimeError(f"functional verdict failed or missing: {name}")
+        expected = "--no-logprobs" not in step["argv"]
+        if record.get("logprobs") is not expected:
+            raise RuntimeError("determinism probe changed its logprob mode")
+    else:
+        # Match the parent qualification contract: speculative-step RNG inputs
+        # can vary with batching. Keep c8 differences as observations; require
+        # the same isolated request to reproduce its own reference.
+        scenarios = record.get("scenarios")
+        if (
+            type(record.get("identical")) is not bool
+            or not isinstance(scenarios, dict)
+            or set(scenarios) != {"c8", "again"}
+            or not isinstance(scenarios["c8"], dict)
+            or not isinstance(scenarios["c8"].get("differing"), list)
+            or not isinstance(scenarios["again"], dict)
+            or scenarios["again"].get("differing") != []
+        ):
+            raise RuntimeError("sampled isolated-repeat verdict failed or missing")
+        if record["identical"] != (not scenarios["c8"]["differing"]):
+            raise RuntimeError("sampled summary contradicts its scenario verdicts")
+
+
 def require_owner(hold: dict | None, state: dict) -> None:
     if not hold or (hold.get("holder"), hold.get("window")) != (
         HOLDER,
@@ -262,6 +307,7 @@ class Round:
                 raise RuntimeError(
                     f"functional script failed: {step['argv']} (exit {code})"
                 )
+            validate_script_verdict(step, (ROOT / step["out"]).read_text())
             return code
 
         lab.spark_cli = cli

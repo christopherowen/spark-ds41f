@@ -185,3 +185,30 @@ evidence were copied and hash-verified on SP8, and both original commits were
 verified there. That removed 578,605,056 allocated bytes. The shared local
 checkout and caches were not changed. Bulk preparation, tests, build data and
 unfinished work remain remote.
+
+
+### Completed CPU image build (2026-11-06)
+
+The exact native-depth image finished at 01:49:51 UTC from deployment
+`eb46c4f20ea076ff48549a45e615276b1d738d86`, source
+`8dea43f62a149a3aef2be4b24fa1c68e9b33407d`, and tree
+`3f9b475dfcd86aabbc042299131cd38aa3612be0`.
+Its SP8 image identity is
+`sha256:3e03ac089d50d1408272aac0dc32ab134109e228a1d8dc8f8310688ccdb16209`.
+The isolated worker exposed no GPU device paths, used one compile job within
+its two-CPU/24-GiB ceiling, and stopped cleanly. Minimum host available memory
+was 106.48 GiB. Exact commands, all compiler output, inspection and hashes are
+retained under `runs/cpu-build-attempt-2/`.
+
+This completes only CPU build preparation. The image remains unqualified:
+native GPU replay, sanitizers, applicable release tests, serving correctness,
+and repeated performance/memory preservation have not run. No production
+configuration or immutable baseline has changed.
+
+Qualification-only follow-up checks now enforce the experiment's deterministic
+verdicts and sampled isolated repeats before timing, while retaining sampled
+batch differences as observations. The affected-cell grid requires complete
+full-graph and drafter evidence at each requested live shape. It does not claim
+that its existing mode fields expose padded capture sizes. The latest bounded
+CPU preflight is 54 passed, with clean lint, configuration validation and
+`git diff --check`; earlier unsuccessful preflights remain recorded.

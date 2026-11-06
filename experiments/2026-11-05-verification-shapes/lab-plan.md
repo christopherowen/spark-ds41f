@@ -212,3 +212,21 @@ the untouched production service and releasing the hold. The gate process
 also monitors exact ownership and has a systemd runtime cap. A failed remote
 cleanup or restoration retains the hold. This is a job runner, not an automatic
 lease-acquisition waiter; invoke it only after the recorded handoff.
+
+Legacy determinism and sampled-digest probes return process status zero even
+when their JSON verdict reports differences. The branch runner explicitly
+requires deterministic token/logprob invariance and the requested logprob mode.
+For seeded sampling, it preserves the C40 qualification contract: the isolated
+repeat must match; concurrent-batch trajectories are observations because RNG
+inputs include the local speculative step. A sampled batch difference remains
+a limitation, never a passing batch-invariance claim. Missing, ambiguous or
+failed required evidence stops before performance and follows normal restoration.
+This contract is declared before any hardware run; collector output is unchanged.
+The focused shared-runner validation work belongs to the verification-budget
+experiment; this check is confined to this experiment's branch controller.
+
+The boundary grid rejects missing/truncated timing arrays and requires every
+recorded step to use the full graph and reach the drafter at the requested live
+dimensions. Its existing mode fields report live rows/requests, not padded
+capture descriptors; those fields alone do not prove an exact capture size.
+Keep capture-policy evidence and measured model timings distinct.

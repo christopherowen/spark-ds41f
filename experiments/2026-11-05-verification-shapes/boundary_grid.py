@@ -2,6 +2,7 @@
 
 import argparse
 import json
+import math
 import sys
 from pathlib import Path
 
@@ -9,6 +10,31 @@ ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(ROOT))
 from servebench import engine
 from spark_ds41f import bench, lab
+
+
+def validate_grid(raw, shapes, replays, workers):
+    """Require every requested model step to reach the full graph and drafter."""
+    if (
+        raw.get("workers") != workers
+        or raw.get("replays") != replays
+        or raw.get("shapes") != shapes
+        or len(raw.get("grid", [])) != len(shapes)
+    ):
+        raise RuntimeError("engine grid identity or shape count differs")
+    for requested, timed in zip(shapes, raw["grid"]):
+        expected = {k: v for k, v in requested.items() if k != "kind"}
+        if timed.get("shape") != expected:
+            raise RuntimeError("engine returned a different requested shape")
+        mode = [True, requested["num_tokens"], requested["num_reqs"]]
+        if timed.get("modes") != [mode] * replays:
+            raise RuntimeError("engine did not record every full-graph model step")
+        for key in ("step_ms", "forward_ms", "drafter_ms"):
+            values = timed.get(key, [])
+            if len(values) != replays or any(
+                type(v) not in (int, float) or not math.isfinite(v) or v <= 0
+                for v in values
+            ):
+                raise RuntimeError(f"incomplete or invalid engine samples: {key}")
 
 
 def main():
@@ -51,7 +77,13 @@ def main():
         if problems:
             raise RuntimeError(str(problems))
         raw = engine.run(args.url, shapes, replays=args.replays, warmup=2, settle=1)
-        record.update(raw=raw, engine=engine.summarize(raw))
+        record["raw"] = raw
+        validate_grid(raw, shapes, args.replays, len(nodes["nodes"]))
+        record["engine"] = engine.summarize(raw)
+        record["execution_evidence"] = {
+            "full_graph_and_drafter_every_step": True,
+            "dimensions": "live requests/tokens; graph padding is not reported",
+        }
         watch.check()
         current = lab.read_hold()
         if not current or (current.get("holder"), current.get("window")) != (

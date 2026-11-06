@@ -209,3 +209,76 @@ def test_remote_gate_refuses_other_task_names(tmp_path, monkeypatch):
     with pytest.raises(RuntimeError, match="identity differs"):
         round.stop_gate()
     action.assert_not_called()
+
+
+@pytest.mark.parametrize("verdict", [False, None, 1, "true"])
+def test_zero_exit_probe_cannot_hide_failed_verdict(verdict):
+    with pytest.raises(RuntimeError, match="verdict failed"):
+        r.validate_script_verdict(
+            {"argv": ["experiments/2026-10-12-r6g/token_determinism_text.py"]},
+            json.dumps(
+                {
+                    "summary": "temperature-0 determinism",
+                    "identical": verdict,
+                }
+            ),
+        )
+
+
+def test_missing_or_duplicate_probe_verdict_refused():
+    step = {"argv": ["experiments/2026-10-12-r6g/token_determinism_text.py"]}
+    passed = json.dumps(
+        {
+            "summary": "temperature-0 determinism",
+            "identical": True,
+            "logprobs": True,
+        }
+    )
+    for output in ("", "{broken", passed + "\n" + passed):
+        with pytest.raises(RuntimeError, match="verdict failed"):
+            r.validate_script_verdict(step, output)
+    r.validate_script_verdict(step, passed)
+
+
+@pytest.mark.parametrize("greedy", [False, True])
+def test_determinism_requires_the_requested_logprob_mode(greedy):
+    step = {
+        "argv": ["experiments/2026-10-12-r6g/token_determinism_text.py"]
+        + (["--no-logprobs"] if greedy else [])
+    }
+    record = {
+        "summary": "temperature-0 determinism",
+        "identical": True,
+        "logprobs": not greedy,
+    }
+    r.validate_script_verdict(step, json.dumps(record))
+    record["logprobs"] = greedy
+    with pytest.raises(RuntimeError, match="logprob mode"):
+        r.validate_script_verdict(step, json.dumps(record))
+
+
+@pytest.mark.parametrize("again", [None, {}, {"differing": None}, {"differing": [0]}])
+def test_sampled_requires_isolated_repeat(again):
+    step = {"argv": ["experiments/2026-10-24-tilelang-completion/sampled_digest.py"]}
+    record = {
+        "summary": "seeded temperature-1 digest",
+        "identical": False,
+        "scenarios": {"c8": {"differing": [0]}, "again": again},
+    }
+    with pytest.raises(RuntimeError, match="isolated-repeat"):
+        r.validate_script_verdict(step, json.dumps(record))
+
+
+def test_sampled_batch_observation_is_retained_without_claiming_invariance():
+    step = {"argv": ["experiments/2026-10-24-tilelang-completion/sampled_digest.py"]}
+    record = {
+        "summary": "seeded temperature-1 digest",
+        "identical": False,
+        "scenarios": {"c8": {"differing": [0]}, "again": {"differing": []}},
+    }
+    output = json.dumps(record)
+    r.validate_script_verdict(step, output)
+    assert json.loads(output)["identical"] is False
+    record["identical"] = True
+    with pytest.raises(RuntimeError, match="contradicts"):
+        r.validate_script_verdict(step, json.dumps(record))
