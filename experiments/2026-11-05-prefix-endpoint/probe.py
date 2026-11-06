@@ -20,11 +20,12 @@ def digest(value):
     return hashlib.sha256(json.dumps(value, sort_keys=True).encode()).hexdigest()
 
 
-def post(url, body):
+def post(url, body, request_id=None):
     require_window(WINDOW_STATE)
-    request = urllib.request.Request(
-        url, data=json.dumps(body).encode(), headers={"Content-Type": "application/json"}
-    )
+    headers = {"Content-Type": "application/json"}
+    if request_id is not None:
+        headers["X-Request-Id"] = request_id
+    request = urllib.request.Request(url, data=json.dumps(body).encode(), headers=headers)
     return urllib.request.urlopen(request, timeout=900)
 
 
@@ -36,14 +37,15 @@ def tokenize(url, model, messages, tools):
 def request(url, model, prompt, salt, label, cancel=False):
     started = time.monotonic()
     receipt = {"label": label, "prompt_tokens": len(prompt), "prompt_sha256": digest(prompt),
-               "cache_salt": salt, "token_ids": [], "logprobs": [], "ttft_s": None}
+               "cache_salt": salt, "client_request_id": f"prefix-{salt}-{label}", "token_ids": [], "logprobs": [], "ttft_s": None}
     try:
         with post(url + "/v1/completions", {
             "model": model, "prompt": prompt, "cache_salt": salt,
             "temperature": 0, "max_tokens": 64, "ignore_eos": True,
             "logprobs": 1, "return_token_ids": True, "stream": True,
             "stream_options": {"include_usage": True},
-        }) as response:
+        }, request_id=receipt["client_request_id"]) as response:
+            receipt["response_request_id"] = getattr(response, "headers", {}).get("X-Request-Id")
             if cancel:
                 time.sleep(0.2)
                 receipt["cancelled_by_client"] = True
@@ -52,6 +54,8 @@ def request(url, model, prompt, salt, label, cancel=False):
                     if not line.startswith(b"data: ") or line.strip() == b"data: [DONE]":
                         continue
                     data = json.loads(line[6:])
+                    if data.get("id"):
+                        receipt["response_id"] = data["id"]
                     if data.get("usage"):
                         receipt["usage"] = data["usage"]
                     for choice in data.get("choices", []):
@@ -67,6 +71,7 @@ def request(url, model, prompt, salt, label, cancel=False):
             receipt["cached_tokens"] = usage["prompt_tokens_details"]["cached_tokens"]
             receipt["uncached_tokens"] = usage["prompt_tokens"] - receipt["cached_tokens"]
             assert usage["prompt_tokens"] == len(prompt)
+            assert 0 <= receipt["cached_tokens"] <= len(prompt)
             assert len(receipt["token_ids"]) == len(receipt["logprobs"]) == 64
             assert receipt["ttft_s"] is not None
     except Exception as error:
@@ -105,6 +110,8 @@ def main():
         stream.flush()
         if "error" in receipt:
             failures.append(receipt["label"] + ": " + receipt["error"])
+        elif "cold" in receipt["label"] and receipt.get("cached_tokens") != 0:
+            failures.append(receipt["label"] + " was not cold")
         return receipt
 
     def compare(a, b):

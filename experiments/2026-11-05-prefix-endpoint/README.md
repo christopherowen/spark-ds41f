@@ -156,7 +156,7 @@ The exact upstream PR source also passes 275 CPU cache-manager tests (four known
 HiSparse cases deselected), recorded in `runs/upstream-pr-cpu.txt`. The controlled
 serving specification and restored-service workflow are in `hardware-plan.md`.
 
-The window-aware harness and restoration helper pass 18 CPU tests; the current
+The window-aware harness and restoration helper pass 20 CPU tests; the current
 comparison plan and offline TP3 doctor also pass. These are preparation checks, not
 hardware gains. Heartbeats must be written atomically so concurrent request checks
 never see a partial hold file.

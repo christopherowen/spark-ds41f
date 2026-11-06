@@ -126,3 +126,33 @@ keeps the hold. `--restore-now` uses the identical procedure at normal completio
 CPU tests cover foreign-window refusal, stale leases, refused/changed-shape plans,
 restore ordering and failed-sync hold retention. They do not replace the required
 actual pre-window state capture, plan inspection and final live restore check.
+
+## Scoped performance-preservation guard
+
+A cache-retention repair with preserved performance is acceptable; a speedup is not
+required. The old policy does not produce wrong model tokens in this reproducer:
+it violates the intended two-endpoint retention invariant and repeats avoidable
+work. Do not relabel that as a model-output correctness failure.
+
+On both candidate comparison boots, run `runtime-guard-suite.json` with the existing
+`bin/spark bench --suite` command under `window_run.py --window-state ... --`.
+Use the named candidate arm profile, `--compare none`, a unique output directory,
+and preserve its normal identity, cooling, fan, memory and thermal checks. Maintain
+an activity marker until the benchmark child is confirmed finished. The wrapper
+adds only ownership/heartbeat checks; it does not duplicate GPU telemetry.
+
+The subset copies the exact existing 32K/128K/256K/512K/1M cold-prefill step and
+distinct c1/c8/c16 steps. C1/c8 are greedy; c16 uses the recorded sampled settings.
+Both control and candidate comparison aliases enable the same dev-mode API as the
+recorded parent; there is no between-arm runtime-setting difference.
+`runtime-guard-references.json` verifies each selected step definition against both
+recorded parent boots. Compare the individual steps using the repository report
+functions and A/A floors (c1 0.35%, c8 0.39%, c16 0.43%). Do not compare mismatched
+whole-suite hashes or rerun those recorded parent/released workloads.
+
+Keep incremental warm-TTFT causal comparisons separate from these preservation
+guards. A confidence interval that still permits a material regression is
+inconclusive; including zero alone does not establish preservation. Report the
+applicable repository margin/noise bound, observed repeat drift and any residual
+uncertainty. Do not let unproved optional dense-retention or private-snapshot tuning
+block an otherwise evidenced repair.
