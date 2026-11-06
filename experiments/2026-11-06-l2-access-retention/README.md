@@ -59,7 +59,7 @@ owned by the probe. Do not put limit changes or context resets on the serving
 step path. No runtime candidate has yet been implemented.
 
 GPU execution requires exclusive ownership of the dgx1 hold and the host GPU
-lock. Preserve the pending normalization request. This experiment has no
+lock. Preserve every preceding request. This experiment has no
 authority to change an existing holder's record.
 
 ## Commands and results
@@ -68,6 +68,47 @@ Preparation: `bin/spark doctor` initially refused the new checkout because it
 has no ignored site map. No GPU operation or serving change was attempted.
 CPU-only container introspection first used nonexistent `python`; repeated
 with `python3` and succeeded. These are preparation errors, not GPU results.
+
+Prepared in a separate clean deployment checkout on dgx4, detached at each
+published experiment commit. The capability binary was compiled without GPU
+execution, with:
+
+```sh
+flock -n /tmp/spark-cpu-analysis.lock taskset -c 0,1 \
+  /usr/local/cuda/bin/nvcc -std=c++17 -O2 -arch=sm_121 \
+  /home/swank/spark-lab/l2-access-retention/checkout/experiments/2026-11-06-l2-access-retention/capability.cu \
+  -o /home/swank/spark-lab/l2-access-retention/bin/capability-6ad22720
+```
+
+Its SHA-256 is
+`99760b979db6dceea6a3f4f2f495be5e16b3c8ca376fc5d583d6a6dc850e5127`.
+The node runner verifies that binary, the clean checkout revision, exact hold
+ownership, GPU lock, an empty GPU, memory floor and cooling/fan curve before
+execution. It retains every output, failure and thermal/memory sample under
+`/home/swank/spark-lab/l2-access-retention/boot-<boot>-<revision>/` on dgx4.
+Each process has an 8-minute deadline, a fresh compilation cache, a two-CPU and
+8 GiB container bound, a 16 GiB host memory floor and an 85 C thermal ceiling.
+The checkpoint hub is mounted at its original path so blob symlinks resolve.
+
+Once preceding requests have run, the controller is invoked from a clean,
+published checkout on dgx1 using its full 40-character revision:
+
+```sh
+python3 experiments/2026-11-06-l2-access-retention/run_window.py \
+  --revision "$(git rev-parse HEAD)" --boot 1
+```
+
+It imports the original clean serving checkout's lab guards, verifies the live
+profile, waits for idle, atomically acquires its own hold, and starts the normal
+watchdog. A 20-second heartbeat covers each job. It runs both boots back to back
+unless a pending request requires yielding after boot 1; `--boot 2` resumes in
+a new window. Closing verifies/restores the original profile once. Serving
+checkouts and topology are not changed by this component experiment.
+
+Local checks: `bin/spark doctor` passes after initializing ignored site maps;
+`git diff --check`, shell syntax and Python compilation pass. `bin/spark build
+check` reports the pinned build tree is not prepared. No upstream patch or new
+runtime image is part of this experiment.
 
 GPU results: pending. No speedup, correctness improvement, or performance
 preservation is claimed.
