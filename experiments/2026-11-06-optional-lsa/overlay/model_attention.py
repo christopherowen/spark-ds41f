@@ -1833,6 +1833,26 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase):
         self.n_local_groups = real_groups
         self.n_local_heads = real_heads
 
+    def _sp_wo_rank_groups(self) -> tuple[int, ...]:
+        """Trimmed WO group counts per TP rank on SP-capable attention layers."""
+        tp_size = get_tensor_model_parallel_world_size()
+        if (
+            tp_size <= 1
+            or getattr(self, "is_draft", False)
+            or getattr(self, "is_ced_decoder", False)
+        ):
+            return ()
+        n_groups = getattr(self, "n_groups", self.n_local_groups * tp_size)
+        hf = getattr(getattr(self.config, "model_config", None), "hf_config", None)
+        orig_groups = getattr(hf, "original_o_groups", n_groups)
+        padded_groups = n_groups // tp_size
+        if orig_groups >= n_groups:
+            return (self.n_local_groups,) * tp_size
+        return tuple(
+            max(0, min(orig_groups - r * padded_groups, padded_groups))
+            for r in range(tp_size)
+        )
+
     def setup_wo_projection(self):
         self._trim_padded_groups()
         groups = self.n_local_groups
@@ -1866,18 +1886,30 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase):
         self._wo_projection_weights = TileLangWOProjection(
             self.wo_a, self.wo_b, groups=groups
         )
+        enable_sp = getattr(self._wo_projection_weights, "enable_sp", None)
+        if enable_sp is not None:
+            enable_sp(self._sp_wo_rank_groups())
 
     def _o_proj(self, o, sp_rows=None):
         """The TileLang WO projection of WO-A's input ``o``, which the attention
         kernels store already rotated back and through ``act_quant``.
 
-        A sequence-parallel step projects through ``project_reduce_scatter``: in
-        slices, and as unreduced rank-order parts when the step keeps them, so a
-        row's sum over ranks is the non-SP step's all-reduce."""
+        A sequence-parallel step on an encoder layer exchanges WO-A's native MXFP8
+        ``o_lora`` output and projects each rank's WO-B shard on local rows into
+        rank-order parts; layers without bound SP shards fall back to
+        ``project_reduce_scatter``."""
         rows, hidden = o.shape[0], self.hidden_size
         if sp_rows is not None:
             if rows != sp_rows.num_tokens:
                 raise ValueError(f"V4.1 SP WO expects {sp_rows.num_tokens} rows")
+            then = lambda: l2_prefetch.issue(self._l2pf_ffn, rows)
+            can_project_sp = getattr(
+                self._wo_projection_weights, "can_project_sp", None
+            )
+            if can_project_sp is not None and can_project_sp(sp_rows):
+                return self._wo_projection_weights.project_sp(
+                    o, sp_rows, then=then
+                )
 
             def project(start, stop, out):
                 self._wo_projection_weights(o[start:stop], out)
@@ -1888,7 +1920,7 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase):
                 torch.bfloat16,
                 o.device,
                 slices=sp_prefill.wo_slices(rows),
-                then=lambda: l2_prefetch.issue(self._l2pf_ffn, rows),
+                then=then,
             )
         local = torch.empty((rows, hidden), dtype=torch.bfloat16, device=o.device)
         self._wo_projection_weights(o, local)

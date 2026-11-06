@@ -18,31 +18,6 @@ STATE_BYTES = 100
 
 
 @tilelang.jit
-def summarize_blocks_reference(page: int, slot_dtype: str = 'int64'):
-    rows,pool_pages,stride = T.dynamic('rows, pool_pages, stride')
-    blocks = page//8
-
-    @T.prim_func
-    def update(Pool: T.StridedTensor([pool_pages,page*STATE_BYTES],[stride,1],T.uint8),
-               Half: T.StridedTensor([pool_pages,page*STATE_BYTES//2],[stride//2,1],T.bfloat16),
-               Slots: T.Tensor([rows],slot_dtype)):
-        with T.Kernel(rows,threads=128) as row:
-            means = T.alloc_fragment([blocks,128],T.float32)
-            slot = Slots[row]
-            if (slot >= 0) & (slot%page == page-1) & (slot//page < pool_pages):
-                physical = slot//page
-                T.fill(means,0.)
-                for k in T.serial(8):
-                    for block,d in T.Parallel(blocks,128):
-                        token = block*8+k
-                        means[block,d] += decode(Pool[physical,token*64+d//2],
-                            Pool[physical,page*64+token*4+d//32],d)*.125
-                for block,d in T.Parallel(blocks,128):
-                    Half[physical,page*68//2+block*128+d] = T.cast(means[block,d],T.bfloat16)
-    return update
-
-
-@tilelang.jit
 def summarize_blocks(page: int, slot_dtype: str = 'int64'):
     rows,pool_pages,stride = T.dynamic('rows, pool_pages, stride')
     groups = (page//8)*4

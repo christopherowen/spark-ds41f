@@ -1,30 +1,1057 @@
-# Upstream base: C36 vLLM 6d4e49d1cdbb6513819e47145e0e52fdab327b6b.
-# Requires the ordered thirteen shortlist/wide-coarse/cooperative-summary patches.
-# Rationale: make TileLang LSA a strict opt-in choice via VLLM_DS41_LSA=1 (zero
-# overhead when off), remove internal mode/compact8 sub-optionality in favor of
-# exact BF16 block8 summaries with 512-thread cooperative maintenance, wire
-# raw-wide/direct coarse selection and full PDL chaining into QueryReusePlan,
-# and unify score_width routing across 32K-1M prefill and multi-row decode.
-# Quality: default path is 100% unchanged native indexing (68-byte keys); opt-in
-# path preserves full BF16 block means and FP32 accumulation without downward
-# quantization.
-# Tests: CPU routing/default-off AST & dispatch verification, 512-thread BF16
-# summary bit-identity & init/race checks, declared-call freeze, actual 12-batch
-# score/recall checks, strict unwritten-suffix initcheck, and 2-boot matrix.
-# Upstream status: unpromoted experiment, not submitted upstream.
+From d9767cb34d1ec307b71588a039310426635bbca5 Mon Sep 17 00:00:00 2001
+From: Christopher Owen <3221756+christopherowen@users.noreply.github.com>
+Date: Fri, 6 Nov 2026 11:01:32 +0000
+Subject: [PATCH] feat(dsv41): add opt-in VLLM_DS41_LSA BF16 block8 shortlist
+ indexing
+
+Add opt-in Latent Sparse Attention (VLLM_DS41_LSA=1; default-off 0/unset)
+using non-quantized bfloat16 8-key block means (100 bytes/key) accumulated in
+float32 via 512-thread cooperative summarize_blocks, QueryReusePlan coarse
+scoring, RawWideCoarseTopK (source 1024), DirectCoarseTopK (source_short 512),
+prefill_short (dense 64 at 32K), and unified score_width routing across 32K-1M
+prefill and multi-row decode.
+
+Upstream-base: 19f2c20ed4d64ae22bd009ceacadd85e2a81e354
+Quality: default-off path is 100% unchanged native indexing (68-byte keys);
+opt-in path preserves full BF16 block means and FP32 accumulation without
+downward quantization.
+Tests: pytest -v -p tests.kernels.deepseek_v41_pdl_sources
+tests/models/test_deepseek_v4_1_lsa.py
+tests/models/test_deepseek_v4_1_attention.py across 2 container boots, 7 GPU
+correctness and sanitizer gates, and 2-boot 32K-1M benchmark matrix.
+Upstream-status: local
+---
+ tests/models/test_deepseek_v4_1_lsa.py        | 995 ++++++++++++++++++
+ vllm/models/deepseek_v4_1/attention.py        |  36 +-
+ .../deepseek_v4_1/tilelang/attention.py       | 136 ++-
+ .../deepseek_v4_1/tilelang/block_shortlist.py | 210 ++++
+ .../deepseek_v4_1/tilelang/coarse_merge.py    | 108 ++
+ vllm/models/deepseek_v4_1/tilelang/indexer.py |   6 +-
+ .../deepseek_v4_1/tilelang/paged_shortlist.py |  10 +
+ .../deepseek_v4_1/tilelang/query_reuse.py     | 153 +++
+ .../deepseek_v4_1/tilelang/raw_wide_coarse.py | 141 +++
+ .../tilelang/shortlist_indexer.py             |  47 +
+ .../deepseek_v4_1/tilelang/wide_topk_merge.py | 140 +++
+ 11 files changed, 1962 insertions(+), 20 deletions(-)
+ create mode 100644 tests/models/test_deepseek_v4_1_lsa.py
+ create mode 100644 vllm/models/deepseek_v4_1/tilelang/block_shortlist.py
+ create mode 100644 vllm/models/deepseek_v4_1/tilelang/coarse_merge.py
+ create mode 100644 vllm/models/deepseek_v4_1/tilelang/paged_shortlist.py
+ create mode 100644 vllm/models/deepseek_v4_1/tilelang/query_reuse.py
+ create mode 100644 vllm/models/deepseek_v4_1/tilelang/raw_wide_coarse.py
+ create mode 100644 vllm/models/deepseek_v4_1/tilelang/shortlist_indexer.py
+ create mode 100644 vllm/models/deepseek_v4_1/tilelang/wide_topk_merge.py
+
+diff --git a/tests/models/test_deepseek_v4_1_lsa.py b/tests/models/test_deepseek_v4_1_lsa.py
+new file mode 100644
+index 000000000..f78607017
+--- /dev/null
++++ b/tests/models/test_deepseek_v4_1_lsa.py
+@@ -0,0 +1,995 @@
++# SPDX-License-Identifier: Apache-2.0
++# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
++"""Unit and GPU tests for opt-in VLLM_DS41_LSA BF16 block8 shortlist indexing."""
++
++import ast
++from pathlib import Path
++from types import SimpleNamespace
++
++import pytest
++import torch
++
++
++def _tilelang_dir() -> Path:
++    import vllm.models.deepseek_v4_1.tilelang.attention as tl_attn
++
++    return Path(tl_attn.__file__).resolve().parent
++
++
++def _has_pdl_chain(tree: ast.AST, fn_name: str) -> bool:
++    fn = next(
++        n for n in tree.body if isinstance(n, ast.FunctionDef) and n.name == fn_name
++    )
++    for call in ast.walk(fn):
++        if (
++            isinstance(call, ast.Call)
++            and isinstance(call.func, ast.Attribute)
++            and isinstance(call.func.value, ast.Name)
++            and call.func.value.id == "pdl"
++            and call.func.attr == "chain"
++        ):
++            return True
++    return False
++
++
++def test_lsa_module_cleanliness_and_pdl_invariants():
++    tl_dir = _tilelang_dir()
++    assert not (tl_dir / "direct_shortlist.py").exists()
++    assert not (tl_dir / "compact_shortlist.py").exists()
++
++    si_text = (tl_dir / "shortlist_indexer.py").read_text()
++    si_tree = ast.parse(si_text)
++    si_defs = {
++        n.name
++        for n in si_tree.body
++        if isinstance(n, (ast.FunctionDef, ast.ClassDef))
++    }
++    assert si_defs == {"decode", "remap_blocks"}
++    for removed in (
++        "ShortlistPlan",
++        "centroid_scores",
++        "shortlist_flags",
++        "shortlist_prefix",
++        "shortlist_scatter",
++    ):
++        assert removed not in si_text
++
++    ps_text = (tl_dir / "paged_shortlist.py").read_text()
++    ps_tree = ast.parse(ps_text)
++    ps_defs = {
++        n.name
++        for n in ps_tree.body
++        if isinstance(n, (ast.FunctionDef, ast.ClassDef))
++    }
++    assert ps_defs == {"PageShortlistPlan"}
++    for removed in ("summarize_pages", "page_scores", "page_flags"):
++        assert removed not in ps_text
++
++    bs_text = (tl_dir / "block_shortlist.py").read_text()
++    qr_text = (tl_dir / "query_reuse.py").read_text()
++    cm_text = (tl_dir / "coarse_merge.py").read_text()
++    rw_text = (tl_dir / "raw_wide_coarse.py").read_text()
++    wt_text = (tl_dir / "wide_topk_merge.py").read_text()
++
++    assert "summarize_blocks_reference" not in bs_text
++    for forbidden in (
++        "_e2m1_code",
++        "_mxfp4_byte",
++        "quantize_mxfp4",
++        "CompactShortlistPlan",
++        "summarize_compact",
++    ):
++        assert forbidden not in bs_text
++        assert forbidden not in qr_text
++
++    bs_tree = ast.parse(bs_text)
++    qr_tree = ast.parse(qr_text)
++    cm_tree = ast.parse(cm_text)
++    rw_tree = ast.parse(rw_text)
++    wt_tree = ast.parse(wt_text)
++
++    assert _has_pdl_chain(bs_tree, "summarize_blocks")
++    assert _has_pdl_chain(bs_tree, "block_scores")
++    assert _has_pdl_chain(bs_tree, "block_candidates")
++    assert _has_pdl_chain(qr_tree, "prepared_scores")
++    assert _has_pdl_chain(qr_tree, "prepare_queries")
++    assert _has_pdl_chain(si_tree, "remap_blocks")
++    assert _has_pdl_chain(cm_tree, "raw_pair")
++    assert _has_pdl_chain(rw_tree, "raw_wide_pair")
++    assert _has_pdl_chain(wt_tree, "wide_indexer_topk_merge")
++
++    sb_fn = next(
++        n
++        for n in bs_tree.body
++        if isinstance(n, ast.FunctionDef) and n.name == "summarize_blocks"
++    )
++    threads_vals = [
++        kw.value.value
++        for call in ast.walk(sb_fn)
++        if isinstance(call, ast.Call)
++        for kw in call.keywords
++        if kw.arg == "threads" and isinstance(kw.value, ast.Constant)
++    ]
++    assert threads_vals == [512]
++
++
++@pytest.mark.parametrize("env_val", [None, "0"])
++def test_lsa_default_off_kv_cache_spec_and_plans(monkeypatch, env_val):
++    from vllm.models.deepseek_v4_1.attention import _Cache
++    from vllm.models.deepseek_v4_1.tilelang import attention as tl_attn
++    from vllm.models.deepseek_v4_1.tilelang.indexer import IndexerV41Plan
++    from vllm.models.deepseek_v4_1.tilelang.paged_shortlist import PageShortlistPlan
++
++    if env_val is None:
++        monkeypatch.delenv("VLLM_DS41_LSA", raising=False)
++    else:
++        monkeypatch.setenv("VLLM_DS41_LSA", env_val)
++    tl_attn._index_plan.cache_clear()
++    tl_attn._source_short_plan.cache_clear()
++
++    assert not tl_attn._lsa_enabled()
++
++    dummy_index_cache = SimpleNamespace(
++        block_size=128,
++        kind="index",
++        ratio=2,
++        window=0,
++        draft=False,
++        prefix="model.layers.2.indexer",
++    )
++    index_spec = _Cache.get_kv_cache_spec(
++        dummy_index_cache, SimpleNamespace(model_config=None)
++    )
++    assert index_spec.state_content_bytes == 68
++
++    dummy_swa_cache = SimpleNamespace(
++        block_size=64,
++        kind="swa",
++        ratio=1,
++        window=512,
++        draft=False,
++        prefix="model.layers.2.swa",
++    )
++    swa_spec = _Cache.get_kv_cache_spec(
++        dummy_swa_cache,
++        SimpleNamespace(
++            model_config=SimpleNamespace(
++                hf_config=SimpleNamespace(num_hidden_layers=61)
++            )
++        ),
++    )
++    assert swa_spec.state_content_bytes == 528
++
++    for args in (
++        (16384, 128, False, False),
++        (524288, 128, False, False),
++        (1048576, 256, False, True),
++    ):
++        assert tl_attn._shortlist_options(args[0], args[2], args[3]) is None
++        assert tl_attn._source_short_options(args[0], args[2], args[3]) is None
++        assert tl_attn._source_short_plan(*args) is None
++        assert tl_attn._index_calls(*args) == IndexerV41Plan.calls(
++            args[0], args[1], candidates=args[2], candidate_blocks=args[3]
++        )
++
++    monkeypatch.setattr(
++        tl_attn,
++        "IndexerV41Plan",
++        lambda width, page, *, candidates=False, candidate_blocks=False: SimpleNamespace(
++            kind="native",
++            width=width,
++            page=page,
++            candidates=candidates,
++            candidate_blocks=candidate_blocks,
++        ),
++    )
++    tl_attn._index_plan.cache_clear()
++    for args in (
++        (16384, 128, False, False),
++        (524288, 128, False, False),
++        (1048576, 256, False, True),
++    ):
++        plan = tl_attn._index_plan(*args)
++        assert not isinstance(plan, PageShortlistPlan)
++        assert plan.kind == "native"
++
++
++def test_lsa_opt_in_kv_cache_spec_and_plan_registration(monkeypatch):
++    from vllm.models.deepseek_v4_1.attention import _Cache
++    from vllm.models.deepseek_v4_1.tilelang import attention as tl_attn
++    from vllm.models.deepseek_v4_1.tilelang.block_shortlist import (
++        STATE_BYTES,
++        summarize_blocks,
++    )
++    from vllm.models.deepseek_v4_1.tilelang.indexer import IndexerV41Plan, page_bytes
++    from vllm.models.deepseek_v4_1.tilelang.paged_shortlist import PageShortlistPlan
++    from vllm.models.deepseek_v4_1.tilelang.query_reuse import QueryReusePlan
++
++    monkeypatch.setenv("VLLM_DS41_LSA", "1")
++    tl_attn._index_plan.cache_clear()
++    tl_attn._source_short_plan.cache_clear()
++
++    assert tl_attn._lsa_enabled()
++    assert STATE_BYTES == 100
++    assert issubclass(QueryReusePlan, PageShortlistPlan)
++
++    dummy_index_cache = SimpleNamespace(
++        block_size=128,
++        kind="index",
++        ratio=2,
++        window=0,
++        draft=False,
++        prefix="model.layers.2.indexer",
++    )
++    index_spec = _Cache.get_kv_cache_spec(
++        dummy_index_cache, SimpleNamespace(model_config=None)
++    )
++    assert index_spec.state_content_bytes == 100
++
++    assert tl_attn._shortlist_options(4096, False, False) is None
++    assert tl_attn._shortlist_options(16384, False, False) == {
++        "candidate_blocks": False,
++        "budget": 64,
++        "row_cap": 256,
++    }
++    assert tl_attn._shortlist_options(524288, True, False) is None
++    assert tl_attn._shortlist_options(65536, False, True) is None
++    assert tl_attn._shortlist_options(1048576, False, True) == {
++        "candidate_blocks": True,
++        "budget": 1024,
++        "row_cap": 256,
++    }
++    assert tl_attn._source_short_options(1048576, False, True) == {
++        "candidate_blocks": True,
++        "budget": 512,
++        "row_cap": 256,
++    }
++
++    dense_calls = tl_attn._index_calls(524288, 128, False, False)
++    expected_dense = [
++        *QueryReusePlan.calls(
++            524288, 128, candidate_blocks=False, budget=64, row_cap=256
++        ),
++        *IndexerV41Plan.calls(524288, 128, candidates=False, candidate_blocks=False),
++    ]
++    assert dense_calls == expected_dense
++
++    source_calls = tl_attn._index_calls(1048576, 256, False, True)
++    expected_source = [
++        *QueryReusePlan.calls(
++            1048576, 256, candidate_blocks=True, budget=1024, row_cap=256
++        ),
++        *IndexerV41Plan.calls(1048576, 256, candidates=False, candidate_blocks=True),
++        *QueryReusePlan.calls(
++            1048576, 256, candidate_blocks=True, budget=512, row_cap=256
++        ),
++    ]
++    assert source_calls == expected_source
++
++    # Verify _check_cache_pages and _write_index_keys wiring on DeepseekV41TileLangAttention
++    layer = tl_attn.DeepseekV41TileLangAttention.__new__(
++        tl_attn.DeepseekV41TileLangAttention
++    )
++    torch.nn.Module.__init__(layer)
++    layer.prefix = "model.layers.2.attn"
++    layer.is_ced_decoder = False
++    layer._main_page = 64
++    layer.swa_cache_layer = SimpleNamespace(
++        kv_cache=torch.zeros(4, 64 * 528, dtype=torch.uint8), block_size=64
++    )
++    layer._owner = lambda: SimpleNamespace(
++        kv_cache=torch.zeros(4, 64 * 288, dtype=torch.uint8)
++    )
++    layer.compressor = SimpleNamespace()
++    layer._index_page = 128
++    layer.compress_ratio = 2
++    layer.rotary_emb = SimpleNamespace(cos_sin_cache=torch.zeros(16, 64))
++    layer.indexer = SimpleNamespace(
++        k_norm=SimpleNamespace(weight=torch.ones(128), variance_epsilon=1e-6),
++        k_cache=SimpleNamespace(
++            kv_cache=torch.zeros(4, 128 * 100, dtype=torch.uint8)
++        ),
++    )
++    layer._check_cache_pages()
++
++    monkeypatch.setenv("VLLM_DS41_LSA", "0")
++    layer.indexer.k_cache.kv_cache = torch.zeros(
++        4, page_bytes(128), dtype=torch.uint8
++    )
++    layer._check_cache_pages()
++
++    writes = []
++    summaries = []
++    monkeypatch.setattr(
++        tl_attn,
++        "norm_rope_write_index_keys",
++        lambda *args: writes.append(("norm_rope", len(args))),
++    )
++    monkeypatch.setattr(
++        tl_attn,
++        "write_index_keys",
++        lambda *args: writes.append(("direct", len(args))),
++    )
++    layer._page_summary = lambda pool, half, slots: summaries.append(
++        (pool.shape, half.dtype, tuple(slots.tolist()))
++    )
++    slots = torch.tensor([127, 255], dtype=torch.int64)
++    positions = torch.tensor([0, 1], dtype=torch.int64)
++    layer._write_index_keys(
++        torch.zeros(2, 128, dtype=torch.bfloat16), slots, positions=positions
++    )
++    layer._write_index_keys(
++        torch.zeros(2, 128, dtype=torch.bfloat16), slots, positions=None
++    )
++    assert writes == [("norm_rope", 9), ("direct", 4)]
++    assert len(summaries) == 2
++    assert all(
++        dtype == torch.bfloat16 and s == (127, 255) for _, dtype, s in summaries
++    )
++    assert summarize_blocks is not None
++
++
++def test_lsa_opt_in_32k_to_1m_routing_and_metadata_wiring(monkeypatch):
++    from vllm.models.deepseek_v4_1.tilelang import attention as tl_attn
++    from vllm.models.deepseek_v4_1.tilelang.paged_shortlist import PageShortlistPlan
++
++    class DummyNativePlan:
++        def __init__(self, width, page, *, candidates=False, candidate_blocks=False):
++            self.kind = "native"
++            self.width = width
++            self.page = page
++            self.candidates = candidates
++            self.candidate_blocks = candidate_blocks
++
++        def scratch_specs(self, rows):
++            return (((rows, self.width), torch.int32),)
++
++    class DummyShortlistPlan(PageShortlistPlan):
++        def __init__(
++            self, width, page, *, candidate_blocks=False, budget=None, row_cap=256
++        ):
++            self.kind = "shortlist"
++            self.width = width
++            self.page = page
++            self.candidate_blocks = candidate_blocks
++            self.budget = budget or (512 if candidate_blocks else 64)
++            self.block_budget = self.budget * 8
++            self.row_cap = row_cap
++            self.coarse_kind = (
++                "RawWideCoarseTopK"
++                if self.block_budget == 8192 and width // 8 > 8192
++                else "DirectCoarseTopK"
++                if self.block_budget == 4096 and width // 8 > 4096
++                else "IndexerTopK"
++            )
++
++        def _specs(self, rows):
++            return {
++                "scratch": (
++                    (min(rows, self.row_cap), self.width, self.budget),
++                    torch.int32,
++                )
++            }
++
++    monkeypatch.setenv("VLLM_DS41_LSA", "1")
++    monkeypatch.setattr(tl_attn, "IndexerV41Plan", DummyNativePlan)
++    monkeypatch.setattr(tl_attn, "BlockMeanShortlistPlan", DummyShortlistPlan)
++    monkeypatch.setattr(
++        tl_attn,
++        "current_workspace_manager",
++        lambda: SimpleNamespace(get_simultaneous=lambda *specs: list(specs)),
++    )
++    monkeypatch.setattr(tl_attn, "retain_cuda_graph_capture_resource", lambda *a: None)
++    tl_attn._index_plan.cache_clear()
++    tl_attn._source_short_plan.cache_clear()
++
++    def build_layer(layer_id: int, compress_ratio: int, candidate_blocks: bool):
++        layer = tl_attn.DeepseekV41TileLangAttention.__new__(
++            tl_attn.DeepseekV41TileLangAttention
++        )
++        torch.nn.Module.__init__(layer)
++        layer.layer_id = layer_id
++        layer.candidate_source_layer = 20
++        layer.compress_ratio = compress_ratio
++        layer.is_ced_decoder = False
++        layer.is_index_source = candidate_blocks
++        layer.n_local_heads = 16
++        layer._index_page = 128 if compress_ratio == 2 else 256
++        layer._index_width = (
++            524288 if compress_ratio == 2 else 1048576
++        ) // layer._index_page
++        layer._short_index_shape = (256, 128) if compress_ratio == 2 else None
++        layer._main_page = 64
++        layer._main_width = 16
++        layer.swa_width = 16
++        layer.capacity = 8192
++        layer._decode_capacity = 96
++        layer.swa_cache_layer = SimpleNamespace(block_size=64, kv_cache=torch.zeros(4, 64 * 528, dtype=torch.uint8))
++        layer._owner = lambda: SimpleNamespace(kv_cache=torch.zeros(4, 64 * 288, dtype=torch.uint8))
++        layer.rotary_emb = SimpleNamespace(cos_sin_cache=torch.zeros(16, 64))
++        layer._attention_workspace_specs = {"decode": (), "prefill": ()}
++        layer.config = SimpleNamespace(
++            scheduler_config=SimpleNamespace(max_num_seqs=4),
++            speculative_config=None,
++            compilation_config=SimpleNamespace(max_cudagraph_capture_size=24),
++        )
++        layer.indexer = SimpleNamespace(
++            heads=32,
++            k_cache=SimpleNamespace(
++                kv_cache=torch.zeros(4, layer._index_page * 100, dtype=torch.uint8)
++            ),
++        )
++        layer._active = torch.tensor(
++            [layer._index_width * layer._index_page], dtype=torch.int32
++        )
++        layer.topk_indices_buffer = torch.zeros(256, 512, dtype=torch.int32)
++        monkeypatch.setattr(
++            tl_attn,
++            "_mla_plan",
++            lambda *args: SimpleNamespace(
++                max_rows=8192, decode_max_rows=96, scratch_specs=lambda r: ()
++            ),
++        )
++        layer._tilelang_plans = layer._build_tilelang_plans()
++        return layer
++
++    dense_layer = build_layer(layer_id=2, compress_ratio=2, candidate_blocks=False)
++    source_layer = build_layer(layer_id=20, compress_ratio=1, candidate_blocks=True)
++
++    def dispatch(layer, mode: str, rows: int, score_width: int | None):
++        chosen = {}
++        plans = layer._tilelang()
++        all_plans = [
++            *plans.index.values(),
++            *plans.native_index.values(),
++            *([plans.source_short] if plans.source_short is not None else []),
++        ]
++        for p in all_plans:
++            p.run = lambda *a, _p=p, **kw: chosen.setdefault(
++                "plan",
++                (
++                    _p.kind,
++                    _p.width,
++                    getattr(_p, "budget", None),
++                    getattr(_p, "coarse_kind", None),
++                ),
++            )
++        q = torch.zeros(rows, 32, 64, dtype=torch.uint8)
++        s = torch.zeros(rows, 32, dtype=torch.float32)
++        w = torch.zeros(rows, 32, dtype=torch.bfloat16)
++        pages = torch.zeros(rows, 16, dtype=torch.int32)
++        lengths = torch.full((rows,), score_width or 32768, dtype=torch.int32)
++        out = torch.zeros(rows, 512, dtype=torch.int32)
++        layer._index_chunk(
++            mode,
++            rows,
++            output_indices=out,
++            q_mxfp4=q,
++            q_scales=s,
++            query_weights=w,
++            page_table=pages,
++            cache_lengths=lengths,
++            score_width=score_width,
++        )
++        return chosen["plan"]
++
++    # Dense layer routing across 4K..1M
++    assert dispatch(dense_layer, "prefill_short", 64, 2048) == (
++        "native",
++        16384,
++        None,
++        None,
++    )
++    assert dispatch(dense_layer, "prefill_short", 64, 4096) == (
++        "native",
++        16384,
++        None,
++        None,
++    )
++    assert dispatch(dense_layer, "prefill_short", 64, 8192) == (
++        "shortlist",
++        16384,
++        64,
++        "IndexerTopK",
++    )
++    assert dispatch(dense_layer, "prefill_short", 64, 16384) == (
++        "shortlist",
++        16384,
++        64,
++        "IndexerTopK",
++    )
++    assert dispatch(dense_layer, "prefill_short", 8, 16384) == (
++        "shortlist",
++        16384,
++        64,
++        "IndexerTopK",
++    )
++    assert dispatch(dense_layer, "decode", 1, 16384) == ("native", 524288, None, None)
++    for tokens in (65536, 131072, 262144, 524288, 1048576):
++        sw = tokens // 2
++        assert dispatch(dense_layer, "prefill", 64, sw) == (
++            "shortlist",
++            524288,
++            64,
++            "IndexerTopK",
++        )
++        assert dispatch(dense_layer, "decode", 8, sw) == (
++            "shortlist",
++            524288,
++            64,
++            "IndexerTopK",
++        )
++
++    # Source layer (layer 20) routing across 32K..1M
++    assert dispatch(source_layer, "prefill", 64, 32768) == (
++        "native",
++        1048576,
++        None,
++        None,
++    )
++    assert dispatch(source_layer, "decode", 8, 32768) == (
++        "native",
++        1048576,
++        None,
++        None,
++    )
++    assert dispatch(source_layer, "decode", 1, 32768) == (
++        "native",
++        1048576,
++        None,
++        None,
++    )
++    assert dispatch(source_layer, "prefill", 64, 65536) == (
++        "shortlist",
++        1048576,
++        512,
++        "DirectCoarseTopK",
++    )
++    assert dispatch(source_layer, "decode", 8, 65536) == (
++        "shortlist",
++        1048576,
++        512,
++        "DirectCoarseTopK",
++    )
++    for tokens in (131072, 262144, 524288, 1048576):
++        assert dispatch(source_layer, "prefill", 64, tokens) == (
++            "shortlist",
++            1048576,
++            1024,
++            "RawWideCoarseTopK",
++        )
++        assert dispatch(source_layer, "decode", 8, tokens) == (
++            "shortlist",
++            1048576,
++            1024,
++            "RawWideCoarseTopK",
++        )
++
++    # During CUDA stream capture (score_width=None), decode r=1 uses native_index and r=8 uses shortlist
++    assert dispatch(dense_layer, "decode", 1, None) == ("native", 524288, None, None)
++    assert dispatch(dense_layer, "decode", 8, None) == (
++        "shortlist",
++        524288,
++        64,
++        "IndexerTopK",
++    )
++    assert dispatch(source_layer, "decode", 1, None) == ("native", 1048576, None, None)
++    assert dispatch(source_layer, "decode", 8, None) == (
++        "shortlist",
++        1048576,
++        1024,
++        "RawWideCoarseTopK",
++    )
++
++    # Verify forward_mqa metadata wiring (score_width, prefill_short, stream capture, VLLM_DS41_LSA=0)
++    from vllm.models.deepseek_v4_1 import attention as base_attn
++    from vllm.models.deepseek_v4_1.tilelang import metadata as tl_metadata
++
++    monkeypatch.setattr(tl_metadata, "pages", lambda *a, **kw: None)
++    monkeypatch.setattr(base_attn, "current_workspace_manager", lambda: SimpleNamespace(get_simultaneous=lambda *specs: list(specs)))
++    monkeypatch.setattr(base_attn, "retain_cuda_graph_capture_resource", lambda *a: None)
++    dense_layer.prefix = "model.layers.2.attn"
++    dense_layer.index_source_layer_id = 2
++    dense_layer._context = {"model.layers.2.attn": dense_layer}
++    dense_layer.swa_cache_layer.prefix = "model.layers.2.swa"
++    dense_layer.kv_cache = torch.zeros(4, 64 * 288, dtype=torch.uint8)
++    dense_layer._owner = lambda: dense_layer
++    dense_layer.indexer.k_cache.prefix = "model.layers.2.indexer"
++    dense_layer._index_pages = torch.zeros(4096, 4096, dtype=torch.int32)
++    dense_layer._short_index_pages = torch.zeros(1024, 128, dtype=torch.int32)
++    dense_layer._shared_decode_metadata = lambda swa, main, r, specs, dev: (
++        torch.zeros(r, 16, dtype=torch.int32),
++        torch.zeros(r, dtype=torch.int32),
++        torch.zeros(r, dtype=torch.int32),
++        torch.zeros(r, 16, dtype=torch.int32),
++    )
++    dense_layer._attend = lambda *a, **kw: None
++
++    def run_forward_mqa(rows: int, max_seq_len: int, is_decode: bool, capturing: bool = False):
++        recorded = {}
++        orig_index_chunk = dense_layer._index_chunk
++
++        def spy_index_chunk(mode, count, **kw):
++            recorded["call"] = (mode, count, kw.get("score_width"))
++            return orig_index_chunk(mode, count, **kw)
++
++        monkeypatch.setattr(dense_layer, "_index_chunk", spy_index_chunk)
++        monkeypatch.setattr(torch.cuda, "is_current_stream_capturing", lambda: capturing)
++        meta = SimpleNamespace(
++            is_decode=is_decode,
++            max_seq_len=max_seq_len,
++            num_decode_tokens=rows if is_decode else 0,
++            req_id_per_token=torch.zeros(rows, dtype=torch.int32),
++            cache_lengths=torch.full((rows,), max_seq_len // 2, dtype=torch.int32),
++            block_table=torch.zeros(4, 256, dtype=torch.int32),
++        )
++        ctx = SimpleNamespace(
++            attn_metadata={
++                "model.layers.2.swa": meta,
++                "model.layers.2.attn": meta,
++                "model.layers.2.indexer": meta,
++            }
++        )
++        monkeypatch.setattr(base_attn, "get_forward_context", lambda: ctx)
++        q = torch.zeros(rows, 16, 512, dtype=torch.bfloat16)
++        kv = torch.zeros(rows, 512, dtype=torch.bfloat16)
++        pos = torch.zeros(rows, dtype=torch.int64)
++        out = torch.zeros_like(q)
++        iq = (
++            torch.zeros(rows, 32, 64, dtype=torch.uint8),
++            torch.zeros(rows, 32, dtype=torch.float32),
++            torch.zeros(rows, 32, dtype=torch.bfloat16),
++            None,
++            None,
++        )
++        dense_layer.forward_mqa(q, kv, pos, out, index_query=iq)
++        return recorded["call"]
++
++    monkeypatch.setenv("VLLM_DS41_LSA", "1")
++    assert run_forward_mqa(rows=8, max_seq_len=32768, is_decode=True) == (
++        "prefill_short",
++        8,
++        16384,
++    )
++    assert run_forward_mqa(rows=1, max_seq_len=32768, is_decode=True) == (
++        "decode",
++        1,
++        16384,
++    )
++    assert run_forward_mqa(rows=8, max_seq_len=32768, is_decode=True, capturing=True) == (
++        "decode",
++        8,
++        None,
++    )
++    monkeypatch.setenv("VLLM_DS41_LSA", "0")
++    assert run_forward_mqa(rows=8, max_seq_len=32768, is_decode=True) == (
++        "decode",
++        8,
++        None,
++    )
++
++
++def _decode_mxfp4_pages_reference(pool: torch.Tensor, page: int) -> torch.Tensor:
++    lut = torch.tensor(
++        [0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0],
++        dtype=torch.float32,
++        device=pool.device,
++    )
++    pages = pool.shape[0]
++    raw_bytes = pool[:, : page * 64].view(pages, page, 64).to(torch.int32)
++    scales = pool[:, page * 64 : page * 68].view(pages, page, 4).to(torch.int32)
++    even = raw_bytes & 15
++    odd = (raw_bytes >> 4) & 15
++    codes = torch.stack((even, odd), dim=-1).view(pages, page, 128)
++    mag = codes & 7
++    sign = torch.where((codes & 8) != 0, -1.0, 1.0)
++    scale_f32 = torch.bitwise_left_shift(scales, 23).view(torch.float32)
++    scale_expanded = scale_f32.repeat_interleave(32, dim=-1)
++    decoded = sign * lut[mag] * scale_expanded
++    return decoded.view(pages, page // 8, 8, 128).mean(dim=2).to(torch.bfloat16)
++
++
++@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
++def test_lsa_gpu_summarize_blocks_and_freeze_registration():
++    import tilelang
++    from vllm.models.deepseek_v4_1.tilelang import prepare
++    from vllm.models.deepseek_v4_1.tilelang.block_shortlist import (
++        STATE_BYTES,
++        summarize_blocks,
++    )
++    from vllm.models.deepseek_v4_1.tilelang.query_reuse import QueryReusePlan
++
++    cases = [
++        (16384, 128, False, 64),
++        (65536, 256, True, 512),
++        (131072, 256, True, 1024),
++    ]
++    calls = [prepare.call(summarize_blocks, 128), prepare.call(summarize_blocks, 256)]
++    for width, page, source, budget in cases:
++        calls.extend(
++            QueryReusePlan.calls(width, page, candidate_blocks=source, budget=budget)
++        )
++    tilelang.prepare(calls, num_workers=4)
++
++    gen = torch.Generator(device="cuda").manual_seed(20261106)
++    for page in (128, 256):
++        num_pages = 6
++        pool = torch.zeros(
++            num_pages, page * STATE_BYTES + 128, dtype=torch.uint8, device="cuda"
++        )[:, : page * STATE_BYTES]
++        pool[:, : page * 64] = torch.randint(
++            0,
++            256,
++            (num_pages, page * 64),
++            generator=gen,
++            dtype=torch.int32,
++            device="cuda",
++        ).to(torch.uint8)
++        pool[:, page * 64 : page * 68] = torch.randint(
++            120,
++            132,
++            (num_pages, page * 4),
++            generator=gen,
++            dtype=torch.int32,
++            device="cuda",
++        ).to(torch.uint8)
++
++        # Complete pages 0, 2, 4; page 1 has non-terminal slot; page 3 is untouched.
++        slots = torch.tensor(
++            [page - 1, page + 5, 2 * page + page - 1, -1, 4 * page + page - 1],
++            dtype=torch.int64,
++            device="cuda",
++        )
++        summarize_blocks(page)(pool, pool.view(torch.bfloat16), slots)
++        ref = _decode_mxfp4_pages_reference(pool, page)
++        actual = pool.view(torch.bfloat16)[:, page * 68 // 2 : page * 100 // 2].view(
++            num_pages, page // 8, 128
++        )
++        for p_idx in (0, 2, 4):
++            assert torch.equal(actual[p_idx], ref[p_idx])
++        for p_idx in (1, 3, 5):
++            assert torch.count_nonzero(actual[p_idx]) == 0
++
++
++@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
++@pytest.mark.parametrize(
++    "width,page,source,budget,active_pages",
++    [
++        (16384, 128, False, 64, 80),
++        (65536, 256, True, 512, 160),
++    ],
++)
++def test_lsa_gpu_index_chunk_and_cudagraph_replay(
++    monkeypatch, width, page, source, budget, active_pages
++):
++    from vllm.models.deepseek_v4_1.tilelang import attention as tl_attn
++    from vllm.models.deepseek_v4_1.tilelang.block_shortlist import (
++        STATE_BYTES,
++        summarize_blocks,
++    )
++    from vllm.models.deepseek_v4_1.tilelang.indexer import (
++        CANDIDATE_BLOCKS,
++        IndexerV41Plan,
++    )
++    from vllm.models.deepseek_v4_1.tilelang.query_reuse import QueryReusePlan
++
++    gen = torch.Generator(device="cuda").manual_seed(4100 + page + budget)
++    pool = torch.zeros(
++        active_pages, page * STATE_BYTES + 128, dtype=torch.uint8, device="cuda"
++    )[:, : page * STATE_BYTES]
++    pool[:, : page * 64] = torch.randint(
++        0,
++        256,
++        (active_pages, page * 64),
++        generator=gen,
++        dtype=torch.int32,
++        device="cuda",
++    ).to(torch.uint8)
++    pool[:, page * 64 : page * 68] = torch.randint(
++        120,
++        130,
++        (active_pages, page * 4),
++        generator=gen,
++        dtype=torch.int32,
++        device="cuda",
++    ).to(torch.uint8)
++    complete_slots = (
++        torch.arange(active_pages, dtype=torch.int64, device="cuda") * page + page - 1
++    )
++    summarize_blocks(page)(pool, pool.view(torch.bfloat16), complete_slots)
++
++    native = IndexerV41Plan(width, page, candidate_blocks=source)
++    shortlist = QueryReusePlan(
++        width, page, candidate_blocks=source, budget=budget, row_cap=64
++    )
++
++    rows = 8
++    q = torch.randint(
++        0, 256, (rows, 32, 64), generator=gen, dtype=torch.int32, device="cuda"
++    ).to(torch.uint8)
++    s_exp = torch.randint(
++        122, 129, (rows, 32, 4), generator=gen, dtype=torch.int32, device="cuda"
++    ).to(torch.uint8)
++    s = s_exp.view(torch.float32).reshape(rows, 32)
++    w = torch.randn((rows, 32), generator=gen, dtype=torch.float32, device="cuda").to(
++        torch.bfloat16
++    )
++    table = torch.full((rows, width // page), -1, dtype=torch.int32, device="cuda")
++    table[:, :active_pages] = torch.arange(
++        active_pages, dtype=torch.int32, device="cuda"
++    ).unsqueeze(0)
++    seq_len = active_pages * page - 16
++    lengths = torch.full((rows,), seq_len, dtype=torch.int32, device="cuda")
++    active = torch.tensor([width], dtype=torch.int32, device="cuda")
++
++    buffers = {}
++    for plan in (native, shortlist):
++        specs = tuple(plan.scratch_specs(rows))
++        buffers[specs] = [
++            torch.empty(shape, dtype=dtype, device="cuda") for shape, dtype in specs
++        ]
++    monkeypatch.setattr(
++        tl_attn,
++        "current_workspace_manager",
++        lambda: SimpleNamespace(get_simultaneous=lambda *specs: buffers[tuple(specs)]),
++    )
++    monkeypatch.setattr(tl_attn, "retain_cuda_graph_capture_resource", lambda *a: None)
++
++    layer = tl_attn.DeepseekV41TileLangAttention.__new__(
++        tl_attn.DeepseekV41TileLangAttention
++    )
++    torch.nn.Module.__init__(layer)
++    layer.indexer = SimpleNamespace(k_cache=SimpleNamespace(kv_cache=pool))
++    layer._active = active
++    layer._ready = True
++    layer._cache_pages_checked = True
++
++    # Default-off plan namespace uses native_index directly and is bit-identical to IndexerV41Plan
++    out_default_off = torch.full((rows, 512), -9, dtype=torch.int32, device="cuda")
++    layer._tilelang_plans = SimpleNamespace(
++        index={"decode": native, "prefill": native},
++        native_index={},
++        source_short=None,
++    )
++    cand_native = (
++        torch.full((rows, CANDIDATE_BLOCKS), -9, dtype=torch.int32, device="cuda")
++        if source
++        else None
++    )
++    cand_len_native = (
++        torch.full((rows,), -9, dtype=torch.int32, device="cuda") if source else None
++    )
++    layer._index_chunk(
++        "prefill",
++        rows,
++        output_indices=out_default_off,
++        q_mxfp4=q,
++        q_scales=s,
++        query_weights=w,
++        page_table=table,
++        cache_lengths=lengths,
++        score_width=seq_len,
++        candidate_output=cand_native,
++        candidate_output_lengths=cand_len_native,
++    )
++
++    direct_out = torch.full((rows, 512), -9, dtype=torch.int32, device="cuda")
++    direct_cand = (
++        torch.full((rows, CANDIDATE_BLOCKS), -9, dtype=torch.int32, device="cuda")
++        if source
++        else None
++    )
++    direct_cand_len = (
++        torch.full((rows,), -9, dtype=torch.int32, device="cuda") if source else None
++    )
++    native.run(
++        q,
++        s,
++        w,
++        pool[:, : page * 68],
++        table,
++        lengths,
++        active,
++        out=direct_out,
++        candidate_out=direct_cand,
++        candidate_out_lengths=direct_cand_len,
++        scratch=buffers[tuple(native.scratch_specs(rows))],
++    )
++    assert torch.equal(out_default_off, direct_out)
++    if source:
++        assert torch.equal(cand_native, direct_cand)
++        assert torch.equal(cand_len_native, direct_cand_len)
++
++    # Opt-in CUDA graph capture and replay (original -> empty -> restored)
++    layer._tilelang_plans = SimpleNamespace(
++        index={"decode": shortlist, "prefill": shortlist},
++        native_index={"decode": native, "prefill": native},
++        source_short=shortlist if source and budget == 512 else None,
++    )
++    out_lsa = torch.full((rows, 512), -9, dtype=torch.int32, device="cuda")
++    cand_lsa = (
++        torch.full((rows, CANDIDATE_BLOCKS), -9, dtype=torch.int32, device="cuda")
++        if source
++        else None
++    )
++    cand_len_lsa = (
++        torch.full((rows,), -9, dtype=torch.int32, device="cuda") if source else None
++    )
++
++    layer._index_chunk(
++        "decode",
++        rows,
++        output_indices=out_lsa,
++        q_mxfp4=q,
++        q_scales=s,
++        query_weights=w,
++        page_table=table,
++        cache_lengths=lengths,
++        score_width=None,
++        candidate_output=cand_lsa,
++        candidate_output_lengths=cand_len_lsa,
++    )
++    eager_out = out_lsa.clone()
++    eager_cand = cand_lsa.clone() if source else None
++    eager_cand_len = cand_len_lsa.clone() if source else None
++
++    valid_mask = (eager_out >= 0) & (eager_out < seq_len)
++    assert bool(valid_mask.all().item())
++
++    graph = torch.cuda.CUDAGraph()
++    stream = torch.cuda.Stream()
++    with torch.cuda.stream(stream):
++        layer._index_chunk(
++            "decode",
++            rows,
++            output_indices=out_lsa,
++            q_mxfp4=q,
++            q_scales=s,
++            query_weights=w,
++            page_table=table,
++            cache_lengths=lengths,
++            score_width=None,
++            candidate_output=cand_lsa,
++            candidate_output_lengths=cand_len_lsa,
++        )
++    torch.cuda.synchronize()
++    with torch.cuda.graph(graph, stream=stream):
++        layer._index_chunk(
++            "decode",
++            rows,
++            output_indices=out_lsa,
++            q_mxfp4=q,
++            q_scales=s,
++            query_weights=w,
++            page_table=table,
++            cache_lengths=lengths,
++            score_width=None,
++            candidate_output=cand_lsa,
++            candidate_output_lengths=cand_len_lsa,
++        )
++    torch.cuda.synchronize()
++
++    out_lsa.fill_(-7)
++    if source:
++        cand_lsa.fill_(-7)
++        cand_len_lsa.fill_(-7)
++    graph.replay()
++    torch.cuda.synchronize()
++    assert torch.equal(out_lsa, eager_out)
++    if source:
++        assert torch.equal(cand_lsa, eager_cand)
++        assert torch.equal(cand_len_lsa, eager_cand_len)
++
++    saved_lengths = lengths.clone()
++    lengths.zero_()
++    graph.replay()
++    torch.cuda.synchronize()
++    assert bool((out_lsa == -1).all().item())
++    if source:
++        assert bool((cand_lsa == -1).all().item())
++        assert bool((cand_len_lsa == 0).all().item())
++
++    lengths.copy_(saved_lengths)
++    graph.replay()
++    torch.cuda.synchronize()
++    assert torch.equal(out_lsa, eager_out)
 diff --git a/vllm/models/deepseek_v4_1/attention.py b/vllm/models/deepseek_v4_1/attention.py
-index 5ec7e71af..bb48b4d5f 100644
+index 6a0688030..aabca74a1 100644
 --- a/vllm/models/deepseek_v4_1/attention.py
 +++ b/vllm/models/deepseek_v4_1/attention.py
-@@ -107,11 +107,12 @@ class _Cache(nn.Module, AttentionLayerBase):
+@@ -107,7 +107,12 @@ class _Cache(nn.Module, AttentionLayerBase):
              block_size=self.block_size,
              num_kv_heads=1,
              head_size=512 if self.kind == "swa" else 68,
--            # Experiment storage is part of each admitted physical cache page.
--            state_content_bytes=(528 if self.kind == "swa" else
--                                 (80 if os.environ.get("VLLM_DS41_PAGE_MODE") == "compact8" else
--                                  100 if os.environ.get("VLLM_DS41_PAGE_MODE") == "block8" else 73)
--                                 if "VLLM_DS41_PAGE_SHORTLIST" in os.environ else 68),
+-            state_content_bytes=528 if self.kind == "swa" else 68,
 +            # Optional BF16 block-mean shortlist storage is admitted only when enabled.
 +            state_content_bytes=(
 +                528
@@ -34,7 +1061,7 @@ index 5ec7e71af..bb48b4d5f 100644
              dtype=torch.uint8,
              tokens_per_state=self.ratio,
              cache_dtype_str="b12x_dsv41",
-@@ -1385,9 +1386,10 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase):
+@@ -1381,9 +1386,10 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase):
              index_mode = "decode" if mode == "decode" else "prefill"
              *query, split, reference = index_query
              im = self._query_metadata(metadata[self.indexer.k_cache.prefix])
@@ -46,7 +1073,7 @@ index 5ec7e71af..bb48b4d5f 100644
                  and self.layer_id <= self.candidate_source_layer
                  and not torch.cuda.is_current_stream_capturing()
              ):
-@@ -1397,17 +1399,31 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase):
+@@ -1393,17 +1399,31 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase):
                  )
              chunk_rows = self.DECODE_CHUNK if mode == "decode" else self.INDEX_CHUNK
              index_pages = self._index_pages
@@ -85,33 +1112,26 @@ index 5ec7e71af..bb48b4d5f 100644
              def select(query, first, selected):
                  # Decode requests' rows (global rows below decode_rows) take the
 diff --git a/vllm/models/deepseek_v4_1/tilelang/attention.py b/vllm/models/deepseek_v4_1/tilelang/attention.py
-index d395b844b..acc186e5a 100644
+index ea18104ce..88ff0cc52 100644
 --- a/vllm/models/deepseek_v4_1/tilelang/attention.py
 +++ b/vllm/models/deepseek_v4_1/tilelang/attention.py
-@@ -26,21 +26,7 @@ from vllm.v1.worker.workspace import (
+@@ -13,6 +13,7 @@ metadata arena.
+ """
+ 
+ import functools
++import os
+ from types import SimpleNamespace
+ 
+ import torch
+@@ -25,6 +26,7 @@ from vllm.v1.worker.workspace import (
  )
  
  from . import prepare
--from .paged_shortlist import PageShortlistPlan, summarize_pages, STATE_BYTES
--from .direct_shortlist import DirectPageShortlistPlan
--from .block_shortlist import summarize_blocks, STATE_BYTES as BLOCK_STATE_BYTES
--from .query_reuse import QueryReusePlan as BlockMeanShortlistPlan
--from .compact_shortlist import CompactShortlistPlan, summarize_compact, STATE_BYTES as COMPACT_STATE_BYTES
--
--if os.environ.get("VLLM_DS41_PAGE_MODE") == "block8":
--    STATE_BYTES = BLOCK_STATE_BYTES
--elif os.environ.get("VLLM_DS41_PAGE_MODE") == "compact8":
--    STATE_BYTES = COMPACT_STATE_BYTES
--
--def _summary_kernel():
--    if os.environ.get("VLLM_DS41_PAGE_MODE") == "compact8":
--        return summarize_compact
--    return summarize_blocks if os.environ.get("VLLM_DS41_PAGE_MODE") == "block8" else summarize_pages
 +from .block_shortlist import STATE_BYTES, summarize_blocks
  from .indexer import (
      CANDIDATE_BLOCK,
      CANDIDATE_BLOCKS,
-@@ -52,9 +38,15 @@ from .indexer import (
+@@ -36,9 +38,15 @@ from .indexer import (
      quantize_mxfp4,
      write_index_keys,
  )
@@ -127,38 +1147,16 @@ index d395b844b..acc186e5a 100644
  class DeepseekV41TileLangBackend(DeepseekV41B12xBackend):
      """The V4.1 cache layout and metadata builder, under the TileLang name."""
  
-@@ -84,47 +76,63 @@ def _mla_calls(*shape) -> list:
+@@ -67,15 +75,61 @@ def _mla_calls(*shape) -> list:
+     return SparseMlaV41Plan.calls(*args, **kwargs)
  
  
- def _shortlist_options(width, candidates, candidate_blocks):
--    if (os.environ.get("VLLM_DS41_PAGE_SHORTLIST") != "1" or candidates
--            or width <= (32768 if candidate_blocks else 16384)
--            or (candidate_blocks and os.environ.get("VLLM_DS41_PAGE_NATIVE_SOURCE") == "1")):
++def _shortlist_options(width, candidates, candidate_blocks):
 +    if not _lsa_enabled() or candidates:
 +        return None
 +    budget = 1024 if candidate_blocks else 64
 +    if width <= budget * 64:
-         return None
--    name = "VLLM_DS41_PAGE_SOURCE_BUDGET" if candidate_blocks else "VLLM_DS41_PAGE_DENSE_BUDGET"
--    budget = int(os.environ.get(name, "512" if candidate_blocks else "64"))
--    if budget <= 0 or budget % 8:
--        raise ValueError("shortlist budget must be a positive multiple of eight")
--    row_cap = int(os.environ.get("VLLM_DS41_PAGE_ROWS", "8"))
--    if row_cap <= 0 or row_cap > 256:
--        raise ValueError("shortlist row capacity must be between1 and256")
--    return dict(candidate_blocks=candidate_blocks, budget=budget, row_cap=row_cap)
--
--
--def _shortlist_class():
--    mode = os.environ.get("VLLM_DS41_PAGE_MODE", "")
--    if mode == "compact8":
--        return CompactShortlistPlan
--    if mode == "block8":
--        return BlockMeanShortlistPlan
--    if mode:
--        raise ValueError("unknown page shortlist mode")
--    return (DirectPageShortlistPlan if os.environ.get("VLLM_DS41_PAGE_DIRECT") == "1"
--            else PageShortlistPlan)
++        return None
 +    return dict(candidate_blocks=candidate_blocks, budget=budget, row_cap=256)
 +
 +
@@ -172,35 +1170,30 @@ index d395b844b..acc186e5a 100644
 +    ):
 +        return None
 +    return {**options, "budget": 512}
- 
- 
++
++
  @functools.cache
  def _index_plan(width, page_size, candidates, candidate_blocks):
-     options = _shortlist_options(width, candidates, candidate_blocks)
-     if options is not None:
--        return _shortlist_class()(width, page_size, **options)
--    return IndexerV41Plan(width, page_size, candidates=candidates, candidate_blocks=candidate_blocks)
++    options = _shortlist_options(width, candidates, candidate_blocks)
++    if options is not None:
 +        return BlockMeanShortlistPlan(width, page_size, **options)
-+    return IndexerV41Plan(
-+        width, page_size, candidates=candidates, candidate_blocks=candidate_blocks
-+    )
-+
-+
+     return IndexerV41Plan(
+         width, page_size, candidates=candidates, candidate_blocks=candidate_blocks
+     )
+ 
+ 
 +@functools.cache
 +def _source_short_plan(width, page_size, candidates, candidate_blocks):
 +    options = _source_short_options(width, candidates, candidate_blocks)
 +    if options is None:
 +        return None
 +    return BlockMeanShortlistPlan(width, page_size, **options)
- 
- 
++
++
  def _index_calls(width, page_size, candidates, candidate_blocks) -> list:
-     options = _shortlist_options(width, candidates, candidate_blocks)
-     if options is not None:
--        return [*_shortlist_class().calls(width, page_size, **options),
--                *IndexerV41Plan.calls(width, page_size, candidates=candidates,
--                                      candidate_blocks=candidate_blocks)]
--    return IndexerV41Plan.calls(width, page_size, candidates=candidates, candidate_blocks=candidate_blocks)
+-    """The kernel calls ``_index_plan`` of these arguments makes."""
++    options = _shortlist_options(width, candidates, candidate_blocks)
++    if options is not None:
 +        calls = [
 +            *BlockMeanShortlistPlan.calls(width, page_size, **options),
 +            *IndexerV41Plan.calls(
@@ -214,21 +1207,13 @@ index d395b844b..acc186e5a 100644
 +        if short_options is not None:
 +            calls.extend(BlockMeanShortlistPlan.calls(width, page_size, **short_options))
 +        return calls
-+    return IndexerV41Plan.calls(
-+        width, page_size, candidates=candidates, candidate_blocks=candidate_blocks
-+    )
- 
- 
- class DeepseekV41TileLangAttention(DeepseekV4Attention):
-@@ -193,11 +201,12 @@ class DeepseekV41TileLangAttention(DeepseekV4Attention):
+     return IndexerV41Plan.calls(
+         width, page_size, candidates=candidates, candidate_blocks=candidate_blocks
+     )
+@@ -147,6 +201,12 @@ class DeepseekV41TileLangAttention(DeepseekV4Attention):
                      rope_dim=self.rotary_emb.cos_sin_cache.shape[1],
                  )
              )  # _quantize_index_query
--        if (self.compressor is not None and self.indexer is not None
--                and os.environ.get("VLLM_DS41_PAGE_SHORTLIST") == "1"
--                and not (self.layer_id == self.candidate_source_layer
--                         and os.environ.get("VLLM_DS41_PAGE_NATIVE_SOURCE") == "1")):
--            calls.append(prepare.call(_summary_kernel(), self._index_page))
 +        if (
 +            self.compressor is not None
 +            and self.indexer is not None
@@ -238,15 +1223,11 @@ index d395b844b..acc186e5a 100644
          if self.compressor is not None:
              from .gemm import bf16_shards
  
-@@ -227,11 +236,13 @@ class DeepseekV41TileLangAttention(DeepseekV4Attention):
+@@ -175,6 +235,15 @@ class DeepseekV41TileLangAttention(DeepseekV4Attention):
+         with torch.inference_mode(False):
              self._prepare(self.rotary_emb.cos_sin_cache.device)
          self._tilelang_plans = self._build_tilelang_plans()
-         self._page_summary = (
--            _summary_kernel()(self._index_page)
--            if (self.compressor is not None and self.indexer is not None
--                and os.environ.get("VLLM_DS41_PAGE_SHORTLIST") == "1"
--                and not (self.layer_id == self.candidate_source_layer
--                         and os.environ.get("VLLM_DS41_PAGE_NATIVE_SOURCE") == "1")) else None
++        self._page_summary = (
 +            summarize_blocks(self._index_page)
 +            if (
 +                self.compressor is not None
@@ -254,16 +1235,15 @@ index d395b844b..acc186e5a 100644
 +                and _lsa_enabled()
 +            )
 +            else None
-         )
++        )
  
      def _tilelang(self) -> SimpleNamespace:
-@@ -266,9 +277,13 @@ class DeepseekV41TileLangAttention(DeepseekV4Attention):
+         """This layer's plans (built when its kernels are bound; the cache pages
+@@ -208,7 +277,13 @@ class DeepseekV41TileLangAttention(DeepseekV4Attention):
              caches.append(("indexed", self._owner().kv_cache, self._main_page * 288))
          if self.indexer is not None:
              caches.append(
--                ("index K", self.indexer.k_cache.kv_cache,
--                 self._index_page * STATE_BYTES if "VLLM_DS41_PAGE_SHORTLIST" in os.environ
--                 else page_bytes(self._index_page))
+-                ("index K", self.indexer.k_cache.kv_cache, page_bytes(self._index_page))
 +                (
 +                    "index K",
 +                    self.indexer.k_cache.kv_cache,
@@ -274,7 +1254,7 @@ index d395b844b..acc186e5a 100644
              )
          for name, cache, page in caches:
              if cache.dim() != 2 or cache.dtype != torch.uint8 or cache.shape[1] != page:
-@@ -281,9 +296,17 @@ class DeepseekV41TileLangAttention(DeepseekV4Attention):
+@@ -221,6 +296,18 @@ class DeepseekV41TileLangAttention(DeepseekV4Attention):
          mla_args, index_args, chunks = self._plan_args()
          mla = _mla_plan(*mla_args)
          index = {mode: _index_plan(*args) for mode, args in index_args.items()}
@@ -283,18 +1263,17 @@ index d395b844b..acc186e5a 100644
 +            if "prefill" in index_args
 +            else None
 +        )
-         native_index = {
--            mode: IndexerV41Plan(args[0], args[1], candidates=args[2], candidate_blocks=args[3])
--            for mode, args in index_args.items() if isinstance(index[mode], PageShortlistPlan)
++        native_index = {
 +            mode: IndexerV41Plan(
 +                args[0], args[1], candidates=args[2], candidate_blocks=args[3]
 +            )
 +            for mode, args in index_args.items()
 +            if isinstance(index[mode], PageShortlistPlan)
-         }
++        }
          # The largest scratch each phase borrows: indexing, then the attention
          # metadata arena with the decode route's segment workspace. They are
-@@ -293,13 +316,20 @@ class DeepseekV41TileLangAttention(DeepseekV4Attention):
+         # reserved in the workspace lane this layer runs in, before profiling
+@@ -229,12 +316,20 @@ class DeepseekV41TileLangAttention(DeepseekV4Attention):
          split_rows = min(mla.decode_max_rows, self.capacity)
          self._scratch_reservations = (
              *(plan.scratch_specs(chunks[mode]) for mode, plan in index.items()),
@@ -303,33 +1282,52 @@ index d395b844b..acc186e5a 100644
 +                if source_short is not None
 +                else ()
 +            ),
-             *(plan.scratch_specs(chunks[mode]) for mode, plan in native_index.items()),
++            *(plan.scratch_specs(chunks[mode]) for mode, plan in native_index.items()),
              *(
                  (*metadata_specs, *mla.scratch_specs(split_rows))
                  for metadata_specs in self._attention_workspace_specs.values()
              ),
          )
--        return SimpleNamespace(mla=mla, index=index, native_index=native_index)
+-        return SimpleNamespace(mla=mla, index=index)
 +        return SimpleNamespace(
 +            mla=mla, index=index, native_index=native_index, source_short=source_short
 +        )
  
      def reserve_profile_scratch(self) -> None:
          """Reserve this layer's largest borrows (``_build_tilelang_plans``) in the
-@@ -369,14 +399,23 @@ class DeepseekV41TileLangAttention(DeepseekV4Attention):
+@@ -277,10 +372,14 @@ class DeepseekV41TileLangAttention(DeepseekV4Attention):
+                 self._index_page,
+                 self.compress_ratio,
+             )
+-            return
+-        write_index_keys(
+-            key, self.indexer.k_cache.kv_cache, slot_mapping, self._index_page
+-        )
++        else:
++            write_index_keys(
++                key, self.indexer.k_cache.kv_cache, slot_mapping, self._index_page
++            )
++        page_summary = self.__dict__.get("_page_summary")
++        if page_summary is not None:
++            pool = self.indexer.k_cache.kv_cache
++            page_summary(pool, pool.view(torch.bfloat16), slot_mapping)
+ 
+     def _index_chunk(
+         self,
+@@ -299,10 +398,25 @@ class DeepseekV41TileLangAttention(DeepseekV4Attention):
+         candidate_output=None,
+         candidate_output_lengths=None,
      ):
-         plans = self._tilelang()
-         plan = plans.index[mode]
--        if (mode == "decode" and os.environ.get("VLLM_DS41_PAGE_NATIVE_DECODE") == "1"
--                and isinstance(plan, PageShortlistPlan)):
+-        # The kernels bound their work by each row's live length on device,
+-        # so the host-side ``score_width`` hint has nothing left to trim.
+-        del score_width
+-        plan = self._tilelang().index[mode]
++        plans = self._tilelang()
++        plan = plans.index[mode]
 +        if mode == "decode" and isinstance(plan, PageShortlistPlan) and rows < 2:
-             plan = plans.native_index[mode]
--        # Outside graph capture, the existing conservative prefill extent can
++            plan = plans.native_index[mode]
 +        # Outside graph capture, the existing conservative extent can
-         # prove that every key would be kept. Avoid the entire coarse pipeline.
--        if (score_width is not None and isinstance(plan, PageShortlistPlan)
--                and score_width <= plan.budget * 64 + plan.page - 1):
--            plan = plans.native_index[mode]
++        # prove that every key would be kept. Avoid the entire coarse pipeline.
 +        if (
 +            score_width is not None
 +            and isinstance(plan, PageShortlistPlan)
@@ -347,34 +1345,30 @@ index d395b844b..acc186e5a 100644
              *plan.scratch_specs(rows)
          )
 diff --git a/vllm/models/deepseek_v4_1/tilelang/block_shortlist.py b/vllm/models/deepseek_v4_1/tilelang/block_shortlist.py
-index 2c63a027a..5bf2e328a 100644
---- a/vllm/models/deepseek_v4_1/tilelang/block_shortlist.py
+new file mode 100644
+index 000000000..9e65f0ff8
+--- /dev/null
 +++ b/vllm/models/deepseek_v4_1/tilelang/block_shortlist.py
-@@ -7,16 +7,18 @@ import tilelang
- import tilelang.language as T
- import torch
- 
--from . import prepare
+@@ -0,0 +1,210 @@
++# SPDX-License-Identifier: Apache-2.0
++# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
++"""Eight-key means, ordered shortlist assembly and native fine scoring."""
++import math
++
++import tilelang
++import tilelang.language as T
++import torch
++
 +from . import pdl, prepare
 +from .coarse_merge import DirectCoarseTopK
- from .indexer import IndexerV41Plan, IndexerTopK, CANDIDATE_BLOCKS, CANDIDATE_BLOCK
- from .paged_shortlist import PageShortlistPlan
++from .indexer import IndexerV41Plan, IndexerTopK, CANDIDATE_BLOCKS, CANDIDATE_BLOCK
++from .paged_shortlist import PageShortlistPlan
 +from .raw_wide_coarse import RawWideCoarseTopK
- from .shortlist_indexer import decode, remap_blocks
- 
- STATE_BYTES = 100
- 
- 
- @tilelang.jit
--def summarize_blocks(page: int, slot_dtype: str = 'int64'):
-+def summarize_blocks_reference(page: int, slot_dtype: str = 'int64'):
-     rows,pool_pages,stride = T.dynamic('rows, pool_pages, stride')
-     blocks = page//8
- 
-@@ -40,6 +42,34 @@ def summarize_blocks(page: int, slot_dtype: str = 'int64'):
-     return update
- 
- 
++from .shortlist_indexer import decode, remap_blocks
++
++STATE_BYTES = 100
++
++
 +@tilelang.jit
 +def summarize_blocks(page: int, slot_dtype: str = 'int64'):
 +    rows,pool_pages,stride = T.dynamic('rows, pool_pages, stride')
@@ -403,63 +1397,332 @@ index 2c63a027a..5bf2e328a 100644
 +    return update
 +
 +
- @tilelang.jit
- def block_scores(width: int, page: int, budget: int, block_c: int = 64):
-     rows,pool_pages,stride = T.dynamic('rows, pool_pages, stride')
-@@ -54,6 +84,7 @@ def block_scores(width: int, page: int, budget: int, block_c: int = 64):
-               Active: T.Tensor([1],T.int32), Score: T.Tensor([rows,n],T.bfloat16),
-               Count: T.Tensor([rows],T.int32)):
-         with T.Kernel(ctas,rows,threads=128) as (cta,row):
++@tilelang.jit
++def block_scores(width: int, page: int, budget: int, block_c: int = 64):
++    rows,pool_pages,stride = T.dynamic('rows, pool_pages, stride')
++    n = width//8
++    ctas = min(tilelang.cdiv(n,block_c),128)
++
++    @T.prim_func
++    def score(Q: T.Tensor([rows,32,64],T.uint8), Scale: T.Tensor([rows,32,4],T.uint8),
++              Weight: T.Tensor([rows,32],T.bfloat16),
++              Pool: T.StridedTensor([pool_pages,page*STATE_BYTES//2],[stride,1],T.bfloat16),
++              Table: T.Tensor([rows,width//page],T.int32), Length: T.Tensor([rows],T.int32),
++              Active: T.Tensor([1],T.int32), Score: T.Tensor([rows,n],T.bfloat16),
++              Count: T.Tensor([rows],T.int32)):
++        with T.Kernel(ctas,rows,threads=128) as (cta,row):
 +            pdl.chain()
-             a = T.alloc_shared([block_c,128],T.bfloat16)
-             b = T.alloc_shared([32,128],T.bfloat16)
-             acc = T.alloc_fragment([block_c,32],T.float32)
-@@ -98,6 +129,7 @@ def block_candidates(width: int, page: int, budget: int):
-                  Candidates: T.Tensor([rows,capacity],T.int32),
-                  CandidateLength: T.Tensor([rows],T.int32)):
-         with T.Kernel(rows,threads=128) as row:
++            a = T.alloc_shared([block_c,128],T.bfloat16)
++            b = T.alloc_shared([32,128],T.bfloat16)
++            acc = T.alloc_fragment([block_c,32],T.float32)
++            terms = T.alloc_shared([block_c,32],T.float32)
++            total = T.alloc_fragment([block_c],T.float32)
++            extent = T.min(T.max(Length[row],0),T.max(T.min(Active[0],width),0))
++            full = extent//page*(page//8)
++            count = T.if_then_else(full <= budget,0,full)
++            if (cta == 0) & (T.get_thread_binding() == 0):
++                Count[row] = count
++            if cta*block_c < count:
++                for h,d in T.Parallel(32,128):
++                    b[h,d] = T.cast(decode(Q[row,h,d//2],Scale[row,h,d//32],d),T.bfloat16)
++                for iteration in T.serial(T.ceildiv(T.max(T.ceildiv(count,block_c)-cta,0),ctas)):
++                    start = (cta+iteration*ctas)*block_c
++                    for c,d in T.Parallel(block_c,128):
++                        a[c,d] = 0
++                        if start+c < count:
++                            a[c,d] = Pool[Table[row,(start+c)//(page//8)],
++                                page*68//2+((start+c)%(page//8))*128+d]
++                    T.gemm(a,b,acc,transpose_B=True,clear_accum=True)
++                    for c,h in T.Parallel(block_c,32):
++                        dot = T.max(T.cast(T.cast(acc[c,h],T.bfloat16),T.float32),0.)
++                        terms[c,h] = T.cast(T.cast(T.fmul(dot,T.cast(Weight[row,h],T.float32)),T.bfloat16),T.float32)
++                    T.sync_threads()
++                    T.fill(total,0.)
++                    for h in T.serial(32):
++                        for c in T.Parallel(block_c):total[c] += terms[c,h]
++                    for c in T.Parallel(block_c):
++                        if start+c < count:Score[row,start+c] = T.cast(total[c],T.bfloat16)
++    return score
++
++
++@tilelang.jit
++def block_candidates(width: int, page: int, budget: int):
++    rows = T.dynamic('rows')
++    capacity = (budget//8+8)*8
++
++    @T.prim_func
++    def assemble(Selected: T.Tensor([rows,budget],T.int32),
++                 Length: T.Tensor([rows],T.int32), Active: T.Tensor([1],T.int32),
++                 Candidates: T.Tensor([rows,capacity],T.int32),
++                 CandidateLength: T.Tensor([rows],T.int32)):
++        with T.Kernel(rows,threads=128) as row:
 +            pdl.chain()
-             search = T.alloc_local([2],T.int32)
-             extent = T.min(T.max(Length[row],0),T.max(T.min(Active[0],width),0))
-             visible = T.ceildiv(extent,8)
-@@ -136,7 +168,9 @@ class BlockMeanShortlistPlan(PageShortlistPlan):
-         self.block_budget = self.budget*8
-         self.capacity = (self.budget+8)*64
-         self.score = block_scores(width,page,self.block_budget)
--        self.coarse = IndexerTopK(width//8,self.block_budget)
++            search = T.alloc_local([2],T.int32)
++            extent = T.min(T.max(Length[row],0),T.max(T.min(Active[0],width),0))
++            visible = T.ceildiv(extent,8)
++            full = extent//page*(page//8)
++            partial = visible-full
++            if full <= budget:
++                for i in T.Parallel(capacity):
++                    Candidates[row,i] = T.if_then_else(i < visible,i,-1)
++                if T.get_thread_binding() == 0:CandidateLength[row] = extent
++            else:
++                search[0] = 0
++                search[1] = budget
++                for step in T.serial(budget.bit_length()):
++                    if search[0] < search[1]:
++                        middle = (search[0]+search[1])//2
++                        if Selected[row,middle] < 0:search[1] = middle
++                        else:search[0] = middle+1
++                used = search[0]
++                last = T.if_then_else(used > 0,Selected[row,T.max(used-1,0)],-1)
++                extra = T.cast((extent > 0) & (partial == 0) & (last != visible-1),T.int32)
++                total = used+partial+extra
++                for i in T.Parallel(capacity):
++                    Candidates[row,i] = -1
++                    if i < used:Candidates[row,i] = Selected[row,i]
++                    elif i < used+partial:Candidates[row,i] = full+i-used
++                    elif i < total:Candidates[row,i] = visible-1
++                if T.get_thread_binding() == 0:
++                    CandidateLength[row] = total*8-T.if_then_else(extent > 0,(8-extent%8)%8,0)
++    return assemble
++
++
++class BlockMeanShortlistPlan(PageShortlistPlan):
++    def __init__(self,width,page,*,candidate_blocks=False,budget=None,row_cap=256):
++        self.width,self.page,self.source,self.row_cap = width,page,candidate_blocks,row_cap
++        self.budget = budget or (512 if candidate_blocks else 64)
++        self.block_budget = self.budget*8
++        self.capacity = (self.budget+8)*64
++        self.score = block_scores(width,page,self.block_budget)
 +        self.coarse = (RawWideCoarseTopK(width//8) if self.block_budget == 8192 and width//8 > 8192
 +                       else DirectCoarseTopK(width//8) if self.block_budget == 4096 and width//8 > 4096
 +                       else IndexerTopK(width//8,self.block_budget))
-         self.assemble = block_candidates(width,page,self.block_budget)
-         self.final = IndexerV41Plan(self.capacity,page,candidates=True)
-         if self.source:
-@@ -146,8 +180,11 @@ class BlockMeanShortlistPlan(PageShortlistPlan):
-     @staticmethod
-     def calls(width,page,*,candidate_blocks=False,budget=None,row_cap=256):
-         b = budget or (512 if candidate_blocks else 64)
++        self.assemble = block_candidates(width,page,self.block_budget)
++        self.final = IndexerV41Plan(self.capacity,page,candidates=True)
++        if self.source:
++            self.select_blocks = IndexerTopK(self.capacity,CANDIDATE_BLOCKS,CANDIDATE_BLOCK)
++            self.remap = remap_blocks(self.capacity)
++
++    @staticmethod
++    def calls(width,page,*,candidate_blocks=False,budget=None,row_cap=256):
++        b = budget or (512 if candidate_blocks else 64)
 +        coarse = (RawWideCoarseTopK.calls(width//8) if b*8 == 8192 and width//8 > 8192
 +                  else DirectCoarseTopK.calls(width//8) if b*8 == 4096 and width//8 > 4096
 +                  else IndexerTopK.calls(width//8,b*8))
-         capacity = (b+8)*64
--        calls = [prepare.call(block_scores,width,page,b*8),*IndexerTopK.calls(width//8,b*8),
++        capacity = (b+8)*64
 +        calls = [prepare.call(block_scores,width,page,b*8),*coarse,
-                  prepare.call(block_candidates,width,page,b*8),
-                  *IndexerV41Plan.calls(capacity,page,candidates=True)]
-         if candidate_blocks:
++                 prepare.call(block_candidates,width,page,b*8),
++                 *IndexerV41Plan.calls(capacity,page,candidates=True)]
++        if candidate_blocks:
++            calls += [*IndexerTopK.calls(capacity,CANDIDATE_BLOCKS,CANDIDATE_BLOCK),
++                      prepare.call(remap_blocks,capacity)]
++        return calls
++
++    def _specs(self,rows):
++        r = min(rows,self.row_cap)
++        specs = {'scores':((r,self.width//8),torch.bfloat16),'counts':((r,),torch.int32),
++                 'selected':((r,self.block_budget),torch.int32),'values':((r,self.block_budget),torch.bfloat16),
++                 'candidates':((r,self.capacity//8),torch.int32),'candidate_lengths':((r,),torch.int32)}
++        for name,plan in [('coarse',self.coarse),('final',self.final)]:
++            for i,spec in enumerate(plan.scratch_specs(r)):specs[f'{name}_{i}'] = spec
++        if self.source:
++            specs.update(compact=((r,CANDIDATE_BLOCKS),torch.int32),block_values=((r,CANDIDATE_BLOCKS),torch.bfloat16))
++            for i,spec in enumerate(self.select_blocks.scratch_specs(r)):specs[f'blocks_{i}'] = spec
++        return specs
++
++    def run(self,q,scales,weights,pool,table,lengths,active,candidates=None,candidate_lengths=None,
++            *,out=None,candidate_out=None,candidate_out_lengths=None,scratch=None):
++        if candidates is not None or candidate_lengths is not None:
++            raise ValueError('block summaries cannot consume reindex candidates')
++        if out is None or scratch is None:raise ValueError('outputs and scratch must be admitted')
++        if self.source and (candidate_out is None or candidate_out_lengths is None):
++            raise ValueError('source handoff outputs are required')
++        rows = len(q)
++        specs = self._specs(rows)
++        if len(scratch) != len(specs):raise ValueError('workspace differs from admission')
++        full = dict(zip(specs,scratch))
++        def buffers(name,plan,b):return [b[f'{name}_{i}'] for i in range(len(plan.scratch_specs(1)))]
++        for start in range(0,rows,self.row_cap):
++            end = min(start+self.row_cap,rows)
++            r = end-start
++            current = self._specs(r)
++            b = {name:t.view(-1)[:math.prod(current[name][0])].view(current[name][0]) for name,t in full.items()}
++            qr,sr,wr,tr,lr = q[start:end],scales[start:end],weights[start:end],table[start:end],lengths[start:end]
++            self.score(qr.view(torch.uint8),sr.view(torch.uint8).reshape(r,32,4),wr,
++                       pool.view(torch.bfloat16),tr,lr,active,b['scores'],b['counts'])
++            self.coarse.run(b['scores'],b['counts'],active,b['selected'],b['values'],scratch=buffers('coarse',self.coarse,b))
++            self.assemble(b['selected'],lr,active,b['candidates'],b['candidate_lengths'])
++            _,scores = self.final.run(qr,sr,wr,pool,tr,lr,active,b['candidates'],b['candidate_lengths'],
++                                     out=out[start:end],scratch=buffers('final',self.final,b))
++            if self.source:
++                self.select_blocks.run(scores,b['candidate_lengths'],active,b['compact'],b['block_values'],
++                                       counts=candidate_out_lengths[start:end],scratch=buffers('blocks',self.select_blocks,b))
++                self.remap(b['compact'],b['candidates'],candidate_out[start:end])
++        return out,None
+diff --git a/vllm/models/deepseek_v4_1/tilelang/coarse_merge.py b/vllm/models/deepseek_v4_1/tilelang/coarse_merge.py
+new file mode 100644
+index 000000000..9acae7ebf
+--- /dev/null
++++ b/vllm/models/deepseek_v4_1/tilelang/coarse_merge.py
+@@ -0,0 +1,108 @@
++# SPDX-License-Identifier: Apache-2.0
++# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
++"""Exact source coarse selection without selecting every entry of a segment."""
++import tilelang
++import tilelang.language as T
++import torch
++
++from vllm.models.deepseek_v4_1.tilelang import prepare,pdl
++from vllm.models.deepseek_v4_1.tilelang.indexer import (
++    IndexerTopK,_make,_row_extent,_key16,_value16,_select_macros,_final_writer,
++)
++
++
++@tilelang.jit(pass_configs={tilelang.PassConfigKey.TL_DISABLE_THREAD_STORAGE_SYNC:True})
++def raw_pair(width:int):
++    rows=T.dynamic('rows')
++    topk,threads=4096,512
++    span=2*topk
++    groups=tilelang.cdiv(width,span)
++    final=groups==1
++    threshold,compact=_select_macros(threads,topk)
++    write_final,write_empty=_final_writer(threads,topk,1)
++
++    @T.macro
++    def body(Scores,Lengths,Active,Indices,Values):
++        with T.Kernel(groups,rows,threads=threads) as (g,row):
++            pdl.chain()
++            tx=T.get_thread_binding()
++            keys=T.alloc_shared([span],T.int32)
++            hist=T.alloc_shared([257],T.int32)
++            scan=T.alloc_shared([threads],T.int32)
++            params=T.alloc_shared([4],T.int32)
++            selected=T.alloc_shared([topk],T.int32)
++            selected_keys=T.alloc_shared([topk],T.int32)
++            extent=_row_extent(Lengths,Active,row,width)
++            base=g*span
++            if base < extent:
++                for i in T.serial(span//threads):
++                    j=i*threads+tx
++                    keys[j]=T.if_then_else(base+j < extent,
++                        _key16(Scores[row,T.min(base+j,width-1)]),0)
++                T.sync_threads()
++                threshold(keys,span,tx,hist,scan,params)
++                compact(keys,span//threads,tx,scan,params,selected,selected_keys)
++                total=scan[threads-1]
++                if final:
++                    write_final(Indices,Values,None,None,row,extent,
++                        lambda slot:slot < total,lambda slot:base+selected[slot],
++                        lambda slot:_value16(selected_keys[slot]),params)
++                else:
++                    for i in T.serial(topk//threads):
++                        slot=i*threads+tx
++                        if slot < total:
++                            Indices[row,g*topk+slot]=base+selected[slot]
++                            Values[row,g*topk+slot]=_value16(selected_keys[slot])
++                        else:
++                            Indices[row,g*topk+slot]=-1
++                            Values[row,g*topk+slot]=-T.infinity(T.bfloat16)
++            elif final:
++                write_empty(Indices,Values,None,row)
++
++    @T.prim_func
++    def run(Scores:T.Tensor([rows,width],T.bfloat16),Lengths:T.Tensor([rows],T.int32),
++            Active:T.Tensor([1],T.int32),Indices:T.Tensor([rows,groups*topk],T.int32),
++            Values:T.Tensor([rows,groups*topk],T.bfloat16)):
++        body(Scores,Lengths,Active,Indices,Values)
++    return run
++
++
++class DirectCoarseTopK:
++    """Raw pairs replace the all-entry segment pass and first merge exactly."""
++    def __init__(self,width):
++        self.width=width
++        self.topk=4096
++        self.groups=tilelang.cdiv(width,8192)
++        segments,first,levels=IndexerTopK.routes(width,self.topk)
++        assert segments>=2 and self.groups==levels[0][2]
++        self.raw=raw_pair(width)
++        self.levels=[(_make(kernel),lists,out) for kernel,lists,out in levels[1:]]
++
++    @staticmethod
++    def calls(width):
++        _,_,levels=IndexerTopK.routes(width,4096)
++        return [prepare.call(raw_pair,width),*(kernel for kernel,_,_ in levels[1:])]
++
++    def scratch_specs(self,rows):
++        if self.groups==1:return ()
++        widest=(self.groups*4096,self.levels[0][2]*4096)
++        return tuple(((rows*cols,),dtype) for cols in widest for dtype in (torch.bfloat16,torch.int32))
++
++    def run(self,scores,lengths,active,indices,values,*,scratch=None):
++        rows=len(scores)
++        if self.groups==1:
++            self.raw(scores,lengths,active,indices,values)
++            return indices
++        specs=self.scratch_specs(rows)
++        if scratch is None:scratch=[torch.empty(shape,dtype=dtype,device='cuda') for shape,dtype in specs]
++        assert len(scratch)==4
++        buffers=((scratch[0],scratch[1]),(scratch[2],scratch[3]))
++        def views(buffer,lists):
++            return tuple(t[:rows*lists*4096].view(rows,lists*4096) for t in buffer)
++        first=views(buffers[0],self.groups)
++        self.raw(scores,lengths,active,first[1],first[0])
++        for level,(kernel,lists,outputs) in enumerate(self.levels):
++            work=views(buffers[level%2],lists)
++            if outputs==1:kernel(*work,lengths,active,indices,values)
++            else:kernel(*work,lengths,active,*views(buffers[(level+1)%2],outputs))
++        return indices
+diff --git a/vllm/models/deepseek_v4_1/tilelang/indexer.py b/vllm/models/deepseek_v4_1/tilelang/indexer.py
+index cf0b4d7ad..769ef4c77 100644
+--- a/vllm/models/deepseek_v4_1/tilelang/indexer.py
++++ b/vllm/models/deepseek_v4_1/tilelang/indexer.py
+@@ -1557,10 +1557,14 @@ class IndexerTopK:
+         )
+         fan_in = max(2, _MERGE_KEYS // topk)
+         lists, span = segments, _SEGMENT_ENTRIES
++        merge = indexer_topk_merge_v41
++        if topk > 4096 and group == 1 and not candidates:
++            from .wide_topk_merge import wide_indexer_topk_merge
++            merge = wide_indexer_topk_merge
+         while True:
+             outputs = tilelang.cdiv(lists, fan_in)
+             kernel = prepare.call(
+-                indexer_topk_merge_v41,
++                merge,
+                 width,
+                 topk,
+                 group,
+diff --git a/vllm/models/deepseek_v4_1/tilelang/paged_shortlist.py b/vllm/models/deepseek_v4_1/tilelang/paged_shortlist.py
+new file mode 100644
+index 000000000..bde27d5ff
+--- /dev/null
++++ b/vllm/models/deepseek_v4_1/tilelang/paged_shortlist.py
+@@ -0,0 +1,10 @@
++# SPDX-License-Identifier: Apache-2.0
++# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
++"""Base shortlist plan interface for page-summary indexers."""
++
++
++class PageShortlistPlan:
++    """Buffer-free serving plan base class; caller owns all scratch."""
++
++    def scratch_specs(self, rows):
++        return tuple(self._specs(rows).values())
 diff --git a/vllm/models/deepseek_v4_1/tilelang/query_reuse.py b/vllm/models/deepseek_v4_1/tilelang/query_reuse.py
-index 02d17e1a9..930569278 100644
---- a/vllm/models/deepseek_v4_1/tilelang/query_reuse.py
+new file mode 100644
+index 000000000..930569278
+--- /dev/null
 +++ b/vllm/models/deepseek_v4_1/tilelang/query_reuse.py
-@@ -1,10 +1,28 @@
- # SPDX-License-Identifier: Apache-2.0
- # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
- """Single shared-memory store per mean element; identical score arithmetic."""
+@@ -0,0 +1,153 @@
++# SPDX-License-Identifier: Apache-2.0
++# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
++"""Single shared-memory store per mean element; identical score arithmetic."""
 +import math
 +
- import tilelang
- import tilelang.language as T
--from vllm.models.deepseek_v4_1.tilelang.shortlist_indexer import decode
--from vllm.models.deepseek_v4_1.tilelang.block_shortlist import STATE_BYTES
++import tilelang
++import tilelang.language as T
 +import torch
 +
 +from vllm.models.deepseek_v4_1.tilelang import pdl, prepare
@@ -478,67 +1741,480 @@ index 02d17e1a9..930569278 100644
 +from vllm.models.deepseek_v4_1.tilelang.raw_wide_coarse import RawWideCoarseTopK
 +from vllm.models.deepseek_v4_1.tilelang.shortlist_indexer import decode, remap_blocks
 +
- 
- @tilelang.jit
- def prepared_scores(width: int, page: int, budget: int, block_c: int = 64):
-@@ -20,6 +38,7 @@ def prepared_scores(width: int, page: int, budget: int, block_c: int = 64):
-               Active: T.Tensor([1],T.int32), Score: T.Tensor([rows,n],T.bfloat16),
-               Count: T.Tensor([rows],T.int32)):
-         with T.Kernel(ctas,rows,threads=128) as (cta,row):
++
++@tilelang.jit
++def prepared_scores(width: int, page: int, budget: int, block_c: int = 64):
++    rows,pool_pages,stride = T.dynamic('rows, pool_pages, stride')
++    n = width//8
++    ctas = min(tilelang.cdiv(n,block_c),128)
++
++    @T.prim_func
++    def score(Q: T.Tensor([rows,32,128],T.bfloat16), Scale: T.Tensor([rows,32,4],T.uint8),
++              Weight: T.Tensor([rows,32],T.bfloat16),
++              Pool: T.StridedTensor([pool_pages,page//8,128],[stride,128,1],T.bfloat16),
++              Table: T.Tensor([rows,width//page],T.int32), Length: T.Tensor([rows],T.int32),
++              Active: T.Tensor([1],T.int32), Score: T.Tensor([rows,n],T.bfloat16),
++              Count: T.Tensor([rows],T.int32)):
++        with T.Kernel(ctas,rows,threads=128) as (cta,row):
 +            pdl.chain()
-             a = T.alloc_shared([block_c,128],T.bfloat16)
-             b = T.alloc_shared([32,128],T.bfloat16)
-             acc = T.alloc_fragment([block_c,32],T.float32)
-@@ -64,6 +83,7 @@ def prepare_queries(width:int,page:int,budget:int):
-                Length:T.Tensor([rows],T.int32),Active:T.Tensor([1],T.int32),
-                Decoded:T.Tensor([rows,32,128],T.bfloat16)):
-         with T.Kernel(rows,threads=128) as row:
++            a = T.alloc_shared([block_c,128],T.bfloat16)
++            b = T.alloc_shared([32,128],T.bfloat16)
++            acc = T.alloc_fragment([block_c,32],T.float32)
++            terms = T.alloc_shared([block_c,32],T.float32)
++            total = T.alloc_fragment([block_c],T.float32)
++            extent = T.min(T.max(Length[row],0),T.max(T.min(Active[0],width),0))
++            full = extent//page*(page//8)
++            count = T.if_then_else(full <= budget,0,full)
++            if (cta == 0) & (T.get_thread_binding() == 0):
++                Count[row] = count
++            if cta*block_c < count:
++                T.copy(Q[row,0:32,0:128],b)
++                for iteration in T.serial(T.ceildiv(T.max(T.ceildiv(count,block_c)-cta,0),ctas)):
++                    start = (cta+iteration*ctas)*block_c
++                    for part in T.serial(block_c//(page//8)):
++                        first = start+part*(page//8)
++                        if first < count:
++                            physical = Table[row,first//(page//8)]
++                            T.copy(Pool[physical,0:page//8,0:128],
++                                   a[part*(page//8):(part+1)*(page//8),0:128])
++                        else:
++                            for c,d in T.Parallel(page//8,128):
++                                a[part*(page//8)+c,d] = 0
++                    T.gemm(a,b,acc,transpose_B=True,clear_accum=True)
++                    for c,h in T.Parallel(block_c,32):
++                        dot = T.max(T.cast(T.cast(acc[c,h],T.bfloat16),T.float32),0.)
++                        terms[c,h] = T.cast(T.cast(T.fmul(dot,T.cast(Weight[row,h],T.float32)),T.bfloat16),T.float32)
++                    T.sync_threads()
++                    T.fill(total,0.)
++                    for h in T.serial(32):
++                        for c in T.Parallel(block_c):total[c] += terms[c,h]
++                    for c in T.Parallel(block_c):
++                        if start+c < count:Score[row,start+c] = T.cast(total[c],T.bfloat16)
++    return score
++
++
++@tilelang.jit
++def prepare_queries(width:int,page:int,budget:int):
++    rows = T.dynamic('rows')
++    @T.prim_func
++    def unpack(Q:T.Tensor([rows,32,64],T.uint8),Scale:T.Tensor([rows,32,4],T.uint8),
++               Length:T.Tensor([rows],T.int32),Active:T.Tensor([1],T.int32),
++               Decoded:T.Tensor([rows,32,128],T.bfloat16)):
++        with T.Kernel(rows,threads=128) as row:
 +            pdl.chain()
-             extent = T.min(T.max(Length[row],0),T.max(T.min(Active[0],width),0))
-             if extent//page*(page//8) > budget:
-                 for h,d in T.Parallel(32,128):
-@@ -71,21 +91,15 @@ def prepare_queries(width:int,page:int,budget:int):
-     return unpack
- 
- 
--import math
--import torch
--from vllm.models.deepseek_v4_1.tilelang import prepare
--from vllm.models.deepseek_v4_1.tilelang.block_shortlist import BlockMeanShortlistPlan,block_candidates
--from vllm.models.deepseek_v4_1.tilelang.indexer import IndexerTopK,IndexerV41Plan,CANDIDATE_BLOCKS,CANDIDATE_BLOCK
--from vllm.models.deepseek_v4_1.tilelang.shortlist_indexer import remap_blocks
--
--
- class QueryReusePlan(BlockMeanShortlistPlan):
-     def __init__(self,width,page,*,candidate_blocks=False,budget=None,row_cap=256):
-         self.width,self.page,self.source,self.row_cap = width,page,candidate_blocks,row_cap
-         self.budget = budget or (512 if candidate_blocks else 64)
-         self.block_budget = self.budget*8
-         self.capacity = (self.budget+8)*64
--        self.coarse = IndexerTopK(width//8,self.block_budget)
++            extent = T.min(T.max(Length[row],0),T.max(T.min(Active[0],width),0))
++            if extent//page*(page//8) > budget:
++                for h,d in T.Parallel(32,128):
++                    Decoded[row,h,d] = T.cast(decode(Q[row,h,d//2],Scale[row,h,d//32],d),T.bfloat16)
++    return unpack
++
++
++class QueryReusePlan(BlockMeanShortlistPlan):
++    def __init__(self,width,page,*,candidate_blocks=False,budget=None,row_cap=256):
++        self.width,self.page,self.source,self.row_cap = width,page,candidate_blocks,row_cap
++        self.budget = budget or (512 if candidate_blocks else 64)
++        self.block_budget = self.budget*8
++        self.capacity = (self.budget+8)*64
 +        self.coarse = (RawWideCoarseTopK(width//8) if self.block_budget == 8192 and width//8 > 8192
 +                       else DirectCoarseTopK(width//8) if self.block_budget == 4096 and width//8 > 4096
 +                       else IndexerTopK(width//8,self.block_budget))
-         self.assemble = block_candidates(width,page,self.block_budget)
-         self.final = IndexerV41Plan(self.capacity,page,candidates=True)
-         if self.source:
-diff --git a/vllm/models/deepseek_v4_1/tilelang/shortlist_indexer.py b/vllm/models/deepseek_v4_1/tilelang/shortlist_indexer.py
-index fd0348d7f..19e3655e7 100644
---- a/vllm/models/deepseek_v4_1/tilelang/shortlist_indexer.py
-+++ b/vllm/models/deepseek_v4_1/tilelang/shortlist_indexer.py
-@@ -11,6 +11,7 @@ import tilelang
- import tilelang.language as T
- import torch
- 
-+from . import pdl
- from .indexer import IndexerTopK, IndexerV41Plan, INDEX_TOPK, CANDIDATE_BLOCKS
- 
- CHUNK = 512
-@@ -189,6 +190,7 @@ def remap_blocks(capacity: int):
-               Candidates: T.Tensor([rows,capacity//BLOCK],T.int32),
-               Original: T.Tensor([rows,CANDIDATE_BLOCKS],T.int32)):
-         with T.Kernel(tilelang.cdiv(CANDIDATE_BLOCKS,128),rows,threads=128) as (tile,row):
++        self.assemble = block_candidates(width,page,self.block_budget)
++        self.final = IndexerV41Plan(self.capacity,page,candidates=True)
++        if self.source:
++            self.select_blocks = IndexerTopK(self.capacity,CANDIDATE_BLOCKS,CANDIDATE_BLOCK)
++            self.remap = remap_blocks(self.capacity)
++        self.unpack = prepare_queries(width,page,self.block_budget)
++        self.prepared_score = prepared_scores(width,page,self.block_budget)
++
++    def _specs(self,rows):
++        specs = super()._specs(rows)
++        specs['prepared_q'] = ((min(rows,self.row_cap),32,128),torch.bfloat16)
++        return specs
++
++    @staticmethod
++    def calls(width,page,*,candidate_blocks=False,budget=None,row_cap=256):
++        b = budget or (512 if candidate_blocks else 64)
++        parent = BlockMeanShortlistPlan.calls(width,page,candidate_blocks=candidate_blocks,budget=budget,row_cap=row_cap)
++        return [prepare.call(prepare_queries,width,page,b*8),
++                prepare.call(prepared_scores,width,page,b*8),*parent[1:]]
++
++    def run(self,q,scales,weights,pool,table,lengths,active,candidates=None,candidate_lengths=None,
++            *,out=None,candidate_out=None,candidate_out_lengths=None,scratch=None):
++        if candidates is not None or candidate_lengths is not None:
++            raise ValueError('block summaries cannot consume reindex candidates')
++        if out is None or scratch is None:raise ValueError('outputs and scratch must be admitted')
++        if self.source and (candidate_out is None or candidate_out_lengths is None):
++            raise ValueError('source handoff outputs are required')
++        rows = len(q)
++        specs = self._specs(rows)
++        if len(scratch) != len(specs):raise ValueError('workspace differs from admission')
++        full = dict(zip(specs,scratch))
++        def buffers(name,plan,b):return [b[f'{name}_{i}'] for i in range(len(plan.scratch_specs(1)))]
++        for start in range(0,rows,self.row_cap):
++            end = min(start+self.row_cap,rows)
++            r = end-start
++            current = self._specs(r)
++            b = {name:t.view(-1)[:math.prod(current[name][0])].view(current[name][0]) for name,t in full.items()}
++            qr,sr,wr,tr,lr = q[start:end],scales[start:end],weights[start:end],table[start:end],lengths[start:end]
++            self.unpack(qr.view(torch.uint8),sr.view(torch.uint8).reshape(r,32,4),lr,active,b['prepared_q'])
++            means = pool.view(torch.bfloat16)[:,self.page*68//2:self.page*100//2].view(len(pool),self.page//8,128)
++            self.prepared_score(b['prepared_q'],sr.view(torch.uint8).reshape(r,32,4),wr,
++                                means,tr,lr,active,b['scores'],b['counts'])
++            self.coarse.run(b['scores'],b['counts'],active,b['selected'],b['values'],scratch=buffers('coarse',self.coarse,b))
++            self.assemble(b['selected'],lr,active,b['candidates'],b['candidate_lengths'])
++            _,scores = self.final.run(qr,sr,wr,pool,tr,lr,active,b['candidates'],b['candidate_lengths'],
++                                     out=out[start:end],scratch=buffers('final',self.final,b))
++            if self.source:
++                self.select_blocks.run(scores,b['candidate_lengths'],active,b['compact'],b['block_values'],
++                                       counts=candidate_out_lengths[start:end],scratch=buffers('blocks',self.select_blocks,b))
++                self.remap(b['compact'],b['candidates'],candidate_out[start:end])
++        return out,None
+diff --git a/vllm/models/deepseek_v4_1/tilelang/raw_wide_coarse.py b/vllm/models/deepseek_v4_1/tilelang/raw_wide_coarse.py
+new file mode 100644
+index 000000000..d1472c2e9
+--- /dev/null
++++ b/vllm/models/deepseek_v4_1/tilelang/raw_wide_coarse.py
+@@ -0,0 +1,141 @@
++# SPDX-License-Identifier: Apache-2.0
++# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
++"""Exact top8192 from raw16384-entry tiles; eliminate two select-all stages."""
++import tilelang
++import tilelang.language as T
++import torch
++from . import prepare,pdl
++from .indexer import IndexerTopK,_make,_row_extent,_key16,_value16,_select_macros,_final_writer
++
++@tilelang.jit(pass_configs={tilelang.PassConfigKey.TL_DISABLE_THREAD_STORAGE_SYNC:True})
++def raw_wide_pair(width:int):
++    rows=T.dynamic('rows')
++    topk,threads=8192,512
++    span=2*topk;per=span//threads;steps=threads.bit_length()-1
++    groups=tilelang.cdiv(width,span);final=groups==1
++    threshold,_=_select_macros(threads,topk)
++    _,write_empty=_final_writer(threads,topk,1)
++    @T.macro
++    def block_scan(values, tx):
++        carry = T.alloc_var(T.int32)
++        for s in T.serial(steps):
++            off = 1 << s
++            carry = T.if_then_else(tx >= off, values[T.max(tx-off, 0)], 0)
++            T.sync_threads()
++            values[tx] += carry
++            T.sync_threads()
++
++
++    @T.macro
++    def body(Scores,Lengths,Active,Indices,Values):
++        with T.Kernel(groups,rows,threads=threads) as (g,row):
 +            pdl.chain()
-             for i in T.Parallel(128):
-                 slot = tile*128+i
-                 entry = Selected[row,slot]
++            tx=T.get_thread_binding()
++            keys=T.alloc_shared([span],T.int32)
++            hist=T.alloc_shared([257],T.int32)
++            scan=T.alloc_shared([threads],T.int32)
++            params=T.alloc_shared([4],T.int32)
++            extent=_row_extent(Lengths,Active,row,width)
++            base=g*span
++            if base<extent:
++                for i in T.serial(per):
++                    j=i*threads+tx
++                    keys[j]=T.if_then_else(base+j<extent,
++                        _key16(Scores[row,T.min(base+j,width-1)]),0)
++                T.sync_threads()
++                threshold(keys,span,tx,hist,scan,params)
++                key = T.alloc_var(T.int32)
++                n_gt = T.alloc_var(T.int32)
++                n_eq = T.alloc_var(T.int32)
++                sel_eq = T.alloc_var(T.int32)
++                out_pos = T.alloc_var(T.int32)
++                taken = T.alloc_var(T.int32)
++                thr = T.alloc_var(T.int32)
++                need = T.alloc_var(T.int32)
++                thr = params[0]
++                need = params[1]
++                n_gt = 0
++                n_eq = 0
++                for v in T.serial(per):
++                    key = keys[tx*per+v]
++                    if key > thr:
++                        n_gt += 1
++                    elif key == thr:
++                        n_eq += 1
++                scan[tx] = n_eq
++                T.sync_threads()
++                block_scan(scan, tx)
++                sel_eq = T.max(T.min(need-(scan[tx]-n_eq), n_eq), 0)
++                T.sync_threads()
++                scan[tx] = n_gt+sel_eq
++                T.sync_threads()
++                block_scan(scan, tx)
++                out_pos = scan[tx]-n_gt-sel_eq
++                taken = 0
++                # Emit each winner once, retaining input entry order and ties.
++                # The output arrays replace two topk-sized shared staging arrays.
++                for v in T.serial(per):
++                    key = keys[tx*per+v]
++                    if (key > thr) | ((key == thr) & (taken < sel_eq)):
++                        if key == thr:
++                            taken += 1
++                        Values[row, g*topk+out_pos] = _value16(key)
++                        Indices[row, g*topk+out_pos] = base+tx*per+v
++                        out_pos += 1
++                T.sync_threads()
++                total = scan[threads-1]
++                for i in T.serial(T.ceildiv(topk, threads)):
++                    slot = i*threads+tx
++                    if (slot < topk) & (slot >= total):
++                        Values[row, g*topk+slot] = -T.infinity(T.bfloat16)
++                        Indices[row, g*topk+slot] = -1
++
++            elif final:
++                write_empty(Indices,Values,None,row)
++
++    @T.prim_func
++    def run(Scores:T.Tensor([rows,width],T.bfloat16),Lengths:T.Tensor([rows],T.int32),
++            Active:T.Tensor([1],T.int32),Indices:T.Tensor([rows,groups*topk],T.int32),
++            Values:T.Tensor([rows,groups*topk],T.bfloat16)):
++        body(Scores,Lengths,Active,Indices,Values)
++    return run
++
++class RawWideCoarseTopK:
++    """Raw tiles replace the all-entry segment pass and first two merges exactly."""
++    def __init__(self,width):
++        self.width=width
++        self.topk=8192
++        self.groups=tilelang.cdiv(width,16384)
++        segments,first,levels=IndexerTopK.routes(width,self.topk)
++        assert segments>=3 and self.groups==levels[1][2]
++        self.raw=raw_wide_pair(width)
++        self.levels=[(_make(kernel),lists,out) for kernel,lists,out in levels[2:]]
++
++    @staticmethod
++    def calls(width):
++        _,_,levels=IndexerTopK.routes(width,8192)
++        return [prepare.call(raw_wide_pair,width),*(kernel for kernel,_,_ in levels[2:])]
++
++    def scratch_specs(self,rows):
++        if self.groups==1:return ()
++        widest=(self.groups*8192,self.levels[0][2]*8192)
++        return tuple(((rows*cols,),dtype) for cols in widest for dtype in (torch.bfloat16,torch.int32))
++
++    def run(self,scores,lengths,active,indices,values,*,scratch=None):
++        rows=len(scores)
++        if self.groups==1:
++            self.raw(scores,lengths,active,indices,values)
++            return indices
++        specs=self.scratch_specs(rows)
++        if scratch is None:scratch=[torch.empty(shape,dtype=dtype,device='cuda') for shape,dtype in specs]
++        assert len(scratch)==4
++        buffers=((scratch[0],scratch[1]),(scratch[2],scratch[3]))
++        def views(buffer,lists):
++            return tuple(t[:rows*lists*8192].view(rows,lists*8192) for t in buffer)
++        first=views(buffers[0],self.groups)
++        self.raw(scores,lengths,active,first[1],first[0])
++        for level,(kernel,lists,outputs) in enumerate(self.levels):
++            work=views(buffers[level%2],lists)
++            if outputs==1:kernel(*work,lengths,active,indices,values)
++            else:kernel(*work,lengths,active,*views(buffers[(level+1)%2],outputs))
++        return indices
+diff --git a/vllm/models/deepseek_v4_1/tilelang/shortlist_indexer.py b/vllm/models/deepseek_v4_1/tilelang/shortlist_indexer.py
+new file mode 100644
+index 000000000..12dabec41
+--- /dev/null
++++ b/vllm/models/deepseek_v4_1/tilelang/shortlist_indexer.py
+@@ -0,0 +1,47 @@
++# SPDX-License-Identifier: Apache-2.0
++# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
++"""Shared MXFP4 decode helper and candidate block remapping for LSA."""
++import tilelang
++import tilelang.language as T
++
++from . import pdl
++from .indexer import CANDIDATE_BLOCKS
++
++BLOCK = 8
++
++
++def decode(byte, scale, dimension):
++    code = (T.cast(byte, T.int32) >> ((dimension % 2) * 4)) & 15
++    magnitude = code & 7
++    value = T.if_then_else(
++        magnitude < 2,
++        T.cast(magnitude, T.float32) * 0.5,
++        (1.0 + T.cast(magnitude & 1, T.float32) * 0.5)
++        * T.cast(1 << T.max(magnitude // 2 - 1, 0), T.float32),
++    )
++    value = value * T.reinterpret(T.cast(scale, T.int32) << 23, T.float32)
++    return T.if_then_else((code & 8) != 0, -value, value)
++
++
++@tilelang.jit
++def remap_blocks(capacity: int):
++    rows = T.dynamic("rows")
++
++    @T.prim_func
++    def remap(
++        Selected: T.Tensor([rows, CANDIDATE_BLOCKS], T.int32),
++        Candidates: T.Tensor([rows, capacity // BLOCK], T.int32),
++        Original: T.Tensor([rows, CANDIDATE_BLOCKS], T.int32),
++    ):
++        with T.Kernel(
++            tilelang.cdiv(CANDIDATE_BLOCKS, 128), rows, threads=128
++        ) as (tile, row):
++            pdl.chain()
++            for i in T.Parallel(128):
++                slot = tile * 128 + i
++                entry = Selected[row, slot]
++                Original[row, slot] = T.if_then_else(
++                    entry >= 0, Candidates[row, T.max(entry, 0)], -1
++                )
++
++    return remap
+diff --git a/vllm/models/deepseek_v4_1/tilelang/wide_topk_merge.py b/vllm/models/deepseek_v4_1/tilelang/wide_topk_merge.py
+new file mode 100644
+index 000000000..f2da32bbc
+--- /dev/null
++++ b/vllm/models/deepseek_v4_1/tilelang/wide_topk_merge.py
+@@ -0,0 +1,140 @@
++# SPDX-License-Identifier: Apache-2.0
++# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
++"""Exact wide coarse merges with direct, ordered writes to admitted outputs."""
++import tilelang
++import tilelang.language as T
++
++from . import pdl
++from .indexer import _row_extent, _key16, _value16, _select_macros, _final_writer
++
++
++@tilelang.jit(pass_configs={tilelang.PassConfigKey.TL_DISABLE_THREAD_STORAGE_SYNC: True})
++def wide_indexer_topk_merge(width: int, topk: int, group: int, lists: int,
++                            span: int, fan_in: int, candidates: bool,
++                            threads: int = 512):
++    assert group == 1 and not candidates, 'wide merge serves coarse entries'
++    rows = T.dynamic('rows')
++    groups = tilelang.cdiv(lists, fan_in)
++    final = groups == 1
++    n = min(lists, fan_in) * topk
++    n_pad = tilelang.cdiv(n, threads) * threads
++    per = n_pad // threads
++    assert n_pad * 4 <= 64 * 1024, 'wide merge keys exceed the admitted tile'
++    steps = threads.bit_length() - 1
++    threshold, _ = _select_macros(threads, topk)
++    write_final, write_empty = _final_writer(threads, topk, 1)
++
++    @T.macro
++    def block_scan(values, tx):
++        carry = T.alloc_var(T.int32)
++        for s in T.serial(steps):
++            off = 1 << s
++            carry = T.if_then_else(tx >= off, values[T.max(tx-off, 0)], 0)
++            T.sync_threads()
++            values[tx] += carry
++            T.sync_threads()
++
++    @T.macro
++    def body(WorkValues, WorkEntries, Lengths, Active, Indices, Values):
++        with T.Kernel(groups, rows, threads=threads) as (g, row):
++            pdl.chain()
++            tx = T.get_thread_binding()
++            keys = T.alloc_shared([n_pad], T.int32)
++            hist = T.alloc_shared([257], T.int32)
++            scan = T.alloc_shared([threads], T.int32)
++            params = T.alloc_shared([4], T.int32)
++            extent = _row_extent(Lengths, Active, row, width)
++            live = T.min(T.ceildiv(extent, span), lists)
++            base = g * fan_in * topk
++            group_live = T.min(T.max(live-g*fan_in, 0), fan_in)
++            if group_live <= 0:
++                if final:
++                    write_empty(Indices, Values, None, row)
++            elif group_live == 1:
++                if final:
++                    write_final(Indices, Values, None, None, row, extent,
++                        lambda slot: WorkEntries[row, base+slot] >= 0,
++                        lambda slot: WorkEntries[row, base+slot],
++                        lambda slot: WorkValues[row, base+slot], params)
++                else:
++                    for i in T.serial(T.ceildiv(topk, threads)):
++                        slot = i*threads+tx
++                        if slot < topk:
++                            Values[row, g*topk+slot] = WorkValues[row, base+slot]
++                            Indices[row, g*topk+slot] = WorkEntries[row, base+slot]
++            else:
++                for i in T.serial(per):
++                    j = i*threads+tx
++                    c = T.min(base+j, lists*topk-1)
++                    keys[j] = T.if_then_else(
++                        (j < n) & (g*fan_in+j//topk < live),
++                        T.if_then_else(WorkEntries[row, c] >= 0,
++                                       _key16(WorkValues[row, c]), 0), 0)
++                T.sync_threads()
++                threshold(keys, n_pad, tx, hist, scan, params)
++                key = T.alloc_var(T.int32)
++                n_gt = T.alloc_var(T.int32)
++                n_eq = T.alloc_var(T.int32)
++                sel_eq = T.alloc_var(T.int32)
++                out_pos = T.alloc_var(T.int32)
++                taken = T.alloc_var(T.int32)
++                thr = T.alloc_var(T.int32)
++                need = T.alloc_var(T.int32)
++                thr = params[0]
++                need = params[1]
++                n_gt = 0
++                n_eq = 0
++                for v in T.serial(per):
++                    key = keys[tx*per+v]
++                    if key > thr:
++                        n_gt += 1
++                    elif key == thr:
++                        n_eq += 1
++                scan[tx] = n_eq
++                T.sync_threads()
++                block_scan(scan, tx)
++                sel_eq = T.max(T.min(need-(scan[tx]-n_eq), n_eq), 0)
++                T.sync_threads()
++                scan[tx] = n_gt+sel_eq
++                T.sync_threads()
++                block_scan(scan, tx)
++                out_pos = scan[tx]-n_gt-sel_eq
++                taken = 0
++                # Emit each winner once, retaining input entry order and ties.
++                # The output arrays replace two topk-sized shared staging arrays.
++                for v in T.serial(per):
++                    key = keys[tx*per+v]
++                    if (key > thr) | ((key == thr) & (taken < sel_eq)):
++                        if key == thr:
++                            taken += 1
++                        Values[row, g*topk+out_pos] = _value16(key)
++                        Indices[row, g*topk+out_pos] = WorkEntries[row, base+tx*per+v]
++                        out_pos += 1
++                T.sync_threads()
++                total = scan[threads-1]
++                for i in T.serial(T.ceildiv(topk, threads)):
++                    slot = i*threads+tx
++                    if (slot < topk) & (slot >= total):
++                        Values[row, g*topk+slot] = -T.infinity(T.bfloat16)
++                        Indices[row, g*topk+slot] = -1
++
++    if final:
++        @T.prim_func
++        def merge(WorkValues: T.Tensor([rows, lists*topk], T.bfloat16),
++                  WorkEntries: T.Tensor([rows, lists*topk], T.int32),
++                  Lengths: T.Tensor([rows], T.int32),
++                  Active: T.Tensor([1], T.int32),
++                  Indices: T.Tensor([rows, topk], T.int32),
++                  Values: T.Tensor([rows, topk], T.bfloat16)):
++            body(WorkValues, WorkEntries, Lengths, Active, Indices, Values)
++        return merge
++
++    @T.prim_func
++    def merge(WorkValues: T.Tensor([rows, lists*topk], T.bfloat16),
++              WorkEntries: T.Tensor([rows, lists*topk], T.int32),
++              Lengths: T.Tensor([rows], T.int32),
++              Active: T.Tensor([1], T.int32),
++              OutValues: T.Tensor([rows, groups*topk], T.bfloat16),
++              OutEntries: T.Tensor([rows, groups*topk], T.int32)):
++        body(WorkValues, WorkEntries, Lengths, Active, OutEntries, OutValues)
++    return merge
+-- 
+2.43.0
+

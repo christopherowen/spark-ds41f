@@ -376,9 +376,10 @@ class DeepseekV41TileLangAttention(DeepseekV4Attention):
             write_index_keys(
                 key, self.indexer.k_cache.kv_cache, slot_mapping, self._index_page
             )
-        if self._page_summary is not None:
+        page_summary = self.__dict__.get("_page_summary")
+        if page_summary is not None:
             pool = self.indexer.k_cache.kv_cache
-            self._page_summary(pool, pool.view(torch.bfloat16), slot_mapping)
+            page_summary(pool, pool.view(torch.bfloat16), slot_mapping)
 
     def _index_chunk(
         self,
