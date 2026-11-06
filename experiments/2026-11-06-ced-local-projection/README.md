@@ -372,3 +372,22 @@ not accept Git archive's `source` root-directory entry. No corrected-tag image
 was produced; its failure receipt is retained. The guard now explicitly accepts
 that directory and a CPU-only consumer independently verifies every streamed
 file's Git blob, file mode, symlink, file count and Dockerfile before another build.
+
+The fourth image attempt was rejected by Docker's stdin archive detector before
+image construction. Git's PAX comment preceded the first ordinary member, beyond
+Docker CLI 29.6.2's 1024-byte detection peek. The stream now begins with the plain
+published Dockerfile entry; all Git entries and content remain unchanged. The
+independent stream check also requires that first header. This behavior was checked
+against Docker CLI's `detectArchiveReader`/`isArchive` implementation at v29.6.2.
+The failed attempt remains in `receipts/native-reuse-image-4.*`.
+
+The second SP5-SP7 native window completed: **368 tests passed with zero skips on
+each of two fresh boots on each of the three nodes**. Source remained `51c1a32`,
+and the controller was published `ac777ffa`. The maximum recorded thermal zone
+was 61.0 C, maximum GPU temperature 52 C, and minimum host memory available
+103.38 GiB. Every run reported 8,889,463,808 peak CUDA-allocated bytes. All commands,
+raw test output, telemetry and failures are retained under `receipts/sp567-window-2/`.
+C37 was independently verified at clean `e9eab460` on all nodes and the leases
+released at 2026-11-06 02:10:24 UTC. These are native correctness results only;
+distributed collectives, whole-model serving and qualified performance remain
+unmeasured for this candidate.

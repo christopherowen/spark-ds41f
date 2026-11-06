@@ -26,14 +26,15 @@ build=subprocess.Popen(command,stdin=subprocess.PIPE)
 archive=subprocess.Popen(['git','-c','tar.umask=0022','archive','--format=tar','--prefix=source/',args.head],cwd=args.source,stdout=subprocess.PIPE)
 try:
     with tarfile.open(fileobj=build.stdin,mode='w|') as target:
+        # A plain first header lets Docker's 1024-byte archive probe succeed.
+        payload=args.dockerfile.read_bytes()
+        member=tarfile.TarInfo('Dockerfile');member.size=len(payload);member.mode=0o644;member.mtime=0
+        target.addfile(member,io.BytesIO(payload))
         with tarfile.open(fileobj=archive.stdout,mode='r|') as source:
             for member in source:
                 assert (member.name=='source' and member.isdir() or member.name.startswith('source/')) and '..' not in Path(member.name).parts
                 stream=source.extractfile(member) if member.isfile() else None
                 target.addfile(member,stream)
-        payload=args.dockerfile.read_bytes()
-        member=tarfile.TarInfo('Dockerfile');member.size=len(payload);member.mode=0o644;member.mtime=0
-        target.addfile(member,io.BytesIO(payload))
     build.stdin.close();archive.stdout.close()
     assert archive.wait()==0,'Git archive failed'
     raise SystemExit(build.wait())

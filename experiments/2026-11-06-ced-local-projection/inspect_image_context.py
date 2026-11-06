@@ -13,7 +13,8 @@ for line in subprocess.check_output(['git','ls-tree','-r',head],cwd=source,text=
     expected['source/'+path]=(mode,blob)
 seen=set();recipe=False
 with tarfile.open(fileobj=sys.stdin.buffer,mode='r|') as archive:
-    for member in archive:
+    for index,member in enumerate(archive):
+        if index==0:assert member.name=='Dockerfile' and not member.pax_headers
         if member.isdir():continue
         if member.name=='Dockerfile':
             assert archive.extractfile(member).read()==Path(dockerfile).read_bytes();recipe=True;continue
