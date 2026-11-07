@@ -1,0 +1,103 @@
+From 00ae5ba4daef8f5034df3d7fcd641226375e5281 Mon Sep 17 00:00:00 2001
+From: Christopher Owen <christopherowen@users.noreply.github.com>
+Date: Sat, 7 Nov 2026 13:05:46 +0100
+Subject: [PATCH] fix(dsv41): normalize 1-row Engram column-slice stride when
+ 24 % tp != 0
+
+Base: 1107 vLLM patch head e3ab3f3da27ccb4b5deb5a919982d87e962704ab.
+
+Rationale:
+When 24 % tp_size != 0 (TP=5 with 5 columns/rank -> 6,400 gathered width, or TP=7 with 4 columns/rank -> 7,168 gathered width), interleaved_rows and interleaved_sp_rows slice rows[:, : 24 * 256].contiguous(), and EngramColumnParallelLinear.forward slices output[..., : self.logical_output_size].contiguous(). For a single-row batch (tokens == 1 during warmup and 1-row CUDA graph capture), PyTorch treats a (1, 6144) slice with stride (6400, 1) or (7168, 1) as already contiguous (shape[0] == 1), so .contiguous() returns the slice unchanged with stride(0) == 6400 or 7168. per_token_cast_impl then requests get_per_token_cast_kernel_cuda(hidden=6144, token_stride=6400), raising KernelNotPreparedError against the frozen kernel cache (which prepares token_stride=6144). Chaining .view(..., 24 * 256) (and .view(*output.shape[:-1], self.logical_output_size)) normalizes stride(0) to the logical width when tokens == 1, while remaining unreachable on TP=1, 2, 3, 4, 6, 8 where 24 % tp_size == 0.
+
+Quality:
+Bit-identical on all divisor TP shapes (TP=1, 2, 3, 4, 6, 8: early return before slice); restores packed row stride on TP=5 and TP=7 for 1-row steps.
+
+Tests:
+- pytest tests/models/test_deepseek_v4_1_engram.py -k test_interleaved_rows_restore_column_order (16 passed across tp_size in 1..8 and tokens in {1, 5}).
+
+Upstream status: local fix for 0750 column-interleaved disk Engram on non-divisor TP sizes.
+---
+ tests/models/test_deepseek_v4_1_engram.py  | 19 ++++++++++++++++---
+ vllm/models/deepseek_v4_1/common/engram.py |  6 +++---
+ 2 files changed, 19 insertions(+), 6 deletions(-)
+
+diff --git a/tests/models/test_deepseek_v4_1_engram.py b/tests/models/test_deepseek_v4_1_engram.py
+index 9f4754897..694288812 100644
+--- a/tests/models/test_deepseek_v4_1_engram.py
++++ b/tests/models/test_deepseek_v4_1_engram.py
+@@ -1149,14 +1149,15 @@ def test_disk_shards_interleave_hash_columns(tp_size):
+     assert column_shard(geometry, 0, 25, 0) is None
+ 
+ 
++@pytest.mark.parametrize("tokens", [1, 5])
+ @pytest.mark.parametrize("tp_size", [1, 2, 3, 4, 5, 6, 7, 8])
+-def test_interleaved_rows_restore_column_order(tp_size, monkeypatch):
++def test_interleaved_rows_restore_column_order(tp_size, tokens, monkeypatch):
+     """Every rank's columns, all-gathered as 256-wide rows along the last dimension,
+     restore the 24-column order (with no copy when tp_size divides 24, and slicing
+-    off the trailing padded columns when 24 % tp_size != 0)."""
++    off the trailing padded columns with packed row stride when 24 % tp_size != 0)."""
++    from types import SimpleNamespace
+     import vllm.models.deepseek_v4_1.common.engram as engram_module
+ 
+-    tokens = 5
+     max_cols = (24 + tp_size - 1) // tp_size
+     padded = torch.zeros(tokens, max_cols * tp_size * 256, dtype=torch.bfloat16)
+     full = torch.randn(tokens, 24 * 256).bfloat16()
+@@ -1174,10 +1175,22 @@ def test_interleaved_rows_restore_column_order(tp_size, monkeypatch):
+ 
+     monkeypatch.setattr(engram_module, "tensor_model_parallel_all_gather", all_gather)
+     rows = engram_module.interleaved_rows(locals_[0])
++    assert rows.shape == (tokens, 24 * 256)
++    assert rows.stride() == (24 * 256, 1)
+     assert torch.equal(rows.view(torch.int16), full.view(torch.int16))
+     if 24 % tp_size == 0:
+         assert rows.data_ptr() == gathered[0].data_ptr()
+ 
++    sp_rows = SimpleNamespace(
++        real_rows=tokens,
++        local_rows=tokens,
++        exchange_rows=lambda local: torch.stack(locals_, dim=0),
++    )
++    sp_out = engram_module.interleaved_sp_rows(locals_[0], sp_rows)
++    assert sp_out.shape == (tokens, 24 * 256)
++    assert sp_out.stride() == (24 * 256, 1)
++    assert torch.equal(sp_out.view(torch.int16), full.view(torch.int16))
++
+ 
+ 
+ @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+diff --git a/vllm/models/deepseek_v4_1/common/engram.py b/vllm/models/deepseek_v4_1/common/engram.py
+index 0c5169b1e..0ec6fbb99 100644
+--- a/vllm/models/deepseek_v4_1/common/engram.py
++++ b/vllm/models/deepseek_v4_1/common/engram.py
+@@ -75,7 +75,7 @@ class _PaddedColumnParallelLinear(ColumnParallelLinear):
+             output = tensor_model_parallel_all_gather(output)
+         if self.padded_output_size == self.logical_output_size:
+             return output
+-        return output[..., : self.logical_output_size].contiguous()
++        return output[..., : self.logical_output_size].contiguous().view(*output.shape[:-1], self.logical_output_size)
+ 
+     def local_product(self, input_, out=None):
+         """This rank's column block of the product, not gathered; written into ``out``
+@@ -478,7 +478,7 @@ def interleaved_rows(local: torch.Tensor) -> torch.Tensor:
+     rows = gathered.view(tokens, -1)
+     if rows.shape[1] == 24 * 256:
+         return rows
+-    return rows[:, : 24 * 256].contiguous()
++    return rows[:, : 24 * 256].contiguous().view(tokens, 24 * 256)
+ 
+ 
+ def interleaved_sp_rows(local: torch.Tensor, sp_rows) -> torch.Tensor:
+@@ -508,7 +508,7 @@ def interleaved_sp_rows(local: torch.Tensor, sp_rows) -> torch.Tensor:
+     rows = concatenated.view(real, -1)
+     if rows.shape[1] == 24 * 256:
+         return rows
+-    return rows[:, : 24 * 256].contiguous()
++    return rows[:, : 24 * 256].contiguous().view(real, 24 * 256)
+ 
+ 
+ class ParallelEngramEmbedding(nn.Module):
+-- 
+2.43.0
+

@@ -1,0 +1,166 @@
+From e3ab3f3da27ccb4b5deb5a919982d87e962704ab Mon Sep 17 00:00:00 2001
+From: Christopher Owen <3221756+christopherowen@users.noreply.github.com>
+Date: Sat, 7 Nov 2026 07:51:28 +0100
+Subject: [PATCH] test(dsv41): align release-gate tests with 1107 series
+
+Base: 1107 vLLM patch head efd4342f8d2a858e2183449cf88ab78803124af9 (tree 263bda12d29a602c8f37b1ec43386daef8694fb6).
+
+Rationale:
+1. test_deepseek_v41_block_scale_words.py: include _mxfp8_gemm_rope_mxfp4_decode (added by 0749) in the SFB clamped-row floor-div-32 AST check.
+2. test_deepseek_v41_tilelang_iket.py: include the PDL wait phase added to gather_columns_kernel by 0753 before its single coalesced store.global range.
+3. test_deepseek_v4_1_ced_model.py & test_deepseek_v4_1_ced_sp.py: initialize _ced_recovery_prompt_end on bare DeepseekV41ModelState stand-ins (0732/0734) and provide the producer MXFP8 cast and route_local contract (0720) in CED SP stand-ins.
+4. test_deepseek_v4_1_engram.py: move packed_dir cleanup from test_disk_rows_read_whole_table_sources to test_disk_rows_pack_and_read_rank_compacted_files (0750).
+5. test_workspace.py: stub _source_short_plan alongside _mla_plan and _index_plan when building synthetic 1-tuple TileLang attention plans (0741).
+
+Quality: test-only; no runtime change.
+
+Tests: all 6 files (145 passed) pass in spark-ds41f:1107 on dgx4 (GB10), bringing the 149-file release-tests gate bundle to 9,494 passed, 360 skipped, 0 failed.
+
+Upstream status: local release-gate test alignment.
+---
+ .../test_deepseek_v41_block_scale_words.py    |  6 +++++-
+ .../test_deepseek_v41_tilelang_iket.py        |  3 ++-
+ tests/models/test_deepseek_v4_1_ced_model.py  | 19 +++++++++++++++++--
+ tests/models/test_deepseek_v4_1_ced_sp.py     |  3 ++-
+ tests/models/test_deepseek_v4_1_engram.py     |  2 +-
+ tests/v1/worker/test_workspace.py             |  1 +
+ 6 files changed, 28 insertions(+), 6 deletions(-)
+
+diff --git a/tests/kernels/quantization/test_deepseek_v41_block_scale_words.py b/tests/kernels/quantization/test_deepseek_v41_block_scale_words.py
+index 0ce70d96d..09c6a4e74 100644
+--- a/tests/kernels/quantization/test_deepseek_v41_block_scale_words.py
++++ b/tests/kernels/quantization/test_deepseek_v41_block_scale_words.py
+@@ -212,7 +212,11 @@ def test_every_sfb_load_clamps_the_row_then_divides_by_32():
+         / "vllm/models/deepseek_v4_1/tilelang/gemm.py"
+     )
+     loads = _sfb_indexes(gemm)
+-    assert [name for name, _ in loads] == ["_mxfp8_gemm", "_mxfp8_gemm_partials"]
++    assert [name for name, _ in loads] == [
++        "_mxfp8_gemm",
++        "_mxfp8_gemm_partials",
++        "_mxfp8_gemm_rope_mxfp4_decode",
++    ]
+     tree = ast.parse(gemm.read_text())
+     clamps = {}
+     for node in tree.body:
+diff --git a/tests/kernels/test_deepseek_v41_tilelang_iket.py b/tests/kernels/test_deepseek_v41_tilelang_iket.py
+index ae19ce321..09bc5959b 100644
+--- a/tests/kernels/test_deepseek_v41_tilelang_iket.py
++++ b/tests/kernels/test_deepseek_v41_tilelang_iket.py
+@@ -603,7 +603,8 @@ def test_gather_columns_into_iket_manifest_is_single_global_store_range():
+     src = kernel.get_kernel_source()
+     _, sites = iket.annotate(src, _token, iters=1, granularity="phase")
+     assert [(s["phase"], s["kinds"], s["events_per_warp_bound"]) for s in sites] == [
+-        ("store", ["global"], 2),
++        ("wait", ["pdl"], 4),
++        ("store", ["global"], 4),
+     ]
+ 
+ 
+diff --git a/tests/models/test_deepseek_v4_1_ced_model.py b/tests/models/test_deepseek_v4_1_ced_model.py
+index ed90e48c2..5712eee34 100644
+--- a/tests/models/test_deepseek_v4_1_ced_model.py
++++ b/tests/models/test_deepseek_v4_1_ced_model.py
+@@ -21,6 +21,7 @@ def test_compacted_prefill_graph_excludes_prompt_logprobs_and_other_batch_shapes
+     state = DeepseekV41ModelState.__new__(DeepseekV41ModelState)
+     state.single_request_prefill_cudagraph_tokens = 4096
+     state._ced_prompt_logprobs = {"full-output"}
++    state._ced_recovery_prompt_end = {}
+     assert state.can_use_single_request_prefill_graph(1, 4096, ["compact"])
+     assert not state.can_use_single_request_prefill_graph(1, 4096, ["full-output"])
+     assert not state.can_use_single_request_prefill_graph(1, 2048, ["compact"])
+@@ -174,7 +175,7 @@ class _Mix:
+             torch.eye(4).expand(rows, 4, 4),
+             residual[:, 0, :],
+             mix,
+-            None,  # no MXFP8 cast: the stand-in projections take any rows
++            self.cast_rows(residual[:, 0, :]),
+         )
+ 
+     def post_pre(self, x, residual, post, comb, fn, scale, base, norm, pre):
+@@ -183,7 +184,13 @@ class _Mix:
+         )
+ 
+     def cast_rows(self, rows):
+-        return None
++        from vllm.models.deepseek_v4_1.tilelang.linear import MXFP8Rows
++
++        return MXFP8Rows(
++            rows,
++            torch.zeros_like(rows, dtype=torch.uint8),
++            torch.zeros((rows.shape[0], 1), dtype=torch.uint8),
++        )
+ 
+ 
+ class _Attention(nn.Module):
+@@ -215,6 +222,14 @@ class _Experts(nn.Module):
+     def __init__(self, index, rows):
+         super().__init__()
+         self.index, self.rows = index, rows
++        self.experts = SimpleNamespace(
++            router=SimpleNamespace(
++                route_local=lambda x, layout, *, input_ids=None: (
++                    torch.ones((x.shape[0], 1), dtype=torch.float32),
++                    torch.zeros((x.shape[0], 1), dtype=torch.int64),
++                )
++            )
++        )
+ 
+     def forward(self, hidden, ids):
+         self.rows.append(("experts", self.index, hidden.shape[0]))
+diff --git a/tests/models/test_deepseek_v4_1_ced_sp.py b/tests/models/test_deepseek_v4_1_ced_sp.py
+index 90ff0d9f6..08f41a936 100644
+--- a/tests/models/test_deepseek_v4_1_ced_sp.py
++++ b/tests/models/test_deepseek_v4_1_ced_sp.py
+@@ -12,7 +12,7 @@ import torch
+ from torch import nn
+ 
+ from tests.models.test_deepseek_v4_1_ced_model import _gather, _Layer, _scatter
+-from tests.models.test_deepseek_v4_1_sp_prefill import _World
++from tests.models.test_deepseek_v4_1_sp_prefill import _simulated_mxfp8_gather, _World
+ from vllm.models.deepseek_v4_1 import ced, sp_prefill
+ from vllm.models.deepseek_v4_1.nvidia import model as native
+ 
+@@ -45,6 +45,7 @@ def _cpu_collectives(monkeypatch, world):
+         sp_prefill, "tensor_model_parallel_reduce_scatter", world.reduce_scatter
+     )
+     monkeypatch.setattr(sp_prefill, "model_parallel_is_initialized", lambda: False)
++    monkeypatch.setattr(sp_prefill.SPRows, "gather_mxfp8", _simulated_mxfp8_gather)
+ 
+ 
+ @pytest.mark.parametrize("world_size", [2, 3, 4])
+diff --git a/tests/models/test_deepseek_v4_1_engram.py b/tests/models/test_deepseek_v4_1_engram.py
+index b9c632c7b..9f4754897 100644
+--- a/tests/models/test_deepseek_v4_1_engram.py
++++ b/tests/models/test_deepseek_v4_1_engram.py
+@@ -1128,7 +1128,6 @@ def test_disk_rows_read_whole_table_sources(tmp_path, dist_init, tp_rank):
+             assert output.data_ptr() == address
+     finally:
+         embed.close()
+-        shutil.rmtree(packed_dir, ignore_errors=True)
+ 
+ 
+ @pytest.mark.parametrize("tp_size", [1, 2, 3, 4, 5, 6, 7, 8])
+@@ -1364,6 +1363,7 @@ def test_disk_rows_pack_and_read_rank_compacted_files(monkeypatch):
+         torch.cuda.synchronize()
+     finally:
+         embed_2p.close()
++        shutil.rmtree(packed_dir, ignore_errors=True)
+ 
+     assert torch.equal(out_packed, out_2p)
+ 
+diff --git a/tests/v1/worker/test_workspace.py b/tests/v1/worker/test_workspace.py
+index 85df2971d..642407496 100644
+--- a/tests/v1/worker/test_workspace.py
++++ b/tests/v1/worker/test_workspace.py
+@@ -500,6 +500,7 @@ def test_v41_tilelang_attention_reserves_scratch_in_its_model_lane(monkeypatch):
+     )
+     monkeypatch.setattr(tl_attention, "_mla_plan", lambda *args: mla)
+     monkeypatch.setattr(tl_attention, "_index_plan", IndexPlan)
++    monkeypatch.setattr(tl_attention, "_source_short_plan", lambda *args: None)
+ 
+     def layer(index_width, metadata_rows):
+         module = tl_attention.DeepseekV41TileLangAttention.__new__(
+-- 
+2.43.0
+
