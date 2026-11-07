@@ -5,8 +5,10 @@ series on `next-candidate` (head c579b3fe1). This folder is that candidate: its 
 manifest, lock, arms, image, release tests and the specs that qualify it. It is modelled on
 spark-ds41f-1025's [rc6/](../2026-10-25-spark-ds41f-candidate/rc6).
 
-**Released (2026-10-30):** candidate 14 is spark-ds41f-1030 on the ring
-([below](#candidate-14-rc14), [release notes](release-notes.md)); the triangle is not qualified on it.
+**Released (2026-11-07):** [1107/](1107) is `spark-ds41f-1107` across all eight topologies
+(`tp4-ring`, `tp3-triangle`, and `tp3-switched` through `tp8-switched`; [below](#spark-ds41f-1107-1107),
+[release notes](release-notes.md)). Previously released (2026-10-30): candidate 14 is
+`spark-ds41f-1030` on the ring and triangle ([below](#candidate-14-rc14)).
 
 **Status (2026-10-26, CET):** candidate 7's image built on dgx4; its release tests passed on dgx4
 (6,417 passed, 163 skipped, 0 failed). **Candidate 8** ([below](#candidate-8-rc8)) adds 0533, the
@@ -967,3 +969,24 @@ Preserves `rc17` (`0568..0593`) plus the **19 proven `rc18` vLLM patches (`0594.
   [rc19/rc-tp3-copy.json](rc19/rc-tp3-copy.json), and [rc19/image-dgx4.json](rc19/image-dgx4.json)
   on `spark-ds41f:19f2c20ed4d6-next-19` ([rc19/source.json](rc19/source.json),
   [rc19/upstreams.lock.json](rc19/upstreams.lock.json)).
+
+## spark-ds41f-1107 ([1107/](1107))
+
+Promoted as `spark-ds41f-1107` ([manifests/baselines/2026-11-07-spark-ds41f-1107.json](../../manifests/baselines/2026-11-07-spark-ds41f-1107.json),
+[releases/spark-ds41f-1107/](../../releases/spark-ds41f-1107/)) across all eight topologies:
+switchless `tp4-ring` and `tp3-triangle` (`dgx1..dgx4`), and switched `tp3-switched` through
+`tp8-switched` (`sp1..sp8`).
+
+- **Source & Image:** [1107/vllm/series](1107/vllm/series) (`641` active patches through `0761`,
+  `patch_head` `320021e3`, `expected_tree` `ed1bdb7a`, `patchset_sha256` `26fac4e5`) and
+  [1107/sparknet/series](1107/sparknet/series) (`3` active patches `0002..0004`, `patch_head`
+  `1f84980b`, `expected_tree` `b86dc07f`, `patchset_sha256` `5394417f`); image `spark-ds41f:1107`
+  (`sha256:3f32a962ce04b7c8d85337cd427a8946b8b6bcaadd97cc8d8a8cd14e8d68a6ce`).
+- **Release Gate Tests:** `111/111` gate files (`6,892 passed, 163 skipped, 0 failed`) plus `67`
+  targeted regression tests (`0` errors).
+- **TP3 Cold-Boot Capture Headroom (`0761`):** flushes the PyTorch CUDA caching allocator and trims
+  glibc's host arena between weight load, kernel warmup, KV cache allocation, CUDA Graph capture,
+  and speculator capture, raising `tp3-switched` cold-boot `min_available_gib` on `sp5..sp7` from
+  `<3.46 GiB` (which tripped `spark-memguard`'s `4.0 GiB` startup floor during speculator capture)
+  to `6.03..6.45 GiB` on head `sp5` and `7.94..8.10 GiB` on followers `sp6..sp7` across two boots.
+- **Full details:** see [1107/README.md](1107/README.md) and [release-notes.md](release-notes.md).

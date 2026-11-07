@@ -63,7 +63,7 @@ before tuning anything on this basis.
 ## Next release
 
 <!-- BEGIN GENERATED: next-release-status -->
-Production is **spark-ds41f-1030** (`manifests/baselines/2026-10-30-spark-ds41f-1030.json`, image `spark-ds41f:1030`), promoted 2026-10-30 on `tp4-ring` ([release record](experiments/2026-10-26-spark-ds41f-candidate/README.md), [suite reference](manifests/suites/2026-10-30-spark-ds41f-1030-tp4/)). `tp3-triangle`'s current qualified reference is **spark-ds41f-1030** ([suite reference](manifests/suites/2026-10-30-spark-ds41f-1030-tp3/)); qualifying `spark-ds41f-1030`'s image on the triangle at its 6,144-token prefill budget is queued once the three-node triangle is cabled (#668).
+Production is **spark-ds41f-1107** (`manifests/baselines/2026-11-07-spark-ds41f-1107.json`, image `spark-ds41f:1107`), promoted 2026-11-07 across `tp4-ring` ([suite reference](manifests/suites/2026-11-07-spark-ds41f-1107-tp4/)), `tp3-triangle` ([suite reference](manifests/suites/2026-11-07-spark-ds41f-1107-tp3/)), and `tp3-switched`..`tp8-switched` ([release record](experiments/2026-10-26-spark-ds41f-candidate/README.md)).
 <!-- END GENERATED: next-release-status -->
 
 Before promoting `1107`:
@@ -82,23 +82,23 @@ Before promoting `1107`:
 ## Current reference
 
 <!-- BEGIN GENERATED: current-reference -->
-Active baseline manifest: [`manifests/baselines/2026-10-30-spark-ds41f-1030.json`](manifests/baselines/2026-10-30-spark-ds41f-1030.json) (`spark-ds41f-1030`). Releases are judged by the servebench release, single-stream and sampled suites (`docs/release-benchmark.md`, `scripts/servebench_suite_table.py`). Current benchmark references are [`manifests/suites/2026-10-30-spark-ds41f-1030-tp4`](manifests/suites/2026-10-30-spark-ds41f-1030-tp4/) for `tp4-ring` and [`manifests/suites/2026-10-30-spark-ds41f-1030-tp3`](manifests/suites/2026-10-30-spark-ds41f-1030-tp3/) for `tp3-triangle`:
+Active baseline manifest: [`manifests/baselines/2026-11-07-spark-ds41f-1107.json`](manifests/baselines/2026-11-07-spark-ds41f-1107.json) (`spark-ds41f-1107`). Releases are judged by the servebench release, single-stream and sampled suites (`docs/release-benchmark.md`, `scripts/servebench_suite_table.py`). Current benchmark references are [`manifests/suites/2026-11-07-spark-ds41f-1107-tp4`](manifests/suites/2026-11-07-spark-ds41f-1107-tp4/) for `tp4-ring` and [`manifests/suites/2026-11-07-spark-ds41f-1107-tp3`](manifests/suites/2026-11-07-spark-ds41f-1107-tp3/) for `tp3-triangle`:
 
-| Measure | `tp4-ring` (`spark-ds41f-1030`, 1M, 16 seqs, 16K batch) | `tp3-triangle` (`spark-ds41f-1030`, 1M, 8 seqs, 8K/6K batch) |
+| Measure | `tp4-ring` (`spark-ds41f-1107`, 1M, 16 seqs, 16K batch) | `tp3-triangle` (`spark-ds41f-1107`, 1M, 8 seqs, 8K/6K batch) |
 | --- | ---: | ---: |
-| Decode grid geometric mean (20 TP4 / 15 TP3 shapes) | 24.58 ms | 25.13 ms |
-| Decode `c16`, 16 streams (output tok/s) | 257.8 | — |
-| Decode `c8`, 8 streams (output tok/s) | 198.4 | 158.6 |
-| Decode `c4`, 4 streams (output tok/s) | — | 121.2 |
-| Single-stream `c1` (output tok/s) | 78.0 | 62.6 |
-| Sampled `c16` / `c8` / `c1` (`temp=1.0`, output tok/s) | 252.2 / 194.9 / 75.6 | 154.9 / 153.8 / 61.4 |
-| Poisson arrivals (0.7 TP4 / 0.42 TP3 req/s, output tok/s) | 180.4 | 119.0 |
-| Source-text prefill 32K (tok/s) | 7,313 | 5,888 |
-| Prefill 131K (tok/s) | 7,396 | 5,862 |
-| Prefill 262K (tok/s) | 7,120 | 5,613 |
-| Prefill 524K (TP4) / 500K (TP3) (tok/s) | 6,538 | 5,113 |
-| Prefill 1M (tok/s) | 5,550 | 4,305 |
-| Short-request TTFT p50 during 131K prefill (3 / 11 streams) | 3.30 s / 3.59 s | — |
+| Decode grid geometric mean (20 TP4 / 15 TP3 shapes) | 21.05 ms | 21.27 ms |
+| Decode `c16`, 16 streams (output tok/s) | 272.9 | — |
+| Decode `c8`, 8 streams (output tok/s) | 207.4 | 160.8 |
+| Decode `c4`, 4 streams (output tok/s) | — | 123.7 |
+| Single-stream `c1` (output tok/s) | 82.6 | 64.3 |
+| Sampled `c16` / `c8` / `c1` (`temp=1.0`, output tok/s) | 268.3 / 203.8 / 80.0 | 156.6 / 157.6 / 63.3 |
+| Poisson arrivals (0.7 TP4 / 0.42 TP3 req/s, output tok/s) | 180.2 | 119.2 |
+| Source-text prefill 32K (tok/s) | 8,508 | 6,452 |
+| Prefill 131K (tok/s) | 8,657 | 6,480 |
+| Prefill 262K (tok/s) | 8,261 | 6,135 |
+| Prefill 524K (TP4) / 500K (TP3) (tok/s) | 7,460 | 5,514 |
+| Prefill 1M (tok/s) | 6,012 | 4,434 |
+| Short-request TTFT p50 during 131K prefill (3 / 11 TP4 or 3 / 6 TP3 streams) | 1.02 s / 1.44 s | 1.07 s / 1.18 s |
 <!-- END GENERATED: current-reference -->
 
 A step-time saving is a fixed cost per step. At one stream it converts almost

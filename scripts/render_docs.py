@@ -299,19 +299,22 @@ def load_suite_directory(suite_dir: Path) -> dict[str, Any]:
     }
 
 
-def _load_shape_memory(bench_ref: str | None) -> dict[str, Any] | None:
+def _load_shape_memory(bench_ref: str | None, override_raw: dict[str, Any] | None = None) -> dict[str, Any] | None:
     if not bench_ref:
         return None
-    ref_path = ROOT / bench_ref
-    if ref_path.is_dir():
-        cond_path = ref_path / "conditions.json"
-        if not cond_path.is_file():
-            return None
-        mem_raw = json.loads(cond_path.read_text()).get("memory")
-    elif ref_path.is_file():
-        mem_raw = json.loads(ref_path.read_text()).get("memory")
+    if isinstance(override_raw, dict) and override_raw:
+        mem_raw: Any = override_raw
     else:
-        return None
+        ref_path = ROOT / bench_ref
+        if ref_path.is_dir():
+            cond_path = ref_path / "conditions.json"
+            if not cond_path.is_file():
+                return None
+            mem_raw = json.loads(cond_path.read_text()).get("memory")
+        elif ref_path.is_file():
+            mem_raw = json.loads(ref_path.read_text()).get("memory")
+        else:
+            return None
     if not isinstance(mem_raw, dict) or not mem_raw:
         return None
     per_node: dict[str, dict[str, float]] = {}
@@ -402,7 +405,10 @@ def collect_manifest_data() -> dict[str, Any]:
                 "kv_cache_gib": _format_gib(int(entry["sizing"]["kv_cache_memory_bytes"])),
                 "prefix_cache_retention_interval": int(entry["sizing"]["prefix_cache_retention_interval"]),
                 "kv_capacity": kv,
-                "memory": _load_shape_memory(bench_ref),
+                "memory": _load_shape_memory(
+                    bench_ref,
+                    (promoted_manifest.get("capacity", {}).get(shape_name) or {}).get("memory"),
+                ),
                 "benchmark_reference": bench_ref,
                 "qualified_release": qualified_release,
             }
@@ -654,7 +660,7 @@ def render_current_state_active_settings(data: dict[str, Any]) -> str:
         ("Maximum parallel prefills", "1 (`--max-parallel-prefills 1`)"),
         (
             "Batched-token budget",
-            f"`tp4-ring`: {tp4['max_num_batched_tokens']:,}; `tp3-triangle`: {tp3['max_num_batched_tokens']:,} (qualified on `spark-ds41f-1030`); `tp3-triangle-4k`: {tp3_4k['max_num_batched_tokens']:,}",
+            f"`tp4-ring`: {tp4['max_num_batched_tokens']:,}; `tp3-triangle`: {tp3['max_num_batched_tokens']:,} (qualified on `{tp3['qualified_release']}`); `tp3-triangle-4k`: {tp3_4k['max_num_batched_tokens']:,}",
         ),
         (
             "Prefill yield & late admission",
@@ -739,6 +745,14 @@ def render_todo_next_release_status(data: dict[str, Any]) -> str:
     shapes = {s["name"]: s for s in data["shapes"]}
     tp4 = shapes["tp4-ring"]
     tp3 = shapes["tp3-triangle"]
+    if tp3["qualified_release"] == data["promoted_short"]:
+        return (
+            f"Production is **{data['promoted_short']}** (`manifests/baselines/{data['promoted_baseline']}.json`, "
+            f"image `{data['image_tag']}`), promoted {data['promoted_date']} across `tp4-ring` "
+            f"([suite reference]({tp4['benchmark_reference']}/)), `tp3-triangle` "
+            f"([suite reference]({tp3['benchmark_reference']}/)), and `tp3-switched`..`tp8-switched` "
+            f"([release record](experiments/2026-10-26-spark-ds41f-candidate/README.md))."
+        )
     return (
         f"Production is **{data['promoted_short']}** (`manifests/baselines/{data['promoted_baseline']}.json`, "
         f"image `{data['image_tag']}`), promoted {data['promoted_date']} on `tp4-ring` "
@@ -757,6 +771,9 @@ def render_todo_current_reference(data: dict[str, Any]) -> str:
     tp3_ref = data["suites_by_path"][shapes["tp3-triangle"]["benchmark_reference"]]
     p4 = {row["size"]: row["tps"] for row in tp4_ref["prefill"]}
     p3 = {row["size"]: row["tps"] for row in tp3_ref["prefill"]}
+    s3_3 = tp3_ref["stalls"].get("stall-3", {}).get("probe_ttft_p50_s")
+    s6_3 = tp3_ref["stalls"].get("stall-6", {}).get("probe_ttft_p50_s")
+    tp3_stall = f"{s3_3:.2f} s / {s6_3:.2f} s" if s3_3 is not None and s6_3 is not None else "—"
 
     lines = [
         f"Active baseline manifest: [`manifests/baselines/{data['promoted_baseline']}.json`](manifests/baselines/{data['promoted_baseline']}.json) (`{data['promoted_short']}`). "
@@ -777,7 +794,7 @@ def render_todo_current_reference(data: dict[str, Any]) -> str:
         f"| Prefill 262K (tok/s) | {p4[262144]:,.0f} | {p3[262144]:,.0f} |",
         f"| Prefill 524K (TP4) / 500K (TP3) (tok/s) | {p4[524288]:,.0f} | {p3.get(524288, p3.get(500000)):,.0f} |",
         f"| Prefill 1M (tok/s) | {p4[1000000]:,.0f} | {f'{p3[1000000]:,.0f}' if 1000000 in p3 else '3,952'} |",
-        f"| Short-request TTFT p50 during 131K prefill (3 / 11 streams) | {tp4_ref['stalls']['stall-3']['probe_ttft_p50_s']:.2f} s / {tp4_ref['stalls']['stall-11']['probe_ttft_p50_s']:.2f} s | — |",
+        f"| Short-request TTFT p50 during 131K prefill (3 / 11 TP4 or 3 / 6 TP3 streams) | {tp4_ref['stalls']['stall-3']['probe_ttft_p50_s']:.2f} s / {tp4_ref['stalls']['stall-11']['probe_ttft_p50_s']:.2f} s | {tp3_stall} |",
     ]
     return "\n".join(lines)
 

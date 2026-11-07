@@ -1,3 +1,62 @@
+# spark-ds41f-1107: release notes
+
+`spark-ds41f-1107` ([manifests/baselines/2026-11-07-spark-ds41f-1107.json](../../manifests/baselines/2026-11-07-spark-ds41f-1107.json),
+[releases/spark-ds41f-1107/](../../releases/spark-ds41f-1107/)) is a release of this deployment,
+named after the day it is promoted. The model is DeepSeek-V4.1-Flash-1017, DeepSeek's checkpoint,
+with native weights.
+
+It advances `spark-ds41f-1030` across vLLM (`641` active patches through `0761` in
+[1107/vllm/series](1107/vllm/series); `patch_head` `320021e3`, `expected_tree` `ed1bdb7a`) and
+`sparknet` (`3` active patches `0002..0004` in [1107/sparknet/series](1107/sparknet/series);
+`patch_head` `1f84980b`, `expected_tree` `b86dc07f`). Image `spark-ds41f:1107`
+(`sha256:3f32a962ce04b7c8d85337cd427a8946b8b6bcaadd97cc8d8a8cd14e8d68a6ce`).
+
+For the first time, the release is qualified across all eight supported topologies:
+- **Switchless (`dgx1..dgx4`):** `tp4-ring` and `tp3-triangle` (`1,048,576` context).
+- **Switched (`sp1..sp8`):** `tp3-switched`, `tp4-switched`, `tp5-switched`, `tp6-switched`,
+  `tp7-switched`, and `tp8-switched` (`1,048,576` context).
+
+## Highlights (`spark-ds41f-1107` vs `spark-ds41f-1030`)
+
+- **Faster across every workload on both switchless topologies:**
+  - **`tp4-ring` (`dgx1..dgx4`):** paired decode `+5.30%` at `c16` (`272.86 tok/s`), `+4.04%` at
+    `c8` (`207.45 tok/s`), `+4.92%` at `c1` (`82.62 tok/s`); engine decode grid `-14.36%` geometric
+    mean (`21.48 ms` vs `25.09 ms`, `20/20` shapes faster); prefill `+8.34%` to `+17.05%` from
+    `32K` to `1M` (`8,508` / `8,657` / `8,261` / `7,460` / `6,012 tok/s`); sampled decode `+4.56%`
+    to `+6.40%` (`268.31` / `201.40` / `79.56 tok/s`); short-request TTFT p50 during `131K` prefill
+    under `3` and `11` streams `-69.22%` (`3.30 s -> 1.02 s`) and `-59.92%` (`3.59 s -> 1.44 s`);
+    greedy `256/256` identical.
+  - **`tp3-triangle` (`dgx1..dgx3`):** paired decode `+1.70%` at `c8` (`160.80 tok/s`), `+2.04%` at
+    `c4` (`123.73 tok/s`), `+2.59%` at `c1` (`64.28 tok/s`); engine decode grid `-15.36%` geometric
+    mean (`21.29 ms` vs `25.15 ms`, `15/15` shapes faster); prefill `+2.99%` to `+10.55%` from
+    `32K` to `1M` (`6,452` / `6,480` / `6,135` / `5,514` / `4,434 tok/s`); sampled decode `+1.92%`
+    to `+2.28%` (`156.64` / `156.25` / `62.80 tok/s`); short-request TTFT p50 during `131K` prefill
+    under `3` and `6` streams `-47.10%` (`2.03 s -> 1.07 s`) and `-87.67%` (`9.59 s -> 1.18 s`);
+    greedy `256/256` identical.
+- **Full `tp3-switched` through `tp8-switched` qualification (`sp1..sp8`):**
+  - Arbitrary tensor-parallel world sizes (`TP=3, 4, 5, 6, 7, 8`) with `64` routed MoE experts and
+    `4` attention heads via cyclic KV head replication and deduplicated linear-projection outputs
+    (`0756..0759`).
+  - All 6 switched shapes passed 2-boot `bin/spark bench` ([manifests/benchmarks/2026-11-07-spark-ds41f-1107-switched.json](../../manifests/benchmarks/2026-11-07-spark-ds41f-1107-switched.json) and `switched{3,5,6,7,8}.json`), collective probes, and `tp3-switched`, `tp4-switched`, `tp8-switched` `servebench`, quality evals, and 1-hour `AgentX` `c8` runs.
+- **TP3 Cold-Boot Capture Headroom (`0761`):** flushes the PyTorch CUDA caching allocator and trims
+  glibc's host arena between weight load, kernel warmup, KV cache allocation, CUDA Graph capture,
+  and speculator capture, raising `tp3-switched` cold-boot `min_available_gib` on `sp5..sp7` from
+  `<3.46 GiB` to `6.03..6.45 GiB` on head `sp5` (`7.94..8.10 GiB` on followers `sp6..sp7`).
+- **Release Gate, Quality Evals, and AgentX:**
+  - Image unit/contract test suite: `648 passed, 0 failed` (`build-check` `6/6`, `patch-contracts`
+    `337/337`, `test-suites` `305/305`).
+  - Determinism gate: `20/20` bit-identical across `tp4-ring`, `tp3-triangle`, `tp3-switched`,
+    `tp4-switched`, and `tp8-switched`.
+  - Quality evals (`tp3-triangle`, `tp4-ring`, `tp3-switched`, `tp4-switched`, `tp8-switched`):
+    `LongBench v2` `8/12` (`66.67%`), `RULER` (`4K..256K`) `26/26` (`100.0%`), `EvalPlus HumanEval+`
+    `164/164` base (`100.0%`) / `156/164` plus (`95.1%`), `Vision Eval` `83.25%` (`1900.5/2283`), and
+    `tool-eval-bench` (`v3.0.1.dev10+g1cd7309e5`) `90..91/100` (`Grade A`, `86/100` deployability).
+  - `AgentX` (`1h`, `c8`, `seed 42`): `125.91 tok/s` (`tp3-switched`), `158.89 tok/s`
+    (`tp4-switched`), `165.32 tok/s` (`tp4-ring`, `756` requests, `96.74%` prefix cache hit rate),
+    and `216.92 tok/s` (`tp8-switched`), all with `0` errors and `0` preemptions.
+
+---
+
 # spark-ds41f-1030: release notes
 
 spark-ds41f-1030 is a release of this deployment, named after the day it is promoted. The model

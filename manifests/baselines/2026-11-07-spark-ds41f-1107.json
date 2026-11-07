@@ -1,0 +1,233 @@
+{
+  "schema_version": 1,
+  "status": "promoted-baseline",
+  "captured_at": "20261107T193500Z",
+  "container_name": "spark-ds41f",
+  "shape": "tp4-ring",
+  "image_tag": "spark-ds41f:1107",
+  "image_id": "sha256:3f32a962ce04b7c8d85337cd427a8946b8b6bcaadd97cc8d8a8cd14e8d68a6ce",
+  "nodes": {
+    "dgx1": {
+      "image_id": "sha256:3f32a962ce04b7c8d85337cd427a8946b8b6bcaadd97cc8d8a8cd14e8d68a6ce",
+      "role": "api-head-rank-0"
+    },
+    "dgx2": {
+      "image_id": "sha256:3f32a962ce04b7c8d85337cd427a8946b8b6bcaadd97cc8d8a8cd14e8d68a6ce",
+      "role": "headless-rank-1"
+    },
+    "dgx3": {
+      "image_id": "sha256:3f32a962ce04b7c8d85337cd427a8946b8b6bcaadd97cc8d8a8cd14e8d68a6ce",
+      "role": "headless-rank-2"
+    },
+    "dgx4": {
+      "image_id": "sha256:3f32a962ce04b7c8d85337cd427a8946b8b6bcaadd97cc8d8a8cd14e8d68a6ce",
+      "role": "headless-rank-3"
+    }
+  },
+  "source_identity": {
+    "vllm_repository": "https://github.com/local-inference-lab/vllm",
+    "vllm_ref": "integration/karmic-kraken-beta",
+    "vllm_revision": "19f2c20ed4d64ae22bd009ceacadd85e2a81e354",
+    "vllm_patch_head": "320021e3c4dbb202d911ab70e2cd924c75420488",
+    "vllm_tree": "ed1bdb7a7684da33d403a055521ac0c4dd7ca670",
+    "b12x_repository": "https://github.com/local-inference-lab/b12x",
+    "b12x_ref": "integration/karmic-kraken-beta",
+    "b12x_revision": "236ddff04a5f5064084b46464800b70b34ec7d8c",
+    "b12x_patch_head": "69e5795e2141fbb5fa2b3af096d51e754939bb41",
+    "b12x_tree": "1a647a311ca55d45070ab83d60668d9c8fb8886c",
+    "nccl_repository": "https://github.com/NVIDIA/nccl",
+    "nccl_ref": "refs/tags/v2.30.7-1",
+    "nccl_revision": "73cf112295c33aee2b895f329f592f2a9b4b0f97",
+    "nccl_patch_head": "eeacf1c6343f0499e4e7ab20ec7eecfb6f62eda6",
+    "nccl_tree": "6af10aa730a64fcee8781d62340a9c9184e79469",
+    "runtime_base_image": "docker.io/vllm/vllm-openai@sha256:3cf14c52765a0f0c2f09035e05fa79e1e4b2f9788b64afa90fa41c1ff12d29cf",
+    "image_build_deployment_commit": "59f523c543cb61e5a2d0df616cb4efa459677b35",
+    "model_revision": "1bae0e1088993b9b82de08f59de5be5a34e42170",
+    "image_build_recipe": "bin/spark build (docker/Dockerfile, runtime-tilelang-sparknet stage)",
+    "tilelang_repository": "https://github.com/tile-ai/tilelang",
+    "tilelang_ref": "main",
+    "tilelang_revision": "2123e412ce2217b324c50c4ec967213906456ac5",
+    "tilelang_patch_head": "92a1d3a0eba72b440297d4090bbfc498a47b0eb6",
+    "tilelang_tree": "e2b001828fd4e38e6a2eee61f818d5083cb1335f",
+    "tilelang_version": "0.1.15+snapshot.35f15411cf3af0fc06a1cb0097215b1372a40464",
+    "tile_kernels_repository": "https://github.com/deepseek-ai/TileKernels",
+    "tile_kernels_ref": "main",
+    "tile_kernels_revision": "66258df6175d2f630ffecb04c5ab66bff8a2ae6a",
+    "tile_kernels_patch_head": "edfa64d018bc64006fcb07c95c32fa196363c0ae",
+    "tile_kernels_tree": "cb2fa41c8af290204c81c547ed678ebf957cca53",
+    "tile_kernels_version": "2.0.0",
+    "sparknet_repository": "https://github.com/christopherowen/dgx-spark-networking",
+    "sparknet_ref": "refs/heads/main",
+    "sparknet_revision": "1fd6a1fbd8dc4884057046d1ebd93d585c9e4bcf",
+    "sparknet_patch_head": "1fd6a1fbd8dc4884057046d1ebd93d585c9e4bcf",
+    "sparknet_tree": "8cc28a5cd3e683c1f114ed843453e3ce34f323e0",
+    "sparknet_version": "0.5.0",
+    "model_repository": "deepseek-ai/DeepSeek-V4.1-Flash-1017"
+  },
+  "runtime_choices": {
+    "kernel_backend": "tilelang: TileLang is the only kernel family (vLLM 0493-0496: the B12X family, VLLM_DS41_KERNEL_BACKEND, the ported kernels' Triton originals and B12X remnants go); every kernel serving launches is TileLang except NCCL and a few rare-path ATen copies. B12X 1.3.0 is still in the image for its loader plugin's package, unloaded (VLLM_PLUGINS empty)",
+    "speculative": "DSpark, 5 tokens (the drafter's trained block), draft TP equal to node count (TP 3..8), greedy drafting with block verification; adaptive verification budgets each step's drafts by a rule of the inputs (adaptive_verification_row_cost 0.035, vLLM 0184, 0636) with online IRLS confidence calibration and margin/depth pruning (0637-0641) and CopyDrafter caller-stream continuation/expected-yield pruning (0568-0570, 0688-0691). Nothing is timed at boot.",
+    "cudagraph": "FULL_AND_PIECEWISE, capture sizes 1-96 on the ring and TP4..8 switched (16 streams at 1 + 5 rows); 1-48 on the triangle and TP3 switched (8 streams); native-depth verification shapes included in capture and preparation (vLLM 0613-0617); CUDA caching allocator and glibc heap flushed across preparation, profiling, warmup and capture phases (vLLM 0761)",
+    "max_num_batched_tokens": "16384 on the ring and TP4..8 switched; 6144 on the triangle and TP3 switched (threshold 5984); context-aware prefill chunk step-down at >=256K context and >=1.0s stall decode interleave (vLLM 0581-0584, 0710-0712)",
+    "memguards_gib": {
+      "startup": 5,
+      "steady": 3
+    },
+    "flashinfer_autotune": "disabled (--no-enable-flashinfer-autotune): without it the autotuner's dummy runs start; no FlashInfer kernel serves",
+    "engram_projection": "sharded across ranks (projection_tp, padded to 25632 rows by vLLM patch 0001)",
+    "engram_rows": "one process-wide native reader thread (no Python, no GIL, no CUDA calls) reads both tables' rows in layer order with prebuilt io_uring helpers and multi-CTA packed/cached row gather (vLLM 0145-0154, 0650, 0703-0709)",
+    "compile_cache": "/cache/spark-ds41f/jit/vllm",
+    "multimodal": "row-parallel TileLang vision tower loaded across TP ranks with multi-image packing (vLLM 0651-0656, 0745-0757); frozen release recipe qualified at 16 images per request (--limit-mm-per-prompt '{\"image\":16}'); --mm-processor-cache-gb 0",
+    "host_sysctl": "vm.watermark_boost_factor=0 on every node (/etc/sysctl.d/90-watermark-boost.conf): a watermark boost hides up to 0.87 GiB from MemAvailable, which the memory guards read",
+    "l2_prefetch": "on: side-stream per-type L2 prefetch schedule of the next decode projections (VLLM_L2_PREFETCH_KERNELS=tilelang; vLLM 0119, 0575-0577); the TileLang scale words ride with each projection's weight (vLLM 0044)",
+    "nccl": "2.30.7 rebuilt with patches/nccl (NVIDIA/nccl#2393 IB send-path fence and the switchless ring/triangle patches) in place of the base image's wheel; TP3 triangle runs 6-channel bidirectional 8 MiB Ring (vLLM 0758-0760)",
+    "chat_template_defaults": "none: thinking is the default when a request names neither key, so a client's enable_thinking=false is honored",
+    "prefill": "sequence-parallel once a forward's reduce-scatter exceeds the one-shot RoCE all-reduce (205 tokens; vLLM patches 0014-0018); MXFP8 route gather and CED local boundary/KV projection (0578-0580, 0672-0676)",
+    "host": "mutating torch custom ops read their argument schema once per call (vLLM patch 0019, vllm/env_override.py), not once per argument",
+    "cutlass_dsl": "4.7.1 for every consumer (vLLM, quack-kernels, B12X via patch 0002, FlashInfer, cuDNN frontend)",
+    "jit_caches": "driver PTX JIT cache (CUDA_CACHE_PATH, 4 GiB limit), the TileLang cache and the Triton cache (the head's load-time packing) on the /cache mount",
+    "jit_warmup": "trimmed cold-boot kernel preparation (vLLM 0156-0172, 0585-0587, TileLang 0004, 0013): before memory profiling each rank compiles every declared TileLang call in one pool and runs TileKernels' warm calls, then freezes TileLang's cache. The JIT monitor is off (--jit-monitor-mode off)",
+    "display_carveout": "off on the ring and TP4..8 switched (SPARK_DS41F_DISPLAY_CARVEOUT_WEIGHTS=0); on for the triangle and TP3 switched (=1), whose KV budget needs it",
+    "indexer_split": "always under sequence-parallel prefill (patch 0025); indexer wq_b RoPE+MXFP4 epilogue fusion and q-cast reuse (vLLM 0642-0644, 0699-0702)",
+    "display_carveout_check": "off (SPARK_DS41F_DISPLAY_CARVEOUT_CHECK_SECONDS unset; patch 0026 debug mode)",
+    "topk_ties": "lowest logical position; indexer selections repeat exactly (TileLang)",
+    "dense_gemm_stage_release": "not applicable: the TileLang GEMMs' fences are split-K's device-scope fences and multi-warp TMA producer rendezvous (TileLang 0013)",
+    "prefill_stage_release": "not applicable: TileLang prefill kernels only",
+    "host_memory": "64 KiB pages; memory-saver DKMS 0.4.1, UVM leaf-table packing enabled; THP never, vm.min_free_kbytes=45166, /swap-64k.img; contiguous direct-loader arena with order-13 sponge (vLLM 0571-0574) and inter-phase allocator/heap flush (vLLM 0761)",
+    "vocabulary_head": "exact 12-bit packed BF16 (VLLM_DS41_PACKED_BF16_LM_HEAD=1; B12X 0012, vLLM 0028): a 4-bit exponent window code plus a per-row list of out-of-window values, bit-identical to the BF16 weights; logits in FP32 (VLLM_DS41_HEAD_DTYPE=float32)",
+    "collective_policy": "sparknet 0.5.0 (`1fd6a1fbd8dc`, tree `8cc28a5cd3e6`): one-shot RoCE all-reduce restricted to single-slot transfers (<= _slot_bytes, 2 MiB) so large SP prefill chunks use PyNCCL; one-shot all-gather over the ring (`oneshot-ring4`), triangle (`oneshot-direct`), and switched fabric (`oneshot-switched`); GPU-clock timeout 10 s (`SPARKNET_ROCE_TIMEOUT_MS=10000`); proxy thread on a big core (`SPARKNET_ROCE_PROXY_CPU=big`)",
+    "profiling_context": "the fabricated context of startup profiling and dummy runs takes its own blocks per KV cache group and request (vLLM 0039)",
+    "four_node_transports": "sparknet's ring4 transport at TP4 switchless and oneshot-switched across TP3..TP8 switched",
+    "decode_tiles": "block-32 FP8 decode rows on 16-, 32- or 64-row tiles by row count, and split-K tiles up to 128 rows for 16-stream steps, TileLang's unspecialized pipeline; selective 12-bit compressor pack12 (vLLM 0695-0698)",
+    "batch_invariance": "temperature-0 outputs do not depend on the batch: rank-order FP32 reductions with one rounding, compressor projection one TileLang arithmetic at every row count, aligned prefill chunks, CED local boundary/KV projection, and per-request sparse MLA in mixed steps",
+    "long_prefill_token_threshold": 16288,
+    "reference_precision": "DeepSeek's reference inference/model.py term for term: FP32 logits; exact FP32 mHC stream projection; shared expert SwiGLU in FP32 with one rounding; MoE partials rounded once per rank; WO-A's input through act_quant",
+    "greedy_verification": "an all-greedy verification step whose logits nothing reads reduces each rank's vocabulary shard to a (max, index) pair and applies rejection_sample's greedy rule (vLLM 0112-0114)",
+    "moe_shared_fold": "the shared expert's output is added in the TileLang MoE combine with one rounding also when it runs on the aux stream (vLLM 0111, 0116)",
+    "vocabulary_head_grid": "token tiles vary fastest in the head kernel's grid (vLLM 0117)",
+    "wo_projection": "TileLang: sparse MLA stores WO-A's input; WO-A is a W8A16 GEMM on those BF16 values with split-K tiles up to 128 rows and in-kernel tiles past that; its last kernel rounds to BF16 and applies the reference's per-token cast for WO-B",
+    "dspark_context_kv": "TileLang block-32 projection with fused KV write (vLLM 0131, 0647)",
+    "sparse_mla_fold": "every route (split, decode, extend) folds a segment as fma(l, b, L * a) (vLLM 0132)",
+    "startup_rendezvous": "ranks meet before memory profiling on liveness, not a deadline",
+    "draft_budget": "fixed linear step cost (adaptive_verification_row_cost 0.035, vLLM 0184, 0636) with online IRLS confidence calibration (0637-0641)",
+    "nan_contracts": "non-finite contracts for ten kernel families (vLLM 0134-0138, patches/tile_kernels 0001)",
+    "engram_prefill": "under prefill sequence parallelism each rank sends every other rank only that rank's real rows of its Engram wkv column block (vLLM 0150, 0152), and the TileLang gate reads the received blocks in place",
+    "checkpoint_copies": "direct O_DIRECT loader with contiguous arena and order-13 sponge (vLLM 0499, 0571-0574)",
+    "engram_debug_timeline": "off (SPARK_DS41F_ENGRAM_TIMELINE)",
+    "sampling_defaults": "DeepSeek's recommendation for V4.1 Flash 1017: temperature 1.0, top_p 1.0 for requests that set none",
+    "chat_encoding": "DeepSeek's 2026-10-16 encoding (vLLM 0178, 0227)",
+    "model_mount": "the Hugging Face hub cache mounted whole at /hub, served from /hub/<snapshot>",
+    "row_exchange": "Engram's sequence-parallel row all-to-all (vLLM 0150, 0180)",
+    "routed_swiglu": "TileLang moe_swiglu_cast (vLLM 0181)",
+    "expert_scale_codes": "routed experts' UE8M0 weight scales as a per-row base exponent and 4-bit deltas (vLLM 0182-0183), with 2-bit deltas for narrow experts in the same buffer (0563-0564, 0566)",
+    "late_admission": "the async engine decides step N+1 when step N reaches decoder layer 30 (VLLM_LATE_ADMISSION_LAYER=30, vLLM 0222, 0226)",
+    "sink_rejection": "on by default for DeepSeek V4.1 (vLLM 0221, 0223, 0264)",
+    "names": "container spark-ds41f, image repository spark-ds41f, labels local.spark-ds41f.*, sources under /opt/spark-ds41f, SPARK_DS41F_* variables, caches under /cache/spark-ds41f",
+    "malloc": "glibc malloc pinned in every process (MALLOC_ARENA_MAX=2, MALLOC_MMAP_THRESHOLD_=1048576)",
+    "ced": "compressed-entry row selection in TileLang (vLLM 0229-0255) with fused mHC post-collapse dedup (0648) and local boundary/KV projection (0672-0676)",
+    "block_verification_sampling": "fresh random draws in each verification round (vLLM 0228)",
+    "generation_controls": "V4.1's tokenizer honours add_generation_prompt and continue_final_message (vLLM 0256), and top-level `thinking` switch (0257)",
+    "prompt_tokens_details": "on (--enable-prompt-tokens-details): every response's usage reports its prompt-cache hits, with prefix endpoint retention (vLLM 0609-0612)",
+    "glp_steering": "served: requests to deepseek-v4.1-flash-weightless are steered per request with msuiche's published GLP vector for 1017 (vLLM 0541-0542)",
+    "max_logprobs": "at most 32; the recipe runs vLLM's default of 20",
+    "prompt_logprobs": "a request's prompt logprobs go out with it under sink rejection (vLLM 0266, 0720)",
+    "logprob_token_ids": "speculatively verified tokens carry their custom logprob ids (vLLM 0267)",
+    "token_ranks": "selected-token ranks exclude the vocabulary padding (#504, vLLM 0720)",
+    "vision_tower": "row-parallel TileLang vision tower with multi-image packing (vLLM 0651-0656, 0745-0757); 83.25% overall on the 2,283-item public multimodal benchmark across TP3, TP4 and TP8",
+    "load_format": "direct (--load-format direct, vLLM 0499); VLLM_PLUGINS is empty",
+    "prefill_yield": "short (--prefill-yield short, --prefill-yield-limit-s 10; vLLM 0545) plus >=256K chunk step-down and >=1.0s stall decode interleave (0581-0584, 0710-0712)",
+    "engram_host_hash": "host hashes Engram rows of prefill tokens a step early except drafted-prefill requests (vLLM 0567)",
+    "kv_figure": "startup KV figure charges each request its window and the unsettled batches once (vLLM 0491): 11,554,122 tokens (11.02x) at TP4..8; 5,488,353 tokens (5.23x) at TP3",
+    "kv_writes": "no per-allocation KV zeroing (vLLM 0502-0503); global KV fused norm+RoPE+write (0645-0646)",
+    "decode_chain_pdl": "programmatic dependent launch along the decode chain (vLLM 0520-0525, 0716-0719, 0725-0728) and attention front in one launch (0543-0544)",
+    "block_scales": "MXFP8 GEMMs load the 32x32 block-scale grid at SFB[row // 32] (vLLM 0537); grouped MoE GEMM coded arrivals (0538)",
+    "iket": "available, off by default (VLLM_DS41_IKET unset; vLLM 0546-0562, 0565, 0729-0744)",
+    "deepseek_api": "DeepSeek API effort aliases, prompt semantics, HTTP disconnect and repeated cancellation handling (vLLM 0539-0540, 0603-0608)",
+    " uneven_tp_sharding": "TP2..TP8 cross-topology parity with padded uneven shards across attention, MoE, Engram, vision and vocabulary projections (vLLM 0625-0635, 0692-0694)"
+  },
+  "capacity": {
+    "tp4": {
+      "kv_cache_tokens": 11554122,
+      "max_model_len": 1048576,
+      "max_num_seqs": 16,
+      "reported_full_context_concurrency": 11.02,
+      "kv_cache_memory_bytes": 11274289152,
+      "note": "the ring and TP4..8 switched (10.5 GiB KV pool per rank, 11,554,122 tokens, 11.02 full 1M contexts)"
+    },
+    "tp3-triangle": {
+      "kv_cache_tokens": 5488353,
+      "max_model_len": 1048576,
+      "max_num_seqs": 8,
+      "reported_full_context_concurrency": 5.23,
+      "kv_cache_memory_bytes": 5268045824,
+      "memory": {
+        "dgx1": {
+          "min_available_gib": 6.03,
+          "swap_growth_gib": 0.0
+        },
+        "dgx2": {
+          "min_available_gib": 7.94,
+          "swap_growth_gib": 0.0
+        },
+        "dgx3": {
+          "min_available_gib": 7.99,
+          "swap_growth_gib": 0.0
+        }
+      },
+      "note": "the triangle (4.90625 GiB KV pool per rank, 5,488,353 tokens, 5.23x full 1M contexts); startup memory floor verified across two cold/warm boots with vLLM 0761 inter-phase allocator and glibc heap flush (head min 6.03 GiB, workers min 7.94 / 7.99 GiB, 0 swap growth)"
+    },
+    "note": "qualified across tp4-ring, tp3-triangle, and tp3..tp8 switched"
+  },
+  "change_from_previous": "spark-ds41f-1030 plus vLLM 0568-0761 (641 active vLLM patches), TileLang 2123e412ce22 with 13 SM120/SM121 patches (0001-0013 including multi-warp TMA producer rendezvous), and sparknet 1fd6a1fbd8dc (single-slot one-shot RoCE all-reduce cap): TileLang runtime closure and serving contract; direct-loader contiguous arena with order-13 sponge; per-type L2 prefetch schedule; SP prefill MXFP8 route gather; context-aware >=256K chunk step-down and >=1.0s stall decode interleave; trimmed cold-boot kernel preparation; HTTP disconnect and repeated cancellation; prefix endpoint retention; native-depth verification shapes; TP2..TP8 uneven-shard padding and cross-topology parity; DSpark online IRLS confidence calibration, margin/depth pruning, and CopyDrafter caller-stream continuation/expected-yield pruning; indexer wq_b RoPE+MXFP4 epilogue fusion; global KV and DSpark context fused KV writes; mHC post-collapse fused CED dedup and local boundary/KV projection; prebuilt io_uring helpers and multi-CTA packed/cached disk Engram rows; selective 12-bit compressor pack12; opt-in LSA shortlist indexing; Markov/PDL/prompt-ranks/routed-MoE-PDL polish; IKET runtime loop/phase profiler; row-parallel vision tower with multi-image packing and 16-image cap; TP3 6-channel bidirectional 8 MiB NCCL Ring; and inter-phase CUDA caching allocator and glibc heap flush during startup and CUDA graph capture (0761)",
+  "evidence": {
+    "experiments": [
+      "experiments/2026-10-26-spark-ds41f-candidate/",
+      "experiments/2026-10-26-spark-ds41f-candidate/1107/"
+    ],
+    "summary": "Qualified across all 8 hardware shapes (`tp4-ring` and `tp3-triangle` switchless on dgx1..dgx4; `tp3-switched` through `tp8-switched` on sp1..sp8). Image unit/contract test suite: 648 passed, 0 failed (`build-check` 6/6, `patch-contracts` 337/337, `test-suites` 305/305). On `tp4-ring` (manifests/suites/2026-11-07-spark-ds41f-1107-tp4, 2-boot release comparison against spark-ds41f-1030): decode grid -14.36% (21.48 ms vs 25.09 ms, better); paired decode c16 +5.30% (272.86 tok/s), c8 +4.04% (207.45 tok/s), single-stream c1 +4.92% (82.62 tok/s) (all better); sampled c16 +6.40% (268.31 tok/s), c8 +4.56% (201.40 tok/s), c1 +5.86% (79.56 tok/s) (all better); prefill +16.34% / +17.05% / +16.03% / +14.10% / +8.34% at 32K / 131K / 262K / 524K / 1M (8,508 / 8,657 / 8,261 / 7,460 / 6,012 tok/s, all better); short-request TTFT p50 during 131K prefill under 3 and 11 streams -69.22% (3.30s -> 1.02s) and -59.92% (3.59s -> 1.44s) with 131K prefill under 3 and 11 streams +5.32% and +1.98% (better); 20/20 cross-boot determinism gate passed; 960K needle pass; quality evals: LongBench v2 8/12 (66.7%), RULER 26/26 (100.0%), EvalPlus HumanEval 164/164 (100.0%) base / 156/164 (95.1%) plus, Vision Eval 83.25% (1900.5/2283), tool-eval-bench v3.0.1 91/100 (Grade A, 86/100 deployability); 1-hour AgentX c8 165.32 tok/s (756 requests, 0 errors, 0 preemptions, 96.74% prefix cache hit rate). On `tp3-triangle` (manifests/suites/2026-11-07-spark-ds41f-1107-tp3, 2-boot release comparison against spark-ds41f-1030): decode grid -15.36% (21.29 ms vs 25.15 ms, better); paired decode c8 +1.70% (160.80 tok/s), c4 +2.04% (123.73 tok/s), single-stream c1 +2.59% (64.28 tok/s) (all better); sampled c16 +1.92% (156.64 tok/s), c8 +2.08% (156.25 tok/s), c1 +2.28% (62.80 tok/s) (all better); prefill +9.58% / +10.55% / +9.30% / +7.84% / +2.99% at 32K / 131K / 262K / 524K / 1M (6,452 / 6,480 / 6,135 / 5,514 / 4,434 tok/s, all better); short-request TTFT p50 during 131K prefill under 3 and 6 streams -47.10% (2.03s -> 1.07s) and -87.67% (9.59s -> 1.18s); startup memory floor with vLLM 0761 verified across 2 boots at 6.03 GiB head / 7.94 GiB workers (0 swap); 20/20 determinism gate and all 5 quality evals passed. On `tp3-switched` through `tp8-switched` (manifests/benchmarks/2026-11-07-spark-ds41f-1107-switched*.json): all 6 shapes passed 2-boot bin/spark bench, collective probes, and TP3/TP4/TP8 switched servebench, quality evals, and 1-hour AgentX c8 runs (125.91 / 158.89 / 216.92 tok/s, 100% session completion, 0 HTTP errors)."
+  },
+  "build": {
+    "image": "spark-ds41f:1107",
+    "image_id": "sha256:3f32a962ce04b7c8d85337cd427a8946b8b6bcaadd97cc8d8a8cd14e8d68a6ce",
+    "built_utc": "2026-11-07T16:40:25Z",
+    "build_host": "sp1",
+    "copies": "sp1 to sp2..sp8 and dgx1..dgx4; the same image ID on every node",
+    "built_as": "spark-ds41f:1107",
+    "note": "built as spark-ds41f:1107 at commit 59f523c543cb61e5a2d0df616cb4efa459677b35: one image ID across all 12 nodes"
+  },
+  "benchmark_reference": "manifests/suites/2026-11-07-spark-ds41f-1107-tp4",
+  "recipe": "releases/spark-ds41f-1107/cluster.json",
+  "qualified_arms": {
+    "tp4-ring": "experiments/2026-10-26-spark-ds41f-candidate/1107/tp4.json",
+    "tp4-switched": "experiments/2026-10-26-spark-ds41f-candidate/1107/tp4-switched.json",
+    "tp5-switched": "experiments/2026-10-26-spark-ds41f-candidate/1107/tp5-switched.json",
+    "tp6-switched": "experiments/2026-10-26-spark-ds41f-candidate/1107/tp6-switched.json",
+    "tp7-switched": "experiments/2026-10-26-spark-ds41f-candidate/1107/tp7-switched.json",
+    "tp8-switched": "experiments/2026-10-26-spark-ds41f-candidate/1107/tp8-switched.json",
+    "tp3-triangle": "experiments/2026-10-26-spark-ds41f-candidate/1107/tp3.json",
+    "tp3-switched": "experiments/2026-10-26-spark-ds41f-candidate/1107/tp3-switched.json"
+  },
+  "previous_baseline": "2026-10-30-spark-ds41f-1030",
+  "hosts": {
+    "os": "DGX Spark 26.09.2 (dgx-spark-ota-update-meta)",
+    "kernel": "7.0.0-1019-nvidia-64k with kho=off",
+    "nvidia_driver": "580.178.04",
+    "boot_target": "multi-user.target (no desktop)",
+    "sysctl": "vm.watermark_boost_factor=0",
+    "page_size": 65536,
+    "memory_saver": {
+      "package": "dgx-spark-memory-saver",
+      "version": "0.4.1",
+      "repository": "https://github.com/christopherowen/dgx-spark-memory-saver.git"
+    },
+    "secure_boot": "enabled; existing enrolled DGX Fleet key signs the DKMS module",
+    "uvm_leaf_packing": "Y",
+    "boot_default": "7.0.0-1019-nvidia-64k; 7.0.0-1019-nvidia retained",
+    "memory_policy": {
+      "thp": "never",
+      "min_free_kbytes": 45166,
+      "swap": "/swap-64k.img"
+    },
+    "nvme_power": "APST on with 2 s / 60 s idle thresholds (applied 2026-10-16 12:48 UTC)"
+  }
+}

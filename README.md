@@ -222,14 +222,14 @@ See [docs/current-state.md](docs/current-state.md) and the manifest-driven dashb
 <!-- BEGIN GENERATED: current-baseline-summary -->
 | Shape | Ranks & transport | Context | Sequences | Batch budget | KV pool / rank | Min free RAM (head / workers) | Full contexts held (startup line) | Qualified reference |
 | --- | --- | ---: | ---: | ---: | ---: | ---: | ---: | --- |
-| `tp4-ring` **(default)** | TP4 `oneshot-ring4` (64 KiB) | 1,048,576 | 16 (up to 718,848 tok each) | 16,384 | 10.5 GiB | 20.33 / 22.58 GiB | 11 (11.03x; startup `11,554,122` / `11.02x`) | [`spark-ds41f-1030`](manifests/suites/2026-10-30-spark-ds41f-1030-tp4/) |
-| `tp4-switched` | TP4 `oneshot-switched` (64 KiB) | 1,048,576 | 16 (up to 718,848 tok each) | 16,384 | 10.5 GiB | 20.83 / 20.92 GiB | 11 (11.03x; startup `11,554,122` / `11.02x`) | [`spark-ds41f-1030`](manifests/benchmarks/2026-10-30-spark-ds41f-1030-switched.json) |
-| `tp5-switched` | TP5 `oneshot-switched` (64 KiB) | 1,048,576 | 16 (up to 718,848 tok each) | 16,384 | 10.5 GiB | 28.88 / 28.90 GiB | 11 (11.03x; startup `11,554,122` / `11.02x`) | [`spark-ds41f-1030`](manifests/benchmarks/2026-10-30-spark-ds41f-1030-switched5.json) |
-| `tp6-switched` | TP6 `oneshot-switched` (64 KiB) | 1,048,576 | 16 (up to 718,848 tok each) | 16,384 | 10.5 GiB | 43.77 / 44.18 GiB | 11 (11.03x; startup `11,554,122` / `11.02x`) | [`spark-ds41f-1030`](manifests/benchmarks/2026-10-30-spark-ds41f-1030-switched6.json) |
-| `tp7-switched` | TP7 `oneshot-switched` (64 KiB) | 1,048,576 | 16 (up to 718,848 tok each) | 16,384 | 10.5 GiB | 43.05 / 43.60 GiB | 11 (11.03x; startup `11,554,122` / `11.02x`) | [`spark-ds41f-1030`](manifests/benchmarks/2026-10-30-spark-ds41f-1030-switched7.json) |
-| `tp8-switched` | TP8 `oneshot-switched` (64 KiB) | 1,048,576 | 16 (up to 718,848 tok each) | 16,384 | 10.5 GiB | 51.90 / 52.49 GiB | 11 (11.03x; startup `11,554,122` / `11.02x`) | [`spark-ds41f-1030`](manifests/benchmarks/2026-10-30-spark-ds41f-1030-switched8.json) |
-| `tp3-triangle` | TP3 `oneshot-direct` (64 KiB) | 1,048,576 | 8 (up to 682,240 tok each) | 6,144 | 4.9062 GiB | 6.81 / 8.17 GiB | 5 (5.24x; startup `5,488,353` / `5.23x`) | [`spark-ds41f-1030`](manifests/suites/2026-10-30-spark-ds41f-1030-tp3/) |
-| `tp3-switched` | TP3 `oneshot-switched` (64 KiB) | 1,048,576 | 8 (up to 682,240 tok each) | 6,144 | 4.9062 GiB | 6.41 / 6.92 GiB | 5 (5.24x; startup `5,488,353` / `5.23x`) | [`spark-ds41f-1030`](manifests/benchmarks/2026-10-30-spark-ds41f-1030-switched3.json) |
+| `tp4-ring` **(default)** | TP4 `oneshot-ring4` (64 KiB) | 1,048,576 | 16 (up to 718,848 tok each) | 16,384 | 10.5 GiB | 21.47 / 24.32 GiB | 11 (11.03x; startup `11,554,122` / `11.02x`) | [`spark-ds41f-1107`](manifests/suites/2026-11-07-spark-ds41f-1107-tp4/) |
+| `tp4-switched` | TP4 `oneshot-switched` (64 KiB) | 1,048,576 | 16 (up to 718,848 tok each) | 16,384 | 10.5 GiB | 21.50 / 23.30 GiB | 11 (11.03x; startup `11,554,122` / `11.02x`) | [`spark-ds41f-1107`](manifests/benchmarks/2026-11-07-spark-ds41f-1107-switched.json) |
+| `tp5-switched` | TP5 `oneshot-switched` (64 KiB) | 1,048,576 | 16 (up to 718,848 tok each) | 16,384 | 10.5 GiB | 28.80 / 30.83 GiB | 11 (11.03x; startup `11,554,122` / `11.02x`) | [`spark-ds41f-1107`](manifests/benchmarks/2026-11-07-spark-ds41f-1107-switched5.json) |
+| `tp6-switched` | TP6 `oneshot-switched` (64 KiB) | 1,048,576 | 16 (up to 718,848 tok each) | 16,384 | 10.5 GiB | 43.90 / 45.90 GiB | 11 (11.03x; startup `11,554,122` / `11.02x`) | [`spark-ds41f-1107`](manifests/benchmarks/2026-11-07-spark-ds41f-1107-switched6.json) |
+| `tp7-switched` | TP7 `oneshot-switched` (64 KiB) | 1,048,576 | 16 (up to 718,848 tok each) | 16,384 | 10.5 GiB | 43.51 / 45.53 GiB | 11 (11.03x; startup `11,554,122` / `11.02x`) | [`spark-ds41f-1107`](manifests/benchmarks/2026-11-07-spark-ds41f-1107-switched7.json) |
+| `tp8-switched` | TP8 `oneshot-switched` (64 KiB) | 1,048,576 | 16 (up to 718,848 tok each) | 16,384 | 10.5 GiB | 52.74 / 53.95 GiB | 11 (11.03x; startup `11,554,122` / `11.02x`) | [`spark-ds41f-1107`](manifests/benchmarks/2026-11-07-spark-ds41f-1107-switched8.json) |
+| `tp3-triangle` | TP3 `oneshot-direct` (64 KiB) | 1,048,576 | 8 (up to 682,240 tok each) | 6,144 | 4.9062 GiB | 6.03 / 7.94 GiB | 5 (5.24x; startup `5,488,353` / `5.23x`) | [`spark-ds41f-1107`](manifests/suites/2026-11-07-spark-ds41f-1107-tp3/) |
+| `tp3-switched` | TP3 `oneshot-switched` (64 KiB) | 1,048,576 | 8 (up to 682,240 tok each) | 6,144 | 4.9062 GiB | 6.57 / 8.12 GiB | 5 (5.24x; startup `5,488,353` / `5.23x`) | [`spark-ds41f-1107`](manifests/benchmarks/2026-11-07-spark-ds41f-1107-switched3.json) |
 | `tp3-triangle-4k` | TP3 `oneshot-direct` (4 KiB) | 262,144 | 8 (up to 262,144 tok each) | 4,096 | 2.2 GiB | — | 8 (8.80x; startup `1,348,708` / `5.14x`) | unqualified (`--unqualified-shape`) |
 <!-- END GENERATED: current-baseline-summary -->
 
@@ -344,21 +344,21 @@ To reproduce the deployment on your own Sparks, follow
 <!-- BEGIN GENERATED: performance-summary -->
 Current qualified reference runs by shape (from `config/cluster.json` and `manifests/suites/`):
 
-| Metric | `tp4-ring` ([`spark-ds41f-1030`](manifests/suites/2026-10-30-spark-ds41f-1030-tp4/)) | `tp3-triangle` ([`spark-ds41f-1030`](manifests/suites/2026-10-30-spark-ds41f-1030-tp3/)) |
+| Metric | `tp4-ring` ([`spark-ds41f-1107`](manifests/suites/2026-11-07-spark-ds41f-1107-tp4/)) | `tp3-triangle` ([`spark-ds41f-1107`](manifests/suites/2026-11-07-spark-ds41f-1107-tp3/)) |
 | --- | ---: | ---: |
-| Decode step geometric mean (20 TP4 / 15 TP3 shapes) | 24.58 ms | 25.13 ms |
-| Decode, 16 streams (`c16` output tok/s) | 257.8 | — |
-| Decode, 8 streams (`c8` output tok/s) | 198.4 | 158.6 |
-| Decode, 4 streams (`c4` output tok/s) | — | 121.2 |
-| One conversation at a time (`single-stream` `c1` output tok/s) | 78.0 | 62.6 |
-| Sampled decode (`temp=1.0, top_p=1.0`), c16 / c8 / c1 (tok/s) | 252.2 / 194.9 / 75.6 | 154.9 / 153.8 / 61.4 |
-| Poisson arrivals (0.7 TP4 / 0.42 TP3 req/s), output (tok/s) | 180.4 | 119.0 |
-| Source-text prefill, 32K (tok/s) | 7,313 | 5,888 |
-| Prefill, 131K (tok/s) | 7,396 | 5,862 |
-| Prefill, 262K (tok/s) | 7,120 | 5,613 |
-| Prefill, 524K (TP4) / 500K (TP3) (tok/s) | 6,538 | 5,113 |
-| Prefill, 1M (tok/s) | 5,550 | 4,305 |
-| Short-request TTFT p50 during 131K prefill, 3 / 11 (TP4) or 3 / 6 (TP3) streams | 3.30 s / 3.59 s | 2.03 s / 9.59 s |
+| Decode step geometric mean (20 TP4 / 15 TP3 shapes) | 21.05 ms | 21.27 ms |
+| Decode, 16 streams (`c16` output tok/s) | 272.9 | — |
+| Decode, 8 streams (`c8` output tok/s) | 207.4 | 160.8 |
+| Decode, 4 streams (`c4` output tok/s) | — | 123.7 |
+| One conversation at a time (`single-stream` `c1` output tok/s) | 82.6 | 64.3 |
+| Sampled decode (`temp=1.0, top_p=1.0`), c16 / c8 / c1 (tok/s) | 268.3 / 203.8 / 80.0 | 156.6 / 157.6 / 63.3 |
+| Poisson arrivals (0.7 TP4 / 0.42 TP3 req/s), output (tok/s) | 180.2 | 119.2 |
+| Source-text prefill, 32K (tok/s) | 8,508 | 6,452 |
+| Prefill, 131K (tok/s) | 8,657 | 6,480 |
+| Prefill, 262K (tok/s) | 8,261 | 6,135 |
+| Prefill, 524K (TP4) / 500K (TP3) (tok/s) | 7,460 | 5,514 |
+| Prefill, 1M (tok/s) | 6,012 | 4,434 |
+| Short-request TTFT p50 during 131K prefill, 3 / 11 (TP4) or 3 / 6 (TP3) streams | 1.02 s / 1.44 s | 1.07 s / 1.18 s |
 <!-- END GENERATED: performance-summary -->
 
 spark-ds41f-1030 against spark-ds41f-1025 on four nodes, both serving

@@ -6,7 +6,7 @@ Unpromoted release candidate combining the validated `C40` runtime base with the
 
 | Component | Base Revision | Patch Series | Patch Count | Patch Head | Expected Tree | Patchset SHA-256 |
 |---|---|---|---:|---|---|---|
-| `vllm` | `19f2c20ed4d64ae22bd009ceacadd85e2a81e354` | `experiments/2026-10-26-spark-ds41f-candidate/1107/vllm/series` (`0001..0758`, `638` active) | `638` | `efd4342f8d2a858e2183449cf88ab78803124af9` | `263bda12d29a602c8f37b1ec43386daef8694fb6` | `346b80849634c705c8de9bae2ed9ebc07067f01755261107fdc8ec321671e8f0` |
+| `vllm` | `19f2c20ed4d64ae22bd009ceacadd85e2a81e354` | `experiments/2026-10-26-spark-ds41f-candidate/1107/vllm/series` (`0001..0761`, `641` active) | `641` | `320021e3c4dbb202d911ab70e2cd924c75420488` | `ed1bdb7a7684da33d403a055521ac0c4dd7ca670` | `26fac4e56977e6f2dc057821f8fa5d10f1d6159861843e8f725bb8a2a10cef38` |
 | `tilelang` | `2123e412ce2217b324c50c4ec967213906456ac5` | `experiments/2026-10-26-spark-ds41f-candidate/1107/tilelang/series` (`0001..0013`) | `13` | `92a1d3a0eba72b440297d4090bbfc498a47b0eb6` | `e2b001828fd4e38e6a2eee61f818d5083cb1335f` | `2142ea448ceec22c0643badfd24bba129eb4b15e3f03a0c4c8c3ccb468b8e0d1` |
 | `sparknet` | `1fd6a1fbd8dc4884057046d1ebd93d585c9e4bcf` | `none` (`refs/heads/main`) | `0` | `1fd6a1fbd8dc4884057046d1ebd93d585c9e4bcf` | `8cc28a5cd3e683c1f114ed843453e3ce34f323e0` | `e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855` |
 
@@ -46,8 +46,10 @@ Unpromoted release candidate combining the validated `C40` runtime base with the
     - Switches vision `attn.wo` and `mlp.w2` to row-parallel `all_reduce`, packs multi-image encoders into a single flash-attn launch, adds `Image.draft()` decode-time downscaling (`7.77x` at 4K), and raises `--limit-mm-per-prompt` to `{"image": 16}`.
 17. **IKET Runtime Loop & Phase Profiler (`0757`) + TileLang Multi-Warp TMA Producer Rendezvous (`tilelang/0013`)**:
     - Adds `tilelang/0013-rendezvous-multi-warp-tma-producers.patch` so multi-warp TMA producer groups synchronize at `mbarrier.arrive_expect_tx` (`0` hangs across 2-boot 10-suite release gate and 2-boot IKET verification in `experiments/2026-10-26-spark-ds41f-candidate/1107/receipts/`).
-18. **TP3 6-Channel Bidirectional 8 MiB NCCL Ring (`1107/tp3.json`)**:
+18. **TP3 6-Channel Bidirectional 8 MiB NCCL Ring (`1107/tp3.json` + `0759..0760`)**:
     - Configures `NCCL_ALGO=Ring`, `NCCL_MIN_NCHANNELS=6`, `NCCL_MAX_NCHANNELS=6`, `NCCL_BUFFSIZE=8388608`, `NCCL_P2P_NET_CHUNKSIZE=262144`, `NCCL_SWITCHLESS_BIDIRECTIONAL=1`, `NCCL_MIN_TRAFFIC_PER_CHANNEL=512`, and `NCCL_THREAD_THRESHOLDS="-2 -2 -2 1 1 1"` (`-16.1%` 42-layer collective time per step on TP3).
+19. **Startup Allocator & Host Heap Flush Across Preparation, Profiling, Warmup and Capture (`0761`)**:
+    - Calls `gc.collect()`, `torch.cuda.empty_cache()`, and `libc.malloc_trim(0)` after TileLang kernel preparation, after memory profiling, before CUDA graph capture, and between backbone and DSpark speculator graph capture. Verified across 2 cold/warm TP3 boots (`sp5..sp7`): head `MemAvailable` stays `>= 6.03 GiB` (`Boot 1: min=6.45 GiB, ready=6.68 GiB`; `Boot 2: min=6.03 GiB, ready=6.60 GiB`) and workers stay `>= 7.94 GiB` (`+1.2–1.6 GiB` headroom above the `5.0 GiB` startup guard, `0` swap growth).
 
 ## Verification
 

@@ -260,11 +260,11 @@ rollback.
 <!-- BEGIN GENERATED: active-settings -->
 | Setting | Active value |
 | --- | --- |
-| Promoted baseline | `2026-10-30-spark-ds41f-1030` (`spark-ds41f-1030`, frozen in `releases/spark-ds41f-1030/`); default shape `tp4-ring` |
+| Promoted baseline | `2026-11-07-spark-ds41f-1107` (`spark-ds41f-1107`, frozen in `releases/spark-ds41f-1107/`); default shape `tp4-ring` |
 | Served models | `deepseek-v4.1-flash` (`deepseek-ai/DeepSeek-V4.1-Flash-1017`, revision `1bae0e10`) and per-request GLP-steered `deepseek-v4.1-flash-weightless` (`msuiche/DeepSeek-V4.1-Flash-1017-abliterated-cyber-GLP-39-L1-39-a0.75`, revision `2715ffd5`) |
-| Kernel backend | TileLang only (`kernel_backend: tilelang`, vLLM 0493-0496): TileLang 0.1.15 (`222b895d`), DeepSeek TileKernels 2.0.0 (`cb2fa41c`), sparknet 0.5.0 (`f997a594`) one-shot RoCE collectives; every serving kernel is TileLang including the vision tower, CED row selection, RoPE, compressor, KV writers, Engram gate/hash/gather, sparse MLA, WO projection, drafter context-KV, sampling and block verification |
-| Sources | Local Inference Lab `integration/karmic-kraken-beta` vLLM `19f2c20e` + `experiments/2026-10-26-spark-ds41f-candidate/rc14/vllm/series` (452 patches, patch head `b6de07aa`, tree `ea1281f8`), TileLang 0.1.15 (4 patches), TileKernels 2.0.0 (1 patch), sparknet 0.5.0, NCCL 2.30.7 (4 patches, tree `6af10aa7`); direct checkpoint loader (`--load-format direct`, vLLM 0499, `VLLM_PLUGINS` empty) |
-| Image | `spark-ds41f:1030` (built as `spark-ds41f:19f2c20ed4d6-next-14`, `sha256:7918fd6145b5`), one digest on all ranks, built by `bin/spark build` |
+| Kernel backend | TileLang only (`kernel_backend: tilelang`, vLLM 0493-0496): TileLang 0.1.15+snapshot.35f15411cf3af0fc06a1cb0097215b1372a40464 (`e2b00182`), DeepSeek TileKernels 2.0.0 (`cb2fa41c`), sparknet 0.5.0 (`8cc28a5c`) one-shot RoCE collectives; every serving kernel is TileLang including the vision tower, CED row selection, RoPE, compressor, KV writers, Engram gate/hash/gather, sparse MLA, WO projection, drafter context-KV, sampling and block verification |
+| Sources | Local Inference Lab `integration/karmic-kraken-beta` vLLM `19f2c20e` + `experiments/2026-10-26-spark-ds41f-candidate/1107/vllm/series` (641 patches, patch head `320021e3`, tree `ed1bdb7a`), TileLang 0.1.15+snapshot.35f15411cf3af0fc06a1cb0097215b1372a40464 (13 patches), TileKernels 2.0.0 (1 patch), sparknet 0.5.0, NCCL 2.30.7 (4 patches, tree `6af10aa7`); direct checkpoint loader (`--load-format direct`, vLLM 0499, `VLLM_PLUGINS` empty) |
+| Image | `spark-ds41f:1107` (built as `spark-ds41f:1107`, `sha256:3f32a962ce04`), one digest on all ranks, built by `bin/spark build` |
 | Decode tiles & PDL | block-32 FP8 decode rows on 16-, 32- or 64-row tiles by row count and split-K tiles up to 128 rows for 16-stream steps, programmatic dependent launch (PDL) along the decode chain (vLLM 0520-0525), attention front in one launch (0543-0544), 64-row prefill MoE tiles and panel rasterization past L2 (0043) |
 | Batch invariance | temperature-0 outputs do not depend on the batch: rank-order FP32 reductions with one rounding, compressor projection one TileLang arithmetic at every row count, aligned prefill chunks (`--long-prefill-token-threshold` 16,288 on `tp4-ring`, 6,096 on `tp3-triangle`, 4,048 on `tp3-triangle-4k`), CED replays a prompt's last 128 rows wherever its chunks end (0526-0527), and mixed steps run sparse MLA per request |
 | Hosts | DGX Spark 26.09.2 (dgx-spark-ota-update-meta), kernel `7.0.0-1019-nvidia-64k with kho=off`, driver 580.178.04, `multi-user.target (no desktop)`, `--cpuset-cpus=5-9,15-19`, glibc malloc pinned (`MALLOC_ARENA_MAX=2`, `MALLOC_MMAP_THRESHOLD_=1048576`) |
@@ -272,7 +272,7 @@ rollback.
 | Maximum model length | `tp4-ring` and `tp3-triangle`: 1,048,576 tokens; `tp3-triangle-4k`: 262,144 tokens |
 | Maximum sequences | `tp4-ring`: 16; `tp3-triangle` and `tp3-triangle-4k`: 8 |
 | Maximum parallel prefills | 1 (`--max-parallel-prefills 1`) |
-| Batched-token budget | `tp4-ring`: 16,384; `tp3-triangle`: 6,144 (qualified on `spark-ds41f-1030`); `tp3-triangle-4k`: 4,096 |
+| Batched-token budget | `tp4-ring`: 16,384; `tp3-triangle`: 6,144 (qualified on `spark-ds41f-1107`); `tp3-triangle-4k`: 4,096 |
 | Prefill yield & late admission | prefill yield enabled (`--prefill-yield short`, `--prefill-yield-limit-s 10`, vLLM 0545) so waiting short requests take the next step from a long prefill; late admission at decoder layer 30 (`VLLM_LATE_ADMISSION_LAYER=30`, vLLM 0222, 0226) |
 | Prefill sequence parallelism | from 205 tokens, where the reduce-scatter exceeds the one-shot RoCE all-reduce; CED encoder layers with non-final row skip (vLLM 0014-0018, 0229-0255) |
 | Indexer under sequence parallelism | each rank scores and selects its own rows and all-gathers the top-k positions (patch 0025), ties broken by lowest logical position in TileLang |
