@@ -1,0 +1,105 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Christopher Owen <3221756+christopherowen@users.noreply.github.com>
+Date: Wed, 4 Nov 2026 01:41:27 +0100
+Subject: [PATCH] CUDA: keep MX scale-byte selectors out of NVFP4 compact
+ packages
+
+Upstream-base: tile-ai/tilelang@2123e412ce2217b324c50c4ec967213906456ac5
+
+Rationale: upstream #3286 added a shared-scale compact package route that
+hardcodes both scale-byte selectors to zero. After adding MXFP8 (1X) and
+MXFP4 (2X), dispatching either format through it silently repeats the wrong
+scale bytes. Restrict this route to 4X; the MX formats retain their existing
+per-MMA route and selectors. NVFP4 retains the upstream optimization.
+
+Quality: required to preserve the deployed MX arithmetic on this newer
+base. Add exact varying-scale products for both A and B, with K128 scales
+1, 2, 4 and 8: the expected sum is 480 for unit operands.
+
+Tests: source syntax and fresh patch application are checked locally.
+The four new SM12x CUDA regression cases require target hardware and have
+not been run for this candidate. See the deployment experiment receipts.
+
+Upstream-status: local compatibility patch; no upstream PR as of 2026-11-04.
+---
+ ...elang_language_mxf8f6f4_mma_block_scale.py | 19 +++++++++++++++++++
+ ...tilelang_language_mxfp4_mma_block_scale.py | 19 +++++++++++++++++++
+ .../macro/mma_sm120_macro_generator.py        |  5 +++--
+ 3 files changed, 41 insertions(+), 2 deletions(-)
+
+diff --git a/testing/python/language/test_tilelang_language_mxf8f6f4_mma_block_scale.py b/testing/python/language/test_tilelang_language_mxf8f6f4_mma_block_scale.py
+index e93935ab0..7c9d48a3c 100644
+--- a/testing/python/language/test_tilelang_language_mxf8f6f4_mma_block_scale.py
++++ b/testing/python/language/test_tilelang_language_mxf8f6f4_mma_block_scale.py
+@@ -180,6 +180,25 @@ def test_mxf8f6f4_rejects_compact_kmajor_scales():
+         tilelang.lower(main, target=target, enable_device_compile=False)
+ 
+ 
++@tilelang.testing.requires_cuda
++@tilelang.testing.requires_cuda_compute_version_ge(12, 0)
++@tilelang.testing.requires_cuda_compute_version_lt(13, 0)
++@pytest.mark.parametrize("scaled_operand", ["a", "b"])
++def test_mxfp8_shared_scale_words_select_every_byte(scaled_operand):
++    """A K128 tile must consume all four bytes, not repeat the first scale."""
++    import torch
++
++    a = torch.ones((64, 128), device="cuda", dtype=torch.float8_e4m3fn)
++    b = torch.ones_like(a)
++    scales = torch.tensor([127, 128, 129, 130], device="cuda", dtype=torch.uint8).repeat(64, 1)
++    sfa = scales if scaled_operand == "a" else torch.full_like(scales, 127)
++    sfb = scales if scaled_operand == "b" else torch.full_like(scales, 127)
++    kernel = tilelang.compile(_make_mxfp8_matmul_kernel(64, 64, 128), target="cuda", out_idx=[4])
++    out = kernel(a, b, sfa.view(torch.uint32), sfb.view(torch.uint32))
++    # 32 products at each of scales 1, 2, 4, 8; all products and sums are exact.
++    torch.testing.assert_close(out, torch.full((64, 64), 480.0, device="cuda"), rtol=0, atol=0)
++
++
+ def _random_mxfp8(rows, K, seed):
+     """Small-integer E4M3 values and power-of-two UE8M0 scales.
+ 
+diff --git a/testing/python/language/test_tilelang_language_mxfp4_mma_block_scale.py b/testing/python/language/test_tilelang_language_mxfp4_mma_block_scale.py
+index c47929b23..227d287c6 100644
+--- a/testing/python/language/test_tilelang_language_mxfp4_mma_block_scale.py
++++ b/testing/python/language/test_tilelang_language_mxfp4_mma_block_scale.py
+@@ -97,6 +97,25 @@ def test_mxfp4_codegen(arch):
+     assert "tl::SM120MmaBlockScaledKind::kMxf4nvf4, 2, tl::SM120MmaScaleType::kUE8M0" in result.kernel_source
+ 
+ 
++@tilelang.testing.requires_cuda
++@tilelang.testing.requires_cuda_compute_version_ge(12, 0)
++@tilelang.testing.requires_cuda_compute_version_lt(13, 0)
++@pytest.mark.parametrize("scaled_operand", ["a", "b"])
++def test_mxfp4_shared_scale_words_select_both_halves(scaled_operand):
++    """The second K64 atom must consume the upper two UE8M0 bytes."""
++    import torch
++
++    # E2M1 code 2 is 1.0; each byte holds two unit operands.
++    a = torch.full((64, 64), 0x22, device="cuda", dtype=torch.int8)
++    b = torch.full_like(a, 0x22)
++    scales = torch.tensor([127, 128, 129, 130], device="cuda", dtype=torch.uint8).repeat(64, 1)
++    sfa = scales if scaled_operand == "a" else torch.full_like(scales, 127)
++    sfb = scales if scaled_operand == "b" else torch.full_like(scales, 127)
++    kernel = tilelang.compile(_make_mxfp4_matmul_kernel(64, 64, 128), target="cuda", out_idx=[4])
++    out = kernel(a, b, sfa.view(torch.uint32), sfb.view(torch.uint32))
++    torch.testing.assert_close(out, torch.full((64, 64), 480.0, device="cuda"), rtol=0, atol=0)
++
++
+ def _random_mxfp4(rows, K, seed):
+     """Packed E2M1 codes and power-of-two UE8M0 scales; products sum exactly in FP32."""
+     import torch
+diff --git a/tilelang/cuda/intrinsics/macro/mma_sm120_macro_generator.py b/tilelang/cuda/intrinsics/macro/mma_sm120_macro_generator.py
+index 4307aff12..817ab78e5 100644
+--- a/tilelang/cuda/intrinsics/macro/mma_sm120_macro_generator.py
++++ b/tilelang/cuda/intrinsics/macro/mma_sm120_macro_generator.py
+@@ -692,8 +692,9 @@ class TensorCoreIntrinEmitterSM120(MMAIntrinEmitter):
+         if sf_layout not in ("rowmajor", "blockscaled_chunk_kmajor"):
+             raise ValueError(f"Unsupported SM120 scale layout: {sf_layout}")
+ 
+-        # Compact selector packages are read from shared memory; other scale scopes keep the per-MMA path below.
+-        if is_shared(SFA_data) and is_shared(SFB_data):
++        # The compact package path hardcodes scale-byte selectors to zero.
++        # MXFP8 (1X) and MXFP4 (2X) must retain their per-K-atom selectors.
++        if self.scale_vec_size == 4 and is_shared(SFA_data) and is_shared(SFB_data):
+             return self._mma_with_compact_scale_packages(
+                 A_local_buf,
+                 B_local_buf,

@@ -353,10 +353,11 @@ Open levers:
 
 ## TileLang kernel family
 
-The TileLang migration is complete in `1030` and `1107`: B12X is retired from
-`upstreams.lock.json` and the container image, and all model, drafter, sampler,
+The TileLang runtime migration is complete in `1030` and `1107`: no B12X kernel
+runs in serving (`--load-format direct` and all model, drafter, sampler,
 rank-reduction, gather-store, scoring, vision-tower, L2-prefetch, and collective
-paths run on TileLang + `sparknet`.
+paths run on TileLang + `sparknet`; retiring the remaining `b12x` build input
+from `upstreams.lock.json` and `docker/Dockerfile` can follow after `1107`).
 
 Remaining kernel-level investigations:
 1. **`mHC: fn` in three bytes.** `project_streams` reads `fn` (`24 x 20,480`

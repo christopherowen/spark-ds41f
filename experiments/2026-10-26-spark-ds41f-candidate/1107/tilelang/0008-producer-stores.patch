@@ -1,0 +1,100 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Christopher Owen <3221756+christopherowen@users.noreply.github.com>
+Date: Wed, 04 Nov 2026 11:40:34 +0100
+Subject: [PATCH] Publish synchronous TileLang producer stores before GEMM
+
+Upstream-base: tile-ai/tilelang@2123e412ce2217b324c50c4ec967213906456ac5
+Local-base: b26f48b85790b832993f2c9d240dc3c39d6075e8, the five-patch refresh from deployment PR #875.
+Upstream-source: https://github.com/tile-ai/tilelang/pull/3661
+Upstream-head: 844f70a0352b875a691859f324b6d5b45d4c3cd6
+
+Rationale: A warp-specialized producer must publish synchronous shared-memory conversion stores before the consumer begins GEMM, even when TMA completes independently.
+
+Quality: Changes producer synchronization only. Keep the existing warp-specialization-disabled runtime workaround; this patch does not enable specialization or change numerical formats.
+
+Tests: The 200-launch synchronous FP8 conversion reproducer passes twice; specialization-disabled controls also pass twice.
+Recorded compiler tree: 710925bbde5faa60a8af1422621bffb02919551b.
+See this candidate's results.json and immutable raw receipts. Full image,
+retained-feature and serving qualification remain separate gates.
+
+Upstream-status: open PR, checked 2026-11-04; pinned experimental backport.
+Remove this local backport when advancing to an upstream revision containing it.
+---
+
+diff --git a/src/cuda/transform/producer_consumer_ws.cc b/src/cuda/transform/producer_consumer_ws.cc
+index 9204c95c..420312dd 100644
+--- a/src/cuda/transform/producer_consumer_ws.cc
++++ b/src/cuda/transform/producer_consumer_ws.cc
+@@ -1592,21 +1592,21 @@ private:
+         producer_stmts.push_back(s);
+       }
+     }
+-    // Async-only producers already contribute one completion per thread.
+-    // With a prefix, also publish any synchronous writes by a regular release.
++    // SIMT producers may retain synchronous stores after async-copy lowering.
++    // Publish those writes, as well as prefix writes, with a regular release.
+     if (!producer_is_single_warp) {
+       for (int fwd_base = 0; fwd_base < num_fwd; fwd_base += num_stages) {
+         PrimExpr fwd_id = IntImm(DataType::Int(32), fwd_base) + p_stage_expr;
+         if (!has_async_producer) {
+           // No async copy: each thread publishes its writes and arrives.
+           producer_stmts.push_back(MakeArriveBarrier(barrier_buf, fwd_id));
+-        } else if (!has_producer_prefix) {
++        } else if (!has_producer_prefix && !has_simt_producer) {
+           // Async copy only: completion consumes the thread's arrival credit.
+           producer_stmts.push_back(Evaluate(
+               Call(DataType::Handle(), tl::ptx_cp_async_barrier_noinc(),
+                    {MakeBarrierRef(barrier_buf, fwd_id)})));
+         } else {
+-          // Async copy with prefix: reserve completion, then publish writes.
++          // Reserve async completion before publishing synchronous writes.
+           producer_stmts.push_back(
+               Evaluate(Call(DataType::Handle(), builtin::ptx_cp_async_barrier(),
+                             {MakeBarrierRef(barrier_buf, fwd_id)})));
+diff --git a/testing/python/issue/test_tilelang_issue_ws_simt_copy_full_producer_extent.py b/testing/python/issue/test_tilelang_issue_ws_simt_copy_full_producer_extent.py
+index 8d1d8057..dff81714 100644
+--- a/testing/python/issue/test_tilelang_issue_ws_simt_copy_full_producer_extent.py
++++ b/testing/python/issue/test_tilelang_issue_ws_simt_copy_full_producer_extent.py
+@@ -125,5 +125,42 @@ def test_ws_tma_producer_participation(coordinate):
+     torch.testing.assert_close(c, a.float() @ reference_b.float(), rtol=1e-2, atol=1e-2)
+ 
+ 
++@tilelang.testing.requires_cuda
++@tilelang.testing.requires_cuda_compute_version_ge(9, 0)
++def test_ws_publishes_synchronous_fp8_conversion():
++    """A TMA producer and synchronous conversion must both finish before GEMM."""
++    M, N, K = 512, 1024, 3072
++
++    @T.prim_func
++    def main(
++        A: T.Tensor((M, K), T.bfloat16),
++        W: T.Tensor((N, K), T.float8_e4m3fn),
++        C: T.Tensor((M, N), T.bfloat16),
++    ):
++        with T.Kernel(N // 16, M // 16, threads=64) as (bn, bm):
++            a = T.alloc_shared((16, 128), T.bfloat16)
++            w = T.alloc_shared((16, 128), T.bfloat16)
++            acc = T.alloc_fragment((16, 16), T.float32)
++            T.clear(acc)
++            for bk in T.Pipelined(K // 128, num_stages=2):
++                T.copy(A[bm * 16, bk * 128], a)
++                for i, j in T.Parallel(16, 128):
++                    w[i, j] = T.cast(W[bn * 16 + i, bk * 128 + j], T.bfloat16)
++                T.gemm(a, w, acc, transpose_B=True)
++            T.copy(acc, C[bm * 16, bn * 16])
++
++    kernel = _compile_tvm_ffi(main)
++    row_tags = torch.arange(M, device="cuda") // 16 % 4 + 1
++    k_tags = torch.arange(K, device="cuda") // 128 + 1
++    a = (row_tags[:, None] * k_tags[None, :]).bfloat16()
++    w = ((k_tags % 7) + 1).expand(N, K).to(torch.float8_e4m3fn)
++    c = torch.empty(M, N, device="cuda", dtype=torch.bfloat16)
++    expected = (a.float() @ w.to(torch.bfloat16).float().T).bfloat16()
++    for _ in range(200):
++        c.fill_(float("nan"))
++        kernel(a, w, c)
++        torch.testing.assert_close(c, expected, rtol=0, atol=0)
++
++
+ if __name__ == "__main__":
+     tilelang.testing.main()
