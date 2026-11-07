@@ -118,10 +118,12 @@ def configuration(
         raise SystemExit(f"invalid JSON in {canonical}: {error}") from error
     shape_nodes = None
     is_recipe_config = cluster_recipe.is_recipe(cluster)
+    is_overlay_config = cluster_recipe.is_overlay(cluster)
+    overlay_sets_master = is_overlay_config and "master_addr" in cluster.get("set", {}).get("distributed", {})
     explicit_shape = getattr(args, "shape", None) or cluster_recipe.site_shape(ROOT)
     nodes_override = getattr(args, "nodes_config", None)
     auto_switched = False
-    if cluster_recipe.is_overlay(cluster):
+    if is_overlay_config:
         cluster = read_cluster(canonical)
     elif is_recipe_config:
         shape = cluster_recipe.chosen_shape(cluster, ROOT, getattr(args, "shape", None))
@@ -176,7 +178,7 @@ def configuration(
     ssh_user = nodes.get("ssh_user")
     if cluster.get("host", {}).get("home") == "/home/swank" and ssh_user not in (None, "", "swank", "u"):
         cluster["host"]["home"] = f"/home/{ssh_user}"
-    if is_recipe_config and cluster.get("distributed", {}).get("master_addr") == "10.0.1.71":
+    if (is_recipe_config or (is_overlay_config and not overlay_sets_master)) and cluster.get("distributed", {}).get("master_addr") == "10.0.1.71":
         heads = [n for n in nodes.get("nodes", []) if n.get("head") and (n.get("control_ip") or n.get("management_ip"))]
         if len(heads) == 1:
             cluster["distributed"]["master_addr"] = heads[0].get("control_ip") or heads[0]["management_ip"]

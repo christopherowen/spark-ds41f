@@ -1184,7 +1184,11 @@ def agentx_target(config: str) -> dict:
     (repository and revision, from its hub snapshot) whose tokenizer it uses, the hub cache,
     and the cores the serving container is pinned to (the client stays off them)."""
     cluster = spark.read_cluster(config)
-    head = next(node for node in nodes_config()["nodes"] if node["head"])
+    nodes = nodes_config()
+    ssh_user = nodes.get("ssh_user")
+    if cluster.get("host", {}).get("home") == "/home/swank" and ssh_user not in (None, "", "swank", "u"):
+        cluster["host"]["home"] = f"/home/{ssh_user}"
+    head = next(node for node in nodes["nodes"] if node["head"])
     snapshot = spark.cluster_recipe.model_snapshot(cluster).format(home=cluster["host"]["home"])
     found = re.search(r"(.*)/models--([^/]+?)--([^/]+)/snapshots/([0-9a-f]{40})/?$", snapshot)
     if not found:
