@@ -1,0 +1,593 @@
+From fa29025e11c82fc7b0324fd68f23689aa165cef3 Mon Sep 17 00:00:00 2001
+From: Christopher Owen <3221756+christopherowen@users.noreply.github.com>
+Date: Fri, 6 Nov 2026 22:25:17 +0000
+Subject: [PATCH] perf(dsv41): fuse rank-major shards in mhc.post and engram
+ post-gate
+
+Upstream base: 19f2c20ed4d64ae22bd009ceacadd85e2a81e354.
+
+Rationale:
+1. Extend mhc.post (post_streams) and engram_post_gate /
+   engram_post_gate_blocked (_reconstruct_stream) with a compile-time world
+   dimension and T.StridedTensor input declarations so SP prefill
+   RankOrderParts ([world, rows, hidden] BF16) are summed in FP32 directly
+   inside the consumer kernel without launching an intermediate
+   previous_output.sum() kernel, reducing SP prefill boundary latency across
+   2 GB10 boots by up to -29.64% on TP3 and -30.07% on TP4 for mhc.post and
+   up to -11.39% for engram_post_gate_blocked.
+2. In Engram.forward and Engram.declare_kernels on non-SP TP steps
+   (sp_rows is None and tp_size > 1), all-gather wkv.local_product(rows) along
+   dim=0 ([tp_size, num_tokens, block_cols]) and pass the rank-major tensor
+   directly to engram_post_gate_blocked / engram_gate_blocked, eliminating
+   concat_rank_shards and contiguous slice copies and reducing non-SP TP
+   boundary latency by -10.89%..-79.41% on TP3 and -11.65%..-60.42% on TP4.
+
+Quality:
+Exact FP32 accumulation of rank-major shards inside _reconstruct_stream and
+post_streams and bit-identical torch.equal output on non-SP TP Engram blocked
+gating (matching rank-major shard indexing [rank, row, col_offset]).
+
+Tests:
+39/39 TileLang Engram + PDL tests, 11/11 model Engram tests, and 186/186 SP
+prefill + L2 tests pass across 2 GPU boots on GB10 with 0 PDL violations.
+
+Upstream status:
+Adapted from source-fork norm-projection-boundaries (356d8fd5f) for candidate
+1107.
+---
+ .../test_deepseek_v41_tilelang_engram.py      |  41 ++++++
+ tests/models/test_deepseek_v4_1_engram.py     | 125 ++++++++++++++++++
+ tests/models/test_deepseek_v4_1_sp_prefill.py |   4 +
+ vllm/models/deepseek_v4_1/common/engram.py    |  78 +++++++++--
+ vllm/models/deepseek_v4_1/tilelang/engram.py  |  86 ++++++++++--
+ vllm/models/deepseek_v4_1/tilelang/mhc.py     |  12 +-
+ 6 files changed, 321 insertions(+), 25 deletions(-)
+
+diff --git a/tests/kernels/test_deepseek_v41_tilelang_engram.py b/tests/kernels/test_deepseek_v41_tilelang_engram.py
+index faa749257..803cc016b 100644
+--- a/tests/kernels/test_deepseek_v41_tilelang_engram.py
++++ b/tests/kernels/test_deepseek_v41_tilelang_engram.py
+@@ -216,3 +216,44 @@ def test_engram_post_gate_blocked_matches_packed_bits(images, blocks, block_cols
+     )
+     torch.cuda.synchronize()
+     assert torch.equal(packed_out.view(torch.int16), blocked_out.view(torch.int16))
++
++
++@pytest.mark.parametrize("images", [False, True])
++@pytest.mark.parametrize("world, block_cols", [(2, 12800), (3, 8544), (4, 6400)])
++@pytest.mark.parametrize("rows", [6, 97])
++def test_engram_post_gate_rank_order_parts_matches_summed_bits(
++    images, world, block_cols, rows
++):
++    """Fused ``engram_post_gate`` and ``engram_post_gate_blocked`` with 3D
++    ``RankOrderParts.packed`` (`[world, rows, DIM]`) match pre-summed
++    ``RankOrderParts.sum()`` bit-for-bit."""
++    from vllm.models.deepseek_v4_1.tilelang.collectives import RankOrderParts
++
++    _, kv, weight, ids = _inputs(rows, seed=41 + world, images=images)
++    _, residual, post, comb = _post_inputs(rows, seed=47 + world)
++    gen = torch.Generator(device=DEVICE).manual_seed(53 + world)
++    packed_parts = torch.randn(
++        (world, rows, DIM), generator=gen, device=DEVICE
++    ).bfloat16()
++    summed = RankOrderParts(packed_parts).sum()
++    width = (HC + 1) * DIM
++    padded = torch.zeros((rows + 3, world * block_cols), device=DEVICE).bfloat16()
++    padded[:rows, :width] = kv
++    padded[rows:] = NAN
++    blocked = padded.view(rows + 3, world, block_cols).transpose(0, 1).contiguous()
++
++    expected = torch.empty_like(residual)
++    actual_packed = torch.empty_like(residual)
++    actual_blocked = torch.empty_like(residual)
++    engram_post_gate(
++        summed, residual, post, comb, kv, weight, ids, expected, EPS, HC
++    )
++    engram_post_gate(
++        packed_parts, residual, post, comb, kv, weight, ids, actual_packed, EPS, HC
++    )
++    engram_post_gate_blocked(
++        packed_parts, residual, post, comb, blocked, weight, ids, actual_blocked, EPS, HC
++    )
++    torch.cuda.synchronize()
++    assert torch.equal(actual_packed.view(torch.int16), expected.view(torch.int16))
++    assert torch.equal(actual_blocked.view(torch.int16), expected.view(torch.int16))
+diff --git a/tests/models/test_deepseek_v4_1_engram.py b/tests/models/test_deepseek_v4_1_engram.py
+index 1ad5768ec..ebd56442f 100644
+--- a/tests/models/test_deepseek_v4_1_engram.py
++++ b/tests/models/test_deepseek_v4_1_engram.py
+@@ -1365,3 +1365,128 @@ def test_disk_rows_pack_and_read_rank_compacted_files(monkeypatch):
+         embed_2p.close()
+ 
+     assert torch.equal(out_packed, out_2p)
++
++
++@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
++@pytest.mark.parametrize("tp_size,block_cols", [(3, 8544), (4, 6400)])
++@torch.inference_mode()
++def test_engram_projection_tp_gathers_dim0_into_blocked_gate(
++    dist_init, monkeypatch, tp_size, block_cols
++):
++    """On non-SP steps with projection_tp=True, Engram all-gathers wkv's local
++    product along dim=0 into engram_gate_blocked / engram_post_gate_blocked
++    without launching concat_rank_shards along dim=-1."""
++    import vllm.models.deepseek_v4_1.common.engram as engram_module
++    from vllm.models.deepseek_v4_1.tilelang.engram_hash import IMAGE_SENTINEL
++
++    device = torch.device("cuda", torch.cuda.current_device())
++    capacity, hidden, streams = 9, HIDDEN, 4
++    geometry = native.build_geometry(base_table_size=19, compressed_vocab_size=32)
++    caps = native.Caps(
++        device=device,
++        max_tokens=capacity,
++        max_seqs=2,
++        max_requests=2,
++        vocab_size=32,
++        layer_id=1,
++        tp_size=1,
++        tp_rank=0,
++    )
++    layout = SimpleNamespace(
++        caps=(caps,),
++        lookup_plans=(None,),
++        geometry=geometry,
++        table_memory="device",
++        projection_tp=False,
++    )
++    config = SimpleNamespace(hidden_size=hidden, hc_mult=streams, rms_norm_eps=1e-3)
++    old_dtype = torch.get_default_dtype()
++    try:
++        torch.set_default_dtype(torch.bfloat16)
++        with torch.device(device):
++            module = Engram(config, None, layout, 0, False, "engram_tp_blocked_test")
++    finally:
++        torch.set_default_dtype(old_dtype)
++    module.q_weight.fill_(0.5)
++    module.k_weight.fill_(0.25)
++    module.wkv.weight.normal_(std=0.01)
++    module.embed_tokens.weight.fill_(2)
++    module.embed_tokens.weight_scale_inv.fill_(127)
++    module.process_weights_after_loading()
++
++    ids = torch.arange(24, device=device).expand(capacity, -1).contiguous()
++    module.prepare_embeddings(ids)
++    gen = torch.Generator(device=device).manual_seed(61 + tp_size)
++    layer_out = torch.randn(
++        (capacity, hidden), generator=gen, device=device, dtype=torch.bfloat16
++    )
++    residual = torch.randn(
++        (capacity, streams, hidden), generator=gen, device=device, dtype=torch.bfloat16
++    )
++    post_mix = torch.rand(
++        (capacity, streams), generator=gen, device=device, dtype=torch.float32
++    )
++    res_mix = torch.rand(
++        (capacity, streams, streams), generator=gen, device=device, dtype=torch.float32
++    )
++    token_ids = torch.full((capacity,), 7, dtype=torch.int32, device=device)
++    token_ids[4] = IMAGE_SENTINEL
++
++    expected_plain = module(residual, ids, token_ids)
++    expected_fused = module(
++        residual,
++        ids,
++        token_ids,
++        previous_output=layer_out,
++        post_mix=post_mix,
++        res_mix=res_mix,
++    )
++
++    orig_wkv = module.wkv
++    width = (streams + 1) * hidden
++    gather_dims = []
++
++    def fake_local_product(rows):
++        full_kv = orig_wkv(rows)
++        if isinstance(full_kv, tuple):
++            full_kv = full_kv[0]
++        padded = torch.zeros(
++            (rows.shape[0], tp_size * block_cols), dtype=full_kv.dtype, device=device
++        )
++        padded[:, :width] = full_kv
++        return padded.view(rows.shape[0], tp_size, block_cols)
++
++    def fake_all_gather(local_kv, dim=-1):
++        gather_dims.append(dim)
++        assert dim == 0
++        # local_kv is [rows, tp_size, block_cols] in our single-process mock;
++        # transpose to [tp_size, rows, block_cols] flattened along dim=0.
++        return local_kv.transpose(0, 1).contiguous().view(tp_size * local_kv.shape[0], block_cols)
++
++    class FakeWKV(engram_module._PaddedColumnParallelLinear):
++        def __init__(self):
++            torch.nn.Module.__init__(self)
++            self.gather_output = True
++            self.tp_size = tp_size
++            self.output_size_per_partition = block_cols
++
++        def local_product(self, r, *, out=None):
++            return fake_local_product(r)
++
++    module.wkv = FakeWKV()
++    monkeypatch.setattr(
++        engram_module, "tensor_model_parallel_all_gather", fake_all_gather
++    )
++
++    actual_plain = module(residual, ids, token_ids)
++    actual_fused = module(
++        residual,
++        ids,
++        token_ids,
++        previous_output=layer_out,
++        post_mix=post_mix,
++        res_mix=res_mix,
++    )
++    assert gather_dims == [0, 0]
++    assert torch.equal(actual_plain.view(torch.int16), expected_plain.view(torch.int16))
++    assert torch.equal(actual_fused.view(torch.int16), expected_fused.view(torch.int16))
+diff --git a/tests/models/test_deepseek_v4_1_sp_prefill.py b/tests/models/test_deepseek_v4_1_sp_prefill.py
+index 022407b84..248a5cfa5 100644
+--- a/tests/models/test_deepseek_v4_1_sp_prefill.py
++++ b/tests/models/test_deepseek_v4_1_sp_prefill.py
+@@ -1291,6 +1291,8 @@ def test_engram_sp_forward_bit_identical_blocked_and_replicated(
+         out.copy_(gate_ref(state, flat_kv, token_ids))
+ 
+     def fake_mhc_post(prev, res, post_m, res_m, out):
++        if prev.ndim == 3:
++            prev = prev.float().sum(dim=0).to(torch.bfloat16)
+         recon = (
+             res.float() * res_m[:, :, 0:1]
+             + prev[:, None, :].float() * post_m[:, :, None]
+@@ -1659,6 +1661,8 @@ def test_engram_forward_sp_disk_columns_local_sp_product_bit_exact(
+     )
+ 
+     def fake_mhc_post(l_out, x_in, p_mix, r_mix, out):
++        if l_out.ndim == 3:
++            l_out = l_out.float().sum(dim=0).to(torch.bfloat16)
+         mixed = torch.einsum("tsr,trd->tsd", r_mix, x_in.float())
+         mixed = mixed + p_mix.unsqueeze(-1) * l_out.float().unsqueeze(1)
+         out.copy_(mixed.to(torch.bfloat16))
+diff --git a/vllm/models/deepseek_v4_1/common/engram.py b/vllm/models/deepseek_v4_1/common/engram.py
+index 0f7345cde..0c5169b1e 100644
+--- a/vllm/models/deepseek_v4_1/common/engram.py
++++ b/vllm/models/deepseek_v4_1/common/engram.py
+@@ -1025,14 +1025,31 @@ class Engram(nn.Module):
+         sequence_parallel = (
+             0 < self.prefill_sp_min_rows <= self.embed_tokens.caps.max_tokens
+         )
++        world_size = get_tensor_model_parallel_world_size()
+         if sequence_parallel:
+             # SP's trailing pad rows pass through (forward).
+             from vllm.models.deepseek_v4_1.tilelang import columns
+ 
+             key = columns.copy_columns_key(self.hc_mult * self.dim, torch.bfloat16)
+             calls.append(prepare.call(columns.copy_columns_kernel, *key))
+-        if sequence_parallel and isinstance(self.wkv, _PaddedColumnParallelLinear):
+-            world_size = get_tensor_model_parallel_world_size()
++            if world_size > 1:
++                calls.append(
++                    prepare.call(
++                        engram_post_gate_kernel,
++                        self.hc_mult,
++                        self.dim,
++                        self.eps,
++                        "int32",
++                        world=world_size,
++                    )
++                )
++        if isinstance(self.wkv, _PaddedColumnParallelLinear) and (
++            sequence_parallel
++            or (
++                getattr(self.wkv, "gather_output", False)
++                and getattr(self.wkv, "tp_size", 1) > 1
++            )
++        ):
+             block_cols = self.wkv.output_size_per_partition
+             calls.append(
+                 prepare.call(
+@@ -1056,6 +1073,19 @@ class Engram(nn.Module):
+                     block_cols,
+                 )
+             )
++            if sequence_parallel and world_size > 1:
++                calls.append(
++                    prepare.call(
++                        engram_post_gate_blocked_kernel,
++                        self.hc_mult,
++                        self.dim,
++                        self.eps,
++                        "int32",
++                        world_size,
++                        block_cols,
++                        world=world_size,
++                    )
++                )
+         prepare.declare(lambda: calls)
+ 
+     def process_weights_after_loading(self):
+@@ -1125,13 +1155,20 @@ class Engram(nn.Module):
+             raise RuntimeError("Disk Engram output is not prepared")
+         if self.embed_tokens.table_memory == "disk":
+             self.embed_tokens.gather_rows(self.staged_rows[:num_tokens])
+-        # With SP and a column-parallel projection, kv is every rank's column block
+-        # of this rank's rows, [N, L, C]: the gate reads the blocks in place.
+-        blocked = sp_rows is not None and isinstance(
+-            self.wkv, _PaddedColumnParallelLinear
++        # With a column-parallel projection, kv is every rank's column block of
++        # the rows, [N, L, C]: the gate reads the rank-major blocks in place.
++        tp_blocked_wkv = (
++            sp_rows is None
++            and isinstance(self.wkv, _PaddedColumnParallelLinear)
++            and getattr(self.wkv, "gather_output", False)
++            and getattr(self.wkv, "tp_size", 1) > 1
+         )
++        blocked = (
++            sp_rows is not None and isinstance(self.wkv, _PaddedColumnParallelLinear)
++        ) or tp_blocked_wkv
+         sp_local_wkv = (
+-            blocked
++            sp_rows is not None
++            and blocked
+             and self.embed_tokens.columns is not None
+             and getattr(self.wkv, "sp_shards", None) is not None
+         )
+@@ -1159,7 +1196,7 @@ class Engram(nn.Module):
+                 )
+ 
+                 if isinstance(previous_output, RankOrderParts):
+-                    previous_output = previous_output.sum()
++                    previous_output = previous_output.packed
+             out = torch.empty_like(state)
+             if sp_rows is not None:
+                 real = sp_rows.real_rows
+@@ -1168,7 +1205,9 @@ class Engram(nn.Module):
+                         from vllm.models.deepseek_v4_1.tilelang.mhc import _mhc_post
+ 
+                         _mhc_post(
+-                            previous_output[real:],
++                            previous_output[:, real:]
++                            if previous_output.ndim == 3
++                            else previous_output[real:],
+                             hidden_states[real:],
+                             post_mix[real:],
+                             res_mix[real:],
+@@ -1186,6 +1225,21 @@ class Engram(nn.Module):
+                 self.l2_prefetch_after_projection(num_tokens)
+             prepare_local()
+             kv_start = 0
++        elif tp_blocked_wkv:
++            block_cols = (
++                getattr(self.wkv, "output_size_per_partition", None)
++                or self.wkv.weight.shape[0]
++            )
++            local_kv = self.wkv.local_product(rows)
++            del rows
++            if self.l2_prefetch_after_projection is not None:
++                self.l2_prefetch_after_projection(num_tokens)
++            prepare_local()
++            kv = tensor_model_parallel_all_gather(local_kv, dim=0).view(
++                self.wkv.tp_size, num_tokens, block_cols
++            )
++            del local_kv
++            kv_start = 0
+         elif blocked:
+             from vllm.models.deepseek_v4_1 import sp_prefill
+ 
+@@ -1239,7 +1293,11 @@ class Engram(nn.Module):
+                 start, real = sp_rows.start, sp_rows.real_rows
+                 if real == 0:
+                     return out
+-                previous_output = previous_output[:real]
++                previous_output = (
++                    previous_output[:, :real]
++                    if previous_output.ndim == 3
++                    else previous_output[:real]
++                )
+                 residual_in = hidden_states[:real]
+                 post_mix = post_mix[:real]
+                 res_mix = res_mix[:real]
+diff --git a/vllm/models/deepseek_v4_1/tilelang/engram.py b/vllm/models/deepseek_v4_1/tilelang/engram.py
+index 6c832cf2b..0b2e8b561 100644
+--- a/vllm/models/deepseek_v4_1/tilelang/engram.py
++++ b/vllm/models/deepseek_v4_1/tilelang/engram.py
+@@ -34,11 +34,26 @@ CLAMP = 1e-6
+ 
+ @T.macro
+ def _reconstruct_stream(
+-    layer_out, residual, post, comb, xs, t, h, tx, chunks, threads, vec, hc_mult
++    layer_out,
++    residual,
++    post,
++    comb,
++    xs,
++    t,
++    h,
++    tx,
++    chunks,
++    threads,
++    vec,
++    hc_mult,
++    world=1,
+ ):
+-    """Reconstruct stream ``h`` of token ``t`` from ``layer_out`` and ``residual`` in
+-    registers using ``post_streams``' exact FP32 FMA sequence, rounded to BF16."""
++    """Reconstruct stream ``h`` of token ``t`` from ``layer_out`` (``[T, D]`` or
++    rank-major ``[world, T, D]``) and ``residual`` in registers using ``post_streams``'
++    exact FP32 FMA sequence, rounded to BF16."""
+     xv = T.alloc_local((vec,), T.bfloat16)
++    xp = T.alloc_local((world * vec,), T.bfloat16)
++    av = T.alloc_local((vec,), T.float32)
+     rv = T.alloc_local((hc_mult * vec,), T.bfloat16)
+     pm = T.alloc_local((1,), T.float32)
+     cm = T.alloc_local((hc_mult,), T.float32)
+@@ -48,8 +63,21 @@ def _reconstruct_stream(
+         cm[m] = comb[t, m, h]
+     for c in T.serial(chunks):
+         col = (c * threads + tx) * vec
+-        for i in T.vectorized(vec):
+-            xv[i] = layer_out[t, col + i]
++        if world == 1:
++            for i in T.vectorized(vec):
++                xv[i] = layer_out[t, col + i]
++        else:
++            for r in T.unroll(world):
++                for i in T.vectorized(vec):
++                    xp[r * vec + i] = layer_out[r, t, col + i]
++            for r in T.unroll(world):
++                for i in T.unroll(vec):
++                    if r == 0:
++                        av[i] = T.cast(xp[i], T.float32)
++                    else:
++                        av[i] = av[i] + T.cast(xp[r * vec + i], T.float32)
++            for i in T.unroll(vec):
++                xv[i] = T.cast(av[i], T.bfloat16)
+         for m in T.unroll(hc_mult):
+             for i in T.vectorized(vec):
+                 rv[m * vec + i] = residual[t, m, col + i]
+@@ -319,16 +347,23 @@ def engram_post_gate_kernel(
+     ids_dtype: str,
+     threads: int = 256,
+     vec: int = 4,
++    world: int = 1,
+ ):
+-    assert hidden % (threads * vec) == 0 and threads % 32 == 0
++    assert hidden % (threads * vec) == 0 and threads % 32 == 0 and world >= 1
+     chunks = hidden // (threads * vec)
+     warps = threads // 32
+     scalar = hidden**-0.5
+     tokens = T.dynamic("tokens")
++    layer_stride0 = T.dynamic("layer_stride0")
++    layer_out_ann = (
++        T.Tensor((tokens, hidden), T.bfloat16)
++        if world == 1
++        else T.StridedTensor((world, tokens, hidden), (layer_stride0, hidden, 1), T.bfloat16)
++    )
+ 
+     @T.prim_func
+     def engram_post_gate(
+-        layer_out: T.Tensor((tokens, hidden), T.bfloat16),
++        layer_out: layer_out_ann,
+         residual: T.Tensor((tokens, hc_mult, hidden), T.bfloat16),
+         post: T.Tensor((tokens, hc_mult), T.float32),
+         comb: T.Tensor((tokens, hc_mult, hc_mult), T.float32),
+@@ -360,6 +395,7 @@ def engram_post_gate_kernel(
+                 threads,
+                 vec,
+                 hc_mult,
++                world,
+             )
+             if T.cast(ids[t], T.int64) == IMAGE_SENTINEL:
+                 for c in T.serial(chunks):
+@@ -432,9 +468,17 @@ def engram_post_gate(
+     if tokens == 0:
+         return
+     hidden = weight.numel() // hc_mult
+-    kernel = engram_post_gate_kernel(hc_mult, hidden, eps, _dtype(ids))
++    world = int(layer_out.shape[0]) if layer_out.ndim == 3 else 1
++    extra = {"world": world} if world != 1 else {}
++    kernel = engram_post_gate_kernel(hc_mult, hidden, eps, _dtype(ids), **extra)
+     kernel(
+-        layer_out.view(tokens, hidden),
++        layer_out.view(tokens, hidden)
++        if world == 1
++        else (
++            layer_out
++            if layer_out.shape == (world, tokens, hidden)
++            else layer_out.view(world, tokens, hidden)
++        ),
+         residual.view(tokens, hc_mult, hidden),
+         post.view(tokens, hc_mult),
+         comb.view(tokens, hc_mult, hc_mult),
+@@ -455,18 +499,25 @@ def engram_post_gate_blocked_kernel(
+     block_cols: int,
+     threads: int = 256,
+     vec: int = 4,
++    world: int = 1,
+ ):
+-    assert hidden % (threads * vec) == 0 and threads % 32 == 0
++    assert hidden % (threads * vec) == 0 and threads % 32 == 0 and world >= 1
+     assert block_cols % vec == 0 and blocks * block_cols >= (hc_mult + 1) * hidden
+     chunks = hidden // (threads * vec)
+     warps = threads // 32
+     scalar = hidden**-0.5
+     tokens = T.dynamic("tokens")
+     rows = T.dynamic("rows")
++    layer_stride0 = T.dynamic("layer_stride0")
++    layer_out_ann = (
++        T.Tensor((tokens, hidden), T.bfloat16)
++        if world == 1
++        else T.StridedTensor((world, tokens, hidden), (layer_stride0, hidden, 1), T.bfloat16)
++    )
+ 
+     @T.prim_func
+     def engram_post_gate_blocked(
+-        layer_out: T.Tensor((tokens, hidden), T.bfloat16),
++        layer_out: layer_out_ann,
+         residual: T.Tensor((tokens, hc_mult, hidden), T.bfloat16),
+         post: T.Tensor((tokens, hc_mult), T.float32),
+         comb: T.Tensor((tokens, hc_mult, hc_mult), T.float32),
+@@ -498,6 +549,7 @@ def engram_post_gate_blocked_kernel(
+                 threads,
+                 vec,
+                 hc_mult,
++                world,
+             )
+             if T.cast(ids[t], T.int64) == IMAGE_SENTINEL:
+                 for c in T.serial(chunks):
+@@ -573,11 +625,19 @@ def engram_post_gate_blocked(
+         return
+     hidden = weight.numel() // hc_mult
+     blocks, _, block_cols = kv.shape
++    world = int(layer_out.shape[0]) if layer_out.ndim == 3 else 1
++    extra = {"world": world} if world != 1 else {}
+     kernel = engram_post_gate_blocked_kernel(
+-        hc_mult, hidden, eps, _dtype(ids), blocks, block_cols
++        hc_mult, hidden, eps, _dtype(ids), blocks, block_cols, **extra
+     )
+     kernel(
+-        layer_out.view(tokens, hidden),
++        layer_out.view(tokens, hidden)
++        if world == 1
++        else (
++            layer_out
++            if layer_out.shape == (world, tokens, hidden)
++            else layer_out.view(world, tokens, hidden)
++        ),
+         residual.view(tokens, hc_mult, hidden),
+         post.view(tokens, hc_mult),
+         comb.view(tokens, hc_mult, hc_mult),
+diff --git a/vllm/models/deepseek_v4_1/tilelang/mhc.py b/vllm/models/deepseek_v4_1/tilelang/mhc.py
+index 42777b407..76b978a57 100644
+--- a/vllm/models/deepseek_v4_1/tilelang/mhc.py
++++ b/vllm/models/deepseek_v4_1/tilelang/mhc.py
+@@ -584,9 +584,11 @@ def post_streams(hidden_size: int, threads: int = 128, world: int = 1):
+ 
+         return mhc_post
+ 
++    x_stride0 = T.dynamic("x_stride0")
++
+     @T.prim_func
+     def mhc_post(
+-        X: T.Tensor((world, M, hidden_size), T.bfloat16),
++        X: T.StridedTensor((world, M, hidden_size), (x_stride0, hidden_size, 1), T.bfloat16),
+         residual: T.Tensor((M, MULT, hidden_size), T.bfloat16),
+         post: T.Tensor((M, MULT), T.float32),
+         comb: T.Tensor((M, MULT, MULT), T.float32),
+@@ -1230,7 +1232,13 @@ def _mhc_post(
+         return
+     world = int(x.shape[0]) if x.ndim == 3 else 1
+     _post(hidden, world)(
+-        x.view(world, tokens, hidden) if world > 1 else x.view(tokens, hidden),
++        (
++            x
++            if x.shape == (world, tokens, hidden)
++            else x.view(world, tokens, hidden)
++        )
++        if world > 1
++        else x.view(tokens, hidden),
+         residual.view(tokens, MULT, hidden),
+         post.view(tokens, MULT),
+         comb.view(tokens, MULT, MULT),
+-- 
+2.43.0
+

@@ -1,0 +1,17 @@
+#!/usr/bin/python3
+"""Add ownership and resource limits to the unchanged standard GPU smoke command."""
+import json
+import os
+from pathlib import Path
+import sys
+
+args=sys.argv[1:]
+if args and args[0]=='run':
+    token=os.environ['CED_SMOKE_TOKEN'];name=os.environ['CED_SMOKE_NAME'];image=os.environ['CED_SMOKE_IMAGE']
+    h=json.loads((Path.home()/'spark-hold.json').read_text())
+    assert h.get('holder')=='ced-sp567-native-correctness' and h.get('token')==token
+    assert h.get('nodes')==['sp5','sp6','sp7'] and h.get('phase')=='native'
+    assert name.startswith('ced-sp567-'+token[:12]+'-') and image in args
+    assert '--memory=16g' in args and '--memory-swap=16g' in args
+    args=['run','--name',name,'--label','ced.window='+token,'--cpus=1','--pids-limit=256','--network=none',*args[1:]]
+os.execv('/usr/bin/docker',['docker',*args])

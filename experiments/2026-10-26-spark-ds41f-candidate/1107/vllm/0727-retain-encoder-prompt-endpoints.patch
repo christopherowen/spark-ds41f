@@ -1,4 +1,4 @@
-From 0aaebda5cc9fcc941973b43d62fd7b229508a371 Mon Sep 17 00:00:00 2001
+From a439edc0beae37a135e2835b83220f7e4b49f249 Mon Sep 17 00:00:00 2001
 From: Christopher Owen <3221756+christopherowen@users.noreply.github.com>
 Date: Thu, 5 Nov 2026 22:53:31 +0000
 Subject: [PATCH] Retain encoder prompt endpoints for bounded-replay prefix
@@ -7,29 +7,27 @@ Subject: [PATCH] Retain encoder prompt endpoints for bounded-replay prefix
 A bounded-replay prompt can retain only its resend boundary while sparse
 retention drops the encoder window at its final complete page. A later
 extension then repeats an additional page despite matching all those tokens.
-Keep the encoder endpoint alongside the resend boundary when replay needs
-more than one token. Decoder and drafter pages remain private, and lookup
-still caps each request at its own replay suffix.
+Keep the encoder endpoint alongside the resend boundary when bounded replay
+crosses into an earlier scheduler block (resend // block != num_prompt_tokens // block).
+When resend and num_prompt_tokens fall in the same scheduler block
+((num_prompt_tokens % 256) >= 128), return only the single resend boundary.
+Decoder and drafter pages remain private, and lookup still caps each request
+at its own replay suffix.
 
 Upstream base: local-inference-lab/vllm 19f2c20ed4d64ae22bd009ceacadd85e2a81e354.
 Validation base: candidate-38 1f33102547e4da5c64712390604695d1abd577c4.
 Quality: no arithmetic, tokenization, sampling, or decoder replay change.
 Tests: 50 endpoint cases cover partial prompt pages, chunking, concurrent
-readers, scratch pressure, changed prefixes, cancellation and eviction.
-28 of the expanded 48 cases fail on the old policy and pass with the fix.
-277 CPU cache-manager tests pass; four unrelated HiSparse failures match
-the base. GPU output equality and incremental TTFT remain unmeasured.
+readers, scratch pressure, changed prefixes, cancellation and eviction, plus
+2-boot GPU CED encoder/decoder replay equivalence (max_abs_diff == 0.0) and
+prefill latency measurements on dgx4.
 Upstream status: proposed for review; not promoted.
----
- tests/v1/core/test_prefix_caching.py | 108 +++++++++++++++++++++++++++
- vllm/v1/core/kv_cache_coordinator.py |  20 +++--
- 2 files changed, 121 insertions(+), 7 deletions(-)
 
 diff --git a/tests/v1/core/test_prefix_caching.py b/tests/v1/core/test_prefix_caching.py
-index f074ebb88..91833c584 100644
+index f074ebb88..c0b27c372 100644
 --- a/tests/v1/core/test_prefix_caching.py
 +++ b/tests/v1/core/test_prefix_caching.py
-@@ -6128,6 +6128,114 @@ def test_ced_prefix_replays_short_prompt_boundary(prompt_length, expected_hit):
+@@ -6128,6 +6128,120 @@ def test_ced_prefix_replays_short_prompt_boundary(prompt_length, expected_hit):
      )
  
  
@@ -57,6 +55,12 @@ index f074ebb88..91833c584 100644
 +    if chunked:
 +        assert manager.allocate_slots(producer, prompt_length - first) is not None
 +        producer.num_computed_tokens = prompt_length
++    expected_boundaries = (
++        (prompt_length - 128, prompt_length)
++        if prompt_length % 256 < 128
++        else (prompt_length - 128,)
++    )
++    assert manager.coordinator.get_replay_boundaries(producer) == expected_boundaries
 +    if not producer_live:
 +        manager.free(producer)
 +
@@ -145,7 +149,7 @@ index f074ebb88..91833c584 100644
      manager = make_kv_cache_manager(
          make_ced_kv_cache_config(ced=False),
 diff --git a/vllm/v1/core/kv_cache_coordinator.py b/vllm/v1/core/kv_cache_coordinator.py
-index 757f03516..53f274aed 100644
+index 757f03516..cded5e944 100644
 --- a/vllm/v1/core/kv_cache_coordinator.py
 +++ b/vllm/v1/core/kv_cache_coordinator.py
 @@ -338,11 +338,12 @@ class KVCacheCoordinator(ABC):
@@ -166,7 +170,7 @@ index 757f03516..53f274aed 100644
          finer hash granularity, which would over-estimate the reach.
          """
          if self.enable_partial_hash_hits:
-@@ -362,9 +363,14 @@ class KVCacheCoordinator(ABC):
+@@ -362,9 +363,18 @@ class KVCacheCoordinator(ABC):
                  )
              )
          if not self.eagle_group_ids:
@@ -175,7 +179,11 @@ index 757f03516..53f274aed 100644
 +            resend = max(
 +                request.num_prompt_tokens - max(1, self.prefill_replay_tokens), 0
              )
-+            if self.prefill_replay_tokens > 1:
++            block = self.scheduler_block_size
++            if (
++                self.prefill_replay_tokens > 1
++                and resend // block != request.num_prompt_tokens // block
++            ):
 +                # CED extensions can reuse the encoder's complete prompt tail
 +                # while rebuilding their own private decoder/drafter suffix.
 +                return (resend, request.num_prompt_tokens)
@@ -183,6 +191,3 @@ index 757f03516..53f274aed 100644
          block = self.scheduler_block_size
          resend = (request.num_prompt_tokens - 1) // block * block
          extension = request.num_prompt_tokens // block * block
--- 
-2.43.0
-

@@ -1,0 +1,1281 @@
+From 058a8721378b509d3e02aefaf309e2a4fe818b6b Mon Sep 17 00:00:00 2001
+From: Christopher Owen <3221756+christopherowen@users.noreply.github.com>
+Date: Fri, 6 Nov 2026 23:34:14 +0000
+Subject: [PATCH] perf(dsv41): row-parallel vision wo/w2, multi-image packing,
+ and pixel cap downscaling
+
+Upstream base: 19f2c20ed4d64ae22bd009ceacadd85e2a81e354.
+Immediate base: a75357bba81e31e4f3085700f94b6a0b29aed44a.
+
+Convert DeepSeek-V4.1 vision attn.wo, mlp.w2, and aligner.w2 from output-column
+sharding (shard_dim=0) to row-parallel input-column sharding (shard_dim=1)
+reduced deterministically via tensor_model_parallel_all_gather and
+rank_order_sum, eliminating all intermediate all-gathers between wqkv/attention
+and wo, mlp.w1 and mlp.w2, and aligner.w1 and aligner.w2 (130 -> 65 collectives
+per pass), removing the 51.9 MiB full-intermediate workspace buffer, and keeping
+wo/w2 output dimension N unsharded (1024/5120, multiple of 128 across TP2..TP8).
+
+Handle wholly padded TP ranks on TP5 (rank 4) and TP7 (rank 6) where
+valid_heads == 0 by zeroing local_branch and skipping redundant kernel launches
+while participating in the row-parallel reduction.
+
+Pack contiguous runs of images within the 9,216-patch ViT workspace and
+3,072-row aligner workspace into batched passes (forward_batch / encode_images),
+collapsing a 4-image prompt from 4x32 ViT loops (520 collectives under old
+shard_dim=0, or 260 under sequential row-parallel) to 1x32 ViT loop (65
+collectives), while honoring --mm-encoder-tp-mode data via
+run_dp_sharded_vision_tower when configured.
+
+Replace hard ValueError rejection on images exceeding VLLM_MAX_IMAGE_PIXELS with
+aspect-ratio-preserving Pillow Image.draft() + Image.thumbnail(..., BILINEAR)
+downscaling during decode so high-megapixel uploads stay bounded by
+VLLM_MAX_IMAGE_PIXELS without HTTP 400 failures.
+
+Quality: rank_order_sum reduction preserves bit-exact parity across all TP ranks
+(0 differing bits across ranks on TP3..TP8) and matches the FP64 reference
+within <= 2^-7 relative RMS error across TP3..TP8.
+Tests: 116 passed across two fresh GPU container boots on sp8
+(tests/kernels/test_deepseek_v41_tilelang_vision.py covering TP3..TP8,
+multi-image packing, and data-parallel override;
+tests/multimodal/media/test_image.py covering pixel-limit downscaling).
+Upstream status: candidate-1107 qualification patch.
+---
+ .../test_deepseek_v41_tilelang_vision.py      | 224 ++++++++-
+ tests/multimodal/media/test_image.py          |  20 +-
+ .../deepseek_v4_1/nvidia/tilelang_vision.py   | 440 ++++++++++++------
+ vllm/models/deepseek_v4_1/nvidia/vl_model.py  |  37 +-
+ vllm/multimodal/media/image.py                |  23 +-
+ 5 files changed, 544 insertions(+), 200 deletions(-)
+
+diff --git a/tests/kernels/test_deepseek_v41_tilelang_vision.py b/tests/kernels/test_deepseek_v41_tilelang_vision.py
+index d56e882ec..c9685b43a 100644
+--- a/tests/kernels/test_deepseek_v41_tilelang_vision.py
++++ b/tests/kernels/test_deepseek_v41_tilelang_vision.py
+@@ -1099,13 +1099,14 @@ def _build_tp_shards(ref_vit, ref_aligner, tp_size: int):
+     return vits, aligners
+ 
+ 
+-@pytest.mark.parametrize("tp_size", [3, 4])
++@pytest.mark.parametrize("tp_size", [3, 4, 5, 6, 7, 8])
+ @pytest.mark.parametrize("height, width", [(1, 1), (5, 7), (13, 17), (24, 24)])
+ def test_tp_sharded_tower_against_reference(real, monkeypatch, tp_size, height, width):
+-    """Tensor-parallel ViT + aligner at TP3 (16 -> 18 heads, 1024 -> 1152 hidden,
+-    2816 -> 2880 MLP, 5120 -> 5184 aligner zero-padded) and TP4 (exact 4-way shards)
+-    produce bit-for-bit identical BF16 outputs to the unsharded TP1 tower and
+-    aligner on every rank."""
++    """Tensor-parallel ViT + aligner at TP3..TP8 with column-parallel
++    wqkv/mlp.w1/aligner.w1 and row-parallel wo/mlp.w2/aligner.w2 (including
++    wholly-padded attention ranks on TP5 rank 4 and TP7 rank 6) produce
++    bit-identical BF16 outputs across all ranks and match the TP1 and FP64
++    references with half the collectives (2 per ViT block + 1 in aligner)."""
+     import threading
+     import vllm.distributed as distributed
+ 
+@@ -1114,9 +1115,11 @@ def test_tp_sharded_tower_against_reference(real, monkeypatch, tp_size, height,
+     barrier = threading.Barrier(tp_size)
+     partials: list[torch.Tensor | None] = [None] * tp_size
+     local_rank = threading.local()
++    gather_calls = [0] * tp_size
+ 
+     def sync_all_gather(tensor: torch.Tensor, dim: int = -1) -> torch.Tensor:
+         r = local_rank.rank
++        gather_calls[r] += 1
+         partials[r] = tensor.clone()
+         barrier.wait()
+         gathered = torch.cat([partials[i] for i in range(tp_size)], dim=dim)
+@@ -1128,6 +1131,8 @@ def test_tp_sharded_tower_against_reference(real, monkeypatch, tp_size, height,
+     patches = _patches(REAL, rows, seed=height * 1000 + width)
+     ref_encoded = ref_vit(patches, height, width)
+     ref_aligned = ref_aligner(ref_encoded, height, width)
++    vit_ref64 = _vit_reference(ref_vit, patches, height, width)
++    aligner_ref64 = _aligner_reference(ref_aligner, ref_encoded, height, width)
+     encoded_ranks: list[torch.Tensor | None] = [None] * tp_size
+     aligned_ranks: list[torch.Tensor | None] = [None] * tp_size
+     errors: list[BaseException] = []
+@@ -1151,17 +1156,34 @@ def test_tp_sharded_tower_against_reference(real, monkeypatch, tp_size, height,
+     if errors:
+         raise errors[0]
+ 
++    expected_gathers = 2 * REAL.vision_n_layers + 1
++    assert gather_calls == [expected_gathers] * tp_size
+     for r in range(tp_size):
+-        _assert_bits(encoded_ranks[r], ref_encoded, f"TP{tp_size} ViT rank {r} vs TP1")
+         _assert_bits(
+-            aligned_ranks[r], ref_aligned, f"TP{tp_size} aligner rank {r} vs TP1"
++            encoded_ranks[r],
++            encoded_ranks[0],
++            f"TP{tp_size} ViT rank {r} vs rank 0",
+         )
++        _assert_bits(
++            aligned_ranks[r],
++            aligned_ranks[0],
++            f"TP{tp_size} aligner rank {r} vs rank 0",
++        )
++    ours = (
++        _relative(encoded_ranks[0], vit_ref64),
++        _relative(aligned_ranks[0], aligner_ref64),
++    )
++    for stage in (0, 1):
++        assert ours[stage] <= 2.0**-7
++    assert _relative(encoded_ranks[0], ref_encoded) <= 2.0**-7
++    assert _relative(aligned_ranks[0], ref_aligned) <= 2.0**-7
+ 
+ 
+ def test_tp_sharding_weight_padding_and_data_parallel_override(real):
+-    """Verify TP3 zero-padding of tail heads/MLP/aligner rows on all 6 column-sharded
+-    projections, TP4 exact 4-way memory reduction, contiguous 1-row O_DIRECT arena
+-    descriptors via ``bind_weight_arena``, and ``use_data_parallel=True`` replication."""
++    """Verify row-parallel (shard_dim=1) on attn.wo, mlp.w2, aligner.w2 and
++    column-parallel (shard_dim=0) on attn.wqkv, mlp.w1, aligner.w1; TP3 tail
++    zero-padding; TP5/TP7 wholly-padded ranks; O_DIRECT arena descriptors via
++    bind_weight_arena; and use_data_parallel=True replication."""
+     from vllm.model_executor.model_loader.direct_io._checkpoint import (
+         TensorRange,
+         view_offset,
+@@ -1172,35 +1194,61 @@ def test_tp_sharding_weight_padding_and_data_parallel_override(real):
+ 
+     ref_vit, ref_aligner = real
+     vits3, aligners3 = _build_tp_shards(ref_vit, ref_aligner, 3)
+-    # TP3: 16 heads -> 6 heads/rank (384 rows); rank 2 has 4 valid heads (256 rows) + 128 zero rows.
++    # TP3: 16 heads -> 6 heads/rank (384 cols); rank 2 has 4 valid heads (256) + 128 zero.
+     assert (
+         vits3[2].local_heads == 6
++        and vits3[2].valid_heads == 4
+         and vits3[2].qkv_width == 384
+-        and vits3[2].local_hidden == 384
++        and vits3[2].local_hidden == 1024
+     )
+     wqkv2 = vits3[2].blocks[0].attn.wqkv
++    assert wqkv2.shard_dim == 0
+     for p in range(3):
+         assert bool((wqkv2.weight[p * 384 + 256 : (p + 1) * 384] == 0).all())
+         assert bool((wqkv2.bias[p * 384 + 256 : (p + 1) * 384] == 0).all())
++    wo0 = vits3[0].blocks[0].attn.wo
+     wo2 = vits3[2].blocks[0].attn.wo
+-    assert bool((wo2.weight[256:] == 0).all())
+-    assert bool((wo2.bias[256:] == 0).all())
+-    # TP3 MLP: w1 2816 -> 960/rank (896 valid + 64 zero rows); w2 1024 -> 384/rank (256 valid + 128 zero rows).
++    assert wo2.shard_dim == 1 and wo2.weight.shape == (1024, 384)
++    assert bool((wo2.weight[:, 256:] == 0).all())
++    _assert_bits(wo0.bias, ref_vit.blocks[0].attn.wo.bias, "TP3 rank 0 wo.bias")
++    assert bool((wo2.bias == 0).all())
++    # TP3 MLP: w1 (shard_dim=0) 2816 -> 960/rank (896 valid + 64 zero rows);
++    # w2 (shard_dim=1) [1024, 960] (896 valid + 64 zero cols on rank 2).
+     w1_2 = vits3[2].blocks[0].mlp.w1
++    w2_2 = vits3[2].blocks[0].mlp.w2
++    assert w1_2.shard_dim == 0 and w2_2.shard_dim == 1
++    assert w2_2.weight.shape == (1024, 960)
+     for p in range(2):
+         assert bool((w1_2.weight[p * 960 + 896 : (p + 1) * 960] == 0).all())
+-    assert bool((vits3[2].blocks[0].mlp.w2.weight[256:] == 0).all())
+-    # TP3 aligner: w1 & w2 5120 -> 1728/rank; rank 2 has 1664 valid + 64 zero rows.
++    assert bool((w2_2.weight[:, 896:] == 0).all())
++    # TP3 aligner: w1 (shard_dim=0) [1728, 9216], w2 (shard_dim=1) [5120, 1728].
++    assert aligners3[2].w1.shard_dim == 0 and aligners3[2].w2.shard_dim == 1
++    assert aligners3[2].w1.weight.shape == (1728, 9216)
++    assert aligners3[2].w2.weight.shape == (5120, 1728)
+     assert bool((aligners3[2].w1.weight[1664:] == 0).all())
+     assert bool((aligners3[2].w1.bias[1664:] == 0).all())
+-    assert bool((aligners3[2].w2.weight[1664:] == 0).all())
+-    assert bool((aligners3[2].w2.bias[1664:] == 0).all())
++    assert bool((aligners3[2].w2.weight[:, 1664:] == 0).all())
++    _assert_bits(aligners3[0].w2.bias, ref_aligner.w2.bias, "TP3 rank 0 aligner.w2.bias")
++    assert bool((aligners3[2].w2.bias == 0).all())
++
++    # TP5 rank 4 and TP7 rank 6 have 0 valid heads; weights/biases are wholly zeroed.
++    vits5, _ = _build_tp_shards(ref_vit, ref_aligner, 5)
++    assert vits5[4].local_heads == 4 and vits5[4].valid_heads == 0
++    assert bool((vits5[4].blocks[0].attn.wqkv.weight == 0).all())
++    assert bool((vits5[4].blocks[0].attn.wqkv.bias == 0).all())
++    assert bool((vits5[4].blocks[0].attn.wo.weight == 0).all())
++    assert bool((vits5[4].blocks[0].attn.wo.bias == 0).all())
++    vits7, _ = _build_tp_shards(ref_vit, ref_aligner, 7)
++    assert vits7[6].local_heads == 3 and vits7[6].valid_heads == 0
++    assert bool((vits7[6].blocks[0].attn.wqkv.weight == 0).all())
++    assert bool((vits7[6].blocks[0].attn.wo.weight == 0).all())
+ 
+     # TP4: exact 1/4 sharding of attention, MLP, and aligner weights.
+     vits4, aligners4 = _build_tp_shards(ref_vit, ref_aligner, 4)
+     assert (
+         vits4[0].local_heads == 4
+-        and vits4[0].local_hidden == 256
++        and vits4[0].valid_heads == 4
++        and vits4[0].local_hidden == 1024
+         and vits4[0].local_inter == 704
+     )
+     assert aligners4[0].local_out_dim == 1280
+@@ -1212,7 +1260,8 @@ def test_tp_sharding_weight_padding_and_data_parallel_override(real):
+     assert aligners4[0].w1.weight.nbytes * 4 == ref_aligner.w1.weight.nbytes
+     assert aligners4[0].w2.weight.nbytes * 4 == ref_aligner.w2.weight.nbytes
+ 
+-    # Direct weight arena: every TP3 shard records 1-row contiguous O_DIRECT DMA descriptors.
++    # Direct weight arena: shard_dim=0 records 1-row contiguous descriptors and
++    # shard_dim=1 records strided column-slice descriptors inside the arena.
+     class _ArenaTower(torch.nn.Module):
+         def __init__(self):
+             super().__init__()
+@@ -1225,7 +1274,7 @@ def test_tp_sharding_weight_padding_and_data_parallel_override(real):
+     assert arena is not None
+     arena_start = arena.data_ptr()
+     arena_end = arena_start + arena.nbytes
+-    recorded: list[tuple[int, ...]] = []
++    recorded: list[tuple[str, tuple[int, ...]]] = []
+ 
+     class _Recorder:
+         def __init__(self):
+@@ -1247,7 +1296,8 @@ def test_tp_sharding_weight_padding_and_data_parallel_override(real):
+             entry = self.entries[id(source.untyped_storage())]
+             offset = view_offset(entry, source, destination)
+             recs = view_records(entry, offset, source, destination, expand=False)
+-            recorded.extend(recs)
++            for rec in recs:
++                recorded.append((entry.name, rec))
+             return True
+ 
+     recorder = _Recorder()
+@@ -1261,10 +1311,21 @@ def test_tp_sharding_weight_padding_and_data_parallel_override(real):
+             src = recorder.make_source(name, ref_all[name])
+             param.weight_loader(param, src)
+     assert len(recorded) > 0
+-    for rec in recorded:
++    row_parallel_names = {
++        "vision.blocks.0.attn.wo.weight",
++        "vision.blocks.0.mlp.w2.weight",
++        "aligner.w2.weight",
++    }
++    seen_row_parallel = set()
++    for name, rec in recorded:
+         _, _, _, dst_ptr, _, rows, src_stride, dst_stride = rec
+-        assert rows == 1 and src_stride == 0 and dst_stride == 0
+         assert arena_start <= dst_ptr < arena_end
++        if name in row_parallel_names:
++            seen_row_parallel.add(name)
++            assert rows in (1024, 5120) and src_stride > 0 and dst_stride > 0
++        else:
++            assert rows == 1 and src_stride == 0 and dst_stride == 0
++    assert seen_row_parallel == row_parallel_names
+ 
+     # use_data_parallel=True keeps full replicated weights even when tp_size is passed.
+     with torch.device("meta"):
+@@ -1276,3 +1337,116 @@ def test_tp_sharding_weight_padding_and_data_parallel_override(real):
+         )
+     assert dp_vit.tp_size == 1 and dp_vit.local_heads == 16
+     assert dp_aligner.tp_size == 1 and dp_aligner.local_out_dim == 5120
++
++
++def test_multi_image_packing_and_collective_reduction(real, small, monkeypatch):
++    """Packing multiple images in encode_images matches per-image forward bit-for-bit
++    on GEMM-sized images, splits chunks when total patches exceed capacity, and
++    collapses 4 images into a single set of TP collectives."""
++    import threading
++    import vllm.distributed as distributed
++
++    ref_vit, ref_aligner = real
++    grids = [(9, 9), (9, 12), (7, 11), (12, 12)]
++    images = [
++        _patches(REAL, h * w, seed=500 + i) for i, (h, w) in enumerate(grids)
++    ]
++    packed_patches = torch.cat(images, dim=0)
++    expected = [
++        ref_aligner(ref_vit(img, h, w), h, w)
++        for img, (h, w) in zip(images, grids)
++    ]
++    got = tilelang_vision.encode_images(
++        ref_vit, ref_aligner, packed_patches, grids
++    )
++    assert len(got) == len(expected)
++    for idx, (g, e) in enumerate(zip(got, expected)):
++        _assert_bits(g, e, f"TP1 packed image {idx}")
++
++    # Multi-chunk splitting when total patches exceed SMALL.capacity (144).
++    small_vit, small_aligner = small
++    overflow_grids = [(10, 10), (9, 9), (6, 6)]  # 100 + 81 + 36 = 217 > 144 -> 2 chunks
++    overflow_imgs = [
++        _patches(SMALL, h * w, seed=700 + i)
++        for i, (h, w) in enumerate(overflow_grids)
++    ]
++    overflow_got = tilelang_vision.encode_images(
++        small_vit, small_aligner, torch.cat(overflow_imgs, dim=0), overflow_grids
++    )
++    for idx, (img, (h, w), g) in enumerate(
++        zip(overflow_imgs, overflow_grids, overflow_got)
++    ):
++        _assert_bits(
++            g,
++            small_aligner(small_vit(img, h, w), h, w),
++            f"multi-chunk image {idx}",
++        )
++
++    # TP4 packed 4-image pass: 1x collectives (2 * n_layers + 1) instead of 4x.
++    tp_size = 4
++    vits4, aligners4 = _build_tp_shards(ref_vit, ref_aligner, tp_size)
++    barrier = threading.Barrier(tp_size)
++    partials: list[torch.Tensor | None] = [None] * tp_size
++    local_rank = threading.local()
++    gather_calls = [0] * tp_size
++
++    def sync_all_gather(tensor: torch.Tensor, dim: int = -1) -> torch.Tensor:
++        r = local_rank.rank
++        gather_calls[r] += 1
++        partials[r] = tensor.clone()
++        barrier.wait()
++        gathered = torch.cat([partials[i] for i in range(tp_size)], dim=dim)
++        barrier.wait()
++        return gathered
++
++    monkeypatch.setattr(distributed, "tensor_model_parallel_all_gather", sync_all_gather)
++    rank_outputs: list[list[torch.Tensor] | None] = [None] * tp_size
++    errors: list[BaseException] = []
++
++    def worker(rank: int) -> None:
++        try:
++            local_rank.rank = rank
++            rank_outputs[rank] = tilelang_vision.encode_images(
++                vits4[rank], aligners4[rank], packed_patches, grids
++            )
++        except BaseException as exc:  # noqa: BLE001
++            errors.append(exc)
++            barrier.abort()
++
++    threads = [threading.Thread(target=worker, args=(r,)) for r in range(tp_size)]
++    for t in threads:
++        t.start()
++    for t in threads:
++        t.join()
++    if errors:
++        raise errors[0]
++
++    expected_gathers = 2 * REAL.vision_n_layers + 1
++    assert gather_calls == [expected_gathers] * tp_size
++    for r in range(tp_size):
++        for idx in range(len(grids)):
++            _assert_bits(
++                rank_outputs[r][idx],
++                rank_outputs[0][idx],
++                f"TP4 packed rank {r} image {idx}",
++            )
++            assert _relative(rank_outputs[r][idx], expected[idx]) <= 2.0**-7
++
++
++def test_oversized_image_transparent_downscaling(monkeypatch):
++    """Oversized images (> VLLM_MAX_IMAGE_PIXELS) are transparently downscaled via
++    Pillow draft() + thumbnail() while preserving aspect ratio."""
++    from io import BytesIO
++    from PIL import Image
++    import vllm.envs as envs
++    from vllm.multimodal.media.image import ImageMediaIO
++
++    monkeypatch.setattr(envs, "VLLM_MAX_IMAGE_PIXELS", 40000)
++    img = Image.new("RGB", (600, 300), (120, 45, 200))
++    buf = BytesIO()
++    img.save(buf, format="JPEG")
++    loaded = ImageMediaIO().load_bytes(buf.getvalue())
++    w, h = loaded.media.size
++    assert w * h <= 40000
++    assert abs((w / h) - 2.0) < 0.05
++    assert loaded.io_config == {"max_pixels": 40000}
+diff --git a/tests/multimodal/media/test_image.py b/tests/multimodal/media/test_image.py
+index 5bbf54b78..074f4a67d 100644
+--- a/tests/multimodal/media/test_image.py
++++ b/tests/multimodal/media/test_image.py
+@@ -248,22 +248,24 @@ def test_image_pixel_limit_respected():
+     assert result.media.size == (100, 100)
+ 
+ 
+-def test_image_pixel_limit_rejected(monkeypatch):
+-    """An image exceeding the pixel limit is rejected before raster decode."""
++def test_image_pixel_limit_downscaled(monkeypatch):
++    """An image exceeding the pixel limit is transparently downscaled on load."""
+     import vllm.envs as envs
+-
+-    monkeypatch.setattr(envs, "VLLM_MAX_IMAGE_PIXELS", 100)
+-
+-    image = Image.new("RGB", (20, 20), (0, 255, 0))
+     from io import BytesIO
+ 
++    monkeypatch.setattr(envs, "VLLM_MAX_IMAGE_PIXELS", 200)
++
++    image = Image.new("RGB", (40, 20), (0, 255, 0))
+     buf = BytesIO()
+-    image.save(buf, format="PNG")
++    image.save(buf, format="JPEG")
+     data = buf.getvalue()
+ 
+     image_io = ImageMediaIO()
+-    with pytest.raises(ValueError, match="exceed"):
+-        image_io.load_bytes(data)
++    result = image_io.load_bytes(data)
++    w, h = result.media.size
++    assert w * h <= 200
++    assert (w, h) == (20, 10)
++    assert result.io_config == {"max_pixels": 200}
+ 
+ 
+ def test_image_pixel_limit_disabled(monkeypatch):
+diff --git a/vllm/models/deepseek_v4_1/nvidia/tilelang_vision.py b/vllm/models/deepseek_v4_1/nvidia/tilelang_vision.py
+index 798305029..a858bad01 100644
+--- a/vllm/models/deepseek_v4_1/nvidia/tilelang_vision.py
++++ b/vllm/models/deepseek_v4_1/nvidia/tilelang_vision.py
+@@ -1,23 +1,21 @@
+ # SPDX-License-Identifier: Apache-2.0
+ # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+-"""Replicated V4.1 ViT and aligner on DeepSeek-V4.1's TileLang kernels.
++"""V4.1 ViT and aligner on DeepSeek-V4.1's TileLang kernels.
+ 
+ The vision tower, over the checkpoint's parameter tree, with every launch a
+-kernel of ``tilelang/vision.py``. One image is evaluated per call.
++kernel of ``tilelang/vision.py``. Single images or packed multi-image batches
++fitting within the tower's capacity (``_capacity``) are evaluated per call.
+ Each module declares its kernels (``declare_kernels``, which the worker calls after
+ loading); binding them provisions a workspace for the tower's capacity
+ (``_capacity``), so a forward allocates nothing but an output the caller did not
+ pass, and a capture with outputs passed allocates nothing at all.
+ 
+-A block runs eight launches: the fused q/k/v projection with its bias, the 2-D
+-rotation of q and k in place in it, attention over the image's rows (reading
+-q, k and v where the projection wrote them), the output projection with its bias,
+-the residual add with the second norm, the gate/up projection with the SwiGLU in
+-its epilogue, the down projection, and the residual add with the next block's (or
+-the final) norm. The aligner merges each window, projects with the bias and GELU
+-in one launch, and projects again. Images of at most ``GEMV_ROWS`` rows (merged
+-rows, for the aligner) project through the SIMT GEMVs, larger ones through the
+-tensor-core GEMMs.
++Under tensor parallelism (``--mm-encoder-tp-mode weights``), ``attn.wqkv``,
++``mlp.w1``, and ``aligner.w1`` are column-parallel (``shard_dim = 0``) while
++``attn.wo``, ``mlp.w2``, and ``aligner.w2`` are row-parallel (``shard_dim = 1``),
++eliminating intermediate all-gathers and keeping output widths unsharded
++(multiples of 128 on every TP size). Partial row-parallel outputs are reduced
++across TP ranks with ``rank_order_sum``.
+ """
+ 
+ import itertools
+@@ -77,28 +75,35 @@ def _local_heads(config, tp_size: int) -> int:
+ 
+ 
+ def _local_width(full_width: int, tp_size: int) -> int:
+-    """Per-rank output width for a column-sharded projection, padded to a multiple
+-    of ``_K_ALIGN = 64`` so every rank's shard has whole GEMM N-tiles and 128-byte
+-    rows for ``tensor_model_parallel_all_gather``."""
++    """Per-rank width for a sharded projection, padded to a multiple of
++    ``_K_ALIGN = 64`` so every rank's shard has whole GEMM N/K tiles."""
+     if tp_size <= 1:
+         return int(full_width)
+     quantum = tp_size * kernels._K_ALIGN
+     return -(-full_width // quantum) * quantum // tp_size
+ 
+ 
+-def _gather_columns(local: torch.Tensor, dst: torch.Tensor, world: int) -> torch.Tensor:
+-    """All-gather column-sharded ``local [rows, local_width]`` across TP ranks and
+-    copy the unpadded ``dst.shape[1]`` columns into ``dst``."""
++def _valid_span(local_count: int, full_count: int, tp_rank: int) -> int:
++    """Valid (unpadded) items on ``tp_rank`` for a dimension of size ``full_count``
++    partitioned into ``local_count``-wide shards."""
++    start = min(tp_rank * local_count, full_count)
++    end = min((tp_rank + 1) * local_count, full_count)
++    return max(0, end - start)
++
++
++def _reduce_rows(local: torch.Tensor, dst: torch.Tensor, world: int) -> torch.Tensor:
++    """All-gather row-parallel partial outputs ``local [rows, width]`` across TP
++    ranks and sum them in rank order into ``dst``."""
+     from vllm import distributed
+-    from vllm.models.deepseek_v4_1.tilelang.gather import gather_columns_into
++    from vllm.models.deepseek_v4_1.tilelang.collectives import rank_order_sum
+ 
+     gathered = distributed.tensor_model_parallel_all_gather(local, dim=0)
+-    gather_columns_into(gathered, (dst,), world)
++    rank_order_sum(list(gathered.view(world, *dst.shape).unbind(0)), out=dst)
+     return dst
+ 
+ 
+ def _capacity(config) -> int:
+-    """Rows of the largest image the tower serves."""
++    """Rows of the largest image batch the tower serves."""
+     capacity = getattr(config, "vision_max_tokens", None)
+     if capacity is None:
+         capacity = config.vision_max_n_token * config.vision_downsample_ratio**2
+@@ -116,9 +121,9 @@ def _bf16_rows(tensor: torch.Tensor, shape: tuple[int, ...], name: str) -> None:
+ 
+ class _Linear(nn.Module):
+     """A checkpoint projection: BF16 ``weight [out, in]`` and ``bias``, optionally
+-    tensor-parallel sharded along ``shard_dim = 0`` (``parts`` stacked column
+-    shards, each contiguous in the checkpoint for ``O_DIRECT`` arena loading) with
+-    zero-padded tail rows when ``full_features`` does not divide evenly."""
++    tensor-parallel sharded along ``shard_dim = 0`` (``parts`` stacked output-row
++    shards) or ``shard_dim = 1`` (input-column shard, with ``bias`` loaded on rank 0
++    and zeroed on nonzero ranks so cross-rank reduction adds the bias once)."""
+ 
+     def __init__(
+         self,
+@@ -133,8 +138,12 @@ class _Linear(nn.Module):
+         full_features: int | None = None,
+     ):
+         super().__init__()
+-        if shard_dim not in (None, 0):
+-            raise ValueError(f"_Linear only supports shard_dim in (None, 0), got {shard_dim}")
++        if shard_dim not in (None, 0, 1):
++            raise ValueError(
++                f"_Linear only supports shard_dim in (None, 0, 1), got {shard_dim}"
++            )
++        if shard_dim == 1 and parts != 1:
++            raise ValueError("_Linear row-parallel shard_dim=1 requires parts=1")
+         self.tp_size = int(tp_size)
+         self.tp_rank = int(tp_rank)
+         self.shard_dim = shard_dim
+@@ -161,6 +170,30 @@ class _Linear(nn.Module):
+         ):
+             copy_weight(param.data, loaded_weight)
+             return
++        if self.shard_dim == 1:
++            if param.ndim == 1:
++                if self.tp_rank == 0:
++                    copy_weight(param.data, loaded_weight)
++                elif not param.is_meta:
++                    param.data.zero_()
++                return
++            local_in = param.shape[1]
++            full_in = (
++                self.full_features
++                if self.full_features is not None
++                else loaded_weight.shape[1]
++            )
++            start = min(self.tp_rank * local_in, full_in)
++            end = min((self.tp_rank + 1) * local_in, full_in)
++            valid = end - start
++            if valid > 0:
++                copy_weight(
++                    param.data[:, :valid],
++                    loaded_weight[:, start:end],
++                )
++            if valid < local_in and not param.is_meta:
++                param.data[:, valid:local_in].zero_()
++            return
+         local_part = param.shape[0] // self.parts
+         full_part = (
+             self.full_features
+@@ -201,23 +234,21 @@ class _Attention(nn.Module):
+         head_dim = config.vision_dim // config.vision_n_heads
+         local_heads = _local_heads(config, tp_size)
+         qkv_width = local_heads * head_dim
+-        local_hidden = _local_width(config.vision_dim, tp_size)
+-        shard = 0 if tp_size > 1 else None
+         self.wqkv = _Linear(
+             config.vision_dim,
+             3 * qkv_width,
+             tp_size=tp_size,
+             tp_rank=tp_rank,
+-            shard_dim=shard,
++            shard_dim=0 if tp_size > 1 else None,
+             parts=3,
+             full_features=config.vision_dim,
+         )
+         self.wo = _Linear(
++            qkv_width,
+             config.vision_dim,
+-            local_hidden,
+             tp_size=tp_size,
+             tp_rank=tp_rank,
+-            shard_dim=shard,
++            shard_dim=1 if tp_size > 1 else None,
+             full_features=config.vision_dim,
+         )
+ 
+@@ -225,27 +256,25 @@ class _Attention(nn.Module):
+ class _MLP(nn.Module):
+     def __init__(self, config, *, tp_size: int = 1, tp_rank: int = 0):
+         super().__init__()
+-        local_hidden = _local_width(config.vision_dim, tp_size)
+         local_inter = _local_width(config.vision_inter_dim, tp_size)
+-        shard = 0 if tp_size > 1 else None
+         self.w1 = _Linear(
+             config.vision_dim,
+             2 * local_inter,
+             False,
+             tp_size=tp_size,
+             tp_rank=tp_rank,
+-            shard_dim=shard,
++            shard_dim=0 if tp_size > 1 else None,
+             parts=2,
+             full_features=config.vision_inter_dim,
+         )
+         self.w2 = _Linear(
+-            config.vision_inter_dim,
+-            local_hidden,
++            local_inter,
++            config.vision_dim,
+             False,
+             tp_size=tp_size,
+             tp_rank=tp_rank,
+-            shard_dim=shard,
+-            full_features=config.vision_dim,
++            shard_dim=1 if tp_size > 1 else None,
++            full_features=config.vision_inter_dim,
+         )
+ 
+ 
+@@ -258,10 +287,11 @@ class _Block(nn.Module):
+ 
+ 
+ class _VisionWorkspace:
+-    """The ViT's capacity-sized buffers. On TP1 the local shard buffers alias the
+-    full-width buffers directly; under TP sharding each column-sharded stage writes
+-    its local shard and all-gathers into the full-width buffer so every subsequent
+-    GEMM/GEMV accumulates over the unsharded K dimension."""
++    """The ViT's capacity-sized buffers. On TP1 ``local_branch`` aliases ``branch``
++    directly; under TP sharding each column-sharded stage (``wqkv``/``attention``,
++    ``mlp.w1``) feeds directly into its paired row-parallel projection (``wo``,
++    ``mlp.w2``), which writes its partial output into ``local_branch`` and reduces
++    across ranks into ``branch``."""
+ 
+     def __init__(
+         self,
+@@ -270,14 +300,13 @@ class _VisionWorkspace:
+         device: torch.device,
+         *,
+         local_heads: int | None = None,
+-        local_hidden: int | None = None,
+         local_inter: int | None = None,
++        sharded: bool = False,
+     ):
+         hidden = config.vision_dim
+         inter_full = config.vision_inter_dim
+         dim = hidden // config.vision_n_heads
+         qkv_width = (local_heads or config.vision_n_heads) * dim
+-        hidden_shard = local_hidden or hidden
+         inter_shard = local_inter or inter_full
+         patch = 3 * config.vision_patch_size**2
+         padded = kernels.padded_width(patch)
+@@ -294,17 +323,8 @@ class _VisionWorkspace:
+         self.local_attended = (
+             self.normalized if qkv_width == hidden else empty(capacity, qkv_width)
+         )
+-        self.local_branch = (
+-            self.branch
+-            if hidden_shard == hidden
+-            else empty(capacity, hidden_shard)
+-        )
+-        self.activated = empty(capacity, inter_full)
+-        self.local_activated = (
+-            self.activated
+-            if inter_shard == inter_full
+-            else empty(capacity, inter_shard)
+-        )
++        self.local_branch = empty(capacity, hidden) if sharded else self.branch
++        self.local_activated = empty(capacity, inter_shard)
+         # B12X's static head geometry, computed the same way (on the CPU, in FP32).
+         inv = 1.0 / (
+             config.vision_rope_theta
+@@ -336,9 +356,8 @@ def _device(module: nn.Module) -> torch.device:
+ 
+ class DeepseekV4ViT(nn.Module):
+     """Reference 2D split-half RoPE and full bidirectional attention per image,
+-    tensor-parallel sharded across TP ranks along output columns (with zero-padded
+-    tail heads/columns when widths do not divide evenly) so every rank accumulates
+-    the exact unsharded K dimension and produces bit-identical BF16 activations."""
++    tensor-parallel sharded with column-parallel ``wqkv``/``mlp.w1`` and
++    row-parallel ``wo``/``mlp.w2`` reduced via ``rank_order_sum``."""
+ 
+     def __init__(
+         self,
+@@ -360,9 +379,15 @@ class DeepseekV4ViT(nn.Module):
+         )
+         self.head_dim = config.vision_dim // config.vision_n_heads
+         self.local_heads = _local_heads(config, self.tp_size)
++        self.valid_heads = _valid_span(
++            self.local_heads, config.vision_n_heads, self.tp_rank
++        )
+         self.qkv_width = self.local_heads * self.head_dim
+-        self.local_hidden = _local_width(config.vision_dim, self.tp_size)
++        self.local_hidden = config.vision_dim
+         self.local_inter = _local_width(config.vision_inter_dim, self.tp_size)
++        self.valid_inter = _valid_span(
++            self.local_inter, config.vision_inter_dim, self.tp_rank
++        )
+         self.rope_dim = self.head_dim // 2
+         self.rope_theta = config.vision_rope_theta
+         self.patch_embed = _PatchEmbed(config)
+@@ -379,13 +404,9 @@ class DeepseekV4ViT(nn.Module):
+     def kernel_calls(self) -> dict[str, prepare.TileLangCall]:
+         """Every kernel the forward launches, by role."""
+         config = self.config
+-        hidden, inter_full = config.vision_dim, config.vision_inter_dim
++        hidden = config.vision_dim
+         heads, dim = self.local_heads, self.head_dim
+-        qkv_width, local_hidden, inter = (
+-            self.qkv_width,
+-            self.local_hidden,
+-            self.local_inter,
+-        )
++        qkv_width, inter = self.qkv_width, self.local_inter
+         patch = 3 * config.vision_patch_size**2
+         calls = {
+             "pad": kernels.pad_call(patch),
+@@ -396,30 +417,24 @@ class DeepseekV4ViT(nn.Module):
+             "qkv": kernels.linear_call(3 * qkv_width, hidden, bias=True),
+             "rope": kernels.rope_call(heads, dim),
+             "attention": kernels.attention_call(heads, dim),
+-            "wo": kernels.linear_call(local_hidden, hidden, bias=True),
++            "wo": kernels.linear_call(hidden, qkv_width, bias=True),
+             "add_norm": kernels.norm_call(hidden, add=True),
+             "mlp_in": kernels.swiglu_call(inter, hidden),
+-            "mlp_out": kernels.linear_call(local_hidden, inter_full, bias=False),
++            "mlp_out": kernels.linear_call(hidden, inter, bias=False),
+             # Images of at most GEMV_ROWS rows; the patches unpadded.
+             "patch_rows": kernels.gemv_call(hidden, patch, "bias"),
+             "qkv_rows": kernels.gemv_call(3 * qkv_width, hidden, "bias"),
+-            "wo_rows": kernels.gemv_call(local_hidden, hidden, "bias"),
++            "wo_rows": kernels.gemv_call(hidden, qkv_width, "bias"),
+             "mlp_in_rows": kernels.gemv_call(2 * inter, hidden, "swiglu"),
+-            "mlp_out_rows": kernels.gemv_call(local_hidden, inter_full, "none"),
++            "mlp_out_rows": kernels.gemv_call(hidden, inter, "none"),
+         }
+ 
+         if self.tp_size > 1:
+-            from vllm.models.deepseek_v4_1.tilelang.gather import gather_call
++            from vllm.models.deepseek_v4_1.tilelang.collectives import (
++                rank_order_sum_kernel,
++            )
+ 
+-            for role, local, full in (
+-                ("attended", qkv_width, hidden),
+-                ("branch", local_hidden, hidden),
+-                ("activated", inter, inter_full),
+-            ):
+-                for packed in (False, True):
+-                    calls[f"gather_{role}_{packed}"] = gather_call(
+-                        self.tp_size, local, full, 1, torch.bfloat16, packed
+-                    )
++            calls["rank_order_sum"] = prepare.call(rank_order_sum_kernel, self.tp_size)
+         return calls
+ 
+     def declare_kernels(self) -> None:
+@@ -439,17 +454,29 @@ class DeepseekV4ViT(nn.Module):
+                 self.capacity,
+                 device,
+                 local_heads=self.local_heads,
+-                local_hidden=self.local_hidden,
+                 local_inter=self.local_inter,
++                sharded=self.tp_size > 1,
+             )
+         elif self._workspace.state.device != device:
+             raise ValueError("vision moved devices after preparation")
+ 
+-    def forward(self, patches, n_vit_h: int, n_vit_w: int, *, out=None):
+-        rows = n_vit_h * n_vit_w
++    def forward_batch(
++        self,
++        patches: torch.Tensor,
++        vit_grid: list[list[int]] | list[tuple[int, int]],
++        *,
++        out: torch.Tensor | None = None,
++    ) -> torch.Tensor:
++        """Encode a packed batch of images whose total patch count fits within
++        ``self.capacity``. Token-independent projections, norms, activations, and
++        collectives execute once across all packed rows; 2D RoPE and self-attention
++        execute per image slice."""
++        grid = [(int(h), int(w)) for h, w in vit_grid]
++        sizes = [h * w for h, w in grid]
++        rows = sum(sizes)
+         if (
+-            n_vit_h <= 0
+-            or n_vit_w <= 0
++            not grid
++            or any(h <= 0 or w <= 0 for h, w in grid)
+             or rows != patches.shape[0]
+             or rows > self.capacity
+         ):
+@@ -477,7 +504,6 @@ class DeepseekV4ViT(nn.Module):
+         qkv = ws.qkv[:rows]
+         local_attended = ws.local_attended[:rows]
+         local_branch = ws.local_branch[:rows]
+-        activated = ws.activated[:rows]
+         local_activated = ws.local_activated[:rows]
+         proj = self.patch_embed.proj
+         project = _projections(launch, rows)
+@@ -492,32 +518,44 @@ class DeepseekV4ViT(nn.Module):
+         norms = [block.norm1.weight for block in self.blocks] + [self.norm.weight]
+         launch["norm"](state, norms[0], normalized if len(self.blocks) else out)
+         sharded = self.tp_size > 1
++        spans: list[tuple[int, int, int]] = []
++        offset = 0
++        for (_, w), size in zip(grid, sizes):
++            spans.append((offset, offset + size, w))
++            offset += size
++
+         for index, block in enumerate(self.blocks):
+             attn, mlp = block.attn, block.mlp
+-            project["qkv"](normalized, attn.wqkv.weight, attn.wqkv.bias, qkv)
+-            launch["rope"](qkv, ws.inv_freq, n_vit_w)
+-            launch["attention"](qkv, local_attended)
+-            attended = (
+-                _gather_columns(local_attended, normalized, self.tp_size)
+-                if sharded
+-                else local_attended
+-            )
+-            project["wo"](attended, attn.wo.weight, attn.wo.bias, local_branch)
++            if self.valid_heads > 0:
++                project["qkv"](normalized, attn.wqkv.weight, attn.wqkv.bias, qkv)
++                for start, end, width in spans:
++                    qkv_slice = qkv[start:end]
++                    launch["rope"](qkv_slice, ws.inv_freq, width)
++                    launch["attention"](qkv_slice, local_attended[start:end])
++                project["wo"](
++                    local_attended, attn.wo.weight, attn.wo.bias, local_branch
++                )
++            else:
++                local_branch.zero_()
+             if sharded:
+-                _gather_columns(local_branch, branch, self.tp_size)
++                _reduce_rows(local_branch, branch, self.tp_size)
+             launch["add_norm"](state, branch, block.norm2.weight, residual, normalized)
+-            project["mlp_in"](normalized, mlp.w1.weight, local_activated)
++            if self.valid_inter > 0:
++                project["mlp_in"](normalized, mlp.w1.weight, local_activated)
++                project["mlp_out"](local_activated, mlp.w2.weight, local_branch)
++            else:
++                local_branch.zero_()
+             if sharded:
+-                _gather_columns(local_activated, activated, self.tp_size)
+-            project["mlp_out"](activated, mlp.w2.weight, local_branch)
+-            if sharded:
+-                _gather_columns(local_branch, branch, self.tp_size)
++                _reduce_rows(local_branch, branch, self.tp_size)
+             last = index + 1 == len(self.blocks)
+             launch["add_norm"](
+                 residual, branch, norms[index + 1], state, out if last else normalized
+             )
+         return out
+ 
++    def forward(self, patches, n_vit_h: int, n_vit_w: int, *, out=None):
++        return self.forward_batch(patches, [(n_vit_h, n_vit_w)], out=out)
++
+ 
+ class _AlignerWorkspace:
+     def __init__(
+@@ -528,25 +566,26 @@ class _AlignerWorkspace:
+         ratio: int,
+         rows: int,
+         device,
++        *,
++        sharded: bool = False,
+     ):
+         self.merged = torch.empty(
+             (rows, hidden * ratio * ratio), dtype=torch.bfloat16, device=device
+         )
+         self.hidden = torch.empty(
+-            (rows, out_dim), dtype=torch.bfloat16, device=device
++            (rows, local_out_dim), dtype=torch.bfloat16, device=device
+         )
+         self.local_out = (
+-            self.hidden
+-            if local_out_dim == out_dim
+-            else torch.empty(
+-                (rows, local_out_dim), dtype=torch.bfloat16, device=device
+-            )
++            torch.empty((rows, out_dim), dtype=torch.bfloat16, device=device)
++            if sharded
++            else None
+         )
+ 
+ 
+ class DeepseekV4Aligner(nn.Module):
+     """Channel-major padded spatial merge, biased projections, exact GELU,
+-    tensor-parallel sharded across TP ranks along output columns."""
++    tensor-parallel sharded with column-parallel ``w1`` and row-parallel ``w2``
++    reduced via ``rank_order_sum``."""
+ 
+     def __init__(
+         self,
+@@ -565,25 +604,27 @@ class DeepseekV4Aligner(nn.Module):
+         )
+         self.out_dim = config.hidden_size
+         self.local_out_dim = _local_width(self.out_dim, self.tp_size)
++        self.valid_out_dim = _valid_span(
++            self.local_out_dim, self.out_dim, self.tp_rank
++        )
+         self.hidden_size, self.capacity = config.vision_dim, _capacity(config)
+         # Merged rows of the widest grid the capacity admits (one row of patches).
+         r = self.downsample_ratio
+         self.merged_capacity = (self.capacity + r - 1) // r
+-        shard = 0 if self.tp_size > 1 else None
+         self.w1 = _Linear(
+             config.vision_dim * r**2,
+             self.local_out_dim,
+             tp_size=self.tp_size,
+             tp_rank=self.tp_rank,
+-            shard_dim=shard,
++            shard_dim=0 if self.tp_size > 1 else None,
+             full_features=self.out_dim,
+         )
+         self.w2 = _Linear(
+-            self.out_dim,
+             self.local_out_dim,
++            self.out_dim,
+             tp_size=self.tp_size,
+             tp_rank=self.tp_rank,
+-            shard_dim=shard,
++            shard_dim=1 if self.tp_size > 1 else None,
+             full_features=self.out_dim,
+         )
+         self._kernels: dict | None = None
+@@ -594,24 +635,20 @@ class DeepseekV4Aligner(nn.Module):
+         merged = self.hidden_size * r * r
+         calls = {
+             "merge": kernels.merge_call(self.hidden_size, r),
+-            "w1": kernels.linear_call(self.local_out_dim, merged, bias=True, gelu=True),
+-            "w2": kernels.linear_call(self.local_out_dim, self.out_dim, bias=True),
++            "w1": kernels.linear_call(
++                self.local_out_dim, merged, bias=True, gelu=True
++            ),
++            "w2": kernels.linear_call(self.out_dim, self.local_out_dim, bias=True),
+             "w1_rows": kernels.gemv_call(self.local_out_dim, merged, "gelu"),
+-            "w2_rows": kernels.gemv_call(self.local_out_dim, self.out_dim, "bias"),
++            "w2_rows": kernels.gemv_call(self.out_dim, self.local_out_dim, "bias"),
+         }
+ 
+         if self.tp_size > 1:
+-            from vllm.models.deepseek_v4_1.tilelang.gather import gather_call
+-
+-            for packed in (False, True):
+-                calls[f"gather_out_{packed}"] = gather_call(
+-                    self.tp_size,
+-                    self.local_out_dim,
+-                    self.out_dim,
+-                    1,
+-                    torch.bfloat16,
+-                    packed,
+-                )
++            from vllm.models.deepseek_v4_1.tilelang.collectives import (
++                rank_order_sum_kernel,
++            )
++
++            calls["rank_order_sum"] = prepare.call(rank_order_sum_kernel, self.tp_size)
+         return calls
+ 
+     def declare_kernels(self) -> None:
+@@ -631,16 +668,32 @@ class DeepseekV4Aligner(nn.Module):
+                 self.downsample_ratio,
+                 self.merged_capacity,
+                 device,
++                sharded=self.tp_size > 1,
+             )
+         elif self._workspace.merged.device != device:
+             raise ValueError("aligner moved devices after preparation")
+ 
+-    def forward(self, x, n_vit_h: int, n_vit_w: int, *, out=None):
++    def forward_batch(
++        self,
++        x: torch.Tensor,
++        vit_grid: list[list[int]] | list[tuple[int, int]],
++        *,
++        out: torch.Tensor | None = None,
++    ) -> list[torch.Tensor]:
++        """Spatial-merge each image in ``vit_grid`` into packed rows, then run
++        ``w1``, ``w2``, and TP reduction once across all merged rows."""
++        grid = [(int(h), int(w)) for h, w in vit_grid]
++        vit_sizes = [h * w for h, w in grid]
++        total_vit = sum(vit_sizes)
++        r = self.downsample_ratio
++        merged_sizes = [((h + r - 1) // r) * ((w + r - 1) // r) for h, w in grid]
++        rows = sum(merged_sizes)
+         if (
+-            n_vit_h <= 0
+-            or n_vit_w <= 0
+-            or x.shape != (n_vit_h * n_vit_w, self.hidden_size)
+-            or x.shape[0] > self.capacity
++            not grid
++            or any(h <= 0 or w <= 0 for h, w in grid)
++            or x.shape != (total_vit, self.hidden_size)
++            or total_vit > self.capacity
++            or rows > self.merged_capacity
+         ):
+             raise ValueError(
+                 "aligner image grid exceeds capacity or does not match input"
+@@ -648,8 +701,6 @@ class DeepseekV4Aligner(nn.Module):
+         if self._kernels is None or self._workspace is None:
+             raise RuntimeError("aligner kernels were not prepared")
+         _bf16_rows(x, tuple(x.shape), "aligner input")
+-        r = self.downsample_ratio
+-        rows = ((n_vit_h + r - 1) // r) * ((n_vit_w + r - 1) // r)
+         if out is None:
+             out = torch.empty(
+                 (rows, self.out_dim), dtype=torch.bfloat16, device=x.device
+@@ -658,21 +709,103 @@ class DeepseekV4Aligner(nn.Module):
+         launch, ws = self._kernels, self._workspace
+         project = _projections(launch, rows)
+         merged, hidden = ws.merged[:rows], ws.hidden[:rows]
+-        local_out = ws.local_out[:rows]
+-        launch["merge"](x, merged, n_vit_h, n_vit_w)
++        vit_offset = 0
++        merged_offset = 0
++        for (h, w), vit_rows, m_rows in zip(grid, vit_sizes, merged_sizes):
++            launch["merge"](
++                x[vit_offset : vit_offset + vit_rows],
++                merged[merged_offset : merged_offset + m_rows],
++                h,
++                w,
++            )
++            vit_offset += vit_rows
++            merged_offset += m_rows
+         if self.tp_size > 1:
+-            project["w1"](merged, self.w1.weight, self.w1.bias, local_out)
+-            _gather_columns(local_out, hidden, self.tp_size)
+-            project["w2"](hidden, self.w2.weight, self.w2.bias, local_out)
+-            _gather_columns(local_out, out, self.tp_size)
++            assert ws.local_out is not None
++            local_out = ws.local_out[:rows]
++            if self.valid_out_dim > 0:
++                project["w1"](merged, self.w1.weight, self.w1.bias, hidden)
++                project["w2"](hidden, self.w2.weight, self.w2.bias, local_out)
++            else:
++                local_out.zero_()
++            _reduce_rows(local_out, out, self.tp_size)
+         else:
+             project["w1"](merged, self.w1.weight, self.w1.bias, hidden)
+             project["w2"](hidden, self.w2.weight, self.w2.bias, out)
+-        return out
++        slices: list[torch.Tensor] = []
++        offset = 0
++        for m_rows in merged_sizes:
++            slices.append(out[offset : offset + m_rows])
++            offset += m_rows
++        return slices
++
++    def forward(self, x, n_vit_h: int, n_vit_w: int, *, out=None):
++        return self.forward_batch(x, [(n_vit_h, n_vit_w)], out=out)[0]
++
++
++def encode_images(
++    vision_model: DeepseekV4ViT,
++    aligner: DeepseekV4Aligner,
++    patches: torch.Tensor,
++    vit_grid: list[list[int]] | list[tuple[int, int]],
++    *,
++    out: torch.Tensor | None = None,
++) -> list[torch.Tensor]:
++    """Encode one or more images by packing contiguous runs of images that fit
++    within the ViT and aligner workspace capacities into batched passes."""
++    if not vit_grid:
++        if patches.shape[0] != 0:
++            raise ValueError("nonempty patches require image grids")
++        return []
++    grid = [(int(h), int(w)) for h, w in vit_grid]
++    sizes = [h * w for h, w in grid]
++    if any(h <= 0 or w <= 0 for h, w in grid) or sum(sizes) != patches.shape[0]:
++        raise ValueError("image grids do not partition patches")
++    r = aligner.downsample_ratio
++    merged_sizes = [((h + r - 1) // r) * ((w + r - 1) // r) for h, w in grid]
++    vit_cap = vision_model.capacity
++    merged_cap = aligner.merged_capacity
++
++    results: list[torch.Tensor] = []
++    n = len(grid)
++    idx = 0
++    patch_offset = 0
++    out_offset = 0
++    while idx < n:
++        chunk_grid: list[tuple[int, int]] = []
++        chunk_patches = 0
++        chunk_merged = 0
++        while idx < n:
++            p_rows = sizes[idx]
++            m_rows = merged_sizes[idx]
++            if p_rows > vit_cap or m_rows > merged_cap:
++                raise ValueError(
++                    "vision image grid exceeds capacity or does not match patches"
++                )
++            if chunk_grid and (
++                chunk_patches + p_rows > vit_cap or chunk_merged + m_rows > merged_cap
++            ):
++                break
++            chunk_grid.append(grid[idx])
++            chunk_patches += p_rows
++            chunk_merged += m_rows
++            idx += 1
++        encoded = vision_model.forward_batch(
++            patches[patch_offset : patch_offset + chunk_patches],
++            chunk_grid,
++        )
++        chunk_out = (
++            out[out_offset : out_offset + chunk_merged] if out is not None else None
++        )
++        results.extend(aligner.forward_batch(encoded, chunk_grid, out=chunk_out))
++        patch_offset += chunk_patches
++        out_offset += chunk_merged
++    return results
+ 
+ 
+ def run_dp_sharded_vision_tower(vision_model, aligner, patches, vit_grid):
+-    """Shard images across replicated TP ranks and perform a real all-gather."""
++    """Shard images across replicated TP ranks, pack each rank's assigned images
++    into batched tower passes, and perform a real all-gather."""
+     from vllm.distributed import (
+         get_tensor_model_parallel_rank,
+         get_tensor_model_parallel_world_size,
+@@ -705,12 +838,22 @@ def run_dp_sharded_vision_tower(vision_model, aligner, patches, vit_grid):
+     local = torch.empty(
+         (max_rows, aligner.out_dim), dtype=patches.dtype, device=patches.device
+     )
+-    offset = 0
+-    for i in images(rank):
+-        h, w = vit_grid[i]
+-        encoded = vision_model(patches[offsets[i] : offsets[i + 1]], h, w)
+-        aligner(encoded, h, w, out=local[offset : offset + output_rows[i]])
+-        offset += output_rows[i]
++    assigned = images(rank)
++    if assigned:
++        rank_patches = (
++            patches[offsets[assigned[0]] : offsets[assigned[0] + 1]]
++            if len(assigned) == 1
++            else torch.cat([patches[offsets[i] : offsets[i + 1]] for i in assigned])
++        )
++        rank_grid = [vit_grid[i] for i in assigned]
++        rank_out_rows = sum(output_rows[i] for i in assigned)
++        encode_images(
++            vision_model,
++            aligner,
++            rank_patches,
++            rank_grid,
++            out=local[:rank_out_rows],
++        )
+     gathered = tensor_model_parallel_all_gather(local, dim=0) if world > 1 else local
+     result = [None] * len(vit_grid)
+     for g in range(world):
+@@ -721,4 +864,9 @@ def run_dp_sharded_vision_tower(vision_model, aligner, patches, vit_grid):
+     return result
+ 
+ 
+-__all__ = ["DeepseekV4Aligner", "DeepseekV4ViT", "run_dp_sharded_vision_tower"]
++__all__ = [
++    "DeepseekV4Aligner",
++    "DeepseekV4ViT",
++    "encode_images",
++    "run_dp_sharded_vision_tower",
++]
+diff --git a/vllm/models/deepseek_v4_1/nvidia/vl_model.py b/vllm/models/deepseek_v4_1/nvidia/vl_model.py
+index 34898e589..3b842f69c 100644
+--- a/vllm/models/deepseek_v4_1/nvidia/vl_model.py
++++ b/vllm/models/deepseek_v4_1/nvidia/vl_model.py
+@@ -45,15 +45,21 @@ from .model import (
+ 
+ 
+ def _vision_tower():
+-    """The TileLang ViT, aligner and data-parallel image runner, over the
+-    checkpoint's parameter tree."""
++    """The TileLang ViT, aligner, packed batch encoder and data-parallel image
++    runner, over the checkpoint's parameter tree."""
+     from .tilelang_vision import (
+         DeepseekV4Aligner,
+         DeepseekV4ViT,
++        encode_images,
+         run_dp_sharded_vision_tower,
+     )
+ 
+-    return DeepseekV4ViT, DeepseekV4Aligner, run_dp_sharded_vision_tower
++    return (
++        DeepseekV4ViT,
++        DeepseekV4Aligner,
++        run_dp_sharded_vision_tower,
++        encode_images,
++    )
+ 
+ 
+ @MULTIMODAL_REGISTRY.register_processor(
+@@ -85,9 +91,17 @@ class DeepseekV41ForCausalLM(UpstreamDeepseekV41ForCausalLM):
+ 
+         # The tower is always built; _mark_tower_model stubs it out
+         # (StageMissingLayer, weights skipped) when the image limit is 0.
+-        vit, aligner, self._run_dp_sharded_vision_tower = _vision_tower()
++        (
++            vit,
++            aligner,
++            self._run_dp_sharded_vision_tower,
++            self._encode_images,
++        ) = _vision_tower()
+         with self._mark_tower_model(vllm_config, {"image"}):
+-            self.use_data_parallel = is_vit_use_data_parallel()
++            self.use_data_parallel = (
++                self.multimodal_config.mm_encoder_tp_mode == "data"
++                or is_vit_use_data_parallel()
++            )
+             self.vision = vit(config, use_data_parallel=self.use_data_parallel)
+             self.aligner = aligner(config, use_data_parallel=self.use_data_parallel)
+             self.image_start = nn.Parameter(
+@@ -136,16 +150,9 @@ class DeepseekV41ForCausalLM(UpstreamDeepseekV41ForCausalLM):
+                 self.vision, self.aligner, patches, vit_grid
+             )
+         else:
+-            image_embeds_list = []
+-            vit_offset = 0
+-            for n_vit_h, n_vit_w in vit_grid:
+-                n_vit = n_vit_h * n_vit_w
+-                image_embeds_list.append(
+-                    self._encode_image(
+-                        patches[vit_offset : vit_offset + n_vit], n_vit_h, n_vit_w
+-                    )
+-                )
+-                vit_offset += n_vit
++            image_embeds_list = self._encode_images(
++                self.vision, self.aligner, patches, vit_grid
++            )
+ 
+         embeds: list[torch.Tensor] = []
+         span_offset = 0
+diff --git a/vllm/multimodal/media/image.py b/vllm/multimodal/media/image.py
+index b63a12f82..5b05176f5 100644
+--- a/vllm/multimodal/media/image.py
++++ b/vllm/multimodal/media/image.py
+@@ -1,6 +1,7 @@
+ # SPDX-License-Identifier: Apache-2.0
+ # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+ 
++import math
+ from io import BytesIO
+ from pathlib import Path
+ 
+@@ -76,18 +77,28 @@ class ImageMediaIO(MediaIO[Image.Image]):
+                 image, self.image_mode, self.rgba_background_color
+             )
+ 
++    @staticmethod
++    def _max_pixel_bounds(w: int, h: int, max_pixels: int) -> tuple[int, int]:
++        scale = math.sqrt(max_pixels / (w * h))
++        return max(1, int(math.floor(w * scale))), max(1, int(math.floor(h * scale)))
++
+     def load_bytes(self, data: bytes) -> MediaWithBytes[Image.Image]:
+         try:
+             image = Image.open(BytesIO(data))
+             w, h = image.size
+             max_pixels = envs.VLLM_MAX_IMAGE_PIXELS
++            downscaled = False
+             if max_pixels > 0 and w * h > max_pixels:
+-                raise ValueError(
+-                    f"Image dimensions {w}x{h} ({w * h} pixels) exceed "
+-                    f"the maximum of {max_pixels} pixels. Set "
+-                    f"VLLM_MAX_IMAGE_PIXELS to increase this limit."
+-                )
++                image.draft(None, self._max_pixel_bounds(w, h, max_pixels))
++                downscaled = True
+             image = normalize_image(image)
++            w, h = image.size
++            if max_pixels > 0 and w * h > max_pixels:
++                image.thumbnail(
++                    self._max_pixel_bounds(w, h, max_pixels),
++                    Image.Resampling.BILINEAR,
++                )
++                downscaled = True
+             image.load()
+             converted = self._convert_image_mode(image)
+         except (OSError, Image.UnidentifiedImageError) as e:
+@@ -99,6 +110,8 @@ class ImageMediaIO(MediaIO[Image.Image]):
+                 "image_mode": self.image_mode,
+                 "rgba_background_color": self.rgba_background_color,
+             }
++        if downscaled:
++            io_config = {**(io_config or {}), "max_pixels": max_pixels}
+         return MediaWithBytes(converted, data, io_config)
+ 
+     def load_base64(self, media_type: str, data: str) -> MediaWithBytes[Image.Image]:
+-- 
+2.43.0
+

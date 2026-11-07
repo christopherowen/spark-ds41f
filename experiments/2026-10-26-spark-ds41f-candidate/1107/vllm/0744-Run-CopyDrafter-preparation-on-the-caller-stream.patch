@@ -1,0 +1,46 @@
+From 2fa993f74bd56c7eb3f2d2ce3d91702550a478ea Mon Sep 17 00:00:00 2001
+From: Christopher Owen <3221756+christopherowen@users.noreply.github.com>
+Date: Fri, 6 Nov 2026 20:39:10 +0000
+Subject: [PATCH] Run CopyDrafter preparation on the caller stream
+
+Remove the auxiliary-stream event handoff around CopyDrafter preparation
+and run prepare/propose in caller stream order.
+Upstream base: a75357bba81e31e4f3085700f94b6a0b29aed44a
+Rationale: Run CopyDrafter preparation on the caller stream rather than handing off to an auxiliary stream with two cross-stream events per step.
+Quality: Bit-exact CopyDrafter proposals and acceptance tracking.
+Tests: pytest tests/v1/spec_decode/test_copy_drafts.py across 2 fresh container boots.
+Upstream status: Local CopyDrafter stream simplification.
+---
+ vllm/v1/worker/gpu/model_runner.py | 9 +++------
+ 1 file changed, 3 insertions(+), 6 deletions(-)
+
+diff --git a/vllm/v1/worker/gpu/model_runner.py b/vllm/v1/worker/gpu/model_runner.py
+index 560bf9d70..c1c7fcf10 100644
+--- a/vllm/v1/worker/gpu/model_runner.py
++++ b/vllm/v1/worker/gpu/model_runner.py
+@@ -3604,10 +3604,9 @@ class GPUModelRunner(LoRAModelRunnerMixin):
+                     self.sampler.watermarking.gpu[input_batch.idx_mapping],
+                 )
+             if self.copy_drafter is not None and num_spec_tokens_to_schedule > 0:
+-                # Match the updated histories, update the copy state and publish
+-                # next-step alloc on output_copy_stream beside the drafter: DSpark
+-                # does not wait for them, and the async output copy of the alloc
+-                # does not wait for DSpark.
++                # Match the updated histories and update the copy state on the
++                # model stream. Attach next-step alloc's asynchronous host copy
++                # before DSpark, preserving its early delivery to the scheduler.
+                 # Requests still mid-prefill after this step have not reached the
+                 # end of their prompt yet and must not be matched.
+                 match_idx_mapping = None
+@@ -3639,8 +3638,6 @@ class GPUModelRunner(LoRAModelRunnerMixin):
+                     verified,
+                     self._dead_row_cut if verified is not None else None,
+                     match_idx_mapping=match_idx_mapping,
+-                    copy_stream=self.output_copy_stream,
+-                    main_stream=self.main_stream,
+                 )
+                 self.copy_drafter.attach_async_output(
+                     async_output,
+-- 
+2.43.0
+

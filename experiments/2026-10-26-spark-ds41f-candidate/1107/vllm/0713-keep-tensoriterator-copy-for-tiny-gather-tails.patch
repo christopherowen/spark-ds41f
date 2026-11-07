@@ -1,0 +1,36 @@
+From 1b9d90f757d14e61cd2f091acbe5b0b82833446f Mon Sep 17 00:00:00 2001
+From: Christopher Owen <3221756+christopherowen@users.noreply.github.com>
+Date: Fri, 6 Nov 2026 20:39:10 +0000
+Subject: [PATCH] Keep TensorIterator copy for tiny gather tails
+
+When a gathered column tail has at most 128 vector units across all ranks
+and rows, copy the transposed view directly into the output slice rather
+than launching rank_rows_bytes_kernel, keeping tiny tails program-identical
+to the reference path while preserving rank_rows_bytes_kernel for larger
+unaligned tails.
+Upstream base: a75357bba81e31e4f3085700f94b6a0b29aed44a
+Rationale: Avoid launching rank_rows_bytes_kernel when a gathered column tail has at most 128 vector units across all ranks and rows; use TensorIterator copy on the transposed view instead.
+Quality: Bit-exact (torch.equal) with reference gather tail handling.
+Tests: pytest tests/kernels/test_deepseek_v41_collectives.py across 2 fresh container boots.
+Upstream status: Local DeepSeek-V4.1 collective tail threshold refinement.
+---
+ vllm/models/deepseek_v4_1/tilelang/collectives.py | 3 +++
+ 1 file changed, 3 insertions(+)
+
+diff --git a/vllm/models/deepseek_v4_1/tilelang/collectives.py b/vllm/models/deepseek_v4_1/tilelang/collectives.py
+index 61a65f0b0..debea5cdc 100644
+--- a/vllm/models/deepseek_v4_1/tilelang/collectives.py
++++ b/vllm/models/deepseek_v4_1/tilelang/collectives.py
+@@ -458,6 +458,9 @@ def _rank_rows_tail(gathered, out, world, rows, row_bytes):
+     unit = next(
+         n for n in (4, 2, 1) if row_bytes % n == 0 and gathered.data_ptr() % n == 0
+     )
++    if out.numel() * out.element_size() // unit <= 128:
++        out.view(rows, world, -1).copy_(gathered.view(world, rows, -1).movedim(0, 1))
++        return
+     dtype = {1: torch.uint8, 2: torch.uint16, 4: torch.uint32}[unit]
+     rank_rows_bytes_kernel(unit)(
+         gathered.view(-1).view(dtype),
+-- 
+2.43.0
+

@@ -1,0 +1,126 @@
+#!/usr/bin/env python3
+"""Summarize retained node evidence without loading event captures into memory."""
+
+import argparse
+from collections import defaultdict, deque
+import hashlib
+import json
+from pathlib import Path
+
+
+def digest(path):
+    checksum = hashlib.sha256()
+    with path.open("rb") as handle:
+        while block := handle.read(1 << 20):
+            checksum.update(block)
+    return {
+        "path": str(path),
+        "bytes": path.stat().st_size,
+        "sha256": checksum.hexdigest(),
+    }
+
+
+def read(path):
+    return json.loads(path.read_text()) if path.exists() else None
+
+
+def collect(root):
+    runs = {}
+    for folder in sorted(root.iterdir()):
+        if not folder.is_dir():
+            continue
+        identity = read(folder / "identity.json")
+        if not identity:
+            continue
+        memory = defaultdict(list)
+        if (folder / "memory.jsonl").exists():
+            with (folder / "memory.jsonl").open() as handle:
+                for line in handle:
+                    sample = json.loads(line)
+                    memory[sample.get("job")].append(sample)
+        jobs = {}
+        results = read(folder / "results.json") or []
+        by_label = {row["job"]["label"]: row for row in results}
+        for job in identity["matrix"]:
+            label = job["label"]
+            dest = folder / label
+            trace = dest / "stream"
+            samples = memory[label]
+            row = {
+                "result": by_label.get(label),
+                "command": read(folder / (label + ".command.json")),
+                "collector": read(trace / "identity.json"),
+                "summary": read(trace / "summary.json"),
+                "stall_events": read(dest / "stall-events.json"),
+                "integrity": read(dest / "integrity.json"),
+                "source_coverage": read(dest / "source-coverage.json"),
+            }
+            log = folder / (label + ".log")
+            if log.exists():
+                row["log"] = digest(log)
+                if not row["result"] or row["result"]["exit"]:
+                    with log.open(errors="replace") as handle:
+                        row["failure_tail"] = list(deque(handle, maxlen=20))
+            if samples:
+                row["memory"] = {
+                    "samples": len(samples),
+                    "first": samples[0],
+                    "last": samples[-1],
+                    "minimum_available_bytes": min(
+                        s["available_bytes"] for s in samples
+                    ),
+                    "maximum_temperature_c": max(s["hottest_c"] for s in samples),
+                }
+            chunks = sorted(trace.glob("events-*.bin"))
+            receipt_hash = hashlib.sha256()
+            first_receipt, last_receipt, missing_receipts = None, None, []
+            for chunk in chunks:
+                receipt = chunk.with_suffix(".bin.json")
+                receipt_hash.update(receipt.name.encode() + b"\0")
+                if receipt.exists():
+                    raw = receipt.read_bytes()
+                    receipt_hash.update(raw)
+                    last_receipt = json.loads(raw)
+                    if first_receipt is None:
+                        first_receipt = last_receipt
+                else:
+                    missing_receipts.append(receipt.name)
+            row["native_chunks"] = {
+                "completed": len(chunks),
+                "bytes": sum(p.stat().st_size for p in chunks),
+                "receipt_manifest_sha256": receipt_hash.hexdigest(),
+                "first_receipt": first_receipt,
+                "last_receipt": last_receipt,
+                "missing_receipts": missing_receipts,
+                "partial_bytes": sum(p.stat().st_size for p in trace.glob("*.partial")),
+            }
+            jobs[label] = row
+        runs[folder.name] = {
+            "identity": identity,
+            "completed": read(folder / "completed.json"),
+            "interruption": read(folder / "interruption.json"),
+            "output_comparison": read(folder / "output-comparison.json"),
+            "memory_log": digest(folder / "memory.jsonl")
+            if (folder / "memory.jsonl").exists()
+            else None,
+            "jobs": jobs,
+            "diagnostics": [
+                digest(path)
+                for path in sorted(folder.glob("*.log"))
+                if path.name not in {label + ".log" for label in jobs}
+            ],
+        }
+    return {
+        "evidence_root": str(root),
+        "runs": runs,
+        "controller_logs": [
+            digest(path) for path in sorted(root.parent.glob("iket-streaming-*.log"))
+        ],
+    }
+
+
+if __name__ == "__main__":
+    parser = argparse.ArgumentParser()
+    parser.add_argument("root", type=Path)
+    args = parser.parse_args()
+    print(json.dumps(collect(args.root), indent=2))

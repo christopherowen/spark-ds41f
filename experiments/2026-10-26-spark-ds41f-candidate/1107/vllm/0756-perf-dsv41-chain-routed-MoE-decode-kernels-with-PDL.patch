@@ -1,0 +1,224 @@
+From fa63642182a5d4e7b4d5060f2c5d6274c4555a40 Mon Sep 17 00:00:00 2001
+From: Christopher Owen <3221756+christopherowen@users.noreply.github.com>
+Date: Sat, 7 Nov 2026 01:02:29 +0000
+Subject: [PATCH] perf(dsv41): chain routed MoE decode kernels with PDL
+
+Upstream base: a75357bba81e31e4f3085700f94b6a0b29aed44a
+
+Rationale: In the routed MoE decode chain (moe_dispatch -> FC1 -> moe_swiglu_cast -> FC2 -> moe_combine), moe_swiglu_cast and early-trigger FC2 already preload routing metadata and weight scales before cudaGridDependencySynchronize(), whereas moe_dispatch and moe_combine waited at kernel entry before doing predecessor-independent work. Move clear_warp_count (zeroing the 26 KB shared-memory expert histogram) before pdl.chain() in moe_dispatch_v41 (part="fused" and part="count") so SMEM initialization overlaps with the upstream router kernel before reading TopkIdx. In moe_combine_v41, preload RoutePos[row, k], Weights[row, k], and Shared[row, bd * block_D + d] into registers before pdl.chain() and unroll the top-k gather loop so routing-table pointer resolution and shared-expert reads overlap with FC2 before waiting on Y.
+
+Quality: Bit-identical across all decode and prefill shapes (torch.equal verified across 208 shape/mode checks and full LayerChain digest checks). Zero stack frame (STACK: 0 across all 28 compiled MoE kernels via cuobjdump --dump-resource-usage).
+
+Tests: pytest -p tests.kernels.deepseek_v41_pdl_sources tests/kernels/moe/test_deepseek_v41_tilelang_moe.py tests/kernels/test_deepseek_v41_tilelang_pdl.py (151 passed, 0 PDL violations).
+
+Upstream status: Local DeepSeek-V4.1 SM120/SM121 TileLang kernel optimization.
+---
+ tests/kernels/deepseek_v41_pdl_sources.py     |  1 +
+ .../moe/test_deepseek_v41_tilelang_moe.py     | 48 ++++++++++++++++
+ vllm/models/deepseek_v4_1/tilelang/moe.py     | 55 ++++++++++++-------
+ 3 files changed, 84 insertions(+), 20 deletions(-)
+
+diff --git a/tests/kernels/deepseek_v41_pdl_sources.py b/tests/kernels/deepseek_v41_pdl_sources.py
+index bba289b56..017f96415 100644
+--- a/tests/kernels/deepseek_v41_pdl_sources.py
++++ b/tests/kernels/deepseek_v41_pdl_sources.py
+@@ -95,6 +95,7 @@ EARLY_PARAMETERS: dict[str, set[str]] = {
+     "indexer_mxfp4_quantize": {"CosSin", "Positions", "Slots", "Weight"},
+     "mhc_finalize": {"base", "scale", "weight"},
+     "mhc_post": {"comb", "post", "residual"},
++    "moe_combine": {"RoutePos", "Shared", "Weights"},
+     "moe_grouped_fp8_fp4_gemm": {"Narrow", "Order", "SFBase", "TileExpert"},
+     "moe_swiglu_cast_kernel": {"Order", "TileExpert", "Weights"},
+     "rope": {"cos_sin", "positions"},
+diff --git a/tests/kernels/moe/test_deepseek_v41_tilelang_moe.py b/tests/kernels/moe/test_deepseek_v41_tilelang_moe.py
+index 54e69763d..f4381b8de 100644
+--- a/tests/kernels/moe/test_deepseek_v41_tilelang_moe.py
++++ b/tests/kernels/moe/test_deepseek_v41_tilelang_moe.py
+@@ -886,3 +886,51 @@ def test_grouped_fp8_fp4_gemm_defers_barrier_init_and_down_stages():
+     assert early_return < rows_write < barrier_init < fence_init < a_row_read
+     # Writing rows_shared and initializing loaded share a single __syncthreads().
+     assert src[rows_write:a_row_read].count("__syncthreads()") == 1
++
++
++def test_routed_moe_pdl_preloads_before_wait():
++    """Routed MoE decode kernels overlap independent work before their PDL wait:
++    moe_dispatch clears warp_count in shared memory before waiting on TopkIdx;
++    early-trigger decode down GEMMs preload TileExpert, Order,
++    SFBase, and Narrow before waiting on moe_swiglu_cast; and moe_combine
++    preloads RoutePos, Weights, and Shared before waiting on the down GEMM."""
++    from vllm.models.deepseek_v4_1.tilelang.moe import (
++        moe_combine_v41,
++        moe_dispatch_v41,
++    )
++    from tilelang import language as T
++
++    for part in ("fused", "count"):
++        d_src = moe_dispatch_v41(384, 6, 16, part, T.int32).get_kernel_source()
++        clear_pos = d_src.index("((i * 512) + ((int)threadIdx.x))] = 0;")
++        wait_pos = d_src.index("cudaGridDependencySynchronize()")
++        topk_pos = d_src.index("TopkIdx[")
++        assert clear_pos < wait_pos < topk_pos
++
++    down_src = grouped_fp8_fp4_gemm(
++        384,
++        5120,
++        576,
++        6,
++        False,
++        16,
++        128,
++        num_stages=2,
++        coded_scales=True,
++        narrow_codes=True,
++        trigger_after_loop=False,
++    ).get_kernel_source()
++    wait_pos = down_src.index("cudaGridDependencySynchronize()")
++    assert down_src.index("TileExpert[") < wait_pos
++    assert down_src.index("Order[") < wait_pos
++    assert down_src.index("SFBase[") < wait_pos
++    assert down_src.index("Narrow[") < wait_pos
++
++    comb_src = moe_combine_v41(
++        5120, 6, shared=True, weighted=True, out_dtype=T.bfloat16
++    ).get_kernel_source()
++    wait_pos = comb_src.index("cudaGridDependencySynchronize()")
++    assert comb_src.index("RoutePos[") < wait_pos
++    assert comb_src.index("Weights[") < wait_pos
++    assert comb_src.index("*(uint4*)(Shared + ") < wait_pos
++    assert wait_pos < comb_src.index("*(uint4*)(Y + ")
+diff --git a/vllm/models/deepseek_v4_1/tilelang/moe.py b/vllm/models/deepseek_v4_1/tilelang/moe.py
+index 3dc403366..b12b53a35 100644
+--- a/vllm/models/deepseek_v4_1/tilelang/moe.py
++++ b/vllm/models/deepseek_v4_1/tilelang/moe.py
+@@ -74,6 +74,14 @@ def _dispatch_macros(num_experts, threads):
+     steps = threads.bit_length() - 1
+     assert threads >= num_experts and threads & (threads - 1) == 0
+ 
++    @T.macro
++    def clear_warp_count(tx, warp_count):
++        for i in T.serial(T.ceildiv((warps + 1) * num_experts, threads)):
++            if i * threads + tx < (warps + 1) * num_experts:
++                warp_count[
++                    (i * threads + tx) // num_experts, (i * threads + tx) % num_experts
++                ] = 0
++
+     @T.macro
+     def rank_routes(TopkIdx, routes, base, topk, tx, warp_count):
+         """For route base + tx: its expert, and its rank among the chunk's routes to it.
+@@ -87,11 +95,6 @@ def _dispatch_macros(num_experts, threads):
+         held = T.alloc_var(T.int32)
+         lane = tx % 32
+         warp = tx // 32
+-        for i in T.serial(T.ceildiv((warps + 1) * num_experts, threads)):
+-            if i * threads + tx < (warps + 1) * num_experts:
+-                warp_count[
+-                    (i * threads + tx) // num_experts, (i * threads + tx) % num_experts
+-                ] = 0
+         T.sync_threads()
+         r = T.min(base + tx, routes - 1)
+         expert = T.if_then_else(
+@@ -171,7 +174,7 @@ def _dispatch_macros(num_experts, threads):
+                 TileExpert[i * threads + tx] = -1
+         return offset
+ 
+-    return rank_routes, layout
++    return clear_warp_count, rank_routes, layout
+ 
+ 
+ @tilelang.jit(
+@@ -193,7 +196,7 @@ def moe_dispatch_v41(
+     """
+     rows, tiles, chunks = T.dynamic("rows, tiles, chunks")
+     warps = threads // 32
+-    rank_routes, layout = _dispatch_macros(num_experts, threads)
++    clear_warp_count, rank_routes, layout = _dispatch_macros(num_experts, threads)
+ 
+     if part == "fused":
+ 
+@@ -211,11 +214,12 @@ def moe_dispatch_v41(
+             NumTiles: T.Tensor([1], T.int32),
+         ):
+             with T.Kernel(1, threads=threads):
+-                pdl.chain()
+                 warp_count = T.alloc_shared([warps + 1, num_experts], T.int32)
+                 scan = T.alloc_shared([threads], T.int32)
+                 count = T.alloc_var(T.int32)
+                 tx = T.get_thread_binding()
++                clear_warp_count(tx, warp_count)
++                pdl.chain()
+                 routes = rows * topk
+                 expert, rank = rank_routes(TopkIdx, routes, 0, topk, tx, warp_count)
+                 count = T.if_then_else(
+@@ -260,9 +264,10 @@ def moe_dispatch_v41(
+             Rank: T.Tensor([rows * topk], T.int32),
+         ):
+             with T.Kernel(chunks, threads=threads) as c:
+-                pdl.chain()
+                 warp_count = T.alloc_shared([warps + 1, num_experts], T.int32)
+                 tx = T.get_thread_binding()
++                clear_warp_count(tx, warp_count)
++                pdl.chain()
+                 expert, rank = rank_routes(
+                     TopkIdx, rows * topk, c * threads, topk, tx, warp_count
+                 )
+@@ -347,7 +352,12 @@ def moe_dispatch_v41(
+     return moe_dispatch
+ 
+ 
+-@tilelang.jit
++@tilelang.jit(
++    pass_configs={
++        tilelang.PassConfigKey.TL_DISABLE_WARP_SPECIALIZED: True,
++        tilelang.PassConfigKey.TL_DISABLE_THREAD_STORAGE_SYNC: True,
++    },
++)
+ def moe_combine_v41(
+     hidden: int,
+     topk: int,
+@@ -377,28 +387,33 @@ def moe_combine_v41(
+         Out: T.Tensor([rows, hidden], out_dtype),
+     ):
+         with T.Kernel(hidden // block_D, rows, threads=threads) as (bd, row):
+-            pdl.chain()
+             acc = T.alloc_fragment([block_D], T.float32)
++            pos = T.alloc_local([topk], T.int32)
++            w = T.alloc_local([topk], T.float32) if weighted else None
++            sv = T.alloc_fragment([block_D], T.bfloat16) if shared else None
+             T.clear(acc)
++            for k in T.unroll(topk):
++                pos[k] = RoutePos[row, k]
++                if weighted:
++                    w[k] = Weights[row, k]
+             if shared:
+-                # Requested before the routes' loads, added after their sum: the
+-                # same arithmetic, with the shared row's latency hidden.
+-                sv = T.alloc_fragment([block_D], T.bfloat16)
++                # Requested before the wait and the routes' loads, added after their
++                # sum: the same arithmetic, with the shared row's latency hidden.
+                 for d in T.Parallel(block_D):
+                     sv[d] = Shared[row, bd * block_D + d]
+-            for k in T.serial(topk):
+-                pos = RoutePos[row, k]
+-                if pos >= 0:
++            pdl.chain()
++            for k in T.unroll(topk):
++                if pos[k] >= 0:
+                     for d in T.Parallel(block_D):
+                         if weighted:
+                             acc[d] = T.fma(
+-                                Weights[row, k],
+-                                T.cast(Y[pos, bd * block_D + d], T.float32),
++                                w[k],
++                                T.cast(Y[pos[k], bd * block_D + d], T.float32),
+                                 acc[d],
+                             )
+                         else:
+                             acc[d] = acc[d] + T.cast(
+-                                Y[pos, bd * block_D + d], T.float32
++                                Y[pos[k], bd * block_D + d], T.float32
+                             )
+             for d in T.Parallel(block_D):
+                 if shared:
+-- 
+2.43.0
+

@@ -1,0 +1,14 @@
+# Python-only experiment image. The build driver verifies the entire parent
+# source tree, unchanged compiled inputs, exact export and inherited layer chain.
+ARG PARENT_IMAGE
+FROM ${PARENT_IMAGE}
+ARG DEPLOYMENT_COMMIT
+ARG VLLM_PATCH_HEAD
+ARG VLLM_TREE
+ARG PARENT_IMAGE
+COPY source/ /opt/spark-ds41f/candidate/vllm/
+LABEL org.opencontainers.image.revision="${DEPLOYMENT_COMMIT}" \
+      local.spark-ds41f.vllm.patch-head="${VLLM_PATCH_HEAD}" \
+      local.spark-ds41f.vllm.tree="${VLLM_TREE}" \
+      local.spark-ds41f.native-reuse.parent-image="${PARENT_IMAGE}" \
+      local.spark-ds41f.native-reuse.scope="Python-only; native source and binaries unchanged"

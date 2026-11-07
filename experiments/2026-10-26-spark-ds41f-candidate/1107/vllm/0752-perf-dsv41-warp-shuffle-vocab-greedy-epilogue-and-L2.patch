@@ -1,0 +1,582 @@
+From 6afa2ef3240cf4e5859ee7a39344fd2ff93d8460 Mon Sep 17 00:00:00 2001
+From: Christopher Owen <3221756+christopherowen@users.noreply.github.com>
+Date: Fri, 6 Nov 2026 22:25:17 +0000
+Subject: [PATCH] perf(dsv41): warp-shuffle vocab greedy epilogue and L2-hot
+ step dispatch
+
+Upstream base: 19f2c20ed4d64ae22bd009ceacadd85e2a81e354.
+Immediate base: a75357bba81e31e4f3085700f94b6a0b29aed44a.
+
+Rationale:
+1. Option B (Warp-shuffle MMA fragment epilogue): Replace full [block_M, 64]
+   shared-memory staging (C_shared) and block-wide T.sync_threads() in
+   bf16_vocab_markov_greedy_partials, packed_vocab_markov_greedy_partials,
+   packed_vocab_greedy_partials, and nvfp4_vocab_greedy_partials with an
+   in-register warp-shuffle (__shfl_xor_sync across MMA fragment lanes
+   offset=2,1) reduction (vllm_vocab_tile_argmax_clocal) that writes only
+   per-warp winners ([block_M, WARPS_N]) to shared memory and reduces them on
+   tx < block_M. Reduces bf16_vocab_markov_greedy_partials register pressure
+   from 126 to 43 registers and speeds up L2-hot Markov steps by up to
+   -11.0% on TP3 and -16.9% on TP4 (12-bit packed) and -18.9% on BF16.
+2. Option A (Step-aware L2-hot TP>1 dispatch + scratch reuse): On TP3/TP4,
+   the 12-bit packed Markov W2 shard (16.55 MB / 12.40 MB) stays resident in
+   GB10 L2 cache across draft steps pos = 1..4. Add
+   _use_fused_markov_greedy_step(tp_size, step, num_reqs) in
+   DSparkSpeculator._sample_sequential and persistent output buffer reuse in
+   markov_bias_local / vocab.project_head(..., out=...) so L2-cold pos == 0
+   (M >= 3) uses the fused kernel while L2-hot pos >= 1 (and M <= 2 on TP > 1)
+   dispatches to unfused markov_bias_local + greedy_markov_shard_pair,
+   reducing the 5-step Markov composite (cold0 + 4*hot) across M = 1..16 by
+   -7.06 to -12.88 us on TP3 and -5.71 to -16.87 us on TP4.
+
+Quality:
+Bit-identical torch.equal greedy token and secondary draft selection across all
+vocabulary head layouts (BF16, 12-bit packed, NVFP4) and TP sizes (TP1, TP3,
+TP4), preserving NaN-first tie-breaking and lowest global vocabulary index
+tie-breaking.
+
+Tests:
+72/72 vocab + PDL unit tests and 55/55 DSpark greedy Markov unit tests pass
+across 2 GPU container boots on GB10 (SM121a) with 0 PDL violations, plus
+2-boot cold/hot benchmark verification across M = 1..16 on TP1, TP3, and TP4.
+
+Upstream status:
+Local DeepSeek-V4.1 / DSpark TileLang optimization for spark-ds41f.
+---
+ tests/v1/worker/test_dspark_greedy_markov.py  |  65 +++++++-
+ vllm/models/deepseek_v4_1/nvidia/dspark.py    |  43 +++++
+ vllm/models/deepseek_v4_1/tilelang/vocab.py   | 154 +++++++++++++-----
+ .../gpu/spec_decode/dspark/speculator.py      |  60 ++++++-
+ 4 files changed, 279 insertions(+), 43 deletions(-)
+
+diff --git a/tests/v1/worker/test_dspark_greedy_markov.py b/tests/v1/worker/test_dspark_greedy_markov.py
+index fcab2b3a3..9e611f053 100644
+--- a/tests/v1/worker/test_dspark_greedy_markov.py
++++ b/tests/v1/worker/test_dspark_greedy_markov.py
+@@ -361,7 +361,6 @@ def test_greedy_markov_exact_replay(dtype, vocab, rows):
+         assert torch.all(result[:, 4:] == -77)
+ 
+ 
+-
+ def test_vocab_parallel_and_local_greedy_stay_enabled_when_confidence_head_uses_estimator(
+     monkeypatch,
+ ):
+@@ -417,3 +416,67 @@ def test_vocab_parallel_and_local_greedy_stay_enabled_when_confidence_head_uses_
+     assert _needs_logits_for_acceptance(spec)
+     assert not spec._vocab_parallel_greedy(False)
+     assert not spec.tp_invariant_confidence
++
++
++@pytest.mark.parametrize("tp_size", [1, 3, 4])
++def test_vocab_parallel_markov_dispatch_and_warmups(tp_size, monkeypatch):
++    """Multi-rank TP dispatches step 0 (rows >= 3) to the fused projection and
++    L2-hot steps (step >= 1 or rows <= 2) to markov_bias_local +
++    greedy_markov_shard_pair, declaring both warmup sets when tp_size > 1."""
++    from vllm.v1.worker.gpu.spec_decode.dflash.speculator import DFlashSpeculator
++    from vllm.v1.worker.gpu.spec_decode.dspark import speculator
++    from vllm.v1.worker.gpu.spec_decode.dspark.speculator import (
++        DSparkSpeculator,
++        _use_fused_markov_greedy_step,
++    )
++
++    for step in range(5):
++        for rows in (1, 2, 3, 4, 8, 16):
++            expected = tp_size <= 1 or (step == 0 and rows >= 3)
++            assert _use_fused_markov_greedy_step(tp_size, step, rows) is expected
++
++    monkeypatch.setattr(
++        DFlashSpeculator, "register_warmups", lambda self, layouts: None
++    )
++    monkeypatch.setattr(
++        speculator, "get_tensor_model_parallel_world_size", lambda: tp_size
++    )
++    shard_warmups = []
++    selections = []
++    monkeypatch.setattr(
++        speculator,
++        "register_greedy_markov_shard_pair_warmup",
++        lambda **kwargs: shard_warmups.append(kwargs),
++    )
++    monkeypatch.setattr(
++        speculator,
++        "register_select_first_argmax_warmup",
++        lambda **kwargs: selections.append(kwargs),
++    )
++    spec = object.__new__(DSparkSpeculator)
++    spec.__dict__.update(
++        _draft_topk=None,
++        num_speculative_steps=5,
++        sample_from_anchor=True,
++        draft_logits=None,
++        use_confidence_head=True,
++        acceptance_estimator=None,
++        _enable_top2_branch=True,
++        draft_tokens=torch.zeros((4, 5), dtype=torch.int64),
++        model=SimpleNamespace(
++            supports_local_draft_argmax=lambda: False,
++            vocab_parallel_greedy=True,
++            draft_id_to_target_id=None,
++            fuses_markov_greedy=True,
++            draft_vocab_shard=(86272, 43008),
++            draft_logits_local_layout=(torch.bfloat16, 43136, 43136),
++            markov_embed_table=lambda: None,
++        ),
++    )
++    spec.register_warmups([])
++    assert [kwargs["ranks"] for kwargs in selections] == [tp_size] * 5
++    if tp_size > 1:
++        assert len(shard_warmups) == 5
++        assert all(w["vocab"] == 43008 and w["top2"] is True for w in shard_warmups)
++    else:
++        assert shard_warmups == []
+diff --git a/vllm/models/deepseek_v4_1/nvidia/dspark.py b/vllm/models/deepseek_v4_1/nvidia/dspark.py
+index 195796812..c99836f7a 100644
+--- a/vllm/models/deepseek_v4_1/nvidia/dspark.py
++++ b/vllm/models/deepseek_v4_1/nvidia/dspark.py
+@@ -693,6 +693,49 @@ class DSparkDeepseekV4ForCausalLM(nn.Module):
+             self.lm_head, self.model.norm(hidden_states), skip_gather=True
+         )
+ 
++    def markov_bias_local(self, markov_embed: torch.Tensor) -> torch.Tensor:
++        w2 = self.model.markov_head.markov_w2
++        if (
++            self.logits_processor.use_tilelang_vocab_projection
++            and hasattr(w2, "tilelang_vocab")
++            and self.logits_processor.soft_cap is None
++            and self.logits_processor.scale == 1.0
++        ):
++            from ..tilelang.vocab import project_head
++
++            n = int(w2.weight.shape[0])
++            rows = markov_embed.shape[0]
++            dtype = getattr(w2, "tilelang_vocab_dtype", torch.bfloat16)
++            scratch = getattr(w2, "_tilelang_vocab_bias_scratch", None)
++            if (
++                scratch is None
++                or scratch.device != markov_embed.device
++                or scratch.dtype != dtype
++                or scratch.shape[0] < rows
++                or scratch.shape[1] != n
++            ):
++                cap = max(rows, getattr(w2, "tilelang_max_rows", rows) or rows)
++                scratch = torch.empty(
++                    (cap, n), dtype=dtype, device=markov_embed.device
++                )
++                w2._tilelang_vocab_bias_scratch = scratch
++            return project_head(w2, markov_embed, out=scratch[:rows])
++        return self.logits_processor(
++            w2, markov_embed, skip_gather=True
++        )
++
++    @property
++    def draft_logits_local_layout(self) -> tuple[torch.dtype, int, int]:
++        """(dtype, draft logits row width, Markov bias row width) of the fresh
++        tensors ``compute_draft_logits_local`` and ``markov_bias_local`` return:
++        both heads write the head dtype, one padded vocabulary shard per row."""
++        assert self.lm_head is not None
++        return (
++            self.logits_processor.head_dtype,
++            self.lm_head.num_embeddings_per_partition,
++            self.model.markov_head.markov_w2.num_embeddings_per_partition,
++        )
++
+     @property
+     def fuses_markov_greedy(self) -> bool:
+         """Whether ``markov_greedy_pairs_local`` can run: a TileLang packed or
+diff --git a/vllm/models/deepseek_v4_1/tilelang/vocab.py b/vllm/models/deepseek_v4_1/tilelang/vocab.py
+index 1f9f311ec..3ff266a32 100644
+--- a/vllm/models/deepseek_v4_1/tilelang/vocab.py
++++ b/vllm/models/deepseek_v4_1/tilelang/vocab.py
+@@ -580,30 +580,54 @@ __device__ __forceinline__ int vllm_vocab_first_argmax_keep(
+ 
+ template <int BM, int BN, int THREADS>
+ __device__ __forceinline__ void vllm_vocab_tile_argmax(
+-    const float* __restrict__ smem_c,
++    const float* __restrict__ c_frag,
++    float* __restrict__ smem_v,
++    int* __restrict__ smem_i,
+     float* __restrict__ partial_vals,
+     int* __restrict__ partial_idxs,
+     int by, int bx, int M, int vocab, int num_tiles, int tx) {
++  constexpr int WARPS = THREADS >> 5;
++  constexpr int WARPS_M = (BM == 16) ? 1 : 2;
++  constexpr int WARPS_N = WARPS / WARPS_M;
++  constexpr int MMA_M = BM / (WARPS_M * 16);
++  constexpr int MMA_N = BN / (WARPS_N * 8);
+   const int warp_id = tx >> 5;
+   const int lane = tx & 31;
+-  constexpr int WARPS = THREADS >> 5;
+-  for (int r = warp_id; r < BM; r += WARPS) {
+-    const int row = by * BM + r;
+-    if (row < M) {
++  const int warp_m = (BM == 16) ? 0 : (warp_id & 1);
++  const int warp_n = (BM == 16) ? warp_id : (warp_id >> 1);
++  const int lane_row = lane >> 2;
++  const int lane_col = (lane & 3) * 2;
++  const int base_col = bx * BN + warp_n * (MMA_N * 8) + lane_col;
++
++  #pragma unroll
++  for (int m_tile = 0; m_tile < MMA_M; ++m_tile) {
++    #pragma unroll
++    for (int r_half = 0; r_half < 2; ++r_half) {
++      const int r = warp_m * (MMA_M * 16) + m_tile * 16 + r_half * 8 + lane_row;
+       float best_v = -CUDART_INF_F;
+       int best_i = 2147483647;
+-      for (int c = lane; c < BN; c += 32) {
+-        const int col = bx * BN + c;
+-        if (col < vocab) {
+-          const float v = smem_c[r * BN + c];
+-          if (vllm_vocab_first_argmax_keep(v, col, best_v, best_i)) {
+-            best_v = v;
+-            best_i = col;
++      #pragma unroll
++      for (int n_tile = 0; n_tile < MMA_N; ++n_tile) {
++        const int col0 = base_col + n_tile * 8;
++        const int idx0 = ((m_tile * MMA_N + n_tile) * 2 + r_half) * 2;
++        if (col0 < vocab) {
++          const float v0 = c_frag[idx0];
++          if (vllm_vocab_first_argmax_keep(v0, col0, best_v, best_i)) {
++            best_v = v0;
++            best_i = col0;
++          }
++        }
++        const int col1 = col0 + 1;
++        if (col1 < vocab) {
++          const float v1 = c_frag[idx0 + 1];
++          if (vllm_vocab_first_argmax_keep(v1, col1, best_v, best_i)) {
++            best_v = v1;
++            best_i = col1;
+           }
+         }
+       }
+       #pragma unroll
+-      for (int offset = 16; offset > 0; offset >>= 1) {
++      for (int offset = 2; offset > 0; offset >>= 1) {
+         const float ov = __shfl_xor_sync(0xffffffffu, best_v, offset);
+         const int oi = __shfl_xor_sync(0xffffffffu, best_i, offset);
+         if (vllm_vocab_first_argmax_keep(ov, oi, best_v, best_i)) {
+@@ -611,7 +635,37 @@ __device__ __forceinline__ void vllm_vocab_tile_argmax(
+           best_i = oi;
+         }
+       }
+-      if (lane == 0) {
++      if (WARPS_N == 1) {
++        const int row = by * BM + r;
++        if ((lane & 3) == 0 && row < M) {
++          const int slot = row * num_tiles + bx;
++          partial_vals[slot] = best_v;
++          partial_idxs[slot] = best_i;
++        }
++      } else {
++        if ((lane & 3) == 0) {
++          smem_v[r * WARPS_N + warp_n] = best_v;
++          smem_i[r * WARPS_N + warp_n] = best_i;
++        }
++      }
++    }
++  }
++  if (WARPS_N > 1) {
++    __syncthreads();
++    for (int r = tx; r < BM; r += THREADS) {
++      const int row = by * BM + r;
++      if (row < M) {
++        float best_v = smem_v[r * WARPS_N];
++        int best_i = smem_i[r * WARPS_N];
++        #pragma unroll
++        for (int wn = 1; wn < WARPS_N; ++wn) {
++          const float v = smem_v[r * WARPS_N + wn];
++          const int i = smem_i[r * WARPS_N + wn];
++          if (vllm_vocab_first_argmax_keep(v, i, best_v, best_i)) {
++            best_v = v;
++            best_i = i;
++          }
++        }
+         const int slot = row * num_tiles + bx;
+         partial_vals[slot] = best_v;
+         partial_idxs[slot] = best_i;
+@@ -619,6 +673,8 @@ __device__ __forceinline__ void vllm_vocab_tile_argmax(
+     }
+   }
+ }
++#define vllm_vocab_tile_argmax_clocal(BM, BN, THREADS, smem_v, smem_i, pvals, pidxs, by, bx, M, vocab, num_tiles, tx) \
++  vllm_vocab_tile_argmax<BM, BN, THREADS>(C_local, smem_v, smem_i, pvals, pidxs, by, bx, M, vocab, num_tiles, tx)
+ 
+ template <int THREADS, int PAIR_WIDTH>
+ __device__ __forceinline__ void vllm_vocab_finish_argmax(
+@@ -923,6 +979,7 @@ def packed_vocab_greedy_partials(
+     slices = HALF // VEC
+     items = block_N * step_groups * slices
+     num_tiles = (N + block_N - 1) // block_N
++    warps_n = (threads // 32) // (1 if block_M == 16 else 2)
+     M = T.dynamic("M")
+     E = T.dynamic("E")
+ 
+@@ -945,7 +1002,8 @@ def packed_vocab_greedy_partials(
+             low_shared = T.alloc_shared((block_N, STEP), T.uint8)
+             code_shared = T.alloc_shared((block_N, STEP // 2), T.uint8)
+             B_shared = T.alloc_shared((block_N, STEP), T.bfloat16)
+-            C_shared = T.alloc_shared((block_M, block_N), T.float32)
++            smem_v = T.alloc_shared((block_M * warps_n,), T.float32)
++            smem_i = T.alloc_shared((block_M * warps_n,), T.int32)
+             C_local = T.alloc_fragment((block_M, block_N), T.float32)
+             C_round = T.alloc_fragment((block_M, block_N), out_dtype)
+             low_a = T.alloc_local((VEC,), T.uint8)
+@@ -1018,11 +1076,14 @@ def packed_vocab_greedy_partials(
+             if out_dtype != T.float32:
+                 T.copy(C_local, C_round)
+                 T.copy(C_round, C_local)
+-            T.copy(C_local, C_shared)
+             T.call_extern(
+                 "handle",
+-                f"vllm_vocab_tile_argmax<{block_M}, {block_N}, {threads}>",
+-                T.address_of(C_shared[0, 0]),
++                "vllm_vocab_tile_argmax_clocal",
++                        block_M,
++                        block_N,
++                        threads,
++                T.address_of(smem_v[0]),
++                T.address_of(smem_i[0]),
+                 T.address_of(partial_vals[0, 0]),
+                 T.address_of(partial_idxs[0, 0]),
+                 by,
+@@ -1071,6 +1132,7 @@ def packed_vocab_markov_greedy_partials(
+     slices = HALF // VEC
+     items = block_N * step_groups * slices
+     num_tiles = (N + block_N - 1) // block_N
++    warps_n = (threads // 32) // (1 if block_M == 16 else 2)
+     M = T.dynamic("M")
+     E = T.dynamic("E")
+     base_stride = T.dynamic("base_stride", "int64")
+@@ -1096,7 +1158,8 @@ def packed_vocab_markov_greedy_partials(
+             low_shared = T.alloc_shared((block_N, STEP), T.uint8)
+             code_shared = T.alloc_shared((block_N, STEP // 2), T.uint8)
+             B_shared = T.alloc_shared((block_N, STEP), T.bfloat16)
+-            C_shared = T.alloc_shared((block_M, block_N), T.float32)
++            smem_v = T.alloc_shared((block_M * warps_n,), T.float32)
++            smem_i = T.alloc_shared((block_M * warps_n,), T.int32)
+             C_local = T.alloc_fragment((block_M, block_N), T.float32)
+             C_round = T.alloc_fragment((block_M, block_N), out_dtype)
+             low_a = T.alloc_local((VEC,), T.uint8)
+@@ -1176,11 +1239,14 @@ def packed_vocab_markov_greedy_partials(
+             if out_dtype != T.float32:
+                 T.copy(C_local, C_round)
+                 T.copy(C_round, C_local)
+-            T.copy(C_local, C_shared)
+             T.call_extern(
+                 "handle",
+-                f"vllm_vocab_tile_argmax<{block_M}, {block_N}, {threads}>",
+-                T.address_of(C_shared[0, 0]),
++                "vllm_vocab_tile_argmax_clocal",
++                        block_M,
++                        block_N,
++                        threads,
++                T.address_of(smem_v[0]),
++                T.address_of(smem_i[0]),
+                 T.address_of(partial_vals[0, 0]),
+                 T.address_of(partial_idxs[0, 0]),
+                 by,
+@@ -1215,6 +1281,7 @@ def bf16_vocab_markov_greedy_partials(
+     ``[M, N]`` Markov bias tensor."""
+     k_blocks = tilelang.cdiv(K, block_K)
+     num_tiles = (N + block_N - 1) // block_N
++    warps_n = (threads // 32) // (1 if block_M == 16 else 2)
+     M = T.dynamic("M")
+     base_stride = T.dynamic("base_stride", "int64")
+ 
+@@ -1234,7 +1301,8 @@ def bf16_vocab_markov_greedy_partials(
+             T.import_source(_GREEDY_HEADER)
+             A_shared = T.alloc_shared((block_M, block_K), T.bfloat16)
+             B_shared = T.alloc_shared((block_N, block_K), T.bfloat16)
+-            C_shared = T.alloc_shared((block_M, block_N), T.float32)
++            smem_v = T.alloc_shared((block_M * warps_n,), T.float32)
++            smem_i = T.alloc_shared((block_M * warps_n,), T.int32)
+             C_local = T.alloc_fragment((block_M, block_N), T.float32)
+             C_round = T.alloc_fragment((block_M, block_N), out_dtype)
+             tx = T.get_thread_binding()
+@@ -1257,11 +1325,14 @@ def bf16_vocab_markov_greedy_partials(
+             if out_dtype != T.float32:
+                 T.copy(C_local, C_round)
+                 T.copy(C_round, C_local)
+-            T.copy(C_local, C_shared)
+             T.call_extern(
+                 "handle",
+-                f"vllm_vocab_tile_argmax<{block_M}, {block_N}, {threads}>",
+-                T.address_of(C_shared[0, 0]),
++                "vllm_vocab_tile_argmax_clocal",
++                        block_M,
++                        block_N,
++                        threads,
++                T.address_of(smem_v[0]),
++                T.address_of(smem_i[0]),
+                 T.address_of(partial_vals[0, 0]),
+                 T.address_of(partial_idxs[0, 0]),
+                 by,
+@@ -1450,6 +1521,7 @@ def nvfp4_vocab_greedy_partials(
+     step_scales = STEP // NVFP4_GROUP
+     items = block_N * step_scales
+     num_tiles = (N + block_N - 1) // block_N
++    warps_n = (threads // 32) // (1 if block_M == 16 else 2)
+     M = T.dynamic("M")
+ 
+     @T.prim_func
+@@ -1470,7 +1542,8 @@ def nvfp4_vocab_greedy_partials(
+             packed_shared = T.alloc_shared((block_N, step_packed), T.uint8)
+             scale_shared = T.alloc_shared((block_N, step_scales), T.float8_e4m3fn)
+             B_shared = T.alloc_shared((block_N, STEP), T.bfloat16)
+-            C_shared = T.alloc_shared((block_M, block_N), T.float32)
++            smem_v = T.alloc_shared((block_M * warps_n,), T.float32)
++            smem_i = T.alloc_shared((block_M * warps_n,), T.int32)
+             C_local = T.alloc_fragment((block_M, block_N), T.float32)
+             packed_local = T.alloc_local((NVFP4_PACKED,), T.uint8)
+             out_local = T.alloc_local((NVFP4_GROUP,), T.bfloat16)
+@@ -1512,11 +1585,14 @@ def nvfp4_vocab_greedy_partials(
+                 if out_dtype == T.bfloat16:
+                     val = T.Cast(T.float32, T.Cast(T.bfloat16, val))
+                 C_local[i, j] = val
+-            T.copy(C_local, C_shared)
+             T.call_extern(
+                 "handle",
+-                f"vllm_vocab_tile_argmax<{block_M}, {block_N}, {threads}>",
+-                T.address_of(C_shared[0, 0]),
++                "vllm_vocab_tile_argmax_clocal",
++                        block_M,
++                        block_N,
++                        threads,
++                T.address_of(smem_v[0]),
++                T.address_of(smem_i[0]),
+                 T.address_of(partial_vals[0, 0]),
+                 T.address_of(partial_idxs[0, 0]),
+                 by,
+@@ -1841,15 +1917,19 @@ def prepare_bf16_head(
+         _declare_markov_greedy(layer, _bf16_head_greedy_kernels(layer, out_dtype))
+ 
+ 
+-def project_head(layer: nn.Module, x: torch.Tensor) -> torch.Tensor:
++def project_head(
++    layer: nn.Module, x: torch.Tensor, *, out: torch.Tensor | None = None
++) -> torch.Tensor:
+     """Logits of ``x[rows, K]`` through a prepared head, in its prepared dtype."""
+-    x = x.contiguous()
++    if not x.is_contiguous():
++        x = x.contiguous()
+     rows = x.shape[0]
+-    out = torch.empty(
+-        (rows, layer.weight.shape[0]),
+-        dtype=getattr(layer, "tilelang_vocab_dtype", torch.bfloat16),
+-        device=x.device,
+-    )
++    if out is None:
++        out = torch.empty(
++            (rows, layer.weight.shape[0]),
++            dtype=getattr(layer, "tilelang_vocab_dtype", torch.bfloat16),
++            device=x.device,
++        )
+     kernel = layer.tilelang_vocab[row_tile(rows)]
+     if hasattr(layer, "packed_bf16_exponent_base"):
+         kernel(
+diff --git a/vllm/v1/worker/gpu/spec_decode/dspark/speculator.py b/vllm/v1/worker/gpu/spec_decode/dspark/speculator.py
+index b4f9940bb..710d549be 100644
+--- a/vllm/v1/worker/gpu/spec_decode/dspark/speculator.py
++++ b/vllm/v1/worker/gpu/spec_decode/dspark/speculator.py
+@@ -42,13 +42,29 @@ from vllm.v1.worker.gpu.spec_decode.dflash.speculator import (
+     DraftBlockTableLayout,
+ )
+ from vllm.v1.worker.gpu.spec_decode.dspark.greedy import (
++    greedy_markov_shard_pair,
+     markov_anchor_embed,
++    register_greedy_markov_shard_pair_warmup,
+     register_sample_greedy_markov_warmup,
+     register_select_first_argmax_warmup,
+     sample_greedy_markov,
+     scratch_shape,
+     select_first_argmax,
+ )
++
++
++def _use_fused_markov_greedy_step(tp_size: int, step: int, num_reqs: int) -> bool:
++    """Whether draft position ``step`` fuses the Markov bias GEMM and shard
++    argmax into one kernel or projects ``markov_bias_local`` and reduces with
++    ``greedy_markov_shard_pair``.
++
++    On TP == 1 the full 129,280-row Markov W2 exceeds GB10's L2 cache, so the
++    fused projection wins at every step and batch size. On multi-rank TP (TP3 /
++    TP4), each rank's 12-bit packed W2 shard (16.55 MB / 12.40 MB) stays L2-hot
++    after position 0; unfused GEMM + ``greedy_markov_shard_pair`` is faster on
++    L2-hot steps (``step >= 1``) and at ``num_reqs <= 2`` on position 0.
++    """
++    return tp_size <= 1 or (step == 0 and num_reqs >= 3)
+ from vllm.v1.worker.gpu.spec_decode.dspark.utils import load_dspark_model
+ 
+ logger = init_logger(__name__)
+@@ -347,7 +363,23 @@ class DSparkSpeculator(DFlashSpeculator):
+             )
+         n_spec = self.num_speculative_steps
+         use_top2 = self._enable_top2_branch
++        tp_size = get_tensor_model_parallel_world_size()
++        has_local_layout = hasattr(self.model, "draft_logits_local_layout")
++        if tp_size > 1 and has_local_layout:
++            vocab_start, shard_vocab = self.model.draft_vocab_shard
++            dtype, head_width, markov_width = self.model.draft_logits_local_layout
+         for i in range(n_spec):
++            if tp_size > 1 and has_local_layout:
++                register_greedy_markov_shard_pair_warmup(
++                    base_dtype=dtype,
++                    base_stride=n_spec * head_width,
++                    base_aligned=i * head_width * dtype.itemsize % 16 == 0,
++                    bias_dtype=dtype,
++                    bias_stride=markov_width,
++                    vocab=shard_vocab,
++                    vocab_start=vocab_start,
++                    top2=use_top2,
++                )
+             register_select_first_argmax_warmup(
+                 ranks=get_tensor_model_parallel_world_size(),
+                 output_dtype=self.draft_tokens.dtype,
+@@ -411,9 +443,13 @@ class DSparkSpeculator(DFlashSpeculator):
+         # Draft-vocab logits; sampled ids are remapped to target vocab below.
+         local_head = getattr(self.model, "supports_local_draft_argmax", lambda: False)()
+         vocab_parallel = self._vocab_parallel_greedy(local_head)
++        can_unfuse_markov = vocab_parallel and hasattr(self.model, "markov_bias_local")
++        tp_size = get_tensor_model_parallel_world_size() if can_unfuse_markov else 1
+         if local_head:
+             base_logits = self.model.compute_local_draft_logits(sample_hidden)
+         elif vocab_parallel:
++            if can_unfuse_markov:
++                vocab_start, shard_vocab = self.model.draft_vocab_shard
+             base_logits = self.model.compute_draft_logits_local(sample_hidden)
+         else:
+             base_logits = self.model.compute_draft_logits(sample_hidden)
+@@ -469,11 +505,25 @@ class DSparkSpeculator(DFlashSpeculator):
+             if vocab_parallel:
+                 use_top2 = self._enable_top2_branch
+                 pairs = self._greedy_shard_pairs[:num_reqs]
+-                # The Markov projection adds the base logits and reduces this
+-                # rank's shard: no bias tensor.
+-                self.model.markov_greedy_pairs_local(
+-                    markov_embed, base_logits[:, i], pairs, top2=use_top2
+-                )
++                if not can_unfuse_markov or _use_fused_markov_greedy_step(
++                    tp_size, i, num_reqs
++                ):
++                    # The Markov projection adds the base logits and reduces
++                    # this rank's shard: no bias tensor.
++                    self.model.markov_greedy_pairs_local(
++                        markov_embed, base_logits[:, i], pairs, top2=use_top2
++                    )
++                else:
++                    bias = self.model.markov_bias_local(markov_embed)
++                    greedy_markov_shard_pair(
++                        base_logits[:, i, :shard_vocab],
++                        bias[:, :shard_vocab],
++                        vocab_start,
++                        pairs,
++                        self._greedy_partial_values,
++                        self._greedy_partial_indices,
++                        top2=use_top2,
++                    )
+                 draft_sampled_i = self.draft_tokens[:num_reqs, i]
+                 has_embed = table is not None and i + 1 < n_spec
+                 select_first_argmax(
+-- 
+2.43.0
+

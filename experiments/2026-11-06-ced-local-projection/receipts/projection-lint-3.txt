@@ -1,0 +1,92 @@
+I001 [*] Import block is un-sorted or un-formatted
+   --> tests/models/test_deepseek_v4_1_ced_model.py:343:5
+    |
+341 |       attention's ``x_q`` before ``mhc.post_pre``, and ``DeepseekV4Model.forward``
+342 |       releases non-final ``aux_recon`` tensors before subsequent layers."""
+343 | /     import weakref
+344 | |     from vllm.models.deepseek_v4_1.tilelang.linear import MXFP8Rows
+    | |___________________________________________________________________^
+345 |
+346 |       monkeypatch.setattr(
+    |
+help: Organize imports
+
+B023 Function definition does not bind loop variable `gathered`
+   --> tests/models/test_deepseek_v4_1_compressor.py:572:40
+    |
+570 |                 comp_mod,
+571 |                 "tensor_model_parallel_all_gather",
+572 |                 lambda tensor, dim=-1: gathered,
+    |                                        ^^^^^^^^
+573 |             )
+574 |             ranks[0]._project(inp)
+    |
+
+E501 Line too long (94 > 88)
+   --> vllm/models/deepseek_v4_1/attention.py:302:89
+    |
+300 |             ):
+301 |                 raise ValueError(
+302 |                     f"Shard id should be between 0 and {len(self.logical_output_sizes) - 1}. "
+    |                                                                                         ^^^^^^
+303 |                     f"Got shard id {loaded_shard_id}."
+304 |                 )
+    |
+
+E501 Line too long (89 > 88)
+   --> vllm/models/deepseek_v4_1/attention.py:384:89
+    |
+382 |         )
+383 |         _native_linear(self.wq_b)
+384 |         # Indexer Q-B reads the normalized q latent's MXFP8 cast alongside attention Q-B.
+    |                                                                                         ^
+385 |         self.wq_b.tilelang_mxfp8_input = True
+386 |         self.weights_proj = ReplicatedLinear(
+    |
+
+F401 [*] `vllm.envs` imported but unused
+  --> vllm/models/deepseek_v4_1/nvidia/model.py:12:21
+   |
+10 | import torch.nn as nn
+11 |
+12 | import vllm.envs as envs
+   |                     ^^^^
+13 | from vllm.config import VllmConfig
+14 | from vllm.distributed import (
+   |
+help: Remove unused import: `vllm.envs`
+
+E501 Line too long (89 > 88)
+    --> vllm/models/deepseek_v4_1/nvidia/model.py:1085:89
+     |
+1083 |             and callable(getattr(layer.mhc, "post_collapse", None))
+1084 |         )
+1085 |         out = self._graph_out(None, full_num_tokens) if last_rank and rows_here else None
+     |                                                                                         ^
+1086 |         if fused_final_collapse_norm:
+1087 |             hidden_states = layer.mhc.post_collapse_norm(
+     |
+
+E501 Line too long (104 > 88)
+  --> vllm/models/deepseek_v4_1/sp_prefill.py:33:89
+   |
+31 | every row: SP covers those and the boundary's row-wise normalization. The
+32 | boundary projects local global-KV rows and gathers their 512-column values,
+33 | plus the selected replay rows of its normalized input and residual carry. Dense selections keep the full
+   |                                                                                         ^^^^^^^^^^^^^^^^
+34 | carry gather when compact slots would cost at least as many rows.
+   |
+
+E501 Line too long (90 > 88)
+   --> vllm/models/deepseek_v4_1/sp_prefill.py:456:89
+    |
+454 |                     ex_into(send[:, lo:hi], parts[:, lo:hi])
+455 |                 else:
+456 |                     exchange_into(comm, send[:, lo:hi], parts[:, lo:hi], self.rank, world)
+    |                                                                                         ^^
+457 |             write(self.rank, lo, hi)
+458 |         if then is not None:
+    |
+
+Found 8 errors.
+[*] 2 fixable with the `--fix` option.

@@ -1,0 +1,804 @@
+From cda702273e77f8fe1c2792b19bd414b0f02f237a Mon Sep 17 00:00:00 2001
+From: Christopher Owen <3221756+christopherowen@users.noreply.github.com>
+Date: Fri, 6 Nov 2026 20:02:11 +0000
+Subject: [PATCH] Fuse multi-CTA disk Engram step and wire packed/cached rows
+
+Upstream base: a75357bba81e31e4f3085700f94b6a0b29aed44a
+
+Rationale:
+1. Fuse disk Engram wait, FP8 gather/dequantize, and release into a single multi-CTA TileLang kernel (engram_rows_step_kernel) with exact column-divisor block sizing (384 threads for TP4, 512 threads for TP3/TP1), overlapped device-memory row-ID preload, and 128B-isolated GPU-L2 inter-CTA synchronization so only CTA 0 polls mapped-host control on wait and only the last finishing CTA writes mapped-host control on release.
+2. Wire ParallelEngramEmbedding.open_disk_rows() to register rank-compacted 4 KiB-page-aligned (15 x 264B rows/page) single-plane packed sources via add_packed_source() when SPARK_DS41F_ENGRAM_PACKED_DIR is configured or a pre-packed file is present alongside the checkpoint, preserving standard two-plane O_DIRECT loading by default.
+3. Remove the 64-token (1536-lookup) PLE_CACHE_MAX_LOOKUPS bypass in _row_plan.h by sizing miss scratch arrays to max(max_lookups, PLE_CACHE_MAX_LOOKUPS), keeping the 17.3 MiB 4-way set-associative user-space row cache active across all batch sizes.
+
+Quality implications: Bit-exact (torch.equal) with the 3-launch disk Engram path and two-plane reader.
+
+Tests: pytest tests/kernels/test_deepseek_v41_engram_rows.py tests/models/test_deepseek_v4_1_engram.py and compute-sanitizer memcheck/initcheck/racecheck.
+
+Upstream status: Local DeepSeek-V4.1 disk Engram optimization.
+---
+ .../kernels/test_deepseek_v41_engram_rows.py  | 151 ++++++++++++-
+ tests/models/test_deepseek_v4_1_engram.py     |  78 +++++++
+ vllm/models/deepseek_v4_1/common/engram.py    | 122 +++++++++-
+ .../deepseek_v4_1/engram_rows/__init__.py     |   2 +
+ .../deepseek_v4_1/engram_rows/_row_plan.h     |   9 +-
+ .../deepseek_v4_1/tilelang/engram_rows.py     | 212 ++++++++++++++++--
+ 6 files changed, 536 insertions(+), 38 deletions(-)
+
+diff --git a/tests/kernels/test_deepseek_v41_engram_rows.py b/tests/kernels/test_deepseek_v41_engram_rows.py
+index 21bd6918a..eb7496e87 100644
+--- a/tests/kernels/test_deepseek_v41_engram_rows.py
++++ b/tests/kernels/test_deepseek_v41_engram_rows.py
+@@ -536,7 +536,7 @@ def test_the_gather_takes_every_nth_column():
+         equal_nan=True,
+     )
+     assert torch.count_nonzero(out[:, 4 * 256 :]) == 0
+-    assert row_kernel_calls(4 * HEADS, 0, TABLE_ROWS, tp5_rank4, out_cols=5)[1][1][-1] == 5
++    assert row_kernel_calls(4 * HEADS, 0, TABLE_ROWS, tp5_rank4, out_cols=5)[0][1][-1] == 5
+     rows.close()
+ 
+ 
+@@ -616,14 +616,31 @@ def test_tilelang_engram_geometry_matches_prime_and_pcg64_contract():
+         tp_rank=1,
+     )
+     assert caps.device.type == "cuda" and caps.tp_rank == 1
++def test_row_kernel_calls_declares_single_step_kernel():
++    from vllm.models.deepseek_v4_1.tilelang.engram_rows import (
++        engram_rows_step_kernel,
++        row_kernel_calls,
++    )
++
++    calls = row_kernel_calls(4 * HEADS, 0, TABLE_ROWS, TP3_RANK1)
++    assert calls == [(engram_rows_step_kernel, (4 * HEADS, 0, TABLE_ROWS, TP3_RANK1), {})]
++
++
+ def test_gather_kernel_uses_streaming_cache_hints_and_matches_reference():
+-    from vllm.models.deepseek_v4_1.tilelang.engram_rows import engram_rows_gather_kernel
++    from vllm.models.deepseek_v4_1.tilelang.engram_rows import (
++        engram_rows_gather_kernel,
++        engram_rows_step_kernel,
++    )
+ 
+-    kernel = engram_rows_gather_kernel(4 * HEADS, 0, TABLE_ROWS, TP3_RANK1)
+-    src = kernel.get_kernel_source()
+-    assert "ld.global.cs.s64" in src
+-    assert "ld.global.cs.u8" in src
+-    assert "ld.global.cs.u32" in src
++    for fn in (engram_rows_step_kernel, engram_rows_gather_kernel):
++        kernel = fn(4 * HEADS, 0, TABLE_ROWS, TP3_RANK1)
++        src = kernel.get_kernel_source()
++        assert "ld.global.cs.s64" in src
++        assert "ld.global.cs.u8" in src
++        assert "ld.global.cs.u32" in src
++    step_src = engram_rows_step_kernel(4 * HEADS, 0, TABLE_ROWS, TP3_RANK1).get_kernel_source()
++    assert "engram_wait_rows_cta" in step_src
++    assert "engram_release_rows_cta" in step_src
+ 
+     codes, scales, paths = _write_table(_table_dir(), seed=41)
+     rows = _rows(paths, tokens=8, columns=TP3_RANK1)
+@@ -1060,3 +1077,123 @@ def test_pack_engram_columns_and_compacted_column_map_match_two_plane_reader(
+     finally:
+         two_plane.close()
+         packed_rows.close()
++
++
++@pytest.mark.parametrize("delta", [-1, -(1 << 63)])
++def test_packed_column_map_refuses_negative_delta_before_io(delta):
++    rows = EngramDiskRows(
++        device="cuda",
++        table_rows=1,
++        shard_start=0,
++        shard_end=1,
++        max_lookups=24,
++        columns=1,
++    )
++    start = np.zeros(24, dtype=np.int64)
++    end = np.zeros(24, dtype=np.int64)
++    end[0] = 1
++    offsets = np.zeros(24, dtype=np.int64)
++    offsets[0] = delta
++    try:
++        with pytest.raises(ValueError):
++            rows.add_packed_source(
++                "must-not-open", col_start=start, col_end=end, col_delta=offsets
++            )
++    finally:
++        rows.close()
++
++
++def test_user_space_row_cache_hits_above_64_tokens():
++    """The 4-way user-space row cache remains active for steps with >64 tokens (>1536
++    lookups) in direct-slot read_rows/read_early paths."""
++    codes, scales, paths = _write_table(_table_dir(), seed=51)
++    rows = _rows(paths, tokens=128, columns=TP3_RANK1, cache_rows=4096)
++    try:
++        ids = (torch.arange(128 * HEADS, dtype=torch.int64) % 96).view(128, HEADS)
++        ids_gpu = ids.cuda()
++        out1, _ = _step(rows, ids_gpu, 128, early=ids.numpy())
++        expected = _reference(codes, scales, ids, 128, 0, TABLE_ROWS, TP3_RANK1)
++        torch.testing.assert_close(out1.cpu(), expected, rtol=0, atol=0, equal_nan=True)
++        torch.cuda.synchronize()
++        deadline = time.monotonic() + 5.0
++        while rows.stats()["queued"] and time.monotonic() < deadline:
++            time.sleep(0.001)
++        s1 = rows.stats()
++
++        out2, _ = _step(rows, ids_gpu, 128, early=ids.numpy())
++        torch.testing.assert_close(out2.cpu(), expected, rtol=0, atol=0, equal_nan=True)
++        torch.cuda.synchronize()
++        while rows.stats()["queued"] and time.monotonic() < deadline:
++            time.sleep(0.001)
++        s2 = rows.stats()
++        assert s2["read_calls"] == s1["read_calls"]
++        assert s2["cache_hits"] - s1["cache_hits"] == 128 * 8
++    finally:
++        rows.close()
++
++
++@pytest.mark.parametrize(
++    "columns,out_cols",
++    [
++        (sum(1 << c for c in range(0, HEADS, 4)), 6),  # TP4
++        (TP3_RANK1, 8),  # TP3
++        (ALL_COLUMNS, 24),  # TP1
++    ],
++)
++def test_multi_cta_step_kernel_matches_three_launch_across_batches(columns: int, out_cols: int):
++    """Multi-CTA engram_rows_step_kernel matches the 3-launch wait+gather+release path bit-for-bit
++    across decode and verification batch sizes in both eager and CUDA Graph modes, and leaves
++    the retirement counter at zero after every step."""
++    from vllm.models.deepseek_v4_1.tilelang.engram_rows import (
++        engram_rows_gather,
++        engram_rows_gather_kernel,
++        engram_rows_release_kernel,
++        engram_rows_wait_kernel,
++    )
++
++    codes, scales, paths = _write_table(_table_dir(), seed=73)
++    batch_sizes = (1, 2, 4, 8, 16, 18, 24, 30, 36, 42, 48)
++    rows = _rows(paths, tokens=48, columns=columns)
++    try:
++        gen = torch.Generator().manual_seed(79)
++        ids_cpu = torch.randint(-1, TABLE_ROWS + 32, (48, HEADS), generator=gen, dtype=torch.int64)
++        ids_gpu = ids_cpu.cuda()
++        stream = torch.cuda.current_stream()
++        wait_k = engram_rows_wait_kernel()
++        gather_k = engram_rows_gather_kernel(rows.weights.device_view.shape[0], 0, TABLE_ROWS, columns)
++        release_k = engram_rows_release_kernel()
++
++        for m in batch_sizes:
++            live = torch.tensor([m], dtype=torch.int32, device="cuda")
++            out_step = torch.full((m, out_cols * ROW_BYTES), -1.0, dtype=torch.bfloat16, device="cuda")
++            out_three = torch.full((m, out_cols * ROW_BYTES), -1.0, dtype=torch.bfloat16, device="cuda")
++
++            rows.stage(stream, ids_gpu[:m], m * HEADS, ids_cpu[:m].numpy())
++            engram_rows_gather(
++                ids_gpu[:m],
++                live,
++                rows.weights.device_view.view(torch.float8_e4m3fn),
++                rows.scales.device_view,
++                rows.control.device_view,
++                out_step,
++                0,
++                TABLE_ROWS,
++                columns=columns,
++            )
++            torch.cuda.synchronize()
++            assert int(rows.control.host[56].item()) == 0
++            assert int(rows.control.host[rows.native.CTRL_CONSUMED_SEQ].item()) == int(
++                rows.control.host[rows.native.CTRL_ROWS_SEQ].item()
++            )
++
++            rows.stage(stream, ids_gpu[:m], m * HEADS, ids_cpu[:m].numpy())
++            wait_k(rows.control.device_view)
++            gather_k(ids_gpu[:m], live, rows.weights.device_view.view(torch.float8_e4m3fn), rows.scales.device_view, out_three)
++            release_k(rows.control.device_view)
++            torch.cuda.synchronize()
++
++            assert torch.equal(out_step.view(torch.uint16), out_three.view(torch.uint16))
++            expected = _reference(codes, scales, ids_cpu[:m], m, 0, TABLE_ROWS, columns)
++            torch.testing.assert_close(out_step.cpu(), expected, rtol=0, atol=0, equal_nan=True)
++    finally:
++        rows.close()
+diff --git a/tests/models/test_deepseek_v4_1_engram.py b/tests/models/test_deepseek_v4_1_engram.py
+index 753ea9690..02df818f0 100644
+--- a/tests/models/test_deepseek_v4_1_engram.py
++++ b/tests/models/test_deepseek_v4_1_engram.py
+@@ -1128,6 +1128,7 @@ def test_disk_rows_read_whole_table_sources(tmp_path, dist_init, tp_rank):
+             assert output.data_ptr() == address
+     finally:
+         embed.close()
++        shutil.rmtree(packed_dir, ignore_errors=True)
+ 
+ 
+ @pytest.mark.parametrize("tp_size", [1, 2, 3, 4, 5, 6, 7, 8])
+@@ -1288,3 +1289,80 @@ def test_engram_forward_fuses_mhc_post_and_gate(dist_init):
+             res_mix=local_comb,
+         )
+         assert torch.equal(actual_sp.view(torch.int16), expected_sp.view(torch.int16))
++
++
++@pytest.mark.skipif(not torch.cuda.is_available(), reason="Disk Engram needs CUDA")
++def test_disk_rows_pack_and_read_rank_compacted_files(monkeypatch):
++    import os
++    from vllm.models.deepseek_v4_1.common import engram as engram_mod
++    from vllm.models.deepseek_v4_1.engram_rows import packed_table_bytes
++
++    geometry = native.build_geometry(
++        layer_ids=(1, 14), base_table_size=19, compressed_vocab_size=32
++    )
++    caps = native.Caps(
++        device=torch.device("cuda"),
++        max_tokens=4,
++        max_seqs=2,
++        max_requests=2,
++        vocab_size=32,
++        layer_id=1,
++        tp_size=3,
++        tp_rank=1,
++    )
++    rows_total = geometry.num_embeddings[0]
++    weight_bytes = torch.randint(0, 120, (rows_total, 256), dtype=torch.uint8)
++    scale_bytes = torch.randint(120, 134, (rows_total, 8), dtype=torch.uint8)
++    base_dir = os.environ.get("ENGRAM_ROWS_TEST_DIR", "/cache/engram-rows-test")
++    os.makedirs(base_dir, exist_ok=True)
++    w_path = os.path.join(base_dir, "model_pack_w.bin")
++    s_path = os.path.join(base_dir, "model_pack_s.bin")
++    with open(w_path, "wb") as f:
++        f.write(weight_bytes.numpy().tobytes())
++    with open(s_path, "wb") as f:
++        f.write(scale_bytes.numpy().tobytes())
++
++    import shutil
++    packed_dir = os.path.join(base_dir, f"packed-{os.getpid()}")
++    shutil.rmtree(packed_dir, ignore_errors=True)
++    monkeypatch.setattr(engram_mod, "ENGRAM_PACKED_DIR", packed_dir)
++    embed = ParallelEngramEmbedding(None, caps, geometry, table_memory="disk")
++    embed._disk_sources = [(w_path, 0, False), (s_path, 0, True)]
++    embed.open_disk_rows()
++    try:
++        packed_file = os.path.join(packed_dir, "engram-layer1-tp3-rank1.packed")
++        assert os.path.exists(packed_file)
++        expected_rows = sum(geometry.primes[0][c] for c in range(1, 24, 3))
++        assert os.path.getsize(packed_file) == packed_table_bytes(expected_rows)
++
++        offsets = geometry.offsets[0]
++        primes = geometry.primes[0]
++        ids = torch.zeros((2, 24), dtype=torch.int64, device="cuda")
++        for c in range(24):
++            ids[0, c] = offsets[c] + (c % primes[c])
++            ids[1, c] = offsets[c] + ((c + 3) % primes[c])
++        hashes = torch.full((4, 24), -1, dtype=torch.int64, device="cuda")
++        hashes[:2].copy_(ids)
++        num_tokens = torch.tensor([2], dtype=torch.int32, device="cuda")
++        embed.share_hashes(hashes, num_tokens)
++        embed.stage_rows(2, torch.cuda.current_stream(), early=ids.cpu().numpy())
++        out_packed = torch.empty((2, 8 * 256), dtype=torch.bfloat16, device="cuda")
++        embed.gather_rows(out_packed)
++        torch.cuda.synchronize()
++    finally:
++        embed.close()
++
++    monkeypatch.setattr(engram_mod, "ENGRAM_PACKED_DIR", "")
++    embed_2p = ParallelEngramEmbedding(None, caps, geometry, table_memory="disk")
++    embed_2p._disk_sources = [(w_path, 0, False), (s_path, 0, True)]
++    embed_2p.open_disk_rows()
++    try:
++        embed_2p.share_hashes(hashes, num_tokens)
++        embed_2p.stage_rows(2, torch.cuda.current_stream(), early=ids.cpu().numpy())
++        out_2p = torch.empty((2, 8 * 256), dtype=torch.bfloat16, device="cuda")
++        embed_2p.gather_rows(out_2p)
++        torch.cuda.synchronize()
++    finally:
++        embed_2p.close()
++
++    assert torch.equal(out_packed, out_2p)
+diff --git a/vllm/models/deepseek_v4_1/common/engram.py b/vllm/models/deepseek_v4_1/common/engram.py
+index 9b2092617..0f7345cde 100644
+--- a/vllm/models/deepseek_v4_1/common/engram.py
++++ b/vllm/models/deepseek_v4_1/common/engram.py
+@@ -20,7 +20,15 @@ from vllm.logger import init_logger
+ from vllm.model_executor.layers.linear import ColumnParallelLinear, ReplicatedLinear
+ from vllm.model_executor.utils import set_weight_attrs
+ from vllm.model_executor.weight_transfer import copy_weight, get_file_tensor_source
+-from vllm.models.deepseek_v4_1.engram_rows import EngramDiskRows, MappedHostAllocation
++from vllm.models.deepseek_v4_1.engram_rows import (
++    DEFAULT_CACHE_ROWS,
++    PACKED_ROW_BYTES,
++    EngramDiskRows,
++    MappedHostAllocation,
++    column_compaction_map,
++    pack_engram_columns,
++    packed_table_bytes,
++)
+ from vllm.models.deepseek_v4_1.tilelang import engram_hash as native
+ from vllm.v1.worker.workspace import retain_cuda_graph_capture_resource
+ 
+@@ -174,6 +182,11 @@ ENGRAM_TIMELINE = os.environ.get("SPARK_DS41F_ENGRAM_TIMELINE", "0") == "1"
+ ENGRAM_TIMELINE_DIR = os.environ.get(
+     "SPARK_DS41F_ENGRAM_TIMELINE_DIR", "/cache/spark-ds41f/engram-timeline"
+ )
++ENGRAM_PACKED_DIR = os.environ.get("SPARK_DS41F_ENGRAM_PACKED_DIR", "")
++_ENGRAM_ROW_CACHE_ENV = os.environ.get("SPARK_DS41F_ENGRAM_ROW_CACHE_ROWS")
++ENGRAM_ROW_CACHE_ROWS: int | None = (
++    int(_ENGRAM_ROW_CACHE_ENV) if _ENGRAM_ROW_CACHE_ENV is not None else None
++)
+ _timeline_tables: list = []
+ 
+ 
+@@ -503,9 +516,9 @@ class ParallelEngramEmbedding(nn.Module):
+         super().__init__()
+         self.plan = plan
+         self.caps = caps
+-        self.table_rows = geometry.num_embeddings[
+-            geometry.layer_ids.index(caps.layer_id)
+-        ]
++        self.geometry = geometry
++        self.layer_index = geometry.layer_ids.index(caps.layer_id)
++        self.table_rows = geometry.num_embeddings[self.layer_index]
+         self.shard_rows = (self.table_rows + caps.tp_size - 1) // caps.tp_size
+         self.shard_start = caps.tp_rank * self.shard_rows
+         self.shard_end = (caps.tp_rank + 1) * self.shard_rows
+@@ -729,6 +742,11 @@ class ParallelEngramEmbedding(nn.Module):
+             raise ValueError(
+                 "Disk Engram needs the table's weight and scale planes, once each"
+             )
++        cache_kw = (
++            {"cache_rows": ENGRAM_ROW_CACHE_ROWS}
++            if ENGRAM_ROW_CACHE_ROWS is not None
++            else {}
++        )
+         rows = EngramDiskRows(
+             device=self.caps.device,
+             table_rows=self.table_rows,
+@@ -737,9 +755,101 @@ class ParallelEngramEmbedding(nn.Module):
+             delay_s=ENGRAM_READ_DELAY_S,
+             check_early=ENGRAM_CHECK_EARLY_IDS,
+             timeline=ENGRAM_TIMELINE,
++            **cache_kw,
++        )
++        weight_path, weight_offset = next(
++            (p, off) for p, off, s in self._disk_sources if not s
++        )
++        scale_path, scale_offset = next(
++            (p, off) for p, off, s in self._disk_sources if s
++        )
++        packed_name = (
++            f"engram-layer{self.caps.layer_id}-tp{self.caps.tp_size}"
++            f"-rank{self.caps.tp_rank}.packed"
++        )
++        owned_columns = (
++            self.columns
++            if self.columns is not None
++            else tuple(c for c in range(24) if (self.column_mask >> c) & 1)
++        )
++        col_start, col_end, col_delta, owned_starts, owned_rows = (
++            column_compaction_map(
++                self.geometry.offsets[self.layer_index],
++                self.table_rows,
++                owned_columns,
++            )
+         )
+-        for path, offset, scale in self._disk_sources:
+-            rows.add_source(path, offset, scale=scale)
++        expected_bytes = packed_table_bytes(int(owned_rows.sum()))
++        prepacked_path = os.path.join(os.path.dirname(weight_path), packed_name)
++        if ENGRAM_PACKED_DIR:
++            import time
++
++            os.makedirs(ENGRAM_PACKED_DIR, exist_ok=True)
++            packed_path = os.path.join(ENGRAM_PACKED_DIR, packed_name)
++            reused = (
++                os.path.exists(packed_path)
++                and os.path.getsize(packed_path) == expected_bytes
++            )
++            pack_seconds = 0.0
++            if not reused:
++                pack_started = time.monotonic()
++                tmp_path = f"{packed_path}.tmp.{os.getpid()}"
++                pack_engram_columns(
++                    weight_path,
++                    weight_offset,
++                    scale_path,
++                    scale_offset,
++                    tmp_path,
++                    owned_starts,
++                    owned_rows,
++                )
++                os.replace(tmp_path, packed_path)
++                pack_seconds = time.monotonic() - pack_started
++            logger.info(
++                "Engram packed rows layer=%d tp=%d rank=%d layout=264-v1 "
++                "bytes=%d written_bytes=%d reused=%s pack_s=%.6f path=%s",
++                self.caps.layer_id,
++                self.caps.tp_size,
++                self.caps.tp_rank,
++                expected_bytes,
++                0 if reused else expected_bytes,
++                reused,
++                pack_seconds,
++                packed_path,
++            )
++            rows.add_packed_source(
++                packed_path,
++                0,
++                col_start=col_start,
++                col_end=col_end,
++                col_delta=col_delta,
++            )
++        elif (
++            os.path.exists(prepacked_path)
++            and os.path.getsize(prepacked_path) == expected_bytes
++        ):
++            logger.info(
++                "Engram packed rows layer=%d tp=%d rank=%d layout=264-v1 "
++                "bytes=%d written_bytes=%d reused=%s pack_s=%.6f path=%s",
++                self.caps.layer_id,
++                self.caps.tp_size,
++                self.caps.tp_rank,
++                expected_bytes,
++                0,
++                True,
++                0.0,
++                prepacked_path,
++            )
++            rows.add_packed_source(
++                prepacked_path,
++                0,
++                col_start=col_start,
++                col_end=col_end,
++                col_delta=col_delta,
++            )
++        else:
++            for path, offset, scale in self._disk_sources:
++                rows.add_source(path, offset, scale=scale)
+         self.disk_rows = rows
+         if ENGRAM_TIMELINE:
+             _record_timeline(rows, self.caps.tp_rank, self.caps.layer_id)
+diff --git a/vllm/models/deepseek_v4_1/engram_rows/__init__.py b/vllm/models/deepseek_v4_1/engram_rows/__init__.py
+index 7ebf723a1..84ed51898 100644
+--- a/vllm/models/deepseek_v4_1/engram_rows/__init__.py
++++ b/vllm/models/deepseek_v4_1/engram_rows/__init__.py
+@@ -3,6 +3,7 @@
+ """DeepSeek-V4.1 Engram rows read from the checkpoint as steps ask (see ``rows``)."""
+ 
+ from vllm.models.deepseek_v4_1.engram_rows.rows import (
++    DEFAULT_CACHE_ROWS,
+     PACKED_PAGE_BYTES,
+     PACKED_ROW_BYTES,
+     PACKED_ROWS_PER_PAGE,
+@@ -14,6 +15,7 @@ from vllm.models.deepseek_v4_1.engram_rows.rows import (
+ )
+ 
+ __all__ = [
++    "DEFAULT_CACHE_ROWS",
+     "EngramDiskRows",
+     "MappedHostAllocation",
+     "PACKED_PAGE_BYTES",
+diff --git a/vllm/models/deepseek_v4_1/engram_rows/_row_plan.h b/vllm/models/deepseek_v4_1/engram_rows/_row_plan.h
+index 9c9546985..77bdcf60a 100644
+--- a/vllm/models/deepseek_v4_1/engram_rows/_row_plan.h
++++ b/vllm/models/deepseek_v4_1/engram_rows/_row_plan.h
+@@ -145,8 +145,8 @@ static inline int ple_plan_init(ple_plan_t *reader, int64_t shard_rows,
+         reader->cache = calloc(sets, sizeof(*reader->cache));
+         reader->miss_lookups = malloc(miss_cap * sizeof(*reader->miss_lookups));
+         reader->miss_ids = malloc(miss_cap * sizeof(*reader->miss_ids));
+-        reader->miss_weights = malloc((size_t)PLE_CACHE_MAX_LOOKUPS * 256u);
+-        reader->miss_scales = malloc((size_t)PLE_CACHE_MAX_LOOKUPS * 8u);
++        reader->miss_weights = malloc(miss_cap * 256u);
++        reader->miss_scales = malloc(miss_cap * 8u);
+         if (!reader->cache || !reader->miss_lookups || !reader->miss_ids ||
+             !reader->miss_weights || !reader->miss_scales)
+             return ENOMEM;
+@@ -259,7 +259,8 @@ static inline int ple_add_packed_source(ple_plan_t *reader, int64_t shard, const
+         expected_rows = 0;
+         for (unsigned c = 0; c < PLE_COLUMNS; c++) {
+             if (!((reader->columns >> c) & 1u)) continue;
+-            if (col_start[c] < 0 || col_end[c] < col_start[c] || col_end[c] > reader->padded_rows ||
++            if (col_start[c] < 0 || col_delta[c] < 0 ||
++                col_end[c] < col_start[c] || col_end[c] > reader->padded_rows ||
+                 col_start[c] < col_delta[c])
+                 return EINVAL;
+             int64_t phys_end = col_end[c] - col_delta[c];
+@@ -437,7 +438,7 @@ static inline bool ple_plan(ple_plan_t *reader, const char *ids, size_t count,
+         char *dst_weights, char *dst_scales, bool dst_is_cached) {
+     reader->fragment_count = reader->job_count = 0;
+     reader->miss_count = 0;
+-    bool use_cache = reader->cache_sets > 0 && (count <= PLE_CACHE_MAX_LOOKUPS || dst_is_cached);
++    bool use_cache = reader->cache_sets > 0 && (count <= reader->max_lookups || dst_is_cached);
+     bool check_cache = use_cache && reader->cache_populated > 0;
+     bool fill_cache = use_cache;
+     reader->miss_src_weights = dst_is_cached ? dst_weights : NULL;
+diff --git a/vllm/models/deepseek_v4_1/tilelang/engram_rows.py b/vllm/models/deepseek_v4_1/tilelang/engram_rows.py
+index 4f22f0b66..88a9dacd6 100644
+--- a/vllm/models/deepseek_v4_1/tilelang/engram_rows.py
++++ b/vllm/models/deepseek_v4_1/tilelang/engram_rows.py
+@@ -59,6 +59,7 @@ _HEADER = (
+ #define ENGRAM_CTRL_GPU_WAIT_SEQ 40
+ #define ENGRAM_CTRL_GPU_WAIT_NS 41
+ #define ENGRAM_CTRL_PHASE 48
++#define ENGRAM_CTRL_RETIRED_CTAS 56
+ #define ENGRAM_PHASE_FAILED 3
+ 
+ // Wait until the rows of the step this stream staged are published (cyclic
+@@ -66,32 +67,38 @@ _HEADER = (
+ // after 64 unanswered polls, so a wait for rows already in place costs one load. A
+ // timeout, or a reader that failed, records the time waited and the step, fenced,
+ // then stops the GPU.
+-__device__ __forceinline__ void engram_wait_rows(void *control) {
++__device__ __forceinline__ unsigned engram_wait_rows_cta(void *control, int is_lead_cta) {
+     unsigned *ctrl = (unsigned *)control;
+     unsigned target;
+     asm volatile("ld.relaxed.sys.global.u32 %0, [%1];" : "=r"(target) : "l"(ctrl + ENGRAM_CTRL_IDS_SEQ) : "memory");
+     unsigned long long start = 0ull, limit = 0ull;
+ #ifdef ENGRAM_TIMING
+-    unsigned long long entered;
+-    asm volatile("mov.u64 %0, %%globaltimer;" : "=l"(entered));
++    unsigned long long entered = 0ull;
++    if (is_lead_cta) {
++        asm volatile("mov.u64 %0, %%globaltimer;" : "=l"(entered));
++    }
++#else
++    (void)is_lead_cta;
+ #endif
+     for (unsigned polls = 1u;; polls++) {
+         unsigned seen;
+         asm volatile("ld.acquire.sys.global.u32 %0, [%1];" : "=r"(seen) : "l"(ctrl + ENGRAM_CTRL_ROWS_SEQ) : "memory");
+         if ((int)(seen - target) >= 0) {
+ #ifdef ENGRAM_TIMING
+-            unsigned long long left;
+-            asm volatile("mov.u64 %0, %%globaltimer;" : "=l"(left));
+-            unsigned long long ns = left - entered;
+-            unsigned waited = ns > 0xffffffffull ? 0xffffffffu : (unsigned)ns;
+-            asm volatile("st.relaxed.sys.global.u32 [%0], %1;"
+-                         :: "l"(ctrl + ENGRAM_CTRL_GPU_WAIT_NS), "r"(waited)
+-                         : "memory");
+-            asm volatile("st.release.sys.global.u32 [%0], %1;"
+-                         :: "l"(ctrl + ENGRAM_CTRL_GPU_WAIT_SEQ), "r"(target)
+-                         : "memory");
++            if (is_lead_cta) {
++                unsigned long long left;
++                asm volatile("mov.u64 %0, %%globaltimer;" : "=l"(left));
++                unsigned long long ns = left - entered;
++                unsigned waited = ns > 0xffffffffull ? 0xffffffffu : (unsigned)ns;
++                asm volatile("st.relaxed.sys.global.u32 [%0], %1;"
++                             :: "l"(ctrl + ENGRAM_CTRL_GPU_WAIT_NS), "r"(waited)
++                             : "memory");
++                asm volatile("st.release.sys.global.u32 [%0], %1;"
++                             :: "l"(ctrl + ENGRAM_CTRL_GPU_WAIT_SEQ), "r"(target)
++                             : "memory");
++            }
+ #endif
+-            return;
++            return target;
+         }
+         if ((polls & 63u) == 0u) {
+             unsigned long long now;
+@@ -116,6 +123,10 @@ __device__ __forceinline__ void engram_wait_rows(void *control) {
+     }
+ }
+ 
++__device__ __forceinline__ void engram_wait_rows(void *control) {
++    engram_wait_rows_cta(control, 1);
++}
++
+ // The stream's gather of the step it staged is done (the kernels before this one have
+ // retired their loads of the mapped rows): tell the reader, with release semantics.
+ __device__ __forceinline__ void engram_release_rows(void *control) {
+@@ -127,6 +138,63 @@ __device__ __forceinline__ void engram_release_rows(void *control) {
+                  :: "l"(ctrl + ENGRAM_CTRL_CONSUMED_SEQ), "r"(staged) : "memory");
+ }
+ 
++// Device-L2 synchronization state across CTAs of engram_rows_step_kernel (128B cache-line
++// isolated words so only CTA 0 touches mapped-host control on wait and only the last
++// finishing CTA touches mapped-host control on release).
++__device__ __align__(128) unsigned engram_gpu_sync[128] = {0u};
++#define ENGRAM_SYNC_COMPLETED 0
++#define ENGRAM_SYNC_READY     32
++#define ENGRAM_SYNC_RETIRED   64
++#define ENGRAM_SYNC_STAGED    96
++
++__device__ __forceinline__ void engram_wait_rows_step(void *control, int is_lead_cta, int total_ctas) {
++    if (total_ctas <= 1) {
++        unsigned target = engram_wait_rows_cta(control, 1);
++        asm volatile("st.relaxed.gpu.global.u32 [%0], %1;" :: "l"(&engram_gpu_sync[ENGRAM_SYNC_STAGED]), "r"(target) : "memory");
++        return;
++    }
++    unsigned my_step;
++    asm volatile("ld.relaxed.gpu.global.u32 %0, [%1];" : "=r"(my_step) : "l"(&engram_gpu_sync[ENGRAM_SYNC_COMPLETED]) : "memory");
++    my_step += 1u;
++    if (is_lead_cta) {
++        unsigned target = engram_wait_rows_cta(control, 1);
++        asm volatile("st.relaxed.gpu.global.u32 [%0], %1;" :: "l"(&engram_gpu_sync[ENGRAM_SYNC_STAGED]), "r"(target) : "memory");
++        asm volatile("st.release.gpu.global.u32 [%0], %1;" :: "l"(&engram_gpu_sync[ENGRAM_SYNC_READY]), "r"(my_step) : "memory");
++    } else {
++        for (;;) {
++            unsigned ready;
++            asm volatile("ld.acquire.gpu.global.u32 %0, [%1];" : "=r"(ready) : "l"(&engram_gpu_sync[ENGRAM_SYNC_READY]) : "memory");
++            if (ready == my_step) break;
++            asm volatile("nanosleep.u32 16;");
++        }
++    }
++}
++
++__device__ __forceinline__ void engram_release_rows_cta(void *control, int total_ctas) {
++    unsigned *ctrl = (unsigned *)control;
++    if (total_ctas <= 1) {
++        unsigned staged;
++        asm volatile("ld.relaxed.gpu.global.u32 %0, [%1];" : "=r"(staged) : "l"(&engram_gpu_sync[ENGRAM_SYNC_STAGED]) : "memory");
++        asm volatile("st.release.sys.global.u32 [%0], %1;"
++                     :: "l"(ctrl + ENGRAM_CTRL_CONSUMED_SEQ), "r"(staged) : "memory");
++        return;
++    }
++    unsigned limit = (unsigned)(total_ctas - 1);
++    unsigned prev;
++    asm volatile("atom.inc.release.gpu.global.u32 %0, [%1], %2;"
++                 : "=r"(prev)
++                 : "l"(&engram_gpu_sync[ENGRAM_SYNC_RETIRED]), "r"(limit)
++                 : "memory");
++    if (prev == limit) {
++        unsigned my_step, staged;
++        asm volatile("ld.relaxed.gpu.global.u32 %0, [%1];" : "=r"(my_step) : "l"(&engram_gpu_sync[ENGRAM_SYNC_READY]) : "memory");
++        asm volatile("ld.relaxed.gpu.global.u32 %0, [%1];" : "=r"(staged) : "l"(&engram_gpu_sync[ENGRAM_SYNC_STAGED]) : "memory");
++        asm volatile("st.release.gpu.global.u32 [%0], %1;" :: "l"(&engram_gpu_sync[ENGRAM_SYNC_COMPLETED]), "r"(my_step) : "memory");
++        asm volatile("st.release.sys.global.u32 [%0], %1;"
++                     :: "l"(ctrl + ENGRAM_CTRL_CONSUMED_SEQ), "r"(staged) : "memory");
++    }
++}
++
+ // One-shot streaming loads (L2::evict_first) for step row IDs and mapped-host
+ // E4M3 rows / E8M0 scales: each slot is consumed once by a single thread, so
+ // streaming keeps mapped-host reads from evicting resident weights in the 24 MB L2.
+@@ -267,6 +335,109 @@ def engram_rows_gather_kernel(
+     return engram_rows_gather
+ 
+ 
++@tilelang.jit(
++    pass_configs={
++        tilelang.PassConfigKey.TL_DISABLE_WARP_SPECIALIZED: True,
++        tilelang.PassConfigKey.TL_DISABLE_SAFE_MEMORY_ACCESS: True,
++    }
++)
++def engram_rows_step_kernel(
++    max_lookups: int,
++    shard_start: int,
++    shard_end: int,
++    columns: int = (1 << HEADS) - 1,
++    out_cols: int = 0,
++    vec: int = 4,
++):
++    """Fused multi-CTA wait + gather + release kernel for a step's Engram rows."""
++    assert 32 % vec == 0
++    first, step, count = column_span(columns)
++    stride_cols = out_cols or count
++    assert stride_cols >= count
++    row_threads = ROW // vec
++    rows_per_cta = next(r for r in range(min(count, 8), 0, -1) if count % r == 0)
++    threads = rows_per_cta * row_threads
++    col_blocks = count // rows_per_cta
++    tokens = T.dynamic("tokens")
++
++    @T.prim_func
++    def engram_rows_step(
++        ids: T.Tensor((tokens, HEADS), T.int64),
++        num_tokens: T.Tensor((1,), T.int32),
++        rows: T.Tensor((max_lookups, ROW), T.float8_e4m3fn),
++        scales: T.Tensor((max_lookups, SCALES), T.uint8),
++        control: T.Tensor((CONTROL_WORDS,), T.int32),
++        out: T.Tensor((tokens, stride_cols * ROW), T.bfloat16),
++    ):
++        with T.Kernel(col_blocks, tokens, threads=threads) as (col_block, t):
++            T.import_source(_HEADER)
++            tx = T.get_thread_binding()
++            total_ctas = col_blocks * tokens
++            row_slot = tx // row_threads
++            lane = tx % row_threads
++            column = col_block * rows_per_cta + row_slot
++            head = first + column * step
++            row = T.call_extern(
++                "int64", "engram_ld_cs_s64", T.address_of(ids[t, head])
++            )
++            n_tok = num_tokens[0]
++            if tx == 0:
++                T.call_extern(
++                    "engram_wait_rows_step",
++                    T.address_of(control[0]),
++                    T.if_then_else((col_block == 0) & (t == 0), T.int32(1), T.int32(0)),
++                    total_ctas,
++                    dtype="handle",
++                )
++            T.sync_threads()
++            lookup = t * HEADS + head
++            owned = (t < n_tok) & (row >= shard_start) & (row < shard_end)
++            if owned:
++                exponent = T.call_extern(
++                    "uint32",
++                    "engram_ld_cs_u8",
++                    T.address_of(scales[lookup, lane * vec // 32]),
++                )
++                scale = T.reinterpret(T.shift_left(exponent, 23), T.float32)
++                scale = T.if_then_else(exponent == 0, T.float32(2.0**-127), scale)
++                scale = T.if_then_else(exponent == 255, T.float32(float("nan")), scale)
++                if vec == 4:
++                    packed = T.call_extern(
++                        "uint32",
++                        "engram_ld_cs_u32",
++                        T.address_of(rows[lookup, lane * vec]),
++                    )
++                    for i in T.vectorized(vec):
++                        byte = T.cast(
++                            T.shift_right(packed, T.uint32(8 * i)) & T.uint32(0xFF),
++                            T.uint8,
++                        )
++                        out[t, column * ROW + lane * vec + i] = T.cast(
++                            T.cast(T.reinterpret(byte, T.float8_e4m3fn), T.float32)
++                            * scale,
++                            T.bfloat16,
++                        )
++                else:
++                    for i in T.vectorized(vec):
++                        out[t, column * ROW + lane * vec + i] = T.cast(
++                            T.cast(rows[lookup, lane * vec + i], T.float32) * scale,
++                            T.bfloat16,
++                        )
++            else:
++                for i in T.vectorized(vec):
++                    out[t, column * ROW + lane * vec + i] = T.bfloat16(0)
++            T.sync_threads()
++            if tx == 0:
++                T.call_extern(
++                    "engram_release_rows_cta",
++                    T.address_of(control[0]),
++                    col_blocks * tokens,
++                    dtype="handle",
++                )
++
++    return engram_rows_step
++
++
+ def row_kernel_calls(
+     max_lookups: int,
+     shard_start: int,
+@@ -280,16 +451,14 @@ def row_kernel_calls(
+     _, _, count = column_span(columns)
+     extra = (out_cols,) if out_cols and out_cols != count else ()
+     return [
+-        prepare.call(engram_rows_wait_kernel),
+         prepare.call(
+-            engram_rows_gather_kernel,
++            engram_rows_step_kernel,
+             max_lookups,
+             shard_start,
+             shard_end,
+             columns,
+             *extra,
+         ),
+-        prepare.call(engram_rows_release_kernel),
+     ]
+ 
+ 
+@@ -310,17 +479,18 @@ def engram_rows_gather(
+     are the step's row IDs; ``rows``, ``scales`` and ``control`` are the reader's
+     mapped buffers; the rank owns the rows in [shard_start, shard_end) of the hash
+     columns in the mask ``columns``, every n-th from the first."""
+-    engram_rows_wait_kernel()(control)
+     tokens = out.shape[0]
+     if tokens:
+         _, _, count = column_span(columns)
+         stride_cols = out.shape[1] // ROW
+         extra = (stride_cols,) if stride_cols != count else ()
+-        kernel = engram_rows_gather_kernel(
++        kernel = engram_rows_step_kernel(
+             rows.shape[0], shard_start, shard_end, columns, *extra
+         )
+-        kernel(ids[:tokens], num_tokens, rows, scales, out)
+-    engram_rows_release_kernel()(control)
++        kernel(ids[:tokens], num_tokens, rows, scales, control, out)
++    else:
++        engram_rows_wait_kernel()(control)
++        engram_rows_release_kernel()(control)
+ 
+ 
+ @tilelang.jit(pass_configs={tilelang.PassConfigKey.TL_DISABLE_WARP_SPECIALIZED: True})
+-- 
+2.43.0
+

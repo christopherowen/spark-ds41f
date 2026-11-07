@@ -1,0 +1,16 @@
+First DGX4 kernel driver entry, before any GPU kernel or test container launch.
+Deployment: c3e8230413e623f14d0059b0f5d01699d262b915
+Source: 51c1a32cd78cfb0a14087e34dfcc06be30928a0e
+Command: python3 experiments/2026-11-06-ced-local-projection/run_gpu.py --source ../vllm --window dgx1-1793922629 --boot boot-1 --mode gates
+Failure: run_gpu.py telemetry(), line 55, float(fields[3]) raised
+ValueError: could not convert string to float: ' [N/A]'
+GB10 reports its memory clock as unavailable. Optional discrete-GPU telemetry
+fields now retain null and their raw text; temperature and host MemAvailable
+remain mandatory, with the original cooling and memory guards unchanged.
+
+Source staging before this entry: a shared clone of a cached vLLM tree lacked
+objects. Fetch failed with `pack has 454 unresolved deltas`; attempting to
+reconstruct from its advertised parent found unreadable blobs and failed git am.
+The incomplete tree was preserved as vllm-incomplete-cache. A fresh three-commit
+clone from the published source fork produced the exact expected head/tree and
+a clean working tree. No GPU work used the incomplete cache.

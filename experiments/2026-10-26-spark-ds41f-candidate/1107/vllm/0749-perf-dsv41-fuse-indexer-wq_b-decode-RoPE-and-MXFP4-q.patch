@@ -1,0 +1,643 @@
+From 0be23139a5d091dd541f192622ac0043f77cd2bb Mon Sep 17 00:00:00 2001
+From: Christopher Owen <3221756+christopherowen@users.noreply.github.com>
+Date: Fri, 6 Nov 2026 20:57:01 +0000
+Subject: [PATCH] perf(dsv41): fuse indexer wq_b decode RoPE and MXFP4
+ quantization
+
+Upstream base: 19f2c20ed4d64ae22bd009ceacadd85e2a81e354.
+Immediate base: a75357bba81e31e4f3085700f94b6a0b29aed44a.
+
+Fuse GPT-J interleaved RoPE on the trailing 64 columns of each 128-dim head and block-32 MXFP4 E2M1/UE8M0 quantization into the decode GEMM epilogue of indexer.wq_b (mxfp8_gemm_rope_mxfp4_decode).
+
+Stage the 16x128 BF16 output tile into C_shared aliasing A_shared at buf_dyn_shmem + 0 after a cross-warp barrier (zero extra dynamic shared memory: 38,016 B total, 2 CTAs/SM = 96 CTAs/wave on GB10). Each 16-lane half-warp processes one 32-column scale group in registers (one adjacent column pair per lane, 64 registers/thread, 0 bytes stack frame) and reduces amax across the 16 lanes via four __shfl_xor_sync butterfly steps. Epilogue row iterations are guarded by warp-uniform m < M checks. DeepseekV4Attention._index_query routes unconditionally through project_block32_rope_mxfp4_decode at decode row counts (rows <= 64), eliminating 42 quantize_mxfp4 kernel launches per decode step and the [rows, 32, 128] BF16 intermediate buffer.
+
+Quality: bit-identical (torch.equal on iq_data, iq_scale, and weights) to unfused wq_b followed by quantize_mxfp4 across all decode and verification batch sizes (rows in {1..48, 64}) in both eager and CUDA graph replay.
+
+Tests: pytest tests/models/test_deepseek_v4_1_attention.py tests/kernels/quantization/test_deepseek_v41_tilelang_linear.py (4 passed, 0 PDL violations) and 2-boot GPU container verification on GB10 (sp8).
+Upstream status: local SM121 TileLang kernel optimization; not applicable upstream.
+---
+ .../test_deepseek_v41_tilelang_linear.py      |  56 ++++
+ tests/models/test_deepseek_v4_1_attention.py  |  56 ++++
+ vllm/models/deepseek_v4_1/attention.py        |  44 +++-
+ vllm/models/deepseek_v4_1/tilelang/gemm.py    | 243 ++++++++++++++++++
+ vllm/models/deepseek_v4_1/tilelang/indexer.py |  19 +-
+ vllm/models/deepseek_v4_1/tilelang/linear.py  |  75 +++++-
+ 6 files changed, 461 insertions(+), 32 deletions(-)
+
+diff --git a/tests/kernels/quantization/test_deepseek_v41_tilelang_linear.py b/tests/kernels/quantization/test_deepseek_v41_tilelang_linear.py
+index d7086d574..b5c16fbb2 100644
+--- a/tests/kernels/quantization/test_deepseek_v41_tilelang_linear.py
++++ b/tests/kernels/quantization/test_deepseek_v41_tilelang_linear.py
+@@ -897,3 +897,59 @@ def test_packed_bf16_compressor_shapes_exact(parts, part_n, out_dtype, k=5120):
+     TileLangScaledLinearMethod(0.5).process_weights_after_loading(scaled_layer)
+     assert not hasattr(scaled_layer, "packed_bf16_exponent_base")
+     assert scaled_layer.weight.dtype == torch.bfloat16
++
++
++def test_mxfp8_gemm_rope_mxfp4_decode_matches_reference(default_vllm_config):
++    """Fused ``project_block32_rope_mxfp4_decode`` on ``indexer.wq_b`` (4096 x 1280,
++    32 heads x 128, trailing 64-dim GPT-J RoPE) matches ``wq_b`` + ``quantize_mxfp4``
++    bit for bit across all decode tile heights (16, 32, 64) and ignores poisoned
++    padding rows."""
++    from torch import nn
++
++    from vllm.models.deepseek_v4_1.tilelang.indexer import quantize_mxfp4
++    from vllm.models.deepseek_v4_1.tilelang.linear import (
++        TileLangBlock32Rows,
++        cast_mxfp8,
++        project_block32_rope_mxfp4_decode,
++        provide_mxfp8,
++    )
++    from vllm.v1.worker.workspace import use_preallocated_workspace
++
++    n, k, heads, head_dim, rope_dim = 4096, 1280, 32, 128, 64
++    weight, exps, _ = _block32_weight(n, k, 41)
++    layer = nn.Module()
++    layer.weight, layer.weight_scale_inv = weight, exps
++    proj = TileLangBlock32Rows(layer, 0)
++    proj.tilelang_mxfp8_input = True
++    proj.tilelang_rope_mxfp4 = (head_dim, rope_dim)
++    proj.declare_kernels()
++
++    gen = _gen(43)
++    x_all = torch.randn((64, k), generator=gen, device=DEVICE).bfloat16()
++    cos_sin = torch.randn((256, rope_dim), generator=gen, device=DEVICE, dtype=torch.float32)
++    pos_all = torch.randint(0, 256, (64,), generator=gen, device=DEVICE, dtype=torch.int64)
++    scratch = torch.empty(16 << 20, dtype=torch.uint8, device=DEVICE)
++
++    with use_preallocated_workspace(scratch):
++        for rows in (1, 2, 3, 4, 6, 8, 12, 16, 17, 24, 32, 33, 48, 64):
++            x = x_all[:rows]
++            pos = pos_all[:rows]
++            provided = cast_mxfp8(x)
++            # Poison padding rows past `rows` in the MXFP8 buffer.
++            if rows < provided.values.shape[0]:
++                provided.values[rows:].fill_(float("nan"))
++                provided.scales[rows:].fill_(0xFF)
++            with provide_mxfp8(provided):
++                iq_ref = proj(x).view(rows, heads, head_dim)
++            q_ref = torch.empty((rows, heads, head_dim // 2), dtype=torch.uint8, device=DEVICE)
++            s_ref = torch.empty((rows, heads, head_dim // 32), dtype=torch.uint8, device=DEVICE)
++            quantize_mxfp4(iq_ref, q_ref, s_ref, positions=pos, cos_sin=cos_sin)
++
++            q_out = torch.empty_like(q_ref)
++            s_out = torch.empty_like(s_ref)
++            with provide_mxfp8(provided):
++                project_block32_rope_mxfp4_decode(
++                    proj, x, pos, cos_sin, q_out, s_out
++                )
++            assert torch.equal(q_out, q_ref), f"q mismatch at rows={rows}"
++            assert torch.equal(s_out, s_ref), f"s mismatch at rows={rows}"
+diff --git a/tests/models/test_deepseek_v4_1_attention.py b/tests/models/test_deepseek_v4_1_attention.py
+index 5ea504c69..e25f715cb 100644
+--- a/tests/models/test_deepseek_v4_1_attention.py
++++ b/tests/models/test_deepseek_v4_1_attention.py
+@@ -248,6 +248,62 @@ def test_index_query_reuses_q_cast_and_fuses_rope_quantize(monkeypatch):
+     assert quant_calls == [("prefill", (5, 32, 128), [104, 105, 106, 107, 108])]
+ 
+ 
++def test_index_query_fuses_wqb_rope_mxfp4_decode(monkeypatch):
++    """At decode row counts (``rows <= tilelang_decode_rows``), ``_index_query`` runs
++    ``project_block32_rope_mxfp4_decode`` directly into ``(iq_data, iq_scale)`` without
++    allocating ``iq`` or launching ``_quantize_index_query``."""
++    from vllm.models.deepseek_v4_1.tilelang import linear as tl_linear
++    from vllm.models.deepseek_v4_1.tilelang.linear import MXFP8Rows
++
++    module = _tilelang_layer(layer_id=3)
++    fused_calls = []
++
++    def fake_wqb(x):
++        raise AssertionError("unfused wq_b should not be called on decode rows")
++
++    fake_wqb.tilelang_decode_rows = 64
++    fake_wqb.tilelang_decode_rope_mxfp4 = {16: object(), 32: object(), 64: object()}
++    module.indexer = SimpleNamespace(
++        heads=32,
++        wq_b=fake_wqb,
++        weights_proj=lambda h: torch.ones((h.shape[0], 32), dtype=torch.bfloat16),
++    )
++
++    def fake_fused(layer, qr_rows, pos_rows, cos_sin, iq_data, iq_scale):
++        provided = tl_linear.provided_mxfp8(qr_rows)
++        fused_calls.append(
++            (
++                layer is fake_wqb,
++                tuple(qr_rows.shape),
++                tuple(provided.values.shape),
++                pos_rows.tolist(),
++                tuple(iq_data.shape),
++                tuple(iq_scale.shape),
++            )
++        )
++        iq_data.fill_(7)
++        iq_scale.fill_(3)
++
++    monkeypatch.setattr(tl_linear, "project_block32_rope_mxfp4_decode", fake_fused)
++    qr = torch.zeros((6, 1280), dtype=torch.bfloat16)
++    q_cast = MXFP8Rows(
++        qr,
++        torch.zeros((64, 1280), dtype=torch.float8_e4m3fn),
++        torch.zeros((64, 40), dtype=torch.uint8),
++    )
++    positions = torch.arange(20, 26, dtype=torch.int64)
++    hidden = torch.zeros((6, 5120), dtype=torch.bfloat16)
++    swa = SimpleNamespace(is_decode=True)
++    iq_data, iq_scale, weights = module._index_query(
++        qr, positions, hidden, None, 0, 6, swa, q_cast
++    )
++    assert fused_calls == [
++        (True, (6, 1280), (64, 1280), [20, 21, 22, 23, 24, 25], (6, 32, 64), (6, 32, 4))
++    ]
++    assert int(iq_data.min()) == 7 and int(iq_scale.min()) == 3
++    assert weights.shape == (6, 32)
++
++
+ def test_prepare_global_kv_fuses_index_key_and_latent_writes(monkeypatch):
+     from vllm.models.deepseek_v4_1 import attention
+     from vllm.models.deepseek_v4_1.tilelang import attention as tl_attention
+diff --git a/vllm/models/deepseek_v4_1/attention.py b/vllm/models/deepseek_v4_1/attention.py
+index 310dff5b2..cf600a675 100644
+--- a/vllm/models/deepseek_v4_1/attention.py
++++ b/vllm/models/deepseek_v4_1/attention.py
+@@ -388,6 +388,7 @@ class DeepseekV4Indexer(nn.Module):
+         _native_linear(self.wq_b)
+         # Indexer Q-B reads the normalized q latent's MXFP8 cast alongside attention Q-B.
+         self.wq_b.tilelang_mxfp8_input = True
++        self.wq_b.tilelang_rope_mxfp4 = (128, hf.qk_rope_head_dim)
+         self.weights_proj = ReplicatedLinear(
+             hf.hidden_size,
+             hf.index_n_heads,
+@@ -1301,19 +1302,40 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase):
+             if q_cast is None
+             else kernels.slice_mxfp8(q_cast, first, last)
+         )
+-        with kernels.mxfp8_inputs(cast_rows):
+-            iq = self.indexer.wq_b(qr_rows).view(rows, h, 128)
+-        del cast_rows, q_cast
+         iq_data = torch.empty((rows, h, 64), dtype=torch.uint8, device=qr.device)
+         iq_scale = torch.empty((rows, h, 4), dtype=torch.uint8, device=qr.device)
+-        self._quantize_index_query(
+-            "decode" if swa.is_decode else "prefill",
+-            iq,
+-            iq_data,
+-            iq_scale,
+-            positions=positions[first:last],
+-        )
+-        del iq
++        pos_rows = positions[first:last]
++        if (
++            rows <= getattr(self.indexer.wq_b, "tilelang_decode_rows", 0)
++            and hasattr(self.indexer.wq_b, "tilelang_decode_rope_mxfp4")
++            and "_quantize_index_query" not in self.__dict__
++        ):
++            from vllm.models.deepseek_v4_1.tilelang.linear import (
++                project_block32_rope_mxfp4_decode,
++            )
++
++            with kernels.mxfp8_inputs(cast_rows):
++                project_block32_rope_mxfp4_decode(
++                    self.indexer.wq_b,
++                    qr_rows,
++                    pos_rows,
++                    self.rotary_emb.cos_sin_cache,
++                    iq_data,
++                    iq_scale,
++                )
++            del cast_rows, q_cast
++        else:
++            with kernels.mxfp8_inputs(cast_rows):
++                iq = self.indexer.wq_b(qr_rows).view(rows, h, 128)
++            del cast_rows, q_cast
++            self._quantize_index_query(
++                "decode" if swa.is_decode else "prefill",
++                iq,
++                iq_data,
++                iq_scale,
++                positions=pos_rows,
++            )
++            del iq
+         # The BF16 head-weight projection runs on every row: its GEMV rounds
+         # differently at another row count, which would move top-k selections.
+         # The FP8 wq_b quantizes per row and does not depend on the row count.
+diff --git a/vllm/models/deepseek_v4_1/tilelang/gemm.py b/vllm/models/deepseek_v4_1/tilelang/gemm.py
+index 80b8461e5..c2443adcb 100644
+--- a/vllm/models/deepseek_v4_1/tilelang/gemm.py
++++ b/vllm/models/deepseek_v4_1/tilelang/gemm.py
+@@ -413,6 +413,249 @@ mxfp8_gemm_partials = tilelang.jit(
+ )(_mxfp8_gemm_partials)
+ 
+ 
++def _e2m1_code(x):
++    """Nearest-even E2M1 code of FP32 ``x``, saturating at 6 (``cvt.rn.satfinite``)."""
++    m = T.abs(x)
++    # Ties go to the even code: strict at even-lower midpoints, inclusive at odd.
++    code = (
++        T.cast(m > 0.25, T.int32)
++        + T.cast(m >= 0.75, T.int32)
++        + T.cast(m > 1.25, T.int32)
++        + T.cast(m >= 1.75, T.int32)
++        + T.cast(m > 2.5, T.int32)
++        + T.cast(m >= 3.5, T.int32)
++        + T.cast(m > 5.0, T.int32)
++    )
++    sign = T.cast(T.shift_right(T.reinterpret(x, T.uint32), 31), T.int32)
++    return code | (sign << 3)
++
++
++def _mxfp8_gemm_rope_mxfp4_decode(
++    N: int,
++    K: int,
++    head_dim: int = 128,
++    rope_dim: int = 64,
++    block_M: int = 16,
++    block_N: int = 128,
++    block_K: int = 128,
++    num_stages: int = 2,
++    threads: int = 256,
++    padded_rows: bool = True,
++    swizzle_panel: int = 0,
++    tile_contiguous: bool = False,
++    ratio: int = 1,
++):
++    """Decode MXFP8 GEMM fused with GPT-J interleaved RoPE and MXFP4 quantization.
++
++    Computes ``C[M, N] = bf16((A * SFA) @ (B * SFB)^T)``, rotates the trailing
++    ``rope_dim`` columns of each ``head_dim``-wide head in registers at
++    ``Positions``, and quantizes each 32-element group to packed E2M1 ``Q``
++    (``[M, N // 2]`` uint8) and UE8M0 scales ``S`` (``[M, N // 32]`` uint8),
++    matching ``mxfp8_gemm_decode`` followed by ``mxfp4_quantize_v41`` bit for
++    bit.
++
++    ``C_shared`` aliases ``A_shared`` after the K loop (zero additional dynamic
++    shared memory). In the epilogue, each 16-lane half-warp processes one
++    32-column group in parallel (one pair of adjacent columns per lane),
++    reducing ``amax`` across the 16 lanes via four ``__shfl_xor_sync`` steps.
++    """
++    assert K % block_K == 0 and block_K % 64 == 0, (
++        "block_K must divide K and be a multiple of 64"
++    )
++    assert N % block_N == 0 and block_N % SF_BLOCK == 0, (
++        "block_N must divide N and be a multiple of 32"
++    )
++    assert (
++        head_dim % SF_BLOCK == 0
++        and 0 < rope_dim <= head_dim
++        and rope_dim % SF_BLOCK == 0
++    ), "head_dim and rope_dim must be multiples of 32"
++    pairs_per_row = block_N // 2
++    assert (
++        threads % pairs_per_row == 0
++        and block_M % (threads // pairs_per_row) == 0
++    ), "threads must cover whole rows of column pairs"
++    k_blocks = K // block_K
++    M = T.dynamic("M")
++    Mp = T.dynamic("Mp") if padded_rows else M
++    max_pos = T.dynamic("max_pos")
++    in_dtype = T.float8_e4m3fn
++    accum_dtype = T.float32
++    sf_words = scale_words(K)
++    block_words = block_scale_words(block_K)
++    if tile_contiguous:
++        assert N % TILE_WEIGHT_N == 0 and K % TILE_WEIGHT_K == 0
++        assert TILE_WEIGHT_N % block_N == 0 and block_K % TILE_WEIGHT_K == 0
++    k_tiles = K // TILE_WEIGHT_K
++    sub_tiles_k = block_K // TILE_WEIGHT_K
++    b_shape = (N * k_tiles, TILE_WEIGHT_K) if tile_contiguous else (N, K)
++    half_n = N // 2
++    scale_n = N // SF_BLOCK
++    rope_start = head_dim - rope_dim
++    rope_half = rope_dim // 2
++    half = SF_BLOCK // 2
++    rows_per_iter = threads // pairs_per_row
++    iters = block_M // rows_per_iter
++
++    @T.prim_func
++    def gemm_mxfp8_rope_mxfp4(
++        A: T.Tensor((Mp, K), in_dtype),
++        B: T.Tensor(b_shape, in_dtype),
++        SFA: T.Tensor((Mp, sf_words), T.uint32),
++        SFB: T.Tensor((N // 32, sf_words), T.uint32),
++        Positions: T.Tensor((M,), T.int64),
++        CosSin: T.Tensor((max_pos, rope_dim), T.float32),
++        Q: T.Tensor((M, half_n), T.uint8),
++        S: T.Tensor((M, scale_n), T.uint8),
++    ):
++        with T.Kernel(
++            T.ceildiv(N, block_N), T.ceildiv(M, block_M), threads=threads
++        ) as (bx, by):
++            if swizzle_panel:
++                T.use_swizzle(panel_size=swizzle_panel)
++            pdl.chain()
++            tx = T.get_thread_binding()
++            A_shared = T.alloc_shared((block_M, block_K), in_dtype)
++            B_shared = T.alloc_shared((block_N, block_K), in_dtype)
++            SFA_shared = T.alloc_shared((block_M, block_words), T.uint32)
++            SFB_shared = T.alloc_shared((block_N, block_words), T.uint32)
++            C_shared = T.alloc_shared((block_M, block_N), T.bfloat16)
++            C_local = T.alloc_fragment((block_M, block_N), accum_dtype)
++            T.clear(C_local)
++            for ko in T.Pipelined(k_blocks, num_stages=num_stages):
++                if padded_rows:
++                    for i, k in T.Parallel(block_M, block_K):
++                        A_shared[i, k] = A[
++                            T.min(by * block_M + i, M - 1),
++                            ko * block_K + k,
++                        ]
++                else:
++                    T.copy(A[by * block_M, ko * block_K], A_shared)
++                if not tile_contiguous:
++                    T.copy(B[bx * block_N, ko * block_K], B_shared)
++                elif sub_tiles_k == 1:
++                    row0 = (
++                        ((bx * block_N // TILE_WEIGHT_N) * k_tiles + ko) * TILE_WEIGHT_N
++                        + (bx * block_N % TILE_WEIGHT_N)
++                    )
++                    T.copy(B[row0, 0], B_shared)
++                else:
++                    for sub_k in T.serial(sub_tiles_k):
++                        row0 = (
++                            (
++                                (bx * block_N // TILE_WEIGHT_N) * k_tiles
++                                + ko * sub_tiles_k
++                                + sub_k
++                            )
++                            * TILE_WEIGHT_N
++                            + (bx * block_N % TILE_WEIGHT_N)
++                        )
++                        T.copy(
++                            B[row0 : row0 + block_N, 0:TILE_WEIGHT_K],
++                            B_shared[
++                                0:block_N,
++                                sub_k * TILE_WEIGHT_K : (sub_k + 1) * TILE_WEIGHT_K,
++                            ],
++                        )
++                word0 = ko * block_K // SF_WORD_K
++                for i, w in T.Parallel(block_M, block_words):
++                    SFA_shared[i, w] = SFA[
++                        T.min(by * block_M + i, M - 1),
++                        T.min(word0 + w, sf_words - 1),
++                    ]
++                for j, w in T.Parallel(block_N, block_words):
++                    row = T.min(bx * block_N + j, N - 1)
++                    SFB_shared[j, w] = SFB[
++                        row // 32,
++                        T.min(word0 + w, sf_words - 1),
++                    ]
++                T.mma_gemm_blockscaled(
++                    A_shared,
++                    B_shared,
++                    C_local,
++                    SFA_shared,
++                    SFB_shared,
++                    transpose_B=True,
++                    k_start=ko * block_K % SF_WORD_K,
++                    sf_a_granularity_k=SF_BLOCK,
++                    sf_b_granularity_k=SF_BLOCK,
++                )
++
++            T.sync_threads()
++            T.copy(C_local, C_shared)
++            col_pair = tx % pairs_per_row
++            row_in_iter = tx // pairs_per_row
++            g = col_pair // half
++            p = tx % half
++            col0 = bx * block_N + g * SF_BLOCK
++            in_head = col0 % head_dim
++            c0 = 2 * col_pair
++
++            v0 = T.alloc_var(T.float32)
++            v1 = T.alloc_var(T.float32)
++            pos = T.alloc_var(T.int64)
++            cosine = T.alloc_var(T.float32)
++            sine = T.alloc_var(T.float32)
++            amax = T.alloc_var(T.float32)
++            bits = T.alloc_var(T.uint32)
++            sf = T.alloc_var(T.int32)
++            scale = T.alloc_var(T.float32)
++            sv0 = T.alloc_var(T.float32)
++            sv1 = T.alloc_var(T.float32)
++            c_lo = T.alloc_var(T.int32)
++            c_hi = T.alloc_var(T.int32)
++
++            for it in T.serial(iters):
++                row_local = it * rows_per_iter + row_in_iter
++                m = by * block_M + row_local
++                if m < M:
++                    v0 = T.cast(C_shared[row_local, c0], T.float32)
++                    v1 = T.cast(C_shared[row_local, c0 + 1], T.float32)
++                    if in_head >= rope_start:
++                        pos = (
++                            Positions[m] // ratio * ratio
++                            if ratio > 1
++                            else Positions[m]
++                        )
++                        pair_base = (in_head - rope_start) // 2
++                        cosine = CosSin[pos, pair_base + p]
++                        sine = CosSin[pos, rope_half + pair_base + p]
++                        r0 = T.cast(T.ieee_fmaf(v0, cosine, -(v1 * sine)), T.bfloat16)
++                        r1 = T.cast(T.ieee_fmaf(v0, sine, v1 * cosine), T.bfloat16)
++                        v0 = T.cast(r0, T.float32)
++                        v1 = T.cast(r1, T.float32)
++                    amax = T.max(
++                        T.float32(6.0 * 2.0**-126),
++                        T.max(T.abs(v0), T.abs(v1)),
++                    )
++                    amax = T.max(amax, T.shfl_xor(amax, 8))
++                    amax = T.max(amax, T.shfl_xor(amax, 4))
++                    amax = T.max(amax, T.shfl_xor(amax, 2))
++                    amax = T.max(amax, T.shfl_xor(amax, 1))
++
++                    bits = T.reinterpret(T.fmul(amax, T.float32(1.0 / 6.0)), T.uint32)
++                    sf = T.cast(T.shift_right(bits, 23) & 0xFF, T.int32) + T.cast(
++                        (bits & 0x7FFFFF) != 0, T.int32
++                    )
++                    scale = T.reinterpret(
++                        T.cast(T.shift_left(254 - sf, 23), T.uint32), T.float32
++                    )
++                    sv0 = T.fmul(v0, scale)
++                    sv1 = T.fmul(v1, scale)
++                    c_lo = _e2m1_code(sv0)
++                    c_hi = _e2m1_code(sv1)
++                    Q[m, col0 // 2 + p] = T.cast(c_lo | (c_hi << 4), T.uint8)
++                    if p == 0:
++                        S[m, col0 // SF_BLOCK] = T.cast(sf, T.uint8)
++
++    return gemm_mxfp8_rope_mxfp4
++
++
++mxfp8_gemm_rope_mxfp4_decode = tilelang.jit(
++    pass_configs={tilelang.PassConfigKey.TL_DISABLE_WARP_SPECIALIZED: True}
++)(_mxfp8_gemm_rope_mxfp4_decode)
++
++
+ @tilelang.jit
+ def splitk_reduce(
+     N: int,
+diff --git a/vllm/models/deepseek_v4_1/tilelang/indexer.py b/vllm/models/deepseek_v4_1/tilelang/indexer.py
+index 769ef4c77..f8bc3fa91 100644
+--- a/vllm/models/deepseek_v4_1/tilelang/indexer.py
++++ b/vllm/models/deepseek_v4_1/tilelang/indexer.py
+@@ -47,7 +47,7 @@ import tilelang.language as T
+ import torch
+ 
+ from . import pdl, prepare
+-from .gemm import SF_BLOCK
++from .gemm import SF_BLOCK, _e2m1_code
+ 
+ INDEX_HEADS = 32
+ INDEX_DIM = 128
+@@ -411,23 +411,6 @@ def indexer_score_v41(
+     return indexer_score
+ 
+ 
+-def _e2m1_code(x):
+-    """Nearest-even E2M1 code of FP32 ``x``, saturating at 6 (``cvt.rn.satfinite``)."""
+-    m = T.abs(x)
+-    # Ties go to the even code: strict at even-lower midpoints, inclusive at odd.
+-    code = (
+-        T.cast(m > 0.25, T.int32)
+-        + T.cast(m >= 0.75, T.int32)
+-        + T.cast(m > 1.25, T.int32)
+-        + T.cast(m >= 1.75, T.int32)
+-        + T.cast(m > 2.5, T.int32)
+-        + T.cast(m >= 3.5, T.int32)
+-        + T.cast(m > 5.0, T.int32)
+-    )
+-    sign = T.cast(T.shift_right(T.reinterpret(x, T.uint32), 31), T.int32)
+-    return code | (sign << 3)
+-
+-
+ def _mxfp4_byte(vals, first, scale):
+     """Two scaled values ``vals[first : first + 2]`` packed low nibble first."""
+     lo = _e2m1_code(T.fmul(T.cast(vals[first], T.float32), scale))
+diff --git a/vllm/models/deepseek_v4_1/tilelang/linear.py b/vllm/models/deepseek_v4_1/tilelang/linear.py
+index 7292175bd..0b14d7bba 100644
+--- a/vllm/models/deepseek_v4_1/tilelang/linear.py
++++ b/vllm/models/deepseek_v4_1/tilelang/linear.py
+@@ -55,6 +55,7 @@ from .gemm import (
+     fp8_prefill_config,
+     mxfp8_gemm,
+     mxfp8_gemm_decode,
++    mxfp8_gemm_rope_mxfp4_decode,
+     mxfp8_gemm_partials,
+     pack_scale_words,
+     pack_weight_tiles,
+@@ -63,6 +64,7 @@ from .gemm import (
+     packed_bf16_gemm_splitk,
+     packed_bf16_gemm_two,
+     packed_bf16_unpack,
++    pick_block_K,
+     scale_words,
+     split_bucket,
+     split_row_tile,
+@@ -508,6 +510,56 @@ def _bf16_linear_shards(
+             layer.tilelang_gemm(x, w_s, out[s, :rows])
+ 
+ 
++def project_block32_rope_mxfp4_decode(
++    layer: nn.Module,
++    x: torch.Tensor,
++    positions: torch.Tensor,
++    cos_sin: torch.Tensor,
++    q_out: torch.Tensor,
++    s_out: torch.Tensor,
++) -> None:
++    """Project ``x`` through a block-32 FP8 layer at decode rows and fuse
++    GPT-J RoPE + MXFP4 quantization directly into ``q_out`` and ``s_out``."""
++    k = layer.weight.shape[1]
++    rows = x.numel() // k if x.ndim != 2 else x.shape[0]
++    if rows == 0:
++        return
++    if x.ndim != 2:
++        x = x.reshape(rows, k)
++    provided = (
++        provided_mxfp8(x)
++        if getattr(layer, "tilelang_mxfp8_input", False)
++        else optional_provided_mxfp8(x)
++    )
++    if provided is not None:
++        xq, sf = provided.values, provided.scales
++    else:
++        xq, sf = _scratch(
++            _activation_specs(rows, k, layer.tilelang_decode_rows),
++            current_preallocated_workspace(),
++        )
++        pdl.per_token_cast(
++            x,
++            "e4m3",
++            SF_BLOCK,
++            round_sf=True,
++            use_packed_ue8m0=True,
++            out=(xq[:rows], sf[:rows]),
++        )
++    weight = getattr(layer, "tilelang_weight", layer.weight)
++    gemm = layer.tilelang_decode_rope_mxfp4
++    gemm(
++        xq,
++        weight,
++        sf.view(torch.uint32),
++        layer.tilelang_weight_sf,
++        positions,
++        cos_sin,
++        q_out.view(rows, -1),
++        s_out.view(rows, -1),
++    )
++
++
+ def project_bf16_partials(layer: nn.Module, x: torch.Tensor) -> torch.Tensor:
+     """Project ``x`` through a BF16 layer, returning 3D FP32 split-K ``partials``
+     (``[shards, rows, N]``) at decode sizes so a fused consumer (``norm_rope_write_index_keys``)
+@@ -531,7 +583,9 @@ def project_bf16_partials(layer: nn.Module, x: torch.Tensor) -> torch.Tensor:
+     return out
+ 
+ 
+-def _block32_kernels(n: int, k: int, groups: int = 1) -> dict:
++def _block32_kernels(
++    n: int, k: int, groups: int = 1, *, rope_mxfp4: tuple[int, int] | None = None
++) -> dict:
+     """Every kernel of a block-32 FP8 projection of an E4M3 ``[n, k]`` weight, as the
+     calls ``_bind_block32`` makes.
+ 
+@@ -564,7 +618,7 @@ def _block32_kernels(n: int, k: int, groups: int = 1) -> dict:
+         if groups == 1 and (n, k) in TILE_CONTIGUOUS_FP8
+         else {}
+     )
+-    return {
++    out = {
+         "decode": {
+             block_M: prepare.call(
+                 mxfp8_gemm_decode,
+@@ -586,6 +640,19 @@ def _block32_kernels(n: int, k: int, groups: int = 1) -> dict:
+             **tile_kw,
+         ),
+     }
++    if rope_mxfp4 is not None:
++        head_dim, rope_dim = rope_mxfp4
++        out["decode_rope_mxfp4"] = prepare.call(
++            mxfp8_gemm_rope_mxfp4_decode,
++            part,
++            k,
++            head_dim=head_dim,
++            rope_dim=rope_dim,
++            block_K=pick_block_K(k),
++            padded_rows=True,
++            **tile_kw,
++        )
++    return out
+ 
+ 
+ def _calls(kernels: dict) -> list[prepare.TileLangCall]:
+@@ -664,7 +731,9 @@ def _declare_block32(layer, groups: int = 1, cast: bool = True) -> None:
+         layer.tilelang_shards = 1
+         layer.tilelang_mxfp8_input = getattr(layer, "tilelang_mxfp8_input", False)
+         return
+-    kernels = _block32_kernels(n, k, groups)
++    kernels = _block32_kernels(
++        n, k, groups, rope_mxfp4=getattr(layer, "tilelang_rope_mxfp4", None)
++    )
+     part_n = (
+         getattr(layer, "part_output_size", 0)
+         if getattr(layer, "tp_size", 1) > 1 and groups == 1
+-- 
+2.43.0
+

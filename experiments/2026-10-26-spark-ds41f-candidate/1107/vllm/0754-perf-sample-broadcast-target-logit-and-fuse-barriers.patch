@@ -1,0 +1,211 @@
+From 6f4e44f5e491de2bc3ca53aff84956471418cd75 Mon Sep 17 00:00:00 2001
+From: Christopher Owen <3221756+christopherowen@users.noreply.github.com>
+Date: Fri, 6 Nov 2026 22:25:17 +0000
+Subject: [PATCH] perf(sample): broadcast target logit and fuse barriers in
+ topk_log_softmax
+
+Upstream base: 19f2c20ed4d64ae22bd009ceacadd85e2a81e354.
+
+Rationale:
+1. In topk_log_softmax_kernel(..., include_ranks=True), load
+   selected_rank_shared[0] once on thread 0 overlapped with the initial global
+   vector read and broadcast it through shared memory at the first barrier
+   instead of issuing 1,024 independent indexed global reads.
+2. Accumulate rank_count inside fold_max (where ALU is otherwise idle behind
+   memory loads) and warp-reduce rank_count into rank_partial before
+   fold_max's block barrier, and fuse se + ties block reduction into a single
+   _row_reduce_pair barrier so include_ranks=True uses 3 T.sync_threads()
+   barriers total (zero extra block barriers compared to include_ranks=False).
+3. In standalone ranks_kernel, hoist the optional write_scores store before the
+   vocabulary scan loop so score-write registers are released before the rank
+   loop.
+
+Quality:
+Bit-identical torch.equal prompt logprob ranks and top-k log-softmax values and
+indices across FP32, FP16, and BF16 inputs, non-finite values, ties, and
+arbitrary vocabulary sizes.
+
+Tests:
+115/115 logprob, topk_log_softmax, and prompt logprob chunking tests pass
+across 2 GPU boots on GB10, and all 10/10 PR #912 prompt logprob benchmark
+cases clear the 2-boot speedup gate (-0.16% to -41.78%).
+
+Upstream status:
+Local TileLang sampler optimization for spark-ds41f.
+---
+ vllm/v1/worker/gpu/sample/tilelang_logprob.py | 95 +++++++++++++------
+ 1 file changed, 66 insertions(+), 29 deletions(-)
+
+diff --git a/vllm/v1/worker/gpu/sample/tilelang_logprob.py b/vllm/v1/worker/gpu/sample/tilelang_logprob.py
+index 933b31464..13ae89378 100644
+--- a/vllm/v1/worker/gpu/sample/tilelang_logprob.py
++++ b/vllm/v1/worker/gpu/sample/tilelang_logprob.py
+@@ -108,9 +108,6 @@ def ranks_kernel(
+                     counts[col] += T.cast(
+                         (index < vocab) & (value >= selected[0]), "int32"
+                     )
+-            T.reduce_sum(counts, total, dim=0)
+-            output[row] = T.cast(total[0], "int64")
+-
+             if write_scores:
+                 for group in T.serial(T.ceildiv(columns, threads)):
+                     col = group * threads + T.get_thread_binding()
+@@ -118,6 +115,8 @@ def ranks_kernel(
+                         scores[row, col] = T.cast(
+                             logits[T.cast(row, T.int64), ids[row, col]], T.float32
+                         )
++            T.reduce_sum(counts, total, dim=0)
++            output[row] = T.cast(total[0], "int64")
+ 
+     if write_scores:
+ 
+@@ -247,6 +246,27 @@ def _row_reduce(value, partial, tx, combine):
+         value[0] = T.call_extern("float32", combine, value[0], partial[w])
+ 
+ 
++@T.macro
++def _row_reduce_pair(val_a, part_a, val_b, part_b, tx, combine):
++    """Reduce two independent block scalars across warps in one barrier."""
++    for distance in (16, 8, 4, 2, 1):
++        val_a[0] = T.call_extern(
++            "float32", combine, val_a[0], T.shfl_xor(val_a[0], distance)
++        )
++        val_b[0] = T.call_extern(
++            "float32", combine, val_b[0], T.shfl_xor(val_b[0], distance)
++        )
++    if tx % 32 == 0:
++        part_a[tx // 32] = val_a[0]
++        part_b[tx // 32] = val_b[0]
++    T.sync_threads()
++    val_a[0] = part_a[0]
++    val_b[0] = part_b[0]
++    for w in tuple(range(1, _SOFTMAX_WARPS)):
++        val_a[0] = T.call_extern("float32", combine, val_a[0], part_a[w])
++        val_b[0] = T.call_extern("float32", combine, val_b[0], part_b[w])
++
++
+ @tilelang.jit(pass_configs=tilelang_sampling._PASS)
+ def topk_log_softmax_kernel(
+     logits_dtype: str,
+@@ -349,17 +369,23 @@ def topk_log_softmax_kernel(
+         with T.Kernel(rows, threads=threads) as row:
+             T.import_source(_HEADER)
+             tx = T.get_thread_binding()
+-            if include_ranks:
+-                selected_rank = T.alloc_local((1,), T.float32)
+-                rank_count = T.alloc_local((1,), T.int32)
+-                rank_count[0] = 0
+-                selected_rank[0] = T.cast(logits[row, token_ids[row, 0]], T.float32)
+             if prefetch_ids:
+                 T.assume(topk <= threads)
+                 # Reuse the reduction barriers; each thread later reads its own slot.
+                 selected = T.alloc_shared((threads,), T.float32)
+                 if tx < topk:
+                     selected[tx] = T.cast(logits[row, token_ids[row, tx]], T.float32)
++            elif include_ranks:
++                selected_rank_shared = T.alloc_shared((1,), T.float32)
++                if tx == 0:
++                    selected_rank_shared[0] = T.cast(
++                        logits[row, token_ids[row, 0]], T.float32
++                    )
++            if include_ranks:
++                selected_rank = T.alloc_local((1,), T.float32)
++                rank_count = T.alloc_local((1,), T.int32)
++                rank_count[0] = 0
++                rank_partial = T.alloc_shared((_SOFTMAX_WARPS,), T.int32)
+             raw = T.alloc_local((per,), logits_dtype)
+             peak = T.alloc_local((loads,), T.float32)
+             total = T.alloc_local((loads,), T.float32)
+@@ -385,6 +411,11 @@ def topk_log_softmax_kernel(
+                 peak[u] = -T.infinity(T.float32)
+             if guarded:
+                 load(logits, raw, row, full, tx, True)
++                if include_ranks:
++                    T.sync_threads()
++                    selected_rank[0] = (
++                        selected[0] if prefetch_ids else selected_rank_shared[0]
++                    )
+                 fold_max(
+                     raw,
+                     peak,
+@@ -394,6 +425,11 @@ def topk_log_softmax_kernel(
+                     selected_rank if include_ranks else best,
+                     rank_count if include_ranks else best,
+                 )
++            elif include_ranks:
++                T.sync_threads()
++                selected_rank[0] = (
++                    selected[0] if prefetch_ids else selected_rank_shared[0]
++                )
+             for step in T.serial(full):
+                 load(logits, raw, row, full - 1 - step, tx, False)
+                 fold_max(
+@@ -408,8 +444,25 @@ def topk_log_softmax_kernel(
+             best[0] = peak[0]
+             for u in tuple(range(1, loads)):
+                 best[0] = T.call_extern("float32", "vllm_max", best[0], peak[u])
++            if include_ranks:
++                for delta in (16, 8, 4, 2, 1):
++                    rank_count[0] += T.call_extern(
++                        "int32",
++                        "__shfl_xor_sync",
++                        T.uint32(0xFFFFFFFF),
++                        rank_count[0],
++                        delta,
++                    )
++                if tx % 32 == 0:
++                    rank_partial[tx // 32] = rank_count[0]
+             _row_reduce(best, max_partial, tx, "vllm_max")
+             maximum = T.alloc_var(T.float32, init=best[0])
++            if include_ranks:
++                if tx == 0:
++                    count = T.alloc_var(T.int32, init=0)
++                    for warp in T.unroll(_SOFTMAX_WARPS):
++                        count += rank_partial[warp]
++                    ranks[row] = T.cast(count, T.int64)
+ 
+             # S: the other columns' exponentials, a thread's sums in step order,
+             # folded in load order, then the block's; and the maximum's ties.
+@@ -427,8 +480,11 @@ def topk_log_softmax_kernel(
+             for u in tuple(range(1, loads)):
+                 se[0] = T.call_extern("float32", "vllm_add", se[0], total[u])
+                 ties[0] = T.call_extern("float32", "vllm_add", ties[0], tally[u])
+-            _row_reduce(se, sum_partial, tx, "vllm_add")
+-            _row_reduce(ties, tie_partial, tx, "vllm_add")
++            if include_ranks:
++                _row_reduce_pair(se, sum_partial, ties, tie_partial, tx, "vllm_add")
++            else:
++                _row_reduce(se, sum_partial, tx, "vllm_add")
++                _row_reduce(ties, tie_partial, tx, "vllm_add")
+             # The log-sum-exp past the maximum, log1p(S).
+             lse = T.alloc_var(
+                 T.float32,
+@@ -439,25 +495,6 @@ def topk_log_softmax_kernel(
+                 ),
+             )
+ 
+-            if include_ranks:
+-                rank_partial = T.alloc_shared((_SOFTMAX_WARPS,), T.int32)
+-                for delta in (16, 8, 4, 2, 1):
+-                    rank_count[0] += T.call_extern(
+-                        "int32",
+-                        "__shfl_xor_sync",
+-                        T.uint32(0xFFFFFFFF),
+-                        rank_count[0],
+-                        delta,
+-                    )
+-                if tx % 32 == 0:
+-                    rank_partial[tx // 32] = rank_count[0]
+-                T.sync_threads()
+-                if tx == 0:
+-                    count = T.alloc_var(T.int32, init=0)
+-                    for warp in T.unroll(_SOFTMAX_WARPS):
+-                        count += rank_partial[warp]
+-                    ranks[row] = T.cast(count, T.int64)
+-
+             # The selected tokens, 1024 at a time. Row offsets are 64-bit.
+             row64 = T.cast(row, T.int64)
+             for c in T.serial(T.ceildiv(topk, threads)):
+-- 
+2.43.0
+

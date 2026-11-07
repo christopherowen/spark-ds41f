@@ -1,0 +1,1193 @@
+From 7ea84a1b1e175b1e6fb78124593b4feb0e78dcb4 Mon Sep 17 00:00:00 2001
+From: Christopher Owen <3221756+christopherowen@users.noreply.github.com>
+Date: Fri, 6 Nov 2026 20:39:10 +0000
+Subject: [PATCH] Prefer useful CopyDrafts continuations and prune aligned
+ suffix search
+
+Rank longest-level matches by available continuation length (1..lookahead)
+before recency, stop backward suffix search once any lane in the warp
+finds a full-continuation match at the current longest level, advance each
+warp's required match length across lanes as shorter levels are matched and
+probe the anchor tokens at need_len and need_len // 2 before walking a
+candidate suffix, gate copy replacement in copy_apply against DSpark's
+expected yield (offered * estimate >= sum(dspark_confidences[r, :block]))
+while clearing pending copy state when DSpark wins, keep the two-stage
+32-element aligned forward-coalesced tile scan in copy_match_kernel with
+priority decoding in copy_alloc_kernel, and grow the adaptive draft cap
+from 1 -> 8 -> 16 on clean full-hit acceptance.
+Upstream base: a75357bba81e31e4f3085700f94b6a0b29aed44a
+Rationale: Rank longest-level CopyDrafts matches by continuation length before recency, stop backward suffix search once any lane hits a full-continuation longest match, prune shorter-level scans with warp-min need_len and 2-token anchor probes, and gate copy replacement against DSpark expected yield.
+Quality: Restores 8->16 adaptive copy drafts on repetitive tails, cuts 1M-token suffix scans by 28-90x, and prevents low-yield copy proposals from clobbering higher-expected-yield DSpark drafts.
+Tests: pytest tests/v1/spec_decode/test_copy_drafts.py and benchmark_copy_drafts.py --gate across 2 fresh container boots.
+Upstream status: Local CopyDrafter suffix-search and expected-yield optimization.
+---
+ benchmarks/kernels/benchmark_copy_drafts.py   |  15 +-
+ tests/v1/spec_decode/test_copy_drafts.py      | 478 ++++++++++++++----
+ vllm/config/speculative.py                    |   6 +-
+ vllm/v1/worker/gpu/spec_decode/copy_drafts.py |  51 +-
+ .../worker/gpu/spec_decode/tilelang_copy.py   | 231 ++++++---
+ 5 files changed, 583 insertions(+), 198 deletions(-)
+
+diff --git a/benchmarks/kernels/benchmark_copy_drafts.py b/benchmarks/kernels/benchmark_copy_drafts.py
+index e51dc90d4..17b7e63c0 100644
+--- a/benchmarks/kernels/benchmark_copy_drafts.py
++++ b/benchmarks/kernels/benchmark_copy_drafts.py
+@@ -101,6 +101,10 @@ def copy_case(num_reqs, context, uva):
+     dspark = torch.zeros((num_reqs, BLOCK), dtype=torch.int64, device="cuda")
+     dconf = torch.full((num_reqs, BLOCK), 0.5, device="cuda")
+     ones = torch.ones(num_reqs, dtype=torch.int32, device="cuda")
++    chosen = torch.empty(
++        (num_reqs, tilelang_copy.CHOSEN_COLUMNS), dtype=torch.int32, device="cuda"
++    )
++    estimates = torch.empty(num_reqs, dtype=torch.float32, device="cuda")
+     outs = (
+         torch.empty((num_reqs, LOOKAHEAD), dtype=torch.int64, device="cuda"),
+         torch.empty((num_reqs, LOOKAHEAD), device="cuda"),
+@@ -109,10 +113,13 @@ def copy_case(num_reqs, context, uva):
+     )
+ 
+     def launch():
+-        tilelang_copy.copy_match(idx, history, total_len, sources, MIN_MATCH)
+-        tilelang_copy.copy_select(
+-            idx, history, total_len, sources, dspark, dconf, ones, ones, ones,
+-            int_state, float_state, *outs, MIN_MATCH, INITIAL,
++        tilelang_copy.copy_match(idx, history, total_len, sources, MIN_MATCH, LOOKAHEAD)
++        tilelang_copy.copy_alloc(
++            idx, total_len, sources, ones, ones, ones, int_state, float_state,
++            chosen, estimates, outs[3], MIN_MATCH, LOOKAHEAD, BLOCK, INITIAL,
++        )  # fmt: skip
++        tilelang_copy.copy_apply(
++            idx, history, chosen, estimates, int_state, dspark, dconf, *outs[:3],
+         )  # fmt: skip
+ 
+     median, low = timed(launch)
+diff --git a/tests/v1/spec_decode/test_copy_drafts.py b/tests/v1/spec_decode/test_copy_drafts.py
+index ffbcadd83..24ccd43cb 100644
+--- a/tests/v1/spec_decode/test_copy_drafts.py
++++ b/tests/v1/spec_decode/test_copy_drafts.py
+@@ -5,8 +5,8 @@ references, the proposer (``spec_decode.copy_drafts.CopyDrafter``) against the
+ design's walk, and temperature-0 output with and without copy drafts.
+ 
+ - ``copy_match``/``copy_alloc``/``copy_apply`` against references written from
+-  the definition: the latest earlier window end whose preceding tokens equal the
+-  context's tail, at the longest level that has one; the copy state's update,
++  the definition: the strongest suffix match, preferring a full continuation,
++  then recency; short-only matches remain available; the copy state's update,
+   the allocation and the proposal.
+   Contexts from 1 token to past two of the match grid's passes, vocabularies of
+   3 to 129280 tokens (few to rare matches), batches in any slot order.
+@@ -14,9 +14,9 @@ design's walk, and temperature-0 output with and without copy drafts.
+   tokens past the length of its new request, and other requests' text in the
+   same batch, never propose; a slot's copy state starts afresh with each request.
+ - The kernels replay in a CUDA graph with new inputs as they run eagerly.
+-- The match and allocation on a side stream beside the drafter give the same
+-  proposals and state as on the drafter's stream, however late the side stream
+-  runs.
++- Preparation and proposals follow the current model stream, including when
++  that stream is busy. Async allocation delivery survives delayed copies and
++  repeated ring wrap under the runner's two-in-flight-output bound.
+ - The proposer, driven as the engine lays out steps (its allocation a step
+   late), takes the steps experiments/2026-10-26-suffix-drafter/variants.py's walk
+   takes for the go variant (exact, minimum match 16, at most 16 drafts, the cap
+@@ -56,10 +56,13 @@ MAX_REQS = 16
+ # --- References -----------------------------------------------------------------
+ 
+ 
+-def ref_source(S: np.ndarray, p: int, min_match: int = MIN_MATCH) -> int:
+-    """The latest window end ``e < p`` whose ``L`` preceding tokens equal the
+-    context's last ``L`` (``S[e - L:e] == S[p - L:p]``) at the longest level ``L``
+-    that has one, else -1. The context is ``S[:p]``."""
++def ref_source(
++    S: np.ndarray, p: int, min_match: int = MIN_MATCH, lookahead: int = LOOKAHEAD
++) -> int:
++    """The best continuation at an end ``e < p`` whose ``L`` preceding tokens
++    equal the context's last ``L`` (``S[e - L:e] == S[p - L:p]``), at the
++    longest level ``L`` that has one, else -1. Rank by continuation capped at
++    lookahead, then latest end. The context is ``S[:p]``."""
+     levels = CopyDraftsConfig(min_match=min_match).levels()
+     if p <= min_match:
+         return -1
+@@ -77,7 +80,7 @@ def ref_source(S: np.ndarray, p: int, min_match: int = MIN_MATCH) -> int:
+     for level in levels:
+         hits = ends[run >= level]
+         if hits.size:
+-            source = int(hits.max())
++            source = int(max(hits, key=lambda e: (min(lookahead, p - int(e)), int(e))))
+     return source
+ 
+ 
+@@ -89,7 +92,9 @@ class RefState:
+         self.hits, self.trials = np.float32(0), np.float32(0)
+ 
+ 
+-def ref_select(state, source, length, num_sampled, verified, cut):
++def ref_select(
++    state, source, length, num_sampled, verified, cut, dspark_yield=0.0
++):
+     """The state update and the proposal's (offered, after, estimate, alloc)."""
+     if state.pending > 0 and num_sampled > 0:
+         live = min(state.pending, verified, cut)
+@@ -109,9 +114,15 @@ def ref_select(state, source, length, num_sampled, verified, cut):
+     else:
+         offered = after = 0
+         state.doublings = 0
++    alloc = max(after, BLOCK)
++    estimate = float((state.hits + tlc.PRIOR_HITS) / (state.trials + tlc.PRIOR_TRIALS))
++    if offered > 0 and np.float32(offered) * np.float32(estimate) < np.float32(
++        dspark_yield
++    ):
++        offered = after = 0
++        state.doublings = 0
+     state.pending = offered
+-    estimate = (state.hits + tlc.PRIOR_HITS) / (state.trials + tlc.PRIOR_TRIALS)
+-    return offered, after, float(estimate), max(after, BLOCK)
++    return offered, after, estimate, alloc
+ 
+ 
+ # --- Streams ----------------------------------------------------------------------
+@@ -139,25 +150,31 @@ def _history(rows, width):
+     return torch.full((rows, width), -9, dtype=torch.int32, device=DEVICE)
+ 
+ 
+-def _run_match(history, total_len, idx_mapping, min_match=MIN_MATCH):
++def _run_match(
++    history, total_len, idx_mapping, min_match=MIN_MATCH, lookahead=LOOKAHEAD
++):
+     sources = torch.full(
+         (idx_mapping.shape[0], tlc.CHUNKS, tlc.num_levels(min_match)),
+         -7,
+         dtype=torch.int32,
+         device=DEVICE,
+     )
+-    tlc.copy_match(idx_mapping, history, total_len, sources, min_match)
++    tlc.copy_match(idx_mapping, history, total_len, sources, min_match, lookahead)
+     return sources
+ 
+ 
+-def _best(sources_row: torch.Tensor) -> int:
++def _best(sources_row: torch.Tensor, length: int, lookahead: int = LOOKAHEAD) -> int:
+     """copy_alloc's choice from one request's chunk sources."""
+     source = -1
+     for level in range(sources_row.shape[1]):
+         latest = int(sources_row[:, level].max())
+         if latest >= 0:
+             source = latest
+-    return source
++    return (
++        source
++        if source < 0
++        else (source - lookahead if source >= lookahead else length - source)
++    )
+ 
+ 
+ @pytest.mark.parametrize("vocab", [3, 64, VOCAB])
+@@ -192,7 +209,7 @@ def test_copy_match_is_the_latest_longest_match(vocab, min_match):
+     for r, slot in enumerate(slots):
+         S = streams[int(slot)]
+         expected = ref_source(S, len(S), min_match)
+-        assert _best(sources[r]) == expected, (r, int(slot), len(S))
++        assert _best(sources[r], len(S)) == expected, (r, int(slot), len(S))
+ 
+ 
+ def test_copy_match_reads_only_its_request():
+@@ -221,14 +238,14 @@ def test_copy_match_reads_only_its_request():
+     total_len[0] = len(c)
+     idx_mapping = torch.tensor([0, 2], dtype=torch.int64, device=DEVICE)
+     sources = _run_match(history, total_len, idx_mapping)
+-    assert _best(sources[1]) == 100 + MIN_MATCH == ref_source(b, len(b))
+-    assert _best(sources[0]) == ref_source(c, len(c))
++    assert _best(sources[1], len(b)) == 100 + MIN_MATCH == ref_source(b, len(b))
++    assert _best(sources[0], len(c)) == ref_source(c, len(c))
+     # Without the early copy, B has no source at all.
+     b2 = prompt.copy()
+     history[2, : len(b2)] = torch.from_numpy(b2.astype(np.int32)).to(DEVICE)
+     sources = _run_match(history, total_len, idx_mapping)
+     assert ref_source(b2, len(b2)) == -1
+-    assert _best(sources[1]) == -1
++    assert _best(sources[1], len(b)) == -1
+ 
+ 
+ def _propose(
+@@ -279,6 +296,7 @@ def _propose(
+         history,
+         chosen,
+         estimates,
++        int_state,
+         dspark[0],
+         dspark[1],
+         drafts,
+@@ -322,7 +340,13 @@ def test_copy_alloc_and_apply_follow_the_reference_over_a_copy():
+         )
+         source = ref_source(S, p)
+         offered, after, estimate, ref_alloc = ref_select(
+-            ref, source, p, num_sampled, verified, cut
++            ref,
++            source,
++            p,
++            num_sampled,
++            verified,
++            cut,
++            dspark_yield=float(dspark[1][0].sum()),
+         )
+         assert int(alloc[0]) == ref_alloc
+         assert int(int_state[slot, 0]) == ref.doublings
+@@ -336,7 +360,7 @@ def test_copy_alloc_and_apply_follow_the_reference_over_a_copy():
+         d = drafts[0].cpu().numpy()
+         c = confidences[0].cpu().numpy()
+         w = planned[0].cpu().numpy()
+-        if source >= 0:
++        if offered > 0:
+             copies += 1
+             np.testing.assert_array_equal(d[:offered], S[source : source + offered])
+             assert (d[offered:] == -1).all()
+@@ -426,12 +450,12 @@ def test_kernels_replay_in_a_cuda_graph():
+     step = [torch.ones(n, dtype=torch.int32, device=DEVICE) for _ in range(3)]
+ 
+     def launch():
+-        tlc.copy_match(idx_mapping, history, total_len, sources, MIN_MATCH)
++        tlc.copy_match(idx_mapping, history, total_len, sources, MIN_MATCH, LOOKAHEAD)
+         tlc.copy_alloc(
+             idx_mapping, total_len, sources, *step, int_state, float_state,
+             chosen, estimates, alloc, MIN_MATCH, LOOKAHEAD, BLOCK, INITIAL,
+         )  # fmt: skip
+-        tlc.copy_apply(idx_mapping, history, chosen, estimates, *dspark, *proposals)
++        tlc.copy_apply(idx_mapping, history, chosen, estimates, int_state, *dspark, *proposals)
+ 
+     def fill(seed):
+         g = np.random.default_rng(seed)
+@@ -921,81 +945,146 @@ def test_stale_wide_allocation_rejects_placeholder_tail_and_doubles_cap():
+     assert int(drafter.int_state[slot, 1]) == 2 * INITIAL
+ 
+ 
+-def test_side_stream_prepare_alloc_matches_the_drafters_stream():
+-    """prepare_alloc on a side stream (the runner's output copy stream) beside the
+-    drafter gives the proposals, allocation and copy state it gives
+-    on the drafter's stream, over a turn of steps, though the side stream starts
+-    each step's work late (busy with an earlier copy): propose waits for it."""
+-    side = torch.cuda.Stream(device=DEVICE)
++def test_prepare_alloc_and_propose_follow_the_current_stream():
++    """The current stream orders preparation/state/proposals without a join."""
+     main = torch.cuda.current_stream(DEVICE)
++    alternate = torch.cuda.Stream(device=DEVICE)
+     runs = []
+-    for side_stream in (None, side):
+-        states = _request_state(8192)
+-        drafter = _drafter(states)
+-        S, start = copy_stream(np.random.default_rng(29), VOCAB, doc=400, edits=2)
+-        P, pstart = prose_stream(np.random.default_rng(30), VOCAB, length=300)
+-        texts = {"copy": list(S[: start + 30]), "prose": list(P[:pstart])}
+-        slots = [_set_history(states, req, tokens) for req, tokens in texts.items()]
+-        for slot in slots:
+-            drafter.add_request(slot)
+-        drafter.apply_staged_writes()
+-        idx = torch.tensor(slots, dtype=torch.int64, device=DEVICE)
+-        num_sampled = torch.ones(2, dtype=torch.int32, device=DEVICE)
+-        verified = torch.zeros(2, dtype=torch.int32, device=DEVICE)
+-        dspark = (
+-            torch.full((2, BLOCK), 42, dtype=torch.int64, device=DEVICE),
+-            torch.full((2, BLOCK), 0.6, device=DEVICE),
+-        )
+-        steps = []
+-        for _ in range(20):
+-            if side_stream is not None:
+-                # An earlier output copy holds the side stream for some ms.
+-                with torch.cuda.stream(side_stream):
+-                    torch.cuda._sleep(20_000_000)
+-            drafter.prepare_alloc(
+-                idx,
+-                num_sampled,
+-                verified,
+-                None,
+-                copy_stream=side_stream,
+-                main_stream=main if side_stream is not None else None,
+-            )
+-            drafts, confidences, planned = drafter.propose(idx, *dspark)
+-            steps.append(
+-                [
+-                    t.clone()
+-                    for t in (
+-                        drafts,
+-                        confidences,
+-                        planned,
+-                        drafter.alloc[:2],
+-                        drafter.int_state[idx],
+-                        drafter.float_state[idx],
+-                    )
+-                ]
++    for run_stream in (main, alternate):
++        run_stream.wait_stream(main)
++        with torch.cuda.stream(run_stream):
++            states = _request_state(8192)
++            drafter = _drafter(states)
++            S, start = copy_stream(np.random.default_rng(29), VOCAB, doc=400, edits=2)
++            P, pstart = prose_stream(np.random.default_rng(30), VOCAB, length=300)
++            texts = {"copy": list(S[: start + 30]), "prose": list(P[:pstart])}
++            slots = [_set_history(states, req, tokens) for req, tokens in texts.items()]
++            for slot in slots:
++                drafter.add_request(slot)
++            drafter.apply_staged_writes()
++            idx = torch.tensor(slots, dtype=torch.int64, device=DEVICE)
++            num_sampled = torch.ones(2, dtype=torch.int32, device=DEVICE)
++            verified = torch.zeros(2, dtype=torch.int32, device=DEVICE)
++            dspark = (
++                torch.full((2, BLOCK), 42, dtype=torch.int64, device=DEVICE),
++                torch.full((2, BLOCK), 0.6, device=DEVICE),
+             )
+-            # Every offered draft of the copying request is accepted; the prose
+-            # request takes two tokens of DSpark's block.
+-            widths = (confidences > 0).sum(dim=1).tolist()
+-            counts = []
+-            for i, req in enumerate(texts):
+-                ahead = S if req == "copy" else P
+-                n = len(texts[req])
+-                take = widths[i] + 1 if req == "copy" else 2
+-                texts[req].extend(int(t) for t in ahead[n : n + take])
+-                counts.append(len(texts[req]) - n)
+-                _set_history(states, req, texts[req])
+-            num_sampled = torch.tensor(counts, dtype=torch.int32, device=DEVICE)
+-            verified = torch.tensor(widths, dtype=torch.int32, device=DEVICE)
++            steps = []
++            for _ in range(20):
++                if run_stream is alternate:
++                    # Inputs, preparation and proposals must follow this delay.
++                    torch.cuda._sleep(20_000_000)
++                drafter.prepare_alloc(idx, num_sampled, verified, None)
++                drafts, confidences, planned = drafter.propose(idx, *dspark)
++                steps.append(
++                    [
++                        t.clone()
++                        for t in (
++                            drafts,
++                            confidences,
++                            planned,
++                            drafter.alloc[:2],
++                            drafter.int_state[idx],
++                            drafter.float_state[idx],
++                        )
++                    ]
++                )
++                # Copy accepts every offered draft; prose takes two DSpark tokens.
++                widths = (confidences > 0).sum(dim=1).tolist()
++                counts = []
++                for i, req in enumerate(texts):
++                    ahead = S if req == "copy" else P
++                    n = len(texts[req])
++                    take = widths[i] + 1 if req == "copy" else 2
++                    texts[req].extend(int(t) for t in ahead[n : n + take])
++                    counts.append(len(texts[req]) - n)
++                    _set_history(states, req, texts[req])
++                num_sampled = torch.tensor(counts, dtype=torch.int32, device=DEVICE)
++                verified = torch.tensor(widths, dtype=torch.int32, device=DEVICE)
+         torch.cuda.synchronize()
+         runs.append(steps)
+-    for on_main, on_side in zip(*runs):
+-        for a, b in zip(on_main, on_side):
++    for on_main, on_alternate in zip(*runs):
++        for a, b in zip(on_main, on_alternate):
+             assert torch.equal(a, b)
+     # The copying request copied: its proposals grew past DSpark's block.
+     assert max(int((step[1][0] > 0).sum()) for step in runs[1]) == LOOKAHEAD
+ 
+ 
++def test_async_alloc_ring_wrap_with_two_inflight_outputs_and_busy_copy_stream():
++    """The PP=1 async runner allows two outstanding outputs, not an unbounded
++    producer. It resolves the oldest future before another step; get_output()
++    must finish alloc D2H before a three-slot ring buffer/event can be reused.
++    Exercise that credit rule over four complete wraps, with real async output
++    delivery and deliberately delayed copies of different allocation rows.
++    """
++    from vllm.v1.executor.uniproc_executor import AsyncOutputFuture
++    from vllm.v1.outputs import ModelRunnerOutput
++    from vllm.v1.worker.gpu.async_utils import AsyncOutput
++    from vllm.v1.worker.gpu.sample.output import SamplerOutput
++
++    main = torch.cuda.current_stream(DEVICE)
++    copy = torch.cuda.Stream(device=DEVICE)
++    states = _request_state(256)
++    drafter = _drafter(states)
++    repeated = np.concatenate((np.arange(64), np.arange(32))) + 1000
++    unique = np.arange(96) + 100000
++    slots = [_set_history(states, req, unique) for req in ("a", "b")]
++    for slot in slots:
++        drafter.add_request(slot)
++    drafter.apply_staged_writes()
++    idx = torch.tensor(slots, dtype=torch.int64, device=DEVICE)
++    one = torch.ones(2, dtype=torch.int32, device=DEVICE)
++    zero = torch.zeros(2, dtype=torch.int32, device=DEVICE)
++    dspark = torch.full((2, BLOCK), 42, dtype=torch.int64, device=DEVICE)
++    confidences = torch.full((2, BLOCK), 0.6, device=DEVICE)
++    pending = []
++    seen_buffers, seen_events = set(), set()
++    completed = []
++
++    def consume_oldest():
++        future, expected = pending.pop(0)
++        # This calls the actual get_output(), including alloc_event.synchronize(),
++        # before reading its NumPy view and returning the host-owned list.
++        output = future.result()
++        assert output.copy_draft_alloc == expected
++        completed.append(output.copy_draft_alloc)
++
++    for step in range(12):
++        assert len(pending) < 2
++        for i, req in enumerate(("a", "b")):
++            _set_history(states, req, repeated if (step + i) % 2 == 0 else unique)
++        drafter.prepare_alloc(idx, one, zero, None)
++        async_output = AsyncOutput(
++            ModelRunnerOutput(["a", "b"], {"a": 0, "b": 1}),
++            SamplerOutput(
++                torch.ones((2, 1), dtype=torch.int64, device=DEVICE),
++                None,
++                None,
++                one,
++            ),
++            one,
++            main,
++            copy,
++        )
++        with torch.cuda.stream(copy):
++            torch.cuda._sleep(20_000_000)
++        drafter.attach_async_output(async_output, 2, copy, main)
++        seen_buffers.add(async_output.copy_draft_alloc.data_ptr())
++        seen_events.add(id(async_output.copy_draft_alloc_event))
++        drafter.propose(idx, dspark, confidences)
++        expected = [LOOKAHEAD, BLOCK] if step % 2 == 0 else [BLOCK, LOOKAHEAD]
++        pending.append((AsyncOutputFuture(async_output, True), expected))
++        if len(pending) == 2:
++            consume_oldest()
++    while pending:
++        consume_oldest()
++    assert len(seen_buffers) == len(seen_events) == drafter._ring_size == 3
++    assert len(completed) == 12
++    # Reusing a pinned ring view cannot mutate an already delivered output list.
++    for step, output in enumerate(completed):
++        assert output == ([LOOKAHEAD, BLOCK] if step % 2 == 0 else [BLOCK, LOOKAHEAD])
++
++
+ # --- The shared budget: what every rank holds alike -------------------------------
+ 
+ 
+@@ -1220,3 +1309,212 @@ def test_verification_through_copy_growth_shrinkage_and_slot_reuse(monkeypatch):
+         states.remove_request(req_id)
+     assert LOOKAHEAD in widths
+     assert len(slots) == 1  # "b" took "a"'s slot
++
++
++@pytest.mark.parametrize("lookahead", [1, 5, 16, 64])
++@pytest.mark.parametrize("period", [1, 3, 64])
++def test_continuation_ranking_across_scan_passes(lookahead, period):
++    """Independent reference at full/short boundaries and across grid passes."""
++    lengths = [17, 31, 32, 33, 63, 64, 255, 256, 257, 260, 300, 8192, 16401]
++    history = _history(MAX_REQS, max(lengths) + 32)
++    total_len = torch.zeros(MAX_REQS, dtype=torch.int32, device=DEVICE)
++    streams = [(np.arange(n) % period + 100).astype(np.int32) for n in lengths]
++    for slot, tokens in enumerate(streams):
++        history[slot, : len(tokens)] = torch.from_numpy(tokens).to(DEVICE)
++        total_len[slot] = len(tokens)
++    idx = torch.arange(len(streams), dtype=torch.int64, device=DEVICE).flip(0)
++    sources = _run_match(history, total_len, idx, lookahead=lookahead)
++    for row, slot in enumerate(idx.tolist()):
++        tokens = streams[slot]
++        assert _best(sources[row], len(tokens), lookahead) == ref_source(
++            tokens, len(tokens), lookahead=lookahead
++        )
++
++
++@pytest.mark.parametrize(
++    "length,available", [(257, 1), (260, 4), (300, 16), (16401, 16)]
++)
++def test_constant_history_keeps_useful_continuation_and_allocation(length, available):
++    """A recent one-token match must not hide a full equal-strength continuation.
++    Short-only matches still work; stronger short matches beat weaker full ones.
++    Allocation before DSpark and proposal after it must agree as the cap grows.
++    """
++    history = _history(MAX_REQS, length + 32)
++    history[3, :length] = 7
++    total_len = torch.zeros(MAX_REQS, dtype=torch.int32, device=DEVICE)
++    total_len[3] = length
++    idx = torch.tensor([3], dtype=torch.int64, device=DEVICE)
++    sources = _run_match(history, total_len, idx)
++    assert _best(sources[0], length) == length - available
++    zero = torch.zeros(1, dtype=torch.int32, device=DEVICE)
++    low_dspark = (
++        torch.full((1, BLOCK), 99, dtype=torch.int64, device=DEVICE),
++        torch.full((1, BLOCK), 0.1, device=DEVICE),
++    )
++    for doublings in (0, 1, 2):
++        ints, floats = _state()
++        ints[3, 0] = doublings
++        drafts, conf, planned, alloc, _ = _propose(
++            history,
++            total_len,
++            idx,
++            sources,
++            ints,
++            floats,
++            zero,
++            zero,
++            zero,
++            dspark=low_dspark,
++        )
++        offered = min(INITIAL << doublings, LOOKAHEAD, available)
++        after = min(2 * (INITIAL << doublings), LOOKAHEAD, available)
++        assert int(ints[3, 1]) == offered
++        assert drafts[0, :offered].tolist() == [7] * offered
++        assert drafts[0, offered:].tolist() == [-1] * (LOOKAHEAD - offered)
++        assert int((conf[0] > 0).sum()) == offered
++        assert int((planned[0] > 0).sum()) == after
++        assert int(alloc[0]) == max(after, BLOCK)
++
++
++def test_copy_apply_gates_replacement_by_expected_yield_against_dspark():
++    """A short copy continuation or a decayed copy acceptance estimate whose
++    expected yield ``offered * estimate`` is below DSpark's expected yield
++    ``sum(dspark_confidences[r, :BLOCK])`` keeps DSpark's proposal and clears
++    ``int_state[slot]`` so the next step does not attribute DSpark's accepted
++    tokens to CopyDrafter."""
++    slot = 2
++    idx = torch.tensor([slot], dtype=torch.int64, device=DEVICE)
++    zero = torch.zeros(1, dtype=torch.int32, device=DEVICE)
++
++    # 1. Short continuation (available=1, offered=1, estimate=0.95 -> yield=0.95)
++    # against DSpark with yield 3.0: DSpark wins and pending is cleared to 0.
++    history = _history(MAX_REQS, 300)
++    history[slot, :257] = 7
++    total_len = torch.zeros(MAX_REQS, dtype=torch.int32, device=DEVICE)
++    total_len[slot] = 257
++    sources = _run_match(history, total_len, idx)
++    ints, floats = _state()
++    ints[slot, 0] = 2
++    dspark_strong = (
++        torch.tensor([[101, 102, 103, 104, 105]], dtype=torch.int64, device=DEVICE),
++        torch.tensor([[0.8, 0.7, 0.6, 0.5, 0.4]], dtype=torch.float32, device=DEVICE),
++    )
++    drafts, conf, planned, alloc, _ = _propose(
++        history,
++        total_len,
++        idx,
++        sources,
++        ints,
++        floats,
++        zero,
++        zero,
++        zero,
++        dspark=dspark_strong,
++    )
++    assert int(alloc[0]) == BLOCK
++    assert int(ints[slot, 0]) == 0
++    assert int(ints[slot, 1]) == 0
++    assert drafts[0, :BLOCK].tolist() == [101, 102, 103, 104, 105]
++    assert drafts[0, BLOCK:].tolist() == [-1] * (LOOKAHEAD - BLOCK)
++    torch.testing.assert_close(conf[0, :BLOCK], dspark_strong[1][0])
++    assert (conf[0, BLOCK:] == 0).all()
++    torch.testing.assert_close(planned[0], conf[0])
++
++    # Next step: verifying DSpark's 5 drafts (4 accepted -> num_sampled=5) must
++    # not update CopyDrafter's hits/trials because pending was cleared to 0.
++    sampled = torch.tensor([5], dtype=torch.int32, device=DEVICE)
++    judged = torch.tensor([BLOCK], dtype=torch.int32, device=DEVICE)
++    _propose(
++        history,
++        total_len,
++        idx,
++        sources,
++        ints,
++        floats,
++        sampled,
++        judged,
++        judged,
++        dspark=dspark_strong,
++    )
++    assert float(floats[slot].abs().sum()) == 0.0
++
++    # 2. Low-estimate full continuation (offered=8, estimate=19/80=0.2375 ->
++    # yield=1.90) yields to DSpark when dspark_yield=2.0, and wins at tie=1.90.
++    total_len[slot] = 300
++    history[slot, :300] = 7
++    sources = _run_match(history, total_len, idx)
++    ints, floats = _state()
++    floats[slot] = torch.tensor([0.0, 60.0], device=DEVICE)
++    dspark_2_0 = (
++        torch.tensor([[201, 202, 203, 204, 205]], dtype=torch.int64, device=DEVICE),
++        torch.tensor([[0.6, 0.5, 0.4, 0.3, 0.2]], dtype=torch.float32, device=DEVICE),
++    )
++    drafts, conf, planned, alloc, _ = _propose(
++        history,
++        total_len,
++        idx,
++        sources,
++        ints,
++        floats,
++        zero,
++        zero,
++        zero,
++        dspark=dspark_2_0,
++    )
++    assert int(alloc[0]) == LOOKAHEAD
++    assert int(ints[slot, 0]) == 0
++    assert int(ints[slot, 1]) == 0
++    assert drafts[0, :BLOCK].tolist() == [201, 202, 203, 204, 205]
++
++    # At exact tie (dspark_yield = 5 * 0.38 = 1.90 == 8 * 0.2375), copy wins.
++    dspark_tie = (
++        dspark_2_0[0],
++        torch.full((1, BLOCK), 0.38, dtype=torch.float32, device=DEVICE),
++    )
++    drafts, conf, planned, _, _ = _propose(
++        history,
++        total_len,
++        idx,
++        sources,
++        ints,
++        floats,
++        zero,
++        zero,
++        zero,
++        dspark=dspark_tie,
++    )
++    assert int(ints[slot, 1]) == INITIAL
++    assert drafts[0, :INITIAL].tolist() == [7] * INITIAL
++    assert drafts[0, INITIAL:].tolist() == [-1] * (LOOKAHEAD - INITIAL)
++
++
++def test_copy_match_boilerplate_anchor_pruning_is_bit_identical():
++    """Contexts with thousands of repeated 16-, 32-, 64-, and 128-token
++    boilerplate phrases produce bit-identical chunk priorities and selected
++    sources to the exact reference."""
++    rng = np.random.default_rng(20261106)
++    length = 65536
++    history = _history(4, length + 64)
++    total_len = torch.full((4,), length, dtype=torch.int32, device=DEVICE)
++    tail = rng.integers(10, VOCAB, MAX_LEVEL, dtype=np.int32)
++    streams = []
++    for row, boiler_len in enumerate((16, 32, 64, 128)):
++        S = rng.integers(10, VOCAB, length, dtype=np.int32)
++        phrase = tail[MAX_LEVEL - boiler_len :]
++        # Stamp the boiler_len suffix every 48 tokens across the entire context,
++        # preceded by a mismatching token so none of them reaches 2 * boiler_len.
++        guard = int((tail[MAX_LEVEL - boiler_len - 1] + 1) % VOCAB)
++        for pos in range(boiler_len + 1, length - MAX_LEVEL - 64, 48):
++            S[pos - boiler_len - 1] = guard
++            S[pos - boiler_len : pos] = phrase
++        # In rows 1 and 3, also plant an earlier full 256-token match.
++        if row in (1, 3):
++            S[1200 : 1200 + MAX_LEVEL] = tail
++        S[length - MAX_LEVEL :] = tail
++        streams.append(S)
++        history[row, :length] = torch.from_numpy(S).to(DEVICE)
++
++    idx = torch.arange(4, dtype=torch.int64, device=DEVICE)
++    sources = _run_match(history, total_len, idx)
++    for row, S in enumerate(streams):
++        assert _best(sources[row], length) == ref_source(S, length)
+diff --git a/vllm/config/speculative.py b/vllm/config/speculative.py
+index ebaf191d6..d7cf118ba 100644
+--- a/vllm/config/speculative.py
++++ b/vllm/config/speculative.py
+@@ -382,8 +382,10 @@ class CopyDraftsConfig:
+ 
+     Each step, a request whose context ends with the same ``min_match`` tokens
+     (or 2, 4, ... times as many, up to ``MAX_LEVEL``) as an earlier position of
+-    its own prompt and output is offered the tokens that followed the latest
+-    such position, in place of DSpark's drafts; DSpark drafts everywhere else.
++    its own prompt and output is offered a continuation in place of DSpark's
++    drafts. Among equally strong matches prefer a full lookahead, then recency;
++    if only short continuations exist, take the longest available. DSpark drafts
++    everywhere else.
+     The search reads only the request's own history: nothing is shared between
+     requests. Drafts never change what is committed, only how many tokens a
+     step verifies.
+diff --git a/vllm/v1/worker/gpu/spec_decode/copy_drafts.py b/vllm/v1/worker/gpu/spec_decode/copy_drafts.py
+index eb7e70cb5..886ff1707 100644
+--- a/vllm/v1/worker/gpu/spec_decode/copy_drafts.py
++++ b/vllm/v1/worker/gpu/spec_decode/copy_drafts.py
+@@ -5,8 +5,8 @@ DSpark verifies greedy drafts adaptively.
+ 
+ After DSpark drafts, each request whose context ends with text it has seen
+ before (an exact suffix match of at least ``min_match`` tokens over its own
+-prompt and output) takes the tokens that followed the latest match in place of
+-DSpark's drafts, up to its cap; every other request keeps DSpark's. The copy's
++prompt and output) takes its best continuation (see ``tilelang_copy``) in place
++of DSpark's drafts, up to its cap; every other request keeps DSpark's. The copy's
+ confidences (the request's acceptance estimate at every draft) enter adaptive
+ verification's budget beside DSpark's, which decides how many rows a step
+ verifies; verification commits only the target's own tokens, so drafts change
+@@ -24,10 +24,10 @@ which the scheduler gives the request's step after next (within its decode-row
+ envelope), and the planned confidences the budget reads at that step.
+ 
+ A step's copy work reads only the committed history and the copy state, never
+-DSpark's drafts, so all of it but the proposal itself (``prepare_alloc``: the
+-match, the state's update, the choice and the allocation) runs before DSpark
+-does, on the output copy stream beside it; ``propose`` waits for it and writes
+-the proposals.
++DSpark's drafts. ``prepare_alloc`` runs the match, state's update, choice and
++allocation on the current model stream before DSpark. Its allocation is still
++delivered asynchronously on the output copy stream; ``propose`` writes the
++proposals after DSpark on the model stream.
+ """
+ 
+ from typing import Any
+@@ -38,7 +38,6 @@ from vllm.config.speculative import CopyDraftsConfig
+ from vllm.utils.torch_utils import async_tensor_h2d
+ from vllm.v1.utils import CpuGpuBuffer
+ from vllm.v1.worker.gpu import tilelang_inputs
+-from vllm.v1.worker.gpu.async_utils import stream
+ from vllm.v1.worker.gpu.spec_decode import tilelang_copy
+ from vllm.v1.worker.gpu.states import RequestState
+ 
+@@ -102,10 +101,6 @@ class CopyDrafter:
+             (max_reqs, tilelang_copy.CHOSEN_COLUMNS), dtype=torch.int32, device=device
+         )
+         self.estimates = torch.zeros(max_reqs, dtype=torch.float32, device=device)
+-        # prepare_alloc's work on a side stream: the stream that must wait for it
+-        # before reading its results, and the event that marks its end.
+-        self._prepared = torch.cuda.Event()
+-        self._prepared_waiter: torch.cuda.Stream | None = None
+         # A step that verified no drafts: nothing to judge.
+         self._no_drafts = torch.zeros(max_reqs, dtype=torch.int32, device=device)
+         self._new_rows: list[int] = []
+@@ -144,36 +139,23 @@ class CopyDrafter:
+         dead_row_cut: torch.Tensor | None,
+         *,
+         match_idx_mapping: torch.Tensor | None = None,
+-        copy_stream: torch.cuda.Stream | None = None,
+-        main_stream: torch.cuda.Stream | None = None,
+     ) -> None:
+         """Match the batch's updated histories, update their copy state from this
+         step's verification, and write the step's choice and ``alloc[:num_reqs]``,
+         so the async output copy does not wait behind the drafter.
+ 
+-        With ``copy_stream`` the work runs there, after ``main_stream``'s work so
+-        far and beside what ``main_stream`` runs next (DSpark); ``propose`` makes
+-        ``main_stream`` wait for it. Without, it runs on the current stream.
++        The work and the later ``propose`` run on the current model stream, so
++        the choice/state are ordered without a separate readiness event. The
++        allocation's asynchronous host copy is attached before DSpark runs.
+         """
+-        self._join()
+         self._ring_idx = (self._ring_idx + 1) % self._ring_size
+         self.alloc = self._alloc_buffers[self._ring_idx].gpu
+         num_reqs = idx_mapping.shape[0]
+         if verified is None:
+             verified = self._no_drafts[:num_reqs]
+-        if copy_stream is None:
+-            self._prepare(
+-                idx_mapping, match_idx_mapping, num_sampled, verified, dead_row_cut
+-            )
+-            return
+-        assert main_stream is not None
+-        with stream(copy_stream, main_stream):
+-            copy_stream.wait_stream(main_stream)
+-            self._prepare(
+-                idx_mapping, match_idx_mapping, num_sampled, verified, dead_row_cut
+-            )
+-            self._prepared.record(copy_stream)
+-        self._prepared_waiter = main_stream
++        self._prepare(
++            idx_mapping, match_idx_mapping, num_sampled, verified, dead_row_cut
++        )
+ 
+     def _prepare(
+         self,
+@@ -192,6 +174,7 @@ class CopyDrafter:
+             total_len,
+             sources,
+             self.min_match,
++            self.lookahead,
+         )
+         tilelang_copy.copy_alloc(
+             idx_mapping,
+@@ -211,12 +194,6 @@ class CopyDrafter:
+             self.initial,
+         )
+ 
+-    def _join(self) -> None:
+-        """Make the stream that reads prepare_alloc's results wait for them."""
+-        if self._prepared_waiter is not None:
+-            self._prepared_waiter.wait_event(self._prepared)
+-            self._prepared_waiter = None
+-
+     def attach_async_output(
+         self,
+         async_output: Any,
+@@ -253,12 +230,12 @@ class CopyDrafter:
+         drafts = self.drafts[:num_reqs]
+         confidences = self.confidences[:num_reqs]
+         planned = self.planned[:num_reqs]
+-        self._join()
+         tilelang_copy.copy_apply(
+             idx_mapping,
+             self.req_states.all_token_ids.gpu,
+             self.chosen[:num_reqs],
+             self.estimates[:num_reqs],
++            self.int_state,
+             dspark_drafts[:num_reqs],
+             dspark_confidences[:num_reqs, : self.num_draft_steps],
+             drafts,
+diff --git a/vllm/v1/worker/gpu/spec_decode/tilelang_copy.py b/vllm/v1/worker/gpu/spec_decode/tilelang_copy.py
+index 50e06cb9c..32eab0055 100644
+--- a/vllm/v1/worker/gpu/spec_decode/tilelang_copy.py
++++ b/vllm/v1/worker/gpu/spec_decode/tilelang_copy.py
+@@ -2,24 +2,29 @@
+ # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+ """TileLang kernels of copy drafting (``copy_drafts.CopyDrafter``).
+ 
+-A request's context is its own token history, ``all_token_ids[slot, :total_len]``:
+-its prompt and output, the last token being the step's last sampled one (draft
+-zero with sink rejection). A copy proposes the tokens that followed the latest
+-earlier position whose preceding tokens equal the context's tail, at the longest
+-of the levels ``m, 2m, 4m, ...`` (``CopyDraftsConfig.levels``) that has one.
+-Nothing outside the request's own row up to its length is read, and nothing is
+-kept between steps but the request's copy state, reset with the slot.
+-
+-- ``copy_match``: a grid of (requests, ``CHUNKS``) blocks. A block loads the
+-  context's last ``MAX_LEVEL`` tokens (the key) and, for each window end ``e``
+-  of its share of ``[m, total_len)``, the number of tokens before ``e`` that
+-  equal the key's (its run, at most ``MAX_LEVEL`` and ``e``); per level, the
+-  largest ``e`` whose run reaches it. A thread's ends ascend, so its last hit is
+-  its largest; the block takes the maximum over its threads (warp shuffles, then
+-  the warps), an order-free reduction, and writes ``sources[r, chunk, level]``
+-  (-1 where none). A block whose share is empty (a context shorter than its
+-  first end) writes -1 without loading the key. No atomics: the result is the
+-  same on every launch.
++A request matches its own token history up to its current length. The longest
++matching level wins. Within that level, prefer a source with the full lookahead
++remaining, breaking ties by latest position; if none has that much continuation,
++use the source with the most remaining tokens. Short copies remain available.
++
++``copy_match`` writes priorities rather than raw positions into ``sources``.
++A full source at end ``e`` has priority ``e + lookahead``; a shorter one has
++priority ``length - e`` (1 .. lookahead - 1); no match is -1. Thus a plain max
++reduction implements the rule without atomics, int64 packing or extra buffers.
++Valid priorities never exceed the request length. ``copy_alloc`` decodes this
++priority using the same lookahead and the same step's length.
++
++The scan visits full continuations in 32-element aligned tiles latest first,
++then short ones in block 0. Because tiles visit decreasing priorities within each
++warp, a warp reduces its matched levels across all 32 lanes whenever any lane
++matches a new level and raises its required match length ``need_len`` to the
++next unmatched level, probing the anchor tokens at ``need_len`` and
++``need_len // 2`` before walking a candidate suffix. Each warp stops its
++full-continuation scan after any lane matches the longest level: that hit also
++matches every shorter level, and every unvisited end of the warp has lower
++priority. Other warps keep their own exact search. No history window or
++candidate is omitted unless it cannot improve the result.
++
+ - ``copy_alloc``: a warp a request, before the drafter's proposal is needed.
+   First the copy state of the request's last proposal is updated from this
+   step's verification of it: a copy whose live verified drafts (its admitted
+@@ -27,16 +32,20 @@ kept between steps but the request's copy state, reset with the slot.
+   ``initial`` up to the lookahead), a rejection or a proposal without a copy
+   returns it to ``initial``, and the accepted and judged drafts update the
+   request's acceptance estimate (decayed counts over a prior). Then the longest
+-  level with a source over the chunks, its latest source, and the choice
+-  (``chosen``: the source, the ``min(cap, total_len - source)`` drafts it
+-  offers, and the ``min(2 cap, lookahead, total_len - source)`` the next
+-  proposal offers if this one is accepted in full; ``estimates``: the estimate).
+-  It also writes the allocation the scheduler lays out the step after next from
+-  (those next drafts, at least DSpark's block).
++  level with a source over the chunks, its highest-priority source decoded to
++  its position, and the choice (``chosen``: the source, the
++  ``min(cap, total_len - source)`` drafts it offers, and the
++  ``min(2 cap, lookahead, total_len - source)`` the next proposal offers if
++  this one is accepted in full; ``estimates``: the estimate). It also writes
++  the allocation the scheduler lays out the step after next from (those next
++  drafts, at least DSpark's block).
+ - ``copy_apply``: a warp a request, once DSpark has drafted: the proposal of
+-  ``copy_alloc``'s choice, each copied token at the estimate as its confidence
+-  and as its planned confidence up to the next proposal's drafts; DSpark's drafts
+-  and confidences where no level has a source.
++  ``copy_alloc``'s choice when its expected yield (``offered * estimate``) is at
++  least DSpark's expected yield (``sum(dspark_confidences[r, :block])``), each
++  copied token at the estimate as its confidence and as its planned confidence up
++  to the next proposal's drafts; otherwise DSpark's drafts and confidences, with
++  the slot's pending copy state cleared so the next step does not judge DSpark's
++  tokens as a copy proposal.
+ 
+ Every launch has a fixed grid for its request count, no host synchronization and
+ no dynamic allocation, so it can be captured in a CUDA graph.
+@@ -84,8 +93,9 @@ def num_levels(min_match: int) -> int:
+ 
+ 
+ @tilelang.jit(pass_configs=_PASS)
+-def copy_match_kernel(min_match: int, idx_dtype: str):
+-    """See the module docstring: each block's latest window end per level."""
++def copy_match_kernel(min_match: int, lookahead: int, idx_dtype: str):
++    """See the module docstring: each block's best continuation priority per level."""
++    assert 1 <= lookahead <= _MATCH_THREADS
+     levels = CopyDraftsConfig(min_match=min_match).levels()
+     count = len(levels)
+     num_reqs = T.dynamic("num_reqs")
+@@ -95,6 +105,37 @@ def copy_match_kernel(min_match: int, idx_dtype: str):
+     total_rows = T.dynamic("total_rows")
+     span = CHUNKS * _MATCH_THREADS  # window ends a pass of the grid covers
+ 
++    @T.macro
++    def evaluate_end(
++        slot, history, key, k0, e, priority, need_len, best, hit
++    ):
++        if (
++            e >= need_len
++            and history[slot, e - 1] == k0
++            and history[slot, e - need_len] == key[need_len - 1]
++            and history[slot, e - T.max(need_len // 2, 1)]
++            == key[T.max(need_len // 2, 1) - 1]
++        ):
++            run = T.alloc_var(T.int32, init=1)
++            # The shortest level first: most ends fail on its first
++            # token. A token is loaded only while the run reaches it.
++            for j in T.unroll(1, min_match):
++                if run == j:  # noqa: SIM102
++                    if history[slot, e - 1 - j] == key[j]:
++                        run = j + 1
++            # A longer level only past a full match of the one before.
++            for i in tuple(range(1, count)):
++                if run == levels[i - 1]:
++                    for j in T.serial(levels[i - 1], levels[i]):
++                        if run == j and j < e:  # noqa: SIM102
++                            if history[slot, e - 1 - j] == key[j]:
++                                run = j + 1
++            if run >= need_len:
++                hit[0] = 1
++                for i in tuple(range(count)):
++                    if run >= levels[i]:
++                        best[i] = T.max(best[i], priority)
++
+     @T.prim_func
+     def copy_match(
+         idx_mapping: T.Tensor((num_reqs,), idx_dtype),
+@@ -109,12 +150,19 @@ def copy_match_kernel(min_match: int, idx_dtype: str):
+             key = T.alloc_shared((MAX_LEVEL,), T.int32)
+             partial = T.alloc_shared((_MATCH_WARPS, count), T.int32)
+             best = T.alloc_local((count,), T.int32)
++            hit = T.alloc_local((1,), T.int32)
+             slot = T.alloc_var(T.int64, init=T.cast(idx_mapping[r], T.int64))
+             length = T.alloc_var(T.int32, init=0)
+             if slot >= 0:
+                 length = total_len[slot]
+-            if min_match + c * _MATCH_THREADS >= length:
+-                # The block's first end is past the context: no end to compare
++            full_last = length - lookahead
++            top_aligned = T.if_then_else(
++                full_last >= min_match, ((full_last + 31) // 32) * 32, 0
++            )
++            if length <= min_match or (
++                c > 0 and top_aligned - c * _MATCH_THREADS < min_match
++            ):
++                # The block's share is empty: no end to compare
+                 # (the branch is the whole block's, so no barrier diverges).
+                 if tx < count:
+                     sources[r, c, tx] = -1
+@@ -127,29 +175,62 @@ def copy_match_kernel(min_match: int, idx_dtype: str):
+                     best[i] = -1
+                 T.sync_threads()
+                 k0 = T.alloc_var(T.int32, init=key[0])
+-                # window ends min_match .. length - 1
+-                ends = T.max(length - min_match, 0)
+-                for k in T.serial(T.ceildiv(ends, span)):
+-                    e = min_match + k * span + c * _MATCH_THREADS + tx
+-                    if e < length:  # noqa: SIM102
+-                        if history[slot, e - 1] == k0:
+-                            run = T.alloc_var(T.int32, init=1)
+-                            # The shortest level first: most ends fail on its first
+-                            # token. A token is loaded only while the run reaches it.
+-                            for j in T.unroll(1, min_match):
+-                                if run == j:  # noqa: SIM102
+-                                    if history[slot, e - 1 - j] == key[j]:
+-                                        run = j + 1
+-                            # A longer level only past a full match of the one before.
+-                            for i in tuple(range(1, count)):
+-                                if run == levels[i - 1]:
+-                                    for j in T.serial(levels[i - 1], levels[i]):
+-                                        if run == j and j < e:  # noqa: SIM102
+-                                            if history[slot, e - 1 - j] == key[j]:
+-                                                run = j + 1
+-                            for i in tuple(range(count)):
+-                                if run >= levels[i]:
+-                                    best[i] = e
++                need_len = T.alloc_var(T.int32, init=min_match)
++                # Stage 1: full continuations (e in [min_match, full_last]) in
++                # 32-element aligned warp tiles from highest priority down.
++                warp_tile = T.alloc_var(
++                    T.int32,
++                    init=top_aligned - (c + 1) * _MATCH_THREADS + (tx // 32) * 32,
++                )
++                searching = T.alloc_var(T.int32, init=1)
++                while warp_tile + 32 >= min_match and searching != 0:
++                    hit[0] = 0
++                    e = warp_tile + tx % 32 + 1
++                    if min_match <= e and e <= full_last:
++                        evaluate_end(
++                            slot,
++                            history,
++                            key,
++                            k0,
++                            e,
++                            e + lookahead,
++                            need_len,
++                            best,
++                            hit,
++                        )
++                    if (
++                        T.call_extern(
++                            "int32",
++                            "__any_sync",
++                            T.uint32(0xFFFFFFFF),
++                            hit[0] != 0,
++                        )
++                        != 0
++                    ):
++                        for i in tuple(range(count)):
++                            for distance in (16, 8, 4, 2, 1):
++                                best[i] = T.max(best[i], T.shfl_xor(best[i], distance))
++                        for i in tuple(range(count - 1)):
++                            if best[i] >= 0:
++                                need_len = levels[i + 1]
++                        if best[count - 1] >= 0:
++                            searching = 0
++                    warp_tile -= span
++                # Stage 2: short continuations (at most lookahead - 1 ends) in block 0.
++                if c == 0 and searching != 0:
++                    e_short = T.max(min_match, full_last + 1) + tx
++                    if e_short < length:
++                        evaluate_end(
++                            slot,
++                            history,
++                            key,
++                            k0,
++                            e_short,
++                            length - e_short,
++                            need_len,
++                            best,
++                            hit,
++                        )
+                 for i in tuple(range(count)):
+                     for distance in (16, 8, 4, 2, 1):
+                         best[i] = T.max(best[i], T.shfl_xor(best[i], distance))
+@@ -196,7 +277,7 @@ def copy_alloc_kernel(
+         with T.Kernel(num_reqs, threads=_SELECT_THREADS) as r:
+             tx = T.get_thread_binding()
+             slot = T.alloc_var(T.int64, init=T.cast(idx_mapping[r], T.int64))
+-            # The longest level with a source wins; its latest source across chunks.
++            # The longest level wins; priorities order its continuations.
+             source = T.alloc_var(T.int32, init=-1)
+             for i in tuple(range(count)):
+                 latest = T.alloc_var(T.int32, init=sources[r, tx, i])
+@@ -205,6 +286,11 @@ def copy_alloc_kernel(
+                 if latest >= 0:
+                     source = latest
+             if tx == 0:
++                length = total_len[slot]
++                if source >= 0:
++                    source = T.if_then_else(
++                        source >= lookahead, source - lookahead, length - source
++                    )
+                 doublings = T.alloc_var(T.int32, init=int_state[slot, 0])
+                 pending = int_state[slot, 1]
+                 hits = T.alloc_var(T.float32, init=float_state[slot, 0])
+@@ -221,7 +307,7 @@ def copy_alloc_kernel(
+                             T.min(accepted + 1, live), T.float32
+                         )
+                 cap = T.min(T.int32(initial) << doublings, lookahead)
+-                distance = total_len[slot] - source
++                distance = length - source
+                 offered = T.if_then_else(source >= 0, T.min(cap, distance), 0)
+                 after = T.if_then_else(
+                     source >= 0, T.min(T.min(2 * cap, lookahead), distance), 0
+@@ -247,6 +333,7 @@ def copy_apply_kernel(lookahead: int, block: int, idx_dtype: str):
+     history_rows, history_cols, history_stride = T.dynamic(
+         "history_rows, history_cols, history_stride"
+     )
++    state_rows = T.dynamic("state_rows")
+     draft_rows, draft_stride = T.dynamic("draft_rows, draft_stride")
+     conf_rows, conf_stride = T.dynamic("conf_rows, conf_stride")
+     passes = -(-lookahead // _SELECT_THREADS)
+@@ -259,6 +346,7 @@ def copy_apply_kernel(lookahead: int, block: int, idx_dtype: str):
+         ),
+         chosen: T.Tensor((num_reqs, CHOSEN_COLUMNS), T.int32),
+         estimates: T.Tensor((num_reqs,), T.float32),
++        int_state: T.Tensor((state_rows, STATE_COLUMNS), T.int32),
+         dspark_drafts: T.StridedTensor((draft_rows, block), (draft_stride, 1), T.int64),
+         dspark_confidences: T.StridedTensor(
+             (conf_rows, block), (conf_stride, 1), T.float32
+@@ -274,10 +362,19 @@ def copy_apply_kernel(lookahead: int, block: int, idx_dtype: str):
+             offered = T.alloc_var(T.int32, init=chosen[r, 1])
+             after = T.alloc_var(T.int32, init=chosen[r, 2])
+             estimate = T.alloc_var(T.float32, init=estimates[r])
++            dspark_yield = T.alloc_var(T.float32, init=T.float32(0))
++            for j in T.unroll(block):
++                dspark_yield += dspark_confidences[r, j]
++            use_copy = T.alloc_var(T.int32, init=0)
++            if start >= 0 and T.cast(offered, T.float32) * estimate >= dspark_yield:
++                use_copy = 1
++            if start >= 0 and use_copy == 0 and tx == 0:
++                int_state[slot, 0] = 0
++                int_state[slot, 1] = 0
+             for k in T.unroll(passes):
+                 col = k * _SELECT_THREADS + tx
+                 if col < lookahead:
+-                    if start >= 0:
++                    if use_copy != 0:
+                         drafts[r, col] = T.if_then_else(
+                             col < offered,
+                             T.cast(
+@@ -309,8 +406,10 @@ def copy_apply_kernel(lookahead: int, block: int, idx_dtype: str):
+     return copy_apply
+ 
+ 
+-def copy_match_key(min_match: int, idx_dtype: torch.dtype) -> tuple:
+-    return (min_match, _DTYPES[idx_dtype])
++def copy_match_key(
++    min_match: int, lookahead: int, idx_dtype: torch.dtype
++) -> tuple:
++    return (min_match, lookahead, _DTYPES[idx_dtype])
+ 
+ 
+ def copy_alloc_key(
+@@ -329,13 +428,13 @@ def copy_match(
+     total_len: torch.Tensor,
+     sources: torch.Tensor,
+     min_match: int,
++    lookahead: int = CopyDraftsConfig.max_drafts,
+ ) -> None:
+-    """``sources[:num_reqs]`` ([num_reqs, CHUNKS, levels] int32): each chunk's
+-    latest window end per level of the batch's requests."""
++    """Write per-chunk, per-level continuation priorities (see module docstring)."""
+     if idx_mapping.shape[0]:
+-        _kernel(copy_match_kernel, *copy_match_key(min_match, idx_mapping.dtype))(
+-            idx_mapping, history, total_len, sources
+-        )
++        _kernel(
++            copy_match_kernel, *copy_match_key(min_match, lookahead, idx_mapping.dtype)
++        )(idx_mapping, history, total_len, sources)
+ 
+ 
+ def copy_alloc(
+@@ -381,6 +480,7 @@ def copy_apply(
+     history: torch.Tensor,
+     chosen: torch.Tensor,
+     estimates: torch.Tensor,
++    int_state: torch.Tensor,
+     dspark_drafts: torch.Tensor,
+     dspark_confidences: torch.Tensor,
+     drafts: torch.Tensor,
+@@ -400,6 +500,7 @@ def copy_apply(
+         history,
+         chosen,
+         estimates,
++        int_state,
+         dspark_drafts,
+         dspark_confidences,
+         drafts,
+@@ -413,7 +514,7 @@ def copy_calls(min_match: int, lookahead: int, block: int, initial: int) -> list
+     idx = torch.int64
+     assert _DTYPES[idx] == RUNNER_IDX_DTYPE
+     return [
+-        _call(copy_match_kernel, *copy_match_key(min_match, idx)),
++        _call(copy_match_kernel, *copy_match_key(min_match, lookahead, idx)),
+         _call(
+             copy_alloc_kernel,
+             *copy_alloc_key(min_match, lookahead, block, initial, idx),
+-- 
+2.43.0
+

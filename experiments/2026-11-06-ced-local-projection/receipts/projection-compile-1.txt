@@ -1,0 +1,314 @@
+/src/vllm/__init__.py:7: RuntimeWarning: Failed to read commit hash:
+No module named 'vllm._version'
+  from .version import __version__, __version_tuple__  # isort:skip
+WARNING 11-05 23:34:34 [interface.py:369] Failed to import from vllm._C: ModuleNotFoundError("No module named 'vllm._C'")
+W1105 23:34:34.318000 1 torch/utils/cpp_extension.py:178] No CUDA runtime is found, using CUDA_HOME='/usr/local/cuda'
+Traceback (most recent call last):
+  File "/check/compile.py", line 10, in <module>
+    tilelang.lower(
+  File "/usr/local/lib/python3.12/dist-packages/tilelang/engine/lower.py", line 238, in lower
+    return lower_with_context(
+           ^^^^^^^^^^^^^^^^^^^
+  File "/usr/local/lib/python3.12/dist-packages/tilelang/engine/lower.py", line 165, in lower_with_context
+    return _lower_with_context_impl(
+           ^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/usr/local/lib/python3.12/dist-packages/tilelang/engine/lower.py", line 190, in _lower_with_context_impl
+    codegen_mod = device_codegen(device_mod, context) if enable_device_compile else device_codegen_without_compile(device_mod, context)
+                  ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/usr/local/lib/python3.12/dist-packages/tilelang/engine/lower.py", line 101, in device_codegen
+    return context.codegen_device(device_mod, compile_device=True)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/usr/local/lib/python3.12/dist-packages/tilelang/backend/module.py", line 221, in codegen_device
+    return self.module.codegen_device(mod, self.target, compile_device=compile_device)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/usr/local/lib/python3.12/dist-packages/tilelang/backend/module.py", line 126, in codegen_device
+    return self.get_device_codegen(target).lower(mod, target, compile_device=compile_device)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/usr/local/lib/python3.12/dist-packages/tilelang/backend/device_codegen.py", line 44, in lower
+    return build_func(mod, target)
+           ^^^^^^^^^^^^^^^^^^^^^^^
+  File "/usr/local/lib/python3.12/dist-packages/tilelang/backend/device_codegen.py", line 21, in build
+    return run_codegen_with_instrumentation(
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/usr/local/lib/python3.12/dist-packages/tilelang/instrumentation/session.py", line 261, in run_codegen_with_instrumentation
+    return session.run_codegen(CodegenEvent(name=name, mod=mod, target=target), call)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/usr/local/lib/python3.12/dist-packages/tilelang/instrumentation/session.py", line 110, in run_codegen
+    return wrapped()
+           ^^^^^^^^^
+  File "/usr/local/lib/python3.12/dist-packages/tilelang/backend/device_codegen.py", line 25, in <lambda>
+    lambda: tvm.ffi.get_global_func(global_func_name)(mod, target),
+            ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "python/tvm_ffi/cython/function.pxi", line 968, in tvm_ffi.core.Function.__call__
+  File "<unknown>", line 0, in tvm::codegen::BuildTileLangCUDA(tvm::IRModule, tvm::Target)
+  File "<unknown>", line 0, in TVMFFIPyCallback(void*, TVMFFIAny const*, int, TVMFFIAny*)
+  File "<unknown>", line 0, in TVMFFICyErrorSetRaisedFromPyError(_object*)
+  File "/usr/local/lib/python3.12/dist-packages/tilelang/cuda/backend.py", line 118, in tilelang_callback_cuda_compile
+    binary = nvcc.compile_cuda(code, compile_format, arch, options=options, verbose=verbose)
+
+  File "/usr/local/lib/python3.12/dist-packages/tilelang/contrib/nvcc.py", line 214, in compile_cuda
+    raise RuntimeError(msg)
+
+RuntimeError: #if defined(_MSC_VER) && !defined(__clang__) && _MSC_VER < 1940
+#define _tl_orig_alignas alignas
+#define alignas(N) _tl_orig_alignas((N) <= 64 ? (N) : 64)
+#include <cuda.h>
+#undef alignas
+#define alignas _tl_orig_alignas
+#endif
+#include <tl_templates/cuda/instruction/mma.h>
+#include <tl_templates/cuda/intrin.h>
+#include <tl_templates/cuda/barrier.h>
+#include <tl_templates/cuda/copy_sm90.h>
+#include <tl_templates/cuda/reduce.h>
+#include <tl_templates/cuda/scan.h>
+#include <tl_templates/cuda/ldsm.h>
+#include <tl_templates/cuda/threadblock_swizzle.h>
+#include <tl_templates/cuda/debug.h>
+#ifdef ENABLE_BF16
+#include <tl_templates/cuda/cuda_bf16_fallbacks.cuh>
+#endif
+
+extern "C" __global__ void gemm_bf16_kernel(__grid_constant__ const CUtensorMap A_desc, __grid_constant__ const CUtensorMap B_desc, bfloat16_t* __restrict__ C, int M);
+extern "C" __global__ void __launch_bounds__(256, 1) gemm_bf16_kernel(__grid_constant__ const CUtensorMap A_desc, __grid_constant__ const CUtensorMap B_desc, bfloat16_t* __restrict__ C, int M) {
+  extern __shared__ __align__(1024) uchar buf_dyn_shmem[];
+  void* A_shared = ((void*)((char*)buf_dyn_shmem + 0));
+  void* B_shared = ((void*)((char*)buf_dyn_shmem + 24576));
+  __shared__ __align__(16) uint64_t mbarrier_mem[6];
+  auto mbarrier = reinterpret_cast<Barrier*>(mbarrier_mem);
+  float C_local[32];
+  float C_total[32];
+  float C_block[32];
+  if (tl::tl_shuffle_elect<0>()) {
+    tl::prefetch_tma_descriptor(A_desc);
+    tl::prefetch_tma_descriptor(B_desc);
+  }
+  if (tl::tl_shuffle_elect<0>()) {
+    mbarrier[0].init(1);
+    mbarrier[1].init(1);
+    mbarrier[2].init(1);
+    mbarrier[3].init(128);
+    mbarrier[4].init(128);
+    mbarrier[5].init(128);
+  }
+  tl::fence_barrier_init();
+  __syncthreads();
+  if (((int)threadIdx.x) < 128) {
+    tl::warpgroup_reg_dealloc<24>();
+    for (int ko = 0; ko < 80; ++ko) {
+      mbarrier[((ko % 3) + 3)].wait((((ko % 6) / 3) ^ 1));
+      if (tl::tl_shuffle_elect<128>()) {
+        mbarrier[(ko % 3)].expect_transaction(8192);
+        tl::tma_load(A_desc, mbarrier[(ko % 3)], (&(((bfloat16_t*)A_shared)[((ko % 3) * 4096)])), (ko * 64), (((int)blockIdx.y) * 64));
+        mbarrier[(ko % 3)].arrive_and_expect_tx(8192);
+        tl::tma_load(B_desc, mbarrier[(ko % 3)], (&(((bfloat16_t*)B_shared)[((ko % 3) * 4096)])), (ko * 64), (((int)blockIdx.x) * 64));
+      }
+    }
+  } else {
+    tl::warpgroup_reg_alloc<240>();
+    #pragma unroll
+    for (int i = 0; i < 8; ++i) {
+      float broadcast_var = 0x0p+0f/*0.000000e+00*/;
+      *(float4*)(C_local + (i * 4)) = make_float4(broadcast_var, broadcast_var, broadcast_var, broadcast_var);
+    }
+    #pragma unroll
+    for (int i_1 = 0; i_1 < 8; ++i_1) {
+      float broadcast_var_1 = 0x0p+0f/*0.000000e+00*/;
+      *(float4*)(C_total + (i_1 * 4)) = make_float4(broadcast_var_1, broadcast_var_1, broadcast_var_1, broadcast_var_1);
+    }
+    for (int ko_1 = 0; ko_1 < 80; ++ko_1) {
+      #pragma unroll
+      for (int i_2 = 0; i_2 < 8; ++i_2) {
+        float broadcast_var_2 = 0x0p+0f/*0.000000e+00*/;
+        *(float4*)(C_block + (i_2 * 4)) = make_float4(broadcast_var_2, broadcast_var_2, broadcast_var_2, broadcast_var_2);
+      }
+      mbarrier[(ko_1 % 3)].wait(((ko_1 % 6) / 3));
+      {
+        bfloat16_t A_local[16];
+        bfloat16_t B_local[16];
+        for (int ki = 0; ki < 4; ++ki) {
+          #pragma unroll
+          for (int i_3 = 0; i_3 < 2; ++i_3) {
+            tl::ptx_ldmatrix_x4((&(((bfloat16_t*)A_shared)[((((((((ko_1 % 3) * 4096) + (((((int)threadIdx.x) & 63) >> 5) * 2048)) + (i_3 * 1024)) + ((((int)threadIdx.x) & 15) * 64)) + (((((((int)threadIdx.x) & 7) >> 2) + (ki >> 1)) & 1) * 32)) + (((((((int)threadIdx.x) & 3) >> 1) + (ki & 1)) & 1) * 16)) + (((((((int)threadIdx.x) & 31) >> 4) + (((int)threadIdx.x) & 1)) & 1) * 8))])), (&(A_local[(i_3 * 8)])));
+          }
+          #pragma unroll
+          for (int i_4 = 0; i_4 < 2; ++i_4) {
+            tl::ptx_ldmatrix_x4((&(((bfloat16_t*)B_shared)[(((((((((ko_1 % 3) * 4096) + (((((int)threadIdx.x) & 127) >> 6) * 2048)) + (i_4 * 1024)) + (((((int)threadIdx.x) & 31) >> 4) * 512)) + ((((int)threadIdx.x) & 7) * 64)) + (((((((int)threadIdx.x) & 7) >> 2) + (ki >> 1)) & 1) * 32)) + (((((((int)threadIdx.x) & 3) >> 1) + (ki & 1)) & 1) * 16)) + (((((((int)threadIdx.x) & 15) >> 3) + (((int)threadIdx.x) & 1)) & 1) * 8))])), (&(B_local[(i_4 * 8)])));
+          }
+          for (int i_5 = 0; i_5 < 2; ++i_5) {
+            for (int j = 0; j < 2; ++j) {
+              tl::mma_sync<tl::DataType::kBFloat16, tl::DataType::kBFloat16, tl::DataType::kFloat32, 16, 8, 16, false, true>(reinterpret_cast<float*>(C_block + ((i_5 * 16) + (j * 8))), reinterpret_cast<const unsigned*>(A_local + (i_5 * 8)), reinterpret_cast<const unsigned*>(B_local + (j * 8)));
+              tl::mma_sync<tl::DataType::kBFloat16, tl::DataType::kBFloat16, tl::DataType::kFloat32, 16, 8, 16, false, true>(reinterpret_cast<float*>(C_block + (((i_5 * 16) + (j * 8)) + 4)), reinterpret_cast<const unsigned*>(A_local + (i_5 * 8)), reinterpret_cast<const unsigned*>(B_local + ((j * 8) + 4)));
+            }
+          }
+        }
+      }
+      mbarrier[((ko_1 % 3) + 3)].arrive();
+      #pragma unroll
+      for (int i_6 = 0; i_6 < 8; ++i_6) {
+        float4 __1;
+          float4 v_ = *(float4*)(C_local + (i_6 * 4));
+          float4 v__1 = *(float4*)(C_block + (i_6 * 4));
+          *(float2*)(&(__1.x)) = tl::add2(*(float2*)(&(v_.x)), *(float2*)(&(v__1.x)));
+          *(float2*)(&(__1.z)) = tl::add2(*(float2*)(&(v_.z)), *(float2*)(&(v__1.z)));
+        *(float4*)(C_local + (i_6 * 4)) = __1;
+      }
+      if (((ko_1 + 1) % 16) == 0) {
+        #pragma unroll
+        for (int i_7 = 0; i_7 < 8; ++i_7) {
+          float4 condval;
+          if ((ko_1 == 15)) {
+            condval = *(float4*)(C_local + (i_7 * 4));
+          } else {
+            float4 __2;
+              float4 v__2 = *(float4*)(C_total + (i_7 * 4));
+              float4 v__3 = *(float4*)(C_local + (i_7 * 4));
+              *(float2*)(&(__2.x)) = tl::add2(*(float2*)(&(v__2.x)), *(float2*)(&(v__3.x)));
+              *(float2*)(&(__2.z)) = tl::add2(*(float2*)(&(v__2.z)), *(float2*)(&(v__3.z)));
+            condval = __2;
+          }
+          *(float4*)(C_total + (i_7 * 4)) = condval;
+        }
+        #pragma unroll
+        for (int i_8 = 0; i_8 < 8; ++i_8) {
+          float broadcast_var_3 = 0x0p+0f/*0.000000e+00*/;
+          *(float4*)(C_local + (i_8 * 4)) = make_float4(broadcast_var_3, broadcast_var_3, broadcast_var_3, broadcast_var_3);
+        }
+      }
+    }
+    #pragma unroll
+    for (int i_9 = 0; i_9 < 16; ++i_9) {
+      bfloat16_t C_local_cast[2];
+      if ((((((((int)blockIdx.y) * 64) + (((((int)threadIdx.x) & 63) >> 5) * 32)) + ((i_9 >> 3) * 16)) + ((i_9 & 1) * 8)) + ((((int)threadIdx.x) & 31) >> 2)) < M) {
+        uint1 __3;
+        float2 v__4 = *(float2*)(C_total + (i_9 * 2));
+        (reinterpret_cast<__nv_bfloat162*>(&__3))[0] = __float22bfloat162_rn(((float2*)(&v__4))[0]);
+        *(uint1*)(C_local_cast + 0) = __3;
+        *(uint1*)(C + ((((((((((((int64_t)((int)blockIdx.y)) * (int64_t)8192) + (((((int64_t)((int)threadIdx.x)) & (int64_t)63) >> (int64_t)5) * (int64_t)4096)) + ((((int64_t)i_9) >> (int64_t)3) * (int64_t)2048)) + ((((int64_t)i_9) & (int64_t)1) * (int64_t)1024)) + (((((int64_t)((int)threadIdx.x)) & (int64_t)31) >> (int64_t)2) * (int64_t)128)) + (((int64_t)((int)blockIdx.x)) * (int64_t)64)) + ((((int64_t)((int)threadIdx.x)) >> (int64_t)6) * (int64_t)32)) + (((((int64_t)i_9) & (int64_t)7) >> (int64_t)1) * (int64_t)8)) + ((((int64_t)((int)threadIdx.x)) & (int64_t)3) * (int64_t)2)) - (int64_t)64)) = *(uint1*)(C_local_cast + 0);
+      }
+    }
+  }
+}
+
+
+Compilation error:
+/usr/local/lib/python3.12/dist-packages/tilelang/3rdparty/../src/tl_templates/cuda/instruction/../common.h(621): warning #1444-D: type "longlong4" was declared deprecated ("use longlong4_16a or longlong4_32a")
+    longlong4 result;
+              ^
+/usr/local/cuda/bin/../targets/sbsa-linux/include/vector_types.h(550): note #3287-D: because of a "deprecated" attribute
+  typedef __attribute__((device_builtin)) struct longlong4 __attribute__((deprecated("use longlong4_16a or longlong4_32a"))) longlong4;
+                                                                          ^
+
+Remark: The warnings can be suppressed with "-diag-suppress <warning-number>"
+
+/usr/local/lib/python3.12/dist-packages/tilelang/3rdparty/../src/tl_templates/cuda/instruction/../common.h(639): warning #1444-D: type "longlong4" was declared deprecated ("use longlong4_16a or longlong4_32a")
+    longlong4 result;
+              ^
+/usr/local/cuda/bin/../targets/sbsa-linux/include/vector_types.h(550): note #3287-D: because of a "deprecated" attribute
+  typedef __attribute__((device_builtin)) struct longlong4 __attribute__((deprecated("use longlong4_16a or longlong4_32a"))) longlong4;
+                                                                          ^
+
+/usr/local/lib/python3.12/dist-packages/tilelang/3rdparty/../src/tl_templates/cuda/instruction/../common.h(657): warning #1444-D: type "ulonglong4" was declared deprecated ("use ulonglong4_16a or ulonglong4_32a")
+    ulonglong4 result;
+               ^
+/usr/local/cuda/bin/../targets/sbsa-linux/include/vector_types.h(551): note #3287-D: because of a "deprecated" attribute
+  typedef __attribute__((device_builtin)) struct ulonglong4 __attribute__((deprecated("use ulonglong4_16a or ulonglong4_32a"))) ulonglong4;
+                                                                           ^
+
+/usr/local/lib/python3.12/dist-packages/tilelang/3rdparty/../src/tl_templates/cuda/instruction/../common.h(1032): warning #20012-D: __device__ annotation is ignored on a non-virtual function("float_e4m3_t") that is explicitly defaulted on its first declaration
+    __inline__ __attribute__((always_inline)) __attribute__((device)) __attribute__((host))
+                                                             ^
+
+/usr/local/lib/python3.12/dist-packages/tilelang/3rdparty/../src/tl_templates/cuda/instruction/../common.h(1032): warning #20012-D: __host__ annotation is ignored on a non-virtual function("float_e4m3_t") that is explicitly defaulted on its first declaration
+    __inline__ __attribute__((always_inline)) __attribute__((device)) __attribute__((host))
+                                                                                     ^
+
+/usr/local/lib/python3.12/dist-packages/tilelang/3rdparty/../src/tl_templates/cuda/instruction/../common.h(1049): warning #20012-D: __device__ annotation is ignored on a non-virtual function("float_e5m2_t") that is explicitly defaulted on its first declaration
+    __inline__ __attribute__((always_inline)) __attribute__((device)) __attribute__((host))
+                                                             ^
+
+/usr/local/lib/python3.12/dist-packages/tilelang/3rdparty/../src/tl_templates/cuda/instruction/../common.h(1049): warning #20012-D: __host__ annotation is ignored on a non-virtual function("float_e5m2_t") that is explicitly defaulted on its first declaration
+    __inline__ __attribute__((always_inline)) __attribute__((device)) __attribute__((host))
+                                                                                     ^
+
+/usr/local/lib/python3.12/dist-packages/tilelang/3rdparty/../src/tl_templates/cuda/instruction/../common.h(1066): warning #20012-D: __device__ annotation is ignored on a non-virtual function("tfloat32_t") that is explicitly defaulted on its first declaration
+    __inline__ __attribute__((always_inline)) __attribute__((device)) __attribute__((host))
+                                                             ^
+
+/usr/local/lib/python3.12/dist-packages/tilelang/3rdparty/../src/tl_templates/cuda/instruction/../common.h(1066): warning #20012-D: __host__ annotation is ignored on a non-virtual function("tfloat32_t") that is explicitly defaulted on its first declaration
+    __inline__ __attribute__((always_inline)) __attribute__((device)) __attribute__((host))
+                                                                                     ^
+
+/usr/local/lib/python3.12/dist-packages/tilelang/3rdparty/../src/tl_templates/cuda/./cuda_fp8.h(42): warning #20012-D: __device__ annotation is ignored on a non-virtual function("fp8_e4_2_t") that is explicitly defaulted on its first declaration
+    __inline__ __attribute__((always_inline)) __attribute__((device)) fp8_e4_2_t() = default; __inline__ __attribute__((always_inline)) __attribute__((device)) fp8_e4_2_t(const fp8_e4_2_t &other) { *this = other; } __inline__ __attribute__((always_inline)) __attribute__((device)) fp8_e4_2_t &operator=(const fp8_e4_2_t &other) { static_assert(sizeof(fp8_e4_2_t) == sizeof(uint16_t), "FP8 copy size mismatch"); static_assert(alignof(fp8_e4_2_t) >= alignof(uint16_t), "FP8 copy alignment mismatch"); *reinterpret_cast<uint16_t *>(this) = *reinterpret_cast<const uint16_t *>(&other); return *this; }
+                                                             ^
+
+/usr/local/lib/python3.12/dist-packages/tilelang/3rdparty/../src/tl_templates/cuda/./cuda_fp8.h(51): warning #20012-D: __device__ annotation is ignored on a non-virtual function("fp8_e4_4_t") that is explicitly defaulted on its first declaration
+    __inline__ __attribute__((always_inline)) __attribute__((device)) fp8_e4_4_t() = default; __inline__ __attribute__((always_inline)) __attribute__((device)) fp8_e4_4_t(const fp8_e4_4_t &other) { *this = other; } __inline__ __attribute__((always_inline)) __attribute__((device)) fp8_e4_4_t &operator=(const fp8_e4_4_t &other) { static_assert(sizeof(fp8_e4_4_t) == sizeof(uint32_t), "FP8 copy size mismatch"); static_assert(alignof(fp8_e4_4_t) >= alignof(uint32_t), "FP8 copy alignment mismatch"); *reinterpret_cast<uint32_t *>(this) = *reinterpret_cast<const uint32_t *>(&other); return *this; }
+                                                             ^
+
+/usr/local/lib/python3.12/dist-packages/tilelang/3rdparty/../src/tl_templates/cuda/./cuda_fp8.h(58): warning #20012-D: __device__ annotation is ignored on a non-virtual function("fp8_e4_8_t") that is explicitly defaulted on its first declaration
+    __inline__ __attribute__((always_inline)) __attribute__((device)) fp8_e4_8_t() = default; __inline__ __attribute__((always_inline)) __attribute__((device)) fp8_e4_8_t(const fp8_e4_8_t &other) { *this = other; } __inline__ __attribute__((always_inline)) __attribute__((device)) fp8_e4_8_t &operator=(const fp8_e4_8_t &other) { static_assert(sizeof(fp8_e4_8_t) == sizeof(uint2), "FP8 copy size mismatch"); static_assert(alignof(fp8_e4_8_t) >= alignof(uint2), "FP8 copy alignment mismatch"); *reinterpret_cast<uint2 *>(this) = *reinterpret_cast<const uint2 *>(&other); return *this; }
+                                                             ^
+
+/usr/local/lib/python3.12/dist-packages/tilelang/3rdparty/../src/tl_templates/cuda/./cuda_fp8.h(65): warning #20012-D: __device__ annotation is ignored on a non-virtual function("fp8_e4_16_t") that is explicitly defaulted on its first declaration
+    __inline__ __attribute__((always_inline)) __attribute__((device)) fp8_e4_16_t() = default; __inline__ __attribute__((always_inline)) __attribute__((device)) fp8_e4_16_t(const fp8_e4_16_t &other) { *this = other; } __inline__ __attribute__((always_inline)) __attribute__((device)) fp8_e4_16_t &operator=(const fp8_e4_16_t &other) { static_assert(sizeof(fp8_e4_16_t) == sizeof(uint4), "FP8 copy size mismatch"); static_assert(alignof(fp8_e4_16_t) >= alignof(uint4), "FP8 copy alignment mismatch"); *reinterpret_cast<uint4 *>(this) = *reinterpret_cast<const uint4 *>(&other); return *this; }
+                                                             ^
+
+/usr/local/lib/python3.12/dist-packages/tilelang/3rdparty/../src/tl_templates/cuda/./cuda_fp8.h(72): warning #20012-D: __device__ annotation is ignored on a non-virtual function("fp8_e4_32_t") that is explicitly defaulted on its first declaration
+    __inline__ __attribute__((always_inline)) __attribute__((device)) fp8_e4_32_t() = default; __inline__ __attribute__((always_inline)) __attribute__((device)) fp8_e4_32_t(const fp8_e4_32_t &other) { *this = other; } __inline__ __attribute__((always_inline)) __attribute__((device)) fp8_e4_32_t &operator=(const fp8_e4_32_t &other) { static_assert(sizeof(fp8_e4_32_t) == sizeof(ulonglong4), "FP8 copy size mismatch"); static_assert(alignof(fp8_e4_32_t) >= alignof(ulonglong4), "FP8 copy alignment mismatch"); *reinterpret_cast<ulonglong4 *>(this) = *reinterpret_cast<const ulonglong4 *>(&other); return *this; }
+                                                             ^
+
+/usr/local/lib/python3.12/dist-packages/tilelang/3rdparty/../src/tl_templates/cuda/./cuda_fp8.h(79): warning #20012-D: __device__ annotation is ignored on a non-virtual function("fp8_e5_2_t") that is explicitly defaulted on its first declaration
+    __inline__ __attribute__((always_inline)) __attribute__((device)) fp8_e5_2_t() = default; __inline__ __attribute__((always_inline)) __attribute__((device)) fp8_e5_2_t(const fp8_e5_2_t &other) { *this = other; } __inline__ __attribute__((always_inline)) __attribute__((device)) fp8_e5_2_t &operator=(const fp8_e5_2_t &other) { static_assert(sizeof(fp8_e5_2_t) == sizeof(uint16_t), "FP8 copy size mismatch"); static_assert(alignof(fp8_e5_2_t) >= alignof(uint16_t), "FP8 copy alignment mismatch"); *reinterpret_cast<uint16_t *>(this) = *reinterpret_cast<const uint16_t *>(&other); return *this; }
+                                                             ^
+
+/usr/local/lib/python3.12/dist-packages/tilelang/3rdparty/../src/tl_templates/cuda/./cuda_fp8.h(88): warning #20012-D: __device__ annotation is ignored on a non-virtual function("fp8_e5_4_t") that is explicitly defaulted on its first declaration
+    __inline__ __attribute__((always_inline)) __attribute__((device)) fp8_e5_4_t() = default; __inline__ __attribute__((always_inline)) __attribute__((device)) fp8_e5_4_t(const fp8_e5_4_t &other) { *this = other; } __inline__ __attribute__((always_inline)) __attribute__((device)) fp8_e5_4_t &operator=(const fp8_e5_4_t &other) { static_assert(sizeof(fp8_e5_4_t) == sizeof(uint32_t), "FP8 copy size mismatch"); static_assert(alignof(fp8_e5_4_t) >= alignof(uint32_t), "FP8 copy alignment mismatch"); *reinterpret_cast<uint32_t *>(this) = *reinterpret_cast<const uint32_t *>(&other); return *this; }
+                                                             ^
+
+/usr/local/lib/python3.12/dist-packages/tilelang/3rdparty/../src/tl_templates/cuda/./cuda_fp8.h(95): warning #20012-D: __device__ annotation is ignored on a non-virtual function("fp8_e5_8_t") that is explicitly defaulted on its first declaration
+    __inline__ __attribute__((always_inline)) __attribute__((device)) fp8_e5_8_t() = default; __inline__ __attribute__((always_inline)) __attribute__((device)) fp8_e5_8_t(const fp8_e5_8_t &other) { *this = other; } __inline__ __attribute__((always_inline)) __attribute__((device)) fp8_e5_8_t &operator=(const fp8_e5_8_t &other) { static_assert(sizeof(fp8_e5_8_t) == sizeof(uint2), "FP8 copy size mismatch"); static_assert(alignof(fp8_e5_8_t) >= alignof(uint2), "FP8 copy alignment mismatch"); *reinterpret_cast<uint2 *>(this) = *reinterpret_cast<const uint2 *>(&other); return *this; }
+                                                             ^
+
+/usr/local/lib/python3.12/dist-packages/tilelang/3rdparty/../src/tl_templates/cuda/./cuda_fp8.h(102): warning #20012-D: __device__ annotation is ignored on a non-virtual function("fp8_e5_16_t") that is explicitly defaulted on its first declaration
+    __inline__ __attribute__((always_inline)) __attribute__((device)) fp8_e5_16_t() = default; __inline__ __attribute__((always_inline)) __attribute__((device)) fp8_e5_16_t(const fp8_e5_16_t &other) { *this = other; } __inline__ __attribute__((always_inline)) __attribute__((device)) fp8_e5_16_t &operator=(const fp8_e5_16_t &other) { static_assert(sizeof(fp8_e5_16_t) == sizeof(uint4), "FP8 copy size mismatch"); static_assert(alignof(fp8_e5_16_t) >= alignof(uint4), "FP8 copy alignment mismatch"); *reinterpret_cast<uint4 *>(this) = *reinterpret_cast<const uint4 *>(&other); return *this; }
+                                                             ^
+
+/usr/local/lib/python3.12/dist-packages/tilelang/3rdparty/../src/tl_templates/cuda/./cuda_fp8.h(109): warning #20012-D: __device__ annotation is ignored on a non-virtual function("fp8_e5_32_t") that is explicitly defaulted on its first declaration
+    __inline__ __attribute__((always_inline)) __attribute__((device)) fp8_e5_32_t() = default; __inline__ __attribute__((always_inline)) __attribute__((device)) fp8_e5_32_t(const fp8_e5_32_t &other) { *this = other; } __inline__ __attribute__((always_inline)) __attribute__((device)) fp8_e5_32_t &operator=(const fp8_e5_32_t &other) { static_assert(sizeof(fp8_e5_32_t) == sizeof(ulonglong4), "FP8 copy size mismatch"); static_assert(alignof(fp8_e5_32_t) >= alignof(ulonglong4), "FP8 copy alignment mismatch"); *reinterpret_cast<ulonglong4 *>(this) = *reinterpret_cast<const ulonglong4 *>(&other); return *this; }
+                                                             ^
+
+/usr/local/lib/python3.12/dist-packages/tilelang/3rdparty/../src/tl_templates/cuda/./cuda_fp8.h(116): warning #20012-D: __device__ annotation is ignored on a non-virtual function("fp8_e8_2_t") that is explicitly defaulted on its first declaration
+    __inline__ __attribute__((always_inline)) __attribute__((device)) fp8_e8_2_t() = default; __inline__ __attribute__((always_inline)) __attribute__((device)) fp8_e8_2_t(const fp8_e8_2_t &other) { *this = other; } __inline__ __attribute__((always_inline)) __attribute__((device)) fp8_e8_2_t &operator=(const fp8_e8_2_t &other) { static_assert(sizeof(fp8_e8_2_t) == sizeof(uint16_t), "FP8 copy size mismatch"); static_assert(alignof(fp8_e8_2_t) >= alignof(uint16_t), "FP8 copy alignment mismatch"); *reinterpret_cast<uint16_t *>(this) = *reinterpret_cast<const uint16_t *>(&other); return *this; }
+                                                             ^
+
+/usr/local/lib/python3.12/dist-packages/tilelang/3rdparty/../src/tl_templates/cuda/./cuda_fp8.h(125): warning #20012-D: __device__ annotation is ignored on a non-virtual function("fp8_e8_4_t") that is explicitly defaulted on its first declaration
+    __inline__ __attribute__((always_inline)) __attribute__((device)) fp8_e8_4_t() = default; __inline__ __attribute__((always_inline)) __attribute__((device)) fp8_e8_4_t(const fp8_e8_4_t &other) { *this = other; } __inline__ __attribute__((always_inline)) __attribute__((device)) fp8_e8_4_t &operator=(const fp8_e8_4_t &other) { static_assert(sizeof(fp8_e8_4_t) == sizeof(uint32_t), "FP8 copy size mismatch"); static_assert(alignof(fp8_e8_4_t) >= alignof(uint32_t), "FP8 copy alignment mismatch"); *reinterpret_cast<uint32_t *>(this) = *reinterpret_cast<const uint32_t *>(&other); return *this; }
+                                                             ^
+
+/usr/local/lib/python3.12/dist-packages/tilelang/3rdparty/../src/tl_templates/cuda/./cuda_fp8.h(132): warning #20012-D: __device__ annotation is ignored on a non-virtual function("fp8_e8_8_t") that is explicitly defaulted on its first declaration
+    __inline__ __attribute__((always_inline)) __attribute__((device)) fp8_e8_8_t() = default; __inline__ __attribute__((always_inline)) __attribute__((device)) fp8_e8_8_t(const fp8_e8_8_t &other) { *this = other; } __inline__ __attribute__((always_inline)) __attribute__((device)) fp8_e8_8_t &operator=(const fp8_e8_8_t &other) { static_assert(sizeof(fp8_e8_8_t) == sizeof(uint2), "FP8 copy size mismatch"); static_assert(alignof(fp8_e8_8_t) >= alignof(uint2), "FP8 copy alignment mismatch"); *reinterpret_cast<uint2 *>(this) = *reinterpret_cast<const uint2 *>(&other); return *this; }
+                                                             ^
+
+/usr/local/lib/python3.12/dist-packages/tilelang/3rdparty/../src/tl_templates/cuda/./cuda_fp8.h(139): warning #20012-D: __device__ annotation is ignored on a non-virtual function("fp8_e8_16_t") that is explicitly defaulted on its first declaration
+    __inline__ __attribute__((always_inline)) __attribute__((device)) fp8_e8_16_t() = default; __inline__ __attribute__((always_inline)) __attribute__((device)) fp8_e8_16_t(const fp8_e8_16_t &other) { *this = other; } __inline__ __attribute__((always_inline)) __attribute__((device)) fp8_e8_16_t &operator=(const fp8_e8_16_t &other) { static_assert(sizeof(fp8_e8_16_t) == sizeof(uint4), "FP8 copy size mismatch"); static_assert(alignof(fp8_e8_16_t) >= alignof(uint4), "FP8 copy alignment mismatch"); *reinterpret_cast<uint4 *>(this) = *reinterpret_cast<const uint4 *>(&other); return *this; }
+                                                             ^
+
+/usr/local/lib/python3.12/dist-packages/tilelang/3rdparty/../src/tl_templates/cuda/./cuda_fp8.h(146): warning #20012-D: __device__ annotation is ignored on a non-virtual function("fp8_e8_32_t") that is explicitly defaulted on its first declaration
+    __inline__ __attribute__((always_inline)) __attribute__((device)) fp8_e8_32_t() = default; __inline__ __attribute__((always_inline)) __attribute__((device)) fp8_e8_32_t(const fp8_e8_32_t &other) { *this = other; } __inline__ __attribute__((always_inline)) __attribute__((device)) fp8_e8_32_t &operator=(const fp8_e8_32_t &other) { static_assert(sizeof(fp8_e8_32_t) == sizeof(ulonglong4), "FP8 copy size mismatch"); static_assert(alignof(fp8_e8_32_t) >= alignof(ulonglong4), "FP8 copy alignment mismatch"); *reinterpret_cast<ulonglong4 *>(this) = *reinterpret_cast<const ulonglong4 *>(&other); return *this; }
+                                                             ^
+
+/usr/local/lib/python3.12/dist-packages/tilelang/3rdparty/../src/tl_templates/cuda/intrin.h(184): error: static assertion failed with "tl::warpgroup_reg_dealloc requires a target with CTA register reconfiguration, such as sm_90a"
+    static_assert(kDependentFalse,
+    ^
+          detected during instantiation of "void tl::warpgroup_reg_dealloc<RegCount,kDependentFalse>() [with RegCount=24U, kDependentFalse=false]" at line 46 of /tmp/tmpog8s2v3z/tvm_kernels.cu
+
+/usr/local/lib/python3.12/dist-packages/tilelang/3rdparty/../src/tl_templates/cuda/intrin.h(173): error: static assertion failed with "tl::warpgroup_reg_alloc requires a target with CTA register reconfiguration, such as sm_90a"
+    static_assert(kDependentFalse,
+    ^
+          detected during instantiation of "void tl::warpgroup_reg_alloc<RegCount,kDependentFalse>() [with RegCount=240U, kDependentFalse=false]" at line 57 of /tmp/tmpog8s2v3z/tvm_kernels.cu
+
+2 errors detected in the compilation of "/tmp/tmpog8s2v3z/tvm_kernels.cu".
+
+Command: /usr/local/cuda/bin/nvcc -ccbin=/usr/bin/g++ --cubin -O3 -lineinfo -arch=sm_121 -std=c++20 -I/usr/local/lib/python3.12/dist-packages/tilelang/3rdparty/../src -I/usr/local/lib/python3.12/dist-packages/tilelang/3rdparty/cutlass/include -o /tmp/tmpog8s2v3z/tvm_kernels.cubin /tmp/tmpog8s2v3z/tvm_kernels.cu

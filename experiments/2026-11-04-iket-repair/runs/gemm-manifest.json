@@ -1,0 +1,105 @@
+{
+ "kernel": "gemm_bf16_kernel",
+ "ctas": 1,
+ "iters": 1,
+ "granularity": "phase",
+ "warps": 1,
+ "payloads": false,
+ "sites": [
+  {
+   "kernel": "gemm_bf16_kernel",
+   "range": "wait.sync",
+   "phase": "wait",
+   "kinds": [
+    "sync"
+   ],
+   "first_line": 42,
+   "last_line": 42,
+   "statement": "__syncthreads();",
+   "loops": 0,
+   "settled": true,
+   "traced": true,
+   "events_per_warp_bound": 12
+  },
+  {
+   "kernel": "gemm_bf16_kernel",
+   "range": "wait.mbarrier*8",
+   "phase": "wait",
+   "kinds": [
+    "mbarrier"
+   ],
+   "first_line": 46,
+   "last_line": 46,
+   "statement": "mbarrier[((ko % 3) + 3)].wait((((ko % 6) / 3) ^ 1));",
+   "loops": 1,
+   "loop_trips": 8,
+   "settled": false,
+   "traced": true,
+   "events_per_warp_bound": 12
+  },
+  {
+   "kernel": "gemm_bf16_kernel",
+   "range": "load.tma*8",
+   "phase": "load",
+   "kinds": [
+    "tma"
+   ],
+   "first_line": 47,
+   "last_line": 52,
+   "statement": "if (tl::tl_shuffle_elect<128>())",
+   "loops": 1,
+   "loop_trips": 8,
+   "tma_bytes": 16384,
+   "settled": false,
+   "traced": true,
+   "events_per_warp_bound": 12
+  },
+  {
+   "kernel": "gemm_bf16_kernel",
+   "range": "wait.mbarrier#2*8",
+   "phase": "wait",
+   "kinds": [
+    "mbarrier"
+   ],
+   "first_line": 62,
+   "last_line": 62,
+   "statement": "mbarrier[(ko_1 % 3)].wait(((ko_1 % 6) / 3));",
+   "loops": 1,
+   "loop_trips": 8,
+   "settled": false,
+   "traced": true,
+   "events_per_warp_bound": 12
+  },
+  {
+   "kernel": "gemm_bf16_kernel",
+   "range": "compute.mma*8",
+   "phase": "compute",
+   "kinds": [
+    "mma"
+   ],
+   "first_line": 63,
+   "last_line": 82,
+   "statement": "{",
+   "loops": 1,
+   "loop_trips": 8,
+   "settled": false,
+   "traced": true,
+   "events_per_warp_bound": 12
+  },
+  {
+   "kernel": "gemm_bf16_kernel",
+   "range": "store.global",
+   "phase": "store",
+   "kinds": [
+    "global"
+   ],
+   "first_line": 85,
+   "last_line": 90,
+   "statement": "for (int i_4 = 0; i_4 < 16; ++i_4)",
+   "loops": 0,
+   "settled": false,
+   "traced": true,
+   "events_per_warp_bound": 12
+  }
+ ]
+}

@@ -1,57 +1,59 @@
 # Candidate 1107
 
-Unpromoted release candidate combining the validated default-enabled `C40`
-runtime base (`5f926df6d312`) with the reviewed and strengthened post-`1030` PRs
-across the vLLM serving stack and the `C45` TileLang compiler stack.
+Unpromoted release candidate combining the validated `C40` runtime base with the complete 2-boot GPU-qualified post-`1030` serving, kernel, compiler, speculative decoding, sequence-parallel, multimodal, and collective optimizations.
 
 ## Source Identity
 
 | Component | Base Revision | Patch Series | Patch Count | Patch Head | Expected Tree | Patchset SHA-256 |
 |---|---|---|---:|---|---|---|
-| `vllm` | `19f2c20ed4d64ae22bd009ceacadd85e2a81e354` | `experiments/2026-10-26-spark-ds41f-candidate/1107/vllm/series` (`0001..0743`) | `615` | `a75357bba81e31e4f3085700f94b6a0b29aed44a` | `45757842cce62c7da54f3873918839866e8c040d` | `9ef866d85a989b41354a3ee4536f32ff31740d4e2063e2298a1c656f8c0da8aa` |
-| `tilelang` | `2123e412ce2217b324c50c4ec967213906456ac5` | `experiments/2026-11-05-compiler-prepared-rework/tilelang/series` (`0001..0012`) | `12` | `a470d5daf8529fcf2b661f1119c8f4bb1aecc5e2` | `80fcfc4521b06e0c9776bbf1b5419849557e1090` | `2018cea5190861fd1ebaf51a5ed95289debdcba4b2f931fd333af95794a90fff` |
-| `sparknet` | `b61660f47a3f5c8f9369f21f92a75313e9b39579` | `experiments/2026-10-24-sparknet-all-to-all/sparknet/series` (`0001..0010`) | `10` | `5ce8c94218f8ce352d36c0d3995f896957e5052f` | `6602287e7f5a60de22fa1533e70e8e73eb7b4713` | `99cd8469f3b490c7361fc54ef481e0621417eb6ab3632cb6614fb55c31e36374` |
+| `vllm` | `19f2c20ed4d64ae22bd009ceacadd85e2a81e354` | `experiments/2026-10-26-spark-ds41f-candidate/1107/vllm/series` (`0001..0758`, `638` active) | `638` | `efd4342f8d2a858e2183449cf88ab78803124af9` | `263bda12d29a602c8f37b1ec43386daef8694fb6` | `346b80849634c705c8de9bae2ed9ebc07067f01755261107fdc8ec321671e8f0` |
+| `tilelang` | `2123e412ce2217b324c50c4ec967213906456ac5` | `experiments/2026-11-05-compiler-prepared-rework/tilelang/series` (`0001..0013`) | `13` | `92a1d3a0eba72b440297d4090bbfc498a47b0eb6` | `e2b001828fd4e38e6a2eee61f818d5083cb1335f` | `2142ea448ceec22c0643badfd24bba129eb4b15e3f03a0c4c8c3ccb468b8e0d1` |
+| `sparknet` | `1fd6a1fbd8dc4884057046d1ebd93d585c9e4bcf` | `none` (`refs/heads/main`) | `0` | `1fd6a1fbd8dc4884057046d1ebd93d585c9e4bcf` | `8cc28a5cd3e683c1f114ed843453e3ce34f323e0` | `e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855` |
 
-## Included PRs and Code-Review Refinements
+## Included Workstreams and 2-Boot GPU Qualifications
 
 1. **Base Stack (`C40`, `0001..0689`, 574 patch files)**:
    - Validated `C38` base (`0001..0687`) plus default `CopyDrafter` enablement and safe envelope (`0688`) and lazy top-k scratch-read guard from PR `#878` (`0689`).
-2. **TileLang Runtime Closure & Single-Rank Path (`#885`, `#886`, `#887`, `#893`, `#895`, `#912`, `#913`, `#914`, `#915` / `#926`, `0690..0719`)**:
-   - Replaces all remaining ATen compute kernels on the single-GPU request path with TileLang or DMA:
-     - `0690`, `0703`, `0704`, `0707`, `0712` (`#885`): TileLang `copy_logits` with 4-wide aligned vectorization, column-first traversal, 1024-column FP32 tiles, and pitched 2D `cudaMemcpy2DAsync` bypass for aligned FP32 matrices `>= 8 MiB`.
-     - `0691` (`#886`): TileLang 8-D strided `rank_order_strided` reduction replacing `torch.sum` fallbacks.
-     - `0692`, `0705`, `0708`, `0711`, `0713`, `0715` (`#887`): Fused `gather_columns_into` and `concat_rank_shards` with magic-multiplier division (`m = (1 << 32) // d + 1`) and 1-warp (`threads=32`) compact blocks for tiny non-vectorized tails.
-     - `0693`, `0700` (`#893`): Fused `gather_logits_kernel` for `logits`-mode selected token scores.
-     - `0694..0699`, `0701..0702`, `0719` (`#895`): Native `int32`/`int64` strided token-ID score inputs, eliminating `.long().contiguous()` ATen `copy_`/`fill_` launches and using 1-warp shared-memory staging.
-     - `0706`, `0709..0710` (`#912`): Fused `prompt_scores_and_ranks` kernel computing prompt log-softmax and token ranks in a single vocabulary pass.
-     - `0714`, `0716` (`#913`): Non-blocking 1-D span `copy_` in `LogprobsTensors.to_cpu_nonblocking`, eliminating per-step GPU slice materialization when `max_num_logprobs == 0`.
-     - `0717` (`#915`): Single-rank fused greedy Markov drafting in `DSparkDraftModel`.
-     - `0718` (`#914`): Native `int32`/`int64` TP1 token IDs in `VocabParallelEmbedding` without `.int()` cast kernels.
+2. **TileLang Runtime Closure & Single-Rank Path (`#885`, `#886`, `#887`, `#893`, `#895`, `#912`, `#915`, `0690..0713`, `0717`, `0752..0754`)**:
+   - Replaces ATen compute kernels on the request path with TileLang or DMA (`copy_logits` with pitched 2D `cudaMemcpy2DAsync` for aligned FP32 matrices `>= 8 MiB`, 8-D strided `rank_order_strided`, magic-multiplier `gather_columns_into` / `concat_rank_shards` with TensorIterator bypass for tiny tails `<= 128` vector units in `0713` and PDL chaining in `0753`, `gather_logits_kernel`, native strided `int32`/`int64` token-ID score inputs, single-pass `prompt_scores_and_ranks`, single-rank fused Markov drafting in `0717` with warp-shuffle vocab greedy epilogue and L2-hot step dispatch in `0752`, and warp-broadcast target logit + fused barriers in `topk_log_softmax` in `0754`).
 3. **Serving Contract & Dead-Code Cleanup (`#894`, `0720..0722`)**:
    - Enforces the sequence-parallel MoE contract (`tp_size > 1` with `use_sequence_parallel_moe=False` rejected), removes dead `VLLM_DS41_ENGRAM_OVERLAP`, `VLLM_DS41_MARKOV_NVFP4`, and `VLLM_DS41_DRAFT_NVFP4_HEAD` fallback branches, and records capability `ds41-serving-contract`.
 4. **Frontend Request & Utility Lifetime Cleanup + Worker Test Isolation (`#890` + `C46`, `0723..0724`, `0730`)**:
-   - Rolls back partially registered `OutputProcessor` / `CoreClient` state on failed `generate()` submission (`0723`) and pops abandoned `call_utility_async` futures on cancellation or send failure (`0724`).
-   - **Review refinement (`0730`)**: Adding `#890`'s two new test files shifted pytest worker grouping so `test_gpu_tilelang_logprob_softmax.py` ran in the same process before `test_gpu_verified_logprob_token_ids.py::test_tilelang_worker_modules_hold_no_live_triton_reference_kernels`. Patching `logprob._topk_log_softmax_kernel` via `monkeypatch.setattr` resolved `logprob.__getattr__` and restored the lazy Triton `JITFunction` into `logprob.__dict__` on teardown. `0730-isolate-logprob-triton-monkeypatch.patch` uses `patch.setitem(logprob.__dict__, "_topk_log_softmax_kernel", None)` inside `monkeypatch.context()` and asserts `"_topk_log_softmax_kernel" not in logprob.__dict__`.
+   - Rolls back partially registered `OutputProcessor` / `CoreClient` state on failed `generate()` submission (`0723`), pops abandoned `call_utility_async` futures on cancellation or send failure (`0724`), and isolates Triton reference monkeypatching (`0730`).
 5. **HTTP Disconnect & Repeated Cancellation Ownership (`#918`, `0725..0726`)**:
-   - Cancels and awaits both `handler_task` and `cancellation_task` inside a shielded `CancelScope`, closes abandoned streaming generators (`aclose()`), and keeps `track_load` wrapping `with_cancellation`.
-   - **Review refinement (`0726`)**: Replaces `await asyncio.gather(*tasks, return_exceptions=True)` in `finally:` with an `asyncio.wait(tasks)` loop that absorbs repeated `asyncio.CancelledError` interrupts until child cleanup finishes, then retrieves task exceptions and re-raises the outer `CancelledError`.
-6. **CED Encoder Prefix Endpoint Retention (`#923`, `0727`)**:
-   - Retains `(resend, request.num_prompt_tokens)` in `KVCacheCoordinator._get_retention_endpoints` when `not self.eagle_group_ids and self.prefill_replay_tokens > 1`, preventing premature truncation of completed 256-token encoder prefix pages when `(num_prompt_tokens % 256) < 128`.
-7. **Native-Depth Verification CUDA Graph Shapes (`#921`, `0728..0729`)**:
-   - Threads `uniform_query_len = 6` (`vllm_config.uniform_decode_query_len`) into `dense_varlen_decode_shapes`, `dspark.py` (`_context_capture_sizes`), and `b12x_prepare.py` (`_planned_decode_counts`). Restores exact `(num_reqs, 6 * num_reqs)` target, context, and warmup CUDA graph shapes (`36` rows at `c6`, `42` rows at `c7`) with `+9` target graphs on TP3 (`60 -> 69`) instead of the `shape-union` alternative (`89` on TP3 / `169` on TP4).
-8. **TileLang Compiler Refresh & Prepared-Kernel Fix (`#875`, `#879..#883`, `C45`, `tilelang/0001..0012`)**:
-   - Refreshes TileLang to `2123e412ce22` with retained SM120/SM121 features (`0001..0005`), correctness fixes (`0006..0010`), explicit `prepare()` compilation when `is_cache_enabled()` is false before `freeze()` (`0011`, fixing `C42`'s IKET failure), and snapshot `VERSION` namespacing (`0012`).
-
-## Excluded Candidates and PRs
-
-- **`C41` (`experiments/2026-11-04-copy-overlap-rework`)**: Excluded per `decision.md` after two-boot hardware measurement showed engine-grid cost regressions (`+0.206%` to `+0.409%`, worse in 7/8 views) and cold 524K prefill regressions (`-0.181%` to `-0.667%`, worse in 4/8 views) relative to `C40`.
-- **Unqualified / Active Research Drafts (`#877`, `#916`, `#917`, `#919`, `#920`, `#922`, `#924`, `#925`)**: Excluded until their independent correctness and two-boot serving qualifications complete.
+   - Cancels and awaits both `handler_task` and `cancellation_task` inside a shielded `CancelScope`, closes abandoned streaming generators (`aclose()`), and absorbs repeated `asyncio.CancelledError` interrupts in `finally:` until child cleanup finishes (`0726`).
+6. **CED Encoder Prefix Endpoint Retention & Finite Decoder Recovery (`#923`, `#919`, `0727`, `0731..0734`)**:
+   - Retains `(resend, request.num_prompt_tokens)` in `KVCacheCoordinator._get_retention_endpoints` only when `resend // block != num_prompt_tokens // block` (`0727`, saving `-10.22 to -10.95 ms` / `+26.0% to +32.8%` on cross-block GPU CED prefills), reads live activation rows in padded MXFP8 decode tiles (`0731`), and reconstructs private finite decoder history after preemption (`0732..0734`).
+7. **Native-Depth Verification CUDA Graph Shapes & Replay (`#921`, `0728..0729`, `0735`)**:
+   - Adds native verification row totals `[18, 30, 36, 42]` (`+4` target graphs on TP3, `-2.97 ms` / `+22.52%` at `42` rows in `0728`) and replays DSpark drafter metadata inside query graphs (`0735`, `-0.39 ms/step`).
+8. **Sequence-Parallel Prefill & mHC/MLA Kernel Optimizations (`0736..0740`, `0742..0743`, `0755..0756`)**:
+   - Selects `prefill_swizzle_panel=2` for `M=64` routed MoE GEMM (`0736`), exchanges WO-A MXFP8 rows and projects WO-B on local SP rows (`0737`), exchanges SP Engram prefill columns and slices projection (`0738`), removes fused mHC entry optionality for 2-launch PDL (`0739`), right-sizes sparse-MLA head block (`block_H=16`) for 16-head TP3 ranks (`0740`), keeps CED boundary normalization and global KV projection on local SP rows before latent gather (`0742..0743`), fuses rank-major shards in `mhc.post` and Engram post-gate (`0755`), and chains routed MoE decode kernels with PDL (`0756`).
+9. **Opt-In `VLLM_DS41_LSA` Shortlist Indexing (`0741`)**:
+   - Adds opt-in `VLLM_DS41_LSA=1` BF16 block-8 shortlist indexing while keeping `VLLM_DS41_LSA=0` default-off bit-identical.
+10. **CopyDrafter Caller-Stream Preparation, Continuation Priority, Warp Pruning & Expected-Yield Gating (`0744..0745`)**:
+    - Runs CopyDrafter preparation on the caller stream (`0744`), ranks longest-level matches by available continuation length (`1..lookahead`) before recency, prunes shorter-level backward suffix scans via warp-minimum `need_len` and 2-token anchor probes (`28–90x` faster on 1M-token contexts), and gates copy replacement against DSpark's expected yield (`offered * estimate >= sum(dspark_confidences[r, :block])` in `0745`).
+11. **DSpark Online Confidence Calibration & Adaptive Verification Alignment (`0746`)**:
+    - Calibrates DSpark confidence head probabilities online via identity-initialized logit-space Platt scaling (`OnlineAcceptanceEstimator.for_confidence_head`), feeds calibrated survival into `select_verification_counts`, and aligns the `c1..c2` threshold to `0.06335` (`43.67x` survival MAE reduction, `+1.21%` expected tokens/step cost on heterogeneous `c8`).
+12. **Cross-Topology TP2..TP8 Parity & Selective 12-Bit `pack12` Compressor (`0747..0748`)**:
+    - Extends column-sharded compressor `fused_wkv_wgate`, `fused_wqa_wkv` decode tiles, and `_trim_padded_groups` across `TP2..TP8` (`0747`), and packs lossless 4-zero-nibble BF16 compressor weights to 12-bit (`0748`, `2.38x` total TP3 compressor speedup).
+13. **Indexer `wq_b` Decode RoPE + MXFP4 Epilogue Fusion (`0749`)**:
+    - Fuses decode RoPE rotation and scale-matched MXFP4 quantization into `wq_b`'s 256-thread TileLang GEMM epilogue (`100% torch.equal`, eliminating 42 `quantize_mxfp4` launches/step and saving `-0.11 to -0.24 ms` per captured 42-layer step).
+14. **Multi-CTA Disk Engram Step, Packed Rows, Negative-Delta Guard & Full-Batch Cache (`0750`)**:
+    - Fuses disk Engram wait, FP8 gather/dequantize, and release into a single multi-CTA kernel (`2.14x–2.41x` Eager, `1.07x–1.18x` CUDA Graph), wires 4 KiB-aligned single-plane packed rows with `col_delta[c] < 0` overflow validation and startup telemetry, and keeps the 17.3 MiB 4-way user-space row cache active across all batch sizes.
+15. **Deep-Context `>=256K` Chunk Step-Down & `>=1.0s` Stall Decode Interleave (`0751`)**:
+    - Preserves full `long_prefill_token_threshold` chunks below `256K` context and on solo prefills while stepping down onto the `2,048`-token grid at `>=256K` and interleaving `K=2` pure decode steps once accumulated prefill stall reaches `>=1.0s` (`-56% to -82%` deep-context decode ITL).
+16. **Row-Parallel Vision (`wo`/`w2`), Multi-Image Packing, JPEG `Image.draft()` Downscaling & `{"image": 16}` Cap (`0758` + `1107/{tp3,tp4}.json`)**:
+    - Switches vision `attn.wo` and `mlp.w2` to row-parallel `all_reduce`, packs multi-image encoders into a single flash-attn launch, adds `Image.draft()` decode-time downscaling (`7.77x` at 4K), and raises `--limit-mm-per-prompt` to `{"image": 16}`.
+17. **IKET Runtime Loop & Phase Profiler (`0757`) + TileLang Multi-Warp TMA Producer Rendezvous (`tilelang/0013`)**:
+    - Adds `tilelang/0013-rendezvous-multi-warp-tma-producers.patch` so multi-warp TMA producer groups synchronize at `mbarrier.arrive_expect_tx` (`0` hangs across 2-boot 10-suite release gate and 2-boot IKET verification in `experiments/2026-10-26-spark-ds41f-candidate/1107/receipts/`).
+18. **TP3 6-Channel Bidirectional 8 MiB NCCL Ring (`1107/tp3.json`)**:
+    - Configures `NCCL_ALGO=Ring`, `NCCL_MIN_NCHANNELS=6`, `NCCL_MAX_NCHANNELS=6`, `NCCL_BUFFSIZE=8388608`, `NCCL_P2P_NET_CHUNKSIZE=262144`, `NCCL_SWITCHLESS_BIDIRECTIONAL=1`, `NCCL_MIN_TRAFFIC_PER_CHANNEL=512`, and `NCCL_THREAD_THRESHOLDS="-2 -2 -2 1 1 1"` (`-16.1%` 42-layer collective time per step on TP3).
 
 ## Verification
 
 ```bash
 bin/spark --cluster-config experiments/2026-10-26-spark-ds41f-candidate/1107/tp3.json doctor
 bin/spark --cluster-config experiments/2026-10-26-spark-ds41f-candidate/1107/tp4.json doctor
-python3 scripts/release_tests.py check /path/to/vllm 19f2c20ed4d64ae22bd009ceacadd85e2a81e354 HEAD experiments/2026-10-26-spark-ds41f-candidate/1107/release-tests.json
-python3 -m unittest tests.test_source_locks tests.test_recipe tests.test_build tests.test_doctor
+python3 scripts/release_tests.py check /path/to/vllm a75357bba81e31e4f3085700f94b6a0b29aed44a HEAD experiments/2026-10-26-spark-ds41f-candidate/1107/release-tests.json
+python3 -m unittest discover -s tests -p "test_*.py"
 ```

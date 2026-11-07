@@ -1,0 +1,158 @@
+From b7e51b5933e92734d3853bf398be0941db524332 Mon Sep 17 00:00:00 2001
+From: Christopher Owen <3221756+christopherowen@users.noreply.github.com>
+Date: Fri, 6 Nov 2026 22:25:17 +0000
+Subject: [PATCH] perf(dsv41): add PDL chain to gather_columns_kernel before
+ compressor
+
+Upstream base: 19f2c20ed4d64ae22bd009ceacadd85e2a81e354.
+
+Rationale:
+gather_columns_into runs immediately between the rank-major all-gather and
+gather_partial_state_kernel / compress_kernel inside DeepseekCompressor._project.
+Without pdl.chain() (T.pdl_sync() / T.pdl_trigger()), compress_kernel cannot
+overlap its pre-wait static weight and slot-metadata preload with
+gather_columns_kernel. Add pdl.chain() to gather_columns_kernel and register
+gather_columns_into in tests/kernels/deepseek_v41_pdl_sources.py CHAIN,
+reducing gather_columns_into -> compress_kernel chain latency across 2 GB10
+boots by -19.85%..-25.52% on ratio-1 and -4.85%..-8.85% on ratio-2 across
+TP3 and TP4 (M = 1..128).
+
+Quality:
+Bit-identical torch.equal output across all ranks, row counts, padding rows,
+and output strides; only adds Programmatic Dependent Launch synchronization.
+
+Tests:
+131/131 gather + PDL tests and 14/14 TileLang PDL source/SASS/order audit
+tests pass across 2 GPU boots on GB10 with 0 PDL violations.
+
+Upstream status:
+Local DeepSeek-V4.1 TileLang PDL chain completion for spark-ds41f.
+---
+ tests/kernels/deepseek_v41_pdl_sources.py     |  1 +
+ .../kernels/test_deepseek_v41_tilelang_pdl.py | 79 +++++++++++++++++++
+ vllm/models/deepseek_v4_1/tilelang/gather.py  |  3 +-
+ 3 files changed, 82 insertions(+), 1 deletion(-)
+
+diff --git a/tests/kernels/deepseek_v41_pdl_sources.py b/tests/kernels/deepseek_v41_pdl_sources.py
+index 269ae75ab..bba289b56 100644
+--- a/tests/kernels/deepseek_v41_pdl_sources.py
++++ b/tests/kernels/deepseek_v41_pdl_sources.py
+@@ -28,6 +28,7 @@ CHAIN = {
+     "split_columns",
+     "join_columns_and_cast_mxfp8",
+     "copy_columns",
++    "gather_columns_into",
+     "context_inputs",
+     "activation_swiglu_clamp",
+     "activation_swiglu_clamp_cast",
+diff --git a/tests/kernels/test_deepseek_v41_tilelang_pdl.py b/tests/kernels/test_deepseek_v41_tilelang_pdl.py
+index f5f219fb5..39770eec6 100644
+--- a/tests/kernels/test_deepseek_v41_tilelang_pdl.py
++++ b/tests/kernels/test_deepseek_v41_tilelang_pdl.py
+@@ -430,3 +430,82 @@ def test_bf16_partials_edges_are_programmatic():
+         if target is None or source is None:
+             continue
+         assert kind == PROGRAMMATIC, f"expected programmatic edge {source} -> {target}, got {kind}"
++
++
++@pytest.mark.parametrize("ratio", [1, 2])
++def test_gather_columns_into_compress_edges_are_programmatic(ratio):
++    """gather_columns_into chains programmatically into compress_kernel (ratio 1)
++    and gather_partial_state_kernel -> compress_kernel (ratio 2)."""
++    from vllm.models.deepseek_v4_1.tilelang.compress import (
++        DIM,
++        STATE,
++        compress,
++        gather_partial_state,
++    )
++    from vllm.models.deepseek_v4_1.tilelang.gather import gather_columns_into
++
++    world, rows, max_reqs, page = 4, 6, 8, 4
++    local = DIM // world
++    gen = torch.Generator(device=DEVICE).manual_seed(100 + ratio)
++    val_dtype = torch.float32 if ratio == 2 else torch.bfloat16
++    parts = 2 if ratio == 2 else 1
++    src = torch.randn((world * parts * rows, local), generator=gen, dtype=val_dtype, device=DEVICE)
++    values = torch.empty((rows, DIM), dtype=val_dtype, device=DEVICE)
++    gates = torch.empty((rows, DIM), dtype=torch.float32, device=DEVICE)
++    outputs = (values, gates) if ratio == 2 else (values,)
++    weight = torch.rand((DIM,), generator=gen, dtype=torch.float32, device=DEVICE) + 0.5
++    starts = torch.zeros((max_reqs + 1,), dtype=torch.int32, device=DEVICE)
++    starts[1] = rows
++    positions = torch.zeros((max_reqs,), dtype=torch.int64, device=DEVICE)
++    positions[0] = 1
++    state_ids = torch.zeros((max_reqs,), dtype=torch.int64, device=DEVICE)
++    slots = torch.arange(rows, dtype=torch.int64, device=DEVICE)
++    state_slots = 2 * page + torch.arange(rows, dtype=torch.int64, device=DEVICE)
++    counts = torch.tensor([rows, 1], dtype=torch.int32, device=DEVICE)
++    pool = torch.randn((8, page * STATE), generator=gen, dtype=torch.float32, device=DEVICE)
++    table = torch.ones((max_reqs, 1), dtype=torch.int32, device=DEVICE)
++    pending_values = torch.empty((max_reqs, DIM), dtype=torch.float32, device=DEVICE)
++    pending_gates = torch.empty((max_reqs, DIM), dtype=torch.float32, device=DEVICE)
++    tags = torch.empty((max_reqs,), dtype=torch.int64, device=DEVICE)
++    local_ids = torch.empty((max_reqs,), dtype=torch.int64, device=DEVICE)
++    out = torch.empty((rows, DIM), dtype=torch.bfloat16, device=DEVICE)
++    emitted = torch.empty((rows,), dtype=torch.bool, device=DEVICE)
++    emitted_slots = torch.empty((rows,), dtype=torch.int64, device=DEVICE)
++
++    def run_chain():
++        gather_columns_into(src, outputs, world)
++        if ratio == 2:
++            gather_partial_state(
++                pool, table, starts, positions, counts,
++                pending_values, pending_gates, tags, local_ids, page=page,
++            )
++        compress(
++            rows, ratio, values, gates, weight, starts, positions,
++            local_ids if ratio == 2 else state_ids, slots, counts,
++            out, emitted, emitted_slots,
++            pending_values=pending_values, pending_gates=pending_gates,
++            tags=tags, pool=pool, state_slots=state_slots, page=page,
++        )
++
++    run_chain()
++    torch.cuda.synchronize()
++    expected_out = out.clone()
++    expected_emitted = emitted.clone()
++    expected_slots = emitted_slots.clone()
++
++    graph = _graph(run_chain, keep=True)
++    edges = _edges(graph)
++    assert len(edges) == (2 if ratio == 2 else 1), edges
++    for source, target, kind in edges:
++        assert source is not None and target is not None
++        assert kind == PROGRAMMATIC, f"expected programmatic edge {source} -> {target}, got {kind}"
++
++    for _ in range(5):
++        values.fill_(float("nan"))
++        gates.fill_(float("nan"))
++        out.fill_(float("nan"))
++        graph.replay()
++        torch.cuda.synchronize()
++        assert torch.equal(out.view(torch.int16), expected_out.view(torch.int16))
++        assert torch.equal(emitted, expected_emitted)
++        assert torch.equal(emitted_slots, expected_slots)
+diff --git a/vllm/models/deepseek_v4_1/tilelang/gather.py b/vllm/models/deepseek_v4_1/tilelang/gather.py
+index b463a5ba5..8d6f8e3d9 100644
+--- a/vllm/models/deepseek_v4_1/tilelang/gather.py
++++ b/vllm/models/deepseek_v4_1/tilelang/gather.py
+@@ -6,7 +6,7 @@ from functools import cache
+ 
+ import torch
+ 
+-from vllm.models.deepseek_v4_1.tilelang import prepare
++from vllm.models.deepseek_v4_1.tilelang import pdl, prepare
+ from vllm.tilelang_utils import T, tilelang
+ 
+ _DTYPES = {
+@@ -67,6 +67,7 @@ def gather_columns_kernel(
+     ):
+         with T.Kernel(rows, T.ceildiv(width, 128 * run), threads=128) as (row, block):
+             T.import_source(_HEADER)
++            pdl.chain()
+             col = (block * 128 + T.get_thread_binding()) * run
+             if col < width:
+                 store(src, out0, 0, row, col)
+-- 
+2.43.0
+

@@ -1,0 +1,1054 @@
+From 96b6620b0e40beab2dd6a3fd0797bc36232a03a5 Mon Sep 17 00:00:00 2001
+From: Christopher Owen <3221756+christopherowen@users.noreply.github.com>
+Date: Fri, 6 Nov 2026 16:03:03 +0000
+Subject: [PATCH] Calibrate DSpark confidence head online and align adaptive
+ verification budget
+
+Upstream base: a75357bba81e31e4f3085700f94b6a0b29aed44a
+Rationale: Calibrate DSpark confidence head probabilities online via identity-initialized logit-space Platt scaling (for_confidence_head), feed calibrated per-step survival probabilities into select_verification_counts, and align the c1..c2 adaptive verification threshold to 0.06335.
+Quality: Reduces cumulative survival MAE by 43.67x (0.1831 -> 0.0042) and eliminates c1 adaptive verification starvation while preserving target token verification semantics.
+Tests: pytest tests/v1/spec_decode/test_acceptance_estimator.py tests/v1/spec_decode/test_adaptive_verification.py tests/v1/worker/test_dspark_greedy_markov.py across 2 fresh container boots.
+Upstream status: Local DSpark online calibration and adaptive verification alignment.
+---
+ .../spec_decode/test_acceptance_estimator.py  | 163 +++++++++++
+ .../spec_decode/test_adaptive_verification.py | 103 +++++++
+ tests/v1/worker/test_dspark_greedy_markov.py  |  58 ++++
+ vllm/v1/worker/gpu/model_runner.py            |  26 +-
+ .../gpu/spec_decode/acceptance_estimator.py   | 253 ++++++++++++++++--
+ .../gpu/spec_decode/adaptive_verification.py  |  69 ++++-
+ .../gpu/spec_decode/dspark/speculator.py      |  52 +++-
+ vllm/v1/worker/gpu/spec_decode/speculator.py  |   4 +-
+ 8 files changed, 689 insertions(+), 39 deletions(-)
+
+diff --git a/tests/v1/spec_decode/test_acceptance_estimator.py b/tests/v1/spec_decode/test_acceptance_estimator.py
+index 9ce7963d1..ded920654 100644
+--- a/tests/v1/spec_decode/test_acceptance_estimator.py
++++ b/tests/v1/spec_decode/test_acceptance_estimator.py
+@@ -315,3 +315,166 @@ def test_refit_stays_bounded_after_a_confidently_wrong_draft():
+     assert typical.item() > 0.05
+     step = (estimator.intercepts - before).abs().max().item()
+     assert step <= estimator.MAX_STEP + 1e-6
++
++
++
++def test_for_confidence_head_starts_as_identity_on_probabilities():
++    """Cold start for a trained confidence head must preserve its raw probabilities."""
++    device = torch.device("cuda")
++    estimator = OnlineAcceptanceEstimator.for_confidence_head(
++        MAX_NUM_REQS, NUM_STEPS, device
++    )
++    raw = torch.tensor(
++        [
++            [0.78, 0.72, 0.71, 0.73],
++            [0.92, 0.85, 0.64, 0.41],
++            [0.15, 0.08, 0.05, 0.02],
++        ],
++        device=device,
++        dtype=torch.float32,
++    )
++    probs = raw.clone()
++    slots = torch.tensor([3, 1, 7], device=device, dtype=torch.int32)
++    idx_mapping = slots.repeat_interleave(NUM_STEPS)
++    estimator.calibrate_confidence_probs(probs, idx_mapping)
++
++    torch.testing.assert_close(probs, raw, atol=1e-5, rtol=1e-5)
++    expected_features = torch.log(raw / (1.0 - raw))
++    torch.testing.assert_close(
++        estimator.features[slots.long()], expected_features, atol=1e-4, rtol=1e-4
++    )
++    torch.testing.assert_close(
++        estimator.predictions[slots.long()], raw, atol=1e-5, rtol=1e-5
++    )
++
++
++@pytest.mark.parametrize("per_token_idx", [False, True])
++def test_calibrate_confidence_probs_agrees_across_slot_and_batch_order(
++    per_token_idx: bool,
++):
++    """Calibrated confidence-head probabilities land in both batch and slot order."""
++    device = torch.device("cuda")
++    torch.manual_seed(17)
++    estimator = OnlineAcceptanceEstimator.for_confidence_head(
++        MAX_NUM_REQS, NUM_STEPS, device
++    )
++    estimator.slope.fill_(0.92)
++    estimator.intercepts[:] = torch.tensor(
++        [-0.42, -0.64, -1.25, -0.99], device=device
++    )
++
++    num_reqs = 5
++    slots = torch.randperm(MAX_NUM_REQS, device=device)[:num_reqs].to(torch.int32)
++    idx_mapping = slots.repeat_interleave(NUM_STEPS) if per_token_idx else slots
++
++    raw = torch.rand(num_reqs, NUM_STEPS, device=device) * 0.85 + 0.08
++    probs = raw.clone()
++    estimator.calibrate_confidence_probs(probs, idx_mapping)
++
++    expected_f = torch.log(raw.double() / (1.0 - raw.double()))
++    expected_p = torch.sigmoid(
++        estimator.slope.double() * expected_f
++        + estimator.intercepts.double()[None, :]
++    ).float()
++
++    torch.testing.assert_close(probs, expected_p, atol=1e-5, rtol=1e-5)
++    torch.testing.assert_close(
++        estimator.predictions[slots.long()], expected_p, atol=1e-5, rtol=1e-5
++    )
++    torch.testing.assert_close(
++        estimator.features[slots.long()], expected_f.float(), atol=1e-4, rtol=1e-4
++    )
++
++
++def test_calibrate_confidence_probs_skips_cudagraph_padded_rows():
++    """Padded rows carry slot -1 and must not overwrite any live slot's features."""
++    device = torch.device("cuda")
++    estimator = OnlineAcceptanceEstimator.for_confidence_head(
++        MAX_NUM_REQS, NUM_STEPS, device
++    )
++    estimator.features.fill_(-77.0)
++    estimator.predictions.fill_(-77.0)
++
++    idx_mapping = torch.tensor(
++        [2, 2, 2, 2, -1, -1, -1, -1], device=device, dtype=torch.int32
++    )
++    probs = torch.full((2, NUM_STEPS), 0.75, device=device)
++    estimator.calibrate_confidence_probs(probs, idx_mapping)
++
++    untouched = [i for i in range(MAX_NUM_REQS) if i != 2]
++    assert (estimator.features[untouched] == -77.0).all()
++    assert (estimator.predictions[untouched] == -77.0).all()
++    assert (estimator.features[2] != -77.0).all()
++
++
++def test_step_ignores_negative_idx_mapping_and_dead_row_cut():
++    """Copy-drafted/padded slots (-1) and dead rows past dead_row_cut must not be graded."""
++    device = torch.device("cuda")
++    estimator = OnlineAcceptanceEstimator.for_confidence_head(
++        MAX_NUM_REQS, NUM_STEPS, device
++    )
++    estimator.features[0] = torch.tensor([1.0, 1.0, 1.0, 1.0], device=device)
++    estimator.predictions[0] = torch.tensor([0.7, 0.7, 0.7, 0.7], device=device)
++
++    # Slot -1 (e.g. copy-drafted request) must not touch slot 0's accumulators.
++    estimator.step(
++        torch.tensor([-1], dtype=torch.int32, device=device),
++        torch.tensor([4], dtype=torch.int32, device=device),
++        torch.tensor([1], dtype=torch.int32, device=device),
++    )
++    assert float(estimator.counts.sum().item()) == 0.0
++
++    # Slot 0 with num_sampled=2 (1 accepted draft), num_rejected=3, but dead_row_cut=1:
++    # only position 0 was live and accepted; position 1 was dead and must not be graded.
++    estimator.step(
++        torch.tensor([0], dtype=torch.int32, device=device),
++        torch.tensor([2], dtype=torch.int32, device=device),
++        torch.tensor([3], dtype=torch.int32, device=device),
++        dead_row_cut=torch.tensor([1], dtype=torch.int32, device=device),
++    )
++    torch.testing.assert_close(
++        estimator.counts,
++        torch.tensor([1.0, 0.0, 0.0, 0.0], device=device),
++    )
++
++
++def test_confidence_head_online_irls_reduces_survival_mae():
++    """Online IRLS calibration of an overconfident confidence head recovers true survival."""
++    device = torch.device("cuda")
++    torch.manual_seed(42)
++    estimator = OnlineAcceptanceEstimator.for_confidence_head(
++        MAX_NUM_REQS, NUM_STEPS, device
++    )
++    estimator.REFIT_INTERVAL = 10
++
++    raw_row = torch.tensor([0.78, 0.72, 0.71, 0.71], device=device)
++    true_cond = torch.tensor([0.677, 0.556, 0.396, 0.460], device=device)
++    true_survival = torch.cumprod(true_cond, dim=0)
++    raw_survival = torch.cumprod(raw_row, dim=0)
++
++    num_reqs = 8
++    slots = torch.arange(num_reqs, device=device, dtype=torch.int32)
++    idx_mapping = slots.repeat_interleave(NUM_STEPS)
++
++    for _ in range(200):
++        probs = raw_row.unsqueeze(0).expand(num_reqs, NUM_STEPS).clone()
++        estimator.calibrate_confidence_probs(probs, idx_mapping)
++        draws = torch.rand(num_reqs, NUM_STEPS, device=device) < true_cond
++        all_ok = draws.all(dim=1)
++        first_fail = (~draws).int().argmax(dim=1)
++        accepted = torch.where(
++            all_ok, torch.full_like(first_fail, NUM_STEPS), first_fail
++        )
++        num_sampled = (accepted + 1).to(torch.int32)
++        num_rejected = (NUM_STEPS - accepted).to(torch.int32)
++        estimator.step(slots, num_sampled, num_rejected)
++
++    test_probs = raw_row.unsqueeze(0).clone()
++    estimator.calibrate_confidence_probs(test_probs, slots[:1])
++    calibrated_survival = torch.cumprod(test_probs[0], dim=0)
++
++    raw_mae = (raw_survival - true_survival).abs().mean().item()
++    cal_mae = (calibrated_survival - true_survival).abs().mean().item()
++    assert raw_mae > 0.15
++    assert cal_mae < 0.03
++    assert calibrated_survival[3].item() < 0.11
+diff --git a/tests/v1/spec_decode/test_adaptive_verification.py b/tests/v1/spec_decode/test_adaptive_verification.py
+index 8ea5b6045..bb97675f1 100644
+--- a/tests/v1/spec_decode/test_adaptive_verification.py
++++ b/tests/v1/spec_decode/test_adaptive_verification.py
+@@ -837,3 +837,106 @@ def test_mid_prefill_chunks_keep_initial_unit_confidence_until_prefill_completes
+         manager._stale_confidences[manager._stale_idx].np[1],
+         np.full(steps, 0.7, dtype=np.float32),
+     )
++
++
++
++def test_dead_rows_tau_excludes_sub_tau_slots_from_host_budget():
++    """Host get_num_tokens must not admit draft slots that dead_rows_tau kills on GPU."""
++    confidences = np.array([[0.78, 0.72, 0.71, 0.71, 0.73]], dtype=np.float32)
++    manager = make_manager(confidences, row_cost=0.01)
++    manager.req_states.req_id_to_index = {"r0": 0}
++    manager.dead_rows_tau = 0.30
++
++    total = manager.get_num_tokens({"r0": 6}, {"r0": [10, 11, 12, 13, 14]})
++    _, _, draft_budget = manager._batch_budget
++    # Survival is [0.78, 0.5616, 0.3987, 0.2831, 0.2067]; only the first 3
++    # positions are >= 0.30, so host budget must be 3 rather than 5.
++    assert draft_budget == 3
++    assert total == 4
++
++
++def test_calibrated_confidence_matches_dead_rows_tau_to_c1_survival():
++    """With calibrated confidence_head survival, c1 admits positions 0..3 on typical
++    requests, 0..4 on high-confidence requests, and prunes low-confidence tails."""
++    # Typical calibrated c1 conditional probs -> survival [0.677, 0.376, 0.149, 0.0686, 0.0438]
++    typical = np.array([[0.677, 0.556, 0.396, 0.460, 0.638]], dtype=np.float32)
++    manager = make_manager(typical, row_cost=0.035)
++    manager.req_states.req_id_to_index = {"r0": 0}
++    manager.dead_rows_tau = 0.20
++    manager.calibrated_confidence = True
++
++    tau = manager.effective_dead_rows_tau()
++    assert np.isclose(tau, 2.0 * 0.035 / (1.0 + 3.0 * 0.035))
++    total = manager.get_num_tokens({"r0": 6}, {"r0": [1, 2, 3, 4, 5]})
++    _, _, draft_budget = manager._batch_budget
++    assert draft_budget == 4
++    assert total == 5
++
++    # High-confidence request -> survival [0.85, 0.68, 0.51, 0.36, 0.25] admits all 5
++    high = np.array([[0.85, 0.80, 0.75, 0.70, 0.70]], dtype=np.float32)
++    manager_hi = make_manager(high, row_cost=0.035)
++    manager_hi.req_states.req_id_to_index = {"r0": 0}
++    manager_hi.dead_rows_tau = 0.20
++    manager_hi.calibrated_confidence = True
++    manager_hi.get_num_tokens({"r0": 6}, {"r0": [1, 2, 3, 4, 5]})
++    assert manager_hi._batch_budget[2] == 5
++
++    # Low-confidence branching request -> survival [0.45, 0.18, 0.054, 0.016, 0.005] admits 2
++    low = np.array([[0.45, 0.40, 0.30, 0.30, 0.30]], dtype=np.float32)
++    manager_lo = make_manager(low, row_cost=0.035)
++    manager_lo.req_states.req_id_to_index = {"r0": 0}
++    manager_lo.dead_rows_tau = 0.20
++    manager_lo.calibrated_confidence = True
++    manager_lo.get_num_tokens({"r0": 6}, {"r0": [1, 2, 3, 4, 5]})
++    assert manager_lo._batch_budget[2] == 2
++
++
++def test_get_verified_draft_counts_clamps_to_dead_row_cut_and_clears_when_no_drafts():
++    """get_verified_draft_counts must clamp to live rows and dead_row_args must
++    return None when a step admitted zero drafts."""
++    manager = make_manager(np.ones((2, 5), dtype=np.float32), row_cost=0.035)
++    manager._batch_draft_capacity = torch.tensor([5, 4, 3], dtype=torch.int32)
++    manager._confidence_probs = torch.ones((3, 5), dtype=torch.float32)
++    manager._dead_row_cut = torch.tensor([3, 5, 1], dtype=torch.int32)
++    manager.dead_rows_tau = 0.20
++
++    manager._has_admitted_drafts = False
++    assert manager.dead_row_args(torch.zeros(12, dtype=torch.bool), 2) is None
++
++    manager._has_admitted_drafts = True
++    dead = manager.dead_row_args(torch.zeros(12, dtype=torch.bool), 2)
++    assert dead is not None
++
++    verified = manager.get_verified_draft_counts(2, dead.cut)
++    assert verified.tolist() == [3, 4]
++    assert manager._batch_draft_capacity[:2].tolist() == [3, 4]
++
++
++def test_high_concurrency_row_cost_knee_admits_coalesced_drafts():
++    """Above the 16-row Tensor Core MMA tile knee, coalesced rows face a lower
++    marginal cost and admit profitable medium-confidence draft slots."""
++    confidences = np.tile(
++        np.array([[0.78, 0.72, 0.71, 0.71, 0.73]], dtype=np.float32), (8, 1)
++    )
++    manager = make_manager(confidences, row_cost=0.035)
++    req_ids = [f"r{i}" for i in range(8)]
++    manager.req_states.req_id_to_index = {rid: i for i, rid in enumerate(req_ids)}
++    manager.dead_rows_tau = 0.20
++
++    num_tokens_per_req = {rid: 6 for rid in req_ids}
++    draft_tokens = {rid: [1, 2, 3, 4, 5] for rid in req_ids}
++
++    # Under a flat linear slope (scale=1.0), only 3 drafts per request (24 total)
++    # pass the linear cost threshold at c8.
++    manager.high_row_cost_scale = 1.0
++    manager.get_num_tokens(num_tokens_per_req, draft_tokens)
++    _, _, flat_budget = manager._batch_budget
++    assert flat_budget == 24
++
++    # With the 16-row Tensor Core tile knee (scale=0.55), positions 0..3 across
++    # all 8 requests (32 draft rows, total 40 rows) are admitted.
++    manager.high_row_cost_scale = 0.55
++    total = manager.get_num_tokens(num_tokens_per_req, draft_tokens)
++    _, _, knee_budget = manager._batch_budget
++    assert knee_budget == 32
++    assert total == 40
+diff --git a/tests/v1/worker/test_dspark_greedy_markov.py b/tests/v1/worker/test_dspark_greedy_markov.py
+index 942d71e31..fcab2b3a3 100644
+--- a/tests/v1/worker/test_dspark_greedy_markov.py
++++ b/tests/v1/worker/test_dspark_greedy_markov.py
+@@ -359,3 +359,61 @@ def test_greedy_markov_exact_replay(dtype, vocab, rows):
+         torch.testing.assert_close(output, (base + bias).argmax(-1), rtol=0, atol=0)
+         assert torch.all(result[:, :3] == -77)
+         assert torch.all(result[:, 4:] == -77)
++
++
++
++def test_vocab_parallel_and_local_greedy_stay_enabled_when_confidence_head_uses_estimator(
++    monkeypatch,
++):
++    """Calibrating confidence_head with OnlineAcceptanceEstimator does not need
++    draft logits, so vocabulary-parallel greedy and tp_invariant_confidence stay active."""
++    import vllm.v1.worker.gpu.spec_decode.dspark.speculator as dspark_spec_mod
++    from vllm.v1.worker.gpu.spec_decode.dspark.speculator import (
++        DSparkSpeculator,
++        _needs_logits_for_acceptance,
++    )
++
++    monkeypatch.setattr(
++        dspark_spec_mod, "get_tensor_model_parallel_world_size", lambda: 4
++    )
++    monkeypatch.setattr(
++        DSparkSpeculator.__mro__[1], "register_warmups", lambda self, _: None
++    )
++    selections = []
++    monkeypatch.setattr(
++        dspark_spec_mod,
++        "register_select_first_argmax_warmup",
++        lambda **kwargs: selections.append(kwargs),
++    )
++
++    spec = DSparkSpeculator.__new__(DSparkSpeculator)
++    spec.__dict__.update(
++        _draft_topk=None,
++        num_speculative_steps=5,
++        sample_from_anchor=True,
++        draft_logits=None,
++        use_confidence_head=True,
++        acceptance_estimator=object(),
++        _enable_top2_branch=False,
++        draft_tokens=torch.zeros((4, 5), dtype=torch.int64),
++        model=SimpleNamespace(
++            supports_local_draft_argmax=lambda: False,
++            vocab_parallel_greedy=True,
++            draft_id_to_target_id=None,
++            fuses_markov_greedy=True,
++            markov_embed_table=lambda: None,
++            model=SimpleNamespace(
++                confidence_head=SimpleNamespace(tp_invariant=True),
++            ),
++        ),
++    )
++    assert not _needs_logits_for_acceptance(spec)
++    assert spec._vocab_parallel_greedy(False)
++    assert spec.tp_invariant_confidence
++    spec.register_warmups([])
++    assert [kwargs["ranks"] for kwargs in selections] == [4] * 5
++
++    spec.use_confidence_head = False
++    assert _needs_logits_for_acceptance(spec)
++    assert not spec._vocab_parallel_greedy(False)
++    assert not spec.tp_invariant_confidence
+diff --git a/vllm/v1/worker/gpu/model_runner.py b/vllm/v1/worker/gpu/model_runner.py
+index c1c7fcf10..43ee2c839 100644
+--- a/vllm/v1/worker/gpu/model_runner.py
++++ b/vllm/v1/worker/gpu/model_runner.py
+@@ -829,6 +829,15 @@ class GPUModelRunner(LoRAModelRunnerMixin):
+             tp_invariant_confidence=getattr(
+                 self.speculator, "tp_invariant_confidence", False
+             ),
++            calibrated_confidence=lambda: (
++                getattr(
++                    getattr(self.speculator, "acceptance_estimator", None),
++                    "_refits",
++                    0,
++                )
++                > 0
++                and getattr(self.speculator, "use_confidence_head", False)
++            ),
+         )
+         if self.copy_drafter is not None and self.adaptive_verification is None:
+             # The draft budget decides how many of a copy's drafts a step
+@@ -3459,7 +3468,9 @@ class GPUModelRunner(LoRAModelRunnerMixin):
+             cudagraph_stats=cudagraph_stats,
+         )
+         num_verified_draft_tokens = (
+-            self.adaptive_verification.get_verified_draft_counts(input_batch.num_reqs)
++            self.adaptive_verification.get_verified_draft_counts(
++                input_batch.num_reqs, self._dead_row_cut
++            )
+             if self.adaptive_verification is not None
+             and input_batch.num_draft_tokens_per_req is not None
+             else None
+@@ -3589,8 +3600,17 @@ class GPUModelRunner(LoRAModelRunnerMixin):
+                     observed_rejected = observed_rejected.masked_fill(
+                         sampler_output.sink.events[:, 0] == SinkOutcome.REJECTED, 0
+                     )
++                observed_idx_mapping = input_batch.idx_mapping
++                if self.copy_drafter is not None:
++                    # Slots whose last verified proposal came from CopyDrafter
++                    # must not grade DSpark's confidence_head features.
++                    observed_idx_mapping = torch.where(
++                        self.copy_drafter.int_state[input_batch.idx_mapping, 1] > 0,
++                        -1,
++                        observed_idx_mapping,
++                    )
+                 self.speculator.observe_verification(
+-                    input_batch.idx_mapping, num_sampled, observed_rejected
++                    observed_idx_mapping, num_sampled, observed_rejected
+                 )
+             # Let the target override the hidden state fed to the drafter
+             # (_mtp_target_states).
+@@ -3626,7 +3646,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
+                         )
+                 verified = (
+                     self.adaptive_verification.get_verified_draft_counts(
+-                        input_batch.num_reqs
++                        input_batch.num_reqs, self._dead_row_cut
+                     )
+                     if self.adaptive_verification is not None
+                     and input_batch.num_draft_tokens_per_req is not None
+diff --git a/vllm/v1/worker/gpu/spec_decode/acceptance_estimator.py b/vllm/v1/worker/gpu/spec_decode/acceptance_estimator.py
+index 88b697aa3..6f3f3d566 100644
+--- a/vllm/v1/worker/gpu/spec_decode/acceptance_estimator.py
++++ b/vllm/v1/worker/gpu/spec_decode/acceptance_estimator.py
+@@ -19,6 +19,13 @@ _MAX_LOG_ODDS = 40.0
+ _INIT_SLOPE = 0.5
+ _INIT_BIAS = -0.2
+ 
++# A trained scalar confidence head (e.g. DSpark's confidence_head) already
++# emits a probability in (0, 1); start at identity in log-odds space (slope 1,
++# intercept 0) so cold-start predictions match the raw head until the first
++# online IRLS refit calibrates the per-position decay and slope.
++_INIT_CONFIDENCE_HEAD_SLOPE = 1.0
++_INIT_CONFIDENCE_HEAD_BIAS = 0.0
++
+ 
+ @triton.jit
+ def _accumulate_kernel(
+@@ -38,9 +45,11 @@ def _accumulate_kernel(
+     step = tl.program_id(0).to(tl.int64)
+     req_block = tl.arange(0, BLOCK_R)
+     req_mask = req_block < num_reqs
+-    req_state_block = tl.load(idx_mapping_ptr + req_block, mask=req_mask, other=0).to(
++    req_state_block = tl.load(idx_mapping_ptr + req_block, mask=req_mask, other=-1).to(
+         tl.int64
+     )
++    req_mask = req_mask & (req_state_block >= 0)
++    safe_req_state = tl.maximum(req_state_block, 0)
+ 
+     num_sampled = tl.load(num_sampled_ptr + req_block, mask=req_mask, other=0).to(
+         tl.int64
+@@ -53,12 +62,12 @@ def _accumulate_kernel(
+     num_admitted = num_accepted + num_rejected
+ 
+     feature = tl.load(
+-        features_ptr + req_state_block * features_stride + step,
++        features_ptr + safe_req_state * features_stride + step,
+         mask=req_mask,
+         other=0.0,
+     ).to(tl.float32)
+     pred = tl.load(
+-        pred_ptr + req_state_block * pred_stride + step,
++        pred_ptr + safe_req_state * pred_stride + step,
+         mask=req_mask,
+         other=0.0,
+     ).to(tl.float32)
+@@ -320,6 +329,49 @@ def _predict_kernel(
+     tl.store(conf_ptr + batch_idx * conf_stride + step, prob)
+ 
+ 
++@triton.jit
++def _calibrate_confidence_kernel(
++    features_ptr,
++    features_stride,
++    pred_ptr,
++    pred_stride,
++    conf_ptr,
++    conf_stride,
++    slope_ptr,
++    intercepts_ptr,
++    idx_mapping_ptr,
++    idx_mapping_stride,
++    num_tokens,
++    NUM_SPECULATIVE_STEPS: tl.constexpr,
++    MAX_LOG_ODDS: tl.constexpr,
++):
++    token_idx = tl.program_id(0).to(tl.int64)
++    if token_idx >= num_tokens:
++        return
++
++    batch_idx = token_idx // NUM_SPECULATIVE_STEPS
++    step = token_idx - batch_idx * NUM_SPECULATIVE_STEPS
++
++    raw_prob = tl.load(conf_ptr + batch_idx * conf_stride + step).to(tl.float32)
++    eps = 1e-6
++    clamped = tl.minimum(tl.maximum(raw_prob, eps), 1.0 - eps)
++    feature = tl.log(clamped / (1.0 - clamped))
++    feature = tl.minimum(tl.maximum(feature, -MAX_LOG_ODDS), MAX_LOG_ODDS)
++
++    weight = tl.load(slope_ptr)
++    bias = tl.load(intercepts_ptr + step)
++    prob = tl.sigmoid(weight * feature + bias)
++    tl.store(conf_ptr + batch_idx * conf_stride + step, prob)
++
++    req_state_idx = tl.load(idx_mapping_ptr + token_idx * idx_mapping_stride).to(
++        tl.int64
++    )
++    if req_state_idx < 0:
++        return
++    tl.store(features_ptr + req_state_idx * features_stride + step, feature)
++    tl.store(pred_ptr + req_state_idx * pred_stride + step, prob)
++
++
+ class OnlineAcceptanceEstimator:
+     """Predicts per-position acceptance, and calibrates itself while serving.
+ 
+@@ -358,6 +410,9 @@ class OnlineAcceptanceEstimator:
+         max_num_reqs: int,
+         num_speculative_steps: int,
+         device: torch.device,
++        *,
++        init_slope: float = _INIT_SLOPE,
++        init_bias: float = _INIT_BIAS,
+     ):
+         self.num_speculative_steps = num_speculative_steps
+         self.device = device
+@@ -365,9 +420,9 @@ class OnlineAcceptanceEstimator:
+         self._refits = 0
+ 
+         # The learned coefficients used for predicting acceptance.
+-        self.slope = torch.full((1,), _INIT_SLOPE, dtype=torch.float32, device=device)
++        self.slope = torch.full((1,), init_slope, dtype=torch.float32, device=device)
+         self.intercepts = torch.full(
+-            (num_speculative_steps,), _INIT_BIAS, dtype=torch.float32, device=device
++            (num_speculative_steps,), init_bias, dtype=torch.float32, device=device
+         )
+         # Holds logit(max q), which is used as the feature for the logistic.
+         # Stored in stable slots keyed by persistent request-state index.
+@@ -418,28 +473,58 @@ class OnlineAcceptanceEstimator:
+             num_speculative_steps, dtype=torch.float32, device=device
+         )
+ 
++    @classmethod
++    def for_confidence_head(
++        cls,
++        max_num_reqs: int,
++        num_speculative_steps: int,
++        device: torch.device,
++    ) -> "OnlineAcceptanceEstimator":
++        """Create an estimator initialized at identity for a scalar confidence head."""
++        return cls(
++            max_num_reqs,
++            num_speculative_steps,
++            device,
++            init_slope=_INIT_CONFIDENCE_HEAD_SLOPE,
++            init_bias=_INIT_CONFIDENCE_HEAD_BIAS,
++        )
++
++    def reset_for_confidence_head(self) -> None:
++        """Reset coefficients to identity in log-odds space for a scalar confidence head."""
++        self.slope.fill_(_INIT_CONFIDENCE_HEAD_SLOPE)
++        self.intercepts.fill_(_INIT_CONFIDENCE_HEAD_BIAS)
++
+     def step(
+         self,
+         idx_mapping: torch.Tensor,
+         num_sampled: torch.Tensor,
+         num_rejected: torch.Tensor,
++        dead_row_cut: torch.Tensor | None = None,
+     ) -> None:
+         # Accumulate the previous step's graded drafts into the IRLS statistics.
+         num_reqs = idx_mapping.shape[0]
+-        _accumulate_kernel[(self.num_speculative_steps,)](
+-            self.info,
+-            self.grad,
+-            idx_mapping,
+-            num_sampled,
+-            num_rejected,
+-            self.features,
+-            self.features.stride(0),
+-            self.predictions,
+-            self.predictions.stride(0),
+-            self.counts,
+-            num_reqs,
+-            BLOCK_R=triton.next_power_of_2(max(num_reqs, 1)),
+-        )
++        if dead_row_cut is not None and num_reqs > 0:
++            num_accepted = (num_sampled - 1).clamp_min(0)
++            live_rejected = (dead_row_cut[:num_reqs] - num_accepted).clamp_min(0)
++            num_rejected = torch.minimum(num_rejected, live_rejected)
++        if self.device.type != "cuda":
++            self._step_cpu(idx_mapping, num_sampled, num_rejected)
++            return
++        if num_reqs > 0:
++            _accumulate_kernel[(self.num_speculative_steps,)](
++                self.info,
++                self.grad,
++                idx_mapping,
++                num_sampled,
++                num_rejected,
++                self.features,
++                self.features.stride(0),
++                self.predictions,
++                self.predictions.stride(0),
++                self.counts,
++                num_reqs,
++                BLOCK_R=triton.next_power_of_2(max(num_reqs, 1)),
++            )
+ 
+         self._steps_since_refit += 1
+         if self._steps_since_refit < self.REFIT_INTERVAL:
+@@ -518,3 +603,133 @@ class OnlineAcceptanceEstimator:
+             MAX_LOG_ODDS=_MAX_LOG_ODDS,
+             PADDED_VOCAB_NUM_BLOCKS=triton.next_power_of_2(num_blocks),
+         )
++
++    def _step_cpu(
++        self,
++        idx_mapping: torch.Tensor,
++        num_sampled: torch.Tensor,
++        num_rejected: torch.Tensor,
++    ) -> None:
++        slots = idx_mapping.to(torch.int64)
++        valid_req = slots >= 0
++        safe_slots = slots.clamp_min(0)
++        num_accepted = (num_sampled.to(torch.int64) - 1).clamp_min(0)
++        num_admitted = num_accepted + num_rejected.to(torch.int64)
++        steps = torch.arange(
++            self.num_speculative_steps, device=self.device, dtype=torch.int64
++        )[None, :]
++        observed = (
++            valid_req[:, None]
++            & (steps <= num_accepted[:, None])
++            & (steps < num_admitted[:, None])
++        )
++        labels = (steps < num_accepted[:, None]).to(torch.float32)
++        feat = self.features[safe_slots]
++        pred = self.predictions[safe_slots]
++        w = torch.where(observed, pred * (1.0 - pred), torch.zeros_like(pred))
++        resid = torch.where(observed, labels - pred, torch.zeros_like(pred))
++        self.info[:, 0] += (w * feat * feat).sum(dim=0)
++        self.info[:, 1] += (w * feat).sum(dim=0)
++        self.info[:, 2] += w.sum(dim=0)
++        self.grad[:, 0] += (resid * feat).sum(dim=0)
++        self.grad[:, 1] += resid.sum(dim=0)
++        self.counts += observed.to(torch.float32).sum(dim=0)
++
++        self._steps_since_refit += 1
++        if self._steps_since_refit < self.REFIT_INTERVAL:
++            return
++        self._steps_since_refit = 0
++
++        a_k = self.info[:, 0]
++        b_k = self.info[:, 1]
++        c_k = self.info[:, 2] + self.L2
++        a = a_k.sum() + self.L2
++        g0 = self.grad[:, 0].sum()
++        g1_k = self.grad[:, 1]
++        n = self.counts
++        w_cur = self.slope[0]
++        bias_cur = self.intercepts
++
++        shrink = b_k * b_k / c_k
++        coupling = b_k * g1_k / c_k
++        step_w = (g0 - coupling.sum()) / (a - shrink.sum())
++        total_n = n.sum()
++        step_w = step_w * (total_n / (total_n + self.DAMPING_OBSERVATIONS))
++        if torch.isnan(step_w) or (w_cur + step_w < 0.0):
++            step_w = torch.zeros_like(step_w)
++        step_w = step_w.clamp(-self.MAX_STEP, self.MAX_STEP)
++        new_w = (w_cur + step_w).clamp_max(self.MAX_SLOPE)
++
++        step_bias = (g1_k - b_k * step_w) / c_k
++        step_bias = step_bias * (n / (n + self.DAMPING_OBSERVATIONS))
++        step_bias = torch.where(
++            torch.isnan(step_bias), torch.zeros_like(step_bias), step_bias
++        )
++        step_bias = step_bias.clamp(-self.MAX_STEP, self.MAX_STEP)
++        new_bias = (bias_cur + step_bias).clamp(
++            -self.MAX_ABS_INTERCEPT, self.MAX_ABS_INTERCEPT
++        )
++        self.slope[0] = new_w
++        self.intercepts.copy_(new_bias)
++        self.info.zero_()
++        self.grad.zero_()
++        self.counts.zero_()
++        self._refits += 1
++
++    def calibrate_confidence_probs(
++        self,
++        confidence_probs: torch.Tensor,
++        idx_mapping: torch.Tensor,
++    ) -> None:
++        """Calibrate scalar confidence-head probabilities in place and record features.
++
++        ``confidence_probs`` has shape ``[num_reqs, num_speculative_steps]`` in
++        current batch order, and ``idx_mapping`` has either ``num_reqs *
++        num_speculative_steps`` entries (per-(req, step) persistent slot) or
++        ``num_reqs`` entries (per-req persistent slot).
++        """
++        num_reqs, num_steps = confidence_probs.shape
++        assert num_steps == self.num_speculative_steps
++        num_tokens = num_reqs * num_steps
++        if num_tokens == 0:
++            return
++        if idx_mapping.numel() == num_reqs and num_steps > 1:
++            token_idx_mapping = idx_mapping.repeat_interleave(num_steps)
++        else:
++            token_idx_mapping = idx_mapping[:num_tokens]
++
++        if confidence_probs.device.type != "cuda":
++            eps = 1e-6
++            clamped = confidence_probs.float().clamp(eps, 1.0 - eps)
++            features = torch.log(clamped / (1.0 - clamped)).clamp(
++                -_MAX_LOG_ODDS, _MAX_LOG_ODDS
++            )
++            probs = torch.sigmoid(
++                self.slope.float() * features + self.intercepts.float()[None, :]
++            ).to(confidence_probs.dtype)
++            confidence_probs.copy_(probs)
++            req_slots = token_idx_mapping.view(num_reqs, num_steps)[:, 0].to(
++                torch.int64
++            )
++            valid = req_slots >= 0
++            if valid.any():
++                live_slots = req_slots[valid]
++                self.features[live_slots] = features[valid]
++                self.predictions[live_slots] = probs[valid].float()
++            return
++
++        _calibrate_confidence_kernel[(num_tokens,)](
++            self.features,
++            self.features.stride(0),
++            self.predictions,
++            self.predictions.stride(0),
++            confidence_probs,
++            confidence_probs.stride(0),
++            self.slope,
++            self.intercepts,
++            token_idx_mapping,
++            token_idx_mapping.stride(0),
++            num_tokens,
++            NUM_SPECULATIVE_STEPS=self.num_speculative_steps,
++            MAX_LOG_ODDS=_MAX_LOG_ODDS,
++        )
+diff --git a/vllm/v1/worker/gpu/spec_decode/adaptive_verification.py b/vllm/v1/worker/gpu/spec_decode/adaptive_verification.py
+index 525722439..d952dbdfd 100644
+--- a/vllm/v1/worker/gpu/spec_decode/adaptive_verification.py
++++ b/vllm/v1/worker/gpu/spec_decode/adaptive_verification.py
+@@ -50,6 +50,12 @@ if TYPE_CHECKING:
+ # verifies a draft per request anyway (see ``get_num_tokens``).
+ EXPLORE_AFTER_IDLE_STEPS = 32
+ 
++# Two-slope verification row-cost knee: once a step crosses one 16-row Tensor
++# Core MMA tile, additional verification rows share the already-launched expert
++# and dense weight tiles at a reduced marginal cost.
++HIGH_ROW_COST_KNEE = 16
++HIGH_ROW_COST_SCALE = 0.55
++
+ 
+ def resolve_adaptive_cudagraph_mode(
+     mode: CUDAGraphMode, *, piecewise_capture_available: bool
+@@ -89,6 +95,7 @@ class AdaptiveVerificationManager:
+         num_draft_steps: int | None = None,
+         *,
+         tp_invariant_confidence: bool = False,
++        calibrated_confidence: bool | Callable[[], bool] = False,
+     ):
+         self.req_states = req_states
+         self.num_speculative_steps = req_states.num_speculative_steps
+@@ -106,8 +113,12 @@ class AdaptiveVerificationManager:
+         # cost: a recipe constant, so the budget is a rule of the inputs, the same
+         # on every build and boot, with nothing timed.
+         self.row_cost = row_cost
++        self.high_row_cost_knee = HIGH_ROW_COST_KNEE
++        self.high_row_cost_scale = HIGH_ROW_COST_SCALE
+         self.tp_invariant_confidence = tp_invariant_confidence
++        self.calibrated_confidence = calibrated_confidence
+         self.dead_rows_tau = _DEAD_ROWS_TAU
++        self._has_admitted_drafts = False
+         self._dead_row_cut = torch.empty(
+             req_states.max_num_reqs, dtype=torch.int32, device=device
+         )
+@@ -271,6 +282,38 @@ class AdaptiveVerificationManager:
+             write_slot.copy_to_cpu()
+             self._copy_events[write_idx].record()
+ 
++    def _step_cost(self, rows: np.ndarray) -> np.ndarray:
++        """Relative verification step cost with a 16-row Tensor Core MMA tile knee."""
++        knee = getattr(self, "high_row_cost_knee", HIGH_ROW_COST_KNEE)
++        scale = getattr(self, "high_row_cost_scale", HIGH_ROW_COST_SCALE)
++        if knee > 0 and scale != 1.0:
++            effective_rows = np.minimum(rows, knee) + scale * np.maximum(
++                rows - knee, 0
++            )
++        else:
++            effective_rows = rows
++        return 1.0 + self.row_cost * effective_rows
++
++    def effective_dead_rows_tau(self) -> float:
++        """Survival threshold for dead-row pruning on host and device.
++
++        Raw ``confidence_head`` survival is inflated by ~3x at tail positions,
++        which ``_DEAD_ROWS_TAU`` (0.20) was scaled to cut. Once online IRLS
++        calibration fits the per-position intercepts, survival probabilities are
++        already on the true acceptance scale, so the threshold matches the
++        single-request marginal row-cost break-even ``2 * row_cost / (1 + 3 * row_cost)``
++        instead of double-counting the tail decay.
++        """
++        tau = float(getattr(self, "dead_rows_tau", 0.0))
++        if tau <= 0.0:
++            return 0.0
++        calibrated = getattr(self, "calibrated_confidence", False)
++        if callable(calibrated):
++            calibrated = bool(calibrated())
++        if calibrated and self.row_cost > 0.0:
++            return min(tau, 2.0 * self.row_cost / (1.0 + 3.0 * self.row_cost))
++        return tau
++
+     def get_num_tokens(
+         self,
+         num_tokens_per_req: dict[str, int],
+@@ -317,6 +360,11 @@ class AdaptiveVerificationManager:
+         survival_probability = np.cumprod(stale_confidences.astype(np.float64), axis=1)
+         steps = np.arange(step_steps)
+         valid = steps[None, :] < eligible_drafts[:, None]
++        tau = self.effective_dead_rows_tau()
++        if tau > 0:
++            # Never admit draft slots on the host that the device dead-row
++            # threshold will immediately mask as padding.
++            valid &= survival_probability >= tau
+         scores = np.sort(survival_probability[valid])[::-1]
+         max_draft_budget = min(
+             int(eligible_drafts.sum()),
+@@ -339,7 +387,7 @@ class AdaptiveVerificationManager:
+             ([num_sampling_requests], num_sampling_requests + np.cumsum(scores))
+         )
+         rows = int(num_non_draft_tokens.sum()) + np.arange(len(scores) + 1)
+-        utilities = expected_tokens / (1.0 + self.row_cost * rows)
++        utilities = expected_tokens / self._step_cost(rows)
+         draft_budget = int(np.argmax(utilities))
+         # The confidences come from an estimator that learns only from admitted
+         # drafts, so a long run of empty budgets would leave it without the
+@@ -415,18 +463,24 @@ class AdaptiveVerificationManager:
+         The confidences are the current drafts', broadcast from rank 0, so
+         every rank marks the same rows.
+         """
+-        if self.dead_rows_tau <= 0:
++        tau = self.effective_dead_rows_tau()
++        if tau <= 0 or not getattr(self, "_has_admitted_drafts", True):
+             return None
+         return DeadRows(
+             self._confidence_probs,
+             is_padding,
+             self._dead_row_cut[:num_reqs],
+-            float(np.log(self.dead_rows_tau)),
++            float(np.log(tau)),
+         )
+ 
+-    def get_verified_draft_counts(self, num_reqs: int) -> torch.Tensor:
+-        """Return the device-selected draft count for each request."""
+-        return self._batch_draft_capacity[:num_reqs]
++    def get_verified_draft_counts(
++        self, num_reqs: int, dead_row_cut: torch.Tensor | None = None
++    ) -> torch.Tensor:
++        """Return the device-selected live draft count for each request."""
++        capacities = self._batch_draft_capacity[:num_reqs]
++        if dead_row_cut is not None:
++            torch.minimum(capacities, dead_row_cut[:num_reqs], out=capacities)
++        return capacities
+ 
+     def reallocate_drafts(
+         self, req_ids: list[str], idx_mapping: torch.Tensor
+@@ -460,6 +514,7 @@ class AdaptiveVerificationManager:
+             else self.num_speculative_steps
+         )
+         self.step_steps = step_steps
++        self._has_admitted_drafts = draft_budget > 0
+         capacities = self._batch_draft_capacity[:num_reqs]
+         if draft_budget:
+             async_tensor_h2d(scheduled_drafts, out=capacities)
+@@ -512,6 +567,7 @@ def maybe_create_adaptive_verification_manager(
+     additional_attn_cg_support: tuple[AttentionCGSupport, str | None] | None = None,
+     planned_confidences: bool = False,
+     tp_invariant_confidence: bool = False,
++    calibrated_confidence: bool | Callable[[], bool] = False,
+ ) -> AdaptiveVerificationManager | None:
+     if not enable_adaptive_verification:
+         return None
+@@ -587,6 +643,7 @@ def maybe_create_adaptive_verification_manager(
+         )
+         or None,
+         tp_invariant_confidence=tp_invariant_confidence,
++        calibrated_confidence=calibrated_confidence,
+     )
+ 
+ 
+diff --git a/vllm/v1/worker/gpu/spec_decode/dspark/speculator.py b/vllm/v1/worker/gpu/spec_decode/dspark/speculator.py
+index 952632a2f..b4f9940bb 100644
+--- a/vllm/v1/worker/gpu/spec_decode/dspark/speculator.py
++++ b/vllm/v1/worker/gpu/spec_decode/dspark/speculator.py
+@@ -54,6 +54,19 @@ from vllm.v1.worker.gpu.spec_decode.dspark.utils import load_dspark_model
+ logger = init_logger(__name__)
+ 
+ 
++def _needs_logits_for_acceptance(speculator: "DSparkSpeculator") -> bool:
++    """Whether ``acceptance_estimator`` reads full vocabulary draft logits.
++
++    When ``use_confidence_head`` is true, the estimator calibrates the scalar
++    confidence head output instead of reducing draft logits, so local and
++    vocabulary-parallel greedy draft reductions remain eligible.
++    """
++    return (
++        getattr(speculator, "acceptance_estimator", None) is not None
++        and not getattr(speculator, "use_confidence_head", False)
++    )
++
++
+ class DSparkSpeculator(DFlashSpeculator):
+     _speculator_name = "DSpark"
+ 
+@@ -213,10 +226,10 @@ class DSparkSpeculator(DFlashSpeculator):
+             self.enable_adaptive_verification
+             and getattr(model.model, "confidence_head", None) is not None
+         )
+-        if self.use_confidence_head:
+-            # The acceptance estimator is not needed when a trained confidence head
+-            # is available.
+-            self.use_acceptance_estimator = False
++        # Keep the online acceptance estimator active when a trained confidence
++        # head is present so it calibrates the head's per-position survival and
++        # slope from observed target verification outcomes.
++        self.use_acceptance_estimator = self.enable_adaptive_verification
+         head = getattr(model.model, "confidence_head", None)
+         proj = getattr(head, "proj", None)
+         weight = getattr(proj, "weight", None)
+@@ -231,11 +244,16 @@ class DSparkSpeculator(DFlashSpeculator):
+             self._markov_conf_weight = weight.view(-1)[hidden:].contiguous()
+         return model
+ 
++    def load_model(self, target_model: torch.nn.Module) -> None:
++        super().load_model(target_model)
++        if self.use_confidence_head and self.acceptance_estimator is not None:
++            self.acceptance_estimator.reset_for_confidence_head()
++
+     @property
+     def tp_invariant_confidence(self) -> bool:
+         """Whether every TP rank computes bitwise-identical draft confidences
+         when TP reductions are rank-ordered."""
+-        if not self.use_confidence_head or self.acceptance_estimator is not None:
++        if not self.use_confidence_head:
+             return False
+         head = getattr(getattr(self.model, "model", None), "confidence_head", None)
+         return bool(getattr(head, "tp_invariant", False))
+@@ -247,7 +265,8 @@ class DSparkSpeculator(DFlashSpeculator):
+         sample_pos: torch.Tensor,
+         step: int,
+     ) -> torch.Tensor:
+-        self._maybe_predict_acceptance(logits, idx_map, self._step_cols[step])
++        if not self.use_confidence_head:
++            self._maybe_predict_acceptance(logits, idx_map, self._step_cols[step])
+         if self.draft_logits is None:
+             draft_ids = logits.argmax(dim=-1)
+             return self.model.map_draft_to_target(draft_ids)
+@@ -291,7 +310,7 @@ class DSparkSpeculator(DFlashSpeculator):
+             and getattr(self.model, "vocab_parallel_greedy", False)
+             and self.draft_logits is None
+             and self.model.draft_id_to_target_id is None
+-            and self.acceptance_estimator is None
++            and not _needs_logits_for_acceptance(self)
+         )
+ 
+     def register_warmups(
+@@ -314,7 +333,7 @@ class DSparkSpeculator(DFlashSpeculator):
+                 and processor is not None
+                 and self.draft_logits is None
+                 and self.model.draft_id_to_target_id is None
+-                and getattr(self, "acceptance_estimator", None) is None
++                and not _needs_logits_for_acceptance(self)
+             ):
+                 register_sample_greedy_markov_warmup(
+                     dtype=processor.head_dtype, output_dtype=self.draft_tokens.dtype
+@@ -433,7 +452,7 @@ class DSparkSpeculator(DFlashSpeculator):
+                     confidence_markov_embeds.append(markov_embed)
+             if local_head:
+                 bias = self.model.compute_local_markov_bias(markov_embed)
+-                if self.draft_logits is None and self.acceptance_estimator is None:
++                if self.draft_logits is None and not _needs_logits_for_acceptance(self):
+                     draft_sampled_i = self.model.sample_local_draft_logits(
+                         base_logits[:, i], bias
+                     )
+@@ -485,7 +504,7 @@ class DSparkSpeculator(DFlashSpeculator):
+                 self.draft_logits is None
+                 and self.model.draft_id_to_target_id is None
+                 and base_logits.dtype == bias.dtype
+-                and self.acceptance_estimator is None
++                and not _needs_logits_for_acceptance(self)
+             ):
+                 draft_sampled_i = self.draft_tokens[:num_reqs, i]
+                 sample_greedy_markov(
+@@ -516,6 +535,14 @@ class DSparkSpeculator(DFlashSpeculator):
+                 torch.stack(confidence_markov_embeds, dim=1).flatten(0, 1),
+                 out=self.draft_token_confidence_probs[:num_reqs].view(-1),
+             )
++        if (
++            self.use_confidence_head
++            and getattr(self, "acceptance_estimator", None) is not None
++        ):
++            self.acceptance_estimator.calibrate_confidence_probs(
++                self.draft_token_confidence_probs[:num_reqs],
++                self.sample_idx_mapping[:num_sample],
++            )
+ 
+     def _sample_sequential_topk(self, num_reqs: int, head_hidden: torch.Tensor) -> None:
+         """Apply the sequential Markov head only to top-k base-logit candidates.
+@@ -569,6 +596,11 @@ class DSparkSpeculator(DFlashSpeculator):
+                 torch.stack(confidence_markov_embeds, dim=1).flatten(0, 1),
+                 out=self.draft_token_confidence_probs[:num_reqs].view(-1),
+             )
++            if getattr(self, "acceptance_estimator", None) is not None:
++                self.acceptance_estimator.calibrate_confidence_probs(
++                    self.draft_token_confidence_probs[:num_reqs],
++                    self.sample_idx_mapping[:num_sample],
++                )
+ 
+     def _generate_draft(
+         self,
+diff --git a/vllm/v1/worker/gpu/spec_decode/speculator.py b/vllm/v1/worker/gpu/spec_decode/speculator.py
+index 6588acd0c..dfd477459 100644
+--- a/vllm/v1/worker/gpu/spec_decode/speculator.py
++++ b/vllm/v1/worker/gpu/spec_decode/speculator.py
+@@ -251,7 +251,9 @@ class DraftModelSpeculator(BaseSpeculator):
+             )
+ 
+         if self.use_acceptance_estimator:
+-            if self.use_local_argmax_reduction:
++            if self.use_local_argmax_reduction and not getattr(
++                self, "use_confidence_head", False
++            ):
+                 raise ValueError(
+                     "Adaptive verification without a confidence head estimates "
+                     "per-position acceptance from the draft logits, which "
+-- 
+2.43.0
+

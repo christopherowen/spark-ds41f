@@ -1,0 +1,282 @@
+From 8fce50b38082ed9164a0379bb4786d3a2cf079c6 Mon Sep 17 00:00:00 2001
+From: Christopher Owen <christopherowen@users.noreply.github.com>
+Date: Sat, 7 Nov 2026 00:09:39 +0100
+Subject: [PATCH] profiling(iket): sample runtime while loops and classify
+ network and gather phases
+
+Upstream base: local-inference-lab/vllm 19f2c20ed4d64ae22bd009ceacadd85e2a81e354.
+Immediate base: 0743-Project-CED-global-KV-on-local-rows-before-gathering.patch.
+
+Give generated CUDA while loops a synthetic trip counter when loop-iteration sampling is active so persistent and unknown-trip loops record bounded initial trips without changing their loop condition, while preserving sampled global flag spin loops as wait.spin phases. Recognize SparkNet staging, doorbell variants, and exchange pack intrinsics as distinct store.stage, signal.proxy, and load.gather phases, and classify vllm_gather_b128 as store.global so gather_columns_into coalesces with its scalar tail branch into a single 2-event store.global range. Vision TMA-only and multi-warp TMA producer synchronization is handled natively by TileLang producer_consumer_ws.cc.
+
+Quality: profiling-only source postprocessor; inactive unless VLLM_DS41_IKET is set.
+
+Tests: 17 CPU phase tests and GPU kernel manifest/producer synchronization checks pass across two GPU boots.
+Upstream status: local candidate, not yet submitted.
+---
+ .../test_deepseek_v41_tilelang_iket.py        | 138 ++++++++++++++++--
+ vllm/models/deepseek_v4_1/tilelang/iket.py    |  46 +++++-
+ 2 files changed, 168 insertions(+), 16 deletions(-)
+
+diff --git a/tests/kernels/test_deepseek_v41_tilelang_iket.py b/tests/kernels/test_deepseek_v41_tilelang_iket.py
+index cae522ad2..ae19ce321 100644
+--- a/tests/kernels/test_deepseek_v41_tilelang_iket.py
++++ b/tests/kernels/test_deepseek_v41_tilelang_iket.py
+@@ -253,23 +253,49 @@ def test_sampled_iterations_guard_loop_ranges():
+     assert f"TL_IKET_WHEN(__tl_iket_cta && {stride}) TL_IKET_EVENT(1," in both
+ 
+ 
+-def test_while_loop_ranges_have_no_bound():
+-    # TVM's while loop has no variable to sample: a range in it records in every
+-    # iteration, so the kernel's bound on a warp's events is None.
++def test_runtime_while_is_sampled_without_changing_its_test():
+     code = KERNEL.replace(
+         "  C[threadIdx.x] = acc[0];\n",
+         "  int t = 0;\n  while (1) {\n    if (!((t < e))) { break; }\n"
+         "    C[t] = acc[0];\n    t = (t + 1);\n  }\n  C[threadIdx.x] = acc[0];\n",
+     )
+-    _, sites = iket.annotate(code, _token, iters=1)
+-    assert [s["unsampled_loops"] for s in sites if "unsampled_loops" in s] == [
+-        ["while (1)"]
+-    ]
+-    assert {s["events_per_warp_bound"] for s in sites} == {None}
+-    assert [s["loop_trips"] for s in sites if "unsampled_loops" in s] == [None]
+-    # Without it, each range opens and closes once in the sampled iteration.
+-    sites = iket.annotate(KERNEL, _token, iters=1)[1]
+-    assert {s["events_per_warp_bound"] for s in sites} == {2 * len(sites)}
++    out, sites = iket.annotate(code, _token, iters=1)
++    assert "__tl_iket_while_0 = 0; (1);" in out
++    assert "__tl_iket_while_0 += (__tl_iket_while_0 < 1ULL)" in out
++    assert "TL_IKET_WHEN((__tl_iket_while_0 < 1ULL))" in out
++    assert "if (!((t < e))) { break; }" in out
++    assert not any(s.get("unsampled_loops") for s in sites)
++    assert all(isinstance(s["events_per_warp_bound"], int) for s in sites)
++    assert any(s.get("loop_trips", 0) is None for s in sites)
++    # Full iteration tracing still explicitly has no static capacity bound.
++    assert {s["events_per_warp_bound"] for s in iket.annotate(code, _token)[1]} == {None}
++
++
++def test_network_exchange_stage_doorbell_and_gather_have_distinct_phases():
++    code = """extern "C" __global__ void network_kernel(float* A, float* C) {
++  roce_stage_scatter_pack(A, C);
++  roce_doorbell_exchange(C);
++  roce_wait_peers(C);
++  roce_reduce_pack_f32(A, C);
++  roce_exchange_pack(A, C);
++  roce_tail(C);
++}
++"""
++    sites = iket.annotate(code, _token, iters=1)[1]
++    assert {s["range"] for s in sites} == {
++        "store.stage", "signal.proxy", "wait.flags", "compute.reduce",
++        "load.gather", "signal.proxy#2",
++    }
++
++
++def test_sampled_global_flag_loop_remains_a_wait_phase():
++    code = """extern "C" __global__ void flag_kernel(float* A) {
++  while (A[0] == 0) {
++  }
++}
++"""
++    sites = iket.annotate(code, _token, iters=1)[1]
++    assert [(s["phase"], s["kinds"]) for s in sites] == [("wait", ["spin"])]
+ 
+ 
+ def test_module_without_kernels_is_unchanged():
+@@ -387,6 +413,31 @@ def test_cache_digest_isolates_sampling_settings():
+ 
+ # ---------------------------------------------------------------- the mode
+ 
++def test_vllm_gather_b128_classified_as_global_store():
++    src = """
++    __global__ void gather_columns_into(const bfloat16_t* __restrict__ src, bfloat16_t* __restrict__ out0, bfloat16_t* __restrict__ out1, int rows, int stride0, int stride1) {
++      int row = (int)blockIdx.x;
++      int col = ((((int)blockIdx.y) * 128) + ((int)threadIdx.x)) * 8;
++      if (col < 384) {
++        int source_row = (((col / 128) * 2) * rows) + row;
++        if ((col + 8) <= 384) {
++          vllm_gather_b128((&(out0[((row * stride0) + col)])), (&(src[((source_row * 128) + (col % 128))])));
++        } else {
++          for (int k = 0; k < 8; ++k) {
++            if ((col + k) < 384) {
++              out0[(((row * stride0) + col) + k)] = src[(((source_row * 128) + (col % 128)) + k)];
++            }
++          }
++        }
++      }
++    }
++    """
++    _, sites = iket.annotate(src, _token, iters=1, granularity="phase")
++    assert [(s["phase"], s["kinds"], s["events_per_warp_bound"]) for s in sites] == [
++        ("store", ["global"], 2),
++    ]
++
++
+ GPU = pytest.mark.skipif(
+     not __import__("torch").cuda.is_available(),
+     reason="the IKET mode compiles CUDA kernels",
+@@ -542,3 +593,66 @@ def test_enable_refuses_after_a_compile(tmp_path):
+     )
+     assert process.returncode == 0, process.stderr[-4000:]
+     assert "refused: IKET mode must be on before TileLang compiles" in process.stdout
++
++
++@GPU
++def test_gather_columns_into_iket_manifest_is_single_global_store_range():
++    from vllm.models.deepseek_v4_1.tilelang.gather import gather_columns_kernel
++
++    kernel = gather_columns_kernel.compile(3, 128, 384, 2, "bfloat16", True)
++    src = kernel.get_kernel_source()
++    _, sites = iket.annotate(src, _token, iters=1, granularity="phase")
++    assert [(s["phase"], s["kinds"], s["events_per_warp_bound"]) for s in sites] == [
++        ("store", ["global"], 2),
++    ]
++
++
++@GPU
++def test_vision_and_multi_warp_tma_producers_synchronized_natively():
++    import re
++    import tilelang
++    import tilelang.language as T
++    from vllm.models.deepseek_v4_1.tilelang import vision
++
++    for fn, args in [
++        (vision.linear_kernel, (1152, 1152, False)),
++        (vision.swiglu_linear_kernel, (4352, 1152)),
++        (vision.attention_kernel, (16, 80)),
++    ]:
++        src = fn.compile(*args).get_kernel_source()
++        flat = " ".join(src.split())
++        producer = flat.split("if (((int)threadIdx.x) < 128) {", 1)[1].split("} else {", 1)[0]
++        assert "if (((int)threadIdx.x) < 32)" in producer, src
++        assert "tl::tl_shuffle_elect<32>()" in producer, src
++
++    @T.prim_func
++    def multi_group_tma(
++        A: T.Tensor((128, 256), T.float16),
++        B1: T.Tensor((256, 128), T.float16),
++        B2: T.Tensor((256, 128), T.float16),
++        I: T.Tensor((4,), T.int32),
++        C: T.Tensor((128, 128), T.float32),
++    ):
++        with T.Kernel(2, 2, threads=128) as (bx, by):
++            A_shared = T.alloc_shared((64, 64), T.float16)
++            B1_shared = T.alloc_shared((64, 64), T.float16)
++            B2_shared = T.alloc_shared((64, 64), T.float16)
++            C_frag = T.alloc_fragment((64, 64), T.float32)
++            T.clear(C_frag)
++            for k in T.Pipelined(4, num_stages=2):
++                idx = I[k] * 64
++                T.copy(A[by * 64, idx], A_shared)
++                T.copy(B1[idx, bx * 64], B1_shared)
++                T.gemm(A_shared, B1_shared, C_frag)
++                T.copy(B2[idx, bx * 64], B2_shared)
++                T.gemm(A_shared, B2_shared, C_frag)
++            T.copy(C_frag, C[by * 64, bx * 64])
++
++    mg_src = tilelang.compile(multi_group_tma, target="cuda", execution_backend="tvm_ffi").get_kernel_source()
++    mg_flat = " ".join(mg_src.split())
++    mg_producer = mg_flat.split("if (((int)threadIdx.x) < 128) {", 1)[1].split("} else {", 1)[0]
++    waits = re.findall(
++        r"mbarrier\[[^\]]+\]\.wait\([^;]+\);\s*tl::__sync_thread_partial\(\d+, 128\);",
++        mg_producer,
++    )
++    assert len(waits) == mg_producer.count(".wait(") >= 2, mg_src
+diff --git a/vllm/models/deepseek_v4_1/tilelang/iket.py b/vllm/models/deepseek_v4_1/tilelang/iket.py
+index 648171f02..4c9454e5d 100644
+--- a/vllm/models/deepseek_v4_1/tilelang/iket.py
++++ b/vllm/models/deepseek_v4_1/tilelang/iket.py
+@@ -110,13 +110,15 @@ _PATTERNS = [
+     ("load", "tma", [r"\btl::tma_load\w*", r"\.expect_transaction\s*\(",
+                      r"\barrive_and_expect_tx\b"]),
+     ("load", "cp_async", [r"\btl::cp_async_\w+", r"\bcp\.async\b"]),
++    ("load", "gather", [r"\broce_(?:gather|exchange)_pack\s*\("]),
+     ("compute", "mma", [r"\btl::\w*mma\w*", r"\bmma\.sync\b",
+                         r"\btl::ptx_ldmatrix\w*", r"\btl::gemm_\w+", r"\bwmma::"]),
+     ("compute", "reduce", [r"\btl::AllReduce\b", r"\btl::warp_reduce\w*",
+                            r"\b__shfl_\w+", r"\broce_reduce_\w+"]),
+     ("store", "tma", [r"\btl::tma_store\w*"]),
+-    ("store", "stage", [r"\broce_copy_\w+\s*\("]),
+-    ("signal", "proxy", [r"\broce_doorbell\s*\(", r"\broce_tail\s*\(",
++    ("store", "stage", [r"\broce_(?:copy|stage)_\w+\s*\("]),
++    ("store", "global", [r"\bvllm_gather_b128\s*\("]),
++    ("signal", "proxy", [r"\broce_doorbell(?:_\w+)?\s*\(", r"\broce_tail\s*\(",
+                          r"\broce_st_\w+\s*\("]),
+     ("store", "atomic", [r"\batomic\w+\s*\(", r"\btl::Atomic\w+\s*\("]),
+ ]  # fmt: skip
+@@ -320,7 +322,7 @@ def _classify(
+             if child.phase == "wait":
+                 wait_kinds |= child.kinds
+     if set(_IDENTIFIER.findall(node.text)) & params:
+-        if node.text.startswith("while"):
++        if node.text.startswith("while") or _RUNTIME_FOR.fullmatch(node.text):
+             phases.add("wait")  # a spin on a global flag
+             node.kinds.add("spin")
+             wait_kinds.add("spin")
+@@ -454,10 +456,45 @@ def _sampled_factor(headers: tuple[str, ...], iters: int) -> float | None:
+     return total / sampled
+ 
+ 
++_RUNTIME_FOR = re.compile(
++    r"for\s*\(unsigned long long (__tl_iket_while_\d+) = 0;.*; "
++    r"\1 \+= \(\1 < (\d+)ULL\)\)", re.S
++)
++
++
++def _sample_runtime_loops(code: str, iters: int) -> str:
++    """Give while loops a saturating observation counter without changing their test."""
++    if not iters:
++        return code
++    changes = []
++
++    def visit(nodes):
++        for node in nodes:
++            if node.text.startswith("while"):
++                position = code.index(node.text, node.start, node.end)
++                test = node.text[node.text.index("(") + 1 : -1]
++                counter = f"__tl_iket_while_{len(changes)}"
++                header = (f"for (unsigned long long {counter} = 0; ({test}); "
++                          f"{counter} += ({counter} < {iters}ULL))")
++                changes.append((position, position + len(node.text), header))
++            visit(node.body or [])
++            visit(node.orelse or [])
++
++    for _, _, start, end in _kernels(code):
++        if not _CONDITIONAL.search(code, start, end):
++            visit(_Parser(code).block(start)[0])
++    for start, end, text in sorted(changes, reverse=True):
++        code = code[:start] + text + code[end:]
++    return code
++
++
+ def _iterations(header: str, iters: int) -> str | None:
+     """True in at most ``iters`` iterations of a TVM ``for`` loop (``for (int v =
+     start; v < bound; ++v)``), each in the middle of its share of the loop, so one
+     sample is the middle iteration, not the pipeline's fill; None for another header."""
++    runtime = _RUNTIME_FOR.fullmatch(header)
++    if runtime is not None:
++        return f"({runtime.group(1)} < {iters}ULL)"
+     loop = _FOR.match(header)
+     if loop is None:
+         return None
+@@ -520,7 +557,7 @@ def annotate(
+     CTA, evenly spread across warp groups, record their ranges so trace stores do
+     not contend across every warp of a CTA. With ``iters`` > 0 a range inside a
+     ``for`` loop records in at most that many of its iterations, evenly spread
+-    (a ``while`` loop has no variable to sample: its site lists it, unsampled):
++    (a ``while`` loop uses a saturating counter and records its first sampled iterations):
+     run-iket reserves the run's largest warp record for every warp of every
+     instrumented launch, so one long kernel sizes the whole run's buffer. With
+     ``granularity="phase"``, consecutive waits and same-phase siblings separated
+@@ -532,6 +569,7 @@ def annotate(
+     preprocessor conditional in its body is left as it is."""
+     if granularity not in _GRANULARITIES:
+         raise ValueError(f"unknown IKET granularity: {granularity!r}")
++    code = _sample_runtime_loops(code, iters)
+     found: list[_Range] = []
+     sites: list[dict] = []
+     bodies: dict[str, int] = {}
+-- 
+2.43.0
+

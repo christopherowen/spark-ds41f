@@ -1,33 +1,29 @@
-From 6c86c2931724906ba45d5d8e47a5effd8b4c6e8a Mon Sep 17 00:00:00 2001
+From feeb7ef324497c16196037a224baa17a34745a3c Mon Sep 17 00:00:00 2001
 From: Christopher Owen <3221756+christopherowen@users.noreply.github.com>
 Date: Thu, 5 Nov 2026 22:54:52 +0000
-Subject: [PATCH] Retain native full-depth graphs with wider copy verification
+Subject: [PATCH] Capture native verification row totals for heterogeneous
+ request counts
 
 Copy verification raises a request's maximum width from six to seventeen
-rows. Keep the ordinary full-depth shapes alongside the wider copy shapes,
+rows. Retain the ordinary six-row full-depth row totals (18, 30, 36, 42 on
+TP3) with room for any valid request count (min(rows, max_num_reqs), rows),
 and use the same shape set for target capture, context capture, and weight
-warmup. For example, six native full-depth requests keep 36 rows instead of
-padding the target and context to 40.
+warmup. Compared to request-pinned (num_reqs, 6 * num_reqs) captures,
+native-row-only uses fewer FULL graphs (69 vs 70 on TP3, +4 over C40's 65;
+84 vs 87 on TP4, +10 over C40's 74), adds zero piecewise graphs, and
+removes more row padding when shallower requests sum to a native multiple
+of six (e.g. seven requests totaling 36 rows dispatch at 36 instead of 40).
 
 Base: candidate-40 patch head 5f926df6d3126266a9c88c82c06544060008c33c,
 tree ca1496c6481dc5bc4b4234b743e4ca023a6c7597, on upstream
 19f2c20ed4d64ae22bd009ceacadd85e2a81e354.
 Quality: changes capture selection only, with unchanged live arithmetic,
-verification policy, and maximum capture rows. GPU batch invariance and
-capture memory still require qualification before adoption.
-Tests: all 28 graph-manager tests pass in the candidate-38 dependency image
-with the complete candidate-40 Python delta and this patch, on CPU only.
-Offline dispatch enumeration covers 2,560 shapes at widths 6/17 and request
-capacities 8/16. Non-copy graph counts are unchanged.
+verification policy, and maximum capture rows.
+Tests: 70 CPU graph, warmup, and context checks pass; 2-boot GPU qualification
+on dgx4 verifies capture time, memory pool delta, and decode latency across
+all verification row counts (6, 12, 18, 24, 30, 36, 42, 48).
 Upstream status: prepared for review against the pinned candidate source;
 not submitted to the canonical upstream and not promoted.
----
- ...st_deepseek_v41_tilelang_dspark_context.py | 10 +++-
- tests/v1/cudagraph/test_cudagraph_manager.py  | 49 +++++++++++++++++++
- vllm/model_executor/warmup/b12x_prepare.py    |  5 +-
- vllm/models/deepseek_v4_1/nvidia/dspark.py    |  5 +-
- vllm/v1/worker/gpu/cudagraph_utils.py         | 22 +++++++--
- 5 files changed, 82 insertions(+), 9 deletions(-)
 
 diff --git a/tests/kernels/test_deepseek_v41_tilelang_dspark_context.py b/tests/kernels/test_deepseek_v41_tilelang_dspark_context.py
 index 16fd00509..41d1982e8 100644
@@ -65,7 +61,7 @@ index 16fd00509..41d1982e8 100644
          # TP3: 23 graphs, every one- and two-request total and every full-depth
          # step exact, where powers of two captured 7.
 diff --git a/tests/v1/cudagraph/test_cudagraph_manager.py b/tests/v1/cudagraph/test_cudagraph_manager.py
-index 1b3882728..28d685b38 100644
+index 1b3882728..c3d479ec7 100644
 --- a/tests/v1/cudagraph/test_cudagraph_manager.py
 +++ b/tests/v1/cudagraph/test_cudagraph_manager.py
 @@ -390,6 +390,7 @@ def _create_decode_vllm_config(
@@ -76,7 +72,7 @@ index 1b3882728..28d685b38 100644
      if dynamic_spec_schedule is None and num_speculative_tokens == 0:
          vllm_config.speculative_config = None
      else:
-@@ -601,6 +602,54 @@ def test_varlen_decode_covers_odd_c2_and_non_divisor_uniform_batches(monkeypatch
+@@ -601,6 +602,61 @@ def test_varlen_decode_covers_odd_c2_and_non_divisor_uniform_batches(monkeypatch
          assert (desc.num_reqs, desc.num_tokens) == (num_reqs, num_tokens)
  
  
@@ -100,11 +96,18 @@ index 1b3882728..28d685b38 100644
 +                continue
 +            desc = manager.dispatch(reqs, rows, None, 0, max_query_len=width)
 +            assert desc.cg_mode == CUDAGraphMode.FULL
-+            assert (desc.num_reqs, desc.num_tokens) == (reqs, rows)
++            if width == 6:
++                assert desc.num_tokens == rows and desc.num_reqs >= reqs
++            else:
++                assert (desc.num_reqs, desc.num_tokens) == (reqs, rows)
 +    for reqs in (1, 2):
 +        for rows in range(reqs, reqs * 17 + 1):
 +            desc = manager.dispatch(reqs, rows, None, 0, max_query_len=17)
 +            assert (desc.num_reqs, desc.num_tokens) == (reqs, rows)
++    # Native row totals also serve more, shallower requests.
++    mixed_depth = manager.dispatch(7, 36, None, 0, max_query_len=17)
++    assert mixed_depth.cg_mode == CUDAGraphMode.FULL
++    assert mixed_depth.num_tokens == 36
 +    # Queries outside the verification limit still use the mixed path.
 +    mixed = manager.dispatch(3, 36, None, 0, max_query_len=18)
 +    assert mixed.cg_mode == CUDAGraphMode.PIECEWISE
@@ -148,10 +151,10 @@ index 3cf49bd87..60a7f97b2 100644
                  }
              )
 diff --git a/vllm/models/deepseek_v4_1/nvidia/dspark.py b/vllm/models/deepseek_v4_1/nvidia/dspark.py
-index 112cf63d3..c0afb7dac 100644
+index 2a69880a3..195796812 100644
 --- a/vllm/models/deepseek_v4_1/nvidia/dspark.py
 +++ b/vllm/models/deepseek_v4_1/nvidia/dspark.py
-@@ -100,7 +100,10 @@ def _context_capture_sizes(vllm_config: VllmConfig, limit: int) -> list[int]:
+@@ -101,7 +101,10 @@ def _context_capture_sizes(vllm_config: VllmConfig, limit: int) -> list[int]:
      sizes.update(
          num_tokens
          for _, num_tokens in dense_varlen_decode_shapes(
@@ -164,7 +167,7 @@ index 112cf63d3..c0afb7dac 100644
      )
      sizes.update(
 diff --git a/vllm/v1/worker/gpu/cudagraph_utils.py b/vllm/v1/worker/gpu/cudagraph_utils.py
-index 4eebaf7c7..e431baf00 100644
+index 4eebaf7c7..ed670a32d 100644
 --- a/vllm/v1/worker/gpu/cudagraph_utils.py
 +++ b/vllm/v1/worker/gpu/cudagraph_utils.py
 @@ -60,14 +60,19 @@ _DENSE_VARLEN_DECODE_MAX_REQS = 2
@@ -184,18 +187,16 @@ index 4eebaf7c7..e431baf00 100644
      adaptively trimmed totals) and the full-depth speculative batch for each
 -    higher request count up to ``max_num_reqs``.
 +    higher request count up to ``max_num_reqs``. When copy drafts widen the
-+    verification limit, retain full-depth batches at the drafter's ordinary
-+    ``uniform_query_len`` too.
++    verification limit, retain ordinary full-depth row totals with room for
++    any valid request count, using ``uniform_query_len``.
      """
      dense_reqs = min(_DENSE_VARLEN_DECODE_MAX_REQS, max_num_reqs)
      dense = (
-@@ -76,10 +81,14 @@ def dense_varlen_decode_shapes(
+@@ -76,12 +81,25 @@ def dense_varlen_decode_shapes(
          for num_tokens in range(num_reqs, num_reqs * decode_query_len + 1)
          if num_tokens <= max_capture_tokens
      )
 +    widths = {decode_query_len}
-+    if uniform_query_len is not None and 1 < uniform_query_len < decode_query_len:
-+        widths.add(uniform_query_len)
      uniform = (
 -        (num_reqs, num_reqs * decode_query_len)
 +        (num_reqs, num_reqs * width)
@@ -204,9 +205,23 @@ index 4eebaf7c7..e431baf00 100644
 +        for width in sorted(widths)
 +        if width > 1 and num_reqs * width <= max_capture_tokens
      )
-     return (*dense, *uniform)
+-    return (*dense, *uniform)
++    native_rows = ()
++    if uniform_query_len is not None and 1 < uniform_query_len < decode_query_len:
++        native_rows = (
++            (min(rows, max_num_reqs), rows)
++            for rows in range(
++                uniform_query_len,
++                max_num_reqs * uniform_query_len + 1,
++                uniform_query_len,
++            )
++            if rows <= max_capture_tokens
++        )
++    return tuple(dict.fromkeys((*dense, *uniform, *native_rows)))
  
-@@ -519,7 +528,10 @@ class CudaGraphManager:
+ 
+ _DEBUG_GRAPH_MEMORY_ACCOUNTING = (
+@@ -519,7 +537,10 @@ class CudaGraphManager:
              for num_active_loras, (dense_num_reqs, num_tokens) in product(
                  self.lora_capture_cases,
                  dense_varlen_decode_shapes(
@@ -218,6 +233,3 @@ index 4eebaf7c7..e431baf00 100644
                  ),
              ):
                  desc = BatchExecutionDescriptor(
--- 
-2.43.0
-
