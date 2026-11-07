@@ -26,11 +26,15 @@ owner.
 - The minimum-match-8 policy hypothesis was dropped at source review, not counted
   as a failed serving benchmark. A future copy-policy idea needs a bounded
   expected benefit and budget-binding mixed copy/edit/tool correctness evidence.
-- C42's TileLang refresh plus existing #879–#883 fixes is rejected as maintenance:
+- C42's built TileLang refresh plus existing #879–#883 fixes failed its native gate:
   8073 tests passed, 360 skipped and the required IKET prepare/freeze check failed.
   #880 ignores an explicitly prepared kernel when cache is disabled. A focused
   review confirmed that VERSION-only C44 cannot fix this branch; withdraw C44
-  unmeasured and retain C40's compiler. No serving/performance point was run.
+  unmeasured. The separate C45 correction repairs explicit preparation with
+  caching disabled and gives the new compiler its own source-bound cache
+  namespace. It continues toward native qualification; C40's compiler remains
+  the validated reference meanwhile. No serving/performance point was run,
+  and this is not a performance rejection of the compiler idea.
   Preserve the separate cache-provenance gap and all failed native evidence in
   `experiments/2026-11-05-compiler-live-qualification`. Subsequent release gates use
   isolated fresh cache directories; no shared cache is deleted or baseline rerun.

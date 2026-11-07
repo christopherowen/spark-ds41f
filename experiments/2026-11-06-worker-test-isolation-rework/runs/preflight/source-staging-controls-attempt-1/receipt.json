@@ -1,0 +1,210 @@
+{
+  "remote_workdir": "/home/chris/spark-work/worker-test-isolation/c46-source-staging-controls-attempt-1",
+  "ssh_exit": 0,
+  "stderr": "",
+  "result": {
+    "wait": {
+      "started": "2026-11-06T03:46:25.443357+00:00",
+      "ended": "2026-11-06T03:46:27.440599+00:00",
+      "argv": [
+        "systemd-run",
+        "--user",
+        "--wait",
+        "--pipe",
+        "--unit=c46-source-staging-controls-1",
+        "-p",
+        "CPUQuota=100%",
+        "-p",
+        "MemoryMax=4G",
+        "-p",
+        "MemorySwapMax=0",
+        "-p",
+        "TasksMax=128",
+        "-p",
+        "RuntimeMaxSec=600s",
+        "python3",
+        "-B",
+        "/home/chris/spark-work/worker-test-isolation/c46-source-staging-controls-attempt-1/driver.py",
+        "/home/chris/spark-work/worker-test-isolation/c46-source-staging-controls-attempt-1",
+        "b55924190e2372ff7c0c948cfd08ba3c04683b6c"
+      ],
+      "actual_wait_exit": 0,
+      "actual_exit_not_dispatch": true
+    },
+    "receipt": {
+      "started": "2026-11-06T03:46:25.473537+00:00",
+      "commit": "b55924190e2372ff7c0c948cfd08ba3c04683b6c",
+      "steps": [
+        {
+          "name": "GPU-readonly-precondition",
+          "argv": [
+            "nvidia-smi",
+            "--query-compute-apps=pid",
+            "--format=csv,noheader"
+          ],
+          "exit": 0,
+          "stdout": "GPU-readonly-precondition.stdout",
+          "stderr": "GPU-readonly-precondition.stderr"
+        },
+        {
+          "name": "clean-private-checkout",
+          "argv": [
+            "git",
+            "-c",
+            "gc.auto=0",
+            "-c",
+            "maintenance.auto=false",
+            "-c",
+            "pack.threads=1",
+            "-C",
+            "/home/chris/spark-work/worker-test-isolation/c46-build-controls-attempt-1/checkout",
+            "status",
+            "--porcelain"
+          ],
+          "exit": 0,
+          "stdout": "clean-private-checkout.stdout",
+          "stderr": "clean-private-checkout.stderr"
+        },
+        {
+          "name": "fetch-exact-control-source",
+          "argv": [
+            "git",
+            "-c",
+            "gc.auto=0",
+            "-c",
+            "maintenance.auto=false",
+            "-c",
+            "pack.threads=1",
+            "-C",
+            "/home/chris/spark-work/worker-test-isolation/c46-build-controls-attempt-1/checkout",
+            "fetch",
+            "--no-tags",
+            "--depth=1",
+            "--filter=blob:none",
+            "deployment",
+            "b55924190e2372ff7c0c948cfd08ba3c04683b6c"
+          ],
+          "exit": 0,
+          "stdout": "fetch-exact-control-source.stdout",
+          "stderr": "fetch-exact-control-source.stderr"
+        },
+        {
+          "name": "sparse-patterns",
+          "argv": [
+            "git",
+            "-c",
+            "gc.auto=0",
+            "-c",
+            "maintenance.auto=false",
+            "-c",
+            "pack.threads=1",
+            "-C",
+            "/home/chris/spark-work/worker-test-isolation/c46-build-controls-attempt-1/checkout",
+            "sparse-checkout",
+            "set",
+            "--no-cone",
+            "--stdin"
+          ],
+          "exit": 0,
+          "stdout": "sparse-patterns.stdout",
+          "stderr": "sparse-patterns.stderr"
+        },
+        {
+          "name": "exact-published-checkout",
+          "argv": [
+            "git",
+            "-c",
+            "gc.auto=0",
+            "-c",
+            "maintenance.auto=false",
+            "-c",
+            "pack.threads=1",
+            "-C",
+            "/home/chris/spark-work/worker-test-isolation/c46-build-controls-attempt-1/checkout",
+            "checkout",
+            "-b",
+            "feat/c46-source-staging-control-1",
+            "b55924190e2372ff7c0c948cfd08ba3c04683b6c"
+          ],
+          "exit": 0,
+          "stdout": "exact-published-checkout.stdout",
+          "stderr": "exact-published-checkout.stderr"
+        },
+        {
+          "name": "verify-commit",
+          "argv": [
+            "git",
+            "-c",
+            "gc.auto=0",
+            "-c",
+            "maintenance.auto=false",
+            "-c",
+            "pack.threads=1",
+            "-C",
+            "/home/chris/spark-work/worker-test-isolation/c46-build-controls-attempt-1/checkout",
+            "rev-parse",
+            "HEAD"
+          ],
+          "exit": 0,
+          "stdout": "verify-commit.stdout",
+          "stderr": "verify-commit.stderr"
+        },
+        {
+          "name": "source-staging-controls",
+          "argv": [
+            "python3",
+            "-B",
+            "-m",
+            "unittest",
+            "test_source_staging",
+            "-v"
+          ],
+          "exit": 0,
+          "stdout": "source-staging-controls.stdout",
+          "stderr": "source-staging-controls.stderr"
+        },
+        {
+          "name": "new-source-parsing",
+          "argv": [
+            "python3",
+            "-B",
+            "-c",
+            "import ast,pathlib;[ast.parse(pathlib.Path(p).read_text(),filename=p) for p in ['experiments/2026-11-06-worker-test-isolation-rework/stage_source.py','experiments/2026-11-06-worker-test-isolation-rework/test_source_staging.py']]"
+          ],
+          "exit": 0,
+          "stdout": "new-source-parsing.stdout",
+          "stderr": "new-source-parsing.stderr"
+        },
+        {
+          "name": "whitespace",
+          "argv": [
+            "git",
+            "-c",
+            "gc.auto=0",
+            "-c",
+            "maintenance.auto=false",
+            "-c",
+            "pack.threads=1",
+            "-C",
+            "/home/chris/spark-work/worker-test-isolation/c46-build-controls-attempt-1/checkout",
+            "diff",
+            "--check"
+          ],
+          "exit": 0,
+          "stdout": "whitespace.stdout",
+          "stderr": "whitespace.stderr"
+        }
+      ],
+      "purpose": "Only10 new source-staging controls and syntax; no prior passing gate or benchmark repeated",
+      "GPU_serving_or_existing_checkout_changes": false,
+      "effective_limits": {
+        "cpu.max": "100000 100000",
+        "memory.max": "4294967296",
+        "memory.swap.max": "0"
+      },
+      "passed": true,
+      "ended": "2026-11-06T03:46:27.429821+00:00"
+    },
+    "stderr": "Running as unit: c46-source-staging-controls-1.service; invocation ID: 900283d9ad474da09741a2b4c71a05c7\nFinished with result: success\nMain processes terminated with: code=exited/status=0\nService runtime: 1.978s\nCPU time consumed: 694ms\nMemory peak: 508.0K\nMemory swap peak: 0B\n"
+  }
+}

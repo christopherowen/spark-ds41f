@@ -138,6 +138,29 @@ before the first boot. `run --dry-run` prints the problems.
   - `"extras"` replaces the profile's workloads: `[script, [arguments], output stem]` each. A
     bare script name is the experiment's own; a path such as `scripts/distinct_streams.py` is
     repository-relative.
+  - A functional phase can declare `"evidence"` contracts keyed by extra output stem.
+    These require `"bench": false`; the controller starts its separate timing phase
+    only after the functional phase succeeds. For example,
+    `"evidence": {"greedy": {"kind": "summary", "label": "temperature-0 determinism",
+    "require": {"identical": true, "logprobs": false}}}` requires those exact JSON
+    values in one summary. Missing, malformed or failed required evidence stops
+    the run even if the collector exits zero, preserving the usual failure restore.
+    `"observe": ["field"]` retains an observation without asserting it is true.
+    Each declared collector gets a `.jsonl.evidence.json` receipt with separate
+    requirements, observations, source hash and process exit. Prior output, receipts
+    or request recordings are refused before boot; use a distinct run name.
+  - The sampled contract declares `"kind": "sampled"`, `"tokens"`, `"seed"`, `"cases"`
+    and separate `"batch_invariance"` / `"isolated_repeat"` policies, each `"require"`
+    or `"observe"`. Native block verification keys draws by local speculative step,
+    so request seed alone does not imply batch-invariant sampled trajectories.
+    C43 observes batch differences and requires the isolated repeat. With
+    `"record_requests": true`, the lab also requires a complete, hash-verified private
+    `.requests/` manifest and per-case requests/responses. These retain nonsecret
+    IDs, generation controls, token/logprob arrays and native token IDs when returned.
+    Native logit positions and local speculative steps are unavailable through HTTP
+    and are marked unavailable. Token and logprob differences are reported separately.
+    The collector still exits zero for observed differences; unannotated historical
+    jobs keep their existing semantics and recorded limitations.
   - Results land where `tables_arms.py` reads them: `results/private/bench/<run>-<label>/` and
     `results/private/determinism/<run>/<kind>-<label>.jsonl`.
 - **Sweeps:** `scripts/lab_sweep.py` writes a `measure` job for one environment variable:
