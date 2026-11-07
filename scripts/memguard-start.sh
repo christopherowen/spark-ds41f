@@ -73,6 +73,7 @@ ready_file=$(mktemp "$runtime_dir/${name}-memguard.XXXXXX")
 rm -f -- "$ready_file"
 
 # A collected transient unit may still have a failed record from a prior stop.
+sudo -n install -d -m 0755 -o "$(id -un)" /var/log/spark-memguard >/dev/null 2>&1 || true
 sudo -n systemctl stop "$unit" >/dev/null 2>&1 || true
 sudo -n systemctl reset-failed "$unit" >/dev/null 2>&1 || true
 sudo -n systemd-run --quiet \

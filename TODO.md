@@ -377,9 +377,6 @@ Remaining kernel-level investigations:
 - The one-read `fill_defaults` fix (`0019`) is still needed on PyTorch main.
 - The NCCL IB send-path fence patch should be dropped once upstream releases the
   fix.
-- `scripts/memguard.sh` evidence directory fallback ([#872](https://github.com/christopherowen/spark-ds41f/issues/872)):
-  ensure `memguard.sh` creates a writable fallback directory when
-  `/var/log/spark-memguard` is not writable by an unprivileged user.
 
 ## Tried and not adopted
 

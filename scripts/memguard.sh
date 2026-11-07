@@ -44,9 +44,19 @@ previous_at=
 # After a kill, what `docker rm -f` would otherwise destroy: the breach's meminfo, the
 # largest host processes, the container's state and its log. Never delays the kill.
 save_evidence() {
-  local meminfo=$1 dir
-  dir="$MEMGUARD_EVIDENCE_DIR/${CONTAINER_NAME}-$(date -u +%Y%m%dT%H%M%SZ)"
-  mkdir -p "$dir" 2>/dev/null || return 0
+  local meminfo=$1 stamp dir
+  stamp="${CONTAINER_NAME}-$(date -u +%Y%m%dT%H%M%SZ)"
+  dir="$MEMGUARD_EVIDENCE_DIR/$stamp"
+  if ! mkdir -p "$dir" 2>/dev/null; then
+    dir="${XDG_STATE_HOME:-${HOME:-/tmp}/.local/state}/spark-memguard/$stamp"
+    if ! mkdir -p "$dir" 2>/dev/null; then
+      dir="${XDG_RUNTIME_DIR:-/tmp}/spark-memguard/$stamp"
+      if ! mkdir -p "$dir" 2>/dev/null; then
+        logger -t spark-memguard "cannot create evidence directory for the kill of $CONTAINER_NAME" || true
+        return 0
+      fi
+    fi
+  fi
   printf '%s\n' "$meminfo" >"$dir/meminfo.txt" 2>/dev/null || true
   ps -eo pid,rss,vsz,comm --sort=-rss 2>/dev/null | head -n 25 >"$dir/ps-rss.txt" || true
   timeout 30 docker inspect "$CONTAINER_NAME" >"$dir/inspect.json" 2>/dev/null || true
