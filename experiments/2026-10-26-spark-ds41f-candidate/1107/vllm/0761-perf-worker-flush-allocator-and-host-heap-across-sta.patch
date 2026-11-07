@@ -1,4 +1,4 @@
-From 9dc29cb2d64f871c079ba710362506c46a2d33fc Mon Sep 17 00:00:00 2001
+From 320021e3c4dbb202d911ab70e2cd924c75420488 Mon Sep 17 00:00:00 2001
 From: Christopher Owen <christopherowen@users.noreply.github.com>
 Date: Sat, 7 Nov 2026 18:17:00 +0100
 Subject: [PATCH] perf(worker): flush allocator and host heap across startup
@@ -10,27 +10,81 @@ Rationale:
 On 119 GiB unified-memory GB10 nodes at TP=3, startup memory dips during CUDA graph capture and tail-shape warmup when unreferenced blocks in the default expandable-segments caching allocator remain reserved alongside global_graph_pool allocations:
 1. GPUModelRunner.capture_model() previously ran target graph capture, DFlash query graph capture, DSpark context graph capture, and AdaptiveVerificationManager.warm_tail_shapes() back-to-back inside freeze_gc_for_cudagraph_capture() with a single empty_cache() at the end.
 2. AdaptiveVerificationManager.warm_tail_shapes() ran eager dummy passes across ascending tail token counts (384, 512, 1024, 2048, 4096, 6155) without synchronizing and flushing the caching allocator between passes, leaving ~1.88 GiB of uncoalesced intermediate segments reserved during the 6,155-token pass before the final empty_cache().
-3. DFlashSpeculator.capture() and DSparkContextCudaGraphs.capture() ran eager capacity warmups before graph capture without flushing the default allocator before entering CudaGraphManager.capture(), and prepare.release_host_memory() called malloc_trim(0) without gc.collect() or empty_cache().
+3. DSparkContextCudaGraphs.capture() warmed 43 capacities in ascending order (1..59) instead of largest-first (59..1) and without flushing _context_main_cast or the default allocator before entering CudaGraphManager.capture(); _profiling_cudagraph_managers() and DFlashSpeculator.reset_attn() did not explicitly close nested _context_preparer graphs on profiling teardown; and prepare.release_host_memory() called malloc_trim(0) without gc.collect() or empty_cache().
 
-Flush the default caching allocator between target and speculator capture, between DFlash query and DSpark context capture, after DSpark context capacity warmups, after each eager pass in warm_tail_shapes() (moved outside freeze_gc_for_cudagraph_capture()), and inside prepare.release_host_memory().
+Flush the default caching allocator between target and speculator capture, between DFlash query and DSpark context capture, after largest-first DSpark context capacity warmups, after each eager pass in warm_tail_shapes() (moved outside freeze_gc_for_cudagraph_capture()), and inside prepare.release_host_memory(), and close nested _context_preparer graphs during profiling teardown.
 
 Quality:
 Bit- and instruction-identical at runtime: only reclaims unreferenced host heap and default-allocator segments during startup before readiness; zero change to weights, kernels, captured CUDA graphs, KV cache sizes, or serving steps.
 
 Tests:
-- pytest tests/v1/worker/test_gpu_model_runner_v2.py tests/v1/spec_decode/test_adaptive_verification.py tests/v1/worker/test_prepare_kernels.py tests/kernels/test_deepseek_v41_tilelang_dspark_context.py (113 passed).
+- pytest tests/v1/worker/test_gpu_model_runner_v2.py tests/v1/worker/test_gpu_model_runner_v2_cudagraph_profiling.py tests/v1/spec_decode/test_adaptive_verification.py tests/v1/worker/test_prepare_kernels.py tests/kernels/test_deepseek_v41_tilelang_dspark_context.py (150 passed).
 
 Upstream status: local startup memory optimization for unified-memory GB10 nodes.
 ---
+ ...st_deepseek_v41_tilelang_dspark_context.py | 44 +++++++++++++++
  .../spec_decode/test_adaptive_verification.py |  9 +++-
  tests/v1/worker/test_gpu_model_runner_v2.py   | 54 +++++++++++++++++++
- vllm/models/deepseek_v4_1/nvidia/dspark.py    |  4 ++
+ vllm/models/deepseek_v4_1/nvidia/dspark.py    |  8 ++-
  vllm/models/deepseek_v4_1/tilelang/prepare.py | 12 ++++-
+ vllm/v1/worker/gpu/cudagraph_utils.py         | 11 ++--
  vllm/v1/worker/gpu/model_runner.py            | 24 ++++++---
  .../gpu/spec_decode/adaptive_verification.py  |  3 ++
- .../gpu/spec_decode/dflash/speculator.py      |  3 ++
- 7 files changed, 98 insertions(+), 11 deletions(-)
+ .../gpu/spec_decode/dflash/speculator.py      |  7 +++
+ 9 files changed, 157 insertions(+), 15 deletions(-)
 
+diff --git a/tests/kernels/test_deepseek_v41_tilelang_dspark_context.py b/tests/kernels/test_deepseek_v41_tilelang_dspark_context.py
+index 41d1982e8..cc8eeae38 100644
+--- a/tests/kernels/test_deepseek_v41_tilelang_dspark_context.py
++++ b/tests/kernels/test_deepseek_v41_tilelang_dspark_context.py
+@@ -536,3 +536,47 @@ def test_context_graphs_pad_decode_rows_no_further_than_the_target(
+         CUDAGraphMode.NONE
+     )
+     assert len(graphs.manager._capture_descs[CUDAGraphMode.FULL]) == len(sizes)
++
++
++def test_context_graphs_warm_largest_first_and_profiling_tracks_nested_manager(
++    monkeypatch,
++):
++    from types import SimpleNamespace
++
++    from vllm.v1.worker.gpu.cudagraph_utils import _profiling_cudagraph_managers
++    from vllm.v1.worker.gpu.spec_decode.dflash.speculator import DFlashSpeculator
++
++    _no_graph_pool(monkeypatch)
++    vllm_config = _decode_config(8, _recipe_ladder(48))
++    graphs = _context_graphs(vllm_config, 48)
++    graphs.model._context_main_cast = "stale"
++    events = []
++    monkeypatch.setattr(graphs, "_forward", lambda cap: events.append(("forward", cap)))
++    monkeypatch.setattr(
++        graphs.manager,
++        "capture",
++        lambda *_a, **_kw: events.append(("capture", graphs.model._context_main_cast)),
++    )
++    monkeypatch.setattr(torch.cuda, "is_available", lambda: True)
++    monkeypatch.setattr(torch.accelerator, "synchronize", lambda: events.append(("sync", None)))
++    monkeypatch.setattr(torch.accelerator, "empty_cache", lambda: events.append(("empty", None)))
++
++    graphs.capture()
++    expected_capacities = list(
++        reversed(graphs.manager.compilation_config.cudagraph_capture_sizes)
++    )
++    assert [cap for kind, cap in events if kind == "forward"] == expected_capacities
++    assert events[-3:] == [("sync", None), ("empty", None), ("capture", None)]
++
++    runner = SimpleNamespace(
++        cudagraph_manager=graphs.manager,
++        speculator=SimpleNamespace(_context_preparer=graphs),
++    )
++    assert _profiling_cudagraph_managers(runner) == [graphs.manager]
++
++    closed = []
++    spec = DFlashSpeculator.__new__(DFlashSpeculator)
++    spec._context_preparer = SimpleNamespace(close=lambda: closed.append(True))
++    spec.reset_attn()
++    assert closed == [True]
++    assert spec._context_preparer is None
 diff --git a/tests/v1/spec_decode/test_adaptive_verification.py b/tests/v1/spec_decode/test_adaptive_verification.py
 index bb97675f1..d9062785b 100644
 --- a/tests/v1/spec_decode/test_adaptive_verification.py
@@ -122,12 +176,17 @@ index a1d3a6ff2..05c019566 100644
  def test_boundary_logits_only_dispatches_pending_cache_tasks(
      monkeypatch, cudagraph_metrics
 diff --git a/vllm/models/deepseek_v4_1/nvidia/dspark.py b/vllm/models/deepseek_v4_1/nvidia/dspark.py
-index c99836f7a..124b679c5 100644
+index c99836f7a..7ac9d3e93 100644
 --- a/vllm/models/deepseek_v4_1/nvidia/dspark.py
 +++ b/vllm/models/deepseek_v4_1/nvidia/dspark.py
-@@ -181,6 +181,10 @@ class DSparkContextCudaGraphs:
+@@ -179,8 +179,14 @@ class DSparkContextCudaGraphs:
+         self.slot_mappings.fill_(PAD_SLOT_ID)
+         # Reserve all native scratch and resolve every planned capacity BEFORE
          # the first graph. Never unlock a serving workspace to make capture fit.
-         for capacity in self.manager.compilation_config.cudagraph_capture_sizes:
+-        for capacity in self.manager.compilation_config.cudagraph_capture_sizes:
++        for capacity in reversed(
++            self.manager.compilation_config.cudagraph_capture_sizes
++        ):
              self._forward(capacity)
 +        self.model._context_main_cast = None
 +        if torch.cuda.is_available():
@@ -161,6 +220,29 @@ index a1779c2d8..5dee71059 100644
 +        torch.accelerator.empty_cache()
      with contextlib.suppress(OSError, AttributeError):
          ctypes.CDLL("libc.so.6").malloc_trim(0)
+ 
+diff --git a/vllm/v1/worker/gpu/cudagraph_utils.py b/vllm/v1/worker/gpu/cudagraph_utils.py
+index ed670a32d..3c5cd1271 100644
+--- a/vllm/v1/worker/gpu/cudagraph_utils.py
++++ b/vllm/v1/worker/gpu/cudagraph_utils.py
+@@ -1303,10 +1303,15 @@ def _profiling_cudagraph_managers(runner: "GPUModelRunner") -> list[CudaGraphMan
+     speculator = runner.speculator
+     if speculator is not None:
+         for candidate in vars(speculator).values():
+-            if isinstance(candidate, CudaGraphManager) and all(
+-                candidate is not manager for manager in managers
++            manager = (
++                candidate
++                if isinstance(candidate, CudaGraphManager)
++                else getattr(candidate, "manager", None)
++            )
++            if isinstance(manager, CudaGraphManager) and all(
++                manager is not existing for existing in managers
+             ):
+-                managers.append(candidate)
++                managers.append(manager)
+     return managers
+ 
  
 diff --git a/vllm/v1/worker/gpu/model_runner.py b/vllm/v1/worker/gpu/model_runner.py
 index 43ee2c839..173432af0 100644
@@ -216,7 +298,7 @@ index d952dbdfd..3f49b6cbc 100644
      def load_draft_budget_kernels(self) -> None:
          """Run the draft-budget selection once at its smallest and largest shapes,
 diff --git a/vllm/v1/worker/gpu/spec_decode/dflash/speculator.py b/vllm/v1/worker/gpu/spec_decode/dflash/speculator.py
-index 758b8c5df..b52e482b7 100644
+index 758b8c5df..544c01f3e 100644
 --- a/vllm/v1/worker/gpu/spec_decode/dflash/speculator.py
 +++ b/vllm/v1/worker/gpu/spec_decode/dflash/speculator.py
 @@ -186,6 +186,9 @@ class DFlashSpeculator(DraftModelSpeculator):
@@ -229,6 +311,17 @@ index 758b8c5df..b52e482b7 100644
          # Only V4.1 DSpark supplies this hook. Other draft models retain their
          # existing eager context path and graph policy.
          capture_context = getattr(self.model, "capture_context_preparation", None)
+@@ -500,6 +503,10 @@ class DFlashSpeculator(DraftModelSpeculator):
+     def reset_attn(self) -> None:
+         """Release DFlash state derived from the target KV-cache layout."""
+         # Drop graphs before detaching the KV cache tensors they reference.
++        if self._context_preparer is not None:
++            close_context = getattr(self._context_preparer, "close", None)
++            if callable(close_context):
++                close_context()
+         self._context_preparer = None
+         for name in (
+             "draft_kv_cache_group_ids",
 -- 
 2.43.0
 
