@@ -20,9 +20,8 @@ NODES = {
 class FakeSsh:
     """Stands in for run_ssh: docker logs answers, hostname answers."""
 
-    def __init__(self, values: dict[str, float | None], hosts: dict[str, str] | None = None):
+    def __init__(self, values: dict[str, float | None]):
         self.values = values
-        self.hosts = hosts or {name: name.replace("spark", "gx10-") for name in values}
         self.calls: list[tuple] = []
 
     def __call__(self, nodes, node, *command):
@@ -44,8 +43,6 @@ class FakeSsh:
                     f"(Worker_TP0 pid=1) Initial free memory {value:.2f} GiB, reserved "
                     "4.91 GiB memory for KV Cache\n"
                 )
-        elif command[:1] == ("hostname",):
-            result.stdout = self.hosts.get(name, name) + "\n"
         else:
             result.stdout = ""
         return result
@@ -64,8 +61,8 @@ class NodeMemoryTests(unittest.TestCase):
         node_memory.baseline_path = lambda: self.path  # type: ignore[assignment]
         self.addCleanup(setattr, node_memory, "baseline_path", self._original_path)
 
-    def run_check(self, values, hosts=None, **host):
-        fake = FakeSsh(values, hosts)
+    def run_check(self, values, **host):
+        fake = FakeSsh(values)
         original = node_memory.run_ssh
         node_memory.run_ssh = fake  # type: ignore[assignment]
         try:
@@ -137,13 +134,18 @@ class NodeMemoryTests(unittest.TestCase):
         self.assertEqual(warnings, [])
         self.assertEqual(json.loads(self.path.read_text())["spark1"]["best_gib"], 113.28)
 
-    def test_a_renamed_host_rebaselines(self):
-        self.run_check({"spark1": 113.28, "spark2": 115.02})
-        warnings = self.run_check(
-            {"spark1": 108.00, "spark2": 115.02},
-            hosts={"spark1": "gx10-9999", "spark2": "gx10-10d1"},
-        )
+    def test_a_node_seen_for_the_first_time_baselines_quietly(self):
+        self.run_check({"spark1": 113.28})
+        warnings = self.run_check({"spark1": 113.28, "spark2": 114.60})
         self.assertEqual(warnings, [])
+        self.assertEqual(json.loads(self.path.read_text())["spark2"]["best_gib"], 114.60)
+
+    def test_the_colon_form_of_the_line_is_understood(self):
+        fake = FakeSsh({"spark1": 113.28})
+        result = fake(NODES, NODES["nodes"][0], "docker", "logs", "spark-ds41f")
+        self.assertIn("Initial free memory 113.28 GiB", result.stdout)
+        self.assertEqual(node_memory.parse_initial_free_memory(
+            "Initial free memory: 109.59 GiB; Requested memory: 0.82"), 109.59)
 
 
 if __name__ == "__main__":

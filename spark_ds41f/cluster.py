@@ -1097,6 +1097,12 @@ def command_cluster_start(args: argparse.Namespace) -> int:
                 raise RuntimeError("; ".join(launch_errors))
         wait_for_api(cluster, nodes)
         print(f"API ready at {elapsed()}", flush=True)
+        try:
+            stamp = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+            for warning in node_memory.check_nodes(cluster, nodes, stamp):
+                print(warning, file=sys.stderr, flush=True)
+        except Exception as error:  # advice only: never fail a healthy boot for this
+            print(f"WARN: node memory baseline check skipped: {error}", file=sys.stderr)
         start_memguards(cluster, nodes, "steady")
     except (RuntimeError, KeyboardInterrupt) as error:
         detail = str(error) if str(error) else "cluster start interrupted"
@@ -1130,8 +1136,6 @@ def command_cluster_start(args: argparse.Namespace) -> int:
         for warning in pool.map(remove_backup, nodes["nodes"]):
             if warning:
                 print(warning)
-    for warning in node_memory.check_nodes(cluster, nodes, time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())):
-        print(warning, file=sys.stderr)
     print(f"cluster ready; memory guards are active on all nodes ({elapsed()})")
     return 0
 

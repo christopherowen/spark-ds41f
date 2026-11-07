@@ -34,19 +34,21 @@ BASELINE_RELATIVE = Path("results/private/node-memory-baseline.json")
 THRESHOLD_KEY = "node_memory_drop_gib"
 DEFAULT_THRESHOLD_GIB = 1.0
 
-_INITIAL_FREE = re.compile(r"Initial free memory ([0-9]+(?:\.[0-9]+)?) GiB")
+_INITIAL_FREE = re.compile(r"Initial free memory:?\s+([0-9]+(?:\.[0-9]+)?)\s+GiB")
 
 
 def baseline_path() -> Path:
     return ROOT / BASELINE_RELATIVE
 
 
-def read_initial_free_memory(nodes: dict, node: dict, container: str) -> float | None:
-    """The last `Initial free memory` a node's container reported, or None."""
-    logs = run_ssh(nodes, node, "docker", "logs", container)
-    if logs.returncode:
-        return None
-    found = _INITIAL_FREE.findall(logs.stdout + logs.stderr)
+def parse_initial_free_memory(text: str) -> float | None:
+    """The last `Initial free memory` figure in text, or None.
+
+    Two forms exist upstream: the no-profiling path prints
+    `Initial free memory 113.28 GiB, reserved ...`, and the profiling path
+    prints `Initial free memory: 109.59 GiB; Requested memory: ...`.
+    """
+    found = _INITIAL_FREE.findall(text)
     if not found:
         return None
     try:
@@ -55,9 +57,13 @@ def read_initial_free_memory(nodes: dict, node: dict, container: str) -> float |
         return None
 
 
-def node_hostname(nodes: dict, node: dict) -> str:
-    result = run_ssh(nodes, node, "hostname")
-    return result.stdout.strip() if not result.returncode else node["name"]
+def read_initial_free_memory(nodes: dict, node: dict, container: str) -> float | None:
+    """The last `Initial free memory` a node's container reported, or None."""
+    logs = run_ssh(nodes, node, "docker", "logs", container)
+    if logs.returncode:
+        return None
+    # vLLM writes to stderr; run_ssh keeps the streams apart.
+    return parse_initial_free_memory(logs.stdout + logs.stderr)
 
 
 def load_baseline(path: Path) -> dict:
@@ -70,7 +76,9 @@ def load_baseline(path: Path) -> dict:
 def save_baseline(path: Path, baseline: dict) -> None:
     try:
         path.parent.mkdir(parents=True, exist_ok=True)
-        path.write_text(json.dumps(baseline, indent=1, sort_keys=True) + "\n")
+        temporary = path.with_suffix(".tmp")
+        temporary.write_text(json.dumps(baseline, indent=2, sort_keys=True) + "\n")
+        temporary.replace(path)
     except OSError as error:
         print(f"WARN: could not record the node memory baseline: {error}", file=sys.stderr)
 
@@ -98,13 +106,10 @@ def check_nodes(cluster: dict, nodes: dict, stamp: str) -> list[str]:
         value = read_initial_free_memory(nodes, node, container)
         if value is None:
             continue
-        host = node_hostname(nodes, node)
         record = baseline.get(node["name"]) or {}
         best = record.get("best_gib")
-        comparable = record.get("image") == image and record.get("host") == host
-        if not comparable or best is None:
+        if record.get("image") != image or best is None:
             baseline[node["name"]] = {
-                "host": host,
                 "image": image,
                 "best_gib": value,
                 "at": stamp,
@@ -120,7 +125,7 @@ def check_nodes(cluster: dict, nodes: dict, stamp: str) -> list[str]:
         if drop < limit:
             continue
         warnings.append(
-            f"WARN: {node['name']} ({host}): CUDA free memory at boot is "
+            f"WARN: {node['name']}: CUDA free memory at boot is "
             f"{value:.2f} GiB, {drop:.2f} GiB below the best seen on this node "
             f"for {image or 'this image'} ({best:.2f} GiB, {record.get('at', 'unknown')}). "
             "A GB10 head accumulates device memory across container restarts that a stop "
