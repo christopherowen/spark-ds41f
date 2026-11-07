@@ -39,6 +39,7 @@ import recipe as cluster_recipe
 
 from .config import *  # noqa: F401,F403
 from .doctor import *  # noqa: F401,F403
+from . import node_memory
 
 def deployment_order(nodes: dict) -> list[dict]:
     workers = sorted(
@@ -1129,6 +1130,8 @@ def command_cluster_start(args: argparse.Namespace) -> int:
         for warning in pool.map(remove_backup, nodes["nodes"]):
             if warning:
                 print(warning)
+    for warning in node_memory.check_nodes(cluster, nodes, time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())):
+        print(warning, file=sys.stderr)
     print(f"cluster ready; memory guards are active on all nodes ({elapsed()})")
     return 0
 

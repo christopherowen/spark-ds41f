@@ -102,6 +102,15 @@ def local_doctor(cluster: dict, nodes: dict, upstreams: dict) -> list[str]:
         problems.append(
             "host.startup_memguard_gib must exceed host.memguard_gib"
         )
+    if not isinstance(host.get("node_memory_watch", True), bool):
+        problems.append("host.node_memory_watch must be a boolean")
+    drop = host.get("node_memory_drop_gib", 1.0)
+    if (
+        not isinstance(drop, (int, float))
+        or isinstance(drop, bool)
+        or drop <= 0
+    ):
+        problems.append("host.node_memory_drop_gib must be a positive number")
     deployment = cluster.get("deployment", {})
     for key in ("repository", "path", "ready_url", "ready_timeout_seconds"):
         if not deployment.get(key):
