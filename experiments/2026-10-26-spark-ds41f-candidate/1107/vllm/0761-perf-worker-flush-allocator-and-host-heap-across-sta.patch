@@ -1,0 +1,234 @@
+From 9dc29cb2d64f871c079ba710362506c46a2d33fc Mon Sep 17 00:00:00 2001
+From: Christopher Owen <christopherowen@users.noreply.github.com>
+Date: Sat, 7 Nov 2026 18:17:00 +0100
+Subject: [PATCH] perf(worker): flush allocator and host heap across startup
+ preparation and capture phases
+
+Base: 1107 vLLM patch head 4652b632a3c6bf5f65da7d2bfb750b203e671aa2.
+
+Rationale:
+On 119 GiB unified-memory GB10 nodes at TP=3, startup memory dips during CUDA graph capture and tail-shape warmup when unreferenced blocks in the default expandable-segments caching allocator remain reserved alongside global_graph_pool allocations:
+1. GPUModelRunner.capture_model() previously ran target graph capture, DFlash query graph capture, DSpark context graph capture, and AdaptiveVerificationManager.warm_tail_shapes() back-to-back inside freeze_gc_for_cudagraph_capture() with a single empty_cache() at the end.
+2. AdaptiveVerificationManager.warm_tail_shapes() ran eager dummy passes across ascending tail token counts (384, 512, 1024, 2048, 4096, 6155) without synchronizing and flushing the caching allocator between passes, leaving ~1.88 GiB of uncoalesced intermediate segments reserved during the 6,155-token pass before the final empty_cache().
+3. DFlashSpeculator.capture() and DSparkContextCudaGraphs.capture() ran eager capacity warmups before graph capture without flushing the default allocator before entering CudaGraphManager.capture(), and prepare.release_host_memory() called malloc_trim(0) without gc.collect() or empty_cache().
+
+Flush the default caching allocator between target and speculator capture, between DFlash query and DSpark context capture, after DSpark context capacity warmups, after each eager pass in warm_tail_shapes() (moved outside freeze_gc_for_cudagraph_capture()), and inside prepare.release_host_memory().
+
+Quality:
+Bit- and instruction-identical at runtime: only reclaims unreferenced host heap and default-allocator segments during startup before readiness; zero change to weights, kernels, captured CUDA graphs, KV cache sizes, or serving steps.
+
+Tests:
+- pytest tests/v1/worker/test_gpu_model_runner_v2.py tests/v1/spec_decode/test_adaptive_verification.py tests/v1/worker/test_prepare_kernels.py tests/kernels/test_deepseek_v41_tilelang_dspark_context.py (113 passed).
+
+Upstream status: local startup memory optimization for unified-memory GB10 nodes.
+---
+ .../spec_decode/test_adaptive_verification.py |  9 +++-
+ tests/v1/worker/test_gpu_model_runner_v2.py   | 54 +++++++++++++++++++
+ vllm/models/deepseek_v4_1/nvidia/dspark.py    |  4 ++
+ vllm/models/deepseek_v4_1/tilelang/prepare.py | 12 ++++-
+ vllm/v1/worker/gpu/model_runner.py            | 24 ++++++---
+ .../gpu/spec_decode/adaptive_verification.py  |  3 ++
+ .../gpu/spec_decode/dflash/speculator.py      |  3 ++
+ 7 files changed, 98 insertions(+), 11 deletions(-)
+
+diff --git a/tests/v1/spec_decode/test_adaptive_verification.py b/tests/v1/spec_decode/test_adaptive_verification.py
+index bb97675f1..d9062785b 100644
+--- a/tests/v1/spec_decode/test_adaptive_verification.py
++++ b/tests/v1/spec_decode/test_adaptive_verification.py
+@@ -685,12 +685,19 @@ def test_adaptive_verification_row_cost_requires_adaptive_dspark():
+         )
+ 
+ 
+-def test_warm_tail_shapes_runs_each_eager_size_once_untimed():
++def test_warm_tail_shapes_runs_each_eager_size_once_untimed(monkeypatch):
+     manager = AdaptiveVerificationManager.__new__(AdaptiveVerificationManager)
+     manager.req_states = SimpleNamespace(max_num_batched_tokens=1024)
+     runs = []
++    flushes = []
++    monkeypatch.setattr(torch.cuda, "is_available", lambda: True)
++    monkeypatch.setattr(torch.accelerator, "synchronize", lambda: flushes.append("sync"))
++    monkeypatch.setattr(
++        torch.accelerator, "empty_cache", lambda: flushes.append("empty")
++    )
+     manager.warm_tail_shapes(lambda **kwargs: runs.append(kwargs), [1, 2, 8])
+     assert runs == [{"num_tokens": n} for n in (12, 16, 32, 64, 128, 256, 512, 1024)]
++    assert flushes == ["sync", "empty"] * 8
+ 
+ 
+ def test_live_rejected_clamps_dead_rows_out_of_estimator_observation():
+diff --git a/tests/v1/worker/test_gpu_model_runner_v2.py b/tests/v1/worker/test_gpu_model_runner_v2.py
+index a1d3a6ff2..05c019566 100644
+--- a/tests/v1/worker/test_gpu_model_runner_v2.py
++++ b/tests/v1/worker/test_gpu_model_runner_v2.py
+@@ -442,6 +442,60 @@ def test_capture_model_excludes_adaptive_verification_warmup_in_profile_only(
+     )
+ 
+ 
++def test_capture_model_flushes_around_speculator_and_unfreezes_gc_before_tail_warmup(
++    monkeypatch,
++):
++    """Speculator capture is bracketed by allocator cache flushes so target
++    capture warmups do not remain reserved during draft graph capture, and
++    eager tail-shape warmup runs after freeze_gc_for_cudagraph_capture exits."""
++    runner = _make_capture_runner(captured=True)
++    runner._draft_workspace_lane = 1
++    monkeypatch.setattr(
++        runner.cudagraph_manager, "captured_token_counts", lambda: [1, 2], raising=False
++    )
++    events: list[str] = []
++
++    @contextlib.contextmanager
++    def _freeze_gc():
++        events.append("gc_freeze_enter")
++        yield
++        events.append("gc_freeze_exit")
++
++    runner.cudagraph_manager.capture = lambda *a, **kw: events.append("target_capture")
++    runner.speculator = SimpleNamespace(
++        capture=lambda: events.append("speculator_capture")
++    )
++    runner.adaptive_verification = SimpleNamespace(
++        warm_tail_shapes=lambda *a: events.append("warm_tail_shapes"),
++        load_draft_budget_kernels=lambda: events.append("load_draft_budget_kernels"),
++    )
++    monkeypatch.setattr(model_runner_module, "freeze_gc_for_cudagraph_capture", _freeze_gc)
++    monkeypatch.setattr(
++        model_runner_module, "use_workspace_lane", lambda _l: contextlib.nullcontext()
++    )
++    monkeypatch.setattr(
++        torch.accelerator, "empty_cache", lambda: events.append("empty_cache")
++    )
++    monkeypatch.setattr(
++        torch.accelerator, "get_memory_info", lambda: (16 << 30, 16 << 30)
++    )
++    monkeypatch.setattr(model_runner_module, "lock_workspace", lambda: None)
++
++    assert runner.capture_model(profile_only=False) == 0
++    assert events == [
++        "gc_freeze_enter",
++        "empty_cache",
++        "target_capture",
++        "empty_cache",
++        "speculator_capture",
++        "empty_cache",
++        "gc_freeze_exit",
++        "warm_tail_shapes",
++        "load_draft_budget_kernels",
++        "empty_cache",
++    ]
++
++
+ @pytest.mark.parametrize("cudagraph_metrics", [False, True])
+ def test_boundary_logits_only_dispatches_pending_cache_tasks(
+     monkeypatch, cudagraph_metrics
+diff --git a/vllm/models/deepseek_v4_1/nvidia/dspark.py b/vllm/models/deepseek_v4_1/nvidia/dspark.py
+index c99836f7a..124b679c5 100644
+--- a/vllm/models/deepseek_v4_1/nvidia/dspark.py
++++ b/vllm/models/deepseek_v4_1/nvidia/dspark.py
+@@ -181,6 +181,10 @@ class DSparkContextCudaGraphs:
+         # the first graph. Never unlock a serving workspace to make capture fit.
+         for capacity in self.manager.compilation_config.cudagraph_capture_sizes:
+             self._forward(capacity)
++        self.model._context_main_cast = None
++        if torch.cuda.is_available():
++            torch.accelerator.synchronize()
++            torch.accelerator.empty_cache()
+ 
+         def create_forward_fn(desc, warmup):
+             return lambda mode: self._forward(desc.num_tokens)
+diff --git a/vllm/models/deepseek_v4_1/tilelang/prepare.py b/vllm/models/deepseek_v4_1/tilelang/prepare.py
+index a1779c2d8..5dee71059 100644
+--- a/vllm/models/deepseek_v4_1/tilelang/prepare.py
++++ b/vllm/models/deepseek_v4_1/tilelang/prepare.py
+@@ -237,11 +237,19 @@ def prepare_declared(registry: JitWarmupRegistry) -> int:
+ 
+ 
+ def release_host_memory() -> None:
+-    """Return the compile threads' freed heap to the system (glibc keeps a malloc
+-    arena per thread), so memory profiling starts from what serving holds."""
++    """Return the compile threads' freed heap and warmup allocator blocks to the
++    system (glibc keeps a malloc arena per thread), so memory profiling starts
++    from what serving holds."""
+     import contextlib
+     import ctypes
++    import gc
+ 
++    import torch
++
++    gc.collect()
++    if torch.cuda.is_available():
++        torch.accelerator.synchronize()
++        torch.accelerator.empty_cache()
+     with contextlib.suppress(OSError, AttributeError):
+         ctypes.CDLL("libc.so.6").malloc_trim(0)
+ 
+diff --git a/vllm/v1/worker/gpu/model_runner.py b/vllm/v1/worker/gpu/model_runner.py
+index 43ee2c839..173432af0 100644
+--- a/vllm/v1/worker/gpu/model_runner.py
++++ b/vllm/v1/worker/gpu/model_runner.py
+@@ -1495,18 +1495,26 @@ class GPUModelRunner(LoRAModelRunnerMixin):
+                         ),
+                     )
+                     if self.speculator is not None:
++                        torch.accelerator.empty_cache()
+                         with use_workspace_lane(self._draft_workspace_lane):
+                             self.speculator.capture()
+-                    if self.adaptive_verification is not None and not profile_only:
+-                        self.adaptive_verification.warm_tail_shapes(
+-                            self._dummy_run,
+-                            self.cudagraph_manager.captured_token_counts(),
+-                        )
+-                        self.adaptive_verification.load_draft_budget_kernels()
++                        torch.accelerator.empty_cache()
+                     self.kv_connector.reset_capture_state()
+ 
+-            torch.accelerator.empty_cache()
+-            end_free_gpu_memory = torch.accelerator.get_memory_info()[0]
++        if (
++            capture_decoder
++            and self.adaptive_verification is not None
++            and not profile_only
++        ):
++            with self.maybe_setup_dummy_loras(self.lora_config):
++                self.adaptive_verification.warm_tail_shapes(
++                    self._dummy_run,
++                    self.cudagraph_manager.captured_token_counts(),
++                )
++                self.adaptive_verification.load_draft_budget_kernels()
++
++        torch.accelerator.empty_cache()
++        end_free_gpu_memory = torch.accelerator.get_memory_info()[0]
+ 
+         if not profile_only:
+             # Lock workspace to prevent resizing during execution. A resize after
+diff --git a/vllm/v1/worker/gpu/spec_decode/adaptive_verification.py b/vllm/v1/worker/gpu/spec_decode/adaptive_verification.py
+index d952dbdfd..3f49b6cbc 100644
+--- a/vllm/v1/worker/gpu/spec_decode/adaptive_verification.py
++++ b/vllm/v1/worker/gpu/spec_decode/adaptive_verification.py
+@@ -189,6 +189,9 @@ class AdaptiveVerificationManager:
+         max_num_tokens = self.req_states.max_num_batched_tokens
+         for num_tokens in preparation_tail_sizes(capture_sizes, max_num_tokens):
+             run_dummy(num_tokens=num_tokens)
++            if torch.cuda.is_available():
++                torch.accelerator.synchronize()
++                torch.accelerator.empty_cache()
+ 
+     def load_draft_budget_kernels(self) -> None:
+         """Run the draft-budget selection once at its smallest and largest shapes,
+diff --git a/vllm/v1/worker/gpu/spec_decode/dflash/speculator.py b/vllm/v1/worker/gpu/spec_decode/dflash/speculator.py
+index 758b8c5df..b52e482b7 100644
+--- a/vllm/v1/worker/gpu/spec_decode/dflash/speculator.py
++++ b/vllm/v1/worker/gpu/spec_decode/dflash/speculator.py
+@@ -186,6 +186,9 @@ class DFlashSpeculator(DraftModelSpeculator):
+             progress_bar_desc=f"Capturing {self._speculator_name.lower()} CUDA graphs",
+             capture_attn_metadata=not self._full_cg_needs_attn_metadata_build,
+         )
++        if torch.cuda.is_available():
++            torch.accelerator.synchronize()
++            torch.accelerator.empty_cache()
+         # Only V4.1 DSpark supplies this hook. Other draft models retain their
+         # existing eager context path and graph policy.
+         capture_context = getattr(self.model, "capture_context_preparation", None)
+-- 
+2.43.0
+

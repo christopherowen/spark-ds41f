@@ -1,0 +1,68 @@
+verdicts: 2026-10-30-spark-ds41f-1030-tp4-single-stream (recorded) -> spark-ds41f-1107, against the run's own repeat (spark-ds41f-1107 -> spark-ds41f-1107-again)
+metric                                 change    ±95%   repeat   floor  margin  verdict
+c1: decode tok/s, paired               +4.92%   2.40%   -0.72%   0.62%   2.48%  better (both candidate boots; window tok/s +5.93% ±4.85%)
+c1: output tok/s                       +5.93%   4.85%   -0.91%       -   5.76%  better
+paired rows: margin = ±95% (over requests) and floor (the recorded A/A bound, or the repeat when larger, for the boots averaged) in quadrature; other rows: ±95% + |repeat|
+
+rows a step (window means; survival = accepted at k a draft, coverage = verified at k a draft)
+step     arm                                                       tokens requests   rows  yield  wasted  by position (survival/coverage)
+c1       spark-ds41f-1107                                           2.383     1.00   3.73  0.639    1.35  0:0.667/1.000 1:0.384/0.858 2:0.185/0.496 3:0.095/0.248 4:0.053/0.130 5:0.000/0.000 6:0.000/0.000 7:0.000/0.000 8:0.000/0.000 9:0.000/0.000 10:0.000/0.000 11:0.000/0.000 12:0.000/0.000 13:0.000/0.000 14:0.000/0.000 15:0.000/0.000 [cond/yield 0:0.667/0.667 1:0.575/0.447 2:0.483/0.373 3:0.511/0.382 4:0.564/0.411 5:0.002/0.335 6:1.000/0.335 7:1.000/0.335 8:1.000/0.335 9:1.000/0.335 10:1.000/0.335 11:1.000/0.335 12:1.000/0.335 13:1.000/0.335 14:1.000/0.335 15:1.000/0.335]
+c1       2026-10-30-spark-ds41f-1030-tp4-single-stream (recorded)   2.276     1.00   4.08  0.558    1.80  0:0.654/1.000 1:0.355/0.959 2:0.157/0.635 3:0.072/0.321 4:0.039/0.163 [cond/yield 0:0.654/0.654 1:0.542/0.370 2:0.442/0.247 3:0.459/0.225 4:0.536/0.237]
+c1       spark-ds41f-1107-again                                     2.382     1.00   3.74  0.636    1.36  0:0.666/1.000 1:0.383/0.863 2:0.185/0.497 3:0.095/0.253 4:0.054/0.131 5:0.000/0.000 6:0.000/0.000 7:0.000/0.000 8:0.000/0.000 9:0.000/0.000 10:0.000/0.000 11:0.000/0.000 12:0.000/0.000 13:0.000/0.000 14:0.000/0.000 15:0.000/0.000 [cond/yield 0:0.666/0.666 1:0.575/0.444 2:0.484/0.373 3:0.511/0.375 4:0.567/0.409 5:0.002/0.335 6:1.000/0.335 7:1.000/0.335 8:1.000/0.335 9:1.000/0.335 10:1.000/0.335 11:1.000/0.335 12:1.000/0.335 13:1.000/0.335 14:1.000/0.335 15:1.000/0.335]
+
+######## 2026-10-30-spark-ds41f-1030-tp4-single-stream (recorded) -> spark-ds41f-1107
+suite single-stream (7c59b27e8503): candidate-12 -> spark-ds41f-1107
+
+== c1
+metric                 candidate-12 spark-ds41f-   change    ±95%  verdict
+output tok/s                 77.997       82.623   +5.93%   4.85%  better
+decode tok/s, paired         78.678       82.590   +5.45%   2.40%  better
+engine steps/s               34.293       34.720   +1.24%   1.76%  same
+output tokens/step            2.276        2.383   +4.72%   6.52%  same
+accepted/draft                1.277        1.385   +8.50%  11.97%  same
+TTFT p50 s                    0.121        0.116   -4.09%          better (no interval)
+TTFT p99 s                    0.151        0.142   -6.23%          better (no interval)
+TTFT, paired                  0.121        0.115   -4.94%   1.63%  better
+TPOT p50 ms                  12.564       11.922   -5.11%          better (no interval)
+TPOT p99 ms                  15.495       14.711   -5.05%          better (no interval)
+per-user tok/s p50           78.604       83.878   +6.71%          better (no interval)
+paired: 91 requests in both windows, each the same prompt on both builds; 3 streamed in as many chunks on both
+speculative log-tps: total +6.03% (1+tau +4.76%, steps/s +1.24%, reqs/step -0.04%; rows/step -8.46%, row yield +14.40%)
+
+######## 2026-10-30-spark-ds41f-1030-tp4-single-stream (recorded) -> spark-ds41f-1107-again
+suite single-stream (7c59b27e8503): candidate-12 -> spark-ds41f-1107-again
+
+== c1
+metric                 candidate-12 spark-ds41f-   change    ±95%  verdict
+output tok/s                 77.997       81.873   +4.97%   4.99%  same
+decode tok/s, paired         78.678       82.050   +4.40%   2.07%  better
+engine steps/s               34.293       34.413   +0.35%   1.63%  same
+output tokens/step            2.276        2.382   +4.68%   6.51%  same
+accepted/draft                1.277        1.384   +8.41%  11.89%  same
+TTFT p50 s                    0.121        0.117   -3.33%          better (no interval)
+TTFT p99 s                    0.151        0.144   -4.39%          better (no interval)
+TTFT, paired                  0.121        0.117   -3.64%   1.53%  better
+TPOT p50 ms                  12.564       12.080   -3.85%          better (no interval)
+TPOT p99 ms                  15.495       14.938   -3.59%          better (no interval)
+per-user tok/s p50           78.604       82.757   +5.28%          better (no interval)
+paired: 91 requests in both windows, each the same prompt on both builds; 7 streamed in as many chunks on both
+speculative log-tps: total +5.05% (1+tau +4.72%, steps/s +0.35%, reqs/step -0.04%; rows/step -8.15%, row yield +13.97%)
+
+######## spark-ds41f-1107 -> spark-ds41f-1107-again
+suite single-stream (7c59b27e8503): spark-ds41f-1107 -> spark-ds41f-1107-again
+
+== c1
+metric                 spark-ds41f- spark-ds41f-   change    ±95%  verdict
+output tok/s                 82.623       81.873   -0.91%   5.78%  same
+decode tok/s, paired         83.137       82.092   -0.72%   0.30%  worse
+engine steps/s               34.720       34.413   -0.88%   1.87%  same
+output tokens/step            2.383        2.382   -0.04%   7.60%  same
+accepted/draft                1.385        1.384   -0.08%  13.48%  same
+TTFT p50 s                    0.116        0.117   +0.79%          same (no interval)
+TTFT p99 s                    0.142        0.144   +1.96%          same (no interval)
+TTFT, paired                  0.116        0.117   +1.04%   0.32%  worse
+TPOT p50 ms                  11.922       12.080   +1.32%          same (no interval)
+TPOT p99 ms                  14.711       14.938   +1.54%          same (no interval)
+per-user tok/s p50           83.878       82.757   -1.34%          same (no interval)
+paired: 96 requests in both windows, each the same prompt on both builds; 42 streamed in as many chunks on both
+speculative log-tps: total -0.92% (1+tau -0.04%, steps/s -0.88%, reqs/step +0.00%; rows/step +0.33%, row yield -0.37%)
