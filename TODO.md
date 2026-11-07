@@ -8,6 +8,7 @@ owner.
 
 ## Recent candidate decisions
 
+- **Candidate `1107`** ([`experiments/2026-10-26-spark-ds41f-candidate/1107`](experiments/2026-10-26-spark-ds41f-candidate/1107/README.md), PR [#937](https://github.com/christopherowen/spark-ds41f/pull/937)) consolidates the C45 TileLang compiler (`tilelang/0001..0013` with explicit wrapper-cache and disk-streamed IKET controls), full TileLang runtime closure (`0690..0713`, `0717`, `0752..0754`), CopyDrafter continuation priority, warp early-exit pruning and expected-yield gating against DSpark (`0744..0745`), native-depth CUDA graph retention under copy verification (`0728`), online confidence calibration (`0746`), per-layer SP WO local MXFP8 exchange (`0737`), SP Engram prefill column exchange (`0738`), TP3 6-channel NCCL Ring and sparse-MLA `block_H=16` occupancy (`0740`), 2-launch mHC PDL (`0739` + `0755`), selective pack12 KV compressor (`0749`), fused indexer `wq_b` RoPE + scale (`0748`), packed 264-byte Engram reader with multi-CTA step, hot-row cache and negative `col_delta` guard (`0750`), deep-context scheduler interleave (`0751`), tensor-parallel vision tower (`0758`), and native `TP2..TP8` cross-topology parity (`0747`). Ready for consolidated image build and full servebench qualification on `tp4-ring` and `tp3-triangle`.
 - C39 delivered default CopyDrafter behavior, but its optional preparation-overlap
   performance claim showed no proven serving-throughput gain against either
   saved C38 recipe. Preserve the adverse engine-grid cost and original collector
@@ -26,12 +27,12 @@ owner.
   as a failed serving benchmark. A future copy-policy idea needs a bounded
   expected benefit and budget-binding mixed copy/edit/tool correctness evidence.
 - C42's TileLang refresh plus existing #879–#883 fixes is rejected as maintenance:
-  8073 tests passed,360 skipped and the required IKET prepare/freeze check failed.
+  8073 tests passed, 360 skipped and the required IKET prepare/freeze check failed.
   #880 ignores an explicitly prepared kernel when cache is disabled. A focused
   review confirmed that VERSION-only C44 cannot fix this branch; withdraw C44
   unmeasured and retain C40's compiler. No serving/performance point was run.
   Preserve the separate cache-provenance gap and all failed native evidence in
-  experiments/2026-11-05-compiler-live-qualification. Subsequent release gates use
+  `experiments/2026-11-05-compiler-live-qualification`. Subsequent release gates use
   isolated fresh cache directories; no shared cache is deleted or baseline rerun.
 
 ## Goal
@@ -43,7 +44,7 @@ fixed scope and tool policy. Record the server side of every agent run with
 requests) and judge candidates on that whenever a change could shift the
 result.
 
-A first 10-second window of live agent traffic on r5j (2026-09-28):
+A first 10-second window of live agent traffic (2026-09-28):
 
 | Measure | Value |
 |---|---|
@@ -65,162 +66,18 @@ before tuning anything on this basis.
 Production is **spark-ds41f-1030** (`manifests/baselines/2026-10-30-spark-ds41f-1030.json`, image `spark-ds41f:1030`), promoted 2026-10-30 on `tp4-ring` ([release record](experiments/2026-10-26-spark-ds41f-candidate/README.md), [suite reference](manifests/suites/2026-10-30-spark-ds41f-1030-tp4/)). `tp3-triangle`'s current qualified reference is **spark-ds41f-1030** ([suite reference](manifests/suites/2026-10-30-spark-ds41f-1030-tp3/)); qualifying `spark-ds41f-1030`'s image on the triangle at its 6,144-token prefill budget is queued once the three-node triangle is cabled (#668).
 <!-- END GENERATED: next-release-status -->
 
-Historical notes from the **r6n / r6s** rounds (2026-10-15 to 2026-10-16):
-**r6s** shipped for TP3 on 2026-10-16
-([experiments/2026-10-16-r6s](experiments/2026-10-16-r6s/README.md)); TP4 stayed on
-**r6n** (2026-10-15, [experiments/2026-10-15-r6n](experiments/2026-10-15-r6n/README.md))
-until r6v was released on the ring. The indexer
-ReLU and the index quantizer's NaN handling stay in the kernel contracts' rounds
-(round 6: the BF16 clamp is on the 1% line at 8K x 2048, the quantizer 1-3% slower);
-they join a candidate only within 1% of r6n with its bits.
-
-**After r6n:**
-1. Drop `disk_resident_scales` from the recipe's serve arguments, then the field
-   (vLLM 0145 accepts it only as false, so the r6k recipe stays valid under
-   `doctor --live`).
-2. Build the Engram reader into the image: it compiles with `cc` on first use into
-   the cache (persistent on `/cache`), and no compiler should run when serving starts.
-3. Remove the Qwen model code (owner, 2026-10-15: no Qwen support needed).
-4. One host channel: move the Engram control block's wait and publish helpers and
-   the native worker into sparknet, then put DSpark's confidences on it with
-   sparknet's broadcast.
-5. ~~Credit huxiaofengtiger with a `Reported-by:` trailer on vLLM 0143~~: carried by r6o's
-   series ([experiments/2026-10-16-r6o](experiments/2026-10-16-r6o/README.md)) into r6s,
-   promoted for TP3 on 2026-10-16; TP4 carries it from its r6s release.
-6. ~~Unpin TP4's cost curves at its next release~~: nothing reads cost curves since vLLM
-   0184 (the DSpark draft budget is a rule of the inputs since r6x), and the recipe pins none.
-7. **Retire the old bench's measurements.** servebench suites decide releases and are the
-   benchmark reference (2026-10-15). Remove `bin/spark bench`'s own suites (single-prompt
-   decode points that move with the text, burst distinct streams, the quality gate's
-   prompts) and the lab's `release` bench profile once nothing in a current job uses them.
-8. Merge sparknet `timeout-stop` (on `tilelang-only`) into sparknet's main and tag it:
-   production now runs it from the branch.
-
-**Engram after r6n** (from the 2026-10-15 step back,
-[experiments/2026-10-15-engram-rows-v2](experiments/2026-10-15-engram-rows-v2/README.md)).
-Decode and prefill differ in when the row IDs exist and in what bounds the cost, not in
-the code they need, so these are behaviours of the one path, chosen by the step, not
-settings. Bound each from a measurement before building it:
-1. **Measure first.** Decode's stall was 0.7-1% of a step (2026-10-07). Prefill's: the
-   first table waits 53 / 86 / 119 ms per 16K prefill on TP3's three ranks, the second
-   never ([experiments/2026-10-16-tp3-prefill](experiments/2026-10-16-tp3-prefill/README.md)).
-   Still open: the same split on the production agent workload.
-2. **Prefill read-ahead: built as the step-aware reader** (vLLM 0148, r6o). The runner
-   hashes a step's prompt rows on the host a step ahead and the reader reads them once
-   the GPU has gathered the previous step; rows of sampled tokens still come from the
-   GPU's hash, in the same step. Qualify and release it on TP3, then TP4
-   ([experiments/2026-10-16-r6o](experiments/2026-10-16-r6o/README.md)).
-3. **Decode hot rows.** Decode is latency-bound and keeps hitting common n-grams,
-   while O_DIRECT reads every row from the SSD every step. Compare the page cache
-   (buffered reads, as ds4 does) or a small hot-row cache against today's reads, by
-   hit rate on recorded row IDs, before building one. Ceiling about 1% of a decode step.
-4. **One read per lookup.** Rows and scales live in two files, so a lookup costs two
-   random 4 KiB reads. A one-time, byte-identical repack of each rank's shard into
-   264-byte rows (256 E4M3 values and their 8 scales, as ds4 stores them) halves the
-   reads, for about 50 GB of SSD per node at TP4.
-5. **Sequence-parallel prefill.** Every rank still looks up, all-reduces and projects
-   all of a chunk's Engram rows: a 96 MiB all-reduce and a 400 MiB all-gather per
-   Engram layer at 8K tokens. A rank owns only its heads' rows, so its band could be
-   gathered instead of summed, and the projection split by tokens.
-6. **Reader latency.** A/B a hot-spinning worker against deep C-states disabled on its
-   core (sparknest measured 231-433 µs for a Spark core to leave a deep idle state).
-
-**Mixed traffic at long context** (from voktolom's knapcio v2.4 report, docs/inspiration.md 2026-10-15):
-1. **Short requests behind a long cold prefill.** `--long-prefill-token-threshold` is 8,096
-   of an 8,192-token budget, so a new request with a few hundred uncached tokens (an agent
-   turn behind a cached prefix) waits for a whole long cold prefill. The mixed-traffic
-   test's long prompts are about 4,000 tokens, one chunk, so it cannot see this. Measure a
-   short request's first token during 72K and 256K cold prefills; then reserve room for it
-   (vLLM's partial-prefill settings or a lower threshold) and confirm temperature-0
-   determinism still holds.
-2. **Idle streams during long cold prefills.** A 1M cold prefill takes about 4 minutes and
-   the stream sends nothing before its first token. Check whether our clients or gateway
-   cut idle streams; if so, send SSE keep-alives.
-3. **Head-node memory at 1M.** Record dgx1's lowest MemAvailable during the release's 1M
-   cold prefill against the memory guard's 3 GiB.
-
-**Selected** (in the next candidate's series):
-1. **Kernel contracts and three NaN fixes**
-   ([experiments/2026-10-14-kernel-contracts](experiments/2026-10-14-kernel-contracts/README.md),
-   #224; vLLM `kernel-contracts` 0001-0006 on r6k's patch head).
-   - **What it adds:** tolerance-free non-finite contracts for ten kernel families,
-     DeepSeek-derived oracles in place of B12X's, and a calibrated MoE check. The
-     shared SwiGLU clamps, the Engram gate floor and the indexer ReLU now keep a NaN
-     as DeepSeek's reference does.
-   - **w1:** all contracts pass with the fixes, and the kernels are bit-identical to
-     r6k's on finite inputs.
-   - **Before gating:** recover the indexer ReLU's vectorized `max2` (+4% on that
-     kernel at an 8K prefill chunk, about 0.25% of the chunk). Round 4's FP32 clamp
-     is worst +1.0%; round 6 tries the clamp on the BF16 dot.
-   - **Open, the owner's decision:** TileKernels' routed-expert SwiGLU has the same
-     clamp. It needs a TileKernels patch or an upstream change; its contract is a
-     strict `xfail` until then.
-2. **No fallback in the RoCE collective policy** (vLLM `no-fallbacks` 15932cb42 on
-   r6l's patch head). The policy guarded the collectives DS4.1 routes, but in-place
-   all-reduce went straight to NCCL's ring and then to the PyTorch NCCL process
-   group, `gather` was inherited from the base class (PyTorch process group), and
-   `broadcast` and `batch_isend_irecv` skipped the guard. DS4.1 calls neither
-   in-place all-reduce nor gather, so under the policy both now raise; the other two
-   take the guard. Its CPU test refuses every PyTorch process-group collective and
-   fails if a base-class collective backed by one is inherited. Run it in the image
-   before gating.
-
-Ideas recorded while making r6f, r6g and r6h (2026-10-11 to 2026-10-12). Bound
-each one from existing traces before building it, and build one piece per
-branch.
-
-**Where r6h stands** ([promotion record](experiments/2026-10-12-r6h/README.md)).
-On TP4 it is level with or ahead of r6d on every text-independent metric. On TP3
-it is identical at temperature 0 and level at four prompts, but trails r6d by
-1.6% ±0.6 at eight prompts and by 1.2-1.5% on prefill. The next release must beat
-r6h on every metric on both topologies.
-
-1. **Draft acceptance across prompts** (owner focus, 2026-10-12). On one fixed
-   prompt, r6h's precision changes moved one-stream throughput by +21% on code
-   (accepted drafts per step 1.75 to 2.37) and -5% on prose (1.26 to 1.13), on
-   the same kernels. That swing is larger than any kernel change in the release.
-   Measure acceptance on the paired sixteen-prompt sweep, never on one prompt.
-   Starting points are draft depth by load, per-request depth and the
-   verification objective (Speculative decoding).
-2. **TP3's remaining cost.** Each TP3 rank holds a third of the vocabulary and
-   experts, so the exact-arithmetic costs weigh more there. The head fix of r6h
-   never applies: TP3 steps have at most 48 rows.
-   - mHC `project_streams` runs three TF32 GEMMs for its exact FP32 projection:
-     41.5 µs a call at 96 rows against r6d's 30.6 µs, before r6h's load-time
-     split took back 2-5 µs. Fold `finalize` into it (TileLang kernel family,
-     item 3). An FP32 FFMA product for N = 24 may recover the three-GEMM cost.
-   - MoE partials in FP32: the combine went from 12.0 to 16.7 µs at 96 rows, and
-     prefill chunks got 6.5% slower.
-   - Profile TP3 at fixed rows (1-48) against r6d, as
-     `experiments/2026-10-12-fixed-row-profile` did for TP4.
-3. **Vocabulary head.**
-   - **A 128-row token tile.** A head call with 65-128 rows takes 1.60-1.89 ms,
-     against 1.10-1.24 ms for one 64-row tile (r6h head bench). The second tile
-     reads the shard from L2 again and unpacks it a second time. The 64-row tile
-     already fills 98,304 of the 101,376 bytes of shared memory: four pipeline
-     stages of activations and packed weights. A 128-row tile fits in about
-     96 KB with two activation stages and four weight stages. The activations
-     come from L2, so they need a shallower pipeline than the weights. The bits
-     stay the same, since each output keeps its K order. Ceiling: about 1% of a
-     sixteen-stream TP4 step, and nothing on TP3 or at eight streams.
-   - **One-tile bandwidth.** One tile streams the 248 MB TP4 shard in 1.1-1.2 ms,
-     about 80% of GB10's DRAM peak. Every head call pays this, twice a step, and
-     TP3's shard is about 331 MB.
-   - **Greedy argmax in the head's epilogue.** Write each tile's (max, index)
-     pair instead of its FP32 logits: about 12 MB less written and read per TP4
-     call.
-4. **WO-A on BF16 activations.** Done in r6k (promoted 2026-10-14): the TileLang WO
-   runs WO-A on BF16 activations as the reference does, with the reference's cast
-   fused into its last kernel.
-5. **Mixed traffic.** r6h's p95 gap between a stream's chunks read 90.0 and
-   93.1 ms against r6d's 86.6 ms, from one run each without an interval. Give the
-   release protocol's mixed-traffic rounds repeats and an interval before
-   reading anything into it.
-6. **Finish the TileLang migration** (TileLang kernel family, item 2): fewer
-   engines bridged in vLLM, kernels short enough to reason about, and neighbours
-   that can be fused.
-7. **Tooling.** `analyze_costs.py` no longer finds this build's step marker, so
-   normalize per step from draft events and streams by hand until it is fixed.
+Before promoting `1107`:
+1. **Build and qualify `spark-ds41f:1107`** across the full servebench release,
+   single-stream, and sampled suites on `tp4-ring` and `tp3-triangle` against
+   `spark-ds41f-1030`.
+2. **Verify `dgx1` memory headroom and native-depth graph capture (`0728`)**:
+   record startup and steady-state `MemAvailable` during 1M cold prefill and
+   under the widened `max_decode_rows` (`59` on TP3, `107` on TP4) plus 69
+   target CUDA graphs on TP3 (`60 -> 69`), confirming headroom stays comfortably
+   above the 5 GiB startup and 3 GiB steady-state guards.
+3. **Retire legacy `bin/spark bench` suites** once no active workflow references
+   them; servebench suites (`docs/release-benchmark.md`) are the release
+   benchmark authority.
 
 ## Current reference
 
@@ -244,120 +101,45 @@ Active baseline manifest: [`manifests/baselines/2026-10-30-spark-ds41f-1030.json
 | Short-request TTFT p50 during 131K prefill (3 / 11 streams) | 3.30 s / 3.59 s | — |
 <!-- END GENERATED: current-reference -->
 
-Historical reference (**r6h**, `manifests/baselines/2026-10-12-karmic-kraken-r6h.json`,
-`manifests/benchmarks/2026-10-12-karmic-kraken-r6h-tp4.json` and `-r6h.json`):
-
-| Measure | TP4 (1M, 16 sequences) | TP3 (512K, 8) |
-|---|---:|---:|
-| 4 different prompts at once | 136.5 | 107.1 |
-| 8 different prompts at once | 184.7 | 134.9 |
-| 16 different prompts at once | 226.5 | |
-| Prefill 32K, tok/s | 5,870 | 4,252 |
-| Prefill 256K | 5,496 | 4,060 |
-| Prefill 500K (TP3) / 512K (TP4) | 5,074 | 3,753 |
-| Prefill 1M | 4,391 | |
-
-The old `bin/spark bench` decode points send one prompt to every stream, so they follow the
-text through DSpark acceptance: quote them as direction only. The figures below
-are older.
-
-On r6, single-stream steps were 38.2 ms on prose and 42.4 ms on code (r5p's B12X:
-41.9 and 46.4), and source-text prefill was 4.3k tok/s at 32K, 4.0k at 256K and
-3.7k at 500K. The TP4 1M recipe's benchmark is in
-`experiments/2026-10-05-tilelang-r6`. Two- and four-stream code points have
-wide intervals (two-stream interleaving differs between samples); add samples
-before quoting them. The bullets below
-were measured on r5o:
-
-- **Time to first token (short prompts):** 0.20-0.21 s at one stream and
-  0.54-0.60 s at eight.
-- **Source-text prefill:** 2.2k tok/s at 1K, 3.8k at 32K and 64K, 3.7k at
-  256K. A 32K prefix takes 6.55 s cold and 0.27 s warm (99% hits).
-- **Long context:** four ~485K-token prompts coexisted with zero preemptions
-  (`experiments/2026-10-02-memory-saver-capacity`).
-- **Quality:** `experiments/2026-09-29-r5k/consistency.py` measures the
-  decode-versus-prefill logprob gap on greedy generations (r5k: 0.0506 mean,
-  2.84% argmax disagreement); use it for any change that touches decode-only
-  state. The r5k figure predates the r5n/r5o fence fixes; re-measure it on r5o
-  before using it as the reference.
-
 A step-time saving is a fixed cost per step. At one stream it converts almost
-fully into tok/s. At eight streams the step is longer (up to 48 verified rows,
-more distinct experts read), so the same saving is a smaller share. Report one
-and eight streams for every decode change, and sixteen on TP4.
+fully into tok/s. At eight or sixteen streams the step is longer (more verified
+rows and more distinct experts read), so the same saving is a smaller share.
+Report one and eight streams for every decode change, and sixteen on TP4.
 
 ## Running a round
 
-- **Screen what the release judges.** Development screens are fixed-row step
-  cost at 1-96 rows (adaptive verification off) plus different prompts at the
-  recipe's concurrency, on TP4 and TP3, measured cumulatively against the
-  previous release and never slower anywhere. r6f's per-piece 3% budget hid a
-  1-5% sum.
-- **Release comparison.** One session, after 30 minutes at the maximum fan
-  floor: the candidate first (heat soak counts against the later arms), the
-  previous release second, the candidate again to bound drift. Promote on those
-  numbers without re-benching.
-- **Confirm a new path engages** (log it once) before trusting an A/B. r6g's
-  greedy-verification window measured nothing because its guard looked on the
-  wrapper model.
-- **Lean screen for quick checks.** One boot per arm:
-  `bin/spark bench --suites quality,decode --decode-cases prose,code,prose-nothink,code-nothink --concurrency 1,8 --min-samples 3 --max-samples 3`
-  (about 8 minutes with the boot). Run the full matrix only for a promotion
-  candidate.
+- **Screen what the release judges.** Development screens use the fixed-row
+  decode grid (adaptive verification off) plus distinct prompts at the recipe's
+  concurrency on TP4 and TP3, measured cumulatively against the previous
+  release with at least two boots per candidate arm. Compare against recorded
+  baseline runs rather than re-benchmarking a released build.
+- **Confirm a new path engages** (log it once) before trusting an A/B.
 - **Start cool.** `bench` and lab jobs bring every node below 55 °C before
   measuring (`--cool-below`, `--cool-timeout`). Long prefills still reach
   83 °C on dgx1 and dgx2 (see Four nodes).
-- **Separate stable measures from output-dependent ones.** Temperature-0
-  outputs drift within one boot, even at one stream, so anything that depends
-  on the generated text varies between samples: accepted drafts per step,
-  prefix-cache hits, output length. Time per verification step is stable to
-  about ±0.5 ms with three samples; acceptance is not. For changes that move
-  acceptance, raise the sample count. Eight-stream aggregates swing 3-5%
-  between samples. Across 231 recorded runs, 41% of three-sample one-stream
-  A/A pairs differ by more than 3% in tok/s (24% at eight streams); gate on
-  step time.
-- **Boot-to-boot noise can look significant.** The 2026-09-27 `base` and
-  `nol2` arms ran identical code (the L2 prefetch was not running) and read
-  1.2 ms per step (-2.4%) apart, "significant" with two boots per arm. When a
-  decision hinges on 2.5% or less, add a null arm: the same configuration on
-  a separate boot.
-- **Control on the same day, with the same protocol.** A lean run and a full
-  matrix of the same image differ by about 1 ms per step at one stream and 3-7%
-  at eight streams.
+- **Separate stable measures from output-dependent ones.** Anything that depends
+  on generated text varies between samples: accepted drafts per step,
+  prefix-cache hits, output length. Fixed-row step time is stable to about
+  ±0.5 ms with three samples; acceptance is not. For changes that move
+  acceptance, use paired multi-prompt suites (`servebench`) across two boots.
+- **When a decision hinges on 2.5% or less**, watch boot-to-boot variance across
+  repeat boots before attributing a small delta to a kernel or policy change.
 - **Python-only vLLM changes need no image build to screen.** Bind-mount the
   changed files from the checked patch branch over the last candidate image via
-  `container.mounts` (the image imports vLLM from `/opt/spark-ds41f/candidate/vllm`;
-  images before the release after spark-ds41f-1022 from `/opt/spark3/candidate/vllm`).
-  Build only for promotion.
-- **Queue arms unattended** with a `setsid -f` chain, `ssh -n` and logs in
-  `~/tl-logs`. Keep other GPU work off the nodes while an arm is timing, and
-  keep bench load off the service while the agent workload is running.
+  `container.mounts` (the image imports vLLM from `/opt/spark-ds41f/candidate/vllm`).
+  Build only for promotion or when compiled extensions/TileLang sources change.
 - **Check every candidate's boot log for silent fallbacks** (`disabled`,
   `fallback`, `compile failed`) and for any JIT compilation after readiness.
-  The L2 weight prefetch was advertised from r5c but failed to compile until
-  r5i, and only the boot log said so. Comparisons made within r5c-r5h are valid
-  relative to each other; with/without-prefetch conclusions from that range are
-  void (corrected in `experiments/2026-09-27-lil-head` and
-  `experiments/2026-09-27-r5-engram-async`). Settings chosen there were tuned
-  without the prefetch and never re-tuned with it: dead-row survival cut 0.2,
-  five drafts, adaptive cost scale 2.0.
 - **Shared packages move forward only.** When components disagree on a shared
-  runtime package, patch the lagging pin forward. The image build checks every
-  CuTe DSL consumer's requirement; do the same for any new shared package.
+  runtime package, patch the lagging pin forward.
 
 ## Memory and safety
 
-- dgx1 hosts rank 0 and the API server, so it is always the tightest node:
-  5.83 GiB minimum MemAvailable with four ~485K-token contexts on the 64 KiB
-  profile. The memory saver's gain went into 1.3 GiB more KV and the 512K
-  limit. Check its headroom before anything else, and never lower the guards
+- `dgx1` hosts rank 0 and the API server, so it is always the tightest node.
+  Check its headroom before anything else, and never lower the guards
   (5 GiB at startup, 3 GiB steady).
-- Known to cross the startup guard on dgx1: 8,192 batched tokens, draft TP 1,
-  full in-engine B12X autotune. That was measured on 2026-09-24, before the
-  display reserve and the 64 KiB memory saver; re-test on TP4, or on TP3 by
-  giving back some KV.
-- Profiling: never use the torch profiler with `with_stack=True` on dgx1;
-  stopping it dropped MemAvailable to 1.5 GiB and the guard stopped the
+- Profiling: never use the torch profiler with `with_stack=True` on `dgx1`;
+  stopping it dropped `MemAvailable` to 1.5 GiB and the guard stopped the
   service. `py-spy record` hangs on the workers; a loop of
   `py-spy dump --nonblocking` works as a sampler. Workers rename themselves
   (`VLLM::Worker_TP0`), so select processes by container, not by name.
@@ -365,7 +147,7 @@ and eight streams for every decode change, and sixteen on TP4.
   owner's decisions, and any host change goes to every node. Stop the
   service before rebooting a node, and don't restart inference while it is in
   use.
-- **Carve-out integrity check is a debug mode.** Patch 0026's
+- **Carve-out integrity check is a debug mode.**
   `SPARK_DS41F_DISPLAY_CARVEOUT_CHECK_SECONDS` stays unset in production; set it
   (for example to 60) only to chase a suspected carve-out fault. It costs
   about 20 ms per check and nothing when unset. Serving-path changes for
@@ -373,415 +155,265 @@ and eight streams for every decode change, and sixteen on TP4.
 
 ## Mixed prefill and decode
 
-The agent workload interleaves long prefill bursts with decode phases, and this
-is the gap between the bench and production. The bench measures decode and prefill
-separately.
+The agent workload interleaves long prefill bursts with decode phases. Cached
+prompts avoid most of it (98–99% prefix-cache hit rate in live agent traffic),
+so the cost falls on cold prompts: the first request of a scan, cache
+evictions, or large new tool outputs.
 
-- **What happens today.** The batched-token budget is 4,096. A step that
-  carries a full prefill chunk takes about 1.1 s, and every decoding stream
-  waits for it. A cold 61K prompt is about 15 such steps, so other requests
-  decode at roughly one step per second for 16 s.
-- **Where it bites.** Cached prompts avoid most of it: in the live window above,
-  98-99% of prompt tokens came from the prefix cache and 0.7% of steps carried
-  prefill. The cost falls on cold prompts: the first request of a scan, cache
-  evictions, large new tool outputs.
-- **Bench suite to add:** run N decode streams, inject a cold long prompt, and
-  report the decode streams' inter-token p50, p99 and longest stall, the long
-  prompt's time to first token, and total tokens in the window.
-  `experiments/2026-09-29-determinism/mixed_latency.py` and
-  `experiments/2026-10-01-scheduler-lanes/hol_latency.py` already do parts of
-  this; fold them into `bin/spark bench`. In production,
-  watch `inter_token` p99 and `carrying_prefill_share` from `workload`.
-- **Levers (restart required):** a smaller batched-token budget while decodes
-  are running (1,024-2,048), trading prefill rate for shorter stalls;
-  `--long-prefill-token-threshold` (4,096 today); a prefill interleave
-  interval. Keep `--max-parallel-prefills 1`: 8 raised the four-64K mean time
-  to first token from 41 s to 67 s. Two lanes and prefill/decode compute
-  sharing (`--prefill-compute-share auto`) are prepared in
-  `experiments/2026-10-01-scheduler-lanes` with two upstream liveness fixes,
-  and not yet measured.
+- **In `1107` (`0751`)**: deep-context scheduler interleave (`VLLM_DS41_DEEP_PREFILL_INTERLEAVE=1`
+  above 16K context) and `block_M=32` long-context sparse-MLA staging reduce
+  32K–64K mixed-decode ITL stalls by 23–27% while keeping pure 131K prefill
+  throughput neutral (`experiments/2026-11-06-deep-context-scheduler`).
+- **Idle streams during long cold prefills.** A 1M cold prefill takes ~3 minutes
+  and sends nothing before its first token. Check whether clients or gateways
+  cut idle streams during 1M prefills; if so, send SSE keep-alives.
 
 ## Decode
 
-Where a step goes on r5o (union of kernel intervals per rank,
-`experiments/2026-09-29-determinism`; compute excludes the collectives, whose
-kernels spin while waiting for the slowest rank):
+Routed MoE is the largest share of decode compute (~50% at one stream, ~62% at
+eight streams), followed by dense FP8 projections, MLA attention/indexer,
+collectives, and DSpark drafting.
 
-| Workload, per step | Compute | Collective wait | Idle |
-|---|---:|---:|---:|
-| One stream, dgx1 | 47.1 ms | 1.0 ms | 3.7 ms |
-| Eight streams, dgx1 / dgx2 / dgx3 | 99.4 / 98.9 / 99.6 ms | 3.9 / 3.0 / 2.5 ms | 5.3 / 6.7 / 6.5 ms |
-
-Routed MoE is half of single-stream compute (24 of 48 ms) and 62% at eight
-streams (67 of 108 ms): the target for faster decoding in general. The older
-r5e split of the rest (`experiments/2026-09-27-single-stream-profile`): dense
-FP8 GEMMs ~15 ms at ~160 GB/s (floor ~10 ms); latency-bound work (81 RoCE
-all-reduces, mHC, norms, quantization, top-k, attention) ~6 ms; drafter layers,
-draft and target heads and Markov ~7-9 ms (drafter head and Markov now NVFP4).
-On that profile the step was about 70% bandwidth-efficient against a ~30 ms
-floor.
-
-1. **Dense FP8 GEMM efficiency** is the largest lever. Per-shape plan sweeps
-   found only 0-4% (2026-09-24), so the loss is between kernels rather than in
-   tile choice. Try keeping weights streaming across kernel boundaries:
-   programmatic dependent launch with the weight prefetch issued before the
-   dependency sync, fusing GEMMs that share an input, and prefetching during the
-   latency-bound phases. The L2 prefetch runs since r5i; its per-phase budgets
-   were never retuned for TP3. r5o idles 3.7 ms per single-stream step and
-   3.6 ms per eight-stream step on average (7.5 ms gaps in half the steps);
-   find what the GPU waits on in those gaps.
-2. **CUDA graph launch cost.** One `cudaGraphLaunch` costs about 0.86 ms of host
-   time. Check how much of it is exposed, and whether splitting the graph with a
-   short lead chunk lets the GPU start sooner.
-3. **All-reduce skew.** Median all-reduce cost is ~17 µs; the tail comes from
-   ranks arriving late. Collective wait is 2.5-3.9 ms per eight-stream step on
-   r5o, and dgx2 is the slowest host. Measure per-rank arrival times. Rank 0
-   also runs the API server, and the RoCEnante proxy threads are created without
-   CPU affinity (`b12x/comm/roce/_roce_proxy.c`) on GB10's mixed core types;
-   pinning them to a fast core is untested.
-4. **Per-step confidence broadcast.** Adaptive verification broadcasts draft
-   confidences from rank 0 every step, because replicated projections can
-   differ in floating-point reduction order, and ranks that choose different
-   verify lengths would issue mismatched collectives and hang. Removing it
-   needs a confidence computation that is bitwise identical on every rank.
-   Measure the broadcast's cost before spending effort on it.
-5. **Exact LM-head compression** is done: the packed 12-bit head serves since
-   r5p. Its remaining levers are under Next release (vocabulary head).
-6. **A second stream inside the decode graph.** Overlap the shared expert with
-   the routed MoE, and the attention key path (cache and indexer-key writes)
-   with the query path, on a second CUDA stream captured into the graph. First
-   measure how much of the ~6 ms latency-bound bucket is serial dependency
-   rather than kernel time.
-7. **The routed experts' SwiGLU** (`experiments/2026-10-14-moe-swiglu`, planned).
-   TileKernels' `swiglu_forward_and_per_token_cast` takes 23-30 µs a layer at
-   every decode row count and runs serially between the two grouped GEMMs, about
-   3% of a step at one to sixteen streams. The shared expert's SwiGLU takes about
-   3 µs. Ceiling of a kernel over the live tiles with the same bytes: 2.4-2.7% of
-   a decode step.
+1. **Routed MoE continuous `FC1 -> SwiGLU -> FC2 -> Combine` persistent kernel**
+   (~2.4–3.5% decode ceiling). TileLang's `swiglu_forward_and_per_token_cast`
+   takes 23–30 µs per layer (~3% of a decode step) and runs serially between the
+   two grouped GEMMs. Keeping routed tiles resident across `FC1 -> SwiGLU -> FC2`
+   (or fusing the SwiGLU + MXFP8 requantization epilogue over live tiles) avoids
+   the global intermediate round-trip and extra kernel launch per layer.
+2. **Direct producer writes (`WO-B` / `moe_combine`) into registered `sparknet`
+   RoCE send buffers** (~1.3–1.6% decode ceiling). `1107` overlaps collective
+   launches via PDL (`0753`, `0755`, `0756`), but `roce_all_reduce` still stages
+   an explicit `cudaMemcpyAsync` from the producer output tensor into
+   `comm_buf` (116 launches per step). Writing final BF16 outputs directly into
+   the registered RoCE send buffer removes the staging copy.
+3. **Q-B and indexer Q-B tile-contiguous weight layout.** Both projections win
+   in isolation but trail by 3–5% per call in serving when reading row-major
+   weights. Screen a tile-contiguous weight layout for the decode projections,
+   kept bit-identical with prefill.
+4. **Vocabulary head (`128`-row token tile and greedy argmax epilogue).**
+   - **A 128-row token tile:** a head call with 65–128 rows on TP4 `c16` runs a
+     second 64-row tile that re-reads and unpacks the 248 MB shard from DRAM.
+     A 128-row tile fits in ~96 KB of shared memory with two activation stages
+     and four weight stages, keeping the same K accumulation order (~1% ceiling
+     at sixteen streams on TP4).
+   - **Greedy argmax in the head epilogue:** write each tile's `(max, index)`
+     pair instead of full FP32 logits when all active requests are greedy (~12 MB
+     less written and read per TP4 call).
+5. **A second stream inside the decode graph.** Overlap the shared expert with
+   routed MoE, and attention key/indexer-key writes with the query path, on a
+   second CUDA stream captured into the graph. First bound how much of the
+   latency-bound bucket is serial dependency rather than SM occupancy.
+6. **All-reduce arrival skew and RoCE proxy core affinity.** Rank 0 also runs
+   the API server, and `sparknet` proxy threads run without explicit CPU core
+   affinity on GB10's mixed core types; test pinning them to fast cores.
+7. **A RoCE one-shot broadcast for adaptive verification.** Adaptive
+   verification broadcasts rank 0's confidence snapshot every decode step
+   through NCCL (`adaptive_verification.py`). Bound its share of the step from
+   decode traces and screen `sparknet`'s one-shot broadcast path if material.
 
 ## Speculative decoding
 
-- **Draft depth by load** is the most promising untested lever.
-  `num_speculative_tokens_per_batch_size` exists in the scheduler
-  (`vllm/v1/core/sched/scheduler.py`) and is unused. Five drafts pay off for
-  code at one stream (+14-18% for code answers when adopted). They likely cost
-  low-acceptance text at eight streams: reasoning prose at eight streams fell
-  6.8% in the r5c promotion that adopted them, before dead rows existed (r5c
-  also changed sources and NCCL). Batch size is only a proxy for content,
-  though: acceptance is set by what is generated (3.1 accepted per step on
-  code answers, 1.89 on live agent traffic). Adaptive verification already
-  trims the verify length each step, and dead rows skip routed MoE for
-  low-survival rows, so long drafts now cost drafter work plus dense and
-  attention work on the rows still verified. Screen depth schedules (for
-  example 5 drafts at one or two streams and 3 above) against recorded agent
-  traffic as well as the bench. A per-request depth from recent acceptance is
-  the content-aware alternative. Include a deeper arm (7 drafts) for code at
-  one stream.
-- **Drafter reuse of the target's token selection.** Check whether the DSpark
-  draft layers run their own indexer scoring and top-k every step. If they do,
-  try reusing the target's selection from the anchor position instead. It
-  changes only the drafts, so output stays exact; measure drafter time and
-  acceptance with the replay trace.
-- **Re-check verification pricing on a replayed trace.** The production table
-  prices verification on padding rows: about 0.5 ms per extra row (17.6 to
-  20.1 ms over six rows, `experiments/2026-10-03-prose-speculation/cost-audit.json`),
-  and its cumulative maximum makes the third draft free. Priced on real rows a
-  verified row cost about 6.5 ms, and 0009 was not adopted because accepted
-  drafts fell in proportion to the shorter steps (`experiments/2026-09-27-dspark-depth5`).
-  Those acceptance comparisons came from three samples of non-repeating text;
-  a replayed draft trace removes that variation. Re-check 0009, the dead-row
-  cut (0.2) and the cost scale (2.0) that way.
-- **Verification objective.** The current rule picks the verify length that
-  maximizes expected accepted tokens per unit of profiled cost at each step.
-  Maximizing expected tokens minus a running-rate-weighted cost may be closer
-  to the long-run optimum. Neither the marginal rule (0006) nor the cost-aware
-  dead-row count (0011) beat the current configuration.
-- **Verify rows across requests by expected tokens per modelled millisecond**
-  ([sparkflash](https://github.com/allenh1/sparkflash/blob/main/docs/performance.md),
-  2026-10-29). Each step it gives up to 64 verify rows to the likeliest drafts
-  across all decoding sequences, ranked by expected accepted tokens per
-  millisecond of a cost model of the step. It reports 5.3-5.7 tokens a step on
-  code and about 3 on prose at one stream, the same as SGLang. Our draft budget
-  admits the globally best slots by survival (`assign_draft_budget`), and the
-  verify length is chosen per step against the profiled cost. Compare the two
-  rules at 4-16 streams on a replayed draft trace. A rule that ranks slots by
-  marginal tokens per marginal millisecond prices the batch's step, not one
-  request's.
-- **Speculation that holds at high concurrency** (sparkflash, same source). It
-  speculates for up to 32 sequences in one step, drafted in passes of sixteen,
-  and keeps 4.2 tokens a step at sixteen code streams and 2.3 on prose (from
-  5.7 and 3.2 at one stream). Record our tokens a step at 8 and 16 streams from
-  the release and sampled suites' accounting rows. If they fall faster than
-  that, find which limit binds first (draft budget, verify-row cap, dead-row
-  cut, capture sizes) and raise it. Its step grows from about 43 ms at one code
-  stream to about 125 ms at eight, because its decode GEMVs run on CUDA cores
-  for batch invariance. Our batch-invariant kernels cost less per extra row, so
-  the same policy may pay more here.
-- **Cost-profile noise.** The startup cost profile takes the median of five
-  replays and varies between boots. One pinned table across a fresh boot and
-  two restarts gave 51.8, 51.2 and 51.8 tok/s on single-stream prose
-  (`experiments/2026-10-03-prose-speculation`): pinning removes the table as a
-  variable, not the output-dependent sample noise. Boot patch 0046 (profile
-  once when pinned curves match) is written and not promoted.
-- **Determinism** is done. Since r6f, temperature-0 outputs are identical alone
-  and in any batch, including fifteen streams with a long prompt arriving
-  mid-decode (`token_determinism.py --wide`). Run it on every candidate.
+In `1107`, DSpark online confidence calibration (`0746`), CopyDrafter
+continuation-priority tie-breaking (`0744`), descending-priority warp early
+exit (`0744`), expected-yield gating against DSpark (`0745`), native-depth CUDA
+graph retention (`0728`), fused single-rank Markov drafting (`0717`), and
+device-side `prepare_inputs` folding (`0754`) are all active.
+
+Open levers:
+- **Bounded or indexed CopyDrafter history match at 100K–1M contexts.** Even
+  with warp early-exit (`0744`), a decode step that does not hit a 256-token
+  match scans the full `[min_match, total_len)` history in UVA (`all_token_ids.gpu`)
+  on `output_copy_stream` (~0.36–0.47 ms/step at `c16`, 1M random tokens, and up
+  to ~2 ms on repeated 16/32-token boilerplate matches), contending with DSpark
+  on `main_stream` for unified memory bandwidth. Maintain a lightweight
+  incremental per-slot rolling-hash index of 16-token suffix positions updated
+  only for newly committed tokens, or bound the scan to a recency + prefix
+  window so `copy_match` is $O(1)$ in context length.
+- **Draft depth by load or recent acceptance.** Five DSpark drafts pay off on
+  high-acceptance code at one stream (`+14–18%`), whereas live agent traffic and
+  8–16 stream prose accept fewer tokens per step. Screen load-aware
+  (`num_speculative_tokens_per_batch_size`) or per-request acceptance-aware
+  draft depth schedules on recorded agent traffic and the paired servebench
+  suites.
+- **Drafter reuse of the target's token selection.** Check whether reusing the
+  target model's indexer top-k selection from the anchor position in DSpark
+  draft layers preserves acceptance while cutting drafter attention work.
+- **Cross-request verify-row allocation at high concurrency.** Compare our
+  per-slot survival budget (`assign_draft_budget`) plus per-step verify length
+  against ranking candidate draft slots across the whole batch by marginal
+  expected accepted tokens per marginal millisecond of step cost at 8–16 streams.
 
 ## Prefill and first token
 
-- **The sequence-parallel MoE input** (`experiments/2026-10-14-sp-moe-gather`,
-  planned). Each encoder layer all-gathers BF16 rows, then casts them to MXFP8
-  twice (the shared and the routed experts) and routes them, on all T rows on
-  every rank: 4.4 ms a layer at an 8,096-row chunk. Routing and casting each
-  rank's own rows and gathering MXFP8 rows with their scales and routes keeps the
-  bits. Ceiling: about 3.9% of a 16K prefill and about 3% at 1M.
-- **First request after a restart** is still ~0.37 s slower to its first token
-  (579 ms against ~210 ms), and nothing JIT-compiles after readiness on r5j.
-  Untested suspects: CUDA lazy module loading (screen `CUDA_MODULE_LOADING=EAGER`
-  and watch the boot time), first-use allocations, and cold Engram rows.
-  Sample the first request with py-spy dumps.
-- **Tiny prefill is host-bound:** a 60-token step took 236 ms wall time with
-  157 ms of GPU work. Patch 0019 removed most of it. CuTe DSL's argument
-  rectification compared every tensor argument with `Tensor.__eq__`, costing
-  ~200 µs per 20-tensor launch on 4.6.2. The image now runs 4.7.1
-  (`experiments/2026-09-28-cute-dsl-471` never recorded results): re-measure
-  there and patch forward if it remains. On r5o an eager step that admits a
-  prompt still takes about 180 ms whatever its token count (about 1.6 ms of
-  host time per routed-MoE call and 2.0-2.5 ms per attention call).
-- **Prefill chunk profile (r5k, 2026-09-29, one 4,096-token chunk under
-  sequence parallelism; `experiments/2026-09-29-indexer-split`):** routed MoE
-  355 ms, sparse MLA 256, dense GEMMs and mHC 198, collectives 162-173 (the
-  NCCL ring reduce-scatters and all-gathers of SP, ~126 ms), indexer 17 ms at
-  8K of context and 323 ms at 200K. Patch 0025 split the indexer's rows across
-  the ranks (-5% at 64K to -15% at 200K per chunk). What remains of it is the
-  MXFP4 score kernel at about 64 TFLOP/s, a kernel lever. On r5o a whole
-  chunk takes 1,032 / 1,086 / 1,115 / 1,156 ms at 8K / 64K / 131K / 200K of
-  context.
-- **NCCL channels for the SP collectives.** They exceed the RoCE one-shot limits
-  and run on NCCL with its default channel choice (`NCCL_MAX_NCHANNELS=8`). On
-  TP4, four Ring channels instead of one halved NCCL kernel time in a 16K
-  prefill trace and made 4K-64K prefill about 23% faster
-  (`experiments/2026-10-03-collective-serving`). Read TP3's actual channel
-  count from the rank-0 NCCL init log, then screen four Ring channels on
-  cooled 32K and 64K prefill. NCCL reports `GDR 0` (no GPUDirect RDMA) on
-  every launch.
-- **Indexer selection at long context.** Split the indexer's 323 ms per chunk at
-  200K into scoring and top-k selection. If selection is a measurable share,
-  try a radix top-k over bounded blocks of candidate rows.
-- **Sparse-MLA prefill occupancy with few heads per rank.** Each rank holds 24
-  query heads at TP3 (16 at TP4). Check the sparse-MLA prefill kernel's SM
-  occupancy at long context; if it is under-filled, split each sequence across
-  SMs (context parallelism inside the GPU).
-- **NVMe interrupt coalescing is off** on every node by the owner's decision
-  (2026-10-02). Prefill measured 0.7-1.6% slower that way
-  (`experiments/2026-10-02-nvme-coalescing`); don't change it without the owner.
-- **Prefix-cache retention:** agent prompts are 64-100K tokens and live on
-  cache hits. Add a probe for retention around block boundaries and under
-  eviction pressure.
+In `1107`, per-layer SP WO local MXFP8 exchange (`0737`), sequence-parallel
+Engram prefill column exchange and sliced projection (`0738`), TP3 6-channel
+NCCL Ring and sparse-MLA `block_H=16` (`2` CTAs/head, `0740`), unconditional
+`M=64` MoE `prefill_swizzle_panel=2` (`0736`), retained CED encoder endpoints
+(`0727`), CED local boundary reduction (`0742`), and SP context-KV projection
+(`0743`) are all active.
 
-## Boot (~121 s)
+Open levers:
+- **Sequence-parallel MoE input (`experiments/2026-10-14-sp-moe-gather`).** Each
+  encoder layer all-gathers BF16 rows, then casts them to MXFP8 twice (shared
+  and routed experts) and routes them on all $T$ rows on every rank (~4.4 ms a
+  layer at an 8,096-row chunk). Routing and casting each rank's own shard before
+  all-gathering MXFP8 rows with their scales and routes preserves exact bits
+  with a ~3–3.9% prefill ceiling.
+- **First request after a restart** is ~0.37 s slower to its first token than
+  subsequent requests. Screen `CUDA_MODULE_LOADING=EAGER` (checking boot time
+  impact) and sample the first request with `py-spy dump --nonblocking`.
+- **Indexer selection at 200K–1M context.** Split long-context indexer time into
+  MXFP4 scoring vs top-k selection; if top-k selection is a measurable share at
+  500K–1M, screen a bounded radix top-k.
+- **NVMe interrupt coalescing stays off** on every node by the owner's decision
+  (2026-10-02; prefill measured 0.7–1.6% slower with it on in
+  `experiments/2026-10-02-nvme-coalescing`).
+- **Prefix-cache retention:** agent prompts are 64–100K tokens and depend on
+  98–99% prefix-cache hit rates ([#902](https://github.com/christopherowen/spark-ds41f/issues/902)).
+  Add a stress probe for retention around block boundaries and under eviction
+  pressure.
 
-Container start to API: engine spawn 20 s, distributed init 11, model build 5,
-B12X shard routing 7, weight read 15 (NVMe rate for 101 GB), post-load and B12X
-preparation 24, KV setup and warmup 16, graph capture ~8 s of real work.
+## Boot
 
-1. **Post-load preparation (24 s)** is the easiest large win: cache B12X
-   routing metadata and prepared state between boots. Boot patches 0046 (DSpark
-   costs profiled once when pinned curves match) and 0047 (no temporary-pool
-   B12X state stage without autotuning) are written (commit 2b918e1) and not
-   yet measured for promotion. Sample it first with
-   `experiments/2026-09-28-boot-time/pyspy_sampler.py` to see what the 24 s
-   holds.
-2. **API server setup:** about 8 s before the engine starts, mostly tokenizer
-   `from_pretrained` copies and conversion plus module imports. Audit import
-   time.
-3. **Per-rank processed-weight image:** the largest and riskiest boot lever. It
-   must preserve the MLA absorbed views and the `e_score_correction_bias`
-   reference.
-
-- **Already measured, no boot gain:** persisted driver and TileLang JIT caches
-  (kept anyway), `NCCL_GIN_ENABLE=0` (communicator init is 0.5-0.6 s),
-  `--skip-mm-profiling` (also costs dgx1 0.1 GiB).
-- **Pitfalls:** a persisted autotune cache holding per-rank entries can deadlock
-  a TP > 1 boot; an interrupted boot can leave corrupt CuTe cache files; warming
-  the page cache takes MemFree that the GB10 allocator needs.
+- **Post-load preparation and routing metadata:** audit remaining post-load
+  preparation time with `py-spy` now that B12X is retired and 264-byte packed
+  Engram shards are reused across boots (`0750` logs `bytes`, `written_bytes`,
+  `reused`, and `pack_s` per rank/layer at startup).
+- **API server setup (~8 s):** mostly tokenizer `from_pretrained` copies and
+  module imports before engine spawn.
+- **Per-rank pre-processed weight image:** largest boot lever, if needed; must
+  preserve MLA absorbed views and `e_score_correction_bias`.
+- **Pitfalls:** warming the host page cache consumes `MemFree` that the GB10
+  unified memory allocator needs; keep startup caches bounded.
 
 ## Context capacity
 
 - **Decode context parallelism.** DS4.1 has one shared KV head
-  (`num_key_value_heads: 1`), so under TP3 every rank stores the whole KV cache.
-  Sharding tokens across the ranks would hold up to three times as many tokens
-  per KV byte, at the cost of a per-layer exchange of attention partials. Our
-  vLLM has decode-context-parallel infrastructure, including a sparse-attention
-  indexer path, but DS4.1's attention does not use it yet. Large; scope it
-  against the 512K limit and long agent contexts first.
+  (`num_key_value_heads: 1`), so under TP3/TP4 every rank stores a full copy of
+  the KV cache. Sharding KV tokens across ranks would multiply KV capacity by
+  the TP degree at the cost of a per-layer exchange of attention partials.
 
 ## dgx1 headroom
 
-- **Vision tower (926 MiB of BF16 weights, now tensor-parallelized).** Image
-  input is enabled (`--limit-mm-per-prompt {"image":4}`), so the tower loads.
-  `deepseek_v4_1/nvidia/vl_model.py` and `tilelang_vision.py` now shard the ViT
-  (`wqkv`, `wo`, `mlp.w1`, `mlp.w2`) and aligner (`w1`, `w2`) across TP ranks
-  (`use_data_parallel = is_vit_use_data_parallel()`, `False` under default
-  `--mm-encoder-tp-mode weights`), with exact 4-way shards at TP4 (~0.68 GiB
-  saved per rank) and zero-weight tail padding at TP3 (16 -> 18 heads,
-  2,816 -> 2,880 MLP, 5,120 -> 5,184 aligner, ~0.59 GiB saved per rank).
-  - If a deployment needs no images, `--limit-mm-per-prompt {"image":0}` or
-    `--language-model-only` stubs the tower and skips its weights. That's the
-    owner's decision, since image input is a promoted feature.
-- **Display reserve:** in use since r5k for the embedding and output head
-  (842.5 MiB per rank of the 2,032 MiB the firmware reserves; dgx3 keeps its
-  8 MiB console framebuffer). The GPU mapping streams at full speed but is
-  uncached with small pages, so only data read once per step belongs there;
-  about 1.2 GiB is still free. `experiments/2026-09-29-display-carveout-kv` has
-  the access-speed measurements.
+- **Vision tower (926 MiB of BF16 weights, tensor-parallelized in `1107` via
+  `0758`).** `deepseek_v4_1/nvidia/vl_model.py` and `tilelang_vision.py` shard
+  the ViT (`wqkv`, `wo`, `mlp.w1`, `mlp.w2`) and aligner (`w1`, `w2`) across TP
+  ranks (`--mm-encoder-tp-mode weights`), saving ~0.68 GiB per rank at TP4 and
+  ~0.59 GiB per rank at TP3 (with zero-weight tail padding to 18 heads / 2,880
+  MLP / 5,184 aligner on TP3).
+- **Display reserve:** in use for the embedding and output head (842.5 MiB per
+  rank of the 2,032 MiB firmware carve-out; `dgx3` keeps its 8 MiB console
+  framebuffer). About 1.2 GiB remains free for read-once-per-step data
+  (`experiments/2026-09-29-display-carveout-kv`).
 - **Uneven head split instead of TP3 padding.** TP3 pads DS4.1's 64 heads and 8
-  output groups to 72 and 9 with zero weights, so each rank holds 24 heads in 3
-  groups. A balanced uneven split (3/3/2 groups) removes the zero group's
-  weights and work from the rank that carries it; measure which rank that is
-  and what it costs. The busiest rank keeps 24 heads, so speed only improves
-  if heads can split inside a group (22/21/21), which needs an extra reduction
-  in the grouped output projection. TP4 needs neither (16 heads per rank).
-  `experiments/2026-10-03-tp3-tp4-comparison/padding.md` lists every TP3
-  padding (heads, groups, Engram width, vocabulary) and where it is applied.
+  output groups to 72 and 9 with zero weights (24 heads in 3 groups per rank).
+  `experiments/2026-10-03-tp3-tp4-comparison/padding.md` documents all TP3
+  paddings.
 - **Do not raise `min_free_kbytes`;** it eats the margin the guards protect.
 
 ## Quality
 
-- **TMA stage releases outside DS4.1's serving set** (`experiments/2026-09-30-proxy-fence-audit`):
-  r5o fences every serving kernel the audit found; still open upstream are the
-  NVFP4/W6A8 MoE releases, a SASS pass over kernels DS4.1 does not run, two
-  single-stage write-after-read races in raw paged kernels, and mbarrier init fences.
-
-- **Temperature 0 is deterministic since r6f** (see Speculative decoding).
-- **Loop containment: qualify candidate-38's existing path.** The
-  [current scope and remaining checks](experiments/2026-10-26-spark-ds41f-candidate/candidate-38/README.md#loop-containment)
-  replace the broad effort/DSpark sweep. Two boots reproduce seeded looping at
-  effort 100 and 75 with detection off; default detection ends reasoning, and
-  the clean fixture is unchanged. Preserve effort semantics and the safeguards
-  for legitimate repeated answers. Next: the older-build long-context canary
-  in [#864](https://github.com/christopherowen/spark-ds41f/issues/864), a compacted
-  tool session, and normal candidate inference/performance qualification.
-  Spontaneous onset remains an open question; the effort-85 proposal #862 is
-  retired from the candidate plan.
-
-- **BF16 sparse attention** (patch 0023, off in configuration): measure its
+- **Temperature 0 is deterministic** alone and in mixed batches
+  (`token_determinism.py --wide`). Run it on every candidate.
+- **Loop containment ([#864](https://github.com/christopherowen/spark-ds41f/issues/864)):**
+  `1107` carries the v2 loop detector (`0679`/`0684`). Complete the long-context
+  83K max-effort canary soak on `1107` during release qualification.
+- **DSML token provenance ([#876](https://github.com/christopherowen/spark-ds41f/issues/876),
+  [#948](https://github.com/christopherowen/spark-ds41f/issues/948), PR
+  [#949](https://github.com/christopherowen/spark-ds41f/pull/949)):** ensure
+  quoted DSML markup inside normal reply text or tool-call string arguments is
+  distinguished from genuine DSML structural tokens on top of `0643`'s streaming
+  string-argument extender.
+- **Opt-in Latent Sparse Attention (`VLLM_DS41_LSA`, `0741` in `1107`):** ships
+  disabled by default (`VLLM_DS41_LSA=0`) with full runtime plumbing and unit
+  tests; any future enablement requires an independent long-context answer
+  quality evaluation.
+- **BF16 sparse attention** (patch `0023`, off in configuration): measure its
   fidelity with a teacher-forced comparison against
   `VLLM_DS41_ATTENTION_COMPUTE=reference` on long agent transcripts before
-  enabling it. It cost 0.5-0.76 GiB of headroom and 8% of decode with four
-  180K contexts for a 12% smaller decode/prefill logprob gap. TP4's headroom
-  would remove the memory objection; the fidelity check is cheap, so run it
-  first.
+  considering it on TP4.
 
-## Four nodes (TP4)
+## Topologies (`tp4-ring`, `tp3-triangle`, and `TP2..TP8`)
 
-The TP4 1M shape on r6 (`tp4-ring` in `config/cluster.json`) is
-benchmarked at its limits: 62.4/76.0 tok/s prose/code at one stream,
-318.4/349.8 at sixteen, prefill 5.8k/5.5k/5.1k/4.4k tok/s at 32K/256K/500K/1M,
-at least 19.35 GiB available on every node. It needs no model-dimension
-padding (16 heads per rank). The B12X recipe (r5p) stays
-benchmarked in `experiments/2026-10-05-r5p-promotion`.
-
-- **Long prefill runs hot.** dgx1 and dgx2 reach 83 °C with 3-4 °C of reported
-  headroom. The thermal guard aborted a 256K TP3 prefill on the restored
-  triangle with dgx2's fans already at maximum
-  (`experiments/2026-10-03-tp3-revalidation`), so it is not specific to TP4 or
-  the relay; the cause is open. dgx3 stays near 67 °C.
-- **Collective policy:** sparknet's ring4 one-shot collectives for small
-  transfers (the TileLang family; B12X used the RoCEnante neighbour relay, now
-  retired) and NCCL Ring with four channels for large ones
-  (`experiments/2026-10-03-collective-serving/decision.md`), enforced by vLLM
-  0027.
-- **Report TP4 prefill at 32K, 256K, 500K and 1M** (the bench's 1M point is
-  size 1,000,000; 1,048,576 exceeds the context once output is added and is
-  skipped), beside TP3's 32K, 256K and 500K.
-- **Open:** sustained-load cooling and a long-context admission and retrieval
-  check at 1M (the recipe's benchmark prefilled 1M once per repeat).
-- **Cabling decides the profile.** TP3 needs the dgx1-dgx2-dgx3 triangle and
-  TP4 the four-node ring, each with a matching node map (the current site
-  `config/nodes.json` is a triangle map). The cabling has changed back and
-  forth since 2026-10-02. Since PR #155 a start refuses a node map whose cable
-  subnets do not match the live links, and any change of node count or shape
-  without `--change-shape`; every `--apply` names its profile.
-- **Retired with RoCEnante:** NIC-forwarded mesh4 and four fixed paths; the
-  records stay (`experiments/2026-10-02-rocenante-mesh4`, `-mesh4-fourpaths`).
-- **A RoCE broadcast for adaptive verification.** Adaptive verification broadcasts
-  rank 0's confidence snapshot every decode step through NCCL
-  (`adaptive_verification.py`): the only NCCL collective on every decode step.
-  Check sparknet's one-shot path for it instead (a broadcast, or the one-shot
-  all-gather of rank 0's row). Bound the gain from existing decode traces first:
-  the broadcast's share of the step against the one-shot's 13-15 µs.
+- **Cabling decides the profile.** `tp3-triangle` needs the `dgx1-dgx2-dgx3`
+  triangle and `tp4-ring` the four-node ring (`bin/spark site shape`). `cluster
+  start` refuses a node map whose cable subnets do not match the live links, and
+  any change of node count or shape without `--change-shape`.
+- **Cross-topology parity (`0747` in `1107`):** `TP2..TP8` head/KV/expert
+  divisibility, padding, and collective routing are unified in source. Any new
+  physical topology still requires its own hardware qualification before
+  promotion.
+- **Long prefill runs hot.** `dgx1` and `dgx2` reach 83 °C during sustained
+  256K–1M prefills with fans at maximum (`dgx3` stays near 67 °C). Keep
+  `--cool-below 55` between benchmark arms.
+- **Collective policy (`0320`):** `sparknet`'s one-shot RoCE collectives for
+  small decode/prefill transfers and NCCL Ring (4 channels on TP4, 6 channels on
+  TP3 in `1107`) for large sequence-parallel collectives, with no silent fallback
+  to PyTorch process-group collectives.
 
 ## TileLang kernel family
 
-The TileLang family is the promoted backend in r6
-(`experiments/2026-10-05-tilelang-r6`); B12X stays in the image as the
-alternative. The decode-kernel comparison is in
-`experiments/2026-10-05-tilelang-decode-kernels`.
+The TileLang migration is complete in `1030` and `1107`: B12X is retired from
+`upstreams.lock.json` and the container image, and all model, drafter, sampler,
+rank-reduction, gather-store, scoring, vision-tower, L2-prefetch, and collective
+paths run on TileLang + `sparknet`.
 
-1. **Q-B and indexer Q-B in serving.** Both win in isolation (warm, cold and
-   racing their own prefetch) but trail B12X by 5% and 3% per call in the
-   serving profile; three Q-B tiles all measured 21.8-21.9 µs. B12X reads
-   tile-packed weights. Try a tile-contiguous weight layout for the decode
-   projections, kept bit-identical with prefill.
-2. **Port the remaining kernels** (`experiments/2026-10-09-tilelang-migration`).
-   Ported in r6d-r6f: RoPE, the KV cache writers, the compressor and its
-   projection, the Engram gate and hash, the index weight scale and the
-   sparse-MLA metadata (the first Triton port). Remaining:
-   - B12X: B1 the fused WO projection (with WO-A on BF16), B6 the DSpark
-     context-KV projection, B10 the Engram row lookup, B11 head packing, B12 the
-     vision tower, the checkpoint loader and the Engram disk reader;
-   - CuTe DSL: C1 the L2 prefetch and C2 sparknet's collectives, both passed
-     and level with the control, not yet switched;
-   - Triton: the remaining DS4.1 model kernels and the V2 runner's (about 1% of
-     a decode step).
-   Then retire B12X.
-3. **mHC: fold `finalize` into `project_streams`.** After vLLM 0040 the
-   sublayer entry is two launches: the projection (about 10.5 µs at one token
-   with fn cold) and the per-token finalize (about 4 µs). Let the last CTA of
-   each token tile reduce the split partials in fixed split order and run the
-   mix, Sinkhorn and RMSNorm, so each sublayer is one launch. The order must
-   not depend on which CTA finishes last.
-4. **mHC: fn in three bytes.** The projection reads fn (24 x 20,480 FP32, 2 MB
-   per sublayer) near the memory bandwidth, and a TF32 MMA reads only the top
-   19 bits of each value. Storing the top 24 bits would cut that traffic by a
-   quarter with identical results, but only if SM121's TF32 MMA truncates its
-   inputs rather than rounding them; verify that on the hardware first. Native
-   weights stay unless the result is bit-identical.
+Remaining kernel-level investigations:
+1. **`mHC: fn` in three bytes.** `project_streams` reads `fn` (`24 x 20,480`
+   FP32, 2 MB per sublayer) near memory bandwidth, and a TF32 MMA consumes only
+   the top 19 bits of each value. Storing the top 24 bits would cut that traffic
+   by 25% with bit-identical results if SM121's TF32 MMA truncates rather than
+   rounds its inputs; verify on hardware first.
+2. **TMA stage releases outside DS4.1's active kernel set**
+   (`experiments/2026-09-30-proxy-fence-audit`): all serving kernels are fenced
+   (and enforced in the compiler via `tilelang/0001..0013` in `1107`); keep the
+   compiler barrier tests in the release gate whenever TileLang is refreshed.
 
 ## Upstream and hygiene
 
-- **No fallbacks** (owner, 2026-10-14): a path production never exercises is
-  untested. Audit our vLLM series for fallbacks of that kind and make each either
-  the selected path or a raise with a traceback. The collective policy was the
-  first (Next release, item 2).
-- The one-read `fill_defaults` fix (0019) is still needed on PyTorch main.
-- The B12X tiny-decode clamp is still unfixed upstream; keep
-  `B12X_W4A8_TINY_DECODE=0`.
+- **No fallbacks** (owner, 2026-10-14): every collective or kernel dispatch path
+  must either be the tested production path or raise with a traceback.
+- The one-read `fill_defaults` fix (`0019`) is still needed on PyTorch main.
 - The NCCL IB send-path fence patch should be dropped once upstream releases the
   fix.
-- A newer CuTe DSL (4.8.0) exists; qualify the move forward.
-- The B12X integration-branch tests fail from API drift in the tests themselves
-  (`hc.plan(policy=)`, `TableLayout`, `Plan.state_capacity`), identically on CuTe
-  DSL 4.6.2 and 4.7.1. Keep a list of expected failures so new ones stand out.
+- `scripts/memguard.sh` evidence directory fallback ([#872](https://github.com/christopherowen/spark-ds41f/issues/872)):
+  ensure `memguard.sh` creates a writable fallback directory when
+  `/var/log/spark-memguard` is not writable by an unprivileged user.
 
 ## Tried and not adopted
 
 Don't repeat these without a new reason:
 
-- **Verification and drafting:** marginal verify rule (0006); gathered Markov
-  bias (0007); verifying every draft (`VERIFY_RULE=all`, −5 to −14% at eight
-  streams); cost-aware dead-row count (0011); `main_proj` split (0013).
+- **Verification and drafting:** marginal verify rule (`0006`); gathered Markov
+  bias (`0007`); verifying every draft (`VERIFY_RULE=all`, −5 to −14% at eight
+  streams); cost-aware dead-row count (`0011`); `main_proj` split (`0013`);
+  lowering `VLLM_DS41_VERIFY_ROW_COST` to `0.010` or `0.020`
+  (`experiments/2026-11-06-verification-budget-hardware`, regressed throughput
+  vs `0.030`); minimum-match-8 CopyDrafter policy (dropped at source review);
+  C39/C41 CopyDrafter preparation-overlap variations
+  (`experiments/2026-11-04-copy-overlap-rework`).
+- **Decode kernels:** 1-launch atomic last-CTA `mHC project_and_finalize_streams`
+  for `M <= 16` (`experiments/2026-11-06-mhc-project-finalize`, #946: 12–34%
+  slower than 2-launch PDL due to atomic/fence serialization and register
+  pressure); fusing decode `WO-A` split-K reduction into `WO-A` (`0737` applies
+  only to prefill SP WO; decode `WO-A` uses `split_k=4` across `K=2048` and
+  `WO-B` reads all `1280` reduced columns per CTA); bounded L2 access-policy
+  retention windows on GB10 (#928, no gain / regression on unified memory);
+  incremental GPU block-table metadata gathers (#932, negligible step impact vs
+  state complexity); `0714`/`0716` score-ID host transfer and `0718` TP1-only
+  embedding ID prep (#913, #914: unmeasured / TP1-only).
 - **Prefill:** M32 MoE tile (+1%); fused M32 MoE (no gain, less headroom);
   `NCCL_PROTO=Simple` (no gain); `--max-parallel-prefills 8` (four-64K mean TTFT
   41 → 67 s); sequence parallelism below 205 tokens (+12 ms TTFT on short
-  prompts).
-- **Collectives:** NCCL for decode all-reduces (75-86 µs against the relay's
-  17-19 µs, `experiments/2026-10-03-collective-policy`); 8 or 16 NCCL channels
-  for serving prefill (0.7-1.2% over four, intervals spanning zero);
-  bidirectional NCCL rings (no general gain); streaming the relay in 32-64 KiB
+  prompts); `8` or `12` NCCL Ring channels on TP3 SP prefill
+  (`experiments/2026-11-06-nccl-sp-channels`, `6` channels won while `8` and
+  `12` regressed).
+- **Collectives:** NCCL for decode all-reduces (75–86 µs against one-shot RoCE's
+  13–19 µs, `experiments/2026-10-03-collective-policy`); 8 or 16 NCCL channels
+  on TP4 serving prefill (0.7–1.2% over four, intervals spanning zero);
+  bidirectional NCCL rings (no general gain); streaming the relay in 32–64 KiB
   chunks (a consistent bulk penalty, `experiments/2026-10-03-relay-progress`);
-  GPUNetIO direct mode (dgx1 rebooted; the runner now rejects it).
+  GPUNetIO direct mode (`dgx1` rebooted; the runner now rejects it).
 - **Drivers:** R610 and CUDA 13.3 libraries
   (`experiments/2026-10-02-driver-cuda-refresh`): no consistent gain, and stock
   R610 faults on large copies with 64 KiB pages.
