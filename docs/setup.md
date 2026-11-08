@@ -560,19 +560,18 @@ The block names the GLP file it steers with: a Hugging Face `repo`, its pinned
 `revision`, the `file` and its `sha256`. The recipe renders the second served name, vLLM's
 `WEIGHTLESS_STEER_PATH` and `WEIGHTLESS_STEER_MODEL`, and a read-only mount of the file
 from the node's hub cache; a profile does not set those itself. Every node needs the file
-(785 KiB). The repository is gated. With the Hugging Face account whose token is on the node, accept
-its agreement once on the
-[repository page](https://huggingface.co/msuiche/DeepSeek-V4.1-Flash-1017-abliterated-cyber-GLP-39-L1-39-a0.75),
-then download the pinned revision on every node:
+(544 KiB) from the
+[repository page](https://huggingface.co/msuiche/DeepSeek-V4.1-Flash-1017-abliterated-cyber-GLP-27-L11-37-a3.5);
+download the pinned revision on every node:
 
 ```sh
-hf download msuiche/DeepSeek-V4.1-Flash-1017-abliterated-cyber-GLP-39-L1-39-a0.75 \
-  glp.deepseek-v41-flash-1017-GLP-39-L1-39-a0.75.gguf \
-  --revision 2715ffd51f59899115853e1118db080536966c44
+hf download msuiche/DeepSeek-V4.1-Flash-1017-abliterated-cyber-GLP-27-L11-37-a3.5 \
+  glp.deepseek-v41-flash-1017-GLP-27-L11-37-a3.5.gguf \
+  --revision 4d570926e9dd4fa7247d126072c34e249c89abd7
 ```
 
-The file is 803,392 bytes, sha256
-`9c66d47701e0ceb42c33906f2d3789c0f1f16b21e7d97185f20f7f3f09fbf5cf`. A node without a
+The file is 556,672 bytes, sha256
+`24e97d41a9a4f77adad78ff4cb888cb4e339eb62151dbf37a7fcd3ea30eb442e`. A node without a
 token can take a copy from another node instead: the snapshot path and the
 `hub/blobs` file it links to. `bin/spark doctor --live` and the launch preflight
 report a node whose file is missing or differs, with this command

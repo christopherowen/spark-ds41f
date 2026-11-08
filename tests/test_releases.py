@@ -93,7 +93,7 @@ class ReleaseTest(unittest.TestCase):
             self.assertTrue(change["qualification"])
             if change["baseline"] != production["promoted_baseline"]:
                 continue
-            for flag, values in change["serve_options"].items():
+            for flag, values in change.get("serve_options", {}).items():
                 # Defaults may change admission limits, never silently replace
                 # a released model, image, source lock or numerical setting.
                 self.assertEqual(flag, "--limit-mm-per-prompt")
@@ -104,6 +104,12 @@ class ReleaseTest(unittest.TestCase):
                 index = frozen["serve_args"].index(flag) + 1
                 self.assertEqual(frozen["serve_args"][index], values["before"])
                 frozen["serve_args"][index] = values["after"]
+            if "glp" in change:
+                self.assertEqual(frozen["glp"], change["glp"]["before"])
+                after_glp = change["glp"]["after"]
+                self.assertEqual(set(after_glp), set(frozen["glp"]))
+                self.assertEqual(after_glp["served_model_name"], frozen["glp"]["served_model_name"])
+                frozen["glp"] = after_glp
         self.assertEqual({k: v for k, v in production.items() if k != "upstreams_config"},
                          {k: v for k, v in frozen.items() if k != "upstreams_config"})
         self.assertNotIn("upstreams_config", production)
