@@ -239,9 +239,21 @@ Open levers:
   (`num_speculative_tokens_per_batch_size`) or per-request acceptance-aware
   draft depth schedules on recorded agent traffic and the paired servebench
   suites.
-- **Drafter reuse of the target's token selection.** Check whether reusing the
-  target model's indexer top-k selection from the anchor position in DSpark
-  draft layers preserves acceptance while cutting drafter attention work.
+- **Drafter reuse of the target's token selection (`experiments/2026-11-08-dspark-topk-selection-reuse`, vLLM `0762`).**
+  Measured across 2 boots on `sp5` (`4K..256K`, `TP=4` and `TP=3`, `c1` and `c8`).
+  In `1107`, `DeepSeek-V4.1-Flash` configures `compress_ratios = [0, 0, 0]` on all
+  3 DSpark draft layers (`layers.40..42`, `mtp.0..2`), so production DSpark draft
+  attention is already window-only (`swa_width = 136`, `idx_width = 0`, `0.00 ms`
+  indexer work). When indexed draft attention (`compress_ratio = 1`, `idx_width = 512`)
+  is enabled, reusing the target model's accepted anchor row top-$k$ selection
+  (`gather_dspark_anchor_topk_indices`, `"target"` mode) or step-0 anchor top-$k$
+  (`broadcast_dspark_step0_topk_indices`, `"anchor"` mode) requires zero new
+  checkpoint weights, keeps 3-layer DSpark indexed attention $O(1)$ (`0.080–0.085 ms`
+  at `c1`, `0.193–0.198 ms` at `c8` on `TP=4`) across `4K..256K` (saving up to
+  `2.69 ms/step` / `14.58x` vs 1 shared draft indexer and `8.10 ms/step` / `41.86x`
+  vs 3 per-layer draft indexers at `256K c8`), and preserves `97.1%–98.8%` top-$k$
+  index overlap, `0.999975–0.999986` 3-layer cosine similarity, and `95.8%–100.0%`
+  (`98.5%` mean) 5-step greedy Markov draft token agreement.
 - **Cross-request verify-row allocation at high concurrency.** Compare our
   per-slot survival budget (`assign_draft_budget`) plus per-step verify length
   against ranking candidate draft slots across the whole batch by marginal
