@@ -19,7 +19,72 @@ ARG RUNTIME_STAGE=runtime
 # no b12x-source context.
 ARG TILELANG_BASE_STAGE=runtime
 
-FROM ${BASE_IMAGE} AS vllm-native-builder
+# Upgrade the Ubuntu 24.04 SBSA CUDA toolchain and math libraries from the base
+# image's CUDA 13.0.2 (nvcc/ptxas 13.0.88, libcublasLt 13.1.1.3) to CUDA 13.5
+# (nvcc/ptxas 13.5.37, libcudart 13.5.37, libcublasLt 13.10.0.20), and wire the
+# pip nvidia/cu13 directory (which libtorch_cuda.so's DT_RPATH and
+# cuda.pathfinder search ahead of /usr/local/cuda) to /usr/local/cuda-13.5.
+FROM ${BASE_IMAGE} AS cuda-base
+
+USER root
+
+ENV CUDA_HOME=/usr/local/cuda \
+    CUDA_VERSION=13.5.0 \
+    NV_CUDA_CUDART_VERSION=13.5.37-1 \
+    NV_CUDA_LIB_VERSION=13.5.0-1 \
+    NV_LIBCUBLAS_VERSION=13.10.0.20-1 \
+    PATH=/usr/local/cuda-13.5/bin:/usr/local/cuda/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin \
+    LD_LIBRARY_PATH=/usr/local/cuda-13.5/targets/sbsa-linux/lib:/usr/local/cuda/targets/sbsa-linux/lib:/usr/local/cuda/lib64
+
+RUN set -eux; \
+    apt-get update; \
+    DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
+      cccl-13-5=13.3.5.0.6-1 \
+      cuda-compat-13-5=620.70.06-1ubuntu1 \
+      cuda-crt-13-5=13.5.37-1 \
+      cuda-cudart-13-5=13.5.37-1 \
+      cuda-cudart-dev-13-5=13.5.37-1 \
+      cuda-culibos-dev-13-5=13.5.25-1 \
+      cuda-cuobjdump-13-5=13.5.37-1 \
+      cuda-driver-dev-13-5=13.5.37-1 \
+      cuda-nvcc-13-5=13.5.37-1 \
+      cuda-nvdisasm-13-5=13.5.37-1 \
+      cuda-nvrtc-13-5=13.5.37-1 \
+      cuda-nvrtc-dev-13-5=13.5.37-1 \
+      cuda-toolkit-13-5-config-common=13.5.37-1 \
+      libcublas-13-5=13.10.0.20-1 \
+      libcublas-dev-13-5=13.10.0.20-1 \
+      libcurand-13-5=10.4.5.25-1 \
+      libcurand-dev-13-5=10.4.5.25-1 \
+      libnvjitlink-13-5=13.5.37-1 \
+      libnvjitlink-dev-13-5=13.5.37-1 \
+      libnvptxcompiler-13-5=13.5.37-1 \
+      libnvvm-13-5=13.5.37-1; \
+    rm -rf /var/lib/apt/lists/*; \
+    printf '%s\n' \
+      '#!/bin/sh' \
+      'set -eux' \
+      'ln -sfn /usr/local/cuda-13.5 /usr/local/cuda' \
+      'ln -sfn /usr/local/cuda-13.5 /usr/local/cuda-13' \
+      'ln -sfn /usr/local/cuda-13.5 /etc/alternatives/cuda' \
+      'ln -sfn /usr/local/cuda-13.5 /etc/alternatives/cuda-13' \
+      'sed -i "s|^TOP[[:space:]]*=.*|TOP = /usr/local/cuda-13.5|" /usr/local/cuda-13.5/bin/nvcc.profile' \
+      'cu13_dir=/usr/local/lib/python3.12/dist-packages/nvidia/cu13' \
+      'cuda_lib=/usr/local/cuda-13.5/targets/sbsa-linux/lib' \
+      'rm -rf "${cu13_dir}/bin" "${cu13_dir}/nvvm"' \
+      'ln -s /usr/local/cuda-13.5/bin "${cu13_dir}/bin"' \
+      'ln -s /usr/local/cuda-13.5/nvvm "${cu13_dir}/nvvm"' \
+      'for lib in libcublas.so.13 libcublasLt.so.13 libnvblas.so.13 libcudart.so.13 libcudart_static.a libcudadevrt.a libnvJitLink.so.13 libnvrtc.so.13 libnvrtc-builtins.so.13.5 libnvptxcompiler_static.a libcurand.so.10; do' \
+      '  ln -sfn "${cuda_lib}/${lib}" "${cu13_dir}/lib/${lib}"' \
+      'done' \
+      'rm -f "${cu13_dir}/lib/libnvrtc-builtins.so.13.0" "${cu13_dir}/lib/libnvrtc-builtins.so.13.2"' \
+      'ln -sfn /usr/local/cuda-13.5/nvvm/lib64/libnvvm.so.4.0.0 "${cu13_dir}/lib/libnvvm.so.4"' \
+      'ldconfig' \
+      > /usr/local/sbin/spark-wire-cuda-13-5; \
+    chmod 0755 /usr/local/sbin/spark-wire-cuda-13-5; \
+    /usr/local/sbin/spark-wire-cuda-13-5
+
+FROM cuda-base AS vllm-native-builder
 
 USER root
 
@@ -82,7 +147,7 @@ RUN --mount=type=secret,id=github_token,required=false \
 # NCCL 2.30.7 (the base image's nvidia-nccl-cu13 wheel), rebuilt from the
 # pinned release tag with patches/nccl for SM121 only. The runtime stage
 # replaces the wheel's libnccl.so.2 with it.
-FROM ${BASE_IMAGE} AS nccl-builder
+FROM cuda-base AS nccl-builder
 
 USER root
 
@@ -103,7 +168,7 @@ RUN set -eux; \
 # the base image's z3-solver, which TileLang links and loads at run time.
 # TileKernels takes its version from setuptools-scm, which an export without
 # Git metadata cannot supply.
-FROM ${BASE_IMAGE} AS tilelang-builder
+FROM cuda-base AS tilelang-builder
 
 USER root
 
@@ -129,7 +194,7 @@ RUN set -eux; \
 # sparknet (christopherowen/dgx-spark-networking): the one-shot RoCE
 # collectives vendored from B12X with spark's patches 0001-0011, used by the
 # TileLang family instead of b12x.comm.roce. Pure Python plus a C proxy.
-FROM ${BASE_IMAGE} AS sparknet-builder
+FROM cuda-base AS sparknet-builder
 
 COPY --from=sparknet-source . /workspace/sparknet/
 RUN python3 -m pip wheel --no-cache-dir --no-deps --wheel-dir /opt/sparknet /workspace/sparknet && \
@@ -139,7 +204,7 @@ RUN python3 -m pip wheel --no-cache-dir --no-deps --wheel-dir /opt/sparknet /wor
 # rebuilt native extensions, the patched NCCL and the hash-locked CuTe DSL wheels.
 # While the lock lists B12X (spark-ds41f-1025 and earlier), `runtime` adds it on
 # top; a lock without it builds the TileLang runtime on this stage directly.
-FROM ${BASE_IMAGE} AS runtime-core
+FROM cuda-base AS runtime-core
 
 # No usage reporting: vLLM's usage stats (stats.vllm.ai) stay off in every image and
 # every container started from it, whatever the deployment's environment.
@@ -216,11 +281,13 @@ RUN set -eux; \
     test -f /opt/spark-ds41f/candidate/vllm/vllm/third_party/flashmla/flash_mla_interface.py
 
 # The nightly base installs CuTe DSL 4.7.1, which vLLM and quack-kernels require.
-# Reinstall the hash-locked wheel set (the same version).
+# Reinstall the hash-locked wheel set (the same version), then re-wire
+# nvidia/cu13 so nvidia-cuda-nvrtc-cu13's libnvrtc resolves to CUDA 13.5.
 RUN set -eux; \
     python3 -m pip install --no-cache-dir --no-deps --force-reinstall \
       /tmp/cutlass-dsl-wheels/*.whl; \
-    rm -rf /tmp/cutlass-dsl-wheels
+    rm -rf /tmp/cutlass-dsl-wheels; \
+    /usr/local/sbin/spark-wire-cuda-13-5
 RUN python3 - <<'PY'
 import importlib.metadata as metadata
 
@@ -253,13 +320,33 @@ RUN LIBRARY_PATH=/usr/local/cuda/lib64/stubs python3 - <<'PY'
 import ctypes
 import hashlib
 import importlib.metadata as metadata
+from pathlib import Path
 import subprocess
 
 assert metadata.version("nvidia-cutlass-dsl") == "4.7.1"
 import cutlass.base_dsl.enums  # noqa: F401  (quack-kernels, the DS4.1 L2 prefetch)
 import quack.compile_utils  # noqa: F401
+from cuda.pathfinder import find_nvidia_binary_utility
 from vllm.model_executor.model_loader.direct_io import _native as direct_native
 from vllm.models.deepseek_v4_1.engram_rows import _native as engram_native
+
+for tool in ("nvcc", "ptxas"):
+    out = subprocess.check_output([f"/usr/local/cuda/bin/{tool}", "--version"], text=True)
+    assert "release 13.5, V13.5.37" in out, out
+    resolved = Path(find_nvidia_binary_utility(tool)).resolve()
+    assert resolved == Path(f"/usr/local/cuda-13.5/bin/{tool}"), resolved
+for lib_path in (
+    "/usr/local/cuda/lib64/libcublasLt.so.13",
+    "/usr/local/lib/python3.12/dist-packages/nvidia/cu13/lib/libcublasLt.so.13",
+):
+    assert Path(lib_path).resolve() == Path(
+        "/usr/local/cuda-13.5/targets/sbsa-linux/lib/libcublasLt.so.13.10.0.20"
+    )
+    assert ctypes.CDLL(lib_path).cublasLtGetVersion() == 131000
+cudart = ctypes.CDLL("/usr/local/cuda/lib64/libcudart.so.13")
+rt_ver = ctypes.c_int()
+assert cudart.cudaRuntimeGetVersion(ctypes.byref(rt_ver)) == 0
+assert rt_ver.value == 13050, rt_ver.value
 
 # torch.cuda.nccl.version() reports the NCCL torch was compiled against, so
 # ask the installed library itself (NCCL_VERSION_CODE 2.30.7 = 23007).

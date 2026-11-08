@@ -5,11 +5,19 @@ karmic-kraken-beta vLLM and B12X (while the lock lists it; see
 [Locks without B12X](#locks-without-b12x)) with the local patch series, plus TileLang,
 DeepSeek's TileKernels and sparknet for the promoted TileLang kernel family
 (the `runtime-tilelang-sparknet` stage), on the canonical
-vLLM ARM64 nightly `af1c0149`. Only vLLM's `_C_stable_libtorch` and
+vLLM ARM64 nightly `af1c0149`. A shared `cuda-base` stage upgrades the Ubuntu
+24.04 SBSA CUDA toolchain and math libraries from the base image's CUDA 13.0.2
+(`nvcc`/`ptxas` `13.0.88`, `libcublasLt` `13.1.1.3`) to CUDA 13.5
+(`cuda-nvcc-13-5` `13.5.37-1`, `cuda-cudart-13-5` `13.5.37-1`,
+`libcublas-13-5` `13.10.0.20-1`) and wires `/usr/local/cuda` and
+`/usr/local/lib/python3.12/dist-packages/nvidia/cu13` (searched first by
+`libtorch_cuda.so`'s `DT_RPATH` and `cuda.pathfinder`) to `/usr/local/cuda-13.5`.
+Only vLLM's `_C_stable_libtorch` and
 `_moe_C_stable_libtorch` are rebuilt, for SM121, and NCCL 2.30.7 (the base
 image's version) is rebuilt from its release tag with `patches/nccl`, replacing
-the wheel's `libnccl.so.2`; the image build checks the installed library's
-version and checksum. FlashInfer 0.6.18.post1 comes from the base image. The r1
+the wheel's `libnccl.so.2`; the image build checks the installed CUDA toolchain,
+`libcublasLt` (`131000`), `libcudart` (`13050`), and NCCL (`23007`) versions and
+checksums. FlashInfer 0.6.18.post1 comes from the base image. The r1
 and r2 images came from the same recipe in
 `experiments/2026-09-23-karmic-kraken-reference/`; r3 was the first built by
 `bin/spark build`. Images are tagged `spark-ds41f:<vLLM base>-<release>` (for example
