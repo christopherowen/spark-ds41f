@@ -1,4 +1,4 @@
-From db4f050c27844c18dfd31aecac229b50ee833cab Mon Sep 17 00:00:00 2001
+From 3b61d110295479a06e67544f21667117c60b9164 Mon Sep 17 00:00:00 2001
 From: koldfrontier <koldfrontier@users.noreply.github.com>
 Date: Fri, 6 Nov 2026 03:07:37 +0000
 Subject: [PATCH] Require the DSML token for DeepSeek V4.1 tool call markup
@@ -7,7 +7,7 @@ MIME-Version: 1.0
 Content-Type: text/plain; charset=UTF-8
 Content-Transfer-Encoding: 8bit
 
-Base: 1107 vLLM patch head 2756478b60b90700b9918b457aeb38657da637b5 (upstream 19f2c20ed4d64ae22bd009ceacadd85e2a81e354 + 641 patches).
+Base: 1107 vLLM patch head b9276542af6feba1b8f916b521f857cd23bd1224 (upstream 19f2c20ed4d64ae22bd009ceacadd85e2a81e354 + 641 patches).
 
 Rationale:
 In the DeepSeek V4.1 tokenizer, 128825 (｜DSML｜) is a bare atom token while each full DSML tag (<｜DSML｜ calls>, <｜DSML｜ invoke name="...", <｜DSML｜ parameter name="..." string="...">, and their closing tags) is a composite sequence of ordinary text tokens around 128825. Because the model can also spell "｜DSML｜" out of ordinary text tokens when quoting DSML markup in prose or writing files containing DSML strings (issues #876 and #948), text-only matching treats quoted DSML tags as genuine structural markers:
@@ -16,11 +16,12 @@ In the DeepSeek V4.1 tokenizer, 128825 (｜DSML｜) is a bare atom token while e
 - An untrusted "<｜DSML｜ parameter ...>" tag after a closed parameter arms the 0643 incremental open-value extender and appends subsequent text into the closed parameter.
 - Splitting "<｜DSML｜ calls>" across streaming deltas when reasoning ends implicitly loses the token-origin span across separate reasoning/tool parser instances in DelegatingParser.
 - Formatting newlines between "</｜DSML｜ invoke>" and "</｜DSML｜ calls>" in TOOL_BETWEEN leak into assistant content when non-whitespace content preceded the tool block.
+- When --tool-call-parser deepseek_v41 or --reasoning-parser deepseek_v41 is configured alone, falling back to DelegatingParser drops model_output_token_ids in non-streaming parse() and leaves ParserEngine in ParserState.REASONING when skip_reasoning_parsing=True.
 
 Track token-ID origin spans through TokenIDScanner, IncrementalLexer, StreamingParserEngine, and ToolCallSlot:
 - Gate composite DSML terminals (TOOL_START, TOOL_END, INVOKE_PREFIX, INVOKE_END, PARAM_START, PARAM_CLOSE) on the presence of a genuine 128825 token span at the "｜DSML｜" offset.
 - Filter parameter header and close matches in DeepSeekV41Parser (_dsml_arg_converter and _dsml_open_value_extender) by recorded token-origin spans, holding back partial genuine headers during incremental string streaming.
-- Route both parse() and parse_delta() through a unified single-engine DeepSeekV41ServingParser so streaming deltas that split "<｜DSML｜ calls>" across an implicit reasoning-to-tool transition preserve token provenance, while keeping DSML markup as content when tools are absent or tool_choice="none".
+- Route both parse() and parse_delta() through DeepSeekV41ServingParser whenever either --reasoning-parser deepseek_v41 or --tool-call-parser deepseek_v41 is active, and start ParserEngine in ParserState.CONTENT when skip_reasoning_parsing=True, preserving token provenance in combined, tool-only, and reasoning-only configurations while keeping DSML markup as content when tools are absent or tool_choice="none".
 - Hold back pure whitespace in TOOL_BETWEEN unless non-whitespace text follows in the same span so structural newlines between "</｜DSML｜ invoke>" and "</｜DSML｜ calls>" do not append to pre-tool assistant content.
 - Include prompt turn-boundary reasoning checks (set_prompt_token_ids, #61857) so multi-turn and task prompts do not inherit an earlier turn's "</think>".
 
@@ -28,27 +29,27 @@ Quality:
 Sampling-neutral; affects only post-generation output parsing for --reasoning-parser deepseek_v41 and --tool-call-parser deepseek_v41. Preserves bit-identical outputs on clean replies while preventing false tool-call extraction and argument truncation when replies or string arguments quote DSML markup.
 
 Tests:
-- pytest tests/parser/engine/test_deepseek_v41_dsml_provenance.py (45 passed)
-- pytest tests/tool_parsers/test_deepseekv41_tool_parser.py (146 passed)
-- pytest tests/parser/engine/test_deepseek_v41.py tests/parser/engine/test_deepseek_v4.py tests/parser/engine/test_token_id_scanner.py tests/parser/engine/test_parser_engine.py tests/tool_parsers/test_deepseekv4_tool_parser.py tests/tool_parsers/test_deepseekv32_tool_parser.py (389 passed; 580 total passed)
-- replay_fixtures.py on fixtures/live-1030.json and fixtures/live-1030-thinking.json (all 9 cases pass across whole, stream/1, stream/7, stream/10000)
+- pytest tests/parser/engine/test_deepseek_v41_dsml_provenance.py (86 passed)
+- pytest tests/tool_parsers/test_deepseekv41_tool_parser.py (152 passed)
+- pytest tests/parser/engine/test_deepseek_v41.py tests/parser/engine/test_deepseek_v4.py tests/parser/engine/test_token_id_scanner.py tests/parser/engine/test_parser_engine.py tests/tool_parsers/test_deepseekv4_tool_parser.py tests/tool_parsers/test_deepseekv32_tool_parser.py (389 passed; 627 total passed across 2 container boots)
+- replay_fixtures.py on fixtures/live-1030.json and fixtures/live-1030-thinking.json (all 9 cases pass across whole, stream/1, stream/7, stream/10000 across 2 container boots)
 
 Upstream status: backported from https://github.com/vllm-project/vllm/pull/65019 (with #61857 prompt reasoning state hook) and adapted to the 1107 series.
 ---
  docs/features/tool_calling.md                 |   6 +
- .../test_deepseek_v41_dsml_provenance.py      | 253 ++++++++
+ .../test_deepseek_v41_dsml_provenance.py      | 396 +++++++++++
  tests/parser/engine/test_token_id_scanner.py  | 122 ++++
- .../test_deepseekv41_tool_parser.py           | 590 ++++++++++++++++++
+ .../test_deepseekv41_tool_parser.py           | 658 ++++++++++++++++++
  vllm/parser/deepseek_v4.py                    |   5 +
- vllm/parser/deepseek_v41.py                   | 237 ++++++-
+ vllm/parser/deepseek_v41.py                   | 260 ++++++-
  vllm/parser/engine/adapters.py                |   3 +
- vllm/parser/engine/incremental_lexer.py       |  70 ++-
- vllm/parser/engine/parser_engine.py           |  49 +-
+ vllm/parser/engine/incremental_lexer.py       |  70 +-
+ vllm/parser/engine/parser_engine.py           |  54 +-
  vllm/parser/engine/parser_engine_config.py    |   3 +
  vllm/parser/engine/streaming_parser_engine.py | 101 ++-
  vllm/parser/engine/token_id_scanner.py        | 168 +++++
- vllm/parser/parser_manager.py                 |  16 +
- 13 files changed, 1587 insertions(+), 36 deletions(-)
+ vllm/parser/parser_manager.py                 |  20 +
+ 13 files changed, 1830 insertions(+), 36 deletions(-)
  create mode 100644 tests/parser/engine/test_deepseek_v41_dsml_provenance.py
  create mode 100644 tests/tool_parsers/test_deepseekv41_tool_parser.py
 
@@ -71,10 +72,10 @@ index 2e8178d39..d8344cf2c 100644
  Supported models:
 diff --git a/tests/parser/engine/test_deepseek_v41_dsml_provenance.py b/tests/parser/engine/test_deepseek_v41_dsml_provenance.py
 new file mode 100644
-index 000000000..1cfe87173
+index 000000000..80dc24c2b
 --- /dev/null
 +++ b/tests/parser/engine/test_deepseek_v41_dsml_provenance.py
-@@ -0,0 +1,253 @@
+@@ -0,0 +1,396 @@
 +# SPDX-License-Identifier: Apache-2.0
 +# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 +"""DeepSeek V4.1: DSML is structure only where its atom is the DSML token.
@@ -204,7 +205,7 @@ index 000000000..1cfe87173
 +
 +
 +@pytest.mark.parametrize("value", QUOTED_VALUES)
-+@pytest.mark.parametrize("chunk_size", [1, 5, 10000])
++@pytest.mark.parametrize("chunk_size", [1, 2, 3, 4, 5, 6, 10000])
 +def test_quoted_dsml_in_string_value_survives_streaming(value, chunk_size):
 +    output = streamed(write_call(("notes.md", value)), WRITE_TOOLS, chunk_size)
 +    assert [json.loads(call["arguments"]) for call in output.tool_calls] == [
@@ -299,7 +300,7 @@ index 000000000..1cfe87173
 +
 +
 +@pytest.mark.parametrize("tools", [WEATHER_TOOLS, None])
-+@pytest.mark.parametrize("chunk_size", [1, 5, 10000])
++@pytest.mark.parametrize("chunk_size", [1, 2, 3, 4, 5, 6, 10000])
 +def test_reply_quoting_dsml_stays_content(tools, chunk_size):
 +    output = streamed(QUOTING_REPLY, tools, chunk_size)
 +    assert output.tool_calls == []
@@ -328,6 +329,149 @@ index 000000000..1cfe87173
 +        preamble,
 +        [("write", {"path": "hello.md", "content": "hello world"})],
 +    )
++
++
++@pytest.mark.parametrize("chunk_size", [1, 2, 3, 4, 5, 6, 10000])
++def test_mixed_json_and_string_params_quoting_dsml(chunk_size):
++    code_body = (
++        f"# parser test\n{SAMPLE}\n"
++        "<|DSML|function_calls>\n"
++        f"<{ATOM}function_calls>\n"
++    )
++    meta_json = json.dumps(
++        {"tags": [f"<{ATOM} calls>", f"</{ATOM} parameter>", "<|DSML|invoke>"]}
++    )
++    template = (
++        f"<{G} calls>\n<{G} invoke name=\"write\">\n"
++        f"<{G} parameter name=\"path\" string=\"true\">deepseek_v32_tool_parser.py</{G} parameter>\n"
++        f"<{G} parameter name=\"content\" string=\"true\">{code_body}</{G} parameter>\n"
++        f"<{G} parameter name=\"meta\" string=\"false\">{meta_json}</{G} parameter>\n"
++        f"<{G} parameter name=\"lines\">42</{G} parameter>\n"
++        f"</{G} invoke>\n</{G} calls>"
++    )
++    expected = {
++        "path": "deepseek_v32_tool_parser.py",
++        "content": code_body,
++        "meta": json.loads(meta_json),
++        "lines": 42,
++    }
++    output = streamed(template, WRITE_TOOLS, chunk_size)
++    assert [json.loads(call["arguments"]) for call in output.tool_calls] == [expected]
++    assert whole(template, WRITE_TOOLS) == ("", [("write", expected)])
++
++
++@pytest.mark.parametrize("chunk_size", [1, 3, 6, 10000])
++def test_tool_only_parser_preserves_provenance(chunk_size):
++    cls = ParserManager.get_parser(
++        tool_parser_name="deepseek_v41",
++        reasoning_parser_name=None,
++        enable_auto_tools=True,
++    )
++    assert cls is not None
++
++    # 1. Quoted DSML in assistant reply (#876) stays content in whole and streaming.
++    tokenizer, tokens = tokenize(QUOTING_REPLY)
++    parser = cls(tokenizer, WEATHER_TOOLS)
++    reasoning, content, calls = parser.parse(
++        "".join(text for _, text in tokens),
++        _test_request(tools=WEATHER_TOOLS),
++        enable_auto_tools=True,
++        model_output_token_ids=[tid for tid, _ in tokens],
++    )
++    assert reasoning is None and calls is None and content == QUOTING_REPLY
++    out = collect_output(
++        replay_streaming(
++            cls(tokenizer, WEATHER_TOOLS),
++            tokens,
++            chunk_size=chunk_size,
++            finished_on_last=True,
++            tools=WEATHER_TOOLS,
++        )
++    )
++    assert out.reasoning == "" and out.tool_calls == [] and out.content == QUOTING_REPLY
++
++    # 2. Quoted DSML inside string argument (#948) survives in whole and streaming.
++    call_tmpl = write_call(("notes.md", QUOTED_VALUES[0]))
++    tokenizer2, tokens2 = tokenize(call_tmpl)
++    parser2 = cls(tokenizer2, WRITE_TOOLS)
++    reasoning2, content2, calls2 = parser2.parse(
++        "".join(text for _, text in tokens2),
++        _test_request(tools=WRITE_TOOLS),
++        enable_auto_tools=True,
++        model_output_token_ids=[tid for tid, _ in tokens2],
++    )
++    assert reasoning2 is None and not content2
++    assert [(c.name, json.loads(c.arguments)) for c in calls2 or []] == [
++        ("write", {"path": "notes.md", "content": QUOTED_VALUES[0]})
++    ]
++    out2 = collect_output(
++        replay_streaming(
++            cls(tokenizer2, WRITE_TOOLS),
++            tokens2,
++            chunk_size=chunk_size,
++            finished_on_last=True,
++            tools=WRITE_TOOLS,
++        )
++    )
++    assert [json.loads(c["arguments"]) for c in out2.tool_calls] == [
++        {"path": "notes.md", "content": QUOTED_VALUES[0]}
++    ]
++
++    # 3. Genuine DSML call when request.tools is None stays content.
++    out_no_tools = collect_output(
++        replay_streaming(
++            cls(tokenizer2, None),
++            tokens2,
++            chunk_size=chunk_size,
++            finished_on_last=True,
++            tools=None,
++        )
++    )
++    assert out_no_tools.tool_calls == []
++    assert out_no_tools.content == call_tmpl.replace(G, ATOM)
++
++
++@pytest.mark.parametrize("chunk_size", [1, 3, 6, 10000])
++def test_reasoning_only_parser_preserves_provenance(chunk_size):
++    cls = ParserManager.get_parser(
++        tool_parser_name=None,
++        reasoning_parser_name="deepseek_v41",
++        enable_auto_tools=False,
++    )
++    assert cls is not None
++    vocab = {ATOM: ATOM_ID, "<think>": 50, "</think>": 51}
++    thought = f"Quoting </think> and <{ATOM} calls> in thought."
++    answer = "Final answer."
++    tokens: list[tuple[int, str]] = [
++        (1000 + i, ch) for i, ch in enumerate(thought)
++    ]
++    tokens.append((51, "</think>"))
++    tokens.extend((2000 + i, ch) for i, ch in enumerate(answer))
++    tokenizer = MockTokenizer(vocab, tokens)
++    tokenizer._special_ids = {50, 51}
++    tokenizer._all_special_tokens = ["<think>", "</think>"]
++
++    parser = cls(tokenizer, None, chat_template_kwargs={"thinking": True})
++    parser.set_prompt_token_ids([50])
++    reasoning, content, calls = parser.parse(
++        "".join(text for _, text in tokens),
++        _test_request(tools=None),
++        enable_auto_tools=False,
++        model_output_token_ids=[tid for tid, _ in tokens],
++    )
++    assert reasoning == thought and content == answer and calls is None
++
++    out = collect_output(
++        replay_streaming(
++            cls(tokenizer, None, chat_template_kwargs={"thinking": True}),
++            tokens,
++            chunk_size=chunk_size,
++            finished_on_last=True,
++            tools=None,
++            prompt_token_ids=[50],
++        )
++    )
++    assert out.reasoning == thought and out.content == answer and out.tool_calls == []
 diff --git a/tests/parser/engine/test_token_id_scanner.py b/tests/parser/engine/test_token_id_scanner.py
 index 8723ac282..f02f0a315 100644
 --- a/tests/parser/engine/test_token_id_scanner.py
@@ -463,10 +607,10 @@ index 8723ac282..f02f0a315 100644
          _CHANNEL_START_TAG: _CHANNEL_START_TID,
 diff --git a/tests/tool_parsers/test_deepseekv41_tool_parser.py b/tests/tool_parsers/test_deepseekv41_tool_parser.py
 new file mode 100644
-index 000000000..42a0ace54
+index 000000000..23322b016
 --- /dev/null
 +++ b/tests/tool_parsers/test_deepseekv41_tool_parser.py
-@@ -0,0 +1,590 @@
+@@ -0,0 +1,658 @@
 +# SPDX-License-Identifier: Apache-2.0
 +# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 +"""DeepSeek V4.1 output parsing through ParserManager with the real tokenizer.
@@ -1057,6 +1201,74 @@ index 000000000..42a0ace54
 +        deltas = schedule_deltas(tokenizer, ids, prompt_ids, schedule)
 +        actual = stream(parser, request, prompt_ids, deltas)
 +    assert actual == ("", "Sure. " + CALL, [])
++
++
++@pytest.mark.parametrize("schedule", SCHEDULES)
++def test_tool_only_and_reasoning_only_parsers_keep_token_provenance(
++    tokenizer, schedule
++):
++    # Tool-only configuration (no reasoning parser)
++    tool_only_cls = ParserManager.get_parser(
++        tool_parser_name="deepseek_v41",
++        reasoning_parser_name=None,
++        enable_auto_tools=True,
++    )
++    assert tool_only_cls is not None
++    request = ChatCompletionRequest(
++        model=MODEL,
++        messages=[{"role": "user", "content": "hi"}],
++        tools=TOOLS,
++        include_reasoning=True,
++    )
++    ids = (
++        text_ids(tokenizer, "Before " + CALL + " ")
++        + marker_ids(tokenizer, STRING_HEAD)
++        + text_ids(tokenizer, QUOTED)
++        + marker_ids(tokenizer, STRING_TAIL)
++    )
++    parser = tool_only_cls(tokenizer, TOOLS)
++    prompt_ids = [THINK_END_ID]
++    if schedule == "nonstream":
++        parser.set_prompt_token_ids(prompt_ids)
++        reasoning, content, calls = parser.parse(
++            tokenizer.decode(ids), request, True, ids
++        )
++        actual = (
++            reasoning or "",
++            content or "",
++            [(c.name, json.loads(c.arguments)) for c in calls or []],
++        )
++    else:
++        deltas = schedule_deltas(tokenizer, ids, prompt_ids, schedule)
++        actual = stream(parser, request, prompt_ids, deltas)
++    assert actual == ("", "Before " + CALL + " ", [("echo", {"text": QUOTED})])
++
++    # Reasoning-only configuration (no tool parser)
++    reasoning_only_cls = ParserManager.get_parser(
++        tool_parser_name=None,
++        reasoning_parser_name="deepseek_v41",
++        enable_auto_tools=False,
++    )
++    assert reasoning_only_cls is not None
++    r_ids = (
++        text_ids(tokenizer, "Draft </think> " + CALL)
++        + [THINK_END_ID]
++        + text_ids(tokenizer, "Done")
++    )
++    r_parser = reasoning_only_cls(
++        tokenizer, None, chat_template_kwargs={"thinking": True}
++    )
++    r_prompt_ids = [THINK_START_ID]
++    if schedule == "nonstream":
++        r_parser.set_prompt_token_ids(r_prompt_ids)
++        reasoning, content, calls = r_parser.parse(
++            tokenizer.decode(r_ids), request, False, r_ids
++        )
++        r_actual = (reasoning or "", content or "", calls or [])
++    else:
++        deltas = schedule_deltas(tokenizer, r_ids, r_prompt_ids, schedule)
++        r_actual = stream(r_parser, request, r_prompt_ids, deltas)
++    assert r_actual == ("Draft </think> " + CALL, "Done", [])
 diff --git a/vllm/parser/deepseek_v4.py b/vllm/parser/deepseek_v4.py
 index f18b4ad46..1c7c209a8 100644
 --- a/vllm/parser/deepseek_v4.py
@@ -1075,7 +1287,7 @@ index f18b4ad46..1c7c209a8 100644
      tail = raw_args[-keep:]
  
 diff --git a/vllm/parser/deepseek_v41.py b/vllm/parser/deepseek_v41.py
-index 76c7ad19b..cf6e58561 100644
+index 76c7ad19b..8ef0091bb 100644
 --- a/vllm/parser/deepseek_v41.py
 +++ b/vllm/parser/deepseek_v41.py
 @@ -2,17 +2,33 @@
@@ -1193,7 +1405,7 @@ index 76c7ad19b..cf6e58561 100644
          arg_converter=functools.partial(
              _dsml_arg_converter,
              param_re=_PARAM_RE,
-@@ -61,3 +137,160 @@ def deepseek_v41_config(thinking: bool = False) -> ParserEngineConfig:
+@@ -61,3 +137,183 @@ def deepseek_v41_config(thinking: bool = False) -> ParserEngineConfig:
  
  class DeepSeekV41Parser(DeepSeekV4Parser):
      parser_config = staticmethod(deepseek_v41_config)
@@ -1247,15 +1459,28 @@ index 76c7ad19b..cf6e58561 100644
 +
 +    def __init__(self, tokenizer, tools=None, **kwargs):
 +        super().__init__(tokenizer, tools, **kwargs)
-+        reasoning_adapter, tool_adapter = self._reasoning_parser, self._tool_parser
-+        assert isinstance(reasoning_adapter, ParserEngineReasoningAdapter)
-+        assert isinstance(tool_adapter, ParserEngineToolAdapter)
++        reasoning_adapter = self._reasoning_parser
++        tool_adapter = self._tool_parser
++        assert reasoning_adapter is None or isinstance(
++            reasoning_adapter, ParserEngineReasoningAdapter
++        )
++        assert tool_adapter is None or isinstance(
++            tool_adapter, ParserEngineToolAdapter
++        )
++        assert reasoning_adapter is not None or tool_adapter is not None
 +        self._reasoning_adapter = reasoning_adapter
-+        self._unified_parser = reasoning_adapter._parser_engine
-+        self._unified_parser._tools = tools
++        if reasoning_adapter is not None:
++            self._unified_parser = reasoning_adapter._parser_engine
++            self._unified_parser._tools = tools
++            if tool_adapter is not None:
++                tool_adapter._parser_engine = self._unified_parser
++            else:
++                self._unified_parser.skip_tool_parsing = True
++        else:
++            assert tool_adapter is not None
++            self._unified_parser = tool_adapter._parser_engine
 +        self._unified_parser._stream_state = self._stream_state
-+        tool_adapter._parser_engine = self._unified_parser
-+        self._skip_tools_override = False
++        self._skip_tools_override = self._tool_parser is None
 +
 +    @property
 +    def skip_tool_parsing(self):
@@ -1269,6 +1494,7 @@ index 76c7ad19b..cf6e58561 100644
 +    def _prepare_tools(self, request, enable_auto_tools=True):
 +        self._unified_parser.skip_tool_parsing = (
 +            self._skip_tools_override
++            or self._tool_parser is None
 +            or request.tool_choice == "none"
 +            or not request.tools
 +            or not enable_auto_tools
@@ -1276,12 +1502,16 @@ index 76c7ad19b..cf6e58561 100644
 +        self._unified_parser._suppress_tool_calls = False
 +
 +    def _sync_reasoning(self):
-+        self._reasoning_adapter._streaming_count_valid = True
-+        self._stream_state.reasoning_ended = self._unified_parser.reasoning_ended
++        if self._reasoning_adapter is not None:
++            self._reasoning_adapter._streaming_count_valid = True
++            self._stream_state.reasoning_ended = self._unified_parser.reasoning_ended
++        else:
++            self._stream_state.reasoning_ended = True
 +
 +    def set_prompt_token_ids(self, prompt_token_ids):
 +        self._unified_parser.set_prompt_token_ids(prompt_token_ids)
-+        self._reasoning_adapter._streaming_count_valid = False
++        if self._reasoning_adapter is not None:
++            self._reasoning_adapter._streaming_count_valid = False
 +
 +    def _uses_json_tool_choice(self, request):
 +        return (
@@ -1294,12 +1524,15 @@ index 76c7ad19b..cf6e58561 100644
 +        self, model_output, request, enable_auto_tools=False, model_output_token_ids=()
 +    ):
 +        if self._uses_json_tool_choice(request):
-+            # Reasoning still needs token provenance before JSON tool dispatch.
-+            with self._reasoning_adapter._skip_tool_parsing():
-+                reasoning, content, _ = self._unified_parser.parse(
-+                    model_output, request, enable_auto_tools, model_output_token_ids
-+                )
-+            self._sync_reasoning()
++            if self._reasoning_adapter is not None:
++                # Reasoning still needs token provenance before JSON tool dispatch.
++                with self._reasoning_adapter._skip_tool_parsing():
++                    reasoning, content, _ = self._unified_parser.parse(
++                        model_output, request, enable_auto_tools, model_output_token_ids
++                    )
++                self._sync_reasoning()
++            else:
++                reasoning, content = None, model_output
 +            tool_calls, content = self._extract_tool_calls(
 +                content, request, enable_auto_tools
 +            )
@@ -1317,9 +1550,10 @@ index 76c7ad19b..cf6e58561 100644
 +            is_tool_called = e
 +            raise
 +        finally:
-+            record_tool_parser_invocation(
-+                is_tool_called=is_tool_called, is_streaming=False, request=request
-+            )
++            if self._tool_parser is not None:
++                record_tool_parser_invocation(
++                    is_tool_called=is_tool_called, is_streaming=False, request=request
++                )
 +
 +    def parse_delta(
 +        self, delta_text, delta_token_ids, request, prompt_token_ids=None, *, finished
@@ -1351,9 +1585,10 @@ index 76c7ad19b..cf6e58561 100644
 +            is_tool_called = e
 +            raise
 +        finally:
-+            record_tool_parser_invocation(
-+                is_tool_called=is_tool_called, is_streaming=True, request=request
-+            )
++            if self._tool_parser is not None:
++                record_tool_parser_invocation(
++                    is_tool_called=is_tool_called, is_streaming=True, request=request
++                )
 diff --git a/vllm/parser/engine/adapters.py b/vllm/parser/engine/adapters.py
 index 3e2488f16..c5979f350 100644
 --- a/vllm/parser/engine/adapters.py
@@ -1548,7 +1783,7 @@ index 8c3820b59..91efb8127 100644
                      )
                      self.buffer = self.buffer[1:]
 diff --git a/vllm/parser/engine/parser_engine.py b/vllm/parser/engine/parser_engine.py
-index d9df0357b..fe668f231 100644
+index d9df0357b..3f66f83f1 100644
 --- a/vllm/parser/engine/parser_engine.py
 +++ b/vllm/parser/engine/parser_engine.py
 @@ -61,6 +61,8 @@ class ToolCallSlot:
@@ -1596,7 +1831,17 @@ index d9df0357b..fe668f231 100644
          self._streaming_initialized: bool = False
          self._prompt_streaming_prepared: bool = False
  
-@@ -224,6 +239,18 @@ class ParserEngine(Parser):
+@@ -211,6 +226,9 @@ class ParserEngine(Parser):
+     @skip_reasoning_parsing.setter
+     def skip_reasoning_parsing(self, value: bool) -> None:
+         self._engine.skip_reasoning_parsing = value
++        if value and self._engine.state == ParserState.REASONING:
++            self._engine.state = ParserState.CONTENT
++            self._reasoning_ended = True
+ 
+     @property
+     def reasoning_ended(self) -> bool:
+@@ -224,6 +242,18 @@ class ParserEngine(Parser):
              self._streaming_initialized = True
              self._reset(initial_state=initial_state)
  
@@ -1615,13 +1860,15 @@ index d9df0357b..fe668f231 100644
      def adjust_initial_state_from_prompt(self, prompt_token_ids: Sequence[int]) -> None:
          """See :meth:`ReasoningParser.adjust_initial_state_from_prompt`."""
          return
-@@ -235,8 +262,11 @@ class ParserEngine(Parser):
+@@ -235,8 +265,13 @@ class ParserEngine(Parser):
          return None
  
      def _reset(self, initial_state: ParserState | None = None) -> None:
 -        self._engine.reset(initial_state=initial_state)
 -        self._reasoning_ended = not self._has_reasoning
-+        prompt_closed = initial_state is None and self._prompt_closes_reasoning
++        prompt_closed = initial_state is None and (
++            self._prompt_closes_reasoning or self.skip_reasoning_parsing
++        )
 +        self._engine.reset(
 +            initial_state=ParserState.CONTENT if prompt_closed else initial_state
 +        )
@@ -1629,7 +1876,7 @@ index d9df0357b..fe668f231 100644
          self._tool_slots.clear()
          self._deferred_content = ""
          self._deferred_reasoning = ""
-@@ -826,12 +856,15 @@ class ParserEngine(Parser):
+@@ -826,12 +861,15 @@ class ParserEngine(Parser):
          # Content always precedes the tool calls in a message, so only
          # whitespace from before the first call can be kept as content.
          before_first_tool = not self._tool_slots
@@ -1646,7 +1893,7 @@ index d9df0357b..fe668f231 100644
                          self._deferred_content += event.value
                      else:
                          content_parts.append(event.value)
-@@ -873,7 +906,11 @@ class ParserEngine(Parser):
+@@ -873,7 +911,11 @@ class ParserEngine(Parser):
              self._deferred_content = self._deferred_content[len(carried_deferred) :]
              carried_deferred = ""
  
@@ -1659,7 +1906,7 @@ index d9df0357b..fe668f231 100644
              # Deferred content carried in from a previous delta precedes this
              # delta's content; content deferred during this call (text after
              # an unpromoted tool event) follows it.
-@@ -963,7 +1000,7 @@ class ParserEngine(Parser):
+@@ -963,7 +1005,7 @@ class ParserEngine(Parser):
          idx = event.tool_index
          slot = self._tool_slots[idx]
          if event.value:
@@ -2130,17 +2377,21 @@ index f663849f2..004accca9 100644
              return []
          results: list[LexerInput] = []
 diff --git a/vllm/parser/parser_manager.py b/vllm/parser/parser_manager.py
-index cc9dd3a6c..cab8ccdff 100644
+index cc9dd3a6c..397ebc278 100644
 --- a/vllm/parser/parser_manager.py
 +++ b/vllm/parser/parser_manager.py
-@@ -141,6 +141,22 @@ class ParserManager:
+@@ -141,6 +141,26 @@ class ParserManager:
  
              return _CohereCommandParser
  
++        active_tool_parser_name = tool_parser_name if enable_auto_tools else None
 +        if (
-+            enable_auto_tools
-+            and reasoning_parser_name == "deepseek_v41"
-+            and tool_parser_name == "deepseek_v41"
++            reasoning_parser_name in (None, "deepseek_v41")
++            and active_tool_parser_name in (None, "deepseek_v41")
++            and (
++                reasoning_parser_name == "deepseek_v41"
++                or active_tool_parser_name == "deepseek_v41"
++            )
 +        ):
 +            from vllm.parser.deepseek_v41 import DeepSeekV41ServingParser
 +

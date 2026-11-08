@@ -28,8 +28,8 @@ In all of them, 128825 appears only at structural positions. The quoted copies a
 ## The change
 
 [`vllm/0001-deepseek-v41-dsml-token-provenance.patch`](vllm/0001-deepseek-v41-dsml-token-provenance.patch), on
-`1107`'s series ([`vllm/series`](vllm/series) = `1107`'s 641 patches at `2756478b60b9`, then this one). It touches 13
-files (+1,587/-36, including 965 lines of tests).
+`1107`'s series ([`vllm/series`](vllm/series) = `1107`'s 641 patches at `b9276542af6f`, then this one). It touches 13
+files (+1,830/-36, including 1,182 lines of tests).
 
 - **Token-origin spans (`token_id_scanner.py`, `incremental_lexer.py`, `streaming_parser_engine.py`, `parser_engine.py`, `parser_engine_config.py`):**
   - `composite_token_id_terminals` maps each composite DSML terminal (`TOOL_START`, `TOOL_END`, `INVOKE_PREFIX`,
@@ -46,10 +46,15 @@ files (+1,587/-36, including 965 lines of tests).
     argument streaming (`0643`).
   - `DeepSeekV41Parser._extend_open_value` prevents an untrusted `<｜DSML｜ parameter ...>` tag after a closed
     parameter from arming the text-based open-value extender.
-- **Unified `DeepSeekV41ServingParser` (`deepseek_v41.py`, `parser_manager.py`, `adapters.py`):**
-  - Routes both `parse()` and `parse_delta()` through a single `DeepSeekV41Parser` instance when tool choice is not
-    JSON-constrained, preserving token-ID provenance when an implicit reasoning-to-tool transition splits
-    `<｜DSML｜ calls>` across streaming deltas.
+- **Unified `DeepSeekV41ServingParser` (`deepseek_v41.py`, `parser_manager.py`, `parser_engine.py`, `adapters.py`):**
+  - Routes both `parse()` and `parse_delta()` through a single `DeepSeekV41Parser` instance whenever either
+    `--reasoning-parser deepseek_v41` or `--tool-call-parser deepseek_v41` is active (combined, tool-only, or
+    reasoning-only) and tool choice is not JSON-constrained. This preserves token-ID provenance across implicit
+    reasoning-to-tool transitions in streaming deltas and avoids `DelegatingParser.parse()`, which drops
+    `model_output_token_ids` in non-streaming mode.
+  - Initializes `ParserEngine._engine.state` to `ParserState.CONTENT` (with `_reasoning_ended=True`) when
+    `skip_reasoning_parsing=True`, so tool-only configurations do not start in `ParserState.REASONING` while `THINK_END`
+    is neutralized.
   - Preserves DSML markup as content when `request.tools` is empty or `request.tool_choice == "none"`, and records tool
     parser invocation metrics.
   - Includes `set_prompt_token_ids` (`#61857`) and `turn_boundary_tokens` so multi-turn and task prompts do not inherit
@@ -59,8 +64,8 @@ files (+1,587/-36, including 965 lines of tests).
 
 ## Validation
 
-All validation ran offline in CPU containers from `spark-ds41f:1107` on `sp5` with the patched `vllm/parser` mounted
-over the image's. Nothing was deployed to the serving cluster.
+All validation ran offline in CPU containers from `spark-ds41f:1107` on `sp5` and across two fresh container boots on
+`sp8` with the patched `vllm/parser` mounted over the image's. Nothing was deployed to the serving cluster.
 
 **Replay of the live fixtures** ([`replay_fixtures.py`](replay_fixtures.py)) runs each output token stream the way
 the chat handler does:
@@ -81,17 +86,18 @@ answer, two tool calls, and `th_n2_python_line`).
 | `q876_no_tools` | fails in 4 of 4 | fails in 4 of 4 | all 4: the sample and FINISHED kept |
 | `ok_two_params`, `q876_tools`, `th_plain`, `th_tool`, `th_tool_max` | reasoning, content and raw arguments equal to the live server, 20 of 20 | equal to the live server, 20 of 20 | equal to the live server, byte for byte, 20 of 20 |
 
-**vLLM tests (`spark-ds41f:1107`):**
-- `tests/parser/engine/test_deepseek_v41_dsml_provenance.py` (45 passed): mock-tokenizer provenance suite covering
-  quoted DSML in string values (four spellings) and reply content, streamed and whole, open-value extender provenance
-  after a closed parameter, split `<｜DSML｜ calls>` across implicit reasoning end, `tools=None` content preservation,
-  and pre-tool content whitespace preservation.
-- `tests/tool_parsers/test_deepseekv41_tool_parser.py` (146 passed with cached tokenizer; cleanly skipped when
+**vLLM tests (`spark-ds41f:1107`, 2 fresh container boots on `sp8`):**
+- `tests/parser/engine/test_deepseek_v41_dsml_provenance.py` (86 passed): mock-tokenizer provenance suite covering
+  quoted DSML in string values (four spellings) and reply content across chunk sizes `1..6`, mixed JSON and string
+  parameters quoting DSML, open-value extender provenance after a closed parameter, split `<｜DSML｜ calls>` across
+  implicit reasoning end, `tools=None` content preservation, pre-tool content whitespace preservation, and tool-only /
+  reasoning-only `ParserManager.get_parser` configurations.
+- `tests/tool_parsers/test_deepseekv41_tool_parser.py` (152 passed with cached tokenizer; cleanly skipped when
   `HF_HUB_OFFLINE=1` without a local tokenizer snapshot): real-tokenizer matrix across `nonstream`, `one_chunk`,
-  `per_token`, and `text_lag3` schedules.
+  `per_token`, and `text_lag3` schedules, including combined, tool-only, and reasoning-only parser modes.
 - Existing parser and tool-parser suites (`test_deepseek_v41.py`, `test_deepseek_v4.py`, `test_token_id_scanner.py`,
-  `test_parser_engine.py`, `test_deepseekv4_tool_parser.py`, `test_deepseekv32_tool_parser.py`): 389 passed (580 passed
-  in total across all 8 files, 0 failures).
+  `test_parser_engine.py`, `test_deepseekv4_tool_parser.py`, `test_deepseekv32_tool_parser.py`): 389 passed (627 passed
+  in total across all 8 files in Boot 1 in 13.36s and Boot 2 in 13.48s, 0 failures).
 
 ## Files
 
