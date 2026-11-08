@@ -6,7 +6,7 @@ Unpromoted release candidate combining the validated `C40` runtime base with the
 
 | Component | Base Revision | Patch Series | Patch Count | Patch Head | Expected Tree | Patchset SHA-256 |
 |---|---|---|---:|---|---|---|
-| `vllm` | `19f2c20ed4d64ae22bd009ceacadd85e2a81e354` | `experiments/2026-10-26-spark-ds41f-candidate/1107/vllm/series` (`0001..0761`, `641` active) | `641` | `320021e3c4dbb202d911ab70e2cd924c75420488` | `ed1bdb7a7684da33d403a055521ac0c4dd7ca670` | `26fac4e56977e6f2dc057821f8fa5d10f1d6159861843e8f725bb8a2a10cef38` |
+| `vllm` | `19f2c20ed4d64ae22bd009ceacadd85e2a81e354` | `experiments/2026-10-26-spark-ds41f-candidate/1107/vllm/series` (`0001..0761`, `641` active) | `641` | `2756478b60b90700b9918b457aeb38657da637b5` | `ed1bdb7a7684da33d403a055521ac0c4dd7ca670` | `26fac4e56977e6f2dc057821f8fa5d10f1d6159861843e8f725bb8a2a10cef38` |
 | `tilelang` | `2123e412ce2217b324c50c4ec967213906456ac5` | `experiments/2026-10-26-spark-ds41f-candidate/1107/tilelang/series` (`0001..0013`) | `13` | `92a1d3a0eba72b440297d4090bbfc498a47b0eb6` | `e2b001828fd4e38e6a2eee61f818d5083cb1335f` | `2142ea448ceec22c0643badfd24bba129eb4b15e3f03a0c4c8c3ccb468b8e0d1` |
 | `sparknet` | `1fd6a1fbd8dc4884057046d1ebd93d585c9e4bcf` | `none` (`refs/heads/main`) | `0` | `1fd6a1fbd8dc4884057046d1ebd93d585c9e4bcf` | `8cc28a5cd3e683c1f114ed843453e3ce34f323e0` | `e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855` |
 
