@@ -1,0 +1,2314 @@
+From 1d3a3a7bfec94b0c50d88bbbfb9254898835c025 Mon Sep 17 00:00:00 2001
+From: Christopher Owen <christopherowen@users.noreply.github.com>
+Date: Sun, 8 Nov 2026 21:19:25 +0000
+Subject: [PATCH] perf(dsv41): vectorize post-load weight prep, add artifact
+ cache, and warm first-prefill state
+
+Base: 1107 vLLM patch head 320021e3c4dbb202d911ab70e2cd924c75420488.
+
+Rationale:
+1. Post-load MoE scale-code and FP4 weight preparation across 58 layers previously ran separate min/max/any reductions in _row_deltas, computed 4-bit nibbles and overlay_byte_codes copies even when all experts were narrow, permuted 64-byte FP4 TMA slabs byte-by-byte instead of as 8-byte int64 words, and invoked torch.cuda.empty_cache() after every submodule in process_weights_after_loading whenever reserved memory exceeded 80% of total memory even when the submodule allocated no new segments.
+2. In-place 12-bit BF16 packing (pack_bf16_weight(in_place=True)) previously staged and copied every 1,024-row chunk across all 43,264 lm_head rows even though output bytes [1.5*K*start, 1.5*K*end) lie strictly below unread input bytes [2*K*start, 2*K*out_features) once start >= 3,072 and 3*end <= 4*start. Similarly, TP3 rank 2 _trim_padded_groups unpacked 12,288 wq_b rows and repacked 8,192 rows across 59 layers even when tilelang_weight was already packed in contiguous 128x128 tiles.
+3. Subsequent starts recomputed all pack12 and MoE scale-code artifacts from scratch; API server model resolution eagerly imported vllm.models.deepseek_v4_1.nvidia.model (pulling in tilelang and flashinfer before worker spawn); get_tokenizer reloaded AutoConfig even when model_config.hf_config was already loaded; and the first eager prefill request after startup lazily constructed 59 layers of L2 prefetch device pointer tables (_build_l2_prefetch) and the SP prefill side stream (sp_prefill._side_stream).
+
+Changes:
+- Vectorize _row_deltas (single-pass torch.aminmax on positive scales), SWAR _pack_crumbs / _pack_nibbles, fused encode_expert_scale_codes, and 8-byte int64 tile_expert_weights / pack_weight_tiles / unpack_weight_tiles.
+- Stage only the first 3,072 overlapping rows in pack_bf16_weight(in_place=True) and pack remaining rows directly in place in non-overlapping geometric steps (end = min(out_features, (4 * start) // 3)).
+- Slice wq_b.tilelang_weight[:q_rows * (k_q // TILE_WEIGHT_K)] directly in _trim_padded_groups when tilelang_weight_packed is True.
+- Guard release_device_memory_under_pressure on torch.cuda.memory_reserved(target_device) > reserved_before.
+- Add an optional per-rank on-disk post-load artifact cache (vllm/models/deepseek_v4_1/tilelang/postload_cache.py) with single-thread background atomic staging writes (*.tmp.<pid> -> os.replace, >=8 GiB free disk guard, dead-PID staging cleanup, loading_done() barrier) and cached direct reads with 4-slice (first, first+1, last, per-boot random) byte-for-byte spot verification before in-place mutation.
+- Make vllm/models/deepseek_v41/__init__.py and vl_model.py lazy, pass config=model_config.hf_config into get_tokenizer for TokenizersBackend subclasses, and warm _build_l2_prefetch() and sp_prefill._side_stream() during DeepseekV4Model.declare_kernels().
+
+Quality:
+100% bit-identical (torch.equal) packed BF16 weights, exception tables, MoE tiled weights, UE8M0 scale codes, trimmed wq_b weights, and model outputs.
+
+Tests:
+- pytest tests/kernels/test_deepseek_v41_postload_startup.py tests/kernels/quantization/test_deepseek_v41_expert_scale_codes.py tests/tokenizers_/test_deepseek_v41.py tests/v1/attention/test_sparse_indexer_decode_seq_lens.py (170 passed across 2 boots).
+
+Upstream status: local startup and post-load optimization for DeepSeek-V4.1 on GB10.
+---
+ .../test_deepseek_v41_postload_startup.py     |  357 ++++++
+ .../layers/quantization/online/packed_bf16.py |    4 +-
+ vllm/model_executor/model_loader/utils.py     |  117 +-
+ vllm/models/deepseek_v41/__init__.py          |   33 +-
+ vllm/models/deepseek_v41/nvidia/vl_model.py   |   19 +-
+ vllm/models/deepseek_v4_1/attention.py        |   48 +-
+ vllm/models/deepseek_v4_1/nvidia/model.py     |   11 +-
+ vllm/models/deepseek_v4_1/nvidia/vl_model.py  |   29 +-
+ .../deepseek_v4_1/tilelang/embedding.py       |    2 +-
+ vllm/models/deepseek_v4_1/tilelang/gemm.py    |   22 +
+ vllm/models/deepseek_v4_1/tilelang/linear.py  |    2 +-
+ vllm/models/deepseek_v4_1/tilelang/moe.py     |   41 +-
+ .../deepseek_v4_1/tilelang/postload_cache.py  | 1010 +++++++++++++++++
+ .../deepseek_v4_1/tilelang/scale_codes.py     |  162 ++-
+ vllm/models/deepseek_v4_1/tilelang/vocab.py   |   53 +-
+ vllm/tokenizers/registry.py                   |   17 +-
+ 16 files changed, 1793 insertions(+), 134 deletions(-)
+ create mode 100644 tests/kernels/test_deepseek_v41_postload_startup.py
+ create mode 100644 vllm/models/deepseek_v4_1/tilelang/postload_cache.py
+
+diff --git a/tests/kernels/test_deepseek_v41_postload_startup.py b/tests/kernels/test_deepseek_v41_postload_startup.py
+new file mode 100644
+index 000000000..0372b3bcc
+--- /dev/null
++++ b/tests/kernels/test_deepseek_v41_postload_startup.py
+@@ -0,0 +1,357 @@
++# SPDX-License-Identifier: Apache-2.0
++# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
++"""Tests for DeepSeek-V4.1 post-load weight preparation, on-disk cache, and startup optimizations."""
++
++from __future__ import annotations
++
++from collections import namedtuple
++import os
++from pathlib import Path
++import subprocess
++import sys
++
++import pytest
++import torch
++
++from vllm.models.deepseek_v4_1.tilelang.gemm import (
++    TILE_WEIGHT_K,
++    TILE_WEIGHT_N,
++    pack_weight_tiles,
++    unpack_weight_tiles,
++)
++from vllm.models.deepseek_v4_1.tilelang.postload_cache import (
++    MIN_FREE_DISK_BYTES,
++    _HEADER_STRUCT,
++    cleanup_dead_pid_staging_files,
++    get_postload_cache_stats,
++    loading_done,
++    postload_cache_context,
++    reset_postload_cache_stats,
++    spot_check_indices,
++)
++from vllm.models.deepseek_v4_1.tilelang.scale_codes import (
++    _pack_crumbs,
++    _pack_nibbles,
++    encode_expert_scale_codes,
++    narrow_code_offsets,
++    overlay_byte_codes,
++    pack_expert_scale_codes,
++    tile_byte_codes,
++)
++
++
++def _legacy_encode_expert_scale_codes(
++    exponents: torch.Tensor, block_N: int = 128
++) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
++    packed = pack_expert_scale_codes(exponents)
++    e, n, words = packed.codes.shape
++    tiled_4bit = (
++        packed.codes.view(torch.int16)
++        .view(e, n // block_N, block_N, words)
++        .permute(0, 1, 3, 2)
++        .reshape(-1, block_N)
++        .contiguous()
++        .view(torch.uint16)
++    )
++    tiled_2bit = tile_byte_codes(packed.codes_2bit, block_N)
++    codes, codes_2bit = overlay_byte_codes(tiled_4bit, tiled_2bit, packed.narrow)
++    return codes, codes_2bit, narrow_code_offsets(packed.narrow), packed.base
++
++
++def test_swar_pack_crumbs_and_nibbles_exhaustive():
++    vals4 = torch.arange(4, dtype=torch.uint8)
++    grid4 = torch.cartesian_prod(vals4, vals4, vals4, vals4).contiguous()
++    ref_crumbs = (
++        grid4[:, 0] | (grid4[:, 1] << 2) | (grid4[:, 2] << 4) | (grid4[:, 3] << 6)
++    ).to(torch.uint8)
++    assert torch.equal(_pack_crumbs(grid4), ref_crumbs)
++
++    vals16 = torch.arange(16, dtype=torch.uint8)
++    grid16 = torch.cartesian_prod(vals16, vals16, vals16, vals16).contiguous()
++    lo = (grid16[:, 0] | (grid16[:, 1] << 4)).to(torch.int16)
++    hi = (grid16[:, 2] | (grid16[:, 3] << 4)).to(torch.int16)
++    ref_nibbles = (lo | (hi << 8)).view(torch.uint16)
++    assert torch.equal(_pack_nibbles(grid16), ref_nibbles)
++
++
++@pytest.mark.parametrize("mode", ["all_narrow", "mixed", "all_wide", "zero_padded"])
++def test_encode_expert_scale_codes_matches_legacy(mode: str):
++    torch.manual_seed(42)
++    device = "cuda" if torch.cuda.is_available() else "cpu"
++    e, n, k_scales = 32, 256, 56
++    base = torch.randint(115, 128, (e, n, 1), dtype=torch.uint8, device=device)
++    if mode == "all_narrow":
++        deltas = torch.randint(0, 4, (e, n, k_scales), dtype=torch.uint8, device=device)
++        scales = base + deltas
++    elif mode == "all_wide":
++        deltas = torch.randint(0, 12, (e, n, k_scales), dtype=torch.uint8, device=device)
++        deltas[:, 0, 0] = 9
++        scales = base + deltas
++    elif mode == "mixed":
++        deltas = torch.randint(0, 4, (e, n, k_scales), dtype=torch.uint8, device=device)
++        deltas[::3, 0, 0] = 11
++        scales = base + deltas
++    else:
++        deltas = torch.randint(0, 4, (e, n, k_scales), dtype=torch.uint8, device=device)
++        deltas[5, 0, 0] = 8
++        scales = base + deltas
++        scales[:, :, -8:] = 0
++
++    ref_codes, ref_2bit, ref_narrow, ref_base = _legacy_encode_expert_scale_codes(
++        scales, 128
++    )
++    codes, codes_2bit, narrow, out_base = encode_expert_scale_codes(
++        scales, 128, use_cache=False
++    )
++    assert torch.equal(codes, ref_codes)
++    assert torch.equal(codes_2bit, ref_2bit)
++    assert torch.equal(narrow, ref_narrow)
++    assert torch.equal(out_base, ref_base)
++
++
++def test_pack_weight_tiles_and_direct_prefix_slice():
++    torch.manual_seed(7)
++    device = "cuda" if torch.cuda.is_available() else "cpu"
++    n, q_rows, k = 1024, 640, 512
++    raw = torch.randint(0, 256, (n, k), dtype=torch.uint8, device=device).view(
++        torch.float8_e4m3fn
++    )
++    packed = pack_weight_tiles(raw)
++    ref_packed = (
++        raw.reshape(n // TILE_WEIGHT_N, TILE_WEIGHT_N, k // TILE_WEIGHT_K, TILE_WEIGHT_K)
++        .permute(0, 2, 1, 3)
++        .contiguous()
++        .view(n * (k // TILE_WEIGHT_K), TILE_WEIGHT_K)
++    )
++    assert torch.equal(packed.view(torch.uint8), ref_packed.view(torch.uint8))
++    unpacked = unpack_weight_tiles(packed, n, k)
++    assert torch.equal(unpacked.view(torch.uint8), raw.view(torch.uint8))
++
++    # Direct packed slice for trimmed group rows (TP3 rank 2 wq_b optimization)
++    direct_slice = packed[: q_rows * (k // TILE_WEIGHT_K)].contiguous()
++    repacked_slice = pack_weight_tiles(unpacked[:q_rows].contiguous())
++    assert torch.equal(direct_slice.view(torch.uint8), repacked_slice.view(torch.uint8))
++
++
++@pytest.mark.skipif(not torch.cuda.is_available(), reason="Requires CUDA for TileLang")
++def test_pack_bf16_weight_in_place_direct_rows_and_tile_expert_weights():
++    from vllm.models.deepseek_v4_1.tilelang.moe import FP4_TMA_K, tile_expert_weights
++    from vllm.models.deepseek_v4_1.tilelang.vocab import (
++        pack_bf16_weight,
++        unpack_bf16_weight,
++    )
++
++    torch.manual_seed(19)
++    # > 3072 rows exercises the overlap-safe direct write tail in pack_bf16_weight(in_place=True).
++    w = torch.randn(4352, 256, device="cuda", dtype=torch.bfloat16)
++    w[0, 3] = 1e-38
++    w[1024, 17] = -1e-37
++    w[3072, 129] = 1e35
++    w[4351, 255] = -1e35
++
++    ref = pack_bf16_weight(w.clone(), in_place=False, use_cache=False)
++    inp = pack_bf16_weight(w.clone(), in_place=True, use_cache=False)
++    assert inp.exponent_base == ref.exponent_base
++    assert inp.exceptions == ref.exceptions
++    assert torch.equal(inp.values, ref.values)
++    assert torch.equal(inp.row_offsets, ref.row_offsets)
++    assert torch.equal(inp.exception_rows, ref.exception_rows)
++    assert torch.equal(inp.exception_entries, ref.exception_entries)
++    assert torch.equal(
++        unpack_bf16_weight(inp).view(torch.int16), w.view(torch.int16)
++    )
++
++    # tile_expert_weights with and without 64-column tail
++    for half_k in (256, 288):
++        b_packed = torch.randint(
++            -128, 127, (16, 256, half_k), dtype=torch.int8, device="cuda"
++        )
++        tiles, tails = tile_expert_weights(b_packed, 128)
++        k_full, tail = divmod(2 * half_k, FP4_TMA_K)
++        b_view = b_packed.view(16, 2, 128, half_k)
++        ref_tiles = (
++            b_view[..., : k_full * (FP4_TMA_K // 2)]
++            .reshape(16, 2, 128, k_full, FP4_TMA_K // 2)
++            .permute(0, 1, 3, 2, 4)
++            .reshape(-1, 128, FP4_TMA_K // 2)
++            .contiguous()
++        )
++        assert torch.equal(tiles, ref_tiles)
++        if tail:
++            ref_tails = (
++                b_view[..., k_full * (FP4_TMA_K // 2) :]
++                .reshape(-1, 128, tail // 2)
++                .contiguous()
++                .view(torch.uint8)
++            )
++            assert torch.equal(tails, ref_tails)
++        else:
++            assert tails is None
++
++
++@pytest.mark.skipif(not torch.cuda.is_available(), reason="Requires CUDA for TileLang")
++def test_postload_cache_hit_and_spot_check_corruption_detection(tmp_path: Path):
++    from vllm.models.deepseek_v4_1.tilelang.vocab import pack_bf16_weight
++
++    ckpt_file = tmp_path / "model.safetensors"
++    ckpt_file.write_bytes(b"checkpoint-header-placeholder")
++    cache_dir = tmp_path / "postload_cache"
++
++    torch.manual_seed(99)
++    w = torch.randn(512, 256, device="cuda", dtype=torch.bfloat16)
++    w[0, 11] = 1e-38
++    w[1, 77] = -1e-38
++    w[511, 200] = 1e35
++
++    scales = torch.randint(118, 122, (24, 256, 56), dtype=torch.uint8, device="cuda")
++    scales[3, 0, 0] = 127
++
++    reset_postload_cache_stats()
++    with postload_cache_context(
++        cache_dir,
++        checkpoint_path=ckpt_file,
++        tp_rank=0,
++        tp_world_size=3,
++        min_free_bytes=1024,
++    ):
++        cold_pack = pack_bf16_weight(w.clone(), in_place=True, cache_tag="lm_head")
++        cold_codes, cold_2bit, cold_narrow, cold_base = encode_expert_scale_codes(
++            scales, 128, cache_tag="layer0.w13"
++        )
++        loading_done()
++
++    stats = get_postload_cache_stats()
++    assert stats.misses == 2
++    assert stats.writes_completed == 2
++    cache_files = sorted(cache_dir.glob("*.bin"))
++    assert len(cache_files) == 2
++
++    # Second start: cache hit with 4-slice spot check
++    with postload_cache_context(
++        cache_dir,
++        checkpoint_path=ckpt_file,
++        tp_rank=0,
++        tp_world_size=3,
++        min_free_bytes=1024,
++    ):
++        warm_pack = pack_bf16_weight(w.clone(), in_place=True, cache_tag="lm_head")
++        warm_codes, warm_2bit, warm_narrow, warm_base = encode_expert_scale_codes(
++            scales, 128, cache_tag="layer0.w13"
++        )
++
++    stats = get_postload_cache_stats()
++    assert stats.hits == 2
++    assert torch.equal(warm_pack.values, cold_pack.values)
++    assert torch.equal(warm_pack.row_offsets, cold_pack.row_offsets)
++    assert torch.equal(warm_pack.exception_rows, cold_pack.exception_rows)
++    assert torch.equal(warm_pack.exception_entries, cold_pack.exception_entries)
++    assert torch.equal(warm_2bit, cold_2bit)
++    assert torch.equal(warm_narrow, cold_narrow)
++    assert torch.equal(warm_base, cold_base)
++
++    # Corrupt 1 byte in the random spot-checked row of pack12 cache and 1 byte in
++    # the random spot-checked expert of moe_scale cache.
++    pack_file = next(cache_dir.glob("pack12_*.bin"))
++    moe_file = next(cache_dir.glob("moe_scale_*.bin"))
++
++    pack_rand_row = spot_check_indices(512)[3]
++    row_width = 256 + 128
++    pack_data = bytearray(pack_file.read_bytes())
++    corrupt_pack_offset = _HEADER_STRUCT.size + pack_rand_row * row_width + 17
++    pack_data[corrupt_pack_offset] ^= 0xFF
++    pack_file.write_bytes(bytes(pack_data))
++
++    moe_rand_expert = spot_check_indices(24)[2]  # last expert
++    moe_data = bytearray(moe_file.read_bytes())
++    # Corrupt 1 byte in the last expert's base row at the end of the file
++    moe_data[-5] ^= 0xFF
++    moe_file.write_bytes(bytes(moe_data))
++
++    with postload_cache_context(
++        cache_dir,
++        checkpoint_path=ckpt_file,
++        tp_rank=0,
++        tp_world_size=3,
++        min_free_bytes=1024,
++    ):
++        recovered_pack = pack_bf16_weight(w.clone(), in_place=True, cache_tag="lm_head")
++        _, recovered_2bit, recovered_narrow, recovered_base = (
++            encode_expert_scale_codes(scales, 128, cache_tag="layer0.w13")
++        )
++        loading_done()
++
++    stats = get_postload_cache_stats()
++    assert stats.corruptions == 2
++    assert torch.equal(recovered_pack.values, cold_pack.values)
++    assert torch.equal(recovered_2bit, cold_2bit)
++    assert torch.equal(recovered_narrow, cold_narrow)
++    assert torch.equal(recovered_base, cold_base)
++    assert moe_rand_expert == 23
++
++
++def test_postload_cache_8gib_free_space_guard_and_dead_pid_cleanup(
++    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
++):
++    cache_dir = tmp_path / "guard_cache"
++    cache_dir.mkdir(parents=True)
++
++    # Create a dead-PID staging file and a live-PID staging file
++    dead_tmp = cache_dir / "pack12_v1_tp0of1_lm_head.bin.tmp.99999999"
++    live_tmp = cache_dir / f"pack12_v1_tp0of1_lm_head.bin.tmp.{os.getpid()}"
++    valid_bin = cache_dir / "keep.bin"
++    dead_tmp.write_bytes(b"partial-dead")
++    live_tmp.write_bytes(b"partial-live")
++    valid_bin.write_bytes(b"valid")
++
++    removed = cleanup_dead_pid_staging_files(cache_dir)
++    assert removed == [dead_tmp]
++    assert not dead_tmp.exists()
++    assert live_tmp.exists()
++    assert valid_bin.exists()
++    live_tmp.unlink()
++
++    # Simulate free disk space just below 8 GiB
++    DiskUsage = namedtuple("usage", ["total", "used", "free"])
++    monkeypatch.setattr(
++        "shutil.disk_usage",
++        lambda _: DiskUsage(
++            total=100 * (1 << 30),
++            used=93 * (1 << 30),
++            free=MIN_FREE_DISK_BYTES - 1,
++        ),
++    )
++
++    reset_postload_cache_stats()
++    device = "cuda" if torch.cuda.is_available() else "cpu"
++    scales = torch.randint(118, 122, (16, 256, 56), dtype=torch.uint8, device=device)
++    with postload_cache_context(
++        cache_dir,
++        tp_rank=0,
++        tp_world_size=1,
++        min_free_bytes=MIN_FREE_DISK_BYTES,
++    ):
++        encode_expert_scale_codes(scales, 128, cache_tag="low_disk_test")
++        loading_done()
++
++    stats = get_postload_cache_stats()
++    assert stats.writes_skipped_low_disk == 1
++    assert stats.writes_completed == 0
++    assert list(cache_dir.glob("moe_scale_*.bin")) == []
++
++
++def test_lazy_deepseek_v41_resolution_avoids_eager_dspark_and_model_import():
++    code = """
++import sys
++import vllm.models.deepseek_v41 as ds41
++cls = ds41.DeepseekV41ForCausalLM
++assert "vllm.models.deepseek_v4_1.nvidia.dspark" not in sys.modules
++assert "vllm.models.deepseek_v4_1.nvidia.model" not in sys.modules
++assert "vllm.models.deepseek_v41.nvidia.model" not in sys.modules
++"""
++    res = subprocess.run(
++        [sys.executable, "-c", code],
++        capture_output=True,
++        text=True,
++        check=False,
++    )
++    assert res.returncode == 0, res.stderr
+diff --git a/vllm/model_executor/layers/quantization/online/packed_bf16.py b/vllm/model_executor/layers/quantization/online/packed_bf16.py
+index d968db77c..f130fa3bc 100644
+--- a/vllm/model_executor/layers/quantization/online/packed_bf16.py
++++ b/vllm/model_executor/layers/quantization/online/packed_bf16.py
+@@ -93,7 +93,7 @@ class PackedBf16LmHeadMethod(QuantizeMethodBase):
+         if self.tilelang:
+             from vllm.models.deepseek_v4_1.tilelang.vocab import pack_bf16_weight
+ 
+-            packed = pack_bf16_weight(weight, in_place=True)
++            packed = pack_bf16_weight(weight, in_place=True, cache_tag="lm_head")
+         else:
+             projection = get_b12x_packed_bf16_vocab_projection()
+             if projection is not None:
+@@ -101,7 +101,7 @@ class PackedBf16LmHeadMethod(QuantizeMethodBase):
+             else:
+                 from vllm.models.deepseek_v4_1.tilelang.vocab import pack_bf16_weight
+ 
+-                packed = pack_bf16_weight(weight, in_place=True)
++                packed = pack_bf16_weight(weight, in_place=True, cache_tag="lm_head")
+         del weight
+         replace_parameter(layer, "weight", packed.values)
+         replace_parameter(layer, "weight_exception_rows", packed.exception_rows)
+diff --git a/vllm/model_executor/model_loader/utils.py b/vllm/model_executor/model_loader/utils.py
+index 11e6be5cf..6a46c4164 100644
+--- a/vllm/model_executor/model_loader/utils.py
++++ b/vllm/model_executor/model_loader/utils.py
+@@ -105,57 +105,78 @@ def process_weights_after_loading(
+     """
+     # Reclaim memory when an explicit lm_head has been
+     # loaded, but it is identical to the input embeddings.
++    from vllm.models.deepseek_v4_1.tilelang.postload_cache import (
++        postload_model_scope,
++        postload_module_scope,
++    )
++
+     maybe_retie_word_embeddings(model, model_config)
++    track_cuda_reserved = (
++        target_device.type == "cuda" and torch.cuda.is_available()
++    )
+ 
+-    for name, module in model.named_modules():
+-        quant_method = getattr(module, "quant_method", None)
+-        if isinstance(quant_method, QuantizeMethodBase):
+-            if (
+-                is_weights_pre_processed()
+-                and not quant_method.supports_pre_processed_weights
+-            ):
+-                raise RuntimeError(
+-                    f"layer {name or '<root>'}: {type(quant_method).__name__} "
+-                    "does not support pre-processed weights"
++    with postload_model_scope(model_config):
++        for name, module in model.named_modules():
++            quant_method = getattr(module, "quant_method", None)
++            if isinstance(quant_method, QuantizeMethodBase):
++                if (
++                    is_weights_pre_processed()
++                    and not quant_method.supports_pre_processed_weights
++                ):
++                    raise RuntimeError(
++                        f"layer {name or '<root>'}: {type(quant_method).__name__} "
++                        "does not support pre-processed weights"
++                    )
++                # When quant methods need to process weights after loading
++                # (for repacking, quantizing, etc), they typically expect parameters
++                # to be on the global target device. This scope is for the
++                # case where cpu offloading is used, where we will move the
++                # parameters onto device for processing and back off after.
++                # Methods that can process weights in place (e.g. PLE scale
++                # validation) set requires_device_loading=False to skip this move.
++                loading_context = (
++                    device_loading_context(module, target_device)
++                    if quant_method.requires_device_loading
++                    else nullcontext()
+                 )
+-            # When quant methods need to process weights after loading
+-            # (for repacking, quantizing, etc), they typically expect parameters
+-            # to be on the global target device. This scope is for the
+-            # case where cpu offloading is used, where we will move the
+-            # parameters onto device for processing and back off after.
+-            # Methods that can process weights in place (e.g. PLE scale
+-            # validation) set requires_device_loading=False to skip this move.
+-            loading_context = (
+-                device_loading_context(module, target_device)
+-                if quant_method.requires_device_loading
+-                else nullcontext()
+-            )
+-            with loading_context:
+-                quant_method.process_weights_after_loading(module)
+-            # process_weights_after_loading may swap in freshly-created
+-            # Parameters (e.g. FP8 requantization), which are stamped with the
+-            # global rank in BasevLLMParameter.__init__. Re-reconcile their TP
+-            # state to the layer so a later weight reload / RL weight-refit
+-            # narrows replicated (disable_tp) weights at the correct offset.
+-            if hasattr(module, "update_param_tp_status"):
+-                module.update_param_tp_status()
+-            # Repacking transients above can leave large amounts of memory in
+-            # the caching allocator, which starves the OS on UMA devices.
+-            release_device_memory_under_pressure(target_device)
+-
+-    # Initialize post-load attention weights for any attention layer and MM
+-    # encoder. NOTE: Happens after other modules so we can easily decompress
+-    # weights.
+-    for _, module in model.named_modules():
+-        if is_deferred_attention_layer(module):
+-            # TODO(lucas): see if there is a way to unify the signatures
+-            # of process_weights_after_loading
+-            with device_loading_context(module, target_device):
+-                module.process_weights_after_loading(model_config.dtype)
+-
+-    # Model-level post-load hook, after the per-layer quant finalize.
+-    if hasattr(model, "process_weights_after_loading"):
+-        model.process_weights_after_loading()
++                reserved_before = (
++                    torch.cuda.memory_reserved(target_device)
++                    if track_cuda_reserved
++                    else 0
++                )
++                with postload_module_scope(name or "<root>"), loading_context:
++                    quant_method.process_weights_after_loading(module)
++                # process_weights_after_loading may swap in freshly-created
++                # Parameters (e.g. FP8 requantization), which are stamped with the
++                # global rank in BasevLLMParameter.__init__. Re-reconcile their TP
++                # state to the layer so a later weight reload / RL weight-refit
++                # narrows replicated (disable_tp) weights at the correct offset.
++                if hasattr(module, "update_param_tp_status"):
++                    module.update_param_tp_status()
++                # Repacking transients above can leave large amounts of memory in
++                # the caching allocator, which starves the OS on UMA devices.
++                if (
++                    not track_cuda_reserved
++                    or torch.cuda.memory_reserved(target_device) > reserved_before
++                ):
++                    release_device_memory_under_pressure(target_device)
++
++        # Initialize post-load attention weights for any attention layer and MM
++        # encoder. NOTE: Happens after other modules so we can easily decompress
++        # weights.
++        for name, module in model.named_modules():
++            if is_deferred_attention_layer(module):
++                # TODO(lucas): see if there is a way to unify the signatures
++                # of process_weights_after_loading
++                with (
++                    postload_module_scope(name or "<root>"),
++                    device_loading_context(module, target_device),
++                ):
++                    module.process_weights_after_loading(model_config.dtype)
++
++        # Model-level post-load hook, after the per-layer quant finalize.
++        if hasattr(model, "process_weights_after_loading"):
++            model.process_weights_after_loading()
+ 
+     # Needed for torchao model reloading via model.reload_weights
+     # @kylesayrs @jerryzh168 this can be removed if callers move to `reload_weights`
+diff --git a/vllm/models/deepseek_v41/__init__.py b/vllm/models/deepseek_v41/__init__.py
+index 6ee561239..c92e9a1c4 100644
+--- a/vllm/models/deepseek_v41/__init__.py
++++ b/vllm/models/deepseek_v41/__init__.py
+@@ -11,23 +11,30 @@ def __getattr__(name):
+     if name not in ("DeepseekV41ForCausalLM", "DSparkDeepseekV4ForCausalLM"):
+         raise AttributeError(name)
+     if current_platform.is_rocm():
++        if name == "DeepseekV41ForCausalLM":
++            from .amd.vl_model import DeepseekV41ForCausalLM
++
++            return DeepseekV41ForCausalLM
+         from .amd.dspark import DSparkDeepseekV4ForCausalLM
+-        from .amd.vl_model import DeepseekV41ForCausalLM
+-    elif current_platform.is_cuda() and current_platform.is_device_capability_family(
++
++        return DSparkDeepseekV4ForCausalLM
++    if current_platform.is_cuda() and current_platform.is_device_capability_family(
+         120
+     ):
+-        from vllm.models.deepseek_v4_1 import (
+-            DeepseekV41ForCausalLM,
+-            DSparkDeepseekV4ForCausalLM,
+-        )
+-    else:
+-        from .nvidia.dspark import DSparkDeepseekV4ForCausalLM
++        if name == "DeepseekV41ForCausalLM":
++            from vllm.models.deepseek_v4_1 import DeepseekV41ForCausalLM
++
++            return DeepseekV41ForCausalLM
++        from vllm.models.deepseek_v4_1 import DSparkDeepseekV4ForCausalLM
++
++        return DSparkDeepseekV4ForCausalLM
++    if name == "DeepseekV41ForCausalLM":
+         from .nvidia.vl_model import DeepseekV41ForCausalLM
+-    return (
+-        DeepseekV41ForCausalLM
+-        if name == "DeepseekV41ForCausalLM"
+-        else DSparkDeepseekV4ForCausalLM
+-    )
++
++        return DeepseekV41ForCausalLM
++    from .nvidia.dspark import DSparkDeepseekV4ForCausalLM
++
++    return DSparkDeepseekV4ForCausalLM
+ 
+ 
+ __all__ = [
+diff --git a/vllm/models/deepseek_v41/nvidia/vl_model.py b/vllm/models/deepseek_v41/nvidia/vl_model.py
+index bfbcaa89a..da235d264 100644
+--- a/vllm/models/deepseek_v41/nvidia/vl_model.py
++++ b/vllm/models/deepseek_v41/nvidia/vl_model.py
+@@ -53,11 +53,16 @@ from ..common.mm_preprocess import (
+     DeepseekV4VLMultiModalProcessor,
+     DeepseekV4VLProcessingInfo,
+ )
+-from .model import (
+-    DeepseekV41LLMForCausalLM,
+-    _linear_scale_param_name,
+-    _make_deepseek_v4_weights_mapper,
+-)
++def __getattr__(name: str):
++    if name in (
++        "DeepseekV41LLMForCausalLM",
++        "_linear_scale_param_name",
++        "_make_deepseek_v4_weights_mapper",
++    ):
++        from . import model as _model
++
++        return getattr(_model, name)
++    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
+ 
+ 
+ class DeepseekV4VLImagePixelInputs(TensorSchema):
+@@ -85,6 +90,8 @@ def _make_deepseek_v4_vl_weights_mapper(
+     expert_dtype: str, linear_scale_name: str
+ ) -> WeightsMapper:
+     """Text-checkpoint mapping rules re-rooted under ``language_model.``."""
++    from .model import _make_deepseek_v4_weights_mapper
++
+     base = _make_deepseek_v4_weights_mapper(expert_dtype, linear_scale_name)
+     orig_to_new_prefix: dict[str, str | None] = {
+         "layers.": "language_model.model.layers.",
+@@ -161,6 +168,8 @@ class DeepseekV41ForCausalLM(nn.Module, SupportsMultiModal, SupportsPP, Supports
+             self.vision.to(dtype=model_config.dtype)
+             self.aligner.to(dtype=model_config.dtype)
+ 
++        from .model import DeepseekV41LLMForCausalLM, _linear_scale_param_name
++
+         with self._mark_language_model(vllm_config):
+             self.language_model = DeepseekV41LLMForCausalLM(
+                 vllm_config=vllm_config,
+diff --git a/vllm/models/deepseek_v4_1/attention.py b/vllm/models/deepseek_v4_1/attention.py
+index cf600a675..8fedce9c8 100644
+--- a/vllm/models/deepseek_v4_1/attention.py
++++ b/vllm/models/deepseek_v4_1/attention.py
+@@ -1852,24 +1852,50 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase):
+         real_heads = real_groups * heads_per_group
+         q_rows = real_heads * self.head_dim
+         wo_rows = real_groups * self.o_lora_rank
+-        from vllm.models.deepseek_v4_1.tilelang.gemm import unpack_weight_tiles
++        from vllm.models.deepseek_v4_1.tilelang.gemm import (
++            TILE_CONTIGUOUS_FP8,
++            TILE_WEIGHT_K,
++            TILE_WEIGHT_N,
++            pack_scale_words,
++            unpack_weight_tiles,
++        )
+         from vllm.models.deepseek_v4_1.tilelang.linear import _block32_scale_words
+ 
+-        if getattr(self.wq_b, "tilelang_weight_packed", False):
+-            w_q = unpack_weight_tiles(
+-                self.wq_b.tilelang_weight, *self.wq_b.weight.shape
+-            )
+-            self.wq_b.tilelang_weight_packed = False
+-        else:
+-            w_q = self.wq_b.weight
+-        self.wq_b.weight = nn.Parameter(w_q[:q_rows].contiguous(), requires_grad=False)
++        k_q = int(self.wq_b.weight.shape[1])
+         self.wq_b.weight_scale_inv = nn.Parameter(
+             self.wq_b.weight_scale_inv[: q_rows // 32].contiguous(),
+             requires_grad=False,
+         )
+         self.wq_b.output_size_per_partition = q_rows
+-        if hasattr(self.wq_b, "tilelang_weight_sf"):
+-            _block32_scale_words(self.wq_b)
++        if (
++            getattr(self.wq_b, "tilelang_weight_packed", False)
++            and q_rows % TILE_WEIGHT_N == 0
++            and (q_rows, k_q) in TILE_CONTIGUOUS_FP8
++        ):
++            packed_q = self.wq_b.tilelang_weight[
++                : q_rows * (k_q // TILE_WEIGHT_K)
++            ].contiguous()
++            self.wq_b.weight = nn.Parameter(
++                packed_q.view(q_rows, k_q), requires_grad=False
++            )
++            self.wq_b.tilelang_weight = packed_q
++            if hasattr(self.wq_b, "tilelang_weight_sf"):
++                self.wq_b.tilelang_weight_sf = pack_scale_words(
++                    self.wq_b.weight_scale_inv
++                )
++        else:
++            if getattr(self.wq_b, "tilelang_weight_packed", False):
++                w_q = unpack_weight_tiles(
++                    self.wq_b.tilelang_weight, *self.wq_b.weight.shape
++                )
++                self.wq_b.tilelang_weight_packed = False
++            else:
++                w_q = self.wq_b.weight
++            self.wq_b.weight = nn.Parameter(
++                w_q[:q_rows].contiguous(), requires_grad=False
++            )
++            if hasattr(self.wq_b, "tilelang_weight_sf"):
++                _block32_scale_words(self.wq_b)
+ 
+         self.attn_sink = nn.Parameter(
+             self.attn_sink[:real_heads].contiguous(), requires_grad=False
+diff --git a/vllm/models/deepseek_v4_1/nvidia/model.py b/vllm/models/deepseek_v4_1/nvidia/model.py
+index b5baa9f0a..aede665ba 100644
+--- a/vllm/models/deepseek_v4_1/nvidia/model.py
++++ b/vllm/models/deepseek_v4_1/nvidia/model.py
+@@ -784,6 +784,14 @@ class DeepseekV4Model(nn.Module, EagleModelMixin):
+             if self._sink_columns is not None
+             else []
+         )
++        def _warm_model_runtime() -> None:
++            if l2_prefetch.ENABLED and not self._l2pf_ready:
++                self._build_l2_prefetch()
++            if self.prefill_sp_min_rows and torch.cuda.is_available():
++                first_param = next(self.parameters(), None)
++                if first_param is not None and first_param.is_cuda:
++                    sp_prefill._side_stream(first_param.device)
++
+         prepare.declare(
+             lambda: [
+                 *collectives.rank_order_sum_calls(),
+@@ -792,7 +800,8 @@ class DeepseekV4Model(nn.Module, EagleModelMixin):
+                 prepare.call(columns.zero_packs_kernel),
+                 *l2_prefetch.kernel_calls(),
+                 *collapse,
+-            ]
++            ],
++            warm=_warm_model_runtime,
+         )
+ 
+     def _build_l2_prefetch(self) -> None:
+diff --git a/vllm/models/deepseek_v4_1/nvidia/vl_model.py b/vllm/models/deepseek_v4_1/nvidia/vl_model.py
+index 3b842f69c..b49619780 100644
+--- a/vllm/models/deepseek_v4_1/nvidia/vl_model.py
++++ b/vllm/models/deepseek_v4_1/nvidia/vl_model.py
+@@ -36,12 +36,20 @@ from vllm.models.deepseek_v41.nvidia.vl_model import (
+ from vllm.multimodal import MULTIMODAL_REGISTRY
+ from vllm.utils.torch_utils import async_tensor_h2d
+ 
+-from ..tilelang import ced as ced_kernels
+-from ..tilelang import prepare
+-from .model import (
+-    DeepseekV41LLMForCausalLM,
+-    _linear_scale_param_name,
+-)
++def __getattr__(name: str):
++    if name in ("DeepseekV41LLMForCausalLM", "_linear_scale_param_name"):
++        from . import model as _model
++
++        return getattr(_model, name)
++    if name == "ced_kernels":
++        from ..tilelang import ced as _ced
++
++        return _ced
++    if name == "prepare":
++        from ..tilelang import prepare as _prepare
++
++        return _prepare
++    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
+ 
+ 
+ def _vision_tower():
+@@ -114,6 +122,8 @@ class DeepseekV41ForCausalLM(UpstreamDeepseekV41ForCausalLM):
+                 torch.empty(config.hidden_size, dtype=torch.float32)
+             )
+ 
++        from .model import DeepseekV41LLMForCausalLM, _linear_scale_param_name
++
+         with self._mark_language_model(vllm_config):
+             self.language_model = DeepseekV41LLMForCausalLM(
+                 vllm_config=vllm_config,
+@@ -192,6 +202,8 @@ class DeepseekV41ForCausalLM(UpstreamDeepseekV41ForCausalLM):
+                 f"{image_embeds.shape[0]} aligner rows for {len(image_slots)} image "
+                 "slots"
+             )
++        from ..tilelang import ced as ced_kernels
++
+         device = image_embeds.device
+         span = image_embeds.new_empty(len(kinds), image_embeds.shape[-1])
+         ced_kernels.copy_rows(
+@@ -236,6 +248,8 @@ class DeepseekV41ForCausalLM(UpstreamDeepseekV41ForCausalLM):
+                 f"{sum(span.shape[0] for span in spans)} image embeddings for "
+                 f"{len(slots)} placeholders"
+             )
++        from ..tilelang import ced as ced_kernels
++
+         offset = 0
+         for span in spans:
+             if span.dim() != 2 or span.dtype != inputs_embeds.dtype:
+@@ -257,6 +271,9 @@ class DeepseekV41ForCausalLM(UpstreamDeepseekV41ForCausalLM):
+     def declare_kernels(self) -> None:
+         """Declare the image path's row copies: the span's delimiter gather and image
+         scatter, and the spans' scatter into the embeddings."""
++        from ..tilelang import ced as ced_kernels
++        from ..tilelang import prepare
++
+         hidden = self.config.hidden_size
+         key = (str(self.embed_dtype).removeprefix("torch."), (hidden,))
+         prepare.declare(
+diff --git a/vllm/models/deepseek_v4_1/tilelang/embedding.py b/vllm/models/deepseek_v4_1/tilelang/embedding.py
+index b21e80051..b121ba209 100644
+--- a/vllm/models/deepseek_v4_1/tilelang/embedding.py
++++ b/vllm/models/deepseek_v4_1/tilelang/embedding.py
+@@ -551,7 +551,7 @@ class TileLangEmbeddingMethod(UnquantizedEmbeddingMethod):
+ 
+         data = weight.data
+         in_features = int(data.shape[1])
+-        packed = pack_bf16_weight(data, in_place=True)
++        packed = pack_bf16_weight(data, in_place=True, cache_tag="embed_tokens")
+         del data
+         replace_parameter(layer, "weight", packed.values)
+         replace_parameter(layer, "weight_exception_rows", packed.exception_rows)
+diff --git a/vllm/models/deepseek_v4_1/tilelang/gemm.py b/vllm/models/deepseek_v4_1/tilelang/gemm.py
+index c2443adcb..ffb13d7f3 100644
+--- a/vllm/models/deepseek_v4_1/tilelang/gemm.py
++++ b/vllm/models/deepseek_v4_1/tilelang/gemm.py
+@@ -50,6 +50,17 @@ def pack_weight_tiles(
+         raise ValueError(
+             f"weight shape {(n, k)} must be divisible by tile {(tile_n, tile_k)}"
+         )
++    tile_bytes = tile_k * weight.element_size()
++    if tile_bytes % 8 == 0 and weight.is_contiguous():
++        words = tile_bytes // 8
++        return (
++            weight.view(torch.int64)
++            .reshape(n // tile_n, tile_n, k // tile_k, words)
++            .permute(0, 2, 1, 3)
++            .contiguous()
++            .view(weight.dtype)
++            .view(n * (k // tile_k), tile_k)
++        )
+     return (
+         weight.reshape(n // tile_n, tile_n, k // tile_k, tile_k)
+         .permute(0, 2, 1, 3)
+@@ -66,6 +77,17 @@ def unpack_weight_tiles(
+     tile_k: int = TILE_WEIGHT_K,
+ ) -> torch.Tensor:
+     """Inverse of ``pack_weight_tiles``: restore row-major ``[N, K]`` FP8 weight."""
++    tile_bytes = tile_k * packed.element_size()
++    if tile_bytes % 8 == 0 and packed.is_contiguous():
++        words = tile_bytes // 8
++        return (
++            packed.view(torch.int64)
++            .reshape(n // tile_n, k // tile_k, tile_n, words)
++            .permute(0, 2, 1, 3)
++            .contiguous()
++            .view(packed.dtype)
++            .view(n, k)
++        )
+     return (
+         packed.reshape(n // tile_n, k // tile_k, tile_n, tile_k)
+         .permute(0, 2, 1, 3)
+diff --git a/vllm/models/deepseek_v4_1/tilelang/linear.py b/vllm/models/deepseek_v4_1/tilelang/linear.py
+index 0b14d7bba..a71c48788 100644
+--- a/vllm/models/deepseek_v4_1/tilelang/linear.py
++++ b/vllm/models/deepseek_v4_1/tilelang/linear.py
+@@ -1062,7 +1062,7 @@ def pack_bf16_layer(layer: nn.Module, shards: int) -> None:
+     n, k = map(int, weight.shape)
+     if n == 0 or k == 0 or k % GROUP or (k // GROUP) % shards:
+         return
+-    packed = pack_bf16_weight(weight, in_place=True)
++    packed = pack_bf16_weight(weight, in_place=True, cache_tag="split_bf16")
+     layer.weight.data = packed.values
+     layer.packed_bf16_in_features = k
+     layer.packed_bf16_exponent_base = packed.exponent_base
+diff --git a/vllm/models/deepseek_v4_1/tilelang/moe.py b/vllm/models/deepseek_v4_1/tilelang/moe.py
+index b12b53a35..2b4a2d550 100644
+--- a/vllm/models/deepseek_v4_1/tilelang/moe.py
++++ b/vllm/models/deepseek_v4_1/tilelang/moe.py
+@@ -56,6 +56,7 @@ from .gemm import (
+ )
+ from .linear import MXFP8Rows, _calls, _launch
+ from .scale_codes import (
++    encode_expert_scale_codes,
+     narrow_code_offsets,
+     overlay_byte_codes,
+     pack_expert_scale_codes,
+@@ -1143,12 +1144,23 @@ def tile_expert_weights(b_packed, block_N):
+     k_full, tail = divmod(2 * half_k, FP4_TMA_K)
+     b = b_packed.view(E, N // block_N, block_N, half_k)
+     full = b[..., : k_full * FP4_TMA_K // 2]
+-    tiles = (
+-        full.reshape(E, N // block_N, block_N, k_full, FP4_TMA_K // 2)
+-        .permute(0, 1, 3, 2, 4)
+-        .reshape(-1, block_N, FP4_TMA_K // 2)
+-        .contiguous()
+-    )
++    slab_bytes = FP4_TMA_K // 2
++    if slab_bytes % 8 == 0 and full.is_contiguous():
++        tiles = (
++            full.view(torch.int64)
++            .reshape(E, N // block_N, block_N, k_full, slab_bytes // 8)
++            .permute(0, 1, 3, 2, 4)
++            .contiguous()
++            .view(b_packed.dtype)
++            .reshape(-1, block_N, slab_bytes)
++        )
++    else:
++        tiles = (
++            full.reshape(E, N // block_N, block_N, k_full, slab_bytes)
++            .permute(0, 1, 3, 2, 4)
++            .reshape(-1, block_N, slab_bytes)
++            .contiguous()
++        )
+     if not tail:
+         return tiles, None
+     tails = b[..., k_full * FP4_TMA_K // 2 :].reshape(-1, block_N, tail // 2)
+@@ -1648,18 +1660,15 @@ class MoeExpertsV41Plan:
+ 
+         prepare.declare(calls, bind=bind)
+ 
+-    def prepare_weight(self, w, scale):
+-        """One GEMM's ``(tiles, tails, codes, codes_2bit, narrow, base)``."""
+-        packed = pack_expert_scale_codes(scale)
+-        narrow, base = packed.narrow, packed.base
+-        codes, codes_2bit = overlay_byte_codes(
+-            tile_codes(packed.codes, self.block_N),
+-            tile_byte_codes(packed.codes_2bit, self.block_N),
+-            narrow,
++    def prepare_weight(self, w, scale, *, cache_tag: str | None = None):
++        """One GEMM's ``(tiles, tails, codes, codes_2bit, narrow, base)``
++        in ``overlay_byte_codes(tile_codes(...), tile_byte_codes(...), narrow)``
++        and ``narrow_code_offsets(narrow)`` layout."""
++        codes, codes_2bit, narrow_offsets, base = encode_expert_scale_codes(
++            scale, self.block_N, cache_tag=cache_tag
+         )
+-        del packed
+         tiles, tails = tile_expert_weights(w.view(torch.int8), self.block_N)
+-        return tiles, tails, codes, codes_2bit, narrow_code_offsets(narrow), base
++        return tiles, tails, codes, codes_2bit, narrow_offsets, base
+ 
+     def prepare_weights(self, w13, w13_scale, w2, w2_scale):
+         """Per GEMM ``(tiles, tails, codes, codes_2bit, narrow, base)``.
+diff --git a/vllm/models/deepseek_v4_1/tilelang/postload_cache.py b/vllm/models/deepseek_v4_1/tilelang/postload_cache.py
+new file mode 100644
+index 000000000..20ee3a756
+--- /dev/null
++++ b/vllm/models/deepseek_v4_1/tilelang/postload_cache.py
+@@ -0,0 +1,1010 @@
++# SPDX-License-Identifier: Apache-2.0
++# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
++"""Per-rank on-disk cache for post-load weight artifacts (12-bit BF16 packs and MoE scale codes).
++
++First start writes prepared buffers asynchronously on a single background thread
++into a PID-scoped staging file (``*.tmp.<pid>``) and publishes them atomically via
++``os.replace`` when free disk space is at least 8 GiB. ``loading_done()`` joins the
++background writer at the end of model post-load processing.
++
++Cached starts read the prepared buffer directly from disk and verify integrity
++without hashing the full tensor by recomputing the reference transform on four
++slices (``first``, ``first + 1``, ``last``, and one per-boot random index) from the
++loaded checkpoint tensor and comparing them byte-for-byte before mutating weights
++in place. Any mismatch or I/O error falls back to full post-load computation and
++replaces the cache entry.
++"""
++
++from __future__ import annotations
++
++from collections.abc import Callable, Iterator, Sequence
++from concurrent.futures import Future, ThreadPoolExecutor
++from contextlib import contextmanager
++from dataclasses import dataclass
++import errno
++import hashlib
++import mmap
++import os
++from pathlib import Path
++import random
++import re
++import shutil
++import struct
++import threading
++from typing import Any
++
++import torch
++
++from vllm.logger import init_logger
++
++logger = init_logger(__name__)
++
++FORMAT_VERSION = 1
++MIN_FREE_DISK_BYTES = 8 * (1 << 30)  # 8 GiB free disk space guard
++PACK12_MAGIC = b"DS41PK12"
++MOE_SCALE_MAGIC = b"DS41MOSC"
++_HEADER_STRUCT = struct.Struct("<8sIIIIIIQQ")
++_TMP_PID_RE = re.compile(r"^.+\.tmp\.(\d+)$")
++_SAFE_TAG_RE = re.compile(r"[^A-Za-z0-9_.-]+")
++
++# Seeded once per process boot so the random slice index is fixed within a boot
++# and varies across boots.
++_BOOT_RNG = random.Random(int.from_bytes(os.urandom(8), "little"))
++_BOOT_RANDOM_INDICES: dict[int, int] = {}
++_BOOT_RNG_LOCK = threading.Lock()
++
++
++@dataclass
++class PostloadCacheStats:
++    """Counters for observability and unit tests."""
++
++    hits: int = 0
++    misses: int = 0
++    corruptions: int = 0
++    writes_completed: int = 0
++    writes_skipped_low_disk: int = 0
++    dead_staging_cleaned: int = 0
++
++
++@dataclass
++class _CacheConfig:
++    cache_dir: Path | None = None
++    checkpoint_path: Path | None = None
++    tp_rank: int | None = None
++    tp_world_size: int | None = None
++    min_free_bytes: int = MIN_FREE_DISK_BYTES
++
++
++_STATE_LOCK = threading.Lock()
++_CONFIG = _CacheConfig()
++_STATS = PostloadCacheStats()
++_CleanedDirs: set[Path] = set()
++_MODULE_STACK: list[str] = []
++_CALL_COUNTERS: dict[str, int] = {}
++_CKPT_FP_CACHE: dict[str, list[tuple[str, int, int]]] = {}
++_WRITER_EXECUTOR: ThreadPoolExecutor | None = None
++_PENDING_FUTURES: list[Future[None]] = []
++_BG_COPY_STREAM: torch.cuda.Stream | None = None
++_READ_SCRATCH: torch.Tensor | None = None
++
++
++def get_postload_cache_stats() -> PostloadCacheStats:
++    return _STATS
++
++
++def reset_postload_cache_stats() -> None:
++    global _STATS
++    with _STATE_LOCK:
++        _STATS = PostloadCacheStats()
++
++
++def reset_postload_cache_counter() -> None:
++    with _STATE_LOCK:
++        _CALL_COUNTERS.clear()
++
++
++def _is_pid_alive(pid: int) -> bool:
++    if pid <= 0:
++        return False
++    if pid == os.getpid():
++        return True
++    try:
++        os.kill(pid, 0)
++    except ProcessLookupError:
++        return False
++    except PermissionError:
++        return True
++    except OSError as exc:
++        if exc.errno == errno.ESRCH:
++            return False
++        return True
++    return True
++
++
++def cleanup_dead_pid_staging_files(cache_dir: str | Path) -> list[Path]:
++    """Remove ``*.tmp.<pid>`` staging files left behind by dead processes."""
++    directory = Path(cache_dir)
++    if not directory.is_dir():
++        return []
++    removed: list[Path] = []
++    try:
++        entries = list(directory.iterdir())
++    except OSError:
++        return []
++    for entry in entries:
++        match = _TMP_PID_RE.match(entry.name)
++        if match is None:
++            continue
++        pid = int(match.group(1))
++        if not _is_pid_alive(pid):
++            try:
++                entry.unlink()
++                removed.append(entry)
++                with _STATE_LOCK:
++                    _STATS.dead_staging_cleaned += 1
++            except FileNotFoundError:
++                pass
++            except OSError as exc:
++                logger.debug("Failed to unlink dead staging file %s: %s", entry, exc)
++    return removed
++
++
++def has_sufficient_disk_space(
++    cache_dir: str | Path, min_free_bytes: int | None = None
++) -> bool:
++    """Return whether ``cache_dir`` has at least ``min_free_bytes`` (default 8 GiB) free."""
++    threshold = _CONFIG.min_free_bytes if min_free_bytes is None else min_free_bytes
++    directory = Path(cache_dir)
++    target = directory if directory.exists() else directory.parent
++    try:
++        usage = shutil.disk_usage(target)
++    except OSError:
++        return False
++    return int(usage.free) >= int(threshold)
++
++
++def spot_check_indices(n: int) -> tuple[int, int, int, int]:
++    """Return ``(first, first + 1, last, random_per_boot)`` slice indices in ``0..n - 1``."""
++    if n <= 0:
++        raise ValueError(f"spot_check_indices requires n >= 1, got {n}")
++    first = 0
++    second = min(1, n - 1)
++    last = n - 1
++    with _BOOT_RNG_LOCK:
++        rand_idx = _BOOT_RANDOM_INDICES.get(n)
++        if rand_idx is None:
++            if n > 3:
++                rand_idx = _BOOT_RNG.randrange(2, n - 1)
++            else:
++                rand_idx = _BOOT_RNG.randrange(0, n)
++            _BOOT_RANDOM_INDICES[n] = rand_idx
++    return (first, second, last, rand_idx)
++
++
++def configure_postload_cache(
++    cache_dir: str | Path | None,
++    *,
++    checkpoint_path: str | Path | None = None,
++    tp_rank: int | None = None,
++    tp_world_size: int | None = None,
++    min_free_bytes: int = MIN_FREE_DISK_BYTES,
++) -> None:
++    """Configure the per-rank on-disk post-load artifact cache."""
++    resolved_dir = Path(cache_dir) if cache_dir else None
++    resolved_ckpt = Path(checkpoint_path) if checkpoint_path else None
++    with _STATE_LOCK:
++        _CONFIG.cache_dir = resolved_dir
++        _CONFIG.checkpoint_path = resolved_ckpt
++        _CONFIG.tp_rank = tp_rank
++        _CONFIG.tp_world_size = tp_world_size
++        _CONFIG.min_free_bytes = min_free_bytes
++        _CALL_COUNTERS.clear()
++        _CKPT_FP_CACHE.clear()
++    if resolved_dir is not None:
++        resolved_dir.mkdir(parents=True, exist_ok=True)
++        cleanup_dead_pid_staging_files(resolved_dir)
++
++
++@contextmanager
++def postload_cache_context(
++    cache_dir: str | Path | None,
++    *,
++    checkpoint_path: str | Path | None = None,
++    tp_rank: int | None = None,
++    tp_world_size: int | None = None,
++    min_free_bytes: int = MIN_FREE_DISK_BYTES,
++) -> Iterator[None]:
++    prev = _CacheConfig(
++        cache_dir=_CONFIG.cache_dir,
++        checkpoint_path=_CONFIG.checkpoint_path,
++        tp_rank=_CONFIG.tp_rank,
++        tp_world_size=_CONFIG.tp_world_size,
++        min_free_bytes=_CONFIG.min_free_bytes,
++    )
++    configure_postload_cache(
++        cache_dir,
++        checkpoint_path=checkpoint_path,
++        tp_rank=tp_rank,
++        tp_world_size=tp_world_size,
++        min_free_bytes=min_free_bytes,
++    )
++    try:
++        yield
++    finally:
++        loading_done()
++        with _STATE_LOCK:
++            _CONFIG.cache_dir = prev.cache_dir
++            _CONFIG.checkpoint_path = prev.checkpoint_path
++            _CONFIG.tp_rank = prev.tp_rank
++            _CONFIG.tp_world_size = prev.tp_world_size
++            _CONFIG.min_free_bytes = prev.min_free_bytes
++            _CALL_COUNTERS.clear()
++            _CKPT_FP_CACHE.clear()
++
++
++@contextmanager
++def postload_model_scope(model_config: Any | None = None) -> Iterator[None]:
++    """Scope around ``process_weights_after_loading`` that sets checkpoint identity
++    and flushes background writes at exit."""
++    reset_postload_cache_counter()
++    prev_ckpt = _CONFIG.checkpoint_path
++    model_path = getattr(model_config, "model", None) if model_config is not None else None
++    if _CONFIG.checkpoint_path is None and model_path:
++        candidate = Path(str(model_path))
++        if candidate.exists():
++            with _STATE_LOCK:
++                _CONFIG.checkpoint_path = candidate
++                _CKPT_FP_CACHE.clear()
++    cache_dir = get_postload_cache_dir()
++    if cache_dir is not None and cache_dir not in _CleanedDirs:
++        cache_dir.mkdir(parents=True, exist_ok=True)
++        cleanup_dead_pid_staging_files(cache_dir)
++        _CleanedDirs.add(cache_dir)
++    try:
++        yield
++    finally:
++        loading_done()
++        with _STATE_LOCK:
++            _CONFIG.checkpoint_path = prev_ckpt
++            _CALL_COUNTERS.clear()
++            _CKPT_FP_CACHE.clear()
++
++
++@contextmanager
++def postload_module_scope(module_name: str) -> Iterator[None]:
++    """Bind the active module name for post-load cache key disambiguation."""
++    _MODULE_STACK.append(module_name)
++    try:
++        yield
++    finally:
++        _MODULE_STACK.pop()
++
++
++def get_postload_cache_dir() -> Path | None:
++    if _CONFIG.cache_dir is not None:
++        return _CONFIG.cache_dir
++    env_dir = os.environ.get("VLLM_POSTLOAD_CACHE_DIR") or os.environ.get(
++        "SPARK_DS41F_POSTLOAD_CACHE_DIR"
++    )
++    if not env_dir:
++        return None
++    return Path(env_dir)
++
++
++def _resolve_tp_identity() -> tuple[int, int]:
++    if _CONFIG.tp_rank is not None and _CONFIG.tp_world_size is not None:
++        return int(_CONFIG.tp_rank), int(_CONFIG.tp_world_size)
++    try:
++        from vllm.distributed import (
++            get_tensor_model_parallel_rank,
++            get_tensor_model_parallel_world_size,
++            model_parallel_is_initialized,
++        )
++
++        if model_parallel_is_initialized():
++            rank = (
++                int(_CONFIG.tp_rank)
++                if _CONFIG.tp_rank is not None
++                else int(get_tensor_model_parallel_rank())
++            )
++            world = (
++                int(_CONFIG.tp_world_size)
++                if _CONFIG.tp_world_size is not None
++                else int(get_tensor_model_parallel_world_size())
++            )
++            return rank, world
++    except Exception:
++        pass
++    return (
++        int(_CONFIG.tp_rank) if _CONFIG.tp_rank is not None else 0,
++        int(_CONFIG.tp_world_size) if _CONFIG.tp_world_size is not None else 1,
++    )
++
++
++def _checkpoint_fingerprint() -> list[tuple[str, int, int]]:
++    ckpt = _CONFIG.checkpoint_path
++    if ckpt is None:
++        env_ckpt = os.environ.get("VLLM_POSTLOAD_CHECKPOINT_PATH")
++        if env_ckpt:
++            ckpt = Path(env_ckpt)
++    if ckpt is None or not ckpt.exists():
++        return []
++    key = str(ckpt)
++    try:
++        dir_st = ckpt.stat()
++        cache_key = f"{key}:{dir_st.st_mtime_ns}:{dir_st.st_size}"
++    except OSError:
++        return []
++    cached = _CKPT_FP_CACHE.get(cache_key)
++    if cached is not None:
++        return cached
++    try:
++        if ckpt.is_file():
++            fp = [(ckpt.name, int(dir_st.st_size), int(dir_st.st_mtime_ns))]
++        elif ckpt.is_dir():
++            safetensors = sorted(ckpt.glob("*.safetensors"))
++            files = safetensors if safetensors else sorted(
++                p for p in ckpt.iterdir() if p.is_file()
++            )
++            fp = [
++                (p.name, int(st.st_size), int(st.st_mtime_ns))
++                for p in files
++                if (st := p.stat()) is not None
++            ]
++        else:
++            fp = []
++    except OSError:
++        return []
++    _CKPT_FP_CACHE[cache_key] = fp
++    return fp
++
++
++def _resolve_tag(kind: str, explicit_tag: str | None) -> str:
++    module_name = _MODULE_STACK[-1] if _MODULE_STACK else ""
++    if module_name and explicit_tag:
++        return f"{module_name}.{explicit_tag}"
++    if explicit_tag:
++        return explicit_tag
++    with _STATE_LOCK:
++        scope_key = f"{kind}:{module_name}"
++        idx = _CALL_COUNTERS.get(scope_key, 0)
++        _CALL_COUNTERS[scope_key] = idx + 1
++    if module_name:
++        return f"{module_name}.{idx}"
++    return f"{kind}.{idx}"
++
++
++def _cache_file_path(
++    cache_dir: Path,
++    kind: str,
++    shape_meta: tuple[int, ...],
++    resolved_tag: str,
++) -> Path:
++    tp_rank, tp_world = _resolve_tp_identity()
++    ckpt_fp = _checkpoint_fingerprint()
++    key_payload = repr(
++        (
++            FORMAT_VERSION,
++            kind,
++            tp_rank,
++            tp_world,
++            shape_meta,
++            resolved_tag,
++            ckpt_fp,
++        )
++    ).encode("utf-8")
++    digest = hashlib.sha256(key_payload).hexdigest()[:16]
++    safe_tag = _SAFE_TAG_RE.sub("_", resolved_tag).strip("._") or kind
++    if len(safe_tag) > 64:
++        safe_tag = safe_tag[-64:]
++    filename = (
++        f"{kind}_v{FORMAT_VERSION}_tp{tp_rank}of{tp_world}_{safe_tag}_{digest}.bin"
++    )
++    return cache_dir / filename
++
++
++def _read_file_u8(path: Path) -> tuple[bytes, torch.Tensor, mmap.mmap | None] | None:
++    """Read ``path`` header and map/read payload into a 1-D ``torch.uint8`` CPU tensor.
++
++    Uses ``O_DIRECT`` into a page-aligned ``mmap`` buffer when
++    ``VLLM_POSTLOAD_CACHE_ODIRECT=1`` and supported by the filesystem, otherwise
++    maps the file directly via ``torch.from_file`` without zero-filling a staging
++    ``bytearray``.
++    """
++    try:
++        st = path.stat()
++    except OSError:
++        return None
++    size = int(st.st_size)
++    if size < _HEADER_STRUCT.size:
++        return None
++    use_odirect = (
++        hasattr(os, "O_DIRECT")
++        and os.environ.get("VLLM_POSTLOAD_CACHE_ODIRECT", "0") == "1"
++    )
++    if use_odirect:
++        fd = -1
++        buf = None
++        view = None
++        try:
++            fd = os.open(str(path), os.O_RDONLY | getattr(os, "O_DIRECT", 0))
++            align = 4096
++            aligned_size = ((size + align - 1) // align) * align
++            buf = mmap.mmap(-1, aligned_size)
++            view = memoryview(buf)
++            total = 0
++            while total < size:
++                chunk = os.readv(fd, [view[total:aligned_size]])
++                if chunk <= 0:
++                    break
++                total += chunk
++            if total == size:
++                header = bytes(view[: _HEADER_STRUCT.size])
++                view.release()
++                view = None
++                t = torch.frombuffer(buf, dtype=torch.uint8, count=size)
++                out_mmap = buf
++                buf = None
++                return header, t, out_mmap
++        except OSError:
++            pass
++        finally:
++            if view is not None:
++                view.release()
++            if buf is not None:
++                buf.close()
++            if fd >= 0:
++                os.close(fd)
++    global _READ_SCRATCH
++    try:
++        if _READ_SCRATCH is None or int(_READ_SCRATCH.numel()) < size:
++            _READ_SCRATCH = torch.empty((size,), dtype=torch.uint8)
++        t = _READ_SCRATCH[:size]
++        with open(path, "rb", buffering=0) as f:
++            view = memoryview(t.numpy())
++            total = 0
++            while total < size:
++                n = f.readinto(view[total:])
++                if not n:
++                    break
++                total += n
++            view.release()
++            if total != size:
++                return None
++        header = bytes(t[: _HEADER_STRUCT.size].numpy())
++        return header, t, None
++    except OSError:
++        return None
++
++
++def _submit_atomic_write(
++    cache_dir: Path,
++    final_path: Path,
++    header: bytes,
++    tensors: Sequence[torch.Tensor],
++) -> None:
++    global _WRITER_EXECUTOR, _BG_COPY_STREAM
++
++    detached = [t.detach() for t in tensors]
++
++    def _write_task() -> None:
++        global _BG_COPY_STREAM
++        try:
++            cache_dir.mkdir(parents=True, exist_ok=True)
++        except OSError:
++            return
++        if not has_sufficient_disk_space(cache_dir):
++            with _STATE_LOCK:
++                _STATS.writes_skipped_low_disk += 1
++            logger.debug(
++                "Skipping post-load cache write to %s: free disk space below %d bytes",
++                final_path,
++                _CONFIG.min_free_bytes,
++            )
++            return
++        pid = os.getpid()
++        tmp_path = final_path.with_name(f"{final_path.name}.tmp.{pid}")
++        try:
++            cpu_tensors: list[torch.Tensor] = []
++            for t in detached:
++                if t.is_cuda:
++                    if _BG_COPY_STREAM is None:
++                        _BG_COPY_STREAM = torch.cuda.Stream(device=t.device)
++                    with torch.cuda.stream(_BG_COPY_STREAM):
++                        t_cpu = t.contiguous().to("cpu", non_blocking=True)
++                    _BG_COPY_STREAM.synchronize()
++                    cpu_tensors.append(t_cpu)
++                else:
++                    cpu_tensors.append(t.contiguous())
++            with open(tmp_path, "wb", buffering=0) as f:
++                f.write(header)
++                for t_cpu in cpu_tensors:
++                    arr_view = memoryview(t_cpu.view(torch.uint8).numpy())
++                    try:
++                        f.write(arr_view)
++                    finally:
++                        arr_view.release()
++                if os.environ.get("VLLM_POSTLOAD_CACHE_FSYNC", "0") == "1":
++                    os.fsync(f.fileno())
++            os.replace(tmp_path, final_path)
++            with _STATE_LOCK:
++                _STATS.writes_completed += 1
++        except OSError as exc:
++            logger.debug("Post-load cache write failed for %s: %s", final_path, exc)
++            try:
++                tmp_path.unlink()
++            except OSError:
++                pass
++
++    with _STATE_LOCK:
++        if _WRITER_EXECUTOR is None:
++            _WRITER_EXECUTOR = ThreadPoolExecutor(
++                max_workers=1, thread_name_prefix="postload-cache-writer"
++            )
++        fut = _WRITER_EXECUTOR.submit(_write_task)
++        _PENDING_FUTURES.append(fut)
++
++
++def loading_done(timeout: float | None = None) -> None:
++    """Wait for all queued background post-load cache writes to finish."""
++    global _READ_SCRATCH
++    with _STATE_LOCK:
++        _READ_SCRATCH = None
++        pending = list(_PENDING_FUTURES)
++        _PENDING_FUTURES.clear()
++        _CALL_COUNTERS.clear()
++    for fut in pending:
++        try:
++            fut.result(timeout=timeout)
++        except Exception as exc:
++            logger.debug("Post-load cache background writer error: %s", exc)
++
++
++def pack_bf16_rows_reference(
++    sample_weight: torch.Tensor,
++    exponent_base: int,
++    row_indices: Sequence[int],
++    *,
++    group: int = 128,
++    window: int = 15,
++) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
++    """Reference 12-bit BF16 pack on a small slice of rows for spot verification."""
++    m, k = map(int, sample_weight.shape)
++    bits = sample_weight.view(torch.int16).to(torch.int32) & 0xFFFF
++    exp = (bits >> 7) & 0xFF
++    out = (exp != 0) & ((exp < exponent_base) | (exp >= exponent_base + window))
++    code = torch.where(
++        (exp != 0) & (~out), exp - exponent_base + 1, torch.zeros_like(exp)
++    )
++    low = torch.where(
++        out, torch.zeros_like(bits), ((bits >> 8) & 0x80) | (bits & 0x7F)
++    )
++    dec = (
++        ((low & 0x80) << 8)
++        | (
++            torch.where(
++                code == 0, torch.zeros_like(code), code + exponent_base - 1
++            )
++            << 7
++        )
++        | (low & 0x7F)
++    )
++    if bool(((~out) & (dec != bits)).any().item()):
++        raise ValueError("Sampled BF16 rows do not round-trip under cached exponent_base")
++    cg = code.view(m, k // group, 2, group // 2)
++    code_bytes = (
++        (cg[:, :, 0, :] | (cg[:, :, 1, :] << 4)).reshape(m, k // 2).to(torch.uint8)
++    )
++    values = torch.cat((low.to(torch.uint8), code_bytes), dim=1).contiguous()
++    counts = out.sum(dim=1, dtype=torch.int32)
++    row_idx_t = torch.tensor(
++        list(row_indices), dtype=torch.int32, device=sample_weight.device
++    )
++    exc_r_local, exc_c = torch.nonzero(out, as_tuple=True)
++    exc_rows = row_idx_t[exc_r_local].contiguous()
++    exc_entries = (
++        (exc_c.to(torch.int32) << 16) | bits[exc_r_local, exc_c]
++    ).to(torch.int32).contiguous()
++    return values, counts, exc_rows, exc_entries
++
++
++def try_load_cached_pack12(
++    weight: torch.Tensor,
++    *,
++    in_place: bool,
++    cache_tag: str | None = None,
++    group: int = 128,
++    window: int = 15,
++) -> tuple[Path | None, str, Any | None]:
++    """Try to load and 4-row spot-verify a cached ``PackedBf16Weight``."""
++    cache_dir = get_postload_cache_dir()
++    if cache_dir is None:
++        return None, "", None
++    out_features, in_features = map(int, weight.shape)
++    resolved_tag = _resolve_tag("pack12", cache_tag)
++    path = _cache_file_path(
++        cache_dir, "pack12", (out_features, in_features), resolved_tag
++    )
++    loaded = _read_file_u8(path)
++    if loaded is None:
++        with _STATE_LOCK:
++            _STATS.misses += 1
++        return path, resolved_tag, None
++    header_bytes, raw_u8, raw = loaded
++
++    try:
++        (
++            magic,
++            version,
++            cached_out,
++            cached_in,
++            exponent_base,
++            exceptions,
++            rows_len,
++            values_nbytes,
++            meta_nbytes,
++        ) = _HEADER_STRUCT.unpack_from(header_bytes, 0)
++        width = in_features + in_features // 2
++        expected_rows_len = max(int(exceptions), 1)
++        expected_values_nbytes = out_features * width
++        expected_meta_nbytes = (out_features + 1) * 4 + 2 * expected_rows_len * 4
++        total_expected = (
++            _HEADER_STRUCT.size + expected_values_nbytes + expected_meta_nbytes
++        )
++        if (
++            magic != PACK12_MAGIC
++            or version != FORMAT_VERSION
++            or cached_out != out_features
++            or cached_in != in_features
++            or rows_len != expected_rows_len
++            or values_nbytes != expected_values_nbytes
++            or meta_nbytes != expected_meta_nbytes
++            or int(raw_u8.numel()) < total_expected
++        ):
++            raise ValueError("pack12 header/size mismatch")
++        offset = _HEADER_STRUCT.size
++        values_cpu = raw_u8[offset : offset + expected_values_nbytes].view(
++            out_features, width
++        )
++        offset += expected_values_nbytes
++
++        offsets_nbytes = (out_features + 1) * 4
++        row_offsets_cpu = raw_u8[offset : offset + offsets_nbytes].view(torch.int32)
++        offset += offsets_nbytes
++
++        rows_nbytes = expected_rows_len * 4
++        exc_rows_cpu = raw_u8[offset : offset + rows_nbytes].view(torch.int32)
++        offset += rows_nbytes
++        exc_entries_cpu = raw_u8[offset : offset + rows_nbytes].view(torch.int32)
++
++        if (
++            int(row_offsets_cpu[0].item()) != 0
++            or int(row_offsets_cpu[-1].item()) != int(exceptions)
++        ):
++            raise ValueError("pack12 row_offsets endpoints corrupted")
++
++        # 4-row byte-for-byte spot check BEFORE mutating weight in place.
++        idx = list(spot_check_indices(out_features))
++        sample_weight = torch.cat(
++            [weight[r : r + 1].detach() for r in idx], dim=0
++        )
++        ref_values_d, ref_counts_d, _, ref_exc_entries_d = pack_bf16_rows_reference(
++            sample_weight,
++            int(exponent_base),
++            idx,
++            group=group,
++            window=window,
++        )
++        ref_values = ref_values_d.cpu()
++        ref_counts = ref_counts_d.cpu()
++        ref_exc_entries = ref_exc_entries_d.cpu()
++        ref_pos = 0
++        for i, r in enumerate(idx):
++            if not torch.equal(values_cpu[r], ref_values[i]):
++                raise ValueError(f"pack12 spot-check values mismatch at row {r}")
++            s = int(row_offsets_cpu[r].item())
++            e = int(row_offsets_cpu[r + 1].item())
++            cnt = int(ref_counts[i].item())
++            if s < 0 or e < s or e > int(exceptions) or (e - s) != cnt:
++                raise ValueError(
++                    f"pack12 spot-check exception count mismatch at row {r}"
++                )
++            if cnt > 0:
++                if not bool((exc_rows_cpu[s:e] == r).all().item()):
++                    raise ValueError(
++                        f"pack12 spot-check exception_rows mismatch at row {r}"
++                    )
++                if not torch.equal(
++                    exc_entries_cpu[s:e], ref_exc_entries[ref_pos : ref_pos + cnt]
++                ):
++                    raise ValueError(
++                        f"pack12 spot-check exception_entries mismatch at row {r}"
++                    )
++                ref_pos += cnt
++    except Exception as exc:
++        logger.warning(
++            "Post-load pack12 cache verification failed for %s (%s); recomputing.",
++            path,
++            exc,
++        )
++        if isinstance(raw, mmap.mmap):
++            raw.close()
++        with _STATE_LOCK:
++            _STATS.corruptions += 1
++            _STATS.misses += 1
++        return path, resolved_tag, None
++
++    device = weight.device
++    if in_place:
++        values = (
++            weight.view(torch.uint8)
++            .view(-1)[: out_features * width]
++            .view(out_features, width)
++        )
++        values.copy_(values_cpu)
++    elif device.type == "cpu":
++        values = values_cpu.clone()
++    else:
++        values = values_cpu.to(device=device)
++    if device.type == "cpu":
++        row_offsets = row_offsets_cpu.clone()
++        exc_rows = exc_rows_cpu.clone()
++        exc_entries = exc_entries_cpu.clone()
++    else:
++        row_offsets = row_offsets_cpu.to(device=device)
++        exc_rows = exc_rows_cpu.to(device=device)
++        exc_entries = exc_entries_cpu.to(device=device)
++    if isinstance(raw, mmap.mmap):
++        del raw_u8, values_cpu, row_offsets_cpu, exc_rows_cpu, exc_entries_cpu
++        raw.close()
++    with _STATE_LOCK:
++        _STATS.hits += 1
++    from .vocab import PackedBf16Weight
++
++    return (
++        path,
++        resolved_tag,
++        PackedBf16Weight(
++            values=values,
++            exponent_base=int(exponent_base),
++            exception_rows=exc_rows,
++            exception_entries=exc_entries,
++            row_offsets=row_offsets,
++            exceptions=int(exceptions),
++        ),
++    )
++
++
++def save_cached_pack12_async(
++    path: Path | None,
++    packed: Any,
++    *,
++    in_features: int,
++) -> None:
++    cache_dir = get_postload_cache_dir()
++    if cache_dir is None or path is None:
++        return
++    values_nbytes = int(packed.values.numel()) * int(packed.values.element_size())
++    offsets_nbytes = int(packed.row_offsets.numel()) * int(
++        packed.row_offsets.element_size()
++    )
++    rows_nbytes = int(packed.exception_rows.numel()) * int(
++        packed.exception_rows.element_size()
++    )
++    entries_nbytes = int(packed.exception_entries.numel()) * int(
++        packed.exception_entries.element_size()
++    )
++    meta_nbytes = offsets_nbytes + rows_nbytes + entries_nbytes
++    header = _HEADER_STRUCT.pack(
++        PACK12_MAGIC,
++        FORMAT_VERSION,
++        int(packed.values.shape[0]),
++        int(in_features),
++        int(packed.exponent_base),
++        int(packed.exceptions),
++        int(packed.exception_rows.numel()),
++        values_nbytes,
++        meta_nbytes,
++    )
++    _submit_atomic_write(
++        cache_dir,
++        path,
++        header,
++        (
++            packed.values,
++            packed.row_offsets,
++            packed.exception_rows,
++            packed.exception_entries,
++        ),
++    )
++
++
++def try_load_cached_moe_scale_codes(
++    exponents: torch.Tensor,
++    block_N: int,
++    *,
++    cache_tag: str | None = None,
++    ref_encode_fn: Callable[
++        ..., tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]
++    ],
++) -> tuple[
++    Path | None,
++    str,
++    tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor] | None,
++]:
++    """Try to load and 4-expert spot-verify cached MoE UE8M0 scale codes."""
++    cache_dir = get_postload_cache_dir()
++    if cache_dir is None:
++        return None, "", None
++    e = exponents.view(torch.uint8)
++    experts, rows, k_scales = map(int, e.shape)
++    resolved_tag = _resolve_tag("moe_scale", cache_tag)
++    path = _cache_file_path(
++        cache_dir,
++        "moe_scale",
++        (experts, rows, k_scales, int(block_N)),
++        resolved_tag,
++    )
++    loaded = _read_file_u8(path)
++    if loaded is None:
++        with _STATE_LOCK:
++            _STATS.misses += 1
++        return path, resolved_tag, None
++    header_bytes, raw_u8, raw = loaded
++
++    try:
++        (
++            magic,
++            version,
++            cached_experts,
++            cached_rows,
++            cached_k_scales,
++            cached_block_n,
++            total_units,
++            codes_nbytes,
++            meta_nbytes,
++        ) = _HEADER_STRUCT.unpack_from(header_bytes, 0)
++        words = -(-k_scales // 4)
++        per = (rows // block_N) * words
++        expected_codes_nbytes = int(total_units) * per * int(block_N)
++        expected_narrow_nbytes = experts * 2
++        expected_base_nbytes = experts * rows
++        expected_meta_nbytes = expected_narrow_nbytes + expected_base_nbytes
++        total_expected = (
++            _HEADER_STRUCT.size + expected_codes_nbytes + expected_meta_nbytes
++        )
++        if (
++            magic != MOE_SCALE_MAGIC
++            or version != FORMAT_VERSION
++            or cached_experts != experts
++            or cached_rows != rows
++            or cached_k_scales != k_scales
++            or cached_block_n != int(block_N)
++            or total_units < experts
++            or total_units > 2 * experts
++            or codes_nbytes != expected_codes_nbytes
++            or meta_nbytes != expected_meta_nbytes
++            or int(raw_u8.numel()) < total_expected
++        ):
++            raise ValueError("moe_scale_codes header/size mismatch")
++        offset = _HEADER_STRUCT.size
++        codes_2bit_cpu = raw_u8[offset : offset + expected_codes_nbytes].view(
++            int(total_units) * per, int(block_N)
++        )
++        offset += expected_codes_nbytes
++
++        narrow_offsets_cpu = raw_u8[offset : offset + expected_narrow_nbytes].view(
++            torch.uint16
++        )
++        offset += expected_narrow_nbytes
++
++        base_cpu = raw_u8[offset : offset + expected_base_nbytes].view(experts, rows)
++
++        # Verify monotonic unit offsets across all experts.
++        narrow_i32 = narrow_offsets_cpu.view(torch.int16).to(torch.int32) & 0xFFFF
++        is_narrow_all = narrow_i32 & 1
++        unit_bases = narrow_i32 >> 1
++        unit_lens = 2 - is_narrow_all
++        expected_bases = torch.cumsum(unit_lens, dim=0) - unit_lens
++        if (
++            not torch.equal(unit_bases, expected_bases)
++            or int((unit_bases[-1] + unit_lens[-1]).item()) != int(total_units)
++        ):
++            raise ValueError("moe_scale_codes narrow_offsets corrupted")
++
++        device = exponents.device
++        if device.type == "cpu":
++            codes_2bit = codes_2bit_cpu.clone()
++            narrow_offsets = narrow_offsets_cpu.clone()
++            base = base_cpu.clone()
++        else:
++            codes_2bit = codes_2bit_cpu.to(device=device)
++            narrow_offsets = narrow_offsets_cpu.to(device=device)
++            base = base_cpu.to(device=device)
++
++        # 4-expert byte-for-byte spot check on device (single synchronization).
++        idx = list(spot_check_indices(experts))
++        sample_exp = torch.cat([e[i : i + 1].detach() for i in idx], dim=0)
++        _, ref_codes_2bit_d, ref_narrow_d, ref_base_d = ref_encode_fn(
++            sample_exp, block_N
++        )
++        c_vals = [int(narrow_offsets_cpu[i].item()) & 0xFFFF for i in idx]
++        c_slices = [
++            codes_2bit[(v >> 1) * per : ((v >> 1) + (2 - (v & 1))) * per]
++            for v in c_vals
++        ]
++        cached_sample_codes = torch.cat(c_slices, dim=0)
++        cached_sample_base = torch.cat([base[i : i + 1] for i in idx], dim=0)
++        cached_sample_narrow = torch.tensor(
++            [v & 1 for v in c_vals], dtype=torch.int32, device=device
++        )
++        ref_narrow_flag = ref_narrow_d.view(torch.int16).to(torch.int32) & 1
++        if (
++            cached_sample_codes.shape != ref_codes_2bit_d.shape
++            or not bool(
++                (
++                    (cached_sample_base == ref_base_d).all()
++                    & (cached_sample_narrow == ref_narrow_flag).all()
++                    & (cached_sample_codes == ref_codes_2bit_d).all()
++                ).item()
++            )
++        ):
++            raise ValueError("moe_scale_codes spot-check mismatch")
++    except Exception as exc:
++        logger.warning(
++            "Post-load MoE scale-code cache verification failed for %s (%s); recomputing.",
++            path,
++            exc,
++        )
++        if isinstance(raw, mmap.mmap):
++            raw.close()
++        with _STATE_LOCK:
++            _STATS.corruptions += 1
++            _STATS.misses += 1
++        return path, resolved_tag, None
++
++    codes = codes_2bit.view(torch.uint16)
++    if isinstance(raw, mmap.mmap):
++        del raw_u8, codes_2bit_cpu, narrow_offsets_cpu, base_cpu
++        raw.close()
++    with _STATE_LOCK:
++        _STATS.hits += 1
++    return path, resolved_tag, (codes, codes_2bit, narrow_offsets, base)
++
++
++def save_cached_moe_scale_codes_async(
++    path: Path | None,
++    codes_2bit: torch.Tensor,
++    narrow_offsets: torch.Tensor,
++    base: torch.Tensor,
++    *,
++    shape_meta: tuple[int, int, int, int],
++) -> None:
++    cache_dir = get_postload_cache_dir()
++    if cache_dir is None or path is None:
++        return
++    experts, rows, k_scales, block_N = shape_meta
++    words = -(-k_scales // 4)
++    per = (rows // block_N) * words
++    total_units = int(codes_2bit.shape[0]) // per
++    codes_nbytes = int(codes_2bit.numel()) * int(codes_2bit.element_size())
++    narrow_nbytes = int(narrow_offsets.numel()) * int(narrow_offsets.element_size())
++    base_nbytes = int(base.numel()) * int(base.element_size())
++    meta_nbytes = narrow_nbytes + base_nbytes
++    header = _HEADER_STRUCT.pack(
++        MOE_SCALE_MAGIC,
++        FORMAT_VERSION,
++        int(experts),
++        int(rows),
++        int(k_scales),
++        int(block_N),
++        int(total_units),
++        codes_nbytes,
++        meta_nbytes,
++    )
++    _submit_atomic_write(
++        cache_dir,
++        path,
++        header,
++        (codes_2bit, narrow_offsets, base),
++    )
+diff --git a/vllm/models/deepseek_v4_1/tilelang/scale_codes.py b/vllm/models/deepseek_v4_1/tilelang/scale_codes.py
+index 5d6c9b0cc..2a2caf393 100644
+--- a/vllm/models/deepseek_v4_1/tilelang/scale_codes.py
++++ b/vllm/models/deepseek_v4_1/tilelang/scale_codes.py
+@@ -13,6 +13,7 @@ from typing import NamedTuple
+ import torch
+ 
+ 
++
+ class ExpertScaleCodes(NamedTuple):
+     """One tensor of experts, each expert entirely 2-bit or entirely 4-bit.
+ 
+@@ -40,18 +41,33 @@ def _row_deltas(
+     ``base`` and the row's base and span reflect only the loaded checkpoint scales.
+     """
+     e = exponents.view(torch.uint8)
+-    nonzero = e > 0
+-    min_nonzero = torch.where(nonzero, e, torch.full_like(e, 255)).amin(dim=-1)
+-    base = torch.where(
+-        nonzero.any(dim=-1), min_nonzero, torch.zeros_like(min_nonzero)
+-    ).contiguous()
+-    deltas = torch.where(nonzero, e - base.unsqueeze(-1), torch.zeros_like(e))
+-    span = int(deltas.max()) if deltas.numel() else 0
+-    if span > max_delta:
+-        bits = 2 if max_delta == 3 else 4
+-        raise ValueError(
+-            f"a row's scale exponents span {span + 1} values; {bits}-bit codes hold {max_delta + 1}"
+-        )
++    if e.numel() == 0:
++        base = torch.zeros(e.shape[:-1], dtype=torch.uint8, device=e.device)
++        deltas = e
++    else:
++        row_min, row_max = torch.aminmax(e, dim=-1)
++        if int(row_min.min().item()) > 0:
++            base = row_min.contiguous()
++            span = int((row_max - row_min).max().item())
++            if span > max_delta:
++                bits = 2 if max_delta == 3 else 4
++                raise ValueError(
++                    f"a row's scale exponents span {span + 1} values; {bits}-bit codes hold {max_delta + 1}"
++                )
++            deltas = e - base.unsqueeze(-1)
++        else:
++            nonzero = e > 0
++            min_nonzero = torch.where(nonzero, e, torch.full_like(e, 255)).amin(dim=-1)
++            base = torch.where(
++                row_max > 0, min_nonzero, torch.zeros_like(min_nonzero)
++            ).contiguous()
++            deltas = torch.where(nonzero, e - base.unsqueeze(-1), torch.zeros_like(e))
++            span = int(deltas.max().item())
++            if span > max_delta:
++                bits = 2 if max_delta == 3 else 4
++                raise ValueError(
++                    f"a row's scale exponents span {span + 1} values; {bits}-bit codes hold {max_delta + 1}"
++                )
+     pad = -e.shape[-1] % 4
+     if pad:
+         deltas = torch.nn.functional.pad(deltas, (0, pad), value=0)
+@@ -59,15 +75,14 @@ def _row_deltas(
+ 
+ 
+ def _pack_nibbles(d: torch.Tensor) -> torch.Tensor:
+-    lo = (d[..., 0] | (d[..., 1] << 4)).to(torch.int16)
+-    hi = (d[..., 2] | (d[..., 3] << 4)).to(torch.int16)
+-    return (lo | (hi << 8)).view(torch.uint16).contiguous()
++    w = d.contiguous().view(torch.int32).view(d.shape[:-1])
++    w = (w | (w >> 4)) & 0x00FF00FF
++    return (w | (w >> 8)).to(torch.int16).view(torch.uint16).contiguous()
+ 
+ 
+ def _pack_crumbs(d: torch.Tensor) -> torch.Tensor:
+-    return (
+-        d[..., 0] | (d[..., 1] << 2) | (d[..., 2] << 4) | (d[..., 3] << 6)
+-    ).contiguous()
++    w = d.contiguous().view(torch.int32).view(d.shape[:-1])
++    return ((w * 0x00041041) >> 18).to(torch.uint8).contiguous()
+ 
+ 
+ def pack_scale_codes(exponents: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+@@ -143,10 +158,14 @@ def pack_expert_scale_codes(exponents: torch.Tensor) -> ExpertScaleCodes:
+     expert_delta = d.reshape(d.shape[0], -1).amax(dim=1)
+     narrow = (expert_delta <= 3).to(torch.uint8).contiguous()
+     codes = _pack_nibbles(d)
+-    codes_2bit = torch.zeros(codes.shape, dtype=torch.uint8, device=codes.device)
+     mask = narrow.bool()
+-    if mask.any().item():
++    if bool(mask.all().item()):
++        codes_2bit = _pack_crumbs(d)
++    elif bool(mask.any().item()):
++        codes_2bit = torch.zeros(codes.shape, dtype=torch.uint8, device=codes.device)
+         codes_2bit[mask] = _pack_crumbs(d[mask])
++    else:
++        codes_2bit = torch.zeros(codes.shape, dtype=torch.uint8, device=codes.device)
+     return ExpertScaleCodes(
+         narrow,
+         base,
+@@ -252,3 +271,106 @@ def overlay_byte_codes(
+     keep[mask, 1] = False
+     compact_bytes = units[keep].reshape(-1, block_N).contiguous()
+     return compact_bytes.view(torch.uint16), compact_bytes
++
++
++def _encode_expert_scale_codes_uncached(
++    exponents: torch.Tensor, block_N: int = 128
++) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
++    """Direct fused computation of ``(codes, codes_2bit, narrow_offsets, base)``."""
++    e = exponents.view(torch.uint8)
++    if e.ndim != 3:
++        raise ValueError("scale exponents must be [experts, rows, K / 32]")
++    experts, n, _ = e.shape
++    if n % block_N or block_N % 2:
++        raise ValueError(f"N={n} must be a multiple of even block_N={block_N}")
++    d, base = _row_deltas(e, 15)
++    words = d.shape[-2]
++    per = (n // block_N) * words
++    expert_delta = d.reshape(experts, -1).amax(dim=1)
++    narrow = (expert_delta <= 3).to(torch.uint8).contiguous()
++    offsets = narrow_code_offsets(narrow)
++    mask = narrow.bool()
++    if bool(mask.all().item()):
++        crumbs = _pack_crumbs(d)
++        compact_bytes = tile_byte_codes(crumbs, block_N)
++        return compact_bytes.view(torch.uint16), compact_bytes, offsets, base
++    if not bool(mask.any().item()):
++        nibbles = _pack_nibbles(d)
++        tiled = (
++            nibbles.view(torch.int16)
++            .view(experts, n // block_N, block_N, words)
++            .permute(0, 1, 3, 2)
++            .reshape(-1, block_N)
++            .contiguous()
++            .view(torch.uint16)
++        )
++        compact = tiled.view(2 * experts * per, block_N // 2)
++        return compact, compact.view(torch.uint8), offsets, base
++
++    unit_base = offsets.view(torch.int16).to(torch.int64) >> 1
++    total_units = int(unit_base[-1].item()) + (1 if bool(mask[-1].item()) else 2)
++    compact_bytes = torch.empty(
++        (total_units, per, block_N), dtype=torch.uint8, device=e.device
++    )
++    crumbs_tiled = tile_byte_codes(_pack_crumbs(d[mask]), block_N).view(
++        -1, per, block_N
++    )
++    compact_bytes[unit_base[mask]] = crumbs_tiled
++    wide_mask = ~mask
++    nibbles_tiled = (
++        _pack_nibbles(d[wide_mask])
++        .view(torch.int16)
++        .view(-1, n // block_N, block_N, words)
++        .permute(0, 1, 3, 2)
++        .contiguous()
++        .view(torch.uint8)
++        .view(-1, 2, per, block_N)
++    )
++    wide_units = unit_base[wide_mask]
++    compact_bytes[wide_units] = nibbles_tiled[:, 0]
++    compact_bytes[wide_units + 1] = nibbles_tiled[:, 1]
++    flat_bytes = compact_bytes.view(-1, block_N)
++    return flat_bytes.view(torch.uint16), flat_bytes, offsets, base
++
++
++def encode_expert_scale_codes(
++    exponents: torch.Tensor,
++    block_N: int = 128,
++    *,
++    cache_tag: str | None = None,
++    use_cache: bool = True,
++) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
++    """Encode ``[E, N, K / 32]`` UE8M0 scales directly into tiled compact ``(codes, codes_2bit, narrow_offsets, base)``."""
++    from vllm.models.deepseek_v4_1.tilelang.postload_cache import (
++        save_cached_moe_scale_codes_async,
++        try_load_cached_moe_scale_codes,
++    )
++
++    cache_path = None
++    if use_cache:
++        cache_path, _, cached = try_load_cached_moe_scale_codes(
++            exponents,
++            block_N,
++            cache_tag=cache_tag,
++            ref_encode_fn=_encode_expert_scale_codes_uncached,
++        )
++        if cached is not None:
++            return cached
++    codes, codes_2bit, offsets, base = _encode_expert_scale_codes_uncached(
++        exponents, block_N
++    )
++    if use_cache and cache_path is not None:
++        e = exponents.view(torch.uint8)
++        save_cached_moe_scale_codes_async(
++            cache_path,
++            codes_2bit,
++            offsets,
++            base,
++            shape_meta=(
++                int(e.shape[0]),
++                int(e.shape[1]),
++                int(e.shape[2]),
++                int(block_N),
++            ),
++        )
++    return codes, codes_2bit, offsets, base
+diff --git a/vllm/models/deepseek_v4_1/tilelang/vocab.py b/vllm/models/deepseek_v4_1/tilelang/vocab.py
+index 3ff266a32..df34ba338 100644
+--- a/vllm/models/deepseek_v4_1/tilelang/vocab.py
++++ b/vllm/models/deepseek_v4_1/tilelang/vocab.py
+@@ -36,12 +36,17 @@ from vllm.v1.worker.workspace import (
+ 
+ from . import pdl, prepare
+ from .gemm import bf16_gemm, bf16_gemm_decode
++from .postload_cache import save_cached_pack12_async, try_load_cached_pack12
+ 
+ GROUP = 128  # columns per code group
+ HALF = GROUP // 2  # one code byte holds a column of each half
+ WINDOW = 15  # exponents encoded per tensor (codes 1..15; code 0 is exponent 0)
+ VEC = 16  # columns of each half one thread decodes at a time
+ _PACK_BLOCK_ROWS = 1_024
++# From row 3 * _PACK_BLOCK_ROWS onward, row r's 1.5*K-byte output end is at or
++# before row (r - _PACK_BLOCK_ROWS)'s 2*K-byte input start, so packing directly
++# into the in-place output view cannot overlap unread input rows.
++_PACK_SAFE_DIRECT_ROW = 3 * _PACK_BLOCK_ROWS
+ # Token tiles: one decode row in a 16-row tile reads the weights once, like 64;
+ # 65-128 verification rows read the packed weight shard once in a 128-row tile.
+ ROW_TILES = (16, 32, 64, 128)
+@@ -340,16 +345,32 @@ def _check_pack_weight(weight: torch.Tensor) -> None:
+ 
+ 
+ def pack_bf16_weight(
+-    weight: torch.Tensor, *, in_place: bool = False
++    weight: torch.Tensor,
++    *,
++    in_place: bool = False,
++    cache_tag: str | None = None,
++    use_cache: bool = True,
+ ) -> PackedBf16Weight:
+     """Pack ``weight`` into exact 12-bit storage using TileLang; raise if any value
+     would not round-trip.
+ 
+     ``in_place=True`` writes the packed rows into the first three quarters of
+-    ``weight``'s own storage using a 1,024-row staging buffer.
++    ``weight``'s own storage, staging only the first 3,072 rows where input and
++    output byte ranges overlap and writing the remaining rows directly.
+     """
+     _check_pack_weight(weight)
+     out_features, in_features = map(int, weight.shape)
++    cache_path = None
++    if use_cache:
++        cache_path, _, cached = try_load_cached_pack12(
++            weight,
++            in_place=in_place,
++            cache_tag=cache_tag,
++            group=GROUP,
++            window=WINDOW,
++        )
++        if cached is not None:
++            return cached
+     width = in_features + in_features // 2
+     device = weight.device
+     bits = weight.view(torch.uint16)
+@@ -374,13 +395,14 @@ def pack_bf16_weight(
+             .view(-1)[: out_features * width]
+             .view(out_features, width)
+         )
++        staged_limit = min(out_features, _PACK_SAFE_DIRECT_ROW)
+         staging = torch.empty(
+-            (min(_PACK_BLOCK_ROWS, out_features), width),
++            (min(_PACK_BLOCK_ROWS, staged_limit), width),
+             dtype=torch.uint8,
+             device=device,
+         )
+-        for start in range(0, out_features, _PACK_BLOCK_ROWS):
+-            count = min(_PACK_BLOCK_ROWS, out_features - start)
++        for start in range(0, staged_limit, _PACK_BLOCK_ROWS):
++            count = min(_PACK_BLOCK_ROWS, staged_limit - start)
+             pack_kernel(
+                 bits,
+                 staging[:count],
+@@ -393,6 +415,22 @@ def pack_bf16_weight(
+             )
+             values[start : start + count].copy_(staging[:count])
+         del staging
++        start = staged_limit
++        while start < out_features:
++            # Output bytes [1.5*K*start, 1.5*K*end) are strictly below unread input
++            # bytes [2*K*start, 2*K*out_features) iff 3*end <= 4*start.
++            end = min(out_features, (4 * start) // 3)
++            pack_kernel(
++                bits,
++                values[start:end],
++                row_offsets,
++                rows,
++                entries,
++                mismatches,
++                base,
++                start,
++            )
++            start = end
+     else:
+         values = torch.empty((out_features, width), dtype=torch.uint8, device=device)
+         pack_kernel(
+@@ -409,7 +447,10 @@ def pack_bf16_weight(
+         raise ValueError(
+             f"packed BF16 weight does not round-trip ({int(mismatches)} mismatches)"
+         )
+-    return PackedBf16Weight(values, base, rows, entries, row_offsets, exceptions)
++    result = PackedBf16Weight(values, base, rows, entries, row_offsets, exceptions)
++    if use_cache and cache_path is not None:
++        save_cached_pack12_async(cache_path, result, in_features=in_features)
++    return result
+ 
+ 
+ def unpack_bf16_weight(packed: PackedBf16Weight) -> torch.Tensor:
+diff --git a/vllm/tokenizers/registry.py b/vllm/tokenizers/registry.py
+index 46446ecd6..016476533 100644
+--- a/vllm/tokenizers/registry.py
++++ b/vllm/tokenizers/registry.py
+@@ -282,10 +282,19 @@ def get_tokenizer(
+         )
+         tokenizer_cls_ = TokenizersBackend
+ 
+-    if config is not None and tokenizer_cls_ is CachedHfTokenizer:
+-        # AutoTokenizer otherwise reloads config.json internally. Reuse the
+-        # config that get_config just loaded successfully so a concurrent Hub
+-        # cache refresh cannot invalidate the file between the two reads.
++    from transformers.tokenization_utils_tokenizers import TokenizersBackend
++
++    if config is not None and (
++        tokenizer_cls_ is CachedHfTokenizer
++        or (
++            isinstance(tokenizer_cls_, type)
++            and issubclass(tokenizer_cls_, TokenizersBackend)
++        )
++    ):
++        # AutoTokenizer and TokenizersBackend subclasses otherwise reload
++        # config.json internally. Reuse the config that get_config just loaded
++        # successfully so a concurrent Hub cache refresh cannot invalidate the
++        # file between the two reads.
+         kwargs.setdefault("config", config)
+ 
+     tokenizer = tokenizer_cls_.from_pretrained(tokenizer_name, *args, **kwargs)
+-- 
+2.43.0
+
