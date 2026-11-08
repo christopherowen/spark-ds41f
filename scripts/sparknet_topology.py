@@ -36,9 +36,18 @@ def checkout(upstream: str, revision: str) -> Path:
     CACHE.mkdir(parents=True, exist_ok=True)
     with tempfile.TemporaryDirectory(dir=CACHE, prefix=".fetch-") as tmp:
         repo, tree = Path(tmp) / "repo", Path(tmp) / "tree"
-        git = ["git", "-c", "advice.detachedHead=false", "-C", str(repo)]
+        git = [
+            "git",
+            "-c", "advice.detachedHead=false",
+            "-c", "gc.auto=0",
+            "-c", "maintenance.auto=false",
+            "-C", str(repo),
+        ]
         try:
-            subprocess.run(["git", "init", "-q", str(repo)], check=True, capture_output=True, text=True)
+            subprocess.run(
+                ["git", "-c", "gc.auto=0", "-c", "maintenance.auto=false", "init", "-q", str(repo)],
+                check=True, capture_output=True, text=True,
+            )
             subprocess.run([*git, "fetch", "-q", "--depth", "1", upstream, revision],
                            check=True, capture_output=True, text=True, timeout=120)
             fetched = subprocess.run([*git, "rev-parse", "FETCH_HEAD"], check=True,
