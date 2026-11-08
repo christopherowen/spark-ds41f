@@ -1,0 +1,1060 @@
+From b5997ecafba00c8c8f2b7b2b4f7b3a86dabc8813 Mon Sep 17 00:00:00 2001
+From: Christopher Owen <3221756+christopherowen@users.noreply.github.com>
+Date: Sun, 8 Nov 2026 20:10:00 +0000
+Subject: [PATCH] Price single-tile sunk draft cost and halt dead DSpark Markov
+ steps early
+
+Upstream base: 19f2c20ed4d64ae22bd009ceacadd85e2a81e354
+Rationale: At single-stream decode (c1, total_rows <= 16), DSpark executes its
+block forward pass and sequential Markov draft loop before adaptive verification
+scores the draft tokens, yet AdaptiveVerificationManager priced rows 2..6 at the
+full-tile row slope (0.035) without the sunk drafting step cost (DRAFT_COST_RATIO)
+or the within-16-row Tensor Core MMA tile marginal slope (SINGLE_TILE_ROW_COST_SCALE),
+and OnlineAcceptanceEstimator started cold with zero intercepts until the first
+IRLS refit. Conversely, at high concurrency (c8, c16) or when cumulative survival
+already falls below effective_dead_rows_tau, executing all 5 sequential Markov
+bias and vocabulary-parallel all_gather steps wastes per-step drafting latency on
+unverified tail positions.
+Quality implications: None (KL = 0); target rejection sampling verification is
+unchanged and TP rank determinism is preserved.
+Tests: pytest tests/v1/spec_decode/test_acceptance_estimator.py tests/v1/spec_decode/test_adaptive_verification.py tests/v1/worker/test_dspark_greedy_markov.py
+Upstream status: Local patch for DeepSeek-V4.1-Flash DSpark speculative decoding.
+---
+ .../spec_decode/test_acceptance_estimator.py  |  54 ++++
+ .../spec_decode/test_adaptive_verification.py | 102 +++++++-
+ tests/v1/worker/test_dspark_greedy_markov.py  | 128 +++++++++
+ vllm/v1/worker/gpu/model_runner.py            |  19 +-
+ .../gpu/spec_decode/acceptance_estimator.py   |  83 +++++-
+ .../gpu/spec_decode/adaptive_verification.py  | 126 ++++++++-
+ .../gpu/spec_decode/dspark/speculator.py      | 243 ++++++++++++++++--
+ 7 files changed, 691 insertions(+), 64 deletions(-)
+
+diff --git a/tests/v1/spec_decode/test_acceptance_estimator.py b/tests/v1/spec_decode/test_acceptance_estimator.py
+index ded920654..5593e87cd 100644
+--- a/tests/v1/spec_decode/test_acceptance_estimator.py
++++ b/tests/v1/spec_decode/test_acceptance_estimator.py
+@@ -478,3 +478,57 @@ def test_confidence_head_online_irls_reduces_survival_mae():
+     assert raw_mae > 0.15
+     assert cal_mae < 0.03
+     assert calibrated_survival[3].item() < 0.11
++
++
++@pytest.mark.parametrize("device_name", ["cpu", "cuda"])
++def test_warm_start_confidence_head_calibrates_from_step_zero_and_preserves_halted_zeros(
++    device_name,
++):
++    """Warm-started confidence_head estimator is calibrated at step 0 and keeps
++    halted (0.0) draft positions at exact 0.0 without polluting features."""
++    device = torch.device(device_name)
++    estimator = OnlineAcceptanceEstimator.for_confidence_head(
++        MAX_NUM_REQS, 5, device, warm_start=True
++    )
++    assert estimator.is_calibrated
++    assert estimator._refits == 0
++
++    # Raw DSpark confidence head output at c1: ~[0.78, 0.72, 0.71, 0.71, 0.73].
++    # Request 0 drafts all 5 steps; request 1 halted early after 2 steps (cols 2..4 = 0.0).
++    raw = torch.tensor(
++        [
++            [0.78, 0.72, 0.71, 0.71, 0.73],
++            [0.45, 0.30, 0.0, 0.0, 0.0],
++        ],
++        device=device,
++        dtype=torch.float32,
++    )
++    probs = raw.clone()
++    slots = torch.tensor([2, 5], device=device, dtype=torch.int32)
++    estimator.features[5] = torch.tensor(
++        [10.0, 20.0, 30.0, 40.0, 50.0], device=device
++    )
++    estimator.predictions[5] = torch.tensor(
++        [0.5, 0.5, 0.5, 0.5, 0.5], device=device
++    )
++    estimator.calibrate_confidence_probs(probs, slots)
++
++    # Request 0 survival matches 1107 empirical c1 survival [0.667, 0.384, 0.185, 0.095, 0.053]
++    # within MAE < 0.006 from step 0 without waiting 100 steps for a refit.
++    emp_survival = torch.tensor(
++        [0.667, 0.384, 0.185, 0.095, 0.053], device=device
++    )
++    cal_survival = torch.cumprod(probs[0], dim=0)
++    assert (cal_survival - emp_survival).abs().mean().item() < 0.006
++
++    # Request 1's halted positions (2..4) remain exact 0.0 and preserve prior slot state.
++    assert probs[1, :2].gt(0.0).all()
++    assert torch.equal(probs[1, 2:], torch.zeros(3, device=device))
++    torch.testing.assert_close(
++        estimator.features[5, 2:],
++        torch.tensor([30.0, 40.0, 50.0], device=device),
++    )
++    torch.testing.assert_close(
++        estimator.predictions[5, 2:],
++        torch.tensor([0.5, 0.5, 0.5], device=device),
++    )
+diff --git a/tests/v1/spec_decode/test_adaptive_verification.py b/tests/v1/spec_decode/test_adaptive_verification.py
+index d9062785b..56026c128 100644
+--- a/tests/v1/spec_decode/test_adaptive_verification.py
++++ b/tests/v1/spec_decode/test_adaptive_verification.py
+@@ -863,8 +863,9 @@ def test_dead_rows_tau_excludes_sub_tau_slots_from_host_budget():
+ 
+ 
+ def test_calibrated_confidence_matches_dead_rows_tau_to_c1_survival():
+-    """With calibrated confidence_head survival, c1 admits positions 0..3 on typical
+-    requests, 0..4 on high-confidence requests, and prunes low-confidence tails."""
++    """With calibrated confidence_head survival, single-tile c1 includes the
++    within-tile marginal row slope and sunk draft cost to retain positive-yield
++    already-drafted tokens while pruning genuinely low-survival tails."""
+     # Typical calibrated c1 conditional probs -> survival [0.677, 0.376, 0.149, 0.0686, 0.0438]
+     typical = np.array([[0.677, 0.556, 0.396, 0.460, 0.638]], dtype=np.float32)
+     manager = make_manager(typical, row_cost=0.035)
+@@ -872,12 +873,18 @@ def test_calibrated_confidence_matches_dead_rows_tau_to_c1_survival():
+     manager.dead_rows_tau = 0.20
+     manager.calibrated_confidence = True
+ 
+-    tau = manager.effective_dead_rows_tau()
+-    assert np.isclose(tau, 2.0 * 0.035 / (1.0 + 3.0 * 0.035))
++    eff_row_cost = 0.035 * adaptive_module.SINGLE_TILE_ROW_COST_SCALE
++    base_cost = 1.0 + adaptive_module.DRAFT_COST_RATIO
++    tau_c1 = manager.effective_dead_rows_tau(num_reqs=1)
++    assert np.isclose(tau_c1, 2.0 * eff_row_cost / (base_cost + 3.0 * eff_row_cost))
++    assert np.isclose(
++        manager.effective_dead_rows_tau(num_reqs=8),
++        2.0 * 0.035 / (1.0 + 3.0 * 0.035),
++    )
+     total = manager.get_num_tokens({"r0": 6}, {"r0": [1, 2, 3, 4, 5]})
+     _, _, draft_budget = manager._batch_budget
+-    assert draft_budget == 4
+-    assert total == 5
++    assert draft_budget == 5
++    assert total == 6
+ 
+     # High-confidence request -> survival [0.85, 0.68, 0.51, 0.36, 0.25] admits all 5
+     high = np.array([[0.85, 0.80, 0.75, 0.70, 0.70]], dtype=np.float32)
+@@ -888,14 +895,15 @@ def test_calibrated_confidence_matches_dead_rows_tau_to_c1_survival():
+     manager_hi.get_num_tokens({"r0": 6}, {"r0": [1, 2, 3, 4, 5]})
+     assert manager_hi._batch_budget[2] == 5
+ 
+-    # Low-confidence branching request -> survival [0.45, 0.18, 0.054, 0.016, 0.005] admits 2
++    # Low-confidence branching request -> survival [0.45, 0.18, 0.054, 0.0162, 0.0049]
++    # admits positions 0..2 (>= 0.01844) and prunes positions 3..4 (< 0.01844).
+     low = np.array([[0.45, 0.40, 0.30, 0.30, 0.30]], dtype=np.float32)
+     manager_lo = make_manager(low, row_cost=0.035)
+     manager_lo.req_states.req_id_to_index = {"r0": 0}
+     manager_lo.dead_rows_tau = 0.20
+     manager_lo.calibrated_confidence = True
+     manager_lo.get_num_tokens({"r0": 6}, {"r0": [1, 2, 3, 4, 5]})
+-    assert manager_lo._batch_budget[2] == 2
++    assert manager_lo._batch_budget[2] == 3
+ 
+ 
+ def test_get_verified_draft_counts_clamps_to_dead_row_cut_and_clears_when_no_drafts():
+@@ -947,3 +955,81 @@ def test_high_concurrency_row_cost_knee_admits_coalesced_drafts():
+     _, _, knee_budget = manager._batch_budget
+     assert knee_budget == 32
+     assert total == 40
++
++
++def test_single_tile_sunk_draft_cost_retains_positive_throughput_drafts_at_c1_and_c2():
++    """Including sunk sequential drafting cost (DRAFT_COST_RATIO) and single-tile
++    marginal row slope (SINGLE_TILE_ROW_COST_SCALE) retains position 4 on c1/c2
++    while preserving multi-tile c8/c16 budgets."""
++    # Empirical 1107 calibrated conditional acceptance -> survival [0.667, 0.384, 0.1855, 0.0948, 0.0535]
++    emp_cond = np.array([[0.667, 0.576, 0.483, 0.511, 0.564]], dtype=np.float32)
++
++    # Without sunk draft cost or single-tile slope, c1 discards position 4 (budget=4).
++    legacy_c1 = make_manager(emp_cond.copy(), row_cost=0.035)
++    legacy_c1.req_states.req_id_to_index = {"r0": 0}
++    legacy_c1.dead_rows_tau = 0.20
++    legacy_c1.calibrated_confidence = True
++    legacy_c1.single_tile_row_cost_scale = 1.0
++    legacy_c1.draft_cost_ratio = 0.0
++    legacy_c1.get_num_tokens({"r0": 6}, {"r0": [1, 2, 3, 4, 5]})
++    assert legacy_c1._batch_budget[2] == 4
++
++    # With single-tile slope (0.42) and sunk draft cost (0.55), c1 (6 rows <= 16)
++    # and c2 (12 rows <= 16) retain all 5 already-drafted tokens per request.
++    cand_c1 = make_manager(emp_cond.copy(), row_cost=0.035)
++    cand_c1.req_states.req_id_to_index = {"r0": 0}
++    cand_c1.dead_rows_tau = 0.20
++    cand_c1.calibrated_confidence = True
++    assert cand_c1.get_num_tokens({"r0": 6}, {"r0": [1, 2, 3, 4, 5]}) == 6
++    assert cand_c1._batch_budget[2] == 5
++
++    cand_c2 = make_manager(np.tile(emp_cond, (2, 1)), row_cost=0.035)
++    cand_c2.req_states.req_id_to_index = {"r0": 0, "r1": 1}
++    cand_c2.dead_rows_tau = 0.20
++    cand_c2.calibrated_confidence = True
++    assert (
++        cand_c2.get_num_tokens(
++            {"r0": 6, "r1": 6}, {"r0": [1, 2, 3, 4, 5], "r1": [1, 2, 3, 4, 5]}
++        )
++        == 12
++    )
++    assert cand_c2._batch_budget[2] == 10
++
++    # Multi-tile c8 (32 total rows, 3 drafts/req) and c16 (48 total rows, 2 drafts/req).
++    for n_reqs, expected_drafts in ((8, 24), (16, 32)):
++        mgr = make_manager(np.tile(emp_cond, (n_reqs, 1)), row_cost=0.035)
++        rids = [f"r{i}" for i in range(n_reqs)]
++        mgr.req_states.req_id_to_index = {rid: i for i, rid in enumerate(rids)}
++        mgr.dead_rows_tau = 0.20
++        mgr.calibrated_confidence = True
++        total = mgr.get_num_tokens(
++            {rid: 6 for rid in rids},
++            {rid: [1, 2, 3, 4, 5] for rid in rids},
++        )
++        assert mgr._batch_budget[2] == expected_drafts
++        assert total == n_reqs + expected_drafts
++
++
++def test_max_draft_steps_for_batch_bounds_sequential_draft_depth():
++    """max_draft_steps_for_batch bounds verifiable per-request draft steps by
++    _max_total_logits and max_draft_steps_per_req."""
++    manager = make_manager(np.ones((16, 5), dtype=np.float32), row_cost=0.035)
++    manager._max_total_logits = 20
++    assert manager.max_draft_steps_for_batch(1) == 5
++    assert manager.max_draft_steps_for_batch(8) == 5
++    # At c16 with max_total_logits=20 and 1 bonus token/req, only 4 draft rows fit.
++    assert manager.max_draft_steps_for_batch(16) == 4
++    assert manager.max_draft_steps_for_batch(20) == 0
++
++    # Once calibrated, multi-tile batches bound sequential draft depth at the
++    # 16-row Tensor Core MMA tile knee (c1/c2 -> 5, c8 -> 4, c16 -> 3).
++    manager._max_total_logits = 2048
++    manager.calibrated_confidence = True
++    assert manager.max_draft_steps_for_batch(1) == 5
++    assert manager.max_draft_steps_for_batch(2) == 5
++    assert manager.max_draft_steps_for_batch(8) == 4
++    assert manager.max_draft_steps_for_batch(16) == 3
++
++    manager.max_draft_steps_per_req = 3
++    assert manager.max_draft_steps_for_batch(1) == 3
++    assert manager.max_draft_steps_for_batch(8) == 3
+diff --git a/tests/v1/worker/test_dspark_greedy_markov.py b/tests/v1/worker/test_dspark_greedy_markov.py
+index 9e611f053..014cb4158 100644
+--- a/tests/v1/worker/test_dspark_greedy_markov.py
++++ b/tests/v1/worker/test_dspark_greedy_markov.py
+@@ -480,3 +480,131 @@ def test_vocab_parallel_markov_dispatch_and_warmups(tp_size, monkeypatch):
+         assert all(w["vocab"] == 43008 and w["top2"] is True for w in shard_warmups)
+     else:
+         assert shard_warmups == []
++
++
++@pytest.mark.parametrize("batch_size", [1, 8, 16])
++def test_dspark_early_draft_halting_and_dynamic_loop_depth(batch_size, monkeypatch):
++    """DSparkSpeculator._sample_sequential and _sample_sequential_topk bound the
++    executed Markov loop depth by max_active_draft_steps and halt early on low
++    cumulative confidence while preserving TP rank determinism."""
++    from vllm.v1.worker.gpu import tilelang_inputs
++    from vllm.v1.worker.gpu.spec_decode.dspark.speculator import DSparkSpeculator
++
++    monkeypatch.setattr(
++        tilelang_inputs, "gather_hidden_rows", lambda src, idx: src[idx]
++    )
++    n_spec = 5
++    vocab_size = 16
++    hidden_dim = 8
++
++    # 1. Dynamic draft depth cap via adaptive_verification.max_draft_steps_for_batch
++    cap_for_batch = {1: 5, 8: 4, 16: 3}[batch_size]
++    executed_steps = []
++
++    def embed(ids):
++        executed_steps.append(ids.clone())
++        return torch.ones((ids.shape[0], 4), dtype=torch.float32)
++
++    base = torch.zeros((batch_size * n_spec, vocab_size), dtype=torch.float32)
++    for s in range(n_spec):
++        base[s::n_spec, s + 1] = 5.0
++
++    def compute_conf(h, m, out=None):
++        probs = torch.full((h.shape[0],), 0.8, dtype=torch.float32)
++        if out is not None:
++            out.copy_(probs)
++            return out
++        return probs
++
++    model = SimpleNamespace(
++        supports_local_draft_argmax=lambda: True,
++        compute_local_draft_logits=lambda h: base,
++        markov_embed=embed,
++        compute_local_markov_bias=lambda x: torch.zeros(
++            (x.shape[0], vocab_size), dtype=torch.float32
++        ),
++        sample_local_draft_logits=lambda b, bias: (b + bias).argmax(dim=-1),
++        compute_confidence=compute_conf,
++    )
++    av = SimpleNamespace(max_draft_steps_for_batch=lambda n: cap_for_batch)
++    spec = SimpleNamespace(
++        _draft_topk=None,
++        num_speculative_steps=n_spec,
++        sample_from_anchor=True,
++        model=model,
++        sample_indices=torch.arange(batch_size * n_spec),
++        sample_idx_mapping=torch.arange(batch_size * n_spec),
++        sample_pos=torch.arange(batch_size * n_spec),
++        use_confidence_head=True,
++        input_buffers=SimpleNamespace(
++            input_ids=torch.full((batch_size * n_spec,), 7, dtype=torch.int64)
++        ),
++        _anchor_idx=torch.arange(batch_size) * n_spec,
++        draft_tokens=torch.full((batch_size, n_spec), -1, dtype=torch.int64),
++        draft_token_confidence_probs=torch.full(
++            (batch_size, n_spec), -1.0, dtype=torch.float32
++        ),
++        draft_logits=None,
++        acceptance_estimator=None,
++        adaptive_verification=av,
++        early_halt_tau=0.0,
++    )
++    spec._vocab_parallel_greedy = MethodType(
++        DSparkSpeculator._vocab_parallel_greedy, spec
++    )
++    hidden = torch.zeros((batch_size * n_spec, hidden_dim), dtype=torch.float32)
++    DSparkSpeculator._sample_sequential(spec, batch_size, hidden)
++
++    assert len(executed_steps) == cap_for_batch
++    for s in range(cap_for_batch):
++        assert (spec.draft_tokens[:, s] == s + 1).all()
++        assert torch.allclose(
++            spec.draft_token_confidence_probs[:, s], torch.tensor(0.8)
++        )
++    if cap_for_batch < n_spec:
++        assert (spec.draft_tokens[:, cap_for_batch:] == 0).all()
++        assert (spec.draft_token_confidence_probs[:, cap_for_batch:] == 0.0).all()
++
++    # 2. Confidence-gated early draft halting (early_halt_tau = 0.15):
++    # Step confidences [0.65, 0.55, 0.25, 0.80, 0.80] -> survival [0.65, 0.3575, 0.0894 < 0.15].
++    # Step 2's confidence is evaluated before step 2's Markov bias/sample, halting at step 2
++    # so only steps 0 and 1 sample tokens and steps 2..4 are skipped and zeroed.
++    step_confs = [0.65, 0.55, 0.25, 0.80, 0.80]
++    conf_call_idx = 0
++    sample_calls = 0
++
++    def compute_conf_halt(h, m, out=None):
++        nonlocal conf_call_idx
++        p = step_confs[min(conf_call_idx, len(step_confs) - 1)]
++        conf_call_idx += 1
++        probs = torch.full((h.shape[0],), p, dtype=torch.float32)
++        if out is not None:
++            out.copy_(probs)
++            return out
++        return probs
++
++    def sample_local(b, bias):
++        nonlocal sample_calls
++        sample_calls += 1
++        return (b + bias).argmax(dim=-1)
++
++    model.compute_confidence = compute_conf_halt
++    model.sample_local_draft_logits = sample_local
++    spec.adaptive_verification = None
++    spec.early_halt_tau = 0.15
++    spec.draft_tokens.fill_(-1)
++    spec.draft_token_confidence_probs.fill_(-1.0)
++
++    DSparkSpeculator._sample_sequential(spec, batch_size, hidden)
++    assert sample_calls == 2
++    assert conf_call_idx == 3
++    assert (spec.draft_tokens[:, 0] == 1).all()
++    assert (spec.draft_tokens[:, 1] == 2).all()
++    assert (spec.draft_tokens[:, 2:] == 0).all()
++    assert torch.allclose(
++        spec.draft_token_confidence_probs[:, 0], torch.tensor(0.65)
++    )
++    assert torch.allclose(
++        spec.draft_token_confidence_probs[:, 1], torch.tensor(0.55)
++    )
++    assert (spec.draft_token_confidence_probs[:, 2:] == 0.0).all()
+diff --git a/vllm/v1/worker/gpu/model_runner.py b/vllm/v1/worker/gpu/model_runner.py
+index 173432af0..c50e64e84 100644
+--- a/vllm/v1/worker/gpu/model_runner.py
++++ b/vllm/v1/worker/gpu/model_runner.py
+@@ -830,15 +830,24 @@ class GPUModelRunner(LoRAModelRunnerMixin):
+                 self.speculator, "tp_invariant_confidence", False
+             ),
+             calibrated_confidence=lambda: (
+-                getattr(
+-                    getattr(self.speculator, "acceptance_estimator", None),
+-                    "_refits",
+-                    0,
++                (
++                    getattr(
++                        getattr(self.speculator, "acceptance_estimator", None),
++                        "is_calibrated",
++                        False,
++                    )
++                    or getattr(
++                        getattr(self.speculator, "acceptance_estimator", None),
++                        "_refits",
++                        0,
++                    )
++                    > 0
+                 )
+-                > 0
+                 and getattr(self.speculator, "use_confidence_head", False)
+             ),
+         )
++        if self.speculator is not None:
++            self.speculator.adaptive_verification = self.adaptive_verification
+         if self.copy_drafter is not None and self.adaptive_verification is None:
+             # The draft budget decides how many of a copy's drafts a step
+             # verifies: a drafter whose checkpoint has no confidence head has
+diff --git a/vllm/v1/worker/gpu/spec_decode/acceptance_estimator.py b/vllm/v1/worker/gpu/spec_decode/acceptance_estimator.py
+index 6f3f3d566..da8fd24b0 100644
+--- a/vllm/v1/worker/gpu/spec_decode/acceptance_estimator.py
++++ b/vllm/v1/worker/gpu/spec_decode/acceptance_estimator.py
+@@ -26,6 +26,20 @@ _INIT_BIAS = -0.2
+ _INIT_CONFIDENCE_HEAD_SLOPE = 1.0
+ _INIT_CONFIDENCE_HEAD_BIAS = 0.0
+ 
++# Empirical per-position log-odds calibration intercepts fitted across DSpark's
++# 5-step Markov confidence head on DeepSeek-V4.1-Flash (positions 0..4).
++# Maps DSpark's overconfident raw head (~[0.78, 0.72, 0.71, 0.71, 0.73]) onto
++# empirical conditional acceptance (~[0.678, 0.576, 0.484, 0.511, 0.563]) from
++# step 0, avoiding cold-boot dead_rows_tau=0.20 starvation and tail censorship
++# during the initial REFIT_INTERVAL steps while still adapting online via IRLS.
++_WARM_CONFIDENCE_HEAD_INTERCEPTS: tuple[float, ...] = (
++    -0.52,
++    -0.64,
++    -0.96,
++    -0.85,
++    -0.74,
++)
++
+ 
+ @triton.jit
+ def _accumulate_kernel(
+@@ -353,6 +367,9 @@ def _calibrate_confidence_kernel(
+     step = token_idx - batch_idx * NUM_SPECULATIVE_STEPS
+ 
+     raw_prob = tl.load(conf_ptr + batch_idx * conf_stride + step).to(tl.float32)
++    if raw_prob <= 0.0:
++        tl.store(conf_ptr + batch_idx * conf_stride + step, 0.0)
++        return
+     eps = 1e-6
+     clamped = tl.minimum(tl.maximum(raw_prob, eps), 1.0 - eps)
+     feature = tl.log(clamped / (1.0 - clamped))
+@@ -418,6 +435,7 @@ class OnlineAcceptanceEstimator:
+         self.device = device
+         self._steps_since_refit = 0
+         self._refits = 0
++        self._warm_started = False
+ 
+         # The learned coefficients used for predicting acceptance.
+         self.slope = torch.full((1,), init_slope, dtype=torch.float32, device=device)
+@@ -473,26 +491,63 @@ class OnlineAcceptanceEstimator:
+             num_speculative_steps, dtype=torch.float32, device=device
+         )
+ 
++    @property
++    def is_calibrated(self) -> bool:
++        """Whether per-position intercepts are calibrated (via warm-start prior or online refit)."""
++        return bool(getattr(self, "_warm_started", False) or self._refits > 0)
++
+     @classmethod
+     def for_confidence_head(
+         cls,
+         max_num_reqs: int,
+         num_speculative_steps: int,
+         device: torch.device,
++        *,
++        warm_start: bool = False,
++        prior_intercepts: tuple[float, ...] | list[float] | None = None,
+     ) -> "OnlineAcceptanceEstimator":
+-        """Create an estimator initialized at identity for a scalar confidence head."""
+-        return cls(
++        """Create an estimator for a scalar confidence head (identity cold-start or warm prior)."""
++        est = cls(
+             max_num_reqs,
+             num_speculative_steps,
+             device,
+             init_slope=_INIT_CONFIDENCE_HEAD_SLOPE,
+             init_bias=_INIT_CONFIDENCE_HEAD_BIAS,
+         )
++        if warm_start or prior_intercepts is not None:
++            est.reset_for_confidence_head(
++                warm_start=True, prior_intercepts=prior_intercepts
++            )
++        return est
+ 
+-    def reset_for_confidence_head(self) -> None:
+-        """Reset coefficients to identity in log-odds space for a scalar confidence head."""
++    def reset_for_confidence_head(
++        self,
++        *,
++        warm_start: bool = False,
++        prior_intercepts: tuple[float, ...] | list[float] | None = None,
++    ) -> None:
++        """Reset coefficients for a scalar confidence head (identity or warm prior intercepts)."""
+         self.slope.fill_(_INIT_CONFIDENCE_HEAD_SLOPE)
+-        self.intercepts.fill_(_INIT_CONFIDENCE_HEAD_BIAS)
++        if warm_start or prior_intercepts is not None:
++            priors = (
++                tuple(prior_intercepts)
++                if prior_intercepts is not None
++                else _WARM_CONFIDENCE_HEAD_INTERCEPTS
++            )
++            if priors:
++                vals = [
++                    float(priors[k] if k < len(priors) else priors[-1])
++                    for k in range(self.num_speculative_steps)
++                ]
++                self.intercepts.copy_(
++                    torch.tensor(vals, dtype=torch.float32, device=self.device)
++                )
++            else:
++                self.intercepts.fill_(_INIT_CONFIDENCE_HEAD_BIAS)
++            self._warm_started = True
++        else:
++            self.intercepts.fill_(_INIT_CONFIDENCE_HEAD_BIAS)
++            self._warm_started = False
+ 
+     def step(
+         self,
+@@ -699,23 +754,31 @@ class OnlineAcceptanceEstimator:
+             token_idx_mapping = idx_mapping[:num_tokens]
+ 
+         if confidence_probs.device.type != "cuda":
++            raw = confidence_probs.float()
++            active = raw > 0.0
+             eps = 1e-6
+-            clamped = confidence_probs.float().clamp(eps, 1.0 - eps)
++            clamped = raw.clamp(eps, 1.0 - eps)
+             features = torch.log(clamped / (1.0 - clamped)).clamp(
+                 -_MAX_LOG_ODDS, _MAX_LOG_ODDS
+             )
+             probs = torch.sigmoid(
+                 self.slope.float() * features + self.intercepts.float()[None, :]
+-            ).to(confidence_probs.dtype)
+-            confidence_probs.copy_(probs)
++            )
++            probs = torch.where(active, probs, torch.zeros_like(probs))
++            confidence_probs.copy_(probs.to(confidence_probs.dtype))
+             req_slots = token_idx_mapping.view(num_reqs, num_steps)[:, 0].to(
+                 torch.int64
+             )
+             valid = req_slots >= 0
+             if valid.any():
+                 live_slots = req_slots[valid]
+-                self.features[live_slots] = features[valid]
+-                self.predictions[live_slots] = probs[valid].float()
++                live_active = active[valid]
++                self.features[live_slots] = torch.where(
++                    live_active, features[valid], self.features[live_slots]
++                )
++                self.predictions[live_slots] = torch.where(
++                    live_active, probs[valid], self.predictions[live_slots]
++                )
+             return
+ 
+         _calibrate_confidence_kernel[(num_tokens,)](
+diff --git a/vllm/v1/worker/gpu/spec_decode/adaptive_verification.py b/vllm/v1/worker/gpu/spec_decode/adaptive_verification.py
+index 3f49b6cbc..9ab840028 100644
+--- a/vllm/v1/worker/gpu/spec_decode/adaptive_verification.py
++++ b/vllm/v1/worker/gpu/spec_decode/adaptive_verification.py
+@@ -56,6 +56,18 @@ EXPLORE_AFTER_IDLE_STEPS = 32
+ HIGH_ROW_COST_KNEE = 16
+ HIGH_ROW_COST_SCALE = 0.55
+ 
++# Single-tile (`max_rows <= 16`) marginal row-cost floor and sunk drafting step
++# overhead: when the entire verification step fits inside one 16-row Tensor Core
++# MMA tile (`decode_16`, e.g., `c1` with 1..6 rows or `c2` with 2..12 rows),
++# adding rows `2..6` costs `+0.145..0.267 ms/row` (`~0.42x` of the nominal
++# `row_cost`), and the step has already paid the fixed DSpark drafting +
++# bookkeeping cost (`~8.5 ms` vs `~15.5 ms` verify base = `0.55` relative base
++# cost). Including `DRAFT_COST_RATIO` in the utility denominator and scaling
++# single-tile marginal row cost by `SINGLE_TILE_ROW_COST_SCALE` prevents
++# discarding already-drafted tokens with positive net throughput contribution.
++SINGLE_TILE_ROW_COST_SCALE = 0.42
++DRAFT_COST_RATIO = 0.55
++
+ 
+ def resolve_adaptive_cudagraph_mode(
+     mode: CUDAGraphMode, *, piecewise_capture_available: bool
+@@ -285,35 +297,123 @@ class AdaptiveVerificationManager:
+             write_slot.copy_to_cpu()
+             self._copy_events[write_idx].record()
+ 
++    def _is_calibrated(self) -> bool:
++        calibrated = getattr(self, "calibrated_confidence", False)
++        if callable(calibrated):
++            return bool(calibrated())
++        return bool(calibrated)
++
++    def max_draft_steps_for_batch(self, num_reqs: int) -> int:
++        """Maximum per-request draft steps verifiable for a batch of ``num_reqs``."""
++        step_steps = int(
++            getattr(self, "num_draft_steps", self.num_speculative_steps)
++        )
++        if num_reqs <= 0:
++            return 0
++        bonus = int(getattr(self, "num_bonus_tokens", 1))
++        max_total_logits = int(getattr(self, "_max_total_logits", 0))
++        if max_total_logits > 0:
++            max_draft_budget = max(0, max_total_logits - num_reqs * bonus)
++            step_steps = min(step_steps, max_draft_budget)
++        knee = getattr(self, "high_row_cost_knee", HIGH_ROW_COST_KNEE)
++        if (
++            self._is_calibrated()
++            and self.row_cost > 0.0
++            and knee > 0
++            and step_steps >= 4
++        ):
++            if num_reqs >= knee:
++                step_steps = min(step_steps, max(1, step_steps - 2))
++            elif 2 * num_reqs >= knee:
++                step_steps = min(step_steps, max(1, step_steps - 1))
++        per_req_cap = getattr(self, "max_draft_steps_per_req", None)
++        if per_req_cap is not None:
++            step_steps = min(step_steps, max(0, int(per_req_cap)))
++        return max(0, step_steps)
++
+     def _step_cost(self, rows: np.ndarray) -> np.ndarray:
+-        """Relative verification step cost with a 16-row Tensor Core MMA tile knee."""
++        """Relative verification step cost with single-tile floor, sunk draft cost, and 16-row MMA knee."""
+         knee = getattr(self, "high_row_cost_knee", HIGH_ROW_COST_KNEE)
+         scale = getattr(self, "high_row_cost_scale", HIGH_ROW_COST_SCALE)
++        max_rows = int(np.max(rows)) if rows.size > 0 else 0
++        calibrated = self._is_calibrated()
++        if knee > 0 and max_rows <= knee:
++            single_tile_scale = float(
++                getattr(
++                    self,
++                    "single_tile_row_cost_scale",
++                    SINGLE_TILE_ROW_COST_SCALE if calibrated else 1.0,
++                )
++            )
++            draft_cost_ratio = float(
++                getattr(
++                    self,
++                    "draft_cost_ratio",
++                    DRAFT_COST_RATIO if calibrated else 0.0,
++                )
++            )
++            if single_tile_scale != 1.0 or draft_cost_ratio > 0.0:
++                return (1.0 + draft_cost_ratio) + (
++                    self.row_cost * single_tile_scale
++                ) * rows
++        draft_cost_ratio = float(getattr(self, "draft_cost_ratio", 0.0))
+         if knee > 0 and scale != 1.0:
+             effective_rows = np.minimum(rows, knee) + scale * np.maximum(
+                 rows - knee, 0
+             )
+         else:
+             effective_rows = rows
+-        return 1.0 + self.row_cost * effective_rows
++        return (1.0 + draft_cost_ratio) + self.row_cost * effective_rows
+ 
+-    def effective_dead_rows_tau(self) -> float:
++    def effective_dead_rows_tau(self, num_reqs: int = 1) -> float:
+         """Survival threshold for dead-row pruning on host and device.
+ 
+         Raw ``confidence_head`` survival is inflated by ~3x at tail positions,
+         which ``_DEAD_ROWS_TAU`` (0.20) was scaled to cut. Once online IRLS
+-        calibration fits the per-position intercepts, survival probabilities are
+-        already on the true acceptance scale, so the threshold matches the
+-        single-request marginal row-cost break-even ``2 * row_cost / (1 + 3 * row_cost)``
+-        instead of double-counting the tail decay.
++        calibration (or warm-start prior calibration) fits the per-position
++        intercepts, survival probabilities are on the true acceptance scale.
++        When the entire batch fits within a single 16-row Tensor Core MMA tile
++        (``num_reqs * (1 + step_steps) <= HIGH_ROW_COST_KNEE``), the marginal
++        row break-even includes the within-tile slope ``SINGLE_TILE_ROW_COST_SCALE``
++        and the sunk drafting step overhead ``DRAFT_COST_RATIO``:
++        ``2 * eff_row_cost / ((1 + draft_cost_ratio) + 3 * eff_row_cost)``.
+         """
+         tau = float(getattr(self, "dead_rows_tau", 0.0))
+         if tau <= 0.0:
+             return 0.0
+-        calibrated = getattr(self, "calibrated_confidence", False)
+-        if callable(calibrated):
+-            calibrated = bool(calibrated())
+-        if calibrated and self.row_cost > 0.0:
++        calibrated = self._is_calibrated()
++        has_explicit_single_tile = (
++            hasattr(self, "single_tile_row_cost_scale")
++            or hasattr(self, "draft_cost_ratio")
++        )
++        if (calibrated or has_explicit_single_tile) and self.row_cost > 0.0:
++            knee = getattr(self, "high_row_cost_knee", HIGH_ROW_COST_KNEE)
++            step_steps = int(
++                getattr(
++                    self,
++                    "num_draft_steps",
++                    getattr(self, "num_speculative_steps", 5),
++                )
++            )
++            bonus = int(getattr(self, "num_bonus_tokens", 1))
++            max_possible_rows = max(1, int(num_reqs)) * (bonus + step_steps)
++            if knee > 0 and max_possible_rows <= knee:
++                single_tile_scale = float(
++                    getattr(
++                        self,
++                        "single_tile_row_cost_scale",
++                        SINGLE_TILE_ROW_COST_SCALE,
++                    )
++                )
++                draft_cost_ratio = float(
++                    getattr(self, "draft_cost_ratio", DRAFT_COST_RATIO)
++                )
++                eff_row_cost = self.row_cost * single_tile_scale
++                base_cost = 1.0 + draft_cost_ratio
++                return min(
++                    tau,
++                    2.0 * eff_row_cost / (base_cost + 3.0 * eff_row_cost),
++                )
+             return min(tau, 2.0 * self.row_cost / (1.0 + 3.0 * self.row_cost))
+         return tau
+ 
+@@ -363,7 +463,7 @@ class AdaptiveVerificationManager:
+         survival_probability = np.cumprod(stale_confidences.astype(np.float64), axis=1)
+         steps = np.arange(step_steps)
+         valid = steps[None, :] < eligible_drafts[:, None]
+-        tau = self.effective_dead_rows_tau()
++        tau = self.effective_dead_rows_tau(num_reqs=num_reqs)
+         if tau > 0:
+             # Never admit draft slots on the host that the device dead-row
+             # threshold will immediately mask as padding.
+@@ -466,7 +566,7 @@ class AdaptiveVerificationManager:
+         The confidences are the current drafts', broadcast from rank 0, so
+         every rank marks the same rows.
+         """
+-        tau = self.effective_dead_rows_tau()
++        tau = self.effective_dead_rows_tau(num_reqs=num_reqs)
+         if tau <= 0 or not getattr(self, "_has_admitted_drafts", True):
+             return None
+         return DeadRows(
+diff --git a/vllm/v1/worker/gpu/spec_decode/dspark/speculator.py b/vllm/v1/worker/gpu/spec_decode/dspark/speculator.py
+index 710d549be..e27e38022 100644
+--- a/vllm/v1/worker/gpu/spec_decode/dspark/speculator.py
++++ b/vllm/v1/worker/gpu/spec_decode/dspark/speculator.py
+@@ -193,6 +193,19 @@ class DSparkSpeculator(DFlashSpeculator):
+         self._markov_conf_weight = torch.zeros(
+             rank, dtype=torch.float32, device=device
+         )
++        self._step_confidence_prob = torch.empty(
++            self.max_num_reqs, dtype=torch.float32, device=device
++        )
++        self.max_draft_steps: int = self.num_speculative_steps
++        self.early_halt_tau: float = float(
++            getattr(
++                self.draft_model_config.hf_config,
++                "dspark_early_halt_tau",
++                0.0,
++            )
++            or 0.0
++        )
++        self.adaptive_verification: Any = None
+ 
+     @property
+     def attn_vllm_config(self) -> VllmConfig:
+@@ -263,7 +276,7 @@ class DSparkSpeculator(DFlashSpeculator):
+     def load_model(self, target_model: torch.nn.Module) -> None:
+         super().load_model(target_model)
+         if self.use_confidence_head and self.acceptance_estimator is not None:
+-            self.acceptance_estimator.reset_for_confidence_head()
++            self.acceptance_estimator.reset_for_confidence_head(warm_start=True)
+ 
+     @property
+     def tp_invariant_confidence(self) -> bool:
+@@ -421,13 +434,90 @@ class DSparkSpeculator(DFlashSpeculator):
+             return None
+         return table
+ 
+-    def _sample_sequential(self, num_reqs: int, head_hidden: torch.Tensor) -> None:
++    def max_active_draft_steps(
++        self,
++        num_reqs: int,
++        num_speculative_tokens: int | None = None,
++    ) -> int:
++        """Maximum sequential Markov draft steps that can be verified for ``num_reqs``."""
++        n_spec = int(self.num_speculative_steps)
++        active = n_spec
++        max_steps = getattr(self, "max_draft_steps", None)
++        if max_steps is not None:
++            active = min(active, max(0, int(max_steps)))
++        if num_speculative_tokens is not None:
++            active = min(active, max(0, int(num_speculative_tokens)))
++        av = getattr(self, "adaptive_verification", None)
++        if av is not None and hasattr(av, "max_draft_steps_for_batch"):
++            active = min(active, int(av.max_draft_steps_for_batch(num_reqs)))
++        return max(0, min(active, n_spec))
++
++    def _effective_early_halt_tau(self, num_reqs: int) -> float:
++        tau = float(getattr(self, "early_halt_tau", 0.0) or 0.0)
++        if tau <= 0.0:
++            av = getattr(self, "adaptive_verification", None)
++            if av is not None:
++                tau = float(getattr(av, "early_halt_tau", 0.0) or 0.0)
++        return max(0.0, tau)
++
++    def _compute_step_confidence(
++        self,
++        num_reqs: int,
++        step: int,
++        step_hidden: torch.Tensor,
++        markov_embed: torch.Tensor,
++    ) -> torch.Tensor:
++        buf = getattr(self, "_step_confidence_prob", None)
++        if buf is None or buf.shape[0] < num_reqs or buf.device != step_hidden.device:
++            step_out = torch.empty(
++                num_reqs, dtype=torch.float32, device=step_hidden.device
++            )
++        else:
++            step_out = buf[:num_reqs]
++        self.model.compute_confidence(
++            step_hidden.contiguous(),
++            markov_embed.contiguous(),
++            out=step_out,
++        )
++        self.draft_token_confidence_probs[:num_reqs, step].copy_(step_out)
++        est = getattr(self, "acceptance_estimator", None)
++        if est is not None:
++            from vllm.v1.worker.gpu.spec_decode.acceptance_estimator import (
++                _MAX_LOG_ODDS,
++            )
++
++            eps = 1e-6
++            clamped = step_out.float().clamp(eps, 1.0 - eps)
++            feat = torch.log(clamped / (1.0 - clamped)).clamp(
++                -_MAX_LOG_ODDS, _MAX_LOG_ODDS
++            )
++            return torch.sigmoid(
++                est.slope.float() * feat + est.intercepts[step].float()
++            )
++        return step_out
++
++    def _sample_sequential(
++        self,
++        num_reqs: int,
++        head_hidden: torch.Tensor,
++        num_speculative_tokens: int | None = None,
++    ) -> None:
+         if self._draft_topk is not None:
+-            self._sample_sequential_topk(num_reqs, head_hidden)
++            DSparkSpeculator._sample_sequential_topk(
++                self, num_reqs, head_hidden, num_speculative_tokens
++            )
+             return
+ 
+         # Sequential Markov sampling over the backbone's output hidden states.
+         n_spec = self.num_speculative_steps
++        active_steps = DSparkSpeculator.max_active_draft_steps(
++            self, num_reqs, num_speculative_tokens
++        )
++        if active_steps <= 0:
++            self.draft_tokens[:num_reqs].zero_()
++            if self.use_confidence_head:
++                self.draft_token_confidence_probs[:num_reqs].zero_()
++            return
+         num_sample = num_reqs * n_spec
+         # Per-(req, position) head hidden, ordered (req, step). When
+         # sample_from_anchor is True, each request's query block has exactly
+@@ -478,14 +568,50 @@ class DSparkSpeculator(DFlashSpeculator):
+         else:
+             prev = self.input_buffers.input_ids[self._anchor_idx[:num_reqs]]
+ 
+-        for i in range(n_spec):
++        early_halt_tau = DSparkSpeculator._effective_early_halt_tau(self, num_reqs)
++        can_early_halt = (
++            early_halt_tau > 0.0
++            and self.use_confidence_head
++            and not (
++                torch.cuda.is_available() and torch.cuda.is_current_stream_capturing()
++            )
++        )
++        sample_hidden_steps = (
++            sample_hidden.view(num_reqs, n_spec, -1) if can_early_halt else None
++        )
++        cum_survival: torch.Tensor | None = None
++        halted_steps = active_steps
++
++        for i in range(active_steps):
++            if (
++                can_early_halt
++                and i >= 1
++                and cum_survival is not None
++                and bool((cum_survival < early_halt_tau).all())
++            ):
++                halted_steps = i
++                break
++
+             # Sequential stage: Markov bias from the previously sampled token.
+             if table is not None:
+                 markov_embed = step_embed
+             else:
+                 markov_embed = self.model.markov_embed(prev)
+-                if self.use_confidence_head:
+-                    confidence_markov_embeds.append(markov_embed)
++
++            if can_early_halt:
++                assert sample_hidden_steps is not None
++                step_prob = DSparkSpeculator._compute_step_confidence(
++                    self, num_reqs, i, sample_hidden_steps[:, i], markov_embed
++                )
++                cum_survival = (
++                    step_prob if cum_survival is None else cum_survival * step_prob
++                )
++                if i >= 1 and bool((cum_survival < early_halt_tau).all()):
++                    halted_steps = i
++                    break
++            elif table is None and self.use_confidence_head:
++                confidence_markov_embeds.append(markov_embed)
++
+             if local_head:
+                 bias = self.model.compute_local_markov_bias(markov_embed)
+                 if self.draft_logits is None and not _needs_logits_for_acceptance(self):
+@@ -525,7 +651,7 @@ class DSparkSpeculator(DFlashSpeculator):
+                         top2=use_top2,
+                     )
+                 draft_sampled_i = self.draft_tokens[:num_reqs, i]
+-                has_embed = table is not None and i + 1 < n_spec
++                has_embed = table is not None and i + 1 < active_steps
+                 select_first_argmax(
+                     tensor_model_parallel_all_gather(pairs, dim=-1),
+                     draft_sampled_i,
+@@ -572,19 +698,27 @@ class DSparkSpeculator(DFlashSpeculator):
+                 self.draft_tokens[:num_reqs, i] = draft_sampled_i
+             prev = draft_sampled_i
+ 
+-        if self.use_confidence_head and table is not None:
+-            # Straight into the probabilities' rows (contiguous: [:num_reqs]).
+-            self.model.compute_confidence(
+-                sample_hidden,
+-                confidence_embeds.flatten(0, 1),
+-                out=self.draft_token_confidence_probs[:num_reqs].view(-1),
+-            )
+-        elif self.use_confidence_head:
+-            self.model.compute_confidence(
+-                sample_hidden,
+-                torch.stack(confidence_markov_embeds, dim=1).flatten(0, 1),
+-                out=self.draft_token_confidence_probs[:num_reqs].view(-1),
+-            )
++        if halted_steps < n_spec:
++            self.draft_tokens[:num_reqs, halted_steps:].zero_()
++
++        if self.use_confidence_head and not can_early_halt:
++            if table is not None:
++                # Straight into the probabilities' rows (contiguous: [:num_reqs]).
++                self.model.compute_confidence(
++                    sample_hidden,
++                    confidence_embeds.flatten(0, 1),
++                    out=self.draft_token_confidence_probs[:num_reqs].view(-1),
++                )
++            else:
++                while len(confidence_markov_embeds) < n_spec:
++                    confidence_markov_embeds.append(confidence_markov_embeds[-1])
++                self.model.compute_confidence(
++                    sample_hidden,
++                    torch.stack(confidence_markov_embeds, dim=1).flatten(0, 1),
++                    out=self.draft_token_confidence_probs[:num_reqs].view(-1),
++                )
++        if self.use_confidence_head and halted_steps < n_spec:
++            self.draft_token_confidence_probs[:num_reqs, halted_steps:].zero_()
+         if (
+             self.use_confidence_head
+             and getattr(self, "acceptance_estimator", None) is not None
+@@ -594,7 +728,12 @@ class DSparkSpeculator(DFlashSpeculator):
+                 self.sample_idx_mapping[:num_sample],
+             )
+ 
+-    def _sample_sequential_topk(self, num_reqs: int, head_hidden: torch.Tensor) -> None:
++    def _sample_sequential_topk(
++        self,
++        num_reqs: int,
++        head_hidden: torch.Tensor,
++        num_speculative_tokens: int | None = None,
++    ) -> None:
+         """Apply the sequential Markov head only to top-k base-logit candidates.
+ 
+         Candidate selection is done once for all draft positions. At each
+@@ -604,6 +743,14 @@ class DSparkSpeculator(DFlashSpeculator):
+         """
+         assert self._draft_topk is not None
+         n_spec = self.num_speculative_steps
++        active_steps = DSparkSpeculator.max_active_draft_steps(
++            self, num_reqs, num_speculative_tokens
++        )
++        if active_steps <= 0:
++            self.draft_tokens[:num_reqs].zero_()
++            if self.use_confidence_head:
++                self.draft_token_confidence_probs[:num_reqs].zero_()
++            return
+         num_sample = num_reqs * n_spec
+         sample_hidden = (
+             head_hidden[:num_sample]
+@@ -623,10 +770,42 @@ class DSparkSpeculator(DFlashSpeculator):
+         sample_pos = self.sample_pos[:num_sample].view(num_reqs, n_spec)
+         confidence_markov_embeds = []
+         prev = self.input_buffers.input_ids[self._anchor_idx[:num_reqs]]
++        early_halt_tau = DSparkSpeculator._effective_early_halt_tau(self, num_reqs)
++        can_early_halt = (
++            early_halt_tau > 0.0
++            and self.use_confidence_head
++            and not (
++                torch.cuda.is_available() and torch.cuda.is_current_stream_capturing()
++            )
++        )
++        sample_hidden_steps = (
++            sample_hidden.view(num_reqs, n_spec, -1) if can_early_halt else None
++        )
++        cum_survival: torch.Tensor | None = None
++        halted_steps = active_steps
+ 
+-        for i in range(n_spec):
++        for i in range(active_steps):
++            if (
++                can_early_halt
++                and i >= 1
++                and cum_survival is not None
++                and bool((cum_survival < early_halt_tau).all())
++            ):
++                halted_steps = i
++                break
+             markov_embed = self.model.markov_embed(prev)
+-            if self.use_confidence_head:
++            if can_early_halt:
++                assert sample_hidden_steps is not None
++                step_prob = DSparkSpeculator._compute_step_confidence(
++                    self, num_reqs, i, sample_hidden_steps[:, i], markov_embed
++                )
++                cum_survival = (
++                    step_prob if cum_survival is None else cum_survival * step_prob
++                )
++                if i >= 1 and bool((cum_survival < early_halt_tau).all()):
++                    halted_steps = i
++                    break
++            elif self.use_confidence_head:
+                 confidence_markov_embeds.append(markov_embed)
+             logits_i = self.model.apply_markov_bias_gathered(
+                 markov_embed,
+@@ -640,12 +819,20 @@ class DSparkSpeculator(DFlashSpeculator):
+             self.draft_tokens[:num_reqs, i] = draft_sampled_i
+             prev = draft_sampled_i
+ 
++        if halted_steps < n_spec:
++            self.draft_tokens[:num_reqs, halted_steps:].zero_()
++
+         if self.use_confidence_head:
+-            self.model.compute_confidence(
+-                sample_hidden,
+-                torch.stack(confidence_markov_embeds, dim=1).flatten(0, 1),
+-                out=self.draft_token_confidence_probs[:num_reqs].view(-1),
+-            )
++            if not can_early_halt:
++                while len(confidence_markov_embeds) < n_spec:
++                    confidence_markov_embeds.append(confidence_markov_embeds[-1])
++                self.model.compute_confidence(
++                    sample_hidden,
++                    torch.stack(confidence_markov_embeds, dim=1).flatten(0, 1),
++                    out=self.draft_token_confidence_probs[:num_reqs].view(-1),
++                )
++            if halted_steps < n_spec:
++                self.draft_token_confidence_probs[:num_reqs, halted_steps:].zero_()
+             if getattr(self, "acceptance_estimator", None) is not None:
+                 self.acceptance_estimator.calibrate_confidence_probs(
+                     self.draft_token_confidence_probs[:num_reqs],
+-- 
+2.43.0
+
