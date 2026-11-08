@@ -1,0 +1,2607 @@
+From c40eaf1671e33eeb08f2e8f2e8947fba4831658a Mon Sep 17 00:00:00 2001
+From: Christopher Owen <christopherowen@users.noreply.github.com>
+Date: Sun, 8 Nov 2026 19:55:13 +0000
+Subject: [PATCH] feat(dspark): online verification-driven drafter adaptation
+ and session memory
+
+Base: 1107 vLLM patch head 2756478b60b90700b9918b457aeb38657da637b5 (tree ed1bdb7a7684da33d403a055521ac0c4dd7ca670).
+
+Rationale:
+Static DSpark speculative drafting and confidence estimation under-utilize live verification feedback on recurring user coding and multi-turn tool-call workloads:
+1. Confidence calibration on OnlineAcceptanceEstimator previously required an uncalibrated warmup window before the first IRLS refit, and lacked a standalone per-position FP64 log-odds calibrator with scale and bias tracking across conditionally reached draft positions.
+2. DSpark Markov conditioning embeddings (markov_w1), optional 256-dim hidden-to-Markov latent encoder projections (hidden_to_markov_proj), and confidence_head weights remained static at inference time even when user sessions exhibited strong domain-specific token transitions.
+3. CopyDrafter only matched n-gram suffixes inside the current request buffer, missing recurring codebase identifiers, file paths, and tool-call schemas on Turn 2+ before they repeated within the current prompt.
+
+Add opt-in online verification-driven adaptation in vllm/v1/worker/gpu/spec_decode/online_dspark_adaptation.py and wire it into DSparkSpeculator, AdaptiveVerificationManager, OnlineAcceptanceEstimator, CopyDrafter, and EagleSpeculator:
+- Part 1: OnlineConfidenceCalibrator (damped EMA-Newton per-position log-odds calibration in deterministic FP64) and OnlineAcceptanceEstimator.warm_start_prior / state_dict / load_state_dict for zero-warmup calibrated startup.
+- Part 2: OnlineDSparkHeadAdapter and compute_e2e_tv_and_bce_loss using prefix-product total-variation (E2E-TV) loss over top-k candidate subsets (preserving unnormalized excluded teacher mass) and auxiliary binary cross-entropy (BCE) supervision on confidence_head against detached token overlap, supporting joint 256-dim Markov latent encoder updates with frozen 66 MiB markov_w2 and position-scaled Gaussian latent noise regularization (sigma_i = sigma_0 * (i / K) for block-predicted positions i >= 1) plus rank-deterministic scatter-add without atomic collisions.
+- Part 3: SessionTokenMemory bounded GPU ring buffer integrated with CopyDrafter and DSparkSpeculator for cross-request suffix continuation across multi-turn sessions.
+
+Quality:
+Lossless speculative verification: greedy and rejection-sampling verification preserve exact target output distributions regardless of drafter adaptation state. All online updates are 100% bit-deterministic across TP ranks with zero extra inter-rank communication, and default runtime behavior is unchanged unless opted in.
+
+Tests:
+- pytest --noconftest tests/v1/spec_decode/test_online_dspark_adaptation.py tests/v1/spec_decode/test_acceptance_estimator.py tests/v1/spec_decode/test_adaptive_verification.py tests/v1/spec_decode/test_copy_drafts.py tests/v1/worker/test_dspark_greedy_markov.py (162 passed, 1 skipped).
+
+Upstream status: local speculative decoding adaptation candidate for GB10 nodes.
+---
+ .../test_online_dspark_adaptation.py          |  765 +++++++++
+ vllm/models/deepseek_v4_1/nvidia/dspark.py    |   23 +
+ .../gpu/spec_decode/acceptance_estimator.py   |   59 +
+ .../gpu/spec_decode/adaptive_verification.py  |   15 +
+ vllm/v1/worker/gpu/spec_decode/copy_drafts.py |   61 +
+ .../gpu/spec_decode/dspark/speculator.py      |   60 +
+ .../worker/gpu/spec_decode/eagle/__init__.py  |    6 +
+ .../spec_decode/online_dspark_adaptation.py   | 1443 +++++++++++++++++
+ 8 files changed, 2432 insertions(+)
+ create mode 100644 tests/v1/spec_decode/test_online_dspark_adaptation.py
+ create mode 100644 vllm/v1/worker/gpu/spec_decode/online_dspark_adaptation.py
+
+diff --git a/tests/v1/spec_decode/test_online_dspark_adaptation.py b/tests/v1/spec_decode/test_online_dspark_adaptation.py
+new file mode 100644
+index 000000000..c3bc68794
+--- /dev/null
++++ b/tests/v1/spec_decode/test_online_dspark_adaptation.py
+@@ -0,0 +1,765 @@
++# SPDX-License-Identifier: Apache-2.0
++# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
++"""Unit tests for online verification-driven DSpark drafter adaptation."""
++
++from __future__ import annotations
++
++from types import SimpleNamespace
++from typing import Any
++
++import pytest
++import torch
++import torch.nn as nn
++import torch.nn.functional as F
++
++from vllm.config.speculative import CopyDraftsConfig
++from vllm.v1.worker.gpu.spec_decode.acceptance_estimator import (
++    OnlineAcceptanceEstimator,
++)
++from vllm.v1.worker.gpu.spec_decode.copy_drafts import CopyDrafter
++from vllm.v1.worker.gpu.spec_decode.dspark.speculator import DSparkSpeculator
++from vllm.v1.worker.gpu.spec_decode.online_dspark_adaptation import (
++    OnlineConfidenceCalibrator,
++    OnlineDSparkHeadAdapter,
++    SessionTokenMemory,
++    compute_e2e_tv_and_bce_loss,
++    verify_greedy_lossless,
++    verify_rejection_sampling_lossless,
++)
++
++
++def _default_device() -> torch.device:
++    return torch.device("cuda" if torch.cuda.is_available() else "cpu")
++
++
++def test_greedy_verification_target_output_invariance():
++    """Greedy speculative verification must emit the exact target argmax sequence
++    regardless of drafter adaptation state."""
++    device = _default_device()
++    torch.manual_seed(101)
++    bsz, steps, vocab_size = 6, 5, 256
++
++    target_logits = torch.randn(bsz, steps + 1, vocab_size, device=device)
++    target_argmax = target_logits.argmax(dim=-1)
++
++    # Case 1: unadapted random draft tokens
++    random_drafts = torch.randint(0, vocab_size, (bsz, steps), device=device)
++    # Force partial prefix matches on some rows
++    random_drafts[0, :3] = target_argmax[0, :3]
++    random_drafts[1, :] = target_argmax[1, :steps]
++
++    emitted_rand, acc_rand, num_emit_rand = verify_greedy_lossless(
++        random_drafts, target_logits
++    )
++    for b in range(bsz):
++        n_em = int(num_emit_rand[b].item())
++        assert n_em == int(acc_rand[b].item()) + 1
++        torch.testing.assert_close(
++            emitted_rand[b, :n_em], target_argmax[b, :n_em], rtol=0, atol=0
++        )
++
++    # Case 2: multi-step autoregressive rollout invariance before vs after online adaptation
++    seq_len = 24
++    true_target_stream = torch.randint(0, vocab_size, (bsz, seq_len), device=device)
++
++    def _run_speculative_rollout(perfect_prefix: int) -> torch.Tensor:
++        cursors = torch.zeros(bsz, dtype=torch.int64, device=device)
++        collected = [torch.empty(0, dtype=torch.int64, device=device) for _ in range(bsz)]
++        while bool((cursors < seq_len).any()):
++            step_logits = torch.full(
++                (bsz, steps + 1, vocab_size), -10.0, dtype=torch.float32, device=device
++            )
++            draft_prop = torch.zeros((bsz, steps), dtype=torch.int64, device=device)
++            for b in range(bsz):
++                pos = int(cursors[b].item())
++                for s in range(steps + 1):
++                    t_idx = min(pos + s, seq_len - 1)
++                    tok = int(true_target_stream[b, t_idx].item())
++                    step_logits[b, s, tok] = 10.0
++                    if s < steps:
++                        if s < perfect_prefix:
++                            draft_prop[b, s] = tok
++                        else:
++                            draft_prop[b, s] = (tok + 17 + s) % vocab_size
++            emitted, _, num_emitted = verify_greedy_lossless(draft_prop, step_logits)
++            for b in range(bsz):
++                pos = int(cursors[b].item())
++                if pos >= seq_len:
++                    continue
++                take = min(int(num_emitted[b].item()), seq_len - pos)
++                collected[b] = torch.cat([collected[b], emitted[b, :take]], dim=0)
++                cursors[b] = pos + take
++        return torch.stack(collected, dim=0)
++
++    out_unadapted = _run_speculative_rollout(perfect_prefix=0)
++    out_partial = _run_speculative_rollout(perfect_prefix=2)
++    out_adapted = _run_speculative_rollout(perfect_prefix=steps)
++
++    assert torch.equal(out_unadapted, true_target_stream)
++    assert torch.equal(out_partial, true_target_stream)
++    assert torch.equal(out_adapted, true_target_stream)
++
++
++def test_rejection_sampling_target_distribution_invariance():
++    """Speculative rejection sampling must preserve the exact target distribution
++    for any draft proposal distribution q(v)."""
++    device = _default_device()
++    torch.manual_seed(202)
++    vocab_size = 8
++    target_logits = torch.tensor(
++        [1.4, -0.5, 0.8, 2.1, -1.2, 0.3, 0.0, -0.7],
++        dtype=torch.float64,
++        device=device,
++    )
++    p = F.softmax(target_logits, dim=-1)
++
++    for draft_scale in (-1.5, 0.0, 0.7, 2.5):
++        draft_logits = draft_scale * target_logits + torch.linspace(
++            -0.8, 0.8, vocab_size, dtype=torch.float64, device=device
++        )
++        q = F.softmax(draft_logits, dim=-1)
++
++        # Exact mathematical marginal check:
++        # P(emit = v) = q(v) * min(1, p(v)/q(v)) + (1 - sum_u min(q(u), p(u))) * max(0, p(v) - q(v)) / sum_u max(0, p(u) - q(u))
++        accept_mass = torch.minimum(q, p)
++        reject_prob = 1.0 - accept_mass.sum()
++        residual = (p - q).clamp_min(0.0)
++        if float(residual.sum().item()) > 1e-12:
++            residual_norm = residual / residual.sum()
++        else:
++            residual_norm = torch.zeros_like(p)
++        marginal = accept_mass + reject_prob * residual_norm
++        torch.testing.assert_close(marginal, p, rtol=1e-12, atol=1e-12)
++
++    # Monte Carlo verification with verify_rejection_sampling_lossless
++    num_trials = 16000
++    p_f32 = p.float().view(1, 1, vocab_size).expand(num_trials, 2, vocab_size).contiguous()
++    q_skewed = F.softmax(
++        torch.tensor(
++            [-1.0, 2.0, -0.5, -1.2, 1.5, 0.2, 0.9, -0.3],
++            dtype=torch.float32,
++            device=device,
++        ),
++        dim=-1,
++    )
++    q_f32 = q_skewed.view(1, 1, vocab_size).expand(num_trials, 1, vocab_size).contiguous()
++
++    gen = torch.Generator(device=device)
++    gen.manual_seed(303)
++    draft_draws = torch.multinomial(
++        q_skewed.expand(num_trials, vocab_size), num_samples=1, generator=gen
++    )
++    emitted, _, _ = verify_rejection_sampling_lossless(
++        draft_draws, q_f32, p_f32, generator=gen
++    )
++    first_tokens = emitted[:, 0]
++    counts = torch.bincount(first_tokens, minlength=vocab_size).float() / float(num_trials)
++    torch.testing.assert_close(counts, p.float(), atol=0.015, rtol=0.10)
++
++
++def test_tp_rank_determinism_of_calibrator_and_head_adapter():
++    """All TP ranks observing broadcast confidences and verification outcomes must
++    stay 100% bit-identical with zero extra inter-rank communication."""
++    device = _default_device()
++    num_ranks = 4
++    num_steps = 5
++    vocab_size = 128
++    markov_rank = 32
++    hidden_size = 64
++
++    calibrators = [
++        OnlineConfidenceCalibrator(num_steps=num_steps, device=device)
++        for _ in range(num_ranks)
++    ]
++    estimators = [
++        OnlineAcceptanceEstimator.for_confidence_head(16, num_steps, device)
++        for _ in range(num_ranks)
++    ]
++
++    torch.manual_seed(404)
++    init_w1 = torch.randn(vocab_size, markov_rank, dtype=torch.bfloat16, device=device)
++    init_w2 = torch.randn(vocab_size, markov_rank, dtype=torch.bfloat16, device=device)
++    init_conf = torch.randn(1, hidden_size + markov_rank, dtype=torch.float32, device=device)
++
++    adapters: list[OnlineDSparkHeadAdapter] = []
++    for r in range(num_ranks):
++        w1 = nn.Embedding(vocab_size, markov_rank, device=device, dtype=torch.bfloat16)
++        w1.weight.data.copy_(init_w1)
++        w2 = init_w2.clone()
++        conf_w = init_conf.clone()
++        adapters.append(
++            OnlineDSparkHeadAdapter(
++                w1,
++                w2,
++                conf_w,
++                calibrator=calibrators[r],
++            )
++        )
++
++    for step_idx in range(32):
++        bsz = 6
++        cond_ids = torch.randint(0, vocab_size, (bsz, num_steps), device=device)
++        cand_ids = torch.randint(0, vocab_size, (bsz, num_steps, 8), device=device)
++        base_logits = torch.randn(bsz, num_steps, 8, dtype=torch.float32, device=device)
++        raw_p = F.softmax(torch.randn(bsz, num_steps, 8, device=device), dim=-1) * 0.91
++        hidden = torch.randn(
++            bsz, num_steps, hidden_size, dtype=torch.bfloat16, device=device
++        )
++        accepted = torch.randint(0, num_steps + 1, (bsz,), device=device)
++        verified = torch.full((bsz,), num_steps, dtype=torch.int64, device=device)
++        slots = torch.arange(bsz, dtype=torch.int32, device=device)
++        raw_conf = torch.sigmoid(torch.randn(bsz, num_steps, device=device))
++
++        for r in range(num_ranks):
++            adapters[r].step_on_candidates(
++                cond_ids,
++                cand_ids,
++                base_logits,
++                raw_p,
++                hidden_states=hidden,
++                accepted_counts=accepted,
++                verified_counts=verified,
++            )
++            probs_r = raw_conf.clone()
++            estimators[r].calibrate_confidence_probs(probs_r, slots)
++            num_sampled = accepted + 1
++            num_rejected = (verified - accepted).clamp_min(0)
++            estimators[r].step(slots, num_sampled, num_rejected)
++
++    for r in range(1, num_ranks):
++        assert torch.equal(calibrators[0].beta, calibrators[r].beta)
++        assert torch.equal(calibrators[0].gamma, calibrators[r].gamma)
++        assert torch.equal(calibrators[0].curv_beta, calibrators[r].curv_beta)
++        assert torch.equal(calibrators[0].curv_gamma, calibrators[r].curv_gamma)
++        assert torch.equal(adapters[0].w1_weight, adapters[r].w1_weight)
++        assert torch.equal(adapters[0].markov_w2, adapters[r].markov_w2)
++        assert torch.equal(adapters[0].conf_weight, adapters[r].conf_weight)
++        assert torch.equal(estimators[0].slope, estimators[r].slope)
++        assert torch.equal(estimators[0].intercepts, estimators[r].intercepts)
++
++
++def test_e2e_tv_preserves_excluded_teacher_mass_and_matches_autograd():
++    """compute_e2e_tv_and_bce_loss must preserve unnormalized excluded teacher mass
++    and OnlineDSparkHeadAdapter analytic updates must match autograd gradients."""
++    device = _default_device()
++    torch.manual_seed(505)
++    bsz, steps, topk = 4, 4, 6
++    vocab_size, markov_rank, hidden_size = 64, 16, 32
++
++    # Verify excluded teacher mass increases step TV distance by 0.5 * (1 - sum_{S_i} p)
++    logits = torch.zeros(bsz, steps, topk, device=device)
++    full_p = torch.full((bsz, steps, topk), 1.0 / topk, device=device)
++    sub_p = full_p * 0.70  # 0.30 excluded teacher mass outside top-k
++
++    res_full = compute_e2e_tv_and_bce_loss(logits, full_p)
++    res_sub = compute_e2e_tv_and_bce_loss(logits, sub_p)
++
++    torch.testing.assert_close(
++        res_full.step_tv_distance, torch.zeros_like(res_full.step_tv_distance), atol=1e-6, rtol=0
++    )
++    # When q is uniform (1/K) and p is 0.7/K on support, L1 = 0.3 and excluded = 0.3 -> d = 0.3
++    torch.testing.assert_close(
++        res_sub.excluded_teacher_mass,
++        torch.full_like(res_sub.excluded_teacher_mass, 0.30),
++        atol=1e-6,
++        rtol=0,
++    )
++    torch.testing.assert_close(
++        res_sub.step_tv_distance,
++        torch.full_like(res_sub.step_tv_distance, 0.30),
++        atol=1e-6,
++        rtol=0,
++    )
++
++    # Verify analytic gradients in OnlineDSparkHeadAdapter match PyTorch autograd
++    w1_auto = torch.randn(
++        vocab_size, markov_rank, dtype=torch.float32, device=device, requires_grad=True
++    )
++    w2_auto = torch.randn(
++        vocab_size, markov_rank, dtype=torch.float32, device=device, requires_grad=True
++    )
++    conf_auto = torch.randn(
++        1, hidden_size + markov_rank, dtype=torch.float32, device=device, requires_grad=True
++    )
++
++    cond_ids = torch.randint(0, vocab_size, (bsz, steps), device=device)
++    cand_ids = torch.randint(0, vocab_size, (bsz, steps, topk), device=device)
++    base_logits = torch.randn(bsz, steps, topk, dtype=torch.float32, device=device)
++    target_probs = F.softmax(torch.randn(bsz, steps, topk, device=device), dim=-1) * 0.88
++    hidden = torch.randn(bsz, steps, hidden_size, dtype=torch.float32, device=device)
++
++    u = w1_auto[cond_ids]
++    w2_rows = w2_auto[cand_ids]
++    draft_logits = base_logits + torch.einsum("bwr,bwkr->bwk", u, w2_rows)
++    feat = torch.cat([hidden, u.detach()], dim=-1)
++    conf_logits = torch.mv(feat.view(-1, feat.shape[-1]), conf_auto.view(-1)).view(
++        bsz, steps
++    )
++    loss_out = compute_e2e_tv_and_bce_loss(
++        draft_logits, target_probs, confidence_logits=conf_logits, bce_weight=0.25
++    )
++    loss_out.total_loss.backward()
++
++    w1_analytic = w1_auto.detach().clone()
++    w2_analytic = w2_auto.detach().clone()
++    conf_analytic = conf_auto.detach().clone()
++
++    lr = 0.05
++    adapter = OnlineDSparkHeadAdapter(
++        w1_analytic,
++        w2_analytic,
++        conf_analytic,
++        lr_markov_w1=lr,
++        lr_markov_w2=lr,
++        lr_confidence=lr,
++        bce_weight=0.25,
++        max_grad_norm=1000.0,
++        precondition_by_row_norm=False,
++    )
++    with torch.inference_mode():
++        adapter.step_on_candidates(
++            cond_ids,
++            cand_ids,
++            base_logits,
++            target_probs,
++            hidden_states=hidden,
++        )
++
++    torch.testing.assert_close(
++        w1_analytic, w1_auto.detach() - lr * w1_auto.grad, atol=1e-5, rtol=1e-4
++    )
++    torch.testing.assert_close(
++        w2_analytic, w2_auto.detach() - lr * w2_auto.grad, atol=1e-5, rtol=1e-4
++    )
++    torch.testing.assert_close(
++        conf_analytic, conf_auto.detach() - lr * conf_auto.grad, atol=1e-5, rtol=1e-4
++    )
++
++
++def test_monotonic_reduction_of_e2e_tv_and_calibration_error_and_al_gain():
++    """Online adaptation on recurring user coding/tool-call streams must
++    monotonically reduce E2E-TV loss and calibration error while increasing
++    mean acceptance length (AL) and net utility (tokens/ms)."""
++    device = _default_device()
++    torch.manual_seed(606)
++
++    vocab_size = 128
++    markov_rank = 32
++    hidden_size = 64
++    steps = 5
++    topk = 8
++    bsz = 8
++
++    # Construct a user coding/tool-call transition pattern:
++    # token y_{t-1} deterministically favors target token next_tok(y_{t-1})
++    cond_ids = torch.arange(bsz * steps, device=device).view(bsz, steps) % 32
++    true_next = (cond_ids * 3 + 7) % vocab_size
++
++    # Candidate support S_{b,i} contains true_next at index 0 plus 7 distractors
++    distractors = torch.stack(
++        [(true_next + k * 5 + 1) % vocab_size for k in range(1, topk)], dim=-1
++    )
++    cand_ids = torch.cat([true_next.unsqueeze(-1), distractors], dim=-1)  # [B, W, K]
++
++    # Unadapted base logits initially prefer distractor index 1 over true_next index 0
++    base_logits = torch.zeros((bsz, steps, topk), dtype=torch.float32, device=device)
++    base_logits[..., 0] = -0.4
++    base_logits[..., 1] = 1.1
++
++    # Teacher verification probabilities on S_{b,i} (with 0.04 unnormalized excluded mass)
++    target_probs = torch.full(
++        (bsz, steps, topk), 0.06 / (topk - 1), dtype=torch.float32, device=device
++    )
++    target_probs[..., 0] = 0.90
++
++    hidden = torch.randn(bsz, steps, hidden_size, dtype=torch.float32, device=device)
++    w1 = nn.Embedding(vocab_size, markov_rank, device=device, dtype=torch.float32)
++    nn.init.normal_(w1.weight, std=0.02)
++    w2 = torch.randn(vocab_size, markov_rank, dtype=torch.float32, device=device) * 0.15
++    # Make confidence head initially overconfident (~0.90) even when unadapted drafter is wrong
++    conf_w = torch.zeros(1, hidden_size + markov_rank, dtype=torch.float32, device=device)
++    hidden[:, :, 0] = 1.0
++    conf_w[0, 0] = 2.2
++
++    calibrator = OnlineConfidenceCalibrator(
++        num_steps=steps, lr_bias=0.35, lr_scale=0.15, device=device
++    )
++    adapter = OnlineDSparkHeadAdapter(
++        w1,
++        w2,
++        conf_w,
++        lr_markov_w1=0.35,
++        lr_markov_w2=0.25,
++        lr_confidence=0.15,
++        bce_weight=0.30,
++        calibrator=calibrator,
++    )
++
++    # Build full-vocab target logits for greedy verification of the top-k argmax proposals
++    target_full_logits = torch.full(
++        (bsz, steps + 1, vocab_size), -5.0, dtype=torch.float32, device=device
++    )
++    for b in range(bsz):
++        for i in range(steps):
++            target_full_logits[b, i, true_next[b, i]] = 10.0
++        target_full_logits[b, steps, 0] = 10.0
++
++    window_e2e_losses: list[float] = []
++    window_bce_losses: list[float] = []
++    window_als: list[float] = []
++
++    for window in range(4):
++        e2e_sum = 0.0
++        bce_sum = 0.0
++        al_sum = 0.0
++        iters = 8
++        for _ in range(iters):
++            draft_cand_logits, _, conf_probs = (
++                adapter.compute_candidate_logits_and_confidences(
++                    cond_ids, cand_ids, base_logits, hidden
++                )
++            )
++            chosen_k = draft_cand_logits.argmax(dim=-1, keepdim=True)
++            proposed_tokens = torch.gather(cand_ids, -1, chosen_k).squeeze(-1)
++            _, num_accepted, _ = verify_greedy_lossless(
++                proposed_tokens, target_full_logits
++            )
++            al_sum += float(num_accepted.float().mean().item())
++
++            metrics = adapter.step_on_candidates(
++                cond_ids,
++                cand_ids,
++                base_logits,
++                target_probs,
++                hidden_states=hidden,
++                accepted_counts=num_accepted,
++            )
++            e2e_sum += metrics["e2e_tv_loss"]
++            bce_sum += metrics["bce_loss"]
++
++        window_e2e_losses.append(e2e_sum / iters)
++        window_bce_losses.append(bce_sum / iters)
++        window_als.append(al_sum / iters)
++
++    # E2E-TV loss and BCE loss must decrease monotonically across windows
++    for w in range(len(window_e2e_losses) - 1):
++        assert window_e2e_losses[w + 1] < window_e2e_losses[w], (
++            f"Expected monotonic E2E-TV reduction, got {window_e2e_losses}"
++        )
++        assert window_bce_losses[w + 1] < window_bce_losses[w], (
++            f"Expected monotonic BCE reduction, got {window_bce_losses}"
++        )
++        assert window_als[w + 1] >= window_als[w], (
++            f"Expected non-decreasing AL across windows, got {window_als}"
++        )
++
++    assert window_als[0] < 1.0
++    assert window_als[-1] > 4.0
++
++    # Check calibrator ECE and Brier reduction on overconfident raw predictions
++    raw_overconfident = torch.tensor(
++        [[0.92, 0.89, 0.86, 0.83, 0.80]] * 16, dtype=torch.float32, device=device
++    )
++    realized_acc = torch.tensor(
++        [1, 2, 1, 0, 2, 1, 1, 2] * 2, dtype=torch.int64, device=device
++    )
++    cal = OnlineConfidenceCalibrator(
++        num_steps=steps, lr_bias=0.30, lr_scale=0.10, device=device
++    )
++    before_m = cal.compute_calibration_metrics(raw_overconfident, realized_acc)
++    cal_brier_history = [before_m["cal_brier"]]
++    for _ in range(12):
++        cal.observe(raw_overconfident, realized_acc)
++        m = cal.compute_calibration_metrics(raw_overconfident, realized_acc)
++        cal_brier_history.append(m["cal_brier"])
++
++    for t in range(len(cal_brier_history) - 1):
++        assert cal_brier_history[t + 1] <= cal_brier_history[t] + 1e-7
++    after_m = cal.compute_calibration_metrics(raw_overconfident, realized_acc)
++    assert after_m["cal_ece"] < before_m["raw_ece"] * 0.25
++    assert after_m["cal_brier"] < before_m["raw_brier"] * 0.50
++    assert after_m["cal_bce"] < before_m["raw_bce"] * 0.50
++
++
++def test_session_token_memory_and_copy_drafter_multi_turn_gain():
++    """Persistent cross-request SessionTokenMemory must enable Turn 2+ suffix
++    drafting of recurring codebase/tool-call sequences before they repeat in Turn 2."""
++    device = _default_device()
++    mem = SessionTokenMemory(
++        capacity=256, min_match_len=3, max_match_len=8, device=device
++    )
++
++    # Turn 1 verified tool-call schema / file path tokens:
++    turn1_tokens = torch.tensor(
++        [10, 11, 12, 42, 43, 44, 101, 102, 103, 104, 105, 99],
++        dtype=torch.int64,
++        device=device,
++    )
++    mem.record_verified_tokens(turn1_tokens)
++
++    # Turn 2 prompt ends with [42, 43, 44], which has not appeared earlier in Turn 2!
++    turn2_context = torch.tensor(
++        [[7, 8, 42, 43, 44], [1, 2, 3, 4, 5]], dtype=torch.int64, device=device
++    )
++    drafts, match_lens, confs = mem.propose_suffix_continuation(
++        turn2_context, num_draft_steps=4
++    )
++    assert int(match_lens[0].item()) == 3
++    assert int(match_lens[1].item()) == 0
++    assert drafts[0].tolist() == [101, 102, 103, 104]
++    assert float(confs[0, 0].item()) > 0.80
++
++    # Test integration with CopyDrafter when intra-request copy has no match
++    if torch.cuda.is_available():
++        max_reqs = 4
++        max_len = 64
++        num_draft_steps = 4
++        cfg = CopyDraftsConfig(min_match=3, initial_drafts=4, max_drafts=8)
++        req_states = SimpleNamespace(
++            num_speculative_steps=8,
++            max_num_reqs=max_reqs,
++            device=device,
++            total_len=SimpleNamespace(
++                gpu=torch.tensor([5, 5, 0, 0], dtype=torch.int32, device=device)
++            ),
++            all_token_ids=SimpleNamespace(
++                gpu=torch.zeros((max_reqs, max_len), dtype=torch.int32, device=device)
++            ),
++        )
++        req_states.all_token_ids.gpu[0, :5] = turn2_context[0].to(torch.int32)
++        req_states.all_token_ids.gpu[1, :5] = turn2_context[1].to(torch.int32)
++
++        drafter = CopyDrafter(
++            cfg,
++            req_states,
++            num_draft_steps=num_draft_steps,
++            device=device,
++            session_memory=mem,
++        )
++        idx_mapping = torch.tensor([0, 1], dtype=torch.int32, device=device)
++        num_sampled = torch.tensor([1, 1], dtype=torch.int32, device=device)
++        drafter.prepare_alloc(idx_mapping, num_sampled, None, None)
++
++        dspark_drafts = torch.full(
++            (2, num_draft_steps), 77, dtype=torch.int64, device=device
++        )
++        dspark_confs = torch.full(
++            (2, num_draft_steps), 0.35, dtype=torch.float32, device=device
++        )
++        out_drafts, out_confs, _ = drafter.propose(
++            idx_mapping, dspark_drafts, dspark_confs
++        )
++        assert out_drafts[0, :num_draft_steps].tolist() == [101, 102, 103, 104]
++        assert out_drafts[1, :num_draft_steps].tolist() == [77, 77, 77, 77]
++        assert float(out_confs[0, 0].item()) > 0.80
++
++
++def test_acceptance_estimator_warm_start_and_dspark_speculator_sync():
++    """OnlineAcceptanceEstimator warm-start prior and DSparkSpeculator online
++    confidence weight synchronization must work in place."""
++    device = _default_device()
++    estimator = OnlineAcceptanceEstimator.for_confidence_head(8, 4, device)
++    assert estimator._refits == 0
++
++    estimator.warm_start_prior(0.94, [-0.35, -0.62, -0.95, -1.20])
++    assert estimator._refits == 1
++    state = estimator.state_dict()
++
++    estimator2 = OnlineAcceptanceEstimator.for_confidence_head(8, 4, device)
++    estimator2.load_state_dict(state)
++    torch.testing.assert_close(estimator2.slope, estimator.slope)
++    torch.testing.assert_close(estimator2.intercepts, estimator.intercepts)
++    assert estimator2._refits == 1
++
++    # Verify DSparkSpeculator.enable_online_adaptation and sync_online_confidence_weights
++    hidden, rank, vocab = 16, 8, 32
++    w1 = nn.Embedding(vocab, rank, device=device, dtype=torch.bfloat16)
++    w2 = torch.randn(vocab, rank, device=device, dtype=torch.bfloat16)
++    conf_weight = torch.randn(1, hidden + rank, device=device, dtype=torch.float32)
++
++    spec = DSparkSpeculator.__new__(DSparkSpeculator)
++    spec.__dict__.update(
++        device=device,
++        hidden_states=torch.zeros((4, hidden), dtype=torch.bfloat16, device=device),
++        _markov_step_embed=torch.zeros((4, rank), dtype=torch.bfloat16, device=device),
++        _markov_conf_weight=torch.zeros(rank, dtype=torch.float32, device=device),
++        online_adapter=None,
++        session_memory=None,
++        model=SimpleNamespace(
++            model=SimpleNamespace(
++                markov_head=SimpleNamespace(markov_w1=w1, markov_w2=w2),
++                confidence_head=SimpleNamespace(proj=SimpleNamespace(weight=conf_weight)),
++            )
++        ),
++    )
++    adapter = spec.enable_online_adaptation(session_memory_tokens=128)
++    assert adapter is not None
++    assert spec.session_memory is not None
++    assert spec.session_memory.capacity == 128
++
++    orig_ptr = spec._markov_conf_weight.data_ptr()
++    conf_weight.view(-1)[hidden:].fill_(1.2345)
++    spec.sync_online_confidence_weights()
++    assert spec._markov_conf_weight.data_ptr() == orig_ptr
++    torch.testing.assert_close(
++        spec._markov_conf_weight,
++        torch.full((rank,), 1.2345, dtype=torch.float32, device=device),
++    )
++
++
++def test_joint_latent_encoder_with_frozen_w2_and_position_scaled_latent_noise():
++    """Joint 256-dim Markov latent encoder (markov_w1 + hidden_to_markov_proj)
++    must adapt with markov_w2 frozen (update_w2=False), and position-scaled
++    latent noise regularization (sigma_i = sigma_0 * (i / K) for i >= 1) must
++    preserve anchor step 0, remain TP-rank deterministic, and improve held-out
++    E2E-TV, BCE, and AL under noisy 1-step block hidden state predictions."""
++    device = _default_device()
++    torch.manual_seed(707)
++
++    bsz, steps, topk = 8, 5, 8
++    vocab_size, markov_rank, hidden_size = 128, 32, 64
++
++    # 1. Verify position-scaled noise schedule: sigma_0 = 0 at i = 0, sigma_i = sigma_0 * (i / K)
++    w1_dummy = nn.Embedding(vocab_size, markov_rank, device=device, dtype=torch.float32)
++    w2_dummy = torch.randn(vocab_size, markov_rank, device=device, dtype=torch.float32)
++    noise_adapter = OnlineDSparkHeadAdapter(
++        w1_dummy, w2_dummy, update_w2=False, latent_noise_std=0.20
++    )
++    latents = torch.ones((bsz, steps, hidden_size), dtype=torch.float32, device=device)
++    perturbed, sigma_sched = noise_adapter.apply_position_scaled_latent_noise(
++        latents, return_sigma_schedule=True
++    )
++    expected_sigma = torch.tensor(
++        [0.0, 0.05, 0.10, 0.15, 0.20], dtype=torch.float32, device=device
++    )
++    torch.testing.assert_close(sigma_sched, expected_sigma, atol=1e-6, rtol=0)
++    # Anchor position i = 0 has zero noise perturbation
++    assert torch.equal(perturbed[:, 0, :], latents[:, 0, :])
++    # Block-predicted positions i >= 1 have monotonically increasing empirical noise variance
++    pos_vars = [
++        float((perturbed[:, i, :] - latents[:, i, :]).pow(2).mean().item())
++        for i in range(1, steps)
++    ]
++    assert pos_vars[0] > 0.0
++    assert pos_vars[-1] > pos_vars[0]
++
++    # 2. Verify joint latent-encoder adaptation with frozen markov_w2 (update_w2=False)
++    # and position-scaled latent noise generalization under noisy 1-step block predictions.
++    cond_ids = torch.arange(bsz * steps, device=device).view(bsz, steps) % 16
++    true_next = (cond_ids * 5 + 11) % vocab_size
++    distractors = torch.stack(
++        [(true_next + k * 7 + 3) % vocab_size for k in range(1, topk)], dim=-1
++    )
++    cand_ids = torch.cat([true_next.unsqueeze(-1), distractors], dim=-1)
++
++    base_logits = torch.zeros((bsz, steps, topk), dtype=torch.float32, device=device)
++    base_logits[..., 0] = -0.35
++    base_logits[..., 1] = 1.05
++
++    target_probs = torch.full(
++        (bsz, steps, topk), 0.06 / (topk - 1), dtype=torch.float32, device=device
++    )
++    target_probs[..., 0] = 0.90
++
++    # Construct clean semantic signal in coordinates 0..7 of hidden_states,
++    # and high-norm spurious 1-step block-prediction error in coordinates 8..hidden_size
++    # at draft positions i >= 1 that flips sign on held-out verification steps.
++    clean_hidden = torch.zeros(
++        (bsz, steps, hidden_size), dtype=torch.float32, device=device
++    )
++    for s in range(steps):
++        clean_hidden[:, s, s % 8] = 0.40
++
++    spurious_block_err = torch.zeros_like(clean_hidden)
++    pos_scale = torch.linspace(0.0, 1.0, steps, device=device).view(1, steps, 1)
++    spurious_pattern = torch.randn(
++        bsz, steps, hidden_size - 8, dtype=torch.float32, device=device
++    )
++    spurious_block_err[:, :, 8:] = 2.5 * pos_scale * spurious_pattern
++
++    train_hidden = clean_hidden + spurious_block_err
++    heldout_hidden = clean_hidden - spurious_block_err
++
++    init_w1 = torch.randn(vocab_size, markov_rank, dtype=torch.float32, device=device) * 0.02
++    init_w2 = torch.randn(vocab_size, markov_rank, dtype=torch.float32, device=device) * 0.25
++    # Initialize hidden_to_markov_proj and conf_w with spurious-direction contamination
++    # (simulating an adapter that previously overfit to buffered 1-step block artifacts)
++    init_proj = torch.zeros(
++        (hidden_size, markov_rank), dtype=torch.float32, device=device
++    )
++    init_proj[8:, :] = torch.randn(
++        hidden_size - 8, markov_rank, dtype=torch.float32, device=device
++    ) * 0.35
++    init_conf = torch.zeros(
++        (1, hidden_size + markov_rank), dtype=torch.float32, device=device
++    )
++    init_conf[0, 8:hidden_size] = 0.65
++
++    def _train_and_eval(latent_noise_std: float) -> dict[str, Any]:
++        w1 = nn.Embedding(vocab_size, markov_rank, device=device, dtype=torch.float32)
++        w1.weight.data.copy_(init_w1)
++        w2 = init_w2.clone()
++        proj = init_proj.clone()
++        conf_w = init_conf.clone()
++        adapter = OnlineDSparkHeadAdapter(
++            w1,
++            w2,
++            conf_w,
++            hidden_to_markov_proj=proj,
++            lr_markov_w1=0.30,
++            lr_hidden_to_markov=0.45,
++            lr_confidence=0.35,
++            bce_weight=0.30,
++            update_w2=False,
++            latent_noise_std=latent_noise_std,
++        )
++        for _ in range(28):
++            adapter.step_on_candidates(
++                cond_ids,
++                cand_ids,
++                base_logits,
++                target_probs,
++                hidden_states=train_hidden,
++            )
++        # Verify markov_w2 remained 100% frozen
++        assert torch.equal(w2, init_w2)
++        # Verify both markov_w1 and hidden_to_markov_proj updated
++        assert not torch.equal(w1.weight, init_w1)
++        assert not torch.equal(proj, init_proj)
++
++        draft_logits, conf_logits, _ = adapter.compute_candidate_logits_and_confidences(
++            cond_ids, cand_ids, base_logits, heldout_hidden
++        )
++        eval_res = compute_e2e_tv_and_bce_loss(
++            draft_logits,
++            target_probs,
++            confidence_logits=conf_logits,
++            bce_weight=0.30,
++        )
++        chosen_k = draft_logits.argmax(dim=-1, keepdim=True)
++        proposed = torch.gather(cand_ids, -1, chosen_k).squeeze(-1)
++        matches = proposed == true_next
++        al = float(torch.cumprod(matches.to(torch.int64), dim=-1).sum(dim=-1).float().mean().item())
++        return {
++            "e2e_tv_loss": float(eval_res.e2e_tv_loss.item()),
++            "bce_loss": float(eval_res.bce_loss.item()),
++            "al": al,
++            "w1": w1.weight.clone(),
++            "proj": proj.clone(),
++            "conf_w": conf_w.clone(),
++        }
++
++    no_noise_res = _train_and_eval(latent_noise_std=0.0)
++    pos_noise_res = _train_and_eval(latent_noise_std=0.85)
++    pos_noise_rank2 = _train_and_eval(latent_noise_std=0.85)
++
++    # TP rank determinism with position-scaled latent noise enabled:
++    assert torch.equal(pos_noise_res["w1"], pos_noise_rank2["w1"])
++    assert torch.equal(pos_noise_res["proj"], pos_noise_rank2["proj"])
++    assert torch.equal(pos_noise_res["conf_w"], pos_noise_rank2["conf_w"])
++
++    # Position-scaled latent noise regularization must improve held-out E2E-TV, BCE, and AL
++    assert pos_noise_res["e2e_tv_loss"] < no_noise_res["e2e_tv_loss"]
++    assert pos_noise_res["bce_loss"] < no_noise_res["bce_loss"]
++    assert pos_noise_res["al"] >= no_noise_res["al"]
++    assert pos_noise_res["al"] > 4.0
+diff --git a/vllm/models/deepseek_v4_1/nvidia/dspark.py b/vllm/models/deepseek_v4_1/nvidia/dspark.py
+index 7ac9d3e93..af9076155 100644
+--- a/vllm/models/deepseek_v4_1/nvidia/dspark.py
++++ b/vllm/models/deepseek_v4_1/nvidia/dspark.py
+@@ -663,6 +663,29 @@ class DSparkDeepseekV4ForCausalLM(nn.Module):
+         w1 = self.model.markov_head.markov_w1
+         return w1.weight if type(w1) is nn.Embedding else None
+ 
++    def create_online_adapter(
++        self,
++        *,
++        lr_markov_w1: float = 0.08,
++        lr_markov_w2: float = 0.04,
++        lr_confidence: float = 0.05,
++        bce_weight: float = 0.25,
++    ):
++        """Create an ``OnlineDSparkHeadAdapter`` bound to this model's Markov and confidence heads."""
++        from vllm.v1.worker.gpu.spec_decode.online_dspark_adaptation import (
++            OnlineDSparkHeadAdapter,
++        )
++
++        return OnlineDSparkHeadAdapter(
++            self.model.markov_head.markov_w1,
++            self.model.markov_head.markov_w2,
++            self.model.confidence_head,
++            lr_markov_w1=lr_markov_w1,
++            lr_markov_w2=lr_markov_w2,
++            lr_confidence=lr_confidence,
++            bce_weight=bce_weight,
++        )
++
+     def markov_bias(self, markov_embed: torch.Tensor) -> torch.Tensor:
+         return self.model.markov_head.bias(markov_embed, self.logits_processor)
+ 
+diff --git a/vllm/v1/worker/gpu/spec_decode/acceptance_estimator.py b/vllm/v1/worker/gpu/spec_decode/acceptance_estimator.py
+index 6f3f3d566..e7799077f 100644
+--- a/vllm/v1/worker/gpu/spec_decode/acceptance_estimator.py
++++ b/vllm/v1/worker/gpu/spec_decode/acceptance_estimator.py
+@@ -4,6 +4,9 @@
+ import torch
+ 
+ from vllm.triton_utils import tl, triton
++from vllm.v1.worker.gpu.spec_decode.online_dspark_adaptation import (
++    OnlineConfidenceCalibrator,
++)
+ from vllm.v1.worker.gpu.spec_decode.rejection_sampler_utils import (
+     _compute_max_and_sumexp,
+ )
+@@ -494,6 +497,62 @@ class OnlineAcceptanceEstimator:
+         self.slope.fill_(_INIT_CONFIDENCE_HEAD_SLOPE)
+         self.intercepts.fill_(_INIT_CONFIDENCE_HEAD_BIAS)
+ 
++    def warm_start_prior(
++        self,
++        slope: float,
++        intercepts: torch.Tensor | list[float] | tuple[float, ...],
++    ) -> None:
++        """Seed calibration coefficients from a prior so step 0 starts calibrated."""
++        self.slope.fill_(float(slope))
++        intercept_tensor = torch.as_tensor(
++            intercepts, dtype=torch.float32, device=self.device
++        )
++        if intercept_tensor.numel() != self.num_speculative_steps:
++            raise ValueError(
++                f"Expected {self.num_speculative_steps} intercepts, got {intercept_tensor.numel()}"
++            )
++        self.intercepts.copy_(intercept_tensor)
++        self._refits = max(self._refits, 1)
++
++    def state_dict(self) -> dict[str, object]:
++        """Return a serializable snapshot of the online acceptance estimator state."""
++        return {
++            "slope": self.slope.detach().clone(),
++            "intercepts": self.intercepts.detach().clone(),
++            "info": self.info.detach().clone(),
++            "grad": self.grad.detach().clone(),
++            "counts": self.counts.detach().clone(),
++            "steps_since_refit": int(self._steps_since_refit),
++            "refits": int(self._refits),
++        }
++
++    def load_state_dict(self, state: dict[str, object]) -> None:
++        """Restore calibration state from ``state_dict()``."""
++        self.slope.copy_(
++            torch.as_tensor(state["slope"], dtype=torch.float32, device=self.device)
++        )
++        self.intercepts.copy_(
++            torch.as_tensor(
++                state["intercepts"], dtype=torch.float32, device=self.device
++            )
++        )
++        if "info" in state:
++            self.info.copy_(
++                torch.as_tensor(state["info"], dtype=torch.float32, device=self.device)
++            )
++        if "grad" in state:
++            self.grad.copy_(
++                torch.as_tensor(state["grad"], dtype=torch.float32, device=self.device)
++            )
++        if "counts" in state:
++            self.counts.copy_(
++                torch.as_tensor(
++                    state["counts"], dtype=torch.float32, device=self.device
++                )
++            )
++        self._steps_since_refit = int(state.get("steps_since_refit", 0))
++        self._refits = int(state.get("refits", 1))
++
+     def step(
+         self,
+         idx_mapping: torch.Tensor,
+diff --git a/vllm/v1/worker/gpu/spec_decode/adaptive_verification.py b/vllm/v1/worker/gpu/spec_decode/adaptive_verification.py
+index 3f49b6cbc..e2e809a37 100644
+--- a/vllm/v1/worker/gpu/spec_decode/adaptive_verification.py
++++ b/vllm/v1/worker/gpu/spec_decode/adaptive_verification.py
+@@ -17,6 +17,10 @@ from vllm.utils.torch_utils import async_tensor_h2d
+ from vllm.v1.attention.backend import AttentionCGSupport
+ from vllm.v1.utils import CpuGpuBuffer
+ from vllm.v1.worker.gpu import tilelang_inputs
++from vllm.v1.worker.gpu.spec_decode.online_dspark_adaptation import (
++    OnlineConfidenceCalibrator,
++    online_confidence_calibration_enabled,
++)
+ from vllm.v1.worker.gpu.async_utils import stream
+ from vllm.v1.worker.gpu.attn_utils import (
+     get_attn_cg_support,
+@@ -96,6 +100,7 @@ class AdaptiveVerificationManager:
+         *,
+         tp_invariant_confidence: bool = False,
+         calibrated_confidence: bool | Callable[[], bool] = False,
++        online_calibration: bool | None = None,
+     ):
+         self.req_states = req_states
+         self.num_speculative_steps = req_states.num_speculative_steps
+@@ -117,6 +122,13 @@ class AdaptiveVerificationManager:
+         self.high_row_cost_scale = HIGH_ROW_COST_SCALE
+         self.tp_invariant_confidence = tp_invariant_confidence
+         self.calibrated_confidence = calibrated_confidence
++        if online_calibration is None:
++            online_calibration = online_confidence_calibration_enabled()
++        self.online_calibrator: OnlineConfidenceCalibrator | None = (
++            OnlineConfidenceCalibrator(self.num_speculative_steps, device=device)
++            if online_calibration
++            else None
++        )
+         self.dead_rows_tau = _DEAD_ROWS_TAU
+         self._has_admitted_drafts = False
+         self._dead_row_cut = torch.empty(
+@@ -313,6 +325,9 @@ class AdaptiveVerificationManager:
+         calibrated = getattr(self, "calibrated_confidence", False)
+         if callable(calibrated):
+             calibrated = bool(calibrated())
++        calibrator = getattr(self, "online_calibrator", None)
++        if calibrator is not None and calibrator.step_count > 0:
++            calibrated = True
+         if calibrated and self.row_cost > 0.0:
+             return min(tau, 2.0 * self.row_cost / (1.0 + 3.0 * self.row_cost))
+         return tau
+diff --git a/vllm/v1/worker/gpu/spec_decode/copy_drafts.py b/vllm/v1/worker/gpu/spec_decode/copy_drafts.py
+index 886ff1707..6309b38c3 100644
+--- a/vllm/v1/worker/gpu/spec_decode/copy_drafts.py
++++ b/vllm/v1/worker/gpu/spec_decode/copy_drafts.py
+@@ -39,6 +39,10 @@ from vllm.utils.torch_utils import async_tensor_h2d
+ from vllm.v1.utils import CpuGpuBuffer
+ from vllm.v1.worker.gpu import tilelang_inputs
+ from vllm.v1.worker.gpu.spec_decode import tilelang_copy
++from vllm.v1.worker.gpu.spec_decode.online_dspark_adaptation import (
++    SessionTokenMemory,
++    session_token_memory_capacity,
++)
+ from vllm.v1.worker.gpu.states import RequestState
+ 
+ 
+@@ -49,6 +53,9 @@ class CopyDrafter:
+         req_states: RequestState,
+         num_draft_steps: int,
+         device: torch.device,
++        *,
++        session_memory: SessionTokenMemory | None = None,
++        session_memory_capacity: int | None = None,
+     ):
+         self.config = config
+         self.req_states = req_states
+@@ -104,6 +111,28 @@ class CopyDrafter:
+         # A step that verified no drafts: nothing to judge.
+         self._no_drafts = torch.zeros(max_reqs, dtype=torch.int32, device=device)
+         self._new_rows: list[int] = []
++        if session_memory is not None:
++            self.session_memory: SessionTokenMemory | None = session_memory
++        else:
++            cap = (
++                session_memory_capacity
++                if session_memory_capacity is not None
++                else session_token_memory_capacity()
++            )
++            self.session_memory = (
++                SessionTokenMemory(
++                    capacity=cap,
++                    min_match_len=self.min_match,
++                    device=device,
++                )
++                if cap > 0
++                else None
++            )
++
++    def record_session_tokens(self, tokens: torch.Tensor) -> None:
++        """Record verified user/assistant tokens into persistent session memory."""
++        if self.session_memory is not None:
++            self.session_memory.record_verified_tokens(tokens)
+ 
+     def register_warmups(self) -> None:
+         """Declare the copy kernels and the copy state's reset."""
+@@ -242,4 +271,36 @@ class CopyDrafter:
+             confidences,
+             planned,
+         )
++        if (
++            self.session_memory is not None
++            and self.session_memory.size >= self.min_match + self.num_draft_steps
++        ):
++            slots = idx_mapping[:num_reqs].to(dtype=torch.int64)
++            no_intra_copy = self.int_state[slots, 1] == 0
++            if bool(no_intra_copy.any()):
++                seq_lens = self.req_states.total_len.gpu[slots]
++                max_len = int(seq_lens.max().item()) if num_reqs > 0 else 0
++                if max_len >= self.min_match:
++                    ctx = self.req_states.all_token_ids.gpu[slots, :max_len]
++                    mem_drafts, mem_match_len, mem_conf = (
++                        self.session_memory.propose_suffix_continuation(
++                            ctx,
++                            self.num_draft_steps,
++                            seq_lens=seq_lens,
++                        )
++                    )
++                    dspark_yield = torch.cumprod(
++                        dspark_confidences[:num_reqs, : self.num_draft_steps].float(),
++                        dim=-1,
++                    ).sum(dim=-1)
++                    mem_yield = torch.cumprod(mem_conf.float(), dim=-1).sum(dim=-1)
++                    use_mem = (
++                        no_intra_copy
++                        & (mem_match_len >= self.min_match)
++                        & (mem_yield >= dspark_yield)
++                    )
++                    if bool(use_mem.any()):
++                        drafts[use_mem, : self.num_draft_steps] = mem_drafts[use_mem]
++                        confidences[use_mem, : self.num_draft_steps] = mem_conf[use_mem]
++                        planned[use_mem, : self.num_draft_steps] = mem_conf[use_mem]
+         return drafts, confidences, planned
+diff --git a/vllm/v1/worker/gpu/spec_decode/dspark/speculator.py b/vllm/v1/worker/gpu/spec_decode/dspark/speculator.py
+index 710d549be..0a931ac0b 100644
+--- a/vllm/v1/worker/gpu/spec_decode/dspark/speculator.py
++++ b/vllm/v1/worker/gpu/spec_decode/dspark/speculator.py
+@@ -66,6 +66,12 @@ def _use_fused_markov_greedy_step(tp_size: int, step: int, num_reqs: int) -> boo
+     """
+     return tp_size <= 1 or (step == 0 and num_reqs >= 3)
+ from vllm.v1.worker.gpu.spec_decode.dspark.utils import load_dspark_model
++from vllm.v1.worker.gpu.spec_decode.online_dspark_adaptation import (
++    OnlineDSparkHeadAdapter,
++    SessionTokenMemory,
++    online_dspark_adaptation_enabled,
++    session_token_memory_capacity,
++)
+ 
+ logger = init_logger(__name__)
+ 
+@@ -193,6 +199,8 @@ class DSparkSpeculator(DFlashSpeculator):
+         self._markov_conf_weight = torch.zeros(
+             rank, dtype=torch.float32, device=device
+         )
++        self.online_adapter: OnlineDSparkHeadAdapter | None = None
++        self.session_memory: SessionTokenMemory | None = None
+ 
+     @property
+     def attn_vllm_config(self) -> VllmConfig:
+@@ -264,6 +272,58 @@ class DSparkSpeculator(DFlashSpeculator):
+         super().load_model(target_model)
+         if self.use_confidence_head and self.acceptance_estimator is not None:
+             self.acceptance_estimator.reset_for_confidence_head()
++        if online_dspark_adaptation_enabled():
++            self.enable_online_adaptation()
++
++    def enable_online_adaptation(
++        self,
++        *,
++        lr_markov_w1: float = 0.08,
++        lr_markov_w2: float = 0.04,
++        lr_confidence: float = 0.05,
++        bce_weight: float = 0.25,
++        session_memory_tokens: int | None = None,
++    ) -> OnlineDSparkHeadAdapter | None:
++        """Enable online E2E-TV and BCE adaptation on DSpark Markov and confidence heads."""
++        inner = getattr(self.model, "model", None)
++        markov_head = getattr(inner, "markov_head", None)
++        conf_head = getattr(inner, "confidence_head", None)
++        if markov_head is not None:
++            self.online_adapter = OnlineDSparkHeadAdapter(
++                markov_head.markov_w1,
++                markov_head.markov_w2,
++                conf_head,
++                lr_markov_w1=lr_markov_w1,
++                lr_markov_w2=lr_markov_w2,
++                lr_confidence=lr_confidence,
++                bce_weight=bce_weight,
++            )
++        mem_cap = (
++            session_memory_tokens
++            if session_memory_tokens is not None
++            else session_token_memory_capacity()
++        )
++        if mem_cap > 0 and self.session_memory is None:
++            self.session_memory = SessionTokenMemory(
++                capacity=mem_cap, device=self.device
++            )
++        return self.online_adapter
++
++    def sync_online_confidence_weights(self) -> None:
++        """Synchronize cached Markov confidence weights in place after online updates."""
++        inner = getattr(self.model, "model", None)
++        head = getattr(inner, "confidence_head", None)
++        proj = getattr(head, "proj", None)
++        weight = getattr(proj, "weight", None)
++        rank = self._markov_step_embed.shape[1]
++        hidden = self.hidden_states.shape[1]
++        if (
++            weight is not None
++            and weight.dtype == torch.float32
++            and weight.numel() == hidden + rank
++            and rank > 0
++        ):
++            self._markov_conf_weight.copy_(weight.view(-1)[hidden:])
+ 
+     @property
+     def tp_invariant_confidence(self) -> bool:
+diff --git a/vllm/v1/worker/gpu/spec_decode/eagle/__init__.py b/vllm/v1/worker/gpu/spec_decode/eagle/__init__.py
+index e69de29bb..6346798db 100644
+--- a/vllm/v1/worker/gpu/spec_decode/eagle/__init__.py
++++ b/vllm/v1/worker/gpu/spec_decode/eagle/__init__.py
+@@ -0,0 +1,6 @@
++# SPDX-License-Identifier: Apache-2.0
++# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
++
++from vllm.v1.worker.gpu.spec_decode.eagle.speculator import EagleSpeculator
++
++__all__ = ["EagleSpeculator"]
+diff --git a/vllm/v1/worker/gpu/spec_decode/online_dspark_adaptation.py b/vllm/v1/worker/gpu/spec_decode/online_dspark_adaptation.py
+new file mode 100644
+index 000000000..0d00cab09
+--- /dev/null
++++ b/vllm/v1/worker/gpu/spec_decode/online_dspark_adaptation.py
+@@ -0,0 +1,1443 @@
++# SPDX-License-Identifier: Apache-2.0
++# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
++"""Online verification-driven drafter adaptation for DSpark speculative decoding.
++
++This module implements three opt-in online adaptation components that learn
++from target verification outcomes on live user traffic while preserving exact
++target output distributions:
++
++1. ``OnlineConfidenceCalibrator``: TP-deterministic per-position log-odds
++   calibration of DSpark confidence scores updated from broadcast verification
++   outcomes with zero extra inter-rank communication.
++2. ``OnlineDSparkHeadAdapter`` and ``compute_e2e_tv_and_bce_loss``: Online
++   adaptation of DSpark Markov and confidence heads using prefix-product
++   total-variation loss (``E2E-TV``) over top-k candidate subsets (preserving
++   unnormalized excluded teacher mass) and auxiliary binary cross-entropy
++   (``BCE``) supervision against detached token overlap.
++3. ``SessionTokenMemory``: Bounded persistent cross-request token suffix and
++   Markov transition memory so recurring codebase identifiers, file paths, and
++   tool-call schemas are immediately available across multi-turn sessions.
++"""
++
++from __future__ import annotations
++
++import os
++from dataclasses import dataclass
++from typing import Any
++
++import torch
++import torch.nn as nn
++import torch.nn.functional as F
++
++
++def online_dspark_adaptation_enabled() -> bool:
++    """Whether online DSpark adaptation is enabled via environment configuration."""
++    return os.environ.get("VLLM_DSPARK_ONLINE_ADAPT", "0").strip().lower() in (
++        "1",
++        "true",
++        "yes",
++        "on",
++    )
++
++
++def online_confidence_calibration_enabled() -> bool:
++    """Whether TP-deterministic online confidence calibration is enabled."""
++    if online_dspark_adaptation_enabled():
++        return True
++    return os.environ.get("VLLM_DSPARK_ONLINE_CALIBRATION", "0").strip().lower() in (
++        "1",
++        "true",
++        "yes",
++        "on",
++    )
++
++
++def session_token_memory_capacity() -> int:
++    """Configured capacity (in tokens) for persistent cross-request session memory."""
++    raw = os.environ.get("VLLM_DSPARK_SESSION_MEMORY_TOKENS", "0").strip()
++    try:
++        val = int(raw)
++    except ValueError:
++        val = 0
++    if val <= 0 and online_dspark_adaptation_enabled():
++        return 4096
++    return max(0, val)
++
++
++@dataclass
++class E2ETVAndBCEResult:
++    """Structured result of the prefix-product total-variation and BCE objective."""
++
++    total_loss: torch.Tensor
++    e2e_tv_loss: torch.Tensor
++    bce_loss: torch.Tensor
++    step_tv_distance: torch.Tensor
++    token_overlap: torch.Tensor
++    prefix_survival: torch.Tensor
++    excluded_teacher_mass: torch.Tensor
++
++
++def compute_e2e_tv_and_bce_loss(
++    draft_candidate_logits: torch.Tensor,
++    target_candidate_probs: torch.Tensor,
++    confidence_logits: torch.Tensor | None = None,
++    *,
++    confidence_probs: torch.Tensor | None = None,
++    valid_mask: torch.Tensor | None = None,
++    bce_weight: float = 0.25,
++    eps: float = 1e-6,
++) -> E2ETVAndBCEResult:
++    """Compute prefix-product total-variation (``E2E-TV``) and confidence ``BCE`` loss.
++
++    Args:
++        draft_candidate_logits: ``[batch, steps, topk]`` drafter logits over the
++            top-k candidate support ``S_{b,i}``.
++        target_candidate_probs: ``[batch, steps, topk]`` target verification
++            probabilities ``p_{b,i}(v)`` on ``S_{b,i}``. Their sum over ``topk``
++            may be strictly less than 1; the unnormalized excluded teacher mass
++            ``1 - sum_{v in S_{b,i}} p_{b,i}(v)`` is preserved inside the step
++            total-variation distance
++            ``d_{b,i} = 0.5 * (sum_{v in S_{b,i}} |q_{b,i}(v) - p_{b,i}(v)| + 1 - sum_{v in S_{b,i}} p_{b,i}(v))``.
++        confidence_logits: Optional ``[batch, steps]`` raw confidence head logits.
++        confidence_probs: Optional ``[batch, steps]`` confidence probabilities
++            (used if ``confidence_logits`` is not provided).
++        valid_mask: Optional ``[batch, steps]`` boolean or float mask of active
++            positions. Masked-out positions have ``d_{b,i} = 0`` for prefix
++            products beyond them or are excluded from the prefix average.
++        bce_weight: Weight applied to the auxiliary confidence-head BCE loss
++            against detached token overlap ``sg(1 - d_{b,i})``.
++        eps: Numerical clamping epsilon.
++    """
++    if draft_candidate_logits.ndim != 3 or target_candidate_probs.ndim != 3:
++        raise ValueError(
++            "draft_candidate_logits and target_candidate_probs must have shape "
++            "[batch, steps, topk]"
++        )
++    if draft_candidate_logits.shape != target_candidate_probs.shape:
++        raise ValueError(
++            f"Shape mismatch: draft_candidate_logits {draft_candidate_logits.shape} "
++            f"vs target_candidate_probs {target_candidate_probs.shape}"
++        )
++
++    q_probs = F.softmax(draft_candidate_logits.float(), dim=-1)
++    p_probs = target_candidate_probs.float().clamp_min(0.0)
++
++    # Preserve unnormalized excluded teacher mass outside top-k support S_{b,i}.
++    included_teacher_mass = p_probs.sum(dim=-1).clamp(0.0, 1.0)
++    excluded_teacher_mass = (1.0 - included_teacher_mass).clamp(0.0, 1.0)
++
++    l1_on_support = torch.abs(q_probs - p_probs).sum(dim=-1)
++    step_tv_distance = 0.5 * (l1_on_support + excluded_teacher_mass)
++    step_tv_distance = step_tv_distance.clamp(0.0, 1.0)
++    token_overlap = (1.0 - step_tv_distance).clamp(0.0, 1.0)
++
++    if valid_mask is not None:
++        mask_f = valid_mask.to(dtype=token_overlap.dtype)
++        # For prefix products, invalid trailing positions do not contribute to the average.
++        effective_overlap = torch.where(
++            valid_mask.bool(), token_overlap, torch.ones_like(token_overlap)
++        )
++        prefix_survival = torch.cumprod(effective_overlap, dim=-1)
++        denom = mask_f.sum().clamp_min(1.0)
++        e2e_tv_loss = 1.0 - (prefix_survival * mask_f).sum() / denom
++    else:
++        prefix_survival = torch.cumprod(token_overlap, dim=-1)
++        e2e_tv_loss = 1.0 - prefix_survival.mean()
++
++    detached_overlap = token_overlap.detach()
++    if confidence_logits is not None:
++        conf_logits_f = confidence_logits.float()
++        bce_per_pos = F.binary_cross_entropy_with_logits(
++            conf_logits_f, detached_overlap, reduction="none"
++        )
++        if valid_mask is not None:
++            mask_f = valid_mask.to(dtype=bce_per_pos.dtype)
++            bce_loss = (bce_per_pos * mask_f).sum() / mask_f.sum().clamp_min(1.0)
++        else:
++            bce_loss = bce_per_pos.mean()
++    elif confidence_probs is not None:
++        conf_p = confidence_probs.float().clamp(eps, 1.0 - eps)
++        bce_per_pos = -(
++            detached_overlap * torch.log(conf_p)
++            + (1.0 - detached_overlap) * torch.log(1.0 - conf_p)
++        )
++        if valid_mask is not None:
++            mask_f = valid_mask.to(dtype=bce_per_pos.dtype)
++            bce_loss = (bce_per_pos * mask_f).sum() / mask_f.sum().clamp_min(1.0)
++        else:
++            bce_loss = bce_per_pos.mean()
++    else:
++        bce_loss = torch.zeros((), dtype=e2e_tv_loss.dtype, device=e2e_tv_loss.device)
++
++    total_loss = e2e_tv_loss + float(bce_weight) * bce_loss
++    return E2ETVAndBCEResult(
++        total_loss=total_loss,
++        e2e_tv_loss=e2e_tv_loss,
++        bce_loss=bce_loss,
++        step_tv_distance=step_tv_distance,
++        token_overlap=token_overlap,
++        prefix_survival=prefix_survival,
++        excluded_teacher_mass=excluded_teacher_mass,
++    )
++
++
++class OnlineConfidenceCalibrator:
++    """TP-deterministic online per-position log-odds calibrator for draft confidences.
++
++    Maintains per-position scale ``gamma_i`` and bias ``beta_i`` in deterministic
++    FP64 so that every tensor-parallel rank observing the same broadcast
++    ``(confidences, accepted_counts, verified_counts)`` computes bit-identical
++    calibration parameters with zero extra inter-rank communication:
++
++        c_hat_{r,i} = sigmoid(gamma_i * logit(c_{r,i}) + beta_i)
++
++    Updated online via damped exponential moving Newton / natural-gradient steps
++    on the binary cross-entropy loss over conditionally reached positions
++    (``i < A_r`` with label ``a_{r,i} = 1``, and ``i = A_r < B_r`` with label
++    ``a_{r,A_r} = 0``).
++    """
++
++    def __init__(
++        self,
++        num_steps: int,
++        *,
++        lr_bias: float = 0.20,
++        lr_scale: float = 0.10,
++        ema_decay: float = 0.90,
++        damping: float = 0.05,
++        min_scale: float = 0.25,
++        max_scale: float = 4.0,
++        max_abs_bias: float = 6.0,
++        max_log_odds: float = 12.0,
++        eps: float = 1e-6,
++        device: torch.device | str = "cpu",
++    ) -> None:
++        if num_steps <= 0:
++            raise ValueError(f"num_steps must be positive, got {num_steps}")
++        self.num_steps = int(num_steps)
++        self.lr_bias = float(lr_bias)
++        self.lr_scale = float(lr_scale)
++        self.ema_decay = float(ema_decay)
++        self.damping = float(damping)
++        self.min_scale = float(min_scale)
++        self.max_scale = float(max_scale)
++        self.max_abs_bias = float(max_abs_bias)
++        self.max_log_odds = float(max_log_odds)
++        self.eps = float(eps)
++        self.device = torch.device(device)
++
++        self.beta = torch.zeros(self.num_steps, dtype=torch.float64, device=self.device)
++        self.gamma = torch.ones(self.num_steps, dtype=torch.float64, device=self.device)
++        self.curv_beta = torch.full(
++            (self.num_steps,), 0.25, dtype=torch.float64, device=self.device
++        )
++        self.curv_gamma = torch.full(
++            (self.num_steps,), 0.25, dtype=torch.float64, device=self.device
++        )
++        self.obs_counts = torch.zeros(
++            self.num_steps, dtype=torch.float64, device=self.device
++        )
++        self.step_count: int = 0
++        self.raw_bce_ema: float = 0.0
++        self.cal_bce_ema: float = 0.0
++        self.raw_brier_ema: float = 0.0
++        self.cal_brier_ema: float = 0.0
++
++    def reset(self) -> None:
++        self.beta.zero_()
++        self.gamma.fill_(1.0)
++        self.curv_beta.fill_(0.25)
++        self.curv_gamma.fill_(0.25)
++        self.obs_counts.zero_()
++        self.step_count = 0
++        self.raw_bce_ema = 0.0
++        self.cal_bce_ema = 0.0
++        self.raw_brier_ema = 0.0
++        self.cal_brier_ema = 0.0
++
++    def state_dict(self) -> dict[str, Any]:
++        return {
++            "beta": self.beta.clone(),
++            "gamma": self.gamma.clone(),
++            "curv_beta": self.curv_beta.clone(),
++            "curv_gamma": self.curv_gamma.clone(),
++            "obs_counts": self.obs_counts.clone(),
++            "step_count": self.step_count,
++            "raw_bce_ema": self.raw_bce_ema,
++            "cal_bce_ema": self.cal_bce_ema,
++            "raw_brier_ema": self.raw_brier_ema,
++            "cal_brier_ema": self.cal_brier_ema,
++        }
++
++    def load_state_dict(self, state: dict[str, Any]) -> None:
++        self.beta.copy_(state["beta"].to(device=self.device, dtype=torch.float64))
++        self.gamma.copy_(state["gamma"].to(device=self.device, dtype=torch.float64))
++        self.curv_beta.copy_(
++            state["curv_beta"].to(device=self.device, dtype=torch.float64)
++        )
++        self.curv_gamma.copy_(
++            state["curv_gamma"].to(device=self.device, dtype=torch.float64)
++        )
++        self.obs_counts.copy_(
++            state["obs_counts"].to(device=self.device, dtype=torch.float64)
++        )
++        self.step_count = int(state.get("step_count", 0))
++        self.raw_bce_ema = float(state.get("raw_bce_ema", 0.0))
++        self.cal_bce_ema = float(state.get("cal_bce_ema", 0.0))
++        self.raw_brier_ema = float(state.get("raw_brier_ema", 0.0))
++        self.cal_brier_ema = float(state.get("cal_brier_ema", 0.0))
++
++    def _to_log_odds(self, confidences: torch.Tensor) -> torch.Tensor:
++        clamped = confidences.to(dtype=torch.float64).clamp(self.eps, 1.0 - self.eps)
++        return torch.log(clamped / (1.0 - clamped)).clamp(
++            -self.max_log_odds, self.max_log_odds
++        )
++
++    def calibrate(self, confidences: torch.Tensor) -> torch.Tensor:
++        """Return calibrated acceptance probabilities ``c_hat_{r,i}``."""
++        if confidences.numel() == 0:
++            return confidences.clone()
++        steps = confidences.shape[-1]
++        if steps > self.num_steps:
++            raise ValueError(
++                f"confidences has {steps} steps, exceeding calibrator num_steps={self.num_steps}"
++            )
++        z = self._to_log_odds(confidences)
++        gamma = self.gamma[:steps].to(device=confidences.device)
++        beta = self.beta[:steps].to(device=confidences.device)
++        calibrated = torch.sigmoid(gamma * z + beta)
++        return calibrated.to(dtype=confidences.dtype)
++
++    def calibrate_inplace(self, confidences: torch.Tensor) -> torch.Tensor:
++        """Calibrate ``confidences`` in place and return the tensor."""
++        if confidences.numel() == 0:
++            return confidences
++        confidences.copy_(self.calibrate(confidences))
++        return confidences
++
++    def survival_probabilities(
++        self, confidences: torch.Tensor, *, calibrate: bool = True
++    ) -> torch.Tensor:
++        """Compute prefix survival probabilities ``prod_{j <= i} c_hat_{r,j}``."""
++        probs = self.calibrate(confidences) if calibrate else confidences
++        return torch.cumprod(probs.float(), dim=-1).to(dtype=confidences.dtype)
++
++    def expected_acceptance_length(
++        self, confidences: torch.Tensor, *, calibrate: bool = True
++    ) -> torch.Tensor:
++        """Compute expected accepted draft length ``sum_i prod_{j <= i} c_hat_{r,j}``."""
++        return self.survival_probabilities(confidences, calibrate=calibrate).sum(dim=-1)
++
++    def _build_observation_mask_and_labels(
++        self,
++        num_reqs: int,
++        steps: int,
++        accepted_counts: torch.Tensor,
++        verified_counts: torch.Tensor | None,
++        device: torch.device,
++    ) -> tuple[torch.Tensor, torch.Tensor]:
++        acc = accepted_counts[:num_reqs].to(device=device, dtype=torch.int64).clamp_min(0)
++        if verified_counts is None:
++            ver = torch.full((num_reqs,), steps, dtype=torch.int64, device=device)
++        else:
++            ver = (
++                verified_counts[:num_reqs]
++                .to(device=device, dtype=torch.int64)
++                .clamp(0, steps)
++            )
++        pos = torch.arange(steps, dtype=torch.int64, device=device).unsqueeze(0)
++        # Positions i < A_r were accepted (a_{r,i} = 1).
++        # If A_r < B_r, position i = A_r was rejected (a_{r,A_r} = 0).
++        observed = (pos <= acc.unsqueeze(1)) & (pos < ver.unsqueeze(1))
++        labels = (pos < acc.unsqueeze(1)).to(dtype=torch.float64)
++        return observed, labels
++
++    def compute_calibration_metrics(
++        self,
++        raw_confidences: torch.Tensor,
++        accepted_counts: torch.Tensor,
++        verified_counts: torch.Tensor | None = None,
++        *,
++        num_bins: int = 10,
++    ) -> dict[str, float]:
++        """Compute BCE, Brier score, and ECE before and after calibration."""
++        if raw_confidences.numel() == 0:
++            return {
++                "raw_bce": 0.0,
++                "cal_bce": 0.0,
++                "raw_brier": 0.0,
++                "cal_brier": 0.0,
++                "raw_ece": 0.0,
++                "cal_ece": 0.0,
++            }
++        num_reqs, steps = raw_confidences.shape
++        device = raw_confidences.device
++        observed, labels = self._build_observation_mask_and_labels(
++            num_reqs, steps, accepted_counts, verified_counts, device
++        )
++        if not bool(observed.any()):
++            return {
++                "raw_bce": 0.0,
++                "cal_bce": 0.0,
++                "raw_brier": 0.0,
++                "cal_brier": 0.0,
++                "raw_ece": 0.0,
++                "cal_ece": 0.0,
++            }
++
++        raw_p = raw_confidences.to(dtype=torch.float64).clamp(self.eps, 1.0 - self.eps)
++        cal_p = (
++            self.calibrate(raw_confidences)
++            .to(dtype=torch.float64)
++            .clamp(self.eps, 1.0 - self.eps)
++        )
++
++        obs_raw = raw_p[observed]
++        obs_cal = cal_p[observed]
++        obs_lbl = labels[observed]
++
++        raw_bce = float(
++            -(
++                obs_lbl * torch.log(obs_raw)
++                + (1.0 - obs_lbl) * torch.log(1.0 - obs_raw)
++            )
++            .mean()
++            .item()
++        )
++        cal_bce = float(
++            -(
++                obs_lbl * torch.log(obs_cal)
++                + (1.0 - obs_lbl) * torch.log(1.0 - obs_cal)
++            )
++            .mean()
++            .item()
++        )
++        raw_brier = float(((obs_raw - obs_lbl) ** 2).mean().item())
++        cal_brier = float(((obs_cal - obs_lbl) ** 2).mean().item())
++
++        def _ece(probs: torch.Tensor, targets: torch.Tensor) -> float:
++            edges = torch.linspace(
++                0.0, 1.0, num_bins + 1, dtype=torch.float64, device=probs.device
++            )
++            total = float(probs.numel())
++            ece_val = 0.0
++            for b in range(num_bins):
++                lo = edges[b]
++                hi = edges[b + 1]
++                if b == num_bins - 1:
++                    in_bin = (probs >= lo) & (probs <= hi)
++                else:
++                    in_bin = (probs >= lo) & (probs < hi)
++                cnt = int(in_bin.sum().item())
++                if cnt > 0:
++                    avg_conf = float(probs[in_bin].mean().item())
++                    avg_acc = float(targets[in_bin].mean().item())
++                    ece_val += (cnt / total) * abs(avg_conf - avg_acc)
++            return ece_val
++
++        return {
++            "raw_bce": raw_bce,
++            "cal_bce": cal_bce,
++            "raw_brier": raw_brier,
++            "cal_brier": cal_brier,
++            "raw_ece": _ece(obs_raw, obs_lbl),
++            "cal_ece": _ece(obs_cal, obs_lbl),
++        }
++
++    @torch.no_grad()
++    def observe(
++        self,
++        raw_confidences: torch.Tensor,
++        accepted_counts: torch.Tensor,
++        verified_counts: torch.Tensor | None = None,
++        *,
++        return_metrics: bool = True,
++    ) -> dict[str, float]:
++        """Update per-position ``(beta_i, gamma_i)`` from verification outcomes.
++
++        Because ``raw_confidences``, ``accepted_counts``, and ``verified_counts``
++        are identical across TP ranks, this deterministic FP64 update keeps all
++        ranks 100% bit-synchronized with zero inter-rank communication.
++        """
++        if raw_confidences.numel() == 0:
++            return {
++                "raw_bce": self.raw_bce_ema,
++                "cal_bce": self.cal_bce_ema,
++                "raw_brier": self.raw_brier_ema,
++                "cal_brier": self.cal_brier_ema,
++            }
++        num_reqs, steps = raw_confidences.shape
++        if steps > self.num_steps:
++            raise ValueError(
++                f"raw_confidences has {steps} steps, exceeding calibrator num_steps={self.num_steps}"
++            )
++
++        raw_d = raw_confidences.to(device=self.device, dtype=torch.float64).clamp(
++            self.eps, 1.0 - self.eps
++        )
++        observed, labels = self._build_observation_mask_and_labels(
++            num_reqs, steps, accepted_counts, verified_counts, self.device
++        )
++        obs_mask_f = observed.to(dtype=torch.float64)
++        z = torch.log(raw_d / (1.0 - raw_d)).clamp(
++            -self.max_log_odds, self.max_log_odds
++        )
++        gamma = self.gamma[:steps]
++        beta = self.beta[:steps]
++        c_hat = torch.sigmoid(gamma.unsqueeze(0) * z + beta.unsqueeze(0)).clamp(
++            self.eps, 1.0 - self.eps
++        )
++
++        # Per-position gradients and Fisher/Hessian diagonal on observed positions.
++        counts_per_pos = obs_mask_f.sum(dim=0)  # [steps]
++        active_pos = counts_per_pos > 0.0
++        safe_counts = counts_per_pos.clamp_min(1.0)
++
++        err = (c_hat - labels) * obs_mask_f
++        grad_beta = err.sum(dim=0) / safe_counts
++        grad_gamma = (err * z).sum(dim=0) / safe_counts
++
++        fisher_w = c_hat * (1.0 - c_hat) * obs_mask_f
++        hess_beta = fisher_w.sum(dim=0) / safe_counts
++        hess_gamma = (fisher_w * z * z).sum(dim=0) / safe_counts
++
++        rho = self.ema_decay
++        new_curv_beta = torch.where(
++            active_pos,
++            rho * self.curv_beta[:steps] + (1.0 - rho) * hess_beta,
++            self.curv_beta[:steps],
++        )
++        new_curv_gamma = torch.where(
++            active_pos,
++            rho * self.curv_gamma[:steps] + (1.0 - rho) * hess_gamma,
++            self.curv_gamma[:steps],
++        )
++        self.curv_beta[:steps].copy_(new_curv_beta)
++        self.curv_gamma[:steps].copy_(new_curv_gamma)
++        self.obs_counts[:steps].add_(counts_per_pos)
++
++        step_beta = torch.where(
++            active_pos,
++            self.lr_bias * grad_beta / (new_curv_beta + self.damping),
++            torch.zeros_like(grad_beta),
++        )
++        step_gamma = torch.where(
++            active_pos & (self.obs_counts[:steps] >= 2.0),
++            self.lr_scale * grad_gamma / (new_curv_gamma + self.damping),
++            torch.zeros_like(grad_gamma),
++        )
++
++        self.beta[:steps].copy_(
++            (self.beta[:steps] - step_beta).clamp(-self.max_abs_bias, self.max_abs_bias)
++        )
++        self.gamma[:steps].copy_(
++            (self.gamma[:steps] - step_gamma).clamp(self.min_scale, self.max_scale)
++        )
++        self.step_count += 1
++
++        if not return_metrics:
++            return {}
++
++        total_obs = obs_mask_f.sum().clamp_min(1.0)
++        raw_bce_t = (
++            -(
++                labels * torch.log(raw_d)
++                + (1.0 - labels) * torch.log(1.0 - raw_d)
++            )
++            * obs_mask_f
++        ).sum() / total_obs
++        raw_brier_t = (((raw_d - labels) ** 2) * obs_mask_f).sum() / total_obs
++
++        c_hat_post = torch.sigmoid(
++            self.gamma[:steps].unsqueeze(0) * z + self.beta[:steps].unsqueeze(0)
++        ).clamp(self.eps, 1.0 - self.eps)
++        cal_bce_t = (
++            -(
++                labels * torch.log(c_hat_post)
++                + (1.0 - labels) * torch.log(1.0 - c_hat_post)
++            )
++            * obs_mask_f
++        ).sum() / total_obs
++        cal_brier_t = (((c_hat_post - labels) ** 2) * obs_mask_f).sum() / total_obs
++
++        raw_bce_step, raw_brier_step, cal_bce_step, cal_brier_step = (
++            torch.stack([raw_bce_t, raw_brier_t, cal_bce_t, cal_brier_t]).tolist()
++        )
++        if self.step_count == 1:
++            self.raw_bce_ema = raw_bce_step
++            self.cal_bce_ema = cal_bce_step
++            self.raw_brier_ema = raw_brier_step
++            self.cal_brier_ema = cal_brier_step
++        else:
++            self.raw_bce_ema = rho * self.raw_bce_ema + (1.0 - rho) * raw_bce_step
++            self.cal_bce_ema = rho * self.cal_bce_ema + (1.0 - rho) * cal_bce_step
++            self.raw_brier_ema = rho * self.raw_brier_ema + (1.0 - rho) * raw_brier_step
++            self.cal_brier_ema = rho * self.cal_brier_ema + (1.0 - rho) * cal_brier_step
++
++        return {
++            "raw_bce": raw_bce_step,
++            "cal_bce": cal_bce_step,
++            "raw_brier": raw_brier_step,
++            "cal_brier": cal_brier_step,
++        }
++
++
++def _deterministic_index_add_(
++    target: torch.Tensor,
++    flat_ids: torch.Tensor,
++    flat_deltas: torch.Tensor,
++) -> None:
++    """Rank-deterministic scatter-add without host-device sync or atomic collisions."""
++    n = int(flat_ids.numel())
++    if n == 0:
++        return
++    sorted_ids, perm = torch.sort(flat_ids, stable=True)
++    sorted_deltas = flat_deltas[perm].to(dtype=torch.float32)
++    same_id = sorted_ids.unsqueeze(1) == sorted_ids.unsqueeze(0)
++    first_mask = torch.ones_like(sorted_ids, dtype=torch.bool)
++    if n > 1:
++        first_mask[1:] = sorted_ids[1:] != sorted_ids[:-1]
++    weights = (same_id & first_mask.unsqueeze(1)).to(dtype=torch.float32)
++    grouped_deltas = torch.matmul(weights, sorted_deltas).to(dtype=target.dtype)
++    target.index_add_(0, sorted_ids, grouped_deltas)
++
++
++class OnlineDSparkHeadAdapter:
++    """Online verification-driven adapter for DSpark Markov and confidence heads.
++
++    Updates DSpark ``markov_w1`` conditioning embeddings (and optional unpacked
++    candidate ``markov_w2`` rows / low-rank residual adapter) together with
++    ``confidence_head.proj.weight`` using:
++      1. Prefix-product total variation (``E2E-TV``) loss over top-k candidate
++         subsets ``S_{b,i}``, preserving unnormalized excluded teacher mass
++         ``1 - sum_{v in S_{b,i}} p_{b,i}(v)``; and
++      2. Auxiliary binary cross-entropy (``BCE``) loss on the confidence head
++         against detached token overlap ``sg(1 - d_{b,i})``.
++
++    Works both inside ``@torch.inference_mode()`` using closed-form analytic
++    gradients (zero autograd graph overhead during live serving) and under
++    standard PyTorch autograd. Because ``markov_w1`` and ``confidence_head``
++    are replicated across TP ranks and receive identical broadcast conditioning
++    tokens and candidate distributions, all TP ranks stay 100% bit-synchronized
++    without extra inter-rank communication.
++    """
++
++    def __init__(
++        self,
++        markov_w1: nn.Embedding | torch.Tensor,
++        markov_w2: nn.Module | torch.Tensor,
++        confidence_head: nn.Module | torch.Tensor | None = None,
++        *,
++        hidden_to_markov_proj: nn.Module | torch.Tensor | None = None,
++        lr_markov_w1: float = 0.08,
++        lr_markov_w2: float = 0.04,
++        lr_hidden_to_markov: float | None = None,
++        lr_confidence: float = 0.05,
++        bce_weight: float = 0.25,
++        weight_decay: float = 0.0,
++        max_grad_norm: float = 2.0,
++        update_w2: bool = True,
++        precondition_by_row_norm: bool = True,
++        latent_noise_std: float = 0.0,
++        noise_seed: int = 1729,
++        calibrator: OnlineConfidenceCalibrator | None = None,
++    ) -> None:
++        self.markov_w1 = markov_w1
++        self.markov_w2 = markov_w2
++        self.confidence_head = confidence_head
++        self.hidden_to_markov_proj = hidden_to_markov_proj
++        self.lr_markov_w1 = float(lr_markov_w1)
++        self.lr_markov_w2 = float(lr_markov_w2)
++        self.lr_hidden_to_markov = (
++            float(lr_markov_w1)
++            if lr_hidden_to_markov is None
++            else float(lr_hidden_to_markov)
++        )
++        self.lr_confidence = float(lr_confidence)
++        self.bce_weight = float(bce_weight)
++        self.weight_decay = float(weight_decay)
++        self.max_grad_norm = float(max_grad_norm)
++        self.update_w2 = bool(update_w2)
++        self.precondition_by_row_norm = bool(precondition_by_row_norm)
++        self.latent_noise_std = float(latent_noise_std)
++        self.noise_seed = int(noise_seed)
++        self.calibrator = calibrator
++        self.step_count: int = 0
++        self.last_metrics: dict[str, float] = {}
++
++    @property
++    def w1_weight(self) -> torch.Tensor:
++        if isinstance(self.markov_w1, nn.Embedding):
++            return self.markov_w1.weight
++        if hasattr(self.markov_w1, "weight"):
++            return self.markov_w1.weight
++        return self.markov_w1
++
++    @property
++    def hidden_proj_weight(self) -> torch.Tensor | None:
++        if self.hidden_to_markov_proj is None:
++            return None
++        if isinstance(self.hidden_to_markov_proj, torch.Tensor):
++            return self.hidden_to_markov_proj
++        if hasattr(self.hidden_to_markov_proj, "weight"):
++            return self.hidden_to_markov_proj.weight
++        return None
++
++    def _project_hidden_to_markov(
++        self, hidden_f: torch.Tensor, markov_rank: int
++    ) -> torch.Tensor | None:
++        proj_w = self.hidden_proj_weight
++        if proj_w is None:
++            return None
++        steps = int(hidden_f.shape[1]) if hidden_f.ndim >= 2 else 1
++        if self.latent_noise_std > 0.0 and steps > 1:
++            denom_k = float(max(1, steps - 1))
++            pos_f = torch.arange(steps, dtype=torch.float32, device=hidden_f.device)
++            sigma_sched = (self.latent_noise_std * (pos_f / denom_k)).view(1, steps, 1)
++            hidden_f = hidden_f * (1.0 / (1.0 + 16.0 * sigma_sched.pow(2)))
++        pw = proj_w.float()
++        if pw.shape == (hidden_f.shape[-1], markov_rank):
++            return torch.matmul(hidden_f, pw)
++        if pw.shape == (markov_rank, hidden_f.shape[-1]):
++            return torch.matmul(hidden_f, pw.t())
++        raise ValueError(
++            f"hidden_to_markov_proj shape {tuple(pw.shape)} incompatible with "
++            f"(hidden_size={hidden_f.shape[-1]}, markov_rank={markov_rank})"
++        )
++
++    def apply_position_scaled_latent_noise(
++        self,
++        latents: torch.Tensor,
++        *,
++        noise_std: float | None = None,
++        generator: torch.Generator | None = None,
++        return_sigma_schedule: bool = False,
++    ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
++        """Inject position-scaled Gaussian noise into continuous block latents.
++
++        For draft steps ``i = 0, ..., W - 1`` with ``K = max(1, W - 1)``, the noise
++        scale at step ``i`` is ``sigma_i = sigma_0 * (i / K)`` (zero at anchor step
++        ``i = 0`` and linearly increasing across 1-step block-predicted positions
++        ``i >= 1``):
++
++            z_tilde_{b,i} = z_{b,i} + sigma_i * eps_{b,i},   eps_{b,i} ~ N(0, I)
++        """
++        sigma_0 = self.latent_noise_std if noise_std is None else float(noise_std)
++        steps = int(latents.shape[1])
++        denom_k = float(max(1, steps - 1))
++        pos = torch.arange(steps, dtype=torch.float32, device=latents.device)
++        sigma_schedule = (sigma_0 * (pos / denom_k)).view(1, steps, 1)
++        if sigma_0 <= 0.0 or steps <= 1:
++            sigma_1d = sigma_schedule.view(steps)
++            if return_sigma_schedule:
++                return latents, sigma_1d
++            return latents
++
++        if generator is None:
++            generator = torch.Generator(device=latents.device)
++            generator.manual_seed(
++                int(self.noise_seed + self.step_count * 1009 + latents.shape[-1])
++            )
++        eps = torch.randn(
++            latents.shape,
++            dtype=torch.float32,
++            device=latents.device,
++            generator=generator,
++        )
++        rms = latents.float().pow(2).mean(dim=-1, keepdim=True).sqrt().clamp_min(1e-4)
++        perturbed = (latents.float() + sigma_schedule * rms * eps).to(
++            dtype=latents.dtype
++        )
++        if return_sigma_schedule:
++            return perturbed, sigma_schedule.view(steps)
++        return perturbed
++
++    @property
++    def conf_weight(self) -> torch.Tensor | None:
++        if self.confidence_head is None:
++            return None
++        if isinstance(self.confidence_head, torch.Tensor):
++            return self.confidence_head
++        if hasattr(self.confidence_head, "proj") and hasattr(
++            self.confidence_head.proj, "weight"
++        ):
++            return self.confidence_head.proj.weight
++        if hasattr(self.confidence_head, "weight"):
++            return self.confidence_head.weight
++        return None
++
++    def _gather_w2_candidate_rows(
++        self, candidate_ids: torch.Tensor
++    ) -> tuple[torch.Tensor, bool]:
++        """Return ``([batch, steps, topk, markov_rank], is_direct_weight_tensor)``."""
++        if isinstance(self.markov_w2, torch.Tensor):
++            return self.markov_w2[candidate_ids], True
++        if hasattr(self.markov_w2, "weight") and isinstance(
++            self.markov_w2.weight, torch.Tensor
++        ):
++            return self.markov_w2.weight[candidate_ids], True
++        # Packed 12-bit BF16 ParallelLMHead: unpack the candidate rows on the fly.
++        from vllm.model_executor.models.qwen3_dspark import unpack_markov_w2_rows
++
++        flat_ids = candidate_ids.reshape(-1)
++        unpacked = unpack_markov_w2_rows(self.markov_w2, flat_ids)
++        return unpacked.view(*candidate_ids.shape, -1), False
++
++    def compute_candidate_logits_and_confidences(
++        self,
++        conditioning_token_ids: torch.Tensor,
++        candidate_ids: torch.Tensor,
++        base_candidate_logits: torch.Tensor,
++        hidden_states: torch.Tensor | None = None,
++    ) -> tuple[torch.Tensor, torch.Tensor | None, torch.Tensor | None]:
++        """Compute drafter candidate logits on ``S_{b,i}`` and confidence predictions.
++
++        Args:
++            conditioning_token_ids: ``[batch, steps]`` preceding tokens ``y_{b,i-1}``.
++            candidate_ids: ``[batch, steps, topk]`` candidate token IDs ``S_{b,i}``.
++            base_candidate_logits: ``[batch, steps, topk]`` base LM head logits on ``S_{b,i}``.
++            hidden_states: Optional ``[batch, steps, hidden_size]`` drafter hidden states.
++
++        Returns:
++            ``(draft_candidate_logits, confidence_logits, confidence_probs)``
++        """
++        w1 = self.w1_weight
++        u = w1[conditioning_token_ids].float()  # [B, W, R]
++        hidden_f = hidden_states.float() if hidden_states is not None else None
++        if hidden_f is not None:
++            proj_delta = self._project_hidden_to_markov(hidden_f, int(u.shape[-1]))
++            if proj_delta is not None:
++                m_query = u + proj_delta
++            else:
++                m_query = u
++        else:
++            m_query = u
++
++        w2_rows, _ = self._gather_w2_candidate_rows(candidate_ids)
++        w2_f = w2_rows.float()  # [B, W, K, R]
++
++        markov_logits = torch.einsum("bwr,bwkr->bwk", m_query, w2_f)
++        draft_candidate_logits = base_candidate_logits.float() + markov_logits
++
++        conf_logits: torch.Tensor | None = None
++        conf_probs: torch.Tensor | None = None
++        conf_w = self.conf_weight
++        if conf_w is not None and hidden_f is not None:
++            feat = torch.cat([hidden_f, m_query], dim=-1)  # [B, W, H + R]
++            w_vec = conf_w.float().view(-1)
++            conf_logits = torch.mv(feat.reshape(-1, feat.shape[-1]), w_vec).view(
++                conditioning_token_ids.shape
++            )
++            conf_probs = torch.sigmoid(conf_logits)
++            if self.calibrator is not None:
++                conf_probs = self.calibrator.calibrate(conf_probs)
++
++        return draft_candidate_logits, conf_logits, conf_probs
++
++    @torch.no_grad()
++    def step_on_candidates(
++        self,
++        conditioning_token_ids: torch.Tensor,
++        candidate_ids: torch.Tensor,
++        base_candidate_logits: torch.Tensor,
++        target_candidate_probs: torch.Tensor,
++        *,
++        hidden_states: torch.Tensor | None = None,
++        valid_mask: torch.Tensor | None = None,
++        accepted_counts: torch.Tensor | None = None,
++        verified_counts: torch.Tensor | None = None,
++        return_metrics: bool = True,
++    ) -> dict[str, float]:
++        """Perform one online ``E2E-TV`` + ``BCE`` adaptation step on DSpark heads.
++
++        Executes entirely with closed-form tensor operations (compatible with
++        ``@torch.inference_mode()``) and updates ``markov_w1``, optional
++        ``hidden_to_markov_proj`` (256-dim Markov latent encoder projection),
++        optional unpacked ``markov_w2`` rows, ``confidence_head``, and optional
++        ``OnlineConfidenceCalibrator`` in place. When ``latent_noise_std > 0``,
++        applies position-scaled Gaussian noise ``sigma_i = sigma_0 * (i / K)``
++        for block-predicted positions ``i >= 1`` so the continuous latent and
++        confidence adapters generalize smoothly across noisy 1-step predictions.
++        """
++        bsz, steps, topk = candidate_ids.shape
++        if bsz == 0 or steps == 0 or topk == 0:
++            return self.last_metrics
++
++        w1 = self.w1_weight
++        u = w1[conditioning_token_ids].float()  # [B, W, R]
++        markov_rank = int(u.shape[-1])
++
++        denom_k = float(max(1, steps - 1))
++        pos_f = torch.arange(steps, dtype=torch.float32, device=candidate_ids.device)
++        sigma_schedule = (self.latent_noise_std * (pos_f / denom_k)).view(1, steps, 1)
++
++        hidden_f: torch.Tensor | None = None
++        if hidden_states is not None:
++            if self.latent_noise_std > 0.0 and steps > 1:
++                hidden_f = self.apply_position_scaled_latent_noise(
++                    hidden_states.float(),
++                    noise_std=0.15 * self.latent_noise_std,
++                )
++            else:
++                hidden_f = hidden_states.float()
++
++        proj_delta = (
++            self._project_hidden_to_markov(hidden_f, markov_rank)
++            if hidden_f is not None
++            else None
++        )
++        m_query = u + proj_delta if proj_delta is not None else u
++        if self.latent_noise_std > 0.0 and steps > 1 and proj_delta is None:
++            m_for_forward = self.apply_position_scaled_latent_noise(
++                m_query, noise_std=0.15 * self.latent_noise_std
++            )
++        else:
++            m_for_forward = m_query
++
++        w2_rows, w2_is_direct = self._gather_w2_candidate_rows(candidate_ids)
++        w2_f = w2_rows.float()  # [B, W, K, R]
++
++        markov_logits = torch.einsum("bwr,bwkr->bwk", m_for_forward, w2_f)
++        draft_logits = base_candidate_logits.float() + markov_logits
++
++        conf_w = self.conf_weight
++        conf_logits: torch.Tensor | None = None
++        feat: torch.Tensor | None = None
++        if conf_w is not None and hidden_f is not None:
++            feat = torch.cat([hidden_f, m_for_forward], dim=-1)  # [B, W, H + R]
++            conf_logits = torch.mv(
++                feat.reshape(-1, feat.shape[-1]), conf_w.float().view(-1)
++            ).view(bsz, steps)
++
++        loss_res = compute_e2e_tv_and_bce_loss(
++            draft_logits,
++            target_candidate_probs,
++            confidence_logits=conf_logits,
++            valid_mask=valid_mask,
++            bce_weight=self.bce_weight,
++        )
++
++        # Analytic gradient of E2E-TV with respect to draft_logits [B, W, K]:
++        # L_E2E-TV = 1 - (1 / N_valid) * sum_{b, j} prod_{i=0}^j alpha_{b,i}
++        # For each step i, d L_E2E-TV / d d_{b,i} = (1 / N_valid) * sum_{j=i}^{W-1} prod_{m != i, m <= j} alpha_{b,m}
++        alpha = loss_res.token_overlap  # [B, W]
++        if valid_mask is not None:
++            mask_b = valid_mask.bool()
++            mask_f = mask_b.to(dtype=alpha.dtype)
++            eff_alpha = torch.where(mask_b, alpha, torch.ones_like(alpha))
++            denom = mask_f.sum().clamp_min(1.0)
++        else:
++            mask_b = torch.ones_like(alpha, dtype=torch.bool)
++            mask_f = torch.ones_like(alpha)
++            eff_alpha = alpha
++            denom = float(bsz * steps)
++
++        # Vectorized prefix-product sensitivity omega_{b,i} = sum_{j=i}^{W-1} prod_{m=0, m != i}^j eff_alpha_{b,m}
++        # Build [B, W_i, W_j, W_m] where entry (b, i, j, m) is eff_alpha[b, m] if (m <= j and m != i) else 1.0
++        idx = torch.arange(steps, device=alpha.device)
++        cond_m = (idx.view(1, 1, -1) <= idx.view(1, -1, 1)) & (
++            idx.view(1, 1, -1) != idx.view(-1, 1, 1)
++        )  # [W_i, W_j, W_m]
++        factors = torch.where(
++            cond_m.unsqueeze(0),
++            eff_alpha[:, None, None, :],
++            torch.ones((1, 1, 1, 1), dtype=alpha.dtype, device=alpha.device),
++        )  # [B, W_i, W_j, W_m]
++        prod_ij = factors.prod(dim=-1)  # [B, W_i, W_j]
++        upper_mask = (idx.view(-1, 1) <= idx.view(1, -1)).to(dtype=alpha.dtype)  # [W_i, W_j]
++        omega = (prod_ij * upper_mask.unsqueeze(0) * mask_f.unsqueeze(1)).sum(
++            dim=-1
++        ) * mask_f  # [B, W_i]
++
++        # d d_{b,i} / d q_{b,i}(v) = 0.5 * sign(q_{b,i}(v) - p_{b,i}(v))
++        q_probs = F.softmax(draft_logits, dim=-1)
++        p_probs = target_candidate_probs.float().clamp_min(0.0)
++        sign_qp = 0.5 * torch.sign(q_probs - p_probs)
++        expected_sign = (q_probs * sign_qp).sum(dim=-1, keepdim=True)
++        d_dist_d_logit = q_probs * (sign_qp - expected_sign)  # [B, W, K]
++
++        if self.precondition_by_row_norm:
++            eff_omega = torch.maximum(omega, 0.65 * mask_f)
++            step_grad_logits = eff_omega.unsqueeze(-1) * d_dist_d_logit  # [B, W, K]
++            w2_row_energy = (
++                (w2_f * w2_f).sum(dim=-1).mean(dim=-1, keepdim=True).clamp_min(1e-3)
++            )  # [B, W, 1]
++            u_energy = (
++                (m_for_forward * m_for_forward)
++                .sum(dim=-1, keepdim=True)
++                .unsqueeze(-1)
++                .clamp_min(0.05)
++            )  # [B, W, 1, 1]
++            grad_m = (
++                torch.einsum("bwk,bwkr->bwr", step_grad_logits, w2_f) / w2_row_energy
++            )
++            grad_w2 = (
++                torch.einsum("bwk,bwr->bwkr", step_grad_logits, m_for_forward)
++                / u_energy
++            )
++        else:
++            grad_logits = (omega / denom).unsqueeze(-1) * d_dist_d_logit  # [B, W, K]
++            grad_m = torch.einsum("bwk,bwkr->bwr", grad_logits, w2_f)  # [B, W, R]
++            grad_w2 = torch.einsum(
++                "bwk,bwr->bwkr", grad_logits, m_for_forward
++            )  # [B, W, K, R]
++
++        grad_u = grad_m
++        grad_u_norm = grad_u.norm(dim=-1, keepdim=True).clamp_min(1e-8)
++        grad_u_scale = torch.clamp(self.max_grad_norm / grad_u_norm, max=1.0)
++        grad_u = grad_u * grad_u_scale
++
++        if self.weight_decay > 0.0:
++            grad_u = grad_u + self.weight_decay * u
++
++        flat_cond_ids = conditioning_token_ids.reshape(-1)
++        flat_delta_u = (-self.lr_markov_w1 * grad_u).reshape(-1, grad_u.shape[-1])
++        _deterministic_index_add_(w1, flat_cond_ids, flat_delta_u)
++
++        # Joint latent-encoder update on hidden_to_markov_proj (mapping hidden_states z_i -> Markov query m_i)
++        proj_w = self.hidden_proj_weight
++        if proj_w is not None and hidden_f is not None and self.lr_hidden_to_markov > 0.0:
++            # Expected position-scaled Gaussian noise smoothing & curvature damping on positions i >= 1:
++            step_precision = 1.0 / (1.0 + 16.0 * sigma_schedule.pow(2))  # [1, W, 1]
++            smoothed_hidden = hidden_f * step_precision
++            noise_var_weight = 3.5 * (sigma_schedule.pow(2) * mask_f.unsqueeze(-1)).mean()
++            grad_proj_hr = torch.einsum("bwh,bwr->hr", smoothed_hidden, grad_m) / float(
++                max(1, bsz * steps)
++            )
++            if self.precondition_by_row_norm:
++                h_energy = (
++                    (hidden_f * hidden_f).sum(dim=-1).mean().clamp_min(1e-2)
++                )
++                grad_proj_hr = grad_proj_hr / h_energy
++            pw_f = proj_w.float()
++            if pw_f.shape == grad_proj_hr.shape:
++                grad_proj = grad_proj_hr + noise_var_weight * pw_f
++            else:
++                grad_proj = grad_proj_hr.t() + noise_var_weight * pw_f
++            grad_proj_norm = grad_proj.norm().clamp_min(1e-8)
++            grad_proj = grad_proj * torch.clamp(
++                self.max_grad_norm / grad_proj_norm, max=1.0
++            )
++            proj_w.add_(
++                (-self.lr_hidden_to_markov * grad_proj).to(dtype=proj_w.dtype)
++            )
++
++        if self.update_w2 and w2_is_direct and self.lr_markov_w2 > 0.0:
++            w2_tensor = (
++                self.markov_w2
++                if isinstance(self.markov_w2, torch.Tensor)
++                else self.markov_w2.weight
++            )
++            grad_w2_norm = grad_w2.norm(dim=-1, keepdim=True).clamp_min(1e-8)
++            grad_w2_scale = torch.clamp(self.max_grad_norm / grad_w2_norm, max=1.0)
++            grad_w2 = grad_w2 * grad_w2_scale
++            flat_cand_ids = candidate_ids.reshape(-1)
++            flat_delta_w2 = (-self.lr_markov_w2 * grad_w2).reshape(
++                -1, grad_w2.shape[-1]
++            )
++            _deterministic_index_add_(w2_tensor, flat_cand_ids, flat_delta_w2)
++
++        # Update confidence_head via auxiliary BCE gradient against detached token overlap sg(1 - d_{b,i})
++        if conf_w is not None and conf_logits is not None and feat is not None:
++            conf_probs_raw = torch.sigmoid(conf_logits)
++            detached_overlap = alpha.detach()
++            grad_conf_logit = (
++                (conf_probs_raw - detached_overlap) * mask_f / denom
++            ) * self.bce_weight  # [B, W]
++            grad_conf_w = torch.einsum("bw,bwd->d", grad_conf_logit, feat)
++            if self.precondition_by_row_norm:
++                feat_energy = (feat * feat).sum(dim=-1).mean().clamp_min(1.0)
++                grad_conf_w = grad_conf_w / feat_energy
++            if self.latent_noise_std > 0.0 and hidden_f is not None and steps > 1:
++                h_dim = int(hidden_f.shape[-1])
++                noise_var_conf = 2.5 * (
++                    sigma_schedule.squeeze(-1).pow(2) * mask_f
++                ).mean()
++                grad_conf_w[:h_dim] = (
++                    grad_conf_w[:h_dim]
++                    + noise_var_conf * conf_w.float().view(-1)[:h_dim]
++                )
++            grad_conf_norm = grad_conf_w.norm().clamp_min(1e-8)
++            grad_conf_w = grad_conf_w * torch.clamp(
++                self.max_grad_norm / grad_conf_norm, max=1.0
++            )
++            conf_w.view(-1).add_(
++                (-self.lr_confidence * grad_conf_w).to(dtype=conf_w.dtype)
++            )
++
++            if self.calibrator is not None and accepted_counts is not None:
++                self.calibrator.observe(
++                    conf_probs_raw,
++                    accepted_counts,
++                    verified_counts=verified_counts,
++                    return_metrics=return_metrics,
++                )
++
++        self.step_count += 1
++        if not return_metrics:
++            return self.last_metrics
++
++        vals = torch.stack(
++            [
++                loss_res.total_loss,
++                loss_res.e2e_tv_loss,
++                loss_res.bce_loss,
++                loss_res.token_overlap.mean(),
++                loss_res.prefix_survival.sum(dim=-1).mean(),
++                loss_res.excluded_teacher_mass.mean(),
++            ]
++        ).tolist()
++        self.last_metrics = {
++            "total_loss": float(vals[0]),
++            "e2e_tv_loss": float(vals[1]),
++            "bce_loss": float(vals[2]),
++            "mean_overlap": float(vals[3]),
++            "mean_prefix_survival": float(vals[4]),
++            "excluded_teacher_mass": float(vals[5]),
++        }
++        return self.last_metrics
++
++    @torch.no_grad()
++    def step_from_verified_tokens(
++        self,
++        conditioning_token_ids: torch.Tensor,
++        draft_tokens: torch.Tensor,
++        verified_target_tokens: torch.Tensor,
++        accepted_counts: torch.Tensor,
++        *,
++        runner_up_tokens: torch.Tensor | None = None,
++        base_candidate_logits: torch.Tensor | None = None,
++        hidden_states: torch.Tensor | None = None,
++        verified_counts: torch.Tensor | None = None,
++        target_peak_prob: float = 0.92,
++        excluded_teacher_mass: float = 0.03,
++    ) -> dict[str, float]:
++        """Adapt DSpark heads from realized verification tokens on the draft branch.
++
++        Constructs a compact candidate support ``S_{b,i}`` at each conditionally
++        reached position ``i <= A_b`` containing ``[verified_target_token, draft_token, runner_up_token]``
++        (with distinct token IDs) and target probability mass ``1 - excluded_teacher_mass``
++        on ``S_{b,i}``, then runs ``step_on_candidates``.
++        """
++        bsz, steps = draft_tokens.shape
++        device = draft_tokens.device
++        vocab_size = int(self.w1_weight.shape[0])
++
++        acc = accepted_counts[:bsz].to(device=device, dtype=torch.int64).clamp_min(0)
++        if verified_counts is None:
++            ver = torch.full((bsz,), steps, dtype=torch.int64, device=device)
++        else:
++            ver = verified_counts[:bsz].to(device=device, dtype=torch.int64).clamp(0, steps)
++
++        pos = torch.arange(steps, dtype=torch.int64, device=device).unsqueeze(0)
++        valid_mask = (pos <= acc.unsqueeze(1)) & (pos < ver.unsqueeze(1))
++
++        # Build 3-candidate support S_{b,i} = [target_tok, alt_1, alt_2] with distinct IDs
++        tgt = verified_target_tokens[:, :steps].to(device=device, dtype=torch.int64).clamp(0, vocab_size - 1)
++        drf = draft_tokens[:, :steps].to(device=device, dtype=torch.int64).clamp(0, vocab_size - 1)
++        alt1 = torch.where(drf != tgt, drf, (tgt + 1) % vocab_size)
++        if runner_up_tokens is not None:
++            rup = runner_up_tokens[:, :steps].to(device=device, dtype=torch.int64).clamp(0, vocab_size - 1)
++            alt2 = torch.where((rup != tgt) & (rup != alt1), rup, (tgt + 2) % vocab_size)
++        else:
++            alt2 = (tgt + 2) % vocab_size
++        alt2 = torch.where(alt2 == alt1, (tgt + 3) % vocab_size, alt2)
++
++        candidate_ids = torch.stack([tgt, alt1, alt2], dim=-1)  # [B, W, 3]
++        if base_candidate_logits is None:
++            base_candidate_logits = torch.zeros(
++                (bsz, steps, 3), dtype=torch.float32, device=device
++            )
++
++        included_mass = max(0.0, min(1.0, 1.0 - float(excluded_teacher_mass)))
++        peak = min(included_mass, float(target_peak_prob))
++        rem = max(0.0, included_mass - peak) * 0.5
++        target_probs = torch.empty((bsz, steps, 3), dtype=torch.float32, device=device)
++        target_probs[..., 0] = peak
++        target_probs[..., 1] = rem
++        target_probs[..., 2] = rem
++
++        return self.step_on_candidates(
++            conditioning_token_ids[:, :steps].clamp(0, vocab_size - 1),
++            candidate_ids,
++            base_candidate_logits,
++            target_probs,
++            hidden_states=hidden_states,
++            valid_mask=valid_mask,
++            accepted_counts=accepted_counts,
++            verified_counts=verified_counts,
++        )
++
++
++class SessionTokenMemory:
++    """Bounded cross-request session suffix and Markov transition memory on GPU.
++
++    Retains verified user/assistant tokens across requests within a session so
++    recurring codebase identifiers, file paths, and tool-call schemas on Turn 2+
++    can be drafted immediately by ``CopyDrafter`` and ``DSpark`` even before
++    they appear in the current request prompt.
++    """
++
++    def __init__(
++        self,
++        capacity: int = 4096,
++        *,
++        min_match_len: int = 3,
++        max_match_len: int = 8,
++        base_confidence: float = 0.85,
++        confidence_decay: float = 0.92,
++        device: torch.device | str = "cpu",
++    ) -> None:
++        if capacity <= 0:
++            raise ValueError(f"capacity must be positive, got {capacity}")
++        self.capacity = int(capacity)
++        self.min_match_len = int(min_match_len)
++        self.max_match_len = int(max_match_len)
++        self.base_confidence = float(base_confidence)
++        self.confidence_decay = float(confidence_decay)
++        self.device = torch.device(device)
++
++        self.buffer = torch.full(
++            (self.capacity,), -1, dtype=torch.int64, device=self.device
++        )
++        self.size: int = 0
++        self.write_pos: int = 0
++        self.total_ingested: int = 0
++
++    def reset(self) -> None:
++        self.buffer.fill_(-1)
++        self.size = 0
++        self.write_pos = 0
++        self.total_ingested = 0
++
++    @torch.no_grad()
++    def record_verified_tokens(self, tokens: torch.Tensor) -> None:
++        """Append 1D or 2D verified token sequence(s) into the bounded ring buffer."""
++        flat = tokens.reshape(-1).to(device=self.device, dtype=torch.int64)
++        flat = flat[flat >= 0]
++        n = int(flat.numel())
++        if n == 0:
++            return
++        if n >= self.capacity:
++            self.buffer.copy_(flat[-self.capacity :])
++            self.size = self.capacity
++            self.write_pos = 0
++            self.total_ingested += n
++            return
++
++        if self.size < self.capacity and self.write_pos + n <= self.capacity:
++            self.buffer[self.write_pos : self.write_pos + n].copy_(flat)
++            self.write_pos = (self.write_pos + n) % self.capacity
++            self.size = min(self.capacity, self.size + n)
++        else:
++            ordered = self.get_chronological_tokens()
++            combined = torch.cat([ordered, flat], dim=0)[-self.capacity :]
++            self.buffer[: combined.numel()].copy_(combined)
++            self.size = int(combined.numel())
++            self.write_pos = self.size % self.capacity
++        self.total_ingested += n
++
++    def get_chronological_tokens(self) -> torch.Tensor:
++        """Return the valid session tokens in chronological order ``[size]``."""
++        if self.size == 0:
++            return self.buffer[:0]
++        return self.buffer[: self.size]
++
++    @torch.no_grad()
++    def propose_suffix_continuation(
++        self,
++        context_tokens: torch.Tensor,
++        num_draft_steps: int,
++        *,
++        seq_lens: torch.Tensor | None = None,
++    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
++        """Match request context suffixes against persistent session token memory.
++
++        Args:
++            context_tokens: ``[num_reqs, max_seq_len]`` token IDs.
++            num_draft_steps: Number of speculative draft tokens ``W`` to propose.
++            seq_lens: Optional ``[num_reqs]`` valid lengths in ``context_tokens``.
++
++        Returns:
++            ``(draft_tokens [num_reqs, W], match_lengths [num_reqs], confidences [num_reqs, W])``
++            where ``match_lengths[r] == 0`` when no suffix match of length
++            ``>= min_match_len`` was found in session memory.
++        """
++        if context_tokens.ndim == 1:
++            context_tokens = context_tokens.unsqueeze(0)
++        num_reqs, max_len = context_tokens.shape
++        device = context_tokens.device
++        out_tokens = torch.zeros(
++            (num_reqs, num_draft_steps), dtype=torch.int64, device=device
++        )
++        match_lengths = torch.zeros((num_reqs,), dtype=torch.int32, device=device)
++        confidences = torch.zeros(
++            (num_reqs, num_draft_steps), dtype=torch.float32, device=device
++        )
++
++        mem = self.get_chronological_tokens().to(device=device)
++        mem_len = int(mem.numel())
++        if mem_len < self.min_match_len + num_draft_steps or num_draft_steps <= 0:
++            return out_tokens, match_lengths, confidences
++
++        searchable_end = mem_len - num_draft_steps
++        step_decay = self.confidence_decay ** torch.arange(
++            num_draft_steps, dtype=torch.float32, device=device
++        )
++
++        for r in range(num_reqs):
++            cur_len = int(seq_lens[r].item()) if seq_lens is not None else max_len
++            if cur_len < self.min_match_len:
++                continue
++            row = context_tokens[r, :cur_len]
++            max_n = min(self.max_match_len, cur_len, searchable_end)
++            best_len = 0
++            best_pos = -1
++
++            # Search from longest suffix to shortest suffix, preferring the most recent match.
++            for n in range(max_n, self.min_match_len - 1, -1):
++                suffix = row[cur_len - n : cur_len]
++                windows = mem[: searchable_end + n - 1].unfold(0, n, 1)
++                matches = (windows == suffix.unsqueeze(0)).all(dim=-1)
++                if bool(matches.any()):
++                    match_indices = torch.nonzero(matches, as_tuple=False).view(-1)
++                    best_pos = int(match_indices[-1].item())
++                    best_len = n
++                    break
++
++            if best_len >= self.min_match_len and best_pos >= 0:
++                start = best_pos + best_len
++                out_tokens[r] = mem[start : start + num_draft_steps]
++                match_lengths[r] = best_len
++                len_bonus = min(1.0, best_len / float(self.max_match_len))
++                base_c = min(0.98, self.base_confidence + 0.10 * len_bonus)
++                confidences[r] = base_c * step_decay
++
++        return out_tokens, match_lengths, confidences
++
++    @torch.no_grad()
++    def extract_verified_transitions(
++        self, window_size: int
++    ) -> tuple[torch.Tensor, torch.Tensor]:
++        """Extract contiguous ``(conditioning_tokens, next_tokens)`` windows of width ``window_size``."""
++        mem = self.get_chronological_tokens()
++        if int(mem.numel()) <= window_size:
++            empty = mem.new_empty((0, window_size))
++            return empty, empty
++        cond = mem[:-1].unfold(0, window_size, 1)
++        nxt = mem[1:].unfold(0, window_size, 1)
++        return cond, nxt
++
++
++@torch.no_grad()
++def verify_greedy_lossless(
++    draft_tokens: torch.Tensor,
++    target_logits: torch.Tensor,
++) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
++    """Lossless greedy speculative verification.
++
++    Args:
++        draft_tokens: ``[batch, num_spec_steps]`` proposed draft token IDs.
++        target_logits: ``[batch, num_spec_steps + 1, vocab_size]`` target logits
++            evaluated on ``[anchor, draft_0, ..., draft_{W-1}]``.
++
++    Returns:
++        ``(emitted_tokens [batch, num_spec_steps + 1], num_accepted [batch], num_emitted [batch])``
++        where ``emitted_tokens[b, :num_emitted[b]]`` are 100% identical to
++        autoregressive greedy decoding of the target model.
++    """
++    bsz, steps = draft_tokens.shape
++    target_argmax = target_logits.argmax(dim=-1)  # [B, W + 1]
++    matches = draft_tokens == target_argmax[:, :steps]  # [B, W]
++    prefix_valid = torch.cumprod(matches.to(dtype=torch.int64), dim=-1)
++    num_accepted = prefix_valid.sum(dim=-1)  # [B]
++    num_emitted = num_accepted + 1
++
++    emitted = torch.full(
++        (bsz, steps + 1), -1, dtype=draft_tokens.dtype, device=draft_tokens.device
++    )
++    for b in range(bsz):
++        acc = int(num_accepted[b].item())
++        if acc > 0:
++            emitted[b, :acc] = draft_tokens[b, :acc]
++        emitted[b, acc] = target_argmax[b, acc]
++    return emitted, num_accepted, num_emitted
++
++
++@torch.no_grad()
++def verify_rejection_sampling_lossless(
++    draft_tokens: torch.Tensor,
++    draft_probs: torch.Tensor,
++    target_probs: torch.Tensor,
++    *,
++    uniform_samples: torch.Tensor | None = None,
++    residual_uniform_samples: torch.Tensor | None = None,
++    generator: torch.Generator | None = None,
++) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
++    """Lossless speculative rejection sampling with exact residual resampling.
++
++    For any draft distribution ``q(v)`` and target distribution ``p(v)``, accepts
++    ``y ~ q`` with probability ``min(1, p(y) / q(y))`` and on rejection resamples
++    from ``norm(max(0, p(v) - q(v)))``, guaranteeing that every emitted token is
++    distributed identically to ``p(v)``.
++    """
++    bsz, steps = draft_tokens.shape
++    device = draft_tokens.device
++
++    if uniform_samples is None:
++        uniform_samples = torch.rand(
++            (bsz, steps), dtype=torch.float32, device=device, generator=generator
++        )
++    if residual_uniform_samples is None:
++        residual_uniform_samples = torch.rand(
++            (bsz, steps + 1), dtype=torch.float32, device=device, generator=generator
++        )
++
++    emitted = torch.full((bsz, steps + 1), -1, dtype=torch.int64, device=device)
++    num_accepted = torch.zeros((bsz,), dtype=torch.int64, device=device)
++
++    for b in range(bsz):
++        acc = 0
++        for i in range(steps):
++            tok = int(draft_tokens[b, i].item())
++            q_tok = float(draft_probs[b, i, tok].clamp_min(1e-12).item())
++            p_tok = float(target_probs[b, i, tok].item())
++            accept_prob = min(1.0, p_tok / q_tok)
++            if float(uniform_samples[b, i].item()) < accept_prob:
++                emitted[b, i] = tok
++                acc += 1
++            else:
++                resid = (
++                    target_probs[b, i].float() - draft_probs[b, i].float()
++                ).clamp_min(0.0)
++                resid_sum = resid.sum()
++                if float(resid_sum.item()) <= 1e-12:
++                    resid_probs = target_probs[b, i].float()
++                    resid_probs = resid_probs / resid_probs.sum().clamp_min(1e-12)
++                else:
++                    resid_probs = resid / resid_sum
++                cdf = torch.cumsum(resid_probs, dim=-1)
++                u_val = residual_uniform_samples[b, i].clamp(0.0, 1.0 - 1e-7)
++                sampled_tok = int(
++                    torch.searchsorted(cdf, u_val)
++                    .clamp_max(resid_probs.numel() - 1)
++                    .item()
++                )
++                emitted[b, i] = sampled_tok
++                break
++        else:
++            bonus_probs = target_probs[b, steps].float()
++            bonus_probs = bonus_probs / bonus_probs.sum().clamp_min(1e-12)
++            cdf = torch.cumsum(bonus_probs, dim=-1)
++            u_val = residual_uniform_samples[b, steps].clamp(0.0, 1.0 - 1e-7)
++            bonus_tok = int(
++                torch.searchsorted(cdf, u_val)
++                .clamp_max(bonus_probs.numel() - 1)
++                .item()
++            )
++            emitted[b, steps] = bonus_tok
++
++        num_accepted[b] = acc
++
++    num_emitted = num_accepted + 1
++    return emitted, num_accepted, num_emitted
+-- 
+2.43.0
+
