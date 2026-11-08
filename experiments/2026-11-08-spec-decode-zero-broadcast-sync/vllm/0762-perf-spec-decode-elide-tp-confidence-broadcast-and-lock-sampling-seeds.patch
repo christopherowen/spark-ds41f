@@ -1,0 +1,464 @@
+From 61354efd180ca3f3152e63882f2fca1c958954a9 Mon Sep 17 00:00:00 2001
+From: Christopher Owen <3221756+christopherowen@users.noreply.github.com>
+Date: Sun, 8 Nov 2026 15:19:42 +0000
+Subject: [PATCH] perf(spec_decode): elide TP confidence broadcasts and
+ lockstep TP sampling seeds
+
+Upstream-Base: https://github.com/local-inference-lab/vllm.git@19f2c20ed4d64ae22bd009ceacadd85e2a81e354
+Upstream-Status: local
+
+Rationale:
+1. SamplingStates.add_request previously drew unseeded per-request seeds from
+   the process-global NumPy RNG (np.random.randint). Any rank-asymmetric call
+   to np.random desynchronized seeds across TP ranks, causing gumbel_sample
+   and rejection_sample to draw different draft and verified tokens per rank,
+   diverging DSparkConfidenceHead inputs and OnlineAcceptanceEstimator IRLS
+   parameters across TP ranks when the per-step confidence broadcast is elided.
+   Give SamplingStates an isolated deterministically seeded generator
+   (self._seed_rng = np.random.default_rng(0)) so all TP ranks assign
+   bit-identical seeds to unseeded requests in lockstep.
+2. Sampler.sample previously dispatched unseeded top_k/top_p requests to
+   flashinfer_sample, which ignores per-request seeds and uses rank-local CUDA
+   RNG state. When TP world_size > 1, route top_k/top_p sampling through the
+   deterministic counter-based TileLang top-k/top-p + gumbel_sample path keyed
+   by (seeds.gpu, pos).
+3. Mark OnlineAcceptanceEstimator as tp_invariant = True, reuse persistent
+   _scratch_stats buffers in predict(), expose predict_from_stats() for
+   vocab-parallel draft stats, and expose DraftModelSpeculator.tp_invariant_confidence
+   so logit- and shard-stat-based acceptance estimation also elides the
+   per-step rank-0 confidence broadcast on rank-ordered TP communicators.
+
+Quality:
+Lossless. Preserves exact sampling distributions while guaranteeing 100%
+cross-rank bitwise determinism across TP ranks for both greedy and sampled
+speculative decoding.
+
+Tests:
+- pytest tests/v1/spec_decode/test_adaptive_verification.py
+- pytest tests/v1/spec_decode/test_acceptance_estimator.py
+- pytest tests/v1/spec_decode/test_copy_drafts.py
+- pytest tests/v1/worker/test_dspark_greedy_markov.py
+- pytest tests/distributed/test_roce_policy_no_fallback.py
+- pytest tests/kernels/test_deepseek_v41_tilelang_confidence.py
+---
+ .../spec_decode/test_adaptive_verification.py | 122 ++++++++++++++++++
+ vllm/v1/worker/gpu/sample/sampler.py          |  16 ++-
+ vllm/v1/worker/gpu/sample/states.py           |  12 +-
+ .../gpu/spec_decode/acceptance_estimator.py   |  87 +++++++++----
+ .../gpu/spec_decode/adaptive_verification.py  |   5 +-
+ .../gpu/spec_decode/dflash/speculator.py      |  28 +---
+ vllm/v1/worker/gpu/spec_decode/speculator.py  |   6 +
+ 7 files changed, 225 insertions(+), 51 deletions(-)
+
+diff --git a/tests/v1/spec_decode/test_adaptive_verification.py b/tests/v1/spec_decode/test_adaptive_verification.py
+index d9062785b..819362d86 100644
+--- a/tests/v1/spec_decode/test_adaptive_verification.py
++++ b/tests/v1/spec_decode/test_adaptive_verification.py
+@@ -947,3 +947,125 @@ def test_high_concurrency_row_cost_knee_admits_coalesced_drafts():
+     _, _, knee_budget = manager._batch_budget
+     assert knee_budget == 32
+     assert total == 40
++
++
++def test_sampling_states_unseeded_requests_stay_lockstep_across_tp_ranks():
++    """Unseeded temperature > 0 requests must draw identical per-request seeds on
++    every TP rank even when rank-local callers perturb the global NumPy RNG."""
++    from vllm.sampling_params import SamplingParams
++    from vllm.v1.worker.gpu.sample.states import SamplingStates
++
++    np.random.seed(101)
++    rank0 = SamplingStates.__new__(SamplingStates)
++    rank0.max_num_reqs = 8
++    rank0.vocab_size = 1024
++    rank0.temperature = SimpleNamespace(np=np.zeros(8, dtype=np.float32))
++    rank0.top_p = SimpleNamespace(np=np.ones(8, dtype=np.float32))
++    rank0.top_k = SimpleNamespace(np=np.full(8, 1024, dtype=np.int32))
++    rank0.min_p = SimpleNamespace(np=np.zeros(8, dtype=np.float32))
++    rank0.seeds = SimpleNamespace(np=np.zeros(8, dtype=np.int64))
++    rank0.seeds_set = np.zeros(8, dtype=bool)
++    rank0.num_logprobs = np.full(8, -1, dtype=np.int32)
++    rank0._seed_rng = np.random.default_rng(0)
++
++    # Perturb the global NumPy RNG asymmetrically on rank 1 before and between requests.
++    np.random.seed(99999)
++    _ = np.random.randint(0, 1000, size=37)
++    rank1 = SamplingStates.__new__(SamplingStates)
++    rank1.max_num_reqs = 8
++    rank1.vocab_size = 1024
++    rank1.temperature = SimpleNamespace(np=np.zeros(8, dtype=np.float32))
++    rank1.top_p = SimpleNamespace(np=np.ones(8, dtype=np.float32))
++    rank1.top_k = SimpleNamespace(np=np.full(8, 1024, dtype=np.int32))
++    rank1.min_p = SimpleNamespace(np=np.zeros(8, dtype=np.float32))
++    rank1.seeds = SimpleNamespace(np=np.zeros(8, dtype=np.int64))
++    rank1.seeds_set = np.zeros(8, dtype=bool)
++    rank1.num_logprobs = np.full(8, -1, dtype=np.int32)
++    rank1._seed_rng = np.random.default_rng(0)
++
++    for slot in range(8):
++        params = SamplingParams(temperature=0.8, top_p=0.95, seed=None)
++        rank0.add_request(slot, params)
++        _ = np.random.random(13)
++        rank1.add_request(slot, params)
++
++    np.testing.assert_array_equal(rank0.seeds.np, rank1.seeds.np)
++    assert not rank0.seeds_set.any()
++    assert len(set(rank0.seeds.np.tolist())) == 8
++
++
++def test_sampler_multi_rank_tp_disables_unseeded_flashinfer_rng(monkeypatch):
++    """When TP > 1, top-k/top-p sampling must route through the counter-based
++    seeded sampler rather than FlashInfer's rank-local device RNG."""
++    import vllm.distributed.parallel_state as parallel_state
++    from vllm.v1.worker.gpu.sample.sampler import Sampler
++
++    sampler = Sampler.__new__(Sampler)
++    sampler.use_flashinfer = True
++    sampler.logprobs_mode = "raw_logprobs"
++    sampler.needs_logits_processing = np.array([True], dtype=bool)
++    sampler.needs_non_temperature_logits_processing = np.array([True], dtype=bool)
++    sampler.sampling_states = SimpleNamespace(
++        get_top_k_top_p=lambda expanded, idx_np: (torch.tensor([16]), None),
++        any_greedy=lambda idx_np: False,
++        any_explicit_seed=lambda idx_np: False,
++    )
++    sampler.apply_sampling_params = lambda logits, *args, **kwargs: logits
++    recorded_use_fi = []
++
++    def fake_sample_random(
++        processed_logits,
++        expanded_idx_mapping,
++        idx_mapping_np,
++        pos,
++        top_k,
++        top_p,
++        use_flashinfer,
++        apply_temperature=False,
++    ):
++        recorded_use_fi.append(bool(use_flashinfer))
++        return torch.zeros(1, dtype=torch.int64), processed_logits
++
++    sampler._sample_random = fake_sample_random
++    logits = torch.zeros((1, 32), dtype=torch.float32)
++    idx = torch.zeros(1, dtype=torch.int32)
++    idx_np = np.array([0], dtype=np.int32)
++    pos = torch.zeros(1, dtype=torch.int64)
++    input_ids = torch.zeros(1, dtype=torch.int64)
++
++    monkeypatch.setattr(parallel_state, "model_parallel_is_initialized", lambda: True)
++    monkeypatch.setattr(
++        parallel_state, "get_tensor_model_parallel_world_size", lambda: 1
++    )
++    sampler.sample(logits, idx, idx, idx_np, pos, input_ids, idx)
++
++    monkeypatch.setattr(
++        parallel_state, "get_tensor_model_parallel_world_size", lambda: 4
++    )
++    sampler.sample(logits, idx, idx, idx_np, pos, input_ids, idx)
++
++    assert recorded_use_fi == [True, False]
++
++
++def test_draft_model_speculator_tp_invariant_confidence_tracks_estimator():
++    """DraftModelSpeculator and DFlashSpeculator report tp_invariant_confidence
++    when OnlineAcceptanceEstimator is active."""
++    from vllm.v1.worker.gpu.spec_decode.acceptance_estimator import (
++        OnlineAcceptanceEstimator,
++    )
++    from vllm.v1.worker.gpu.spec_decode.dflash.speculator import DFlashSpeculator
++    from vllm.v1.worker.gpu.spec_decode.speculator import DraftModelSpeculator
++
++    assert OnlineAcceptanceEstimator.tp_invariant is True
++    spec = DFlashSpeculator.__new__(DFlashSpeculator)
++    spec.acceptance_estimator = None
++    assert spec.tp_invariant_confidence is False
++    assert DraftModelSpeculator.tp_invariant_confidence.fget(spec) is False
++
++    spec.acceptance_estimator = SimpleNamespace(tp_invariant=True)
++    assert spec.tp_invariant_confidence is True
++    assert DraftModelSpeculator.tp_invariant_confidence.fget(spec) is True
++
++    dflash = DFlashSpeculator.__new__(DFlashSpeculator)
++    dflash.acceptance_estimator = SimpleNamespace(tp_invariant=True)
++    assert dflash.tp_invariant_confidence is True
+diff --git a/vllm/v1/worker/gpu/sample/sampler.py b/vllm/v1/worker/gpu/sample/sampler.py
+index cdcd3a877..277c83c5c 100644
+--- a/vllm/v1/worker/gpu/sample/sampler.py
++++ b/vllm/v1/worker/gpu/sample/sampler.py
+@@ -441,12 +441,14 @@ class Sampler:
+         )
+         use_flashinfer = self.use_flashinfer and not (
+             # Don't use FI sampler if no requests use top_k/top_p, if there are
+-            # any greedy requests or per-request seeds, or if post-processed
++            # any greedy requests or per-request seeds, if multi-rank TP needs
++            # lockstep counter-based RNG across ranks, or if post-processed
+             # logprobs need to be returned for any requests.
+             (top_k is None and top_p is None)
+             or (return_logprobs and self.logprobs_mode in PROCESSED_LOGPROBS_MODES)
+             or self.sampling_states.any_greedy(idx_mapping_np)
+             or self.sampling_states.any_explicit_seed(idx_mapping_np)
++            or self._tp_lockstep_sampling()
+         )
+ 
+         if in_kernel_temperature:
+@@ -470,6 +472,18 @@ class Sampler:
+             use_flashinfer,
+         )
+ 
++    def _tp_lockstep_sampling(self) -> bool:
++        """Whether multi-rank TP requires counter-based seeded sampling across ranks."""
++        from vllm.distributed.parallel_state import (
++            get_tensor_model_parallel_world_size,
++            model_parallel_is_initialized,
++        )
++
++        return (
++            model_parallel_is_initialized()
++            and get_tensor_model_parallel_world_size() > 1
++        )
++
+     def _sample_random(
+         self,
+         processed_logits: torch.Tensor,
+diff --git a/vllm/v1/worker/gpu/sample/states.py b/vllm/v1/worker/gpu/sample/states.py
+index 533b7bdc4..a224f16f7 100644
+--- a/vllm/v1/worker/gpu/sample/states.py
++++ b/vllm/v1/worker/gpu/sample/states.py
+@@ -28,6 +28,10 @@ class SamplingStates:
+         # Tracks whether `seed` was set explicitly by the user, so callers
+         # can fall back from RNG paths that don't honor per-request seeds.
+         self.seeds_set = np.zeros(max_num_reqs, dtype=bool)
++        # Dedicated lockstep generator so unseeded requests draw identical
++        # per-request seeds across TP ranks regardless of rank-local callers
++        # touching the process-global NumPy RNG.
++        self._seed_rng = np.random.default_rng(0)
+ 
+         # Initialize top_k and top_p manually because 0 is an invalid value for them.
+         self.top_k.np.fill(self.vocab_size)
+@@ -51,7 +55,13 @@ class SamplingStates:
+         seed = sampling_params.seed
+         self.seeds_set[req_idx] = seed is not None
+         if seed is None:
+-            seed = np.random.randint(_NP_INT64_MIN, _NP_INT64_MAX)
++            seed_rng = getattr(self, "_seed_rng", None)
++            if seed_rng is None:
++                seed_rng = np.random.default_rng(0)
++                self._seed_rng = seed_rng
++            seed = int(
++                seed_rng.integers(_NP_INT64_MIN, _NP_INT64_MAX, dtype=np.int64)
++            )
+         self.seeds.np[req_idx] = seed
+ 
+         num_logprobs = sampling_params.logprobs
+diff --git a/vllm/v1/worker/gpu/spec_decode/acceptance_estimator.py b/vllm/v1/worker/gpu/spec_decode/acceptance_estimator.py
+index 6f3f3d566..9d7578536 100644
+--- a/vllm/v1/worker/gpu/spec_decode/acceptance_estimator.py
++++ b/vllm/v1/worker/gpu/spec_decode/acceptance_estimator.py
+@@ -388,6 +388,9 @@ class OnlineAcceptanceEstimator:
+     estimator degrades to uniform-depth truncation rather than to anything harmful.
+     """
+ 
++    # Fixed-block Triton reductions over rank-ordered inputs are TP-invariant.
++    tp_invariant: bool = True
++
+     # Refit every this many steps, accumulating samples in between.
+     REFIT_INTERVAL = 100
+     # Newton steps are damped by n / (n + DAMPING_OBSERVATIONS), so a round
+@@ -472,6 +475,8 @@ class OnlineAcceptanceEstimator:
+         self.counts = torch.zeros(
+             num_speculative_steps, dtype=torch.float32, device=device
+         )
++        self._local_max_buf: torch.Tensor | None = None
++        self._local_sumexp_buf: torch.Tensor | None = None
+ 
+     @classmethod
+     def for_confidence_head(
+@@ -551,6 +556,61 @@ class OnlineAcceptanceEstimator:
+         )
+         self._refits += 1
+ 
++    def _scratch_stats(
++        self, num_tokens: int, num_blocks: int
++    ) -> tuple[torch.Tensor, torch.Tensor]:
++        buf_max = getattr(self, "_local_max_buf", None)
++        buf_sumexp = getattr(self, "_local_sumexp_buf", None)
++        if (
++            buf_max is None
++            or buf_sumexp is None
++            or buf_max.shape[0] < num_tokens
++            or buf_max.shape[1] != num_blocks
++        ):
++            rows = max(num_tokens, self.features.shape[0])
++            buf_max = torch.empty(
++                rows, num_blocks, dtype=torch.float32, device=self.device
++            )
++            buf_sumexp = torch.empty_like(buf_max)
++            self._local_max_buf = buf_max
++            self._local_sumexp_buf = buf_sumexp
++        return buf_max[:num_tokens], buf_sumexp[:num_tokens]
++
++    def predict_from_stats(
++        self,
++        local_max: torch.Tensor,
++        local_sumexp: torch.Tensor,
++        idx_mapping: torch.Tensor,
++        draft_step: torch.Tensor,
++        confidence_probs: torch.Tensor,
++    ) -> None:
++        num_tokens, num_blocks = local_max.shape
++        if num_tokens == 0:
++            return
++        _predict_kernel[(num_tokens,)](
++            self.features,
++            self.features.stride(0),
++            self.predictions,
++            self.predictions.stride(0),
++            confidence_probs,
++            confidence_probs.stride(0),
++            self.slope,
++            self.intercepts,
++            local_max,
++            local_max.stride(0),
++            local_sumexp,
++            local_sumexp.stride(0),
++            idx_mapping,
++            idx_mapping.stride(0),
++            draft_step,
++            num_tokens,
++            num_blocks,
++            per_token_step=draft_step.dim() > 0,
++            NUM_SPECULATIVE_STEPS=self.num_speculative_steps,
++            MAX_LOG_ODDS=_MAX_LOG_ODDS,
++            PADDED_VOCAB_NUM_BLOCKS=triton.next_power_of_2(num_blocks),
++        )
++
+     def predict(
+         self,
+         logits: torch.Tensor,
+@@ -560,12 +620,11 @@ class OnlineAcceptanceEstimator:
+         temperature: torch.Tensor,
+     ) -> None:
+         num_tokens, vocab_size = logits.shape
++        if num_tokens == 0:
++            return
+         VOCAB_BLOCK_SIZE = 4096
+         num_blocks = triton.cdiv(vocab_size, VOCAB_BLOCK_SIZE)
+-        local_max = torch.empty(
+-            num_tokens, num_blocks, dtype=torch.float32, device=self.device
+-        )
+-        local_sumexp = torch.empty_like(local_max)
++        local_max, local_sumexp = self._scratch_stats(num_tokens, num_blocks)
+         _local_max_sumexp_kernel[(num_tokens, num_blocks)](
+             local_max,
+             local_max.stride(0),
+@@ -580,28 +639,12 @@ class OnlineAcceptanceEstimator:
+             vocab_size,
+             BLOCK_SIZE=VOCAB_BLOCK_SIZE,
+         )
+-        _predict_kernel[(num_tokens,)](
+-            self.features,
+-            self.features.stride(0),
+-            self.predictions,
+-            self.predictions.stride(0),
+-            confidence_probs,
+-            confidence_probs.stride(0),
+-            self.slope,
+-            self.intercepts,
++        self.predict_from_stats(
+             local_max,
+-            local_max.stride(0),
+             local_sumexp,
+-            local_sumexp.stride(0),
+             idx_mapping,
+-            idx_mapping.stride(0),
+             draft_step,
+-            num_tokens,
+-            num_blocks,
+-            per_token_step=draft_step.dim() > 0,
+-            NUM_SPECULATIVE_STEPS=self.num_speculative_steps,
+-            MAX_LOG_ODDS=_MAX_LOG_ODDS,
+-            PADDED_VOCAB_NUM_BLOCKS=triton.next_power_of_2(num_blocks),
++            confidence_probs,
+         )
+ 
+     def _step_cpu(
+diff --git a/vllm/v1/worker/gpu/spec_decode/adaptive_verification.py b/vllm/v1/worker/gpu/spec_decode/adaptive_verification.py
+index 3f49b6cbc..4a6cfa243 100644
+--- a/vllm/v1/worker/gpu/spec_decode/adaptive_verification.py
++++ b/vllm/v1/worker/gpu/spec_decode/adaptive_verification.py
+@@ -266,9 +266,12 @@ class AdaptiveVerificationManager:
+         # reductions unless both the TP group's reductions and the confidence
+         # head are rank-invariant. Both CPU graph selection and GPU request
+         # compaction must consume one TP-wide confidence snapshot.
++        tp_invariant = getattr(self, "tp_invariant_confidence", False)
++        if callable(tp_invariant):
++            tp_invariant = bool(tp_invariant())
+         tp_group = get_tp_group()
+         if tp_group.world_size > 1 and not (
+-            getattr(self, "tp_invariant_confidence", False)
++            tp_invariant
+             and getattr(
+                 getattr(tp_group, "device_communicator", None),
+                 "rank_order_reduce_scatter",
+diff --git a/vllm/v1/worker/gpu/spec_decode/dflash/speculator.py b/vllm/v1/worker/gpu/spec_decode/dflash/speculator.py
+index 544c01f3e..706aba8fa 100644
+--- a/vllm/v1/worker/gpu/spec_decode/dflash/speculator.py
++++ b/vllm/v1/worker/gpu/spec_decode/dflash/speculator.py
+@@ -322,36 +322,12 @@ class DFlashSpeculator(DraftModelSpeculator):
+         )
+         est = self.acceptance_estimator
+         if est is not None:
+-            # Same predictor as acceptance_estimator.predict, fed with per-rank
+-            # (max, sum-exp) partials of logits / T instead of vocab blocks.
+-            from vllm.v1.worker.gpu.spec_decode.acceptance_estimator import (
+-                _MAX_LOG_ODDS,
+-                _predict_kernel,
+-            )
+-
+-            num_tokens, nparts = maxes.shape
+-            _predict_kernel[(num_tokens,)](
+-                est.features,
+-                est.features.stride(0),
+-                est.predictions,
+-                est.predictions.stride(0),
+-                self.draft_token_confidence_probs,
+-                self.draft_token_confidence_probs.stride(0),
+-                est.slope,
+-                est.intercepts,
++            est.predict_from_stats(
+                 maxes,
+-                maxes.stride(0),
+                 sums,
+-                sums.stride(0),
+                 idx_mapping,
+-                idx_mapping.stride(0),
+                 draft_step,
+-                num_tokens,
+-                nparts,
+-                per_token_step=draft_step.dim() > 0,
+-                NUM_SPECULATIVE_STEPS=est.num_speculative_steps,
+-                MAX_LOG_ODDS=_MAX_LOG_ODDS,
+-                PADDED_VOCAB_NUM_BLOCKS=next_power_of_2(nparts),
++                self.draft_token_confidence_probs,
+             )
+         return tokens
+ 
+diff --git a/vllm/v1/worker/gpu/spec_decode/speculator.py b/vllm/v1/worker/gpu/spec_decode/speculator.py
+index dfd477459..b6f865a1c 100644
+--- a/vllm/v1/worker/gpu/spec_decode/speculator.py
++++ b/vllm/v1/worker/gpu/spec_decode/speculator.py
+@@ -491,6 +491,12 @@ class DraftModelSpeculator(BaseSpeculator):
+         self._maybe_predict_acceptance(logits, idx_mapping, draft_step)
+         return sampled
+ 
++    @property
++    def tp_invariant_confidence(self) -> bool:
++        """Whether every TP rank computes bitwise-identical draft confidences
++        when TP reductions are rank-ordered."""
++        return bool(getattr(self.acceptance_estimator, "tp_invariant", False))
++
+     def _maybe_predict_acceptance(
+         self,
+         logits: torch.Tensor,
+-- 
+2.43.0
+
