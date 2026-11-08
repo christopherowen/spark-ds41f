@@ -1,0 +1,67 @@
+==================== BOOT 1 ====================
+INFO 11-08 12:17:09 [l2_prefetch.py:300] [l2_prefetch] CuTe kernel ready (grid=4 block=128 chunk=4096; budgets A/B/C/A_mla=20/50/15/36 MB)
+
+================ TP3 (inter=768) ================
+2026-11-08 12:17:12  [TileLang:tilelang.cache.kernel_cache:WARNING] (kernel_cache.py:421): Found kernel 'moe_dispatch' in memory cache. For better performance, consider using `@tilelang.jit` instead of direct kernel caching.
+2026-11-08 12:17:12  [TileLang:tilelang.cache.kernel_cache:WARNING] (kernel_cache.py:421): Found kernel 'moe_dispatch' in memory cache. For better performance, consider using `@tilelang.jit` instead of direct kernel caching.
+TP3: 100% bit-identical (torch.equal) across all M=1..4096!
+
+--- TP3 Standalone MoE (Rotating 16 Layer Routings) ---
+    M | Base med (mean+-ci95 us) | EvictFirst med (mean+-ci95 us) |     Delta
+    1 |   167.07 (  167.81+-1.62) |     161.92 (  162.83+-1.35)  |    -3.08%
+    2 |   321.86 (  322.90+-1.43) |     321.38 (  330.09+-6.04)  |    -0.15%
+    4 |   631.90 (  632.92+-1.58) |     625.73 (  626.30+-1.44)  |    -0.98%
+    6 |   942.14 (  952.25+-8.19) |     923.58 (  924.14+-1.92)  |    -1.97%
+    8 |  1250.62 ( 1252.01+-1.44) |    1220.45 ( 1221.91+-1.95)  |    -2.41%
+   16 |  2488.22 ( 2488.55+-1.51) |    2432.03 ( 2435.82+-3.69)  |    -2.26%
+   32 |  5009.31 ( 5113.02+-46.58) |    4954.24 ( 4954.94+-2.37)  |    -1.10%
+   64 |  9900.16 ( 9901.22+-2.87) |    9901.28 ( 9902.13+-4.79)  |    +0.01%
+  128 |  9981.12 ( 9994.63+-17.29) |    9953.50 ( 9958.02+-5.25)  |    -0.28%
+  512 | 10374.21 (10399.22+-43.12) |   10339.62 (10344.07+-9.36)  |    -0.33%
+ 1024 | 11348.03 (11451.07+-199.44) |   10851.62 (10855.73+-9.24)  |    -4.37%
+ 2048 | 11793.54 (11800.04+-13.11) |   11788.42 (11815.07+-53.39)  |    -0.04%
+ 4096 | 13717.73 (13873.77+-93.71) |   13715.36 (13792.77+-76.34)  |    -0.02%
+
+--- TP3 Full FFN Layer (L2 Prefetch Shared Experts + Routed MoE + Shared GEMMs + Residual) ---
+    M | Base med (mean+-ci95 us) | EvictFirst med (mean+-ci95 us) |     Delta
+INFO 11-08 12:17:22 [l2_prefetch.py:541] [l2_prefetch] persisting L2 set-aside on cuda:0: L2 25 MB, max 19 MB, requested 0 MB, now 0 MB
+    1 |   220.32 (  221.82+-2.08) |     184.45 (  190.06+-4.86)  |   -16.28%
+    2 |   376.19 (  376.73+-0.61) |     339.14 (  339.69+-1.16)  |    -9.85%
+    4 |   691.42 (  714.71+-11.87) |     648.42 (  649.26+-1.21)  |    -6.22%
+    6 |   997.38 (  997.55+-0.89) |     952.54 (  953.21+-1.56)  |    -4.49%
+    8 |  1308.99 ( 1319.84+-10.01) |    1265.60 ( 1265.54+-1.67)  |    -3.31%
+   16 |  2549.12 ( 2549.08+-1.23) |    2530.24 ( 2530.42+-1.45)  |    -0.74%
+   32 |  5028.80 ( 5040.73+-13.53) |    5015.58 ( 5016.68+-1.99)  |    -0.26%
+
+================ TP4 (inter=576) ================
+TP4: 100% bit-identical (torch.equal) across all M=1..4096!
+2026-11-08 12:17:26  [TileLang:tilelang.jit.kernel:INFO] (kernel.py:137): TileLang begins to compile kernel `gemm_mxfp8` with `out_idx=None`
+2026-11-08 12:17:28  [TileLang:tilelang.jit.kernel:INFO] (kernel.py:145): TileLang completes to compile kernel `gemm_mxfp8`
+2026-11-08 12:17:28  [TileLang:tilelang.jit.kernel:INFO] (kernel.py:137): TileLang begins to compile kernel `gemm_mxfp8` with `out_idx=None`
+2026-11-08 12:17:29  [TileLang:tilelang.jit.kernel:INFO] (kernel.py:145): TileLang completes to compile kernel `gemm_mxfp8`
+
+--- TP4 Standalone MoE (Rotating 16 Layer Routings) ---
+    M | Base med (mean+-ci95 us) | EvictFirst med (mean+-ci95 us) |     Delta
+    1 |   348.67 (  350.78+-11.55) |     335.87 (  307.75+-24.23)  |    -3.67%
+    2 |   251.14 (  266.09+-7.13) |     256.19 (  271.58+-7.94)  |    +2.01%
+    4 |   513.18 (  514.50+-9.22) |     468.16 (  479.81+-8.01)  |    -8.77%
+    6 |   711.87 (  728.02+-10.56) |     682.21 (  684.31+-2.29)  |    -4.17%
+    8 |   940.13 (  941.04+-1.69) |     905.41 (  919.04+-10.57)  |    -3.69%
+   16 |  1866.91 ( 1870.48+-2.97) |    1840.16 ( 1842.07+-2.86)  |    -1.43%
+   32 |  3713.09 ( 3713.70+-3.24) |    3708.00 ( 3708.28+-2.10)  |    -0.14%
+   64 |  7412.86 ( 7425.90+-15.28) |    7409.82 ( 7420.48+-13.79)  |    -0.04%
+  128 |  7481.73 ( 7483.57+-4.66) |    7474.37 ( 7473.19+-2.43)  |    -0.10%
+  512 |  7833.63 ( 7868.47+-42.48) |    7812.22 ( 7814.45+-5.40)  |    -0.27%
+ 1024 |  8299.71 ( 8322.08+-42.97) |    8359.17 ( 8358.58+-26.78)  |    +0.72%
+ 2048 |  9205.89 ( 9255.77+-49.95) |    9162.98 ( 9165.98+-7.28)  |    -0.47%
+ 4096 | 10964.06 (11089.99+-77.13) |   10950.75 (11011.52+-66.86)  |    -0.12%
+
+--- TP4 Full FFN Layer (L2 Prefetch Shared Experts + Routed MoE + Shared GEMMs + Residual) ---
+    M | Base med (mean+-ci95 us) | EvictFirst med (mean+-ci95 us) |     Delta
+    1 |   176.35 (  177.06+-1.01) |     150.50 (  150.77+-1.08)  |   -14.66%
+    2 |   288.83 (  301.60+-8.24) |     259.26 (  271.84+-8.40)  |   -10.24%
+    4 |   516.19 (  516.35+-0.95) |     488.54 (  505.04+-10.31)  |    -5.36%
+    6 |   747.62 (  749.42+-3.58) |     708.99 (  710.97+-1.82)  |    -5.17%
+    8 |   981.06 (  981.31+-1.21) |     943.42 (  944.82+-1.85)  |    -3.84%
+   16 |  1911.84 ( 1911.79+-1.49) |    1905.89 ( 1906.38+-1.83)  |    -0.31%
+   32 |  3761.25 ( 3764.09+-4.70) |    3761.15 ( 3761.67+-1.90)  |    -0.00%
