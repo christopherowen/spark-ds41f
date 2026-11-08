@@ -1,0 +1,1379 @@
+From 0d7c729b30927043ffd047ce782fff5db9efb419 Mon Sep 17 00:00:00 2001
+From: Christopher Owen <christopherowen@users.noreply.github.com>
+Date: Sun, 8 Nov 2026 16:02:59 +0000
+Subject: [PATCH] oneshot: add single-kernel multi-stage pipelined RoCE
+ collectives
+
+Upstream base: 1fd6a1fbd8dc4884057046d1ebd93d585c9e4bcf
+
+Rationale:
+Large sequence-parallel prefill collectives (> 256 KiB..16 MiB+) previously
+sliced payloads across multiple sequential Python-level kernel launches with
+DEFAULT_BLOCKS = 64 (16 of 20 GB10 SMs). When overlapped with compute on a
+side CUDA stream, yielding the GPU between slices allowed main-stream GEMM
+waves to claim all 20 SMs and stall subsequent collective slices for
+150-375 us, forcing commit 1fd6a1fbd8dc to cap SparknetOneShotAllReduce at a
+single slot (<= _slot_bytes) and fall back to PyNCCL (which steals 4-8 SMs).
+
+Replace multi-launch Python slicing across oneshot_allgather,
+oneshot_reducescatter, oneshot_exchange, and all_to_all_rows with a single
+persistent low-occupancy kernel launch (for s in T.serial(num_stages):) capped
+at SPARKNET_ROCE_COLLECTIVE_BLOCKS=8 CTAs (2 of 20 GB10 SMs) and
+SPARKNET_ROCE_STAGE_BYTES=4194304 (4 MiB collective bytes per stage). Within
+one persistent kernel launch, the 8 resident CTAs alternate across the two
+ping-pong RDMA slots (seq = epoch + s, slot = seq & (slots - 1)) and advance
+counters[0] to epoch + num_stages at completion without yielding SMs between
+stages or allocating additional pinned host memory.
+
+Quality implications:
+Bit-exact (zero arithmetic change; identical rank-order reduction and
+byte-exact gather/exchange staging).
+
+Tests:
+- python3 -m unittest tests/test_oneshot_cpu.py -v (24/24 passed)
+- pytest tests/ -v (97 passed, 62 subtests passed)
+- 2-boot TP=4 and TP=3 hardware verification and GEMM-overlap benchmarks
+  across 48 KiB - 16 MiB on GB10 ConnectX-7 RoCEv2
+
+Upstream status:
+Candidate for dgx-spark-networking main.
+---
+ sparknet/integration/vllm/roce_all_reduce.py |  22 +-
+ sparknet/oneshot/_allgather_tilelang.py      | 136 ++++++---
+ sparknet/oneshot/_exchange_tilelang.py       | 185 ++++++-----
+ sparknet/oneshot/_kernels.py                 |   2 +
+ sparknet/oneshot/_reducescatter_tilelang.py  | 181 ++++++-----
+ sparknet/oneshot/runtime.py                  | 306 ++++++++++---------
+ tests/test_oneshot_cpu.py                    |  29 ++
+ 7 files changed, 517 insertions(+), 344 deletions(-)
+
+diff --git a/sparknet/integration/vllm/roce_all_reduce.py b/sparknet/integration/vllm/roce_all_reduce.py
+index dc88442..e5eeab3 100644
+--- a/sparknet/integration/vllm/roce_all_reduce.py
++++ b/sparknet/integration/vllm/roce_all_reduce.py
+@@ -201,8 +201,19 @@ class SparknetOneShotAllReduce:
+                 self.all_reduce_max_bytes, self.all_reduce_capacity_bytes)
+         return self._runtime.all_reduce(inp)
+ 
++    def _max_collective_bytes(self) -> int:
++        val = os.environ.get("SPARKNET_ROCE_MAX_COLLECTIVE_BYTES")
++        if val is not None:
++            return parse_byte_size(val)
++        return 64 * 1024 * 1024
++
+     def should_all_gather(self, inp: torch.Tensor, dim: int) -> bool:
+-        return not self.disabled and self._runtime.should_all_gather(inp, dim)
++        sliced = os.environ.get("SPARKNET_ROCE_SLICED_ALLGATHER", "1") != "0"
++        return (
++            not self.disabled
++            and self.world_size * inp.numel() * inp.element_size() <= self._max_collective_bytes()
++            and self._runtime.should_all_gather(inp, dim, sliced=sliced)
++        )
+ 
+     def all_gather(self, inp: torch.Tensor, dim: int) -> torch.Tensor:
+         if not self._announced_gather:
+@@ -210,12 +221,13 @@ class SparknetOneShotAllReduce:
+             log = logger.info if self.rank == 0 else logger.debug
+             log("one-shot all-gather is live: first routed shard is %s %s along dim %d; input shard dispatch limit=%d bytes.",
+                 tuple(inp.shape), str(inp.dtype).replace("torch.", ""), dim, self.all_gather_max_bytes)
+-        return self._runtime.all_gather(inp, dim=dim)
++        sliced = os.environ.get("SPARKNET_ROCE_SLICED_ALLGATHER", "1") != "0"
++        return self._runtime.all_gather(inp, dim=dim, sliced=sliced)
+ 
+     def should_reduce_scatter(self, inp: torch.Tensor, dim: int = 0) -> bool:
+         return (
+             not self.disabled
+-            and inp.numel() * inp.element_size() <= self._runtime._slot_bytes
++            and inp.numel() * inp.element_size() <= self._max_collective_bytes()
+             and self._runtime.should_reduce_scatter(inp, dim=dim)
+         )
+ 
+@@ -230,7 +242,7 @@ class SparknetOneShotAllReduce:
+     def should_exchange(self, chunks: torch.Tensor, parts: torch.Tensor | None = None) -> bool:
+         return (
+             not self.disabled
+-            and chunks.numel() * chunks.element_size() <= self._runtime._slot_bytes
++            and chunks.numel() * chunks.element_size() <= self._max_collective_bytes()
+             and self._runtime.should_exchange(chunks, parts)
+         )
+ 
+@@ -245,7 +257,7 @@ class SparknetOneShotAllReduce:
+     def should_all_to_all_rows(self, inp: torch.Tensor, rows: int) -> bool:
+         return (
+             not self.disabled
+-            and inp.numel() * inp.element_size() <= self._runtime._slot_bytes
++            and inp.numel() * inp.element_size() <= self._max_collective_bytes()
+             and self._runtime.should_all_to_all_rows(inp, rows)
+         )
+ 
+diff --git a/sparknet/oneshot/_allgather_tilelang.py b/sparknet/oneshot/_allgather_tilelang.py
+index 869298e..f782b47 100644
+--- a/sparknet/oneshot/_allgather_tilelang.py
++++ b/sparknet/oneshot/_allgather_tilelang.py
+@@ -3,9 +3,9 @@
+ Same transport and protocol as the all-reduce with the reduction replaced by
+ a strided copy that writes the concatenated output directly (dim-0 and
+ last-dim concatenation). Staging also writes the rank's own shard to its
+-block of the output, so the data phase reads only the peers. Generated as CUDA source by TileLang with the
+-protocol steps in ``_device.py``; the buffers are the kernel's arguments and
+-``run`` takes a ``Launch``.
++block of the output, so the data phase reads only the peers. Multi-stage
++launches execute all stages inside a single persistent kernel across the two
++ping-pong slots.
+ """
+ 
+ # No postponed annotations: TileLang evaluates the prim_func's annotations
+@@ -34,6 +34,7 @@ def _build(world_size: int, rank: int, threads: int, slots: int, flag_stride: in
+     source = render_source(world_size=world_size, rank=rank, slots=slots, flag_stride=flag_stride,
+                            hca_count=lanes, neighbor_lanes=neighbor_lanes)
+     resident = _resident_blocks(threads)
++    pack_words = PACK_BYTES // 4
+ 
+     @tilelang.jit(pass_configs=_pass_configs())
+     def program():
+@@ -59,6 +60,8 @@ def _build(world_size: int, rank: int, threads: int, slots: int, flag_stride: in
+             rung_index: T.int32,
+             arrival_index: T.int32,
+             grid_x: T.int32,
++            num_stages: T.int32,
++            stage_packs: T.int32,
+         ):
+             with T.Kernel(grid_x, threads=threads) as bx:
+                 T.annotate_min_blocks_per_sm(resident)
+@@ -67,49 +70,104 @@ def _build(world_size: int, rank: int, threads: int, slots: int, flag_stride: in
+                 epoch = T.alloc_var(T.uint32)
+                 epoch = T.call_extern("roce_ld_relaxed_gpu_u32", T.address_of(counters[0]), dtype=T.uint32)
+                 seq = T.alloc_var(T.uint32)
+-                seq = epoch + T.uint32(1)
+                 slot = T.alloc_var(T.int32)
+-                slot = T.cast(seq & T.uint32(1), T.int32)
+                 send_slot = T.alloc_var(T.int32)
+-                send_slot = send_off + slot * slot_bytes
+                 index = T.alloc_var(T.int32)
+                 index = bx * threads + tx
+                 stride = T.alloc_var(T.int32)
+                 stride = grid_x * threads
+-                # 1. stage the local shard into the pinned send slot and its own column block of the output
++                stage_offset = T.alloc_var(T.int32)
++                cur_packs = T.alloc_var(T.int32)
++                cur_row_packs = T.alloc_var(T.int32)
+                 count = T.alloc_var(T.int32)
+-                count = T.max(0, (shard_packs - index + stride - 1) // stride)
+-                for i in T.serial(count):
+-                    T.call_extern("roce_stage_gather_pack", T.address_of(inp[0]),
+-                                  T.call_extern("roce_ptr", region_base + T.cast(send_slot, T.int64), dtype="handle"),
+-                                  index + i * stride, row_packs, T.address_of(out[0]), dst_stride_packs, dtype="handle")
+-                T.sync_threads()
+-                # 2. the last block to finish staging rings the proxy doorbell
+-                if tx == 0:
+-                    rang = T.alloc_var(T.uint32)
+-                    rang = T.call_extern("roce_doorbell", T.address_of(counters[stage_index]), T.cast(grid_x, T.uint32),
+-                                         T.call_extern("roce_ptr", region_base + T.cast(ctrl_off, T.int64), dtype="handle"), T.cast(nbytes, T.uint32), seq, dtype=T.uint32)
+-                    if rang != T.uint32(0):
+-                        T.call_extern("roce_st_release_gpu_u32", T.address_of(counters[rung_index]), seq, dtype="handle")
+-                # 3. block 0 waits for every peer's payload-stripe flags, the other blocks for block 0
+-                T.call_extern("roce_wait_peers", bx, tx, T.call_extern("roce_ptr", region_base + T.cast(flag_off, T.int64), dtype="handle"), seq,
+-                              T.call_extern("roce_ptr", region_base + T.cast(ctrl_off, T.int64), dtype="handle"),
+-                              T.address_of(counters[rung_index]), T.address_of(counters[arrival_index]), dtype="handle")
+-                T.sync_threads()
+-                if bx == 0:
++                rang = T.alloc_var(T.uint32)
++                out_word_offset = T.alloc_var(T.int32)
++
++                for s in T.serial(num_stages):
++                    seq = epoch + T.uint32(1) + T.cast(s, T.uint32)
++                    slot = T.cast(seq & T.uint32(slots - 1), T.int32)
++                    send_slot = send_off + slot * slot_bytes
++                    stage_offset = s * stage_packs
++                    cur_packs = T.min(stage_packs, shard_packs - stage_offset)
++                    cur_row_packs = T.if_then_else(row_packs == shard_packs, cur_packs, row_packs)
++                    out_word_offset = T.if_then_else(
++                        row_packs == shard_packs,
++                        stage_offset * pack_words,
++                        stage_offset * world_size * pack_words,
++                    )
++                    count = T.max(0, (cur_packs - index + stride - 1) // stride)
++
++                    # 1. stage the local shard into the pinned send slot and its own column block of the output
++                    for i in T.serial(count):
++                        T.call_extern(
++                            "roce_stage_gather_pack",
++                            T.address_of(inp[stage_offset * pack_words]),
++                            T.call_extern("roce_ptr", region_base + T.cast(send_slot, T.int64), dtype="handle"),
++                            index + i * stride,
++                            cur_row_packs,
++                            T.address_of(out[out_word_offset]),
++                            dst_stride_packs,
++                            dtype="handle",
++                        )
++                    T.sync_threads()
++                    # 2. the last block to finish staging rings the proxy doorbell
+                     if tx == 0:
+-                        T.call_extern("roce_st_release_gpu_u32", T.address_of(counters[arrival_index]), seq, dtype="handle")
+-                # 4. concatenate: shard s occupies column block s of every output row
+-                for i in T.serial(count):
+-                    T.call_extern("roce_gather_pack", T.call_extern("roce_ptr", region_base + T.cast(recv_off, T.int64), dtype="handle"),
+-                                  T.cast(slot_bytes, T.int64), seq, index + i * stride, row_packs,
+-                                  T.address_of(out[0]), dst_stride_packs, dtype="handle")
++                        rang = T.call_extern(
++                            "roce_doorbell",
++                            T.address_of(counters[stage_index]),
++                            T.cast(grid_x, T.uint32),
++                            T.call_extern("roce_ptr", region_base + T.cast(ctrl_off, T.int64), dtype="handle"),
++                            T.cast(cur_packs * PACK_BYTES, T.uint32),
++                            seq,
++                            dtype=T.uint32,
++                        )
++                        if rang != T.uint32(0):
++                            T.call_extern("roce_st_release_gpu_u32", T.address_of(counters[rung_index]), seq, dtype="handle")
++                    # 3. block 0 waits for every peer's payload-stripe flags, the other blocks for block 0
++                    T.call_extern(
++                        "roce_wait_peers",
++                        bx,
++                        tx,
++                        T.call_extern("roce_ptr", region_base + T.cast(flag_off, T.int64), dtype="handle"),
++                        seq,
++                        T.call_extern("roce_ptr", region_base + T.cast(ctrl_off, T.int64), dtype="handle"),
++                        T.address_of(counters[rung_index]),
++                        T.address_of(counters[arrival_index]),
++                        dtype="handle",
++                    )
++                    T.sync_threads()
++                    if bx == 0:
++                        if tx == 0:
++                            T.call_extern(
++                                "roce_st_release_gpu_u32", T.address_of(counters[arrival_index]), seq, dtype="handle"
++                            )
++                    # 4. concatenate: shard p occupies column block p of every output row
++                    for i in T.serial(count):
++                        T.call_extern(
++                            "roce_gather_pack",
++                            T.call_extern("roce_ptr", region_base + T.cast(recv_off, T.int64), dtype="handle"),
++                            T.cast(slot_bytes, T.int64),
++                            seq,
++                            index + i * stride,
++                            cur_row_packs,
++                            T.address_of(out[out_word_offset]),
++                            dst_stride_packs,
++                            dtype="handle",
++                        )
++                    T.sync_threads()
++
+                 # 5. the last block to finish publishes the next epoch
+                 T.call_extern("roce_fence_sc_gpu", dtype="handle")
+                 T.sync_threads()
+                 if tx == 0:
+-                    T.call_extern("roce_tail", T.address_of(counters[tail_index]), T.cast(grid_x, T.uint32),
+-                                  T.address_of(counters[0]), seq, dtype="handle")
++                    T.call_extern(
++                        "roce_tail",
++                        T.address_of(counters[tail_index]),
++                        T.cast(grid_x, T.uint32),
++                        T.address_of(counters[0]),
++                        epoch + T.cast(num_stages, T.uint32),
++                        dtype="handle",
++                    )
+ 
+         return oneshot_allgather
+ 
+@@ -153,17 +211,23 @@ def get_launcher(
+ 
+     def run(launch: Launch) -> None:
+         """Launch the compiled kernel on the current stream (bound through the tensor arguments)."""
+-        dst_stride = int(launch.dst_peer_packs) if launch.dst_peer_packs else int(launch.row_packs)
++        row_packs = int(launch.row_packs) if launch.row_packs > 0 else int(launch.size_packs)
++        dst_stride = int(launch.dst_peer_packs) if launch.dst_peer_packs else row_packs
++        num_stages = int(launch.num_stages) if launch.num_stages > 0 else 1
++        stage_packs = int(launch.stage_packs) if launch.stage_packs > 0 else int(launch.size_packs)
+         kernel(
+             launch.input, launch.output, launch.counters, int(launch.region.data_ptr()),
+-            int(launch.size_packs), int(launch.nbytes), int(launch.row_packs), dst_stride,
++            int(launch.size_packs), int(launch.nbytes), row_packs, dst_stride,
+             int(launch.recv_off), int(launch.flag_off),
+             int(launch.send_off), int(launch.ctrl_off), int(launch.slot_bytes), int(launch.stage_index),
+             int(launch.tail_index), int(launch.rung_index), int(launch.arrival_index), int(launch.grid_x),
++            num_stages, stage_packs,
+         )
+ 
+     _PREPARED_LAUNCHERS.add(process_key)
+     return run
+ 
+ 
++launcher = get_launcher
++
+ __all__ = ["PACK_BYTES", "get_launcher", "is_launcher_prepared"]
+diff --git a/sparknet/oneshot/_exchange_tilelang.py b/sparknet/oneshot/_exchange_tilelang.py
+index cc21259..392943b 100644
+--- a/sparknet/oneshot/_exchange_tilelang.py
++++ b/sparknet/oneshot/_exchange_tilelang.py
+@@ -3,7 +3,8 @@
+ Stages each peer p's chunk (p != rank) into send[slot] + p * chunk_bytes (and
+ optionally copies rank's own chunk into out[rank]), rings the proxy doorbell in
+ exchange mode (ROCE_MODE_EXCHANGE), waits for every peer's stripe flags, and
+-copies each peer's received chunk into out[p].
++copies each peer's received chunk into out[p]. Multi-stage launches execute
++all stages inside a single persistent kernel across the two slots.
+ """
+ 
+ # No postponed annotations: TileLang evaluates the prim_func's annotations
+@@ -46,6 +47,7 @@ def _build(
+         neighbor_lanes=neighbor_lanes,
+     )
+     resident = _resident_blocks(threads)
++    pack_words = PACK_BYTES // 4
+ 
+     @tilelang.jit(pass_configs=_pass_configs())
+     def program():
+@@ -74,6 +76,8 @@ def _build(
+             rung_index: T.int32,
+             arrival_index: T.int32,
+             grid_x: T.int32,
++            num_stages: T.int32,
++            stage_packs: T.int32,
+         ):
+             with T.Kernel(grid_x, threads=threads) as bx:
+                 T.annotate_min_blocks_per_sm(resident)
+@@ -84,107 +88,120 @@ def _build(
+                     "roce_ld_relaxed_gpu_u32", T.address_of(counters[0]), dtype=T.uint32
+                 )
+                 seq = T.alloc_var(T.uint32)
+-                seq = epoch + T.uint32(1)
+                 slot = T.alloc_var(T.int32)
+-                slot = T.cast(seq & T.uint32(1), T.int32)
+                 send_slot = T.alloc_var(T.int32)
+-                send_slot = send_off + slot * slot_bytes
+                 index = T.alloc_var(T.int32)
+                 index = bx * threads + tx
+                 stride = T.alloc_var(T.int32)
+                 stride = grid_x * threads
+-                # 1. stage each peer's chunk into its slice of the pinned send slot
++                stage_offset = T.alloc_var(T.int32)
++                cur_packs = T.alloc_var(T.int32)
++                cur_total_src = T.alloc_var(T.int32)
++                cur_valid_out = T.alloc_var(T.int32)
+                 count = T.alloc_var(T.int32)
+-                count = T.max(0, (chunk_packs - index + stride - 1) // stride)
+-                for i in T.serial(count):
++                rang = T.alloc_var(T.uint32)
++
++                for s in T.serial(num_stages):
++                    seq = epoch + T.uint32(1) + T.cast(s, T.uint32)
++                    slot = T.cast(seq & T.uint32(slots - 1), T.int32)
++                    send_slot = send_off + slot * slot_bytes
++                    stage_offset = s * stage_packs
++                    cur_packs = T.min(stage_packs, chunk_packs - stage_offset)
++                    cur_total_src = T.max(0, total_src_packs - stage_offset)
++                    cur_valid_out = T.min(cur_packs, T.max(0, valid_out_packs - stage_offset))
++                    count = T.max(0, (cur_packs - index + stride - 1) // stride)
++
++                    # 1. stage each peer's chunk into its slice of the pinned send slot
++                    for i in T.serial(count):
++                        T.call_extern(
++                            "roce_stage_exchange_pack",
++                            T.address_of(inp[stage_offset * pack_words]),
++                            T.call_extern(
++                                "roce_ptr",
++                                region_base + T.cast(send_slot, T.int64),
++                                dtype="handle",
++                            ),
++                            index + i * stride,
++                            cur_packs,
++                            src_peer_packs,
++                            dst_peer_packs,
++                            cur_total_src,
++                            cur_valid_out,
++                            copy_self,
++                            T.address_of(out[stage_offset * pack_words]),
++                            dtype="handle",
++                        )
++                    T.sync_threads()
++                    # 2. the last block to finish staging rings the proxy doorbell in exchange mode
++                    if tx == 0:
++                        rang = T.call_extern(
++                            "roce_doorbell_exchange",
++                            T.address_of(counters[stage_index]),
++                            T.cast(grid_x, T.uint32),
++                            T.call_extern(
++                                "roce_ptr",
++                                region_base + T.cast(ctrl_off, T.int64),
++                                dtype="handle",
++                            ),
++                            T.cast(cur_packs * PACK_BYTES, T.uint32),
++                            seq,
++                            dtype=T.uint32,
++                        )
++                        if rang != T.uint32(0):
++                            T.call_extern(
++                                "roce_st_release_gpu_u32",
++                                T.address_of(counters[rung_index]),
++                                seq,
++                                dtype="handle",
++                            )
++                    # 3. block 0 waits for every peer's payload-stripe flags, the other blocks for block 0
+                     T.call_extern(
+-                        "roce_stage_exchange_pack",
+-                        T.address_of(inp[0]),
++                        "roce_wait_peers",
++                        bx,
++                        tx,
+                         T.call_extern(
+                             "roce_ptr",
+-                            region_base + T.cast(send_slot, T.int64),
++                            region_base + T.cast(flag_off, T.int64),
+                             dtype="handle",
+                         ),
+-                        index + i * stride,
+-                        chunk_packs,
+-                        src_peer_packs,
+-                        dst_peer_packs,
+-                        total_src_packs,
+-                        valid_out_packs,
+-                        copy_self,
+-                        T.address_of(out[0]),
+-                        dtype="handle",
+-                    )
+-                T.sync_threads()
+-                # 2. the last block to finish staging rings the proxy doorbell in exchange mode
+-                if tx == 0:
+-                    rang = T.alloc_var(T.uint32)
+-                    rang = T.call_extern(
+-                        "roce_doorbell_exchange",
+-                        T.address_of(counters[stage_index]),
+-                        T.cast(grid_x, T.uint32),
++                        seq,
+                         T.call_extern(
+                             "roce_ptr",
+                             region_base + T.cast(ctrl_off, T.int64),
+                             dtype="handle",
+                         ),
+-                        T.cast(chunk_bytes, T.uint32),
+-                        seq,
+-                        dtype=T.uint32,
+-                    )
+-                    if rang != T.uint32(0):
+-                        T.call_extern(
+-                            "roce_st_release_gpu_u32",
+-                            T.address_of(counters[rung_index]),
+-                            seq,
+-                            dtype="handle",
+-                        )
+-                # 3. block 0 waits for every peer's payload-stripe flags, the other blocks for block 0
+-                T.call_extern(
+-                    "roce_wait_peers",
+-                    bx,
+-                    tx,
+-                    T.call_extern(
+-                        "roce_ptr",
+-                        region_base + T.cast(flag_off, T.int64),
++                        T.address_of(counters[rung_index]),
++                        T.address_of(counters[arrival_index]),
+                         dtype="handle",
+-                    ),
+-                    seq,
+-                    T.call_extern(
+-                        "roce_ptr",
+-                        region_base + T.cast(ctrl_off, T.int64),
+-                        dtype="handle",
+-                    ),
+-                    T.address_of(counters[rung_index]),
+-                    T.address_of(counters[arrival_index]),
+-                    dtype="handle",
+-                )
+-                T.sync_threads()
+-                if bx == 0:
+-                    if tx == 0:
++                    )
++                    T.sync_threads()
++                    if bx == 0:
++                        if tx == 0:
++                            T.call_extern(
++                                "roce_st_release_gpu_u32",
++                                T.address_of(counters[arrival_index]),
++                                seq,
++                                dtype="handle",
++                            )
++                    # 4. copy each peer's received chunk into its slice of out
++                    for i in T.serial(count):
+                         T.call_extern(
+-                            "roce_st_release_gpu_u32",
+-                            T.address_of(counters[arrival_index]),
++                            "roce_exchange_pack",
++                            T.call_extern(
++                                "roce_ptr",
++                                region_base + T.cast(recv_off, T.int64),
++                                dtype="handle",
++                            ),
++                            T.cast(slot_bytes, T.int64),
+                             seq,
++                            index + i * stride,
++                            dst_peer_packs,
++                            cur_valid_out,
++                            T.address_of(out[stage_offset * pack_words]),
+                             dtype="handle",
+                         )
+-                # 4. copy each peer's received chunk into its slice of out
+-                for i in T.serial(count):
+-                    T.call_extern(
+-                        "roce_exchange_pack",
+-                        T.call_extern(
+-                            "roce_ptr",
+-                            region_base + T.cast(recv_off, T.int64),
+-                            dtype="handle",
+-                        ),
+-                        T.cast(slot_bytes, T.int64),
+-                        seq,
+-                        index + i * stride,
+-                        dst_peer_packs,
+-                        valid_out_packs,
+-                        T.address_of(out[0]),
+-                        dtype="handle",
+-                    )
++                    T.sync_threads()
++
+                 # 5. the last block to finish publishes the next epoch
+                 T.call_extern("roce_fence_sc_gpu", dtype="handle")
+                 T.sync_threads()
+@@ -194,7 +211,7 @@ def _build(
+                         T.address_of(counters[tail_index]),
+                         T.cast(grid_x, T.uint32),
+                         T.address_of(counters[0]),
+-                        seq,
++                        epoch + T.cast(num_stages, T.uint32),
+                         dtype="handle",
+                     )
+ 
+@@ -275,6 +292,8 @@ def get_launcher(
+             if launch.valid_out_packs >= 0
+             else chunk_packs
+         )
++        num_stages = int(launch.num_stages) if launch.num_stages > 0 else 1
++        stage_packs = int(launch.stage_packs) if launch.stage_packs > 0 else chunk_packs
+         kernel(
+             launch.input,
+             launch.output,
+@@ -297,10 +316,14 @@ def get_launcher(
+             int(launch.rung_index),
+             int(launch.arrival_index),
+             int(launch.grid_x),
++            num_stages,
++            stage_packs,
+         )
+ 
+     _PREPARED_LAUNCHERS.add(process_key)
+     return run
+ 
+ 
++launcher = get_launcher
++
+ __all__ = ["PACK_BYTES", "get_launcher", "is_launcher_prepared"]
+diff --git a/sparknet/oneshot/_kernels.py b/sparknet/oneshot/_kernels.py
+index ad8e04e..448883f 100644
+--- a/sparknet/oneshot/_kernels.py
++++ b/sparknet/oneshot/_kernels.py
+@@ -51,6 +51,8 @@ class Launch:
+     total_src_packs: int = 0  # exchange / all-to-all: valid pack count in input
+     valid_out_packs: int = -1  # exchange / all-to-all: valid pack count per peer in output (-1 = size_packs)
+     copy_self: int = 0  # exchange / all-to-all: copy this rank's own block into output
++    num_stages: int = 1  # number of pipeline stages in one kernel launch
++    stage_packs: int = 0  # max 16-byte packs per stage (0 = size_packs)
+ 
+ 
+ def kernel_setting_problems(environ: Mapping[str, str]) -> list[str]:
+diff --git a/sparknet/oneshot/_reducescatter_tilelang.py b/sparknet/oneshot/_reducescatter_tilelang.py
+index 78d6ca8..15d0698 100644
+--- a/sparknet/oneshot/_reducescatter_tilelang.py
++++ b/sparknet/oneshot/_reducescatter_tilelang.py
+@@ -3,7 +3,8 @@
+ Stages each peer p's chunk (p != rank) into send[slot] + p * chunk_bytes, rings
+ the proxy doorbell in exchange mode (ROCE_MODE_EXCHANGE), waits for every peer's
+ stripe flags, and reduces the local chunk and every peer's received chunk in
+-fixed rank order with float32 accumulation into out.
++fixed rank order with float32 accumulation into out. Multi-stage launches
++execute all stages inside a single persistent kernel across the two slots.
+ """
+ 
+ # No postponed annotations: TileLang evaluates the prim_func's annotations
+@@ -79,6 +80,8 @@ def _build(
+             rung_index: T.int32,
+             arrival_index: T.int32,
+             grid_x: T.int32,
++            num_stages: T.int32,
++            stage_packs: T.int32,
+         ):
+             with T.Kernel(grid_x, threads=threads) as bx:
+                 T.annotate_min_blocks_per_sm(resident)
+@@ -89,103 +92,112 @@ def _build(
+                     "roce_ld_relaxed_gpu_u32", T.address_of(counters[0]), dtype=T.uint32
+                 )
+                 seq = T.alloc_var(T.uint32)
+-                seq = epoch + T.uint32(1)
+                 slot = T.alloc_var(T.int32)
+-                slot = T.cast(seq & T.uint32(1), T.int32)
+                 send_slot = T.alloc_var(T.int32)
+-                send_slot = send_off + slot * slot_bytes
+                 index = T.alloc_var(T.int32)
+                 index = bx * threads + tx
+                 stride = T.alloc_var(T.int32)
+                 stride = grid_x * threads
+-                # 1. stage each peer's chunk into its slice of the pinned send slot
++                stage_offset = T.alloc_var(T.int32)
++                cur_packs = T.alloc_var(T.int32)
+                 count = T.alloc_var(T.int32)
+-                count = T.max(0, (chunk_packs - index + stride - 1) // stride)
+-                for i in T.serial(count):
++                rang = T.alloc_var(T.uint32)
++                pack = T.alloc_var(T.int32)
++
++                for s in T.serial(num_stages):
++                    seq = epoch + T.uint32(1) + T.cast(s, T.uint32)
++                    slot = T.cast(seq & T.uint32(slots - 1), T.int32)
++                    send_slot = send_off + slot * slot_bytes
++                    stage_offset = s * stage_packs
++                    cur_packs = T.min(stage_packs, chunk_packs - stage_offset)
++                    count = T.max(0, (cur_packs - index + stride - 1) // stride)
++
++                    for i in T.serial(count):
++                        T.call_extern(
++                            "roce_stage_scatter_pack",
++                            T.address_of(inp[stage_offset * pack_words]),
++                            T.call_extern(
++                                "roce_ptr",
++                                region_base + T.cast(send_slot, T.int64),
++                                dtype="handle",
++                            ),
++                            index + i * stride,
++                            cur_packs,
++                            src_peer_packs,
++                            dtype="handle",
++                        )
++                    T.sync_threads()
++                    if tx == 0:
++                        rang = T.call_extern(
++                            "roce_doorbell_exchange",
++                            T.address_of(counters[stage_index]),
++                            T.cast(grid_x, T.uint32),
++                            T.call_extern(
++                                "roce_ptr",
++                                region_base + T.cast(ctrl_off, T.int64),
++                                dtype="handle",
++                            ),
++                            T.cast(cur_packs * PACK_BYTES, T.uint32),
++                            seq,
++                            dtype=T.uint32,
++                        )
++                        if rang != T.uint32(0):
++                            T.call_extern(
++                                "roce_st_release_gpu_u32",
++                                T.address_of(counters[rung_index]),
++                                seq,
++                                dtype="handle",
++                            )
++
+                     T.call_extern(
+-                        "roce_stage_scatter_pack",
+-                        T.address_of(inp[0]),
++                        "roce_wait_peers",
++                        bx,
++                        tx,
+                         T.call_extern(
+                             "roce_ptr",
+-                            region_base + T.cast(send_slot, T.int64),
++                            region_base + T.cast(flag_off, T.int64),
+                             dtype="handle",
+                         ),
+-                        index + i * stride,
+-                        chunk_packs,
+-                        src_peer_packs,
+-                        dtype="handle",
+-                    )
+-                T.sync_threads()
+-                # 2. the last block to finish staging rings the proxy doorbell in exchange mode
+-                if tx == 0:
+-                    rang = T.alloc_var(T.uint32)
+-                    rang = T.call_extern(
+-                        "roce_doorbell_exchange",
+-                        T.address_of(counters[stage_index]),
+-                        T.cast(grid_x, T.uint32),
++                        seq,
+                         T.call_extern(
+                             "roce_ptr",
+                             region_base + T.cast(ctrl_off, T.int64),
+                             dtype="handle",
+                         ),
+-                        T.cast(chunk_bytes, T.uint32),
+-                        seq,
+-                        dtype=T.uint32,
+-                    )
+-                    if rang != T.uint32(0):
+-                        T.call_extern(
+-                            "roce_st_release_gpu_u32",
+-                            T.address_of(counters[rung_index]),
+-                            seq,
+-                            dtype="handle",
+-                        )
+-                # 3. block 0 waits for every peer's payload-stripe flags, the other blocks for block 0
+-                T.call_extern(
+-                    "roce_wait_peers",
+-                    bx,
+-                    tx,
+-                    T.call_extern(
+-                        "roce_ptr",
+-                        region_base + T.cast(flag_off, T.int64),
++                        T.address_of(counters[rung_index]),
++                        T.address_of(counters[arrival_index]),
+                         dtype="handle",
+-                    ),
+-                    seq,
+-                    T.call_extern(
+-                        "roce_ptr",
+-                        region_base + T.cast(ctrl_off, T.int64),
+-                        dtype="handle",
+-                    ),
+-                    T.address_of(counters[rung_index]),
+-                    T.address_of(counters[arrival_index]),
+-                    dtype="handle",
+-                )
+-                T.sync_threads()
+-                if bx == 0:
+-                    if tx == 0:
++                    )
++                    T.sync_threads()
++                    if bx == 0:
++                        if tx == 0:
++                            T.call_extern(
++                                "roce_st_release_gpu_u32",
++                                T.address_of(counters[arrival_index]),
++                                seq,
++                                dtype="handle",
++                            )
++
++                    for i in T.serial(count):
++                        pack = index + i * stride
+                         T.call_extern(
+-                            "roce_st_release_gpu_u32",
+-                            T.address_of(counters[arrival_index]),
++                            reduce_pack,
++                            T.address_of(
++                                inp[(rank * src_peer_packs + stage_offset) * pack_words]
++                            ),
++                            T.call_extern(
++                                "roce_ptr",
++                                region_base + T.cast(recv_off, T.int64),
++                                dtype="handle",
++                            ),
++                            T.cast(slot_bytes, T.int64),
+                             seq,
++                            T.address_of(out[stage_offset * pack_words]),
++                            T.cast(pack, T.int64) * PACK_BYTES,
+                             dtype="handle",
+                         )
+-                # 4. reduce this rank's chunk (from inp) and the peers' chunks in fixed rank order
+-                for i in T.serial(count):
+-                    pack = index + i * stride
+-                    T.call_extern(
+-                        reduce_pack,
+-                        T.address_of(inp[rank * src_peer_packs * pack_words]),
+-                        T.call_extern(
+-                            "roce_ptr",
+-                            region_base + T.cast(recv_off, T.int64),
+-                            dtype="handle",
+-                        ),
+-                        T.cast(slot_bytes, T.int64),
+-                        seq,
+-                        T.address_of(out[0]),
+-                        T.cast(pack, T.int64) * PACK_BYTES,
+-                        dtype="handle",
+-                    )
+-                # 5. the last block to finish reduction publishes the next epoch
++                    T.sync_threads()
++
+                 T.call_extern("roce_fence_sc_gpu", dtype="handle")
+                 T.sync_threads()
+                 if tx == 0:
+@@ -194,7 +206,7 @@ def _build(
+                         T.address_of(counters[tail_index]),
+                         T.cast(grid_x, T.uint32),
+                         T.address_of(counters[0]),
+-                        seq,
++                        epoch + T.cast(num_stages, T.uint32),
+                         dtype="handle",
+                     )
+ 
+@@ -264,7 +276,7 @@ def get_launcher(
+         device_index,
+         ring4,
+     )
+-    cache_key = process_key[:7] + process_key[8:]
++    cache_key = process_key[:-2] + (bool(ring4),)
+     raise_if_kernel_resolution_frozen(
+         "tilelang.jit", target="oneshot_reducescatter", cache_key=cache_key
+     )
+@@ -280,17 +292,18 @@ def get_launcher(
+ 
+     def run(launch: Launch) -> None:
+         """Launch the compiled kernel on the current stream (bound through the tensor arguments)."""
++        chunk_packs = int(launch.size_packs)
+         src_stride = (
+-            int(launch.src_peer_packs)
+-            if launch.src_peer_packs
+-            else int(launch.size_packs)
++            int(launch.src_peer_packs) if launch.src_peer_packs else chunk_packs
+         )
++        num_stages = int(launch.num_stages) if launch.num_stages > 0 else 1
++        stage_packs = int(launch.stage_packs) if launch.stage_packs > 0 else chunk_packs
+         kernel(
+             launch.input,
+             launch.output,
+             launch.counters,
+             int(launch.region.data_ptr()),
+-            int(launch.size_packs),
++            chunk_packs,
+             int(launch.nbytes),
+             src_stride,
+             int(launch.recv_off),
+@@ -303,10 +316,14 @@ def get_launcher(
+             int(launch.rung_index),
+             int(launch.arrival_index),
+             int(launch.grid_x),
++            num_stages,
++            stage_packs,
+         )
+ 
+     _PREPARED_LAUNCHERS.add(process_key)
+     return run
+ 
+ 
++launcher = get_launcher
++
+ __all__ = ["PACK_BYTES", "get_launcher", "is_launcher_prepared"]
+diff --git a/sparknet/oneshot/runtime.py b/sparknet/oneshot/runtime.py
+index 1f13d4e..716e330 100644
+--- a/sparknet/oneshot/runtime.py
++++ b/sparknet/oneshot/runtime.py
+@@ -874,6 +874,33 @@ class RoceOneshotAllReduce:
+         span_elems = (self.world_size - 1) * int(peer_stride_elems) + int(chunk_elems)
+         return torch.as_strided(tensor, (span_elems,), (1,)).view(torch.int32)
+ 
++    def _collective_stage_rows(
++        self,
++        local_rows: int,
++        collective_row_bytes: int,
++        slot_row_bytes: int | None = None,
++    ) -> tuple[int, int]:
++        """Return (stage_rows, num_stages) for a collective of local_rows rows."""
++        slot_unit = slot_row_bytes if slot_row_bytes is not None else collective_row_bytes
++        slot_max_rows = max(1, self._slot_bytes // slot_unit)
++        env_stage = int(os.environ.get("SPARKNET_ROCE_STAGE_BYTES", "4194304"))
++        if env_stage <= 0:
++            stage_rows = min(local_rows, slot_max_rows)
++        else:
++            stage_rows = max(
++                1,
++                min(local_rows, slot_max_rows, env_stage // collective_row_bytes),
++            )
++        num_stages = (local_rows + stage_rows - 1) // stage_rows
++        return stage_rows, num_stages
++
++    def _collective_max_blocks(self, num_stages: int, total_bytes: int) -> int:
++        """Return the CTA cap for SP prefill collectives to preserve SM occupancy."""
++        env_blocks = int(os.environ.get("SPARKNET_ROCE_COLLECTIVE_BLOCKS", "8"))
++        if env_blocks > 0:
++            return min(self._blocks, env_blocks)
++        return self._blocks
++
+     def _launch(
+         self,
+         src: torch.Tensor,
+@@ -887,14 +914,20 @@ class RoceOneshotAllReduce:
+         valid_out_packs: int = -1,
+         copy_self: int = 0,
+         raw_words: bool = False,
++        num_stages: int = 1,
++        stage_packs: int = 0,
++        max_blocks: int = 0,
+     ) -> Launch:
+         """The family-neutral description of one collective launch."""
+-        grid_blocks = _grid_blocks(nbytes // PACK_BYTES, self._threads, self._blocks)
++        size_packs = nbytes // PACK_BYTES
++        eff_packs = stage_packs if stage_packs > 0 else size_packs
++        block_cap = min(self._blocks, max_blocks) if max_blocks > 0 else self._blocks
++        grid_blocks = _grid_blocks(eff_packs, self._threads, block_cap)
+         stage_index, tail_index = self._counter_indices(grid_blocks)
+         inp_words = src if raw_words else self._words(src)
+         out_words = dst if raw_words else self._words(dst)
+         return Launch(
+-            input=inp_words, output=out_words, size_packs=nbytes // PACK_BYTES, nbytes=nbytes,
++            input=inp_words, output=out_words, size_packs=size_packs, nbytes=nbytes,
+             region=self._region, recv_off=self._layout.recv_off, flag_off=self._layout.flag_off,
+             send_off=self._layout.send_off, ctrl_off=self._layout.ctrl_off, slot_bytes=self._slot_bytes,
+             counters=self._counters, stage_index=stage_index, tail_index=tail_index,
+@@ -902,6 +935,7 @@ class RoceOneshotAllReduce:
+             grid_x=grid_blocks, row_packs=row_packs, trace_base=self._trace_base,
+             src_peer_packs=src_peer_packs, dst_peer_packs=dst_peer_packs,
+             total_src_packs=total_src_packs, valid_out_packs=valid_out_packs, copy_self=copy_self,
++            num_stages=num_stages, stage_packs=stage_packs,
+         )
+ 
+     def prepare(
+@@ -1249,7 +1283,10 @@ class RoceOneshotAllReduce:
+             with torch.cuda.device(self.device), context:
+                 capturing = torch.cuda.is_current_stream_capturing()
+                 nbytes = inp.numel() * inp.element_size()
+-                if nbytes > self.max_gather_bytes:
++                direct = self._direct_gather_layout(inp, dim) and (
++                    out is None or out.data_ptr() % PACK_BYTES == 0
++                )
++                if direct or nbytes > self.max_gather_bytes:
+                     if out is None:
+                         out = torch.empty(shape, dtype=inp.dtype, device=inp.device)
+                     launcher = self._resolve_gather_launcher(capturing)
+@@ -1257,60 +1294,50 @@ class RoceOneshotAllReduce:
+                     if dim == 0:
+                         local_rows = inp.shape[0]
+                         row_bytes = nbytes // local_rows
+-                        max_rows = self._slot_bytes // row_bytes
+                         full_shard_packs = nbytes // PACK_BYTES
+-                        for lo in range(0, local_rows, max_rows):
+-                            hi = min(local_rows, lo + max_rows)
+-                            slice_bytes = (hi - lo) * row_bytes
+-                            slice_packs = slice_bytes // PACK_BYTES
+-                            out_slice = out[
+-                                lo : (self.world_size - 1) * local_rows + hi
+-                            ]
+-                            self._launch_gather(
+-                                launcher,
+-                                inp[lo:hi],
+-                                out_slice,
+-                                slice_bytes,
+-                                slice_packs,
+-                                dst_peer_packs=full_shard_packs,
+-                            )
++                        if not capturing and row_bytes % PACK_BYTES == 0 and 0 < row_bytes <= self._slot_bytes:
++                            stage_rows, num_stages = self._collective_stage_rows(local_rows, self.world_size * row_bytes, slot_row_bytes=row_bytes)
++                            stage_packs = (stage_rows * row_bytes) // PACK_BYTES
++                            max_blocks = self._collective_max_blocks(num_stages, self.world_size * nbytes)
++                        else:
++                            num_stages = 1
++                            stage_packs = full_shard_packs
++                            max_blocks = 0
++                        self._launch_gather(
++                            launcher,
++                            inp,
++                            out,
++                            nbytes,
++                            full_shard_packs,
++                            dst_peer_packs=full_shard_packs,
++                            num_stages=num_stages,
++                            stage_packs=stage_packs,
++                            max_blocks=max_blocks,
++                        )
+                     else:
+                         width = inp.shape[-1]
+                         rows = inp.numel() // width
+                         row_bytes = width * inp.element_size()
+                         row_packs = row_bytes // PACK_BYTES
+-                        max_rows = self._slot_bytes // row_bytes
+-                        inp_2d = inp.view(rows, width)
+-                        out_2d = out.view(rows, self.world_size * width)
+-                        for lo in range(0, rows, max_rows):
+-                            hi = min(rows, lo + max_rows)
+-                            slice_bytes = (hi - lo) * row_bytes
+-                            self._launch_gather(
+-                                launcher,
+-                                inp_2d[lo:hi],
+-                                out_2d[lo:hi],
+-                                slice_bytes,
+-                                row_packs,
+-                            )
+-                    self._mark_stream(capturing)
+-                    return out
+-                # Both paths stage the shard contiguously and only the reader is
+-                # strided, so ranks may take different paths for one collective.
+-                direct = self._direct_gather_layout(inp, dim) and (
+-                    out is None or out.data_ptr() % PACK_BYTES == 0
+-                )
+-                if direct:
+-                    if out is None:
+-                        out = torch.empty(shape, dtype=inp.dtype, device=inp.device)
+-                    row_packs = (
+-                        nbytes // PACK_BYTES
+-                        if dim == 0
+-                        else (inp.shape[-1] * inp.element_size()) // PACK_BYTES
+-                    )
+-                    self._order_stream(capturing)
+-                    self._launch_gather(
+-                        self._resolve_gather_launcher(capturing), inp, out, nbytes, row_packs,
+-                    )
++                        if not capturing and 0 < row_bytes <= self._slot_bytes:
++                            stage_rows, num_stages = self._collective_stage_rows(rows, self.world_size * row_bytes, slot_row_bytes=row_bytes)
++                            stage_packs = stage_rows * row_packs
++                            max_blocks = self._collective_max_blocks(num_stages, self.world_size * nbytes)
++                        else:
++                            num_stages = 1
++                            stage_packs = nbytes // PACK_BYTES
++                            max_blocks = 0
++                        self._launch_gather(
++                            launcher,
++                            inp,
++                            out,
++                            nbytes,
++                            row_packs,
++                            dst_peer_packs=row_packs,
++                            num_stages=num_stages,
++                            stage_packs=stage_packs,
++                            max_blocks=max_blocks,
++                        )
+                     self._mark_stream(capturing)
+                     return out
+                 # Padded path: pad each shard to a whole number of packs, gather
+@@ -1369,12 +1396,11 @@ class RoceOneshotAllReduce:
+         row_packs: int,
+         *,
+         dst_peer_packs: int = 0,
++        num_stages: int = 1,
++        stage_packs: int = 0,
++        max_blocks: int = 0,
+     ) -> None:
+         """Launch an already prepared all-gather kernel."""
+-        # Same size-aware geometry as the all-reduce: a small shard (top-k
+-        # values and ids, MTP logits) launches a few blocks instead of the
+-        # full grid, and each power-of-two grid has its own arrival counters
+-        # so gathers and reductions of any size may interleave in one graph.
+         launcher(
+             self._launch(
+                 source,
+@@ -1382,6 +1408,9 @@ class RoceOneshotAllReduce:
+                 nbytes,
+                 row_packs=row_packs,
+                 dst_peer_packs=dst_peer_packs,
++                num_stages=num_stages,
++                stage_packs=stage_packs,
++                max_blocks=max_blocks,
+             )
+         )
+         if not torch.cuda.is_current_stream_capturing():
+@@ -1390,7 +1419,7 @@ class RoceOneshotAllReduce:
+     # -- reduce-scatter & exchange ------------------------------------------------
+ 
+     def should_reduce_scatter(self, inp: torch.Tensor, dim: int = 0) -> bool:
+-        """Eligible: contiguous CUDA tensor of a supported dtype divisible along ``dim`` by ``world_size``."""
++        """Eligible: contiguous CUDA tensor of a supported dtype divisible along dim by world_size."""
+         if self._closed or self._proxy is None:
+             raise RuntimeError("RoCE runtime is closed")
+         if inp.dtype not in SUPPORTED_DTYPES or not inp.is_cuda or inp.dim() == 0:
+@@ -1423,7 +1452,7 @@ class RoceOneshotAllReduce:
+         out: Optional[torch.Tensor] = None,
+         stream: object = None,
+     ) -> torch.Tensor:
+-        """Reduce-scatter ``inp`` along ``dim`` (0) in fixed rank order with float32 accumulation."""
++        """Reduce-scatter inp along dim (0) in fixed rank order with float32 accumulation."""
+         with self._lock:
+             self.check_health()
+             if not self.should_reduce_scatter(inp, dim):
+@@ -1442,6 +1471,7 @@ class RoceOneshotAllReduce:
+                 )
+             nbytes = inp.numel() * inp.element_size()
+             chunk_bytes = nbytes // self.world_size
++            row_bytes = chunk_bytes // local_rows
+             context = (
+                 torch.cuda.stream(stream) if stream is not None else _nullcontext()
+             )
+@@ -1450,7 +1480,14 @@ class RoceOneshotAllReduce:
+                 launcher = self._reducescatter_launcher(inp.dtype, capturing)
+                 if out is None:
+                     out = torch.empty(out_shape, dtype=inp.dtype, device=inp.device)
+-                if nbytes <= self._slot_bytes:
++                can_pipeline = (
++                    not capturing
++                    and row_bytes % PACK_BYTES == 0
++                    and 0 < self.world_size * row_bytes <= self._slot_bytes
++                    and inp.data_ptr() % PACK_BYTES == 0
++                    and out.data_ptr() % PACK_BYTES == 0
++                )
++                if not can_pipeline and nbytes <= self._slot_bytes:
+                     src = inp
+                     if inp.data_ptr() % PACK_BYTES != 0:
+                         src = self._aligned_scratch(0, inp)
+@@ -1466,26 +1503,25 @@ class RoceOneshotAllReduce:
+                         out.copy_(dst)
+                     self._mark_stream(capturing)
+                 else:
+-                    row_bytes = chunk_bytes // local_rows
+-                    max_rows = self._slot_bytes // (self.world_size * row_bytes)
++                    row_packs = row_bytes // PACK_BYTES
+                     full_chunk_packs = chunk_bytes // PACK_BYTES
++                    stage_rows, num_stages = self._collective_stage_rows(
++                        local_rows, self.world_size * row_bytes
++                    )
++                    stage_packs = stage_rows * row_packs
++                    max_blocks = self._collective_max_blocks(num_stages, nbytes)
+                     self._order_stream(capturing)
+-                    for lo in range(0, local_rows, max_rows):
+-                        hi = min(local_rows, lo + max_rows)
+-                        slice_chunk_bytes = (hi - lo) * row_bytes
+-                        inp_slice = inp[
+-                            lo : (self.world_size - 1) * local_rows + hi
+-                        ]
+-                        launcher(
+-                            self._launch(
+-                                inp_slice,
+-                                out[lo:hi],
+-                                slice_chunk_bytes,
+-                                src_peer_packs=full_chunk_packs,
+-                            )
++                    launcher(
++                        self._launch(
++                            inp,
++                            out,
++                            chunk_bytes,
++                            src_peer_packs=full_chunk_packs,
++                            num_stages=num_stages,
++                            stage_packs=stage_packs,
++                            max_blocks=max_blocks,
+                         )
+-                        if not capturing:
+-                            self.check_health()
++                    )
+                     self._mark_stream(capturing)
+         if not capturing:
+             self.check_health()
+@@ -1494,7 +1530,7 @@ class RoceOneshotAllReduce:
+     def should_exchange(
+         self, chunks: torch.Tensor, parts: Optional[torch.Tensor] = None
+     ) -> bool:
+-        """Eligible: ``(world_size, local_rows, ...)`` CUDA tensors with 16-byte-aligned peer slices."""
++        """Eligible: (world_size, local_rows, ...) CUDA tensors with 16-byte-aligned peer slices."""
+         if self._closed or self._proxy is None:
+             raise RuntimeError("RoCE runtime is closed")
+         if not chunks.is_cuda or chunks.device != self.device or chunks.dim() < 2:
+@@ -1546,7 +1582,7 @@ class RoceOneshotAllReduce:
+         copy_self: bool = False,
+         stream: object = None,
+     ) -> torch.Tensor:
+-        """Send ``chunks[p]`` to peer ``p`` and receive peer ``p``'s chunk into ``parts[p]``."""
++        """Send chunks[p] to peer p and receive peer p's chunk into parts[p]."""
+         if parts is None and out is not None:
+             parts = out
+         with self._lock:
+@@ -1563,6 +1599,8 @@ class RoceOneshotAllReduce:
+                 return parts
+             src_peer_packs = (int(chunks.stride(0)) * elem_size) // PACK_BYTES
+             dst_peer_packs = (int(parts.stride(0)) * elem_size) // PACK_BYTES
++            local_rows = chunks.shape[1]
++            row_bytes = chunk_bytes // local_rows
+             context = (
+                 torch.cuda.stream(stream) if stream is not None else _nullcontext()
+             )
+@@ -1570,12 +1608,20 @@ class RoceOneshotAllReduce:
+                 capturing = torch.cuda.is_current_stream_capturing()
+                 launcher = self._resolve_exchange_launcher(capturing)
+                 self._order_stream(capturing)
+-                if self.world_size * chunk_bytes <= self._slot_bytes:
+-                    src_words = self._span_words(
+-                        chunks, int(chunks.stride(0)), chunks[0].numel()
++                src_words = self._span_words(
++                    chunks, int(chunks.stride(0)), chunks[0].numel()
++                )
++                dst_words = self._span_words(
++                    parts, int(parts.stride(0)), parts[0].numel()
++                )
++                if not capturing and row_bytes % PACK_BYTES == 0 and 0 < self.world_size * row_bytes <= self._slot_bytes:
++                    row_packs = row_bytes // PACK_BYTES
++                    stage_rows, num_stages = self._collective_stage_rows(
++                        local_rows, self.world_size * row_bytes
+                     )
+-                    dst_words = self._span_words(
+-                        parts, int(parts.stride(0)), parts[0].numel()
++                    stage_packs = stage_rows * row_packs
++                    max_blocks = self._collective_max_blocks(
++                        num_stages, self.world_size * chunk_bytes
+                     )
+                     launcher(
+                         self._launch(
+@@ -1586,43 +1632,30 @@ class RoceOneshotAllReduce:
+                             dst_peer_packs=dst_peer_packs,
+                             copy_self=int(copy_self),
+                             raw_words=True,
++                            num_stages=num_stages,
++                            stage_packs=stage_packs,
++                            max_blocks=max_blocks,
+                         )
+                     )
+                 else:
+-                    local_rows = chunks.shape[1]
+-                    row_bytes = chunk_bytes // local_rows
+-                    max_rows = self._slot_bytes // (self.world_size * row_bytes)
+-                    for lo in range(0, local_rows, max_rows):
+-                        hi = min(local_rows, lo + max_rows)
+-                        c_slice = chunks[:, lo:hi]
+-                        p_slice = parts[:, lo:hi]
+-                        slice_chunk_bytes = (hi - lo) * row_bytes
+-                        src_words = self._span_words(
+-                            c_slice, int(c_slice.stride(0)), c_slice[0].numel()
+-                        )
+-                        dst_words = self._span_words(
+-                            p_slice, int(p_slice.stride(0)), p_slice[0].numel()
+-                        )
+-                        launcher(
+-                            self._launch(
+-                                src_words,
+-                                dst_words,
+-                                slice_chunk_bytes,
+-                                src_peer_packs=src_peer_packs,
+-                                dst_peer_packs=dst_peer_packs,
+-                                copy_self=int(copy_self),
+-                                raw_words=True,
+-                            )
++                    launcher(
++                        self._launch(
++                            src_words,
++                            dst_words,
++                            chunk_bytes,
++                            src_peer_packs=src_peer_packs,
++                            dst_peer_packs=dst_peer_packs,
++                            copy_self=int(copy_self),
++                            raw_words=True,
+                         )
+-                        if not capturing:
+-                            self.check_health()
++                    )
+                 self._mark_stream(capturing)
+         if not capturing:
+             self.check_health()
+         return parts
+ 
+     def should_all_to_all_rows(self, inp: torch.Tensor, rows: int) -> bool:
+-        """Eligible: contiguous CUDA tensor with 16-byte rows and ``0 < inp.shape[0] <= world_size * rows``."""
++        """Eligible: contiguous CUDA tensor with 16-byte rows and 0 < inp.shape[0] <= world_size * rows."""
+         if self._closed or self._proxy is None:
+             raise RuntimeError("RoCE runtime is closed")
+         if not inp.is_cuda or inp.device != self.device or inp.dim() < 1 or not inp.is_contiguous():
+@@ -1652,7 +1685,7 @@ class RoceOneshotAllReduce:
+         out: Optional[torch.Tensor] = None,
+         stream: object = None,
+     ) -> torch.Tensor:
+-        """Exchange ``rows``-row blocks of ``inp`` into ``(world_size, rows, *inp.shape[1:])``."""
++        """Exchange rows-row blocks of inp into (world_size, rows, *inp.shape[1:])."""
+         with self._lock:
+             self.check_health()
+             if not self.should_all_to_all_rows(inp, rows):
+@@ -1674,6 +1707,7 @@ class RoceOneshotAllReduce:
+             row_packs = row_bytes // PACK_BYTES
+             full_chunk_packs = rows * row_packs
+             chunk_bytes = rows * row_bytes
++            own_rows = max(0, min(rows, total - self.rank * rows))
+             context = (
+                 torch.cuda.stream(stream) if stream is not None else _nullcontext()
+             )
+@@ -1683,8 +1717,14 @@ class RoceOneshotAllReduce:
+                 if out is None:
+                     out = inp.new_empty(out_shape)
+                 self._order_stream(capturing)
+-                if self.world_size * chunk_bytes <= self._slot_bytes:
+-                    own_rows = max(0, min(rows, total - self.rank * rows))
++                if not capturing and 0 < self.world_size * row_bytes <= self._slot_bytes:
++                    stage_rows, num_stages = self._collective_stage_rows(
++                        rows, self.world_size * row_bytes
++                    )
++                    stage_packs = stage_rows * row_packs
++                    max_blocks = self._collective_max_blocks(
++                        num_stages, self.world_size * chunk_bytes
++                    )
+                     launcher(
+                         self._launch(
+                             inp,
+@@ -1695,38 +1735,24 @@ class RoceOneshotAllReduce:
+                             total_src_packs=total * row_packs,
+                             valid_out_packs=own_rows * row_packs,
+                             copy_self=1,
++                            num_stages=num_stages,
++                            stage_packs=stage_packs,
++                            max_blocks=max_blocks,
+                         )
+                     )
+                 else:
+-                    max_rows = self._slot_bytes // (self.world_size * row_bytes)
+-                    for lo in range(0, rows, max_rows):
+-                        hi = min(rows, lo + max_rows)
+-                        slice_rows = hi - lo
+-                        slice_chunk_bytes = slice_rows * row_bytes
+-                        inp_slice = inp[lo:] if lo < total else inp[:1]
+-                        total_src_packs = max(0, total - lo) * row_packs
+-                        own_slice_rows = max(
+-                            0, min(slice_rows, total - (self.rank * rows + lo))
+-                        )
+-                        out_slice = out[:, lo:hi]
+-                        dst_words = self._span_words(
+-                            out_slice, int(out_slice.stride(0)), out_slice[0].numel()
+-                        )
+-                        launcher(
+-                            self._launch(
+-                                self._words(inp_slice),
+-                                dst_words,
+-                                slice_chunk_bytes,
+-                                src_peer_packs=full_chunk_packs,
+-                                dst_peer_packs=full_chunk_packs,
+-                                total_src_packs=total_src_packs,
+-                                valid_out_packs=own_slice_rows * row_packs,
+-                                copy_self=1,
+-                                raw_words=True,
+-                            )
++                    launcher(
++                        self._launch(
++                            inp,
++                            out,
++                            chunk_bytes,
++                            src_peer_packs=full_chunk_packs,
++                            dst_peer_packs=full_chunk_packs,
++                            total_src_packs=total * row_packs,
++                            valid_out_packs=own_rows * row_packs,
++                            copy_self=1,
+                         )
+-                        if not capturing:
+-                            self.check_health()
++                    )
+                 self._mark_stream(capturing)
+         if not capturing:
+             self.check_health()
+diff --git a/tests/test_oneshot_cpu.py b/tests/test_oneshot_cpu.py
+index cdc85a9..534fad1 100644
+--- a/tests/test_oneshot_cpu.py
++++ b/tests/test_oneshot_cpu.py
+@@ -433,5 +433,34 @@ class FailStopTest(unittest.TestCase):
+             self.assertNotIn("spin_limit", source, module)
+ 
+ 
++
++    def _stage_methods(self):
++        tree = ast.parse((ROCE / "runtime.py").read_text())
++        cls = next(n for n in tree.body if isinstance(n, ast.ClassDef) and n.name == "RoceOneshotAllReduce")
++        methods = [
++            n for n in cls.body
++            if isinstance(n, ast.FunctionDef)
++            and n.name in {"_collective_stage_rows", "_collective_max_blocks"}
++        ]
++        namespace = dict(os=os, Optional=typing.Optional)
++        exec(compile(ast.Module(body=methods, type_ignores=[]), "runtime.py", "exec"), namespace)
++        return namespace["_collective_stage_rows"], namespace["_collective_max_blocks"]
++
++    def test_collective_stage_rows_and_block_cap(self):
++        stage_rows_fn, max_blocks_fn = self._stage_methods()
++        rt = types.SimpleNamespace(_slot_bytes=4 * 1024 * 1024, _blocks=64)
++        # 16 MiB total collective (512 local rows, 8192 B/row, world_size=4 -> 32768 B collective/row)
++        rows, stages = stage_rows_fn(rt, 512, 4 * 8192, slot_row_bytes=8192)
++        self.assertEqual((rows, stages), (128, 4))
++        # Reduce-scatter / exchange: slot_row_bytes defaults to collective_row_bytes
++        rows_rs, stages_rs = stage_rows_fn(rt, 512, 4 * 8192)
++        self.assertEqual((rows_rs, stages_rs), (128, 4))
++        # Single-stage <= 4 MiB total collective
++        rows_small, stages_small = stage_rows_fn(rt, 64, 4 * 8192)
++        self.assertEqual((rows_small, stages_small), (64, 1))
++        # Default collective CTA cap is 8 blocks (2 SMs on GB10)
++        self.assertEqual(max_blocks_fn(rt, 4, 16 * 1024 * 1024), 8)
++
++
+ if __name__ == "__main__":
+     unittest.main()
+-- 
+2.43.0
+
