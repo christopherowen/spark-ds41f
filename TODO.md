@@ -210,6 +210,13 @@ collectives, and DSpark drafting.
 6. **All-reduce arrival skew and RoCE proxy core affinity.** Rank 0 also runs
    the API server, and `sparknet` proxy threads run without explicit CPU core
    affinity on GB10's mixed core types; test pinning them to fast cores.
+   Measured in `experiments/2026-11-08-roce-proxy-fast-core-affinity/` (`sparknet`
+   `0001` + `vllm` `0762`): partitioning GB10's 10 `Cortex-X925` cores into
+   disjoint sets (`sparknet-proxy` on `CPU 19`, `VLLM::Worker_TP*` main on
+   `CPU 18`, `VLLM::EngineCore` on `CPU 17`, Rank-0 `APIServer` on `15-16` +
+   efficiency cores, and worker auxiliary threads on `5-9`) reduces 116-call
+   step collective time 3.34x vs. unpinned cores (`0.273 ms -> 0.082 ms`) and
+   eliminates Rank-0 preemption tail spikes (`0.939 ms -> 0.084 ms` p99).
 7. **A RoCE one-shot broadcast for adaptive verification.** Adaptive
    verification broadcasts rank 0's confidence snapshot every decode step
    through NCCL (`adaptive_verification.py`). Bound its share of the step from
