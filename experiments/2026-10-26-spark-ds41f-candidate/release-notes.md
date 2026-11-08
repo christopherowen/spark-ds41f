@@ -6,7 +6,7 @@ named after the day it is promoted. The model is DeepSeek-V4.1-Flash-1017, DeepS
 with native weights.
 
 It advances `spark-ds41f-1030` across vLLM (`641` active patches through `0761` in
-[1107/vllm/series](1107/vllm/series); `patch_head` `320021e3`, `expected_tree` `ed1bdb7a`) and
+[1107/vllm/series](1107/vllm/series); `patch_head` `2756478b`, `expected_tree` `ed1bdb7a`) and
 `sparknet` (`3` active patches `0002..0004` in [1107/sparknet/series](1107/sparknet/series);
 `patch_head` `1f84980b`, `expected_tree` `b86dc07f`). Image `spark-ds41f:1107`
 (`sha256:3f32a962ce04b7c8d85337cd427a8946b8b6bcaadd97cc8d8a8cd14e8d68a6ce`).
