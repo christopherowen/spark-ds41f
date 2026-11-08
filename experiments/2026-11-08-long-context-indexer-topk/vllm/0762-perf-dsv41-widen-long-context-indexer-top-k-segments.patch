@@ -1,0 +1,666 @@
+From 4ef117500fa21b821d73b17265a80b1c9e06ec4f Mon Sep 17 00:00:00 2001
+From: Christopher Owen <christopherowen@users.noreply.github.com>
+Date: Sun, 8 Nov 2026 19:22:06 +0000
+Subject: [PATCH] perf(dsv41): widen long-context indexer top-k segments and
+ reuse source blocks
+
+Base: 1107 vLLM patch head 320021e3c4dbb202d911ab70e2cd924c75420488.
+
+Rationale:
+Long-context V4.1 indexer top-k selection (IndexerTopK at widths 64K..1M) previously stored order-preserving 16-bit BF16 keys (_key16) in 4-byte T.int32 shared-memory arrays, capping each segment CTA at _SEGMENT_ENTRIES = 4096 entries and each merge CTA at _MERGE_KEYS = 8192 keys. Furthermore:
+1. Per-thread contiguous reads (keys[tx * per + v]) during ordered compaction suffered 8-way to 32-way shared-memory bank conflicts across warps, and every thread re-read keys[tx * per + v] in the second compaction pass even when its slice had zero winners.
+2. Stage-1 and merge CTAs initialized and scanned the full compile-time segment/merge capacity even when the row active extent was smaller.
+3. On candidate-publishing source layers (Layer 20, candidate_blocks=True, width > 16384), IndexerV41Plan ran both select_blocks (top-2048 blocks of 8 = 16,384 positions over the full 1M row) and a full-width select (top-512 individual positions over the full 1M row), even though every top-512 position is guaranteed to reside inside the top-2048 blocks.
+
+Optimize long-context IndexerTopK and IndexerV41Plan while preserving exact score-then-lowest-position tie-breaking and ascending output order:
+1. Store shared-memory keys and sel_key as T.uint16 for topk <= 2048, widening _LONG_SEGMENT_ENTRIES to 16,384 and _LONG_MERGE_KEYS to 16,384 while keeping total shared memory <= 47 KiB (2 CTAs/SM on SM120). This collapses 16,384-entry reindex selection to a single kernel launch (zero merge, zero scratch), cuts 524K k=512 from 128 segments + 2 merge levels to 32 segments + 1 merge level, cuts 1M k=2048 g=8 from 32 segments + 3 merge levels to 8 segments + 1 merge level, and cuts 1M k=2048 g=1 from 256 segments + 4 merge levels to 64 segments + 2 merge levels.
+2. Apply a bijective XOR bank-conflict swizzle (idx ^ ((idx >> 5) & 31)) on shared-memory keys, bound load/threshold/compact loops by the active entry count n_active, and gate the second compaction read loop on (n_gt > 0) | (sel_eq > 0).
+3. Add gather_scores=True on IndexerTopK so source-layer IndexerV41Plan(candidate_blocks=True) selects the top-512 positions directly from the 2,048 ascending candidate blocks published by select_blocks in a single 1-CTA-per-row launch with zero select scratch buffers.
+
+Quality:
+Bit-identical (torch.equal on selected indices, values, and counts) across all widths, batch sizes, partial active extents, and adversarial tie-breaking cases; preserves _SEGMENT_ENTRIES = 4096 and _MERGE_KEYS = 8192 for coarse selectors with topk > 2048.
+
+Tests:
+- pytest --noconftest -q tests/kernels/attention/test_deepseek_v41_tilelang.py tests/models/test_deepseek_v4_1_lsa.py tests/models/test_deepseek_v4_1_attention.py (132 passed across 2 fresh container boots).
+- python3 tests/kernels/attention/deepseek_v41_indexer_reads.py (scored 4 cases across 2 fresh container boots).
+
+Upstream status: local SM120 TileLang long-context indexer top-k optimization.
+---
+ .../attention/test_deepseek_v41_tilelang.py   |  18 +-
+ vllm/models/deepseek_v4_1/tilelang/indexer.py | 329 +++++++++++++-----
+ 2 files changed, 245 insertions(+), 102 deletions(-)
+
+diff --git a/tests/kernels/attention/test_deepseek_v41_tilelang.py b/tests/kernels/attention/test_deepseek_v41_tilelang.py
+index 8491131..3c58fc6 100644
+--- a/tests/kernels/attention/test_deepseek_v41_tilelang.py
++++ b/tests/kernels/attention/test_deepseek_v41_tilelang.py
+@@ -765,13 +765,15 @@ def _tie_scores(rows, width, seed=3):
+     [
+         (4000, INDEX_TOPK, 1),  # one pass
+         (20000, INDEX_TOPK, 1),  # segments, one merge
+-        (300000, INDEX_TOPK, 1),  # segments, two merge levels
++        (300000, INDEX_TOPK, 1),  # segments, one merge
++        (600000, INDEX_TOPK, 1),  # segments, two merge levels
+         (
+             4000 * CANDIDATE_BLOCK + 8,
+             CANDIDATE_BLOCKS,
+             CANDIDATE_BLOCK,
+-        ),  # blocks, one merge
+-        (200000, CANDIDATE_BLOCKS, CANDIDATE_BLOCK),  # blocks, two merge levels
++        ),  # blocks, one pass
++        (200000, CANDIDATE_BLOCKS, CANDIDATE_BLOCK),  # blocks, one merge
++        (1048576, CANDIDATE_BLOCKS, CANDIDATE_BLOCK),  # blocks, one merge (8->1)
+     ],
+ )
+ def test_topk_routes(width, topk, group, rows=4):
+@@ -801,14 +803,15 @@ def test_topk_routes(width, topk, group, rows=4):
+     [
+         (4096, INDEX_TOPK, 1),  # one pass
+         (32768, INDEX_TOPK, 1),  # one merge
+-        (300000, INDEX_TOPK, 1),  # two merge levels
++        (300000, INDEX_TOPK, 1),  # one merge
++        (600000, INDEX_TOPK, 1),  # two merge levels
+         (32768, CANDIDATE_BLOCKS, CANDIDATE_BLOCK),  # grouped, one pass
+         (200000, CANDIDATE_BLOCKS, CANDIDATE_BLOCK),  # grouped, one merge
+     ],
+ )
+ def test_topk_single_live_and_empty_fastpaths(width, topk, group):
+-    """Rows with extent 0, single live segment (<= 4096 * group), and single live
+-    first-level merge group (<= 65536 * group) produce exact indices, values, and counts."""
++    """Rows with extent 0, single live segment (<= 16384 * group), and single live
++    first-level merge group (<= 524288 * group) produce exact indices, values, and counts."""
+     raw_lengths = [
+         0,
+         1,
+@@ -816,7 +819,10 @@ def test_topk_single_live_and_empty_fastpaths(width, topk, group):
+         min(511 * group, width),
+         min(4096 * group, width),
+         min(4096 * group + 1, width),
++        min(16384 * group, width),
++        min(16384 * group + 1, width),
+         min(16 * 4096 * group, width),
++        min(32 * 16384 * group, width),
+     ]
+     rows = len(raw_lengths)
+     scores = _tie_scores(rows, width, seed=19)
+diff --git a/vllm/models/deepseek_v4_1/tilelang/indexer.py b/vllm/models/deepseek_v4_1/tilelang/indexer.py
+index f8bc3fa..cfff971 100644
+--- a/vllm/models/deepseek_v4_1/tilelang/indexer.py
++++ b/vllm/models/deepseek_v4_1/tilelang/indexer.py
+@@ -859,10 +859,20 @@ def _value16(key):
+ 
+ _TOPK_THREADS = 512
+ _SEGMENT_ENTRIES = _TOPK_THREADS * 8
++_LONG_TOPK_MAX = CANDIDATE_BLOCKS
++_LONG_SEGMENT_ENTRIES = _TOPK_THREADS * 32
+ 
+ 
+-def _select_macros(threads, topk):
+-    """Radix threshold and ordered compaction over int32 keys held in shared memory."""
++def _segment_entries(topk: int) -> int:
++    return _LONG_SEGMENT_ENTRIES if topk <= _LONG_TOPK_MAX else _SEGMENT_ENTRIES
++
++
++def _swizzle_key_idx(idx, swizzle: bool = False):
++    return (idx ^ ((idx >> 5) & 31)) if swizzle else idx
++
++
++def _select_macros(threads, topk, swizzle: bool = False):
++    """Radix threshold and ordered compaction over keys held in shared memory."""
+     radix = 256
+     steps = threads.bit_length() - 1
+ 
+@@ -902,7 +912,7 @@ def _select_macros(threads, topk):
+         T.sync_threads()
+         for i in T.serial(T.ceildiv(n, threads)):
+             if i * threads + tx < n:
+-                key = keys[i * threads + tx]
++                key = T.cast(keys[_swizzle_key_idx(i * threads + tx, swizzle)], T.int32)
+                 if key > _KEY_NEG_INF:
+                     T.atomic_add(hist[key >> 8], 1)
+         T.sync_threads()
+@@ -923,7 +933,7 @@ def _select_macros(threads, topk):
+         T.sync_threads()
+         for i in T.serial(T.ceildiv(n, threads)):
+             if i * threads + tx < n:
+-                key = keys[i * threads + tx]
++                key = T.cast(keys[_swizzle_key_idx(i * threads + tx, swizzle)], T.int32)
+                 if (key > _KEY_NEG_INF) & ((key >> 8) == hi):
+                     T.atomic_add(hist[key & 0xFF], 1)
+         T.sync_threads()
+@@ -943,7 +953,7 @@ def _select_macros(threads, topk):
+         T.sync_threads()
+ 
+     @T.macro
+-    def compact(keys, per, tx, scan, params, sel_idx, sel_key):
++    def compact(keys, per, tx, scan, params, sel_idx, sel_key, n=None):
+         """Write the selected indices and keys to sel_idx/sel_key in index order.
+ 
+         Ties at the threshold keep the lowest indices. Each thread owns
+@@ -962,12 +972,14 @@ def _select_macros(threads, topk):
+         need = params[1]
+         n_gt = 0
+         n_eq = 0
+-        for v in T.serial(per):
+-            key = keys[tx * per + v]
+-            if key > thr:
+-                n_gt += 1
+-            elif key == thr:
+-                n_eq += 1
++        if n is None or tx * per < n:
++            for v in T.serial(per):
++                if n is None or tx * per + v < n:
++                    key = T.cast(keys[_swizzle_key_idx(tx * per + v, swizzle)], T.int32)
++                    if key > thr:
++                        n_gt += 1
++                    elif key == thr:
++                        n_eq += 1
+         scan[tx] = n_eq
+         T.sync_threads()
+         block_scan(scan, tx, steps)
+@@ -978,14 +990,16 @@ def _select_macros(threads, topk):
+         block_scan(scan, tx, steps)
+         out_pos = scan[tx] - n_gt - sel_eq
+         taken = 0
+-        for v in T.serial(per):
+-            key = keys[tx * per + v]
+-            if (key > thr) | ((key == thr) & (taken < sel_eq)):
+-                if key == thr:
+-                    taken += 1
+-                sel_idx[out_pos] = tx * per + v
+-                sel_key[out_pos] = key
+-                out_pos += 1
++        if (n_gt > 0) | (sel_eq > 0):
++            for v in T.serial(per):
++                if n is None or tx * per + v < n:
++                    key = T.cast(keys[_swizzle_key_idx(tx * per + v, swizzle)], T.int32)
++                    if (key > thr) | ((key == thr) & (taken < sel_eq)):
++                        if key == thr:
++                            taken += 1
++                        sel_idx[out_pos] = tx * per + v
++                        sel_key[out_pos] = T.cast(key, sel_key.dtype)
++                        out_pos += 1
+         T.sync_threads()
+ 
+     return threshold, compact
+@@ -1059,62 +1073,87 @@ def indexer_topk_segment_v41(
+     final: bool = True,
+     candidates: bool = False,
+     threads: int = _TOPK_THREADS,
++    gather_scores: bool = False,
+ ):
+-    """Stage 1: the exact top-``topk`` of each ``_SEGMENT_ENTRIES``-entry row segment.
++    """Stage 1: the exact top-``topk`` of each segment of a row.
+ 
+     Inputs: ``Scores`` (``[rows, width]`` BF16), ``Lengths`` (``[rows]`` int32)
+-    and, unless ``candidates``, ``Active`` (``[1]`` int32): a row selects from
+-    its first ``min(Lengths, Active, width)`` positions. With ``group > 1`` an
+-    entry is a block of ``group`` positions keyed by its maximum; the block
+-    holding the last position always ranks first.
++    and, unless ``candidates`` or ``gather_scores``, ``Active`` (``[1]`` int32):
++    a row selects from its first ``min(Lengths, Active, width)`` positions. With
++    ``group > 1`` an entry is a block of ``group`` positions keyed by its
++    maximum; the block holding the last position always ranks first.
+ 
+     ``final`` (one segment per row) writes ``Indices`` (``[rows, topk]`` int32
+     ascending positions, or block ids with ``group > 1``, ``-1`` padded) and
+-    ``Values`` (``[rows, topk]`` BF16); ``candidates`` maps entries through
+-    ``Gather`` (``[rows, width // CANDIDATE_BLOCK]`` block ids), and
+-    ``group > 1`` also writes ``Counts`` (``[rows]`` positions kept).
+-    Otherwise it writes each live segment's winners, in entry order, to
+-    ``WorkValues`` / ``WorkEntries`` (``[rows, segments * topk]``, ``-1``
+-    padded); segments past a row's extent are left unwritten.
++    ``Values`` (``[rows, topk]`` BF16); ``candidates`` and ``gather_scores`` map
++    entries through ``Gather`` (block ids), with ``gather_scores`` reading dense
++    ``Scores`` at the gathered block positions, and ``group > 1`` also writes
++    ``Counts`` (``[rows]`` positions kept). Otherwise it writes each live
++    segment's winners, in entry order, to ``WorkValues`` / ``WorkEntries``
++    (``[rows, segments * topk]``, ``-1`` padded); segments past a row's extent
++    are left unwritten.
+     """
+-    assert not (candidates and group > 1), "candidate rows select positions, not blocks"
++    assert not ((candidates or gather_scores) and group > 1), (
++        "candidate rows select positions, not blocks"
++    )
+     rows = T.dynamic("rows")
+-    entries = tilelang.cdiv(width, group)
+-    segment = _SEGMENT_ENTRIES
++    entries = (
++        CANDIDATE_BLOCKS * CANDIDATE_BLOCK
++        if gather_scores
++        else tilelang.cdiv(width, group)
++    )
++    segment = _segment_entries(topk)
++    key_dtype = T.uint16 if topk <= _LONG_TOPK_MAX else T.int32
++    swizzle = topk <= _LONG_TOPK_MAX
+     segments = tilelang.cdiv(entries, segment)
+     assert not final or segments == 1, "a final segment must cover the row"
+     per = segment // threads
+-    threshold, compact = _select_macros(threads, topk)
++    threshold, compact = _select_macros(threads, topk, swizzle)
+     write_final, write_empty_final = _final_writer(threads, topk, group)
+ 
+     @T.macro
+     def select_segment(
+-        Scores, extent, row, seg, keys, hist, scan, params, sel_idx, sel_key
++        Scores, Gather, extent, row, seg, keys, hist, scan, params, sel_idx, sel_key
+     ):
+         tx = T.get_thread_binding()
+         best = T.alloc_var(T.int32)
+         n_entries = T.ceildiv(extent, group)
+-        for i in T.serial(per):
++        n_active = T.min(segment, T.max(n_entries - seg * segment, 0))
++        for i in T.serial(T.ceildiv(n_active, threads)):
+             j = i * threads + tx
+-            e = seg * segment + j
+-            if group == 1:
+-                keys[j] = T.if_then_else(
+-                    e < n_entries, _key16(Scores[row, T.min(e, width - 1)]), 0
+-                )
+-            else:
+-                best = 0
+-                for o in T.serial(group):
+-                    if (e < n_entries) & (e * group + o < extent):
+-                        best = T.max(
+-                            best, _key16(Scores[row, T.min(e * group + o, width - 1)])
+-                        )
+-                # The block holding the last visible position always survives.
+-                keys[j] = T.if_then_else(
+-                    (e < n_entries) & (e == (extent - 1) // group), 0xFF80, best
+-                )
++            if j < n_active:
++                e = seg * segment + j
++                if gather_scores:
++                    blk = Gather[row, e // CANDIDATE_BLOCK]
++                    pos = blk * CANDIDATE_BLOCK + e % CANDIDATE_BLOCK
++                    keys[_swizzle_key_idx(j, swizzle)] = T.cast(
++                        T.if_then_else(
++                            blk >= 0,
++                            _key16(Scores[row, T.min(T.max(pos, 0), width - 1)]),
++                            0,
++                        ),
++                        key_dtype,
++                    )
++                elif group == 1:
++                    keys[_swizzle_key_idx(j, swizzle)] = T.cast(
++                        _key16(Scores[row, T.min(e, width - 1)]), key_dtype
++                    )
++                else:
++                    best = 0
++                    for o in T.serial(group):
++                        if e * group + o < extent:
++                            best = T.max(
++                                best,
++                                _key16(Scores[row, T.min(e * group + o, width - 1)]),
++                            )
++                    # The block holding the last visible position always survives.
++                    keys[_swizzle_key_idx(j, swizzle)] = T.cast(
++                        T.if_then_else(e == (extent - 1) // group, 0xFF80, best),
++                        key_dtype,
++                    )
+         T.sync_threads()
+-        threshold(keys, segment, tx, hist, scan, params)
+-        compact(keys, per, tx, scan, params, sel_idx, sel_key)
++        threshold(keys, n_active, tx, hist, scan, params)
++        compact(keys, per, tx, scan, params, sel_idx, sel_key, n_active)
+ 
+     @T.macro
+     def body(
+@@ -1131,17 +1170,20 @@ def indexer_topk_segment_v41(
+         with T.Kernel(segments, rows, threads=threads) as (seg, row):
+             pdl.chain()
+             tx = T.get_thread_binding()
+-            keys = T.alloc_shared([segment], T.int32)
++            keys = T.alloc_shared([segment], key_dtype)
+             hist = T.alloc_shared([257], T.int32)
+             scan = T.alloc_shared([threads], T.int32)
+             params = T.alloc_shared([4], T.int32)
+             sel_idx = T.alloc_shared([topk], T.int32)
+-            sel_key = T.alloc_shared([topk], T.int32)
+-            extent = _row_extent(Lengths, Active, row, width)
++            sel_key = T.alloc_shared([topk], key_dtype)
++            extent = _row_extent(
++                Lengths, Active, row, entries if gather_scores else width
++            )
+             if final:
+                 if extent > 0:
+                     select_segment(
+                         Scores,
++                        Gather,
+                         extent,
+                         row,
+                         0,
+@@ -1162,7 +1204,7 @@ def indexer_topk_segment_v41(
+                         extent,
+                         lambda slot: slot < total,
+                         lambda slot: sel_idx[slot],
+-                        lambda slot: _value16(sel_key[slot]),
++                        lambda slot: _value16(T.cast(sel_key[slot], T.int32)),
+                         params,
+                     )
+                 else:
+@@ -1170,14 +1212,26 @@ def indexer_topk_segment_v41(
+             elif seg * segment < T.ceildiv(extent, group):
+                 # Segments past the row's extent hold nothing; the merges skip them.
+                 select_segment(
+-                    Scores, extent, row, seg, keys, hist, scan, params, sel_idx, sel_key
++                    Scores,
++                    Gather,
++                    extent,
++                    row,
++                    seg,
++                    keys,
++                    hist,
++                    scan,
++                    params,
++                    sel_idx,
++                    sel_key,
+                 )
+                 total = scan[threads - 1]
+                 for i in T.serial(T.ceildiv(topk, threads)):
+                     slot = i * threads + tx
+                     if slot < topk:
+                         if slot < total:
+-                            WorkValues[row, seg * topk + slot] = _value16(sel_key[slot])
++                            WorkValues[row, seg * topk + slot] = _value16(
++                                T.cast(sel_key[slot], T.int32)
++                            )
+                             WorkEntries[row, seg * topk + slot] = (
+                                 seg * segment + sel_idx[slot]
+                             )
+@@ -1223,13 +1277,16 @@ def indexer_topk_segment_v41(
+ 
+         return indexer_topk_segment
+ 
+-    if candidates:
++    if candidates or gather_scores:
++        gather_cols = (
++            CANDIDATE_BLOCKS if gather_scores else width // CANDIDATE_BLOCK
++        )
+ 
+         @T.prim_func
+         def indexer_topk_segment(
+             Scores: T.Tensor([rows, width], T.bfloat16),
+             Lengths: T.Tensor([rows], T.int32),
+-            Gather: T.Tensor([rows, width // CANDIDATE_BLOCK], T.int32),
++            Gather: T.Tensor([rows, gather_cols], T.int32),
+             Indices: T.Tensor([rows, topk], T.int32),
+             Values: T.Tensor([rows, topk], T.bfloat16),
+         ):
+@@ -1297,8 +1354,13 @@ def indexer_topk_merge_v41(
+     n = min(lists, fan_in) * topk
+     n_pad = tilelang.cdiv(n, threads) * threads
+     per = n_pad // threads
+-    assert n_pad * 4 <= 64 * 1024, f"{n} merge keys exceed shared memory; lower fan_in"
+-    threshold, compact = _select_macros(threads, topk)
++    key_dtype = T.uint16 if topk <= _LONG_TOPK_MAX else T.int32
++    key_bytes = 2 if topk <= _LONG_TOPK_MAX else 4
++    swizzle = topk <= _LONG_TOPK_MAX
++    assert n_pad * key_bytes <= 64 * 1024, (
++        f"{n} merge keys exceed shared memory; lower fan_in"
++    )
++    threshold, compact = _select_macros(threads, topk, swizzle)
+     write_final, write_empty_final = _final_writer(threads, topk, group)
+ 
+     @T.macro
+@@ -1306,12 +1368,12 @@ def indexer_topk_merge_v41(
+         with T.Kernel(groups, rows, threads=threads) as (g, row):
+             pdl.chain()
+             tx = T.get_thread_binding()
+-            keys = T.alloc_shared([n_pad], T.int32)
++            keys = T.alloc_shared([n_pad], key_dtype)
+             hist = T.alloc_shared([257], T.int32)
+             scan = T.alloc_shared([threads], T.int32)
+             params = T.alloc_shared([4], T.int32)
+             sel_idx = T.alloc_shared([topk], T.int32)
+-            sel_key = T.alloc_shared([topk], T.int32)
++            sel_key = T.alloc_shared([topk], key_dtype)
+             extent = _row_extent(Lengths, Active, row, width)
+             live = T.min(
+                 T.ceildiv(T.ceildiv(extent, group), span), lists
+@@ -1346,23 +1408,22 @@ def indexer_topk_merge_v41(
+                                 row, base + slot
+                             ]
+             else:
+-                for i in T.serial(per):
++                n_active = group_live * topk
++                for i in T.serial(T.ceildiv(n_active, threads)):
+                     j = i * threads + tx
+-                    c = T.min(base + j, lists * topk - 1)
+-                    # List liveness must guard the global read itself. A bitwise
+-                    # conjunction evaluates WorkEntries even for unwritten lists.
+-                    keys[j] = T.if_then_else(
+-                        (j < n) & (g * fan_in + j // topk < live),
+-                        T.if_then_else(
+-                            WorkEntries[row, c] >= 0,
+-                            _key16(WorkValues[row, c]),
+-                            0,
+-                        ),
+-                        0,
+-                    )
++                    if j < n_active:
++                        c = base + j
++                        keys[_swizzle_key_idx(j, swizzle)] = T.cast(
++                            T.if_then_else(
++                                WorkEntries[row, c] >= 0,
++                                _key16(WorkValues[row, c]),
++                                0,
++                            ),
++                            key_dtype,
++                        )
+                 T.sync_threads()
+-                threshold(keys, n_pad, tx, hist, scan, params)
+-                compact(keys, per, tx, scan, params, sel_idx, sel_key)
++                threshold(keys, n_active, tx, hist, scan, params)
++                compact(keys, per, tx, scan, params, sel_idx, sel_key, n_active)
+                 total = scan[threads - 1]
+                 if final:
+                     write_final(
+@@ -1374,7 +1435,7 @@ def indexer_topk_merge_v41(
+                         extent,
+                         lambda slot: slot < total,
+                         lambda slot: WorkEntries[row, sel_idx[slot]],
+-                        lambda slot: _value16(sel_key[slot]),
++                        lambda slot: _value16(T.cast(sel_key[slot], T.int32)),
+                         params,
+                     )
+                 else:
+@@ -1382,7 +1443,9 @@ def indexer_topk_merge_v41(
+                         slot = i * threads + tx
+                         if slot < topk:
+                             if slot < total:
+-                                Values[row, g * topk + slot] = _value16(sel_key[slot])
++                                Values[row, g * topk + slot] = _value16(
++                                    T.cast(sel_key[slot], T.int32)
++                                )
+                                 Indices[row, g * topk + slot] = WorkEntries[
+                                     row, base + sel_idx[slot]
+                                 ]
+@@ -1484,6 +1547,11 @@ def indexer_topk_merge_v41(
+ 
+ 
+ _MERGE_KEYS = 8192  # keys one merge CTA holds in shared memory (32 KiB)
++_LONG_MERGE_KEYS = 16384  # uint16 keys one merge CTA holds in shared memory (32 KiB)
++
++
++def _merge_keys(topk: int) -> int:
++    return _LONG_MERGE_KEYS if topk <= _LONG_TOPK_MAX else _MERGE_KEYS
+ 
+ 
+ def _take(scratch, specs):
+@@ -1511,9 +1579,20 @@ class IndexerTopK:
+     return block ids.
+     """
+ 
+-    def __init__(self, width, topk=INDEX_TOPK, group=1, candidates=False):
++    def __init__(
++        self,
++        width,
++        topk=INDEX_TOPK,
++        group=1,
++        candidates=False,
++        *,
++        gather_scores=False,
++    ):
+         self.topk, self.group, self.candidates = topk, group, candidates
+-        self.segments, first, levels = self.routes(width, topk, group, candidates)
++        self.gather_scores = gather_scores
++        self.segments, first, levels = self.routes(
++            width, topk, group, candidates, gather_scores=gather_scores
++        )
+         if self.segments == 1:
+             self.single = _make(first)
+         else:
+@@ -1522,13 +1601,33 @@ class IndexerTopK:
+         self.levels = [(_make(kernel), lists, out) for kernel, lists, out in levels]
+ 
+     @staticmethod
+-    def routes(width, topk=INDEX_TOPK, group=1, candidates=False):
++    def routes(
++        width,
++        topk=INDEX_TOPK,
++        group=1,
++        candidates=False,
++        *,
++        gather_scores=False,
++    ):
+         """``(segments, first, levels)``: the segment count, the first kernel (the
+         final segment kernel of a one-segment row, else stage 1) and the merge
+         levels ``(kernel, input lists, output lists)``, kernels as
+         ``prepare.call``s."""
++        if gather_scores:
++            first = prepare.call(
++                indexer_topk_segment_v41,
++                width,
++                topk,
++                group,
++                True,
++                candidates,
++                _TOPK_THREADS,
++                True,
++            )
++            return 1, first, []
+         entries = tilelang.cdiv(width, group)
+-        segments = tilelang.cdiv(entries, _SEGMENT_ENTRIES)
++        seg_entries = _segment_entries(topk)
++        segments = tilelang.cdiv(entries, seg_entries)
+         levels = []
+         if segments == 1:
+             first = prepare.call(
+@@ -1538,8 +1637,8 @@ class IndexerTopK:
+         first = prepare.call(
+             indexer_topk_segment_v41, width, topk, group, False, candidates
+         )
+-        fan_in = max(2, _MERGE_KEYS // topk)
+-        lists, span = segments, _SEGMENT_ENTRIES
++        fan_in = max(2, _merge_keys(topk) // topk)
++        lists, span = segments, seg_entries
+         merge = indexer_topk_merge_v41
+         if topk > 4096 and group == 1 and not candidates:
+             from .wide_topk_merge import wide_indexer_topk_merge
+@@ -1563,9 +1662,19 @@ class IndexerTopK:
+         return segments, first, levels
+ 
+     @classmethod
+-    def calls(cls, width, topk=INDEX_TOPK, group=1, candidates=False) -> list:
++    def calls(
++        cls,
++        width,
++        topk=INDEX_TOPK,
++        group=1,
++        candidates=False,
++        *,
++        gather_scores=False,
++    ) -> list:
+         """The kernel calls ``IndexerTopK(width, topk, group, candidates)`` makes."""
+-        _, first, levels = cls.routes(width, topk, group, candidates)
++        _, first, levels = cls.routes(
++            width, topk, group, candidates, gather_scores=gather_scores
++        )
+         return [first, *(kernel for kernel, _, _ in levels)]
+ 
+     def scratch_specs(self, rows):
+@@ -1597,9 +1706,10 @@ class IndexerTopK:
+         ``gather`` (their candidate block ids) instead.
+         """
+         rows = scores.shape[0]
+-        cap = () if self.candidates else (active,)
++        uses_gather = self.candidates or self.gather_scores
++        cap = () if uses_gather else (active,)
+         final = (
+-            *((gather,) if self.candidates else ()),
++            *((gather,) if uses_gather else ()),
+             indices,
+             values,
+             *((counts,) if self.group > 1 else ()),
+@@ -1640,6 +1750,14 @@ class IndexerV41Plan:
+     call needs, which a caller can borrow from a shared workspace.
+     """
+ 
++    @staticmethod
++    def _gather_from_blocks(width, topk, candidate_blocks) -> bool:
++        return (
++            candidate_blocks
++            and width > CANDIDATE_BLOCKS * CANDIDATE_BLOCK
++            and topk < CANDIDATE_BLOCKS
++        )
++
+     def __init__(
+         self,
+         width,
+@@ -1655,7 +1773,10 @@ class IndexerV41Plan:
+         self.width, self.page_size, self.topk = width, page_size, topk
+         self.candidates, self.candidate_blocks = candidates, candidate_blocks
+         self.score = _make(_score_call(width, page_size, candidates))
+-        self.select = IndexerTopK(width, topk, 1, candidates)
++        gather_scores = self._gather_from_blocks(width, topk, candidate_blocks)
++        self.select = IndexerTopK(
++            width, topk, 1, candidates, gather_scores=gather_scores
++        )
+         self.select_blocks = (
+             IndexerTopK(width, CANDIDATE_BLOCKS, CANDIDATE_BLOCK)
+             if candidate_blocks
+@@ -1672,9 +1793,14 @@ class IndexerV41Plan:
+         candidate_blocks=False,
+     ) -> list:
+         """The kernel calls ``IndexerV41Plan`` of these arguments makes."""
++        gather_scores = IndexerV41Plan._gather_from_blocks(
++            width, topk, candidate_blocks
++        )
+         calls = [
+             _score_call(width, page_size, candidates),
+-            *IndexerTopK.calls(width, topk, 1, candidates),
++            *IndexerTopK.calls(
++                width, topk, 1, candidates, gather_scores=gather_scores
++            ),
+         ]
+         if candidate_blocks:
+             calls.extend(IndexerTopK.calls(width, CANDIDATE_BLOCKS, CANDIDATE_BLOCK))
+@@ -1750,7 +1876,6 @@ class IndexerV41Plan:
+             )
+             return out, scores
+         self.score(*args, scores)
+-        self.select.run(scores, lengths, active, out, values, scratch=select_buffers)
+         if self.select_blocks is not None:
+             block_values, *block_buffers = buffers[2 + select_scratch :]
+             self.select_blocks.run(
+@@ -1762,4 +1887,16 @@ class IndexerV41Plan:
+                 counts=candidate_out_lengths,
+                 scratch=block_buffers,
+             )
++            if self.select.gather_scores:
++                self.select.run(
++                    scores,
++                    candidate_out_lengths,
++                    None,
++                    out,
++                    values,
++                    gather=candidate_out,
++                    scratch=select_buffers,
++                )
++                return out, scores
++        self.select.run(scores, lengths, active, out, values, scratch=select_buffers)
+         return out, scores
+-- 
+2.43.0
+
