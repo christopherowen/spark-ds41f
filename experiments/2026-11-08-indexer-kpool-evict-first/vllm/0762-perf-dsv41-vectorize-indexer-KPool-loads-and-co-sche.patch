@@ -1,0 +1,280 @@
+From a52f800a66f5e99689c1438e0c1257fff563dd08 Mon Sep 17 00:00:00 2001
+From: Christopher Owen <3221756+christopherowen@users.noreply.github.com>
+Date: Sun, 8 Nov 2026 18:15:00 +0100
+Subject: [PATCH] perf(dsv41): vectorize indexer KPool loads and co-schedule
+ dense CTA columns
+
+Base: 1107 vLLM patch head 2756478b60b90700b9918b457aeb38657da637b5.
+
+Rationale:
+1. In indexer_score_v41, load_keys mapped T.Parallel(64, 128) across 128 threads with 2 E2M1 elements (1 byte) per thread along D=128 and a 32-iteration loop along block_P=64, and TileLang failed to vectorize across the conditional bounds check and 16-byte swizzle boundary. Each thread issued 32 scalar 1-byte LDG.E.U8 loads, 32 1-byte STS.U8 stores, and 33 redundant PageTable global loads per 64-position tile (1,223 SASS instructions / 148 registers on ptxas 13.0.88; 1,518 SASS instructions / 250 registers on ptxas 13.5.37). Replacing load_keys with 16-byte uint4 (32 E2M1) global loads, a single hoisted PageTable lookup per tile/row, and direct swizzled STS.128 stores reduces indexer_score_v41 to 528 SASS instructions (-56.8%) and 68 registers on 13.0.88 (535 SASS instructions and 67 registers on 13.5.37).
+2. In multi-row dense scoring (rows > 1, e.g. MTP verification), launching (ctas, rows) as (bx, by) scheduled all 128 CTAs of row 0 in Waves 0..1 on GB10 before row 1..5 launched, streaming the entire KPool and evicting early tiles from the 24 MB L2 cache before rows 1..5 could reuse them. Mapping cta = (by * ctas + bx) // rows and row = (by * ctas + bx) % rows co-schedules all rows of each persistent CTA column in the same wave so rows 1..5 hit L2 on row 0's KPool loads, cutting cold-L2 6-row indexer_score_v41 latency by 38.5%-50.1% across 16K-262K context (481.3 -> 240.0 us at 262K, saving 241.7 us/layer or -37.3% across the full post-MoE attention block).
+
+Quality:
+Bit-identical outputs (torch.equal == True) across dense and candidate modes; preserves exact out-of-bounds read predicates verified under compute-sanitizer --tool initcheck.
+
+Tests:
+- pytest tests/kernels/attention/test_deepseek_v41_tilelang.py tests/models/test_deepseek_v4_1_lsa.py (66 passed, 1 xfailed across 2 boots, including compute-sanitizer initcheck).
+
+Upstream status: local SM120/SM121 TileLang indexer optimization.
+---
+ .../attention/test_deepseek_v41_tilelang.py   |  15 ++
+ vllm/models/deepseek_v4_1/tilelang/indexer.py | 169 +++++++++++++++++-
+ 2 files changed, 182 insertions(+), 2 deletions(-)
+
+diff --git a/tests/kernels/attention/test_deepseek_v41_tilelang.py b/tests/kernels/attention/test_deepseek_v41_tilelang.py
+index 849113154..c88fd887f 100644
+--- a/tests/kernels/attention/test_deepseek_v41_tilelang.py
++++ b/tests/kernels/attention/test_deepseek_v41_tilelang.py
+@@ -1286,3 +1286,18 @@ def test_sparse_mla_plan_routes_right_sizes_head_block_and_decode_waves(monkeypa
+     assert swa24.segments == 1
+     assert swa24.split_max_rows == 24
+     assert swa24.decode_max_rows == 144
++
++
++def test_indexer_score_vectorizes_kpool_loads_and_coschedules_dense_rows():
++    """Dense and candidate score kernels load 64-byte E2M1 key rows via 16-byte uint4
++    loads with a single PageTable lookup per position, and dense mode co-schedules
++    persistent CTA columns across rows in the grid."""
++    from vllm.models.deepseek_v4_1.tilelang.indexer import indexer_score_v41
++
++    dense_src = indexer_score_v41(32768, 256, candidates=False).get_kernel_source()
++    assert "__tl_load_k_shared_dense(" in dense_src
++    assert "(((int)blockIdx.y) * 128 + ((int)blockIdx.x)) / rows" in dense_src or "/ rows" in dense_src
++    assert "% rows" in dense_src
++
++    cand_src = indexer_score_v41(16384, 256, candidates=True).get_kernel_source()
++    assert "__tl_load_k_shared_candidates(" in cand_src
+diff --git a/vllm/models/deepseek_v4_1/tilelang/indexer.py b/vllm/models/deepseek_v4_1/tilelang/indexer.py
+index f8bc3fa91..8209e9481 100644
+--- a/vllm/models/deepseek_v4_1/tilelang/indexer.py
++++ b/vllm/models/deepseek_v4_1/tilelang/indexer.py
+@@ -143,6 +143,119 @@ def _candidate_position(Candidates, row, j, count=None):
+     return block * CANDIDATE_BLOCK + offset
+ 
+ 
++_SCORE_LOAD_HEADER = r"""
++__device__ __forceinline__ void __tl_load_k_shared_dense(
++    const void* __restrict__ KPool,
++    const uint* __restrict__ KScale,
++    const int* __restrict__ PageTable,
++    void* __restrict__ K_shared,
++    void* __restrict__ SFK_shared,
++    int row,
++    int p0,
++    int extent,
++    int page_size,
++    int table_width,
++    int pool_pages,
++    int pool_stride,
++    int scale_stride,
++    int scale_word0
++) {
++    int tx = threadIdx.x;
++    int logical_page = min(p0 / page_size, table_width - 1);
++    int raw_page = (table_width >= 1) ? PageTable[(int64_t)row * table_width + logical_page] : 0;
++    int page = min(max(raw_page, 0), pool_pages - 1);
++    int64_t page_byte_base = ((int64_t)page * pool_stride) >> 1;
++    uint4* k_smem = reinterpret_cast<uint4*>(K_shared);
++
++    #pragma unroll
++    for (int half = 0; half < 2; ++half) {
++        int p = half * 32 + (tx >> 2);
++        int c = tx & 3;
++        int pos = p0 + p;
++        uint4 val = make_uint4(0, 0, 0, 0);
++        if (pos < extent && page >= 0 && page < pool_pages) {
++            const uint4* gptr = reinterpret_cast<const uint4*>(
++                reinterpret_cast<const uint8_t*>(KPool) + page_byte_base + ((pos % page_size) * 64) + c * 16
++            );
++            val = *gptr;
++        }
++        int smem_idx = p * 4 + (c ^ ((p >> 1) & 3));
++        k_smem[smem_idx] = val;
++    }
++    if (tx < 64) {
++        int pos = p0 + tx;
++        uint sval = 0;
++        if (pos < extent && page >= 0 && page < pool_pages) {
++            sval = KScale[(int64_t)page * scale_stride + scale_word0 + (pos % page_size)];
++        }
++        reinterpret_cast<uint*>(SFK_shared)[tx] = sval;
++    }
++    __syncthreads();
++}
++
++__device__ __forceinline__ void __tl_load_k_shared_candidates(
++    const void* __restrict__ KPool,
++    const uint* __restrict__ KScale,
++    const int* __restrict__ PageTable,
++    const int* __restrict__ Candidates,
++    void* __restrict__ K_shared,
++    void* __restrict__ SFK_shared,
++    int row,
++    int p0,
++    int extent,
++    int blocks,
++    int page_size,
++    int table_width,
++    int pool_pages,
++    int pool_stride,
++    int scale_stride,
++    int scale_word0
++) {
++    int tx = threadIdx.x;
++    bool whole = (p0 + 64 <= extent);
++    uint4* k_smem = reinterpret_cast<uint4*>(K_shared);
++
++    #pragma unroll
++    for (int half = 0; half < 2; ++half) {
++        int p = half * 32 + (tx >> 2);
++        int c = tx & 3;
++        int j = p0 + p;
++        int blk = max(Candidates[(int64_t)row * blocks + (j >> 3)], 0);
++        int offset = (!whole && j >= extent) ? 0 : (j & 7);
++        int pos = (blk << 3) + offset;
++        int logical_page = min(pos / page_size, table_width - 1);
++        int raw_page = (table_width >= 1) ? PageTable[(int64_t)row * table_width + logical_page] : 0;
++        int page = min(max(raw_page, 0), pool_pages - 1);
++        uint4 val = make_uint4(0, 0, 0, 0);
++        if (page >= 0 && page < pool_pages) {
++            int64_t page_byte_base = ((int64_t)page * pool_stride) >> 1;
++            const uint4* gptr = reinterpret_cast<const uint4*>(
++                reinterpret_cast<const uint8_t*>(KPool) + page_byte_base + ((pos % page_size) * 64) + c * 16
++            );
++            val = *gptr;
++        }
++        int smem_idx = p * 4 + (c ^ ((p >> 1) & 3));
++        k_smem[smem_idx] = val;
++    }
++    if (tx < 64) {
++        int j = p0 + tx;
++        int blk = max(Candidates[(int64_t)row * blocks + (j >> 3)], 0);
++        int offset = (!whole && j >= extent) ? 0 : (j & 7);
++        int pos = (blk << 3) + offset;
++        int logical_page = min(pos / page_size, table_width - 1);
++        int raw_page = (table_width >= 1) ? PageTable[(int64_t)row * table_width + logical_page] : 0;
++        int page = min(max(raw_page, 0), pool_pages - 1);
++        uint sval = 0;
++        if (page >= 0 && page < pool_pages) {
++            sval = KScale[(int64_t)page * scale_stride + scale_word0 + (pos % page_size)];
++        }
++        reinterpret_cast<uint*>(SFK_shared)[tx] = sval;
++    }
++    __syncthreads();
++}
++"""
++
++
+ @tilelang.jit
+ def indexer_score_v41(
+     width: int,
+@@ -218,6 +331,8 @@ def indexer_score_v41(
+                 T.cast(0, T.uint32),
+             )
+ 
++    use_vec128 = block_P == 64 and D == 128 and threads == 128
++
+     @T.macro
+     def score_row(
+         Q,
+@@ -226,6 +341,7 @@ def indexer_score_v41(
+         KPool,
+         KScale,
+         PageTable,
++        Candidates,
+         row,
+         cta,
+         extent,
+@@ -266,7 +382,47 @@ def indexer_score_v41(
+                 # the end. Only the tile holding a candidate row's count bounds its
+                 # positions by it: a tile ``whole`` below the count takes
+                 # ``whole_position``, chosen once for the tile.
+-                if whole is None:
++                if use_vec128 and not candidates:
++                    T.call_extern(
++                        "handle",
++                        "__tl_load_k_shared_dense",
++                        T.address_of(KPool[0, 0]),
++                        T.address_of(KScale[0, 0]),
++                        T.address_of(PageTable[0, 0]),
++                        T.address_of(K_shared[0, 0]),
++                        T.address_of(SFK_shared[0, 0]),
++                        row,
++                        p0,
++                        extent,
++                        page_size,
++                        table_width,
++                        pool_pages,
++                        pool_stride,
++                        scale_stride,
++                        scale_word0,
++                    )
++                elif use_vec128 and candidates:
++                    T.call_extern(
++                        "handle",
++                        "__tl_load_k_shared_candidates",
++                        T.address_of(KPool[0, 0]),
++                        T.address_of(KScale[0, 0]),
++                        T.address_of(PageTable[0, 0]),
++                        T.address_of(Candidates[0, 0]),
++                        T.address_of(K_shared[0, 0]),
++                        T.address_of(SFK_shared[0, 0]),
++                        row,
++                        p0,
++                        extent,
++                        blocks,
++                        page_size,
++                        table_width,
++                        pool_pages,
++                        pool_stride,
++                        scale_stride,
++                        scale_word0,
++                    )
++                elif whole is None:
+                     load_keys(
+                         KPool,
+                         KScale,
+@@ -350,8 +506,13 @@ def indexer_score_v41(
+             Active: T.Tensor([1], T.int32),
+             Scores: T.Tensor([rows, width], T.bfloat16),
+         ):
+-            with T.Kernel(ctas, rows, threads=threads) as (cta, row):
++            with T.Kernel(ctas, rows, threads=threads) as (bx, by):
++                if use_vec128:
++                    T.import_source(_SCORE_LOAD_HEADER)
+                 pdl.chain()
++                linear_block = by * ctas + bx
++                cta = linear_block // rows
++                row = linear_block % rows
+                 extent = _row_extent(Lengths, Active, row, width)
+                 score_row(
+                     Q,
+@@ -360,6 +521,7 @@ def indexer_score_v41(
+                     KPool,
+                     KScale,
+                     PageTable,
++                    None,
+                     row,
+                     cta,
+                     extent,
+@@ -388,6 +550,8 @@ def indexer_score_v41(
+         Scores: T.Tensor([rows, width], T.bfloat16),
+     ):
+         with T.Kernel(ctas, rows, threads=threads) as (cta, row):
++            if use_vec128:
++                T.import_source(_SCORE_LOAD_HEADER)
+             pdl.chain()
+             extent = _row_extent(CandidateLengths, None, row, width)
+             score_row(
+@@ -397,6 +561,7 @@ def indexer_score_v41(
+                 KPool,
+                 KScale,
+                 PageTable,
++                Candidates,
+                 row,
+                 cta,
+                 extent,
+-- 
+2.43.0
+
