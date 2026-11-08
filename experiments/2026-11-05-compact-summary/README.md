@@ -1,0 +1,46 @@
+# Compact coarse scoring feasibility
+
+Base `dd579b47`, C36 image and the existing captured operands. This out-of-band
+screen tests the interaction of MXFP4-encoded block8 means and the native MXFP4
+score kernel at a 16/32-key tile for native page128/256. The current serving candidate remains unchanged.
+The hypothesis is that removing repeated BF16 query expansion and using compact
+mean operands can reduce the measured coarse-scoring bottleneck. Precision may
+change selected keys; independently graded final answers remain mandatory.
+
+The probe builds the current BF16 means, quantizes a separate mean cache using
+the pinned native encoder, and times coarse scores only. Construction and the
+extra cache memory are recorded separately; neither is a demonstrated serving
+implementation or an amortized request-speed result. A future integrated layout
+would still need native-byte, initialization, ownership/recycling, graph/cache,
+memory/admission and final-answer qualification. No model recipe uses this probe.
+
+All four outcome-independent `validation-a` snapshots, original physical page
+IDs, source/dense shapes and query row counts1/8/64 are retained. Score bits are
+checked against an independent BF16 computation of the decoded quantized means;
+precision drift and native-top512 coverage remain diagnostics, not quality proof.
+Only CUDA graph scorer replay is in score timers. Raw operands remain private
+on sp8; no activations, reference calls or comparisons enter serving. All errors,
+samples, allocator observations and lease releases must remain in `runs/`.
+
+The first attempt at `fc0e0698` stops before any scorer compilation or timing:
+its input assertion incorrectly assumes page256, while the first saved capture
+uses page128. Original logs, input/source identity and release remain retained
+in `runs/screen-01`. The probe now derives its tile from the native page geometry;
+neither captured operands nor outcome-independent selection changes. The retry
+uses a new result path and must still establish scorer feasibility.
+
+The geometry-corrected retry at `d1c923ce` passes in two fresh processes; all
+12 captured cases have zero score-bit differences against the independently
+decoded quantized-mean oracle. Single-row coarse scoring is 2.43–2.90x faster
+for dense inputs and 2.29–2.36x faster for source inputs than the BF16 scorer.
+The ratios are 1.70–1.81x / 1.45–1.48x at eight rows and 1.36–1.38x /
+1.23–1.25x at 64 rows (dense / source). Full samples, quantization construction
+costs and allocator observations remain in `runs/screen-02`.
+
+Quantization changes scores and selected keys: measured native-top512 coverage
+can fall by approximately 1.03 percentage points. This is a component feasibility
+pass, **not a serving implementation, request-speed result or answer-quality
+pass**. Integration must account for summary construction, layout/admission,
+initialization and cache/graph lifecycle before independently graded model tests.
+No runtime configuration changes. The sp8 lease is released at 18:37:46 UTC;
+the later independent read finds no remaining container, lease or request.

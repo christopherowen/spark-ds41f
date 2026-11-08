@@ -1,0 +1,46 @@
+{
+  "notes": "Input capture only: C36 arithmetic, long-domain dense and source interfaces, caller layer identity; isolated checkout and API port.",
+  "extends": {
+    "config": "experiments/2026-10-26-spark-ds41f-candidate/candidate-36/tp3-dev.json"
+  },
+  "set": {
+    "environment": {
+      "VLLM_DS41_CLUSTER_CAPTURE": "/cache/clustered-indexer-capture-20261104",
+      "VLLM_DS41_CLUSTER_CAPTURE_MIN_KEYS": "32769"
+    },
+    "container": {
+      "mounts": [
+        [
+          "{home}/projects/spark-ds41f/cache",
+          "/cache",
+          "rw"
+        ],
+        [
+          "{checkout}/experiments/2026-11-04-clustered-indexer/capture/overlay/indexer.py",
+          "/opt/spark-ds41f/candidate/vllm/vllm/models/deepseek_v4_1/tilelang/indexer.py",
+          "ro"
+        ],
+        [
+          "{checkout}/experiments/2026-11-04-clustered-indexer/capture/overlay/clustered_capture.py",
+          "/opt/spark-ds41f/candidate/vllm/vllm/models/deepseek_v4_1/tilelang/clustered_capture.py",
+          "ro"
+        ],
+        [
+          "{checkout}/experiments/2026-11-04-clustered-indexer/capture/overlay/attention.py",
+          "/opt/spark-ds41f/candidate/vllm/vllm/models/deepseek_v4_1/tilelang/attention.py",
+          "ro"
+        ]
+      ]
+    },
+    "deployment": {
+      "ready_url": "http://127.0.0.1:8001/v1/models",
+      "path": "{home}/spark-lab/checkouts/clustered-indexer-capture"
+    }
+  },
+  "serve_options": {
+    "--port": "8001"
+  },
+  "unset": [
+    "deployment.branch"
+  ]
+}

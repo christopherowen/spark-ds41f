@@ -1,0 +1,9 @@
+# Exact prefill pipeline cleanup
+
+Base `61eaf51bb93d72cf2da3d79bddaab05cfe717a85`. This explicitly tests the interaction of two previously component-qualified exact optimizations: final-candidate fusion and cooperative summary construction. The phase policy stays compact dense/source prefill with native generation and verification. Budgets, cache geometry, weights, fine-score arithmetic and answer protocol remain unchanged. No input, task ID or answer influences serving policy.
+
+A fresh named source tree applies the ten phase-routing patches followed by the existing fusion and summary patches. Runtime attention, compact selection and candidate-fusion files must equal the overlays byte for byte. No kernel body is changed. GPU graph replay, declared-call registration and actual-input checks remain required on a clean published commit, followed by independent final-answer gates and two fresh model boots. This does not inherit an untested quality or request-speed claim from a component timing.
+
+Exact commands, source hashes and preparation output remain in `runs/local`. GPU work is queued through native holds and uses separate clean runner checkouts. One CPU, 4 GiB and one build worker cap remote preparation. Raw text, token IDs, activations and programs remain node-local. All model thinking and unsuccessful time counts; temperature0, seed0, high thinking and65536 generated tokens stay shared. No quality or performance result and no production promotion are claimed.
+
+The parent phase policy subsequently loses the128K QA answer in `source-prefill-ruler-window-01`. Its queued integration GPU check is cancelled before starting. The exact optimization combination remains prepared but model-unqualified; it cannot claim to recover this selection loss.

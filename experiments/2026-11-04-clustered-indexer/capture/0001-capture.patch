@@ -1,0 +1,105 @@
+From 3378a5de61239b7a6cb920e608dc587f4f1b4c4a Mon Sep 17 00:00:00 2001
+From: Christopher Owen <3221756+christopherowen@users.noreply.github.com>
+Date: Wed, 4 Nov 2026 09:25:44 +0100
+Subject: [PATCH] Add an explicitly armed one-query indexer capture for offline
+ search tests
+
+Upstream base: 19f2c20ed4d64ae22bd009ceacadd85e2a81e354, after candidate-36's
+published series (tree cc0fdf582d0bddff71c6a853e237bc9e87587832).
+
+Rationale: evaluate exact cluster bounds on actual DeepSeek indexer operands
+before introducing a serving search path. Capture one query and only its
+visible cache pages after an explicit file arms the hook at API readiness.
+Zero the unused tail, and publish the tensor file atomically.
+
+Quality: the scorer, weights and arithmetic are unchanged. Synchronization
+and copying perturb timing, so the capture arm is not a performance arm.
+
+Tests: fresh candidate-36 series reproduction, syntax and patch/overlay
+identity. Actual capture and replay remain pending a cluster window.
+
+Upstream status: local experiment instrumentation, not submitted upstream.
+---
+ .../tilelang/clustered_capture.py             | 54 +++++++++++++++++++
+ vllm/models/deepseek_v4_1/tilelang/indexer.py |  4 ++
+ 2 files changed, 58 insertions(+)
+ create mode 100644 vllm/models/deepseek_v4_1/tilelang/clustered_capture.py
+
+diff --git a/vllm/models/deepseek_v4_1/tilelang/clustered_capture.py b/vllm/models/deepseek_v4_1/tilelang/clustered_capture.py
+new file mode 100644
+index 0000000000..caa8808dfe
+--- /dev/null
++++ b/vllm/models/deepseek_v4_1/tilelang/clustered_capture.py
+@@ -0,0 +1,54 @@
++# SPDX-License-Identifier: Apache-2.0
++# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
++"""One-shot, explicitly armed real indexer snapshot for the cluster-search lab."""
++import os
++from pathlib import Path
++
++import torch
++
++_done = False
++
++
++def maybe_capture(q, scales, weights, pool, table, lengths, active, width, page_size):
++    global _done
++    directory = os.environ.get('VLLM_DS41_CLUSTER_CAPTURE')
++    if _done or not directory or q.shape[0] == 0 or not Path(directory, 'arm').is_file():
++        return
++    if torch.cuda.is_current_stream_capturing():
++        return
++    limit = min(int(active[0].item()), width)
++    row = int(lengths.argmax().item())
++    extent = min(int(lengths[row].item()), limit)
++    if extent < 8192:
++        return
++    # Only one query and the cache pages it can read. No whole-pool host copy.
++    logical_pages = (extent + page_size - 1) // page_size
++    ids = table[row, :logical_pages].long()
++    from .indexer import page_bytes
++    nbytes = page_bytes(page_size)
++    selected = pool[:, :nbytes].index_select(0, ids)
++    tail = extent % page_size
++    if tail:
++        selected[-1, tail * 64:page_size * 64] = 0
++        selected[-1, page_size * 64 + tail * 4:] = 0
++    rank = torch.distributed.get_rank() if torch.distributed.is_initialized() else 0
++    target = Path(directory, f'rank-{rank}.pt')
++    snapshot = {
++        'q': q[row:row+1].detach().cpu(),
++        'scales': scales[row:row+1].detach().cpu(),
++        'weights': weights[row:row+1].detach().cpu(),
++        'pool': selected.detach().cpu(),
++        'table': torch.arange(logical_pages, dtype=torch.int32).view(1, -1),
++        'lengths': torch.tensor([extent], dtype=torch.int32),
++        'active': torch.tensor([logical_pages * page_size], dtype=torch.int32),
++        'page_size': page_size,
++        'width': logical_pages * page_size,
++        'rank': rank,
++        'source': 'candidate-36, tree cc0fdf582d0bddff71c6a853e237bc9e87587832',
++    }
++    # Atomic publication: a partial capture is never replayed as an input.
++    temporary = target.with_suffix('.tmp')
++    torch.save(snapshot, temporary)
++    temporary.replace(target)
++    _done = True
++    print(f'clustered indexer snapshot rank={rank} extent={extent} path={target}', flush=True)
+diff --git a/vllm/models/deepseek_v4_1/tilelang/indexer.py b/vllm/models/deepseek_v4_1/tilelang/indexer.py
+index b920b01a7f..8e70369fec 100644
+--- a/vllm/models/deepseek_v4_1/tilelang/indexer.py
++++ b/vllm/models/deepseek_v4_1/tilelang/indexer.py
+@@ -1725,6 +1725,10 @@ class IndexerV41Plan:
+         ``candidate_out_lengths`` (its count of positions). Scores past a row's
+         extent are unwritten.
+         """
++        if not self.candidates:
++            from .clustered_capture import maybe_capture
++            maybe_capture(q_packed, q_scales, weights, pool, page_table, lengths,
++                          active, self.width, self.page_size)
+         rows = q_packed.shape[0]
+         buffers = _take(scratch, self.scratch_specs(rows))
+         scores, values = buffers[:2]
+-- 
+2.54.0 (Apple Git-157)
+

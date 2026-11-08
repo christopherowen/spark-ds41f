@@ -1,0 +1,30 @@
+Preparation attempts retained in addition to native GPU receipts:
+
+1. Initial SSH to the management IP 10.0.1.71 timed out (exit 255).
+   The configured `dgx1` SSH alias worked. No host state changed.
+2. Initial doctor/upstream prepare in the new worktree refused because its
+   ignored site maps were absent. Existing node-local maps were copied from
+   the owner's checkout to the new ignored config paths. Doctor then passed.
+3. Fresh promoted vLLM preparation succeeded at tree
+   ea1281f880e7535e3d87725be0156a8e38fc2fb2. Git reported an existing blank
+   line at EOF in historical patch 0134. Published patches were unchanged.
+4. Build check reported:
+   WARN: .work/build/vllm-19f2c20ed4d6-b12x-236ddff04a5f-31ac0765 is not prepared; run bin/spark build prepare
+   Complete image build inputs are absent locally. No image was built.
+5. Initial check_sources.py used an absolute git-apply --directory path.
+   Git rejected it as an invalid path. The check now applies in a temporary
+   working directory and passes.
+6. A remote checkout was attempted before its clone completed; Git rejected
+   the not-yet-present revision. After clone completion, clean detached
+   checkout of the published commit succeeded.
+7. The release image has no compute-sanitizer executable on PATH. The idle
+   host has CUDA 13.0's complete compute-sanitizer directory. Sanitizer
+   bundles mount that directory read-only; no host package was installed.
+8. No torch or tilelang package is installed in the local macOS Python.
+   Local arithmetic tests use the standard library; GPU tests use the
+   recorded release image on idle dgx4.
+
+9. Publishing the unwritten-tail harness commit initially received GitHub's
+   Internal Server Error (2026-11-04T09:37:08Z). The following normal push
+   successfully published that commit and its descendant. No history was
+   rewritten, and no node received a dirty working tree.

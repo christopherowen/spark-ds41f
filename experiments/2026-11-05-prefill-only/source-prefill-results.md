@@ -1,0 +1,7 @@
+# Compact source prefill with native generation
+
+Source `ef48cc6683d177516486f4c2007ff68fa09ce235`, immutable C36 image, sp1–sp4 TP4. This changes source-prefill selection relative to the native-source phase recipe; generation and verification stay native. The published same-day native controls both score26/26. The new candidate reaches24 observed responses,23 correct, before the quality observer rejects `qa_1-l131072-s20272205` with official score0 versus100 on both controls. The last two tasks and repeat candidate boot do not run. No complete speed comparison is available or claimed.
+
+An earlier long, independently correct reasoning response becomes much shorter, but that cannot offset a lost answer. Native generation does not repair the prefix selection loss. This policy is rejected. Full receipts include its partial response metadata, interruption, quality observer, conditions, errors and incomplete summary. Temperature0, seed0, high thinking and65536-token allowance are unchanged; no grader, answer or dataset is repaired.
+
+C37 restores at2026-11-05T23:15:52.740393+00:00. Independent all-node verification confirms the exact image, clean equal serving checkouts, no experimental mounts/environment and removed reservations. Promoted configuration and immutable release evidence remain unchanged. The associated exact fusion/summary combination stays source-prepared only; its GPU queue was cancelled before any job ran. Higher source retention is a separate unqualified hypothesis.

@@ -1,0 +1,26 @@
+# Upstream base: C36 vLLM 6d4e49d1cdbb6513819e47145e0e52fdab327b6b.
+# Requires native top-k guard, four LSA patches and block-summary patch in order.
+# Rationale: one conditional shared store avoids a barrier per loaded summary row.
+# Quality: operands, BF16 rounding, ordered sums and selected keys are unchanged.
+# Tests: actual coarse/fine bits, graph/cache lifecycle, strict initcheck and
+# two-process component timing; final-answer and request gates remain required.
+# Upstream status: unpromoted local experiment, not submitted upstream.
+diff --git a/vllm/models/deepseek_v4_1/tilelang/block_shortlist.py b/vllm/models/deepseek_v4_1/tilelang/block_shortlist.py
+index 2c63a027ae..5f95ed7609 100644
+--- a/vllm/models/deepseek_v4_1/tilelang/block_shortlist.py
++++ b/vllm/models/deepseek_v4_1/tilelang/block_shortlist.py
+@@ -70,10 +70,10 @@ def block_scores(width: int, page: int, budget: int, block_c: int = 64):
+                 for iteration in T.serial(T.ceildiv(T.max(T.ceildiv(count,block_c)-cta,0),ctas)):
+                     start = (cta+iteration*ctas)*block_c
+                     for c,d in T.Parallel(block_c,128):
+-                        a[c,d] = 0
+-                        if start+c < count:
+-                            a[c,d] = Pool[Table[row,(start+c)//(page//8)],
+-                                page*68//2+((start+c)%(page//8))*128+d]
++                        a[c,d] = T.if_then_else(start+c < count,
++                            Pool[Table[row,(start+c)//(page//8)],
++                                 page*68//2+((start+c)%(page//8))*128+d],
++                            T.cast(0,T.bfloat16))
+                     T.gemm(a,b,acc,transpose_B=True,clear_accum=True)
+                     for c,h in T.Parallel(block_c,32):
+                         dot = T.max(T.cast(T.cast(acc[c,h],T.bfloat16),T.float32),0.)

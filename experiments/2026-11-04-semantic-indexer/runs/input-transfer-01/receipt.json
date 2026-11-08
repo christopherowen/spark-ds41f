@@ -1,0 +1,39 @@
+{
+  "source": "sp8",
+  "destination": "sp5",
+  "node_local_directory": "/home/chris/spark-lab/inputs/clustered-indexer",
+  "method": "tar pipe over SSH; no local tensor files",
+  "source_command": [
+    "ssh",
+    "-o",
+    "ConnectTimeout=12",
+    "sp8",
+    "python3 -c 'from pathlib import Path; import tarfile,sys; p=Path.home()/'\"'\"'spark-lab/inputs/clustered-indexer'\"'\"'; files=sorted(p.glob('\"'\"'rank-*.pt'\"'\"')); assert len(files)==12; t=tarfile.open(fileobj=sys.stdout.buffer,mode='\"'\"'w|'\"'\"'); [t.add(f,arcname=f.name) for f in files]; t.close()'"
+  ],
+  "destination_command": [
+    "ssh",
+    "-o",
+    "ConnectTimeout=12",
+    "sp5",
+    "mkdir -p ~/spark-lab/inputs && mkdir ~/spark-lab/inputs/clustered-indexer && tar -xf - -C ~/spark-lab/inputs/clustered-indexer"
+  ],
+  "exit": [
+    0,
+    0
+  ],
+  "sha256": {
+    "rank-0-dense-0.pt": "87175b2db9cd1011d44b857e183736c318d240c81043508cdf13ba20780b71e6",
+    "rank-0-dense-1.pt": "dea602f73ff59830db676332859245803545111f76fe2c6f053e90bd866f0209",
+    "rank-0-dense-2.pt": "65a17094cc0c20dde8ec7991ae56d1dbd38ad38a06f3d9fde4f472a4b3cb0743",
+    "rank-0-source-0.pt": "6416c2030bf4b285da0a3bd316475ad6694e8865318d9f119147b16fcb96fc93",
+    "rank-1-dense-0.pt": "e84bcb072920d283f6bf0bd7964c6437f7fe80152373441ed6a8414d4026b980",
+    "rank-1-dense-1.pt": "955f0dcb147060f5f33cc0eed2255d9c845cc4703459b429ad00833129c7f690",
+    "rank-1-dense-2.pt": "cf2091e8250c9341ec1cb0178d1f5bc3559a70c0626b57b8421bf5c4492b7eb4",
+    "rank-1-source-0.pt": "04febb490d072e2aa514b797de8c05b1e59c0ef7d064c638cebb36304b8cf65f",
+    "rank-2-dense-0.pt": "f9dd3e6bfb4d467f56fa303e43a68773737291c6677f425eccd5cf478ba73afa",
+    "rank-2-dense-1.pt": "a70838b5503169993a4e397f9e5aae66f2592f74136a4d00567d25e0716f71d2",
+    "rank-2-dense-2.pt": "10ea9b1784d9b7bcf9805272c12d7e6a28f7800137cb6d8c0ff695fffffaa4ab",
+    "rank-2-source-0.pt": "8c9d9eac9aa228c853bf6be2081f94f01a28a76dd5e5c331fd847639ab51a10e"
+  },
+  "identical": true
+}
