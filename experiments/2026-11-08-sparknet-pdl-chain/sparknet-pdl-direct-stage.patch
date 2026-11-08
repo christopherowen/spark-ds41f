@@ -1,0 +1,324 @@
+diff --git a/sparknet/integration/vllm/roce_all_reduce.py b/sparknet/integration/vllm/roce_all_reduce.py
+index dc88442..fa9d1bd 100644
+--- a/sparknet/integration/vllm/roce_all_reduce.py
++++ b/sparknet/integration/vllm/roce_all_reduce.py
+@@ -190,6 +190,18 @@ class SparknetOneShotAllReduce:
+     def should_custom_ar(self, inp: torch.Tensor) -> bool:
+         return not self.disabled and self._runtime.should_allreduce(inp)
+ 
++    def next_send_buffer(
++        self,
++        shape: Sequence[int],
++        dtype: torch.dtype,
++        *,
++        slot: int | None = None,
++    ) -> torch.Tensor | None:
++        """Zero-copy CUDA tensor view into the next collective's pinned send slot, or None when disabled."""
++        if self.disabled or self._runtime is None:
++            return None
++        return self._runtime.next_send_buffer(shape, dtype, slot=slot)
++
+     def custom_all_reduce(self, inp: torch.Tensor) -> torch.Tensor | None:
+         if not self.should_custom_ar(inp):
+             return None
+diff --git a/sparknet/oneshot/_allgather_tilelang.py b/sparknet/oneshot/_allgather_tilelang.py
+index 869298e..c849664 100644
+--- a/sparknet/oneshot/_allgather_tilelang.py
++++ b/sparknet/oneshot/_allgather_tilelang.py
+@@ -63,6 +63,7 @@ def _build(world_size: int, rank: int, threads: int, slots: int, flag_stride: in
+             with T.Kernel(grid_x, threads=threads) as bx:
+                 T.annotate_min_blocks_per_sm(resident)
+                 T.import_source(source)
++                T.pdl_sync()
+                 tx = T.get_thread_binding()
+                 epoch = T.alloc_var(T.uint32)
+                 epoch = T.call_extern("roce_ld_relaxed_gpu_u32", T.address_of(counters[0]), dtype=T.uint32)
+@@ -91,6 +92,7 @@ def _build(world_size: int, rank: int, threads: int, slots: int, flag_stride: in
+                                          T.call_extern("roce_ptr", region_base + T.cast(ctrl_off, T.int64), dtype="handle"), T.cast(nbytes, T.uint32), seq, dtype=T.uint32)
+                     if rang != T.uint32(0):
+                         T.call_extern("roce_st_release_gpu_u32", T.address_of(counters[rung_index]), seq, dtype="handle")
++                T.pdl_trigger()
+                 # 3. block 0 waits for every peer's payload-stripe flags, the other blocks for block 0
+                 T.call_extern("roce_wait_peers", bx, tx, T.call_extern("roce_ptr", region_base + T.cast(flag_off, T.int64), dtype="handle"), seq,
+                               T.call_extern("roce_ptr", region_base + T.cast(ctrl_off, T.int64), dtype="handle"),
+diff --git a/sparknet/oneshot/_device.py b/sparknet/oneshot/_device.py
+index 7ec8ec3..1e919fd 100644
+--- a/sparknet/oneshot/_device.py
++++ b/sparknet/oneshot/_device.py
+@@ -35,6 +35,7 @@ FUNCTIONS = (
+     "roce_wait_until_eq_acquire_sys",
+     "roce_trap",
+     "roce_ptr",
++    "roce_same_ptr",
+     "roce_copy_pack",
+     "roce_doorbell",
+     "roce_doorbell_exchange",
+@@ -76,6 +77,8 @@ struct roce_pack { roce_u32 w[4]; };
+ // takes only device tensors as buffer arguments); this turns it into a pointer.
+ __device__ __forceinline__ roce_byte *roce_ptr(long long address) { return (roce_byte *)(size_t)address; }
+ 
++__device__ __forceinline__ int roce_same_ptr(const void *a, const void *b) { return a == b; }
++
+ __device__ __forceinline__ roce_u32 roce_ld_relaxed_gpu_u32(const void *p) {
+     roce_u32 v;
+     asm volatile("ld.relaxed.gpu.global.u32 %0, [%1];" : "=r"(v) : "l"(p) : "memory");
+@@ -200,7 +203,9 @@ __device__ __forceinline__ void roce_st_global_pack(void *dst, roce_pack p) {
+ }
+ 
+ __device__ __forceinline__ void roce_copy_pack(const void *src, void *dst) {
+-    roce_st_global_pack(dst, roce_ld_global_pack(src));
++    if (src != dst) {
++        roce_st_global_pack(dst, roce_ld_global_pack(src));
++    }
+ }
+ 
+ // Conversions: round-to-nearest-even packing of the float32 sums.
+@@ -460,7 +465,9 @@ __device__ __forceinline__ void roce_stage_gather_pack(const void *input, void *
+                                                        void *output, int dst_stride_packs = 0) {
+     long long offset = (long long)copy_index * ROCE_PACK_BYTES;
+     roce_pack p = roce_ld_global_pack((const roce_byte *)input + offset);
+-    roce_st_global_pack((roce_byte *)send + offset, p);
++    if (input != send) {
++        roce_st_global_pack((roce_byte *)send + offset, p);
++    }
+     roce_st_global_pack(roce_gather_dest(output, copy_index, row_packs, ROCE_RANK, dst_stride_packs), p);
+ }
+ 
+diff --git a/sparknet/oneshot/_exchange_tilelang.py b/sparknet/oneshot/_exchange_tilelang.py
+index cc21259..9d1cd83 100644
+--- a/sparknet/oneshot/_exchange_tilelang.py
++++ b/sparknet/oneshot/_exchange_tilelang.py
+@@ -78,6 +78,7 @@ def _build(
+             with T.Kernel(grid_x, threads=threads) as bx:
+                 T.annotate_min_blocks_per_sm(resident)
+                 T.import_source(source)
++                T.pdl_sync()
+                 tx = T.get_thread_binding()
+                 epoch = T.alloc_var(T.uint32)
+                 epoch = T.call_extern(
+@@ -139,6 +140,7 @@ def _build(
+                             seq,
+                             dtype="handle",
+                         )
++                T.pdl_trigger()
+                 # 3. block 0 waits for every peer's payload-stripe flags, the other blocks for block 0
+                 T.call_extern(
+                     "roce_wait_peers",
+diff --git a/sparknet/oneshot/_oneshot_tilelang.py b/sparknet/oneshot/_oneshot_tilelang.py
+index 5c9bbbf..7796a19 100644
+--- a/sparknet/oneshot/_oneshot_tilelang.py
++++ b/sparknet/oneshot/_oneshot_tilelang.py
+@@ -107,6 +107,7 @@ def _build(dtype_name: str, world_size: int, rank: int, threads: int, slots: int
+             with T.Kernel(grid_x, threads=threads) as bx:
+                 T.annotate_min_blocks_per_sm(resident)
+                 T.import_source(source)
++                T.pdl_sync()
+                 tx = T.get_thread_binding()
+                 # Every block reads the epoch before any block can advance it:
+                 # the advance happens only after all blocks arrived at the tail.
+@@ -127,14 +128,17 @@ def _build(dtype_name: str, world_size: int, rank: int, threads: int, slots: int
+                         if tx == 0:
+                             T.call_extern("roce_trace_begin", trace_base, seq, T.cast(nbytes, T.uint32),
+                                           T.cast(grid_x, T.uint32), dtype="handle")
+-                # 1. stage the input into the pinned send slot
++                # 1. stage the input into the pinned send slot (skipped when inp already aliases send_slot)
+                 count = T.alloc_var(T.int32)
+                 count = T.max(0, (size_packs - index + stride - 1) // stride)
+-                for i in T.serial(count):
+-                    pack = index + i * stride
+-                    T.call_extern("roce_copy_pack", T.address_of(inp[pack * pack_words]),
+-                                  T.call_extern("roce_ptr", region_base + T.cast(send_slot + pack * PACK_BYTES, T.int64), dtype="handle"), dtype="handle")
+-                T.sync_threads()
++                if T.call_extern("roce_same_ptr", T.address_of(inp[0]),
++                                 T.call_extern("roce_ptr", region_base + T.cast(send_slot, T.int64), dtype="handle"),
++                                 dtype=T.int32) == 0:
++                    for i in T.serial(count):
++                        pack = index + i * stride
++                        T.call_extern("roce_copy_pack", T.address_of(inp[pack * pack_words]),
++                                      T.call_extern("roce_ptr", region_base + T.cast(send_slot + pack * PACK_BYTES, T.int64), dtype="handle"), dtype="handle")
++                    T.sync_threads()
+                 # 2. the last block to finish staging rings the proxy doorbell
+                 if tx == 0:
+                     rang = T.alloc_var(T.uint32)
+@@ -144,6 +148,7 @@ def _build(dtype_name: str, world_size: int, rank: int, threads: int, slots: int
+                         T.call_extern("roce_st_release_gpu_u32", T.address_of(counters[rung_index]), seq, dtype="handle")
+                         if traced:
+                             T.call_extern("roce_trace_stamp", trace_base, seq, w_doorbell, dtype="handle")
++                T.pdl_trigger()
+                 # 3. block 0 waits for every peer's payload-stripe flags, the other blocks for block 0
+                 if traced:
+                     T.call_extern("roce_wait_peers", bx, tx, T.call_extern("roce_ptr", region_base + T.cast(flag_off, T.int64), dtype="handle"), seq,
+diff --git a/sparknet/oneshot/_reducescatter_tilelang.py b/sparknet/oneshot/_reducescatter_tilelang.py
+index 78d6ca8..19f762a 100644
+--- a/sparknet/oneshot/_reducescatter_tilelang.py
++++ b/sparknet/oneshot/_reducescatter_tilelang.py
+@@ -83,6 +83,7 @@ def _build(
+             with T.Kernel(grid_x, threads=threads) as bx:
+                 T.annotate_min_blocks_per_sm(resident)
+                 T.import_source(source)
++                T.pdl_sync()
+                 tx = T.get_thread_binding()
+                 epoch = T.alloc_var(T.uint32)
+                 epoch = T.call_extern(
+@@ -139,6 +140,7 @@ def _build(
+                             seq,
+                             dtype="handle",
+                         )
++                T.pdl_trigger()
+                 # 3. block 0 waits for every peer's payload-stripe flags, the other blocks for block 0
+                 T.call_extern(
+                     "roce_wait_peers",
+diff --git a/sparknet/oneshot/runtime.py b/sparknet/oneshot/runtime.py
+index 1f13d4e..483f0a8 100644
+--- a/sparknet/oneshot/runtime.py
++++ b/sparknet/oneshot/runtime.py
+@@ -425,6 +425,18 @@ def _exchange(local: object, group: ProcessGroup) -> list[object]:
+     return gathered
+ 
+ 
++class _CudaSlotView:
++    """Zero-copy ``__cuda_array_interface__`` view over device-accessible pinned host memory."""
++
++    def __init__(self, ptr: int, nbytes: int) -> None:
++        self.__cuda_array_interface__ = {
++            "shape": (int(nbytes),),
++            "typestr": "|u1",
++            "data": (int(ptr), False),
++            "version": 3,
++        }
++
++
+ class RoceOneshotAllReduce:
+     """One-shot RDMA all-reduce over the DGX Spark 200 GbE fabric."""
+ 
+@@ -563,6 +575,15 @@ class RoceOneshotAllReduce:
+         self._flag_base = host_ptr + self._layout.flag_off
+         self._send_base = host_ptr + self._layout.send_off
+         self._ctrl_base = host_ptr + self._layout.ctrl_off
++        self._host_seq = 0
++        with torch.cuda.device(self.device):
++            self._send_dev = tuple(
++                torch.as_tensor(
++                    _CudaSlotView(self._send_base + slot * self._slot_bytes, self._slot_bytes),
++                    device=self.device,
++                )
++                for slot in range(self._layout.slots)
++            )
+         # ctrl record: seq, nbytes, error seq, missing peer, nbytes per slot
+         # (the proxy uses these when it has to catch up), the missing HCA,
+         # the wait timeout (host-written) and the time a timed-out wait waited.
+@@ -893,6 +914,7 @@ class RoceOneshotAllReduce:
+         stage_index, tail_index = self._counter_indices(grid_blocks)
+         inp_words = src if raw_words else self._words(src)
+         out_words = dst if raw_words else self._words(dst)
++        self._host_seq += 1
+         return Launch(
+             input=inp_words, output=out_words, size_packs=nbytes // PACK_BYTES, nbytes=nbytes,
+             region=self._region, recv_off=self._layout.recv_off, flag_off=self._layout.flag_off,
+@@ -982,6 +1004,33 @@ class RoceOneshotAllReduce:
+ 
+     # -- execution ----------------------------------------------------------------
+ 
++    def next_send_buffer(
++        self,
++        shape: Sequence[int],
++        dtype: torch.dtype,
++        *,
++        slot: Optional[int] = None,
++    ) -> torch.Tensor:
++        """Return a zero-copy CUDA tensor view into the pinned send slot of the next collective launch."""
++        if self._closed or self._proxy is None:
++            raise RuntimeError("RoCE runtime is closed")
++        shape_tuple = tuple(int(d) for d in shape)
++        numel = 1
++        for d in shape_tuple:
++            numel *= d
++        elem_size = torch.tensor([], dtype=dtype).element_size()
++        nbytes = numel * elem_size
++        if nbytes <= 0 or nbytes > self._slot_bytes or nbytes % PACK_BYTES != 0:
++            raise ValueError(
++                f"send buffer size {nbytes} bytes must be a positive multiple of {PACK_BYTES} within {self._slot_bytes}"
++            )
++        target_slot = (
++            ((self._host_seq + 1) % self._layout.slots)
++            if slot is None
++            else (int(slot) % self._layout.slots)
++        )
++        return self._send_dev[target_slot][:nbytes].view(dtype).view(shape_tuple)
++
+     def all_reduce(
+         self,
+         inp: torch.Tensor,
+diff --git a/tests/gpu/test_oneshot_gpu.py b/tests/gpu/test_oneshot_gpu.py
+index 69f1961..9be9d89 100644
+--- a/tests/gpu/test_oneshot_gpu.py
++++ b/tests/gpu/test_oneshot_gpu.py
+@@ -755,4 +755,32 @@ def test_sliced_all_gather_exceeding_slot_capacity(runtime):
+         assert torch.equal(out, expected)
+ 
+ 
++def test_direct_send_buffer_zero_copy_all_reduce_and_all_gather(runtime):
++    """Producer writing directly into ``next_send_buffer`` skips the Phase 1 staging copy."""
++    world = dist.get_world_size()
++    rank = dist.get_rank()
++    rtol, atol = _tolerance(torch.bfloat16, world)
++    for step in range(4):
++        torch.manual_seed(6060 + 17 * step + rank)
++        ref = torch.randn(16, 5120, dtype=torch.bfloat16, device=runtime.device)
++        expected = ref.clone()
++        dist.all_reduce(expected)
++        direct_in = runtime.next_send_buffer(ref.shape, ref.dtype)
++        direct_in.copy_(ref)
++        out = runtime.all_reduce(direct_in)
++        torch.cuda.synchronize()
++        runtime.check_health()
++        torch.testing.assert_close(out, expected, rtol=rtol, atol=atol)
++
++        g_ref = torch.randn(16, 1280, dtype=torch.bfloat16, device=runtime.device)
++        parts = [torch.empty_like(g_ref) for _ in range(world)]
++        dist.all_gather(parts, g_ref)
++        g_expected = torch.cat(parts, dim=-1)
++        g_direct = runtime.next_send_buffer(g_ref.shape, g_ref.dtype)
++        g_direct.copy_(g_ref)
++        g_out = runtime.all_gather(g_direct, dim=-1)
++        torch.cuda.synchronize()
++        runtime.check_health()
++        assert torch.equal(g_out, g_expected)
++    dist.barrier()
+ 
+diff --git a/tests/test_oneshot_cpu.py b/tests/test_oneshot_cpu.py
+index cdc85a9..b6b59bf 100644
+--- a/tests/test_oneshot_cpu.py
++++ b/tests/test_oneshot_cpu.py
+@@ -128,6 +128,31 @@ class KernelFamilyTest(unittest.TestCase):
+             self.assertIn("T.annotate_min_blocks_per_sm(resident)", text, module_name)
+             self.assertIn("_resident_blocks(threads)", text, module_name)
+ 
++    def test_tilelang_kernels_emit_pdl_sync_and_trigger(self):
++        for module_name in ("_oneshot_tilelang.py", "_allgather_tilelang.py", "_reducescatter_tilelang.py", "_exchange_tilelang.py"):
++            text = (ROCE / module_name).read_text()
++            sync_pos = text.find("T.pdl_sync()")
++            trigger_pos = text.find("T.pdl_trigger()")
++            first_addr = text.find("T.address_of(")
++            doorbell_pos = text.find("roce_doorbell")
++            wait_pos = text.find("roce_wait_peers")
++            self.assertGreater(sync_pos, 0, module_name)
++            self.assertGreater(first_addr, sync_pos, module_name)
++            self.assertGreater(trigger_pos, doorbell_pos, module_name)
++            self.assertLess(trigger_pos, wait_pos, module_name)
++
++    def test_direct_send_slot_guard(self):
++        device = (ROCE / "_device.py").read_text()
++        self.assertIn("if (src != dst)", device)
++        self.assertIn("if (input != send)", device)
++        self.assertIn("roce_same_ptr(const void *a, const void *b)", device)
++        oneshot = (ROCE / "_oneshot_tilelang.py").read_text()
++        self.assertIn('"roce_same_ptr"', oneshot)
++        runtime = (ROCE / "runtime.py").read_text()
++        self.assertIn("def next_send_buffer(", runtime)
++        adapter = (ROOT / "sparknet" / "integration" / "vllm" / "roce_all_reduce.py").read_text()
++        self.assertIn("def next_send_buffer(", adapter)
++
+     def test_runtime_routes_launchers_to_the_tilelang_kernels(self):
+         runtime = (ROCE / "runtime.py").read_text()
+         self.assertIn("reduce_launcher(*self._launcher_key(dtype))", runtime)
