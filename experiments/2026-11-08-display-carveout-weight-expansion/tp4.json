@@ -1,0 +1,332 @@
+{
+  "experiment": "2026-11-08-display-carveout-weight-expansion",
+  "base_commit": "cc20ed18be1f7cbf5c6c53cdee945f7cc77d5fc5",
+  "base_release": "spark-ds41f-1107",
+  "base_vllm_patch_head": "320021e3c4dbb202d911ab70e2cd924c75420488",
+  "candidate_patch": "experiments/2026-11-08-display-carveout-weight-expansion/vllm/0762-perf-worker-compact-packed-vocab-tables-and-expand-d.patch",
+  "node": "sp3 (spark-0011, NVIDIA GB10)",
+  "image": "spark-ds41f:1107 (sha256:3f32a962ce04)",
+  "intended_variable": "Compact 12-bit packed embed_tokens and lm_head dumb buffers in place and expand SPARK_DS41F_DISPLAY_CARVEOUT_WEIGHTS=1 to hold DSpark markov_w1.weight and decode-only DSpark routed-expert w13_weight/w2_weight slabs up to _MAX_TOTAL_BYTES = 1,968 MiB.",
+  "unit_tests": {
+    "command": "pytest tests/v1/worker/test_display_carveout.py tests/models/test_dspark_mla.py tests/model_executor/model_loader/test_direct_loader.py tests/v1/worker/test_gpu_model_runner_v2.py tests/kernels/test_deepseek_v41_tilelang_embedding.py",
+    "passed": 234,
+    "failed": 0
+  },
+  "rejected_prefill_dense_candidates_screen": {
+    "engram_wkv_M_4096_us": {
+      "regular": 2398.79,
+      "carveout": 7436.7,
+      "ratio": 3.1002
+    },
+    "dspark_main_proj_M_4096_us": {
+      "regular": 1565.18,
+      "carveout": 4409.75,
+      "ratio": 2.8174
+    },
+    "shared_gate_up_M_4096_us": {
+      "regular": 1352.0,
+      "carveout": 3741.89,
+      "ratio": 2.7677
+    },
+    "shared_down_M_4096_us": {
+      "regular": 681.55,
+      "carveout": 2033.36,
+      "ratio": 2.9834
+    },
+    "reason": "Prefill-active dense GEMMs re-read weight tiles across 32 M-tiles at M=4096; uncached display carve-out mappings bypass L2 reuse and regress prefill 2.8x-3.1x. Only weights that never run prefill and are read at most once per decode/draft step (markov_w1 and decode-only DSpark routed-expert slabs) qualify."
+  },
+  "shape": "tp4-ring",
+  "tp_size": 4,
+  "streamed_weights_in_carveout": [
+    {
+      "name": "model.language_model.embed_tokens.weight",
+      "weight_mib": 236.71875,
+      "buffer_mib": 240
+    },
+    {
+      "name": "model.language_model.lm_head.weight",
+      "weight_mib": 236.71875,
+      "buffer_mib": 240
+    },
+    {
+      "name": "model.markov_head.markov_w1.weight",
+      "weight_mib": 63.125,
+      "buffer_mib": 64
+    },
+    {
+      "name": "model.layers.0.ffn.experts.w13_weight",
+      "weight_mib": 360.0,
+      "buffer_mib": 368
+    },
+    {
+      "name": "model.layers.0.ffn.experts.w2_weight",
+      "weight_mib": 160.0,
+      "buffer_mib": 160
+    },
+    {
+      "name": "model.layers.1.ffn.experts.w13_weight",
+      "weight_mib": 360.0,
+      "buffer_mib": 368
+    },
+    {
+      "name": "model.layers.1.ffn.experts.w2_weight",
+      "weight_mib": 160.0,
+      "buffer_mib": 160
+    },
+    {
+      "name": "model.layers.2.ffn.experts.w13_weight",
+      "weight_mib": 360.0,
+      "buffer_mib": 368
+    }
+  ],
+  "boot_1": {
+    "shape": "tp4-ring",
+    "tp_size": 4,
+    "baseline": {
+      "carveout_buffers_mib": [
+        320,
+        320
+      ],
+      "carveout_total_mib": 640,
+      "carveout_weight_mib": 473.438,
+      "uma_mem_available_used_mib": 1830.12,
+      "uma_cuda_free_used_mib": 1830.12,
+      "cuda_allocated_mib": 1712.17,
+      "cuda_reserved_mib": 1788.0,
+      "cuda_peak_reserved_mib": 2308.0
+    },
+    "candidate": {
+      "carveout_buffers_mib": [
+        240,
+        240,
+        64,
+        368,
+        160,
+        368,
+        160,
+        368
+      ],
+      "carveout_total_mib": 1968,
+      "carveout_weight_mib": 1936.562,
+      "uma_mem_available_used_mib": 361.18,
+      "uma_cuda_free_used_mib": 361.18,
+      "cuda_allocated_mib": 248.799,
+      "cuda_reserved_mib": 306.0,
+      "cuda_peak_reserved_mib": 1146.0
+    },
+    "savings": {
+      "additional_carveout_buffers_mib": 1328,
+      "additional_carveout_weight_mib": 1463.125,
+      "uma_mem_available_saved_mib": 1468.93,
+      "uma_cuda_free_saved_mib": 1468.93,
+      "cuda_allocated_saved_mib": 1463.371,
+      "cuda_reserved_saved_mib": 1482.0,
+      "cuda_peak_reserved_saved_mib": 1162.0
+    },
+    "kernels": {
+      "markov_anchor_embed_reqs_1": {
+        "regular_us": 9.86,
+        "carveout_us": 9.95,
+        "delta_us": 0.09,
+        "ratio": 1.0091,
+        "bit_identical": true
+      },
+      "markov_anchor_embed_reqs_3": {
+        "regular_us": 11.94,
+        "carveout_us": 12.42,
+        "delta_us": 0.48,
+        "ratio": 1.0402,
+        "bit_identical": true
+      },
+      "markov_anchor_embed_reqs_8": {
+        "regular_us": 9.7,
+        "carveout_us": 9.73,
+        "delta_us": 0.03,
+        "ratio": 1.0031,
+        "bit_identical": true
+      },
+      "dspark_moe_M_5": {
+        "regular_us": 297.22,
+        "carveout_us": 251.1,
+        "delta_us": -46.12,
+        "ratio": 0.8448,
+        "bit_identical": true
+      },
+      "dspark_moe_M_15": {
+        "regular_us": 859.01,
+        "carveout_us": 732.06,
+        "delta_us": -126.95,
+        "ratio": 0.8522,
+        "bit_identical": true
+      },
+      "dspark_moe_M_40": {
+        "regular_us": 2274.56,
+        "carveout_us": 2101.25,
+        "delta_us": -173.31,
+        "ratio": 0.9238,
+        "bit_identical": true
+      },
+      "vocab_embedding_packed_M_1": {
+        "regular_us": 10.3,
+        "carveout_us": 13.44,
+        "delta_us": 3.14,
+        "ratio": 1.3049,
+        "bit_identical": true
+      },
+      "vocab_embedding_packed_M_5": {
+        "regular_us": 10.56,
+        "carveout_us": 9.82,
+        "delta_us": -0.74,
+        "ratio": 0.9299,
+        "bit_identical": true
+      },
+      "vocab_embedding_packed_M_40": {
+        "regular_us": 10.4,
+        "carveout_us": 10.46,
+        "delta_us": 0.06,
+        "ratio": 1.0058,
+        "bit_identical": true
+      },
+      "vocab_embedding_packed_M_4096": {
+        "regular_us": 238.82,
+        "carveout_us": 239.68,
+        "delta_us": 0.86,
+        "ratio": 1.0036,
+        "bit_identical": true
+      }
+    }
+  },
+  "boot_2": {
+    "shape": "tp4-ring",
+    "tp_size": 4,
+    "baseline": {
+      "carveout_buffers_mib": [
+        320,
+        320
+      ],
+      "carveout_total_mib": 640,
+      "carveout_weight_mib": 473.438,
+      "uma_mem_available_used_mib": 1838.53,
+      "uma_cuda_free_used_mib": 1838.53,
+      "cuda_allocated_mib": 1712.416,
+      "cuda_reserved_mib": 1788.0,
+      "cuda_peak_reserved_mib": 2308.0
+    },
+    "candidate": {
+      "carveout_buffers_mib": [
+        240,
+        240,
+        64,
+        368,
+        160,
+        368,
+        160,
+        368
+      ],
+      "carveout_total_mib": 1968,
+      "carveout_weight_mib": 1936.562,
+      "uma_mem_available_used_mib": 366.04,
+      "uma_cuda_free_used_mib": 366.27,
+      "cuda_allocated_mib": 249.538,
+      "cuda_reserved_mib": 308.0,
+      "cuda_peak_reserved_mib": 1148.0
+    },
+    "savings": {
+      "additional_carveout_buffers_mib": 1328,
+      "additional_carveout_weight_mib": 1463.125,
+      "uma_mem_available_saved_mib": 1472.48,
+      "uma_cuda_free_saved_mib": 1472.25,
+      "cuda_allocated_saved_mib": 1462.878,
+      "cuda_reserved_saved_mib": 1480.0,
+      "cuda_peak_reserved_saved_mib": 1160.0
+    },
+    "kernels": {
+      "markov_anchor_embed_reqs_1": {
+        "regular_us": 9.92,
+        "carveout_us": 9.98,
+        "delta_us": 0.06,
+        "ratio": 1.006,
+        "bit_identical": true
+      },
+      "markov_anchor_embed_reqs_3": {
+        "regular_us": 11.65,
+        "carveout_us": 9.95,
+        "delta_us": -1.7,
+        "ratio": 0.8541,
+        "bit_identical": true
+      },
+      "markov_anchor_embed_reqs_8": {
+        "regular_us": 12.1,
+        "carveout_us": 9.92,
+        "delta_us": -2.18,
+        "ratio": 0.8198,
+        "bit_identical": true
+      },
+      "dspark_moe_M_5": {
+        "regular_us": 297.06,
+        "carveout_us": 253.09,
+        "delta_us": -43.97,
+        "ratio": 0.852,
+        "bit_identical": true
+      },
+      "dspark_moe_M_15": {
+        "regular_us": 864.26,
+        "carveout_us": 740.45,
+        "delta_us": -123.81,
+        "ratio": 0.8567,
+        "bit_identical": true
+      },
+      "dspark_moe_M_40": {
+        "regular_us": 2291.97,
+        "carveout_us": 2104.38,
+        "delta_us": -187.59,
+        "ratio": 0.9182,
+        "bit_identical": true
+      },
+      "vocab_embedding_packed_M_1": {
+        "regular_us": 10.56,
+        "carveout_us": 10.37,
+        "delta_us": -0.19,
+        "ratio": 0.982,
+        "bit_identical": true
+      },
+      "vocab_embedding_packed_M_5": {
+        "regular_us": 10.43,
+        "carveout_us": 10.53,
+        "delta_us": 0.1,
+        "ratio": 1.0096,
+        "bit_identical": true
+      },
+      "vocab_embedding_packed_M_40": {
+        "regular_us": 14.24,
+        "carveout_us": 10.72,
+        "delta_us": -3.52,
+        "ratio": 0.7528,
+        "bit_identical": true
+      },
+      "vocab_embedding_packed_M_4096": {
+        "regular_us": 237.76,
+        "carveout_us": 235.71,
+        "delta_us": -2.05,
+        "ratio": 0.9914,
+        "bit_identical": true
+      }
+    }
+  },
+  "summary": {
+    "baseline_carveout_buffers_mib": 640,
+    "candidate_carveout_buffers_mib": 1968,
+    "baseline_carveout_weight_mib": 473.438,
+    "candidate_carveout_weight_mib": 1936.562,
+    "additional_carveout_weight_mib": 1463.125,
+    "cuda_allocated_saved_mib_mean": 1463.124,
+    "cuda_reserved_saved_mib_mean": 1481.0,
+    "cuda_peak_reserved_saved_mib_mean": 1161.0,
+    "uma_mem_available_saved_mib_mean": 1470.7,
+    "dspark_moe_M_5_ratio_mean": 0.8484,
+    "dspark_moe_M_15_ratio_mean": 0.8544,
+    "dspark_moe_M_40_ratio_mean": 0.921,
+    "prefill_step_impact_us": 0.0,
+    "all_outputs_bit_identical": true
+  }
+}
