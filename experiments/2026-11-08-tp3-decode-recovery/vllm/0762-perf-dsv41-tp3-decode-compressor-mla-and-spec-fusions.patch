@@ -1,0 +1,1151 @@
+From a32ae4512616acee8d964d976e6fbc646e08b72f Mon Sep 17 00:00:00 2001
+From: Christopher Owen <3221756+christopherowen@users.noreply.github.com>
+Date: Sun, 8 Nov 2026 11:30:00 +0100
+Subject: [PATCH] perf(dsv41): TP3/TP4 decode compressor, sparse MLA, and
+ spec-decode fusions
+
+Upstream base: 1107 vLLM patch head 320021e3c4dbb202d911ab70e2cd924c75420488.
+
+Rationale:
+1. DeepseekCompressor sharded and 12-bit packed fused_wkv_wgate across TP=3 and TP=4 (30 MiB total across the 4 compressor layers), adding 4 RoCE all-gathers and 4 column-gather launches per step plus L2-resident 12-bit unpack overhead over the COMP L2 prefetch window. Replicate fused_wkv_wgate in uncompressed BF16 for tp_size <= 4 (pack_bf16 = not disable_tp) while retaining sharded 12-bit packing above TP=4.
+2. In sparse_mla_fwd_v41 decode_body, Stage 2 guarded the 5 scalar online-softmax lines inside the unrolled segment loop with seg_active(c, SwaLengths, IdxLengths, rc), preventing full unrolling across segments. Write the (-inf, 0.0) online-softmax identity in Stage 1 for inactive segments and execute the scalar online-softmax update unconditionally in Stage 2 (guarding only the D=512 vector FMA loop with PartialStats[rc, c, hc, 1] > 0).
+3. GPUModelRunner.execute_model ran 5 eager PyTorch ops per decode step to filter dead_row_cut, sink_events, and copy_drafter.int_state before OnlineAcceptanceEstimator.step, and called adaptive_verification.get_verified_draft_counts twice per step. Fuse dead-row clamping, sink-rejection zeroing, and CopyDrafter slot masking directly into _accumulate_kernel (and _step_cpu) and reuse num_verified_draft_tokens.
+4. DSparkSpeculator launched dspark_confidence_kernel followed by _calibrate_confidence_kernel on every draft step, lazily allocated _tilelang_vocab_bias_scratch on markov_w2, and execute_model(dummy_run=True) overwrote active num_reqs with batch_desc.num_reqs (inflating DSpark drafting on 4x24 from 4 to 8 requests). Add fused dspark_confidence_calibrate_kernel / TileLangConfidenceHead.probability_and_calibrate, preallocate _tilelang_vocab_bias_scratch in process_weights_after_loading, and preserve active num_reqs alongside num_reqs_after_padding in InputBatch.make_dummy.
+5. On TP=3 each rank executes a wider MoE intermediate (768 vs 576) and 24 MLA heads (2 head tiles vs 1), increasing marginal verification row cost above the 16-row MMA knee. Use topology-aware HIGH_ROW_COST_SCALE_TP3 = 0.85 and MIN_CALIBRATED_DEAD_ROWS_TAU_TP3 = 0.12 when tp_size == 3.
+
+Quality implications:
+- Compressor BF16 projection matches TP=1 bit-for-bit across all row counts.
+- Sparse MLA Stage-1/Stage-2 online-softmax identity (-inf, 0.0) produces bit-identical outputs to the branched seg_active guard.
+- Fused _accumulate_kernel and dspark_confidence_calibrate_kernel match the unfused paths within FP32 rounding.
+
+Tests:
+- pytest tests/models/test_deepseek_v4_1_compressor.py tests/kernels/test_deepseek_v41_tilelang_confidence.py tests/v1/spec_decode/test_acceptance_estimator.py tests/v1/spec_decode/test_adaptive_verification.py tests/kernels/attention/test_deepseek_v41_tilelang.py
+
+Upstream status: local DeepSeek-V4.1 SM121 TP=3/TP=4 decode optimization.
+---
+ .../test_deepseek_v41_tilelang_confidence.py  |  63 +++++-
+ tests/models/test_deepseek_v4_1_compressor.py |  28 ++-
+ .../spec_decode/test_acceptance_estimator.py  |  55 +++++
+ .../spec_decode/test_adaptive_verification.py |  11 +
+ vllm/models/deepseek_v4_1/compressor.py       |   6 +-
+ vllm/models/deepseek_v4_1/nvidia/dspark.py    |  49 +++-
+ .../deepseek_v4_1/tilelang/confidence.py      | 212 +++++++++++++++++-
+ vllm/models/deepseek_v4_1/tilelang/linear.py  |   5 +-
+ .../deepseek_v4_1/tilelang/sparse_mla.py      |  17 +-
+ vllm/v1/worker/gpu/input_batch.py             |  33 ++-
+ vllm/v1/worker/gpu/model_runner.py            |  66 +++---
+ .../gpu/spec_decode/acceptance_estimator.py   |  69 +++++-
+ .../gpu/spec_decode/adaptive_verification.py  |  28 ++-
+ .../gpu/spec_decode/dspark/speculator.py      |  78 ++++---
+ vllm/v1/worker/gpu/spec_decode/speculator.py  |  13 +-
+ 15 files changed, 625 insertions(+), 108 deletions(-)
+
+diff --git a/tests/kernels/test_deepseek_v41_tilelang_confidence.py b/tests/kernels/test_deepseek_v41_tilelang_confidence.py
+index 05d1bec60..8f2d3a7d6 100644
+--- a/tests/kernels/test_deepseek_v41_tilelang_confidence.py
++++ b/tests/kernels/test_deepseek_v41_tilelang_confidence.py
+@@ -212,4 +212,65 @@ def test_declared_as_the_head_calls_it():
+     with registry.activate():
+         confidence.declare(HIDDEN, RANK)
+     calls = list(prepare.declared_calls(registry))
+-    assert calls == [(confidence.dspark_confidence_kernel, (HIDDEN, RANK), {})]
++    assert calls == [
++        (confidence.dspark_confidence_kernel, (HIDDEN, RANK), {}),
++        (confidence.dspark_confidence_calibrate_kernel, (HIDDEN, RANK, 5), {}),
++    ]
++
++
++@pytest.mark.parametrize("num_reqs", [1, 4, 8])
++def test_fused_confidence_calibration_matches_two_step_estimator(num_reqs):
++    """Fused ``probability_and_calibrate`` matches two-step ``probability`` plus
++    ``OnlineAcceptanceEstimator.calibrate_confidence_probs`` bit for bit."""
++    from vllm.v1.worker.gpu.spec_decode.acceptance_estimator import (
++        OnlineAcceptanceEstimator,
++    )
++
++    steps = 5
++    rows = num_reqs * steps
++    hidden, markov, weight = _inputs(rows, seed=31 + num_reqs)
++    head = confidence.TileLangConfidenceHead.__new__(confidence.TileLangConfidenceHead)
++    torch.nn.Module.__init__(head)
++    head.proj = SimpleNamespace(weight=weight.view(1, -1))
++    head.hidden_size, head.markov_rank = HIDDEN, RANK
++
++    est_ref = OnlineAcceptanceEstimator.for_confidence_head(16, steps, torch.device("cuda"))
++    est_fused = OnlineAcceptanceEstimator.for_confidence_head(
++        16, steps, torch.device("cuda")
++    )
++    est_ref.slope.fill_(1.35)
++    est_fused.slope.fill_(1.35)
++    intercepts = torch.tensor(
++        [0.15, -0.25, -0.85, -1.10, -0.55], dtype=torch.float32, device="cuda"
++    )
++    est_ref.intercepts.copy_(intercepts)
++    est_fused.intercepts.copy_(intercepts)
++
++    slots = torch.tensor(
++        [3, -1, 7, 1, 0, -1, 12, 5][:num_reqs], dtype=torch.int32, device="cuda"
++    )
++    idx_mapping = slots.repeat_interleave(steps).contiguous()
++
++    out_ref = torch.empty((num_reqs, steps), dtype=torch.float32, device="cuda")
++    head.probability(hidden, markov, out=out_ref.view(-1))
++    est_ref.calibrate_confidence_probs(out_ref, idx_mapping)
++
++    out_fused = torch.empty((num_reqs, steps), dtype=torch.float32, device="cuda")
++    head.probability_and_calibrate(
++        hidden,
++        markov,
++        out_fused.view(-1),
++        est_fused.slope,
++        est_fused.intercepts,
++        idx_mapping,
++        est_fused.features,
++        est_fused.predictions,
++    )
++
++    torch.testing.assert_close(out_fused, out_ref, atol=1e-6, rtol=1e-6)
++    torch.testing.assert_close(
++        est_fused.features, est_ref.features, atol=1e-5, rtol=1e-5
++    )
++    torch.testing.assert_close(
++        est_fused.predictions, est_ref.predictions, atol=1e-6, rtol=1e-6
++    )
+diff --git a/tests/models/test_deepseek_v4_1_compressor.py b/tests/models/test_deepseek_v4_1_compressor.py
+index 5fabb558c..fd512227b 100644
+--- a/tests/models/test_deepseek_v4_1_compressor.py
++++ b/tests/models/test_deepseek_v4_1_compressor.py
+@@ -533,11 +533,8 @@ def test_compressor_tp_sharded_fused_wkv_wgate_matches_tp1(monkeypatch, ratio):
+ 
+         tp1 = build_rank(0, 1)
+         assert tp1.fused_wkv_wgate.tp_size == 1
+-        assert hasattr(tp1.fused_wkv_wgate, "packed_bf16_exponent_base")
+-        assert tp1.fused_wkv_wgate.weight.shape == (
+-            512 * ratio,
+-            hidden + hidden // 2,
+-        )
++        assert not hasattr(tp1.fused_wkv_wgate, "packed_bf16_exponent_base")
++        assert tp1.fused_wkv_wgate.weight.shape == (512 * ratio, hidden)
+         assert unpack_bf16_layer(tp1.fused_wkv_wgate).shape == (512 * ratio, hidden)
+ 
+         x = torch.randn(
+@@ -555,7 +552,26 @@ def test_compressor_tp_sharded_fused_wkv_wgate_matches_tp1(monkeypatch, ratio):
+         from vllm.models.deepseek_v4_1.compressor import _compressor_part_cols
+         from vllm.models.deepseek_v4_1.tilelang.linear import project_parts
+ 
+-        for tp_size in (2, 3, 4, 5, 6, 7, 8):
++        for tp_size in (2, 3, 4):
++            ranks = [build_rank(r, tp_size) for r in range(tp_size)]
++            for comp in ranks:
++                assert comp.fused_wkv_wgate.tp_size == 1
++                assert not hasattr(comp.fused_wkv_wgate, "packed_bf16_exponent_base")
++                assert comp.fused_wkv_wgate.weight.shape == (512 * ratio, hidden)
++            for rows in (1, 7, 16, 64, 160):
++                inp = x[:rows]
++                ref_values, ref_gates = expected_by_rows[rows]
++                ranks[0]._project(inp)
++                assert torch.equal(
++                    ranks[0]._values[:rows], ref_values
++                ), f"tp={tp_size} rows={rows}"
++                if ratio == 2:
++                    assert torch.equal(
++                        ranks[0]._gates[:rows], ref_gates
++                    ), f"tp={tp_size} rows={rows}"
++                assert not ranks[0].fused_wkv_wgate.tilelang_counters.any()
++
++        for tp_size in (5, 6, 7, 8):
+             part_cols = _compressor_part_cols(tp_size)
+             ranks = [build_rank(r, tp_size) for r in range(tp_size)]
+             for r, comp in enumerate(ranks):
+diff --git a/tests/v1/spec_decode/test_acceptance_estimator.py b/tests/v1/spec_decode/test_acceptance_estimator.py
+index ded920654..7a51941cd 100644
+--- a/tests/v1/spec_decode/test_acceptance_estimator.py
++++ b/tests/v1/spec_decode/test_acceptance_estimator.py
+@@ -478,3 +478,58 @@ def test_confidence_head_online_irls_reduces_survival_mae():
+     assert raw_mae > 0.15
+     assert cal_mae < 0.03
+     assert calibrated_survival[3].item() < 0.11
++
++
++@pytest.mark.parametrize("device", [torch.device("cpu"), torch.device("cuda")])
++def test_step_fuses_dead_row_cut_sink_events_and_copy_state_filtering(device):
++    """Fused ``step`` filtering for dead-row cut, sink rejection, and CopyDrafter
++    slots matches explicit host/tensor pre-filtering on both CPU and CUDA."""
++    num_reqs = 4
++    est_fused = OnlineAcceptanceEstimator.for_confidence_head(8, NUM_STEPS, device)
++    est_ref = OnlineAcceptanceEstimator.for_confidence_head(8, NUM_STEPS, device)
++
++    feats = torch.tensor(
++        [
++            [1.2, 0.8, 0.4, -0.2],
++            [0.9, 0.5, 0.1, -0.5],
++            [1.5, 1.1, 0.7, 0.3],
++            [0.6, 0.2, -0.3, -0.8],
++        ],
++        dtype=torch.float32,
++        device=device,
++    )
++    preds = torch.sigmoid(feats)
++    for est in (est_fused, est_ref):
++        est.features[:num_reqs].copy_(feats)
++        est.predictions[:num_reqs].copy_(preds)
++
++    idx_mapping = torch.tensor([0, 1, 2, 3], dtype=torch.int32, device=device)
++    num_sampled = torch.tensor([2, 1, 3, 2], dtype=torch.int32, device=device)
++    num_rejected = torch.tensor([3, 4, 2, 3], dtype=torch.int32, device=device)
++    dead_row_cut = torch.tensor([2, 3, 3, 4], dtype=torch.int32, device=device)
++    # Req 1 had sink outcome REJECTED (code 2); Req 2 came from CopyDrafter (col 1 > 0)
++    sink_events = torch.tensor(
++        [[0, 0], [2, 0], [0, 0], [1, 0]], dtype=torch.int32, device=device
++    )
++    copy_int_state = torch.zeros((8, 4), dtype=torch.int32, device=device)
++    copy_int_state[2, 1] = 1
++
++    est_fused.step(
++        idx_mapping,
++        num_sampled,
++        num_rejected,
++        dead_row_cut=dead_row_cut,
++        sink_events=sink_events,
++        copy_int_state=copy_int_state,
++    )
++
++    ref_accepted = (num_sampled - 1).clamp_min(0)
++    ref_live_rejected = (dead_row_cut - ref_accepted).clamp_min(0)
++    ref_rejected = torch.minimum(num_rejected, ref_live_rejected)
++    ref_rejected = ref_rejected.masked_fill(sink_events[:, 0] == 2, 0)
++    ref_idx = torch.where(copy_int_state[idx_mapping, 1] > 0, -1, idx_mapping)
++    est_ref.step(ref_idx, num_sampled, ref_rejected)
++
++    torch.testing.assert_close(est_fused.info, est_ref.info)
++    torch.testing.assert_close(est_fused.grad, est_ref.grad)
++    torch.testing.assert_close(est_fused.counts, est_ref.counts)
+diff --git a/tests/v1/spec_decode/test_adaptive_verification.py b/tests/v1/spec_decode/test_adaptive_verification.py
+index d9062785b..842ae46e0 100644
+--- a/tests/v1/spec_decode/test_adaptive_verification.py
++++ b/tests/v1/spec_decode/test_adaptive_verification.py
+@@ -947,3 +947,14 @@ def test_high_concurrency_row_cost_knee_admits_coalesced_drafts():
+     _, _, knee_budget = manager._batch_budget
+     assert knee_budget == 32
+     assert total == 40
++
++    # On TP3 (scale=0.85, calibrated survival floor=0.12), c8 trims to 24 draft
++    # rows (total 32 rows) and c1 prunes position 3 (survival 0.0686 < 0.12).
++    manager.high_row_cost_scale = 0.85
++    manager.min_calibrated_dead_rows_tau = 0.12
++    manager.calibrated_confidence = True
++    assert np.isclose(manager.effective_dead_rows_tau(), 0.12)
++    total_tp3 = manager.get_num_tokens(num_tokens_per_req, draft_tokens)
++    _, _, tp3_budget = manager._batch_budget
++    assert tp3_budget == 24
++    assert total_tp3 == 32
+diff --git a/vllm/models/deepseek_v4_1/compressor.py b/vllm/models/deepseek_v4_1/compressor.py
+index 65831409b..d784645d3 100644
+--- a/vllm/models/deepseek_v4_1/compressor.py
++++ b/vllm/models/deepseek_v4_1/compressor.py
+@@ -220,7 +220,10 @@ class DeepseekCompressor(nn.Module):
+         tp_size = linear_layers.get_tensor_model_parallel_world_size()
+         self._sp_enabled = compress_ratio == 1 and tp_size > 1
+         self._sp_weight = self._sp_kernel = None
+-        disable_tp = tp_size <= 1
++        # Replicate the 4 compressor layers (30 MiB total across the model) in
++        # uncompressed BF16 up through TP4 so decode avoids 4 RoCE all-gathers,
++        # 4 column-gather launches, and L2-resident 12-bit unpack overhead.
++        disable_tp = tp_size <= 4
+         self.fused_wkv_wgate = _PaddedSplitColumnParallelLinear(
+             hidden_size,
+             compress_ratio,
+@@ -235,6 +238,7 @@ class DeepseekCompressor(nn.Module):
+         from vllm.models.deepseek_v4_1.tilelang.linear import TileLangSplitLinearMethod
+ 
+         # wkv and wgate (ratio 2) each project into their own buffer.
++        self.fused_wkv_wgate.pack_bf16 = not disable_tp
+         self.fused_wkv_wgate.quant_method = TileLangSplitLinearMethod(compress_ratio)
+         self.fused_wkv_wgate.out_dtype = (
+             torch.float32 if compress_ratio == 2 else torch.bfloat16
+diff --git a/vllm/models/deepseek_v4_1/nvidia/dspark.py b/vllm/models/deepseek_v4_1/nvidia/dspark.py
+index 7ac9d3e93..d8cbd493a 100644
+--- a/vllm/models/deepseek_v4_1/nvidia/dspark.py
++++ b/vllm/models/deepseek_v4_1/nvidia/dspark.py
+@@ -844,6 +844,43 @@ class DSparkDeepseekV4ForCausalLM(nn.Module):
+         assert self.model.confidence_head is not None
+         return self.model.confidence_head.probability(head_hidden, markov_embed, out)
+ 
++    def compute_and_calibrate_confidence(
++        self,
++        head_hidden: torch.Tensor,
++        markov_embed: torch.Tensor,
++        out: torch.Tensor,
++        estimator: object,
++        idx_mapping: torch.Tensor,
++    ) -> torch.Tensor:
++        """Per-position acceptance probability calibrated online by ``estimator``."""
++        assert self.model.confidence_head is not None
++        head = self.model.confidence_head
++        if (
++            estimator is not None
++            and hasattr(head, "probability_and_calibrate")
++            and head_hidden.is_cuda
++            and idx_mapping.dtype == torch.int32
++            and idx_mapping.is_contiguous()
++            and idx_mapping.numel() == head_hidden.shape[0]
++        ):
++            return head.probability_and_calibrate(
++                head_hidden,
++                markov_embed,
++                out,
++                estimator.slope,
++                estimator.intercepts,
++                idx_mapping,
++                estimator.features,
++                estimator.predictions,
++            )
++        probs = self.compute_confidence(head_hidden, markov_embed, out=out)
++        if estimator is not None:
++            num_steps = estimator.num_speculative_steps
++            estimator.calibrate_confidence_probs(
++                probs.view(-1, num_steps), idx_mapping
++            )
++        return probs
++
+     # --- Weight loading ----------------------------------------------------
+ 
+     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
+@@ -982,9 +1019,15 @@ class DSparkDeepseekV4ForCausalLM(nn.Module):
+         return loaded_params
+ 
+     def process_weights_after_loading(self) -> None:
+-        self.logits_processor.prepare_b12x_vocab_projection(
+-            self.model.markov_head.markov_w2
+-        )
++        w2 = self.model.markov_head.markov_w2
++        self.logits_processor.prepare_b12x_vocab_projection(w2)
++        if hasattr(w2, "tilelang_vocab") and hasattr(w2, "weight"):
++            cap = int(getattr(w2, "tilelang_max_rows", 16) or 16)
++            n = int(w2.weight.shape[0])
++            dtype = getattr(w2, "tilelang_vocab_dtype", torch.bfloat16)
++            w2._tilelang_vocab_bias_scratch = torch.empty(
++                (cap, n), dtype=dtype, device=w2.weight.device
++            )
+         for layer in self.model.layers:
+             layer.attn.setup_wo_projection()
+         self.model._context_kv_projections = [
+diff --git a/vllm/models/deepseek_v4_1/tilelang/confidence.py b/vllm/models/deepseek_v4_1/tilelang/confidence.py
+index da2e03edb..573b476f1 100644
+--- a/vllm/models/deepseek_v4_1/tilelang/confidence.py
++++ b/vllm/models/deepseek_v4_1/tilelang/confidence.py
+@@ -123,17 +123,134 @@ def dspark_confidence_kernel(hidden: int, rank: int, threads: int = 128):
+     return dspark_confidence
+ 
+ 
++@tilelang.jit(pass_configs={tilelang.PassConfigKey.TL_DISABLE_WARP_SPECIALIZED: True})
++def dspark_confidence_calibrate_kernel(
++    hidden: int, rank: int, steps: int = 5, threads: int = 128
++):
++    """``out[m] = sigmoid(slope * clamp(logit(clamp(sigmoid(w . [h[m] | e[m]]), eps, 1 - eps)), -40, 40) + intercepts[m % steps])``,
++    also recording ``features[slot, m % steps]`` and ``predictions[slot, m % steps]``
++    when ``slot = idx_mapping[m] >= 0``."""
++    assert (
++        hidden % _VEC == 0 and rank % _VEC == 0 and steps > 0 and threads % 32 == 0
++    )
++    warps = threads // 32
++    hidden_pieces = hidden // _VEC
++    rank_pieces = rank // _VEC
++    hidden_chunks = -(-hidden_pieces // threads)
++    rank_chunks = -(-rank_pieces // threads)
++    chunks = hidden_chunks + rank_chunks
++    rows = T.dynamic("rows")
++    slots = T.dynamic("slots")
++
++    @T.prim_func
++    def dspark_confidence_calibrate(
++        h: T.Tensor((rows, hidden), T.bfloat16),
++        e: T.Tensor((rows, rank), T.bfloat16),
++        weight: T.Tensor((hidden + rank,), T.float32),
++        out: T.Tensor((rows,), T.float32),
++        slope: T.Tensor((1,), T.float32),
++        intercepts: T.Tensor((steps,), T.float32),
++        idx_mapping: T.Tensor((rows,), T.int32),
++        features: T.Tensor((slots, steps), T.float32),
++        predictions: T.Tensor((slots, steps), T.float32),
++    ):
++        with T.Kernel(rows, threads=threads) as m:
++            tx = T.get_thread_binding()
++            xs = T.alloc_local((chunks * _VEC,), T.bfloat16)
++            ws = T.alloc_local((chunks * _VEC,), T.float32)
++            acc = T.alloc_local((_VEC,), T.float32)
++            total = T.alloc_local((1,), T.float32)
++            partial = T.alloc_shared((warps,), T.float32)
++            for c in T.unroll(hidden_chunks):
++                piece = c * threads + tx
++                if piece < hidden_pieces:
++                    for i in T.vectorized(_VEC):
++                        xs[c * _VEC + i] = h[m, piece * _VEC + i]
++                    for i in T.vectorized(4):
++                        ws[c * _VEC + i] = weight[piece * _VEC + i]
++                    for i in T.vectorized(4):
++                        ws[c * _VEC + 4 + i] = weight[piece * _VEC + 4 + i]
++                else:
++                    for i in T.vectorized(_VEC):
++                        xs[c * _VEC + i] = T.bfloat16(0)
++                    for i in T.vectorized(_VEC):
++                        ws[c * _VEC + i] = T.float32(0)
++            for c in T.unroll(rank_chunks):
++                piece = c * threads + tx
++                k = hidden_chunks + c
++                if piece < rank_pieces:
++                    for i in T.vectorized(_VEC):
++                        xs[k * _VEC + i] = e[m, piece * _VEC + i]
++                    for i in T.vectorized(4):
++                        ws[k * _VEC + i] = weight[hidden + piece * _VEC + i]
++                    for i in T.vectorized(4):
++                        ws[k * _VEC + 4 + i] = weight[hidden + piece * _VEC + 4 + i]
++                else:
++                    for i in T.vectorized(_VEC):
++                        xs[k * _VEC + i] = T.bfloat16(0)
++                    for i in T.vectorized(_VEC):
++                        ws[k * _VEC + i] = T.float32(0)
++            for i in T.unroll(_VEC):
++                acc[i] = T.float32(0)
++            for c in T.unroll(chunks):
++                for i in T.unroll(_VEC):
++                    acc[i] += T.cast(xs[c * _VEC + i], T.float32) * ws[c * _VEC + i]
++            for i in T.unroll(4):
++                acc[i] = acc[i] + acc[i + 4]
++            for i in T.unroll(2):
++                acc[i] = acc[i] + acc[i + 2]
++            acc[0] = acc[0] + acc[1]
++            acc[0] = T.warp_reduce_sum(acc[0])
++            if tx % 32 == 0:
++                partial[tx // 32] = acc[0]
++            T.sync_threads()
++            if tx == 0:
++                total[0] = T.float32(0)
++                for warp in T.serial(warps):
++                    total[0] += partial[warp]
++                raw_prob = T.float32(1) / (T.float32(1) + T.exp(-total[0]))
++                clamped = T.min(
++                    T.max(raw_prob, T.float32(1e-6)),
++                    T.float32(1.0 - 1e-6),
++                )
++                feat = T.min(
++                    T.max(
++                        T.log(clamped / (T.float32(1.0) - clamped)),
++                        T.float32(-40.0),
++                    ),
++                    T.float32(40.0),
++                )
++                step = m % steps
++                cal = slope[0] * feat + intercepts[step]
++                prob = T.float32(1) / (T.float32(1) + T.exp(-cal))
++                out[m] = prob
++                slot = idx_mapping[m]
++                if slot >= 0:
++                    features[slot, step] = feat
++                    predictions[slot, step] = prob
++
++    return dspark_confidence_calibrate
++
++
+ @cache
+ def _kernel(hidden: int, rank: int):
+     return dspark_confidence_kernel(hidden, rank)
+ 
+ 
+-def declare(hidden: int, rank: int) -> None:
++@cache
++def _calibrate_kernel(hidden: int, rank: int, steps: int):
++    return dspark_confidence_calibrate_kernel(hidden, rank, steps)
++
++
++def declare(hidden: int, rank: int, steps: int = 5) -> None:
+     """Declare the head over ``hidden``-wide hidden states and ``rank``-wide Markov
+     embeddings, and keep it."""
+     prepare.declare(
+-        lambda: [prepare.call(dspark_confidence_kernel, hidden, rank)],
+-        bind=lambda: _kernel(hidden, rank),
++        lambda: [
++            prepare.call(dspark_confidence_kernel, hidden, rank),
++            prepare.call(dspark_confidence_calibrate_kernel, hidden, rank, steps),
++        ],
++        bind=lambda: (_kernel(hidden, rank), _calibrate_kernel(hidden, rank, steps)),
+     )
+ 
+ 
+@@ -172,6 +289,64 @@ def dspark_confidence(
+     _kernel(width, rank)(hidden, markov_embed, weight, out)
+ 
+ 
++def dspark_confidence_calibrate(
++    hidden: torch.Tensor,
++    markov_embed: torch.Tensor,
++    weight: torch.Tensor,
++    out: torch.Tensor,
++    slope: torch.Tensor,
++    intercepts: torch.Tensor,
++    idx_mapping: torch.Tensor,
++    features: torch.Tensor,
++    predictions: torch.Tensor,
++) -> None:
++    """Fused confidence head projection and online logistic calibration."""
++    rows, width = hidden.shape
++    rank = markov_embed.shape[-1]
++    steps = intercepts.shape[0]
++    if (
++        hidden.dtype != torch.bfloat16
++        or markov_embed.dtype != torch.bfloat16
++        or weight.dtype != torch.float32
++        or out.dtype != torch.float32
++        or slope.dtype != torch.float32
++        or intercepts.dtype != torch.float32
++        or idx_mapping.dtype != torch.int32
++        or features.dtype != torch.float32
++        or predictions.dtype != torch.float32
++        or markov_embed.shape != (rows, rank)
++        or weight.shape != (width + rank,)
++        or out.shape != (rows,)
++        or slope.shape != (1,)
++        or idx_mapping.shape != (rows,)
++        or features.ndim != 2
++        or features.shape[1] != steps
++        or predictions.shape != features.shape
++        or rows % steps != 0
++        or not (hidden.is_contiguous() and markov_embed.is_contiguous())
++        or not (weight.is_contiguous() and out.is_contiguous())
++        or not (slope.is_contiguous() and intercepts.is_contiguous())
++        or not (idx_mapping.is_contiguous() and features.is_contiguous())
++        or not predictions.is_contiguous()
++    ):
++        raise ValueError(
++            "Invalid inputs for fused TileLang DSpark confidence calibration"
++        )
++    if rows == 0:
++        return
++    _calibrate_kernel(width, rank, steps)(
++        hidden,
++        markov_embed,
++        weight,
++        out,
++        slope,
++        intercepts,
++        idx_mapping,
++        features,
++        predictions,
++    )
++
++
+ class TileLangConfidenceHead(DSparkConfidenceHead):
+     """``DSparkConfidenceHead`` (its FP32 projection and weight loading) whose
+     probability is the one-launch kernel."""
+@@ -206,10 +381,41 @@ class TileLangConfidenceHead(DSparkConfidenceHead):
+         dspark_confidence(hidden, markov_embed, self.proj.weight.view(-1), out)
+         return out
+ 
++    def probability_and_calibrate(
++        self,
++        hidden: torch.Tensor,
++        markov_embed: torch.Tensor,
++        out: torch.Tensor | None,
++        slope: torch.Tensor,
++        intercepts: torch.Tensor,
++        idx_mapping: torch.Tensor,
++        features: torch.Tensor,
++        predictions: torch.Tensor,
++    ) -> torch.Tensor:
++        """Each row's calibrated acceptance probability in one TileLang launch."""
++        if out is None:
++            out = torch.empty(
++                hidden.shape[0], dtype=torch.float32, device=hidden.device
++            )
++        dspark_confidence_calibrate(
++            hidden,
++            markov_embed,
++            self.proj.weight.view(-1),
++            out,
++            slope,
++            intercepts,
++            idx_mapping,
++            features,
++            predictions,
++        )
++        return out
++
+ 
+ __all__ = [
+     "TileLangConfidenceHead",
+     "declare",
+     "dspark_confidence",
++    "dspark_confidence_calibrate",
++    "dspark_confidence_calibrate_kernel",
+     "dspark_confidence_kernel",
+ ]
+diff --git a/vllm/models/deepseek_v4_1/tilelang/linear.py b/vllm/models/deepseek_v4_1/tilelang/linear.py
+index 0b14d7bba..00ab36530 100644
+--- a/vllm/models/deepseek_v4_1/tilelang/linear.py
++++ b/vllm/models/deepseek_v4_1/tilelang/linear.py
+@@ -1136,10 +1136,11 @@ class TileLangSplitLinearMethod(UnquantizedLinearMethod):
+         return dict(shards=split["shards"], blocked=split["blocked"], decode=decode)
+ 
+     def process_weights_after_loading(self, layer: nn.Module) -> None:
+-        """Pack the compressor's BF16 weight into exact 12-bit storage."""
++        """Pack the compressor's BF16 weight into exact 12-bit storage when enabled."""
+         if hasattr(layer, "_zero_pad_rows"):
+             layer._zero_pad_rows()
+-        pack_bf16_layer(layer, self._split(layer)["shards"])
++        if getattr(layer, "pack_bf16", True):
++            pack_bf16_layer(layer, self._split(layer)["shards"])
+ 
+     def _kernels(self, layer: nn.Module) -> dict:
+         """Every kernel of the split projection, as calls."""
+diff --git a/vllm/models/deepseek_v4_1/tilelang/sparse_mla.py b/vllm/models/deepseek_v4_1/tilelang/sparse_mla.py
+index da22b50ab..77c83015d 100644
+--- a/vllm/models/deepseek_v4_1/tilelang/sparse_mla.py
++++ b/vllm/models/deepseek_v4_1/tilelang/sparse_mla.py
+@@ -636,6 +636,11 @@ def sparse_mla_fwd_v41(
+                     if h0 + h < heads:
+                         PartialStats[row, seg, h0 + h, 0] = m_g[h]
+                         PartialStats[row, seg, h0 + h, 1] = l_g[h]
++            else:
++                for h in T.Parallel(block_H):
++                    if h0 + h < heads:
++                        PartialStats[row, seg, h0 + h, 0] = -T.infinity(accum_dtype)
++                        PartialStats[row, seg, h0 + h, 1] = T.Cast(accum_dtype, 0)
+ 
+         # Fold the segment partials in order from the sink; store WO-A's input.
+         with T.Kernel(heads, rows, threads=128) as (hc, rc):
+@@ -661,12 +666,12 @@ def sparse_mla_fwd_v41(
+             pdl.chain()
+             if not skip_inactive or row_active(SwaLengths, IdxLengths, rc):
+                 for c in T.unroll(segments):
+-                    if not skip_inactive or seg_active(c, SwaLengths, IdxLengths, rc):
+-                        m_new = T.max(M, PartialStats[rc, c, hc, 0])
+-                        a = T.exp2(M - m_new)
+-                        b = T.exp2(PartialStats[rc, c, hc, 0] - m_new)
+-                        L = T.fma(PartialStats[rc, c, hc, 1], b, T.fmul(L, a))
+-                        M = m_new
++                    m_new = T.max(M, PartialStats[rc, c, hc, 0])
++                    a = T.exp2(M - m_new)
++                    b = T.exp2(PartialStats[rc, c, hc, 0] - m_new)
++                    L = T.fma(PartialStats[rc, c, hc, 1], b, T.fmul(L, a))
++                    M = m_new
++                    if not skip_inactive or PartialStats[rc, c, hc, 1] > 0:
+                         for d in T.Parallel(D):
+                             o[d] = T.fma(Partial[rc, c, hc, d], b, T.fmul(o[d], a))
+                 L = 1.0 / L
+diff --git a/vllm/v1/worker/gpu/input_batch.py b/vllm/v1/worker/gpu/input_batch.py
+index b2d271713..d85cc7a09 100644
+--- a/vllm/v1/worker/gpu/input_batch.py
++++ b/vllm/v1/worker/gpu/input_batch.py
+@@ -205,8 +205,14 @@ class InputBatch:
+         num_tokens: int,
+         input_buffers: InputBuffers,
+         max_query_len: int | None = None,
++        num_reqs_after_padding: int | None = None,
+     ) -> "InputBatch":
+         assert 0 < num_reqs <= num_tokens
++        padded_reqs = (
++            num_reqs
++            if num_reqs_after_padding is None
++            else max(num_reqs, num_reqs_after_padding)
++        )
+         device = input_buffers.device
+ 
+         req_ids = [f"req_{i}_{random_uuid()}" for i in range(num_reqs)]
+@@ -232,18 +238,21 @@ class InputBatch:
+         input_buffers.seq_lens[num_reqs - num_extra : num_reqs] = base_tokens + 1
+         # Pad for full CUDA graph mode.
+         input_buffers.seq_lens[num_reqs:] = 0
+-        seq_lens = input_buffers.seq_lens[:num_reqs]
++        seq_lens = input_buffers.seq_lens[:padded_reqs]
+ 
+-        query_start_loc_np = np.empty(num_reqs + 1, dtype=np.int32)
++        query_start_loc_np = np.empty(padded_reqs + 1, dtype=np.int32)
+         query_start_loc_np[0] = 0
+-        np.cumsum(num_scheduled_tokens, out=query_start_loc_np[1:])
++        np.cumsum(num_scheduled_tokens, out=query_start_loc_np[1 : num_reqs + 1])
++        query_start_loc_np[num_reqs + 1 :] = num_tokens
+         input_buffers.query_start_loc[:1] = 0
+         torch.cumsum(
+-            seq_lens, dim=0, out=input_buffers.query_start_loc[1 : num_reqs + 1]
++            input_buffers.seq_lens[:num_reqs],
++            dim=0,
++            out=input_buffers.query_start_loc[1 : num_reqs + 1],
+         )
+         # Pad for full CUDA graph mode.
+         input_buffers.query_start_loc[num_reqs + 1 :] = num_tokens
+-        query_start_loc = input_buffers.query_start_loc[: num_reqs + 1]
++        query_start_loc = input_buffers.query_start_loc[: padded_reqs + 1]
+ 
+         input_ids = input_buffers.input_ids[:num_tokens].zero_()
+         positions = input_buffers.positions[:num_tokens].zero_()
+@@ -252,16 +261,18 @@ class InputBatch:
+         is_padding = input_buffers.is_padding[:num_tokens]
+ 
+         # int64, as a real step's: the dummy runs the kernels serving runs.
+-        logits_indices = (query_start_loc[1:] - 1).long()
++        logits_indices = (input_buffers.query_start_loc[1 : num_reqs + 1] - 1).long()
+         cu_num_logits = input_buffers.one_logit_cu[: num_reqs + 1]
+         cu_num_logits_np = np.arange(num_reqs + 1, dtype=np.int32)
+         # Copy so set_dummy_context can add context in place without touching
+         # num_scheduled_tokens.
+-        seq_lens_cpu_upper_bound = torch.from_numpy(num_scheduled_tokens.copy())
++        seq_lens_cpu_upper_bound_np = np.zeros(padded_reqs, dtype=np.int32)
++        seq_lens_cpu_upper_bound_np[:num_reqs] = num_scheduled_tokens
++        seq_lens_cpu_upper_bound = torch.from_numpy(seq_lens_cpu_upper_bound_np)
+         return cls(
+             req_ids=req_ids,
+             num_reqs=num_reqs,
+-            num_reqs_after_padding=num_reqs,
++            num_reqs_after_padding=padded_reqs,
+             idx_mapping=idx_mapping,
+             idx_mapping_np=idx_mapping_np,
+             expanded_idx_mapping=expanded_idx_mapping,
+@@ -331,12 +342,12 @@ def set_dummy_context(
+ 
+     # Decode-like shape: each request continues after context_len
+     # already-computed tokens.
+-    input_batch.seq_lens += context_len
+-    input_batch.seq_lens_cpu_upper_bound += context_len
++    input_batch.seq_lens[:num_reqs] += context_len
++    input_batch.seq_lens_cpu_upper_bound[:num_reqs] += context_len
+     input_batch.num_computed_tokens_np.fill(context_len)
+     input_batch.num_computed_prefill_tokens_np.fill(context_len)
+     local_pos = np.arange(input_batch.num_tokens, dtype=np.int64) - np.repeat(
+-        input_batch.query_start_loc_np[:-1], input_batch.num_scheduled_tokens
++        input_batch.query_start_loc_np[:num_reqs], input_batch.num_scheduled_tokens
+     )
+     input_batch.positions.copy_(torch.from_numpy(local_pos + context_len))
+ 
+diff --git a/vllm/v1/worker/gpu/model_runner.py b/vllm/v1/worker/gpu/model_runner.py
+index 173432af0..02bfea136 100644
+--- a/vllm/v1/worker/gpu/model_runner.py
++++ b/vllm/v1/worker/gpu/model_runner.py
+@@ -2068,12 +2068,13 @@ class GPUModelRunner(LoRAModelRunnerMixin):
+     def prepare_dummy_attn(
+         self, input_batch: InputBatch, valid_state_slots: bool = False
+     ) -> tuple[tuple[torch.Tensor, ...], torch.Tensor]:
++        num_reqs_padded = input_batch.num_reqs_after_padding
+         block_table_provider = self.pcp_manager or self.block_tables
+-        block_tables = block_table_provider.get_dummy_block_tables(input_batch.num_reqs)
++        block_tables = block_table_provider.get_dummy_block_tables(num_reqs_padded)
+         if valid_state_slots:
+             state_slots = torch.arange(
+                 1,
+-                input_batch.num_reqs + 1,
++                num_reqs_padded + 1,
+                 dtype=torch.int32,
+                 device=self.device,
+             )
+@@ -3092,12 +3093,22 @@ class GPUModelRunner(LoRAModelRunnerMixin):
+                 self._set_active_loras(*lora_inputs)
+         else:
+             # No actual tokens to run. A dummy run for DP or memory profiling.
+-            dummy_num_reqs = batch_desc.num_reqs or num_reqs
++            padded_num_reqs = batch_desc.num_reqs or num_reqs
++            max_q = batch_desc.max_query_len or batch_desc.num_tokens
++            dummy_num_reqs = (
++                num_reqs
++                if not is_profile
++                and self.pcp_manager is None
++                and 0 < num_reqs <= padded_num_reqs
++                and num_reqs * max_q >= batch_desc.num_tokens
++                else padded_num_reqs
++            )
+             input_batch = InputBatch.make_dummy(
+                 dummy_num_reqs,
+                 batch_desc.num_tokens,
+                 self.input_buffers,
+                 max_query_len=batch_desc.max_query_len,
++                num_reqs_after_padding=padded_num_reqs,
+             )
+             if self.pcp_manager is not None:
+                 input_batch = self.pcp_manager.prepare_inputs_to_capture(input_batch)
+@@ -3592,33 +3603,21 @@ class GPUModelRunner(LoRAModelRunnerMixin):
+                 isinstance(self.speculator, DraftModelSpeculator)
+                 and self.speculator.acceptance_estimator is not None
+             ):
+-                observed_rejected = num_rejected
+-                if self._dead_row_cut is not None:
+-                    # Rows past the dead-row cut skipped routed MoE and were
+-                    # never verified; only live rows can be observed as rejected.
+-                    live_rejected = (
+-                        self._dead_row_cut[: input_batch.num_reqs]
+-                        - (num_sampled - 1).clamp_min(0)
+-                    ).clamp_min(0)
+-                    observed_rejected = torch.minimum(
+-                        observed_rejected, live_rejected
+-                    )
+-                if sampler_output.sink is not None:
+-                    # A rejected draft zero left the drafts unjudged.
+-                    observed_rejected = observed_rejected.masked_fill(
+-                        sampler_output.sink.events[:, 0] == SinkOutcome.REJECTED, 0
+-                    )
+-                observed_idx_mapping = input_batch.idx_mapping
+-                if self.copy_drafter is not None:
+-                    # Slots whose last verified proposal came from CopyDrafter
+-                    # must not grade DSpark's confidence_head features.
+-                    observed_idx_mapping = torch.where(
+-                        self.copy_drafter.int_state[input_batch.idx_mapping, 1] > 0,
+-                        -1,
+-                        observed_idx_mapping,
+-                    )
+                 self.speculator.observe_verification(
+-                    observed_idx_mapping, num_sampled, observed_rejected
++                    input_batch.idx_mapping,
++                    num_sampled,
++                    num_rejected,
++                    dead_row_cut=self._dead_row_cut,
++                    sink_events=(
++                        sampler_output.sink.events
++                        if sampler_output.sink is not None
++                        else None
++                    ),
++                    copy_int_state=(
++                        self.copy_drafter.int_state
++                        if self.copy_drafter is not None
++                        else None
++                    ),
+                 )
+             # Let the target override the hidden state fed to the drafter
+             # (_mtp_target_states).
+@@ -3652,14 +3651,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
+                             dtype=input_batch.idx_mapping.dtype,
+                             device=self.device,
+                         )
+-                verified = (
+-                    self.adaptive_verification.get_verified_draft_counts(
+-                        input_batch.num_reqs, self._dead_row_cut
+-                    )
+-                    if self.adaptive_verification is not None
+-                    and input_batch.num_draft_tokens_per_req is not None
+-                    else None
+-                )
++                verified = num_verified_draft_tokens
+                 self.copy_drafter.prepare_alloc(
+                     input_batch.idx_mapping,
+                     num_sampled,
+diff --git a/vllm/v1/worker/gpu/spec_decode/acceptance_estimator.py b/vllm/v1/worker/gpu/spec_decode/acceptance_estimator.py
+index 6f3f3d566..a78b54715 100644
+--- a/vllm/v1/worker/gpu/spec_decode/acceptance_estimator.py
++++ b/vllm/v1/worker/gpu/spec_decode/acceptance_estimator.py
+@@ -34,12 +34,21 @@ def _accumulate_kernel(
+     idx_mapping_ptr,
+     num_sampled_ptr,
+     num_rejected_ptr,
++    dead_row_cut_ptr,
++    sink_events_ptr,
++    sink_events_stride,
++    copy_int_state_ptr,
++    copy_int_state_stride,
+     features_ptr,
+     features_stride,
+     pred_ptr,
+     pred_stride,
+     counts_ptr,
+     num_reqs,
++    HAS_DEAD_ROW_CUT: tl.constexpr,
++    HAS_SINK_EVENTS: tl.constexpr,
++    HAS_COPY_INT_STATE: tl.constexpr,
++    SINK_REJECTED_CODE: tl.constexpr,
+     BLOCK_R: tl.constexpr,
+ ):
+     step = tl.program_id(0).to(tl.int64)
+@@ -50,6 +59,13 @@ def _accumulate_kernel(
+     )
+     req_mask = req_mask & (req_state_block >= 0)
+     safe_req_state = tl.maximum(req_state_block, 0)
++    if HAS_COPY_INT_STATE:
++        copy_source = tl.load(
++            copy_int_state_ptr + safe_req_state * copy_int_state_stride + 1,
++            mask=req_mask,
++            other=0,
++        )
++        req_mask = req_mask & (copy_source <= 0)
+ 
+     num_sampled = tl.load(num_sampled_ptr + req_block, mask=req_mask, other=0).to(
+         tl.int64
+@@ -59,6 +75,17 @@ def _accumulate_kernel(
+     num_rejected = tl.load(num_rejected_ptr + req_block, mask=req_mask, other=0).to(
+         tl.int64
+     )
++    if HAS_DEAD_ROW_CUT:
++        dead_cut = tl.load(dead_row_cut_ptr + req_block, mask=req_mask, other=0).to(
++            tl.int64
++        )
++        live_rejected = tl.maximum(dead_cut - num_accepted, 0)
++        num_rejected = tl.minimum(num_rejected, live_rejected)
++    if HAS_SINK_EVENTS:
++        sink_outcome = tl.load(
++            sink_events_ptr + req_block * sink_events_stride, mask=req_mask, other=0
++        )
++        num_rejected = tl.where(sink_outcome == SINK_REJECTED_CODE, 0, num_rejected)
+     num_admitted = num_accepted + num_rejected
+ 
+     feature = tl.load(
+@@ -500,15 +527,21 @@ class OnlineAcceptanceEstimator:
+         num_sampled: torch.Tensor,
+         num_rejected: torch.Tensor,
+         dead_row_cut: torch.Tensor | None = None,
++        *,
++        sink_events: torch.Tensor | None = None,
++        copy_int_state: torch.Tensor | None = None,
+     ) -> None:
+         # Accumulate the previous step's graded drafts into the IRLS statistics.
+         num_reqs = idx_mapping.shape[0]
+-        if dead_row_cut is not None and num_reqs > 0:
+-            num_accepted = (num_sampled - 1).clamp_min(0)
+-            live_rejected = (dead_row_cut[:num_reqs] - num_accepted).clamp_min(0)
+-            num_rejected = torch.minimum(num_rejected, live_rejected)
+         if self.device.type != "cuda":
+-            self._step_cpu(idx_mapping, num_sampled, num_rejected)
++            self._step_cpu(
++                idx_mapping,
++                num_sampled,
++                num_rejected,
++                dead_row_cut=dead_row_cut,
++                sink_events=sink_events,
++                copy_int_state=copy_int_state,
++            )
+             return
+         if num_reqs > 0:
+             _accumulate_kernel[(self.num_speculative_steps,)](
+@@ -517,12 +550,21 @@ class OnlineAcceptanceEstimator:
+                 idx_mapping,
+                 num_sampled,
+                 num_rejected,
++                dead_row_cut if dead_row_cut is not None else idx_mapping,
++                sink_events if sink_events is not None else idx_mapping,
++                sink_events.stride(0) if sink_events is not None else 0,
++                copy_int_state if copy_int_state is not None else idx_mapping,
++                copy_int_state.stride(0) if copy_int_state is not None else 0,
+                 self.features,
+                 self.features.stride(0),
+                 self.predictions,
+                 self.predictions.stride(0),
+                 self.counts,
+                 num_reqs,
++                HAS_DEAD_ROW_CUT=dead_row_cut is not None,
++                HAS_SINK_EVENTS=sink_events is not None,
++                HAS_COPY_INT_STATE=copy_int_state is not None,
++                SINK_REJECTED_CODE=2,
+                 BLOCK_R=triton.next_power_of_2(max(num_reqs, 1)),
+             )
+ 
+@@ -609,12 +651,27 @@ class OnlineAcceptanceEstimator:
+         idx_mapping: torch.Tensor,
+         num_sampled: torch.Tensor,
+         num_rejected: torch.Tensor,
++        *,
++        dead_row_cut: torch.Tensor | None = None,
++        sink_events: torch.Tensor | None = None,
++        copy_int_state: torch.Tensor | None = None,
+     ) -> None:
++        num_reqs = idx_mapping.shape[0]
+         slots = idx_mapping.to(torch.int64)
+         valid_req = slots >= 0
+         safe_slots = slots.clamp_min(0)
++        if copy_int_state is not None and num_reqs > 0:
++            valid_req = valid_req & (copy_int_state[safe_slots, 1] <= 0)
+         num_accepted = (num_sampled.to(torch.int64) - 1).clamp_min(0)
+-        num_admitted = num_accepted + num_rejected.to(torch.int64)
++        rejected = num_rejected.to(torch.int64)
++        if dead_row_cut is not None and num_reqs > 0:
++            live_rejected = (
++                dead_row_cut[:num_reqs].to(torch.int64) - num_accepted
++            ).clamp_min(0)
++            rejected = torch.minimum(rejected, live_rejected)
++        if sink_events is not None and num_reqs > 0:
++            rejected = rejected.masked_fill(sink_events[:num_reqs, 0] == 2, 0)
++        num_admitted = num_accepted + rejected
+         steps = torch.arange(
+             self.num_speculative_steps, device=self.device, dtype=torch.int64
+         )[None, :]
+diff --git a/vllm/v1/worker/gpu/spec_decode/adaptive_verification.py b/vllm/v1/worker/gpu/spec_decode/adaptive_verification.py
+index 3f49b6cbc..4d7aaad9a 100644
+--- a/vllm/v1/worker/gpu/spec_decode/adaptive_verification.py
++++ b/vllm/v1/worker/gpu/spec_decode/adaptive_verification.py
+@@ -52,9 +52,21 @@ EXPLORE_AFTER_IDLE_STEPS = 32
+ 
+ # Two-slope verification row-cost knee: once a step crosses one 16-row Tensor
+ # Core MMA tile, additional verification rows share the already-launched expert
+-# and dense weight tiles at a reduced marginal cost.
++# and dense weight tiles at a reduced marginal cost. On TP3 each rank holds a
++# wider MoE shard (768 vs 576) and 24 MLA heads (2 head tiles vs 1), so rows
++# past the knee remain closer to the base marginal cost and single-request tail
++# pruning uses a higher calibrated survival floor.
+ HIGH_ROW_COST_KNEE = 16
+ HIGH_ROW_COST_SCALE = 0.55
++HIGH_ROW_COST_SCALE_TP3 = 0.85
++MIN_CALIBRATED_DEAD_ROWS_TAU_TP3 = 0.12
++
++
++def _tp_world_size() -> int:
++    try:
++        return int(get_tp_group().world_size)
++    except Exception:
++        return 1
+ 
+ 
+ def resolve_adaptive_cudagraph_mode(
+@@ -113,8 +125,14 @@ class AdaptiveVerificationManager:
+         # cost: a recipe constant, so the budget is a rule of the inputs, the same
+         # on every build and boot, with nothing timed.
+         self.row_cost = row_cost
++        tp_size = _tp_world_size()
+         self.high_row_cost_knee = HIGH_ROW_COST_KNEE
+-        self.high_row_cost_scale = HIGH_ROW_COST_SCALE
++        self.high_row_cost_scale = (
++            HIGH_ROW_COST_SCALE_TP3 if tp_size == 3 else HIGH_ROW_COST_SCALE
++        )
++        self.min_calibrated_dead_rows_tau = (
++            MIN_CALIBRATED_DEAD_ROWS_TAU_TP3 if tp_size == 3 else 0.0
++        )
+         self.tp_invariant_confidence = tp_invariant_confidence
+         self.calibrated_confidence = calibrated_confidence
+         self.dead_rows_tau = _DEAD_ROWS_TAU
+@@ -314,7 +332,11 @@ class AdaptiveVerificationManager:
+         if callable(calibrated):
+             calibrated = bool(calibrated())
+         if calibrated and self.row_cost > 0.0:
+-            return min(tau, 2.0 * self.row_cost / (1.0 + 3.0 * self.row_cost))
++            floor = float(getattr(self, "min_calibrated_dead_rows_tau", 0.0))
++            return min(
++                tau,
++                max(floor, 2.0 * self.row_cost / (1.0 + 3.0 * self.row_cost)),
++            )
+         return tau
+ 
+     def get_num_tokens(
+diff --git a/vllm/v1/worker/gpu/spec_decode/dspark/speculator.py b/vllm/v1/worker/gpu/spec_decode/dspark/speculator.py
+index 710d549be..7fabc87f5 100644
+--- a/vllm/v1/worker/gpu/spec_decode/dspark/speculator.py
++++ b/vllm/v1/worker/gpu/spec_decode/dspark/speculator.py
+@@ -572,27 +572,35 @@ class DSparkSpeculator(DFlashSpeculator):
+                 self.draft_tokens[:num_reqs, i] = draft_sampled_i
+             prev = draft_sampled_i
+ 
+-        if self.use_confidence_head and table is not None:
+-            # Straight into the probabilities' rows (contiguous: [:num_reqs]).
+-            self.model.compute_confidence(
+-                sample_hidden,
+-                confidence_embeds.flatten(0, 1),
+-                out=self.draft_token_confidence_probs[:num_reqs].view(-1),
+-            )
+-        elif self.use_confidence_head:
+-            self.model.compute_confidence(
+-                sample_hidden,
+-                torch.stack(confidence_markov_embeds, dim=1).flatten(0, 1),
+-                out=self.draft_token_confidence_probs[:num_reqs].view(-1),
+-            )
+-        if (
+-            self.use_confidence_head
+-            and getattr(self, "acceptance_estimator", None) is not None
+-        ):
+-            self.acceptance_estimator.calibrate_confidence_probs(
+-                self.draft_token_confidence_probs[:num_reqs],
+-                self.sample_idx_mapping[:num_sample],
++        if self.use_confidence_head:
++            conf_embeds = (
++                confidence_embeds.flatten(0, 1)
++                if table is not None
++                else torch.stack(confidence_markov_embeds, dim=1).flatten(0, 1)
+             )
++            conf_out = self.draft_token_confidence_probs[:num_reqs].view(-1)
++            estimator = getattr(self, "acceptance_estimator", None)
++            if estimator is not None and hasattr(
++                self.model, "compute_and_calibrate_confidence"
++            ):
++                self.model.compute_and_calibrate_confidence(
++                    sample_hidden,
++                    conf_embeds,
++                    conf_out,
++                    estimator,
++                    self.sample_idx_mapping[:num_sample],
++                )
++            else:
++                self.model.compute_confidence(
++                    sample_hidden,
++                    conf_embeds,
++                    out=conf_out,
++                )
++                if estimator is not None:
++                    estimator.calibrate_confidence_probs(
++                        self.draft_token_confidence_probs[:num_reqs],
++                        self.sample_idx_mapping[:num_sample],
++                    )
+ 
+     def _sample_sequential_topk(self, num_reqs: int, head_hidden: torch.Tensor) -> None:
+         """Apply the sequential Markov head only to top-k base-logit candidates.
+@@ -641,16 +649,30 @@ class DSparkSpeculator(DFlashSpeculator):
+             prev = draft_sampled_i
+ 
+         if self.use_confidence_head:
+-            self.model.compute_confidence(
+-                sample_hidden,
+-                torch.stack(confidence_markov_embeds, dim=1).flatten(0, 1),
+-                out=self.draft_token_confidence_probs[:num_reqs].view(-1),
+-            )
+-            if getattr(self, "acceptance_estimator", None) is not None:
+-                self.acceptance_estimator.calibrate_confidence_probs(
+-                    self.draft_token_confidence_probs[:num_reqs],
++            conf_embeds = torch.stack(confidence_markov_embeds, dim=1).flatten(0, 1)
++            conf_out = self.draft_token_confidence_probs[:num_reqs].view(-1)
++            estimator = getattr(self, "acceptance_estimator", None)
++            if estimator is not None and hasattr(
++                self.model, "compute_and_calibrate_confidence"
++            ):
++                self.model.compute_and_calibrate_confidence(
++                    sample_hidden,
++                    conf_embeds,
++                    conf_out,
++                    estimator,
+                     self.sample_idx_mapping[:num_sample],
+                 )
++            else:
++                self.model.compute_confidence(
++                    sample_hidden,
++                    conf_embeds,
++                    out=conf_out,
++                )
++                if estimator is not None:
++                    estimator.calibrate_confidence_probs(
++                        self.draft_token_confidence_probs[:num_reqs],
++                        self.sample_idx_mapping[:num_sample],
++                    )
+ 
+     def _generate_draft(
+         self,
+diff --git a/vllm/v1/worker/gpu/spec_decode/speculator.py b/vllm/v1/worker/gpu/spec_decode/speculator.py
+index dfd477459..c5e03bb6b 100644
+--- a/vllm/v1/worker/gpu/spec_decode/speculator.py
++++ b/vllm/v1/worker/gpu/spec_decode/speculator.py
+@@ -511,6 +511,10 @@ class DraftModelSpeculator(BaseSpeculator):
+         idx_mapping: torch.Tensor,
+         num_sampled: torch.Tensor,
+         num_rejected: torch.Tensor,
++        dead_row_cut: torch.Tensor | None = None,
++        *,
++        sink_events: torch.Tensor | None = None,
++        copy_int_state: torch.Tensor | None = None,
+     ) -> None:
+         """Fold the target's verdict on the last drafts into the estimator.
+ 
+@@ -518,7 +522,14 @@ class DraftModelSpeculator(BaseSpeculator):
+         features the verdict grades.
+         """
+         if self.acceptance_estimator is not None:
+-            self.acceptance_estimator.step(idx_mapping, num_sampled, num_rejected)
++            self.acceptance_estimator.step(
++                idx_mapping,
++                num_sampled,
++                num_rejected,
++                dead_row_cut=dead_row_cut,
++                sink_events=sink_events,
++                copy_int_state=copy_int_state,
++            )
+ 
+     def prepare_watermarking(
+         self, contexts: torch.Tensor, watermarking: torch.Tensor
+-- 
+2.54.0 (Apple Git-157)
+
