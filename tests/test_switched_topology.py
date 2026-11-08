@@ -22,6 +22,7 @@ def fixture(count=4, shape='tp4-ring'):
     cluster['environment'] = {k: v for k, v in cluster['environment'].items()
                               if k not in ring and k not in (
                                   'NCCL_MIN_NCHANNELS', 'NCCL_MAX_NCHANNELS',
+                                  'NCCL_P2P_NET_CHUNKSIZE',
                                   'NCCL_SWITCHLESS_BIDIRECTIONAL', 'NCCL_MIN_TRAFFIC_PER_CHANNEL',
                                   'NCCL_THREAD_THRESHOLDS')}
     cluster['distributed']['master_addr'] = '192.0.2.11'
@@ -52,6 +53,7 @@ class SwitchedTopologyTest(unittest.TestCase):
             lambda c, n: c['environment'].update(NCCL_MIN_TRAFFIC_PER_CHANNEL='1'),
             lambda c, n: c['environment'].update(NCCL_THREAD_THRESHOLDS='0 0 0'),
             lambda c, n: c['environment'].update(NCCL_ALGO='Ring'),
+            lambda c, n: c['environment'].update(NCCL_P2P_NET_CHUNKSIZE='262144'),
             lambda c, n: c['serve_args'].append('--disable-custom-all-reduce'),
             lambda c, n: n['nodes'][0]['roce_hcas'].reverse(),
             lambda c, n: n['nodes'][0]['roce_hcas'].__setitem__(1, n['nodes'][0]['roce_hcas'][0]),
@@ -122,6 +124,10 @@ class SwitchedTopologyTest(unittest.TestCase):
         # says so and the collective probe is the gate.
         cluster, nodes = fixture(count=3, shape='tp3-triangle')
         self.assertEqual(topology.problems(cluster, nodes), [])
+        triangle_base = spark.read_cluster('config/cluster.json', 'tp3-triangle')
+        result = topology.candidate(triangle_base, nodes, 'switched-3.json')
+        self.assertNotIn('NCCL_P2P_NET_CHUNKSIZE', result['environment'])
+        self.assertEqual(topology.problems(result, nodes), [])
 
     def test_switched_maps_accept_three_to_eight_nodes_and_reject_outside_bounds(self):
         for count in (3, 4, 5, 6, 7, 8):

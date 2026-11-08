@@ -198,6 +198,7 @@ def problems(cluster: dict, nodes: dict) -> list[str]:
             errors.append(f"{mode} requires explicit fabric.topology=switched")
         for key in ("NCCL_SWITCHLESS_BIDIRECTIONAL", "NCCL_MIN_TRAFFIC_PER_CHANNEL",
                     "NCCL_THREAD_THRESHOLDS", "NCCL_ALGO", "NCCL_MIN_NCHANNELS",
+                    "NCCL_P2P_NET_CHUNKSIZE",
                     "NCCL_ALGO_PLUGIN", "NCCL_TUNER_PLUGIN", "NCCL_GRAPH_FILE", "NCCL_TOPO_FILE"):
             if key in settings:
                 errors.append(f"{mode} must omit stale ring/topology control {key}")
@@ -208,6 +209,14 @@ def problems(cluster: dict, nodes: dict) -> list[str]:
             errors.append("nccl-switched runs plain NCCL; it requires --disable-custom-all-reduce")
     elif cluster.get("fabric", {}).get("topology") == "switched":
         errors.append("fabric.topology=switched requires an explicit switched transport")
+    else:
+        bidirectional = settings.get("NCCL_SWITCHLESS_BIDIRECTIONAL")
+        if bidirectional is not None:
+            if str(bidirectional) not in ("1", "2"):
+                errors.append("NCCL_SWITCHLESS_BIDIRECTIONAL must be 1 or 2")
+            channels = str(settings.get("NCCL_MAX_NCHANNELS", ""))
+            if str(bidirectional) == "2" and channels.isdigit() and int(channels) > 2 and int(channels) % 4 != 0:
+                errors.append("NCCL_SWITCHLESS_BIDIRECTIONAL=2 needs two or a multiple of four channels")
     if mode is not None and not is_sparknet(mode) and any(k.startswith("SPARKNET_ROCE_") for k in settings):
         errors.append(f"{mode} does not run sparknet; SPARKNET_ROCE_* settings do not apply")
     for flag in ("--tensor-parallel-size", "--nnodes"):
@@ -321,6 +330,7 @@ def candidate(base: dict, nodes: dict, nodes_path: str) -> dict:
         result.pop("benchmark_reference", None)
         for key in ("NCCL_SWITCHLESS_BIDIRECTIONAL", "NCCL_MIN_TRAFFIC_PER_CHANNEL",
                     "NCCL_THREAD_THRESHOLDS", "NCCL_ALGO", "NCCL_MIN_NCHANNELS",
+                    "NCCL_P2P_NET_CHUNKSIZE",
                     "NCCL_ALGO_PLUGIN", "NCCL_TUNER_PLUGIN", "NCCL_GRAPH_FILE", "NCCL_TOPO_FILE",
                     "NCCL_COLLNET_ENABLE", "NCCL_CUMEM_HOST_ENABLE", "NCCL_GIN_ENABLE",
                     "NCCL_IB_SUBNET_PREFIX_LEN", "NCCL_MNNVL_ENABLE", "NCCL_PAT_ENABLE",
