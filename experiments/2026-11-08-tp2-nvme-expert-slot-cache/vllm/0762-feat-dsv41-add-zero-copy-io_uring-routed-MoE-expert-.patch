@@ -1,10 +1,10 @@
-From c295a65d19d2d5076187a7d5bb480c1d0ba0b29e Mon Sep 17 00:00:00 2001
-From: Christopher Owen <3221756+christopherowen@users.noreply.github.com>
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Christopher Owen <christopherowen@users.noreply.github.com>
 Date: Sun, 8 Nov 2026 15:24:45 +0000
-Subject: [PATCH] feat(dsv41): add zero-copy io_uring routed MoE expert slot
- cache for TP=2
+Subject: [PATCH 762/762] feat(dsv41): add zero-copy io_uring routed MoE expert
+ slot cache for TP=2
 
-Base: 1107 vLLM patch head 320021e3c4dbb202d911ab70e2cd924c75420488.
+Base: 1107 vLLM patch head 9942460917d4a107e97d7d8ba690b53d7e9158ec.
 
 Rationale:
 At TP=2 on two 128 GiB GB10 unified-memory nodes, native DeepSeek-V4.1-Flash weights total 123.75 GiB per rank (24.08 GiB replicated + sharded dense/attention/shared-expert/drafter/lm_head + 99.67 GiB routed MoE experts across 58 layers = 1.718 GiB/layer/rank for all 384 experts at hidden=5120, intermediate=1152), exceeding the ~115 GiB usable per-node memory budget by ~17-27 GiB per rank once OS, display carve-out, and KV cache are included.
@@ -14,28 +14,28 @@ At the same time, every TMA tile in tile_expert_weights (block_N=128, FP4_TMA_K=
    - Add optional slot_map=True support to moe_dispatch_v41 and MoeDispatchV41Plan so TileExpert[t] maps logical expert e in 0..num_experts-1 to physical slot ExpertToSlot[e] in 0..num_slots-1 inside the dispatch kernel itself (zero extra kernel launches) while preserving exact logical-expert route grouping (Order, RoutePos, LayoutWeights).
    - Add num_slots, narrow_codes, slot_map, and wait_w2 callback hooks (invoked between swiglu_kernel and down_kernel) to MoeExpertsV41Plan.
 2. vllm/models/deepseek_v4_1/expert_slots/:
-   - _reader.c & _native.py: C99 + liburing extension implementing O_DIRECT + io_uring_register_buffers (IORING_OP_READ_FIXED) + io_uring_register_files (IOSQE_FIXED_FILE) with per-dynamic-slot fixed buffers and two-phase role-major submission/completion (ROLE_W13 waited before gate_up_proj; ROLE_W2 waited before down_proj so w2 NVMe DMA overlaps with gate_up_proj and moe_swiglu_cast).
-   - cache.py: alloc_pinned_aligned and as_cuda_zero_copy (__cuda_array_interface__ zero-copy views over page-aligned cudaHostAlloc storage), ExpertPackMeta, pack_layer_experts, CountDecayLFU (exponential frequency decay with cold-prefill protection for decode-hot dynamic slots), RouterLookaheadPredictor (cross-layer router lookahead using layer L+1 gate weights), and ExpertSlotCache (including multi-window prefill batching when active cold experts exceed dynamic_slots).
+   - _reader.c & _native.py: C99 + liburing extension implementing O_DIRECT + io_uring_register_buffers (IORING_OP_READ_FIXED) + io_uring_register_files (IOSQE_FIXED_FILE) with per-dynamic-slot fixed buffers, LBA-sorted multi-miss request ordering (qsort by ascending expert file offset with lba_ordered_submissions and contiguous_slot_pairs telemetry), and two-phase role-major submission/completion (ROLE_W13 waited before gate_up_proj; ROLE_W2 waited before down_proj so w2 NVMe DMA overlaps with gate_up_proj and moe_swiglu_cast).
+   - cache.py: alloc_pinned_aligned and as_cuda_zero_copy (__cuda_array_interface__ zero-copy views over page-aligned cudaHostAlloc storage), ExpertPackMeta, pack_layer_experts, rank_experts_by_router_bias (seeding static slots from checkpoint e_score_correction_bias, optional gate_weight L2 norms, and empirical hotlist_counts), plan_layer_slot_budgets (distributing global slot budgets across layers proportionally to routing Shannon entropy), compute_uma_slot_budget (auto-sizing per-layer slot counts from Linux /proc/meminfo MemAvailable on integrated-memory hosts), CountDecayLFU (exponential frequency decay with cold-prefill protection, unread lookahead probation so unconsumed speculative prefetches retain score=0.0 and are evicted first, and LBA-sorted multi-miss victim slot pairing), RouterLookaheadPredictor, and ExpertSlotCache.
 3. vllm/model_executor/layers/fused_moe/tilelang.py:
-   - Wire optional layer.slot_cache_config (_slot_cache and _next_lookahead) into TileLangExperts.process_weights_after_loading and TileLangExperts.apply.
+   - Wire optional layer.slot_cache_config (_slot_cache, router_bias/e_score_correction_bias seeding, and _next_lookahead) into TileLangExperts.process_weights_after_loading and TileLangExperts.apply.
 
 Quality:
-Bit-identical (torch.equal, max_abs_diff = 0.0) to full 384-expert resident MoeExpertsV41Plan across all-hit decode, role-major w13/w2 overlapped cold misses, cross-layer router lookahead prefetches, and multi-window prefill batches. At TP=2 geometry (E=384, H=5120, I=1152, num_slots=288, static_slots=240, dynamic_slots=48), reduces resident MoE weight footprint by 937.24 MiB/layer (53.086 GiB across 58 layers) with zero all-hit decode latency overhead.
+Bit-identical (torch.equal, max_abs_diff = 0.0) to full 384-expert resident MoeExpertsV41Plan across all-hit decode, role-major w13/w2 overlapped cold misses, LBA-sorted multi-miss reads, cross-layer router lookahead prefetches, and multi-window prefill batches. At TP=2 geometry (E=384, H=5120, I=1152, num_slots=288, static_slots=240, dynamic_slots=48), reduces resident MoE weight footprint by 937.24 MiB/layer (53.086 GiB across 58 layers) with zero all-hit decode latency overhead.
 
 Tests:
-- pytest tests/kernels/moe/test_deepseek_v41_expert_slots.py tests/kernels/quantization/test_deepseek_v41_expert_scale_codes.py (34 passed).
+- pytest tests/kernels/moe/test_deepseek_v41_expert_slots.py tests/kernels/quantization/test_deepseek_v41_expert_scale_codes.py (38 passed).
 - pytest tests/kernels/moe/test_deepseek_v41_tilelang_moe.py (139 passed).
 
 Upstream status: local SM121 unified-memory TP=2 native-weight MoE expert slot cache.
 ---
- .../moe/test_deepseek_v41_expert_slots.py     | 365 +++++++
- .../layers/fused_moe/tilelang.py              |  82 +-
- .../deepseek_v4_1/expert_slots/__init__.py    |  27 +
- .../deepseek_v4_1/expert_slots/_native.py     | 172 ++++
- .../deepseek_v4_1/expert_slots/_reader.c      | 743 ++++++++++++++
- .../deepseek_v4_1/expert_slots/cache.py       | 912 ++++++++++++++++++
- vllm/models/deepseek_v4_1/tilelang/moe.py     | 249 ++++-
- 7 files changed, 2504 insertions(+), 46 deletions(-)
+ .../moe/test_deepseek_v41_expert_slots.py     |  649 +++++++++
+ .../layers/fused_moe/tilelang.py              |   88 +-
+ .../deepseek_v4_1/expert_slots/__init__.py    |   33 +
+ .../deepseek_v4_1/expert_slots/_native.py     |  172 +++
+ .../deepseek_v4_1/expert_slots/_reader.c      |  789 ++++++++++
+ .../deepseek_v4_1/expert_slots/cache.py       | 1282 +++++++++++++++++
+ vllm/models/deepseek_v4_1/tilelang/moe.py     |  249 +++-
+ 7 files changed, 3216 insertions(+), 46 deletions(-)
  create mode 100644 tests/kernels/moe/test_deepseek_v41_expert_slots.py
  create mode 100644 vllm/models/deepseek_v4_1/expert_slots/__init__.py
  create mode 100644 vllm/models/deepseek_v4_1/expert_slots/_native.py
@@ -44,10 +44,10 @@ Upstream status: local SM121 unified-memory TP=2 native-weight MoE expert slot c
 
 diff --git a/tests/kernels/moe/test_deepseek_v41_expert_slots.py b/tests/kernels/moe/test_deepseek_v41_expert_slots.py
 new file mode 100644
-index 0000000..e5efe58
+index 0000000..6ed1717
 --- /dev/null
 +++ b/tests/kernels/moe/test_deepseek_v41_expert_slots.py
-@@ -0,0 +1,365 @@
+@@ -0,0 +1,649 @@
 +# SPDX-License-Identifier: Apache-2.0
 +# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 +"""Tests for the zero-copy ``pin_memory`` + ``io_uring`` (``READ_FIXED``) MoE expert slot cache."""
@@ -66,7 +66,10 @@ index 0000000..e5efe58
 +    ExpertSlotCache,
 +    RouterLookaheadPredictor,
 +    alloc_pinned_aligned,
++    compute_uma_slot_budget,
 +    pack_layer_experts,
++    plan_layer_slot_budgets,
++    rank_experts_by_router_bias,
 +)
 +from vllm.models.deepseek_v4_1.tilelang import linear, prepare
 +from vllm.models.deepseek_v4_1.tilelang.moe import MoeExpertsV41Plan
@@ -413,8 +416,289 @@ index 0000000..e5efe58
 +    finally:
 +        if slot_ex._slot_cache is not None:
 +            slot_ex._slot_cache.close()
++
++
++
++def test_unread_lookahead_probation_protects_warm_decode_slots(tmp_path: Path):
++    num_experts = 16
++    num_slots = 8
++    static_slots = 4
++    topk = 3
++    hidden = 256
++    intermediate = 128
++
++    w13, s13, w2, s2 = _make_random_weights(
++        num_experts, hidden, intermediate, seed=501
++    )
++    ref_plan = MoeExpertsV41Plan(
++        num_experts, topk, hidden, intermediate, swiglu_limit=7.0, out_dtype=torch.bfloat16
++    )
++    ref_plan.declare_kernels()
++    ref_weights = ref_plan.prepare_weights(w13, s13, w2, s2)
++
++    slot_plan = MoeExpertsV41Plan(
++        num_experts,
++        topk,
++        hidden,
++        intermediate,
++        swiglu_limit=7.0,
++        out_dtype=torch.bfloat16,
++        num_slots=num_slots,
++        narrow_codes=False,
++    )
++    slot_plan.declare_kernels()
++    slot_prepared_all = slot_plan.prepare_weights(w13, s13, w2, s2)
++    meta = ExpertPackMeta.from_plan(slot_plan)
++    pack_path = pack_layer_experts(
++        tmp_path / "probation.pack", meta, slot_prepared_all[0], slot_prepared_all[1]
++    )
++
++    cache = ExpertSlotCache(
++        meta, pack_path, num_slots=num_slots, static_slots=static_slots
++    )
++    try:
++        # Warm dynamic experts 4 and 5 across several decode steps; leave 6 and 7 cooler.
++        for _ in range(5):
++            w_cb = cache.ensure_active([0, 4, 5], is_prefill=False)
++            if w_cb is not None:
++                w_cb()
++        score_4_before = float(cache.lfu.scores[4])
++        score_5_before = float(cache.lfu.scores[5])
++        assert score_4_before > 2.0 and score_5_before > 2.0
++
++        # Speculatively prefetch cold experts [10, 11]; they must replace the
++        # coldest dynamic slots (6 and 7) with probationary=True and score=0.0.
++        n_pref = cache.prefetch_async([11, 10])
++        assert n_pref == 2
++        slot_10 = int(cache.lfu.expert_to_slot[10])
++        slot_11 = int(cache.lfu.expert_to_slot[11])
++        assert slot_10 in (6, 7) and slot_11 in (6, 7) and slot_10 < slot_11
++        assert bool(cache.lfu.probationary[slot_10]) is True
++        assert bool(cache.lfu.probationary[slot_11]) is True
++        assert float(cache.lfu.scores[10]) == 0.0
++        assert float(cache.lfu.scores[11]) == 0.0
++
++        # Router demands [0, 4, 10]: 10 is promoted (lookahead hit), while 11 was
++        # mispredicted so its probation is cleared and its score stays 0.0.
++        x_bf16 = torch.randn(2, hidden, dtype=torch.bfloat16, device="cuda")
++        x_q = linear.cast_mxfp8(x_bf16)
++        topk_ids = torch.tensor([[0, 4, 10], [1, 5, 10]], dtype=torch.int64, device="cuda")
++        topk_w = torch.softmax(torch.randn(2, topk, dtype=torch.float32, device="cuda"), dim=-1)
++        out_ref = torch.empty(2, hidden, dtype=torch.bfloat16, device="cuda")
++        out_slot = torch.empty(2, hidden, dtype=torch.bfloat16, device="cuda")
++
++        ref_plan.run(x_q, topk_ids, topk_w, ref_weights, out_ref)
++        cache.run(slot_plan, x_q, topk_ids, topk_w, out_slot)
++        torch.cuda.synchronize()
++        assert torch.equal(out_ref, out_slot)
++
++        assert cache.lookahead_hits == 1
++        assert cache.lookahead_evictable == 1
++        assert bool(cache.lfu.probationary[slot_10]) is False
++        assert bool(cache.lfu.probationary[slot_11]) is False
++        assert float(cache.lfu.scores[10]) > 0.0
++        assert float(cache.lfu.scores[11]) == 0.0
++
++        # A subsequent demand miss for cold expert 12 must evict the unhit
++        # lookahead expert 11 (score=0.0) first, preserving warm experts 4, 5, 10.
++        w_cb2 = cache.ensure_active([0, 12], is_prefill=False)
++        if w_cb2 is not None:
++            w_cb2()
++        assert int(cache.lfu.expert_to_slot[12]) == slot_11
++        assert int(cache.lfu.expert_to_slot[11]) == -1
++        assert int(cache.lfu.expert_to_slot[4]) >= static_slots
++        assert int(cache.lfu.expert_to_slot[5]) >= static_slots
++        assert int(cache.lfu.expert_to_slot[10]) == slot_10
++    finally:
++        cache.close()
++
++
++def test_lba_sorted_miss_scheduling_and_contiguous_slot_coalescing(tmp_path: Path):
++    num_experts = 16
++    num_slots = 8
++    static_slots = 4
++    topk = 4
++    hidden = 256
++    intermediate = 128
++
++    w13, s13, w2, s2 = _make_random_weights(
++        num_experts, hidden, intermediate, seed=607
++    )
++    ref_plan = MoeExpertsV41Plan(
++        num_experts, topk, hidden, intermediate, swiglu_limit=7.0, out_dtype=torch.bfloat16
++    )
++    ref_plan.declare_kernels()
++    ref_weights = ref_plan.prepare_weights(w13, s13, w2, s2)
++
++    slot_plan = MoeExpertsV41Plan(
++        num_experts,
++        topk,
++        hidden,
++        intermediate,
++        swiglu_limit=7.0,
++        out_dtype=torch.bfloat16,
++        num_slots=num_slots,
++        narrow_codes=False,
++    )
++    slot_plan.declare_kernels()
++    slot_prepared_all = slot_plan.prepare_weights(w13, s13, w2, s2)
++    meta = ExpertPackMeta.from_plan(slot_plan)
++    pack_path = pack_layer_experts(
++        tmp_path / "lba_coalesce.pack", meta, slot_prepared_all[0], slot_prepared_all[1]
++    )
++
++    cache = ExpertSlotCache(
++        meta, pack_path, num_slots=num_slots, static_slots=static_slots
++    )
++    try:
++        # Demand 4 contiguous cold experts in reverse/scrambled order [15, 12, 14, 13].
++        x_bf16 = torch.randn(2, hidden, dtype=torch.bfloat16, device="cuda")
++        x_q = linear.cast_mxfp8(x_bf16)
++        topk_ids = torch.tensor(
++            [[15, 12, 14, 13], [0, 13, 15, 12]], dtype=torch.int64, device="cuda"
++        )
++        topk_w = torch.softmax(torch.randn(2, topk, dtype=torch.float32, device="cuda"), dim=-1)
++        out_ref = torch.empty(2, hidden, dtype=torch.bfloat16, device="cuda")
++        out_slot = torch.empty(2, hidden, dtype=torch.bfloat16, device="cuda")
++
++        ref_plan.run(x_q, topk_ids, topk_w, ref_weights, out_ref)
++        cache.run(slot_plan, x_q, topk_ids, topk_w, out_slot)
++        torch.cuda.synchronize()
++        assert torch.equal(out_ref, out_slot)
++
++        # Verify LBA-sorted expert-to-slot binding: 12->4, 13->5, 14->6, 15->7.
++        assigned_slots = [int(cache.lfu.expert_to_slot[e]) for e in (12, 13, 14, 15)]
++        assert assigned_slots == [4, 5, 6, 7]
++        rstats = cache.reader_stats()
++        assert rstats["lba_ordered_submissions"] >= 1
++        assert rstats["contiguous_slot_pairs"] >= 3
++    finally:
++        cache.close()
++
++
++def test_router_bias_seeding_and_layer_slot_budget_planner(tmp_path: Path):
++    num_experts = 16
++    num_slots = 8
++    static_slots = 4
++    topk = 3
++    hidden = 256
++    intermediate = 128
++
++    # Construct router bias where tail experts 12..15 have the highest prior bias.
++    bias = torch.linspace(-1.0, 1.0, steps=num_experts, dtype=torch.float32)
++    bias[12:] += 5.0
++    ranked = rank_experts_by_router_bias(bias)
++    assert set(ranked[:4]) == {12, 13, 14, 15}
++    assert ranked[0] == 15
++
++    # Empirical hotlist_counts boosts expert 7 to the top even with lower bias.
++    hotlist = torch.zeros(num_experts, dtype=torch.float32)
++    hotlist[7] = 10000.0
++    ranked_hot = rank_experts_by_router_bias(bias, hotlist_counts=hotlist)
++    assert ranked_hot[0] == 7
++
++    # Verify ExpertSlotCache seeds static_slots from router_bias automatically.
++    w13, s13, w2, s2 = _make_random_weights(
++        num_experts, hidden, intermediate, seed=709
++    )
++    slot_plan = MoeExpertsV41Plan(
++        num_experts,
++        topk,
++        hidden,
++        intermediate,
++        swiglu_limit=7.0,
++        out_dtype=torch.bfloat16,
++        num_slots=num_slots,
++        narrow_codes=False,
++    )
++    slot_plan.declare_kernels()
++    slot_prepared_all = slot_plan.prepare_weights(w13, s13, w2, s2)
++    meta = ExpertPackMeta.from_plan(slot_plan)
++    pack_path = pack_layer_experts(
++        tmp_path / "router_bias.pack", meta, slot_prepared_all[0], slot_prepared_all[1]
++    )
++    cache = ExpertSlotCache(
++        meta,
++        pack_path,
++        num_slots=num_slots,
++        static_slots=static_slots,
++        router_bias=bias,
++    )
++    try:
++        # Static slots 0..3 must hold the top-4 biased experts {15, 14, 13, 12},
++        # so a decode step routing to [12, 13, 14, 15] incurs zero misses.
++        w_cb = cache.ensure_active([12, 13, 14, 15], is_prefill=False)
++        assert w_cb is None
++        assert cache.misses == 0
++        assert cache.hits == 4
++    finally:
++        cache.close()
++
++    # Verify layer-adaptive slot budget planner across concentrated vs diffuse layers.
++    peaked_bias = torch.zeros(384, dtype=torch.float32)
++    peaked_bias[:8] = 10.0  # Very low routing entropy (concentrated on 8 experts)
++    diffuse_bias = torch.zeros(384, dtype=torch.float32)  # Maximum routing entropy
++    moderate_bias = torch.linspace(-0.5, 0.5, steps=384, dtype=torch.float32)
++
++    budgets = plan_layer_slot_budgets(
++        [peaked_bias, moderate_bias, diffuse_bias],
++        total_slot_budget=3 * 256,
++        min_slots_per_layer=96,
++        max_slots_per_layer=360,
++        dynamic_slots_per_layer=48,
++    )
++    assert len(budgets) == 3
++    assert sum(b[0] for b in budgets) == 3 * 256
++    for total_s, static_s in budgets:
++        assert 96 <= total_s <= 360
++        assert static_s == total_s - 48
++    # Diffuse (high-entropy) layer gets strictly more slots than peaked layer.
++    assert budgets[2][0] >= budgets[1][0] > budgets[0][0]
++
++
++def test_compute_uma_slot_budget():
++    # 115 GiB available, 8 GiB system, 12 GiB KV, 24 GiB non-routed -> 71 GiB for MoE.
++    gib = 1 << 30
++    slots_58 = compute_uma_slot_budget(
++        num_layers=58,
++        expert_bytes=9_134_080,
++        non_routed_bytes=24 * gib,
++        kv_reserve_bytes=12 * gib,
++        system_reserve_bytes=8 * gib,
++        available_bytes=115 * gib,
++    )
++    expected = (71 * gib // 58) // 9_134_080
++    assert slots_58 == expected
++    assert 64 <= slots_58 <= 384
++
++    # Clamp to min_slots when available memory is tight, and max_slots when abundant.
++    assert (
++        compute_uma_slot_budget(
++            num_layers=58,
++            expert_bytes=9_134_080,
++            available_bytes=10 * gib,
++            system_reserve_bytes=8 * gib,
++            min_slots=64,
++            max_slots=384,
++        )
++        == 64
++    )
++    assert (
++        compute_uma_slot_budget(
++            num_layers=40,
++            expert_bytes=9_134_080,
++            available_bytes=256 * gib,
++            system_reserve_bytes=8 * gib,
++            min_slots=64,
++            max_slots=384,
++        )
++        == 384
++    )
++    # Also verify live /proc/meminfo fallback returns a valid clamped slot count.
++    live_slots = compute_uma_slot_budget(num_layers=58, expert_bytes=9_134_080)
++    assert 64 <= live_slots <= 384
 diff --git a/vllm/model_executor/layers/fused_moe/tilelang.py b/vllm/model_executor/layers/fused_moe/tilelang.py
-index e767700..65e7135 100644
+index e767700..e3780f8 100644
 --- a/vllm/model_executor/layers/fused_moe/tilelang.py
 +++ b/vllm/model_executor/layers/fused_moe/tilelang.py
 @@ -20,6 +20,7 @@ rest of the batch.
@@ -456,7 +740,7 @@ index e767700..65e7135 100644
          # The plan's geometry; its kernels are declared when the worker prepares
          # kernels (``declare_kernels``).
          self._plan = moe.MoeExpertsV41Plan(
-@@ -212,7 +223,47 @@ class TileLangExperts(mk.FusedMoEExpertsModular):
+@@ -212,7 +223,53 @@ class TileLangExperts(mk.FusedMoEExpertsModular):
              if idx_dtype is not None
              else (torch.int32, torch.int64),
              max_rows=getattr(router, "max_rows", None),
@@ -480,12 +764,18 @@ index e767700..65e7135 100644
 +                del g13, g2
 +            else:
 +                del w13, w2
++            router_bias = slot_cfg.get("router_bias")
++            if router_bias is None:
++                router_bias = getattr(layer, "e_score_correction_bias", None)
 +            self._slot_cache = ExpertSlotCache(
 +                meta,
 +                pack_path,
 +                num_slots=int(slot_cfg["num_slots"]),
 +                static_slots=int(slot_cfg["static_slots"]),
 +                initial_experts=slot_cfg.get("initial_experts"),
++                router_bias=router_bias,
++                gate_weight=slot_cfg.get("gate_weight"),
++                hotlist_counts=slot_cfg.get("hotlist_counts"),
 +                half_life_steps=float(slot_cfg.get("half_life_steps", 64.0)),
 +                prefill_protect_rows=int(slot_cfg.get("prefill_protect_rows", 16)),
 +                device=layer.w13_weight.device,
@@ -504,7 +794,7 @@ index e767700..65e7135 100644
          # Tile-major copies replace the checkpoint layout, so each GEMM tile's
          # weights and scale codes are contiguous. A K that ends 64 past a multiple
          # of 128 (TP4's 576-wide rows) keeps its last 64 columns as compact tails.
-@@ -324,15 +375,28 @@ class TileLangExperts(mk.FusedMoEExpertsModular):
+@@ -324,15 +381,28 @@ class TileLangExperts(mk.FusedMoEExpertsModular):
              shared = self.combine_addend
          if self.defer_combine:
              assert self.fold_shared, "only a folded combine is deferred"
@@ -544,13 +834,13 @@ index e767700..65e7135 100644
  
 diff --git a/vllm/models/deepseek_v4_1/expert_slots/__init__.py b/vllm/models/deepseek_v4_1/expert_slots/__init__.py
 new file mode 100644
-index 0000000..44cc657
+index 0000000..574bfe0
 --- /dev/null
 +++ b/vllm/models/deepseek_v4_1/expert_slots/__init__.py
-@@ -0,0 +1,27 @@
+@@ -0,0 +1,33 @@
 +# SPDX-License-Identifier: Apache-2.0
 +# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-+"""Zero-copy ``pin_memory`` + ``io_uring`` (``READ_FIXED``) routed MoE expert slot cache."""
++"""Zero-copy pin_memory + io_uring (READ_FIXED) routed MoE expert slot cache."""
 +
 +from .cache import (
 +    DEFAULT_PIN_ALIGN,
@@ -561,7 +851,10 @@ index 0000000..44cc657
 +    RouterLookaheadPredictor,
 +    alloc_pinned_aligned,
 +    as_cuda_zero_copy,
++    compute_uma_slot_budget,
 +    pack_layer_experts,
++    plan_layer_slot_budgets,
++    rank_experts_by_router_bias,
 +)
 +
 +__all__ = [
@@ -573,7 +866,10 @@ index 0000000..44cc657
 +    "RouterLookaheadPredictor",
 +    "alloc_pinned_aligned",
 +    "as_cuda_zero_copy",
++    "compute_uma_slot_budget",
 +    "pack_layer_experts",
++    "plan_layer_slot_budgets",
++    "rank_experts_by_router_bias",
 +]
 diff --git a/vllm/models/deepseek_v4_1/expert_slots/_native.py b/vllm/models/deepseek_v4_1/expert_slots/_native.py
 new file mode 100644
@@ -755,10 +1051,10 @@ index 0000000..a1ef235
 +    return module
 diff --git a/vllm/models/deepseek_v4_1/expert_slots/_reader.c b/vllm/models/deepseek_v4_1/expert_slots/_reader.c
 new file mode 100644
-index 0000000..abdc4a7
+index 0000000..82ed20e
 --- /dev/null
 +++ b/vllm/models/deepseek_v4_1/expert_slots/_reader.c
-@@ -0,0 +1,743 @@
+@@ -0,0 +1,789 @@
 +/* SPDX-License-Identifier: Apache-2.0
 + * SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 + *
@@ -869,7 +1165,26 @@ index 0000000..abdc4a7
 +    uint64_t w2_wait_ns;
 +    uint64_t submissions;
 +    uint64_t experts_loaded;
++    uint64_t lba_ordered_submissions;
++    uint64_t contiguous_slot_pairs;
 +} expert_slot_reader_t;
++
++typedef struct {
++    int32_t expert;
++    int32_t dyn_slot;
++} expert_slot_req_t;
++
++static int cmp_expert_slot_req(const void *a, const void *b) {
++    const expert_slot_req_t *ra = (const expert_slot_req_t *)a;
++    const expert_slot_req_t *rb = (const expert_slot_req_t *)b;
++    if (ra->expert != rb->expert) {
++        return (ra->expert < rb->expert) ? -1 : 1;
++    }
++    if (ra->dyn_slot != rb->dyn_slot) {
++        return (ra->dyn_slot < rb->dyn_slot) ? -1 : 1;
++    }
++    return 0;
++}
 +
 +static uint64_t monotonic_ns(void) {
 +    struct timespec ts;
@@ -1237,19 +1552,35 @@ index 0000000..abdc4a7
 +    const int32_t *experts = (const int32_t *)experts_buf.buf;
 +    const int32_t *dyn_slots = (const int32_t *)slots_buf.buf;
 +
++    expert_slot_req_t *reqs = NULL;
++    if (count > 0) {
++        reqs = (expert_slot_req_t *)malloc((size_t)count * sizeof(expert_slot_req_t));
++        if (reqs == NULL) {
++            PyBuffer_Release(&experts_buf);
++            PyBuffer_Release(&slots_buf);
++            return PyErr_NoMemory();
++        }
++    }
 +    for (unsigned i = 0; i < count; i++) {
 +        if (experts[i] < 0 || (unsigned)experts[i] >= r->num_experts) {
++            free(reqs);
 +            PyBuffer_Release(&experts_buf);
 +            PyBuffer_Release(&slots_buf);
 +            PyErr_Format(PyExc_ValueError, "expert id %d out of range 0..%u", experts[i], r->num_experts);
 +            return NULL;
 +        }
 +        if (dyn_slots[i] < 0 || (unsigned)dyn_slots[i] >= r->dynamic_slots) {
++            free(reqs);
 +            PyBuffer_Release(&experts_buf);
 +            PyBuffer_Release(&slots_buf);
 +            PyErr_Format(PyExc_ValueError, "dynamic slot %d out of range 0..%u", dyn_slots[i], r->dynamic_slots);
 +            return NULL;
 +        }
++        reqs[i].expert = experts[i];
++        reqs[i].dyn_slot = dyn_slots[i];
++    }
++    if (count > 1) {
++        qsort(reqs, (size_t)count, sizeof(expert_slot_req_t), cmp_expert_slot_req);
 +    }
 +
 +    char err_buf[256] = {0};
@@ -1257,7 +1588,14 @@ index 0000000..abdc4a7
 +    unsigned D = r->dynamic_slots;
 +
 +    Py_BEGIN_ALLOW_THREADS
-+    /* Phase 1: submit all w13 reads first (role-major ordering). */
++    for (unsigned i = 1; i < count; i++) {
++        if (reqs[i].expert == reqs[i - 1].expert + 1 &&
++            reqs[i].dyn_slot == reqs[i - 1].dyn_slot + 1) {
++            r->contiguous_slot_pairs++;
++        }
++    }
++
++    /* Phase 1: submit all w13 reads first in ascending LBA order. */
 +    for (unsigned i = 0; i < count && err == 0; i++) {
 +        while (r->pending_w13 + r->pending_w2 + 2u > RING_DEPTH) {
 +            io_uring_submit(&r->ring);
@@ -1268,8 +1606,8 @@ index 0000000..abdc4a7
 +        }
 +        if (err < 0) break;
 +
-+        unsigned e = (unsigned)experts[i];
-+        unsigned d = (unsigned)dyn_slots[i];
++        unsigned e = (unsigned)reqs[i].expert;
++        unsigned d = (unsigned)reqs[i].dyn_slot;
 +        off_t base_off = (off_t)((size_t)e * r->expert_stride);
 +
 +        struct io_uring_sqe *sqe_tiles = io_uring_get_sqe(&r->ring);
@@ -1316,8 +1654,8 @@ index 0000000..abdc4a7
 +        }
 +        if (err < 0) break;
 +
-+        unsigned e = (unsigned)experts[i];
-+        unsigned d = (unsigned)dyn_slots[i];
++        unsigned e = (unsigned)reqs[i].expert;
++        unsigned d = (unsigned)reqs[i].dyn_slot;
 +        off_t w2_off = (off_t)((size_t)e * r->expert_stride + r->w13_role_bytes);
 +
 +        struct io_uring_sqe *sqe_tiles = io_uring_get_sqe(&r->ring);
@@ -1360,11 +1698,13 @@ index 0000000..abdc4a7
 +            err = -1;
 +        } else {
 +            r->submissions++;
++            r->lba_ordered_submissions++;
 +            r->experts_loaded += count;
 +        }
 +    }
 +    Py_END_ALLOW_THREADS
 +
++    free(reqs);
 +    PyBuffer_Release(&experts_buf);
 +    PyBuffer_Release(&slots_buf);
 +
@@ -1439,7 +1779,7 @@ index 0000000..abdc4a7
 +        return NULL;
 +    }
 +    return Py_BuildValue(
-+        "{s:O,s:O,s:O,s:I,s:I,s:K,s:K,s:K,s:K,s:K,s:K,s:K}",
++        "{s:O,s:O,s:O,s:I,s:I,s:K,s:K,s:K,s:K,s:K,s:K,s:K,s:K,s:K}",
 +        "o_direct", r->o_direct ? Py_True : Py_False,
 +        "buffers_registered", r->buffers_registered ? Py_True : Py_False,
 +        "files_registered", r->files_registered ? Py_True : Py_False,
@@ -1451,7 +1791,9 @@ index 0000000..abdc4a7
 +        "w13_wait_ns", (unsigned long long)r->w13_wait_ns,
 +        "w2_wait_ns", (unsigned long long)r->w2_wait_ns,
 +        "submissions", (unsigned long long)r->submissions,
-+        "experts_loaded", (unsigned long long)r->experts_loaded
++        "experts_loaded", (unsigned long long)r->experts_loaded,
++        "lba_ordered_submissions", (unsigned long long)r->lba_ordered_submissions,
++        "contiguous_slot_pairs", (unsigned long long)r->contiguous_slot_pairs
 +    );
 +}
 +
@@ -1504,10 +1846,10 @@ index 0000000..abdc4a7
 +}
 diff --git a/vllm/models/deepseek_v4_1/expert_slots/cache.py b/vllm/models/deepseek_v4_1/expert_slots/cache.py
 new file mode 100644
-index 0000000..9e8a301
+index 0000000..e0eeb0b
 --- /dev/null
 +++ b/vllm/models/deepseek_v4_1/expert_slots/cache.py
-@@ -0,0 +1,912 @@
+@@ -0,0 +1,1282 @@
 +# SPDX-License-Identifier: Apache-2.0
 +# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 +"""Zero-copy ``pin_memory`` + ``io_uring`` (``READ_FIXED``) routed MoE expert slot cache.
@@ -1533,8 +1875,10 @@ index 0000000..9e8a301
 +
 +from __future__ import annotations
 +
-+from collections.abc import Callable, Iterable
++from collections.abc import Callable, Iterable, Sequence
 +from dataclasses import dataclass
++import math
++import os
 +from pathlib import Path
 +
 +import numpy as np
@@ -1794,6 +2138,226 @@ index 0000000..9e8a301
 +    return target
 +
 +
++
++
++def _to_1d_float64(values: torch.Tensor | np.ndarray | Sequence[float]) -> np.ndarray:
++    if isinstance(values, torch.Tensor):
++        return values.detach().cpu().to(torch.float64).reshape(-1).numpy().copy()
++    return np.asarray(values, dtype=np.float64).reshape(-1).copy()
++
++
++def _zscore(arr: np.ndarray) -> np.ndarray:
++    if arr.size == 0:
++        return arr
++    std = float(np.std(arr))
++    if std <= 1e-12:
++        return arr - float(np.mean(arr))
++    return (arr - float(np.mean(arr))) / std
++
++
++def rank_experts_by_router_bias(
++    e_score_correction_bias: torch.Tensor | np.ndarray | Sequence[float],
++    gate_weight: torch.Tensor | None = None,
++    hotlist_counts: torch.Tensor | np.ndarray | Sequence[float] | None = None,
++) -> list[int]:
++    """Rank experts ``0 .. E - 1`` from hottest to coldest using checkpoint router
++    bias (``e_score_correction_bias``), optional router ``gate_weight`` row L2
++    norms, and optional empirical ``hotlist_counts``."""
++    bias = _to_1d_float64(e_score_correction_bias)
++    num_experts = int(bias.size)
++    if num_experts == 0:
++        return []
++
++    prior = _zscore(bias)
++    if gate_weight is not None:
++        gw = gate_weight.detach().cpu().to(torch.float64)
++        if gw.ndim == 2 and gw.shape[0] == num_experts:
++            row_norms = torch.linalg.vector_norm(gw, dim=-1).numpy()
++            prior = prior + 0.25 * _zscore(row_norms)
++
++    if hotlist_counts is not None:
++        counts = _to_1d_float64(hotlist_counts)
++        if counts.size != num_experts:
++            raise ValueError(
++                f"hotlist_counts length {counts.size} != num_experts {num_experts}"
++            )
++        log_counts = np.log1p(np.maximum(counts, 0.0))
++        if float(np.max(log_counts)) > 0.0:
++            prior = prior + 2.0 * _zscore(log_counts)
++
++    return [
++        idx
++        for idx, _ in sorted(
++            enumerate(prior.tolist()),
++            key=lambda item: (-item[1], item[0]),
++        )
++    ]
++
++
++def plan_layer_slot_budgets(
++    layer_biases: Sequence[torch.Tensor | np.ndarray | Sequence[float]],
++    total_slot_budget: int,
++    min_slots_per_layer: int = 64,
++    max_slots_per_layer: int = 384,
++    dynamic_slots_per_layer: int = 48,
++    *,
++    temperature: float | None = None,
++) -> list[tuple[int, int]]:
++    """Distribute ``total_slot_budget`` across MoE layers proportionally to each
++    layer's routing Shannon entropy, returning ``[(num_slots_l, static_slots_l), ...]``."""
++    num_layers = len(layer_biases)
++    if num_layers == 0:
++        return []
++    if min_slots_per_layer < 1 or min_slots_per_layer > max_slots_per_layer:
++        raise ValueError(
++            f"invalid slot bounds: min={min_slots_per_layer}, max={max_slots_per_layer}"
++        )
++
++    arrays = [_to_1d_float64(b) for b in layer_biases]
++    stds = [float(np.std(a)) for a in arrays if a.size > 0]
++    median_std = float(np.median(stds)) if stds else 0.0
++    temp = (
++        float(temperature)
++        if temperature is not None
++        else (0.05 if 0.0 < median_std < 0.25 else 1.0)
++    )
++    if temp <= 0.0:
++        raise ValueError(f"temperature must be positive, got {temp}")
++
++    weights: list[float] = []
++    for arr in arrays:
++        if arr.size <= 1:
++            weights.append(1.0)
++            continue
++        centered = (arr - float(np.mean(arr))) / temp
++        shifted = centered - float(np.max(centered))
++        exps = np.exp(shifted)
++        probs = exps / float(np.sum(exps))
++        entropy = -float(np.sum(probs * np.log(np.maximum(probs, 1e-30))))
++        weights.append(max(1e-6, entropy))
++
++    min_total = num_layers * min_slots_per_layer
++    max_total = num_layers * max_slots_per_layer
++    target_total = max(min_total, min(max_total, int(total_slot_budget)))
++
++    alloc = [float(min_slots_per_layer) for _ in range(num_layers)]
++    remaining = float(target_total - min_total)
++    active = {i for i in range(num_layers) if alloc[i] < max_slots_per_layer}
++
++    while remaining > 1e-9 and active:
++        w_sum = sum(weights[i] for i in active)
++        if w_sum <= 0.0:
++            share = remaining / len(active)
++            for i in list(active):
++                add = min(float(max_slots_per_layer) - alloc[i], share)
++                alloc[i] += add
++                remaining -= add
++                if alloc[i] >= max_slots_per_layer - 1e-9:
++                    active.remove(i)
++            continue
++
++        capped_any = False
++        for i in list(active):
++            ideal_add = remaining * (weights[i] / w_sum)
++            if alloc[i] + ideal_add >= max_slots_per_layer - 1e-9:
++                used = float(max_slots_per_layer) - alloc[i]
++                alloc[i] = float(max_slots_per_layer)
++                remaining -= used
++                active.remove(i)
++                capped_any = True
++        if not capped_any:
++            for i in active:
++                alloc[i] += remaining * (weights[i] / w_sum)
++            remaining = 0.0
++            break
++
++    floors = [
++        max(min_slots_per_layer, min(max_slots_per_layer, int(math.floor(x + 1e-9))))
++        for x in alloc
++    ]
++    deficit = target_total - sum(floors)
++    if deficit > 0:
++        order = sorted(
++            range(num_layers),
++            key=lambda i: (-(alloc[i] - floors[i]), -weights[i], i),
++        )
++        for i in order:
++            if deficit <= 0:
++                break
++            if floors[i] < max_slots_per_layer:
++                floors[i] += 1
++                deficit -= 1
++    elif deficit < 0:
++        order = sorted(
++            range(num_layers),
++            key=lambda i: ((alloc[i] - floors[i]), weights[i], -i),
++        )
++        for i in order:
++            if deficit >= 0:
++                break
++            if floors[i] > min_slots_per_layer:
++                floors[i] -= 1
++                deficit += 1
++
++    result: list[tuple[int, int]] = []
++    for slots in floors:
++        dyn = min(max(0, int(dynamic_slots_per_layer)), slots)
++        static = max(0, slots - dyn)
++        result.append((int(slots), int(static)))
++    return result
++
++
++def _read_proc_memavailable_bytes() -> int:
++    try:
++        with open("/proc/meminfo", encoding="utf-8") as f:
++            for line in f:
++                if line.startswith("MemAvailable:"):
++                    parts = line.split()
++                    return int(parts[1]) * 1024
++    except OSError:
++        pass
++    try:
++        page_size = int(os.sysconf("SC_PAGE_SIZE"))
++        phys_pages = int(os.sysconf("SC_PHYS_PAGES"))
++        if page_size > 0 and phys_pages > 0:
++            return page_size * phys_pages
++    except (ValueError, OSError, AttributeError):
++        pass
++    return 120 * (1 << 30)
++
++
++def compute_uma_slot_budget(
++    num_layers: int = 58,
++    expert_bytes: int = 9_134_080,
++    non_routed_bytes: int = 0,
++    kv_reserve_bytes: int = 0,
++    system_reserve_bytes: int = 8 * (1 << 30),
++    available_bytes: int | None = None,
++    *,
++    min_slots: int = 64,
++    max_slots: int = 384,
++) -> int:
++    """Compute a safe per-layer resident MoE slot budget from Linux ``MemAvailable``
++    on integrated-memory (UMA) hosts after subtracting system, KV, and non-routed
++    weight reserves."""
++    if num_layers <= 0 or expert_bytes <= 0:
++        raise ValueError(
++            f"num_layers ({num_layers}) and expert_bytes ({expert_bytes}) must be positive"
++        )
++    avail = (
++        int(available_bytes)
++        if available_bytes is not None
++        else _read_proc_memavailable_bytes()
++    )
++    usable = max(
++        0,
++        avail - int(system_reserve_bytes) - int(kv_reserve_bytes) - int(non_routed_bytes),
++    )
++    per_layer_bytes = usable // int(num_layers)
++    raw_slots = per_layer_bytes // int(expert_bytes)
++    return int(max(min_slots, min(max_slots, raw_slots)))
++
++
 +class CountDecayLFU:
 +    """Decayed-frequency (``count_decay``) slot replacement with cold-prefill protection.
 +
@@ -1841,6 +2405,7 @@ index 0000000..9e8a301
 +        self.slot_to_expert = np.full((num_slots,), -1, dtype=np.int32)
 +        self.scores = np.zeros((num_experts,), dtype=np.float32)
 +        self.last_used = np.zeros((num_slots,), dtype=np.int64)
++        self.probationary = np.zeros((num_slots,), dtype=bool)
 +        self.step = 0
 +
 +        for slot, exp in enumerate(order):
@@ -1863,7 +2428,71 @@ index 0000000..9e8a301
 +                self.scores[exp] += bump
 +                slot = int(self.expert_to_slot[exp])
 +                if slot >= 0:
++                    self.probationary[slot] = False
 +                    self.last_used[slot] = self.step
++
++    def promote_probationary(self, expert_id: int) -> bool:
++        """Promote an unread lookahead slot to a normal resident slot when demanded."""
++        if 0 <= expert_id < self.num_experts:
++            slot = int(self.expert_to_slot[expert_id])
++            if slot >= self.static_slots and bool(self.probationary[slot]):
++                self.probationary[slot] = False
++                self.last_used[slot] = self.step
++                return True
++        return False
++
++    def clear_probation(self) -> int:
++        """Clear temporary lookahead protection on any unpromoted probationary slots,
++        leaving their score at 0.0 and last_used at 0 so they are evicted first."""
++        if self.dynamic_slots <= 0:
++            return 0
++        dyn_prob = self.probationary[self.static_slots : self.num_slots]
++        count = int(np.count_nonzero(dyn_prob))
++        if count > 0:
++            dyn_prob[:] = False
++        return count
++
++    def _candidate_dynamic_slots(
++        self,
++        protected_experts: set[int],
++        *,
++        is_prefill: bool = False,
++    ) -> list[tuple[int, float, int, int]]:
++        candidates: list[tuple[int, float, int, int]] = []
++        for slot in range(self.static_slots, self.num_slots):
++            if bool(self.probationary[slot]):
++                continue
++            occ = int(self.slot_to_expert[slot])
++            if occ in protected_experts:
++                continue
++            score = float(self.scores[occ]) if occ >= 0 else -1.0
++            hot_flag = 1 if (is_prefill and score >= self.hot_threshold) else 0
++            candidates.append((hot_flag, score, int(self.last_used[slot]), slot))
++        candidates.sort()
++        return candidates
++
++    def _bind_slot(
++        self,
++        victim_slot: int,
++        new_expert: int,
++        *,
++        is_prefill: bool,
++        probationary: bool,
++    ) -> None:
++        old_expert = int(self.slot_to_expert[victim_slot])
++        if old_expert >= 0:
++            self.expert_to_slot[old_expert] = -1
++        self.expert_to_slot[new_expert] = victim_slot
++        self.slot_to_expert[victim_slot] = new_expert
++        if probationary:
++            self.probationary[victim_slot] = True
++            self.scores[new_expert] = 0.0
++            self.last_used[victim_slot] = 0
++        else:
++            self.probationary[victim_slot] = False
++            self.last_used[victim_slot] = self.step
++            if self.scores[new_expert] <= 0.0:
++                self.scores[new_expert] = 0.25 if is_prefill else 1.0
 +
 +    def allocate_dynamic_slot(
 +        self,
@@ -1871,6 +2500,7 @@ index 0000000..9e8a301
 +        protected_experts: set[int],
 +        *,
 +        is_prefill: bool = False,
++        probationary: bool = False,
 +    ) -> int:
 +        """Select a victim dynamic slot ``s in [static_slots, num_slots - 1]`` for
 +        ``new_expert`` without evicting any expert in ``protected_experts``."""
@@ -1882,32 +2512,70 @@ index 0000000..9e8a301
 +                f"expert {new_expert} missed but dynamic_slots == 0"
 +            )
 +
-+        candidates: list[tuple[int, float, int, int]] = []
-+        for slot in range(self.static_slots, self.num_slots):
-+            occ = int(self.slot_to_expert[slot])
-+            if occ in protected_experts:
-+                continue
-+            score = float(self.scores[occ]) if occ >= 0 else -1.0
-+            hot_flag = 1 if (is_prefill and score >= self.hot_threshold) else 0
-+            candidates.append((hot_flag, score, int(self.last_used[slot]), slot))
-+
++        candidates = self._candidate_dynamic_slots(
++            protected_experts, is_prefill=is_prefill
++        )
 +        if not candidates:
 +            raise RuntimeError(
 +                f"no unpinned dynamic slot available for expert {new_expert} "
 +                f"(protected={len(protected_experts)}, dynamic_slots={self.dynamic_slots})"
 +            )
 +
-+        candidates.sort()
 +        victim_slot = candidates[0][3]
-+        old_expert = int(self.slot_to_expert[victim_slot])
-+        if old_expert >= 0:
-+            self.expert_to_slot[old_expert] = -1
-+        self.expert_to_slot[new_expert] = victim_slot
-+        self.slot_to_expert[victim_slot] = new_expert
-+        self.last_used[victim_slot] = self.step
-+        if self.scores[new_expert] <= 0.0:
-+            self.scores[new_expert] = 0.25 if is_prefill else 1.0
++        self._bind_slot(
++            victim_slot,
++            new_expert,
++            is_prefill=is_prefill,
++            probationary=probationary,
++        )
 +        return victim_slot
++
++    def allocate_dynamic_slots_lba(
++        self,
++        miss_experts: Iterable[int],
++        protected_experts: set[int],
++        *,
++        is_prefill: bool = False,
++        probationary: bool = False,
++    ) -> tuple[list[int], list[int]]:
++        """Allocate dynamic slots for multiple missed experts by sorting both the
++        missed expert IDs (ascending LBA file offset) and the chosen victim dynamic
++        slots (ascending buffer address) before binding ``e_k -> s_k``."""
++        sorted_experts = sorted(
++            {
++                int(e)
++                for e in miss_experts
++                if 0 <= int(e) < self.num_experts
++                and int(self.expert_to_slot[int(e)]) < 0
++            }
++        )
++        if not sorted_experts:
++            return [], []
++        if self.dynamic_slots <= 0:
++            raise RuntimeError(
++                f"{len(sorted_experts)} experts missed but dynamic_slots == 0"
++            )
++
++        candidates = self._candidate_dynamic_slots(
++            protected_experts | set(sorted_experts),
++            is_prefill=is_prefill,
++        )
++        needed = len(sorted_experts)
++        if len(candidates) < needed:
++            raise RuntimeError(
++                f"need {needed} dynamic slots but only {len(candidates)} available "
++                f"(protected={len(protected_experts)}, dynamic_slots={self.dynamic_slots})"
++            )
++
++        sorted_slots = sorted(c[3] for c in candidates[:needed])
++        for exp, slot in zip(sorted_experts, sorted_slots):
++            self._bind_slot(
++                slot,
++                exp,
++                is_prefill=is_prefill,
++                probationary=probationary,
++            )
++        return sorted_experts, sorted_slots
 +
 +
 +class RouterLookaheadPredictor:
@@ -1953,6 +2621,9 @@ index 0000000..9e8a301
 +        num_slots: int,
 +        static_slots: int,
 +        initial_experts: Iterable[int] | None = None,
++        router_bias: torch.Tensor | np.ndarray | Sequence[float] | None = None,
++        gate_weight: torch.Tensor | None = None,
++        hotlist_counts: torch.Tensor | np.ndarray | Sequence[float] | None = None,
 +        half_life_steps: float = 64.0,
 +        prefill_protect_rows: int = 16,
 +        device: torch.device | str | None = None,
@@ -1965,6 +2636,21 @@ index 0000000..9e8a301
 +        self.dynamic_slots = num_slots - static_slots
 +        self.prefill_protect_rows = prefill_protect_rows
 +        self.device = torch.device("cuda" if device is None else device)
++
++        if initial_experts is None and (
++            router_bias is not None or hotlist_counts is not None
++        ):
++            bias_input = (
++                router_bias
++                if router_bias is not None
++                else np.zeros((meta.num_experts,), dtype=np.float32)
++            )
++            ranked = rank_experts_by_router_bias(
++                bias_input,
++                gate_weight=gate_weight,
++                hotlist_counts=hotlist_counts,
++            )
++            initial_experts = ranked[:num_slots]
 +
 +        self.lfu = CountDecayLFU(
 +            meta.num_experts,
@@ -2077,6 +2763,7 @@ index 0000000..9e8a301
 +        self.misses: int = 0
 +        self.lookahead_submitted: int = 0
 +        self.lookahead_hits: int = 0
++        self.lookahead_evictable: int = 0
 +        self.prefill_windows: int = 0
 +
 +    def _open_native_reader(
@@ -2157,6 +2844,7 @@ index 0000000..9e8a301
 +                "misses": self.misses,
 +                "lookahead_submitted": self.lookahead_submitted,
 +                "lookahead_hits": self.lookahead_hits,
++                "lookahead_evictable": self.lookahead_evictable,
 +                "prefill_windows": self.prefill_windows,
 +            }
 +        )
@@ -2173,41 +2861,55 @@ index 0000000..9e8a301
 +        *,
 +        max_prefetch: int | None = None,
 +    ) -> int:
-+        """Issue non-blocking role-major ``io_uring`` reads for predicted cold experts."""
++        """Issue non-blocking LBA-sorted role-major ``io_uring`` reads for predicted
++        cold experts into probationary dynamic slots (``score = 0.0`` until demanded)."""
 +        if self.dynamic_slots <= 0:
 +            return 0
 +        if self._w2_pending:
 +            self._mod.wait_role(self._reader, self._mod.ROLE_ALL)
 +            self._w2_pending = False
++            self.lookahead_evictable += self.lfu.clear_probation()
 +            self._in_flight_lookahead.clear()
 +
-+        unique_pred = []
-+        seen = set()
++        unique_pred: list[int] = []
++        seen: set[int] = set()
 +        for e in predicted_experts:
 +            ei = int(e)
 +            if 0 <= ei < self.num_experts and ei not in seen:
 +                seen.add(ei)
 +                unique_pred.append(ei)
 +
-+        cap = self.dynamic_slots if max_prefetch is None else min(max_prefetch, self.dynamic_slots)
++        cap = (
++            self.dynamic_slots
++            if max_prefetch is None
++            else min(max_prefetch, self.dynamic_slots)
++        )
++        cold_candidates: list[int] = []
 +        protected = set(unique_pred) | self._in_flight_lookahead
-+        miss_experts: list[int] = []
-+        miss_dyn_slots: list[int] = []
-+
++        avail_candidates = self.lfu._candidate_dynamic_slots(
++            protected, is_prefill=False
++        )
++        max_alloc = min(cap, len(avail_candidates))
 +        for exp in unique_pred:
 +            if int(self.lfu.expert_to_slot[exp]) >= 0:
 +                continue
-+            if len(miss_experts) >= cap:
++            if len(cold_candidates) >= max_alloc:
 +                break
-+            if len(protected) >= self.static_slots + self.dynamic_slots:
-+                break
-+            slot = self.lfu.allocate_dynamic_slot(exp, protected, is_prefill=False)
-+            protected.add(exp)
-+            miss_experts.append(exp)
-+            miss_dyn_slots.append(slot - self.static_slots)
-+            self._in_flight_lookahead.add(exp)
++            cold_candidates.append(exp)
 +
++        if not cold_candidates:
++            return 0
++
++        miss_experts, miss_slots = self.lfu.allocate_dynamic_slots_lba(
++            cold_candidates,
++            protected,
++            is_prefill=False,
++            probationary=True,
++        )
 +        if miss_experts:
++            for exp in miss_experts:
++                self._in_flight_lookahead.add(exp)
++            miss_dyn_slots = [slot - self.static_slots for slot in miss_slots]
 +            exp_arr = np.asarray(miss_experts, dtype=np.int32)
 +            slot_arr = np.asarray(miss_dyn_slots, dtype=np.int32)
 +            self._mod.submit_reads(self._reader, exp_arr.tobytes(), slot_arr.tobytes())
@@ -2223,7 +2925,9 @@ index 0000000..9e8a301
 +        *,
 +        is_prefill: bool = False,
 +    ) -> Callable[[], None] | None:
-+        """Ensure all ``active_experts`` are mapped to slots, wait for ``ROLE_W13``,
++        """Ensure all ``active_experts`` are mapped to slots, promote demanded
++        lookahead slots while demoting unused lookahead slots to evictable
++        ``score = 0.0``, submit LBA-sorted demand misses, wait for ``ROLE_W13``,
 +        and return a ``wait_w2`` callback that waits for ``ROLE_W2`` before ``down_proj``."""
 +        unique_active: list[int] = []
 +        seen: set[int] = set()
@@ -2233,39 +2937,47 @@ index 0000000..9e8a301
 +                seen.add(ei)
 +                unique_active.append(ei)
 +
-+        protected = set(unique_active) | self._in_flight_lookahead
-+        miss_experts: list[int] = []
-+        miss_dyn_slots: list[int] = []
-+
++        raw_misses: list[int] = []
 +        for exp in unique_active:
-+            if exp in self._in_flight_lookahead:
++            slot = int(self.lfu.expert_to_slot[exp])
++            if exp in self._in_flight_lookahead or (
++                slot >= self.static_slots and bool(self.lfu.probationary[slot])
++            ):
++                self.lfu.promote_probationary(exp)
++                self._in_flight_lookahead.discard(exp)
 +                self.lookahead_hits += 1
 +                self.hits += 1
-+                continue
-+            if int(self.lfu.expert_to_slot[exp]) >= 0:
++            elif slot >= 0:
 +                self.hits += 1
-+                continue
-+            self.misses += 1
-+            # If in-flight lookahead slots prevent allocating a demand miss, drain
-+            # the in-flight lookahead first so its slots become evictable if needed.
-+            if (
-+                self._in_flight_lookahead
-+                and len(protected - set(range(self.static_slots))) >= self.dynamic_slots
-+            ):
++            else:
++                self.misses += 1
++                raw_misses.append(exp)
++
++        # Any lookahead expert not demanded by the router on this step loses its
++        # probationary protection and remains at score=0.0 (last_used=0), making it
++        # the first candidate for eviction without displacing warm decode experts.
++        unhit_probation = self.lfu.clear_probation()
++        if unhit_probation > 0:
++            self.lookahead_evictable += unhit_probation
++        self._in_flight_lookahead.clear()
++
++        miss_experts: list[int] = []
++        miss_slots: list[int] = []
++        if raw_misses:
++            if self._w2_pending:
 +                self._mod.wait_role(self._reader, self._mod.ROLE_ALL)
 +                self._w2_pending = False
-+                self._in_flight_lookahead.clear()
-+                protected = set(unique_active) | set(miss_experts)
-+            slot = self.lfu.allocate_dynamic_slot(
-+                exp, protected, is_prefill=is_prefill
++            miss_experts, miss_slots = self.lfu.allocate_dynamic_slots_lba(
++                raw_misses,
++                set(unique_active),
++                is_prefill=is_prefill,
++                probationary=False,
 +            )
-+            protected.add(exp)
-+            miss_experts.append(exp)
-+            miss_dyn_slots.append(slot - self.static_slots)
 +
 +        self.lfu.record_step(unique_active, is_prefill=is_prefill)
 +
 +        if miss_experts:
++            miss_dyn_slots = [slot - self.static_slots for slot in miss_slots]
 +            exp_arr = np.asarray(miss_experts, dtype=np.int32)
 +            slot_arr = np.asarray(miss_dyn_slots, dtype=np.int32)
 +            self._mod.submit_reads(self._reader, exp_arr.tobytes(), slot_arr.tobytes())
@@ -2862,6 +3574,3 @@ index b12b53a..c0e18f6 100644
          down_kernel(hq, h_words, *_present(down), order, tile_expert, y)
          if callable(shared):
              shared = shared()
--- 
-2.43.0
-
