@@ -23,16 +23,40 @@ failed a test-fixture invariant before serving; its distinct
 continues on C40. Preparation or build difficulty is not a performance rejection.
 Each completed round reports compatible saved1030, C36, previous and current
 builds, signed changes, both repeat margins and retained adverse rows.
-The promoted release remains spark-ds41f-1030.
+The promoted release is spark-ds41f-1107 (below).
 Loop work follows the candidate's
 [containment scope](experiments/2026-10-26-spark-ds41f-candidate/candidate-38/README.md#loop-containment):
 preserve requested effort, end looping reasoning once, and stop continued
 degeneration while protecting legitimate repeated answers.
 
-Production is **spark-ds41f-1030**, serving DeepSeek-V4.1-Flash-1017 on the four-node TP4 1M
-profile on the ring the site is cabled as ([release record](experiments/2026-10-26-spark-ds41f-candidate/README.md),
-[release notes](experiments/2026-10-26-spark-ds41f-candidate/release-notes.md)). The release name is
-the date it was promoted; the model is DeepSeek's checkpoint, unchanged. It is spark-ds41f-1025
+Production is **spark-ds41f-1107**, serving DeepSeek-V4.1-Flash-1017 on the four-node TP4 1M
+profile on the ring the site is cabled as, promoted 2026-11-07 ([release record](experiments/2026-10-26-spark-ds41f-candidate/README.md),
+[release notes](experiments/2026-10-26-spark-ds41f-candidate/release-notes.md),
+[baseline](manifests/baselines/2026-11-07-spark-ds41f-1107.json)). The release name is the date
+it was promoted; the model is DeepSeek's checkpoint, unchanged. It is spark-ds41f-1030 with vLLM
+0568-0761 (641 active patches), TileLang with 13 SM120/SM121 patches and sparknet's single-slot
+one-shot RoCE all-reduce cap, in image `spark-ds41f:1107` (`sha256:3f32a962ce04`, the same ID on
+every node). It is the first release qualified on all eight supported shapes: `tp4-ring` and
+`tp3-triangle` on the switchless nodes, and `tp3-switched` through `tp8-switched` on the switched
+ones. Among its changes: loop detection on by default in every phase, including requests with
+thinking off (0656, 0674, 0679); CopyDrafter drafts beside DSpark by default (0688, 0744-0745);
+DSpark online confidence calibration; the full TileLang runtime closure; a context-aware long
+prefill step-down and decode interleave; selective 12-bit packing of the KV compressor's BF16
+weights; a tensor-parallel vision tower; and TP2-TP8 uneven-shard padding with cross-topology
+parity. On the ring against spark-ds41f-1030: paired decode +5.30% at c16 (272.86 tok/s), +4.04%
+at c8 and +4.92% at one stream (82.62 tok/s); engine decode grid -14.36% (20/20 shapes faster);
+prefill +8.34% to +17.05% from 32K to 1M; a short request's first token during a 131K prefill
+69% sooner beside 3 streams (3.30 to 1.02 s) and 60% sooner beside 11; greedy 256/256 identical.
+On the triangle: paired decode +1.70% at c8, +2.04% at c4 and +2.59% at one stream (64.28 tok/s);
+engine decode grid -15.36%; prefill +2.99% to +10.55% from 32K to 1M; the same first token 47%
+sooner beside 3 streams and 88% sooner beside 6; greedy 256/256 identical. The recipe and lock are
+frozen in [releases/spark-ds41f-1107](releases/spark-ds41f-1107/); spark-ds41f-1030's, the
+rollback, in [releases/spark-ds41f-1030](releases/spark-ds41f-1030/).
+
+Before spark-ds41f-1107, production was **spark-ds41f-1030** (2026-10-30 to 2026-11-07), serving
+DeepSeek-V4.1-Flash-1017 on the four-node TP4 1M profile on the ring
+([release record](experiments/2026-10-26-spark-ds41f-candidate/README.md),
+[release notes](experiments/2026-10-26-spark-ds41f-candidate/release-notes.md)). It is spark-ds41f-1025
 with TileLang as the only kernel family and direct checkpoint loading, prefill yield (a short
 request's first token beside a 131K prefill in 3.3-3.6 s instead of 12.4-12.8 s), a second served
 name, `deepseek-v4.1-flash-weightless`, steered per request with msuiche's published GLP vector
@@ -49,7 +73,7 @@ On the triangle (qualified 2026-10-30, 6,144-token budget): decode 2.3-3.8% fast
 tok/s at one stream, 158.6 output tok/s at eight), prefill 4.1-7.0% faster from 32K to 500K;
 a 131K prefill beside 3 or 6 streams with short requests waiting is 3.7-4.6% slower, while
 those requests' first token comes 2-8x sooner; greedy 256/256 identical. The recipe and lock are frozen in
-[releases/spark-ds41f-1030](releases/spark-ds41f-1030/); spark-ds41f-1025's, the rollback, in
+[releases/spark-ds41f-1030](releases/spark-ds41f-1030/); spark-ds41f-1025's, its rollback, in
 [releases/spark-ds41f-1025](releases/spark-ds41f-1025/).
 
 Before spark-ds41f-1030, production was **spark-ds41f-1025**, serving DeepSeek-V4.1-Flash-1017 on the
