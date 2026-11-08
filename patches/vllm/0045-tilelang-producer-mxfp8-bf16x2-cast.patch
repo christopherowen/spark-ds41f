@@ -1,0 +1,354 @@
+From a561910caee63c80955022ec63958160052e5a42 Mon Sep 17 00:00:00 2001
+From: Christopher Owen <3221756+christopherowen@users.noreply.github.com>
+Date: Sun, 8 Nov 2026 17:49:04 +0000
+Subject: [PATCH] perf(dsv41): bfloat162 exponent scaling and paired E4M3
+ conversion in producer MXFP8 casts
+
+Upstream base: 19f2c20ed4d64ae22bd009ceacadd85e2a81e354
+
+Rationale: Producer MXFP8 block-32 cast kernels starting from BF16 inputs (vllm_columns_join_and_cast_8 in columns.py, cast_block_mxfp8 in gemm.py used by activation.py and mhc.py) previously unpacked BF16 values to FP32, computed block amax in FP32, multiplied by the power-of-two inverse scale in FP32, and converted FP32 pairs to E4M3. In addition, under CUDA 13.0 (spark-ds41f:1107), TileLang's __tl_cvt_bfloat162_to_fp8x2 delegates to __nv_cvt_bfloat16raw2_to_fp8x2, which unpacks each half to float and emits two scalar F2FP instructions per bfloat162 pair in per_token_cast_kernel, norm_forward_and_per_token_cast_kernel, and attention_front_kernel. Because the UE8M0 reciprocal scale 2^(127 - exp_sf) is an exact power of two within normal BF16 range, scaling in bfloat162 via __hmul2 only adjusts the 8-bit exponent without touching the 7-bit mantissa. Computing local amax in bfloat162 (__habs2/__hmax2), scaling via __hmul2, and converting via PTX 9.1 cvt.rn.satfinite.e4m3x2.bf16x2 on CUDA >= 13.1 (or packed shift/mask float2 + __nv_cvt_float2_to_fp8x2 on CUDA 13.0) eliminates redundant FP32 unpacking, halves F2FP instructions on CUDA 13.0, and reduces SASS instruction and register counts across all six producer MXFP8 kernels.
+
+Quality: Bit-identical across all 102 output tensors covering join_columns_and_cast_mxfp8, cast_mxfp8, per_token_cast, activation_swiglu_clamp_cast, moe_swiglu_cast, mhc_finalize, norm_forward_and_per_token_cast, and attention_front under both CUDA 13.0.88 and CUDA 13.5.37 (0 mismatches via torch.equal).
+
+Tests: Verified with test_deepseek_v41_tilelang_linear.py (97 passed, 0 failed) and standalone bit-exactness and 2-boot hardware benchmarks on GB10 (SM121).
+
+Upstream status: Local DeepSeek-V4.1 SM120/SM121 TileLang kernel optimization.
+---
+ .../deepseek_v4_1/tilelang/activation.py      |  9 +-
+ vllm/models/deepseek_v4_1/tilelang/columns.py | 47 ++++++----
+ vllm/models/deepseek_v4_1/tilelang/front.py   |  3 +-
+ vllm/models/deepseek_v4_1/tilelang/gemm.py    | 89 +++++++++++++++----
+ vllm/models/deepseek_v4_1/tilelang/mhc.py     | 10 +--
+ vllm/models/deepseek_v4_1/tilelang/norm.py    |  3 +
+ .../deepseek_v4_1/tilelang/quant_common.py    | 23 +++++
+ 7 files changed, 132 insertions(+), 52 deletions(-)
+
+diff --git a/vllm/models/deepseek_v4_1/tilelang/activation.py b/vllm/models/deepseek_v4_1/tilelang/activation.py
+index f2ab202..ab4d1d8 100644
+--- a/vllm/models/deepseek_v4_1/tilelang/activation.py
++++ b/vllm/models/deepseek_v4_1/tilelang/activation.py
+@@ -90,15 +90,12 @@ def swiglu_clamp_cast_kernel(n: int, limit: float, threads: int = 128):
+             gate = T.alloc_local((_VEC,), T.bfloat16)
+             up = T.alloc_local((_VEC,), T.bfloat16)
+             out = T.alloc_local((_VEC,), T.bfloat16)
+-            xf = T.alloc_local((_VEC,), T.float32)
+             xq = T.alloc_local((_VEC,), T.float8_e4m3fn)
+-            amax = T.alloc_local((1,), T.float32)
+             if col < n:
+                 for v in T.vectorized(_VEC):
+                     gate[v] = X[by, col + v]
+                 for v in T.vectorized(_VEC):
+                     up[v] = X[by, n + col + v]
+-                amax[0] = T.float32(0)
+                 for v in T.unroll(_VEC):
+                     g = T.alloc_var(T.float32, init=T.Cast(T.float32, gate[v]))
+                     u = T.alloc_var(T.float32, init=T.Cast(T.float32, up[v]))
+@@ -106,11 +103,7 @@ def swiglu_clamp_cast_kernel(n: int, limit: float, threads: int = 128):
+                     u = T.if_then_else(u > limit, T.float32(limit), u)
+                     u = T.if_then_else(u < -limit, T.float32(-limit), u)
+                     out[v] = T.Cast(T.bfloat16, g / (1.0 + T.exp(-g)) * u)
+-                    xf[v] = T.Cast(T.float32, out[v])
+-                    amax[0] = T.max(amax[0], T.abs(xf[v]))
+-                amax[0] = T.max(amax[0], T.shfl_xor(amax[0], 1))
+-                amax[0] = T.max(amax[0], T.shfl_xor(amax[0], 2))
+-                cast_block_mxfp8(xf, xq, _VEC, amax[0], Yq, Ysf, by, col)
++                cast_block_mxfp8(out, xq, _VEC, Yq, Ysf, by, col)
+ 
+     return activation_swiglu_clamp_cast
+ 
+diff --git a/vllm/models/deepseek_v4_1/tilelang/columns.py b/vllm/models/deepseek_v4_1/tilelang/columns.py
+index 5c78e41..d6a7cb5 100644
+--- a/vllm/models/deepseek_v4_1/tilelang/columns.py
++++ b/vllm/models/deepseek_v4_1/tilelang/columns.py
+@@ -48,6 +48,20 @@ __device__ __forceinline__ void vllm_columns_zero_b128(const void* d) {
+   *reinterpret_cast<uint4*>(const_cast<void*>(d)) = make_uint4(0u, 0u, 0u, 0u);
+ }
+ 
++__device__ __forceinline__ __nv_fp8x2_storage_t vllm_columns_cvt_bf16x2_to_e4m3x2(
++    __nv_bfloat162 x) {
++  const unsigned int u = *reinterpret_cast<const unsigned int*>(&x);
++#if (__CUDACC_VER_MAJOR__ > 13) || (__CUDACC_VER_MAJOR__ == 13 && __CUDACC_VER_MINOR__ >= 1)
++  __nv_fp8x2_storage_t tmp;
++  asm("{cvt.rn.satfinite.e4m3x2.bf16x2 %0, %1;}\n" : "=h"(tmp) : "r"(u));
++  return tmp;
++#else
++  const float2 f2 = make_float2(
++      __uint_as_float(u << 16), __uint_as_float(u & 0xffff0000u));
++  return __nv_cvt_float2_to_fp8x2(f2, __NV_SATFINITE, __NV_E4M3);
++#endif
++}
++
+ __device__ __forceinline__ void vllm_columns_join_and_cast_8(
+     const void* dst_bf16_ptr,
+     const void* src_bf16_ptr,
+@@ -58,16 +72,12 @@ __device__ __forceinline__ void vllm_columns_join_and_cast_8(
+   *reinterpret_cast<uint4*>(const_cast<void*>(dst_bf16_ptr)) = raw;
+ 
+   const __nv_bfloat162* bf2 = reinterpret_cast<const __nv_bfloat162*>(&raw);
+-  const float2 f01 = __bfloat1622float2(bf2[0]);
+-  const float2 f23 = __bfloat1622float2(bf2[1]);
+-  const float2 f45 = __bfloat1622float2(bf2[2]);
+-  const float2 f67 = __bfloat1622float2(bf2[3]);
+-
+-  float amax0 = fmaxf(fmaxf(fabsf(f01.x), fabsf(f01.y)),
+-                      fmaxf(fabsf(f23.x), fabsf(f23.y)));
+-  float amax1 = fmaxf(fmaxf(fabsf(f45.x), fabsf(f45.y)),
+-                      fmaxf(fabsf(f67.x), fabsf(f67.y)));
+-  float amax = fmaxf(amax0, amax1);
++  const __nv_bfloat162 a01 = __habs2(bf2[0]);
++  const __nv_bfloat162 a23 = __habs2(bf2[1]);
++  const __nv_bfloat162 a45 = __habs2(bf2[2]);
++  const __nv_bfloat162 a67 = __habs2(bf2[3]);
++  const __nv_bfloat162 amax2 = __hmax2(__hmax2(a01, a23), __hmax2(a45, a67));
++  float amax = __bfloat162float(__hmax(amax2.x, amax2.y));
+   amax = fmaxf(amax, __shfl_xor_sync(0xffffffffu, amax, 2));
+   amax = fmaxf(amax, __shfl_xor_sync(0xffffffffu, amax, 1));
+ 
+@@ -75,20 +85,19 @@ __device__ __forceinline__ void vllm_columns_join_and_cast_8(
+   const unsigned int bits = __float_as_uint(scale_inv);
+   const unsigned int rounded_bits = (bits + 0x007FFFFFu) & 0x7F800000u;
+   const unsigned int ue8m0_byte = (rounded_bits >> 23) & 0xFFu;
+-  const float inv_scale = __uint_as_float((254u - ue8m0_byte) << 23);
++  const unsigned int inv_bf16_bits = (254u - ue8m0_byte) << 7;
++  const unsigned int inv_bf16x2_bits = inv_bf16_bits | (inv_bf16_bits << 16);
++  const __nv_bfloat162 inv_bf2 =
++      *reinterpret_cast<const __nv_bfloat162*>(&inv_bf16x2_bits);
+ 
+-  const float2 q01 = make_float2(f01.x * inv_scale, f01.y * inv_scale);
+-  const float2 q23 = make_float2(f23.x * inv_scale, f23.y * inv_scale);
+-  const float2 q45 = make_float2(f45.x * inv_scale, f45.y * inv_scale);
+-  const float2 q67 = make_float2(f67.x * inv_scale, f67.y * inv_scale);
+   const __nv_fp8x2_storage_t p01 =
+-      __nv_cvt_float2_to_fp8x2(q01, __NV_SATFINITE, __NV_E4M3);
++      vllm_columns_cvt_bf16x2_to_e4m3x2(__hmul2(bf2[0], inv_bf2));
+   const __nv_fp8x2_storage_t p23 =
+-      __nv_cvt_float2_to_fp8x2(q23, __NV_SATFINITE, __NV_E4M3);
++      vllm_columns_cvt_bf16x2_to_e4m3x2(__hmul2(bf2[1], inv_bf2));
+   const __nv_fp8x2_storage_t p45 =
+-      __nv_cvt_float2_to_fp8x2(q45, __NV_SATFINITE, __NV_E4M3);
++      vllm_columns_cvt_bf16x2_to_e4m3x2(__hmul2(bf2[2], inv_bf2));
+   const __nv_fp8x2_storage_t p67 =
+-      __nv_cvt_float2_to_fp8x2(q67, __NV_SATFINITE, __NV_E4M3);
++      vllm_columns_cvt_bf16x2_to_e4m3x2(__hmul2(bf2[3], inv_bf2));
+   *reinterpret_cast<uint2*>(const_cast<void*>(dst_fp8_ptr)) = make_uint2(
+       (unsigned int)p01 | ((unsigned int)p23 << 16),
+       (unsigned int)p45 | ((unsigned int)p67 << 16));
+diff --git a/vllm/models/deepseek_v4_1/tilelang/front.py b/vllm/models/deepseek_v4_1/tilelang/front.py
+index d44ab8d..cc62d00 100644
+--- a/vllm/models/deepseek_v4_1/tilelang/front.py
++++ b/vllm/models/deepseek_v4_1/tilelang/front.py
+@@ -90,6 +90,7 @@ def attention_front_kernel(eps: float, page_size: int, slot_dtype: str = "int64"
+     """q CTAs (two rows each) then kv CTAs (eight rows each); see the module
+     docstring. ``qa_kv`` is the fused projection's output, q columns first."""
+     from vllm.models.deepseek_v4_1.tilelang.quant_common import (
++        IMPORT_BF16X2_FP8_CVT,
+         get_cast_output_config,
+         get_sf_and_inv,
+         get_sf_index,
+@@ -212,7 +213,7 @@ def attention_front_kernel(eps: float, page_size: int, slot_dtype: str = "int64"
+         kv: T.Tensor((M, KV_LATENT), T.bfloat16),
+     ):
+         with T.Kernel(T.ceildiv(M, qb) + T.ceildiv(M, kb), threads=_THREADS) as bx:
+-            T.import_source(_CVT_HEADER)
++            T.import_source(_CVT_HEADER + IMPORT_BF16X2_FP8_CVT)
+             tid = T.get_thread_binding()
+             q_sum_partial = T.alloc_fragment((qb, qt), T.float32)
+             q_warp_reducer = T.alloc_reducer((qb, qw), T.float32, op="sum")
+diff --git a/vllm/models/deepseek_v4_1/tilelang/gemm.py b/vllm/models/deepseek_v4_1/tilelang/gemm.py
+index c2443ad..cf4dc1a 100644
+--- a/vllm/models/deepseek_v4_1/tilelang/gemm.py
++++ b/vllm/models/deepseek_v4_1/tilelang/gemm.py
+@@ -748,24 +748,83 @@ def _reference_roundtrip(A_shared, A_q, X, amax, inv, scale, block_M, block_K):
+         )
+ 
+ 
++_CAST_BLOCK_MXFP8_HEADER = r"""
++#ifndef VLLM_CAST_BLOCK_MXFP8_H_
++#define VLLM_CAST_BLOCK_MXFP8_H_
++#include <cuda_bf16.h>
++#include <cuda_fp8.h>
++
++__device__ __forceinline__ __nv_fp8x2_storage_t vllm_cast_block_cvt_bf16x2_to_e4m3x2(
++    __nv_bfloat162 x) {
++  const unsigned int u = *reinterpret_cast<const unsigned int*>(&x);
++#if (__CUDACC_VER_MAJOR__ > 13) || (__CUDACC_VER_MAJOR__ == 13 && __CUDACC_VER_MINOR__ >= 1)
++  __nv_fp8x2_storage_t tmp;
++  asm("{cvt.rn.satfinite.e4m3x2.bf16x2 %0, %1;}\n" : "=h"(tmp) : "r"(u));
++  return tmp;
++#else
++  const float2 f2 = make_float2(
++      __uint_as_float(u << 16), __uint_as_float(u & 0xffff0000u));
++  return __nv_cvt_float2_to_fp8x2(f2, __NV_SATFINITE, __NV_E4M3);
++#endif
++}
++
++__device__ __forceinline__ unsigned char vllm_cast_block_mxfp8_8(
++    const void* src_bf16_ptr,
++    void* dst_fp8_ptr) {
++  const __nv_bfloat162* bf2 = reinterpret_cast<const __nv_bfloat162*>(src_bf16_ptr);
++  const __nv_bfloat162 a01 = __habs2(bf2[0]);
++  const __nv_bfloat162 a23 = __habs2(bf2[1]);
++  const __nv_bfloat162 a45 = __habs2(bf2[2]);
++  const __nv_bfloat162 a67 = __habs2(bf2[3]);
++  const __nv_bfloat162 amax2 = __hmax2(__hmax2(a01, a23), __hmax2(a45, a67));
++  float amax = __bfloat162float(__hmax(amax2.x, amax2.y));
++  amax = fmaxf(amax, __shfl_xor_sync(0xffffffffu, amax, 1));
++  amax = fmaxf(amax, __shfl_xor_sync(0xffffffffu, amax, 2));
++
++  const float scale_inv = fmaxf(amax, 1e-4f) * (1.0f / 448.0f);
++  const unsigned int bits = __float_as_uint(scale_inv);
++  const unsigned int ue8m0_byte = ((bits - 1u) >> 23) + 1u;
++  const unsigned int inv_bf16_bits = (254u - ue8m0_byte) << 7;
++  const unsigned int inv_bf16x2_bits = inv_bf16_bits | (inv_bf16_bits << 16);
++  const __nv_bfloat162 inv_bf2 =
++      *reinterpret_cast<const __nv_bfloat162*>(&inv_bf16x2_bits);
++
++  const __nv_fp8x2_storage_t p01 =
++      vllm_cast_block_cvt_bf16x2_to_e4m3x2(__hmul2(bf2[0], inv_bf2));
++  const __nv_fp8x2_storage_t p23 =
++      vllm_cast_block_cvt_bf16x2_to_e4m3x2(__hmul2(bf2[1], inv_bf2));
++  const __nv_fp8x2_storage_t p45 =
++      vllm_cast_block_cvt_bf16x2_to_e4m3x2(__hmul2(bf2[2], inv_bf2));
++  const __nv_fp8x2_storage_t p67 =
++      vllm_cast_block_cvt_bf16x2_to_e4m3x2(__hmul2(bf2[3], inv_bf2));
++  *reinterpret_cast<uint2*>(dst_fp8_ptr) = make_uint2(
++      (unsigned int)p01 | ((unsigned int)p23 << 16),
++      (unsigned int)p45 | ((unsigned int)p67 << 16));
++  return (unsigned char)ue8m0_byte;
++}
++#endif
++"""
++
++
+ @T.macro
+-def cast_block_mxfp8(values, quantized, count, amax, Q, S, row, col):
+-    """One thread's share of a 32-value block in registers through ``_reference_cast``'s
+-    arithmetic: ``values[0:count]`` (FP32 copies of BF16 values) are columns ``col`` on
+-    of output row ``row``, ``amax`` the whole block's (the caller reduces it across the
+-    block's threads). Their E4M3 bytes go through ``quantized`` (local, ``count``
+-    long) to ``Q`` and, from the thread whose columns start the block, the UE8M0 byte
+-    to ``S``: the bytes ``per_token_cast`` writes. A producer whose output is in
+-    registers writes its consumers' MXFP8 input with it."""
+-    bits = T.reinterpret(
+-        T.max(amax, T.float32(_AMAX_FLOOR)) * T.float32(_FP8_MAX_INV), T.uint32
++def cast_block_mxfp8(values, quantized, count, Q, S, row, col):
++    """One thread's 8-element share of a 32-value BF16 block in registers through
++    ``_reference_cast``'s arithmetic: ``values[0:count]`` (BF16) are columns ``col``
++    on of output row ``row``. Their E4M3 bytes go through ``quantized`` (local,
++    ``count`` long) to ``Q`` and, from the thread whose columns start the block,
++    the UE8M0 byte to ``S``: the bytes ``per_token_cast`` writes."""
++    T.import_source(_CAST_BLOCK_MXFP8_HEADER)
++    ue8m0 = T.alloc_var(
++        T.uint8,
++        init=T.call_extern(
++            T.uint8,
++            "vllm_cast_block_mxfp8_8",
++            T.address_of(values[0]),
++            T.address_of(quantized[0]),
++        ),
+     )
+-    exponent = T.Cast(T.int32, ((bits - T.uint32(1)) >> 23) + T.uint32(1)) - 127
+-    inv = T.reinterpret(T.Cast(T.uint32, 127 - exponent) << 23, T.float32)
+     if col % 32 == 0:
+-        S[row, col // 32] = T.Cast(T.uint8, exponent + 127)
+-    for v in T.vectorized(count):
+-        quantized[v] = T.Cast(T.float8_e4m3fn, values[v] * inv)
++        S[row, col // 32] = ue8m0
+     for v in T.vectorized(count):
+         Q[row, col + v] = quantized[v]
+ 
+diff --git a/vllm/models/deepseek_v4_1/tilelang/mhc.py b/vllm/models/deepseek_v4_1/tilelang/mhc.py
+index 76b978a..040d126 100644
+--- a/vllm/models/deepseek_v4_1/tilelang/mhc.py
++++ b/vllm/models/deepseek_v4_1/tilelang/mhc.py
+@@ -398,10 +398,8 @@ def finalize(
+             xv = T.alloc_local((VEC,), T.bfloat16)
+             wv = T.alloc_local((steps * VEC,), T.bfloat16)
+             yv = T.alloc_local((steps * VEC,), T.bfloat16)
+-            xf = T.alloc_local((VEC,), T.float32)
+             xq = T.alloc_local((VEC,), T.float8_e4m3fn)
+             total = T.alloc_local((1,), T.float32)
+-            amax = T.alloc_local((1,), T.float32)
+             rms_l = T.alloc_local((1,), T.float32)
+             p_acc = T.alloc_local((1,), T.float32)
+             s_val = T.alloc_local((1,), T.float32)
+@@ -497,14 +495,8 @@ def finalize(
+                             )
+                         for v in T.vectorized(VEC):
+                             y[pid, chunk * VEC + v] = xv[v]
+-                        amax[0] = T.float32(0)
+-                        for v in T.unroll(VEC):
+-                            xf[v] = T.Cast(T.float32, xv[v])
+-                            amax[0] = T.max(amax[0], T.abs(xf[v]))
+-                        amax[0] = T.max(amax[0], T.shfl_xor(amax[0], 1))
+-                        amax[0] = T.max(amax[0], T.shfl_xor(amax[0], 2))
+                         cast_block_mxfp8(
+-                            xf, xq, VEC, amax[0], yq, ysf, pid, chunk * VEC
++                            xv, xq, VEC, yq, ysf, pid, chunk * VEC
+                         )
+ 
+     return mhc_finalize
+diff --git a/vllm/models/deepseek_v4_1/tilelang/norm.py b/vllm/models/deepseek_v4_1/tilelang/norm.py
+index 52a79a0..afe212d 100644
+--- a/vllm/models/deepseek_v4_1/tilelang/norm.py
++++ b/vllm/models/deepseek_v4_1/tilelang/norm.py
+@@ -15,6 +15,7 @@ from vllm.models.deepseek_v4_1.tilelang import pdl, prepare
+ from vllm.models.deepseek_v4_1.tilelang.gemm import SF_BLOCK
+ from vllm.models.deepseek_v4_1.tilelang.linear import MXFP8Rows, empty_mxfp8
+ from vllm.models.deepseek_v4_1.tilelang.quant_common import (
++    IMPORT_BF16X2_FP8_CVT,
+     CastOutputConfig,
+     QuantTensor,
+     align,
+@@ -176,6 +177,8 @@ def get_norm_forward_and_per_token_cast_kernel_cuda(
+         with T.Kernel(
+             T.ceildiv(num_tokens, block_m), batch, threads=num_threads
+         ) as (pid_token, batch_id):
++            if sf_inv_dtype == T.bfloat16:
++                T.import_source(IMPORT_BF16X2_FP8_CVT)
+             T.assume(x_stride % 16 == 0)
+             T.assume(x_batch_stride % 16 == 0)
+             T.assume(out_stride % 16 == 0)
+diff --git a/vllm/models/deepseek_v4_1/tilelang/quant_common.py b/vllm/models/deepseek_v4_1/tilelang/quant_common.py
+index ce1a535..058790a 100644
+--- a/vllm/models/deepseek_v4_1/tilelang/quant_common.py
++++ b/vllm/models/deepseek_v4_1/tilelang/quant_common.py
+@@ -326,6 +326,27 @@ def cast_epilogue(out_sf: torch.Tensor, config: BaseCastConfig) -> torch.Tensor:
+     return out_sf.T if config.use_tma_aligned_col_major_sf else out_sf
+ 
+ 
++IMPORT_BF16X2_FP8_CVT = r"""
++#ifndef VLLM_BF16X2_FP8_CVT_H_
++#define VLLM_BF16X2_FP8_CVT_H_
++#if (__CUDACC_VER_MAJOR__ < 13) || (__CUDACC_VER_MAJOR__ == 13 && __CUDACC_VER_MINOR__ < 1)
++#include <cuda_bf16.h>
++#include <cuda_fp8.h>
++
++__device__ __forceinline__ __nv_fp8x2_storage_t __vllm_cvt_bfloat162_to_fp8x2(
++    const __nv_bfloat162 src,
++    const __nv_fp8_interpretation_t fp8_interpretation) {
++  const unsigned int u = *reinterpret_cast<const unsigned int*>(&src);
++  const float2 f2 = make_float2(
++      __uint_as_float(u << 16), __uint_as_float(u & 0xffff0000u));
++  return __nv_cvt_float2_to_fp8x2(f2, __NV_SATFINITE, fp8_interpretation);
++}
++#define __tl_cvt_bfloat162_to_fp8x2 __vllm_cvt_bfloat162_to_fp8x2
++#endif
++#endif
++"""
++
++
+ @T.macro
+ def get_sf_and_inv(
+     amax: float, out_config: CastOutputConfig, sf_inv_dtype: T.dtype = T.float32
+@@ -547,6 +568,8 @@ def get_per_token_cast_kernel_cuda(
+         with T.Kernel(
+             T.ceildiv(num_tokens, block_m) * blocks_per_token, threads=num_threads
+         ) as pid:
++            if sf_inv_dtype == T.bfloat16:
++                T.import_source(IMPORT_BF16X2_FP8_CVT)
+             pid_token = pid // blocks_per_token
+             pid_hidden = pid % blocks_per_token
+             if use_pdl:
+-- 
+2.43.0
