@@ -1,0 +1,125 @@
+From a6e4fecd2964363e824770c35b03bf8721ed6ab7 Mon Sep 17 00:00:00 2001
+From: Christopher Owen <3221756+christopherowen@users.noreply.github.com>
+Date: Sun, 8 Nov 2026 22:47:00 +0000
+Subject: [PATCH] fix(rocm): reserve kpool decode indexer logits in workspace
+ during profiling
+
+Base: f1a8d0994 (0763 on 1107 series).
+
+Rationale:
+Backport canonical vllm-project/vllm commit d76fe936a1c4bb40abaf1b06aba37d849e95bdb2 (#65092). In vllm/models/glm5next/amd/sparse_indexer.py, sparse_attn_indexer_kpool previously allocated a temporary torch.empty tensor for worst-case decode logits during profiling instead of reserving the decode logits shape in WorkspaceManager via get_simultaneous(), which could fail on a locked workspace when decode logits exceed the prefill gather workspace.
+
+Quality:
+Reserves the exact worst-case decode logits buffer in WorkspaceManager during profiling; no change to DeepSeek V4.1 TileLang serving kernels (which already reserve both decode and prefill indexer scratch via 0506).
+
+Tests:
+- pytest tests/v1/worker/test_workspace.py -k test_amd_kpool_sparse_indexer_reserves_decode_logits_in_workspace
+
+Upstream status: cherry-picked from vllm-project/vllm commit d76fe936a1c4bb40abaf1b06aba37d849e95bdb2 (#65092).
+---
+ tests/v1/worker/test_workspace.py          | 11 ++++++
+ vllm/models/glm5next/amd/sparse_indexer.py | 43 ++++++++++++----------
+ 2 files changed, 35 insertions(+), 19 deletions(-)
+
+diff --git a/tests/v1/worker/test_workspace.py b/tests/v1/worker/test_workspace.py
+index 642407496..ca4f2cfa0 100644
+--- a/tests/v1/worker/test_workspace.py
++++ b/tests/v1/worker/test_workspace.py
+@@ -533,3 +533,14 @@ def test_v41_tilelang_attention_reserves_scratch_in_its_model_lane(monkeypatch):
+     # Target: the scores (2 MiB) outgrow its arena; the drafter: its arena (2 KiB)
+     # and the attention scratch of 64 rows, each 256-byte aligned.
+     assert sizes == [256 * 4096 * 2, 128 * 4 * 4 + 256]
++
++
++
++def test_amd_kpool_sparse_indexer_reserves_decode_logits_in_workspace(monkeypatch):
++    """sparse_attn_indexer_kpool reserves worst-case decode logits in WorkspaceManager during profiling."""
++    import inspect
++    from vllm.models.glm5next.amd import sparse_indexer
++
++    src = inspect.getsource(sparse_indexer.sparse_attn_indexer_kpool)
++    assert "decode_rows = _max_decode_logits_rows(hidden_states.shape[0])" in src
++    assert "workspace_manager.get_simultaneous(" in src
+diff --git a/vllm/models/glm5next/amd/sparse_indexer.py b/vllm/models/glm5next/amd/sparse_indexer.py
+index f47c9164b..275e5932e 100644
+--- a/vllm/models/glm5next/amd/sparse_indexer.py
++++ b/vllm/models/glm5next/amd/sparse_indexer.py
+@@ -24,6 +24,10 @@ from vllm.models.glm5next.common.sparse_indexer import (
+     kv_cache_as_quant_view,
+ )
+ from vllm.platforms import current_platform
++from vllm.platforms.rocm import (
++    _ON_GFX942,
++    _ON_GFX950,
++)
+ from vllm.utils.torch_utils import (
+     LayerNameType,
+     _encode_layer_name,
+@@ -33,6 +37,9 @@ from vllm.v1.attention.backends.mla.indexer import (
+     DeepseekV32IndexerMetadata,
+ )
+ from vllm.v1.attention.ops.common import pack_seq_triton, unpack_seq_triton
++from vllm.v1.attention.ops.rocm_aiter_mla_sparse import (
++    _max_decode_logits_rows,
++)
+ from vllm.v1.worker.workspace import current_workspace_manager
+ 
+ logger = init_logger(__name__)
+@@ -126,37 +133,35 @@ def sparse_attn_indexer_kpool(
+     # assert isinstance(attn_metadata, dict)
+     if not isinstance(attn_metadata, dict):
+         # Reserve workspace for indexer during profiling run
++        workspace_manager = current_workspace_manager()
+         values_spec, scales_spec = _gather_workspace_shapes(
+             total_seq_lens, head_dim, fp8_dtype, use_fp4_cache
+         )
+-        current_workspace_manager().get_simultaneous(
++        workspace_manager.get_simultaneous(
+             values_spec,
+             scales_spec,
+             ((RADIX_TOPK_WORKSPACE_SIZE,), torch.uint8),
+         )
+ 
+-        # Reserve profiler-visible memory for the worst-case decode logits,
+-        # whose shape is [B * next_n, max_model_len]. This profiling branch
+-        # returns before invoking the logits kernel itself.
+-        cfg = get_current_vllm_config_or_none()
+-        worst_decode_tokens = 0
+-        if cfg is not None:
+-            sched = cfg.scheduler_config
+-            num_spec = (
+-                cfg.speculative_config.num_speculative_tokens
+-                if cfg.speculative_config is not None
+-                else 0
++        # Reserve workspace for the worst-case decode logits, whose shape in
++        # rocm_fp8_paged_mqa_logits is [B * next_n, max_model_len] (or
++        # [H, B * next_n, max_model_len] on the stage1 fallback path). This
++        # profiling branch returns before invoking the logits kernel itself.
++        decode_rows = _max_decode_logits_rows(hidden_states.shape[0])
++        if _ON_GFX942 or _ON_GFX950:
++            workspace_manager.get_simultaneous(
++                ((decode_rows, max_model_len), torch.float32),
+             )
+-            worst_decode_tokens = min(
+-                sched.max_num_seqs * (num_spec + 1),
+-                sched.max_num_batched_tokens,
++        else:
++            workspace_manager.get_simultaneous(
++                ((q_quant.shape[1], decode_rows, max_model_len), torch.float32),
+             )
+-        # float32 logits -> 4 bytes/element; uint8 sentinel so elems == bytes.
+-        decode_logits_elems = worst_decode_tokens * max_model_len * 4
++
++        # Transient prefill logits peak memory, produced by rocm_fp8_mqa_logits
++        # while the workspace's k_quant and k_scale views are live.
+         prefill_cap_elems = envs.VLLM_SPARSE_INDEXER_MAX_LOGITS_MB * 1024 * 1024
+-        max_logits_elems = max(decode_logits_elems, prefill_cap_elems)
+         _ = torch.empty(
+-            max_logits_elems, dtype=torch.uint8, device=hidden_states.device
++            prefill_cap_elems, dtype=torch.uint8, device=hidden_states.device
+         )
+ 
+         return topk_indices_buffer
+-- 
+2.43.0
+
