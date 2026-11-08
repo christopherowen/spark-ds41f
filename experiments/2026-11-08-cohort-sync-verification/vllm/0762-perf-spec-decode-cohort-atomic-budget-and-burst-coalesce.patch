@@ -1,0 +1,491 @@
+From 5c2f486dfd7caa62a41be6ed4887fcdaa6efbadf Mon Sep 17 00:00:00 2001
+From: Christopher Owen <3221756+christopherowen@users.noreply.github.com>
+Date: Sun, 8 Nov 2026 10:30:00 +0100
+Subject: [PATCH] perf(spec-decode): cohort-atomic verification budget,
+ 16..40-row cost band, and idle-wakeup burst coalescing
+
+Upstream base: 1107 vLLM patch head 320021e3c4dbb202d911ab70e2cd924c75420488 (tree ed1bdb7a7684da33d403a055521ac0c4dd7ca670).
+
+Rationale:
+On switched TP6/TP7/TP8 runs at 16 concurrent streams, prose decode regressed ~10% in 1107 relative to the synchronized 1030 run (706.4 -> 637.9 tok/s on TP6, 685.6 -> 601.0 tok/s on TP7, 753.6 -> 658.9 tok/s on TP8) while code at 16 streams improved (+19.2% on TP6):
+1. When an idle EngineCoreProc woke on the first request of a 16-stream burst, _process_input_queue() immediately dispatched Step 1 with Request 0 alone while the ZMQ input thread was still deserializing Requests 1..15 (1+15 prefill split).
+2. Under --async-scheduling, CPU get_num_tokens() computed draft_budget from _stale_confidences (Step T-2) while GPU reallocate_drafts() invoked assign_draft_budget_kernel on _confidence_probs (Step T-1). Whenever Request 0 changed confidence between T-2 and T-1, the remaining budget for the 15 identical trailing requests was not divisible by 15, and 1-ULP BF16 tile-alignment differences plus index tie-breaking shattered the 15 trailing prose streams into 4 desynchronized sub-cohorts (2+8+2+4), tripling unique active MoE experts per layer across all 61 MoE layers and adding a ~300 ms straggler tail.
+3. In 0746, _step_cost(rows) applied HIGH_ROW_COST_SCALE=0.55 to all rows > 16 without an upper ceiling, discounting every draft row at c16 (rows 17..96) and over-verifying low-yield 2nd/3rd prose drafts across the second 32-row CTA / MXFP8 block boundary (ver/d 1.496 -> 2.038, M=40 -> 56 CUDA graph).
+
+Fix all three mechanisms:
+1. Add _coalesce_idle_burst() in EngineCoreProc._process_input_queue() to briefly poll input_queue (0.3 ms initial, 0.5 ms per subsequent burst arrival up to max_num_seqs) when waking from idle so concurrent burst waves enter Step 1 together.
+2. In AdaptiveVerificationManager.get_num_tokens(), group sampling requests at the same (num_computed_tokens, prefill_len, eligible_drafts) whose stale confidences agree within COHORT_CONFIDENCE_TOL=0.025 into synchronized cohorts, average their confidences, admit draft steps atomically per cohort, pass the cohort-uniform capacities directly to reallocate_drafts(), skip per-row device dead_rows when cohort-locked, and monotonically phase-lock any split leading group A (k_A=0, k_B=min(k_B, gap)) so trailing cohort B catches up without overshooting.
+3. Bound the 0.55x coalesced row-cost discount to rows 17..40 (HIGH_ROW_COST_CEILING=40) with HIGH_ROW_COST_ABOVE_SCALE=0.78 above 40 rows, pruning low-yield 2nd/3rd prose drafts at c16 while preserving c1..c8 and high-confidence code-c16 verification.
+
+Quality implications:
+Target-model verification semantics are unchanged; only speculative draft verification budgets and idle-wakeup request coalescing change.
+
+Tests:
+- pytest tests/v1/spec_decode/test_adaptive_verification.py tests/v1/worker/test_dead_rows.py tests/v1/engine/test_late_admission.py tests/v1/engine/test_late_admission_sink.py tests/v1/worker/test_late_admission.py (77 passed, 1 skipped).
+
+Upstream status:
+Local speculative-decoding and engine-core scheduling optimization for GB10 clusters.
+---
+ tests/v1/engine/test_late_admission.py        |  34 ++++
+ .../spec_decode/test_adaptive_verification.py |  58 ++++++
+ vllm/v1/engine/core.py                        |  41 +++-
+ .../gpu/spec_decode/adaptive_verification.py  | 185 +++++++++++++++---
+ 4 files changed, 288 insertions(+), 30 deletions(-)
+
+diff --git a/tests/v1/engine/test_late_admission.py b/tests/v1/engine/test_late_admission.py
+index e095f67..68f3b26 100644
+--- a/tests/v1/engine/test_late_admission.py
++++ b/tests/v1/engine/test_late_admission.py
+@@ -239,3 +239,37 @@ def test_the_engine_process_admits_every_queued_request_without_blocking():
+     ]
+     engine._admit_arrivals()  # an empty queue returns at once
+     assert engine._handle_client_request.call_count == 2
++
++
++def test_idle_wakeup_coalesces_concurrent_arrival_burst():
++    import threading
++    import time
++
++    engine = object.__new__(EngineCoreProc)
++    engine.input_queue = queue.Queue()
++    engine.aborts_queue = queue.Queue()
++    engine._idle_state_callbacks = []
++    engine._loop_watchdog = None
++    engine.process_input_queue_block = True
++    engine.vllm_config = SimpleNamespace(
++        scheduler_config=SimpleNamespace(max_num_seqs=16)
++    )
++    admitted: list[int] = []
++    engine.has_work = lambda: len(admitted) > 0
++    engine.is_running = lambda: True
++
++    def handle(_kind, req_id):
++        admitted.append(req_id)
++
++    engine._handle_client_request = handle
++
++    def feed_burst():
++        for i in range(16):
++            engine.input_queue.put(("add", i))
++            time.sleep(0.0001)
++
++    feeder = threading.Thread(target=feed_burst, daemon=True)
++    feeder.start()
++    engine._process_input_queue()
++    feeder.join(timeout=1.0)
++    assert admitted == list(range(16))
+diff --git a/tests/v1/spec_decode/test_adaptive_verification.py b/tests/v1/spec_decode/test_adaptive_verification.py
+index d906278..1c35df1 100644
+--- a/tests/v1/spec_decode/test_adaptive_verification.py
++++ b/tests/v1/spec_decode/test_adaptive_verification.py
+@@ -947,3 +947,61 @@ def test_high_concurrency_row_cost_knee_admits_coalesced_drafts():
+     _, _, knee_budget = manager._batch_budget
+     assert knee_budget == 32
+     assert total == 40
++
++
++def test_high_row_cost_ceiling_bounds_c16_prose_without_penalizing_code():
++    """Above 40 rows, the second 32-row CTA / MXFP8 block slope prunes low-yield
++    2nd and 3rd prose drafts at c16 while still admitting high-confidence code drafts."""
++    req_ids = [f"r{i}" for i in range(16)]
++    num_tokens_per_req = {rid: 6 for rid in req_ids}
++    draft_tokens = {rid: [1, 2, 3, 4, 5] for rid in req_ids}
++
++    prose_med = np.tile(
++        np.array([[0.66, 0.48, 0.44, 0.42, 0.40]], dtype=np.float32), (16, 1)
++    )
++    manager = make_manager(prose_med, row_cost=0.035)
++    manager.req_states.req_id_to_index = {rid: i for i, rid in enumerate(req_ids)}
++    manager.dead_rows_tau = 0.20
++    manager.calibrated_confidence = True
++
++    manager.high_row_cost_ceiling = 1000
++    assert manager.get_num_tokens(num_tokens_per_req, draft_tokens) == 48
++
++    manager.high_row_cost_ceiling = 40
++    assert manager.get_num_tokens(num_tokens_per_req, draft_tokens) == 32
++
++    code_hi = np.tile(
++        np.array([[0.86, 0.78, 0.74, 0.65, 0.60]], dtype=np.float32), (16, 1)
++    )
++    manager._stale_confidences = [SimpleNamespace(np=code_hi)]
++    assert manager.get_num_tokens(num_tokens_per_req, draft_tokens) == 64
++
++
++def test_cohort_locking_preserves_synchronized_wave_and_catches_up_split_lead():
++    """A 1+15 split wave keeps the 15 trailing streams unified against 1-ULP
++    confidence noise and phase-locks all 16 streams onto the same token position."""
++    req_ids = [f"r{i}" for i in range(16)]
++    num_tokens_per_req = {rid: 6 for rid in req_ids}
++    draft_tokens = {rid: [1, 2, 3, 4, 5] for rid in req_ids}
++
++    conf = np.ones((16, 5), dtype=np.float32)
++    conf[0] = [0.66, 0.54, 0.45, 0.40, 0.38]
++    for i in range(1, 16):
++        eps = 0.0015 if (i % 2 == 0) else 0.0
++        conf[i] = [0.72 + eps, 0.58 + eps, 0.48 + eps, 0.42 + eps, 0.39 + eps]
++
++    manager = make_manager(conf, row_cost=0.035)
++    manager.req_states.req_id_to_index = {rid: i for i, rid in enumerate(req_ids)}
++    manager.req_states.num_computed_tokens_np = np.array(
++        [249] + [246] * 15, dtype=np.int32
++    )
++    manager.req_states.prefill_len.np = np.full(16, 246, dtype=np.int32)
++    manager.dead_rows_tau = 0.20
++    manager.calibrated_confidence = True
++
++    manager.get_num_tokens(num_tokens_per_req, draft_tokens)
++    caps = [manager._capacities_cpu_override[rid] for rid in req_ids]
++    assert caps[0] == 0
++    assert len(set(caps[1:])) == 1
++    assert 1 <= caps[1] <= 3
++    assert manager.dead_row_args(torch.zeros(48, dtype=torch.bool), 16) is None
+diff --git a/vllm/v1/engine/core.py b/vllm/v1/engine/core.py
+index 8c28414..888474e 100644
+--- a/vllm/v1/engine/core.py
++++ b/vllm/v1/engine/core.py
+@@ -1619,10 +1619,44 @@ class EngineCoreProc(EngineCore):
+             )
+             self.output_queue.put_nowait((-1, EngineCoreOutputs(scheduler_stats=stats)))
+ 
++    idle_wakeup_first_poll_s: float = 0.0003
++    idle_wakeup_burst_poll_s: float = 0.0005
++
++    def _coalesce_idle_burst(self) -> None:
++        """Coalesce a concurrent request burst waking an idle engine so all
++        streams of a burst wave enter the first prefill step together."""
++        self._admit_arrivals()
++        scheduler_config = getattr(
++            getattr(self, "vllm_config", None), "scheduler_config", None
++        )
++        max_num_seqs = int(getattr(scheduler_config, "max_num_seqs", 16) or 16)
++        if max_num_seqs <= 1:
++            return
++        first_poll_s = float(getattr(self, "idle_wakeup_first_poll_s", 0.0003))
++        burst_poll_s = float(getattr(self, "idle_wakeup_burst_poll_s", 0.0005))
++        if first_poll_s <= 0:
++            return
++        try:
++            req = self.input_queue.get(timeout=first_poll_s)
++        except queue.Empty:
++            return
++        self._handle_client_request(*req)
++        self._admit_arrivals()
++        for _ in range(max_num_seqs - 2):
++            if burst_poll_s <= 0:
++                break
++            try:
++                req = self.input_queue.get(timeout=burst_poll_s)
++            except queue.Empty:
++                break
++            self._handle_client_request(*req)
++            self._admit_arrivals()
++
+     def _process_input_queue(self):
+         """Exits when an engine step needs to be performed."""
+ 
+         waited = False
++        blocked_from_idle = False
+         while not self.has_work() and self.is_running():
+             # Notify callbacks waiting for engine to become idle.
+             self._notify_idle_state_callbacks()
+@@ -1639,6 +1673,8 @@ class EngineCoreProc(EngineCore):
+             try:
+                 req = self.input_queue.get(block=block)
+                 self._handle_client_request(*req)
++                if block:
++                    blocked_from_idle = True
+             except queue.Empty:
+                 break
+             if not block:
+@@ -1648,7 +1684,10 @@ class EngineCoreProc(EngineCore):
+             logger.debug("EngineCore loop active.")
+ 
+         # Handle any more client requests.
+-        self._admit_arrivals()
++        if blocked_from_idle and self.has_work():
++            self._coalesce_idle_burst()
++        else:
++            self._admit_arrivals()
+ 
+     def _admit_arrivals(self) -> None:
+         """Handle every client request that has arrived, without blocking."""
+diff --git a/vllm/v1/worker/gpu/spec_decode/adaptive_verification.py b/vllm/v1/worker/gpu/spec_decode/adaptive_verification.py
+index 3f49b6c..c056231 100644
+--- a/vllm/v1/worker/gpu/spec_decode/adaptive_verification.py
++++ b/vllm/v1/worker/gpu/spec_decode/adaptive_verification.py
+@@ -50,11 +50,14 @@ if TYPE_CHECKING:
+ # verifies a draft per request anyway (see ``get_num_tokens``).
+ EXPLORE_AFTER_IDLE_STEPS = 32
+ 
+-# Two-slope verification row-cost knee: once a step crosses one 16-row Tensor
+-# Core MMA tile, additional verification rows share the already-launched expert
+-# and dense weight tiles at a reduced marginal cost.
++# Piecewise verification row-cost curve: rows 17..40 share the first 32-row CTA
++# and MXFP8 block at a reduced marginal slope (0.55), while rows above 40 cross
++# into a second 32-row CTA / MXFP8 block at a steeper slope (0.78).
+ HIGH_ROW_COST_KNEE = 16
+ HIGH_ROW_COST_SCALE = 0.55
++HIGH_ROW_COST_CEILING = 40
++HIGH_ROW_COST_ABOVE_SCALE = 0.78
++COHORT_CONFIDENCE_TOL = 0.025
+ 
+ 
+ def resolve_adaptive_cudagraph_mode(
+@@ -115,6 +118,11 @@ class AdaptiveVerificationManager:
+         self.row_cost = row_cost
+         self.high_row_cost_knee = HIGH_ROW_COST_KNEE
+         self.high_row_cost_scale = HIGH_ROW_COST_SCALE
++        self.high_row_cost_ceiling = HIGH_ROW_COST_CEILING
++        self.high_row_cost_above_scale = HIGH_ROW_COST_ABOVE_SCALE
++        self.cohort_confidence_tol = COHORT_CONFIDENCE_TOL
++        self._capacities_cpu_override: dict[str, int] | None = None
++        self._cohort_locked = False
+         self.tp_invariant_confidence = tp_invariant_confidence
+         self.calibrated_confidence = calibrated_confidence
+         self.dead_rows_tau = _DEAD_ROWS_TAU
+@@ -286,13 +294,24 @@ class AdaptiveVerificationManager:
+             self._copy_events[write_idx].record()
+ 
+     def _step_cost(self, rows: np.ndarray) -> np.ndarray:
+-        """Relative verification step cost with a 16-row Tensor Core MMA tile knee."""
++        """Relative verification step cost with a 16..40-row coalesced tile band."""
+         knee = getattr(self, "high_row_cost_knee", HIGH_ROW_COST_KNEE)
+         scale = getattr(self, "high_row_cost_scale", HIGH_ROW_COST_SCALE)
++        ceiling = getattr(self, "high_row_cost_ceiling", HIGH_ROW_COST_CEILING)
++        above_scale = getattr(
++            self, "high_row_cost_above_scale", HIGH_ROW_COST_ABOVE_SCALE
++        )
+         if knee > 0 and scale != 1.0:
+-            effective_rows = np.minimum(rows, knee) + scale * np.maximum(
+-                rows - knee, 0
+-            )
++            if ceiling > knee:
++                band = np.clip(rows - knee, 0, ceiling - knee)
++                above = np.maximum(rows - ceiling, 0)
++                effective_rows = (
++                    np.minimum(rows, knee) + scale * band + above_scale * above
++                )
++            else:
++                effective_rows = np.minimum(rows, knee) + scale * np.maximum(
++                    rows - knee, 0
++                )
+         else:
+             effective_rows = rows
+         return 1.0 + self.row_cost * effective_rows
+@@ -359,8 +378,31 @@ class AdaptiveVerificationManager:
+         )
+         stale_confidences = self._stale_confidences[self._stale_idx].np[
+             slots, :step_steps
+-        ]
+-        survival_probability = np.cumprod(stale_confidences.astype(np.float64), axis=1)
++        ].astype(np.float64, copy=True)
++        computed_np = self.req_states.num_computed_tokens_np[slots]
++        prefill_np = self.req_states.prefill_len.np[slots]
++        is_sampling = (computed_np + num_non_draft_tokens) >= prefill_np
++
++        tol = float(getattr(self, "cohort_confidence_tol", COHORT_CONFIDENCE_TOL))
++        cohorts: dict[tuple[int, int, int], list[int]] = {}
++        if num_reqs >= 2 and step_steps > 0 and tol > 0:
++            groups: dict[tuple[int, int, int], list[int]] = {}
++            for i in range(num_reqs):
++                if is_sampling[i] and eligible_drafts[i] > 0:
++                    key = (
++                        int(computed_np[i]),
++                        int(prefill_np[i]),
++                        int(eligible_drafts[i]),
++                    )
++                    groups.setdefault(key, []).append(i)
++            for key, idxs in groups.items():
++                if len(idxs) >= 2:
++                    group_conf = stale_confidences[idxs]
++                    if float(np.ptp(group_conf, axis=0).max(initial=0.0)) <= tol:
++                        cohorts[key] = idxs
++                        stale_confidences[idxs] = group_conf.mean(axis=0, keepdims=True)
++
++        survival_probability = np.cumprod(stale_confidences, axis=1)
+         steps = np.arange(step_steps)
+         valid = steps[None, :] < eligible_drafts[:, None]
+         tau = self.effective_dead_rows_tau()
+@@ -368,12 +410,10 @@ class AdaptiveVerificationManager:
+             # Never admit draft slots on the host that the device dead-row
+             # threshold will immediately mask as padding.
+             valid &= survival_probability >= tau
+-        scores = np.sort(survival_probability[valid])[::-1]
+         max_draft_budget = min(
+             int(eligible_drafts.sum()),
+             max(0, self._max_total_logits - num_reqs * self.num_bonus_tokens),
+         )
+-        scores = scores[:max_draft_budget]
+         num_drafts_per_req = {
+             req_id: int(num_drafts)
+             for req_id, num_drafts in zip(req_ids, eligible_drafts, strict=True)
+@@ -382,16 +422,82 @@ class AdaptiveVerificationManager:
+             req_id: int(num_tokens)
+             for req_id, num_tokens in zip(req_ids, num_non_draft_tokens, strict=True)
+         }
+-        num_sampling_requests = np.count_nonzero(
+-            self.req_states.num_computed_tokens_np[slots] + num_non_draft_tokens
+-            >= self.req_states.prefill_len.np[slots]
+-        )
+-        expected_tokens = np.concatenate(
+-            ([num_sampling_requests], num_sampling_requests + np.cumsum(scores))
+-        )
+-        rows = int(num_non_draft_tokens.sum()) + np.arange(len(scores) + 1)
+-        utilities = expected_tokens / self._step_cost(rows)
+-        draft_budget = int(np.argmax(utilities))
++        num_sampling_requests = int(np.count_nonzero(is_sampling))
++        capacities_cpu: np.ndarray | None = None
++        if cohorts:
++            in_cohort = np.zeros(num_reqs, dtype=bool)
++            units: list[tuple[float, list[int]]] = []
++            for idxs in cohorts.values():
++                in_cohort[idxs] = True
++                rep = idxs[0]
++                for d in range(int(eligible_drafts[rep])):
++                    if valid[rep, d]:
++                        units.append((float(survival_probability[rep, d]), idxs))
++                    else:
++                        break
++            for i in range(num_reqs):
++                if not in_cohort[i]:
++                    for d in range(int(eligible_drafts[i])):
++                        if valid[i, d]:
++                            units.append((float(survival_probability[i, d]), [i]))
++                        else:
++                            break
++            units.sort(key=lambda u: u[0], reverse=True)
++            capacities_cpu = np.zeros(num_reqs, dtype=np.int32)
++            base_rows = int(num_non_draft_tokens.sum())
++            best_util = float(num_sampling_requests) / float(
++                self._step_cost(np.array([base_rows]))[0]
++            )
++            best_caps = capacities_cpu.copy()
++            cur_rows = base_rows
++            cur_drafts = 0
++            cur_expected = float(num_sampling_requests)
++            for surv, idxs in units:
++                u_len = len(idxs)
++                if cur_drafts + u_len > max_draft_budget:
++                    continue
++                cur_drafts += u_len
++                cur_rows += u_len
++                cur_expected += surv * u_len
++                capacities_cpu[idxs] += 1
++                util = cur_expected / float(self._step_cost(np.array([cur_rows]))[0])
++                if util > best_util:
++                    best_util = util
++                    best_caps = capacities_cpu.copy()
++            capacities_cpu = best_caps
++
++            largest_key, largest_idxs = max(cohorts.items(), key=lambda kv: len(kv[1]))
++            pos_b, prefill_b, _ = largest_key
++            k_b = int(capacities_cpu[largest_idxs[0]])
++            if k_b > 0:
++                min_gap = None
++                lead_idxs: list[int] = []
++                for i in range(num_reqs):
++                    if i in largest_idxs or not is_sampling[i]:
++                        continue
++                    if int(prefill_np[i]) == prefill_b:
++                        gap = int(computed_np[i]) - pos_b
++                        if 1 <= gap <= step_steps + 1:
++                            lead_idxs.append(i)
++                            if min_gap is None or gap < min_gap:
++                                min_gap = gap
++                if (
++                    lead_idxs
++                    and len(lead_idxs) < len(largest_idxs)
++                    and min_gap is not None
++                ):
++                    capacities_cpu[lead_idxs] = 0
++                    capacities_cpu[largest_idxs] = min(k_b, min_gap)
++
++            draft_budget = int(capacities_cpu.sum())
++        else:
++            scores = np.sort(survival_probability[valid])[::-1][:max_draft_budget]
++            expected_tokens = np.concatenate(
++                ([num_sampling_requests], num_sampling_requests + np.cumsum(scores))
++            )
++            rows = int(num_non_draft_tokens.sum()) + np.arange(len(scores) + 1)
++            utilities = expected_tokens / self._step_cost(rows)
++            draft_budget = int(np.argmax(utilities))
+         # The confidences come from an estimator that learns only from admitted
+         # drafts, so a long run of empty budgets would leave it without the
+         # evidence to ever admit one again. Periodically verify one draft per
+@@ -401,6 +507,9 @@ class AdaptiveVerificationManager:
+             idle += 1
+             if idle >= EXPLORE_AFTER_IDLE_STEPS:
+                 draft_budget = min(num_reqs, max_draft_budget)
++                if capacities_cpu is not None:
++                    capacities_cpu[:] = 0
++                    capacities_cpu[:draft_budget] = 1
+                 idle = 0
+         else:
+             idle = 0
+@@ -413,6 +522,12 @@ class AdaptiveVerificationManager:
+             num_reqs,
+             self.row_cost,
+         )
++        self._capacities_cpu_override = (
++            {req_id: int(c) for req_id, c in zip(req_ids, capacities_cpu, strict=True)}
++            if capacities_cpu is not None
++            else None
++        )
++        self._cohort_locked = capacities_cpu is not None
+         self._batch_budget = (
+             num_drafts_per_req,
+             num_non_draft_tokens_per_req,
+@@ -466,6 +581,8 @@ class AdaptiveVerificationManager:
+         The confidences are the current drafts', broadcast from rank 0, so
+         every rank marks the same rows.
+         """
++        if getattr(self, "_cohort_locked", False):
++            return None
+         tau = self.effective_dead_rows_tau()
+         if tau <= 0 or not getattr(self, "_has_admitted_drafts", True):
+             return None
+@@ -494,6 +611,8 @@ class AdaptiveVerificationManager:
+         batch_budget, self._batch_budget = self._batch_budget, None
+         assert batch_budget is not None
+         num_drafts_per_req, num_non_draft_tokens_per_req, draft_budget = batch_budget
++        override = getattr(self, "_capacities_cpu_override", None)
++        self._capacities_cpu_override = None
+         num_reqs = idx_mapping.shape[0]
+         scheduled_drafts = np.fromiter(
+             (num_drafts_per_req[req_id] for req_id in req_ids),
+@@ -520,15 +639,23 @@ class AdaptiveVerificationManager:
+         self._has_admitted_drafts = draft_budget > 0
+         capacities = self._batch_draft_capacity[:num_reqs]
+         if draft_budget:
+-            async_tensor_h2d(scheduled_drafts, out=capacities)
+-            if draft_budget < int(scheduled_drafts.sum()):
+-                tilelang_inputs.assign_draft_budget(
+-                    self._confidence_probs[:, :step_steps],
+-                    idx_mapping,
+-                    capacities,
+-                    draft_budget,
+-                    step_steps,
++            if override is not None:
++                cohort_caps = np.fromiter(
++                    (override[req_id] for req_id in req_ids),
++                    dtype=np.int32,
++                    count=num_reqs,
+                 )
++                async_tensor_h2d(cohort_caps, out=capacities)
++            else:
++                async_tensor_h2d(scheduled_drafts, out=capacities)
++                if draft_budget < int(scheduled_drafts.sum()):
++                    tilelang_inputs.assign_draft_budget(
++                        self._confidence_probs[:, :step_steps],
++                        idx_mapping,
++                        capacities,
++                        draft_budget,
++                        step_steps,
++                    )
+ 
+         num_non_draft_tokens_gpu = self._num_non_draft_tokens[:num_reqs]
+         async_tensor_h2d(num_non_draft_tokens, out=num_non_draft_tokens_gpu)
+-- 
+2.43.0
+
