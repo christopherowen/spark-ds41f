@@ -1,0 +1,361 @@
+From 575ab53b9f25b2f630410e32258d758ee482bc72 Mon Sep 17 00:00:00 2001
+From: Christopher Owen <3221756+christopherowen@users.noreply.github.com>
+Date: Sun, 8 Nov 2026 17:43:08 +0000
+Subject: [PATCH] perf(dsv41): use hardware cvt.rn.satfinite.e2m1x2.f32 in
+ indexer and GEMM MXFP4 quantizers
+
+Upstream base: 19f2c20ed4d64ae22bd009ceacadd85e2a81e354.
+Immediate base: 320021e3c4dbb202d911ab70e2cd924c75420488.
+
+Rationale:
+While cache_writer.py already packs E2M1 pairs using the SM121 hardware instruction cvt.rn.satfinite.e2m1x2.f32 (F2FP.SATFINITE.E2M1.F32.PACK_AB), three hot MXFP4 quantizer kernels in gemm.py and indexer.py still used the 7-comparison software emulation (_e2m1_code / _mxfp4_byte):
+1. mxfp8_gemm_rope_mxfp4_decode (indexer.wq_b fused GEMM + RoPE + MXFP4 epilogue in gemm.py)
+2. mxfp4_quantize_v41 (indexer.py)
+3. mxfp4_norm_rope_quantize_v41 (indexer.py)
+Furthermore, in mxfp4_quantize_v41, _mxfp4_byte expanded each scaled FP32 expression 8 times across the 7 comparison thresholds and sign extraction without binding a local TIR variable, causing the generated C++ to recompute __fmul_rn((float)vals[...], scale) across every comparison and issue 16 separate 1-byte global stores per thread.
+
+Replace _e2m1_code with inline PTX cvt.rn.satfinite.e2m1x2.f32 helpers (dsv41_e2m1x2, dsv41_e2m1x8, dsv41_store_e2m1x8, dsv41_store_e2m1x32), vectorizing 4-byte per-lane stores in mxfp4_norm_rope_quantize_v41 and 16-byte per-group stores in mxfp4_quantize_v41 while keeping the mxfp8_gemm_rope_mxfp4_decode epilogue loop rolled (#pragma unroll 1).
+
+Quality:
+100% bit-exact (torch.equal on packed E2M1 bytes, UE8M0 scales, and paged index-cache pool buffers) to the nearest-even software reference across all decode and prefill shapes, including exact E2M1 tie midpoints, subnormals, and saturating inputs.
+
+Tests:
+- pytest tests/models/test_deepseek_v4_1_lsa.py tests/kernels/quantization/test_deepseek_v41_block_scale_words.py tests/kernels/quantization/test_deepseek_v41_tilelang_linear.py tests/kernels/attention/test_deepseek_v41_tilelang.py (28 passed, 0 PDL violations across 2 boots on GB10).
+
+Upstream status: local SM121 TileLang kernel optimization; not applicable upstream.
+---
+ .../test_deepseek_v41_tilelang_linear.py      | 45 ++++++++++
+ tests/models/test_deepseek_v4_1_lsa.py        |  6 ++
+ vllm/models/deepseek_v4_1/tilelang/gemm.py    | 78 +++++++++++-----
+ vllm/models/deepseek_v4_1/tilelang/indexer.py | 88 +++++++++++++------
+ 4 files changed, 170 insertions(+), 47 deletions(-)
+
+diff --git a/tests/kernels/quantization/test_deepseek_v41_tilelang_linear.py b/tests/kernels/quantization/test_deepseek_v41_tilelang_linear.py
+index b5c16fbb2..4271ab614 100644
+--- a/tests/kernels/quantization/test_deepseek_v41_tilelang_linear.py
++++ b/tests/kernels/quantization/test_deepseek_v41_tilelang_linear.py
+@@ -44,6 +44,15 @@ DEVICE = "cuda"
+ ROWS = (1, 7, 16, 17, 32, 33, 64, 65, 200)
+ 
+ 
++@pytest.fixture
++def default_vllm_config():
++    from vllm.config import VllmConfig, set_current_vllm_config
++
++    config = VllmConfig()
++    with set_current_vllm_config(config):
++        yield config
++
++
+ def _gen(seed):
+     return torch.Generator(device=DEVICE).manual_seed(seed)
+ 
+@@ -953,3 +962,39 @@ def test_mxfp8_gemm_rope_mxfp4_decode_matches_reference(default_vllm_config):
+                 )
+             assert torch.equal(q_out, q_ref), f"q mismatch at rows={rows}"
+             assert torch.equal(s_out, s_ref), f"s mismatch at rows={rows}"
++
++
++
++def test_hw_e2m1x2_codegen_in_gemm_and_indexer_quantizers():
++    """Verify that ``mxfp8_gemm_rope_mxfp4_decode``, ``mxfp4_quantize_v41``, and
++    ``mxfp4_norm_rope_quantize_v41`` lower MXFP4 byte packing through hardware
++    ``cvt.rn.satfinite.e2m1x2.f32`` and vectorized stores rather than 7-comparison
++    software emulation."""
++    from vllm.models.deepseek_v4_1.tilelang.gemm import mxfp8_gemm_rope_mxfp4_decode
++    from vllm.models.deepseek_v4_1.tilelang.indexer import (
++        mxfp4_norm_rope_quantize_v41,
++        mxfp4_quantize_v41,
++    )
++
++    gemm_src = mxfp8_gemm_rope_mxfp4_decode(
++        4096, 1280, 128, 64, block_M=16, padded_rows=True, tile_contiguous=True
++    ).get_kernel_source()
++    assert "cvt.rn.satfinite.e2m1x2.f32" in gemm_src
++    assert "dsv41_e2m1x2(" in gemm_src
++
++    for q_kernel in (
++        mxfp4_quantize_v41(paged=False),
++        mxfp4_quantize_v41(paged=False, rope_heads=32, rope_dim=64),
++        mxfp4_quantize_v41(paged=True, page_size=64),
++    ):
++        src = q_kernel.get_kernel_source()
++        assert "cvt.rn.satfinite.e2m1x2.f32" in src
++        assert "dsv41_store_e2m1x32(" in src
++
++    for nrq_kernel in (
++        mxfp4_norm_rope_quantize_v41(1e-6, page_size=64, shards=1),
++        mxfp4_norm_rope_quantize_v41(1e-6, page_size=64, shards=6),
++    ):
++        src = nrq_kernel.get_kernel_source()
++        assert "cvt.rn.satfinite.e2m1x2.f32" in src
++        assert "dsv41_store_e2m1x8(" in src
+diff --git a/tests/models/test_deepseek_v4_1_lsa.py b/tests/models/test_deepseek_v4_1_lsa.py
+index f78607017..661989840 100644
+--- a/tests/models/test_deepseek_v4_1_lsa.py
++++ b/tests/models/test_deepseek_v4_1_lsa.py
+@@ -82,6 +82,12 @@ def test_lsa_module_cleanliness_and_pdl_invariants():
+         assert forbidden not in bs_text
+         assert forbidden not in qr_text
+ 
++    gemm_text = (tl_dir / "gemm.py").read_text()
++    idx_text = (tl_dir / "indexer.py").read_text()
++    assert "cvt.rn.satfinite.e2m1x2.f32" in gemm_text
++    assert "_e2m1_code" not in gemm_text
++    assert "_e2m1_code" not in idx_text
++
+     bs_tree = ast.parse(bs_text)
+     qr_tree = ast.parse(qr_text)
+     cm_tree = ast.parse(cm_text)
+diff --git a/vllm/models/deepseek_v4_1/tilelang/gemm.py b/vllm/models/deepseek_v4_1/tilelang/gemm.py
+index c2443adcb..6820e140f 100644
+--- a/vllm/models/deepseek_v4_1/tilelang/gemm.py
++++ b/vllm/models/deepseek_v4_1/tilelang/gemm.py
+@@ -413,21 +413,58 @@ mxfp8_gemm_partials = tilelang.jit(
+ )(_mxfp8_gemm_partials)
+ 
+ 
+-def _e2m1_code(x):
+-    """Nearest-even E2M1 code of FP32 ``x``, saturating at 6 (``cvt.rn.satfinite``)."""
+-    m = T.abs(x)
+-    # Ties go to the even code: strict at even-lower midpoints, inclusive at odd.
+-    code = (
+-        T.cast(m > 0.25, T.int32)
+-        + T.cast(m >= 0.75, T.int32)
+-        + T.cast(m > 1.25, T.int32)
+-        + T.cast(m >= 1.75, T.int32)
+-        + T.cast(m > 2.5, T.int32)
+-        + T.cast(m >= 3.5, T.int32)
+-        + T.cast(m > 5.0, T.int32)
+-    )
+-    sign = T.cast(T.shift_right(T.reinterpret(x, T.uint32), 31), T.int32)
+-    return code | (sign << 3)
++_E2M1_HEADER = r"""
++__device__ __forceinline__ uint8_t dsv41_e2m1x2(float v0, float v1) {
++  unsigned int packed;
++  asm("{\n"
++      ".reg .b8 b;\n"
++      "cvt.rn.satfinite.e2m1x2.f32 b, %2, %1;\n"
++      "cvt.u32.u8 %0, b;\n"
++      "}"
++      : "=r"(packed)
++      : "f"(v0), "f"(v1));
++  return (uint8_t)packed;
++}
++
++__device__ __forceinline__ uint32_t dsv41_e2m1x8(
++    float v0, float v1, float v2, float v3,
++    float v4, float v5, float v6, float v7) {
++  uint32_t packed;
++  asm("{\n"
++      ".reg .b8 b0, b1, b2, b3;\n"
++      ".reg .b16 w0, w1;\n"
++      "cvt.rn.satfinite.e2m1x2.f32 b0, %2, %1;\n"
++      "cvt.rn.satfinite.e2m1x2.f32 b1, %4, %3;\n"
++      "cvt.rn.satfinite.e2m1x2.f32 b2, %6, %5;\n"
++      "cvt.rn.satfinite.e2m1x2.f32 b3, %8, %7;\n"
++      "mov.b16 w0, {b0, b1};\n"
++      "mov.b16 w1, {b2, b3};\n"
++      "mov.b32 %0, {w0, w1};\n"
++      "}"
++      : "=r"(packed)
++      : "f"(v0), "f"(v1), "f"(v2), "f"(v3),
++        "f"(v4), "f"(v5), "f"(v6), "f"(v7));
++  return packed;
++}
++
++__device__ __forceinline__ void dsv41_store_e2m1x8(
++    uint8_t* ptr,
++    float v0, float v1, float v2, float v3,
++    float v4, float v5, float v6, float v7) {
++  *reinterpret_cast<uint32_t*>(ptr) = dsv41_e2m1x8(
++      v0, v1, v2, v3, v4, v5, v6, v7);
++}
++
++__device__ __forceinline__ void dsv41_store_e2m1x32(
++    uint8_t* ptr, uint32_t w0, uint32_t w1, uint32_t w2, uint32_t w3) {
++  *reinterpret_cast<uint4*>(ptr) = make_uint4(w0, w1, w2, w3);
++}
++"""
++
++
++def _e2m1x2_byte(v0, v1):
++    """Two FP32 values rounded to nearest-even E2M1 (``cvt.rn.satfinite.e2m1x2.f32``), low nibble ``v0``."""
++    return T.call_extern("uint8", "dsv41_e2m1x2", v0, v1)
+ 
+ 
+ def _mxfp8_gemm_rope_mxfp4_decode(
+@@ -511,6 +548,7 @@ def _mxfp8_gemm_rope_mxfp4_decode(
+         with T.Kernel(
+             T.ceildiv(N, block_N), T.ceildiv(M, block_M), threads=threads
+         ) as (bx, by):
++            T.import_source(_E2M1_HEADER)
+             if swizzle_panel:
+                 T.use_swizzle(panel_size=swizzle_panel)
+             pdl.chain()
+@@ -602,10 +640,10 @@ def _mxfp8_gemm_rope_mxfp4_decode(
+             scale = T.alloc_var(T.float32)
+             sv0 = T.alloc_var(T.float32)
+             sv1 = T.alloc_var(T.float32)
+-            c_lo = T.alloc_var(T.int32)
+-            c_hi = T.alloc_var(T.int32)
+ 
+-            for it in T.serial(iters):
++            for it in T.unroll(
++                iters, explicit=False, annotations={"pragma_unroll_factor": 1}
++            ):
+                 row_local = it * rows_per_iter + row_in_iter
+                 m = by * block_M + row_local
+                 if m < M:
+@@ -642,9 +680,7 @@ def _mxfp8_gemm_rope_mxfp4_decode(
+                     )
+                     sv0 = T.fmul(v0, scale)
+                     sv1 = T.fmul(v1, scale)
+-                    c_lo = _e2m1_code(sv0)
+-                    c_hi = _e2m1_code(sv1)
+-                    Q[m, col0 // 2 + p] = T.cast(c_lo | (c_hi << 4), T.uint8)
++                    Q[m, col0 // 2 + p] = _e2m1x2_byte(sv0, sv1)
+                     if p == 0:
+                         S[m, col0 // SF_BLOCK] = T.cast(sf, T.uint8)
+ 
+diff --git a/vllm/models/deepseek_v4_1/tilelang/indexer.py b/vllm/models/deepseek_v4_1/tilelang/indexer.py
+index f8bc3fa91..9ea60be69 100644
+--- a/vllm/models/deepseek_v4_1/tilelang/indexer.py
++++ b/vllm/models/deepseek_v4_1/tilelang/indexer.py
+@@ -47,7 +47,7 @@ import tilelang.language as T
+ import torch
+ 
+ from . import pdl, prepare
+-from .gemm import SF_BLOCK, _e2m1_code
++from .gemm import SF_BLOCK, _E2M1_HEADER
+ 
+ INDEX_HEADS = 32
+ INDEX_DIM = 128
+@@ -411,11 +411,33 @@ def indexer_score_v41(
+     return indexer_score
+ 
+ 
+-def _mxfp4_byte(vals, first, scale):
+-    """Two scaled values ``vals[first : first + 2]`` packed low nibble first."""
+-    lo = _e2m1_code(T.fmul(T.cast(vals[first], T.float32), scale))
+-    hi = _e2m1_code(T.fmul(T.cast(vals[first + 1], T.float32), scale))
+-    return T.cast(lo | (hi << 4), T.uint8)
++def _mxfp4_word(vals, first, scale):
++    """Eight scaled values ``vals[first : first + 8]`` packed as four E2M1 bytes."""
++    return T.call_extern(
++        "uint32",
++        "dsv41_e2m1x8",
++        T.fmul(T.cast(vals[first], T.float32), scale),
++        T.fmul(T.cast(vals[first + 1], T.float32), scale),
++        T.fmul(T.cast(vals[first + 2], T.float32), scale),
++        T.fmul(T.cast(vals[first + 3], T.float32), scale),
++        T.fmul(T.cast(vals[first + 4], T.float32), scale),
++        T.fmul(T.cast(vals[first + 5], T.float32), scale),
++        T.fmul(T.cast(vals[first + 6], T.float32), scale),
++        T.fmul(T.cast(vals[first + 7], T.float32), scale),
++    )
++
++
++def _mxfp4_store_group(ptr, vals, scale):
++    """Quantize and store 32 values (16 packed E2M1 bytes) with a 128-bit store."""
++    return T.call_extern(
++        "void",
++        "dsv41_store_e2m1x32",
++        ptr,
++        _mxfp4_word(vals, 0, scale),
++        _mxfp4_word(vals, 8, scale),
++        _mxfp4_word(vals, 16, scale),
++        _mxfp4_word(vals, 24, scale),
++    )
+ 
+ 
+ @tilelang.jit
+@@ -450,6 +472,7 @@ def mxfp4_quantize_v41(
+     @T.macro
+     def body(X, Positions, CosSin, Q, S, Slots, Pool):
+         with T.Kernel(T.ceildiv(rows * groups, threads), threads=threads) as bx:
++            T.import_source(_E2M1_HEADER)
+             tx = T.get_thread_binding()
+             g = bx * threads + tx
+             row, k = g // groups, g % groups
+@@ -504,16 +527,22 @@ def mxfp4_quantize_v41(
+                     slot = slot_l[0]
+                     page, token = slot // page_size, slot % page_size
+                     if (slot >= 0) & (page < pool_pages):
+-                        for i in T.serial(half):
+-                            Pool[page, token * (INDEX_DIM // 2) + k * half + i] = (
+-                                _mxfp4_byte(vals, 2 * i, scale)
+-                            )
++                        _mxfp4_store_group(
++                            T.address_of(
++                                Pool[page, token * (INDEX_DIM // 2) + k * half]
++                            ),
++                            vals,
++                            scale,
++                        )
+                         Pool[
+                             page, page_size * (INDEX_DIM // 2) + token * groups + k
+                         ] = T.cast(sf, T.uint8)
+                 else:
+-                    for i in T.serial(half):
+-                        Q[row, k * half + i] = _mxfp4_byte(vals, 2 * i, scale)
++                    _mxfp4_store_group(
++                        T.address_of(Q[row, k * half]),
++                        vals,
++                        scale,
++                    )
+                     S[row, k] = T.cast(sf, T.uint8)
+ 
+     if paged:
+@@ -638,6 +667,7 @@ def mxfp4_norm_rope_quantize_v41(
+     @T.macro
+     def body(X, Weight, Positions, CosSin, Slots, Pool):
+         with T.Kernel(T.ceildiv(rows, kb), threads=_THREADS) as bx:
++            T.import_source(_E2M1_HEADER)
+             tid = T.get_thread_binding()
+             k_sum_partial = T.alloc_fragment((kb, kt), T.float32)
+             k_warp_reducer = T.alloc_reducer((kb, 1), T.float32, op="sum")
+@@ -769,20 +799,26 @@ def mxfp4_norm_rope_quantize_v41(
+                         scale = T.reinterpret(
+                             T.cast(T.shift_left(254 - sf, 23), T.uint32), T.float32
+                         )
+-                        for i in T.unroll(pairs):
+-                            lo = _e2m1_code(
+-                                T.fmul(T.cast(k_y[vi, 2 * i], T.float32), scale)
+-                            )
+-                            hi = _e2m1_code(
+-                                T.fmul(T.cast(k_y[vi, 2 * i + 1], T.float32), scale)
+-                            )
+-                            Pool[
+-                                page,
+-                                tok * (INDEX_DIM // 2)
+-                                + group * 16
+-                                + group_lane * pairs
+-                                + i,
+-                            ] = T.cast(lo | (hi << 4), T.uint8)
++                        T.call_extern(
++                            "void",
++                            "dsv41_store_e2m1x8",
++                            T.address_of(
++                                Pool[
++                                    page,
++                                    tok * (INDEX_DIM // 2)
++                                    + group * 16
++                                    + group_lane * pairs,
++                                ]
++                            ),
++                            T.fmul(T.cast(k_y[vi, 0], T.float32), scale),
++                            T.fmul(T.cast(k_y[vi, 1], T.float32), scale),
++                            T.fmul(T.cast(k_y[vi, 2], T.float32), scale),
++                            T.fmul(T.cast(k_y[vi, 3], T.float32), scale),
++                            T.fmul(T.cast(k_y[vi, 4], T.float32), scale),
++                            T.fmul(T.cast(k_y[vi, 5], T.float32), scale),
++                            T.fmul(T.cast(k_y[vi, 6], T.float32), scale),
++                            T.fmul(T.cast(k_y[vi, 7], T.float32), scale),
++                        )
+                         if group_lane == 0:
+                             Pool[
+                                 page,
+-- 
+2.43.0
+

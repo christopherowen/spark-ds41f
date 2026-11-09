@@ -1,0 +1,100 @@
+From 537028908d7eecc23c97590b9126d1702463a31e Mon Sep 17 00:00:00 2001
+From: Christopher Owen <3221756+christopherowen@users.noreply.github.com>
+Date: Sun, 8 Nov 2026 23:50:00 +0100
+Subject: [PATCH] perf(dsv41): align Q-B and indexer Q-B decode tiles with
+ 128x128 tile-contiguous weights
+
+Base: 1107 vLLM patch head 2756478b60b90700b9918b457aeb38657da637b5.
+
+Rationale:
+In DeepSeek-V4.1 decode, Q-B (wq_b) and indexer Q-B (indexer.wq_b, including the fused RoPE + MXFP4 epilogue kernel mxfp8_gemm_rope_mxfp4_decode) pack their FP8 weights into 128x128 tile-contiguous slabs ([N // 128, K // 128, 128, 128] viewed as (N * (K // 128), 128), 16 KiB per tile) via pack_weight_tiles when (N, K) is in TILE_CONTIGUOUS_FP8. However:
+1. Five Q-B / indexer Q-B decode buckets in DECODE_FP8_CONFIGS -- (12288, 1280) at block_M in (32, 64), (8192, 1280) at block_M in (32, 64), and (4096, 1280) at block_M = 16 -- used block_N = 64 while TILE_WEIGHT_N = 128, and (8192, 1280) at block_M = 64 used num_stages = 3. Whenever N >= 6144 (where N // 128 >= 48 SMs on GB10) or block_M in (16, 32), block_N = 64 splits each 128x128 (16 KiB) packed weight tile across two adjacent CTAs (bx even reads the upper 8 KiB half, bx odd reads the lower 8 KiB half), forcing every CTA to step across an 8 KiB non-contiguous gap on each ko iteration and doubling the CTA grid and redundant A / SFA shared-memory loads without increasing SM occupancy.
+2. Three Q-B shard shapes across TP=2..TP=7 -- (16384, 1280) on TP=2 (8 head groups), (6144, 1280) on TP=6/TP=7 ranks 0..4 (3 head groups), and (2048, 1280) on TP=6/TP=7 rank 5 after _trim_padded_groups (1 head group) -- were missing from TILE_CONTIGUOUS_FP8 and DECODE_FP8_CONFIGS, falling back to row-major weight loads with 1,280 B inter-row stride and generic _default_config(N, K) tiles.
+
+Align all N >= 6144 Q-B shapes in DECODE_FP8_CONFIGS to block_N = 128, block_K = 128 across all block_M in (16, 32, 64) (num_stages = 3 at block_M in (16, 32) and num_stages = 2 at block_M = 64), align N in (4096, 2048) to block_N = 128, block_K = 128, num_stages = 3 at block_M in (16, 32) while keeping block_N = 64, block_K = 128, num_stages = 2 at block_M = 64 so 64-row epilogues fill all 48 SMs, and register (16384, 1280), (6144, 1280), and (2048, 1280) in TILE_CONTIGUOUS_FP8 and DECODE_FP8_CONFIGS.
+
+Quality:
+Bit-exact (torch.equal, 0 uint16 diffs) with prefill mxfp8_gemm and row-major mxfp8_gemm_decode / mxfp8_gemm_rope_mxfp4_decode across all Q-B and indexer Q-B shapes ((2048, 1280), (4096, 1280), (6144, 1280), (8192, 1280), (12288, 1280), (16384, 1280)) and batch sizes M in (1, 2, 3, 6, 12, 24, 48).
+
+Tests:
+- pytest tests/kernels/quantization/test_deepseek_v41_tilelang_linear.py tests/kernels/quantization/test_deepseek_v41_block_scale_words.py tests/models/test_deepseek_v4_1_attention.py tests/models/test_deepseek_v4_1_l2_schedule.py tests/kernels/test_deepseek_v41_tilelang_pdl.py (189 passed across 2 boots).
+
+Upstream status: local DeepSeek-V4.1 SM12x TileLang decode weight layout and tile alignment.
+---
+ .../test_deepseek_v41_tilelang_linear.py      |  2 ++
+ vllm/models/deepseek_v4_1/tilelang/gemm.py    | 32 +++++++++++++++----
+ 2 files changed, 27 insertions(+), 7 deletions(-)
+
+diff --git a/tests/kernels/quantization/test_deepseek_v41_tilelang_linear.py b/tests/kernels/quantization/test_deepseek_v41_tilelang_linear.py
+index b5c16fb..db9af8f 100644
+--- a/tests/kernels/quantization/test_deepseek_v41_tilelang_linear.py
++++ b/tests/kernels/quantization/test_deepseek_v41_tilelang_linear.py
+@@ -602,6 +602,8 @@ def test_tile_contiguous_fp8_matches_row_major(default_vllm_config, n, k):
+ 
+     for block_M in DECODE_TILE_ROWS:
+         cfg = fp8_decode_config(n, k, block_M)
++        expected_n = 64 if (n < 6144 and block_M == 64) else 128
++        assert cfg["block_N"] == expected_n and cfg["block_K"] == 128, (n, k, block_M, cfg)
+         k_ref = mxfp8_gemm_decode(n, k, **cfg, padded_rows=True)
+         k_tiled = mxfp8_gemm_decode(
+             n, k, **cfg, padded_rows=True, tile_contiguous=True
+diff --git a/vllm/models/deepseek_v4_1/tilelang/gemm.py b/vllm/models/deepseek_v4_1/tilelang/gemm.py
+index c2443ad..ed39419 100644
+--- a/vllm/models/deepseek_v4_1/tilelang/gemm.py
++++ b/vllm/models/deepseek_v4_1/tilelang/gemm.py
+@@ -2492,27 +2492,45 @@ DECODE_TILE_ROWS = (16, 32, DECODE_ROWS)
+ # into [N // 128, K // 128, 128, 128] tiles so each decode and prefill tile reads a
+ # contiguous 128-wide slab per K step while keeping bit-identity with row-major [N, K].
+ TILE_CONTIGUOUS_FP8: set[tuple[int, int]] = {
++    (16384, 1280),
+     (12288, 1280),
+     (8192, 1280),
++    (6144, 1280),
+     (4096, 1280),
++    (2048, 1280),
+ }
+ 
+ DECODE_FP8_CONFIGS: dict[tuple[int, ...], dict[int, dict]] = {
+-    # Attention: Q-B (TP3, TP4..7, TP8 / indexer Q-B) and fused Q-A/KV.
++    # Attention: Q-B (TP2, TP3, TP4..7, TP8 / indexer Q-B) and fused Q-A/KV.
++    (16384, 1280): {
++        16: dict(block_N=128, block_K=128, num_stages=3),
++        32: dict(block_N=128, block_K=128, num_stages=3),
++        64: dict(block_N=128, block_K=128, num_stages=2),
++    },
+     (12288, 1280): {
+         16: dict(block_N=128, block_K=128, num_stages=3),
+-        32: dict(block_N=64, block_K=128, num_stages=3),
+-        64: dict(block_N=64, block_K=128, num_stages=2),
++        32: dict(block_N=128, block_K=128, num_stages=3),
++        64: dict(block_N=128, block_K=128, num_stages=2),
+     },
+     (8192, 1280): {
+         16: dict(block_N=128, block_K=128, num_stages=3),
+-        32: dict(block_N=64, block_K=128, num_stages=3),
+-        64: dict(block_N=64, block_K=128, num_stages=3),
++        32: dict(block_N=128, block_K=128, num_stages=3),
++        64: dict(block_N=128, block_K=128, num_stages=2),
++    },
++    (6144, 1280): {
++        16: dict(block_N=128, block_K=128, num_stages=3),
++        32: dict(block_N=128, block_K=128, num_stages=3),
++        64: dict(block_N=128, block_K=128, num_stages=2),
+     },
+     (4096, 1280): {
+-        16: dict(block_N=64, block_K=128, num_stages=3),
++        16: dict(block_N=128, block_K=128, num_stages=3),
+         32: dict(block_N=128, block_K=128, num_stages=3),
+-        64: dict(block_N=64, block_K=128, num_stages=2, threads=64),
++        64: dict(block_N=64, block_K=128, num_stages=2),
++    },
++    (2048, 1280): {
++        16: dict(block_N=128, block_K=128, num_stages=3),
++        32: dict(block_N=128, block_K=128, num_stages=3),
++        64: dict(block_N=64, block_K=128, num_stages=2),
+     },
+     (1792, 5120): {
+         16: dict(block_N=64, block_K=256, num_stages=2),
+-- 
+2.43.0
+

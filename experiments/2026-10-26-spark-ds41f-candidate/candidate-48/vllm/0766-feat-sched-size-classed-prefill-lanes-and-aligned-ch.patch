@@ -1,0 +1,1581 @@
+From 94d7d913036b141033fbd94aa586bbebb5d7c45b Mon Sep 17 00:00:00 2001
+From: Christopher Owen <christopherowen@users.noreply.github.com>
+Date: Sun, 8 Nov 2026 23:33:51 +0000
+Subject: [PATCH] feat(sched): size-classed prefill lanes and aligned-chunk
+ lane rotation
+
+Upstream base: 1107 vLLM patch head after 0762.
+
+Rationale:
+1. When align_prefill_chunks=True and max_parallel_prefills > 1, capping each lane to prefill_interleave_step.token_budget (token_budget // active_lanes) splits the step budget below aligned_chunk (long_prefill_token_threshold), causing num_new_tokens < aligned_chunk to skip every selected long prefill each step without releasing its lane. Exempt aligned chunks from per-step lane-share splitting so parallel lanes rotate whole aligned chunks across steps instead.
+2. Add size-classed prefill lanes (--prefill-long-threshold and --max-long-prefills, defaulting to 1 when prefill_long_threshold > 0) to bound concurrent long prefills while reserving the remaining parallel lanes for short requests (ordered by remaining uncached tokens after prefix-cache lookup, with 8-step starvation aging) and skipping waiting long prefills at the long-lane cap so short work queued behind them is not head-of-line blocked.
+3. Prevent multi-lane prefill livelocks by excluding blocked waiting statuses (WAITING_FOR_FSM, WAITING_FOR_REMOTE_KVS, WAITING_FOR_STREAMING_REQ) from prefill lane selection, releasing lanes on KV allocation failure or Mamba zero-token split, keeping lane shares above the Mamba block quantum when step budget permits, and allowing preemption in the post-waiting interleave pass when a step scheduled zero tokens.
+
+Quality:
+Scheduler-only change; preserves exact aligned chunk boundaries when align_prefill_chunks=True and leaves the promoted single-lane --prefill-yield short path unchanged.
+
+Tests:
+- pytest tests/v1/core/test_prefill_lane_livelock.py tests/v1/core/test_prefill_qos_lanes.py tests/v1/core/test_aligned_prefill_lanes.py tests/v1/core/test_prefill_yield.py tests/v1/core/test_aligned_prefill_chunks.py tests/v1/core/test_prefill_compute_share_scheduler.py (116 passed).
+
+Upstream status: local scheduler enhancement for parallel prefill lanes.
+---
+ tests/v1/core/test_aligned_prefill_lanes.py | 100 ++++
+ tests/v1/core/test_prefill_lane_livelock.py | 479 ++++++++++++++++++++
+ tests/v1/core/test_prefill_qos_lanes.py     | 259 +++++++++++
+ tests/v1/core/utils.py                      |   4 +
+ vllm/config/scheduler.py                    |  32 +-
+ vllm/engine/arg_utils.py                    |  12 +
+ vllm/v1/core/kv_cache_manager.py            |  12 +-
+ vllm/v1/core/sched/prefill_interleave.py    | 120 ++++-
+ vllm/v1/core/sched/scheduler.py             | 206 ++++++++-
+ vllm/v1/request.py                          |   4 +
+ 10 files changed, 1200 insertions(+), 28 deletions(-)
+ create mode 100644 tests/v1/core/test_aligned_prefill_lanes.py
+ create mode 100644 tests/v1/core/test_prefill_lane_livelock.py
+ create mode 100644 tests/v1/core/test_prefill_qos_lanes.py
+
+diff --git a/tests/v1/core/test_aligned_prefill_lanes.py b/tests/v1/core/test_aligned_prefill_lanes.py
+new file mode 100644
+index 0000000000..3f43c71023
+--- /dev/null
++++ b/tests/v1/core/test_aligned_prefill_lanes.py
+@@ -0,0 +1,100 @@
++# SPDX-License-Identifier: Apache-2.0
++# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
++"""Prefill lanes with aligned chunks: a lane's share does not split a whole chunk.
++
++Two long prompts each given half the budget never fit a whole aligned chunk; capped at
++their shares, both were skipped every step and nothing prefilled.
++"""
++
++import functools
++import json
++
++import pytest
++
++_OPT_CONFIG = {
++    "architectures": ["OPTForCausalLM"],
++    "model_type": "opt",
++    "hidden_size": 768,
++    "num_attention_heads": 12,
++    "num_hidden_layers": 12,
++    "ffn_dim": 3072,
++    "max_position_embeddings": 8192,
++    "vocab_size": 50272,
++    "word_embed_proj_dim": 768,
++    "torch_dtype": "float16",
++    "do_layer_norm_before": True,
++    "pad_token_id": 1,
++    "bos_token_id": 2,
++    "eos_token_id": 2,
++}
++
++BUDGET = 1024
++SEQS = 16
++THRESHOLD = BUDGET - SEQS
++
++
++def _schedules(monkeypatch, tmp_path, lanes, prompts, steps, aligned=True):
++    utils = pytest.importorskip("tests.v1.core.utils")
++    monkeypatch.setattr(
++        utils,
++        "SchedulerConfig",
++        functools.partial(utils.SchedulerConfig, align_prefill_chunks=aligned),
++    )
++    (tmp_path / "config.json").write_text(json.dumps(_OPT_CONFIG))
++    scheduler = utils.create_scheduler(
++        model=str(tmp_path),
++        max_num_seqs=SEQS,
++        max_num_batched_tokens=BUDGET,
++        long_prefill_token_threshold=THRESHOLD,
++        max_parallel_prefills=lanes,
++        max_model_len=8192,
++        skip_tokenizer_init=True,
++        device="cpu",
++    )
++    for name, tokens in prompts:
++        (request,) = utils.create_requests(
++            num_requests=1, num_tokens=tokens, req_ids=[name]
++        )
++        scheduler.add_request(request)
++    return [dict(scheduler.schedule().num_scheduled_tokens) for _ in range(steps)]
++
++
++def test_two_lanes_prefill_two_long_prompts(monkeypatch, tmp_path):
++    steps = _schedules(monkeypatch, tmp_path, 2, [("a", 4000), ("b", 4000)], 6)
++    assert steps == [
++        {"a": THRESHOLD},
++        {"a": THRESHOLD},
++        {"a": THRESHOLD},
++        {"a": 4000 - 3 * THRESHOLD},
++        {"b": THRESHOLD},
++        {"b": THRESHOLD},
++    ]
++
++
++def test_two_lanes_rotate_whole_chunks(monkeypatch, tmp_path):
++    prompts = [("a", 3000), ("b", 2500), ("c", 300)]
++    # One lane: first come, first served.
++    assert _schedules(monkeypatch, tmp_path, 1, prompts, 6) == [
++        {"a": THRESHOLD},
++        {"a": THRESHOLD},
++        {"a": 3000 - 2 * THRESHOLD},
++        {"b": THRESHOLD},
++        {"b": THRESHOLD},
++        {"b": 2500 - 2 * THRESHOLD, "c": 300},
++    ]
++    # Two lanes go to the prefills served longest ago; each takes a whole chunk.
++    assert _schedules(monkeypatch, tmp_path, 2, prompts, 6) == [
++        {"a": THRESHOLD},
++        {"b": THRESHOLD},
++        {"a": THRESHOLD},
++        {"b": THRESHOLD},
++        {"a": 3000 - 2 * THRESHOLD},
++        {"b": 2500 - 2 * THRESHOLD, "c": 300},
++    ]
++
++
++def test_shares_still_split_unaligned_chunks(monkeypatch, tmp_path):
++    (step,) = _schedules(
++        monkeypatch, tmp_path, 2, [("a", 4000), ("b", 4000)], 1, aligned=False
++    )
++    assert step == {"a": BUDGET // 2, "b": BUDGET // 2}
+diff --git a/tests/v1/core/test_prefill_lane_livelock.py b/tests/v1/core/test_prefill_lane_livelock.py
+new file mode 100644
+index 0000000000..3fac724af5
+--- /dev/null
++++ b/tests/v1/core/test_prefill_lane_livelock.py
+@@ -0,0 +1,479 @@
++# SPDX-License-Identifier: Apache-2.0
++# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
++"""Prefill-lane livelock regressions (max_parallel_prefills > 1).
++
++A lane-selected async-load candidate whose allocation fails must not
++strand the waiting loop with the remaining lane-holders still holding
++lanes (intra-step leak).
++
++A never-admissible rank-(-1) waiting cohort must not monopolize the
++lanes across steps: lane aging has to hand a running chunk a lane in a
++preempt-capable pass so preemption eventually frees blocks.
++
++The other cross-step monopoly cohort - requests scheduled once and
++then preempted keep their last_scheduled_step lane rank. That rank must
++age out, and the post-waiting interleave pass must be able to preempt on
++a step that scheduled nothing (only while the connector is quiescent),
++or the frozen-rank pair starves the running chunks forever at free == 0.
++
++With mamba "align" cache mode, a lane share below the block align
++quantum zeroes the chunk in the aligned split before the allocator is
++reached: doomed lane candidates must not fan the token budget out below
++the quantum, or no chunk can ever advance.
++"""
++
++import pytest
++
++from vllm.v1.outputs import ModelRunnerOutput
++from vllm.v1.request import RequestStatus
++
++from .utils import create_requests, create_scheduler, mock_kv
++
++pytestmark = pytest.mark.cpu_test
++
++BLOCK_SIZE = 16
++
++
++def _partial_prefill_output(req_ids: list[str]) -> ModelRunnerOutput:
++    """Model-runner output for a step that only advanced prefills."""
++    return ModelRunnerOutput(
++        req_ids=list(req_ids),
++        req_id_to_index={req_id: i for i, req_id in enumerate(req_ids)},
++        sampled_token_ids=[[] for _ in req_ids],
++        logprobs=None,
++        prompt_logprobs_dict={},
++        pooler_output=[],
++    )
++
++
++def _empty_output() -> ModelRunnerOutput:
++    return _partial_prefill_output([])
++
++
++def test_async_admission_failure_releases_lane_for_other_candidates():
++    """Failed async lane-holders must not block other lane candidates.
++
++    Three async-load candidates (connector CPU-tier hits) can never pass
++    the async admission gate while the running chunk reserves its
++    remaining prompt. A failed lane-holder parks and releases its lane,
++    lanes rotate to the chunk, every lane-holding candidate is processed
++    within the step, and the chunk keeps advancing every step.
++    """
++    scheduler = create_scheduler(
++        max_num_seqs=16,
++        max_num_batched_tokens=64,
++        max_model_len=1024,
++        max_parallel_prefills=2,
++        num_blocks=48,
++        block_size=BLOCK_SIZE,
++        enable_prefix_caching=False,
++        use_kv_connector=mock_kv(matched_tokens=0, is_async=True),
++    )
++    looked_up: list[str] = []
++
++    def fake_lookup(request, num_computed_tokens):
++        looked_up.append(request.request_id)
++        if request.request_id == "chunk":
++            return 0, False
++        # Whole-prompt CPU-tier hit: admission pays the full-sequence
++        # requirement and must fail against the chunk's reservation.
++        return 240, True
++
++    assert scheduler.connector is not None
++    scheduler.connector.get_num_new_matched_tokens = fake_lookup
++
++    (chunk,) = create_requests(
++        num_requests=1,
++        num_tokens=640,
++        req_ids=["chunk"],
++        block_size=BLOCK_SIZE,
++    )
++    scheduler.add_request(chunk)
++    output = scheduler.schedule()
++    assert output.num_scheduled_tokens.get("chunk", 0) == 64
++    scheduler.update_from_output(output, _partial_prefill_output(["chunk"]))
++    assert chunk.is_prefill_chunk
++
++    for req_id in ("r1", "r2", "r3"):
++        (req,) = create_requests(
++            num_requests=1,
++            num_tokens=640,
++            req_ids=[req_id],
++            block_size=BLOCK_SIZE,
++        )
++        scheduler.add_request(req)
++
++    for _ in range(3):
++        looked_up.clear()
++        output = scheduler.schedule()
++        assert output.num_scheduled_tokens.get("chunk", 0) == 64, (
++            "running chunk starved: failed async lane-holders kept the lanes"
++        )
++        # Every lane-holding candidate was processed this step: the waiting
++        # loop did not break with unprocessed lane-holders in place.
++        assert set(looked_up) == {"r1", "r2", "r3"}
++        scheduler.update_from_output(output, _partial_prefill_output(["chunk"]))
++
++    for req_id in ("r1", "r2", "r3"):
++        assert scheduler.requests[req_id].status == RequestStatus.WAITING
++    assert chunk.num_computed_tokens == 64 + 3 * 64
++
++
++def test_never_admissible_cohort_cannot_starve_runnable_chunk_forever():
++    """A rank-(-1) cohort must age out so preemption can fire.
++
++    A filler plus two running prefill chunks own the whole pool
++    (free == 0, their blocks non-evictable) and four promoted-waiting
++    requests can never be admitted. The connector is held
++    non-quiescent so the guarded post-waiting interleave pass cannot
++    preempt: cross-step lane aging is the isolated recovery mechanism,
++    rotating the cohort behind the chunks within LANE_AGING_STEPS
++    steps until a chunk reaches the preempt-capable first pass and
++    preemption of the last running request frees blocks.
++    """
++
++    scheduler = create_scheduler(
++        max_num_seqs=16,
++        max_num_batched_tokens=32,
++        max_model_len=1024,
++        max_parallel_prefills=4,
++        num_blocks=33,
++        block_size=BLOCK_SIZE,
++        enable_prefix_caching=False,
++        use_kv_connector=mock_kv(matched_tokens=0, is_async=False),
++    )
++    # Keep the connector non-quiescent: the post-waiting interleave pass
++    # may preempt on a no-progress step only while it holds no in-flight
++    # jobs, so this test exercises aging as the sole recovery path.
++    assert scheduler.connector is not None
++    scheduler.connector.has_pending_push_work = lambda: True
++
++    # Filler: prefills to completion, then holds its blocks pinned
++    # (non-evictable) without contributing tokens (no sampled output).
++    (filler,) = create_requests(
++        num_requests=1,
++        num_tokens=128,
++        req_ids=["filler"],
++        block_size=BLOCK_SIZE,
++    )
++    scheduler.add_request(filler)
++    while filler.num_computed_tokens < 128:
++        output = scheduler.schedule()
++        assert output.total_num_scheduled_tokens > 0
++        scheduler.update_from_output(
++            output, _partial_prefill_output(list(output.num_scheduled_tokens))
++        )
++    assert filler.num_computed_tokens == 128
++
++    c1, c2 = create_requests(
++        num_requests=2,
++        num_tokens=320,
++        req_ids=["c1", "c2"],
++        block_size=BLOCK_SIZE,
++    )
++    scheduler.add_request(c1)
++    scheduler.add_request(c2)
++
++    # Fill the pool with the two chunks (lane token-split keeps them even;
++    # 24 blocks remain, both need 20 -> neither completes).
++    while scheduler.kv_cache_manager.block_pool.get_num_free_blocks() > 0:
++        output = scheduler.schedule()
++        assert output.total_num_scheduled_tokens > 0
++        scheduler.update_from_output(
++            output, _partial_prefill_output(list(output.num_scheduled_tokens))
++        )
++    assert c1.is_prefill_chunk and c2.is_prefill_chunk
++
++    # Promoted-waiting cohort: async loads completed (num_computed preset),
++    # their blocks were never allocated, and free == 0 makes them
++    # permanently inadmissible.
++    for i in range(4):
++        (promoted,) = create_requests(
++            num_requests=1,
++            num_tokens=256,
++            req_ids=[f"p{i}"],
++            block_size=BLOCK_SIZE,
++        )
++        promoted.num_computed_tokens = 240
++        scheduler.add_request(promoted)
++
++    # The intra-step rotation alone cannot recover: while the cohort holds
++    # rank -1 at step start, the chunks only reach the post-waiting pass,
++    # which cannot preempt while the connector reports in-flight jobs, so
++    # steps stay empty.
++    for _ in range(10):
++        output = scheduler.schedule()
++        assert output.total_num_scheduled_tokens == 0
++        scheduler.update_from_output(output, _empty_output())
++
++    # Aging must hand the chunks a lane in the preempt-capable first pass
++    # within a bounded number of steps.
++    progressed = False
++    for _ in range(64):
++        output = scheduler.schedule()
++        if output.total_num_scheduled_tokens > 0:
++            progressed = True
++            break
++        scheduler.update_from_output(output, _empty_output())
++    assert progressed, (
++        "never-scheduled rank-(-1) cohort starved the running chunks "
++        "forever: lane aging did not rotate lanes to a preempt-capable pass"
++    )
++    assert c1.num_preemptions + c2.num_preemptions >= 1, (
++        "expected preemption of a running chunk to free blocks"
++    )
++
++
++def _drive_to_preempted_after_scheduled_cohort(scheduler):
++    """Build the preempted-after-scheduled roster and return (c1, c2, s1, s2).
++
++    Two chunks fill the pool (45 blocks; both stop below their 24-block
++    completion), a never-scheduled pair is scheduled once for one
++    32-token chunk each (last_scheduled_step set), the scheduler's own
++    preemption path (pop the running tail + _preempt_request, as the
++    preempt-capable first pass does when the pool goes dry) preempts
++    the pair, and the chunks consume the freed blocks until free == 0.
++    The pair then waits, preempted, with its lane rank set and ahead of
++    the chunks'.
++    """
++    free_blocks = scheduler.kv_cache_manager.block_pool.get_num_free_blocks
++    c1, c2 = create_requests(
++        num_requests=2,
++        num_tokens=384,
++        req_ids=["c1", "c2"],
++        block_size=BLOCK_SIZE,
++    )
++    scheduler.add_request(c1)
++    scheduler.add_request(c2)
++    # Advance both chunks to 14 blocks each, leaving 16 free blocks:
++    # enough for the pair's full-sequence admission check (224 tokens
++    # = 14 blocks each) and an even drain (four blocks per step) back
++    # to free == 0, while the first chunk advance step drops free below
++    # the pair's full-sequence requirement so it can never re-qualify.
++    while free_blocks() > 16:
++        output = scheduler.schedule()
++        assert output.total_num_scheduled_tokens > 0
++        scheduler.update_from_output(
++            output, _partial_prefill_output(list(output.num_scheduled_tokens))
++        )
++    assert c1.is_prefill_chunk and c2.is_prefill_chunk
++
++    s1, s2 = create_requests(
++        num_requests=2,
++        num_tokens=224,
++        req_ids=["s1", "s2"],
++        block_size=BLOCK_SIZE,
++    )
++    scheduler.add_request(s1)
++    scheduler.add_request(s2)
++    # The never-scheduled pair outranks the chunks and takes both lanes
++    # for exactly one step.
++    output = scheduler.schedule()
++    assert output.num_scheduled_tokens.get("s1") == 32
++    assert output.num_scheduled_tokens.get("s2") == 32
++    scheduler.update_from_output(output, _partial_prefill_output(["s1", "s2"]))
++
++    # Preempt the pair the way the preempt-capable first pass does when
++    # the pool goes dry: pop the running tail and preempt. Preemption
++    # does not clear last_scheduled_step.
++    for victim in (s2, s1):
++        assert scheduler.running.pop() is victim
++        scheduler._preempt_request(victim, timestamp=0.0)
++
++    # The chunks consume the freed blocks down to free == 0. The pair's
++    # frozen rank keeps it at the lane front, where its admission fails
++    # the full-sequence check every step and it parks, so the chunks
++    # advance through the post-waiting pass.
++    while free_blocks() > 0:
++        output = scheduler.schedule()
++        assert output.total_num_scheduled_tokens > 0
++        scheduler.update_from_output(
++            output, _partial_prefill_output(list(output.num_scheduled_tokens))
++        )
++    for req in (s1, s2):
++        assert req.status == RequestStatus.PREEMPTED
++        assert req.num_preemptions == 1
++    assert c1.is_prefill_chunk and c2.is_prefill_chunk
++    controller = scheduler.prefill_interleave_controller
++    # The pair's rank is set and ahead of the chunks' (scheduled once,
++    # preempted without its last_scheduled_step being cleared), so it
++    # wins both lanes at every step start.
++    assert "s1" in controller.last_scheduled_step
++    assert "s2" in controller.last_scheduled_step
++    assert controller.last_scheduled_step["s1"] < controller.last_scheduled_step["c1"]
++    assert controller.last_scheduled_step["s2"] < controller.last_scheduled_step["c2"]
++    return c1, c2, s1, s2
++
++
++def test_preempted_after_scheduled_cohort_cannot_starve_runnable_chunks():
++    """The preempted-after-scheduled cohort must not starve the chunks.
++
++    The pair keeps its last_scheduled_step rank and wins both lanes at
++    step start, so the chunks only reach the post-waiting interleave
++    pass: with the connector quiescent it must preempt on a step that
++    scheduled nothing, and preemption of the last running chunk frees
++    blocks for a forward.
++    """
++    scheduler = create_scheduler(
++        max_num_seqs=16,
++        max_num_batched_tokens=64,
++        max_model_len=1024,
++        max_parallel_prefills=2,
++        num_blocks=45,
++        block_size=BLOCK_SIZE,
++        enable_prefix_caching=False,
++    )
++    c1, c2, s1, s2 = _drive_to_preempted_after_scheduled_cohort(scheduler)
++
++    progressed = False
++    for _ in range(64):
++        output = scheduler.schedule()
++        if output.total_num_scheduled_tokens > 0:
++            progressed = True
++            break
++        scheduler.update_from_output(output, _empty_output())
++    assert progressed, (
++        "preempted-after-scheduled cohort starved the running chunks: "
++        "the frozen-rank pair held both lanes at step start and the "
++        "post-waiting interleave pass scheduled nothing"
++    )
++    assert c1.num_preemptions + c2.num_preemptions >= 1, (
++        "expected recovery through preemption of a running request"
++    )
++    for req in (s1, s2):
++        assert req.status == RequestStatus.PREEMPTED
++
++
++def test_busy_connector_guards_preemption_and_aging_recovers():
++    """With connector jobs in flight the post-waiting interleave pass
++    must not preempt (the preemption's flush would reach an unbounded
++    worker-side wait()); recovery then comes from aging the stale
++    ranks out of the lane front so a chunk reaches the preempt-capable
++    first pass.
++    """
++    scheduler = create_scheduler(
++        max_num_seqs=16,
++        max_num_batched_tokens=64,
++        max_model_len=1024,
++        max_parallel_prefills=2,
++        num_blocks=45,
++        block_size=BLOCK_SIZE,
++        enable_prefix_caching=False,
++        use_kv_connector=mock_kv(matched_tokens=0, is_async=False),
++    )
++    assert scheduler.connector is not None
++    scheduler.connector.has_pending_push_work = lambda: True
++    c1, c2, s1, s2 = _drive_to_preempted_after_scheduled_cohort(scheduler)
++
++    # The guard holds while the pair's rank is still fresh: no-progress
++    # steps stay empty instead of preempting.
++    for _ in range(10):
++        output = scheduler.schedule()
++        assert output.total_num_scheduled_tokens == 0, (
++            "the post-waiting interleave pass preempted while the "
++            "connector reported in-flight jobs"
++        )
++        scheduler.update_from_output(output, _empty_output())
++
++    progressed = False
++    for _ in range(64):
++        output = scheduler.schedule()
++        if output.total_num_scheduled_tokens > 0:
++            progressed = True
++            break
++        scheduler.update_from_output(output, _empty_output())
++    assert progressed, (
++        "stale frozen ranks never aged out of the lane front: the "
++        "preempted-after-scheduled cohort starved the chunks with the "
++        "interleave pass guarded"
++    )
++    assert c1.num_preemptions + c2.num_preemptions >= 1, (
++        "expected recovery through preemption in the preempt-capable "
++        "first running pass"
++    )
++
++
++def test_lane_share_below_align_quantum_cannot_starve_chunk():
++    """A fanout share below the align quantum must not zero the chunk.
++
++    In a mamba "align" deployment the align quantum is the block size
++    (64 here); a chunk whose share ends before the next block boundary is
++    floored to zero tokens by the aligned split, consumes its lane, and
++    never reaches the allocator. With more lane candidates than lanes,
++    every chunk's fanout share falls below the quantum and no prefill
++    can advance while doomed async candidates hold lanes and fail the
++    full-sequence admission gate: empty steps forever. The lane share
++    must fall back to the global step budget whenever that budget can
++    cover a full quantum.
++    """
++    scheduler = create_scheduler(
++        max_num_seqs=16,
++        max_num_batched_tokens=131,  # 2 * 64 + 3: two full quanta per step
++        max_model_len=1024,
++        max_parallel_prefills=4,
++        num_blocks=11,
++        block_size=64,
++        enable_prefix_caching=False,
++        use_kv_connector=mock_kv(matched_tokens=0, is_async=True),
++    )
++    # The scheduler-side flag of a mamba "align" deployment (derived at
++    # construction from has_mamba_layers and mamba_cache_mode == "align").
++    scheduler.need_mamba_block_aligned_split = True
++
++    def fake_lookup(request, num_computed_tokens):
++        if request.request_id == "chunk":
++            return 0, False
++        # Whole-prompt CPU-tier hit: the async admission gate pays the
++        # full-sequence requirement (8 blocks) and must fail against
++        # free (6) minus the chunk's remaining-block reservation (4).
++        return 240, True
++
++    assert scheduler.connector is not None
++    scheduler.connector.get_num_new_matched_tokens = fake_lookup
++
++    (chunk,) = create_requests(
++        num_requests=1,
++        num_tokens=512,
++        req_ids=["chunk"],
++        block_size=64,
++    )
++    scheduler.add_request(chunk)
++    # Advance to a block-aligned mid-prefill position with two full
++    # quanta pending (the aligned split floors every step to 128 here).
++    while chunk.num_computed_tokens < 256:
++        output = scheduler.schedule()
++        assert output.total_num_scheduled_tokens > 0
++        scheduler.update_from_output(
++            output, _partial_prefill_output(list(output.num_scheduled_tokens))
++        )
++    assert chunk.is_prefill_chunk
++
++    for req_id in ("d1", "d2"):
++        (doomed,) = create_requests(
++            num_requests=1,
++            num_tokens=512,
++            req_ids=[req_id],
++            block_size=64,
++        )
++        scheduler.add_request(doomed)
++
++    # All three candidates hold lanes (4 lanes, 3 candidates), so the
++    # chunk's fanout share is ceil(131/3) = 44 < 64: below the
++    # quantum, the aligned split would zero the chunk and consume the
++    # lane at the zero-token branch. With the share cap dropped, the
++    # chunk takes two full quanta from the step budget.
++    progressed = False
++    for _ in range(64):
++        output = scheduler.schedule()
++        if output.total_num_scheduled_tokens > 0:
++            progressed = True
++            break
++        scheduler.update_from_output(output, _empty_output())
++    assert progressed, (
++        "lane fanout shares below the align quantum zeroed the chunk: "
++        "the lane-selected chunk never reached the allocator and starved "
++        "behind the doomed async candidates"
++    )
++    assert chunk.num_computed_tokens == 384
++    for req_id in ("d1", "d2"):
++        assert scheduler.requests[req_id].status == RequestStatus.WAITING
+diff --git a/tests/v1/core/test_prefill_qos_lanes.py b/tests/v1/core/test_prefill_qos_lanes.py
+new file mode 100644
+index 0000000000..7b16493eaa
+--- /dev/null
++++ b/tests/v1/core/test_prefill_qos_lanes.py
+@@ -0,0 +1,259 @@
++# SPDX-License-Identifier: Apache-2.0
++# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
++"""Size-classed prefill lanes: short work keeps flowing beside long prefills.
++
++Geometry for every test: 4 lanes (auto), 16-token steps, block size 4, and a
++long threshold of 32 uncached tokens with one long lane.
++"""
++
++import pytest
++
++from vllm.config import SchedulerConfig
++from vllm.engine.arg_utils import EngineArgs
++from vllm.utils.argparse_utils import FlexibleArgumentParser
++from vllm.v1.core.sched.prefill_interleave import PrefillInterleaveController
++from vllm.v1.core.sched.scheduler import Scheduler
++from vllm.v1.outputs import ModelRunnerOutput
++from vllm.v1.request import RequestStatus
++
++from .utils import create_requests, create_scheduler
++
++pytestmark = pytest.mark.cpu_test
++
++THRESHOLD = 32
++
++
++@pytest.fixture
++def opt_model_path(tmp_path):
++    (tmp_path / "config.json").write_text(
++        '{"architectures":["OPTForCausalLM"],"model_type":"opt",'
++        '"max_position_embeddings":32768}'
++    )
++    return str(tmp_path)
++
++
++def _scheduler(opt_model_path, **kwargs):
++    kwargs.setdefault("max_parallel_prefills", "auto")
++    kwargs.setdefault("prefill_long_threshold", THRESHOLD)
++    kwargs.setdefault("max_long_prefills", 1)
++    return create_scheduler(
++        model=opt_model_path,
++        skip_tokenizer_init=True,
++        device="cpu",
++        max_num_seqs=kwargs.pop("max_num_seqs", 8),
++        max_num_batched_tokens=kwargs.pop("max_num_batched_tokens", 16),
++        max_model_len=kwargs.pop("max_model_len", 512),
++        block_size=kwargs.pop("block_size", 4),
++        **kwargs,
++    )
++
++
++def _update(scheduler, output) -> None:
++    req_ids = list(output.num_scheduled_tokens)
++    sampled_token_ids = [
++        [] if scheduler.requests[req_id].is_prefill_chunk else [0] for req_id in req_ids
++    ]
++    scheduler.update_from_output(
++        output,
++        ModelRunnerOutput(
++            req_ids=req_ids,
++            req_id_to_index={req_id: index for index, req_id in enumerate(req_ids)},
++            sampled_token_ids=sampled_token_ids,
++            logprobs=None,
++            prompt_logprobs_dict={},
++            pooler_output=[],
++        ),
++    )
++
++
++def _start(scheduler, req_id: str, num_tokens: int):
++    (request,) = create_requests(
++        num_requests=1, num_tokens=num_tokens, req_ids=[req_id]
++    )
++    scheduler.add_request(request)
++    return request
++
++
++def test_size_classes_require_parallel_lanes():
++    with pytest.raises(ValueError, match="prefill_long_threshold"):
++        SchedulerConfig(
++            max_model_len=128,
++            is_encoder_decoder=False,
++            max_parallel_prefills=1,
++            prefill_long_threshold=THRESHOLD,
++        )
++
++
++def test_size_classes_cli_contract():
++    parser = EngineArgs.add_cli_args(FlexibleArgumentParser())
++    namespace = parser.parse_args(
++        [
++            "--max-parallel-prefills",
++            "auto",
++            "--prefill-long-threshold",
++            "32768",
++            "--max-long-prefills",
++            "2",
++        ]
++    )
++    engine_args = EngineArgs.from_cli_args(namespace)
++    assert engine_args.prefill_long_threshold == 32768
++    assert engine_args.max_long_prefills == 2
++
++
++def test_long_prefill_alone_keeps_the_full_budget(opt_model_path):
++    scheduler = _scheduler(opt_model_path)
++    _start(scheduler, "long", 200)
++
++    output = scheduler.schedule()
++
++    assert output.num_scheduled_tokens == {"long": 16}
++
++
++def test_long_prefill_keeps_a_lane_when_short_requests_arrive(opt_model_path):
++    """Plain round-robin gives every lane to never-scheduled newcomers; size
++    classes keep one lane for the running long prefill (its progress floor)."""
++    scheduler = _scheduler(opt_model_path)
++    _start(scheduler, "long", 200)
++    _update(scheduler, scheduler.schedule())
++    for index in range(4):
++        _start(scheduler, f"s{index}", 8)
++
++    output = scheduler.schedule()
++
++    assert output.num_scheduled_tokens["long"] >= 4
++    shorts = [f"s{index}" for index in range(4)]
++    assert sum(req_id in output.num_scheduled_tokens for req_id in shorts) == 3
++    assert sum(output.num_scheduled_tokens.values()) == 16
++
++
++def test_without_size_classes_newcomers_take_every_lane(opt_model_path):
++    """The legacy round-robin behaviour is unchanged when size classes are off."""
++    scheduler = _scheduler(opt_model_path, prefill_long_threshold=0)
++    _start(scheduler, "long", 200)
++    _update(scheduler, scheduler.schedule())
++    for index in range(4):
++        _start(scheduler, f"s{index}", 8)
++
++    output = scheduler.schedule()
++
++    assert "long" not in output.num_scheduled_tokens
++    assert sorted(output.num_scheduled_tokens) == ["s0", "s1", "s2", "s3"]
++
++
++def test_second_long_admission_skips_over_without_blocking_short_work(
++    opt_model_path,
++):
++    scheduler = _scheduler(opt_model_path)
++    long1 = _start(scheduler, "long1", 200)
++    _update(scheduler, scheduler.schedule())
++    long2 = _start(scheduler, "long2", 200)
++    _start(scheduler, "s0", 8)
++    _start(scheduler, "s1", 8)
++
++    output = scheduler.schedule()
++
++    assert "long1" in output.num_scheduled_tokens
++    assert "long2" not in output.num_scheduled_tokens
++    assert "s0" in output.num_scheduled_tokens
++    assert "s1" in output.num_scheduled_tokens
++    # long2 was looked up once and parked, not admitted.
++    assert long2.qos_cached_tokens_hint == 0
++    assert long2.status == RequestStatus.WAITING
++    assert long1.status == RequestStatus.RUNNING
++
++    # While long1 is in flight, the parked long2 gets no lane at all.
++    _update(scheduler, output)
++    output = scheduler.schedule()
++    assert "long2" not in output.num_scheduled_tokens
++    assert "long1" in output.num_scheduled_tokens
++
++
++def test_parked_long_is_admitted_once_long_work_drops_below_threshold(
++    opt_model_path,
++):
++    scheduler = _scheduler(opt_model_path)
++    long1 = _start(scheduler, "long1", 64)
++    _update(scheduler, scheduler.schedule())
++    long2 = _start(scheduler, "long2", 200)
++
++    admitted_at = None
++    for step in range(12):
++        output = scheduler.schedule()
++        if "long2" in output.num_scheduled_tokens:
++            admitted_at = step
++            break
++        _update(scheduler, output)
++
++    assert admitted_at is not None
++    # long2 waited only until long1's remaining work fell below the threshold.
++    assert long1.num_tokens - 1 - long1.num_computed_tokens < THRESHOLD
++    assert long2.status == RequestStatus.RUNNING
++
++
++def test_short_requests_finish_while_long_prefill_progresses(opt_model_path):
++    scheduler = _scheduler(opt_model_path)
++    long_request = _start(scheduler, "long", 400)
++    _update(scheduler, scheduler.schedule())
++    shorts = [_start(scheduler, f"s{index}", 12) for index in range(6)]
++
++    for _ in range(10):
++        before = long_request.num_computed_tokens
++        output = scheduler.schedule()
++        _update(scheduler, output)
++        # The long prefill advances on every step: no starvation.
++        assert long_request.num_computed_tokens > before
++
++    # Every short request finished its prefill and is decoding.
++    for request in shorts:
++        assert request.num_computed_tokens >= request.num_prompt_tokens
++    assert long_request.num_computed_tokens < long_request.num_prompt_tokens
++
++
++def test_blocked_request_does_not_take_a_lane():
++    """A request preempted mid-prefill keeps is_prefill_chunk; while it waits
++    for a remote KV load it must not hold a prefill lane."""
++    blocked, ready = create_requests(
++        num_requests=2, num_tokens=64, req_ids=["blocked", "ready"]
++    )
++    blocked.status = RequestStatus.WAITING_FOR_REMOTE_KVS
++    blocked.is_prefill_chunk = True
++
++    step = PrefillInterleaveController().begin_step(
++        running=[],
++        waiting=[ready],
++        skipped_waiting=[blocked],
++        request_lookup={"blocked": blocked, "ready": ready},
++        is_local_prefill=Scheduler._request_has_local_prefill,
++        max_parallel_prefills=2,
++        policy="round-robin",
++        num_runnable_decodes=0,
++        decode_refill_target=2,
++        current_step=1,
++        respect_priority=False,
++    )
++
++    assert step is not None
++    assert step.is_selected("ready")
++    assert not step.is_selected("blocked")
++
++
++@pytest.mark.parametrize("threshold, admitted", [(THRESHOLD, False), (0, True)])
++def test_long_admission_reserves_in_flight_prefill_blocks(
++    opt_model_path, threshold, admitted
++):
++    """With size classes on, a long admission must fit beside the blocks an
++    in-flight long prefill still needs (full-ISL check with reservation)."""
++    scheduler = _scheduler(
++        opt_model_path,
++        prefill_long_threshold=threshold,
++        max_long_prefills=2,
++        num_blocks=80,
++    )
++    _start(scheduler, "long1", 200)
++    _update(scheduler, scheduler.schedule())
++    _start(scheduler, "long2", 140)
++
++    output = scheduler.schedule()
++
++    assert ("long2" in output.num_scheduled_tokens) is admitted
+diff --git a/tests/v1/core/utils.py b/tests/v1/core/utils.py
+index a0652f8692..8bde20698e 100644
+--- a/tests/v1/core/utils.py
++++ b/tests/v1/core/utils.py
+@@ -70,6 +70,8 @@ def create_scheduler(
+     max_parallel_prefills: MaxParallelPrefills = 1,
+     prefill_policy: PrefillPolicy = "round-robin",
+     decode_refill_target: DecodeRefillTarget = "auto",
++    prefill_long_threshold: int = 0,
++    max_long_prefills: int = 1,
+     scheduling_policy: SchedulerPolicy = "fcfs",
+     device: str = "auto",
+     disable_chunked_mm_input: bool = False,
+@@ -132,6 +134,8 @@ def create_scheduler(
+         max_parallel_prefills=max_parallel_prefills,
+         prefill_policy=prefill_policy,
+         decode_refill_target=decode_refill_target,
++        prefill_long_threshold=prefill_long_threshold,
++        max_long_prefills=max_long_prefills,
+         policy=scheduling_policy,
+         disable_chunked_mm_input=disable_chunked_mm_input,
+         enable_chunked_prefill=enable_chunked_prefill,
+diff --git a/vllm/config/scheduler.py b/vllm/config/scheduler.py
+index ef98fad4fd..ad2be908ff 100644
+--- a/vllm/config/scheduler.py
++++ b/vllm/config/scheduler.py
+@@ -231,8 +231,9 @@ class SchedulerConfig:
+     caps that count by ``max_num_seqs``. The scheduler's normal token budget
+     limits actual work, so this remains independent of cache block size and
+     ``max_num_batched_tokens``. A lone prefill retains the full token budget
+-    and unused shares are redistributed within the step. ``1`` preserves
+-    legacy behavior.
++    and unused shares are redistributed within the step. With aligned prefill
++    chunks a lane takes its whole chunk while the step's budget holds it, and
++    lanes rotate whole chunks. ``1`` preserves legacy behavior.
+     """
+ 
+     prefill_policy: PrefillPolicy = "round-robin"
+@@ -269,6 +270,29 @@ class SchedulerConfig:
+     """With ``prefill_yield``: a long prefill that has yielded this long stops
+     yielding until its next chunk runs."""
+ 
++    prefill_long_threshold: int = Field(default=0, ge=0)
++    """Size-classed prefill lanes: QoS for many concurrent users.
++
++    A local prefill whose uncached remaining work is at least this many
++    tokens is long; other prefills are short. The estimate uses the prefix
++    and connector cache hits found when the request was last looked up, not
++    the prompt length, so a mostly cached follow-up turn is short. Zero
++    disables size classes and lanes behave as before.
++
++    With size classes, long prefills hold at most ``max_long_prefills`` lanes
++    while short prefills wait, always keep at least one lane while one is
++    runnable, and take any lane that short work leaves unused. A long
++    admission waits, without blocking the short work behind it, while
++    ``max_long_prefills`` long prefills are already in flight. Requires
++    ``max_parallel_prefills`` greater than one.
++    """
++
++    max_long_prefills: int = Field(default=1, ge=1)
++    """Long prefills (see ``prefill_long_threshold``) that may be in flight
++    and hold lanes while short work waits. At least one lane always stays
++    available to short work, so the effective value is at most the lane count
++    minus one."""
++
+     async_scheduling: bool | None = None
+     """If set to False, disable async scheduling. Async scheduling helps to
+     avoid gaps in GPU utilization, leading to better latency and throughput.
+@@ -414,6 +438,10 @@ class SchedulerConfig:
+             raise ValueError(
+                 "prefill interleaving requires enable_chunked_prefill=True"
+             )
++        if self.prefill_long_threshold > 0 and not interleaving_enabled:
++            raise ValueError(
++                "prefill_long_threshold requires max_parallel_prefills greater than one"
++            )
+ 
+         if is_encoder_decoder:
+             if interleaving_enabled:
+diff --git a/vllm/engine/arg_utils.py b/vllm/engine/arg_utils.py
+index 398cfe7b36..4e52871fd6 100644
+--- a/vllm/engine/arg_utils.py
++++ b/vllm/engine/arg_utils.py
+@@ -731,6 +731,8 @@ class EngineArgs:
+     decode_refill_target: DecodeRefillTarget = SchedulerConfig.decode_refill_target
+     prefill_yield: PrefillYield = SchedulerConfig.prefill_yield
+     prefill_yield_limit_s: float = SchedulerConfig.prefill_yield_limit_s
++    prefill_long_threshold: int = SchedulerConfig.prefill_long_threshold
++    max_long_prefills: int = SchedulerConfig.max_long_prefills
+ 
+     watermark: float = SchedulerConfig.watermark
+ 
+@@ -1775,6 +1777,14 @@ class EngineArgs:
+         scheduler_group.add_argument(
+             "--prefill-yield-limit-s", **scheduler_kwargs["prefill_yield_limit_s"]
+         )
++        scheduler_group.add_argument(
++            "--prefill-long-threshold",
++            **scheduler_kwargs["prefill_long_threshold"],
++        )
++        scheduler_group.add_argument(
++            "--max-long-prefills",
++            **scheduler_kwargs["max_long_prefills"],
++        )
+         scheduler_group.add_argument(
+             "--disable-hybrid-kv-cache-manager",
+             **scheduler_kwargs["disable_hybrid_kv_cache_manager"],
+@@ -2629,6 +2639,8 @@ class EngineArgs:
+             decode_refill_target=self.decode_refill_target,
+             prefill_yield=self.prefill_yield,
+             prefill_yield_limit_s=self.prefill_yield_limit_s,
++            prefill_long_threshold=self.prefill_long_threshold,
++            max_long_prefills=self.max_long_prefills,
+             disable_hybrid_kv_cache_manager=self.disable_hybrid_kv_cache_manager,
+             async_scheduling=self.async_scheduling,
+             stream_interval=self.stream_interval,
+diff --git a/vllm/v1/core/kv_cache_manager.py b/vllm/v1/core/kv_cache_manager.py
+index 4b115283c3..508ad0bf71 100644
+--- a/vllm/v1/core/kv_cache_manager.py
++++ b/vllm/v1/core/kv_cache_manager.py
+@@ -495,6 +495,7 @@ class KVCacheManager:
+         full_sequence_must_fit: bool = False,
+         reserved_blocks: int = 0,
+         has_scheduled_reqs: bool = True,
++        full_sequence_reserved_blocks: int = 0,
+     ) -> KVCacheBlocks | None:
+         """Add slots for a request with new tokens to append.
+ 
+@@ -527,6 +528,10 @@ class KVCacheManager:
+                 blocks an already in-flight (prefilling) sequence is relying on.
+             has_scheduled_reqs: Whether any requests are already scheduled to run
+                 this step, controls whether watermark is applied.
++            full_sequence_reserved_blocks: Free blocks the full-sequence check
++                must leave for other in-flight prefills. Size-classed prefill
++                lanes pass it for long admissions, so two long prompts cannot
++                both pass the check against the same free blocks.
+ 
+         Blocks layout:
+         ```
+@@ -661,7 +666,12 @@ class KVCacheManager:
+             required_blocks = (
+                 num_blocks_to_allocate + watermark_blocks + boundary_blocks
+             )
+-            if required_blocks > self.block_pool.get_num_free_blocks() - import_reserve:
++            if (
++                required_blocks
++                > self.block_pool.get_num_free_blocks()
++                - import_reserve
++                - full_sequence_reserved_blocks
++            ):
+                 return None
+ 
+         num_tokens_main_model = total_computed_tokens + num_new_tokens
+diff --git a/vllm/v1/core/sched/prefill_interleave.py b/vllm/v1/core/sched/prefill_interleave.py
+index df81bdc934..92f2b9719b 100644
+--- a/vllm/v1/core/sched/prefill_interleave.py
++++ b/vllm/v1/core/sched/prefill_interleave.py
+@@ -14,7 +14,24 @@ from vllm.v1.core.sched.request_queue import RequestQueue
+ from vllm.v1.request import Request, RequestStatus
+ 
+ LocalPrefillPredicate = Callable[[Request], bool]
++RemainingWorkEstimate = Callable[[Request], int]
+ AUTO_MAX_PARALLEL_PREFILLS = 4
++# Waiting states that cannot use a prefill lane this step (a remote KV load,
++# a grammar or a streaming input in progress). A request preempted mid-prefill
++# keeps is_prefill_chunk, so without this it could hold a lane while blocked.
++BLOCKED_LANE_STATUSES = (
++    RequestStatus.WAITING_FOR_STRUCTURED_OUTPUT_GRAMMAR,
++    RequestStatus.WAITING_FOR_REMOTE_KVS,
++    RequestStatus.WAITING_FOR_STREAMING_REQ,
++)
++# Staleness window for lane candidates. A never-scheduled request
++# alternates between the lane front and back after this many
++# consecutive candidate steps without being scheduled, for an equal
++# window; a candidate whose last scheduling is more than this many
++# steps behind the current step ranks stale, behind every recently
++# scheduled candidate, so neither cohort can hold lanes at a frozen
++# rank forever.
++LANE_AGING_STEPS = 32
+ 
+ 
+ def resolve_max_parallel_prefills(
+@@ -44,10 +61,18 @@ class PrefillInterleaveStep:
+     max_parallel_prefills: int
+     request_lookup: dict[str, Request]
+     is_local_prefill: LocalPrefillPredicate
++    # Size classes (QoS): None keeps plain rank-order lanes.
++    is_long: LocalPrefillPredicate | None = None
++    max_long_prefills: int = 0
++    # False while max_long_prefills long prefills are already in flight: a
++    # looked-up long request still waiting would only be parked again, so it
++    # gets no lane (and no repeated cache lookup) until a long slot frees.
++    long_admission_open: bool = True
+     rank: dict[str, int] = field(init=False)
+     selected_ids: set[str] = field(default_factory=set, init=False)
+     unavailable_ids: set[str] = field(default_factory=set, init=False)
+     _next_candidate: int = field(default=0, init=False)
++    _consumed_ids: set[str] = field(default_factory=set, init=False)
+ 
+     def __post_init__(self) -> None:
+         self.rank = {
+@@ -106,6 +131,9 @@ class PrefillInterleaveStep:
+         return queue, request
+ 
+     def _replenish(self) -> None:
++        if self.is_long is not None:
++            self._replenish_classed()
++            return
+         while len(
+             self.selected_ids
+         ) < self.max_parallel_prefills and self._next_candidate < len(
+@@ -120,12 +148,71 @@ class PrefillInterleaveStep:
+                 continue
+             self.selected_ids.add(request.request_id)
+ 
++    def _is_long_id(self, request_id: str) -> bool:
++        assert self.is_long is not None
++        request = self.request_lookup.get(request_id)
++        return request is not None and self.is_long(request)
++
++    def _replenish_classed(self) -> None:
++        """Fill lanes by size class, in rank order within each class.
++
++        1. Long prefills first, up to max_long_prefills: a progress floor for
++           long work, and a cap on how many lanes it holds.
++        2. Short prefills take the remaining lanes.
++        3. More long prefills only when no short candidate is left, so a lane
++           is never idle while work is runnable.
++        """
++        while len(self.selected_ids) < self.max_parallel_prefills:
++            long_selected = sum(
++                self._is_long_id(request_id) for request_id in self.selected_ids
++            )
++            first_long: str | None = None
++            first_short: str | None = None
++            for request in self.ordered_requests:
++                request_id = request.request_id
++                if (
++                    request_id in self._consumed_ids
++                    or request_id in self.unavailable_ids
++                ):
++                    continue
++                current_request = self.request_lookup.get(request_id)
++                if current_request is None or not self.is_local_prefill(
++                    current_request
++                ):
++                    continue
++                if self._is_long_id(request_id):
++                    if (
++                        not self.long_admission_open
++                        and current_request.status != RequestStatus.RUNNING
++                    ):
++                        continue
++                    if first_long is None:
++                        first_long = request_id
++                elif first_short is None:
++                    first_short = request_id
++                if first_long is not None and first_short is not None:
++                    break
++            if first_long is not None and long_selected < self.max_long_prefills:
++                pick = first_long
++            elif first_short is not None:
++                pick = first_short
++            else:
++                pick = first_long
++            if pick is None:
++                return
++            self.selected_ids.add(pick)
++            self._consumed_ids.add(pick)
++
+ 
+ class PrefillInterleaveController:
+     """Rotate local prefill service fairly across scheduler steps."""
+ 
+     def __init__(self) -> None:
+         self.last_scheduled_step: dict[str, int] = {}
++        # Steps spent as a lane candidate without being scheduled. Ages a
++        # never-scheduled request's rank so it cannot hold a lane at -1
++        # forever; reset by record_scheduled / forget.
++        self.attempts: dict[str, int] = {}
+ 
+     def begin_step(
+         self,
+@@ -141,6 +228,10 @@ class PrefillInterleaveController:
+         decode_refill_target: int,
+         current_step: int,
+         respect_priority: bool,
++        is_long: LocalPrefillPredicate | None = None,
++        max_long_prefills: int = 0,
++        remaining_estimate: RemainingWorkEstimate | None = None,
++        long_admission_open: bool = True,
+     ) -> PrefillInterleaveStep | None:
+         """Create fair step-local prefill lanes, or use legacy scheduling."""
+         if max_parallel_prefills <= 1:
+@@ -153,6 +244,8 @@ class PrefillInterleaveController:
+                 continue
+             if not is_local_prefill(request):
+                 continue
++            if request.status in BLOCKED_LANE_STATUSES:
++                continue
+             if (
+                 request.status == RequestStatus.RUNNING
+                 and current_step < request.next_decode_eligible_step
+@@ -164,7 +257,7 @@ class PrefillInterleaveController:
+         requests.sort(
+             key=lambda request: (
+                 request.priority if respect_priority else 0,
+-                self.last_scheduled_step.get(request.request_id, -1),
++                self._lane_rank(request.request_id, current_step),
+                 request.arrival_time,
+                 request.request_id,
+             )
+@@ -181,7 +274,9 @@ class PrefillInterleaveController:
+             nearest_decode = min(
+                 eligible,
+                 key=lambda request: (
+-                    max(
++                    remaining_estimate(request)
++                    if remaining_estimate is not None
++                    else max(
+                         request.num_tokens - 1 - request.num_computed_tokens,
+                         0,
+                     ),
+@@ -191,13 +286,32 @@ class PrefillInterleaveController:
+             )
+             requests.remove(nearest_decode)
+             requests.insert(0, nearest_decode)
++        for request in requests:
++            self.attempts[request.request_id] = (
++                self.attempts.get(request.request_id, 0) + 1
++            )
+         return PrefillInterleaveStep(
+             requests,
+             max_parallel_prefills,
+             request_lookup,
+             is_local_prefill,
++            is_long=is_long,
++            max_long_prefills=max_long_prefills,
++            long_admission_open=long_admission_open,
+         )
+ 
++    def _lane_rank(self, request_id: str, current_step: int) -> int:
++        """Lane-order rank; ages stale lane candidates (see LANE_AGING_STEPS)."""
++        scheduled = self.last_scheduled_step.get(request_id)
++        if scheduled is not None:
++            if current_step - scheduled > LANE_AGING_STEPS:
++                return current_step
++            return scheduled
++        attempts = self.attempts.get(request_id, 0)
++        if (attempts // LANE_AGING_STEPS) % 2 == 1:
++            return current_step
++        return -1
++
+     def record_scheduled(
+         self,
+         request_ids: Iterable[str],
+@@ -205,6 +319,8 @@ class PrefillInterleaveController:
+     ) -> None:
+         for request_id in request_ids:
+             self.last_scheduled_step[request_id] = current_step
++            self.attempts.pop(request_id, None)
+ 
+     def forget(self, request_id: str) -> None:
+         self.last_scheduled_step.pop(request_id, None)
++        self.attempts.pop(request_id, None)
+diff --git a/vllm/v1/core/sched/scheduler.py b/vllm/v1/core/sched/scheduler.py
+index b61ec528d2..ebc3eb28f3 100644
+--- a/vllm/v1/core/sched/scheduler.py
++++ b/vllm/v1/core/sched/scheduler.py
+@@ -530,6 +530,31 @@ class Scheduler(SchedulerInterface):
+         self._prefill_stall_accum_s: float = 0.0
+         self._last_prefill_step_at: float | None = None
+         self._last_prefill_step_est_s: float = 0.0
++        # Size-classed prefill lanes (QoS). Long prefills keep a floor of one
++        # lane and at most max_long_prefills lanes; short work always keeps at
++        # least one lane, so the cap is below the lane count.
++        self.prefill_long_threshold = self.scheduler_config.prefill_long_threshold
++        self.max_long_prefills = 0
++        if self.prefill_long_threshold > 0:
++            if self.max_parallel_prefills <= 1:
++                logger.warning(
++                    "prefill_long_threshold needs more than one prefill lane; "
++                    "max_parallel_prefills resolved to %d, so size classes are off.",
++                    self.max_parallel_prefills,
++                )
++                self.prefill_long_threshold = 0
++            else:
++                self.max_long_prefills = min(
++                    self.scheduler_config.max_long_prefills,
++                    self.max_parallel_prefills - 1,
++                )
++                logger.info(
++                    "Size-classed prefill lanes: long >= %d uncached tokens, "
++                    "%d of %d lanes for long work while short work waits.",
++                    self.prefill_long_threshold,
++                    self.max_long_prefills,
++                    self.max_parallel_prefills,
++                )
+ 
+         self.has_mamba_layers = kv_cache_config.has_mamba_layers
+         self.needs_kv_cache_zeroing = kv_cache_config.needs_kv_cache_zeroing
+@@ -874,6 +899,50 @@ class Scheduler(SchedulerInterface):
+             num_new_tokens -= self.num_prefill_lookahead - remaining
+         return max(num_new_tokens, 0)
+ 
++    def _qos_remaining_tokens(self, request: Request) -> int | None:
++        """Uncached local prefill work a request still needs.
++
++        A waiting request's estimate includes the cache hits its last lookup
++        found. None means a waiting request has not been looked up yet: it
++        ranks and classes as short, and its first lookup corrects that.
++        """
++        computed = request.num_computed_tokens
++        if (
++            request.status in (RequestStatus.WAITING, RequestStatus.PREEMPTED)
++            and not request.is_prefill_chunk
++        ):
++            hint = request.qos_cached_tokens_hint
++            if hint is None:
++                return None
++            computed = max(computed, hint)
++        return max(request.num_tokens - 1 - computed, 0)
++
++    def _qos_is_long(self, request: Request) -> bool:
++        remaining = self._qos_remaining_tokens(request)
++        return remaining is not None and remaining >= self.prefill_long_threshold
++
++    def _qos_rank_remaining(self, request: Request) -> int:
++        remaining = self._qos_remaining_tokens(request)
++        return 0 if remaining is None else remaining
++
++    def _qos_num_long_in_flight(self) -> int:
++        """Long prefills already admitted: running chunks with long remaining
++        work, and remote KV loads that will need long local work after."""
++        threshold = self.prefill_long_threshold
++        count = sum(
++            request.num_tokens - 1 - request.num_computed_tokens >= threshold
++            for request in self.running
++        )
++        for request in self.skipped_waiting:
++            if (
++                request.status == RequestStatus.WAITING_FOR_REMOTE_KVS
++                and request.qos_cached_tokens_hint is not None
++                and request.num_tokens - 1 - request.qos_cached_tokens_hint
++                >= threshold
++            ):
++                count += 1
++        return count
++
+     @staticmethod
+     def _request_has_local_prefill(request: Request) -> bool:
+         """Whether a request still needs model compute for its input."""
+@@ -1319,6 +1388,15 @@ class Scheduler(SchedulerInterface):
+                 decode_refill_target=self.decode_refill_target,
+                 current_step=self.current_step,
+                 respect_priority=self.policy == SchedulingPolicy.PRIORITY,
++                is_long=self._qos_is_long if self.prefill_long_threshold else None,
++                max_long_prefills=self.max_long_prefills,
++                remaining_estimate=(
++                    self._qos_rank_remaining if self.prefill_long_threshold else None
++                ),
++                long_admission_open=(
++                    not self.prefill_long_threshold
++                    or self._qos_num_long_in_flight() < self.max_long_prefills
++                ),
+             )
+             if self.max_parallel_prefills > 1 and has_possible_prefill
+             else None
+@@ -1558,13 +1636,33 @@ class Scheduler(SchedulerInterface):
+                         num_new_tokens,
+                         max(0, step_prefill_token_cap - prefill_tokens_scheduled),
+                     )
+-                if request.is_prefill_chunk and prefill_interleave_step is not None:
+-                    num_new_tokens = min(
+-                        num_new_tokens,
+-                        prefill_interleave_step.token_budget(
+-                            token_budget, scheduled_prefill_req_ids
+-                        ),
++                if (
++                    request.is_prefill_chunk
++                    and prefill_interleave_step is not None
++                    and aligned_chunk is None
++                ):
++                    # An aligned chunk is not split to a lane's share: capped, it
++                    # would only be skipped, and two lanes whose chunks both exceed
++                    # their shares would never run. It takes the step's budget when
++                    # that holds it.
++                    lane_share = prefill_interleave_step.token_budget(
++                        token_budget, scheduled_prefill_req_ids
+                     )
++                    # Invariant: a lane share must never fall below the
++                    # recurrent-state align quantum - the aligned split
++                    # floors a chunk ending before a block boundary to
++                    # zero tokens, consuming the lane before the
++                    # allocator is reached. When the step budget covers
++                    # a full quantum, drop the share cap so an
++                    # unrunnable lane-holder cannot tax a runnable
++                    # chunk.
++                    if (
++                        self.need_mamba_block_aligned_split
++                        and lane_share < self.cache_config.block_size
++                        and token_budget >= self.cache_config.block_size
++                    ):
++                        lane_share = num_new_tokens
++                    num_new_tokens = min(num_new_tokens, lane_share)
+                 num_new_tokens = min(
+                     num_new_tokens, token_budget, input_budget - draft_slots
+                 )
+@@ -1877,6 +1975,8 @@ class Scheduler(SchedulerInterface):
+                             request_id,
+                         )
+                     request_queue.remove_request(request)
++                    if prefill_interleave_step is not None:
++                        prefill_interleave_step.mark_unavailable(request_id)
+                     step_skipped_waiting.prepend_request(request)
+                     continue
+ 
+@@ -2109,6 +2209,26 @@ class Scheduler(SchedulerInterface):
+                     step_skipped_waiting.prepend_request(request)
+                     continue
+ 
++                qos_long_admission = False
++                if self.prefill_long_threshold > 0:
++                    request.qos_cached_tokens_hint = num_computed_tokens
++                    qos_long_admission = (
++                        prefill_interleave_step is not None
++                        and request.num_tokens - 1 - num_computed_tokens
++                        >= self.prefill_long_threshold
++                    )
++                    if (
++                        qos_long_admission
++                        and self._qos_num_long_in_flight() >= self.max_long_prefills
++                    ):
++                        # Skip over: this long prompt waits for the long work
++                        # in flight, without blocking the short work behind it.
++                        assert prefill_interleave_step is not None
++                        request_queue.remove_request(request)
++                        prefill_interleave_step.mark_unavailable(request_id)
++                        step_skipped_waiting.prepend_request(request)
++                        continue
++
+                 encoder_inputs_to_schedule = None
+                 external_load_encoder_input: list[int] = []
+                 new_encoder_compute_budget = encoder_compute_budget
+@@ -2116,11 +2236,13 @@ class Scheduler(SchedulerInterface):
+                 has_local_prefill = (
+                     not load_kv_async and num_computed_tokens < request.num_tokens - 1
+                 )
+-                interleaved_local_prefill = (
++                # Latch the lane selection before the release below can drop
++                # this request from selected_ids.
++                lane_selected = (
+                     prefill_interleave_step is not None
+                     and prefill_interleave_step.is_selected(request_id)
+-                    and has_local_prefill
+                 )
++                interleaved_local_prefill = lane_selected and has_local_prefill
+                 if prefill_interleave_step is not None and not has_local_prefill:
+                     prefill_interleave_step.release(request_id)
+                 if load_kv_async:
+@@ -2147,7 +2269,12 @@ class Scheduler(SchedulerInterface):
+                             # prefill compute to a cadence-aligned step.
+                             break
+                     request_token_budget = min(token_budget, input_budget - draft_slots)
+-                    if interleaved_local_prefill:
++                    if (
++                        interleaved_local_prefill
++                        and not self.scheduler_config.align_prefill_chunks
++                    ):
++                        # Aligned chunks are not split to a lane's share (see the
++                        # running pass).
+                         assert prefill_interleave_step is not None
+                         request_token_budget = min(
+                             request_token_budget,
+@@ -2326,6 +2453,13 @@ class Scheduler(SchedulerInterface):
+                     # only if it fits in (free - other in-flight reservations), to
+                     # avoid deadlock and predictable preemptions.
+                     reserved_blocks = self._inflight_prefill_reserved_blocks()
++                full_sequence_reserved_blocks = 0
++                if qos_long_admission and self.scheduler_reserve_full_isl:
++                    # Size classes admit more prefills at once; a long prompt
++                    # must fit beside what in-flight prefills still need.
++                    full_sequence_reserved_blocks = (
++                        reserved_blocks or self._inflight_prefill_reserved_blocks()
++                    )
+ 
+                 new_blocks = self.kv_cache_manager.allocate_slots(
+                     request,
+@@ -2339,6 +2473,7 @@ class Scheduler(SchedulerInterface):
+                     full_sequence_must_fit=self.scheduler_reserve_full_isl,
+                     reserved_blocks=reserved_blocks,
+                     has_scheduled_reqs=bool(self.running),
++                    full_sequence_reserved_blocks=full_sequence_reserved_blocks,
+                 )
+ 
+                 if new_blocks is None:
+@@ -2348,20 +2483,26 @@ class Scheduler(SchedulerInterface):
+                     # manager
+                     if request.has_encoder_inputs:
+                         self.encoder_cache_manager.free(request)
+-                    if not interleaved_local_prefill:
+-                        # FCFS stops here; imports that already own their
+-                        # capacity cannot take it from this request.
+-                        if ready_imports is None:
+-                            ready_imports = self._ready_imports_to_consider(
+-                                considered_ids, prefill_interleave_step
+-                            )
+-                        if not ready_imports:
+-                            break
++                    if lane_selected:
++                        # Invariant: a lane-holder that cannot allocate must
++                        # leave the waiting loop without holding a lane:
++                        # park it and release the lane so _replenish rotates
++                        # lanes toward the running chunks and the remaining
++                        # lane-holders get processed instead of stranded by
++                        # the FCFS stop.
++                        request_queue.remove_request(request)
++                        assert prefill_interleave_step is not None
++                        prefill_interleave_step.mark_unavailable(request_id)
++                        step_skipped_waiting.prepend_request(request)
+                         continue
+-                    request_queue.remove_request(request)
+-                    assert prefill_interleave_step is not None
+-                    prefill_interleave_step.mark_unavailable(request_id)
+-                    step_skipped_waiting.prepend_request(request)
++                    # FCFS stops here; imports that already own their
++                    # capacity cannot take it from this request.
++                    if ready_imports is None:
++                        ready_imports = self._ready_imports_to_consider(
++                            considered_ids, prefill_interleave_step
++                        )
++                    if not ready_imports:
++                        break
+                     continue
+ 
+                 # KVTransfer: the connector uses this info to determine
+@@ -2527,7 +2668,21 @@ class Scheduler(SchedulerInterface):
+             and not defer_prefills
+             and token_budget > 0
+         ):
+-            schedule_running_requests("prefill", allow_preemption=False)
++            # A request preempted after being scheduled keeps its lane
++            # rank, so a waiting pair can own the lanes at step start
++            # and leave this as the only pass a running chunk reaches.
++            # On a step that scheduled nothing, forbidding preemption
++            # here locks the engine into empty steps at free == 0.
++            # Preempting a request with an in-flight connector job
++            # would flush into an unbounded worker-side wait(), so
++            # allow it only while has_pending_push_work() is False:
++            # no connector transfer jobs and no tier-manager pending
++            # work. Lane aging is the recovery path meanwhile.
++            allow_preemption = not num_scheduled_tokens and (
++                self.connector is None
++                or not self.connector.has_pending_push_work()
++            )
++            schedule_running_requests("prefill", allow_preemption=allow_preemption)
+ 
+         # The coarse runnable check can race async-completion guards. If a
+         # selected decode turn produced no work, give an already-running
+@@ -2876,6 +3031,11 @@ class Scheduler(SchedulerInterface):
+             "decode_refill_target": self.scheduler_config.decode_refill_target,
+             "effective_decode_refill_target": self.decode_refill_target,
+             "runnable_decodes": num_runnable_decodes,
++            "prefill_long_threshold": self.prefill_long_threshold,
++            "effective_max_long_prefills": self.max_long_prefills,
++            "long_prefills_in_flight": (
++                self._qos_num_long_in_flight() if self.prefill_long_threshold else 0
++            ),
+         }
+ 
+     def set_prefill_fairness(self, config: dict[str, Any]) -> dict[str, Any]:
+diff --git a/vllm/v1/request.py b/vllm/v1/request.py
+index 7dd1ddd797..cfa03cf62e 100644
+--- a/vllm/v1/request.py
++++ b/vllm/v1/request.py
+@@ -213,6 +213,10 @@ class Request:
+ 
+         # True if this request is scheduled as a non-final prefill chunk.
+         self.is_prefill_chunk = False
++        # Size-classed prefill lanes: computed tokens (local prefix plus
++        # connector hits) that the last waiting-pass lookup found. None until
++        # the request has been looked up.
++        self.qos_cached_tokens_hint: int | None = None
+ 
+         # Block-aligned token position of a proven shared prefix worth pinning
+         # in the (sparse) prefix cache; 0 means none. Set at admission for
+-- 
+2.43.0
+

@@ -1,0 +1,526 @@
+From b8e65c4bdb17d085daeb55c1368389bc35239386 Mon Sep 17 00:00:00 2001
+From: Christopher Owen <3221756+christopherowen@users.noreply.github.com>
+Date: Sun, 8 Nov 2026 21:00:00 +0100
+Subject: [PATCH] perf(dsv41): skip empty moe_swiglu_cast slabs and restore
+ post-gate shared_experts hook
+
+Base: 1107 vLLM patch head 2756478b60b90700b9918b457aeb38657da637b5.
+
+Rationale:
+1. In vllm/models/deepseek_v4_1/tilelang/moe.py, moe_swiglu_cast launched rows_per_cta = 4 if warps >= 4 else 2 (only 2 rows/CTA on TP3 where intermediate = 768 and warps = 3, doubling active-tile slabs from 4 to 8), unconditionally preloaded all rows_per_cta Order and Weights entries before pdl.chain(), and after pdl.chain() stepped through every row r in 0..rows_per_cta-1 inside an unrolled loop even when orders[0] < 0 (an empty slab, which represents 75% of active-tile CTAs in decode since active experts average 1.0-2.1 rows out of 16) or orders[1] < 0 (a 1-row tile, which represents 68%-100% of slab == 0 CTAs in decode).
+   Use rows_per_cta = 2 if intermediate > 1152 else 4 so TP3 (intermediate = 768) also processes 4 rows/CTA; cascade Order and Weights preloads before pdl.chain() so empty slabs only read orders[0] and 1-row tiles only read orders[0..1] and weights[0]; exit empty slabs immediately after pdl.chain() via if expert >= 0 and orders[0] >= 0:; and guard rows 1..rows_per_cta-1 behind if rows_per_cta > 1 and orders[1] >= 0:.
+2. In vllm/model_executor/layers/fused_moe/runner/moe_runner.py, _forward_impl checked workspace_size == 0 and launched shared_experts.maybe_forward_async before _apply_quant_method even when fold_shared == True (where workspace_size == 0 is always true because shared experts accumulate directly into the routed combine buffer). That bypassed the decode router._post_gate_hook in _apply_quant_method and launched shared_experts on the side stream before router gate GEMM, causing SM contention with the router gate GEMM and cold-L2 FFN prefetch. Furthermore, when _post_gate_hook fired after partials_kernel, maybe_forward_async recorded _input_ready_event on current_stream() after partials_kernel, forcing the side stream to wait for partials_kernel before starting shared_experts.
+   Skip the pre-_apply_quant_method shared_experts launch when fold_shared is True, pre-record _input_ready_event before router.select_experts when deferring shared_experts to _post_gate_hook, and add input_ready_recorded=True to SharedExpertsRunner.maybe_forward_async so the side stream only waits on hidden_states readiness while still launching after router gate GEMM.
+
+Quality:
+Bit-identical (torch.equal, 0 uint16 diffs, max_abs_diff == 0.0) across all TP4 and TP3 shapes (M = 1..48), both standalone and end-to-end inside captured decode CUDA graphs.
+
+Tests:
+- pytest tests/models/test_deepseek_v4_1_l2_schedule.py tests/kernels/moe/test_deepseek_v41_tilelang_moe.py tests/kernels/test_deepseek_v41_tilelang_pdl.py (160 passed across 2 boots).
+
+Upstream status: local DeepSeek V4.1 TileLang MoE and dual-stream runner optimization for GB10.
+---
+ .../moe/test_deepseek_v41_tilelang_moe.py     |   8 +
+ .../models/test_deepseek_v4_1_l2_schedule.py  |  33 ++-
+ .../layers/fused_moe/runner/moe_runner.py     |  25 +-
+ .../layers/fused_moe/runner/shared_experts.py |  30 +-
+ vllm/models/deepseek_v4_1/tilelang/moe.py     | 270 ++++++++++++------
+ 5 files changed, 264 insertions(+), 102 deletions(-)
+
+diff --git a/tests/kernels/moe/test_deepseek_v41_tilelang_moe.py b/tests/kernels/moe/test_deepseek_v41_tilelang_moe.py
+index f4381b8def..7a0f4c4bce 100644
+--- a/tests/kernels/moe/test_deepseek_v41_tilelang_moe.py
++++ b/tests/kernels/moe/test_deepseek_v41_tilelang_moe.py
+@@ -926,6 +926,14 @@ def test_routed_moe_pdl_preloads_before_wait():
+     assert down_src.index("SFBase[") < wait_pos
+     assert down_src.index("Narrow[") < wait_pos
+ 
++    swiglu_src = moe_swiglu_cast(768, 16, LIMIT).get_kernel_source()
++    wait_pos = swiglu_src.index("cudaGridDependencySynchronize()")
++    assert swiglu_src.index("TileExpert[") < wait_pos
++    assert swiglu_src.index("Order[") < wait_pos
++    assert swiglu_src.index("Weights[") < wait_pos
++    assert "if ((0 <= expert) && (0 <= orders[0]))" in swiglu_src[wait_pos:]
++    assert wait_pos < swiglu_src.index("*(uint4*)(H + ")
++
+     comb_src = moe_combine_v41(
+         5120, 6, shared=True, weighted=True, out_dtype=T.bfloat16
+     ).get_kernel_source()
+diff --git a/tests/models/test_deepseek_v4_1_l2_schedule.py b/tests/models/test_deepseek_v4_1_l2_schedule.py
+index b11d3cf8f0..da615cb768 100644
+--- a/tests/models/test_deepseek_v4_1_l2_schedule.py
++++ b/tests/models/test_deepseek_v4_1_l2_schedule.py
+@@ -214,8 +214,14 @@ def test_decode_shared_experts_launch_after_router_gate():
+         def _determine_shared_experts_order(self, x):
+             return SharedExpertsOrder.MULTI_STREAM_OVERLAPPED
+ 
+-        def maybe_forward_async(self, x, workspace=None):
+-            events.append("shared_async")
++        def record_input_ready(self, x):
++            events.append("shared_input_ready")
++            return True
++
++        def maybe_forward_async(self, x, workspace=None, *, input_ready_recorded=False):
++            events.append(
++                "shared_async_prerecorded" if input_ready_recorded else "shared_async"
++            )
+             return True
+ 
+         def wait_output(self):
+@@ -224,6 +230,8 @@ def test_decode_shared_experts_launch_after_router_gate():
+         def wait(self):
+             events.append("shared_wait")
+ 
++    from contextlib import nullcontext
++
+     runner = SimpleNamespace(
+         _shared_experts=_Shared(),
+         _maybe_apply_shared_experts=lambda *a, **k: None,
+@@ -232,17 +240,32 @@ def test_decode_shared_experts_launch_after_router_gate():
+             topk_indices_dtype=torch.int64,
+         ),
+         routed_experts=SimpleNamespace(
++            _ensure_moe_quant_config_init=lambda: None,
+             quant_method=SimpleNamespace(is_monolithic=False),
+             forward_modular=lambda **kwargs: (events.append("routed"), "routed_out")[1],
+         ),
+         router=_Router(),
++        gate=None,
++        _sequence_parallel_context=nullcontext,
++        _maybe_dispatch=lambda h, r: (h, r),
++        _maybe_combine=lambda num_tokens, h: h,
++    )
++    runner._apply_quant_method = lambda **kw: MoERunner._apply_quant_method(
++        runner, **kw
+     )
+ 
+     x6 = torch.zeros(6, 16)
+-    MoERunner._apply_quant_method(runner, x6, x6, x6)
+-    assert events == ["gate", "shared_async", "topk", "routed", "shared_wait"]
++    MoERunner._forward_impl(runner, x6, x6, x6)
++    assert events == [
++        "shared_input_ready",
++        "gate",
++        "shared_async_prerecorded",
++        "topk",
++        "routed",
++        "shared_wait",
++    ]
+ 
+     events.clear()
+     x48 = torch.zeros(48, 16)
+-    MoERunner._apply_quant_method(runner, x48, x48, x48)
++    MoERunner._forward_impl(runner, x48, x48, x48)
+     assert events == ["shared_async", "gate", "topk", "routed", "shared_wait"]
+diff --git a/vllm/model_executor/layers/fused_moe/runner/moe_runner.py b/vllm/model_executor/layers/fused_moe/runner/moe_runner.py
+index 465e02b80d..923dbe51ba 100644
+--- a/vllm/model_executor/layers/fused_moe/runner/moe_runner.py
++++ b/vllm/model_executor/layers/fused_moe/runner/moe_runner.py
+@@ -780,23 +780,38 @@ class MoERunner(MoERunnerInterface):
+                 # prefetch.
+                 if not shared_experts_overlapping:
+                     shared_experts = self._shared_experts
++                    input_ready_recorded = False
+ 
+                     def _launch_shared() -> None:
+                         nonlocal launch_shared
+                         if launch_shared is None:
+                             return
+                         launch_shared = None
+-                        launched = shared_experts.maybe_forward_async(
+-                            shared_experts_input, shared_workspace
+-                        )
++                        if input_ready_recorded:
++                            launched = shared_experts.maybe_forward_async(
++                                shared_experts_input,
++                                shared_workspace,
++                                input_ready_recorded=True,
++                            )
++                        else:
++                            launched = shared_experts.maybe_forward_async(
++                                shared_experts_input, shared_workspace
++                            )
+                         assert launched
+ 
+                     launch_shared = _launch_shared
+                     if (
+                         not getattr(self.router, "routes_hidden_states", False)
+                         or hidden_states.shape[0] > 32
++                        or self.routed_experts.quant_method.is_monolithic
+                     ):
+                         launch_shared()
++                    else:
++                        record_ready = getattr(
++                            shared_experts, "record_input_ready", None
++                        )
++                        if record_ready is not None:
++                            input_ready_recorded = record_ready(shared_experts_input)
+                 experts.combine_addend = self._shared_experts.wait_output
+ 
+         if self.routed_experts.quant_method.is_monolithic:
+@@ -1196,7 +1211,9 @@ class MoERunner(MoERunnerInterface):
+         # If using multi-stream overlap for shared experts, we must launch it
+         # before routed expert dispatch.
+         shared_experts_overlapping = False
+-        if self._shared_experts is not None:
++        if self._shared_experts is not None and not getattr(
++            self._quant_method.modular_experts, "fold_shared", False
++        ):
+             assert shared_experts_input is not None
+             if self._shared_experts.workspace_size(shared_experts_input):
+                 # Dispatch determines routed scratch sizes. Reserve both branches
+diff --git a/vllm/model_executor/layers/fused_moe/runner/shared_experts.py b/vllm/model_executor/layers/fused_moe/runner/shared_experts.py
+index b7c9aa4013..fc8076b2d6 100644
+--- a/vllm/model_executor/layers/fused_moe/runner/shared_experts.py
++++ b/vllm/model_executor/layers/fused_moe/runner/shared_experts.py
+@@ -140,10 +140,35 @@ class SharedExperts(torch.nn.Module):
+         else:
+             return SharedExpertsOrder.NO_OVERLAP
+ 
++    def record_input_ready(
++        self,
++        shared_experts_input: torch.Tensor,
++    ) -> bool:
++        """Record ``_input_ready_event`` on the main stream before router gate launch.
++
++        When the aux-stream shared expert launch is deferred until after the router
++        gate GEMM (``_post_gate_hook``), recording the input-ready event before the
++        gate GEMM lets the aux stream start immediately without waiting on the gate
++        GEMM or inserting an event record between the gate GEMM and top-k routing.
++        """
++        if (
++            self._determine_shared_experts_order(shared_experts_input)
++            != SharedExpertsOrder.MULTI_STREAM_OVERLAPPED
++        ):
++            return False
++        assert self._stream is not None
++        idx = self._output_idx
++        assert self._output[idx] is None
++        shared_experts_input.record_stream(self._stream)
++        self._input_ready_event[idx].record(current_stream())
++        return True
++
+     def maybe_forward_async(
+         self,
+         shared_experts_input: torch.Tensor,
+         workspace: torch.Tensor | None = None,
++        *,
++        input_ready_recorded: bool = False,
+     ) -> bool:
+         """Enqueue shared experts on the aux stream without waiting for them.
+ 
+@@ -159,8 +184,9 @@ class SharedExperts(torch.nn.Module):
+         assert self._stream is not None
+         idx = self._output_idx
+         assert self._output[idx] is None
+-        shared_experts_input.record_stream(self._stream)
+-        self._input_ready_event[idx].record(current_stream())
++        if not input_ready_recorded:
++            shared_experts_input.record_stream(self._stream)
++            self._input_ready_event[idx].record(current_stream())
+         with torch.cuda.stream(self._stream), use_preallocated_workspace(workspace):
+             self._input_ready_event[idx].wait(self._stream)
+             self._output[idx] = self._layer(shared_experts_input)
+diff --git a/vllm/models/deepseek_v4_1/tilelang/moe.py b/vllm/models/deepseek_v4_1/tilelang/moe.py
+index b12b53a354..db8883596d 100644
+--- a/vllm/models/deepseek_v4_1/tilelang/moe.py
++++ b/vllm/models/deepseek_v4_1/tilelang/moe.py
+@@ -1201,9 +1201,10 @@ def moe_swiglu_cast(intermediate, block_M, limit, rows_per_cta=None):
+     assert SF_BLOCK % vec == 0, "a scale block spans whole thread vectors"
+     warps = intermediate // chunk  # one row's warps
+     if rows_per_cta is None:
+-        # Fewer warps a row (TP3's 768 columns: 3) want fewer rows a CTA in flight
+-        # (GB10 bench, experiments/2026-10-18-r6w-swiglu).
+-        rows_per_cta = 4 if warps >= 4 else 2
++        # Four rows per CTA cut decode slab launches from 8 to 4 per 16-row tile at
++        # both TP4 (576, 1152) and TP3 (768); above 1152 columns (vec=8, 6 warps),
++        # two rows per CTA keep register pressure bounded.
++        rows_per_cta = 2 if intermediate > 1152 else 4
+     assert block_M % rows_per_cta == 0
+     threads = warp * warps
+     reduce_rounds = (SF_BLOCK // vec).bit_length() - 1
+@@ -1213,6 +1214,99 @@ def moe_swiglu_cast(intermediate, block_M, limit, rows_per_cta=None):
+     tiles = T.dynamic("tiles")
+     rows = tiles * block_M
+ 
++    @T.macro
++    def compute_row(
++        r,
++        base,
++        col,
++        tid,
++        weights,
++        xl,
++        xr,
++        xl_f,
++        xr_f,
++        x,
++        stored,
++        amax,
++        cert_min_l,
++        Out,
++        OutSF,
++    ):
++        row = base + r
++        weight = T.alloc_var(T.float32, init=weights[r])
++        for j in T.vectorized(vec):
++            xl_f[j] = T.float32(xl[r, j])
++            xr_f[j] = T.float32(xr[r, j])
++        for j in T.unroll(vec):
++            val_l = T.alloc_var(T.float32, init=xl_f[j])
++            val_r = T.alloc_var(T.float32, init=xr_f[j])
++            if limit is not None:
++                val_l = T.Select(val_l > limit, limit, val_l)
++                val_r = T.Select(val_r > limit, limit, val_r)
++                val_r = T.Select(val_r < -limit, -limit, val_r)
++            val = T.alloc_var(
++                T.float32,
++                init=T.call_extern(
++                    T.float32,
++                    "__fdividef",
++                    val_l,
++                    1 + T.call_extern(T.float32, "__expf", -val_l),
++                )
++                * val_r,
++            )
++            val = val * weight
++            x[j] = val
++        # TileKernels' certificate: the fast product lands in the
++        # precise product's E4M3/scale cell, or the warp recomputes.
++        cert_min_metric = T.alloc_var(T.uint32, init=0xFFFFFFFF)
++        cert_max_metric = T.alloc_var(T.uint32, init=0)
++        for j in T.vectorized(2):
++            cert_min_l[j] = T.float32(0)
++        for j in T.unroll(vec):
++            cert_min_l[j % 2] = T.min(cert_min_l[j % 2], xl_f[j])
++        cert_min_l[0] = T.min(cert_min_l[0], cert_min_l[1])
++        for j in T.unroll(vec):
++            cert_t = T.reinterpret(x[j], T.uint32) & T.uint32(0x7FFFF)
++            cert_min_metric = T.min(cert_min_metric, cert_t)
++            cert_max_metric = T.max(cert_max_metric, cert_t)
++        if (
++            T.all_sync(
++                (cert_min_l[0] > -16.0)
++                and (cert_min_metric > cert_e)
++                and (cert_max_metric < 0x80000 - cert_e)
++            )
++            == 0
++        ):
++            for j in T.unroll(vec):
++                val_l = T.alloc_var(T.float32, init=xl_f[j])
++                val_r = T.alloc_var(T.float32, init=xr_f[j])
++                if limit is not None:
++                    val_l = T.Select(val_l > limit, limit, val_l)
++                    val_r = T.Select(val_r > limit, limit, val_r)
++                    val_r = T.Select(val_r < -limit, -limit, val_r)
++                val = T.alloc_var(
++                    T.float32,
++                    init=(val_l / (1 + T.exp(-val_l))) * val_r,
++                )
++                val = val * weight
++                x[j] = val
++        for j in T.vectorized(2):
++            amax[j] = 0
++        for j in T.unroll(vec):
++            amax[j % 2] = T.max(amax[j % 2], T.abs(x[j]))
++        amax[0] = T.max(amax[0], amax[1])
++        for j in T.unroll(reduce_rounds):
++            amax[0] = T.max(amax[0], T.shfl_xor(amax[0], 1 << j))
++        sf, sf_inv = get_sf_and_inv(amax[0], out_config)
++        if (tid % warp) % sf_lanes == 0:
++            OutSF[row, col // SF_BLOCK] = sf
++        for j in T.vectorized(vec):
++            x[j] *= sf_inv
++        for j in T.vectorized(vec):
++            stored[j] = T.cast(x[j], T.float8_e4m3fn)
++        for j in T.vectorized(vec):
++            Out[row, col + j] = stored[j]
++
+     @T.prim_func
+     def moe_swiglu_cast_kernel(
+         H: T.Tensor((rows, 2 * intermediate), in_dtype),
+@@ -1235,99 +1329,93 @@ def moe_swiglu_cast(intermediate, block_M, limit, rows_per_cta=None):
+             stored = T.alloc_local((vec,), T.float8_e4m3fn)
+             amax = T.alloc_local((2,), T.float32)
+             cert_min_l = T.alloc_local((2,), T.float32)
+-            weight = T.alloc_var(T.float32)
+             base = t * block_M + slab * rows_per_cta
+             expert = TileExpert[t]
++            # Routes within each tile are packed contiguously from row 0, so a negative
++            # order at row 0 (or row 1) implies all remaining rows in the slab are padding.
+             if expert >= 0:
+-                for r in T.unroll(rows_per_cta):
+-                    orders[r] = Order[base + r]
+-                for r in T.unroll(rows_per_cta):
+-                    if orders[r] >= 0:
+-                        weights[r] = Weights[base + r]
++                orders[0] = Order[base]
++                if orders[0] >= 0:
++                    weights[0] = Weights[base]
++                    if rows_per_cta > 1:
++                        orders[1] = Order[base + 1]
++                        if orders[1] >= 0:
++                            weights[1] = Weights[base + 1]
++                            for r in T.unroll(rows_per_cta - 2):
++                                orders[r + 2] = Order[base + r + 2]
++                                if orders[r + 2] >= 0:
++                                    weights[r + 2] = Weights[base + r + 2]
+             pdl.chain()
+-            if expert >= 0:
+-                for r in T.unroll(rows_per_cta):
+-                    if orders[r] >= 0:
+-                        for j in T.vectorized(vec):
+-                            xl[r, j] = H[base + r, col + j]
+-                        for j in T.vectorized(vec):
+-                            xr[r, j] = H[base + r, intermediate + col + j]
+-                for r in T.unroll(rows_per_cta):
+-                    row = base + r
+-                    if orders[r] >= 0:
+-                        weight = weights[r]
+-                        for j in T.vectorized(vec):
+-                            xl_f[j] = T.float32(xl[r, j])
+-                            xr_f[j] = T.float32(xr[r, j])
+-                        for j in T.unroll(vec):
+-                            val_l = T.alloc_var(T.float32, init=xl_f[j])
+-                            val_r = T.alloc_var(T.float32, init=xr_f[j])
+-                            if limit is not None:
+-                                val_l = T.Select(val_l > limit, limit, val_l)
+-                                val_r = T.Select(val_r > limit, limit, val_r)
+-                                val_r = T.Select(val_r < -limit, -limit, val_r)
+-                            val = T.alloc_var(
+-                                T.float32,
+-                                init=T.call_extern(
+-                                    T.float32,
+-                                    "__fdividef",
+-                                    val_l,
+-                                    1 + T.call_extern(T.float32, "__expf", -val_l),
+-                                )
+-                                * val_r,
+-                            )
+-                            val = val * weight
+-                            x[j] = val
+-                        # TileKernels' certificate: the fast product lands in the
+-                        # precise product's E4M3/scale cell, or the warp recomputes.
+-                        cert_min_metric = T.alloc_var(T.uint32, init=0xFFFFFFFF)
+-                        cert_max_metric = T.alloc_var(T.uint32, init=0)
+-                        for j in T.vectorized(2):
+-                            cert_min_l[j] = T.float32(0)
+-                        for j in T.unroll(vec):
+-                            cert_min_l[j % 2] = T.min(cert_min_l[j % 2], xl_f[j])
+-                        cert_min_l[0] = T.min(cert_min_l[0], cert_min_l[1])
+-                        for j in T.unroll(vec):
+-                            cert_t = T.reinterpret(x[j], T.uint32) & T.uint32(0x7FFFF)
+-                            cert_min_metric = T.min(cert_min_metric, cert_t)
+-                            cert_max_metric = T.max(cert_max_metric, cert_t)
+-                        if (
+-                            T.all_sync(
+-                                (cert_min_l[0] > -16.0)
+-                                and (cert_min_metric > cert_e)
+-                                and (cert_max_metric < 0x80000 - cert_e)
++            if expert >= 0 and orders[0] >= 0:
++                for j in T.vectorized(vec):
++                    xl[0, j] = H[base, col + j]
++                for j in T.vectorized(vec):
++                    xr[0, j] = H[base, intermediate + col + j]
++                if rows_per_cta > 1 and orders[1] >= 0:
++                    for j in T.vectorized(vec):
++                        xl[1, j] = H[base + 1, col + j]
++                    for j in T.vectorized(vec):
++                        xr[1, j] = H[base + 1, intermediate + col + j]
++                    for r in T.unroll(rows_per_cta - 2):
++                        if orders[r + 2] >= 0:
++                            for j in T.vectorized(vec):
++                                xl[r + 2, j] = H[base + r + 2, col + j]
++                            for j in T.vectorized(vec):
++                                xr[r + 2, j] = H[base + r + 2, intermediate + col + j]
++                compute_row(
++                    0,
++                    base,
++                    col,
++                    tid,
++                    weights,
++                    xl,
++                    xr,
++                    xl_f,
++                    xr_f,
++                    x,
++                    stored,
++                    amax,
++                    cert_min_l,
++                    Out,
++                    OutSF,
++                )
++                if rows_per_cta > 1 and orders[1] >= 0:
++                    compute_row(
++                        1,
++                        base,
++                        col,
++                        tid,
++                        weights,
++                        xl,
++                        xr,
++                        xl_f,
++                        xr_f,
++                        x,
++                        stored,
++                        amax,
++                        cert_min_l,
++                        Out,
++                        OutSF,
++                    )
++                    for r in T.unroll(rows_per_cta - 2):
++                        if orders[r + 2] >= 0:
++                            compute_row(
++                                r + 2,
++                                base,
++                                col,
++                                tid,
++                                weights,
++                                xl,
++                                xr,
++                                xl_f,
++                                xr_f,
++                                x,
++                                stored,
++                                amax,
++                                cert_min_l,
++                                Out,
++                                OutSF,
+                             )
+-                            == 0
+-                        ):
+-                            for j in T.unroll(vec):
+-                                val_l = T.alloc_var(T.float32, init=xl_f[j])
+-                                val_r = T.alloc_var(T.float32, init=xr_f[j])
+-                                if limit is not None:
+-                                    val_l = T.Select(val_l > limit, limit, val_l)
+-                                    val_r = T.Select(val_r > limit, limit, val_r)
+-                                    val_r = T.Select(val_r < -limit, -limit, val_r)
+-                                val = T.alloc_var(
+-                                    T.float32,
+-                                    init=(val_l / (1 + T.exp(-val_l))) * val_r,
+-                                )
+-                                val = val * weight
+-                                x[j] = val
+-                        for j in T.vectorized(2):
+-                            amax[j] = 0
+-                        for j in T.unroll(vec):
+-                            amax[j % 2] = T.max(amax[j % 2], T.abs(x[j]))
+-                        amax[0] = T.max(amax[0], amax[1])
+-                        for j in T.unroll(reduce_rounds):
+-                            amax[0] = T.max(amax[0], T.shfl_xor(amax[0], 1 << j))
+-                        sf, sf_inv = get_sf_and_inv(amax[0], out_config)
+-                        if (tid % warp) % sf_lanes == 0:
+-                            OutSF[row, col // SF_BLOCK] = sf
+-                        for j in T.vectorized(vec):
+-                            x[j] *= sf_inv
+-                        for j in T.vectorized(vec):
+-                            stored[j] = T.cast(x[j], T.float8_e4m3fn)
+-                        for j in T.vectorized(vec):
+-                            Out[row, col + j] = stored[j]
+ 
+     return moe_swiglu_cast_kernel
+ 
+-- 
+2.43.0
+

@@ -1,0 +1,490 @@
+From 970944cee9c2276e6533e1d10eb1ac47a3d7b07f Mon Sep 17 00:00:00 2001
+From: Christopher Owen <3221756+christopherowen@users.noreply.github.com>
+Date: Sun, 8 Nov 2026 15:17:51 +0000
+Subject: [PATCH] perf(spec_decode): price MMA tile knees, 64-row wave
+ saturation, and context bands in _step_cost
+
+Base: 1107 vLLM patch head 320021e3c4dbb202d911ab70e2cd924c75420488.
+
+Rationale:
+On NVIDIA GB10 (48 SMs, sm_121a), AdaptiveVerificationManager._step_cost() previously applied HIGH_ROW_COST_SCALE = 0.55 to all verification rows above HIGH_ROW_COST_KNEE = 16 with no upper bound and ignored request context length except when global KV pool occupancy exceeded 70%:
+1. Across 40-layer Dense FP8 projections, SparseMlaV41Plan, and 8-layer IndexerV41Plan on GB10, crossing R = 16 -> 17 rows jumps from the 1-tile decode_16 kernel into the 2-tile decode_32 kernel (+1,200.3 us / +79.6% dense GEMM latency).
+2. Above R = 64 rows on 48 SMs, dense projections cross DECODE_ROWS = 64 into prefill_128 (+2,692.2 us / +95.7% at R = 80), _index_chunk crosses DECODE_CHUNK = 64 into a second 64-row wave, and routed MoE expert union (64 * 6 = 384 slots across 256 experts) saturates. Leaving HIGH_ROW_COST_SCALE = 0.55 unbounded above 64 rows caused c16/c32 cohorts to drop the first-draft survival threshold to ~0.33 and spill into the 80..96-row second wave.
+3. At long context lengths (16K..128K tokens) where global KV page occupancy remains below 70%, per-row IndexerV41Plan + SparseMlaV41Plan cost rises from 0.4 us/row at 2K to 21.1 us/row at 16K (4-layer ratio=1 reindex saturation at L = 16,384) and 95.7..102.8 us/row at 128K (3-layer ratio=2 full-index scan), and does not coalesce in the 17..64-row regime.
+
+Calibrate _step_cost(), effective_dead_rows_tau(), and get_num_tokens() using deterministic, rank-invariant tensor metadata:
+- Add three-regime MMA-tile and wave-saturation pricing (HIGH_ROW_COST_KNEE = 16 at 0.55x, SATURATED_ROW_COST_KNEE = 64 returning to SATURATED_ROW_COST_SCALE = 1.0x, MMA_TILE_STEP_ROWS = 0.25 per 16-row boundary up to 64 rows, SINGLE_REQ_TILE_STEP_ROWS = 1.5 at the c=1 16 -> 17 row boundary, and SECOND_WAVE_STEP_ROWS = 2.0 above 64 rows).
+- Add two-slope context-length row-cost scaling _context_row_cost_scale() (CONTEXT_ROW_COST_KNEE = 8192, CONTEXT_REINDEX_SATURATION = 16384 with weight 0.12, CONTEXT_SOURCE_SPAN = 65536 with slope 0.22, capped at CONTEXT_MAX_ROW_COST_SCALE = 2.25), applied as uncoalesced per-row excess cost in _step_cost(), scaled into effective_dead_rows_tau(), and used to prioritize short-context draft slots during get_num_tokens() reallocation.
+
+Quality:
+Preserves exact target rejection-sampling verification semantics and rank-invariant token budgets across TP ranks while curbing low-yield draft admission across the 16-row single-request MMA boundary, the 64-row second-wave saturation knee, and 16K..128K long-context regimes.
+
+Tests:
+- pytest tests/v1/spec_decode/test_adaptive_verification.py across 2 fresh container boots (44 passed, 1 skipped).
+
+Upstream status: local GB10 SM121 adaptive verification cost model calibration.
+---
+ .../spec_decode/test_adaptive_verification.py | 115 +++++++++
+ .../gpu/spec_decode/adaptive_verification.py  | 244 ++++++++++++++++--
+ 2 files changed, 333 insertions(+), 26 deletions(-)
+
+diff --git a/tests/v1/spec_decode/test_adaptive_verification.py b/tests/v1/spec_decode/test_adaptive_verification.py
+index d9062785b..80c113d2d 100644
+--- a/tests/v1/spec_decode/test_adaptive_verification.py
++++ b/tests/v1/spec_decode/test_adaptive_verification.py
+@@ -947,3 +947,118 @@ def test_high_concurrency_row_cost_knee_admits_coalesced_drafts():
+     _, _, knee_budget = manager._batch_budget
+     assert knee_budget == 32
+     assert total == 40
++def test_saturated_row_cost_knee_curbs_second_wave_over_admission():
++    """Above 64 rows (DECODE_ROWS / DECODE_CHUNK), Tensor Core tiles and MoE
++    expert union saturate, returning marginal row cost to >= 1.0x and adding a
++    second-wave step jump so low-confidence tail drafts do not spill past 64."""
++    # 16 requests with 5 drafts: positions 0..2 have high survival (0.90, 0.81, 0.729)
++    # filling 16 + 48 = 64 rows; position 3 has survival 0.36 (profitable only if
++    # the 0.55x discount continued forever past 64 rows).
++    confidences = np.tile(
++        np.array([[0.90, 0.90, 0.90, 0.62, 0.50]], dtype=np.float32), (16, 1)
++    )
++    manager = make_manager(confidences, row_cost=0.035)
++    req_ids = [f"r{i}" for i in range(16)]
++    manager.req_states.req_id_to_index = {rid: i for i, rid in enumerate(req_ids)}
++    manager.dead_rows_tau = 0.15
++
++    num_tokens_per_req = {rid: 6 for rid in req_ids}
++    draft_tokens = {rid: [1, 2, 3, 4, 5] for rid in req_ids}
++
++    # Without the 64-row saturation knee, 0.55x slope admits position 3 into the
++    # 80-row second wave.
++    manager.saturated_row_cost_knee = 0
++    manager.second_wave_step_rows = 0.0
++    unbounded_total = manager.get_num_tokens(num_tokens_per_req, draft_tokens)
++    assert unbounded_total == 80
++
++    # With the 64-row saturation knee and second-wave step, total rows stay at 64.
++    manager.saturated_row_cost_knee = 64
++    manager.saturated_row_cost_scale = 1.0
++    manager.second_wave_step_rows = 2.0
++    capped_total = manager.get_num_tokens(num_tokens_per_req, draft_tokens)
++    _, _, capped_budget = manager._batch_budget
++    assert capped_budget == 48
++    assert capped_total == 64
++
++
++def test_single_request_16_row_mma_tile_boundary_prevents_spill():
++    """A single request (c1) with > 15 candidate drafts has no cross-request
++    expert coalescing above 16 rows and must pay the 16->17 MMA tile step."""
++    # 1 request with 19 copy-draft slots (20 rows max): first 15 drafts have 0.96
++    # conditional confidence, tail drafts 15..18 have survival ~0.042.
++    probs = np.array(
++        [[0.96] * 15 + [0.095, 0.98, 0.98, 0.98]], dtype=np.float32
++    )
++    manager = make_manager(probs, row_cost=0.035)
++    manager.req_states.req_id_to_index = {"r0": 0}
++    total = manager.get_num_tokens({"r0": 20}, {"r0": list(range(19))})
++    _, _, draft_budget = manager._batch_budget
++    # Stops at 15 drafts (16 total rows = 1 MMA tile) rather than spilling into
++    # the 2nd 16-row MMA tile for low-survival tail drafts.
++    assert draft_budget == 15
++    assert total == 16
++
++
++def test_context_length_band_scales_row_cost_and_dead_rows_tau():
++    """Deep active context (16K..128K) scales marginal per-row indexer cost and
++    tightens calibrated dead-row thresholds while keeping <= 8K unchanged."""
++    confidences = np.tile(
++        np.array([[0.78, 0.72, 0.71, 0.71, 0.73]], dtype=np.float32), (8, 1)
++    )
++    manager = make_manager(confidences, row_cost=0.035)
++    req_ids = [f"r{i}" for i in range(8)]
++    manager.req_states.req_id_to_index = {rid: i for i, rid in enumerate(req_ids)}
++    manager.dead_rows_tau = 0.20
++    manager.calibrated_confidence = True
++
++    scales = manager._context_row_cost_scale(
++        np.array([2048, 8192, 16384, 32768, 65536, 131072])
++    )
++    assert np.allclose(scales[:2], [1.0, 1.0])
++    assert np.all(np.diff(scales[1:]) > 0)
++
++    num_tokens_per_req = {rid: 6 for rid in req_ids}
++    draft_tokens = {rid: [1, 2, 3, 4, 5] for rid in req_ids}
++
++    # At 2K and 8K context, c8 admits 32 draft rows (total 40).
++    for ctx_len in (2048, 8192):
++        manager.req_states.num_computed_tokens_np = np.full(8, ctx_len, dtype=np.int32)
++        assert manager.get_num_tokens(num_tokens_per_req, draft_tokens) == 40
++        assert np.isclose(
++            manager.effective_dead_rows_tau(),
++            2.0 * 0.035 / (1.0 + 3.0 * 0.035),
++        )
++
++    # At 128K context, uncoalesced indexer cost per row trims position 3
++    # (survival 0.2831), reducing draft budget from 32 to 24 (total 32) and
++    # raising the calibrated dead-row threshold.
++    manager.req_states.num_computed_tokens_np = np.full(8, 131072, dtype=np.int32)
++    total_128k = manager.get_num_tokens(num_tokens_per_req, draft_tokens)
++    _, _, budget_128k = manager._batch_budget
++    assert budget_128k == 24
++    assert total_128k == 32
++    assert manager.effective_dead_rows_tau() > 2.0 * 0.035 / (1.0 + 3.0 * 0.035)
++
++
++def test_heterogeneous_context_batch_prioritizes_short_context_drafts():
++    """In a mixed-context cohort, short-context requests receive draft budget
++    ahead of deep-context requests with similar raw confidence."""
++    confidences = np.array(
++        [
++            [0.75, 0.72, 0.70, 0.68, 0.65],  # short (2K)
++            [0.76, 0.72, 0.70, 0.68, 0.65],  # long (128K)
++        ],
++        dtype=np.float32,
++    )
++    manager = make_manager(confidences, row_cost=0.055)
++    manager.req_states.req_id_to_index = {"short": 0, "long": 1}
++    manager.req_states.num_computed_tokens_np = np.array([2048, 131072], dtype=np.int32)
++
++    manager.get_num_tokens(
++        {"short": 6, "long": 6},
++        {"short": [1, 2, 3, 4, 5], "long": [1, 2, 3, 4, 5]},
++    )
++    num_drafts_per_req, _, draft_budget = manager._batch_budget
++    assert 0 < draft_budget < 10
++    assert num_drafts_per_req["short"] > num_drafts_per_req["long"]
+diff --git a/vllm/v1/worker/gpu/spec_decode/adaptive_verification.py b/vllm/v1/worker/gpu/spec_decode/adaptive_verification.py
+index 3f49b6cbc..e519ed3e3 100644
+--- a/vllm/v1/worker/gpu/spec_decode/adaptive_verification.py
++++ b/vllm/v1/worker/gpu/spec_decode/adaptive_verification.py
+@@ -50,11 +50,38 @@ if TYPE_CHECKING:
+ # verifies a draft per request anyway (see ``get_num_tokens``).
+ EXPLORE_AFTER_IDLE_STEPS = 32
+ 
+-# Two-slope verification row-cost knee: once a step crosses one 16-row Tensor
+-# Core MMA tile, additional verification rows share the already-launched expert
+-# and dense weight tiles at a reduced marginal cost.
++# Three-regime verification row-cost curve on SM120 / SM121:
++# 1) rows <= 16: single 16-row Tensor Core MMA tile (block_M=16) and early
++#    MoE PDL trigger (slope 1.0x).
++# 2) 17 <= rows <= 64: multi-request rows pack into decode_32 / decode_64 MMA
++#    tiles and share active MoE expert tiles at a 0.55x marginal slope, with
++#    discrete tile-step costs at the 16->17 and 32->33 MMA boundaries. A
++#    single request spilling past 16 rows has no cross-request expert
++#    coalescing and pays the full 1.0x slope plus the second-tile jump.
++# 3) rows > 64: dense projections exceed DECODE_ROWS=64 into prefill_128 /
++#    multi-tile waves, attention indexers split into a second 64-row
++#    DECODE_CHUNK, and MoE experts saturate, returning the marginal slope to
++#    1.0x plus a discrete wave-boundary step per 64-row chunk.
+ HIGH_ROW_COST_KNEE = 16
+ HIGH_ROW_COST_SCALE = 0.55
++SATURATED_ROW_COST_KNEE = 64
++SATURATED_ROW_COST_SCALE = 1.0
++MMA_TILE_STEP_ROWS = 0.25
++SINGLE_REQ_TILE_STEP_ROWS = 1.5
++SECOND_WAVE_STEP_ROWS = 2.0
++
++# Context-length marginal row-cost scaling: above 8,192 tokens, each
++# verification row scans more KV/index pages in the 8 V4.1 indexer layers
++# (4 reindex layers saturating at 16,384 candidate positions, and 4 source
++# layers scaling linearly across the active context). Because indexer and
++# sparse-MLA work is per-row rather than shared across a weight tile, its
++# excess cost above 1.0x is added uncoalesced per verification row.
++CONTEXT_ROW_COST_KNEE = 8192
++CONTEXT_REINDEX_SATURATION = 16384
++CONTEXT_REINDEX_WEIGHT = 0.12
++CONTEXT_SOURCE_SPAN = 65536
++CONTEXT_SOURCE_SLOPE = 0.22
++CONTEXT_MAX_ROW_COST_SCALE = 2.25
+ 
+ 
+ def resolve_adaptive_cudagraph_mode(
+@@ -115,6 +142,18 @@ class AdaptiveVerificationManager:
+         self.row_cost = row_cost
+         self.high_row_cost_knee = HIGH_ROW_COST_KNEE
+         self.high_row_cost_scale = HIGH_ROW_COST_SCALE
++        self.saturated_row_cost_knee = SATURATED_ROW_COST_KNEE
++        self.saturated_row_cost_scale = SATURATED_ROW_COST_SCALE
++        self.mma_tile_step_rows = MMA_TILE_STEP_ROWS
++        self.single_req_tile_step_rows = SINGLE_REQ_TILE_STEP_ROWS
++        self.second_wave_step_rows = SECOND_WAVE_STEP_ROWS
++        self.context_row_cost_knee = CONTEXT_ROW_COST_KNEE
++        self.context_reindex_saturation = CONTEXT_REINDEX_SATURATION
++        self.context_reindex_weight = CONTEXT_REINDEX_WEIGHT
++        self.context_source_span = CONTEXT_SOURCE_SPAN
++        self.context_source_slope = CONTEXT_SOURCE_SLOPE
++        self.context_max_row_cost_scale = CONTEXT_MAX_ROW_COST_SCALE
++        self._batch_context_scale = 1.0
+         self.tp_invariant_confidence = tp_invariant_confidence
+         self.calibrated_confidence = calibrated_confidence
+         self.dead_rows_tau = _DEAD_ROWS_TAU
+@@ -285,19 +324,112 @@ class AdaptiveVerificationManager:
+             write_slot.copy_to_cpu()
+             self._copy_events[write_idx].record()
+ 
+-    def _step_cost(self, rows: np.ndarray) -> np.ndarray:
+-        """Relative verification step cost with a 16-row Tensor Core MMA tile knee."""
++    def _context_row_cost_scale(
++        self, seq_lens: np.ndarray | int | float
++    ) -> np.ndarray:
++        """Per-row verification cost multiplier as a function of active context length."""
++        ctx_knee = getattr(self, "context_row_cost_knee", CONTEXT_ROW_COST_KNEE)
++        seq_arr = np.asarray(seq_lens, dtype=np.float64)
++        if ctx_knee <= 0:
++            return np.ones_like(seq_arr, dtype=np.float64)
++        excess = np.maximum(seq_arr - ctx_knee, 0.0)
++        reindex_span = max(
++            1.0,
++            float(
++                getattr(
++                    self,
++                    "context_reindex_saturation",
++                    CONTEXT_REINDEX_SATURATION,
++                )
++                - ctx_knee
++            ),
++        )
++        reindex_weight = float(
++            getattr(self, "context_reindex_weight", CONTEXT_REINDEX_WEIGHT)
++        )
++        source_span = max(
++            1.0, float(getattr(self, "context_source_span", CONTEXT_SOURCE_SPAN))
++        )
++        source_slope = float(
++            getattr(self, "context_source_slope", CONTEXT_SOURCE_SLOPE)
++        )
++        max_scale = float(
++            getattr(self, "context_max_row_cost_scale", CONTEXT_MAX_ROW_COST_SCALE)
++        )
++        scale = (
++            1.0
++            + reindex_weight * np.minimum(excess / reindex_span, 1.0)
++            + source_slope * (excess / source_span)
++        )
++        return np.minimum(scale, max_scale)
++
++    def _step_cost(
++        self,
++        rows: np.ndarray,
++        *,
++        context_excess_rows: np.ndarray | float = 0.0,
++        num_reqs: int | None = None,
++    ) -> np.ndarray:
++        """Relative verification step cost with MMA-tile boundaries, 64-row wave
++        saturation, and uncoalesced context-length indexer cost."""
++        rows_f = np.asarray(rows, dtype=np.float64)
+         knee = getattr(self, "high_row_cost_knee", HIGH_ROW_COST_KNEE)
+         scale = getattr(self, "high_row_cost_scale", HIGH_ROW_COST_SCALE)
+-        if knee > 0 and scale != 1.0:
+-            effective_rows = np.minimum(rows, knee) + scale * np.maximum(
+-                rows - knee, 0
++        sat_knee = getattr(
++            self, "saturated_row_cost_knee", SATURATED_ROW_COST_KNEE
++        )
++        sat_scale = getattr(
++            self, "saturated_row_cost_scale", SATURATED_ROW_COST_SCALE
++        )
++        tile_step = (
++            float(
++                getattr(
++                    self,
++                    "single_req_tile_step_rows",
++                    SINGLE_REQ_TILE_STEP_ROWS,
++                )
+             )
++            if num_reqs is not None and num_reqs <= 1
++            else 0.0
++        )
++        single_req = tile_step > 0.0
++        mid_scale = 1.0 if single_req else scale
++        if knee > 0:
++            band1 = np.minimum(rows_f, knee)
++            if sat_knee > knee:
++                band2 = np.clip(rows_f - knee, 0.0, sat_knee - knee)
++                band3 = np.maximum(rows_f - sat_knee, 0.0)
++                effective_rows = band1 + mid_scale * band2 + sat_scale * band3
++            else:
++                effective_rows = band1 + mid_scale * np.maximum(rows_f - knee, 0.0)
++            if single_req:
++                effective_rows = effective_rows + tile_step * (rows_f > knee)
++            else:
++                mma_step = getattr(
++                    self, "mma_tile_step_rows", MMA_TILE_STEP_ROWS
++                )
++                if mma_step > 0.0:
++                    effective_rows = effective_rows + mma_step * (
++                        (rows_f > knee).astype(np.float64)
++                        + 3.0 * (rows_f > 2 * knee).astype(np.float64)
++                    )
++            if sat_knee > 0:
++                wave_step = getattr(
++                    self, "second_wave_step_rows", SECOND_WAVE_STEP_ROWS
++                )
++                if wave_step > 0.0:
++                    extra_waves = np.maximum(
++                        np.ceil(np.maximum(rows_f, 1.0) / sat_knee) - 1.0, 0.0
++                    )
++                    effective_rows = effective_rows + wave_step * extra_waves
+         else:
+-            effective_rows = rows
++            effective_rows = rows_f
++        effective_rows = effective_rows + context_excess_rows
+         return 1.0 + self.row_cost * effective_rows
+ 
+-    def effective_dead_rows_tau(self) -> float:
++    def effective_dead_rows_tau(
++        self, context_scale: float | None = None
++    ) -> float:
+         """Survival threshold for dead-row pruning on host and device.
+ 
+         Raw ``confidence_head`` survival is inflated by ~3x at tail positions,
+@@ -305,7 +437,8 @@ class AdaptiveVerificationManager:
+         calibration fits the per-position intercepts, survival probabilities are
+         already on the true acceptance scale, so the threshold matches the
+         single-request marginal row-cost break-even ``2 * row_cost / (1 + 3 * row_cost)``
+-        instead of double-counting the tail decay.
++        (scaled by the active context-length row-cost multiplier) instead of
++        double-counting the tail decay.
+         """
+         tau = float(getattr(self, "dead_rows_tau", 0.0))
+         if tau <= 0.0:
+@@ -314,7 +447,13 @@ class AdaptiveVerificationManager:
+         if callable(calibrated):
+             calibrated = bool(calibrated())
+         if calibrated and self.row_cost > 0.0:
+-            return min(tau, 2.0 * self.row_cost / (1.0 + 3.0 * self.row_cost))
++            if context_scale is None:
++                context_scale = float(getattr(self, "_batch_context_scale", 1.0))
++            effective_row_cost = self.row_cost * max(1.0, context_scale)
++            return min(
++                tau,
++                2.0 * effective_row_cost / (1.0 + 3.0 * effective_row_cost),
++            )
+         return tau
+ 
+     def get_num_tokens(
+@@ -326,7 +465,7 @@ class AdaptiveVerificationManager:
+ 
+         The budget maximises expected tokens per unit of step cost: the step's
+         sampling requests plus the survival probabilities of the admitted draft
+-        slots (best first), over ``1 + row_cost * rows``, where ``rows`` counts
++        slots (best first), over ``_step_cost(rows)``, where ``rows`` counts
+         the step's non-draft rows and admitted draft rows; within the one-chunk
+         logits limit. Stashes it in ``_batch_budget`` for the compaction and
+         reallocation that follow in the same step.
+@@ -347,6 +486,17 @@ class AdaptiveVerificationManager:
+             dtype=np.int32,
+             count=len(req_ids),
+         )
++        seq_lens = (
++            self.req_states.num_computed_tokens_np[slots] + num_non_draft_tokens
++        )
++        sampling_mask = seq_lens >= self.req_states.prefill_len.np[slots]
++        num_sampling_requests = int(np.count_nonzero(sampling_mask))
++        req_context_scales = self._context_row_cost_scale(self.req_states.num_computed_tokens_np[slots])
++        self._batch_context_scale = (
++            float(np.min(req_context_scales[sampling_mask]))
++            if num_sampling_requests > 0
++            else 1.0
++        )
+         # The scheduler's drafts, not a rank's own view of the latest proposal:
+         # the budget reads only what every rank holds alike (these and the
+         # confidence snapshot), so every rank lays out the same step (#852).
+@@ -363,34 +513,59 @@ class AdaptiveVerificationManager:
+         survival_probability = np.cumprod(stale_confidences.astype(np.float64), axis=1)
+         steps = np.arange(step_steps)
+         valid = steps[None, :] < eligible_drafts[:, None]
+-        tau = self.effective_dead_rows_tau()
+-        if tau > 0:
++        if float(getattr(self, "dead_rows_tau", 0.0)) > 0.0:
+             # Never admit draft slots on the host that the device dead-row
+             # threshold will immediately mask as padding.
+-            valid &= survival_probability >= tau
+-        scores = np.sort(survival_probability[valid])[::-1]
++            req_taus = np.fromiter(
++                (
++                    self.effective_dead_rows_tau(float(scale))
++                    for scale in req_context_scales
++                ),
++                dtype=np.float64,
++                count=num_reqs,
++            )
++            valid &= survival_probability >= req_taus[:, None]
+         max_draft_budget = min(
+             int(eligible_drafts.sum()),
+             max(0, self._max_total_logits - num_reqs * self.num_bonus_tokens),
+         )
+-        scores = scores[:max_draft_budget]
+-        num_drafts_per_req = {
+-            req_id: int(num_drafts)
+-            for req_id, num_drafts in zip(req_ids, eligible_drafts, strict=True)
+-        }
++        valid_req_idx, _ = np.nonzero(valid)
++        valid_scores = survival_probability[valid]
++        valid_scales = req_context_scales[valid_req_idx]
++        heterogeneous_context = (
++            num_reqs > 1
++            and valid_scores.size > 0
++            and float(np.ptp(req_context_scales)) > 1e-6
++        )
++        if heterogeneous_context:
++            priorities = valid_scores - self.row_cost * np.maximum(
++                valid_scales - 1.0, 0.0
++            )
++            order = np.lexsort((-valid_scores, -priorities))[:max_draft_budget]
++        else:
++            order = np.argsort(valid_scores, kind="stable")[::-1][:max_draft_budget]
++        scores = valid_scores[order]
++        ordered_scales = valid_scales[order]
++        ordered_req_idx = valid_req_idx[order]
+         num_non_draft_tokens_per_req = {
+             req_id: int(num_tokens)
+             for req_id, num_tokens in zip(req_ids, num_non_draft_tokens, strict=True)
+         }
+-        num_sampling_requests = np.count_nonzero(
+-            self.req_states.num_computed_tokens_np[slots] + num_non_draft_tokens
+-            >= self.req_states.prefill_len.np[slots]
++        base_context_excess = float(
++            np.dot(num_non_draft_tokens, np.maximum(req_context_scales - 1.0, 0.0))
++        )
++        context_excess_rows = base_context_excess + np.concatenate(
++            ([0.0], np.cumsum(np.maximum(ordered_scales - 1.0, 0.0)))
+         )
+         expected_tokens = np.concatenate(
+             ([num_sampling_requests], num_sampling_requests + np.cumsum(scores))
+         )
+         rows = int(num_non_draft_tokens.sum()) + np.arange(len(scores) + 1)
+-        utilities = expected_tokens / self._step_cost(rows)
++        utilities = expected_tokens / self._step_cost(
++            rows,
++            context_excess_rows=context_excess_rows,
++            num_reqs=num_reqs,
++        )
+         draft_budget = int(np.argmax(utilities))
+         # The confidences come from an estimator that learns only from admitted
+         # drafts, so a long run of empty budgets would leave it without the
+@@ -405,6 +580,23 @@ class AdaptiveVerificationManager:
+         else:
+             idle = 0
+         self._steps_without_drafts = idle
++        if (
++            heterogeneous_context
++            and 0 < draft_budget < int(eligible_drafts.sum())
++            and getattr(self, "_confidence_buffer", torch.empty(1)).shape[0] <= 1
++        ):
++            admitted_per_req = np.bincount(
++                ordered_req_idx[:draft_budget], minlength=num_reqs
++            )
++            num_drafts_per_req = {
++                req_id: int(admitted)
++                for req_id, admitted in zip(req_ids, admitted_per_req, strict=True)
++            }
++        else:
++            num_drafts_per_req = {
++                req_id: int(num_drafts)
++                for req_id, num_drafts in zip(req_ids, eligible_drafts, strict=True)
++            }
+         logger.debug(
+             "DSpark adaptive verification selected %d/%d draft rows for %d "
+             "requests at row cost %.3g",
+-- 
+2.43.0
+
