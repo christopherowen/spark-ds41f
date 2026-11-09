@@ -1,0 +1,86 @@
+{
+ "experiment": "experiments/2026-10-26-spark-ds41f-candidate/candidate-50",
+ "run": "candidate-50-qualify-tp8-switched",
+ "jobs": [
+  {
+   "kind": "sync"
+  },
+  {
+   "kind": "fabric",
+   "config": "tp8-switched.json",
+   "script": "screen_zero_broadcast_sync_rowsfix_valid_seeded.py",
+   "label": "pr-980-screen-boot1",
+   "args": [
+    "--worker",
+    "--boot",
+    "boot1",
+    "--verify-steps",
+    "1000",
+    "--bench-iters",
+    "1000",
+    "--sampling-seed",
+    "1234"
+   ]
+  },
+  {
+   "kind": "fabric",
+   "config": "tp8-switched.json",
+   "script": "screen_zero_broadcast_sync_rowsfix_valid_seeded.py",
+   "label": "pr-980-screen-boot2",
+   "args": [
+    "--worker",
+    "--boot",
+    "boot2",
+    "--verify-steps",
+    "1000",
+    "--bench-iters",
+    "1000",
+    "--sampling-seed",
+    "1234"
+   ]
+  },
+  {
+   "kind": "measure",
+   "bench": false,
+   "bracket": false,
+   "extras": [
+    [
+     "check_955_quoted_dsml.py",
+     [],
+     "pr-955"
+    ],
+    [
+     "check_1013_completions_grammar.py",
+     [
+      "--container",
+      "spark-ds41f"
+     ],
+     "pr-1013"
+    ],
+    [
+     "check_980_lockstep.py",
+     [
+      "results/private/lab/{run}",
+      "--labels",
+      "pr-980-screen-boot1,pr-980-screen-boot2"
+     ],
+     "pr-980"
+    ],
+    [
+     "check_972_stream.py",
+     [
+      "--container",
+      "spark-ds41f"
+     ],
+     "pr-972"
+    ]
+   ],
+   "arms": [
+    {
+     "config": "tp8-switched.json",
+     "label": "candidate-50"
+    }
+   ]
+  }
+ ]
+}

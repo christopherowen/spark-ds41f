@@ -181,13 +181,39 @@ again. Each testbed opens its window with `scripts/lab.py`, after the hold and i
    ([1107/receipts](../1107/receipts/README.md)).
 6. **AgentX**: the lab's `agentx` job, 1 hour, `c8`, seed 42, on every shape 1107 reported:
    `tp4-ring`, `tp4-switched`, `tp3-switched` and `tp8-switched`.
-7. **Live functional checks** of the carried fixes, as candidate-48 declared them:
-   - #955: a live tool call quoting DSML returns complete arguments.
-   - #1013: a live `/v1/completions` request with a JSON grammar under the `deepseek_v41` reasoning
-     parser returns valid output.
-   - #972: a live client disconnect aborts the engine request, keep-alive frames arrive every 15 s,
-     and servebench's streams parse.
-   - #980: the 1,000-step TP lockstep screen shows 0 rank mismatches, and the sampled suite completes.
+7. **Live functional checks** of the carried fixes, as candidate-48 declared them. One spec per
+   shape runs them on a candidate-50 boot:
+   - [qualify-tp4.json](qualify-tp4.json) at `tp4-ring`;
+   - [qualify-tp4-switched.json](qualify-tp4-switched.json), [qualify-tp3-switched.json](qualify-tp3-switched.json)
+     and [qualify-tp8-switched.json](qualify-tp8-switched.json) on spaceport;
+   - [qualify-tp3.json](qualify-tp3.json) at `tp3-triangle`, once the dgx fabric is re-cabled.
+
+   Each spec syncs, then runs #980's screen twice as `fabric` jobs with serving stopped. It then
+   boots `<shape>.json` and runs the checks as `measure` extras. Each check prints a summary line
+   with `passed` and exits non-zero on a failure, so the lab keeps the engine logs beside it. The
+   outputs are `results/private/determinism/candidate-50-qualify-<shape>/pr-<N>-candidate-50.jsonl`.
+   - #955 ([check_955_quoted_dsml.py](check_955_quoted_dsml.py)): #955's own capture cases, whole and
+     streamed. A `write` call whose content quotes DSML closers keeps every quoted line, and DSML
+     quoted in a reply stays text, with no tool call. 1107 cut these arguments short.
+   - #1013 ([check_1013_completions_grammar.py](check_1013_completions_grammar.py)): a
+     `/v1/completions` request with a JSON-schema grammar, on a server whose container runs
+     `--reasoning-parser deepseek_v41`. Whole and streamed, it must finish with `stop`, open with
+     the object and be schema-valid. The same request without a grammar shows 1107's behaviour
+     without booting 1107: 1107 applied no grammar row to a completions request, so at temperature
+     0 it returned that prose for the grammar request too.
+   - #972 ([check_972_stream.py](check_972_stream.py)):
+     - a chat stream that cannot finish early is closed after 32 chunks, and the server's generated
+       token count must stop within 30 s;
+     - a 500,000-word prompt keeps the stream silent for its prefill. Keep-alive comments must
+       arrive every 15 s, at least two of them before the first output;
+     - servebench's own collector reads that stream without taking a comment for output.
+   - #980 ([screen_zero_broadcast_sync_rowsfix_valid_seeded.py](screen_zero_broadcast_sync_rowsfix_valid_seeded.py)):
+     candidate-48's round 1 harness, byte for byte as it ran on sp2. On sp2 it ran every rank on
+     one GPU. Here a `fabric` job runs one rank per node, rank = the node's rank, in the arm's
+     image and environment, with the configured seed 1234.
+     [check_980_lockstep.py](check_980_lockstep.py) reads both runs. Each candidate mode needs 0
+     mismatching steps out of 1,000, no broadcast and equal seeds on every rank, and the control
+     must still mismatch. That the sampled suite completes is shown by the release set.
    - #1011: its tests pass in the release tests.
 8. **Startup**: each rank's lowest `MemAvailable` (the startup memory floor) and the time to ready,
    from the release arms' startup memory, with no JIT after readiness.
