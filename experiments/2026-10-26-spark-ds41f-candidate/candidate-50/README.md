@@ -4,7 +4,8 @@ Unpromoted release candidate for release qualification
 ([release-benchmark](../../../docs/release-benchmark.md#9-release-qualification-final-benchmarking), step 9):
 spark-ds41f-1107 plus every PR that passed PR validation in candidates 47-49, each reworked PR as its
 corrected patch. 18 PRs, 19 patches. It is qualified on `tp4-ring` (dgx1..dgx4), `tp4-switched`
-(sp1..sp4), `tp3-switched` (sp5..sp7) and `tp3-triangle` (dgx1..dgx3).
+(sp1..sp4), `tp3-switched` (sp5..sp7), `tp8-switched` (sp1..sp8) and `tp3-triangle` (dgx1..dgx3),
+the shapes 1107 recorded.
 
 ## Source
 
@@ -36,10 +37,10 @@ corrected patch. 18 PRs, 19 patches. It is qualified on `tp4-ring` (dgx1..dgx4),
 | `0774-perf-dsv41-fast-path-multi-turn-chat-rendering-and-s.patch` | #973 | perf(dsv41): fast-path multi-turn chat rendering and segment tokenization | candidate-48, PR head `fed91173461f` | [pass](../candidate-48/receipts/own-marks/pr-973/result.json) |
 | `0775-perf-dsv41-widen-long-context-indexer-top-k-segments.patch` | #999 | perf(dsv41): widen long-context indexer top-k segments and reuse source blocks | [#999 round 1](../candidate-49/receipts/rework/pr-999-r1) (candidate-49) | [corrected-meets-mark](../candidate-49/receipts/rework/pr-999-r1/result.json) |
 | `0776-perf-dsv41-vectorize-indexer-KPool-loads-and-co-sche.patch` (rebased, context only) | #993 | perf(dsv41): vectorize indexer_score_v41 KPool loads and co-schedule dense CTA columns | candidate-49, PR head `a3067d857fda` | [pass](../candidate-49/receipts/own-marks/pr-993/result.json) |
-| `0777-perf-dsv41-hw-e2m1x2-indexer-and-gemm-mxfp4-quantize.patch` | #991 | perf(dsv41): use hardware cvt.rn.satfinite.e2m1x2.f32 in indexer and GEMM MXFP4 quantizers | [#991 round 1](../candidate-49/receipts/rework/pr-991-r1) (candidate-49) | [corrected-misses-mark](../candidate-49/receipts/rework/pr-991-r1/result.json) |
+| `0777-perf-dsv41-hw-e2m1x2-indexer-and-gemm-mxfp4-quantize.patch` | #991 | perf(dsv41): use hardware cvt.rn.satfinite.e2m1x2.f32 in indexer and GEMM MXFP4 quantizers | [#991 round 1](../candidate-49/receipts/rework/pr-991-r1) (candidate-49) | [meets its mark, coordinator](../candidate-49/receipts/rework/pr-991-r1/analysis.md) (sub-agent: [corrected-misses-mark](../candidate-49/receipts/rework/pr-991-r1/result.json)) |
 | `0778-perf-dsv41-sp-prefill-local-attention-front.patch` (rebased, context only) | #1009 | perf(dsv41): fuse SP prefill local attention front and keep index_weights local | candidate-49, PR head `78e6f933d270` | [pass](../candidate-49/receipts/own-marks/pr-1009/result.json) |
 | `0779-perf-dsv41-pipeline-the-sliced-SP-Engram-row-exchang.patch` | #979 | perf(dsv41): route SP prefill gather_many and row exchange through sparknet | [#979 round 1](../candidate-49/receipts/rework/pr-979-r1) (candidate-49) | [corrected-meets-mark](../candidate-49/receipts/rework/pr-979-r1/result.json) |
-| `0780-perf-dsv41-cache-SP-local-routing-masks-and-skip-SP-.patch` | #996 | perf(sp-prefill): cache SP local routing masks and skip SP tail pad rows | [#996 round 2](../candidate-49/receipts/rework/pr-996-r2) (candidate-49) | [corrected-misses-mark](../candidate-49/receipts/rework/pr-996-r2/result.json) |
+| `0780-perf-dsv41-cache-SP-local-routing-masks-and-skip-SP-.patch` | #996 | perf(sp-prefill): cache SP local routing masks and skip SP tail pad rows | [#996 round 2](../candidate-49/receipts/rework/pr-996-r2) (candidate-49) | [meets its mark, coordinator](../candidate-49/receipts/rework/pr-996-r2/analysis.md) (sub-agent: [corrected-misses-mark](../candidate-49/receipts/rework/pr-996-r2/result.json)) |
 
 **Carried in part.** #1013 is carried as its grammar fix (`0770`) alone, and #1011 as candidate-48's
 `0768` and `0769` alone (`0772` and `0773` here). Two patches were left out at selection, so the
@@ -59,7 +60,8 @@ The lanes patch's test files (`tests/v1/core/test_prefill_lane_livelock.py`,
 ([round 1](../candidate-47/receipts/rework/pr-1005-r1/result.json)) and #1010
 ([round 2](../candidate-48/receipts/rework/pr-1010-r2/result.json)).
 
-**Two carried reworks record a literal miss**, and the release qualification measures them in place:
+**Two carried reworks record a sub-agent miss that the coordinator's verdict overrules** (each folder's
+`analysis.md`), and the release qualification measures them in place:
 - #991 round 1: GEMM M=6 and M=8 read slower in the eager-launch bench. By kernel time (CUPTI) and
   CUDA-graph replay, the path decode serving takes, every cell is faster beyond its interval
   ([step 7](../../../docs/release-benchmark.md#7-own-marks): judge on the path serving takes).
@@ -93,7 +95,7 @@ these combinations; the release qualification is their first measurement.
 
 ## Cluster configurations
 
-A cluster configuration for every shape the recipe serves, so the candidate can be run on any setup: `bin/spark --cluster-config experiments/2026-10-26-spark-ds41f-candidate/candidate-50/<file> …` with your site's node map. Each one extends `releases/spark-ds41f-1107/cluster.json` at its shape and sets only the image `spark-ds41f:candidate-50`, its tree labels and this lock; no PR changes the recipe. The `-dev` file adds the dev-mode collective RPC that the release suite's engine grid needs. This candidate is qualified at the four shapes marked; the other files are configurations, not part of its runs.
+A cluster configuration for every shape the recipe serves, so the candidate can be run on any setup: `bin/spark --cluster-config experiments/2026-10-26-spark-ds41f-candidate/candidate-50/<file> …` with your site's node map. Each one extends `releases/spark-ds41f-1107/cluster.json` at its shape and sets only the image `spark-ds41f:candidate-50`, its tree labels and this lock; no PR changes the recipe. The `-dev` file adds the dev-mode collective RPC that the release suite's engine grid needs. This candidate is qualified at the five shapes marked; the other files are configurations, not part of its runs.
 
 | Shape | Configuration | With dev RPC | |
 | --- | --- | --- | --- |
@@ -105,7 +107,7 @@ A cluster configuration for every shape the recipe serves, so the candidate can 
 | `tp5-switched` | [tp5-switched.json](tp5-switched.json) | [tp5-switched-dev.json](tp5-switched-dev.json) |  |
 | `tp6-switched` | [tp6-switched.json](tp6-switched.json) | [tp6-switched-dev.json](tp6-switched-dev.json) |  |
 | `tp7-switched` | [tp7-switched.json](tp7-switched.json) | [tp7-switched-dev.json](tp7-switched-dev.json) |  |
-| `tp8-switched` | [tp8-switched.json](tp8-switched.json) | [tp8-switched-dev.json](tp8-switched-dev.json) |  |
+| `tp8-switched` | [tp8-switched.json](tp8-switched.json) | [tp8-switched-dev.json](tp8-switched-dev.json) | qualified here |
 
 - [image-dgx4.json](image-dgx4.json): build-only profile.
 
@@ -153,6 +155,8 @@ again. Each testbed opens its window with `scripts/lab.py`, after the hold and i
    - [candidate-tp4-switched.json](candidate-tp4-switched.json) at `tp4-switched`;
    - [candidate-tp3-switched.json](candidate-tp3-switched.json) at `tp3-switched`;
    - [candidate-tp3.json](candidate-tp3.json) at `tp3-triangle`, once the dgx fabric is re-cabled.
+   - `tp8-switched` boots after the `tp4-switched` and `tp3-switched` runs, on sp1..sp8; its release
+     arms boot first, so a startup failure shows there.
 3. **Cold boots** ([testing](../../../docs/testing.md)): one rank's, every rank's and every JIT cache
    empty, with nothing compiled after preparation.
 4. **Release set**: the `release-<shape>.json` specs run `candidate-50` and `candidate-50-again`, each
@@ -165,6 +169,7 @@ again. Each testbed opens its window with `scripts/lab.py`, after the hold and i
    | `tp3-triangle` | [release-tp3.json](release-tp3.json) | `release-tp3`, `single-stream`, `sampled` | `"release"`: `manifests/suites/2026-11-07-spark-ds41f-1107-tp3` |
    | `tp4-switched` | [release-tp4-switched.json](release-tp4-switched.json) | `release`, `single-stream`, `sampled` | `manifests/suites/2026-11-07-spark-ds41f-1107-tp4-switched` |
    | `tp3-switched` | [release-tp3-switched.json](release-tp3-switched.json) | `release-tp3`, `single-stream`, `sampled` | `manifests/suites/2026-11-07-spark-ds41f-1107-tp3-switched` |
+   | `tp8-switched` | [release-tp8-switched.json](release-tp8-switched.json) | `release`, `single-stream`, `sampled` | `manifests/suites/2026-11-07-spark-ds41f-1107-tp8-switched` |
 
    Each companion's reference is the same path with `-single-stream` or `-sampled` appended.
    - The switched specs name their reference path. At those shapes, the recipe's
