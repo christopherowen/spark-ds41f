@@ -1,0 +1,1526 @@
+{
+ "pr": 969,
+ "pr_head": "aad967cbe89737777db07876ad89eea66383eca3",
+ "patch": "0783-perf-dsv41-direct-insert-packed-engram-cache-and-ali.patch (sha256 a802a3047922, equal to the PR head's 0762)",
+ "kind": "perf",
+ "mark": "Its Engram row-cache bench (run_cache_and_packed_benchmark) on the image, 2 boots, ABBA against the base image in the same session: cold-miss and Zipfian lookups faster beyond the interval; the engram-row tests pass; rows identical.",
+ "host": "sp8 (spark-0016, NVIDIA GB10, driver 580.178.04, kernel 7.0.0-1024-nvidia)",
+ "images": {
+  "base": "spark-ds41f:candidate-50 sha256:8c1ea1f62f62c3e2adc03b645c091a5499cf7163101aca32875c894b96f155db + candidate-50/no1009/overlay (4 files, ro); Engram reader = the image's prebuilt for candidate-50's sources (digest 9cd64e5b59d4, extension aa59fde670e4d070)",
+  "c52": "the same image + candidate-52's 13 differing files (ro); Engram reader built at first use from the mounted _reader.c/_row_plan.h (digest 304875ed85c2, extension b5df645b4d9aec3c)"
+ },
+ "overlay_representable": "yes: the C sources are compiled at runtime by _native.py, keyed by their digest; the same runtime build of candidate-50's sources is byte-identical to the image's prebuilt (aa59fde670e4d070), so c52's runtime build is what a built candidate-52 image would ship",
+ "bench_identity": "bench_and_verify.run_cache_and_packed_benchmark was not committed by the PR; we used main's module of that name (experiments/2026-11-06-engram-step-and-cache/bench_and_verify.py, 0750's) with one signature change for bench_dir/boot_label (bench_and_verify.diff). Its rows and modes equal the PR receipts', and rep 1 of c52 boot1 reproduces all 228 hit/miss/hit-rate/read-call counters of the PR's receipts/bench-cache-boot1.json exactly.",
+ "session": "sp8, 2026-11-09T18:07:14Z..18:10:17Z, one hold of /tmp/spark-lab-gpu.lock: bench ABBA (base, c52, c52, base; 20 calls a boot), rows969 ABBA, tests on c52 twice",
+ "evidence": [
+  "the PR's bench call, 20 times per boot, 4 boots ABBA (raw/bench-cache-*.json); a cell's boot value is the median of its 20 step_us; rep 1 alone is the PR's single call",
+  "our rows969.py, 4 boots ABBA (raw/rows-*.json): every step's gathered rows hashed for all four modes over the bench's hot, Zipfian and cold workloads plus a duplicate-miss workload",
+  "the PR's pytest, 2 boots on c52"
+ ],
+ "bit_exact": true,
+ "bit_exact_detail": "rows969: one digest (6a0243f804de9b4f) on all four boots of both arms, and all four modes agree within every workload (hot M1-128, Zipfian M4-128 over 80 steps, cold M4-32 over 20 steps, 32 tokens x 24 repeated rows miss-then-hit); the bench's own in-run mode-equality asserts held on every call.",
+ "measured": {
+  "cold_and_zipfian_cache64k": {
+   "cold/M4/two_plane_cache64k": {
+    "base_boot_medians": [
+     31.59,
+     32.19
+    ],
+    "c52_boot_medians": [
+     30.34,
+     31.63
+    ],
+    "c52_over_base_mean": 0.9716,
+    "verdict_20rep_medians": "within",
+    "rep1_only": {
+     "base-boot1": 31.6,
+     "c52-boot1": 31.04,
+     "c52-boot2": 35.13,
+     "base-boot2": 32.74
+    },
+    "verdict_rep1_only": "within",
+    "hit_rate": null,
+    "read_calls_per_step": [
+     16.0
+    ]
+   },
+   "cold/M4/packed_cache64k": {
+    "base_boot_medians": [
+     22.54,
+     23.04
+    ],
+    "c52_boot_medians": [
+     21.24,
+     22.64
+    ],
+    "c52_over_base_mean": 0.9627,
+    "verdict_20rep_medians": "within",
+    "rep1_only": {
+     "base-boot1": 22.54,
+     "c52-boot1": 21.77,
+     "c52-boot2": 24.33,
+     "base-boot2": 22.51
+    },
+    "verdict_rep1_only": "within",
+    "hit_rate": null,
+    "read_calls_per_step": [
+     8.0
+    ]
+   },
+   "cold/M16/two_plane_cache64k": {
+    "base_boot_medians": [
+     61.07,
+     64.06
+    ],
+    "c52_boot_medians": [
+     55.88,
+     57.83
+    ],
+    "c52_over_base_mean": 0.9087,
+    "verdict_20rep_medians": "faster",
+    "rep1_only": {
+     "base-boot1": 53.63,
+     "c52-boot1": 56.45,
+     "c52-boot2": 54.55,
+     "base-boot2": 54.82
+    },
+    "verdict_rep1_only": "within",
+    "hit_rate": null,
+    "read_calls_per_step": [
+     16.0
+    ]
+   },
+   "cold/M16/packed_cache64k": {
+    "base_boot_medians": [
+     42.18,
+     41.08
+    ],
+    "c52_boot_medians": [
+     37.72,
+     40.02
+    ],
+    "c52_over_base_mean": 0.9337,
+    "verdict_20rep_medians": "faster",
+    "rep1_only": {
+     "base-boot1": 45.09,
+     "c52-boot1": 44.04,
+     "c52-boot2": 46.44,
+     "base-boot2": 46.54
+    },
+    "verdict_rep1_only": "within",
+    "hit_rate": null,
+    "read_calls_per_step": [
+     8.0
+    ]
+   },
+   "cold/M32/two_plane_cache64k": {
+    "base_boot_medians": [
+     90.45,
+     90.44
+    ],
+    "c52_boot_medians": [
+     80.43,
+     81.73
+    ],
+    "c52_over_base_mean": 0.8965,
+    "verdict_20rep_medians": "faster",
+    "rep1_only": {
+     "base-boot1": 89.16,
+     "c52-boot1": 81.0,
+     "c52-boot2": 83.95,
+     "base-boot2": 91.51
+    },
+    "verdict_rep1_only": "faster",
+    "hit_rate": null,
+    "read_calls_per_step": [
+     16.0
+    ]
+   },
+   "cold/M32/packed_cache64k": {
+    "base_boot_medians": [
+     78.29,
+     78.48
+    ],
+    "c52_boot_medians": [
+     71.59,
+     73.36
+    ],
+    "c52_over_base_mean": 0.9246,
+    "verdict_20rep_medians": "faster",
+    "rep1_only": {
+     "base-boot1": 77.98,
+     "c52-boot1": 76.06,
+     "c52-boot2": 75.16,
+     "base-boot2": 79.07
+    },
+    "verdict_rep1_only": "faster",
+    "hit_rate": null,
+    "read_calls_per_step": [
+     8.0
+    ]
+   },
+   "zipf/M4/two_plane_cache64k": {
+    "base_boot_medians": [
+     20.02,
+     20.27
+    ],
+    "c52_boot_medians": [
+     19.41,
+     20.1
+    ],
+    "c52_over_base_mean": 0.9806,
+    "verdict_20rep_medians": "within",
+    "rep1_only": {
+     "base-boot1": 19.91,
+     "c52-boot1": 19.4,
+     "c52-boot2": 20.17,
+     "base-boot2": 19.62
+    },
+    "verdict_rep1_only": "within",
+    "hit_rate": [
+     0.8365
+    ],
+    "read_calls_per_step": [
+     9.18
+    ]
+   },
+   "zipf/M4/packed_cache64k": {
+    "base_boot_medians": [
+     15.36,
+     15.46
+    ],
+    "c52_boot_medians": [
+     14.5,
+     15.32
+    ],
+    "c52_over_base_mean": 0.9676,
+    "verdict_20rep_medians": "faster",
+    "rep1_only": {
+     "base-boot1": 37.58,
+     "c52-boot1": 14.49,
+     "c52-boot2": 15.43,
+     "base-boot2": 16.19
+    },
+    "verdict_rep1_only": "faster",
+    "hit_rate": [
+     0.8365
+    ],
+    "read_calls_per_step": [
+     4.98
+    ]
+   },
+   "zipf/M16/two_plane_cache64k": {
+    "base_boot_medians": [
+     26.85,
+     27.06
+    ],
+    "c52_boot_medians": [
+     26.05,
+     26.59
+    ],
+    "c52_over_base_mean": 0.9764,
+    "verdict_20rep_medians": "faster",
+    "rep1_only": {
+     "base-boot1": 26.75,
+     "c52-boot1": 26.03,
+     "c52-boot2": 26.52,
+     "base-boot2": 25.95
+    },
+    "verdict_rep1_only": "within",
+    "hit_rate": [
+     0.9246
+    ],
+    "read_calls_per_step": [
+     13.92
+    ]
+   },
+   "zipf/M16/packed_cache64k": {
+    "base_boot_medians": [
+     20.8,
+     20.94
+    ],
+    "c52_boot_medians": [
+     19.94,
+     20.77
+    ],
+    "c52_over_base_mean": 0.9753,
+    "verdict_20rep_medians": "faster",
+    "rep1_only": {
+     "base-boot1": 21.19,
+     "c52-boot1": 19.92,
+     "c52-boot2": 20.77,
+     "base-boot2": 20.09
+    },
+    "verdict_rep1_only": "within",
+    "hit_rate": [
+     0.9246
+    ],
+    "read_calls_per_step": [
+     8.52
+    ]
+   },
+   "zipf/M48/two_plane_cache64k": {
+    "base_boot_medians": [
+     32.2,
+     32.2
+    ],
+    "c52_boot_medians": [
+     31.34,
+     31.43
+    ],
+    "c52_over_base_mean": 0.9747,
+    "verdict_20rep_medians": "faster",
+    "rep1_only": {
+     "base-boot1": 32.21,
+     "c52-boot1": 55.38,
+     "c52-boot2": 39.69,
+     "base-boot2": 50.6
+    },
+    "verdict_rep1_only": "within",
+    "hit_rate": [
+     0.9695
+    ],
+    "read_calls_per_step": [
+     15.23
+    ]
+   },
+   "zipf/M48/packed_cache64k": {
+    "base_boot_medians": [
+     25.88,
+     25.78
+    ],
+    "c52_boot_medians": [
+     25.12,
+     25.2
+    ],
+    "c52_over_base_mean": 0.9741,
+    "verdict_20rep_medians": "faster",
+    "rep1_only": {
+     "base-boot1": 26.05,
+     "c52-boot1": 25.62,
+     "c52-boot2": 29.69,
+     "base-boot2": 26.33
+    },
+    "verdict_rep1_only": "within",
+    "hit_rate": [
+     0.9695
+    ],
+    "read_calls_per_step": [
+     9.62
+    ]
+   },
+   "zipf/M128/two_plane_cache64k": {
+    "base_boot_medians": [
+     39.39,
+     38.3
+    ],
+    "c52_boot_medians": [
+     37.94,
+     37.58
+    ],
+    "c52_over_base_mean": 0.9721,
+    "verdict_20rep_medians": "faster",
+    "rep1_only": {
+     "base-boot1": 39.58,
+     "c52-boot1": 40.36,
+     "c52-boot2": 57.41,
+     "base-boot2": 39.59
+    },
+    "verdict_rep1_only": "slower",
+    "hit_rate": [
+     0.9912
+    ],
+    "read_calls_per_step": [
+     12.47
+    ]
+   },
+   "zipf/M128/packed_cache64k": {
+    "base_boot_medians": [
+     34.23,
+     32.88
+    ],
+    "c52_boot_medians": [
+     32.21,
+     32.27
+    ],
+    "c52_over_base_mean": 0.9608,
+    "verdict_20rep_medians": "faster",
+    "rep1_only": {
+     "base-boot1": 34.07,
+     "c52-boot1": 34.73,
+     "c52-boot2": 32.45,
+     "base-boot2": 34.52
+    },
+    "verdict_rep1_only": "within",
+    "hit_rate": [
+     0.9912
+    ],
+    "read_calls_per_step": [
+     7.75
+    ]
+   },
+   "hot/M1/two_plane_cache64k": {
+    "base_boot_medians": [
+     15.39,
+     15.39
+    ],
+    "c52_boot_medians": [
+     14.12,
+     15.08
+    ],
+    "c52_over_base_mean": 0.9487,
+    "verdict_20rep_medians": "faster",
+    "rep1_only": {
+     "base-boot1": 84.54,
+     "c52-boot1": 17.74,
+     "c52-boot2": 18.41,
+     "base-boot2": 23.64
+    },
+    "verdict_rep1_only": "faster",
+    "hit_rate": [
+     1.0
+    ],
+    "read_calls_per_step": [
+     0.0
+    ]
+   },
+   "hot/M1/packed_cache64k": {
+    "base_boot_medians": [
+     15.33,
+     15.36
+    ],
+    "c52_boot_medians": [
+     13.97,
+     15.02
+    ],
+    "c52_over_base_mean": 0.9446,
+    "verdict_20rep_medians": "faster",
+    "rep1_only": {
+     "base-boot1": 15.76,
+     "c52-boot1": 13.97,
+     "c52-boot2": 19.5,
+     "base-boot2": 15.83
+    },
+    "verdict_rep1_only": "within",
+    "hit_rate": [
+     1.0
+    ],
+    "read_calls_per_step": [
+     0.0
+    ]
+   },
+   "hot/M4/two_plane_cache64k": {
+    "base_boot_medians": [
+     15.8,
+     15.36
+    ],
+    "c52_boot_medians": [
+     14.27,
+     15.41
+    ],
+    "c52_over_base_mean": 0.9525,
+    "verdict_20rep_medians": "within",
+    "rep1_only": {
+     "base-boot1": 16.05,
+     "c52-boot1": 13.92,
+     "c52-boot2": 15.5,
+     "base-boot2": 15.84
+    },
+    "verdict_rep1_only": "faster",
+    "hit_rate": [
+     1.0
+    ],
+    "read_calls_per_step": [
+     0.0
+    ]
+   },
+   "hot/M4/packed_cache64k": {
+    "base_boot_medians": [
+     15.75,
+     15.46
+    ],
+    "c52_boot_medians": [
+     14.1,
+     15.22
+    ],
+    "c52_over_base_mean": 0.9394,
+    "verdict_20rep_medians": "faster",
+    "rep1_only": {
+     "base-boot1": 15.98,
+     "c52-boot1": 13.68,
+     "c52-boot2": 16.78,
+     "base-boot2": 16.36
+    },
+    "verdict_rep1_only": "within",
+    "hit_rate": [
+     1.0
+    ],
+    "read_calls_per_step": [
+     0.0
+    ]
+   },
+   "hot/M8/two_plane_cache64k": {
+    "base_boot_medians": [
+     16.21,
+     16.07
+    ],
+    "c52_boot_medians": [
+     14.54,
+     15.75
+    ],
+    "c52_over_base_mean": 0.9384,
+    "verdict_20rep_medians": "faster",
+    "rep1_only": {
+     "base-boot1": 16.26,
+     "c52-boot1": 14.0,
+     "c52-boot2": 15.55,
+     "base-boot2": 16.45
+    },
+    "verdict_rep1_only": "faster",
+    "hit_rate": [
+     1.0
+    ],
+    "read_calls_per_step": [
+     0.0
+    ]
+   },
+   "hot/M8/packed_cache64k": {
+    "base_boot_medians": [
+     16.17,
+     16.02
+    ],
+    "c52_boot_medians": [
+     14.25,
+     15.7
+    ],
+    "c52_over_base_mean": 0.9304,
+    "verdict_20rep_medians": "faster",
+    "rep1_only": {
+     "base-boot1": 16.66,
+     "c52-boot1": 13.89,
+     "c52-boot2": 15.66,
+     "base-boot2": 15.9
+    },
+    "verdict_rep1_only": "faster",
+    "hit_rate": [
+     1.0
+    ],
+    "read_calls_per_step": [
+     0.0
+    ]
+   },
+   "hot/M16/two_plane_cache64k": {
+    "base_boot_medians": [
+     16.21,
+     16.25
+    ],
+    "c52_boot_medians": [
+     14.5,
+     15.88
+    ],
+    "c52_over_base_mean": 0.9359,
+    "verdict_20rep_medians": "faster",
+    "rep1_only": {
+     "base-boot1": 16.66,
+     "c52-boot1": 14.18,
+     "c52-boot2": 15.85,
+     "base-boot2": 16.09
+    },
+    "verdict_rep1_only": "faster",
+    "hit_rate": [
+     1.0
+    ],
+    "read_calls_per_step": [
+     0.0
+    ]
+   },
+   "hot/M16/packed_cache64k": {
+    "base_boot_medians": [
+     16.24,
+     16.23
+    ],
+    "c52_boot_medians": [
+     14.48,
+     15.86
+    ],
+    "c52_over_base_mean": 0.9344,
+    "verdict_20rep_medians": "faster",
+    "rep1_only": {
+     "base-boot1": 16.55,
+     "c52-boot1": 14.18,
+     "c52-boot2": 15.84,
+     "base-boot2": 16.48
+    },
+    "verdict_rep1_only": "faster",
+    "hit_rate": [
+     1.0
+    ],
+    "read_calls_per_step": [
+     0.0
+    ]
+   },
+   "hot/M32/two_plane_cache64k": {
+    "base_boot_medians": [
+     16.43,
+     16.28
+    ],
+    "c52_boot_medians": [
+     15.15,
+     16.06
+    ],
+    "c52_over_base_mean": 0.9541,
+    "verdict_20rep_medians": "faster",
+    "rep1_only": {
+     "base-boot1": 16.83,
+     "c52-boot1": 14.77,
+     "c52-boot2": 15.67,
+     "base-boot2": 16.34
+    },
+    "verdict_rep1_only": "faster",
+    "hit_rate": [
+     1.0
+    ],
+    "read_calls_per_step": [
+     0.0
+    ]
+   },
+   "hot/M32/packed_cache64k": {
+    "base_boot_medians": [
+     16.57,
+     16.38
+    ],
+    "c52_boot_medians": [
+     14.89,
+     15.82
+    ],
+    "c52_over_base_mean": 0.932,
+    "verdict_20rep_medians": "faster",
+    "rep1_only": {
+     "base-boot1": 16.56,
+     "c52-boot1": 14.61,
+     "c52-boot2": 15.73,
+     "base-boot2": 16.26
+    },
+    "verdict_rep1_only": "faster",
+    "hit_rate": [
+     1.0
+    ],
+    "read_calls_per_step": [
+     0.0
+    ]
+   },
+   "hot/M48/two_plane_cache64k": {
+    "base_boot_medians": [
+     17.12,
+     17.59
+    ],
+    "c52_boot_medians": [
+     15.29,
+     16.77
+    ],
+    "c52_over_base_mean": 0.9237,
+    "verdict_20rep_medians": "faster",
+    "rep1_only": {
+     "base-boot1": 17.05,
+     "c52-boot1": 15.3,
+     "c52-boot2": 17.47,
+     "base-boot2": 17.42
+    },
+    "verdict_rep1_only": "within",
+    "hit_rate": [
+     1.0
+    ],
+    "read_calls_per_step": [
+     0.0
+    ]
+   },
+   "hot/M48/packed_cache64k": {
+    "base_boot_medians": [
+     17.2,
+     17.54
+    ],
+    "c52_boot_medians": [
+     15.45,
+     16.8
+    ],
+    "c52_over_base_mean": 0.9283,
+    "verdict_20rep_medians": "faster",
+    "rep1_only": {
+     "base-boot1": 17.15,
+     "c52-boot1": 14.64,
+     "c52-boot2": 17.47,
+     "base-boot2": 17.32
+    },
+    "verdict_rep1_only": "within",
+    "hit_rate": [
+     1.0
+    ],
+    "read_calls_per_step": [
+     0.0
+    ]
+   },
+   "hot/M64/two_plane_cache64k": {
+    "base_boot_medians": [
+     17.98,
+     17.59
+    ],
+    "c52_boot_medians": [
+     15.81,
+     16.91
+    ],
+    "c52_over_base_mean": 0.9199,
+    "verdict_20rep_medians": "faster",
+    "rep1_only": {
+     "base-boot1": 17.8,
+     "c52-boot1": 14.98,
+     "c52-boot2": 17.57,
+     "base-boot2": 17.52
+    },
+    "verdict_rep1_only": "within",
+    "hit_rate": [
+     1.0
+    ],
+    "read_calls_per_step": [
+     0.0
+    ]
+   },
+   "hot/M64/packed_cache64k": {
+    "base_boot_medians": [
+     17.81,
+     17.27
+    ],
+    "c52_boot_medians": [
+     15.67,
+     16.8
+    ],
+    "c52_over_base_mean": 0.9256,
+    "verdict_20rep_medians": "faster",
+    "rep1_only": {
+     "base-boot1": 17.6,
+     "c52-boot1": 15.16,
+     "c52-boot2": 17.37,
+     "base-boot2": 17.54
+    },
+    "verdict_rep1_only": "faster",
+    "hit_rate": [
+     1.0
+    ],
+    "read_calls_per_step": [
+     0.0
+    ]
+   },
+   "hot/M128/two_plane_cache64k": {
+    "base_boot_medians": [
+     20.82,
+     20.16
+    ],
+    "c52_boot_medians": [
+     17.52,
+     19.06
+    ],
+    "c52_over_base_mean": 0.8926,
+    "verdict_20rep_medians": "faster",
+    "rep1_only": {
+     "base-boot1": 20.59,
+     "c52-boot1": 16.85,
+     "c52-boot2": 19.12,
+     "base-boot2": 20.63
+    },
+    "verdict_rep1_only": "faster",
+    "hit_rate": [
+     1.0
+    ],
+    "read_calls_per_step": [
+     0.0
+    ]
+   },
+   "hot/M128/packed_cache64k": {
+    "base_boot_medians": [
+     20.67,
+     20.05
+    ],
+    "c52_boot_medians": [
+     17.69,
+     19.0
+    ],
+    "c52_over_base_mean": 0.901,
+    "verdict_20rep_medians": "faster",
+    "rep1_only": {
+     "base-boot1": 20.29,
+     "c52-boot1": 17.11,
+     "c52-boot2": 19.33,
+     "base-boot2": 16.68
+    },
+    "verdict_rep1_only": "within",
+    "hit_rate": [
+     1.0
+    ],
+    "read_calls_per_step": [
+     0.0
+    ]
+   }
+  },
+  "nocache_modes": {
+   "cold/M4/two_plane_nocache": {
+    "base_boot_medians": [
+     34.62,
+     36.55
+    ],
+    "c52_boot_medians": [
+     35.52,
+     36.05
+    ],
+    "c52_over_base_mean": 1.0056,
+    "verdict_20rep_medians": "within",
+    "rep1_only": {
+     "base-boot1": 34.48,
+     "c52-boot1": 34.22,
+     "c52-boot2": 36.16,
+     "base-boot2": 34.21
+    },
+    "verdict_rep1_only": "within",
+    "hit_rate": null,
+    "read_calls_per_step": [
+     16.0
+    ]
+   },
+   "cold/M4/packed_nocache": {
+    "base_boot_medians": [
+     20.81,
+     21.31
+    ],
+    "c52_boot_medians": [
+     20.34,
+     21.08
+    ],
+    "c52_over_base_mean": 0.9834,
+    "verdict_20rep_medians": "within",
+    "rep1_only": {
+     "base-boot1": 21.31,
+     "c52-boot1": 20.51,
+     "c52-boot2": 22.45,
+     "base-boot2": 20.51
+    },
+    "verdict_rep1_only": "within",
+    "hit_rate": null,
+    "read_calls_per_step": [
+     8.0
+    ]
+   },
+   "cold/M16/two_plane_nocache": {
+    "base_boot_medians": [
+     53.45,
+     53.69
+    ],
+    "c52_boot_medians": [
+     52.71,
+     53.52
+    ],
+    "c52_over_base_mean": 0.9915,
+    "verdict_20rep_medians": "within",
+    "rep1_only": {
+     "base-boot1": 52.42,
+     "c52-boot1": 51.96,
+     "c52-boot2": 52.79,
+     "base-boot2": 53.0
+    },
+    "verdict_rep1_only": "within",
+    "hit_rate": null,
+    "read_calls_per_step": [
+     16.0
+    ]
+   },
+   "cold/M16/packed_nocache": {
+    "base_boot_medians": [
+     54.16,
+     54.44
+    ],
+    "c52_boot_medians": [
+     53.66,
+     54.11
+    ],
+    "c52_over_base_mean": 0.9924,
+    "verdict_20rep_medians": "faster",
+    "rep1_only": {
+     "base-boot1": 54.39,
+     "c52-boot1": 53.21,
+     "c52-boot2": 54.77,
+     "base-boot2": 54.18
+    },
+    "verdict_rep1_only": "within",
+    "hit_rate": null,
+    "read_calls_per_step": [
+     8.0
+    ]
+   },
+   "cold/M32/two_plane_nocache": {
+    "base_boot_medians": [
+     78.52,
+     78.34
+    ],
+    "c52_boot_medians": [
+     76.0,
+     76.69
+    ],
+    "c52_over_base_mean": 0.9734,
+    "verdict_20rep_medians": "faster",
+    "rep1_only": {
+     "base-boot1": 79.44,
+     "c52-boot1": 76.73,
+     "c52-boot2": 77.74,
+     "base-boot2": 80.76
+    },
+    "verdict_rep1_only": "faster",
+    "hit_rate": null,
+    "read_calls_per_step": [
+     16.0
+    ]
+   },
+   "cold/M32/packed_nocache": {
+    "base_boot_medians": [
+     67.69,
+     67.83
+    ],
+    "c52_boot_medians": [
+     66.84,
+     67.1
+    ],
+    "c52_over_base_mean": 0.9883,
+    "verdict_20rep_medians": "faster",
+    "rep1_only": {
+     "base-boot1": 68.3,
+     "c52-boot1": 66.89,
+     "c52-boot2": 67.46,
+     "base-boot2": 67.71
+    },
+    "verdict_rep1_only": "faster",
+    "hit_rate": null,
+    "read_calls_per_step": [
+     8.0
+    ]
+   },
+   "zipf/M4/two_plane_nocache": {
+    "base_boot_medians": [
+     41.52,
+     41.75
+    ],
+    "c52_boot_medians": [
+     41.49,
+     41.69
+    ],
+    "c52_over_base_mean": 0.9989,
+    "verdict_20rep_medians": "within",
+    "rep1_only": {
+     "base-boot1": 41.64,
+     "c52-boot1": 41.51,
+     "c52-boot2": 41.89,
+     "base-boot2": 41.53
+    },
+    "verdict_rep1_only": "within",
+    "hit_rate": [
+     0.0
+    ],
+    "read_calls_per_step": [
+     19.98
+    ]
+   },
+   "zipf/M4/packed_nocache": {
+    "base_boot_medians": [
+     33.91,
+     34.13
+    ],
+    "c52_boot_medians": [
+     33.55,
+     33.9
+    ],
+    "c52_over_base_mean": 0.9913,
+    "verdict_20rep_medians": "faster",
+    "rep1_only": {
+     "base-boot1": 54.82,
+     "c52-boot1": 33.52,
+     "c52-boot2": 33.96,
+     "base-boot2": 33.69
+    },
+    "verdict_rep1_only": "within",
+    "hit_rate": [
+     0.0
+    ],
+    "read_calls_per_step": [
+     12.38
+    ]
+   },
+   "zipf/M16/two_plane_nocache": {
+    "base_boot_medians": [
+     51.03,
+     51.23
+    ],
+    "c52_boot_medians": [
+     50.69,
+     50.95
+    ],
+    "c52_over_base_mean": 0.9939,
+    "verdict_20rep_medians": "faster",
+    "rep1_only": {
+     "base-boot1": 51.04,
+     "c52-boot1": 50.19,
+     "c52-boot2": 50.92,
+     "base-boot2": 50.4
+    },
+    "verdict_rep1_only": "within",
+    "hit_rate": [
+     0.0
+    ],
+    "read_calls_per_step": [
+     26.9
+    ]
+   },
+   "zipf/M16/packed_nocache": {
+    "base_boot_medians": [
+     40.09,
+     40.02
+    ],
+    "c52_boot_medians": [
+     39.71,
+     39.79
+    ],
+    "c52_over_base_mean": 0.9924,
+    "verdict_20rep_medians": "faster",
+    "rep1_only": {
+     "base-boot1": 40.71,
+     "c52-boot1": 39.54,
+     "c52-boot2": 40.05,
+     "base-boot2": 39.57
+    },
+    "verdict_rep1_only": "within",
+    "hit_rate": [
+     0.0
+    ],
+    "read_calls_per_step": [
+     19.53
+    ]
+   },
+   "zipf/M48/two_plane_nocache": {
+    "base_boot_medians": [
+     80.12,
+     80.58
+    ],
+    "c52_boot_medians": [
+     79.15,
+     79.38
+    ],
+    "c52_over_base_mean": 0.9865,
+    "verdict_20rep_medians": "faster",
+    "rep1_only": {
+     "base-boot1": 79.66,
+     "c52-boot1": 78.94,
+     "c52-boot2": 118.86,
+     "base-boot2": 79.85
+    },
+    "verdict_rep1_only": "within",
+    "hit_rate": [
+     0.0
+    ],
+    "read_calls_per_step": [
+     33.18
+    ]
+   },
+   "zipf/M48/packed_nocache": {
+    "base_boot_medians": [
+     60.75,
+     60.81
+    ],
+    "c52_boot_medians": [
+     60.05,
+     59.72
+    ],
+    "c52_over_base_mean": 0.9853,
+    "verdict_20rep_medians": "faster",
+    "rep1_only": {
+     "base-boot1": 61.06,
+     "c52-boot1": 59.44,
+     "c52-boot2": 68.28,
+     "base-boot2": 61.57
+    },
+    "verdict_rep1_only": "within",
+    "hit_rate": [
+     0.0
+    ],
+    "read_calls_per_step": [
+     26.18
+    ]
+   },
+   "zipf/M128/two_plane_nocache": {
+    "base_boot_medians": [
+     106.87,
+     108.32
+    ],
+    "c52_boot_medians": [
+     105.0,
+     104.61
+    ],
+    "c52_over_base_mean": 0.9741,
+    "verdict_20rep_medians": "faster",
+    "rep1_only": {
+     "base-boot1": 153.12,
+     "c52-boot1": 106.19,
+     "c52-boot2": 115.43,
+     "base-boot2": 107.36
+    },
+    "verdict_rep1_only": "within",
+    "hit_rate": [
+     0.0
+    ],
+    "read_calls_per_step": [
+     34.05
+    ]
+   },
+   "zipf/M128/packed_nocache": {
+    "base_boot_medians": [
+     82.15,
+     81.65
+    ],
+    "c52_boot_medians": [
+     79.87,
+     80.24
+    ],
+    "c52_over_base_mean": 0.9775,
+    "verdict_20rep_medians": "faster",
+    "rep1_only": {
+     "base-boot1": 82.45,
+     "c52-boot1": 83.02,
+     "c52-boot2": 79.66,
+     "base-boot2": 82.32
+    },
+    "verdict_rep1_only": "within",
+    "hit_rate": [
+     0.0
+    ],
+    "read_calls_per_step": [
+     27.57
+    ]
+   },
+   "hot/M1/two_plane_nocache": {
+    "base_boot_medians": [
+     46.23,
+     69.06
+    ],
+    "c52_boot_medians": [
+     58.11,
+     73.23
+    ],
+    "c52_over_base_mean": 1.1392,
+    "verdict_20rep_medians": "within",
+    "rep1_only": {
+     "base-boot1": 88.7,
+     "c52-boot1": 67.62,
+     "c52-boot2": 66.87,
+     "base-boot2": 40.46
+    },
+    "verdict_rep1_only": "within",
+    "hit_rate": [
+     0.0
+    ],
+    "read_calls_per_step": [
+     16.0
+    ]
+   },
+   "hot/M1/packed_nocache": {
+    "base_boot_medians": [
+     17.95,
+     17.86
+    ],
+    "c52_boot_medians": [
+     17.45,
+     17.84
+    ],
+    "c52_over_base_mean": 0.9855,
+    "verdict_20rep_medians": "faster",
+    "rep1_only": {
+     "base-boot1": 79.3,
+     "c52-boot1": 18.5,
+     "c52-boot2": 18.82,
+     "base-boot2": 81.63
+    },
+    "verdict_rep1_only": "faster",
+    "hit_rate": [
+     0.0
+    ],
+    "read_calls_per_step": [
+     8.0
+    ]
+   },
+   "hot/M4/two_plane_nocache": {
+    "base_boot_medians": [
+     33.8,
+     33.98
+    ],
+    "c52_boot_medians": [
+     33.78,
+     33.8
+    ],
+    "c52_over_base_mean": 0.997,
+    "verdict_20rep_medians": "within",
+    "rep1_only": {
+     "base-boot1": 34.36,
+     "c52-boot1": 56.41,
+     "c52-boot2": 34.56,
+     "base-boot2": 33.98
+    },
+    "verdict_rep1_only": "slower",
+    "hit_rate": [
+     0.0
+    ],
+    "read_calls_per_step": [
+     19.0
+    ]
+   },
+   "hot/M4/packed_nocache": {
+    "base_boot_medians": [
+     25.54,
+     25.55
+    ],
+    "c52_boot_medians": [
+     25.09,
+     25.46
+    ],
+    "c52_over_base_mean": 0.9894,
+    "verdict_20rep_medians": "faster",
+    "rep1_only": {
+     "base-boot1": 25.43,
+     "c52-boot1": 34.01,
+     "c52-boot2": 25.89,
+     "base-boot2": 25.61
+    },
+    "verdict_rep1_only": "slower",
+    "hit_rate": [
+     0.0
+    ],
+    "read_calls_per_step": [
+     12.0
+    ]
+   },
+   "hot/M8/two_plane_nocache": {
+    "base_boot_medians": [
+     37.48,
+     37.66
+    ],
+    "c52_boot_medians": [
+     37.05,
+     37.37
+    ],
+    "c52_over_base_mean": 0.9904,
+    "verdict_20rep_medians": "faster",
+    "rep1_only": {
+     "base-boot1": 37.72,
+     "c52-boot1": 41.31,
+     "c52-boot2": 37.54,
+     "base-boot2": 37.49
+    },
+    "verdict_rep1_only": "within",
+    "hit_rate": [
+     0.0
+    ],
+    "read_calls_per_step": [
+     16.0
+    ]
+   },
+   "hot/M8/packed_nocache": {
+    "base_boot_medians": [
+     27.83,
+     28.09
+    ],
+    "c52_boot_medians": [
+     27.58,
+     28.38
+    ],
+    "c52_over_base_mean": 1.0007,
+    "verdict_20rep_medians": "within",
+    "rep1_only": {
+     "base-boot1": 27.76,
+     "c52-boot1": 29.4,
+     "c52-boot2": 28.54,
+     "base-boot2": 27.95
+    },
+    "verdict_rep1_only": "slower",
+    "hit_rate": [
+     0.0
+    ],
+    "read_calls_per_step": [
+     8.0
+    ]
+   },
+   "hot/M16/two_plane_nocache": {
+    "base_boot_medians": [
+     42.42,
+     42.66
+    ],
+    "c52_boot_medians": [
+     41.78,
+     41.92
+    ],
+    "c52_over_base_mean": 0.9838,
+    "verdict_20rep_medians": "faster",
+    "rep1_only": {
+     "base-boot1": 42.46,
+     "c52-boot1": 43.39,
+     "c52-boot2": 41.91,
+     "base-boot2": 42.7
+    },
+    "verdict_rep1_only": "within",
+    "hit_rate": [
+     0.0
+    ],
+    "read_calls_per_step": [
+     16.0
+    ]
+   },
+   "hot/M16/packed_nocache": {
+    "base_boot_medians": [
+     31.86,
+     32.21
+    ],
+    "c52_boot_medians": [
+     31.59,
+     32.14
+    ],
+    "c52_over_base_mean": 0.9947,
+    "verdict_20rep_medians": "within",
+    "rep1_only": {
+     "base-boot1": 31.89,
+     "c52-boot1": 32.91,
+     "c52-boot2": 32.12,
+     "base-boot2": 31.97
+    },
+    "verdict_rep1_only": "slower",
+    "hit_rate": [
+     0.0
+    ],
+    "read_calls_per_step": [
+     8.0
+    ]
+   },
+   "hot/M32/two_plane_nocache": {
+    "base_boot_medians": [
+     51.3,
+     51.58
+    ],
+    "c52_boot_medians": [
+     50.11,
+     50.07
+    ],
+    "c52_over_base_mean": 0.9738,
+    "verdict_20rep_medians": "faster",
+    "rep1_only": {
+     "base-boot1": 51.86,
+     "c52-boot1": 51.44,
+     "c52-boot2": 50.28,
+     "base-boot2": 51.96
+    },
+    "verdict_rep1_only": "faster",
+    "hit_rate": [
+     0.0
+    ],
+    "read_calls_per_step": [
+     16.0
+    ]
+   },
+   "hot/M32/packed_nocache": {
+    "base_boot_medians": [
+     37.28,
+     37.38
+    ],
+    "c52_boot_medians": [
+     36.64,
+     36.89
+    ],
+    "c52_over_base_mean": 0.9849,
+    "verdict_20rep_medians": "faster",
+    "rep1_only": {
+     "base-boot1": 37.18,
+     "c52-boot1": 36.96,
+     "c52-boot2": 37.06,
+     "base-boot2": 37.42
+    },
+    "verdict_rep1_only": "faster",
+    "hit_rate": [
+     0.0
+    ],
+    "read_calls_per_step": [
+     8.0
+    ]
+   },
+   "hot/M48/two_plane_nocache": {
+    "base_boot_medians": [
+     60.32,
+     60.77
+    ],
+    "c52_boot_medians": [
+     58.45,
+     58.48
+    ],
+    "c52_over_base_mean": 0.9656,
+    "verdict_20rep_medians": "faster",
+    "rep1_only": {
+     "base-boot1": 60.39,
+     "c52-boot1": 59.56,
+     "c52-boot2": 58.38,
+     "base-boot2": 60.9
+    },
+    "verdict_rep1_only": "faster",
+    "hit_rate": [
+     0.0
+    ],
+    "read_calls_per_step": [
+     16.0
+    ]
+   },
+   "hot/M48/packed_nocache": {
+    "base_boot_medians": [
+     43.23,
+     43.31
+    ],
+    "c52_boot_medians": [
+     41.77,
+     42.37
+    ],
+    "c52_over_base_mean": 0.9723,
+    "verdict_20rep_medians": "faster",
+    "rep1_only": {
+     "base-boot1": 43.16,
+     "c52-boot1": 42.38,
+     "c52-boot2": 43.0,
+     "base-boot2": 43.72
+    },
+    "verdict_rep1_only": "faster",
+    "hit_rate": [
+     0.0
+    ],
+    "read_calls_per_step": [
+     8.0
+    ]
+   },
+   "hot/M64/two_plane_nocache": {
+    "base_boot_medians": [
+     60.62,
+     60.91
+    ],
+    "c52_boot_medians": [
+     60.3,
+     60.16
+    ],
+    "c52_over_base_mean": 0.9912,
+    "verdict_20rep_medians": "faster",
+    "rep1_only": {
+     "base-boot1": 61.57,
+     "c52-boot1": 59.62,
+     "c52-boot2": 60.08,
+     "base-boot2": 61.74
+    },
+    "verdict_rep1_only": "faster",
+    "hit_rate": [
+     0.0
+    ],
+    "read_calls_per_step": [
+     16.0
+    ]
+   },
+   "hot/M64/packed_nocache": {
+    "base_boot_medians": [
+     48.45,
+     48.43
+    ],
+    "c52_boot_medians": [
+     46.51,
+     47.53
+    ],
+    "c52_over_base_mean": 0.9707,
+    "verdict_20rep_medians": "faster",
+    "rep1_only": {
+     "base-boot1": 48.6,
+     "c52-boot1": 46.94,
+     "c52-boot2": 47.46,
+     "base-boot2": 48.67
+    },
+    "verdict_rep1_only": "faster",
+    "hit_rate": [
+     0.0
+    ],
+    "read_calls_per_step": [
+     8.0
+    ]
+   },
+   "hot/M128/two_plane_nocache": {
+    "base_boot_medians": [
+     82.7,
+     82.5
+    ],
+    "c52_boot_medians": [
+     80.72,
+     80.57
+    ],
+    "c52_over_base_mean": 0.9763,
+    "verdict_20rep_medians": "faster",
+    "rep1_only": {
+     "base-boot1": 82.79,
+     "c52-boot1": 79.69,
+     "c52-boot2": 80.53,
+     "base-boot2": 82.85
+    },
+    "verdict_rep1_only": "faster",
+    "hit_rate": [
+     0.0
+    ],
+    "read_calls_per_step": [
+     16.0
+    ]
+   },
+   "hot/M128/packed_nocache": {
+    "base_boot_medians": [
+     56.05,
+     55.43
+    ],
+    "c52_boot_medians": [
+     52.63,
+     54.32
+    ],
+    "c52_over_base_mean": 0.9594,
+    "verdict_20rep_medians": "faster",
+    "rep1_only": {
+     "base-boot1": 56.1,
+     "c52-boot1": 61.0,
+     "c52-boot2": 54.34,
+     "base-boot2": 56.27
+    },
+    "verdict_rep1_only": "within",
+    "hit_rate": [
+     0.0
+    ],
+    "read_calls_per_step": [
+     8.0
+    ]
+   }
+  },
+  "cell_counts_20rep": {
+   "within": 12,
+   "faster": 48
+  },
+  "cell_counts_rep1_only": {
+   "within": 32,
+   "faster": 23,
+   "slower": 5
+  },
+  "pytest_c52": {
+   "c52-boot1": "52 passed, 14 warnings",
+   "c52-boot2": "52 passed, 14 warnings"
+  },
+  "interval": "an arm's interval is the range of its two boots' medians (20 calls each); 'faster'/'slower' = the candidate's two boots wholly below/above the base's two"
+ },
+ "verdict": "pass",
+ "reason": "Cold-miss lookups are faster beyond the interval at M16 (two-plane 0.909x, packed 0.934x) and M32 (0.897x, 0.925x), and Zipfian lookups at M16, M48 and M128 in both cache modes (0.961-0.976x) and M4 packed (0.968x); hot-cache steps are faster at 15 of 16 cells (0.89-0.95x). The remaining cache cells (cold M4 both modes 0.963-0.972x, Zipfian M4 two-plane 0.981x, hot M4 two-plane 0.953x) improve inside the interval. No cell in any of the four modes is slower (60 cells: 48 faster, 12 within). Rows are identical across arms and modes, the 52 engram-row tests pass on both boots, and the same-session ABBA replaces the recorded-0750 comparison that parked the PR.",
+ "notes": [
+  "With the PR's single call per boot (rep 1 only), 5 of 60 cells read 'slower' (Zipfian M128 two_plane_cache64k; hot M4 two_plane_nocache and packed_nocache; hot M8 and M16 packed_nocache), 32 'within' and 23 'faster'. Each is one boot's first call landing high (e.g. hot M4 two_plane_nocache 56.41 us on c52 boot1 against 34.56 on c52 boot2 and 33.98-34.36 on base; Zipfian M128 57.41 on c52 boot2 against 40.36 on boot1): one call is 6-60 wall-clock steps, so its spread is wider than the effect. With 20 calls a boot those five are 2 'faster' and 3 'within', none slower. Both views are in measured.",
+  "hot/M1/two_plane_nocache is the first timed cell of every call and swings 46-73 us across boots (cold start of the call); it is 'within'.",
+  "The PR README's table has cold-miss and Zipfian M=1 rows that neither its receipts nor the bench contain (cold M is 4,16,32 and Zipfian M 4,16,48,128); the comparison here uses the bench's rows.",
+  "The bench times host stage + GPU gather by wall clock (perf_counter) over the disk reader's io_uring path, a host and I/O path rather than a decode GPU kernel, so CUDA-graph replay does not apply; the reader runs O_DIRECT reads from an ext4 directory on sp8's NVMe root."
+ ]
+}

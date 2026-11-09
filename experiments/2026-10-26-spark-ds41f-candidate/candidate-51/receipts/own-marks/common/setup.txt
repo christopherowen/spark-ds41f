@@ -1,0 +1,73 @@
+# candidate-51 own marks: shared setup on sp8 (spark-0016, NVIDIA GB10), 2026-11-09.
+# Work dir B = ~/spark-lab/agents/candidate-51-own-marks. No build, push, commit, cluster
+# or window operation; no other host's GPU. Every GPU command ran under
+# flock /tmp/spark-lab-gpu.lock through bin/om.sh, which records loadavg, docker ps and
+# ~/spark-hold.json inside the lock and refuses to run when the hold file exists or a
+# "vllm serve" container runs. ~/spark-hold.json was absent and no serving container ran
+# at every run (each run's block in raw/commands.txt).
+#
+# 1. Deployment checkout (for the patch series, overlays and PR heads):
+git clone -q --reference ~/projects/spark-ds41f https://github.com/christopherowen/spark-ds41f.git $B/repo
+git -C $B/repo checkout -q --detach 83e594528e68737650e8d542145906e664dcbe38   # origin/main, candidate-51 merged
+for n in 961 963 987 1001; do git -C $B/repo fetch -q origin pull/$n/head:pr-$n; done
+#   heads: 961 9362f944201a45fc0d74424ac0d73c5fc17cdf78  963 e5db47f172cfef9bbe77d4af8b061f6fc683969a
+#          987 9be94ed5310ceb4f77ecae29985a40c569878c32  1001 03e2d903daf9ea197b430e24b75e64b0eda7e737
+#   (all equal to candidate-51's README table)
+#   each PR's experiment dir exported with git archive pr-<N> <dir> | tar -x -C $B/src/pr-<N>
+#
+# 2. candidate-51's vLLM tree from its series (stack.sh, copied from
+#    ~/spark-lab/agents/candidates-51-53/tools/stack.sh, sha256 6bbb757b...):
+git clone -q --shared --no-checkout ~/spark-lab/agents/round-51-53-select/base-vllm $B/stack-vllm
+bash $B/tools/stack.sh $B $B/repo/experiments/2026-10-26-spark-ds41f-candidate 51 $B/logs/stack-51.log
+#   from 1107's patch head 2756478b60b9 (tree ed1bdb7a7684, = 1107 source.json): candidate-50's
+#   0762..0777, 0779, 0780 (0778, #1009, left out) -> 0bc043e85 tree 14c5a2dc (the selection's base),
+#   then 0781..0784 with git am as bin/spark build prepare applies them ->
+#   head cc1115c55efe (= candidate-51 lock patch_head) tree 987ba0589960 (= expected_tree);
+#   git diff --check 19f2c20ed4d6..HEAD clean. Log: stack-51.log.
+#
+# 3. Image: spark-ds41f:candidate-50 = sha256:8c1ea1f62f62c3e2adc03b645c091a5499cf7163101aca32875c894b96f155db
+#    (created 2026-11-09T14:48:01+01:00); its /opt/spark-ds41f/candidate/vllm is candidate-50's
+#    prepared tree ba7400d9 (tree d5778ab5): all 7,831 tracked files match (verify/verify-tree-img.txt).
+#
+# 4. Arms (bin/om.sh):
+#    base = the image + candidate-50/no1009/overlay's 4 files ro (files-base.txt), as tp4-no1009.json
+#           mounts them; the container sees tree 14c5a2dc except the two no1009 test files that
+#           tp4-no1009.json does not mount (verify-tree-base.txt: 7,829 match, 2 differ:
+#           tests/kernels/test_deepseek_v41_tilelang_front.py, tests/models/test_deepseek_v4_1_attention.py).
+#    c51  = the image + the 15 files in which cc1115c5 differs from the image's tree, ro
+#           (files-c51.txt; written with git show cc1115c5:<path>); the container sees tree
+#           987ba058 exactly (verify-tree-c51.txt: 7,831 match, 0 differ). overlay-sha.txt lists
+#           every file's SHA-256 in each tree. verify-overlay-*.txt shows the change markers each
+#           arm imports, from /opt/spark-ds41f/candidate/vllm (no stale module).
+git -C $B/stack-vllm diff --name-only ba7400d9b6715ea1be6fa98b1d9ccedf5fcb65f9 cc1115c55efe9ab2eacaa54d8f6eddff21bb0c2a > $B/files-c51.txt
+bash $B/bin/pr-common.sh     # verify-tree-{img,base,c51}, verify-overlay-{base,c51}
+#    Every PR changes Python or TileLang/CuTe JIT source only (l2_prefetch.py x2, gemm.py,
+#    vocab.py, wo.py, tests), so the overlay represents each change; nothing compiled is involved.
+#    Each arm has its own TileLang cache (B/c/tl-<arm> at /root/.tilelang), env
+#    TILELANG_CACHE_DIR=/root/.tilelang/cache, HF_HUB_OFFLINE=1,
+#    PYTHONPATH=/opt/spark-ds41f/candidate/vllm, workdir /opt/spark-ds41f/candidate/vllm.
+#
+# 5. Method: ABBA in one session per PR: base boot1, c51 boot1, c51 boot2, base boot2 (a boot is
+#    a fresh container). Every timed script starts with >= 250 ms of GPU warm-up
+#    (h/omlib.gpu_warmup: BF16 4096^3 matmuls; h/warm.py wraps the PR scripts that run unchanged).
+#    Interval rule (as candidate-49's own marks): a cell is faster when the slower candidate boot
+#    beats the faster base boot, slower when the faster candidate boot is slower than the slower
+#    base boot, else same.
+#    Order on sp8: common, #987, #1001, #961, #963, then #987's supplement (boots 3-4) and the
+#    pytest re-runs with the tblib stand-in (progress.log). Other agents' jobs interleaved through
+#    the lock (docker_ps_before in each run's block).
+#
+# 6. pytest: the image lacks tblib, which tests/conftest.py imports; the first #987 and #1001
+#    pytest runs stopped there (exit 4, kept). Every later pytest run loads the release bundle's
+#    stand-in plugin (h/tblib_stub.py = candidate-51/bundles/release-tests/tblib_stub.py) with
+#    -p tblib_stub and PYTHONPATH=/opt/spark-ds41f/candidate/vllm:/h.
+#
+# 7. Cleanup (2026-11-09T19:1xZ): the TileLang caches (root-owned, removed through a non-GPU
+#    container of the image), the deployment clone (repo, 491 MB), the vLLM clone (stack-vllm,
+#    143 MB) and the tree listings deleted on sp8; about 6.6 MB of scripts, overlay files, PR
+#    experiment copies and outputs remain in $B.
+#
+# 8. Script versions: h/omlib.py gained kernel_isolated_us() (and h963.py its use) after #987's
+#    boots 1-2 and before any #963, #987-supplement or later run used them; nothing else in
+#    omlib.py changed, so #987 boots 1-2 ran the same functions minus that one. Every #963 boot
+#    and every h987b boot ran the final files kept here.

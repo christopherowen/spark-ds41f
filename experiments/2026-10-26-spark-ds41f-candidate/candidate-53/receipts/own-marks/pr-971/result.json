@@ -1,0 +1,664 @@
+{
+ "pr": 971,
+ "pr_head": "9ef22e1fcdf4c83d782d863dafbd51278362b6d5",
+ "patch": "0782-perf-spec-decode-copy-drafter-survival-and-tile-cap.patch (the selection's context-only rebase of the PR's 0762; SHA-256 f56bd1a2...)",
+ "mark": "Its screen_copy_drafter_smooth.py 58-layer step screen on the image, 2 boots: the single-stream initial copy step and the post-reject shrunk step faster beyond the interval at TP3; paired decode at 1 stream better and at 8 streams not worse; temperature-0 text unchanged",
+ "host": "sp8 (spark-0016, NVIDIA GB10, driver 580.178.04)",
+ "images": {
+  "base": "spark-ds41f:candidate-50 sha256:8c1ea1f62f62... + no1009/overlay (4 files, ro)",
+  "candidate-53": "the same image + 33 candidate-53 files (ro); ../common/overlay-sha.txt"
+ },
+ "evidence": [
+  "The PR's screen_copy_drafter_smooth.py from its head, unmodified (--boot boot1/boot2, -w /opt/spark-ds41f/candidate/vllm), on the candidate arm twice. It compares two hand-chosen step shapes in-process; its 'parent' policy is simulated (single_req_tile_spill_scale = 0.55, dead_rows_tau = 0.0). On the base arm it stops at its first assert (copy_apply admits no 2-token copy there): script-base-boot1.txt, recorded once.",
+  "Policy-driven image A/B (harness ab971.py, ABBA, same session, -e SPARK_DS41F_DSPARK_DEAD_ROWS_TAU=0.2 as config/cluster.json sets it for every shape): each image's own copy_apply kernel and AdaptiveVerificationManager (built as the PR's make_manager builds it) decide the c1 initial copy step (0.95 prior, row_cost 0.035) and the post-reject shrunk step (5 live drafts, -1 tail at confidence 0) through the image's dead_row_args and combine_sampled_and_draft_tokens, at two dead-row taus: 'recipe' (the module's _DEAD_ROWS_TAU = 0.2) and 'pr' (0.0, the PR's make_manager). The PR's 58-layer step workload (one routed MoE layer + one dense GEMM per graph replay, x58) then times each image's chosen shape; 50 warm-up replays (>100 ms) and 40 timed, warm and 128 MiB wash, TP3 and TP4. All four shapes are timed on both images, which gives an A/A floor (identical kernels).",
+  "The PR's tests on the candidate arm, twice, -v --noconftest."
+ ],
+ "measured": {
+  "pr_script_candidate_image": "Reproduces the PR in-process: TP3 initial step 158.0/152.9 -> 151.3/146.4 ms (warm, boot1/boot2), shrunk step 156.4/157.4 -> 62.5/61.0 ms; TP4 initial 118.5/118.4 -> 112.6/111.7, shrunk 116.1/119.4 -> 44.5/44.8. Gates: candidate admits 2/3/4/8-token copies, c1 16 tokens (16-row graph), shrunk step 6 unmasked rows, dead cut 5.",
+  "policy": {
+   "copy_apply_gate_offered_2_3_4_8": {
+    "base": [
+     false,
+     false,
+     true,
+     true
+    ],
+    "candidate": [
+     true,
+     true,
+     true,
+     true
+    ]
+   },
+   "c1_initial_step_0.95": {
+    "base": "17 tokens (16 drafts) -> 24-row graph",
+    "candidate": "16 tokens (15 drafts) -> 16-row graph"
+   },
+   "c1_0.97": "17 tokens on both images",
+   "c2_0.95": "34 tokens on both images",
+   "shrunk_step_tau_recipe_0.2": {
+    "base": "dead_row_args active (log_tau = log 0.2), cut 5, 6 unmasked rows in a 24-row graph",
+    "candidate": "the same cut, 6 unmasked rows in a 16-row graph"
+   },
+   "shrunk_step_tau_0": {
+    "base": "dead_row_args None, 17 unmasked rows in a 24-row graph",
+    "candidate": "log_tau -1e30, cut 5, 6 unmasked rows in a 16-row graph"
+   }
+  },
+  "cells_58layer_step_ms": {
+   "tau_recipe/TP3/warm/initial_step": {
+    "base_shape_graph_x_live": [
+     24,
+     17
+    ],
+    "candidate_shape_graph_x_live": [
+     16,
+     16
+    ],
+    "base_ms": [
+     155.598,
+     157.53
+    ],
+    "candidate_ms": [
+     148.959,
+     148.174
+    ],
+    "delta_pct": -5.11,
+    "welch95_ms": [
+     -8.571,
+     -7.424
+    ],
+    "verdict": "better"
+   },
+   "tau_recipe/TP3/warm/shrunk_step": {
+    "base_shape_graph_x_live": [
+     24,
+     6
+    ],
+    "candidate_shape_graph_x_live": [
+     16,
+     6
+    ],
+    "base_ms": [
+     63.13,
+     61.577
+    ],
+    "candidate_ms": [
+     61.263,
+     62.263
+    ],
+    "delta_pct": -0.95,
+    "welch95_ms": [
+     -1.187,
+     0.007
+    ],
+    "verdict": "same"
+   },
+   "tau_recipe/TP3/128MiB_wash/initial_step": {
+    "base_shape_graph_x_live": [
+     24,
+     17
+    ],
+    "candidate_shape_graph_x_live": [
+     16,
+     16
+    ],
+    "base_ms": [
+     159.81,
+     161.294
+    ],
+    "candidate_ms": [
+     151.741,
+     152.385
+    ],
+    "delta_pct": -5.29,
+    "welch95_ms": [
+     -8.716,
+     -8.262
+    ],
+    "verdict": "better"
+   },
+   "tau_recipe/TP3/128MiB_wash/shrunk_step": {
+    "base_shape_graph_x_live": [
+     24,
+     6
+    ],
+    "candidate_shape_graph_x_live": [
+     16,
+     6
+    ],
+    "base_ms": [
+     64.914,
+     65.949
+    ],
+    "candidate_ms": [
+     64.942,
+     65.53
+    ],
+    "delta_pct": -0.3,
+    "welch95_ms": [
+     -0.394,
+     0.003
+    ],
+    "verdict": "same"
+   },
+   "tau_recipe/TP4/warm/initial_step": {
+    "base_shape_graph_x_live": [
+     24,
+     17
+    ],
+    "candidate_shape_graph_x_live": [
+     16,
+     16
+    ],
+    "base_ms": [
+     120.802,
+     118.74
+    ],
+    "candidate_ms": [
+     113.737,
+     115.817
+    ],
+    "delta_pct": -4.17,
+    "welch95_ms": [
+     -6.091,
+     -3.898
+    ],
+    "verdict": "better"
+   },
+   "tau_recipe/TP4/warm/shrunk_step": {
+    "base_shape_graph_x_live": [
+     24,
+     6
+    ],
+    "candidate_shape_graph_x_live": [
+     16,
+     6
+    ],
+    "base_ms": [
+     47.254,
+     47.271
+    ],
+    "candidate_ms": [
+     46.18,
+     47.241
+    ],
+    "delta_pct": -1.17,
+    "welch95_ms": [
+     -1.347,
+     0.244
+    ],
+    "verdict": "same"
+   },
+   "tau_recipe/TP4/128MiB_wash/initial_step": {
+    "base_shape_graph_x_live": [
+     24,
+     17
+    ],
+    "candidate_shape_graph_x_live": [
+     16,
+     16
+    ],
+    "base_ms": [
+     121.641,
+     122.593
+    ],
+    "candidate_ms": [
+     115.093,
+     115.61
+    ],
+    "delta_pct": -5.54,
+    "welch95_ms": [
+     -6.97,
+     -6.562
+    ],
+    "verdict": "better"
+   },
+   "tau_recipe/TP4/128MiB_wash/shrunk_step": {
+    "base_shape_graph_x_live": [
+     24,
+     6
+    ],
+    "candidate_shape_graph_x_live": [
+     16,
+     6
+    ],
+    "base_ms": [
+     49.884,
+     53.854
+    ],
+    "candidate_ms": [
+     49.737,
+     49.483
+    ],
+    "delta_pct": -4.36,
+    "welch95_ms": [
+     -3.044,
+     -1.473
+    ],
+    "verdict": "same"
+   },
+   "tau_pr/TP3/warm/initial_step": {
+    "base_shape_graph_x_live": [
+     24,
+     17
+    ],
+    "candidate_shape_graph_x_live": [
+     16,
+     16
+    ],
+    "base_ms": [
+     155.598,
+     157.53
+    ],
+    "candidate_ms": [
+     148.959,
+     148.174
+    ],
+    "delta_pct": -5.11,
+    "welch95_ms": [
+     -8.571,
+     -7.424
+    ],
+    "verdict": "better"
+   },
+   "tau_pr/TP3/warm/shrunk_step": {
+    "base_shape_graph_x_live": [
+     24,
+     17
+    ],
+    "candidate_shape_graph_x_live": [
+     16,
+     6
+    ],
+    "base_ms": [
+     155.598,
+     157.53
+    ],
+    "candidate_ms": [
+     61.263,
+     62.263
+    ],
+    "delta_pct": -60.55,
+    "welch95_ms": [
+     -95.251,
+     -94.351
+    ],
+    "verdict": "better"
+   },
+   "tau_pr/TP3/128MiB_wash/initial_step": {
+    "base_shape_graph_x_live": [
+     24,
+     17
+    ],
+    "candidate_shape_graph_x_live": [
+     16,
+     16
+    ],
+    "base_ms": [
+     159.81,
+     161.294
+    ],
+    "candidate_ms": [
+     151.741,
+     152.385
+    ],
+    "delta_pct": -5.29,
+    "welch95_ms": [
+     -8.716,
+     -8.262
+    ],
+    "verdict": "better"
+   },
+   "tau_pr/TP3/128MiB_wash/shrunk_step": {
+    "base_shape_graph_x_live": [
+     24,
+     17
+    ],
+    "candidate_shape_graph_x_live": [
+     16,
+     6
+    ],
+    "base_ms": [
+     159.81,
+     161.294
+    ],
+    "candidate_ms": [
+     64.942,
+     65.53
+    ],
+    "delta_pct": -59.37,
+    "welch95_ms": [
+     -95.544,
+     -95.088
+    ],
+    "verdict": "better"
+   },
+   "tau_pr/TP4/warm/initial_step": {
+    "base_shape_graph_x_live": [
+     24,
+     17
+    ],
+    "candidate_shape_graph_x_live": [
+     16,
+     16
+    ],
+    "base_ms": [
+     120.802,
+     118.74
+    ],
+    "candidate_ms": [
+     113.737,
+     115.817
+    ],
+    "delta_pct": -4.17,
+    "welch95_ms": [
+     -6.091,
+     -3.898
+    ],
+    "verdict": "better"
+   },
+   "tau_pr/TP4/warm/shrunk_step": {
+    "base_shape_graph_x_live": [
+     24,
+     17
+    ],
+    "candidate_shape_graph_x_live": [
+     16,
+     6
+    ],
+    "base_ms": [
+     120.802,
+     118.74
+    ],
+    "candidate_ms": [
+     46.18,
+     47.241
+    ],
+    "delta_pct": -61.0,
+    "welch95_ms": [
+     -73.925,
+     -72.196
+    ],
+    "verdict": "better"
+   },
+   "tau_pr/TP4/128MiB_wash/initial_step": {
+    "base_shape_graph_x_live": [
+     24,
+     17
+    ],
+    "candidate_shape_graph_x_live": [
+     16,
+     16
+    ],
+    "base_ms": [
+     121.641,
+     122.593
+    ],
+    "candidate_ms": [
+     115.093,
+     115.61
+    ],
+    "delta_pct": -5.54,
+    "welch95_ms": [
+     -6.97,
+     -6.562
+    ],
+    "verdict": "better"
+   },
+   "tau_pr/TP4/128MiB_wash/shrunk_step": {
+    "base_shape_graph_x_live": [
+     24,
+     17
+    ],
+    "candidate_shape_graph_x_live": [
+     16,
+     6
+    ],
+    "base_ms": [
+     121.641,
+     122.593
+    ],
+    "candidate_ms": [
+     49.737,
+     49.483
+    ],
+    "delta_pct": -59.38,
+    "welch95_ms": [
+     -72.651,
+     -72.363
+    ],
+    "verdict": "better"
+   }
+  },
+  "aa_floor_identical_kernels_across_images": {
+   "TP3/warm/24x17": {
+    "base_ms": [
+     155.598,
+     157.53
+    ],
+    "candidate_ms": [
+     157.619,
+     156.763
+    ],
+    "delta_pct": 0.4,
+    "verdict": "same"
+   },
+   "TP3/warm/16x16": {
+    "base_ms": [
+     147.37,
+     147.626
+    ],
+    "candidate_ms": [
+     148.959,
+     148.174
+    ],
+    "delta_pct": 0.72,
+    "verdict": "worse"
+   },
+   "TP3/warm/24x6": {
+    "base_ms": [
+     63.13,
+     61.577
+    ],
+    "candidate_ms": [
+     61.999,
+     63.067
+    ],
+    "delta_pct": 0.29,
+    "verdict": "same"
+   },
+   "TP3/warm/16x6": {
+    "base_ms": [
+     61.299,
+     61.09
+    ],
+    "candidate_ms": [
+     61.263,
+     62.263
+    ],
+    "delta_pct": 0.93,
+    "verdict": "same"
+   },
+   "TP3/128MiB_wash/24x17": {
+    "base_ms": [
+     159.81,
+     161.294
+    ],
+    "candidate_ms": [
+     160.754,
+     161.055
+    ],
+    "delta_pct": 0.22,
+    "verdict": "same"
+   },
+   "TP3/128MiB_wash/16x16": {
+    "base_ms": [
+     151.255,
+     153.031
+    ],
+    "candidate_ms": [
+     151.741,
+     152.385
+    ],
+    "delta_pct": -0.05,
+    "verdict": "same"
+   },
+   "TP3/128MiB_wash/24x6": {
+    "base_ms": [
+     64.914,
+     65.949
+    ],
+    "candidate_ms": [
+     65.093,
+     65.447
+    ],
+    "delta_pct": -0.25,
+    "verdict": "same"
+   },
+   "TP3/128MiB_wash/16x6": {
+    "base_ms": [
+     64.575,
+     64.956
+    ],
+    "candidate_ms": [
+     64.942,
+     65.53
+    ],
+    "delta_pct": 0.73,
+    "verdict": "same"
+   },
+   "TP4/warm/24x17": {
+    "base_ms": [
+     120.802,
+     118.74
+    ],
+    "candidate_ms": [
+     122.08,
+     119.786
+    ],
+    "delta_pct": 0.97,
+    "verdict": "same"
+   },
+   "TP4/warm/16x16": {
+    "base_ms": [
+     113.33,
+     111.959
+    ],
+    "candidate_ms": [
+     113.737,
+     115.817
+    ],
+    "delta_pct": 1.89,
+    "verdict": "worse"
+   },
+   "TP4/warm/24x6": {
+    "base_ms": [
+     47.254,
+     47.271
+    ],
+    "candidate_ms": [
+     46.984,
+     51.743
+    ],
+    "delta_pct": 4.45,
+    "verdict": "same"
+   },
+   "TP4/warm/16x6": {
+    "base_ms": [
+     45.817,
+     45.939
+    ],
+    "candidate_ms": [
+     46.18,
+     47.241
+    ],
+    "delta_pct": 1.81,
+    "verdict": "same"
+   },
+   "TP4/128MiB_wash/24x17": {
+    "base_ms": [
+     121.641,
+     122.593
+    ],
+    "candidate_ms": [
+     121.709,
+     121.601
+    ],
+    "delta_pct": -0.38,
+    "verdict": "same"
+   },
+   "TP4/128MiB_wash/16x16": {
+    "base_ms": [
+     115.218,
+     115.718
+    ],
+    "candidate_ms": [
+     115.093,
+     115.61
+    ],
+    "delta_pct": -0.1,
+    "verdict": "same"
+   },
+   "TP4/128MiB_wash/24x6": {
+    "base_ms": [
+     49.884,
+     53.854
+    ],
+    "candidate_ms": [
+     50.191,
+     49.957
+    ],
+    "delta_pct": -3.46,
+    "verdict": "same"
+   },
+   "TP4/128MiB_wash/16x6": {
+    "base_ms": [
+     49.373,
+     49.626
+    ],
+    "candidate_ms": [
+     49.737,
+     49.483
+    ],
+    "delta_pct": 0.22,
+    "verdict": "same"
+   }
+  },
+  "pytest_candidate": {
+   "boot1": "114 passed, 1 skipped in 62.30s",
+   "boot2": "114 passed, 1 skipped in 31.25s",
+   "note": "PR receipt 108 passed, 1 skipped; the candidate's files carry other patches' tests"
+  }
+ },
+ "parts": [
+  {
+   "part": "single-stream initial copy step faster beyond the interval at TP3",
+   "verdict": "pass",
+   "detail": "serving tau (0.2): TP3 -5.1% warm (155.6/157.5 -> 149.0/148.2 ms), -5.3% wash; TP4 -4.2%/-5.5%; all beyond the interval. The tile cap moves the step from the 24-row to the 16-row graph."
+  },
+  {
+   "part": "post-reject shrunk step faster beyond the interval at TP3",
+   "verdict": "miss",
+   "detail": "On the serving path (SPARK_DS41F_DSPARK_DEAD_ROWS_TAU=0.2, set for every shape in config/cluster.json) the base already marks the -1 tail as dead rows (6 unmasked rows): TP3 -0.95% warm, -0.3% wash, same within the interval (TP4 -1.2%/-4.4%, same). The PR's -60% exists only at tau 0 (reproduced: -60.6%/-59.4% at TP3), which the recipe does not run; its README calls tau 0 'the promoted default'. The patch's dead-row change (log_tau -1e30 when tau <= 0, dead_rows declared for the copy drafter) is inert at the recipe's tau."
+  },
+  {
+   "part": "no slower cells",
+   "verdict": "pass",
+   "detail": "no cell of the policy-driven A/B is worse. The A/A floor (identical kernels timed on both images) is a median |change| of 0.5% (range 0.05-4.5%, the largest from boot outliers); two A/A cells flag 'worse' under the cell rule, at +0.7% and +1.9%, which is noise of identical code"
+  },
+  {
+   "part": "paired decode at 1 stream better, at 8 streams not worse; temperature-0 text unchanged",
+   "verdict": "cannot-evaluate-on-sp8",
+   "detail": "multi-node: the coordinator's tp3-switched screen with its single-stream and sampled companions, and the determinism gate"
+  }
+ ],
+ "verdict": "miss",
+ "verdict_scope": "sp8-evaluable parts; paired decode and temperature-0 text are the tp3-switched screen's and gate's",
+ "reason": "The mark declares two faster cells at TP3. The tile cap gives the first on the serving path (-5.1%/-5.3% on the c1 initial copy step, beyond the interval). The second, the post-reject shrunk step's -60%, does not occur on the path serving takes: the recipe's dead-row tau of 0.2 already masks the trailing -1 rows in the base, so the shrunk step is the same within the interval (-0.3% to -0.95% at TP3); the PR measured it at tau 0. No cell is slower.",
+ "rework_hint": "Re-declare the mark on the tile cap and the copy_apply survival gate (the parts that act at tau 0.2), or drop the inert tau-0 dead-row change; the 1-stream paired decode row decides the tile cap's serving value.",
+ "notes": [
+  "copy_apply's survival yield is confirmed on the image: 2- and 3-token copies are now admitted against DSpark's [0.70..0.50] confidences (base: not admitted). Its effect on decode is a drafting change the screen's single-stream and sampled companions measure.",
+  "Same-shape A/A: the four step shapes timed on both images with identical kernels differ by -3.5% to +4.5% (TP4 24x6 warm has a 4.8 ms outlier boot on c53 boot2, TP4 24x6 wash one on base boot2)."
+ ]
+}

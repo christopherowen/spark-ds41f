@@ -1,0 +1,58 @@
+# candidate-53 own marks: shared setup. Host sp8 (spark-0016, NVIDIA GB10, driver 580.178.04).
+# Work dir B = /home/chris/spark-lab/agents/candidate-53-own-marks on sp8. No build, push, commit, cluster or
+# window operation; no other host's GPU. Every GPU command ran through run.sh, which takes
+# /tmp/spark-lab-gpu.lock and, inside the lock, records loadavg, docker ps and ~/spark-hold.json and refuses
+# (exit 3, retried by q.sh) when the hold file exists or any container is running. sp8 was shared with the
+# candidate-51 and candidate-52 own-mark agents (their c51om-*/c52om-* containers ran between our jobs, never
+# during one: docker_ps_before is "none" in every block of every commands.txt).
+#
+# Pre-checks 2026-11-09T17:05Z..17:27Z: ~/spark-hold.json absent; docker ps empty when our first job took the
+# lock. The image arrived on sp8 at about 17:24Z (a docker load was running at 17:06Z).
+#
+# 1. Image (both arms): spark-ds41f:candidate-50 = sha256:8c1ea1f62f62c3e2adc03b645c091a5499cf7163101aca32875c894b96f155db
+#    (labels: vllm.tree d5778ab56647a20d94710ecb94cfd9a4de27bee9, vllm.patch-head ba7400d9b671). setup.sh hashed
+#    every one of the 7,831 tracked files of d5778ab5 inside the image (git blob SHA-1): all equal.
+# 2. Candidate-53 tree: git clone --shared of ~/spark-lab/agents/round-51-53-select/base-vllm at round-51-53-base
+#    (0bffb886, tree 14c5a2dc = candidate-50 without 0778), then git am of candidate-53/vllm/0781..0785 copied
+#    from origin/main 83e594528e (SHA-256 prefixes 95387b8e f56bd1a2 6ebb4590 b82e1eec cbb39349, equal to
+#    receipts/selection.json). Result: tree c0e25ff14f7cbf760973002447e50ba507b987f9 = the lock's expected_tree;
+#    git diff --check clean.
+# 3. PR heads (git fetch origin pull/<N>/head), equal to the candidate-53 README table:
+#    #960 6cfd0bd33413 #971 9ef22e1fcdf4 #977 4e0244deb7d5 #984 737aec88ed62 #998 e89ab5f9a31b (pr-heads.txt).
+#    The candidate patches equal the PR heads' patches for #960, #977, #984, #998; #971's 0782 is the selection's
+#    context-only rebase. The bench scripts ran from the PR heads' experiment folders (git archive).
+# 4. Arms (run.sh):
+#    base = the image + candidate-50's 4 no1009/overlay files mounted read-only at their tree paths, as
+#           candidate-50/tp3-switched-no1009.json mounts them (no1009-files.txt).
+#    c53  = the image + the 33 files that differ between d5778ab5 and c0e25ff1 mounted read-only
+#           (changed-files.txt: the 4 no1009 source files, 0778's 2 test files at their base versions, and every
+#           file 0781..0785 change). overlay-sha.txt gives each file's SHA-256 prefix in the image, the base
+#           without 0778, and candidate-53. verify-*.txt: the SHA-256s a container sees equal those; in a GPU
+#           container (setup-runs/import-*.txt) every changed module imports from its mounted path, and the
+#           candidate-only APIs exist only on c53 (CEDState.stage_floors, display_carveout.compact,
+#           SINGLE_REQ_TILE_SPILL_SCALE, mem_utils.reclaim_uma_memory). The image ships timestamp-based .pyc
+#           for 3 changed modules; the mounted sources' mtimes invalidate them.
+#    No PR changes compiled code (all 33 files are Python; TileLang kernels are JIT-compiled from Python), so
+#    the overlay represents every PR. Each arm has its own TileLang cache (B/c/tl-<arm>).
+# 5. Order: per PR, ABBA in one session: base boot1, c53 boot1, c53 boot2, base boot2 (a boot = a fresh
+#    container). The PR's own command first (on c53 twice; on base once where it cannot run there), then
+#    our image A/B harness (harness/), then the PR's tests on c53 twice. q.sh is the queue as run.
+# 6. Warm-up: harness/warm.py runs >= 200 ms of back-to-back bf16 GEMMs (after one untimed cuBLAS-init GEMM)
+#    before an unmodified PR script, in the same process. Exception: #960 script-c53-boot1 and
+#    script-base-boot1 ran with the first warm.py, whose 200 ms window was spent in one GEMM including cuBLAS
+#    initialisation (stderr: "[warm.py] 1 GEMMs in 0.267 s"); fixed before every later run. #984's bench ran
+#    without warm.py (a CUDA context in its parent would move the MemAvailable it measures in its children).
+# 7. Stubs written in place of uncommitted ones: stub_pkgs/tblib (for #984's /tmp/stub_pkgs): tests/conftest.py
+#    imports tblib.pickling_support and calls install(); the image lacks tblib. install() does nothing, as in
+#    candidate-53 bundles/release-tests/tblib_stub.py. Collection found nothing else missing
+#    (setup-runs/collect-984-c53.txt without it: ModuleNotFoundError tblib; collect2: 236/237 collected).
+# 8. Analysis: analyze/*.py read the raw outputs; each PR's analysis.json is that script's output.
+#    Cell rule (analyze/common.py): 'better'/'worse' only when both candidate boots lie on one side of both base
+#    boots and the mean change exceeds the larger boot-to-boot change within an arm; else 'same'.
+# 9. Extra queues run beside q.sh, through the same run.sh: q-confirm977.sh (#977 <=32K cells at 201 replays)
+#    and q-flush984b.sh (#984 flush components under the recipe's allocator settings).
+# 10. #998 stopped at 19:13Z on the coordinator's instruction (its release tests fail; a rework agent owns it):
+#    q.sh 998 was killed after script-base-boot1 and while script-c53-boot1 ran (that run finished, exit 0);
+#    nothing else of #998 ran. Our last GPU job ended 19:13:50Z.
+# 11. Cleanup on sp8 ~19:20Z: vllm-c53 (143 MB clone) and the TileLang caches (root-owned, removed through a
+#    non-GPU container of the same image) deleted; about 7 MB of scripts, overlays and outputs remain in B.

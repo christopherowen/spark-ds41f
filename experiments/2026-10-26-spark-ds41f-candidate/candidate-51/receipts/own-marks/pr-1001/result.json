@@ -1,0 +1,50 @@
+{
+ "pr": 1001,
+ "pr_head": "03e2d903daf9ea197b430e24b75e64b0eda7e737",
+ "patch": "0784-Match-128-row-vocab-head-tile-pipeline-stages.patch (context-only rebase)",
+ "mark": "Its bench_vocab_2boot.py (captured CUDA graphs) on the image, 2 boots, ABBA: projection and greedy epilogue at M=97..128 (the 128-row tile) faster beyond the interval, bit-identical logits and (max, index) pairs, M<=96 not worse. TP4 only, as #987",
+ "host": "sp8 (spark-0016, NVIDIA GB10)",
+ "arms": {
+  "base": "spark-ds41f:candidate-50 sha256:8c1ea1f62f62c3e2adc03b645c091a5499cf7163101aca32875c894b96f155db + candidate-50 no1009/overlay (4 files, ro): tree 14c5a2dc; its TILE_CONFIGS[128] is s4a2 (num_stages 4, act_stages 2)",
+  "c51": "the same image + the 15 files where candidate-51's tree differs (ro): tree 987ba058 (cc1115c5); its TILE_CONFIGS[128] is s2 (num_stages 2)"
+ },
+ "evidence": "The PR's bench_vocab_2boot.py at 03e2d903 with the changes in ../common/h/bench_vocab_2boot_c51.diff, behind a >= 250 ms GPU warm-up, ABBA in one session. The changes: (1) the base's certified screen (#997) changed the layout of layer.tilelang_vocab_greedy[64] (7 screen kernels, not the 1107 (partials, finish, tiles) triple the PR unpacks), so the 64-row greedy-partials reference is compiled directly, as 1107's head declared it; (2) M 97, 107 and 120 added to the PR's list (the mark's 97..128; 107 = TP4's c16 CopyDrafter rows); (3) eager loops of the four headline cells and output hashes added. Everything else, including the in-process base_1107 (s4a2) and candidate (s2) layers it builds by setting TILE_CONFIGS[128], is unchanged. Three comparisons: in_process_c51 (on the candidate arm, s4a2 -> s2, both carrying #963's vocab.py: #1001 alone on the accumulated stack, the PR's own comparison), in_process_base (the same on the base arm, without #963), and image_ab (each arm's own config: #1001 with #963). Then the PR's tests on c51.",
+ "measured": {
+  "projection_graph_us_in_process_c51 (#1001 alone), M=97..128": {
+   "TP4 FP32": "M=97 1300.76/1290.83 -> 1275.05/1272.01 (1.017x); 104 1.020x; 107 1.044x; 112 1.040x; 120 1.065x; 128 1474.06/1468.69 -> 1354.04/1350.01 (1.088x): all faster",
+   "TP4 BF16": "1.018x, 1.035x, 1.050x, 1.052x, 1.072x, 1.101x: all faster",
+   "TP3 FP32": "1.014x, 1.023x, 1.042x, 1.051x, 1.069x, 1.108x: all faster",
+   "TP3 BF16": "1.012x, 1.031x, 1.050x, 1.064x, 1.060x, 1.089x: all faster",
+   "count": "24 of 24 cells faster beyond the interval"
+  },
+  "projection_graph_us_other": {
+   "in_process_c51 M=72, 96 (also the 128-row tile)": "3 faster (1.000-1.018x), 5 same, 0 slower",
+   "in_process_base (#1001 without #963), M=97..128": "24 of 24 faster (e.g. TP4 FP32 M=128 1770.95/1774.09 -> 1606.81/1604.25 (1.104x, faster)); M=72/96 8 of 8 faster (1.016-1.048x)",
+   "image_ab (#1001 with #963), M=97..128": "24 of 24 faster, 1.185-1.336x (TP4 FP32 M=107 1561.51/1564.08 -> 1314.76/1306.29)",
+   "M<=64 (tiles 16/32/64, identical kernels in the in-process pairs)": "in_process_c51 0 slower; in_process_base 2 slower by 0.3-0.5% (TP4 FP32 M=32 and 48), A/A noise of the interval rule on identical kernels"
+  },
+  "greedy_epilogue_graph_us (project_head_greedy_pairs, the serving greedy path)": {
+   "in_process_c51, M=97..128": "21 same, 3 faster, 0 slower: no gain, e.g. TP4 FP32 M=107 1294.35/1303.01 -> 1291.94/1318.75 (same), M=128 1483.44/1450.24 -> 1472.05/1464.48 (same)",
+   "why": "with #997's certified two-pass screen in the base, project_head_greedy_pairs runs screen_vocab_greedy_partials (SCREEN_TILE_CONFIGS) and refine_vocab_greedy_partials (block_N 32, the screen config's threads/step_groups); neither reads TILE_CONFIGS, which is all #1001 changes. The PR measured on 1107, whose greedy pairs ran packed_vocab_greedy_partials with TILE_CONFIGS. SCREEN_TILE_CONFIGS[128] is still dict(block_N=32, threads=256, step_groups=1, num_stages=4, act_stages=2), the configuration the PR diagnosed",
+   "image_ab, M=97..128": "14 same, 2 faster, 8 slower by 0.3-1.4% (TP4 FP32 M=97, 104, 107, 112, 120; TP4 BF16 M=97, 104; TP3 BF16 M=120): #963's change to the screen's refine decode (pr-963 section D shows the same at the PR's density), not #1001's",
+   "in_process_c51 at M<=96": "8 faster, 18 same, 6 slower by 0.5-1.2%, all at M<=64 where both layers run identical kernels: the A/A noise of the interval rule"
+  },
+  "proj_plus_argmax_graph (project_head + greedy_shard_pair)": "in_process_c51 M=97..128: 21 faster, 3 same; slower cells only at M<=64 (identical kernels, up to 3.7% at TP4 FP32 M=1)",
+  "pytest_c51": {
+   "first runs (pytest-c51-boot1/2)": "exit 4: tests/conftest.py imports tblib, which the image lacks; kept",
+   "with the release bundle's tblib stand-in, boot1": "108 passed, 14 warnings in 63.05s",
+   "boot2": "108 passed, 14 warnings in 45.72s",
+   "files": "test_deepseek_v41_tilelang_vocab.py (76), tests/kernels/test_deepseek_v41_tilelang_pdl.py (14), tests/v1/worker/gpu/test_greedy_verification.py (18); the PR on 1107: 105 passed (73 + 14 + 18); the base (candidate-50's patches since 1107) adds vocab tests"
+  }
+ },
+ "bit_exact": true,
+ "bit_exact_detail": "In every run and cell the bench asserts torch.equal of the logits of the 64-row tile, the s4a2 128-row head and the s2 head, and of the greedy (max, index) pairs of the 64-row greedy partials, both heads' certified screen and greedy_shard_pair on the logits: all four runs completed. The added logits and pairs hashes are equal across all four runs of both arms in every cell (FP32 and BF16, TP4 and TP3, M=1..128).",
+ "verdict": "miss",
+ "reason": "The projection half of the mark passes: on the accumulated stack the matched two-stage 128-row tile makes the packed vocabulary projection faster beyond the interval at every M=97..128 cell (24 of 24, 1.2-10.8%; 1.017-1.088x at TP4 FP32), bit-identical, with no M<=96 cell worse. The greedy-epilogue half cannot be met on this base: serving's greedy pairs go through #997's certified screen, whose kernels do not read TILE_CONFIGS, so #1001's change does not reach them (in-process 21 same, 3 faster at M=97..128). The screen's own 128-row tile, SCREEN_TILE_CONFIGS[128], still has the num_stages=4 / act_stages=2 pattern the PR diagnosed; a rework that applies the same matched-stage change there (and checks SCREEN_TILE_CONFIGS[32], also act_stages=2) would test the greedy claim on the path serving takes.",
+ "notes": [
+  "Measured on spark-ds41f:candidate-50 with candidate-51's tree mounted; the trees are verified file by file (../common/verify).",
+  "The full-logits projection (project_head) serves the logits processor (sampled requests, log-probabilities) and the DSpark Markov head's W2 projection; greedy verification uses the screen.",
+  "The image_ab projection gain (1.19-1.34x) is mostly #963 (pr-963 same-config cells); #1001's own share is the in_process_c51 comparison.",
+  "start_utc in commands.txt is after the GPU lock was taken; other agents' jobs ran between runs."
+ ]
+}
