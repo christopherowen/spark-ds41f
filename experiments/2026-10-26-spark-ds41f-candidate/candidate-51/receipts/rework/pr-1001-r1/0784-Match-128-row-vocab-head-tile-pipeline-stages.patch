@@ -1,0 +1,95 @@
+From 3b732b6f1961fe898dcc095cc6123b49c56e6482 Mon Sep 17 00:00:00 2001
+From: Christopher Owen <3221756+christopherowen@users.noreply.github.com>
+Date: Sun, 8 Nov 2026 19:35:24 +0000
+Subject: [PATCH] Match 128-row vocab head tile pipeline stages
+
+Base: 1107 vLLM patch head 2756478b60b90700b9918b457aeb38657da637b5.
+
+Rationale:
+In vllm/models/deepseek_v4_1/tilelang/vocab.py, TILE_CONFIGS[128] used num_stages=4 with act_stages=2 so four 32x128 weight stages and two 128x128 activation stages fit under the 99 KiB GB10 shared-memory ceiling (98,304 B). However, offsetting activation staging (stage 2) from weight cp.async staging (stage 0) inside T.Pipelined(..., stage=[2, 0, 0, 3, 3]) causes TileLang to emit three unrolled pipeline drain blocks with three simultaneously live bfloat16_t A_local[32] register arrays across cp.async_wait<3/2/1/0> barriers. That inflated register pressure on SM121 from 86 registers (block_M=64) to 195 registers in packed_vocab_projection and 197 registers in packed_vocab_greedy_partials (50,432 registers/CTA at 256 threads), making the 128-row tile at M=128 slower than launching two waves of the 64-row tile on both TP4 (N=32320) and TP3 (N=43136).
+
+Setting TILE_CONFIGS[128] to num_stages=2 (matching activation and weight pipeline depth at stage=[0, 0, 0, 1, 1]) reduces dynamic shared memory from 98,304 B to 86,016 B (78,336 B for NVFP4), eliminates two unrolled drain stages, and cuts register allocation from 195 to 97 registers in packed_vocab_projection and from 197 to 100 registers in packed_vocab_greedy_partials with zero spills. Across M=72..128 in captured CUDA graphs on GB10, this speeds up packed_vocab_projection and packed_vocab_greedy_partials by up to 10.2% (-195.8 us at M=128) on TP4 and up to 11.5% (-280.4 us at M=128) on TP3.
+
+Round 1 (candidate-51):
+On candidate-51's base the greedy pairs that serving verifies go through #997's certified two-pass screen: project_head_greedy_pairs runs screen_vocab_greedy_partials with SCREEN_TILE_CONFIGS and then the refine kernel, and neither reads TILE_CONFIGS, so the first version left the greedy epilogue unchanged (own mark: 21 same, 3 faster at M=97..128). SCREEN_TILE_CONFIGS[128] had the same pattern, num_stages=4 with act_stages=2 (T.Pipelined(..., stage=[2, 0, 3, 3]): two 128x128 activation stages offset from four 32x128 8-bit weight stages). It now uses num_stages=2 as well (stage=[0, 0, 1, 1]: two weight stages fewer, the same two activation stages), and vocab_screen_greedy_partials at the 128-row tile drops from 193 to 78 registers (cuobjdump, sm_121a). On sp8 (GB10), on candidate-51's corrected tree, project_head_greedy_pairs at M=72..128 is 3.3-16.7% faster by CUDA-graph replay in all 32 cells (TP4 and TP3 shards, FP32 and BF16 heads; 9.7-16.0% at M=97..128 on the FP32 heads serving runs), measured slot-balanced in one process on two boots, and gives bit for bit the same pairs. SCREEN_TILE_CONFIGS[32] (num_stages=4, act_stages=2) was checked too and stays: in one in-process run num_stages=2 read 1.3-2.5% faster at TP4 FP32 but 1.0% slower at TP3 FP32 M=24, and num_stages=3 5.6-7.4% slower at TP3 FP32.
+
+Quality:
+Bit-identical (torch.equal) FP32 and BF16 logits and greedy (max, index) pairs across all M=1..128 on TP4 and TP3 shards; identical K accumulation order and tile reduction tree.
+Round 1: the screen's pipeline depth changes when its loads are issued, not its arithmetic: the certified-screen pairs equal the base's, greedy_shard_pair's on the logits and the 64-row tile's at every M=1..128, TP4 and TP3, FP32 and BF16 heads, in every run of both arms.
+
+Tests:
+- pytest tests/kernels/quantization/test_deepseek_v41_tilelang_vocab.py tests/kernels/test_deepseek_v41_tilelang_pdl.py tests/v1/worker/gpu/test_greedy_verification.py (105 passed across 2 boots).
+- Round 1: test_screen_tile_config_128_uses_matched_two_stage_pipeline. The same three files on candidate-51's corrected tree: 109 passed on each of two container runs.
+
+Upstream status: local TileLang SM121 vocabulary head pipeline tuning.
+---
+ .../test_deepseek_v41_tilelang_vocab.py       | 34 +++++++++++++++++++
+ vllm/models/deepseek_v4_1/tilelang/vocab.py   |  4 +--
+ 2 files changed, 36 insertions(+), 2 deletions(-)
+
+diff --git a/tests/kernels/quantization/test_deepseek_v41_tilelang_vocab.py b/tests/kernels/quantization/test_deepseek_v41_tilelang_vocab.py
+index 7643ae371..0ee26baba 100644
+--- a/tests/kernels/quantization/test_deepseek_v41_tilelang_vocab.py
++++ b/tests/kernels/quantization/test_deepseek_v41_tilelang_vocab.py
+@@ -721,3 +721,37 @@ def test_packed_bf16_lm_head_carveout_shares_single_buffer_with_screen_wq(monkey
+         expected = vocab_parallel_pairs(logits, n, 0, tp_size=1)
+         actual = project_head_greedy_pairs(layer, x, vocab=n, vocab_start=0)
+         assert torch.equal(actual[:, :2], expected[:, :2])
++
++
++def test_tile_config_128_uses_matched_two_stage_pipeline():
++    cfg = tile_config(128, 5120)
++    assert cfg == dict(block_N=32, threads=256, step_groups=1, num_stages=2)
++    assert "act_stages" not in cfg
++    assert (
++        packed_format.shared_memory_bytes(
++            128,
++            cfg["block_N"],
++            cfg["num_stages"],
++            cfg["step_groups"],
++            act_stages=cfg.get("act_stages"),
++        )
++        == 86_016
++    )
++    assert (
++        packed_format.nvfp4_shared_memory_bytes(
++            128,
++            cfg["block_N"],
++            cfg["num_stages"],
++            cfg["step_groups"],
++            act_stages=cfg.get("act_stages"),
++        )
++        == 78_336
++    )
++
++
++def test_screen_tile_config_128_uses_matched_two_stage_pipeline():
++    """The certified screen's 128-row tile stages its activations and 8-bit weights
++    together (no ``act_stages`` offset), as the projection's 128-row tile does."""
++    cfg = packed_format.screen_tile_config(128, 5120)
++    assert cfg == dict(block_N=32, threads=256, step_groups=1, num_stages=2)
++    assert "act_stages" not in cfg
+diff --git a/vllm/models/deepseek_v4_1/tilelang/vocab.py b/vllm/models/deepseek_v4_1/tilelang/vocab.py
+index e8b01a4e7..9814aa19f 100644
+--- a/vllm/models/deepseek_v4_1/tilelang/vocab.py
++++ b/vllm/models/deepseek_v4_1/tilelang/vocab.py
+@@ -458,14 +458,14 @@ TILE_CONFIGS = {
+     16: dict(block_N=32, threads=128, step_groups=2, num_stages=4),
+     32: dict(block_N=16, threads=128, step_groups=2, num_stages=4),
+     64: dict(block_N=32, threads=256, step_groups=1, num_stages=4),
+-    128: dict(block_N=32, threads=256, step_groups=1, num_stages=4, act_stages=2),
++    128: dict(block_N=32, threads=256, step_groups=1, num_stages=2),
+ }
+ 
+ SCREEN_TILE_CONFIGS = {
+     16: dict(block_N=32, threads=128, step_groups=2, num_stages=4),
+     32: dict(block_N=32, threads=128, step_groups=2, num_stages=4, act_stages=2),
+     64: dict(block_N=32, threads=256, step_groups=1, num_stages=4),
+-    128: dict(block_N=32, threads=256, step_groups=1, num_stages=4, act_stages=2),
++    128: dict(block_N=32, threads=256, step_groups=1, num_stages=2),
+ }
+ 
+ 
+-- 
+2.43.0
+

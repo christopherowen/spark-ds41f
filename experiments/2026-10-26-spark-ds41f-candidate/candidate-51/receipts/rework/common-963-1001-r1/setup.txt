@@ -1,0 +1,62 @@
+# candidate-51 round-1 rework of #963 and #1001: shared setup on sp8 (spark-0016, NVIDIA GB10),
+# 2026-11-09. Work dir W = ~/spark-lab/agents/candidate-51-rework-963-1001. No build, push,
+# commit to any shared repository, PR, image build, cluster or window operation; no dgx.
+# Every GPU command ran under flock /tmp/spark-lab-gpu.lock through bin/rw.sh (the own-mark
+# run's om.sh with this work dir and the c51r1 arm), which records loadavg, docker ps and
+# ~/spark-hold.json inside the lock and refuses to run when the hold file exists or a
+# "vllm serve" container runs. ~/spark-hold.json was absent and no serving container ran at
+# every run (each run's block in the commands.txt files). Other agents' jobs (c53 rework)
+# interleaved through the lock.
+#
+# 1. Deployment checkout (patch series) and PR heads, as the own-mark run:
+git clone -q --reference ~/projects/spark-ds41f https://github.com/christopherowen/spark-ds41f.git $W/repo
+git -C $W/repo checkout -q --detach 83e594528e68737650e8d542145906e664dcbe38   # origin/main, candidate-51 merged
+for n in 963 1001; do git -C $W/repo fetch -q origin pull/$n/head:pr-$n; done
+#   963 e5db47f172cfef9bbe77d4af8b061f6fc683969a  1001 03e2d903daf9ea197b430e24b75e64b0eda7e737
+#
+# 2. candidate-51's vLLM tree from its series with the own-mark run's stack.sh (sha256 6bbb757b...):
+git clone -q --shared --no-checkout ~/spark-lab/agents/round-51-53-select/base-vllm $W/stack-vllm
+bash $W/tools/stack.sh $W $W/repo/experiments/2026-10-26-spark-ds41f-candidate 51 $W/logs/stack-51.log
+#   -> base-c50-no1009 0bc043e85 (tree 14c5a2dc), 0781 48c7ed80f, 0782 f3305e631, 0783 1287a2cf8,
+#      0784 cc1115c55efe (tree 987ba0589960 = candidate-51's expected_tree); git diff --check clean.
+#
+# 3. The rework, on branch rw-963-r1 from 48c7ed80f (0781):
+#    cherry-pick f3305e631 (0782), edit gemm.py, vocab.py, deepseek_v41_pdl_sources.py and
+#    test_deepseek_v41_tilelang_linear.py, amend (author and author date kept);
+#    cherry-pick 1287a2cf8 (0783, unchanged: applies cleanly);
+#    cherry-pick cc1115c55 (0784), edit vocab.py SCREEN_TILE_CONFIGS[128] and
+#    test_deepseek_v41_tilelang_vocab.py, amend.
+#    Corrected head: tree 35cd2a0e87a6b7a0c61c6c81dbe875ac1e7da005 (see patch-apply check below).
+#
+# 4. Image: spark-ds41f:candidate-50 = sha256:8c1ea1f62f62c3e2adc03b645c091a5499cf7163101aca32875c894b96f155db,
+#    whose /opt/spark-ds41f/candidate/vllm is candidate-50's prepared tree ba7400d9 (tree d5778ab5)
+#    (the own-mark run verified all 7,831 tracked files).
+#
+# 5. Arms (bin/rw.sh):
+#    base  = the image + candidate-50/no1009/overlay's 4 files ro (files-base.txt), the own-mark
+#            run's base arm: tree 14c5a2dc except the two no1009 test files tp4-no1009.json does
+#            not mount (verify-tree-base.txt: 7,829 match, 2 differ, as in the own-mark run);
+#    c51r1 = the image + the 15 files in which the corrected tree differs from the image's tree,
+#            ro (files-c51r1.txt, written with git show <corrected head>:<path>; the same 15 paths
+#            as the own-mark run's c51 arm): the container sees the corrected tree exactly
+#            (verify-tree-c51r1.txt: 7,831 match, 0 differ); verify-overlay-c51r1.txt shows the
+#            markers each change imports (base decode, base filter_exc, _PACKED_WIDE_TILES 32,
+#            SCREEN_TILE_CONFIGS[128] num_stages 2, [32] unchanged).
+#    c51   = the own-mark run's candidate-51 arm (tree 987ba058), used only for the in-process
+#            diagnosis (d963.py), whose variants load from /h/var.
+#    Each arm has its own TileLang cache (W/c/tl-<arm>), env TILELANG_CACHE_DIR=/root/.tilelang/cache,
+#    HF_HUB_OFFLINE=1, PYTHONPATH=/opt/spark-ds41f/candidate/vllm, workdir /opt/spark-ds41f/candidate/vllm.
+#
+# 6. Method: ABBA in one session per PR: base boot1, c51r1 boot1, c51r1 boot2, base boot2 (a boot
+#    is a fresh container). Every timed script starts with >= 250 ms of GPU warm-up (omlib.gpu_warmup:
+#    BF16 4096^3 matmuls). Interval rule (as the own marks): a cell is faster when the slower
+#    candidate boot beats the faster base boot, slower when the faster candidate boot is slower
+#    than the slower base boot, else same. Judged by CUDA-graph replay; CUPTI kernel time
+#    (back to back and isolated) and the eager loop recorded beside it.
+#    In-process diagnosis (h/d963.py, h/var built by h/mkvar.py from the base and #963 files):
+#    variants compiled from their own module copies (the TileLang cache key includes the imported
+#    header source, so variants never share a kernel), timed v1..vn, vn..v1 in one process.
+#
+# 7. pytest: with the release bundle's tblib stand-in (-p tblib_stub, PYTHONPATH .../vllm:/h), as
+#    the own-mark run; #963's files also with -p tests.kernels.deepseek_v41_pdl_sources (the PR's
+#    README reports that plugin's check).

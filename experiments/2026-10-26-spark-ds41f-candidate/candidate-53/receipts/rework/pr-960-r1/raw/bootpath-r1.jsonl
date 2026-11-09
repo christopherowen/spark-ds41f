@@ -1,0 +1,15 @@
+{"label": "r1", "kind": "identity", "gpu": "NVIDIA GB10", "torch": "2.13.0+cu130", "model_runner": "/opt/spark-ds41f/candidate/vllm/vllm/v1/worker/gpu/model_runner.py", "kv_connector": "/opt/spark-ds41f/candidate/vllm/vllm/v1/worker/gpu/kv_connector.py"}
+{"label": "r1", "kind": "check", "check": "serving connector is NO_OP_KV_CONNECTOR (no KV transfer group)", "ok": true, "type": "KVConnector"}
+{"label": "r1", "kind": "api", "KVConnector_has_connector": false, "ActiveKVConnector_has_connector": false, "DSparkSpeculator_uses_target_attn_metadata": false}
+{"label": "r1", "kind": "check", "check": "can_capture_full_attn_metadata(DeepseekV41ModelState, 23 B12x groups)", "ok": true}
+{"label": "r1", "kind": "step", "case": "no-kv-connector", "connector": "KVConnector", "connector_is_no_op": true, "outcome": "stopped-before-model-inputs", "error": null, "events": ["prepare_inputs(batch staged=True)"], "ced_plan_is_none": true, "staged_floors": [0, 64, 0]}
+{"label": "r1", "kind": "check", "check": "no connector: execute_model passes the condition (no exception)", "ok": true, "error": null}
+{"label": "r1", "kind": "check", "check": "no connector: fast path (stage_full_cudagraph_attn, no eager metadata)", "ok": true}
+{"label": "r1", "kind": "check", "check": "no connector: prepare_inputs sees the batch staged (no eager restage)", "ok": true}
+{"label": "r1", "kind": "check", "check": "no connector: CED floors staged = replay_rows floors", "ok": true, "floors": [0, 64, 0]}
+{"label": "r1", "kind": "check", "check": "no connector: in-graph CED refresh == eager CEDState.stage", "ok": true, "equal": {"replay_start": true, "request_positions": true, "floors": true, "starts": true}, "replay_start": [0, 64, 0], "request_positions": [64, 71, 78]}
+{"label": "r1", "kind": "check", "check": "factory with a transfer group returns ActiveKVConnector", "ok": true}
+{"label": "r1", "kind": "step", "case": "active-kv-connector", "connector": "ActiveKVConnector", "connector_is_no_op": false, "outcome": "stopped-before-model-inputs", "error": null, "events": ["slot_mappings_by_layer", "prepare_attn", "prepare_inputs(batch staged=False)"], "ced_plan_is_none": true, "staged_floors": [0, null, null]}
+{"label": "r1", "kind": "check", "check": "active connector: execute_model passes the condition (no exception)", "ok": true, "error": null}
+{"label": "r1", "kind": "check", "check": "active connector: eager metadata path (slot mappings by layer + prepare_attn FULL)", "ok": true}
+{"label": "r1", "kind": "summary", "failures": [], "passed": true}

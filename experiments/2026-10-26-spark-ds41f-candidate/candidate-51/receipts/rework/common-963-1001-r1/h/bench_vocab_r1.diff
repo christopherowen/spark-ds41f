@@ -1,0 +1,54 @@
+--- /private/tmp/claude-501/-Users-christopherowen-projects-spark-ds41f/d7a6b002-8e73-4152-857a-2e58be7a2871/scratchpad/own-marks-51/common/h/bench_vocab_2boot_c51.py	2026-11-09 18:25:08
++++ /private/tmp/claude-501/-Users-christopherowen-projects-spark-ds41f/d7a6b002-8e73-4152-857a-2e58be7a2871/scratchpad/rw/h/bench_vocab_r1.py	2026-11-09 20:35:25
+@@ -14,7 +14,17 @@
+ 
+ DEVICE = torch.device("cuda:0")
+ K = 5120
+-MS = [1, 6, 16, 32, 48, 64, 72, 96, 97, 104, 107, 112, 120, 128]  # c51 own marks: + 97, 107, 120
++MS = [1, 6, 16, 17, 24, 32, 48, 64, 72, 96, 97, 104, 107, 112, 120, 128]  # c51 own marks: + 97, 107, 120; round 1: + 17, 24
++# Round 1 (candidate-51 rework of #1001): the certified screen's tiles each layer runs.
++# base_1107 keeps the base's SCREEN_TILE_CONFIGS; candidate takes #1001-r1's.
++SCREEN_BASE = {
++    128: dict(block_N=32, threads=256, step_groups=1, num_stages=4, act_stages=2),
++    32: dict(block_N=32, threads=128, step_groups=2, num_stages=4, act_stages=2),
++}
++SCREEN_CAND = {
++    128: dict(block_N=32, threads=256, step_groups=1, num_stages=2),
++    32: dict(block_N=32, threads=128, step_groups=2, num_stages=4, act_stages=2),
++}
+ SHAPES = {
+     "tp4": (32320, 32320),
+     "tp3": (43136, 43072),
+@@ -107,12 +117,16 @@
+         vocab.TILE_CONFIGS[128] = dict(
+             block_N=32, threads=256, step_groups=1, num_stages=4, act_stages=2
+         )
++        for bm, cfg in SCREEN_BASE.items():  # round 1
++            vocab.SCREEN_TILE_CONFIGS[bm] = dict(cfg)
+         layer_base128 = make_layer(packed, out_dtype)
+ 
+         # 2. candidate (TILE_CONFIGS[128] with num_stages=2)
+         vocab.TILE_CONFIGS[128] = dict(
+             block_N=32, threads=256, step_groups=1, num_stages=2
+         )
++        for bm, cfg in SCREEN_CAND.items():  # round 1
++            vocab.SCREEN_TILE_CONFIGS[bm] = dict(cfg)
+         layer_cand128 = make_layer(packed, out_dtype)
+ 
+         ker64 = layer_cand128.tilelang_vocab[64]
+@@ -248,6 +262,7 @@
+                 )
+             )
+             row_entry["image_tile_configs_128"] = image_cfg128
++            row_entry["image_screen_tile_configs"] = image_screen  # round 1
+             print(f"[{shape_name}][{dtype_name}] M={m:3d}: {row_entry}", flush=True)
+             dtype_res[str(m)] = row_entry
+ 
+@@ -256,6 +271,7 @@
+ 
+ 
+ image_cfg128 = dict(vocab.TILE_CONFIGS[128])  # c51 own marks: the image's own config, before the bench sets it
++image_screen = {str(k): dict(v) for k, v in vocab.SCREEN_TILE_CONFIGS.items()}  # round 1
+ 
+ 
+ def main():

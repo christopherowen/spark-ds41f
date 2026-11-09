@@ -1,0 +1,563 @@
+== A_gemm
+  compressor_down_512x10240
+    M=    1 graph 83.38/83.68 -> 83.22/84.02 (0.999x, same) | kiso 83.22/83.75 -> 94.68/89.57 (0.906x, slower) | eager 86.10/86.12 -> 85.94/86.24 (1.000x, same) | hash= True
+    M=    6 graph 84.27/83.96 -> 83.47/87.14 (0.986x, same) | kiso 83.95/83.75 -> 83.24/84.04 (1.003x, same) | eager 89.77/87.74 -> 87.79/86.31 (1.020x, same) | hash= True
+    M=   16 graph 84.40/84.06 -> 83.48/84.42 (1.003x, same) | kiso 84.14/83.77 -> 83.23/94.43 (0.945x, same) | eager 88.36/86.12 -> 85.98/86.59 (1.011x, same) | hash= True
+    M=   32 graph 94.01/94.43 -> 93.74/94.84 (0.999x, same) | kiso 94.32/94.14 -> 93.29/94.51 (1.004x, same) | eager 96.44/96.89 -> 97.88/96.84 (0.993x, same) | hash= True
+    M=   64 graph 120.05/120.10 -> 119.16/120.16 (1.003x, same) | kiso 119.71/119.72 -> 118.80/119.70 (1.004x, faster) | eager 121.40/124.91 -> 123.82/124.01 (0.994x, same) | hash= True
+    M=  128 graph 120.92/120.46 -> 120.53/120.61 (1.001x, same) | kiso 124.63/120.07 -> 120.16/128.42 (0.984x, same) | eager 124.45/124.27 -> 122.50/122.92 (1.013x, faster) | hash= True
+    M=  256 graph 122.54/124.04 -> 122.70/122.70 (1.005x, same) | kiso 122.14/123.65 -> 123.29/122.40 (1.000x, same) | eager 127.36/126.94 -> 128.56/129.59 (0.985x, slower) | hash= True
+    M=  512 graph 244.71/246.87 -> 245.06/245.15 (1.003x, same) | kiso 244.79/246.77 -> 244.78/244.82 (1.004x, same) | eager 253.04/251.93 -> 250.80/249.74 (1.009x, faster) | hash= True
+  compressor_up_5120x512
+    M=    1 graph 7.27/7.27 -> 6.65/6.64 (1.094x, faster) | kiso 7.50/6.89 -> 6.54/6.44 (1.109x, faster) | eager 8.25/8.24 -> 6.30/6.31 (1.308x, faster) | hash= True
+    M=    6 graph 7.60/7.64 -> 7.07/7.09 (1.076x, faster) | kiso 7.16/7.30 -> 6.88/7.04 (1.039x, faster) | eager 9.13/10.28 -> 7.17/8.54 (1.236x, faster) | hash= True
+    M=   16 graph 7.77/7.76 -> 7.19/7.25 (1.075x, faster) | kiso 7.36/7.34 -> 9.18/7.05 (0.906x, same) | eager 12.06/10.13 -> 6.89/6.87 (1.613x, faster) | hash= True
+    M=   32 graph 13.16/13.23 -> 12.12/12.16 (1.087x, faster) | kiso 13.13/12.86 -> 12.57/12.15 (1.051x, faster) | eager 15.01/14.91 -> 11.95/12.32 (1.233x, faster) | hash= True
+    M=   64 graph 17.12/17.01 -> 15.97/15.69 (1.078x, faster) | kiso 17.56/16.85 -> 16.35/15.59 (1.077x, faster) | eager 19.15/18.92 -> 22.62/15.53 (0.998x, same) | hash= True
+    M=  128 graph 31.34/31.11 -> 30.76/30.30 (1.023x, faster) | kiso 33.03/31.17 -> 35.25/30.34 (0.979x, same) | eager 33.35/33.11 -> 30.28/30.10 (1.101x, faster) | hash= True
+    M=  256 graph 55.31/55.61 -> 52.72/52.98 (1.049x, faster) | kiso 55.27/55.57 -> 53.22/53.30 (1.041x, faster) | eager 59.53/57.52 -> 53.73/52.95 (1.097x, faster) | hash= True
+    M=  512 graph 104.20/105.10 -> 101.50/102.43 (1.026x, faster) | kiso 104.89/105.55 -> 102.85/112.00 (0.979x, same) | eager 108.14/108.37 -> 103.53/103.26 (1.047x, faster) | hash= True
+  indexer_wq_b_4096x1280
+    M=    1 graph 14.87/14.40 -> 13.47/13.49 (1.086x, faster) | kiso 13.87/17.60 -> 13.42/14.99 (1.108x, same) | eager 16.58/16.42 -> 13.14/13.24 (1.251x, faster) | hash= True
+    M=    6 graph 14.77/14.55 -> 13.64/13.68 (1.073x, faster) | kiso 18.21/14.11 -> 13.58/13.50 (1.194x, faster) | eager 17.14/16.42 -> 14.92/13.37 (1.186x, faster) | hash= True
+    M=   16 graph 14.92/14.80 -> 13.94/13.91 (1.067x, faster) | kiso 14.39/14.27 -> 13.85/13.82 (1.036x, faster) | eager 16.65/16.81 -> 13.75/13.84 (1.213x, faster) | hash= True
+    M=   32 graph 25.48/25.75 -> 24.99/24.65 (1.032x, faster) | kiso 25.53/27.11 -> 24.60/24.56 (1.071x, faster) | eager 26.76/27.23 -> 24.57/24.58 (1.098x, faster) | hash= True
+    M=   64 graph 33.07/33.21 -> 31.69/31.74 (1.045x, faster) | kiso 37.50/32.76 -> 31.89/31.78 (1.104x, faster) | eager 35.10/35.16 -> 31.33/31.56 (1.117x, faster) | hash= True
+    M=  128 graph 50.03/50.55 -> 48.02/48.10 (1.046x, faster) | kiso 49.73/50.05 -> 48.17/48.18 (1.036x, faster) | eager 52.18/52.32 -> 47.73/47.84 (1.093x, faster) | hash= True
+    M=  256 graph 95.67/96.76 -> 94.40/95.15 (1.015x, faster) | kiso 95.73/108.87 -> 95.08/95.53 (1.073x, faster) | eager 101.31/101.19 -> 95.98/96.06 (1.054x, faster) | hash= True
+    M=  512 graph 176.72/178.52 -> 173.52/175.28 (1.018x, faster) | kiso 177.24/178.89 -> 174.81/175.78 (1.016x, faster) | eager 181.68/183.27 -> 175.25/175.69 (1.040x, faster) | hash= True
+  indexer_wk_128x5120
+    M=    1 graph 41.51/41.80 -> 42.10/41.77 (0.993x, same) | kiso 41.13/41.27 -> 41.05/41.46 (0.999x, same) | eager 43.66/44.19 -> 43.69/43.66 (1.006x, same) | hash= True
+    M=    6 graph 41.48/41.75 -> 41.41/41.77 (1.001x, same) | kiso 41.18/41.36 -> 41.07/41.42 (1.001x, same) | eager 43.56/43.65 -> 43.73/44.44 (0.989x, slower) | hash= True
+    M=   16 graph 41.58/41.82 -> 41.57/41.77 (1.001x, same) | kiso 41.08/41.32 -> 40.99/41.53 (0.999x, same) | eager 43.73/44.87 -> 43.60/47.15 (0.976x, same) | hash= True
+    M=   32 graph 46.79/47.14 -> 46.70/47.15 (1.001x, same) | kiso 46.37/46.68 -> 46.29/46.79 (1.000x, same) | eager 49.33/49.74 -> 49.11/49.58 (1.004x, same) | hash= True
+    M=   64 graph 59.65/60.18 -> 60.34/59.98 (0.996x, same) | kiso 59.19/59.66 -> 59.21/59.63 (1.000x, same) | eager 61.78/62.63 -> 62.01/61.51 (1.007x, same) | hash= True
+    M=  128 graph 59.60/60.08 -> 59.77/60.00 (0.999x, same) | kiso 59.18/59.57 -> 59.16/59.46 (1.001x, same) | eager 61.58/62.63 -> 61.68/61.50 (1.008x, same) | hash= True
+    M=  256 graph 60.03/60.09 -> 59.61/60.03 (1.004x, same) | kiso 59.61/59.64 -> 59.20/59.64 (1.003x, same) | eager 61.75/62.81 -> 61.73/61.57 (1.010x, faster) | hash= True
+    M=  512 graph 60.24/60.24 -> 60.20/60.27 (1.000x, same) | kiso 59.80/59.72 -> 59.81/59.88 (0.999x, slower) | eager 63.21/62.78 -> 63.75/62.49 (0.998x, same) | hash= True
+== B_proj
+  tp4_32320x5120
+    M=    1 own_vs_own             graph 2650.86/2643.06 -> 1080.81/1079.84 (2.450x, faster) | kiso 2659.74/2653.71 -> 1202.54/1080.36 (2.328x, faster) | hash= True
+    M=    6 own_vs_own             graph 3010.90/3032.74 -> 1090.24/1090.93 (2.771x, faster) | kiso 3016.47/3037.42 -> 1091.16/1088.51 (2.777x, faster) | hash= True
+    M=   12 own_vs_own             graph 3383.56/3410.09 -> 1105.23/1103.43 (3.076x, faster) | kiso 3384.53/3411.27 -> 1130.06/1105.22 (3.040x, faster) | hash= True
+    M=   16 own_vs_own             graph 3426.33/3456.18 -> 1113.26/1116.49 (3.087x, faster) | kiso 3429.12/3454.50 -> 1117.55/1115.31 (3.083x, faster) | hash= True
+    M=   24 own_vs_own             graph 3923.78/3965.91 -> 1250.01/1246.47 (3.160x, faster) | kiso 3953.23/3976.45 -> 1255.20/1326.23 (3.072x, faster) | hash= True
+    M=   32 own_vs_own             graph 4221.92/4250.22 -> 1338.85/1308.67 (3.200x, faster) | kiso 4225.22/4252.97 -> 1340.73/1350.68 (3.150x, faster) | hash= True
+    M=   48 own_vs_own             graph 4957.27/4965.54 -> 1479.38/1460.25 (3.376x, faster) | kiso 4956.17/4974.16 -> 1564.87/1459.91 (3.283x, faster) | hash= True
+    M=   64 own_vs_own             graph 5105.91/5126.88 -> 1589.73/1566.88 (3.242x, faster) | kiso 5132.07/5126.84 -> 1580.40/1653.18 (3.173x, faster) | hash= True
+    M=   96 own_vs_own             graph 8554.97/8629.31 -> 2223.26/2271.85 (3.823x, faster) | kiso 8561.65/8638.15 -> 2309.73/2352.24 (3.689x, faster) | hash= True
+    M=   96 same_cfg_s4a2          graph 8554.97/8629.31 -> 2346.76/2365.89 (3.646x, faster) | kiso 8561.65/8638.15 -> 2389.09/2448.29 (3.556x, faster) | hash= True
+    M=   96 same_cfg_s2            graph 8401.65/8470.36 -> 2223.26/2271.85 (3.753x, faster) | kiso 8402.83/8490.69 -> 2309.73/2352.24 (3.624x, faster) | hash= True
+    M=  107 own_vs_own             graph 8677.04/8760.98 -> 2496.28/2507.23 (3.485x, faster) | kiso 8702.35/8771.00 -> 2501.03/2580.57 (3.439x, faster) | hash= True
+    M=  107 same_cfg_s4a2          graph 8677.04/8760.98 -> 2629.42/2637.73 (3.311x, faster) | kiso 8702.35/8771.00 -> 2714.43/2711.94 (3.220x, faster) | hash= True
+    M=  107 same_cfg_s2            graph 8517.02/8576.68 -> 2496.28/2507.23 (3.416x, faster) | kiso 8837.63/8576.94 -> 2501.03/2580.57 (3.427x, faster) | hash= True
+    M=  128 own_vs_own             graph 9212.81/9160.39 -> 3038.42/3053.90 (3.016x, faster) | kiso 9220.25/9180.47 -> 3040.69/3055.76 (3.018x, faster) | hash= True
+    M=  128 same_cfg_s4a2          graph 9212.81/9160.39 -> 3226.21/3232.60 (2.845x, faster) | kiso 9220.25/9180.47 -> 3297.25/3237.48 (2.816x, faster) | hash= True
+    M=  128 same_cfg_s2            graph 8983.72/8923.01 -> 3038.42/3053.90 (2.939x, faster) | kiso 9058.62/8927.52 -> 3040.69/3055.76 (2.950x, faster) | hash= True
+    M=  512 own_vs_own             graph 36557.73/36294.82 -> 12867.56/12895.48 (2.828x, faster) | kiso 36564.75/36300.95 -> 12933.46/12907.21 (2.820x, faster) | hash= True
+    M=  512 same_cfg_s4a2          graph 36557.73/36294.82 -> 13733.32/13763.61 (2.649x, faster) | kiso 36564.75/36300.95 -> 13752.19/13749.12 (2.650x, faster) | hash= True
+    M=  512 same_cfg_s2            graph 35469.97/35228.22 -> 12867.56/12895.48 (2.744x, faster) | kiso 35566.34/35340.35 -> 12933.46/12907.21 (2.744x, faster) | hash= True
+    M= 2048 own_vs_own             graph 162574.92/155824.15 -> 48206.60/48429.48 (3.295x, faster) | kiso 163585.16/155807.60 -> 48438.88/48386.89 (3.299x, faster) | hash= True
+    M= 2048 same_cfg_s4a2          graph 162574.92/155824.15 -> 62699.43/57606.35 (2.647x, faster) | kiso 163585.16/155807.60 -> 63003.11/58947.09 (2.619x, faster) | hash= True
+    M= 2048 same_cfg_s2            graph 156065.87/150233.29 -> 48206.60/48429.48 (3.170x, faster) | kiso 157105.02/150321.19 -> 48438.88/48386.89 (3.175x, faster) | hash= True
+  tp3_43096x5120
+    M=    1 own_vs_own             graph 3423.63/3458.55 -> 1418.61/1404.30 (2.438x, faster) | kiso 3433.43/3468.50 -> 1409.32/1405.54 (2.452x, faster) | hash= True
+    M=    6 own_vs_own             graph 3979.43/3999.21 -> 1418.13/1412.06 (2.819x, faster) | kiso 3977.92/4000.21 -> 1420.48/1412.90 (2.816x, faster) | hash= True
+    M=   12 own_vs_own             graph 4481.56/4503.17 -> 1429.09/1433.05 (3.139x, faster) | kiso 4482.18/4504.29 -> 1505.99/1427.43 (3.063x, faster) | hash= True
+    M=   16 own_vs_own             graph 4517.90/4554.03 -> 1445.97/1439.96 (3.144x, faster) | kiso 4517.00/4554.11 -> 1447.36/1438.70 (3.143x, faster) | hash= True
+    M=   24 own_vs_own             graph 5246.78/5260.27 -> 1684.41/1626.16 (3.174x, faster) | kiso 5249.41/5263.02 -> 1756.45/1630.04 (3.104x, faster) | hash= True
+    M=   32 own_vs_own             graph 5634.02/5664.00 -> 1751.66/1765.84 (3.212x, faster) | kiso 5638.59/5666.79 -> 1746.64/1801.65 (3.186x, faster) | hash= True
+    M=   48 own_vs_own             graph 6535.18/6579.18 -> 1858.59/1917.38 (3.473x, faster) | kiso 6537.21/6580.22 -> 1964.29/1985.12 (3.321x, faster) | hash= True
+    M=   64 own_vs_own             graph 6738.10/6794.72 -> 2058.39/2092.92 (3.260x, faster) | kiso 6740.14/6794.20 -> 2062.84/2092.56 (3.257x, faster) | hash= True
+    M=   96 own_vs_own             graph 11386.63/11468.57 -> 2966.72/3015.62 (3.820x, faster) | kiso 11382.13/11463.34 -> 3094.19/3080.10 (3.700x, faster) | hash= True
+    M=   96 same_cfg_s4a2          graph 11386.63/11468.57 -> 3145.74/3156.71 (3.626x, faster) | kiso 11382.13/11463.34 -> 3208.59/3186.36 (3.572x, faster) | hash= True
+    M=   96 same_cfg_s2            graph 11149.49/11234.19 -> 2966.72/3015.62 (3.742x, faster) | kiso 11147.95/11241.72 -> 3094.19/3080.10 (3.626x, faster) | hash= True
+    M=  107 own_vs_own             graph 11524.13/11600.83 -> 3306.19/3356.61 (3.471x, faster) | kiso 11518.85/11595.07 -> 3363.45/3396.37 (3.419x, faster) | hash= True
+    M=  107 same_cfg_s4a2          graph 11524.13/11600.83 -> 3497.80/3524.03 (3.293x, faster) | kiso 11518.85/11595.07 -> 3493.48/3998.81 (3.085x, faster) | hash= True
+    M=  107 same_cfg_s2            graph 11239.06/11316.06 -> 3306.19/3356.61 (3.385x, faster) | kiso 11234.17/11317.75 -> 3363.45/3396.37 (3.336x, faster) | hash= True
+    M=  128 own_vs_own             graph 12144.85/12238.99 -> 4078.03/4141.90 (2.966x, faster) | kiso 12143.46/12238.30 -> 4084.12/4177.16 (2.951x, faster) | hash= True
+    M=  128 same_cfg_s4a2          graph 12144.85/12238.99 -> 4354.96/4427.61 (2.776x, faster) | kiso 12143.46/12238.30 -> 4343.28/4415.96 (2.784x, faster) | hash= True
+    M=  128 same_cfg_s2            graph 11774.69/11886.11 -> 4078.03/4141.90 (2.878x, faster) | kiso 11773.87/11887.50 -> 4084.12/4177.16 (2.864x, faster) | hash= True
+    M=  512 own_vs_own             graph 48681.88/48550.83 -> 17112.44/17266.93 (2.828x, faster) | kiso 48679.82/48590.91 -> 17162.74/17315.19 (2.821x, faster) | hash= True
+    M=  512 same_cfg_s4a2          graph 48681.88/48550.83 -> 18331.91/18316.12 (2.653x, faster) | kiso 48679.82/48590.91 -> 18334.03/18297.24 (2.655x, faster) | hash= True
+    M=  512 same_cfg_s2            graph 47111.80/47047.86 -> 17112.44/17266.93 (2.739x, faster) | kiso 47245.10/47059.59 -> 17162.74/17315.19 (2.735x, faster) | hash= True
+    M= 2048 own_vs_own             graph 196883.06/194266.87 -> 70131.38/70599.10 (2.779x, faster) | kiso 196912.61/194856.29 -> 71111.20/70846.32 (2.760x, faster) | hash= True
+    M= 2048 same_cfg_s4a2          graph 196883.06/194266.87 -> 76301.81/76604.50 (2.558x, faster) | kiso 196912.61/194856.29 -> 77313.75/77031.40 (2.538x, faster) | hash= True
+    M= 2048 same_cfg_s2            graph 190613.88/188387.47 -> 70131.38/70599.10 (2.693x, faster) | kiso 190660.23/189023.55 -> 71111.20/70846.32 (2.675x, faster) | hash= True
+== C_greedy
+  tp4_32320x5120
+    M=    1 own_vs_own             graph 2618.52/2602.42 -> 1084.79/1084.49 (2.407x, faster) | kiso 2622.91/2615.74 -> 1084.06/1093.01 (2.406x, faster) | hash= True
+    M=    6 own_vs_own             graph 2965.00/2985.54 -> 1088.98/1088.09 (2.733x, faster) | kiso 2963.91/2989.93 -> 1124.50/1124.65 (2.647x, faster) | hash= True
+    M=   12 own_vs_own             graph 3338.33/3363.46 -> 1100.13/1102.06 (3.043x, faster) | kiso 3352.83/3362.74 -> 1101.24/1203.84 (2.913x, faster) | hash= True
+    M=   16 own_vs_own             graph 3380.44/3403.81 -> 1110.60/1113.40 (3.050x, faster) | kiso 3392.62/3435.81 -> 1112.33/1156.88 (3.009x, faster) | hash= True
+    M=   24 own_vs_own             graph 3870.12/3916.46 -> 1265.50/1271.47 (3.069x, faster) | kiso 3873.33/3946.73 -> 1345.99/1274.18 (2.985x, faster) | hash= True
+    M=   32 own_vs_own             graph 4172.50/4192.32 -> 1347.74/1320.43 (3.135x, faster) | kiso 4175.26/4221.51 -> 1388.20/1324.89 (3.095x, faster) | hash= True
+    M=   48 own_vs_own             graph 4898.44/4914.43 -> 1484.65/1463.04 (3.329x, faster) | kiso 4898.17/4942.32 -> 1476.25/1467.39 (3.343x, faster) | hash= True
+    M=   64 own_vs_own             graph 5047.47/5068.60 -> 1592.04/1569.90 (3.199x, faster) | kiso 5047.05/5068.43 -> 1639.20/1664.26 (3.062x, faster) | hash= True
+    M=   96 own_vs_own             graph 8510.14/8584.76 -> 2228.78/2276.25 (3.795x, faster) | kiso 8510.17/8583.32 -> 2283.68/2355.34 (3.685x, faster) | hash= True
+    M=   96 same_cfg_s4a2          graph 8510.14/8584.76 -> 2365.60/2382.14 (3.601x, faster) | kiso 8510.17/8583.32 -> 2438.85/2422.17 (3.516x, faster) | hash= True
+    M=   96 same_cfg_s2            graph 8368.50/8437.13 -> 2228.78/2276.25 (3.730x, faster) | kiso 8374.86/8436.35 -> 2283.68/2355.34 (3.624x, faster) | hash= True
+    M=  107 own_vs_own             graph 8645.02/8718.95 -> 2502.14/2518.47 (3.459x, faster) | kiso 8648.92/8743.43 -> 2578.96/2567.19 (3.380x, faster) | hash= True
+    M=  107 same_cfg_s4a2          graph 8645.02/8718.95 -> 2663.49/2661.48 (3.261x, faster) | kiso 8648.92/8743.43 -> 2701.65/2661.28 (3.243x, faster) | hash= True
+    M=  107 same_cfg_s2            graph 8487.40/8528.10 -> 2502.14/2518.47 (3.389x, faster) | kiso 8513.39/8525.60 -> 2578.96/2567.19 (3.311x, faster) | hash= True
+    M=  128 own_vs_own             graph 9182.31/9118.14 -> 3036.31/3044.15 (3.010x, faster) | kiso 9184.11/9126.66 -> 3075.27/3106.97 (2.962x, faster) | hash= True
+    M=  128 same_cfg_s4a2          graph 9182.31/9118.14 -> 3256.15/3259.81 (2.809x, faster) | kiso 9184.11/9126.66 -> 3287.23/3292.13 (2.783x, faster) | hash= True
+    M=  128 same_cfg_s2            graph 9004.32/8873.10 -> 3036.31/3044.15 (2.940x, faster) | kiso 8998.66/8868.84 -> 3075.27/3106.97 (2.890x, faster) | hash= True
+  tp3_43096x5120
+    M=    1 own_vs_own             graph 3370.85/3405.17 -> 1419.94/1409.33 (2.395x, faster) | kiso 3382.92/3422.35 -> 1469.56/1410.61 (2.363x, faster) | hash= True
+    M=    6 own_vs_own             graph 3906.36/3928.51 -> 1414.42/1408.64 (2.775x, faster) | kiso 3906.68/3932.79 -> 1417.42/1411.85 (2.771x, faster) | hash= True
+    M=   12 own_vs_own             graph 4404.75/4426.91 -> 1428.27/1420.39 (3.100x, faster) | kiso 4408.44/4431.41 -> 1431.15/1419.36 (3.101x, faster) | hash= True
+    M=   16 own_vs_own             graph 4440.66/4474.95 -> 1438.78/1436.91 (3.100x, faster) | kiso 4446.81/4478.95 -> 1443.86/1442.84 (3.092x, faster) | hash= True
+    M=   24 own_vs_own             graph 5180.07/5163.46 -> 1696.03/1643.02 (3.098x, faster) | kiso 5183.72/5166.40 -> 1768.36/1727.75 (2.960x, faster) | hash= True
+    M=   32 own_vs_own             graph 5566.49/5596.11 -> 1771.97/1783.29 (3.140x, faster) | kiso 5569.88/5605.04 -> 1847.12/1839.48 (3.031x, faster) | hash= True
+    M=   48 own_vs_own             graph 6459.71/6504.81 -> 1846.08/1919.27 (3.443x, faster) | kiso 6464.00/6506.34 -> 1945.02/2007.10 (3.282x, faster) | hash= True
+    M=   64 own_vs_own             graph 6664.50/6719.01 -> 2071.24/2108.25 (3.202x, faster) | kiso 6704.25/6720.94 -> 2154.82/2184.79 (3.094x, faster) | hash= True
+    M=   96 own_vs_own             graph 11289.37/11378.24 -> 2954.51/3006.28 (3.803x, faster) | kiso 11285.67/11440.65 -> 3024.13/3025.43 (3.757x, faster) | hash= True
+    M=   96 same_cfg_s4a2          graph 11289.37/11378.24 -> 3121.17/3159.47 (3.609x, faster) | kiso 11285.67/11440.65 -> 3161.27/3164.00 (3.593x, faster) | hash= True
+    M=   96 same_cfg_s2            graph 11080.85/11167.05 -> 2954.51/3006.28 (3.732x, faster) | kiso 11080.45/11167.67 -> 3024.13/3025.43 (3.678x, faster) | hash= True
+    M=  107 own_vs_own             graph 11412.99/11485.99 -> 3295.14/3313.96 (3.465x, faster) | kiso 11407.20/11484.18 -> 3337.77/3299.39 (3.449x, faster) | hash= True
+    M=  107 same_cfg_s4a2          graph 11412.99/11485.99 -> 3474.02/3487.02 (3.290x, faster) | kiso 11407.20/11484.18 -> 3513.29/3520.72 (3.254x, faster) | hash= True
+    M=  107 same_cfg_s2            graph 11166.38/11246.49 -> 3295.14/3313.96 (3.391x, faster) | kiso 11164.03/11242.69 -> 3337.77/3299.39 (3.376x, faster) | hash= True
+    M=  128 own_vs_own             graph 12041.05/12149.20 -> 4059.71/4123.73 (2.956x, faster) | kiso 12038.63/12155.80 -> 4061.66/4183.07 (2.935x, faster) | hash= True
+    M=  128 same_cfg_s4a2          graph 12041.05/12149.20 -> 4345.78/4417.78 (2.760x, faster) | kiso 12038.63/12155.80 -> 4347.81/4416.52 (2.761x, faster) | hash= True
+    M=  128 same_cfg_s2            graph 11781.78/11820.57 -> 4059.71/4123.73 (2.884x, faster) | kiso 11778.45/11825.67 -> 4061.66/4183.07 (2.863x, faster) | hash= True
+== D_screen
+  tp4_32320x5120
+    M=    1 same_set_s4a2          graph 748.98/746.96 -> 745.13/746.51 (1.003x, faster) | kiso 857.33/855.26 -> 841.83/863.15 (1.004x, same) | hash= True
+    M=    1 same_set_r1            graph 708.21/725.63 -> 721.24/729.10 (0.989x, same) | kiso 836.72/810.18 -> 819.08/844.71 (0.990x, same) | hash= True
+    M=    1 own_vs_own             graph 748.98/746.96 -> 721.24/729.10 (1.031x, faster) | kiso 857.33/855.26 -> 819.08/844.71 (1.029x, faster) | hash= True
+    M=    1 1001r1_within_base     graph 748.98/746.96 -> 708.21/725.63 (1.043x, faster) | kiso 857.33/855.26 -> 836.72/810.18 (1.040x, faster) | hash= True
+    M=    1 1001r1_within_c51r1    graph 745.13/746.51 -> 721.24/729.10 (1.028x, faster) | kiso 841.83/863.15 -> 819.08/844.71 (1.025x, same) | hash= True
+    M=    6 same_set_s4a2          graph 762.71/761.72 -> 763.58/763.77 (0.998x, slower) | kiso 887.49/834.84 -> 834.49/900.28 (0.993x, same) | hash= True
+    M=    6 same_set_r1            graph 729.00/741.10 -> 737.41/738.83 (0.996x, same) | kiso 806.01/829.64 -> 856.26/809.76 (0.982x, same) | hash= True
+    M=    6 own_vs_own             graph 762.71/761.72 -> 737.41/738.83 (1.033x, faster) | kiso 887.49/834.84 -> 856.26/809.76 (1.034x, same) | hash= True
+    M=    6 1001r1_within_base     graph 762.71/761.72 -> 729.00/741.10 (1.037x, faster) | kiso 887.49/834.84 -> 806.01/829.64 (1.053x, faster) | hash= True
+    M=    6 1001r1_within_c51r1    graph 763.58/763.77 -> 737.41/738.83 (1.035x, faster) | kiso 834.49/900.28 -> 856.26/809.76 (1.041x, same) | hash= True
+    M=   16 same_set_s4a2          graph 790.71/787.65 -> 789.22/790.98 (0.999x, same) | kiso 878.08/878.96 -> 922.24/898.45 (0.965x, slower) | hash= True
+    M=   16 same_set_r1            graph 756.19/766.98 -> 764.77/767.77 (0.994x, same) | kiso 863.74/905.48 -> 896.88/859.97 (1.007x, same) | hash= True
+    M=   16 own_vs_own             graph 790.71/787.65 -> 764.77/767.77 (1.030x, faster) | kiso 878.08/878.96 -> 896.88/859.97 (1.000x, same) | hash= True
+    M=   16 1001r1_within_base     graph 790.71/787.65 -> 756.19/766.98 (1.036x, faster) | kiso 878.08/878.96 -> 863.74/905.48 (0.993x, same) | hash= True
+    M=   16 1001r1_within_c51r1    graph 789.22/790.98 -> 764.77/767.77 (1.031x, faster) | kiso 922.24/898.45 -> 896.88/859.97 (1.036x, faster) | hash= True
+    M=   17 same_set_s4a2          graph 796.94/798.12 -> 803.32/798.66 (0.996x, slower) | kiso 893.92/920.86 -> 934.24/904.61 (0.987x, same) | hash= True
+    M=   17 same_set_r1            graph 769.02/780.82 -> 776.24/778.18 (0.997x, same) | kiso 917.32/945.45 -> 931.01/913.65 (1.010x, same) | hash= True
+    M=   17 own_vs_own             graph 796.94/798.12 -> 776.24/778.18 (1.026x, faster) | kiso 893.92/920.86 -> 931.01/913.65 (0.984x, same) | hash= True
+    M=   17 1001r1_within_base     graph 796.94/798.12 -> 769.02/780.82 (1.029x, faster) | kiso 893.92/920.86 -> 917.32/945.45 (0.974x, same) | hash= True
+    M=   17 1001r1_within_c51r1    graph 803.32/798.66 -> 776.24/778.18 (1.031x, faster) | kiso 934.24/904.61 -> 931.01/913.65 (0.997x, same) | hash= True
+    M=   24 same_set_s4a2          graph 811.68/811.47 -> 813.12/815.21 (0.997x, slower) | kiso 940.86/975.46 -> 950.56/981.36 (0.992x, same) | hash= True
+    M=   24 same_set_r1            graph 786.34/794.15 -> 792.93/794.19 (0.996x, same) | kiso 953.98/909.83 -> 922.23/900.06 (1.023x, same) | hash= True
+    M=   24 own_vs_own             graph 811.68/811.47 -> 792.93/794.19 (1.023x, faster) | kiso 940.86/975.46 -> 922.23/900.06 (1.052x, faster) | hash= True
+    M=   24 1001r1_within_base     graph 811.68/811.47 -> 786.34/794.15 (1.027x, faster) | kiso 940.86/975.46 -> 953.98/909.83 (1.028x, same) | hash= True
+    M=   24 1001r1_within_c51r1    graph 813.12/815.21 -> 792.93/794.19 (1.026x, faster) | kiso 950.56/981.36 -> 922.23/900.06 (1.060x, faster) | hash= True
+    M=   32 same_set_s4a2          graph 831.94/833.29 -> 833.08/833.70 (0.999x, same) | kiso 987.89/1016.09 -> 1009.42/1004.28 (0.995x, same) | hash= True
+    M=   32 same_set_r1            graph 805.47/816.12 -> 812.51/816.24 (0.996x, same) | kiso 968.88/935.36 -> 936.27/931.71 (1.019x, same) | hash= True
+    M=   32 own_vs_own             graph 831.94/833.29 -> 812.51/816.24 (1.022x, faster) | kiso 987.89/1016.09 -> 936.27/931.71 (1.073x, faster) | hash= True
+    M=   32 1001r1_within_base     graph 831.94/833.29 -> 805.47/816.12 (1.027x, faster) | kiso 987.89/1016.09 -> 968.88/935.36 (1.052x, faster) | hash= True
+    M=   32 1001r1_within_c51r1    graph 833.08/833.70 -> 812.51/816.24 (1.023x, faster) | kiso 1009.42/1004.28 -> 936.27/931.71 (1.078x, faster) | hash= True
+    M=   64 same_set_s4a2          graph 970.79/977.24 -> 974.97/976.63 (0.998x, same) | kiso 1201.03/1220.58 -> 1232.87/1230.03 (0.983x, slower) | hash= True
+    M=   64 same_set_r1            graph 956.79/963.34 -> 956.46/955.94 (1.004x, faster) | kiso 1207.37/1222.89 -> 1219.04/1207.70 (1.001x, same) | hash= True
+    M=   64 own_vs_own             graph 970.79/977.24 -> 956.46/955.94 (1.019x, faster) | kiso 1201.03/1220.58 -> 1219.04/1207.70 (0.998x, same) | hash= True
+    M=   64 1001r1_within_base     graph 970.79/977.24 -> 956.79/963.34 (1.015x, faster) | kiso 1201.03/1220.58 -> 1207.37/1222.89 (0.996x, same) | hash= True
+    M=   64 1001r1_within_c51r1    graph 974.97/976.63 -> 956.46/955.94 (1.020x, faster) | kiso 1232.87/1230.03 -> 1219.04/1207.70 (1.015x, faster) | hash= True
+    M=   96 same_set_s4a2          graph 1283.97/1290.82 -> 1290.47/1292.88 (0.997x, same) | kiso 1672.34/1689.06 -> 1671.14/1714.96 (0.993x, same) | hash= True
+    M=   96 same_set_r1            graph 1187.92/1197.35 -> 1189.70/1206.21 (0.996x, same) | kiso 1563.14/1799.41 -> 1624.68/1581.26 (1.049x, same) | hash= True
+    M=   96 own_vs_own             graph 1283.97/1290.82 -> 1189.70/1206.21 (1.075x, faster) | kiso 1672.34/1689.06 -> 1624.68/1581.26 (1.048x, faster) | hash= True
+    M=   96 1001r1_within_base     graph 1283.97/1290.82 -> 1187.92/1197.35 (1.079x, faster) | kiso 1672.34/1689.06 -> 1563.14/1799.41 (1.000x, same) | hash= True
+    M=   96 1001r1_within_c51r1    graph 1290.47/1292.88 -> 1189.70/1206.21 (1.078x, faster) | kiso 1671.14/1714.96 -> 1624.68/1581.26 (1.056x, faster) | hash= True
+    M=   97 same_set_s4a2          graph 1296.69/1316.64 -> 1296.47/1320.23 (0.999x, same) | kiso 1709.81/1692.11 -> 1669.80/1691.01 (1.012x, faster) | hash= True
+    M=   97 same_set_r1            graph 1202.08/1205.37 -> 1198.93/1205.59 (1.001x, same) | kiso 1587.45/1579.00 -> 1634.77/1580.36 (0.985x, same) | hash= True
+    M=   97 own_vs_own             graph 1296.69/1316.64 -> 1198.93/1205.59 (1.087x, faster) | kiso 1709.81/1692.11 -> 1634.77/1580.36 (1.058x, faster) | hash= True
+    M=   97 1001r1_within_base     graph 1296.69/1316.64 -> 1202.08/1205.37 (1.086x, faster) | kiso 1709.81/1692.11 -> 1587.45/1579.00 (1.074x, faster) | hash= True
+    M=   97 1001r1_within_c51r1    graph 1296.47/1320.23 -> 1198.93/1205.59 (1.088x, faster) | kiso 1669.80/1691.01 -> 1634.77/1580.36 (1.045x, faster) | hash= True
+    M=  104 same_set_s4a2          graph 1358.25/1358.02 -> 1363.66/1367.99 (0.994x, slower) | kiso 1749.65/1788.73 -> 1760.39/1817.03 (0.989x, same) | hash= True
+    M=  104 same_set_r1            graph 1219.21/1228.03 -> 1225.41/1232.42 (0.996x, same) | kiso 1553.03/1617.47 -> 1613.14/1663.94 (0.967x, same) | hash= True
+    M=  104 own_vs_own             graph 1358.25/1358.02 -> 1225.41/1232.42 (1.105x, faster) | kiso 1749.65/1788.73 -> 1613.14/1663.94 (1.080x, faster) | hash= True
+    M=  104 1001r1_within_base     graph 1358.25/1358.02 -> 1219.21/1228.03 (1.110x, faster) | kiso 1749.65/1788.73 -> 1553.03/1617.47 (1.116x, faster) | hash= True
+    M=  104 1001r1_within_c51r1    graph 1363.66/1367.99 -> 1225.41/1232.42 (1.111x, faster) | kiso 1760.39/1817.03 -> 1613.14/1663.94 (1.092x, faster) | hash= True
+    M=  107 same_set_s4a2          graph 1382.64/1394.08 -> 1381.44/1399.78 (0.998x, same) | kiso 1830.91/1844.88 -> 1965.37/1819.56 (0.971x, same) | hash= True
+    M=  107 same_set_r1            graph 1238.39/1239.47 -> 1235.81/1248.69 (0.997x, same) | kiso 1653.92/1628.48 -> 1632.11/1721.64 (0.979x, same) | hash= True
+    M=  107 own_vs_own             graph 1382.64/1394.08 -> 1235.81/1248.69 (1.118x, faster) | kiso 1830.91/1844.88 -> 1632.11/1721.64 (1.096x, faster) | hash= True
+    M=  107 1001r1_within_base     graph 1382.64/1394.08 -> 1238.39/1239.47 (1.121x, faster) | kiso 1830.91/1844.88 -> 1653.92/1628.48 (1.120x, faster) | hash= True
+    M=  107 1001r1_within_c51r1    graph 1381.44/1399.78 -> 1235.81/1248.69 (1.119x, faster) | kiso 1965.37/1819.56 -> 1632.11/1721.64 (1.129x, faster) | hash= True
+    M=  112 same_set_s4a2          graph 1417.99/1435.81 -> 1421.24/1442.53 (0.997x, same) | kiso 1824.68/1860.80 -> 1899.36/1796.34 (0.997x, same) | hash= True
+    M=  112 same_set_r1            graph 1250.07/1267.08 -> 1254.03/1272.22 (0.996x, same) | kiso 1651.69/1674.08 -> 1651.62/1701.78 (0.992x, same) | hash= True
+    M=  112 own_vs_own             graph 1417.99/1435.81 -> 1254.03/1272.22 (1.130x, faster) | kiso 1824.68/1860.80 -> 1651.62/1701.78 (1.099x, faster) | hash= True
+    M=  112 1001r1_within_base     graph 1417.99/1435.81 -> 1250.07/1267.08 (1.134x, faster) | kiso 1824.68/1860.80 -> 1651.69/1674.08 (1.108x, faster) | hash= True
+    M=  112 1001r1_within_c51r1    graph 1421.24/1442.53 -> 1254.03/1272.22 (1.134x, faster) | kiso 1899.36/1796.34 -> 1651.62/1701.78 (1.102x, faster) | hash= True
+    M=  120 same_set_s4a2          graph 1497.71/1491.68 -> 1482.54/1491.64 (1.005x, faster) | kiso 1937.98/1986.95 -> 1983.09/1984.56 (0.989x, same) | hash= True
+    M=  120 same_set_r1            graph 1288.68/1306.56 -> 1302.14/1321.07 (0.989x, same) | kiso 1726.00/1745.28 -> 1771.80/1775.28 (0.979x, slower) | hash= True
+    M=  120 own_vs_own             graph 1497.71/1491.68 -> 1302.14/1321.07 (1.140x, faster) | kiso 1937.98/1986.95 -> 1771.80/1775.28 (1.107x, faster) | hash= True
+    M=  120 1001r1_within_base     graph 1497.71/1491.68 -> 1288.68/1306.56 (1.152x, faster) | kiso 1937.98/1986.95 -> 1726.00/1745.28 (1.131x, faster) | hash= True
+    M=  120 1001r1_within_c51r1    graph 1482.54/1491.64 -> 1302.14/1321.07 (1.134x, faster) | kiso 1983.09/1984.56 -> 1771.80/1775.28 (1.119x, faster) | hash= True
+    M=  128 same_set_s4a2          graph 1564.38/1587.14 -> 1580.80/1572.06 (1.000x, same) | kiso 2064.34/2094.56 -> 2087.55/2057.61 (1.003x, same) | hash= True
+    M=  128 same_set_r1            graph 1414.79/1387.47 -> 1410.32/1410.68 (0.993x, same) | kiso 1884.85/1838.15 -> 1896.56/1840.76 (0.996x, same) | hash= True
+    M=  128 own_vs_own             graph 1564.38/1587.14 -> 1410.32/1410.68 (1.117x, faster) | kiso 2064.34/2094.56 -> 1896.56/1840.76 (1.113x, faster) | hash= True
+    M=  128 1001r1_within_base     graph 1564.38/1587.14 -> 1414.79/1387.47 (1.125x, faster) | kiso 2064.34/2094.56 -> 1884.85/1838.15 (1.117x, faster) | hash= True
+    M=  128 1001r1_within_c51r1    graph 1580.80/1572.06 -> 1410.32/1410.68 (1.118x, faster) | kiso 2087.55/2057.61 -> 1896.56/1840.76 (1.109x, faster) | hash= True
+  tp3_43096x5120
+    M=    1 same_set_s4a2          graph 985.72/980.76 -> 983.07/981.27 (1.001x, same) | kiso 1057.61/1063.11 -> 1108.39/1084.70 (0.967x, slower) | hash= True
+    M=    1 same_set_r1            graph 927.19/922.91 -> 919.36/923.14 (1.004x, same) | kiso 1023.71/981.48 -> 1034.65/1020.92 (0.975x, same) | hash= True
+    M=    1 own_vs_own             graph 985.72/980.76 -> 919.36/923.14 (1.067x, faster) | kiso 1057.61/1063.11 -> 1034.65/1020.92 (1.032x, faster) | hash= True
+    M=    1 1001r1_within_base     graph 985.72/980.76 -> 927.19/922.91 (1.063x, faster) | kiso 1057.61/1063.11 -> 1023.71/981.48 (1.058x, faster) | hash= True
+    M=    1 1001r1_within_c51r1    graph 983.07/981.27 -> 919.36/923.14 (1.066x, faster) | kiso 1108.39/1084.70 -> 1034.65/1020.92 (1.067x, faster) | hash= True
+    M=    6 same_set_s4a2          graph 1000.86/999.53 -> 1001.94/999.69 (0.999x, same) | kiso 1111.06/1151.55 -> 1128.80/1111.01 (1.010x, same) | hash= True
+    M=    6 same_set_r1            graph 948.74/951.12 -> 941.55/945.81 (1.007x, faster) | kiso 1016.71/1018.07 -> 1041.59/1076.85 (0.961x, slower) | hash= True
+    M=    6 own_vs_own             graph 1000.86/999.53 -> 941.55/945.81 (1.060x, faster) | kiso 1111.06/1151.55 -> 1041.59/1076.85 (1.068x, faster) | hash= True
+    M=    6 1001r1_within_base     graph 1000.86/999.53 -> 948.74/951.12 (1.053x, faster) | kiso 1111.06/1151.55 -> 1016.71/1018.07 (1.112x, faster) | hash= True
+    M=    6 1001r1_within_c51r1    graph 1001.94/999.69 -> 941.55/945.81 (1.061x, faster) | kiso 1128.80/1111.01 -> 1041.59/1076.85 (1.057x, faster) | hash= True
+    M=   16 same_set_s4a2          graph 1028.61/1026.30 -> 1030.11/1027.65 (0.999x, same) | kiso 1166.49/1168.65 -> 1170.08/1111.70 (1.023x, same) | hash= True
+    M=   16 same_set_r1            graph 978.65/974.45 -> 972.24/984.76 (0.998x, same) | kiso 1062.50/1124.91 -> 1116.07/1129.06 (0.974x, same) | hash= True
+    M=   16 own_vs_own             graph 1028.61/1026.30 -> 972.24/984.76 (1.050x, faster) | kiso 1166.49/1168.65 -> 1116.07/1129.06 (1.040x, faster) | hash= True
+    M=   16 1001r1_within_base     graph 1028.61/1026.30 -> 978.65/974.45 (1.052x, faster) | kiso 1166.49/1168.65 -> 1062.50/1124.91 (1.068x, faster) | hash= True
+    M=   16 1001r1_within_c51r1    graph 1030.11/1027.65 -> 972.24/984.76 (1.051x, faster) | kiso 1170.08/1111.70 -> 1116.07/1129.06 (1.016x, same) | hash= True
+    M=   17 same_set_s4a2          graph 1040.26/1038.74 -> 1039.67/1037.88 (1.001x, same) | kiso 1135.16/1192.95 -> 1198.37/1193.08 (0.974x, slower) | hash= True
+    M=   17 same_set_r1            graph 997.51/995.97 -> 991.13/996.98 (1.003x, same) | kiso 1154.20/1098.88 -> 1186.74/1162.35 (0.959x, slower) | hash= True
+    M=   17 own_vs_own             graph 1040.26/1038.74 -> 991.13/996.98 (1.046x, faster) | kiso 1135.16/1192.95 -> 1186.74/1162.35 (0.991x, same) | hash= True
+    M=   17 1001r1_within_base     graph 1040.26/1038.74 -> 997.51/995.97 (1.043x, faster) | kiso 1135.16/1192.95 -> 1154.20/1098.88 (1.033x, same) | hash= True
+    M=   17 1001r1_within_c51r1    graph 1039.67/1037.88 -> 991.13/996.98 (1.045x, faster) | kiso 1198.37/1193.08 -> 1186.74/1162.35 (1.018x, faster) | hash= True
+    M=   24 same_set_s4a2          graph 1059.08/1056.86 -> 1056.72/1056.90 (1.001x, same) | kiso 1181.58/1218.23 -> 1231.75/1214.31 (0.981x, same) | hash= True
+    M=   24 same_set_r1            graph 1019.64/1011.83 -> 1008.17/1007.76 (1.008x, faster) | kiso 1186.83/1126.23 -> 1116.11/1171.57 (1.011x, same) | hash= True
+    M=   24 own_vs_own             graph 1059.08/1056.86 -> 1008.17/1007.76 (1.050x, faster) | kiso 1181.58/1218.23 -> 1116.11/1171.57 (1.049x, faster) | hash= True
+    M=   24 1001r1_within_base     graph 1059.08/1056.86 -> 1019.64/1011.83 (1.042x, faster) | kiso 1181.58/1218.23 -> 1186.83/1126.23 (1.038x, same) | hash= True
+    M=   24 1001r1_within_c51r1    graph 1056.72/1056.90 -> 1008.17/1007.76 (1.048x, faster) | kiso 1231.75/1214.31 -> 1116.11/1171.57 (1.069x, faster) | hash= True
+    M=   32 same_set_s4a2          graph 1085.59/1084.63 -> 1085.91/1084.16 (1.000x, same) | kiso 1261.39/1260.85 -> 1265.33/1270.17 (0.995x, slower) | hash= True
+    M=   32 same_set_r1            graph 1047.68/1041.77 -> 1037.14/1045.03 (1.003x, same) | kiso 1228.20/1275.06 -> 1258.15/1224.12 (1.008x, same) | hash= True
+    M=   32 own_vs_own             graph 1085.59/1084.63 -> 1037.14/1045.03 (1.042x, faster) | kiso 1261.39/1260.85 -> 1258.15/1224.12 (1.016x, faster) | hash= True
+    M=   32 1001r1_within_base     graph 1085.59/1084.63 -> 1047.68/1041.77 (1.039x, faster) | kiso 1261.39/1260.85 -> 1228.20/1275.06 (1.008x, same) | hash= True
+    M=   32 1001r1_within_c51r1    graph 1085.91/1084.16 -> 1037.14/1045.03 (1.042x, faster) | kiso 1265.33/1270.17 -> 1258.15/1224.12 (1.021x, faster) | hash= True
+    M=   64 same_set_s4a2          graph 1274.41/1267.88 -> 1266.77/1268.96 (1.003x, same) | kiso 1567.52/1568.87 -> 1581.70/1585.68 (0.990x, slower) | hash= True
+    M=   64 same_set_r1            graph 1229.70/1226.52 -> 1216.59/1221.11 (1.008x, faster) | kiso 1528.83/1500.69 -> 1461.55/1504.90 (1.021x, same) | hash= True
+    M=   64 own_vs_own             graph 1274.41/1267.88 -> 1216.59/1221.11 (1.043x, faster) | kiso 1567.52/1568.87 -> 1461.55/1504.90 (1.057x, faster) | hash= True
+    M=   64 1001r1_within_base     graph 1274.41/1267.88 -> 1229.70/1226.52 (1.035x, faster) | kiso 1567.52/1568.87 -> 1528.83/1500.69 (1.035x, faster) | hash= True
+    M=   64 1001r1_within_c51r1    graph 1266.77/1268.96 -> 1216.59/1221.11 (1.040x, faster) | kiso 1581.70/1585.68 -> 1461.55/1504.90 (1.068x, faster) | hash= True
+    M=   96 same_set_s4a2          graph 1659.22/1665.53 -> 1661.46/1666.71 (0.999x, same) | kiso 2110.71/2105.42 -> 2115.41/2134.62 (0.992x, slower) | hash= True
+    M=   96 same_set_r1            graph 1535.64/1539.12 -> 1539.61/1535.99 (1.000x, same) | kiso 1935.92/1970.15 -> 1966.92/2020.57 (0.980x, same) | hash= True
+    M=   96 own_vs_own             graph 1659.22/1665.53 -> 1539.61/1535.99 (1.081x, faster) | kiso 2110.71/2105.42 -> 1966.92/2020.57 (1.057x, faster) | hash= True
+    M=   96 1001r1_within_base     graph 1659.22/1665.53 -> 1535.64/1539.12 (1.081x, faster) | kiso 2110.71/2105.42 -> 1935.92/1970.15 (1.079x, faster) | hash= True
+    M=   96 1001r1_within_c51r1    graph 1661.46/1666.71 -> 1539.61/1535.99 (1.082x, faster) | kiso 2115.41/2134.62 -> 1966.92/2020.57 (1.066x, faster) | hash= True
+    M=   97 same_set_s4a2          graph 1690.63/1693.27 -> 1689.89/1696.10 (0.999x, same) | kiso 2160.83/2152.34 -> 2092.43/2139.52 (1.019x, faster) | hash= True
+    M=   97 same_set_r1            graph 1547.49/1544.23 -> 1552.84/1543.26 (0.999x, same) | kiso 1953.23/1907.45 -> 1961.94/2004.82 (0.973x, slower) | hash= True
+    M=   97 own_vs_own             graph 1690.63/1693.27 -> 1552.84/1543.26 (1.093x, faster) | kiso 2160.83/2152.34 -> 1961.94/2004.82 (1.087x, faster) | hash= True
+    M=   97 1001r1_within_base     graph 1690.63/1693.27 -> 1547.49/1544.23 (1.095x, faster) | kiso 2160.83/2152.34 -> 1953.23/1907.45 (1.117x, faster) | hash= True
+    M=   97 1001r1_within_c51r1    graph 1689.89/1696.10 -> 1552.84/1543.26 (1.094x, faster) | kiso 2092.43/2139.52 -> 1961.94/2004.82 (1.067x, faster) | hash= True
+    M=  104 same_set_s4a2          graph 1768.62/1777.00 -> 1775.84/1783.03 (0.996x, same) | kiso 2265.29/2230.21 -> 2279.68/2243.51 (0.994x, same) | hash= True
+    M=  104 same_set_r1            graph 1584.74/1576.48 -> 1574.34/1571.23 (1.005x, faster) | kiso 2050.09/2065.68 -> 2011.23/2051.70 (1.013x, same) | hash= True
+    M=  104 own_vs_own             graph 1768.62/1777.00 -> 1574.34/1571.23 (1.127x, faster) | kiso 2265.29/2230.21 -> 2011.23/2051.70 (1.106x, faster) | hash= True
+    M=  104 1001r1_within_base     graph 1768.62/1777.00 -> 1584.74/1576.48 (1.122x, faster) | kiso 2265.29/2230.21 -> 2050.09/2065.68 (1.092x, faster) | hash= True
+    M=  104 1001r1_within_c51r1    graph 1775.84/1783.03 -> 1574.34/1571.23 (1.131x, faster) | kiso 2279.68/2243.51 -> 2011.23/2051.70 (1.113x, faster) | hash= True
+    M=  107 same_set_s4a2          graph 1783.22/1804.62 -> 1813.16/1798.30 (0.993x, same) | kiso 2282.76/2311.95 -> 2276.18/2304.03 (1.003x, same) | hash= True
+    M=  107 same_set_r1            graph 1586.31/1600.17 -> 1590.27/1610.08 (0.996x, same) | kiso 2094.50/2079.16 -> 2065.39/2091.82 (1.004x, same) | hash= True
+    M=  107 own_vs_own             graph 1783.22/1804.62 -> 1590.27/1610.08 (1.121x, faster) | kiso 2282.76/2311.95 -> 2065.39/2091.82 (1.105x, faster) | hash= True
+    M=  107 1001r1_within_base     graph 1783.22/1804.62 -> 1586.31/1600.17 (1.126x, faster) | kiso 2282.76/2311.95 -> 2094.50/2079.16 (1.101x, faster) | hash= True
+    M=  107 1001r1_within_c51r1    graph 1813.16/1798.30 -> 1590.27/1610.08 (1.128x, faster) | kiso 2276.18/2304.03 -> 2065.39/2091.82 (1.102x, faster) | hash= True
+    M=  112 same_set_s4a2          graph 1846.88/1848.27 -> 1850.24/1835.62 (1.003x, same) | kiso 2336.36/2356.97 -> 2358.70/2300.79 (1.007x, same) | hash= True
+    M=  112 same_set_r1            graph 1605.03/1603.12 -> 1604.98/1599.15 (1.001x, same) | kiso 2122.23/2040.65 -> 2092.94/2548.75 (0.897x, same) | hash= True
+    M=  112 own_vs_own             graph 1846.88/1848.27 -> 1604.98/1599.15 (1.153x, faster) | kiso 2336.36/2356.97 -> 2092.94/2548.75 (1.011x, same) | hash= True
+    M=  112 1001r1_within_base     graph 1846.88/1848.27 -> 1605.03/1603.12 (1.152x, faster) | kiso 2336.36/2356.97 -> 2122.23/2040.65 (1.127x, faster) | hash= True
+    M=  112 1001r1_within_c51r1    graph 1850.24/1835.62 -> 1604.98/1599.15 (1.150x, faster) | kiso 2358.70/2300.79 -> 2092.94/2548.75 (1.004x, same) | hash= True
+    M=  120 same_set_s4a2          graph 1926.36/1955.40 -> 1931.93/1931.36 (1.005x, same) | kiso 2472.51/2470.89 -> 2472.24/2490.48 (0.996x, same) | hash= True
+    M=  120 same_set_r1            graph 1684.66/1656.28 -> 1742.69/1774.69 (0.950x, slower) | kiso 2205.87/2143.11 -> 2289.56/2316.89 (0.944x, slower) | hash= True
+    M=  120 own_vs_own             graph 1926.36/1955.40 -> 1742.69/1774.69 (1.104x, faster) | kiso 2472.51/2470.89 -> 2289.56/2316.89 (1.073x, faster) | hash= True
+    M=  120 1001r1_within_base     graph 1926.36/1955.40 -> 1684.66/1656.28 (1.162x, faster) | kiso 2472.51/2470.89 -> 2205.87/2143.11 (1.137x, faster) | hash= True
+    M=  120 1001r1_within_c51r1    graph 1931.93/1931.36 -> 1742.69/1774.69 (1.098x, faster) | kiso 2472.24/2490.48 -> 2289.56/2316.89 (1.077x, faster) | hash= True
+    M=  128 same_set_s4a2          graph 2053.01/2047.70 -> 2030.88/2020.82 (1.012x, faster) | kiso 2604.22/2545.22 -> 2616.28/2533.30 (1.000x, same) | hash= True
+    M=  128 same_set_r1            graph 1730.36/1722.70 -> 1717.77/1773.58 (0.989x, same) | kiso 2276.94/2261.55 -> 2256.90/2274.64 (1.002x, same) | hash= True
+    M=  128 own_vs_own             graph 2053.01/2047.70 -> 1717.77/1773.58 (1.175x, faster) | kiso 2604.22/2545.22 -> 2256.90/2274.64 (1.136x, faster) | hash= True
+    M=  128 1001r1_within_base     graph 2053.01/2047.70 -> 1730.36/1722.70 (1.188x, faster) | kiso 2604.22/2545.22 -> 2276.94/2261.55 (1.135x, faster) | hash= True
+    M=  128 1001r1_within_c51r1    graph 2030.88/2020.82 -> 1717.77/1773.58 (1.160x, faster) | kiso 2616.28/2533.30 -> 2256.90/2274.64 (1.136x, faster) | hash= True
+== E_splitk
+  compressor_wkv_wgate_1024x5120_x2_fp32
+    M=    1 graph 14.99/15.10 -> 15.68/15.01 (0.980x, same) | kiso 14.64/14.61 -> 14.62/14.57 (1.002x, same) | eager 14.85/15.08 -> 77.68/14.90 (0.323x, same) | hash= True
+    M=    6 graph 15.61/15.56 -> 15.61/15.50 (1.002x, same) | kiso 15.16/15.19 -> 15.15/18.02 (0.915x, same) | eager 15.42/16.06 -> 76.94/18.74 (0.329x, slower) | hash= True
+    M=   16 graph 16.89/16.85 -> 16.78/16.79 (1.005x, faster) | kiso 16.71/16.78 -> 19.06/16.52 (0.941x, same) | eager 19.57/16.79 -> 18.66/16.75 (1.027x, same) | hash= True
+    M=   24 graph 16.43/16.45 -> 16.44/16.37 (1.002x, same) | kiso 16.26/17.02 -> 16.23/16.15 (1.028x, faster) | eager 16.17/16.17 -> 16.14/16.35 (0.995x, same) | hash= True
+    M=   32 graph 17.07/17.24 -> 16.99/17.09 (1.007x, same) | kiso 17.43/16.71 -> 16.71/16.67 (1.023x, same) | eager 16.82/17.04 -> 16.78/16.79 (1.009x, faster) | hash= True
+    M=   48 graph 26.83/26.78 -> 26.89/26.66 (1.001x, same) | kiso 27.90/26.87 -> 30.69/26.86 (0.952x, same) | eager 26.79/26.68 -> 26.62/26.64 (1.004x, faster) | hash= True
+    M=   64 graph 28.06/28.14 -> 28.14/28.13 (0.999x, same) | kiso 33.22/28.15 -> 32.41/30.13 (0.981x, same) | eager 28.02/28.39 -> 28.00/28.09 (1.006x, same) | hash= True
+    M=   96 graph 48.41/48.88 -> 48.36/48.39 (1.006x, faster) | kiso 56.81/49.30 -> 53.76/49.35 (1.029x, same) | eager 48.30/51.17 -> 48.28/48.35 (1.029x, same) | hash= True
+    M=  107 graph 49.16/49.86 -> 49.39/49.74 (0.999x, same) | kiso 49.69/50.39 -> 49.85/50.20 (1.000x, same) | eager 49.10/53.42 -> 49.31/50.83 (1.024x, same) | hash= True
+    M=  128 graph 51.13/51.66 -> 51.34/51.58 (0.999x, same) | kiso 51.87/52.32 -> 51.96/52.02 (1.002x, same) | eager 53.78/52.52 -> 53.38/53.64 (0.993x, same) | hash= True
+  compressor_wkv_512x5120_bf16
+    M=    1 graph 9.26/9.38 -> 9.35/9.35 (0.997x, same) | kiso 14.94/9.51 -> 12.44/9.11 (1.135x, same) | eager 13.47/13.39 -> 14.09/13.29 (0.981x, same) | hash= True
+    M=    6 graph 9.61/9.66 -> 9.64/9.60 (1.002x, same) | kiso 9.80/9.36 -> 9.37/9.39 (1.021x, same) | eager 13.20/12.87 -> 13.66/12.93 (0.980x, same) | hash= True
+    M=   16 graph 10.17/10.23 -> 10.17/10.17 (1.003x, same) | kiso 10.70/10.16 -> 10.62/10.21 (1.001x, same) | eager 14.01/12.98 -> 13.09/12.40 (1.059x, same) | hash= True
+    M=   24 graph 13.00/13.08 -> 12.98/13.10 (1.000x, same) | kiso 11.31/11.85 -> 11.82/11.41 (0.997x, same) | eager 14.50/12.74 -> 14.78/12.63 (0.994x, same) | hash= True
+    M=   32 graph 13.59/13.77 -> 13.75/13.71 (0.996x, same) | kiso 11.76/11.89 -> 11.83/11.80 (1.001x, same) | eager 13.53/17.01 -> 16.89/12.65 (1.034x, same) | hash= True
+    M=   48 graph 15.74/15.94 -> 15.79/16.03 (0.996x, same) | kiso 15.86/15.70 -> 15.74/15.80 (1.001x, same) | eager 15.57/15.95 -> 15.74/15.92 (0.996x, same) | hash= True
+    M=   64 graph 17.19/17.40 -> 17.12/17.29 (1.005x, same) | kiso 16.99/16.81 -> 21.61/24.64 (0.731x, slower) | eager 17.07/17.28 -> 19.20/17.27 (0.942x, same) | hash= True
+    M=   96 graph 28.14/28.28 -> 28.12/28.25 (1.001x, same) | kiso 27.76/28.13 -> 29.64/29.89 (0.939x, slower) | eager 29.31/28.23 -> 28.08/28.16 (1.023x, faster) | hash= True
+    M=  107 graph 28.96/29.05 -> 28.84/28.90 (1.005x, faster) | kiso 28.41/28.78 -> 28.32/28.54 (1.006x, same) | eager 28.88/32.57 -> 28.69/29.27 (1.060x, same) | hash= True
+    M=  128 graph 30.50/30.54 -> 30.40/30.49 (1.002x, faster) | kiso 29.99/32.24 -> 30.15/30.06 (1.034x, same) | eager 33.39/30.50 -> 30.21/34.29 (0.991x, same) | hash= True
+{
+ "A_gemm:compressor_down_512x10240": {
+  "graph": {
+   "same": 8
+  },
+  "kernel": {
+   "same": 8
+  },
+  "kernel_isolated": {
+   "slower": 1,
+   "same": 6,
+   "faster": 1
+  },
+  "eager": {
+   "same": 5,
+   "faster": 2,
+   "slower": 1
+  }
+ },
+ "A_gemm:compressor_up_5120x512": {
+  "graph": {
+   "faster": 8
+  },
+  "kernel": {
+   "slower": 6,
+   "same": 2
+  },
+  "kernel_isolated": {
+   "faster": 5,
+   "same": 3
+  },
+  "eager": {
+   "faster": 7,
+   "same": 1
+  }
+ },
+ "A_gemm:indexer_wq_b_4096x1280": {
+  "graph": {
+   "faster": 8
+  },
+  "kernel": {
+   "slower": 7,
+   "same": 1
+  },
+  "kernel_isolated": {
+   "same": 1,
+   "faster": 7
+  },
+  "eager": {
+   "faster": 8
+  }
+ },
+ "A_gemm:indexer_wk_128x5120": {
+  "graph": {
+   "same": 8
+  },
+  "kernel": {
+   "same": 7,
+   "faster": 1
+  },
+  "kernel_isolated": {
+   "same": 7,
+   "slower": 1
+  },
+  "eager": {
+   "same": 6,
+   "slower": 1,
+   "faster": 1
+  }
+ },
+ "B_proj_own": {
+  "graph": {
+   "faster": 26
+  },
+  "kernel": {
+   "faster": 26
+  },
+  "kernel_isolated": {
+   "faster": 26
+  },
+  "eager": {
+   "faster": 26
+  }
+ },
+ "B_proj_same_cfg_all_tiles": {},
+ "B_proj_tile128_s4a2": {
+  "graph": {
+   "faster": 10
+  },
+  "kernel": {
+   "faster": 10
+  },
+  "kernel_isolated": {
+   "faster": 10
+  },
+  "eager": {
+   "faster": 10
+  }
+ },
+ "B_proj_tile128_s2": {
+  "graph": {
+   "faster": 10
+  },
+  "kernel": {
+   "faster": 10
+  },
+  "kernel_isolated": {
+   "faster": 10
+  },
+  "eager": {
+   "faster": 10
+  }
+ },
+ "C_greedy_own": {
+  "graph": {
+   "faster": 22
+  },
+  "kernel": {
+   "faster": 22
+  },
+  "kernel_isolated": {
+   "faster": 22
+  },
+  "eager": {
+   "faster": 22
+  }
+ },
+ "C_greedy_same_cfg_all_tiles": {},
+ "C_greedy_tile128_s4a2": {
+  "graph": {
+   "faster": 6
+  },
+  "kernel": {
+   "faster": 6
+  },
+  "kernel_isolated": {
+   "faster": 6
+  },
+  "eager": {
+   "faster": 6
+  }
+ },
+ "C_greedy_tile128_s2": {
+  "graph": {
+   "faster": 6
+  },
+  "kernel": {
+   "faster": 6
+  },
+  "kernel_isolated": {
+   "faster": 6
+  },
+  "eager": {
+   "faster": 6
+  }
+ },
+ "D_screen_same_set_s4a2": {
+  "graph": {
+   "faster": 3,
+   "slower": 4,
+   "same": 21
+  },
+  "kernel": {
+   "faster": 8,
+   "same": 14,
+   "slower": 6
+  },
+  "kernel_isolated": {
+   "same": 19,
+   "slower": 7,
+   "faster": 2
+  },
+  "eager": {
+   "same": 20,
+   "slower": 5,
+   "faster": 3
+  }
+ },
+ "D_screen_same_set_r1": {
+  "graph": {
+   "same": 22,
+   "faster": 5,
+   "slower": 1
+  },
+  "kernel": {
+   "same": 20,
+   "slower": 5,
+   "faster": 3
+  },
+  "kernel_isolated": {
+   "same": 23,
+   "slower": 5
+  },
+  "eager": {
+   "same": 14,
+   "faster": 9,
+   "slower": 5
+  }
+ },
+ "D_screen_own": {
+  "graph": {
+   "faster": 28
+  },
+  "kernel": {
+   "faster": 26,
+   "same": 2
+  },
+  "kernel_isolated": {
+   "faster": 22,
+   "same": 6
+  },
+  "eager": {
+   "faster": 27,
+   "same": 1
+  }
+ },
+ "D_screen_1001r1_within_base": {
+  "graph": {
+   "faster": 28
+  },
+  "kernel": {
+   "faster": 26,
+   "slower": 1,
+   "same": 1
+  },
+  "kernel_isolated": {
+   "faster": 20,
+   "same": 8
+  },
+  "eager": {
+   "faster": 27,
+   "same": 1
+  }
+ },
+ "D_screen_1001r1_within_c51r1": {
+  "graph": {
+   "faster": 28
+  },
+  "kernel": {
+   "faster": 26,
+   "same": 2
+  },
+  "kernel_isolated": {
+   "same": 5,
+   "faster": 23
+  },
+  "eager": {
+   "faster": 27,
+   "same": 1
+  }
+ },
+ "E_splitk": {
+  "graph": {
+   "same": 16,
+   "faster": 4
+  },
+  "kernel": {
+   "same": 16,
+   "slower": 2,
+   "faster": 2
+  },
+  "kernel_isolated": {
+   "same": 17,
+   "faster": 1,
+   "slower": 2
+  },
+  "eager": {
+   "same": 16,
+   "slower": 1,
+   "faster": 3
+  }
+ }
+}
+errors: {}

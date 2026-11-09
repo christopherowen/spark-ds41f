@@ -1,0 +1,1133 @@
+{
+ "pr": 998,
+ "round": 1,
+ "candidate": "candidate-53",
+ "patch": "vllm/0785-perf-worker-compact-packed-vocab-tables-and-expand-d.patch",
+ "verdict": "corrected-meets-mark",
+ "verdict_reason": "Both release-test failures were #998's and both are fixed by a narrow change (3 files, +20/-8). On the path serving takes at TP3 (TileLang head, carve-out on), the corrected patch saves 1,023.1 MiB of regular memory a rank (deterministic, both runs), moves draft-MoE slabs whose layers run 7.0-8.6% (layer 0) and 1.5-2.6% (layer 1) faster beyond the interval, and every vocab, head, markov and MoE output is bit-identical to the base. Caveats: the saving is 1,023 MiB, not the PR's 1,263 MiB, because on this base the lm_head's carve-out buffer already holds candidate-50 0763's screening table and has no slack (the PR's own script still reports 1,263 because it builds the 1107 layout); the startup floor and the prefill/decode core metrics need the screen at tp3-switched and were not measured here; the as-shipped candidate-53 cannot load the head at TP3 at all.",
+ "base_of_patch": "candidate-53 series through 0784 (vllm tree c0e25ff1 minus 0785); corrected tree d0ecca479dfd24baadba2044db71754e9410f7e8",
+ "host": "sp8 (spark-0016), one GB10",
+ "image": "spark-ds41f:candidate-50 sha256:8c1ea1f62f62c3e2adc03b645c091a5499cf7163101aca32875c894b96f155db",
+ "arms": {
+  "base": "candidate-50 + candidate-50/no1009/overlay (4 files)",
+  "c53": "candidate-50 + candidate-53 tree (c0e25ff1) versions of the 33 differing source files",
+  "fix": "candidate-50 + corrected tree (d0ecca47) versions of the same 33 files"
+ },
+ "root_causes": [
+  {
+   "failure": "tests/kernels/quantization/test_deepseek_v41_tilelang_vocab.py: Fatal Python error: Segmentation fault (exit 139/-11)",
+   "test": "test_packed_bf16_lm_head_carveout_shares_single_buffer_with_screen_wq",
+   "kernel": "build_screen_weights (vocab.py:2727, W_q[start:end] = (sign << 7) | u7), reached from PackedBf16LmHeadMethod.process_weights_after_loading -> _ensure_screen_weights",
+   "cause": "Use after free, not an out-of-bounds read of the compacted tables. #998 was written on 1107, where the lm_head carve-out buffer held only the BF16 head. candidate-50's 0763 (certified two-pass lm_head vocab screen) allocates the TileLang head's carve-out buffer at n x 1.25k BF16 and sets layer._carveout_screen_wq, a view of the buffer's tail at [1.5nk, 2.5nk) bytes, for the 8-bit screening table. #998's display_carveout.compact(packed.values) copies only the packed rows into a new tight buffer and closes the old one (cuMemFree + cuDestroyExternalMemory), so the screening view dangles; build_screen_weights then writes into the freed range. Diagnostic (test shape n=16384, k=4096): before compact the view lies in the live 160 MiB buffer at 0x334e00000; after it the only buffer is a new 96 MiB one at 0xf5a010600000 and cuPointerGetAttribute on the view returns CUDA_ERROR_INVALID_VALUE (no mapping). The fixed tree keeps the 160 MiB buffer with the view inside it. A semantic conflict between #998 and 0763: no file conflict, so stacking found nothing.",
+   "serving_impact": "Serving takes this path at every TP3 shape (tp3-triangle sets SPARK_DS41F_DISPLAY_CARVEOUT_WEIGHTS=1; tp3-switched and tp3-triangle-4k extend it; the recipe runs --linear-backend tilelang). At the TP3 shard shape (43,136 x 5,120) candidate-53 fails at the same write with 'CUDA error: invalid argument' (raw/bench-serving-c53-boot1.txt), so no TP3 rank of candidate-53 as built can load its head.",
+   "fix": "packed_bf16.py: compact the head only when its buffer holds no screening table (getattr(layer, '_carveout_screen_wq', None) is None). With the table the buffer is exactly 2.5nk bytes (1.5nk packed + 1.0nk table), so there is no slack to reclaim and nothing is lost. display_carveout.compact() docstring states the caller must hold the only live view. The embedding table still compacts (432 -> 320 MiB at TP3); the b12x head path (no screening table) still compacts."
+  },
+  {
+   "failure": "tests/kernels/quantization/test_deepseek_v41_expert_scale_codes.py::test_process_weights_replaces_w13_before_preparing_w2: AttributeError: '_Plan' object has no attribute 'max_rows' (tilelang.py:224)",
+   "cause": "#998 made TileLangExperts.process_weights_after_loading read self._plan.max_rows and self._plan._has_mid_tiles() unconditionally, on every shape, to decide its carve-out move; the test's minimal _Plan stub implements only prepare_weight.",
+   "decision": "Fix the code, not the test: the stub is not stale (it is the minimal contract of what weight preparation needs), the decode-only test serves only the carve-out move, and display_carveout.move() is a no-op without the carve-out. The test is now evaluated only when display_carveout.required(); without the carve-out (TP4, the switched TP4..TP8 shapes, the release tests) preparation is exactly the base's. MoeExpertsV41Plan always sets max_rows and _has_mid_tiles(), so the TP3 placement is unchanged (DSpark draft routers: max_rows = max_num_seqs x query_rows, decode-only; target routers: max_num_batched_tokens, mid tiles, not moved)."
+  }
+ ],
+ "reproduction": {
+  "sp8_c53_two_files": "exit 139: '.........................F' then Fatal Python error: Segmentation fault at vocab.py:2727 in build_screen_weights <- packed_bf16.py:136 <- test_deepseek_v41_tilelang_vocab.py:703 (raw/repro-c53-vocab-and-scale-codes.txt), the dgx2 trace exactly",
+  "sp8_c53_scale_codes_alone": "1 failed, 28 passed: AttributeError '_Plan' object has no attribute 'max_rows' at tilelang.py:224 (raw/repro-c53-scale-codes-alone.txt)",
+  "sp8_c53_serving_shape": "CUDA error: invalid argument at vocab.py:2727 (raw/bench-serving-c53-boot1.txt)"
+ },
+ "tests": {
+  "failing_two_files_fix": {
+   "passed": 104,
+   "failed": 0,
+   "note": "same count as dgx2's run with candidate-50's three files (104 passed)",
+   "output": "raw/failing-files-fix-run1.txt"
+  },
+  "files": [
+   "tests/kernels/quantization/test_deepseek_v41_expert_scale_codes.py",
+   "tests/kernels/quantization/test_deepseek_v41_tilelang_vocab.py",
+   "tests/v1/worker/test_display_carveout.py (the one test file #998 touches)",
+   "tests/models/test_dspark_mla.py",
+   "tests/model_executor/model_loader/test_direct_loader.py",
+   "tests/v1/worker/test_gpu_model_runner_v2.py",
+   "tests/kernels/test_deepseek_v41_tilelang_embedding.py",
+   "tests/kernels/moe/test_deepseek_v41_tilelang_moe.py (covers the changed fused_moe/tilelang.py)"
+  ],
+  "fix_run1": {
+   "passed": 480,
+   "failed": 0,
+   "skipped": 0,
+   "output": "raw/tests-fix-run1.txt"
+  },
+  "fix_run2": {
+   "passed": 480,
+   "failed": 0,
+   "skipped": 0,
+   "output": "raw/tests-fix-run2.txt"
+  },
+  "how": "the release-test runner's pytest flags and plugins (tblib_stub, offline_skip) from candidate-53's bundle, /dev/dri/card0 passed through, each run a fresh container"
+ },
+ "patch_checks": {
+  "applies_in_candidate_53_series": "git am (no --3way) on candidate-53's 0784 commit: clean; git diff --check clean; resulting tree d0ecca479dfd24baadba2044db71754e9410f7e8",
+  "author": "Christopher Owen <christopherowen@users.noreply.github.com>, Date Sun, 8 Nov 2026 19:29:28 +0000 (original)",
+  "files_changed_vs_candidate_53_0785": [
+   "vllm/model_executor/layers/fused_moe/tilelang.py",
+   "vllm/model_executor/layers/quantization/online/packed_bf16.py",
+   "vllm/v1/worker/display_carveout.py"
+  ],
+  "interdiff": "0785-r1-vs-candidate-53.diff (+20/-8, code and docstring only)",
+  "sha256_new": "6f4fd81df55e14e7cd56bca03626cd4c0631c73746a7a9f2e5359a517747f189",
+  "sha256_candidate_53_0785": "cbb393495e7a1ce58df0aa1fdeb00c05a514ccfd1aefb918e90a83508efc809f",
+  "not_run": "bin/spark doctor and bin/spark build check (no image builds; series applied on sp8, not the laptop)"
+ },
+ "own_mark": {
+  "mark": "regular UMA saved per rank (PR: 1,263 MiB at TP3), moved DSpark MoE layers not slower (PR: 8.5-12.3% faster), torch.equal, startup floor higher; acts only with SPARK_DS41F_DISPLAY_CARVEOUT_WEIGHTS=1 (TP3)",
+  "method": "bench_serving_path.py: the image's own layer code in serving order at TP3 shard shapes (embed_tokens 43,136 x 5,120 via VocabParallelEmbedding + TileLangEmbeddingMethod; lm_head via PackedBf16LmHeadMethod with the TileLang backend; DSparkMarkovHead.__init__; three decode-only TileLangExperts layers, 128 experts, top-3, I=768, router max_rows 40; confirm_streamed_weights as model_runner calls it), with the recipe's carve-out, allocator and head-dtype environment. Same session, base/fix/fix/base, each a fresh container. Times are CUDA-event medians of 200 after 30 warmup. The PR's own script runs on the fix arm only (it calls compact/move/total_bytes, which the base lacks); it builds the 1107 layout (lm_head buffer n x k, no screening table), so it is not the serving path on this base.",
+  "carveout_buffers_mib": {
+   "base": [
+    [
+     432,
+     528
+    ],
+    [
+     432,
+     528
+    ]
+   ],
+   "fix": [
+    [
+     320,
+     528,
+     64,
+     480,
+     240,
+     240
+    ],
+    [
+     320,
+     528,
+     64,
+     480,
+     240,
+     240
+    ]
+   ]
+  },
+  "placement_fix": {
+   "embed_tokens.weight": true,
+   "lm_head.weight": true,
+   "lm_head.screen_wq": true,
+   "markov_w1.weight": true,
+   "layer0.w13_weight": true,
+   "layer0.w2_weight": true,
+   "layer1.w13_weight": false,
+   "layer1.w2_weight": true,
+   "layer2.w13_weight": false,
+   "layer2.w2_weight": false
+  },
+  "memory_cells": {
+   "cuda_allocated_mib": {
+    "base": [
+     2294.405,
+     2294.405
+    ],
+    "fix": [
+     1271.28,
+     1271.28
+    ],
+    "saved_mean": 1023.13,
+    "saved_pairs": [
+     1023.13,
+     1023.13
+    ]
+   },
+   "cuda_reserved_mib": {
+    "base": [
+     2388.0,
+     2388.0
+    ],
+    "fix": [
+     1328.0,
+     1328.0
+    ],
+    "saved_mean": 1060.0,
+    "saved_pairs": [
+     1060.0,
+     1060.0
+    ]
+   },
+   "cuda_peak_reserved_mib": {
+    "base": [
+     2948.0,
+     2948.0
+    ],
+    "fix": [
+     1808.0,
+     1808.0
+    ],
+    "saved_mean": 1140.0,
+    "saved_pairs": [
+     1140.0,
+     1140.0
+    ]
+   },
+   "host_mem_available_used_mib": {
+    "base": [
+     2909.51,
+     2902.5
+    ],
+    "fix": [
+     1904.42,
+     1878.24
+    ],
+    "saved_mean": 1014.68,
+    "saved_pairs": [
+     1005.09,
+     1024.26
+    ]
+   },
+   "carveout_weights_regular_memory_mib": {
+    "base": [
+     2223.125,
+     2223.125
+    ],
+    "fix": [
+     1200.0,
+     1200.0
+    ],
+    "saved_mean": 1023.12,
+    "saved_pairs": [
+     1023.12,
+     1023.12
+    ]
+   },
+   "carveout_total_mib": {
+    "base": [
+     960,
+     960
+    ],
+    "fix": [
+     1872,
+     1872
+    ],
+    "saved_mean": -912.0,
+    "saved_pairs": [
+     -912,
+     -912
+    ]
+   }
+  },
+  "uma_saved_per_rank_tp3_mib": 1023.13,
+  "uma_saved_vs_pr_claim": "1,023.1 MiB vs the PR's 1,263.1 MiB: the lm_head buffer (528 MiB with its screening table) is not compacted, so 960 MiB of draft-expert slabs fit under _MAX_TOTAL_BYTES instead of 1,200 (layer-1 w13 and layer-2 w13/w2 stay in regular memory); 960 MiB is the most any subset of the slabs fits in the 1,056 MiB left",
+  "times_us": {
+   "embedding_M1": {
+    "base_us": [
+     11.3,
+     11.52
+    ],
+    "fix_us": [
+     11.3,
+     11.23
+    ],
+    "ratio_fix_over_base": 0.9873,
+    "delta_pct": -1.3,
+    "verdict": "within interval"
+   },
+   "embedding_M5": {
+    "base_us": [
+     11.14,
+     11.17
+    ],
+    "fix_us": [
+     11.14,
+     11.04
+    ],
+    "ratio_fix_over_base": 0.9942,
+    "delta_pct": -0.6,
+    "verdict": "within interval"
+   },
+   "embedding_M40": {
+    "base_us": [
+     11.17,
+     11.3
+    ],
+    "fix_us": [
+     11.39,
+     11.01
+    ],
+    "ratio_fix_over_base": 0.9969,
+    "delta_pct": -0.3,
+    "verdict": "within interval"
+   },
+   "embedding_M4096": {
+    "base_us": [
+     337.89,
+     329.92
+    ],
+    "fix_us": [
+     357.44,
+     354.34
+    ],
+    "ratio_fix_over_base": 1.0658,
+    "delta_pct": 6.6,
+    "verdict": "slower beyond interval"
+   },
+   "lm_head_logits_M1": {
+    "base_us": [
+     1285.54,
+     1284.35
+    ],
+    "fix_us": [
+     1281.31,
+     1282.27
+    ],
+    "ratio_fix_over_base": 0.9975,
+    "delta_pct": -0.2,
+    "verdict": "faster beyond interval"
+   },
+   "lm_head_greedy_pairs_M1": {
+    "base_us": [
+     907.04,
+     903.14
+    ],
+    "fix_us": [
+     903.42,
+     903.33
+    ],
+    "ratio_fix_over_base": 0.9981,
+    "delta_pct": -0.2,
+    "verdict": "within interval"
+   },
+   "lm_head_logits_M5": {
+    "base_us": [
+     1286.43,
+     1289.79
+    ],
+    "fix_us": [
+     1280.1,
+     1281.09
+    ],
+    "ratio_fix_over_base": 0.9942,
+    "delta_pct": -0.6,
+    "verdict": "faster beyond interval"
+   },
+   "lm_head_greedy_pairs_M5": {
+    "base_us": [
+     908.48,
+     904.35
+    ],
+    "fix_us": [
+     902.43,
+     902.27
+    ],
+    "ratio_fix_over_base": 0.9955,
+    "delta_pct": -0.4,
+    "verdict": "faster beyond interval"
+   },
+   "lm_head_logits_M40": {
+    "base_us": [
+     1383.55,
+     1367.42
+    ],
+    "fix_us": [
+     1415.39,
+     1424.45
+    ],
+    "ratio_fix_over_base": 1.0323,
+    "delta_pct": 3.2,
+    "verdict": "slower beyond interval"
+   },
+   "lm_head_greedy_pairs_M40": {
+    "base_us": [
+     1028.1,
+     1028.1
+    ],
+    "fix_us": [
+     1025.31,
+     1027.26
+    ],
+    "ratio_fix_over_base": 0.9982,
+    "delta_pct": -0.2,
+    "verdict": "faster beyond interval"
+   },
+   "markov_anchor_embed_reqs1": {
+    "base_us": [
+     9.82,
+     9.66
+    ],
+    "fix_us": [
+     10.08,
+     9.79
+    ],
+    "ratio_fix_over_base": 1.02,
+    "delta_pct": 2.0,
+    "verdict": "within interval"
+   },
+   "markov_anchor_embed_reqs3": {
+    "base_us": [
+     9.66,
+     9.7
+    ],
+    "fix_us": [
+     10.05,
+     9.86
+    ],
+    "ratio_fix_over_base": 1.0284,
+    "delta_pct": 2.8,
+    "verdict": "slower beyond interval"
+   },
+   "markov_anchor_embed_reqs8": {
+    "base_us": [
+     9.63,
+     11.14
+    ],
+    "fix_us": [
+     9.98,
+     9.79
+    ],
+    "ratio_fix_over_base": 0.9519,
+    "delta_pct": -4.8,
+    "verdict": "within interval"
+   },
+   "dspark_moe_layer0_M5": {
+    "base_us": [
+     376.67,
+     379.94
+    ],
+    "fix_us": [
+     346.4,
+     345.34
+    ],
+    "ratio_fix_over_base": 0.9143,
+    "delta_pct": -8.6,
+    "verdict": "faster beyond interval"
+   },
+   "dspark_moe_layer0_M15": {
+    "base_us": [
+     969.98,
+     988.19
+    ],
+    "fix_us": [
+     906.66,
+     914.75
+    ],
+    "ratio_fix_over_base": 0.9302,
+    "delta_pct": -7.0,
+    "verdict": "faster beyond interval"
+   },
+   "dspark_moe_layer0_M40": {
+    "base_us": [
+     1887.26,
+     1921.28
+    ],
+    "fix_us": [
+     1756.16,
+     1760.32
+    ],
+    "ratio_fix_over_base": 0.9233,
+    "delta_pct": -7.7,
+    "verdict": "faster beyond interval"
+   },
+   "dspark_moe_layer1_M5": {
+    "base_us": [
+     368.93,
+     366.88
+    ],
+    "fix_us": [
+     362.56,
+     357.6
+    ],
+    "ratio_fix_over_base": 0.9787,
+    "delta_pct": -2.1,
+    "verdict": "faster beyond interval"
+   },
+   "dspark_moe_layer1_M15": {
+    "base_us": [
+     971.81,
+     967.68
+    ],
+    "fix_us": [
+     940.29,
+     949.31
+    ],
+    "ratio_fix_over_base": 0.9743,
+    "delta_pct": -2.6,
+    "verdict": "faster beyond interval"
+   },
+   "dspark_moe_layer1_M40": {
+    "base_us": [
+     1866.91,
+     1871.1
+    ],
+    "fix_us": [
+     1832.0,
+     1850.59
+    ],
+    "ratio_fix_over_base": 0.9852,
+    "delta_pct": -1.5,
+    "verdict": "faster beyond interval"
+   },
+   "dspark_moe_layer2_M5": {
+    "base_us": [
+     367.01,
+     362.78
+    ],
+    "fix_us": [
+     364.58,
+     366.85
+    ],
+    "ratio_fix_over_base": 1.0022,
+    "delta_pct": 0.2,
+    "verdict": "within interval"
+   },
+   "dspark_moe_layer2_M15": {
+    "base_us": [
+     972.99,
+     954.66
+    ],
+    "fix_us": [
+     973.09,
+     964.0
+    ],
+    "ratio_fix_over_base": 1.0049,
+    "delta_pct": 0.5,
+    "verdict": "within interval"
+   },
+   "dspark_moe_layer2_M40": {
+    "base_us": [
+     1880.38,
+     1845.31
+    ],
+    "fix_us": [
+     1880.19,
+     1851.42
+    ],
+    "ratio_fix_over_base": 1.0016,
+    "delta_pct": 0.2,
+    "verdict": "within interval"
+   }
+  },
+  "moved_moe_verdict": "layer 0 (w13+w2 in carve-out) 7.0-8.6% faster and layer 1 (w2 only) 1.5-2.6% faster, beyond the interval at M=5,15,40; layer 2 (none moved) within the interval",
+  "bit_exact": {
+   "all_hashes_equal": true,
+   "compared": 36,
+   "output_keys": [
+    "dspark_moe_layer0_M15",
+    "dspark_moe_layer0_M40",
+    "dspark_moe_layer0_M5",
+    "dspark_moe_layer1_M15",
+    "dspark_moe_layer1_M40",
+    "dspark_moe_layer1_M5",
+    "dspark_moe_layer2_M15",
+    "dspark_moe_layer2_M40",
+    "dspark_moe_layer2_M5",
+    "embedding_M1",
+    "embedding_M40",
+    "embedding_M4096",
+    "embedding_M5",
+    "lm_head_greedy_pairs_M1",
+    "lm_head_greedy_pairs_M40",
+    "lm_head_greedy_pairs_M5",
+    "lm_head_logits_M1",
+    "lm_head_logits_M40",
+    "lm_head_logits_M5",
+    "markov_anchor_embed_reqs1",
+    "markov_anchor_embed_reqs3",
+    "markov_anchor_embed_reqs8"
+   ],
+   "mismatch": {}
+  },
+  "rows_beyond_interval_slower": {
+   "embedding_M4096": {
+    "base_us": [
+     337.89,
+     329.92
+    ],
+    "fix_us": [
+     357.44,
+     354.34
+    ],
+    "ratio_fix_over_base": 1.0658,
+    "delta_pct": 6.6,
+    "verdict": "slower beyond interval"
+   },
+   "lm_head_logits_M40": {
+    "base_us": [
+     1383.55,
+     1367.42
+    ],
+    "fix_us": [
+     1415.39,
+     1424.45
+    ],
+    "ratio_fix_over_base": 1.0323,
+    "delta_pct": 3.2,
+    "verdict": "slower beyond interval"
+   },
+   "markov_anchor_embed_reqs3": {
+    "base_us": [
+     9.66,
+     9.7
+    ],
+    "fix_us": [
+     10.05,
+     9.86
+    ],
+    "ratio_fix_over_base": 1.0284,
+    "delta_pct": 2.8,
+    "verdict": "slower beyond interval"
+   },
+   "attribution": "Not the placement. In-process controls (raw/json/control-inprocess-*.json): in the fix image the compacted table and the same bytes in an unpacked-size 432 MiB buffer (the base layout) run 352.4 vs 354.3 us (boot2) and 354.6 vs 351.3 us (boot1b) at M=4096, the sign flipping; the base image's own served table runs 354.4 us in its control, as the fix image's does, against 330-338 us in its two ABBA runs. The lm_head buffer is the same allocation and bytes in both images; mapping or closing 960 MiB of other carve-out buffers leaves logits M=40 at 1,390-1,405 us (fix) and 1,398 us (base). The markov row moves by 0.3 us. Run-to-run variation on the shared host (other agents' containers ran between the ABBA runs) explains them."
+  },
+  "inprocess_controls": {
+   "fix-boot2": {
+    "embedding_tables": {
+     "served": {
+      "va": "0x327c00000",
+      "buffer_mib": 320
+     },
+     "unpacked_prefix": {
+      "va": "0xfbf980000000",
+      "buffer_mib": 432
+     },
+     "regular": {
+      "va": "0x2580000000"
+     }
+    },
+    "embedding_M4096_median_us": {
+     "served": 352.35,
+     "unpacked_prefix": 354.27,
+     "regular": 342.4
+    },
+    "embedding_M4096_rounds_us": {
+     "served": [
+      352.32,
+      352.19,
+      353.47,
+      352.35,
+      352.38,
+      352.29
+     ],
+     "unpacked_prefix": [
+      354.46,
+      354.14,
+      355.39,
+      354.27,
+      354.24,
+      354.21
+     ],
+     "regular": [
+      342.18,
+      342.27,
+      343.26,
+      342.3,
+      342.91,
+      342.4
+     ]
+    },
+    "embedding_M40_median_us": {
+     "served": 10.94,
+     "unpacked_prefix": 10.91,
+     "regular": 11.33
+    },
+    "embedding_outputs_equal": true,
+    "head_median_us": {
+     "logits_M1_extra_mapped": 1279.2,
+     "logits_M1_extra_closed": 1280.22,
+     "logits_M5_extra_mapped": 1278.05,
+     "logits_M5_extra_closed": 1278.37,
+     "logits_M40_extra_mapped": 1405.34,
+     "logits_M40_extra_closed": 1405.25,
+     "greedy_pairs_M1_extra_mapped": 901.63,
+     "greedy_pairs_M1_extra_closed": 902.08,
+     "greedy_pairs_M5_extra_mapped": 901.34,
+     "greedy_pairs_M5_extra_closed": 901.31,
+     "greedy_pairs_M40_extra_mapped": 1025.09,
+     "greedy_pairs_M40_extra_closed": 1027.26
+    },
+    "head_outputs_equal": false,
+    "head_outputs_equal_note": "False here compares whole [rows, 4] greedy-pair tensors whose columns 2..3 are never written; the later runs compare the two written columns and logits: True"
+   },
+   "fix-boot1b": {
+    "embedding_tables": {
+     "served": {
+      "va": "0x327c00000",
+      "buffer_mib": 320
+     },
+     "unpacked_prefix": {
+      "va": "0xe065a0000000",
+      "buffer_mib": 432
+     },
+     "regular": {
+      "va": "0x2580000000"
+     }
+    },
+    "embedding_M4096_median_us": {
+     "served": 354.62,
+     "unpacked_prefix": 351.33,
+     "regular": 343.23
+    },
+    "embedding_M4096_rounds_us": {
+     "served": [
+      355.26,
+      355.39,
+      354.5,
+      354.62,
+      354.46,
+      354.59
+     ],
+     "unpacked_prefix": [
+      351.26,
+      351.2,
+      351.23,
+      351.33,
+      351.39,
+      351.46
+     ],
+     "regular": [
+      343.1,
+      343.26,
+      342.98,
+      343.26,
+      343.14,
+      343.23
+     ]
+    },
+    "embedding_M40_median_us": {
+     "served": 10.98,
+     "unpacked_prefix": 10.94,
+     "regular": 13.41
+    },
+    "embedding_outputs_equal": true,
+    "head_median_us": {
+     "logits_M1_extra_mapped": 1281.18,
+     "logits_M1_extra_closed": 1282.27,
+     "logits_M5_extra_mapped": 1279.07,
+     "logits_M5_extra_closed": 1284.29,
+     "logits_M40_extra_mapped": 1389.76,
+     "logits_M40_extra_closed": 1391.65,
+     "greedy_pairs_M1_extra_mapped": 903.07,
+     "greedy_pairs_M1_extra_closed": 909.7,
+     "greedy_pairs_M5_extra_mapped": 902.34,
+     "greedy_pairs_M5_extra_closed": 902.69,
+     "greedy_pairs_M40_extra_mapped": 1030.34,
+     "greedy_pairs_M40_extra_closed": 1031.3
+    },
+    "head_outputs_equal": true
+   },
+   "base-boot1b": {
+    "embedding_tables": {
+     "served": {
+      "va": "0xf8f9a0000000",
+      "buffer_mib": 432
+     },
+     "unpacked_prefix": {
+      "va": "0xf8f8e0000000",
+      "buffer_mib": 432
+     },
+     "regular": {
+      "va": "0x2580000000"
+     }
+    },
+    "embedding_M4096_median_us": {
+     "served": 354.4,
+     "unpacked_prefix": 354.4,
+     "regular": 344.99
+    },
+    "embedding_M4096_rounds_us": {
+     "served": [
+      355.26,
+      354.34,
+      354.4,
+      354.5,
+      354.37,
+      354.37
+     ],
+     "unpacked_prefix": [
+      354.46,
+      354.4,
+      354.62,
+      354.4,
+      354.37,
+      354.37
+     ],
+     "regular": [
+      344.26,
+      345.09,
+      345.02,
+      344.35,
+      344.22,
+      344.99
+     ]
+    },
+    "embedding_M40_median_us": {
+     "served": 10.85,
+     "unpacked_prefix": 10.94,
+     "regular": 10.75
+    },
+    "embedding_outputs_equal": true,
+    "head_median_us": {
+     "logits_M1_extra_mapped": 1282.18,
+     "logits_M1_extra_closed": 1281.86,
+     "logits_M5_extra_mapped": 1281.02,
+     "logits_M5_extra_closed": 1280.9,
+     "logits_M40_extra_mapped": 1398.05,
+     "logits_M40_extra_closed": 1398.05,
+     "greedy_pairs_M1_extra_mapped": 903.49,
+     "greedy_pairs_M1_extra_closed": 903.39,
+     "greedy_pairs_M5_extra_mapped": 905.5,
+     "greedy_pairs_M5_extra_closed": 903.3,
+     "greedy_pairs_M40_extra_mapped": 1030.43,
+     "greedy_pairs_M40_extra_closed": 1038.56
+    },
+    "head_outputs_equal": true
+   }
+  },
+  "pr_script_on_fix": {
+   "boot1": {
+    "tp3": {
+     "savings": {
+      "additional_carveout_buffers_mib": 1040,
+      "additional_carveout_weight_mib": 1263.125,
+      "uma_mem_available_saved_mib": 1654.98,
+      "uma_cuda_free_saved_mib": 1654.98,
+      "cuda_allocated_saved_mib": 1263.782,
+      "cuda_reserved_saved_mib": 1320.0,
+      "cuda_peak_reserved_saved_mib": 1500.0
+     },
+     "carveout_buffers_mib": [
+      320,
+      320,
+      64,
+      480,
+      240,
+      480
+     ],
+     "kernels": {
+      "markov_anchor_embed_reqs_1": {
+       "regular_us": 9.92,
+       "carveout_us": 10.08,
+       "ratio": 1.0161,
+       "bit_identical": true
+      },
+      "markov_anchor_embed_reqs_3": {
+       "regular_us": 9.86,
+       "carveout_us": 10.02,
+       "ratio": 1.0162,
+       "bit_identical": true
+      },
+      "markov_anchor_embed_reqs_8": {
+       "regular_us": 11.71,
+       "carveout_us": 9.89,
+       "ratio": 0.8446,
+       "bit_identical": true
+      },
+      "dspark_moe_M_5": {
+       "regular_us": 380.1,
+       "carveout_us": 345.38,
+       "ratio": 0.9087,
+       "bit_identical": true
+      },
+      "dspark_moe_M_15": {
+       "regular_us": 1104.13,
+       "carveout_us": 1017.76,
+       "ratio": 0.9218,
+       "bit_identical": true
+      },
+      "dspark_moe_M_40": {
+       "regular_us": 2914.43,
+       "carveout_us": 2838.94,
+       "ratio": 0.9741,
+       "bit_identical": true
+      },
+      "vocab_embedding_packed_M_1": {
+       "regular_us": 54.88,
+       "carveout_us": 53.6,
+       "ratio": 0.9767,
+       "bit_identical": true
+      },
+      "vocab_embedding_packed_M_5": {
+       "regular_us": 53.98,
+       "carveout_us": 51.49,
+       "ratio": 0.9539,
+       "bit_identical": true
+      },
+      "vocab_embedding_packed_M_40": {
+       "regular_us": 13.86,
+       "carveout_us": 10.98,
+       "ratio": 0.7922,
+       "bit_identical": true
+      },
+      "vocab_embedding_packed_M_4096": {
+       "regular_us": 240.67,
+       "carveout_us": 238.78,
+       "ratio": 0.9921,
+       "bit_identical": true
+      }
+     }
+    },
+    "tp4": {
+     "savings": {
+      "additional_carveout_buffers_mib": 1328,
+      "additional_carveout_weight_mib": 1463.125,
+      "uma_mem_available_saved_mib": 1491.62,
+      "uma_cuda_free_saved_mib": 1491.66,
+      "cuda_allocated_saved_mib": 1463.125,
+      "cuda_reserved_saved_mib": 1480.0,
+      "cuda_peak_reserved_saved_mib": 1160.0
+     },
+     "carveout_buffers_mib": [
+      240,
+      240,
+      64,
+      368,
+      160,
+      368,
+      160,
+      368
+     ],
+     "kernels": {
+      "markov_anchor_embed_reqs_1": {
+       "regular_us": 10.02,
+       "carveout_us": 10.11,
+       "ratio": 1.009,
+       "bit_identical": true
+      },
+      "markov_anchor_embed_reqs_3": {
+       "regular_us": 11.87,
+       "carveout_us": 9.98,
+       "ratio": 0.8408,
+       "bit_identical": true
+      },
+      "markov_anchor_embed_reqs_8": {
+       "regular_us": 11.81,
+       "carveout_us": 10.08,
+       "ratio": 0.8535,
+       "bit_identical": true
+      },
+      "dspark_moe_M_5": {
+       "regular_us": 276.7,
+       "carveout_us": 254.05,
+       "ratio": 0.9181,
+       "bit_identical": true
+      },
+      "dspark_moe_M_15": {
+       "regular_us": 806.88,
+       "carveout_us": 738.4,
+       "ratio": 0.9151,
+       "bit_identical": true
+      },
+      "dspark_moe_M_40": {
+       "regular_us": 2256.06,
+       "carveout_us": 2103.62,
+       "ratio": 0.9324,
+       "bit_identical": true
+      },
+      "vocab_embedding_packed_M_1": {
+       "regular_us": 10.62,
+       "carveout_us": 13.31,
+       "ratio": 1.2533,
+       "bit_identical": true
+      },
+      "vocab_embedding_packed_M_5": {
+       "regular_us": 11.87,
+       "carveout_us": 10.53,
+       "ratio": 0.8871,
+       "bit_identical": true
+      },
+      "vocab_embedding_packed_M_40": {
+       "regular_us": 10.75,
+       "carveout_us": 10.75,
+       "ratio": 1.0,
+       "bit_identical": true
+      },
+      "vocab_embedding_packed_M_4096": {
+       "regular_us": 241.79,
+       "carveout_us": 240.86,
+       "ratio": 0.9962,
+       "bit_identical": true
+      }
+     }
+    }
+   },
+   "boot2": {
+    "tp3": {
+     "savings": {
+      "additional_carveout_buffers_mib": 1040,
+      "additional_carveout_weight_mib": 1263.125,
+      "uma_mem_available_saved_mib": 1664.52,
+      "uma_cuda_free_saved_mib": 1664.52,
+      "cuda_allocated_saved_mib": 1263.125,
+      "cuda_reserved_saved_mib": 1320.0,
+      "cuda_peak_reserved_saved_mib": 1500.0
+     },
+     "carveout_buffers_mib": [
+      320,
+      320,
+      64,
+      480,
+      240,
+      480
+     ],
+     "kernels": {
+      "markov_anchor_embed_reqs_1": {
+       "regular_us": 9.86,
+       "carveout_us": 9.95,
+       "ratio": 1.0091,
+       "bit_identical": true
+      },
+      "markov_anchor_embed_reqs_3": {
+       "regular_us": 9.73,
+       "carveout_us": 9.82,
+       "ratio": 1.0092,
+       "bit_identical": true
+      },
+      "markov_anchor_embed_reqs_8": {
+       "regular_us": 9.5,
+       "carveout_us": 9.76,
+       "ratio": 1.0274,
+       "bit_identical": true
+      },
+      "dspark_moe_M_5": {
+       "regular_us": 377.73,
+       "carveout_us": 349.06,
+       "ratio": 0.9241,
+       "bit_identical": true
+      },
+      "dspark_moe_M_15": {
+       "regular_us": 1107.2,
+       "carveout_us": 1024.22,
+       "ratio": 0.9251,
+       "bit_identical": true
+      },
+      "dspark_moe_M_40": {
+       "regular_us": 2906.46,
+       "carveout_us": 2807.17,
+       "ratio": 0.9658,
+       "bit_identical": true
+      },
+      "vocab_embedding_packed_M_1": {
+       "regular_us": 10.37,
+       "carveout_us": 10.3,
+       "ratio": 0.9932,
+       "bit_identical": true
+      },
+      "vocab_embedding_packed_M_5": {
+       "regular_us": 10.66,
+       "carveout_us": 10.56,
+       "ratio": 0.9906,
+       "bit_identical": true
+      },
+      "vocab_embedding_packed_M_40": {
+       "regular_us": 13.25,
+       "carveout_us": 10.75,
+       "ratio": 0.8113,
+       "bit_identical": true
+      },
+      "vocab_embedding_packed_M_4096": {
+       "regular_us": 241.7,
+       "carveout_us": 235.68,
+       "ratio": 0.9751,
+       "bit_identical": true
+      }
+     }
+    },
+    "tp4": {
+     "savings": {
+      "additional_carveout_buffers_mib": 1328,
+      "additional_carveout_weight_mib": 1463.125,
+      "uma_mem_available_saved_mib": 1458.24,
+      "uma_cuda_free_saved_mib": 1458.24,
+      "cuda_allocated_saved_mib": 1462.633,
+      "cuda_reserved_saved_mib": 1480.0,
+      "cuda_peak_reserved_saved_mib": 1160.0
+     },
+     "carveout_buffers_mib": [
+      240,
+      240,
+      64,
+      368,
+      160,
+      368,
+      160,
+      368
+     ],
+     "kernels": {
+      "markov_anchor_embed_reqs_1": {
+       "regular_us": 9.89,
+       "carveout_us": 12.38,
+       "ratio": 1.2518,
+       "bit_identical": true
+      },
+      "markov_anchor_embed_reqs_3": {
+       "regular_us": 9.66,
+       "carveout_us": 12.35,
+       "ratio": 1.2785,
+       "bit_identical": true
+      },
+      "markov_anchor_embed_reqs_8": {
+       "regular_us": 9.92,
+       "carveout_us": 9.92,
+       "ratio": 1.0,
+       "bit_identical": true
+      },
+      "dspark_moe_M_5": {
+       "regular_us": 281.5,
+       "carveout_us": 254.21,
+       "ratio": 0.9031,
+       "bit_identical": true
+      },
+      "dspark_moe_M_15": {
+       "regular_us": 820.45,
+       "carveout_us": 746.69,
+       "ratio": 0.9101,
+       "bit_identical": true
+      },
+      "dspark_moe_M_40": {
+       "regular_us": 2261.09,
+       "carveout_us": 2107.52,
+       "ratio": 0.9321,
+       "bit_identical": true
+      },
+      "vocab_embedding_packed_M_1": {
+       "regular_us": 10.59,
+       "carveout_us": 10.53,
+       "ratio": 0.9943,
+       "bit_identical": true
+      },
+      "vocab_embedding_packed_M_5": {
+       "regular_us": 10.46,
+       "carveout_us": 10.46,
+       "ratio": 1.0,
+       "bit_identical": true
+      },
+      "vocab_embedding_packed_M_40": {
+       "regular_us": 10.75,
+       "carveout_us": 10.62,
+       "ratio": 0.9879,
+       "bit_identical": true
+      },
+      "vocab_embedding_packed_M_4096": {
+       "regular_us": 243.74,
+       "carveout_us": 241.63,
+       "ratio": 0.9913,
+       "bit_identical": true
+      }
+     }
+    }
+   }
+  },
+  "startup_floor": "not measured here: needs the screen's startup record at tp3-switched. The serving-path build used 1,005-1,024 MiB less host MemAvailable on the fix arm."
+ },
+ "bit_exactness": "All 36 hashes equal in all four ABBA runs: embedding lookups M=1,5,40,4096; FP32 head logits and certified greedy pairs M=1,5,40; markov_anchor_embed reqs=1,3,8; DSpark MoE layers 0-2 at M=5,15,40; and the packed embedding table and exceptions, packed head, all four screening tensors, markov_w1 and the six prepared expert slabs. The in-process controls also show identical outputs from compacted, unpacked-layout and regular-memory tables.",
+ "deliverables": {
+  "patch": "0785-perf-worker-compact-packed-vocab-tables-and-expand-d.patch",
+  "overlay": "overlay/vllm/{model_executor/layers/fused_moe/tilelang.py, model_executor/layers/quantization/online/packed_bf16.py, v1/worker/display_carveout.py}: the three files round 1 changes; mount each at /opt/spark-ds41f/candidate/vllm/vllm/<same path> over the candidate-53 image",
+  "commands": "commands.txt",
+  "raw": "raw/ (every run's output, raw/json, raw/cells.json, raw/commands.txt)",
+  "scripts": "scripts/ (bench_serving_path.py, control_inprocess.py, diag_screen_wq.py, analyze.py, and the PR's bench_carveout_expansion.py at e89ab5f9)"
+ },
+ "notes": [
+  "No pushes, commits to the deployment repository, PRs, image builds or cluster/window operations. dgx2 logs read over ssh only.",
+  "Every GPU run checked ~/spark-hold.json (absent) and for serving containers, under flock /tmp/spark-lab-gpu.lock. Other agents' containers ran between runs.",
+  "Failed runs kept: bench-serving-fix-smoke (script bug), control-inprocess-fix-boot1 (no CUDA context), control-inprocess-base-boot1 (base _Carveout has no close()); their fixes are noted in raw/commands.txt and none of them supplied data.",
+  "The candidate-53 README's 'commits no receipts' for #998 still applies to the PR; these are this rework's."
+ ]
+}

@@ -1,0 +1,102 @@
+perf(worker): compact packed vocab tables and expand display carve-out weights
+
+Base: 1107 vLLM patch head 320021e3c4dbb202d911ab70e2cd924c75420488.
+
+Rationale:
+On 119 GiB unified-memory GB10 nodes with SPARK_DS41F_DISPLAY_CARVEOUT_WEIGHTS=1, the firmware display carve-out (/dev/dri/card0, 2,032 MiB on dgx3 with 8 MiB console framebuffer, 2,045 MiB on headless nodes) previously held only unpacked allocations for embed_tokens.weight and lm_head.weight (2 x 432 = 864 MiB at TP3, 2 x 320 = 640 MiB at TP4):
+1. After 12-bit packing in TileLangEmbeddingMethod and PackedBf16LmHeadMethod, each shard occupies 315.64 MiB at TP3 (236.72 MiB at TP4), leaving 224 MiB at TP3 (160 MiB at TP4) of unused tail inside the two dumb buffers plus 1,168 MiB (TP3) / 1,392 MiB (TP4) of unallocated carve-out space.
+2. DSpark's replicated Markov anchor embedding (model.markov_head.markov_w1.weight, 129,280 x 256 BF16 = 63.125 MiB) missed _MIN_WEIGHT_BYTES = 64 MiB by 0.875 MiB and was allocated in ordinary UMA memory, even though it is only read by single-row anchor lookups during speculative drafting and never touched during prefill.
+3. DSpark's 3 draft MoE layers (model.layers.{0,1,2}.ffn.experts.w13_weight and w2_weight, 480 MiB + 240 MiB per layer at TP3, 360 MiB + 160 MiB at TP4) use a decode-only MoeExpertsV41Plan (max_rows is not None and not _has_mid_tiles()), never execute during prefill, and stream each active expert's weight slab at most once per draft step.
+
+Changes:
+- Add _Carveout.close(), display_carveout.total_bytes(), display_carveout.compact(), and display_carveout.move() with _MIN_WEIGHT_BYTES = 60 MiB and _MAX_TOTAL_BYTES = 1,968 MiB (leaving 64 MiB of free scanout heap on dgx3).
+- Compact embed_tokens.weight and lm_head.weight after in-place 12-bit packing into tight 320 MiB (TP3) / 240 MiB (TP4) dumb buffers reallocated at the bottom of the scanout heap with zero fragmentation.
+- Allocate DSparkMarkovHead.markov_w1.weight in the display carve-out via display_carveout.allocate, shrinking the drafter's _direct_weight_arena by 63.125 MiB and streaming markov_w1 directly into the carve-out.
+- Move decode-only TileLangExperts w13_weight and w2_weight slabs into the remaining carve-out budget via display_carveout.move (mtp.0 w13_weight, mtp.0 w2_weight, and mtp.1 w13_weight = 1,200 MiB at TP3; plus mtp.1 w2_weight and mtp.2 w13_weight = 1,400 MiB at TP4), and verify both target and speculator models in confirm_streamed_weights.
+
+Quality:
+Bit-identical outputs (torch.equal = True) across vocab_embedding_packed, PackedBf16LmHeadMethod, markov_anchor_embed, and MoeExpertsV41Plan.run. Saves 1,263.125 MiB (1.234 GiB) of regular UMA allocated memory (1,320 MiB reserved, ~1,669 MiB host MemAvailable) per rank at TP3 and 1,463.125 MiB (1.429 GiB) at TP4, while speeding up moved DSpark MoE layers by 8.5%-12.3% across M=5..40 with zero prefill impact.
+
+Tests:
+- pytest tests/v1/worker/test_display_carveout.py tests/models/test_dspark_mla.py tests/model_executor/model_loader/test_direct_loader.py tests/v1/worker/test_gpu_model_runner_v2.py tests/kernels/test_deepseek_v41_tilelang_embedding.py (234 passed).
+
+Upstream status: local GB10 display carve-out weight placement optimization.
+
+Round 1 (candidate-53 rework):
+Base: candidate-53's series through 0784 (spark-ds41f candidate-50 without
+0778, then #960 #971 #977 #984). candidate-53's release tests failed in two
+files with this patch, and both failures were this patch's.
+
+1. tests/kernels/quantization/test_deepseek_v41_tilelang_vocab.py crashed
+   (SIGSEGV) in test_packed_bf16_lm_head_carveout_shares_single_buffer_with_screen_wq,
+   at the screening-table write in build_screen_weights. The patch was written
+   on 1107, where the lm_head's carve-out buffer held only the BF16 head.
+   candidate-50's 0763 (certified two-pass lm_head vocabulary screen) sizes
+   the TileLang head's buffer at 1.25x and keeps the 8-bit screening table
+   in its tail, after the packed rows (layer._carveout_screen_wq). compact()
+   copied only the packed rows to a new buffer and closed the old one, so the
+   table's view pointed into freed memory (cuPointerGetAttribute reports no
+   mapping there) and _ensure_screen_weights wrote through it. Serving takes
+   the same path: TP3 runs --linear-backend tilelang with
+   SPARK_DS41F_DISPLAY_CARVEOUT_WEIGHTS=1, and at the TP3 shard shape
+   (43,136 x 5,120) the same write fails with "CUDA error: invalid argument",
+   so no TP3 rank could load its head.
+   Fix: PackedBf16LmHeadMethod compacts only a head whose buffer holds no
+   screening table. With the table the buffer has no slack (1.5*n*k bytes
+   packed plus 1.0*n*k bytes of table is its whole 2.5*n*k), so nothing is
+   given up. compact() now states that the caller must hold the only live
+   view of the buffer. The embedding table still compacts (432 -> 320 MiB
+   at TP3).
+
+2. tests/kernels/quantization/test_deepseek_v41_expert_scale_codes.py::
+   test_process_weights_replaces_w13_before_preparing_w2 failed with
+   "AttributeError: '_Plan' object has no attribute 'max_rows'":
+   TileLangExperts.process_weights_after_loading read the plan's max_rows
+   and _has_mid_tiles() on every load, and the test's minimal plan stub has
+   neither. The decode-only test serves only the carve-out move, so it now
+   runs only when the carve-out is required. Without the carve-out (TP4, the
+   switched shapes, the release tests) weight preparation is the base's and
+   asks nothing more of the plan. MoeExpertsV41Plan always sets both, so the
+   TP3 placement is unchanged. The test stub is left as it is.
+
+At TP3 the carve-out now holds 1,872 MiB in six buffers: embed_tokens 320,
+lm_head with its screening table 528, markov_w1 64, and the draft experts'
+layer-0 w13 480, layer-0 w2 240 and layer-1 w2 240. The head keeps its table,
+so 960 MiB of draft-expert slabs fit under _MAX_TOTAL_BYTES instead of
+1,200 MiB. 960 MiB is the most any choice of slabs could fit in the 1,056 MiB
+left. The "Changes" and "Quality" numbers above describe the 1107 layout; on
+this base.
+
+Image A/B on sp8 at the TP3 shard shapes, through the layer code as serving
+builds it (embed_tokens, the TileLang lm_head, DSparkMarkovHead, three
+decode-only TileLangExperts layers, confirm_streamed_weights), base
+candidate-50 without 0778, same session, base/candidate/candidate/base:
+- Regular memory: torch allocated 2,294.4 -> 1,271.3 MiB (-1,023.1 MiB a
+  rank: markov_w1 63.1 plus 960 MiB of draft-expert slabs), reserved
+  -1,060 MiB, peak reserved -1,140 MiB, host MemAvailable used -1,005 and
+  -1,024 MiB. Identical in both runs of each arm.
+- Draft MoE, M = 5, 15, 40: layer 0 (both slabs moved) 7.0-8.6% faster,
+  layer 1 (w2 moved) 1.5-2.6% faster, beyond the runs' interval; layer 2
+  (none moved) unchanged.
+- Every output bit-identical to the base in all four runs (36 hashes):
+  embedding lookups M = 1..4096, FP32 head logits and certified greedy pairs
+  M = 1, 5, 40, the markov anchor embedding, the three MoE layers, and the
+  packed tables and screening tables themselves.
+- Two rows that differed across containers (embedding at M = 4096, +6.6%;
+  FP32 logits at M = 40, +3.2%) do not come from the placement. In one
+  process, the compacted table and the same bytes in an unpacked-size buffer
+  run within 1% of each other, and the sign flips between runs. The base
+  image's own table runs at 354 us in its in-process control, as the
+  candidate's does. The head's buffer is the same allocation in both images,
+  and mapping or closing 960 MiB of other carve-out buffers leaves it
+  unchanged.
+
+Round 1 tests (sp8, spark-ds41f:candidate-50 with candidate-53's tree and
+this patch mounted, two container runs):
+- pytest tests/kernels/quantization/test_deepseek_v41_expert_scale_codes.py
+  tests/kernels/quantization/test_deepseek_v41_tilelang_vocab.py
+  tests/v1/worker/test_display_carveout.py tests/models/test_dspark_mla.py
+  tests/model_executor/model_loader/test_direct_loader.py
+  tests/v1/worker/test_gpu_model_runner_v2.py
+  tests/kernels/test_deepseek_v41_tilelang_embedding.py
+  tests/kernels/moe/test_deepseek_v41_tilelang_moe.py (480 passed, twice).

@@ -1,0 +1,75 @@
+diff --git a/vllm/model_executor/layers/fused_moe/tilelang.py b/vllm/model_executor/layers/fused_moe/tilelang.py
+index bb55c0ed8..a45b67116 100644
+--- a/vllm/model_executor/layers/fused_moe/tilelang.py
++++ b/vllm/model_executor/layers/fused_moe/tilelang.py
+@@ -220,7 +220,13 @@ class TileLangExperts(mk.FusedMoEExpertsModular):
+         # where narrow experts (``narrow & 1`` = 1) take one ``block_N``-byte unit
+         # a tile row (2-bit codes) and wide experts take two (4-bit codes);
+         # ``narrow >> 1`` is each expert's starting unit in that buffer.
+-        decode_only = (
++        # With the display carve-out on, a decode-only plan's slabs (a row cap
++        # below the mid tiles: DSpark's draft layers, which read each active
++        # expert's slab at most once a step) move into it. Off the carve-out the
++        # preparation is unchanged and asks nothing more of the plan.
++        from vllm.v1.worker import display_carveout
++
++        decode_only = display_carveout.required() and (
+             self._plan.max_rows is not None and not self._plan._has_mid_tiles()
+         )
+         t13, tail13, codes13, byte13, narrow13, base13 = self._plan.prepare_weight(
+@@ -228,8 +234,6 @@ class TileLangExperts(mk.FusedMoEExpertsModular):
+         )
+         del w13
+         if decode_only:
+-            from vllm.v1.worker import display_carveout
+-
+             t13 = display_carveout.move(t13)
+         replace_parameter(layer, "w13_weight", t13)
+         replace_parameter(layer, "w13_weight_scale", codes13)
+@@ -239,8 +243,6 @@ class TileLangExperts(mk.FusedMoEExpertsModular):
+         )
+         del w2
+         if decode_only:
+-            from vllm.v1.worker import display_carveout
+-
+             t2 = display_carveout.move(t2)
+         replace_parameter(layer, "w2_weight", t2)
+         replace_parameter(layer, "w2_weight_scale", codes2)
+diff --git a/vllm/model_executor/layers/quantization/online/packed_bf16.py b/vllm/model_executor/layers/quantization/online/packed_bf16.py
+index bc0124ce8..bcc96fe2c 100644
+--- a/vllm/model_executor/layers/quantization/online/packed_bf16.py
++++ b/vllm/model_executor/layers/quantization/online/packed_bf16.py
+@@ -122,7 +122,13 @@ class PackedBf16LmHeadMethod(QuantizeMethodBase):
+         from vllm.v1.worker import display_carveout
+ 
+         del weight
+-        replace_parameter(layer, "weight", display_carveout.compact(packed.values))
++        values = packed.values
++        # The TileLang head's carve-out buffer also holds its 8-bit screening
++        # table, right after the packed rows (``_carveout_screen_wq``), so it has
++        # no slack to give back: compacting it would free the table's storage.
++        if getattr(layer, "_carveout_screen_wq", None) is None:
++            values = display_carveout.compact(values)
++        replace_parameter(layer, "weight", values)
+         replace_parameter(layer, "weight_exception_rows", packed.exception_rows)
+         replace_parameter(layer, "weight_exception_entries", packed.exception_entries)
+         replace_parameter(layer, "weight_row_offsets", packed.row_offsets)
+diff --git a/vllm/v1/worker/display_carveout.py b/vllm/v1/worker/display_carveout.py
+index b652ede79..a5e09f665 100644
+--- a/vllm/v1/worker/display_carveout.py
++++ b/vllm/v1/worker/display_carveout.py
+@@ -252,8 +252,12 @@ def compact(tensor: torch.Tensor) -> torch.Tensor:
+ 
+     12-bit vocabulary packing shrinks an unpacked BF16 table to 75% of its
+     bytes in place. Reallocating a tight dumb buffer and closing the unpacked
+-    one reclaims 224 MiB of carve-out at TP3 (160 MiB at TP4) without touching
+-    ordinary memory.
++    one reclaims 112 MiB of carve-out a table at TP3 (80 MiB at TP4) without
++    touching ordinary memory.
++
++    The old buffer is closed, so ``tensor`` must be the only live view of it:
++    a caller that keeps other data in the same buffer (the TileLang packed
++    head's screening table) must not compact it.
+     """
+     nbytes = _nbytes(tensor)
+     if (
