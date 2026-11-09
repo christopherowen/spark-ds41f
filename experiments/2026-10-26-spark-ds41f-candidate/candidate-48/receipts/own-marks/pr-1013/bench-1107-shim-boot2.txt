@@ -1,0 +1,32 @@
+[transformers] You are using a model of type `deepseek_v41` to instantiate a model of type ``. This may be expected if you are loading a checkpoint that shares a subset of the architecture (e.g., loading a `sam2_video` checkpoint into `Sam2Model`), but is otherwise not supported and can yield errors. Please verify that the checkpoint is compatible with the model you are instantiating.
+INFO 11-09 04:41:49 [model.py:693] Resolved architecture: OPTForCausalLM
+INFO 11-09 04:41:49 [model.py:2066] Using max model len 8192
+INFO 11-09 04:41:49 [scheduler.py:436] Chunked prefill is enabled with max_num_batched_tokens=2048.
+WARNING 11-09 04:41:49 [vllm.py:1735] Async scheduling not supported with ngram-based speculative decoding and will be disabled.
+INFO 11-09 04:41:49 [kernel.py:435] Final IR op priority after setting platform defaults: IrOpPriorityConfig(rms_norm=['native'], fused_add_rms_norm=['native'], gelu_and_mul_sparse=['triton', 'native'])
+WARNING 11-09 04:41:49 [vllm.py:2425] max_num_scheduled_tokens is set to 2048 based on the speculative decoding settings. This may lead to suboptimal performance. Consider increasing max_num_batched_tokens to accommodate the additional draft token slots, or decrease num_speculative_tokens.
+WARNING 11-09 04:41:49 [vllm.py:907] Model Runner V2 does not yet support speculative method 'ngram'; using the V1 model runner instead.
+INFO 11-09 04:41:49 [config.py:852] Detected quantization_config.scale_fmt=ue8m0; enabling UE8M0 for DeepGEMM.
+Traceback (most recent call last):
+  File "/mnt/shim/run_bench_suite_on_1107.py", line 39, in <module>
+    runpy.run_path(script, run_name="__main__")
+  File "<frozen runpy>", line 286, in run_path
+  File "<frozen runpy>", line 98, in _run_module_code
+  File "<frozen runpy>", line 88, in _run_code
+  File "/mnt/host-tmp/bench_suite.py", line 697, in <module>
+    main()
+  File "/mnt/host-tmp/bench_suite.py", line 690, in main
+    "scheduler": bench_scheduler(tmp_dir),
+                 ^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/mnt/host-tmp/bench_suite.py", line 218, in bench_scheduler
+    from vllm.v1.core.sched.scheduler import Scheduler
+  File "/opt/spark-ds41f/candidate/vllm/vllm/v1/core/sched/scheduler.py", line 32, in <module>
+    from vllm.model_executor.layers.fused_moe.routed_experts_capturer import (
+  File "/opt/spark-ds41f/candidate/vllm/vllm/model_executor/layers/fused_moe/__init__.py", line 13, in <module>
+    from vllm.model_executor.layers.fused_moe.config import (
+  File "/opt/spark-ds41f/candidate/vllm/vllm/model_executor/layers/fused_moe/config.py", line 1282, in <module>
+    class FusedMoEConfig:
+  File "/opt/spark-ds41f/candidate/vllm/vllm/model_executor/layers/fused_moe/config.py", line 1308, in FusedMoEConfig
+    max_num_tokens: int = SchedulerConfig.DEFAULT_MAX_NUM_BATCHED_TOKENS_FOR_BATCHED_DP
+                          ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+AttributeError: 'function' object has no attribute 'DEFAULT_MAX_NUM_BATCHED_TOKENS_FOR_BATCHED_DP'

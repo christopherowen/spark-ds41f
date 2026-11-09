@@ -1,0 +1,64 @@
+{
+  "pr": 1010,
+  "pr_head": "ad613458e55962d309c3a53fec15c02413e849d5",
+  "mark": "Its retention probe passes on the image; the live prefix-cache hit share on multi-turn traffic is not below 1107's",
+  "host": "sp8 (spark-0016, NVIDIA GB10)",
+  "images": {
+    "candidate-48": "sha256:d6ffd842978849651e756ebd39e9bf2da7ddb03e746113013533029878485a24",
+    "1107": "sha256:3f32a962ce04b7c8d85337cd427a8946b8b6bcaadd97cc8d8a8cd14e8d68a6ce"
+  },
+  "evidence": "experiments/2026-11-08-prefix-cache-retention-probe/probe_prefix_cache_retention.py (boundary matrix, spec-decode stopping step, LRU order, 64K-100K multi-turn stress) and the PR's GPU pytest list",
+  "readme_command_defects": [
+    "README section 4 runs `docker run ... spark-ds41f:1107 python3 .../probe_prefix_cache_retention.py`: without --entrypoint the image's `vllm serve` entrypoint receives the arguments and exits 2 (probe-readme-cmd-candidate48.txt)",
+    "With --entrypoint python3 the README's `--json-out` flag is rejected: the script requires `--boot` and `--output` (exit 2, probe-readme-cmd-entrypoint-python3-candidate48.txt)",
+    "README's pytest list names tests/v1/core/test_FullAttentionManager.py and tests/v1/core/test_scheduler_Scenarios.py, which do not exist; the conftest also needs tblib (exit 4 both ways). The PR's own receipts ran a different 23-file list, which is the list re-run here",
+    "README quotes the 1107 stress baseline as 57.09% (tp3) / 56.34% (tp4) of 2,444,316 reusable tokens; the probe itself reports 1,128,008 reusable tokens, and 1107 measures 99.68% / 99.54% on it"
+  ],
+  "measured": {
+    "probe_candidate-48": {
+      "boot1_boot2_identical": true,
+      "boundary_matrix": "1404/1404 ext, 1404/1404 retry, 567/567 slid-past-boundary",
+      "long_decode_cached_swa_blocks_retention_0_512_8192_None": [4, 11, 4, 18],
+      "long_decode_turn2_hit_tokens": "4608/4608 for all four retentions",
+      "spec_decode_stopping_step": "60/60 (40/40 crossing)",
+      "lru_inversions_by_retention": {"0": 0, "512": 0, "8192": 0, "None": 0},
+      "lru_first_last_evict_end_token": [25088, 256],
+      "stress_tp3-triangle": {"hit_tokens": 1121024, "reusable_tokens": 1128008, "overall": 0.993809, "non_evicted_mean": 0.998478, "evicted_mean": 0.977496, "evicted_min": 0.97235},
+      "stress_tp4-ring": {"hit_tokens": 1116416, "reusable_tokens": 1128008, "overall": 0.989723, "non_evicted_mean": 0.998478, "evicted_mean": 0.959408, "evicted_min": 0.934952},
+      "equal_to_pr_receipts_probe-boot1_and_boot2": true
+    },
+    "probe_1107": {
+      "boot1_boot2_identical": true,
+      "boundary_matrix": "699/1404 ext, 855/1404 retry, 225/567 slid-past-boundary",
+      "long_decode_cached_swa_blocks_retention_0_512_8192_None": [2, 10, 2, 18],
+      "long_decode_turn2_hit_tokens": "512/4608 at retention 0 and 8192; 4608/4608 at 512 and None",
+      "spec_decode_stopping_step": "45/60 (25/40 crossing)",
+      "lru_inversions_by_retention": {"0": 6, "512": 6, "8192": 6, "None": 8},
+      "stress_tp3-triangle": {"hit_tokens": 1124352, "reusable_tokens": 1128008, "overall": 0.996759, "non_evicted_mean": 0.996354, "evicted_mean": 0.997894, "evicted_min": 0.995828},
+      "stress_tp4-ring": {"hit_tokens": 1122816, "reusable_tokens": 1128008, "overall": 0.995397, "non_evicted_mean": 0.995195, "evicted_mean": 0.995765, "evicted_min": 0.995318}
+    },
+    "stress_candidate_minus_1107": {
+      "tp3-triangle": {"hit_tokens": -3328, "overall_pp": -0.295},
+      "tp4-ring": {"hit_tokens": -6400, "overall_pp": -0.567},
+      "per_turn": "candidate gains +256 tokens on every non-evicted turn; on the turns after an eviction it loses: tp3 turns 4/6/8 agent 0 = 73216/83968/93696 vs 1107 75264/85504/95232; tp4 turns 4/8 agent 0 = 70400/90368 vs 1107 75008/95232 (turn 6 = 85504 vs 85248)"
+    },
+    "pytest_receipt_list_candidate-48": {
+      "boot1": "2679 passed in 663.14s",
+      "boot2": "2679 passed in 651.81s",
+      "note": "same count as the PR's receipts (2679 passed), about 6x slower than the PR's 110 s on sp7"
+    },
+    "interval": "the probe is deterministic: both boots identical on each image, so the interval is zero"
+  },
+  "parts": [
+    {"part": "retention probe passes on the image", "verdict": "pass", "detail": "boundary matrix 1404/1404, spec-decode 60/60, 0 LRU inversions, long-decode 4608/4608 on both candidate-48 boots, identical to the PR's own probe receipts; 1107 fails the same checks (699/1404, 45/60, 6-8 inversions); the PR's 2679-test list passes on both boots"},
+    {"part": "live prefix-cache hit share on multi-turn traffic is not below 1107's", "verdict": "cannot-evaluate-on-sp8", "detail": "needs live multi-node serving. WARNING: the PR's own offline proxy for it, the 64K-100K multi-turn stress probe, is BELOW 1107 on the candidate image: 99.38% vs 99.68% (tp3) and 98.97% vs 99.54% (tp4), driven by turns after eviction (evicted-turn mean 97.75% vs 99.79% tp3, 95.94% vs 99.58% tp4)"}
+  ],
+  "verdict": "pass",
+  "verdict_scope": "sp8-evaluable part only (the probe's unit-level checks); the live hit-share part is cannot-evaluate-on-sp8, and its offline proxy points the wrong way",
+  "reason": "The probe's boundary, spec-decode, LRU-order and long-decode checks pass on both candidate-48 boots and fail on 1107, so the fixes are present and effective in the integrated image. But the README's headline claim (1107 at 57% overall hit rate under the stress workload) is not reproduced: 1107 measures 99.68% / 99.54% on the same probe, above the candidate's 99.38% / 98.97%. The candidate is better on every non-evicted turn (+256 tokens) and worse on the turns after eviction (up to -4,864 tokens per turn on tp4), so the tail-to-root eviction order costs more than the decode-frontier retention gains on this workload. The live hit-share comparison should be watched closely; the offline proxy predicts it will be below 1107.",
+  "notes": [
+    "commands.txt start_utc is when the command was issued and includes any wait on /tmp/spark-lab-gpu.lock",
+    "probe runs used --entrypoint python3 -w /opt/spark-ds41f/candidate/vllm --boot N --output ..., the form that produced the PR's own receipts",
+    "pytest runs used -p tblib_stub from scripts/release_tests at the PR head (mounted read-only)"
+  ]
+}

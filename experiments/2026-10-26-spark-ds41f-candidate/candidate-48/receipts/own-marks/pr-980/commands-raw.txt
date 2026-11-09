@@ -1,0 +1,180 @@
+### pytest-candidate48-boot1
+host: spark-0016 (sp8)
+image: sha256:d6ffd842978849651e756ebd39e9bf2da7ddb03e746113013533029878485a24 (spark-ds41f:candidate-48)
+start_utc: 2026-11-09T04:06:14Z
+loadavg_before: 2.58 2.60 2.68
+docker_ps_before: none
+command: flock /tmp/spark-lab-gpu.lock docker run --rm --name c48om-980-pyt-b1 --gpus all --ipc=host --network=host --entrypoint pytest sha256:d6ffd842978849651e756ebd39e9bf2da7ddb03e746113013533029878485a24 --noconftest -v /opt/spark-ds41f/candidate/vllm/tests/v1/spec_decode/test_adaptive_verification.py /opt/spark-ds41f/candidate/vllm/tests/v1/spec_decode/test_acceptance_estimator.py /opt/spark-ds41f/candidate/vllm/tests/v1/spec_decode/test_copy_drafts.py /opt/spark-ds41f/candidate/vllm/tests/v1/worker/test_dspark_greedy_markov.py /opt/spark-ds41f/candidate/vllm/tests/distributed/test_roce_policy_no_fallback.py /opt/spark-ds41f/candidate/vllm/tests/kernels/test_deepseek_v41_tilelang_confidence.py
+end_utc: 2026-11-09T04:08:09Z
+loadavg_after: 3.22 2.75 2.72
+exit_code: 0
+output: pytest-candidate48-boot1.txt
+
+### pytest-candidate48-boot2
+host: spark-0016 (sp8)
+image: sha256:d6ffd842978849651e756ebd39e9bf2da7ddb03e746113013533029878485a24 (spark-ds41f:candidate-48)
+start_utc: 2026-11-09T04:08:09Z
+loadavg_before: 3.22 2.75 2.72
+docker_ps_before: none
+command: flock /tmp/spark-lab-gpu.lock docker run --rm --name c48om-980-pyt-b2 --gpus all --ipc=host --network=host --entrypoint pytest sha256:d6ffd842978849651e756ebd39e9bf2da7ddb03e746113013533029878485a24 --noconftest -v /opt/spark-ds41f/candidate/vllm/tests/v1/spec_decode/test_adaptive_verification.py /opt/spark-ds41f/candidate/vllm/tests/v1/spec_decode/test_acceptance_estimator.py /opt/spark-ds41f/candidate/vllm/tests/v1/spec_decode/test_copy_drafts.py /opt/spark-ds41f/candidate/vllm/tests/v1/worker/test_dspark_greedy_markov.py /opt/spark-ds41f/candidate/vllm/tests/distributed/test_roce_policy_no_fallback.py /opt/spark-ds41f/candidate/vllm/tests/kernels/test_deepseek_v41_tilelang_confidence.py
+end_utc: 2026-11-09T04:10:05Z
+loadavg_after: 3.07 2.79 2.74
+exit_code: 0
+output: pytest-candidate48-boot2.txt
+
+### screen-tp2-one-gpu-rank0
+host: spark-0016 (sp8)
+image: sha256:d6ffd842978849651e756ebd39e9bf2da7ddb03e746113013533029878485a24 (spark-ds41f:candidate-48)
+start_utc: 2026-11-09T04:10:09Z
+loadavg_before: 2.91 2.76 2.73
+docker_ps_before: none
+command: flock /tmp/spark-lab-gpu.lock bash -c tp2
+end_utc: 2026-11-09T04:10:18Z
+loadavg_after: 2.92 2.77 2.73
+exit_code: 1
+output: screen-tp2-one-gpu-rank0.txt
+
+### screen-tp1-smoke-candidate48-boot1
+host: spark-0016 (sp8)
+image: sha256:d6ffd842978849651e756ebd39e9bf2da7ddb03e746113013533029878485a24 (spark-ds41f:candidate-48)
+start_utc: 2026-11-09T04:10:18Z
+loadavg_before: 2.92 2.77 2.73
+docker_ps_before: none
+command: flock /tmp/spark-lab-gpu.lock timeout 600 docker run --rm --name c48om-980-tp1-b1 --network=host --ipc=host --gpus=all --device=/dev/infiniband:/dev/infiniband:rwm --cap-add=IPC_LOCK --ulimit=memlock=-1:-1 --entrypoint python3 -e GLOO_SOCKET_IFNAME=enp1s0f0np0 -e NCCL_SOCKET_IFNAME=enp1s0f0np0 -e TP_SOCKET_IFNAME=enp1s0f0np0 -e NCCL_IB_HCA==rocep1s0f0\,roceP2p1s0f0 -e NCCL_IB_ADDR_FAMILY=AF_INET -e NCCL_IB_DISABLE=0 -e NCCL_IB_GID_INDEX=3 -e NCCL_IB_MERGE_NICS=1 -e NCCL_IB_ROCE_VERSION_NUM=2 -e NCCL_IB_SUBNET_AWARE_ROUTING=1 -e NCCL_CROSS_NIC=1 -e NCCL_CUMEM_ENABLE=0 -e NCCL_IGNORE_CPU_AFFINITY=1 -e NCCL_NET=IB -e NCCL_NET_PLUGIN=none -e NCCL_NVLS_ENABLE=0 -e NCCL_P2P_DISABLE=1 -e NCCL_SHM_DISABLE=1 -e TORCH_NCCL_ASYNC_ERROR_HANDLING=1 -v /home/chris/spark-lab/agents/candidate-48-own-marks/src/pr-980/experiments/2026-11-08-spec-decode-zero-broadcast-sync/screen_zero_broadcast_sync.py:/tmp/screen_zero_broadcast_sync.py:ro sha256:d6ffd842978849651e756ebd39e9bf2da7ddb03e746113013533029878485a24 /tmp/screen_zero_broadcast_sync.py --worker --boot tp1-boot1 --rank 0 --world-size 1 --master-addr 10.30.0.16 --master-port 29871 --verify-steps 1000 --bench-iters 1000
+end_utc: 2026-11-09T04:10:28Z
+loadavg_after: 2.78 2.74 2.72
+exit_code: 1
+output: screen-tp1-smoke-candidate48-boot1.txt
+
+### screen-tp1-smoke-candidate48-boot2
+host: spark-0016 (sp8)
+image: sha256:d6ffd842978849651e756ebd39e9bf2da7ddb03e746113013533029878485a24 (spark-ds41f:candidate-48)
+start_utc: 2026-11-09T04:10:28Z
+loadavg_before: 2.78 2.74 2.72
+docker_ps_before: none
+command: flock /tmp/spark-lab-gpu.lock timeout 600 docker run --rm --name c48om-980-tp1-b2 --network=host --ipc=host --gpus=all --device=/dev/infiniband:/dev/infiniband:rwm --cap-add=IPC_LOCK --ulimit=memlock=-1:-1 --entrypoint python3 -e GLOO_SOCKET_IFNAME=enp1s0f0np0 -e NCCL_SOCKET_IFNAME=enp1s0f0np0 -e TP_SOCKET_IFNAME=enp1s0f0np0 -e NCCL_IB_HCA==rocep1s0f0\,roceP2p1s0f0 -e NCCL_IB_ADDR_FAMILY=AF_INET -e NCCL_IB_DISABLE=0 -e NCCL_IB_GID_INDEX=3 -e NCCL_IB_MERGE_NICS=1 -e NCCL_IB_ROCE_VERSION_NUM=2 -e NCCL_IB_SUBNET_AWARE_ROUTING=1 -e NCCL_CROSS_NIC=1 -e NCCL_CUMEM_ENABLE=0 -e NCCL_IGNORE_CPU_AFFINITY=1 -e NCCL_NET=IB -e NCCL_NET_PLUGIN=none -e NCCL_NVLS_ENABLE=0 -e NCCL_P2P_DISABLE=1 -e NCCL_SHM_DISABLE=1 -e TORCH_NCCL_ASYNC_ERROR_HANDLING=1 -v /home/chris/spark-lab/agents/candidate-48-own-marks/src/pr-980/experiments/2026-11-08-spec-decode-zero-broadcast-sync/screen_zero_broadcast_sync.py:/tmp/screen_zero_broadcast_sync.py:ro sha256:d6ffd842978849651e756ebd39e9bf2da7ddb03e746113013533029878485a24 /tmp/screen_zero_broadcast_sync.py --worker --boot tp1-boot2 --rank 0 --world-size 1 --master-addr 10.30.0.16 --master-port 29872 --verify-steps 1000 --bench-iters 1000
+end_utc: 2026-11-09T04:10:38Z
+loadavg_after: 2.66 2.72 2.71
+exit_code: 1
+output: screen-tp1-smoke-candidate48-boot2.txt
+
+### screen-candidate48-boot1-tp3-onegpu-rank0
+host: spark-0016 (sp8)
+image: sha256:d6ffd842978849651e756ebd39e9bf2da7ddb03e746113013533029878485a24 (spark-ds41f:candidate-48)
+start_utc: 2026-11-09T04:11:09Z
+loadavg_before: 2.17 2.59 2.67
+docker_ps_before: d6ffd8429788 c48om-972-cad-b1;
+command: flock /tmp/spark-lab-gpu.lock bash -c mr\ sha256:d6ffd842978849651e756ebd39e9bf2da7ddb03e746113013533029878485a24\ candidate48\ boot1\ 3\ 29881
+end_utc: 2026-11-09T04:11:37Z
+loadavg_after: 2.22 2.55 2.65
+exit_code: 1
+output: screen-candidate48-boot1-tp3-onegpu-rank0.txt
+
+### screen-candidate48-boot1-tp4-onegpu-rank0
+host: spark-0016 (sp8)
+image: sha256:d6ffd842978849651e756ebd39e9bf2da7ddb03e746113013533029878485a24 (spark-ds41f:candidate-48)
+start_utc: 2026-11-09T04:11:37Z
+loadavg_before: 2.22 2.55 2.65
+docker_ps_before: none
+command: flock /tmp/spark-lab-gpu.lock bash -c mr\ sha256:d6ffd842978849651e756ebd39e9bf2da7ddb03e746113013533029878485a24\ candidate48\ boot1\ 4\ 29882
+end_utc: 2026-11-09T04:12:37Z
+loadavg_after: 2.53 2.52 2.63
+exit_code: 1
+output: screen-candidate48-boot1-tp4-onegpu-rank0.txt
+
+### screen-candidate48-boot2-tp4-onegpu-rank0
+host: spark-0016 (sp8)
+image: sha256:d6ffd842978849651e756ebd39e9bf2da7ddb03e746113013533029878485a24 (spark-ds41f:candidate-48)
+start_utc: 2026-11-09T04:12:37Z
+loadavg_before: 2.53 2.52 2.63
+docker_ps_before: none
+command: flock /tmp/spark-lab-gpu.lock bash -c mr\ sha256:d6ffd842978849651e756ebd39e9bf2da7ddb03e746113013533029878485a24\ candidate48\ boot2\ 4\ 29891
+end_utc: 2026-11-09T04:12:50Z
+loadavg_after: 2.98 2.62 2.66
+exit_code: 1
+output: screen-candidate48-boot2-tp4-onegpu-rank0.txt
+
+### screen-candidate48-boot2-tp3-onegpu-rank0
+host: spark-0016 (sp8)
+image: sha256:d6ffd842978849651e756ebd39e9bf2da7ddb03e746113013533029878485a24 (spark-ds41f:candidate-48)
+start_utc: 2026-11-09T04:12:51Z
+loadavg_before: 2.98 2.62 2.66
+docker_ps_before: none
+command: flock /tmp/spark-lab-gpu.lock bash -c mr\ sha256:d6ffd842978849651e756ebd39e9bf2da7ddb03e746113013533029878485a24\ candidate48\ boot2\ 3\ 29892
+end_utc: 2026-11-09T04:13:55Z
+loadavg_after: 2.72 2.60 2.65
+exit_code: 1
+output: screen-candidate48-boot2-tp3-onegpu-rank0.txt
+
+### screen-diag-tp2-one-container
+host: spark-0016 (sp8)
+image: sha256:d6ffd842978849651e756ebd39e9bf2da7ddb03e746113013533029878485a24 (spark-ds41f:candidate-48)
+start_utc: 2026-11-09T04:14:19Z
+loadavg_before: 2.60 2.59 2.65
+docker_ps_before: d6ffd8429788 c48om-1013-bench-cand-b1;
+command: flock /tmp/spark-lab-gpu.lock timeout 400 docker run --rm --name c48om-980-diag --network=host --ipc=host --gpus=all --device=/dev/infiniband:/dev/infiniband:rwm --cap-add=IPC_LOCK --ulimit=memlock=-1:-1 --entrypoint bash -e NCCL_DEBUG=WARN -e NCCL_MULTI_RANK_GPU_ENABLE=1 -e GLOO_SOCKET_IFNAME=enp1s0f0np0 -e NCCL_SOCKET_IFNAME=enp1s0f0np0 -e TP_SOCKET_IFNAME=enp1s0f0np0 -e NCCL_IB_HCA==rocep1s0f0\,roceP2p1s0f0 -e NCCL_IB_ADDR_FAMILY=AF_INET -e NCCL_IB_DISABLE=0 -e NCCL_IB_GID_INDEX=3 -e NCCL_IB_MERGE_NICS=1 -e NCCL_IB_ROCE_VERSION_NUM=2 -e NCCL_IB_SUBNET_AWARE_ROUTING=1 -e NCCL_CROSS_NIC=1 -e NCCL_CUMEM_ENABLE=0 -e NCCL_IGNORE_CPU_AFFINITY=1 -e NCCL_NET=IB -e NCCL_NET_PLUGIN=none -e NCCL_NVLS_ENABLE=0 -e NCCL_P2P_DISABLE=1 -e NCCL_SHM_DISABLE=1 -e TORCH_NCCL_ASYNC_ERROR_HANDLING=1 -v /home/chris/spark-lab/agents/candidate-48-own-marks/src/pr-980/experiments/2026-11-08-spec-decode-zero-broadcast-sync/screen_zero_broadcast_sync.py:/tmp/screen_zero_broadcast_sync.py:ro sha256:d6ffd842978849651e756ebd39e9bf2da7ddb03e746113013533029878485a24 -c python3\ /tmp/screen_zero_broadcast_sync.py\ --worker\ --boot\ diag\ --world-size\ 2\ --master-addr\ 10.30.0.16\ --master-port\ 29901\ --verify-steps\ 1000\ --bench-iters\ 1000\ --rank\ 1\ \>\ /tmp/rank1.log\ 2\>\&1\ \&\ python3\ /tmp/screen_zero_broadcast_sync.py\ --worker\ --boot\ diag\ --world-size\ 2\ --master-addr\ 10.30.0.16\ --master-port\ 29901\ --verify-steps\ 1000\ --bench-iters\ 1000\ --rank\ 0\;\ rc=\$\?\;\ wait\;\ echo\ \'---\ rank1\ log\'\;\ cat\ /tmp/rank1.log\;\ exit\ \$rc
+end_utc: 2026-11-09T04:15:36Z
+loadavg_after: 3.39 2.81 2.72
+exit_code: 134
+output: screen-diag-tp2-one-container.txt
+
+### screen-diag-tp2-one-container-launch-blocking
+host: spark-0016 (sp8)
+image: sha256:d6ffd842978849651e756ebd39e9bf2da7ddb03e746113013533029878485a24 (spark-ds41f:candidate-48)
+start_utc: 2026-11-09T04:16:27Z
+loadavg_before: 2.85 2.76 2.71
+docker_ps_before: 3f32a962ce04 c48om-1013-bench-1107-b1;
+command: flock /tmp/spark-lab-gpu.lock timeout 400 docker run --rm --name c48om-980-diag2 --network=host --ipc=host --gpus=all --device=/dev/infiniband:/dev/infiniband:rwm --cap-add=IPC_LOCK --ulimit=memlock=-1:-1 --entrypoint bash -e NCCL_DEBUG=WARN -e CUDA_LAUNCH_BLOCKING=1 -e NCCL_MULTI_RANK_GPU_ENABLE=1 -e GLOO_SOCKET_IFNAME=enp1s0f0np0 -e NCCL_SOCKET_IFNAME=enp1s0f0np0 -e TP_SOCKET_IFNAME=enp1s0f0np0 -e NCCL_IB_HCA==rocep1s0f0\,roceP2p1s0f0 -e NCCL_IB_ADDR_FAMILY=AF_INET -e NCCL_IB_DISABLE=0 -e NCCL_IB_GID_INDEX=3 -e NCCL_IB_MERGE_NICS=1 -e NCCL_IB_ROCE_VERSION_NUM=2 -e NCCL_IB_SUBNET_AWARE_ROUTING=1 -e NCCL_CROSS_NIC=1 -e NCCL_CUMEM_ENABLE=0 -e NCCL_IGNORE_CPU_AFFINITY=1 -e NCCL_NET=IB -e NCCL_NET_PLUGIN=none -e NCCL_NVLS_ENABLE=0 -e NCCL_P2P_DISABLE=1 -e NCCL_SHM_DISABLE=1 -e TORCH_NCCL_ASYNC_ERROR_HANDLING=1 -v /home/chris/spark-lab/agents/candidate-48-own-marks/src/pr-980/experiments/2026-11-08-spec-decode-zero-broadcast-sync/screen_zero_broadcast_sync.py:/tmp/screen_zero_broadcast_sync.py:ro sha256:d6ffd842978849651e756ebd39e9bf2da7ddb03e746113013533029878485a24 -c python3\ /tmp/screen_zero_broadcast_sync.py\ --worker\ --boot\ diag\ --world-size\ 2\ --master-addr\ 10.30.0.16\ --master-port\ 29911\ --verify-steps\ 1000\ --bench-iters\ 1000\ --rank\ 1\ \>\ /tmp/rank1.log\ 2\>\&1\ \&\ python3\ /tmp/screen_zero_broadcast_sync.py\ --worker\ --boot\ diag\ --world-size\ 2\ --master-addr\ 10.30.0.16\ --master-port\ 29911\ --verify-steps\ 1000\ --bench-iters\ 1000\ --rank\ 0\;\ rc=\$\?\;\ wait\;\ echo\ \'---\ rank1\ log\'\;\ cat\ /tmp/rank1.log\;\ exit\ \$rc
+end_utc: 2026-11-09T04:18:02Z
+loadavg_after: 3.93 3.13 2.84
+exit_code: 134
+output: screen-diag-tp2-one-container-launch-blocking.txt
+
+### screen-onecontainer-boot1-tp3
+host: spark-0016 (sp8)
+image: sha256:d6ffd842978849651e756ebd39e9bf2da7ddb03e746113013533029878485a24 (spark-ds41f:candidate-48)
+start_utc: 2026-11-09T04:19:04Z
+loadavg_before: 3.38 3.12 2.86
+docker_ps_before: d6ffd8429788 c48om-1013-pyt-b2;
+command: flock /tmp/spark-lab-gpu.lock timeout 900 docker run --rm --name c48om-980-oc-boot1-tp3 --network=host --ipc=host --gpus=all --device=/dev/infiniband:/dev/infiniband:rwm --cap-add=IPC_LOCK --ulimit=memlock=-1:-1 --entrypoint bash -e NCCL_MULTI_RANK_GPU_ENABLE=1 -e GLOO_SOCKET_IFNAME=enp1s0f0np0 -e NCCL_SOCKET_IFNAME=enp1s0f0np0 -e TP_SOCKET_IFNAME=enp1s0f0np0 -e NCCL_IB_HCA==rocep1s0f0\,roceP2p1s0f0 -e NCCL_IB_ADDR_FAMILY=AF_INET -e NCCL_IB_DISABLE=0 -e NCCL_IB_GID_INDEX=3 -e NCCL_IB_MERGE_NICS=1 -e NCCL_IB_ROCE_VERSION_NUM=2 -e NCCL_IB_SUBNET_AWARE_ROUTING=1 -e NCCL_CROSS_NIC=1 -e NCCL_CUMEM_ENABLE=0 -e NCCL_IGNORE_CPU_AFFINITY=1 -e NCCL_NET=IB -e NCCL_NET_PLUGIN=none -e NCCL_NVLS_ENABLE=0 -e NCCL_P2P_DISABLE=1 -e NCCL_SHM_DISABLE=1 -e TORCH_NCCL_ASYNC_ERROR_HANDLING=1 -v /home/chris/spark-lab/agents/candidate-48-own-marks/src/pr-980/experiments/2026-11-08-spec-decode-zero-broadcast-sync/screen_zero_broadcast_sync.py:/tmp/screen_zero_broadcast_sync.py:ro sha256:d6ffd842978849651e756ebd39e9bf2da7ddb03e746113013533029878485a24 -c \ python3\ /tmp/screen_zero_broadcast_sync.py\ --worker\ --boot\ boot1\ --world-size\ 3\ --master-addr\ 10.30.0.16\ --master-port\ 29921\ --verify-steps\ 1000\ --bench-iters\ 1000\ --rank\ 1\ \>\ /tmp/rank1.log\ 2\>\&1\ \&\ python3\ /tmp/screen_zero_broadcast_sync.py\ --worker\ --boot\ boot1\ --world-size\ 3\ --master-addr\ 10.30.0.16\ --master-port\ 29921\ --verify-steps\ 1000\ --bench-iters\ 1000\ --rank\ 2\ \>\ /tmp/rank2.log\ 2\>\&1\ \&\ python3\ /tmp/screen_zero_broadcast_sync.py\ --worker\ --boot\ boot1\ --world-size\ 3\ --master-addr\ 10.30.0.16\ --master-port\ 29921\ --verify-steps\ 1000\ --bench-iters\ 1000\ --rank\ 0\;\ rc=\$\?\;\ wait\;\ for\ r\ in\ \$\(seq\ 1\ 2\)\;\ do\ echo\ \"---\ rank\$r\ log\"\;\ cat\ /tmp/rank\$r.log\;\ done\;\ exit\ \$rc
+end_utc: 2026-11-09T04:24:12Z
+loadavg_after: 5.10 4.40 3.47
+exit_code: 0
+output: screen-onecontainer-boot1-tp3.txt
+
+### screen-onecontainer-boot1-tp4
+host: spark-0016 (sp8)
+image: sha256:d6ffd842978849651e756ebd39e9bf2da7ddb03e746113013533029878485a24 (spark-ds41f:candidate-48)
+start_utc: 2026-11-09T04:24:12Z
+loadavg_before: 5.10 4.40 3.47
+docker_ps_before: none
+command: flock /tmp/spark-lab-gpu.lock timeout 900 docker run --rm --name c48om-980-oc-boot1-tp4 --network=host --ipc=host --gpus=all --device=/dev/infiniband:/dev/infiniband:rwm --cap-add=IPC_LOCK --ulimit=memlock=-1:-1 --entrypoint bash -e NCCL_MULTI_RANK_GPU_ENABLE=1 -e GLOO_SOCKET_IFNAME=enp1s0f0np0 -e NCCL_SOCKET_IFNAME=enp1s0f0np0 -e TP_SOCKET_IFNAME=enp1s0f0np0 -e NCCL_IB_HCA==rocep1s0f0\,roceP2p1s0f0 -e NCCL_IB_ADDR_FAMILY=AF_INET -e NCCL_IB_DISABLE=0 -e NCCL_IB_GID_INDEX=3 -e NCCL_IB_MERGE_NICS=1 -e NCCL_IB_ROCE_VERSION_NUM=2 -e NCCL_IB_SUBNET_AWARE_ROUTING=1 -e NCCL_CROSS_NIC=1 -e NCCL_CUMEM_ENABLE=0 -e NCCL_IGNORE_CPU_AFFINITY=1 -e NCCL_NET=IB -e NCCL_NET_PLUGIN=none -e NCCL_NVLS_ENABLE=0 -e NCCL_P2P_DISABLE=1 -e NCCL_SHM_DISABLE=1 -e TORCH_NCCL_ASYNC_ERROR_HANDLING=1 -v /home/chris/spark-lab/agents/candidate-48-own-marks/src/pr-980/experiments/2026-11-08-spec-decode-zero-broadcast-sync/screen_zero_broadcast_sync.py:/tmp/screen_zero_broadcast_sync.py:ro sha256:d6ffd842978849651e756ebd39e9bf2da7ddb03e746113013533029878485a24 -c \ python3\ /tmp/screen_zero_broadcast_sync.py\ --worker\ --boot\ boot1\ --world-size\ 4\ --master-addr\ 10.30.0.16\ --master-port\ 29922\ --verify-steps\ 1000\ --bench-iters\ 1000\ --rank\ 1\ \>\ /tmp/rank1.log\ 2\>\&1\ \&\ python3\ /tmp/screen_zero_broadcast_sync.py\ --worker\ --boot\ boot1\ --world-size\ 4\ --master-addr\ 10.30.0.16\ --master-port\ 29922\ --verify-steps\ 1000\ --bench-iters\ 1000\ --rank\ 2\ \>\ /tmp/rank2.log\ 2\>\&1\ \&\ python3\ /tmp/screen_zero_broadcast_sync.py\ --worker\ --boot\ boot1\ --world-size\ 4\ --master-addr\ 10.30.0.16\ --master-port\ 29922\ --verify-steps\ 1000\ --bench-iters\ 1000\ --rank\ 3\ \>\ /tmp/rank3.log\ 2\>\&1\ \&\ python3\ /tmp/screen_zero_broadcast_sync.py\ --worker\ --boot\ boot1\ --world-size\ 4\ --master-addr\ 10.30.0.16\ --master-port\ 29922\ --verify-steps\ 1000\ --bench-iters\ 1000\ --rank\ 0\;\ rc=\$\?\;\ wait\;\ for\ r\ in\ \$\(seq\ 1\ 3\)\;\ do\ echo\ \"---\ rank\$r\ log\"\;\ cat\ /tmp/rank\$r.log\;\ done\;\ exit\ \$rc
+end_utc: 2026-11-09T04:31:21Z
+loadavg_after: 6.79 6.09 4.59
+exit_code: 0
+output: screen-onecontainer-boot1-tp4.txt
+
+### screen-onecontainer-boot2-tp4
+host: spark-0016 (sp8)
+image: sha256:d6ffd842978849651e756ebd39e9bf2da7ddb03e746113013533029878485a24 (spark-ds41f:candidate-48)
+start_utc: 2026-11-09T04:31:22Z
+loadavg_before: 6.65 6.08 4.59
+docker_ps_before: none
+command: flock /tmp/spark-lab-gpu.lock timeout 900 docker run --rm --name c48om-980-oc-boot2-tp4 --network=host --ipc=host --gpus=all --device=/dev/infiniband:/dev/infiniband:rwm --cap-add=IPC_LOCK --ulimit=memlock=-1:-1 --entrypoint bash -e NCCL_MULTI_RANK_GPU_ENABLE=1 -e GLOO_SOCKET_IFNAME=enp1s0f0np0 -e NCCL_SOCKET_IFNAME=enp1s0f0np0 -e TP_SOCKET_IFNAME=enp1s0f0np0 -e NCCL_IB_HCA==rocep1s0f0\,roceP2p1s0f0 -e NCCL_IB_ADDR_FAMILY=AF_INET -e NCCL_IB_DISABLE=0 -e NCCL_IB_GID_INDEX=3 -e NCCL_IB_MERGE_NICS=1 -e NCCL_IB_ROCE_VERSION_NUM=2 -e NCCL_IB_SUBNET_AWARE_ROUTING=1 -e NCCL_CROSS_NIC=1 -e NCCL_CUMEM_ENABLE=0 -e NCCL_IGNORE_CPU_AFFINITY=1 -e NCCL_NET=IB -e NCCL_NET_PLUGIN=none -e NCCL_NVLS_ENABLE=0 -e NCCL_P2P_DISABLE=1 -e NCCL_SHM_DISABLE=1 -e TORCH_NCCL_ASYNC_ERROR_HANDLING=1 -v /home/chris/spark-lab/agents/candidate-48-own-marks/src/pr-980/experiments/2026-11-08-spec-decode-zero-broadcast-sync/screen_zero_broadcast_sync.py:/tmp/screen_zero_broadcast_sync.py:ro sha256:d6ffd842978849651e756ebd39e9bf2da7ddb03e746113013533029878485a24 -c \ python3\ /tmp/screen_zero_broadcast_sync.py\ --worker\ --boot\ boot2\ --world-size\ 4\ --master-addr\ 10.30.0.16\ --master-port\ 29931\ --verify-steps\ 1000\ --bench-iters\ 1000\ --rank\ 1\ \>\ /tmp/rank1.log\ 2\>\&1\ \&\ python3\ /tmp/screen_zero_broadcast_sync.py\ --worker\ --boot\ boot2\ --world-size\ 4\ --master-addr\ 10.30.0.16\ --master-port\ 29931\ --verify-steps\ 1000\ --bench-iters\ 1000\ --rank\ 2\ \>\ /tmp/rank2.log\ 2\>\&1\ \&\ python3\ /tmp/screen_zero_broadcast_sync.py\ --worker\ --boot\ boot2\ --world-size\ 4\ --master-addr\ 10.30.0.16\ --master-port\ 29931\ --verify-steps\ 1000\ --bench-iters\ 1000\ --rank\ 3\ \>\ /tmp/rank3.log\ 2\>\&1\ \&\ python3\ /tmp/screen_zero_broadcast_sync.py\ --worker\ --boot\ boot2\ --world-size\ 4\ --master-addr\ 10.30.0.16\ --master-port\ 29931\ --verify-steps\ 1000\ --bench-iters\ 1000\ --rank\ 0\;\ rc=\$\?\;\ wait\;\ for\ r\ in\ \$\(seq\ 1\ 3\)\;\ do\ echo\ \"---\ rank\$r\ log\"\;\ cat\ /tmp/rank\$r.log\;\ done\;\ exit\ \$rc
+end_utc: 2026-11-09T04:41:39Z
+loadavg_after: 6.35 6.36 5.39
+exit_code: 0
+output: screen-onecontainer-boot2-tp4.txt
+
+### screen-onecontainer-boot2-tp3
+host: spark-0016 (sp8)
+image: sha256:d6ffd842978849651e756ebd39e9bf2da7ddb03e746113013533029878485a24 (spark-ds41f:candidate-48)
+start_utc: 2026-11-09T04:41:39Z
+loadavg_before: 6.35 6.36 5.39
+docker_ps_before: none
+command: flock /tmp/spark-lab-gpu.lock timeout 900 docker run --rm --name c48om-980-oc-boot2-tp3 --network=host --ipc=host --gpus=all --device=/dev/infiniband:/dev/infiniband:rwm --cap-add=IPC_LOCK --ulimit=memlock=-1:-1 --entrypoint bash -e NCCL_MULTI_RANK_GPU_ENABLE=1 -e GLOO_SOCKET_IFNAME=enp1s0f0np0 -e NCCL_SOCKET_IFNAME=enp1s0f0np0 -e TP_SOCKET_IFNAME=enp1s0f0np0 -e NCCL_IB_HCA==rocep1s0f0\,roceP2p1s0f0 -e NCCL_IB_ADDR_FAMILY=AF_INET -e NCCL_IB_DISABLE=0 -e NCCL_IB_GID_INDEX=3 -e NCCL_IB_MERGE_NICS=1 -e NCCL_IB_ROCE_VERSION_NUM=2 -e NCCL_IB_SUBNET_AWARE_ROUTING=1 -e NCCL_CROSS_NIC=1 -e NCCL_CUMEM_ENABLE=0 -e NCCL_IGNORE_CPU_AFFINITY=1 -e NCCL_NET=IB -e NCCL_NET_PLUGIN=none -e NCCL_NVLS_ENABLE=0 -e NCCL_P2P_DISABLE=1 -e NCCL_SHM_DISABLE=1 -e TORCH_NCCL_ASYNC_ERROR_HANDLING=1 -v /home/chris/spark-lab/agents/candidate-48-own-marks/src/pr-980/experiments/2026-11-08-spec-decode-zero-broadcast-sync/screen_zero_broadcast_sync.py:/tmp/screen_zero_broadcast_sync.py:ro sha256:d6ffd842978849651e756ebd39e9bf2da7ddb03e746113013533029878485a24 -c \ python3\ /tmp/screen_zero_broadcast_sync.py\ --worker\ --boot\ boot2\ --world-size\ 3\ --master-addr\ 10.30.0.16\ --master-port\ 29932\ --verify-steps\ 1000\ --bench-iters\ 1000\ --rank\ 1\ \>\ /tmp/rank1.log\ 2\>\&1\ \&\ python3\ /tmp/screen_zero_broadcast_sync.py\ --worker\ --boot\ boot2\ --world-size\ 3\ --master-addr\ 10.30.0.16\ --master-port\ 29932\ --verify-steps\ 1000\ --bench-iters\ 1000\ --rank\ 2\ \>\ /tmp/rank2.log\ 2\>\&1\ \&\ python3\ /tmp/screen_zero_broadcast_sync.py\ --worker\ --boot\ boot2\ --world-size\ 3\ --master-addr\ 10.30.0.16\ --master-port\ 29932\ --verify-steps\ 1000\ --bench-iters\ 1000\ --rank\ 0\;\ rc=\$\?\;\ wait\;\ for\ r\ in\ \$\(seq\ 1\ 2\)\;\ do\ echo\ \"---\ rank\$r\ log\"\;\ cat\ /tmp/rank\$r.log\;\ done\;\ exit\ \$rc
+end_utc: 2026-11-09T04:47:43Z
+loadavg_after: 6.54 5.97 5.44
+exit_code: 0
+output: screen-onecontainer-boot2-tp3.txt
+

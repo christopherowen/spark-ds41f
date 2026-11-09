@@ -1,0 +1,496 @@
+From c0916096b2921a1021fa0bbde8bc0782b7eec937 Mon Sep 17 00:00:00 2001
+From: Christopher Owen <3221756+christopherowen@users.noreply.github.com>
+Date: Sun, 8 Nov 2026 12:15:00 +0100
+Subject: [PATCH] perf(worker): eliminate decode-step redundant H2D transfers,
+ UVA copies, and eager ATen ops
+
+Upstream base: 1107 vLLM patch head 320021e3c4dbb202d911ab70e2cd924c75420488 (tree ed1bdb7a7684da33d403a055521ac0c4dd7ca670).
+
+Rationale:
+On every steady-state speculative decode step in GPUModelRunner, several host-to-device DMA transfers, UVA buffer rotations, and eager PyTorch ATen kernel launches ran unconditionally even when their outputs were immediately overwritten or unused:
+1. GPUModelRunner.add_requests() called self.sampler.apply_staged_writes() outside the if scheduler_output.scheduled_new_reqs: guard, rotating and copying 15 UvaBackedTensors and checking 7 StagedWriteTensors on every decode step even though sampler.add_request() only runs for new requests.
+2. BlockTables.apply_staged_writes() unconditionally called fused_writer.apply() (which gathers every group's staged lists before finding them empty) and num_blocks.copy_to_uva() (a UVA buffer rotation and copy) on every decode step even when no request crossed a KV block boundary (overwrite=False and empty block_ids).
+3. In GPUModelRunner.prepare_inputs(), when adaptive_verification is enabled, async_tensor_h2d(cu_num_logits_np) and async_tensor_h2d(query_start_loc_np) allocated pinned host memory and launched two H2D cudaMemcpyAsync transfers whose destination tensors were immediately overwritten on-device by adaptive_verification.reallocate_drafts() (tilelang_inputs.adaptive_offsets).
+4. In GPUModelRunner.sample_tokens() before speculator.propose(), clamping num_rejected by _dead_row_cut (repeated in both model_runner.py and OnlineAcceptanceEstimator.step) and masking CopyDrafter slots via torch.where(copy_drafter.int_state[idx_mapping, 1] > 0, -1, idx_mapping) launched 8 eager ATen kernels and 8 temporary GPU allocations on main_stream, and adaptive_verification.get_verified_draft_counts() was called a second time before copy_drafter.prepare_alloc(). In DraftModelSpeculator._copy_request_inputs(), idx_mapping[num_reqs:].fill_(-1) also launched a 0-element fill kernel when num_reqs == max_num_reqs.
+
+Fix all of these per-step decode overheads:
+1. Guard self.sampler.apply_staged_writes() under if scheduler_output.scheduled_new_reqs: in GPUModelRunner.add_requests().
+2. Track a _dirty flag on BlockTables, set by append_block_ids when it stages a write or changes num_blocks, so a step with nothing to publish (every append overwrite=False with empty new_block_ids, and no write staged on a table directly) skips fused_writer.apply() and num_blocks.copy_to_uva(). apply_staged_writes() still applies a write staged on a table directly, outside append_block_ids, as before: the skip is taken only when there is nothing staged at all (the fused staged-write and declared-call coverage tests of tests/v1/worker/test_gpu_tilelang_inputs.py stage that way).
+3. Skip the redundant cu_num_logits and query_start_loc async_tensor_h2d() transfers in GPUModelRunner.prepare_inputs() when adaptive_verification is active.
+4. Fuse optional dead_row_cut clamping (HAS_DEAD_ROW_CUT) and CopyDrafter slot masking (HAS_COPY_STATE) directly into OnlineAcceptanceEstimator._accumulate_kernel, reuse num_verified_draft_tokens for copy_drafter.prepare_alloc(), and guard idx_mapping[num_reqs:].fill_(-1) with if num_reqs < self.max_num_reqs:.
+
+Quality implications:
+None. All tensor values, acceptance-estimator IRLS accumulators, and speculative verification outputs are bit-exact with the baseline.
+
+Tests:
+- pytest tests/v1/spec_decode/test_acceptance_estimator.py tests/v1/spec_decode/test_adaptive_verification.py tests/v1/spec_decode/test_copy_drafts.py tests/v1/worker/test_gpu_block_table.py tests/v1/worker/test_gpu_model_runner_v2.py tests/v1/worker/test_gpu_input_batch_v2.py (219 passed, 1 skipped across 2 boots on sp5).
+- tests/v1/worker/test_gpu_block_table.py::test_block_tables_apply_staged_writes_applies_writes_staged_on_a_table: a write staged on a table directly, outside append_block_ids, lands on the next apply_staged_writes().
+- pytest tests/v1/worker/test_gpu_tilelang_inputs.py (682 passed, 1 skipped on sp8, on 1107 with candidate-47's 0762..0769 and this patch as 0766; with the first version of this patch, test_apply_fused_staged_writes and test_declared_calls_cover_the_call_sites failed).
+
+Upstream status:
+Local worker and speculative-decoding step-overhead optimization for GB10 clusters.
+---
+ .../spec_decode/test_acceptance_estimator.py  | 49 +++++++++++++
+ tests/v1/worker/test_gpu_block_table.py       | 61 ++++++++++++++++
+ tests/v1/worker/test_gpu_model_runner_v2.py   | 12 ++++
+ vllm/v1/worker/gpu/block_table.py             | 15 +++-
+ vllm/v1/worker/gpu/model_runner.py            | 69 ++++++++-----------
+ .../gpu/spec_decode/acceptance_estimator.py   | 41 +++++++++--
+ vllm/v1/worker/gpu/spec_decode/speculator.py  | 13 +++-
+ 7 files changed, 214 insertions(+), 46 deletions(-)
+
+diff --git a/tests/v1/spec_decode/test_acceptance_estimator.py b/tests/v1/spec_decode/test_acceptance_estimator.py
+index ded9206..6f06782 100644
+--- a/tests/v1/spec_decode/test_acceptance_estimator.py
++++ b/tests/v1/spec_decode/test_acceptance_estimator.py
+@@ -438,6 +438,55 @@ def test_step_ignores_negative_idx_mapping_and_dead_row_cut():
+     )
+ 
+ 
++@pytest.mark.parametrize("device_name", ["cuda", "cpu"])
++def test_step_fuses_dead_row_cut_and_copy_int_state(device_name: str):
++    """Fused dead_row_cut and copy_int_state in step() matches unfused reference."""
++    device = torch.device(device_name)
++    torch.manual_seed(99)
++    est_fused = OnlineAcceptanceEstimator.for_confidence_head(
++        MAX_NUM_REQS, NUM_STEPS, device
++    )
++    est_ref = OnlineAcceptanceEstimator.for_confidence_head(
++        MAX_NUM_REQS, NUM_STEPS, device
++    )
++    feats = torch.randn(MAX_NUM_REQS, NUM_STEPS, device=device)
++    preds = torch.rand(MAX_NUM_REQS, NUM_STEPS, device=device) * 0.8 + 0.1
++    est_fused.features.copy_(feats)
++    est_fused.predictions.copy_(preds)
++    est_ref.features.copy_(feats)
++    est_ref.predictions.copy_(preds)
++
++    idx_mapping = torch.tensor([0, 2, 5, -1, 7], dtype=torch.int32, device=device)
++    num_sampled = torch.tensor([3, 2, 4, 1, 1], dtype=torch.int32, device=device)
++    num_rejected = torch.tensor([2, 3, 1, 0, 4], dtype=torch.int32, device=device)
++    dead_row_cut = torch.tensor([2, 2, 4, 0, 2], dtype=torch.int32, device=device)
++    copy_int_state = torch.zeros((MAX_NUM_REQS, 2), dtype=torch.int32, device=device)
++    # Mark slot 2 as having a pending CopyDrafter proposal (> 0 in column 1).
++    copy_int_state[2, 1] = 8
++
++    est_fused.step(
++        idx_mapping,
++        num_sampled,
++        num_rejected,
++        dead_row_cut=dead_row_cut,
++        copy_int_state=copy_int_state,
++    )
++
++    live_rejected = (dead_row_cut - (num_sampled - 1).clamp_min(0)).clamp_min(0)
++    ref_rejected = torch.minimum(num_rejected, live_rejected)
++    safe_idx = idx_mapping.clamp_min(0)
++    ref_idx = torch.where(
++        (idx_mapping >= 0) & (copy_int_state[safe_idx, 1] > 0),
++        -1,
++        idx_mapping,
++    )
++    est_ref.step(ref_idx, num_sampled, ref_rejected)
++
++    torch.testing.assert_close(est_fused.counts, est_ref.counts)
++    torch.testing.assert_close(est_fused.info, est_ref.info)
++    torch.testing.assert_close(est_fused.grad, est_ref.grad)
++
++
+ def test_confidence_head_online_irls_reduces_survival_mae():
+     """Online IRLS calibration of an overconfident confidence head recovers true survival."""
+     device = torch.device("cuda")
+diff --git a/tests/v1/worker/test_gpu_block_table.py b/tests/v1/worker/test_gpu_block_table.py
+index bfa39db..6ad0b55 100644
+--- a/tests/v1/worker/test_gpu_block_table.py
++++ b/tests/v1/worker/test_gpu_block_table.py
+@@ -431,3 +431,64 @@ def test_block_tables_circular_group_maps_positions_into_its_ring():
+     assert slot_mappings[1].tolist() == ring + [-1] * 4
+     paged = [[3, 4, 5][p // 16] * 16 + p % 16 for p in positions[:37]]
+     assert slot_mappings[0].tolist() == paged + [6 * 16 + 5, 6 * 16 + 6, -1, -1]
++
++
++def test_block_tables_apply_staged_writes_skips_clean_decode_steps(monkeypatch):
++    """Non-allocating decode steps (overwrite=False, empty block_ids) skip UVA/GPU writes."""
++    device = torch.device("cuda")
++    block_tables = BlockTables(
++        block_sizes=[16, 32],
++        max_num_reqs=4,
++        max_num_batched_tokens=64,
++        max_num_blocks_per_group=[8, 8],
++        device=device,
++        kernel_block_sizes=[16, 16],
++    )
++    block_tables.append_block_ids(
++        req_index=0,
++        new_block_ids=([1, 2], [3]),
++        overwrite=True,
++    )
++    assert block_tables._dirty
++    block_tables.apply_staged_writes()
++    assert not block_tables._dirty
++
++    # Append empty block lists as on a normal decode step that allocates no new blocks.
++    block_tables.append_block_ids(
++        req_index=0,
++        new_block_ids=([], []),
++        overwrite=False,
++    )
++    assert not block_tables._dirty
++
++    monkeypatch.setattr(
++        block_tables.fused_writer,
++        "apply",
++        lambda *a, **kw: pytest.fail("clean decode step must skip fused_writer.apply"),
++    )
++    monkeypatch.setattr(
++        block_tables.num_blocks,
++        "copy_to_uva",
++        lambda *a, **kw: pytest.fail("clean decode step must skip num_blocks.copy_to_uva"),
++    )
++    block_tables.apply_staged_writes()
++
++
++def test_block_tables_apply_staged_writes_applies_writes_staged_on_a_table():
++    """The skip covers only a step with nothing staged: a write staged on a table
++    directly, outside append_block_ids, still lands on the next apply."""
++    device = torch.device("cuda")
++    block_tables = BlockTables(
++        block_sizes=[16, 32],
++        max_num_reqs=4,
++        max_num_batched_tokens=64,
++        max_num_blocks_per_group=[8, 8],
++        device=device,
++        kernel_block_sizes=[16, 16],
++    )
++    block_tables.block_tables[1].stage_write(2, 3, [7, 8])
++    assert not block_tables._dirty
++    block_tables.apply_staged_writes()
++    torch.accelerator.synchronize()
++    assert block_tables.block_tables[1].gpu[2, 3:5].tolist() == [7, 8]
++    assert not block_tables.block_tables[1]._staged_write_indices
+diff --git a/tests/v1/worker/test_gpu_model_runner_v2.py b/tests/v1/worker/test_gpu_model_runner_v2.py
+index 05c0195..49d0f06 100644
+--- a/tests/v1/worker/test_gpu_model_runner_v2.py
++++ b/tests/v1/worker/test_gpu_model_runner_v2.py
+@@ -1006,3 +1006,15 @@ def test_moe_output_buffer_is_reused_and_disjoint_from_workspace_scratch(
+     out2 = impl.apply(hidden, w1, w2, topk_ids, topk_weights)
+     assert out1.data_ptr() == out2.data_ptr() == view_small.data_ptr()
+     assert aliases == [view_small.data_ptr(), view_small.data_ptr()]
++
++
++def test_add_requests_skips_sampler_apply_staged_writes_when_no_new_reqs():
++    from unittest.mock import Mock
++
++    runner = GPUModelRunner.__new__(GPUModelRunner)
++    runner.sampler = SimpleNamespace(apply_staged_writes=Mock())
++    scheduler_output = SimpleNamespace(scheduled_new_reqs=[])
++
++    runner.add_requests(scheduler_output)
++
++    runner.sampler.apply_staged_writes.assert_not_called()
+diff --git a/vllm/v1/worker/gpu/block_table.py b/vllm/v1/worker/gpu/block_table.py
+index 6560f93..678eae1 100644
+--- a/vllm/v1/worker/gpu/block_table.py
++++ b/vllm/v1/worker/gpu/block_table.py
+@@ -100,6 +100,9 @@ class BlockTables:
+             device=self.device,
+         )
+ 
++        # Set by append_block_ids when it stages a write or changes num_blocks, so
++        # a decode step that allocates no block can skip apply_staged_writes.
++        self._dirty = False
+         self.init_block_table_layout_tensors()
+ 
+     def _make_ptr_tensor(self, x: Iterable[torch.Tensor]) -> torch.Tensor:
+@@ -156,8 +159,10 @@ class BlockTables:
+         overwrite: bool,
+     ) -> None:
+         for i in range(self.num_kv_cache_groups):
+-            start = self.num_blocks.np[i, req_index] if not overwrite else 0
+             block_ids = new_block_ids[i]
++            if not overwrite and not block_ids:
++                continue
++            start = self.num_blocks.np[i, req_index] if not overwrite else 0
+             bpk = self.blocks_per_kv_block[i]
+             if bpk > 1:
+                 block_ids = [b * bpk + k for b in block_ids for k in range(bpk)]
+@@ -170,10 +175,18 @@ class BlockTables:
+                 )
+             self.block_tables[i].stage_write(req_index, start, block_ids)
+             self.num_blocks.np[i, req_index] = end
++            self._dirty = True
+ 
+     def apply_staged_writes(self) -> None:
+         if self.num_kv_cache_groups == 0:
+             return
++        if not self._dirty and not any(
++            t._staged_write_indices for t in self.block_tables
++        ):
++            # Nothing staged and num_blocks as last published: a step that
++            # allocates no block. A write staged on a table directly still applies.
++            return
++        self._dirty = False
+         if self.num_kv_cache_groups == 1:
+             # Single group: write directly, skipping the per-write group lookup.
+             self.block_tables[0].apply_write()
+diff --git a/vllm/v1/worker/gpu/model_runner.py b/vllm/v1/worker/gpu/model_runner.py
+index 173432a..da881b8 100644
+--- a/vllm/v1/worker/gpu/model_runner.py
++++ b/vllm/v1/worker/gpu/model_runner.py
+@@ -1650,8 +1650,8 @@ class GPUModelRunner(LoRAModelRunnerMixin):
+                 self.adaptive_verification.apply_staged_writes()
+             if self.copy_drafter is not None:
+                 self.copy_drafter.apply_staged_writes()
+-        if self.sampler is not None:
+-            self.sampler.apply_staged_writes()
++            if self.sampler is not None:
++                self.sampler.apply_staged_writes()
+ 
+     def update_requests(self, scheduler_output: SchedulerOutput) -> None:
+         # Add new blocks and update num_computed_tokens for the existing requests.
+@@ -1834,7 +1834,10 @@ class GPUModelRunner(LoRAModelRunnerMixin):
+                 cu_num_logits_np = np.empty(num_reqs + 1, dtype=np.int32)
+                 cu_num_logits_np[0] = 0
+                 np.cumsum(num_logits, out=cu_num_logits_np[1:])
+-                cu_num_logits = async_tensor_h2d(cu_num_logits_np, device=self.device)
++                if adaptive_verification is None:
++                    cu_num_logits = async_tensor_h2d(
++                        cu_num_logits_np, device=self.device
++                    )
+ 
+         num_scheduled_tokens_upper_bound = num_scheduled_tokens_np
+         if adaptive_verification is not None:
+@@ -1852,14 +1855,20 @@ class GPUModelRunner(LoRAModelRunnerMixin):
+         # Get query_start_loc.
+         # num_reqs_padded is None for PIECEWISE graphs (no request padding needed)
+         num_reqs_padded = batch_desc.num_reqs or num_reqs
+-        query_start_loc_np = np.empty(self.max_num_reqs + 1, dtype=np.int32)
+-        query_start_loc_np[0] = 0
+-        np.cumsum(num_scheduled_tokens_np, out=query_start_loc_np[1 : num_reqs + 1])
+-        # Pad for full CUDA graph mode.
+-        # Some attention backends like FA3 require query_start_loc to be non-decreasing.
+-        query_start_loc_np[num_reqs + 1 :] = num_tokens
+         query_start_loc = self.input_buffers.query_start_loc
+-        async_tensor_h2d(query_start_loc_np, out=query_start_loc)
++        if adaptive_verification is None:
++            query_start_loc_np = np.empty(self.max_num_reqs + 1, dtype=np.int32)
++            query_start_loc_np[0] = 0
++            np.cumsum(num_scheduled_tokens_np, out=query_start_loc_np[1 : num_reqs + 1])
++            # Pad for full CUDA graph mode.
++            # Some attention backends like FA3 require query_start_loc to be non-decreasing.
++            query_start_loc_np[num_reqs + 1 :] = num_tokens
++            async_tensor_h2d(query_start_loc_np, out=query_start_loc)
++        else:
++            query_start_loc_np = np.empty(num_reqs_padded + 1, dtype=np.int32)
++            query_start_loc_np[0] = 0
++            np.cumsum(num_scheduled_tokens_np, out=query_start_loc_np[1 : num_reqs + 1])
++            query_start_loc_np[num_reqs + 1 :] = num_tokens
+         if (
+             draft_tokens
+             and adaptive_verification is None
+@@ -3593,32 +3602,21 @@ class GPUModelRunner(LoRAModelRunnerMixin):
+                 and self.speculator.acceptance_estimator is not None
+             ):
+                 observed_rejected = num_rejected
+-                if self._dead_row_cut is not None:
+-                    # Rows past the dead-row cut skipped routed MoE and were
+-                    # never verified; only live rows can be observed as rejected.
+-                    live_rejected = (
+-                        self._dead_row_cut[: input_batch.num_reqs]
+-                        - (num_sampled - 1).clamp_min(0)
+-                    ).clamp_min(0)
+-                    observed_rejected = torch.minimum(
+-                        observed_rejected, live_rejected
+-                    )
+                 if sampler_output.sink is not None:
+                     # A rejected draft zero left the drafts unjudged.
+                     observed_rejected = observed_rejected.masked_fill(
+                         sampler_output.sink.events[:, 0] == SinkOutcome.REJECTED, 0
+                     )
+-                observed_idx_mapping = input_batch.idx_mapping
+-                if self.copy_drafter is not None:
+-                    # Slots whose last verified proposal came from CopyDrafter
+-                    # must not grade DSpark's confidence_head features.
+-                    observed_idx_mapping = torch.where(
+-                        self.copy_drafter.int_state[input_batch.idx_mapping, 1] > 0,
+-                        -1,
+-                        observed_idx_mapping,
+-                    )
+                 self.speculator.observe_verification(
+-                    observed_idx_mapping, num_sampled, observed_rejected
++                    input_batch.idx_mapping,
++                    num_sampled,
++                    observed_rejected,
++                    dead_row_cut=self._dead_row_cut,
++                    copy_int_state=(
++                        self.copy_drafter.int_state
++                        if self.copy_drafter is not None
++                        else None
++                    ),
+                 )
+             # Let the target override the hidden state fed to the drafter
+             # (_mtp_target_states).
+@@ -3652,14 +3650,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
+                             dtype=input_batch.idx_mapping.dtype,
+                             device=self.device,
+                         )
+-                verified = (
+-                    self.adaptive_verification.get_verified_draft_counts(
+-                        input_batch.num_reqs, self._dead_row_cut
+-                    )
+-                    if self.adaptive_verification is not None
+-                    and input_batch.num_draft_tokens_per_req is not None
+-                    else None
+-                )
++                verified = num_verified_draft_tokens
+                 self.copy_drafter.prepare_alloc(
+                     input_batch.idx_mapping,
+                     num_sampled,
+@@ -3746,7 +3737,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
+                 )
+         elif self.speculator is not None:
+             draft_tokens_for_next_step = self.req_states.draft_tokens[
+-                input_batch.idx_mapping, :0
++                : input_batch.num_reqs, :0
+             ]
+ 
+         if self.num_speculative_steps > 0:
+diff --git a/vllm/v1/worker/gpu/spec_decode/acceptance_estimator.py b/vllm/v1/worker/gpu/spec_decode/acceptance_estimator.py
+index 6f3f3d5..0090533 100644
+--- a/vllm/v1/worker/gpu/spec_decode/acceptance_estimator.py
++++ b/vllm/v1/worker/gpu/spec_decode/acceptance_estimator.py
+@@ -34,12 +34,17 @@ def _accumulate_kernel(
+     idx_mapping_ptr,
+     num_sampled_ptr,
+     num_rejected_ptr,
++    dead_row_cut_ptr,
++    copy_int_state_ptr,
++    copy_int_state_stride,
+     features_ptr,
+     features_stride,
+     pred_ptr,
+     pred_stride,
+     counts_ptr,
+     num_reqs,
++    HAS_DEAD_ROW_CUT: tl.constexpr,
++    HAS_COPY_STATE: tl.constexpr,
+     BLOCK_R: tl.constexpr,
+ ):
+     step = tl.program_id(0).to(tl.int64)
+@@ -50,6 +55,13 @@ def _accumulate_kernel(
+     )
+     req_mask = req_mask & (req_state_block >= 0)
+     safe_req_state = tl.maximum(req_state_block, 0)
++    if HAS_COPY_STATE:
++        copy_verified = tl.load(
++            copy_int_state_ptr + safe_req_state * copy_int_state_stride + 1,
++            mask=req_mask,
++            other=0,
++        )
++        req_mask = req_mask & (copy_verified <= 0)
+ 
+     num_sampled = tl.load(num_sampled_ptr + req_block, mask=req_mask, other=0).to(
+         tl.int64
+@@ -59,6 +71,12 @@ def _accumulate_kernel(
+     num_rejected = tl.load(num_rejected_ptr + req_block, mask=req_mask, other=0).to(
+         tl.int64
+     )
++    if HAS_DEAD_ROW_CUT:
++        dead_cut = tl.load(dead_row_cut_ptr + req_block, mask=req_mask, other=0).to(
++            tl.int64
++        )
++        live_rejected = tl.maximum(dead_cut - num_accepted, 0)
++        num_rejected = tl.minimum(num_rejected, live_rejected)
+     num_admitted = num_accepted + num_rejected
+ 
+     feature = tl.load(
+@@ -500,29 +518,44 @@ class OnlineAcceptanceEstimator:
+         num_sampled: torch.Tensor,
+         num_rejected: torch.Tensor,
+         dead_row_cut: torch.Tensor | None = None,
++        copy_int_state: torch.Tensor | None = None,
+     ) -> None:
+         # Accumulate the previous step's graded drafts into the IRLS statistics.
+         num_reqs = idx_mapping.shape[0]
+-        if dead_row_cut is not None and num_reqs > 0:
+-            num_accepted = (num_sampled - 1).clamp_min(0)
+-            live_rejected = (dead_row_cut[:num_reqs] - num_accepted).clamp_min(0)
+-            num_rejected = torch.minimum(num_rejected, live_rejected)
+         if self.device.type != "cuda":
++            if dead_row_cut is not None and num_reqs > 0:
++                num_accepted = (num_sampled - 1).clamp_min(0)
++                live_rejected = (dead_row_cut[:num_reqs] - num_accepted).clamp_min(0)
++                num_rejected = torch.minimum(num_rejected, live_rejected)
++            if copy_int_state is not None and num_reqs > 0:
++                safe_idx = idx_mapping.clamp_min(0)
++                idx_mapping = torch.where(
++                    (idx_mapping >= 0) & (copy_int_state[safe_idx, 1] > 0),
++                    -1,
++                    idx_mapping,
++                )
+             self._step_cpu(idx_mapping, num_sampled, num_rejected)
+             return
+         if num_reqs > 0:
++            has_dead_row_cut = dead_row_cut is not None
++            has_copy_state = copy_int_state is not None
+             _accumulate_kernel[(self.num_speculative_steps,)](
+                 self.info,
+                 self.grad,
+                 idx_mapping,
+                 num_sampled,
+                 num_rejected,
++                dead_row_cut if has_dead_row_cut else num_rejected,
++                copy_int_state if has_copy_state else num_rejected,
++                copy_int_state.stride(0) if has_copy_state else 0,
+                 self.features,
+                 self.features.stride(0),
+                 self.predictions,
+                 self.predictions.stride(0),
+                 self.counts,
+                 num_reqs,
++                HAS_DEAD_ROW_CUT=has_dead_row_cut,
++                HAS_COPY_STATE=has_copy_state,
+                 BLOCK_R=triton.next_power_of_2(max(num_reqs, 1)),
+             )
+ 
+diff --git a/vllm/v1/worker/gpu/spec_decode/speculator.py b/vllm/v1/worker/gpu/spec_decode/speculator.py
+index dfd4774..4f00369 100644
+--- a/vllm/v1/worker/gpu/spec_decode/speculator.py
++++ b/vllm/v1/worker/gpu/spec_decode/speculator.py
+@@ -511,6 +511,8 @@ class DraftModelSpeculator(BaseSpeculator):
+         idx_mapping: torch.Tensor,
+         num_sampled: torch.Tensor,
+         num_rejected: torch.Tensor,
++        dead_row_cut: torch.Tensor | None = None,
++        copy_int_state: torch.Tensor | None = None,
+     ) -> None:
+         """Fold the target's verdict on the last drafts into the estimator.
+ 
+@@ -518,7 +520,13 @@ class DraftModelSpeculator(BaseSpeculator):
+         features the verdict grades.
+         """
+         if self.acceptance_estimator is not None:
+-            self.acceptance_estimator.step(idx_mapping, num_sampled, num_rejected)
++            self.acceptance_estimator.step(
++                idx_mapping,
++                num_sampled,
++                num_rejected,
++                dead_row_cut=dead_row_cut,
++                copy_int_state=copy_int_state,
++            )
+ 
+     def prepare_watermarking(
+         self, contexts: torch.Tensor, watermarking: torch.Tensor
+@@ -548,7 +556,8 @@ class DraftModelSpeculator(BaseSpeculator):
+         self.idx_mapping[:num_reqs].copy_(idx_mapping)
+         # idx_mapping for CG padded requests points to -1, which is ignored
+         # during sampling to prevent writing stale values to draft logits.
+-        self.idx_mapping[num_reqs:].fill_(-1)
++        if num_reqs < self.max_num_reqs:
++            self.idx_mapping[num_reqs:].fill_(-1)
+ 
+     def _build_uniform_batch_dp_sync(
+         self,
+-- 
+2.43.0
+

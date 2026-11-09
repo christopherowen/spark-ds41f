@@ -1,0 +1,117 @@
+# Commands run on sp8 for the PR #1010 rework (round 1), one block per run, in issue order.
+# start_utc is when the command was issued; it includes any wait on /tmp/spark-lab-gpu.lock.
+# hold_file is the content of ~/spark-hold.json at issue time; empty means there was none.
+# Mounted files (read-only over spark-ds41f:candidate-48): final/ = candidate-48 stack before 0763 + the reworked 0763 (git am), files that differ from the image only.
+#   final/vllm/v1/core/kv_cache_coordinator.py, final/vllm/v1/core/single_type_kv_cache_manager.py, final/tests/v1/core/test_prefix_cache_retention_probe.py
+# src/probe/probe_prefix_cache_retention.py is the PR head probe (sha256 4c69d0be...), unchanged. src/release_tests is scripts/release_tests at the PR #1011 head (tblib_stub).
+
+### pytest-pr-file-precheck
+host: spark-0016 (sp8)
+image: sha256:d6ffd842978849651e756ebd39e9bf2da7ddb03e746113013533029878485a24 (spark-ds41f:candidate-48)
+start_utc: 2026-11-09T05:25:08Z
+loadavg_before: 2.81 2.70 2.88
+docker_ps_before: 9f51f2e2c5ab c49om-996-pyt-b2;
+hold_file: 
+command: flock /tmp/spark-lab-gpu.lock docker run --rm --name c48rw-1010-pyt-pre --gpus all --ipc=host --entrypoint pytest -w /opt/spark-ds41f/candidate/vllm -v /home/chris/spark-lab/agents/candidate-48-rework-1010/final/vllm/v1/core/kv_cache_coordinator.py:/opt/spark-ds41f/candidate/vllm/vllm/v1/core/kv_cache_coordinator.py:ro -v /home/chris/spark-lab/agents/candidate-48-rework-1010/final/vllm/v1/core/single_type_kv_cache_manager.py:/opt/spark-ds41f/candidate/vllm/vllm/v1/core/single_type_kv_cache_manager.py:ro -v /home/chris/spark-lab/agents/candidate-48-rework-1010/final/tests/v1/core/test_prefix_cache_retention_probe.py:/opt/spark-ds41f/candidate/vllm/tests/v1/core/test_prefix_cache_retention_probe.py:ro -e PYTHONPATH=/opt/spark-ds41f/candidate/vllm:/opt/spark-ds41f/candidate/b12x:/opt/release_tests -v /home/chris/spark-lab/agents/candidate-48-rework-1010/src/release_tests:/opt/release_tests:ro sha256:d6ffd842978849651e756ebd39e9bf2da7ddb03e746113013533029878485a24 -p tblib_stub -q tests/v1/core/test_prefix_cache_retention_probe.py
+end_utc: 2026-11-09T05:29:44Z
+loadavg_after: 2.30 2.59 2.79
+exit_code: 0
+output: pytest-pr-file-precheck.txt
+
+### probe-rework-boot1
+host: spark-0016 (sp8)
+image: sha256:d6ffd842978849651e756ebd39e9bf2da7ddb03e746113013533029878485a24 (spark-ds41f:candidate-48)
+start_utc: 2026-11-09T05:29:44Z
+loadavg_before: 2.30 2.59 2.79
+docker_ps_before: 
+hold_file: 
+command: flock /tmp/spark-lab-gpu.lock docker run --rm --name c48rw-1010-probe-b1 --gpus all --ipc=host --entrypoint python3 -w /opt/spark-ds41f/candidate/vllm -v /home/chris/spark-lab/agents/candidate-48-rework-1010/final/vllm/v1/core/kv_cache_coordinator.py:/opt/spark-ds41f/candidate/vllm/vllm/v1/core/kv_cache_coordinator.py:ro -v /home/chris/spark-lab/agents/candidate-48-rework-1010/final/vllm/v1/core/single_type_kv_cache_manager.py:/opt/spark-ds41f/candidate/vllm/vllm/v1/core/single_type_kv_cache_manager.py:ro -v /home/chris/spark-lab/agents/candidate-48-rework-1010/final/tests/v1/core/test_prefix_cache_retention_probe.py:/opt/spark-ds41f/candidate/vllm/tests/v1/core/test_prefix_cache_retention_probe.py:ro -v /home/chris/spark-lab/agents/candidate-48-rework-1010/src/probe:/probe:ro -v /home/chris/spark-lab/agents/candidate-48-rework-1010/out:/out sha256:d6ffd842978849651e756ebd39e9bf2da7ddb03e746113013533029878485a24 /probe/probe_prefix_cache_retention.py --boot 1 --output /out/probe-rework-boot1.json
+end_utc: 2026-11-09T05:30:36Z
+loadavg_after: 2.15 2.52 2.76
+exit_code: 0
+output: probe-rework-boot1.txt
+
+### probe-rework-boot2
+host: spark-0016 (sp8)
+image: sha256:d6ffd842978849651e756ebd39e9bf2da7ddb03e746113013533029878485a24 (spark-ds41f:candidate-48)
+start_utc: 2026-11-09T05:30:37Z
+loadavg_before: 2.15 2.52 2.76
+docker_ps_before: 
+hold_file: 
+command: flock /tmp/spark-lab-gpu.lock docker run --rm --name c48rw-1010-probe-b2 --gpus all --ipc=host --entrypoint python3 -w /opt/spark-ds41f/candidate/vllm -v /home/chris/spark-lab/agents/candidate-48-rework-1010/final/vllm/v1/core/kv_cache_coordinator.py:/opt/spark-ds41f/candidate/vllm/vllm/v1/core/kv_cache_coordinator.py:ro -v /home/chris/spark-lab/agents/candidate-48-rework-1010/final/vllm/v1/core/single_type_kv_cache_manager.py:/opt/spark-ds41f/candidate/vllm/vllm/v1/core/single_type_kv_cache_manager.py:ro -v /home/chris/spark-lab/agents/candidate-48-rework-1010/final/tests/v1/core/test_prefix_cache_retention_probe.py:/opt/spark-ds41f/candidate/vllm/tests/v1/core/test_prefix_cache_retention_probe.py:ro -v /home/chris/spark-lab/agents/candidate-48-rework-1010/src/probe:/probe:ro -v /home/chris/spark-lab/agents/candidate-48-rework-1010/out:/out sha256:d6ffd842978849651e756ebd39e9bf2da7ddb03e746113013533029878485a24 /probe/probe_prefix_cache_retention.py --boot 2 --output /out/probe-rework-boot2.json
+end_utc: 2026-11-09T05:31:28Z
+loadavg_after: 2.10 2.46 2.72
+exit_code: 0
+output: probe-rework-boot2.txt
+
+### pytest-receipt-list-rework-boot1
+host: spark-0016 (sp8)
+image: sha256:d6ffd842978849651e756ebd39e9bf2da7ddb03e746113013533029878485a24 (spark-ds41f:candidate-48)
+start_utc: 2026-11-09T05:31:28Z
+loadavg_before: 2.10 2.46 2.72
+docker_ps_before: 
+hold_file: 
+command: flock /tmp/spark-lab-gpu.lock docker run --rm --name c48rw-1010-pyt-b1 --gpus all --ipc=host --entrypoint pytest -w /opt/spark-ds41f/candidate/vllm -v /home/chris/spark-lab/agents/candidate-48-rework-1010/final/vllm/v1/core/kv_cache_coordinator.py:/opt/spark-ds41f/candidate/vllm/vllm/v1/core/kv_cache_coordinator.py:ro -v /home/chris/spark-lab/agents/candidate-48-rework-1010/final/vllm/v1/core/single_type_kv_cache_manager.py:/opt/spark-ds41f/candidate/vllm/vllm/v1/core/single_type_kv_cache_manager.py:ro -v /home/chris/spark-lab/agents/candidate-48-rework-1010/final/tests/v1/core/test_prefix_cache_retention_probe.py:/opt/spark-ds41f/candidate/vllm/tests/v1/core/test_prefix_cache_retention_probe.py:ro -e PYTHONPATH=/opt/spark-ds41f/candidate/vllm:/opt/spark-ds41f/candidate/b12x:/opt/release_tests -v /home/chris/spark-lab/agents/candidate-48-rework-1010/src/release_tests:/opt/release_tests:ro sha256:d6ffd842978849651e756ebd39e9bf2da7ddb03e746113013533029878485a24 -p tblib_stub tests/v1/core/test_prefix_cache_retention_probe.py tests/v1/core/test_prefix_group_validity.py tests/v1/core/prefix_cache/test_mamba_boundary_capture.py tests/v1/core/prefix_cache/test_mamba_boundary_capture_digest.py tests/v1/core/prefix_cache/test_mamba_eagle_resume_checkpoint.py tests/v1/core/prefix_cache/test_partial_prefix_cache_hits.py tests/v1/core/prefix_cache/test_partial_prefix_cache_primitives.py tests/v1/core/prefix_cache/test_sparse_event_context.py tests/v1/core/test_async_scheduler.py tests/v1/core/test_boundary_admission.py tests/v1/core/test_boundary_admission_aged_cache.py tests/v1/core/test_boundary_admission_continuation.py tests/v1/core/test_boundary_admission_horizon.py tests/v1/core/test_boundary_admission_review.py tests/v1/core/test_partial_attention_rewind.py tests/v1/core/test_prefix_caching.py tests/v1/core/test_single_type_kv_cache_manager.py tests/v1/core/test_sink_draft_zero.py tests/v1/core/test_swa_inflight_window_free.py tests/v1/worker/test_boundary_checkpoint_attention.py tests/v1/worker/test_boundary_checkpoint_restore_scalars.py tests/kernels/attention/test_deepseek_v41_ced_replay.py tests/v1/attention/test_b12x_v41_ced_metadata.py
+end_utc: 2026-11-09T05:42:07Z
+loadavg_after: 3.59 2.75 2.65
+exit_code: 0
+output: pytest-receipt-list-rework-boot1.txt
+
+### pytest-receipt-list-rework-boot2
+host: spark-0016 (sp8)
+image: sha256:d6ffd842978849651e756ebd39e9bf2da7ddb03e746113013533029878485a24 (spark-ds41f:candidate-48)
+start_utc: 2026-11-09T05:42:08Z
+loadavg_before: 3.59 2.75 2.65
+docker_ps_before: 
+hold_file: 
+command: flock /tmp/spark-lab-gpu.lock docker run --rm --name c48rw-1010-pyt-b2 --gpus all --ipc=host --entrypoint pytest -w /opt/spark-ds41f/candidate/vllm -v /home/chris/spark-lab/agents/candidate-48-rework-1010/final/vllm/v1/core/kv_cache_coordinator.py:/opt/spark-ds41f/candidate/vllm/vllm/v1/core/kv_cache_coordinator.py:ro -v /home/chris/spark-lab/agents/candidate-48-rework-1010/final/vllm/v1/core/single_type_kv_cache_manager.py:/opt/spark-ds41f/candidate/vllm/vllm/v1/core/single_type_kv_cache_manager.py:ro -v /home/chris/spark-lab/agents/candidate-48-rework-1010/final/tests/v1/core/test_prefix_cache_retention_probe.py:/opt/spark-ds41f/candidate/vllm/tests/v1/core/test_prefix_cache_retention_probe.py:ro -e PYTHONPATH=/opt/spark-ds41f/candidate/vllm:/opt/spark-ds41f/candidate/b12x:/opt/release_tests -v /home/chris/spark-lab/agents/candidate-48-rework-1010/src/release_tests:/opt/release_tests:ro sha256:d6ffd842978849651e756ebd39e9bf2da7ddb03e746113013533029878485a24 -p tblib_stub tests/v1/core/test_prefix_cache_retention_probe.py tests/v1/core/test_prefix_group_validity.py tests/v1/core/prefix_cache/test_mamba_boundary_capture.py tests/v1/core/prefix_cache/test_mamba_boundary_capture_digest.py tests/v1/core/prefix_cache/test_mamba_eagle_resume_checkpoint.py tests/v1/core/prefix_cache/test_partial_prefix_cache_hits.py tests/v1/core/prefix_cache/test_partial_prefix_cache_primitives.py tests/v1/core/prefix_cache/test_sparse_event_context.py tests/v1/core/test_async_scheduler.py tests/v1/core/test_boundary_admission.py tests/v1/core/test_boundary_admission_aged_cache.py tests/v1/core/test_boundary_admission_continuation.py tests/v1/core/test_boundary_admission_horizon.py tests/v1/core/test_boundary_admission_review.py tests/v1/core/test_partial_attention_rewind.py tests/v1/core/test_prefix_caching.py tests/v1/core/test_single_type_kv_cache_manager.py tests/v1/core/test_sink_draft_zero.py tests/v1/core/test_swa_inflight_window_free.py tests/v1/worker/test_boundary_checkpoint_attention.py tests/v1/worker/test_boundary_checkpoint_restore_scalars.py tests/kernels/attention/test_deepseek_v41_ced_replay.py tests/v1/attention/test_b12x_v41_ced_metadata.py
+end_utc: 2026-11-09T05:56:27Z
+loadavg_after: 3.12 2.48 2.53
+exit_code: 0
+output: pytest-receipt-list-rework-boot2.txt
+
+
+# ---------------------------------------------------------------------------
+# Diagnostics (root-cause analysis, not measurements of the mark). They replay the
+# stress probe's turn schedule or the LRU-order probe and print which cached blocks
+# the eviction takes. All ran on sp8 against spark-ds41f:candidate-48
+# (sha256:d6ffd842978849651e756ebd39e9bf2da7ddb03e746113013533029878485a24),
+# without --gpus (CPU-only bookkeeping), under flock /tmp/spark-lab-gpu.lock.
+# Times are from the container log lines. Scripts and outputs are in diag/.
+# No 1107 image run: "pre-0763" is the candidate-48 image with the four files 0763
+# touches replaced by their pre-0763 versions (git archive base-pre0763, built by
+# reverse-applying 0766's scheduler.py hunks and then 0763 to the image's files).
+# Its per-turn hits equal 1107's receipts exactly.
+
+### diag-orig (candidate-48 as built), ~2026-11-09T05:01:46Z
+command: timeout 600 flock /tmp/spark-lab-gpu.lock docker run --rm --name c48rw-1010-diag-orig --entrypoint python3 -w /opt/spark-ds41f/candidate/vllm -v $HOME/spark-lab/agents/candidate-48-own-marks/src/pr-1010:/workspace:ro -v $PWD/work/diag:/diag:ro spark-ds41f:candidate-48 /diag/diag_stress.py
+output: diag/diag-orig.txt
+
+### diag-pre0763 (candidate-48 with 0763 reverted in its four files), ~2026-11-09T05:02:06Z
+command: timeout 600 flock /tmp/spark-lab-gpu.lock docker run --rm --name c48rw-1010-diag-pre --entrypoint python3 -w /opt/spark-ds41f/candidate/vllm -v $PWD/work/tree-pre0763/vllm/v1/core/kv_cache_coordinator.py:/opt/spark-ds41f/candidate/vllm/vllm/v1/core/kv_cache_coordinator.py:ro -v $PWD/work/tree-pre0763/vllm/v1/core/single_type_kv_cache_manager.py:/opt/spark-ds41f/candidate/vllm/vllm/v1/core/single_type_kv_cache_manager.py:ro -v $PWD/work/tree-pre0763/vllm/v1/core/sched/scheduler.py:/opt/spark-ds41f/candidate/vllm/vllm/v1/core/sched/scheduler.py:ro -v $PWD/work/tree-pre0763/vllm/v1/core/sched/async_scheduler.py:/opt/spark-ds41f/candidate/vllm/vllm/v1/core/sched/async_scheduler.py:ro -v $HOME/spark-lab/agents/candidate-48-own-marks/src/pr-1010:/workspace:ro -v $PWD/work/diag:/diag:ro spark-ds41f:candidate-48 /diag/diag_stress.py
+output: diag/diag-pre0763.txt
+
+### diag-varA / diag-varB (screening variants, with --gpus all), ~2026-11-09T05:10Z-05:24Z
+# varA = the reworked 0763 (final); varB = varA without the cross-group free order
+# (kv_cache_coordinator.py free/pop_blocks_for_free as before 0763).
+# work/runprobe.sh <dir> <label> <args> bind-mounts <dir>'s copies of the changed files read-only:
+command: work/runprobe.sh work/varA varA-diag /diag/diag_stress.py
+command: work/runprobe.sh work/varA varA-probe /workspace/experiments/2026-11-08-prefix-cache-retention-probe/probe_prefix_cache_retention.py --boot 0 --output /out/varA-diag-probe.json
+command: work/runprobe.sh work/varB varB-diag /diag/diag_stress.py
+command: work/runprobe.sh work/varB varB-probe /workspace/experiments/2026-11-08-prefix-cache-retention-probe/probe_prefix_cache_retention.py --boot 0 --output /out/varB-diag-probe.json
+# runprobe.sh: flock /tmp/spark-lab-gpu.lock docker run --rm --name c48rw-1010-<label> --gpus all --ipc=host --entrypoint python3 -w /opt/spark-ds41f/candidate/vllm <mounts> -v <pr-1010 src>:/workspace:ro -v work/diag:/diag:ro -v work/out:/out spark-ds41f:candidate-48 <args>
+# varA probe: matrix 1404/1404/567, spec 60/60, LRU inversions 6/6/6/6, stress tp3 and tp4 1,126,400 (99.8574%)
+# varB probe: matrix 1404/1404/567, spec 60/60, LRU inversions 8/8/8/8, stress tp3 and tp4 1,126,400 (99.8574%)
+output: diag/diag-varA.txt, diag/diag-varB.txt
+
+### diag-lru-rework (reworked 0763 = final/), issued ~2026-11-09T05:31Z, ran after pytest boot 1 (lock queue)
+command: flock /tmp/spark-lab-gpu.lock docker run --rm --name c48rw-1010-diag-lru --entrypoint python3 -w /opt/spark-ds41f/candidate/vllm -v $D/final/vllm/v1/core/kv_cache_coordinator.py:/opt/spark-ds41f/candidate/vllm/vllm/v1/core/kv_cache_coordinator.py:ro -v $D/final/vllm/v1/core/single_type_kv_cache_manager.py:/opt/spark-ds41f/candidate/vllm/vllm/v1/core/single_type_kv_cache_manager.py:ro -v $D/src/probe:/probe:ro -v $D/work/diag:/diag:ro spark-ds41f:candidate-48 /diag/diag_lru.py
+output: diag/diag-lru-rework.txt
+
+# Patch identity checks (sp8, ~/spark-lab/agents/candidate-48-rework-1010):
+#   repo/: base-pre0763 = image files with 0766's scheduler/kv_cache_manager/utils/request hunks and 0763 reverse-applied;
+#   git am of the original 0763 on it, plus 0766, reproduces the image's files byte for byte.
+#   git commit --amend (author and date kept) -> git format-patch -1 -> 0763-fix-prefix-cache-retain-decode-frontier-swa-and-orde.patch
+#   git diff --check base-pre0763 HEAD: clean
+#   work/applytest: git am of the delivered patch on base-pre0763 succeeds; 0766 then applies (git apply --check);
+#   the resulting scheduler.py, async_scheduler.py, kv_cache_manager.py, tests/v1/core/utils.py and request.py equal the image's.

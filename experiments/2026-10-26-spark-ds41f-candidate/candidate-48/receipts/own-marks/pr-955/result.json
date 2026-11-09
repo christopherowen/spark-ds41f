@@ -1,0 +1,35 @@
+{
+  "pr": 955,
+  "pr_head": "3a854ba440e14a0dc37d2f12ee54fe0cd0f37e6d",
+  "mark": "Its DSML fixture replay (36/36) on the image, and a live tool call quoting DSML returns complete arguments",
+  "host": "sp8 (spark-0016, NVIDIA GB10)",
+  "images": {
+    "candidate-48": "sha256:d6ffd842978849651e756ebd39e9bf2da7ddb03e746113013533029878485a24",
+    "1107": "sha256:3f32a962ce04b7c8d85337cd427a8946b8b6bcaadd97cc8d8a8cd14e8d68a6ce"
+  },
+  "evidence": "experiments/2026-11-06-deepseek-v41-dsml-provenance/replay_fixtures.py over fixtures/live-1030.json and fixtures/live-1030-thinking.json (9 cases x 4 runs: whole, stream/1, stream/7, stream/10000), CPU container as in the PR",
+  "measured": {
+    "candidate-48": {
+      "boot1": {"rows": 36, "ok": 36, "failing_cases": []},
+      "boot2": {"rows": 36, "ok": 36, "failing_cases": []},
+      "rows_identical_to_pr_runs_replay-patched.jsonl": true,
+      "boot1_boot2_identical": true
+    },
+    "1107": {
+      "boot1": {"rows": 36, "ok": 20, "failing_cases": ["n1_file_of_closers", "n2_python_line", "q876_no_tools", "th_n2_python_line"]},
+      "boot2": {"rows": 36, "ok": 20, "failing_cases": ["n1_file_of_closers", "n2_python_line", "q876_no_tools", "th_n2_python_line"]},
+      "rows_identical_to_pr_runs_replay-1107.jsonl": true
+    },
+    "interval": "deterministic replay: both boots identical, so the interval is zero"
+  },
+  "parts": [
+    {"part": "DSML fixture replay 36/36 on the image", "verdict": "pass", "detail": "36/36 on both candidate-48 boots; 1107 gives 20/36 (16 rows fail, the 4 quoted-DSML cases) on both boots"},
+    {"part": "live tool call quoting DSML returns complete arguments", "verdict": "cannot-evaluate-on-sp8", "detail": "needs a live serving cluster; sp8 serves no model"}
+  ],
+  "verdict": "pass",
+  "verdict_scope": "sp8-evaluable parts only; the live part is cannot-evaluate-on-sp8",
+  "reason": "The PR's own replay gives 36/36 on both candidate-48 boots, row-for-row equal to the PR's runs/replay-patched.jsonl, while 1107 reproduces the 16 failing rows of runs/replay-1107.jsonl. The README gives no literal replay command; the command used is the script's documented usage (python3 replay_fixtures.py <model dir> <fixtures.json>...). The live tool call is not evaluable on sp8.",
+  "notes": [
+    "commands.txt start_utc is when the command was issued and includes any wait on /tmp/spark-lab-gpu.lock"
+  ]
+}

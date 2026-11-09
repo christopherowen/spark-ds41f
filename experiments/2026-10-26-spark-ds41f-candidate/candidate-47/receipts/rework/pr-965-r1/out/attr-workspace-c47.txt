@@ -1,0 +1,95 @@
+F                                                                        [100%]
+=================================== FAILURES ===================================
+________ test_v41_tilelang_attention_reserves_scratch_in_its_model_lane ________
+
+monkeypatch = <_pytest.monkeypatch.MonkeyPatch object at 0xf3b1eeb25d30>
+
+    def test_v41_tilelang_attention_reserves_scratch_in_its_model_lane(monkeypatch):
+        """A V4.1 TileLang attention layer's indexing scratch and metadata arena are
+        reserved in the lane of the model holding the layer, before profiling: binding
+        the plans reserves nothing, so the drafter's lane does not take the target's
+        indexing scratch."""
+        pytest.importorskip("tilelang")
+        from vllm.models.deepseek_v4_1.tilelang import attention as tl_attention
+        from vllm.v1.worker.gpu.model_runner import GPUModelRunner
+    
+        monkeypatch.setattr(workspace, "dbo_current_ubatch_id", lambda: 0)
+        manager = workspace.WorkspaceManager(
+            torch.device("cpu"), num_ubatches=1, num_lanes=2
+        )
+        monkeypatch.setattr(workspace, "_manager", manager)
+        monkeypatch.setattr(tl_attention, "current_workspace_manager", lambda: manager)
+    
+        class IndexPlan:
+            def __init__(self, width):
+                self.width = width
+    
+            def scratch_specs(self, rows):
+                return (((rows, self.width), torch.bfloat16),)
+    
+        mla = SimpleNamespace(
+            decode_max_rows=64, scratch_specs=lambda rows: (((rows, 4), torch.uint8),)
+        )
+        monkeypatch.setattr(tl_attention, "_mla_plan", lambda *args: mla)
+        monkeypatch.setattr(tl_attention, "_index_plan", IndexPlan)
+        monkeypatch.setattr(tl_attention, "_source_short_plan", lambda *args: None)
+    
+        def layer(index_width, metadata_rows):
+            module = tl_attention.DeepseekV41TileLangAttention.__new__(
+                tl_attention.DeepseekV41TileLangAttention
+            )
+            torch.nn.Module.__init__(module)
+            module.capacity = 1024
+            index = {"prefill": (index_width,)} if index_width else {}
+            module._plan_args = lambda: ((), index, {"prefill": 256})
+            module._attention_workspace_specs = {
+                "extend": (((metadata_rows, 4), torch.int32),)
+            }
+            module._build_tilelang_plans()
+            return module
+    
+>       target = layer(4096, 512)  # an index layer: 256 rows x 4,096 BF16 scores
+                 ^^^^^^^^^^^^^^^^
+
+tests/v1/worker/test_workspace.py:519: 
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
+tests/v1/worker/test_workspace.py:516: in layer
+    module._build_tilelang_plans()
+vllm/models/deepseek_v4_1/tilelang/attention.py:329: in _build_tilelang_plans
+    overlap_specs = self._decode_overlap_workspace_specs(self.DECODE_CHUNK)
+                    ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+vllm/models/deepseek_v4_1/attention.py:1095: in _decode_overlap_workspace_specs
+    if self.indexer is None:
+       ^^^^^^^^^^^^
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
+
+self = DeepseekV41TileLangAttention(), name = 'indexer'
+
+    def __getattr__(self, name: str) -> Union[Tensor, "Module"]:
+        if "_parameters" in self.__dict__:
+            _parameters = self.__dict__["_parameters"]
+            if name in _parameters:
+                return _parameters[name]
+        if "_buffers" in self.__dict__:
+            _buffers = self.__dict__["_buffers"]
+            if name in _buffers:
+                return _buffers[name]
+        if "_modules" in self.__dict__:
+            modules = self.__dict__["_modules"]
+            if name in modules:
+                return modules[name]
+>       raise AttributeError(
+            f"'{type(self).__name__}' object has no attribute '{name}'"
+        )
+E       AttributeError: 'DeepseekV41TileLangAttention' object has no attribute 'indexer'
+
+/usr/local/lib/python3.12/dist-packages/torch/nn/modules/module.py:1967: AttributeError
+=============================== warnings summary ===============================
+../../../../usr/local/lib/python3.12/dist-packages/torch/jit/_script.py:365: 14 warnings
+  /usr/local/lib/python3.12/dist-packages/torch/jit/_script.py:365: DeprecationWarning: `torch.jit.script_method` is deprecated. Please switch to `torch.compile` or `torch.export`.
+    warnings.warn(
+
+-- Docs: https://docs.pytest.org/en/stable/how-to/capture-warnings.html
+=========================== short test summary info ============================
+FAILED tests/v1/worker/test_workspace.py::test_v41_tilelang_attention_reserves_scratch_in_its_model_lane
+1 failed, 14 warnings in 6.83s

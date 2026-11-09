@@ -1,0 +1,66 @@
+{
+ "pr": 1012,
+ "round": 1,
+ "verdict": "corrected-meets-mark",
+ "change": "tests only (16 lines): the two hand-built test fixtures gain the compressor and indexer attributes (wk, wq_b, weights_proj) that 0767's _decode_overlap_workspace_specs legitimately reads; assertions unchanged; no serving-code change",
+ "patch": "0767-perf-dsv41-overlap-decode-kv-index-writes-with-query.patch",
+ "patch_sha256": "b93f0b8231ce4c0c34058094747f0338958e0a41a3c657e2dd2128b7460870ec",
+ "host": "sp8 (spark-ds41f:1107 image with the candidate-47 tree, then the fix, bind-mounted; no build)",
+ "tests": {
+  "control_1107_two_tests": "2 passed",
+  "candidate47_two_tests": "2 failed (AttributeError indexer / compressor)",
+  "fix_two_tests": "2 passed",
+  "candidate47_seven_files": "2 failed, 155 passed",
+  "fix_seven_files_boot1": "157 passed",
+  "fix_seven_files_boot2": "157 passed"
+ },
+ "bench": {
+  "bit_exact": "eager and graph replay, all families, M=1..48, tp4 and tp3, both boots",
+  "step_8indexed_layers_delta_us": {
+   "tp4_warm": [
+    -42.9,
+    -46.5,
+    -46.2,
+    -75.9,
+    -53.1,
+    -45.7,
+    -52.3,
+    -44.9
+   ],
+   "tp4_cold_l2pf": [
+    -45.6,
+    -39.7,
+    -46.9,
+    -53.1,
+    -42.0,
+    -58.6,
+    -37.6,
+    -48.5
+   ],
+   "tp3_warm": [
+    -48.4,
+    -40.7,
+    -39.3,
+    -32.2,
+    -38.7,
+    -33.4,
+    -33.5,
+    -65.8
+   ],
+   "tp3_cold_l2pf": [
+    -50.6,
+    -40.5,
+    -36.4,
+    -39.8,
+    -42.0,
+    -45.1,
+    -59.9,
+    -61.5
+   ],
+   "order": "M1 boot1, M1 boot2, M6 boot1, M6 boot2, M24 boot1, M24 boot2, M48 boot1, M48 boot2"
+  },
+  "per_family_exception": "tp3 r2_kv_index_source_warm M48 boot1 +0.8 us (boot2 -10.0 us)"
+ },
+ "caveat": "#1012's bench (bench_decode_2stream_kv_indexer.py) rebuilds the 1-stream and 2-stream schedules from kernel modules and never imports attention.py or compressor.py, so it cannot measure the patched forward path; its serving effect is judged from candidate-47's engine decode grid",
+ "reason": "the release-test failures were stale fixtures, not a serving regression; with them fixed, every test passes and the bench gain and bit-exactness hold on both boots"
+}

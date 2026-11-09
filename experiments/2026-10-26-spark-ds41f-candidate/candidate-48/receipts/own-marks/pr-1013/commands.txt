@@ -1,0 +1,148 @@
+# Commands run on sp8 for this PR's own-mark check, one block per run, in issue order.
+# start_utc is when the command was issued; it includes any wait on /tmp/spark-lab-gpu.lock.
+# end_utc, exit_code and the output file come from the same run.sh invocation.
+
+### pytest-candidate48-boot1
+host: spark-0016 (sp8)
+image: sha256:d6ffd842978849651e756ebd39e9bf2da7ddb03e746113013533029878485a24 (spark-ds41f:candidate-48)
+start_utc: 2026-11-09T04:12:39Z
+loadavg_before: 2.53 2.52 2.63
+docker_ps_before: none
+command: flock /tmp/spark-lab-gpu.lock docker run --rm --name c48om-1013-pyt-b1 --gpus=all -e HF_HUB_OFFLINE=1 -v /home/chris/.cache/huggingface:/root/.cache/huggingface:ro -v /home/chris/spark-lab/agents/candidate-48-own-marks/src/pr-1011/scripts/release_tests:/opt/release_tests:ro --entrypoint bash sha256:d6ffd842978849651e756ebd39e9bf2da7ddb03e746113013533029878485a24 -c set\ -e\;\ cd\ /opt/spark-ds41f/candidate/vllm\;\ PYTHONPATH=/opt/release_tests:\$PYTHONPATH\ pytest\ -o\ addopts=\'\'\ -p\ tblib_stub\ -q\ tests/v1/structured_output/test_structured_output_manager.py\ tests/v1/spec_decode/test_mtp_structured_output.py\ tests/v1/core/test_prefill_lane_livelock.py\ tests/v1/core/test_prefill_qos_lanes.py\ tests/v1/core/test_aligned_prefill_lanes.py\ tests/v1/core/test_prefill_yield.py\ tests/v1/core/test_aligned_prefill_chunks.py\ tests/v1/core/test_prefill_compute_share_scheduler.py
+end_utc: 2026-11-09T04:13:45Z
+loadavg_after: 2.57 2.57 2.64
+exit_code: 1
+output: pytest-candidate48-boot1.txt
+
+### bench-candidate48-boot1
+host: spark-0016 (sp8)
+image: sha256:d6ffd842978849651e756ebd39e9bf2da7ddb03e746113013533029878485a24 (spark-ds41f:candidate-48)
+start_utc: 2026-11-09T04:13:45Z
+loadavg_before: 2.57 2.57 2.64
+docker_ps_before: none
+command: flock /tmp/spark-lab-gpu.lock docker run --rm --name c48om-1013-bench-cand-b1 --gpus=all --security-opt=seccomp=unconfined --cap-add=IPC_LOCK --ulimit=memlock=-1:-1 -e HF_HUB_OFFLINE=1 -v /home/chris/.cache/huggingface/hub:/mnt/ds41-hub:ro -v /home/chris/spark-lab/agents/candidate-48-own-marks/work/pr-1013:/mnt/host-tmp:rw -v /home/chris/spark-lab/agents/candidate-48-own-marks/src/pr-1013/experiments/2026-11-08-completions-grammar-and-prefill-lanes/bench_suite.py:/mnt/host-tmp/bench_suite.py:ro --entrypoint bash sha256:d6ffd842978849651e756ebd39e9bf2da7ddb03e746113013533029878485a24 -c set\ -e\;\ cd\ /opt/spark-ds41f/candidate/vllm\;\ python3\ /mnt/host-tmp/bench_suite.py\ boot1
+end_utc: 2026-11-09T04:14:36Z
+loadavg_after: 2.54 2.57 2.64
+exit_code: 0
+output: bench-candidate48-boot1.txt
+
+### bench-1107-boot1
+host: spark-0016 (sp8)
+image: sha256:3f32a962ce04b7c8d85337cd427a8946b8b6bcaadd97cc8d8a8cd14e8d68a6ce (spark-ds41f:1107)
+start_utc: 2026-11-09T04:14:36Z
+loadavg_before: 2.58 2.58 2.64
+docker_ps_before: none
+command: flock /tmp/spark-lab-gpu.lock docker run --rm --name c48om-1013-bench-1107-b1 --gpus=all --security-opt=seccomp=unconfined --cap-add=IPC_LOCK --ulimit=memlock=-1:-1 -e HF_HUB_OFFLINE=1 -v /home/chris/.cache/huggingface/hub:/mnt/ds41-hub:ro -v /home/chris/spark-lab/agents/candidate-48-own-marks/work/pr-1013:/mnt/host-tmp:rw -v /home/chris/spark-lab/agents/candidate-48-own-marks/src/pr-1013/experiments/2026-11-08-completions-grammar-and-prefill-lanes/bench_suite.py:/mnt/host-tmp/bench_suite.py:ro --entrypoint bash sha256:3f32a962ce04b7c8d85337cd427a8946b8b6bcaadd97cc8d8a8cd14e8d68a6ce -c set\ -e\;\ cd\ /opt/spark-ds41f/candidate/vllm\;\ python3\ /mnt/host-tmp/bench_suite.py\ 1107-boot1
+end_utc: 2026-11-09T04:16:36Z
+loadavg_after: 2.78 2.75 2.70
+exit_code: 1
+output: bench-1107-boot1.txt
+
+### bench-1107-shim-boot1
+host: spark-0016 (sp8)
+image: sha256:3f32a962ce04b7c8d85337cd427a8946b8b6bcaadd97cc8d8a8cd14e8d68a6ce (spark-ds41f:1107)
+start_utc: 2026-11-09T04:16:36Z
+loadavg_before: 2.96 2.79 2.72
+docker_ps_before: none
+command: flock /tmp/spark-lab-gpu.lock docker run --rm --name c48om-1013-bench-1107s-b1 --gpus=all --security-opt=seccomp=unconfined --cap-add=IPC_LOCK --ulimit=memlock=-1:-1 -e HF_HUB_OFFLINE=1 -v /home/chris/.cache/huggingface/hub:/mnt/ds41-hub:ro -v /home/chris/spark-lab/agents/candidate-48-own-marks/work/pr-1013:/mnt/host-tmp:rw -v /home/chris/spark-lab/agents/candidate-48-own-marks/src/pr-1013/experiments/2026-11-08-completions-grammar-and-prefill-lanes/bench_suite.py:/mnt/host-tmp/bench_suite.py:ro -v /home/chris/spark-lab/agents/candidate-48-own-marks/shim/run_bench_suite_on_1107.py:/mnt/shim/run_bench_suite_on_1107.py:ro --entrypoint bash sha256:3f32a962ce04b7c8d85337cd427a8946b8b6bcaadd97cc8d8a8cd14e8d68a6ce -c set\ -e\;\ cd\ /opt/spark-ds41f/candidate/vllm\;\ python3\ /mnt/shim/run_bench_suite_on_1107.py\ /mnt/host-tmp/bench_suite.py\ 1107-shim-boot1
+end_utc: 2026-11-09T04:19:02Z
+loadavg_after: 3.38 3.12 2.86
+exit_code: 1
+output: bench-1107-shim-boot1.txt
+
+### pytest-candidate48-boot2
+host: spark-0016 (sp8)
+image: sha256:d6ffd842978849651e756ebd39e9bf2da7ddb03e746113013533029878485a24 (spark-ds41f:candidate-48)
+start_utc: 2026-11-09T04:19:02Z
+loadavg_before: 3.38 3.12 2.86
+docker_ps_before: none
+command: flock /tmp/spark-lab-gpu.lock docker run --rm --name c48om-1013-pyt-b2 --gpus=all -e HF_HUB_OFFLINE=1 -v /home/chris/.cache/huggingface:/root/.cache/huggingface:ro -v /home/chris/spark-lab/agents/candidate-48-own-marks/src/pr-1011/scripts/release_tests:/opt/release_tests:ro --entrypoint bash sha256:d6ffd842978849651e756ebd39e9bf2da7ddb03e746113013533029878485a24 -c set\ -e\;\ cd\ /opt/spark-ds41f/candidate/vllm\;\ PYTHONPATH=/opt/release_tests:\$PYTHONPATH\ pytest\ -o\ addopts=\'\'\ -p\ tblib_stub\ -q\ tests/v1/structured_output/test_structured_output_manager.py\ tests/v1/spec_decode/test_mtp_structured_output.py\ tests/v1/core/test_prefill_lane_livelock.py\ tests/v1/core/test_prefill_qos_lanes.py\ tests/v1/core/test_aligned_prefill_lanes.py\ tests/v1/core/test_prefill_yield.py\ tests/v1/core/test_aligned_prefill_chunks.py\ tests/v1/core/test_prefill_compute_share_scheduler.py
+end_utc: 2026-11-09T04:19:57Z
+loadavg_after: 2.73 2.97 2.82
+exit_code: 1
+output: pytest-candidate48-boot2.txt
+
+### bench-candidate48-boot2
+host: spark-0016 (sp8)
+image: sha256:d6ffd842978849651e756ebd39e9bf2da7ddb03e746113013533029878485a24 (spark-ds41f:candidate-48)
+start_utc: 2026-11-09T04:19:57Z
+loadavg_before: 2.73 2.97 2.82
+docker_ps_before: none
+command: flock /tmp/spark-lab-gpu.lock docker run --rm --name c48om-1013-bench-cand-b2 --gpus=all --security-opt=seccomp=unconfined --cap-add=IPC_LOCK --ulimit=memlock=-1:-1 -e HF_HUB_OFFLINE=1 -v /home/chris/.cache/huggingface/hub:/mnt/ds41-hub:ro -v /home/chris/spark-lab/agents/candidate-48-own-marks/work/pr-1013:/mnt/host-tmp:rw -v /home/chris/spark-lab/agents/candidate-48-own-marks/src/pr-1013/experiments/2026-11-08-completions-grammar-and-prefill-lanes/bench_suite.py:/mnt/host-tmp/bench_suite.py:ro --entrypoint bash sha256:d6ffd842978849651e756ebd39e9bf2da7ddb03e746113013533029878485a24 -c set\ -e\;\ cd\ /opt/spark-ds41f/candidate/vllm\;\ python3\ /mnt/host-tmp/bench_suite.py\ boot2
+end_utc: 2026-11-09T04:24:53Z
+loadavg_after: 4.66 4.44 3.53
+exit_code: 0
+output: bench-candidate48-boot2.txt
+
+### pytest-offline-skip-candidate48-boot1
+host: spark-0016 (sp8)
+image: sha256:d6ffd842978849651e756ebd39e9bf2da7ddb03e746113013533029878485a24 (spark-ds41f:candidate-48)
+start_utc: 2026-11-09T04:21:57Z
+loadavg_before: 5.78 4.00 3.21
+docker_ps_before: d6ffd8429788 c48om-980-oc-boot1-tp3;
+command: flock /tmp/spark-lab-gpu.lock docker run --rm --name c48om-1013-pyt-os-b1 --gpus=all -e HF_HUB_OFFLINE=1 -v /home/chris/.cache/huggingface:/root/.cache/huggingface:ro -v /home/chris/spark-lab/agents/candidate-48-own-marks/src/pr-1011/scripts/release_tests:/opt/release_tests:ro --entrypoint bash sha256:d6ffd842978849651e756ebd39e9bf2da7ddb03e746113013533029878485a24 -c set\ -e\;\ cd\ /opt/spark-ds41f/candidate/vllm\;\ PYTHONPATH=/opt/release_tests:\$PYTHONPATH\ pytest\ -o\ addopts=\'\'\ -p\ tblib_stub\ -p\ offline_skip\ -q\ -rs\ tests/v1/structured_output/test_structured_output_manager.py\ tests/v1/spec_decode/test_mtp_structured_output.py\ tests/v1/core/test_prefill_lane_livelock.py\ tests/v1/core/test_prefill_qos_lanes.py\ tests/v1/core/test_aligned_prefill_lanes.py\ tests/v1/core/test_prefill_yield.py\ tests/v1/core/test_aligned_prefill_chunks.py\ tests/v1/core/test_prefill_compute_share_scheduler.py
+end_utc: 2026-11-09T04:25:47Z
+loadavg_after: 3.45 4.13 3.48
+exit_code: 0
+output: pytest-offline-skip-candidate48-boot1.txt
+
+### bench-1107-boot2
+host: spark-0016 (sp8)
+image: sha256:3f32a962ce04b7c8d85337cd427a8946b8b6bcaadd97cc8d8a8cd14e8d68a6ce (spark-ds41f:1107)
+start_utc: 2026-11-09T04:24:53Z
+loadavg_before: 4.66 4.44 3.53
+docker_ps_before: none
+command: flock /tmp/spark-lab-gpu.lock docker run --rm --name c48om-1013-bench-1107-b2 --gpus=all --security-opt=seccomp=unconfined --cap-add=IPC_LOCK --ulimit=memlock=-1:-1 -e HF_HUB_OFFLINE=1 -v /home/chris/.cache/huggingface/hub:/mnt/ds41-hub:ro -v /home/chris/spark-lab/agents/candidate-48-own-marks/work/pr-1013:/mnt/host-tmp:rw -v /home/chris/spark-lab/agents/candidate-48-own-marks/src/pr-1013/experiments/2026-11-08-completions-grammar-and-prefill-lanes/bench_suite.py:/mnt/host-tmp/bench_suite.py:ro --entrypoint bash sha256:3f32a962ce04b7c8d85337cd427a8946b8b6bcaadd97cc8d8a8cd14e8d68a6ce -c set\ -e\;\ cd\ /opt/spark-ds41f/candidate/vllm\;\ python3\ /mnt/host-tmp/bench_suite.py\ 1107-boot2
+end_utc: 2026-11-09T04:32:22Z
+loadavg_after: 4.07 5.44 4.47
+exit_code: 1
+output: bench-1107-boot2.txt
+
+### bench-1107-shimv2-boot1
+host: spark-0016 (sp8)
+image: sha256:3f32a962ce04b7c8d85337cd427a8946b8b6bcaadd97cc8d8a8cd14e8d68a6ce (spark-ds41f:1107)
+start_utc: 2026-11-09T04:25:47Z
+loadavg_before: 3.45 4.13 3.48
+docker_ps_before: none
+command: flock /tmp/spark-lab-gpu.lock docker run --rm --name c48om-1013-bench-1107s2-b1 --gpus=all --security-opt=seccomp=unconfined --cap-add=IPC_LOCK --ulimit=memlock=-1:-1 -e HF_HUB_OFFLINE=1 -v /home/chris/.cache/huggingface/hub:/mnt/ds41-hub:ro -v /home/chris/spark-lab/agents/candidate-48-own-marks/work/pr-1013:/mnt/host-tmp:rw -v /home/chris/spark-lab/agents/candidate-48-own-marks/src/pr-1013/experiments/2026-11-08-completions-grammar-and-prefill-lanes/bench_suite.py:/mnt/host-tmp/bench_suite.py:ro -v /home/chris/spark-lab/agents/candidate-48-own-marks/shim/run_bench_suite_on_1107_v2.py:/mnt/shim/run_bench_suite_on_1107_v2.py:ro --entrypoint bash sha256:3f32a962ce04b7c8d85337cd427a8946b8b6bcaadd97cc8d8a8cd14e8d68a6ce -c set\ -e\;\ cd\ /opt/spark-ds41f/candidate/vllm\;\ python3\ /mnt/shim/run_bench_suite_on_1107_v2.py\ /mnt/host-tmp/bench_suite.py\ 1107-shimv2-boot1
+end_utc: 2026-11-09T04:33:27Z
+loadavg_after: 3.50 4.98 4.37
+exit_code: 0
+output: bench-1107-shimv2-boot1.txt
+
+### bench-1107-shim-boot2
+host: spark-0016 (sp8)
+image: sha256:3f32a962ce04b7c8d85337cd427a8946b8b6bcaadd97cc8d8a8cd14e8d68a6ce (spark-ds41f:1107)
+start_utc: 2026-11-09T04:32:22Z
+loadavg_before: 4.07 5.44 4.47
+docker_ps_before: none
+command: flock /tmp/spark-lab-gpu.lock docker run --rm --name c48om-1013-bench-1107s-b2 --gpus=all --security-opt=seccomp=unconfined --cap-add=IPC_LOCK --ulimit=memlock=-1:-1 -e HF_HUB_OFFLINE=1 -v /home/chris/.cache/huggingface/hub:/mnt/ds41-hub:ro -v /home/chris/spark-lab/agents/candidate-48-own-marks/work/pr-1013:/mnt/host-tmp:rw -v /home/chris/spark-lab/agents/candidate-48-own-marks/src/pr-1013/experiments/2026-11-08-completions-grammar-and-prefill-lanes/bench_suite.py:/mnt/host-tmp/bench_suite.py:ro -v /home/chris/spark-lab/agents/candidate-48-own-marks/shim/run_bench_suite_on_1107.py:/mnt/shim/run_bench_suite_on_1107.py:ro --entrypoint bash sha256:3f32a962ce04b7c8d85337cd427a8946b8b6bcaadd97cc8d8a8cd14e8d68a6ce -c set\ -e\;\ cd\ /opt/spark-ds41f/candidate/vllm\;\ python3\ /mnt/shim/run_bench_suite_on_1107.py\ /mnt/host-tmp/bench_suite.py\ 1107-shim-boot2
+end_utc: 2026-11-09T04:42:39Z
+loadavg_after: 3.83 5.64 5.20
+exit_code: 1
+output: bench-1107-shim-boot2.txt
+
+### pytest-offline-skip-candidate48-boot2
+host: spark-0016 (sp8)
+image: sha256:d6ffd842978849651e756ebd39e9bf2da7ddb03e746113013533029878485a24 (spark-ds41f:candidate-48)
+start_utc: 2026-11-09T04:33:27Z
+loadavg_before: 3.50 4.98 4.37
+docker_ps_before: none
+command: flock /tmp/spark-lab-gpu.lock docker run --rm --name c48om-1013-pyt-os-b2 --gpus=all -e HF_HUB_OFFLINE=1 -v /home/chris/.cache/huggingface:/root/.cache/huggingface:ro -v /home/chris/spark-lab/agents/candidate-48-own-marks/src/pr-1011/scripts/release_tests:/opt/release_tests:ro --entrypoint bash sha256:d6ffd842978849651e756ebd39e9bf2da7ddb03e746113013533029878485a24 -c set\ -e\;\ cd\ /opt/spark-ds41f/candidate/vllm\;\ PYTHONPATH=/opt/release_tests:\$PYTHONPATH\ pytest\ -o\ addopts=\'\'\ -p\ tblib_stub\ -p\ offline_skip\ -q\ -rs\ tests/v1/structured_output/test_structured_output_manager.py\ tests/v1/spec_decode/test_mtp_structured_output.py\ tests/v1/core/test_prefill_lane_livelock.py\ tests/v1/core/test_prefill_qos_lanes.py\ tests/v1/core/test_aligned_prefill_lanes.py\ tests/v1/core/test_prefill_yield.py\ tests/v1/core/test_aligned_prefill_chunks.py\ tests/v1/core/test_prefill_compute_share_scheduler.py
+end_utc: 2026-11-09T04:43:30Z
+loadavg_after: 3.73 5.31 5.11
+exit_code: 0
+output: pytest-offline-skip-candidate48-boot2.txt
+
+### bench-1107-shimv2-boot2
+host: spark-0016 (sp8)
+image: sha256:3f32a962ce04b7c8d85337cd427a8946b8b6bcaadd97cc8d8a8cd14e8d68a6ce (spark-ds41f:1107)
+start_utc: 2026-11-09T04:43:30Z
+loadavg_before: 3.73 5.31 5.11
+docker_ps_before: none
+command: flock /tmp/spark-lab-gpu.lock docker run --rm --name c48om-1013-bench-1107s2-b2 --gpus=all --security-opt=seccomp=unconfined --cap-add=IPC_LOCK --ulimit=memlock=-1:-1 -e HF_HUB_OFFLINE=1 -v /home/chris/.cache/huggingface/hub:/mnt/ds41-hub:ro -v /home/chris/spark-lab/agents/candidate-48-own-marks/work/pr-1013:/mnt/host-tmp:rw -v /home/chris/spark-lab/agents/candidate-48-own-marks/src/pr-1013/experiments/2026-11-08-completions-grammar-and-prefill-lanes/bench_suite.py:/mnt/host-tmp/bench_suite.py:ro -v /home/chris/spark-lab/agents/candidate-48-own-marks/shim/run_bench_suite_on_1107_v2.py:/mnt/shim/run_bench_suite_on_1107_v2.py:ro --entrypoint bash sha256:3f32a962ce04b7c8d85337cd427a8946b8b6bcaadd97cc8d8a8cd14e8d68a6ce -c set\ -e\;\ cd\ /opt/spark-ds41f/candidate/vllm\;\ python3\ /mnt/shim/run_bench_suite_on_1107_v2.py\ /mnt/host-tmp/bench_suite.py\ 1107-shimv2-boot2
+end_utc: 2026-11-09T04:49:55Z
+loadavg_after: 3.81 5.08 5.17
+exit_code: 0
+output: bench-1107-shimv2-boot2.txt
+

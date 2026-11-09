@@ -1,0 +1,37 @@
+{
+  "pr": 1011,
+  "pr_head": "8904a1fec170469846516c8e65fd2536a2d411b7",
+  "mark": "Its tests pass on the image",
+  "host": "sp8 (spark-0016, NVIDIA GB10)",
+  "images": {
+    "candidate-48": "sha256:d6ffd842978849651e756ebd39e9bf2da7ddb03e746113013533029878485a24",
+    "1107": "sha256:3f32a962ce04b7c8d85337cd427a8946b8b6bcaadd97cc8d8a8cd14e8d68a6ce"
+  },
+  "evidence": "README's two-boot command: pytest tests/v1/worker/test_gpu_worker.py tests/v1/worker/test_workspace.py -k 'llm_repr or batch_invariant or kpool', then screen_vllm_mainline_patch_audit.py --boot N --output ...; the patched-file bind mounts are dropped because the candidate image carries 0768..0770",
+  "measured": {
+    "candidate-48": {
+      "pytest_boot1": "3 passed, 118 deselected in 5.53s",
+      "pytest_boot2": "3 passed, 118 deselected in 5.66s",
+      "screen_boot1": {"item2_rpc_calls_during_100_reprs": 0, "item2_repr_latency_us": 0.146, "item2_total_rpc_after_2_inspections": 1, "item3_effective_max_seq_len_batch_invariant_on": 4096, "item3_window_stays_active": true, "item5_locked_workspace_bytes": 50331648, "item5_reserves_decode_logits": true, "item1_parallel_draft_ms_reqs4_k1_vs_k5": [1.0052, 1.0583], "item1_parallel_draft_ms_reqs8_k1_vs_k5": [1.0146, 1.0207], "item4_pinned_plus_cpu_nvml_delta_bytes": 0, "item4_psutil_drop_bytes": 404254720},
+      "screen_boot2": {"item2_rpc_calls_during_100_reprs": 0, "item2_repr_latency_us": 0.143, "item2_total_rpc_after_2_inspections": 1, "item3_effective_max_seq_len_batch_invariant_on": 4096, "item3_window_stays_active": true, "item5_locked_workspace_bytes": 50331648, "item5_reserves_decode_logits": true, "item1_parallel_draft_ms_reqs4_k1_vs_k5": [1.0004, 1.0504], "item1_parallel_draft_ms_reqs8_k1_vs_k5": [1.0095, 1.0331], "item4_pinned_plus_cpu_nvml_delta_bytes": 0, "item4_psutil_drop_bytes": 403943424}
+    },
+    "1107": {
+      "pytest_boot1": "0 selected, 118 deselected (the three tests do not exist on 1107)",
+      "pytest_boot2": "0 selected, 118 deselected",
+      "screen_boot1": "exit 1: AttributeError 'LLM' object has no attribute '_cached_repr' in check_item2 (the screen assumes the patched LLM)",
+      "screen_boot2": "exit 1: same AttributeError"
+    },
+    "interval": "pass/fail tests; screen latencies vary by about 0.05 ms between boots"
+  },
+  "parts": [
+    {"part": "its tests pass on the image", "verdict": "pass", "detail": "3/3 selected tests pass on both candidate-48 boots, and the audit screen completes on both with 0 RPCs from repr(llm), FA SWA max_seq_len held at max_model_len under VLLM_BATCH_INVARIANT, and the 48 MiB locked workspace for kpool decode logits"}
+  ],
+  "verdict": "pass",
+  "verdict_scope": "fully evaluable on sp8",
+  "reason": "The PR's own test selection passes 3/3 on both boots of the integrated image and its audit screen reproduces the README's candidate values (0 RPCs, 4096 effective max_seq_len, 50,331,648-byte locked workspace). On 1107 the tests do not exist and the screen crashes on the unpatched LLM, so 1107 cannot serve as a like-for-like baseline for this screen.",
+  "notes": [
+    "commands.txt start_utc is when the command was issued and includes any wait on /tmp/spark-lab-gpu.lock",
+    "README's item4 psutil drop was 472-480 MiB on its host; sp8 shows 404,254,720 / 403,943,424 bytes (385.5 / 385.2 MiB). This is the audit's GB10 memory observation, not part of the mark",
+    "Item3 'effective_max_seq_len_batch_invariant_on' is computed in the screen from a source-text check of flash_attn.py plus an expression, not by running the metadata builder; the pytest test is the functional check"
+  ]
+}
