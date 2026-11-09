@@ -1,0 +1,1856 @@
+{
+  "pr": 996,
+  "round": 2,
+  "pr_head": "86d4a427f46c6fed959d7d9074723fb9d4dc9db4",
+  "verdict": "corrected-misses-mark",
+  "host": "sp8 (spark-0016, NVIDIA GB10)",
+  "images": {
+    "1107": "sha256:3f32a962ce04b7c8d85337cd427a8946b8b6bcaadd97cc8d8a8cd14e8d68a6ce"
+  },
+  "stack": "spark-ds41f:1107 with the 15 files of 0762..0766 and round 2's 0767 bind-mounted read-only (all .py; no build), as in round 1. 13 of the 15 files are byte-identical to round 1's; router.py and the router test file differ.",
+  "patch": {
+    "file": "0767-perf-dsv41-cache-SP-local-routing-masks-and-skip-SP-.patch",
+    "sha256": "389b737f694f0e4ef13308d68a8f555c5e935f89dcbce1f6c294d3a40d02b775",
+    "commit": "251f7af47ae6185a6af0866aab9ad1034fedf4f6 (sp8 branch rework-996-r2)",
+    "tree": "2ca1dd953b3e4c3ff510edfdee1b24176aeac561 (the measured tree; after the runs only the commit message was amended)",
+    "author": "Christopher Owen <christopherowen@users.noreply.github.com>, Sun, 8 Nov 2026 18:50:51 +0000 (kept)",
+    "applies_on": "candidate-49 0762..0766 (git am on a087373, tree equal to the tested one) and bare 1107 (git apply --check)",
+    "files": [
+      "vllm/models/deepseek_v4_1/tilelang/router.py",
+      "tests/kernels/moe/test_deepseek_v41_tilelang_router.py"
+    ],
+    "diff_check": "clean",
+    "vs_round_1": "router.py: _local_mask returns mask[start:start + local_rows] before any cache work when the rank has no pad rows (start + local_rows <= num_tokens <= mask.shape[0]); the tail-rank cache path is round 1's, with the layout values read once. Tests: one assertion of round 1's inference-mode test changed (every rank keeps masks -> only the tail rank does), one new test (8 cases)."
+  },
+  "change": "On a rank whose local slice has no pad rows (every rank when TP divides T, all but the last otherwise), _local_mask now returns the view mask[start:start + local_rows] directly: the same view sp_rows.local_slice(mask[:num_tokens]) returns (same base, data pointer, shape and strides), made with one tensor slice instead of 1107's two, with no key built and nothing read from or kept on the ForwardContext. A mask shorter than T falls through to local_slice, which refuses it as in 1107. The tail rank (pad rows present) keeps round 1's per-forward cache of its new padded tensor, and the pad=True fix in _partials_mask is unchanged.",
+  "why_not_stale": [
+    "Ranks without pad rows keep nothing: each call makes its view from the mask it is handed, as 1107 does, so there is no entry that could be stale. A view also shares the mask's storage, so it can never disagree with the mask.",
+    "Tail rank, unchanged from round 1: entries live on the forward's own ForwardContext, and the runner creates a new one for every forward, so no entry outlives its forward although the runner's persistent buffers keep their storage across steps.",
+    "Tail rank: the entry holds the mask tensor and a hit requires entry[0] is mask, so the id in the key cannot be reused by another tensor while the entry lives. No version counter is read (inference tensors have none).",
+    "Tail rank: a forward's is_padding and input_ids are filled before it runs and not written during it, and routed/image are new tensors each forward that nothing writes after their kernel; 1107 already relies on this for the routed and image masks it keeps on the context by identity.",
+    "Tail rank: num_tokens, world_size, rank, rows and pad are in the key, so another layout in the same forward gets its own entry.",
+    "Tested: test_gate_router_route_local_masks_last_one_forward (persistent buffers refilled in place across three forwards, each routed with its own masks) passes on both boots; exact_996 shows 0 entries per step on ranks without pad rows and 2 on the tail rank."
+  ],
+  "premise_check": {
+    "what": "Round 1 attributed the non-tail slowdown to the cache lookup on ranks whose slice is already a cheap view. Measured host cost on sp8 (cpu_996.py: one later routing layer's mask calls, 2000 calls x 7 repeats, three _local_mask bodies interleaved in one process, two boots; slice_cost.py):",
+    "one_view_vs_lookup_ns": "a tensor slice costs 665-735 ns, two slices (1107) 1304-1523 ns, the 6-tuple dict hit round 1 uses 102 ns",
+    "per_layer_host_us_non_tail": {
+      "no_grad": {
+        "1107": "6.4-6.8",
+        "round 1": "1.9-2.0",
+        "round 2": "3.6-3.9"
+      },
+      "inference_mode": {
+        "1107": "4.9-5.3",
+        "round 1": "1.9-2.0",
+        "round 2": "2.8-3.1"
+      }
+    },
+    "per_layer_host_us_tail": {
+      "no_grad": {
+        "1107": "23.9-24.5",
+        "round 1": "2.0",
+        "round 2": "2.2-2.3"
+      },
+      "inference_mode": {
+        "1107": "21.1-21.3",
+        "round 1": "2.0",
+        "round 2": "2.2-2.3"
+      }
+    },
+    "conclusion": "The premise does not hold: round 1's lookup was already cheaper than 1107's view, by about 3-4.5 us per layer of host work, and the GPU work on ranks without pad rows is identical in 1107, round 1 and round 2 (no kernel is launched for a view). This host work runs after the gate GEMM (or partials GEMM) launch, so it overlaps GPU work and cannot slow a GPU-bound call. Skipping the cache for views costs about 1-1.8 us per layer of host work against round 1, still 1.9-2.9 us less than 1107."
+  },
+  "mark": {
+    "no_cell_slower_than_1107_beyond_interval": {
+      "verdict": "fail",
+      "per_call": "tail {'faster': 5, 'within': 0, 'slower': 0}, non-tail {'faster': 6, 'within': 15, 'slower': 2}; slower: ['TP3 T4096 r0 (+0.031 us)', 'TP4 T16384 r0 (+3.041 us)']",
+      "pass_per_layer": "tail {'faster': 5, 'within': 0, 'slower': 0}, non-tail {'faster': 6, 'within': 14, 'slower': 3}; slower: ['TP3 T4096 r0 (+0.202 us)', 'TP4 T6144 r0 (+0.004 us)', 'TP4 T16384 r0 (+2.475 us)']",
+      "round_1_for_comparison": "per-call non-tail {'faster': 6, 'within': 11, 'slower': 6}, pass non-tail {'faster': 3, 'within': 14, 'slower': 6}"
+    },
+    "tail_gain_kept": {
+      "verdict": "pass",
+      "detail": "5 of 5 TP3 tail cells faster beyond the recorded 1107 interval on per-call and on 20-layer-pass timing (round 1: 4 of 5, T=8192 within): 1.304x, 1.137x, 1.080x, 1.030x, 1.030x per call at T = 1024, 2048, 4096, 8192, 16384. Against the round 1 control in the same session: 1 faster, 4 within, 0 slower."
+    },
+    "bit_exact_no_stale_masks": {
+      "verdict": "pass",
+      "detail": "under inference mode, every rank, TP 3 and 4, T = 1024..16384, 2 forwards x 20 layers: 1680 of 1680 layers torch.equal to 1107's uncached _local_mask on each boot; gathered rows equal full-row routing in 12 of 12; padded ids -1; no_grad bench real-row hashes equal the recorded 1107 boots in 28 of 28 cells; the stale-mask test passes on both boots"
+    },
+    "round_1_tests_pass": {
+      "verdict": "pass, with one round 1 assertion changed",
+      "detail": "279 passed on each boot (round 1's 271, its 6 new tests among them, plus 8 new cases). Round 1's test file unchanged over round 2's router: 85 passed, 4 failed, all 4 the inference-mode test at 'assert context._ds41_local_masks' on rank 0 (AttributeError: no _ds41_local_masks), the assertion that every rank keeps masks, which a change that keeps nothing for views must change. Its routing assertions pass unchanged; it now asserts that only the tail rank keeps masks."
+    },
+    "inference_mode": {
+      "verdict": "pass",
+      "detail": "own-marks inference-mode cases 5 of 5 ok on both boots, real-row hashes equal to the recorded 1107 inference-mode boots in 5 of 5; the inference-mode tests pass; exact runs entirely under torch.inference_mode"
+    }
+  },
+  "route_local_bench_no_grad_vs_recorded_1107": {
+    "rule": "faster beyond the interval: the slower r2 boot beats the faster 1107 boot; slower beyond it: the faster r2 boot is slower than the slower 1107 boot; else within",
+    "reference": "1107 and candidate-49: the recorded own-mark boots (candidate-49/receipts/own-marks/pr-996/json), r1: round 1's recorded boots (receipts/rework/pr-996-r1/json); none re-measured. r1_control: the round 1 tree re-run in this session, ABBA with round 2 (r2 b1, r1 b1, r1 b2, r2 b2), supplementary",
+    "per_call_us": {
+      "TP3_T768_rank0": {
+        "tail": false,
+        "path": "partials",
+        "local_rows": 256,
+        "real_rows": 256,
+        "1107_recorded": [
+          37.089,
+          39.024
+        ],
+        "r2": [
+          37.488,
+          36.864
+        ],
+        "vs_1107": "within",
+        "margin_us": 0.0,
+        "speedup_vs_1107": 1.024,
+        "r1_recorded": [
+          38.928,
+          36.944
+        ],
+        "r1_recorded_vs_1107": "within",
+        "r1_control": [
+          132.672,
+          133.568
+        ],
+        "r1_control_vs_1107": "slower",
+        "r2_vs_r1_control_in_session": "faster"
+      },
+      "TP3_T768_rank2": {
+        "tail": false,
+        "path": "partials",
+        "local_rows": 256,
+        "real_rows": 256,
+        "1107_recorded": [
+          37.92,
+          38.736
+        ],
+        "r2": [
+          36.976,
+          37.104
+        ],
+        "vs_1107": "faster",
+        "margin_us": 0.816,
+        "speedup_vs_1107": 1.035,
+        "r1_recorded": [
+          39.264,
+          39.488
+        ],
+        "r1_recorded_vs_1107": "slower",
+        "r1_control": [
+          37.312,
+          36.465
+        ],
+        "r1_control_vs_1107": "faster",
+        "r2_vs_r1_control_in_session": "within"
+      },
+      "TP3_T1024_rank0": {
+        "tail": false,
+        "path": "gate",
+        "local_rows": 342,
+        "real_rows": 342,
+        "1107_recorded": [
+          45.072,
+          47.36
+        ],
+        "r2": [
+          44.768,
+          44.704
+        ],
+        "vs_1107": "faster",
+        "margin_us": 0.304,
+        "speedup_vs_1107": 1.033,
+        "r1_recorded": [
+          44.816,
+          44.977
+        ],
+        "r1_recorded_vs_1107": "faster",
+        "r1_control": [
+          44.88,
+          44.737
+        ],
+        "r1_control_vs_1107": "faster",
+        "r2_vs_r1_control_in_session": "within"
+      },
+      "TP3_T1024_rank2": {
+        "tail": true,
+        "path": "gate",
+        "local_rows": 342,
+        "real_rows": 340,
+        "1107_recorded": [
+          57.136,
+          60.224
+        ],
+        "r2": [
+          44.864,
+          45.168
+        ],
+        "vs_1107": "faster",
+        "margin_us": 11.968,
+        "speedup_vs_1107": 1.304,
+        "r1_recorded": [
+          44.864,
+          45.472
+        ],
+        "r1_recorded_vs_1107": "faster",
+        "r1_control": [
+          44.961,
+          44.672
+        ],
+        "r1_control_vs_1107": "faster",
+        "r2_vs_r1_control_in_session": "within"
+      },
+      "TP3_T2048_rank0": {
+        "tail": false,
+        "path": "gate",
+        "local_rows": 683,
+        "real_rows": 683,
+        "1107_recorded": [
+          79.056,
+          80.144
+        ],
+        "r2": [
+          78.544,
+          77.777
+        ],
+        "vs_1107": "faster",
+        "margin_us": 0.512,
+        "speedup_vs_1107": 1.018,
+        "r1_recorded": [
+          78.704,
+          81.568
+        ],
+        "r1_recorded_vs_1107": "within",
+        "r1_control": [
+          78.513,
+          78.704
+        ],
+        "r1_control_vs_1107": "faster",
+        "r2_vs_r1_control_in_session": "within"
+      },
+      "TP3_T2048_rank2": {
+        "tail": true,
+        "path": "gate",
+        "local_rows": 683,
+        "real_rows": 682,
+        "1107_recorded": [
+          87.968,
+          91.328
+        ],
+        "r2": [
+          79.072,
+          78.608
+        ],
+        "vs_1107": "faster",
+        "margin_us": 8.896,
+        "speedup_vs_1107": 1.137,
+        "r1_recorded": [
+          78.848,
+          79.648
+        ],
+        "r1_recorded_vs_1107": "faster",
+        "r1_control": [
+          79.232,
+          78.561
+        ],
+        "r1_control_vs_1107": "faster",
+        "r2_vs_r1_control_in_session": "within"
+      },
+      "TP3_T4096_rank0": {
+        "tail": false,
+        "path": "gate",
+        "local_rows": 1366,
+        "real_rows": 1366,
+        "1107_recorded": [
+          115.297,
+          115.056
+        ],
+        "r2": [
+          115.328,
+          116.912
+        ],
+        "vs_1107": "slower",
+        "margin_us": 0.031,
+        "speedup_vs_1107": 0.992,
+        "r1_recorded": [
+          115.633,
+          116.0
+        ],
+        "r1_recorded_vs_1107": "slower",
+        "r1_control": [
+          117.025,
+          116.225
+        ],
+        "r1_control_vs_1107": "slower",
+        "r2_vs_r1_control_in_session": "within"
+      },
+      "TP3_T4096_rank2": {
+        "tail": true,
+        "path": "gate",
+        "local_rows": 1366,
+        "real_rows": 1364,
+        "1107_recorded": [
+          125.761,
+          123.504
+        ],
+        "r2": [
+          114.688,
+          116.208
+        ],
+        "vs_1107": "faster",
+        "margin_us": 7.296,
+        "speedup_vs_1107": 1.08,
+        "r1_recorded": [
+          117.024,
+          115.153
+        ],
+        "r1_recorded_vs_1107": "faster",
+        "r1_control": [
+          117.777,
+          115.824
+        ],
+        "r1_control_vs_1107": "faster",
+        "r2_vs_r1_control_in_session": "within"
+      },
+      "TP3_T6144_rank0": {
+        "tail": false,
+        "path": "gate",
+        "local_rows": 2048,
+        "real_rows": 2048,
+        "1107_recorded": [
+          158.32,
+          156.992
+        ],
+        "r2": [
+          160.336,
+          156.401
+        ],
+        "vs_1107": "within",
+        "margin_us": 0.0,
+        "speedup_vs_1107": 0.996,
+        "r1_recorded": [
+          155.793,
+          158.464
+        ],
+        "r1_recorded_vs_1107": "within",
+        "r1_control": [
+          163.169,
+          157.728
+        ],
+        "r1_control_vs_1107": "within",
+        "r2_vs_r1_control_in_session": "within"
+      },
+      "TP3_T6144_rank2": {
+        "tail": false,
+        "path": "gate",
+        "local_rows": 2048,
+        "real_rows": 2048,
+        "1107_recorded": [
+          155.936,
+          156.48
+        ],
+        "r2": [
+          156.0,
+          155.457
+        ],
+        "vs_1107": "within",
+        "margin_us": 0.0,
+        "speedup_vs_1107": 1.003,
+        "r1_recorded": [
+          157.04,
+          157.409
+        ],
+        "r1_recorded_vs_1107": "slower",
+        "r1_control": [
+          207.969,
+          155.601
+        ],
+        "r1_control_vs_1107": "within",
+        "r2_vs_r1_control_in_session": "within"
+      },
+      "TP3_T8192_rank0": {
+        "tail": false,
+        "path": "gate",
+        "local_rows": 2731,
+        "real_rows": 2731,
+        "1107_recorded": [
+          227.345,
+          223.824
+        ],
+        "r2": [
+          225.185,
+          227.713
+        ],
+        "vs_1107": "within",
+        "margin_us": 0.0,
+        "speedup_vs_1107": 0.996,
+        "r1_recorded": [
+          231.537,
+          229.329
+        ],
+        "r1_recorded_vs_1107": "slower",
+        "r1_control": [
+          233.873,
+          226.529
+        ],
+        "r1_control_vs_1107": "within",
+        "r2_vs_r1_control_in_session": "within"
+      },
+      "TP3_T8192_rank2": {
+        "tail": true,
+        "path": "gate",
+        "local_rows": 2731,
+        "real_rows": 2730,
+        "1107_recorded": [
+          231.041,
+          230.624
+        ],
+        "r2": [
+          224.433,
+          223.68
+        ],
+        "vs_1107": "faster",
+        "margin_us": 6.191,
+        "speedup_vs_1107": 1.03,
+        "r1_recorded": [
+          231.808,
+          220.865
+        ],
+        "r1_recorded_vs_1107": "within",
+        "r1_control": [
+          232.049,
+          228.481
+        ],
+        "r1_control_vs_1107": "within",
+        "r2_vs_r1_control_in_session": "faster"
+      },
+      "TP3_T16384_rank0": {
+        "tail": false,
+        "path": "gate",
+        "local_rows": 5462,
+        "real_rows": 5462,
+        "1107_recorded": [
+          432.322,
+          427.76
+        ],
+        "r2": [
+          428.001,
+          430.146
+        ],
+        "vs_1107": "within",
+        "margin_us": 0.0,
+        "speedup_vs_1107": 1.002,
+        "r1_recorded": [
+          430.113,
+          428.753
+        ],
+        "r1_recorded_vs_1107": "within",
+        "r1_control": [
+          430.738,
+          429.489
+        ],
+        "r1_control_vs_1107": "within",
+        "r2_vs_r1_control_in_session": "within"
+      },
+      "TP3_T16384_rank2": {
+        "tail": true,
+        "path": "gate",
+        "local_rows": 5462,
+        "real_rows": 5460,
+        "1107_recorded": [
+          442.05,
+          440.016
+        ],
+        "r2": [
+          425.313,
+          430.689
+        ],
+        "vs_1107": "faster",
+        "margin_us": 9.327,
+        "speedup_vs_1107": 1.03,
+        "r1_recorded": [
+          430.881,
+          436.898
+        ],
+        "r1_recorded_vs_1107": "faster",
+        "r1_control": [
+          437.922,
+          427.953
+        ],
+        "r1_control_vs_1107": "faster",
+        "r2_vs_r1_control_in_session": "within"
+      },
+      "TP4_T768_rank0": {
+        "tail": false,
+        "path": "partials",
+        "local_rows": 192,
+        "real_rows": 192,
+        "1107_recorded": [
+          32.337,
+          33.6
+        ],
+        "r2": [
+          34.24,
+          32.016
+        ],
+        "vs_1107": "within",
+        "margin_us": 0.0,
+        "speedup_vs_1107": 0.995,
+        "r1_recorded": [
+          32.256,
+          32.016
+        ],
+        "r1_recorded_vs_1107": "faster",
+        "r1_control": [
+          31.872,
+          31.68
+        ],
+        "r1_control_vs_1107": "faster",
+        "r2_vs_r1_control_in_session": "slower"
+      },
+      "TP4_T768_rank3": {
+        "tail": false,
+        "path": "partials",
+        "local_rows": 192,
+        "real_rows": 192,
+        "1107_recorded": [
+          32.56,
+          33.616
+        ],
+        "r2": [
+          33.552,
+          31.873
+        ],
+        "vs_1107": "within",
+        "margin_us": 0.0,
+        "speedup_vs_1107": 1.011,
+        "r1_recorded": [
+          31.904,
+          31.696
+        ],
+        "r1_recorded_vs_1107": "faster",
+        "r1_control": [
+          31.936,
+          31.696
+        ],
+        "r1_control_vs_1107": "faster",
+        "r2_vs_r1_control_in_session": "within"
+      },
+      "TP4_T1024_rank0": {
+        "tail": false,
+        "path": "partials",
+        "local_rows": 256,
+        "real_rows": 256,
+        "1107_recorded": [
+          38.672,
+          39.104
+        ],
+        "r2": [
+          38.816,
+          37.104
+        ],
+        "vs_1107": "within",
+        "margin_us": 0.0,
+        "speedup_vs_1107": 1.024,
+        "r1_recorded": [
+          37.696,
+          36.992
+        ],
+        "r1_recorded_vs_1107": "faster",
+        "r1_control": [
+          37.28,
+          37.345
+        ],
+        "r1_control_vs_1107": "faster",
+        "r2_vs_r1_control_in_session": "within"
+      },
+      "TP4_T1024_rank3": {
+        "tail": false,
+        "path": "partials",
+        "local_rows": 256,
+        "real_rows": 256,
+        "1107_recorded": [
+          39.552,
+          37.456
+        ],
+        "r2": [
+          37.68,
+          37.216
+        ],
+        "vs_1107": "within",
+        "margin_us": 0.0,
+        "speedup_vs_1107": 1.028,
+        "r1_recorded": [
+          36.72,
+          37.184
+        ],
+        "r1_recorded_vs_1107": "faster",
+        "r1_control": [
+          37.28,
+          37.472
+        ],
+        "r1_control_vs_1107": "within",
+        "r2_vs_r1_control_in_session": "within"
+      },
+      "TP4_T2048_rank0": {
+        "tail": false,
+        "path": "gate",
+        "local_rows": 512,
+        "real_rows": 512,
+        "1107_recorded": [
+          52.768,
+          51.488
+        ],
+        "r2": [
+          50.241,
+          49.728
+        ],
+        "vs_1107": "faster",
+        "margin_us": 1.247,
+        "speedup_vs_1107": 1.043,
+        "r1_recorded": [
+          51.072,
+          51.553
+        ],
+        "r1_recorded_vs_1107": "within",
+        "r1_control": [
+          50.865,
+          50.528
+        ],
+        "r1_control_vs_1107": "faster",
+        "r2_vs_r1_control_in_session": "faster"
+      },
+      "TP4_T2048_rank3": {
+        "tail": false,
+        "path": "gate",
+        "local_rows": 512,
+        "real_rows": 512,
+        "1107_recorded": [
+          52.832,
+          52.496
+        ],
+        "r2": [
+          50.544,
+          49.936
+        ],
+        "vs_1107": "faster",
+        "margin_us": 1.952,
+        "speedup_vs_1107": 1.048,
+        "r1_recorded": [
+          52.448,
+          50.544
+        ],
+        "r1_recorded_vs_1107": "faster",
+        "r1_control": [
+          50.32,
+          51.008
+        ],
+        "r1_control_vs_1107": "faster",
+        "r2_vs_r1_control_in_session": "within"
+      },
+      "TP4_T4096_rank0": {
+        "tail": false,
+        "path": "gate",
+        "local_rows": 1024,
+        "real_rows": 1024,
+        "1107_recorded": [
+          85.041,
+          86.736
+        ],
+        "r2": [
+          85.088,
+          86.369
+        ],
+        "vs_1107": "within",
+        "margin_us": 0.0,
+        "speedup_vs_1107": 1.002,
+        "r1_recorded": [
+          84.736,
+          85.888
+        ],
+        "r1_recorded_vs_1107": "within",
+        "r1_control": [
+          86.336,
+          85.888
+        ],
+        "r1_control_vs_1107": "within",
+        "r2_vs_r1_control_in_session": "within"
+      },
+      "TP4_T4096_rank3": {
+        "tail": false,
+        "path": "gate",
+        "local_rows": 1024,
+        "real_rows": 1024,
+        "1107_recorded": [
+          86.064,
+          87.472
+        ],
+        "r2": [
+          84.976,
+          86.176
+        ],
+        "vs_1107": "within",
+        "margin_us": 0.0,
+        "speedup_vs_1107": 1.014,
+        "r1_recorded": [
+          86.832,
+          86.832
+        ],
+        "r1_recorded_vs_1107": "within",
+        "r1_control": [
+          84.656,
+          87.296
+        ],
+        "r1_control_vs_1107": "within",
+        "r2_vs_r1_control_in_session": "within"
+      },
+      "TP4_T6144_rank0": {
+        "tail": false,
+        "path": "gate",
+        "local_rows": 1536,
+        "real_rows": 1536,
+        "1107_recorded": [
+          119.937,
+          119.824
+        ],
+        "r2": [
+          119.665,
+          119.728
+        ],
+        "vs_1107": "faster",
+        "margin_us": 0.096,
+        "speedup_vs_1107": 1.002,
+        "r1_recorded": [
+          120.192,
+          120.817
+        ],
+        "r1_recorded_vs_1107": "slower",
+        "r1_control": [
+          122.112,
+          121.329
+        ],
+        "r1_control_vs_1107": "slower",
+        "r2_vs_r1_control_in_session": "faster"
+      },
+      "TP4_T6144_rank3": {
+        "tail": false,
+        "path": "gate",
+        "local_rows": 1536,
+        "real_rows": 1536,
+        "1107_recorded": [
+          121.393,
+          120.464
+        ],
+        "r2": [
+          121.088,
+          118.833
+        ],
+        "vs_1107": "within",
+        "margin_us": 0.0,
+        "speedup_vs_1107": 1.008,
+        "r1_recorded": [
+          121.809,
+          122.033
+        ],
+        "r1_recorded_vs_1107": "slower",
+        "r1_control": [
+          121.44,
+          120.688
+        ],
+        "r1_control_vs_1107": "within",
+        "r2_vs_r1_control_in_session": "within"
+      },
+      "TP4_T8192_rank0": {
+        "tail": false,
+        "path": "gate",
+        "local_rows": 2048,
+        "real_rows": 2048,
+        "1107_recorded": [
+          160.736,
+          156.88
+        ],
+        "r2": [
+          159.457,
+          156.768
+        ],
+        "vs_1107": "within",
+        "margin_us": 0.0,
+        "speedup_vs_1107": 1.004,
+        "r1_recorded": [
+          157.936,
+          159.137
+        ],
+        "r1_recorded_vs_1107": "within",
+        "r1_control": [
+          159.937,
+          156.833
+        ],
+        "r1_control_vs_1107": "within",
+        "r2_vs_r1_control_in_session": "within"
+      },
+      "TP4_T8192_rank3": {
+        "tail": false,
+        "path": "gate",
+        "local_rows": 2048,
+        "real_rows": 2048,
+        "1107_recorded": [
+          159.857,
+          157.696
+        ],
+        "r2": [
+          159.681,
+          157.825
+        ],
+        "vs_1107": "within",
+        "margin_us": 0.0,
+        "speedup_vs_1107": 1.0,
+        "r1_recorded": [
+          159.665,
+          159.057
+        ],
+        "r1_recorded_vs_1107": "within",
+        "r1_control": [
+          160.049,
+          157.489
+        ],
+        "r1_control_vs_1107": "within",
+        "r2_vs_r1_control_in_session": "within"
+      },
+      "TP4_T16384_rank0": {
+        "tail": false,
+        "path": "gate",
+        "local_rows": 4096,
+        "real_rows": 4096,
+        "1107_recorded": [
+          323.218,
+          323.392
+        ],
+        "r2": [
+          326.433,
+          326.897
+        ],
+        "vs_1107": "slower",
+        "margin_us": 3.041,
+        "speedup_vs_1107": 0.99,
+        "r1_recorded": [
+          323.393,
+          319.665
+        ],
+        "r1_recorded_vs_1107": "within",
+        "r1_control": [
+          328.785,
+          324.37
+        ],
+        "r1_control_vs_1107": "slower",
+        "r2_vs_r1_control_in_session": "within"
+      },
+      "TP4_T16384_rank3": {
+        "tail": false,
+        "path": "gate",
+        "local_rows": 4096,
+        "real_rows": 4096,
+        "1107_recorded": [
+          320.529,
+          304.352
+        ],
+        "r2": [
+          316.193,
+          321.489
+        ],
+        "vs_1107": "within",
+        "margin_us": 0.0,
+        "speedup_vs_1107": 0.98,
+        "r1_recorded": [
+          318.081,
+          320.465
+        ],
+        "r1_recorded_vs_1107": "within",
+        "r1_control": [
+          320.881,
+          320.225
+        ],
+        "r1_control_vs_1107": "within",
+        "r2_vs_r1_control_in_session": "within"
+      }
+    },
+    "pass_us_per_layer": {
+      "TP3_T768_rank0": {
+        "tail": false,
+        "path": "partials",
+        "local_rows": 256,
+        "real_rows": 256,
+        "1107_recorded": [
+          26.534,
+          27.467
+        ],
+        "r2": [
+          26.458,
+          26.312
+        ],
+        "vs_1107": "faster",
+        "margin_us": 0.076,
+        "speedup_vs_1107": 1.023,
+        "r1_recorded": [
+          26.577,
+          26.304
+        ],
+        "r1_recorded_vs_1107": "within",
+        "r1_control": [
+          122.495,
+          44.507
+        ],
+        "r1_control_vs_1107": "slower",
+        "r2_vs_r1_control_in_session": "faster"
+      },
+      "TP3_T768_rank2": {
+        "tail": false,
+        "path": "partials",
+        "local_rows": 256,
+        "real_rows": 256,
+        "1107_recorded": [
+          26.707,
+          26.526
+        ],
+        "r2": [
+          26.867,
+          26.406
+        ],
+        "vs_1107": "within",
+        "margin_us": 0.0,
+        "speedup_vs_1107": 0.999,
+        "r1_recorded": [
+          26.882,
+          27.359
+        ],
+        "r1_recorded_vs_1107": "slower",
+        "r1_control": [
+          26.746,
+          26.458
+        ],
+        "r1_control_vs_1107": "within",
+        "r2_vs_r1_control_in_session": "within"
+      },
+      "TP3_T1024_rank0": {
+        "tail": false,
+        "path": "gate",
+        "local_rows": 342,
+        "real_rows": 342,
+        "1107_recorded": [
+          35.508,
+          35.779
+        ],
+        "r2": [
+          34.963,
+          35.231
+        ],
+        "vs_1107": "faster",
+        "margin_us": 0.277,
+        "speedup_vs_1107": 1.016,
+        "r1_recorded": [
+          34.345,
+          35.405
+        ],
+        "r1_recorded_vs_1107": "faster",
+        "r1_control": [
+          35.54,
+          34.97
+        ],
+        "r1_control_vs_1107": "within",
+        "r2_vs_r1_control_in_session": "within"
+      },
+      "TP3_T1024_rank2": {
+        "tail": true,
+        "path": "gate",
+        "local_rows": 342,
+        "real_rows": 340,
+        "1107_recorded": [
+          52.959,
+          53.906
+        ],
+        "r2": [
+          36.07,
+          36.825
+        ],
+        "vs_1107": "faster",
+        "margin_us": 16.134,
+        "speedup_vs_1107": 1.466,
+        "r1_recorded": [
+          36.35,
+          36.913
+        ],
+        "r1_recorded_vs_1107": "faster",
+        "r1_control": [
+          36.815,
+          35.496
+        ],
+        "r1_control_vs_1107": "faster",
+        "r2_vs_r1_control_in_session": "within"
+      },
+      "TP3_T2048_rank0": {
+        "tail": false,
+        "path": "gate",
+        "local_rows": 683,
+        "real_rows": 683,
+        "1107_recorded": [
+          68.429,
+          69.076
+        ],
+        "r2": [
+          68.713,
+          67.971
+        ],
+        "vs_1107": "within",
+        "margin_us": 0.0,
+        "speedup_vs_1107": 1.006,
+        "r1_recorded": [
+          68.307,
+          69.988
+        ],
+        "r1_recorded_vs_1107": "within",
+        "r1_control": [
+          68.304,
+          68.474
+        ],
+        "r1_control_vs_1107": "within",
+        "r2_vs_r1_control_in_session": "within"
+      },
+      "TP3_T2048_rank2": {
+        "tail": true,
+        "path": "gate",
+        "local_rows": 683,
+        "real_rows": 682,
+        "1107_recorded": [
+          78.538,
+          83.602
+        ],
+        "r2": [
+          68.995,
+          68.79
+        ],
+        "vs_1107": "faster",
+        "margin_us": 9.543,
+        "speedup_vs_1107": 1.177,
+        "r1_recorded": [
+          68.954,
+          69.308
+        ],
+        "r1_recorded_vs_1107": "faster",
+        "r1_control": [
+          69.958,
+          68.694
+        ],
+        "r1_control_vs_1107": "faster",
+        "r2_vs_r1_control_in_session": "within"
+      },
+      "TP3_T4096_rank0": {
+        "tail": false,
+        "path": "gate",
+        "local_rows": 1366,
+        "real_rows": 1366,
+        "1107_recorded": [
+          104.506,
+          103.979
+        ],
+        "r2": [
+          104.708,
+          106.443
+        ],
+        "vs_1107": "slower",
+        "margin_us": 0.202,
+        "speedup_vs_1107": 0.987,
+        "r1_recorded": [
+          105.111,
+          104.922
+        ],
+        "r1_recorded_vs_1107": "slower",
+        "r1_control": [
+          106.88,
+          105.008
+        ],
+        "r1_control_vs_1107": "slower",
+        "r2_vs_r1_control_in_session": "within"
+      },
+      "TP3_T4096_rank2": {
+        "tail": true,
+        "path": "gate",
+        "local_rows": 1366,
+        "real_rows": 1364,
+        "1107_recorded": [
+          114.688,
+          112.601
+        ],
+        "r2": [
+          104.083,
+          106.342
+        ],
+        "vs_1107": "faster",
+        "margin_us": 6.259,
+        "speedup_vs_1107": 1.08,
+        "r1_recorded": [
+          107.225,
+          104.751
+        ],
+        "r1_recorded_vs_1107": "faster",
+        "r1_control": [
+          107.757,
+          105.261
+        ],
+        "r1_control_vs_1107": "faster",
+        "r2_vs_r1_control_in_session": "within"
+      },
+      "TP3_T6144_rank0": {
+        "tail": false,
+        "path": "gate",
+        "local_rows": 2048,
+        "real_rows": 2048,
+        "1107_recorded": [
+          146.883,
+          145.983
+        ],
+        "r2": [
+          149.7,
+          145.654
+        ],
+        "vs_1107": "within",
+        "margin_us": 0.0,
+        "speedup_vs_1107": 0.992,
+        "r1_recorded": [
+          144.301,
+          147.791
+        ],
+        "r1_recorded_vs_1107": "within",
+        "r1_control": [
+          153.984,
+          147.464
+        ],
+        "r1_control_vs_1107": "slower",
+        "r2_vs_r1_control_in_session": "within"
+      },
+      "TP3_T6144_rank2": {
+        "tail": false,
+        "path": "gate",
+        "local_rows": 2048,
+        "real_rows": 2048,
+        "1107_recorded": [
+          144.585,
+          145.385
+        ],
+        "r2": [
+          145.393,
+          144.41
+        ],
+        "vs_1107": "within",
+        "margin_us": 0.0,
+        "speedup_vs_1107": 1.001,
+        "r1_recorded": [
+          146.143,
+          146.314
+        ],
+        "r1_recorded_vs_1107": "slower",
+        "r1_control": [
+          214.277,
+          144.846
+        ],
+        "r1_control_vs_1107": "within",
+        "r2_vs_r1_control_in_session": "within"
+      },
+      "TP3_T8192_rank0": {
+        "tail": false,
+        "path": "gate",
+        "local_rows": 2731,
+        "real_rows": 2731,
+        "1107_recorded": [
+          216.737,
+          213.186
+        ],
+        "r2": [
+          215.028,
+          217.014
+        ],
+        "vs_1107": "within",
+        "margin_us": 0.0,
+        "speedup_vs_1107": 0.995,
+        "r1_recorded": [
+          221.246,
+          218.6
+        ],
+        "r1_recorded_vs_1107": "slower",
+        "r1_control": [
+          223.599,
+          216.253
+        ],
+        "r1_control_vs_1107": "within",
+        "r2_vs_r1_control_in_session": "within"
+      },
+      "TP3_T8192_rank2": {
+        "tail": true,
+        "path": "gate",
+        "local_rows": 2731,
+        "real_rows": 2730,
+        "1107_recorded": [
+          220.497,
+          221.465
+        ],
+        "r2": [
+          214.51,
+          213.859
+        ],
+        "vs_1107": "faster",
+        "margin_us": 5.987,
+        "speedup_vs_1107": 1.032,
+        "r1_recorded": [
+          222.157,
+          209.576
+        ],
+        "r1_recorded_vs_1107": "within",
+        "r1_control": [
+          221.647,
+          218.745
+        ],
+        "r1_control_vs_1107": "within",
+        "r2_vs_r1_control_in_session": "faster"
+      },
+      "TP3_T16384_rank0": {
+        "tail": false,
+        "path": "gate",
+        "local_rows": 5462,
+        "real_rows": 5462,
+        "1107_recorded": [
+          421.949,
+          417.41
+        ],
+        "r2": [
+          417.712,
+          420.23
+        ],
+        "vs_1107": "within",
+        "margin_us": 0.0,
+        "speedup_vs_1107": 1.002,
+        "r1_recorded": [
+          420.106,
+          418.688
+        ],
+        "r1_recorded_vs_1107": "within",
+        "r1_control": [
+          422.437,
+          419.025
+        ],
+        "r1_control_vs_1107": "within",
+        "r2_vs_r1_control_in_session": "within"
+      },
+      "TP3_T16384_rank2": {
+        "tail": true,
+        "path": "gate",
+        "local_rows": 5462,
+        "real_rows": 5460,
+        "1107_recorded": [
+          433.231,
+          430.897
+        ],
+        "r2": [
+          416.006,
+          420.933
+        ],
+        "vs_1107": "faster",
+        "margin_us": 9.964,
+        "speedup_vs_1107": 1.032,
+        "r1_recorded": [
+          422.121,
+          427.913
+        ],
+        "r1_recorded_vs_1107": "faster",
+        "r1_control": [
+          429.038,
+          418.439
+        ],
+        "r1_control_vs_1107": "faster",
+        "r2_vs_r1_control_in_session": "within"
+      },
+      "TP4_T768_rank0": {
+        "tail": false,
+        "path": "partials",
+        "local_rows": 192,
+        "real_rows": 192,
+        "1107_recorded": [
+          25.704,
+          26.074
+        ],
+        "r2": [
+          23.419,
+          21.816
+        ],
+        "vs_1107": "faster",
+        "margin_us": 2.285,
+        "speedup_vs_1107": 1.145,
+        "r1_recorded": [
+          22.301,
+          21.986
+        ],
+        "r1_recorded_vs_1107": "faster",
+        "r1_control": [
+          21.969,
+          21.969
+        ],
+        "r1_control_vs_1107": "faster",
+        "r2_vs_r1_control_in_session": "within"
+      },
+      "TP4_T768_rank3": {
+        "tail": false,
+        "path": "partials",
+        "local_rows": 192,
+        "real_rows": 192,
+        "1107_recorded": [
+          25.024,
+          25.879
+        ],
+        "r2": [
+          22.948,
+          21.806
+        ],
+        "vs_1107": "faster",
+        "margin_us": 2.076,
+        "speedup_vs_1107": 1.137,
+        "r1_recorded": [
+          21.936,
+          21.842
+        ],
+        "r1_recorded_vs_1107": "faster",
+        "r1_control": [
+          21.83,
+          21.766
+        ],
+        "r1_control_vs_1107": "faster",
+        "r2_vs_r1_control_in_session": "within"
+      },
+      "TP4_T1024_rank0": {
+        "tail": false,
+        "path": "partials",
+        "local_rows": 256,
+        "real_rows": 256,
+        "1107_recorded": [
+          26.696,
+          27.178
+        ],
+        "r2": [
+          26.741,
+          26.441
+        ],
+        "vs_1107": "within",
+        "margin_us": 0.0,
+        "speedup_vs_1107": 1.013,
+        "r1_recorded": [
+          27.239,
+          26.443
+        ],
+        "r1_recorded_vs_1107": "within",
+        "r1_control": [
+          26.711,
+          26.694
+        ],
+        "r1_control_vs_1107": "within",
+        "r2_vs_r1_control_in_session": "within"
+      },
+      "TP4_T1024_rank3": {
+        "tail": false,
+        "path": "partials",
+        "local_rows": 256,
+        "real_rows": 256,
+        "1107_recorded": [
+          27.025,
+          26.49
+        ],
+        "r2": [
+          26.358,
+          26.474
+        ],
+        "vs_1107": "faster",
+        "margin_us": 0.016,
+        "speedup_vs_1107": 1.013,
+        "r1_recorded": [
+          26.642,
+          26.452
+        ],
+        "r1_recorded_vs_1107": "within",
+        "r1_control": [
+          26.762,
+          26.567
+        ],
+        "r1_control_vs_1107": "within",
+        "r2_vs_r1_control_in_session": "faster"
+      },
+      "TP4_T2048_rank0": {
+        "tail": false,
+        "path": "gate",
+        "local_rows": 512,
+        "real_rows": 512,
+        "1107_recorded": [
+          41.497,
+          40.201
+        ],
+        "r2": [
+          45.825,
+          39.607
+        ],
+        "vs_1107": "within",
+        "margin_us": 0.0,
+        "speedup_vs_1107": 0.956,
+        "r1_recorded": [
+          41.351,
+          41.656
+        ],
+        "r1_recorded_vs_1107": "within",
+        "r1_control": [
+          41.041,
+          39.826
+        ],
+        "r1_control_vs_1107": "within",
+        "r2_vs_r1_control_in_session": "within"
+      },
+      "TP4_T2048_rank3": {
+        "tail": false,
+        "path": "gate",
+        "local_rows": 512,
+        "real_rows": 512,
+        "1107_recorded": [
+          41.396,
+          41.433
+        ],
+        "r2": [
+          39.939,
+          39.641
+        ],
+        "vs_1107": "faster",
+        "margin_us": 1.457,
+        "speedup_vs_1107": 1.041,
+        "r1_recorded": [
+          41.42,
+          40.019
+        ],
+        "r1_recorded_vs_1107": "within",
+        "r1_control": [
+          44.659,
+          41.271
+        ],
+        "r1_control_vs_1107": "within",
+        "r2_vs_r1_control_in_session": "faster"
+      },
+      "TP4_T4096_rank0": {
+        "tail": false,
+        "path": "gate",
+        "local_rows": 1024,
+        "real_rows": 1024,
+        "1107_recorded": [
+          74.527,
+          75.613
+        ],
+        "r2": [
+          74.494,
+          76.405
+        ],
+        "vs_1107": "within",
+        "margin_us": 0.0,
+        "speedup_vs_1107": 0.995,
+        "r1_recorded": [
+          74.479,
+          74.875
+        ],
+        "r1_recorded_vs_1107": "within",
+        "r1_control": [
+          76.322,
+          75.629
+        ],
+        "r1_control_vs_1107": "slower",
+        "r2_vs_r1_control_in_session": "within"
+      },
+      "TP4_T4096_rank3": {
+        "tail": false,
+        "path": "gate",
+        "local_rows": 1024,
+        "real_rows": 1024,
+        "1107_recorded": [
+          75.186,
+          75.918
+        ],
+        "r2": [
+          74.473,
+          75.87
+        ],
+        "vs_1107": "within",
+        "margin_us": 0.0,
+        "speedup_vs_1107": 1.005,
+        "r1_recorded": [
+          75.458,
+          76.5
+        ],
+        "r1_recorded_vs_1107": "within",
+        "r1_control": [
+          74.44,
+          76.64
+        ],
+        "r1_control_vs_1107": "within",
+        "r2_vs_r1_control_in_session": "within"
+      },
+      "TP4_T6144_rank0": {
+        "tail": false,
+        "path": "gate",
+        "local_rows": 1536,
+        "real_rows": 1536,
+        "1107_recorded": [
+          109.297,
+          109.246
+        ],
+        "r2": [
+          109.301,
+          109.386
+        ],
+        "vs_1107": "slower",
+        "margin_us": 0.004,
+        "speedup_vs_1107": 0.999,
+        "r1_recorded": [
+          109.435,
+          110.022
+        ],
+        "r1_recorded_vs_1107": "slower",
+        "r1_control": [
+          111.346,
+          111.315
+        ],
+        "r1_control_vs_1107": "slower",
+        "r2_vs_r1_control_in_session": "faster"
+      },
+      "TP4_T6144_rank3": {
+        "tail": false,
+        "path": "gate",
+        "local_rows": 1536,
+        "real_rows": 1536,
+        "1107_recorded": [
+          110.865,
+          109.455
+        ],
+        "r2": [
+          109.868,
+          108.344
+        ],
+        "vs_1107": "within",
+        "margin_us": 0.0,
+        "speedup_vs_1107": 1.01,
+        "r1_recorded": [
+          111.308,
+          111.227
+        ],
+        "r1_recorded_vs_1107": "slower",
+        "r1_control": [
+          110.246,
+          110.008
+        ],
+        "r1_control_vs_1107": "within",
+        "r2_vs_r1_control_in_session": "faster"
+      },
+      "TP4_T8192_rank0": {
+        "tail": false,
+        "path": "gate",
+        "local_rows": 2048,
+        "real_rows": 2048,
+        "1107_recorded": [
+          148.691,
+          146.156
+        ],
+        "r2": [
+          148.521,
+          146.405
+        ],
+        "vs_1107": "within",
+        "margin_us": 0.0,
+        "speedup_vs_1107": 1.0,
+        "r1_recorded": [
+          147.03,
+          148.242
+        ],
+        "r1_recorded_vs_1107": "within",
+        "r1_control": [
+          149.205,
+          146.637
+        ],
+        "r1_control_vs_1107": "within",
+        "r2_vs_r1_control_in_session": "within"
+      },
+      "TP4_T8192_rank3": {
+        "tail": false,
+        "path": "gate",
+        "local_rows": 2048,
+        "real_rows": 2048,
+        "1107_recorded": [
+          148.772,
+          145.889
+        ],
+        "r2": [
+          148.473,
+          146.691
+        ],
+        "vs_1107": "within",
+        "margin_us": 0.0,
+        "speedup_vs_1107": 0.998,
+        "r1_recorded": [
+          148.606,
+          147.488
+        ],
+        "r1_recorded_vs_1107": "within",
+        "r1_control": [
+          149.343,
+          146.621
+        ],
+        "r1_control_vs_1107": "within",
+        "r2_vs_r1_control_in_session": "within"
+      },
+      "TP4_T16384_rank0": {
+        "tail": false,
+        "path": "gate",
+        "local_rows": 4096,
+        "real_rows": 4096,
+        "1107_recorded": [
+          312.812,
+          314.138
+        ],
+        "r2": [
+          316.825,
+          316.613
+        ],
+        "vs_1107": "slower",
+        "margin_us": 2.475,
+        "speedup_vs_1107": 0.99,
+        "r1_recorded": [
+          313.104,
+          309.259
+        ],
+        "r1_recorded_vs_1107": "within",
+        "r1_control": [
+          336.492,
+          313.477
+        ],
+        "r1_control_vs_1107": "within",
+        "r2_vs_r1_control_in_session": "within"
+      },
+      "TP4_T16384_rank3": {
+        "tail": false,
+        "path": "gate",
+        "local_rows": 4096,
+        "real_rows": 4096,
+        "1107_recorded": [
+          310.344,
+          293.747
+        ],
+        "r2": [
+          306.08,
+          311.926
+        ],
+        "vs_1107": "within",
+        "margin_us": 0.0,
+        "speedup_vs_1107": 0.977,
+        "r1_recorded": [
+          307.592,
+          310.412
+        ],
+        "r1_recorded_vs_1107": "within",
+        "r1_control": [
+          310.957,
+          310.476
+        ],
+        "r1_control_vs_1107": "slower",
+        "r2_vs_r1_control_in_session": "within"
+      }
+    },
+    "summary": {
+      "tail_cached_r2_vs_1107": {
+        "faster": 5,
+        "within": 0,
+        "slower": 0
+      },
+      "tail_cached_r1_recorded_vs_1107": {
+        "faster": 4,
+        "within": 1,
+        "slower": 0
+      },
+      "tail_cached_r1_control_vs_1107": {
+        "faster": 4,
+        "within": 1,
+        "slower": 0
+      },
+      "tail_cached_r2_vs_r1_control_in_session": {
+        "faster": 1,
+        "within": 4,
+        "slower": 0
+      },
+      "tail_cached_r1_control_vs_r1_recorded": {
+        "faster": 0,
+        "within": 5,
+        "slower": 0
+      },
+      "tail_cached_r2_slower_cells": [],
+      "tail_pass_r2_vs_1107": {
+        "faster": 5,
+        "within": 0,
+        "slower": 0
+      },
+      "tail_pass_r1_recorded_vs_1107": {
+        "faster": 4,
+        "within": 1,
+        "slower": 0
+      },
+      "tail_pass_r1_control_vs_1107": {
+        "faster": 4,
+        "within": 1,
+        "slower": 0
+      },
+      "tail_pass_r2_vs_r1_control_in_session": {
+        "faster": 1,
+        "within": 4,
+        "slower": 0
+      },
+      "tail_pass_r1_control_vs_r1_recorded": {
+        "faster": 0,
+        "within": 5,
+        "slower": 0
+      },
+      "tail_pass_r2_slower_cells": [],
+      "non_tail_cached_r2_vs_1107": {
+        "faster": 6,
+        "within": 15,
+        "slower": 2
+      },
+      "non_tail_cached_r1_recorded_vs_1107": {
+        "faster": 6,
+        "within": 11,
+        "slower": 6
+      },
+      "non_tail_cached_r1_control_vs_1107": {
+        "faster": 8,
+        "within": 11,
+        "slower": 4
+      },
+      "non_tail_cached_r2_vs_r1_control_in_session": {
+        "faster": 3,
+        "within": 19,
+        "slower": 1
+      },
+      "non_tail_cached_r1_control_vs_r1_recorded": {
+        "faster": 4,
+        "within": 14,
+        "slower": 5
+      },
+      "non_tail_cached_r2_slower_cells": [
+        "TP3 T4096 r0 (+0.031 us)",
+        "TP4 T16384 r0 (+3.041 us)"
+      ],
+      "non_tail_pass_r2_vs_1107": {
+        "faster": 6,
+        "within": 14,
+        "slower": 3
+      },
+      "non_tail_pass_r1_recorded_vs_1107": {
+        "faster": 3,
+        "within": 14,
+        "slower": 6
+      },
+      "non_tail_pass_r1_control_vs_1107": {
+        "faster": 2,
+        "within": 15,
+        "slower": 6
+      },
+      "non_tail_pass_r2_vs_r1_control_in_session": {
+        "faster": 5,
+        "within": 18,
+        "slower": 0
+      },
+      "non_tail_pass_r1_control_vs_r1_recorded": {
+        "faster": 5,
+        "within": 13,
+        "slower": 5
+      },
+      "non_tail_pass_r2_slower_cells": [
+        "TP3 T4096 r0 (+0.202 us)",
+        "TP4 T6144 r0 (+0.004 us)",
+        "TP4 T16384 r0 (+2.475 us)"
+      ],
+      "real_rows_hashes_equal_1107": "28 of 28",
+      "ibench_tail_cached_r2_vs_1107": {
+        "faster": 5,
+        "within": 0,
+        "slower": 0
+      },
+      "ibench_tail_pass_r2_vs_1107": {
+        "faster": 5,
+        "within": 0,
+        "slower": 0
+      },
+      "ibench_non_tail_cached_r2_vs_1107": {
+        "faster": 1,
+        "within": 22,
+        "slower": 0
+      },
+      "ibench_non_tail_pass_r2_vs_1107": {
+        "faster": 3,
+        "within": 18,
+        "slower": 2
+      }
+    }
+  },
+  "attribution_of_the_slower_cells": [
+    "TP3 T4096 rank0 (per call +0.03 us, pass +0.20 us), TP4 T6144 rank0 (pass +0.004 us) and TP4 T16384 rank0 (per call +3.04 us, pass +2.48 us, 0.9%) are gate-path cells of 1366-4096 local rows whose calls take 105-327 us, mostly the gate GEMM; the mask path's host work (smaller than 1107's) runs after the GEMM launch and overlaps it, and their GPU work is 1107's.",
+    "In-process A/B under inference mode (round 2's _local_mask against 1107's body, interleaved per step, two boots): all three cells within on both timings; at TP4 T16384 rank0 1107's own mask logic measures 323.0/325.7 us per call in this session, a spread 16 times the width of its recorded own-mark interval (323.2/323.4), and round 2 measures 323.0/325.5. Over all non-tail cells: per call 1 faster, 22 within, 0 slower; pass 3 faster, 18 within, 2 slower (TP4 T2048 r0 +0.01 us, TP4 T6144 r3 +0.03 us).",
+    "Identical code, two sessions: round 1's tree re-run here (ABBA with round 2) is, per call, faster than its own recorded boots in 4 non-tail cells and slower in 5; against 1107 it is slower in 4 non-tail cells (one of them the disturbed first cell, see caveats), not round 1's 6, with 2 in common. The recorded 1107 interval in these cells (e.g. 0.17 us wide at TP4 T16384 rank0) is narrower than the session-to-session spread of unchanged code.",
+    "Round 2 against the round 1 control in this session, non-tail: per call 3 faster, 19 within, 1 slower (TP4 T768 rank0, 34.2/32.0 against 31.9/31.7 us, a small partials cell where round 1's cheaper lookup is the expected direction; within on the pass timing); pass 5 faster, 18 within, 0 slower."
+  ],
+  "parts": [
+    {
+      "part": "the change targets the stated cause (cache lookup on view ranks)",
+      "verdict": "done, premise refuted",
+      "detail": "views now skip the cache; the lookup was cheaper than a view, so this adds 1-1.8 us/layer host work against round 1 (still below 1107) and removes no cost that the bench can see"
+    },
+    {
+      "part": "no tail or non-tail cell slower than 1107 beyond the interval, both boots",
+      "verdict": "fail",
+      "detail": "per call: 2 non-tail cells slower (TP3 T4096 r0 +0.031 us, TP4 T16384 r0 +3.041 us); pass: 3 (TP3 T4096 r0 +0.202, TP4 T6144 r0 +0.004, TP4 T16384 r0 +2.475); no tail cell slower"
+    },
+    {
+      "part": "tail-rank gain kept",
+      "verdict": "pass",
+      "detail": "5 of 5 faster beyond the interval on both timings"
+    },
+    {
+      "part": "bit-exact, no stale masks",
+      "verdict": "pass",
+      "detail": "1680/1680 layers per boot under inference mode, 28/28 no_grad hashes"
+    },
+    {
+      "part": "round 1's tests, its 6 new ones included",
+      "verdict": "pass with one assertion changed",
+      "detail": "279 passed per boot; unchanged, 4 cases fail only at the every-rank-keeps-masks assertion"
+    },
+    {
+      "part": "works under torch.inference_mode",
+      "verdict": "pass",
+      "detail": "5/5 inference cases ok, hashes equal 1107"
+    }
+  ],
+  "reason": "Round 2 skips the cache for ranks whose slice is a view, as asked, and keeps everything else round 1 achieved: the tail gain (now 5 of 5 cells beyond the interval), bit-exactness under inference mode, the stale-mask guarantees and the tests (one round 1 assertion about views being kept is changed). It still misses the literal mark: 2 non-tail per-call cells (TP3 T4096 rank0 by 0.03 us, TP4 T16384 rank0 by 3.0 us, 0.9%) and 3 pass cells are slower than the recorded 1107 boots beyond their two-boot interval. The data does not attribute these to the patch. The premise of the fix is false: round 1's lookup was cheaper than the view it replaced, the non-tail GPU work is identical, and the in-process A/B finds all three cells within. Unchanged round 1 code re-run in this session lands slower in a different set of cells. Against a reference interval recorded in another session, no change confined to the mask path can make these GPU-bound cells reliably not slower; whether to accept that is the owner's call.",
+  "caveats": [
+    "The verdict applies the mark literally to both timings of the own-mark bench against the recorded 1107 boots, which are not re-measured.",
+    "The round 1 control's first cell (TP3 T768 rank0) was 133 us per call on both control boots against 37-39 us everywhere else, a disturbance on the shared host that was not explained; round 2's boots did not show it. It does not enter the verdict.",
+    "Other agents shared sp8 during the batch; every GPU command ran under the GPU lock, and docker_ps lines are recorded per run. bench-r2-boot1's start_utc includes a wait on the lock.",
+    "The harness uses a stand-in ForwardContext and plain scratch, as the PR's tests do; it does not run the SP gather collective or a cluster boot. A tp3-switched boot of the corrected stack is still to be done in a candidate window."
+  ],
+  "harness": {
+    "bench_996_route_local.py": "own-marks harness, unchanged, sha256 968eed5d2c63e5c0407dc2f1660211d5bcb0e978cadc2f219c1d1b48882c150a",
+    "exact_996.py": "round 1's harness/exact_996.py, unchanged, sha256 0143127e2d929d5dea8242c7dc810c9486b75898a8d38d956f2eb9929f754a9f",
+    "cpu_996.py": "harness/cpu_996.py (new: host cost of one layer's mask calls, three bodies interleaved), sha256 24da2b9d9ba622cd351f69827975d2a826c4da51b63056534159cc3bdacd40db",
+    "slice_cost.py": "harness/slice_cost.py (new, development run), sha256 2bb4e34a87c4e53705c40e38e348bff9d3ebdd847f1730305900e7cc01255cb4",
+    "analyze_r2.py": "harness/analyze_r2.py (writes json/analysis-r2.json and analysis-r2.txt), sha256 824bc41fa975a4c411b2e22c2e9b385b19080f8c25b04cd08bc2027fec12f77c",
+    "cells_r2.py": "harness/cells_r2.py (prints the cell table)",
+    "batch": "harness/batch-r2.sh, env.sh, run.sh"
+  },
+  "sp8_state": {
+    "branches": "~/spark-lab/agents/candidate-49-rework-996-r2/vllm-stack (12 MB subset repo): rework-996-r2 251f7af (this patch), rework-996 873df17 (round 1), stack-0766 a087373, base 1ecc66b; origin is round 1's mirror ~/spark-lab/agents/candidate-49-rework-996/vllm-stack.git (5.9 MB, branches base, rework-996, stack-0766)",
+    "deleted": "round 1's vllm-1107 (763 MB) and vllm-stack (769 MB) trees, after mirroring vllm-stack's git repo; round 2 made no full vLLM tree copy (a 12 MB clone of the subset repo only)",
+    "kept": "small receipts in both workspaces (out/, shim/, patches/, c49-files/); round 1's pr-clone (423 MB, a spark-ds41f clone, not a vLLM tree) is left as it was"
+  }
+}

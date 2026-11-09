@@ -1,0 +1,95 @@
+INFO 11-09 11:05:33 [__init__.py:119] Registered model loader `<class 'b12x.integration.vllm.loader.B12xModelLoader'>` with load format `b12x`
+WARNING 11-09 11:05:33 [envs.py:2719] Unknown vLLM environment variable detected: VLLM_L2_PREFETCH_KERNELS
+WARNING 11-09 11:05:33 [envs.py:2719] Unknown vLLM environment variable detected: VLLM_L2_PREFETCH_GRID
+WARNING 11-09 11:05:33 [envs.py:2719] Unknown vLLM environment variable detected: VLLM_NATIVE_CACHE_DIR
+INFO 11-09 11:05:33 [config.py:852] Detected quantization_config.scale_fmt=ue8m0; enabling UE8M0 for DeepGEMM.
+INFO 11-09 11:05:41 [model.py:693] Resolved architecture: DeepseekV41ForCausalLM
+INFO 11-09 11:05:41 [model.py:716] Defaulting to tokenizer_mode='deepseek_v41' for DeepseekV41ForCausalLM
+INFO 11-09 11:05:41 [model.py:2066] Using max model len 65536
+WARNING 11-09 11:05:41 [model.py:997] Model does not support mm_device_do_normalize, forcing mm_device_do_normalize = False.
+INFO 11-09 11:05:41 [scheduler.py:436] Chunked prefill is enabled with max_num_batched_tokens=16384.
+INFO 11-09 11:05:41 [vllm.py:1521] Resolved Engram configuration: EngramConfig(cpu_offload=True, embedding_across_dp=False, dp_shared_memory=False, table_memory='device', projection_tp=False, disk_resident_scales=False)
+INFO 11-09 11:05:41 [kernel.py:435] Final IR op priority after setting platform defaults: IrOpPriorityConfig(rms_norm=['native'], fused_add_rms_norm=['native'], gelu_and_mul_sparse=['triton', 'native'])
+INFO 11-09 11:05:41 [compilation.py:336] Enabled custom fusions: norm_quant, act_quant
+INFO 11-09 11:05:41 [parallel_state.py:1953] world_size=1 rank=0 local_rank=0 distributed_init_method=tcp://127.0.0.1:29517 backend=nccl
+INFO 11-09 11:05:41 [parallel_state.py:2393] rank 0 in world size 1 is assigned as DP rank 0, PP rank 0, PCP rank 0, TP rank 0, ETP rank 0, EP rank 0, EPLB rank N/A
+INFO 11-09 11:05:43 [mxfp4.py:464] Using 'TILELANG_MXFP4_MXFP8' Mxfp4 MoE backend.
+INFO 11-09 11:05:43 [mxfp4.py:2011] Using MoEPrepareAndFinalizeNoDPEPModular
+INFO 11-09 11:05:43 [mxfp4.py:2012] Using TileLangExperts
+2026-11-09 11:05:47  [TileLang:tilelang.cache.kernel_cache:WARNING] (kernel_cache.py:421): Found kernel 'moe_dispatch' in memory cache. For better performance, consider using `@tilelang.jit` instead of direct kernel caching.
+2026-11-09 11:05:47  [TileLang:tilelang.cache.kernel_cache:WARNING] (kernel_cache.py:421): Found kernel 'moe_dispatch' in memory cache. For better performance, consider using `@tilelang.jit` instead of direct kernel caching.
+2026-11-09 11:05:47  [TileLang:tilelang.cache.kernel_cache:WARNING] (kernel_cache.py:421): Found kernel 'moe_dispatch' in memory cache. For better performance, consider using `@tilelang.jit` instead of direct kernel caching.
+[tp4] built in 14.6s; swiglu args (576, 16, 10.0); alt kernel differs True
+[tp4] base: M=1 ['shared.maybe_forward_async(recorded=False)', 'router(no hook)']
+[tp4] kern: M=1 ['shared.maybe_forward_async(recorded=False)', 'router(no hook)']
+[tp4] hook: M=1 ['shared.record_input_ready->True', 'router(post_gate_hook)', 'shared.maybe_forward_async(recorded=True)']
+[tp4] c47: M=1 ['shared.record_input_ready->True', 'router(post_gate_hook)', 'shared.maybe_forward_async(recorded=True)']
+[tp4] post: M=1 ['shared.record_input_ready->False', 'router(post_gate_hook)', 'shared.maybe_forward_async(recorded=False)']
+[tp4] postk: M=1 ['shared.record_input_ready->False', 'router(post_gate_hook)', 'shared.maybe_forward_async(recorded=False)']
+INFO 11-09 11:05:47 [l2_prefetch.py:541] [l2_prefetch] persisting L2 set-aside on cuda:0: L2 25 MB, max 19 MB, requested 0 MB, now 0 MB
+INFO 11-09 11:05:47 [l2_prefetch.py:267] [l2_prefetch] TileLang kernel ready (grid=2 block=128 chunk=4096)
+[tp4] captured 132 graphs
+[tp4] chain M= 1 base   191.45 | kern  +0.00 | hook  -1.31 | c47  -0.72 | post  +0.05 | postk  -1.13
+[tp4] chain M= 2 base   299.17 | kern  -0.32 | hook  -0.65 | c47  -0.46 | post  -1.25 | postk  -0.94
+[tp4] chain M= 3 base   411.75 | kern  -0.85 | hook  -0.08 | c47  -0.19 | post  -0.78 | postk  -1.55
+[tp4] chain M= 4 base   518.65 | kern  -0.90 | hook  +0.25 | c47  +1.09 | post  +0.03 | postk  +0.60
+[tp4] chain M= 6 base   724.17 | kern  -0.15 | hook  -0.21 | c47  -0.05 | post  +0.07 | postk  -0.19
+[tp4] chain M= 8 base   942.30 | kern  +0.47 | hook  +0.28 | c47  +0.18 | post  -1.00 | postk  -1.37
+[tp4] chain M=12 base  1305.18 | kern  -0.82 | hook  +0.09 | c47  -1.67 | post  -0.88 | postk  -1.38
+[tp4] chain M=16 base  1734.22 | kern  -0.71 | hook  +0.35 | c47  +1.19 | post  -0.01 | postk  -1.11
+[tp4] chain M=24 base  2374.84 | kern  -1.64 | hook  +1.11 | c47  +1.31 | post  -1.40 | postk  -2.38
+[tp4] chain M=32 base  2990.85 | kern  -2.09 | hook  +0.00 | c47  -0.80 | post  -2.44 | postk  -3.33
+[tp4] chain M=48 base  3967.68 | kern  -1.03 | hook  +3.61 | c47  -0.07 | post  +2.89 | postk  +2.19
+[tp4] cold  M= 1 base   246.51 | kern  -0.34 | hook  +0.57 | c47  -0.38 | post  +2.02 | postk  +1.27
+[tp4] cold  M= 2 base   356.47 | kern  +0.26 | hook  -0.17 | c47  -0.52 | post  +0.26 | postk  +0.19
+[tp4] cold  M= 3 base   469.37 | kern  +0.89 | hook  +1.34 | c47  -0.23 | post  +2.44 | postk  +1.45
+[tp4] cold  M= 4 base   577.13 | kern  +0.89 | hook  +0.10 | c47  -0.35 | post  +2.62 | postk  +1.41
+[tp4] cold  M= 6 base   778.33 | kern  +0.43 | hook  +0.15 | c47  +0.34 | post  +2.45 | postk  +2.53
+[tp4] cold  M= 8 base   993.65 | kern  +0.78 | hook  +0.67 | c47  +0.35 | post  +2.94 | postk  +2.02
+[tp4] cold  M=12 base  1353.81 | kern  +0.65 | hook  +0.93 | c47  +0.55 | post  +2.80 | postk  +2.81
+[tp4] cold  M=16 base  1780.79 | kern  +0.25 | hook  +0.52 | c47  +0.41 | post  +3.16 | postk  +3.35
+[tp4] cold  M=24 base  2414.76 | kern  -0.65 | hook  -1.26 | c47  +0.09 | post  +3.67 | postk  +0.33
+[tp4] cold  M=32 base  3030.90 | kern  -0.68 | hook  -0.84 | c47  -2.46 | post  +2.36 | postk  -0.19
+[tp4] cold  M=48 base  4006.18 | kern  -0.15 | hook  +2.17 | c47  -1.50 | post  -0.01 | postk  -1.31
+WARNING 11-09 11:08:35 [envs.py:2719] Unknown vLLM environment variable detected: VLLM_L2_PREFETCH_KERNELS
+WARNING 11-09 11:08:35 [envs.py:2719] Unknown vLLM environment variable detected: VLLM_L2_PREFETCH_GRID
+WARNING 11-09 11:08:35 [envs.py:2719] Unknown vLLM environment variable detected: VLLM_NATIVE_CACHE_DIR
+INFO 11-09 11:08:35 [model.py:693] Resolved architecture: DeepseekV41ForCausalLM
+INFO 11-09 11:08:35 [model.py:716] Defaulting to tokenizer_mode='deepseek_v41' for DeepseekV41ForCausalLM
+INFO 11-09 11:08:35 [model.py:2066] Using max model len 65536
+WARNING 11-09 11:08:35 [model.py:997] Model does not support mm_device_do_normalize, forcing mm_device_do_normalize = False.
+INFO 11-09 11:08:35 [kernel.py:435] Final IR op priority after setting platform defaults: IrOpPriorityConfig(rms_norm=['native'], fused_add_rms_norm=['native'], gelu_and_mul_sparse=['triton', 'native'])
+2026-11-09 11:08:39  [TileLang:tilelang.jit.kernel:INFO] (kernel.py:137): TileLang begins to compile kernel `moe_swiglu_cast_kernel` with `out_idx=None`
+2026-11-09 11:08:41  [TileLang:tilelang.jit.kernel:INFO] (kernel.py:145): TileLang completes to compile kernel `moe_swiglu_cast_kernel`
+[tp3] built in 5.6s; swiglu args (768, 16, 10.0); alt kernel differs True
+[tp3] base: M=1 ['shared.maybe_forward_async(recorded=False)', 'router(no hook)']
+[tp3] kern: M=1 ['shared.maybe_forward_async(recorded=False)', 'router(no hook)']
+[tp3] hook: M=1 ['shared.record_input_ready->True', 'router(post_gate_hook)', 'shared.maybe_forward_async(recorded=True)']
+[tp3] c47: M=1 ['shared.record_input_ready->True', 'router(post_gate_hook)', 'shared.maybe_forward_async(recorded=True)']
+[tp3] post: M=1 ['shared.record_input_ready->False', 'router(post_gate_hook)', 'shared.maybe_forward_async(recorded=False)']
+[tp3] postk: M=1 ['shared.record_input_ready->False', 'router(post_gate_hook)', 'shared.maybe_forward_async(recorded=False)']
+[tp3] captured 132 graphs
+[tp3] chain M= 1 base   235.55 | kern  +0.77 | hook  +0.17 | c47  +0.36 | post  -2.58 | postk  -1.62
+[tp3] chain M= 2 base   390.29 | kern  -1.22 | hook  +1.29 | c47  -0.55 | post  -2.32 | postk  -2.12
+[tp3] chain M= 3 base   531.93 | kern  +0.72 | hook  +0.90 | c47  +0.15 | post  -2.88 | postk  -1.77
+[tp3] chain M= 4 base   679.81 | kern  -0.34 | hook  -0.20 | c47  +0.20 | post  -1.08 | postk  -1.27
+[tp3] chain M= 6 base   947.54 | kern  +0.88 | hook  +0.05 | c47  +0.62 | post  -1.45 | postk  -1.68
+[tp3] chain M= 8 base  1219.92 | kern  +0.53 | hook  +0.27 | c47  +0.29 | post  -3.15 | postk  -1.03
+[tp3] chain M=12 base  1726.37 | kern  +0.03 | hook  +0.16 | c47  +0.85 | post  -0.76 | postk  -1.56
+[tp3] chain M=16 base  2246.99 | kern  -2.55 | hook  -2.12 | c47  -0.58 | post  -1.11 | postk  -3.63
+[tp3] chain M=24 base  3102.77 | kern  +0.12 | hook  -0.25 | c47  +0.19 | post  -0.21 | postk  -0.63
+[tp3] chain M=32 base  3882.52 | kern  -0.95 | hook  -0.06 | c47  -2.91 | post  -2.02 | postk  -5.30
+[tp3] chain M=48 base  5173.19 | kern  -0.15 | hook  +1.42 | c47  -2.55 | post  -3.77 | postk  -0.14
+[tp3] cold  M= 1 base   289.15 | kern  +0.14 | hook  -0.26 | c47  -0.01 | post  +3.09 | postk  +3.13
+[tp3] cold  M= 2 base   441.28 | kern  +0.22 | hook  +0.68 | c47  +0.64 | post  +4.56 | postk  +4.60
+[tp3] cold  M= 3 base   584.08 | kern  -0.09 | hook  -0.42 | c47  +0.36 | post  +1.38 | postk  +2.42
+[tp3] cold  M= 4 base   731.80 | kern  -0.13 | hook  -0.78 | c47  -0.82 | post  +3.59 | postk  +3.67
+[tp3] cold  M= 6 base   996.40 | kern  +0.69 | hook  +0.18 | c47  +0.47 | post  +4.05 | postk  +3.80
+[tp3] cold  M= 8 base  1267.02 | kern  +1.70 | hook  +0.82 | c47  +1.15 | post  +5.23 | postk  +3.18
+[tp3] cold  M=12 base  1771.40 | kern  -1.27 | hook  -0.62 | c47  -1.35 | post  +1.72 | postk  +2.26
+[tp3] cold  M=16 base  2282.66 | kern  +0.51 | hook  -0.67 | c47  +0.43 | post  +3.70 | postk  +3.48
+[tp3] cold  M=24 base  3131.60 | kern  -1.13 | hook  +0.04 | c47  -0.09 | post  +2.49 | postk  +2.13
+[tp3] cold  M=32 base  3906.98 | kern  +0.23 | hook  -1.10 | c47  -2.21 | post  -0.12 | postk  +0.01
+[tp3] cold  M=48 base  5189.16 | kern  -1.51 | hook  -0.51 | c47  -1.57 | post  -0.72 | postk  -1.49
+done
+[rank0]:[W1109 11:12:05.549221158 ProcessGroupNCCL.cpp:1624] Warning: WARNING: destroy_process_group() was not called before program exit, which can leak resources. For more info, please see https://pytorch.org/docs/stable/distributed.html#shutdown (function operator())

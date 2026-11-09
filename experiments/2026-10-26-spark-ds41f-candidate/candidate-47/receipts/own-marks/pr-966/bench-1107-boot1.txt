@@ -1,0 +1,38 @@
+INFO 11-09 09:48:20 [l2_prefetch.py:300] [l2_prefetch] CuTe kernel ready (grid=4 block=128 chunk=4096; budgets A/B/C/A_mla=20/50/15/36 MB)
+
+================ TP3 (inter=768) ================
+Traceback (most recent call last):
+  File "/tmp/bench_moe_evict.py", line 307, in <module>
+    sys.exit(main())
+             ^^^^^^
+  File "/tmp/bench_moe_evict.py", line 65, in main
+    plan_base = build_plan(I, eviction_policy="evict_normal", max_rows=4096)
+                ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/tmp/bench_moe_evict.py", line 41, in build_plan
+    for name, kernel in _launch(calls).items():
+                        ^^^^^^^^^^^^^^
+  File "/opt/spark-ds41f/candidate/vllm/vllm/models/deepseek_v4_1/tilelang/linear.py", line 671, in _launch
+    else prepare.launch(value)
+         ^^^^^^^^^^^^^^^^^^^^^
+  File "/opt/spark-ds41f/candidate/vllm/vllm/models/deepseek_v4_1/tilelang/prepare.py", line 330, in launch
+    return function(*args, **kwargs)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/usr/local/lib/python3.12/dist-packages/tilelang/jit/__init__.py", line 628, in __call__
+    kernel = self.compile(*args, **kwargs)
+             ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/usr/local/lib/python3.12/dist-packages/tilelang/jit/__init__.py", line 523, in compile
+    prim_func = self.get_tir(*args, **kwargs)
+                ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/usr/local/lib/python3.12/dist-packages/tilelang/jit/__init__.py", line 431, in get_tir
+    tir = self.func(*args, **kwargs)
+          ^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/usr/local/lib/python3.12/dist-packages/tilelang/language/eager/builder.py", line 1709, in __call__
+    return self.get_tir(*args, **kwargs)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/usr/local/lib/python3.12/dist-packages/tilelang/language/eager/builder.py", line 1698, in get_tir
+    template = self._build_tir_template(*args, **kwargs)
+               ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/usr/local/lib/python3.12/dist-packages/tilelang/language/eager/builder.py", line 1665, in _build_tir_template
+    return TirTemplate.from_lazy_style(self.orig_func.__name__, self.orig_func(*args, **kwargs))
+                                                                ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+TypeError: grouped_fp8_fp4_gemm() got an unexpected keyword argument 'eviction_policy'

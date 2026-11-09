@@ -1,0 +1,217 @@
+# PR #991 rework r1: commands, in issue order.
+# GPU runs: sp8 (spark-0016), ~/spark-lab/agents/candidate-49-rework-991/, each through
+# scripts/run.sh, which refuses to run while ~/spark-hold.json exists and records host, image ID,
+# UTC start/end, load, `docker ps` and exit code. start_utc is when the command was issued and
+# includes any wait on /tmp/spark-lab-gpu.lock. No hold file existed at any check.
+# scripts/env.sh: C = spark-ds41f:candidate-49 (sha256:9f51f2e2...), L = lock, V = vLLM root,
+# EXP = the PR checkout's experiment dir (bench_hw_e2m1x2_quant.py, unchanged).
+#
+# Diagnostics (candidate-49 image as built, PR #991 as is; files under diag/):
+#   diag-paged-1, diag-gemm-1 (failed: loop construct), diag-gemm-2: scripts/diag_variants.py
+#   diag-bench-pr-asis: the PR bench, unchanged, on the image as is (one run, today)
+#   diag-graph-pr-asis: scripts/bench_graph_companion.py on the image as is
+#   diag-cupti-1: scripts/diag_cupti.py (kernel time, CUPTI) on the image as is
+# Mark runs (corrected gemm.py + its test, files/, bind-mounted over the image; raw/ and json/):
+#   scripts/final.sh: per boot pytest, bench, graph companion, CUPTI (boots 1 and 2)
+#   scripts/boot3.sh: bench boot 3, because bench-r1-boot2 overlapped an unlocked container
+#   of another session (silly_spence, 08:21:10-08:23:31Z, raw/gpu-neighbors.log). Boot 2 is kept.
+#   raw/gpu-neighbors.log samples `docker ps` every 5 s during final.sh (its loop matched its own
+#   command line and kept running until killed after the batch; samples after 08:30Z are idle).
+#
+# Laptop (text only, no GPU): the corrected patch.
+#   reconstruct 1107 + 0762 + 0763 state of the four files: candidate-49 image files with
+#     `patch -R -p1 < candidate-49/vllm/0764-...patch` (blob hashes b5c16fb, f786070, c2443ad
+#     match 0764's index lines; indexer.py 4746cef is 0764's base after 0762/0763)
+#   git init; commit base; git am candidate-49/vllm/0764-...patch  (reproduces the image's files)
+#   edit gemm.py (T.serial epilogue loop) and the codegen test; git commit --amend -F commit-msg
+#   git format-patch -1 HEAD -> 0764-perf-dsv41-hw-e2m1x2-indexer-and-gemm-mxfp4-quantize.patch
+#   git apply --check/apply on the reconstructed base (exact) and on 1107's files (offsets);
+#   cmp of the result with files/gemm.py and files/test_deepseek_v41_tilelang_linear.py: equal;
+#   git diff --check: clean. 0765..0767 touch none of the four files.
+#
+# Analysis: scripts/cmp.py (cell table vs the own-mark receipts' 1107 arm), scripts/summarize.py.
+#   python3 scripts/cmp.py ref/bench-candidate49-boot{1,2}.json json/bench-r1-boot1.json json/bench-r1-boot3.json --json json/cells-r1-boots13.json
+#   python3 scripts/cmp.py ref/bench-candidate49-boot{1,2}.json json/bench-r1-boot1.json json/bench-r1-boot2.json --json json/cells-r1.json
+#   python3 scripts/summarize.py json json/cells-r1.json json/summary-r1.json
+#   (ref/ = candidate-49 receipts/own-marks/pr-991/json/bench-candidate49-boot{1,2}.json)
+
+### diag-paged-1
+host: spark-0016 (sp8)
+image: sha256:9f51f2e2c5ab728e96490d794bff7b83a147d6d3d61333c5b60b2cff662049cd (spark-ds41f:candidate-49)
+start_utc: 2026-11-09T07:39:49Z
+loadavg_before: 1.57 1.99 2.24
+docker_ps_before: none
+command: flock /tmp/spark-lab-gpu.lock docker run --rm --gpus all --ipc=host --name rw991-diag-paged-1 --entrypoint '' -v /usr/local/cuda-13.0/bin/nvdisasm:/usr/local/bin/nvdisasm:ro -v /home/chris/spark-lab/agents/candidate-49-own-marks/src/pr-991/experiments/2026-11-08-hw-e2m1x2-indexer-gemm-quant/bench_hw_e2m1x2_quant.py:/tmp/bench_hw_e2m1x2_quant.py:ro -v /home/chris/spark-lab/agents/candidate-49-rework-991/scratch/diag_variants.py:/tmp/diag_variants.py:ro -v /home/chris/spark-lab/agents/candidate-49-rework-991/out/diag:/out -w /opt/spark-ds41f/candidate/vllm sha256:9f51f2e2c5ab728e96490d794bff7b83a147d6d3d61333c5b60b2cff662049cd bash -lc python3\ /tmp/diag_variants.py\ --what\ paged\ --modes\ sw\,pr\,hw8\,hw32\,hw64\,null\ --ms\ 1\,2\,4\,6\,8\,16\,32\,512\,2048\,8192\ --graph\ --out\ /out/paged-1.json\ --dump\ /out/dump-paged\ 2\>\&1\ \|\ grep\ -v\ TileLang:tilelang.jit.kernel
+end_utc: 2026-11-09T07:40:18Z
+loadavg_after: 1.72 1.99 2.23
+exit_code: 0
+output: diag-paged-1.txt
+
+### diag-gemm-1
+host: spark-0016 (sp8)
+image: sha256:9f51f2e2c5ab728e96490d794bff7b83a147d6d3d61333c5b60b2cff662049cd (spark-ds41f:candidate-49)
+start_utc: 2026-11-09T07:42:02Z
+loadavg_before: 3.28 2.29 2.30
+docker_ps_before: spark-ds41f:1107 ecstatic_ardinghelli;
+command: flock /tmp/spark-lab-gpu.lock docker run --rm --gpus all --ipc=host --name rw991-diag-gemm-1 --entrypoint '' -v /usr/local/cuda-13.0/bin/nvdisasm:/usr/local/bin/nvdisasm:ro -v /home/chris/spark-lab/agents/candidate-49-own-marks/src/pr-991/experiments/2026-11-08-hw-e2m1x2-indexer-gemm-quant/bench_hw_e2m1x2_quant.py:/tmp/bench_hw_e2m1x2_quant.py:ro -v /home/chris/spark-lab/agents/candidate-49-rework-991/scratch/diag_variants.py:/tmp/diag_variants.py:ro -v /home/chris/spark-lab/agents/candidate-49-rework-991/out/diag:/out -w /opt/spark-ds41f/candidate/vllm sha256:9f51f2e2c5ab728e96490d794bff7b83a147d6d3d61333c5b60b2cff662049cd bash -lc python3\ /tmp/diag_variants.py\ --what\ gemm\ --modes\ sw\,pr\,hw_serial\,sw_rolled\ --ms\ 1\,2\,4\,6\,8\,16\,32\,64\ --graph\ --out\ /out/gemm-1.json\ --dump\ /out/dump-gemm\ 2\>\&1\ \|\ grep\ -v\ TileLang:tilelang.jit.kernel
+end_utc: 2026-11-09T07:42:18Z
+loadavg_after: 3.53 2.39 2.33
+exit_code: 0
+output: diag-gemm-1.txt
+
+### diag-gemm-2
+host: spark-0016 (sp8)
+image: sha256:9f51f2e2c5ab728e96490d794bff7b83a147d6d3d61333c5b60b2cff662049cd (spark-ds41f:candidate-49)
+start_utc: 2026-11-09T07:42:55Z
+loadavg_before: 3.80 2.60 2.40
+docker_ps_before: d6ffd8429788 c48rw2-1010-oracle-b2;spark-ds41f:1107 ecstatic_ardinghelli;
+command: flock /tmp/spark-lab-gpu.lock docker run --rm --gpus all --ipc=host --name rw991-diag-gemm-2 --entrypoint '' -v /usr/local/cuda-13.0/bin/nvdisasm:/usr/local/bin/nvdisasm:ro -v /home/chris/spark-lab/agents/candidate-49-own-marks/src/pr-991/experiments/2026-11-08-hw-e2m1x2-indexer-gemm-quant/bench_hw_e2m1x2_quant.py:/tmp/bench_hw_e2m1x2_quant.py:ro -v /home/chris/spark-lab/agents/candidate-49-rework-991/scratch/diag_variants.py:/tmp/diag_variants.py:ro -v /home/chris/spark-lab/agents/candidate-49-rework-991/out/diag:/out -w /opt/spark-ds41f/candidate/vllm sha256:9f51f2e2c5ab728e96490d794bff7b83a147d6d3d61333c5b60b2cff662049cd bash -lc python3\ /tmp/diag_variants.py\ --what\ gemm\ --modes\ sw\,pr\,hw_serial\,sw_rolled\ --ms\ 1\,2\,4\,6\,8\,16\,32\,64\ --graph\ --out\ /out/gemm-1.json\ --dump\ /out/dump-gemm\ 2\>\&1\ \|\ grep\ -v\ TileLang:tilelang.jit.kernel
+end_utc: 2026-11-09T07:44:01Z
+loadavg_after: 3.37 2.71 2.46
+exit_code: 0
+output: diag-gemm-2.txt
+
+### diag-bench-pr-asis
+host: spark-0016 (sp8)
+image: sha256:9f51f2e2c5ab728e96490d794bff7b83a147d6d3d61333c5b60b2cff662049cd (spark-ds41f:candidate-49)
+start_utc: 2026-11-09T07:45:22Z
+loadavg_before: 3.72 3.06 2.61
+docker_ps_before: 9f51f2e2c5ab c49rw999-gaps-b1;spark-ds41f:1107 ecstatic_ardinghelli;
+command: flock /tmp/spark-lab-gpu.lock docker run --rm --gpus all --ipc=host --name rw991-diag-bench-asis --entrypoint '' -v /usr/local/cuda-13.0/bin/nvdisasm:/usr/local/bin/nvdisasm:ro -v /home/chris/spark-lab/agents/candidate-49-own-marks/src/pr-991/experiments/2026-11-08-hw-e2m1x2-indexer-gemm-quant/bench_hw_e2m1x2_quant.py:/tmp/bench_hw_e2m1x2_quant.py:ro -v /home/chris/spark-lab/agents/candidate-49-rework-991/out/diag:/out -w /opt/spark-ds41f/candidate/vllm sha256:9f51f2e2c5ab728e96490d794bff7b83a147d6d3d61333c5b60b2cff662049cd bash -lc python3\ /tmp/bench_hw_e2m1x2_quant.py\ --out\ /out/bench-pr-asis.json
+end_utc: 2026-11-09T07:46:57Z
+loadavg_after: 3.32 3.12 2.68
+exit_code: 0
+output: diag-bench-pr-asis.txt
+
+### diag-graph-pr-asis
+host: spark-0016 (sp8)
+image: sha256:9f51f2e2c5ab728e96490d794bff7b83a147d6d3d61333c5b60b2cff662049cd (spark-ds41f:candidate-49)
+start_utc: 2026-11-09T07:46:58Z
+loadavg_before: 3.32 3.12 2.68
+docker_ps_before: spark-ds41f:1107 ecstatic_ardinghelli;
+command: flock /tmp/spark-lab-gpu.lock docker run --rm --gpus all --ipc=host --name rw991-diag-graph-asis --entrypoint '' -v /usr/local/cuda-13.0/bin/nvdisasm:/usr/local/bin/nvdisasm:ro -v /home/chris/spark-lab/agents/candidate-49-own-marks/src/pr-991/experiments/2026-11-08-hw-e2m1x2-indexer-gemm-quant/bench_hw_e2m1x2_quant.py:/tmp/bench_hw_e2m1x2_quant.py:ro -v /home/chris/spark-lab/agents/candidate-49-rework-991/scratch/bench_graph_companion.py:/tmp/bench_graph_companion.py:ro -v /home/chris/spark-lab/agents/candidate-49-rework-991/out/diag:/out -w /opt/spark-ds41f/candidate/vllm sha256:9f51f2e2c5ab728e96490d794bff7b83a147d6d3d61333c5b60b2cff662049cd bash -lc python3\ /tmp/bench_graph_companion.py\ --out\ /out/graph-pr-asis.json
+end_utc: 2026-11-09T07:49:27Z
+loadavg_after: 2.45 2.92 2.69
+exit_code: 0
+output: diag-graph-pr-asis.txt
+
+### diag-cupti-1
+host: spark-0016 (sp8)
+image: sha256:9f51f2e2c5ab728e96490d794bff7b83a147d6d3d61333c5b60b2cff662049cd (spark-ds41f:candidate-49)
+start_utc: 2026-11-09T07:52:27Z
+loadavg_before: 3.01 2.73 2.64
+docker_ps_before: spark-ds41f:1107 serene_pascal;
+command: flock /tmp/spark-lab-gpu.lock docker run --rm --gpus all --ipc=host --name rw991-diag-cupti-1 --entrypoint '' -v /usr/local/cuda-13.0/bin/nvdisasm:/usr/local/bin/nvdisasm:ro -v /home/chris/spark-lab/agents/candidate-49-own-marks/src/pr-991/experiments/2026-11-08-hw-e2m1x2-indexer-gemm-quant/bench_hw_e2m1x2_quant.py:/tmp/bench_hw_e2m1x2_quant.py:ro -v /home/chris/spark-lab/agents/candidate-49-rework-991/scratch/diag_variants.py:/tmp/diag_variants.py:ro -v /home/chris/spark-lab/agents/candidate-49-rework-991/scratch/diag_cupti.py:/tmp/diag_cupti.py:ro -v /home/chris/spark-lab/agents/candidate-49-rework-991/out/diag:/out -w /opt/spark-ds41f/candidate/vllm sha256:9f51f2e2c5ab728e96490d794bff7b83a147d6d3d61333c5b60b2cff662049cd bash -lc python3\ /tmp/diag_cupti.py\ --out\ /out/cupti-1.json\ 2\>\&1\ \|\ grep\ -v\ -E\ \"TileLang:tilelang.jit.kernel\|STAGE:\"
+end_utc: 2026-11-09T07:53:02Z
+loadavg_after: 2.83 2.73 2.64
+exit_code: 0
+output: diag-cupti-1.txt
+
+### pytest-r1-boot1
+host: spark-0016 (sp8)
+image: sha256:9f51f2e2c5ab728e96490d794bff7b83a147d6d3d61333c5b60b2cff662049cd (spark-ds41f:candidate-49)
+start_utc: 2026-11-09T07:56:35Z
+loadavg_before: 1.36 2.08 2.40
+docker_ps_before: none
+command: flock /tmp/spark-lab-gpu.lock docker run --rm --gpus all --ipc=host --name rw991-pyt-b1 --entrypoint pytest -v /usr/local/cuda-13.0/bin/nvdisasm:/usr/local/bin/nvdisasm:ro -v /home/chris/spark-lab/agents/candidate-49-rework-991/variants/r1/gemm.py:/opt/spark-ds41f/candidate/vllm/vllm/models/deepseek_v4_1/tilelang/gemm.py:ro -v /home/chris/spark-lab/agents/candidate-49-rework-991/variants/r1/test_deepseek_v41_tilelang_linear.py:/opt/spark-ds41f/candidate/vllm/tests/kernels/quantization/test_deepseek_v41_tilelang_linear.py:ro -w /opt/spark-ds41f/candidate/vllm sha256:9f51f2e2c5ab728e96490d794bff7b83a147d6d3d61333c5b60b2cff662049cd --noconftest -o addopts= -o cache_dir=/tmp/pytest_cache -v -k test_lsa\ or\ test_block_scale_words\ or\ test_mxfp8_gemm_rope_mxfp4_decode_matches_reference\ or\ test_hw_e2m1x2_codegen_in_gemm_and_indexer_quantizers\ or\ test_mxfp4_quantize\ or\ test_write_index_keys\ or\ test_norm_rope_write_index_keys\ or\ test_indexer_dense\ or\ test_indexer_candidates tests/models/test_deepseek_v4_1_lsa.py tests/kernels/quantization/test_deepseek_v41_block_scale_words.py tests/kernels/quantization/test_deepseek_v41_tilelang_linear.py tests/kernels/attention/test_deepseek_v41_tilelang.py
+end_utc: 2026-11-09T07:58:41Z
+loadavg_after: 2.90 2.54 2.54
+exit_code: 0
+output: pytest-r1-boot1.txt
+
+### bench-r1-boot1
+host: spark-0016 (sp8)
+image: sha256:9f51f2e2c5ab728e96490d794bff7b83a147d6d3d61333c5b60b2cff662049cd (spark-ds41f:candidate-49)
+start_utc: 2026-11-09T07:58:41Z
+loadavg_before: 2.90 2.54 2.54
+docker_ps_before: none
+command: flock /tmp/spark-lab-gpu.lock docker run --rm --gpus all --ipc=host --name rw991-bench-b1 --entrypoint '' -v /usr/local/cuda-13.0/bin/nvdisasm:/usr/local/bin/nvdisasm:ro -v /home/chris/spark-lab/agents/candidate-49-rework-991/variants/r1/gemm.py:/opt/spark-ds41f/candidate/vllm/vllm/models/deepseek_v4_1/tilelang/gemm.py:ro -v /home/chris/spark-lab/agents/candidate-49-rework-991/variants/r1/test_deepseek_v41_tilelang_linear.py:/opt/spark-ds41f/candidate/vllm/tests/kernels/quantization/test_deepseek_v41_tilelang_linear.py:ro -v /home/chris/spark-lab/agents/candidate-49-own-marks/src/pr-991/experiments/2026-11-08-hw-e2m1x2-indexer-gemm-quant/bench_hw_e2m1x2_quant.py:/tmp/bench_hw_e2m1x2_quant.py:ro -v /home/chris/spark-lab/agents/candidate-49-rework-991/out/json:/out -w /opt/spark-ds41f/candidate/vllm sha256:9f51f2e2c5ab728e96490d794bff7b83a147d6d3d61333c5b60b2cff662049cd bash -lc python3\ /tmp/bench_hw_e2m1x2_quant.py\ --out\ /out/bench-r1-boot1.json
+end_utc: 2026-11-09T08:06:18Z
+loadavg_after: 2.93 3.44 3.02
+exit_code: 0
+output: bench-r1-boot1.txt
+
+### graph-r1-boot1
+host: spark-0016 (sp8)
+image: sha256:9f51f2e2c5ab728e96490d794bff7b83a147d6d3d61333c5b60b2cff662049cd (spark-ds41f:candidate-49)
+start_utc: 2026-11-09T08:06:18Z
+loadavg_before: 2.93 3.44 3.02
+docker_ps_before: none
+command: flock /tmp/spark-lab-gpu.lock docker run --rm --gpus all --ipc=host --name rw991-graph-b1 --entrypoint '' -v /usr/local/cuda-13.0/bin/nvdisasm:/usr/local/bin/nvdisasm:ro -v /home/chris/spark-lab/agents/candidate-49-rework-991/variants/r1/gemm.py:/opt/spark-ds41f/candidate/vllm/vllm/models/deepseek_v4_1/tilelang/gemm.py:ro -v /home/chris/spark-lab/agents/candidate-49-rework-991/variants/r1/test_deepseek_v41_tilelang_linear.py:/opt/spark-ds41f/candidate/vllm/tests/kernels/quantization/test_deepseek_v41_tilelang_linear.py:ro -v /home/chris/spark-lab/agents/candidate-49-own-marks/src/pr-991/experiments/2026-11-08-hw-e2m1x2-indexer-gemm-quant/bench_hw_e2m1x2_quant.py:/tmp/bench_hw_e2m1x2_quant.py:ro -v /home/chris/spark-lab/agents/candidate-49-rework-991/scratch/bench_graph_companion.py:/tmp/bench_graph_companion.py:ro -v /home/chris/spark-lab/agents/candidate-49-rework-991/out/json:/out -w /opt/spark-ds41f/candidate/vllm sha256:9f51f2e2c5ab728e96490d794bff7b83a147d6d3d61333c5b60b2cff662049cd bash -lc python3\ /tmp/bench_graph_companion.py\ --out\ /out/graph-r1-boot1.json
+end_utc: 2026-11-09T08:10:04Z
+loadavg_after: 2.62 2.95 2.91
+exit_code: 0
+output: graph-r1-boot1.txt
+
+### cupti-r1-boot1
+host: spark-0016 (sp8)
+image: sha256:9f51f2e2c5ab728e96490d794bff7b83a147d6d3d61333c5b60b2cff662049cd (spark-ds41f:candidate-49)
+start_utc: 2026-11-09T08:10:04Z
+loadavg_before: 2.62 2.95 2.91
+docker_ps_before: none
+command: flock /tmp/spark-lab-gpu.lock docker run --rm --gpus all --ipc=host --name rw991-cupti-b1 --entrypoint '' -v /usr/local/cuda-13.0/bin/nvdisasm:/usr/local/bin/nvdisasm:ro -v /home/chris/spark-lab/agents/candidate-49-rework-991/variants/r1/gemm.py:/opt/spark-ds41f/candidate/vllm/vllm/models/deepseek_v4_1/tilelang/gemm.py:ro -v /home/chris/spark-lab/agents/candidate-49-rework-991/variants/r1/test_deepseek_v41_tilelang_linear.py:/opt/spark-ds41f/candidate/vllm/tests/kernels/quantization/test_deepseek_v41_tilelang_linear.py:ro -v /home/chris/spark-lab/agents/candidate-49-own-marks/src/pr-991/experiments/2026-11-08-hw-e2m1x2-indexer-gemm-quant/bench_hw_e2m1x2_quant.py:/tmp/bench_hw_e2m1x2_quant.py:ro -v /home/chris/spark-lab/agents/candidate-49-rework-991/scratch/diag_variants.py:/tmp/diag_variants.py:ro -v /home/chris/spark-lab/agents/candidate-49-rework-991/scratch/diag_cupti.py:/tmp/diag_cupti.py:ro -v /home/chris/spark-lab/agents/candidate-49-rework-991/out/json:/out -w /opt/spark-ds41f/candidate/vllm sha256:9f51f2e2c5ab728e96490d794bff7b83a147d6d3d61333c5b60b2cff662049cd bash -lc python3\ /tmp/diag_cupti.py\ --out\ /out/cupti-r1-boot1.json
+end_utc: 2026-11-09T08:12:31Z
+loadavg_after: 2.27 2.78 2.86
+exit_code: 0
+output: cupti-r1-boot1.txt
+
+### pytest-r1-boot2
+host: spark-0016 (sp8)
+image: sha256:9f51f2e2c5ab728e96490d794bff7b83a147d6d3d61333c5b60b2cff662049cd (spark-ds41f:candidate-49)
+start_utc: 2026-11-09T08:12:32Z
+loadavg_before: 2.27 2.78 2.86
+docker_ps_before: none
+command: flock /tmp/spark-lab-gpu.lock docker run --rm --gpus all --ipc=host --name rw991-pyt-b2 --entrypoint pytest -v /usr/local/cuda-13.0/bin/nvdisasm:/usr/local/bin/nvdisasm:ro -v /home/chris/spark-lab/agents/candidate-49-rework-991/variants/r1/gemm.py:/opt/spark-ds41f/candidate/vllm/vllm/models/deepseek_v4_1/tilelang/gemm.py:ro -v /home/chris/spark-lab/agents/candidate-49-rework-991/variants/r1/test_deepseek_v41_tilelang_linear.py:/opt/spark-ds41f/candidate/vllm/tests/kernels/quantization/test_deepseek_v41_tilelang_linear.py:ro -w /opt/spark-ds41f/candidate/vllm sha256:9f51f2e2c5ab728e96490d794bff7b83a147d6d3d61333c5b60b2cff662049cd --noconftest -o addopts= -o cache_dir=/tmp/pytest_cache -v -k test_lsa\ or\ test_block_scale_words\ or\ test_mxfp8_gemm_rope_mxfp4_decode_matches_reference\ or\ test_hw_e2m1x2_codegen_in_gemm_and_indexer_quantizers\ or\ test_mxfp4_quantize\ or\ test_write_index_keys\ or\ test_norm_rope_write_index_keys\ or\ test_indexer_dense\ or\ test_indexer_candidates tests/models/test_deepseek_v4_1_lsa.py tests/kernels/quantization/test_deepseek_v41_block_scale_words.py tests/kernels/quantization/test_deepseek_v41_tilelang_linear.py tests/kernels/attention/test_deepseek_v41_tilelang.py
+end_utc: 2026-11-09T08:15:35Z
+loadavg_after: 2.97 2.89 2.89
+exit_code: 0
+output: pytest-r1-boot2.txt
+
+### bench-r1-boot2
+host: spark-0016 (sp8)
+image: sha256:9f51f2e2c5ab728e96490d794bff7b83a147d6d3d61333c5b60b2cff662049cd (spark-ds41f:candidate-49)
+start_utc: 2026-11-09T08:15:35Z
+loadavg_before: 2.97 2.89 2.89
+docker_ps_before: none
+command: flock /tmp/spark-lab-gpu.lock docker run --rm --gpus all --ipc=host --name rw991-bench-b2 --entrypoint '' -v /usr/local/cuda-13.0/bin/nvdisasm:/usr/local/bin/nvdisasm:ro -v /home/chris/spark-lab/agents/candidate-49-rework-991/variants/r1/gemm.py:/opt/spark-ds41f/candidate/vllm/vllm/models/deepseek_v4_1/tilelang/gemm.py:ro -v /home/chris/spark-lab/agents/candidate-49-rework-991/variants/r1/test_deepseek_v41_tilelang_linear.py:/opt/spark-ds41f/candidate/vllm/tests/kernels/quantization/test_deepseek_v41_tilelang_linear.py:ro -v /home/chris/spark-lab/agents/candidate-49-own-marks/src/pr-991/experiments/2026-11-08-hw-e2m1x2-indexer-gemm-quant/bench_hw_e2m1x2_quant.py:/tmp/bench_hw_e2m1x2_quant.py:ro -v /home/chris/spark-lab/agents/candidate-49-rework-991/out/json:/out -w /opt/spark-ds41f/candidate/vllm sha256:9f51f2e2c5ab728e96490d794bff7b83a147d6d3d61333c5b60b2cff662049cd bash -lc python3\ /tmp/bench_hw_e2m1x2_quant.py\ --out\ /out/bench-r1-boot2.json
+end_utc: 2026-11-09T08:22:54Z
+loadavg_after: 5.31 4.55 3.62
+exit_code: 0
+output: bench-r1-boot2.txt
+
+### graph-r1-boot2
+host: spark-0016 (sp8)
+image: sha256:9f51f2e2c5ab728e96490d794bff7b83a147d6d3d61333c5b60b2cff662049cd (spark-ds41f:candidate-49)
+start_utc: 2026-11-09T08:22:55Z
+loadavg_before: 5.31 4.55 3.62
+docker_ps_before: spark-ds41f:1107 silly_spence;
+command: flock /tmp/spark-lab-gpu.lock docker run --rm --gpus all --ipc=host --name rw991-graph-b2 --entrypoint '' -v /usr/local/cuda-13.0/bin/nvdisasm:/usr/local/bin/nvdisasm:ro -v /home/chris/spark-lab/agents/candidate-49-rework-991/variants/r1/gemm.py:/opt/spark-ds41f/candidate/vllm/vllm/models/deepseek_v4_1/tilelang/gemm.py:ro -v /home/chris/spark-lab/agents/candidate-49-rework-991/variants/r1/test_deepseek_v41_tilelang_linear.py:/opt/spark-ds41f/candidate/vllm/tests/kernels/quantization/test_deepseek_v41_tilelang_linear.py:ro -v /home/chris/spark-lab/agents/candidate-49-own-marks/src/pr-991/experiments/2026-11-08-hw-e2m1x2-indexer-gemm-quant/bench_hw_e2m1x2_quant.py:/tmp/bench_hw_e2m1x2_quant.py:ro -v /home/chris/spark-lab/agents/candidate-49-rework-991/scratch/bench_graph_companion.py:/tmp/bench_graph_companion.py:ro -v /home/chris/spark-lab/agents/candidate-49-rework-991/out/json:/out -w /opt/spark-ds41f/candidate/vllm sha256:9f51f2e2c5ab728e96490d794bff7b83a147d6d3d61333c5b60b2cff662049cd bash -lc python3\ /tmp/bench_graph_companion.py\ --out\ /out/graph-r1-boot2.json
+end_utc: 2026-11-09T08:28:35Z
+loadavg_after: 2.42 3.01 3.20
+exit_code: 0
+output: graph-r1-boot2.txt
+
+### cupti-r1-boot2
+host: spark-0016 (sp8)
+image: sha256:9f51f2e2c5ab728e96490d794bff7b83a147d6d3d61333c5b60b2cff662049cd (spark-ds41f:candidate-49)
+start_utc: 2026-11-09T08:28:35Z
+loadavg_before: 2.42 3.01 3.20
+docker_ps_before: none
+command: flock /tmp/spark-lab-gpu.lock docker run --rm --gpus all --ipc=host --name rw991-cupti-b2 --entrypoint '' -v /usr/local/cuda-13.0/bin/nvdisasm:/usr/local/bin/nvdisasm:ro -v /home/chris/spark-lab/agents/candidate-49-rework-991/variants/r1/gemm.py:/opt/spark-ds41f/candidate/vllm/vllm/models/deepseek_v4_1/tilelang/gemm.py:ro -v /home/chris/spark-lab/agents/candidate-49-rework-991/variants/r1/test_deepseek_v41_tilelang_linear.py:/opt/spark-ds41f/candidate/vllm/tests/kernels/quantization/test_deepseek_v41_tilelang_linear.py:ro -v /home/chris/spark-lab/agents/candidate-49-own-marks/src/pr-991/experiments/2026-11-08-hw-e2m1x2-indexer-gemm-quant/bench_hw_e2m1x2_quant.py:/tmp/bench_hw_e2m1x2_quant.py:ro -v /home/chris/spark-lab/agents/candidate-49-rework-991/scratch/diag_variants.py:/tmp/diag_variants.py:ro -v /home/chris/spark-lab/agents/candidate-49-rework-991/scratch/diag_cupti.py:/tmp/diag_cupti.py:ro -v /home/chris/spark-lab/agents/candidate-49-rework-991/out/json:/out -w /opt/spark-ds41f/candidate/vllm sha256:9f51f2e2c5ab728e96490d794bff7b83a147d6d3d61333c5b60b2cff662049cd bash -lc python3\ /tmp/diag_cupti.py\ --out\ /out/cupti-r1-boot2.json
+end_utc: 2026-11-09T08:32:42Z
+loadavg_after: 3.05 3.01 3.15
+exit_code: 0
+output: cupti-r1-boot2.txt
+
+### bench-r1-boot3
+host: spark-0016 (sp8)
+image: sha256:9f51f2e2c5ab728e96490d794bff7b83a147d6d3d61333c5b60b2cff662049cd (spark-ds41f:candidate-49)
+start_utc: 2026-11-09T08:36:33Z
+loadavg_before: 3.76 3.41 3.28
+docker_ps_before: 9f51f2e2c5ab c49rw999-r1-bench2boot-boot4;
+command: flock /tmp/spark-lab-gpu.lock bash -c for\ i\ in\ \$\(seq\ 120\)\;\ do\ \[\ -z\ \"\$\(docker\ ps\ -q\)\"\ \]\ \&\&\ break\;\ sleep\ 5\;\ done\;\ echo\ containers_at_start:\ \$\(docker\ ps\ --format\ \{\{.Names\}\}\)\;\ \(\ while\ sleep\ 3\;\ do\ echo\ \"\$\(date\ -u\ +%FT%TZ\)\ \$\(docker\ ps\ --format\ \{\{.Names\}\}\ \|\ tr\ \"\\n\"\ \"\ \"\)\"\;\ done\ \)\ \>\ /home/chris/spark-lab/agents/candidate-49-rework-991/out/bench-r1-boot3-neighbors.log\ \&\ m=\$\!\;\ docker\ run\ --rm\ --gpus\ all\ --ipc=host\ --name\ rw991-bench-b3\ --entrypoint\ \"\"\ -v\ /usr/local/cuda-13.0/bin/nvdisasm:/usr/local/bin/nvdisasm:ro\ -v\ /home/chris/spark-lab/agents/candidate-49-rework-991/variants/r1/gemm.py:/opt/spark-ds41f/candidate/vllm/vllm/models/deepseek_v4_1/tilelang/gemm.py:ro\ -v\ /home/chris/spark-lab/agents/candidate-49-rework-991/variants/r1/test_deepseek_v41_tilelang_linear.py:/opt/spark-ds41f/candidate/vllm/tests/kernels/quantization/test_deepseek_v41_tilelang_linear.py:ro\ -v\ /home/chris/spark-lab/agents/candidate-49-own-marks/src/pr-991/experiments/2026-11-08-hw-e2m1x2-indexer-gemm-quant/bench_hw_e2m1x2_quant.py:/tmp/bench_hw_e2m1x2_quant.py:ro\ -v\ /home/chris/spark-lab/agents/candidate-49-rework-991/out/json:/out\ -w\ /opt/spark-ds41f/candidate/vllm\ sha256:9f51f2e2c5ab728e96490d794bff7b83a147d6d3d61333c5b60b2cff662049cd\ bash\ -lc\ \"python3\ /tmp/bench_hw_e2m1x2_quant.py\ --out\ /out/bench-r1-boot3.json\"\;\ rc=\$\?\;\ kill\ \$m\;\ exit\ \$rc
+end_utc: 2026-11-09T08:39:10Z
+loadavg_after: 3.13 3.27 3.25
+exit_code: 0
+output: bench-r1-boot3.txt
+
