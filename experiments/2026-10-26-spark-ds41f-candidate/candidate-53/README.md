@@ -103,16 +103,17 @@ Each testbed opens its window with `scripts/lab.py`, after the hold and idle gua
 2. [candidate-tp3-switched.json](candidate-tp3-switched.json) (`candidate-53-tp3-switched`): the determinism gate
    at `tp3-switched`, first ([step 5](../../../docs/release-benchmark.md#5-gate-first)).
 3. [screen-tp3-switched.json](screen-tp3-switched.json) (`candidate-53-screen-tp3-switched`): the `screen-tp3`
-   suite on `candidate-53` and `candidate-53-again`, with startup memory ([step 6](../../../docs/release-benchmark.md#6-screen)).
-   - **Reference:** candidate-50's screen at `tp3-switched`, the accumulated base, recorded at
-     `experiments/2026-10-26-spark-ds41f-candidate/candidate-50/receipts/references/candidate-50-no1009-tp3-switched-screen`.
-   - **The reference is pending.** candidate-50's screens are running, and the coordinator commits the record.
-     Until it is there, the lab's dry run reports the reference as missing.
-   - **Steps the screen lacks.** Three marks below name rows `screen-tp3` does not have: #971's paired decode at
-     1 stream (`single-stream`), the sampled realizations #971 and #977 may change (`sampled`), and #984's
-     short-request TTFT during a long prefill (`release`). The spec runs the screen alone: candidate-50's screens
-     record no companion, so these companions have no reference at the accumulated base. Until one is recorded,
-     those rows come from the PRs' own benches (below).
+   suite plus the companions this round's marks need, on `candidate-53` and `candidate-53-again`, with startup
+   memory ([step 6](../../../docs/release-benchmark.md#6-screen)):
+   - `single-stream` for #971's paired decode at 1 stream;
+   - `sampled` for the sampled realizations #971 and #977 may change;
+   - `release-tp3` for #984's short-request TTFT during a long prefill (the stall rows).
+   - **Reference:** candidate-50's runs at `tp3-switched`, the accumulated base. They are recorded at
+     `experiments/2026-10-26-spark-ds41f-candidate/candidate-50/receipts/references/candidate-50-no1009-tp3-switched-screen`,
+     with the companions beside it as `-single-stream`, `-sampled` and `-release-tp3`.
+     candidate-50's [screen-tp3-switched.json](../candidate-50/screen-tp3-switched.json) and
+     [companions-tp3-switched.json](../candidate-50/companions-tp3-switched.json) record them.
+   - **The references are pending** until the coordinator commits them; until then the lab's dry run reports them missing.
 4. **Own marks** on sp8 (below), two boots each, ABBA against the base.
 
 ## Marks
