@@ -2,8 +2,8 @@
 
 - **Date**: 2026-11-08
 - **Base deployment commit**: `cc20ed18b6ca6521b602f09cb3ba326774166d1c` (Candidate `1107`, `experiments/2026-10-26-spark-ds41f-candidate/1107`)
-- **Base vLLM commit**: `320021e3c4dbb202d911ab70e2cd924c75420488` (tree `ed1bdb7a7684da33d403a055521ac0c4dd7ca670`, `0001..0761`)
-- **Candidate vLLM commit**: `61354efd180ca3f3152e63882f2fca1c958954a9` (tree `962ad153cc8bbd014239fe481577eb4501c8d8b1`, `0001..0762`, `patchset_sha256` `f3f9016e678d5971517bde650d0ee2ce46f75c84744712fc455ee8c8d5de0807`)
+- **Base vLLM commit**: `2756478b60b90700b9918b457aeb38657da637b5` (tree `ed1bdb7a7684da33d403a055521ac0c4dd7ca670`, `0001..0761`)
+- **Candidate vLLM commit**: `83cd04f10ae78736fed434b0a96cc5c071027b75` (tree `b6defe690f8b869d0ca7eec94d519e00db13c24b`, `0001..0762`, `patchset_sha256` `3eae42127ec986bb100fd3dc0efc78797a4f3d4e6781095a2f974c15183f508c`)
 - **Intended causal variable**: Eliminate per-step TP collective broadcasts in `AdaptiveVerificationManager.record_confidences` across all speculative drafters (`DSparkSpeculator`, `DraftModelSpeculator`, `DFlashSpeculator`) and lockstep tensor-parallel sampling RNG seeds (`0762-perf-spec-decode-elide-tp-confidence-broadcast-and-lock-sampling-seeds.patch`, `TODO.md` Decode #7).
 
 ## 1. Technical Audit & Motivation
@@ -168,3 +168,8 @@ Each 1,000-step run simulates an 8-request batch (`num_speculative_steps = 5`, `
 - **Memory**: Replaces 2 transient GPU tensor allocations (`local_max`, `local_expsum`) per draft step in `OnlineAcceptanceEstimator.predict()` with a single reusable `(2, max_num_reqs, num_splits)` `float32` scratch tensor (`2 x 8 x 127 x 4 B = 8,128 B` at `max_num_seqs=8`), eliminating `10` allocator calls per 5-step decode iteration.
 - **Cross-rank determinism**: Fixes a latent multi-rank verification budget hang under `temperature > 0` speculative decoding where unseeded requests drew divergent `SamplingStates` seeds from process-global `np.random`, causing `AdaptiveVerificationManager` to pick different `draft_budget` (`choose_k`) and `total_tokens` across TP ranks on `26.3%` of steps (`263/1000`) on TP3 and `23.9%` (`239/1000`) on TP4. With `SamplingStates._seed_rng` and `Sampler._tp_lockstep_sampling()`, all TP ranks produce `0/1000` mismatches (`max_abs_diff = 0.0`) across draft tokens, confidence probabilities, online IRLS estimator parameters, rejection-sampled tokens, and verification budgets across both greedy and `temperature > 0` workloads on TP3 and TP4.
 - **Per-step latency**: Eliding the per-step `record_confidences` broadcast saves **`16.8–17.8 µs/step` median (`31.9–36.0 µs/step` mean, `-31%` to `-35%` median / `-45%` to `-50%` mean)** vs `torch.distributed.broadcast` and **`33.2–34.8 µs/step` median (`-46%` to `-52%`)** vs `roce_oneshot_broadcast` across `128 B`, `160 B`, and `320 B` buffers on TP3 and TP4, while `OnlineAcceptanceEstimator.predict_from_stats` saves an additional **`11.4–11.6 µs` per draft step (`-38.5%`, `-57 µs` per 5-step decode)**. Ready for review.
+
+## Rework Update (Pure Win Without Downsides)
+
+- Seeded `SamplingStates._seed_rng` from `ModelConfig.seed` (forwarded via `Sampler(seed=...)`, defaulting to `0`) so `--seed` controls unseeded request streams identically across TP ranks.
+- Removed the dead `callable()` broadcast-elision hunk in `adaptive_verification.py` (`1107` already elides the broadcast via `tp_invariant_confidence`).
