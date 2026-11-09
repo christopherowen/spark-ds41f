@@ -190,6 +190,12 @@ once, on the release candidate, when the owner calls a release.
 
 ## Status
 
-Built (`spark-ds41f:candidate-50`), and its release tests passed. At `tp4-ring` the full candidate does not
-boot (#1009). Without #1009, the gate passes: greedy outputs are identical and match TP4's hashes.
-The screens and live checks are running.
+Built (`spark-ds41f:candidate-50`, image ID `8c1ea1f6`); its release tests passed on dgx4. The full candidate does not boot at `tp4-ring` (#1009, in rework). Results without #1009 are in [receipts/tp4-ring](receipts/tp4-ring/README.md):
+
+| Testbed | Gate | Screen against 1107 | Live checks |
+| --- | --- | --- | --- |
+| `tp4-ring` | identical outputs (TP4 hashes) | faster on every core metric: grid 0.8%, c16 decode 1.45%, prefill 2% at 32K and 6% at 256K; greedy identical | #955, #1013 and #972 pass |
+| `tp4-switched` | pending | pending | |
+| `tp3-switched` | pending | pending | |
+
+The screen references the next round uses are in [receipts/references](receipts/references). Their greedy corpora (`model.json.gz`, 7.4 MB each) stay on dgx1, listed with their SHA-256 in `large-files-on-nodes.tsv`, as 1107's promoted suite references omit them.
