@@ -1,0 +1,68 @@
+{
+  "pr": 996,
+  "pr_head": "86d4a427f46c6fed959d7d9074723fb9d4dc9db4",
+  "mark": "Its route_local bench: gain beyond the interval, bit-exact",
+  "host": "sp8 (spark-0016, NVIDIA GB10)",
+  "images": {
+    "candidate-49": "sha256:9f51f2e2c5ab728e96490d794bff7b83a147d6d3d61333c5b60b2cff662049cd",
+    "1107": "sha256:3f32a962ce04b7c8d85337cd427a8946b8b6bcaadd97cc8d8a8cd14e8d68a6ce"
+  },
+  "evidence": "README 'Exact Commands': its pytest (test_deepseek_v4_1_sp_prefill.py, test_deepseek_v41_tilelang_router.py) on the candidate image, two boots, patched-file mounts dropped because the image carries 0767. The README's bench, python3 /tmp/bench_sp_moe.py, is not in the PR (it lived in sp5's /tmp), so the route_local mark is measured with our harness bench_996_route_local.py: the image's own TileLangGateRouter.route_local, called as one SP rank calls it on the 20 encoder layers of a prefill step (fake forward context with is_padding and input_ids, as the PR's padded_step test fixture does), run unchanged on the candidate image and on 1107, two boots each, output hashes compared across images. Supplementary (ours): the same calls under torch.inference_mode, which is how the vLLM worker runs the model (gpu_model_runner's @torch.inference_mode)",
+  "measured": {
+    "pytest_candidate-49": {
+      "boot1": "265 passed, 14 warnings in 48.27s",
+      "boot2": "265 passed, 14 warnings in 47.93s"
+    },
+    "route_local_tail_rank_cached_calls_us_1107_boots_to_candidate49_boots": {
+      "TP3_T1024_rank2": "57.136/60.224 -> 47.52/47.104 (1.240x)",
+      "TP3_T2048_rank2": "87.968/91.328 -> 80.976/80.832 (1.108x)",
+      "TP3_T4096_rank2": "125.761/123.504 -> 117.056/115.904 (1.070x)",
+      "TP3_T8192_rank2": "231.041/230.624 -> 228.785/226.048 (1.015x)",
+      "TP3_T16384_rank2": "442.05/440.016 -> 431.202/430.8 (1.023x)"
+    },
+    "route_local_tail_rank_20_layer_pass_us_per_layer": {
+      "TP3_T1024_rank2": "52.959/53.906 -> 37.055/37.131",
+      "TP3_T2048_rank2": "78.538/83.602 -> 69.973/70.276",
+      "TP3_T4096_rank2": "114.688/112.601 -> 106.432/105.494",
+      "TP3_T8192_rank2": "220.497/221.465 -> 218.652/215.601",
+      "TP3_T16384_rank2": "433.231/430.897 -> 420.942/421.231"
+    },
+    "tail_rank_cells": "5 of 5 TP3 tail-rank cells faster beyond the two-boot interval, on per-call and on 20-layer-pass timing",
+    "non_tail_ranks": "23 cells without a padded tail: mostly within the interval; 4 per-call cells are 0.2-1.8% slower beyond it (e.g. TP3 T2048 rank0 79.056/80.144 -> 80.641/81.52 us), i.e. the cache lookup costs about 1 us where there is nothing to save",
+    "tp4": "every TP4 cell (T = 768..16384, all multiples of 4) has real_rows == local_rows, so TP4 has no tail rank on this grid; the PR's TP4 tail-rank gains (e.g. 46.91 -> 26.37 us at T=1024) cannot come from tail-mask caching and are not reproduced (TP4 T1024 rank3: 39.552/37.456 -> 39.633/39.136 us)",
+    "bit_exactness": "real-row weights (as int32) and expert ids hash identically on 1107 and candidate-49 in all 28 (TP, T, rank) cells, on both boots, at layers 1 and 20 of every step; tail pad rows route to id -1 on both images in these cells (local_rows > 256)",
+    "inference_mode": {
+      "candidate-49_boot1": "5 of 5 cases raise RuntimeError: Inference tensors do not track version counter. (router.py line 203, cache[key] = (mask, mask._version, local)), reached from _routing_masks line 266 (TP3 T1024 rank0 and rank2, TP3 T6144 rank0) and from _partials_mask line 285 (TP3 T205 rank2, TP4 T1024 rank3)",
+      "candidate-49_boot2": "the same 5 of 5 cases raise the same RuntimeError at the same lines",
+      "1107_boot1": "5 of 5 cases return; the 4 that have a no_grad cell (all but TP3 T205) hash as in the no_grad bench",
+      "1107_boot2": "5 of 5 cases return, same hashes as boot1"
+    },
+    "interval": "two container boots per image; each cell is the median over 10 measured steps x 19 cached layer calls (per-call, synced) or over 10 measured 20-layer passes; a gain is beyond the interval when the slower candidate boot beats the faster 1107 boot"
+  },
+  "parts": [
+    {
+      "part": "route_local bench: gain beyond the interval",
+      "verdict": "pass (outside inference mode)",
+      "detail": "TP3 tail rank 1.015x-1.24x faster beyond the interval at T = 1024..16384, matching the PR's TP3 direction and size (PR -30.54% .. -2.95%); no gain on ranks without a tail, and no TP4 tail exists at these T"
+    },
+    {
+      "part": "bit-exact",
+      "verdict": "pass",
+      "detail": "real rows identical to 1107 in every cell"
+    },
+    {
+      "part": "works as the worker calls it",
+      "verdict": "fail",
+      "detail": "under torch.inference_mode the patched _local_mask reads mask._version of an inference tensor and raises on every SP route_local call tried, tail rank or not; 1107 runs the same calls"
+    }
+  ],
+  "verdict": "miss",
+  "reason": "The tail-mask cache gives its small TP3 tail-rank gain and stays bit-exact, but only outside inference mode. Under torch.inference_mode, as the vLLM worker runs the forward, the patched _local_mask raises RuntimeError on every sequence-parallel route_local call (5 of 5 cases, both boots), where 1107 completes them. A serving engine with SP prefill would fail its first prefill, so the PR cannot deliver its metric and would break the zero-failed-requests core metric. Fix to try in the rework: do not read _version of an inference tensor (for example key the cache on the mask's identity within the step only, or check mask.is_inference() first).",
+  "notes": [
+    "commands.txt start_utc is when the command was issued and includes any wait on /tmp/spark-lab-gpu.lock",
+    "The inference-mode failure matches a comment on PR #996 (2026-11-09T02:38Z) reporting this traceback at tp3-triangle in candidate-49's stack; our check reproduces it on one GPU independently of topology",
+    "Our harness uses plain scratch allocation and a stand-in forward context, as the PR's own tests do; it does not run the gather_mxfp8 collective",
+    "analysis.json is derived from json/ by a_other.py",
+    "The pytest count is 265 rather than the PR's 262 because #979 adds three tests to test_deepseek_v4_1_sp_prefill.py; the PR's two new router tests (route_local tail masks, cached tail-rank masks) pass on both boots, but none of its tests runs under torch.inference_mode"
+  ]
+}

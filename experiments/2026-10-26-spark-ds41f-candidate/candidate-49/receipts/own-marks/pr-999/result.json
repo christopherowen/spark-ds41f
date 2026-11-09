@@ -1,0 +1,92 @@
+{
+  "pr": 999,
+  "pr_head": "5f50df40e090c95cc96a445c27c1b1f624a6e7f6",
+  "mark": "Its indexer top-k bench on the image: gain beyond the interval, bit-exact; long prefill not worse",
+  "host": "sp8 (spark-0016, NVIDIA GB10)",
+  "images": {
+    "candidate-49": "sha256:9f51f2e2c5ab728e96490d794bff7b83a147d6d3d61333c5b60b2cff662049cd",
+    "1107": "sha256:3f32a962ce04b7c8d85337cd427a8946b8b6bcaadd97cc8d8a8cd14e8d68a6ce"
+  },
+  "evidence": "README section 3 on the candidate image, two boots: pytest --noconftest -q on test_deepseek_v41_tilelang.py, test_deepseek_v4_1_lsa.py, test_deepseek_v4_1_attention.py, then deepseek_v41_indexer_reads.py; and bench_2boot.py (verify_exactness, then the paired base/cand latency grid). The bench's baseline module is 1107's indexer.py mounted at /tmp_host/indexer_baseline.py. Verbatim, it cannot import on the candidate image (the image's gemm.py no longer exports _e2m1_code after #991), so the scored runs use 1107's indexer.py with 1107 gemm.py's _e2m1_code inlined (indexer_baseline_1107.diff). That function feeds only 1107's quantizer kernels, which the bench does not call; the IndexerTopK code under test is 1107's, unchanged. The same command on the 1107 image was also run, twice",
+  "measured": {
+    "pytest_candidate-49": {
+      "boot1": "139 passed, 1 skipped, 1 xfailed in 328.89s; indexer reads: scored 4 cases",
+      "boot2": "139 passed, 1 skipped, 1 xfailed in 330.51s; indexer reads: scored 4 cases"
+    },
+    "bit_exactness_verify_exactness": {
+      "boot1": "PASS",
+      "boot2": "PASS"
+    },
+    "selection_cells": "210 (base,cand) pairs over N=64K..1M x M=1..1024 plus the 16K reindex row; 209 are faster beyond the two-boot interval, 1 is slower beyond it",
+    "speedup_of_two_boot_means_by_selector": {
+      "reindex_16k_k512_candidates": [
+        1.485,
+        1.878
+      ],
+      "dense_524k_k512": [
+        1.319,
+        1.811
+      ],
+      "layer20_select_blocks_k2048_g8": [
+        1.319,
+        1.893
+      ],
+      "layer20_select_k512_gather": [
+        1.475,
+        48.705
+      ],
+      "layer20_total_selection": [
+        1.46,
+        3.961
+      ],
+      "standalone_1m_k2048_g1": [
+        1.548,
+        4.021
+      ],
+      "standalone_1m_k512_g1": [
+        0.963,
+        1.796
+      ]
+    },
+    "headline_cells_us_base_boots_to_cand_boots": {
+      "reindex_16k_M1": "24.21/24.01 -> 13.70/13.75 (1.757x; PR 22.8 -> 13.6)",
+      "reindex_16k_M1024": "343.35/343.12 -> 225.35/236.79 (1.485x; PR 341.2 -> 249.3)",
+      "layer20_total_N1M_M16": "547.63/551.63 -> 188.18/182.10 (2.969x; PR 563.5 -> 195.0)",
+      "layer20_total_N1M_M256": "9070.66/9116.48 -> 2733.21/2772.43 (3.303x; PR 9277.6 -> 2742.8)",
+      "layer20_total_N1M_M1024": "36275.53/35961.33 -> 10873.04/10905.37 (3.317x; PR 36819.7 -> 10815.5)",
+      "dense_524k_N524K_M256": "2634.63/2633.20 -> 1584.08/1590.21 (1.660x; PR 2680.1 -> 1608.4)",
+      "dense_524k_N524K_M1024": "10407.02/10373.96 -> 6189.05/6204.80 (1.677x; PR 10459.8 -> 6306.5)",
+      "standalone_1m_k2048_N1M_M256": "15689.15/15603.19 -> 4645.93/4689.50 (3.352x; PR 15823.0 -> 4789.3)"
+    },
+    "worse_cell": "standalone IndexerTopK(1048576, 512, 1) at N=524288, M=1: 38.92/39.17 -> 40.51/40.59 us (0.963x). The PR's tables do not report this selector; at N=1M M=1 and every M>=6 it is faster",
+    "same_command_on_1107": "exit 1 on both boots inside verify_exactness: 1107's IndexerTopK has no gather_scores path, so cand_plan.select.run(..., gather=...) fails with 'indexer_topk_segment.Active is expected to have non-NULL pointer'. No A/A floor comes from it",
+    "readme_command_verbatim": "exit 1: ImportError cannot import name '_e2m1_code' from the candidate image's tilelang/gemm.py",
+    "interval": "two candidate-image boots per arm, each arm a trimmed mean of 25 timed calls; a gain is beyond the interval when the slower candidate boot is faster than the faster baseline boot"
+  },
+  "parts": [
+    {
+      "part": "indexer top-k bench: gain beyond the interval",
+      "verdict": "pass",
+      "detail": "209 of 210 cells faster beyond the two-boot interval, magnitudes within a few percent of the PR's sp7 tables; one standalone selector cell not on the Layer 20 path is 4% slower at N=512K M=1"
+    },
+    {
+      "part": "bit-exact",
+      "verdict": "pass",
+      "detail": "verify_exactness PASS on both boots (indices, values and counts torch.equal against 1107's IndexerTopK, plus Layer 20 gather_scores against the full-width select)"
+    },
+    {
+      "part": "long prefill not worse",
+      "verdict": "cannot-evaluate-on-sp8",
+      "detail": "a suite metric of the tp3-switched cluster run, not of a single-GPU bench"
+    }
+  ],
+  "verdict": "pass",
+  "verdict_scope": "sp8-evaluable parts only; long prefill is cannot-evaluate-on-sp8",
+  "reason": "On the integrated image the PR's own bench reproduces its top-k gains against 1107's selector, beyond the two-boot interval in 209 of 210 cells, with exact outputs, and its test suite passes on both boots. Running it needed a one-line import shim because #991 removed the 1107 helper the baseline file imports.",
+  "notes": [
+    "commands.txt start_utc is when the command was issued and includes any wait on /tmp/spark-lab-gpu.lock",
+    "The pytest count differs from the PR's 132 because the candidate's test files also carry #993's and #991's tests",
+    "bench-analysis.json is derived from the two candidate bench JSONs (json/) by a999.py",
+    "The 1 skipped test in test_deepseek_v41_tilelang.py is, by #993's -v run of the same file on the same image, test_indexer_reads_only_visible_rows (no compute-sanitizer in the image); with the host sanitizer mounted it passes on this image (pr-993/sanitizer-candidate49-boot*.txt)"
+  ]
+}

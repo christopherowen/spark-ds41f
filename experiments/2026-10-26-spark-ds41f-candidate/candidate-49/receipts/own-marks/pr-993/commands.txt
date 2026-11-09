@@ -1,0 +1,102 @@
+# Commands run on sp8 for this PR's own-mark check, one block per run, in issue order.
+# start_utc is when the command was issued; it includes any wait on /tmp/spark-lab-gpu.lock.
+# end_utc, exit_code and the output file come from the same run.sh invocation (run.sh in this folder).
+# Batch scripts: pr-993.sh, then pr-993-sanitizer.sh (env.sh sets B, C = candidate-49 image ID, R = 1107 image ID, L = lock, V = vLLM root).
+# bench_993_score.py is our harness (the PR ships no bench script); its baseline is 1107 indexer.py with the _e2m1_code shim (indexer_baseline_1107.diff).
+
+### pytest-candidate49-boot1
+host: spark-0016 (sp8)
+image: sha256:9f51f2e2c5ab728e96490d794bff7b83a147d6d3d61333c5b60b2cff662049cd (spark-ds41f:candidate-49)
+start_utc: 2026-11-09T05:42:25Z
+loadavg_before: 4.14 2.91 2.71
+docker_ps_before: none
+command: flock /tmp/spark-lab-gpu.lock docker run --rm --gpus all --ipc=host --name c49om-993-pyt-b1 --entrypoint '' -w /opt/spark-ds41f/candidate/vllm sha256:9f51f2e2c5ab728e96490d794bff7b83a147d6d3d61333c5b60b2cff662049cd bash -lc pytest\ --noconftest\ -v\ tests/kernels/attention/test_deepseek_v41_tilelang.py\ tests/models/test_deepseek_v4_1_lsa.py
+end_utc: 2026-11-09T06:01:11Z
+loadavg_after: 3.54 2.70 2.58
+exit_code: 0
+output: pytest-candidate49-boot1.txt
+
+### score-candidate49-boot1
+host: spark-0016 (sp8)
+image: sha256:9f51f2e2c5ab728e96490d794bff7b83a147d6d3d61333c5b60b2cff662049cd (spark-ds41f:candidate-49)
+start_utc: 2026-11-09T06:01:11Z
+loadavg_before: 3.54 2.70 2.58
+docker_ps_before: none
+command: flock /tmp/spark-lab-gpu.lock docker run --rm --gpus all --ipc=host --name c49om-993-score-cand-b1 --entrypoint '' -w /opt/spark-ds41f/candidate/vllm -v /home/chris/spark-lab/agents/candidate-49-own-marks/shim/bench_993_score.py:/tmp/bench_993_score.py:ro -v /home/chris/spark-lab/agents/candidate-49-own-marks/shim/indexer_baseline_1107.py:/tmp_host/indexer_baseline.py:ro -v /home/chris/spark-lab/agents/candidate-49-own-marks/out/pr-993/json:/out sha256:9f51f2e2c5ab728e96490d794bff7b83a147d6d3d61333c5b60b2cff662049cd bash -lc python3\ /tmp/bench_993_score.py\ /out/score-candidate49-boot1.json
+end_utc: 2026-11-09T06:02:54Z
+loadavg_after: 3.60 2.97 2.68
+exit_code: 0
+output: score-candidate49-boot1.txt
+
+### score-1107-boot1
+host: spark-0016 (sp8)
+image: sha256:3f32a962ce04b7c8d85337cd427a8946b8b6bcaadd97cc8d8a8cd14e8d68a6ce (spark-ds41f:1107)
+start_utc: 2026-11-09T06:02:54Z
+loadavg_before: 3.60 2.97 2.68
+docker_ps_before: none
+command: flock /tmp/spark-lab-gpu.lock docker run --rm --gpus all --ipc=host --name c49om-993-score-1107-b1 --entrypoint '' -w /opt/spark-ds41f/candidate/vllm -v /home/chris/spark-lab/agents/candidate-49-own-marks/shim/bench_993_score.py:/tmp/bench_993_score.py:ro -v /home/chris/spark-lab/agents/candidate-49-own-marks/shim/indexer_baseline_1107.py:/tmp_host/indexer_baseline.py:ro -v /home/chris/spark-lab/agents/candidate-49-own-marks/out/pr-993/json:/out sha256:3f32a962ce04b7c8d85337cd427a8946b8b6bcaadd97cc8d8a8cd14e8d68a6ce bash -lc python3\ /tmp/bench_993_score.py\ /out/score-1107-boot1.json
+end_utc: 2026-11-09T06:03:59Z
+loadavg_after: 3.57 3.08 2.74
+exit_code: 0
+output: score-1107-boot1.txt
+
+### pytest-candidate49-boot2
+host: spark-0016 (sp8)
+image: sha256:9f51f2e2c5ab728e96490d794bff7b83a147d6d3d61333c5b60b2cff662049cd (spark-ds41f:candidate-49)
+start_utc: 2026-11-09T06:03:59Z
+loadavg_before: 3.57 3.08 2.74
+docker_ps_before: none
+command: flock /tmp/spark-lab-gpu.lock docker run --rm --gpus all --ipc=host --name c49om-993-pyt-b2 --entrypoint '' -w /opt/spark-ds41f/candidate/vllm sha256:9f51f2e2c5ab728e96490d794bff7b83a147d6d3d61333c5b60b2cff662049cd bash -lc pytest\ --noconftest\ -v\ tests/kernels/attention/test_deepseek_v41_tilelang.py\ tests/models/test_deepseek_v4_1_lsa.py
+end_utc: 2026-11-09T06:17:27Z
+loadavg_after: 2.80 2.87 2.87
+exit_code: 0
+output: pytest-candidate49-boot2.txt
+
+### score-candidate49-boot2
+host: spark-0016 (sp8)
+image: sha256:9f51f2e2c5ab728e96490d794bff7b83a147d6d3d61333c5b60b2cff662049cd (spark-ds41f:candidate-49)
+start_utc: 2026-11-09T06:17:27Z
+loadavg_before: 2.80 2.87 2.87
+docker_ps_before: none
+command: flock /tmp/spark-lab-gpu.lock docker run --rm --gpus all --ipc=host --name c49om-993-score-cand-b2 --entrypoint '' -w /opt/spark-ds41f/candidate/vllm -v /home/chris/spark-lab/agents/candidate-49-own-marks/shim/bench_993_score.py:/tmp/bench_993_score.py:ro -v /home/chris/spark-lab/agents/candidate-49-own-marks/shim/indexer_baseline_1107.py:/tmp_host/indexer_baseline.py:ro -v /home/chris/spark-lab/agents/candidate-49-own-marks/out/pr-993/json:/out sha256:9f51f2e2c5ab728e96490d794bff7b83a147d6d3d61333c5b60b2cff662049cd bash -lc python3\ /tmp/bench_993_score.py\ /out/score-candidate49-boot2.json
+end_utc: 2026-11-09T06:57:50Z
+loadavg_after: 2.37 2.39 2.51
+exit_code: 0
+output: score-candidate49-boot2.txt
+
+### score-1107-boot2
+host: spark-0016 (sp8)
+image: sha256:3f32a962ce04b7c8d85337cd427a8946b8b6bcaadd97cc8d8a8cd14e8d68a6ce (spark-ds41f:1107)
+start_utc: 2026-11-09T06:57:50Z
+loadavg_before: 2.37 2.39 2.51
+docker_ps_before: none
+command: flock /tmp/spark-lab-gpu.lock docker run --rm --gpus all --ipc=host --name c49om-993-score-1107-b2 --entrypoint '' -w /opt/spark-ds41f/candidate/vllm -v /home/chris/spark-lab/agents/candidate-49-own-marks/shim/bench_993_score.py:/tmp/bench_993_score.py:ro -v /home/chris/spark-lab/agents/candidate-49-own-marks/shim/indexer_baseline_1107.py:/tmp_host/indexer_baseline.py:ro -v /home/chris/spark-lab/agents/candidate-49-own-marks/out/pr-993/json:/out sha256:3f32a962ce04b7c8d85337cd427a8946b8b6bcaadd97cc8d8a8cd14e8d68a6ce bash -lc python3\ /tmp/bench_993_score.py\ /out/score-1107-boot2.json
+end_utc: 2026-11-09T07:00:01Z
+loadavg_after: 2.63 2.55 2.56
+exit_code: 0
+output: score-1107-boot2.txt
+
+### sanitizer-candidate49-boot1
+host: spark-0016 (sp8)
+image: sha256:9f51f2e2c5ab728e96490d794bff7b83a147d6d3d61333c5b60b2cff662049cd (spark-ds41f:candidate-49)
+start_utc: 2026-11-09T07:16:26Z
+loadavg_before: 2.48 2.83 2.70
+docker_ps_before: none
+command: flock /tmp/spark-lab-gpu.lock docker run --rm --gpus all --ipc=host --name c49om-993-san-b1 --entrypoint '' -w /opt/spark-ds41f/candidate/vllm -v /usr/local/cuda-13.0/compute-sanitizer:/usr/local/cuda-13.0/compute-sanitizer:ro -e COMPUTE_SANITIZER=/usr/local/cuda-13.0/compute-sanitizer/compute-sanitizer sha256:9f51f2e2c5ab728e96490d794bff7b83a147d6d3d61333c5b60b2cff662049cd pytest --noconftest -v -rs tests/kernels/attention/test_deepseek_v41_tilelang.py -k test_indexer_reads_only_visible_rows
+end_utc: 2026-11-09T07:17:06Z
+loadavg_after: 2.54 2.80 2.69
+exit_code: 0
+output: sanitizer-candidate49-boot1.txt
+
+### sanitizer-candidate49-boot2
+host: spark-0016 (sp8)
+image: sha256:9f51f2e2c5ab728e96490d794bff7b83a147d6d3d61333c5b60b2cff662049cd (spark-ds41f:candidate-49)
+start_utc: 2026-11-09T07:17:06Z
+loadavg_before: 2.54 2.80 2.69
+docker_ps_before: none
+command: flock /tmp/spark-lab-gpu.lock docker run --rm --gpus all --ipc=host --name c49om-993-san-b2 --entrypoint '' -w /opt/spark-ds41f/candidate/vllm -v /usr/local/cuda-13.0/compute-sanitizer:/usr/local/cuda-13.0/compute-sanitizer:ro -e COMPUTE_SANITIZER=/usr/local/cuda-13.0/compute-sanitizer/compute-sanitizer sha256:9f51f2e2c5ab728e96490d794bff7b83a147d6d3d61333c5b60b2cff662049cd pytest --noconftest -v -rs tests/kernels/attention/test_deepseek_v41_tilelang.py -k test_indexer_reads_only_visible_rows
+end_utc: 2026-11-09T07:17:46Z
+loadavg_after: 2.81 2.87 2.72
+exit_code: 0
+output: sanitizer-candidate49-boot2.txt
+

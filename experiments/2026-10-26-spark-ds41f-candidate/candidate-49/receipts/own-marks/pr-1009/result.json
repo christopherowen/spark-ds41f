@@ -1,0 +1,42 @@
+{
+  "pr": 1009,
+  "pr_head": "78e6f933d2707e0ed83e4bf280c8b531e5a1a944",
+  "mark": "Its SP attention-front bench: gain beyond the interval, bit-exact; prefill not worse",
+  "host": "sp8 (spark-0016, NVIDIA GB10)",
+  "images": {
+    "candidate-49": "sha256:9f51f2e2c5ab728e96490d794bff7b83a147d6d3d61333c5b60b2cff662049cd",
+    "1107": "sha256:3f32a962ce04b7c8d85337cd427a8946b8b6bcaadd97cc8d8a8cd14e8d68a6ce"
+  },
+  "evidence": "README bench, bench_sp_attention_front.py --json-out (defaults: 40 warmup, 200 timed iterations), on the candidate image, two boots. It is self-contained: verify_bit_exactness simulates the TP gather on one GPU and compares the 1107 _gather_front sequence with Option B byte for byte, then benchmark_shapes times the 1107 kernel sequence against sp_attention_front + write_swa_records in the same process. README pytest: its file list verbatim (once), and the file list its receipts/pytest_boot*.txt actually ran, two boots. The bench on 1107 cannot import (sp_attention_front and write_swa_records are new); recorded once",
+  "measured": {
+    "pytest_readme_list": "exit 4: ERROR file or directory not found: tests/models/test_sp_prefill.py (neither it nor tests/models/test_sp_prefill_e2e.py exists in the tree); no tests ran",
+    "pytest_receipt_list_candidate-49": {"boot1": "371 passed in 103.36s", "boot2": "371 passed in 103.30s", "files": "test_deepseek_v41_tilelang_front.py, test_deepseek_v41_tilelang_columns.py, test_deepseek_v4_1_attention.py, test_deepseek_v4_1_sp_prefill.py, test_deepseek_v4_1_prepare.py, test_deepseek_v41_serving_contract.py (PR: 368 passed)"},
+    "bit_exactness": "14 shapes (TP 3/4 x T 60..4096, including non-divisible T) on both boots: 0 differing bytes in q_values, q_scales, SWA cache, index_weights and index_slice_mxfp8 for Option B",
+    "kernel_median_us_1107_sequence_boots_to_option_b_boots": {
+      "TP3_T4096": "244.704/245.856 -> 24.832/24.96 (9.852x; PR 243.68/242.91 -> 25.12/24.99)",
+      "TP3_T8192": "566.72/564.288 -> 76.0/64.832 (8.031x; PR 568.29/566.40 -> 62.75/52.35)",
+      "TP3_T16384": "1093.92/1105.12 -> 221.184/221.376 (4.969x; PR 1108.96/1119.39 -> 223.20/222.46)",
+      "TP4_T4096": "236.64/232.736 -> 24.832/25.024 (9.415x; PR 233.50/235.42 -> 25.12/24.99)",
+      "TP4_T8192": "538.848/540.96 -> 30.976/38.944 (15.443x; PR 548.26/546.91 -> 32.99/38.94)",
+      "TP4_T16384": "1103.968/1104.064 -> 185.408/187.616 (5.919x; PR 1062.18/1073.02 -> 189.50/193.09)"
+    },
+    "saved_ms_54_layers": "11.2-49.6 ms per prefill chunk across shapes and boots (PR 11.25-48.43)",
+    "cells": "6 of 6 shapes faster beyond the two-boot interval",
+    "same_command_on_1107": "exit 1: ImportError cannot import name 'write_swa_records' from tilelang/cache_writer.py",
+    "interval": "two candidate-image boots, each a median of 200 CUDA-event-timed iterations of the whole kernel sequence"
+  },
+  "parts": [
+    {"part": "SP attention-front bench: gain beyond the interval", "verdict": "pass", "detail": "4.97x-15.4x on all six TP/T shapes, beyond the interval, within a few percent of the PR's sp4 numbers"},
+    {"part": "bit-exact", "verdict": "pass", "detail": "0 byte diffs in all 14 shapes on both boots"},
+    {"part": "prefill not worse", "verdict": "cannot-evaluate-on-sp8", "detail": "the bench times kernels only; the collective payload cut (3,648 -> 1,848 B/row) and end-to-end prefill need the tp3-switched suite"}
+  ],
+  "verdict": "pass",
+  "verdict_scope": "sp8-evaluable parts only; prefill is cannot-evaluate-on-sp8",
+  "reason": "The PR's own bench reproduces its kernel-sequence speedups on the integrated image beyond the two-boot interval, with byte-identical q_cast, SWA cache records and index weights against 1107's _gather_front path, and the test files its receipts ran pass on both boots. The README's own pytest list names two files that do not exist.",
+  "notes": [
+    "commands.txt start_utc is when the command was issued and includes any wait on /tmp/spark-lab-gpu.lock",
+    "The bench's baseline arm times split_columns on an already gathered buffer and excludes the all-gather itself, as does Option B; it measures kernel work, not the collective",
+    "The pytest count is 371 rather than the PR's 368 because the candidate's test files also carry other PRs' tests",
+    "analysis.json is derived from json/ by a_other.py"
+  ]
+}

@@ -1,0 +1,33 @@
+{
+  "pr": 979,
+  "pr_head": "c1d1bf3b76bc412aa4a87892726d107caa07bd6e",
+  "mark": "Its SP gather bench at T>=6144: gain beyond the interval, bit-exact",
+  "host": "sp8 (spark-0016, NVIDIA GB10)",
+  "images": {
+    "candidate-49": "sha256:9f51f2e2c5ab728e96490d794bff7b83a147d6d3d61333c5b60b2cff662049cd",
+    "1107": "sha256:3f32a962ce04b7c8d85337cd427a8946b8b6bcaadd97cc8d8a8cd14e8d68a6ce"
+  },
+  "evidence": "README 'Verification': the 2-boot GPU unit tests (test_deepseek_v41_sp_project_reduce_scatter.py, test_deepseek_v4_1_sp_prefill.py) and the 2-boot CPU unit tests (test_deepseek_v4_1_sp_prefill.py, test_deepseek_v4_1_engram.py) on the candidate image. The README gives no pytest command line, so the first attempt (--noconftest) was wrong for these files and is kept; the scored runs load tests/conftest.py with the repository's scripts/release_tests/tblib_stub.py, and the CPU suite runs with the driver mounted and no visible device. The bench_sp_roce / bench_sp_focused suites are 4-node RoCE collective benches on sp1..sp4, and their scripts are not in the PR (only their receipt JSONs)",
+  "measured": {
+    "gpu_pytest_candidate-49": {"boot1": "396 passed, 14 warnings in 103.29s", "boot2": "396 passed, 14 warnings in 103.98s", "pr": "396 passed, 14 warnings in 102.71s / 103.48s", "includes": "test_gather_many_routes_roce_and_packs_small_tensors, test_project_exchange_rows_roce_and_pynccl_coexistence, test_exchange_into_passes_send_and_recv_to_should_exchange PASSED on both boots"},
+    "cpu_pytest_candidate-49": {"boot1": "219 passed, 17 skipped, 14 warnings in 58.21s", "boot2": "219 passed, 17 skipped, 14 warnings in 58.06s", "pr": "219 passed, 17 skipped in 11.18s / 10.93s", "how": "--gpus all with CUDA_VISIBLE_DEVICES empty"},
+    "failed_attempts_kept": {
+      "noconftest_gpu": "384 passed, 12 errors on both boots: fixture 'default_vllm_config' not found (a tests/conftest.py fixture)",
+      "noconftest_cpu": "collection error on test_deepseek_v4_1_engram.py on both boots",
+      "conftest_without_tblib": "exit 4 on all four runs: tests/conftest.py imports tblib, which the image lacks",
+      "conftest_tblibstub_cpu_no_gpu": "collection error on both boots: vllm/v1/worker/gpu/tilelang_inputs.py:59 dereferences tilelang, which vllm.tilelang_utils leaves None in a container without the GPU driver; the same command on 1107 fails identically, so it is the release's behaviour, not this PR's"
+    },
+    "sp_gather_bench": "not run: 4-node collective bench (sp1..sp4 over RoCE), scripts absent from the PR"
+  },
+  "parts": [
+    {"part": "SP gather bench at T>=6144: gain beyond the interval", "verdict": "cannot-evaluate-on-sp8", "detail": "needs four ranks over RoCE; also, the PR ships only the bench receipts, not bench_sp_roce / bench_sp_focused, so it could not be re-run from the PR even on sp1..sp4"},
+    {"part": "bit-exact", "verdict": "cannot-evaluate-on-sp8", "detail": "the PR's bit-exactness check lives inside the same multi-rank bench; the single-GPU unit tests, including its three new routing tests, pass on both boots"}
+  ],
+  "verdict": "cannot-evaluate-on-sp8",
+  "reason": "The mark is a multi-node collective measurement. Its single-GPU parts pass on the integrated image with the PR's exact counts (396 GPU tests; 219 passed and 17 skipped CPU tests), on both boots.",
+  "notes": [
+    "commands.txt start_utc is when the command was issued and includes any wait on /tmp/spark-lab-gpu.lock",
+    "The mark says 'SP gather bench at T>=6144', but in the PR's README the T>=6144 gain (-9% to -21%) is SPRows.project_exchange_rows; gather_mxfp8 falls back to PyNCCL above the one-shot cap (T=2048 on ring4, T=4096 on direct) and its table stops at T<=4096. Whoever runs it on sp1..sp4 should check which bench the mark means",
+    "The PR's CPU receipt prints 'Triton is installed but 0 active driver(s) found'; our no-visible-device run does not, so the PR's exact CPU container setup is unknown; the counts match"
+  ]
+}
