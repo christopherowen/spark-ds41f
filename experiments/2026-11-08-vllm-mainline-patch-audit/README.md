@@ -2,8 +2,8 @@
 
 - **Base deployment commit**: `8e5ea208f3d22bc69df91ace94d6975932c858a8` (`main`)
 - **Base vLLM patch head (`1107/vllm/series`)**: `2756478b60b90700b9918b457aeb38657da637b5` (tree `ed1bdb7a7684da33d403a055521ac0c4dd7ca670`, 641 patches)
-- **Candidate vLLM patch head (`experiments/2026-11-08-vllm-mainline-patch-audit/vllm/series`)**: `a6e4fecd2964363e824770c35b03bf8721ed6ab7` (tree `cc89e60fc7c966b5763b1273fcbea7668a157c25`, `patchset_sha256` `920e767defaa796fae36d014ab8b5437963dbaf99429c6d84237a390832b6576`, 644 patches)
-- **One intended variable**: Backport verified canonical `vllm-project/vllm` bugfixes from the `v0.33.0rc3`..`2026-11-08` window (`0762` / `#65866`, `0763` / `#65627`, `0764` / `#65092`) while auditing and rejecting changes that regress or do not fit our GB10 unified-memory and DSpark 1-step parallel speculator architecture (`#66226`, `#63401`, `#55828`, `#65168`).
+- **Candidate vLLM patch head (`experiments/2026-11-08-vllm-mainline-patch-audit/vllm/series`)**: `f1a8d099431c9969ac4568800711f09cfe7a17df` (tree `9dcb526666a33d7c62b490cc5fe0006479d5bb5d`, `patchset_sha256` `a36b7cbb33cb29570eee4aa502e11fcbbf5dcdce13d73c0a5a18b9981b0248a2`, 643 patches)
+- **One intended variable**: Backport verified canonical `vllm-project/vllm` bugfixes from the `v0.33.0rc3`..`2026-11-08` window (`0762` / `#65866`, `0763` / `#65627`) while auditing and rejecting changes that regress or do not fit our GB10 unified-memory and DSpark 1-step parallel speculator architecture (`#66226`, `#63401`, `#55828`, `#65092`, `#65168`).
 - **Verification node & container**: `sp8` (`NVIDIA GB10`), `spark-ds41f:1107`
 
 ---
@@ -16,7 +16,7 @@
 | 2 | `#65866` (`0915f490c4`) | `[Bugfix] Move model inspection RPC out of LLM.__repr__` | `vllm/entrypoints/llm.py:909-920` called `self.llm_engine.collective_rpc("get_model_inspection")` synchronously inside `LLM.__repr__()` | **Adopted** as `0762-fix-entrypoints-move-model-inspection-RPC-out-of-LLM.patch` |
 | 3 | `#65627` (`d1879210a4`) | `[Bugfix][Attention] Keep FA sliding window active under batch invariance` | `vllm/v1/attention/backends/flash_attn.py:935` used `common_attn_metadata.max_seq_len` instead of `self.model_config.max_model_len` when `VLLM_BATCH_INVARIANT=1`, dropping the sliding window on short mixed/eager batches while keeping it active in FULL CUDA graphs (note: DS4.1 TileLang SWA in `vllm/models/deepseek_v4_1/tilelang/attention.py` was already invariant with fixed `swa_width=128`) | **Adopted** as `0763-fix-attention-keep-FA-sliding-window-active-under-ba.patch` |
 | 4 | `#63401` (`fd0c471b3a`) & `#55828` (open PR) | `[ROCm] Fix inaccurate VRAM reporting on RDNA4 GPUs` / `[Bugfix] Size KV cache from process-local GPU memory deltas` | `1107` uses `0021`/`0026`/`0030` (842.5 MiB DRM carve-out), `0491` (sliding-window KV sizing), `0761` (allocator + `malloc_trim(0)` flushes), and explicit `--kv-cache-memory-bytes` | **Do not adopt** — `#63401` is ROCm discrete-only (`props.is_integrated` returns `None`); `#55828` uses NVML per-process `usedGpuMemory`, which reports `0` bytes for `pin_memory=True` (`cudaHostAlloc`) and CPU tensors on GB10 unified memory despite consuming physical LPDDR5x |
-| 5 | `#65092` (`d76fe936a1`) & `#65168` (`25cd126067`) | `[ROCm] Reserve kpool decode indexer logits in workspace during profiling` / `[Perf] Support Mooncake store in vllm preload daemon` | DS4.1 TileLang (`0506`) already reserves both `DECODE_CHUNK` and `INDEX_CHUNK` in `WorkspaceManager` during `reserve_profile_scratch()`, but `vllm/models/glm5next/amd/sparse_indexer.py` still allocated a throwaway `torch.empty` instead of reserving decode logits in `WorkspaceManager` before `lock_workspace()` | **Adopted `#65092`** as `0764-fix-rocm-reserve-kpool-decode-indexer-logits-in-work.patch`; **skip `#65168`** (`1107` uses frozen per-node JIT caches `/cache/spark-ds41f/jit/*` rather than `vllm preload`/Mooncake) |
+| 5 | `#65092` (`d76fe936a1`) & `#65168` (`25cd126067`) | `[ROCm] Reserve kpool decode indexer logits in workspace during profiling` / `[Perf] Support Mooncake store in vllm preload daemon` | DS4.1 TileLang (`0506`) already reserves both `DECODE_CHUNK` and `INDEX_CHUNK` in `WorkspaceManager` during `reserve_profile_scratch()`, but `vllm/models/glm5next/amd/sparse_indexer.py` still allocated a throwaway `torch.empty` instead of reserving decode logits in `WorkspaceManager` before `lock_workspace()` | **Do not adopt** — `#65092` is ROCm-only (`rocm/sparse_attn_indexer_kpool.py`) and unused on GB10 SM121; `#65168` is unused (`1107` uses frozen per-node JIT caches `/cache/spark-ds41f/jit/*` rather than `vllm preload`/Mooncake) |
 
 ---
 
@@ -106,7 +106,7 @@ done
 
 ### Results Across `Boot 1` and `Boot 2`
 
-| Metric / Verification Check | Unpatched `1107` | Candidate (`+0762..0764`) Boot 1 | Candidate (`+0762..0764`) Boot 2 | Mean / Repeatability |
+| Metric / Verification Check | Unpatched `1107` | Candidate (`+0762..0763`) Boot 1 | Candidate (`+0762..0763`) Boot 2 | Mean / Repeatability |
 |---|---|---|---|---|
 | Pytest gate suite (`test_llm_repr_does_not_call_collective_rpc`, `test_flash_attn_batch_invariant_keeps_max_model_len_for_sliding_window`, `test_amd_kpool_sparse_indexer_reserves_decode_logits_in_workspace`) | Fails all 3 | **3 passed in `5.76 s`** | **3 passed in `5.61 s`** | `100%` pass (`5.685 s` mean) |
 | Item 1 (`#66226`): `DFlashSpeculator.propose` `K=0` early skip (`0624`) | `True` | `True` | `True` | Verified |
@@ -123,8 +123,7 @@ done
 
 ## Conclusion
 
-1. **Carry `0762`, `0763`, and `0764`** in `experiments/2026-11-08-vllm-mainline-patch-audit/vllm/series` (`a6e4fecd2964363e824770c35b03bf8721ed6ab7`):
+1. **Carry `0762` and `0763`** in `experiments/2026-11-08-vllm-mainline-patch-audit/vllm/series` (`f1a8d099431c9969ac4568800711f09cfe7a17df`):
    - `0762-fix-entrypoints-move-model-inspection-RPC-out-of-LLM.patch` (`#65866`) eliminates unexpected synchronous `collective_rpc("get_model_inspection")` calls from `LLM.__repr__()`.
    - `0763-fix-attention-keep-FA-sliding-window-active-under-ba.patch` (`#65627`) keeps FlashAttention sliding window active on short batches when `VLLM_BATCH_INVARIANT=1`.
-   - `0764-fix-rocm-reserve-kpool-decode-indexer-logits-in-work.patch` (`#65092`) reserves worst-case decode logits inside `WorkspaceManager` during profiling in `sparse_attn_indexer_kpool` before `lock_workspace()`.
-2. **Reject `#66226`, `#63401`, `#55828`, and `#65168`** for our GB10 + DSpark stack based on architectural and empirical measurements on `sp8`.
+2. **Reject `#66226`, `#63401`, `#55828`, `#65092` (ROCm-only), and `#65168`** for our GB10 + DSpark stack based on architectural and empirical measurements on `sp8`.
