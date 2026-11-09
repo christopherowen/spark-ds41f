@@ -107,6 +107,16 @@ Each testbed opens its window with `scripts/lab.py`, after the hold and idle gua
      and 53 name, are still pending.
    - No companion suite: every mark below is measured by the screen or by the PR's own bench.
 4. **Own marks** on sp8 (below), two boots each, ABBA against the base.
+5. [single-stream-tp4.json](single-stream-tp4.json) (`candidate-51-single-stream-tp4`): the `single-stream`
+   suite at `tp4-ring`, added after the screen. The screen's one-request grid rows are 4.4-8.4% faster than
+   candidate-50's, and its 16-stream paired decode 0.68%; the screen has no one-stream closed loop, so the
+   effect on one-stream decode is not measured.
+   - **Arms:** `candidate-51`, `candidate-50-no1009` (the accumulated base, as the middle arm) and
+     `candidate-51-again`, on the same development arms as the screen.
+   - **The base is measured here** because no `single-stream` record of candidate-50 exists at `tp4-ring`
+     ([step 6](../../../docs/release-benchmark.md#6-screen): a reference is recorded by the run that first
+     needs it). 1107's recorded run (`manifests/suites/2026-11-07-spark-ds41f-1107-tp4-single-stream`) is
+     from another session, so it is printed beside the table, not used for the verdict.
 
 ## Marks
 
