@@ -369,8 +369,11 @@ the whole release benchmark (release tests, determinism gate, this comparison) a
 - **Unified `candidate-<N>` naming (from `candidate-25` onward).** Every release candidate
   uses `candidate-<N>` everywhere (`rc<N>` and `19f2c20ed4d6-next-<N>` are retired):
   - directory: `experiments/2026-10-26-spark-ds41f-candidate/candidate-<N>/`;
-  - arm configs inside `candidate-<N>/`: `tp3.json`, `tp3-dev.json`, `tp4.json`,
-    `screen-tp3.json`, `upstreams.lock.json` (no `rc-` prefix);
+  - cluster configurations inside `candidate-<N>/`: one for every shape of the release
+    recipe it extends, each with its `-dev` file, named by shape (`tp4` for `tp4-ring`,
+    `tp3` for `tp3-triangle`, and the shape name otherwise), plus `upstreams.lock.json`
+    (no `rc-` prefix). The rest of the folder and a round's steps are in
+    [release-benchmark.md](release-benchmark.md#candidates);
   - container image tag: `"image": "spark-ds41f:candidate-<N>"`;
   - suite run and arm label: `"run": "candidate-<N>-screen-tp3"` (or
     `"candidate-<N>-release-tp3"`), `"label": "candidate-<N>"`;
