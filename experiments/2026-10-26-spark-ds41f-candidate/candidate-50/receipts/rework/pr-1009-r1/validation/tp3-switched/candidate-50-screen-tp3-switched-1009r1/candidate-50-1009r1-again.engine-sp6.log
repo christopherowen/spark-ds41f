@@ -1,0 +1,83 @@
+WARNING 11-09 19:24:17 [envs.py:2719] Unknown vLLM environment variable detected: VLLM_L2_PREFETCH_GRID
+WARNING 11-09 19:24:17 [envs.py:2719] Unknown vLLM environment variable detected: VLLM_CACHE_DIR
+WARNING 11-09 19:24:17 [envs.py:2719] Unknown vLLM environment variable detected: VLLM_L2_PREFETCH_KERNELS
+WARNING 11-09 19:24:17 [envs.py:2719] Unknown vLLM environment variable detected: VLLM_NATIVE_CACHE_DIR
+INFO 11-09 19:24:17 [config.py:852] Detected quantization_config.scale_fmt=ue8m0; enabling UE8M0 for DeepGEMM.
+INFO 11-09 19:24:17 [model.py:693] Resolved architecture: DeepseekV41ForCausalLM
+INFO 11-09 19:24:17 [model.py:2066] Using max model len 1048576
+INFO 11-09 19:24:18 [arg_utils.py:2462] Inferred data_parallel_rank 0 from node_rank 1
+INFO 11-09 19:24:18 [model.py:693] Resolved architecture: DeepseekV41ForCausalLM
+INFO 11-09 19:24:18 [model.py:2066] Using max model len 1048576
+WARNING 11-09 19:24:18 [config.py:561] Padded DeepSeek V4.1 attention for TP3: heads 64 -> 72, output groups 8 -> 9.
+INFO 11-09 19:24:18 [scheduler.py:436] Chunked prefill is enabled with max_num_batched_tokens=6144.
+WARNING 11-09 19:24:18 [config.py:561] Padded DeepSeek V4.1 attention for TP3: heads 64 -> 72, output groups 8 -> 9.
+INFO 11-09 19:24:18 [vllm.py:1521] Resolved Engram configuration: EngramConfig(cpu_offload=True, embedding_across_dp=False, dp_shared_memory=False, table_memory='disk', projection_tp=True, disk_resident_scales=False)
+WARNING 11-09 19:24:18 [config.py:561] Padded DeepSeek V4.1 attention for TP3: heads 64 -> 72, output groups 8 -> 9.
+INFO 11-09 19:24:18 [kernel.py:435] Final IR op priority after setting platform defaults: IrOpPriorityConfig(rms_norm=['native'], fused_add_rms_norm=['native'], gelu_and_mul_sparse=['triton', 'native'])
+INFO 11-09 19:24:18 [vllm.py:2464] Copy drafts widen max_num_batched_tokens from 6144 to 6155: an aligned 6096-token prefill chunk beside 59 decode rows.
+WARNING 11-09 19:24:18 [vllm.py:2425] max_num_scheduled_tokens is set to 6155 based on the speculative decoding settings. This may lead to suboptimal performance. Consider increasing max_num_batched_tokens to accommodate the additional draft token slots, or decrease num_speculative_tokens.
+INFO 11-09 19:24:18 [vllm.py:2496] Copy drafts widen the CUDA-graph capture range from 48 to 59 rows.
+INFO 11-09 19:24:19 [compilation.py:336] Enabled custom fusions: norm_quant, act_quant
+INFO 11-09 19:24:19 [serve.py:251] Launching vLLM (v0.29.1rc1.dev187+gaf1c01499) headless multiproc executor, with head node address 10.30.0.13:9999 for torch.distributed process group.
+(Worker pid=1) INFO 11-09 19:24:24 [parallel_state.py:1953] world_size=3 rank=1 local_rank=0 distributed_init_method=tcp://10.30.0.13:9999 backend=nccl
+(Worker pid=1) INFO 11-09 19:24:45 [parallel_state.py:2393] rank 1 in world size 3 is assigned as DP rank 0, PP rank 0, PCP rank 0, TP rank 1, ETP rank 1, EP rank 1, EPLB rank N/A
+(Worker pid=1) INFO 11-09 19:24:45 [gpu_worker.py:525] Using V2 Model Runner
+(Worker_TP1 pid=1) INFO 11-09 19:24:45 [model_runner.py:512] Loading model from scratch...
+(Worker_TP1 pid=1) INFO 11-09 19:24:45 [sp_prefill.py:175] DeepSeek V4.1 prefill sequence parallelism from 205 tokens (capacity floor=2097152 bytes; independent of all-reduce dispatch)
+(Worker_TP1 pid=1) INFO 11-09 19:24:47 [mxfp4.py:464] Using 'TILELANG_MXFP4_MXFP8' Mxfp4 MoE backend.
+(Worker_TP1 pid=1) INFO 11-09 19:24:52 [glp.py:247] GLP file /glp/vector.gguf: 39 directions, layers [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 30, 31, 32, 33, 34, 35, 36, 37, 38, 39], alpha_default 0.75, base DeepSeek-V4.1-Flash-1017@1bae0e1088993b9b82de08f59de5be5a34e42170
+(Worker_TP1 pid=1) INFO 11-09 19:24:52 [glp.py:383] GLP steering on: alpha 0.75, layers [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 30, 31, 32, 33, 34, 35, 36, 37, 38, 39], requests to 'deepseek-v4.1-flash-weightless'
+(Worker_TP1 pid=1) WARNING 11-09 19:24:52 [compilation.py:1361] Op 'quant_fp8' not present in model, enabling with '+quant_fp8' has no effect
+(Worker_TP1 pid=1) WARNING 11-09 19:24:52 [vllm.py:3756] `torch.compile` is turned on, but the model /hub/models--deepseek-ai--DeepSeek-V4.1-Flash-1017/snapshots/1bae0e1088993b9b82de08f59de5be5a34e42170 does not support it. Please open an issue on GitHub if you want it to be supported.
+(Worker_TP1 pid=1) INFO 11-09 19:25:16 [default_loader.py:575] Loading weights took 18.58 seconds
+(Worker_TP1 pid=1) INFO 11-09 19:25:16 [mxfp4.py:2011] Using MoEPrepareAndFinalizeNoDPEPModular
+(Worker_TP1 pid=1) INFO 11-09 19:25:16 [mxfp4.py:2012] Using TileLangExperts
+(Worker_TP1 pid=1) INFO 11-09 19:25:24 [packed_bf16.py:142] Packed the BF16 LM head exactly into 12 bits per weight: exponents 112..126, 33875 out-of-window values kept exactly per shard.
+(Worker_TP1 pid=1) INFO 11-09 19:25:24 [direct_loader.py:387] Direct loader: weights loaded, 100.57 GB of checkpoint payload in 18.58 s (5.41 GB/s); 166.77 GB read from disk, 0.00 GB BF16 expanded in the ring, 0.00 GB converted in the GPU scratch, 0.00 GB copied by Torch
+(Worker_TP1 pid=1) INFO 11-09 19:25:24 [eagle3_utils.py:27] Using Eagle3 auxiliary layers from config: (37, 38, 39)
+(Worker_TP1 pid=1) WARNING 11-09 19:25:24 [config.py:561] Padded DeepSeek V4.1 attention for TP3: heads 64 -> 72, output groups 8 -> 9.
+(Worker_TP1 pid=1) WARNING 11-09 19:25:24 [config.py:561] Padded DeepSeek V4.1 attention for TP3: heads 64 -> 72, output groups 8 -> 9.
+(Worker_TP1 pid=1) INFO 11-09 19:25:24 [kernel.py:435] Final IR op priority after setting platform defaults: IrOpPriorityConfig(rms_norm=['native'], fused_add_rms_norm=['native'], gelu_and_mul_sparse=['triton', 'native'])
+(Worker_TP1 pid=1) WARNING 11-09 19:25:24 [vllm.py:3756] `torch.compile` is turned on, but the model /hub/models--deepseek-ai--DeepSeek-V4.1-Flash-1017/snapshots/1bae0e1088993b9b82de08f59de5be5a34e42170 does not support it. Please open an issue on GitHub if you want it to be supported.
+(Worker_TP1 pid=1) INFO 11-09 19:25:25 [weight_utils.py:705] Safetensors index filter selected 3/48 checkpoint shards.
+(Worker_TP1 pid=1) INFO 11-09 19:25:25 [dspark.py:981] DSpark draft model loaded: 97 params
+(Worker_TP1 pid=1) INFO 11-09 19:25:25 [default_loader.py:575] Loading weights took 0.73 seconds
+(Worker_TP1 pid=1) INFO 11-09 19:25:26 [packed_bf16.py:142] Packed the BF16 LM head exactly into 12 bits per weight: exponents 114..128, 2368 out-of-window values kept exactly per shard.
+(Worker_TP1 pid=1) INFO 11-09 19:25:26 [direct_loader.py:387] Direct loader: weights loaded, 2.73 GB of checkpoint payload in 0.73 s (3.77 GB/s); 4.45 GB read from disk, 0.00 GB BF16 expanded in the ring, 0.00 GB converted in the GPU scratch, 0.00 GB copied by Torch
+(Worker_TP1 pid=1) WARNING 11-09 19:25:26 [speculator.py:246] Draft model DSparkDeepseekV4ForCausalLM does not support external multimodal embeddings. Embeddings from the target model will not be passed to the drafter; using text-only draft inputs instead.
+(Worker_TP1 pid=1) INFO 11-09 19:25:26 [display_carveout.py:404] Display carve-out holds 631.9 MiB of streamed weights in 2 buffers, loaded in place (language_model.model.embed_tokens.weight, language_model.lm_head.weight); debug integrity check off
+(Worker_TP1 pid=1) INFO 11-09 19:25:26 [model_runner.py:548] Model loading took 92.88 GiB memory and 40.999580 seconds
+(Worker_TP1 pid=1) INFO 11-09 19:25:26 [model_runner.py:2751] Sink detector: residual column 2455, threshold 85000, rejection on (3 alternates per provisional token)
+(Worker_TP1 pid=1) 2026-11-09 19:25:39  [TileLang:tilelang.cache.kernel_cache:WARNING] (kernel_cache.py:421): Found kernel 'moe_dispatch' in memory cache. For better performance, consider using `@tilelang.jit` instead of direct kernel caching.
+(Worker_TP1 pid=1) 2026-11-09 19:25:39  [TileLang:tilelang.cache.kernel_cache:WARNING] (kernel_cache.py:421): Found kernel 'moe_dispatch' in memory cache. For better performance, consider using `@tilelang.jit` instead of direct kernel caching.
+(Worker_TP1 pid=1) 2026-11-09 19:25:39  [TileLang:tilelang.cache.kernel_cache:WARNING] (kernel_cache.py:421): Found kernel 'moe_dispatch' in memory cache. For better performance, consider using `@tilelang.jit` instead of direct kernel caching.
+(Worker_TP1 pid=1) 2026-11-09 19:25:39  [TileLang:tilelang.cache.kernel_cache:WARNING] (kernel_cache.py:421): Found kernel 'moe_dispatch' in memory cache. For better performance, consider using `@tilelang.jit` instead of direct kernel caching.
+(Worker_TP1 pid=1) 2026-11-09 19:25:39  [TileLang:tilelang.cache.kernel_cache:WARNING] (kernel_cache.py:421): Found kernel 'moe_dispatch' in memory cache. For better performance, consider using `@tilelang.jit` instead of direct kernel caching.
+(Worker_TP1 pid=1) 2026-11-09 19:25:39  [TileLang:tilelang.cache.kernel_cache:WARNING] (kernel_cache.py:421): Found kernel 'moe_dispatch' in memory cache. For better performance, consider using `@tilelang.jit` instead of direct kernel caching.
+(Worker_TP1 pid=1) 2026-11-09 19:25:39  [TileLang:tilelang.cache.kernel_cache:WARNING] (kernel_cache.py:421): Found kernel 'moe_dispatch' in memory cache. For better performance, consider using `@tilelang.jit` instead of direct kernel caching.
+(Worker_TP1 pid=1) 2026-11-09 19:25:39  [TileLang:tilelang.cache.kernel_cache:WARNING] (kernel_cache.py:421): Found kernel 'moe_dispatch' in memory cache. For better performance, consider using `@tilelang.jit` instead of direct kernel caching.
+(Worker_TP1 pid=1) 2026-11-09 19:25:39  [TileLang:tilelang.cache.kernel_cache:WARNING] (kernel_cache.py:421): Found kernel 'moe_dispatch' in memory cache. For better performance, consider using `@tilelang.jit` instead of direct kernel caching.
+(Worker_TP1 pid=1) 2026-11-09 19:25:39  [TileLang:tilelang.cache.kernel_cache:WARNING] (kernel_cache.py:421): Found kernel 'moe_dispatch' in memory cache. For better performance, consider using `@tilelang.jit` instead of direct kernel caching.
+(Worker_TP1 pid=1) 2026-11-09 19:25:39  [TileLang:tilelang.cache.kernel_cache:WARNING] (kernel_cache.py:421): Found kernel 'moe_dispatch' in memory cache. For better performance, consider using `@tilelang.jit` instead of direct kernel caching.
+(Worker_TP1 pid=1) 2026-11-09 19:25:39  [TileLang:tilelang.cache.kernel_cache:WARNING] (kernel_cache.py:421): Found kernel 'moe_dispatch' in memory cache. For better performance, consider using `@tilelang.jit` instead of direct kernel caching.
+(Worker_TP1 pid=1) 2026-11-09 19:25:39  [TileLang:tilelang.cache.kernel_cache:WARNING] (kernel_cache.py:421): Found kernel 'moe_dispatch' in memory cache. For better performance, consider using `@tilelang.jit` instead of direct kernel caching.
+(Worker_TP1 pid=1) 2026-11-09 19:25:39  [TileLang:tilelang.cache.kernel_cache:WARNING] (kernel_cache.py:421): Found kernel 'moe_dispatch' in memory cache. For better performance, consider using `@tilelang.jit` instead of direct kernel caching.
+(Worker_TP1 pid=1) INFO 11-09 19:25:41 [model_runner.py:2238] Greedy verification from vocabulary shards: on
+(Worker_TP1 pid=1) INFO 11-09 19:25:51 [gpu_worker.py:1507] Prepared 331 TileLang calls and the registry's other kernels in 24.0 s.
+(Worker_TP1 pid=1) INFO 11-09 19:25:51 [encoder_runner.py:131] Encoder cache will be initialized with a budget of 6155 tokens, and profiled with 6 image items of the maximum feature size.
+(Worker_TP1 pid=1) INFO 11-09 19:25:53 [l2_prefetch.py:267] [l2_prefetch] TileLang kernel ready (grid=2 block=128 chunk=4096)
+(Worker_TP1 pid=1) INFO 11-09 19:25:53 [model.py:496] [l2_prefetch] layer 0 WO 3 segs 20.0 MB: wo_a.weight:12.6MB, wo_a.tilelang_weight_sf:0.0MB, wo_b.weight[head]:7.4MB | COMP - | FFN 7 segs 16.0 MB: mhc.hc_ffn_fn:2.0MB, mhc.hc_ffn_base:0.0MB, ffn_norm.weight:0.0MB, gate.weight:3.9MB, gate_up_proj.weight:7.9MB, gate_up_proj.tilelang_weight_sf:0.0MB, down_proj.weight[head]:2.2MB | NEXT 6 segs 20.0 MB: mhc.hc_attn_fn:2.0MB, mhc.hc_attn_base:0.0MB, attn_norm.weight:0.0MB, wqa_wkv.weight:3.1MB, wqa_wkv.tilelang_weight_sf:0.0MB, wq_b.weight[head]:14.9MB | ENGRAM 1 segs 20.0 MB: engram.wkv.weight[head]:20.0MB
+(Worker_TP1 pid=1) INFO 11-09 19:25:53 [model.py:496] [l2_prefetch] layer 39 WO 3 segs 20.0 MB: wo_a.weight:12.6MB, wo_a.tilelang_weight_sf:0.0MB, wo_b.weight[head]:7.4MB | COMP - | FFN 7 segs 16.0 MB: mhc.hc_ffn_fn:2.0MB, mhc.hc_ffn_base:0.0MB, ffn_norm.weight:0.0MB, gate.weight:3.9MB, gate_up_proj.weight:7.9MB, gate_up_proj.tilelang_weight_sf:0.0MB, down_proj.weight[head]:2.2MB | NEXT - | ENGRAM -
+(Worker_TP1 pid=1) INFO 11-09 19:25:53 [l2_prefetch.py:541] [l2_prefetch] persisting L2 set-aside on cuda:0: L2 25 MB, max 19 MB, requested 0 MB, now 0 MB
+(Worker_TP1 pid=1) INFO 11-09 19:25:53 [model.py:496] [l2_prefetch] layer 40 WO 3 segs 20.0 MB: wo_a.weight:12.6MB, wo_a.tilelang_weight_sf:0.0MB, wo_b.weight[head]:7.4MB | COMP - | FFN 8 segs 15.1 MB: mhc.hc_ffn_fn:2.0MB, mhc.hc_ffn_base:0.0MB, ffn_norm.weight:0.0MB, gate.weight:1.3MB, gate_up_proj.weight:7.9MB, gate_up_proj.tilelang_weight_sf:0.0MB, down_proj.weight:3.9MB, down_proj.tilelang_weight_sf:0.0MB | NEXT 6 segs 20.0 MB: mhc.hc_attn_fn:2.0MB, mhc.hc_attn_base:0.0MB, attn_norm.weight:0.0MB, wqa_wkv.weight:9.2MB, wqa_wkv.tilelang_weight_sf:0.0MB, wq_b.weight[head]:8.8MB | ENGRAM -
+(Worker_TP1 pid=1) INFO 11-09 19:25:53 [model.py:496] [l2_prefetch] layer 42 WO 3 segs 20.0 MB: wo_a.weight:12.6MB, wo_a.tilelang_weight_sf:0.0MB, wo_b.weight[head]:7.4MB | COMP - | FFN 8 segs 15.1 MB: mhc.hc_ffn_fn:2.0MB, mhc.hc_ffn_base:0.0MB, ffn_norm.weight:0.0MB, gate.weight:1.3MB, gate_up_proj.weight:7.9MB, gate_up_proj.tilelang_weight_sf:0.0MB, down_proj.weight:3.9MB, down_proj.tilelang_weight_sf:0.0MB | NEXT - | ENGRAM -
+(Worker_TP1 pid=1) INFO 11-09 19:25:53 [adaptive_verification.py:126] DSpark dead verification rows below survival 0.2
+(Worker_TP1 pid=1) INFO 11-09 19:25:55 [gpu_worker.py:715] Initial free memory 114.27 GiB, reserved 4.91 GiB memory for KV Cache as specified by kv_cache_memory_bytes config and skipped memory profiling. This does not respect the gpu_memory_utilization config. Only use kv_cache_memory_bytes config when you want manual control of KV cache memory size. If OOM'ed, check the difference of initial free memory between the current run and the previous run where kv_cache_memory_bytes is suggested and update it correspondingly.
+(Worker_TP1 pid=1) INFO 11-09 19:25:55 [adaptive_verification.py:126] DSpark dead verification rows below survival 0.2
+(Worker_TP1 pid=1) WARNING 11-09 19:25:56 [torch_utils.py:275] OMP_NUM_THREADS=8 is set; leaving Torch threads at 8 for serving. Multi-threaded torch CPU ops during serving can degrade performance through spin-wait contention and cgroup CPU-quota throttling.
+(Worker_TP1 pid=1) INFO 11-09 19:25:56 [kernel_warmup.py:174] JIT kernel warmup starting.
+(Worker_TP1 pid=1) INFO 11-09 19:25:56 [kernel_warmup.py:187] JIT kernel warmup finished in 0.00s.
+(Worker_TP1 pid=1) INFO 11-09 19:25:56 [kernel_warmup.py:252] Skipping FlashInfer autotune because it is disabled.
+(Worker_TP1 pid=1) INFO 11-09 19:25:59 [speculator.py:170] Capturing model for DSpark speculator...
+(Worker_TP1 pid=1) INFO 11-09 19:26:01 [model_runner.py:1533] Graph capturing finished in 5 secs, took 1.67 GiB
+(Worker_TP1 pid=1) INFO 11-09 19:26:02 [gpu_worker.py:2071] [memory_breakdown] rank=1 weights=92.88 GiB kv_cache=4.91 GiB workspace=0.83 GiB other_torch_allocated=1.72 GiB torch_allocated=100.34 GiB torch_reserved=101.0 GiB torch_allocator_slack=0.66 GiB peak_activation=0.0 GiB cudagraph=1.67 GiB non_torch_cuda=12.4 GiB free_memory=8.29 GiB
