@@ -1,8 +1,8 @@
 # Experiment: Hardware `cvt.rn.satfinite.e2m1x2.f32` (`F2FP.SATFINITE.E2M1.F32.PACK_AB`) and Vectorized Global Stores in TileLang Indexer and Fused GEMM+RoPE+MXFP4 Quantizers
 
 - **Date**: 2026-11-08
-- **Base commit (`deployment`)**: `cc20ed18b` (`upstreams.lock.json` vLLM patch head `320021e3c4dbb202d911ab70e2cd924c75420488`, patch `0761`)
-- **Candidate patch**: `experiments/2026-11-08-hw-e2m1x2-indexer-gemm-quant/vllm/0762-perf-dsv41-hw-e2m1x2-indexer-and-gemm-mxfp4-quantize.patch` (commit `575ab53b9f25b2f630410e32258d758ee482bc72`, tree `f85de82ea26ab857867bee09762bcd85a541e7ac`)
+- **Base commit (`deployment`)**: `cc20ed18b` (`upstreams.lock.json` vLLM patch head `2756478b60b90700b9918b457aeb38657da637b5`, patch `0761`)
+- **Candidate patch**: `experiments/2026-11-08-hw-e2m1x2-indexer-gemm-quant/vllm/0762-perf-dsv41-hw-e2m1x2-indexer-and-gemm-mxfp4-quantize.patch` (commit `b80566f0de68954ddc83811f5f83188a72045008`, tree `2109395c051f6a6a4c6ac8518b02cf54e0ab439d`)
 - **Causal variable**: Replace the 7-comparison software `_e2m1_code` / `_mxfp4_byte` emulation across `vllm/models/deepseek_v4_1/tilelang/gemm.py` and `vllm/models/deepseek_v4_1/tilelang/indexer.py` with inline PTX `cvt.rn.satfinite.e2m1x2.f32` (`F2FP.SATFINITE.E2M1.F32.PACK_AB`) helpers (`dsv41_e2m1x2`, `dsv41_e2m1x8`, `dsv41_store_e2m1x8`, `dsv41_store_e2m1x32`), vectorizing the per-lane 4-byte stores in `mxfp4_norm_rope_quantize_v41` (`STG.E`) and per-group 16-byte stores in `mxfp4_quantize_v41` (`STG.E.128`) while keeping the `mxfp8_gemm_rope_mxfp4_decode` epilogue loop rolled (`#pragma unroll 1`).
 - **Hardware**: `sp8` (NVIDIA GB10 `sm_121a`, CUDA 13.0, `spark-ds41f:1107`)
 
@@ -155,3 +155,7 @@ Replacing the 7-comparison software `_e2m1_code` / `_mxfp4_byte` emulation with 
 - Speeds up `mxfp8_gemm_rope_mxfp4_decode` by **`-2.8%` to `-5.6%`** at `M = 16..64` (`-12` to `-55 us / 61 layers`) and **`-1.2%` to `-1.9%`** at `M = 1`.
 - Speeds up prefill `mxfp4_quantize_v41` query RoPE by **`-35.4%` (`1.55x`, `-420 us / 61 layers`)** at `M = 512` and **`-26.5%` to `-29.4%` (`1.36x–1.42x`, `-1.20` to `-1.30 ms / 61 layers`)** at `M = 2048`.
 - Speeds up prefill `mxfp4_quantize_v41` paged key writes by **`-49.9%` to `-50.2%` (`2.00x`, `-475 us / 61 layers`)** at `M = 8192` and `mxfp4_norm_rope_quantize_v41` by **`-22.1%` to `-22.4%` (`1.29x`, `-94 us / 61 layers`)** at `M = 8192`.
+
+## Rework Update (Pure Win Without Downsides)
+
+- Removed `#pragma unroll 1` (`pragma_unroll_factor: 1`) from the `mxfp8_gemm_rope_mxfp4_decode` epilogue loop so `nvcc` unrolls the `T.serial(iters)` loop at `block_M = 16`, preserving the `1.04-1.05x` speedup across `M = 1..4` (`5.09 -> 4.90 us` at `M = 1`) as well as `M = 8..64`.

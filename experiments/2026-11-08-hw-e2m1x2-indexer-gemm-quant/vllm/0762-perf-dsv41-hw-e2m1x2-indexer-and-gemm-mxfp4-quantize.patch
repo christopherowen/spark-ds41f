@@ -1,4 +1,4 @@
-From 575ab53b9f25b2f630410e32258d758ee482bc72 Mon Sep 17 00:00:00 2001
+From 96c8b873c779a303051387cbf6a897b69db46dfd Mon Sep 17 00:00:00 2001
 From: Christopher Owen <3221756+christopherowen@users.noreply.github.com>
 Date: Sun, 8 Nov 2026 17:43:08 +0000
 Subject: [PATCH] perf(dsv41): use hardware cvt.rn.satfinite.e2m1x2.f32 in
@@ -14,24 +14,32 @@ While cache_writer.py already packs E2M1 pairs using the SM121 hardware instruct
 3. mxfp4_norm_rope_quantize_v41 (indexer.py)
 Furthermore, in mxfp4_quantize_v41, _mxfp4_byte expanded each scaled FP32 expression 8 times across the 7 comparison thresholds and sign extraction without binding a local TIR variable, causing the generated C++ to recompute __fmul_rn((float)vals[...], scale) across every comparison and issue 16 separate 1-byte global stores per thread.
 
-Replace _e2m1_code with inline PTX cvt.rn.satfinite.e2m1x2.f32 helpers (dsv41_e2m1x2, dsv41_e2m1x8, dsv41_store_e2m1x8, dsv41_store_e2m1x32), vectorizing 4-byte per-lane stores in mxfp4_norm_rope_quantize_v41 and 16-byte per-group stores in mxfp4_quantize_v41 while keeping the mxfp8_gemm_rope_mxfp4_decode epilogue loop rolled (#pragma unroll 1).
+Replace _e2m1_code with inline PTX cvt.rn.satfinite.e2m1x2.f32 helpers (dsv41_e2m1x2, dsv41_e2m1x8, dsv41_store_e2m1x8, dsv41_store_e2m1x32), vectorizing 4-byte per-lane stores in mxfp4_norm_rope_quantize_v41 and 16-byte per-group stores in mxfp4_quantize_v41.
+
+The mxfp8_gemm_rope_mxfp4_decode epilogue keeps its T.serial row loop, which nvcc now unrolls. The first revision forced it rolled (#pragma unroll 1); at block_M=16 the loop's counter, pointer and branch path then cost about the conversion's whole gain, and decode M=1..4 ran no faster than the software path (GB10 kernel time about 5.1 us for both at M=1). Unrolled, it takes 4.90 us.
+
+Measured on GB10 (sp8), kernel time from CUPTI over isolated launches, 1107 -> this patch:
+- mxfp8_gemm_rope_mxfp4_decode (N=4096, K=1280): M=1 5.09 -> 4.90 us, M=8 5.60 -> 5.31, M=16 6.56 -> 6.24, M=32 9.41 -> 9.06, M=64 15.68 -> 15.01.
+- mxfp4_quantize_v41 paged keys: M=1 1.95 -> 1.22 us, M=2048 3.90 -> 2.62, M=8192 13.63 -> 5.92.
+CUDA-graph replay of the PR bench's cases is faster in all 45 (two boots each): GEMM 1.04-1.05x at every M, query RoPE 1.57x to M=512, paged keys 1.4-2.1x, norm-RoPE 1.19-1.50x; query RoPE M=8192 is memory-bound (1.003x). The PR bench's eager timings at small M sit on the host launch path (about 3.9 us for the quantizers, 6.2 us for the GEMM) and do not resolve these kernel times.
 
 Quality:
 100% bit-exact (torch.equal on packed E2M1 bytes, UE8M0 scales, and paged index-cache pool buffers) to the nearest-even software reference across all decode and prefill shapes, including exact E2M1 tie midpoints, subnormals, and saturating inputs.
 
 Tests:
-- pytest tests/models/test_deepseek_v4_1_lsa.py tests/kernels/quantization/test_deepseek_v41_block_scale_words.py tests/kernels/quantization/test_deepseek_v41_tilelang_linear.py tests/kernels/attention/test_deepseek_v41_tilelang.py (28 passed, 0 PDL violations across 2 boots on GB10).
+- pytest tests/models/test_deepseek_v4_1_lsa.py tests/kernels/quantization/test_deepseek_v41_block_scale_words.py tests/kernels/quantization/test_deepseek_v41_tilelang_linear.py tests/kernels/attention/test_deepseek_v41_tilelang.py (-k selection of the experiment README; 28 passed on 2 boots on GB10).
+- test_hw_e2m1x2_codegen_in_gemm_and_indexer_quantizers also checks that the GEMM epilogue loop is not forced rolled.
 
 Upstream status: local SM121 TileLang kernel optimization; not applicable upstream.
 ---
- .../test_deepseek_v41_tilelang_linear.py      | 45 ++++++++++
+ .../test_deepseek_v41_tilelang_linear.py      | 47 ++++++++++
  tests/models/test_deepseek_v4_1_lsa.py        |  6 ++
  vllm/models/deepseek_v4_1/tilelang/gemm.py    | 78 +++++++++++-----
  vllm/models/deepseek_v4_1/tilelang/indexer.py | 88 +++++++++++++------
- 4 files changed, 170 insertions(+), 47 deletions(-)
+ 4 files changed, 173 insertions(+), 46 deletions(-)
 
 diff --git a/tests/kernels/quantization/test_deepseek_v41_tilelang_linear.py b/tests/kernels/quantization/test_deepseek_v41_tilelang_linear.py
-index b5c16fbb2..4271ab614 100644
+index b5c16fb..d4c0f22 100644
 --- a/tests/kernels/quantization/test_deepseek_v41_tilelang_linear.py
 +++ b/tests/kernels/quantization/test_deepseek_v41_tilelang_linear.py
 @@ -44,6 +44,15 @@ DEVICE = "cuda"
@@ -50,7 +58,7 @@ index b5c16fbb2..4271ab614 100644
  def _gen(seed):
      return torch.Generator(device=DEVICE).manual_seed(seed)
  
-@@ -953,3 +962,39 @@ def test_mxfp8_gemm_rope_mxfp4_decode_matches_reference(default_vllm_config):
+@@ -953,3 +962,41 @@ def test_mxfp8_gemm_rope_mxfp4_decode_matches_reference(default_vllm_config):
                  )
              assert torch.equal(q_out, q_ref), f"q mismatch at rows={rows}"
              assert torch.equal(s_out, s_ref), f"s mismatch at rows={rows}"
@@ -73,6 +81,8 @@ index b5c16fbb2..4271ab614 100644
 +    ).get_kernel_source()
 +    assert "cvt.rn.satfinite.e2m1x2.f32" in gemm_src
 +    assert "dsv41_e2m1x2(" in gemm_src
++    # The epilogue row loop stays unforced so nvcc can unroll it (decode M=1..16).
++    assert "#pragma unroll 1" not in gemm_src
 +
 +    for q_kernel in (
 +        mxfp4_quantize_v41(paged=False),
@@ -91,7 +101,7 @@ index b5c16fbb2..4271ab614 100644
 +        assert "cvt.rn.satfinite.e2m1x2.f32" in src
 +        assert "dsv41_store_e2m1x8(" in src
 diff --git a/tests/models/test_deepseek_v4_1_lsa.py b/tests/models/test_deepseek_v4_1_lsa.py
-index f78607017..661989840 100644
+index f786070..6619898 100644
 --- a/tests/models/test_deepseek_v4_1_lsa.py
 +++ b/tests/models/test_deepseek_v4_1_lsa.py
 @@ -82,6 +82,12 @@ def test_lsa_module_cleanliness_and_pdl_invariants():
@@ -108,7 +118,7 @@ index f78607017..661989840 100644
      qr_tree = ast.parse(qr_text)
      cm_tree = ast.parse(cm_text)
 diff --git a/vllm/models/deepseek_v4_1/tilelang/gemm.py b/vllm/models/deepseek_v4_1/tilelang/gemm.py
-index c2443adcb..6820e140f 100644
+index c2443ad..b61fb2a 100644
 --- a/vllm/models/deepseek_v4_1/tilelang/gemm.py
 +++ b/vllm/models/deepseek_v4_1/tilelang/gemm.py
 @@ -413,21 +413,58 @@ mxfp8_gemm_partials = tilelang.jit(
@@ -193,21 +203,21 @@ index c2443adcb..6820e140f 100644
              if swizzle_panel:
                  T.use_swizzle(panel_size=swizzle_panel)
              pdl.chain()
-@@ -602,10 +640,10 @@ def _mxfp8_gemm_rope_mxfp4_decode(
+@@ -602,9 +640,11 @@ def _mxfp8_gemm_rope_mxfp4_decode(
              scale = T.alloc_var(T.float32)
              sv0 = T.alloc_var(T.float32)
              sv1 = T.alloc_var(T.float32)
 -            c_lo = T.alloc_var(T.int32)
 -            c_hi = T.alloc_var(T.int32)
  
--            for it in T.serial(iters):
-+            for it in T.unroll(
-+                iters, explicit=False, annotations={"pragma_unroll_factor": 1}
-+            ):
++            # A plain loop: nvcc unrolls it now that the E2M1 body is short. Kept
++            # rolled (#pragma unroll 1), each row pays the loop's counter, pointer
++            # and branch path, which at block_M=16 costs about the conversion's
++            # whole gain at M=1..4 (GB10 kernel time).
+             for it in T.serial(iters):
                  row_local = it * rows_per_iter + row_in_iter
                  m = by * block_M + row_local
-                 if m < M:
-@@ -642,9 +680,7 @@ def _mxfp8_gemm_rope_mxfp4_decode(
+@@ -642,9 +682,7 @@ def _mxfp8_gemm_rope_mxfp4_decode(
                      )
                      sv0 = T.fmul(v0, scale)
                      sv1 = T.fmul(v1, scale)
@@ -219,7 +229,7 @@ index c2443adcb..6820e140f 100644
                          S[m, col0 // SF_BLOCK] = T.cast(sf, T.uint8)
  
 diff --git a/vllm/models/deepseek_v4_1/tilelang/indexer.py b/vllm/models/deepseek_v4_1/tilelang/indexer.py
-index f8bc3fa91..9ea60be69 100644
+index 4746cef..53db71e 100644
 --- a/vllm/models/deepseek_v4_1/tilelang/indexer.py
 +++ b/vllm/models/deepseek_v4_1/tilelang/indexer.py
 @@ -47,7 +47,7 @@ import tilelang.language as T
@@ -231,7 +241,7 @@ index f8bc3fa91..9ea60be69 100644
  
  INDEX_HEADS = 32
  INDEX_DIM = 128
-@@ -411,11 +411,33 @@ def indexer_score_v41(
+@@ -576,11 +576,33 @@ def indexer_score_v41(
      return indexer_score
  
  
@@ -270,7 +280,7 @@ index f8bc3fa91..9ea60be69 100644
  
  
  @tilelang.jit
-@@ -450,6 +472,7 @@ def mxfp4_quantize_v41(
+@@ -615,6 +637,7 @@ def mxfp4_quantize_v41(
      @T.macro
      def body(X, Positions, CosSin, Q, S, Slots, Pool):
          with T.Kernel(T.ceildiv(rows * groups, threads), threads=threads) as bx:
@@ -278,7 +288,7 @@ index f8bc3fa91..9ea60be69 100644
              tx = T.get_thread_binding()
              g = bx * threads + tx
              row, k = g // groups, g % groups
-@@ -504,16 +527,22 @@ def mxfp4_quantize_v41(
+@@ -669,16 +692,22 @@ def mxfp4_quantize_v41(
                      slot = slot_l[0]
                      page, token = slot // page_size, slot % page_size
                      if (slot >= 0) & (page < pool_pages):
@@ -307,7 +317,7 @@ index f8bc3fa91..9ea60be69 100644
                      S[row, k] = T.cast(sf, T.uint8)
  
      if paged:
-@@ -638,6 +667,7 @@ def mxfp4_norm_rope_quantize_v41(
+@@ -803,6 +832,7 @@ def mxfp4_norm_rope_quantize_v41(
      @T.macro
      def body(X, Weight, Positions, CosSin, Slots, Pool):
          with T.Kernel(T.ceildiv(rows, kb), threads=_THREADS) as bx:
@@ -315,7 +325,7 @@ index f8bc3fa91..9ea60be69 100644
              tid = T.get_thread_binding()
              k_sum_partial = T.alloc_fragment((kb, kt), T.float32)
              k_warp_reducer = T.alloc_reducer((kb, 1), T.float32, op="sum")
-@@ -769,20 +799,26 @@ def mxfp4_norm_rope_quantize_v41(
+@@ -934,20 +964,26 @@ def mxfp4_norm_rope_quantize_v41(
                          scale = T.reinterpret(
                              T.cast(T.shift_left(254 - sf, 23), T.uint32), T.float32
                          )
@@ -357,5 +367,5 @@ index f8bc3fa91..9ea60be69 100644
                              Pool[
                                  page,
 -- 
-2.43.0
+2.54.0 (Apple Git-157)
 
