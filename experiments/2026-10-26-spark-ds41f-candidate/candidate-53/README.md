@@ -107,10 +107,10 @@ Each testbed opens its window with `scripts/lab.py`, after the hold and idle gua
    memory ([step 6](../../../docs/release-benchmark.md#6-screen)):
    - `single-stream` for #971's paired decode at 1 stream;
    - `sampled` for the sampled realizations #971 and #977 may change;
-   - `release-tp3` for #984's short-request TTFT during a long prefill (the stall rows).
+   - the stall steps alone ([../candidate-50/stall-tp3-suite.json](../candidate-50/stall-tp3-suite.json), release-tp3's three stall steps) for #984's short-request TTFT during a long prefill. It runs as a second measure job, against candidate-50's run of the same suite in the sp5 window (`stall-tp3-switched.json`). The full `release-tp3` suite halts at its model step on sp5, at the 4 GiB bench memory floor.
    - **Reference:** candidate-50's runs at `tp3-switched`, the accumulated base. They are recorded at
      `experiments/2026-10-26-spark-ds41f-candidate/candidate-50/receipts/references/candidate-50-no1009-tp3-switched-screen`,
-     with the companions beside it as `-single-stream`, `-sampled` and `-release-tp3`.
+     with the companions beside it as `-single-stream` and `-sampled`.
      candidate-50's [screen-tp3-switched.json](../candidate-50/screen-tp3-switched.json) and
      [companions-tp3-switched.json](../candidate-50/companions-tp3-switched.json) record them.
    - **The references are pending** until the coordinator commits them; until then the lab's dry run reports them missing.
