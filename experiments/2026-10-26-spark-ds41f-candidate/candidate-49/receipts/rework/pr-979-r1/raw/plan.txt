@@ -1,0 +1,23 @@
+# PR #979 rework r1 plan, written 2026-11-09T12:19:42Z before any bench run
+Arms (each = spark-ds41f:1107 + the arm overlay of the 7 vLLM files, bound read-only):
+  corrA = 0762..0765 + corrected 0766 + 0767 (A: one-shot RoCE gather only on sparknet ring4; one-slice
+          project_exchange_rows back to 1107s serial path; sliced pipeline at slices>=2 kept)
+          sp_prefill.py sha256 cf8b0302dd38061b7ebfa2677e00805a2c1394111c7c6b3d2ea383153fde2dcf
+  corrB = same, but gather_many exactly 1107s grouped PyNCCL (no one-shot gather anywhere)
+          sp_prefill.py sha256 cd10236f284af1ed43e1d7a00c74971935cc82864a4729a2925ac811de573f1a
+  base0 = candidate-49 without #979 (0762..0765 + 0767), == own-mark no979 (880ff323...)
+  orig  = candidate-49 with original #979 (0762..0767), == own-mark c49 (58e7f257...)
+Sequence (same session), per topology ring4 then direct, 2 boots per arm, mirrored order:
+  corrA corrB base0 orig | orig base0 corrB corrA
+Bench: own-mark bench_979_integrated.py unchanged (sha256 b05cd796...): same T, shapes, seeds,
+  12 warmup + 40 timed iterations, >=200 ms GPU warm-up before timing.
+Judging (pre-registered): per cell (op x T x topology), interval = the two boot medians of an arm;
+  "loss" = corrected arm min(boot medians) > baseline max, "gain" = corrected max < baseline min,
+  on max-rank medians and on rank0 medians. Mark: project_exchange_rows T>=6144 gain on both
+  topologies, bit-exact. Rule: no loss cell vs base0 on max-rank or rank0, except cells where the
+  corrected arm and base0 run identical code, which are judged as A/A (identical-code pairs).
+Choice corrA vs corrB (pre-registered): corrA only if, on ring4 at the one-shot-routed T (<=1024),
+  corrA and orig (identical gather code) are each faster than base0 beyond the interval at >=1 T
+  on max-rank and neither is slower beyond the interval at any T on max-rank or rank0;
+  otherwise corrB.
+# A/A appendix, started 2026-11-09T12:34:33Z right after the main sequence: base0 boots 3 and 4 per topology (same arm, same code as base0 boots 1 and 2), to measure how often identical code reads beyond the two-boot interval
