@@ -1,63 +1,29 @@
-From d12ac8eaf4d79c2cc054a04350a45be3f53e358b Mon Sep 17 00:00:00 2001
-From: Christopher Owen <root@your.mom>
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Christopher Owen <3221756+christopherowen@users.noreply.github.com>
 Date: Sun, 8 Nov 2026 11:30:00 +0100
 Subject: [PATCH] perf(cudagraph): capture target FULL attention/CED metadata
- replay and fix post-gate shared-expert fork
+ replay and deduplicate DFlash padding
 
-Upstream base: 1107 vLLM patch head 320021e3c4dbb202d911ab70e2cd924c75420488 (tree ed1bdb7a7684da33d403a055521ac0c4dd7ca670).
+Upstream base: 1107 vLLM patch head 2756478b60b90700b9918b457aeb38657da637b5 (tree ed1bdb7a7684da33d403a055521ac0c4dd7ca670).
 
 Rationale:
 1. On every CUDAGraphMode.FULL target decode step in 1107, GPUModelRunner.execute_model unconditionally invoked build_slot_mappings_by_layer (90-layer dict) and model_state.prepare_attn, which allocated two fresh pinned host tensors via torch.tensor(..., pin_memory=True) in CEDState.stage, issued two H2D copies, launched ced_kernels.requests(..., compact=False) eagerly, and looped over all 23 target KV-cache groups to launch 23 separate tl_metadata.builder kernels eagerly from Python (~420-436 us/step), even though run_fullgraph and DFlashSpeculator.propose ignore the returned attn_metadata and slot_mappings_by_layer dicts.
    - Extend ModelCudaGraphManager.capture to record model_state.prepare_cudagraph_replay (invoking ced_kernels.requests(..., compact=False) in-graph) and each attention group builder's prepare_cudagraph_replay inside every CUDAGraphMode.FULL target graph when can_capture_full_attn_metadata holds.
    - Skip build_slot_mappings_by_layer and model_state.prepare_attn on runtime CUDAGraphMode.FULL steps when captures_full_attn_metadata is active, staging only changed CED replay floors through a preallocated 4-slot pinned host ring buffer in CEDState.stage_floors (~390 us/step saved).
 2. In DFlashSpeculator.propose, tilelang_inputs.padding_rows(self._is_padding, live, num_tokens_padded) was launched eagerly between _context_preparer.run and query_cudagraph_manager.run_fullgraph on every step even when live was unchanged from the previous step. Track _padding_live and skip the redundant kernel launch when live is unchanged (~12 us/step saved).
-3. In DefaultMoERunner._forward_impl, patch 0657's _post_gate_hook deferral for decode batches (rows <= 32) was bypassed before _apply_quant_method ran because _forward_impl unconditionally called maybe_sync_shared_experts_stream (when workspace_size > 0) or maybe_forward_async (when workspace_size == 0, which holds whenever tilelang_mxfp8_input=True). Defer both calls in _forward_impl when fold_shared, routes_hidden_states, rows <= 32, and MULTI_STREAM_OVERLAPPED hold so shared_experts forks onto aux_stream after the 24-CTA gate GEMM as intended (~1-26 us/layer saved across M=1..28).
 
 Quality implications:
-None. All three changes preserve bit-identical outputs (torch.equal across all decode shapes at temperature=0) and add zero GPU memory overhead.
-
-Tests:
-- pytest tests/models/test_deepseek_v4_1_l2_schedule.py tests/v1/attention/test_b12x_v41_ced_metadata.py tests/v1/cudagraph/test_cudagraph_manager.py tests/v1/cudagraph/test_breakable_cudagraph.py tests/v1/spec_decode/test_dflash2.py tests/v1/spec_decode/test_dflash_prepare_inputs.py tests/v1/worker/test_gpu_model_runner_v2.py
-
-Upstream status:
-Local GB10 CUDA graph and MoE stream-overlap optimizations.
+None. Both changes preserve bit-identical outputs (torch.equal across all decode shapes at temperature=0) and add zero GPU memory overhead.
 ---
- .../models/test_deepseek_v4_1_l2_schedule.py  | 17 ++++
  .../attention/test_b12x_v41_ced_metadata.py   | 42 ++++++++
  tests/v1/cudagraph/test_cudagraph_manager.py  | 99 +++++++++++++++++++
- .../layers/fused_moe/runner/moe_runner.py     | 19 +++-
  vllm/models/deepseek_v4_1/ced.py              | 87 +++++++++++++---
  .../deepseek_v4_1/nvidia/model_state.py       | 20 ++++
  vllm/v1/worker/gpu/cudagraph_utils.py         | 64 ++++++++++++
  vllm/v1/worker/gpu/model_runner.py            | 75 +++++++++-----
  .../gpu/spec_decode/dflash/speculator.py      | 14 ++-
- 9 files changed, 390 insertions(+), 47 deletions(-)
+ 7 files changed, 358 insertions(+), 43 deletions(-)
 
-diff --git a/tests/models/test_deepseek_v4_1_l2_schedule.py b/tests/models/test_deepseek_v4_1_l2_schedule.py
-index b11d3cf8f..d4bc82f6b 100644
---- a/tests/models/test_deepseek_v4_1_l2_schedule.py
-+++ b/tests/models/test_deepseek_v4_1_l2_schedule.py
-@@ -246,3 +246,20 @@ def test_decode_shared_experts_launch_after_router_gate():
-     x48 = torch.zeros(48, 16)
-     MoERunner._apply_quant_method(runner, x48, x48, x48)
-     assert events == ["shared_async", "gate", "topk", "routed", "shared_wait"]
-+
-+    from contextlib import nullcontext
-+
-+    runner.gate = None
-+    runner.routed_experts._ensure_moe_quant_config_init = lambda: None
-+    runner._sequence_parallel_context = nullcontext
-+    runner._maybe_dispatch = lambda h, r: (h, r)
-+    runner._apply_quant_method = lambda **kw: MoERunner._apply_quant_method(runner, **kw)
-+    runner._maybe_combine = lambda s, h: (s, h)
-+
-+    events.clear()
-+    MoERunner._forward_impl(runner, x6, None, x6)
-+    assert events == ["gate", "shared_async", "topk", "routed", "shared_wait"]
-+
-+    events.clear()
-+    MoERunner._forward_impl(runner, x48, None, x48)
-+    assert events == ["shared_async", "gate", "topk", "routed", "shared_wait"]
 diff --git a/tests/v1/attention/test_b12x_v41_ced_metadata.py b/tests/v1/attention/test_b12x_v41_ced_metadata.py
 index 8256a0eee..f1add511f 100644
 --- a/tests/v1/attention/test_b12x_v41_ced_metadata.py
@@ -215,39 +181,6 @@ index ca3e70ad8..ca8f867f9 100644
 +        if mode == CUDAGraphMode.FULL
 +        else ["model", "model"]
 +    )
-diff --git a/vllm/model_executor/layers/fused_moe/runner/moe_runner.py b/vllm/model_executor/layers/fused_moe/runner/moe_runner.py
-index 465e02b80..9e6ce5fd3 100644
---- a/vllm/model_executor/layers/fused_moe/runner/moe_runner.py
-+++ b/vllm/model_executor/layers/fused_moe/runner/moe_runner.py
-@@ -1198,13 +1198,24 @@ class MoERunner(MoERunnerInterface):
-         shared_experts_overlapping = False
-         if self._shared_experts is not None:
-             assert shared_experts_input is not None
-+            experts = getattr(self._quant_method, "modular_experts", None)
-+            defer_shared_until_post_gate = (
-+                getattr(experts, "fold_shared", False)
-+                and getattr(self.router, "routes_hidden_states", False)
-+                and hidden_states.shape[0] <= 32
-+                and self._shared_experts._determine_shared_experts_order(
-+                    shared_experts_input
-+                )
-+                == SharedExpertsOrder.MULTI_STREAM_OVERLAPPED
-+            )
-             if self._shared_experts.workspace_size(shared_experts_input):
-                 # Dispatch determines routed scratch sizes. Reserve both branches
-                 # together before launching arena-backed shared experts.
--                self._shared_experts.maybe_sync_shared_experts_stream(
--                    shared_experts_input
--                )
--            else:
-+                if not defer_shared_until_post_gate:
-+                    self._shared_experts.maybe_sync_shared_experts_stream(
-+                        shared_experts_input
-+                    )
-+            elif not defer_shared_until_post_gate:
-                 shared_experts_overlapping = self._shared_experts.maybe_forward_async(
-                     shared_experts_input
-                 )
 diff --git a/vllm/models/deepseek_v4_1/ced.py b/vllm/models/deepseek_v4_1/ced.py
 index 8ecaa4fde..902865482 100644
 --- a/vllm/models/deepseek_v4_1/ced.py

@@ -3,7 +3,7 @@
 - **Date**: 2026-11-08
 - **Base deployment commit**: `cc20ed18be1f7cbf5c6c53cdee945f7cc77d5fc5` (`spark-ds41f-1107`)
 - **Base vLLM commit**: `320021e3c4dbb202d911ab70e2cd924c75420488` (tree `ed1bdb7a7684da33d403a055521ac0c4dd7ca670`, `0001..0761`)
-- **Candidate vLLM commit**: `fccfedd5a7dd22edb0c398f6b10982ccc0d51897` (tree `5a208cb8f5766b164487dc4502dc0eba8b3242a5`, `0001..0762`, `patchset_sha256` `0cad7524d871b0cae5744b5e13432e9a831145f92f8c369fe84eef00ccf04b13`)
+- **Candidate vLLM commit**: `0bf35efc7d78c20d159eb7eed6f883b5668662f7` (tree `500c40bf9f3eb031be5652b362cf58597fdd9d2c`, `0001..0762`, `patchset_sha256` `be3026d7335a9e31383e3eaff32fe0fffa50f65bb1338031f61bc2dc07060917`)
 - **Verification node**: `sp6` (`spark-0014`, NVIDIA GB10 `sm_121a`, CUDA 13.0.2, `spark-ds41f:1107`)
 
 ---
