@@ -1023,11 +1023,8 @@ candidate, which is qualified on all shapes. Marks, runs and rework rules are in
 
 ## Candidate 50 ([candidate-50/](candidate-50))
 
-The release candidate for release qualification: spark-ds41f-1107 plus every PR that passed PR
-validation in candidates 47-49 (#966, #997, #965, #1012, #1016, #964, #955, #980, #1013, #972, #1011,
-#973, #999, #993, #991, #1009, #979, #996), each reworked PR as its corrected patch. It is qualified on
-`tp4-ring`, `tp4-switched`, `tp3-switched`, `tp8-switched` and `tp3-triangle`. Sources, stacking, declared output
-changes and the qualification plan are in its README.
+The merged base of candidates 47-49: spark-ds41f-1107 plus every PR that passed PR validation in candidates 47-49 (#966, #997, #965, #1012, #1016, #964, #955, #980, #1013, #972, #1011,
+#973, #999, #993, #991, #1009, #979, #996), each reworked PR as its corrected patch. It is verified, not release-qualified (the owner, 2026-11-09: dozens more PRs before a release), on `tp4-ring`, `tp4-switched` and `tp3-switched`. It is verified without #1009, which breaks the `tp4-ring` boot and is in rework. Sources, stacking and the runs are in its README.
 
 - **Series:** [candidate-50/vllm/series](candidate-50/vllm/series) (`0001..0780`, 660 patches;
   `patchset_sha256` `38d230e9`, `patch_head` `ba7400d9`, `expected_tree` `d5778ab5`).
