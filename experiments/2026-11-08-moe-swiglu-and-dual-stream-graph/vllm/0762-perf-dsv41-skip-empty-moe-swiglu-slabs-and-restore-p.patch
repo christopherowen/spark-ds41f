@@ -1,34 +1,24 @@
-From b8e65c4bdb17d085daeb55c1368389bc35239386 Mon Sep 17 00:00:00 2001
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: Christopher Owen <3221756+christopherowen@users.noreply.github.com>
 Date: Sun, 8 Nov 2026 21:00:00 +0100
-Subject: [PATCH] perf(dsv41): skip empty moe_swiglu_cast slabs and restore
- post-gate shared_experts hook
+Subject: [PATCH] perf(dsv41): skip empty moe_swiglu_cast slabs and cascade
+ 1-row PDL preloads
 
 Base: 1107 vLLM patch head 2756478b60b90700b9918b457aeb38657da637b5.
 
 Rationale:
-1. In vllm/models/deepseek_v4_1/tilelang/moe.py, moe_swiglu_cast launched rows_per_cta = 4 if warps >= 4 else 2 (only 2 rows/CTA on TP3 where intermediate = 768 and warps = 3, doubling active-tile slabs from 4 to 8), unconditionally preloaded all rows_per_cta Order and Weights entries before pdl.chain(), and after pdl.chain() stepped through every row r in 0..rows_per_cta-1 inside an unrolled loop even when orders[0] < 0 (an empty slab, which represents 75% of active-tile CTAs in decode since active experts average 1.0-2.1 rows out of 16) or orders[1] < 0 (a 1-row tile, which represents 68%-100% of slab == 0 CTAs in decode).
-   Use rows_per_cta = 2 if intermediate > 1152 else 4 so TP3 (intermediate = 768) also processes 4 rows/CTA; cascade Order and Weights preloads before pdl.chain() so empty slabs only read orders[0] and 1-row tiles only read orders[0..1] and weights[0]; exit empty slabs immediately after pdl.chain() via if expert >= 0 and orders[0] >= 0:; and guard rows 1..rows_per_cta-1 behind if rows_per_cta > 1 and orders[1] >= 0:.
-2. In vllm/model_executor/layers/fused_moe/runner/moe_runner.py, _forward_impl checked workspace_size == 0 and launched shared_experts.maybe_forward_async before _apply_quant_method even when fold_shared == True (where workspace_size == 0 is always true because shared experts accumulate directly into the routed combine buffer). That bypassed the decode router._post_gate_hook in _apply_quant_method and launched shared_experts on the side stream before router gate GEMM, causing SM contention with the router gate GEMM and cold-L2 FFN prefetch. Furthermore, when _post_gate_hook fired after partials_kernel, maybe_forward_async recorded _input_ready_event on current_stream() after partials_kernel, forcing the side stream to wait for partials_kernel before starting shared_experts.
-   Skip the pre-_apply_quant_method shared_experts launch when fold_shared is True, pre-record _input_ready_event before router.select_experts when deferring shared_experts to _post_gate_hook, and add input_ready_recorded=True to SharedExpertsRunner.maybe_forward_async so the side stream only waits on hidden_states readiness while still launching after router gate GEMM.
+In vllm/models/deepseek_v4_1/tilelang/moe.py, moe_swiglu_cast unconditionally preloaded all rows_per_cta Order and Weights entries before pdl.chain(), and after pdl.chain() stepped through every row r in 0..rows_per_cta-1 inside an unrolled loop even when orders[0] < 0 (an empty slab, which represents 75% of active-tile CTAs in decode since active experts average 1.0-2.1 rows out of 16) or orders[1] < 0 (a 1-row tile, which represents 68%-100% of slab == 0 CTAs in decode).
+Preserve rows_per_cta = 4 if warps >= 4 else 2 (keeping TP3 at rows_per_cta = 2 as measured in experiments/2026-10-18-r6w-swiglu), cascade Order and Weights preloads before pdl.chain() so empty slabs only read orders[0] and 1-row tiles only read orders[0..1] and weights[0], exit empty slabs immediately after pdl.chain() via if expert >= 0 and orders[0] >= 0:, and guard rows 1..rows_per_cta-1 behind if rows_per_cta > 1 and orders[1] >= 0:.
 
 Quality:
 Bit-identical (torch.equal, 0 uint16 diffs, max_abs_diff == 0.0) across all TP4 and TP3 shapes (M = 1..48), both standalone and end-to-end inside captured decode CUDA graphs.
-
-Tests:
-- pytest tests/models/test_deepseek_v4_1_l2_schedule.py tests/kernels/moe/test_deepseek_v41_tilelang_moe.py tests/kernels/test_deepseek_v41_tilelang_pdl.py (160 passed across 2 boots).
-
-Upstream status: local DeepSeek V4.1 TileLang MoE and dual-stream runner optimization for GB10.
 ---
  .../moe/test_deepseek_v41_tilelang_moe.py     |   8 +
- .../models/test_deepseek_v4_1_l2_schedule.py  |  33 ++-
- .../layers/fused_moe/runner/moe_runner.py     |  25 +-
- .../layers/fused_moe/runner/shared_experts.py |  30 +-
- vllm/models/deepseek_v4_1/tilelang/moe.py     | 270 ++++++++++++------
- 5 files changed, 264 insertions(+), 102 deletions(-)
+ vllm/models/deepseek_v4_1/tilelang/moe.py     | 263 ++++++++++++------
+ 2 files changed, 183 insertions(+), 88 deletions(-)
 
 diff --git a/tests/kernels/moe/test_deepseek_v41_tilelang_moe.py b/tests/kernels/moe/test_deepseek_v41_tilelang_moe.py
-index f4381b8def..7a0f4c4bce 100644
+index f4381b8de..7a0f4c4bc 100644
 --- a/tests/kernels/moe/test_deepseek_v41_tilelang_moe.py
 +++ b/tests/kernels/moe/test_deepseek_v41_tilelang_moe.py
 @@ -926,6 +926,14 @@ def test_routed_moe_pdl_preloads_before_wait():
@@ -46,200 +36,11 @@ index f4381b8def..7a0f4c4bce 100644
      comb_src = moe_combine_v41(
          5120, 6, shared=True, weighted=True, out_dtype=T.bfloat16
      ).get_kernel_source()
-diff --git a/tests/models/test_deepseek_v4_1_l2_schedule.py b/tests/models/test_deepseek_v4_1_l2_schedule.py
-index b11d3cf8f0..da615cb768 100644
---- a/tests/models/test_deepseek_v4_1_l2_schedule.py
-+++ b/tests/models/test_deepseek_v4_1_l2_schedule.py
-@@ -214,8 +214,14 @@ def test_decode_shared_experts_launch_after_router_gate():
-         def _determine_shared_experts_order(self, x):
-             return SharedExpertsOrder.MULTI_STREAM_OVERLAPPED
- 
--        def maybe_forward_async(self, x, workspace=None):
--            events.append("shared_async")
-+        def record_input_ready(self, x):
-+            events.append("shared_input_ready")
-+            return True
-+
-+        def maybe_forward_async(self, x, workspace=None, *, input_ready_recorded=False):
-+            events.append(
-+                "shared_async_prerecorded" if input_ready_recorded else "shared_async"
-+            )
-             return True
- 
-         def wait_output(self):
-@@ -224,6 +230,8 @@ def test_decode_shared_experts_launch_after_router_gate():
-         def wait(self):
-             events.append("shared_wait")
- 
-+    from contextlib import nullcontext
-+
-     runner = SimpleNamespace(
-         _shared_experts=_Shared(),
-         _maybe_apply_shared_experts=lambda *a, **k: None,
-@@ -232,17 +240,32 @@ def test_decode_shared_experts_launch_after_router_gate():
-             topk_indices_dtype=torch.int64,
-         ),
-         routed_experts=SimpleNamespace(
-+            _ensure_moe_quant_config_init=lambda: None,
-             quant_method=SimpleNamespace(is_monolithic=False),
-             forward_modular=lambda **kwargs: (events.append("routed"), "routed_out")[1],
-         ),
-         router=_Router(),
-+        gate=None,
-+        _sequence_parallel_context=nullcontext,
-+        _maybe_dispatch=lambda h, r: (h, r),
-+        _maybe_combine=lambda num_tokens, h: h,
-+    )
-+    runner._apply_quant_method = lambda **kw: MoERunner._apply_quant_method(
-+        runner, **kw
-     )
- 
-     x6 = torch.zeros(6, 16)
--    MoERunner._apply_quant_method(runner, x6, x6, x6)
--    assert events == ["gate", "shared_async", "topk", "routed", "shared_wait"]
-+    MoERunner._forward_impl(runner, x6, x6, x6)
-+    assert events == [
-+        "shared_input_ready",
-+        "gate",
-+        "shared_async_prerecorded",
-+        "topk",
-+        "routed",
-+        "shared_wait",
-+    ]
- 
-     events.clear()
-     x48 = torch.zeros(48, 16)
--    MoERunner._apply_quant_method(runner, x48, x48, x48)
-+    MoERunner._forward_impl(runner, x48, x48, x48)
-     assert events == ["shared_async", "gate", "topk", "routed", "shared_wait"]
-diff --git a/vllm/model_executor/layers/fused_moe/runner/moe_runner.py b/vllm/model_executor/layers/fused_moe/runner/moe_runner.py
-index 465e02b80d..923dbe51ba 100644
---- a/vllm/model_executor/layers/fused_moe/runner/moe_runner.py
-+++ b/vllm/model_executor/layers/fused_moe/runner/moe_runner.py
-@@ -780,23 +780,38 @@ class MoERunner(MoERunnerInterface):
-                 # prefetch.
-                 if not shared_experts_overlapping:
-                     shared_experts = self._shared_experts
-+                    input_ready_recorded = False
- 
-                     def _launch_shared() -> None:
-                         nonlocal launch_shared
-                         if launch_shared is None:
-                             return
-                         launch_shared = None
--                        launched = shared_experts.maybe_forward_async(
--                            shared_experts_input, shared_workspace
--                        )
-+                        if input_ready_recorded:
-+                            launched = shared_experts.maybe_forward_async(
-+                                shared_experts_input,
-+                                shared_workspace,
-+                                input_ready_recorded=True,
-+                            )
-+                        else:
-+                            launched = shared_experts.maybe_forward_async(
-+                                shared_experts_input, shared_workspace
-+                            )
-                         assert launched
- 
-                     launch_shared = _launch_shared
-                     if (
-                         not getattr(self.router, "routes_hidden_states", False)
-                         or hidden_states.shape[0] > 32
-+                        or self.routed_experts.quant_method.is_monolithic
-                     ):
-                         launch_shared()
-+                    else:
-+                        record_ready = getattr(
-+                            shared_experts, "record_input_ready", None
-+                        )
-+                        if record_ready is not None:
-+                            input_ready_recorded = record_ready(shared_experts_input)
-                 experts.combine_addend = self._shared_experts.wait_output
- 
-         if self.routed_experts.quant_method.is_monolithic:
-@@ -1196,7 +1211,9 @@ class MoERunner(MoERunnerInterface):
-         # If using multi-stream overlap for shared experts, we must launch it
-         # before routed expert dispatch.
-         shared_experts_overlapping = False
--        if self._shared_experts is not None:
-+        if self._shared_experts is not None and not getattr(
-+            self._quant_method.modular_experts, "fold_shared", False
-+        ):
-             assert shared_experts_input is not None
-             if self._shared_experts.workspace_size(shared_experts_input):
-                 # Dispatch determines routed scratch sizes. Reserve both branches
-diff --git a/vllm/model_executor/layers/fused_moe/runner/shared_experts.py b/vllm/model_executor/layers/fused_moe/runner/shared_experts.py
-index b7c9aa4013..fc8076b2d6 100644
---- a/vllm/model_executor/layers/fused_moe/runner/shared_experts.py
-+++ b/vllm/model_executor/layers/fused_moe/runner/shared_experts.py
-@@ -140,10 +140,35 @@ class SharedExperts(torch.nn.Module):
-         else:
-             return SharedExpertsOrder.NO_OVERLAP
- 
-+    def record_input_ready(
-+        self,
-+        shared_experts_input: torch.Tensor,
-+    ) -> bool:
-+        """Record ``_input_ready_event`` on the main stream before router gate launch.
-+
-+        When the aux-stream shared expert launch is deferred until after the router
-+        gate GEMM (``_post_gate_hook``), recording the input-ready event before the
-+        gate GEMM lets the aux stream start immediately without waiting on the gate
-+        GEMM or inserting an event record between the gate GEMM and top-k routing.
-+        """
-+        if (
-+            self._determine_shared_experts_order(shared_experts_input)
-+            != SharedExpertsOrder.MULTI_STREAM_OVERLAPPED
-+        ):
-+            return False
-+        assert self._stream is not None
-+        idx = self._output_idx
-+        assert self._output[idx] is None
-+        shared_experts_input.record_stream(self._stream)
-+        self._input_ready_event[idx].record(current_stream())
-+        return True
-+
-     def maybe_forward_async(
-         self,
-         shared_experts_input: torch.Tensor,
-         workspace: torch.Tensor | None = None,
-+        *,
-+        input_ready_recorded: bool = False,
-     ) -> bool:
-         """Enqueue shared experts on the aux stream without waiting for them.
- 
-@@ -159,8 +184,9 @@ class SharedExperts(torch.nn.Module):
-         assert self._stream is not None
-         idx = self._output_idx
-         assert self._output[idx] is None
--        shared_experts_input.record_stream(self._stream)
--        self._input_ready_event[idx].record(current_stream())
-+        if not input_ready_recorded:
-+            shared_experts_input.record_stream(self._stream)
-+            self._input_ready_event[idx].record(current_stream())
-         with torch.cuda.stream(self._stream), use_preallocated_workspace(workspace):
-             self._input_ready_event[idx].wait(self._stream)
-             self._output[idx] = self._layer(shared_experts_input)
 diff --git a/vllm/models/deepseek_v4_1/tilelang/moe.py b/vllm/models/deepseek_v4_1/tilelang/moe.py
-index b12b53a354..db8883596d 100644
+index b12b53a35..dd632eadf 100644
 --- a/vllm/models/deepseek_v4_1/tilelang/moe.py
 +++ b/vllm/models/deepseek_v4_1/tilelang/moe.py
-@@ -1201,9 +1201,10 @@ def moe_swiglu_cast(intermediate, block_M, limit, rows_per_cta=None):
-     assert SF_BLOCK % vec == 0, "a scale block spans whole thread vectors"
-     warps = intermediate // chunk  # one row's warps
-     if rows_per_cta is None:
--        # Fewer warps a row (TP3's 768 columns: 3) want fewer rows a CTA in flight
--        # (GB10 bench, experiments/2026-10-18-r6w-swiglu).
--        rows_per_cta = 4 if warps >= 4 else 2
-+        # Four rows per CTA cut decode slab launches from 8 to 4 per 16-row tile at
-+        # both TP4 (576, 1152) and TP3 (768); above 1152 columns (vec=8, 6 warps),
-+        # two rows per CTA keep register pressure bounded.
-+        rows_per_cta = 2 if intermediate > 1152 else 4
-     assert block_M % rows_per_cta == 0
-     threads = warp * warps
-     reduce_rounds = (SF_BLOCK // vec).bit_length() - 1
-@@ -1213,6 +1214,99 @@ def moe_swiglu_cast(intermediate, block_M, limit, rows_per_cta=None):
+@@ -1213,6 +1213,99 @@ def moe_swiglu_cast(intermediate, block_M, limit, rows_per_cta=None):
      tiles = T.dynamic("tiles")
      rows = tiles * block_M
  
@@ -339,7 +140,7 @@ index b12b53a354..db8883596d 100644
      @T.prim_func
      def moe_swiglu_cast_kernel(
          H: T.Tensor((rows, 2 * intermediate), in_dtype),
-@@ -1235,99 +1329,93 @@ def moe_swiglu_cast(intermediate, block_M, limit, rows_per_cta=None):
+@@ -1235,99 +1328,93 @@ def moe_swiglu_cast(intermediate, block_M, limit, rows_per_cta=None):
              stored = T.alloc_local((vec,), T.float8_e4m3fn)
              amax = T.alloc_local((2,), T.float32)
              cert_min_l = T.alloc_local((2,), T.float32)
@@ -522,5 +323,5 @@ index b12b53a354..db8883596d 100644
      return moe_swiglu_cast_kernel
  
 -- 
-2.43.0
+2.54.0 (Apple Git-157)
 

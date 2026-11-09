@@ -6,8 +6,8 @@
 - **Upstream vLLM base**: `19f2c20ed4d64ae22bd009ceacadd85e2a81e354`
 - **vLLM patch series**: `experiments/2026-11-08-moe-swiglu-and-dual-stream-graph/vllm/series` (`642` active patches)
   - Patch added: `0762-perf-dsv41-skip-empty-moe-swiglu-slabs-and-restore-p.patch`
-  - Patch head: `2756478b60b90700b9918b457aeb38657da637b5` -> `b8e65c4bdb17d085daeb55c1368389bc35239386`
-  - Expected tree: `ed1bdb7a7684da33d403a055521ac0c4dd7ca670` -> `5c282295b34b626be15faa4988ebf516ab4c6407`
+  - Patch head: `2756478b60b90700b9918b457aeb38657da637b5` -> `e2c90df7ca7611dda40bebd16ca951bd85b1f322`
+  - Expected tree: `ed1bdb7a7684da33d403a055521ac0c4dd7ca670` -> `1648d2a2a84790f9c1a89e08d48d80ea5a92bd67`
 - **Hardware**: `sp6` (`spark-0014`, NVIDIA GB10 `sm_121a`)
 - **Causal variables (`TODO.md` lines 181-186 & 206-209)**:
   1. **Routed MoE `moe_swiglu_cast` empty-slab and 1-row-tile early exit + `rows_per_cta = 4` at `intermediate = 768` (`vllm/models/deepseek_v4_1/tilelang/moe.py`)**:
