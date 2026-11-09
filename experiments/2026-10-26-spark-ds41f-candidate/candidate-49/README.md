@@ -23,10 +23,22 @@ Unpromoted release candidate: spark-ds41f-1107 plus 6 PRs, prefill and long-cont
 | `0766-perf-dsv41-sp-prefill-sparknet-routing.patch` | #979 | perf(dsv41): route SP prefill gather_many and row exchange through sparknet | `c1d1bf3b76bc` |
 | `0767-perf-dsv41-cache-SP-local-routing-masks-and-skip-SP-.patch` | #996 | perf(sp-prefill): cache SP local routing masks and skip SP tail pad rows | `86d4a427f46c` |
 
-## Arms
+## Cluster configurations
 
-- [tp3-switched.json](tp3-switched.json): extends `releases/spark-ds41f-1107/cluster.json` at `tp3-switched`, and sets only the image `spark-ds41f:candidate-49`, its tree labels and this lock. No PR changes the recipe.
-- [tp3-switched-dev.json](tp3-switched-dev.json): adds the dev-mode collective RPC for the engine grid.
+A cluster configuration for every shape the recipe serves, so the candidate can be run on any setup: `bin/spark --cluster-config experiments/2026-10-26-spark-ds41f-candidate/candidate-49/<file> …` with your site's node map. Each one extends `releases/spark-ds41f-1107/cluster.json` at its shape and sets only the image `spark-ds41f:candidate-49`, its tree labels and this lock; no PR changes the recipe. The `-dev` file adds the dev-mode collective RPC that the release suite's engine grid needs. This candidate is measured at `tp3-switched` only; the other files are configurations, not part of its runs.
+
+| Shape | Configuration | With dev RPC | |
+| --- | --- | --- | --- |
+| `tp4-ring` | [tp4.json](tp4.json) | [tp4-dev.json](tp4-dev.json) |  |
+| `tp3-triangle` | [tp3.json](tp3.json) | [tp3-dev.json](tp3-dev.json) |  |
+| `tp3-triangle-4k` | [tp3-triangle-4k.json](tp3-triangle-4k.json) | [tp3-triangle-4k-dev.json](tp3-triangle-4k-dev.json) |  |
+| `tp3-switched` | [tp3-switched.json](tp3-switched.json) | [tp3-switched-dev.json](tp3-switched-dev.json) | tested here |
+| `tp4-switched` | [tp4-switched.json](tp4-switched.json) | [tp4-switched-dev.json](tp4-switched-dev.json) |  |
+| `tp5-switched` | [tp5-switched.json](tp5-switched.json) | [tp5-switched-dev.json](tp5-switched-dev.json) |  |
+| `tp6-switched` | [tp6-switched.json](tp6-switched.json) | [tp6-switched-dev.json](tp6-switched-dev.json) |  |
+| `tp7-switched` | [tp7-switched.json](tp7-switched.json) | [tp7-switched-dev.json](tp7-switched-dev.json) |  |
+| `tp8-switched` | [tp8-switched.json](tp8-switched.json) | [tp8-switched-dev.json](tp8-switched-dev.json) |  |
+
 - [image-dgx4.json](image-dgx4.json): build-only profile.
 
 ## Release tests
