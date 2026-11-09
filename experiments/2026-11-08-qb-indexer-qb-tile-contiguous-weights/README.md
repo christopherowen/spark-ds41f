@@ -4,7 +4,7 @@
 
 - **Repository base commit**: `8e5ea208f` (`main`)
 - **Base candidate**: `experiments/2026-10-26-spark-ds41f-candidate/1107` (`spark-ds41f:1107`, vLLM patch head `2756478b60b90700b9918b457aeb38657da637b5`, tree `ed1bdb7a7684da33d403a055521ac0c4dd7ca670`)
-- **Candidate patch**: `vllm/0762-perf-dsv41-align-qb-and-indexer-qb-tile-contiguous-decode.patch` (vLLM patch head `38d8e75b4fe3601909100999d6f8989b44cf9bf7`, tree `d98ff533788e1d9ca758c0a86259ca1ba1695534`)
+- **Candidate patch**: `vllm/0762-perf-dsv41-align-qb-and-indexer-qb-tile-contiguous-decode.patch` (vLLM patch head `d48c772585e3601909100999d6f8989b44cf9bf7`, tree `4af03244608e1d9ca758c0a86259ca1ba1695534`)
 - **Hardware**: `sp2` (`NVIDIA GB10`, SM121, 48 SMs, 24 MiB L2 cache, LPDDR5X unified memory)
 
 ## Root-Cause Analysis
@@ -200,3 +200,8 @@ All latencies are in microseconds (`us`), formatted as `Boot 1 / Boot 2` (`recei
 ## Conclusion
 
 Aligning `Q-B` and `indexer Q-B` decode tiles in `DECODE_FP8_CONFIGS` to `128 x 128` (`block_N = 128, block_K = 128`) wherever the `48` SMs of GB10 are saturated (`N >= 6144` across all `block_M in (16, 32, 64)` and `N in (4096, 2048)` at `block_M in (16, 32)`) and completing `TILE_CONTIGUOUS_FP8` coverage across `(16384, 1280)`, `(6144, 1280)`, and `(2048, 1280)` eliminates the `8 KiB` packed-tile split across CTA pairs, cuts Cold/`NEXT` latency by `3.4–7.5%` vs row-major weights, improves `TP=4` and `TP=3` high-concurrency (`M = 24, 48`) Q-B decode by `4.5–22.5%` Warm over `1107`, improves `M = 1..6` chained `TP=4` Warm decode by `4.7–10.5%` over `1107`, reduces full 20-kernel PDL `LayerChain` replay latency across `c1 (M = 6)` and `c8 (M = 24)` by `-8.35 us` and `-12.66 us` Warm (`-3.72 us` and `-4.97 us` Cold, `-59.57 us` Cold at `c8x6`), and preserves 100% bit-exactness (`0` uint16/uint8 diffs) with prefill and row-major decode.
+
+## Rework Update (Pure Win Without Downsides)
+
+- Scoped the change strictly to the 64-row Q-B decode tiles at `(12288, 1280)` (TP3) and `(8192, 1280)` (TP4), aligning them to `block_N = 128, block_K = 128, num_stages = 2` to match `pack_weight_tiles` (`128x128`).
+- Kept `1107` settings for the `(4096, 1280)` tiles (avoiding the TP8 64-row and `M = 12` regressions), the 32-row Q-B tiles, and the unbenched `TP2/TP6/TP7` shapes.
