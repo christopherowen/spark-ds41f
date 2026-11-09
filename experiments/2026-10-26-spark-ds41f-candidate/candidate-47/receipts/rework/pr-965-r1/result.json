@@ -1,0 +1,383 @@
+{
+ "pr": 965,
+ "round": 1,
+ "candidate": "candidate-47",
+ "verdict": "corrected-meets-mark",
+ "reason": "Both failures have one cause: the original 0766 made BlockTables.apply_staged_writes() return unless append_block_ids() had set _dirty, so writes staged on the block tables directly (as both tests stage them) were neither applied nor cleared. Serving was not affected: production stages block-table writes only through append_block_ids(), which sets _dirty, and the declared-call mismatch was a declared fused write the test no longer launched (launched - declared was empty), not an undeclared launch. The correction skips only when nothing is staged and num_blocks is unchanged (the 1107 no-op case), so both tests pass unchanged, the series still applies, output stays bit-exact and the step-time gain holds beyond the interval on two boots at c1, c8 and c16.",
+ "host": "sp8 (spark-0016), NVIDIA GB10",
+ "stack": "spark-ds41f:1107 (sha256:3f32a962ce04b7c8d85337cd427a8946b8b6bcaadd97cc8d8a8cd14e8d68a6ce) with candidate-47's 0762..0769 bind-mounted (26 files); corrected stack: the same with the corrected 0766",
+ "patch": {
+  "file": "0766-perf-worker-eliminate-decode-step-h2d-and-aten-overhead.patch",
+  "sha256": "3cc90fd7cbd7e4bbc6d70195c4f520b9f2779181b7d7b694c873ced472652155",
+  "author": "Christopher Owen <3221756+christopherowen@users.noreply.github.com>, Sun, 8 Nov 2026 12:15:00 +0100 (kept)",
+  "applies_on": "0762..0765; 0767, 0768, 0769 apply after it",
+  "integrated_tree": "7bafc5b11d3111ae3550d16e23f14c035137f2a6 (0762..0769 with the corrected 0766, the tree tested)",
+  "change_vs_original": "vllm/v1/worker/gpu/block_table.py: apply_staged_writes() returns early only when not _dirty and no table has staged writes; tests/v1/worker/test_gpu_block_table.py: one new test (a write staged on a table directly lands); commit message rationale/fix item 2 and Tests updated"
+ },
+ "tests": {
+  "tests/v1/worker/test_gpu_tilelang_inputs.py": {
+   "original_0766": "2 failed, 680 passed, 1 skipped (test_apply_fused_staged_writes, test_declared_calls_cover_the_call_sites)",
+   "corrected_0766": "682 passed, 1 skipped"
+  },
+  "diagnosis_declared_calls": {
+   "original_0766": "launched 14, declared 15; launched - declared: none; declared - launched: apply_write_kernel ('int32', True) (FusedStagedWriter)",
+   "corrected_0766": "launched 15 = declared 15"
+  },
+  "diagnosis_fused_writes": {
+   "original_0766": "57 writes staged, _dirty False: 0/7 tables written, 57 writes left staged",
+   "corrected_0766": "7/7 tables written, 0 left staged"
+  },
+  "release_gate_files_tests_v1_worker_and_spec_decode_corrected": {
+   "files": 50,
+   "passed": 4567,
+   "failed": 1,
+   "skipped": 8,
+   "error": 0,
+   "pr_965_own_files": "test_acceptance_estimator 16, test_adaptive_verification 44 (+1 skip), test_copy_drafts 44, test_gpu_block_table 15, test_gpu_model_runner_v2 42, test_gpu_input_batch_v2 65: all pass",
+   "the_one_failure": "tests/v1/worker/test_workspace.py::test_v41_tilelang_attention_reserves_scratch_in_its_model_lane (AttributeError: 'DeepseekV41TileLangAttention' object has no attribute 'indexer'): not #965's. It fails identically on candidate-47 as built (original 0766) and with the correction, and passes with the corrected series stopped at 0766; of 0767..0769 only 0767 (#1012) touches vllm/models/deepseek_v4_1/attention.py."
+  }
+ },
+ "harness": {
+  "name": "bench_step_fastpath.py from PR #965 head 52c00805 (sha256 8e07e05b...), unchanged; 50 warmup + 300 timed iterations per mode and concurrency; baseline = 1107 behaviour emulated in-process",
+  "total_step_overhead_mean": {
+   "c1": {
+    "original_0766": {
+     "baseline_us": [
+      253.13,
+      258.82
+     ],
+     "candidate_us": [
+      126.0,
+      125.52
+     ],
+     "gain_beyond_interval": true,
+     "bit_exact": [
+      true,
+      true
+     ]
+    },
+    "corrected_0766": {
+     "baseline_us": [
+      256.45,
+      255.59
+     ],
+     "candidate_us": [
+      124.9,
+      124.23
+     ],
+     "gain_beyond_interval": true,
+     "bit_exact": [
+      true,
+      true
+     ]
+    },
+    "corrected_minus_original_candidate_mean_us": -1.19
+   },
+   "c8": {
+    "original_0766": {
+     "baseline_us": [
+      277.39,
+      278.15
+     ],
+     "candidate_us": [
+      137.38,
+      135.53
+     ],
+     "gain_beyond_interval": true,
+     "bit_exact": [
+      true,
+      true
+     ]
+    },
+    "corrected_0766": {
+     "baseline_us": [
+      280.89,
+      273.0
+     ],
+     "candidate_us": [
+      141.0,
+      135.52
+     ],
+     "gain_beyond_interval": true,
+     "bit_exact": [
+      true,
+      true
+     ]
+    },
+    "corrected_minus_original_candidate_mean_us": 1.81
+   },
+   "c16": {
+    "original_0766": {
+     "baseline_us": [
+      288.28,
+      279.42
+     ],
+     "candidate_us": [
+      144.17,
+      143.69
+     ],
+     "gain_beyond_interval": true,
+     "bit_exact": [
+      true,
+      true
+     ]
+    },
+    "corrected_0766": {
+     "baseline_us": [
+      283.19,
+      279.85
+     ],
+     "candidate_us": [
+      143.43,
+      144.51
+     ],
+     "gain_beyond_interval": true,
+     "bit_exact": [
+      true,
+      true
+     ]
+    },
+    "corrected_minus_original_candidate_mean_us": 0.04
+   }
+  },
+  "pipelined_step_overhead_mean": {
+   "c1": {
+    "original_0766": {
+     "baseline_us": [
+      248.73,
+      250.77
+     ],
+     "candidate_us": [
+      119.65,
+      121.22
+     ],
+     "gain_beyond_interval": true,
+     "bit_exact": [
+      true,
+      true
+     ]
+    },
+    "corrected_0766": {
+     "baseline_us": [
+      255.75,
+      251.83
+     ],
+     "candidate_us": [
+      119.02,
+      117.09
+     ],
+     "gain_beyond_interval": true,
+     "bit_exact": [
+      true,
+      true
+     ]
+    },
+    "corrected_minus_original_candidate_mean_us": -2.38
+   },
+   "c8": {
+    "original_0766": {
+     "baseline_us": [
+      265.08,
+      263.71
+     ],
+     "candidate_us": [
+      130.35,
+      129.07
+     ],
+     "gain_beyond_interval": true,
+     "bit_exact": [
+      true,
+      true
+     ]
+    },
+    "corrected_0766": {
+     "baseline_us": [
+      263.37,
+      262.78
+     ],
+     "candidate_us": [
+      130.56,
+      128.72
+     ],
+     "gain_beyond_interval": true,
+     "bit_exact": [
+      true,
+      true
+     ]
+    },
+    "corrected_minus_original_candidate_mean_us": -0.07
+   },
+   "c16": {
+    "original_0766": {
+     "baseline_us": [
+      274.72,
+      274.81
+     ],
+     "candidate_us": [
+      137.96,
+      137.81
+     ],
+     "gain_beyond_interval": true,
+     "bit_exact": [
+      true,
+      true
+     ]
+    },
+    "corrected_0766": {
+     "baseline_us": [
+      278.04,
+      271.32
+     ],
+     "candidate_us": [
+      138.12,
+      137.19
+     ],
+     "gain_beyond_interval": true,
+     "bit_exact": [
+      true,
+      true
+     ]
+    },
+    "corrected_minus_original_candidate_mean_us": -0.23
+   }
+  },
+  "staged_writes_stage_mean": {
+   "c1": {
+    "original_0766": {
+     "baseline_us": [
+      28.61,
+      28.87
+     ],
+     "candidate_us": [
+      2.61,
+      2.61
+     ],
+     "gain_beyond_interval": true,
+     "bit_exact": [
+      true,
+      true
+     ]
+    },
+    "corrected_0766": {
+     "baseline_us": [
+      28.97,
+      28.69
+     ],
+     "candidate_us": [
+      2.9,
+      2.95
+     ],
+     "gain_beyond_interval": true,
+     "bit_exact": [
+      true,
+      true
+     ]
+    },
+    "corrected_minus_original_candidate_mean_us": 0.31
+   },
+   "c8": {
+    "original_0766": {
+     "baseline_us": [
+      31.81,
+      31.93
+     ],
+     "candidate_us": [
+      3.57,
+      3.65
+     ],
+     "gain_beyond_interval": true,
+     "bit_exact": [
+      true,
+      true
+     ]
+    },
+    "corrected_0766": {
+     "baseline_us": [
+      32.48,
+      32.36
+     ],
+     "candidate_us": [
+      3.97,
+      3.92
+     ],
+     "gain_beyond_interval": true,
+     "bit_exact": [
+      true,
+      true
+     ]
+    },
+    "corrected_minus_original_candidate_mean_us": 0.34
+   },
+   "c16": {
+    "original_0766": {
+     "baseline_us": [
+      34.64,
+      34.92
+     ],
+     "candidate_us": [
+      4.64,
+      4.79
+     ],
+     "gain_beyond_interval": true,
+     "bit_exact": [
+      true,
+      true
+     ]
+    },
+    "corrected_0766": {
+     "baseline_us": [
+      35.12,
+      35.04
+     ],
+     "candidate_us": [
+      5.03,
+      5.05
+     ],
+     "gain_beyond_interval": true,
+     "bit_exact": [
+      true,
+      true
+     ]
+    },
+    "corrected_minus_original_candidate_mean_us": 0.33
+   }
+  }
+ },
+ "clean_apply_microbench_us": {
+  "what": "append_block_ids(overwrite=False, empty) per request + apply_staged_writes() on a clean step, 7-group geometry of the release test (the harness uses 2 groups); mean of 5 x 20000 per boot",
+  "per_concurrency": {
+   "c1": {
+    "original_0766": [
+     0.259,
+     0.263
+    ],
+    "corrected_0766": [
+     0.492,
+     0.494
+    ]
+   },
+   "c8": {
+    "original_0766": [
+     1.334,
+     1.332
+    ],
+    "corrected_0766": [
+     1.593,
+     1.586
+    ]
+   },
+   "c16": {
+    "original_0766": [
+     2.517,
+     2.502
+    ],
+    "corrected_0766": [
+     2.763,
+     2.769
+    ]
+   }
+  },
+  "cost_of_correction_us": "about +0.24 per step (the any() over seven groups' staged lists)"
+ },
+ "serving_affected": false
+}

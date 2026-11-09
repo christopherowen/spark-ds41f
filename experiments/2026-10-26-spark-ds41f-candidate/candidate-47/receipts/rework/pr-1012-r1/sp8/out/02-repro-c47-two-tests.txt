@@ -1,0 +1,241 @@
+FF                                                                       [100%]
+=================================== FAILURES ===================================
+____________ test_lsa_opt_in_32k_to_1m_routing_and_metadata_wiring _____________
+
+monkeypatch = <_pytest.monkeypatch.MonkeyPatch object at 0xf895c3d2ac90>
+
+    def test_lsa_opt_in_32k_to_1m_routing_and_metadata_wiring(monkeypatch):
+        from vllm.models.deepseek_v4_1.tilelang import attention as tl_attn
+        from vllm.models.deepseek_v4_1.tilelang.paged_shortlist import PageShortlistPlan
+    
+        class DummyNativePlan:
+            def __init__(self, width, page, *, candidates=False, candidate_blocks=False):
+                self.kind = "native"
+                self.width = width
+                self.page = page
+                self.candidates = candidates
+                self.candidate_blocks = candidate_blocks
+    
+            def scratch_specs(self, rows):
+                return (((rows, self.width), torch.int32),)
+    
+        class DummyShortlistPlan(PageShortlistPlan):
+            def __init__(
+                self, width, page, *, candidate_blocks=False, budget=None, row_cap=256
+            ):
+                self.kind = "shortlist"
+                self.width = width
+                self.page = page
+                self.candidate_blocks = candidate_blocks
+                self.budget = budget or (512 if candidate_blocks else 64)
+                self.block_budget = self.budget * 8
+                self.row_cap = row_cap
+                self.coarse_kind = (
+                    "RawWideCoarseTopK"
+                    if self.block_budget == 8192 and width // 8 > 8192
+                    else "DirectCoarseTopK"
+                    if self.block_budget == 4096 and width // 8 > 4096
+                    else "IndexerTopK"
+                )
+    
+            def _specs(self, rows):
+                return {
+                    "scratch": (
+                        (min(rows, self.row_cap), self.width, self.budget),
+                        torch.int32,
+                    )
+                }
+    
+        monkeypatch.setenv("VLLM_DS41_LSA", "1")
+        monkeypatch.setattr(tl_attn, "IndexerV41Plan", DummyNativePlan)
+        monkeypatch.setattr(tl_attn, "BlockMeanShortlistPlan", DummyShortlistPlan)
+        monkeypatch.setattr(
+            tl_attn,
+            "current_workspace_manager",
+            lambda: SimpleNamespace(get_simultaneous=lambda *specs: list(specs)),
+        )
+        monkeypatch.setattr(tl_attn, "retain_cuda_graph_capture_resource", lambda *a: None)
+        tl_attn._index_plan.cache_clear()
+        tl_attn._source_short_plan.cache_clear()
+    
+        def build_layer(layer_id: int, compress_ratio: int, candidate_blocks: bool):
+            layer = tl_attn.DeepseekV41TileLangAttention.__new__(
+                tl_attn.DeepseekV41TileLangAttention
+            )
+            torch.nn.Module.__init__(layer)
+            layer.layer_id = layer_id
+            layer.candidate_source_layer = 20
+            layer.compress_ratio = compress_ratio
+            layer.is_ced_decoder = False
+            layer.is_index_source = candidate_blocks
+            layer.n_local_heads = 16
+            layer._index_page = 128 if compress_ratio == 2 else 256
+            layer._index_width = (
+                524288 if compress_ratio == 2 else 1048576
+            ) // layer._index_page
+            layer._short_index_shape = (256, 128) if compress_ratio == 2 else None
+            layer._main_page = 64
+            layer._main_width = 16
+            layer.swa_width = 16
+            layer.capacity = 8192
+            layer._decode_capacity = 96
+            layer.swa_cache_layer = SimpleNamespace(block_size=64, kv_cache=torch.zeros(4, 64 * 528, dtype=torch.uint8))
+            layer._owner = lambda: SimpleNamespace(kv_cache=torch.zeros(4, 64 * 288, dtype=torch.uint8))
+            layer.rotary_emb = SimpleNamespace(cos_sin_cache=torch.zeros(16, 64))
+            layer._attention_workspace_specs = {"decode": (), "prefill": ()}
+            layer.config = SimpleNamespace(
+                scheduler_config=SimpleNamespace(max_num_seqs=4),
+                speculative_config=None,
+                compilation_config=SimpleNamespace(max_cudagraph_capture_size=24),
+            )
+            layer.indexer = SimpleNamespace(
+                heads=32,
+                k_cache=SimpleNamespace(
+                    kv_cache=torch.zeros(4, layer._index_page * 100, dtype=torch.uint8)
+                ),
+            )
+            layer._active = torch.tensor(
+                [layer._index_width * layer._index_page], dtype=torch.int32
+            )
+            layer.topk_indices_buffer = torch.zeros(256, 512, dtype=torch.int32)
+            monkeypatch.setattr(
+                tl_attn,
+                "_mla_plan",
+                lambda *args: SimpleNamespace(
+                    max_rows=8192, decode_max_rows=96, scratch_specs=lambda r: ()
+                ),
+            )
+            layer._tilelang_plans = layer._build_tilelang_plans()
+            return layer
+    
+>       dense_layer = build_layer(layer_id=2, compress_ratio=2, candidate_blocks=False)
+                      ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+tests/models/test_deepseek_v4_1_lsa.py:436: 
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
+tests/models/test_deepseek_v4_1_lsa.py:433: in build_layer
+    layer._tilelang_plans = layer._build_tilelang_plans()
+                            ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+vllm/models/deepseek_v4_1/tilelang/attention.py:329: in _build_tilelang_plans
+    overlap_specs = self._decode_overlap_workspace_specs(self.DECODE_CHUNK)
+                    ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+vllm/models/deepseek_v4_1/attention.py:1099: in _decode_overlap_workspace_specs
+    if self.compressor is not None
+       ^^^^^^^^^^^^^^^
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
+
+self = DeepseekV41TileLangAttention(), name = 'compressor'
+
+    def __getattr__(self, name: str) -> Union[Tensor, "Module"]:
+        if "_parameters" in self.__dict__:
+            _parameters = self.__dict__["_parameters"]
+            if name in _parameters:
+                return _parameters[name]
+        if "_buffers" in self.__dict__:
+            _buffers = self.__dict__["_buffers"]
+            if name in _buffers:
+                return _buffers[name]
+        if "_modules" in self.__dict__:
+            modules = self.__dict__["_modules"]
+            if name in modules:
+                return modules[name]
+>       raise AttributeError(
+            f"'{type(self).__name__}' object has no attribute '{name}'"
+        )
+E       AttributeError: 'DeepseekV41TileLangAttention' object has no attribute 'compressor'
+
+/usr/local/lib/python3.12/dist-packages/torch/nn/modules/module.py:1967: AttributeError
+________ test_v41_tilelang_attention_reserves_scratch_in_its_model_lane ________
+
+monkeypatch = <_pytest.monkeypatch.MonkeyPatch object at 0xf893b4674e90>
+
+    def test_v41_tilelang_attention_reserves_scratch_in_its_model_lane(monkeypatch):
+        """A V4.1 TileLang attention layer's indexing scratch and metadata arena are
+        reserved in the lane of the model holding the layer, before profiling: binding
+        the plans reserves nothing, so the drafter's lane does not take the target's
+        indexing scratch."""
+        pytest.importorskip("tilelang")
+        from vllm.models.deepseek_v4_1.tilelang import attention as tl_attention
+        from vllm.v1.worker.gpu.model_runner import GPUModelRunner
+    
+        monkeypatch.setattr(workspace, "dbo_current_ubatch_id", lambda: 0)
+        manager = workspace.WorkspaceManager(
+            torch.device("cpu"), num_ubatches=1, num_lanes=2
+        )
+        monkeypatch.setattr(workspace, "_manager", manager)
+        monkeypatch.setattr(tl_attention, "current_workspace_manager", lambda: manager)
+    
+        class IndexPlan:
+            def __init__(self, width):
+                self.width = width
+    
+            def scratch_specs(self, rows):
+                return (((rows, self.width), torch.bfloat16),)
+    
+        mla = SimpleNamespace(
+            decode_max_rows=64, scratch_specs=lambda rows: (((rows, 4), torch.uint8),)
+        )
+        monkeypatch.setattr(tl_attention, "_mla_plan", lambda *args: mla)
+        monkeypatch.setattr(tl_attention, "_index_plan", IndexPlan)
+        monkeypatch.setattr(tl_attention, "_source_short_plan", lambda *args: None)
+    
+        def layer(index_width, metadata_rows):
+            module = tl_attention.DeepseekV41TileLangAttention.__new__(
+                tl_attention.DeepseekV41TileLangAttention
+            )
+            torch.nn.Module.__init__(module)
+            module.capacity = 1024
+            index = {"prefill": (index_width,)} if index_width else {}
+            module._plan_args = lambda: ((), index, {"prefill": 256})
+            module._attention_workspace_specs = {
+                "extend": (((metadata_rows, 4), torch.int32),)
+            }
+            module._build_tilelang_plans()
+            return module
+    
+>       target = layer(4096, 512)  # an index layer: 256 rows x 4,096 BF16 scores
+                 ^^^^^^^^^^^^^^^^
+
+tests/v1/worker/test_workspace.py:519: 
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
+tests/v1/worker/test_workspace.py:516: in layer
+    module._build_tilelang_plans()
+vllm/models/deepseek_v4_1/tilelang/attention.py:329: in _build_tilelang_plans
+    overlap_specs = self._decode_overlap_workspace_specs(self.DECODE_CHUNK)
+                    ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+vllm/models/deepseek_v4_1/attention.py:1095: in _decode_overlap_workspace_specs
+    if self.indexer is None:
+       ^^^^^^^^^^^^
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
+
+self = DeepseekV41TileLangAttention(), name = 'indexer'
+
+    def __getattr__(self, name: str) -> Union[Tensor, "Module"]:
+        if "_parameters" in self.__dict__:
+            _parameters = self.__dict__["_parameters"]
+            if name in _parameters:
+                return _parameters[name]
+        if "_buffers" in self.__dict__:
+            _buffers = self.__dict__["_buffers"]
+            if name in _buffers:
+                return _buffers[name]
+        if "_modules" in self.__dict__:
+            modules = self.__dict__["_modules"]
+            if name in modules:
+                return modules[name]
+>       raise AttributeError(
+            f"'{type(self).__name__}' object has no attribute '{name}'"
+        )
+E       AttributeError: 'DeepseekV41TileLangAttention' object has no attribute 'indexer'
+
+/usr/local/lib/python3.12/dist-packages/torch/nn/modules/module.py:1967: AttributeError
+=============================== warnings summary ===============================
+../../../../usr/local/lib/python3.12/dist-packages/torch/jit/_script.py:365: 14 warnings
+  /usr/local/lib/python3.12/dist-packages/torch/jit/_script.py:365: DeprecationWarning: `torch.jit.script_method` is deprecated. Please switch to `torch.compile` or `torch.export`.
+    warnings.warn(
+
+-- Docs: https://docs.pytest.org/en/stable/how-to/capture-warnings.html
+=========================== short test summary info ============================
+FAILED tests/models/test_deepseek_v4_1_lsa.py::test_lsa_opt_in_32k_to_1m_routing_and_metadata_wiring
+FAILED tests/v1/worker/test_workspace.py::test_v41_tilelang_attention_reserves_scratch_in_its_model_lane
+2 failed, 14 warnings in 7.01s

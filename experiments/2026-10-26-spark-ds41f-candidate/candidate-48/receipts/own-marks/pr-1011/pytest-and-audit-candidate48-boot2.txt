@@ -1,0 +1,74 @@
+============================= test session starts ==============================
+platform linux -- Python 3.12.3, pytest-9.1.1, pluggy-1.6.0 -- /usr/bin/python3
+rootdir: /opt/spark-ds41f/candidate/vllm
+configfile: pyproject.toml
+plugins: anyio-4.15.1
+collecting ... collected 121 items / 118 deselected / 3 selected
+
+tests/v1/worker/test_gpu_worker.py::test_llm_repr_does_not_call_collective_rpc PASSED [ 33%]
+tests/v1/worker/test_gpu_worker.py::test_flash_attn_batch_invariant_keeps_max_model_len_for_sliding_window PASSED [ 66%]
+tests/v1/worker/test_workspace.py::test_amd_kpool_sparse_indexer_reserves_decode_logits_in_workspace PASSED [100%]
+
+=============================== warnings summary ===============================
+../../../../usr/local/lib/python3.12/dist-packages/torch/jit/_script.py:365: 14 warnings
+  /usr/local/lib/python3.12/dist-packages/torch/jit/_script.py:365: DeprecationWarning: `torch.jit.script_method` is deprecated. Please switch to `torch.compile` or `torch.export`.
+    warnings.warn(
+
+-- Docs: https://docs.pytest.org/en/stable/how-to/capture-warnings.html
+================ 3 passed, 118 deselected, 14 warnings in 5.66s ================
+WARNING 11-09 04:04:55 [rocm.py:42] Failed to import from amdsmi with ModuleNotFoundError("No module named 'amdsmi'")
+WARNING 11-09 04:04:55 [rocm.py:47] Failed to import from vllm._C with ModuleNotFoundError("No module named 'vllm._C'")
+WARNING 11-09 04:04:55 [rocm.py:58] Failed to import from vllm._rocm_C with ModuleNotFoundError("No module named 'vllm._rocm_C'")
+{
+  "boot": 2,
+  "device_name": "NVIDIA GB10",
+  "timestamp": "2026-11-09T04:04:47Z",
+  "item1_pr66226_spec_decode_prefill_load": {
+    "dflash_has_0624_k0_skip": true,
+    "parallel_draft_step_ms": {
+      "reqs1_k1_rows2": 1.0234,
+      "reqs1_k3_rows4": 1.0072,
+      "reqs1_k5_rows6": 1.0043,
+      "reqs4_k1_rows8": 1.0004,
+      "reqs4_k3_rows16": 1.004,
+      "reqs4_k5_rows24": 1.0504,
+      "reqs8_k1_rows16": 1.0095,
+      "reqs8_k3_rows32": 1.0396,
+      "reqs8_k5_rows48": 1.0331
+    }
+  },
+  "item2_pr65866_llm_repr_rpc": {
+    "repr_output": "LLM(model='deepseek-ai/DeepSeek-V4.1-Flash-1017')",
+    "rpc_calls_during_100_reprs": 0,
+    "repr_latency_us": 0.143,
+    "first_get_model_inspection_ms": 5.073,
+    "cached_get_model_inspection_us": 0.256,
+    "total_rpc_calls_after_2_inspections": 1
+  },
+  "item3_pr65627_batch_invariant_fa_swa": {
+    "has_batch_invariant_max_seq_len_override": true,
+    "sliding_window": 1024,
+    "max_model_len": 4096,
+    "mixed_batch_common_max_seq_len": 512,
+    "effective_max_seq_len_batch_invariant_off": 512,
+    "effective_max_seq_len_batch_invariant_on": 4096,
+    "window_stays_active_under_batch_invariant": true
+  },
+  "item4_pr63401_pr55828_gb10_uma_memory": {
+    "is_integrated_gpu": true,
+    "base_nvml_used_bytes": 248758272,
+    "cuda_512mib_nvml_delta_bytes": 536870912,
+    "after_empty_cache_nvml_delta_bytes": 0,
+    "pinned_256mib_plus_cpu_256mib_nvml_delta_bytes": 0,
+    "pinned_256mib_plus_cpu_256mib_psutil_drop_bytes": 403943424
+  },
+  "item5_pr65092_kpool_workspace": {
+    "amd_kpool_reserves_decode_logits_in_workspace": true,
+    "locked_workspace_bytes": 50331648,
+    "decode_logits_shape_verified_under_lock": [
+      32,
+      96,
+      4096
+    ]
+  }
+}

@@ -1,0 +1,55 @@
+{
+  "pr": 1013,
+  "pr_head": "aeba4fc4ac4063eb0736e4267191a7c27e5584c8",
+  "mark": "A live `/v1/completions` request with a JSON grammar under the `deepseek_v41` reasoning parser returns valid output; 0763's defaults leave scheduling unchanged",
+  "host": "sp8 (spark-0016, NVIDIA GB10)",
+  "images": {
+    "candidate-48": "sha256:d6ffd842978849651e756ebd39e9bf2da7ddb03e746113013533029878485a24",
+    "1107": "sha256:3f32a962ce04b7c8d85337cd427a8946b8b6bcaadd97cc8d8a8cd14e8d68a6ce"
+  },
+  "evidence": "README step 1 (pytest, 8 files) and step 2 (bench_suite.py: structured output, scheduler simulation, engram rows) on the candidate image, two boots; the patched-file copy-in is dropped because the candidate image carries 0765/0766 (the PR's 0762/0763). bench_suite.py was also run on 1107, verbatim and through a kwargs shim (ours)",
+  "readme_command_defects": [
+    "Step 1 mounts /tmp/hf-test-cache (small test models such as facebook/opt-125m) and loads a tblib_stub from /tmp; neither exists on sp8. With tblib_stub from scripts/release_tests the run gives 51 failed, 44 errors, 101 passed on both boots, every failure a missing offline Hugging Face resource (pytest-candidate48-boot*.txt.gz). Re-run with the release tests' offline_skip plugin: 101 passed, 95 skipped (all 'needs Hugging Face ... (offline)'), 0 failed, both boots. The PR claims 196 passed; the 95 skipped include all of test_structured_output_manager.py, so the fix's own unit tests did not run here",
+    "Step 2 verbatim on 1107 fails before printing any result: SchedulerConfig rejects prefill_long_threshold / max_long_prefills (2 validation errors), both boots. Shim v1 (a plain function in place of SchedulerConfig) broke an import-time class-attribute read and failed both boots; shim v2 (forwarding callable, scheduler modules imported first) ran both boots"
+  ],
+  "measured": {
+    "structured_output_completions_real_image_code": {
+      "candidate-48_boot1": {"constraint_start": 0, "drafts_trimmed": "5->2", "bitmask": "CCU", "reasoner_instantiated": false, "invalid_token_masked": true, "open_brace_sampled": true, "cpu_step_us": 10.67},
+      "candidate-48_boot2": {"constraint_start": 0, "drafts_trimmed": "5->2", "bitmask": "CCU", "reasoner_instantiated": false, "invalid_token_masked": true, "open_brace_sampled": true, "cpu_step_us": 10.61},
+      "1107_shimv2_boot1": {"constraint_start": 6, "drafts_trimmed": "5->5", "bitmask": "UUUUUU", "reasoner_instantiated": true, "invalid_token_masked": false, "open_brace_sampled": false, "cpu_step_us": 45182.1},
+      "1107_shimv2_boot2": {"constraint_start": 6, "drafts_trimmed": "5->5", "bitmask": "UUUUUU", "reasoner_instantiated": true, "invalid_token_masked": false, "open_brace_sampled": false, "cpu_step_us": 45302.9},
+      "note": "the bench's 'completions_patched' mode runs the image's own _get_constraint_start; its 'completions_unpatched' mode is a simulation of the old code and gives cs=6 / UUUUUU on every image. Chat modes are unchanged between images (cs=6 UUUUUU thinking; cs=2 UUCCU with </think> mid-draft)"
+    },
+    "scheduler_defaults_1-lane_arms": {
+      "result": "identical scheduling decisions on candidate-48 (both boots) and 1107 (shim v2, both boots) for both 1-lane arms at 64K/128K/256K",
+      "1-lane FCFS (yield off)": {"64K": "short_cold 19/19 steps, TTFT 8.122 s; long1 5 aligned chunks, done step 4", "128K": "35/35, 16.962 s; 9 chunks, step 8", "256K": "67/67, 37.327 s; 17 chunks, step 16"},
+      "1-lane Prefill Yield short (promoted)": {"64K": "short_cold and short_cached 1/1 step, TTFT 0.192 s; long1 5 aligned chunks, done step 12", "128K": "1/1, 0.192 s; 9 chunks, step 24", "256K": "1/1, 0.192 s; 17 chunks, step 47"},
+      "sched_cpu_us_per_step_prefill_yield": {"candidate-48": {"64K": [248.9, 249.4], "128K": [404.4, 424.2], "256K": [297.1, 299.1]}, "1107": {"64K": [255.6, 255.2], "128K": [427.5, 410.0], "256K": [453.0, 453.0]}},
+      "sched_cpu_us_per_step_fcfs": {"candidate-48": {"64K": [374.1, 367.9], "128K": [383.3, 387.4], "256K": [387.8, 389.2]}, "1107": {"64K": [378.8, 385.6], "128K": [382.9, 375.8], "256K": [400.6, 389.8]}}
+    },
+    "scheduler_non_default_arms": {
+      "4-lane aligned size-blind": "candidate-48: completes (64K short_cold 19/19, long1 done step 12); 1107: livelock, long1 stalls after chunk 1 and short requests never finish within 400 steps, both boots",
+      "size-classed arms on 1107": "not valid: the shim drops prefill_long_threshold, so they run size-blind"
+    },
+    "engram_rows": {"candidate-48_early_us": [14.51, 15.52], "candidate-48_decode_us": [25.56, 25.79], "cache_hits_misses": "157440 / 384 both boots", "note": "PR's sp6 numbers were 86.89/94.11 and 143.78/154.17 us; not part of the mark"},
+    "pytest_candidate-48": {
+      "readme_form_boot1": "51 failed, 101 passed, 44 errors (all missing offline HF resources)",
+      "readme_form_boot2": "51 failed, 101 passed, 44 errors (same)",
+      "offline_skip_boot1": "101 passed, 95 skipped in 47.41s",
+      "offline_skip_boot2": "101 passed, 95 skipped in 44.47s"
+    },
+    "interval": "the scheduler simulation and structured-output decisions are deterministic and identical across boots; CPU timings vary by up to about 20 us/step between boots"
+  },
+  "parts": [
+    {"part": "live /v1/completions with a JSON grammar under deepseek_v41 returns valid output", "verdict": "cannot-evaluate-on-sp8", "detail": "needs a live server. Offline, the bench's real-code path on the candidate image constrains from token 0 (cs=0, CCU bitmask, invalid token masked, '{' sampled) where 1107 leaves every row unconstrained (cs=6, UUUUUU) and samples the invalid token"},
+    {"part": "0763's defaults leave scheduling unchanged", "verdict": "pass", "detail": "offline scheduler simulation: both 1-lane arms (FCFS and the promoted prefill-yield short) make identical decisions on candidate-48 and 1107 at 64K, 128K and 256K, both boots. 1107's side needed our kwargs shim"}
+  ],
+  "verdict": "pass",
+  "verdict_scope": "sp8-evaluable parts only; the live completions request is cannot-evaluate-on-sp8",
+  "reason": "The PR's bench shows the completions grammar fix working in the integrated image (constraint from token 0, invalid draft trimmed and masked) and the bug present in 1107, and the 1-lane scheduling path is decision-for-decision identical to 1107. Two caveats: the PR's own structured-output unit tests could not run on sp8 (no offline test models), and the 1107 side of the scheduler comparison is an adapted run through our shim.",
+  "notes": [
+    "commands.txt start_utc is when the command was issued and includes any wait on /tmp/spark-lab-gpu.lock; batches queued on the lock interleave in the raw log, and each end block names its output file",
+    "pytest-candidate48-boot*.txt are gzipped (4.9 MB each raw, mostly offline tracebacks)",
+    "bench-summary.txt is a derived digest of the bench outputs (analyze/a1013.py)"
+  ]
+}

@@ -1,0 +1,56 @@
+diff --git a/tests/v1/worker/test_gpu_block_table.py b/tests/v1/worker/test_gpu_block_table.py
+index eda4cf1..6ad0b55 100644
+--- a/tests/v1/worker/test_gpu_block_table.py
++++ b/tests/v1/worker/test_gpu_block_table.py
+@@ -472,3 +472,23 @@ def test_block_tables_apply_staged_writes_skips_clean_decode_steps(monkeypatch):
+         lambda *a, **kw: pytest.fail("clean decode step must skip num_blocks.copy_to_uva"),
+     )
+     block_tables.apply_staged_writes()
++
++
++def test_block_tables_apply_staged_writes_applies_writes_staged_on_a_table():
++    """The skip covers only a step with nothing staged: a write staged on a table
++    directly, outside append_block_ids, still lands on the next apply."""
++    device = torch.device("cuda")
++    block_tables = BlockTables(
++        block_sizes=[16, 32],
++        max_num_reqs=4,
++        max_num_batched_tokens=64,
++        max_num_blocks_per_group=[8, 8],
++        device=device,
++        kernel_block_sizes=[16, 16],
++    )
++    block_tables.block_tables[1].stage_write(2, 3, [7, 8])
++    assert not block_tables._dirty
++    block_tables.apply_staged_writes()
++    torch.accelerator.synchronize()
++    assert block_tables.block_tables[1].gpu[2, 3:5].tolist() == [7, 8]
++    assert not block_tables.block_tables[1]._staged_write_indices
+diff --git a/vllm/v1/worker/gpu/block_table.py b/vllm/v1/worker/gpu/block_table.py
+index 29525d1..678eae1 100644
+--- a/vllm/v1/worker/gpu/block_table.py
++++ b/vllm/v1/worker/gpu/block_table.py
+@@ -100,6 +100,8 @@ class BlockTables:
+             device=self.device,
+         )
+ 
++        # Set by append_block_ids when it stages a write or changes num_blocks, so
++        # a decode step that allocates no block can skip apply_staged_writes.
+         self._dirty = False
+         self.init_block_table_layout_tensors()
+ 
+@@ -176,7 +178,13 @@ class BlockTables:
+             self._dirty = True
+ 
+     def apply_staged_writes(self) -> None:
+-        if self.num_kv_cache_groups == 0 or not self._dirty:
++        if self.num_kv_cache_groups == 0:
++            return
++        if not self._dirty and not any(
++            t._staged_write_indices for t in self.block_tables
++        ):
++            # Nothing staged and num_blocks as last published: a step that
++            # allocates no block. A write staged on a table directly still applies.
+             return
+         self._dirty = False
+         if self.num_kv_cache_groups == 1:

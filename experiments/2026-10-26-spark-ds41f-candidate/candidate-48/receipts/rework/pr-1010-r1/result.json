@@ -1,0 +1,176 @@
+{
+  "pr": 1010,
+  "round": 1,
+  "pr_head": "ad613458e55962d309c3a53fec15c02413e849d5",
+  "host": "sp8 (spark-0016, NVIDIA GB10)",
+  "image": "sha256:d6ffd842978849651e756ebd39e9bf2da7ddb03e746113013533029878485a24 (spark-ds41f:candidate-48), changed files bind-mounted read-only; no image built",
+  "mark": "keep the passing probe checks (boundary matrix 1404/1404, spec-decode 60/60, 0 LRU inversions) and the PR's 23-file test list, and bring the 64K-100K stress-probe overall hit share to at least 1107's on tp3 (retention 512) and tp4 (retention 8192), on two boots",
+  "verdict": "corrected-misses-mark",
+  "reason": "Root cause: 0763 re-appended every retained SWA checkpoint of a matched prefix to the MRU end on each hit, each window advance and each free, and re-sorted a finished request's already-free checkpoints into one tail-to-root run. A sliding-window hit reads only the window at the hit, so those aged checkpoints were the pool's harmless first eviction victims in 1107. Moving them behind the live conversation tails made pool pressure evict a conversation's newest positions first. The reworked 0763 removes that refresh. It keeps the decode-frontier retention, the stopping-step caching and the cross-group tail-to-root order of a freed request's own blocks. Every turn, evicted or not, now hits its last 256-token boundary: stress 99.8574% on tp3 and tp4, above 1107 (99.6759%, 99.5397%) and above candidate-48 (99.3809%, 98.9723%), identical on both boots. It misses one clause: the probe counts 6 LRU inversions per retention, not 0. That clause cannot be met together with the stress clause on this probe. Zero inversions means a conversation's cached blocks form one non-increasing run, so the probe's 18-block eviction must take agent 0's newest positions. That costs at least 1,536 tokens on turn 4 against a total tp3 margin over 1107 of 2,048 tokens for three evictions. The 6 inversions all sit between aged checkpoints, none inside a freed request's own run (diag/diag-lru-rework.txt). The live multi-turn hit-share part of the README mark still needs live serving and is not evaluated on sp8.",
+  "patch": {
+    "file": "0763-fix-prefix-cache-retain-decode-frontier-swa-and-orde.patch",
+    "sha256": "446274bc66b5e38575e0e99f7f47dc9bedec76409df7750ae8d90e6466765568",
+    "author": "Christopher Owen <christopherowen@users.noreply.github.com>, Sun, 8 Nov 2026 23:30:00 +0100 (kept)",
+    "diffstat": "5 files, +871 -12 (original +1067 -12); vs original: 3 files, +95 -291",
+    "applies": "git am on the candidate-48 stack before 0763 (reconstructed from the image's files); 0766 applies after it; the stack's scheduler.py, async_scheduler.py, kv_cache_manager.py, tests/v1/core/utils.py and request.py then equal the image's",
+    "git_diff_check": "clean",
+    "kept": [
+      "SlidingWindowManager.cache_blocks decode-frontier retention and recycling of obsolete frontier blocks (_req_decode_frontier_blocks, _resolve_decode_frontier_boundaries)",
+      "Scheduler/AsyncScheduler stopping-step cache_blocks call and stale/clamp guard (unchanged)",
+      "KVCacheCoordinator.pop_blocks_for_free sorted by token position across groups; free() frees reversed(pop_blocks_for_free)"
+    ],
+    "removed": [
+      "_req_retained_blocks, _block_prefix_chain, _refresh_free_retained_blocks_desc",
+      "SlidingWindowManager.add_local_computed_blocks, remove_skipped_blocks and free overrides",
+      "KVCacheCoordinator.free re-sort of already-free skipped SWA checkpoints"
+    ],
+    "tests_changed": [
+      "test_shared_block_pool_tail_to_root_eviction_order: now asserts that only SWA checkpoints age ahead of the finished request's run, that the run is strictly tail-to-root across groups (MLA before SWA), and that an extension still hits 25,088 after every aged checkpoint is evicted (it asserted the removed one-run order)",
+      "test_64k_to_100k_multi_turn_agent_retention_under_eviction_pressure: asserts the exact 256-token boundary hit on every turn, evicted or not (it asserted evicted >= 93.4% and overall >= 98.8%, set just under the candidate's measured values)"
+    ]
+  },
+  "measured": {
+    "probe_rework": {
+      "boot1_boot2_identical": true,
+      "boundary_matrix": "1404/1404 ext, 1404/1404 retry, 567/567 slid-past-boundary",
+      "long_decode_cached_swa_blocks_retention_0_512_8192_None": [
+        4,
+        11,
+        4,
+        18
+      ],
+      "long_decode_turn2_hit_tokens": "4608/4608 for all four retentions",
+      "spec_decode_stopping_step": "60/60 (40/40 crossing)",
+      "lru_inversions_by_retention": {
+        "0": 6,
+        "512": 6,
+        "8192": 6,
+        "None": 6
+      },
+      "lru_first_last_evict_end_token": [
+        16128,
+        256
+      ],
+      "lru_turn2_hit_tokens": 16896,
+      "stress_tp3-triangle": {
+        "hit_tokens": 1126400,
+        "reusable_tokens": 1128008,
+        "overall": 0.998574,
+        "non_evicted_mean": 0.998478,
+        "evicted_mean": 0.998787,
+        "evicted_min": 0.998307,
+        "evicted_turn_hits_agent0_turns_4_6_8": [
+          75264,
+          85504,
+          95488
+        ]
+      },
+      "stress_tp4-ring": {
+        "hit_tokens": 1126400,
+        "reusable_tokens": 1128008,
+        "overall": 0.998574,
+        "non_evicted_mean": 0.998478,
+        "evicted_mean": 0.998787,
+        "evicted_min": 0.998307,
+        "evicted_turn_hits_agent0_turns_4_6_8": [
+          75264,
+          85504,
+          95488
+        ]
+      },
+      "ceiling": "1,126,400 is every turn at prev_len // 256 * 256, the most this probe allows"
+    },
+    "reference_from_receipts_not_remeasured": {
+      "1107": {
+        "stress_tp3_overall": 0.996759,
+        "stress_tp4_overall": 0.995397,
+        "stress_tp3_hit_tokens": 1124352,
+        "stress_tp4_hit_tokens": 1122816,
+        "boundary_matrix": "699/1404",
+        "spec_decode": "45/60",
+        "lru_inversions": {
+          "0": 6,
+          "512": 6,
+          "8192": 6,
+          "None": 8
+        }
+      },
+      "candidate-48": {
+        "stress_tp3_overall": 0.993809,
+        "stress_tp4_overall": 0.989723,
+        "stress_tp3_hit_tokens": 1121024,
+        "stress_tp4_hit_tokens": 1116416,
+        "boundary_matrix": "1404/1404",
+        "spec_decode": "60/60",
+        "lru_inversions": {
+          "0": 0,
+          "512": 0,
+          "8192": 0,
+          "None": 0
+        },
+        "pytest_receipt_list": "2679 passed x2"
+      }
+    },
+    "rework_minus_1107": {
+      "tp3-triangle": {
+        "hit_tokens": 2048,
+        "overall_pp": 0.1815
+      },
+      "tp4-ring": {
+        "hit_tokens": 3584,
+        "overall_pp": 0.3177
+      }
+    },
+    "rework_minus_candidate48": {
+      "tp3-triangle": {
+        "hit_tokens": 5376,
+        "overall_pp": 0.4765
+      },
+      "tp4-ring": {
+        "hit_tokens": 9984,
+        "overall_pp": 0.8851
+      }
+    },
+    "pytest_pr_file_precheck": "tests/v1/core/test_prefix_cache_retention_probe.py: 1462 passed in 264.72s",
+    "pytest_receipt_list_rework": {
+      "boot1": "2679 passed in 615.58s",
+      "boot2": "2679 passed in 616.21s"
+    },
+    "interval": "the probe is deterministic: both boots identical, so the interval is zero",
+    "lru_inversion_location": "6 per retention = 5 between aged SWA checkpoints + 1 at the aged-to-run boundary, 0 inside the finished request's run (diag/diag-lru-rework.txt)"
+  },
+  "screening": {
+    "varA": "the delivered patch: LRU inversions 6/6/6/6, stress 99.8574% on both shapes",
+    "varB": "varA without the cross-group free order: LRU inversions 8/8/8/8, stress 99.8574% on both shapes; not chosen"
+  },
+  "parts": [
+    {
+      "part": "boundary matrix 1404/1404",
+      "verdict": "pass"
+    },
+    {
+      "part": "spec-decode stopping step 60/60",
+      "verdict": "pass"
+    },
+    {
+      "part": "0 LRU inversions",
+      "verdict": "miss",
+      "detail": "6 per retention (1107: 6/6/6/8). It conflicts with the stress clause on this probe; see reason."
+    },
+    {
+      "part": "PR 23-file test list",
+      "verdict": "pass",
+      "detail": "2679 passed on both boots (same count as candidate-48), with the PR's two eviction tests rewritten to assert the corrected policy"
+    },
+    {
+      "part": "stress-probe hit share >= 1107 on tp3 and tp4, two boots",
+      "verdict": "pass",
+      "detail": "99.8574% vs 99.6759% (tp3) and 99.5397% (tp4)"
+    }
+  ],
+  "notes": [
+    "analysis.md was not written: the harness blocks sub-agents from writing .md report files. The analysis is in the hand-back report.",
+    "The PR's experiment README quotes 1107 at 57.09% / 56.34% on the stress probe; the probe gives 99.68% / 99.54%. Its commands also need the fixes listed in own-marks/pr-1010/result.json. The rework does not touch the PR's experiment folder.",
+    "diag/ holds the root-cause diagnostics (the blocks each eviction takes, before and after); they are not measurements of the mark."
+  ]
+}

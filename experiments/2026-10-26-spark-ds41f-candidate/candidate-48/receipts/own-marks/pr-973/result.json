@@ -1,0 +1,45 @@
+{
+  "pr": 973,
+  "pr_head": "fed91173461f5e04a1c1db0dae480f6ca6c72583",
+  "mark": "Its render-and-tokenize bench on the image: gain beyond the interval, identical `tokens_sha256`",
+  "host": "sp8 (spark-0016, NVIDIA GB10, Grace), --cpuset-cpus=5-9,15-19 as in the PR",
+  "images": {
+    "candidate-48": "sha256:d6ffd842978849651e756ebd39e9bf2da7ddb03e746113013533029878485a24",
+    "1107": "sha256:3f32a962ce04b7c8d85337cd427a8946b8b6bcaadd97cc8d8a8cd14e8d68a6ce"
+  },
+  "evidence": "README's A/B: bench_chat_template_multiturn.py --iters 8 on 1107 (baseline) and on the candidate image, boot1 then boot2, alternating images as in the README; plus the README's 7-file unit/contract pytest on the candidate image, two boots. The patched-file bind mounts are dropped because the candidate image carries 0771",
+  "measured": {
+    "tokens_sha256": "identical across all 4 runs (1107 x2, candidate-48 x2) in all 8 scenarios, and equal to the PR's prefixes: baccd4201d8c, 3c146c4aa9ed, 97a032f32afb, 02b371ce8e53, ba167fe3da8a, fd4a03f054c9, 5e7cc508dc6c, 96ddc572772c",
+    "e2e_mean_ms_1107_vs_candidate48_2boot_mean_pm_halfrange": {
+      "100t_ue50": {"cold": "89.511 +/- 5.291 -> 11.009 +/- 0.053 (8.13x)", "incremental": "90.256 +/- 5.459 -> 3.648 +/- 0.027 (24.74x)"},
+      "250t_ue50": {"cold": "212.173 +/- 7.634 -> 40.645 +/- 0.323 (5.22x)", "incremental": "212.991 +/- 7.244 -> 8.365 +/- 0.180 (25.46x)"},
+      "500t_ue50": {"cold": "430.632 +/- 10.671 -> 47.773 +/- 0.419 (9.01x)", "incremental": "412.849 +/- 10.748 -> 14.479 +/- 0.015 (28.51x)"},
+      "100t_ue1000": {"cold": "92.858 +/- 4.557 -> 11.227 +/- 0.074 (8.27x)", "incremental": "93.728 +/- 4.658 -> 3.776 +/- 0.041 (24.82x)"},
+      "250t_ue1000": {"cold": "233.195 +/- 8.687 -> 24.413 +/- 0.152 (9.55x)", "incremental": "235.804 +/- 7.847 -> 8.526 +/- 0.055 (27.66x)"},
+      "500t_ue1000": {"cold": "510.589 +/- 8.770 -> 47.877 +/- 0.242 (10.66x)", "incremental": "510.690 +/- 9.387 -> 14.868 +/- 0.159 (34.35x)"},
+      "250t_ue50_ctrl": {"cold": "110.070 +/- 0.854 -> 26.148 +/- 0.030 (4.21x)", "incremental": "111.778 +/- 1.202 -> 11.462 +/- 0.058 (9.75x)"},
+      "500t_ue50_ctrl": {"cold": "218.969 +/- 0.865 -> 51.008 +/- 0.827 (4.29x)", "incremental": "238.382 +/- 0.538 -> 20.771 +/- 0.155 (11.48x)"}
+    },
+    "render_only_mean_ms": "6.95x-23.67x faster, all beyond the interval (e.g. 500t_ue1000 183.624 +/- 0.407 -> 7.757 +/- 0.028)",
+    "peak_heap_kib_1107_vs_candidate48": {"100t_ue50": [2482.48, 1166.38], "250t_ue50": [5946.8, 2866.45], "500t_ue50": [11719.19, 5461.41], "500t_ue50_ctrl": [14667.61, 7004.49]},
+    "pytest_candidate-48": {"boot1": "413 passed in 47.76s", "boot2": "413 passed in 42.01s"},
+    "interval": "two boots per image; mean +/- half-range of the two boots' 8-iteration means. Every cold and incremental e2e gain is beyond both intervals"
+  },
+  "anomalies": [
+    "parse_chat_messages at 500 turns / user_every 50 / ctrl=True is SLOWER by mean on the candidate (16.656 +/- 0.041 ms vs 1107 3.115 +/- 0.034 ms) in both boots. It is one iteration of 8: max 122.448 / 123.661 ms, median 1.509 / 1.411 ms against 1107's median 3.04 ms",
+    "cold_e2e at 250 turns / user_every 50 carries the same kind of single outlier on the candidate (max 149.255 / 158.207 ms, median 24.906 / 24.197 ms), which is why its mean speedup (5.22x) is below its neighbours'",
+    "One-iteration outliers of 120-220 ms at fixed scenario positions also appear in 1107's runs (500t_ue50_ctrl render_only, max 199.8 / 219.0 ms) and in the PR's own receipts (candidate 250t_ue50 incremental_e2e, max 135.8 / 128.1 ms), so they look like a deterministic Python pause, not a regression of this patch; the bench reports means over 8 iterations, so one pause moves a cell"
+  ],
+  "parts": [
+    {"part": "render-and-tokenize bench: gain beyond the interval", "verdict": "pass", "detail": "cold e2e 4.21x-10.66x and incremental e2e 9.75x-34.35x faster than 1107 in all 8 scenarios, each beyond both images' boot intervals; render_only 6.95x-23.67x"},
+    {"part": "identical tokens_sha256", "verdict": "pass", "detail": "all 8 scenarios, all 4 runs, equal to the PR's hashes"}
+  ],
+  "verdict": "pass",
+  "verdict_scope": "fully evaluable on sp8 (host-side CPU bench)",
+  "reason": "On the integrated image the PR's bench reproduces its gains against 1107 measured on the same host the same day, beyond the two-boot interval in every e2e cell, with bit-identical token IDs, and its 413-test suite passes on both boots. The one stage that is worse by mean (parse at 500 turns with control spellings) is a single-iteration pause; its median improves 2x.",
+  "notes": [
+    "commands.txt start_utc is when the command was issued and includes any wait on /tmp/spark-lab-gpu.lock",
+    "sp8 load average was 3.3-5.6 during these runs (other agents' CPU jobs, unpinned); the benches were pinned to CPUs 5-9,15-19",
+    "bench-analysis.json is derived from the four bench JSONs by a973.py"
+  ]
+}

@@ -1,0 +1,1033 @@
+From b53a620652d44dc3178587d90892b6123aa1fdf8 Mon Sep 17 00:00:00 2001
+From: Christopher Owen <christopherowen@users.noreply.github.com>
+Date: Sun, 8 Nov 2026 23:30:00 +0100
+Subject: [PATCH] fix(core): retain decode-frontier SWA checkpoints and order
+ hybrid KV eviction tail-to-root
+
+Base: 1107 vLLM patch head 2756478b60b90700b9918b457aeb38657da637b5.
+
+Rationale:
+Multi-turn 64K-100K agent conversations with hybrid FullAttention (block_size=256) + SlidingWindow (block_size=128, window=128) KV cache and sparse prefix_cache_retention_interval (512 on tp3-triangle, 8192 on tp4-ring) lose prefix-cache hits in three places in vllm/v1/core/:
+1. Decode-frontier SWA checkpoint loss: SparseRetentionPolicy._retain only retained segment multiples (k * interval) and prompt boundaries (request.num_prompt_tokens). During decode (num_tokens > request.num_prompt_tokens), whenever a turn stopped at T_end with T_end % 256 >= 128 on a non-segment boundary, SlidingWindowManager.remove_skipped_blocks freed the 128-token SWA block at floor(T_end / 256) * 256 un-hashed before free() ran, causing the next turn to miss the decoded 256-token boundary.
+2. Group-major free order: KVCacheCoordinator.free freed every block of group 0 tail-to-root, then every block of group 1, and so on. When pool pressure reaches a finished conversation, it evicts one group's blocks position after position while the other groups' blocks at those positions stay cached but unusable, so each evicted block shortens the next hit by a whole 256-token page.
+3. Un-cached boundary crossing on speculative decode stopping steps: Scheduler._update_request_with_output omitted kv_cache_manager.cache_blocks when a running request crossed a block boundary via accepted draft tokens on the same step that stopped the request, and AsyncScheduler._update_request_with_output lacked a staleness and num_tokens clamp guard.
+
+Fix all three gaps:
+- In SlidingWindowManager.cache_blocks, retain the active decode frontier (resend_lo, resend_hi, aligned_ext) SWA tail blocks across 256-token MLA boundaries while recycling obsolete intermediate non-segment decode-frontier SWA blocks (un-hashing and prepending to the scratch front of free_block_queue via prepend_n), leaving only the final turn endpoint SWA checkpoint cached at turn completion alongside sparse segment checkpoints.
+- Sort KVCacheCoordinator.pop_blocks_for_free across groups by token position, so free() returns a finished request's blocks to the free queue strictly tail-to-root across all groups, with full-attention blocks evicted before SWA blocks at the same token position.
+- SWA checkpoints that a later hit did not read keep their LRU age. A sliding-window hit reads only the window that ends at the hit (SlidingWindowManager.find_longest_cache_hit stops at the first cached window from the right), so evicting an older checkpoint never shortens an extension of the same conversation, while it does free a block before any live conversation tail.
+- In Scheduler._update_request_with_output and AsyncScheduler._update_request_with_output, call kv_cache_manager.cache_blocks(request, min(request.num_computed_tokens, request.num_tokens)) whenever a non-stale running request advances num_computed_tokens with zero remaining output placeholders before freeing on stop.
+
+Rework (candidate-48): the first revision also re-appended every retained SWA checkpoint of a matched prefix to the MRU end of free_block_queue on each hit, on each sliding-window advance and on free, and re-sorted a finished request's already-free checkpoints into one tail-to-root run. That moved the aged checkpoints, the pool's harmless first eviction victims, behind the live conversation tails, so pool pressure evicted a conversation's newest MLA and SWA blocks first: the stress probe's evicted turns lost up to 5,120 tokens each, and its overall reusable-prefix hit share fell to 99.38% (tp3) and 98.97% (tp4), below 1107's 99.68% and 99.54%. That refresh is removed; with it goes the per-request retained-checkpoint map and the per-block prefix-chain map it needed.
+
+Quality:
+Bit- and mathematically identical KV attention and compressor contents; no change to what a hit reads. Only which blocks stay hashed and the order in which free cached blocks are evicted change.
+
+Tests:
+- pytest tests/v1/core/test_prefix_cache_retention_probe.py tests/v1/core/test_prefix_group_validity.py tests/v1/core/prefix_cache/test_mamba_boundary_capture.py tests/v1/core/prefix_cache/test_mamba_boundary_capture_digest.py tests/v1/core/prefix_cache/test_mamba_eagle_resume_checkpoint.py tests/v1/core/prefix_cache/test_partial_prefix_cache_hits.py tests/v1/core/prefix_cache/test_partial_prefix_cache_primitives.py tests/v1/core/prefix_cache/test_sparse_event_context.py tests/v1/core/test_async_scheduler.py tests/v1/core/test_boundary_admission.py tests/v1/core/test_boundary_admission_aged_cache.py tests/v1/core/test_boundary_admission_continuation.py tests/v1/core/test_boundary_admission_horizon.py tests/v1/core/test_boundary_admission_review.py tests/v1/core/test_partial_attention_rewind.py tests/v1/core/test_prefix_caching.py tests/v1/core/test_single_type_kv_cache_manager.py tests/v1/core/test_sink_draft_zero.py tests/v1/core/test_swa_inflight_window_free.py tests/v1/worker/test_boundary_checkpoint_attention.py tests/v1/worker/test_boundary_checkpoint_restore_scalars.py tests/kernels/attention/test_deepseek_v41_ced_replay.py tests/v1/attention/test_b12x_v41_ced_metadata.py
+- test_shared_block_pool_tail_to_root_eviction_order asserts the order above: aged SWA checkpoints first, then the finished request's blocks tail-to-root across groups, and an extension hit at the full tail after every aged checkpoint is evicted. The 64K-100K stress test asserts the exact 256-token boundary hit on every turn, evicted or not.
+
+Upstream status: local fix for hybrid MLA + SWA sparse prefix-cache retention and eviction ordering.
+---
+ .../core/test_prefix_cache_retention_probe.py | 683 ++++++++++++++++++
+ vllm/v1/core/kv_cache_coordinator.py          |  39 +-
+ vllm/v1/core/sched/async_scheduler.py         |   8 +-
+ vllm/v1/core/sched/scheduler.py               |  15 +-
+ vllm/v1/core/single_type_kv_cache_manager.py  | 138 +++-
+ 5 files changed, 871 insertions(+), 12 deletions(-)
+ create mode 100644 tests/v1/core/test_prefix_cache_retention_probe.py
+
+diff --git a/tests/v1/core/test_prefix_cache_retention_probe.py b/tests/v1/core/test_prefix_cache_retention_probe.py
+new file mode 100644
+index 0000000..bca8476
+--- /dev/null
++++ b/tests/v1/core/test_prefix_cache_retention_probe.py
+@@ -0,0 +1,683 @@
++# SPDX-License-Identifier: Apache-2.0
++# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
++"""Stress probe and regression tests for prefix-cache block-boundary retention
++and LRU eviction ordering under 64K-100K multi-turn agent workloads (#902).
++
++Covers:
++1. Exact block-boundary retention around block_size - 1, block_size, and
++   block_size + 1 across 128-token Encoder SWA and 256-token Global MLA
++   boundaries and across prefix_cache_retention_interval in {0, 512, 8192, None}.
++2. Rolling decode-frontier SWA retention when decode stops at T where
++   T % 256 >= 128 (after the 128-token sliding window has moved past the last
++   256-token scheduler boundary) and recycling of intermediate decode SWA
++   blocks to the scratch front of free_block_queue.
++3. Multi-step speculative decoding (1..6 tokens/step) crossing block boundaries
++   and finishing on the crossing step in both Scheduler and AsyncScheduler,
++   plus KVCacheManager hybrid CED speculative decode step stepping.
++4. Shared BlockPool eviction order across hybrid FullAttentionManager +
++   SlidingWindowManager groups: a finished request's blocks are freed
++   tail-to-root across all groups, while SWA checkpoints that no hit read keep
++   their LRU age and are evicted before any live conversation tail.
++5. 64K-100K multi-turn concurrent agent stress probe under KV block eviction
++   pressure across tp3-triangle (retention_interval=512) and tp4-ring
++   (retention_interval=8192) profiles, asserting every turn, evicted or not,
++   hits the previous turn's last 256-token boundary.
++"""
++
++from __future__ import annotations
++
++from dataclasses import replace
++
++import pytest
++import torch
++
++from tests.v1.core.test_prefix_caching import make_kv_cache_manager, make_request
++from vllm.utils.hashing import sha256
++from vllm.v1.core.kv_cache_utils import (
++    get_block_hash,
++    get_group_id,
++    get_request_block_hasher,
++    init_none_hash,
++)
++from vllm.v1.core.single_type_kv_cache_manager import SlidingWindowManager
++from vllm.v1.kv_cache_interface import (
++    KVCacheConfig,
++    KVCacheGroupSpec,
++    MLAAttentionSpec,
++    SlidingWindowMLASpec,
++)
++from vllm.v1.outputs import DraftTokenIds, ModelRunnerOutput
++
++from .utils import create_requests, create_scheduler
++
++HASH = 128
++PAGE = 256
++WINDOW = 128
++
++
++@pytest.fixture(autouse=True)
++def initialize_hashes():
++    init_none_hash(sha256)
++
++
++def make_ced_manager(
++    retention: int | None,
++    *,
++    num_blocks: int = 4096,
++    max_model_len: int = 131072,
++    include_private_decoder: bool = True,
++):
++    """Build a DeepSeek V4.1 CED hybrid KV cache manager:
++    - Global MLA (block_size=256, persistent)
++    - Indexer MLA (block_size=256, persistent)
++    - Encoder SWA (block_size=128, sliding_window=128, persistent)
++    - Decoder SWA (block_size=128, sliding_window=128, private, replay=128)
++    - Draft SWA (block_size=128, sliding_window=128, private, extra_retained=1)
++    """
++    global_spec = MLAAttentionSpec(
++        block_size=PAGE,
++        num_kv_heads=1,
++        head_size=512,
++        tokens_per_state=2,
++        dtype=torch.uint8,
++    )
++    encoder_spec = SlidingWindowMLASpec(
++        block_size=HASH,
++        num_kv_heads=1,
++        head_size=512,
++        dtype=torch.uint8,
++        sliding_window=WINDOW,
++    )
++    groups = [
++        KVCacheGroupSpec(["global-mla"], global_spec),
++        KVCacheGroupSpec(["indexer-mla"], replace(global_spec, head_size=68)),
++        KVCacheGroupSpec(["encoder-swa"], encoder_spec),
++    ]
++    if include_private_decoder:
++        decoder_spec = replace(
++            encoder_spec, prefix_cache_enabled=False, prefill_replay_window=WINDOW
++        )
++        groups.extend(
++            [
++                KVCacheGroupSpec(["decoder-swa"], decoder_spec),
++                KVCacheGroupSpec(
++                    ["draft-swa"], replace(decoder_spec, extra_retained_tokens=1)
++                ),
++            ]
++        )
++    config = KVCacheConfig(
++        num_blocks=num_blocks,
++        kv_cache_tensors=[],
++        kv_cache_groups=groups,
++        prefix_cache_retention_interval=retention,
++    )
++    manager = make_kv_cache_manager(
++        config, max_model_len=max_model_len, hash_block_size=HASH
++    )
++    roles = {group.layer_names[0]: i for i, group in enumerate(groups)}
++    return manager, roles
++
++
++def make_ced_request(name: str, tokens: list[int], max_tokens: int = 8192):
++    req = make_request(name, list(tokens), HASH, sha256)
++    req.max_tokens = max_tokens
++    req.sampling_params.max_tokens = max_tokens
++    return req
++
++
++def run_prefill_and_decode(
++    manager,
++    req,
++    decode_tokens: list[int],
++    *,
++    tokens_per_step: int = 1,
++    prefill_chunk_size: int | None = None,
++) -> int:
++    """Execute prefill (optionally chunked) followed by multi-step decode
++    (1..6 tokens/step, modeling standard decode or speculative decoding).
++    Returns the initial prefix-cache hit in tokens.
++    """
++    computed_blocks, num_cached_tokens, _ = manager.get_computed_blocks(req)
++    remaining_prefill = req.num_prompt_tokens - num_cached_tokens
++    if prefill_chunk_size is None or remaining_prefill <= prefill_chunk_size:
++        if remaining_prefill > 0:
++            assert (
++                manager.allocate_slots(
++                    req, remaining_prefill, num_cached_tokens, computed_blocks
++                )
++                is not None
++            )
++            req.num_computed_tokens = req.num_prompt_tokens
++            manager.cache_blocks(req, req.num_computed_tokens)
++        else:
++            assert (
++                manager.allocate_slots(req, 0, num_cached_tokens, computed_blocks)
++                is not None
++            )
++            req.num_computed_tokens = num_cached_tokens
++    else:
++        first_chunk = min(prefill_chunk_size, remaining_prefill)
++        assert (
++            manager.allocate_slots(
++                req, first_chunk, num_cached_tokens, computed_blocks
++            )
++            is not None
++        )
++        req.num_computed_tokens = num_cached_tokens + first_chunk
++        manager.cache_blocks(req, req.num_computed_tokens)
++        while req.num_computed_tokens < req.num_prompt_tokens:
++            step = min(
++                prefill_chunk_size, req.num_prompt_tokens - req.num_computed_tokens
++            )
++            assert manager.allocate_slots(req, step) is not None
++            req.num_computed_tokens += step
++            manager.cache_blocks(req, req.num_computed_tokens)
++
++    idx = 0
++    while idx < len(decode_tokens):
++        step_tokens = decode_tokens[idx : idx + tokens_per_step]
++        idx += len(step_tokens)
++        req.append_output_token_ids(step_tokens)
++        new_to_allocate = req.num_tokens - req.num_computed_tokens
++        assert manager.allocate_slots(req, new_to_allocate) is not None
++        req.num_computed_tokens = req.num_tokens
++        manager.cache_blocks(req, req.num_computed_tokens)
++
++    manager.free(req)
++    return num_cached_tokens
++
++
++# ---------------------------------------------------------------------------
++# 1. Exact Block-Boundary & Rolling Decode-Frontier Retention
++# ---------------------------------------------------------------------------
++
++
++@pytest.mark.parametrize("retention", [0, 512, 8192, None], ids=["0", "512", "8192", "dense"])
++@pytest.mark.parametrize("prompt_base", [256, 512, 1024])
++@pytest.mark.parametrize("prompt_offset", [-1, 0, 1])
++@pytest.mark.parametrize(
++    "decode_stop_offset",
++    [
++        127,  # B - 1 (just before 128 SWA boundary)
++        128,  # B + 128 (exact 128 SWA boundary)
++        129,  # B + 129 (1 token past 128 SWA boundary)
++        255,  # next 256 boundary - 1
++        256,  # exact next 256 boundary
++        257,  # next 256 boundary + 1
++        383,  # next 256 + 127
++        384,  # next 256 + 128 (sliding window moved past next 256 boundary!)
++        385,  # next 256 + 129 (sliding window moved past next 256 boundary!)
++        511,  # +2*256 - 1
++        512,  # +2*256
++        513,  # +2*256 + 1
++        641,  # +2*256 + 129 (2.5 pages decoded, T % 256 == 129 >= 128)
++    ],
++)
++@pytest.mark.parametrize("tokens_per_step", [1, 3, 6], ids=["step1", "step3", "step6"])
++def test_exact_block_boundary_and_decode_frontier_retention(
++    retention: int | None,
++    prompt_base: int,
++    prompt_offset: int,
++    decode_stop_offset: int,
++    tokens_per_step: int,
++):
++    """Verify that regardless of whether a prompt starts at B-1, B, or B+1 and
++    regardless of whether multi-step decode (1..6 tokens/step) stops at an
++    offset where T % 256 < 128 or T % 256 >= 128 (after the 128-token SWA
++    window has slid past floor(T / 256) * 256), the completed 256-token
++    boundary floor(T_end / 256) * 256 is retained across all persistent groups
++    so Turn 2 hits floor(T_end / 256) * 256 in full.
++    """
++    manager, _ = make_ced_manager(retention, num_blocks=2048)
++    prompt_len = prompt_base + prompt_offset
++    target_total = prompt_base + decode_stop_offset
++    num_decode = target_total - prompt_len
++    assert num_decode > 0
++
++    all_tokens = list(range(target_total + 512))
++    turn1_prompt = all_tokens[:prompt_len]
++    turn1_decode = all_tokens[prompt_len:target_total]
++
++    req1 = make_ced_request("turn-1", turn1_prompt)
++    run_prefill_and_decode(
++        manager, req1, turn1_decode, tokens_per_step=tokens_per_step
++    )
++
++    # Turn 2 appends >= 128 tokens (e.g., 256 tokens of tool output / user reply)
++    # so the 128-token private decoder replay window sits inside the new suffix.
++    turn2_prompt = all_tokens[: target_total + 256]
++    req2 = make_ced_request("turn-2", turn2_prompt)
++    _, hit_ext, _ = manager.get_computed_blocks(req2)
++    expected_ext_hit = (target_total // PAGE) * PAGE
++    assert hit_ext == expected_ext_hit, (
++        f"retention={retention}, prompt={prompt_len}, total={target_total}, "
++        f"step={tokens_per_step}: expected extension hit {expected_ext_hit}, got {hit_ext}"
++    )
++
++    # Also verify exact-same-length retry (delta_prompt == 0): capped by
++    # target_total - WINDOW, so it must hit floor((target_total - WINDOW) / PAGE) * PAGE.
++    req_retry = make_ced_request("retry", all_tokens[:target_total])
++    _, hit_retry, _ = manager.get_computed_blocks(req_retry)
++    expected_retry_hit = ((target_total - WINDOW) // PAGE) * PAGE
++    assert hit_retry == expected_retry_hit, (
++        f"retention={retention}, prompt={prompt_len}, total={target_total}, "
++        f"step={tokens_per_step}: expected retry hit {expected_retry_hit}, got {hit_retry}"
++    )
++
++
++@pytest.mark.parametrize("retention", [0, 512, 8192], ids=["0", "512", "8192"])
++def test_long_decode_recycles_intermediate_swa_frontier_blocks(retention: int):
++    """During a long decode (e.g., 4,096 decoded tokens = 16 pages), rolling
++    decode-frontier SWA retention must recycle obsolete intermediate non-segment
++    decode SWA blocks to the scratch front of free_block_queue so decode never
++    accumulates O(T_decode) extra SWA checkpoints when retention != None.
++    """
++    manager, roles = make_ced_manager(retention, num_blocks=2048)
++    swa_group_id = roles["encoder-swa"]
++    swa_mgr = manager.coordinator.single_type_managers[swa_group_id]
++    assert isinstance(swa_mgr, SlidingWindowManager)
++
++    prompt_len = 513  # unaligned prompt
++    decode_len = 4096  # 16 pages of decode -> ends at 4609 (4609 % 256 == 1)
++    total_len = prompt_len + decode_len
++    tokens = list(range(total_len + 256))
++
++    req1 = make_ced_request("long-decode", tokens[:prompt_len])
++    run_prefill_and_decode(
++        manager, req1, tokens[prompt_len:total_len], tokens_per_step=4
++    )
++
++    # Count how many Encoder SWA blocks remain hashed in the block pool.
++    cached_swa_blocks = [
++        b
++        for b in manager.block_pool.blocks
++        if b.block_hash is not None and get_group_id(b.block_hash) == swa_group_id
++    ]
++    if retention == 0:
++        # Only prompt boundaries (256, 512) + final decode frontier (4352, 4608): <= 4 SWA blocks.
++        assert len(cached_swa_blocks) <= 4
++    elif retention == 8192:
++        # Total < 8192, so only prompt boundaries (256, 512) + final decode frontier (4352, 4608): <= 4 SWA blocks.
++        assert len(cached_swa_blocks) <= 4
++    elif retention == 512:
++        # Segment multiples of 512 up to 4608 (9 boundaries) + prompt/final boundaries: <= 11 SWA blocks
++        # (whereas dense retention would keep all 36 SWA blocks).
++        assert len(cached_swa_blocks) <= 11
++
++    # And Turn 2 still hits the final 256-token boundary (4608) in full!
++    req2 = make_ced_request("turn-2", tokens[: total_len + 256])
++    _, hit, _ = manager.get_computed_blocks(req2)
++    assert hit == (total_len // PAGE) * PAGE == 4608
++
++
++# ---------------------------------------------------------------------------
++# 2. Speculative Decoding (1..6 tokens/step) Crossing Block Boundaries
++#    in Scheduler and AsyncScheduler
++# ---------------------------------------------------------------------------
++
++
++@pytest.mark.parametrize("async_scheduling", [False, True], ids=["sync", "async"])
++@pytest.mark.parametrize("num_spec", [1, 2, 3, 5], ids=["spec1", "spec2", "spec3", "spec5"])
++@pytest.mark.parametrize(
++    "prompt_offset_from_boundary",
++    [1, 2, 3, 4, 5, 6],
++    ids=["minus1", "minus2", "minus3", "minus4", "minus5", "minus6"],
++)
++def test_scheduler_spec_decode_caches_boundary_crossed_on_stopping_step(
++    async_scheduling: bool,
++    num_spec: int,
++    prompt_offset_from_boundary: int,
++):
++    """Regression test for Bug 3: when a running request with speculative
++    decoding (1..5 draft tokens + 1 bonus token = 2..6 tokens/step) crosses a
++    block boundary via accepted draft tokens and finishes on that exact step
++    (reaching max_tokens), Scheduler._update_request_with_output and
++    AsyncScheduler._update_request_with_output must call cache_blocks before
++    _free_request so the newly completed full block is hashed and cached for
++    subsequent requests.
++    """
++    block_size = 16
++    scheduler = create_scheduler(
++        enable_prefix_caching=True,
++        block_size=block_size,
++        num_speculative_tokens=num_spec,
++        speculative_method="ngram_gpu" if async_scheduling else "ngram",
++        async_scheduling=async_scheduling,
++    )
++    # Start at 2 * block_size - prompt_offset_from_boundary (e.g. 32 - k, in 26..31).
++    # First step (prefill) generates 1 token -> num_tokens = 32 - k + 1.
++    # Second step (decode with spec tokens) accepts up to num_spec draft tokens + 1 bonus token
++    # so total tokens crosses 32 (2 full blocks) and hits max_tokens on that step!
++    prompt_len = 2 * block_size - prompt_offset_from_boundary
++    # Ensure 1 prefill token + (1 + num_spec) decode tokens >= prompt_offset_from_boundary
++    total_generated_on_decode_step = min(1 + num_spec, max(1, prompt_offset_from_boundary))
++    max_tokens = 1 + total_generated_on_decode_step
++    will_cross_second_block = (prompt_len + max_tokens - 1) >= 2 * block_size
++
++    req1 = create_requests(
++        num_requests=1,
++        num_tokens=prompt_len,
++        max_tokens=max_tokens,
++        block_size=block_size,
++        same_prompt=True,
++    )[0]
++    scheduler.add_request(req1)
++
++    # Step 1: Prefill req1 -> generates token 0, proposes num_spec draft 0s
++    sched_out1 = scheduler.schedule()
++    drafts = [0] * num_spec
++    model_out1 = ModelRunnerOutput(
++        req_ids=[req1.request_id],
++        req_id_to_index={req1.request_id: 0},
++        sampled_token_ids=[[0]],
++        logprobs=None,
++        prompt_logprobs_dict={},
++        pooler_output=[],
++    )
++    scheduler.update_from_output(sched_out1, model_out1)
++
++    if not req1.is_finished():
++        # Step 2: Decode with speculative draft tokens -> accept drafts + bonus token
++        # and finish on this step!
++        scheduler.update_draft_token_ids(DraftTokenIds([req1.request_id], [list(drafts)]))
++        sched_out2 = scheduler.schedule()
++        step2_tokens = [0] * total_generated_on_decode_step
++        model_out2 = ModelRunnerOutput(
++            req_ids=[req1.request_id],
++            req_id_to_index={req1.request_id: 0},
++            sampled_token_ids=[step2_tokens],
++            logprobs=None,
++            prompt_logprobs_dict={},
++            pooler_output=[],
++        )
++        scheduler.update_from_output(sched_out2, model_out2)
++
++    assert req1.is_finished()
++    assert req1.num_tokens == prompt_len + max_tokens
++
++    # Follow-up request with identical 2-block prefix (32 tokens):
++    # If req1 crossed 2 * block_size (32 tokens), both blocks 0 and 1 MUST be cached!
++    req2 = create_requests(
++        num_requests=1,
++        num_tokens=2 * block_size + 4,
++        max_tokens=4,
++        block_size=block_size,
++        req_ids=["followup-req"],
++    )[0]
++
++    computed_blocks, num_cached_tokens, _ = (
++        scheduler.kv_cache_manager.get_computed_blocks(req2)
++    )
++    if will_cross_second_block:
++        assert num_cached_tokens == 2 * block_size, (
++            f"async={async_scheduling}, num_spec={num_spec}, offset={prompt_offset_from_boundary}: "
++            f"expected 2 full blocks ({2 * block_size} tokens) cached after stopping step, "
++            f"got {num_cached_tokens}"
++        )
++    else:
++        assert num_cached_tokens == block_size
++
++
++# ---------------------------------------------------------------------------
++# 3. Shared BlockPool Tail-to-Root LRU Eviction Ordering
++# ---------------------------------------------------------------------------
++
++
++@pytest.mark.parametrize("retention", [0, 512, 8192, None], ids=["0", "512", "8192", "dense"])
++def test_shared_block_pool_tail_to_root_eviction_order(retention: int | None):
++    """Regression test for the hybrid eviction order in one shared BlockPool.
++
++    After a two-turn session the cached blocks in free_block_queue are:
++    1. first (evicted first), the Encoder SWA checkpoints that turn 2's hit did
++       not read. A sliding-window hit reads only the window that ends at the
++       hit, so earlier checkpoints keep their LRU age; no full-attention block
++       is among them, because turn 2 reused every MLA block of turn 1;
++    2. then turn 2's own blocks, freed tail-to-root across all groups: token
++       positions strictly non-increasing from the LRU head, with dense MLA
++       before sparse SWA at the same position, so an eviction that reaches a
++       live conversation peels its newest tail first instead of one whole
++       group at a time.
++    Evicting every aged checkpoint must not shorten an extension of turn 2.
++    """
++    manager, roles = make_ced_manager(retention, num_blocks=1024)
++    swa_gid = roles["encoder-swa"]
++
++    tokens = list(range(32768))
++
++    # Turn 1: 16,384-token prompt + 512-token decode -> 16,896 tokens
++    req1 = make_ced_request("turn-1", tokens[:16384])
++    run_prefill_and_decode(manager, req1, tokens[16384:16896], tokens_per_step=4)
++
++    # Turn 2: hits Turn 1's 16,896 tokens, extends to 24,576 + 512 decode.
++    req2 = make_ced_request("turn-2", tokens[:24576])
++    hit2 = run_prefill_and_decode(manager, req2, tokens[24576:25088], tokens_per_step=4)
++    assert hit2 == 16896
++
++    hash_to_end_token = {
++        blk_hash: (idx_blk + 1) * HASH
++        for idx_blk, blk_hash in enumerate(req2.block_hashes)
++    }
++    free_blocks = manager.block_pool.free_block_queue.get_all_free_blocks()
++    cached_entries = []
++    num_scanned = 0
++    for blk in free_blocks:
++        num_scanned += 1
++        if blk.block_hash is None:
++            continue
++        gid = get_group_id(blk.block_hash)
++        end_tok = hash_to_end_token[get_block_hash(blk.block_hash)]
++        cached_entries.append((end_tok, gid == swa_gid, gid, num_scanned))
++    assert cached_entries, "Expected cached blocks in free_block_queue"
++
++    # Turn 2's run starts at its tail, the highest cached position.
++    tail_end = max(entry[0] for entry in cached_entries)
++    assert tail_end == 25088
++    run_start = next(
++        i for i, entry in enumerate(cached_entries) if entry[0] == tail_end
++    )
++    aged, run = cached_entries[:run_start], cached_entries[run_start:]
++
++    assert all(is_sparse for _, is_sparse, _, _ in aged), (
++        "Only SWA checkpoints a hit did not read may age ahead of the live tail"
++    )
++    for (end_a, sparse_a, gid_a, _), (end_b, sparse_b, gid_b, _) in zip(
++        run, run[1:]
++    ):
++        assert end_a >= end_b, (
++            f"Tail-to-root order violated: block ending at {end_a} (group "
++            f"{gid_a}) is evicted before block ending at {end_b} (group {gid_b})"
++        )
++        if end_a == end_b:
++            assert sparse_a <= sparse_b, (
++                f"At end_token={end_a}, sparse SWA block (group {gid_a}) "
++                f"precedes dense MLA block (group {gid_b}) in eviction order"
++            )
++
++    # Evict every aged checkpoint: an extension of turn 2 still hits its tail.
++    if aged:
++        # aged[-1][3] counts the free blocks up to the last aged checkpoint.
++        manager.block_pool.get_new_blocks(aged[-1][3])
++    req3 = make_ced_request("turn-3", tokens[: 25088 + 256])
++    _, hit3, _ = manager.get_computed_blocks(req3)
++    assert hit3 == 25088
++
++
++# ---------------------------------------------------------------------------
++# 4. 64K-100K Multi-Turn Concurrent Agent Stress Probe Under Eviction Pressure
++# ---------------------------------------------------------------------------
++
++
++@pytest.mark.parametrize(
++    "retention",
++    [512, 8192],
++    ids=["tp3-triangle-retention-512", "tp4-ring-retention-8192"],
++)
++def test_64k_to_100k_multi_turn_agent_retention_under_eviction_pressure(
++    retention: int,
++):
++    """Full-scale 64K-100K token multi-turn concurrent agent stress probe (#902).
++
++    Simulates 2 concurrent agent sessions scaling from 64K (65,536 tokens) up to
++    100K (100,096 tokens) across 8 turns each, with:
++    - Unaligned prompt extensions (+4,000 to +5,000 tokens per turn) and
++      multi-step speculative decoding (1..6 tokens/step) stopping at both
++      T % 256 < 128 and T % 256 >= 128 offsets,
++    - Interleaved ephemeral stressor requests between turns that force KV block
++      evictions from the shared BlockPool.
++
++    Verifies:
++    1. Without eviction between turns, every turn hits the previous turn's
++       last 256-token boundary exactly.
++    2. Under KV block eviction pressure (a stressor evicts the first 18
++       cached blocks at the LRU head), the evicted blocks are aged SWA
++       checkpoints no hit read, never a live conversation tail, so the turns
++       after an eviction hit the same exact boundary.
++    """
++    # Size the BlockPool so 2 concurrent 100K agent sessions fit with tight
++    # headroom. At 100K tokens (391 MLA blocks * 2 groups = 782 MLA blocks plus
++    # the retained SWA checkpoints per agent), 2 agents use ~1,600 of the 2,200
++    # blocks, and an ephemeral stressor evicts the 18 cached blocks at the LRU
++    # head of free_block_queue.
++    manager, _ = make_ced_manager(
++        retention,
++        num_blocks=2200,
++        max_model_len=131072,
++    )
++
++    num_agents = 2
++    # Turn schedule (prompt_len, decode_len, spec_step_size) scaling from 64K to 100K:
++    # Notice decode endpoints intentionally alternate between T % 256 < 128 and T % 256 >= 128!
++    turn_schedule = [
++        (65536, 389, 4),   # Turn 1: 65,536 -> 65,925 (65925 % 256 == 133 >= 128!)
++        (70144, 412, 6),   # Turn 2: 70,144 -> 70,556 (70556 % 256 == 156 >= 128!)
++        (75008, 290, 3),   # Turn 3: 75,008 -> 75,298 (75298 % 256 == 34 < 128)
++        (80128, 395, 5),   # Turn 4: 80,128 -> 80,523 (80523 % 256 == 139 >= 128!)
++        (85248, 401, 4),   # Turn 5: 85,248 -> 85,649 (85649 % 256 == 145 >= 128!)
++        (90112, 310, 6),   # Turn 6: 90,112 -> 90,422 (90422 % 256 == 54 < 128)
++        (95232, 399, 5),   # Turn 7: 95,232 -> 95,631 (95631 % 256 == 143 >= 128!)
++        (99584, 512, 4),   # Turn 8: 99,584 -> 100,096 (100,096 tokens!)
++    ]
++
++    agent_tokens = {
++        agent_id: [agent_id * 1_000_000 + i for i in range(102400)]
++        for agent_id in range(num_agents)
++    }
++    prev_completed_len = {agent_id: 0 for agent_id in range(num_agents)}
++
++    total_expected_reusable_tokens = 0
++    total_actual_hit_tokens = 0
++    no_eviction_turn_hit_rates = []
++    eviction_turn_hit_rates = []
++
++    for turn_idx, (prompt_len, decode_len, step_size) in enumerate(turn_schedule):
++        # Before turns 4, 6 and 8, inject an ephemeral stressor request to force
++        # partial KV block eviction from the shared BlockPool.
++        eviction_active = turn_idx in (3, 5, 7)
++        if eviction_active:
++            # Force real BlockPool LRU eviction of the first 18 cached blocks at
++            # the head of free_block_queue by allocating all unhashed free blocks
++            # ahead of them plus those 18, then returning them unhashed.
++            free_list = manager.block_pool.free_block_queue.get_all_free_blocks()
++            blocks_to_claim = 0
++            cached_seen = 0
++            for b in free_list:
++                blocks_to_claim += 1
++                if b.block_hash is not None:
++                    cached_seen += 1
++                    if cached_seen == 18:
++                        break
++            claimed = manager.block_pool.get_new_blocks(blocks_to_claim)
++            for b in claimed:
++                b.ref_cnt -= 1
++            manager.block_pool.free_block_queue.prepend_n(claimed)
++
++        for agent_id in range(num_agents):
++            seq = agent_tokens[agent_id]
++            prompt = seq[:prompt_len]
++            decode = seq[prompt_len : prompt_len + decode_len]
++            req = make_ced_request(f"agent-{agent_id}-turn-{turn_idx}", prompt)
++
++            hit = run_prefill_and_decode(
++                manager,
++                req,
++                decode,
++                tokens_per_step=step_size,
++                prefill_chunk_size=8192,
++            )
++
++            prev_len = prev_completed_len[agent_id]
++            if prev_len > 0:
++                max_possible_hit = (prev_len // PAGE) * PAGE
++                hit_ratio = hit / prev_len
++                total_expected_reusable_tokens += prev_len
++                total_actual_hit_tokens += hit
++
++                # Exact boundary hit expected on every turn, evicted or not.
++                assert hit == max_possible_hit, (
++                    f"retention={retention}, turn={turn_idx}, agent={agent_id}, "
++                    f"eviction={eviction_active}: expected exact boundary hit "
++                    f"{max_possible_hit} from prev_len={prev_len}, "
++                    f"got {hit} ({hit_ratio:.4%})"
++                )
++                if eviction_active and agent_id == 0:
++                    eviction_turn_hit_rates.append(hit_ratio)
++                else:
++                    no_eviction_turn_hit_rates.append(hit_ratio)
++
++            prev_completed_len[agent_id] = prompt_len + decode_len
++
++    overall_hit_rate = total_actual_hit_tokens / total_expected_reusable_tokens
++    min_no_eviction_hit = min(no_eviction_turn_hit_rates)
++    min_eviction_hit = min(eviction_turn_hit_rates)
++
++    # The exact-boundary asserts above bound every turn at
++    # (prev_len // 256 * 256) / prev_len >= 99.6% for this schedule.
++    assert min_no_eviction_hit >= 0.996, (
++        f"retention={retention}: min non-evicted turn hit rate {min_no_eviction_hit:.4%} < 99.6%"
++    )
++    assert min_eviction_hit >= 0.996, (
++        f"retention={retention}: min evicted turn hit rate {min_eviction_hit:.4%} < 99.6%"
++    )
++    assert overall_hit_rate >= 0.996, (
++        f"retention={retention}: overall 64K-100K hit rate {overall_hit_rate:.4%} < 99.6%"
++    )
++
++
++def test_async_scheduler_stale_output_after_preemption_does_not_cache():
++    """Verify that AsyncScheduler._update_request_with_output skips cache_blocks
++    when output_is_stale is True (after a preemption rolled num_computed_tokens
++    back to 0 while an in-flight step was still pending).
++    """
++    block_size = 16
++    scheduler = create_scheduler(
++        enable_prefix_caching=True,
++        block_size=block_size,
++        async_scheduling=True,
++    )
++    req1 = create_requests(
++        num_requests=1,
++        num_tokens=block_size - 1,
++        max_tokens=4,
++        block_size=block_size,
++        same_prompt=True,
++    )[0]
++    scheduler.add_request(req1)
++
++    # Step 1: Schedule prefill (in flight)
++    sched_out1 = scheduler.schedule()
++    # Simulate preemption while Step 1 is in flight
++    scheduler._preempt_request(req1, 0.0)
++    assert req1.num_computed_tokens == 0
++    assert req1.num_stale_output_tokens == block_size - 1
++
++    # Deliver the now-stale output from Step 1
++    model_out1 = ModelRunnerOutput(
++        req_ids=[req1.request_id],
++        req_id_to_index={req1.request_id: 0},
++        sampled_token_ids=[[0]],
++        logprobs=None,
++        prompt_logprobs_dict={},
++        pooler_output=[],
++    )
++    scheduler.update_from_output(sched_out1, model_out1)
++    assert req1.num_computed_tokens == 0
+diff --git a/vllm/v1/core/kv_cache_coordinator.py b/vllm/v1/core/kv_cache_coordinator.py
+index cded5e9..0ab46b2 100644
+--- a/vllm/v1/core/kv_cache_coordinator.py
++++ b/vllm/v1/core/kv_cache_coordinator.py
+@@ -428,7 +428,12 @@ class KVCacheCoordinator(ABC):
+         pools = dict.fromkeys(
+             manager.block_pool for manager in self.single_type_managers
+         )
+-        return all([pool.reset_prefix_cache() for pool in pools])
++        ok = all([pool.reset_prefix_cache() for pool in pools])
++        if ok:
++            for manager in self.single_type_managers:
++                if isinstance(manager, SlidingWindowManager):
++                    manager._req_decode_frontier_blocks.clear()
++        return ok
+ 
+     def free(self, request_id: str) -> None:
+         """
+@@ -437,8 +442,15 @@ class KVCacheCoordinator(ABC):
+         Args:
+             request_id: The request ID.
+         """
+-        for manager in self.single_type_managers:
+-            manager.free(request_id)
++        if len(self.single_type_managers) <= 1:
++            for manager in self.single_type_managers:
++                manager.free(request_id)
++            return
++
++        # Free the request's blocks across all groups tail-to-root, so a
++        # token position's blocks in every group are evicted together and
++        # before the positions below it.
++        self.block_pool.free_blocks(reversed(self.pop_blocks_for_free(request_id)))
+ 
+     def pop_blocks_for_free(self, request_id: str) -> list[KVCacheBlock]:
+         """
+@@ -454,10 +466,23 @@ class KVCacheCoordinator(ABC):
+         Returns:
+             The request's blocks in allocation order.
+         """
+-        blocks: list[KVCacheBlock] = []
+-        for manager in self.single_type_managers:
+-            blocks.extend(manager.pop_blocks_for_free(request_id))
+-        return blocks
++        if len(self.single_type_managers) <= 1:
++            blocks: list[KVCacheBlock] = []
++            for manager in self.single_type_managers:
++                blocks.extend(manager.pop_blocks_for_free(request_id))
++            return blocks
++
++        tagged_blocks: list[tuple[int, int, int, int, KVCacheBlock]] = []
++        for group_id, manager in enumerate(self.single_type_managers):
++            is_sparse = (
++                1 if isinstance(manager, (SlidingWindowManager, MambaManager)) else 0
++            )
++            block_size = manager.block_size
++            for blk_idx, blk in enumerate(manager.pop_blocks_for_free(request_id)):
++                end_token = (blk_idx + 1) * block_size
++                tagged_blocks.append((end_token, -is_sparse, -group_id, blk_idx, blk))
++        tagged_blocks.sort(key=lambda item: item[:4])
++        return [item[4] for item in tagged_blocks]
+ 
+     def get_num_common_prefix_blocks(self, running_request_id: str) -> list[int]:
+         """
+diff --git a/vllm/v1/core/sched/async_scheduler.py b/vllm/v1/core/sched/async_scheduler.py
+index 048f5e3..5f83d88 100644
+--- a/vllm/v1/core/sched/async_scheduler.py
++++ b/vllm/v1/core/sched/async_scheduler.py
+@@ -100,9 +100,13 @@ class AsyncScheduler(Scheduler):
+             assert request.num_output_placeholders >= 0
+ 
+         # Cache the new tokens. Preempted requests should be skipped.
+-        if status_before_update == RequestStatus.RUNNING:
++        if status_before_update == RequestStatus.RUNNING and not is_stale:
+             self.kv_cache_manager.cache_blocks(
+-                request, request.num_computed_tokens - request.num_output_placeholders
++                request,
++                min(
++                    request.num_computed_tokens - request.num_output_placeholders,
++                    request.num_tokens,
++                ),
+             )
+         return new_token_ids, stopped
+ 
+diff --git a/vllm/v1/core/sched/scheduler.py b/vllm/v1/core/sched/scheduler.py
+index b61ec52..b821956 100644
+--- a/vllm/v1/core/sched/scheduler.py
++++ b/vllm/v1/core/sched/scheduler.py
+@@ -4122,11 +4122,12 @@ class Scheduler(SchedulerInterface):
+         is_stale: bool = False,
+         count_placeholders: bool = True,
+     ) -> tuple[list[int], bool]:
+-        # is_stale and count_placeholders are only used by the AsyncScheduler
+-        # override.
++        # count_placeholders is only used by the AsyncScheduler override.
+         # Append generated tokens and check for stop. Note that if
+         # a request is still being prefilled, we expect the model runner
+         # to return empty token ids for the request.
++        status_before_update = request.status
++        num_tokens_before = request.num_tokens
+         stopped = False
+         start_ids = self.reasoning_start_token_ids
+         end_ids = self.natural_reasoning_end_token_ids
+@@ -4213,6 +4214,16 @@ class Scheduler(SchedulerInterface):
+                     )
+                 del new_token_ids[num_new:]  # Trim new tokens if needed.
+                 break
++        if (
++            status_before_update == RequestStatus.RUNNING
++            and not is_stale
++            and request.num_output_placeholders == 0
++            and request.num_computed_tokens > num_tokens_before
++        ):
++            self.kv_cache_manager.cache_blocks(
++                request,
++                min(request.num_computed_tokens, request.num_tokens),
++            )
+         return new_token_ids, stopped
+ 
+     def _free_encoder_inputs(self, request: Request) -> None:
+diff --git a/vllm/v1/core/single_type_kv_cache_manager.py b/vllm/v1/core/single_type_kv_cache_manager.py
+index a1eb644..1bf95b4 100644
+--- a/vllm/v1/core/single_type_kv_cache_manager.py
++++ b/vllm/v1/core/single_type_kv_cache_manager.py
+@@ -1198,6 +1198,12 @@ class SlidingWindowManager(SingleTypeKVCacheManager):
+         # multi-module MTP store-side lag can still reconstruct the window from
+         # cached blocks.
+         self.extra_retained_tokens = kv_cache_spec.extra_retained_tokens
++        # Transient decode-frontier SWA blocks that can be recycled once decode
++        # advances past their replay window:
++        # {req_id: {block_idx: (block, block_hash)}}
++        self._req_decode_frontier_blocks: dict[
++            str, dict[int, tuple[KVCacheBlock, BlockHashWithGroupId]]
++        ] = {}
+ 
+     @classmethod
+     def _contiguous_blocks_for_hit(
+@@ -1427,6 +1433,29 @@ class SlidingWindowManager(SingleTypeKVCacheManager):
+                 return computed_blocks, hit_length
+         return tuple([] for _ in range(num_groups)), 0
+ 
++    def _resolve_decode_frontier_boundaries(
++        self,
++        num_tokens: int,
++        mask_alignment_tokens: int,
++    ) -> tuple[bool, tuple[int, ...]]:
++        aligned_ext = num_tokens // mask_alignment_tokens * mask_alignment_tokens
++        replay_back = max(1, self.prefill_replay_tokens)
++        resend_lo = max(aligned_ext - replay_back, 0)
++        resend_hi = max(aligned_ext + mask_alignment_tokens - 1 - replay_back, 0)
++        raw_boundaries = tuple(
++            dict.fromkeys(
++                b for b in (resend_lo, resend_hi, aligned_ext) if b > 0
++            )
++        )
++        return resolve_sparse_retention_inputs(
++            self.kv_cache_spec,
++            self.use_eagle,
++            self.lookup_drops_eagle_block,
++            raw_boundaries,
++            lookup_alignment_tokens=mask_alignment_tokens,
++            state_materialization_alignment_tokens=self.scheduler_block_size,
++        )
++
+     def cache_blocks(
+         self,
+         request: Request,
+@@ -1439,12 +1468,100 @@ class SlidingWindowManager(SingleTypeKVCacheManager):
+         if not self.enable_caching:
+             return
+         num_cached_before = self.num_cached_block.get(request.request_id, 0)
++        num_full_blocks = num_tokens // self.block_size
++        mask_alignment_tokens = (
++            self.cache_hit_alignment_tokens
++            if alignment_tokens is None
++            else alignment_tokens
++        )
++        effective_replay_boundaries = replay_boundaries
++        permanent_mask: list[bool] | None = None
++        if (
++            num_full_blocks > num_cached_before
++            and retention_interval is not None
++            and num_tokens > request.num_prompt_tokens
++        ):
++            raw_prompt_boundaries = (
++                ()
++                if replay_boundaries is not None
++                else (
++                    max(
++                        0,
++                        request.num_prompt_tokens
++                        - max(1, self.prefill_replay_tokens),
++                    ),
++                )
++            )
++            if request.shared_prefix_boundary:
++                raw_prompt_boundaries = (
++                    *raw_prompt_boundaries,
++                    request.shared_prefix_boundary,
++                )
++            retention_use_eagle, prompt_reachable = resolve_sparse_retention_inputs(
++                self.kv_cache_spec,
++                self.use_eagle,
++                self.lookup_drops_eagle_block,
++                raw_prompt_boundaries,
++                lookup_alignment_tokens=mask_alignment_tokens,
++                state_materialization_alignment_tokens=self.scheduler_block_size,
++            )
++            if replay_boundaries is not None:
++                prompt_reachable = (*replay_boundaries, *prompt_reachable)
++            permanent_mask = self.reachable_block_mask(
++                start_block=num_cached_before,
++                end_block=num_full_blocks,
++                alignment_tokens=mask_alignment_tokens,
++                kv_cache_spec=self.kv_cache_spec,
++                use_eagle=retention_use_eagle,
++                retention_interval=retention_interval,
++                reachable_boundaries=prompt_reachable,
++                dcp_world_size=self.dcp_world_size,
++            )
++            _, decode_boundaries = self._resolve_decode_frontier_boundaries(
++                num_tokens, mask_alignment_tokens
++            )
++            effective_replay_boundaries = (*prompt_reachable, *decode_boundaries)
++
++            # Recycle previous transient decode-frontier SWA blocks that are
++            # no longer part of the active decode replay window.
++            frontier = self._req_decode_frontier_blocks.get(request.request_id)
++            if frontier:
++                recycled_free: list[KVCacheBlock] = []
++                for old_idx, (old_blk, old_hash) in list(frontier.items()):
++                    still_keep = self.reachable_block_mask(
++                        start_block=old_idx,
++                        end_block=old_idx + 1,
++                        alignment_tokens=mask_alignment_tokens,
++                        kv_cache_spec=self.kv_cache_spec,
++                        use_eagle=retention_use_eagle,
++                        retention_interval=0,
++                        reachable_boundaries=decode_boundaries,
++                        dcp_world_size=self.dcp_world_size,
++                    )
++                    if still_keep is None or still_keep[0]:
++                        continue
++                    frontier.pop(old_idx, None)
++                    if not old_blk.is_null and old_blk.block_hash == old_hash:
++                        self.block_pool._maybe_evict_cached_block(old_blk)
++                        if (
++                            old_blk.ref_cnt == 0
++                            and (old_blk.pool is None or old_blk.pool is self.block_pool)
++                            and old_blk.prev_free_block is not None
++                            and old_blk.next_free_block is not None
++                        ):
++                            recycled_free.append(old_blk)
++                if recycled_free:
++                    queue = self.block_pool.free_block_queue
++                    for blk in recycled_free:
++                        queue.remove(blk)
++                    queue.prepend_n(recycled_free)
++
+         super().cache_blocks(
+             request,
+             num_tokens,
+             retention_interval=retention_interval,
+             alignment_tokens=alignment_tokens,
+-            replay_boundaries=replay_boundaries,
++            replay_boundaries=effective_replay_boundaries,
+         )
+         hit_alignment = (
+             self.cache_hit_alignment_tokens
+@@ -1456,6 +1573,21 @@ class SlidingWindowManager(SingleTypeKVCacheManager):
+             self._cache_internal_attention_anchors(
+                 request, num_tokens, num_cached_before, retention_interval
+             )
++        num_cached_after = self.num_cached_block.get(request.request_id, 0)
++        if permanent_mask is not None and num_cached_after > num_cached_before:
++            # Record the decode-frontier tails this step cached beyond the
++            # permanent (segment / prompt-boundary) mask so a later step can
++            # recycle them once decode moves past their replay window.
++            blocks = self.req_to_blocks[request.request_id]
++            frontier = self._req_decode_frontier_blocks.setdefault(
++                request.request_id, {}
++            )
++            for idx in range(num_cached_before, num_cached_after):
++                blk = blocks[idx]
++                if blk.is_null or blk.block_hash is None:
++                    continue
++                if not permanent_mask[idx - num_cached_before]:
++                    frontier[idx] = (blk, blk.block_hash)
+ 
+     @classmethod
+     def _fine_grained_reachable_block_mask(
+@@ -1635,6 +1767,10 @@ class SlidingWindowManager(SingleTypeKVCacheManager):
+             num_computed_tokens - self.sliding_window + 1 - self.extra_retained_tokens,
+         )
+ 
++    def pop_blocks_for_free(self, request_id: str) -> list[KVCacheBlock]:
++        self._req_decode_frontier_blocks.pop(request_id, None)
++        return super().pop_blocks_for_free(request_id)
++
+     def get_num_common_prefix_blocks(self, running_request_id: str) -> int:
+         """
+         NOTE(Chen): The prefix blocks are null blocks for sliding window layers.
+-- 
+2.43.0
+

@@ -1,0 +1,34 @@
+[transformers] You are using a model of type `deepseek_v41` to instantiate a model of type ``. This may be expected if you are loading a checkpoint that shares a subset of the architecture (e.g., loading a `sam2_video` checkpoint into `Sam2Model`), but is otherwise not supported and can yield errors. Please verify that the checkpoint is compatible with the model you are instantiating.
+INFO 11-09 04:15:46 [model.py:693] Resolved architecture: OPTForCausalLM
+INFO 11-09 04:15:46 [model.py:2066] Using max model len 8192
+INFO 11-09 04:15:46 [scheduler.py:436] Chunked prefill is enabled with max_num_batched_tokens=2048.
+WARNING 11-09 04:15:46 [vllm.py:1735] Async scheduling not supported with ngram-based speculative decoding and will be disabled.
+INFO 11-09 04:15:46 [kernel.py:435] Final IR op priority after setting platform defaults: IrOpPriorityConfig(rms_norm=['native'], fused_add_rms_norm=['native'], gelu_and_mul_sparse=['triton', 'native'])
+WARNING 11-09 04:15:46 [vllm.py:2425] max_num_scheduled_tokens is set to 2048 based on the speculative decoding settings. This may lead to suboptimal performance. Consider increasing max_num_batched_tokens to accommodate the additional draft token slots, or decrease num_speculative_tokens.
+WARNING 11-09 04:15:46 [vllm.py:907] Model Runner V2 does not yet support speculative method 'ngram'; using the V1 model runner instead.
+INFO 11-09 04:15:46 [config.py:852] Detected quantization_config.scale_fmt=ue8m0; enabling UE8M0 for DeepGEMM.
+INFO 11-09 04:16:35 [model.py:693] Resolved architecture: OPTForCausalLM
+INFO 11-09 04:16:35 [model.py:2066] Using max model len 524288
+Traceback (most recent call last):
+  File "/mnt/host-tmp/bench_suite.py", line 697, in <module>
+    main()
+  File "/mnt/host-tmp/bench_suite.py", line 690, in main
+    "scheduler": bench_scheduler(tmp_dir),
+                 ^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/mnt/host-tmp/bench_suite.py", line 547, in bench_scheduler
+    run_scenario(
+  File "/mnt/host-tmp/bench_suite.py", line 371, in run_scenario
+    sched = make_sched(
+            ^^^^^^^^^^^
+  File "/mnt/host-tmp/bench_suite.py", line 272, in make_sched
+    scheduler_config = SchedulerConfig(
+                       ^^^^^^^^^^^^^^^^
+  File "/usr/local/lib/python3.12/dist-packages/pydantic/_internal/_dataclasses.py", line 121, in __init__
+    s.__pydantic_validator__.validate_python(ArgsKwargs(args, kwargs), self_instance=s)
+pydantic_core._pydantic_core.ValidationError: 2 validation errors for SchedulerConfig
+prefill_long_threshold
+  Unexpected keyword argument [type=unexpected_keyword_argument, input_value=0, input_type=int]
+    For further information visit https://errors.pydantic.dev/2.13/v/unexpected_keyword_argument
+max_long_prefills
+  Unexpected keyword argument [type=unexpected_keyword_argument, input_value=1, input_type=int]
+    For further information visit https://errors.pydantic.dev/2.13/v/unexpected_keyword_argument
