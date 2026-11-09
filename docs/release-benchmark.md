@@ -19,8 +19,14 @@ with it ([lab.md](lab.md#release-comparison)).
 
 ## Candidates
 
-A candidate is the latest release plus a selection of PRs. Several candidates are tested
-at once, one per testbed. Every PR that passes is carried into all later candidates, and a
+A candidate is the latest release plus a selection of PRs. The work has two phases
+(owner, 2026-11-09):
+- **PR validation** (steps 1-8) is quick. It shows whether each PR earns its keep.
+- **Release qualification** (step 9) measures the final candidate once, completely, and
+  produces the benchmark data for the release notes and announcement.
+
+AgentX, quality evals, cold boots and the full release set belong to release qualification
+only. Several candidates are tested at once, one per testbed. Every PR that passes is carried into all later candidates, and a
 PR that misses goes to rework ([methodology](methodology.md#round-purpose-report-and-drop-rule)).
 Each round follows the steps below. Candidates 47-49 are the worked example
 ([experiments/2026-10-26-spark-ds41f-candidate](../experiments/2026-10-26-spark-ds41f-candidate/README.md)).
@@ -28,6 +34,7 @@ Each round follows the steps below. Candidates 47-49 are the worked example
 Owner rules for these rounds (2026-11-09):
 - Testing on the dgx and spaceport nodes needs no further approval, and neither does
   merging the round's own PRs. The hold-file rules in AGENTS.md still apply.
+- Every merge of the round's PRs follows a passing unit-suite run on a dgx node (step 3).
 - Builds never run on the owner's laptop.
 - Every test result is kept.
 
@@ -71,7 +78,7 @@ The folder is `experiments/2026-10-26-spark-ds41f-candidate/candidate-<N>/`.
 - `README.md`: the PRs, the testbed, the runs, and each PR's mark, declared before building.
 - **Specs:**
   - `build.json` (sync, image, kernel), or `candidate-<shape>.json`, which adds the gate;
-  - `release-<shape>.json`.
+  - `screen-<shape>.json` (step 6). `release-<shape>.json` is for release qualification (step 9).
 
 ### 3. Lock and check (on a dgx node)
 
@@ -87,7 +94,17 @@ bin/spark --cluster-config <dir>/image-dgx4.json build prepare --only vllm --loc
 - Run `scripts/release_tests.py check <prepared tree> <base revision> HEAD <dir>/release-tests.json`,
   starting from the base release's classification, and classify every new or changed test
   file. Then run `gate` and `bundle`.
-- Run `bin/spark doctor` on every configuration, the unit suite on Linux, and `git diff --check`.
+- **Unit suite on a dgx node.** Run it in that checkout, at the commit being merged:
+  ```bash
+  python3 -m unittest discover -s tests -p "test_*.py"
+  ```
+  - It must pass in full there.
+  - A run on the owner's laptop (macOS) does not count. Some tests need Linux: the sandboxed
+    model-output parser and the CPU-affinity build sizing.
+  - Use a node that is not part of a running measurement. Test load on a measured node
+    perturbs the bench. When every dgx node is measuring, wait for a gap between jobs or for
+    the window to close.
+- Run `bin/spark doctor` on every configuration, and `git diff --check`.
 - Merge the folder to `main`. The lab opens a window only on a published commit.
 
 ### 4. Build and release tests (dgx window)
@@ -110,17 +127,35 @@ one boot instead of a release run.
 
 ### 6. Screen
 
-`release-<shape>.json` runs the release suite (`release-tp3` at TP3) with `single-stream`, on
-two candidate boots.
-- **Reference:** the base's recorded runs (`"reference": "release"`). Where no suite record
-  exists at that shape, boot the previous release as the middle arm, and keep its run as the
-  reference for later candidates.
-- **`sampled`:** add it only when a PR's mark depends on temperature > 0 or on drafting.
+`screen-<shape>.json` runs the `screen` suite on two candidate boots: `screen` at TP4,
+`screen-tp3` at TP3, about 18 minutes a boot. It covers model behaviour (greedy identity
+against the reference), the engine grid, a closed loop (16 streams at TP4, 8 at TP3) and
+prefill at 32K and 256K.
+- **Reference:** the base release's `screen` run at the same shape.
+  - Record it once per testbed shape: two boots of the release, as the first job of the
+    round that first needs it.
+  - Keep it in that candidate's `receipts/references/<release>-<shape>-screen/` (companions
+    beside it as `-<suite>`), and name it in later screens' `"reference"`.
+  - Measuring the release here is allowed because no record of this suite exists; it isn't
+    re-measuring a recorded number.
+  - The release's `release`-suite records serve release qualification, not screens.
+- **Companions:** add a suite only when a PR's mark needs a step the screen lacks:
+  - `single-stream` for one-stream decode;
+  - `sampled` for temperature > 0 or drafting;
+  - `release` (with its own reference) for the stall rows, such as TTFT during a long prefill.
 
 ### 7. Own marks
 
 - For every PR, re-run its own evidence (its README's commands) on the candidate image on sp8,
   two boots each. Use the base image as the baseline where the PR compared against it.
+- **Run the baseline in the same session, interleaved (ABBA).** Microbenchmark spreads between
+  sessions are larger than one session's interval. A candidate compared with baseline numbers
+  recorded in another session shows "slower" cells that re-running unchanged code also shows
+  (#996 round 2). The baseline arm of a PR's kernel A/B is not a release record, so the rule
+  against re-measuring a release does not apply to it. Reworks follow the same rule.
+- **Judge on the path serving takes.** Decode kernels run from CUDA graphs, so for them CUDA-graph
+  replay or kernel time decides. A loop of eager launches measures the launch cost, not the kernel
+  (#991 round 1). Record both.
 - Receipts go in `receipts/own-marks/pr-<N>/`, with a `result.json`.
 - One sub-agent per candidate does this.
 
@@ -138,18 +173,36 @@ two candidate boots.
 - **Receipts:** keep every one, unfavourable runs included. `experiments/**/receipts/**` is
   exempt from whitespace checks, so receipts stay byte-for-byte.
 
-### 9. Merge the winners
+### 9. Release qualification (final benchmarking)
 
-- **The next candidate** is the base plus every PR that passed, including every reworked PR that meets its mark.
-- **Every shape:** it is qualified on every shape the release serves, `tp3-triangle` included.
-- **Every testing layer** of [testing.md](testing.md):
-  - the release tests;
-  - the determinism gate;
-  - cold boots;
-  - the full release set (`release`, `single-stream`, `sampled`);
-  - the quality evals the previous release recorded (LongBench v2, RULER, EvalPlus HumanEval, Vision Eval, tool-eval-bench, the 960K needle, a 1-hour AgentX run);
-  - the live functional checks of its fixes.
-- **Then promotion** (section 4).
+The release candidate is the base plus every PR that passed PR validation, including every
+reworked PR that met its mark. It is measured once, completely, on every shape the release
+serves, `tp3-triangle` included.
+
+**What runs:**
+- every layer of [testing.md](testing.md): the release tests, the determinism gate and cold boots;
+- the full release set on two candidate boots, against the previous release's recorded runs:
+  `release` (`release-tp3` at TP3), `single-stream` and `sampled`. The promoted runs become
+  each shape's `benchmark_reference`;
+- the quality evals the previous release recorded: LongBench v2, RULER, EvalPlus HumanEval,
+  Vision Eval, tool-eval-bench and the 960K needle;
+- a 1-hour AgentX run (the lab's `agentx` job) on every shape the previous release reported;
+- the live functional checks of the fixes it carries;
+- startup memory floors and boot time.
+
+**What the release notes report**, against the previous release (the format of
+[release-notes.md](../experiments/2026-10-26-spark-ds41f-candidate/release-notes.md)):
+- paired decode at each concurrency;
+- the engine grid;
+- prefill from 32K to 1M;
+- sampled decode;
+- short-request TTFT during a 131K prefill;
+- greedy identity;
+- the quality scores;
+- AgentX throughput and prefix-cache hit rate;
+- the startup memory floor.
+
+Then promotion (section 4).
 
 ## Arms
 
