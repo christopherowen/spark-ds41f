@@ -1,0 +1,97 @@
+diff --git a/tests/models/test_deepseek_v4_1_attention.py b/tests/models/test_deepseek_v4_1_attention.py
+index 5147110c4..e1fd95311 100644
+--- a/tests/models/test_deepseek_v4_1_attention.py
++++ b/tests/models/test_deepseek_v4_1_attention.py
+@@ -1902,16 +1902,19 @@ def test_decode_two_stream_overlap_schedules_disjoint_workspaces(monkeypatch):
+     assert ("attend", "main") in names_reidx
+ 
+ 
++@pytest.mark.parametrize("is_decode", [False, True])
+ @pytest.mark.parametrize("n_real", [4, 2, 0])
+ @pytest.mark.parametrize("split_check", [False, True])
+ def test_sp_prefill_with_replicated_fused_wqa_wkv_gathers_mxfp8_and_swa_records(
+-    monkeypatch, n_real, split_check
++    monkeypatch, n_real, split_check, is_decode
+ ):
+     """When ``fused_wqa_wkv`` is replicated across TP, SP prefill without a compressor
+     runs ``sp_attention_front`` on ``qr_kv[:real_rows]``, gathers only ``local_q_cast``
+     and 528-byte SWA cache records via ``gather_mxfp8`` (1,848 B/row), scatters the
+     records via ``write_swa_records``, and keeps ``indexer.weights_proj`` rank-local
+-    unless ``_INDEX_SPLIT_CHECK`` is active."""
++    unless ``_INDEX_SPLIT_CHECK`` is active. A decode step of an SP forward (the
++    warm-up's eager tail shapes) scores every row, so it gathers the head weights of
++    every row: the index queries and their weights always have one row count."""
+     from vllm.models.deepseek_v4_1 import attention, kernels, sp_prefill
+     from vllm.models.deepseek_v4_1.tilelang import cache_writer, front
+     from vllm.models.deepseek_v4_1.tilelang.linear import MXFP8Rows, provided_mxfp8
+@@ -2042,7 +2045,7 @@ def test_sp_prefill_with_replicated_fused_wqa_wkv_gathers_mxfp8_and_swa_records(
+         (4, 32), dtype=torch.bfloat16
+     )
+     slots = torch.arange(100, 110, dtype=torch.int64)
+-    metadata = {"swa": SimpleNamespace(is_decode=False, slot_mapping=slots)}
++    metadata = {"swa": SimpleNamespace(is_decode=is_decode, slot_mapping=slots)}
+     monkeypatch.setattr(
+         attention,
+         "get_forward_context",
+@@ -2057,7 +2060,7 @@ def test_sp_prefill_with_replicated_fused_wqa_wkv_gathers_mxfp8_and_swa_records(
+         ("fused_wqa_wkv", (4, 32)),
+         ("weights_proj", (4, 32)),
+     ]
+-    if split_check:
++    if split_check or is_decode:
+         expected_events.append(("gather", (4, 4), torch.bfloat16))
+     if n_real > 0:
+         expected_events.append(
+@@ -2080,6 +2083,13 @@ def test_sp_prefill_with_replicated_fused_wqa_wkv_gathers_mxfp8_and_swa_records(
+     assert events == expected_events
+     assert len(seen_index_query) == 1
+     iq_data, iq_scale, weights, split, ref = seen_index_query[0]
++    assert weights.shape[0] == iq_data.shape[0] == iq_scale.shape[0]
++    if is_decode:
++        assert split is None and ref is None
++        assert iq_data.shape == (10, 4, 64)
++        assert iq_scale.shape == (10, 4, 4)
++        assert torch.equal(weights, gathered_weights)
++        return
+     assert iq_data.shape == (n_real, 4, 64)
+     assert iq_scale.shape == (n_real, 4, 4)
+     if split_check:
+diff --git a/vllm/models/deepseek_v4_1/attention.py b/vllm/models/deepseek_v4_1/attention.py
+index 426bc4787..f05021dd6 100644
+--- a/vllm/models/deepseek_v4_1/attention.py
++++ b/vllm/models/deepseek_v4_1/attention.py
+@@ -1266,18 +1266,29 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase):
+         replicated: ``indexer.weights_proj`` stays rank-local (unless
+         ``_INDEX_SPLIT_CHECK`` gathers it), and with SWA cache pages ``sp_attention_front``
+         casts ``qr`` to MXFP8 and packs 528-byte SWA records on this rank's real rows
+-        before one grouped ``gather_mxfp8`` (1,848 B/row) and ``write_swa_records``."""
++        before one grouped ``gather_mxfp8`` (1,848 B/row) and ``write_swa_records``.
++
++        The head weights stay local only where ``_forward`` splits the indexer by
++        rank: a step with prefill rows. A decode step, every request within the
++        decode threshold (the warm-up's eager token counts past the capture limit,
++        or a step of short requests), scores every row, as does the split check's
++        reference, so there the head weights of every row are gathered. The index
++        queries and their head weights then reach the scorer with one row count."""
++        metadata = get_forward_context().attn_metadata
++        swa = (
++            self._query_metadata(metadata[self.swa_cache_layer.prefix])
++            if isinstance(metadata, dict)
++            else None
++        )
+         index_weights = None
+         if self.indexer is not None:
+             index_weights = self.indexer.weights_proj(hidden_states)
+-            if _INDEX_SPLIT_CHECK:
++            if _INDEX_SPLIT_CHECK or (swa is not None and swa.is_decode):
+                 index_weights = sp_rows.gather(index_weights)
+             else:
+                 index_weights = index_weights[: sp_rows.real_rows]
+-        metadata = get_forward_context().attn_metadata
+         swa_cache = getattr(self.swa_cache_layer, "kv_cache", None)
+-        if not is_breakable_cudagraph_enabled() and isinstance(metadata, dict):
+-            swa = self._query_metadata(metadata[self.swa_cache_layer.prefix])
++        if not is_breakable_cudagraph_enabled() and swa is not None:
+             if (
+                 swa_cache is not None
+                 and swa_cache.numel() > 0
