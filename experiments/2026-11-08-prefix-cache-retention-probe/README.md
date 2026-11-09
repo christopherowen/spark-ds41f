@@ -3,7 +3,7 @@
 - **Date:** 2026-11-08
 - **Issue:** [`#902`](https://github.com/christopherowen/spark-ds41f/issues/902) (`TODO.md` lines 275–278)
 - **Base commit:** `8e5ea208` (`2026-11-07-spark-ds41f-1107`, vLLM 641-patch head `2756478b60b90700b9918b457aeb38657da637b5`, tree `ed1bdb7a7684da33d403a055521ac0c4dd7ca670`)
-- **Candidate patch:** [`vllm/0762-fix-prefix-cache-retain-decode-frontier-swa-and-orde.patch`](vllm/0762-fix-prefix-cache-retain-decode-frontier-swa-and-orde.patch) (`patch_head: 240f1a871b4221c8ede03c299939ba253c7bc694`, `expected_tree: b8654934ac7c849345e788533ad4ef5a4862748f`)
+- **Candidate patch:** [`vllm/0762-fix-prefix-cache-retain-decode-frontier-swa-and-orde.patch`](vllm/0762-fix-prefix-cache-retain-decode-frontier-swa-and-orde.patch) (`patch_head: f15304120ca50287210ed58e973f26beeeb730e7`, `expected_tree: 86e26f856452715f0a42793935869d41f5195bbb`)
 - **Verification node:** `sp8` (`NVIDIA GB10`, container `spark-ds41f:1107`, 2 fresh container boots serialized under `flock /tmp/spark-lab-gpu.lock`)
 
 ---

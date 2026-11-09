@@ -1,4 +1,4 @@
-From f8982844971fe4f413fc601a5533f099f18abb9b Mon Sep 17 00:00:00 2001
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: Christopher Owen <christopherowen@users.noreply.github.com>
 Date: Sun, 8 Nov 2026 23:30:00 +0100
 Subject: [PATCH] fix(core): retain decode-frontier SWA checkpoints and order
@@ -28,11 +28,11 @@ Tests:
 Upstream status: local fix for hybrid MLA + SWA sparse prefix-cache retention and two-tier checkpoint-floor eviction ordering.
 ---
  .../core/test_prefix_cache_retention_probe.py | 740 ++++++++++++++++++
- vllm/v1/core/kv_cache_coordinator.py          | 193 ++++-
+ vllm/v1/core/kv_cache_coordinator.py          | 226 +++++-
  vllm/v1/core/sched/async_scheduler.py         |   8 +-
  vllm/v1/core/sched/scheduler.py               |  15 +-
- vllm/v1/core/single_type_kv_cache_manager.py  | 208 ++++-
- 5 files changed, 1152 insertions(+), 12 deletions(-)
+ vllm/v1/core/single_type_kv_cache_manager.py  | 201 ++++-
+ 5 files changed, 1178 insertions(+), 12 deletions(-)
  create mode 100644 tests/v1/core/test_prefix_cache_retention_probe.py
 
 diff --git a/tests/v1/core/test_prefix_cache_retention_probe.py b/tests/v1/core/test_prefix_cache_retention_probe.py
@@ -782,10 +782,10 @@ index 000000000..473adbf94
 +    scheduler.update_from_output(sched_out1, model_out1)
 +    assert req1.num_computed_tokens == 0
 diff --git a/vllm/v1/core/kv_cache_coordinator.py b/vllm/v1/core/kv_cache_coordinator.py
-index cded5e944..ea5f5acdf 100644
+index cded5e944..0459f1b81 100644
 --- a/vllm/v1/core/kv_cache_coordinator.py
 +++ b/vllm/v1/core/kv_cache_coordinator.py
-@@ -428,7 +428,14 @@ class KVCacheCoordinator(ABC):
+@@ -428,7 +428,15 @@ class KVCacheCoordinator(ABC):
          pools = dict.fromkeys(
              manager.block_pool for manager in self.single_type_managers
          )
@@ -797,11 +797,12 @@ index cded5e944..ea5f5acdf 100644
 +                    manager._req_retained_blocks.clear()
 +                    manager._req_decode_frontier_blocks.clear()
 +                    manager._block_prefix_chain.clear()
++                    manager._req_last_chain_node.clear()
 +        return ok
  
      def free(self, request_id: str) -> None:
          """
-@@ -437,8 +444,167 @@ class KVCacheCoordinator(ABC):
+@@ -437,8 +445,199 @@ class KVCacheCoordinator(ABC):
          Args:
              request_id: The request ID.
          """
@@ -923,20 +924,52 @@ index cded5e944..ea5f5acdf 100644
 +                if blk.block_id not in seen_aged:
 +                    seen_aged.add(blk.block_id)
 +                    ordered_aged.append(blk)
-+            for blk in ordered_aged:
-+                queue.remove(blk)
++            # Locate the unhashed/hashed boundary in O(1) when the pool is full
++            # (or O(cached blocks) backward from ordered_aged[-1] when large
++            # unhashed free capacity sits at fake_free_list_head).
 +            curr = queue.fake_free_list_head.next_free_block
++            steps = 0
 +            while (
 +                curr is not None
 +                and curr is not queue.fake_free_list_tail
 +                and curr.block_hash is None
++                and steps < 8
 +            ):
 +                curr = curr.next_free_block
-+            anchor_prev = (
-+                curr.prev_free_block
-+                if curr is not None and curr.prev_free_block is not None
-+                else queue.fake_free_list_head
-+            )
++                steps += 1
++            if (
++                curr is not None
++                and curr is not queue.fake_free_list_tail
++                and curr.block_hash is None
++            ):
++                scan = ordered_aged[-1]
++                while scan.prev_free_block is not None and (
++                    scan.prev_free_block is not queue.fake_free_list_head
++                ):
++                    prev = scan.prev_free_block
++                    if prev.block_hash is not None:
++                        scan = prev
++                    elif (
++                        prev.prev_free_block is not None
++                        and prev.prev_free_block is not queue.fake_free_list_head
++                        and prev.prev_free_block.block_hash is not None
++                    ):
++                        scan = prev.prev_free_block
++                    else:
++                        break
++                anchor_prev = (
++                    scan.prev_free_block
++                    if scan.prev_free_block is not None
++                    else queue.fake_free_list_head
++                )
++            else:
++                anchor_prev = (
++                    curr.prev_free_block
++                    if curr is not None and curr.prev_free_block is not None
++                    else queue.fake_free_list_head
++                )
++            for blk in ordered_aged:
++                queue.remove(blk)
 +            next_node = anchor_prev.next_free_block
 +            assert next_node is not None
 +            prev_node = anchor_prev
@@ -971,7 +1004,7 @@ index cded5e944..ea5f5acdf 100644
  
      def pop_blocks_for_free(self, request_id: str) -> list[KVCacheBlock]:
          """
-@@ -454,10 +620,23 @@ class KVCacheCoordinator(ABC):
+@@ -454,10 +653,23 @@ class KVCacheCoordinator(ABC):
          Returns:
              The request's blocks in allocation order.
          """
@@ -1056,7 +1089,7 @@ index b61ec528d..b821956c7 100644
  
      def _free_encoder_inputs(self, request: Request) -> None:
 diff --git a/vllm/v1/core/single_type_kv_cache_manager.py b/vllm/v1/core/single_type_kv_cache_manager.py
-index a1eb644a0..2cceb95b7 100644
+index a1eb644a0..5cd53afcf 100644
 --- a/vllm/v1/core/single_type_kv_cache_manager.py
 +++ b/vllm/v1/core/single_type_kv_cache_manager.py
 @@ -1198,6 +1198,28 @@ class SlidingWindowManager(SingleTypeKVCacheManager):
@@ -1076,19 +1109,19 @@ index a1eb644a0..2cceb95b7 100644
 +        ] = {}
 +        # Prefix checkpoint chain keyed by tail block_id so a prefix-cache hit
 +        # touching only the window tail also refreshes earlier sparse SWA
-+        # checkpoints of that prefix:
-+        # {tail_block_id: (tail_block_hash, [(block_idx, block, block_hash), ...])}
++        # checkpoints of that prefix in O(1) per cached block:
++        # {block_id: (block_idx, block, block_hash, prev_node)}
 +        self._block_prefix_chain: dict[
 +            int,
-+            tuple[
-+                BlockHashWithGroupId,
-+                list[tuple[int, KVCacheBlock, BlockHashWithGroupId]],
-+            ],
++            tuple[int, KVCacheBlock, BlockHashWithGroupId, Any],
++        ] = {}
++        self._req_last_chain_node: dict[
++            str, tuple[int, KVCacheBlock, BlockHashWithGroupId, Any] | None
 +        ] = {}
  
      @classmethod
      def _contiguous_blocks_for_hit(
-@@ -1427,6 +1449,58 @@ class SlidingWindowManager(SingleTypeKVCacheManager):
+@@ -1427,6 +1449,61 @@ class SlidingWindowManager(SingleTypeKVCacheManager):
                  return computed_blocks, hit_length
          return tuple([] for _ in range(num_groups)), 0
  
@@ -1115,9 +1148,12 @@ index a1eb644a0..2cceb95b7 100644
 +                retained[idx] = (blk, blk.block_hash)
 +                tail_block = blk
 +        if tail_block is not None and tail_block.block_hash is not None:
-+            chain_entry = self._block_prefix_chain.get(tail_block.block_id)
-+            if chain_entry is not None and chain_entry[0] == tail_block.block_hash:
-+                for b_idx, b, expected_hash in chain_entry[1]:
++            node = self._block_prefix_chain.get(tail_block.block_id)
++            if node is not None and node[2] == tail_block.block_hash:
++                self._req_last_chain_node[request_id] = node
++                curr = node[3]
++                while curr is not None:
++                    b_idx, b, expected_hash, curr = curr
 +                    if not b.is_null and b.block_hash == expected_hash:
 +                        retained.setdefault(b_idx, (b, expected_hash))
 +
@@ -1147,7 +1183,7 @@ index a1eb644a0..2cceb95b7 100644
      def cache_blocks(
          self,
          request: Request,
-@@ -1439,12 +1513,103 @@ class SlidingWindowManager(SingleTypeKVCacheManager):
+@@ -1439,12 +1516,103 @@ class SlidingWindowManager(SingleTypeKVCacheManager):
          if not self.enable_caching:
              return
          num_cached_before = self.num_cached_block.get(request.request_id, 0)
@@ -1252,7 +1288,7 @@ index a1eb644a0..2cceb95b7 100644
          )
          hit_alignment = (
              self.cache_hit_alignment_tokens
-@@ -1456,6 +1621,42 @@ class SlidingWindowManager(SingleTypeKVCacheManager):
+@@ -1456,6 +1624,31 @@ class SlidingWindowManager(SingleTypeKVCacheManager):
              self._cache_internal_attention_anchors(
                  request, num_tokens, num_cached_before, retention_interval
              )
@@ -1265,48 +1301,38 @@ index a1eb644a0..2cceb95b7 100644
 +                if permanent_mask is not None
 +                else None
 +            )
-+            newly_cached_indices: list[int] = []
++            last_node = self._req_last_chain_node.get(request.request_id)
 +            for idx in range(num_cached_before, num_cached_after):
 +                blk = blocks[idx]
 +                if blk.is_null or blk.block_hash is None:
 +                    continue
 +                retained[idx] = (blk, blk.block_hash)
-+                newly_cached_indices.append(idx)
++                node = (idx, blk, blk.block_hash, last_node)
++                self._block_prefix_chain[blk.block_id] = node
++                last_node = node
 +                if (
 +                    frontier is not None
 +                    and permanent_mask is not None
 +                    and not permanent_mask[idx - num_cached_before]
 +                ):
 +                    frontier[idx] = (blk, blk.block_hash)
-+            if newly_cached_indices:
-+                valid_items = [
-+                    (b_idx, b, expected_hash)
-+                    for b_idx, (b, expected_hash) in sorted(retained.items())
-+                    if not b.is_null and b.block_hash == expected_hash
-+                ]
-+                for idx in newly_cached_indices:
-+                    blk = blocks[idx]
-+                    if blk.block_hash is not None:
-+                        chain = [item for item in valid_items if item[0] <= idx]
-+                        self._block_prefix_chain[blk.block_id] = (
-+                            blk.block_hash,
-+                            chain,
-+                        )
++            self._req_last_chain_node[request.request_id] = last_node
  
      @classmethod
      def _fine_grained_reachable_block_mask(
-@@ -1635,6 +1836,11 @@ class SlidingWindowManager(SingleTypeKVCacheManager):
+@@ -1635,6 +1828,12 @@ class SlidingWindowManager(SingleTypeKVCacheManager):
              num_computed_tokens - self.sliding_window + 1 - self.extra_retained_tokens,
          )
  
 +    def pop_blocks_for_free(self, request_id: str) -> list[KVCacheBlock]:
 +        self._req_retained_blocks.pop(request_id, None)
 +        self._req_decode_frontier_blocks.pop(request_id, None)
++        self._req_last_chain_node.pop(request_id, None)
 +        return super().pop_blocks_for_free(request_id)
 +
      def get_num_common_prefix_blocks(self, running_request_id: str) -> int:
          """
          NOTE(Chen): The prefix blocks are null blocks for sliding window layers.
 -- 
-2.43.0
+2.54.0 (Apple Git-157)
 
