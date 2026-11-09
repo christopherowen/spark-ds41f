@@ -2,8 +2,8 @@
 
 - **Date**: 2026-11-08
 - **Base deployment commit**: `cc20ed18b6ca6521b602f09cb3ba326774166d1c`
-- **Base vLLM patch head**: `320021e3c4dbb202d911ab70e2cd924c75420488` (tree `ed1bdb7a7684da33d403a055521ac0c4dd7ca670`, 641 patches)
-- **Candidate vLLM patch head**: `a4c48599bdbbd931b64206a63673f7e7b0197e10` (tree `f7d46a4cc63f4f4ceb405c0b6f4824d75e2deaf1`, `patchset_sha256` `efe09d2ed1c60b3f00e3592d5b8da419d469aeab1711a1ebc3425aabd623c93c`, 642 patches)
+- **Base vLLM patch head**: `2756478b60b90700b9918b457aeb38657da637b5` (tree `ed1bdb7a7684da33d403a055521ac0c4dd7ca670`, 641 patches)
+- **Candidate vLLM patch head**: `fc663f5ea83290a64a881431467b67854959095d` (tree `74ccafcbb7516f06d82f77c97a51fdbf9e38fb56`, `patchset_sha256` `ceef15f68a7c3324402d2ec4b3f8d5b9435808d745ebaff106a43feb8d666d46`, 642 patches)
 - **Patch**: `vllm/0762-perf-dsv41-sp-prefill-sparknet-routing.patch`
 
 ## Hypothesis & Audit Findings
@@ -100,3 +100,8 @@ In `bench_sp_roce` (4-call `sparknet_4calls` vs `1107` `PyNCCL` group) and `benc
   - `./bin/spark --cluster-config experiments/2026-11-08-sp-prefill-sparknet-routing/tp3.json doctor` -> `configuration OK`
   - `./bin/spark --cluster-config experiments/2026-11-08-sp-prefill-sparknet-routing/tp4.json doctor` -> `configuration OK`
   - `./bin/spark doctor` -> `configuration OK`
+
+## Rework Update (Pure Win Without Downsides)
+
+- Retained only the `T >= 6,144` two-slice SP Engram row-exchange pipeline (`ENGRAM_SLICE_TOKENS = 6144`, restoring `_tp_pynccl_comm()` alongside `_tp_roce_comm()` and validating both `send` and `recv` in `SPRows.exchange_into`).
+- Removed the one-shot RoCE `gather_many` / `gather_mxfp8` routing and small-tensor packing (which regressed direct topology at `T <= 2,048`) and the single-slice side-stream overlap below `T = 6,144`.
