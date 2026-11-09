@@ -1,0 +1,167 @@
+# Commands run on sp6 (spark-0014) for PR #1013's own test list against candidate-48 code.
+# Host checks before any container: `docker ps` empty, ~/spark-hold.json and ~/spark-request.json absent.
+# Work dir: W=/home/chris/spark-lab/agents/candidate-48-own-marks-1013 (removed afterwards except this record).
+# No builds, no pushes, no cluster operations.
+
+## Source of the PR's test list
+git clone -q --reference ~/projects/spark-ds41f https://github.com/christopherowen/spark-ds41f.git $W/src
+git -C $W/src fetch -q origin pull/1013/head:pr-1013     # aeba4fc4ac4063eb0736e4267191a7c27e5584c8
+git -C $W/src show pr-1013:experiments/2026-11-08-completions-grammar-and-prefill-lanes/README.md   # "1. 2-Boot Unit Test Verification"
+# tblib_stub comes from $W/src/scripts/release_tests (main 34ec29fb; identical to #1011's head)
+
+## Candidate-48 code (1107 image tree + 0762..0771, applied in series order)
+cid=$(docker create --entrypoint true spark-ds41f:1107)        # sha256:3f32a962ce04b7c8d85337cd427a8946b8b6bcaadd97cc8d8a8cd14e8d68a6ce
+docker cp -q $cid:/opt/spark-ds41f/candidate/vllm $W/tree/vllm; docker rm $cid
+cd $W/tree/vllm; for p in $W/patches/07*.patch; do git apply --check $p && git apply --whitespace=nowarn $p; done   # all 10 applied cleanly
+# patches (sha256, from candidate-48/vllm/):
+#   4faecf86602d5af78f0fb7b6ce8231079e1045ec07d2ef4499c4039cd4e48165  0762-deepseek-v41-dsml-token-provenance.patch
+#   98d6142f82d1e6a84f7b6ec35c297006584252ebe119509722e8e45375a5c311  0763-fix-prefix-cache-retain-decode-frontier-swa-and-orde.patch
+#   e90eb5a6b619cf848d745ff594aef7c4f7321c64578b911a2f106e248758b123  0764-perf-spec-decode-elide-tp-confidence-broadcast-and-lock-sampling-seeds.patch
+#   62f0c10104df81e76870339de74f391956f21c70869acfc4db1c755a0aef4475  0765-fix-structured-output-enforce-completions-grammar-un.patch
+#   c41b1fd0d9f5fb8e362293e61c68e7d31a095104f2214adce513b9f3954a9ce6  0766-feat-sched-size-classed-prefill-lanes-and-aligned-ch.patch
+#   6376f864f55999f720f5352c1d38ecb5fb9ef01b1efdcaa0e6826f203ec041b7  0767-feat-serve-sse-keepalive-heartbeat-and-abort-cleanup.patch
+#   b6d59741bef111b035759235ab8044e2c3b64ae95a870ca500a9323b3b325b4d  0768-fix-entrypoints-move-model-inspection-RPC-out-of-LLM.patch
+#   bde52b4ac23f14410ac142b2bb7e6b132b0728c3ab4b68b4dc73726e2fa3459c  0769-fix-attention-keep-FA-sliding-window-active-under-ba.patch
+#   41bfc634345b42c2990f19970d72b2c805eed3851adf84dc1d901b7876b06f41  0770-fix-rocm-reserve-kpool-decode-indexer-logits-in-work.patch
+#   5ab215e451714e0d821f9c6656da53372cb941f54669d448100bfce78a4f08f2  0771-perf-dsv41-fast-path-multi-turn-chat-rendering-and-s.patch
+# Check: each of the 49 pre-existing touched files differs from the image copy; the 6 new files exist.
+# The 55 touched files (bind-mounted read-only over /opt/spark-ds41f/candidate/vllm/<path>):
+#   docs/features/tool_calling.md
+#   docs/serving/offline_inference.md
+#   tests/entrypoints/serve/utils/test_api_cancellation.py
+#   tests/parser/engine/test_deepseek_v41_dsml_provenance.py
+#   tests/parser/engine/test_token_id_scanner.py
+#   tests/tokenizers_/test_deepseek_v41.py
+#   tests/tool_parsers/test_deepseekv41_tool_parser.py
+#   tests/v1/core/test_aligned_prefill_lanes.py
+#   tests/v1/core/test_prefill_lane_livelock.py
+#   tests/v1/core/test_prefill_qos_lanes.py
+#   tests/v1/core/test_prefix_cache_retention_probe.py
+#   tests/v1/core/utils.py
+#   tests/v1/spec_decode/test_adaptive_verification.py
+#   tests/v1/structured_output/test_structured_output_manager.py
+#   tests/v1/worker/test_gpu_worker.py
+#   tests/v1/worker/test_workspace.py
+#   vllm/config/scheduler.py
+#   vllm/engine/arg_utils.py
+#   vllm/entrypoints/anthropic/api_router.py
+#   vllm/entrypoints/chat_utils.py
+#   vllm/entrypoints/llm.py
+#   vllm/entrypoints/openai/chat_completion/api_router.py
+#   vllm/entrypoints/openai/completion/api_router.py
+#   vllm/entrypoints/openai/responses/api_router.py
+#   vllm/entrypoints/serve/utils/api_utils.py
+#   vllm/entrypoints/serve/utils/sse_keep_alive.py
+#   vllm/models/deepseek_v4_1/nvidia/model_state.py
+#   vllm/models/glm5next/amd/sparse_indexer.py
+#   vllm/parser/deepseek_v4.py
+#   vllm/parser/deepseek_v41.py
+#   vllm/parser/engine/adapters.py
+#   vllm/parser/engine/incremental_lexer.py
+#   vllm/parser/engine/parser_engine.py
+#   vllm/parser/engine/parser_engine_config.py
+#   vllm/parser/engine/streaming_parser_engine.py
+#   vllm/parser/engine/token_id_scanner.py
+#   vllm/parser/parser_manager.py
+#   vllm/tokenizers/deepseek_v41.py
+#   vllm/tokenizers/deepseek_v41_encoding.py
+#   vllm/v1/attention/backends/flash_attn.py
+#   vllm/v1/core/kv_cache_coordinator.py
+#   vllm/v1/core/kv_cache_manager.py
+#   vllm/v1/core/sched/async_scheduler.py
+#   vllm/v1/core/sched/prefill_interleave.py
+#   vllm/v1/core/sched/scheduler.py
+#   vllm/v1/core/single_type_kv_cache_manager.py
+#   vllm/v1/engine/async_llm.py
+#   vllm/v1/request.py
+#   vllm/v1/structured_output/__init__.py
+#   vllm/v1/worker/gpu/sample/sampler.py
+#   vllm/v1/worker/gpu/sample/states.py
+#   vllm/v1/worker/gpu/spec_decode/acceptance_estimator.py
+#   vllm/v1/worker/gpu/spec_decode/adaptive_verification.py
+#   vllm/v1/worker/gpu/spec_decode/dflash/speculator.py
+#   vllm/v1/worker/gpu/spec_decode/speculator.py
+
+## README step 1 as written cannot run on sp6; changes made (reporting flags only otherwise)
+# - `-v /tmp/hf-test-cache:/root/.cache/huggingface:ro`: /tmp/hf-test-cache no longer exists on sp6.
+#   Replaced by sp6's ~/.cache/huggingface (read-only), which holds only deepseek-ai/DeepSeek-V4.1-Flash-1017
+#   and two msuiche DeepSeek-V4.1-Flash-1017 variants. No gpt2, Qwen/Qwen3-0.6B or facebook/opt-125m
+#   cache exists anywhere on sp6 (find over / and inside the 1107 image).
+# - `cp /mnt/vllm-src/$f $f` from /tmp/work-lil-vllm-prs/.work/upstreams/vllm: that tree no longer exists on sp6,
+#   and it held only the PR's 0762/0763. Replaced by bind-mounting the 55 files of candidate-48's 0762..0771.
+# - `PYTHONPATH=/tmp ... -p tblib_stub`: neither the image's /tmp nor any mount has tblib_stub.py, and the image
+#   has no tblib, so the plugin cannot load. Replaced by scripts/release_tests mounted at /opt/release_tests.
+# - Added `-rfEs` and `--junitxml` for the per-test record; `--gpus=all` as in the earlier sp8 check.
+# The test file list is the README's 8 files unchanged; it already includes
+# tests/v1/structured_output/test_structured_output_manager.py.
+
+## Runner: $W/run-tests.sh N   (N = 1, 2)
+#   #!/bin/bash
+#   # Run PR #1013's own test list (README step 1, corrected) against candidate-48 code:
+#   # spark-ds41f:1107 with every file touched by candidate-48's 0762..0771 bind-mounted read-only.
+#   set -u
+#   W=$HOME/spark-lab/agents/candidate-48-own-marks-1013
+#   N=$1
+#   IMG=sha256:3f32a962ce04b7c8d85337cd427a8946b8b6bcaadd97cc8d8a8cd14e8d68a6ce
+#   RT=$W/src/scripts/release_tests
+#   OUT=$W/out; mkdir -p $OUT; chmod 777 $OUT
+#   FILES="tests/v1/structured_output/test_structured_output_manager.py tests/v1/spec_decode/test_mtp_structured_output.py tests/v1/core/test_prefill_lane_livelock.py tests/v1/core/test_prefill_qos_lanes.py tests/v1/core/test_aligned_prefill_lanes.py tests/v1/core/test_prefill_yield.py tests/v1/core/test_aligned_prefill_chunks.py tests/v1/core/test_prefill_compute_share_scheduler.py"
+#   MOUNTS=()
+#   while read -r f; do MOUNTS+=(-v "$W/tree/vllm/$f:/opt/spark-ds41f/candidate/vllm/$f:ro"); done < $W/touched.txt
+#   if [ -e $HOME/spark-hold.json ]; then echo "hold file present, not running"; exit 3; fi
+#   LOG=$OUT/pytest-sp6-run$N.txt
+#   CMD=(flock /tmp/spark-lab-gpu.lock docker run --rm --name c48om-1013-sp6-run$N --gpus=all
+#     -e HF_HUB_OFFLINE=1
+#     -v $HOME/.cache/huggingface:/root/.cache/huggingface:ro
+#     -v $RT:/opt/release_tests:ro
+#     "${MOUNTS[@]}"
+#     -v $OUT:/mnt/out:rw
+#     --entrypoint bash $IMG -c "set -e; cd /opt/spark-ds41f/candidate/vllm; PYTHONPATH=/opt/release_tests:\$PYTHONPATH pytest -o addopts='' -p tblib_stub -q -rfEs --junitxml=/mnt/out/junit-sp6-run$N.xml $FILES")
+#   {
+#     echo "### pytest-sp6-run$N"
+#     echo "host: $(hostname) (sp6)"
+#     echo "image: $IMG (spark-ds41f:1107) + candidate-48 0762..0771 files bind-mounted read-only ($(wc -l < $W/touched.txt) files)"
+#     echo "start_utc: $(date -u +%FT%TZ)"
+#     echo "loadavg_before: $(cut -d' ' -f1-3 /proc/loadavg)"
+#     echo "docker_ps_before: $(docker ps --format '{{.ID}} {{.Names}}' | tr '\n' ';' | sed 's/^$/none/')"
+#     echo "hold_file_before: $( [ -e $HOME/spark-hold.json ] && echo present || echo absent)"
+#     printf 'command:'; printf ' %q' "${CMD[@]}"; echo
+#   } > $OUT/cmd-run$N.txt
+#   "${CMD[@]}" > $LOG 2>&1
+#   RC=$?
+#   {
+#     echo "end_utc: $(date -u +%FT%TZ)"
+#     echo "loadavg_after: $(cut -d' ' -f1-3 /proc/loadavg)"
+#     echo "exit_code: $RC"
+#     echo "output: pytest-sp6-run$N.txt"
+#     echo
+#   } >> $OUT/cmd-run$N.txt
+#   tail -3 $LOG
+#   echo "rc=$RC"
+
+### pytest-sp6-run1
+host: spark-0014 (sp6)
+image: sha256:3f32a962ce04b7c8d85337cd427a8946b8b6bcaadd97cc8d8a8cd14e8d68a6ce (spark-ds41f:1107) + candidate-48 0762..0771 files bind-mounted read-only (55 files)
+start_utc: 2026-11-09T11:25:23Z
+loadavg_before: 0.10 0.15 0.10
+docker_ps_before: none
+hold_file_before: absent
+command: flock /tmp/spark-lab-gpu.lock docker run --rm --name c48om-1013-sp6-run1 --gpus=all -e HF_HUB_OFFLINE=1 -v /home/chris/.cache/huggingface:/root/.cache/huggingface:ro -v /home/chris/spark-lab/agents/candidate-48-own-marks-1013/src/scripts/release_tests:/opt/release_tests:ro -v /home/chris/spark-lab/agents/candidate-48-own-marks-1013/tree/vllm/docs/features/tool_calling.md:/opt/spark-ds41f/candidate/vllm/docs/features/tool_calling.md:ro -v /home/chris/spark-lab/agents/candidate-48-own-marks-1013/tree/vllm/docs/serving/offline_inference.md:/opt/spark-ds41f/candidate/vllm/docs/serving/offline_inference.md:ro -v /home/chris/spark-lab/agents/candidate-48-own-marks-1013/tree/vllm/tests/entrypoints/serve/utils/test_api_cancellation.py:/opt/spark-ds41f/candidate/vllm/tests/entrypoints/serve/utils/test_api_cancellation.py:ro -v /home/chris/spark-lab/agents/candidate-48-own-marks-1013/tree/vllm/tests/parser/engine/test_deepseek_v41_dsml_provenance.py:/opt/spark-ds41f/candidate/vllm/tests/parser/engine/test_deepseek_v41_dsml_provenance.py:ro -v /home/chris/spark-lab/agents/candidate-48-own-marks-1013/tree/vllm/tests/parser/engine/test_token_id_scanner.py:/opt/spark-ds41f/candidate/vllm/tests/parser/engine/test_token_id_scanner.py:ro -v /home/chris/spark-lab/agents/candidate-48-own-marks-1013/tree/vllm/tests/tokenizers_/test_deepseek_v41.py:/opt/spark-ds41f/candidate/vllm/tests/tokenizers_/test_deepseek_v41.py:ro -v /home/chris/spark-lab/agents/candidate-48-own-marks-1013/tree/vllm/tests/tool_parsers/test_deepseekv41_tool_parser.py:/opt/spark-ds41f/candidate/vllm/tests/tool_parsers/test_deepseekv41_tool_parser.py:ro -v /home/chris/spark-lab/agents/candidate-48-own-marks-1013/tree/vllm/tests/v1/core/test_aligned_prefill_lanes.py:/opt/spark-ds41f/candidate/vllm/tests/v1/core/test_aligned_prefill_lanes.py:ro -v /home/chris/spark-lab/agents/candidate-48-own-marks-1013/tree/vllm/tests/v1/core/test_prefill_lane_livelock.py:/opt/spark-ds41f/candidate/vllm/tests/v1/core/test_prefill_lane_livelock.py:ro -v /home/chris/spark-lab/agents/candidate-48-own-marks-1013/tree/vllm/tests/v1/core/test_prefill_qos_lanes.py:/opt/spark-ds41f/candidate/vllm/tests/v1/core/test_prefill_qos_lanes.py:ro -v /home/chris/spark-lab/agents/candidate-48-own-marks-1013/tree/vllm/tests/v1/core/test_prefix_cache_retention_probe.py:/opt/spark-ds41f/candidate/vllm/tests/v1/core/test_prefix_cache_retention_probe.py:ro -v /home/chris/spark-lab/agents/candidate-48-own-marks-1013/tree/vllm/tests/v1/core/utils.py:/opt/spark-ds41f/candidate/vllm/tests/v1/core/utils.py:ro -v /home/chris/spark-lab/agents/candidate-48-own-marks-1013/tree/vllm/tests/v1/spec_decode/test_adaptive_verification.py:/opt/spark-ds41f/candidate/vllm/tests/v1/spec_decode/test_adaptive_verification.py:ro -v /home/chris/spark-lab/agents/candidate-48-own-marks-1013/tree/vllm/tests/v1/structured_output/test_structured_output_manager.py:/opt/spark-ds41f/candidate/vllm/tests/v1/structured_output/test_structured_output_manager.py:ro -v /home/chris/spark-lab/agents/candidate-48-own-marks-1013/tree/vllm/tests/v1/worker/test_gpu_worker.py:/opt/spark-ds41f/candidate/vllm/tests/v1/worker/test_gpu_worker.py:ro -v /home/chris/spark-lab/agents/candidate-48-own-marks-1013/tree/vllm/tests/v1/worker/test_workspace.py:/opt/spark-ds41f/candidate/vllm/tests/v1/worker/test_workspace.py:ro -v /home/chris/spark-lab/agents/candidate-48-own-marks-1013/tree/vllm/vllm/config/scheduler.py:/opt/spark-ds41f/candidate/vllm/vllm/config/scheduler.py:ro -v /home/chris/spark-lab/agents/candidate-48-own-marks-1013/tree/vllm/vllm/engine/arg_utils.py:/opt/spark-ds41f/candidate/vllm/vllm/engine/arg_utils.py:ro -v /home/chris/spark-lab/agents/candidate-48-own-marks-1013/tree/vllm/vllm/entrypoints/anthropic/api_router.py:/opt/spark-ds41f/candidate/vllm/vllm/entrypoints/anthropic/api_router.py:ro -v /home/chris/spark-lab/agents/candidate-48-own-marks-1013/tree/vllm/vllm/entrypoints/chat_utils.py:/opt/spark-ds41f/candidate/vllm/vllm/entrypoints/chat_utils.py:ro -v /home/chris/spark-lab/agents/candidate-48-own-marks-1013/tree/vllm/vllm/entrypoints/llm.py:/opt/spark-ds41f/candidate/vllm/vllm/entrypoints/llm.py:ro -v /home/chris/spark-lab/agents/candidate-48-own-marks-1013/tree/vllm/vllm/entrypoints/openai/chat_completion/api_router.py:/opt/spark-ds41f/candidate/vllm/vllm/entrypoints/openai/chat_completion/api_router.py:ro -v /home/chris/spark-lab/agents/candidate-48-own-marks-1013/tree/vllm/vllm/entrypoints/openai/completion/api_router.py:/opt/spark-ds41f/candidate/vllm/vllm/entrypoints/openai/completion/api_router.py:ro -v /home/chris/spark-lab/agents/candidate-48-own-marks-1013/tree/vllm/vllm/entrypoints/openai/responses/api_router.py:/opt/spark-ds41f/candidate/vllm/vllm/entrypoints/openai/responses/api_router.py:ro -v /home/chris/spark-lab/agents/candidate-48-own-marks-1013/tree/vllm/vllm/entrypoints/serve/utils/api_utils.py:/opt/spark-ds41f/candidate/vllm/vllm/entrypoints/serve/utils/api_utils.py:ro -v /home/chris/spark-lab/agents/candidate-48-own-marks-1013/tree/vllm/vllm/entrypoints/serve/utils/sse_keep_alive.py:/opt/spark-ds41f/candidate/vllm/vllm/entrypoints/serve/utils/sse_keep_alive.py:ro -v /home/chris/spark-lab/agents/candidate-48-own-marks-1013/tree/vllm/vllm/models/deepseek_v4_1/nvidia/model_state.py:/opt/spark-ds41f/candidate/vllm/vllm/models/deepseek_v4_1/nvidia/model_state.py:ro -v /home/chris/spark-lab/agents/candidate-48-own-marks-1013/tree/vllm/vllm/models/glm5next/amd/sparse_indexer.py:/opt/spark-ds41f/candidate/vllm/vllm/models/glm5next/amd/sparse_indexer.py:ro -v /home/chris/spark-lab/agents/candidate-48-own-marks-1013/tree/vllm/vllm/parser/deepseek_v4.py:/opt/spark-ds41f/candidate/vllm/vllm/parser/deepseek_v4.py:ro -v /home/chris/spark-lab/agents/candidate-48-own-marks-1013/tree/vllm/vllm/parser/deepseek_v41.py:/opt/spark-ds41f/candidate/vllm/vllm/parser/deepseek_v41.py:ro -v /home/chris/spark-lab/agents/candidate-48-own-marks-1013/tree/vllm/vllm/parser/engine/adapters.py:/opt/spark-ds41f/candidate/vllm/vllm/parser/engine/adapters.py:ro -v /home/chris/spark-lab/agents/candidate-48-own-marks-1013/tree/vllm/vllm/parser/engine/incremental_lexer.py:/opt/spark-ds41f/candidate/vllm/vllm/parser/engine/incremental_lexer.py:ro -v /home/chris/spark-lab/agents/candidate-48-own-marks-1013/tree/vllm/vllm/parser/engine/parser_engine.py:/opt/spark-ds41f/candidate/vllm/vllm/parser/engine/parser_engine.py:ro -v /home/chris/spark-lab/agents/candidate-48-own-marks-1013/tree/vllm/vllm/parser/engine/parser_engine_config.py:/opt/spark-ds41f/candidate/vllm/vllm/parser/engine/parser_engine_config.py:ro -v /home/chris/spark-lab/agents/candidate-48-own-marks-1013/tree/vllm/vllm/parser/engine/streaming_parser_engine.py:/opt/spark-ds41f/candidate/vllm/vllm/parser/engine/streaming_parser_engine.py:ro -v /home/chris/spark-lab/agents/candidate-48-own-marks-1013/tree/vllm/vllm/parser/engine/token_id_scanner.py:/opt/spark-ds41f/candidate/vllm/vllm/parser/engine/token_id_scanner.py:ro -v /home/chris/spark-lab/agents/candidate-48-own-marks-1013/tree/vllm/vllm/parser/parser_manager.py:/opt/spark-ds41f/candidate/vllm/vllm/parser/parser_manager.py:ro -v /home/chris/spark-lab/agents/candidate-48-own-marks-1013/tree/vllm/vllm/tokenizers/deepseek_v41.py:/opt/spark-ds41f/candidate/vllm/vllm/tokenizers/deepseek_v41.py:ro -v /home/chris/spark-lab/agents/candidate-48-own-marks-1013/tree/vllm/vllm/tokenizers/deepseek_v41_encoding.py:/opt/spark-ds41f/candidate/vllm/vllm/tokenizers/deepseek_v41_encoding.py:ro -v /home/chris/spark-lab/agents/candidate-48-own-marks-1013/tree/vllm/vllm/v1/attention/backends/flash_attn.py:/opt/spark-ds41f/candidate/vllm/vllm/v1/attention/backends/flash_attn.py:ro -v /home/chris/spark-lab/agents/candidate-48-own-marks-1013/tree/vllm/vllm/v1/core/kv_cache_coordinator.py:/opt/spark-ds41f/candidate/vllm/vllm/v1/core/kv_cache_coordinator.py:ro -v /home/chris/spark-lab/agents/candidate-48-own-marks-1013/tree/vllm/vllm/v1/core/kv_cache_manager.py:/opt/spark-ds41f/candidate/vllm/vllm/v1/core/kv_cache_manager.py:ro -v /home/chris/spark-lab/agents/candidate-48-own-marks-1013/tree/vllm/vllm/v1/core/sched/async_scheduler.py:/opt/spark-ds41f/candidate/vllm/vllm/v1/core/sched/async_scheduler.py:ro -v /home/chris/spark-lab/agents/candidate-48-own-marks-1013/tree/vllm/vllm/v1/core/sched/prefill_interleave.py:/opt/spark-ds41f/candidate/vllm/vllm/v1/core/sched/prefill_interleave.py:ro -v /home/chris/spark-lab/agents/candidate-48-own-marks-1013/tree/vllm/vllm/v1/core/sched/scheduler.py:/opt/spark-ds41f/candidate/vllm/vllm/v1/core/sched/scheduler.py:ro -v /home/chris/spark-lab/agents/candidate-48-own-marks-1013/tree/vllm/vllm/v1/core/single_type_kv_cache_manager.py:/opt/spark-ds41f/candidate/vllm/vllm/v1/core/single_type_kv_cache_manager.py:ro -v /home/chris/spark-lab/agents/candidate-48-own-marks-1013/tree/vllm/vllm/v1/engine/async_llm.py:/opt/spark-ds41f/candidate/vllm/vllm/v1/engine/async_llm.py:ro -v /home/chris/spark-lab/agents/candidate-48-own-marks-1013/tree/vllm/vllm/v1/request.py:/opt/spark-ds41f/candidate/vllm/vllm/v1/request.py:ro -v /home/chris/spark-lab/agents/candidate-48-own-marks-1013/tree/vllm/vllm/v1/structured_output/__init__.py:/opt/spark-ds41f/candidate/vllm/vllm/v1/structured_output/__init__.py:ro -v /home/chris/spark-lab/agents/candidate-48-own-marks-1013/tree/vllm/vllm/v1/worker/gpu/sample/sampler.py:/opt/spark-ds41f/candidate/vllm/vllm/v1/worker/gpu/sample/sampler.py:ro -v /home/chris/spark-lab/agents/candidate-48-own-marks-1013/tree/vllm/vllm/v1/worker/gpu/sample/states.py:/opt/spark-ds41f/candidate/vllm/vllm/v1/worker/gpu/sample/states.py:ro -v /home/chris/spark-lab/agents/candidate-48-own-marks-1013/tree/vllm/vllm/v1/worker/gpu/spec_decode/acceptance_estimator.py:/opt/spark-ds41f/candidate/vllm/vllm/v1/worker/gpu/spec_decode/acceptance_estimator.py:ro -v /home/chris/spark-lab/agents/candidate-48-own-marks-1013/tree/vllm/vllm/v1/worker/gpu/spec_decode/adaptive_verification.py:/opt/spark-ds41f/candidate/vllm/vllm/v1/worker/gpu/spec_decode/adaptive_verification.py:ro -v /home/chris/spark-lab/agents/candidate-48-own-marks-1013/tree/vllm/vllm/v1/worker/gpu/spec_decode/dflash/speculator.py:/opt/spark-ds41f/candidate/vllm/vllm/v1/worker/gpu/spec_decode/dflash/speculator.py:ro -v /home/chris/spark-lab/agents/candidate-48-own-marks-1013/tree/vllm/vllm/v1/worker/gpu/spec_decode/speculator.py:/opt/spark-ds41f/candidate/vllm/vllm/v1/worker/gpu/spec_decode/speculator.py:ro -v /home/chris/spark-lab/agents/candidate-48-own-marks-1013/out:/mnt/out:rw --entrypoint bash sha256:3f32a962ce04b7c8d85337cd427a8946b8b6bcaadd97cc8d8a8cd14e8d68a6ce -c set\ -e\;\ cd\ /opt/spark-ds41f/candidate/vllm\;\ PYTHONPATH=/opt/release_tests:\$PYTHONPATH\ pytest\ -o\ addopts=\'\'\ -p\ tblib_stub\ -q\ -rfEs\ --junitxml=/mnt/out/junit-sp6-run1.xml\ tests/v1/structured_output/test_structured_output_manager.py\ tests/v1/spec_decode/test_mtp_structured_output.py\ tests/v1/core/test_prefill_lane_livelock.py\ tests/v1/core/test_prefill_qos_lanes.py\ tests/v1/core/test_aligned_prefill_lanes.py\ tests/v1/core/test_prefill_yield.py\ tests/v1/core/test_aligned_prefill_chunks.py\ tests/v1/core/test_prefill_compute_share_scheduler.py
+end_utc: 2026-11-09T11:26:15Z
+loadavg_after: 0.61 0.28 0.15
+exit_code: 1
+output: pytest-sp6-run1.txt
+
+### pytest-sp6-run2
+host: spark-0014 (sp6)
+image: sha256:3f32a962ce04b7c8d85337cd427a8946b8b6bcaadd97cc8d8a8cd14e8d68a6ce (spark-ds41f:1107) + candidate-48 0762..0771 files bind-mounted read-only (55 files)
+start_utc: 2026-11-09T11:26:21Z
+loadavg_before: 0.56 0.28 0.15
+docker_ps_before: none
+hold_file_before: absent
+command: flock /tmp/spark-lab-gpu.lock docker run --rm --name c48om-1013-sp6-run2 --gpus=all -e HF_HUB_OFFLINE=1 -v /home/chris/.cache/huggingface:/root/.cache/huggingface:ro -v /home/chris/spark-lab/agents/candidate-48-own-marks-1013/src/scripts/release_tests:/opt/release_tests:ro -v /home/chris/spark-lab/agents/candidate-48-own-marks-1013/tree/vllm/docs/features/tool_calling.md:/opt/spark-ds41f/candidate/vllm/docs/features/tool_calling.md:ro -v /home/chris/spark-lab/agents/candidate-48-own-marks-1013/tree/vllm/docs/serving/offline_inference.md:/opt/spark-ds41f/candidate/vllm/docs/serving/offline_inference.md:ro -v /home/chris/spark-lab/agents/candidate-48-own-marks-1013/tree/vllm/tests/entrypoints/serve/utils/test_api_cancellation.py:/opt/spark-ds41f/candidate/vllm/tests/entrypoints/serve/utils/test_api_cancellation.py:ro -v /home/chris/spark-lab/agents/candidate-48-own-marks-1013/tree/vllm/tests/parser/engine/test_deepseek_v41_dsml_provenance.py:/opt/spark-ds41f/candidate/vllm/tests/parser/engine/test_deepseek_v41_dsml_provenance.py:ro -v /home/chris/spark-lab/agents/candidate-48-own-marks-1013/tree/vllm/tests/parser/engine/test_token_id_scanner.py:/opt/spark-ds41f/candidate/vllm/tests/parser/engine/test_token_id_scanner.py:ro -v /home/chris/spark-lab/agents/candidate-48-own-marks-1013/tree/vllm/tests/tokenizers_/test_deepseek_v41.py:/opt/spark-ds41f/candidate/vllm/tests/tokenizers_/test_deepseek_v41.py:ro -v /home/chris/spark-lab/agents/candidate-48-own-marks-1013/tree/vllm/tests/tool_parsers/test_deepseekv41_tool_parser.py:/opt/spark-ds41f/candidate/vllm/tests/tool_parsers/test_deepseekv41_tool_parser.py:ro -v /home/chris/spark-lab/agents/candidate-48-own-marks-1013/tree/vllm/tests/v1/core/test_aligned_prefill_lanes.py:/opt/spark-ds41f/candidate/vllm/tests/v1/core/test_aligned_prefill_lanes.py:ro -v /home/chris/spark-lab/agents/candidate-48-own-marks-1013/tree/vllm/tests/v1/core/test_prefill_lane_livelock.py:/opt/spark-ds41f/candidate/vllm/tests/v1/core/test_prefill_lane_livelock.py:ro -v /home/chris/spark-lab/agents/candidate-48-own-marks-1013/tree/vllm/tests/v1/core/test_prefill_qos_lanes.py:/opt/spark-ds41f/candidate/vllm/tests/v1/core/test_prefill_qos_lanes.py:ro -v /home/chris/spark-lab/agents/candidate-48-own-marks-1013/tree/vllm/tests/v1/core/test_prefix_cache_retention_probe.py:/opt/spark-ds41f/candidate/vllm/tests/v1/core/test_prefix_cache_retention_probe.py:ro -v /home/chris/spark-lab/agents/candidate-48-own-marks-1013/tree/vllm/tests/v1/core/utils.py:/opt/spark-ds41f/candidate/vllm/tests/v1/core/utils.py:ro -v /home/chris/spark-lab/agents/candidate-48-own-marks-1013/tree/vllm/tests/v1/spec_decode/test_adaptive_verification.py:/opt/spark-ds41f/candidate/vllm/tests/v1/spec_decode/test_adaptive_verification.py:ro -v /home/chris/spark-lab/agents/candidate-48-own-marks-1013/tree/vllm/tests/v1/structured_output/test_structured_output_manager.py:/opt/spark-ds41f/candidate/vllm/tests/v1/structured_output/test_structured_output_manager.py:ro -v /home/chris/spark-lab/agents/candidate-48-own-marks-1013/tree/vllm/tests/v1/worker/test_gpu_worker.py:/opt/spark-ds41f/candidate/vllm/tests/v1/worker/test_gpu_worker.py:ro -v /home/chris/spark-lab/agents/candidate-48-own-marks-1013/tree/vllm/tests/v1/worker/test_workspace.py:/opt/spark-ds41f/candidate/vllm/tests/v1/worker/test_workspace.py:ro -v /home/chris/spark-lab/agents/candidate-48-own-marks-1013/tree/vllm/vllm/config/scheduler.py:/opt/spark-ds41f/candidate/vllm/vllm/config/scheduler.py:ro -v /home/chris/spark-lab/agents/candidate-48-own-marks-1013/tree/vllm/vllm/engine/arg_utils.py:/opt/spark-ds41f/candidate/vllm/vllm/engine/arg_utils.py:ro -v /home/chris/spark-lab/agents/candidate-48-own-marks-1013/tree/vllm/vllm/entrypoints/anthropic/api_router.py:/opt/spark-ds41f/candidate/vllm/vllm/entrypoints/anthropic/api_router.py:ro -v /home/chris/spark-lab/agents/candidate-48-own-marks-1013/tree/vllm/vllm/entrypoints/chat_utils.py:/opt/spark-ds41f/candidate/vllm/vllm/entrypoints/chat_utils.py:ro -v /home/chris/spark-lab/agents/candidate-48-own-marks-1013/tree/vllm/vllm/entrypoints/llm.py:/opt/spark-ds41f/candidate/vllm/vllm/entrypoints/llm.py:ro -v /home/chris/spark-lab/agents/candidate-48-own-marks-1013/tree/vllm/vllm/entrypoints/openai/chat_completion/api_router.py:/opt/spark-ds41f/candidate/vllm/vllm/entrypoints/openai/chat_completion/api_router.py:ro -v /home/chris/spark-lab/agents/candidate-48-own-marks-1013/tree/vllm/vllm/entrypoints/openai/completion/api_router.py:/opt/spark-ds41f/candidate/vllm/vllm/entrypoints/openai/completion/api_router.py:ro -v /home/chris/spark-lab/agents/candidate-48-own-marks-1013/tree/vllm/vllm/entrypoints/openai/responses/api_router.py:/opt/spark-ds41f/candidate/vllm/vllm/entrypoints/openai/responses/api_router.py:ro -v /home/chris/spark-lab/agents/candidate-48-own-marks-1013/tree/vllm/vllm/entrypoints/serve/utils/api_utils.py:/opt/spark-ds41f/candidate/vllm/vllm/entrypoints/serve/utils/api_utils.py:ro -v /home/chris/spark-lab/agents/candidate-48-own-marks-1013/tree/vllm/vllm/entrypoints/serve/utils/sse_keep_alive.py:/opt/spark-ds41f/candidate/vllm/vllm/entrypoints/serve/utils/sse_keep_alive.py:ro -v /home/chris/spark-lab/agents/candidate-48-own-marks-1013/tree/vllm/vllm/models/deepseek_v4_1/nvidia/model_state.py:/opt/spark-ds41f/candidate/vllm/vllm/models/deepseek_v4_1/nvidia/model_state.py:ro -v /home/chris/spark-lab/agents/candidate-48-own-marks-1013/tree/vllm/vllm/models/glm5next/amd/sparse_indexer.py:/opt/spark-ds41f/candidate/vllm/vllm/models/glm5next/amd/sparse_indexer.py:ro -v /home/chris/spark-lab/agents/candidate-48-own-marks-1013/tree/vllm/vllm/parser/deepseek_v4.py:/opt/spark-ds41f/candidate/vllm/vllm/parser/deepseek_v4.py:ro -v /home/chris/spark-lab/agents/candidate-48-own-marks-1013/tree/vllm/vllm/parser/deepseek_v41.py:/opt/spark-ds41f/candidate/vllm/vllm/parser/deepseek_v41.py:ro -v /home/chris/spark-lab/agents/candidate-48-own-marks-1013/tree/vllm/vllm/parser/engine/adapters.py:/opt/spark-ds41f/candidate/vllm/vllm/parser/engine/adapters.py:ro -v /home/chris/spark-lab/agents/candidate-48-own-marks-1013/tree/vllm/vllm/parser/engine/incremental_lexer.py:/opt/spark-ds41f/candidate/vllm/vllm/parser/engine/incremental_lexer.py:ro -v /home/chris/spark-lab/agents/candidate-48-own-marks-1013/tree/vllm/vllm/parser/engine/parser_engine.py:/opt/spark-ds41f/candidate/vllm/vllm/parser/engine/parser_engine.py:ro -v /home/chris/spark-lab/agents/candidate-48-own-marks-1013/tree/vllm/vllm/parser/engine/parser_engine_config.py:/opt/spark-ds41f/candidate/vllm/vllm/parser/engine/parser_engine_config.py:ro -v /home/chris/spark-lab/agents/candidate-48-own-marks-1013/tree/vllm/vllm/parser/engine/streaming_parser_engine.py:/opt/spark-ds41f/candidate/vllm/vllm/parser/engine/streaming_parser_engine.py:ro -v /home/chris/spark-lab/agents/candidate-48-own-marks-1013/tree/vllm/vllm/parser/engine/token_id_scanner.py:/opt/spark-ds41f/candidate/vllm/vllm/parser/engine/token_id_scanner.py:ro -v /home/chris/spark-lab/agents/candidate-48-own-marks-1013/tree/vllm/vllm/parser/parser_manager.py:/opt/spark-ds41f/candidate/vllm/vllm/parser/parser_manager.py:ro -v /home/chris/spark-lab/agents/candidate-48-own-marks-1013/tree/vllm/vllm/tokenizers/deepseek_v41.py:/opt/spark-ds41f/candidate/vllm/vllm/tokenizers/deepseek_v41.py:ro -v /home/chris/spark-lab/agents/candidate-48-own-marks-1013/tree/vllm/vllm/tokenizers/deepseek_v41_encoding.py:/opt/spark-ds41f/candidate/vllm/vllm/tokenizers/deepseek_v41_encoding.py:ro -v /home/chris/spark-lab/agents/candidate-48-own-marks-1013/tree/vllm/vllm/v1/attention/backends/flash_attn.py:/opt/spark-ds41f/candidate/vllm/vllm/v1/attention/backends/flash_attn.py:ro -v /home/chris/spark-lab/agents/candidate-48-own-marks-1013/tree/vllm/vllm/v1/core/kv_cache_coordinator.py:/opt/spark-ds41f/candidate/vllm/vllm/v1/core/kv_cache_coordinator.py:ro -v /home/chris/spark-lab/agents/candidate-48-own-marks-1013/tree/vllm/vllm/v1/core/kv_cache_manager.py:/opt/spark-ds41f/candidate/vllm/vllm/v1/core/kv_cache_manager.py:ro -v /home/chris/spark-lab/agents/candidate-48-own-marks-1013/tree/vllm/vllm/v1/core/sched/async_scheduler.py:/opt/spark-ds41f/candidate/vllm/vllm/v1/core/sched/async_scheduler.py:ro -v /home/chris/spark-lab/agents/candidate-48-own-marks-1013/tree/vllm/vllm/v1/core/sched/prefill_interleave.py:/opt/spark-ds41f/candidate/vllm/vllm/v1/core/sched/prefill_interleave.py:ro -v /home/chris/spark-lab/agents/candidate-48-own-marks-1013/tree/vllm/vllm/v1/core/sched/scheduler.py:/opt/spark-ds41f/candidate/vllm/vllm/v1/core/sched/scheduler.py:ro -v /home/chris/spark-lab/agents/candidate-48-own-marks-1013/tree/vllm/vllm/v1/core/single_type_kv_cache_manager.py:/opt/spark-ds41f/candidate/vllm/vllm/v1/core/single_type_kv_cache_manager.py:ro -v /home/chris/spark-lab/agents/candidate-48-own-marks-1013/tree/vllm/vllm/v1/engine/async_llm.py:/opt/spark-ds41f/candidate/vllm/vllm/v1/engine/async_llm.py:ro -v /home/chris/spark-lab/agents/candidate-48-own-marks-1013/tree/vllm/vllm/v1/request.py:/opt/spark-ds41f/candidate/vllm/vllm/v1/request.py:ro -v /home/chris/spark-lab/agents/candidate-48-own-marks-1013/tree/vllm/vllm/v1/structured_output/__init__.py:/opt/spark-ds41f/candidate/vllm/vllm/v1/structured_output/__init__.py:ro -v /home/chris/spark-lab/agents/candidate-48-own-marks-1013/tree/vllm/vllm/v1/worker/gpu/sample/sampler.py:/opt/spark-ds41f/candidate/vllm/vllm/v1/worker/gpu/sample/sampler.py:ro -v /home/chris/spark-lab/agents/candidate-48-own-marks-1013/tree/vllm/vllm/v1/worker/gpu/sample/states.py:/opt/spark-ds41f/candidate/vllm/vllm/v1/worker/gpu/sample/states.py:ro -v /home/chris/spark-lab/agents/candidate-48-own-marks-1013/tree/vllm/vllm/v1/worker/gpu/spec_decode/acceptance_estimator.py:/opt/spark-ds41f/candidate/vllm/vllm/v1/worker/gpu/spec_decode/acceptance_estimator.py:ro -v /home/chris/spark-lab/agents/candidate-48-own-marks-1013/tree/vllm/vllm/v1/worker/gpu/spec_decode/adaptive_verification.py:/opt/spark-ds41f/candidate/vllm/vllm/v1/worker/gpu/spec_decode/adaptive_verification.py:ro -v /home/chris/spark-lab/agents/candidate-48-own-marks-1013/tree/vllm/vllm/v1/worker/gpu/spec_decode/dflash/speculator.py:/opt/spark-ds41f/candidate/vllm/vllm/v1/worker/gpu/spec_decode/dflash/speculator.py:ro -v /home/chris/spark-lab/agents/candidate-48-own-marks-1013/tree/vllm/vllm/v1/worker/gpu/spec_decode/speculator.py:/opt/spark-ds41f/candidate/vllm/vllm/v1/worker/gpu/spec_decode/speculator.py:ro -v /home/chris/spark-lab/agents/candidate-48-own-marks-1013/out:/mnt/out:rw --entrypoint bash sha256:3f32a962ce04b7c8d85337cd427a8946b8b6bcaadd97cc8d8a8cd14e8d68a6ce -c set\ -e\;\ cd\ /opt/spark-ds41f/candidate/vllm\;\ PYTHONPATH=/opt/release_tests:\$PYTHONPATH\ pytest\ -o\ addopts=\'\'\ -p\ tblib_stub\ -q\ -rfEs\ --junitxml=/mnt/out/junit-sp6-run2.xml\ tests/v1/structured_output/test_structured_output_manager.py\ tests/v1/spec_decode/test_mtp_structured_output.py\ tests/v1/core/test_prefill_lane_livelock.py\ tests/v1/core/test_prefill_qos_lanes.py\ tests/v1/core/test_aligned_prefill_lanes.py\ tests/v1/core/test_prefill_yield.py\ tests/v1/core/test_aligned_prefill_chunks.py\ tests/v1/core/test_prefill_compute_share_scheduler.py
+end_utc: 2026-11-09T11:27:12Z
+loadavg_after: 0.83 0.40 0.20
+exit_code: 1
+output: pytest-sp6-run2.txt
+

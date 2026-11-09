@@ -1,0 +1,2342 @@
+{
+ "pr": 980,
+ "round": 1,
+ "pr_head": "11b169b0dd07de9aa45ad6b9ab9f0f58156fb822",
+ "host": "sp2 (spark-0010, NVIDIA GB10), single GPU; hold file absent, docker idle, every GPU command under flock /tmp/spark-lab-gpu.lock",
+ "images": {
+  "candidate-48": "sha256:d6ffd842978849651e756ebd39e9bf2da7ddb03e746113013533029878485a24",
+  "1107": "sha256:3f32a962ce04b7c8d85337cd427a8946b8b6bcaadd97cc8d8a8cd14e8d68a6ce"
+ },
+ "mark": [
+  "keep the lockstep fix: 0/1000 rank mismatches at TP3 and TP4 on the PR's own 1,000-step screen; its tests pass",
+  "add no per-step cost on the greedy decode path: single-GPU step cost of the worker's sampler and spec-decode post-step path against 1107's files, both boots, at the grid's shapes",
+  "explain or fix the TP2 crash",
+  "(coordinator follow-up, same round) derive _seed_rng from the configured seed, identical on every TP rank; keep a deterministic fallback when none is configured; test that two seeds differ and two ranks with one seed agree; re-run the harness-fixed lockstep screen at TP3/TP4, both boots, and the PR's tests"
+ ],
+ "verdict": "corrected-meets-mark",
+ "reason": "The engine grid's timed steps run none of #980's changed lines, so #980 cannot add the +0.27% (about 55 us per 21.1 ms step) as per-step work. The grid times _dummy_run: a target forward on zeroed dummy tokens plus DSparkSpeculator.propose(dummy_run=True). That path never samples (sampler.py, states.py), never calls record_confidences (adaptive_verification.py), and DSpark with its TileLang confidence head never calls OnlineAcceptanceEstimator.predict; DFlash's predict_from_stats only serves probabilistic vocab-parallel drafts, and the recipe drafts greedily. On the real greedy decode step, a line trace of the five post-step components finds exactly three changed lines executed, all in record_confidences (adaptive_verification.py 269, 270, 274: the tp_invariant getattr hoisted ahead of the TP check, plus a callable() test). In-process A/B/C timing puts the cost at 0.0 to 0.2 us per step, the same as the A/A between byte-identical code. The PR's -17 us broadcast saving does not apply to production either: DSparkSpeculator has exposed tp_invariant_confidence since 0568 and overrides the property #980 adds to DraftModelSpeculator, so the production broadcast was already elided in 1107. The correction (r1) drops that adaptive_verification.py hunk. Its callable() branch is dead: the model runner passes the speculator's value to the manager as a bool when it creates it (model_runner.initialize_kv_cache). With the hunk gone, record_confidences is byte-identical to 1107's, and the trace finds zero changed lines on the greedy path. The same round fixes #980's --seed regression: SamplingStates._seed_rng was np.random.default_rng(0) whatever --seed was, while 1107's unseeded request seeds came from the global NumPy RNG the worker seeds with set_random_seed(ModelConfig.seed). Now the model runner hands ModelConfig.seed to Sampler(seed=...) and SamplingStates(seed=...), which draws unseeded requests' seeds from np.random.default_rng(seed). ModelConfig.seed is the same on every TP rank, so lockstep holds; with no configured seed it falls back to vLLM's default 0, the value 1107 seeded with by default (and #980's default_rng(0)). A new test checks that two seeds give different unseeded seeds, that ranks with one seed agree however each perturbs the global RNG, that no seed equals seed 0, and that the Sampler forwards its seed. Lockstep is kept: the harness-fixed screen with configured seed 1234 shows 0/1000 in every candidate mode and history at TP3 and TP4, both boots, and before the seed change the PR's own screen showed the same with the control reproducing the PR's 263/1000 and 239/1000. The tests pass: 190 passed, 1 skipped, both boots. The TP2 crash is a bug in the screen harness, not in #980 (tp2_finding). Caveat for the 4-node confirmation: r1 keeps #980's sampling changes, which alter the tokens the startup sampler warmup leaves in req_states.last_sampled_tokens. Every grid dummy step feeds those tokens to the MoE draft model. So r1 may show the same grid offset as candidate-48 without adding any per-step work (grid_attribution).",
+ "patch": {
+  "file": "0764-perf-spec-decode-elide-tp-confidence-broadcast-and-lock-sampling-seeds.patch",
+  "sha256": "8909cac3a7164a33fc31a3094b6c13e8f81e491884a1772b7dccf8d7978cb46f",
+  "author": "Christopher Owen <3221756+christopherowen@users.noreply.github.com>, Sun, 8 Nov 2026 15:19:42 +0000 (kept)",
+  "change_from_pr_head": [
+   "drops the vllm/v1/worker/gpu/spec_decode/adaptive_verification.py hunk: record_confidences is back to 1107's, byte-identical (rationale item 3)",
+   "keys the unseeded-request generator to the configured seed: states.py adds unseeded_request_seed_rng(seed) = np.random.default_rng(0 if seed is None else seed mod 2**64) and SamplingStates(max_num_reqs, vocab_size, seed=None); sampler.py adds Sampler(..., seed=None) and passes it on; model_runner.py puts ModelConfig.seed (the value the worker passes to set_random_seed) in the sampler kwargs (rationale item 1)",
+   "adds two tests: test_unseeded_request_seeds_follow_configured_seed_across_tp_ranks and test_sampler_hands_configured_seed_to_sampling_states",
+   "acceptance_estimator.py, dflash/speculator.py and speculator.py are #980's unchanged"
+  ],
+  "files": [
+   "tests/v1/spec_decode/test_adaptive_verification.py",
+   "vllm/v1/worker/gpu/model_runner.py",
+   "vllm/v1/worker/gpu/sample/sampler.py",
+   "vllm/v1/worker/gpu/sample/states.py",
+   "vllm/v1/worker/gpu/spec_decode/acceptance_estimator.py",
+   "vllm/v1/worker/gpu/spec_decode/dflash/speculator.py",
+   "vllm/v1/worker/gpu/spec_decode/speculator.py"
+  ],
+  "stack_check": {
+   "base": "local-inference-lab/vllm 19f2c20ed4d6 + candidate-48 series 0001..0763 (643 active), git am with the fixed committer and --committer-date-is-author-date as spark_ds41f/build.py",
+   "original_reproduced": {
+    "patch_head": "bd28dbf3b67301bbf285dedfeb1853835f4e0a4e",
+    "tree": "fe5bddc4df277d37838339fbed09576c3219e34d",
+    "equals_candidate48_lock": true
+   },
+   "r1_in_place_of_0764_then_0765_0771": {
+    "applies": true,
+    "patch_head": "b180aa08ce3181664328abaf7b5b2a5d61463081",
+    "tree": "21156b980a4322fa064eedddbe6d3b6169fa4433",
+    "git_diff_check": "clean",
+    "diff_vs_candidate48_tree": "adaptive_verification.py (back to 1107's), sample/states.py, sample/sampler.py, model_runner.py (+3 lines), tests/v1/spec_decode/test_adaptive_verification.py (+68 lines)"
+   },
+   "superseded_r1_noseed": {
+    "patch_head": "91b1f432c5c103b1a06c2d2199c90c5f3851626a",
+    "tree": "70fb6f9ad870df963f1c944a4fd3dab598d85662",
+    "where": "superseded/r1-noseed/ (patch, overlay, overlay-tests): the files the step-cost benches and the earlier screens ran"
+   },
+   "note": "0762..0771 other than 0764 touch none of 0764's files, model_runner.py included"
+  },
+  "overlay": "overlay/vllm/v1/worker/gpu/...: seven files, #980's six (adaptive_verification.py equal to 1107's / no980's) plus model_runner.py (the candidate-48 image's plus the 3-line seed kwarg); a grid arm must mount all seven, because model_runner.py passes seed= to Sampler. overlay-tests/ holds the patch's test file"
+ },
+ "seed_change": {
+  "problem": "#980's SamplingStates._seed_rng = np.random.default_rng(0) ignored --seed; in 1107 unseeded request seeds came from np.random.randint on the global RNG, which gpu_worker seeds with set_random_seed(self.model_config.seed), so --seed selected them",
+  "fix": "ModelConfig.seed -> model runner sampler kwargs -> Sampler(seed=) -> SamplingStates(seed=) -> unseeded_request_seed_rng(seed) = np.random.default_rng(0 if seed is None else int(seed) % 2**64); add_request draws from it as before",
+  "lockstep": "the generator depends only on ModelConfig.seed, which every TP rank reads from the same config, and on the order of add_request calls, which every rank shares; the global RNG plays no part",
+  "fallback": "no configured seed (None, e.g. a SamplingStates built without one) is seed 0: vLLM's ModelConfig.seed default is 0, which is what 1107 seeded the global RNG with by default, and what #980's default_rng(0) used, so the default --seed keeps #980's seed stream",
+  "not_identical_to_1107": "the stream for a given --seed differs from 1107's (a PCG64 generator of its own, not draws from the shared global MT19937), as #980's declared change to sampled realizations already allows",
+  "tests": {
+   "test_unseeded_request_seeds_follow_configured_seed_across_tp_ranks": "two ranks built with seed 1234 assign identical seeds to 8 unseeded requests after different global-RNG perturbations; seed 4321 gives a disjoint set (and agrees with itself); no seed equals seed 0",
+   "test_sampler_hands_configured_seed_to_sampling_states": "Sampler(seed=7) twice gives the same first unseeded seed, and Sampler(seed=8) a different one",
+   "model_runner_wiring": "not unit-tested: the three added lines put self.model_config.seed in the kwargs both Sampler and GPUWatermarkSampler (which forwards **kwargs) receive"
+  },
+  "per_step_effect": "none: the change touches SamplingStates.__init__ / add_request, Sampler.__init__ and the runner's construction only; the greedy-path line trace of the final files is in cause_of_added_step_cost.greedy_decode_step_trace.r1seed"
+ },
+ "cause_of_added_step_cost": {
+  "finding": "none of #980's code runs in the grid's timed steps; on the real greedy decode step it adds at most about 0.2 us (3 lines in record_confidences), far below the 50-60 us attributed",
+  "grid_path_static": {
+   "engine_grid -> _dummy_run": "execute_model(dummy_run=True) with InputBatch.make_dummy (input_ids and positions zeroed), then speculator.propose(dummy_run=True); no sample_tokens, so no Sampler, no rejection sampler, no record_confidences (model_runner.py engine_grid / _dummy_run)",
+   "DSpark propose": "_generate_draft -> _sample_sequential -> _sample_logits, which calls _maybe_predict_acceptance only when use_confidence_head is false (dspark/speculator.py 284); the recipe has the TileLang confidence head and draft_sample_method greedy (draft_logits None), so neither predict() nor DFlash.sample_draft/predict_from_stats runs; the draft step is CUDA-graph captured",
+   "tp_invariant_confidence": "read once at manager construction (model_runner.initialize_kv_cache); DSparkSpeculator overrides the DraftModelSpeculator property #980 adds, so the production value and the broadcast decision are 1107's"
+  },
+  "greedy_decode_step_trace": {
+   "c48": {
+    "greedy_check": {},
+    "est_step": {},
+    "est_calibrate": {},
+    "record_conf": {
+     "spec_decode/adaptive_verification.py": [
+      269,
+      270,
+      274
+     ]
+    },
+    "get_num_tokens": {},
+    "greedy_total": {
+     "spec_decode/adaptive_verification.py": [
+      269,
+      270,
+      274
+     ]
+    },
+    "sample_greedy": {},
+    "sample_sampled": {
+     "sample/sampler.py": [
+      451,
+      477,
+      482,
+      483,
+      484
+     ]
+    },
+    "draft_predict": {
+     "spec_decode/acceptance_estimator.py": [
+      562,
+      563,
+      565,
+      566,
+      567,
+      568,
+      577,
+      587,
+      588,
+      590,
+      591,
+      592,
+      593,
+      594,
+      595,
+      596,
+      597,
+      598,
+      599,
+      600,
+      601,
+      602,
+      603,
+      604,
+      605,
+      606,
+      607,
+      608,
+      609,
+      610,
+      611,
+      623,
+      627,
+      642,
+      647
+     ]
+    },
+    "draft_vp_predict": {
+     "spec_decode/acceptance_estimator.py": [
+      587,
+      588,
+      590,
+      591,
+      592,
+      593,
+      594,
+      595,
+      596,
+      597,
+      598,
+      599,
+      600,
+      601,
+      602,
+      603,
+      604,
+      605,
+      606,
+      607,
+      608,
+      609,
+      610,
+      611
+     ]
+    }
+   },
+   "r1": {
+    "greedy_check": {},
+    "est_step": {},
+    "est_calibrate": {},
+    "record_conf": {},
+    "get_num_tokens": {},
+    "greedy_total": {},
+    "sample_greedy": {},
+    "sample_sampled": {
+     "sample/sampler.py": [
+      451,
+      477,
+      482,
+      483,
+      484
+     ]
+    },
+    "draft_predict": {
+     "spec_decode/acceptance_estimator.py": [
+      562,
+      563,
+      565,
+      566,
+      567,
+      568,
+      577,
+      587,
+      588,
+      590,
+      591,
+      592,
+      593,
+      594,
+      595,
+      596,
+      597,
+      598,
+      599,
+      600,
+      601,
+      602,
+      603,
+      604,
+      605,
+      606,
+      607,
+      608,
+      609,
+      610,
+      611,
+      623,
+      627,
+      642,
+      647
+     ]
+    },
+    "draft_vp_predict": {
+     "spec_decode/acceptance_estimator.py": [
+      587,
+      588,
+      590,
+      591,
+      592,
+      593,
+      594,
+      595,
+      596,
+      597,
+      598,
+      599,
+      600,
+      601,
+      602,
+      603,
+      604,
+      605,
+      606,
+      607,
+      608,
+      609,
+      610,
+      611
+     ]
+    }
+   },
+   "r1seed": {
+    "greedy_check": {},
+    "est_step": {},
+    "est_calibrate": {},
+    "record_conf": {},
+    "get_num_tokens": {},
+    "greedy_total": {},
+    "sample_greedy": {},
+    "sample_sampled": {
+     "sample/sampler.py": [
+      453,
+      479,
+      484,
+      485,
+      486
+     ]
+    },
+    "draft_predict": {
+     "spec_decode/acceptance_estimator.py": [
+      562,
+      563,
+      565,
+      566,
+      567,
+      568,
+      577,
+      587,
+      588,
+      590,
+      591,
+      592,
+      593,
+      594,
+      595,
+      596,
+      597,
+      598,
+      599,
+      600,
+      601,
+      602,
+      603,
+      604,
+      605,
+      606,
+      607,
+      608,
+      609,
+      610,
+      611,
+      623,
+      627,
+      642,
+      647
+     ]
+    },
+    "draft_vp_predict": {
+     "spec_decode/acceptance_estimator.py": [
+      587,
+      588,
+      590,
+      591,
+      592,
+      593,
+      594,
+      595,
+      596,
+      597,
+      598,
+      599,
+      600,
+      601,
+      602,
+      603,
+      604,
+      605,
+      606,
+      607,
+      608,
+      609,
+      610,
+      611
+     ]
+    }
+   }
+  },
+  "greedy_decode_step_trace_reading": "c48 = original #980 (3 lines in record_confidences); r1 = r1-noseed and r1seed = the final files: no changed line in any greedy-path component; sample_sampled, draft_predict and draft_vp_predict are the non-greedy paths the patch means to change",
+  "step_cost_in_process_abc": {
+   "method": "stepcost_ab.py: the three arms' copies of the changed modules loaded side by side in one process on spark-ds41f:candidate-48; each arm's objects built from its own copies; calls interleaved with the arm order rotated every iteration; each call timed alone on an idle GPU (host clock around the call); 1500 iterations x 3 arms per component and shape; slow outliers beyond median + 5 MAD dropped; TP4 emulated as the PR's screen does (fake rank-ordered TP group, parallel_state TP 4); shapes = the grid's 14 decode shapes (num_reqs 1,4,8,16 x 2 and 3 rows; 1,2,4,8,12,16 x 6 rows); max_num_reqs 16, 5 speculative steps, vocab 129280",
+   "aa_controls": "r1's adaptive_verification.py is byte-identical to 1107's (record_conf r1 vs 1107); r1's other files are byte-identical to candidate-48's",
+   "files": "measured with superseded/r1-noseed's files; the --seed change adds no per-step line (seed_change.per_step_effect)",
+   "greedy_total": {
+    "boot1": {
+     "host_us_geomean": {
+      "1107": 124.9,
+      "c48": 124.95,
+      "r1": 125.095
+     },
+     "c48_minus_1107_host_us_mean_over_14_shapes": 0.0508,
+     "c48_minus_1107_host_us_range_over_shapes": [
+      -0.2653,
+      0.4257
+     ],
+     "r1_minus_1107_host_us_mean_over_14_shapes": 0.196,
+     "r1_minus_1107_host_us_range_over_shapes": [
+      -0.2169,
+      0.4611
+     ],
+     "largest_per_shape_ci95_us": 0.237
+    },
+    "boot2": {
+     "host_us_geomean": {
+      "1107": 124.313,
+      "c48": 124.52,
+      "r1": 124.716
+     },
+     "c48_minus_1107_host_us_mean_over_14_shapes": 0.2065,
+     "c48_minus_1107_host_us_range_over_shapes": [
+      -0.1844,
+      0.4802
+     ],
+     "r1_minus_1107_host_us_mean_over_14_shapes": 0.4014,
+     "r1_minus_1107_host_us_range_over_shapes": [
+      0.0826,
+      1.0317
+     ],
+     "largest_per_shape_ci95_us": 0.2917
+    }
+   },
+   "record_conf": {
+    "boot1": {
+     "host_us_geomean": {
+      "1107": 30.218,
+      "c48": 30.356,
+      "r1": 30.287
+     },
+     "c48_minus_1107_host_us_mean_over_14_shapes": 0.14,
+     "c48_minus_1107_host_us_range_over_shapes": [
+      -0.0058,
+      0.351
+     ],
+     "r1_minus_1107_host_us_mean_over_14_shapes": 0.0698,
+     "r1_minus_1107_host_us_range_over_shapes": [
+      -0.3372,
+      0.2886
+     ],
+     "largest_per_shape_ci95_us": 0.1702
+    },
+    "boot2": {
+     "host_us_geomean": {
+      "1107": 30.144,
+      "c48": 30.135,
+      "r1": 30.234
+     },
+     "c48_minus_1107_host_us_mean_over_14_shapes": -0.0069,
+     "c48_minus_1107_host_us_range_over_shapes": [
+      -0.1188,
+      0.175
+     ],
+     "r1_minus_1107_host_us_mean_over_14_shapes": 0.0884,
+     "r1_minus_1107_host_us_range_over_shapes": [
+      -0.1469,
+      0.3134
+     ],
+     "largest_per_shape_ci95_us": 0.1737
+    }
+   },
+   "sample_greedy": {
+    "boot1": {
+     "host_us_geomean": {
+      "1107": 27.85,
+      "c48": 27.86,
+      "r1": 27.867
+     },
+     "c48_minus_1107_host_us_mean_over_14_shapes": 0.0099,
+     "c48_minus_1107_host_us_range_over_shapes": [
+      -0.04,
+      0.041
+     ],
+     "r1_minus_1107_host_us_mean_over_14_shapes": 0.0165,
+     "r1_minus_1107_host_us_range_over_shapes": [
+      -0.0345,
+      0.0544
+     ],
+     "largest_per_shape_ci95_us": 0.0484
+    },
+    "boot2": {
+     "host_us_geomean": {
+      "1107": 27.381,
+      "c48": 27.379,
+      "r1": 27.371
+     },
+     "c48_minus_1107_host_us_mean_over_14_shapes": -0.0023,
+     "c48_minus_1107_host_us_range_over_shapes": [
+      -0.0571,
+      0.035
+     ],
+     "r1_minus_1107_host_us_mean_over_14_shapes": -0.0105,
+     "r1_minus_1107_host_us_range_over_shapes": [
+      -0.0422,
+      0.0395
+     ],
+     "largest_per_shape_ci95_us": 0.0521
+    }
+   },
+   "est_step": {
+    "boot1": {
+     "host_us_geomean": {
+      "1107": 33.12,
+      "c48": 33.115,
+      "r1": 33.177
+     },
+     "c48_minus_1107_host_us_mean_over_14_shapes": -0.005,
+     "c48_minus_1107_host_us_range_over_shapes": [
+      -0.0601,
+      0.0493
+     ],
+     "r1_minus_1107_host_us_mean_over_14_shapes": 0.0562,
+     "r1_minus_1107_host_us_range_over_shapes": [
+      -0.0055,
+      0.1269
+     ],
+     "largest_per_shape_ci95_us": 0.0809
+    },
+    "boot2": {
+     "host_us_geomean": {
+      "1107": 33.028,
+      "c48": 33.064,
+      "r1": 33.114
+     },
+     "c48_minus_1107_host_us_mean_over_14_shapes": 0.0358,
+     "c48_minus_1107_host_us_range_over_shapes": [
+      -0.0247,
+      0.1022
+     ],
+     "r1_minus_1107_host_us_mean_over_14_shapes": 0.0857,
+     "r1_minus_1107_host_us_range_over_shapes": [
+      0.0337,
+      0.1641
+     ],
+     "largest_per_shape_ci95_us": 0.0719
+    }
+   },
+   "est_calibrate": {
+    "boot1": {
+     "host_us_geomean": {
+      "1107": 16.116,
+      "c48": 16.067,
+      "r1": 16.125
+     },
+     "c48_minus_1107_host_us_mean_over_14_shapes": -0.0494,
+     "c48_minus_1107_host_us_range_over_shapes": [
+      -0.1015,
+      -0.0133
+     ],
+     "r1_minus_1107_host_us_mean_over_14_shapes": 0.0083,
+     "r1_minus_1107_host_us_range_over_shapes": [
+      -0.0402,
+      0.0951
+     ],
+     "largest_per_shape_ci95_us": 0.0415
+    },
+    "boot2": {
+     "host_us_geomean": {
+      "1107": 15.887,
+      "c48": 15.87,
+      "r1": 15.95
+     },
+     "c48_minus_1107_host_us_mean_over_14_shapes": -0.0178,
+     "c48_minus_1107_host_us_range_over_shapes": [
+      -0.076,
+      0.0265
+     ],
+     "r1_minus_1107_host_us_mean_over_14_shapes": 0.063,
+     "r1_minus_1107_host_us_range_over_shapes": [
+      0.0162,
+      0.1106
+     ],
+     "largest_per_shape_ci95_us": 0.0211
+    }
+   },
+   "get_num_tokens": {
+    "boot1": {
+     "host_us_geomean": {
+      "1107": 21.471,
+      "c48": 21.485,
+      "r1": 21.503
+     },
+     "c48_minus_1107_host_us_mean_over_14_shapes": 0.014,
+     "c48_minus_1107_host_us_range_over_shapes": [
+      -0.0355,
+      0.0442
+     ],
+     "r1_minus_1107_host_us_mean_over_14_shapes": 0.0314,
+     "r1_minus_1107_host_us_range_over_shapes": [
+      -0.0329,
+      0.1198
+     ],
+     "largest_per_shape_ci95_us": 0.0111
+    },
+    "boot2": {
+     "host_us_geomean": {
+      "1107": 21.23,
+      "c48": 21.274,
+      "r1": 21.311
+     },
+     "c48_minus_1107_host_us_mean_over_14_shapes": 0.0433,
+     "c48_minus_1107_host_us_range_over_shapes": [
+      0.0184,
+      0.0682
+     ],
+     "r1_minus_1107_host_us_mean_over_14_shapes": 0.0815,
+     "r1_minus_1107_host_us_range_over_shapes": [
+      0.0307,
+      0.2271
+     ],
+     "largest_per_shape_ci95_us": 0.0121
+    }
+   },
+   "greedy_check": {
+    "boot1": {
+     "host_us_geomean": {
+      "1107": 6.991,
+      "c48": 6.981,
+      "r1": 6.992
+     },
+     "c48_minus_1107_host_us_mean_over_14_shapes": -0.0095,
+     "c48_minus_1107_host_us_range_over_shapes": [
+      -0.0203,
+      0.0019
+     ],
+     "r1_minus_1107_host_us_mean_over_14_shapes": 0.0015,
+     "r1_minus_1107_host_us_range_over_shapes": [
+      -0.0089,
+      0.014
+     ],
+     "largest_per_shape_ci95_us": 0.0055
+    },
+    "boot2": {
+     "host_us_geomean": {
+      "1107": 6.931,
+      "c48": 6.94,
+      "r1": 6.942
+     },
+     "c48_minus_1107_host_us_mean_over_14_shapes": 0.0098,
+     "c48_minus_1107_host_us_range_over_shapes": [
+      0.0039,
+      0.0152
+     ],
+     "r1_minus_1107_host_us_mean_over_14_shapes": 0.0113,
+     "r1_minus_1107_host_us_range_over_shapes": [
+      0.001,
+      0.022
+     ],
+     "largest_per_shape_ci95_us": 0.0055
+    }
+   },
+   "reading": "greedy post-step total (sampler eligibility reads, estimator step, calibration, record_confidences, get_num_tokens), about 125 us of host work per step: candidate-48 minus 1107 = +0.05 / +0.21 us (boot1/boot2, mean over shapes); r1 minus 1107 = +0.20 / +0.40 us, the same band as the A/A between byte-identical code. record_confidences: candidate-48 +0.14 / -0.01 us. That is at most 0.002% of a 21.1 ms grid step"
+  },
+  "step_cost_per_process": {
+   "method": "stepcost.py: one fresh container per arm and boot (boot1 order 1107, c48, r1; boot2 r1, c48, 1107), the arm's six files mounted over the candidate-48 image, 9 rounds x 300 calls per component and shape, wall time per call to the end of its GPU work",
+   "geomean_over_14_shapes": {
+    "greedy_total": {
+     "geomean_wall_us": {
+      "1107": 127.22,
+      "c48": 128.566,
+      "r1": 128.155
+     },
+     "geomean_wall_us_by_boot": {
+      "1107-boot1": 126.539,
+      "1107-boot2": 127.886,
+      "c48-boot1": 129.844,
+      "c48-boot2": 127.282,
+      "r1-boot1": 127.934,
+      "r1-boot2": 128.363
+     },
+     "c48_vs_1107_pct": 1.058,
+     "r1_vs_1107_pct": 0.735,
+     "aa_spread_pct": {
+      "1107": 1.053,
+      "c48": 2.013,
+      "r1": 0.334
+     }
+    },
+    "record_conf": {
+     "geomean_wall_us": {
+      "1107": 42.881,
+      "c48": 43.944,
+      "r1": 47.681
+     },
+     "geomean_wall_us_by_boot": {
+      "1107-boot1": 42.331,
+      "1107-boot2": 42.645,
+      "c48-boot1": 43.702,
+      "c48-boot2": 42.773,
+      "r1-boot1": 47.387,
+      "r1-boot2": 47.817
+     },
+     "c48_vs_1107_pct": 2.479,
+     "r1_vs_1107_pct": 11.193,
+     "aa_spread_pct": {
+      "1107": 0.736,
+      "c48": 2.172,
+      "r1": 0.899
+     }
+    },
+    "sample_greedy": {
+     "geomean_wall_us": {
+      "1107": 39.519,
+      "c48": 39.776,
+      "r1": 40.026
+     },
+     "geomean_wall_us_by_boot": {
+      "1107-boot1": 39.833,
+      "1107-boot2": 39.196,
+      "c48-boot1": 39.806,
+      "c48-boot2": 39.742,
+      "r1-boot1": 40.484,
+      "r1-boot2": 39.545
+     },
+     "c48_vs_1107_pct": 0.649,
+     "r1_vs_1107_pct": 1.283,
+     "aa_spread_pct": {
+      "1107": 1.625,
+      "c48": 0.161,
+      "r1": 2.375
+     }
+    },
+    "est_step": {
+     "geomean_wall_us": {
+      "1107": 32.867,
+      "c48": 32.879,
+      "r1": 33.055
+     },
+     "geomean_wall_us_by_boot": {
+      "1107-boot1": 32.854,
+      "1107-boot2": 32.869,
+      "c48-boot1": 33.051,
+      "c48-boot2": 32.698,
+      "r1-boot1": 32.871,
+      "r1-boot2": 33.236
+     },
+     "c48_vs_1107_pct": 0.036,
+     "r1_vs_1107_pct": 0.573,
+     "aa_spread_pct": {
+      "1107": 0.046,
+      "c48": 1.08,
+      "r1": 1.098
+     }
+    },
+    "est_calibrate": {
+     "geomean_wall_us": {
+      "1107": 21.219,
+      "c48": 21.379,
+      "r1": 21.49
+     },
+     "geomean_wall_us_by_boot": {
+      "1107-boot1": 21.199,
+      "1107-boot2": 21.216,
+      "c48-boot1": 21.387,
+      "c48-boot2": 21.347,
+      "r1-boot1": 21.383,
+      "r1-boot2": 21.59
+     },
+     "c48_vs_1107_pct": 0.757,
+     "r1_vs_1107_pct": 1.28,
+     "aa_spread_pct": {
+      "1107": 0.08,
+      "c48": 0.187,
+      "r1": 0.959
+     }
+    },
+    "get_num_tokens": {
+     "geomean_wall_us": {
+      "1107": 20.541,
+      "c48": 20.524,
+      "r1": 20.424
+     },
+     "geomean_wall_us_by_boot": {
+      "1107-boot1": 20.459,
+      "1107-boot2": 20.624,
+      "c48-boot1": 20.501,
+      "c48-boot2": 20.547,
+      "r1-boot1": 20.532,
+      "r1-boot2": 20.315
+     },
+     "c48_vs_1107_pct": -0.086,
+     "r1_vs_1107_pct": -0.573,
+     "aa_spread_pct": {
+      "1107": 0.8,
+      "c48": 0.224,
+      "r1": 1.068
+     }
+    },
+    "greedy_check": {
+     "geomean_wall_us": {
+      "1107": 6.339,
+      "c48": 6.28,
+      "r1": 6.304
+     },
+     "geomean_wall_us_by_boot": {
+      "1107-boot1": 6.318,
+      "1107-boot2": 6.36,
+      "c48-boot1": 6.283,
+      "c48-boot2": 6.277,
+      "r1-boot1": 6.317,
+      "r1-boot2": 6.291
+     },
+     "c48_vs_1107_pct": -0.929,
+     "r1_vs_1107_pct": -0.557,
+     "aa_spread_pct": {
+      "1107": 0.66,
+      "c48": 0.096,
+      "r1": 0.413
+     }
+    }
+   },
+   "reading": "process-to-process variance dominates here: r1 vs 1107 differ by +11% on record_confidences with byte-identical code (a bimodal wait on the previous step's copy event), and greedy_total arms differ by 0.7-1.1% against 0.3-2.0% boot-to-boot spreads. It bounds any greedy-path cost to about 1 us per step; the in-process A/B/C bench resolves it"
+  },
+  "other_paths_not_greedy": {
+   "sample_sampled_tp4": {
+    "per_process_wall_geomean_us": {
+     "1107": 390.765,
+     "c48": 274.705,
+     "r1": 276.513
+    },
+    "c48_vs_1107_pct": -29.701,
+    "in_process_host": {
+     "boot1": {
+      "host_us_geomean": {
+       "1107": 104.259,
+       "c48": 122.092,
+       "r1": 123.209
+      },
+      "c48_minus_1107_host_us_mean_over_14_shapes": 18.4108,
+      "c48_minus_1107_host_us_range_over_shapes": [
+       -17.3474,
+       24.8053
+      ],
+      "r1_minus_1107_host_us_mean_over_14_shapes": 19.5367,
+      "r1_minus_1107_host_us_range_over_shapes": [
+       -16.4061,
+       26.6547
+      ],
+      "largest_per_shape_ci95_us": 0.6462
+     },
+     "boot2": {
+      "host_us_geomean": {
+       "1107": 102.606,
+       "c48": 120.905,
+       "r1": 121.945
+      },
+      "c48_minus_1107_host_us_mean_over_14_shapes": 18.872,
+      "c48_minus_1107_host_us_range_over_shapes": [
+       -15.3804,
+       26.4073
+      ],
+      "r1_minus_1107_host_us_mean_over_14_shapes": 19.9197,
+      "r1_minus_1107_host_us_range_over_shapes": [
+       -14.6749,
+       27.3847
+      ],
+      "largest_per_shape_ci95_us": 0.5817
+     }
+    },
+    "reading": "#980 routes unseeded top-k/top-p rows at TP>1 through TileLang top-k/top-p + gumbel instead of FlashInfer: host time +18 us per call on average over the shapes (+25 us at 1 request, -13 us at 16 x 6 rows), and per-call wall time to the end of the GPU work 30% lower in geomean (equal at 1 request, up to about 40% lower at 8-16 requests x 3-6 rows); not the greedy path, and the release run found the sampled companion not worse"
+   },
+   "draft_predict": {
+    "in_process_host": {
+     "boot1": {
+      "host_us_geomean": {
+       "1107": 24.934,
+       "c48": 24.64,
+       "r1": 24.726
+      },
+      "c48_minus_1107_host_us_mean_over_14_shapes": -0.2933,
+      "c48_minus_1107_host_us_range_over_shapes": [
+       -0.5178,
+       -0.0157
+      ],
+      "r1_minus_1107_host_us_mean_over_14_shapes": -0.207,
+      "r1_minus_1107_host_us_range_over_shapes": [
+       -0.4393,
+       0.0334
+      ],
+      "largest_per_shape_ci95_us": 0.0521
+     },
+     "boot2": {
+      "host_us_geomean": {
+       "1107": 24.751,
+       "c48": 24.542,
+       "r1": 24.59
+      },
+      "c48_minus_1107_host_us_mean_over_14_shapes": -0.2088,
+      "c48_minus_1107_host_us_range_over_shapes": [
+       -0.3806,
+       0.1504
+      ],
+      "r1_minus_1107_host_us_mean_over_14_shapes": -0.1604,
+      "r1_minus_1107_host_us_range_over_shapes": [
+       -0.3193,
+       0.0929
+      ],
+      "largest_per_shape_ci95_us": 0.0627
+     }
+    },
+    "reading": "predict() with the scratch buffers: 0.2-0.3 us less host time (DraftModel/DFlash drafters without a confidence head)"
+   },
+   "draft_vp_predict": {
+    "in_process_host": {
+     "boot1": {
+      "host_us_geomean": {
+       "1107": 11.983,
+       "c48": 12.441,
+       "r1": 12.493
+      },
+      "c48_minus_1107_host_us_mean_over_14_shapes": 0.4569,
+      "c48_minus_1107_host_us_range_over_shapes": [
+       0.4167,
+       0.5213
+      ],
+      "r1_minus_1107_host_us_mean_over_14_shapes": 0.5091,
+      "r1_minus_1107_host_us_range_over_shapes": [
+       0.4244,
+       0.5552
+      ],
+      "largest_per_shape_ci95_us": 0.0335
+     },
+     "boot2": {
+      "host_us_geomean": {
+       "1107": 12.03,
+       "c48": 12.45,
+       "r1": 12.492
+      },
+      "c48_minus_1107_host_us_mean_over_14_shapes": 0.4199,
+      "c48_minus_1107_host_us_range_over_shapes": [
+       0.373,
+       0.4583
+      ],
+      "r1_minus_1107_host_us_mean_over_14_shapes": 0.4616,
+      "r1_minus_1107_host_us_range_over_shapes": [
+       0.4339,
+       0.5018
+      ],
+      "largest_per_shape_ci95_us": 0.0323
+     }
+    },
+    "reading": "DFlash vocab-parallel probabilistic drafts: predict_from_stats adds 0.42-0.51 us of host time per draft step (one more Python call); 1107's DFlash already fed the per-rank stats to _predict_kernel inline, so the PR's -11.4 us per draft step is against predict()'s full-vocab rescan, not against 1107; eager-only, as the draft step is CUDA-graph captured"
+   }
+  }
+ },
+ "grid_attribution": {
+  "observation": "candidate-48 21.1043 / 21.1292 ms vs no980 21.0514 / 21.0667 ms (+0.27%); no1011 +0.16% vs candidate-48",
+  "why_it_is_not_980_step_work": "per the static path and the trace above, no #980 line executes in the timed steps",
+  "likely_mechanism": "the grid's dummy steps read state that earlier traffic leaves behind, and #980 changes that state. The startup sampler warmup (gpu/warmup.py: SamplingParams.for_sampler_warmup(), temperature 0.9, top-k 50, top-p 0.9, unseeded, slots 0..n-1) samples different tokens under #980: seeds come from SamplingStates._seed_rng instead of the global NumPy RNG, and at TP>1 the rows go through TileLang top-k/top-p + gumbel instead of FlashInfer. Those tokens stay in req_states.last_sampled_tokens. _dummy_run passes them to the drafter (model_runner.py 1210, last_sampled -> prepare_dflash_inputs), and the DSpark draft layers are MoE, so routing and the drafter's step time depend on them. Each arm's warmup is deterministic, which gives a per-arm offset that repeats across boots, the pattern the attribution showed. Any sampled traffic before the grid does the same, and so may KV the warmup wrote into dummy-context blocks",
+  "measured_precondition_on_sp2": {
+   "warmup_tokens": {
+    "1107-boot1": {
+     "flashinfer_path": true,
+     "seeds_sha256_16": "f7435d88800311f5",
+     "tokens_sha256_16": "56c19316f1ab50f8",
+     "first_step_tokens_head": [
+      111092,
+      23384,
+      93890,
+      112549,
+      119920,
+      110464
+     ]
+    },
+    "1107-boot2": {
+     "flashinfer_path": true,
+     "seeds_sha256_16": "f7435d88800311f5",
+     "tokens_sha256_16": "56c19316f1ab50f8",
+     "first_step_tokens_head": [
+      111092,
+      23384,
+      93890,
+      112549,
+      119920,
+      110464
+     ]
+    },
+    "c48-boot1": {
+     "flashinfer_path": false,
+     "seeds_sha256_16": "1449fb0d352add0d",
+     "tokens_sha256_16": "afe98f3c0d04d6b8",
+     "first_step_tokens_head": [
+      74037,
+      43775,
+      106407,
+      121621,
+      110585,
+      42168
+     ]
+    },
+    "c48-boot2": {
+     "flashinfer_path": false,
+     "seeds_sha256_16": "1449fb0d352add0d",
+     "tokens_sha256_16": "afe98f3c0d04d6b8",
+     "first_step_tokens_head": [
+      74037,
+      43775,
+      106407,
+      121621,
+      110585,
+      42168
+     ]
+    },
+    "r1-boot1": {
+     "flashinfer_path": false,
+     "seeds_sha256_16": "1449fb0d352add0d",
+     "tokens_sha256_16": "afe98f3c0d04d6b8",
+     "first_step_tokens_head": [
+      74037,
+      43775,
+      106407,
+      121621,
+      110585,
+      42168
+     ]
+    },
+    "r1-boot2": {
+     "flashinfer_path": false,
+     "seeds_sha256_16": "1449fb0d352add0d",
+     "tokens_sha256_16": "afe98f3c0d04d6b8",
+     "first_step_tokens_head": [
+      74037,
+      43775,
+      106407,
+      121621,
+      110585,
+      42168
+     ]
+    }
+   },
+   "reading": "with TP4 emulated and the worker's seeding (set_random_seed(0)), the warmup's sampled tokens are identical across boots within each arm, and differ between 1107 (FlashInfer path, tokens hash 56c19316f1ab50f8) and candidate-48 / r1 (TileLang path, afe98f3c0d04d6b8)"
+  },
+  "not_verified": "the effect of these tokens on the 4-node grid's step time; it needs the model and was not run here",
+  "position_note": "candidate-48 booted first in every triple (positions 1 and 4), and the no1011 overlay, which changes only FlashAttention-backend lines DS4.1 does not run, also measured 0.16% faster than candidate-48",
+  "how_to_settle_on_the_grid": [
+   "read forward_ms vs drafter_ms in the existing candidate-48 / no980 grid records: a delta in drafter_ms on code that does not run points at the drafter's inputs",
+   "run arms r1 (overlay/, seven files), no980, and the two 2x2 overlays in diag-overlays/ (diag-r1seed-1107sampling: r1's spec-decode files with 1107's sampler.py and states.py and the image's model_runner.py; diag-1107-r1seedsampling: 1107's spec-decode files with r1's sampler.py, states.py and model_runner.py), all on the candidate-48 image, rotating arm order so no arm always boots first; if the delta follows sampler.py/states.py (the warmup tokens) and not the spec-decode files, it is the leftover-input effect, not engine speed",
+   "at the recipe's default --seed 0 the corrected patch's warmup tokens equal r1-noseed's and candidate-48's (default_rng(0) either way), so the caveat holds for the final patch",
+   "a harness fix that would make the grid's dummy inputs independent of history (resetting req_states.last_sampled_tokens / next_prefill_tokens, and the dummy context blocks, before timing) is outside this PR"
+  ]
+ },
+ "lockstep_screen": {
+  "final_files_harness_fixed_screen": {
+   "script": "screen_zero_broadcast_sync_rowsfix_valid_seeded.py: the PR's screen with draft_sampled laid out as [num_logits], only the sampled entries rejection_sample writes compared (raw counts kept as unchecked_sampled_raw_steps), and --sampling-seed handed to SamplingStates as the configured seed (scripts/screen-valid-seeded-vs-pr.diff is the whole change); --sampling-seed 1234; the final seven files mounted on the candidate-48 image; same one-container layout; boot1 TP3 then TP4, boot2 TP4 then TP3",
+   "runs": {
+    "screen-r1seed-boot1-tp3": {
+     "exit": 0,
+     "sampling_seed": 1234,
+     "modes": {
+      "control_unseeded_global_rng": {
+       "broadcast_calls": 0,
+       "seeds_equal_across_ranks": false,
+       "refits_completed": 10,
+       "mismatch_draft_steps": 1000,
+       "mismatch_conf_steps": 1000,
+       "mismatch_budget_steps": 264,
+       "mismatch_capacities_steps": 0,
+       "mismatch_dead_cut_steps": 0,
+       "mismatch_sampled_steps": 1000,
+       "unchecked_sampled_raw_steps": 1000,
+       "mismatch_estimator_steps": 901,
+       "max_conf_abs_diff": 0.45357957,
+       "max_slope_abs_diff": 0.62770355,
+       "max_intercept_abs_diff": 1.12419176
+      },
+      "candidate_greedy": {
+       "broadcast_calls": 0,
+       "seeds_equal_across_ranks": true,
+       "refits_completed": 10,
+       "mismatch_draft_steps": 0,
+       "mismatch_conf_steps": 0,
+       "mismatch_budget_steps": 0,
+       "mismatch_capacities_steps": 0,
+       "mismatch_dead_cut_steps": 0,
+       "mismatch_sampled_steps": 0,
+       "unchecked_sampled_raw_steps": 0,
+       "mismatch_estimator_steps": 0,
+       "max_conf_abs_diff": 0.0,
+       "max_slope_abs_diff": 0.0,
+       "max_intercept_abs_diff": 0.0
+      },
+      "candidate_sampled_unseeded": {
+       "broadcast_calls": 0,
+       "seeds_equal_across_ranks": true,
+       "refits_completed": 10,
+       "mismatch_draft_steps": 0,
+       "mismatch_conf_steps": 0,
+       "mismatch_budget_steps": 0,
+       "mismatch_capacities_steps": 0,
+       "mismatch_dead_cut_steps": 0,
+       "mismatch_sampled_steps": 0,
+       "unchecked_sampled_raw_steps": 0,
+       "mismatch_estimator_steps": 0,
+       "max_conf_abs_diff": 0.0,
+       "max_slope_abs_diff": 0.0,
+       "max_intercept_abs_diff": 0.0
+      },
+      "candidate_dflash_estimator": {
+       "broadcast_calls": 0,
+       "seeds_equal_across_ranks": true,
+       "refits_completed": 10,
+       "mismatch_draft_steps": 0,
+       "mismatch_conf_steps": 0,
+       "mismatch_budget_steps": 0,
+       "mismatch_capacities_steps": 0,
+       "mismatch_dead_cut_steps": 0,
+       "mismatch_sampled_steps": 0,
+       "unchecked_sampled_raw_steps": 0,
+       "mismatch_estimator_steps": 0,
+       "max_conf_abs_diff": 0.0,
+       "max_slope_abs_diff": 0.0,
+       "max_intercept_abs_diff": 0.0
+      }
+     }
+    },
+    "screen-r1seed-boot1-tp4": {
+     "exit": 0,
+     "sampling_seed": 1234,
+     "modes": {
+      "control_unseeded_global_rng": {
+       "broadcast_calls": 0,
+       "seeds_equal_across_ranks": false,
+       "refits_completed": 10,
+       "mismatch_draft_steps": 1000,
+       "mismatch_conf_steps": 1000,
+       "mismatch_budget_steps": 240,
+       "mismatch_capacities_steps": 0,
+       "mismatch_dead_cut_steps": 0,
+       "mismatch_sampled_steps": 1000,
+       "unchecked_sampled_raw_steps": 1000,
+       "mismatch_estimator_steps": 901,
+       "max_conf_abs_diff": 0.44834155,
+       "max_slope_abs_diff": 0.38667405,
+       "max_intercept_abs_diff": 1.89094448
+      },
+      "candidate_greedy": {
+       "broadcast_calls": 0,
+       "seeds_equal_across_ranks": true,
+       "refits_completed": 10,
+       "mismatch_draft_steps": 0,
+       "mismatch_conf_steps": 0,
+       "mismatch_budget_steps": 0,
+       "mismatch_capacities_steps": 0,
+       "mismatch_dead_cut_steps": 0,
+       "mismatch_sampled_steps": 0,
+       "unchecked_sampled_raw_steps": 0,
+       "mismatch_estimator_steps": 0,
+       "max_conf_abs_diff": 0.0,
+       "max_slope_abs_diff": 0.0,
+       "max_intercept_abs_diff": 0.0
+      },
+      "candidate_sampled_unseeded": {
+       "broadcast_calls": 0,
+       "seeds_equal_across_ranks": true,
+       "refits_completed": 10,
+       "mismatch_draft_steps": 0,
+       "mismatch_conf_steps": 0,
+       "mismatch_budget_steps": 0,
+       "mismatch_capacities_steps": 0,
+       "mismatch_dead_cut_steps": 0,
+       "mismatch_sampled_steps": 0,
+       "unchecked_sampled_raw_steps": 2,
+       "mismatch_estimator_steps": 0,
+       "max_conf_abs_diff": 0.0,
+       "max_slope_abs_diff": 0.0,
+       "max_intercept_abs_diff": 0.0
+      },
+      "candidate_dflash_estimator": {
+       "broadcast_calls": 0,
+       "seeds_equal_across_ranks": true,
+       "refits_completed": 10,
+       "mismatch_draft_steps": 0,
+       "mismatch_conf_steps": 0,
+       "mismatch_budget_steps": 0,
+       "mismatch_capacities_steps": 0,
+       "mismatch_dead_cut_steps": 0,
+       "mismatch_sampled_steps": 0,
+       "unchecked_sampled_raw_steps": 6,
+       "mismatch_estimator_steps": 0,
+       "max_conf_abs_diff": 0.0,
+       "max_slope_abs_diff": 0.0,
+       "max_intercept_abs_diff": 0.0
+      }
+     }
+    },
+    "screen-r1seed-boot2-tp4": {
+     "exit": 0,
+     "sampling_seed": 1234,
+     "modes": {
+      "control_unseeded_global_rng": {
+       "broadcast_calls": 0,
+       "seeds_equal_across_ranks": false,
+       "refits_completed": 10,
+       "mismatch_draft_steps": 1000,
+       "mismatch_conf_steps": 1000,
+       "mismatch_budget_steps": 240,
+       "mismatch_capacities_steps": 0,
+       "mismatch_dead_cut_steps": 0,
+       "mismatch_sampled_steps": 1000,
+       "unchecked_sampled_raw_steps": 1000,
+       "mismatch_estimator_steps": 901,
+       "max_conf_abs_diff": 0.44834155,
+       "max_slope_abs_diff": 0.38667405,
+       "max_intercept_abs_diff": 1.89094448
+      },
+      "candidate_greedy": {
+       "broadcast_calls": 0,
+       "seeds_equal_across_ranks": true,
+       "refits_completed": 10,
+       "mismatch_draft_steps": 0,
+       "mismatch_conf_steps": 0,
+       "mismatch_budget_steps": 0,
+       "mismatch_capacities_steps": 0,
+       "mismatch_dead_cut_steps": 0,
+       "mismatch_sampled_steps": 0,
+       "unchecked_sampled_raw_steps": 0,
+       "mismatch_estimator_steps": 0,
+       "max_conf_abs_diff": 0.0,
+       "max_slope_abs_diff": 0.0,
+       "max_intercept_abs_diff": 0.0
+      },
+      "candidate_sampled_unseeded": {
+       "broadcast_calls": 0,
+       "seeds_equal_across_ranks": true,
+       "refits_completed": 10,
+       "mismatch_draft_steps": 0,
+       "mismatch_conf_steps": 0,
+       "mismatch_budget_steps": 0,
+       "mismatch_capacities_steps": 0,
+       "mismatch_dead_cut_steps": 0,
+       "mismatch_sampled_steps": 0,
+       "unchecked_sampled_raw_steps": 2,
+       "mismatch_estimator_steps": 0,
+       "max_conf_abs_diff": 0.0,
+       "max_slope_abs_diff": 0.0,
+       "max_intercept_abs_diff": 0.0
+      },
+      "candidate_dflash_estimator": {
+       "broadcast_calls": 0,
+       "seeds_equal_across_ranks": true,
+       "refits_completed": 10,
+       "mismatch_draft_steps": 0,
+       "mismatch_conf_steps": 0,
+       "mismatch_budget_steps": 0,
+       "mismatch_capacities_steps": 0,
+       "mismatch_dead_cut_steps": 0,
+       "mismatch_sampled_steps": 0,
+       "unchecked_sampled_raw_steps": 6,
+       "mismatch_estimator_steps": 0,
+       "max_conf_abs_diff": 0.0,
+       "max_slope_abs_diff": 0.0,
+       "max_intercept_abs_diff": 0.0
+      }
+     }
+    },
+    "screen-r1seed-boot2-tp3": {
+     "exit": 0,
+     "sampling_seed": 1234,
+     "modes": {
+      "control_unseeded_global_rng": {
+       "broadcast_calls": 0,
+       "seeds_equal_across_ranks": false,
+       "refits_completed": 10,
+       "mismatch_draft_steps": 1000,
+       "mismatch_conf_steps": 1000,
+       "mismatch_budget_steps": 264,
+       "mismatch_capacities_steps": 0,
+       "mismatch_dead_cut_steps": 0,
+       "mismatch_sampled_steps": 1000,
+       "unchecked_sampled_raw_steps": 1000,
+       "mismatch_estimator_steps": 901,
+       "max_conf_abs_diff": 0.45357957,
+       "max_slope_abs_diff": 0.62770355,
+       "max_intercept_abs_diff": 1.12419176
+      },
+      "candidate_greedy": {
+       "broadcast_calls": 0,
+       "seeds_equal_across_ranks": true,
+       "refits_completed": 10,
+       "mismatch_draft_steps": 0,
+       "mismatch_conf_steps": 0,
+       "mismatch_budget_steps": 0,
+       "mismatch_capacities_steps": 0,
+       "mismatch_dead_cut_steps": 0,
+       "mismatch_sampled_steps": 0,
+       "unchecked_sampled_raw_steps": 0,
+       "mismatch_estimator_steps": 0,
+       "max_conf_abs_diff": 0.0,
+       "max_slope_abs_diff": 0.0,
+       "max_intercept_abs_diff": 0.0
+      },
+      "candidate_sampled_unseeded": {
+       "broadcast_calls": 0,
+       "seeds_equal_across_ranks": true,
+       "refits_completed": 10,
+       "mismatch_draft_steps": 0,
+       "mismatch_conf_steps": 0,
+       "mismatch_budget_steps": 0,
+       "mismatch_capacities_steps": 0,
+       "mismatch_dead_cut_steps": 0,
+       "mismatch_sampled_steps": 0,
+       "unchecked_sampled_raw_steps": 0,
+       "mismatch_estimator_steps": 0,
+       "max_conf_abs_diff": 0.0,
+       "max_slope_abs_diff": 0.0,
+       "max_intercept_abs_diff": 0.0
+      },
+      "candidate_dflash_estimator": {
+       "broadcast_calls": 0,
+       "seeds_equal_across_ranks": true,
+       "refits_completed": 10,
+       "mismatch_draft_steps": 0,
+       "mismatch_conf_steps": 0,
+       "mismatch_budget_steps": 0,
+       "mismatch_capacities_steps": 0,
+       "mismatch_dead_cut_steps": 0,
+       "mismatch_sampled_steps": 0,
+       "unchecked_sampled_raw_steps": 0,
+       "mismatch_estimator_steps": 0,
+       "max_conf_abs_diff": 0.0,
+       "max_slope_abs_diff": 0.0,
+       "max_intercept_abs_diff": 0.0
+      }
+     }
+    }
+   },
+   "reading": "configured seed 1234: every candidate mode (greedy, sampled unseeded, dflash estimator) has 0/1000 in the draft, confidence, budget, capacities, dead-cut, sampled (written entries) and estimator histories at TP3 and TP4, both boots, with seeds equal across ranks, 0 broadcasts and 10 refits; the raw rows differ only in the uninitialized tail past num_sampled (0-6 steps at TP4, as without the seed); the control arm, which draws seeds from the global RNG, diverges as designed (264/1000 TP3, 240/1000 TP4 budget mismatches in this harness-fixed screen, against 263/239 in the PR's)",
+   "verdict": "pass"
+  },
+  "script": "before the seed change: the PR's screen_zero_broadcast_sync.py, unchanged, --worker at TP3 and TP4, 1,000 steps, every rank a process in one container on sp2's GB10 (NCCL_MULTI_RANK_GPU_ENABLE=1, as the sp8 own-mark run), r1's six files mounted on the candidate-48 image; boot order as the PR's orchestrator (boot1 TP3 then TP4, boot2 TP4 then TP3)",
+  "runs": {
+   "screen-r1-boot1-tp3": {
+    "exit": 0,
+    "modes": {
+     "control_unseeded_global_rng": {
+      "broadcast_calls": 0,
+      "seeds_equal_across_ranks": false,
+      "refits_completed": 10,
+      "mismatch_draft_steps": 1000,
+      "mismatch_conf_steps": 1000,
+      "mismatch_budget_steps": 263,
+      "mismatch_capacities_steps": 0,
+      "mismatch_dead_cut_steps": 0,
+      "mismatch_sampled_steps": 1000,
+      "mismatch_estimator_steps": 901,
+      "max_conf_abs_diff": 0.29860765,
+      "max_slope_abs_diff": 0.50481915,
+      "max_intercept_abs_diff": 1.1976037
+     },
+     "candidate_greedy": {
+      "broadcast_calls": 0,
+      "seeds_equal_across_ranks": true,
+      "refits_completed": 10,
+      "mismatch_draft_steps": 0,
+      "mismatch_conf_steps": 0,
+      "mismatch_budget_steps": 0,
+      "mismatch_capacities_steps": 0,
+      "mismatch_dead_cut_steps": 0,
+      "mismatch_sampled_steps": 0,
+      "mismatch_estimator_steps": 0,
+      "max_conf_abs_diff": 0.0,
+      "max_slope_abs_diff": 0.0,
+      "max_intercept_abs_diff": 0.0
+     },
+     "candidate_sampled_unseeded": {
+      "broadcast_calls": 0,
+      "seeds_equal_across_ranks": true,
+      "refits_completed": 10,
+      "mismatch_draft_steps": 0,
+      "mismatch_conf_steps": 0,
+      "mismatch_budget_steps": 0,
+      "mismatch_capacities_steps": 0,
+      "mismatch_dead_cut_steps": 0,
+      "mismatch_sampled_steps": 0,
+      "mismatch_estimator_steps": 0,
+      "max_conf_abs_diff": 0.0,
+      "max_slope_abs_diff": 0.0,
+      "max_intercept_abs_diff": 0.0
+     },
+     "candidate_dflash_estimator": {
+      "broadcast_calls": 0,
+      "seeds_equal_across_ranks": true,
+      "refits_completed": 10,
+      "mismatch_draft_steps": 0,
+      "mismatch_conf_steps": 0,
+      "mismatch_budget_steps": 0,
+      "mismatch_capacities_steps": 0,
+      "mismatch_dead_cut_steps": 0,
+      "mismatch_sampled_steps": 0,
+      "mismatch_estimator_steps": 0,
+      "max_conf_abs_diff": 0.0,
+      "max_slope_abs_diff": 0.0,
+      "max_intercept_abs_diff": 0.0
+     }
+    }
+   },
+   "screen-r1-boot1-tp4": {
+    "exit": 0,
+    "modes": {
+     "control_unseeded_global_rng": {
+      "broadcast_calls": 0,
+      "seeds_equal_across_ranks": false,
+      "refits_completed": 10,
+      "mismatch_draft_steps": 1000,
+      "mismatch_conf_steps": 1000,
+      "mismatch_budget_steps": 239,
+      "mismatch_capacities_steps": 0,
+      "mismatch_dead_cut_steps": 0,
+      "mismatch_sampled_steps": 1000,
+      "mismatch_estimator_steps": 901,
+      "max_conf_abs_diff": 0.51592845,
+      "max_slope_abs_diff": 0.36450931,
+      "max_intercept_abs_diff": 2.01140976
+     },
+     "candidate_greedy": {
+      "broadcast_calls": 0,
+      "seeds_equal_across_ranks": true,
+      "refits_completed": 10,
+      "mismatch_draft_steps": 0,
+      "mismatch_conf_steps": 0,
+      "mismatch_budget_steps": 0,
+      "mismatch_capacities_steps": 0,
+      "mismatch_dead_cut_steps": 0,
+      "mismatch_sampled_steps": 0,
+      "mismatch_estimator_steps": 0,
+      "max_conf_abs_diff": 0.0,
+      "max_slope_abs_diff": 0.0,
+      "max_intercept_abs_diff": 0.0
+     },
+     "candidate_sampled_unseeded": {
+      "broadcast_calls": 0,
+      "seeds_equal_across_ranks": true,
+      "refits_completed": 10,
+      "mismatch_draft_steps": 0,
+      "mismatch_conf_steps": 0,
+      "mismatch_budget_steps": 0,
+      "mismatch_capacities_steps": 0,
+      "mismatch_dead_cut_steps": 0,
+      "mismatch_sampled_steps": 0,
+      "mismatch_estimator_steps": 0,
+      "max_conf_abs_diff": 0.0,
+      "max_slope_abs_diff": 0.0,
+      "max_intercept_abs_diff": 0.0
+     },
+     "candidate_dflash_estimator": {
+      "broadcast_calls": 0,
+      "seeds_equal_across_ranks": true,
+      "refits_completed": 10,
+      "mismatch_draft_steps": 0,
+      "mismatch_conf_steps": 0,
+      "mismatch_budget_steps": 0,
+      "mismatch_capacities_steps": 0,
+      "mismatch_dead_cut_steps": 0,
+      "mismatch_sampled_steps": 0,
+      "mismatch_estimator_steps": 0,
+      "max_conf_abs_diff": 0.0,
+      "max_slope_abs_diff": 0.0,
+      "max_intercept_abs_diff": 0.0
+     }
+    }
+   },
+   "screen-r1-boot2-tp4": {
+    "exit": 0,
+    "modes": {
+     "control_unseeded_global_rng": {
+      "broadcast_calls": 0,
+      "seeds_equal_across_ranks": false,
+      "refits_completed": 10,
+      "mismatch_draft_steps": 1000,
+      "mismatch_conf_steps": 1000,
+      "mismatch_budget_steps": 239,
+      "mismatch_capacities_steps": 0,
+      "mismatch_dead_cut_steps": 0,
+      "mismatch_sampled_steps": 1000,
+      "mismatch_estimator_steps": 901,
+      "max_conf_abs_diff": 0.51592845,
+      "max_slope_abs_diff": 0.36450931,
+      "max_intercept_abs_diff": 2.01140976
+     },
+     "candidate_greedy": {
+      "broadcast_calls": 0,
+      "seeds_equal_across_ranks": true,
+      "refits_completed": 10,
+      "mismatch_draft_steps": 0,
+      "mismatch_conf_steps": 0,
+      "mismatch_budget_steps": 0,
+      "mismatch_capacities_steps": 0,
+      "mismatch_dead_cut_steps": 0,
+      "mismatch_sampled_steps": 0,
+      "mismatch_estimator_steps": 0,
+      "max_conf_abs_diff": 0.0,
+      "max_slope_abs_diff": 0.0,
+      "max_intercept_abs_diff": 0.0
+     },
+     "candidate_sampled_unseeded": {
+      "broadcast_calls": 0,
+      "seeds_equal_across_ranks": true,
+      "refits_completed": 10,
+      "mismatch_draft_steps": 0,
+      "mismatch_conf_steps": 0,
+      "mismatch_budget_steps": 0,
+      "mismatch_capacities_steps": 0,
+      "mismatch_dead_cut_steps": 0,
+      "mismatch_sampled_steps": 0,
+      "mismatch_estimator_steps": 0,
+      "max_conf_abs_diff": 0.0,
+      "max_slope_abs_diff": 0.0,
+      "max_intercept_abs_diff": 0.0
+     },
+     "candidate_dflash_estimator": {
+      "broadcast_calls": 0,
+      "seeds_equal_across_ranks": true,
+      "refits_completed": 10,
+      "mismatch_draft_steps": 0,
+      "mismatch_conf_steps": 0,
+      "mismatch_budget_steps": 0,
+      "mismatch_capacities_steps": 0,
+      "mismatch_dead_cut_steps": 0,
+      "mismatch_sampled_steps": 0,
+      "mismatch_estimator_steps": 0,
+      "max_conf_abs_diff": 0.0,
+      "max_slope_abs_diff": 0.0,
+      "max_intercept_abs_diff": 0.0
+     }
+    }
+   },
+   "screen-r1-boot2-tp3": {
+    "exit": 0,
+    "modes": {
+     "control_unseeded_global_rng": {
+      "broadcast_calls": 0,
+      "seeds_equal_across_ranks": false,
+      "refits_completed": 10,
+      "mismatch_draft_steps": 1000,
+      "mismatch_conf_steps": 1000,
+      "mismatch_budget_steps": 263,
+      "mismatch_capacities_steps": 0,
+      "mismatch_dead_cut_steps": 0,
+      "mismatch_sampled_steps": 1000,
+      "mismatch_estimator_steps": 901,
+      "max_conf_abs_diff": 0.29860765,
+      "max_slope_abs_diff": 0.50481915,
+      "max_intercept_abs_diff": 1.1976037
+     },
+     "candidate_greedy": {
+      "broadcast_calls": 0,
+      "seeds_equal_across_ranks": true,
+      "refits_completed": 10,
+      "mismatch_draft_steps": 0,
+      "mismatch_conf_steps": 0,
+      "mismatch_budget_steps": 0,
+      "mismatch_capacities_steps": 0,
+      "mismatch_dead_cut_steps": 0,
+      "mismatch_sampled_steps": 0,
+      "mismatch_estimator_steps": 0,
+      "max_conf_abs_diff": 0.0,
+      "max_slope_abs_diff": 0.0,
+      "max_intercept_abs_diff": 0.0
+     },
+     "candidate_sampled_unseeded": {
+      "broadcast_calls": 0,
+      "seeds_equal_across_ranks": true,
+      "refits_completed": 10,
+      "mismatch_draft_steps": 0,
+      "mismatch_conf_steps": 0,
+      "mismatch_budget_steps": 0,
+      "mismatch_capacities_steps": 0,
+      "mismatch_dead_cut_steps": 0,
+      "mismatch_sampled_steps": 0,
+      "mismatch_estimator_steps": 0,
+      "max_conf_abs_diff": 0.0,
+      "max_slope_abs_diff": 0.0,
+      "max_intercept_abs_diff": 0.0
+     },
+     "candidate_dflash_estimator": {
+      "broadcast_calls": 0,
+      "seeds_equal_across_ranks": true,
+      "refits_completed": 10,
+      "mismatch_draft_steps": 0,
+      "mismatch_conf_steps": 0,
+      "mismatch_budget_steps": 0,
+      "mismatch_capacities_steps": 0,
+      "mismatch_dead_cut_steps": 0,
+      "mismatch_sampled_steps": 0,
+      "mismatch_estimator_steps": 0,
+      "max_conf_abs_diff": 0.0,
+      "max_slope_abs_diff": 0.0,
+      "max_intercept_abs_diff": 0.0
+     }
+    }
+   }
+  },
+  "reading": "every candidate mode (greedy, sampled unseeded, dflash estimator) has 0/1000 in the draft, confidence, budget, capacities, dead-cut, sampled and estimator histories, with 0 broadcasts, 10 refits and seeds equal across ranks; the control reproduces the PR's 263/1000 (TP3) and 239/1000 (TP4) budget mismatches and max confidence diffs of 0.29860765 / 0.51592845",
+  "verdict": "pass"
+ },
+ "tests": {
+  "command": "pytest --noconftest -v on the PR's six test files (README 3.1), the final seven files and test file mounted on the candidate-48 image",
+  "boot1": "190 passed, 1 skipped, 15 warnings in 113.59s (0:01:53)",
+  "boot2": "190 passed, 1 skipped, 15 warnings in 114.99s (0:01:54)",
+  "new_tests": [
+   "test_unseeded_request_seeds_follow_configured_seed_across_tp_ranks",
+   "test_sampler_hands_configured_seed_to_sampling_states"
+  ],
+  "before_seed_change": {
+   "boot1": "188 passed, 1 skipped, 14 warnings in 114.26s (0:01:54)",
+   "boot2": "188 passed, 1 skipped, 14 warnings in 114.42s (0:01:54)"
+  },
+  "verdict": "pass"
+ },
+ "tp2_finding": {
+  "conclusion": "a screen-harness bug, not #980's and not the shared-GPU layout. The serving worker cannot hit it, at TP2, TP3 or TP4",
+  "mechanism": "rejection_sample takes draft_sampled as [num_logits] and reads request r's draft i at row cu_num_logits[r] + i + 1 (rejection_sampler_utils.py: tl.load(draft_sampled_ptr + logit_idx + 1)); the worker passes input_ids[logits_indices] (InputBatch.logits_rows), which is [num_logits]. The screen passes draft_tokens.view(-1): num_reqs x num_steps = 40 entries where 48 are read, so the last request reads 8 int64 past the tensor, into its 512-byte allocator block's stale bytes (and every request's drafts are misaligned). The kernel clamps only negative ids (tl.maximum(0, ...)); a stale value at or above the vocab size indexes target and draft logits out of bounds. Whether it faults depends on what the allocator block held, which varies with world size, vocab size (4096 x world) and mode history: hence TP2's candidate_sampled_unseeded, and not TP3/TP4",
+  "reproduced": {
+   "unmodified_screen_tp2_on_sp2": {
+    "screen-tp2-c48-orig": {
+     "exit": 134,
+     "modes": {
+      "control_unseeded_global_rng": {
+       "broadcast_calls": 0,
+       "seeds_equal_across_ranks": false,
+       "refits_completed": 10,
+       "mismatch_draft_steps": 1000,
+       "mismatch_conf_steps": 1000,
+       "mismatch_budget_steps": 274,
+       "mismatch_capacities_steps": 0,
+       "mismatch_dead_cut_steps": 0,
+       "mismatch_sampled_steps": 1000,
+       "mismatch_estimator_steps": 901,
+       "max_conf_abs_diff": 0.76689875,
+       "max_slope_abs_diff": 0.98333633,
+       "max_intercept_abs_diff": 1.0518384
+      },
+      "candidate_greedy": {
+       "broadcast_calls": 0,
+       "seeds_equal_across_ranks": true,
+       "refits_completed": 10,
+       "mismatch_draft_steps": 0,
+       "mismatch_conf_steps": 0,
+       "mismatch_budget_steps": 0,
+       "mismatch_capacities_steps": 0,
+       "mismatch_dead_cut_steps": 0,
+       "mismatch_sampled_steps": 0,
+       "mismatch_estimator_steps": 0,
+       "max_conf_abs_diff": 0.0,
+       "max_slope_abs_diff": 0.0,
+       "max_intercept_abs_diff": 0.0
+      }
+     },
+     "crash": {
+      "illegal_memory_access": true,
+      "in": null
+     }
+    },
+    "screen-tp2-r1-orig": {
+     "exit": 134,
+     "modes": {
+      "control_unseeded_global_rng": {
+       "broadcast_calls": 0,
+       "seeds_equal_across_ranks": false,
+       "refits_completed": 10,
+       "mismatch_draft_steps": 1000,
+       "mismatch_conf_steps": 1000,
+       "mismatch_budget_steps": 274,
+       "mismatch_capacities_steps": 0,
+       "mismatch_dead_cut_steps": 0,
+       "mismatch_sampled_steps": 1000,
+       "mismatch_estimator_steps": 901,
+       "max_conf_abs_diff": 0.76689875,
+       "max_slope_abs_diff": 0.98333633,
+       "max_intercept_abs_diff": 1.0518384
+      },
+      "candidate_greedy": {
+       "broadcast_calls": 0,
+       "seeds_equal_across_ranks": true,
+       "refits_completed": 10,
+       "mismatch_draft_steps": 0,
+       "mismatch_conf_steps": 0,
+       "mismatch_budget_steps": 0,
+       "mismatch_capacities_steps": 0,
+       "mismatch_dead_cut_steps": 0,
+       "mismatch_sampled_steps": 0,
+       "mismatch_estimator_steps": 0,
+       "max_conf_abs_diff": 0.0,
+       "max_slope_abs_diff": 0.0,
+       "max_intercept_abs_diff": 0.0
+      }
+     },
+     "crash": {
+      "illegal_memory_access": true,
+      "in": null
+     }
+    }
+   },
+   "deterministic_repro_no_tp": {
+    "1107_image_no_980_code": [
+     {
+      "mode": "rows",
+      "exit": 0,
+      "stdout": [
+       "{\"mode\": \"rows\", \"draft_sampled_numel\": 48, \"num_logits\": 48, \"num_sampled\": [4, 1, 2, 4, 6, 1, 3, 1], \"max_sampled_token\": 7517}"
+      ],
+      "errors": []
+     },
+     {
+      "mode": "short_zero",
+      "exit": 0,
+      "stdout": [
+       "{\"mode\": \"short_zero\", \"draft_sampled_numel\": 40, \"num_logits\": 48, \"num_sampled\": [1, 3, 6, 3, 6, 4, 6, 1], \"max_sampled_token\": 7927}"
+      ],
+      "errors": []
+     },
+     {
+      "mode": "short_stale",
+      "exit": 1,
+      "stdout": [],
+      "errors": [
+       "RuntimeError: Triton Error [CUDA]: an illegal memory access was encountered"
+      ]
+     }
+    ],
+    "candidate48_image": [
+     {
+      "mode": "rows",
+      "exit": 0,
+      "stdout": [
+       "{\"mode\": \"rows\", \"draft_sampled_numel\": 48, \"num_logits\": 48, \"num_sampled\": [4, 1, 2, 4, 6, 1, 3, 1], \"max_sampled_token\": 7517}"
+      ],
+      "errors": []
+     },
+     {
+      "mode": "short_zero",
+      "exit": 0,
+      "stdout": [
+       "{\"mode\": \"short_zero\", \"draft_sampled_numel\": 40, \"num_logits\": 48, \"num_sampled\": [1, 3, 6, 3, 6, 4, 6, 1], \"max_sampled_token\": 7927}"
+      ],
+      "errors": []
+     },
+     {
+      "mode": "short_stale",
+      "exit": 1,
+      "stdout": [],
+      "errors": [
+       "RuntimeError: Triton Error [CUDA]: an illegal memory access was encountered"
+      ]
+     }
+    ],
+    "reading": "the screen's TP2 shapes in one process, rejection_sample only: [num_logits] layout runs; the 40-entry argument runs while the 8 entries past it are 0, and raises 'an illegal memory access' when they hold an out-of-vocab value, on the 1107 image too"
+   }
+  },
+  "harness_fixed": {
+   "rowsfix": "draft_sampled laid out as [num_logits] with each request's drafts at rows 1..num_steps (scripts/screen-rowsfix.diff)",
+   "rowsfix_runs": {
+    "screen-tp2-c48-rowsfix": {
+     "exit": 1,
+     "modes": {
+      "control_unseeded_global_rng": {
+       "broadcast_calls": 0,
+       "seeds_equal_across_ranks": false,
+       "refits_completed": 10,
+       "mismatch_draft_steps": 1000,
+       "mismatch_conf_steps": 1000,
+       "mismatch_budget_steps": 128,
+       "mismatch_capacities_steps": 0,
+       "mismatch_dead_cut_steps": 0,
+       "mismatch_sampled_steps": 1000,
+       "mismatch_estimator_steps": 901,
+       "max_conf_abs_diff": 0.29258701,
+       "max_slope_abs_diff": 0.15581679,
+       "max_intercept_abs_diff": 1.64974451
+      },
+      "candidate_greedy": {
+       "broadcast_calls": 0,
+       "seeds_equal_across_ranks": true,
+       "refits_completed": 10,
+       "mismatch_draft_steps": 0,
+       "mismatch_conf_steps": 0,
+       "mismatch_budget_steps": 0,
+       "mismatch_capacities_steps": 0,
+       "mismatch_dead_cut_steps": 0,
+       "mismatch_sampled_steps": 0,
+       "mismatch_estimator_steps": 0,
+       "max_conf_abs_diff": 0.0,
+       "max_slope_abs_diff": 0.0,
+       "max_intercept_abs_diff": 0.0
+      },
+      "candidate_sampled_unseeded": {
+       "broadcast_calls": 0,
+       "seeds_equal_across_ranks": true,
+       "refits_completed": 10,
+       "mismatch_draft_steps": 0,
+       "mismatch_conf_steps": 0,
+       "mismatch_budget_steps": 0,
+       "mismatch_capacities_steps": 0,
+       "mismatch_dead_cut_steps": 0,
+       "mismatch_sampled_steps": 7,
+       "mismatch_estimator_steps": 0,
+       "max_conf_abs_diff": 0.0,
+       "max_slope_abs_diff": 0.0,
+       "max_intercept_abs_diff": 0.0
+      }
+     },
+     "crash": {
+      "illegal_memory_access": false,
+      "in": null
+     }
+    },
+    "screen-tp2-r1-rowsfix": {
+     "exit": 1,
+     "modes": {
+      "control_unseeded_global_rng": {
+       "broadcast_calls": 0,
+       "seeds_equal_across_ranks": false,
+       "refits_completed": 10,
+       "mismatch_draft_steps": 1000,
+       "mismatch_conf_steps": 1000,
+       "mismatch_budget_steps": 128,
+       "mismatch_capacities_steps": 0,
+       "mismatch_dead_cut_steps": 0,
+       "mismatch_sampled_steps": 1000,
+       "mismatch_estimator_steps": 901,
+       "max_conf_abs_diff": 0.29258701,
+       "max_slope_abs_diff": 0.15581679,
+       "max_intercept_abs_diff": 1.64974451
+      },
+      "candidate_greedy": {
+       "broadcast_calls": 0,
+       "seeds_equal_across_ranks": true,
+       "refits_completed": 10,
+       "mismatch_draft_steps": 0,
+       "mismatch_conf_steps": 0,
+       "mismatch_budget_steps": 0,
+       "mismatch_capacities_steps": 0,
+       "mismatch_dead_cut_steps": 0,
+       "mismatch_sampled_steps": 0,
+       "mismatch_estimator_steps": 0,
+       "max_conf_abs_diff": 0.0,
+       "max_slope_abs_diff": 0.0,
+       "max_intercept_abs_diff": 0.0
+      },
+      "candidate_sampled_unseeded": {
+       "broadcast_calls": 0,
+       "seeds_equal_across_ranks": true,
+       "refits_completed": 10,
+       "mismatch_draft_steps": 0,
+       "mismatch_conf_steps": 0,
+       "mismatch_budget_steps": 0,
+       "mismatch_capacities_steps": 0,
+       "mismatch_dead_cut_steps": 0,
+       "mismatch_sampled_steps": 7,
+       "mismatch_estimator_steps": 0,
+       "max_conf_abs_diff": 0.0,
+       "max_slope_abs_diff": 0.0,
+       "max_intercept_abs_diff": 0.0
+      }
+     },
+     "crash": {
+      "illegal_memory_access": false,
+      "in": null
+     }
+    },
+    "screen-tp3-r1-rowsfix": {
+     "exit": 0,
+     "modes": {
+      "control_unseeded_global_rng": {
+       "broadcast_calls": 0,
+       "seeds_equal_across_ranks": false,
+       "refits_completed": 10,
+       "mismatch_draft_steps": 1000,
+       "mismatch_conf_steps": 1000,
+       "mismatch_budget_steps": 264,
+       "mismatch_capacities_steps": 0,
+       "mismatch_dead_cut_steps": 0,
+       "mismatch_sampled_steps": 1000,
+       "mismatch_estimator_steps": 901,
+       "max_conf_abs_diff": 0.45357957,
+       "max_slope_abs_diff": 0.62770355,
+       "max_intercept_abs_diff": 1.12419176
+      },
+      "candidate_greedy": {
+       "broadcast_calls": 0,
+       "seeds_equal_across_ranks": true,
+       "refits_completed": 10,
+       "mismatch_draft_steps": 0,
+       "mismatch_conf_steps": 0,
+       "mismatch_budget_steps": 0,
+       "mismatch_capacities_steps": 0,
+       "mismatch_dead_cut_steps": 0,
+       "mismatch_sampled_steps": 0,
+       "mismatch_estimator_steps": 0,
+       "max_conf_abs_diff": 0.0,
+       "max_slope_abs_diff": 0.0,
+       "max_intercept_abs_diff": 0.0
+      },
+      "candidate_sampled_unseeded": {
+       "broadcast_calls": 0,
+       "seeds_equal_across_ranks": true,
+       "refits_completed": 10,
+       "mismatch_draft_steps": 0,
+       "mismatch_conf_steps": 0,
+       "mismatch_budget_steps": 0,
+       "mismatch_capacities_steps": 0,
+       "mismatch_dead_cut_steps": 0,
+       "mismatch_sampled_steps": 0,
+       "mismatch_estimator_steps": 0,
+       "max_conf_abs_diff": 0.0,
+       "max_slope_abs_diff": 0.0,
+       "max_intercept_abs_diff": 0.0
+      },
+      "candidate_dflash_estimator": {
+       "broadcast_calls": 0,
+       "seeds_equal_across_ranks": true,
+       "refits_completed": 10,
+       "mismatch_draft_steps": 0,
+       "mismatch_conf_steps": 0,
+       "mismatch_budget_steps": 0,
+       "mismatch_capacities_steps": 0,
+       "mismatch_dead_cut_steps": 0,
+       "mismatch_sampled_steps": 0,
+       "mismatch_estimator_steps": 0,
+       "max_conf_abs_diff": 0.0,
+       "max_slope_abs_diff": 0.0,
+       "max_intercept_abs_diff": 0.0
+      }
+     },
+     "crash": {
+      "illegal_memory_access": false,
+      "in": null
+     }
+    },
+    "screen-tp4-r1-rowsfix": {
+     "exit": 1,
+     "modes": {
+      "control_unseeded_global_rng": {
+       "broadcast_calls": 0,
+       "seeds_equal_across_ranks": false,
+       "refits_completed": 10,
+       "mismatch_draft_steps": 1000,
+       "mismatch_conf_steps": 1000,
+       "mismatch_budget_steps": 240,
+       "mismatch_capacities_steps": 0,
+       "mismatch_dead_cut_steps": 0,
+       "mismatch_sampled_steps": 1000,
+       "mismatch_estimator_steps": 901,
+       "max_conf_abs_diff": 0.44834155,
+       "max_slope_abs_diff": 0.38667405,
+       "max_intercept_abs_diff": 1.89094448
+      },
+      "candidate_greedy": {
+       "broadcast_calls": 0,
+       "seeds_equal_across_ranks": true,
+       "refits_completed": 10,
+       "mismatch_draft_steps": 0,
+       "mismatch_conf_steps": 0,
+       "mismatch_budget_steps": 0,
+       "mismatch_capacities_steps": 0,
+       "mismatch_dead_cut_steps": 0,
+       "mismatch_sampled_steps": 0,
+       "mismatch_estimator_steps": 0,
+       "max_conf_abs_diff": 0.0,
+       "max_slope_abs_diff": 0.0,
+       "max_intercept_abs_diff": 0.0
+      },
+      "candidate_sampled_unseeded": {
+       "broadcast_calls": 0,
+       "seeds_equal_across_ranks": true,
+       "refits_completed": 10,
+       "mismatch_draft_steps": 0,
+       "mismatch_conf_steps": 0,
+       "mismatch_budget_steps": 0,
+       "mismatch_capacities_steps": 0,
+       "mismatch_dead_cut_steps": 0,
+       "mismatch_sampled_steps": 2,
+       "mismatch_estimator_steps": 0,
+       "max_conf_abs_diff": 0.0,
+       "max_slope_abs_diff": 0.0,
+       "max_intercept_abs_diff": 0.0
+      }
+     },
+     "crash": {
+      "illegal_memory_access": false,
+      "in": null
+     }
+    }
+   },
+   "rowsfix_reading": "no crash at TP2, TP3 or TP4; but the sampled history then differs on 7 (TP2) and 2 (TP4) steps while drafts, confidences, budgets, num_sampled and the estimator all match: rejection_sample returns sampled = new_empty(num_reqs, num_steps + 1) and writes row r's first num_sampled[r] entries only, and the screen records the whole row, uninitialized tail included",
+   "valid_entries": "rowsfix + compare entries < num_sampled only, raw counts kept as unchecked_sampled_raw_steps (scripts/screen-rowsfix-valid.diff; scripts/screen-rowsfix-valid-vs-pr.diff is the whole change against the PR's screen)",
+   "valid_runs": {
+    "screen-tp2-r1-valid": {
+     "exit": 0,
+     "modes": {
+      "control_unseeded_global_rng": {
+       "broadcast_calls": 0,
+       "seeds_equal_across_ranks": false,
+       "refits_completed": 10,
+       "mismatch_draft_steps": 1000,
+       "mismatch_conf_steps": 1000,
+       "mismatch_budget_steps": 128,
+       "mismatch_capacities_steps": 0,
+       "mismatch_dead_cut_steps": 0,
+       "mismatch_sampled_steps": 1000,
+       "unchecked_sampled_raw_steps": 1000,
+       "mismatch_estimator_steps": 901,
+       "max_conf_abs_diff": 0.29258701,
+       "max_slope_abs_diff": 0.15581679,
+       "max_intercept_abs_diff": 1.64974451
+      },
+      "candidate_greedy": {
+       "broadcast_calls": 0,
+       "seeds_equal_across_ranks": true,
+       "refits_completed": 10,
+       "mismatch_draft_steps": 0,
+       "mismatch_conf_steps": 0,
+       "mismatch_budget_steps": 0,
+       "mismatch_capacities_steps": 0,
+       "mismatch_dead_cut_steps": 0,
+       "mismatch_sampled_steps": 0,
+       "unchecked_sampled_raw_steps": 0,
+       "mismatch_estimator_steps": 0,
+       "max_conf_abs_diff": 0.0,
+       "max_slope_abs_diff": 0.0,
+       "max_intercept_abs_diff": 0.0
+      },
+      "candidate_sampled_unseeded": {
+       "broadcast_calls": 0,
+       "seeds_equal_across_ranks": true,
+       "refits_completed": 10,
+       "mismatch_draft_steps": 0,
+       "mismatch_conf_steps": 0,
+       "mismatch_budget_steps": 0,
+       "mismatch_capacities_steps": 0,
+       "mismatch_dead_cut_steps": 0,
+       "mismatch_sampled_steps": 0,
+       "unchecked_sampled_raw_steps": 0,
+       "mismatch_estimator_steps": 0,
+       "max_conf_abs_diff": 0.0,
+       "max_slope_abs_diff": 0.0,
+       "max_intercept_abs_diff": 0.0
+      },
+      "candidate_dflash_estimator": {
+       "broadcast_calls": 0,
+       "seeds_equal_across_ranks": true,
+       "refits_completed": 10,
+       "mismatch_draft_steps": 0,
+       "mismatch_conf_steps": 0,
+       "mismatch_budget_steps": 0,
+       "mismatch_capacities_steps": 0,
+       "mismatch_dead_cut_steps": 0,
+       "mismatch_sampled_steps": 0,
+       "unchecked_sampled_raw_steps": 0,
+       "mismatch_estimator_steps": 0,
+       "max_conf_abs_diff": 0.0,
+       "max_slope_abs_diff": 0.0,
+       "max_intercept_abs_diff": 0.0
+      }
+     },
+     "crash": {
+      "illegal_memory_access": false,
+      "in": null
+     }
+    },
+    "screen-tp2-r1-valid-again": {
+     "exit": 0,
+     "modes": {
+      "control_unseeded_global_rng": {
+       "broadcast_calls": 0,
+       "seeds_equal_across_ranks": false,
+       "refits_completed": 10,
+       "mismatch_draft_steps": 1000,
+       "mismatch_conf_steps": 1000,
+       "mismatch_budget_steps": 128,
+       "mismatch_capacities_steps": 0,
+       "mismatch_dead_cut_steps": 0,
+       "mismatch_sampled_steps": 1000,
+       "unchecked_sampled_raw_steps": 1000,
+       "mismatch_estimator_steps": 901,
+       "max_conf_abs_diff": 0.29258701,
+       "max_slope_abs_diff": 0.15581679,
+       "max_intercept_abs_diff": 1.64974451
+      },
+      "candidate_greedy": {
+       "broadcast_calls": 0,
+       "seeds_equal_across_ranks": true,
+       "refits_completed": 10,
+       "mismatch_draft_steps": 0,
+       "mismatch_conf_steps": 0,
+       "mismatch_budget_steps": 0,
+       "mismatch_capacities_steps": 0,
+       "mismatch_dead_cut_steps": 0,
+       "mismatch_sampled_steps": 0,
+       "unchecked_sampled_raw_steps": 0,
+       "mismatch_estimator_steps": 0,
+       "max_conf_abs_diff": 0.0,
+       "max_slope_abs_diff": 0.0,
+       "max_intercept_abs_diff": 0.0
+      },
+      "candidate_sampled_unseeded": {
+       "broadcast_calls": 0,
+       "seeds_equal_across_ranks": true,
+       "refits_completed": 10,
+       "mismatch_draft_steps": 0,
+       "mismatch_conf_steps": 0,
+       "mismatch_budget_steps": 0,
+       "mismatch_capacities_steps": 0,
+       "mismatch_dead_cut_steps": 0,
+       "mismatch_sampled_steps": 0,
+       "unchecked_sampled_raw_steps": 0,
+       "mismatch_estimator_steps": 0,
+       "max_conf_abs_diff": 0.0,
+       "max_slope_abs_diff": 0.0,
+       "max_intercept_abs_diff": 0.0
+      },
+      "candidate_dflash_estimator": {
+       "broadcast_calls": 0,
+       "seeds_equal_across_ranks": true,
+       "refits_completed": 10,
+       "mismatch_draft_steps": 0,
+       "mismatch_conf_steps": 0,
+       "mismatch_budget_steps": 0,
+       "mismatch_capacities_steps": 0,
+       "mismatch_dead_cut_steps": 0,
+       "mismatch_sampled_steps": 0,
+       "unchecked_sampled_raw_steps": 0,
+       "mismatch_estimator_steps": 0,
+       "max_conf_abs_diff": 0.0,
+       "max_slope_abs_diff": 0.0,
+       "max_intercept_abs_diff": 0.0
+      }
+     },
+     "crash": {
+      "illegal_memory_access": false,
+      "in": null
+     }
+    },
+    "screen-tp2-c48-valid": {
+     "exit": 0,
+     "modes": {
+      "control_unseeded_global_rng": {
+       "broadcast_calls": 0,
+       "seeds_equal_across_ranks": false,
+       "refits_completed": 10,
+       "mismatch_draft_steps": 1000,
+       "mismatch_conf_steps": 1000,
+       "mismatch_budget_steps": 128,
+       "mismatch_capacities_steps": 0,
+       "mismatch_dead_cut_steps": 0,
+       "mismatch_sampled_steps": 1000,
+       "unchecked_sampled_raw_steps": 1000,
+       "mismatch_estimator_steps": 901,
+       "max_conf_abs_diff": 0.29258701,
+       "max_slope_abs_diff": 0.15581679,
+       "max_intercept_abs_diff": 1.64974451
+      },
+      "candidate_greedy": {
+       "broadcast_calls": 0,
+       "seeds_equal_across_ranks": true,
+       "refits_completed": 10,
+       "mismatch_draft_steps": 0,
+       "mismatch_conf_steps": 0,
+       "mismatch_budget_steps": 0,
+       "mismatch_capacities_steps": 0,
+       "mismatch_dead_cut_steps": 0,
+       "mismatch_sampled_steps": 0,
+       "unchecked_sampled_raw_steps": 0,
+       "mismatch_estimator_steps": 0,
+       "max_conf_abs_diff": 0.0,
+       "max_slope_abs_diff": 0.0,
+       "max_intercept_abs_diff": 0.0
+      },
+      "candidate_sampled_unseeded": {
+       "broadcast_calls": 0,
+       "seeds_equal_across_ranks": true,
+       "refits_completed": 10,
+       "mismatch_draft_steps": 0,
+       "mismatch_conf_steps": 0,
+       "mismatch_budget_steps": 0,
+       "mismatch_capacities_steps": 0,
+       "mismatch_dead_cut_steps": 0,
+       "mismatch_sampled_steps": 0,
+       "unchecked_sampled_raw_steps": 0,
+       "mismatch_estimator_steps": 0,
+       "max_conf_abs_diff": 0.0,
+       "max_slope_abs_diff": 0.0,
+       "max_intercept_abs_diff": 0.0
+      },
+      "candidate_dflash_estimator": {
+       "broadcast_calls": 0,
+       "seeds_equal_across_ranks": true,
+       "refits_completed": 10,
+       "mismatch_draft_steps": 0,
+       "mismatch_conf_steps": 0,
+       "mismatch_budget_steps": 0,
+       "mismatch_capacities_steps": 0,
+       "mismatch_dead_cut_steps": 0,
+       "mismatch_sampled_steps": 0,
+       "unchecked_sampled_raw_steps": 0,
+       "mismatch_estimator_steps": 0,
+       "max_conf_abs_diff": 0.0,
+       "max_slope_abs_diff": 0.0,
+       "max_intercept_abs_diff": 0.0
+      }
+     },
+     "crash": {
+      "illegal_memory_access": false,
+      "in": null
+     }
+    },
+    "screen-tp3-r1-valid": {
+     "exit": 0,
+     "modes": {
+      "control_unseeded_global_rng": {
+       "broadcast_calls": 0,
+       "seeds_equal_across_ranks": false,
+       "refits_completed": 10,
+       "mismatch_draft_steps": 1000,
+       "mismatch_conf_steps": 1000,
+       "mismatch_budget_steps": 264,
+       "mismatch_capacities_steps": 0,
+       "mismatch_dead_cut_steps": 0,
+       "mismatch_sampled_steps": 1000,
+       "unchecked_sampled_raw_steps": 1000,
+       "mismatch_estimator_steps": 901,
+       "max_conf_abs_diff": 0.45357957,
+       "max_slope_abs_diff": 0.62770355,
+       "max_intercept_abs_diff": 1.12419176
+      },
+      "candidate_greedy": {
+       "broadcast_calls": 0,
+       "seeds_equal_across_ranks": true,
+       "refits_completed": 10,
+       "mismatch_draft_steps": 0,
+       "mismatch_conf_steps": 0,
+       "mismatch_budget_steps": 0,
+       "mismatch_capacities_steps": 0,
+       "mismatch_dead_cut_steps": 0,
+       "mismatch_sampled_steps": 0,
+       "unchecked_sampled_raw_steps": 0,
+       "mismatch_estimator_steps": 0,
+       "max_conf_abs_diff": 0.0,
+       "max_slope_abs_diff": 0.0,
+       "max_intercept_abs_diff": 0.0
+      },
+      "candidate_sampled_unseeded": {
+       "broadcast_calls": 0,
+       "seeds_equal_across_ranks": true,
+       "refits_completed": 10,
+       "mismatch_draft_steps": 0,
+       "mismatch_conf_steps": 0,
+       "mismatch_budget_steps": 0,
+       "mismatch_capacities_steps": 0,
+       "mismatch_dead_cut_steps": 0,
+       "mismatch_sampled_steps": 0,
+       "unchecked_sampled_raw_steps": 0,
+       "mismatch_estimator_steps": 0,
+       "max_conf_abs_diff": 0.0,
+       "max_slope_abs_diff": 0.0,
+       "max_intercept_abs_diff": 0.0
+      },
+      "candidate_dflash_estimator": {
+       "broadcast_calls": 0,
+       "seeds_equal_across_ranks": true,
+       "refits_completed": 10,
+       "mismatch_draft_steps": 0,
+       "mismatch_conf_steps": 0,
+       "mismatch_budget_steps": 0,
+       "mismatch_capacities_steps": 0,
+       "mismatch_dead_cut_steps": 0,
+       "mismatch_sampled_steps": 0,
+       "unchecked_sampled_raw_steps": 0,
+       "mismatch_estimator_steps": 0,
+       "max_conf_abs_diff": 0.0,
+       "max_slope_abs_diff": 0.0,
+       "max_intercept_abs_diff": 0.0
+      }
+     },
+     "crash": {
+      "illegal_memory_access": false,
+      "in": null
+     }
+    },
+    "screen-tp4-r1-valid": {
+     "exit": 0,
+     "modes": {
+      "control_unseeded_global_rng": {
+       "broadcast_calls": 0,
+       "seeds_equal_across_ranks": false,
+       "refits_completed": 10,
+       "mismatch_draft_steps": 1000,
+       "mismatch_conf_steps": 1000,
+       "mismatch_budget_steps": 240,
+       "mismatch_capacities_steps": 0,
+       "mismatch_dead_cut_steps": 0,
+       "mismatch_sampled_steps": 1000,
+       "unchecked_sampled_raw_steps": 1000,
+       "mismatch_estimator_steps": 901,
+       "max_conf_abs_diff": 0.44834155,
+       "max_slope_abs_diff": 0.38667405,
+       "max_intercept_abs_diff": 1.89094448
+      },
+      "candidate_greedy": {
+       "broadcast_calls": 0,
+       "seeds_equal_across_ranks": true,
+       "refits_completed": 10,
+       "mismatch_draft_steps": 0,
+       "mismatch_conf_steps": 0,
+       "mismatch_budget_steps": 0,
+       "mismatch_capacities_steps": 0,
+       "mismatch_dead_cut_steps": 0,
+       "mismatch_sampled_steps": 0,
+       "unchecked_sampled_raw_steps": 0,
+       "mismatch_estimator_steps": 0,
+       "max_conf_abs_diff": 0.0,
+       "max_slope_abs_diff": 0.0,
+       "max_intercept_abs_diff": 0.0
+      },
+      "candidate_sampled_unseeded": {
+       "broadcast_calls": 0,
+       "seeds_equal_across_ranks": true,
+       "refits_completed": 10,
+       "mismatch_draft_steps": 0,
+       "mismatch_conf_steps": 0,
+       "mismatch_budget_steps": 0,
+       "mismatch_capacities_steps": 0,
+       "mismatch_dead_cut_steps": 0,
+       "mismatch_sampled_steps": 0,
+       "unchecked_sampled_raw_steps": 2,
+       "mismatch_estimator_steps": 0,
+       "max_conf_abs_diff": 0.0,
+       "max_slope_abs_diff": 0.0,
+       "max_intercept_abs_diff": 0.0
+      },
+      "candidate_dflash_estimator": {
+       "broadcast_calls": 0,
+       "seeds_equal_across_ranks": true,
+       "refits_completed": 10,
+       "mismatch_draft_steps": 0,
+       "mismatch_conf_steps": 0,
+       "mismatch_budget_steps": 0,
+       "mismatch_capacities_steps": 0,
+       "mismatch_dead_cut_steps": 0,
+       "mismatch_sampled_steps": 0,
+       "unchecked_sampled_raw_steps": 6,
+       "mismatch_estimator_steps": 0,
+       "max_conf_abs_diff": 0.0,
+       "max_slope_abs_diff": 0.0,
+       "max_intercept_abs_diff": 0.0
+      }
+     },
+     "crash": {
+      "illegal_memory_access": false,
+      "in": null
+     }
+    }
+   },
+   "valid_reading": "0/1000 in every history for every candidate mode at TP2 (twice with r1, once with candidate-48's files), TP3 and TP4; only the uninitialized tail differs (0-6 steps), which the worker never reads"
+  },
+  "980_sampling_path": "#980's sampling changes feed rejection_sample only seed values and the choice of the TileLang top-k/top-p path; seeds and temperatures are indexed by request slot (in bounds), so they cannot produce an out-of-bounds token id"
+ },
+ "observations_outside_the_mark": [
+  "the PR's predict_from_stats saving (-11.4 us per draft step) is against predict()'s rescan; against 1107's DFlash inline launch it is +0.4-0.5 us of host time (eager only)",
+  "the screen's own pass criteria rest on the harness bug's luck at TP3/TP4 (misaligned drafts, 8 out-of-bounds reads per step); the harness-fixed screen in scripts/ is the sound one for future runs"
+ ],
+ "not_done": [
+  "no 4-node grid run (the coordinator's confirmation, sp1..sp4)",
+  "the screen ran with all ranks on one GB10, not across nodes; its latency records are not comparable to the PR's",
+  "the warmup-token mechanism is supported by code reading and the sp2 precondition, not by a grid measurement"
+ ],
+ "receipts": {
+  "commands": "commands.txt (setup and every run with UTC times and exit codes)",
+  "raw": "raw/ (each run's output; stepcost-*.json, stepcost-ab-*.json, screen jsonl, trace-*.json, executed-changed-lines-*.json, stepcost-summary.json)",
+  "numbers": "numbers.json (assemble_numbers.py over raw/)",
+  "scripts": "scripts/",
+  "superseded": "superseded/r1-noseed/: the first r1 (without the seed change): patch, overlay, overlay-tests"
+ }
+}

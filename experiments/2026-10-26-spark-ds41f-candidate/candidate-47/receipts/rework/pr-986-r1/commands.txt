@@ -1,0 +1,55 @@
+# PR #986 rework, round 1 (candidate-47): why #986's modeled gains do not reach serving.
+# Verdict: no-defensible-correction (result.json). No patch.
+# Hosts: dgx1 read-only (files copied, no GPU work, no service touched); sp3 (spark-0011) for a
+# CPU-only replay inside the spark-ds41f:1107 image, under flock /tmp/spark-lab-gpu.lock, with
+# `docker ps` empty and ~/spark-hold.json absent checked inside the lock before each run.
+# No build, no cluster start/stop, no commit, no push. Laptop: file copies and small pure-Python tables.
+# W = laptop scratch (rw986/), R = this receipts directory, L = sp3:~/spark-lab/agents/candidate-47-rework-986
+
+## 1. Inputs
+# The patch as tested in candidate-47 (sha256 e5ff5250..., = receipts/selection.json) and 1107's file:
+#   candidate-47/vllm/0762-perf-spec-decode-adaptive-verify-graph-context-cost.patch
+#   candidate-47/no986/overlay/vllm/v1/worker/gpu/spec_decode/adaptive_verification.py   (av_1107.py, sha256 4560e7fe...)
+# #986's file: 1107's file with the patch applied (vllm/ part only)                       (av_986.py, sha256 bf802343...)
+git init a && cp <1107 file> a/vllm/v1/worker/gpu/spec_decode/ && git -C a apply --include='vllm/*' 0762-...patch
+# #986's experiment (screen, profiles, constants), private clone:
+git clone --shared --no-checkout ~/projects/spark-ds41f clone
+git -C clone fetch https://github.com/christopherowen/spark-ds41f.git pull/986/head:pr986     # c00819eeb06b
+git -C clone show pr986:experiments/2026-11-08-adaptive-verify-graph-context-cost/{README.md,screen_graph_context_cost.py,receipts/*}
+# Served suites, read-only from dgx1 (model.json.gz left behind):
+ssh dgx1 'cd ~/projects/spark-ds41f/results/private/suites && tar cf - --exclude=model.json.gz \
+  candidate-47-release-tp4 candidate-47-no986-release-tp4 \
+  candidate-47-release-tp4-single-stream candidate-47-no986-release-tp4-single-stream' | tar xf - -C W/data
+
+## 2. Rows a step, with and without #986 (servebench's own accounting)
+python3 -c 'suite.format_accounting(...)' over the 8 arm directories           > R/rows-a-step.txt
+REPO=~/projects/spark-ds41f python3 W/scripts/rows_compare.py W/data R/rows-a-step-compare.json               # means, deltas, boot spread
+python3 -m servebench compare <no986> <candidate-47>                              > R/compare-no986-to-c47.txt
+python3 -m servebench compare <no986-again> <candidate-47-again>                  > R/compare-no986again-to-c47again.txt
+python3 -m servebench compare <no986 single-stream> <candidate-47 single-stream>  > R/compare-ss-no986-to-c47.txt
+
+## 3. Serving step time against rows and tokens, per 30 s batch (10 batches x 4 boots a step)
+python3 -I W/scripts/batch_regress.py W/data R/batch-regression.json
+REPO=~/projects/spark-ds41f python3 W/scripts/served_targets.py W/data R/batch-regression.json R/served_targets.json
+
+## 4. Where #986's modeled savings come from (its own boot-1/2 profiles and latency model)
+python3 W/scripts/decompose_screen.py pr986-profile-boot1.json pr986-profile-boot2.json R/pr986-screen-decomposition.json
+
+## 5. Replay of the real budget modules (sp3, CPU only, spark-ds41f:1107 = sha256:3f32a962ce04...)
+scp replay_budget.py run_replay.sh av_1107.py av_986.py served_targets.json grid/*.grid.json L/in/; scp batch-regression.json L/in/out-batch-regress.json
+# in/run_replay.sh: flock 9 on /tmp/spark-lab-gpu.lock; refuse if ~/spark-hold.json exists or `docker ps -q` is non-empty;
+docker run --rm --gpus all --network none --cpus 6 --entrypoint python3 -v L:/w spark-ds41f:1107 \
+  /w/in/replay_budget.py --grid /w/in/grid/{candidate-47,candidate-47-again,candidate-47-no986,candidate-47-no986-again}.grid.json \
+  --served /w/in/served_targets.json --regress /w/in/out-batch-regress.json \
+  --modules /w/in/av_1107.py /w/in/av_986.py --steps 20000 --seed {0,1} --out /w/out/replay-seed{0,1}.json
+# (the GPU is visible only so the vLLM imports resolve; no kernel runs. Smoke runs at 2,000 steps
+#  found and fixed three replay bugs before these: the image's vLLM path needs no `python -I`; the
+#  module takes conditional confidences, not survival; servebench's coverage counts only request-steps
+#  that verified a draft. A one-component confidence model under-fit tokens a step (32.2 vs 34.3 at
+#  c16); the two-component model fits c16 to 2e-5.)
+scp L/out/replay-seed{0,1}.{json,log} R/
+
+## 6. Not run
+# No GPU step-cost profile: the tp4-ring engine grid of the same image, four boots, is the
+# step-time evidence (a one-GPU profile cannot see TP4 shapes or real-text expert routing).
+# No serving run: nothing to confirm (verdict no-defensible-correction).
