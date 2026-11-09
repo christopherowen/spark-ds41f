@@ -1,0 +1,830 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Christopher Owen <christopherowen@users.noreply.github.com>
+Date: Sun, 8 Nov 2026 23:29:19 +0000
+Subject: [PATCH 18/19] [Layout] Run the atomics and read-modify-writes of a
+ replicated loop once
+
+Upstream-base: tile-ai/tilelang@2123e412ce2217b324c50c4ec967213906456ac5
+Upstream-pr: https://github.com/tile-ai/tilelang/pull/3873
+
+Rationale: When a T.Parallel loop has fewer iterations than the CTA thread count and writes a register fragment (store_fragment_buffers non-empty), layout inference replicates the loop across thread groups so every replica populates its fragment copy. Any shared or global atomic or read-modify-write inside the same loop was previously executed by every replica, multiplying updates by the replication factor. Guard shared/global non-idempotent writes inside replicated loops to run on replica 0 only, and reject replicated loops where a fragment value depends on a shared/global buffer modified in the same barrier-free segment.
+
+Quality: Eliminates silent multi-replica atomic/RMW corruption in replicated T.Parallel loops while keeping all 33 existing spark-ds41f:1107 kernels byte-for-byte unchanged.
+
+Tests: testing/python/layout/test_tilelang_ReplicatedParallelWritesOnce.py across two GPU boots on SM121.
+
+Upstream-status: Backported from open upstream PR tile-ai/tilelang#3873 (fixes #3870).
+---
+ src/ascend/transform/layout_inference.cc      |  21 +-
+ src/op/parallel.cc                            | 410 +++++++++++++++++-
+ src/op/parallel.h                             |  17 +
+ .../layout_inference/layout_inference.cc      |  21 +-
+ .../test_tilelang_language_parallel.py        | 161 +++++++
+ 5 files changed, 621 insertions(+), 9 deletions(-)
+
+diff --git a/src/ascend/transform/layout_inference.cc b/src/ascend/transform/layout_inference.cc
+index 7985d929..2903dd90 100644
+--- a/src/ascend/transform/layout_inference.cc
++++ b/src/ascend/transform/layout_inference.cc
+@@ -135,6 +135,9 @@ struct LayoutInferenceResult {
+   Map<For, Fragment> for_map;
+   Map<For, PrimExpr> predicate_map;
+   Map<For, Bool> padding_guard_map;
++  Map<For, PrimExpr> replica_write_guard_map;
++  // Values of the variables bound by `Bind` statements.
++  Map<Var, PrimExpr> bindings;
+   // Parallel loops that live inside a PTO SIMD_VF block. Their for_map entry
+   // is a lane Fragment that must be written back under the PTO-specific
+   // annotation key instead of the SIMT parallel_loop_layout.
+@@ -693,6 +696,7 @@ public:
+     Map<For, Fragment> for_map;
+     Map<For, PrimExpr> predicate_map;
+     Map<For, Bool> padding_guard_map;
++    Map<For, PrimExpr> replica_write_guard_map;
+     std::unordered_set<const ForNode *> pto_simd_parallel_roots;
+     ICHECK(infer_list_.size() == thread_index_vec_.size())
+         << "infer_list_ and thread_index_vec_ size mismatch";
+@@ -719,6 +723,9 @@ public:
+         if (auto predicate = for_infer->GetPredicate(thread_index)) {
+           predicate_map.Set(for_infer->GetRoot(), predicate.value());
+         }
++        if (auto guard = for_infer->GetReplicaWriteGuard(thread_index)) {
++          replica_write_guard_map.Set(for_infer->GetRoot(), guard.value());
++        }
+       }
+     }
+ 
+@@ -734,7 +741,12 @@ public:
+       pto_simd_parallel_roots.insert(root.get());
+     }
+ 
+-    return {layout_map, for_map, predicate_map, padding_guard_map,
++    return {layout_map,
++            for_map,
++            predicate_map,
++            padding_guard_map,
++            replica_write_guard_map,
++            bind_var_to_expr_,
+             pto_simd_parallel_roots};
+   }
+ 
+@@ -1916,6 +1928,13 @@ private:
+                                result_.padding_guard_map[root]);
+     }
+ 
++    if (result_.replica_write_guard_map.count(root)) {
++      for_ptr->body = GuardReplicaWrites(
++          for_ptr->body,
++          analyzer_->Simplify(result_.replica_write_guard_map[root]),
++          result_.bindings);
++    }
++
+     // Store the predicate as an annotation if it exists and is not trivially
+     // true
+     if (result_.predicate_map.count(root)) {
+diff --git a/src/op/parallel.cc b/src/op/parallel.cc
+index b747bc87..cdee7819 100644
+--- a/src/op/parallel.cc
++++ b/src/op/parallel.cc
+@@ -10,9 +10,14 @@
+ #include <tvm/runtime/logging.h>
+ 
+ #include <algorithm>
++#include <map>
++#include <set>
+ #include <tvm/tirx/analysis.h>
+ #include <tvm/tirx/op.h>
++#include <tvm/tirx/stmt_functor.h>
++#include <unordered_map>
+ #include <unordered_set>
++#include <vector>
+ 
+ #include "../layout/layout.h"
+ #include "../layout/utils.h"
+@@ -23,6 +28,7 @@
+ #include "builtin.h"
+ #include "reducer.h"
+ #include "span_utils.h"
++#include "tir/transforms/ir_utils.h"
+ #include "utils.h"
+ 
+ namespace tvm {
+@@ -206,6 +212,17 @@ ParallelOpNode::ParallelOpNode(For root) : root_(root), V(this) {
+       if (IsSharedBuffer(load->buffer) || IsGlobalBuffer(load->buffer)) {
+         has_cross_thread_access_ = true;
+       }
++    } else if (const auto *var = obj.as<VarNode>()) {
++      // A pointer (e.g. the data of `tvm_access_ptr` or a bound access
++      // pointer) into memory other than this thread's own.
++      if (var->dtype.is_handle()) {
++        const auto *ptr = var->type_annotation.as<PointerTypeNode>();
++        std::string scope = ptr ? std::string(ptr->storage_scope) : "";
++        if (scope != "local" && scope != "local.fragment" &&
++            scope != "local.var") {
++          has_cross_thread_access_ = true;
++        }
++      }
+     }
+   });
+ }
+@@ -791,6 +808,381 @@ Optional<PrimExpr> ParallelOpNode::GetPredicate(PrimExpr thread_index) const {
+   }
+ }
+ 
++Optional<PrimExpr>
++ParallelOpNode::GetReplicaWriteGuard(PrimExpr thread_index) const {
++  if (!replica_write_guard_.defined()) {
++    return std::nullopt;
++  }
++  return Substitute(replica_write_guard_.value(),
++                    {{InputPlaceholder(0), thread_index}});
++}
++
++namespace {
++
++/*!
++ * \brief Restrict the non-idempotent shared/global writes of a replicated
++ *        parallel loop to one replica.
++ *
++ * Every replica runs the loop body, so each one writes its copy of the
++ * fragments. Plain shared/global stores then write the same value from every
++ * replica and stay as they are. Calls writing through a pointer (atomics,
++ * externs taking a writable `access_ptr`) and stores to a shared/global buffer
++ * the loop also reads must happen once and are wrapped in `guard`.
++ *
++ * A value read from a buffer written once, with no barrier between the read
++ * and the write, is only consistent on the replica that writes it: another
++ * replica may read before or after that write. Stores of such a value to
++ * shared/global memory are therefore guarded as well, and a fragment store of
++ * it, which every replica needs, is rejected.
++ */
++class ReplicaWriteGuarder : public StmtMutator {
++public:
++  static Stmt Rewrite(const Stmt &body, PrimExpr guard,
++                      const Map<Var, PrimExpr> &bindings) {
++    ReplicaWriteGuarder guarder(std::move(guard));
++    // Pointers bound outside the loop may be written through inside it.
++    for (const auto &[var, value] : bindings) {
++      if (const VarNode *target = guarder.WriteTarget(value)) {
++        guarder.write_pointers_[var.get()] = target;
++      }
++    }
++    guarder.Collect(body);
++    return guarder(body);
++  }
++
++private:
++  explicit ReplicaWriteGuarder(PrimExpr guard) : guard_(std::move(guard)) {}
++
++  static bool IsSharedOrGlobal(const Buffer &buffer) {
++    return IsSharedBuffer(buffer) || IsGlobalBuffer(buffer);
++  }
++
++  static bool IsPointerOp(const CallNode *call) {
++    return call->op.same_as(access_ptr()) ||
++           call->op.same_as(builtin::tvm_access_ptr()) ||
++           call->op.same_as(builtin::address_of());
++  }
++
++  static bool MayWrite(const PrimExpr &rw_mask) {
++    const auto *mask = rw_mask.as<IntImmNode>();
++    return !mask || (mask->value & 2);
++  }
++
++  // The shared/global buffer data `expr` points to for writing, if any.
++  const VarNode *WriteTarget(const PrimExpr &expr) const {
++    if (const auto *var = expr.as<VarNode>()) {
++      auto it = write_pointers_.find(var);
++      return it == write_pointers_.end() ? nullptr : it->second;
++    }
++    const auto *call = expr.as<CallNode>();
++    if (!call) {
++      return nullptr;
++    }
++    if (call->op.same_as(access_ptr()) && call->args.size() >= 3) {
++      const auto *base = call->args[0].as<BufferLoadNode>();
++      if (base && IsSharedOrGlobal(base->buffer) && MayWrite(call->args[2])) {
++        return base->buffer->data.get();
++      }
++    } else if (call->op.same_as(builtin::address_of()) &&
++               call->args.size() == 1) {
++      const auto *base = call->args[0].as<BufferLoadNode>();
++      if (base && IsSharedOrGlobal(base->buffer)) {
++        return base->buffer->data.get();
++      }
++    } else if (call->op.same_as(builtin::tvm_access_ptr()) &&
++               call->args.size() == 5) {
++      const auto *data = call->args[1].as<VarNode>();
++      if (data && MayWrite(call->args[4])) {
++        std::string scope = GetPtrStorageScope(GetRef<Var>(data));
++        if (scope.empty() || scope == "global" || scope == "shared" ||
++            scope == "shared.dyn") {
++          return data;
++        }
++      }
++    }
++    return nullptr;
++  }
++
++  // The shared/global buffers `call` writes through its pointer arguments.
++  std::vector<const VarNode *> WriteTargets(const CallNode *call) const {
++    std::vector<const VarNode *> targets;
++    if (!IsPointerOp(call)) {
++      for (const PrimExpr &arg : call->args) {
++        if (const VarNode *target = WriteTarget(arg)) {
++          targets.push_back(target);
++        }
++      }
++    }
++    return targets;
++  }
++
++  bool Writes(const PrimExpr &expr) const {
++    bool writes = false;
++    PostOrderVisit(expr, [&](const ObjectRef &obj) {
++      if (const auto *call = obj.as<CallNode>()) {
++        writes = writes || !WriteTargets(call).empty();
++      }
++    });
++    return writes;
++  }
++
++  // The segment `segment` shares its accesses with: a loop's last segment
++  // runs on, without a barrier, into the first one of its next iteration.
++  int Segment(int segment) const {
++    for (auto it = loop_segments_.find(segment); it != loop_segments_.end();
++         it = loop_segments_.find(segment)) {
++      segment = it->second;
++    }
++    return segment;
++  }
++
++  bool WrittenInSegment(const VarNode *data) const {
++    return written_between_barriers_.count({data, Segment(segment_)});
++  }
++
++  // Whether `expr` reads a buffer written once between the same barriers, so
++  // its value may differ between replicas. Reads through a pointer count too.
++  bool Diverges(const PrimExpr &expr) const {
++    bool diverges = false;
++    PostOrderVisit(expr, [&](const ObjectRef &obj) {
++      if (const auto *load = obj.as<BufferLoadNode>()) {
++        diverges = diverges || WrittenInSegment(load->buffer->data.get());
++      } else if (const auto *var = obj.as<VarNode>()) {
++        auto it = write_pointers_.find(var);
++        diverges =
++            diverges || divergent_vars_.count(var) ||
++            WrittenInSegment(it == write_pointers_.end() ? var : it->second);
++      }
++    });
++    return diverges;
++  }
++
++  bool Diverges(const BufferStoreNode *op) const {
++    bool diverges = divergent_control_ || Diverges(op->value);
++    for (const PrimExpr &index : op->indices) {
++      diverges = diverges || Diverges(index);
++    }
++    return diverges;
++  }
++
++  // A barrier every replica passes: one outside any branch, so that the
++  // accesses before it are ordered against those after it across replicas.
++  bool IsBarrier(const EvaluateNode *op) const {
++    const auto *call = op->value.as<CallNode>();
++    if (conditional_ > 0 || !call) {
++      return false;
++    }
++    if (call->op.same_as(sync_grid())) {
++      return true;
++    }
++    if (call->op.same_as(builtin::tvm_storage_sync()) && !call->args.empty()) {
++      const auto *scope = call->args[0].as<StringImmNode>();
++      return scope && scope->value != "warp";
++    }
++    return false;
++  }
++
++  // A loop of a known positive trip count runs its barriers on every replica.
++  static bool RunsBody(const ForNode *op) {
++    const auto *extent = op->extent.as<IntImmNode>();
++    return extent && extent->value > 0;
++  }
++
++  // Records, in program order and per barrier-delimited segment, the
++  // shared/global accesses of the body.
++  class AccessCollector : public StmtExprVisitor {
++  public:
++    explicit AccessCollector(ReplicaWriteGuarder *guarder) : g_(guarder) {}
++
++    std::unordered_set<const VarNode *> read;
++    std::vector<std::pair<const VarNode *, int>> stores;
++    std::vector<std::pair<const VarNode *, int>> pointer_writes;
++
++  private:
++    void VisitExpr_(const BufferLoadNode *op) final {
++      if (IsSharedOrGlobal(op->buffer)) {
++        read.insert(op->buffer->data.get());
++      }
++      StmtExprVisitor::VisitExpr_(op);
++    }
++    void VisitExpr_(const CallNode *op) final {
++      for (const VarNode *target : g_->WriteTargets(op)) {
++        pointer_writes.emplace_back(target, g_->segment_);
++      }
++      StmtExprVisitor::VisitExpr_(op);
++    }
++    void VisitStmt_(const BufferStoreNode *op) final {
++      if (IsSharedOrGlobal(op->buffer)) {
++        stores.emplace_back(op->buffer->data.get(), g_->segment_);
++      }
++      StmtExprVisitor::VisitStmt_(op);
++    }
++    void VisitStmt_(const BindNode *op) final {
++      StmtExprVisitor::VisitStmt_(op);
++      if (const VarNode *target = g_->WriteTarget(op->value)) {
++        g_->write_pointers_[op->var.get()] = target;
++      }
++    }
++    void VisitStmt_(const EvaluateNode *op) final {
++      StmtExprVisitor::VisitStmt_(op);
++      if (g_->IsBarrier(op)) {
++        ++g_->segment_;
++      }
++    }
++    void VisitStmt_(const IfThenElseNode *op) final { Conditional(op); }
++    void VisitStmt_(const WhileNode *op) final { Conditional(op); }
++    void VisitStmt_(const ForNode *op) final {
++      if (!RunsBody(op)) {
++        Conditional(op);
++        return;
++      }
++      int first = g_->segment_;
++      StmtExprVisitor::VisitStmt_(op);
++      int last = g_->Segment(g_->segment_);
++      first = g_->Segment(first);
++      if (last != first && !is_one(op->extent)) {
++        g_->loop_segments_[last] = first;
++      }
++    }
++    template <typename Node> void Conditional(const Node *op) {
++      ++g_->conditional_;
++      StmtExprVisitor::VisitStmt_(op);
++      --g_->conditional_;
++    }
++
++    ReplicaWriteGuarder *g_;
++  };
++
++  void Collect(const Stmt &body) {
++    AccessCollector collector(this);
++    collector(body);
++    for (const auto &[data, segment] : collector.stores) {
++      if (collector.read.count(data)) {
++        written_once_.insert(data);
++        written_between_barriers_.insert({data, Segment(segment)});
++      }
++    }
++    for (const auto &[data, segment] : collector.pointer_writes) {
++      written_once_.insert(data);
++      written_between_barriers_.insert({data, Segment(segment)});
++    }
++    segment_ = 0;
++  }
++
++  void CheckNoWrite(const PrimExpr &expr, const char *what) const {
++    ICHECK(!Writes(expr))
++        << "A replicated parallel loop cannot use the result of a "
++           "shared/global write (e.g. an atomic returning the previous value) "
++           "as "
++        << what
++        << ": the write must run once, but every replica needs the "
++           "result.";
++  }
++
++  Stmt Guard(const Stmt &stmt) const { return IfThenElse(guard_, stmt); }
++
++  Stmt VisitStmt_(const BufferStoreNode *op) final {
++    bool writes = Writes(op->value);
++    for (const PrimExpr &index : op->indices) {
++      writes = writes || Writes(index);
++    }
++    if (IsSharedOrGlobal(op->buffer)) {
++      if (writes || written_once_.count(op->buffer->data.get()) ||
++          Diverges(op)) {
++        return Guard(GetRef<Stmt>(op));
++      }
++      return GetRef<Stmt>(op);
++    }
++    ICHECK(!writes) << "A replicated parallel loop cannot store the result of "
++                       "a shared/global write (e.g. an atomic returning the "
++                       "previous value) into "
++                    << op->buffer
++                    << ": the write must run once, but every replica needs "
++                       "the result.";
++    ICHECK(!Diverges(op))
++        << "A replicated parallel loop cannot store into " << op->buffer
++        << " a value read from shared/global memory it also updates: every "
++           "replica needs the value, but the update runs once and may land "
++           "before another replica's read.";
++    return GetRef<Stmt>(op);
++  }
++
++  Stmt VisitStmt_(const BindNode *op) final {
++    CheckNoWrite(op->value, "a bound value");
++    if (write_pointers_.count(op->var.get())) {
++      return GetRef<Stmt>(op);
++    }
++    if (divergent_control_ || Diverges(op->value)) {
++      divergent_vars_.insert(op->var.get());
++    }
++    return GetRef<Stmt>(op);
++  }
++
++  Stmt VisitStmt_(const EvaluateNode *op) final {
++    if (IsBarrier(op)) {
++      ++segment_;
++    }
++    if (Writes(op->value)) {
++      return Guard(GetRef<Stmt>(op));
++    }
++    return GetRef<Stmt>(op);
++  }
++
++  // Control flow that may differ between replicas makes every store under it
++  // divergent.
++  template <typename Node>
++  Stmt VisitDivergentIf(const Node *op, bool diverges,
++                        bool conditional = true) {
++    bool outer = divergent_control_;
++    divergent_control_ = outer || diverges;
++    conditional_ += conditional;
++    Stmt stmt = StmtMutator::VisitStmt_(op);
++    conditional_ -= conditional;
++    divergent_control_ = outer;
++    return stmt;
++  }
++
++  Stmt VisitStmt_(const IfThenElseNode *op) final {
++    CheckNoWrite(op->condition, "a branch condition");
++    return VisitDivergentIf(op, Diverges(op->condition));
++  }
++
++  Stmt VisitStmt_(const WhileNode *op) final {
++    CheckNoWrite(op->condition, "a loop condition");
++    return VisitDivergentIf(op, Diverges(op->condition));
++  }
++
++  Stmt VisitStmt_(const ForNode *op) final {
++    CheckNoWrite(op->min, "a loop bound");
++    CheckNoWrite(op->extent, "a loop bound");
++    return VisitDivergentIf(op, Diverges(op->min) || Diverges(op->extent),
++                            !RunsBody(op));
++  }
++
++  PrimExpr guard_;
++  // Bound pointers to shared/global memory that may be written through.
++  std::unordered_map<const VarNode *, const VarNode *> write_pointers_;
++  // Shared/global buffers whose writes run on one replica only, and the
++  // barrier-delimited segments they are written in.
++  std::unordered_set<const VarNode *> written_once_;
++  std::set<std::pair<const VarNode *, int>> written_between_barriers_;
++  int segment_ = 0;
++  // The last segment of a loop body mapped to the segment its next iteration
++  // starts in.
++  std::map<int, int> loop_segments_;
++  int conditional_ = 0;
++  // Bound values that may differ between replicas.
++  std::unordered_set<const VarNode *> divergent_vars_;
++  bool divergent_control_ = false;
++};
++
++} // namespace
++
++Stmt GuardReplicaWrites(const Stmt &body, const PrimExpr &guard,
++                        const Map<Var, PrimExpr> &bindings) {
++  return ReplicaWriteGuarder::Rewrite(body, guard, bindings);
++}
++
+ Fragment ParallelOpNode::CompleteBufferFragment(const Buffer &buffer) const {
+   ICHECK(loop_layout_.defined());
+   if (IsCommonAccessIndice(buffer)) {
+@@ -1076,7 +1468,17 @@ void ParallelOpNode::BuildReplicationGuardsIfNeeded(
+   if (!has_cross_thread_access)
+     return;
+ 
++  auto inv = loop_layout_->Inverse();
++  Array<PrimExpr> fwd;
++  for (size_t i = 0; i < loop_layout_->OutputDim(); i++)
++    fwd.push_back(0);
++  fwd.push_back(InputPlaceholder(0) - layout_args.thread_bounds->min);
++  PrimExpr is_first_replica = EQ(inv->Forward(fwd).back(), 0);
++
+   if (!store_fragment_buffers.empty()) {
++    // Every replica must write its copy of the fragments, so only the
++    // non-idempotent shared/global writes are restricted to one replica.
++    replica_write_guard_ = is_first_replica;
+     bool replicate_is_from_dynamic_index_fragment = false;
+     for (const auto &fragment : store_fragment_buffers) {
+       if (!layout_args.layout_map.count(fragment)) {
+@@ -1106,13 +1508,7 @@ void ParallelOpNode::BuildReplicationGuardsIfNeeded(
+            "in replicated loop layout.";
+     return;
+   } else {
+-    auto inv = loop_layout_->Inverse();
+-    Array<PrimExpr> fwd;
+-    for (size_t i = 0; i < loop_layout_->OutputDim(); i++)
+-      fwd.push_back(0);
+-    fwd.push_back(InputPlaceholder(0) - layout_args.thread_bounds->min);
+-    auto rep = inv->Forward(fwd).back();
+-    AddPredicate(EQ(rep, 0));
++    AddPredicate(is_first_replica);
+   }
+ }
+ Fragment
+diff --git a/src/op/parallel.h b/src/op/parallel.h
+index 1b77d821..1c62dcb9 100644
+--- a/src/op/parallel.h
++++ b/src/op/parallel.h
+@@ -119,6 +119,10 @@ public:
+   // The predicate expression for the loop, if any, mutable for lazy
+   // construction.
+   mutable Optional<PrimExpr> predicate_;
++  // Single-replica guard for the non-fragment side effects of a replicated
++  // loop that also stores fragments (the loop itself cannot be predicated,
++  // since every replica must write its fragment copy).
++  mutable Optional<PrimExpr> replica_write_guard_;
+   // If the user/compiler provided annotations on the outermost loop, we cache
+   // them here (layout without thread-range binding, and the predicate). This
+   // lets InferLayout adopt them cleanly without re-parsing annotations.
+@@ -153,6 +157,7 @@ public:
+   ParallelOpNode(const ParallelOpNode &other) : ParallelOpNode(other.root_) {
+     loop_layout_ = other.loop_layout_;
+     predicate_ = other.predicate_;
++    replica_write_guard_ = other.replica_write_guard_;
+     loop_layout_inferred_ = other.loop_layout_inferred_;
+     loop_layout_requires_padding_guard_ =
+         other.loop_layout_requires_padding_guard_;
+@@ -180,6 +185,9 @@ public:
+   // real threadIdx.x Var; callers without thread bindings (e.g. CPU) pass
+   // constant 0.
+   Optional<PrimExpr> GetPredicate(PrimExpr thread_index) const;
++  // Get the guard that restricts non-idempotent shared/global writes (atomics
++  // and read-modify-writes) of a replicated loop to one replica, if any.
++  Optional<PrimExpr> GetReplicaWriteGuard(PrimExpr thread_index) const;
+ 
+   // Clone this operator.
+   TileOperator Clone() const override;
+@@ -281,6 +289,15 @@ private:
+   std::vector<Buffer> store_fragment_buffers_;
+ };
+ 
++/*!
++ * \brief Restrict the non-idempotent shared/global writes in the body of a
++ *        replicated parallel loop to the replica selected by `guard` (see
++ *        ParallelOpNode::GetReplicaWriteGuard). `bindings` maps the variables
++ *        bound in the enclosing function to their values.
++ */
++Stmt GuardReplicaWrites(const Stmt &body, const PrimExpr &guard,
++                        const Map<Var, PrimExpr> &bindings);
++
+ class ParallelOp : public TileOperator {
+ public:
+   TVM_FFI_DEFINE_OBJECT_REF_METHODS_NULLABLE(ParallelOp, TileOperator,
+diff --git a/src/transform/layout_inference/layout_inference.cc b/src/transform/layout_inference/layout_inference.cc
+index 07466c65..563b018d 100644
+--- a/src/transform/layout_inference/layout_inference.cc
++++ b/src/transform/layout_inference/layout_inference.cc
+@@ -139,6 +139,9 @@ struct LayoutInferenceResult {
+   Map<For, Fragment> for_map;
+   Map<For, PrimExpr> predicate_map;
+   Map<For, Bool> padding_guard_map;
++  Map<For, PrimExpr> replica_write_guard_map;
++  // Values of the variables bound by `Bind` statements.
++  Map<Var, PrimExpr> bindings;
+ };
+ 
+ /*! \brief Everything the inference engine knows about reducer dst-steering,
+@@ -681,6 +684,7 @@ public:
+     Map<For, Fragment> for_map;
+     Map<For, PrimExpr> predicate_map;
+     Map<For, Bool> padding_guard_map;
++    Map<For, PrimExpr> replica_write_guard_map;
+     ICHECK(infer_list_.size() == thread_index_vec_.size())
+         << "infer_list_ and thread_index_vec_ size mismatch";
+     for (int i = 0; i < infer_list_.size(); i++) {
+@@ -706,10 +710,18 @@ public:
+         if (auto predicate = for_infer->GetPredicate(thread_index)) {
+           predicate_map.Set(for_infer->GetRoot(), predicate.value());
+         }
++        if (auto guard = for_infer->GetReplicaWriteGuard(thread_index)) {
++          replica_write_guard_map.Set(for_infer->GetRoot(), guard.value());
++        }
+       }
+     }
+ 
+-    return {layout_map, for_map, predicate_map, padding_guard_map};
++    return {layout_map,
++            for_map,
++            predicate_map,
++            padding_guard_map,
++            replica_write_guard_map,
++            bind_var_to_expr_};
+   }
+ 
+   void Collect(const PrimFunc &f) {
+@@ -1620,6 +1632,13 @@ private:
+                                result_.padding_guard_map[root]);
+     }
+ 
++    if (result_.replica_write_guard_map.count(root)) {
++      for_ptr->body = GuardReplicaWrites(
++          for_ptr->body,
++          analyzer_->Simplify(result_.replica_write_guard_map[root]),
++          result_.bindings);
++    }
++
+     // Store the predicate as an annotation if it exists and is not trivially
+     // true
+     if (result_.predicate_map.count(root)) {
+diff --git a/testing/python/language/test_tilelang_language_parallel.py b/testing/python/language/test_tilelang_language_parallel.py
+index 3f27540a..0c4a78f5 100644
+--- a/testing/python/language/test_tilelang_language_parallel.py
++++ b/testing/python/language/test_tilelang_language_parallel.py
+@@ -3,6 +3,7 @@ import tilelang.language as T
+ import torch
+ import tilelang.testing
+ import pytest
++from tilelang import tvm
+ 
+ tilelang.testing.set_random_seed()
+ 
+@@ -121,5 +122,165 @@ def test_parallel_vectorize_var():
+     assert "float2" in source
+ 
+ 
++@tilelang.testing.requires_cuda
++@pytest.mark.parametrize("update", ["atomic_add", "read_modify_write", "extern_access_ptr", "extern_address_of"])
++def test_replicated_parallel_writes_once(update):
++    """A replicated loop (64 iterations on 128 threads) that stores a fragment
++    runs its atomics and read-modify-writes on one replica only (#3870)."""
++    n = 64
++
++    @T.prim_func
++    def main(A: T.Tensor((n,), T.float32), B: T.Tensor((n,), T.float32), C: T.Tensor((n,), T.float32)):
++        with T.Kernel(1, threads=128):
++            L = T.alloc_fragment((n,), T.float32)
++            for i in T.Parallel(n):
++                L[i] = B[i]
++                if update == "atomic_add":
++                    T.atomic_add(A[i], L[i])
++                elif update == "read_modify_write":
++                    A[i] = A[i] + L[i]
++                elif update == "extern_access_ptr":
++                    T.call_extern("float32", "atomicAdd", A.access_ptr("rw", offset=i), L[i])
++                else:
++                    T.call_extern("float32", "atomicAdd", T.address_of(A[i]), L[i])
++                C[i] = L[i]
++
++    kernel = tilelang.compile(main)
++    source = kernel.get_kernel_source()
++    assert "& 63" in source, "expected a replicated loop layout"
++    a = torch.zeros(n, device="cuda")
++    b = torch.arange(n, dtype=torch.float32, device="cuda")
++    c = torch.empty(n, device="cuda")
++    kernel(a, b, c)
++    torch.testing.assert_close(a, b, rtol=0, atol=0)
++    torch.testing.assert_close(c, b, rtol=0, atol=0)
++
++
++@tilelang.testing.requires_cuda
++@pytest.mark.parametrize("pointer", ["bound_inside", "bound_outside", "only_access"])
++def test_replicated_parallel_guards_writes_through_pointers(pointer):
++    """A write through a pointer runs on one replica, while binding the pointer
++    stays on every replica, also when the loop touches shared/global memory
++    only through that pointer (#3870)."""
++    n = 64
++
++    @T.prim_func
++    def main(A: T.Tensor((n,), T.float32), B: T.Tensor((n,), T.float32), C: T.Tensor((n,), T.float32)):
++        with T.Kernel(1, threads=128):
++            L = T.alloc_fragment((n,), T.float32)
++            if pointer == "bound_outside":
++                ptr = T.bind(T.access_ptr(A[0], "rw"))
++            if pointer == "only_access":
++                for i in T.Parallel(n):
++                    L[i] = T.cast(i, T.float32)
++                    T.call_extern("float32", "extern_update", A.access_ptr("rw", offset=i), L[i])
++                for i in T.Parallel(n):
++                    C[i] = L[i]
++            else:
++                for i in T.Parallel(n):
++                    L[i] = B[i]
++                    if pointer == "bound_inside":
++                        ptr = T.bind(T.access_ptr(A[i], "rw"))
++                    T.call_extern("float32", "extern_update", ptr, L[i])
++                    C[i] = L[i]
++
++    target = tvm.target.Target({"kind": "cuda", "arch": "sm_90a"})
++    with target:
++        source = tilelang.lower(main, target=target).kernel_source
++    guard = source.index("if ((((int)threadIdx.x) >> 6) == 0) {")
++    if pointer != "only_access":
++        assert source.index("void* ptr = ") < guard
++    assert guard < source.index("extern_update(")
++    assert source.index("C[") > source.index("extern_update(")
++
++
++@tilelang.testing.requires_cuda
++def test_replicated_parallel_reads_before_its_update():
++    """A value read before the loop's single-replica update of the same buffer
++    is only consistent on that replica (#3870)."""
++    n = 64
++
++    @T.prim_func
++    def snapshot(A: T.Tensor((n,), T.float32), B: T.Tensor((n,), T.float32), C: T.Tensor((n,), T.float32)):
++        with T.Kernel(1, threads=128):
++            L = T.alloc_fragment((n,), T.float32)
++            for i in T.Parallel(n):
++                L[i] = B[i]
++                C[i] = A[i]
++                A[i] = L[i]
++
++    kernel = tilelang.compile(snapshot)
++    a = torch.arange(n, dtype=torch.float32, device="cuda")
++    b = -torch.arange(n, dtype=torch.float32, device="cuda") - 1
++    c = torch.empty(n, device="cuda")
++    expected_c = a.clone()
++    kernel(a, b, c)
++    torch.testing.assert_close(c, expected_c, rtol=0, atol=0)
++    torch.testing.assert_close(a, b, rtol=0, atol=0)
++
++    @T.prim_func
++    def into_fragment(A: T.Tensor((n,), T.float32), C: T.Tensor((n,), T.float32)):
++        with T.Kernel(1, threads=128):
++            L = T.alloc_fragment((n,), T.float32)
++            for i in T.Parallel(n):
++                L[i] = A[i]
++                A[i] = L[i] + 1.0
++                C[i] = L[i]
++
++    with pytest.raises(Exception, match="also updates"):
++        tilelang.compile(into_fragment)
++
++    @T.prim_func
++    def atomic_condition(A: T.Tensor((n,), T.float32), B: T.Tensor((n,), T.float32), C: T.Tensor((n,), T.float32)):
++        with T.Kernel(1, threads=128):
++            L = T.alloc_fragment((n,), T.float32)
++            for i in T.Parallel(n):
++                L[i] = B[i]
++                if T.atomic_add(A[i], L[i], return_prev=True) > 0:
++                    C[i] = L[i]
++
++    with pytest.raises(Exception, match="every replica needs the result"):
++        tilelang.compile(atomic_condition)
++
++    @T.prim_func
++    def through_pointer(A: T.Tensor((n,), T.float32), C: T.Tensor((n,), T.float32)):
++        with T.Kernel(1, threads=128):
++            L = T.alloc_fragment((n,), T.float32)
++            for i in T.Parallel(n):
++                L[i] = T.call_extern("float32", "load", A.access_ptr("r", offset=i))
++                T.atomic_add(A[i], 1.0)
++                C[i] = L[i]
++
++    @T.prim_func
++    def across_iterations(A: T.Tensor((n,), T.float32), C: T.Tensor((n,), T.float32)):
++        with T.Kernel(1, threads=128):
++            L = T.alloc_fragment((n,), T.float32)
++            for i in T.Parallel(n):
++                for _ in T.serial(2):
++                    L[i] = A[i]
++                    T.sync_threads()
++                    A[i] = A[i] + L[i]
++                C[i] = L[i]
++
++    for program in (through_pointer, across_iterations):
++        with pytest.raises(Exception, match="also updates"):
++            tilelang.compile(program)
++
++    @T.prim_func
++    def atomic_pointer_index(
++        A: T.Tensor((n,), T.float32), B: T.Tensor((n,), T.float32), C: T.Tensor((n,), T.float32), Cnt: T.Tensor((1,), T.int32)
++    ):
++        with T.Kernel(1, threads=128):
++            L = T.alloc_fragment((n,), T.float32)
++            for i in T.Parallel(n):
++                L[i] = B[i]
++                ptr = T.bind(T.access_ptr(A[T.atomic_add(Cnt[0], 1, return_prev=True)], "rw"))
++                T.call_extern("float32", "extern_update", ptr, L[i])
++                C[i] = L[i]
++
++    with pytest.raises(Exception, match="every replica needs the result"):
++        tilelang.compile(atomic_pointer_index)
++
++
+ if __name__ == "__main__":
+     tilelang.testing.main()
+-- 
+2.43.0
+
