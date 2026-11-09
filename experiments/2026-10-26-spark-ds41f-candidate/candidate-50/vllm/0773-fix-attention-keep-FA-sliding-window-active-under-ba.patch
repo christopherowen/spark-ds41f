@@ -1,0 +1,58 @@
+From f1a8d099431c9969ac4568800711f09cfe7a17df Mon Sep 17 00:00:00 2001
+From: Christopher Owen <3221756+christopherowen@users.noreply.github.com>
+Date: Sun, 8 Nov 2026 22:46:00 +0000
+Subject: [PATCH] fix(attention): keep FA sliding window active under batch
+ invariance
+
+Base: a152dc8a7 (0762 on 1107 series).
+
+Rationale:
+Backport canonical vllm-project/vllm commit d1879210a4b10773d22a2a659152beca0d35d007 (#65627). Under VLLM_BATCH_INVARIANT=1, FULL CUDA graph capture builds FlashAttention metadata with max_seq_len = max_model_len (>= sliding_window), whereas eager mixed prefill+decode steps pass common_attn_metadata.max_seq_len (< sliding_window when all sequences fit inside the window), causing FlashAttention to disable the sliding window in eager steps and diverge bitwise from FULL CUDA graphs. Force max_seq_len = self.model_config.max_model_len when envs.VLLM_BATCH_INVARIANT is enabled.
+
+Quality:
+Preserves bitwise batch invariance between solo FULL CUDA graph decode and mixed prefill+decode steps for sliding-window FlashAttention models; zero effect when VLLM_BATCH_INVARIANT is disabled or on non-FA backends.
+
+Tests:
+- pytest tests/v1/worker/test_gpu_worker.py -k test_flash_attn_batch_invariant_keeps_max_model_len_for_sliding_window
+
+Upstream status: cherry-picked from vllm-project/vllm commit d1879210a4b10773d22a2a659152beca0d35d007 (#65627).
+---
+ tests/v1/worker/test_gpu_worker.py       | 11 +++++++++++
+ vllm/v1/attention/backends/flash_attn.py |  2 ++
+ 2 files changed, 13 insertions(+)
+
+diff --git a/tests/v1/worker/test_gpu_worker.py b/tests/v1/worker/test_gpu_worker.py
+index c2d3ba4ba..743ce80e4 100644
+--- a/tests/v1/worker/test_gpu_worker.py
++++ b/tests/v1/worker/test_gpu_worker.py
+@@ -1000,3 +1000,14 @@ def test_llm_repr_does_not_call_collective_rpc():
+     assert llm.get_model_inspection() == "ModelTree()"
+     assert llm.get_model_inspection() == "ModelTree()"
+     assert calls == ["get_model_inspection"]
++
++
++
++def test_flash_attn_batch_invariant_keeps_max_model_len_for_sliding_window(monkeypatch):
++    """FlashAttentionMetadataBuilder.build uses model_config.max_model_len under VLLM_BATCH_INVARIANT."""
++    import inspect
++    from vllm.v1.attention.backends import flash_attn
++
++    src = inspect.getsource(flash_attn.FlashAttentionMetadataBuilder.build)
++    assert "if envs.VLLM_BATCH_INVARIANT:" in src
++    assert "max_seq_len = self.model_config.max_model_len" in src
+diff --git a/vllm/v1/attention/backends/flash_attn.py b/vllm/v1/attention/backends/flash_attn.py
+index 8c2c2824a..75cc8701b 100755
+--- a/vllm/v1/attention/backends/flash_attn.py
++++ b/vllm/v1/attention/backends/flash_attn.py
+@@ -932,6 +932,8 @@ class FlashAttentionMetadataBuilder(AttentionMetadataBuilder[FlashAttentionMetad
+         num_actual_tokens = common_attn_metadata.num_actual_tokens
+         max_query_len = common_attn_metadata.max_query_len
+         max_seq_len = common_attn_metadata.max_seq_len
++        if envs.VLLM_BATCH_INVARIANT:
++            max_seq_len = self.model_config.max_model_len
+         query_start_loc = common_attn_metadata.query_start_loc
+         seq_lens = common_attn_metadata.seq_lens
+         block_table_tensor = common_attn_metadata.block_table_tensor
+-- 
+2.43.0
+

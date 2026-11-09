@@ -1,0 +1,21 @@
+--- a/0776-perf-dsv41-vectorize-indexer-KPool-loads-and-co-sche.patch (original)
++++ b/0776-perf-dsv41-vectorize-indexer-KPool-loads-and-co-sche.patch (rebased)
+@@ -23,13 +23,13 @@
+  2 files changed, 182 insertions(+), 2 deletions(-)
+ 
+ diff --git a/tests/kernels/attention/test_deepseek_v41_tilelang.py b/tests/kernels/attention/test_deepseek_v41_tilelang.py
+-index 849113154..c88fd887f 100644
++index c0c0eba92..53cd29825 100644
+ --- a/tests/kernels/attention/test_deepseek_v41_tilelang.py
+ +++ b/tests/kernels/attention/test_deepseek_v41_tilelang.py
+-@@ -1286,3 +1286,18 @@ def test_sparse_mla_plan_routes_right_sizes_head_block_and_decode_waves(monkeypa
+-     assert swa24.segments == 1
+-     assert swa24.split_max_rows == 24
+-     assert swa24.decode_max_rows == 144
++@@ -1355,3 +1355,18 @@ def test_sparse_mla_short_indexed_segments_match_across_routes(heads, rows=6):
++     )
++     for kernel, out in outs.items():
++         assert torch.equal(out, outs["extend"]), f"{kernel} differs from extend"
+ +
+ +
+ +def test_indexer_score_vectorizes_kpool_loads_and_coschedules_dense_rows():

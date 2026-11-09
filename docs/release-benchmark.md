@@ -57,6 +57,11 @@ Owner rules for these rounds (2026-11-09):
 - Apply each PR's patches alone on the base tree. Then, for every pair that touches a common
   file, apply one and check the other.
 - A candidate holds no conflicting pair. The candidates of one round overlap at most in test files.
+- Take only the patches that act on this deployment, DeepSeek V4.1 Flash on GB10. A patch for a
+  platform or path it does not serve (ROCm, another model, a feature the recipe leaves off) is left
+  out. Split a PR whose patches mix the two, and record each patch left out, with its reason, in
+  `receipts/selection.json` (owner, 2026-11-09: candidate-48 carried #1011's ROCm-only patch and
+  #1013's prefill lanes, and candidate-50 left both out).
 - The base is the release's series plus every PR that has passed so far.
 
 ### 2. Assemble

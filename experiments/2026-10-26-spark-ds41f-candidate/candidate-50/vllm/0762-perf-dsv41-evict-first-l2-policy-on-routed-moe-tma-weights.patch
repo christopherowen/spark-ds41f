@@ -1,0 +1,120 @@
+From eb8367abcb1f64b8aea176d2bd516b7c24c88d3e Mon Sep 17 00:00:00 2001
+From: Christopher Owen <3221756+christopherowen@users.noreply.github.com>
+Date: Sun, 8 Nov 2026 12:45:00 +0000
+Subject: [PATCH] perf(dsv41): default unswizzled routed MoE TMA weight loads
+ to L2 evict_first
+
+Base: 1107 vLLM patch head 2756478b60b90700b9918b457aeb38657da637b5 (tree ed1bdb7a7684da33d403a055521ac0c4dd7ca670).
+
+Rationale:
+In grouped_fp8_fp4_gemm, each active expert streams ~5.90 MB (TP3, I=768) or ~4.42 MB (TP4, I=576) of single-use MXFP4 weights (B) via T.tma_copy across gate_up and down_proj (35.4 MB at M=1 top-6, 177 MB at M=6, 413 MB at M=16). When swizzle_panel <= 0 (decode block_M=16, late_ block_M=16, and mid_ block_M=32), each CTA streams its [block_N, block_K] weight slab without cross-CTA M-tile swizzle reuse. Under default EVICT_NORMAL TMA cache policy, these single-use weight slabs flush GB10's 24 MB L2 cache, evicting:
+1. Prefetched shared_experts.down_proj and residual lines loaded with evict_last by l2_prefetch before the FFN block.
+2. Gathered input activation rows A and scale words SFA reused across active expert tiles and column blocks bx.
+3. Intermediate SwiGLU outputs hq written by moe_swiglu_cast and read across 40 column blocks by the down GEMM.
+4. Per-route outputs y written by the down GEMM and reduced by moe_combine_v41.
+
+Default eviction_policy to "evict_first" in grouped_fp8_fp4_gemm when swizzle_panel <= 0 and eviction_policy is None, emitting tl::tma_load<tl::CacheHintSm90::EVICT_FIRST>(B_desc, ...) (L2 cache hint 0x12f0000000000000ULL) while keeping default EVICT_NORMAL when swizzle_panel > 0 (prefill_ block_M=64, swizzle_panel=2) where consecutive M-tiles of the same expert share B across a swizzle panel.
+
+Quality:
+Bit-identical (torch.equal verified across M = 1..4096 on TP3 and TP4; TMA L2 cache hint only affects L2 replacement priority).
+
+Tests:
+- pytest tests/kernels/moe/test_deepseek_v41_tilelang_moe.py tests/v1/worker/test_prepare_kernels.py (148 passed).
+
+Upstream status: local SM120/SM121 TileLang routed MoE L2 cache replacement policy.
+---
+ .../moe/test_deepseek_v41_tilelang_moe.py     | 44 +++++++++++++++++++
+ vllm/models/deepseek_v4_1/tilelang/moe.py     | 10 ++++-
+ 2 files changed, 53 insertions(+), 1 deletion(-)
+
+diff --git a/tests/kernels/moe/test_deepseek_v41_tilelang_moe.py b/tests/kernels/moe/test_deepseek_v41_tilelang_moe.py
+index f4381b8de..592cad2dc 100644
+--- a/tests/kernels/moe/test_deepseek_v41_tilelang_moe.py
++++ b/tests/kernels/moe/test_deepseek_v41_tilelang_moe.py
+@@ -934,3 +934,47 @@ def test_routed_moe_pdl_preloads_before_wait():
+     assert comb_src.index("Weights[") < wait_pos
+     assert comb_src.index("*(uint4*)(Shared + ") < wait_pos
+     assert wait_pos < comb_src.index("*(uint4*)(Y + ")
++
++
++def test_grouped_fp8_fp4_gemm_unswizzled_tma_evict_first():
++    """Unswizzled grouped GEMMs stream expert weight slabs with EVICT_FIRST L2
++    cache hints by default, while swizzled prefill panels retain normal L2
++    eviction across consecutive M-tiles."""
++    unswizzled = grouped_fp8_fp4_gemm(
++        16, 256, 576, 4, True, 16, 128, coded_scales=True, narrow_codes=True
++    )
++    swizzled = grouped_fp8_fp4_gemm(
++        16,
++        256,
++        576,
++        4,
++        True,
++        64,
++        128,
++        coded_scales=True,
++        narrow_codes=True,
++        swizzle_panel=2,
++    )
++    explicit_normal = grouped_fp8_fp4_gemm(
++        16,
++        256,
++        576,
++        4,
++        True,
++        16,
++        128,
++        coded_scales=True,
++        narrow_codes=True,
++        eviction_policy="evict_normal",
++    )
++
++    unswizzled_src = unswizzled.get_kernel_source()
++    swizzled_src = swizzled.get_kernel_source()
++    normal_src = explicit_normal.get_kernel_source()
++
++    assert "tl::tma_load<tl::CacheHintSm90::EVICT_FIRST>(B_desc," in unswizzled_src
++    assert "tl::tma_load(B_desc," not in unswizzled_src
++    assert "tl::tma_load(B_desc," in swizzled_src
++    assert "EVICT_FIRST" not in swizzled_src
++    assert "tl::tma_load(B_desc," in normal_src
++    assert "EVICT_FIRST" not in normal_src
+diff --git a/vllm/models/deepseek_v4_1/tilelang/moe.py b/vllm/models/deepseek_v4_1/tilelang/moe.py
+index b12b53a35..287badf56 100644
+--- a/vllm/models/deepseek_v4_1/tilelang/moe.py
++++ b/vllm/models/deepseek_v4_1/tilelang/moe.py
+@@ -647,6 +647,7 @@ def grouped_fp8_fp4_gemm(
+     narrow_codes: bool = False,
+     trigger_after_loop: bool = False,
+     swizzle_panel: int = 0,
++    eviction_policy: str | None = None,
+ ):
+     """``C[r] = (A[row(r)] * SFA) @ (B[e] * SFB[e])^T``, ``e`` the expert of row ``r``.
+ 
+@@ -681,8 +682,14 @@ def grouped_fp8_fp4_gemm(
+     and reversing ``bx`` on odd panels, so consecutive M-tiles of the same
+     expert can access each ``bx`` weight slab closer together. Cache benefit
+     depends on occupancy and panel boundaries. Empty logical tiles still return
+-    early but can interleave with live CTAs inside a partial panel.
++    early but can interleave with live CTAs inside a partial panel. When
++    ``swizzle_panel <= 0`` and ``eviction_policy`` is ``None``, TMA weight loads
++    default to ``"evict_first"`` so single-use streamed expert weights do not
++    displace prefetched weights, gathered activations, or intermediate buffers
++    in L2.
+     """
++    if eviction_policy is None and swizzle_panel <= 0:
++        eviction_policy = "evict_first"
+     block_K = FP4_TMA_K
+     tail = K % block_K
+     k_full = K // block_K
+@@ -727,6 +734,7 @@ def grouped_fp8_fp4_gemm(
+                 B[tile : tile + 1, 0:block_N, 0:block_K],
+                 B_shared[s : s + 1, :, :],
+                 barrier=loaded[s],
++                eviction_policy=eviction_policy,
+             )
+         # The tail exists at trace time (BT); its block is chosen on device.
+         if BT is not None:  # noqa: SIM102
+-- 
+2.43.0
+
