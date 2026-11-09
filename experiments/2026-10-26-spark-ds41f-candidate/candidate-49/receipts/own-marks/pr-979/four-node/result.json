@@ -1,0 +1,403 @@
+{
+  "pr": 979,
+  "pr_head": "c1d1bf3b76bc412aa4a87892726d107caa07bd6e",
+  "patch": {
+    "name": "0766-perf-dsv41-sp-prefill-sparknet-routing.patch",
+    "sha256": "1a95ed84e8c0018d205b8a26ae236712160919cac861d2da420e675e91c7ce2f"
+  },
+  "mark": "Its SP gather bench at T>=6144: gain beyond the interval, bit-exact",
+  "mark_reading": "The PR's T>=6144 gain is SPRows.project_exchange_rows (ENGRAM_SLICE_TOKENS 2048 -> 6144 and the sliced copy_self=False side-stream pipeline); SPRows.gather_mxfp8 falls back to grouped PyNCCL above the one-shot cap (ring4 from T=2048, direct from T=4096) in both arms. So at T>=6144 the mark is judged on project_exchange_rows; gather_mxfp8 is reported at every T.",
+  "hosts": "sp1..sp4 (spark-0009..spark-0012), NVIDIA GB10, one rank per node, 200G dual-rail switched RoCE (rocep1s0f0, roceP2p1s0f0); tp4-switched profile of releases/spark-ds41f-1107/cluster.json",
+  "image": "spark-ds41f:1107 sha256:3f32a962ce04b7c8d85337cd427a8946b8b6bcaadd97cc8d8a8cd14e8d68a6ce on all four nodes (no build)",
+  "arms": {
+    "candidate-49": "1107 image with 0762..0767 applied to the image's vLLM tree (7 vLLM files bound read-only); sp_prefill.py sha256 58e7f2579b73...",
+    "baseline": "candidate-49 without #979: 1107 image with 0762..0765 and 0767; differs from candidate-49 in sp_prefill.py only (sha256 880ff323bde3...), so it isolates #979"
+  },
+  "bench": "scripts/bench_979_integrated.py: the workload of the PR's bench_sp_focused.py (pr-bench-scripts/, found on sp2..sp4 /tmp; the PR itself ships only receipts) - same T, shapes, seeds, project (Engram wkv [6400, 6144] BF16 matmul) and then (RankOrderParts([4, L, 5120]).sum()), MXFP8 gather tensors with top-k 6, topology settings, 12 warmup and 40 timed iterations with a barrier before each. It times each tree's own SPRows.project_exchange_rows(slices=engram_slices(T), then=...) as engram.py calls it and SPRows.gather_mxfp8 as kernels.py calls it, instead of the PR script's in-script reimplementations (which would be identical code in both arms). Added: T=8192, a seeded engram weight, per-rank timings (max-rank and rank0), output digests, and in-process anchors that are the same code in both arms.",
+  "method": "Same session (11:44-11:53Z), ABBA per topology: candidate-49 boot1, baseline boot1, baseline boot2, candidate-49 boot2; ring4 then direct. Each boot is a fresh 4-container launch; each rank did ~240 ms of back-to-back 4096^3 BF16 GEMMs before anything was timed. Metric: median over 40 iterations of the per-iteration max over the 4 ranks of CUDA-event time; rank0's median alongside (the PR's script reports rank 0). Interval: the two boots' medians of an arm; 'gain' or 'loss' when the arms' intervals do not overlap. Each boot also has a bootstrap 95% CI of its median.",
+  "measured": {
+    "project_exchange_rows_T>=6144": {
+      "ring4_T6144": {
+        "candidate-49": {
+          "boot_medians_us": [
+            9637.25,
+            9882.75
+          ],
+          "boot_median_ci95_us": [
+            [
+              9480.48,
+              9823.42
+            ],
+            [
+              9728.29,
+              10153.41
+            ]
+          ],
+          "boot_p10_p90_us": [
+            [
+              9192.13,
+              10415.84
+            ],
+            [
+              9325.79,
+              11001.38
+            ]
+          ],
+          "rank0_boot_medians_us": [
+            9377.34,
+            9537.73
+          ]
+        },
+        "baseline": {
+          "boot_medians_us": [
+            11312.0,
+            11167.71
+          ],
+          "boot_median_ci95_us": [
+            [
+              11001.57,
+              11697.63
+            ],
+            [
+              11041.5,
+              11537.66
+            ]
+          ],
+          "boot_p10_p90_us": [
+            [
+              10377.34,
+              12394.24
+            ],
+            [
+              10562.69,
+              12366.94
+            ]
+          ],
+          "rank0_boot_medians_us": [
+            11071.94,
+            10921.66
+          ]
+        },
+        "change_pct": -13.2,
+        "change_us": -1479.9,
+        "beyond_interval": "gain",
+        "rank0_change_pct": -14.0,
+        "rank0_beyond_interval": "gain",
+        "route_candidate": {
+          "engram_slices": 2,
+          "roce_should_all_to_all_rows": false
+        },
+        "bit_exact_across_4_runs": true,
+        "equal_to_in_process_anchor": true
+      },
+      "ring4_T8192": {
+        "candidate-49": {
+          "boot_medians_us": [
+            12682.37,
+            12602.78
+          ],
+          "boot_median_ci95_us": [
+            [
+              12396.0,
+              12921.31
+            ],
+            [
+              12415.65,
+              12691.9
+            ]
+          ],
+          "boot_p10_p90_us": [
+            [
+              12066.98,
+              13502.94
+            ],
+            [
+              12095.74,
+              13377.54
+            ]
+          ],
+          "rank0_boot_medians_us": [
+            12396.0,
+            12430.72
+          ]
+        },
+        "baseline": {
+          "boot_medians_us": [
+            15344.16,
+            15447.36
+          ],
+          "boot_median_ci95_us": [
+            [
+              15136.99,
+              15645.31
+            ],
+            [
+              15204.58,
+              15761.41
+            ]
+          ],
+          "boot_p10_p90_us": [
+            [
+              14691.97,
+              16348.7
+            ],
+            [
+              14723.36,
+              16395.14
+            ]
+          ],
+          "rank0_boot_medians_us": [
+            14976.16,
+            15049.73
+          ]
+        },
+        "change_pct": -17.9,
+        "change_us": -2753.2,
+        "beyond_interval": "gain",
+        "rank0_change_pct": -17.3,
+        "rank0_beyond_interval": "gain",
+        "route_candidate": {
+          "engram_slices": 2,
+          "roce_should_all_to_all_rows": false
+        },
+        "bit_exact_across_4_runs": true,
+        "equal_to_in_process_anchor": true
+      },
+      "direct_T6144": {
+        "candidate-49": {
+          "boot_medians_us": [
+            8930.53,
+            8925.02
+          ],
+          "boot_median_ci95_us": [
+            [
+              8750.59,
+              9139.14
+            ],
+            [
+              8767.71,
+              9020.86
+            ]
+          ],
+          "boot_p10_p90_us": [
+            [
+              8455.55,
+              9742.69
+            ],
+            [
+              8213.25,
+              9765.73
+            ]
+          ],
+          "rank0_boot_medians_us": [
+            8729.02,
+            8748.03
+          ]
+        },
+        "baseline": {
+          "boot_medians_us": [
+            10443.04,
+            11123.68
+          ],
+          "boot_median_ci95_us": [
+            [
+              9973.79,
+              10988.48
+            ],
+            [
+              10315.42,
+              11540.03
+            ]
+          ],
+          "boot_p10_p90_us": [
+            [
+              9542.82,
+              12192.13
+            ],
+            [
+              9580.61,
+              12622.14
+            ]
+          ],
+          "rank0_boot_medians_us": [
+            10118.3,
+            10764.93
+          ]
+        },
+        "change_pct": -17.2,
+        "change_us": -1855.6,
+        "beyond_interval": "gain",
+        "rank0_change_pct": -16.3,
+        "rank0_beyond_interval": "gain",
+        "route_candidate": {
+          "engram_slices": 2,
+          "roce_should_all_to_all_rows": false
+        },
+        "bit_exact_across_4_runs": true,
+        "equal_to_in_process_anchor": true
+      },
+      "direct_T8192": {
+        "candidate-49": {
+          "boot_medians_us": [
+            11536.93,
+            11633.79
+          ],
+          "boot_median_ci95_us": [
+            [
+              11437.31,
+              11827.81
+            ],
+            [
+              11521.98,
+              11973.76
+            ]
+          ],
+          "boot_p10_p90_us": [
+            [
+              11118.43,
+              12333.02
+            ],
+            [
+              11285.25,
+              12914.5
+            ]
+          ],
+          "rank0_boot_medians_us": [
+            11237.79,
+            11261.25
+          ]
+        },
+        "baseline": {
+          "boot_medians_us": [
+            14432.51,
+            13842.72
+          ],
+          "boot_median_ci95_us": [
+            [
+              13635.52,
+              14958.24
+            ],
+            [
+              13401.31,
+              14420.9
+            ]
+          ],
+          "boot_p10_p90_us": [
+            [
+              12848.19,
+              15869.7
+            ],
+            [
+              12751.2,
+              15939.55
+            ]
+          ],
+          "rank0_boot_medians_us": [
+            13591.84,
+            13643.62
+          ]
+        },
+        "change_pct": -18.1,
+        "change_us": -2552.3,
+        "beyond_interval": "gain",
+        "rank0_change_pct": -17.4,
+        "rank0_beyond_interval": "gain",
+        "route_candidate": {
+          "engram_slices": 2,
+          "roce_should_all_to_all_rows": false
+        },
+        "bit_exact_across_4_runs": true,
+        "equal_to_in_process_anchor": true
+      }
+    },
+    "pr_claim_T6144": "-9.0% to -21.6% (853-2,226 us) across the PR's boots and both topologies",
+    "project_exchange_rows_all_T": {
+      "ring4": {
+        "160": "c49 [1597.34, 1582.37] vs base [1326.72, 1352.22] us: +18.7% (+250.4 us) loss; rank0 +5.2% within",
+        "256": "c49 [1325.98, 1255.84] vs base [1505.47, 1508.35] us: -14.3% (-216.0 us) gain; rank0 -10.6% within",
+        "512": "c49 [1608.29, 1570.02] vs base [1736.29, 1915.46] us: -13.0% (-236.7 us) gain; rank0 -0.4% within",
+        "1024": "c49 [2130.75, 2278.75] vs base [2238.78, 2245.18] us: -1.7% (-37.2 us) within; rank0 -2.0% within",
+        "2048": "c49 [4033.54, 4114.98] vs base [3996.13, 4006.98] us: +1.8% (+72.7 us) loss; rank0 +3.1% within",
+        "4096": "c49 [7333.12, 7449.57] vs base [7294.21, 7275.74] us: +1.5% (+106.4 us) loss; rank0 +1.4% within",
+        "6144": "c49 [9637.25, 9882.75] vs base [11312.0, 11167.71] us: -13.2% (-1479.9 us) gain; rank0 -14.0% gain",
+        "8192": "c49 [12682.37, 12602.78] vs base [15344.16, 15447.36] us: -17.9% (-2753.2 us) gain; rank0 -17.3% gain"
+      },
+      "direct": {
+        "160": "c49 [1244.38, 1335.2] vs base [1127.62, 1346.27] us: +4.3% (+52.8 us) within; rank0 +10.6% within",
+        "256": "c49 [1253.95, 1474.37] vs base [1670.21, 1150.11] us: -3.3% (-46.0 us) within; rank0 -19.2% within",
+        "512": "c49 [1570.75, 1445.86] vs base [1418.85, 1515.1] us: +2.8% (+41.3 us) within; rank0 -4.1% gain",
+        "1024": "c49 [2021.28, 1963.04] vs base [2040.74, 2151.39] us: -5.0% (-103.9 us) gain; rank0 +2.7% within",
+        "2048": "c49 [3631.49, 3423.68] vs base [3679.78, 3637.92] us: -3.6% (-131.3 us) gain; rank0 -3.0% within",
+        "4096": "c49 [6711.74, 6891.33] vs base [6513.44, 6765.22] us: +2.4% (+162.2 us) within; rank0 +4.5% loss",
+        "6144": "c49 [8930.53, 8925.02] vs base [10443.04, 11123.68] us: -17.2% (-1855.6 us) gain; rank0 -16.3% gain",
+        "8192": "c49 [11536.93, 11633.79] vs base [14432.51, 13842.72] us: -18.1% (-2552.3 us) gain; rank0 -17.4% gain"
+      }
+    },
+    "gather_mxfp8_all_T": {
+      "ring4": {
+        "160": "c49 [701.25, 709.41] vs base [1209.6, 885.22] us: -32.7% (-342.1 us) gain; rank0 -21.9% within",
+        "256": "c49 [535.23, 843.17] vs base [896.64, 916.7] us: -24.0% (-217.5 us) gain; rank0 -24.5% within",
+        "512": "c49 [777.6, 1039.55] vs base [960.61, 1035.04] us: -8.9% (-89.2 us) within; rank0 -21.5% within",
+        "1024": "c49 [1119.9, 958.75] vs base [1076.06, 1221.38] us: -9.5% (-109.4 us) within; rank0 -9.8% within",
+        "2048": "c49 [1225.6, 1130.94] vs base [904.06, 1342.72] us: +4.9% (+54.9 us) within; rank0 -5.2% within",
+        "4096": "c49 [1647.49, 1501.95] vs base [1529.76, 1767.07] us: -4.5% (-73.7 us) within; rank0 -10.2% gain",
+        "6144": "c49 [2106.91, 1947.55] vs base [1947.52, 2200.16] us: -2.2% (-46.6 us) within; rank0 -9.2% within",
+        "8192": "c49 [2076.7, 2362.24] vs base [2252.86, 2279.97] us: -2.1% (-46.9 us) within; rank0 +1.8% within"
+      },
+      "direct": {
+        "160": "c49 [947.2, 1070.34] vs base [923.52, 927.71] us: +9.0% (+83.2 us) loss; rank0 +22.8% within",
+        "256": "c49 [1061.79, 1059.55] vs base [827.78, 1058.5] us: +12.5% (+117.5 us) loss; rank0 +9.0% within",
+        "512": "c49 [1120.38, 947.84] vs base [784.99, 782.82] us: +31.9% (+250.2 us) loss; rank0 +18.3% loss",
+        "1024": "c49 [1061.63, 1215.01] vs base [968.0, 1041.12] us: +13.3% (+133.8 us) loss; rank0 -0.5% within",
+        "2048": "c49 [1609.7, 1723.17] vs base [1215.01, 1014.43] us: +49.5% (+551.7 us) loss; rank0 +24.7% loss",
+        "4096": "c49 [1458.34, 1781.5] vs base [1567.46, 1418.46] us: +8.5% (+127.0 us) within; rank0 +3.7% within",
+        "6144": "c49 [1954.66, 1799.65] vs base [1847.87, 1963.81] us: -1.5% (-28.7 us) within; rank0 +11.8% loss",
+        "8192": "c49 [2343.42, 2259.52] vs base [2281.89, 2271.33] us: +1.1% (+24.9 us) within; rank0 +13.1% loss"
+      }
+    },
+    "in_process_anchor_T6144_us": {
+      "ring4": {
+        "candidate-49_runs": [
+          12323.52,
+          11514.4
+        ],
+        "baseline_runs": [
+          11277.66,
+          11308.22
+        ]
+      },
+      "direct": {
+        "candidate-49_runs": [
+          10902.05,
+          11189.54
+        ],
+        "baseline_runs": [
+          10149.5,
+          11432.51
+        ]
+      }
+    }
+  },
+  "bit_exact": true,
+  "bit_exact_detail": "At every T, op and topology, each rank's output digest (sha256 of the real rows of project_exchange_rows; of values, scales, weights and ids for gather_mxfp8) is equal across all four runs (two candidate-49, two baseline), and every rank's output equals its in-process anchor (serial project + exchange_rows; grouped PyNCCL all_gather) bit for bit, then() output included. The digests are also the same on ring4 and direct.",
+  "verdict": "pass",
+  "reason": "At T>=6144 candidate-49's project_exchange_rows is faster than the baseline's beyond the interval on both topologies, on max-rank and rank0 medians, and the per-boot 95% CIs do not overlap: ring4 T=6144 c49 [9637.25, 9882.75] vs base [11312.0, 11167.71] us: -13.2% (-1479.9 us) gain; rank0 -14.0% gain; direct T=6144 c49 [8930.53, 8925.02] vs base [10443.04, 11123.68] us: -17.2% (-1855.6 us) gain; rank0 -16.3% gain; at T=8192 -17.9% (ring4) and -18.1% (direct). This is inside the PR's claimed -9.0% to -21.6% at T=6144. Outputs are bit-identical to the baseline's.",
+  "notes": [
+    "Not part of the mark: gather_mxfp8's one-shot route (T<=1024 on ring4, T<=2048 on direct) gains on ring4 at T=160/256 (-33%/-24% max-rank, beyond the interval) but is slower on direct at every routed T (max-rank +9% to +50%, beyond the interval; rank0 beyond at T=512 +18% and T=2048 +25%). The in-process anchor (grouped PyNCCL, same code in both arms) agrees: in the candidate-49 direct runs at T=2048 the anchor's medians are 1,085/1,309 us against 1,610/1,723 us for the routed gather. direct is the sparknet mode the switched shapes serve with, so this route is worth a look at serving level; candidate-49 (without #996) was not worse on any core metric at tp3-switched.",
+    "Below the mark's T, project_exchange_rows (slices=1 in both arms) is mostly within the interval; beyond it, ring4 T=160 +18.7% (+250 us, max-rank only), ring4 T=2048 +1.8% and T=4096 +1.5% (+73/+106 us), direct T=4096 rank0 +4.5%; gains at ring4 T=256/512 and direct T=1024/2048 (max-rank). The PR says T=160..4096 do not regress.",
+    "Two boots per arm is a narrow interval: at T>=4096 the gather is the same grouped PyNCCL code in both arms, yet direct rank0 shows +11.8%/+13.1% 'beyond the interval' at T=6144/8192 while max-rank is within (-1.5%/+1.1%). Read single small-T 'beyond' cells with that in mind; the T>=6144 project_exchange_rows gains are 1.5-2.8 ms with non-overlapping per-boot CIs.",
+    "The PR's README cites max-rank time, its script reports rank 0; both are recorded here.",
+    "The PR's two scripts are not in the PR. The copies used as the workload reference were on sp2..sp4 /tmp with mtimes seconds before the PR's receipts on sp1 /tmp; they were read, not run.",
+    "Every node was idle, without a hold file, with its GPU lock held, before each run; sp2 was shared with another agent's flock-wrapped jobs, so the first run waited for sp2's lock.",
+    "superseded/ holds a first ring4-c49-boot1 whose warm-up may have been under 100 ms of GPU work (its T=6144 result was 9,787 vs anchor 11,963 us), and two launcher attempts that started no container; their numbers are not used."
+  ],
+  "files": {
+    "commands.txt": "setup commands and every run's record (exact per-rank commands, image IDs, lock/start/end UTC, load, docker ps, exit codes)",
+    "raw/": "each run's per-rank stdout+stderr (<label>-sp1..sp4.txt) and rank 0's JSON (<label>.json, per-iteration times of every rank)",
+    "sequence.log": "the sequence driver's output",
+    "analysis.json": "scripts/analyze.py over raw/",
+    "scripts/": "bench, renderer, launcher, sequence, analysis",
+    "pr-bench-scripts/": "the PR's bench_sp_focused.py and bench_sp_roce.py as found",
+    "superseded/": "runs and attempts not used"
+  }
+}

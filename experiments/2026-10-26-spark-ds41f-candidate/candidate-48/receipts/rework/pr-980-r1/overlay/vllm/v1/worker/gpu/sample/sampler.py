@@ -1,0 +1,516 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+
+import numpy as np
+import torch
+
+import vllm.envs as envs
+from vllm.config.model import PROCESSED_LOGPROBS_MODES, LogprobsMode
+from vllm.config.reasoning import ReasoningConfig
+from vllm.sampling_params import SamplingParams
+from vllm.v1.sample.ops.topk_topp_sampler import (
+    flashinfer_sample,
+    flashinfer_sampler_supported,
+)
+from vllm.v1.worker.gpu.input_batch import (
+    InputBatch,
+    get_num_sampled_and_rejected,
+    logits_rows,
+)
+from vllm.v1.worker.gpu.metrics.logits import get_num_nans
+from vllm.v1.worker.gpu.sample import (
+    tilelang_auxiliary,
+    tilelang_sampling,
+    tilelang_topk_topp,
+)
+from vllm.v1.worker.gpu.sample.bad_words import BadWordsState
+from vllm.v1.worker.gpu.sample.gumbel import gumbel_sample, register_sampling_warmups
+from vllm.v1.worker.gpu.sample.logit_bias import LogitBiasState
+from vllm.v1.worker.gpu.sample.logprob import (
+    LogprobTokenIdsState,
+    compute_topk_scores,
+    register_topk_scores_warmup,
+)
+from vllm.v1.worker.gpu.sample.min_p import register_min_p_warmup
+from vllm.v1.worker.gpu.sample.output import SamplerOutput, SamplingMaskTensors
+from vllm.v1.worker.gpu.sample.penalties import PenaltiesState
+from vllm.v1.worker.gpu.sample.sink import SinkAlternates, SinkSampler
+from vllm.v1.worker.gpu.sample.states import NO_LOGPROBS, SamplingStates
+from vllm.v1.worker.gpu.sample.thinking_budget import ThinkingBudgetState
+from vllm.v1.worker.gpu.sample.trace_replay import TraceReplayState
+from vllm.v1.worker.gpu.states import RequestState
+
+
+class Sampler:
+    def __init__(
+        self,
+        max_num_reqs: int,
+        vocab_size: int,
+        device: torch.device,
+        req_states: RequestState,
+        logprobs_mode: LogprobsMode = "raw_logprobs",
+        num_speculative_tokens: int = 1,
+        use_fp64_gumbel: bool = False,
+        enable_trace_replay: bool = False,
+        reasoning_config: ReasoningConfig | None = None,
+        return_sampling_mask: bool = False,
+        seed: int | None = None,
+    ):
+        self.logprobs_mode = logprobs_mode
+        self.compute_nans = envs.VLLM_COMPUTE_NANS_IN_LOGITS  # False by default.
+        self.use_fp64_gumbel = use_fp64_gumbel
+
+        self.req_states = req_states
+        # Unseeded requests' seeds follow the configured seed (ModelConfig.seed).
+        self.sampling_states = SamplingStates(max_num_reqs, vocab_size, seed=seed)
+        self.penalties_state = PenaltiesState(req_states)
+        self.logit_bias_state = LogitBiasState(max_num_reqs, device)
+        self.bad_words_state = BadWordsState(req_states)
+        self.logprob_token_ids_state = LogprobTokenIdsState(max_num_reqs, device)
+        self.thinking_budget_state = ThinkingBudgetState(req_states, reasoning_config)
+        self.trace_replay_state = (
+            TraceReplayState(req_states) if enable_trace_replay else None
+        )
+        self.needs_logits_processing = np.zeros(max_num_reqs, dtype=bool)
+        self.needs_non_temperature_logits_processing = np.zeros(
+            max_num_reqs, dtype=bool
+        )
+        self.num_speculative_tokens = num_speculative_tokens
+        self.return_sampling_mask = return_sampling_mask
+        self.use_flashinfer = (
+            not return_sampling_mask and flashinfer_sampler_supported()
+        )
+        # Sink rejection (set by the model runner): the alternates of each
+        # request's draw. The runner turns FlashInfer off with it.
+        self.sink: SinkSampler | None = None
+
+    def add_request(
+        self, req_idx: int, prompt_len: int, sampling_params: SamplingParams
+    ) -> None:
+        self.sampling_states.add_request(req_idx, sampling_params)
+        self.penalties_state.add_request(req_idx, sampling_params)
+        self.logit_bias_state.add_request(req_idx, prompt_len, sampling_params)
+        self.bad_words_state.add_request(req_idx, sampling_params)
+        self.logprob_token_ids_state.add_request(req_idx, sampling_params)
+        self.thinking_budget_state.add_request(req_idx, sampling_params)
+        if self.trace_replay_state is not None:
+            self.trace_replay_state.add_request(req_idx, sampling_params)
+
+        self._update_needs_logits_processing(req_idx)
+
+    def _update_needs_logits_processing(self, req_idx: int) -> None:
+        states = self.sampling_states
+        temperature = states.temperature.np[req_idx]
+        non_temperature = (
+            self.logit_bias_state.use_logit_bias[req_idx]
+            or self.penalties_state.use_penalty[req_idx]
+            or self.bad_words_state.num_bad_words.np[req_idx] > 0
+            or (
+                self.thinking_budget_state.enabled
+                and self.thinking_budget_state.use_thinking_budget[req_idx]
+            )
+            or states.min_p.np[req_idx] != 0.0
+            or states.top_k.np[req_idx] != states.vocab_size
+            or states.top_p.np[req_idx] != 1.0
+        )
+        self.needs_non_temperature_logits_processing[req_idx] = non_temperature
+        self.needs_logits_processing[req_idx] = non_temperature or (
+            temperature != 0.0 and temperature != 1.0
+        )
+
+    def any_non_temperature_logits_processing(
+        self, idx_mapping_np: np.ndarray
+    ) -> bool:
+        flags = getattr(
+            self,
+            "needs_non_temperature_logits_processing",
+            self.needs_logits_processing,
+        )
+        return bool(np.any(flags[idx_mapping_np]))
+
+    def set_forced_thinking_end(self, req_indices: set[int]) -> set[int]:
+        changed, newly_forced = self.thinking_budget_state.set_forced_end_requests(
+            req_indices
+        )
+        if not changed:
+            return newly_forced
+        for req_idx in changed:
+            self._update_needs_logits_processing(req_idx)
+        self.thinking_budget_state.apply_staged_writes()
+        return newly_forced
+
+    def register_warmups(
+        self,
+        *,
+        logits: tuple[tuple[torch.dtype, int], ...],
+        processed_logits_strides: tuple[int, ...],
+        vocab_size: int,
+    ) -> None:
+        """Register the kernels sampling launches, for ``vocab_size``-wide raw
+        logits given as ``(dtype, row stride)`` pairs and their processed FP32
+        copies (rows ``processed_logits_strides`` apart), and the staged writes of
+        the per-request sampling state."""
+        processed = tuple(
+            (torch.float32, stride) for stride in processed_logits_strides
+        )
+        for logits_stride in processed_logits_strides:
+            register_min_p_warmup(logits_stride=logits_stride, vocab_size=vocab_size)
+        # Top-k / top-p over the processed logits, at up to every request's rows,
+        # and the gathers of their per-request values (get_top_k_top_p).
+        self.sampling_states.register_warmups()
+        tilelang_topk_topp.register_top_k_top_p(
+            logits_strides=processed_logits_strides,
+            vocab_size=vocab_size,
+            max_rows=self.sampling_states.max_num_reqs * self.num_speculative_tokens,
+        )
+        register_sampling_warmups(
+            logits=(*logits, *processed),
+            processed_logits_strides=processed_logits_strides,
+            vocab_size=vocab_size,
+            use_fp64=self.use_fp64_gumbel,
+        )
+        self.penalties_state.register_warmups(processed_logits_strides)
+        self.logit_bias_state.register_warmups(processed_logits_strides, vocab_size)
+        self.bad_words_state.register_warmups(processed_logits_strides)
+        self.thinking_budget_state.register_warmups(processed_logits_strides)
+        if self.compute_nans:
+            # The raw logits' NaN count, here and in the rejection sampler.
+            tilelang_auxiliary.register_nan_counts(logits=logits, vocab_size=vocab_size)
+        self.logprob_token_ids_state.register_warmups()
+        if self.trace_replay_state is not None:
+            register_trace_warmups = getattr(
+                self.trace_replay_state, "register_warmups", None
+            )
+            if register_trace_warmups is not None:
+                register_trace_warmups()
+            else:
+                self.trace_replay_state.trace_token_ids.register_warmup()
+        if getattr(self, "return_sampling_mask", False):
+            from vllm.v1.worker.gpu.sample import tilelang_sampling
+
+            tilelang_sampling.declare(
+                lambda: tilelang_sampling.compact_sampling_mask_calls(
+                    logits_dtypes=(torch.float32, *(dtype for dtype, _ in logits))
+                )
+            )
+        register_topk_scores_warmup(
+            logits=processed
+            if self.logprobs_mode in PROCESSED_LOGPROBS_MODES
+            else logits,
+            vocab_size=vocab_size,
+            logits_mode=self.logprobs_mode in ("raw_logits", "processed_logits"),
+        )
+
+    def apply_staged_writes(self) -> None:
+        self.sampling_states.apply_staged_writes()
+        self.penalties_state.apply_staged_writes()
+        self.logit_bias_state.apply_staged_writes()
+        self.bad_words_state.apply_staged_writes()
+        self.logprob_token_ids_state.apply_staged_writes()
+        self.thinking_budget_state.apply_staged_writes()
+        if self.trace_replay_state is not None:
+            self.trace_replay_state.apply_staged_writes()
+
+    def get_logprobs_dims(self, idx_mapping_np: np.ndarray) -> tuple[int, int] | None:
+        """(num_logprobs, max_per_req_token_ids) for the given requests, or
+        None when none of them want logprobs."""
+        max_num_logprobs = self.sampling_states.max_num_logprobs(idx_mapping_np)
+        max_token_ids = self.logprob_token_ids_state.max_num_token_ids(idx_mapping_np)
+        if max_num_logprobs == NO_LOGPROBS and max_token_ids == 0:
+            return None
+        num_logprobs = max_num_logprobs if max_num_logprobs != NO_LOGPROBS else 0
+        return num_logprobs, max_token_ids
+
+    def __call__(
+        self,
+        logits: torch.Tensor,
+        input_batch: InputBatch,
+    ) -> SamplerOutput:
+        expanded_idx_mapping = input_batch.expanded_idx_mapping
+        idx_mapping = input_batch.idx_mapping
+        idx_mapping_np = input_batch.idx_mapping_np
+        cu_num_logits_np = input_batch.cu_num_logits_np
+        expanded_local_pos = input_batch.expanded_local_pos
+        input_ids, pos = logits_rows(input_batch)
+
+        # NOTE(woosuk): We intentionally compute num_nans before sampling to make clear
+        # that num_nans is computed before applying penalties and temperature.
+        num_nans = get_num_nans(logits) if self.compute_nans else None
+
+        logprobs_dims = self.get_logprobs_dims(idx_mapping_np)
+
+        sampled, processed_logits = self.sample(
+            logits,
+            expanded_idx_mapping,
+            idx_mapping,
+            idx_mapping_np,
+            pos,
+            input_ids,
+            expanded_local_pos,
+            return_logprobs=logprobs_dims is not None,
+        )
+
+        if self.trace_replay_state is not None:
+            # Overwrite sampled tokens with the replay trace up-front so that
+            # computed logprobs reflect the real distribution of the forced token.
+            self.trace_replay_state.apply_trace(sampled, idx_mapping)
+
+        if logprobs_dims is not None:
+            num_logprobs, max_per_req_token_ids = logprobs_dims
+            if self.logprobs_mode in PROCESSED_LOGPROBS_MODES:
+                logits = processed_logits
+            expanded_logits = logits.shape[0] != idx_mapping_np.shape[0]
+            cu_num_logits = cu_num_logits_np.tolist() if expanded_logits else None
+            logprobs_tensors = compute_topk_scores(
+                logits,
+                num_logprobs,
+                sampled,
+                cu_num_logits,
+                logprob_token_ids_state=self.logprob_token_ids_state,
+                expanded_idx_mapping=input_batch.expanded_idx_mapping,
+                max_per_req_token_ids=max_per_req_token_ids,
+                logits_mode=self.logprobs_mode in ("raw_logits", "processed_logits"),
+            )
+        else:
+            logprobs_tensors = None
+
+        # 1 sampled token per request, except chunked-prefill requests
+        # (seq_len < prefill_len) which aren't done prefilling and produce no
+        # output token. num_rejected is always 0 here (one logit per request).
+        # None: the count kernel takes one token a request itself.
+        num_sampled, num_rejected = get_num_sampled_and_rejected(
+            None,
+            input_batch.seq_lens,
+            input_batch.cu_num_logits,
+            input_batch.idx_mapping,
+            self.req_states.prefill_len.gpu,
+        )
+
+        sink_alternates = None
+        if self.sink is not None:
+            alternates = self.sink.alternates_of(
+                processed_logits,
+                input_batch.cu_num_logits,
+                num_sampled,
+                sampled.view(-1, 1),
+                input_ids,
+                idx_mapping,
+                self.sampling_states.temperature.gpu,
+                self.sampling_states.seeds.gpu,
+                pos,
+                mask_rejected_draft=False,
+            )
+            if logprobs_dims is not None:
+                sink_alternates = self.sink.alternate_logprobs_of(
+                    logits,
+                    input_batch.cu_num_logits,
+                    num_sampled,
+                    alternates,
+                    logits_mode=self.logprobs_mode
+                    in ("raw_logits", "processed_logits"),
+                )
+            else:
+                sink_alternates = SinkAlternates(alternates)
+
+        sampling_mask_tensors = None
+        if self.return_sampling_mask:
+            # Size by the validated top_k batch max; wider supports use the bitmask.
+            max_num_kept = int(np.max(self.sampling_states.top_k.np[idx_mapping_np]))
+            sampling_mask_tensors = SamplingMaskTensors.from_logits(
+                processed_logits, num_sampled, max_num_kept
+            )
+
+        # These are GPU tensors.
+        sampler_output = SamplerOutput(
+            # The sampled tokens are expanded to 2D tensor with shape
+            # [num_requests, 1], where each row represents one generated
+            # token per request.
+            sampled_token_ids=sampled.view(-1, 1),
+            logprobs_tensors=logprobs_tensors,
+            num_nans=num_nans,
+            num_sampled=num_sampled,
+            num_rejected=num_rejected,
+            sampling_mask_tensors=sampling_mask_tensors,
+            sink_alternates=sink_alternates,
+        )
+        return sampler_output
+
+    def apply_sampling_params(
+        self,
+        logits: torch.Tensor,
+        expanded_idx_mapping: torch.Tensor,
+        idx_mapping: torch.Tensor,
+        idx_mapping_np: np.ndarray,
+        pos: torch.Tensor,
+        input_ids: torch.Tensor,
+        expanded_local_pos: torch.Tensor,
+        skip_top_k_top_p: bool = False,
+        skip_temperature: bool = False,
+    ) -> torch.Tensor:
+        if skip_temperature:
+            if not self.any_non_temperature_logits_processing(idx_mapping_np):
+                return logits
+        elif not np.any(self.needs_logits_processing[idx_mapping_np]):
+            return logits
+
+        # Copy logits to a new FP32 tensor.
+        logits = tilelang_sampling.copy_logits(logits)
+
+        # Apply logit bias (e.g., allowed_token_ids, min_tokens) in place.
+        self.logit_bias_state.apply_logit_bias(
+            logits, expanded_idx_mapping, idx_mapping_np, pos
+        )
+
+        # Apply penalties in place.
+        self.penalties_state.apply_penalties(
+            logits,
+            expanded_idx_mapping,
+            idx_mapping_np,
+            input_ids,
+            expanded_local_pos,
+        )
+
+        # Apply bad words masking in place.
+        self.bad_words_state.apply_bad_words(
+            logits,
+            expanded_idx_mapping,
+            idx_mapping_np,
+            input_ids,
+            expanded_local_pos,
+        )
+
+        # Force the reasoning end marker once a request's thinking budget is
+        # reached; applied before temperature so the forced token is always kept.
+        self.thinking_budget_state.apply(
+            logits,
+            expanded_idx_mapping,
+            idx_mapping,
+            idx_mapping_np,
+            input_ids,
+            expanded_local_pos,
+        )
+
+        if not skip_temperature:
+            # Apply temperature in place.
+            self.sampling_states.apply_temperature(
+                logits, expanded_idx_mapping, idx_mapping_np
+            )
+
+        # Apply min_p in place.
+        self.sampling_states.apply_min_p(logits, expanded_idx_mapping, idx_mapping_np)
+
+        if skip_top_k_top_p:
+            return logits
+
+        # Apply top_k and/or top_p. This might or might not return a new tensor.
+        return self.sampling_states.apply_top_k_top_p(
+            logits, expanded_idx_mapping, idx_mapping_np
+        )
+
+    def sample(
+        self,
+        logits: torch.Tensor,
+        expanded_idx_mapping: torch.Tensor,
+        idx_mapping: torch.Tensor,
+        idx_mapping_np: np.ndarray,
+        pos: torch.Tensor,
+        input_ids: torch.Tensor,
+        expanded_local_pos: torch.Tensor,
+        return_logprobs: bool = False,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        in_kernel_temperature = (
+            type(self) is Sampler
+            and not getattr(self, "use_fp64_gumbel", False)
+            and bool(np.any(self.needs_logits_processing[idx_mapping_np]))
+            and not self.any_non_temperature_logits_processing(idx_mapping_np)
+            and not (return_logprobs and self.logprobs_mode in PROCESSED_LOGPROBS_MODES)
+            and not getattr(self, "return_sampling_mask", False)
+            and getattr(self, "sink", None) is None
+        )
+        processed_logits = self.apply_sampling_params(
+            logits,
+            expanded_idx_mapping,
+            idx_mapping,
+            idx_mapping_np,
+            pos,
+            input_ids,
+            expanded_local_pos,
+            skip_top_k_top_p=True,
+            skip_temperature=in_kernel_temperature,
+        )
+        top_k, top_p = self.sampling_states.get_top_k_top_p(
+            expanded_idx_mapping, idx_mapping_np
+        )
+        use_flashinfer = self.use_flashinfer and not (
+            # Don't use FI sampler if no requests use top_k/top_p, if there are
+            # any greedy requests or per-request seeds, if multi-rank TP needs
+            # lockstep counter-based RNG across ranks, or if post-processed
+            # logprobs need to be returned for any requests.
+            (top_k is None and top_p is None)
+            or (return_logprobs and self.logprobs_mode in PROCESSED_LOGPROBS_MODES)
+            or self.sampling_states.any_greedy(idx_mapping_np)
+            or self.sampling_states.any_explicit_seed(idx_mapping_np)
+            or self._tp_lockstep_sampling()
+        )
+
+        if in_kernel_temperature:
+            return self._sample_random(
+                processed_logits,
+                expanded_idx_mapping,
+                idx_mapping_np,
+                pos,
+                top_k,
+                top_p,
+                use_flashinfer,
+                apply_temperature=True,
+            )
+        return self._sample_random(
+            processed_logits,
+            expanded_idx_mapping,
+            idx_mapping_np,
+            pos,
+            top_k,
+            top_p,
+            use_flashinfer,
+        )
+
+    def _tp_lockstep_sampling(self) -> bool:
+        """Whether multi-rank TP requires counter-based seeded sampling across ranks."""
+        from vllm.distributed.parallel_state import (
+            get_tensor_model_parallel_world_size,
+            model_parallel_is_initialized,
+        )
+
+        return (
+            model_parallel_is_initialized()
+            and get_tensor_model_parallel_world_size() > 1
+        )
+
+    def _sample_random(
+        self,
+        processed_logits: torch.Tensor,
+        expanded_idx_mapping: torch.Tensor,
+        idx_mapping_np: np.ndarray,
+        pos: torch.Tensor,
+        top_k: torch.Tensor | None,
+        top_p: torch.Tensor | None,
+        use_flashinfer: bool,
+        apply_temperature: bool = False,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        if use_flashinfer:
+            sampled = flashinfer_sample(processed_logits, top_k, top_p).to(torch.int64)
+        else:
+            processed_logits = tilelang_topk_topp.apply_top_k_top_p(
+                processed_logits, top_k, top_p
+            )
+            sampled = gumbel_sample(
+                processed_logits,
+                expanded_idx_mapping,
+                self.sampling_states.temperature.gpu,
+                self.sampling_states.seeds.gpu,
+                pos,
+                apply_temperature=apply_temperature,
+                is_drafting=False,
+                use_fp64=self.use_fp64_gumbel,
+            )
+        return sampled, processed_logits

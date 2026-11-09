@@ -1,0 +1,45 @@
+perf(spec_decode): elide TP confidence broadcasts and lockstep TP sampling seeds
+
+Upstream-Base: https://github.com/local-inference-lab/vllm.git@19f2c20ed4d64ae22bd009ceacadd85e2a81e354
+Upstream-Status: local
+
+Rationale:
+1. SamplingStates.add_request previously drew unseeded per-request seeds from
+   the process-global NumPy RNG (np.random.randint). Any rank-asymmetric call
+   to np.random desynchronized seeds across TP ranks, causing gumbel_sample
+   and rejection_sample to draw different draft and verified tokens per rank,
+   diverging DSparkConfidenceHead inputs and OnlineAcceptanceEstimator IRLS
+   parameters across TP ranks when the per-step confidence broadcast is elided.
+   Give SamplingStates an isolated generator keyed by the configured seed
+   (self._seed_rng = np.random.default_rng(seed), where seed is ModelConfig.seed,
+   the value the worker passes to set_random_seed; the model runner hands it to
+   Sampler(seed=...), and vLLM's default seed 0 stands in when none is given), so
+   all TP ranks assign bit-identical seeds to unseeded requests in lockstep and
+   --seed still selects their stream, as it did through the global RNG.
+2. Sampler.sample previously dispatched unseeded top_k/top_p requests to
+   flashinfer_sample, which ignores per-request seeds and uses rank-local CUDA
+   RNG state. When TP world_size > 1, route top_k/top_p sampling through the
+   deterministic counter-based TileLang top-k/top-p + gumbel_sample path keyed
+   by (seeds.gpu, pos).
+3. Mark OnlineAcceptanceEstimator as tp_invariant = True, reuse persistent
+   _scratch_stats buffers in predict(), expose predict_from_stats() for
+   vocab-parallel draft stats, and expose DraftModelSpeculator.tp_invariant_confidence.
+   The model runner hands the speculator's value to AdaptiveVerificationManager
+   when it creates it, so logit- and shard-stat-based acceptance estimation also
+   elides the per-step rank-0 confidence broadcast on rank-ordered TP
+   communicators. AdaptiveVerificationManager.record_confidences is unchanged:
+   it reads that stored flag as before, so the greedy DSpark decode step (whose
+   confidence head already elides the broadcast) runs no line of this patch.
+
+Quality:
+Lossless. Preserves exact sampling distributions while guaranteeing 100%
+cross-rank bitwise determinism across TP ranks for both greedy and sampled
+speculative decoding.
+
+Tests:
+- pytest tests/v1/spec_decode/test_adaptive_verification.py
+- pytest tests/v1/spec_decode/test_acceptance_estimator.py
+- pytest tests/v1/spec_decode/test_copy_drafts.py
+- pytest tests/v1/worker/test_dspark_greedy_markov.py
+- pytest tests/distributed/test_roce_policy_no_fallback.py
+- pytest tests/kernels/test_deepseek_v41_tilelang_confidence.py

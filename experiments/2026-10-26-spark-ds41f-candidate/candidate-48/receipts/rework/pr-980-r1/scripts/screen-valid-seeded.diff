@@ -1,0 +1,31 @@
+--- screen_zero_broadcast_sync_rowsfix_valid.py	2026-11-09 10:38:12.460751718 +0000
++++ screen_zero_broadcast_sync_rowsfix_valid_seeded.py	2026-11-09 11:12:45.302073410 +0000
+@@ -282,7 +282,11 @@
+         mgr.calibrated_confidence = lambda: est._refits > 0
+ 
+         # Set up SamplingStates
+-        states = SamplingStates(num_reqs, vocab_size)
++        states = (
++            SamplingStates(num_reqs, vocab_size)
++            if args.sampling_seed is None
++            else SamplingStates(num_reqs, vocab_size, seed=args.sampling_seed)
++        )
+         # Intentionally perturb process-global np.random asymmetrically per rank!
+         np.random.seed(1000 + rank * 7919)
+         _ = np.random.randint(0, 100000, size=rank * 17 + 3)
+@@ -621,6 +625,7 @@
+ 
+         return {
+             "mode": mode,
++            "sampling_seed": args.sampling_seed,
+             "steps": steps_verify,
+             "broadcast_calls": broadcast_calls,
+             "seeds_equal_across_ranks": seeds_equal,
+@@ -1033,6 +1038,7 @@
+     parser.add_argument("--master-port", type=int, default=29740)
+     parser.add_argument("--verify-steps", type=int, default=1000)
+     parser.add_argument("--bench-iters", type=int, default=1000)
++    parser.add_argument("--sampling-seed", type=int, default=None)
+     parser.add_argument("--out-dir", type=str, default="/tmp/zero-bcast-receipts")
+     parser.add_argument("--vllm-dir", type=str, default="/tmp/zero-bcast-vllm")
+     parser.add_argument("--image", type=str, default="spark-ds41f:1107")

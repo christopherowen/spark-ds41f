@@ -1,0 +1,71 @@
+--- screen_zero_broadcast_sync.py	2026-11-09 08:50:06.647787338 +0000
++++ screen_zero_broadcast_sync_rowsfix_valid.py	2026-11-09 10:38:12.460751718 +0000
+@@ -317,6 +317,7 @@
+         hist_cap = torch.empty((steps_verify, num_reqs), dtype=torch.int32, device=device)
+         hist_dead = torch.empty((steps_verify, num_reqs), dtype=torch.int32, device=device)
+         hist_sampled = torch.empty((steps_verify, num_reqs, 1 + num_steps), dtype=torch.int64, device=device)
++        hist_sampled_raw = torch.empty((steps_verify, num_reqs, 1 + num_steps), dtype=torch.int64, device=device)
+         hist_nsampled = torch.empty((steps_verify, num_reqs), dtype=torch.int32, device=device)
+         hist_slope = torch.empty((steps_verify, 1), dtype=torch.float32, device=device)
+         hist_inter = torch.empty((steps_verify, num_steps), dtype=torch.float32, device=device)
+@@ -535,10 +536,18 @@
+                 proc_logits = tilelang_topk_topp.apply_top_k_top_p(
+                     target_logits, top_k_t, top_p_t
+                 )
++                # rejection_sample reads draft_sampled as [num_logits], each
++                # request's drafts at its rows 1..num_steps (the worker passes
++                # input_ids[logits_indices]); draft_tokens.view(-1) is only
++                # num_reqs * num_steps long.
++                draft_rows = torch.zeros(
++                    (num_reqs, 1 + num_steps), dtype=draft_tokens.dtype, device=device
++                )
++                draft_rows[:, 1:] = draft_tokens
+                 sampled_tokens, num_sampled = rejection_sample(
+                     proc_logits,
+                     draft_logits,
+-                    draft_tokens.view(-1),
++                    draft_rows.view(-1),
+                     cu_num_logits,
+                     pos_verify,
+                     idx_mapping,
+@@ -552,6 +561,14 @@
+                     use_block_verification=False,
+                     dead_row_cut=dead_cut,
+                 )
++                raw_sampled = sampled_tokens.clone()
++                written = (
++                    torch.arange(1 + num_steps, device=device)[None, :]
++                    < num_sampled.to(torch.int64)[:, None]
++                )
++                sampled_tokens = torch.where(
++                    written, sampled_tokens, torch.full_like(sampled_tokens, -1)
++                )
+                 num_accepted = (num_sampled - 1).clamp_min(0)
+                 num_rejected = (dead_cut - num_accepted).clamp_min(0)
+ 
+@@ -564,6 +581,9 @@
+             hist_cap[step].copy_(capacities_t)
+             hist_dead[step].copy_(dead_cut)
+             hist_sampled[step].copy_(sampled_tokens.view(num_reqs, 1 + num_steps))
++            hist_sampled_raw[step].copy_(
++                (sampled_tokens if is_greedy else raw_sampled).view(num_reqs, 1 + num_steps)
++            )
+             hist_nsampled[step].copy_(num_sampled)
+             hist_slope[step].copy_(est.slope)
+             hist_inter[step].copy_(est.intercepts)
+@@ -592,6 +612,7 @@
+         mismatch_capacities_steps, _ = count_step_mismatches(hist_cap)
+         mismatch_dead_cut_steps, _ = count_step_mismatches(hist_dead)
+         mm_s1, _ = count_step_mismatches(hist_sampled)
++        mismatch_sampled_raw_steps, _ = count_step_mismatches(hist_sampled_raw)
+         mm_s2, _ = count_step_mismatches(hist_nsampled)
+         mismatch_sampled_steps = max(mm_s1, mm_s2)
+         mm_e1, max_slope_abs_diff = count_step_mismatches(hist_slope)
+@@ -610,6 +631,7 @@
+             "mismatch_capacities_steps": mismatch_capacities_steps,
+             "mismatch_dead_cut_steps": mismatch_dead_cut_steps,
+             "mismatch_sampled_steps": mismatch_sampled_steps,
++            "unchecked_sampled_raw_steps": mismatch_sampled_raw_steps,
+             "mismatch_estimator_steps": mismatch_estimator_steps,
+             "max_conf_abs_diff": round(max_conf_abs_diff, 8),
+             "max_slope_abs_diff": round(max_slope_abs_diff, 8),

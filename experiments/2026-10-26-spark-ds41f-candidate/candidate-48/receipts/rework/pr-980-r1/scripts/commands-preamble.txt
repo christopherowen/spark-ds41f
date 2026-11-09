@@ -1,0 +1,55 @@
+# PR #980 rework r1 -- commands (sp2 = spark-0010, NVIDIA GB10; work dir ~/spark-lab/agents/candidate-48-rework-980)
+# Preconditions checked before any GPU work: ~/spark-hold.json absent on sp2 (NO_HOLD), ~/spark-request.json absent,
+# `docker ps` empty. Every GPU command ran under `flock /tmp/spark-lab-gpu.lock`. Images: spark-ds41f:candidate-48
+# (sha256:d6ffd842978849651e756ebd39e9bf2da7ddb03e746113013533029878485a24), spark-ds41f:1107 (sha256:3f32a962ce04...).
+# No build, no cluster start/stop, no push/commit to GitHub, sp2's deployment checkout untouched (only used as
+# --reference for the clone).
+
+## setup (no GPU)
+git clone --reference ~/projects/spark-ds41f https://github.com/christopherowen/spark-ds41f.git repo
+git -C repo fetch origin pull/980/head:pr-980                      # PR head 11b169b0dd07
+git -C repo show pr-980:experiments/2026-11-08-spec-decode-zero-broadcast-sync/screen_zero_broadcast_sync.py > screen_zero_broadcast_sync.py
+for img in candidate-48 1107; do cid=$(docker create spark-ds41f:$img true); docker cp $cid:/opt/spark-ds41f/candidate/vllm/vllm trees/$img/vllm; docker cp $cid:/opt/spark-ds41f/candidate/vllm/tests trees/$img/tests; docker rm $cid; done
+# candidate-48's patch dir (0762..0771 + series) and receipts copied from the coordinator's worktree into
+# repo/experiments/2026-10-26-spark-ds41f-candidate/candidate-48/vllm so the series' relative paths resolve.
+
+## vLLM source at the lock, patch stack (as spark_ds41f/build.py: git am, fixed committer, --committer-date-is-author-date)
+git clone --filter=blob:none --no-checkout https://github.com/local-inference-lab/vllm.git vllm-src
+git -C vllm-src switch -c rework/980-r1-base 19f2c20ed4d64ae22bd009ceacadd85e2a81e354
+./apply_series.sh vllm-src repo/experiments/2026-10-26-spark-ds41f-candidate/candidate-48/vllm/series 0763-fix-prefix   # 643 patches -> e7f6eca9c
+git -C vllm-src branch base-0763 HEAD
+# reproduce candidate-48: original 0764..0771 on base-0763 -> patch_head bd28dbf3b67301bbf285dedfeb1853835f4e0a4e,
+# tree fe5bddc4df277d37838339fbed09576c3219e34d (= candidate-48 upstreams.lock.json); 0764 commit 8ccd7cd4e648.
+# The six files in that tree equal the candidate-48 image's; base-0763's equal the 1107 image's and no980/overlay.
+
+## the correction
+git -C vllm-src switch -c rework/980-r1 base-0763
+git -C vllm-src am --committer-date-is-author-date .../candidate-48/vllm/0764-perf-spec-decode-elide-tp-confidence-broadcast-and-lock-sampling-seeds.patch
+git -C vllm-src checkout base-0763 -- vllm/v1/worker/gpu/spec_decode/adaptive_verification.py
+git -C vllm-src commit --amend -F r1-msg.txt      # author and author date kept: Christopher Owen, Sun 8 Nov 2026 15:19:42 +0000
+git -C vllm-src diff --check base-0763 HEAD       # clean
+git -C vllm-src format-patch -1 HEAD --stdout > deliver/0764-perf-spec-decode-elide-tp-confidence-broadcast-and-lock-sampling-seeds.patch
+# stack check: corrected 0764 then 0765..0771 on base-0763, all apply -> patch_head 91b1f432c5c103b1a06c2d2199c90c5f3851626a,
+# tree 70fb6f9ad870df963f1c944a4fd3dab598d85662; `git diff --check 19f2c20 HEAD` clean; the only difference from
+# candidate-48's tree is adaptive_verification.py (1 insertion, 4 deletions).
+# overlay ov/r1 = the six files of that tree; ov/1107 = candidate-48/no980/overlay; ov/c48 = the candidate-48 image's six files.
+
+## the --seed correction (same round, after the coordinator's follow-up)
+git -C vllm-src branch rework/980-r1-noseed rework/980-r1     # the first r1, kept (superseded/r1-noseed/)
+python3 edit_r1_seed.py vllm-src                              # states.py, sampler.py, model_runner.py, test file
+python3 -m py_compile <the four files>; git -C vllm-src diff --check   # clean
+git -C vllm-src commit --amend -F r1-seed-msg.txt             # author and author date kept
+git -C vllm-src format-patch -1 HEAD --stdout > deliver/0764-perf-spec-decode-elide-tp-confidence-broadcast-and-lock-sampling-seeds.patch
+# stack check: corrected 0764 then 0765..0771 on base-0763, all apply -> patch_head b180aa08ce3181664328abaf7b5b2a5d61463081,
+# tree 21156b980a4322fa064eedddbe6d3b6169fa4433; `git diff --check 19f2c20 HEAD` clean.
+# overlay ov/r1seed = the seven files of that tree (model_runner.py = the candidate-48 image's + 3 lines).
+python3 make_valid_seeded.py screen_zero_broadcast_sync_rowsfix_valid.py screen_zero_broadcast_sync_rowsfix_valid_seeded.py
+python3 changed_lines.py vllm-src base-0763 rework/980-r1 out/trace-r1seed.json > out/executed-changed-lines-r1seed.json
+# batch-seed.sh: pytest-r1seed-boot{1,2}, screen-r1seed-boot{1,2}-tp{3,4} (--sampling-seed 1234), trace-r1seed
+
+## measured runs (each entry below: label, UTC start/end, exit code, exact command; raw output in raw/<label>.txt)
+# start_utc is when run.sh was invoked and includes any wait on /tmp/spark-lab-gpu.lock (batches overlapped and
+# serialized on the lock). smoke-* entries are untimed smoke checks of the benches, kept as recorded.
+# The out/ paths inside the commands are raw/ here. Exit 134 = the screen aborted on the illegal memory access;
+# exit 1 = the screen's own assertion (raw uninitialized sampled tail, see result.json tp2_finding).
+# Runs before pytest-r1seed-boot1 used ov/r1 = superseded/r1-noseed/overlay; r1seed runs use overlay/.
