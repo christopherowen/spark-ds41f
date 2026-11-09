@@ -990,3 +990,33 @@ switchless `tp4-ring` and `tp3-triangle` (`dgx1..dgx4`), and switched `tp3-switc
   `<3.46 GiB` (which tripped `spark-memguard`'s `4.0 GiB` startup floor during speculator capture)
   to `6.03..6.45 GiB` on head `sp5` and `7.94..8.10 GiB` on followers `sp6..sp7` across two boots.
 - **Full details:** see [1107/README.md](1107/README.md) and [release-notes.md](release-notes.md).
+
+## Candidate 47 ([candidate-47/](candidate-47))
+
+spark-ds41f-1107 plus #986, #966, #997, #1005, #965, #1012, #1016, #964, tested at `tp4-ring` (dgx1..dgx4). Candidates 47, 48 and 49
+are tested at the same time, one per testbed. The PRs that earn their keep are merged into the next
+candidate, which is qualified on all shapes. Marks, runs and rework rules are in its README.
+
+- **Series:** [candidate-47/vllm/series](candidate-47/vllm/series) (`0001..0769`, 649 patches;
+  `patchset_sha256` `d5160a07`, `patch_head` `fd03994c`, `expected_tree` `eb6f1070`).
+- **Status:** prepared and locked; not built, not measured.
+
+## Candidate 48 ([candidate-48/](candidate-48))
+
+spark-ds41f-1107 plus #955, #1010, #980, #1013, #972, #1011, #973, tested at `tp4-switched` (sp1..sp4). Candidates 47, 48 and 49
+are tested at the same time, one per testbed. The PRs that earn their keep are merged into the next
+candidate, which is qualified on all shapes. Marks, runs and rework rules are in its README.
+
+- **Series:** [candidate-48/vllm/series](candidate-48/vllm/series) (`0001..0771`, 651 patches;
+  `patchset_sha256` `95a7270c`, `patch_head` `bd28dbf3`, `expected_tree` `fe5bddc4`).
+- **Status:** prepared and locked; not built, not measured.
+
+## Candidate 49 ([candidate-49/](candidate-49))
+
+spark-ds41f-1107 plus #999, #993, #991, #1009, #979, #996, tested at `tp3-switched` (sp5..sp7). Candidates 47, 48 and 49
+are tested at the same time, one per testbed. The PRs that earn their keep are merged into the next
+candidate, which is qualified on all shapes. Marks, runs and rework rules are in its README.
+
+- **Series:** [candidate-49/vllm/series](candidate-49/vllm/series) (`0001..0767`, 647 patches;
+  `patchset_sha256` `ee85de7e`, `patch_head` `d0ee539e`, `expected_tree` `2eaad40f`).
+- **Status:** prepared and locked; not built, not measured.

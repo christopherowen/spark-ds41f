@@ -1,0 +1,1176 @@
+From 3515dba65257e6d4260b2362ce2842c4c832d9cb Mon Sep 17 00:00:00 2001
+From: Christopher Owen <3221756+christopherowen@users.noreply.github.com>
+Date: Sun, 8 Nov 2026 23:45:00 +0100
+Subject: [PATCH] perf(dsv41): fuse SP prefill local attention front and keep
+ index_weights local
+
+Base: 1107 vLLM patch head 2756478b60b90700b9918b457aeb38657da637b5.
+
+Rationale:
+In DeepSeek-V4.1 sequence-parallel prefill (`sp_rows is not None`) across all 54 layers without a KV compressor (`self.compressor is None` and `replicated_sp_prefill == True`), `_gather_front` previously ran `q_norm` (`2,560 B/row` BF16), `kv_norm` (`1,024 B/row` BF16), and `indexer.weights_proj` (`64 B/row` BF16) on local `L` rows, packed them via `copy_columns`, all-gathered `3,648 B/row` of BF16 across all TP ranks, unpacked via `split_columns`, and then ran `cast_mxfp8(qr)` and `_cache_context_kv(kv, positions)` (`rope_` + `write_cache(..., cache_kind="swa")`) redundantly on all `T` gathered rows on every rank. However:
+1. Neither `self.wq_b` nor `self.indexer.wq_b` reads the BF16 `qr` values when `mxfp8_inputs` (`q_cast`) is supplied.
+2. `forward_mqa` never reads its `kv` argument once the SWA cache pages are written.
+3. `_index_query` slices `index_weights[first:last]` where `[first, last) = [split.start, split.start + split.real_rows)`, so each rank only ever consumes its own local `real_rows` slice unless `_INDEX_SPLIT_CHECK` is enabled.
+
+Introduce:
+- `sp_attention_front_kernel` / `sp_attention_front` in `vllm/models/deepseek_v4_1/tilelang/front.py`: a single fused TileLang kernel on local `real_rows` (`qr_kv[:real, :1792]`) that RMS-normalizes `qr` (`1280`) and casts it directly to MXFP8 (`1,280 B` E4M3 values + `40 B` UE8M0 scales = `1,320 B/row`), and RMS-normalizes `kv` (`512`), applies NeoX RoPE on the 64 dim-pairs using `positions[start:start + real]`, and packs the 528-byte SWA KV record (`512 B` E4M3 + `16 B` UE8M0 scales) per row.
+- `swa_records_kernel` / `write_swa_records` in `vllm/models/deepseek_v4_1/tilelang/cache_writer.py`: scatters gathered 528-byte SWA records (`[T, 528]`) into paged `swa_cache_layer.kv_cache` at `slot_mapping[:T]` via 128-bit `dsv41_copy_b128` vector copies.
+- `_sp_front` in `vllm/models/deepseek_v4_1/attention.py`: replaces `_gather_front`, keeping `index_weights = self.indexer.weights_proj(hidden_states)[:real]` rank-local (unless `_INDEX_SPLIT_CHECK` is enabled) and all-gathering `(local_q_cast, local_records)` via `sp_rows.gather_mxfp8` (`1,848 B/row` vs `3,648 B/row`, `-49.34%` collective payload; `-1,518.75 MiB` across 54 layers at `T=16,384`, `TP=4`), then scattering SWA records into `swa_cache_layer.kv_cache`.
+
+Quality:
+100% bit-exact (`torch.equal`, 0 uint16/uint8 diffs) against the 5-kernel reference sequence (`q_norm`, `cast_mxfp8`, `kv_norm`, `rope_`, `write_cache`) across `TP=3` and `TP=4` including non-divisible token counts (`real_rows < local_rows` on tail ranks).
+
+Tests:
+- pytest tests/kernels/test_deepseek_v41_tilelang_front.py tests/models/test_deepseek_v4_1_attention.py tests/models/test_sp_prefill.py tests/models/test_sp_prefill_e2e.py (368 passed across 2 boots, 0 PDL violations).
+
+Upstream status: local DeepSeek-V4.1 SM12x TileLang sequence-parallel prefill optimization.
+---
+ .../test_deepseek_v41_tilelang_front.py       | 103 ++++
+ tests/models/test_deepseek_v4_1_attention.py  | 188 ++++++++
+ vllm/models/deepseek_v4_1/attention.py        | 144 ++++--
+ vllm/models/deepseek_v4_1/sp_prefill.py       |   6 +-
+ .../deepseek_v4_1/tilelang/cache_writer.py    | 111 ++++-
+ vllm/models/deepseek_v4_1/tilelang/front.py   | 450 +++++++++++++++---
+ 6 files changed, 880 insertions(+), 122 deletions(-)
+
+diff --git a/tests/kernels/test_deepseek_v41_tilelang_front.py b/tests/kernels/test_deepseek_v41_tilelang_front.py
+index 5fee245be..2cfe007b4 100644
+--- a/tests/kernels/test_deepseek_v41_tilelang_front.py
++++ b/tests/kernels/test_deepseek_v41_tilelang_front.py
+@@ -21,6 +21,7 @@ pytest.importorskip("tile_kernels")
+ from vllm.models.deepseek_v4_1.tilelang.cache_writer import (  # noqa: E402
+     RECORD_BYTES,
+     write_cache,
++    write_swa_records,
+ )
+ from vllm.models.deepseek_v4_1.tilelang.front import (  # noqa: E402
+     KV_LATENT,
+@@ -28,6 +29,7 @@ from vllm.models.deepseek_v4_1.tilelang.front import (  # noqa: E402
+     ROPE_DIM,
+     attention_front,
+     context_kv_front,
++    sp_attention_front,
+ )
+ from vllm.models.deepseek_v4_1.tilelang.gemm import scale_words  # noqa: E402
+ from vllm.models.deepseek_v4_1.tilelang.pdl import (  # noqa: E402
+@@ -161,3 +163,104 @@ def test_context_kv_front_gives_the_three_kernels_bits(rows, slot_dtype):
+         kv_raw, kv_weight, EPS, positions, table, pages, slots, PAGE_SIZE
+     )
+     _assert_bytes_equal(pages, pages_ref, "context kv cache pages")
++
++
++@pytest.mark.parametrize("slot_dtype", [torch.int64, torch.int32])
++@pytest.mark.parametrize("rows", [1, 2, 3, 6, 8, 9, 16, 24, 48, 64, 65, 512])
++def test_sp_front_and_write_swa_records_give_the_five_kernels_bits(rows, slot_dtype):
++    """``sp_attention_front`` + ``write_swa_records`` match the five-kernel reference
++    bit for bit on ``q_values``, ``q_scales``, and ``pages`` (including strided
++    ``qa_kv`` views, skipped negative/out-of-range slots, and special FP values)."""
++    gen = torch.Generator(device=DEVICE).manual_seed(rows + 200)
++    qa_kv_full = (
++        torch.randn((rows, Q_LATENT + KV_LATENT + 32), generator=gen, device=DEVICE)
++        * 3
++    ).bfloat16()
++    qa_kv = qa_kv_full[:, : Q_LATENT + KV_LATENT]
++    qa_kv[0, :64] = -0.0
++    if rows > 2:
++        qa_kv[1, :] = 0.0
++        qa_kv[2, Q_LATENT + 100] = 1e4
++    if rows > 3:
++        qa_kv[3, :] *= 1e-30
++    q_weight = (
++        torch.randn(Q_LATENT, generator=gen, device=DEVICE) * 0.3 + 1
++    ).bfloat16()
++    kv_weight = (
++        torch.randn(KV_LATENT, generator=gen, device=DEVICE) * 0.3 + 1
++    ).bfloat16()
++    q_weight[:32] = 0.0
++    q_weight[32:64] *= 4096.0
++    positions = torch.randint(0, POSITIONS, (rows,), generator=gen, device=DEVICE)
++    slots = torch.randperm(PAGES * PAGE_SIZE, generator=gen, device=DEVICE)[:rows]
++    slots[rows // 2] = -1
++    if rows > 4:
++        slots[rows - 1] = PAGES * PAGE_SIZE + 5
++    slots = slots.to(slot_dtype)
++    table = _table()
++    page_bytes = PAGE_SIZE * RECORD_BYTES["swa"]
++    pages = torch.empty((PAGES, page_bytes), dtype=torch.uint8, device=DEVICE)
++    pages.random_(generator=gen)
++
++    q_ref = torch.empty((rows, Q_LATENT), dtype=torch.bfloat16, device=DEVICE)
++    norm_forward(qa_kv[:, :Q_LATENT].contiguous(), q_weight, EPS, out=q_ref)
++    kv_ref = torch.empty((rows, KV_LATENT), dtype=torch.bfloat16, device=DEVICE)
++    norm_forward(qa_kv[:, Q_LATENT:].contiguous(), kv_weight, EPS, out=kv_ref)
++    values_ref = torch.empty((rows, Q_LATENT), dtype=torch.float8_e4m3fn, device=DEVICE)
++    scales_ref = torch.empty(
++        (rows, 4 * scale_words(Q_LATENT)), dtype=torch.uint8, device=DEVICE
++    )
++    per_token_cast(
++        q_ref, "e4m3", 32, round_sf=True, use_packed_ue8m0=True,
++        out=(values_ref, scales_ref),
++    )  # fmt: skip
++    rope_(kv_ref, positions, table, 1, False)
++    pages_ref = pages.clone()
++    write_cache(kv_ref, pages_ref, slots, page_size=PAGE_SIZE, cache_kind="swa")
++
++    values = torch.empty_like(values_ref)
++    values.view(torch.uint8).fill_(0x7F)
++    scales = torch.full_like(scales_ref, 0xFF)
++    records = torch.full(
++        (rows, RECORD_BYTES["swa"]), 0xAA, dtype=torch.uint8, device=DEVICE
++    )
++    sp_attention_front(
++        qa_kv, q_weight, kv_weight, EPS, positions, table, values, scales, records
++    )
++    write_swa_records(records, pages, slots, page_size=PAGE_SIZE)
++    _assert_bytes_equal(values, values_ref, "sp q E4M3")
++    _assert_bytes_equal(scales, scales_ref, "sp q scales")
++    _assert_bytes_equal(pages, pages_ref, "sp cache pages")
++
++
++def test_sp_front_and_write_swa_records_empty_and_validation():
++    """Zero-row launches are no-ops and malformed record/page inputs raise ValueError."""
++    table = _table()
++    page_bytes = PAGE_SIZE * RECORD_BYTES["swa"]
++    pages = torch.zeros((PAGES, page_bytes), dtype=torch.uint8, device=DEVICE)
++    q_weight = torch.ones(Q_LATENT, dtype=torch.bfloat16, device=DEVICE)
++    kv_weight = torch.ones(KV_LATENT, dtype=torch.bfloat16, device=DEVICE)
++    sp_attention_front(
++        torch.empty((0, Q_LATENT + KV_LATENT), dtype=torch.bfloat16, device=DEVICE),
++        q_weight,
++        kv_weight,
++        EPS,
++        torch.empty((0,), dtype=torch.int64, device=DEVICE),
++        table,
++        torch.empty((0, Q_LATENT), dtype=torch.float8_e4m3fn, device=DEVICE),
++        torch.empty((0, 4 * scale_words(Q_LATENT)), dtype=torch.uint8, device=DEVICE),
++        torch.empty((0, RECORD_BYTES["swa"]), dtype=torch.uint8, device=DEVICE),
++    )
++    write_swa_records(
++        torch.empty((0, RECORD_BYTES["swa"]), dtype=torch.uint8, device=DEVICE),
++        pages,
++        torch.empty((0,), dtype=torch.int64, device=DEVICE),
++        page_size=PAGE_SIZE,
++    )
++    with pytest.raises(ValueError, match="SWA cache records"):
++        write_swa_records(
++            torch.zeros((2, 16), dtype=torch.uint8, device=DEVICE),
++            pages,
++            torch.zeros((2,), dtype=torch.int64, device=DEVICE),
++            page_size=PAGE_SIZE,
++        )
+diff --git a/tests/models/test_deepseek_v4_1_attention.py b/tests/models/test_deepseek_v4_1_attention.py
+index e25f715cb..0d3956e36 100644
+--- a/tests/models/test_deepseek_v4_1_attention.py
++++ b/tests/models/test_deepseek_v4_1_attention.py
+@@ -1624,3 +1624,191 @@ def test_sp_wo_local_exchange_matches_native_tilelang_kernels_on_sm12x(monkeypat
+             actual_sum = collectives.RankOrderParts(parts).sum()
+             expected_sum = collectives.RankOrderParts(expected).sum()
+             assert torch.equal(actual_sum.view(torch.int16), expected_sum.view(torch.int16))
++
++
++@pytest.mark.parametrize("n_real", [4, 2, 0])
++@pytest.mark.parametrize("split_check", [False, True])
++def test_sp_prefill_with_replicated_fused_wqa_wkv_gathers_mxfp8_and_swa_records(
++    monkeypatch, n_real, split_check
++):
++    """When ``fused_wqa_wkv`` is replicated across TP, SP prefill without a compressor
++    runs ``sp_attention_front`` on ``qr_kv[:real_rows]``, gathers only ``local_q_cast``
++    and 528-byte SWA cache records via ``gather_mxfp8`` (1,848 B/row), scatters the
++    records via ``write_swa_records``, and keeps ``indexer.weights_proj`` rank-local
++    unless ``_INDEX_SPLIT_CHECK`` is active."""
++    from vllm.models.deepseek_v4_1 import attention, kernels, sp_prefill
++    from vllm.models.deepseek_v4_1.tilelang import cache_writer, front
++    from vllm.models.deepseek_v4_1.tilelang.linear import MXFP8Rows, provided_mxfp8
++
++    monkeypatch.setattr(attention, "_INDEX_SPLIT_CHECK", split_check)
++    module = _tilelang_layer(layer_id=5)
++    module._ready = True
++    module.q_lora_rank = 1280
++    module.n_local_heads = 2
++    module._l2pf_wo = None
++    module._l2pf_comp = None
++    swa_cache = torch.zeros((4, 64 * 528), dtype=torch.uint8)
++    module.swa_cache_layer = SimpleNamespace(
++        prefix="swa", kv_cache=swa_cache, block_size=64
++    )
++    module.q_norm = SimpleNamespace(
++        weight=torch.ones(1280, dtype=torch.bfloat16), variance_epsilon=1e-6
++    )
++    module.kv_norm = SimpleNamespace(
++        weight=torch.ones(512, dtype=torch.bfloat16), variance_epsilon=1e-6
++    )
++    module.rotary_emb = SimpleNamespace(
++        cos_sin_cache=torch.ones((32, 64), dtype=torch.float32)
++    )
++
++    local_x = torch.ones((4, 32), dtype=torch.bfloat16)
++    local_weights = torch.arange(16, dtype=torch.bfloat16).reshape(4, 4)
++    gathered_weights = torch.arange(40, dtype=torch.bfloat16).reshape(10, 4)
++    gathered_q = MXFP8Rows(
++        rows=torch.empty((10, 1280), dtype=torch.bfloat16),
++        values=torch.full((64, 1280), 7, dtype=torch.float8_e4m3fn),
++        scales=torch.full((64, 40), 9, dtype=torch.uint8),
++    )
++    gathered_records = torch.full((10, 528), 11, dtype=torch.uint8)
++    events = []
++
++    class _FakeSPRows:
++        num_tokens = 10
++        local_rows = 4
++        start = 4
++        real_rows = n_real
++
++        def gather(self, x):
++            events.append(("gather", tuple(x.shape), x.dtype))
++            return gathered_weights
++
++        def gather_mxfp8(self, x_q, *extra):
++            assert len(extra) == 1
++            rec = extra[0]
++            events.append(
++                (
++                    "gather_mxfp8",
++                    tuple(x_q.rows.shape),
++                    tuple(rec.shape),
++                    rec.dtype,
++                )
++            )
++            return (gathered_q, gathered_records)
++
++    def rep_wqa_wkv(h):
++        events.append(("fused_wqa_wkv", tuple(h.shape)))
++        return torch.ones((4, 1280 + 512), dtype=torch.bfloat16), None
++
++    rep_wqa_wkv.tp_size = 4
++    rep_wqa_wkv.replicated_sp_prefill = True
++    module.fused_wqa_wkv = rep_wqa_wkv
++
++    def fake_sp_front(
++        qa_kv, q_w, kv_w, eps, pos, cos_sin, q_values, q_scales, records
++    ):
++        events.append(
++            (
++                "sp_attention_front",
++                tuple(qa_kv.shape),
++                 pos.tolist(),
++                tuple(q_values.shape),
++                tuple(q_scales.shape),
++                tuple(records.shape),
++            )
++        )
++
++    def fake_write_swa_records(records, cache, slots, *, page_size):
++        events.append(
++            (
++                "write_swa_records",
++                records is gathered_records,
++                cache is swa_cache,
++                slots.tolist(),
++                page_size,
++            )
++        )
++
++    monkeypatch.setattr(front, "sp_attention_front", fake_sp_front)
++    monkeypatch.setattr(cache_writer, "write_swa_records", fake_write_swa_records)
++    monkeypatch.setattr(
++        kernels,
++        "cast_mxfp8",
++        lambda rows: (_ for _ in ()).throw(
++            AssertionError("cast_mxfp8 should not run on gathered qr")
++        ),
++    )
++    module._cache_context_kv = lambda kv, pos: (_ for _ in ()).throw(
++        AssertionError("_cache_context_kv should not run when _sp_front wrote SWA records")
++    )
++    module.wq_b = lambda qr: (
++        events.append(("wq_b", qr is gathered_q.rows, provided_mxfp8(qr) is gathered_q)),
++        torch.ones((qr.shape[0], 2 * 512), dtype=torch.bfloat16),
++    )[1]
++    module._rope = lambda x, pos, role: x
++    module.indexer = SimpleNamespace(
++        heads=4,
++        wq_b=lambda qr: torch.ones((qr.shape[0], 4 * 128), dtype=torch.bfloat16),
++        weights_proj=lambda h: (
++            events.append(("weights_proj", tuple(h.shape))),
++            local_weights,
++        )[1],
++    )
++    module._quantize_index_query = lambda mode, iq, data, scale, positions=None: None
++    seen_index_query = []
++
++    def check_forward_mqa(q, kv, pos, output, *, index_query=None):
++        assert kv is None
++        seen_index_query.append(index_query)
++        output.zero_()
++
++    module.forward_mqa = check_forward_mqa
++    module._o_proj = lambda output, sp_rows=None: torch.zeros(
++        (4, 32), dtype=torch.bfloat16
++    )
++    slots = torch.arange(100, 110, dtype=torch.int64)
++    metadata = {"swa": SimpleNamespace(is_decode=False, slot_mapping=slots)}
++    monkeypatch.setattr(
++        attention,
++        "get_forward_context",
++        lambda: SimpleNamespace(attn_metadata=metadata),
++    )
++    monkeypatch.setattr(sp_prefill, "current", lambda: _FakeSPRows())
++    positions = torch.arange(20, 30, dtype=torch.int64)
++    out = module._forward(positions, local_x)
++    assert out.shape == (4, 32)
++
++    expected_events = [
++        ("fused_wqa_wkv", (4, 32)),
++        ("weights_proj", (4, 32)),
++    ]
++    if split_check:
++        expected_events.append(("gather", (4, 4), torch.bfloat16))
++    if n_real > 0:
++        expected_events.append(
++            (
++                "sp_attention_front",
++                (n_real, 1792),
++                list(range(24, 24 + n_real)),
++                (n_real, 1280),
++                (n_real, 40),
++                (n_real, 528),
++            )
++        )
++    expected_events.extend(
++        [
++            ("gather_mxfp8", (4, 1280), (4, 528), torch.uint8),
++            ("write_swa_records", True, True, list(range(100, 110)), 64),
++            ("wq_b", True, True),
++        ]
++    )
++    assert events == expected_events
++    assert len(seen_index_query) == 1
++    iq_data, iq_scale, weights, split, ref = seen_index_query[0]
++    assert iq_data.shape == (n_real, 4, 64)
++    assert iq_scale.shape == (n_real, 4, 4)
++    if split_check:
++        assert torch.equal(weights, gathered_weights[4 : 4 + n_real])
++        assert ref is not None and torch.equal(ref[2], gathered_weights)
++    else:
++        assert torch.equal(weights, local_weights[:n_real])
++        assert ref is None
+diff --git a/vllm/models/deepseek_v4_1/attention.py b/vllm/models/deepseek_v4_1/attention.py
+index cf600a675..2b9855cc6 100644
+--- a/vllm/models/deepseek_v4_1/attention.py
++++ b/vllm/models/deepseek_v4_1/attention.py
+@@ -772,10 +772,14 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase):
+         groups this layer joins, the RoPE of every role and the cache writers, each
+         in its call site's call form."""
+         from vllm.models.deepseek_v4_1.tilelang import metadata as tl_metadata
+-        from vllm.models.deepseek_v4_1.tilelang.cache_writer import writer_call
++        from vllm.models.deepseek_v4_1.tilelang.cache_writer import (
++            swa_records_call,
++            writer_call,
++        )
+         from vllm.models.deepseek_v4_1.tilelang.front import (
+             context_kv_front_call,
+             front_call,
++            sp_front_call,
+         )
+         from vllm.models.deepseek_v4_1.tilelang.rope import rope_call
+ 
+@@ -867,17 +871,12 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase):
+                 )
+             )
+         else:
+-            # _gather_front: prefill SP's BF16 front, the index head weights beside
+-            # the normalized halves.
+-            from vllm.models.deepseek_v4_1.tilelang import columns
+-
+-            widths = (self.q_lora_rank, 512)
+-            if self.indexer is not None:
+-                widths += (self.indexer.heads,)
+-                key = columns.copy_columns_key(self.indexer.heads, torch.bfloat16)
+-                calls.append(prepare.call(columns.copy_columns_kernel, *key))
+-            key = columns.split_columns_key(widths, torch.bfloat16)
+-            calls.append(prepare.call(columns.split_columns_kernel, *key))
++            # _sp_front: prefill SP's local q MXFP8 cast + SWA record front and the
++            # gathered SWA record writer.
++            calls.append(sp_front_call(self.q_norm.variance_epsilon))
++            calls.append(
++                swa_records_call(self.swa_cache_layer.block_size, SLOT_DTYPE)
++            )
+         return calls
+ 
+     def _prepare(self, device):
+@@ -1068,23 +1067,82 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase):
+             return torch.empty_like(hidden_states)
+         return self._forward(positions, hidden_states)
+ 
+-    def _gather_front(self, sp_rows, hidden_states, qr, kv):
+-        """Sequence-parallel prefill's row-wise front of every row, as contiguous
+-        parts (normalized Q, normalized KV, the indexer's head weights, all BF16):
+-        one all-gather of this rank's rows side by side. The norms write their
+-        halves into the gather's buffer in place and the head weights are copied
+-        beside them."""
+-        from vllm.models.deepseek_v4_1.tilelang import columns
+-
+-        q = self.q_lora_rank
+-        widths = (q, 512) + (() if self.indexer is None else (self.indexer.heads,))
+-        front = qr.new_empty(qr.shape[0], sum(widths))
+-        self.q_norm(qr, out=front[:, :q])
+-        self.kv_norm(kv, out=front[:, q : q + 512])
++    def _sp_front(self, sp_rows, hidden_states, qr_kv, positions):
++        """Sequence-parallel prefill's local attention front when ``fused_wqa_wkv`` is
++        replicated: ``indexer.weights_proj`` stays rank-local (unless
++        ``_INDEX_SPLIT_CHECK`` gathers it), and with SWA cache pages ``sp_attention_front``
++        casts ``qr`` to MXFP8 and packs 528-byte SWA records on this rank's real rows
++        before one grouped ``gather_mxfp8`` (1,848 B/row) and ``write_swa_records``."""
++        index_weights = None
+         if self.indexer is not None:
+-            weights = self.indexer.weights_proj(hidden_states)
+-            columns.copy_columns(weights, front[:, q + 512 :])
+-        return columns.split_columns(sp_rows.gather(front), widths)
++            index_weights = self.indexer.weights_proj(hidden_states)
++            if _INDEX_SPLIT_CHECK:
++                index_weights = sp_rows.gather(index_weights)
++            else:
++                index_weights = index_weights[: sp_rows.real_rows]
++        metadata = get_forward_context().attn_metadata
++        swa_cache = getattr(self.swa_cache_layer, "kv_cache", None)
++        if not is_breakable_cudagraph_enabled() and isinstance(metadata, dict):
++            swa = self._query_metadata(metadata[self.swa_cache_layer.prefix])
++            if (
++                swa_cache is not None
++                and swa_cache.numel() > 0
++                and getattr(swa, "slot_mapping", None) is not None
++            ):
++                from vllm.models.deepseek_v4_1.tilelang.cache_writer import (
++                    RECORD_BYTES,
++                    write_swa_records,
++                )
++                from vllm.models.deepseek_v4_1.tilelang.front import (
++                    sp_attention_front,
++                )
++                from vllm.models.deepseek_v4_1.tilelang.linear import empty_mxfp8
++
++                local_rows = sp_rows.local_rows
++                real = sp_rows.real_rows
++                local_qr = torch.empty(
++                    (local_rows, self.q_lora_rank),
++                    dtype=qr_kv.dtype,
++                    device=qr_kv.device,
++                )
++                local_q_cast = empty_mxfp8(local_qr)
++                local_records = torch.empty(
++                    (local_rows, RECORD_BYTES["swa"]),
++                    dtype=torch.uint8,
++                    device=qr_kv.device,
++                )
++                if real > 0:
++                    sp_attention_front(
++                        qr_kv[:real],
++                        self.q_norm.weight,
++                        self.kv_norm.weight,
++                        self.q_norm.variance_epsilon,
++                        positions[sp_rows.start : sp_rows.start + real],
++                        self.rotary_emb.cos_sin_cache,
++                        local_q_cast.values[:real],
++                        local_q_cast.scales[:real],
++                        local_records[:real],
++                    )
++                q_cast, swa_records = sp_rows.gather_mxfp8(
++                    local_q_cast, local_records
++                )
++                write_swa_records(
++                    swa_records,
++                    swa_cache,
++                    swa.slot_mapping[: sp_rows.num_tokens],
++                    page_size=self.swa_cache_layer.block_size,
++                )
++                return (q_cast.rows, None, q_cast), None, None, None, index_weights
++        qr, kv = qr_kv.split((self.q_lora_rank, 512), dim=-1)
++        qr, kv = self.q_norm(qr), self.kv_norm(kv)
++        if self.n_local_heads > 0 or self.indexer is not None:
++            local_q_cast = kernels.cast_mxfp8(qr)
++            q_cast, kv = sp_rows.gather_mxfp8(local_q_cast, kv)
++            qr = q_cast.rows
++        else:
++            qr, kv = sp_rows.gather_many(qr, kv)
++            q_cast = None
++        return None, qr, kv, q_cast, index_weights
+ 
+     def _front(self, qr_kv, positions, sp_rows=None):
+         """The front after the fused projection in one launch (``tilelang.front``):
+@@ -1130,21 +1188,20 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase):
+         sp_rows = sp_prefill.current()
+         index_weights = None
+         front = None
++        q_cast = None
+         if sp_rows is not None and self.compressor is None:
+             if getattr(self.fused_wqa_wkv, "tp_size", 1) == 1 or getattr(
+                 self.fused_wqa_wkv, "replicated_sp_prefill", False
+             ):
+                 # Sequence-parallel prefill without a compressor when fused_wqa_wkv
+-                # is replicated: the row-wise front (projection, norms, index weights)
+-                # runs on this rank's rows, and its product is gathered.
++                # is replicated: the row-wise front (projection, q norm + MXFP8 cast,
++                # kv norm + RoPE + SWA record packing, local index weights) runs on
++                # this rank's rows; only the MXFP8 q cast and SWA records are gathered.
+                 qr_kv, _ = self.fused_wqa_wkv(hidden_states)
+-                qr, kv = qr_kv.split((self.q_lora_rank, 512), dim=-1)
++                front, qr, kv, q_cast, index_weights = self._sp_front(
++                    sp_rows, hidden_states, qr_kv, positions
++                )
+                 del qr_kv
+-                parts = self._gather_front(sp_rows, hidden_states, qr, kv)
+-                qr, kv = parts[0], parts[1]
+-                if self.indexer is not None:
+-                    index_weights = parts[2]
+-                del parts
+                 hidden_states = None
+                 rows = sp_rows.num_tokens
+             else:
+@@ -1196,11 +1253,10 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase):
+             else:
+                 del qr_kv
+         if front is None:
+-            q_cast = (
+-                kernels.cast_mxfp8(qr)
+-                if self.n_local_heads > 0 or self.indexer is not None
+-                else None
+-            )
++            if q_cast is None and (
++                self.n_local_heads > 0 or self.indexer is not None
++            ):
++                q_cast = kernels.cast_mxfp8(qr)
+             front_wrote_kv = False
+         else:
+             qr, kv, q_cast = front
+@@ -1340,7 +1396,11 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase):
+         # differently at another row count, which would move top-k selections.
+         # The FP8 wq_b quantizes per row and does not depend on the row count.
+         weights = (
+-            index_weights[first:last]
++            (
++                index_weights[:rows]
++                if index_weights.shape[0] == rows
++                else index_weights[first:last]
++            )
+             if index_weights is not None
+             else self.indexer.weights_proj(hidden_states)[first:last]
+         )
+diff --git a/vllm/models/deepseek_v4_1/sp_prefill.py b/vllm/models/deepseek_v4_1/sp_prefill.py
+index 29802f3f3..94c8dd2eb 100644
+--- a/vllm/models/deepseek_v4_1/sp_prefill.py
++++ b/vllm/models/deepseek_v4_1/sp_prefill.py
+@@ -59,8 +59,10 @@ projection gather would cost at least as many bytes.
+   (``wq_b``, indexer, compressor, KV cache writes, sparse MLA, WO), and the
+   MoE routed and shared experts.
+ - In attention layers without a compressor, the row-wise front
+-  (``fused_wqa_wkv``, the q/kv norms and the index weights) runs on local
+-  rows and its narrower product is gathered instead of the hidden state.
++  (``fused_wqa_wkv``, the q norm and MXFP8 cast, the kv norm, RoPE and SWA
++  record packing, and the local index head weights) runs on local rows; only
++  the MXFP8 q cast and 528-byte SWA records are gathered, and index head
++  weights stay rank-local.
+ - In encoder attention layers, ``WO-A`` projects all ``T`` rows into its
+   native MXFP8 ``o_lora`` activations, exchanges those narrower rows across
+   ranks while projecting this rank's own ``WO-B`` shard on local rows, and
+diff --git a/vllm/models/deepseek_v4_1/tilelang/cache_writer.py b/vllm/models/deepseek_v4_1/tilelang/cache_writer.py
+index c70671851..71e67d6d1 100644
+--- a/vllm/models/deepseek_v4_1/tilelang/cache_writer.py
++++ b/vllm/models/deepseek_v4_1/tilelang/cache_writer.py
+@@ -297,4 +297,113 @@ def writer_call(
+     )
+ 
+ 
+-__all__ = ["RECORD_BYTES", "cache_writer_kernel", "write_cache", "writer_call"]
++_COPY_B128_HEADER = """
++__device__ __forceinline__ void dsv41_copy_b128(uint32_t* dst, const uint32_t* src) {
++  if (((reinterpret_cast<uintptr_t>(dst) | reinterpret_cast<uintptr_t>(src)) & 15) == 0) {
++    *reinterpret_cast<uint4*>(dst) = *reinterpret_cast<const uint4*>(src);
++  } else {
++    #pragma unroll
++    for (int i = 0; i < 4; ++i) dst[i] = src[i];
++  }
++}
++"""
++
++
++@tilelang.jit(pass_configs={tilelang.PassConfigKey.TL_DISABLE_WARP_SPECIALIZED: True})
++def swa_records_kernel(page_size: int, slot_dtype: str = "int64"):
++    """Scatter pre-packed 528-byte SWA records into paged ``cache`` at ``slots``."""
++    record = RECORD_BYTES["swa"]
++    words_per_record = record // 4  # 132 uint32 words = 33 * 4 words
++    row_threads = 32
++    threads = 128
++    block_m = threads // row_threads
++    tokens = T.dynamic("tokens")
++    pages, page_words, word_stride = T.dynamic("pages, page_words, word_stride")
++
++    @T.prim_func
++    def cache_writer(
++        src_words: T.Tensor((tokens, words_per_record), T.uint32),
++        dst_words: T.StridedTensor((pages, page_words), (word_stride, 1), T.uint32),
++        slots: T.Tensor((tokens,), slot_dtype),
++    ):
++        with T.Kernel(T.ceildiv(tokens, block_m), threads=threads) as pid:
++            T.import_source(_COPY_B128_HEADER)
++            pdl.chain()
++            tid = T.get_thread_binding()
++            row = tid // row_threads
++            lane = tid % row_threads
++            token_id = pid * block_m + row
++            if token_id < tokens:
++                slot = T.cast(slots[token_id], T.int64)
++                page = slot // page_size
++                if (slot >= 0) & (page < pages):
++                    word_base = (slot % page_size) * words_per_record
++                    T.call_extern(
++                        "handle",
++                        "dsv41_copy_b128",
++                        T.address_of(dst_words[page, word_base + lane * 4]),
++                        T.address_of(src_words[token_id, lane * 4]),
++                    )
++                    if lane == 0:
++                        T.call_extern(
++                            "handle",
++                            "dsv41_copy_b128",
++                            T.address_of(dst_words[page, word_base + 128]),
++                            T.address_of(src_words[token_id, 128]),
++                        )
++
++    return cache_writer
++
++
++def write_swa_records(
++    records: torch.Tensor,
++    cache: torch.Tensor,
++    slot_mapping: torch.Tensor,
++    *,
++    page_size: int,
++) -> None:
++    """Write pre-packed SWA ``records`` (``[T, 528]`` uint8, contiguous) into
++    ``cache`` at ``slot_mapping`` (``[T]`` int32 or int64)."""
++    if records.shape[0] == 0:
++        return
++    record_bytes = RECORD_BYTES["swa"]
++    if (
++        records.dtype != torch.uint8
++        or records.shape[1] != record_bytes
++        or not records.is_contiguous()
++    ):
++        raise ValueError(
++            f"SWA cache records must be contiguous [T, {record_bytes}] uint8"
++        )
++    pages = cache.view(torch.uint8)
++    if pages.dim() > 2:
++        pages = pages.flatten(1)
++    if pages.shape[1] < page_size * record_bytes:
++        raise ValueError(f"cache pages hold fewer than {page_size} swa records")
++    word_bytes, _, word_torch = _WORD["swa"]
++    if pages.stride(0) % word_bytes or pages.shape[1] % word_bytes:
++        raise ValueError(f"cache pages are not whole {word_bytes}-byte words")
++    function, args, kwargs = swa_records_call(page_size, slot_mapping.dtype)
++    kernel = function(*args, **kwargs)
++    kernel(records.view(word_torch), pages.view(word_torch), slot_mapping)
++
++
++def swa_records_call(page_size: int, slot_dtype: torch.dtype):
++    """The kernel ``write_swa_records`` launches for ``slot_dtype`` slots, as a
++    ``prepare.call``."""
++    return prepare.call(
++        swa_records_kernel,
++        page_size,
++        str(slot_dtype).removeprefix("torch."),
++    )
++
++
++__all__ = [
++    "RECORD_BYTES",
++    "cache_writer_kernel",
++    "swa_records_call",
++    "swa_records_kernel",
++    "write_cache",
++    "write_swa_records",
++    "writer_call",
++]
+diff --git a/vllm/models/deepseek_v4_1/tilelang/front.py b/vllm/models/deepseek_v4_1/tilelang/front.py
+index d44ab8dfe..856eb1a70 100644
+--- a/vllm/models/deepseek_v4_1/tilelang/front.py
++++ b/vllm/models/deepseek_v4_1/tilelang/front.py
+@@ -85,6 +85,83 @@ def _row_split(hidden: int) -> dict:
+     )
+ 
+ 
++def _make_norm(split, M):
++    """TileKernels' RMSNorm of ``split``'s rows from ``column`` of ``qa_kv``: the
++    sum of squares reduced over each row's threads (``sum_fragment``), in its
++    order."""
++    hidden, row_threads = split["hidden"], split["row_threads"]
++    block_m, warp_threads = split["block_m"], split["warp_threads"]
++    num_row_warps = split["num_row_warps"]
++
++    @T.macro
++    def norm(
++        qa_kv,
++        column,
++        pid_token,
++        tid,
++        sum_partial,
++        warp_reducer,
++        warp_fragment,
++        sum_shared,
++        row_partial,
++        sum_reducer,
++        sum_fragment,
++        x_local,
++        sum_local,
++    ):
++        row_id = tid // row_threads
++        row_offset = tid % row_threads
++        token_id = pid_token * block_m + row_id
++        T.clear(sum_local)
++        for vi in T.unroll(split["num_thread_vec"]):
++            token_offset = (vi * row_threads + row_offset) * _VEC
++            if token_id < M and token_offset < hidden:
++                for j in T.vectorized(_VEC):
++                    x_local[vi, j] = qa_kv[token_id, column + token_offset + j]
++            else:
++                T.clear(x_local[vi, :])
++            for j in T.vectorized(_VEC):
++                sum_local[j % 2] += T.float32(x_local[vi, j]) * T.float32(
++                    x_local[vi, j]
++                )
++        # Reduce RSTD over the threads of the row
++        sum_partial[row_id, row_offset] = sum_local[0] + sum_local[1]
++        T.reducer_init(warp_reducer)
++        for i, w, j in T.Parallel(
++            block_m,
++            num_row_warps,
++            warp_threads,
++            loop_layout=split["warp_reduce_layout"],
++        ):
++            T.reducer_update(
++                warp_reducer[i, w], sum_partial[i, w * warp_threads + j]
++            )
++        T.finalize_reducer(warp_reducer, warp_fragment)
++        if row_offset % warp_threads == 0:
++            sum_shared[row_id, row_offset // warp_threads] = warp_fragment[
++                row_id, row_offset // warp_threads
++            ]
++        T.sync_threads()
++        for i, j, w in T.Parallel(
++            block_m,
++            row_threads,
++            num_row_warps,
++            loop_layout=split["row_reduce_layout"],
++        ):
++            row_partial[i, j, w] = sum_shared[i, w]
++        T.reducer_init(sum_reducer)
++        for i, j, w in T.Parallel(
++            block_m,
++            row_threads,
++            num_row_warps,
++            loop_layout=split["row_reduce_layout"],
++        ):
++            T.reducer_update(sum_reducer[i, j], row_partial[i, j, w])
++        T.finalize_reducer(sum_reducer, sum_fragment)
++
++    return norm
++
++
+ @tilelang.jit(pass_configs={tilelang.PassConfigKey.TL_DISABLE_WARP_SPECIALIZED: True})
+ def attention_front_kernel(eps: float, page_size: int, slot_dtype: str = "int64"):
+     """q CTAs (two rows each) then kv CTAs (eight rows each); see the module
+@@ -116,83 +193,7 @@ def attention_front_kernel(eps: float, page_size: int, slot_dtype: str = "int64"
+     pages, page_bytes, page_stride = T.dynamic("pages, page_bytes, page_stride")
+     page_words, word_stride = T.dynamic("page_words, word_stride")
+ 
+-    def make_norm(split):
+-        """TileKernels' RMSNorm of ``split``'s rows from ``column`` of ``qa_kv``: the
+-        sum of squares reduced over each row's threads (``sum_fragment``), in its
+-        order."""
+-        hidden, row_threads = split["hidden"], split["row_threads"]
+-        block_m, warp_threads = split["block_m"], split["warp_threads"]
+-        num_row_warps = split["num_row_warps"]
+-
+-        @T.macro
+-        def norm(
+-            qa_kv,
+-            column,
+-            pid_token,
+-            tid,
+-            sum_partial,
+-            warp_reducer,
+-            warp_fragment,
+-            sum_shared,
+-            row_partial,
+-            sum_reducer,
+-            sum_fragment,
+-            x_local,
+-            sum_local,
+-        ):
+-            row_id = tid // row_threads
+-            row_offset = tid % row_threads
+-            token_id = pid_token * block_m + row_id
+-            T.clear(sum_local)
+-            for vi in T.unroll(split["num_thread_vec"]):
+-                token_offset = (vi * row_threads + row_offset) * _VEC
+-                if token_id < M and token_offset < hidden:
+-                    for j in T.vectorized(_VEC):
+-                        x_local[vi, j] = qa_kv[token_id, column + token_offset + j]
+-                else:
+-                    T.clear(x_local[vi, :])
+-                for j in T.vectorized(_VEC):
+-                    sum_local[j % 2] += T.float32(x_local[vi, j]) * T.float32(
+-                        x_local[vi, j]
+-                    )
+-            # Reduce RSTD over the threads of the row
+-            sum_partial[row_id, row_offset] = sum_local[0] + sum_local[1]
+-            T.reducer_init(warp_reducer)
+-            for i, w, j in T.Parallel(
+-                block_m,
+-                num_row_warps,
+-                warp_threads,
+-                loop_layout=split["warp_reduce_layout"],
+-            ):
+-                T.reducer_update(
+-                    warp_reducer[i, w], sum_partial[i, w * warp_threads + j]
+-                )
+-            T.finalize_reducer(warp_reducer, warp_fragment)
+-            if row_offset % warp_threads == 0:
+-                sum_shared[row_id, row_offset // warp_threads] = warp_fragment[
+-                    row_id, row_offset // warp_threads
+-                ]
+-            T.sync_threads()
+-            for i, j, w in T.Parallel(
+-                block_m,
+-                row_threads,
+-                num_row_warps,
+-                loop_layout=split["row_reduce_layout"],
+-            ):
+-                row_partial[i, j, w] = sum_shared[i, w]
+-            T.reducer_init(sum_reducer)
+-            for i, j, w in T.Parallel(
+-                block_m,
+-                row_threads,
+-                num_row_warps,
+-                loop_layout=split["row_reduce_layout"],
+-            ):
+-                T.reducer_update(sum_reducer[i, j], row_partial[i, j, w])
+-            T.finalize_reducer(sum_reducer, sum_fragment)
+-
+-        return norm
+-
+-    q_norm, kv_norm = make_norm(q), make_norm(k)
++    q_norm, kv_norm = _make_norm(q, M), _make_norm(k, M)
+     qb, qt, qw = q["block_m"], q["row_threads"], q["num_row_warps"]
+     kb, kt = k["block_m"], k["row_threads"]
+ 
+@@ -701,6 +702,298 @@ def context_kv_front(
+     )
+ 
+ 
++@tilelang.jit(pass_configs={tilelang.PassConfigKey.TL_DISABLE_WARP_SPECIALIZED: True})
++def sp_attention_front_kernel(eps: float):
++    """Sequence-parallel local attention front on ``qa_kv`` (``[M, 1792]`` BF16):
++    q CTAs write only the MXFP8 cast (``q_values``, ``q_scales``) and kv CTAs write
++    only the 528-byte SWA cache ``records`` (after in-register RMSNorm and RoPE),
++    omitting the unused local BF16 ``qn`` and ``kv`` copies before the TP gather."""
++    from vllm.models.deepseek_v4_1.tilelang.quant_common import (
++        get_cast_output_config,
++        get_sf_and_inv,
++        get_sf_index,
++        get_sf_inv_dtype,
++        get_sf_shape,
++    )
++
++    out_config = get_cast_output_config("e4m3", (1, 32), False, True, True)
++    sf_inv_dtype = get_sf_inv_dtype(T.bfloat16, out_config)
++    group_lanes = 32 // _VEC
++    out_scale = 1.0
++    q, k = _row_split(Q_LATENT), _row_split(KV_LATENT)
++    assert (
++        k["num_row_warps"] == 1 and k["row_threads"] == 16 and k["num_thread_vec"] == 4
++    )
++    half = ROPE_DIM // 2
++    rope_vec = KV_LATENT // _VEC - ROPE_DIM // _VEC
++    last = k["num_thread_vec"] - 1
++    record = RECORD_BYTES["swa"]
++    width = Q_LATENT + KV_LATENT
++    M, Mq, qa_stride = T.dynamic("M, Mq, qa_stride")
++    sf_shape = get_sf_shape((M, Q_LATENT), out_config)
++    positions_max = T.dynamic("positions_max")
++    q_norm, kv_norm = _make_norm(q, M), _make_norm(k, M)
++    qb, qt, qw = q["block_m"], q["row_threads"], q["num_row_warps"]
++    kb, kt = k["block_m"], k["row_threads"]
++
++    @T.prim_func
++    def attention_front(
++        qa_kv: T.StridedTensor((M, width), (qa_stride, 1), T.bfloat16),
++        q_weight: T.Tensor((Q_LATENT,), T.bfloat16),
++        kv_weight: T.Tensor((KV_LATENT,), T.bfloat16),
++        positions: T.Tensor((M,), T.int64),
++        cos_sin: T.Tensor((positions_max, ROPE_DIM), T.float32),
++        q_values: T.Tensor((Mq, Q_LATENT), out_config.dtype),
++        q_scales: T.Tensor((Mq, sf_shape[1]), out_config.sf_dtype),
++        records: T.Tensor((M, record), T.uint8),
++        words: T.Tensor((M, record // 4), T.uint32),
++    ):
++        with T.Kernel(T.ceildiv(M, qb) + T.ceildiv(M, kb), threads=_THREADS) as bx:
++            T.import_source(_CVT_HEADER)
++            tid = T.get_thread_binding()
++            q_sum_partial = T.alloc_fragment((qb, qt), T.float32)
++            q_warp_reducer = T.alloc_reducer((qb, qw), T.float32, op="sum")
++            q_warp_fragment = T.alloc_fragment((qb, qw), T.float32)
++            q_sum_shared = T.alloc_shared((qb, qw), T.float32)
++            q_row_partial = T.alloc_fragment((qb, qt, qw), T.float32)
++            q_sum_reducer = T.alloc_reducer((qb, qt), T.float32, op="sum")
++            q_sum_fragment = T.alloc_fragment((qb, qt), T.float32)
++            k_sum_partial = T.alloc_fragment((kb, kt), T.float32)
++            k_warp_reducer = T.alloc_reducer((kb, 1), T.float32, op="sum")
++            k_warp_fragment = T.alloc_fragment((kb, 1), T.float32)
++            k_sum_shared = T.alloc_shared((kb, 1), T.float32)
++            k_row_partial = T.alloc_fragment((kb, kt, 1), T.float32)
++            k_sum_reducer = T.alloc_reducer((kb, kt), T.float32, op="sum")
++            k_sum_fragment = T.alloc_fragment((kb, kt), T.float32)
++            T.annotate_layout(
++                {
++                    q_sum_partial: q["row_layout"],
++                    q_warp_fragment: q["warp_layout"],
++                    q_row_partial: q["row_reduce_layout"],
++                    q_sum_fragment: q["row_layout"],
++                    k_sum_partial: k["row_layout"],
++                    k_warp_fragment: k["warp_layout"],
++                    k_row_partial: k["row_reduce_layout"],
++                    k_sum_fragment: k["row_layout"],
++                }
++            )
++            q_x = T.alloc_local((q["num_thread_vec"], _VEC), T.bfloat16)
++            q_y = T.alloc_local((q["num_thread_vec"], _VEC), T.bfloat16)
++            q_w = T.alloc_local((q["num_thread_vec"], _VEC), T.bfloat16)
++            k_x = T.alloc_local((k["num_thread_vec"], _VEC), T.bfloat16)
++            k_y = T.alloc_local((k["num_thread_vec"], _VEC), T.bfloat16)
++            k_w = T.alloc_local((k["num_thread_vec"], _VEC), T.bfloat16)
++            y_fp32_local = T.alloc_local((_VEC,), T.float32)
++            sum_local = T.alloc_local((2,), T.float32)
++            sf_local = T.alloc_local((q["num_thread_vec"],), out_config.sf_dtype)
++            amax_local = T.alloc_local((q["num_thread_vec"],), T.float32)
++            cs = T.alloc_local((_VEC,), T.float32)
++            values = T.alloc_local((_VEC,), T.float32)
++
++            if bx < T.ceildiv(M, qb):
++                row_offset = tid % qt
++                for vi in T.unroll(q["num_thread_vec"]):
++                    token_offset = (vi * qt + row_offset) * _VEC
++                    if token_offset < Q_LATENT:
++                        for j in T.vectorized(_VEC):
++                            q_w[vi, j] = q_weight[token_offset + j]
++            else:
++                pid = bx - T.ceildiv(M, qb)
++                lane = tid % kt
++                token_id = pid * kb + tid // kt
++                for vi in T.unroll(k["num_thread_vec"]):
++                    token_offset = (vi * kt + lane) * _VEC
++                    for j in T.vectorized(_VEC):
++                        k_w[vi, j] = kv_weight[token_offset + j]
++                if token_id < M:
++                    if last * kt + lane >= rope_vec:
++                        rope_lane = last * kt + lane - rope_vec
++                        position = positions[token_id]
++                        for i in T.vectorized(_VEC // 2):
++                            cs[i] = cos_sin[position, rope_lane * (_VEC // 2) + i]
++                        for i in T.vectorized(_VEC // 2):
++                            cs[_VEC // 2 + i] = cos_sin[
++                                position, half + rope_lane * (_VEC // 2) + i
++                            ]
++
++            pdl.chain()
++
++            if bx < T.ceildiv(M, qb):
++                q_norm(
++                    qa_kv,
++                    0,
++                    bx,
++                    tid,
++                    q_sum_partial,
++                    q_warp_reducer,
++                    q_warp_fragment,
++                    q_sum_shared,
++                    q_row_partial,
++                    q_sum_reducer,
++                    q_sum_fragment,
++                    q_x,
++                    sum_local,
++                )
++                row_offset = tid % qt
++                token_id = bx * qb + tid // qt
++                rstd_value = T.alloc_var(
++                    T.float32,
++                    init=T.rsqrt(
++                        q_sum_fragment[tid // qt, row_offset] / Q_LATENT + eps
++                    ),
++                )
++                for vi in T.unroll(q["num_thread_vec"]):
++                    for j in T.vectorized(_VEC):
++                        y_fp32_local[j] = (
++                            T.float32(q_x[vi, j])
++                            * rstd_value
++                            * (T.float32(q_w[vi, j]) * out_scale)
++                        )
++                    for j in T.vectorized(_VEC):
++                        q_y[vi, j] = y_fp32_local[j]
++                    amax = T.alloc_var(T.float32, init=0.0)
++                    for j in T.unroll(_VEC):
++                        amax = T.max(amax, T.abs(y_fp32_local[j]))
++                    amax = T.float32(T.cast(amax, T.bfloat16))
++                    for i in T.unroll(int(math.log2(group_lanes))):
++                        amax = T.max(amax, T.shfl_xor(amax, 1 << i))
++                    amax_local[vi] = amax
++                for vi in T.unroll(q["num_thread_vec"]):
++                    token_offset = (vi * qt + row_offset) * _VEC
++                    sf, sf_inv = get_sf_and_inv(
++                        amax_local[vi], out_config, sf_inv_dtype
++                    )
++                    sf_local[vi] = sf
++                    if token_id < M and token_offset < Q_LATENT:
++                        for j in T.vectorized(_VEC):
++                            q_values[token_id, token_offset + j] = q_y[vi, j] * sf_inv
++                if token_id < M and row_offset % group_lanes == 0:
++                    for vi in T.unroll(q["num_thread_vec"]):
++                        token_offset = (vi * qt + row_offset) * _VEC
++                        if token_offset < Q_LATENT:
++                            sf_row, sf_column = get_sf_index(
++                                token_id, token_offset // 32, out_config
++                            )
++                            q_scales[sf_row, sf_column] = sf_local[vi]
++            else:
++                pid = bx - T.ceildiv(M, qb)
++                kv_norm(
++                    qa_kv,
++                    Q_LATENT,
++                    pid,
++                    tid,
++                    k_sum_partial,
++                    k_warp_reducer,
++                    k_warp_fragment,
++                    k_sum_shared,
++                    k_row_partial,
++                    k_sum_reducer,
++                    k_sum_fragment,
++                    k_x,
++                    sum_local,
++                )
++                lane = tid % kt
++                token_id = pid * kb + tid // kt
++                rstd_value = T.alloc_var(
++                    T.float32,
++                    init=T.rsqrt(k_sum_fragment[tid // kt, lane] / KV_LATENT + eps),
++                )
++                for vi in T.unroll(k["num_thread_vec"]):
++                    for j in T.vectorized(_VEC):
++                        y_fp32_local[j] = (
++                            T.float32(k_x[vi, j])
++                            * rstd_value
++                            * (T.float32(k_w[vi, j]) * out_scale)
++                        )
++                    for j in T.vectorized(_VEC):
++                        k_y[vi, j] = y_fp32_local[j]
++                if (last * kt + lane >= rope_vec) & (token_id < M):
++                    for j in T.unroll(_VEC // 2):
++                        first = T.cast(k_y[last, 2 * j], T.float32)
++                        second = T.cast(k_y[last, 2 * j + 1], T.float32)
++                        cosine = cs[j]
++                        sine = cs[_VEC // 2 + j]
++                        k_y[last, 2 * j] = T.cast(
++                            T.ieee_fmaf(first, cosine, -(second * sine)), T.bfloat16
++                        )
++                        k_y[last, 2 * j + 1] = T.cast(
++                            T.ieee_fmaf(first, sine, second * cosine), T.bfloat16
++                        )
++                for vi in T.unroll(k["num_thread_vec"]):
++                    col = (vi * kt + lane) * _VEC
++                    amax = T.alloc_var(T.float32, init=0.0)
++                    for j in T.unroll(_VEC):
++                        values[j] = T.cast(k_y[vi, j], T.float32)
++                        amax = T.max(amax, T.abs(values[j]))
++                    amax = T.max(amax, T.shfl_xor(amax, 1))
++                    amax = T.max(amax, T.shfl_xor(amax, 2))
++                    if token_id < M:
++                        bits = T.reinterpret(
++                            T.fmul(T.max(amax, 1e-4), T.float32(1.0 / _E4M3_MAX)),
++                            T.uint32,
++                        )
++                        bumped = T.if_then_else(
++                            (bits & 0x7FFFFF) != 0,
++                            (bits + 0x800000) & 0x7F800000,
++                            bits,
++                        )
++                        exponent = T.cast(T.shift_right(bumped, 23) & 0xFF, T.int32)
++                        inverse = T.reinterpret(
++                            T.cast(T.shift_left(254 - exponent, 23), T.uint32),
++                            T.float32,
++                        )
++                        for h in T.unroll(2):
++                            words[token_id, (col + 4 * h) // 4] = T.call_extern(
++                                "uint32",
++                                "dsv41_e4m3x4",
++                                T.fmul(values[4 * h], inverse),
++                                T.fmul(values[4 * h + 1], inverse),
++                                T.fmul(values[4 * h + 2], inverse),
++                                T.fmul(values[4 * h + 3], inverse),
++                            )
++                        if lane % group_lanes == 0:
++                            records[token_id, KV_LATENT + col // 32] = T.cast(
++                                exponent, T.uint8
++                            )
++
++    return attention_front
++
++
++def sp_front_call(eps: float):
++    """The kernel ``sp_attention_front`` launches, as a ``prepare.call``."""
++    return prepare.call(sp_attention_front_kernel, eps)
++
++
++def sp_attention_front(
++    qa_kv: torch.Tensor,
++    q_weight: torch.Tensor,
++    kv_weight: torch.Tensor,
++    eps: float,
++    positions: torch.Tensor,
++    cos_sin_cache: torch.Tensor,
++    q_values: torch.Tensor,
++    q_scales: torch.Tensor,
++    records: torch.Tensor,
++) -> None:
++    """The sequence-parallel local front of ``qa_kv``'s rows (``[M, 1792]`` BF16):
++    normalized ``q``'s MXFP8 cast (``q_values`` and ``q_scales`` bytes) and rotated
++    normalized ``kv``'s 528-byte SWA ``records``."""
++    if qa_kv.shape[0] == 0:
++        return
++    function, args, kwargs = sp_front_call(eps)
++    function(*args, **kwargs)(
++        qa_kv,
++        q_weight,
++        kv_weight,
++        positions,
++        cos_sin_cache,
++        q_values,
++        q_scales.view(torch.uint8),
++        records,
++        records.view(torch.uint32),
++    )
++
++
+ __all__ = [
+     "attention_front",
+     "attention_front_kernel",
+@@ -708,4 +1001,7 @@ __all__ = [
+     "context_kv_front_call",
+     "context_kv_front_kernel",
+     "front_call",
++    "sp_attention_front",
++    "sp_attention_front_kernel",
++    "sp_front_call",
+ ]
+-- 
+2.43.0
+
