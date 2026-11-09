@@ -63,12 +63,38 @@ and ends with a pytest-style summary for the lab's exit verdict.
   that still has the switch; a `tilelang-only` series has no such variable),
   `SPARK_DS41F_DISPLAY_CARVEOUT_WEIGHTS=1` makes the worker require the display carve-out.
   Tests set what they need (the kernel family through a fixture or `monkeypatch`), so the
-  bundle exports only `HF_HUB_OFFLINE=1`, `PYTHONPATH` and a TileLang cache directory.
+  bundle exports only `HF_HUB_OFFLINE=1`, `PYTHONPATH`, a TileLang cache directory, the
+  O_DIRECT test directories and `DS41F_SNAPSHOT`.
 - **Offline, DS4.1 weights only, one GPU.** A test whose failure is exactly a missing resource
-  (an uncached Hugging Face model or config, ray) is reported as skipped, naming it
+  (an uncached Hugging Face model or config, ray, more GPUs than the node's one) is reported as
+  skipped, naming it
   (`scripts/release_tests/offline_skip.py`); any other failure, any other `ModelConfig`
   validation error included, stays a failure. Files that need such resources throughout are
   excluded.
+- **Tests run against DeepSeek, not stand-in models.** Upstream tests name small hub models
+  (`gpt2`, `facebook/opt-125m`, `Qwen/Qwen3-0.6B`) when they only need a tokenizer or a
+  config. The deployment serves DeepSeek V4.1 Flash, so those ids resolve to the served
+  checkpoint's `config.json` and tokenizer, never its weights
+  (`scripts/release_tests/deepseek_models.py`).
+  - The bundle mounts the recipe's checkpoint read-only, as serving does, and names its
+    snapshot in `DS41F_SNAPSHOT`. The plugin then points the hub at a cache of symlinks.
+  - Nothing is downloaded, and every node already holds the checkpoint.
+  - A test whose setup DeepSeek V4.1's own config validation refuses is reported as skipped,
+    naming the guard: aligned prefill chunks with no `long_prefill_token_threshold`, DBO or
+    microbatching, a classic MTP or draft model, no tokenizer. It asks for a configuration the
+    deployment cannot construct.
+  - A test that needs a stand-in's weights or one of its tokens fails like any other test,
+    and is fixed, deselected or excluded with its reason. For example,
+    `test_schedule_concurrent_partial_requests` expects an unaligned partial chunk, so it is
+    deselected.
+  - On 1107's gate (2026-11-09, sp5..sp7), 202 tests used to skip offline. With the plugin:
+    - 44 run and pass against DeepSeek's config and tokenizer;
+    - 156 skip, each naming the DeepSeek guard or the GPUs it needs;
+    - 2 are deselected.
+
+    Every run is in [experiments/2026-11-09-deepseek-test-models](../experiments/2026-11-09-deepseek-test-models/README.md).
+  - A new test in the series should name the served checkpoint, or a config it writes
+    itself, instead of a hub model the nodes do not hold.
 - **The serving image lacks test extras.** `tests/conftest.py` imports tblib to pickle worker
   tracebacks; a plugin (`scripts/release_tests/tblib_stub.py`) stands in, so worker failures
   still raise, with their message. ray and multiprocess are absent: tests that need them are

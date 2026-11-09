@@ -32,7 +32,8 @@ def pytest(paths, out: Path, tag: str, timeout: int) -> tuple[object, Path, floa
     deselect = [arg for node in DESELECT if node.split("::")[0] in paths
                 for arg in ("--deselect", node)]
     command = [sys.executable, "-m", "pytest", "-q", "-rfEs", "-p", "no:cacheprovider", *deselect,
-               "-p", "tblib_stub", "-p", "offline_skip", "--continue-on-collection-errors",
+               "-p", "tblib_stub", "-p", "offline_skip", "-p", "deepseek_models",
+               "--continue-on-collection-errors",
                "-o", "junit_family=xunit1", "-o", "faulthandler_timeout=300",
                "--junitxml", str(report), "--basetemp", f"{BASETEMP}/{tag}", *paths]
     started = time.time()

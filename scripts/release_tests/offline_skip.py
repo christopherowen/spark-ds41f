@@ -6,7 +6,8 @@ as its reason, so a file mixing such tests with runnable ones can still gate on 
 
 - a Hugging Face model or config that is not cached (offline lookups, ``ModelConfig``'s
   "Invalid repository ID or local directory" for a hub id);
-- ray, which the serving image does not install.
+- ray, which the serving image does not install;
+- more GPUs than the node has (``ParallelConfig``'s world-size check; a node has one).
 
 Any other failure, including any other ``ModelConfig`` validation error, stays a failure.
 """
@@ -19,11 +20,15 @@ _OFFLINE = re.compile(
     r"|LocalEntryNotFoundError|OfflineModeIsEnabled"
     r"|couldn't connect to 'https://huggingface\.co'"
 )
+_GPUS = re.compile(r"World size \((\d+)\) is larger than the number of available GPUs \((\d+)\)")
 
 
 def missing_resource(text: str) -> str | None:
     if "No module named 'ray'" in text:
         return "ray (not in the serving image)"
+    gpus = _GPUS.search(text)
+    if gpus:
+        return f"{gpus.group(1)} GPUs (the node has {gpus.group(2)})"
     match = _OFFLINE.search(text)
     if match:
         return f"Hugging Face {match.group(1) or 'download'} (offline)"
