@@ -536,7 +536,7 @@ class KernelBackendTest(unittest.TestCase):
 @functools.lru_cache(maxsize=1)
 def _experiment_configs_and_locks() -> tuple[tuple[str, dict], ...]:
     """Experiment JSON dictionaries that could be cluster profiles or upstream locks."""
-    skipped_dirs = {"results", "bundles", "release-tests", "__pycache__"}
+    skipped_dirs = {"results", "receipts", "bundles", "release-tests", "__pycache__"}
     items: list[tuple[str, dict]] = []
     for dirpath, dirnames, filenames in os.walk(ROOT / "experiments"):
         dirnames[:] = sorted(d for d in dirnames if d not in skipped_dirs)
