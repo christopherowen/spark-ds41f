@@ -116,16 +116,24 @@ Each testbed opens its window with `scripts/lab.py`, after the hold and idle gua
    - **The references are pending** until the coordinator commits them; until then the lab's dry run reports them missing.
 4. **Own marks** on sp8 (below), two boots each, ABBA against the base.
 
-## Release tests: #998 fails; measured without it
+## Release tests: #998 fails; boot: #960 fails; measured without both
 
-The release tests passed on candidates 51 and 52 and failed on candidate-53 (dgx2, 2026-11-09), in two files, both #998's:
+**Release tests** (dgx2, 2026-11-09): they passed on candidates 51 and 52 and failed on candidate-53, in two files, both #998's:
 - `tests/kernels/quantization/test_deepseek_v41_tilelang_vocab.py` crashes with a segmentation fault;
-- `tests/kernels/quantization/test_deepseek_v41_expert_scale_codes.py::test_process_weights_replaces_w13_before_preparing_w2` fails with `'_Plan' object has no attribute 'max_rows'` (`fused_moe/tilelang.py:224`, a line #998 adds).
+- `tests/kernels/quantization/test_deepseek_v41_expert_scale_codes.py::test_process_weights_replaces_w13_before_preparing_w2` fails with `'_Plan' object has no attribute 'max_rows'`, at `fused_moe/tilelang.py:224`, a line #998 adds.
 
-With candidate-50's copies of #998's three files mounted over the candidate-53 image, both files pass (104 passed). No other candidate-53 patch touches those files.
+With candidate-50's copies of `fused_moe/tilelang.py`, `packed_bf16.py` and `embedding.py` mounted over the candidate-53 image, both files pass (104 passed).
 
-- **Gate and screen** run on [tp3-switched-no998.json](tp3-switched-no998.json), from [no998/overlay](no998/overlay), so they measure #960, #971, #977 and #984.
-- **#998** is in rework round 1.
+**Boot at tp3-switched** (sp5, 2026-11-09): it fails in the warm-up decode step on every rank, with `'KVConnector' object has no attribute 'has_connector'` at `model_runner.py:3204`.
+- #960 (0781) adds that call. This deployment's `KVConnector` has no such method; serving uses `NO_OP_KV_CONNECTOR`.
+- #960's own mark on one GPU never ran a decode step through `execute_model`.
+
+**Measured without both:**
+- [tp3-switched-no960-no998.json](tp3-switched-no960-no998.json) mounts the 10 non-test files that differ when 0781 and 0785 are reverted from candidate-53's tree (`62df12dc` to tree `94015950`), from [no960-no998/overlay](no960-no998/overlay).
+- Shared files such as `model_runner.py` keep the other PRs' changes. So the gate and screen measure #971 (as built), #977 and #984.
+- #960 and #998 are each in rework round 1.
+
+**Recorded error.** The first control, `no998` (#1048), mounted only those three files. #998 also changes `qwen3_dspark.py`, `display_carveout.py` and `model_runner.py`, so that control left part of #998 in place. It never measured anything, because the boot failed first on #960. The release-test result above stands: those tests touch only the three files. The `no998` control is removed.
 
 ## Marks
 
