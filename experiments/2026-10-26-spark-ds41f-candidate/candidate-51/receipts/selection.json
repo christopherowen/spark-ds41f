@@ -1,0 +1,185 @@
+{
+ "candidate": 51,
+ "shape": "tp4-ring",
+ "nodes": "dgx1..dgx4",
+ "purpose": "PR validation (docs/release-benchmark.md, steps 1-8): one of candidates 51, 52 and 53, tested at the same time, one per testbed",
+ "theme": "bit-identical TP4 decode kernels (gemm/vocab tiles at 97..128 rows, L2 prefetch pacing)",
+ "base": "candidate-50 without #1009",
+ "base_series": "candidate-50's vllm/series without 0778 (#1009): spark-ds41f-1107's 0001..0761 (641 active) plus candidate-50's 0762..0777, 0779 and 0780, 659 patches, listed by relative path",
+ "base_tree": "14c5a2dc924541ce4eda44d5b39d811be15f2363",
+ "base_left_out": [
+  {
+   "patch": "0778-perf-dsv41-sp-prefill-local-attention-front.patch",
+   "pr": 1009,
+   "source_patch": "experiments/2026-10-26-spark-ds41f-candidate/candidate-50/vllm/0778-perf-dsv41-sp-prefill-local-attention-front.patch",
+   "sha256": "7f3fc988bc05b12b1a3193e580e991e7b01f8eff8608594a94b71cc0e7324ebc",
+   "reason": "in rework for the tp4-ring boot failure it causes (candidate-50/receipts/tp4-boot-failure); it joins a later base when its rework passes"
+  }
+ ],
+ "stack_tree": "987ba05899600da36d3c11b065c5be7967256224",
+ "stack_head": "cc1115c55efe9ab2eacaa54d8f6eddff21bb0c2a",
+ "order": [
+  961,
+  963,
+  987,
+  1001
+ ],
+ "patches": [
+  {
+   "patch": "0781-perf-dsv41-64k-chunked-globaltimer-paced-l2-prefetch.patch",
+   "pr": 961,
+   "pr_title": "perf(dsv41): 64 KiB chunked, %globaltimer-paced side-stream L2 prefetch",
+   "pr_head": "9362f944201a45fc0d74424ac0d73c5fc17cdf78",
+   "source_patch": "experiments/2026-11-08-l2-prefetch-pacing/vllm/0762-perf-dsv41-64k-chunked-globaltimer-paced-l2-prefetch.patch",
+   "source_sha256": "4209b337da381bd98cb5c70c87b68d9cad7e8e9f5bc1b940fe850e6e0be3af67",
+   "method": "git am",
+   "applied": "clean",
+   "sha256": "4209b337da381bd98cb5c70c87b68d9cad7e8e9f5bc1b940fe850e6e0be3af67",
+   "kind": "perf",
+   "category": "K1",
+   "own_mark": "Its bench_l2_prefetch_ab.py (16 MiB cold prefetch, then the consumer read) on the candidate image on sp8, 2 boots, ABBA against the base image, with the recipe's VLLM_L2_PREFETCH_GRID=2: the consumer read is faster beyond the interval and the L2 hit share higher; its pytest passes. No decode cell of the engine grid worse",
+   "declared_output_change": "none"
+  },
+  {
+   "patch": "0782-perf-dsv41-unconditional-pack12-plane-loads-and-swar.patch",
+   "pr": 963,
+   "pr_title": "perf(dsv41): unconditional pack12 plane loads, byte-perm vocab SWAR, and per-column exception lookup",
+   "pr_head": "e5db47f172cfef9bbe77d4af8b061f6fc683969a",
+   "source_patch": "experiments/2026-11-08-pack12-unconditional-loads-swar/vllm/0762-perf-dsv41-unconditional-pack12-plane-loads-and-swar.patch",
+   "source_sha256": "b0c54984ac70edec43e643202e82e663becfb5f5df7318d6f0d06559a500972f",
+   "method": "git am",
+   "applied": "clean",
+   "sha256": "b0c54984ac70edec43e643202e82e663becfb5f5df7318d6f0d06559a500972f",
+   "kind": "perf",
+   "category": "K1",
+   "own_mark": "Its screen_pack12_kernels.py on the image, 2 boots, ABBA against the base image, by kernel time and CUDA-graph replay: packed BF16 GEMM (compressor_up, M=1..256) and packed vocab projection/greedy partials faster beyond the interval, 0 ULP, including through #997's certified screen (in the base)",
+   "declared_output_change": "none"
+  },
+  {
+   "patch": "0783-perf-dsv41-extend-WO-B-WIDE_DECODE-to-128-rows-and-g.patch",
+   "pr": 987,
+   "pr_title": "perf(dsv41): extend WO-B WIDE_DECODE to 128 rows and guard high-concurrency decode cliffs",
+   "pr_head": "9be94ed5310ceb4f77ecae29985a40c569878c32",
+   "source_patch": "experiments/2026-11-08-wide-decode-wo-b-and-high-concurrency/vllm/0762-perf-dsv41-extend-WO-B-WIDE_DECODE-to-128-rows-and-g.patch",
+   "source_sha256": "14b6d9c420f9bbcce203b35c5ce2121057b9cdcd06bf3f70a6463a474546ff77",
+   "method": "split",
+   "rebase": "experiments/2026-10-26-spark-ds41f-candidate/candidate-51/receipts/rebases/51-03-perf-dsv41-extend-WO-B-WIDE_DECODE-to-128-rows-and-g.patch",
+   "applied": "clean; the WO-B part of the PR's patch, split at selection (file-level, every kept line unchanged): experiments/2026-10-26-spark-ds41f-candidate/candidate-51/receipts/rebases/51-03-perf-dsv41-extend-WO-B-WIDE_DECODE-to-128-rows-and-g.patch",
+   "sha256": "7a29c933563e085076c8d9548b4e84e03b3c0df41c53f409158e4d588fa609a5",
+   "kind": "perf",
+   "category": "K1",
+   "own_mark": "WO-B part only. Its WO-B bench (mxfp8_gemm and TileLangWOProjection at M=104..128, K=3072/2048/1024) on the image, 2 boots, ABBA: faster beyond the interval at M=97..128, torch.equal against the prefill GEMM; the engine grid's 16-stream cell not worse. It acts only at TP4 (rows past 96 need 16 streams with copy widening: 107 rows at max_num_seqs 16; TP3's 8 streams reach 59)",
+   "declared_output_change": "none"
+  },
+  {
+   "patch": "0784-Match-128-row-vocab-head-tile-pipeline-stages.patch",
+   "pr": 1001,
+   "pr_title": "perf(dsv41): match 128-row vocab head tile pipeline stages on GB10",
+   "pr_head": "03e2d903daf9ea197b430e24b75e64b0eda7e737",
+   "source_patch": "experiments/2026-11-08-vocab-head-128tile-greedy/vllm/0762-Match-128-row-vocab-head-tile-pipeline-stages.patch",
+   "source_sha256": "7fb087e80cab9b5f53ba87b5269abcc0591895ab69d004e619dee839ad082c61",
+   "method": "context-only rebase",
+   "rebase": "experiments/2026-10-26-spark-ds41f-candidate/candidate-51/receipts/rebases/51-04-Match-128-row-vocab-head-tile-pipeline-stages.patch",
+   "applied": "clean; the PR's patch rebased with a context-only change at selection: experiments/2026-10-26-spark-ds41f-candidate/candidate-51/receipts/rebases/51-04-Match-128-row-vocab-head-tile-pipeline-stages.patch",
+   "sha256": "c905a4930474122ee70a4f2e5d0af8b1d8398922fd78f1ad4dcb16e38fca885c",
+   "kind": "perf",
+   "category": "K1",
+   "own_mark": "Its bench_vocab_2boot.py (captured CUDA graphs) on the image, 2 boots, ABBA: projection and greedy epilogue at M=97..128 (the 128-row tile) faster beyond the interval, bit-identical logits and (max, index) pairs, M<=96 not worse. TP4 only (as #987)",
+   "declared_output_change": "none"
+  }
+ ],
+ "left_out": [
+  {
+   "pr": 987,
+   "patch": "0762-perf-dsv41-extend-WO-B-WIDE_DECODE-to-128-rows-and-g.patch",
+   "part": "vllm/models/deepseek_v4_1/sp_prefill.py and tests/models/test_deepseek_v4_1_sp_prefill.py (resolve_min_rows)",
+   "reason": "does nothing on this deployment: at max_num_seqs <= 16 the SP floor stays at the 205-row RoCE limit; it acts only past 32 streams",
+   "disposition": "left out at selection (file-level split)"
+  },
+  {
+   "pr": 987,
+   "patch": "same",
+   "part": "vllm/v1/worker/gpu/cudagraph_utils.py and its test in tests/v1/cudagraph/test_cudagraph_manager.py (_FULL_DEPTH_VARLEN_DECODE_MAX_REQS = 16)",
+   "reason": "does nothing on this deployment: the PR states zero change to captured graphs at max_num_seqs <= 16, and the recipe serves 16 (TP4) and 8 (TP3)",
+   "disposition": "left out at selection (file-level split)"
+  },
+  {
+   "pr": 987,
+   "patch": "same",
+   "part": "vllm/models/deepseek_v4_1/tilelang/collectives.py and vllm/distributed/device_communicators/cuda_communicator.py (all_reduce_rank_order through RoCE reduce-scatter + all-gather)",
+   "reason": "not inert: it moves CED decoder steps of 205..408 rows from the PyNCCL rank-order path to RoCE, a second causal variable unrelated to the WO-B mark",
+   "disposition": "split out; re-submit as its own experiment (prefill collectives, tp4-switched or tp3)"
+  },
+  {
+   "pr": 988,
+   "patch": "0762-perf-spec-decode-sampler-dead-row-skip-and-sparse-topk.patch",
+   "part": "sparse top-k Markov sampling: topk_* kernels in tilelang_sampling.py, _sample_sequential_topk in dspark/speculator.py, apply_markov_bias_topk in nvidia/dspark.py, apply_bias_topk in qwen3_dspark.py's DSparkMarkovHead, tests/v1/spec_decode/test_dspark_topk.py",
+   "reason": "does nothing on this deployment: it runs only when dspark_draft_topk is set, and neither the recipe nor the 1017 checkpoint's config sets it (drafts are greedy); Qwen3DSparkForCausalLM.apply_markov_bias_topk is another model",
+   "disposition": "PR queued: hunk-level split needed before it can join"
+  },
+  {
+   "pr": 995,
+   "patch": "0762-perf-spec-decode-copy-drafter-guards-and-wide-ramp.patch",
+   "part": "SPARK_DS41F_COPY_MAX_DRAFTS (vllm/config/speculative.py), greedy_rejection_kernel widths above 32 (tilelang_sampling.py), benchmark --lookahead, test_wide_lookahead_31_and_63_greedy_verification_and_ramp",
+   "reason": "does nothing on this deployment: the 31/63-draft ramp is opt-in; the recipe keeps max_drafts at 16 (17 rows), where the kernel keeps its one-pass code",
+   "disposition": "PR queued: hunk-level split needed"
+  },
+  {
+   "pr": 1006,
+   "patch": "0762-perf-dsv41-vectorize-postload-add-artifact-cache-and.patch",
+   "part": "vllm/models/deepseek_v4_1/tilelang/postload_cache.py and its hooks (artifact cache)",
+   "reason": "does nothing on this deployment: it reads or writes only when VLLM_POSTLOAD_CACHE_DIR or SPARK_DS41F_POSTLOAD_CACHE_DIR is set; the recipe sets neither",
+   "disposition": "PR queued: hunk-level split into its variables needed"
+  },
+  {
+   "pr": 1006,
+   "patch": "same",
+   "part": "vllm/models/deepseek_v41/nvidia/vl_model.py",
+   "reason": "does nothing on GB10: vllm/models/deepseek_v41 routes capability family 120 to vllm/models/deepseek_v4_1; this file is the other-NVIDIA path",
+   "disposition": "PR queued (file-level)"
+  },
+  {
+   "pr": 983,
+   "patch": "0762-perf-dsv41-engram-clock-pro-prefill-shield-and-pinned-scales.patch",
+   "part": "pin_scales (rows.py and the two-plane reader path)",
+   "reason": "does nothing on this deployment: opt-in SPARK_DS41F_ENGRAM_PIN_SCALES for two-plane tables; production reads packed rows",
+   "disposition": "PR parked"
+  },
+  {
+   "pr": 957,
+   "patch": "0762-perf-dsv41-tp3-decode-compressor-mla-and-spec-fusions.patch",
+   "part": "part 3, fused post-step verification bookkeeping (acceptance_estimator.py, speculator.py, model_runner.py)",
+   "reason": "superseded: the base's #965 and #980 already fuse the dead-row cut and copy state into _accumulate_kernel; these hunks conflict with them",
+   "disposition": "PR queued for rework"
+  },
+  {
+   "pr": 954,
+   "patch": "whole PR",
+   "part": "",
+   "reason": "does nothing on this deployment (opt-in LSA)",
+   "disposition": "parked"
+  },
+  {
+   "pr": 1014,
+   "patch": "whole PR",
+   "part": "",
+   "reason": "does nothing on this deployment (opt-in LSA)",
+   "disposition": "parked"
+  },
+  {
+   "pr": 981,
+   "patch": "whole PR",
+   "part": "",
+   "reason": "does nothing on this deployment (TP=2 is not served)",
+   "disposition": "parked"
+  },
+  {
+   "pr": 1004,
+   "patch": "whole PR",
+   "part": "",
+   "reason": "does nothing on this deployment (the draft layers have no indexer)",
+   "disposition": "parked"
+  }
+ ],
+ "selection_receipts": "experiments/2026-10-26-spark-ds41f-candidate/candidate-51/receipts/selection-proposal.json"
+}

@@ -1,0 +1,403 @@
+From 530ecffb0ab2b659a243828835d6dabf5e9333e0 Mon Sep 17 00:00:00 2001
+From: Christopher Owen <3221756+christopherowen@users.noreply.github.com>
+Date: Sun, 8 Nov 2026 12:00:00 +0000
+Subject: [PATCH] perf(dsv41): unconditional pack12 row bounds, PDL chain, and
+ byte-level vocab SWAR
+
+- Replace vllm_packed_bf16_filter_exc in _packed_bf16_gemm and packed_bf16_gemm_two with unconditional vllm_packed_bf16_load_row_bounds (eliminating the redundant col < K binary search loop over full rows) and make vllm_packed_bf16_filter_exc load row_offsets unconditionally.
+- Add pdl.chain() to _packed_bf16_gemm and packed_bf16_gemm_two and register the packed_bf16 GEMM/unpack kernels in deepseek_v41_pdl_sources.CHAIN.
+- Upgrade vllm_vocab_decode_vec16 to 18-op byte-level __byte_perm SWAR (cutting inner-loop unpack ALU by 44%) and replace the tile-wide CSR exception broadcast loop in packed_vocab_projection, packed_vocab_greedy_partials, and packed_vocab_markov_greedy_partials with direct per-fragment-column vllm_vocab_apply_row_exceptions.
+---
+ tests/kernels/deepseek_v41_pdl_sources.py   |   5 +
+ vllm/models/deepseek_v4_1/tilelang/gemm.py  |  33 +--
+ vllm/models/deepseek_v4_1/tilelang/vocab.py | 242 ++++++++++++--------
+ 3 files changed, 171 insertions(+), 109 deletions(-)
+
+diff --git a/tests/kernels/deepseek_v41_pdl_sources.py b/tests/kernels/deepseek_v41_pdl_sources.py
+index 017f964..d2b1c58 100644
+--- a/tests/kernels/deepseek_v41_pdl_sources.py
++++ b/tests/kernels/deepseek_v41_pdl_sources.py
+@@ -46,6 +46,11 @@ CHAIN = {
+     "gemm_fp8w_bf16_cast",
+     "gemm_fp8w_bf16_partials",
+     "gemm_mxfp8_partials",
++    "gemm_packed_bf16",
++    "gemm_packed_bf16_partials",
++    "gemm_packed_bf16_splitk",
++    "gemm_packed_bf16_two",
++    "unpack_packed_bf16",
+     "gemm_mxfp8_rope_mxfp4",
+     "gemm_splitk_reduce",
+     "gemm_splitk_reduce_cast",
+diff --git a/vllm/models/deepseek_v4_1/tilelang/gemm.py b/vllm/models/deepseek_v4_1/tilelang/gemm.py
+index c2443ad..f83c2fa 100644
+--- a/vllm/models/deepseek_v4_1/tilelang/gemm.py
++++ b/vllm/models/deepseek_v4_1/tilelang/gemm.py
+@@ -1443,6 +1443,17 @@ _PACKED_BF16_HEADER = r"""
+ 
+ __device__ __forceinline__ void splitk_fence() { __threadfence(); }
+ 
++__device__ __forceinline__ void vllm_packed_bf16_load_row_bounds(
++    int num_exceptions,
++    const int* __restrict__ row_offsets,
++    int row,
++    int* __restrict__ out_start,
++    int* __restrict__ out_end) {
++  const bool has_exc = (num_exceptions > 0);
++  *out_start = has_exc ? __ldg(&row_offsets[row]) : 0;
++  *out_end = has_exc ? __ldg(&row_offsets[row + 1]) : 0;
++}
++
+ __device__ __forceinline__ void vllm_packed_bf16_filter_exc(
+     const int* __restrict__ exception_entries,
+     int num_exceptions,
+@@ -1452,13 +1463,9 @@ __device__ __forceinline__ void vllm_packed_bf16_filter_exc(
+     int col_end,
+     int* __restrict__ out_start,
+     int* __restrict__ out_end) {
+-  if (num_exceptions <= 0) {
+-    *out_start = 0;
+-    *out_end = 0;
+-    return;
+-  }
+-  int start = __ldg(&row_offsets[row]);
+-  int end = __ldg(&row_offsets[row + 1]);
++  const bool has_exc = (num_exceptions > 0);
++  int start = has_exc ? __ldg(&row_offsets[row]) : 0;
++  int end = has_exc ? __ldg(&row_offsets[row + 1]) : 0;
+   if (col_start > 0 && start < end) {
+     int lo = start;
+     int hi = end;
+@@ -1694,6 +1701,7 @@ def _packed_bf16_gemm(
+             T.ceildiv(N, block_N), T.ceildiv(M, block_M), threads=threads
+         ) as (bx, by):
+             T.import_source(_PACKED_BF16_HEADER)
++            pdl.chain()
+             if blocked:
+                 A0_shared = T.alloc_shared((block_M, _PACKED_HALF), T.bfloat16)
+                 A1_shared = T.alloc_shared((block_M, _PACKED_HALF), T.bfloat16)
+@@ -1726,13 +1734,10 @@ def _packed_bf16_gemm(
+                     r_idx = T.min(first + j, N - 1)
+                     T.call_extern(
+                         "handle",
+-                        "vllm_packed_bf16_filter_exc",
+-                        T.address_of(exception_entries[0]),
++                        "vllm_packed_bf16_load_row_bounds",
+                         E,
+                         T.address_of(row_offsets[0]),
+                         r_idx,
+-                        0,
+-                        K,
+                         T.address_of(exc_s[step]),
+                         T.address_of(exc_e[step]),
+                     )
+@@ -1886,6 +1891,7 @@ def packed_bf16_gemm_two(
+     ):
+         with T.Kernel(2 * tiles, T.ceildiv(M, block_M), threads=threads) as (bx, by):
+             T.import_source(_PACKED_BF16_HEADER)
++            pdl.chain()
+             if blocked:
+                 A0_shared = T.alloc_shared((block_M, _PACKED_HALF), T.bfloat16)
+                 A1_shared = T.alloc_shared((block_M, _PACKED_HALF), T.bfloat16)
+@@ -1918,13 +1924,10 @@ def packed_bf16_gemm_two(
+                     r_idx = T.min(first + j, 2 * N - 1)
+                     T.call_extern(
+                         "handle",
+-                        "vllm_packed_bf16_filter_exc",
+-                        T.address_of(exception_entries[0]),
++                        "vllm_packed_bf16_load_row_bounds",
+                         E,
+                         T.address_of(row_offsets[0]),
+                         r_idx,
+-                        0,
+-                        K,
+                         T.address_of(exc_s[step]),
+                         T.address_of(exc_e[step]),
+                     )
+diff --git a/vllm/models/deepseek_v4_1/tilelang/vocab.py b/vllm/models/deepseek_v4_1/tilelang/vocab.py
+index 3ff266a..c16887b 100644
+--- a/vllm/models/deepseek_v4_1/tilelang/vocab.py
++++ b/vllm/models/deepseek_v4_1/tilelang/vocab.py
+@@ -532,7 +532,7 @@ __device__ __forceinline__ void vllm_vocab_decode_vec16(
+   const unsigned int* cd = reinterpret_cast<const unsigned int*>(&codes4);
+   unsigned int* oa = reinterpret_cast<unsigned int*>(out_a_ptr);
+   unsigned int* ob = reinterpret_cast<unsigned int*>(out_b_ptr);
+-  constexpr unsigned int BASE_SCALAR = (unsigned int)(BASE_MINUS_ONE & 0xFFFF);
++  constexpr unsigned int BASE_BYTE = (unsigned int)(BASE_MINUS_ONE & 0xFF);
+ 
+   #pragma unroll
+   for (int w = 0; w < 4; ++w) {
+@@ -540,36 +540,102 @@ __device__ __forceinline__ void vllm_vocab_decode_vec16(
+     const unsigned int la_word = la[w];
+     const unsigned int lb_word = lb[w];
+ 
+-    const unsigned int c01 = __byte_perm(c_word, 0u, 0x4140u);
+-    const unsigned int c23 = __byte_perm(c_word, 0u, 0x4342u);
+-
+-    const unsigned int ca01 = c01 & 0x000F000Fu;
+-    const unsigned int cb01 = (c01 >> 4) & 0x000F000Fu;
+-    const unsigned int ca23 = c23 & 0x000F000Fu;
+-    const unsigned int cb23 = (c23 >> 4) & 0x000F000Fu;
+-
+-    const unsigned int nza01 = ((ca01 + 0x000F000Fu) >> 4) & 0x00010001u;
+-    const unsigned int nzb01 = ((cb01 + 0x000F000Fu) >> 4) & 0x00010001u;
+-    const unsigned int nza23 = ((ca23 + 0x000F000Fu) >> 4) & 0x00010001u;
+-    const unsigned int nzb23 = ((cb23 + 0x000F000Fu) >> 4) & 0x00010001u;
+-
+-    const unsigned int expa01 = (ca01 + nza01 * BASE_SCALAR) << 7;
+-    const unsigned int expb01 = (cb01 + nzb01 * BASE_SCALAR) << 7;
+-    const unsigned int expa23 = (ca23 + nza23 * BASE_SCALAR) << 7;
+-    const unsigned int expb23 = (cb23 + nzb23 * BASE_SCALAR) << 7;
+-
+-    const unsigned int la01 = __byte_perm(la_word, 0u, 0x1100u);
+-    const unsigned int la23 = __byte_perm(la_word, 0u, 0x3322u);
+-    const unsigned int lb01 = __byte_perm(lb_word, 0u, 0x1100u);
+-    const unsigned int lb23 = __byte_perm(lb_word, 0u, 0x3322u);
+-
+-    oa[2 * w + 0] = (la01 & 0x807F807Fu) | expa01;
+-    oa[2 * w + 1] = (la23 & 0x807F807Fu) | expa23;
+-    ob[2 * w + 0] = (lb01 & 0x807F807Fu) | expb01;
+-    ob[2 * w + 1] = (lb23 & 0x807F807Fu) | expb23;
++    const unsigned int ca4 = c_word & 0x0F0F0F0Fu;
++    const unsigned int cb4 = (c_word >> 4) & 0x0F0F0F0Fu;
++    const unsigned int nza4 = ((ca4 + 0x0F0F0F0Fu) >> 4) & 0x01010101u;
++    const unsigned int nzb4 = ((cb4 + 0x0F0F0F0Fu) >> 4) & 0x01010101u;
++    const unsigned int ea4 = ca4 + nza4 * BASE_BYTE;
++    const unsigned int eb4 = cb4 + nzb4 * BASE_BYTE;
++
++    const unsigned int la_mag = la_word & 0x7F7F7F7Fu;
++    const unsigned int lb_mag = lb_word & 0x7F7F7F7Fu;
++    const unsigned int la_sgn = la_word & 0x80808080u;
++    const unsigned int lb_sgn = lb_word & 0x80808080u;
++
++    const unsigned int a_lo = (la_mag | ((ea4 & 0x01010101u) << 7)) & (nza4 * 0xFFu);
++    const unsigned int b_lo = (lb_mag | ((eb4 & 0x01010101u) << 7)) & (nzb4 * 0xFFu);
++    const unsigned int a_hi = la_sgn | ((ea4 >> 1) & 0x7F7F7F7Fu);
++    const unsigned int b_hi = lb_sgn | ((eb4 >> 1) & 0x7F7F7F7Fu);
++
++    oa[2 * w + 0] = __byte_perm(a_lo, a_hi, 0x5140u);
++    oa[2 * w + 1] = __byte_perm(a_lo, a_hi, 0x7362u);
++    ob[2 * w + 0] = __byte_perm(b_lo, b_hi, 0x5140u);
++    ob[2 * w + 1] = __byte_perm(b_lo, b_hi, 0x7362u);
+   }
+ }
+ 
++template <int BM, int BN, int THREADS, int N_ROWS, int K_COLS>
++__device__ __forceinline__ void vllm_vocab_apply_row_exceptions(
++    float* __restrict__ c_frag,
++    const void* __restrict__ a_ptr,
++    const int* __restrict__ exception_rows,
++    const int* __restrict__ exception_entries,
++    const int* __restrict__ row_offsets,
++    int by, int bx, int M, int num_exceptions, int tx) {
++  (void)exception_rows;
++  if (num_exceptions <= 0) return;
++  const uint16_t* __restrict__ A = reinterpret_cast<const uint16_t*>(a_ptr);
++  constexpr int WARPS = THREADS >> 5;
++  constexpr int WARPS_M = (BM == 16) ? 1 : 2;
++  constexpr int WARPS_N = WARPS / WARPS_M;
++  constexpr int MMA_M = BM / (WARPS_M * 16);
++  constexpr int MMA_N = BN / (WARPS_N * 8);
++  const int warp_id = tx >> 5;
++  const int lane = tx & 31;
++  const int warp_m = (BM == 16) ? 0 : (warp_id & 1);
++  const int warp_n = (BM == 16) ? warp_id : (warp_id >> 1);
++  const int lane_row = lane >> 2;
++  const int lane_col = (lane & 3) * 2;
++  const int base_col = bx * BN + warp_n * (MMA_N * 8) + lane_col;
++
++  #pragma unroll
++  for (int n_tile = 0; n_tile < MMA_N; ++n_tile) {
++    const int col0 = base_col + n_tile * 8;
++    const int col1 = col0 + 1;
++    const int s0 = (col0 < N_ROWS) ? __ldg(&row_offsets[col0]) : 0;
++    const int e0 = (col0 < N_ROWS) ? __ldg(&row_offsets[col0 + 1]) : 0;
++    const int e1 = (col1 < N_ROWS) ? __ldg(&row_offsets[col1 + 1]) : e0;
++    for (int idx = s0; idx < e0; ++idx) {
++      const unsigned int entry = (unsigned int)__ldg(&exception_entries[idx]);
++      const int k_col = (int)(entry >> 16);
++      const unsigned int v_bits = (entry & 0xFFFFu) << 16;
++      const float val = __uint_as_float(v_bits);
++      #pragma unroll
++      for (int m_tile = 0; m_tile < MMA_M; ++m_tile) {
++        #pragma unroll
++        for (int r_half = 0; r_half < 2; ++r_half) {
++          const int r = warp_m * (MMA_M * 16) + m_tile * 16 + r_half * 8 + lane_row;
++          const int tok = (by * BM + r < M) ? (by * BM + r) : (M - 1);
++          const unsigned int a_bits = ((unsigned int)A[(long long)tok * K_COLS + k_col]) << 16;
++          const float a_val = __uint_as_float(a_bits);
++          const int frag_idx = ((m_tile * MMA_N + n_tile) * 2 + r_half) * 2;
++          c_frag[frag_idx] += val * a_val;
++        }
++      }
++    }
++    for (int idx = e0; idx < e1; ++idx) {
++      const unsigned int entry = (unsigned int)__ldg(&exception_entries[idx]);
++      const int k_col = (int)(entry >> 16);
++      const unsigned int v_bits = (entry & 0xFFFFu) << 16;
++      const float val = __uint_as_float(v_bits);
++      #pragma unroll
++      for (int m_tile = 0; m_tile < MMA_M; ++m_tile) {
++        #pragma unroll
++        for (int r_half = 0; r_half < 2; ++r_half) {
++          const int r = warp_m * (MMA_M * 16) + m_tile * 16 + r_half * 8 + lane_row;
++          const int tok = (by * BM + r < M) ? (by * BM + r) : (M - 1);
++          const unsigned int a_bits = ((unsigned int)A[(long long)tok * K_COLS + k_col]) << 16;
++          const float a_val = __uint_as_float(a_bits);
++          const int frag_idx = ((m_tile * MMA_N + n_tile) * 2 + r_half) * 2 + 1;
++          c_frag[frag_idx] += val * a_val;
++        }
++      }
++    }
++  }
++}
++#define vllm_vocab_apply_row_exceptions_clocal(BM, BN, THREADS, N_ROWS, K_COLS, A_ptr, exc_rows, exc_entries, row_offs, by, bx, M, E, tx) \
++  vllm_vocab_apply_row_exceptions<BM, BN, THREADS, N_ROWS, K_COLS>(C_local, A_ptr, exc_rows, exc_entries, row_offs, by, bx, M, E, tx)
++
+ __device__ __forceinline__ int vllm_vocab_first_argmax_keep(
+     float av, int ai, float bv, int bi) {
+   const bool a_nan = av != av;
+@@ -922,28 +988,24 @@ def packed_vocab_projection(
+             # Only the exception's own row changes; the others are selected
+             # unchanged, so no other output gains a +0.0 (which would turn a
+             # -0.0 into +0.0).
+-            if E > 0:
+-                first = bx * block_N
+-                start = T.alloc_var(T.int32, init=row_offsets[first])
+-                end = T.alloc_var(T.int32, init=row_offsets[T.min(first + block_N, N)])
+-                if start < end:
+-                    for index in T.serial(start, end):
+-                        row = T.alloc_var(T.int32, init=exception_rows[index] - first)
+-                        entry = T.alloc_var(T.int32, init=exception_entries[index])
+-                        value = T.alloc_var(
+-                            T.float32,
+-                            init=T.Cast(
+-                                T.float32,
+-                                T.reinterpret(T.Cast(T.uint16, entry & 0xFFFF), T.bfloat16),
+-                            ),
+-                        )
+-                        column = T.alloc_var(T.int32, init=entry >> 16)
+-                        for i, j in T.Parallel(block_M, block_N):
+-                            if j == row:
+-                                token = T.min(by * block_M + i, M - 1)
+-                                C_local[i, j] = C_local[i, j] + value * T.Cast(
+-                                    T.float32, A[token, column]
+-                                )
++            T.call_extern(
++                "handle",
++                "vllm_vocab_apply_row_exceptions_clocal",
++                block_M,
++                block_N,
++                threads,
++                N,
++                K,
++                T.address_of(A[0, 0]),
++                T.address_of(exception_rows[0]),
++                T.address_of(exception_entries[0]),
++                T.address_of(row_offsets[0]),
++                by,
++                bx,
++                M,
++                E,
++                tx,
++            )
+             T.copy(C_local, C[by * block_M, bx * block_N])
+ 
+     return vocab_packed_projection
+@@ -1051,28 +1113,24 @@ def packed_vocab_greedy_partials(
+                         for v in T.vectorized(VEC):
+                             B_shared[j, g * GROUP + HALF + c + v] = out_b[v]
+                 T.gemm(A_shared, B_shared, C_local, transpose_B=True)
+-            if E > 0:
+-                first = bx * block_N
+-                start = T.alloc_var(T.int32, init=row_offsets[first])
+-                end = T.alloc_var(T.int32, init=row_offsets[T.min(first + block_N, N)])
+-                if start < end:
+-                    for index in T.serial(start, end):
+-                        row = T.alloc_var(T.int32, init=exception_rows[index] - first)
+-                        entry = T.alloc_var(T.int32, init=exception_entries[index])
+-                        value = T.alloc_var(
+-                            T.float32,
+-                            init=T.Cast(
+-                                T.float32,
+-                                T.reinterpret(T.Cast(T.uint16, entry & 0xFFFF), T.bfloat16),
+-                            ),
+-                        )
+-                        column = T.alloc_var(T.int32, init=entry >> 16)
+-                        for i, j in T.Parallel(block_M, block_N):
+-                            if j == row:
+-                                token = T.min(by * block_M + i, M - 1)
+-                                C_local[i, j] = C_local[i, j] + value * T.Cast(
+-                                    T.float32, A[token, column]
+-                                )
++            T.call_extern(
++                "handle",
++                "vllm_vocab_apply_row_exceptions_clocal",
++                block_M,
++                block_N,
++                threads,
++                N,
++                K,
++                T.address_of(A[0, 0]),
++                T.address_of(exception_rows[0]),
++                T.address_of(exception_entries[0]),
++                T.address_of(row_offsets[0]),
++                by,
++                bx,
++                M,
++                E,
++                tx,
++            )
+             if out_dtype != T.float32:
+                 T.copy(C_local, C_round)
+                 T.copy(C_round, C_local)
+@@ -1207,28 +1265,24 @@ def packed_vocab_markov_greedy_partials(
+                         for v in T.vectorized(VEC):
+                             B_shared[j, g * GROUP + HALF + c + v] = out_b[v]
+                 T.gemm(A_shared, B_shared, C_local, transpose_B=True)
+-            if E > 0:
+-                first = bx * block_N
+-                start = T.alloc_var(T.int32, init=row_offsets[first])
+-                end = T.alloc_var(T.int32, init=row_offsets[T.min(first + block_N, N)])
+-                if start < end:
+-                    for index in T.serial(start, end):
+-                        row = T.alloc_var(T.int32, init=exception_rows[index] - first)
+-                        entry = T.alloc_var(T.int32, init=exception_entries[index])
+-                        value = T.alloc_var(
+-                            T.float32,
+-                            init=T.Cast(
+-                                T.float32,
+-                                T.reinterpret(T.Cast(T.uint16, entry & 0xFFFF), T.bfloat16),
+-                            ),
+-                        )
+-                        column = T.alloc_var(T.int32, init=entry >> 16)
+-                        for i, j in T.Parallel(block_M, block_N):
+-                            if j == row:
+-                                token = T.min(by * block_M + i, M - 1)
+-                                C_local[i, j] = C_local[i, j] + value * T.Cast(
+-                                    T.float32, A[token, column]
+-                                )
++            T.call_extern(
++                "handle",
++                "vllm_vocab_apply_row_exceptions_clocal",
++                block_M,
++                block_N,
++                threads,
++                N,
++                K,
++                T.address_of(A[0, 0]),
++                T.address_of(exception_rows[0]),
++                T.address_of(exception_entries[0]),
++                T.address_of(row_offsets[0]),
++                by,
++                bx,
++                M,
++                E,
++                tx,
++            )
+             if out_dtype != T.float32:
+                 T.copy(C_local, C_round)
+                 T.copy(C_round, C_local)
+-- 
+2.43.0
+
