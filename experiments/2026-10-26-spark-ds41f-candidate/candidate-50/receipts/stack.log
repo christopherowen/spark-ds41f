@@ -1,0 +1,220 @@
+# candidate-50 stack log
+#
+# Fresh vLLM checkout on dgx4: local-inference-lab/vllm 19f2c20ed4d64ae22bd009ceacadd85e2a81e354 (git fetch --filter=blob:none),
+# 1107's series 0001..0761 (641 patches) applied with git am --committer-date-is-author-date and committer
+# Christopher Owen <3221756+christopherowen@users.noreply.github.com>, as bin/spark build prepare does; it reproduces
+# 1107's patch_head 2756478b60b9 and tree ed1bdb7a7684 (tag base-1107). Each candidate-50 patch is then checked with
+# git apply --check --verbose (hunk offsets are listed) and applied with git am, in series order. Scripts: see the end.
+
+## 1. Requested order, patches as copied from candidates 47-49 (0776 and 0778 not yet rebased)
+
+base-1107 patch_head 2756478b60b90700b9918b457aeb38657da637b5 tree ed1bdb7a7684da33d403a055521ac0c4dd7ca670
+OK    0762-perf-dsv41-evict-first-l2-policy-on-routed-moe-tma-weights.patch sha256=9c87a2cde0c3725abf2eeaeb75d7c3da588781ebd64fbf1e2ef87145063087c2  commit=eb8367abcb1f64b8aea176d2bd516b7c24c88d3e tree=e10b5f644a8fc58f38d26a8bf71109fdd184204d files=2
+OK    0763-perf-dsv41-certified-two-pass-lm-head-vocab-screen.patch sha256=9dd029645123a6d781b8b266a7f5631e07fce46420da30f185a50f57dc15975f  commit=2ab2b10322a3cec35a6459315e42604c9fd5e26c tree=c4c1334009ded56386e91bfad538d4d2c816f78f files=4
+OK    0764-perf-worker-eliminate-decode-step-h2d-and-aten-overhead.patch sha256=3cc90fd7cbd7e4bbc6d70195c4f520b9f2779181b7d7b694c873ced472652155  commit=2c74b76baf9efb6a8940be0b479912af5f5110a0 tree=66b55adf073bcda7b59ce71d72acc8dc17e9bcd7 files=7
+OK    0765-perf-dsv41-overlap-decode-kv-index-writes-with-query.patch sha256=b93f0b8231ce4c0c34058094747f0338958e0a41a3c657e2dd2128b7460870ec  commit=7378235432185029eae5f41844dbf397aee9f0fb tree=b966a5aabd6486dc66de230609d3bcdd957e2ec5 files=6
+OK    0766-perf-dsv41-align-qb-and-indexer-qb-tile-contiguous-decode.patch sha256=a2e890cb07352a5321b8976becd2bcd0e7623dd4d04860792c52dbfdd109da53  commit=693f5a34f8e8d289b914c8e4907fa8987e216b4a tree=1bb01637f364abf92eca37c67e977254ee55b55e files=2
+OK    0767-perf-dsv41-sparse-mla-stage1-kv-gather-and-barrier-opt.patch sha256=a94953a2256e034b253062b2939fb722edda5e0f04c468cc58777d4593a5805d  commit=2d6d365cac0026e3fa1e29fe2cbd750fa18cab67 tree=144aa07d60a2f3c6a2c9b08675cb07fde1ca1fdc files=2
+OK    0768-deepseek-v41-dsml-token-provenance.patch sha256=4faecf86602d5af78f0fb7b6ce8231079e1045ec07d2ef4499c4039cd4e48165  commit=224fd77f8ee17d368c106142f36275b5f4e01a7c tree=1384a958839bc302725667dddec60da99391bfde files=13
+OK    0769-perf-spec-decode-elide-tp-confidence-broadcast-and-lock-sampling-seeds.patch sha256=8909cac3a7164a33fc31a3094b6c13e8f81e491884a1772b7dccf8d7978cb46f  commit=d928d3bc9ee4403e0664c55bdbba9c297c76dac4 tree=e5b6c992daf014b52abde2e56b79710133dba759 files=7
+      git apply: Hunk #1 succeeded at 406 (offset 18 lines).
+      git apply: Hunk #2 succeeded at 493 (offset 18 lines).
+      git apply: Hunk #3 succeeded at 589 (offset 33 lines).
+      git apply: Hunk #4 succeeded at 653 (offset 33 lines).
+      git apply: Hunk #5 succeeded at 672 (offset 33 lines).
+OK    0770-fix-structured-output-enforce-completions-grammar-un.patch sha256=62f0c10104df81e76870339de74f391956f21c70869acfc4db1c755a0aef4475  commit=f4cf51df5c31f349ca847fd9688017000e52d283 tree=4ed2b51913d2f224a52bcee0717262d17b768a54 files=3
+OK    0771-feat-serve-sse-keepalive-heartbeat-and-abort-cleanup.patch sha256=6376f864f55999f720f5352c1d38ecb5fb9ef01b1efdcaa0e6826f203ec041b7  commit=55a961f43fc5ef65bcd535ee932e4f7830112839 tree=aa8d84b1f3c8822bdd728d7b521b2bc90230b845 files=8
+OK    0772-fix-entrypoints-move-model-inspection-RPC-out-of-LLM.patch sha256=b6d59741bef111b035759235ab8044e2c3b64ae95a870ca500a9323b3b325b4d  commit=9a412d911d11d953d0167e30de2c92cc2a6842bc tree=4f8be4f71018ba914d3b9cedf533b8ffafdf9dab files=3
+OK    0773-fix-attention-keep-FA-sliding-window-active-under-ba.patch sha256=bde52b4ac23f14410ac142b2bb7e6b132b0728c3ab4b68b4dc73726e2fa3459c  commit=4e7f40f19704c7aa8739575145002f8a89a079dd tree=0b4acc88eb9993a79886c3dc5eacb0503fdb484c files=2
+OK    0774-perf-dsv41-fast-path-multi-turn-chat-rendering-and-s.patch sha256=5ab215e451714e0d821f9c6656da53372cb941f54669d448100bfce78a4f08f2  commit=65309d02a3d6926565ea7e04aed54a831ea6e5a4 tree=e4481e62237a0b5a6ab82e1d639cf6a28f5514c3 files=4
+OK    0775-perf-dsv41-widen-long-context-indexer-top-k-segments.patch sha256=82dd996ae49515ccc478e4b1de21200d7bf7b3e151689f8d01f5742b57db8240  commit=7ded0c6ca0d131fe5f68dfb6340531a1ae25b8a2 tree=e801ccc78a4ff3ec67c46d32b74ca33d0718b2cb files=2
+FAIL  0776-perf-dsv41-vectorize-indexer-KPool-loads-and-co-sche.patch sha256=3140e70d2f340cb2a8086934125bb134441e477140178a17f0fa2ef75efe8d62  git apply --check rc=1
+      Checking patch tests/kernels/attention/test_deepseek_v41_tilelang.py...
+      error: while searching for:
+          assert swa24.segments == 1
+          assert swa24.split_max_rows == 24
+          assert swa24.decode_max_rows == 144
+      
+      error: patch failed: tests/kernels/attention/test_deepseek_v41_tilelang.py:1286
+      error: tests/kernels/attention/test_deepseek_v41_tilelang.py: patch does not apply
+      Checking patch vllm/models/deepseek_v4_1/tilelang/indexer.py...
+head 7ded0c6ca0d131fe5f68dfb6340531a1ae25b8a2 tree e801ccc78a4ff3ec67c46d32b74ca33d0718b2cb patches_after_base 14
+git diff --check 19f2c20ed4d6..HEAD: clean
+
+## 2. Other orders, each candidate's internal order kept (git apply --index on base-1107, original patches)
+## candidate-47 = 0762..0767, candidate-48 = 0768..0774, candidate-49 = 0775..0780
+
+order 47 48 49: FAIL at 0776 (error: patch failed: tests/kernels/attention/test_deepseek_v41_tilelang.py:1286)
+order 47 49 48: FAIL at 0776 (error: patch failed: tests/kernels/attention/test_deepseek_v41_tilelang.py:1286)
+order 48 47 49: FAIL at 0776 (error: patch failed: tests/kernels/attention/test_deepseek_v41_tilelang.py:1286)
+order 48 49 47: FAIL at 0765 (error: patch failed: tests/models/test_deepseek_v4_1_attention.py:1624)
+order 49 47 48: FAIL at 0765 (error: patch failed: tests/models/test_deepseek_v4_1_attention.py:1624)
+order 49 48 47: FAIL at 0765 (error: patch failed: tests/models/test_deepseek_v4_1_attention.py:1624)
+[0762 0763 0764 0765 0766 0768 0769 0770 0771 0772 0773 0774 0775 0776 0767 0777 0778 0779 0780] -> FAIL at 0767: error: patch failed: tests/kernels/attention/test_deepseek_v41_tilelang.py:1286 error: tests/kernels/attention/test_deepseek_v41_tilelang.py: patch does not apply 
+[0762 0763 0764 0765 0766 0768 0769 0770 0771 0772 0773 0774 0775 0776 0777 0778 0779 0780 0767] -> FAIL at 0778: error: patch failed: tests/models/test_deepseek_v4_1_attention.py:1624 error: tests/models/test_deepseek_v4_1_attention.py: patch does not apply 
+[0776 0767] -> FAIL at 0767: error: patch failed: tests/kernels/attention/test_deepseek_v41_tilelang.py:1286 error: tests/kernels/attention/test_deepseek_v41_tilelang.py: patch does not apply 
+[0778 0765] -> FAIL at 0765: error: patch failed: tests/models/test_deepseek_v4_1_attention.py:1624 error: tests/models/test_deepseek_v4_1_attention.py: patch does not apply 
+
+# #964 (0767) and #993 (0776) both append a test at the end of tests/kernels/attention/test_deepseek_v41_tilelang.py;
+# #1012 round 1 (0765) and #1009 (0778) both append a test at the end of tests/models/test_deepseek_v4_1_attention.py.
+# No order applies; both are textual test-file conflicts. 0776 and 0778 are rebased with a context-only change
+# (receipts/rebases/rebases.json and the .patch.diff files beside it).
+
+## 3. Requested order with 0776 rebased (0778 original)
+
+base-1107 patch_head 2756478b60b90700b9918b457aeb38657da637b5 tree ed1bdb7a7684da33d403a055521ac0c4dd7ca670
+OK    0762-perf-dsv41-evict-first-l2-policy-on-routed-moe-tma-weights.patch sha256=9c87a2cde0c3725abf2eeaeb75d7c3da588781ebd64fbf1e2ef87145063087c2  commit=eb8367abcb1f64b8aea176d2bd516b7c24c88d3e tree=e10b5f644a8fc58f38d26a8bf71109fdd184204d files=2
+OK    0763-perf-dsv41-certified-two-pass-lm-head-vocab-screen.patch sha256=9dd029645123a6d781b8b266a7f5631e07fce46420da30f185a50f57dc15975f  commit=2ab2b10322a3cec35a6459315e42604c9fd5e26c tree=c4c1334009ded56386e91bfad538d4d2c816f78f files=4
+OK    0764-perf-worker-eliminate-decode-step-h2d-and-aten-overhead.patch sha256=3cc90fd7cbd7e4bbc6d70195c4f520b9f2779181b7d7b694c873ced472652155  commit=2c74b76baf9efb6a8940be0b479912af5f5110a0 tree=66b55adf073bcda7b59ce71d72acc8dc17e9bcd7 files=7
+OK    0765-perf-dsv41-overlap-decode-kv-index-writes-with-query.patch sha256=b93f0b8231ce4c0c34058094747f0338958e0a41a3c657e2dd2128b7460870ec  commit=7378235432185029eae5f41844dbf397aee9f0fb tree=b966a5aabd6486dc66de230609d3bcdd957e2ec5 files=6
+OK    0766-perf-dsv41-align-qb-and-indexer-qb-tile-contiguous-decode.patch sha256=a2e890cb07352a5321b8976becd2bcd0e7623dd4d04860792c52dbfdd109da53  commit=693f5a34f8e8d289b914c8e4907fa8987e216b4a tree=1bb01637f364abf92eca37c67e977254ee55b55e files=2
+OK    0767-perf-dsv41-sparse-mla-stage1-kv-gather-and-barrier-opt.patch sha256=a94953a2256e034b253062b2939fb722edda5e0f04c468cc58777d4593a5805d  commit=2d6d365cac0026e3fa1e29fe2cbd750fa18cab67 tree=144aa07d60a2f3c6a2c9b08675cb07fde1ca1fdc files=2
+OK    0768-deepseek-v41-dsml-token-provenance.patch sha256=4faecf86602d5af78f0fb7b6ce8231079e1045ec07d2ef4499c4039cd4e48165  commit=224fd77f8ee17d368c106142f36275b5f4e01a7c tree=1384a958839bc302725667dddec60da99391bfde files=13
+OK    0769-perf-spec-decode-elide-tp-confidence-broadcast-and-lock-sampling-seeds.patch sha256=8909cac3a7164a33fc31a3094b6c13e8f81e491884a1772b7dccf8d7978cb46f  commit=d928d3bc9ee4403e0664c55bdbba9c297c76dac4 tree=e5b6c992daf014b52abde2e56b79710133dba759 files=7
+      git apply: Hunk #1 succeeded at 406 (offset 18 lines).
+      git apply: Hunk #2 succeeded at 493 (offset 18 lines).
+      git apply: Hunk #3 succeeded at 589 (offset 33 lines).
+      git apply: Hunk #4 succeeded at 653 (offset 33 lines).
+      git apply: Hunk #5 succeeded at 672 (offset 33 lines).
+OK    0770-fix-structured-output-enforce-completions-grammar-un.patch sha256=62f0c10104df81e76870339de74f391956f21c70869acfc4db1c755a0aef4475  commit=f4cf51df5c31f349ca847fd9688017000e52d283 tree=4ed2b51913d2f224a52bcee0717262d17b768a54 files=3
+OK    0771-feat-serve-sse-keepalive-heartbeat-and-abort-cleanup.patch sha256=6376f864f55999f720f5352c1d38ecb5fb9ef01b1efdcaa0e6826f203ec041b7  commit=55a961f43fc5ef65bcd535ee932e4f7830112839 tree=aa8d84b1f3c8822bdd728d7b521b2bc90230b845 files=8
+OK    0772-fix-entrypoints-move-model-inspection-RPC-out-of-LLM.patch sha256=b6d59741bef111b035759235ab8044e2c3b64ae95a870ca500a9323b3b325b4d  commit=9a412d911d11d953d0167e30de2c92cc2a6842bc tree=4f8be4f71018ba914d3b9cedf533b8ffafdf9dab files=3
+OK    0773-fix-attention-keep-FA-sliding-window-active-under-ba.patch sha256=bde52b4ac23f14410ac142b2bb7e6b132b0728c3ab4b68b4dc73726e2fa3459c  commit=4e7f40f19704c7aa8739575145002f8a89a079dd tree=0b4acc88eb9993a79886c3dc5eacb0503fdb484c files=2
+OK    0774-perf-dsv41-fast-path-multi-turn-chat-rendering-and-s.patch sha256=5ab215e451714e0d821f9c6656da53372cb941f54669d448100bfce78a4f08f2  commit=65309d02a3d6926565ea7e04aed54a831ea6e5a4 tree=e4481e62237a0b5a6ab82e1d639cf6a28f5514c3 files=4
+OK    0775-perf-dsv41-widen-long-context-indexer-top-k-segments.patch sha256=82dd996ae49515ccc478e4b1de21200d7bf7b3e151689f8d01f5742b57db8240  commit=7ded0c6ca0d131fe5f68dfb6340531a1ae25b8a2 tree=e801ccc78a4ff3ec67c46d32b74ca33d0718b2cb files=2
+OK    0776-perf-dsv41-vectorize-indexer-KPool-loads-and-co-sche.patch sha256=fa8d0000e8cd1df8d5524190e9821e40321bf53895ebef26e8d9295dee75def6  commit=d6afe84ac5f2744b274a435e1c08cbd030d54894 tree=d841fab2460a6ff556abeeeb737c18450aced72d files=2
+OK    0777-perf-dsv41-hw-e2m1x2-indexer-and-gemm-mxfp4-quantize.patch sha256=20bbb06587981c992e805a3aa56b4a15f2e208f1fc9a0ea4d9d1849ab3fd992f  commit=668bc8056e15aafc6a3b3de37e7aff32c66cd339 tree=2e343ae0c2ce9ad74a17bead938092541ddbd70e files=4
+      git apply: Hunk #2 succeeded at 964 (offset 2 lines).
+FAIL  0778-perf-dsv41-sp-prefill-local-attention-front.patch sha256=40ce0360e4a4a6e2219a541072cb65229bb7758838bc14438a31c385dd704eb8  git apply --check rc=1
+      Checking patch tests/kernels/test_deepseek_v41_tilelang_front.py...
+      Checking patch tests/models/test_deepseek_v4_1_attention.py...
+      error: while searching for:
+                  actual_sum = collectives.RankOrderParts(parts).sum()
+                  expected_sum = collectives.RankOrderParts(expected).sum()
+                  assert torch.equal(actual_sum.view(torch.int16), expected_sum.view(torch.int16))
+      
+      error: patch failed: tests/models/test_deepseek_v4_1_attention.py:1624
+      error: tests/models/test_deepseek_v4_1_attention.py: patch does not apply
+      Checking patch vllm/models/deepseek_v4_1/attention.py...
+      Hunk #1 succeeded at 774 (offset 2 lines).
+      Hunk #2 succeeded at 873 (offset 2 lines).
+      Hunk #3 succeeded at 1261 (offset 194 lines).
+      Hunk #4 succeeded at 1382 (offset 194 lines).
+      Hunk #5 succeeded at 1447 (offset 194 lines).
+      Hunk #6 succeeded at 1615 (offset 219 lines).
+      Checking patch vllm/models/deepseek_v4_1/sp_prefill.py...
+      Checking patch vllm/models/deepseek_v4_1/tilelang/cache_writer.py...
+      Checking patch vllm/models/deepseek_v4_1/tilelang/front.py...
+head 668bc8056e15aafc6a3b3de37e7aff32c66cd339 tree 2e343ae0c2ce9ad74a17bead938092541ddbd70e patches_after_base 16
+git diff --check 19f2c20ed4d6..HEAD: clean
+
+## 4. Requested order with 0776 and 0778 rebased: the candidate-50 series as committed
+
+base-1107 patch_head 2756478b60b90700b9918b457aeb38657da637b5 tree ed1bdb7a7684da33d403a055521ac0c4dd7ca670
+OK    0762-perf-dsv41-evict-first-l2-policy-on-routed-moe-tma-weights.patch sha256=9c87a2cde0c3725abf2eeaeb75d7c3da588781ebd64fbf1e2ef87145063087c2  commit=eb8367abcb1f64b8aea176d2bd516b7c24c88d3e tree=e10b5f644a8fc58f38d26a8bf71109fdd184204d files=2
+OK    0763-perf-dsv41-certified-two-pass-lm-head-vocab-screen.patch sha256=9dd029645123a6d781b8b266a7f5631e07fce46420da30f185a50f57dc15975f  commit=2ab2b10322a3cec35a6459315e42604c9fd5e26c tree=c4c1334009ded56386e91bfad538d4d2c816f78f files=4
+OK    0764-perf-worker-eliminate-decode-step-h2d-and-aten-overhead.patch sha256=3cc90fd7cbd7e4bbc6d70195c4f520b9f2779181b7d7b694c873ced472652155  commit=2c74b76baf9efb6a8940be0b479912af5f5110a0 tree=66b55adf073bcda7b59ce71d72acc8dc17e9bcd7 files=7
+OK    0765-perf-dsv41-overlap-decode-kv-index-writes-with-query.patch sha256=b93f0b8231ce4c0c34058094747f0338958e0a41a3c657e2dd2128b7460870ec  commit=7378235432185029eae5f41844dbf397aee9f0fb tree=b966a5aabd6486dc66de230609d3bcdd957e2ec5 files=6
+OK    0766-perf-dsv41-align-qb-and-indexer-qb-tile-contiguous-decode.patch sha256=a2e890cb07352a5321b8976becd2bcd0e7623dd4d04860792c52dbfdd109da53  commit=693f5a34f8e8d289b914c8e4907fa8987e216b4a tree=1bb01637f364abf92eca37c67e977254ee55b55e files=2
+OK    0767-perf-dsv41-sparse-mla-stage1-kv-gather-and-barrier-opt.patch sha256=a94953a2256e034b253062b2939fb722edda5e0f04c468cc58777d4593a5805d  commit=2d6d365cac0026e3fa1e29fe2cbd750fa18cab67 tree=144aa07d60a2f3c6a2c9b08675cb07fde1ca1fdc files=2
+OK    0768-deepseek-v41-dsml-token-provenance.patch sha256=4faecf86602d5af78f0fb7b6ce8231079e1045ec07d2ef4499c4039cd4e48165  commit=224fd77f8ee17d368c106142f36275b5f4e01a7c tree=1384a958839bc302725667dddec60da99391bfde files=13
+OK    0769-perf-spec-decode-elide-tp-confidence-broadcast-and-lock-sampling-seeds.patch sha256=8909cac3a7164a33fc31a3094b6c13e8f81e491884a1772b7dccf8d7978cb46f  commit=d928d3bc9ee4403e0664c55bdbba9c297c76dac4 tree=e5b6c992daf014b52abde2e56b79710133dba759 files=7
+      git apply: Hunk #1 succeeded at 406 (offset 18 lines).
+      git apply: Hunk #2 succeeded at 493 (offset 18 lines).
+      git apply: Hunk #3 succeeded at 589 (offset 33 lines).
+      git apply: Hunk #4 succeeded at 653 (offset 33 lines).
+      git apply: Hunk #5 succeeded at 672 (offset 33 lines).
+OK    0770-fix-structured-output-enforce-completions-grammar-un.patch sha256=62f0c10104df81e76870339de74f391956f21c70869acfc4db1c755a0aef4475  commit=f4cf51df5c31f349ca847fd9688017000e52d283 tree=4ed2b51913d2f224a52bcee0717262d17b768a54 files=3
+OK    0771-feat-serve-sse-keepalive-heartbeat-and-abort-cleanup.patch sha256=6376f864f55999f720f5352c1d38ecb5fb9ef01b1efdcaa0e6826f203ec041b7  commit=55a961f43fc5ef65bcd535ee932e4f7830112839 tree=aa8d84b1f3c8822bdd728d7b521b2bc90230b845 files=8
+OK    0772-fix-entrypoints-move-model-inspection-RPC-out-of-LLM.patch sha256=b6d59741bef111b035759235ab8044e2c3b64ae95a870ca500a9323b3b325b4d  commit=9a412d911d11d953d0167e30de2c92cc2a6842bc tree=4f8be4f71018ba914d3b9cedf533b8ffafdf9dab files=3
+OK    0773-fix-attention-keep-FA-sliding-window-active-under-ba.patch sha256=bde52b4ac23f14410ac142b2bb7e6b132b0728c3ab4b68b4dc73726e2fa3459c  commit=4e7f40f19704c7aa8739575145002f8a89a079dd tree=0b4acc88eb9993a79886c3dc5eacb0503fdb484c files=2
+OK    0774-perf-dsv41-fast-path-multi-turn-chat-rendering-and-s.patch sha256=5ab215e451714e0d821f9c6656da53372cb941f54669d448100bfce78a4f08f2  commit=65309d02a3d6926565ea7e04aed54a831ea6e5a4 tree=e4481e62237a0b5a6ab82e1d639cf6a28f5514c3 files=4
+OK    0775-perf-dsv41-widen-long-context-indexer-top-k-segments.patch sha256=82dd996ae49515ccc478e4b1de21200d7bf7b3e151689f8d01f5742b57db8240  commit=7ded0c6ca0d131fe5f68dfb6340531a1ae25b8a2 tree=e801ccc78a4ff3ec67c46d32b74ca33d0718b2cb files=2
+OK    0776-perf-dsv41-vectorize-indexer-KPool-loads-and-co-sche.patch sha256=fa8d0000e8cd1df8d5524190e9821e40321bf53895ebef26e8d9295dee75def6  commit=d6afe84ac5f2744b274a435e1c08cbd030d54894 tree=d841fab2460a6ff556abeeeb737c18450aced72d files=2
+OK    0777-perf-dsv41-hw-e2m1x2-indexer-and-gemm-mxfp4-quantize.patch sha256=20bbb06587981c992e805a3aa56b4a15f2e208f1fc9a0ea4d9d1849ab3fd992f  commit=668bc8056e15aafc6a3b3de37e7aff32c66cd339 tree=2e343ae0c2ce9ad74a17bead938092541ddbd70e files=4
+      git apply: Hunk #2 succeeded at 964 (offset 2 lines).
+OK    0778-perf-dsv41-sp-prefill-local-attention-front.patch sha256=7f3fc988bc05b12b1a3193e580e991e7b01f8eff8608594a94b71cc0e7324ebc  commit=0a231de286fe622ee5699e421b40179d6b6c2389 tree=d0bc2a20abff072b1ec8037b01016a3f8b1617f6 files=6
+      git apply: Hunk #1 succeeded at 774 (offset 2 lines).
+      git apply: Hunk #2 succeeded at 873 (offset 2 lines).
+      git apply: Hunk #3 succeeded at 1261 (offset 194 lines).
+      git apply: Hunk #4 succeeded at 1382 (offset 194 lines).
+      git apply: Hunk #5 succeeded at 1447 (offset 194 lines).
+      git apply: Hunk #6 succeeded at 1615 (offset 219 lines).
+OK    0779-perf-dsv41-pipeline-the-sliced-SP-Engram-row-exchang.patch sha256=bc4c5e7a196eb6312e07044d80648575f3f8ea80d077030ebea99892b45152f0  commit=c2de628d08c3a23b7fa4aab92b23abfb139f6a15 tree=4433691d0db245c8d5c768057daec68c3c3b1360 files=3
+OK    0780-perf-dsv41-cache-SP-local-routing-masks-and-skip-SP-.patch sha256=389b737f694f0e4ef13308d68a8f555c5e935f89dcbce1f6c294d3a40d02b775  commit=ba7400d9b6715ea1be6fa98b1d9ccedf5fcb65f9 tree=d5778ab56647a20d94710ecb94cfd9a4de27bee9 files=2
+head ba7400d9b6715ea1be6fa98b1d9ccedf5fcb65f9 tree d5778ab56647a20d94710ecb94cfd9a4de27bee9 patches_after_base 19
+git diff --check 19f2c20ed4d6..HEAD: clean
+
+## 5. bin/spark --cluster-config experiments/2026-10-26-spark-ds41f-candidate/candidate-50/image-dgx4.json build prepare --only vllm --lock
+
+vllm: prepared ba7400d9b671 (tree d5778ab56647) in .work/build/vllm-19f2c20ed4d6-b12x-236ddff04a5f-561f2a07
+patch_count 660, patch_head ba7400d9b6715ea1be6fa98b1d9ccedf5fcb65f9, expected_tree d5778ab56647a20d94710ecb94cfd9a4de27bee9,
+patchset_sha256 38d230e9b5a6447db36da90934cf8154380092f4b52e4c64a4683f61b9ced586: the same head and tree as section 4.
+
+## Scripts as run
+
+### apply_stack.sh
+#!/usr/bin/env bash
+# Apply candidate-50 patches 0762.. on top of a tree at 1107 patch head; log each result.
+set -u
+REPO=$1; SERIES_DIR=$2; LOG=$3
+cd "$REPO"
+{
+echo "# candidate-50 stack: 1107 series (0001..0761, 641 active) then candidate-50 0762.. in series order"
+echo "# repo: vLLM 19f2c20ed4d64ae22bd009ceacadd85e2a81e354 + 1107 series via git am --committer-date-is-author-date (committer Christopher Owen <3221756+christopherowen@users.noreply.github.com>)"
+echo "# host: $(hostname)  date: $(date -u +%Y-%m-%dT%H:%M:%SZ)  git: $(git --version)"
+echo "base-1107 patch_head $(git rev-parse base-1107) tree $(git rev-parse base-1107^{tree})"
+} > "$LOG"
+grep -v "^#" "$SERIES_DIR/series" | grep -v "^\s*$" | grep -E "^07[6-9][0-9]-|^0[8-9][0-9][0-9]-" | grep -v "^0761" | while read p; do
+  f="$SERIES_DIR/$p"
+  sha=$(sha256sum "$f" | cut -c1-64)
+  out=$(git apply --check --verbose "$f" 2>&1); rc=$?
+  echo "$p" | grep -q "^076[2-9]\|^07[7-9]" || continue
+  if [ $rc -ne 0 ]; then
+    echo "FAIL  $p sha256=$sha  git apply --check rc=$rc" >> "$LOG"; echo "$out" | sed "s/^/      /" >> "$LOG"; exit 1
+  fi
+  am=$(git -c user.name="Christopher Owen" -c user.email=3221756+christopherowen@users.noreply.github.com am --quiet --committer-date-is-author-date "$f" 2>&1); rc=$?
+  if [ $rc -ne 0 ]; then
+    echo "FAIL  $p sha256=$sha  git am rc=$rc" >> "$LOG"; echo "$am" | sed "s/^/      /" >> "$LOG"; git am --abort; exit 1
+  fi
+  files=$(git diff --name-only HEAD~1 HEAD | wc -l)
+  echo "OK    $p sha256=$sha  commit=$(git rev-parse HEAD) tree=$(git rev-parse HEAD^{tree}) files=$files" >> "$LOG"
+  echo "$out" | grep -E "offset|fuzz" | sed "s/^/      git apply: /" >> "$LOG"
+  [ -n "$am" ] && echo "$am" | sed "s/^/      git am: /" >> "$LOG"
+  true
+done
+echo "head $(git rev-parse HEAD) tree $(git rev-parse HEAD^{tree}) patches_after_base $(git rev-list --count base-1107..HEAD)" >> "$LOG"
+git diff --check 19f2c20ed4d64ae22bd009ceacadd85e2a81e354 HEAD >/dev/null && echo "git diff --check 19f2c20ed4d6..HEAD: clean" >> "$LOG" || echo "git diff --check 19f2c20ed4d6..HEAD: PROBLEMS" >> "$LOG"
+exit 0
+
+### try_orders.sh
+#!/usr/bin/env bash
+# Try candidate block orders on base-1107 with git apply; report first failure per order.
+P=${P:-$HOME/spark-lab/agents/candidate-50/spark-ds41f/experiments/2026-10-26-spark-ds41f-candidate/candidate-50/vllm}
+WT=$HOME/spark-lab/agents/candidate-50/stack/wt
+cd $HOME/spark-lab/agents/candidate-50/stack/vllm
+git worktree remove --force $WT 2>/dev/null; git worktree add -q --detach $WT base-1107
+c47="0762 0763 0764 0765 0766 0767"; c48="0768 0769 0770 0771 0772 0773 0774"; c49="0775 0776 0777 0778 0779 0780"
+for order in "47 48 49" "47 49 48" "48 47 49" "48 49 47" "49 47 48" "49 48 47"; do
+  cd $WT; git checkout -q --detach base-1107; git reset -q --hard; git clean -qfd
+  seq=""; for c in $order; do v=c$c; seq="$seq ${!v}"; done
+  res="ALL-OK"
+  for n in $seq; do f=$(ls $P/$n-*.patch); if ! git apply --index "$f" 2>/tmp/c50err.$$; then res="FAIL at $n ($(grep -m1 "patch failed" /tmp/c50err.$$))"; break; fi; done
+  echo "order $order: $res"
+done
+cd $HOME/spark-lab/agents/candidate-50/stack/vllm; git worktree remove --force $WT; rm -f /tmp/c50err.$$
+
+### try_seq.sh
+#!/usr/bin/env bash
+# try_seq.sh "<n1 n2 ...>": apply the given numbered patches in order on base-1107 with git apply.
+P=${P:-$HOME/spark-lab/agents/candidate-50/spark-ds41f/experiments/2026-10-26-spark-ds41f-candidate/candidate-50/vllm}
+WT=$HOME/spark-lab/agents/candidate-50/stack/wt
+cd $HOME/spark-lab/agents/candidate-50/stack/vllm
+git worktree remove --force $WT 2>/dev/null; git worktree add -q --detach $WT base-1107
+for seq in "$@"; do
+  cd $WT; git reset -q --hard base-1107; git clean -qfd
+  res="ALL-OK"
+  for n in $seq; do f=$(ls $P/$n-*.patch); if ! git apply --index "$f" 2>$WT.err; then res="FAIL at $n: $(grep "patch failed\|does not apply" $WT.err | tr "\n" " ")"; break; fi; done
+  echo "[$seq] -> $res"
+done
+cd $HOME/spark-lab/agents/candidate-50/stack/vllm; git worktree remove --force $WT; rm -f $WT.err

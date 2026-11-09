@@ -1,0 +1,39 @@
+{
+ "candidate": 50,
+ "rule": "A patch that does not apply after every other order keeping each candidate's internal order is rebased with a minimal, context-only change: only the conflicting file's index line, hunk header and context lines change; every added and removed line is byte-identical to the original (checked: the +/- lines of both versions hash the same).",
+ "orders_tried": "receipts/stack.log, section 2: all six candidate-block orders, and #964 moved after #993 and after all of candidate-49; #964/#993 and #1012/#1009 conflict whichever comes first.",
+ "rebases": [
+  {
+   "patch": "0776-perf-dsv41-vectorize-indexer-KPool-loads-and-co-sche.patch",
+   "pr": 993,
+   "source": "experiments/2026-10-26-spark-ds41f-candidate/candidate-49/vllm/0763-perf-dsv41-vectorize-indexer-KPool-loads-and-co-sche.patch",
+   "original_sha256": "3140e70d2f340cb2a8086934125bb134441e477140178a17f0fa2ef75efe8d62",
+   "rebased_sha256": "fa8d0000e8cd1df8d5524190e9821e40321bf53895ebef26e8d9295dee75def6",
+   "conflicts_with": {
+    "patch": "0767-perf-dsv41-sparse-mla-stage1-kv-gather-and-barrier-opt.patch",
+    "pr": 964
+   },
+   "file": "tests/kernels/attention/test_deepseek_v41_tilelang.py",
+   "kind": "textual, test file only: #964 and #993 each append one new test after the file's last line (1107's test_sparse_mla_plan_routes_right_sizes_head_block_and_decode_waves); the union keeps both tests, #964's first",
+   "change": "the test hunk's context is now the last three lines of #964's appended test (hunk @@ -1355,3 +1355,18 @@, index c0c0eba92..53cd29825, the file's blobs before and after this patch in the stack); the 15 added lines and the indexer.py hunks are unchanged",
+   "diff": "receipts/rebases/0776-perf-dsv41-vectorize-indexer-KPool-loads-and-co-sche.patch.diff"
+  },
+  {
+   "patch": "0778-perf-dsv41-sp-prefill-local-attention-front.patch",
+   "pr": 1009,
+   "source": "experiments/2026-10-26-spark-ds41f-candidate/candidate-49/vllm/0765-perf-dsv41-sp-prefill-local-attention-front.patch",
+   "original_sha256": "40ce0360e4a4a6e2219a541072cb65229bb7758838bc14438a31c385dd704eb8",
+   "rebased_sha256": "7f3fc988bc05b12b1a3193e580e991e7b01f8eff8608594a94b71cc0e7324ebc",
+   "conflicts_with": {
+    "patch": "0765-perf-dsv41-overlap-decode-kv-index-writes-with-query.patch",
+    "pr": 1012,
+    "round": 1
+   },
+   "file": "tests/models/test_deepseek_v4_1_attention.py",
+   "kind": "textual, test file only: #1012 round 1 and #1009 each append one new test after the file's last line (1107's test_sp_wo_local_exchange_matches_native_tilelang_kernels_on_sm12x); the union keeps both tests, #1012's first",
+   "change": "the test hunk's context is now the last three lines of #1012's appended test (hunk @@ -1900,3 +1900,191 @@, index 1e4258e06..5147110c4, the file's blobs before and after this patch in the stack); the 188 added lines and the other files' hunks are unchanged",
+   "diff": "receipts/rebases/0778-perf-dsv41-sp-prefill-local-attention-front.patch.diff"
+  }
+ ],
+ "semantic_review": "No semantic conflict found where two candidates' patches touch one non-test file: vllm/models/deepseek_v4_1/attention.py (#1012 round 1's decode two-stream overlap runs only when sp_rows is None and the step is decode; #1009 changes only the sequence-parallel prefill front, and its index_weights slice equals [first:last] on the overlap path), vllm/models/deepseek_v4_1/tilelang/gemm.py (#1016 round 1 changes DECODE_FP8_CONFIGS for 64-row Q-B tiles; #991 round 1 changes the MXFP4 epilogue of mxfp8_gemm_rope_mxfp4_decode, which does not read DECODE_FP8_CONFIGS), and vllm/v1/worker/gpu/{model_runner.py, spec_decode/acceptance_estimator.py, spec_decode/speculator.py} (#965 round 1 changes add_requests, prepare_inputs, observe_verification and the IRLS accumulate step; #980 round 1 adds the sampler seed, tp_invariant, the predict scratch buffers and predict_from_stats). Each pair edits different functions. The integrated stack has not been built or tested."
+}

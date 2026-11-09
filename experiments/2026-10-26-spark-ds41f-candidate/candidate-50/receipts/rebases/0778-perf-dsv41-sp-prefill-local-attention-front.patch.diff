@@ -1,0 +1,21 @@
+--- a/0778-perf-dsv41-sp-prefill-local-attention-front.patch (original)
++++ b/0778-perf-dsv41-sp-prefill-local-attention-front.patch (rebased)
+@@ -159,13 +159,13 @@
+ +            page_size=PAGE_SIZE,
+ +        )
+ diff --git a/tests/models/test_deepseek_v4_1_attention.py b/tests/models/test_deepseek_v4_1_attention.py
+-index e25f715cb..0d3956e36 100644
++index 1e4258e06..5147110c4 100644
+ --- a/tests/models/test_deepseek_v4_1_attention.py
+ +++ b/tests/models/test_deepseek_v4_1_attention.py
+-@@ -1624,3 +1624,191 @@ def test_sp_wo_local_exchange_matches_native_tilelang_kernels_on_sm12x(monkeypat
+-             actual_sum = collectives.RankOrderParts(parts).sum()
+-             expected_sum = collectives.RankOrderParts(expected).sum()
+-             assert torch.equal(actual_sum.view(torch.int16), expected_sum.view(torch.int16))
++@@ -1900,3 +1900,191 @@ def test_decode_two_stream_overlap_schedules_disjoint_workspaces(monkeypatch):
++     assert ("indexer.wq_b", "main") in names_reidx
++     assert ("index_chunk", "main") in names_reidx
++     assert ("attend", "main") in names_reidx
+ +
+ +
+ +@pytest.mark.parametrize("n_real", [4, 2, 0])

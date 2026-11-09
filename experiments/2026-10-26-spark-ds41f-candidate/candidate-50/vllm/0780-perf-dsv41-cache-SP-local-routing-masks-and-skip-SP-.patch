@@ -1,0 +1,462 @@
+From 251f7af47ae6185a6af0866aab9ad1034fedf4f6 Mon Sep 17 00:00:00 2001
+From: Christopher Owen <christopherowen@users.noreply.github.com>
+Date: Sun, 8 Nov 2026 18:50:51 +0000
+Subject: [PATCH] perf(dsv41): cache SP local routing masks and skip SP tail
+ pad rows in partials router
+
+Base: 1107 vLLM patch head 320021e3c4dbb202d911ab70e2cd924c75420488. It applies unchanged on candidate-49's 0762..0766, which touch neither file.
+
+Rationale:
+During sequence-parallel prefill on the 20 encoder layers (0..19), mhc.post_pre casts each rank's L = ceil(T / TP) shard to MXFP8 while sp_moe_inputs calls router.route_local(x, sp_rows, input_ids=input_ids) before sp_rows.gather_mxfp8(x_q, weights, ids):
+1. While _routing_masks cached the full T-row image and routed masks on ForwardContext, _local_mask(mask, rows, sp_rows) called sp_rows.local_slice(mask[:sp_rows.num_tokens]) uncached on every encoder layer. Whenever T % TP != 0 (every power-of-2 chunk size T = 256..16384 on TP=3, and any non-multiple of TP on TP=4), the tail rank (rank = TP - 1, where real_rows < local_rows) allocated a new boolean tensor and copied [:real_rows] twice per layer (4 GPU kernel launches per layer, 80 across the 20 encoder layers), adding 8.7-20.5 us/layer (+3% to +44% local router latency) on the tail rank immediately before the synchronous gather_mxfp8 collective.
+2. In _partials_mask (used by TileLangGateRouter when local_rows <= 256, i.e., 205 <= T <= 768 on TP=3 and 205 <= T <= 1024 on TP=4), _local_mask(is_padding, rows, sp_rows) zero-padded [real_rows:local_rows] with False (active / route) instead of True (padding / skip), causing route_partials to route unused SP tail pad rows as active tokens (and fail T.device_assert(finite) if tail pad rows contained NaN/Inf) instead of skipping them with topk_idx = -1, topk_weights = 0.0 as TileKernelsRouter does when local_rows > 256.
+
+Keep the tail rank's _local_mask slices on the forward's ForwardContext, keyed by the mask tensor (held by the entry, so its id cannot be reused while the entry lives) and (num_tokens, world_size, rank, rows, pad), and pass pad=True in _partials_mask so SP tail pad rows [real_rows:local_rows] are padded with True (skipped).
+
+A rank without pad rows keeps nothing. Its slice is a view of the mask, which _local_mask now makes directly, mask[start:start + local_rows] (the very view sp_rows.local_slice(mask[:num_tokens]) returns), with one slice instead of two and without building a key or touching the context. On sp8 the host cost of one routing layer's local masks on such a rank is 2.8-3.1 us under inference mode and 3.6-3.9 us under no_grad, against 4.9-5.3 us and 6.4-6.8 us in 1107; on the tail rank it is 2.2-2.3 us under either, against 21.1-21.3 us and 23.9-24.5 us. The GPU work of a rank without pad rows is 1107's.
+
+The key reads no version counter. The vLLM worker runs every forward, its startup memory profile included, under torch.inference_mode, where the step's masks are inference tensors that track none: the first revision validated entries with mask._version, which raised "Inference tensors do not track version counter" in _local_mask on every SP route_local call and stopped the engine from booting (candidate-49, tp3-switched, profile_run). A rank without pad rows cannot see a stale mask: it keeps nothing, and makes its view from the mask it is handed on every call, as 1107 does. A slice the tail rank keeps cannot be stale either: a forward's padding mask and ids are filled before it runs and do not change while it runs (the routed and image masks 1107 already keeps on ForwardContext, keyed by tensor identity alone, rely on the same), the routed and image masks are new tensors each forward that nothing writes after their kernel, and the runner creates a new ForwardContext for every forward, so a slice never outlives its forward, even though the runner's persistent buffers keep their storage across steps. Outside a forward nothing is cached: the first revision fell back to caching on sp_rows, but SPRows is a frozen dataclass (assigning raised FrozenInstanceError) and a value shared by equal layouts, not a step.
+
+Quality:
+Bit-identical (torch.equal) on all real rows [0:real_rows] across all ranks and chunk sizes, under torch.inference_mode as under no_grad; skips unused SP tail pad rows [real_rows:local_rows] with topk_idx = -1 and topk_weights = 0.0 in route_partials (matching TileKernelsRouter).
+
+Tests:
+- New: test_gate_router_route_local_under_inference_mode (TP3 T=205, 800, 1024 and TP4 T=1024, every rank, 3 layers a forward, bit-equal to the no_grad route; only the tail rank keeps masks, where the previous revision asserted that every rank keeps them), test_gate_router_route_local_masks_last_one_forward (persistent padding and id buffers refilled in place across three forwards, each routed with its own masks), test_gate_router_route_local_outside_a_forward (no ForwardContext). All six fail on the first revision (5 RuntimeError, 1 FrozenInstanceError) and pass on this one.
+- New: test_local_mask_keeps_only_the_tail_ranks_slices (TP3 T=205, 800, 1024 and TP4 T=1024, every rank, masks of T and T + 5 rows, pad and no pad, under inference mode): a rank without pad rows gets local_slice's own view (same base, data pointer and strides) and keeps nothing; the tail rank's slice is a new tensor, its pad rows set with pad, kept and handed back; a mask shorter than T is refused as local_slice refuses it.
+- pytest --noconftest tests/models/test_deepseek_v4_1_sp_prefill.py tests/kernels/moe/test_deepseek_v41_tilelang_router.py (279 passed on each of 2 fresh container boots).
+
+Upstream status: local SP prefill router optimization and tail-padding fix for DeepSeek V4.1 TileLang router.
+---
+ .../moe/test_deepseek_v41_tilelang_router.py  | 298 +++++++++++++++++-
+ vllm/models/deepseek_v4_1/tilelang/router.py  |  62 +++-
+ 2 files changed, 349 insertions(+), 11 deletions(-)
+
+diff --git a/tests/kernels/moe/test_deepseek_v41_tilelang_router.py b/tests/kernels/moe/test_deepseek_v41_tilelang_router.py
+index 5f56368..5235f46 100644
+--- a/tests/kernels/moe/test_deepseek_v41_tilelang_router.py
++++ b/tests/kernels/moe/test_deepseek_v41_tilelang_router.py
+@@ -499,14 +499,15 @@ def test_provide_routes_scopes_handed_over_routes():
+     assert tilelang_router.provided_routes(rows) is None
+ 
+ 
+-@pytest.mark.parametrize("num_tokens", [150, 205])
++@pytest.mark.parametrize("num_tokens", [150, 205, 800])
+ @pytest.mark.parametrize("vision", [False, True])
+ def test_gate_router_route_local_matches_full_rows(
+     plain_scratch, padded_step, num_tokens, vision
+ ):
+     """Sequence-parallel local routing across ranks matches full-batch routing
+-    bit-for-bit across both the split-K partials path (local_rows <= 64) and the
+-    full-gate path (local_rows > 64), including vision tokens and padding masks."""
++    bit-for-bit across both the split-K partials path (local_rows <= 256) and the
++    full-gate path (local_rows > 256), including vision tokens, padding masks,
++    and skipped SP tail pad rows."""
+     from vllm.models.deepseek_v4_1 import sp_prefill
+ 
+     world_size = 3
+@@ -549,11 +550,16 @@ def test_gate_router_route_local_matches_full_rows(
+     rank_ids = []
+     for rank in range(world_size):
+         layout = sp_prefill.SPRows(num_tokens, world_size, rank)
+-        local_x = layout.local_slice(x)
++        local_x = layout.local_slice(x).clone()
++        if layout.real_rows < layout.local_rows:
++            local_x[layout.real_rows :] = float("nan")
+         w, idx = router.route_local(local_x, layout, input_ids=input_ids)
+         assert w.shape == (layout.local_rows, 6)
+         assert idx.shape == (layout.local_rows, 6)
+         assert torch.isfinite(w).all()
++        if layout.real_rows < layout.local_rows:
++            assert (idx[layout.real_rows :] == -1).all()
++            assert (w[layout.real_rows :] == 0).all()
+         rank_weights.append(w)
+         rank_ids.append(idx)
+ 
+@@ -572,3 +578,287 @@ def test_gate_router_route_local_matches_full_rows(
+             None, handle, None, input_ids=input_ids
+         )
+     assert handed_w is gathered_weights and handed_ids is gathered_ids
++
++
++@pytest.mark.parametrize("num_tokens", [205, 800])
++def test_gate_router_route_local_caches_tail_rank_masks(
++    plain_scratch, padded_step, monkeypatch, num_tokens
++):
++    """Repeated SP local routing across encoder layers reuses the tail rank's
++    padded local masks instead of re-allocating and copying them per layer."""
++    from vllm.models.deepseek_v4_1 import sp_prefill
++
++    world_size = 3
++    padded_step(num_tokens, 4)
++    gate = _Gate(384, seed=num_tokens)
++    generator = torch.Generator(device="cuda").manual_seed(num_tokens + 7)
++    x = torch.randn(num_tokens, 5120, device="cuda", generator=generator).to(
++        torch.bfloat16
++    )
++    bias = torch.randn(384, device="cuda", generator=generator) * 0.1
++    bias_vl = torch.nn.Parameter(
++        torch.randn(384, device="cuda", generator=generator) * 0.1,
++        requires_grad=False,
++    )
++    input_ids = torch.randint(
++        0, 1000, (num_tokens,), device="cuda", generator=generator
++    )
++    input_ids[1::4] = LO
++    router = tilelang_router.TileLangGateRouter(
++        gate=gate,
++        top_k=6,
++        global_num_experts=384,
++        e_score_correction_bias=bias,
++        renormalize=True,
++        routed_scaling_factor=SCALE,
++        scoring_func="sqrtsoftplus",
++        bias_vl=bias_vl,
++        image_sentinel_lo=LO,
++        image_sentinel_count=1,
++    )
++    router.declare_kernels()
++
++    layout = sp_prefill.SPRows(num_tokens, world_size, world_size - 1)
++    assert layout.real_rows < layout.local_rows
++    local_x = layout.local_slice(x)
++
++    orig_local_slice = sp_prefill.SPRows.local_slice
++    slice_calls = []
++
++    def counted_local_slice(self, tensor):
++        slice_calls.append(tensor.shape)
++        return orig_local_slice(self, tensor)
++
++    monkeypatch.setattr(sp_prefill.SPRows, "local_slice", counted_local_slice)
++    w1, ids1 = router.route_local(local_x, layout, input_ids=input_ids)
++    first_calls = len(slice_calls)
++    assert first_calls >= 1
++    w2, ids2 = router.route_local(local_x, layout, input_ids=input_ids)
++    assert len(slice_calls) == first_calls
++    assert torch.equal(ids1, ids2)
++    assert torch.equal(w1.view(torch.int32), w2.view(torch.int32))
++
++
++def _sp_gate_router(seed):
++    """A vision layer's gate router, as the SP local routing tests build it."""
++    gate = _Gate(384, seed=seed)
++    generator = torch.Generator(device="cuda").manual_seed(seed + 7)
++    bias = torch.randn(384, device="cuda", generator=generator) * 0.1
++    bias_vl = torch.nn.Parameter(
++        torch.randn(384, device="cuda", generator=generator) * 0.1,
++        requires_grad=False,
++    )
++    router = tilelang_router.TileLangGateRouter(
++        gate=gate,
++        top_k=6,
++        global_num_experts=384,
++        e_score_correction_bias=bias,
++        renormalize=True,
++        routed_scaling_factor=SCALE,
++        scoring_func="sqrtsoftplus",
++        bias_vl=bias_vl,
++        image_sentinel_lo=LO,
++        image_sentinel_count=1,
++    )
++    router.declare_kernels()
++    return router, generator
++
++
++def _new_forward(monkeypatch):
++    """A forward of its own: the runner makes a new ForwardContext every step."""
++    context = type("Context", (), {})()
++    context.attn_metadata = None  # ForwardContext always has it; no CED plan here
++    monkeypatch.setattr(tilelang_router, "is_forward_context_available", lambda: True)
++    monkeypatch.setattr(tilelang_router, "get_forward_context", lambda: context)
++    return context
++
++
++@pytest.mark.parametrize(
++    "world_size,num_tokens", [(3, 205), (3, 800), (3, 1024), (4, 1024)]
++)
++def test_gate_router_route_local_under_inference_mode(
++    plain_scratch, monkeypatch, world_size, num_tokens
++):
++    """The worker runs every forward, its startup memory profile included, under
++    torch.inference_mode, where the step's padding mask and ids, and the masks
++    routing computes from them, are inference tensors: they track no version
++    counter. SP local routing runs there on every rank, on the partials path
++    (local_rows <= 256) and the full-gate path: the tail rank keeps its padded
++    local masks, a rank without pad rows takes views and keeps none, and each
++    routes the bits it routes outside inference mode."""
++    from vllm.models.deepseek_v4_1 import sp_prefill
++
++    router, generator = _sp_gate_router(num_tokens)
++    x = torch.randn(num_tokens, 5120, device="cuda", generator=generator).to(
++        torch.bfloat16
++    )
++    input_ids = torch.randint(
++        0, 1000, (num_tokens,), device="cuda", generator=generator
++    )
++    input_ids[1::4] = LO
++
++    def forward(layout, layers):
++        context = _new_forward(monkeypatch)
++        context.is_padding = torch.zeros(num_tokens, dtype=torch.bool, device="cuda")
++        context.is_padding[num_tokens - 4 :] = True
++        ids = input_ids.clone()
++        local_x = layout.local_slice(x)
++        routes = [
++            router.route_local(local_x, layout, input_ids=ids) for _ in range(layers)
++        ]
++        return context, routes
++
++    for rank in range(world_size):
++        layout = sp_prefill.SPRows(num_tokens, world_size, rank)
++        with torch.no_grad():
++            _, ((expected_weights, expected_ids),) = forward(layout, 1)
++        with torch.inference_mode():
++            context, routes = forward(layout, 3)
++        assert context.is_padding.is_inference()
++        tail = layout.real_rows < layout.local_rows
++        assert bool(getattr(context, "_ds41_local_masks", None)) == tail
++        for weights, ids in routes:
++            assert torch.equal(ids, expected_ids)
++            assert torch.equal(
++                weights.view(torch.int32), expected_weights.view(torch.int32)
++            )
++        if tail:
++            assert (routes[0][1][layout.real_rows :] == -1).all()
++
++
++@pytest.mark.parametrize("extra_rows", [0, 5])
++@pytest.mark.parametrize(
++    "world_size,num_tokens", [(3, 205), (3, 800), (3, 1024), (4, 1024)]
++)
++def test_local_mask_keeps_only_the_tail_ranks_slices(
++    monkeypatch, world_size, num_tokens, extra_rows
++):
++    """A rank without pad rows gets the very view ``local_slice`` returns, and its
++    forward keeps nothing for it. The tail rank's slice is a new tensor, its pad rows
++    set with ``pad``, which its forward keeps and hands back to later layers. A mask
++    longer than the step slices as its first T rows do; a shorter one is refused."""
++    from vllm.models.deepseek_v4_1 import sp_prefill
++
++    generator = torch.Generator(device="cuda").manual_seed(num_tokens)
++    mask = torch.rand(num_tokens + extra_rows, device="cuda", generator=generator)
++    mask = mask < 0.5
++    with torch.inference_mode():
++        for rank in range(world_size):
++            layout = sp_prefill.SPRows(num_tokens, world_size, rank)
++            rows, real = layout.local_rows, layout.real_rows
++            expected = layout.local_slice(mask[:num_tokens])
++            context = _new_forward(monkeypatch)
++            for pad in (False, True):
++                local = tilelang_router._local_mask(
++                    mask, rows, layout, context=context, pad=pad
++                )
++                again = tilelang_router._local_mask(
++                    mask, rows, layout, context=context, pad=pad
++                )
++                assert local.shape == (rows,)
++                assert torch.equal(local[:real], expected[:real])
++                if real == rows:
++                    assert local._base is mask
++                    assert local.data_ptr() == expected.data_ptr()
++                    assert local.stride() == expected.stride()
++                    assert torch.equal(again, local)
++                else:
++                    assert local._base is None
++                    assert again is local
++                    assert (local[real:] == pad).all()
++            kept = getattr(context, "_ds41_local_masks", None)
++            assert bool(kept) == (real < rows)
++            if real == rows:
++                with pytest.raises(ValueError, match="SP slice expects"):
++                    tilelang_router._local_mask(
++                        mask[: num_tokens - 1], rows, layout, context=context
++                    )
++
++
++def test_gate_router_route_local_masks_last_one_forward(plain_scratch, monkeypatch):
++    """The runner refills its padding and id buffers in place every step and hands
++    each forward new views of them in a new ForwardContext. A forward's SP local
++    masks are its own: never the previous forward's, though the buffers' storage,
++    the row count and the layout are the same."""
++    from vllm.models.deepseek_v4_1 import sp_prefill
++
++    num_tokens, world_size = 800, 3
++    layout = sp_prefill.SPRows(num_tokens, world_size, world_size - 1)
++    assert layout.real_rows < layout.local_rows
++    router, generator = _sp_gate_router(num_tokens)
++    x = torch.randn(num_tokens, 5120, device="cuda", generator=generator).to(
++        torch.bfloat16
++    )
++    local_x = layout.local_slice(x)
++    first_ids = torch.randint(
++        0, 1000, (num_tokens,), device="cuda", generator=generator
++    )
++    first_ids[1::4] = LO
++    second_ids = first_ids.clone()
++    second_ids[1::4] = 7
++    second_ids[2::4] = LO
++    steps = [(first_ids, 4), (second_ids, 40), (first_ids, 4)]
++    padding_buffer = torch.zeros(num_tokens, dtype=torch.bool, device="cuda")
++    ids_buffer = torch.zeros(num_tokens, dtype=torch.int64, device="cuda")
++    real = slice(layout.start, layout.start + layout.real_rows)
++
++    with torch.inference_mode():
++        for step_ids, padding in steps:
++            # The full-row reference, in a forward of its own.
++            context = _new_forward(monkeypatch)
++            context.is_padding = torch.zeros_like(padding_buffer)
++            context.is_padding[num_tokens - padding :] = True
++            expected_weights, expected_ids = router._compute_routing(
++                None, x, None, input_ids=step_ids.clone()
++            )
++            # The step: its buffers refilled in place, as the runner fills them.
++            padding_buffer.fill_(False)
++            padding_buffer[num_tokens - padding :] = True
++            ids_buffer.copy_(step_ids)
++            context = _new_forward(monkeypatch)
++            context.is_padding = padding_buffer[:num_tokens]
++            ids = ids_buffer[:num_tokens]
++            first_pad = num_tokens - padding - layout.start
++            for _ in range(2):
++                weights, topk_ids = router.route_local(local_x, layout, input_ids=ids)
++                assert torch.equal(topk_ids[: layout.real_rows], expected_ids[real])
++                assert torch.equal(
++                    weights[: layout.real_rows].view(torch.int32),
++                    expected_weights[real].view(torch.int32),
++                )
++                assert (topk_ids[first_pad:] == -1).all()
++                assert (topk_ids[:first_pad] >= 0).all()
++
++
++def test_gate_router_route_local_outside_a_forward(plain_scratch):
++    """Outside a forward (no ForwardContext) SP local routing keeps nothing: the
++    row layout is a frozen value, not a step, and it routes as the full rows do."""
++    from vllm.models.deepseek_v4_1 import sp_prefill
++
++    assert not tilelang_router.is_forward_context_available()
++    num_tokens, world_size = 800, 3
++    router, generator = _sp_gate_router(num_tokens)
++    x = torch.randn(num_tokens, 5120, device="cuda", generator=generator).to(
++        torch.bfloat16
++    )
++    input_ids = torch.randint(
++        0, 1000, (num_tokens,), device="cuda", generator=generator
++    )
++    input_ids[1::4] = LO
++    expected_weights, expected_ids = router._compute_routing(
++        None, x, None, input_ids=input_ids
++    )
++    for rank in range(world_size):
++        layout = sp_prefill.SPRows(num_tokens, world_size, rank)
++        real = slice(layout.start, layout.start + layout.real_rows)
++        with torch.inference_mode():
++            for _ in range(2):
++                weights, ids = router.route_local(
++                    layout.local_slice(x), layout, input_ids=input_ids
++                )
++                assert torch.equal(ids[: layout.real_rows], expected_ids[real])
++                assert torch.equal(
++                    weights[: layout.real_rows].view(torch.int32),
++                    expected_weights[real].view(torch.int32),
++                )
++        assert not hasattr(layout, "_ds41_local_masks")
+diff --git a/vllm/models/deepseek_v4_1/tilelang/router.py b/vllm/models/deepseek_v4_1/tilelang/router.py
+index 61ece0f..908606a 100644
+--- a/vllm/models/deepseek_v4_1/tilelang/router.py
++++ b/vllm/models/deepseek_v4_1/tilelang/router.py
+@@ -162,12 +162,60 @@ def _ced_routing_mask(context, rows: int, ced_decoder: bool) -> torch.Tensor | N
+     return None
+ 
+ 
+-def _local_mask(mask: torch.Tensor | None, rows: int, sp_rows) -> torch.Tensor | None:
+-    """``mask``'s first ``rows`` rows, or this rank's ``sp_rows.local_rows`` slice."""
++def _local_mask(
++    mask: torch.Tensor | None,
++    rows: int,
++    sp_rows,
++    *,
++    context=None,
++    pad: bool = False,
++) -> torch.Tensor | None:
++    """``mask``'s first ``rows`` rows, or this rank's ``sp_rows.local_rows`` slice,
++    whose pad rows are clear, or set with ``pad`` (a padding mask: they are skipped).
++
++    A rank without pad rows gets a view of ``mask``, the one ``sp_rows.local_slice``
++    returns, made with one slice instead of two, and nothing is kept for it. A rank
++    with pad rows (the last, when TP does not divide T) gets a new tensor. Its
++    forward's ForwardContext (``context``, or the current one) keeps it, so the
++    forward's later routing layers reuse it. The key is the mask tensor, which the
++    entry holds (its id is not reused while the entry lives), and the row layout. A
++    forward's masks do not change while it runs, which the routing and image masks
++    kept on the context already rely on, and the next forward has a new context, so
++    a kept slice is never another forward's. The key reads no version counter: the
++    worker's ``torch.inference_mode`` tensors have none. Outside a forward nothing
++    is kept."""
+     if mask is None:
+         return None
+     if sp_rows is not None and mask.shape[0] != rows:
+-        return sp_rows.local_slice(mask[: sp_rows.num_tokens])
++        num_tokens = sp_rows.num_tokens
++        local_rows = sp_rows.local_rows
++        start = sp_rows.rank * local_rows
++        if start + local_rows <= num_tokens <= mask.shape[0]:
++            # No pad rows: sp_rows.local_slice(mask[:num_tokens]), a view.
++            return mask[start : start + local_rows]
++        if context is None and is_forward_context_available():
++            context = get_forward_context()
++        cache = None
++        key = (id(mask), num_tokens, sp_rows.world_size, sp_rows.rank, rows, pad)
++        if context is not None:
++            cache = getattr(context, "_ds41_local_masks", None)
++            if cache is None:
++                cache = {}
++                context._ds41_local_masks = cache
++            entry = cache.get(key)
++            if entry is not None and entry[0] is mask:
++                return entry[1]
++        src = mask[:num_tokens]
++        real_rows = sp_rows.real_rows
++        if pad and real_rows < local_rows:
++            local = src.new_ones((local_rows, *src.shape[1:]))
++            if real_rows:
++                local[:real_rows].copy_(src[start : start + real_rows])
++        else:
++            local = sp_rows.local_slice(src)
++        if cache is not None:
++            cache[key] = (mask, local)
++        return local
+     return mask if mask.shape[0] == rows else mask[:rows]
+ 
+ 
+@@ -188,7 +236,7 @@ def _known_routing_mask(
+         return None, None
+     cached = getattr(context, "_ds41_routing_mask", None)
+     if cached is not None and cached[0] is is_padding:
+-        return _local_mask(cached[1], rows, sp_rows), None
++        return _local_mask(cached[1], rows, sp_rows, context=context), None
+     return None, is_padding
+ 
+ 
+@@ -228,8 +276,8 @@ def _routing_masks(
+         if is_padding is not None:
+             assert context is not None and routed is not None
+             context._ds41_routing_mask = (is_padding, routed)
+-            route = _local_mask(routed, rows, sp_rows)
+-    return _local_mask(image, rows, sp_rows), route
++            route = _local_mask(routed, rows, sp_rows, context=context)
++    return _local_mask(image, rows, sp_rows, context=context), route
+ 
+ 
+ def _partials_mask(
+@@ -247,7 +295,7 @@ def _partials_mask(
+     is_padding = context.is_padding
+     if is_padding is None:
+         return None, False
+-    return _local_mask(is_padding, rows, sp_rows), True
++    return _local_mask(is_padding, rows, sp_rows, context=context, pad=True), True
+ 
+ 
+ def _routing_mask_variants(vllm_config) -> tuple[bool, ...]:
+-- 
+2.43.0
+
