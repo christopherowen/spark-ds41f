@@ -116,6 +116,17 @@ Each testbed opens its window with `scripts/lab.py`, after the hold and idle gua
    - **The references are pending** until the coordinator commits them; until then the lab's dry run reports them missing.
 4. **Own marks** on sp8 (below), two boots each, ABBA against the base.
 
+## Release tests: #998 fails; measured without it
+
+The release tests passed on candidates 51 and 52 and failed on candidate-53 (dgx2, 2026-11-09), in two files, both #998's:
+- `tests/kernels/quantization/test_deepseek_v41_tilelang_vocab.py` crashes with a segmentation fault;
+- `tests/kernels/quantization/test_deepseek_v41_expert_scale_codes.py::test_process_weights_replaces_w13_before_preparing_w2` fails with `'_Plan' object has no attribute 'max_rows'` (`fused_moe/tilelang.py:224`, a line #998 adds).
+
+With candidate-50's copies of #998's three files mounted over the candidate-53 image, both files pass (104 passed). No other candidate-53 patch touches those files.
+
+- **Gate and screen** run on [tp3-switched-no998.json](tp3-switched-no998.json), from [no998/overlay](no998/overlay), so they measure #960, #971, #977 and #984.
+- **#998** is in rework round 1.
+
 ## Marks
 
 Declared before building or measuring ([methodology](../../../docs/methodology.md#round-purpose-report-and-drop-rule)).
