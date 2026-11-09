@@ -1,11 +1,12 @@
 # candidate-50
 
-Unpromoted release candidate for release qualification
-([release-benchmark](../../../docs/release-benchmark.md#9-release-qualification-final-benchmarking), step 9):
-spark-ds41f-1107 plus every PR that passed PR validation in candidates 47-49, each reworked PR as its
-corrected patch. 18 PRs, 19 patches. It is qualified on `tp4-ring` (dgx1..dgx4), `tp4-switched`
-(sp1..sp4), `tp3-switched` (sp5..sp7), `tp8-switched` (sp1..sp8) and `tp3-triangle` (dgx1..dgx3),
-the shapes 1107 recorded.
+The merged base of candidates 47-49: spark-ds41f-1107 plus every PR that passed PR validation in
+candidates 47-49, each reworked PR as its corrected patch. 18 PRs, 19 patches. It is not a release
+candidate. The owner (2026-11-09): "there are dozens more PRs to work through until release". So it
+is verified, not release-qualified, and the next round's candidates build on it.
+
+Verification: the determinism gate, the screen and the carried fixes' live checks, on the three
+testbeds (`tp4-ring` dgx1..dgx4, `tp4-switched` sp1..sp4, `tp3-switched` sp5..sp7).
 
 ## Source
 
@@ -61,7 +62,7 @@ The lanes patch's test files (`tests/v1/core/test_prefill_lane_livelock.py`,
 ([round 2](../candidate-48/receipts/rework/pr-1010-r2/result.json)).
 
 **Two carried reworks record a sub-agent miss that the coordinator's verdict overrules** (each folder's
-`analysis.md`), and the release qualification measures them in place:
+`analysis.md`), and the verification below measures them in place:
 - #991 round 1: GEMM M=6 and M=8 read slower in the eager-launch bench. By kernel time (CUPTI) and
   CUDA-graph replay, the path decode serving takes, every cell is faster beyond its interval
   ([step 7](../../../docs/release-benchmark.md#7-own-marks): judge on the path serving takes).
@@ -91,23 +92,23 @@ Patches of two candidates also share non-test files, and apply cleanly there:
 
 Each pair edits different functions, and no semantic conflict was found
 ([rebases.json](receipts/rebases/rebases.json), `semantic_review`). PR validation never measured
-these combinations; the release qualification is their first measurement.
+these combinations; this verification is their first measurement.
 
 ## Cluster configurations
 
-A cluster configuration for every shape the recipe serves, so the candidate can be run on any setup: `bin/spark --cluster-config experiments/2026-10-26-spark-ds41f-candidate/candidate-50/<file> …` with your site's node map. Each one extends `releases/spark-ds41f-1107/cluster.json` at its shape and sets only the image `spark-ds41f:candidate-50`, its tree labels and this lock; no PR changes the recipe. The `-dev` file adds the dev-mode collective RPC that the release suite's engine grid needs. This candidate is qualified at the five shapes marked; the other files are configurations, not part of its runs.
+A cluster configuration for every shape the recipe serves, so the candidate can be run on any setup: `bin/spark --cluster-config experiments/2026-10-26-spark-ds41f-candidate/candidate-50/<file> …` with your site's node map. Each one extends `releases/spark-ds41f-1107/cluster.json` at its shape and sets only the image `spark-ds41f:candidate-50`, its tree labels and this lock; no PR changes the recipe. The `-dev` file adds the dev-mode collective RPC that the release suite's engine grid needs. This candidate is verified at the three testbeds marked; the other files are configurations, not part of its runs.
 
 | Shape | Configuration | With dev RPC | |
 | --- | --- | --- | --- |
-| `tp4-ring` | [tp4.json](tp4.json) | [tp4-dev.json](tp4-dev.json) | qualified here |
-| `tp3-triangle` | [tp3.json](tp3.json) | [tp3-dev.json](tp3-dev.json) | qualified here |
+| `tp4-ring` | [tp4.json](tp4.json) | [tp4-dev.json](tp4-dev.json) | verified here |
+| `tp3-triangle` | [tp3.json](tp3.json) | [tp3-dev.json](tp3-dev.json) |  |
 | `tp3-triangle-4k` | [tp3-triangle-4k.json](tp3-triangle-4k.json) | [tp3-triangle-4k-dev.json](tp3-triangle-4k-dev.json) |  |
-| `tp3-switched` | [tp3-switched.json](tp3-switched.json) | [tp3-switched-dev.json](tp3-switched-dev.json) | qualified here |
-| `tp4-switched` | [tp4-switched.json](tp4-switched.json) | [tp4-switched-dev.json](tp4-switched-dev.json) | qualified here |
+| `tp3-switched` | [tp3-switched.json](tp3-switched.json) | [tp3-switched-dev.json](tp3-switched-dev.json) | verified here |
+| `tp4-switched` | [tp4-switched.json](tp4-switched.json) | [tp4-switched-dev.json](tp4-switched-dev.json) | verified here |
 | `tp5-switched` | [tp5-switched.json](tp5-switched.json) | [tp5-switched-dev.json](tp5-switched-dev.json) |  |
 | `tp6-switched` | [tp6-switched.json](tp6-switched.json) | [tp6-switched-dev.json](tp6-switched-dev.json) |  |
 | `tp7-switched` | [tp7-switched.json](tp7-switched.json) | [tp7-switched-dev.json](tp7-switched-dev.json) |  |
-| `tp8-switched` | [tp8-switched.json](tp8-switched.json) | [tp8-switched-dev.json](tp8-switched-dev.json) | qualified here |
+| `tp8-switched` | [tp8-switched.json](tp8-switched.json) | [tp8-switched-dev.json](tp8-switched-dev.json) |  |
 
 - [image-dgx4.json](image-dgx4.json): build-only profile.
 
@@ -140,63 +141,55 @@ Temperature-0 output hashes must equal the 1017 checkpoint's, except where a PR 
 
 Every other PR declares none.
 
-## Qualification plan
+## Verification
 
-Step 9 measures this candidate once, completely, against 1107's recorded runs; 1107 is not measured
-again. Each testbed opens its window with `scripts/lab.py`, after the hold and idle guards.
+### tp4-ring boot failure: #1009
 
-1. [build.json](build.json) (`candidate-50-image`), in the dgx window. It builds the image on dgx4,
-   copies it along the ring, and runs the release tests ([bundles/release-tests](bundles/release-tests))
-   on dgx4. The image is then streamed to sp1 and sp5
-   (`ssh dgx1 docker save spark-ds41f:candidate-50 | ssh <head> docker load`) and distributed from each
-   head with `build distribute --apply`. Every rank shows the same image ID.
-2. **Determinism gate**, first on each testbed:
-   - [candidate-tp4.json](candidate-tp4.json) at `tp4-ring`;
-   - [candidate-tp4-switched.json](candidate-tp4-switched.json) at `tp4-switched`;
-   - [candidate-tp3-switched.json](candidate-tp3-switched.json) at `tp3-switched`;
-   - [candidate-tp3.json](candidate-tp3.json) at `tp3-triangle`, once the dgx fabric is re-cabled.
-   - `tp8-switched` boots after the `tp4-switched` and `tp3-switched` runs, on sp1..sp8; its release
-     arms boot first, so a startup failure shows there.
-3. **Cold boots** ([testing](../../../docs/testing.md)): one rank's, every rank's and every JIT cache
-   empty, with nothing compiled after preparation.
-4. **Release set**: the `release-<shape>.json` specs run `candidate-50` and `candidate-50-again`, each
-   with startup memory, against 1107's recorded runs. The promoted runs become each shape's
-   `benchmark_reference`.
+The first gate boot at `tp4-ring` failed while capturing CUDA graphs: in a `warm_tail_shapes`
+dummy step of 54 tokens, `indexer_score` got index-query rows padded to 64 and 54 weight rows
+(`Weights shape[0] violates packed ABI constraint; expected: 64, got: 54`). The logs are in
+[receipts/tp4-boot-failure](receipts/tp4-boot-failure). The release tests passed on the image.
 
-   | Shape | Spec | Suites | 1107 reference |
-   | --- | --- | --- | --- |
-   | `tp4-ring` | [release-tp4.json](release-tp4.json) | `release`, `single-stream`, `sampled` | `"release"`: `manifests/suites/2026-11-07-spark-ds41f-1107-tp4` |
-   | `tp3-triangle` | [release-tp3.json](release-tp3.json) | `release-tp3`, `single-stream`, `sampled` | `"release"`: `manifests/suites/2026-11-07-spark-ds41f-1107-tp3` |
-   | `tp4-switched` | [release-tp4-switched.json](release-tp4-switched.json) | `release`, `single-stream`, `sampled` | `manifests/suites/2026-11-07-spark-ds41f-1107-tp4-switched` |
-   | `tp3-switched` | [release-tp3-switched.json](release-tp3-switched.json) | `release-tp3`, `single-stream`, `sampled` | `manifests/suites/2026-11-07-spark-ds41f-1107-tp3-switched` |
-   | `tp8-switched` | [release-tp8-switched.json](release-tp8-switched.json) | `release`, `single-stream`, `sampled` | `manifests/suites/2026-11-07-spark-ds41f-1107-tp8-switched` |
+Controls on the same image, each mounting candidate-50's files minus one patch:
 
-   Each companion's reference is the same path with `-single-stream` or `-sampled` appended.
-   - The switched specs name their reference path. At those shapes, the recipe's
-     `benchmark_reference` is a `bin/spark bench` report, which is not a suite run.
-   - 1107's `tp3-switched` record has no prefill step (no `prefill.json`, no `finished_utc`), so
-     prefill at `tp3-switched` has no 1107 row.
-5. **Quality evals** that 1107 recorded, on the shapes where it ran them: LongBench v2, RULER,
-   EvalPlus HumanEval, Vision Eval, tool-eval-bench and the 960K needle
-   ([1107/receipts](../1107/receipts/README.md)).
-6. **AgentX**: the lab's `agentx` job, 1 hour, `c8`, seed 42, on every shape 1107 reported:
-   `tp4-ring`, `tp4-switched`, `tp3-switched` and `tp8-switched`.
-7. **Live functional checks** of the carried fixes, as candidate-48 declared them:
-   - #955: a live tool call quoting DSML returns complete arguments.
-   - #1013: a live `/v1/completions` request with a JSON grammar under the `deepseek_v41` reasoning
-     parser returns valid output.
-   - #972: a live client disconnect aborts the engine request, keep-alive frames arrive every 15 s,
-     and servebench's streams parse.
-   - #980: the 1,000-step TP lockstep screen shows 0 rank mismatches, and the sampled suite completes.
-   - #1011: its tests pass in the release tests.
-8. **Startup**: each rank's lowest `MemAvailable` (the startup memory floor) and the time to ready,
-   from the release arms' startup memory, with no JIT after readiness.
+| Control | Boot |
+| --- | --- |
+| [tp4-no1012.json](tp4-no1012.json): without #1012 round 1 (0765) | fails the same way |
+| [tp4-no1009.json](tp4-no1009.json): without #1009 (0778) | ready in 112 s |
 
-The release notes then report against 1107, in the format of
-[release-notes.md](../release-notes.md): paired decode at each concurrency, the engine grid,
-prefill from 32K to 1M, sampled decode, short-request TTFT during a 131K prefill, greedy identity,
-the quality scores, AgentX throughput and prefix-cache hit rate, and the startup memory floor.
+#1009 had only booted at TP3 (candidate-49), and it goes to rework round 1. candidate-50 is verified
+without it, on the same image with the `no1009` overlay. That is exact for #1009, which is pure
+Python.
+
+### Runs
+
+| Testbed | Gate | Screen (ABBA with two 1107 boots) | Live checks |
+| --- | --- | --- | --- |
+| `tp4-ring` | [candidate-tp4-no1009.json](candidate-tp4-no1009.json) | [screen-tp4.json](screen-tp4.json) | [live-checks-tp4.json](live-checks-tp4.json) |
+| `tp4-switched` | [candidate-tp4-switched-no1009.json](candidate-tp4-switched-no1009.json) | [screen-tp4-switched.json](screen-tp4-switched.json) | |
+| `tp3-switched` | [candidate-tp3-switched-no1009.json](candidate-tp3-switched-no1009.json) | [screen-tp3-switched.json](screen-tp3-switched.json) | |
+
+- No screen record of 1107 existed at these shapes. Each screen runs 1107 as its first and last
+  arm, so it also records 1107's screen reference (release-benchmark step 6).
+- The screens of candidate-50 are the next round's reference: new PRs are judged against the
+  accumulated base.
+- The live checks are the marks candidate-48 declared for its fixes, which the one-GPU own-mark runs
+  could not run live:
+  - [check_955_quoted_dsml.py](check_955_quoted_dsml.py): a tool call quoting DSML keeps its
+    arguments, and quoted DSML in a reply stays text;
+  - [check_1013_completions_grammar.py](check_1013_completions_grammar.py): `/v1/completions` with a
+    JSON-schema grammar under the `deepseek_v41` reasoning parser returns schema-valid output;
+  - [check_972_stream.py](check_972_stream.py): a client disconnect aborts the engine request,
+    keep-alive frames arrive every 15 s, and servebench's stream parsing ignores them.
+- #980's lockstep screen passed in its rework (0/1000 at TP3 and TP4 on both boots,
+  [candidate-48/receipts/rework/pr-980-r1](../candidate-48/receipts/rework/pr-980-r1)). #1011 is
+  covered by the release tests.
+
+The release set, quality evals, AgentX and cold boots belong to release qualification. They run
+once, on the release candidate, when the owner calls a release.
 
 ## Status
 
-Prepared and locked. Not built, not measured.
+Built (`spark-ds41f:candidate-50`), and its release tests passed. At `tp4-ring` the full candidate does not
+boot (#1009). Without #1009, the gate passes: greedy outputs are identical and match TP4's hashes.
+The screens and live checks are running.

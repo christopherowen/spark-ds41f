@@ -184,6 +184,15 @@ prefill at 32K and 256K.
 
 ### 9. Release qualification (final benchmarking)
 
+**Between releases, a round's winners merge into the next base.** It runs only when the owner calls a release
+(owner, 2026-11-09: "there are dozens more PRs to work through until release").
+- **The merged base:** the previous base plus the PRs that passed. It gets its own candidate number
+  ([candidate-50](../experiments/2026-10-26-spark-ds41f-candidate/candidate-50/README.md) is the first).
+- **Verification only:** the gate, the screen on each testbed (which records the previous release's
+  screen reference where none exists), and the live checks of the fixes it carries. No release set,
+  quality evals, AgentX or cold boots.
+- **Its screens are the next round's reference:** later PRs are judged against the accumulated base.
+
 The release candidate is the base plus every PR that passed PR validation, including every
 reworked PR that met its mark. It is measured once, completely, on every shape the release
 serves, `tp3-triangle` included.
