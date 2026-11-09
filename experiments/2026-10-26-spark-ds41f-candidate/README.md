@@ -1029,3 +1029,27 @@ The merged base of candidates 47-49: spark-ds41f-1107 plus every PR that passed 
 - **Series:** [candidate-50/vllm/series](candidate-50/vllm/series) (`0001..0780`, 660 patches;
   `patchset_sha256` `38d230e9`, `patch_head` `ba7400d9`, `expected_tree` `d5778ab5`).
 - **Status:** prepared and locked; not built, not measured.
+
+## Candidate 51 ([candidate-51/](candidate-51))
+
+candidate-50 without #1009 plus #961, #963, #987 (its WO-B part), #1001, tested at `tp4-ring` (dgx1..dgx4). Candidates 51, 52 and 53 are tested at the same time, one per testbed, on the accumulated base: candidate-50 without #1009, which is in rework. The PRs that pass are carried into all later candidates. Marks, runs, own-mark commands and rework rules are in its README.
+
+- **Series:** [candidate-51/vllm/series](candidate-51/vllm/series) (`0001..0784`, 663 patches;
+  `patchset_sha256` `9fae6dc3`, `patch_head` `cc1115c5`, `expected_tree` `987ba058`).
+- **Status:** prepared and locked; not built, not measured.
+
+## Candidate 52 ([candidate-52/](candidate-52))
+
+candidate-50 without #1009 plus #1030, #968, #969, tested at `tp4-switched` (sp1..sp4). Candidates 51, 52 and 53 are tested at the same time, one per testbed, on the accumulated base: candidate-50 without #1009, which is in rework. The PRs that pass are carried into all later candidates. Marks, runs, own-mark commands and rework rules are in its README. #1030 changes temperature-0 output, so the gate checks #968 and #969 on its `no1030` control.
+
+- **Series:** [candidate-52/vllm/series](candidate-52/vllm/series) (`0001..0783`, 662 patches;
+  `patchset_sha256` `5ef94129`, `patch_head` `51a16b66`, `expected_tree` `1116740c`).
+- **Status:** prepared and locked; not built, not measured.
+
+## Candidate 53 ([candidate-53/](candidate-53))
+
+candidate-50 without #1009 plus #960, #971, #977, #984, #998, tested at `tp3-switched` (sp5..sp7). Candidates 51, 52 and 53 are tested at the same time, one per testbed, on the accumulated base: candidate-50 without #1009, which is in rework. The PRs that pass are carried into all later candidates. Marks, runs, own-mark commands and rework rules are in its README. Its `build.json`, queued last, ends with the round's one release-test `kernel` job for all three.
+
+- **Series:** [candidate-53/vllm/series](candidate-53/vllm/series) (`0001..0785`, 664 patches;
+  `patchset_sha256` `f7f2d13c`, `patch_head` `62df12dc`, `expected_tree` `c0e25ff1`).
+- **Status:** prepared and locked; not built, not measured.

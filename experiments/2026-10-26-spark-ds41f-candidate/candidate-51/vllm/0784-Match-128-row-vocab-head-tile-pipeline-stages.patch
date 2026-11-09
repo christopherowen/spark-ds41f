@@ -1,0 +1,74 @@
+From b50ee1bbcf0cd6ac9d139398d3a4907208c3a0ae Mon Sep 17 00:00:00 2001
+From: Christopher Owen <3221756+christopherowen@users.noreply.github.com>
+Date: Sun, 8 Nov 2026 19:35:24 +0000
+Subject: [PATCH] Match 128-row vocab head tile pipeline stages
+
+Base: 1107 vLLM patch head 2756478b60b90700b9918b457aeb38657da637b5.
+
+Rationale:
+In vllm/models/deepseek_v4_1/tilelang/vocab.py, TILE_CONFIGS[128] used num_stages=4 with act_stages=2 so four 32x128 weight stages and two 128x128 activation stages fit under the 99 KiB GB10 shared-memory ceiling (98,304 B). However, offsetting activation staging (stage 2) from weight cp.async staging (stage 0) inside T.Pipelined(..., stage=[2, 0, 0, 3, 3]) causes TileLang to emit three unrolled pipeline drain blocks with three simultaneously live bfloat16_t A_local[32] register arrays across cp.async_wait<3/2/1/0> barriers. That inflated register pressure on SM121 from 86 registers (block_M=64) to 195 registers in packed_vocab_projection and 197 registers in packed_vocab_greedy_partials (50,432 registers/CTA at 256 threads), making the 128-row tile at M=128 slower than launching two waves of the 64-row tile on both TP4 (N=32320) and TP3 (N=43136).
+
+Setting TILE_CONFIGS[128] to num_stages=2 (matching activation and weight pipeline depth at stage=[0, 0, 0, 1, 1]) reduces dynamic shared memory from 98,304 B to 86,016 B (78,336 B for NVFP4), eliminates two unrolled drain stages, and cuts register allocation from 195 to 97 registers in packed_vocab_projection and from 197 to 100 registers in packed_vocab_greedy_partials with zero spills. Across M=72..128 in captured CUDA graphs on GB10, this speeds up packed_vocab_projection and packed_vocab_greedy_partials by up to 10.2% (-195.8 us at M=128) on TP4 and up to 11.5% (-280.4 us at M=128) on TP3.
+
+Quality:
+Bit-identical (torch.equal) FP32 and BF16 logits and greedy (max, index) pairs across all M=1..128 on TP4 and TP3 shards; identical K accumulation order and tile reduction tree.
+
+Tests:
+- pytest tests/kernels/quantization/test_deepseek_v41_tilelang_vocab.py tests/kernels/test_deepseek_v41_tilelang_pdl.py tests/v1/worker/gpu/test_greedy_verification.py (105 passed across 2 boots).
+
+Upstream status: local TileLang SM121 vocabulary head pipeline tuning.
+---
+ .../test_deepseek_v41_tilelang_vocab.py       | 26 +++++++++++++++++++
+ vllm/models/deepseek_v4_1/tilelang/vocab.py   |  2 +-
+ 2 files changed, 27 insertions(+), 1 deletion(-)
+
+diff --git a/tests/kernels/quantization/test_deepseek_v41_tilelang_vocab.py b/tests/kernels/quantization/test_deepseek_v41_tilelang_vocab.py
+index 7643ae371..9763cea5d 100644
+--- a/tests/kernels/quantization/test_deepseek_v41_tilelang_vocab.py
++++ b/tests/kernels/quantization/test_deepseek_v41_tilelang_vocab.py
+@@ -721,3 +721,29 @@ def test_packed_bf16_lm_head_carveout_shares_single_buffer_with_screen_wq(monkey
+         expected = vocab_parallel_pairs(logits, n, 0, tp_size=1)
+         actual = project_head_greedy_pairs(layer, x, vocab=n, vocab_start=0)
+         assert torch.equal(actual[:, :2], expected[:, :2])
++
++
++def test_tile_config_128_uses_matched_two_stage_pipeline():
++    cfg = tile_config(128, 5120)
++    assert cfg == dict(block_N=32, threads=256, step_groups=1, num_stages=2)
++    assert "act_stages" not in cfg
++    assert (
++        packed_format.shared_memory_bytes(
++            128,
++            cfg["block_N"],
++            cfg["num_stages"],
++            cfg["step_groups"],
++            act_stages=cfg.get("act_stages"),
++        )
++        == 86_016
++    )
++    assert (
++        packed_format.nvfp4_shared_memory_bytes(
++            128,
++            cfg["block_N"],
++            cfg["num_stages"],
++            cfg["step_groups"],
++            act_stages=cfg.get("act_stages"),
++        )
++        == 78_336
++    )
+diff --git a/vllm/models/deepseek_v4_1/tilelang/vocab.py b/vllm/models/deepseek_v4_1/tilelang/vocab.py
+index 2ab9d3be0..0db333d0f 100644
+--- a/vllm/models/deepseek_v4_1/tilelang/vocab.py
++++ b/vllm/models/deepseek_v4_1/tilelang/vocab.py
+@@ -458,7 +458,7 @@ TILE_CONFIGS = {
+     16: dict(block_N=32, threads=128, step_groups=2, num_stages=4),
+     32: dict(block_N=16, threads=128, step_groups=2, num_stages=4),
+     64: dict(block_N=32, threads=256, step_groups=1, num_stages=4),
+-    128: dict(block_N=32, threads=256, step_groups=1, num_stages=4, act_stages=2),
++    128: dict(block_N=32, threads=256, step_groups=1, num_stages=2),
+ }
+ 
+ SCREEN_TILE_CONFIGS = {
+-- 
+2.43.0
+

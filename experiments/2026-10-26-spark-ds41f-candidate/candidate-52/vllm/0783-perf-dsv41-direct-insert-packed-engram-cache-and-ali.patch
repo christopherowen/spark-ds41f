@@ -1,0 +1,527 @@
+From be312021678a254dc6c374dd628a961d91f41bda Mon Sep 17 00:00:00 2001
+From: Christopher Owen <christopherowen@users.noreply.github.com>
+Date: Sun, 8 Nov 2026 12:30:00 +0000
+Subject: [PATCH] perf(dsv41): direct-insert packed Engram cache rows and align
+ split cache arrays
+
+Upstream base: 19f2c20ed4d64ae22bd009ceacadd85e2a81e354
+
+Rationale:
+1. Split the 4-way set-associative disk Engram user-space row cache in _row_plan.h from an interleaved 1,096-byte struct array (where weights started at unaligned offset 33 and tags straddled 64B cache lines on 37.5% of sets across an 18 MiB footprint) into separate 64B-aligned cache_tags (512 KiB total for 64K rows, fitting in Grace L2 with one 32B tag set per half cache line), cache_clocks (16 KiB), 64B-aligned prefaulted cache_weights (16 MiB), and 8B-aligned prefaulted cache_scales (512 KiB).
+2. Insert non-page-straddling packed 264B rows directly into the user-space row cache inside ple_stash_job() from the io_uring slot buffer and index two-plane/split miss staging densely by miss_idx (0..miss_count-1) rather than sparse lookup stride, eliminating the intermediate miss_weights/miss_scales bounce copy on packed single-fragment misses.
+3. Deduplicate repeated misses of the same row ID within a step in ple_plan(), add a single-shard fast path when shard == 0, compact ple_fragment_t from 40B to 32B, and use insertion sort in ple_sort() for <= 32 fragments.
+
+Quality implications: Bit-exact (torch.equal) with the existing disk Engram reader across packed and two-plane sources, cached and uncached modes, and page-boundary splits.
+
+Tests: pytest tests/kernels/test_deepseek_v41_engram_rows.py (52 passed across 2 fresh container boots) and 2-boot run_cache_and_packed_benchmark suite.
+
+Upstream status: Local DeepSeek-V4.1 disk Engram optimization.
+---
+ .../kernels/test_deepseek_v41_engram_rows.py  |  68 +++++
+ .../deepseek_v4_1/engram_rows/_reader.c       |   7 +-
+ .../deepseek_v4_1/engram_rows/_row_plan.h     | 267 ++++++++++++------
+ 3 files changed, 250 insertions(+), 92 deletions(-)
+
+diff --git a/tests/kernels/test_deepseek_v41_engram_rows.py b/tests/kernels/test_deepseek_v41_engram_rows.py
+index eb7496e879..4ba32fb350 100644
+--- a/tests/kernels/test_deepseek_v41_engram_rows.py
++++ b/tests/kernels/test_deepseek_v41_engram_rows.py
+@@ -1197,3 +1197,71 @@ def test_multi_cta_step_kernel_matches_three_launch_across_batches(columns: int,
+             torch.testing.assert_close(out_step.cpu(), expected, rtol=0, atol=0, equal_nan=True)
+     finally:
+         rows.close()
++
++
++@pytest.mark.parametrize("offset", [0, 4096 - ROW_BYTES - 4])
++def test_packed_row_cache_direct_insert_and_duplicate_miss_dedup(offset: int):
++    """Packed row cache inserts directly from io_uring buffers on aligned 264B rows,
++    stages split rows across 4 KiB page boundaries on unaligned offsets, deduplicates
++    repeated in-step misses, and serves subsequent hits with zero disk reads."""
++    directory = _table_dir()
++    weights, scales, paths = _write_table(directory, seed=83 + offset)
++    base_packed = os.path.join(directory, f"packed-cache-base-{offset}.bin")
++    pack_engram_columns(
++        paths[0],
++        WEIGHT_OFFSET,
++        paths[1],
++        SCALE_OFFSET,
++        base_packed,
++        np.array([0], dtype=np.int64),
++        np.array([TABLE_ROWS], dtype=np.int64),
++    )
++    if offset == 0:
++        packed_path = base_packed
++    else:
++        packed_path = os.path.join(directory, f"packed-cache-{offset}.bin")
++        with open(base_packed, "rb") as src_f:
++            payload = src_f.read()
++        with open(packed_path, "wb") as f:
++            f.write(b"\x5a" * offset)
++            f.write(payload)
++
++    rows = EngramDiskRows(
++        device="cuda",
++        table_rows=TABLE_ROWS,
++        shard_start=0,
++        shard_end=TABLE_ROWS,
++        columns=TP3_RANK1,
++        max_lookups=32 * HEADS,
++        cache_rows=256,
++    )
++    rows.add_packed_source(packed_path, offset)
++    try:
++        # 24 unique row IDs repeated across all 32 tokens (heavy in-step duplicate misses).
++        base_row = torch.arange(24, dtype=torch.int64) * 15 + 14  # includes page-boundary rows
++        ids = base_row.unsqueeze(0).expand(32, -1).contiguous()
++        ids_gpu = ids.cuda()
++        expected = _reference(weights, scales, ids, 32, 0, TABLE_ROWS, TP3_RANK1)
++
++        out_miss, _ = _step(rows, ids_gpu, 32, early=ids.numpy())
++        torch.testing.assert_close(out_miss.cpu(), expected, rtol=0, atol=0, equal_nan=True)
++        torch.cuda.synchronize()
++        deadline = time.monotonic() + 5.0
++        while rows.stats()["queued"] and time.monotonic() < deadline:
++            time.sleep(0.001)
++        s_after_miss = rows.stats()
++        assert s_after_miss["read_calls"] > 0
++
++        # Poison host buffers to prove the second step comes 100% from the row cache.
++        rows.weights.host.fill_(0x7F)
++        rows.scales.host.fill_(0xFF)
++        out_hit, _ = _step(rows, ids_gpu, 32, early=ids.numpy())
++        torch.testing.assert_close(out_hit.cpu(), expected, rtol=0, atol=0, equal_nan=True)
++        torch.cuda.synchronize()
++        while rows.stats()["queued"] and time.monotonic() < deadline:
++            time.sleep(0.001)
++        s_after_hit = rows.stats()
++        assert s_after_hit["read_calls"] == s_after_miss["read_calls"]
++        assert s_after_hit["cache_hits"] - s_after_miss["cache_hits"] == 32 * 8
++    finally:
++        rows.close()
+diff --git a/vllm/models/deepseek_v4_1/engram_rows/_reader.c b/vllm/models/deepseek_v4_1/engram_rows/_reader.c
+index d438f7259a..fedfd2d1d3 100644
+--- a/vllm/models/deepseek_v4_1/engram_rows/_reader.c
++++ b/vllm/models/deepseek_v4_1/engram_rows/_reader.c
+@@ -167,8 +167,11 @@ static void ple_scatter(reader_t *reader, size_t index, const char *buffer) {
+     if (!reader->plan.packed) {
+         for (size_t i = job->begin; i < job->end; i++) {
+             ple_fragment_t *fragment = &reader->plan.fragments[i];
+-            memcpy((fragment->scale ? dst_scales : dst_weights) + fragment->destination,
+-                   buffer + (fragment->offset - job->offset), fragment->length);
++            char *dst = (fragment->scale
++                             ? dst_scales + (size_t)fragment->lookup * 8u
++                             : dst_weights + (size_t)fragment->lookup * 256u) +
++                        fragment->in_row;
++            memcpy(dst, buffer + (fragment->offset - job->offset), fragment->length);
+         }
+     } else {
+         for (size_t i = job->begin; i < job->end; i++) {
+diff --git a/vllm/models/deepseek_v4_1/engram_rows/_row_plan.h b/vllm/models/deepseek_v4_1/engram_rows/_row_plan.h
+index 77bdcf60af..a9d8531a3d 100644
+--- a/vllm/models/deepseek_v4_1/engram_rows/_row_plan.h
++++ b/vllm/models/deepseek_v4_1/engram_rows/_row_plan.h
+@@ -19,13 +19,8 @@
+ #define PLE_DEFAULT_CACHE_ROWS 65536
+ #define PLE_CACHE_MAX_TOKENS 64u
+ #define PLE_CACHE_MAX_LOOKUPS (PLE_CACHE_MAX_TOKENS * PLE_COLUMNS)
+-
+-typedef struct {
+-    int64_t ids[PLE_CACHE_WAYS];
+-    uint8_t clock;
+-    char weights[PLE_CACHE_WAYS][256];
+-    char scales[PLE_CACHE_WAYS][8];
+-} ple_cache_set_t;
++#define PLE_NO_MISS UINT32_MAX
++#define PLE_STEP_DEDUP_SLOTS 64u
+ 
+ typedef struct {
+     int fd;
+@@ -46,8 +41,9 @@ typedef struct {
+     int64_t offset;
+     unsigned length;
+     uint32_t lookup;
+-    size_t destination;
+-    bool scale;
++    uint32_t miss_idx;
++    uint16_t in_row;
++    uint8_t scale;
+ } ple_fragment_t;
+ 
+ typedef struct {
+@@ -60,7 +56,7 @@ typedef struct {
+ typedef struct {
+     int64_t shard_rows, padded_rows, tp_start, tp_end;
+     uint32_t columns;
+-    bool packed, has_col_map;
++    bool packed, has_col_map, has_staged_misses;
+     int64_t col_start[PLE_COLUMNS], col_end[PLE_COLUMNS], col_delta[PLE_COLUMNS];
+     size_t weight_bytes, scale_bytes, max_lookups, capacity;
+     ple_fragment_t *fragments;
+@@ -73,7 +69,9 @@ typedef struct {
+     uint64_t lookups, requested_bytes, read_bytes, read_calls;
+     uint64_t unique_blocks, coalesced_reads, submit_calls;
+     double execution_seconds, planning_seconds;
+-    ple_cache_set_t *cache;
++    int64_t (*cache_tags)[PLE_CACHE_WAYS];
++    uint8_t *cache_clocks;
++    char *cache_weights, *cache_scales;
+     size_t cache_sets, cache_set_mask;
+     uint64_t cache_populated;
+     uint32_t *miss_lookups;
+@@ -96,7 +94,10 @@ static inline void ple_plan_release(ple_plan_t *reader) {
+     free(reader->sources);
+     free(reader->fragments);
+     free(reader->jobs);
+-    free(reader->cache);
++    free(reader->cache_tags);
++    free(reader->cache_clocks);
++    free(reader->cache_weights);
++    free(reader->cache_scales);
+     free(reader->miss_lookups);
+     free(reader->miss_ids);
+     free(reader->miss_weights);
+@@ -137,24 +138,38 @@ static inline int ple_plan_init(ple_plan_t *reader, int64_t shard_rows,
+             if (sets > SIZE_MAX / 2) return EOVERFLOW;
+             sets <<= 1;
+         }
++        if (sets > SIZE_MAX / (PLE_CACHE_WAYS * 256u)) return EOVERFLOW;
++        size_t total_ways = sets * PLE_CACHE_WAYS;
+         size_t miss_cap = (size_t)max_lookups > PLE_CACHE_MAX_LOOKUPS
+                               ? (size_t)max_lookups
+                               : (size_t)PLE_CACHE_MAX_LOOKUPS;
+         reader->cache_sets = sets;
+         reader->cache_set_mask = sets - 1;
+-        reader->cache = calloc(sets, sizeof(*reader->cache));
++        void *tags_ptr = NULL, *weights_ptr = NULL, *miss_w_ptr = NULL;
++        if (posix_memalign(&tags_ptr, 64u, sets * sizeof(*reader->cache_tags)) != 0 ||
++            posix_memalign(&weights_ptr, 64u, total_ways * 256u) != 0 ||
++            posix_memalign(&miss_w_ptr, 64u, miss_cap * 256u) != 0) {
++            free(tags_ptr);
++            free(weights_ptr);
++            free(miss_w_ptr);
++            return ENOMEM;
++        }
++        reader->cache_tags = tags_ptr;
++        reader->cache_weights = weights_ptr;
++        reader->miss_weights = miss_w_ptr;
++        reader->cache_clocks = calloc(sets, sizeof(*reader->cache_clocks));
++        reader->cache_scales = malloc(total_ways * 8u);
+         reader->miss_lookups = malloc(miss_cap * sizeof(*reader->miss_lookups));
+         reader->miss_ids = malloc(miss_cap * sizeof(*reader->miss_ids));
+-        reader->miss_weights = malloc(miss_cap * 256u);
+         reader->miss_scales = malloc(miss_cap * 8u);
+-        if (!reader->cache || !reader->miss_lookups || !reader->miss_ids ||
+-            !reader->miss_weights || !reader->miss_scales)
++        if (!reader->cache_clocks || !reader->cache_scales || !reader->miss_lookups ||
++            !reader->miss_ids || !reader->miss_scales)
+             return ENOMEM;
+-        for (size_t s = 0; s < sets; s++) {
+-            for (unsigned w = 0; w < PLE_CACHE_WAYS; w++) {
+-                reader->cache[s].ids[w] = -1;
+-            }
+-        }
++        memset(reader->cache_tags, 0xFF, sets * sizeof(*reader->cache_tags));
++        memset(reader->cache_weights, 0, total_ways * 256u);
++        memset(reader->cache_scales, 0, total_ways * 8u);
++        memset(reader->miss_weights, 0, miss_cap * 256u);
++        memset(reader->miss_scales, 0, miss_cap * 8u);
+     }
+     return 0;
+ }
+@@ -301,6 +316,19 @@ static inline void ple_sift(ple_fragment_t *items, size_t root, size_t count) {
+ static inline void ple_sort(ple_plan_t *reader) {
+     ple_fragment_t *items = reader->fragments;
+     size_t count = reader->fragment_count;
++    if (count <= 1) return;
++    if (count <= 32) {
++        for (size_t i = 1; i < count; i++) {
++            ple_fragment_t value = items[i];
++            size_t j = i;
++            while (j > 0 && ple_fragment_compare(&value, &items[j - 1]) < 0) {
++                items[j] = items[j - 1];
++                j--;
++            }
++            items[j] = value;
++        }
++        return;
++    }
+     if (count < 1024) {
+         for (size_t i = count / 2; i > 0; i--) ple_sift(items, i - 1, count);
+         for (size_t end = count; end > 1; end--) {
+@@ -356,26 +384,47 @@ static inline size_t ple_cache_set_index(int64_t id, size_t mask) {
+     return (size_t)((h ^ (h >> 32)) & mask);
+ }
+ 
+-static inline void ple_scatter_packed_fragment(const ple_fragment_t *fragment, const char *src,
+-        char *dst_weights, char *dst_scales) {
+-    size_t lookup = fragment->lookup;
+-    if (fragment->length == PLE_PACKED_ROW_BYTES) {
+-        memcpy(dst_weights + lookup * 256u, src, 256u);
+-        memcpy(dst_scales + lookup * 8u, src + 256u, 8u);
++static inline void ple_scatter_packed_row_part(size_t in_row, unsigned length,
++        const char *src, char *dst_weight, char *dst_scale) {
++    if (length == PLE_PACKED_ROW_BYTES) {
++        memcpy(dst_weight, src, 256u);
++        memcpy(dst_scale, src + 256u, 8u);
+         return;
+     }
+-    size_t in_row = fragment->destination - lookup * PLE_PACKED_ROW_BYTES;
+-    size_t end_in_row = in_row + fragment->length;
++    size_t end_in_row = in_row + length;
+     if (in_row < 256u) {
+         size_t w_len = (end_in_row <= 256u ? end_in_row : 256u) - in_row;
+-        memcpy(dst_weights + lookup * 256u + in_row, src, w_len);
++        memcpy(dst_weight + in_row, src, w_len);
+     }
+     if (end_in_row > 256u) {
+         size_t s_start = in_row > 256u ? in_row - 256u : 0u;
+         size_t s_len = (end_in_row - 256u) - s_start;
+         size_t src_off = in_row < 256u ? 256u - in_row : 0u;
+-        memcpy(dst_scales + lookup * 8u + s_start, src + src_off, s_len);
++        memcpy(dst_scale + s_start, src + src_off, s_len);
++    }
++}
++
++static inline void ple_scatter_packed_fragment(const ple_fragment_t *fragment, const char *src,
++        char *dst_weights, char *dst_scales) {
++    size_t lookup = fragment->lookup;
++    ple_scatter_packed_row_part(fragment->in_row, fragment->length, src,
++                                dst_weights + lookup * 256u, dst_scales + lookup * 8u);
++}
++
++static inline void ple_cache_insert(ple_plan_t *reader, int64_t id,
++        const char *weight_src, const char *scale_src) {
++    size_t set_idx = ple_cache_set_index(id, reader->cache_set_mask);
++    int64_t *tags = reader->cache_tags[set_idx];
++    for (unsigned w = 0; w < PLE_CACHE_WAYS; w++) {
++        if (tags[w] == id) return;
+     }
++    unsigned w = reader->cache_clocks[set_idx] & (PLE_CACHE_WAYS - 1);
++    reader->cache_clocks[set_idx] = (uint8_t)((w + 1) & (PLE_CACHE_WAYS - 1));
++    tags[w] = id;
++    size_t way_idx = set_idx * PLE_CACHE_WAYS + (size_t)w;
++    memcpy(reader->cache_weights + way_idx * 256u, weight_src, 256u);
++    memcpy(reader->cache_scales + way_idx * 8u, scale_src, 8u);
++    reader->cache_populated++;
+ }
+ 
+ static inline void ple_stash_job(ple_plan_t *reader, size_t index) {
+@@ -385,64 +434,85 @@ static inline void ple_stash_job(ple_plan_t *reader, size_t index) {
+     if (!reader->packed) {
+         for (size_t i = job->begin; i < job->end; i++) {
+             ple_fragment_t *fragment = &reader->fragments[i];
+-            memcpy((fragment->scale ? reader->miss_scales : reader->miss_weights) + fragment->destination,
+-                   buffer + (fragment->offset - job->offset), fragment->length);
++            uint32_t m = fragment->miss_idx;
++            if (m == PLE_NO_MISS) continue;
++            char *dst = (fragment->scale
++                             ? reader->miss_scales + (size_t)m * 8u
++                             : reader->miss_weights + (size_t)m * 256u) +
++                        fragment->in_row;
++            memcpy(dst, buffer + (fragment->offset - job->offset), fragment->length);
++            reader->has_staged_misses = true;
+         }
+     } else {
+         for (size_t i = job->begin; i < job->end; i++) {
+             ple_fragment_t *fragment = &reader->fragments[i];
+-            ple_scatter_packed_fragment(fragment, buffer + (fragment->offset - job->offset),
+-                                        reader->miss_weights, reader->miss_scales);
++            uint32_t m = fragment->miss_idx;
++            if (m == PLE_NO_MISS) continue;
++            const char *src = buffer + (fragment->offset - job->offset);
++            if (fragment->length == PLE_PACKED_ROW_BYTES) {
++                int64_t id = reader->miss_ids[m];
++                if (id >= 0) {
++                    ple_cache_insert(reader, id, src, src + 256u);
++                    reader->miss_ids[m] = -1;
++                }
++            } else {
++                ple_scatter_packed_row_part(fragment->in_row, fragment->length, src,
++                                            reader->miss_weights + (size_t)m * 256u,
++                                            reader->miss_scales + (size_t)m * 8u);
++                reader->has_staged_misses = true;
++            }
+         }
+     }
+     job->saved_buffer = NULL;
+ }
+ 
+-static inline void ple_cache_insert(ple_plan_t *reader, int64_t id,
+-        const char *weight_src, const char *scale_src) {
+-    size_t set_idx = ple_cache_set_index(id, reader->cache_set_mask);
+-    ple_cache_set_t *set = &reader->cache[set_idx];
+-    for (unsigned w = 0; w < PLE_CACHE_WAYS; w++) {
+-        if (set->ids[w] == id) return;
+-    }
+-    unsigned w = set->clock & (PLE_CACHE_WAYS - 1);
+-    set->clock = (uint8_t)((w + 1) & (PLE_CACHE_WAYS - 1));
+-    set->ids[w] = id;
+-    memcpy(set->weights[w], weight_src, 256u);
+-    memcpy(set->scales[w], scale_src, 8u);
+-    reader->cache_populated++;
+-}
+-
+ static inline void ple_cache_commit(ple_plan_t *reader) {
+     if (!reader->miss_count) return;
+     const char *w_base = reader->miss_src_weights;
+     const char *s_base = reader->miss_src_scales;
+-    if (!w_base) {
++    if (w_base) {
++        for (size_t k = 0; k < reader->miss_count; k++) {
++            uint32_t lookup = reader->miss_lookups[k];
++            int64_t id = reader->miss_ids[k];
++            ple_cache_insert(reader, id,
++                             w_base + (size_t)lookup * 256u,
++                             s_base + (size_t)lookup * 8u);
++        }
++    } else {
+         for (size_t j = 0; j < reader->job_count; j++) {
+             ple_stash_job(reader, j);
+         }
+-        w_base = reader->miss_weights;
+-        s_base = reader->miss_scales;
+-    }
+-    for (size_t k = 0; k < reader->miss_count; k++) {
+-        uint32_t lookup = reader->miss_lookups[k];
+-        int64_t id = reader->miss_ids[k];
+-        ple_cache_insert(reader, id,
+-                         w_base + (size_t)lookup * 256u,
+-                         s_base + (size_t)lookup * 8u);
++        if (reader->has_staged_misses) {
++            for (size_t k = 0; k < reader->miss_count; k++) {
++                int64_t id = reader->miss_ids[k];
++                if (id >= 0) {
++                    ple_cache_insert(reader, id,
++                                     reader->miss_weights + k * 256u,
++                                     reader->miss_scales + k * 8u);
++                }
++            }
++        }
+     }
+     reader->miss_count = 0;
++    reader->has_staged_misses = false;
+ }
+ 
+ static inline bool ple_plan(ple_plan_t *reader, const char *ids, size_t count,
+         char *dst_weights, char *dst_scales, bool dst_is_cached) {
+     reader->fragment_count = reader->job_count = 0;
+     reader->miss_count = 0;
++    reader->has_staged_misses = false;
+     bool use_cache = reader->cache_sets > 0 && (count <= reader->max_lookups || dst_is_cached);
+     bool check_cache = use_cache && reader->cache_populated > 0;
+     bool fill_cache = use_cache;
+     reader->miss_src_weights = dst_is_cached ? dst_weights : NULL;
+     reader->miss_src_scales = dst_is_cached ? dst_scales : NULL;
++    int64_t step_seen_id[PLE_STEP_DEDUP_SLOTS];
++    if (fill_cache) memset(step_seen_id, 0xFF, sizeof(step_seen_id));
++    int planes = reader->scale_bytes ? 2 : 1;
++    bool fast_shard0 = reader->source_count >= (size_t)planes &&
++                       reader->sources[0].shard == 0 && !reader->sources[0].scale &&
++                       (planes == 1 || (reader->sources[1].shard == 0 && reader->sources[1].scale));
+     for (size_t i = 0; i < count; i++) {
+         int64_t id;
+         memcpy(&id, ids + i * sizeof(id), sizeof(id));
+@@ -463,43 +533,60 @@ static inline bool ple_plan(ple_plan_t *reader, const char *ids, size_t count,
+             }
+             phys_id = id - reader->col_delta[col];
+         }
+-        if (check_cache) {
++        uint32_t frag_miss = PLE_NO_MISS;
++        if (use_cache) {
+             size_t set_idx = ple_cache_set_index(id, reader->cache_set_mask);
+-            ple_cache_set_t *set = &reader->cache[set_idx];
+-            int hit_way = -1;
+-            for (unsigned w = 0; w < PLE_CACHE_WAYS; w++) {
+-                if (set->ids[w] == id) {
+-                    hit_way = (int)w;
+-                    break;
++            if (check_cache) {
++                const int64_t *tags = reader->cache_tags[set_idx];
++                int hit_way = -1;
++                for (unsigned w = 0; w < PLE_CACHE_WAYS; w++) {
++                    if (tags[w] == id) {
++                        hit_way = (int)w;
++                        break;
++                    }
++                }
++                if (hit_way >= 0) {
++                    size_t way_idx = set_idx * PLE_CACHE_WAYS + (size_t)hit_way;
++                    memcpy(dst_weights + i * 256u, reader->cache_weights + way_idx * 256u, 256u);
++                    memcpy(dst_scales + i * 8u, reader->cache_scales + way_idx * 8u, 8u);
++                    reader->cache_hits++;
++                    continue;
+                 }
+             }
+-            if (hit_way >= 0) {
+-                memcpy(dst_weights + i * 256u, set->weights[hit_way], 256u);
+-                memcpy(dst_scales + i * 8u, set->scales[hit_way], 8u);
+-                reader->cache_hits++;
+-                continue;
+-            }
+-        }
+-        if (reader->cache_sets > 0) {
+             reader->cache_misses++;
+             if (fill_cache) {
+-                size_t m = reader->miss_count++;
+-                reader->miss_lookups[m] = (uint32_t)i;
+-                reader->miss_ids[m] = id;
++                size_t dedup_slot = set_idx & (PLE_STEP_DEDUP_SLOTS - 1u);
++                if (step_seen_id[dedup_slot] != id) {
++                    step_seen_id[dedup_slot] = id;
++                    size_t m = reader->miss_count++;
++                    reader->miss_lookups[m] = (uint32_t)i;
++                    reader->miss_ids[m] = id;
++                    if (!dst_is_cached) frag_miss = (uint32_t)m;
++                }
+             }
++        } else if (reader->cache_sets > 0) {
++            reader->cache_misses++;
+         }
+-        for (int plane = 0; plane < (reader->scale_bytes ? 2 : 1); plane++) {
+-            ple_source_t key = {.shard = phys_id / reader->shard_rows, .scale = plane != 0};
+-            ple_source_t *source = reader->source_count ? bsearch(&key, reader->sources,
+-                reader->source_count, sizeof(key), ple_source_compare) : NULL;
+-            if (!source) {
+-                snprintf(reader->failure.message, sizeof(reader->failure.message),
+-                         "missing PLE %s source for shard %lld", plane ? "scale" : "weight", (long long)key.shard);
+-                return false;
++        bool in_shard0 = fast_shard0 && (uint64_t)phys_id < (uint64_t)reader->shard_rows;
++        for (int plane = 0; plane < planes; plane++) {
++            ple_source_t *source;
++            int64_t rel_row;
++            if (in_shard0) {
++                source = &reader->sources[plane];
++                rel_row = phys_id;
++            } else {
++                ple_source_t key = {.shard = phys_id / reader->shard_rows, .scale = plane != 0};
++                source = reader->source_count ? bsearch(&key, reader->sources,
++                    reader->source_count, sizeof(key), ple_source_compare) : NULL;
++                if (!source) {
++                    snprintf(reader->failure.message, sizeof(reader->failure.message),
++                             "missing PLE %s source for shard %lld", plane ? "scale" : "weight", (long long)key.shard);
++                    return false;
++                }
++                rel_row = phys_id % reader->shard_rows;
+             }
+             size_t bytes = plane ? reader->scale_bytes : reader->weight_bytes;
+-            size_t destination = i * bytes;
+-            int64_t rel_row = phys_id % reader->shard_rows;
++            uint16_t in_row = 0;
+             int64_t offset = reader->packed
+                 ? source->offset + (rel_row / (int64_t)PLE_PACKED_ROWS_PER_PAGE) * (int64_t)PLE_BLOCK +
+                       (rel_row % (int64_t)PLE_PACKED_ROWS_PER_PAGE) * (int64_t)PLE_PACKED_ROW_BYTES
+@@ -509,9 +596,9 @@ static inline bool ple_plan(ple_plan_t *reader, const char *ids, size_t count,
+                 unsigned length = PLE_BLOCK - (uint64_t)offset % PLE_BLOCK;
+                 if (bytes < length) length = (unsigned)bytes;
+                 reader->fragments[reader->fragment_count++] =
+-                    (ple_fragment_t){source->file, offset, length, (uint32_t)i, destination, plane != 0};
++                    (ple_fragment_t){source->file, offset, length, (uint32_t)i, frag_miss, in_row, (uint8_t)(plane != 0)};
+                 offset += length;
+-                destination += length;
++                in_row = (uint16_t)(in_row + length);
+                 bytes -= length;
+             }
+         }
+-- 
+2.43.0
+
