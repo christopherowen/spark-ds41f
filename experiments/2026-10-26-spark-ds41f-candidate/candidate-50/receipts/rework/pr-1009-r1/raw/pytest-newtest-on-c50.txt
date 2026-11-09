@@ -1,0 +1,594 @@
+============================= test session starts ==============================
+platform linux -- Python 3.12.3, pytest-9.1.1, pluggy-1.6.0
+rootdir: /opt/spark-ds41f/candidate/vllm
+configfile: pyproject.toml
+plugins: anyio-4.15.1
+collected 78 items / 66 deselected / 12 selected
+
+tests/models/test_deepseek_v4_1_attention.py .F.F.F......                [100%]
+
+=================================== FAILURES ===================================
+_ test_sp_prefill_with_replicated_fused_wqa_wkv_gathers_mxfp8_and_swa_records[False-4-True] _
+
+monkeypatch = <_pytest.monkeypatch.MonkeyPatch object at 0xfc5317295b20>
+n_real = 4, split_check = False, is_decode = True
+
+    @pytest.mark.parametrize("is_decode", [False, True])
+    @pytest.mark.parametrize("n_real", [4, 2, 0])
+    @pytest.mark.parametrize("split_check", [False, True])
+    def test_sp_prefill_with_replicated_fused_wqa_wkv_gathers_mxfp8_and_swa_records(
+        monkeypatch, n_real, split_check, is_decode
+    ):
+        """When ``fused_wqa_wkv`` is replicated across TP, SP prefill without a compressor
+        runs ``sp_attention_front`` on ``qr_kv[:real_rows]``, gathers only ``local_q_cast``
+        and 528-byte SWA cache records via ``gather_mxfp8`` (1,848 B/row), scatters the
+        records via ``write_swa_records``, and keeps ``indexer.weights_proj`` rank-local
+        unless ``_INDEX_SPLIT_CHECK`` is active. A decode step of an SP forward (the
+        warm-up's eager tail shapes) scores every row, so it gathers the head weights of
+        every row: the index queries and their weights always have one row count."""
+        from vllm.models.deepseek_v4_1 import attention, kernels, sp_prefill
+        from vllm.models.deepseek_v4_1.tilelang import cache_writer, front
+        from vllm.models.deepseek_v4_1.tilelang.linear import MXFP8Rows, provided_mxfp8
+    
+        monkeypatch.setattr(attention, "_INDEX_SPLIT_CHECK", split_check)
+        module = _tilelang_layer(layer_id=5)
+        module._ready = True
+        module.q_lora_rank = 1280
+        module.n_local_heads = 2
+        module._l2pf_wo = None
+        module._l2pf_comp = None
+        swa_cache = torch.zeros((4, 64 * 528), dtype=torch.uint8)
+        module.swa_cache_layer = SimpleNamespace(
+            prefix="swa", kv_cache=swa_cache, block_size=64
+        )
+        module.q_norm = SimpleNamespace(
+            weight=torch.ones(1280, dtype=torch.bfloat16), variance_epsilon=1e-6
+        )
+        module.kv_norm = SimpleNamespace(
+            weight=torch.ones(512, dtype=torch.bfloat16), variance_epsilon=1e-6
+        )
+        module.rotary_emb = SimpleNamespace(
+            cos_sin_cache=torch.ones((32, 64), dtype=torch.float32)
+        )
+    
+        local_x = torch.ones((4, 32), dtype=torch.bfloat16)
+        local_weights = torch.arange(16, dtype=torch.bfloat16).reshape(4, 4)
+        gathered_weights = torch.arange(40, dtype=torch.bfloat16).reshape(10, 4)
+        gathered_q = MXFP8Rows(
+            rows=torch.empty((10, 1280), dtype=torch.bfloat16),
+            values=torch.full((64, 1280), 7, dtype=torch.float8_e4m3fn),
+            scales=torch.full((64, 40), 9, dtype=torch.uint8),
+        )
+        gathered_records = torch.full((10, 528), 11, dtype=torch.uint8)
+        events = []
+    
+        class _FakeSPRows:
+            num_tokens = 10
+            local_rows = 4
+            start = 4
+            real_rows = n_real
+    
+            def gather(self, x):
+                events.append(("gather", tuple(x.shape), x.dtype))
+                return gathered_weights
+    
+            def gather_mxfp8(self, x_q, *extra):
+                assert len(extra) == 1
+                rec = extra[0]
+                events.append(
+                    (
+                        "gather_mxfp8",
+                        tuple(x_q.rows.shape),
+                        tuple(rec.shape),
+                        rec.dtype,
+                    )
+                )
+                return (gathered_q, gathered_records)
+    
+        def rep_wqa_wkv(h):
+            events.append(("fused_wqa_wkv", tuple(h.shape)))
+            return torch.ones((4, 1280 + 512), dtype=torch.bfloat16), None
+    
+        rep_wqa_wkv.tp_size = 4
+        rep_wqa_wkv.replicated_sp_prefill = True
+        module.fused_wqa_wkv = rep_wqa_wkv
+    
+        def fake_sp_front(
+            qa_kv, q_w, kv_w, eps, pos, cos_sin, q_values, q_scales, records
+        ):
+            events.append(
+                (
+                    "sp_attention_front",
+                    tuple(qa_kv.shape),
+                     pos.tolist(),
+                    tuple(q_values.shape),
+                    tuple(q_scales.shape),
+                    tuple(records.shape),
+                )
+            )
+    
+        def fake_write_swa_records(records, cache, slots, *, page_size):
+            events.append(
+                (
+                    "write_swa_records",
+                    records is gathered_records,
+                    cache is swa_cache,
+                    slots.tolist(),
+                    page_size,
+                )
+            )
+    
+        monkeypatch.setattr(front, "sp_attention_front", fake_sp_front)
+        monkeypatch.setattr(cache_writer, "write_swa_records", fake_write_swa_records)
+        monkeypatch.setattr(
+            kernels,
+            "cast_mxfp8",
+            lambda rows: (_ for _ in ()).throw(
+                AssertionError("cast_mxfp8 should not run on gathered qr")
+            ),
+        )
+        module._cache_context_kv = lambda kv, pos: (_ for _ in ()).throw(
+            AssertionError("_cache_context_kv should not run when _sp_front wrote SWA records")
+        )
+        module.wq_b = lambda qr: (
+            events.append(("wq_b", qr is gathered_q.rows, provided_mxfp8(qr) is gathered_q)),
+            torch.ones((qr.shape[0], 2 * 512), dtype=torch.bfloat16),
+        )[1]
+        module._rope = lambda x, pos, role: x
+        module.indexer = SimpleNamespace(
+            heads=4,
+            wq_b=lambda qr: torch.ones((qr.shape[0], 4 * 128), dtype=torch.bfloat16),
+            weights_proj=lambda h: (
+                events.append(("weights_proj", tuple(h.shape))),
+                local_weights,
+            )[1],
+        )
+        module._quantize_index_query = lambda mode, iq, data, scale, positions=None: None
+        seen_index_query = []
+    
+        def check_forward_mqa(q, kv, pos, output, *, index_query=None):
+            assert kv is None
+            seen_index_query.append(index_query)
+            output.zero_()
+    
+        module.forward_mqa = check_forward_mqa
+        module._o_proj = lambda output, sp_rows=None: torch.zeros(
+            (4, 32), dtype=torch.bfloat16
+        )
+        slots = torch.arange(100, 110, dtype=torch.int64)
+        metadata = {"swa": SimpleNamespace(is_decode=is_decode, slot_mapping=slots)}
+        monkeypatch.setattr(
+            attention,
+            "get_forward_context",
+            lambda: SimpleNamespace(attn_metadata=metadata),
+        )
+        monkeypatch.setattr(sp_prefill, "current", lambda: _FakeSPRows())
+        positions = torch.arange(20, 30, dtype=torch.int64)
+        out = module._forward(positions, local_x)
+        assert out.shape == (4, 32)
+    
+        expected_events = [
+            ("fused_wqa_wkv", (4, 32)),
+            ("weights_proj", (4, 32)),
+        ]
+        if split_check or is_decode:
+            expected_events.append(("gather", (4, 4), torch.bfloat16))
+        if n_real > 0:
+            expected_events.append(
+                (
+                    "sp_attention_front",
+                    (n_real, 1792),
+                    list(range(24, 24 + n_real)),
+                    (n_real, 1280),
+                    (n_real, 40),
+                    (n_real, 528),
+                )
+            )
+        expected_events.extend(
+            [
+                ("gather_mxfp8", (4, 1280), (4, 528), torch.uint8),
+                ("write_swa_records", True, True, list(range(100, 110)), 64),
+                ("wq_b", True, True),
+            ]
+        )
+>       assert events == expected_events
+E       AssertionError: assert [('fused_wqa_..., True, True)] == [('fused_wqa_.....], 64), ...]
+E         
+E         At index 2 diff: ('sp_attention_front', (4, 1792), [24, 25, 26, 27], (4, 1280), (4, 40), (4, 528)) != ('gather', (4, 4), torch.bfloat16)
+E         Right contains one more item: ('wq_b', True, True)
+E         Use -v to get more diff
+
+tests/models/test_deepseek_v4_1_attention.py:2083: AssertionError
+_ test_sp_prefill_with_replicated_fused_wqa_wkv_gathers_mxfp8_and_swa_records[False-2-True] _
+
+monkeypatch = <_pytest.monkeypatch.MonkeyPatch object at 0xfc530e674e00>
+n_real = 2, split_check = False, is_decode = True
+
+    @pytest.mark.parametrize("is_decode", [False, True])
+    @pytest.mark.parametrize("n_real", [4, 2, 0])
+    @pytest.mark.parametrize("split_check", [False, True])
+    def test_sp_prefill_with_replicated_fused_wqa_wkv_gathers_mxfp8_and_swa_records(
+        monkeypatch, n_real, split_check, is_decode
+    ):
+        """When ``fused_wqa_wkv`` is replicated across TP, SP prefill without a compressor
+        runs ``sp_attention_front`` on ``qr_kv[:real_rows]``, gathers only ``local_q_cast``
+        and 528-byte SWA cache records via ``gather_mxfp8`` (1,848 B/row), scatters the
+        records via ``write_swa_records``, and keeps ``indexer.weights_proj`` rank-local
+        unless ``_INDEX_SPLIT_CHECK`` is active. A decode step of an SP forward (the
+        warm-up's eager tail shapes) scores every row, so it gathers the head weights of
+        every row: the index queries and their weights always have one row count."""
+        from vllm.models.deepseek_v4_1 import attention, kernels, sp_prefill
+        from vllm.models.deepseek_v4_1.tilelang import cache_writer, front
+        from vllm.models.deepseek_v4_1.tilelang.linear import MXFP8Rows, provided_mxfp8
+    
+        monkeypatch.setattr(attention, "_INDEX_SPLIT_CHECK", split_check)
+        module = _tilelang_layer(layer_id=5)
+        module._ready = True
+        module.q_lora_rank = 1280
+        module.n_local_heads = 2
+        module._l2pf_wo = None
+        module._l2pf_comp = None
+        swa_cache = torch.zeros((4, 64 * 528), dtype=torch.uint8)
+        module.swa_cache_layer = SimpleNamespace(
+            prefix="swa", kv_cache=swa_cache, block_size=64
+        )
+        module.q_norm = SimpleNamespace(
+            weight=torch.ones(1280, dtype=torch.bfloat16), variance_epsilon=1e-6
+        )
+        module.kv_norm = SimpleNamespace(
+            weight=torch.ones(512, dtype=torch.bfloat16), variance_epsilon=1e-6
+        )
+        module.rotary_emb = SimpleNamespace(
+            cos_sin_cache=torch.ones((32, 64), dtype=torch.float32)
+        )
+    
+        local_x = torch.ones((4, 32), dtype=torch.bfloat16)
+        local_weights = torch.arange(16, dtype=torch.bfloat16).reshape(4, 4)
+        gathered_weights = torch.arange(40, dtype=torch.bfloat16).reshape(10, 4)
+        gathered_q = MXFP8Rows(
+            rows=torch.empty((10, 1280), dtype=torch.bfloat16),
+            values=torch.full((64, 1280), 7, dtype=torch.float8_e4m3fn),
+            scales=torch.full((64, 40), 9, dtype=torch.uint8),
+        )
+        gathered_records = torch.full((10, 528), 11, dtype=torch.uint8)
+        events = []
+    
+        class _FakeSPRows:
+            num_tokens = 10
+            local_rows = 4
+            start = 4
+            real_rows = n_real
+    
+            def gather(self, x):
+                events.append(("gather", tuple(x.shape), x.dtype))
+                return gathered_weights
+    
+            def gather_mxfp8(self, x_q, *extra):
+                assert len(extra) == 1
+                rec = extra[0]
+                events.append(
+                    (
+                        "gather_mxfp8",
+                        tuple(x_q.rows.shape),
+                        tuple(rec.shape),
+                        rec.dtype,
+                    )
+                )
+                return (gathered_q, gathered_records)
+    
+        def rep_wqa_wkv(h):
+            events.append(("fused_wqa_wkv", tuple(h.shape)))
+            return torch.ones((4, 1280 + 512), dtype=torch.bfloat16), None
+    
+        rep_wqa_wkv.tp_size = 4
+        rep_wqa_wkv.replicated_sp_prefill = True
+        module.fused_wqa_wkv = rep_wqa_wkv
+    
+        def fake_sp_front(
+            qa_kv, q_w, kv_w, eps, pos, cos_sin, q_values, q_scales, records
+        ):
+            events.append(
+                (
+                    "sp_attention_front",
+                    tuple(qa_kv.shape),
+                     pos.tolist(),
+                    tuple(q_values.shape),
+                    tuple(q_scales.shape),
+                    tuple(records.shape),
+                )
+            )
+    
+        def fake_write_swa_records(records, cache, slots, *, page_size):
+            events.append(
+                (
+                    "write_swa_records",
+                    records is gathered_records,
+                    cache is swa_cache,
+                    slots.tolist(),
+                    page_size,
+                )
+            )
+    
+        monkeypatch.setattr(front, "sp_attention_front", fake_sp_front)
+        monkeypatch.setattr(cache_writer, "write_swa_records", fake_write_swa_records)
+        monkeypatch.setattr(
+            kernels,
+            "cast_mxfp8",
+            lambda rows: (_ for _ in ()).throw(
+                AssertionError("cast_mxfp8 should not run on gathered qr")
+            ),
+        )
+        module._cache_context_kv = lambda kv, pos: (_ for _ in ()).throw(
+            AssertionError("_cache_context_kv should not run when _sp_front wrote SWA records")
+        )
+        module.wq_b = lambda qr: (
+            events.append(("wq_b", qr is gathered_q.rows, provided_mxfp8(qr) is gathered_q)),
+            torch.ones((qr.shape[0], 2 * 512), dtype=torch.bfloat16),
+        )[1]
+        module._rope = lambda x, pos, role: x
+        module.indexer = SimpleNamespace(
+            heads=4,
+            wq_b=lambda qr: torch.ones((qr.shape[0], 4 * 128), dtype=torch.bfloat16),
+            weights_proj=lambda h: (
+                events.append(("weights_proj", tuple(h.shape))),
+                local_weights,
+            )[1],
+        )
+        module._quantize_index_query = lambda mode, iq, data, scale, positions=None: None
+        seen_index_query = []
+    
+        def check_forward_mqa(q, kv, pos, output, *, index_query=None):
+            assert kv is None
+            seen_index_query.append(index_query)
+            output.zero_()
+    
+        module.forward_mqa = check_forward_mqa
+        module._o_proj = lambda output, sp_rows=None: torch.zeros(
+            (4, 32), dtype=torch.bfloat16
+        )
+        slots = torch.arange(100, 110, dtype=torch.int64)
+        metadata = {"swa": SimpleNamespace(is_decode=is_decode, slot_mapping=slots)}
+        monkeypatch.setattr(
+            attention,
+            "get_forward_context",
+            lambda: SimpleNamespace(attn_metadata=metadata),
+        )
+        monkeypatch.setattr(sp_prefill, "current", lambda: _FakeSPRows())
+        positions = torch.arange(20, 30, dtype=torch.int64)
+        out = module._forward(positions, local_x)
+        assert out.shape == (4, 32)
+    
+        expected_events = [
+            ("fused_wqa_wkv", (4, 32)),
+            ("weights_proj", (4, 32)),
+        ]
+        if split_check or is_decode:
+            expected_events.append(("gather", (4, 4), torch.bfloat16))
+        if n_real > 0:
+            expected_events.append(
+                (
+                    "sp_attention_front",
+                    (n_real, 1792),
+                    list(range(24, 24 + n_real)),
+                    (n_real, 1280),
+                    (n_real, 40),
+                    (n_real, 528),
+                )
+            )
+        expected_events.extend(
+            [
+                ("gather_mxfp8", (4, 1280), (4, 528), torch.uint8),
+                ("write_swa_records", True, True, list(range(100, 110)), 64),
+                ("wq_b", True, True),
+            ]
+        )
+>       assert events == expected_events
+E       AssertionError: assert [('fused_wqa_..., True, True)] == [('fused_wqa_.....], 64), ...]
+E         
+E         At index 2 diff: ('sp_attention_front', (2, 1792), [24, 25], (2, 1280), (2, 40), (2, 528)) != ('gather', (4, 4), torch.bfloat16)
+E         Right contains one more item: ('wq_b', True, True)
+E         Use -v to get more diff
+
+tests/models/test_deepseek_v4_1_attention.py:2083: AssertionError
+_ test_sp_prefill_with_replicated_fused_wqa_wkv_gathers_mxfp8_and_swa_records[False-0-True] _
+
+monkeypatch = <_pytest.monkeypatch.MonkeyPatch object at 0xfc530e6755b0>
+n_real = 0, split_check = False, is_decode = True
+
+    @pytest.mark.parametrize("is_decode", [False, True])
+    @pytest.mark.parametrize("n_real", [4, 2, 0])
+    @pytest.mark.parametrize("split_check", [False, True])
+    def test_sp_prefill_with_replicated_fused_wqa_wkv_gathers_mxfp8_and_swa_records(
+        monkeypatch, n_real, split_check, is_decode
+    ):
+        """When ``fused_wqa_wkv`` is replicated across TP, SP prefill without a compressor
+        runs ``sp_attention_front`` on ``qr_kv[:real_rows]``, gathers only ``local_q_cast``
+        and 528-byte SWA cache records via ``gather_mxfp8`` (1,848 B/row), scatters the
+        records via ``write_swa_records``, and keeps ``indexer.weights_proj`` rank-local
+        unless ``_INDEX_SPLIT_CHECK`` is active. A decode step of an SP forward (the
+        warm-up's eager tail shapes) scores every row, so it gathers the head weights of
+        every row: the index queries and their weights always have one row count."""
+        from vllm.models.deepseek_v4_1 import attention, kernels, sp_prefill
+        from vllm.models.deepseek_v4_1.tilelang import cache_writer, front
+        from vllm.models.deepseek_v4_1.tilelang.linear import MXFP8Rows, provided_mxfp8
+    
+        monkeypatch.setattr(attention, "_INDEX_SPLIT_CHECK", split_check)
+        module = _tilelang_layer(layer_id=5)
+        module._ready = True
+        module.q_lora_rank = 1280
+        module.n_local_heads = 2
+        module._l2pf_wo = None
+        module._l2pf_comp = None
+        swa_cache = torch.zeros((4, 64 * 528), dtype=torch.uint8)
+        module.swa_cache_layer = SimpleNamespace(
+            prefix="swa", kv_cache=swa_cache, block_size=64
+        )
+        module.q_norm = SimpleNamespace(
+            weight=torch.ones(1280, dtype=torch.bfloat16), variance_epsilon=1e-6
+        )
+        module.kv_norm = SimpleNamespace(
+            weight=torch.ones(512, dtype=torch.bfloat16), variance_epsilon=1e-6
+        )
+        module.rotary_emb = SimpleNamespace(
+            cos_sin_cache=torch.ones((32, 64), dtype=torch.float32)
+        )
+    
+        local_x = torch.ones((4, 32), dtype=torch.bfloat16)
+        local_weights = torch.arange(16, dtype=torch.bfloat16).reshape(4, 4)
+        gathered_weights = torch.arange(40, dtype=torch.bfloat16).reshape(10, 4)
+        gathered_q = MXFP8Rows(
+            rows=torch.empty((10, 1280), dtype=torch.bfloat16),
+            values=torch.full((64, 1280), 7, dtype=torch.float8_e4m3fn),
+            scales=torch.full((64, 40), 9, dtype=torch.uint8),
+        )
+        gathered_records = torch.full((10, 528), 11, dtype=torch.uint8)
+        events = []
+    
+        class _FakeSPRows:
+            num_tokens = 10
+            local_rows = 4
+            start = 4
+            real_rows = n_real
+    
+            def gather(self, x):
+                events.append(("gather", tuple(x.shape), x.dtype))
+                return gathered_weights
+    
+            def gather_mxfp8(self, x_q, *extra):
+                assert len(extra) == 1
+                rec = extra[0]
+                events.append(
+                    (
+                        "gather_mxfp8",
+                        tuple(x_q.rows.shape),
+                        tuple(rec.shape),
+                        rec.dtype,
+                    )
+                )
+                return (gathered_q, gathered_records)
+    
+        def rep_wqa_wkv(h):
+            events.append(("fused_wqa_wkv", tuple(h.shape)))
+            return torch.ones((4, 1280 + 512), dtype=torch.bfloat16), None
+    
+        rep_wqa_wkv.tp_size = 4
+        rep_wqa_wkv.replicated_sp_prefill = True
+        module.fused_wqa_wkv = rep_wqa_wkv
+    
+        def fake_sp_front(
+            qa_kv, q_w, kv_w, eps, pos, cos_sin, q_values, q_scales, records
+        ):
+            events.append(
+                (
+                    "sp_attention_front",
+                    tuple(qa_kv.shape),
+                     pos.tolist(),
+                    tuple(q_values.shape),
+                    tuple(q_scales.shape),
+                    tuple(records.shape),
+                )
+            )
+    
+        def fake_write_swa_records(records, cache, slots, *, page_size):
+            events.append(
+                (
+                    "write_swa_records",
+                    records is gathered_records,
+                    cache is swa_cache,
+                    slots.tolist(),
+                    page_size,
+                )
+            )
+    
+        monkeypatch.setattr(front, "sp_attention_front", fake_sp_front)
+        monkeypatch.setattr(cache_writer, "write_swa_records", fake_write_swa_records)
+        monkeypatch.setattr(
+            kernels,
+            "cast_mxfp8",
+            lambda rows: (_ for _ in ()).throw(
+                AssertionError("cast_mxfp8 should not run on gathered qr")
+            ),
+        )
+        module._cache_context_kv = lambda kv, pos: (_ for _ in ()).throw(
+            AssertionError("_cache_context_kv should not run when _sp_front wrote SWA records")
+        )
+        module.wq_b = lambda qr: (
+            events.append(("wq_b", qr is gathered_q.rows, provided_mxfp8(qr) is gathered_q)),
+            torch.ones((qr.shape[0], 2 * 512), dtype=torch.bfloat16),
+        )[1]
+        module._rope = lambda x, pos, role: x
+        module.indexer = SimpleNamespace(
+            heads=4,
+            wq_b=lambda qr: torch.ones((qr.shape[0], 4 * 128), dtype=torch.bfloat16),
+            weights_proj=lambda h: (
+                events.append(("weights_proj", tuple(h.shape))),
+                local_weights,
+            )[1],
+        )
+        module._quantize_index_query = lambda mode, iq, data, scale, positions=None: None
+        seen_index_query = []
+    
+        def check_forward_mqa(q, kv, pos, output, *, index_query=None):
+            assert kv is None
+            seen_index_query.append(index_query)
+            output.zero_()
+    
+        module.forward_mqa = check_forward_mqa
+        module._o_proj = lambda output, sp_rows=None: torch.zeros(
+            (4, 32), dtype=torch.bfloat16
+        )
+        slots = torch.arange(100, 110, dtype=torch.int64)
+        metadata = {"swa": SimpleNamespace(is_decode=is_decode, slot_mapping=slots)}
+        monkeypatch.setattr(
+            attention,
+            "get_forward_context",
+            lambda: SimpleNamespace(attn_metadata=metadata),
+        )
+        monkeypatch.setattr(sp_prefill, "current", lambda: _FakeSPRows())
+        positions = torch.arange(20, 30, dtype=torch.int64)
+        out = module._forward(positions, local_x)
+        assert out.shape == (4, 32)
+    
+        expected_events = [
+            ("fused_wqa_wkv", (4, 32)),
+            ("weights_proj", (4, 32)),
+        ]
+        if split_check or is_decode:
+            expected_events.append(("gather", (4, 4), torch.bfloat16))
+        if n_real > 0:
+            expected_events.append(
+                (
+                    "sp_attention_front",
+                    (n_real, 1792),
+                    list(range(24, 24 + n_real)),
+                    (n_real, 1280),
+                    (n_real, 40),
+                    (n_real, 528),
+                )
+            )
+        expected_events.extend(
+            [
+                ("gather_mxfp8", (4, 1280), (4, 528), torch.uint8),
+                ("write_swa_records", True, True, list(range(100, 110)), 64),
+                ("wq_b", True, True),
+            ]
+        )
+>       assert events == expected_events
+E       AssertionError: assert [('fused_wqa_..., True, True)] == [('fused_wqa_..., True, True)]
+E         
+E         At index 2 diff: ('gather_mxfp8', (4, 1280), (4, 528), torch.uint8) != ('gather', (4, 4), torch.bfloat16)
+E         Right contains one more item: ('wq_b', True, True)
+E         Use -v to get more diff
+
+tests/models/test_deepseek_v4_1_attention.py:2083: AssertionError
+=============================== warnings summary ===============================
+tests/models/test_deepseek_v4_1_attention.py: 14 warnings
+  /usr/local/lib/python3.12/dist-packages/torch/jit/_script.py:365: DeprecationWarning: `torch.jit.script_method` is deprecated. Please switch to `torch.compile` or `torch.export`.
+    warnings.warn(
+
+-- Docs: https://docs.pytest.org/en/stable/how-to/capture-warnings.html
+=========================== short test summary info ============================
+FAILED tests/models/test_deepseek_v4_1_attention.py::test_sp_prefill_with_replicated_fused_wqa_wkv_gathers_mxfp8_and_swa_records[False-4-True]
+FAILED tests/models/test_deepseek_v4_1_attention.py::test_sp_prefill_with_replicated_fused_wqa_wkv_gathers_mxfp8_and_swa_records[False-2-True]
+FAILED tests/models/test_deepseek_v4_1_attention.py::test_sp_prefill_with_replicated_fused_wqa_wkv_gathers_mxfp8_and_swa_records[False-0-True]
+=========== 3 failed, 9 passed, 66 deselected, 14 warnings in 8.90s ============
