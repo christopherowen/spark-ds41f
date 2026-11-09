@@ -1,0 +1,96 @@
+# Commands run on sp8 (spark-0016) for the PR #1010 rework, round 2, in issue order.
+# Working directory: /home/chris/spark-lab/agents/candidate-48-rework-1010-r2 (new; round 1's tree was read and copied, not modified).
+# No image was built; no patch was produced; nothing was committed or pushed.
+# Every container run was CPU-only (no --gpus) and still ran under flock /tmp/spark-lab-gpu.lock.
+# ~/spark-hold.json was checked (test -s) before every run and was absent each time.
+# Inputs (sha256):
+#   src/probe/probe_prefix_cache_retention.py   4c69d0be26cf2ad60844a41cfb3ee08eacfa65a5493a02eef5a2e1047d6ce349 (PR head probe, unchanged)
+#   r1final/vllm/v1/core/kv_cache_coordinator.py          acc3fc0f8fe2d1debab7a1448c2615d341d6d7c6f4f7975f10c6ef89840f76b4 (round-1 0763, copied from round 1's final/)
+#   r1final/vllm/v1/core/single_type_kv_cache_manager.py  ff6fecb89e9d4d6c040d1ab37c246c758c5dd63d4e0cf51b22ba34cb5aadc668 (round-1 0763)
+#   src/tree-pre0763/vllm/v1/core/{kv_cache_coordinator,single_type_kv_cache_manager,sched/scheduler,sched/async_scheduler}.py
+#     = round 1's pre-0763 reconstruction (candidate-48 image files with 0766's hunks and 0763 reverse-applied);
+#     sha256 a7220ee2..., 48656e18..., fbcfc411..., add7c380... Its stress and LRU results equal 1107's receipts exactly
+#     (1,124,352 / 1,122,816; inversions 6/6/6/8). It is a diagnostic tree on the candidate-48 image, not the 1107 image.
+#   diag/oracle_bound.py (final revision C)     b3b03531d2f2701797f7b39f4746718b1beaba94a96de5240a3be269de62ebe2
+# Image: sha256:d6ffd842978849651e756ebd39e9bf2da7ddb03e746113013533029878485a24 (spark-ds41f:candidate-48), entrypoint python3, workdir /opt/spark-ds41f/candidate/vllm.
+# Mounts common to every run: -v /home/chris/spark-lab/agents/candidate-48-rework-1010-r2/src/probe:/probe:ro -v /home/chris/spark-lab/agents/candidate-48-rework-1010-r2/diag:/diag:ro -v /home/chris/spark-lab/agents/candidate-48-rework-1010-r2/out:/out
+# "R1 mounts":  -v /home/chris/spark-lab/agents/candidate-48-rework-1010-r2/r1final/vllm/v1/core/kv_cache_coordinator.py:/opt/spark-ds41f/candidate/vllm/vllm/v1/core/kv_cache_coordinator.py:ro
+#               -v /home/chris/spark-lab/agents/candidate-48-rework-1010-r2/r1final/vllm/v1/core/single_type_kv_cache_manager.py:/opt/spark-ds41f/candidate/vllm/vllm/v1/core/single_type_kv_cache_manager.py:ro
+
+### smoke (screening, harness revision A), issued ~2026-11-09T07:37Z; stdout not saved to a file, JSON saved
+command: timeout 1500 flock /tmp/spark-lab-gpu.lock docker run --rm --name c48rw2-1010-smoke --entrypoint python3 -w /opt/spark-ds41f/candidate/vllm <R1 mounts> -v /home/chris/spark-lab/agents/candidate-48-rework-1010-r2/src/probe:/probe:ro -v /home/chris/spark-lab/agents/candidate-48-rework-1010-r2/diag:/diag:ro -v /home/chris/spark-lab/agents/candidate-48-rework-1010-r2/out:/out sha256:d6ffd842978849651e756ebd39e9bf2da7ddb03e746113013533029878485a24 /diag/oracle_bound.py --boot 0 --output /out/smoke.json
+exit_code: 0
+output: out/smoke.json
+error recorded: revision A classified a block as "aged" when the finished request did not hold it at free. That wrongly
+  counted each turn's endpoint SWA checkpoint (it slides out of the window before free) as aged, so floor1 evicted the
+  next turn's endpoint: floor1 tp3 1,110,528 (98.4504%), tp4 1,026,560 (91.0064%), with 47 / 346 cached blocks then
+  evicted by normal allocation. Revision B classifies against the blocks the real lookup returns for the next prompt
+  (the live hit path). In revision A, oracle0 and mono_lru moved a redundant copy (a second cached block with the same
+  hash) ahead only within its own token position; revision B moves every redundant copy to the front of its
+  conversation's order, since evicting one costs nothing and the LRU scenario never contains one. Revision A numbers:
+  oracle0 tp3 1,121,280, tp4 1,115,904; mono_lru tp3 1,120,512, tp4 1,112,832. Revision B/C: oracle0 1,121,536 /
+  1,120,512; mono_lru 1,121,024 / 1,116,416 (equal to candidate-48's receipts). actual is the same in A, B and C.
+
+### smoke2 (screening, harness revision B), issued ~2026-11-09T07:40Z; stdout not saved to a file, JSON saved
+command: same as smoke with --name c48rw2-1010-smoke2 and --output /out/smoke2.json
+exit_code: 0
+output: out/smoke2.json (every number it shares with revision C is equal)
+
+### diag-pre0763-oracle (diagnostic, harness revision B)
+host: spark-0016 (sp8)
+image: sha256:d6ffd842978849651e756ebd39e9bf2da7ddb03e746113013533029878485a24 (spark-ds41f:candidate-48)
+start_utc: 2026-11-09T07:41:34Z
+loadavg_before: 1.76 1.95 2.19
+docker_ps_before: spark-ds41f:1107 ecstatic_ardinghelli;
+hold_file: 
+command: timeout 1500 flock /tmp/spark-lab-gpu.lock docker run --rm --name c48rw2-1010-pre0763 --entrypoint python3 -w /opt/spark-ds41f/candidate/vllm -v /home/chris/spark-lab/agents/candidate-48-rework-1010-r2/src/tree-pre0763/vllm/v1/core/kv_cache_coordinator.py:/opt/spark-ds41f/candidate/vllm/vllm/v1/core/kv_cache_coordinator.py:ro -v /home/chris/spark-lab/agents/candidate-48-rework-1010-r2/src/tree-pre0763/vllm/v1/core/single_type_kv_cache_manager.py:/opt/spark-ds41f/candidate/vllm/vllm/v1/core/single_type_kv_cache_manager.py:ro -v /home/chris/spark-lab/agents/candidate-48-rework-1010-r2/src/tree-pre0763/vllm/v1/core/sched/scheduler.py:/opt/spark-ds41f/candidate/vllm/vllm/v1/core/sched/scheduler.py:ro -v /home/chris/spark-lab/agents/candidate-48-rework-1010-r2/src/tree-pre0763/vllm/v1/core/sched/async_scheduler.py:/opt/spark-ds41f/candidate/vllm/vllm/v1/core/sched/async_scheduler.py:ro -v /home/chris/spark-lab/agents/candidate-48-rework-1010-r2/src/probe:/probe:ro -v /home/chris/spark-lab/agents/candidate-48-rework-1010-r2/diag:/diag:ro -v /home/chris/spark-lab/agents/candidate-48-rework-1010-r2/out:/out sha256:d6ffd842978849651e756ebd39e9bf2da7ddb03e746113013533029878485a24 /diag/oracle_bound.py --boot 0 --set pre0763 --output /out/diag-pre0763-oracle.json
+end_utc: 2026-11-09T07:41:43Z
+loadavg_after: 1.86 1.96 2.20
+exit_code: 0
+output: diag-pre0763-oracle.txt
+
+### oracle-r1code-boot1 (container run 1 of 2, harness revision C)
+host: spark-0016 (sp8)
+image: sha256:d6ffd842978849651e756ebd39e9bf2da7ddb03e746113013533029878485a24 (spark-ds41f:candidate-48)
+start_utc: 2026-11-09T07:42:31Z
+loadavg_before: 3.52 2.44 2.35
+docker_ps_before: spark-ds41f:1107 ecstatic_ardinghelli;
+hold_file: 
+command: timeout 1500 flock /tmp/spark-lab-gpu.lock docker run --rm --name c48rw2-1010-oracle-b1 --entrypoint python3 -w /opt/spark-ds41f/candidate/vllm -v /home/chris/spark-lab/agents/candidate-48-rework-1010-r2/r1final/vllm/v1/core/kv_cache_coordinator.py:/opt/spark-ds41f/candidate/vllm/vllm/v1/core/kv_cache_coordinator.py:ro -v /home/chris/spark-lab/agents/candidate-48-rework-1010-r2/r1final/vllm/v1/core/single_type_kv_cache_manager.py:/opt/spark-ds41f/candidate/vllm/vllm/v1/core/single_type_kv_cache_manager.py:ro -v /home/chris/spark-lab/agents/candidate-48-rework-1010-r2/src/probe:/probe:ro -v /home/chris/spark-lab/agents/candidate-48-rework-1010-r2/diag:/diag:ro -v /home/chris/spark-lab/agents/candidate-48-rework-1010-r2/out:/out sha256:d6ffd842978849651e756ebd39e9bf2da7ddb03e746113013533029878485a24 /diag/oracle_bound.py --boot 1 --output /out/oracle-r1code-boot1.json
+end_utc: 2026-11-09T07:42:44Z
+loadavg_after: 3.86 2.56 2.39
+exit_code: 0
+output: oracle-r1code-boot1.txt
+
+### oracle-r1code-boot2 (container run 2 of 2, harness revision C)
+host: spark-0016 (sp8)
+image: sha256:d6ffd842978849651e756ebd39e9bf2da7ddb03e746113013533029878485a24 (spark-ds41f:candidate-48)
+start_utc: 2026-11-09T07:42:44Z
+loadavg_before: 3.86 2.56 2.39
+docker_ps_before: spark-ds41f:1107 ecstatic_ardinghelli;
+hold_file: 
+command: timeout 1500 flock /tmp/spark-lab-gpu.lock docker run --rm --name c48rw2-1010-oracle-b2 --entrypoint python3 -w /opt/spark-ds41f/candidate/vllm -v /home/chris/spark-lab/agents/candidate-48-rework-1010-r2/r1final/vllm/v1/core/kv_cache_coordinator.py:/opt/spark-ds41f/candidate/vllm/vllm/v1/core/kv_cache_coordinator.py:ro -v /home/chris/spark-lab/agents/candidate-48-rework-1010-r2/r1final/vllm/v1/core/single_type_kv_cache_manager.py:/opt/spark-ds41f/candidate/vllm/vllm/v1/core/single_type_kv_cache_manager.py:ro -v /home/chris/spark-lab/agents/candidate-48-rework-1010-r2/src/probe:/probe:ro -v /home/chris/spark-lab/agents/candidate-48-rework-1010-r2/diag:/diag:ro -v /home/chris/spark-lab/agents/candidate-48-rework-1010-r2/out:/out sha256:d6ffd842978849651e756ebd39e9bf2da7ddb03e746113013533029878485a24 /diag/oracle_bound.py --boot 2 --output /out/oracle-r1code-boot2.json
+end_utc: 2026-11-09T07:42:57Z
+loadavg_after: 3.80 2.60 2.40
+exit_code: 0
+output: oracle-r1code-boot2.txt
+
+### diag-pre0763-oracle-final (diagnostic, harness revision C)
+host: spark-0016 (sp8)
+image: sha256:d6ffd842978849651e756ebd39e9bf2da7ddb03e746113013533029878485a24 (spark-ds41f:candidate-48)
+start_utc: 2026-11-09T07:42:57Z
+loadavg_before: 3.80 2.60 2.40
+docker_ps_before: spark-ds41f:1107 ecstatic_ardinghelli;
+hold_file: 
+command: timeout 1500 flock /tmp/spark-lab-gpu.lock docker run --rm --name c48rw2-1010-pre0763-f --entrypoint python3 -w /opt/spark-ds41f/candidate/vllm -v /home/chris/spark-lab/agents/candidate-48-rework-1010-r2/src/tree-pre0763/vllm/v1/core/kv_cache_coordinator.py:/opt/spark-ds41f/candidate/vllm/vllm/v1/core/kv_cache_coordinator.py:ro -v /home/chris/spark-lab/agents/candidate-48-rework-1010-r2/src/tree-pre0763/vllm/v1/core/single_type_kv_cache_manager.py:/opt/spark-ds41f/candidate/vllm/vllm/v1/core/single_type_kv_cache_manager.py:ro -v /home/chris/spark-lab/agents/candidate-48-rework-1010-r2/src/tree-pre0763/vllm/v1/core/sched/scheduler.py:/opt/spark-ds41f/candidate/vllm/vllm/v1/core/sched/scheduler.py:ro -v /home/chris/spark-lab/agents/candidate-48-rework-1010-r2/src/tree-pre0763/vllm/v1/core/sched/async_scheduler.py:/opt/spark-ds41f/candidate/vllm/vllm/v1/core/sched/async_scheduler.py:ro -v /home/chris/spark-lab/agents/candidate-48-rework-1010-r2/src/probe:/probe:ro -v /home/chris/spark-lab/agents/candidate-48-rework-1010-r2/diag:/diag:ro -v /home/chris/spark-lab/agents/candidate-48-rework-1010-r2/out:/out sha256:d6ffd842978849651e756ebd39e9bf2da7ddb03e746113013533029878485a24 /diag/oracle_bound.py --boot 0 --set pre0763 --output /out/diag-pre0763-oracle-final.json
+end_utc: 2026-11-09T07:44:10Z
+loadavg_after: 3.31 2.72 2.46
+exit_code: 0
+output: diag-pre0763-oracle-final.txt
+
+# Notes
+# - docker_ps_before shows another agent's spark-ds41f:1107 container (ecstatic_ardinghelli) on sp8 during these runs;
+#   my runs used no GPU and queued on the shared lock.
+# - The two container runs' JSONs differ only in boot, timestamp_utc, elapsed_s and the container hostname; the text
+#   outputs differ only in the INFO-line timestamps.
+# - start_utc includes any wait on /tmp/spark-lab-gpu.lock.

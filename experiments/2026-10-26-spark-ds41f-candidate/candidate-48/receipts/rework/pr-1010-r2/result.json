@@ -1,0 +1,1910 @@
+{
+  "pr": 1010,
+  "round": 2,
+  "pr_head": "ad613458e55962d309c3a53fec15c02413e849d5",
+  "host": "sp8 (spark-0016, NVIDIA GB10); every container run CPU-only, under flock /tmp/spark-lab-gpu.lock, no hold file",
+  "image": "sha256:d6ffd842978849651e756ebd39e9bf2da7ddb03e746113013533029878485a24 (spark-ds41f:candidate-48), round-1 core files bind-mounted read-only; no build",
+  "mark": "0 LRU inversions (retention 0/512/8192/None), stress-probe hit share >= 1107 on tp3 (retention 512) and tp4 (retention 8192), boundary matrix 1404/1404, spec-decode 60/60, the PR's 23-file test list passing; both settings, two boots",
+  "verdict": "no-defensible-correction",
+  "reason": "No design meets the whole mark, and the inversion definition is not wrong, so I did not change it. (1) The definition measures the PR's stated purpose. The PR's test says 'partial eviction from the BlockPool always evicts the newest tail blocks first and preserves the root prefix blocks'. Its README places 'root checkpoints (512, 8,192) at the MRU tail (evicted last)'. Its LRU scenario is built to catch turn 1's skipped SWA checkpoints, which are blocks outside the finished request's run. Counting only within the run would drop that stated target: round 1 then scores 0. Counting per KV group still gives round 1 6, all of them in the SWA group. The check also guards a real property. With round 1's order, the extension hit stays at 25,088 while the 52 aged checkpoints are evicted; on the 53rd eviction it falls to 0, with every MLA block still cached. Under the monotone order it falls in steps of 256 or 512 tokens, one step every 3 to 5 evicted blocks. (2) Bound. With 0 inversions, each conversation's cached blocks leave the free queue in non-increasing position order, MLA before SWA at a tie. Then the first cached block in the queue is some conversation's top, and that block is on the conversation's next hit path. Each block the stress eviction takes is therefore either one of the at most 3 non-redundant cached blocks at a lost 256-token position of a live conversation, or a redundant copy. A redundant copy exists only for a position that was lost earlier and re-prefilled, and a lost position yields at most 3 of these, counting its own evicted blocks. The three evictions take 54 cached blocks, so at least 18 positions (4,608 tokens) are lost, and the hit is at most 1,121,792 (99.4489%). 1107 is 2,048 tokens below the ceiling on tp3 and 3,584 on tp4, which is 8 and 14 positions. Measured: at most 3 blocks per position at every eviction. The best 0-inversion order the harness found, choosing each eviction's split between the two conversations by the real lookup: tp3 1,121,536 (99.4262%, -2,816 vs 1107), tp4 1,120,512 (99.3355%, -2,304). With dense SWA retention it reaches 1,121,792, the bound itself. (3) The step from the LRU scenario to the stress probe assumes the queue rule is the same for both. The LRU scenario runs retention 512 and 8192 through the same cache_blocks, remove_skipped_blocks and free paths as the stress profiles. Their only differences are the number of conversations, chunked prefill and the pool size. A rule keyed to those would game the probe; it would not fix the code. (4) The fewest inversions compatible with the stress clause is 1: aged checkpoints must precede some live top. The floor1 ordering reaches 1/1/1/1 at the ceiling, 99.8574% on both profiles; round 1 has 6. The two existing corrections each miss exactly one clause. The original 0763 (candidate-48) meets 0 inversions but its stress share is -3,328 / -6,400 tokens below 1107. Round 1 is at the ceiling but has 6 inversions. At 36 blocks per eviction, the count the PR's own test comment names, round 1 collapses on tp4 to 93.19% (agent 0's turn 4 hits 0), as does the 1107 reconstruction (92.89%); the best 0-inversion order keeps 98.65%. Choosing between protecting the extension and degrading gracefully is a decision about the mark, not a code fix. Round 2 delivers no patch.",
+  "patch": null,
+  "patch_note": "none delivered. Round 1's patch (rework/pr-1010-r1/0763-...patch, sha256 446274bc66b5e38575e0e99f7f47dc9bedec76409df7750ae8d90e6466765568) remains the best correction for the stress clause; the original 0763 in candidate-48 is the one that meets the inversion clause. No code change I could make moves either past the bound.",
+  "reference_not_remeasured": {
+    "1107": {
+      "source": "own-marks/pr-1010/result.json (not re-measured)",
+      "boundary_matrix": "699/1404 ext, 855/1404 retry, 225/567 slid",
+      "spec_decode": "45/60",
+      "lru_inversions": {
+        "0": 6,
+        "512": 6,
+        "8192": 6,
+        "None": 8
+      },
+      "stress_tp3": {
+        "hit_tokens": 1124352,
+        "share_pct": 99.6759
+      },
+      "stress_tp4": {
+        "hit_tokens": 1122816,
+        "share_pct": 99.5397
+      }
+    },
+    "ceiling": {
+      "hit_tokens": 1126400,
+      "share_pct": 99.8574,
+      "meaning": "every turn hits its last 256-token boundary; 1107 is 8 positions (2,048 tokens) below it on tp3 and 14 positions (3,584 tokens) on tp4"
+    }
+  },
+  "clauses_by_design": {
+    "original_0763 (candidate-48 as built: per-conversation tail-to-root, 0 inversions)": {
+      "source": "own-marks/pr-1010/result.json, two boots on sp8 (not re-measured)",
+      "boundary_matrix": "1404/1404 ext, 1404/1404 retry, 567/567 slid (pass)",
+      "spec_decode": "60/60 (pass)",
+      "lru_inversions": {
+        "0": 0,
+        "512": 0,
+        "8192": 0,
+        "None": 0
+      },
+      "lru_inversions_verdict": "pass",
+      "test_list": "2679 passed x2 (pass)",
+      "stress_tp3": {
+        "hit_tokens": 1121024,
+        "share_pct": 99.3809,
+        "vs_1107": -3328,
+        "verdict": "miss"
+      },
+      "stress_tp4": {
+        "hit_tokens": 1116416,
+        "share_pct": 98.9723,
+        "vs_1107": -6400,
+        "verdict": "miss"
+      },
+      "harness_cross_check": "this round's mono_lru ordering reproduces both stress numbers exactly on both container runs"
+    },
+    "round_1 (r1 patch sha256 446274bc...: aged SWA checkpoints keep LRU age)": {
+      "source": "rework/pr-1010-r1 (two boots); stress and inversions re-observed here as harness variant 'actual' on both container runs",
+      "boundary_matrix": "1404/1404 ext, 1404/1404 retry, 567/567 slid (pass)",
+      "spec_decode": "60/60 (pass)",
+      "lru_inversions": {
+        "0": 6,
+        "512": 6,
+        "8192": 6,
+        "None": 6
+      },
+      "lru_inversions_verdict": "miss",
+      "test_list": "2679 passed x2 (pass, with the PR's two eviction tests rewritten to the round-1 policy)",
+      "stress_tp3": {
+        "boot1": {
+          "hit_tokens": 1126400,
+          "share_pct": 99.8574,
+          "lost_256_positions": 0,
+          "evicted_turn_hits_turn_agent_hit_aligned": [
+            [
+              4,
+              0,
+              75264,
+              75264
+            ],
+            [
+              4,
+              1,
+              75264,
+              75264
+            ],
+            [
+              6,
+              0,
+              85504,
+              85504
+            ],
+            [
+              6,
+              1,
+              85504,
+              85504
+            ],
+            [
+              8,
+              0,
+              95488,
+              95488
+            ],
+            [
+              8,
+              1,
+              95488,
+              95488
+            ]
+          ],
+          "stray_cached_evictions_by_normal_allocation": 0
+        },
+        "boot2": {
+          "hit_tokens": 1126400,
+          "share_pct": 99.8574,
+          "lost_256_positions": 0,
+          "evicted_turn_hits_turn_agent_hit_aligned": [
+            [
+              4,
+              0,
+              75264,
+              75264
+            ],
+            [
+              4,
+              1,
+              75264,
+              75264
+            ],
+            [
+              6,
+              0,
+              85504,
+              85504
+            ],
+            [
+              6,
+              1,
+              85504,
+              85504
+            ],
+            [
+              8,
+              0,
+              95488,
+              95488
+            ],
+            [
+              8,
+              1,
+              95488,
+              95488
+            ]
+          ],
+          "stray_cached_evictions_by_normal_allocation": 0
+        },
+        "boots_identical": true,
+        "vs_1107": 2048,
+        "verdict": "pass"
+      },
+      "stress_tp4": {
+        "boot1": {
+          "hit_tokens": 1126400,
+          "share_pct": 99.8574,
+          "lost_256_positions": 0,
+          "evicted_turn_hits_turn_agent_hit_aligned": [
+            [
+              4,
+              0,
+              75264,
+              75264
+            ],
+            [
+              4,
+              1,
+              75264,
+              75264
+            ],
+            [
+              6,
+              0,
+              85504,
+              85504
+            ],
+            [
+              6,
+              1,
+              85504,
+              85504
+            ],
+            [
+              8,
+              0,
+              95488,
+              95488
+            ],
+            [
+              8,
+              1,
+              95488,
+              95488
+            ]
+          ],
+          "stray_cached_evictions_by_normal_allocation": 0
+        },
+        "boot2": {
+          "hit_tokens": 1126400,
+          "share_pct": 99.8574,
+          "lost_256_positions": 0,
+          "evicted_turn_hits_turn_agent_hit_aligned": [
+            [
+              4,
+              0,
+              75264,
+              75264
+            ],
+            [
+              4,
+              1,
+              75264,
+              75264
+            ],
+            [
+              6,
+              0,
+              85504,
+              85504
+            ],
+            [
+              6,
+              1,
+              85504,
+              85504
+            ],
+            [
+              8,
+              0,
+              95488,
+              95488
+            ],
+            [
+              8,
+              1,
+              95488,
+              95488
+            ]
+          ],
+          "stray_cached_evictions_by_normal_allocation": 0
+        },
+        "boots_identical": true,
+        "vs_1107": 3584,
+        "verdict": "pass"
+      }
+    },
+    "floor1 (harness ordering: aged checkpoints first, each conversation's aged blocks in descending position, then the live hit paths)": {
+      "what": "the fewest probe inversions any ordering can have while evicting no live block; an ordering applied by the harness at each eviction, not an implementation",
+      "lru_inversions": {
+        "0": 1,
+        "512": 1,
+        "8192": 1,
+        "None": 1
+      },
+      "lru_inversions_verdict": "miss (1 is the floor: see reason)",
+      "stress_tp3": {
+        "boot1": {
+          "hit_tokens": 1126400,
+          "share_pct": 99.8574,
+          "lost_256_positions": 0,
+          "evicted_turn_hits_turn_agent_hit_aligned": [
+            [
+              4,
+              0,
+              75264,
+              75264
+            ],
+            [
+              4,
+              1,
+              75264,
+              75264
+            ],
+            [
+              6,
+              0,
+              85504,
+              85504
+            ],
+            [
+              6,
+              1,
+              85504,
+              85504
+            ],
+            [
+              8,
+              0,
+              95488,
+              95488
+            ],
+            [
+              8,
+              1,
+              95488,
+              95488
+            ]
+          ],
+          "stray_cached_evictions_by_normal_allocation": 0
+        },
+        "boot2": {
+          "hit_tokens": 1126400,
+          "share_pct": 99.8574,
+          "lost_256_positions": 0,
+          "evicted_turn_hits_turn_agent_hit_aligned": [
+            [
+              4,
+              0,
+              75264,
+              75264
+            ],
+            [
+              4,
+              1,
+              75264,
+              75264
+            ],
+            [
+              6,
+              0,
+              85504,
+              85504
+            ],
+            [
+              6,
+              1,
+              85504,
+              85504
+            ],
+            [
+              8,
+              0,
+              95488,
+              95488
+            ],
+            [
+              8,
+              1,
+              95488,
+              95488
+            ]
+          ],
+          "stray_cached_evictions_by_normal_allocation": 0
+        },
+        "boots_identical": true,
+        "vs_1107": 2048,
+        "verdict": "pass"
+      },
+      "stress_tp4": {
+        "boot1": {
+          "hit_tokens": 1126400,
+          "share_pct": 99.8574,
+          "lost_256_positions": 0,
+          "evicted_turn_hits_turn_agent_hit_aligned": [
+            [
+              4,
+              0,
+              75264,
+              75264
+            ],
+            [
+              4,
+              1,
+              75264,
+              75264
+            ],
+            [
+              6,
+              0,
+              85504,
+              85504
+            ],
+            [
+              6,
+              1,
+              85504,
+              85504
+            ],
+            [
+              8,
+              0,
+              95488,
+              95488
+            ],
+            [
+              8,
+              1,
+              95488,
+              95488
+            ]
+          ],
+          "stray_cached_evictions_by_normal_allocation": 0
+        },
+        "boot2": {
+          "hit_tokens": 1126400,
+          "share_pct": 99.8574,
+          "lost_256_positions": 0,
+          "evicted_turn_hits_turn_agent_hit_aligned": [
+            [
+              4,
+              0,
+              75264,
+              75264
+            ],
+            [
+              4,
+              1,
+              75264,
+              75264
+            ],
+            [
+              6,
+              0,
+              85504,
+              85504
+            ],
+            [
+              6,
+              1,
+              85504,
+              85504
+            ],
+            [
+              8,
+              0,
+              95488,
+              95488
+            ],
+            [
+              8,
+              1,
+              95488,
+              95488
+            ]
+          ],
+          "stray_cached_evictions_by_normal_allocation": 0
+        },
+        "boots_identical": true,
+        "vs_1107": 3584,
+        "verdict": "pass"
+      },
+      "boundary_matrix_spec_decode_test_list": "not applicable (ordering simulation, no code)"
+    },
+    "oracle0 (harness: best eviction set any 0-inversion ordering can produce)": {
+      "what": "per conversation the evicted blocks are a prefix of its (end desc, MLA before SWA) order, redundant copies free; the split between the two conversations is chosen per eviction by the real lookup to minimise the next turns' loss",
+      "lru_inversions": {
+        "0": 0,
+        "512": 0,
+        "8192": 0,
+        "None": 0
+      },
+      "lru_inversions_verdict": "pass (by construction; harness 'monotone' order counts 0 on both runs)",
+      "stress_tp3": {
+        "boot1": {
+          "hit_tokens": 1121536,
+          "share_pct": 99.4262,
+          "lost_256_positions": 19,
+          "evicted_turn_hits_turn_agent_hit_aligned": [
+            [
+              4,
+              0,
+              75008,
+              75264
+            ],
+            [
+              4,
+              1,
+              73728,
+              75264
+            ],
+            [
+              6,
+              0,
+              84992,
+              85504
+            ],
+            [
+              6,
+              1,
+              84480,
+              85504
+            ],
+            [
+              8,
+              0,
+              94720,
+              95488
+            ],
+            [
+              8,
+              1,
+              94720,
+              95488
+            ]
+          ],
+          "stray_cached_evictions_by_normal_allocation": 0
+        },
+        "boot2": {
+          "hit_tokens": 1121536,
+          "share_pct": 99.4262,
+          "lost_256_positions": 19,
+          "evicted_turn_hits_turn_agent_hit_aligned": [
+            [
+              4,
+              0,
+              75008,
+              75264
+            ],
+            [
+              4,
+              1,
+              73728,
+              75264
+            ],
+            [
+              6,
+              0,
+              84992,
+              85504
+            ],
+            [
+              6,
+              1,
+              84480,
+              85504
+            ],
+            [
+              8,
+              0,
+              94720,
+              95488
+            ],
+            [
+              8,
+              1,
+              94720,
+              95488
+            ]
+          ],
+          "stray_cached_evictions_by_normal_allocation": 0
+        },
+        "boots_identical": true,
+        "vs_1107": -2816,
+        "verdict": "miss"
+      },
+      "stress_tp4": {
+        "boot1": {
+          "hit_tokens": 1120512,
+          "share_pct": 99.3355,
+          "lost_256_positions": 23,
+          "evicted_turn_hits_turn_agent_hit_aligned": [
+            [
+              4,
+              0,
+              75008,
+              75264
+            ],
+            [
+              4,
+              1,
+              73728,
+              75264
+            ],
+            [
+              6,
+              0,
+              85504,
+              85504
+            ],
+            [
+              6,
+              1,
+              81920,
+              85504
+            ],
+            [
+              8,
+              0,
+              95488,
+              95488
+            ],
+            [
+              8,
+              1,
+              94976,
+              95488
+            ]
+          ],
+          "stray_cached_evictions_by_normal_allocation": 0
+        },
+        "boot2": {
+          "hit_tokens": 1120512,
+          "share_pct": 99.3355,
+          "lost_256_positions": 23,
+          "evicted_turn_hits_turn_agent_hit_aligned": [
+            [
+              4,
+              0,
+              75008,
+              75264
+            ],
+            [
+              4,
+              1,
+              73728,
+              75264
+            ],
+            [
+              6,
+              0,
+              85504,
+              85504
+            ],
+            [
+              6,
+              1,
+              81920,
+              85504
+            ],
+            [
+              8,
+              0,
+              95488,
+              95488
+            ],
+            [
+              8,
+              1,
+              94976,
+              95488
+            ]
+          ],
+          "stray_cached_evictions_by_normal_allocation": 0
+        },
+        "boots_identical": true,
+        "vs_1107": -2304,
+        "verdict": "miss"
+      },
+      "dense_retention_bound_check (retention None, 3,600-block pool, same schedule)": {
+        "boot1": {
+          "hit_tokens": 1121792,
+          "share_pct": 99.4489,
+          "lost_256_positions": 18,
+          "evicted_turn_hits_turn_agent_hit_aligned": [
+            [
+              4,
+              0,
+              75264,
+              75264
+            ],
+            [
+              4,
+              1,
+              73728,
+              75264
+            ],
+            [
+              6,
+              0,
+              85504,
+              85504
+            ],
+            [
+              6,
+              1,
+              83968,
+              85504
+            ],
+            [
+              8,
+              0,
+              95488,
+              95488
+            ],
+            [
+              8,
+              1,
+              93952,
+              95488
+            ]
+          ],
+          "stray_cached_evictions_by_normal_allocation": 0
+        },
+        "boot2": {
+          "hit_tokens": 1121792,
+          "share_pct": 99.4489,
+          "lost_256_positions": 18,
+          "evicted_turn_hits_turn_agent_hit_aligned": [
+            [
+              4,
+              0,
+              75264,
+              75264
+            ],
+            [
+              4,
+              1,
+              73728,
+              75264
+            ],
+            [
+              6,
+              0,
+              85504,
+              85504
+            ],
+            [
+              6,
+              1,
+              83968,
+              85504
+            ],
+            [
+              8,
+              0,
+              95488,
+              95488
+            ],
+            [
+              8,
+              1,
+              93952,
+              95488
+            ]
+          ],
+          "stray_cached_evictions_by_normal_allocation": 0
+        },
+        "boots_identical": true
+      },
+      "boundary_matrix_spec_decode_test_list": "not applicable (ordering simulation, no code)"
+    }
+  },
+  "inversion_definition_review": {
+    "probe_definition": "adjacent cached free blocks a, b (a evicted first) with end_a < end_b, or end_a == end_b with a SWA and b MLA, over the whole free queue",
+    "pr_stated_purpose": [
+      "test docstring: 'Cached blocks (block_hash is not None) sit in monotonically decreasing order of token offset (end_token) from the LRU head of free_block_queue to the MRU tail'; 'Consequently, partial eviction from the BlockPool always evicts the newest tail blocks first and preserves the root prefix blocks.'",
+      "test code comment: 'monotonically NON-INCREASING from head (evict first) to tail (evict last) across all cached blocks'",
+      "README: 'root checkpoints (512, 8,192) sit at the MRU tail (evicted last)'",
+      "test comment on turn 2: 'early SWA checkpoints at 8192 etc. are skipped by SlidingWindowManager.add_local_computed_blocks!' (the target is blocks outside the finished request's run)"
+    ],
+    "alternative_scopes_on_round_1": {
+      "within_finished_run_only": {
+        "0": 0,
+        "512": 0,
+        "8192": 0,
+        "None": 0
+      },
+      "per_kv_group": {
+        "0": {
+          "gmla": 0,
+          "imla": 0,
+          "eswa": 6
+        },
+        "512": {
+          "gmla": 0,
+          "imla": 0,
+          "eswa": 6
+        },
+        "8192": {
+          "gmla": 0,
+          "imla": 0,
+          "eswa": 6
+        },
+        "None": {
+          "gmla": 0,
+          "imla": 0,
+          "eswa": 6
+        }
+      }
+    },
+    "conclusion": "not changed. The within-run scope gives round 1 a 0 but drops the PR's own target, the aged checkpoints outside the run. The per-group scope still counts 6, all in the SWA group. The definition is faithful to the PR's purpose."
+  },
+  "eviction_curves_lru_scenario": {
+    "scenario": "the LRU probe's state after turn 2 (retention 512): hit of a fresh request after the first k cached blocks of an order are evicted, as [k, hit] change points",
+    "round_1_actual_order": {
+      "extension": [
+        [
+          0,
+          25088
+        ],
+        [
+          53,
+          0
+        ]
+      ],
+      "branch_8256": [
+        [
+          0,
+          8192
+        ],
+        [
+          17,
+          7680
+        ],
+        [
+          18,
+          7168
+        ],
+        [
+          19,
+          6656
+        ],
+        [
+          20,
+          6144
+        ],
+        [
+          21,
+          5632
+        ],
+        [
+          22,
+          5120
+        ],
+        [
+          23,
+          4608
+        ],
+        [
+          24,
+          4096
+        ],
+        [
+          25,
+          3584
+        ],
+        [
+          26,
+          3072
+        ],
+        [
+          27,
+          2560
+        ],
+        [
+          28,
+          2048
+        ],
+        [
+          29,
+          1536
+        ],
+        [
+          30,
+          1024
+        ],
+        [
+          31,
+          512
+        ],
+        [
+          32,
+          0
+        ]
+      ],
+      "branch_20544": [
+        [
+          0,
+          20480
+        ],
+        [
+          43,
+          19968
+        ],
+        [
+          44,
+          19456
+        ],
+        [
+          45,
+          18944
+        ],
+        [
+          46,
+          18432
+        ],
+        [
+          47,
+          17920
+        ],
+        [
+          48,
+          17408
+        ],
+        [
+          49,
+          16896
+        ],
+        [
+          50,
+          0
+        ]
+      ]
+    },
+    "monotone_order": {
+      "extension": [
+        [
+          0,
+          25088
+        ],
+        [
+          1,
+          24832
+        ],
+        [
+          4,
+          24576
+        ],
+        [
+          7,
+          24320
+        ],
+        [
+          10,
+          24064
+        ],
+        [
+          13,
+          23552
+        ],
+        [
+          18,
+          23040
+        ],
+        [
+          23,
+          22528
+        ],
+        [
+          28,
+          22016
+        ],
+        [
+          33,
+          21504
+        ],
+        [
+          38,
+          20992
+        ],
+        [
+          43,
+          20480
+        ],
+        [
+          48,
+          19968
+        ],
+        [
+          53,
+          19456
+        ],
+        [
+          58,
+          18944
+        ],
+        [
+          63,
+          18432
+        ],
+        [
+          68,
+          17920
+        ],
+        [
+          73,
+          17408
+        ],
+        [
+          78,
+          16896
+        ],
+        [
+          83,
+          16640
+        ],
+        [
+          86,
+          16384
+        ],
+        [
+          89,
+          16128
+        ],
+        [
+          92,
+          15872
+        ],
+        [
+          95,
+          15360
+        ],
+        [
+          100,
+          14848
+        ],
+        [
+          105,
+          14336
+        ],
+        [
+          110,
+          13824
+        ],
+        [
+          115,
+          13312
+        ],
+        [
+          120,
+          12800
+        ],
+        [
+          125,
+          12288
+        ],
+        [
+          130,
+          11776
+        ],
+        [
+          135,
+          11264
+        ],
+        [
+          140,
+          10752
+        ],
+        [
+          145,
+          10240
+        ],
+        [
+          150,
+          9728
+        ],
+        [
+          155,
+          9216
+        ],
+        [
+          160,
+          8704
+        ],
+        [
+          165,
+          8192
+        ],
+        [
+          170,
+          7680
+        ],
+        [
+          175,
+          7168
+        ],
+        [
+          180,
+          6656
+        ],
+        [
+          185,
+          6144
+        ],
+        [
+          190,
+          5632
+        ],
+        [
+          195,
+          5120
+        ],
+        [
+          200,
+          4608
+        ],
+        [
+          205,
+          4096
+        ],
+        [
+          210,
+          3584
+        ],
+        [
+          215,
+          3072
+        ],
+        [
+          220,
+          2560
+        ],
+        [
+          225,
+          2048
+        ],
+        [
+          230,
+          1536
+        ],
+        [
+          235,
+          1024
+        ],
+        [
+          240,
+          512
+        ],
+        [
+          245,
+          0
+        ]
+      ],
+      "branch_8256": [
+        [
+          0,
+          8192
+        ],
+        [
+          170,
+          7680
+        ],
+        [
+          175,
+          7168
+        ],
+        [
+          180,
+          6656
+        ],
+        [
+          185,
+          6144
+        ],
+        [
+          190,
+          5632
+        ],
+        [
+          195,
+          5120
+        ],
+        [
+          200,
+          4608
+        ],
+        [
+          205,
+          4096
+        ],
+        [
+          210,
+          3584
+        ],
+        [
+          215,
+          3072
+        ],
+        [
+          220,
+          2560
+        ],
+        [
+          225,
+          2048
+        ],
+        [
+          230,
+          1536
+        ],
+        [
+          235,
+          1024
+        ],
+        [
+          240,
+          512
+        ],
+        [
+          245,
+          0
+        ]
+      ],
+      "branch_20544": [
+        [
+          0,
+          20480
+        ],
+        [
+          48,
+          19968
+        ],
+        [
+          53,
+          19456
+        ],
+        [
+          58,
+          18944
+        ],
+        [
+          63,
+          18432
+        ],
+        [
+          68,
+          17920
+        ],
+        [
+          73,
+          17408
+        ],
+        [
+          78,
+          16896
+        ],
+        [
+          83,
+          16640
+        ],
+        [
+          86,
+          16384
+        ],
+        [
+          89,
+          16128
+        ],
+        [
+          92,
+          15872
+        ],
+        [
+          95,
+          15360
+        ],
+        [
+          100,
+          14848
+        ],
+        [
+          105,
+          14336
+        ],
+        [
+          110,
+          13824
+        ],
+        [
+          115,
+          13312
+        ],
+        [
+          120,
+          12800
+        ],
+        [
+          125,
+          12288
+        ],
+        [
+          130,
+          11776
+        ],
+        [
+          135,
+          11264
+        ],
+        [
+          140,
+          10752
+        ],
+        [
+          145,
+          10240
+        ],
+        [
+          150,
+          9728
+        ],
+        [
+          155,
+          9216
+        ],
+        [
+          160,
+          8704
+        ],
+        [
+          165,
+          8192
+        ],
+        [
+          170,
+          7680
+        ],
+        [
+          175,
+          7168
+        ],
+        [
+          180,
+          6656
+        ],
+        [
+          185,
+          6144
+        ],
+        [
+          190,
+          5632
+        ],
+        [
+          195,
+          5120
+        ],
+        [
+          200,
+          4608
+        ],
+        [
+          205,
+          4096
+        ],
+        [
+          210,
+          3584
+        ],
+        [
+          215,
+          3072
+        ],
+        [
+          220,
+          2560
+        ],
+        [
+          225,
+          2048
+        ],
+        [
+          230,
+          1536
+        ],
+        [
+          235,
+          1024
+        ],
+        [
+          240,
+          512
+        ],
+        [
+          245,
+          0
+        ]
+      ]
+    },
+    "aged_blocks": 52,
+    "run_blocks": 197
+  },
+  "robustness_36_blocks_per_eviction": {
+    "why": "the PR's stress test comment says it evicts 'the first 36 cached blocks'; the code evicts 18. Same schedule, 36 cached blocks per eviction.",
+    "tp4-ring": {
+      "round_1_actual": {
+        "boot1": {
+          "hit_tokens": 1051136,
+          "share_pct": 93.1852,
+          "lost_256_positions": 294,
+          "evicted_turn_hits_turn_agent_hit_aligned": [
+            [
+              4,
+              0,
+              0,
+              75264
+            ],
+            [
+              4,
+              1,
+              75264,
+              75264
+            ],
+            [
+              6,
+              0,
+              85504,
+              85504
+            ],
+            [
+              6,
+              1,
+              85504,
+              85504
+            ],
+            [
+              8,
+              0,
+              95488,
+              95488
+            ],
+            [
+              8,
+              1,
+              95488,
+              95488
+            ]
+          ],
+          "stray_cached_evictions_by_normal_allocation": 13
+        },
+        "boot2": {
+          "hit_tokens": 1051136,
+          "share_pct": 93.1852,
+          "lost_256_positions": 294,
+          "evicted_turn_hits_turn_agent_hit_aligned": [
+            [
+              4,
+              0,
+              0,
+              75264
+            ],
+            [
+              4,
+              1,
+              75264,
+              75264
+            ],
+            [
+              6,
+              0,
+              85504,
+              85504
+            ],
+            [
+              6,
+              1,
+              85504,
+              85504
+            ],
+            [
+              8,
+              0,
+              95488,
+              95488
+            ],
+            [
+              8,
+              1,
+              95488,
+              95488
+            ]
+          ],
+          "stray_cached_evictions_by_normal_allocation": 13
+        },
+        "boots_identical": true
+      },
+      "floor1": {
+        "boot1": {
+          "hit_tokens": 975872,
+          "share_pct": 86.5129,
+          "lost_256_positions": 588,
+          "evicted_turn_hits_turn_agent_hit_aligned": [
+            [
+              4,
+              0,
+              0,
+              75264
+            ],
+            [
+              4,
+              1,
+              0,
+              75264
+            ],
+            [
+              6,
+              0,
+              85504,
+              85504
+            ],
+            [
+              6,
+              1,
+              85504,
+              85504
+            ],
+            [
+              8,
+              0,
+              95488,
+              95488
+            ],
+            [
+              8,
+              1,
+              95488,
+              95488
+            ]
+          ],
+          "stray_cached_evictions_by_normal_allocation": 610
+        },
+        "boot2": {
+          "hit_tokens": 975872,
+          "share_pct": 86.5129,
+          "lost_256_positions": 588,
+          "evicted_turn_hits_turn_agent_hit_aligned": [
+            [
+              4,
+              0,
+              0,
+              75264
+            ],
+            [
+              4,
+              1,
+              0,
+              75264
+            ],
+            [
+              6,
+              0,
+              85504,
+              85504
+            ],
+            [
+              6,
+              1,
+              85504,
+              85504
+            ],
+            [
+              8,
+              0,
+              95488,
+              95488
+            ],
+            [
+              8,
+              1,
+              95488,
+              95488
+            ]
+          ],
+          "stray_cached_evictions_by_normal_allocation": 610
+        },
+        "boots_identical": true,
+        "note": "approximate: after the collapse, normal allocation evicted 610 cached blocks in round 1's queue order, which the harness does not reorder"
+      },
+      "oracle0": {
+        "boot1": {
+          "hit_tokens": 1112832,
+          "share_pct": 98.6546,
+          "lost_256_positions": 53,
+          "evicted_turn_hits_turn_agent_hit_aligned": [
+            [
+              4,
+              0,
+              75264,
+              75264
+            ],
+            [
+              4,
+              1,
+              70400,
+              75264
+            ],
+            [
+              6,
+              0,
+              85504,
+              85504
+            ],
+            [
+              6,
+              1,
+              81920,
+              85504
+            ],
+            [
+              8,
+              0,
+              95488,
+              95488
+            ],
+            [
+              8,
+              1,
+              90368,
+              95488
+            ]
+          ],
+          "stray_cached_evictions_by_normal_allocation": 0
+        },
+        "boot2": {
+          "hit_tokens": 1112832,
+          "share_pct": 98.6546,
+          "lost_256_positions": 53,
+          "evicted_turn_hits_turn_agent_hit_aligned": [
+            [
+              4,
+              0,
+              75264,
+              75264
+            ],
+            [
+              4,
+              1,
+              70400,
+              75264
+            ],
+            [
+              6,
+              0,
+              85504,
+              85504
+            ],
+            [
+              6,
+              1,
+              81920,
+              85504
+            ],
+            [
+              8,
+              0,
+              95488,
+              95488
+            ],
+            [
+              8,
+              1,
+              90368,
+              95488
+            ]
+          ],
+          "stray_cached_evictions_by_normal_allocation": 0
+        },
+        "boots_identical": true
+      },
+      "pre0763_reconstruction_diagnostic": {
+        "hit_tokens": 1047808,
+        "share_pct": 92.8901,
+        "evicted_turn_hits": [
+          [
+            4,
+            0,
+            0,
+            75264
+          ],
+          [
+            4,
+            1,
+            75008,
+            75264
+          ],
+          [
+            6,
+            0,
+            85248,
+            85504
+          ],
+          [
+            6,
+            1,
+            85248,
+            85504
+          ],
+          [
+            8,
+            0,
+            95232,
+            95488
+          ],
+          [
+            8,
+            1,
+            95232,
+            95488
+          ]
+        ],
+        "note": "one run (diagnostic); agent 0's turn-4 hit collapses to 0 as in round 1"
+      }
+    },
+    "tp3-triangle": {
+      "round_1_actual": {
+        "boot1": {
+          "hit_tokens": 1126400,
+          "share_pct": 99.8574,
+          "lost_256_positions": 0,
+          "evicted_turn_hits_turn_agent_hit_aligned": [
+            [
+              4,
+              0,
+              75264,
+              75264
+            ],
+            [
+              4,
+              1,
+              75264,
+              75264
+            ],
+            [
+              6,
+              0,
+              85504,
+              85504
+            ],
+            [
+              6,
+              1,
+              85504,
+              85504
+            ],
+            [
+              8,
+              0,
+              95488,
+              95488
+            ],
+            [
+              8,
+              1,
+              95488,
+              95488
+            ]
+          ],
+          "stray_cached_evictions_by_normal_allocation": 0
+        },
+        "boot2": {
+          "hit_tokens": 1126400,
+          "share_pct": 99.8574,
+          "lost_256_positions": 0,
+          "evicted_turn_hits_turn_agent_hit_aligned": [
+            [
+              4,
+              0,
+              75264,
+              75264
+            ],
+            [
+              4,
+              1,
+              75264,
+              75264
+            ],
+            [
+              6,
+              0,
+              85504,
+              85504
+            ],
+            [
+              6,
+              1,
+              85504,
+              85504
+            ],
+            [
+              8,
+              0,
+              95488,
+              95488
+            ],
+            [
+              8,
+              1,
+              95488,
+              95488
+            ]
+          ],
+          "stray_cached_evictions_by_normal_allocation": 0
+        },
+        "boots_identical": true
+      },
+      "oracle0": {
+        "boot1": {
+          "hit_tokens": 1115648,
+          "share_pct": 98.9043,
+          "lost_256_positions": 42,
+          "evicted_turn_hits_turn_agent_hit_aligned": [
+            [
+              4,
+              0,
+              75264,
+              75264
+            ],
+            [
+              4,
+              1,
+              71680,
+              75264
+            ],
+            [
+              6,
+              0,
+              85504,
+              85504
+            ],
+            [
+              6,
+              1,
+              81920,
+              85504
+            ],
+            [
+              8,
+              0,
+              95232,
+              95488
+            ],
+            [
+              8,
+              1,
+              92160,
+              95488
+            ]
+          ],
+          "stray_cached_evictions_by_normal_allocation": 0
+        },
+        "boot2": {
+          "hit_tokens": 1115648,
+          "share_pct": 98.9043,
+          "lost_256_positions": 42,
+          "evicted_turn_hits_turn_agent_hit_aligned": [
+            [
+              4,
+              0,
+              75264,
+              75264
+            ],
+            [
+              4,
+              1,
+              71680,
+              75264
+            ],
+            [
+              6,
+              0,
+              85504,
+              85504
+            ],
+            [
+              6,
+              1,
+              81920,
+              85504
+            ],
+            [
+              8,
+              0,
+              95232,
+              95488
+            ],
+            [
+              8,
+              1,
+              92160,
+              95488
+            ]
+          ],
+          "stray_cached_evictions_by_normal_allocation": 0
+        },
+        "boots_identical": true
+      },
+      "pre0763_reconstruction_diagnostic": {
+        "hit_tokens": 1124352,
+        "share_pct": 99.6759
+      }
+    }
+  },
+  "interval": "the harness is deterministic: the two container runs are identical in every number (JSONs differ only in boot, timestamp, elapsed and container hostname), so the interval is zero",
+  "not_done": [
+    "no build, no image, no GPU use; no pytest run, since no code changed",
+    "the probe's boundary-matrix and spec-decode sections were not re-run in round 2; their numbers for both existing corrections are in the earlier receipts",
+    "nothing committed or pushed; no other host touched"
+  ],
+  "files": {
+    "harness": "diag/oracle_bound.py (sha256 b3b03531d2f2701797f7b39f4746718b1beaba94a96de5240a3be269de62ebe2)",
+    "container_runs": [
+      "out/oracle-r1code-boot1.{txt,json}",
+      "out/oracle-r1code-boot2.{txt,json}"
+    ],
+    "diagnostics": [
+      "out/diag-pre0763-oracle-final.{txt,json}",
+      "out/diag-pre0763-oracle.{txt,json} (revision B)"
+    ],
+    "screening": [
+      "out/smoke.json (revision A, with the classification error recorded in commands.txt)",
+      "out/smoke2.json (revision B)"
+    ]
+  }
+}

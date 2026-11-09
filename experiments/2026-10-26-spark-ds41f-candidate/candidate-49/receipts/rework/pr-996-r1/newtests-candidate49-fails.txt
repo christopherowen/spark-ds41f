@@ -1,0 +1,710 @@
+============================= test session starts ==============================
+platform linux -- Python 3.12.3, pytest-9.1.1, pluggy-1.6.0
+rootdir: /opt/spark-ds41f/candidate/vllm
+configfile: pyproject.toml
+plugins: anyio-4.15.1
+collected 89 items / 83 deselected / 6 selected
+
+tests/kernels/moe/test_deepseek_v41_tilelang_router.py FFFFFF            [100%]
+
+=================================== FAILURES ===================================
+___________ test_gate_router_route_local_under_inference_mode[3-205] ___________
+
+plain_scratch = None
+monkeypatch = <_pytest.monkeypatch.MonkeyPatch object at 0xe0e2d785bec0>
+world_size = 3, num_tokens = 205
+
+    @pytest.mark.parametrize(
+        "world_size,num_tokens", [(3, 205), (3, 800), (3, 1024), (4, 1024)]
+    )
+    def test_gate_router_route_local_under_inference_mode(
+        plain_scratch, monkeypatch, world_size, num_tokens
+    ):
+        """The worker runs every forward, its startup memory profile included, under
+        torch.inference_mode, where the step's padding mask and ids, and the masks
+        routing computes from them, are inference tensors: they track no version
+        counter. SP local routing keeps its local masks there too, on every rank, on
+        the partials path (local_rows <= 256) and the full-gate path, and routes the
+        bits it routes outside inference mode."""
+        from vllm.models.deepseek_v4_1 import sp_prefill
+    
+        router, generator = _sp_gate_router(num_tokens)
+        x = torch.randn(num_tokens, 5120, device="cuda", generator=generator).to(
+            torch.bfloat16
+        )
+        input_ids = torch.randint(
+            0, 1000, (num_tokens,), device="cuda", generator=generator
+        )
+        input_ids[1::4] = LO
+    
+        def forward(layout, layers):
+            context = _new_forward(monkeypatch)
+            context.is_padding = torch.zeros(num_tokens, dtype=torch.bool, device="cuda")
+            context.is_padding[num_tokens - 4 :] = True
+            ids = input_ids.clone()
+            local_x = layout.local_slice(x)
+            routes = [
+                router.route_local(local_x, layout, input_ids=ids) for _ in range(layers)
+            ]
+            return context, routes
+    
+        for rank in range(world_size):
+            layout = sp_prefill.SPRows(num_tokens, world_size, rank)
+            with torch.no_grad():
+                _, ((expected_weights, expected_ids),) = forward(layout, 1)
+            with torch.inference_mode():
+>               context, routes = forward(layout, 3)
+                                  ^^^^^^^^^^^^^^^^^^
+
+tests/kernels/moe/test_deepseek_v41_tilelang_router.py:715: 
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
+tests/kernels/moe/test_deepseek_v41_tilelang_router.py:706: in forward
+    router.route_local(local_x, layout, input_ids=ids) for _ in range(layers)
+    ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+vllm/models/deepseek_v4_1/tilelang/router.py:1232: in route_local
+    return self._compute_routing(
+vllm/models/deepseek_v4_1/tilelang/router.py:1285: in _compute_routing
+    route_mask, padding = _partials_mask(
+vllm/models/deepseek_v4_1/tilelang/router.py:285: in _partials_mask
+    return _local_mask(is_padding, rows, sp_rows, context=context, pad=True), True
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
+
+mask = tensor([False, False, False, False, False, False, False, False, False, False,
+        False, False, False, False, Fals...e, False, False, False, False, False, False, False, False,
+        False,  True,  True,  True,  True], device='cuda:0')
+rows = 69
+sp_rows = SPRows(num_tokens=205, world_size=3, rank=0, unreduced=False)
+context = <tests.kernels.moe.test_deepseek_v41_tilelang_router.Context object at 0xe0e658a00a40>
+pad = True
+
+    def _local_mask(
+        mask: torch.Tensor | None,
+        rows: int,
+        sp_rows,
+        *,
+        context=None,
+        pad: bool = False,
+    ) -> torch.Tensor | None:
+        """``mask``'s first ``rows`` rows, or this rank's ``sp_rows.local_rows`` slice."""
+        if mask is None:
+            return None
+        if sp_rows is not None and mask.shape[0] != rows:
+            if context is None and is_forward_context_available():
+                context = get_forward_context()
+            holder = context if context is not None else sp_rows
+            cache = getattr(holder, "_ds41_local_masks", None)
+            if cache is None:
+                cache = {}
+                holder._ds41_local_masks = cache
+            key = (
+                id(mask),
+                sp_rows.num_tokens,
+                sp_rows.world_size,
+                sp_rows.rank,
+                rows,
+                pad,
+            )
+            entry = cache.get(key)
+            if entry is not None and entry[0] is mask and entry[1] == mask._version:
+                return entry[2]
+            src = mask[: sp_rows.num_tokens]
+            if pad and sp_rows.real_rows < sp_rows.local_rows:
+                local = src.new_ones((sp_rows.local_rows, *src.shape[1:]))
+                if sp_rows.real_rows:
+                    start = sp_rows.rank * sp_rows.local_rows
+                    local[: sp_rows.real_rows].copy_(src[start : start + sp_rows.real_rows])
+            else:
+                local = sp_rows.local_slice(src)
+>           cache[key] = (mask, mask._version, local)
+                                ^^^^^^^^^^^^^
+E           RuntimeError: Inference tensors do not track version counter.
+
+vllm/models/deepseek_v4_1/tilelang/router.py:203: RuntimeError
+----------------------------- Captured stdout call -----------------------------
+2026-11-09 07:29:08  [TileLang:tilelang.jit.kernel:INFO] (kernel.py:137): TileLang begins to compile kernel `gemm_bf16_partials` with `out_idx=None`
+2026-11-09 07:29:08  [TileLang:tilelang.jit.kernel:INFO] (kernel.py:137): TileLang begins to compile kernel `gemm_bf16` with `out_idx=None`
+2026-11-09 07:29:08  [TileLang:tilelang.jit.kernel:INFO] (kernel.py:137): TileLang begins to compile kernel `gemm_bf16_partials` with `out_idx=None`
+2026-11-09 07:29:08  [TileLang:tilelang.jit.kernel:INFO] (kernel.py:137): TileLang begins to compile kernel `gemm_splitk_reduce` with `out_idx=None`
+2026-11-09 07:29:08  [TileLang:tilelang.jit.kernel:INFO] (kernel.py:137): TileLang begins to compile kernel `gemm_bf16_partials` with `out_idx=None`
+2026-11-09 07:29:08  [TileLang:tilelang.jit.kernel:INFO] (kernel.py:145): TileLang completes to compile kernel `gemm_splitk_reduce`
+2026-11-09 07:29:09  [TileLang:tilelang.jit.kernel:INFO] (kernel.py:145): TileLang completes to compile kernel `gemm_bf16`
+2026-11-09 07:29:09  [TileLang:tilelang.jit.kernel:INFO] (kernel.py:145): TileLang completes to compile kernel `gemm_bf16_partials`
+2026-11-09 07:29:10  [TileLang:tilelang.jit.kernel:INFO] (kernel.py:145): TileLang completes to compile kernel `gemm_bf16_partials`
+2026-11-09 07:29:10  [TileLang:tilelang.jit.kernel:INFO] (kernel.py:145): TileLang completes to compile kernel `gemm_bf16_partials`
+2026-11-09 07:29:10  [TileLang:tilelang.jit.kernel:INFO] (kernel.py:137): TileLang begins to compile kernel `router_partials` with `out_idx=None`
+2026-11-09 07:29:10  [TileLang:tilelang.jit.kernel:INFO] (kernel.py:137): TileLang begins to compile kernel `router_partials` with `out_idx=None`
+2026-11-09 07:29:10  [TileLang:tilelang.jit.kernel:INFO] (kernel.py:137): TileLang begins to compile kernel `router_partials` with `out_idx=None`
+2026-11-09 07:29:10  [TileLang:tilelang.jit.kernel:INFO] (kernel.py:137): TileLang begins to compile kernel `routing_masks` with `out_idx=None`
+2026-11-09 07:29:10  [TileLang:tilelang.jit.kernel:INFO] (kernel.py:137): TileLang begins to compile kernel `router_partials` with `out_idx=None`
+2026-11-09 07:29:10  [TileLang:tilelang.jit.kernel:INFO] (kernel.py:137): TileLang begins to compile kernel `routing_masks` with `out_idx=None`
+2026-11-09 07:29:10  [TileLang:tilelang.jit.kernel:INFO] (kernel.py:137): TileLang begins to compile kernel `routing_masks` with `out_idx=None`
+2026-11-09 07:29:10  [TileLang:tilelang.jit.kernel:INFO] (kernel.py:137): TileLang begins to compile kernel `routing_masks` with `out_idx=None`
+2026-11-09 07:29:10  [TileLang:tilelang.jit.kernel:INFO] (kernel.py:137): TileLang begins to compile kernel `routing_masks` with `out_idx=None`
+2026-11-09 07:29:11  [TileLang:tilelang.jit.kernel:INFO] (kernel.py:145): TileLang completes to compile kernel `routing_masks`
+2026-11-09 07:29:11  [TileLang:tilelang.jit.kernel:INFO] (kernel.py:145): TileLang completes to compile kernel `routing_masks`
+2026-11-09 07:29:11  [TileLang:tilelang.jit.kernel:INFO] (kernel.py:145): TileLang completes to compile kernel `routing_masks`
+2026-11-09 07:29:11  [TileLang:tilelang.jit.kernel:INFO] (kernel.py:145): TileLang completes to compile kernel `routing_masks`
+2026-11-09 07:29:11  [TileLang:tilelang.jit.kernel:INFO] (kernel.py:145): TileLang completes to compile kernel `routing_masks`
+2026-11-09 07:29:11  [TileLang:tilelang.jit.kernel:INFO] (kernel.py:145): TileLang completes to compile kernel `router_partials`
+2026-11-09 07:29:12  [TileLang:tilelang.jit.kernel:INFO] (kernel.py:145): TileLang completes to compile kernel `router_partials`
+2026-11-09 07:29:12  [TileLang:tilelang.jit.kernel:INFO] (kernel.py:145): TileLang completes to compile kernel `router_partials`
+2026-11-09 07:29:12  [TileLang:tilelang.jit.kernel:INFO] (kernel.py:145): TileLang completes to compile kernel `router_partials`
+2026-11-09 07:29:12  [TileLang:tilelang.jit.kernel:INFO] (kernel.py:137): TileLang begins to compile kernel `moe_topk_gate_forward_kernel` with `out_idx=None`
+2026-11-09 07:29:13  [TileLang:tilelang.jit.kernel:INFO] (kernel.py:145): TileLang completes to compile kernel `moe_topk_gate_forward_kernel`
+2026-11-09 07:29:14  [TileLang:tilelang.jit.kernel:INFO] (kernel.py:137): TileLang begins to compile kernel `moe_topk_gate_forward_kernel` with `out_idx=None`
+2026-11-09 07:29:15  [TileLang:tilelang.jit.kernel:INFO] (kernel.py:145): TileLang completes to compile kernel `moe_topk_gate_forward_kernel`
+------------------------------ Captured log call -------------------------------
+INFO     tilelang.jit.kernel:kernel.py:137 TileLang begins to compile kernel `gemm_bf16_partials` with `out_idx=None`
+INFO     tilelang.jit.kernel:kernel.py:137 TileLang begins to compile kernel `gemm_bf16` with `out_idx=None`
+INFO     tilelang.jit.kernel:kernel.py:137 TileLang begins to compile kernel `gemm_bf16_partials` with `out_idx=None`
+INFO     tilelang.jit.kernel:kernel.py:137 TileLang begins to compile kernel `gemm_splitk_reduce` with `out_idx=None`
+INFO     tilelang.jit.kernel:kernel.py:137 TileLang begins to compile kernel `gemm_bf16_partials` with `out_idx=None`
+INFO     tilelang.jit.kernel:kernel.py:145 TileLang completes to compile kernel `gemm_splitk_reduce`
+INFO     tilelang.jit.kernel:kernel.py:145 TileLang completes to compile kernel `gemm_bf16`
+INFO     tilelang.jit.kernel:kernel.py:145 TileLang completes to compile kernel `gemm_bf16_partials`
+INFO     tilelang.jit.kernel:kernel.py:145 TileLang completes to compile kernel `gemm_bf16_partials`
+INFO     tilelang.jit.kernel:kernel.py:145 TileLang completes to compile kernel `gemm_bf16_partials`
+INFO     tilelang.jit.kernel:kernel.py:137 TileLang begins to compile kernel `router_partials` with `out_idx=None`
+INFO     tilelang.jit.kernel:kernel.py:137 TileLang begins to compile kernel `router_partials` with `out_idx=None`
+INFO     tilelang.jit.kernel:kernel.py:137 TileLang begins to compile kernel `router_partials` with `out_idx=None`
+INFO     tilelang.jit.kernel:kernel.py:137 TileLang begins to compile kernel `routing_masks` with `out_idx=None`
+INFO     tilelang.jit.kernel:kernel.py:137 TileLang begins to compile kernel `router_partials` with `out_idx=None`
+INFO     tilelang.jit.kernel:kernel.py:137 TileLang begins to compile kernel `routing_masks` with `out_idx=None`
+INFO     tilelang.jit.kernel:kernel.py:137 TileLang begins to compile kernel `routing_masks` with `out_idx=None`
+INFO     tilelang.jit.kernel:kernel.py:137 TileLang begins to compile kernel `routing_masks` with `out_idx=None`
+INFO     tilelang.jit.kernel:kernel.py:137 TileLang begins to compile kernel `routing_masks` with `out_idx=None`
+INFO     tilelang.jit.kernel:kernel.py:145 TileLang completes to compile kernel `routing_masks`
+INFO     tilelang.jit.kernel:kernel.py:145 TileLang completes to compile kernel `routing_masks`
+INFO     tilelang.jit.kernel:kernel.py:145 TileLang completes to compile kernel `routing_masks`
+INFO     tilelang.jit.kernel:kernel.py:145 TileLang completes to compile kernel `routing_masks`
+INFO     tilelang.jit.kernel:kernel.py:145 TileLang completes to compile kernel `routing_masks`
+INFO     tilelang.jit.kernel:kernel.py:145 TileLang completes to compile kernel `router_partials`
+INFO     tilelang.jit.kernel:kernel.py:145 TileLang completes to compile kernel `router_partials`
+INFO     tilelang.jit.kernel:kernel.py:145 TileLang completes to compile kernel `router_partials`
+INFO     tilelang.jit.kernel:kernel.py:145 TileLang completes to compile kernel `router_partials`
+INFO     tilelang.jit.kernel:kernel.py:137 TileLang begins to compile kernel `moe_topk_gate_forward_kernel` with `out_idx=None`
+INFO     tilelang.jit.kernel:kernel.py:145 TileLang completes to compile kernel `moe_topk_gate_forward_kernel`
+INFO     tilelang.jit.kernel:kernel.py:137 TileLang begins to compile kernel `moe_topk_gate_forward_kernel` with `out_idx=None`
+INFO     tilelang.jit.kernel:kernel.py:145 TileLang completes to compile kernel `moe_topk_gate_forward_kernel`
+___________ test_gate_router_route_local_under_inference_mode[3-800] ___________
+
+plain_scratch = None
+monkeypatch = <_pytest.monkeypatch.MonkeyPatch object at 0xe0e2cd5a0a10>
+world_size = 3, num_tokens = 800
+
+    @pytest.mark.parametrize(
+        "world_size,num_tokens", [(3, 205), (3, 800), (3, 1024), (4, 1024)]
+    )
+    def test_gate_router_route_local_under_inference_mode(
+        plain_scratch, monkeypatch, world_size, num_tokens
+    ):
+        """The worker runs every forward, its startup memory profile included, under
+        torch.inference_mode, where the step's padding mask and ids, and the masks
+        routing computes from them, are inference tensors: they track no version
+        counter. SP local routing keeps its local masks there too, on every rank, on
+        the partials path (local_rows <= 256) and the full-gate path, and routes the
+        bits it routes outside inference mode."""
+        from vllm.models.deepseek_v4_1 import sp_prefill
+    
+        router, generator = _sp_gate_router(num_tokens)
+        x = torch.randn(num_tokens, 5120, device="cuda", generator=generator).to(
+            torch.bfloat16
+        )
+        input_ids = torch.randint(
+            0, 1000, (num_tokens,), device="cuda", generator=generator
+        )
+        input_ids[1::4] = LO
+    
+        def forward(layout, layers):
+            context = _new_forward(monkeypatch)
+            context.is_padding = torch.zeros(num_tokens, dtype=torch.bool, device="cuda")
+            context.is_padding[num_tokens - 4 :] = True
+            ids = input_ids.clone()
+            local_x = layout.local_slice(x)
+            routes = [
+                router.route_local(local_x, layout, input_ids=ids) for _ in range(layers)
+            ]
+            return context, routes
+    
+        for rank in range(world_size):
+            layout = sp_prefill.SPRows(num_tokens, world_size, rank)
+            with torch.no_grad():
+                _, ((expected_weights, expected_ids),) = forward(layout, 1)
+            with torch.inference_mode():
+>               context, routes = forward(layout, 3)
+                                  ^^^^^^^^^^^^^^^^^^
+
+tests/kernels/moe/test_deepseek_v41_tilelang_router.py:715: 
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
+tests/kernels/moe/test_deepseek_v41_tilelang_router.py:706: in forward
+    router.route_local(local_x, layout, input_ids=ids) for _ in range(layers)
+    ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+vllm/models/deepseek_v4_1/tilelang/router.py:1232: in route_local
+    return self._compute_routing(
+vllm/models/deepseek_v4_1/tilelang/router.py:1266: in _compute_routing
+    return super()._compute_routing(
+vllm/models/deepseek_v4_1/tilelang/router.py:877: in _compute_routing
+    image_token_mask, mask = _routing_masks(
+vllm/models/deepseek_v4_1/tilelang/router.py:266: in _routing_masks
+    route = _local_mask(routed, rows, sp_rows, context=context)
+            ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
+
+mask = tensor([ True,  True,  True,  True,  True,  True,  True,  True,  True,  True,
+         True,  True,  True,  True,  Tru...e,  True,  True,
+         True,  True,  True,  True,  True,  True, False, False, False, False],
+       device='cuda:0')
+rows = 267
+sp_rows = SPRows(num_tokens=800, world_size=3, rank=0, unreduced=False)
+context = <tests.kernels.moe.test_deepseek_v41_tilelang_router.Context object at 0xe0e2cd62cc20>
+pad = False
+
+    def _local_mask(
+        mask: torch.Tensor | None,
+        rows: int,
+        sp_rows,
+        *,
+        context=None,
+        pad: bool = False,
+    ) -> torch.Tensor | None:
+        """``mask``'s first ``rows`` rows, or this rank's ``sp_rows.local_rows`` slice."""
+        if mask is None:
+            return None
+        if sp_rows is not None and mask.shape[0] != rows:
+            if context is None and is_forward_context_available():
+                context = get_forward_context()
+            holder = context if context is not None else sp_rows
+            cache = getattr(holder, "_ds41_local_masks", None)
+            if cache is None:
+                cache = {}
+                holder._ds41_local_masks = cache
+            key = (
+                id(mask),
+                sp_rows.num_tokens,
+                sp_rows.world_size,
+                sp_rows.rank,
+                rows,
+                pad,
+            )
+            entry = cache.get(key)
+            if entry is not None and entry[0] is mask and entry[1] == mask._version:
+                return entry[2]
+            src = mask[: sp_rows.num_tokens]
+            if pad and sp_rows.real_rows < sp_rows.local_rows:
+                local = src.new_ones((sp_rows.local_rows, *src.shape[1:]))
+                if sp_rows.real_rows:
+                    start = sp_rows.rank * sp_rows.local_rows
+                    local[: sp_rows.real_rows].copy_(src[start : start + sp_rows.real_rows])
+            else:
+                local = sp_rows.local_slice(src)
+>           cache[key] = (mask, mask._version, local)
+                                ^^^^^^^^^^^^^
+E           RuntimeError: Inference tensors do not track version counter.
+
+vllm/models/deepseek_v4_1/tilelang/router.py:203: RuntimeError
+__________ test_gate_router_route_local_under_inference_mode[3-1024] ___________
+
+plain_scratch = None
+monkeypatch = <_pytest.monkeypatch.MonkeyPatch object at 0xe0e2cd5a0530>
+world_size = 3, num_tokens = 1024
+
+    @pytest.mark.parametrize(
+        "world_size,num_tokens", [(3, 205), (3, 800), (3, 1024), (4, 1024)]
+    )
+    def test_gate_router_route_local_under_inference_mode(
+        plain_scratch, monkeypatch, world_size, num_tokens
+    ):
+        """The worker runs every forward, its startup memory profile included, under
+        torch.inference_mode, where the step's padding mask and ids, and the masks
+        routing computes from them, are inference tensors: they track no version
+        counter. SP local routing keeps its local masks there too, on every rank, on
+        the partials path (local_rows <= 256) and the full-gate path, and routes the
+        bits it routes outside inference mode."""
+        from vllm.models.deepseek_v4_1 import sp_prefill
+    
+        router, generator = _sp_gate_router(num_tokens)
+        x = torch.randn(num_tokens, 5120, device="cuda", generator=generator).to(
+            torch.bfloat16
+        )
+        input_ids = torch.randint(
+            0, 1000, (num_tokens,), device="cuda", generator=generator
+        )
+        input_ids[1::4] = LO
+    
+        def forward(layout, layers):
+            context = _new_forward(monkeypatch)
+            context.is_padding = torch.zeros(num_tokens, dtype=torch.bool, device="cuda")
+            context.is_padding[num_tokens - 4 :] = True
+            ids = input_ids.clone()
+            local_x = layout.local_slice(x)
+            routes = [
+                router.route_local(local_x, layout, input_ids=ids) for _ in range(layers)
+            ]
+            return context, routes
+    
+        for rank in range(world_size):
+            layout = sp_prefill.SPRows(num_tokens, world_size, rank)
+            with torch.no_grad():
+                _, ((expected_weights, expected_ids),) = forward(layout, 1)
+            with torch.inference_mode():
+>               context, routes = forward(layout, 3)
+                                  ^^^^^^^^^^^^^^^^^^
+
+tests/kernels/moe/test_deepseek_v41_tilelang_router.py:715: 
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
+tests/kernels/moe/test_deepseek_v41_tilelang_router.py:706: in forward
+    router.route_local(local_x, layout, input_ids=ids) for _ in range(layers)
+    ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+vllm/models/deepseek_v4_1/tilelang/router.py:1232: in route_local
+    return self._compute_routing(
+vllm/models/deepseek_v4_1/tilelang/router.py:1266: in _compute_routing
+    return super()._compute_routing(
+vllm/models/deepseek_v4_1/tilelang/router.py:877: in _compute_routing
+    image_token_mask, mask = _routing_masks(
+vllm/models/deepseek_v4_1/tilelang/router.py:266: in _routing_masks
+    route = _local_mask(routed, rows, sp_rows, context=context)
+            ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
+
+mask = tensor([ True,  True,  True,  ..., False, False, False], device='cuda:0')
+rows = 342
+sp_rows = SPRows(num_tokens=1024, world_size=3, rank=0, unreduced=False)
+context = <tests.kernels.moe.test_deepseek_v41_tilelang_router.Context object at 0xe0e2cd5beb10>
+pad = False
+
+    def _local_mask(
+        mask: torch.Tensor | None,
+        rows: int,
+        sp_rows,
+        *,
+        context=None,
+        pad: bool = False,
+    ) -> torch.Tensor | None:
+        """``mask``'s first ``rows`` rows, or this rank's ``sp_rows.local_rows`` slice."""
+        if mask is None:
+            return None
+        if sp_rows is not None and mask.shape[0] != rows:
+            if context is None and is_forward_context_available():
+                context = get_forward_context()
+            holder = context if context is not None else sp_rows
+            cache = getattr(holder, "_ds41_local_masks", None)
+            if cache is None:
+                cache = {}
+                holder._ds41_local_masks = cache
+            key = (
+                id(mask),
+                sp_rows.num_tokens,
+                sp_rows.world_size,
+                sp_rows.rank,
+                rows,
+                pad,
+            )
+            entry = cache.get(key)
+            if entry is not None and entry[0] is mask and entry[1] == mask._version:
+                return entry[2]
+            src = mask[: sp_rows.num_tokens]
+            if pad and sp_rows.real_rows < sp_rows.local_rows:
+                local = src.new_ones((sp_rows.local_rows, *src.shape[1:]))
+                if sp_rows.real_rows:
+                    start = sp_rows.rank * sp_rows.local_rows
+                    local[: sp_rows.real_rows].copy_(src[start : start + sp_rows.real_rows])
+            else:
+                local = sp_rows.local_slice(src)
+>           cache[key] = (mask, mask._version, local)
+                                ^^^^^^^^^^^^^
+E           RuntimeError: Inference tensors do not track version counter.
+
+vllm/models/deepseek_v4_1/tilelang/router.py:203: RuntimeError
+__________ test_gate_router_route_local_under_inference_mode[4-1024] ___________
+
+plain_scratch = None
+monkeypatch = <_pytest.monkeypatch.MonkeyPatch object at 0xe0e2cd62e810>
+world_size = 4, num_tokens = 1024
+
+    @pytest.mark.parametrize(
+        "world_size,num_tokens", [(3, 205), (3, 800), (3, 1024), (4, 1024)]
+    )
+    def test_gate_router_route_local_under_inference_mode(
+        plain_scratch, monkeypatch, world_size, num_tokens
+    ):
+        """The worker runs every forward, its startup memory profile included, under
+        torch.inference_mode, where the step's padding mask and ids, and the masks
+        routing computes from them, are inference tensors: they track no version
+        counter. SP local routing keeps its local masks there too, on every rank, on
+        the partials path (local_rows <= 256) and the full-gate path, and routes the
+        bits it routes outside inference mode."""
+        from vllm.models.deepseek_v4_1 import sp_prefill
+    
+        router, generator = _sp_gate_router(num_tokens)
+        x = torch.randn(num_tokens, 5120, device="cuda", generator=generator).to(
+            torch.bfloat16
+        )
+        input_ids = torch.randint(
+            0, 1000, (num_tokens,), device="cuda", generator=generator
+        )
+        input_ids[1::4] = LO
+    
+        def forward(layout, layers):
+            context = _new_forward(monkeypatch)
+            context.is_padding = torch.zeros(num_tokens, dtype=torch.bool, device="cuda")
+            context.is_padding[num_tokens - 4 :] = True
+            ids = input_ids.clone()
+            local_x = layout.local_slice(x)
+            routes = [
+                router.route_local(local_x, layout, input_ids=ids) for _ in range(layers)
+            ]
+            return context, routes
+    
+        for rank in range(world_size):
+            layout = sp_prefill.SPRows(num_tokens, world_size, rank)
+            with torch.no_grad():
+                _, ((expected_weights, expected_ids),) = forward(layout, 1)
+            with torch.inference_mode():
+>               context, routes = forward(layout, 3)
+                                  ^^^^^^^^^^^^^^^^^^
+
+tests/kernels/moe/test_deepseek_v41_tilelang_router.py:715: 
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
+tests/kernels/moe/test_deepseek_v41_tilelang_router.py:706: in forward
+    router.route_local(local_x, layout, input_ids=ids) for _ in range(layers)
+    ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+vllm/models/deepseek_v4_1/tilelang/router.py:1232: in route_local
+    return self._compute_routing(
+vllm/models/deepseek_v4_1/tilelang/router.py:1285: in _compute_routing
+    route_mask, padding = _partials_mask(
+vllm/models/deepseek_v4_1/tilelang/router.py:285: in _partials_mask
+    return _local_mask(is_padding, rows, sp_rows, context=context, pad=True), True
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
+
+mask = tensor([False, False, False,  ...,  True,  True,  True], device='cuda:0')
+rows = 256
+sp_rows = SPRows(num_tokens=1024, world_size=4, rank=0, unreduced=False)
+context = <tests.kernels.moe.test_deepseek_v41_tilelang_router.Context object at 0xe0e2cd62c740>
+pad = True
+
+    def _local_mask(
+        mask: torch.Tensor | None,
+        rows: int,
+        sp_rows,
+        *,
+        context=None,
+        pad: bool = False,
+    ) -> torch.Tensor | None:
+        """``mask``'s first ``rows`` rows, or this rank's ``sp_rows.local_rows`` slice."""
+        if mask is None:
+            return None
+        if sp_rows is not None and mask.shape[0] != rows:
+            if context is None and is_forward_context_available():
+                context = get_forward_context()
+            holder = context if context is not None else sp_rows
+            cache = getattr(holder, "_ds41_local_masks", None)
+            if cache is None:
+                cache = {}
+                holder._ds41_local_masks = cache
+            key = (
+                id(mask),
+                sp_rows.num_tokens,
+                sp_rows.world_size,
+                sp_rows.rank,
+                rows,
+                pad,
+            )
+            entry = cache.get(key)
+            if entry is not None and entry[0] is mask and entry[1] == mask._version:
+                return entry[2]
+            src = mask[: sp_rows.num_tokens]
+            if pad and sp_rows.real_rows < sp_rows.local_rows:
+                local = src.new_ones((sp_rows.local_rows, *src.shape[1:]))
+                if sp_rows.real_rows:
+                    start = sp_rows.rank * sp_rows.local_rows
+                    local[: sp_rows.real_rows].copy_(src[start : start + sp_rows.real_rows])
+            else:
+                local = sp_rows.local_slice(src)
+>           cache[key] = (mask, mask._version, local)
+                                ^^^^^^^^^^^^^
+E           RuntimeError: Inference tensors do not track version counter.
+
+vllm/models/deepseek_v4_1/tilelang/router.py:203: RuntimeError
+_____________ test_gate_router_route_local_masks_last_one_forward ______________
+
+plain_scratch = None
+monkeypatch = <_pytest.monkeypatch.MonkeyPatch object at 0xe0e2cd5bea20>
+
+    def test_gate_router_route_local_masks_last_one_forward(plain_scratch, monkeypatch):
+        """The runner refills its padding and id buffers in place every step and hands
+        each forward new views of them in a new ForwardContext. A forward's SP local
+        masks are its own: never the previous forward's, though the buffers' storage,
+        the row count and the layout are the same."""
+        from vllm.models.deepseek_v4_1 import sp_prefill
+    
+        num_tokens, world_size = 800, 3
+        layout = sp_prefill.SPRows(num_tokens, world_size, world_size - 1)
+        assert layout.real_rows < layout.local_rows
+        router, generator = _sp_gate_router(num_tokens)
+        x = torch.randn(num_tokens, 5120, device="cuda", generator=generator).to(
+            torch.bfloat16
+        )
+        local_x = layout.local_slice(x)
+        first_ids = torch.randint(
+            0, 1000, (num_tokens,), device="cuda", generator=generator
+        )
+        first_ids[1::4] = LO
+        second_ids = first_ids.clone()
+        second_ids[1::4] = 7
+        second_ids[2::4] = LO
+        steps = [(first_ids, 4), (second_ids, 40), (first_ids, 4)]
+        padding_buffer = torch.zeros(num_tokens, dtype=torch.bool, device="cuda")
+        ids_buffer = torch.zeros(num_tokens, dtype=torch.int64, device="cuda")
+        real = slice(layout.start, layout.start + layout.real_rows)
+    
+        with torch.inference_mode():
+            for step_ids, padding in steps:
+                # The full-row reference, in a forward of its own.
+                context = _new_forward(monkeypatch)
+                context.is_padding = torch.zeros_like(padding_buffer)
+                context.is_padding[num_tokens - padding :] = True
+                expected_weights, expected_ids = router._compute_routing(
+                    None, x, None, input_ids=step_ids.clone()
+                )
+                # The step: its buffers refilled in place, as the runner fills them.
+                padding_buffer.fill_(False)
+                padding_buffer[num_tokens - padding :] = True
+                ids_buffer.copy_(step_ids)
+                context = _new_forward(monkeypatch)
+                context.is_padding = padding_buffer[:num_tokens]
+                ids = ids_buffer[:num_tokens]
+                first_pad = num_tokens - padding - layout.start
+                for _ in range(2):
+>                   weights, topk_ids = router.route_local(local_x, layout, input_ids=ids)
+                                        ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+tests/kernels/moe/test_deepseek_v41_tilelang_router.py:772: 
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
+vllm/models/deepseek_v4_1/tilelang/router.py:1232: in route_local
+    return self._compute_routing(
+vllm/models/deepseek_v4_1/tilelang/router.py:1266: in _compute_routing
+    return super()._compute_routing(
+vllm/models/deepseek_v4_1/tilelang/router.py:877: in _compute_routing
+    image_token_mask, mask = _routing_masks(
+vllm/models/deepseek_v4_1/tilelang/router.py:266: in _routing_masks
+    route = _local_mask(routed, rows, sp_rows, context=context)
+            ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
+
+mask = tensor([ True,  True,  True,  True,  True,  True,  True,  True,  True,  True,
+         True,  True,  True,  True,  Tru...e,  True,  True,
+         True,  True,  True,  True,  True,  True, False, False, False, False],
+       device='cuda:0')
+rows = 267
+sp_rows = SPRows(num_tokens=800, world_size=3, rank=2, unreduced=False)
+context = <tests.kernels.moe.test_deepseek_v41_tilelang_router.Context object at 0xe0e2cd5bf830>
+pad = False
+
+    def _local_mask(
+        mask: torch.Tensor | None,
+        rows: int,
+        sp_rows,
+        *,
+        context=None,
+        pad: bool = False,
+    ) -> torch.Tensor | None:
+        """``mask``'s first ``rows`` rows, or this rank's ``sp_rows.local_rows`` slice."""
+        if mask is None:
+            return None
+        if sp_rows is not None and mask.shape[0] != rows:
+            if context is None and is_forward_context_available():
+                context = get_forward_context()
+            holder = context if context is not None else sp_rows
+            cache = getattr(holder, "_ds41_local_masks", None)
+            if cache is None:
+                cache = {}
+                holder._ds41_local_masks = cache
+            key = (
+                id(mask),
+                sp_rows.num_tokens,
+                sp_rows.world_size,
+                sp_rows.rank,
+                rows,
+                pad,
+            )
+            entry = cache.get(key)
+            if entry is not None and entry[0] is mask and entry[1] == mask._version:
+                return entry[2]
+            src = mask[: sp_rows.num_tokens]
+            if pad and sp_rows.real_rows < sp_rows.local_rows:
+                local = src.new_ones((sp_rows.local_rows, *src.shape[1:]))
+                if sp_rows.real_rows:
+                    start = sp_rows.rank * sp_rows.local_rows
+                    local[: sp_rows.real_rows].copy_(src[start : start + sp_rows.real_rows])
+            else:
+                local = sp_rows.local_slice(src)
+>           cache[key] = (mask, mask._version, local)
+                                ^^^^^^^^^^^^^
+E           RuntimeError: Inference tensors do not track version counter.
+
+vllm/models/deepseek_v4_1/tilelang/router.py:203: RuntimeError
+________________ test_gate_router_route_local_outside_a_forward ________________
+
+plain_scratch = None
+
+    def test_gate_router_route_local_outside_a_forward(plain_scratch):
+        """Outside a forward (no ForwardContext) SP local routing keeps nothing: the
+        row layout is a frozen value, not a step, and it routes as the full rows do."""
+        from vllm.models.deepseek_v4_1 import sp_prefill
+    
+        assert not tilelang_router.is_forward_context_available()
+        num_tokens, world_size = 800, 3
+        router, generator = _sp_gate_router(num_tokens)
+        x = torch.randn(num_tokens, 5120, device="cuda", generator=generator).to(
+            torch.bfloat16
+        )
+        input_ids = torch.randint(
+            0, 1000, (num_tokens,), device="cuda", generator=generator
+        )
+        input_ids[1::4] = LO
+        expected_weights, expected_ids = router._compute_routing(
+            None, x, None, input_ids=input_ids
+        )
+        for rank in range(world_size):
+            layout = sp_prefill.SPRows(num_tokens, world_size, rank)
+            real = slice(layout.start, layout.start + layout.real_rows)
+            with torch.inference_mode():
+                for _ in range(2):
+>                   weights, ids = router.route_local(
+                        layout.local_slice(x), layout, input_ids=input_ids
+                    )
+
+tests/kernels/moe/test_deepseek_v41_tilelang_router.py:805: 
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
+vllm/models/deepseek_v4_1/tilelang/router.py:1232: in route_local
+    return self._compute_routing(
+vllm/models/deepseek_v4_1/tilelang/router.py:1266: in _compute_routing
+    return super()._compute_routing(
+vllm/models/deepseek_v4_1/tilelang/router.py:877: in _compute_routing
+    image_token_mask, mask = _routing_masks(
+vllm/models/deepseek_v4_1/tilelang/router.py:262: in _routing_masks
+    holder._ds41_image_token_mask = (ids, image)
+    ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
+
+self = SPRows(num_tokens=800, world_size=3, rank=0, unreduced=False)
+name = '_ds41_image_token_mask'
+value = (tensor([   764, 129264,    635,    841,    764, 129264,    402,    573,    280,
+        129264,    715,    967,    99..., False,  True,
+        False, False, False,  True, False, False, False,  True, False, False],
+       device='cuda:0'))
+
+>   ???
+E   dataclasses.FrozenInstanceError: cannot assign to field '_ds41_image_token_mask'
+
+<string>:4: FrozenInstanceError
+=========================== short test summary info ============================
+FAILED tests/kernels/moe/test_deepseek_v41_tilelang_router.py::test_gate_router_route_local_under_inference_mode[3-205]
+FAILED tests/kernels/moe/test_deepseek_v41_tilelang_router.py::test_gate_router_route_local_under_inference_mode[3-800]
+FAILED tests/kernels/moe/test_deepseek_v41_tilelang_router.py::test_gate_router_route_local_under_inference_mode[3-1024]
+FAILED tests/kernels/moe/test_deepseek_v41_tilelang_router.py::test_gate_router_route_local_under_inference_mode[4-1024]
+FAILED tests/kernels/moe/test_deepseek_v41_tilelang_router.py::test_gate_router_route_local_masks_last_one_forward
+FAILED tests/kernels/moe/test_deepseek_v41_tilelang_router.py::test_gate_router_route_local_outside_a_forward
+====================== 6 failed, 83 deselected in 17.41s =======================
