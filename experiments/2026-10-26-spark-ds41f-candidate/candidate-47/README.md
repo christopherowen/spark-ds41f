@@ -25,10 +25,22 @@ Unpromoted release candidate: spark-ds41f-1107 plus 8 PRs, #986 (the owner's pri
 | `0768-perf-dsv41-align-qb-and-indexer-qb-tile-contiguous-decode.patch` | #1016 | perf(dsv41): align Q-B and indexer Q-B decode tiles with 128x128 tile-contiguous weights | `a272efff662e` |
 | `0769-perf-dsv41-sparse-mla-stage1-kv-gather-and-barrier-opt.patch` | #964 | perf(dsv41): sparse MLA stage-1 KV gather and staging barrier opt | `d6d69b92afb9` |
 
-## Arms
+## Cluster configurations
 
-- [tp4.json](tp4.json): extends `releases/spark-ds41f-1107/cluster.json` at `tp4-ring`, and sets only the image `spark-ds41f:candidate-47`, its tree labels and this lock. No PR changes the recipe.
-- [tp4-dev.json](tp4-dev.json): adds the dev-mode collective RPC for the engine grid.
+A cluster configuration for every shape the recipe serves, so the candidate can be run on any setup: `bin/spark --cluster-config experiments/2026-10-26-spark-ds41f-candidate/candidate-47/<file> …` with your site's node map. Each one extends `releases/spark-ds41f-1107/cluster.json` at its shape and sets only the image `spark-ds41f:candidate-47`, its tree labels and this lock; no PR changes the recipe. The `-dev` file adds the dev-mode collective RPC that the release suite's engine grid needs. This candidate is measured at `tp4-ring` only; the other files are configurations, not part of its runs.
+
+| Shape | Configuration | With dev RPC | |
+| --- | --- | --- | --- |
+| `tp4-ring` | [tp4.json](tp4.json) | [tp4-dev.json](tp4-dev.json) | tested here |
+| `tp3-triangle` | [tp3.json](tp3.json) | [tp3-dev.json](tp3-dev.json) |  |
+| `tp3-triangle-4k` | [tp3-triangle-4k.json](tp3-triangle-4k.json) | [tp3-triangle-4k-dev.json](tp3-triangle-4k-dev.json) |  |
+| `tp3-switched` | [tp3-switched.json](tp3-switched.json) | [tp3-switched-dev.json](tp3-switched-dev.json) |  |
+| `tp4-switched` | [tp4-switched.json](tp4-switched.json) | [tp4-switched-dev.json](tp4-switched-dev.json) |  |
+| `tp5-switched` | [tp5-switched.json](tp5-switched.json) | [tp5-switched-dev.json](tp5-switched-dev.json) |  |
+| `tp6-switched` | [tp6-switched.json](tp6-switched.json) | [tp6-switched-dev.json](tp6-switched-dev.json) |  |
+| `tp7-switched` | [tp7-switched.json](tp7-switched.json) | [tp7-switched-dev.json](tp7-switched-dev.json) |  |
+| `tp8-switched` | [tp8-switched.json](tp8-switched.json) | [tp8-switched-dev.json](tp8-switched-dev.json) |  |
+
 - [image-dgx4.json](image-dgx4.json): build-only profile.
 - [tp4-no986.json](tp4-no986.json), [tp4-no986-dev.json](tp4-no986-dev.json): candidate-47 without #986. They use the same image, with 1107's `adaptive_verification.py` mounted from [no986/overlay](no986/overlay). #986 is pure Python and no later patch here touches that file, so the arm is candidate-47 minus exactly #986 (SHA-256 in [receipts/selection.json](receipts/selection.json)).
 
