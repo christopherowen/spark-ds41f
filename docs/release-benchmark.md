@@ -121,13 +121,22 @@ bin/spark --cluster-config <dir>/image-dgx4.json build prepare --only vllm --loc
 - **Build:** the `image` job builds each candidate on dgx4 and copies it along the ring.
 - **Release tests:** ONE `kernel` job runs every candidate's release-test bundle at once, each
   on its own node. A bundle takes about 45-50 minutes.
-- **Spaceport copies:** dgx does not reach spaceport, so stream each spaceport candidate's
-  image to its testbed head:
+- **Spaceport copies:** dgx does not reach spaceport, so each image crosses through the owner's
+  laptop once, to sp1, and fans out over the spaceport fabric:
   ```bash
-  ssh dgx1 docker save spark-ds41f:candidate-<N> | ssh <head> docker load
+  ssh dgx1 docker save spark-ds41f:candidate-<N> | ssh sp1 docker load
   ```
-  Then run `bin/spark --cluster-config <dir>/<shape>.json build distribute --apply` from the
-  head, and check that every node shows the same image ID.
+  - Stream one image at a time. On 2026-11-09, two parallel streams ran at about 2.5 MB/s each,
+    and each 10.5 GB image took 108 minutes.
+  - A candidate for `tp3-switched` goes on from sp1 to its head, over the fabric:
+    `ssh sp1 'docker save spark-ds41f:candidate-<N> | ssh sp5 docker load'`.
+  - On each head, run `bin/spark --cluster-config <dir>/<shape>.json build distribute --apply`, and
+    check that every node shows the same image ID. Over the fabric this took 4–6 minutes for
+    3–4 ranks.
+- **Production first:** a spaceport window opens only with its production profile live
+  (`doctor --live`). If the testbed was stopped, start 1107 there first:
+  `bin/spark --cluster-config config/cluster.json cluster start --replace --apply`, after reading
+  the plan.
 
 ### 5. Gate first
 
