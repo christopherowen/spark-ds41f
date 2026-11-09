@@ -141,7 +141,18 @@ A promotion commit must:
    (every step's output except the model step's generated text, plus the release
    table), named by that shape's `benchmark_reference`. `bin/spark bench --suite`
    compares with it. Releases before r6l recorded a `bin/spark bench` report as
-   `manifests/benchmarks/<baseline>[-<shape>].json` instead;
+   `manifests/benchmarks/<baseline>[-<shape>].json` instead. This is done for EVERY shape
+   the release is qualified on, with the companion runs beside it and the repeat boot.
+
+   **Keep every qualification record in the repository** (owner, 2026-11-09). That means
+   the suite runs and the other records: the quality evals, AgentX, the gate, startup
+   memory, collective probes and telemetry, under the release's candidate folder
+   `receipts/`. Later candidates compare against them, and the next release notes report
+   against them. A record left only on a node (`~/spark-lab`, `results/private`) can't be
+   found, so the release ends up measured again. 1107's switched records were left on the
+   nodes and recovered on 2026-11-09 (`experiments/2026-10-26-spark-ds41f-candidate/1107/receipts/`).
+   Files too large to commit stay on the nodes, listed in the receipts with their host,
+   path, size and SHA-256;
 8. pass the release tests on the promoted image ([testing](testing.md)):
    `scripts/release_tests.py check` reports no unclassified, ambiguous or missing file
    for the release's patch series, and the gate bundle exits 0;

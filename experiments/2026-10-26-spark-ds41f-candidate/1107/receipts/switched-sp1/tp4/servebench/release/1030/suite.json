@@ -1,0 +1,436 @@
+{
+ "schema": "servebench-suite/1",
+ "suite": {
+  "name": "release",
+  "version": 3,
+  "description": "Release measurement, about 60 minutes a build: the screen with all 256 prompts, eight streams as well, Poisson arrivals at 0.7 requests/s (about 80% of sixteen streams' rate) with goodput under a 2 s time to first token and 100 ms per output token, decode stalls while a cold 131K prompt prefills at three depths of the sixteen slots (3 and 11 streams, with short probes sent 2-14 s into it, whose time to first token is what a new conversation waits; 15 streams, which fills every slot during the prefill), and real-text prefill from 32K to 1M. Its grid needs the dev-mode collective RPC.",
+  "steps": [
+   {
+    "id": "model",
+    "command": "model",
+    "args": {
+     "concurrency": 16,
+     "max_tokens": 256,
+     "top": 20
+    }
+   },
+   {
+    "id": "grid",
+    "command": "engine",
+    "args": {
+     "replays": 100,
+     "settle": 1
+    }
+   },
+   {
+    "id": "c16",
+    "command": "run",
+    "args": {
+     "mode": "closed",
+     "concurrency": 16,
+     "warmup": 60,
+     "duration": 300,
+     "extra_body": {
+      "chat_template_kwargs": {
+       "thinking": false
+      }
+     }
+    }
+   },
+   {
+    "id": "c8",
+    "command": "run",
+    "args": {
+     "mode": "closed",
+     "concurrency": 8,
+     "warmup": 60,
+     "duration": 300,
+     "extra_body": {
+      "chat_template_kwargs": {
+       "thinking": false
+      }
+     }
+    }
+   },
+   {
+    "id": "poisson",
+    "command": "run",
+    "args": {
+     "mode": "poisson",
+     "rate": 0.7,
+     "warmup": 60,
+     "duration": 300,
+     "slo_ttft": 2,
+     "slo_tpot": 100,
+     "extra_body": {
+      "chat_template_kwargs": {
+       "thinking": false
+      }
+     }
+    }
+   },
+   {
+    "id": "stall-3",
+    "command": "stall",
+    "args": {
+     "sizes": [
+      131072
+     ],
+     "streams": 3,
+     "max_tokens": 16384,
+     "warmup": 20,
+     "tail": 2,
+     "repeats": 3,
+     "probes": [
+      2,
+      5,
+      8,
+      11,
+      14
+     ],
+     "probe_tokens": 500,
+     "probe_max_tokens": 16
+    }
+   },
+   {
+    "id": "stall-11",
+    "command": "stall",
+    "args": {
+     "sizes": [
+      131072
+     ],
+     "streams": 11,
+     "max_tokens": 16384,
+     "warmup": 20,
+     "tail": 2,
+     "repeats": 3,
+     "probes": [
+      2,
+      5,
+      8,
+      11,
+      14
+     ],
+     "probe_tokens": 500,
+     "probe_max_tokens": 16
+    }
+   },
+   {
+    "id": "stall-15",
+    "command": "stall",
+    "args": {
+     "sizes": [
+      131072
+     ],
+     "streams": 15,
+     "max_tokens": 16384,
+     "warmup": 20,
+     "tail": 2,
+     "repeats": 3
+    }
+   },
+   {
+    "id": "prefill",
+    "command": "prefill",
+    "args": {
+     "sizes": [
+      32768,
+      131072,
+      262144,
+      524288,
+      1000000
+     ],
+     "repeats": 3
+    }
+   }
+  ]
+ },
+ "suite_sha256": "2c1698722fafa68c534a2197673c418fa9b465c0dbaa70f53d9105a4271c4d87",
+ "label": "1030",
+ "corpus": null,
+ "started_utc": "2026-11-01T05:52:01+00:00",
+ "steps": [
+  {
+   "id": "model",
+   "command": "model",
+   "output": "model.json.gz",
+   "exit": 0,
+   "seconds": 298.6
+  },
+  {
+   "id": "grid",
+   "command": "engine",
+   "output": "grid.json",
+   "exit": 0,
+   "seconds": 104.9
+  },
+  {
+   "id": "c16",
+   "command": "run",
+   "output": "c16.json",
+   "exit": 0,
+   "seconds": 370.8
+  },
+  {
+   "id": "c8",
+   "command": "run",
+   "output": "c8.json",
+   "exit": 0,
+   "seconds": 367.0
+  },
+  {
+   "id": "poisson",
+   "command": "run",
+   "output": "poisson.json",
+   "exit": 0,
+   "seconds": 366.3
+  },
+  {
+   "id": "stall-3",
+   "command": "stall",
+   "output": "stall-3.json",
+   "exit": 0,
+   "seconds": 129.1
+  },
+  {
+   "id": "stall-11",
+   "command": "stall",
+   "output": "stall-11.json",
+   "exit": 0,
+   "seconds": 131.2
+  },
+  {
+   "id": "stall-15",
+   "command": "stall",
+   "output": "stall-15.json",
+   "exit": 0,
+   "seconds": 124.6
+  },
+  {
+   "id": "prefill",
+   "command": "prefill",
+   "output": "prefill.json",
+   "exit": 0,
+   "seconds": 991.0
+  }
+ ],
+ "metadata": {
+  "identity": {
+   "cluster_config": "config/1030-tp4-switched-dev.local.json",
+   "cluster_config_sha256": "e23af45e3471175923c6c6bd1f976c6770baa45bd3ba0acbfc86f1e432436be1",
+   "nodes_config": "config/nodes-switched.local.json",
+   "topology": {
+    "schema_version": 1,
+    "ssh_user": "chris",
+    "nodes": [
+     {
+      "name": "sp1",
+      "rank": 0,
+      "management_ip": "10.30.0.9",
+      "head": true,
+      "roce_gid_index": 3,
+      "management_interface": "enp1s0f0np0",
+      "roce_hcas": [
+       "rocep1s0f0",
+       "roceP2p1s0f0"
+      ],
+      "roce_subnets": {
+       "rocep1s0f0": "10.30.0.0/24",
+       "roceP2p1s0f0": "10.30.1.0/24"
+      },
+      "roce_traffic_class": 106
+     },
+     {
+      "name": "sp2",
+      "rank": 1,
+      "management_ip": "10.30.0.10",
+      "head": false,
+      "roce_gid_index": 3,
+      "management_interface": "enp1s0f0np0",
+      "roce_hcas": [
+       "rocep1s0f0",
+       "roceP2p1s0f0"
+      ],
+      "roce_subnets": {
+       "rocep1s0f0": "10.30.0.0/24",
+       "roceP2p1s0f0": "10.30.1.0/24"
+      },
+      "roce_traffic_class": 106
+     },
+     {
+      "name": "sp3",
+      "rank": 2,
+      "management_ip": "10.30.0.11",
+      "head": false,
+      "roce_gid_index": 3,
+      "management_interface": "enp1s0f0np0",
+      "roce_hcas": [
+       "rocep1s0f0",
+       "roceP2p1s0f0"
+      ],
+      "roce_subnets": {
+       "rocep1s0f0": "10.30.0.0/24",
+       "roceP2p1s0f0": "10.30.1.0/24"
+      },
+      "roce_traffic_class": 106
+     },
+     {
+      "name": "sp4",
+      "rank": 3,
+      "management_ip": "10.30.0.12",
+      "head": false,
+      "roce_gid_index": 3,
+      "management_interface": "enp1s0f0np0",
+      "roce_hcas": [
+       "rocep1s0f0",
+       "roceP2p1s0f0"
+      ],
+      "roce_subnets": {
+       "rocep1s0f0": "10.30.0.0/24",
+       "roceP2p1s0f0": "10.30.1.0/24"
+      },
+      "roce_traffic_class": 106
+     }
+    ]
+   },
+   "transport": "oneshot-switched",
+   "kernel_backend": "tilelang",
+   "promoted_baseline": "2026-10-30-spark-ds41f-1030",
+   "image": "spark-ds41f:1030",
+   "client_commit": "bc16160378586565b425e313191046fc7dca7960",
+   "client_dirty": false,
+   "client_host": "spark-0009",
+   "nodes": {
+    "sp1": {
+     "image_id": "sha256:b0ab988dc074d88f001aeb5c341da919b5755548fcc3e1e9bdb4bb158c1b801c",
+     "container_started_at": "2026-11-01T05:50:15.455678259Z",
+     "checkout": "bc16160378586565b425e313191046fc7dca7960"
+    },
+    "sp2": {
+     "image_id": "sha256:59c6f0a3dac3917b3c5be7e8f630b1c20267f91d829f0a97019b853bfe841282",
+     "container_started_at": "2026-11-01T05:50:15.024344202Z",
+     "checkout": "bc16160378586565b425e313191046fc7dca7960"
+    },
+    "sp3": {
+     "image_id": "sha256:acfc4af971388e1d3299d4356ab1f3e342b4e977dcfbf31357b9d6772695aae1",
+     "container_started_at": "2026-11-01T05:50:15.02567508Z",
+     "checkout": "bc16160378586565b425e313191046fc7dca7960"
+    },
+    "sp4": {
+     "image_id": "sha256:350538854640c023f8c5bbb1304eb183aa65c3edd1813a9011ee273df0f1dd9e",
+     "container_started_at": "2026-11-01T05:50:15.02115768Z",
+     "checkout": "bc16160378586565b425e313191046fc7dca7960"
+    }
+   },
+   "live_problems": [],
+   "live_warnings": [
+    "sp1: running kernel/page size is outside the prepared pair: '7.0.0-1024-nvidia'/4096",
+    "sp1: 64 KiB package versions differ: linux-tools-7.0.0-1019-nvidia-64k, linux-image-7.0.0-1019-nvidia-64k, linux-modules-7.0.0-1019-nvidia-64k, linux-headers-7.0.0-1019-nvidia-64k, linux-modules-nvidia-580-open-7.0.0-1019-nvidia-64k",
+    "sp1: missing or empty /boot/vmlinuz-7.0.0-1019-nvidia-64k",
+    "sp1: missing or empty /boot/initrd.img-7.0.0-1019-nvidia-64k",
+    "sp1: missing or empty /boot/config-7.0.0-1019-nvidia-64k",
+    "sp1: candidate headers or CONFIG_ARM64_64K_PAGES=y missing",
+    "sp1: candidate cpupower tool is missing; nv-cpu-governor.service cannot run on that kernel",
+    "sp1: nvidia is not prepared for 7.0.0-1019-nvidia-64k",
+    "sp1: candidate nvidia driver version differs from 580.178.04",
+    "sp1: nvidia_uvm is not prepared for 7.0.0-1019-nvidia-64k",
+    "sp1: candidate nvidia_uvm driver version differs from 580.178.04",
+    "sp1: nvidia_drm is not prepared for 7.0.0-1019-nvidia-64k",
+    "sp1: candidate nvidia_drm driver version differs from 580.178.04",
+    "sp1: mlx5_core is not prepared for 7.0.0-1019-nvidia-64k",
+    "sp1: mlx5_ib is not prepared for 7.0.0-1019-nvidia-64k",
+    "sp1: dgx_ec_fan_control is not prepared for 7.0.0-1019-nvidia-64k",
+    "sp1: fan-control DKMS is not installed for 7.0.0-1019-nvidia-64k",
+    "sp1: Secure Boot is enabled but the candidate fan signature/enrolled key is unverified",
+    "sp1: candidate is missing from GRUB",
+    "sp1: normal boot is not explicitly pinned to 7.0.0-1019-nvidia-64k (GRUB default '0')",
+    "sp1: memory-saver DKMS 0.4.1 is missing or not installed for 7.0.0-1019-nvidia-64k",
+    "sp1: candidate UVM does not select the expected memory-saver DKMS module",
+    "sp1: memory-saver module has no readable Secure Boot signer",
+    "sp1: serving profile recommends 7.0.0-1019-nvidia-64k / 65536-byte pages; running '7.0.0-1024-nvidia' / 4096",
+    "sp1: booted with splash, but the boot configuration omits it now; reboot with the service stopped to apply",
+    "sp1: DKMS dgx-spark-fan-control is not installed for 7.0.0-1024-nvidia; serving does not need it, bench does; run sudo dkms autoinstall -k 7.0.0-1024-nvidia",
+    "sp2: running kernel/page size is outside the prepared pair: '7.0.0-1024-nvidia'/4096",
+    "sp2: 64 KiB package versions differ: linux-tools-7.0.0-1019-nvidia-64k, linux-image-7.0.0-1019-nvidia-64k, linux-modules-7.0.0-1019-nvidia-64k, linux-headers-7.0.0-1019-nvidia-64k, linux-modules-nvidia-580-open-7.0.0-1019-nvidia-64k",
+    "sp2: missing or empty /boot/vmlinuz-7.0.0-1019-nvidia-64k",
+    "sp2: missing or empty /boot/initrd.img-7.0.0-1019-nvidia-64k",
+    "sp2: missing or empty /boot/config-7.0.0-1019-nvidia-64k",
+    "sp2: candidate headers or CONFIG_ARM64_64K_PAGES=y missing",
+    "sp2: candidate cpupower tool is missing; nv-cpu-governor.service cannot run on that kernel",
+    "sp2: nvidia is not prepared for 7.0.0-1019-nvidia-64k",
+    "sp2: candidate nvidia driver version differs from 580.178.04",
+    "sp2: nvidia_uvm is not prepared for 7.0.0-1019-nvidia-64k",
+    "sp2: candidate nvidia_uvm driver version differs from 580.178.04",
+    "sp2: nvidia_drm is not prepared for 7.0.0-1019-nvidia-64k",
+    "sp2: candidate nvidia_drm driver version differs from 580.178.04",
+    "sp2: mlx5_core is not prepared for 7.0.0-1019-nvidia-64k",
+    "sp2: mlx5_ib is not prepared for 7.0.0-1019-nvidia-64k",
+    "sp2: dgx_ec_fan_control is not prepared for 7.0.0-1019-nvidia-64k",
+    "sp2: fan-control DKMS is not installed for 7.0.0-1019-nvidia-64k",
+    "sp2: Secure Boot is enabled but the candidate fan signature/enrolled key is unverified",
+    "sp2: candidate is missing from GRUB",
+    "sp2: normal boot is not explicitly pinned to 7.0.0-1019-nvidia-64k (GRUB default '0')",
+    "sp2: memory-saver DKMS 0.4.1 is missing or not installed for 7.0.0-1019-nvidia-64k",
+    "sp2: candidate UVM does not select the expected memory-saver DKMS module",
+    "sp2: memory-saver module has no readable Secure Boot signer",
+    "sp2: serving profile recommends 7.0.0-1019-nvidia-64k / 65536-byte pages; running '7.0.0-1024-nvidia' / 4096",
+    "sp2: booted with splash, but the boot configuration omits it now; reboot with the service stopped to apply",
+    "sp2: DKMS dgx-spark-fan-control is not installed for 7.0.0-1024-nvidia; serving does not need it, bench does; run sudo dkms autoinstall -k 7.0.0-1024-nvidia",
+    "sp3: running kernel/page size is outside the prepared pair: '7.0.0-1024-nvidia'/4096",
+    "sp3: 64 KiB package versions differ: linux-tools-7.0.0-1019-nvidia-64k, linux-image-7.0.0-1019-nvidia-64k, linux-modules-7.0.0-1019-nvidia-64k, linux-headers-7.0.0-1019-nvidia-64k, linux-modules-nvidia-580-open-7.0.0-1019-nvidia-64k",
+    "sp3: missing or empty /boot/vmlinuz-7.0.0-1019-nvidia-64k",
+    "sp3: missing or empty /boot/initrd.img-7.0.0-1019-nvidia-64k",
+    "sp3: missing or empty /boot/config-7.0.0-1019-nvidia-64k",
+    "sp3: candidate headers or CONFIG_ARM64_64K_PAGES=y missing",
+    "sp3: candidate cpupower tool is missing; nv-cpu-governor.service cannot run on that kernel",
+    "sp3: nvidia is not prepared for 7.0.0-1019-nvidia-64k",
+    "sp3: candidate nvidia driver version differs from 580.178.04",
+    "sp3: nvidia_uvm is not prepared for 7.0.0-1019-nvidia-64k",
+    "sp3: candidate nvidia_uvm driver version differs from 580.178.04",
+    "sp3: nvidia_drm is not prepared for 7.0.0-1019-nvidia-64k",
+    "sp3: candidate nvidia_drm driver version differs from 580.178.04",
+    "sp3: mlx5_core is not prepared for 7.0.0-1019-nvidia-64k",
+    "sp3: mlx5_ib is not prepared for 7.0.0-1019-nvidia-64k",
+    "sp3: dgx_ec_fan_control is not prepared for 7.0.0-1019-nvidia-64k",
+    "sp3: fan-control DKMS is not installed for 7.0.0-1019-nvidia-64k",
+    "sp3: Secure Boot is enabled but the candidate fan signature/enrolled key is unverified",
+    "sp3: candidate is missing from GRUB",
+    "sp3: normal boot is not explicitly pinned to 7.0.0-1019-nvidia-64k (GRUB default '0')",
+    "sp3: memory-saver DKMS 0.4.1 is missing or not installed for 7.0.0-1019-nvidia-64k",
+    "sp3: candidate UVM does not select the expected memory-saver DKMS module",
+    "sp3: memory-saver module has no readable Secure Boot signer",
+    "sp3: serving profile recommends 7.0.0-1019-nvidia-64k / 65536-byte pages; running '7.0.0-1024-nvidia' / 4096",
+    "sp3: booted with splash, but the boot configuration omits it now; reboot with the service stopped to apply",
+    "sp3: DKMS dgx-spark-fan-control is not installed for 7.0.0-1024-nvidia; serving does not need it, bench does; run sudo dkms autoinstall -k 7.0.0-1024-nvidia",
+    "sp4: running kernel/page size is outside the prepared pair: '7.0.0-1024-nvidia'/4096",
+    "sp4: 64 KiB package versions differ: linux-tools-7.0.0-1019-nvidia-64k, linux-image-7.0.0-1019-nvidia-64k, linux-modules-7.0.0-1019-nvidia-64k, linux-headers-7.0.0-1019-nvidia-64k, linux-modules-nvidia-580-open-7.0.0-1019-nvidia-64k",
+    "sp4: missing or empty /boot/vmlinuz-7.0.0-1019-nvidia-64k",
+    "sp4: missing or empty /boot/initrd.img-7.0.0-1019-nvidia-64k",
+    "sp4: missing or empty /boot/config-7.0.0-1019-nvidia-64k",
+    "sp4: candidate headers or CONFIG_ARM64_64K_PAGES=y missing",
+    "sp4: candidate cpupower tool is missing; nv-cpu-governor.service cannot run on that kernel",
+    "sp4: nvidia is not prepared for 7.0.0-1019-nvidia-64k",
+    "sp4: candidate nvidia driver version differs from 580.178.04",
+    "sp4: nvidia_uvm is not prepared for 7.0.0-1019-nvidia-64k",
+    "sp4: candidate nvidia_uvm driver version differs from 580.178.04",
+    "sp4: nvidia_drm is not prepared for 7.0.0-1019-nvidia-64k",
+    "sp4: candidate nvidia_drm driver version differs from 580.178.04",
+    "sp4: mlx5_core is not prepared for 7.0.0-1019-nvidia-64k",
+    "sp4: mlx5_ib is not prepared for 7.0.0-1019-nvidia-64k",
+    "sp4: dgx_ec_fan_control is not prepared for 7.0.0-1019-nvidia-64k",
+    "sp4: fan-control DKMS is not installed for 7.0.0-1019-nvidia-64k",
+    "sp4: Secure Boot is enabled but the candidate fan signature/enrolled key is unverified",
+    "sp4: candidate is missing from GRUB",
+    "sp4: normal boot is not explicitly pinned to 7.0.0-1019-nvidia-64k (GRUB default '0')",
+    "sp4: memory-saver DKMS 0.4.1 is missing or not installed for 7.0.0-1019-nvidia-64k",
+    "sp4: candidate UVM does not select the expected memory-saver DKMS module",
+    "sp4: memory-saver module has no readable Secure Boot signer",
+    "sp4: serving profile recommends 7.0.0-1019-nvidia-64k / 65536-byte pages; running '7.0.0-1024-nvidia' / 4096",
+    "sp4: booted with splash, but the boot configuration omits it now; reboot with the service stopped to apply",
+    "sp4: DKMS dgx-spark-fan-control is not installed for 7.0.0-1024-nvidia; serving does not need it, bench does; run sudo dkms autoinstall -k 7.0.0-1024-nvidia",
+    "Kernel corrections (not executed):\n  sp1: sudo apt-get install linux-tools-7.0.0-1019-nvidia-64k=7.0.0-1019.19~24.04.2 linux-image-7.0.0-1019-nvidia-64k=7.0.0-1019.19~24.04.2 linux-modules-7.0.0-1019-nvidia-64k=7.0.0-1019.19~24.04.2 linux-headers-7.0.0-1019-nvidia-64k=7.0.0-1019.19~24.04.2 linux-modules-nvidia-580-open-7.0.0-1019-nvidia-64k\n  sp1: sudo dkms autoinstall -k 7.0.0-1019-nvidia-64k\n  sp1: sudo update-grub\n  sp1: restore the configured entry in /etc/default/grub.d/zz-spark-kernel-trial.cfg, then sudo update-grub\n  sp1: register the pinned source using docs/memory-profiles.md#install-memory-saver; then sudo dkms install -m dgx-spark-memory-saver -v 0.4.1 -k 7.0.0-1019-nvidia-64k. For a loaded-module mismatch, stop GPU clients and reboot into the configured kernel.\n  sp2: sudo apt-get install linux-tools-7.0.0-1019-nvidia-64k=7.0.0-1019.19~24.04.2 linux-image-7.0.0-1019-nvidia-64k=7.0.0-1019.19~24.04.2 linux-modules-7.0.0-1019-nvidia-64k=7.0.0-1019.19~24.04.2 linux-headers-7.0.0-1019-nvidia-64k=7.0.0-1019.19~24.04.2 linux-modules-nvidia-580-open-7.0.0-1019-nvidia-64k\n  sp2: sudo dkms autoinstall -k 7.0.0-1019-nvidia-64k\n  sp2: sudo update-grub\n  sp2: restore the configured entry in /etc/default/grub.d/zz-spark-kernel-trial.cfg, then sudo update-grub\n  sp2: register the pinned source using docs/memory-profiles.md#install-memory-saver; then sudo dkms install -m dgx-spark-memory-saver -v 0.4.1 -k 7.0.0-1019-nvidia-64k. For a loaded-module mismatch, stop GPU clients and reboot into the configured kernel.\n  sp3: sudo apt-get install linux-tools-7.0.0-1019-nvidia-64k=7.0.0-1019.19~24.04.2 linux-image-7.0.0-1019-nvidia-64k=7.0.0-1019.19~24.04.2 linux-modules-7.0.0-1019-nvidia-64k=7.0.0-1019.19~24.04.2 linux-headers-7.0.0-1019-nvidia-64k=7.0.0-1019.19~24.04.2 linux-modules-nvidia-580-open-7.0.0-1019-nvidia-64k\n  sp3: sudo dkms autoinstall -k 7.0.0-1019-nvidia-64k\n  sp3: sudo update-grub\n  sp3: restore the configured entry in /etc/default/grub.d/zz-spark-kernel-trial.cfg, then sudo update-grub\n  sp3: register the pinned source using docs/memory-profiles.md#install-memory-saver; then sudo dkms install -m dgx-spark-memory-saver -v 0.4.1 -k 7.0.0-1019-nvidia-64k. For a loaded-module mismatch, stop GPU clients and reboot into the configured kernel.\n  sp4: sudo apt-get install linux-tools-7.0.0-1019-nvidia-64k=7.0.0-1019.19~24.04.2 linux-image-7.0.0-1019-nvidia-64k=7.0.0-1019.19~24.04.2 linux-modules-7.0.0-1019-nvidia-64k=7.0.0-1019.19~24.04.2 linux-headers-7.0.0-1019-nvidia-64k=7.0.0-1019.19~24.04.2 linux-modules-nvidia-580-open-7.0.0-1019-nvidia-64k\n  sp4: sudo dkms autoinstall -k 7.0.0-1019-nvidia-64k\n  sp4: sudo update-grub\n  sp4: restore the configured entry in /etc/default/grub.d/zz-spark-kernel-trial.cfg, then sudo update-grub\n  sp4: register the pinned source using docs/memory-profiles.md#install-memory-saver; then sudo dkms install -m dgx-spark-memory-saver -v 0.4.1 -k 7.0.0-1019-nvidia-64k. For a loaded-module mismatch, stop GPU clients and reboot into the configured kernel."
+   ]
+  }
+ },
+ "finished_utc": "2026-11-01T06:40:04+00:00"
+}
