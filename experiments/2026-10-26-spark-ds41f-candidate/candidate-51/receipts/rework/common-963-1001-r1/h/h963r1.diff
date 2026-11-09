@@ -1,0 +1,89 @@
+--- /private/tmp/claude-501/-Users-christopherowen-projects-spark-ds41f/d7a6b002-8e73-4152-857a-2e58be7a2871/scratchpad/own-marks-51/common/h/h963.py	2026-11-09 18:33:17
++++ /private/tmp/claude-501/-Users-christopherowen-projects-spark-ds41f/d7a6b002-8e73-4152-857a-2e58be7a2871/scratchpad/rw/h/h963r1.py	2026-11-09 20:26:01
+@@ -1,5 +1,8 @@
+-# usage: python3 /h/h963.py OUT.json
++# usage: python3 /h/h963r1.py OUT.json
+ #
++# Round 1 (candidate-51 rework of #963): h963.py with section D run for both screen-config
++# sets (SCREEN_SETS) on each arm and M 17, 24 added; everything else unchanged.
++#
+ # #963's own mark on the image's own kernels (no patch step): the timing half of the PR's
+ # screen_pack12_kernels.py (its shapes, weights, seeds, M lists and tile choices), run
+ # unchanged on both arms, plus CUDA-graph replay and CUPTI kernel time beside the PR's
+@@ -37,6 +40,12 @@
+ out_path = sys.argv[1]
+ CFG_S4A2 = dict(block_N=32, threads=256, step_groups=1, num_stages=4, act_stages=2)
+ CFG_S2 = dict(block_N=32, threads=256, step_groups=1, num_stages=2)
++# Round 1: the screen-config sets each arm's certified screen runs (base: the image's
++# SCREEN_TILE_CONFIGS; r1: #1001-r1's matched-stage screen tiles).
++SCREEN_SETS = {
++    "s4a2": {128: dict(block_N=32, threads=256, step_groups=1, num_stages=4, act_stages=2)},
++    "r1": {128: dict(block_N=32, threads=256, step_groups=1, num_stages=2)},
++}
+ res = {"env": env_info(), "tile_configs_128": dict(vocab_mod.TILE_CONFIGS[128]),
+        "A_gemm": {}, "B_proj": {}, "C_greedy": {}, "D_screen": {}, "E_splitk": {}, "errors": []}
+ res["warmup_ms"] = gpu_warmup(250.0)
+@@ -151,29 +160,43 @@
+             row["block_M"] = bm
+             res["B_proj"][name][str(M)] = row
+             save()
+-        # D. the certified two-pass greedy screen that serving's greedy verification runs
++        # D. the certified two-pass greedy screen that serving's greedy verification runs,
++        # with each screen-config set on both arms (round 1: #1001-r1 changes
++        # SCREEN_TILE_CONFIGS, so the same-set cells separate #963-r1 from it)
+         try:
+-            layer = torch.nn.Module()
+-            layer.weight = torch.nn.Parameter(p.values, requires_grad=False)
+-            layer.weight_exception_rows = torch.nn.Parameter(p.exception_rows, requires_grad=False)
+-            layer.weight_exception_entries = torch.nn.Parameter(p.exception_entries, requires_grad=False)
+-            layer.weight_row_offsets = torch.nn.Parameter(p.row_offsets, requires_grad=False)
+-            layer.packed_bf16_in_features = K
+-            layer.packed_bf16_exponent_base = p.exponent_base
+-            layer.packed_bf16_exceptions = p.exceptions
+-            prepare_packed_head(layer, out_dtype=torch.float32)
+-            res["D_screen"][name] = {}
+-            for M in [1, 6, 16, 32, 64, 96, 97, 104, 107, 112, 120, 128]:
++            res["D_screen"][name] = {"image_screen_tile_configs": {str(k): dict(v) for k, v in vocab_mod.SCREEN_TILE_CONFIGS.items()}}
++            orig_screen = {k: dict(v) for k, v in vocab_mod.SCREEN_TILE_CONFIGS.items()}
++            layers = {}
++            for sname, sset in SCREEN_SETS.items():
++                for bm, cfg in sset.items():
++                    vocab_mod.SCREEN_TILE_CONFIGS[bm] = dict(cfg)
++                layer = torch.nn.Module()
++                layer.weight = torch.nn.Parameter(p.values, requires_grad=False)
++                layer.weight_exception_rows = torch.nn.Parameter(p.exception_rows, requires_grad=False)
++                layer.weight_exception_entries = torch.nn.Parameter(p.exception_entries, requires_grad=False)
++                layer.weight_row_offsets = torch.nn.Parameter(p.row_offsets, requires_grad=False)
++                layer.packed_bf16_in_features = K
++                layer.packed_bf16_exponent_base = p.exponent_base
++                layer.packed_bf16_exceptions = p.exceptions
++                prepare_packed_head(layer, out_dtype=torch.float32)
++                layers[sname] = layer
++                vocab_mod.SCREEN_TILE_CONFIGS.clear()
++                vocab_mod.SCREEN_TILE_CONFIGS.update({k: dict(v) for k, v in orig_screen.items()})
++            own = [sn for sn, sset in SCREEN_SETS.items() if all(orig_screen[bm] == cfg for bm, cfg in sset.items())]
++            res["D_screen"][name]["own_set"] = own
++            for M in [1, 6, 16, 17, 24, 32, 64, 96, 97, 104, 107, 112, 120, 128]:
+                 torch.manual_seed(2000 + M)
+                 x = torch.randn((M, K), device="cuda", dtype=torch.bfloat16)
+-                ref = project_head_greedy_pairs(layer, x, vocab=N, vocab_start=0, pair_width=4, scratch_pairs=False).clone()
+-                fn = lambda x=x: project_head_greedy_pairs(layer, x, vocab=N, vocab_start=0, pair_width=4, scratch_pairs=True)  # noqa: E731
+-                d = cell(fn)
+-                d["pairs_hash"] = h(ref[:, :2])
+-                d["block_M"] = row_tile(M)
+-                res["D_screen"][name][str(M)] = d
+-                print(f"[D] {name} M={M}: eager {d['eager_us']} graph {d['graph']['median_us']} kernel {d['kernel']['per_call_us']} {d['pairs_hash']}", flush=True)
+-            del layer
++                row = {"block_M": row_tile(M)}
++                for sname, layer in layers.items():
++                    ref = project_head_greedy_pairs(layer, x, vocab=N, vocab_start=0, pair_width=4, scratch_pairs=False).clone()
++                    fn = lambda x=x, layer=layer: project_head_greedy_pairs(layer, x, vocab=N, vocab_start=0, pair_width=4, scratch_pairs=True)  # noqa: E731
++                    d = cell(fn)
++                    d["pairs_hash"] = h(ref[:, :2])
++                    row[sname] = d
++                    print(f"[D] {name} M={M} {sname}: eager {d['eager_us']} graph {d['graph']['median_us']} kernel {d['kernel']['per_call_us']} {d['pairs_hash']}", flush=True)
++                res["D_screen"][name][str(M)] = row
++            del layers, layer
+         except Exception:
+             err(f"D {name}")
+         del p, proj, greedy

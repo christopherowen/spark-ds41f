@@ -1,0 +1,509 @@
+{
+ "pr": 960,
+ "round": 1,
+ "pr_head": "6cfd0bd33413edb16cac1d07b3c2672cb95dbf60",
+ "patch": "0781-perf-cudagraph-target-full-replay-and-post-gate-fork.patch (r1, SHA-256 29623124ed864bb1...; author Christopher Owen <3221756+christopherowen@users.noreply.github.com>, Sun 8 Nov 2026 11:30 +0100, kept; Round 1 section with the measured cells)",
+ "verdict": "corrected-meets-mark",
+ "root_cause": "0781's FULL fast-path condition in GPUModelRunner.execute_model (model_runner.py:3204 in candidate-53's tree) calls self.kv_connector.has_connector(). No KVConnector in this base defines it: not the no-op base class that NO_OP_KV_CONNECTOR instantiates, not ActiveKVConnector, and not upstream vLLM main's KVConnector (80362712, 2026-11-09). The only has_connector in the tree is KVTransferConfig.has_connector(connector_name), a config method. The first runtime FULL step, the warm-up decode step, raised AttributeError on every rank. #960's own mark and the release tests never ran a non-dummy FULL step through execute_model.",
+ "fix": "model_runner.py: 'and not self.kv_connector.has_connector()' -> 'and self.kv_connector is NO_OP_KV_CONNECTOR' (plus a one-line comment). get_kv_connector returns NO_OP_KV_CONNECTOR when no KV transfer group exists and an ActiveKVConnector otherwise. NO_OP_KV_CONNECTOR is already imported by the runner. Semantics as #960 intended: the fast path runs only with no active KV connector, because an active connector's pre_forward reads the step's attention metadata. An identity check fails closed: any other connector object takes the eager path.",
+ "other_upstream_only_apis": "None found. Every receiver.attribute in 0781's non-test added lines was checked against the base (raw/setup/audit-attrs-name-grep.txt plus a type-aware manual check): BlockTables.cp_size, AttentionGroup.get_metadata_builder, DeepseekV41B12xMetadataBuilder.prepare_cudagraph_replay(qsl, seq_lens, block_table, slot_mapping, nr, nt), DefaultModelState.prepare_attn and vllm.v1.worker.gpu.model_states.default, InputBuffers.query_start_loc/seq_lens, BlockTables.input_block_tables/slot_mappings, ced_kernels.requests(..., compact=), CEDState.counts/starts/request_positions/replay_start, DeepseekV41ModelState._ced_rows (3-tuple) and _ced_batch exist; the rest the patch adds. Semantics checked too: the non-compact requests kernel ignores limits, so stage_floors not restaging limits is safe; FULL steps never carry a CED plan (prepare_attn raises otherwise); DFlash/DSpark propose never reads the target attn_metadata.",
+ "trees": {
+  "base": "round-51-53-base 0bffb886, tree 14c5a2dc",
+  "original_candidate_53": "c0e25ff1",
+  "corrected_candidate_53": "8f75da8bb73dccb06759ed376d71fd7bbc798308 (the delivered 0781 + 0782..0785 by git am on round-51-53-base, diff --check clean; raw/setup/series-check.txt)",
+  "diff_vs_original": "2 files: model_runner.py (+2/-1), tests/v1/worker/test_gpu_model_runner_v2.py (+131)"
+ },
+ "tests": {
+  "new_regression_test": "tests/v1/worker/test_gpu_model_runner_v2.py::test_full_cudagraph_decode_attn_prep_follows_kv_connector[False,True]: runs GPUModelRunner.execute_model on a FULL decode step up to model-input preparation with the connector get_kv_connector builds (NO_OP_KV_CONNECTOR; ActiveKVConnector with a Mock transfer group).",
+  "new_test_on_r1": "2 passed (raw/newtest-r1.txt)",
+  "new_test_on_original_runner": "2 failed with the boot's AttributeError at model_runner.py:3204, both connectors (raw/newtest-orig-runner.txt)",
+  "suite_on_r1": "test_b12x_v41_ced_metadata.py + test_cudagraph_manager.py + test_gpu_model_runner_v2.py + test_gpu_kv_connector.py: 173 passed, twice (raw/pytest-r1-boot1.txt, boot2)"
+ },
+ "boot_path_one_gpu": {
+  "harness": "scripts/harness/bootpath960.py: the image's real execute_model from its first line to model-input preparation, warm-up-decode-shaped step (3 reqs x 6 tokens, FULL), real get_kv_connector, real DeepseekV41ModelState + CEDState on GPU, DSpark class, real can_capture_full_attn_metadata on 23 real B12x groups, real InputBatch/InputBuffers/SchedulerOutput.",
+  "original": "raises AttributeError 'KVConnector' object has no attribute 'has_connector' at model_runner.py:3204, the sp5..sp7 failure reproduced (raw/bootpath-orig.jsonl)",
+  "r1": "all checks pass: NO_OP_KV_CONNECTOR -> fast path, floors [0,64,0] = replay_rows, batch marked staged, in-graph CED refresh == eager CEDState.stage (replay_start, request_positions, floors, starts); ActiveKVConnector -> eager build_slot_mappings_by_layer + prepare_attn(FULL, for_capture=False) (raw/bootpath-r1.jsonl)"
+ },
+ "bench_cells": {
+  "method": "harness ab960.py (the candidate-53 own mark's image A/B, unchanged), ABBA base b1, r1 b1, r1 b2, base b2 in one lock hold (21:57:49-22:00:24Z). base = spark-ds41f:candidate-50 + no1009 overlay; r1 = the same image + the corrected candidate-53 overlay. Cell rule: scripts/analyze/common.py (better only when every candidate boot beats every base boot and |delta| > boot spread).",
+  "image_ab_full_decode_step": {
+   "(1,1)": {
+    "wall_us_base_boots": [
+     476.41,
+     472.68
+    ],
+    "wall_us_r1_boots": [
+     32.32,
+     32.1
+    ],
+    "wall_delta_pct": -93.21,
+    "wall_welch95_us": [
+     -444.448,
+     -440.479
+    ],
+    "wall_verdict": "better",
+    "device_us_base_boots": [
+     70.5,
+     50.69
+    ],
+    "device_us_r1_boots": [
+     33.86,
+     33.73
+    ],
+    "device_delta_pct": -44.23,
+    "device_verdict": "better",
+    "r1_floors_change_every_step": {
+     "wall_us": [
+      39.33,
+      39.22
+     ],
+     "device_us": [
+      39.94,
+      39.84
+     ],
+     "verdict_vs_base": "better"
+    }
+   },
+   "(1,6)": {
+    "wall_us_base_boots": [
+     477.52,
+     472.21
+    ],
+    "wall_us_r1_boots": [
+     32.16,
+     31.3
+    ],
+    "wall_delta_pct": -93.32,
+    "wall_welch95_us": [
+     -444.845,
+     -440.347
+    ],
+    "wall_verdict": "better",
+    "device_us_base_boots": [
+     50.62,
+     71.2
+    ],
+    "device_us_r1_boots": [
+     32.58,
+     32.58
+    ],
+    "device_delta_pct": -46.51,
+    "device_verdict": "better",
+    "r1_floors_change_every_step": {
+     "wall_us": [
+      39.37,
+      36.96
+     ],
+     "device_us": [
+      39.62,
+      40.13
+     ],
+     "verdict_vs_base": "better"
+    }
+   },
+   "(2,12)": {
+    "wall_us_base_boots": [
+     478.15,
+     473.51
+    ],
+    "wall_us_r1_boots": [
+     34.81,
+     34.29
+    ],
+    "wall_delta_pct": -92.74,
+    "wall_welch95_us": [
+     -443.118,
+     -439.206
+    ],
+    "wall_verdict": "better",
+    "device_us_base_boots": [
+     75.46,
+     74.34
+    ],
+    "device_us_r1_boots": [
+     36.06,
+     35.65
+    ],
+    "device_delta_pct": -52.13,
+    "device_verdict": "better",
+    "r1_floors_change_every_step": {
+     "wall_us": [
+      39.9,
+      39.7
+     ],
+     "device_us": [
+      41.98,
+      49.92
+     ],
+     "verdict_vs_base": "better"
+    }
+   },
+   "(3,18)": {
+    "wall_us_base_boots": [
+     477.29,
+     474.98
+    ],
+    "wall_us_r1_boots": [
+     32.79,
+     33.13
+    ],
+    "wall_delta_pct": -93.08,
+    "wall_welch95_us": [
+     -444.662,
+     -442.725
+    ],
+    "wall_verdict": "better",
+    "device_us_base_boots": [
+     73.25,
+     54.78
+    ],
+    "device_us_r1_boots": [
+     34.62,
+     35.17
+    ],
+    "device_delta_pct": -45.49,
+    "device_verdict": "better",
+    "r1_floors_change_every_step": {
+     "wall_us": [
+      39.28,
+      39.49
+     ],
+     "device_us": [
+      41.63,
+      40.86
+     ],
+     "verdict_vs_base": "better"
+    }
+   },
+   "(4,16)": {
+    "wall_us_base_boots": [
+     477.93,
+     475.8
+    ],
+    "wall_us_r1_boots": [
+     35.26,
+     35.68
+    ],
+    "wall_delta_pct": -92.56,
+    "wall_welch95_us": [
+     -442.348,
+     -439.746
+    ],
+    "wall_verdict": "better",
+    "device_us_base_boots": [
+     58.78,
+     76.16
+    ],
+    "device_us_r1_boots": [
+     36.67,
+     37.54
+    ],
+    "device_delta_pct": -45.01,
+    "device_verdict": "better",
+    "r1_floors_change_every_step": {
+     "wall_us": [
+      38.1,
+      41.11
+     ],
+     "device_us": [
+      42.43,
+      43.49
+     ],
+     "verdict_vs_base": "better"
+    }
+   },
+   "(4,24)": {
+    "wall_us_base_boots": [
+     479.7,
+     474.87
+    ],
+    "wall_us_r1_boots": [
+     36.4,
+     35.76
+    ],
+    "wall_delta_pct": -92.44,
+    "wall_welch95_us": [
+     -443.043,
+     -438.967
+    ],
+    "wall_verdict": "better",
+    "device_us_base_boots": [
+     76.48,
+     75.74
+    ],
+    "device_us_r1_boots": [
+     37.7,
+     37.79
+    ],
+    "device_delta_pct": -50.41,
+    "device_verdict": "better",
+    "r1_floors_change_every_step": {
+     "wall_us": [
+      41.09,
+      40.86
+     ],
+     "device_us": [
+      43.71,
+      43.52
+     ],
+     "verdict_vs_base": "better"
+    }
+   },
+   "(8,32)": {
+    "wall_us_base_boots": [
+     481.51,
+     476.65
+    ],
+    "wall_us_r1_boots": [
+     39.6,
+     39.31
+    ],
+    "wall_delta_pct": -91.76,
+    "wall_welch95_us": [
+     -441.284,
+     -437.902
+    ],
+    "wall_verdict": "better",
+    "device_us_base_boots": [
+     80.42,
+     82.37
+    ],
+    "device_us_r1_boots": [
+     39.26,
+     40.96
+    ],
+    "device_delta_pct": -50.72,
+    "device_verdict": "better",
+    "r1_floors_change_every_step": {
+     "wall_us": [
+      49.42,
+      48.45
+     ],
+     "device_us": [
+      47.74,
+      46.66
+     ],
+     "verdict_vs_base": "better"
+    }
+   },
+   "(8,48)": {
+    "wall_us_base_boots": [
+     482.43,
+     477.34
+    ],
+    "wall_us_r1_boots": [
+     37.01,
+     36.86
+    ],
+    "wall_delta_pct": -92.3,
+    "wall_welch95_us": [
+     -444.313,
+     -441.725
+    ],
+    "wall_verdict": "better",
+    "device_us_base_boots": [
+     58.88,
+     79.46
+    ],
+    "device_us_r1_boots": [
+     38.43,
+     38.14
+    ],
+    "device_delta_pct": -44.65,
+    "device_verdict": "better",
+    "r1_floors_change_every_step": {
+     "wall_us": [
+      46.11,
+      42.33
+     ],
+     "device_us": [
+      44.35,
+      44.1
+     ],
+     "verdict_vs_base": "better"
+    }
+   },
+   "(16,64)": {
+    "wall_us_base_boots": [
+     485.17,
+     481.25
+    ],
+    "wall_us_r1_boots": [
+     39.97,
+     39.06
+    ],
+    "wall_delta_pct": -91.82,
+    "wall_welch95_us": [
+     -445.123,
+     -442.637
+    ],
+    "wall_verdict": "better",
+    "device_us_base_boots": [
+     77.57,
+     79.58
+    ],
+    "device_us_r1_boots": [
+     41.57,
+     39.1
+    ],
+    "device_delta_pct": -48.67,
+    "device_verdict": "better",
+    "r1_floors_change_every_step": {
+     "wall_us": [
+      49.52,
+      47.35
+     ],
+     "device_us": [
+      47.78,
+      47.52
+     ],
+     "verdict_vs_base": "better"
+    }
+   }
+  },
+  "bit_exact": {
+   "(1,1)": {
+    "graph_equals_eager_in_r1": true,
+    "r1_graph_equals_base_eager_across_images": true
+   },
+   "(1,6)": {
+    "graph_equals_eager_in_r1": true,
+    "r1_graph_equals_base_eager_across_images": true
+   },
+   "(2,12)": {
+    "graph_equals_eager_in_r1": true,
+    "r1_graph_equals_base_eager_across_images": true
+   },
+   "(3,18)": {
+    "graph_equals_eager_in_r1": true,
+    "r1_graph_equals_base_eager_across_images": true
+   },
+   "(4,16)": {
+    "graph_equals_eager_in_r1": true,
+    "r1_graph_equals_base_eager_across_images": true
+   },
+   "(4,24)": {
+    "graph_equals_eager_in_r1": true,
+    "r1_graph_equals_base_eager_across_images": true
+   },
+   "(8,32)": {
+    "graph_equals_eager_in_r1": true,
+    "r1_graph_equals_base_eager_across_images": true
+   },
+   "(8,48)": {
+    "graph_equals_eager_in_r1": true,
+    "r1_graph_equals_base_eager_across_images": true
+   },
+   "(16,64)": {
+    "graph_equals_eager_in_r1": true,
+    "r1_graph_equals_base_eager_across_images": true
+   }
+  },
+  "pr_script_r1": {
+   "boot1": {
+    "(1,1)": {
+     "baseline_us": 430.94,
+     "candidate_us": 31.6,
+     "bit_exact": true
+    },
+    "(1,6)": {
+     "baseline_us": 429.47,
+     "candidate_us": 32.6,
+     "bit_exact": true
+    },
+    "(2,12)": {
+     "baseline_us": 422.45,
+     "candidate_us": 34.89,
+     "bit_exact": true
+    },
+    "(3,18)": {
+     "baseline_us": 429.16,
+     "candidate_us": 32.77,
+     "bit_exact": true
+    },
+    "(4,16)": {
+     "baseline_us": 424.07,
+     "candidate_us": 34.95,
+     "bit_exact": true
+    },
+    "(4,24)": {
+     "baseline_us": 424.11,
+     "candidate_us": 34.84,
+     "bit_exact": true
+    },
+    "(8,32)": {
+     "baseline_us": 432.64,
+     "candidate_us": 39.65,
+     "bit_exact": true
+    },
+    "(8,48)": {
+     "baseline_us": 436.48,
+     "candidate_us": 36.93,
+     "bit_exact": true
+    },
+    "(16,64)": {
+     "baseline_us": 433.91,
+     "candidate_us": 39.46,
+     "bit_exact": true
+    }
+   },
+   "boot2": {
+    "(1,1)": {
+     "baseline_us": 435.24,
+     "candidate_us": 32.56,
+     "bit_exact": true
+    },
+    "(1,6)": {
+     "baseline_us": 426.68,
+     "candidate_us": 32.09,
+     "bit_exact": true
+    },
+    "(2,12)": {
+     "baseline_us": 436.1,
+     "candidate_us": 34.81,
+     "bit_exact": true
+    },
+    "(3,18)": {
+     "baseline_us": 434.46,
+     "candidate_us": 33.49,
+     "bit_exact": true
+    },
+    "(4,16)": {
+     "baseline_us": 435.91,
+     "candidate_us": 36.92,
+     "bit_exact": true
+    },
+    "(4,24)": {
+     "baseline_us": 437.53,
+     "candidate_us": 35.85,
+     "bit_exact": true
+    },
+    "(8,32)": {
+     "baseline_us": 442.55,
+     "candidate_us": 39.96,
+     "bit_exact": true
+    },
+    "(8,48)": {
+     "baseline_us": 439.28,
+     "candidate_us": 37.65,
+     "bit_exact": true
+    },
+    "(16,64)": {
+     "baseline_us": 450.96,
+     "candidate_us": 39.88,
+     "bit_exact": true
+    }
+   }
+  },
+  "pr_script_note": "The PR's screen_cudagraph_wins.py at head 6cfd0bd3, unmodified, on r1 twice (in-process eager baseline vs in-graph path). Its DFlash padding_rows section: ~4 us -> 0.02 us bit-exact; its MoE post-gate fork section times hand-written schedules the head dropped (bit-exact, no claim).",
+  "summary": "wall 472-485 us -> 31-40 us (-91.8% to -93.3%, all 9 shapes better, Welch 95% -437.9..-445.1 us); device 51-82 us -> 33-42 us (-44% to -52%, all better); digests equal across images on all 9 shapes. Matches the original 0781 own mark (467-481 -> 31-40 us wall).",
+  "analysis": "raw/analysis.json"
+ },
+ "notes": [
+  "overlay/ holds the 22 corrected non-test files of candidate-53's tree (r1 in place of 0781) that differ from the candidate-50 image tree d5778ab5; only vllm/v1/worker/gpu/model_runner.py differs from the original.",
+  "Not booted at TP3 (sp8 is one GPU); the coordinator boots tp3-switched.",
+  "No push, commit to this repository, PR, image build, cluster or window operation; sp8 only; every GPU job under /tmp/spark-lab-gpu.lock with the hold file and docker ps checked (raw/commands.txt).",
+  "Bench and runs: raw/ (commands.txt is every GPU-lock block as run.sh logged it; q2-a.log, q2-b.log are the queue logs)."
+ ],
+ "verdict_scope": "The fix removes the boot failure (reproduced and cleared on one GPU through the real execute_model), the regression test fails on the original and passes on r1, the PR's tests pass twice, and the mark still holds: per-step FULL metadata/CED staging is lower beyond the interval on all 9 shapes, image A/B ABBA, bit-exact. Not booted at TP3 (sp8 is one GPU): the coordinator boots tp3-switched. The engine grid and paired decode come from the screen."
+}

@@ -1,0 +1,805 @@
+{
+ "pr": 1001,
+ "round": 1,
+ "pr_head": "03e2d903daf9ea197b430e24b75e64b0eda7e737",
+ "patch": "0784-Match-128-row-vocab-head-tile-pipeline-stages.patch (round 1; context-only rebase as candidate-51's, plus the screen tile)",
+ "author": "Christopher Owen <3221756+christopherowen@users.noreply.github.com> (the PR's), author date Sun, 8 Nov 2026 19:35:24 +0000 kept",
+ "mark": "The own mark's, unchanged: its bench_vocab_2boot.py (captured CUDA graphs) on the image, 2 boots, ABBA: projection and greedy epilogue at M=97..128 (the 128-row tile) faster beyond the interval, bit-identical logits and (max, index) pairs, M<=96 not worse; per the rework brief, at TP4 and TP3 (every cell of the own-mark bench) with no cell slower on a shape serving uses.",
+ "change": {
+  "kept": "TILE_CONFIGS[128] = dict(block_N=32, threads=256, step_groups=1, num_stages=2) and its test (the first version, context-only rebase)",
+  "added": "SCREEN_TILE_CONFIGS[128] = dict(block_N=32, threads=256, step_groups=1, num_stages=2) (was num_stages=4, act_stages=2): the certified screen's 128-row tile, which serves the greedy pairs of 65..128 rows; test_screen_tile_config_128_uses_matched_two_stage_pipeline",
+  "checked_and_left": "SCREEN_TILE_CONFIGS[32] (num_stages=4, act_stages=2): no matched config is faster in every cell (sconf, one boot, in-process, layers built s4a2, s3, s2): num_stages=2 read 1.3-2.5% faster at TP4 FP32 (0.6-0.9% faster or same at TP4 BF16) but 1.0% slower at TP3 FP32 M=24 and 0.3% at TP3 BF16 M=32; num_stages=3 5.6-7.4% slower at TP3 FP32. The in-process slot effect (up to ~5% on identical kernels) is as large as the num_stages=2 readings, so no gain is shown; the tile stays",
+  "why_the_screen": "on this base serving's greedy pairs go through #997's certified two-pass screen (project_head_greedy_pairs: screen_vocab_greedy_partials with SCREEN_TILE_CONFIGS, then refine), which never reads TILE_CONFIGS; SCREEN_TILE_CONFIGS[128] had the pattern #1001 diagnosed (T.Pipelined stage=[2, 0, 3, 3]); num_stages=2 gives stage=[0, 0, 1, 1]: the same two activation stages, two weight stages fewer",
+  "registers (cuobjdump of the cached cubins, sm_121a)": "vocab_screen_greedy_partials at the 128-row tile (256 threads): 193 registers with num_stages=4/act_stages=2 (10 cp.async commit groups, 36 LDGSTS), 78 with num_stages=2 (5, 18); at the 32-row tile (128 threads): 166 (s4a2), 87-88 (s3), 63-64 (s2), against 64-66 at the 16- and 64-row tiles",
+  "diff_vs_first_version": "git diff --stat first..r1 (0784 only): vllm/models/deepseek_v4_1/tilelang/vocab.py 1 line (SCREEN_TILE_CONFIGS[128]), tests/kernels/quantization/test_deepseek_v41_tilelang_vocab.py +8; corrected 0784 against its parent: 2 files, +36/-2"
+ },
+ "host": "sp8 (spark-0016, NVIDIA GB10)",
+ "arms": {
+  "base": "spark-ds41f:candidate-50 sha256:8c1ea1f62f62c3e2adc03b645c091a5499cf7163101aca32875c894b96f155db + candidate-50 no1009/overlay (4 files, ro): tree 14c5a2dc; TILE_CONFIGS[128] and SCREEN_TILE_CONFIGS[128] s4a2",
+  "c51r1": "the same image + the 15 files where the corrected candidate-51 tree (35cd2a0e87a6: 0781, 0782 #963-r1, 0783, 0784 #1001-r1) differs from the image's (ro); TILE_CONFIGS[128] and SCREEN_TILE_CONFIGS[128] num_stages 2"
+ },
+ "evidence": "bench_vocab_r1.py = the own-mark run's bench_vocab_2boot_c51.py with SCREEN_BASE / SCREEN_CAND set per layer (base_1107: the base's s4a2 screen tiles; candidate: #1001-r1's) and M 17, 24 added (diff: common/h/bench_vocab_r1.diff), behind a >= 250 ms GPU warm-up, ABBA in one session. Comparisons as the own mark: in_process_c51r1 (#1001-r1 alone on the accumulated stack, the PR's own comparison), in_process_base (the same on the base arm), image_ab (each arm's own config: #1001-r1 with #963-r1). The layers of the in-process pairs are built base_1107 first, candidate second; a layer's slot moves graph-replay time on identical kernels (see slot_effect), so the screen gain is also measured slot-balanced (sab).",
+ "measured": {
+  "greedy_epilogue_graph_us (project_head_greedy_pairs, serving's greedy path)": {
+   "counts in_process_c51r1": {
+    "<=96": {
+     "faster": 22,
+     "slower": 13,
+     "same": 5
+    },
+    "97..128": {
+     "faster": 24
+    }
+   },
+   "counts in_process_base": {
+    "<=96": {
+     "faster": 24,
+     "slower": 9,
+     "same": 7
+    },
+    "97..128": {
+     "faster": 24
+    }
+   },
+   "counts image_ab": {
+    "<=96": {
+     "faster": 21,
+     "slower": 10,
+     "same": 9
+    },
+    "97..128": {
+     "faster": 24
+    }
+   },
+   "TP4 FP32 in_process_c51r1": {
+    "M=72": "1092.94/1092.65 -> 1048.36/1060.11 (1.037x, faster)",
+    "M=96": "1221.08/1222.32 -> 1113.27/1125.24 (1.092x, faster)",
+    "M=97": "1226.89/1250.62 -> 1190.41/1135.94 (1.065x, faster)",
+    "M=104": "1275.51/1276.63 -> 1140.51/1143.63 (1.117x, faster)",
+    "M=107": "1304.19/1309.56 -> 1143.03/1167.67 (1.131x, faster)",
+    "M=112": "1360.17/1335.78 -> 1168.43/1165.37 (1.155x, faster)",
+    "M=120": "1383.23/1395.31 -> 1201.38/1229.07 (1.143x, faster)",
+    "M=128": "1443.38/1454.80 -> 1286.45/1303.62 (1.119x, faster)"
+   },
+   "TP3 FP32 in_process_c51r1": {
+    "M=72": "1422.79/1433.93 -> 1377.99/1376.56 (1.037x, faster)",
+    "M=96": "1653.41/1613.62 -> 1501.45/1467.20 (1.101x, faster)",
+    "M=97": "1601.11/1621.31 -> 1470.52/1472.77 (1.095x, faster)",
+    "M=104": "1688.22/1688.90 -> 1503.24/1498.93 (1.125x, faster)",
+    "M=107": "1693.10/1736.92 -> 1507.93/1507.70 (1.137x, faster)",
+    "M=112": "1751.57/1762.74 -> 1582.27/1530.66 (1.129x, faster)",
+    "M=120": "1833.28/1866.37 -> 1563.58/1604.21 (1.168x, faster)",
+    "M=128": "1927.67/1945.81 -> 1746.69/1705.10 (1.122x, faster)"
+   },
+   "TP4 BF16 in_process_c51r1": {
+    "M=72": "1109.55/1115.92 -> 1079.22/1081.02 (1.030x, faster)",
+    "M=96": "1242.66/1242.97 -> 1147.10/1159.96 (1.077x, faster)",
+    "M=97": "1254.12/1262.35 -> 1164.53/1151.03 (1.087x, faster)",
+    "M=104": "1298.91/1299.46 -> 1165.10/1168.27 (1.114x, faster)",
+    "M=107": "1327.16/1319.44 -> 1177.53/1178.50 (1.123x, faster)",
+    "M=112": "1356.36/1354.90 -> 1193.00/1193.53 (1.136x, faster)",
+    "M=120": "1416.00/1415.45 -> 1219.99/1326.40 (1.112x, faster)",
+    "M=128": "1477.08/1475.00 -> 1303.35/1324.27 (1.123x, faster)"
+   },
+   "TP3 BF16 in_process_c51r1": {
+    "M=72": "1432.50/1523.21 -> 1383.57/1400.79 (1.062x, faster)",
+    "M=96": "1702.05/1630.45 -> 1486.68/1482.64 (1.122x, faster)",
+    "M=97": "1630.96/1645.63 -> 1485.78/1493.90 (1.100x, faster)",
+    "M=104": "1695.58/1706.26 -> 1534.33/1511.25 (1.117x, faster)",
+    "M=107": "1724.81/1744.86 -> 1524.95/1528.76 (1.136x, faster)",
+    "M=112": "1803.70/1802.50 -> 1603.26/1542.85 (1.146x, faster)",
+    "M=120": "1854.62/1869.59 -> 1616.03/1705.48 (1.121x, faster)",
+    "M=128": "1955.73/1986.48 -> 1772.20/1723.82 (1.128x, faster)"
+   },
+   "TP4 FP32 image_ab": {
+    "M=72": "1124.34/1103.12 -> 1048.36/1060.11 (1.056x, faster)",
+    "M=96": "1235.02/1208.48 -> 1113.27/1125.24 (1.092x, faster)",
+    "M=97": "1256.50/1220.12 -> 1190.41/1135.94 (1.065x, faster)",
+    "M=104": "1283.19/1271.47 -> 1140.51/1143.63 (1.118x, faster)",
+    "M=107": "1305.95/1313.58 -> 1143.03/1167.67 (1.134x, faster)",
+    "M=112": "1349.23/1332.25 -> 1168.43/1165.37 (1.149x, faster)",
+    "M=120": "1408.40/1388.37 -> 1201.38/1229.07 (1.151x, faster)",
+    "M=128": "1488.55/1442.31 -> 1286.45/1303.62 (1.132x, faster)"
+   },
+   "TP3 FP32 image_ab": {
+    "M=72": "1489.95/1420.28 -> 1377.99/1376.56 (1.057x, faster)",
+    "M=96": "1650.17/1612.09 -> 1501.45/1467.20 (1.099x, faster)",
+    "M=97": "1672.23/1613.96 -> 1470.52/1472.77 (1.117x, faster)",
+    "M=104": "1727.61/1675.10 -> 1503.24/1498.93 (1.133x, faster)",
+    "M=107": "1735.57/1704.47 -> 1507.93/1507.70 (1.141x, faster)",
+    "M=112": "1764.94/1757.52 -> 1582.27/1530.66 (1.132x, faster)",
+    "M=120": "1866.58/1836.92 -> 1563.58/1604.21 (1.169x, faster)",
+    "M=128": "1956.08/1944.33 -> 1746.69/1705.10 (1.130x, faster)"
+   }
+  },
+  "projection_graph_us (project_head: #1001's first half, unchanged)": {
+   "counts in_process_c51r1": {
+    "<=96": {
+     "faster": 10,
+     "same": 26,
+     "slower": 4
+    },
+    "97..128": {
+     "faster": 22,
+     "same": 2
+    }
+   },
+   "counts in_process_base": {
+    "<=96": {
+     "faster": 22,
+     "same": 16,
+     "slower": 2
+    },
+    "97..128": {
+     "faster": 24
+    }
+   },
+   "counts image_ab": {
+    "<=96": {
+     "faster": 34,
+     "same": 6
+    },
+    "97..128": {
+     "faster": 24
+    }
+   },
+   "TP4 FP32 in_process_c51r1": {
+    "M=72": "1237.21/1240.83 -> 1238.93/1254.49 (0.994x, same)",
+    "M=96": "1288.16/1296.95 -> 1305.59/1269.54 (1.004x, same)",
+    "M=97": "1279.59/1280.94 -> 1276.21/1269.29 (1.006x, faster)",
+    "M=104": "1301.91/1306.15 -> 1279.75/1281.56 (1.018x, faster)",
+    "M=107": "1403.34/1320.61 -> 1293.87/1292.90 (1.053x, faster)",
+    "M=112": "1351.96/1340.20 -> 1310.70/1300.39 (1.031x, faster)",
+    "M=120": "1418.73/1389.95 -> 1332.35/1319.50 (1.059x, faster)",
+    "M=128": "1457.81/1457.58 -> 1349.66/1345.11 (1.082x, faster)"
+   },
+   "TP3 FP32 in_process_c51r1": {
+    "M=72": "1643.29/1646.68 -> 1645.82/1646.29 (0.999x, same)",
+    "M=96": "1693.79/1739.59 -> 1687.24/1690.66 (1.016x, faster)",
+    "M=97": "1697.42/1717.37 -> 1685.66/1769.52 (0.988x, same)",
+    "M=104": "1728.19/1742.65 -> 1713.41/1707.04 (1.015x, faster)",
+    "M=107": "1749.36/1762.34 -> 1734.74/1716.21 (1.018x, faster)",
+    "M=112": "1786.13/1799.47 -> 1727.81/1731.44 (1.037x, faster)",
+    "M=120": "1861.86/1882.41 -> 1757.08/1776.00 (1.060x, faster)",
+    "M=128": "1944.76/1975.49 -> 1786.19/1791.22 (1.096x, faster)"
+   },
+   "TP4 BF16 in_process_c51r1": {
+    "M=72": "1216.99/1217.90 -> 1229.10/1218.10 (0.995x, slower)",
+    "M=96": "1266.26/1265.41 -> 1246.42/1246.90 (1.015x, faster)",
+    "M=97": "1263.83/1264.90 -> 1250.33/1248.36 (1.012x, faster)",
+    "M=104": "1294.98/1299.53 -> 1261.37/1261.57 (1.028x, faster)",
+    "M=107": "1308.10/1307.46 -> 1269.34/1267.90 (1.031x, faster)",
+    "M=112": "1339.91/1337.46 -> 1281.75/1342.70 (1.020x, same)",
+    "M=120": "1394.57/1416.99 -> 1304.78/1304.39 (1.078x, faster)",
+    "M=128": "1490.17/1467.35 -> 1335.84/1363.66 (1.096x, faster)"
+   },
+   "TP3 BF16 in_process_c51r1": {
+    "M=72": "1609.82/1613.70 -> 1613.79/1617.24 (0.998x, slower)",
+    "M=96": "1668.39/1694.78 -> 1653.93/1658.23 (1.015x, faster)",
+    "M=97": "1683.86/1682.89 -> 1655.94/1660.10 (1.015x, faster)",
+    "M=104": "1710.20/1721.88 -> 1678.34/1677.26 (1.023x, faster)",
+    "M=107": "1760.73/1748.84 -> 1694.30/1686.86 (1.038x, faster)",
+    "M=112": "1776.62/1798.19 -> 1699.16/1704.36 (1.050x, faster)",
+    "M=120": "1857.27/1891.31 -> 1729.16/1743.02 (1.080x, faster)",
+    "M=128": "1980.77/1999.90 -> 1768.55/1769.59 (1.125x, faster)"
+   }
+  },
+  "proj_plus_argmax_graph": {
+   "counts in_process_c51r1": {
+    "<=96": {
+     "same": 27,
+     "slower": 4,
+     "faster": 9
+    },
+    "97..128": {
+     "faster": 22,
+     "same": 2
+    }
+   },
+   "counts image_ab": {
+    "<=96": {
+     "faster": 35,
+     "same": 5
+    },
+    "97..128": {
+     "faster": 24
+    }
+   }
+  },
+  "every slower reading (graph)": [
+   "tp4_float32 M=16 (tile 16) in_process_base proj_argmax_graph: 1110.02/1109.52 -> 1110.27/1110.32 (1.000x, slower)",
+   "tp4_float32 M=17 (tile 32) in_process_c51r1 proj_argmax_graph: 1092.42/1096.57 -> 1099.29/1098.86 (0.996x, slower)",
+   "tp4_float32 M=24 (tile 32) in_process_base proj_graph: 1122.11/1122.71 -> 1123.49/1123.24 (0.999x, slower)",
+   "tp4_float32 M=64 (tile 64) in_process_base proj_argmax_graph: 1258.93/1262.47 -> 1262.70/1271.24 (0.995x, slower)",
+   "tp4_bfloat16 M=1 (tile 16) in_process_c51r1 greedy_graph: 746.14/748.07 -> 758.82/755.96 (0.986x, slower)",
+   "tp4_bfloat16 M=1 (tile 16) in_process_base greedy_graph: 740.96/745.50 -> 761.28/758.32 (0.978x, slower)",
+   "tp4_bfloat16 M=1 (tile 16) image_ab greedy_graph: 740.96/745.50 -> 758.82/755.96 (0.981x, slower)",
+   "tp4_bfloat16 M=6 (tile 16) in_process_c51r1 greedy_graph: 762.24/763.84 -> 778.44/769.98 (0.986x, slower)",
+   "tp4_bfloat16 M=6 (tile 16) in_process_base proj_argmax_graph: 1092.14/1092.03 -> 1097.61/1094.91 (0.996x, slower)",
+   "tp4_bfloat16 M=16 (tile 16) in_process_c51r1 greedy_graph: 783.67/779.38 -> 794.95/795.16 (0.983x, slower)",
+   "tp4_bfloat16 M=16 (tile 16) in_process_c51r1 proj_argmax_graph: 1093.31/1093.07 -> 1093.91/1093.81 (0.999x, slower)",
+   "tp4_bfloat16 M=17 (tile 32) in_process_c51r1 greedy_graph: 788.20/791.10 -> 798.90/842.41 (0.962x, slower)",
+   "tp4_bfloat16 M=24 (tile 32) in_process_c51r1 greedy_graph: 801.96/795.82 -> 814.12/810.10 (0.984x, slower)",
+   "tp4_bfloat16 M=24 (tile 32) in_process_base greedy_graph: 799.69/795.60 -> 813.89/812.12 (0.981x, slower)",
+   "tp4_bfloat16 M=24 (tile 32) image_ab greedy_graph: 799.69/795.60 -> 814.12/810.10 (0.982x, slower)",
+   "tp4_bfloat16 M=32 (tile 32) in_process_base greedy_graph: 813.17/812.83 -> 831.49/827.37 (0.980x, slower)",
+   "tp4_bfloat16 M=32 (tile 32) image_ab greedy_graph: 813.17/812.83 -> 828.82/827.60 (0.982x, slower)",
+   "tp4_bfloat16 M=48 (tile 64) in_process_c51r1 greedy_graph: 912.38/905.75 -> 920.52/918.15 (0.989x, slower)",
+   "tp4_bfloat16 M=48 (tile 64) in_process_c51r1 proj_graph: 1166.19/1166.50 -> 1168.89/1170.43 (0.997x, slower)",
+   "tp4_bfloat16 M=64 (tile 64) in_process_c51r1 greedy_graph: 953.02/938.66 -> 960.74/959.52 (0.985x, slower)",
+   "tp4_bfloat16 M=64 (tile 64) in_process_base greedy_graph: 938.00/937.38 -> 953.16/957.17 (0.982x, slower)",
+   "tp4_bfloat16 M=64 (tile 64) image_ab greedy_graph: 938.00/937.38 -> 960.74/959.52 (0.977x, slower)",
+   "tp4_bfloat16 M=72 (tile 128) in_process_c51r1 proj_graph: 1216.99/1217.90 -> 1229.10/1218.10 (0.995x, slower)",
+   "tp3_float32 M=16 (tile 16) in_process_c51r1 proj_argmax_graph: 1469.80/1467.91 -> 1525.81/1472.52 (0.980x, slower)",
+   "tp3_float32 M=64 (tile 64) in_process_c51r1 proj_graph: 1591.00/1588.82 -> 1591.80/1599.21 (0.996x, slower)",
+   "tp3_bfloat16 M=1 (tile 16) in_process_c51r1 greedy_graph: 929.39/950.60 -> 969.75/963.33 (0.973x, slower)",
+   "tp3_bfloat16 M=1 (tile 16) in_process_base greedy_graph: 928.67/955.49 -> 967.69/964.50 (0.975x, slower)",
+   "tp3_bfloat16 M=1 (tile 16) image_ab greedy_graph: 928.67/955.49 -> 969.75/963.33 (0.975x, slower)",
+   "tp3_bfloat16 M=6 (tile 16) in_process_c51r1 greedy_graph: 959.35/970.42 -> 990.16/995.55 (0.972x, slower)",
+   "tp3_bfloat16 M=6 (tile 16) in_process_base greedy_graph: 958.33/986.22 -> 1000.23/987.36 (0.978x, slower)",
+   "tp3_bfloat16 M=6 (tile 16) image_ab greedy_graph: 958.33/986.22 -> 990.16/995.55 (0.979x, slower)",
+   "tp3_bfloat16 M=16 (tile 16) in_process_c51r1 greedy_graph: 989.27/1001.99 -> 1022.05/1020.03 (0.975x, slower)",
+   "tp3_bfloat16 M=16 (tile 16) in_process_base greedy_graph: 982.68/1012.92 -> 1024.00/1023.35 (0.975x, slower)",
+   "tp3_bfloat16 M=16 (tile 16) image_ab greedy_graph: 982.68/1012.92 -> 1022.05/1020.03 (0.977x, slower)",
+   "tp3_bfloat16 M=17 (tile 32) in_process_c51r1 greedy_graph: 992.77/1005.81 -> 1024.87/1019.10 (0.978x, slower)",
+   "tp3_bfloat16 M=32 (tile 32) in_process_c51r1 greedy_graph: 1040.60/1050.16 -> 1065.19/1062.38 (0.983x, slower)",
+   "tp3_bfloat16 M=32 (tile 32) in_process_base greedy_graph: 1038.94/1056.25 -> 1063.48/1060.94 (0.986x, slower)",
+   "tp3_bfloat16 M=32 (tile 32) image_ab greedy_graph: 1038.94/1056.25 -> 1065.19/1062.38 (0.985x, slower)",
+   "tp3_bfloat16 M=48 (tile 64) in_process_c51r1 greedy_graph: 1156.61/1174.19 -> 1183.18/1180.85 (0.986x, slower)",
+   "tp3_bfloat16 M=48 (tile 64) in_process_base proj_graph: 1608.02/1629.17 -> 1663.93/1636.09 (0.981x, slower)",
+   "tp3_bfloat16 M=48 (tile 64) image_ab greedy_graph: 1150.74/1178.92 -> 1183.18/1180.85 (0.985x, slower)",
+   "tp3_bfloat16 M=64 (tile 64) in_process_base greedy_graph: 1196.30/1212.07 -> 1222.64/1231.13 (0.981x, slower)",
+   "tp3_bfloat16 M=64 (tile 64) image_ab greedy_graph: 1196.30/1212.07 -> 1225.32/1230.05 (0.981x, slower)",
+   "tp3_bfloat16 M=72 (tile 128) in_process_c51r1 proj_graph: 1609.82/1613.70 -> 1613.79/1617.24 (0.998x, slower)",
+   "tp3_bfloat16 M=72 (tile 128) in_process_c51r1 proj_argmax_graph: 1633.39/1639.88 -> 1719.92/1640.00 (0.974x, slower)"
+  ],
+  "sab: slot-balanced screen A/B (c51r1 arm, 2 boots; SCREEN_TILE_CONFIGS[128] s4a2 -> s2, four layers s4a2_a, s2_a, s2_b, s4a2_b)": {
+   "counts": {
+    "<=64 (identical kernels)": {
+     "same": 7,
+     "faster": 5
+    },
+    "65..96": {
+     "faster": 8
+    },
+    "97..128": {
+     "faster": 24
+    }
+   },
+   "cells": {
+    "sab|tp4|float32|M=1": "742.04/745.75 -> 742.56/742.73 (1.002x, same)",
+    "sab|tp4|float32|M=16": "779.72/779.21 -> 778.83/780.29 (1.000x, same)",
+    "sab|tp4|float32|M=64": "930.30/935.03 -> 928.08/933.51 (1.002x, same)",
+    "sab|tp4|float32|M=72": "1079.76/1080.20 -> 1042.85/1047.38 (1.033x, faster)",
+    "sab|tp4|float32|M=96": "1228.37/1221.30 -> 1118.20/1123.38 (1.093x, faster)",
+    "sab|tp4|float32|M=97": "1238.30/1229.10 -> 1121.82/1127.98 (1.097x, faster)",
+    "sab|tp4|float32|M=104": "1283.04/1284.40 -> 1145.76/1148.36 (1.119x, faster)",
+    "sab|tp4|float32|M=107": "1312.03/1305.66 -> 1160.97/1157.40 (1.129x, faster)",
+    "sab|tp4|float32|M=112": "1349.44/1332.65 -> 1188.70/1176.63 (1.134x, faster)",
+    "sab|tp4|float32|M=120": "1410.82/1404.61 -> 1241.09/1199.86 (1.153x, faster)",
+    "sab|tp4|float32|M=128": "1466.34/1462.26 -> 1288.52/1289.22 (1.136x, faster)",
+    "sab|tp4|bfloat16|M=1": "718.83/728.87 -> 710.81/711.73 (1.018x, faster)",
+    "sab|tp4|bfloat16|M=16": "756.04/767.73 -> 750.91/751.41 (1.014x, faster)",
+    "sab|tp4|bfloat16|M=64": "913.22/914.04 -> 914.74/910.80 (1.001x, same)",
+    "sab|tp4|bfloat16|M=72": "1098.67/1100.27 -> 1054.49/1053.88 (1.043x, faster)",
+    "sab|tp4|bfloat16|M=96": "1232.86/1241.51 -> 1126.43/1126.48 (1.098x, faster)",
+    "sab|tp4|bfloat16|M=97": "1248.59/1249.72 -> 1131.71/1126.48 (1.106x, faster)",
+    "sab|tp4|bfloat16|M=104": "1292.45/1299.12 -> 1148.30/1149.17 (1.128x, faster)",
+    "sab|tp4|bfloat16|M=107": "1310.26/1320.93 -> 1159.95/1152.58 (1.138x, faster)",
+    "sab|tp4|bfloat16|M=112": "1344.51/1363.81 -> 1179.57/1183.39 (1.146x, faster)",
+    "sab|tp4|bfloat16|M=120": "1413.58/1418.03 -> 1252.08/1264.23 (1.125x, faster)",
+    "sab|tp4|bfloat16|M=128": "1466.59/1485.62 -> 1334.00/1249.15 (1.143x, faster)",
+    "sab|tp3|float32|M=1": "952.67/954.42 -> 947.20/957.14 (1.001x, same)",
+    "sab|tp3|float32|M=16": "999.52/1006.76 -> 1000.48/1009.02 (0.998x, same)",
+    "sab|tp3|float32|M=64": "1210.11/1221.10 -> 1208.42/1215.89 (1.003x, same)",
+    "sab|tp3|float32|M=72": "1421.08/1420.92 -> 1369.16/1376.83 (1.035x, faster)",
+    "sab|tp3|float32|M=96": "1610.22/1608.41 -> 1459.54/1472.97 (1.098x, faster)",
+    "sab|tp3|float32|M=97": "1628.70/1625.91 -> 1466.54/1476.58 (1.106x, faster)",
+    "sab|tp3|float32|M=104": "1690.46/1680.54 -> 1493.45/1496.55 (1.127x, faster)",
+    "sab|tp3|float32|M=107": "1721.21/1720.23 -> 1510.13/1511.96 (1.139x, faster)",
+    "sab|tp3|float32|M=112": "1761.56/1758.14 -> 1539.98/1538.98 (1.143x, faster)",
+    "sab|tp3|float32|M=120": "1849.02/1843.34 -> 1608.70/1574.93 (1.160x, faster)",
+    "sab|tp3|float32|M=128": "1934.99/1932.67 -> 1703.70/1760.64 (1.116x, faster)",
+    "sab|tp3|bfloat16|M=1": "954.44/956.28 -> 950.16/953.81 (1.004x, faster)",
+    "sab|tp3|bfloat16|M=16": "1012.61/1013.62 -> 1005.85/1010.60 (1.005x, faster)",
+    "sab|tp3|bfloat16|M=64": "1225.11/1221.76 -> 1203.84/1212.66 (1.013x, faster)",
+    "sab|tp3|bfloat16|M=72": "1442.98/1443.93 -> 1381.64/1388.66 (1.042x, faster)",
+    "sab|tp3|bfloat16|M=96": "1624.96/1628.35 -> 1471.26/1480.49 (1.102x, faster)",
+    "sab|tp3|bfloat16|M=97": "1646.63/1641.56 -> 1479.70/1487.29 (1.108x, faster)",
+    "sab|tp3|bfloat16|M=104": "1708.44/1713.32 -> 1500.27/1514.54 (1.135x, faster)",
+    "sab|tp3|bfloat16|M=107": "1733.11/1742.78 -> 1511.30/1531.86 (1.142x, faster)",
+    "sab|tp3|bfloat16|M=112": "1787.03/1788.30 -> 1539.71/1554.03 (1.156x, faster)",
+    "sab|tp3|bfloat16|M=120": "1865.57/1857.53 -> 1582.05/1607.04 (1.167x, faster)",
+    "sab|tp3|bfloat16|M=128": "1936.88/1942.18 -> 1673.79/1663.49 (1.162x, faster)"
+   },
+   "slot A/A (same config, early vs late layer)": {
+    "sab|tp4|float32|M=1": {
+     "boot1": {
+      "s4a2_a/s4a2_b": 1.0189,
+      "s2_a/s2_b": 1.007
+     },
+     "boot2": {
+      "s4a2_a/s4a2_b": 1.0218,
+      "s2_a/s2_b": 1.0083
+     }
+    },
+    "sab|tp4|float32|M=16": {
+     "boot1": {
+      "s4a2_a/s4a2_b": 1.0169,
+      "s2_a/s2_b": 1.0006
+     },
+     "boot2": {
+      "s4a2_a/s4a2_b": 1.024,
+      "s2_a/s2_b": 1.0117
+     }
+    },
+    "sab|tp4|float32|M=64": {
+     "boot1": {
+      "s4a2_a/s4a2_b": 1.0171,
+      "s2_a/s2_b": 0.9995
+     },
+     "boot2": {
+      "s4a2_a/s4a2_b": 1.0155,
+      "s2_a/s2_b": 1.0111
+     }
+    },
+    "sab|tp4|float32|M=72": {
+     "boot1": {
+      "s4a2_a/s4a2_b": 1.0039,
+      "s2_a/s2_b": 0.9994
+     },
+     "boot2": {
+      "s4a2_a/s4a2_b": 0.9977,
+      "s2_a/s2_b": 1.0067
+     }
+    },
+    "sab|tp4|float32|M=96": {
+     "boot1": {
+      "s4a2_a/s4a2_b": 1.0041,
+      "s2_a/s2_b": 0.9986
+     },
+     "boot2": {
+      "s4a2_a/s4a2_b": 0.9996,
+      "s2_a/s2_b": 1.0005
+     }
+    },
+    "sab|tp4|float32|M=97": {
+     "boot1": {
+      "s4a2_a/s4a2_b": 0.9957,
+      "s2_a/s2_b": 0.9988
+     },
+     "boot2": {
+      "s4a2_a/s4a2_b": 1.0009,
+      "s2_a/s2_b": 1.0018
+     }
+    },
+    "sab|tp4|float32|M=104": {
+     "boot1": {
+      "s4a2_a/s4a2_b": 0.9994,
+      "s2_a/s2_b": 0.9895
+     },
+     "boot2": {
+      "s4a2_a/s4a2_b": 1.0087,
+      "s2_a/s2_b": 0.9993
+     }
+    },
+    "sab|tp4|float32|M=107": {
+     "boot1": {
+      "s4a2_a/s4a2_b": 1.0002,
+      "s2_a/s2_b": 1.0013
+     },
+     "boot2": {
+      "s4a2_a/s4a2_b": 0.998,
+      "s2_a/s2_b": 1.0069
+     }
+    },
+    "sab|tp4|float32|M=112": {
+     "boot1": {
+      "s4a2_a/s4a2_b": 0.9973,
+      "s2_a/s2_b": 1.0151
+     },
+     "boot2": {
+      "s4a2_a/s4a2_b": 1.0005,
+      "s2_a/s2_b": 1.0088
+     }
+    },
+    "sab|tp4|float32|M=120": {
+     "boot1": {
+      "s4a2_a/s4a2_b": 1.0052,
+      "s2_a/s2_b": 0.9581
+     },
+     "boot2": {
+      "s4a2_a/s4a2_b": 1.0008,
+      "s2_a/s2_b": 0.9901
+     }
+    },
+    "sab|tp4|float32|M=128": {
+     "boot1": {
+      "s4a2_a/s4a2_b": 1.0037,
+      "s2_a/s2_b": 0.9598
+     },
+     "boot2": {
+      "s4a2_a/s4a2_b": 0.9866,
+      "s2_a/s2_b": 1.0255
+     }
+    },
+    "sab|tp4|bfloat16|M=1": {
+     "boot1": {
+      "s4a2_a/s4a2_b": 1.0119,
+      "s2_a/s2_b": 1.0045
+     },
+     "boot2": {
+      "s4a2_a/s4a2_b": 1.0149,
+      "s2_a/s2_b": 1.0083
+     }
+    },
+    "sab|tp4|bfloat16|M=16": {
+     "boot1": {
+      "s4a2_a/s4a2_b": 1.0055,
+      "s2_a/s2_b": 1.0011
+     },
+     "boot2": {
+      "s4a2_a/s4a2_b": 1.0063,
+      "s2_a/s2_b": 1.0119
+     }
+    },
+    "sab|tp4|bfloat16|M=64": {
+     "boot1": {
+      "s4a2_a/s4a2_b": 0.9948,
+      "s2_a/s2_b": 0.9845
+     },
+     "boot2": {
+      "s4a2_a/s4a2_b": 0.9951,
+      "s2_a/s2_b": 1.0053
+     }
+    },
+    "sab|tp4|bfloat16|M=72": {
+     "boot1": {
+      "s4a2_a/s4a2_b": 0.9954,
+      "s2_a/s2_b": 0.993
+     },
+     "boot2": {
+      "s4a2_a/s4a2_b": 0.9949,
+      "s2_a/s2_b": 0.9983
+     }
+    },
+    "sab|tp4|bfloat16|M=96": {
+     "boot1": {
+      "s4a2_a/s4a2_b": 1.0024,
+      "s2_a/s2_b": 0.996
+     },
+     "boot2": {
+      "s4a2_a/s4a2_b": 0.9955,
+      "s2_a/s2_b": 1.0062
+     }
+    },
+    "sab|tp4|bfloat16|M=97": {
+     "boot1": {
+      "s4a2_a/s4a2_b": 1.0041,
+      "s2_a/s2_b": 0.9921
+     },
+     "boot2": {
+      "s4a2_a/s4a2_b": 0.9959,
+      "s2_a/s2_b": 0.9997
+     }
+    },
+    "sab|tp4|bfloat16|M=104": {
+     "boot1": {
+      "s4a2_a/s4a2_b": 0.9975,
+      "s2_a/s2_b": 0.9987
+     },
+     "boot2": {
+      "s4a2_a/s4a2_b": 0.9935,
+      "s2_a/s2_b": 1.0087
+     }
+    },
+    "sab|tp4|bfloat16|M=107": {
+     "boot1": {
+      "s4a2_a/s4a2_b": 0.9966,
+      "s2_a/s2_b": 0.9943
+     },
+     "boot2": {
+      "s4a2_a/s4a2_b": 0.9945,
+      "s2_a/s2_b": 1.0013
+     }
+    },
+    "sab|tp4|bfloat16|M=112": {
+     "boot1": {
+      "s4a2_a/s4a2_b": 0.9989,
+      "s2_a/s2_b": 0.9765
+     },
+     "boot2": {
+      "s4a2_a/s4a2_b": 1.0077,
+      "s2_a/s2_b": 0.9785
+     }
+    },
+    "sab|tp4|bfloat16|M=120": {
+     "boot1": {
+      "s4a2_a/s4a2_b": 0.9792,
+      "s2_a/s2_b": 0.9986
+     },
+     "boot2": {
+      "s4a2_a/s4a2_b": 1.0033,
+      "s2_a/s2_b": 1.0044
+     }
+    },
+    "sab|tp4|bfloat16|M=128": {
+     "boot1": {
+      "s4a2_a/s4a2_b": 1.001,
+      "s2_a/s2_b": 0.9904
+     },
+     "boot2": {
+      "s4a2_a/s4a2_b": 1.0004,
+      "s2_a/s2_b": 0.977
+     }
+    },
+    "sab|tp3|float32|M=1": {
+     "boot1": {
+      "s4a2_a/s4a2_b": 1.0698,
+      "s2_a/s2_b": 1.0419
+     },
+     "boot2": {
+      "s4a2_a/s4a2_b": 1.0507,
+      "s2_a/s2_b": 1.022
+     }
+    },
+    "sab|tp3|float32|M=16": {
+     "boot1": {
+      "s4a2_a/s4a2_b": 1.0552,
+      "s2_a/s2_b": 1.0341
+     },
+     "boot2": {
+      "s4a2_a/s4a2_b": 1.0437,
+      "s2_a/s2_b": 1.0226
+     }
+    },
+    "sab|tp3|float32|M=64": {
+     "boot1": {
+      "s4a2_a/s4a2_b": 1.0324,
+      "s2_a/s2_b": 1.0131
+     },
+     "boot2": {
+      "s4a2_a/s4a2_b": 1.0342,
+      "s2_a/s2_b": 1.0095
+     }
+    },
+    "sab|tp3|float32|M=72": {
+     "boot1": {
+      "s4a2_a/s4a2_b": 0.9985,
+      "s2_a/s2_b": 1.0028
+     },
+     "boot2": {
+      "s4a2_a/s4a2_b": 1.0049,
+      "s2_a/s2_b": 1.013
+     }
+    },
+    "sab|tp3|float32|M=96": {
+     "boot1": {
+      "s4a2_a/s4a2_b": 1.0023,
+      "s2_a/s2_b": 1.0009
+     },
+     "boot2": {
+      "s4a2_a/s4a2_b": 1.0025,
+      "s2_a/s2_b": 1.0058
+     }
+    },
+    "sab|tp3|float32|M=97": {
+     "boot1": {
+      "s4a2_a/s4a2_b": 0.9991,
+      "s2_a/s2_b": 1.0048
+     },
+     "boot2": {
+      "s4a2_a/s4a2_b": 0.997,
+      "s2_a/s2_b": 1.0099
+     }
+    },
+    "sab|tp3|float32|M=104": {
+     "boot1": {
+      "s4a2_a/s4a2_b": 1.0026,
+      "s2_a/s2_b": 1.0018
+     },
+     "boot2": {
+      "s4a2_a/s4a2_b": 1.0015,
+      "s2_a/s2_b": 1.0105
+     }
+    },
+    "sab|tp3|float32|M=107": {
+     "boot1": {
+      "s4a2_a/s4a2_b": 1.0125,
+      "s2_a/s2_b": 0.9959
+     },
+     "boot2": {
+      "s4a2_a/s4a2_b": 0.9985,
+      "s2_a/s2_b": 1.0004
+     }
+    },
+    "sab|tp3|float32|M=112": {
+     "boot1": {
+      "s4a2_a/s4a2_b": 1.0023,
+      "s2_a/s2_b": 0.9946
+     },
+     "boot2": {
+      "s4a2_a/s4a2_b": 0.9901,
+      "s2_a/s2_b": 1.0129
+     }
+    },
+    "sab|tp3|float32|M=120": {
+     "boot1": {
+      "s4a2_a/s4a2_b": 0.9981,
+      "s2_a/s2_b": 1.0451
+     },
+     "boot2": {
+      "s4a2_a/s4a2_b": 1.0139,
+      "s2_a/s2_b": 1.0241
+     }
+    },
+    "sab|tp3|float32|M=128": {
+     "boot1": {
+      "s4a2_a/s4a2_b": 0.9861,
+      "s2_a/s2_b": 0.9558
+     },
+     "boot2": {
+      "s4a2_a/s4a2_b": 0.9868,
+      "s2_a/s2_b": 1.0263
+     }
+    },
+    "sab|tp3|bfloat16|M=1": {
+     "boot1": {
+      "s4a2_a/s4a2_b": 1.0748,
+      "s2_a/s2_b": 1.0071
+     },
+     "boot2": {
+      "s4a2_a/s4a2_b": 1.0615,
+      "s2_a/s2_b": 1.0024
+     }
+    },
+    "sab|tp3|bfloat16|M=16": {
+     "boot1": {
+      "s4a2_a/s4a2_b": 1.0657,
+      "s2_a/s2_b": 1.0066
+     },
+     "boot2": {
+      "s4a2_a/s4a2_b": 1.0564,
+      "s2_a/s2_b": 1.0045
+     }
+    },
+    "sab|tp3|bfloat16|M=64": {
+     "boot1": {
+      "s4a2_a/s4a2_b": 1.0429,
+      "s2_a/s2_b": 1.0091
+     },
+     "boot2": {
+      "s4a2_a/s4a2_b": 1.0396,
+      "s2_a/s2_b": 1.0032
+     }
+    },
+    "sab|tp3|bfloat16|M=72": {
+     "boot1": {
+      "s4a2_a/s4a2_b": 1.0038,
+      "s2_a/s2_b": 1.0023
+     },
+     "boot2": {
+      "s4a2_a/s4a2_b": 1.016,
+      "s2_a/s2_b": 0.9948
+     }
+    },
+    "sab|tp3|bfloat16|M=96": {
+     "boot1": {
+      "s4a2_a/s4a2_b": 1.0025,
+      "s2_a/s2_b": 1.0049
+     },
+     "boot2": {
+      "s4a2_a/s4a2_b": 1.0044,
+      "s2_a/s2_b": 0.9938
+     }
+    },
+    "sab|tp3|bfloat16|M=97": {
+     "boot1": {
+      "s4a2_a/s4a2_b": 1.0024,
+      "s2_a/s2_b": 1.0052
+     },
+     "boot2": {
+      "s4a2_a/s4a2_b": 1.0012,
+      "s2_a/s2_b": 0.9978
+     }
+    },
+    "sab|tp3|bfloat16|M=104": {
+     "boot1": {
+      "s4a2_a/s4a2_b": 0.9966,
+      "s2_a/s2_b": 1.0018
+     },
+     "boot2": {
+      "s4a2_a/s4a2_b": 0.9983,
+      "s2_a/s2_b": 0.9967
+     }
+    },
+    "sab|tp3|bfloat16|M=107": {
+     "boot1": {
+      "s4a2_a/s4a2_b": 1.0009,
+      "s2_a/s2_b": 1.0003
+     },
+     "boot2": {
+      "s4a2_a/s4a2_b": 1.0063,
+      "s2_a/s2_b": 0.9834
+     }
+    },
+    "sab|tp3|bfloat16|M=112": {
+     "boot1": {
+      "s4a2_a/s4a2_b": 1.0132,
+      "s2_a/s2_b": 1.0024
+     },
+     "boot2": {
+      "s4a2_a/s4a2_b": 1.001,
+      "s2_a/s2_b": 0.9904
+     }
+    },
+    "sab|tp3|bfloat16|M=120": {
+     "boot1": {
+      "s4a2_a/s4a2_b": 1.0007,
+      "s2_a/s2_b": 0.9864
+     },
+     "boot2": {
+      "s4a2_a/s4a2_b": 1.0017,
+      "s2_a/s2_b": 1.0179
+     }
+    },
+    "sab|tp3|bfloat16|M=128": {
+     "boot1": {
+      "s4a2_a/s4a2_b": 1.0151,
+      "s2_a/s2_b": 1.0075
+     },
+     "boot2": {
+      "s4a2_a/s4a2_b": 1.0182,
+      "s2_a/s2_b": 1.0283
+     }
+    }
+   }
+  }
+ },
+ "tests": {
+  "files": "tests/kernels/quantization/test_deepseek_v41_tilelang_vocab.py, tests/kernels/test_deepseek_v41_tilelang_pdl.py, tests/v1/worker/gpu/test_greedy_verification.py (the PR's three), with -p tblib_stub",
+  "smoke (new and changed config tests, before the bench)": "6 passed, 14 warnings in 26.96s",
+  "boot1": "109 passed, 14 warnings in 63.22s (0:01:03)",
+  "boot2": "109 passed, 14 warnings in 46.73s"
+ },
+ "bit_exact": true,
+ "bit_exact_detail": "In every run and cell the bench asserts torch.equal of the logits of the 64-row tile, the base_1107 and candidate heads, and of the greedy pairs of the 64-row partials, both heads' certified screens and greedy_shard_pair on the logits (all four runs completed); the logits and pairs hashes are equal across all four runs of both arms in every cell; sab's four layers give equal pairs in every cell of both boots.",
+ "slot_effect_note": "The in-process pairs build base_1107 first and the candidate second, and a layer's build slot moves graph replay on identical kernels (sab: up to 7% at TP3 M=1, monotone with the build order; this bench at M<=64, identical kernels: BF16 greedy pairs 1-3.8% slower in the second slot on both arms). The screen gain is therefore also measured slot-balanced (sab), where the identical-kernel cells read same or within 1.8% faster and the 128-row tile 3.3-16.7% faster.",
+ "verdict": "corrected-meets-mark",
+ "reason": "Round 1 extends #1001's matched-stage change to the certified screen's 128-row tile, SCREEN_TILE_CONFIGS[128] (num_stages=4, act_stages=2 -> num_stages=2: 193 -> 78 registers), the tile through which serving's greedy pairs of 65..128 rows go on this base. Greedy epilogue (project_head_greedy_pairs) at M=97..128, by CUDA-graph replay, beyond the interval: 24 of 24 cells faster in process on the corrected tree (TP4 FP32 M=104 1275.51/1276.63 -> 1140.51/1143.63 us, 1.117x; TP3 FP32 M=120 1.168x), 24/24 in process on the base arm and 24/24 across images; slot-balanced (sab, two boots) 24/24 faster at 97..128 (1.097-1.167x) and 8/8 at M=72, 96 (1.033-1.102x). Projection (the first version's change, unchanged): 22 of 24 faster at 97..128 in process on the corrected tree (2 same, each from one outlier boot: TP3 FP32 M=97 1769.52, TP4 BF16 M=112 1342.70), 24/24 on the base arm and 24/24 across images. Bit-identical throughout. M<=96 not worse: every slower reading at M<=64 is between layers with identical kernels (the in-process slot effect: BF16 greedy 1-3.8%, present on the base arm too), and at M=72 the only ones are two BF16 projection cells (0.995x, 0.998x; BF16 is not the deployed head dtype, VLLM_DS41_HEAD_DTYPE=float32), within the same slot effect's reading on identical kernels (TP4 BF16 M=48 projection 0.997x); across images every M<=96 projection cell is faster or same and every FP32 cell of every comparison is faster or same except identical-kernel cells. SCREEN_TILE_CONFIGS[32] was checked and left: no matched config was faster in every cell.",
+ "notes": [
+  "Measured on spark-ds41f:candidate-50 with the corrected candidate-51 tree mounted (15 files, verified file by file); the c51r1 arm also carries #963-r1, whose screen kernels are byte-identical to the base's, so image_ab's greedy cells are #1001-r1 alone up to placement, and its projection cells #1001 with #963-r1.",
+  "The full-logits projection serves the logits processor and DSpark's Markov W2; greedy verification uses the certified screen.",
+  "sconf (tile-32 and tile-128 screen configs) ran one boot, in process, layers in build order; it chose the tile-128 change, which sab then measured slot-balanced on two boots.",
+  "start_utc in commands.txt is after the GPU lock was taken; other agents' jobs ran between runs."
+ ],
+ "patch_sha256": "0ad547d388f9daeda2c93c98a9dae978b843a2a637155e39cd26ec01f9a5e2e8",
+ "apply_check": {
+  "order": "candidate-51's series with the corrected patches: candidate-50's 0762..0777, 0779, 0780 on 1107's patch head, then 0781 (#961), 0782 (#963-r1), 0783 (#987, unchanged), 0784 (#1001-r1)",
+  "how": "the own-mark run's stack.sh in a fresh --shared clone (W/verify-apply): git apply --check --verbose, then git am --committer-date-is-author-date, as bin/spark build prepare applies them",
+  "result": [
+   "OK    0783-perf-dsv41-extend-WO-B-WIDE_DECODE-to-128-rows-and-g.patch sha256=7a29c933563e085076c8d9548b4e84e03b3c0df41c53f409158e4d588fa609a5  commit=28c8a04585e1b84e6497fcb0a53e891f99d72f78 tree=808d2f09cf78b6aca58d20f20e4c8cffdc9d429d files=3",
+   "      git apply: Hunk #1 succeeded at 1048 (offset 46 lines).",
+   "      git apply: Hunk #1 succeeded at 2717 (offset 46 lines).",
+   "      git apply: Hunk #2 succeeded at 2726 (offset 46 lines).",
+   "      git apply: Hunk #3 succeeded at 2905 (offset 46 lines).",
+   "OK    0784-Match-128-row-vocab-head-tile-pipeline-stages.patch sha256=0ad547d388f9daeda2c93c98a9dae978b843a2a637155e39cd26ec01f9a5e2e8  commit=a1ef9b6c55c15650934a3534622f7dc5e3b1b810 tree=35cd2a0e87a6b7a0c61c6c81dbe875ac1e7da005 files=2",
+   "head a1ef9b6c55c15650934a3534622f7dc5e3b1b810 tree 35cd2a0e87a6b7a0c61c6c81dbe875ac1e7da005 patches_after_base 4 patches_after_1107 22",
+   "git diff --check 19f2c20ed4d6..HEAD: clean"
+  ],
+  "tree": "35cd2a0e87a6b7a0c61c6c81dbe875ac1e7da005, the tree measured as the c51r1 arm; git diff --check 19f2c20ed4d6..HEAD clean"
+ },
+ "overlay": {
+  "files": {
+   "vllm/models/deepseek_v4_1/tilelang/vocab.py": "75ec700072fef6b24479e1e0c1902a56ce2461be783298eaa69870749bae948c"
+  },
+  "state": "each file as the corrected candidate-51 tree (35cd2a0e87a6, after 0781, 0782 #963-r1, 0783 #987, 0784 #1001-r1) holds it, the bytes the c51r1 arm mounted (equal SHA-256): gemm.py includes #987's WIDE_DECODE/DECODE_FP8_CONFIGS entries, vocab.py #1001-r1's tile configs. The arm mounted 15 files in all (common/files-c51r1.txt); test files are in the patches."
+ },
+ "receipts": {
+  "bench": "raw/vocab-*.txt, raw/json/vocab-*.json; analysis.json / analysis.txt (a1001r1.py)",
+  "sab": "raw/diag/d963-sab-boot*.{txt,json}; analysis-sab.json / analysis-sab.txt (asab.py)",
+  "sconf": "raw/diag/d963-sconf-boot1.{txt,json}; raw/diag/adiag-sconf.txt",
+  "tests": "raw/pytest-c51r1-boot{1,2}.txt",
+  "registers": "common/h/screenregs.py, common/verify/sass-*.txt"
+ }
+}

@@ -1,0 +1,24 @@
+perf(worker): compact packed vocab tables and expand display carve-out weights
+
+Base: 1107 vLLM patch head 320021e3c4dbb202d911ab70e2cd924c75420488.
+
+Rationale:
+On 119 GiB unified-memory GB10 nodes with SPARK_DS41F_DISPLAY_CARVEOUT_WEIGHTS=1, the firmware display carve-out (/dev/dri/card0, 2,032 MiB on dgx3 with 8 MiB console framebuffer, 2,045 MiB on headless nodes) previously held only unpacked allocations for embed_tokens.weight and lm_head.weight (2 x 432 = 864 MiB at TP3, 2 x 320 = 640 MiB at TP4):
+1. After 12-bit packing in TileLangEmbeddingMethod and PackedBf16LmHeadMethod, each shard occupies 315.64 MiB at TP3 (236.72 MiB at TP4), leaving 224 MiB at TP3 (160 MiB at TP4) of unused tail inside the two dumb buffers plus 1,168 MiB (TP3) / 1,392 MiB (TP4) of unallocated carve-out space.
+2. DSpark's replicated Markov anchor embedding (model.markov_head.markov_w1.weight, 129,280 x 256 BF16 = 63.125 MiB) missed _MIN_WEIGHT_BYTES = 64 MiB by 0.875 MiB and was allocated in ordinary UMA memory, even though it is only read by single-row anchor lookups during speculative drafting and never touched during prefill.
+3. DSpark's 3 draft MoE layers (model.layers.{0,1,2}.ffn.experts.w13_weight and w2_weight, 480 MiB + 240 MiB per layer at TP3, 360 MiB + 160 MiB at TP4) use a decode-only MoeExpertsV41Plan (max_rows is not None and not _has_mid_tiles()), never execute during prefill, and stream each active expert's weight slab at most once per draft step.
+
+Changes:
+- Add _Carveout.close(), display_carveout.total_bytes(), display_carveout.compact(), and display_carveout.move() with _MIN_WEIGHT_BYTES = 60 MiB and _MAX_TOTAL_BYTES = 1,968 MiB (leaving 64 MiB of free scanout heap on dgx3).
+- Compact embed_tokens.weight and lm_head.weight after in-place 12-bit packing into tight 320 MiB (TP3) / 240 MiB (TP4) dumb buffers reallocated at the bottom of the scanout heap with zero fragmentation.
+- Allocate DSparkMarkovHead.markov_w1.weight in the display carve-out via display_carveout.allocate, shrinking the drafter's _direct_weight_arena by 63.125 MiB and streaming markov_w1 directly into the carve-out.
+- Move decode-only TileLangExperts w13_weight and w2_weight slabs into the remaining carve-out budget via display_carveout.move (mtp.0 w13_weight, mtp.0 w2_weight, and mtp.1 w13_weight = 1,200 MiB at TP3; plus mtp.1 w2_weight and mtp.2 w13_weight = 1,400 MiB at TP4), and verify both target and speculator models in confirm_streamed_weights.
+
+Quality:
+Bit-identical outputs (torch.equal = True) across vocab_embedding_packed, PackedBf16LmHeadMethod, markov_anchor_embed, and MoeExpertsV41Plan.run. Saves 1,263.125 MiB (1.234 GiB) of regular UMA allocated memory (1,320 MiB reserved, ~1,669 MiB host MemAvailable) per rank at TP3 and 1,463.125 MiB (1.429 GiB) at TP4, while speeding up moved DSpark MoE layers by 8.5%-12.3% across M=5..40 with zero prefill impact.
+
+Tests:
+- pytest tests/v1/worker/test_display_carveout.py tests/models/test_dspark_mla.py tests/model_executor/model_loader/test_direct_loader.py tests/v1/worker/test_gpu_model_runner_v2.py tests/kernels/test_deepseek_v41_tilelang_embedding.py (234 passed).
+
+Upstream status: local GB10 display carve-out weight placement optimization.
+

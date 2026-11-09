@@ -1,0 +1,601 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Christopher Owen <3221756+christopherowen@users.noreply.github.com>
+Date: Sun, 8 Nov 2026 11:30:00 +0100
+Subject: [PATCH] perf(cudagraph): capture target FULL attention/CED metadata
+ replay and deduplicate DFlash padding
+
+Upstream base: 1107 vLLM patch head 2756478b60b90700b9918b457aeb38657da637b5 (tree ed1bdb7a7684da33d403a055521ac0c4dd7ca670).
+
+Rationale:
+1. On every CUDAGraphMode.FULL target decode step in 1107, GPUModelRunner.execute_model unconditionally invoked build_slot_mappings_by_layer (90-layer dict) and model_state.prepare_attn, which allocated two fresh pinned host tensors via torch.tensor(..., pin_memory=True) in CEDState.stage, issued two H2D copies, launched ced_kernels.requests(..., compact=False) eagerly, and looped over all 23 target KV-cache groups to launch 23 separate tl_metadata.builder kernels eagerly from Python (~420-436 us/step), even though run_fullgraph and DFlashSpeculator.propose ignore the returned attn_metadata and slot_mappings_by_layer dicts.
+   - Extend ModelCudaGraphManager.capture to record model_state.prepare_cudagraph_replay (invoking ced_kernels.requests(..., compact=False) in-graph) and each attention group builder's prepare_cudagraph_replay inside every CUDAGraphMode.FULL target graph when can_capture_full_attn_metadata holds.
+   - Skip build_slot_mappings_by_layer and model_state.prepare_attn on runtime CUDAGraphMode.FULL steps when captures_full_attn_metadata is active, staging only changed CED replay floors through a preallocated 4-slot pinned host ring buffer in CEDState.stage_floors (~390 us/step saved).
+2. In DFlashSpeculator.propose, tilelang_inputs.padding_rows(self._is_padding, live, num_tokens_padded) was launched eagerly between _context_preparer.run and query_cudagraph_manager.run_fullgraph on every step even when live was unchanged from the previous step. Track _padding_live and skip the redundant kernel launch when live is unchanged (~12 us/step saved).
+
+Quality implications:
+None. Both changes preserve bit-identical outputs (torch.equal across all decode shapes at temperature=0) and add zero GPU memory overhead.
+---
+ .../attention/test_b12x_v41_ced_metadata.py   | 42 ++++++++
+ tests/v1/cudagraph/test_cudagraph_manager.py  | 99 +++++++++++++++++++
+ vllm/models/deepseek_v4_1/ced.py              | 87 +++++++++++++---
+ .../deepseek_v4_1/nvidia/model_state.py       | 20 ++++
+ vllm/v1/worker/gpu/cudagraph_utils.py         | 64 ++++++++++++
+ vllm/v1/worker/gpu/model_runner.py            | 75 +++++++++-----
+ .../gpu/spec_decode/dflash/speculator.py      | 14 ++-
+ 7 files changed, 358 insertions(+), 43 deletions(-)
+
+diff --git a/tests/v1/attention/test_b12x_v41_ced_metadata.py b/tests/v1/attention/test_b12x_v41_ced_metadata.py
+index 8256a0eee..f1add511f 100644
+--- a/tests/v1/attention/test_b12x_v41_ced_metadata.py
++++ b/tests/v1/attention/test_b12x_v41_ced_metadata.py
+@@ -1136,3 +1136,45 @@ def test_original_prompt_recovery_excludes_input_stream_sessions(is_streaming_in
+     assert limits == ([127] if is_streaming_input else [384])
+     state.remove_request("resumed")
+     assert state._ced_recovery_prompt_end == {}
++
++
++@cuda
++def test_ced_state_cudagraph_replay_matches_eager_stage(monkeypatch):
++    """CEDState.stage_floors + prepare_cudagraph_replay inside a captured graph
++    matches eager CEDState.stage bit-for-bit across varying seq_lens and floors."""
++    import importlib
++
++    import tilelang.cache
++
++    from vllm.models.deepseek_v4_1.tilelang import ced as ced_kernels
++
++    cache_module = importlib.import_module(tilelang.cache.freeze.__module__)
++    monkeypatch.setattr(cache_module, "_frozen_reason", None)
++    ced_kernels.requests_kernel(4, False, False)
++
++    captured = CEDState(4, 256, (128, 256), "cuda")
++    eager = CEDState(4, 256, (128, 256), "cuda")
++    starts = torch.tensor([0, 6, 12, 18, 24], dtype=torch.int32, device="cuda")
++    seq = torch.tensor([140, 260, 90, 512], dtype=torch.int32, device="cuda")
++    captured.stage(starts, seq, [6] * 4, [False] * 4, [0] * 4)
++    torch.accelerator.synchronize()
++
++    graph = torch.cuda.CUDAGraph()
++    with torch.cuda.graph(graph):
++        captured.prepare_cudagraph_replay(starts, seq, 4)
++
++    for lengths, floors in (
++        ([140, 260, 90, 512], [0, 0, 0, 0]),
++        ([145, 265, 95, 517], [0, 0, 0, 0]),
++        ([200, 400, 150, 800], [128, 256, 64, 512]),
++    ):
++        seq.copy_(torch.tensor(lengths, dtype=torch.int32))
++        ring_before = captured._stage_ring_idx
++        captured.stage_floors(floors)
++        if floors == [0, 0, 0, 0]:
++            assert captured._stage_ring_idx == ring_before
++        graph.replay()
++        eager.stage(starts, seq, [6] * 4, [False] * 4, floors)
++        assert torch.equal(captured.replay_start[:4], eager.replay_start[:4])
++        assert torch.equal(captured.request_positions[:4], eager.request_positions[:4])
++        assert torch.equal(captured.starts[:5], eager.starts[:5])
+diff --git a/tests/v1/cudagraph/test_cudagraph_manager.py b/tests/v1/cudagraph/test_cudagraph_manager.py
+index ca3e70ad8..ca8f867f9 100644
+--- a/tests/v1/cudagraph/test_cudagraph_manager.py
++++ b/tests/v1/cudagraph/test_cudagraph_manager.py
+@@ -898,3 +898,102 @@ def test_divisor_query_len_dispatch_is_unchanged(
+         assert desc.cg_mode == CUDAGraphMode.FULL, num_tokens
+         assert desc.num_tokens == expected, num_tokens
+         assert desc.num_reqs == expected // decode_query_len, num_tokens
++
++
++@pytest.mark.parametrize("mode", [CUDAGraphMode.FULL, CUDAGraphMode.PIECEWISE])
++def test_target_model_full_cudagraph_metadata_and_state_replay(monkeypatch, mode):
++    """Target FULL graphs refresh model_state and attention builder metadata in-graph."""
++    inputs = SimpleNamespace(
++        input_ids=torch.zeros(20, dtype=torch.int32),
++        positions=torch.zeros(20, dtype=torch.int64),
++        query_start_loc=torch.arange(5, dtype=torch.int32) * 5,
++        seq_lens=torch.tensor([11, 21, 0, 0], dtype=torch.int32),
++        is_padding=torch.ones(20, dtype=torch.bool),
++    )
++    tables = SimpleNamespace(
++        cp_size=1,
++        input_block_tables=[torch.ones(4, 2, dtype=torch.int32)],
++        slot_mappings=torch.ones(1, 20, dtype=torch.int64),
++    )
++    events: list[object] = []
++
++    class State:
++        supports_captured_full_attn_metadata = True
++
++        def prepare_dummy_inputs(self, nr, nt):
++            return {}
++
++        def finalize_cudagraph_inputs(self, model_inputs, cg_mode):
++            return None
++
++        def prepare_cudagraph_replay(self, buf, nr, nt):
++            events.append(("state_replay", buf.seq_lens[1].item(), nr, nt))
++
++    def refresh(starts, seq, table, slots, nr, nt):
++        events.append(("attn_replay", seq[1].item(), table[1, 0].item(), slots[5].item()))
++
++    group = SimpleNamespace(
++        get_metadata_builder=lambda: SimpleNamespace(prepare_cudagraph_replay=refresh)
++    )
++    monkeypatch.setattr(
++        gpu_cudagraph_utils, "prepare_inputs_to_capture", lambda *a, **kw: ({}, {})
++    )
++    monkeypatch.setattr(
++        gpu_cudagraph_utils,
++        "set_forward_context",
++        contextmanager(lambda *a, **kw: (yield)),
++    )
++
++    def capture(self, create_forward, progress_bar_desc):
++        desc = BatchExecutionDescriptor(mode, 10, 2, 5)
++        forward = create_forward(desc, warmup=False)
++        forward(mode)
++        inputs.seq_lens[1] = 7
++        tables.input_block_tables[0][1, 0] = 3
++        tables.slot_mappings[0, 5] = 17
++        forward(mode)
++
++    monkeypatch.setattr(gpu_cudagraph_utils.CudaGraphManager, "capture", capture)
++    manager = gpu_cudagraph_utils.ModelCudaGraphManager.__new__(
++        gpu_cudagraph_utils.ModelCudaGraphManager
++    )
++    manager.max_num_reqs, manager.dp_size = 4, 1
++    manager.is_first_pp_rank = manager.is_last_pp_rank = True
++    manager.use_breakable_cg = False
++    manager.cudagraph_mode = mode
++    manager.vllm_config = _create_vllm_config()
++    manager.hidden_states = None
++    manager.aux_hidden_states = []
++    manager.intermediate_tensors = None
++    manager.run_pw_graph = lambda model, model_inputs: model(**model_inputs)
++
++    class Model(torch.nn.Module):
++        def forward(self, **kwargs):
++            events.append("model")
++            return torch.zeros((10, 4))
++
++    with patch.object(
++        gpu_cudagraph_utils, "has_compiled_submodule", return_value=True
++    ):
++        manager.capture(
++            Model(),
++            State(),
++            inputs,
++            None,
++            tables,
++            [[group]],
++            None,
++        )
++    assert manager.captures_full_attn_metadata
++    assert events == (
++        [
++            ("state_replay", 21, 2, 10),
++            ("attn_replay", 21, 1, 1),
++            "model",
++            ("state_replay", 7, 2, 10),
++            ("attn_replay", 7, 3, 17),
++            "model",
++        ]
++        if mode == CUDAGraphMode.FULL
++        else ["model", "model"]
++    )
+diff --git a/vllm/models/deepseek_v4_1/ced.py b/vllm/models/deepseek_v4_1/ced.py
+index 8ecaa4fde..902865482 100644
+--- a/vllm/models/deepseek_v4_1/ced.py
++++ b/vllm/models/deepseek_v4_1/ced.py
+@@ -170,6 +170,8 @@ def replay_rows(
+ class CEDState:
+     """Stable per-model staging buffers shared by dummy, capture, and runtime."""
+ 
++    _STAGE_RING_SIZE = 4
++
+     def __init__(
+         self, max_requests: int, max_tokens: int, capacities: tuple[int, ...], device
+     ):
+@@ -185,6 +187,17 @@ class CEDState:
+         self.limits = torch.empty(max_requests, dtype=torch.int32, device=device)
+         self.floors = torch.empty_like(self.request_positions)
+         self.plan: CEDPlan | None = None
++        pin = self.indices.device.type == "cuda"
++        self._limits_host_ring = tuple(
++            torch.empty(max_requests, dtype=torch.int32, device="cpu", pin_memory=pin)
++            for _ in range(self._STAGE_RING_SIZE)
++        )
++        self._floors_host_ring = tuple(
++            torch.empty(max_requests, dtype=torch.int64, device="cpu", pin_memory=pin)
++            for _ in range(self._STAGE_RING_SIZE)
++        )
++        self._stage_ring_idx = 0
++        self._staged_floors: list[int | None] = [None] * max_requests
+ 
+     def warmup(
+         self, hidden_size: int, hc_mult: int, *, pipeline: bool, sink_columns: bool
+@@ -272,24 +285,33 @@ class CEDState:
+         kept-row limits (both from ``replay_rows``)."""
+         nr = len(query_lengths)
+         self.plan = plan_ced(query_lengths, keep_full, self.capacities, limits)
+-        # Fresh pinned sources remain owned by the async-copy allocator until
+-        # transfer completion; reusing a CPU staging buffer could race overlap.
++        # Rotate through preallocated pinned host buffers so async H2D transfers
++        # never allocate per-step pinned host tensors or race the previous step.
+         # A request keeps at most its limit of rows: all of them, the window, or
+         # the rows from its replay floor on.
+-        limits_host = torch.tensor(
+-            [
+-                KEEP_ALL if full else CED_WINDOW if limits is None else limits[i]
+-                for i, full in enumerate(keep_full)
+-            ],
+-            dtype=torch.int32,
+-            device="cpu",
+-            pin_memory=True,
+-        )
+-        floors_host = torch.tensor(
+-            floors, dtype=torch.int64, device="cpu", pin_memory=True
+-        )
+-        self.limits[:nr].copy_(limits_host, non_blocking=True)
+-        self.floors[:nr].copy_(floors_host, non_blocking=True)
++        if nr > 0:
++            ring_slot = self._stage_ring_idx % self._STAGE_RING_SIZE
++            self._stage_ring_idx += 1
++            limits_host = self._limits_host_ring[ring_slot][:nr]
++            floors_host = self._floors_host_ring[ring_slot][:nr]
++            limits_host.copy_(
++                torch.tensor(
++                    [
++                        KEEP_ALL
++                        if full
++                        else CED_WINDOW
++                        if limits is None
++                        else limits[i]
++                        for i, full in enumerate(keep_full)
++                    ],
++                    dtype=torch.int32,
++                )
++            )
++            floors_list = [int(f) for f in floors[:nr]]
++            floors_host.copy_(torch.tensor(floors_list, dtype=torch.int64))
++            self.limits[:nr].copy_(limits_host, non_blocking=True)
++            self.floors[:nr].copy_(floors_host, non_blocking=True)
++            self._staged_floors[:nr] = floors_list
+         ced_kernels.requests(
+             starts,
+             seq,
+@@ -311,6 +333,39 @@ class CEDState:
+                 self.plan.num_tokens,
+             )
+ 
++    def stage_floors(self, floors) -> None:
++        """Stage per-request replay floors for non-compacting FULL CUDA graph replay."""
++        self.plan = None
++        nr = len(floors)
++        if nr == 0:
++            return
++        floors_list = [int(f) for f in floors]
++        if self._staged_floors[:nr] == floors_list:
++            return
++        ring_slot = self._stage_ring_idx % self._STAGE_RING_SIZE
++        self._stage_ring_idx += 1
++        floors_host = self._floors_host_ring[ring_slot][:nr]
++        floors_host.copy_(torch.tensor(floors_list, dtype=torch.int64))
++        self.floors[:nr].copy_(floors_host, non_blocking=True)
++        self._staged_floors[:nr] = floors_list
++
++    def prepare_cudagraph_replay(
++        self, starts: torch.Tensor, seq: torch.Tensor, num_reqs: int
++    ) -> None:
++        """Refresh request positions and SWA replay starts inside a FULL CUDA graph."""
++        ced_kernels.requests(
++            starts,
++            seq,
++            self.limits,
++            self.floors,
++            self.starts,
++            self.request_positions,
++            self.replay_start,
++            self.counts,
++            num_reqs,
++            compact=False,
++        )
++
+     def get_indices(self) -> torch.Tensor | None:
+         return None if self.plan is None else self.indices[: self.plan.num_tokens]
+ 
+diff --git a/vllm/models/deepseek_v4_1/nvidia/model_state.py b/vllm/models/deepseek_v4_1/nvidia/model_state.py
+index 0a6fdf43f..9397723fb 100644
+--- a/vllm/models/deepseek_v4_1/nvidia/model_state.py
++++ b/vllm/models/deepseek_v4_1/nvidia/model_state.py
+@@ -45,6 +45,7 @@ class DeepseekV41ModelState(DefaultModelState):
+     """
+ 
+     _ced_streaming_prefix_start: tuple[str, int] | None = None
++    supports_captured_full_attn_metadata: bool = True
+ 
+     def __init__(
+         self,
+@@ -292,6 +293,25 @@ class DeepseekV41ModelState(DefaultModelState):
+         )
+         self._ced_batch = input_batch
+ 
++    def stage_full_cudagraph_attn(self, input_batch: InputBatch) -> None:
++        state = self.ced_state
++        if state is None:
++            return
++        _, floors, _ = self._ced_rows(input_batch)
++        state.stage_floors(floors)
++        self._ced_batch = input_batch
++
++    def prepare_cudagraph_replay(
++        self, input_buffers: Any, num_reqs: int, num_tokens: int
++    ) -> None:
++        state = self.ced_state
++        if state is not None:
++            state.prepare_cudagraph_replay(
++                input_buffers.query_start_loc,
++                input_buffers.seq_lens,
++                num_reqs,
++            )
++
+     def prepare_attn(
+         self,
+         input_batch: InputBatch,
+diff --git a/vllm/v1/worker/gpu/cudagraph_utils.py b/vllm/v1/worker/gpu/cudagraph_utils.py
+index 3c5cd1271..770d8960e 100644
+--- a/vllm/v1/worker/gpu/cudagraph_utils.py
++++ b/vllm/v1/worker/gpu/cudagraph_utils.py
+@@ -8,6 +8,7 @@ from collections import defaultdict
+ from collections.abc import Callable, Iterable, Sequence
+ from contextlib import ExitStack
+ from dataclasses import dataclass, replace
++from functools import partial
+ from itertools import groupby, product
+ from typing import TYPE_CHECKING, Any, NamedTuple, Protocol
+ 
+@@ -923,6 +924,33 @@ class ModelCudaGraphManager(CudaGraphManager):
+         self.aux_hidden_states: list[torch.Tensor] = []
+         self.use_aux_hidden_state_outputs = False
+         self.intermediate_tensors: IntermediateTensors | None = None
++        self.captures_full_attn_metadata: bool = False
++
++    @staticmethod
++    def can_capture_full_attn_metadata(
++        model_state: ModelState,
++        block_tables: BlockTables,
++        attn_groups: list[list[AttentionGroup]],
++        pcp_manager: "PCPManager | None" = None,
++    ) -> bool:
++        if pcp_manager is not None or getattr(block_tables, "cp_size", 1) > 1:
++            return False
++        if not getattr(model_state, "supports_captured_full_attn_metadata", False):
++            from vllm.v1.worker.gpu.model_states.default import DefaultModelState
++
++            if (
++                getattr(type(model_state), "prepare_attn", None)
++                is not DefaultModelState.prepare_attn
++            ):
++                return False
++        has_groups = False
++        for groups in attn_groups:
++            for group in groups:
++                has_groups = True
++                builder = group.get_metadata_builder()
++                if not callable(getattr(builder, "prepare_cudagraph_replay", None)):
++                    return False
++        return has_groups
+ 
+     def capture(
+         self,
+@@ -941,6 +969,9 @@ class ModelCudaGraphManager(CudaGraphManager):
+     ) -> None:
+         """Capture CUDA graphs for model forward pass."""
+         self.use_aux_hidden_state_outputs = use_aux_hidden_state_outputs
++        self.captures_full_attn_metadata = self.can_capture_full_attn_metadata(
++            model_state, block_tables, attn_groups, pcp_manager
++        )
+         if self.use_breakable_cg:
+             self.init_breakable_cg_runner(model)
+ 
+@@ -1062,6 +1093,37 @@ class ModelCudaGraphManager(CudaGraphManager):
+             )
+             model_state.finalize_cudagraph_inputs(model_inputs, desc.cg_mode)
+ 
++            metadata_updates: list[Callable[[], None]] = []
++            if self.captures_full_attn_metadata and desc.cg_mode == CUDAGraphMode.FULL:
++                prepare_state = getattr(
++                    model_state, "prepare_cudagraph_replay", None
++                )
++                if callable(prepare_state):
++                    metadata_updates.append(
++                        partial(prepare_state, input_buffers, num_reqs, num_tokens)
++                    )
++                for group_id, groups in enumerate(attn_groups):
++                    for group in groups:
++                        prepare = getattr(
++                            group.get_metadata_builder(),
++                            "prepare_cudagraph_replay",
++                            None,
++                        )
++                        if callable(prepare):
++                            metadata_updates.append(
++                                partial(
++                                    prepare,
++                                    input_buffers.query_start_loc[: num_reqs + 1],
++                                    input_buffers.seq_lens[:num_reqs],
++                                    block_tables.input_block_tables[group_id][
++                                        :num_reqs
++                                    ],
++                                    block_tables.slot_mappings[group_id, :num_tokens],
++                                    num_reqs,
++                                    num_tokens,
++                                )
++                            )
++
+             # Capture with dummy rows marked as padding.
+             input_buffers.is_padding.fill_(True)
+ 
+@@ -1093,6 +1155,8 @@ class ModelCudaGraphManager(CudaGraphManager):
+                         # run_pw_graph).
+                         model_output = self.run_pw_graph(model, model_inputs)
+                     else:
++                        for update in metadata_updates:
++                            update()
+                         model_output = model(**model_inputs)
+ 
+                 if cg_mode == CUDAGraphMode.PIECEWISE:
+diff --git a/vllm/v1/worker/gpu/model_runner.py b/vllm/v1/worker/gpu/model_runner.py
+index 173432af0..0bb03f2d9 100644
+--- a/vllm/v1/worker/gpu/model_runner.py
++++ b/vllm/v1/worker/gpu/model_runner.py
+@@ -3162,31 +3162,56 @@ class GPUModelRunner(LoRAModelRunnerMixin):
+                 for_capture=dummy_run and batch_desc.cg_mode == CUDAGraphMode.FULL,
+             )
+         elif not (dummy_run and skip_attn_for_dummy_run):
+-            assert slot_mappings is not None
+-            slot_mappings_by_layer = build_slot_mappings_by_layer(
+-                slot_mappings, self.kv_cache_config
+-            )
+-            assert block_tables is not None
+-            attn_groups = self.attn_groups
+-            if dummy_run and is_profile and not profile_all_kv_cache_groups:
+-                # Mamba layers take a cheap warmup path with no metadata;
+-                # attention metadata is still built so those kernels tune.
+-                attn_groups = [
+-                    [g for g in groups if not isinstance(g.kv_cache_spec, MambaSpec)]
+-                    for groups in attn_groups
+-                ]
+-            attn_metadata = self.model_state.prepare_attn(
+-                input_batch,
+-                batch_desc.cg_mode,
+-                block_tables,
+-                slot_mappings,
+-                attn_groups,
+-                self.kv_cache_config,
+-                # FULL replay reads capture-time metadata buffers. Re-stage them
+-                # from the zeroed dummy block tables instead of retaining state
+-                # indices from the previous real batch.
+-                for_capture=dummy_run and batch_desc.cg_mode == CUDAGraphMode.FULL,
+-            )
++            if (
++                not dummy_run
++                and batch_desc.cg_mode == CUDAGraphMode.FULL
++                and self.cudagraph_manager is not None
++                and getattr(
++                    self.cudagraph_manager, "captures_full_attn_metadata", False
++                )
++                and not self.kv_connector.has_connector()
++                and (
++                    self.speculator is None
++                    or not getattr(
++                        self.speculator, "uses_target_attn_metadata", True
++                    )
++                )
++            ):
++                stage_full_cg = getattr(
++                    self.model_state, "stage_full_cudagraph_attn", None
++                )
++                if callable(stage_full_cg):
++                    stage_full_cg(input_batch)
++            else:
++                assert slot_mappings is not None
++                slot_mappings_by_layer = build_slot_mappings_by_layer(
++                    slot_mappings, self.kv_cache_config
++                )
++                assert block_tables is not None
++                attn_groups = self.attn_groups
++                if dummy_run and is_profile and not profile_all_kv_cache_groups:
++                    # Mamba layers take a cheap warmup path with no metadata;
++                    # attention metadata is still built so those kernels tune.
++                    attn_groups = [
++                        [
++                            g
++                            for g in groups
++                            if not isinstance(g.kv_cache_spec, MambaSpec)
++                        ]
++                        for groups in attn_groups
++                    ]
++                attn_metadata = self.model_state.prepare_attn(
++                    input_batch,
++                    batch_desc.cg_mode,
++                    block_tables,
++                    slot_mappings,
++                    attn_groups,
++                    self.kv_cache_config,
++                    # FULL replay reads capture-time metadata buffers. Re-stage them
++                    # from the zeroed dummy block tables instead of retaining state
++                    # indices from the previous real batch.
++                    for_capture=dummy_run and batch_desc.cg_mode == CUDAGraphMode.FULL,
++                )
+ 
+         input_ids = input_batch.input_ids
+         inputs_embeds = None
+diff --git a/vllm/v1/worker/gpu/spec_decode/dflash/speculator.py b/vllm/v1/worker/gpu/spec_decode/dflash/speculator.py
+index 544c01f3e..2e61aafe3 100644
+--- a/vllm/v1/worker/gpu/spec_decode/dflash/speculator.py
++++ b/vllm/v1/worker/gpu/spec_decode/dflash/speculator.py
+@@ -48,6 +48,7 @@ class DraftBlockTableLayout(NamedTuple):
+ 
+ class DFlashSpeculator(DraftModelSpeculator):
+     _speculator_name = "DFlash"  # For logging, so we can share methods with subclasses
++    uses_target_attn_metadata = False
+ 
+     def __init__(self, vllm_config: VllmConfig, device: torch.device):
+         parallel_config = vllm_config.parallel_config
+@@ -69,6 +70,7 @@ class DFlashSpeculator(DraftModelSpeculator):
+         self._is_padding = torch.ones(
+             self.max_num_tokens, dtype=torch.bool, device=device
+         )
++        self._padding_live = 0
+ 
+         # Multimodal inputs not currently supported.
+         self.supports_mm_inputs = False
+@@ -175,6 +177,7 @@ class DFlashSpeculator(DraftModelSpeculator):
+         assert self.query_cudagraph_manager is not None
+         # Capture runs dummy rows only: route none of them.
+         self._is_padding.fill_(True)
++        self._padding_live = 0
+         self.query_cudagraph_manager.capture(
+             self._generate_draft,
+             self.input_buffers,
+@@ -503,7 +506,7 @@ class DFlashSpeculator(DraftModelSpeculator):
+     def reset_attn(self) -> None:
+         """Release DFlash state derived from the target KV-cache layout."""
+         # Drop graphs before detaching the KV cache tensors they reference.
+-        if self._context_preparer is not None:
++        if getattr(self, "_context_preparer", None) is not None:
+             close_context = getattr(self._context_preparer, "close", None)
+             if callable(close_context):
+                 close_context()
+@@ -522,6 +525,7 @@ class DFlashSpeculator(DraftModelSpeculator):
+             "_layer_group_idx",
+             "_group_causal",
+             "_full_cg_needs_attn_metadata_build",
++            "_padding_live",
+         ):
+             if hasattr(self, name):
+                 delattr(self, name)
+@@ -730,6 +734,7 @@ class DFlashSpeculator(DraftModelSpeculator):
+             self._prepare_eplb_forward(num_query_tokens)
+             # A memory-profile batch is all padding, like the target's.
+             self._is_padding[:num_query_tokens].fill_(True)
++            self._padding_live = 0
+             self._generate_draft(
+                 num_reqs,
+                 num_query_tokens,
+@@ -900,7 +905,12 @@ class DFlashSpeculator(DraftModelSpeculator):
+         from vllm.v1.worker.gpu import tilelang_inputs
+ 
+         live = 0 if dummy_run else num_query_tokens
+-        tilelang_inputs.padding_rows(self._is_padding, live, num_tokens_padded)
++        last_live = getattr(self, "_padding_live", None)
++        if last_live != live:
++            tilelang_inputs.padding_rows(
++                self._is_padding, live, max(num_tokens_padded, last_live or 0)
++            )
++            self._padding_live = live
+ 
+         if batch_desc.cg_mode == CUDAGraphMode.FULL:
+             if getattr(self, "_full_cg_needs_attn_metadata_build", True):
+-- 
+2.54.0 (Apple Git-157)
+

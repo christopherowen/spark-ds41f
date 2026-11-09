@@ -1,0 +1,305 @@
+# #998 round 1 rework (candidate-53): commands, in order. Host sp8 (spark-0016), directory
+# ~/spark-lab/agents/candidate-53-rework-998 ($D). Every GPU command ran through run.sh, which
+# refuses when ~/spark-hold.json exists or a serving container runs, then takes
+# flock /tmp/spark-lab-gpu.lock around one `docker run --rm` of spark-ds41f:candidate-50
+# (sha256:8c1ea1f62f62...) with an overlay of files mounted read-only over
+# /opt/spark-ds41f/candidate/vllm. raw/run.sh is the exact script.
+
+## Sources (laptop, read-only from origin/main 83e594528e and the PR head)
+git fetch origin pull/998/head:refs/remotes/origin/pr-998        # e89ab5f9a31b
+git archive origin/main <the 664 patch files of candidate-53/vllm/series>   # raw/c53-series-resolved.txt
+git show origin/pr-998:experiments/2026-11-08-display-carveout-weight-expansion/bench_carveout_expansion.py
+# candidate-50's no1009/overlay (4 files) and candidate-53's bundles/release-tests, from origin/main
+
+## Trees (sp8, no GPU)
+git clone --no-checkout ~/spark-lab/agents/candidate-53-own-marks/vllm-c53 $D/vllm-c53   # object source only
+cd $D/vllm-c53 && git checkout -b c53 19f2c20ed4d64ae22bd009ceacadd85e2a81e354
+while read p; do git am --3way ../patches/$p; done < ../c53-series-resolved.txt          # 664 applied
+git rev-parse HEAD^{tree}   # c0e25ff14f7cbf760973002447e50ba507b987f9 = candidate-53 expected_tree
+git clone $D/vllm-c53 $D/vllm-fix; edit the three files; git commit --amend -F ../msg-round1.txt
+git format-patch -1 --stdout > 0785-perf-worker-compact-packed-vocab-tables-and-expand-d.patch
+# apply check: fresh clone at candidate-53's 0784 commit (HEAD~1), git am of the new 0785 (no --3way):
+#   applies clean, git diff --check clean, tree d0ecca479dfd24baadba2044db71754e9410f7e8
+# overlay arms (raw/src-diff.txt: the 33 source files where candidate-53's tree differs from the
+# candidate-50 image, from sha1 of every .py in the image and the tree):
+#   base = candidate-50 + candidate-50/no1009/overlay (4 files)
+#   c53  = candidate-50 + candidate-53's versions of the 33 files
+#   fix  = candidate-50 + the fix tree's versions of the 33 files
+# vllm/model_executor/layers/sparse_attn_indexer_kpool.py is only in the image (stale; upstream moved
+# it), so it is not in the list.
+
+## Runs (raw/commands.txt has each run's start time, docker ps, full command and exit)
+# reproduce on candidate-53's files
+run.sh c53 repro-c53-vocab-and-scale-codes  <release-test pytest> tests/kernels/quantization/test_deepseek_v41_expert_scale_codes.py tests/kernels/quantization/test_deepseek_v41_tilelang_vocab.py   # exit 139 (first try exit 125: a mount of the stale image-only file)
+run.sh c53 repro-c53-scale-codes-alone      <release-test pytest> tests/kernels/quantization/test_deepseek_v41_expert_scale_codes.py   # 1 failed, 28 passed
+run.sh c53 diag-screen-wq-c53  python3 /s/diag_screen_wq.py     # the screening-table view after compact()
+run.sh fix diag-screen-wq-fix  python3 /s/diag_screen_wq.py
+# the fix
+run.sh fix failing-files-fix-run1 <release-test pytest> the two failing files                 # 104 passed
+run.sh fix tests-fix-run1 <release-test pytest> 8 files (below)                                # 480 passed
+run.sh fix tests-fix-run2 <release-test pytest> 8 files                                        # 480 passed
+#   <release-test pytest> = python3 -m pytest -q -rfEs -p no:cacheprovider -p tblib_stub -p offline_skip
+#     -o faulthandler_timeout=300, the candidate-53 release bundle at /b on PYTHONPATH,
+#     --device /dev/dri/card0; the 8-file runs add --security-opt seccomp=unconfined
+#     --ulimit memlock=-1:-1 and DIRECT_IO_TEST_DIR / ENGRAM_ROWS_TEST_DIR on a bind mount
+#   8 files: tests/kernels/quantization/test_deepseek_v41_expert_scale_codes.py
+#     tests/kernels/quantization/test_deepseek_v41_tilelang_vocab.py tests/v1/worker/test_display_carveout.py
+#     tests/models/test_dspark_mla.py tests/model_executor/model_loader/test_direct_loader.py
+#     tests/v1/worker/test_gpu_model_runner_v2.py tests/kernels/test_deepseek_v41_tilelang_embedding.py
+#     tests/kernels/moe/test_deepseek_v41_tilelang_moe.py
+# own mark on the serving path: -e SPARK_DS41F_DISPLAY_CARVEOUT_WEIGHTS=1
+#   -e PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True,garbage_collection_threshold:0.6 (the recipe's)
+#   -e VLLM_DS41_HEAD_DTYPE=float32 (the recipe's)
+run.sh fix bench-serving-fix-smoke   python3 /s/bench_serving_path.py ...   # exit 1: script bug (MoE out dtype), fixed, no data used
+run.sh fix bench-serving-fix-smoke2  python3 /s/bench_serving_path.py fix smoke2 ...   # smoke, not counted
+run.sh c53  bench-serving-c53-boot1  python3 /s/bench_serving_path.py c53 boot1 /o/...  # exit 1: CUDA invalid argument at the screening-table write
+run.sh base bench-serving-base-boot1 python3 /s/bench_serving_path.py base boot1 /o/bench-serving-base-boot1.json
+run.sh fix  bench-serving-fix-boot1  python3 /s/bench_serving_path.py fix boot1 /o/bench-serving-fix-boot1.json
+run.sh fix  bench-serving-fix-boot2  python3 /s/bench_serving_path.py fix boot2 /o/bench-serving-fix-boot2.json
+run.sh base bench-serving-base-boot2 python3 /s/bench_serving_path.py base boot2 /o/bench-serving-base-boot2.json
+# the PR's own script (runs only where #998's display_carveout API exists: compact/move/total_bytes)
+run.sh fix bench-pr998-script-fix-boot1 -e PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True python3 /s/bench_carveout_expansion.py 1
+run.sh fix bench-pr998-script-fix-boot2 -e PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True python3 /s/bench_carveout_expansion.py 2
+# in-process controls for the two rows that moved across containers (same env as the serving bench)
+run.sh fix  control-inprocess-fix-boot1  ...   # exit 1 before measuring: no CUDA context before the carve-out driver call; fixed
+run.sh base control-inprocess-base-boot1 ...   # exit 1 after part A: base _Carveout has no close(); fixed
+run.sh fix  control-inprocess-fix-boot2  python3 /s/control_inprocess.py fix-boot2 /o/control-inprocess-fix-boot2.json   # head equality over whole pair tensors (cols 2..3 unwritten): ignore that flag
+run.sh fix  control-inprocess-fix-boot1b python3 /s/control_inprocess.py fix-boot1b /o/control-inprocess-fix-boot1b.json
+run.sh base control-inprocess-base-boot1b python3 /s/control_inprocess.py base-boot1b /o/control-inprocess-base-boot1b.json
+
+## Analysis (laptop)
+python3 -I scripts/analyze.py raw/json raw > raw/cells.json
+
+## Script SHA-256
+  8b80f55e6a270c7d94d5bac8d518668735e49125db889fdf7f6bcad0f0886f6a  scripts/analyze.py
+  2f48f72e10262869d79992b60bdca19a2a9a476394a7ae622c857ca8f2746c49  scripts/bench_carveout_expansion.py
+  f424e02db677a5091ac7d417f33eeb62e99802c01a8598aa1d6e7b690908e749  scripts/bench_serving_path.py
+  75acbd6a4f386a69a8103be998821917debef218c40e1c103aff0746cbcd0298  scripts/control_inprocess.py
+  cd76c78a7636fa82d97b776665445f53cbf1c03ea15e35d621708188fb875b79  scripts/diag_screen_wq.py
+
+## Raw run log (raw/commands.txt)
+### repro-c53-vocab-and-scale-codes
+host: spark-0016 arm: c53
+image: sha256:8c1ea1f62f62c3e2adc03b645c091a5499cf7163101aca32875c894b96f155db (spark-ds41f:candidate-50)
+overlay: c53 (34 files)
+start_utc: 2026-11-09T19:22:15Z
+hold_file: absent; docker_ps_before: 
+command: flock /tmp/spark-lab-gpu.lock docker run --rm --gpus all --ipc=host --name c53rw998-repro-c53-vocab-and-scale-codes --device /dev/dri/card0 -e TILELANG_CACHE_DIR=/c/tl -v $D/tlcache:/c/tl -e HF_HUB_OFFLINE=1 --entrypoint  -w /opt/spark-ds41f/candidate/vllm -v $D/bundle/release-tests:/b:ro -e PYTHONPATH=/b:/opt/spark-ds41f/candidate/vllm:/opt/spark-ds41f/candidate/b12x spark-ds41f:candidate-50 python3 -m pytest -q -rfEs -p no:cacheprovider -p tblib_stub -p offline_skip -o faulthandler_timeout=300 tests/kernels/quantization/test_deepseek_v41_expert_scale_codes.py tests/kernels/quantization/test_deepseek_v41_tilelang_vocab.py
+mounted_files: c53 overlay over /opt/spark-ds41f/candidate/vllm
+exit: 125  wall_s: 0  output: out/repro-c53-vocab-and-scale-codes.txt
+
+note: vllm/model_executor/layers/sparse_attn_indexer_kpool.py exists only in the image (upstream moved it to vllm/models/glm5next; stale image file, imported by nothing); dropped from the overlay list
+### repro-c53-vocab-and-scale-codes
+host: spark-0016 arm: c53
+image: sha256:8c1ea1f62f62c3e2adc03b645c091a5499cf7163101aca32875c894b96f155db (spark-ds41f:candidate-50)
+overlay: c53 (33 files)
+start_utc: 2026-11-09T19:22:31Z
+hold_file: absent; docker_ps_before: 
+command: flock /tmp/spark-lab-gpu.lock docker run --rm --gpus all --ipc=host --name c53rw998-repro-c53-vocab-and-scale-codes --device /dev/dri/card0 -e TILELANG_CACHE_DIR=/c/tl -v $D/tlcache:/c/tl -e HF_HUB_OFFLINE=1 --entrypoint  -w /opt/spark-ds41f/candidate/vllm -v $D/bundle/release-tests:/b:ro -e PYTHONPATH=/b:/opt/spark-ds41f/candidate/vllm:/opt/spark-ds41f/candidate/b12x spark-ds41f:candidate-50 python3 -m pytest -q -rfEs -p no:cacheprovider -p tblib_stub -p offline_skip -o faulthandler_timeout=300 tests/kernels/quantization/test_deepseek_v41_expert_scale_codes.py tests/kernels/quantization/test_deepseek_v41_tilelang_vocab.py
+mounted_files: c53 overlay over /opt/spark-ds41f/candidate/vllm
+exit: 139  wall_s: 268  output: out/repro-c53-vocab-and-scale-codes.txt
+
+### diag-screen-wq-c53
+host: spark-0016 arm: c53
+image: sha256:8c1ea1f62f62c3e2adc03b645c091a5499cf7163101aca32875c894b96f155db (spark-ds41f:candidate-50)
+overlay: c53 (33 files)
+start_utc: 2026-11-09T19:27:33Z
+hold_file: absent; docker_ps_before: c51rw-diag-d963-gemm-boot1 
+command: flock /tmp/spark-lab-gpu.lock docker run --rm --gpus all --ipc=host --name c53rw998-diag-screen-wq-c53 --device /dev/dri/card0 -e TILELANG_CACHE_DIR=/c/tl -v $D/tlcache:/c/tl -e HF_HUB_OFFLINE=1 --entrypoint  -w /opt/spark-ds41f/candidate/vllm -v $D/scripts:/s:ro spark-ds41f:candidate-50 python3 /s/diag_screen_wq.py
+mounted_files: c53 overlay over /opt/spark-ds41f/candidate/vllm
+exit: 0  wall_s: 40  output: out/diag-screen-wq-c53.txt
+
+### diag-screen-wq-fix
+host: spark-0016 arm: fix
+image: sha256:8c1ea1f62f62c3e2adc03b645c091a5499cf7163101aca32875c894b96f155db (spark-ds41f:candidate-50)
+overlay: fix (33 files)
+start_utc: 2026-11-09T19:28:26Z
+hold_file: absent; docker_ps_before: c51rw-diag-d963-gemm-boot2 
+command: flock /tmp/spark-lab-gpu.lock docker run --rm --gpus all --ipc=host --name c53rw998-diag-screen-wq-fix --device /dev/dri/card0 -e TILELANG_CACHE_DIR=/c/tl -v $D/tlcache:/c/tl -e HF_HUB_OFFLINE=1 --entrypoint  -w /opt/spark-ds41f/candidate/vllm -v $D/scripts:/s:ro spark-ds41f:candidate-50 python3 /s/diag_screen_wq.py
+mounted_files: fix overlay over /opt/spark-ds41f/candidate/vllm
+exit: 0  wall_s: 29  output: out/diag-screen-wq-fix.txt
+
+### failing-files-fix-run1
+host: spark-0016 arm: fix
+image: sha256:8c1ea1f62f62c3e2adc03b645c091a5499cf7163101aca32875c894b96f155db (spark-ds41f:candidate-50)
+overlay: fix (33 files)
+start_utc: 2026-11-09T19:29:03Z
+hold_file: absent; docker_ps_before: c51rw-diag-d963-vocab-boot1 
+command: flock /tmp/spark-lab-gpu.lock docker run --rm --gpus all --ipc=host --name c53rw998-failing-files-fix-run1 --device /dev/dri/card0 -e TILELANG_CACHE_DIR=/c/tl -v $D/tlcache:/c/tl -e HF_HUB_OFFLINE=1 --entrypoint  -w /opt/spark-ds41f/candidate/vllm -v $D/bundle/release-tests:/b:ro -e PYTHONPATH=/b:/opt/spark-ds41f/candidate/vllm:/opt/spark-ds41f/candidate/b12x spark-ds41f:candidate-50 python3 -m pytest -q -rfEs -p no:cacheprovider -p tblib_stub -p offline_skip -o faulthandler_timeout=300 tests/kernels/quantization/test_deepseek_v41_expert_scale_codes.py tests/kernels/quantization/test_deepseek_v41_tilelang_vocab.py
+mounted_files: fix overlay over /opt/spark-ds41f/candidate/vllm
+exit: 0  wall_s: 538  output: out/failing-files-fix-run1.txt
+
+### bench-serving-fix-smoke
+host: spark-0016 arm: fix
+image: sha256:8c1ea1f62f62c3e2adc03b645c091a5499cf7163101aca32875c894b96f155db (spark-ds41f:candidate-50)
+overlay: fix (33 files)
+start_utc: 2026-11-09T19:38:17Z
+hold_file: absent; docker_ps_before: c51rw-diag-d963-sconf-boot1 
+command: flock /tmp/spark-lab-gpu.lock docker run --rm --gpus all --ipc=host --name c53rw998-bench-serving-fix-smoke --device /dev/dri/card0 -e TILELANG_CACHE_DIR=/c/tl -v $D/tlcache:/c/tl -e HF_HUB_OFFLINE=1 --entrypoint  -w /opt/spark-ds41f/candidate/vllm -v $D/scripts:/s:ro -v $D/out/json:/o -e SPARK_DS41F_DISPLAY_CARVEOUT_WEIGHTS=1 -e PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True,garbage_collection_threshold:0.6 -e VLLM_DS41_HEAD_DTYPE=float32 spark-ds41f:candidate-50 python3 /s/bench_serving_path.py fix smoke /o/bench-serving-fix-smoke.json
+mounted_files: fix overlay over /opt/spark-ds41f/candidate/vllm
+exit: 1  wall_s: 312  output: out/bench-serving-fix-smoke.txt
+
+note: bench-serving-fix-smoke failed in the bench script (MoE output tensor allocated BF16; the plan combines in its out_dtype); fixed the script to allocate plan.out_dtype, no measurement taken from the smoke run
+### bench-serving-fix-smoke2
+host: spark-0016 arm: fix
+image: sha256:8c1ea1f62f62c3e2adc03b645c091a5499cf7163101aca32875c894b96f155db (spark-ds41f:candidate-50)
+overlay: fix (33 files)
+start_utc: 2026-11-09T19:43:52Z
+hold_file: absent; docker_ps_before: 
+command: flock /tmp/spark-lab-gpu.lock docker run --rm --gpus all --ipc=host --name c53rw998-bench-serving-fix-smoke2 --device /dev/dri/card0 -e TILELANG_CACHE_DIR=/c/tl -v $D/tlcache:/c/tl -e HF_HUB_OFFLINE=1 --entrypoint  -w /opt/spark-ds41f/candidate/vllm -v $D/scripts:/s:ro -v $D/out/json:/o -e SPARK_DS41F_DISPLAY_CARVEOUT_WEIGHTS=1 -e PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True,garbage_collection_threshold:0.6 -e VLLM_DS41_HEAD_DTYPE=float32 spark-ds41f:candidate-50 python3 /s/bench_serving_path.py fix smoke2 /o/bench-serving-fix-smoke2.json
+mounted_files: fix overlay over /opt/spark-ds41f/candidate/vllm
+exit: 0  wall_s: 33  output: out/bench-serving-fix-smoke2.txt
+
+### repro-c53-scale-codes-alone
+host: spark-0016 arm: c53
+image: sha256:8c1ea1f62f62c3e2adc03b645c091a5499cf7163101aca32875c894b96f155db (spark-ds41f:candidate-50)
+overlay: c53 (33 files)
+start_utc: 2026-11-09T19:44:35Z
+hold_file: absent; docker_ps_before: c51rw-common-smoke-new-tests-c51r1 
+command: flock /tmp/spark-lab-gpu.lock docker run --rm --gpus all --ipc=host --name c53rw998-repro-c53-scale-codes-alone --device /dev/dri/card0 -e TILELANG_CACHE_DIR=/c/tl -v $D/tlcache:/c/tl -e HF_HUB_OFFLINE=1 --entrypoint  -w /opt/spark-ds41f/candidate/vllm -v $D/bundle/release-tests:/b:ro -e PYTHONPATH=/b:/opt/spark-ds41f/candidate/vllm:/opt/spark-ds41f/candidate/b12x --security-opt seccomp=unconfined --ulimit memlock=-1:-1 -v $D/scratch:/c/scratch -e DIRECT_IO_TEST_DIR=/c/scratch/direct-io-test -e ENGRAM_ROWS_TEST_DIR=/c/scratch/engram-rows-test spark-ds41f:candidate-50 python3 -m pytest -q -rfEs -p no:cacheprovider -p tblib_stub -p offline_skip -o faulthandler_timeout=300 tests/kernels/quantization/test_deepseek_v41_expert_scale_codes.py
+mounted_files: c53 overlay over /opt/spark-ds41f/candidate/vllm
+exit: 1  wall_s: 45  output: out/repro-c53-scale-codes-alone.txt
+
+### tests-fix-run1
+host: spark-0016 arm: fix
+image: sha256:8c1ea1f62f62c3e2adc03b645c091a5499cf7163101aca32875c894b96f155db (spark-ds41f:candidate-50)
+overlay: fix (33 files)
+start_utc: 2026-11-09T19:45:20Z
+hold_file: absent; docker_ps_before: 
+command: flock /tmp/spark-lab-gpu.lock docker run --rm --gpus all --ipc=host --name c53rw998-tests-fix-run1 --device /dev/dri/card0 -e TILELANG_CACHE_DIR=/c/tl -v $D/tlcache:/c/tl -e HF_HUB_OFFLINE=1 --entrypoint  -w /opt/spark-ds41f/candidate/vllm -v $D/bundle/release-tests:/b:ro -e PYTHONPATH=/b:/opt/spark-ds41f/candidate/vllm:/opt/spark-ds41f/candidate/b12x --security-opt seccomp=unconfined --ulimit memlock=-1:-1 -v $D/scratch:/c/scratch -e DIRECT_IO_TEST_DIR=/c/scratch/direct-io-test -e ENGRAM_ROWS_TEST_DIR=/c/scratch/engram-rows-test spark-ds41f:candidate-50 python3 -m pytest -q -rfEs -p no:cacheprovider -p tblib_stub -p offline_skip -o faulthandler_timeout=300 tests/kernels/quantization/test_deepseek_v41_expert_scale_codes.py tests/kernels/quantization/test_deepseek_v41_tilelang_vocab.py tests/v1/worker/test_display_carveout.py tests/models/test_dspark_mla.py tests/model_executor/model_loader/test_direct_loader.py tests/v1/worker/test_gpu_model_runner_v2.py tests/kernels/test_deepseek_v41_tilelang_embedding.py tests/kernels/moe/test_deepseek_v41_tilelang_moe.py
+mounted_files: fix overlay over /opt/spark-ds41f/candidate/vllm
+exit: 0  wall_s: 270  output: out/tests-fix-run1.txt
+
+### tests-fix-run2
+host: spark-0016 arm: fix
+image: sha256:8c1ea1f62f62c3e2adc03b645c091a5499cf7163101aca32875c894b96f155db (spark-ds41f:candidate-50)
+overlay: fix (33 files)
+start_utc: 2026-11-09T19:49:50Z
+hold_file: absent; docker_ps_before: 
+command: flock /tmp/spark-lab-gpu.lock docker run --rm --gpus all --ipc=host --name c53rw998-tests-fix-run2 --device /dev/dri/card0 -e TILELANG_CACHE_DIR=/c/tl -v $D/tlcache:/c/tl -e HF_HUB_OFFLINE=1 --entrypoint  -w /opt/spark-ds41f/candidate/vllm -v $D/bundle/release-tests:/b:ro -e PYTHONPATH=/b:/opt/spark-ds41f/candidate/vllm:/opt/spark-ds41f/candidate/b12x --security-opt seccomp=unconfined --ulimit memlock=-1:-1 -v $D/scratch:/c/scratch -e DIRECT_IO_TEST_DIR=/c/scratch/direct-io-test -e ENGRAM_ROWS_TEST_DIR=/c/scratch/engram-rows-test spark-ds41f:candidate-50 python3 -m pytest -q -rfEs -p no:cacheprovider -p tblib_stub -p offline_skip -o faulthandler_timeout=300 tests/kernels/quantization/test_deepseek_v41_expert_scale_codes.py tests/kernels/quantization/test_deepseek_v41_tilelang_vocab.py tests/v1/worker/test_display_carveout.py tests/models/test_dspark_mla.py tests/model_executor/model_loader/test_direct_loader.py tests/v1/worker/test_gpu_model_runner_v2.py tests/kernels/test_deepseek_v41_tilelang_embedding.py tests/kernels/moe/test_deepseek_v41_tilelang_moe.py
+mounted_files: fix overlay over /opt/spark-ds41f/candidate/vllm
+exit: 0  wall_s: 904  output: out/tests-fix-run2.txt
+
+### bench-serving-c53-boot1
+host: spark-0016 arm: c53
+image: sha256:8c1ea1f62f62c3e2adc03b645c091a5499cf7163101aca32875c894b96f155db (spark-ds41f:candidate-50)
+overlay: c53 (33 files)
+start_utc: 2026-11-09T20:04:54Z
+hold_file: absent; docker_ps_before: 
+command: flock /tmp/spark-lab-gpu.lock docker run --rm --gpus all --ipc=host --name c53rw998-bench-serving-c53-boot1 --device /dev/dri/card0 -e TILELANG_CACHE_DIR=/c/tl -v $D/tlcache:/c/tl -e HF_HUB_OFFLINE=1 --entrypoint  -w /opt/spark-ds41f/candidate/vllm -v $D/scripts:/s:ro -v $D/out/json:/o -e SPARK_DS41F_DISPLAY_CARVEOUT_WEIGHTS=1 -e PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True,garbage_collection_threshold:0.6 -e VLLM_DS41_HEAD_DTYPE=float32 spark-ds41f:candidate-50 python3 /s/bench_serving_path.py c53 boot1 /o/bench-serving-c53-boot1.json
+mounted_files: c53 overlay over /opt/spark-ds41f/candidate/vllm
+exit: 1  wall_s: 453  output: out/bench-serving-c53-boot1.txt
+
+### bench-serving-base-boot1
+host: spark-0016 arm: base
+image: sha256:8c1ea1f62f62c3e2adc03b645c091a5499cf7163101aca32875c894b96f155db (spark-ds41f:candidate-50)
+overlay: base (4 files)
+start_utc: 2026-11-09T20:12:27Z
+hold_file: absent; docker_ps_before: 
+command: flock /tmp/spark-lab-gpu.lock docker run --rm --gpus all --ipc=host --name c53rw998-bench-serving-base-boot1 --device /dev/dri/card0 -e TILELANG_CACHE_DIR=/c/tl -v $D/tlcache:/c/tl -e HF_HUB_OFFLINE=1 --entrypoint  -w /opt/spark-ds41f/candidate/vllm -v $D/scripts:/s:ro -v $D/out/json:/o -e SPARK_DS41F_DISPLAY_CARVEOUT_WEIGHTS=1 -e PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True,garbage_collection_threshold:0.6 -e VLLM_DS41_HEAD_DTYPE=float32 spark-ds41f:candidate-50 python3 /s/bench_serving_path.py base boot1 /o/bench-serving-base-boot1.json
+mounted_files: base overlay over /opt/spark-ds41f/candidate/vllm
+exit: 0  wall_s: 432  output: out/bench-serving-base-boot1.txt
+
+### bench-serving-fix-boot1
+host: spark-0016 arm: fix
+image: sha256:8c1ea1f62f62c3e2adc03b645c091a5499cf7163101aca32875c894b96f155db (spark-ds41f:candidate-50)
+overlay: fix (33 files)
+start_utc: 2026-11-09T20:19:39Z
+hold_file: absent; docker_ps_before: 
+command: flock /tmp/spark-lab-gpu.lock docker run --rm --gpus all --ipc=host --name c53rw998-bench-serving-fix-boot1 --device /dev/dri/card0 -e TILELANG_CACHE_DIR=/c/tl -v $D/tlcache:/c/tl -e HF_HUB_OFFLINE=1 --entrypoint  -w /opt/spark-ds41f/candidate/vllm -v $D/scripts:/s:ro -v $D/out/json:/o -e SPARK_DS41F_DISPLAY_CARVEOUT_WEIGHTS=1 -e PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True,garbage_collection_threshold:0.6 -e VLLM_DS41_HEAD_DTYPE=float32 spark-ds41f:candidate-50 python3 /s/bench_serving_path.py fix boot1 /o/bench-serving-fix-boot1.json
+mounted_files: fix overlay over /opt/spark-ds41f/candidate/vllm
+exit: 0  wall_s: 652  output: out/bench-serving-fix-boot1.txt
+
+### bench-serving-fix-boot2
+host: spark-0016 arm: fix
+image: sha256:8c1ea1f62f62c3e2adc03b645c091a5499cf7163101aca32875c894b96f155db (spark-ds41f:candidate-50)
+overlay: fix (33 files)
+start_utc: 2026-11-09T20:30:31Z
+hold_file: absent; docker_ps_before: 
+command: flock /tmp/spark-lab-gpu.lock docker run --rm --gpus all --ipc=host --name c53rw998-bench-serving-fix-boot2 --device /dev/dri/card0 -e TILELANG_CACHE_DIR=/c/tl -v $D/tlcache:/c/tl -e HF_HUB_OFFLINE=1 --entrypoint  -w /opt/spark-ds41f/candidate/vllm -v $D/scripts:/s:ro -v $D/out/json:/o -e SPARK_DS41F_DISPLAY_CARVEOUT_WEIGHTS=1 -e PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True,garbage_collection_threshold:0.6 -e VLLM_DS41_HEAD_DTYPE=float32 spark-ds41f:candidate-50 python3 /s/bench_serving_path.py fix boot2 /o/bench-serving-fix-boot2.json
+mounted_files: fix overlay over /opt/spark-ds41f/candidate/vllm
+exit: 0  wall_s: 465  output: out/bench-serving-fix-boot2.txt
+
+### bench-serving-base-boot2
+host: spark-0016 arm: base
+image: sha256:8c1ea1f62f62c3e2adc03b645c091a5499cf7163101aca32875c894b96f155db (spark-ds41f:candidate-50)
+overlay: base (4 files)
+start_utc: 2026-11-09T20:38:16Z
+hold_file: absent; docker_ps_before: 
+command: flock /tmp/spark-lab-gpu.lock docker run --rm --gpus all --ipc=host --name c53rw998-bench-serving-base-boot2 --device /dev/dri/card0 -e TILELANG_CACHE_DIR=/c/tl -v $D/tlcache:/c/tl -e HF_HUB_OFFLINE=1 --entrypoint  -w /opt/spark-ds41f/candidate/vllm -v $D/scripts:/s:ro -v $D/out/json:/o -e SPARK_DS41F_DISPLAY_CARVEOUT_WEIGHTS=1 -e PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True,garbage_collection_threshold:0.6 -e VLLM_DS41_HEAD_DTYPE=float32 spark-ds41f:candidate-50 python3 /s/bench_serving_path.py base boot2 /o/bench-serving-base-boot2.json
+mounted_files: base overlay over /opt/spark-ds41f/candidate/vllm
+exit: 0  wall_s: 445  output: out/bench-serving-base-boot2.txt
+
+### bench-pr998-script-fix-boot1
+host: spark-0016 arm: fix
+image: sha256:8c1ea1f62f62c3e2adc03b645c091a5499cf7163101aca32875c894b96f155db (spark-ds41f:candidate-50)
+overlay: fix (33 files)
+start_utc: 2026-11-09T20:45:41Z
+hold_file: absent; docker_ps_before: 
+command: flock /tmp/spark-lab-gpu.lock docker run --rm --gpus all --ipc=host --name c53rw998-bench-pr998-script-fix-boot1 --device /dev/dri/card0 -e TILELANG_CACHE_DIR=/c/tl -v $D/tlcache:/c/tl -e HF_HUB_OFFLINE=1 --entrypoint  -w /opt/spark-ds41f/candidate/vllm -v $D/scripts:/s:ro -e PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True spark-ds41f:candidate-50 python3 /s/bench_carveout_expansion.py 1
+mounted_files: fix overlay over /opt/spark-ds41f/candidate/vllm
+exit: 0  wall_s: 410  output: out/bench-pr998-script-fix-boot1.txt
+
+### bench-pr998-script-fix-boot2
+host: spark-0016 arm: fix
+image: sha256:8c1ea1f62f62c3e2adc03b645c091a5499cf7163101aca32875c894b96f155db (spark-ds41f:candidate-50)
+overlay: fix (33 files)
+start_utc: 2026-11-09T20:52:32Z
+hold_file: absent; docker_ps_before: 
+command: flock /tmp/spark-lab-gpu.lock docker run --rm --gpus all --ipc=host --name c53rw998-bench-pr998-script-fix-boot2 --device /dev/dri/card0 -e TILELANG_CACHE_DIR=/c/tl -v $D/tlcache:/c/tl -e HF_HUB_OFFLINE=1 --entrypoint  -w /opt/spark-ds41f/candidate/vllm -v $D/scripts:/s:ro -e PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True spark-ds41f:candidate-50 python3 /s/bench_carveout_expansion.py 2
+mounted_files: fix overlay over /opt/spark-ds41f/candidate/vllm
+exit: 0  wall_s: 425  output: out/bench-pr998-script-fix-boot2.txt
+
+### control-inprocess-fix-boot1
+host: spark-0016 arm: fix
+image: sha256:8c1ea1f62f62c3e2adc03b645c091a5499cf7163101aca32875c894b96f155db (spark-ds41f:candidate-50)
+overlay: fix (33 files)
+start_utc: 2026-11-09T20:59:46Z
+hold_file: absent; docker_ps_before: ecstatic_bardeen 
+command: flock /tmp/spark-lab-gpu.lock docker run --rm --gpus all --ipc=host --name c53rw998-control-inprocess-fix-boot1 --device /dev/dri/card0 -e TILELANG_CACHE_DIR=/c/tl -v $D/tlcache:/c/tl -e HF_HUB_OFFLINE=1 --entrypoint  -w /opt/spark-ds41f/candidate/vllm -v $D/scripts:/s:ro -v $D/out/json:/o -e SPARK_DS41F_DISPLAY_CARVEOUT_WEIGHTS=1 -e PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True,garbage_collection_threshold:0.6 -e VLLM_DS41_HEAD_DTYPE=float32 spark-ds41f:candidate-50 python3 /s/control_inprocess.py fix-boot1 /o/control-inprocess-fix-boot1.json
+mounted_files: fix overlay over /opt/spark-ds41f/candidate/vllm
+exit: 1  wall_s: 744  output: out/control-inprocess-fix-boot1.txt
+
+### control-inprocess-base-boot1
+host: spark-0016 arm: base
+image: sha256:8c1ea1f62f62c3e2adc03b645c091a5499cf7163101aca32875c894b96f155db (spark-ds41f:candidate-50)
+overlay: base (4 files)
+start_utc: 2026-11-09T21:12:10Z
+hold_file: absent; docker_ps_before: 
+command: flock /tmp/spark-lab-gpu.lock docker run --rm --gpus all --ipc=host --name c53rw998-control-inprocess-base-boot1 --device /dev/dri/card0 -e TILELANG_CACHE_DIR=/c/tl -v $D/tlcache:/c/tl -e HF_HUB_OFFLINE=1 --entrypoint  -w /opt/spark-ds41f/candidate/vllm -v $D/scripts:/s:ro -v $D/out/json:/o -e SPARK_DS41F_DISPLAY_CARVEOUT_WEIGHTS=1 -e PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True,garbage_collection_threshold:0.6 -e VLLM_DS41_HEAD_DTYPE=float32 spark-ds41f:candidate-50 python3 /s/control_inprocess.py base-boot1 /o/control-inprocess-base-boot1.json
+mounted_files: base overlay over /opt/spark-ds41f/candidate/vllm
+note: control-inprocess-fix-boot1 failed before measuring (cuImportExternalMemory: initialization error: the control script made its first CUDA call through the carve-out driver path, before any CUDA context); the script now creates a context first; control-inprocess-base-boot1 started with the updated script if it had not yet acquired the lock
+exit: 1  wall_s: 93  output: out/control-inprocess-base-boot1.txt
+
+### control-inprocess-fix-boot2
+host: spark-0016 arm: fix
+image: sha256:8c1ea1f62f62c3e2adc03b645c091a5499cf7163101aca32875c894b96f155db (spark-ds41f:candidate-50)
+overlay: fix (33 files)
+start_utc: 2026-11-09T21:13:43Z
+hold_file: absent; docker_ps_before: 
+command: flock /tmp/spark-lab-gpu.lock docker run --rm --gpus all --ipc=host --name c53rw998-control-inprocess-fix-boot2 --device /dev/dri/card0 -e TILELANG_CACHE_DIR=/c/tl -v $D/tlcache:/c/tl -e HF_HUB_OFFLINE=1 --entrypoint  -w /opt/spark-ds41f/candidate/vllm -v $D/scripts:/s:ro -v $D/out/json:/o -e SPARK_DS41F_DISPLAY_CARVEOUT_WEIGHTS=1 -e PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True,garbage_collection_threshold:0.6 -e VLLM_DS41_HEAD_DTYPE=float32 spark-ds41f:candidate-50 python3 /s/control_inprocess.py fix-boot2 /o/control-inprocess-fix-boot2.json
+mounted_files: fix overlay over /opt/spark-ds41f/candidate/vllm
+note: control-inprocess-base-boot1 failed after part A (the base _Carveout has no close(), which #998 adds); the script now closes its control buffers through the same driver calls on the base; no measurement taken from it
+exit: 0  wall_s: 276  output: out/control-inprocess-fix-boot2.txt
+
+### control-inprocess-fix-boot1b
+host: spark-0016 arm: fix
+image: sha256:8c1ea1f62f62c3e2adc03b645c091a5499cf7163101aca32875c894b96f155db (spark-ds41f:candidate-50)
+overlay: fix (33 files)
+start_utc: 2026-11-09T21:18:21Z
+hold_file: absent; docker_ps_before: sleepy_rhodes 
+command: flock /tmp/spark-lab-gpu.lock docker run --rm --gpus all --ipc=host --name c53rw998-control-inprocess-fix-boot1b --device /dev/dri/card0 -e TILELANG_CACHE_DIR=/c/tl -v $D/tlcache:/c/tl -e HF_HUB_OFFLINE=1 --entrypoint  -w /opt/spark-ds41f/candidate/vllm -v $D/scripts:/s:ro -v $D/out/json:/o -e SPARK_DS41F_DISPLAY_CARVEOUT_WEIGHTS=1 -e PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True,garbage_collection_threshold:0.6 -e VLLM_DS41_HEAD_DTYPE=float32 spark-ds41f:candidate-50 python3 /s/control_inprocess.py fix-boot1b /o/control-inprocess-fix-boot1b.json
+mounted_files: fix overlay over /opt/spark-ds41f/candidate/vllm
+note: control-inprocess-fix-boot2 compared whole greedy-pair tensors, whose columns 2..3 are never written (pair_width 4, only (max, index) written); its head.equal=False is that; the script now compares the two written columns (fix-boot1b and base-boot1b use it if not yet started)
+exit: 0  wall_s: 223  output: out/control-inprocess-fix-boot1b.txt
+
+### control-inprocess-base-boot1b
+host: spark-0016 arm: base
+image: sha256:8c1ea1f62f62c3e2adc03b645c091a5499cf7163101aca32875c894b96f155db (spark-ds41f:candidate-50)
+overlay: base (4 files)
+start_utc: 2026-11-09T21:22:07Z
+hold_file: absent; docker_ps_before: c51rw-963-aa-DE-base-boot1 
+command: flock /tmp/spark-lab-gpu.lock docker run --rm --gpus all --ipc=host --name c53rw998-control-inprocess-base-boot1b --device /dev/dri/card0 -e TILELANG_CACHE_DIR=/c/tl -v $D/tlcache:/c/tl -e HF_HUB_OFFLINE=1 --entrypoint  -w /opt/spark-ds41f/candidate/vllm -v $D/scripts:/s:ro -v $D/out/json:/o -e SPARK_DS41F_DISPLAY_CARVEOUT_WEIGHTS=1 -e PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True,garbage_collection_threshold:0.6 -e VLLM_DS41_HEAD_DTYPE=float32 spark-ds41f:candidate-50 python3 /s/control_inprocess.py base-boot1b /o/control-inprocess-base-boot1b.json
+mounted_files: base overlay over /opt/spark-ds41f/candidate/vllm
+exit: 0  wall_s: 497  output: out/control-inprocess-base-boot1b.txt
+
