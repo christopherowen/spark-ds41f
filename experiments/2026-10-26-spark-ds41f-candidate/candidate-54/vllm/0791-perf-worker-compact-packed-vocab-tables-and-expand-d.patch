@@ -1,0 +1,584 @@
+From 182ecb03290e68c7d4adb6e2944e4d3b7fa02e29 Mon Sep 17 00:00:00 2001
+From: Christopher Owen <christopherowen@users.noreply.github.com>
+Date: Sun, 8 Nov 2026 19:29:28 +0000
+Subject: [PATCH] perf(worker): compact packed vocab tables and expand display
+ carve-out weights
+
+Base: 1107 vLLM patch head 320021e3c4dbb202d911ab70e2cd924c75420488.
+
+Rationale:
+On 119 GiB unified-memory GB10 nodes with SPARK_DS41F_DISPLAY_CARVEOUT_WEIGHTS=1, the firmware display carve-out (/dev/dri/card0, 2,032 MiB on dgx3 with 8 MiB console framebuffer, 2,045 MiB on headless nodes) previously held only unpacked allocations for embed_tokens.weight and lm_head.weight (2 x 432 = 864 MiB at TP3, 2 x 320 = 640 MiB at TP4):
+1. After 12-bit packing in TileLangEmbeddingMethod and PackedBf16LmHeadMethod, each shard occupies 315.64 MiB at TP3 (236.72 MiB at TP4), leaving 224 MiB at TP3 (160 MiB at TP4) of unused tail inside the two dumb buffers plus 1,168 MiB (TP3) / 1,392 MiB (TP4) of unallocated carve-out space.
+2. DSpark's replicated Markov anchor embedding (model.markov_head.markov_w1.weight, 129,280 x 256 BF16 = 63.125 MiB) missed _MIN_WEIGHT_BYTES = 64 MiB by 0.875 MiB and was allocated in ordinary UMA memory, even though it is only read by single-row anchor lookups during speculative drafting and never touched during prefill.
+3. DSpark's 3 draft MoE layers (model.layers.{0,1,2}.ffn.experts.w13_weight and w2_weight, 480 MiB + 240 MiB per layer at TP3, 360 MiB + 160 MiB at TP4) use a decode-only MoeExpertsV41Plan (max_rows is not None and not _has_mid_tiles()), never execute during prefill, and stream each active expert's weight slab at most once per draft step.
+
+Changes:
+- Add _Carveout.close(), display_carveout.total_bytes(), display_carveout.compact(), and display_carveout.move() with _MIN_WEIGHT_BYTES = 60 MiB and _MAX_TOTAL_BYTES = 1,968 MiB (leaving 64 MiB of free scanout heap on dgx3).
+- Compact embed_tokens.weight and lm_head.weight after in-place 12-bit packing into tight 320 MiB (TP3) / 240 MiB (TP4) dumb buffers reallocated at the bottom of the scanout heap with zero fragmentation.
+- Allocate DSparkMarkovHead.markov_w1.weight in the display carve-out via display_carveout.allocate, shrinking the drafter's _direct_weight_arena by 63.125 MiB and streaming markov_w1 directly into the carve-out.
+- Move decode-only TileLangExperts w13_weight and w2_weight slabs into the remaining carve-out budget via display_carveout.move (mtp.0 w13_weight, mtp.0 w2_weight, and mtp.1 w13_weight = 1,200 MiB at TP3; plus mtp.1 w2_weight and mtp.2 w13_weight = 1,400 MiB at TP4), and verify both target and speculator models in confirm_streamed_weights.
+
+Quality:
+Bit-identical outputs (torch.equal = True) across vocab_embedding_packed, PackedBf16LmHeadMethod, markov_anchor_embed, and MoeExpertsV41Plan.run. Saves 1,263.125 MiB (1.234 GiB) of regular UMA allocated memory (1,320 MiB reserved, ~1,669 MiB host MemAvailable) per rank at TP3 and 1,463.125 MiB (1.429 GiB) at TP4, while speeding up moved DSpark MoE layers by 8.5%-12.3% across M=5..40 with zero prefill impact.
+
+Tests:
+- pytest tests/v1/worker/test_display_carveout.py tests/models/test_dspark_mla.py tests/model_executor/model_loader/test_direct_loader.py tests/v1/worker/test_gpu_model_runner_v2.py tests/kernels/test_deepseek_v41_tilelang_embedding.py (234 passed).
+
+Upstream status: local GB10 display carve-out weight placement optimization.
+
+Round 1 (candidate-53 rework):
+Base: candidate-53's series through 0784 (spark-ds41f candidate-50 without
+0778, then #960 #971 #977 #984). candidate-53's release tests failed in two
+files with this patch, and both failures were this patch's.
+
+1. tests/kernels/quantization/test_deepseek_v41_tilelang_vocab.py crashed
+   (SIGSEGV) in test_packed_bf16_lm_head_carveout_shares_single_buffer_with_screen_wq,
+   at the screening-table write in build_screen_weights. The patch was written
+   on 1107, where the lm_head's carve-out buffer held only the BF16 head.
+   candidate-50's 0763 (certified two-pass lm_head vocabulary screen) sizes
+   the TileLang head's buffer at 1.25x and keeps the 8-bit screening table
+   in its tail, after the packed rows (layer._carveout_screen_wq). compact()
+   copied only the packed rows to a new buffer and closed the old one, so the
+   table's view pointed into freed memory (cuPointerGetAttribute reports no
+   mapping there) and _ensure_screen_weights wrote through it. Serving takes
+   the same path: TP3 runs --linear-backend tilelang with
+   SPARK_DS41F_DISPLAY_CARVEOUT_WEIGHTS=1, and at the TP3 shard shape
+   (43,136 x 5,120) the same write fails with "CUDA error: invalid argument",
+   so no TP3 rank could load its head.
+   Fix: PackedBf16LmHeadMethod compacts only a head whose buffer holds no
+   screening table. With the table the buffer has no slack (1.5*n*k bytes
+   packed plus 1.0*n*k bytes of table is its whole 2.5*n*k), so nothing is
+   given up. compact() now states that the caller must hold the only live
+   view of the buffer. The embedding table still compacts (432 -> 320 MiB
+   at TP3).
+
+2. tests/kernels/quantization/test_deepseek_v41_expert_scale_codes.py::
+   test_process_weights_replaces_w13_before_preparing_w2 failed with
+   "AttributeError: '_Plan' object has no attribute 'max_rows'":
+   TileLangExperts.process_weights_after_loading read the plan's max_rows
+   and _has_mid_tiles() on every load, and the test's minimal plan stub has
+   neither. The decode-only test serves only the carve-out move, so it now
+   runs only when the carve-out is required. Without the carve-out (TP4, the
+   switched shapes, the release tests) weight preparation is the base's and
+   asks nothing more of the plan. MoeExpertsV41Plan always sets both, so the
+   TP3 placement is unchanged. The test stub is left as it is.
+
+At TP3 the carve-out now holds 1,872 MiB in six buffers: embed_tokens 320,
+lm_head with its screening table 528, markov_w1 64, and the draft experts'
+layer-0 w13 480, layer-0 w2 240 and layer-1 w2 240. The head keeps its table,
+so 960 MiB of draft-expert slabs fit under _MAX_TOTAL_BYTES instead of
+1,200 MiB. 960 MiB is the most any choice of slabs could fit in the 1,056 MiB
+left. The "Changes" and "Quality" numbers above describe the 1107 layout; on
+this base.
+
+Image A/B on sp8 at the TP3 shard shapes, through the layer code as serving
+builds it (embed_tokens, the TileLang lm_head, DSparkMarkovHead, three
+decode-only TileLangExperts layers, confirm_streamed_weights), base
+candidate-50 without 0778, same session, base/candidate/candidate/base:
+- Regular memory: torch allocated 2,294.4 -> 1,271.3 MiB (-1,023.1 MiB a
+  rank: markov_w1 63.1 plus 960 MiB of draft-expert slabs), reserved
+  -1,060 MiB, peak reserved -1,140 MiB, host MemAvailable used -1,005 and
+  -1,024 MiB. Identical in both runs of each arm.
+- Draft MoE, M = 5, 15, 40: layer 0 (both slabs moved) 7.0-8.6% faster,
+  layer 1 (w2 moved) 1.5-2.6% faster, beyond the runs' interval; layer 2
+  (none moved) unchanged.
+- Every output bit-identical to the base in all four runs (36 hashes):
+  embedding lookups M = 1..4096, FP32 head logits and certified greedy pairs
+  M = 1, 5, 40, the markov anchor embedding, the three MoE layers, and the
+  packed tables and screening tables themselves.
+- Two rows that differed across containers (embedding at M = 4096, +6.6%;
+  FP32 logits at M = 40, +3.2%) do not come from the placement. In one
+  process, the compacted table and the same bytes in an unpacked-size buffer
+  run within 1% of each other, and the sign flips between runs. The base
+  image's own table runs at 354 us in its in-process control, as the
+  candidate's does. The head's buffer is the same allocation in both images,
+  and mapping or closing 960 MiB of other carve-out buffers leaves it
+  unchanged.
+
+Round 1 tests (sp8, spark-ds41f:candidate-50 with candidate-53's tree and
+this patch mounted, two container runs):
+- pytest tests/kernels/quantization/test_deepseek_v41_expert_scale_codes.py
+  tests/kernels/quantization/test_deepseek_v41_tilelang_vocab.py
+  tests/v1/worker/test_display_carveout.py tests/models/test_dspark_mla.py
+  tests/model_executor/model_loader/test_direct_loader.py
+  tests/v1/worker/test_gpu_model_runner_v2.py
+  tests/kernels/test_deepseek_v41_tilelang_embedding.py
+  tests/kernels/moe/test_deepseek_v41_tilelang_moe.py (480 passed, twice).
+---
+ tests/v1/worker/test_display_carveout.py      |  85 +++++++-
+ .../layers/fused_moe/tilelang.py              |  13 ++
+ .../layers/quantization/online/packed_bf16.py |  10 +-
+ vllm/model_executor/models/qwen3_dspark.py    |  22 ++-
+ .../deepseek_v4_1/tilelang/embedding.py       |   4 +-
+ vllm/v1/worker/display_carveout.py            | 187 +++++++++++++++---
+ vllm/v1/worker/gpu/model_runner.py            |   6 +-
+ 7 files changed, 295 insertions(+), 32 deletions(-)
+
+diff --git a/tests/v1/worker/test_display_carveout.py b/tests/v1/worker/test_display_carveout.py
+index c11849c98..abe67700c 100644
+--- a/tests/v1/worker/test_display_carveout.py
++++ b/tests/v1/worker/test_display_carveout.py
+@@ -27,7 +27,7 @@ class _Table(torch.nn.Module):
+         if data is None:
+             data = torch.empty(rows, width, dtype=torch.bfloat16, device=device)
+         data.copy_(
+-            torch.randn(width, dtype=torch.bfloat16).expand(rows, width)
++            torch.randn(width, dtype=torch.bfloat16, device=device).expand(rows, width)
+         )  # "loading"
+         self.weight = torch.nn.Parameter(data, requires_grad=False)
+ 
+@@ -44,10 +44,14 @@ def _model(device: str) -> torch.nn.Module:
+ 
+ @pytest.fixture
+ def tables(monkeypatch):
++    carveouts = []
+     monkeypatch.setattr(display_carveout, "VocabParallelEmbedding", _Table)
+     monkeypatch.setattr(display_carveout, "_REQUIRED", False)
+-    monkeypatch.setattr(display_carveout, "_carveouts", [])
++    monkeypatch.setattr(display_carveout, "_carveouts", carveouts)
+     monkeypatch.setattr(display_carveout, "_integrity", None)
++    yield
++    for carveout in list(carveouts):
++        carveout.close()
+ 
+ 
+ @pytest.fixture
+@@ -200,3 +204,80 @@ def test_integrity_check_is_off_by_default(required, monkeypatch):
+     display_carveout.confirm_streamed_weights(_model("cuda"), torch.device("cuda"))
+     assert display_carveout._integrity is None
+     display_carveout.start_checks()
++
++
++@needs_cuda
++@needs_drm
++def test_compact_shrinks_packed_carveout_buffer_in_place(required):
++    # 96 MiB unpacked BF16 table packed in-place into 64 MiB (4 granules).
++    unpacked = display_carveout.allocate((12288, 4096), torch.bfloat16, "cuda")
++    assert unpacked is not None
++    assert display_carveout.total_bytes() == 96 << 20
++    old_carveout = display_carveout._carveouts[0]
++    packed_view = unpacked.view(torch.uint8).reshape(-1)[: 64 << 20].clone()
++    # Simulate in-place prefix view inside the 96 MiB carve-out buffer.
++    in_place_prefix = unpacked.view(torch.uint8).reshape(-1)[: 64 << 20]
++    in_place_prefix.copy_(packed_view)
++    del unpacked
++    compacted = display_carveout.compact(in_place_prefix)
++    del in_place_prefix
++    assert display_carveout.total_bytes() == 64 << 20
++    assert len(display_carveout._carveouts) == 1
++    assert old_carveout._closed
++    assert display_carveout._carveouts[0] is not old_carveout
++    assert torch.equal(compacted, packed_view)
++
++
++@needs_cuda
++@needs_drm
++def test_move_respects_max_total_bytes_and_tracks_extra_models(required, monkeypatch):
++    monkeypatch.setattr(display_carveout, "_MAX_TOTAL_BYTES", 256 << 20)
++    model = _model("cuda")  # 2 x 64 MiB = 128 MiB in carve-out
++    speculator = torch.nn.Module()
++    speculator.lm_head = model.lm_head
++    markov_data = display_carveout.allocate((30720, 1024), torch.bfloat16, "cuda")  # 60 MiB -> 64 MiB buffer
++    assert markov_data is not None
++    speculator.markov_w1 = torch.nn.Embedding(
++        30720, 1024, _weight=markov_data, _freeze=True
++    )
++    speculator.markov_w1._display_carveout_required = True
++    assert display_carveout.total_bytes() == 192 << 20
++
++    # First 64 MiB decode-only expert slab fits within the 256 MiB cap (192 + 64 <= 256).
++    w13_raw = torch.randint(0, 255, (64 << 20,), dtype=torch.uint8, device="cuda")
++    w13_moved = display_carveout.move(w13_raw)
++    assert w13_moved.data_ptr() != w13_raw.data_ptr()
++    assert torch.equal(w13_moved, w13_raw)
++    assert display_carveout.total_bytes() == 256 << 20
++
++    # Second 64 MiB decode-only expert slab exceeds the 256 MiB cap and stays in regular memory.
++    w2_raw = torch.randint(0, 255, (64 << 20,), dtype=torch.uint8, device="cuda")
++    w2_moved = display_carveout.move(w2_raw)
++    assert w2_moved.data_ptr() == w2_raw.data_ptr()
++    assert display_carveout.total_bytes() == 256 << 20
++
++    speculator.experts = torch.nn.Module()
++    speculator.experts.w13_weight = torch.nn.Parameter(w13_moved, requires_grad=False)
++    speculator.experts.w2_weight = torch.nn.Parameter(w2_moved, requires_grad=False)
++
++    names = [name for name, _ in display_carveout.streamed_weights(model, speculator)]
++    assert names == [
++        "embed_tokens.weight",
++        "lm_head.weight",
++        "markov_w1.weight",
++        "experts.w13_weight",
++    ]
++    display_carveout.confirm_streamed_weights(model, torch.device("cuda"), speculator)
++
++
++@needs_cuda
++@needs_drm
++def test_markov_w1_outside_carveout_refuses(required):
++    model = _model("cuda")
++    speculator = torch.nn.Module()
++    speculator.markov_w1 = torch.nn.Embedding(30720, 1024, device="cuda", dtype=torch.bfloat16)
++    speculator.markov_w1._display_carveout_required = True
++    with pytest.raises(RuntimeError, match="markov_w1.weight"):
++        display_carveout.confirm_streamed_weights(
++            model, torch.device("cuda"), speculator
++        )
+diff --git a/vllm/model_executor/layers/fused_moe/tilelang.py b/vllm/model_executor/layers/fused_moe/tilelang.py
+index e76770094..a45b67116 100644
+--- a/vllm/model_executor/layers/fused_moe/tilelang.py
++++ b/vllm/model_executor/layers/fused_moe/tilelang.py
+@@ -220,10 +220,21 @@ class TileLangExperts(mk.FusedMoEExpertsModular):
+         # where narrow experts (``narrow & 1`` = 1) take one ``block_N``-byte unit
+         # a tile row (2-bit codes) and wide experts take two (4-bit codes);
+         # ``narrow >> 1`` is each expert's starting unit in that buffer.
++        # With the display carve-out on, a decode-only plan's slabs (a row cap
++        # below the mid tiles: DSpark's draft layers, which read each active
++        # expert's slab at most once a step) move into it. Off the carve-out the
++        # preparation is unchanged and asks nothing more of the plan.
++        from vllm.v1.worker import display_carveout
++
++        decode_only = display_carveout.required() and (
++            self._plan.max_rows is not None and not self._plan._has_mid_tiles()
++        )
+         t13, tail13, codes13, byte13, narrow13, base13 = self._plan.prepare_weight(
+             w13, layer.w13_weight_scale
+         )
+         del w13
++        if decode_only:
++            t13 = display_carveout.move(t13)
+         replace_parameter(layer, "w13_weight", t13)
+         replace_parameter(layer, "w13_weight_scale", codes13)
+         del t13, codes13
+@@ -231,6 +242,8 @@ class TileLangExperts(mk.FusedMoEExpertsModular):
+             w2, layer.w2_weight_scale
+         )
+         del w2
++        if decode_only:
++            t2 = display_carveout.move(t2)
+         replace_parameter(layer, "w2_weight", t2)
+         replace_parameter(layer, "w2_weight_scale", codes2)
+         del t2, codes2
+diff --git a/vllm/model_executor/layers/quantization/online/packed_bf16.py b/vllm/model_executor/layers/quantization/online/packed_bf16.py
+index efc2379e4..bcc96fe2c 100644
+--- a/vllm/model_executor/layers/quantization/online/packed_bf16.py
++++ b/vllm/model_executor/layers/quantization/online/packed_bf16.py
+@@ -119,8 +119,16 @@ class PackedBf16LmHeadMethod(QuantizeMethodBase):
+                 from vllm.models.deepseek_v4_1.tilelang.vocab import pack_bf16_weight
+ 
+                 packed = pack_bf16_weight(weight, in_place=True)
++        from vllm.v1.worker import display_carveout
++
+         del weight
+-        replace_parameter(layer, "weight", packed.values)
++        values = packed.values
++        # The TileLang head's carve-out buffer also holds its 8-bit screening
++        # table, right after the packed rows (``_carveout_screen_wq``), so it has
++        # no slack to give back: compacting it would free the table's storage.
++        if getattr(layer, "_carveout_screen_wq", None) is None:
++            values = display_carveout.compact(values)
++        replace_parameter(layer, "weight", values)
+         replace_parameter(layer, "weight_exception_rows", packed.exception_rows)
+         replace_parameter(layer, "weight_exception_entries", packed.exception_entries)
+         replace_parameter(layer, "weight_row_offsets", packed.row_offsets)
+diff --git a/vllm/model_executor/models/qwen3_dspark.py b/vllm/model_executor/models/qwen3_dspark.py
+index 2c1c1863a..38acbd1d7 100644
+--- a/vllm/model_executor/models/qwen3_dspark.py
++++ b/vllm/model_executor/models/qwen3_dspark.py
+@@ -79,13 +79,25 @@ class DSparkMarkovHead(nn.Module):
+             raise ValueError("Replicated Markov W1 requires a TP-sharded Markov head")
+         if self.shard_across_tp and retain_weight_for_gather:
+             raise ValueError("Gathered Markov top-k requires replicated weights")
+-        self.markov_w1 = (
+-            VocabParallelEmbedding(
++        if self.shard_across_tp and not self.replicate_w1:
++            self.markov_w1 = VocabParallelEmbedding(
+                 vocab_size, markov_rank, prefix=maybe_prefix(prefix, "markov_w1")
+             )
+-            if self.shard_across_tp and not self.replicate_w1
+-            else nn.Embedding(vocab_size, markov_rank)
+-        )
++        else:
++            from vllm.v1.worker import display_carveout
++
++            data = display_carveout.allocate(
++                (vocab_size, markov_rank),
++                torch.get_default_dtype(),
++                torch.get_default_device(),
++            )
++            self.markov_w1 = nn.Embedding(
++                vocab_size,
++                markov_rank,
++                _weight=data,
++                _freeze=data is not None,
++            )
++            self.markov_w1._display_carveout_required = True
+         # vocab_parallel shards the projection by vocabulary rows like the
+         # LM head, for callers that reduce the draft argmax across shards.
+         self.markov_w2 = ParallelLMHead(
+diff --git a/vllm/models/deepseek_v4_1/tilelang/embedding.py b/vllm/models/deepseek_v4_1/tilelang/embedding.py
+index b21e80051..22cb03da3 100644
+--- a/vllm/models/deepseek_v4_1/tilelang/embedding.py
++++ b/vllm/models/deepseek_v4_1/tilelang/embedding.py
+@@ -551,9 +551,11 @@ class TileLangEmbeddingMethod(UnquantizedEmbeddingMethod):
+ 
+         data = weight.data
+         in_features = int(data.shape[1])
++        from vllm.v1.worker import display_carveout
++
+         packed = pack_bf16_weight(data, in_place=True)
+         del data
+-        replace_parameter(layer, "weight", packed.values)
++        replace_parameter(layer, "weight", display_carveout.compact(packed.values))
+         replace_parameter(layer, "weight_exception_rows", packed.exception_rows)
+         replace_parameter(layer, "weight_exception_entries", packed.exception_entries)
+         replace_parameter(layer, "weight_row_offsets", packed.row_offsets)
+diff --git a/vllm/v1/worker/display_carveout.py b/vllm/v1/worker/display_carveout.py
+index 1fc02f7ad..a5e09f665 100644
+--- a/vllm/v1/worker/display_carveout.py
++++ b/vllm/v1/worker/display_carveout.py
+@@ -77,8 +77,11 @@ _DUMB_WIDTH = 4096
+ _DUMB_BPP = 32
+ _ROW_BYTES = _DUMB_WIDTH * _DUMB_BPP // 8
+ _GRANULE = 16 << 20
+-# Vocabulary-sized tables only; small embeddings stay where they are.
+-_MIN_WEIGHT_BYTES = 64 << 20
++# Vocabulary-sized tables (including DSpark's 63.125 MiB markov_w1) and
++# decode-only DSpark routed-expert slabs; small embeddings stay where they are.
++_MIN_WEIGHT_BYTES = 60 << 20
++# Leave 64 MiB of the 2,032 MiB scanout reserve free for the console framebuffer.
++_MAX_TOTAL_BYTES = 1968 << 20
+ _CU_EXTERNAL_MEMORY_HANDLE_TYPE_DMABUF_FD = 9
+ 
+ 
+@@ -166,6 +169,23 @@ class _Carveout:
+             ),
+             "cuExternalMemoryGetMappedBuffer",
+         )
++        self._closed = False
++
++    def close(self) -> None:
++        if getattr(self, "_closed", True):
++            return
++        self._closed = True
++        cuda = ctypes.CDLL("libcuda.so.1")
++        if getattr(self, "pointer", None) and self.pointer.value:
++            cuda.cuMemFree_v2(self.pointer)
++            self.pointer = ctypes.c_ulonglong()
++        if getattr(self, "external", None) and self.external.value:
++            cuda.cuDestroyExternalMemory(self.external)
++            self.external = ctypes.c_void_p()
++        if getattr(self, "dmabuf_fd", -1) >= 0:
++            with contextlib.suppress(OSError):
++                os.close(self.dmabuf_fd)
++            self.dmabuf_fd = -1
+ 
+     @property
+     def __cuda_array_interface__(self):
+@@ -222,6 +242,103 @@ def allocate(
+     return backing[:nbytes].view(dtype).view(shape)
+ 
+ 
++def total_bytes() -> int:
++    """Total bytes currently reserved across all active carve-out buffers."""
++    return sum(carveout.nbytes for carveout in _carveouts)
++
++
++def compact(tensor: torch.Tensor) -> torch.Tensor:
++    """Shrink a carve-out buffer to fit ``tensor`` after in-place packing.
++
++    12-bit vocabulary packing shrinks an unpacked BF16 table to 75% of its
++    bytes in place. Reallocating a tight dumb buffer and closing the unpacked
++    one reclaims 112 MiB of carve-out a table at TP3 (80 MiB at TP4) without
++    touching ordinary memory.
++
++    The old buffer is closed, so ``tensor`` must be the only live view of it:
++    a caller that keeps other data in the same buffer (the TileLang packed
++    head's screening table) must not compact it.
++    """
++    nbytes = _nbytes(tensor)
++    if (
++        not _REQUIRED
++        or not tensor.is_cuda
++        or not tensor.is_contiguous()
++        or nbytes <= 0
++    ):
++        return tensor
++    rounded = -(-nbytes // _GRANULE) * _GRANULE
++    for index, carveout in enumerate(_carveouts):
++        if not _holds(carveout, tensor):
++            continue
++        if rounded >= carveout.nbytes:
++            return tensor
++        try:
++            staging = _Carveout(rounded)
++        except OSError:
++            return tensor
++        staging_view = (
++            torch.as_tensor(staging, device=tensor.device)[:nbytes]
++            .view(tensor.dtype)
++            .view(tensor.shape)
++        )
++        staging_view.copy_(tensor)
++        torch.cuda.synchronize(tensor.device)
++        del tensor
++        carveout.close()
++        # Reallocate at the bottom of the scanout heap now that ``carveout`` is
++        # closed so compacted vocabulary tables leave no hole between them.
++        try:
++            shrunk = _Carveout(rounded)
++        except OSError:
++            _carveouts[index] = staging
++            return staging_view
++        backing = torch.as_tensor(shrunk, device=staging_view.device)
++        assert backing.data_ptr() == shrunk.pointer.value
++        out = backing[:nbytes].view(staging_view.dtype).view(staging_view.shape)
++        out.copy_(staging_view)
++        torch.cuda.synchronize(staging_view.device)
++        del staging_view
++        staging.close()
++        _carveouts[index] = shrunk
++        return out
++    return tensor
++
++
++def move(tensor: torch.Tensor) -> torch.Tensor:
++    """Move a prepared decode-only weight tensor into the carve-out if space permits.
++
++    Used after ``process_weights_after_loading`` prepares a tile-major
++    decode-only weight (such as DSpark's routed-expert ``w13_weight`` and
++    ``w2_weight``) when the remaining carve-out capacity within
++    ``_MAX_TOTAL_BYTES`` can hold it.
++    """
++    nbytes = _nbytes(tensor)
++    if (
++        not _REQUIRED
++        or not tensor.is_cuda
++        or not tensor.is_contiguous()
++        or nbytes < _MIN_WEIGHT_BYTES
++    ):
++        return tensor
++    if any(_holds(carveout, tensor) for carveout in _carveouts):
++        return tensor
++    rounded = -(-nbytes // _GRANULE) * _GRANULE
++    if total_bytes() + rounded > _MAX_TOTAL_BYTES:
++        return tensor
++    try:
++        carveout = _Carveout(rounded)
++    except OSError:
++        return tensor
++    _carveouts.append(carveout)
++    backing = torch.as_tensor(carveout, device=tensor.device)
++    assert backing.data_ptr() == carveout.pointer.value
++    out = backing[:nbytes].view(tensor.dtype).view(tensor.shape)
++    out.copy_(tensor)
++    torch.cuda.synchronize(tensor.device)
++    return out
++
++
+ def _holds(carveout: _Carveout, tensor: torch.Tensor) -> bool:
+     start = carveout.pointer.value
+     return start <= tensor.data_ptr() < start + carveout.nbytes
+@@ -335,36 +452,62 @@ def _nbytes(tensor: torch.Tensor) -> int:
+     return tensor.numel() * tensor.element_size()
+ 
+ 
+-def streamed_weights(model: torch.nn.Module) -> list[tuple[str, torch.nn.Parameter]]:
+-    """Vocabulary-sized embedding and output-head weights, deduplicated.
++def _is_mandatory_vocab_module(module: torch.nn.Module) -> bool:
++    return isinstance(module, VocabParallelEmbedding) or (
++        isinstance(module, torch.nn.Embedding)
++        and getattr(module, "_display_carveout_required", False)
++    )
++
++
++def streamed_weights(
++    model: torch.nn.Module, *extra_models: torch.nn.Module | None
++) -> list[tuple[str, torch.nn.Parameter]]:
++    """Streamed carve-out weights across ``model`` and any ``extra_models``, deduplicated.
+ 
+-    ``ParallelLMHead`` is a ``VocabParallelEmbedding``; a drafter that aliases
+-    the target's modules shares their parameters, so each tensor appears once.
++    Includes every mandatory vocabulary-sized table (``VocabParallelEmbedding``
++    and DSpark's ``markov_w1``) plus any decode-only parameters moved into
++    ``_carveouts`` after preparation. A drafter that aliases the target's
++    modules shares their parameters, so each tensor appears once.
+     """
++    roots = [model, *(m for m in extra_models if m is not None)]
+     found: dict[int, tuple[str, torch.nn.Parameter]] = {}
+-    for name, module in model.named_modules():
+-        if not isinstance(module, VocabParallelEmbedding):
+-            continue
+-        weight = getattr(module, "weight", None)
+-        if (
+-            isinstance(weight, torch.nn.Parameter)
+-            and weight.is_cuda
+-            and weight.is_contiguous()
+-            and _nbytes(weight) >= _MIN_WEIGHT_BYTES
+-        ):
+-            found.setdefault(weight.data_ptr(), (f"{name}.weight", weight))
++    for root in roots:
++        for name, module in root.named_modules():
++            if not _is_mandatory_vocab_module(module):
++                continue
++            weight = getattr(module, "weight", None)
++            if (
++                isinstance(weight, torch.nn.Parameter)
++                and weight.is_cuda
++                and weight.is_contiguous()
++                and _nbytes(weight) >= _MIN_WEIGHT_BYTES
++            ):
++                label = f"{name}.weight" if name else "weight"
++                found.setdefault(weight.data_ptr(), (label, weight))
++        for name, param in root.named_parameters():
++            if (
++                param.is_cuda
++                and param.is_contiguous()
++                and any(_holds(carveout, param.data) for carveout in _carveouts)
++            ):
++                found.setdefault(param.data_ptr(), (name, param))
+     return list(found.values())
+ 
+ 
+-def confirm_streamed_weights(model: torch.nn.Module, device: torch.device) -> None:
+-    """Confirm the embedding and output-head weights loaded into the carve-out.
++def confirm_streamed_weights(
++    model: torch.nn.Module,
++    device: torch.device,
++    *extra_models: torch.nn.Module | None,
++) -> None:
++    """Confirm the streamed weights loaded into the display carve-out.
+ 
+-    Every vocabulary-sized weight of the served model must sit in a buffer from
+-    ``allocate``, and every such buffer must still hold one of them.
++    Every vocabulary-sized weight of the served model (and any drafter) must
++    sit in a buffer from ``allocate``, and every carve-out buffer must hold a
++    live parameter of the served models.
+     """
+     assert ctypes.sizeof(_ExternalMemoryHandleDesc) == 104
+     assert ctypes.sizeof(_ExternalMemoryBufferDesc) == 88
+-    weights = streamed_weights(model)
++    weights = streamed_weights(model, *extra_models)
+     if not weights:
+         raise RuntimeError(
+             "SPARK_DS41F_DISPLAY_CARVEOUT_WEIGHTS=1 but the model has no "
+diff --git a/vllm/v1/worker/gpu/model_runner.py b/vllm/v1/worker/gpu/model_runner.py
+index 23255378c..5294aad92 100644
+--- a/vllm/v1/worker/gpu/model_runner.py
++++ b/vllm/v1/worker/gpu/model_runner.py
+@@ -548,7 +548,11 @@ class GPUModelRunner(LoRAModelRunnerMixin):
+             # Before any kernel plan or graph sees the weights; the drafter
+             # aliases the target's embedding and head, which loaded in place.
+             if display_carveout.required():
+-                display_carveout.confirm_streamed_weights(self.model, self.device)
++                display_carveout.confirm_streamed_weights(
++                    self.model,
++                    self.device,
++                    getattr(self.speculator, "model", None),
++                )
+         time_after_load = time.perf_counter()
+ 
+         self.model_memory_usage = m.consumed_memory
+-- 
+2.43.0
+

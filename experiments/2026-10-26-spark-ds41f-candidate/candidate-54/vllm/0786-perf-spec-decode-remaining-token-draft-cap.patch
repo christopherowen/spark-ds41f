@@ -1,0 +1,210 @@
+From 8eaa8d41d7b02fea721ad7d673abb72a02704390 Mon Sep 17 00:00:00 2001
+From: Christopher Owen <3221756+christopherowen@users.noreply.github.com>
+Date: Sun, 8 Nov 2026 00:00:00 +0000
+Subject: [PATCH] perf(spec_decode): clamp scheduled decode verify rows to
+ remaining max_tokens
+
+Upstream-Base: 866fa1e1ef2ed2ee7bcdbb8deffaccccd5ecdd46
+
+Rationale: When a speculative decode request approaches max_tokens under async scheduling or synchronous decode, scheduling 1 + num_spec_tokens verify rows allocates KV blocks and runs target attention/MLP rows for positions past max_tokens that check_stop immediately discards. Clamping scheduled decode new tokens and copy-placeholder widening to the remaining token budget (or remaining budget + 1 when sink rejection is active so the final committed output token still undergoes sink verification) eliminates wasted target verify rows without changing any cross-rank control flow.
+
+Quality: Lossless; only verify rows beyond max_tokens (or beyond the sink-verified last output token) are omitted.
+
+Tests: pytest tests/v1/core/test_copy_drafts_scheduler.py tests/v1/core/test_sink_draft_zero.py
+
+Upstream-Status: Spark-DS41F local patch
+---
+ tests/v1/core/test_copy_drafts_scheduler.py | 97 +++++++++++++++++++++
+ vllm/v1/core/sched/scheduler.py             | 50 ++++++++++-
+ 2 files changed, 146 insertions(+), 1 deletion(-)
+
+diff --git a/tests/v1/core/test_copy_drafts_scheduler.py b/tests/v1/core/test_copy_drafts_scheduler.py
+index 2fcc09bba..033199783 100644
+--- a/tests/v1/core/test_copy_drafts_scheduler.py
++++ b/tests/v1/core/test_copy_drafts_scheduler.py
+@@ -413,3 +413,100 @@ def test_active_prefill_chunk_keeps_decode_requests_at_the_block(monkeypatch, tm
+         if len(queue) == 2:
+             done = queue.popleft()
+             scheduler.update_from_output(done, _output(done, alloc))
++
++
++def test_remaining_max_tokens_clamps_decode_rows_and_copy_widening(
++    monkeypatch, tmp_path
++):
++    """A decode request near ``max_tokens`` caps its scheduled draft rows and
++    copy-placeholder widening to the tokens that can still be committed, leaving
++    unused copy rows in the envelope for other copying requests."""
++    utils, scheduler = _scheduler(
++        monkeypatch, tmp_path, copy_drafts=True, max_num_seqs=4
++    )
++    requests = utils.create_requests(num_requests=4, num_tokens=20, max_tokens=500)
++    # Give the first request a tight max_tokens cap so its final decode step
++    # needs fewer than BLOCK drafts while a step is in flight.
++    finishing = requests[0]
++    finishing.max_tokens = 10
++    alloc = {request.request_id: LOOKAHEAD for request in requests}
++    for request in requests:
++        scheduler.add_request(request)
++
++    queue: deque[SchedulerOutput] = deque()
++    seen_finishing_widths: list[int] = []
++    seen_other_max_widths: list[int] = []
++    for _ in range(6):
++        scheduled = scheduler.schedule()
++        if finishing.request_id in scheduled.scheduled_spec_decode_tokens:
++            fin_drafts = len(
++                scheduled.scheduled_spec_decode_tokens[finishing.request_id]
++            )
++            seen_finishing_widths.append(fin_drafts)
++            assert (
++                scheduled.num_scheduled_tokens[finishing.request_id] == 1 + fin_drafts
++            )
++            other_widths = [
++                len(scheduled.scheduled_spec_decode_tokens[r.request_id])
++                for r in requests[1:]
++                if r.request_id in scheduled.scheduled_spec_decode_tokens
++            ]
++            if other_widths:
++                seen_other_max_widths.append(max(other_widths))
++        queue.append(scheduled)
++        if len(queue) == 2:
++            done = queue.popleft()
++            # Reject all drafts on finishing's steps so it approaches max_tokens
++            # one token at a time and exercises partial-draft clamping.
++            req_ids = list(done.num_scheduled_tokens)
++            sampled = []
++            for req_id in req_ids:
++                if req_id == finishing.request_id:
++                    sampled.append([7])
++                else:
++                    drafts = len(done.scheduled_spec_decode_tokens.get(req_id, ()))
++                    sampled.append([7] * (drafts + 1))
++            scheduler.update_from_output(
++                done,
++                ModelRunnerOutput(
++                    req_ids=req_ids,
++                    req_id_to_index={req_id: i for i, req_id in enumerate(req_ids)},
++                    sampled_token_ids=sampled,
++                    logprobs=None,
++                    prompt_logprobs_dict={},
++                    pooler_output=[],
++                    copy_draft_alloc=[alloc[req_id] for req_id in req_ids],
++                ),
++            )
++
++    # Once finishing is within LOOKAHEAD tokens of max_tokens, it no longer
++    # consumes the full 11 extra copy rows, allowing the next copying request
++    # in the 4-request batch to widen to LOOKAHEAD.
++    assert any(w < BLOCK for w in seen_finishing_widths)
++    assert LOOKAHEAD in seen_other_max_widths
++
++
++def test_remaining_max_tokens_with_sink_rejection_preserves_last_token_row(
++    monkeypatch, tmp_path
++):
++    """With sink rejection on, the ``max_tokens``-th output token is kept as a
++    draft row so the sink detector inspects its residual column, while drafts
++    strictly past ``max_tokens`` are trimmed."""
++    monkeypatch.setenv("VLLM_SINK_DETECTOR_COLUMN", "2455")
++    monkeypatch.setenv("VLLM_SINK_DETECTOR_THRESHOLD", "85000")
++    monkeypatch.setenv("VLLM_SINK_REJECTION", "1")
++    utils, scheduler = _scheduler(
++        monkeypatch, tmp_path, copy_drafts=True, max_num_seqs=4
++    )
++    assert scheduler.sink_rejection
++    request = utils.create_requests(num_requests=1, num_tokens=20, max_tokens=4)[0]
++    scheduler.add_request(request)
++
++    # Step 1: prefill (20 prompt tokens), samples token #1 as provisional.
++    s1 = scheduler.schedule()
++    assert s1.num_scheduled_tokens[request.request_id] == 20
++    # Step 2 (in flight after prefill): 4 output tokens total -> draft zero (#1)
++    # plus 3 drafter tokens (#2, #3, #4) = 4 rows total (clamped from 6).
++    s2 = scheduler.schedule()
++    assert s2.num_scheduled_tokens[request.request_id] == 4
++    assert len(s2.scheduled_spec_decode_tokens[request.request_id]) == 4
+diff --git a/vllm/v1/core/sched/scheduler.py b/vllm/v1/core/sched/scheduler.py
+index b61ec528d..d1015e71b 100644
+--- a/vllm/v1/core/sched/scheduler.py
++++ b/vllm/v1/core/sched/scheduler.py
+@@ -380,6 +380,13 @@ class Scheduler(SchedulerInterface):
+             speculative_config is not None
+             and speculative_config.copy_drafts is not None
+         )
++        self.enable_adaptive_verification = (
++            speculative_config is not None
++            and (
++                speculative_config.enable_adaptive_verification
++                or self.copy_drafts
++            )
++        )
+         self.max_decode_rows = vllm_config.max_decode_rows
+         self.num_lookahead_tokens = vllm_config.num_lookahead_tokens
+         if self.scheduler_config.align_prefill_chunks:
+@@ -1127,6 +1134,40 @@ class Scheduler(SchedulerInterface):
+                     return True
+         return False
+ 
++    def _max_decode_new_tokens(self, request: Request) -> int | None:
++        """Maximum decode rows ``request`` can use before reaching ``max_tokens``.
++
++        With adaptive verification (variable-length decode CUDA graphs), partial
++        drafts do not break decode graph dispatch. Under async scheduling,
++        ``num_computed_tokens`` includes in-flight ``num_output_placeholders``;
++        subtracting ``max(0, num_output_placeholders - 1)`` retains only the
++        single token an in-flight step is guaranteed to commit when all of its
++        drafts reject. With sink rejection, the last output token is verified
++        as a draft row so the sink detector inspects its residual column.
++        """
++        if (
++            not self.enable_adaptive_verification
++            or request.is_prefill_chunk
++            or getattr(request, "max_tokens", None) is None
++            or getattr(request, "num_prompt_tokens", None) is None
++        ):
++            return None
++        min_computed_tokens = request.num_computed_tokens - max(
++            0, request.num_output_placeholders - 1
++        )
++        max_model_tokens = (
++            self.max_model_len
++            - request.num_computed_tokens
++            - self.num_sampled_tokens_per_step
++        )
++        max_output_tokens = (
++            request.num_prompt_tokens
++            + request.max_tokens
++            - min_computed_tokens
++            - (0 if self.sink_rejection else self.num_sampled_tokens_per_step)
++        )
++        return max(1, min(max_model_tokens, max_output_tokens))
++
+     def _widen_copy_placeholders(self, request: Request, rows_left: int) -> int:
+         """Lay out a decoding request's draft placeholders for the copy drafts its
+         last output asked for (``copy_draft_alloc``): DSpark's block and at most
+@@ -1146,7 +1187,11 @@ class Scheduler(SchedulerInterface):
+             or placeholders[-1] != -1
+         ):
+             return 0
+-        rows = max(0, min(request.copy_draft_alloc - self.num_spec_tokens, rows_left))
++        alloc = request.copy_draft_alloc
++        max_new_tokens = self._max_decode_new_tokens(request)
++        if max_new_tokens is not None:
++            alloc = min(alloc, max_new_tokens - 1)
++        rows = max(0, min(alloc - self.num_spec_tokens, rows_left))
+         if len(placeholders) != base + rows:
+             request.spec_token_ids = [-1] * (base + rows)
+         return rows
+@@ -1580,6 +1625,9 @@ class Scheduler(SchedulerInterface):
+                     - request.num_computed_tokens
+                     - self.num_sampled_tokens_per_step,
+                 )
++                max_decode_new_tokens = self._max_decode_new_tokens(request)
++                if max_decode_new_tokens is not None:
++                    num_new_tokens = min(num_new_tokens, max_decode_new_tokens)
+ 
+                 # Apply Mamba alignment before encoder caps.
+                 if self.need_mamba_block_aligned_split:
+-- 
+2.43.0
+

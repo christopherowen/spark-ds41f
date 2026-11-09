@@ -1,0 +1,349 @@
+From e8b8e44f37f305d71ec493ecbc0430c87a8a79a6 Mon Sep 17 00:00:00 2001
+From: Christopher Owen <3221756+christopherowen@users.noreply.github.com>
+Date: Sun, 8 Nov 2026 12:15:00 +0100
+Subject: [PATCH] perf(dsv41): 64 KiB chunked, %globaltimer-paced side-stream
+ L2 prefetch
+
+Upstream base: 19f2c20ed4d64ae22bd009ceacadd85e2a81e354 (spark-ds41f-1107 0001..0761).
+
+Rationale:
+On GB10 (sm_121a, 273 GB/s LPDDR5X), cp.async.bulk.prefetch.L2.global.L2::cache_hint
+honors chunk sizes up to 64 KiB (65536 bytes; 128 KiB and 1 MiB requests are ignored)
+and feeds a finite hardware TMA prefetch FIFO. Launching grid * 128 threads (256 threads
+at grid=2 on TP4, or 512 threads at grid=4 on TP3) that each issue unpaced 4 KiB
+bulk-prefetch requests overflows the TMA prefetch FIFO (making grid=4 40-42 us/layer
+slower than grid=2 even during zero-memory windows) and floods the memory controller
+during concurrent window kernels.
+
+Update both the TileLang L2 prefetch kernel (vllm/models/glm5next/nvidia/tilelang/l2_prefetch.py)
+and the CuTe DSL L2 prefetch kernel (vllm/models/glm5next/nvidia/l2_prefetch.py) so a
+single issuer thread (CTA 0, lane 0) walks the (ptr, bytes) segment table in 64 KiB
+(65536-byte) bulk-prefetch chunks with an initial 128 KiB (2-chunk) burst followed by
+200 ns %globaltimer pacing between subsequent chunks. Keep a separate _SLICE_BYTES = 4096
+alignment granule in take_budget so all L2PrefetchPlan segment tables remain unchanged.
+
+Quality implications:
+None (cache-hint-only L2 prefetch; 100% bit-exact outputs across all decode and draft steps).
+
+Tests:
+- pytest tests/models/test_glm5next_tilelang_l2_prefetch.py
+- pytest tests/models/test_glm5next_l2_prefetch_persist.py
+- pytest tests/models/test_deepseek_v4_1_l2_schedule.py
+- pytest tests/models/kimi_k3/test_l2_prefetch.py
+
+Upstream status:
+Local SM121a GB10 hardware optimization.
+---
+ .../test_glm5next_tilelang_l2_prefetch.py     | 21 ++++
+ vllm/models/glm5next/nvidia/l2_prefetch.py    | 97 +++++++++++++------
+ .../glm5next/nvidia/tilelang/l2_prefetch.py   | 83 ++++++++++------
+ 3 files changed, 140 insertions(+), 61 deletions(-)
+
+diff --git a/tests/models/test_glm5next_tilelang_l2_prefetch.py b/tests/models/test_glm5next_tilelang_l2_prefetch.py
+index dc73eced8..45995b50b 100644
+--- a/tests/models/test_glm5next_tilelang_l2_prefetch.py
++++ b/tests/models/test_glm5next_tilelang_l2_prefetch.py
+@@ -52,3 +52,24 @@ def test_tilelang_prefetch_captures_in_a_graph():
+         main.wait_stream(side)
+     graph.replay()
+     torch.cuda.synchronize()
++
++
++def test_tilelang_prefetch_64k_paced_default():
++    from vllm.models.glm5next.nvidia import l2_prefetch
++    from vllm.models.glm5next.nvidia.tilelang.l2_prefetch import compile_launcher
++
++    assert l2_prefetch._CHUNK_BYTES == 65536
++    launch = compile_launcher(
++        grid=l2_prefetch._GRID, block=l2_prefetch._BLOCK, chunk=l2_prefetch._CHUNK_BYTES
++    )
++    a = torch.randn(2 * 1024 * 1024 + 19, device="cuda")
++    b = torch.randint(0, 255, (65536 * 3 + 48,), dtype=torch.uint8, device="cuda")
++    before = [t.clone() for t in (a, b)]
++    plan = _plan(a, b)
++    side = torch.cuda.Stream()
++    side.wait_stream(torch.cuda.current_stream())
++    launch(plan.segs, side.cuda_stream)
++    torch.cuda.current_stream().wait_stream(side)
++    torch.cuda.synchronize()
++    for t, ref in zip((a, b), before):
++        assert torch.equal(t, ref)
+diff --git a/vllm/models/glm5next/nvidia/l2_prefetch.py b/vllm/models/glm5next/nvidia/l2_prefetch.py
+index d4c80f587..fce5cde6f 100644
+--- a/vllm/models/glm5next/nvidia/l2_prefetch.py
++++ b/vllm/models/glm5next/nvidia/l2_prefetch.py
+@@ -57,8 +57,11 @@ from vllm.logger import init_logger
+ logger = init_logger(__name__)
+ 
+ _MIN_BYTES = 64 * 1024
+-_CHUNK_BYTES = 4096
+-_BLOCK = 128
++_SLICE_BYTES = 4096
++_CHUNK_BYTES = 65536
++_BURST_CHUNKS = 2
++_PACE_DELAY_NS = 200
++_BLOCK = 32
+ # Caches and lookup tables are either written immediately before use or read
+ # sparsely. Streaming them into L2 would evict projection weights without
+ # shortening their own critical path.
+@@ -93,12 +96,12 @@ def _mb(name: str, default: str) -> int:
+         return int(float(default) * 1e6)
+ 
+ 
+-# Fewer issuing CTAs throttle the fill rate, leaving device-memory headroom
+-# for latency-bound kernels running beside the prefetch. GB10 (SM121) decode
+-# measured best with 4.
++# A single issuing CTA with 64 KiB bulk-prefetch chunks and %globaltimer pacing
++# avoids overflowing GB10's hardware TMA prefetch FIFO while leaving device-memory
++# headroom for latency-bound kernels running beside the prefetch.
+ _GRID = _int_env(
+     "VLLM_L2_PREFETCH_GRID",
+-    4
++    1
+     if torch.cuda.is_available() and torch.cuda.get_device_capability() == (12, 1)
+     else 16,
+ )
+@@ -192,24 +195,43 @@ if _CUTE_OK:
+             ip=ip,
+         )
+ 
++    @dsl_user_op
++    def _globaltimer_ns(*, loc=None, ip=None):
++        i64 = _ir.IntegerType.get_signless(64)
++        res = _llvm.inline_asm(
++            i64,
++            [],
++            "mov.u64 $0, %globaltimer;",
++            "=l",
++            has_side_effects=True,
++            loc=loc,
++            ip=ip,
++        )
++        return cutlass.Int64(res)
++
+     class L2PrefetchKernel:
+-        """grid x block threads walk the (ptr, bytes) segment table and issue
+-        one bulk L2 prefetch per 4 KB chunk (fire-and-forget)."""
++        """CTA 0 lane 0 walks the (ptr, bytes) segment table and issues one
++        64 KiB bulk L2 prefetch per chunk, paced by %globaltimer after an
++        initial 128 KiB burst."""
+ 
+         def __init__(
+             self,
+             chunk_bytes: int = _CHUNK_BYTES,
+             grid: int = _GRID,
+             block: int = _BLOCK,
++            burst_chunks: int = _BURST_CHUNKS,
++            delay_ns: int = _PACE_DELAY_NS,
+         ):
+-            self.chunk_bytes = int(chunk_bytes)
++            self.chunk_bytes = max(int(chunk_bytes), _CHUNK_BYTES)
+             self.grid = int(grid)
+             self.block = int(block)
++            self.burst_chunks = int(burst_chunks)
++            self.delay_ns = int(delay_ns)
+ 
+         @cute.jit
+         def __call__(self, gSegs: cute.Tensor, stream: CUstream) -> None:
+             self.kernel(gSegs).launch(
+-                grid=[self.grid, 1, 1],
++                grid=[1, 1, 1],
+                 block=[self.block, 1, 1],
+                 stream=stream,
+             )
+@@ -219,27 +241,38 @@ if _CUTE_OK:
+             tidx, _, _ = cute.arch.thread_idx()
+             bidx, _, _ = cute.arch.block_idx()
+             chunk: cutlass.Constexpr = self.chunk_bytes
+-            stride = cutlass.Int64(self.grid * self.block)
+-            tid = cutlass.Int64(bidx) * cutlass.Int64(self.block) + cutlass.Int64(tidx)
+-            nseg = cutlass.Int32(cute.size(gSegs, mode=[0]) // 2)
+-            policy = _createpolicy_evict_last()
+-            s = cutlass.Int32(0)
+-            while s < nseg:
+-                base = cutlass.Int64(gSegs[2 * s])
+-                nbytes = cutlass.Int64(gSegs[2 * s + 1])
+-                nchunks = (nbytes + cutlass.Int64(chunk - 1)) // cutlass.Int64(chunk)
+-                c = tid
+-                while c < nchunks:
+-                    off = c * cutlass.Int64(chunk)
+-                    rem = nbytes - off
+-                    size = cutlass.Int32(chunk)
+-                    if rem < cutlass.Int64(chunk):
+-                        size = cutlass.Int32(rem)
+-                    size = (size // cutlass.Int32(16)) * cutlass.Int32(16)
+-                    if size > cutlass.Int32(0):
+-                        _bulk_prefetch_l2(base + off, size, policy)
+-                    c = c + stride
+-                s = s + cutlass.Int32(1)
++            burst: cutlass.Constexpr = self.burst_chunks
++            pace_ns: cutlass.Constexpr = self.delay_ns
++            if bidx == cutlass.Int32(0) and tidx == cutlass.Int32(0):
++                nseg = cutlass.Int32(cute.size(gSegs, mode=[0]) // 2)
++                policy = _createpolicy_evict_last()
++                issued = cutlass.Int32(0)
++                s = cutlass.Int32(0)
++                while s < nseg:
++                    base = cutlass.Int64(gSegs[2 * s])
++                    nbytes = cutlass.Int64(gSegs[2 * s + 1])
++                    off = cutlass.Int64(0)
++                    while off < nbytes:
++                        rem = nbytes - off
++                        size = cutlass.Int32(chunk)
++                        if rem < cutlass.Int64(chunk):
++                            size = cutlass.Int32(rem)
++                        size = (size // cutlass.Int32(16)) * cutlass.Int32(16)
++                        if size > cutlass.Int32(0):
++                            _bulk_prefetch_l2(base + off, size, policy)
++                            issued = issued + cutlass.Int32(1)
++                            if pace_ns > 0 and issued >= cutlass.Int32(burst):
++                                if (
++                                    off + cutlass.Int64(chunk) < nbytes
++                                    or s + cutlass.Int32(1) < nseg
++                                ):
++                                    t0 = _globaltimer_ns()
++                                    while _globaltimer_ns() - t0 < cutlass.Int64(
++                                        pace_ns
++                                    ):
++                                        pass
++                        off = off + cutlass.Int64(chunk)
++                    s = s + cutlass.Int32(1)
+ 
+ 
+ _compiled = None
+@@ -417,7 +450,7 @@ def take_budget(
+             taken.append((name, ptr, nbytes))
+             used += nbytes
+         else:
+-            head = room - (room % _CHUNK_BYTES)
++            head = room - (room % _SLICE_BYTES)
+             if head > 0:
+                 taken.append((name + "[head]", ptr, head))
+                 used += head
+diff --git a/vllm/models/glm5next/nvidia/tilelang/l2_prefetch.py b/vllm/models/glm5next/nvidia/tilelang/l2_prefetch.py
+index 55a7547af..4b458b441 100644
+--- a/vllm/models/glm5next/nvidia/tilelang/l2_prefetch.py
++++ b/vllm/models/glm5next/nvidia/tilelang/l2_prefetch.py
+@@ -3,9 +3,11 @@
+ """TileLang bulk L2 prefetch, the TileLang counterpart of the CuTe DSL kernel in
+ ``l2_prefetch.py``.
+ 
+-Same work split and the same two PTX instructions: grid x block threads walk the
+-(ptr, bytes) segment table and issue one ``cp.async.bulk.prefetch.L2`` with an
+-``evict_last`` cache policy per 4 KB chunk, rounded down to 16 bytes. Cache hints
++A single issuer thread (CTA 0, lane 0) walks the (ptr, bytes) segment table and
++issues one ``cp.async.bulk.prefetch.L2`` with an ``evict_last`` cache policy per
++64 KiB chunk (rounded down to 16 bytes for segment tails), pacing chunks via
++``%globaltimer`` after an initial 128 KiB burst so side-stream prefetches do not
++overflow the hardware TMA prefetch FIFO or stall concurrent kernels. Cache hints
+ only; nothing is written.
+ """
+ 
+@@ -15,55 +17,78 @@ import tilelang
+ import tilelang.language as T
+ import torch
+ 
++_BULK_CHUNK_BYTES = 65536
++_BURST_CHUNKS = 2
++_PACE_DELAY_NS = 200
++
+ # createpolicy has no side effects (the compiler may hoist it); the prefetch does.
+ _HEADER = r"""
++#include <stdint.h>
++
+ __device__ __forceinline__ unsigned long long l2pf_policy_evict_last() {
+     unsigned long long policy;
+     asm("createpolicy.fractional.L2::evict_last.b64 %0, 1.0;" : "=l"(policy));
+     return policy;
+ }
+ 
++__device__ __forceinline__ unsigned long long l2_prefetch_globaltimer() {
++    unsigned long long t;
++    asm volatile("mov.u64 %0, %%globaltimer;" : "=l"(t));
++    return t;
++}
++
+ __device__ __forceinline__ void l2pf_bulk_prefetch(long long address, int bytes,
+                                                    unsigned long long policy) {
+     asm volatile("cp.async.bulk.prefetch.L2.global.L2::cache_hint [%0], %1, %2;"
+                  :: "l"(address), "r"(bytes), "l"(policy));
+ }
++
++template <int CHUNK_BYTES, int BURST_CHUNKS, int DELAY_NS>
++__device__ __forceinline__ void l2_prefetch_segments_paced(
++    const int64_t* __restrict__ segs,
++    int nseg2) {
++    if (blockIdx.x != 0 || threadIdx.x != 0) return;
++    unsigned long long policy = l2pf_policy_evict_last();
++    int nseg = nseg2 >> 1;
++    int issued = 0;
++    for (int s = 0; s < nseg; ++s) {
++        long long base = (long long)segs[2 * s];
++        long long nbytes = (long long)segs[2 * s + 1];
++        for (long long off = 0; off < nbytes; off += (long long)CHUNK_BYTES) {
++            long long rem = nbytes - off;
++            int size = (int)((rem < (long long)CHUNK_BYTES ? rem : (long long)CHUNK_BYTES) & ~15LL);
++            if (size > 0) {
++                l2pf_bulk_prefetch(base + off, size, policy);
++                ++issued;
++                if (DELAY_NS > 0 && issued >= BURST_CHUNKS &&
++                    (off + (long long)CHUNK_BYTES < nbytes || s + 1 < nseg)) {
++                    unsigned long long t0 = l2_prefetch_globaltimer();
++                    while ((l2_prefetch_globaltimer() - t0) < (unsigned long long)DELAY_NS) {}
++                }
++            }
++        }
++    }
++}
+ """
+ 
+ 
+ @tilelang.jit(target="cuda")
+ def l2_prefetch_kernel(grid: int, block: int, chunk: int):
+-    """The prefetch of a shape-dynamic segment table by ``grid`` x ``block`` threads in
+-    ``chunk``-byte requests; one kernel per (grid, block, chunk)."""
++    """The prefetch of a shape-dynamic segment table in 64 KiB bulk-prefetch
++    requests paced by ``%globaltimer``; one kernel per (grid, block, chunk)."""
+     nseg2 = T.dynamic("nseg2")
++    step = max(int(chunk), _BULK_CHUNK_BYTES)
+ 
+     @T.prim_func
+     def l2_prefetch(segs: T.Tensor((nseg2,), T.int64)):
+-        with T.Kernel(grid, threads=block) as bx:
++        with T.Kernel(1, threads=32) as _bx:
+             T.import_source(_HEADER)
+-            tx = T.get_thread_binding()
+-            tid = T.cast(bx, T.int64) * block + T.cast(tx, T.int64)
+-            stride = T.int64(grid * block)
+-            policy = T.alloc_local((1,), T.uint64)
+-            policy[0] = T.call_extern("l2pf_policy_evict_last", dtype=T.uint64)
+-            for s in T.serial(nseg2 // 2):
+-                base = segs[2 * s]
+-                nbytes = segs[2 * s + 1]
+-                nchunks = (nbytes + (chunk - 1)) // chunk
+-                # This thread's chunks: tid, tid + stride, ... below nchunks.
+-                for k in T.serial(
+-                    T.max((nchunks - tid + (stride - 1)) // stride, T.int64(0))
+-                ):
+-                    off = (tid + k * stride) * chunk
+-                    size = T.min(nbytes - off, T.int64(chunk)) // 16 * 16
+-                    if size > 0:
+-                        T.call_extern(
+-                            "l2pf_bulk_prefetch",
+-                            base + off,
+-                            T.cast(size, T.int32),
+-                            policy[0],
+-                            dtype="handle",
+-                        )
++            T.call_extern(
++                f"l2_prefetch_segments_paced<{step}, {_BURST_CHUNKS}, {_PACE_DELAY_NS}>",
++                segs,
++                nseg2,
++                dtype="handle",
++            )
+ 
+     return l2_prefetch
+ 
+-- 
+2.43.0
+
