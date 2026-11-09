@@ -1,0 +1,69 @@
+{
+  "pr": 991,
+  "pr_head": "c2953fb0dd49d69122bddd5ebe6ed68b775d88f9",
+  "mark": "Its quantizer bench: gain beyond the interval, bit-exact",
+  "host": "sp8 (spark-0016, NVIDIA GB10)",
+  "images": {
+    "candidate-49": "sha256:9f51f2e2c5ab728e96490d794bff7b83a147d6d3d61333c5b60b2cff662049cd",
+    "1107": "sha256:3f32a962ce04b7c8d85337cd427a8946b8b6bcaadd97cc8d8a8cd14e8d68a6ce"
+  },
+  "evidence": "README section 4 pytest (-k selection over 4 files, host nvdisasm mounted as in the README; patched-file mounts dropped because the image carries 0764) and README section 5 bench, bench_hw_e2m1x2_quant.py --out (defaults: 80 interleaved AB/BA rounds x 25 repeats, 5 for M >= 2048), on the candidate image, two boots. The bench is self-contained: its sw arm is the 1107 software E2M1 kernels re-declared in the script, its hw arm the image's kernels, each case checked torch.equal before timing. The same bench on 1107 cannot import (it needs _E2M1_HEADER from the patched gemm.py); recorded once",
+  "measured": {
+    "pytest_candidate-49": {
+      "boot1": "28 passed, 143 deselected in 121.53s",
+      "boot2": "28 passed, 143 deselected in 120.38s"
+    },
+    "bit_exact": "all 45 (kernel, M) cases torch.equal on both boots, including the E2M1 tie midpoints",
+    "static_sass_sw_to_hw": {
+      "gemm_bm16": "488 -> 440",
+      "gemm_bm32": "536 -> 496",
+      "gemm_bm64": "656 -> 608",
+      "quantize_query_rope": "864 -> 416",
+      "quantize_paged_keys": "656 -> 224",
+      "norm_rope_shards1": "760 -> 376",
+      "norm_rope_shards6": "880 -> 480",
+      "note": "identical to the PR's table"
+    },
+    "median_us_sw_boots_to_hw_boots": {
+      "gemm_rope_mxfp4_M32": "9.82/9.508 -> 9.393/9.124 (1.044x; PR -3.7%)",
+      "gemm_rope_mxfp4_M64": "15.898/15.697 -> 15.066/14.886 (1.055x; PR -5.1% to -5.6%)",
+      "quantize_query_rope_M512": "19.457/19.428 -> 12.464/12.542 (1.555x; PR 1.55x)",
+      "quantize_query_rope_M2048": "75.61/76.57 -> 76.566/80.838 (0.967x, within the interval; paired deltas +1.27% / +5.58%; PR claimed 1.36x-1.42x)",
+      "quantize_query_rope_M8192": "597.555/651.072 -> 596.17/650.861 (1.001x; PR -0.4% to -0.5%)",
+      "paged_keys_M512": "4.755/4.679 -> 4.256/4.315 (1.101x; PR -10%)",
+      "paged_keys_M8192": "15.517/15.635 -> 7.754/7.782 (2.005x; PR 2.00x)",
+      "norm_rope_shards1_M8192": "6.922/7.024 -> 5.354/5.885 (1.241x; PR 1.28x-1.29x)"
+    },
+    "cells": "45: 7 faster beyond the two-boot interval (the above, plus paged keys M=32 at 1.049x), 33 within it, 5 slower beyond it",
+    "slower_beyond_interval": {
+      "gemm_rope_mxfp4_M1": "6.277/6.261 -> 6.317/6.31 (+0.64% / +0.78%; PR claimed -1.2% / -1.9%)",
+      "paged_keys_M2": "4.361/4.323 -> 4.466/4.365 (+2.41% / +0.98%)",
+      "paged_keys_M4": "4.388/4.38 -> 4.444/4.456 (+1.27% / +1.74%)",
+      "paged_keys_M6": "4.312/4.355 -> 4.373/4.42 (+1.41% / +1.50%)",
+      "paged_keys_M2048": "5.293/5.395 -> 5.622/5.651 (+6.23% / +4.74%)",
+      "note": "the PR's own receipts show the same paged-key decode-shape regressions (+1.4% to +6.1%) and a mixed M=2048 (+5.38% / -0.06%)"
+    },
+    "same_command_on_1107": "exit 1: ImportError cannot import name '_E2M1_HEADER' (the bench needs the patched gemm.py)",
+    "interval": "two candidate-image boots; each value is the median of 80 interleaved rounds; a gain is beyond the interval when the slower hw boot beats the faster sw boot. Boot-to-boot spread is large in some decode cells (query rope M=1: 4.268 vs 12.431 us for sw), so the per-boot paired deltas are given too"
+  },
+  "parts": [
+    {
+      "part": "quantizer bench: gain beyond the interval",
+      "verdict": "pass",
+      "detail": "the prefill headline gains reproduce beyond the interval (query rope M=512 1.555x, paged keys M=8192 2.005x, norm-rope M=8192 1.241x, GEMM epilogue M=32/64 4-6%); the claimed query-rope M=2048 gain does not reproduce, and five decode-shape cells (GEMM M=1, paged keys M=2..6) and paged keys M=2048 are 0.6%-6% slower beyond the interval"
+    },
+    {
+      "part": "bit-exact",
+      "verdict": "pass",
+      "detail": "45 of 45 cases torch.equal on both boots"
+    }
+  ],
+  "verdict": "pass",
+  "verdict_scope": "its own bench on the candidate image; whether the 0.04-0.2 us decode-shape slowdowns move the decode suite is a cluster question",
+  "reason": "The hardware e2m1x2 quantizers are bit-exact and give the PR's prefill gains on the integrated image beyond the two-boot interval, with the PR's SASS reductions. Not every claim holds: query-rope M=2048 shows no gain, and the decode-shape paged-key writes and the M=1 GEMM epilogue are slightly slower, as the PR's own receipts already showed for the paged keys.",
+  "notes": [
+    "commands.txt start_utc is when the command was issued and includes any wait on /tmp/spark-lab-gpu.lock",
+    "The README's pytest receipts end with a 'PDL sources: 55 kernels launched, 55 with PDL, 0 violations' line; our runs of the same command print no such line (its source was not investigated)",
+    "analysis.json is derived from json/ by a_other.py"
+  ]
+}

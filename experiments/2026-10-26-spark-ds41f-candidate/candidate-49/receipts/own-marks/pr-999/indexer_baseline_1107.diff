@@ -1,0 +1,24 @@
+50c50,70
+< from .gemm import SF_BLOCK, _e2m1_code
+---
+> from .gemm import SF_BLOCK
+> 
+> # own-marks shim (candidate-49): the candidate image gemm.py no longer exports
+> # _e2m1_code (#991 replaced it), so the 1107 baseline carries 1107 gemm.py's
+> # definition verbatim. It is used only by the 1107 quantizer kernels.
+> def _e2m1_code(x):
+>     """Nearest-even E2M1 code of FP32 ``x``, saturating at 6 (``cvt.rn.satfinite``)."""
+>     m = T.abs(x)
+>     # Ties go to the even code: strict at even-lower midpoints, inclusive at odd.
+>     code = (
+>         T.cast(m > 0.25, T.int32)
+>         + T.cast(m >= 0.75, T.int32)
+>         + T.cast(m > 1.25, T.int32)
+>         + T.cast(m >= 1.75, T.int32)
+>         + T.cast(m > 2.5, T.int32)
+>         + T.cast(m >= 3.5, T.int32)
+>         + T.cast(m > 5.0, T.int32)
+>     )
+>     sign = T.cast(T.shift_right(T.reinterpret(x, T.uint32), 31), T.int32)
+>     return code | (sign << 3)
+> 
