@@ -1,0 +1,225 @@
+============================= test session starts ==============================
+platform linux -- Python 3.12.3, pytest-9.1.1, pluggy-1.6.0
+rootdir: /opt/spark-ds41f/candidate/vllm
+configfile: pyproject.toml
+plugins: anyio-4.15.1
+collected 89 items
+
+tests/kernels/moe/test_deepseek_v41_tilelang_router.py ................. [ 19%]
+..................................................................FFFF.. [100%]
+
+=================================== FAILURES ===================================
+___________ test_gate_router_route_local_under_inference_mode[3-205] ___________
+
+plain_scratch = None
+monkeypatch = <_pytest.monkeypatch.MonkeyPatch object at 0xef15b285d5e0>
+world_size = 3, num_tokens = 205
+
+    @pytest.mark.parametrize(
+        "world_size,num_tokens", [(3, 205), (3, 800), (3, 1024), (4, 1024)]
+    )
+    def test_gate_router_route_local_under_inference_mode(
+        plain_scratch, monkeypatch, world_size, num_tokens
+    ):
+        """The worker runs every forward, its startup memory profile included, under
+        torch.inference_mode, where the step's padding mask and ids, and the masks
+        routing computes from them, are inference tensors: they track no version
+        counter. SP local routing keeps its local masks there too, on every rank, on
+        the partials path (local_rows <= 256) and the full-gate path, and routes the
+        bits it routes outside inference mode."""
+        from vllm.models.deepseek_v4_1 import sp_prefill
+    
+        router, generator = _sp_gate_router(num_tokens)
+        x = torch.randn(num_tokens, 5120, device="cuda", generator=generator).to(
+            torch.bfloat16
+        )
+        input_ids = torch.randint(
+            0, 1000, (num_tokens,), device="cuda", generator=generator
+        )
+        input_ids[1::4] = LO
+    
+        def forward(layout, layers):
+            context = _new_forward(monkeypatch)
+            context.is_padding = torch.zeros(num_tokens, dtype=torch.bool, device="cuda")
+            context.is_padding[num_tokens - 4 :] = True
+            ids = input_ids.clone()
+            local_x = layout.local_slice(x)
+            routes = [
+                router.route_local(local_x, layout, input_ids=ids) for _ in range(layers)
+            ]
+            return context, routes
+    
+        for rank in range(world_size):
+            layout = sp_prefill.SPRows(num_tokens, world_size, rank)
+            with torch.no_grad():
+                _, ((expected_weights, expected_ids),) = forward(layout, 1)
+            with torch.inference_mode():
+                context, routes = forward(layout, 3)
+            assert context.is_padding.is_inference()
+>           assert context._ds41_local_masks
+                   ^^^^^^^^^^^^^^^^^^^^^^^^^
+E           AttributeError: 'Context' object has no attribute '_ds41_local_masks'
+
+tests/kernels/moe/test_deepseek_v41_tilelang_router.py:717: AttributeError
+___________ test_gate_router_route_local_under_inference_mode[3-800] ___________
+
+plain_scratch = None
+monkeypatch = <_pytest.monkeypatch.MonkeyPatch object at 0xef15b285c3e0>
+world_size = 3, num_tokens = 800
+
+    @pytest.mark.parametrize(
+        "world_size,num_tokens", [(3, 205), (3, 800), (3, 1024), (4, 1024)]
+    )
+    def test_gate_router_route_local_under_inference_mode(
+        plain_scratch, monkeypatch, world_size, num_tokens
+    ):
+        """The worker runs every forward, its startup memory profile included, under
+        torch.inference_mode, where the step's padding mask and ids, and the masks
+        routing computes from them, are inference tensors: they track no version
+        counter. SP local routing keeps its local masks there too, on every rank, on
+        the partials path (local_rows <= 256) and the full-gate path, and routes the
+        bits it routes outside inference mode."""
+        from vllm.models.deepseek_v4_1 import sp_prefill
+    
+        router, generator = _sp_gate_router(num_tokens)
+        x = torch.randn(num_tokens, 5120, device="cuda", generator=generator).to(
+            torch.bfloat16
+        )
+        input_ids = torch.randint(
+            0, 1000, (num_tokens,), device="cuda", generator=generator
+        )
+        input_ids[1::4] = LO
+    
+        def forward(layout, layers):
+            context = _new_forward(monkeypatch)
+            context.is_padding = torch.zeros(num_tokens, dtype=torch.bool, device="cuda")
+            context.is_padding[num_tokens - 4 :] = True
+            ids = input_ids.clone()
+            local_x = layout.local_slice(x)
+            routes = [
+                router.route_local(local_x, layout, input_ids=ids) for _ in range(layers)
+            ]
+            return context, routes
+    
+        for rank in range(world_size):
+            layout = sp_prefill.SPRows(num_tokens, world_size, rank)
+            with torch.no_grad():
+                _, ((expected_weights, expected_ids),) = forward(layout, 1)
+            with torch.inference_mode():
+                context, routes = forward(layout, 3)
+            assert context.is_padding.is_inference()
+>           assert context._ds41_local_masks
+                   ^^^^^^^^^^^^^^^^^^^^^^^^^
+E           AttributeError: 'Context' object has no attribute '_ds41_local_masks'
+
+tests/kernels/moe/test_deepseek_v41_tilelang_router.py:717: AttributeError
+__________ test_gate_router_route_local_under_inference_mode[3-1024] ___________
+
+plain_scratch = None
+monkeypatch = <_pytest.monkeypatch.MonkeyPatch object at 0xef15b285e390>
+world_size = 3, num_tokens = 1024
+
+    @pytest.mark.parametrize(
+        "world_size,num_tokens", [(3, 205), (3, 800), (3, 1024), (4, 1024)]
+    )
+    def test_gate_router_route_local_under_inference_mode(
+        plain_scratch, monkeypatch, world_size, num_tokens
+    ):
+        """The worker runs every forward, its startup memory profile included, under
+        torch.inference_mode, where the step's padding mask and ids, and the masks
+        routing computes from them, are inference tensors: they track no version
+        counter. SP local routing keeps its local masks there too, on every rank, on
+        the partials path (local_rows <= 256) and the full-gate path, and routes the
+        bits it routes outside inference mode."""
+        from vllm.models.deepseek_v4_1 import sp_prefill
+    
+        router, generator = _sp_gate_router(num_tokens)
+        x = torch.randn(num_tokens, 5120, device="cuda", generator=generator).to(
+            torch.bfloat16
+        )
+        input_ids = torch.randint(
+            0, 1000, (num_tokens,), device="cuda", generator=generator
+        )
+        input_ids[1::4] = LO
+    
+        def forward(layout, layers):
+            context = _new_forward(monkeypatch)
+            context.is_padding = torch.zeros(num_tokens, dtype=torch.bool, device="cuda")
+            context.is_padding[num_tokens - 4 :] = True
+            ids = input_ids.clone()
+            local_x = layout.local_slice(x)
+            routes = [
+                router.route_local(local_x, layout, input_ids=ids) for _ in range(layers)
+            ]
+            return context, routes
+    
+        for rank in range(world_size):
+            layout = sp_prefill.SPRows(num_tokens, world_size, rank)
+            with torch.no_grad():
+                _, ((expected_weights, expected_ids),) = forward(layout, 1)
+            with torch.inference_mode():
+                context, routes = forward(layout, 3)
+            assert context.is_padding.is_inference()
+>           assert context._ds41_local_masks
+                   ^^^^^^^^^^^^^^^^^^^^^^^^^
+E           AttributeError: 'Context' object has no attribute '_ds41_local_masks'
+
+tests/kernels/moe/test_deepseek_v41_tilelang_router.py:717: AttributeError
+__________ test_gate_router_route_local_under_inference_mode[4-1024] ___________
+
+plain_scratch = None
+monkeypatch = <_pytest.monkeypatch.MonkeyPatch object at 0xef15b285da00>
+world_size = 4, num_tokens = 1024
+
+    @pytest.mark.parametrize(
+        "world_size,num_tokens", [(3, 205), (3, 800), (3, 1024), (4, 1024)]
+    )
+    def test_gate_router_route_local_under_inference_mode(
+        plain_scratch, monkeypatch, world_size, num_tokens
+    ):
+        """The worker runs every forward, its startup memory profile included, under
+        torch.inference_mode, where the step's padding mask and ids, and the masks
+        routing computes from them, are inference tensors: they track no version
+        counter. SP local routing keeps its local masks there too, on every rank, on
+        the partials path (local_rows <= 256) and the full-gate path, and routes the
+        bits it routes outside inference mode."""
+        from vllm.models.deepseek_v4_1 import sp_prefill
+    
+        router, generator = _sp_gate_router(num_tokens)
+        x = torch.randn(num_tokens, 5120, device="cuda", generator=generator).to(
+            torch.bfloat16
+        )
+        input_ids = torch.randint(
+            0, 1000, (num_tokens,), device="cuda", generator=generator
+        )
+        input_ids[1::4] = LO
+    
+        def forward(layout, layers):
+            context = _new_forward(monkeypatch)
+            context.is_padding = torch.zeros(num_tokens, dtype=torch.bool, device="cuda")
+            context.is_padding[num_tokens - 4 :] = True
+            ids = input_ids.clone()
+            local_x = layout.local_slice(x)
+            routes = [
+                router.route_local(local_x, layout, input_ids=ids) for _ in range(layers)
+            ]
+            return context, routes
+    
+        for rank in range(world_size):
+            layout = sp_prefill.SPRows(num_tokens, world_size, rank)
+            with torch.no_grad():
+                _, ((expected_weights, expected_ids),) = forward(layout, 1)
+            with torch.inference_mode():
+                context, routes = forward(layout, 3)
+            assert context.is_padding.is_inference()
+>           assert context._ds41_local_masks
+                   ^^^^^^^^^^^^^^^^^^^^^^^^^
+E           AttributeError: 'Context' object has no attribute '_ds41_local_masks'
+
+tests/kernels/moe/test_deepseek_v41_tilelang_router.py:717: AttributeError
+=========================== short test summary info ============================
+FAILED tests/kernels/moe/test_deepseek_v41_tilelang_router.py::test_gate_router_route_local_under_inference_mode[3-205]
+FAILED tests/kernels/moe/test_deepseek_v41_tilelang_router.py::test_gate_router_route_local_under_inference_mode[3-800]
+FAILED tests/kernels/moe/test_deepseek_v41_tilelang_router.py::test_gate_router_route_local_under_inference_mode[3-1024]
+FAILED tests/kernels/moe/test_deepseek_v41_tilelang_router.py::test_gate_router_route_local_under_inference_mode[4-1024]
+======================== 4 failed, 85 passed in 40.65s =========================

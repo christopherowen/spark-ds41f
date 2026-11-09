@@ -1,0 +1,110 @@
+From 9a8340efdad3571063720dc422c91f3b79c426b4 Mon Sep 17 00:00:00 2001
+From: Christopher Owen <3221756+christopherowen@users.noreply.github.com>
+Date: Mon, 9 Nov 2026 12:00:00 +0100
+Subject: [PATCH] perf(dsv41): align 64-row Q-B decode tiles with 128x128
+ tile-contiguous weights
+
+Base: 1107 vLLM patch head 2756478b60b90700b9918b457aeb38657da637b5. Replaces
+candidate-47's 0768 (PR #1016 as submitted). It touches only gemm.py and its
+test, which no other patch of the 0762..0769 series changes.
+
+Rationale:
+Q-B (wq_b) at TP4/TP5 (8192 x 1280) and TP3 (12288 x 1280) keeps its FP8 weight
+in 128x128 tile-contiguous slabs (pack_weight_tiles, 16 KiB per tile). 1107's
+64-row decode tiles for both shapes use block_N = 64, so two CTAs share each
+slab, each reading an 8 KiB half per K step. The grid doubles to 128 / 192 CTAs
+on 48 SMs, and every CTA repeats the A and SFA loads. With block_N = 128,
+block_K = 128 and num_stages = 2 (1107's 12288 tile already uses 2 stages), each
+CTA reads whole slabs, and the 64 / 96 CTAs still cover the 48 SMs.
+
+Only the 64-row Q-B tiles change. The submitted revision also widened the
+32-row Q-B tiles and the 16-row (4096, 1280) tile, dropped threads=64 from the
+64-row (4096, 1280) tile, and registered (16384|6144|2048, 1280). This revision
+keeps 1107's settings for all of those:
+- In the model, the (4096, 1280) decode tiles serve only TP8's Q-B. The indexer
+  Q-B runs decode_rope_mxfp4, which linear.py builds with the kernel defaults
+  (block_M 16, block_N 128, 2 stages, 256 threads). It never reads
+  DECODE_FP8_CONFIGS. On the TP8 Q-B, dropping threads=64 does not speed up the
+  64-row tile (M=48: +0.2 us warm, +1.1 us cold, mean of five processes). The
+  16-row block_N = 128 tile is faster at M <= 6 but slower at M = 12 (+0.4 us
+  warm in every process).
+- The chained bench builds its indexer kernel from the (4096, 1280) tiles. On
+  that kernel, block_N = 128 at 128 threads halves the rows of each serial
+  RoPE/MXFP4 epilogue pass (2 * threads / block_N rows). M = 12 therefore needs
+  six dependent passes instead of three, which is the bench's M = 12 slowdown.
+- The 32-row tiles gained nothing at M = 24 beyond the interval. Single
+  processes put the TP3 pair 4..6 us slower with the weights in L2.
+- The TP2/TP6/TP7 shapes are outside the chained Q-B bench. They need their own
+  change and their own measurement: TP6/TP7's trimmed rank unpacks and repacks
+  Q-B.
+
+Quality:
+block_N and num_stages only change which CTA computes which output columns and
+how the loads are pipelined. Each output accumulates K in the same order, so
+decode outputs are bit-identical (torch.equal) to 1107's tiles, to row-major
+decode and to prefill.
+
+Tests:
+- pytest tests/kernels/quantization/test_deepseek_v41_tilelang_linear.py
+  tests/kernels/quantization/test_deepseek_v41_block_scale_words.py
+  tests/models/test_deepseek_v4_1_attention.py
+  tests/models/test_deepseek_v4_1_l2_schedule.py
+  tests/kernels/test_deepseek_v41_tilelang_pdl.py on candidate-47 with this
+  patch: 187 passed on each of 2 boots (sp4), including
+  test_tile_contiguous_fp8_matches_row_major.
+- Chained Q-B + indexer Q-B (CUDA-graph replay; warm, cold and NEXT L2;
+  M = 1..48). Same-session ABBA on sp4 against candidate-47 without #1016
+  (1107's gemm.py), with 1107's table timed in each process. The M = 1..24
+  kernels are identical to 1107's. At M = 48 with the weights in L2: TP4
+  -3.1 us, TP3 -5.1 us paired (cross-image -2.9 / -7.7 us; with the indexer
+  kernel as the model builds it, -3.0 / -3.9 us). Cold and NEXT are unchanged
+  within the interval. No cell is slower. Outputs are bit-identical across
+  images.
+
+Upstream status: local DeepSeek-V4.1 SM12x TileLang decode tile table; not for
+upstream vLLM.
+---
+ .../quantization/test_deepseek_v41_tilelang_linear.py       | 2 ++
+ vllm/models/deepseek_v4_1/tilelang/gemm.py                  | 6 ++++--
+ 2 files changed, 6 insertions(+), 2 deletions(-)
+
+diff --git a/tests/kernels/quantization/test_deepseek_v41_tilelang_linear.py b/tests/kernels/quantization/test_deepseek_v41_tilelang_linear.py
+index b5c16fb..0944678 100644
+--- a/tests/kernels/quantization/test_deepseek_v41_tilelang_linear.py
++++ b/tests/kernels/quantization/test_deepseek_v41_tilelang_linear.py
+@@ -602,6 +602,8 @@ def test_tile_contiguous_fp8_matches_row_major(default_vllm_config, n, k):
+ 
+     for block_M in DECODE_TILE_ROWS:
+         cfg = fp8_decode_config(n, k, block_M)
++        if block_M == DECODE_ROWS and n >= 8192:
++            assert (cfg["block_N"], cfg["block_K"]) == (128, 128), (n, block_M, cfg)
+         k_ref = mxfp8_gemm_decode(n, k, **cfg, padded_rows=True)
+         k_tiled = mxfp8_gemm_decode(
+             n, k, **cfg, padded_rows=True, tile_contiguous=True
+diff --git a/vllm/models/deepseek_v4_1/tilelang/gemm.py b/vllm/models/deepseek_v4_1/tilelang/gemm.py
+index c2443ad..af0248f 100644
+--- a/vllm/models/deepseek_v4_1/tilelang/gemm.py
++++ b/vllm/models/deepseek_v4_1/tilelang/gemm.py
+@@ -2499,15 +2499,17 @@ TILE_CONTIGUOUS_FP8: set[tuple[int, int]] = {
+ 
+ DECODE_FP8_CONFIGS: dict[tuple[int, ...], dict[int, dict]] = {
+     # Attention: Q-B (TP3, TP4..7, TP8 / indexer Q-B) and fused Q-A/KV.
++    # 64-row Q-B tiles read whole 128-row tile-contiguous slabs (block_N =
++    # TILE_WEIGHT_N); N // 128 >= 64 tiles still cover the 48 SMs.
+     (12288, 1280): {
+         16: dict(block_N=128, block_K=128, num_stages=3),
+         32: dict(block_N=64, block_K=128, num_stages=3),
+-        64: dict(block_N=64, block_K=128, num_stages=2),
++        64: dict(block_N=128, block_K=128, num_stages=2),
+     },
+     (8192, 1280): {
+         16: dict(block_N=128, block_K=128, num_stages=3),
+         32: dict(block_N=64, block_K=128, num_stages=3),
+-        64: dict(block_N=64, block_K=128, num_stages=3),
++        64: dict(block_N=128, block_K=128, num_stages=2),
+     },
+     (4096, 1280): {
+         16: dict(block_N=64, block_K=128, num_stages=3),
+-- 
+2.43.0
+

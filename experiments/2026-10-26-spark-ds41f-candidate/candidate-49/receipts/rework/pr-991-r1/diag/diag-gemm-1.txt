@@ -1,0 +1,267 @@
+2026-11-09 07:42:16  [TileLang:tilelang.language.eager.builder:CRITICAL] (builder.py:1787): Failed to build prim_func from gemm_mxfp8_rope_mxfp4
+args={'A': A, 'B': B, 'SFA': SFA, 'SFB': SFB, 'Positions': Positions, 'CosSin': CosSin, 'Q': Q, 'S': S}
+source=def make_closure(M, N, accum_dtype, block_K, block_M, block_N, block_words, conv, half, head_dim, in_dtype, iters, k_blocks, k_tiles, num_stages, pairs_per_row, rolled, rope_half, rope_start, rows_per_iter, sf_words, threads):
+
+    def gemm_mxfp8_rope_mxfp4(__tb):
+        __tb_fl = '/tmp/diag_variants.py'
+        __tb_fn = 'gemm_mxfp8_rope_mxfp4'
+        __tb.set_fileline(__tb_fl, 174, __tb_fn)
+
+        def gemm_mxfp8_rope_mxfp4(A, B, SFA, SFB, Positions, CosSin, Q, S, **__kwargs):
+            __tb.set_fileline(__tb_fl, 175, __tb_fn)
+            A = __tb.arg('A', A)
+            __tb.set_fileline(__tb_fl, 176, __tb_fn)
+            B = __tb.arg('B', B)
+            __tb.set_fileline(__tb_fl, 177, __tb_fn)
+            SFA = __tb.arg('SFA', SFA)
+            __tb.set_fileline(__tb_fl, 178, __tb_fn)
+            SFB = __tb.arg('SFB', SFB)
+            __tb.set_fileline(__tb_fl, 179, __tb_fn)
+            Positions = __tb.arg('Positions', Positions)
+            __tb.set_fileline(__tb_fl, 180, __tb_fn)
+            CosSin = __tb.arg('CosSin', CosSin)
+            __tb.set_fileline(__tb_fl, 181, __tb_fn)
+            Q = __tb.arg('Q', Q)
+            __tb.set_fileline(__tb_fl, 182, __tb_fn)
+            S = __tb.arg('S', S)
+            __tb.set_fileline(__tb_fl, 184, __tb_fn)
+            if __tb.skip_kernel_ctx():
+                __tb.set_fileline(__tb_fl, 184, __tb_fn)
+                return
+            __tb.set_fileline(__tb_fl, 184, __tb_fn)
+            with __tb.ctx_with(__tb.resolve_call(__tb.rval('T', T).Kernel)(__tb.resolve_call(__tb.rval('T', T).ceildiv)(__tb.rval('N', N), __tb.rval('block_N', block_N)), __tb.resolve_call(__tb.rval('T', T).ceildiv)(__tb.rval('M', M), __tb.rval('block_M', block_M)), threads=__tb.rval('threads', threads))) as (bx, by):
+                __tb.set_fileline(__tb_fl, 188, __tb_fn)
+                __tb.eval(__tb.resolve_call(__tb.rval('T', T).import_source)(__tb.rval('_E2M1_HEADER', _E2M1_HEADER)))
+                __tb.set_fileline(__tb_fl, 189, __tb_fn)
+                __tb.eval(__tb.resolve_call(__tb.rval('pdl', pdl).chain)())
+                __tb.set_fileline(__tb_fl, 190, __tb_fn)
+                tx = __tb.bind('tx', __tb.resolve_call(__tb.rval('T', T).get_thread_binding)())
+                __tb.set_fileline(__tb_fl, 191, __tb_fn)
+                A_shared = __tb.bind('A_shared', __tb.resolve_call(__tb.rval('T', T).alloc_shared)((__tb.rval('block_M', block_M), __tb.rval('block_K', block_K)), __tb.rval('in_dtype', in_dtype)))
+                __tb.set_fileline(__tb_fl, 192, __tb_fn)
+                B_shared = __tb.bind('B_shared', __tb.resolve_call(__tb.rval('T', T).alloc_shared)((__tb.rval('block_N', block_N), __tb.rval('block_K', block_K)), __tb.rval('in_dtype', in_dtype)))
+                __tb.set_fileline(__tb_fl, 193, __tb_fn)
+                SFA_shared = __tb.bind('SFA_shared', __tb.resolve_call(__tb.rval('T', T).alloc_shared)((__tb.rval('block_M', block_M), __tb.rval('block_words', block_words)), __tb.rval('T', T).uint32))
+                __tb.set_fileline(__tb_fl, 194, __tb_fn)
+                SFB_shared = __tb.bind('SFB_shared', __tb.resolve_call(__tb.rval('T', T).alloc_shared)((__tb.rval('block_N', block_N), __tb.rval('block_words', block_words)), __tb.rval('T', T).uint32))
+                __tb.set_fileline(__tb_fl, 195, __tb_fn)
+                C_shared = __tb.bind('C_shared', __tb.resolve_call(__tb.rval('T', T).alloc_shared)((__tb.rval('block_M', block_M), __tb.rval('block_N', block_N)), __tb.rval('T', T).bfloat16))
+                __tb.set_fileline(__tb_fl, 196, __tb_fn)
+                C_local = __tb.bind('C_local', __tb.resolve_call(__tb.rval('T', T).alloc_fragment)((__tb.rval('block_M', block_M), __tb.rval('block_N', block_N)), __tb.rval('accum_dtype', accum_dtype)))
+                __tb.set_fileline(__tb_fl, 197, __tb_fn)
+                __tb.eval(__tb.resolve_call(__tb.rval('T', T).clear)(__tb.rval('C_local', C_local)))
+                __tb.set_fileline(__tb_fl, 198, __tb_fn)
+                for __9 in __tb.ctx_for(__tb.iter_call(__tb.resolve_call(__tb.rval('T', T).Pipelined), __tb.rval('k_blocks', k_blocks), num_stages=__tb.rval('num_stages', num_stages))):
+                    __tb.set_fileline(__tb_fl, 198, __tb_fn)
+                    ko = __tb.bind('ko', __9, loop_target=True)
+                    __tb.set_fileline(__tb_fl, 199, __tb_fn)
+                    for __0 in __tb.ctx_for(__tb.iter_call(__tb.resolve_call(__tb.rval('T', T).Parallel), __tb.rval('block_M', block_M), __tb.rval('block_K', block_K))):
+                        __tb.set_fileline(__tb_fl, 199, __tb_fn)
+                        __1, __2 = __tb.unwrap_value(__0)
+                        __tb.set_fileline(__tb_fl, 199, __tb_fn)
+                        __1, __2 = (__tb.bind('_', __1), __tb.bind('_', __2))
+                        __tb.set_fileline(__tb_fl, 199, __tb_fn)
+                        i, kk = (__tb.bind('i', __1, loop_target=True), __tb.bind('kk', __2, loop_target=True))
+                        __tb.set_fileline(__tb_fl, 200, __tb_fn)
+                        __tb.assign_slice(__tb.rval('A_shared', A_shared), (__tb.rval('i', i), __tb.rval('kk', kk)), __tb.rval('A', A)[__tb.resolve_call(__tb.rval('T', T).min)(__tb.rval('by', by) * __tb.rval('block_M', block_M) + __tb.rval('i', i), __tb.rval('M', M) - 1), __tb.rval('ko', ko) * __tb.rval('block_K', block_K) + __tb.rval('kk', kk)])
+                    __tb.set_fileline(__tb_fl, 201, __tb_fn)
+                    row0 = __tb.bind('row0', (__tb.rval('bx', bx) * __tb.rval('block_N', block_N) // __tb.rval('TILE_WEIGHT_N', TILE_WEIGHT_N) * __tb.rval('k_tiles', k_tiles) + __tb.rval('ko', ko)) * __tb.rval('TILE_WEIGHT_N', TILE_WEIGHT_N) + __tb.rval('bx', bx) * __tb.rval('block_N', block_N) % __tb.rval('TILE_WEIGHT_N', TILE_WEIGHT_N))
+                    __tb.set_fileline(__tb_fl, 204, __tb_fn)
+                    __tb.eval(__tb.resolve_call(__tb.rval('T', T).copy)(__tb.rval('B', B)[__tb.rval('row0', row0), 0], __tb.rval('B_shared', B_shared)))
+                    __tb.set_fileline(__tb_fl, 205, __tb_fn)
+                    word0 = __tb.bind('word0', __tb.rval('ko', ko) * __tb.rval('block_K', block_K) // __tb.rval('SF_WORD_K', SF_WORD_K))
+                    __tb.set_fileline(__tb_fl, 206, __tb_fn)
+                    for __3 in __tb.ctx_for(__tb.iter_call(__tb.resolve_call(__tb.rval('T', T).Parallel), __tb.rval('block_M', block_M), __tb.rval('block_words', block_words))):
+                        __tb.set_fileline(__tb_fl, 206, __tb_fn)
+                        __4, __5 = __tb.unwrap_value(__3)
+                        __tb.set_fileline(__tb_fl, 206, __tb_fn)
+                        __4, __5 = (__tb.bind('_', __4), __tb.bind('_', __5))
+                        __tb.set_fileline(__tb_fl, 206, __tb_fn)
+                        i, w = (__tb.bind('i', __4, loop_target=True), __tb.bind('w', __5, loop_target=True))
+                        __tb.set_fileline(__tb_fl, 207, __tb_fn)
+                        __tb.assign_slice(__tb.rval('SFA_shared', SFA_shared), (__tb.rval('i', i), __tb.rval('w', w)), __tb.rval('SFA', SFA)[__tb.resolve_call(__tb.rval('T', T).min)(__tb.rval('by', by) * __tb.rval('block_M', block_M) + __tb.rval('i', i), __tb.rval('M', M) - 1), __tb.resolve_call(__tb.rval('T', T).min)(__tb.rval('word0', word0) + __tb.rval('w', w), __tb.rval('sf_words', sf_words) - 1)])
+                    __tb.set_fileline(__tb_fl, 210, __tb_fn)
+                    for __6 in __tb.ctx_for(__tb.iter_call(__tb.resolve_call(__tb.rval('T', T).Parallel), __tb.rval('block_N', block_N), __tb.rval('block_words', block_words))):
+                        __tb.set_fileline(__tb_fl, 210, __tb_fn)
+                        __7, __8 = __tb.unwrap_value(__6)
+                        __tb.set_fileline(__tb_fl, 210, __tb_fn)
+                        __7, __8 = (__tb.bind('_', __7), __tb.bind('_', __8))
+                        __tb.set_fileline(__tb_fl, 210, __tb_fn)
+                        j, w = (__tb.bind('j', __7, loop_target=True), __tb.bind('w', __8, loop_target=True))
+                        __tb.set_fileline(__tb_fl, 211, __tb_fn)
+                        row = __tb.bind('row', __tb.resolve_call(__tb.rval('T', T).min)(__tb.rval('bx', bx) * __tb.rval('block_N', block_N) + __tb.rval('j', j), __tb.rval('N', N) - 1))
+                        __tb.set_fileline(__tb_fl, 212, __tb_fn)
+                        __tb.assign_slice(__tb.rval('SFB_shared', SFB_shared), (__tb.rval('j', j), __tb.rval('w', w)), __tb.rval('SFB', SFB)[__tb.rval('row', row) // 32, __tb.resolve_call(__tb.rval('T', T).min)(__tb.rval('word0', word0) + __tb.rval('w', w), __tb.rval('sf_words', sf_words) - 1)])
+                    __tb.set_fileline(__tb_fl, 213, __tb_fn)
+                    __tb.eval(__tb.resolve_call(__tb.rval('T', T).mma_gemm_blockscaled)(__tb.rval('A_shared', A_shared), __tb.rval('B_shared', B_shared), __tb.rval('C_local', C_local), __tb.rval('SFA_shared', SFA_shared), __tb.rval('SFB_shared', SFB_shared), transpose_B=True, k_start=__tb.rval('ko', ko) * __tb.rval('block_K', block_K) % __tb.rval('SF_WORD_K', SF_WORD_K), sf_a_granularity_k=__tb.rval('SF_BLOCK', SF_BLOCK), sf_b_granularity_k=__tb.rval('SF_BLOCK', SF_BLOCK)))
+                __tb.set_fileline(__tb_fl, 225, __tb_fn)
+                __tb.eval(__tb.resolve_call(__tb.rval('T', T).sync_threads)())
+                __tb.set_fileline(__tb_fl, 226, __tb_fn)
+                __tb.eval(__tb.resolve_call(__tb.rval('T', T).copy)(__tb.rval('C_local', C_local), __tb.rval('C_shared', C_shared)))
+                __tb.set_fileline(__tb_fl, 227, __tb_fn)
+                col_pair = __tb.bind('col_pair', __tb.rval('tx', tx) % __tb.rval('pairs_per_row', pairs_per_row))
+                __tb.set_fileline(__tb_fl, 228, __tb_fn)
+                row_in_iter = __tb.bind('row_in_iter', __tb.rval('tx', tx) // __tb.rval('pairs_per_row', pairs_per_row))
+                __tb.set_fileline(__tb_fl, 229, __tb_fn)
+                g = __tb.bind('g', __tb.rval('col_pair', col_pair) // __tb.rval('half', half))
+                __tb.set_fileline(__tb_fl, 230, __tb_fn)
+                p = __tb.bind('p', __tb.rval('tx', tx) % __tb.rval('half', half))
+                __tb.set_fileline(__tb_fl, 231, __tb_fn)
+                col0 = __tb.bind('col0', __tb.rval('bx', bx) * __tb.rval('block_N', block_N) + __tb.rval('g', g) * __tb.rval('SF_BLOCK', SF_BLOCK))
+                __tb.set_fileline(__tb_fl, 232, __tb_fn)
+                in_head = __tb.bind('in_head', __tb.rval('col0', col0) % __tb.rval('head_dim', head_dim))
+                __tb.set_fileline(__tb_fl, 233, __tb_fn)
+                c0 = __tb.bind('c0', 2 * __tb.rval('col_pair', col_pair))
+                __tb.set_fileline(__tb_fl, 235, __tb_fn)
+                v0 = __tb.bind('v0', __tb.resolve_call(__tb.rval('T', T).alloc_var)(__tb.rval('T', T).float32))
+                __tb.set_fileline(__tb_fl, 236, __tb_fn)
+                v1 = __tb.bind('v1', __tb.resolve_call(__tb.rval('T', T).alloc_var)(__tb.rval('T', T).float32))
+                __tb.set_fileline(__tb_fl, 237, __tb_fn)
+                pos = __tb.bind('pos', __tb.resolve_call(__tb.rval('T', T).alloc_var)(__tb.rval('T', T).int64))
+                __tb.set_fileline(__tb_fl, 238, __tb_fn)
+                cosine = __tb.bind('cosine', __tb.resolve_call(__tb.rval('T', T).alloc_var)(__tb.rval('T', T).float32))
+                __tb.set_fileline(__tb_fl, 239, __tb_fn)
+                sine = __tb.bind('sine', __tb.resolve_call(__tb.rval('T', T).alloc_var)(__tb.rval('T', T).float32))
+                __tb.set_fileline(__tb_fl, 240, __tb_fn)
+                amax = __tb.bind('amax', __tb.resolve_call(__tb.rval('T', T).alloc_var)(__tb.rval('T', T).float32))
+                __tb.set_fileline(__tb_fl, 241, __tb_fn)
+                bits = __tb.bind('bits', __tb.resolve_call(__tb.rval('T', T).alloc_var)(__tb.rval('T', T).uint32))
+                __tb.set_fileline(__tb_fl, 242, __tb_fn)
+                sf = __tb.bind('sf', __tb.resolve_call(__tb.rval('T', T).alloc_var)(__tb.rval('T', T).int32))
+                __tb.set_fileline(__tb_fl, 243, __tb_fn)
+                scale = __tb.bind('scale', __tb.resolve_call(__tb.rval('T', T).alloc_var)(__tb.rval('T', T).float32))
+                __tb.set_fileline(__tb_fl, 244, __tb_fn)
+                sv0 = __tb.bind('sv0', __tb.resolve_call(__tb.rval('T', T).alloc_var)(__tb.rval('T', T).float32))
+                __tb.set_fileline(__tb_fl, 245, __tb_fn)
+                sv1 = __tb.bind('sv1', __tb.resolve_call(__tb.rval('T', T).alloc_var)(__tb.rval('T', T).float32))
+                __tb.set_fileline(__tb_fl, 246, __tb_fn)
+                c_lo = __tb.bind('c_lo', __tb.resolve_call(__tb.rval('T', T).alloc_var)(__tb.rval('T', T).int32))
+                __tb.set_fileline(__tb_fl, 247, __tb_fn)
+                c_hi = __tb.bind('c_hi', __tb.resolve_call(__tb.rval('T', T).alloc_var)(__tb.rval('T', T).int32))
+                __tb.set_fileline(__tb_fl, 249, __tb_fn)
+                loop = __tb.bind('loop', __tb.ifexp(__tb.rval('rolled', rolled), lambda: __tb.resolve_call(__tb.rval('T', T).unroll)(__tb.rval('iters', iters), explicit=False, annotations={'pragma_unroll_factor': 1}), lambda: __tb.resolve_call(__tb.rval('T', T).serial)(__tb.rval('iters', iters))))
+                __tb.set_fileline(__tb_fl, 254, __tb_fn)
+                for __14 in __tb.ctx_for(__tb.iter_call(__tb.rval, 'loop', loop)):
+                    __tb.set_fileline(__tb_fl, 254, __tb_fn)
+                    it = __tb.bind('it', __14, loop_target=True)
+                    __tb.set_fileline(__tb_fl, 255, __tb_fn)
+                    row_local = __tb.bind('row_local', __tb.rval('it', it) * __tb.rval('rows_per_iter', rows_per_iter) + __tb.rval('row_in_iter', row_in_iter))
+                    __tb.set_fileline(__tb_fl, 256, __tb_fn)
+                    m = __tb.bind('m', __tb.rval('by', by) * __tb.rval('block_M', block_M) + __tb.rval('row_local', row_local))
+                    __tb.set_fileline(__tb_fl, 257, __tb_fn)
+                    for __13 in __tb.ctx_if(__tb.rval('m', m) < __tb.rval('M', M)):
+                        __tb.set_fileline(__tb_fl, 257, __tb_fn)
+                        for _ in __tb.ctx_then(__13):
+                            __tb.set_fileline(__tb_fl, 258, __tb_fn)
+                            v0 = __tb.bind('v0', __tb.resolve_call(__tb.rval('T', T).cast)(__tb.rval('C_shared', C_shared)[__tb.rval('row_local', row_local), __tb.rval('c0', c0)], __tb.rval('T', T).float32))
+                            __tb.set_fileline(__tb_fl, 259, __tb_fn)
+                            v1 = __tb.bind('v1', __tb.resolve_call(__tb.rval('T', T).cast)(__tb.rval('C_shared', C_shared)[__tb.rval('row_local', row_local), __tb.rval('c0', c0) + 1], __tb.rval('T', T).float32))
+                            __tb.set_fileline(__tb_fl, 260, __tb_fn)
+                            for __10 in __tb.ctx_if(__tb.rval('in_head', in_head) >= __tb.rval('rope_start', rope_start)):
+                                __tb.set_fileline(__tb_fl, 260, __tb_fn)
+                                for _ in __tb.ctx_then(__10):
+                                    __tb.set_fileline(__tb_fl, 261, __tb_fn)
+                                    pos = __tb.bind('pos', __tb.rval('Positions', Positions)[__tb.rval('m', m)])
+                                    __tb.set_fileline(__tb_fl, 262, __tb_fn)
+                                    pair_base = __tb.bind('pair_base', (__tb.rval('in_head', in_head) - __tb.rval('rope_start', rope_start)) // 2)
+                                    __tb.set_fileline(__tb_fl, 263, __tb_fn)
+                                    cosine = __tb.bind('cosine', __tb.rval('CosSin', CosSin)[__tb.rval('pos', pos), __tb.rval('pair_base', pair_base) + __tb.rval('p', p)])
+                                    __tb.set_fileline(__tb_fl, 264, __tb_fn)
+                                    sine = __tb.bind('sine', __tb.rval('CosSin', CosSin)[__tb.rval('pos', pos), __tb.rval('rope_half', rope_half) + __tb.rval('pair_base', pair_base) + __tb.rval('p', p)])
+                                    __tb.set_fileline(__tb_fl, 265, __tb_fn)
+                                    r0 = __tb.bind('r0', __tb.resolve_call(__tb.rval('T', T).cast)(__tb.resolve_call(__tb.rval('T', T).ieee_fmaf)(__tb.rval('v0', v0), __tb.rval('cosine', cosine), -(__tb.rval('v1', v1) * __tb.rval('sine', sine))), __tb.rval('T', T).bfloat16))
+                                    __tb.set_fileline(__tb_fl, 266, __tb_fn)
+                                    r1 = __tb.bind('r1', __tb.resolve_call(__tb.rval('T', T).cast)(__tb.resolve_call(__tb.rval('T', T).ieee_fmaf)(__tb.rval('v0', v0), __tb.rval('sine', sine), __tb.rval('v1', v1) * __tb.rval('cosine', cosine)), __tb.rval('T', T).bfloat16))
+                                    __tb.set_fileline(__tb_fl, 267, __tb_fn)
+                                    v0 = __tb.bind('v0', __tb.resolve_call(__tb.rval('T', T).cast)(__tb.rval('r0', r0), __tb.rval('T', T).float32))
+                                    __tb.set_fileline(__tb_fl, 268, __tb_fn)
+                                    v1 = __tb.bind('v1', __tb.resolve_call(__tb.rval('T', T).cast)(__tb.rval('r1', r1), __tb.rval('T', T).float32))
+                            __tb.set_fileline(__tb_fl, 269, __tb_fn)
+                            amax = __tb.bind('amax', __tb.resolve_call(__tb.rval('T', T).max)(__tb.resolve_call(__tb.rval('T', T).float32)(6.0 * 2.0 ** (-126)), __tb.resolve_call(__tb.rval('T', T).max)(__tb.resolve_call(__tb.rval('T', T).abs)(__tb.rval('v0', v0)), __tb.resolve_call(__tb.rval('T', T).abs)(__tb.rval('v1', v1)))))
+                            __tb.set_fileline(__tb_fl, 270, __tb_fn)
+                            amax = __tb.bind('amax', __tb.resolve_call(__tb.rval('T', T).max)(__tb.rval('amax', amax), __tb.resolve_call(__tb.rval('T', T).shfl_xor)(__tb.rval('amax', amax), 8)))
+                            __tb.set_fileline(__tb_fl, 271, __tb_fn)
+                            amax = __tb.bind('amax', __tb.resolve_call(__tb.rval('T', T).max)(__tb.rval('amax', amax), __tb.resolve_call(__tb.rval('T', T).shfl_xor)(__tb.rval('amax', amax), 4)))
+                            __tb.set_fileline(__tb_fl, 272, __tb_fn)
+                            amax = __tb.bind('amax', __tb.resolve_call(__tb.rval('T', T).max)(__tb.rval('amax', amax), __tb.resolve_call(__tb.rval('T', T).shfl_xor)(__tb.rval('amax', amax), 2)))
+                            __tb.set_fileline(__tb_fl, 273, __tb_fn)
+                            amax = __tb.bind('amax', __tb.resolve_call(__tb.rval('T', T).max)(__tb.rval('amax', amax), __tb.resolve_call(__tb.rval('T', T).shfl_xor)(__tb.rval('amax', amax), 1)))
+                            __tb.set_fileline(__tb_fl, 274, __tb_fn)
+                            bits = __tb.bind('bits', __tb.resolve_call(__tb.rval('T', T).reinterpret)(__tb.resolve_call(__tb.rval('T', T).fmul)(__tb.rval('amax', amax), __tb.resolve_call(__tb.rval('T', T).float32)(1.0 / 6.0)), __tb.rval('T', T).uint32))
+                            __tb.set_fileline(__tb_fl, 275, __tb_fn)
+                            sf = __tb.bind('sf', __tb.resolve_call(__tb.rval('T', T).cast)(__tb.resolve_call(__tb.rval('T', T).shift_right)(__tb.rval('bits', bits), 23) & 255, __tb.rval('T', T).int32) + __tb.resolve_call(__tb.rval('T', T).cast)(__tb.rval('bits', bits) & 8388607 != 0, __tb.rval('T', T).int32))
+                            __tb.set_fileline(__tb_fl, 278, __tb_fn)
+                            scale = __tb.bind('scale', __tb.resolve_call(__tb.rval('T', T).reinterpret)(__tb.resolve_call(__tb.rval('T', T).cast)(__tb.resolve_call(__tb.rval('T', T).shift_left)(254 - __tb.rval('sf', sf), 23), __tb.rval('T', T).uint32), __tb.rval('T', T).float32))
+                            __tb.set_fileline(__tb_fl, 281, __tb_fn)
+                            sv0 = __tb.bind('sv0', __tb.resolve_call(__tb.rval('T', T).fmul)(__tb.rval('v0', v0), __tb.rval('scale', scale)))
+                            __tb.set_fileline(__tb_fl, 282, __tb_fn)
+                            sv1 = __tb.bind('sv1', __tb.resolve_call(__tb.rval('T', T).fmul)(__tb.rval('v1', v1), __tb.rval('scale', scale)))
+                            __tb.set_fileline(__tb_fl, 283, __tb_fn)
+                            for __11 in __tb.ctx_if(__tb.rval('conv', conv) == 'sw'):
+                                __tb.set_fileline(__tb_fl, 283, __tb_fn)
+                                for _ in __tb.ctx_then(__11):
+                                    __tb.set_fileline(__tb_fl, 284, __tb_fn)
+                                    c_lo = __tb.bind('c_lo', __tb.resolve_call(__tb.rval('bench', bench)._sw_e2m1_code)(__tb.rval('sv0', sv0)))
+                                    __tb.set_fileline(__tb_fl, 285, __tb_fn)
+                                    c_hi = __tb.bind('c_hi', __tb.resolve_call(__tb.rval('bench', bench)._sw_e2m1_code)(__tb.rval('sv1', sv1)))
+                                    __tb.set_fileline(__tb_fl, 286, __tb_fn)
+                                    __tb.assign_slice(__tb.rval('Q', Q), (__tb.rval('m', m), __tb.rval('col0', col0) // 2 + __tb.rval('p', p)), __tb.resolve_call(__tb.rval('T', T).cast)(__tb.rval('c_lo', c_lo) | __tb.rval('c_hi', c_hi) << 4, __tb.rval('T', T).uint8))
+                                __tb.set_fileline(__tb_fl, 283, __tb_fn)
+                                for _ in __tb.ctx_else(__11):
+                                    __tb.set_fileline(__tb_fl, 288, __tb_fn)
+                                    __tb.assign_slice(__tb.rval('Q', Q), (__tb.rval('m', m), __tb.rval('col0', col0) // 2 + __tb.rval('p', p)), __tb.resolve_call(__tb.rval('_e2m1x2', _e2m1x2))(__tb.rval('sv0', sv0), __tb.rval('sv1', sv1)))
+                            __tb.set_fileline(__tb_fl, 289, __tb_fn)
+                            for __12 in __tb.ctx_if(__tb.rval('p', p) == 0):
+                                __tb.set_fileline(__tb_fl, 289, __tb_fn)
+                                for _ in __tb.ctx_then(__12):
+                                    __tb.set_fileline(__tb_fl, 290, __tb_fn)
+                                    __tb.assign_slice(__tb.rval('S', S), (__tb.rval('m', m), __tb.rval('col0', col0) // __tb.rval('SF_BLOCK', SF_BLOCK)), __tb.resolve_call(__tb.rval('T', T).cast)(__tb.rval('sf', sf), __tb.rval('T', T).uint8))
+        return gemm_mxfp8_rope_mxfp4
+    return gemm_mxfp8_rope_mxfp4
+Traceback (most recent call last):
+  File "/tmp/diag_variants.py", line 473, in <module>
+    main()
+  File "/tmp/diag_variants.py", line 467, in main
+    run_gemm(args, out)
+  File "/tmp/diag_variants.py", line 426, in run_gemm
+    kern[(m, bm)] = make(m, bm)
+                    ^^^^^^^^^^^
+  File "/tmp/diag_variants.py", line 421, in make
+    return gemm_variant(n, k, conv, rolled, hd, rd, block_M=bm)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/usr/local/lib/python3.12/dist-packages/tilelang/jit/__init__.py", line 628, in __call__
+    kernel = self.compile(*args, **kwargs)
+             ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/usr/local/lib/python3.12/dist-packages/tilelang/jit/__init__.py", line 523, in compile
+    prim_func = self.get_tir(*args, **kwargs)
+                ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/usr/local/lib/python3.12/dist-packages/tilelang/jit/__init__.py", line 431, in get_tir
+    tir = self.func(*args, **kwargs)
+          ^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/usr/local/lib/python3.12/dist-packages/tilelang/language/eager/builder.py", line 1709, in __call__
+    return self.get_tir(*args, **kwargs)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/usr/local/lib/python3.12/dist-packages/tilelang/language/eager/builder.py", line 1698, in get_tir
+    template = self._build_tir_template(*args, **kwargs)
+               ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/usr/local/lib/python3.12/dist-packages/tilelang/language/eager/builder.py", line 1665, in _build_tir_template
+    return TirTemplate.from_lazy_style(self.orig_func.__name__, self.orig_func(*args, **kwargs))
+                                                                ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/tmp/diag_variants.py", line 173, in gemm_variant
+    @T.prim_func
+     ^^^^^^^^^^^
+  File "/usr/local/lib/python3.12/dist-packages/tilelang/language/eager/builder.py", line 1790, in prim_func
+    return impl(func) if func is not None else impl
+           ^^^^^^^^^^
+  File "/usr/local/lib/python3.12/dist-packages/tilelang/language/eager/builder.py", line 1788, in impl
+    raise e
+  File "/usr/local/lib/python3.12/dist-packages/tilelang/language/eager/builder.py", line 1781, in impl
+    ir_gen.gen(builder)(**annot)
+  File "/tmp/diag_variants.py", line 254, in gemm_mxfp8_rope_mxfp4
+    for it in loop:
+
+  File "/usr/local/lib/python3.12/dist-packages/tilelang/language/eager/builder.py", line 510, in ctx_for
+    self.python_iterable(it, "Invalid for loop")
+  File "/usr/local/lib/python3.12/dist-packages/tilelang/language/eager/builder.py", line 971, in python_iterable
+    raise TypeError(
+TypeError: Invalid for loop: a TIR expression or buffer is not iterable (got Var). Use range(n) or T.serial(n) in a for statement to loop over a runtime extent, or iterate over a Python container such as [expr] or buffer.shape.

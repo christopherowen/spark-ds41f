@@ -1,0 +1,2345 @@
+{
+ "pr": 991,
+ "round": "rework r1",
+ "verdict": "corrected-misses-mark",
+ "verdict_scope": "the mark's own instrument: the PR bench, unchanged, eager launches, new r1 boots against the 1107 arm of the candidate-49 own-mark receipts (two boots), as instructed. By kernel time (CUPTI) and by CUDA-graph replay of the same 45 cases, no cell is slower and every cell is faster beyond its two-boot interval.",
+ "reason": "The defensible correction is in the GEMM epilogue: the PR forced its row loop rolled (#pragma unroll 1), which left the decode GEMM at M=1..4 with no gain (kernel time PR 5.120 us vs 1107 5.120-5.184 us); r1 keeps 1107's T.serial loop, which nvcc unrolls, and the decode GEMM is 3.7-5.1% faster at every M (CUPTI kernel time; 3.7-4.8% in graph replay), and the M=1 cell is now a gain beyond the interval in the bench. The paged-key 'slowdowns' at M=2/4/6/2048 were never kernel slowdowns (kernel time 30-57% lower at every M); those eager cells sit on the host launch path (~3.9 us/launch against 1.2-2.6 us of kernel), and with r1 they read as gains or within. The mark is still missed: GEMM M=6 and M=8 measure slower beyond the interval in all three r1 bench boots (6.36-6.52 us vs 1107's 6.198/5.833 and 6.116/5.874). There the faster kernel drops the bench's loop of identical eager launches out of its queued mode (in-run paired +4..+12%, and 5.53/5.54 us, faster than 1107, in one companion boot), while kernel time and graph replay show r1 4.6-5.1% faster at the same M. With the clean boot pair (1 and 3), paged keys M=1 is also flagged: both arms ran at 10-11.6 us in that first cell (paired -0.5/+2.7%). The query-rope M=2048 gain is not claimed: it reads +1.3/+5.6% in the receipts and -8.7% to -30% here.",
+ "host": "sp8 (spark-0016, NVIDIA GB10)",
+ "image": {
+  "candidate-49": "sha256:9f51f2e2c5ab728e96490d794bff7b83a147d6d3d61333c5b60b2cff662049cd",
+  "bind_mounts": [
+   "files/gemm.py -> vllm/models/deepseek_v4_1/tilelang/gemm.py",
+   "files/test_deepseek_v41_tilelang_linear.py -> tests/kernels/quantization/test_deepseek_v41_tilelang_linear.py"
+  ],
+  "note": "indexer.py and test_deepseek_v4_1_lsa.py are the image's (r1 leaves them as 0764 made them)"
+ },
+ "baseline": "1107 arm (bench 'sw', the 1107 kernels re-declared in the PR bench) of candidate-49 receipts/own-marks/pr-991/json/bench-candidate49-boot{1,2}.json; not re-measured as a separate run. The bench re-times that arm in every run; its in-run values are reported as in_run_1107_arm_us.",
+ "patch": {
+  "file": "0764-perf-dsv41-hw-e2m1x2-indexer-and-gemm-mxfp4-quantize.patch",
+  "sha256": "20bbb06587981c992e805a3aa56b4a15f2e208f1fc9a0ea4d9d1849ab3fd992f",
+  "replaces": "candidate-49/vllm/0764-perf-dsv41-hw-e2m1x2-indexer-and-gemm-mxfp4-quantize.patch (sha256 85da1c98...)",
+  "author": "Christopher Owen <3221756+christopherowen@users.noreply.github.com>, Sun, 8 Nov 2026 17:43:08 +0000 (kept)",
+  "change_vs_0764": [
+   "gemm.py: mxfp8_gemm_rope_mxfp4_decode's epilogue row loop back to 1107's T.serial(iters) (drops the PR's T.unroll(..., pragma_unroll_factor=1)); comment states why",
+   "test_deepseek_v41_tilelang_linear.py: test_hw_e2m1x2_codegen_in_gemm_and_indexer_quantizers also asserts the GEMM source has no '#pragma unroll 1'",
+   "commit message: rationale, measured kernel times, test line updated; the 'loop rolled' claim and the static-SASS framing dropped",
+   "indexer.py, test_deepseek_v4_1_lsa.py and the E2M1 helpers: unchanged from 0764"
+  ],
+  "applies": "exactly on 1107 + 0762 + 0763 (the four files reconstructed from the image by reversing 0764; blob hashes match 0764's index lines); also on 1107 alone (indexer.py hunks at offset -165). 0765..0767 touch none of the four files. git diff --check clean.",
+  "measured_files_equal_patch_result": true
+ },
+ "cause": {
+  "gemm_M1": "PR's '#pragma unroll 1' on the 4-row epilogue loop (block_M=16, 256 threads, 4 rows per pass). Rolled, each pass runs the loop counter and five pointer/row increments, the compare and back-edge plus a BSSY/BSYNC region (diag/dump/gemm_pr_bm16.sass, 0x1840-0x18b0); unrolled, nvcc folds the row offsets into immediates (STG [R2.64+0x2000/0x4000/0x6000]) and exits after the last row check (gemm_hw_serial_bm16.sass). The GEMM main loop is the same SASS in both. Kernel time (CUPTI, isolated launches, 300 each): 1107 5.152/5.120/5.184 us at M=1/2/4, PR 5.120/5.120/5.120, unrolled 4.928/4.928/4.960 (diag/cupti-1.json). So the hardware conversion alone saved ~0 at M<=4, where 1 to 4 of 16 rows are live, and the eager bench's +/-1% noise decided the sign of the M=1 cell. The unrolled body is larger (static SASS 720 vs 440 at bm16); static count is not the cost. At block_M=32 and 64 rolled and unrolled are within 0.03 us (CUPTI) / 0.1 us (graph).",
+  "paged_keys_small_M_and_2048": "Not a kernel regression. Kernel time 1107 -> PR/r1: 1.952 -> 1.216 us (M=1), 1.984 -> 1.248 (M=2,4), 2.080 -> 1.312 (M=6), 3.904 -> 2.624 (M=2048). The PR bench times 25 (or 5) back-to-back eager TileLang launches per sample; for this 3-argument kernel that path costs ~3.9 us per launch (and ~4.7 us per sample at 5 launches), above either kernel's time, so both arms read the launch floor and the hw arm's +1..+6% in the receipts is launch-path jitter: today the same unchanged PR measured -0.3..-1.1% at M=2..6 and -2.5% at 2048 (diag/bench-pr-asis.json), and r1 boots 1 and 2 read -0.1..-0.4% and -2.3/-2.1% (boot 3 +1.9..+2.4% at M=2..6, inside a slow first phase where both arms ran at ~11 us; -2.4% at 2048). Register pressure is not involved (52 -> 43 registers).",
+  "gemm_M6_M8_in_r1": "Eager-launch bistability, not kernel time. The GEMM's launch path costs ~6.2-6.5 us per eager launch; 1107's kernel at M=6/8 (5.4-5.6 us) keeps the launch queue fed and reads ~5.7-5.8 us; r1's (5.2-5.3 us) usually drains it and reads the launch cost, 6.36-6.52 us, but read 5.53/5.54 us in the first companion boot. At M=1..4 every variant reads the launch cost (~6.2-6.5 us) with q75 up to 10-12 us. Inference from these numbers; not traced at the driver level.",
+  "query_rope_M2048": "Not reproducible as a stable claim. 16 MiB in + 4 MiB out per call; memory-bound with large run-to-run spread (receipts +1.3/+5.6%; today PR as is -23.6% and -8.1%; r1 -21.2/-30.4/-8.7% paired; graph 1.23x). Not claimed.",
+  "serving_note": "Decode runs these kernels from CUDA graphs (pdl.py: 'A decode step is one chain of about 1,850 small kernels in CUDA graphs'), where the launch path is off the critical path; the plain paged-key writer (write_index_keys) is reached only when positions is None, and attention.py always passes positions, so serving writes index keys through mxfp4_norm_rope_quantize_v41."
+ },
+ "measured": {
+  "pytest": {
+   "boot1": "28 passed, 143 deselected in 122.29s",
+   "boot2": "28 passed, 143 deselected in 120.61s",
+   "note": "README section 4 -k selection, corrected gemm.py and test mounted; includes test_mxfp8_gemm_rope_mxfp4_decode_matches_reference and the codegen test with the new '#pragma unroll 1' assertion"
+  },
+  "bit_exact": "all 45 cases torch.equal in all three bench boots and both graph-companion boots",
+  "bench_tally_vs_1107_receipts_boots_1_3": {
+   "cells": 45,
+   "gain": 18,
+   "within": 24,
+   "worse": 3
+  },
+  "bench_tally_vs_1107_receipts_boots_1_2_3": {
+   "cells": 45,
+   "gain": 12,
+   "within": 31,
+   "worse": 2
+  },
+  "worse_beyond_interval_boots_1_3": [
+   "mxfp8_gemm_rope_mxfp4_decode M=6",
+   "mxfp8_gemm_rope_mxfp4_decode M=8",
+   "mxfp4_quantize_v41_paged_keys M=1"
+  ],
+  "worse_beyond_interval_boots_1_2_3": [
+   "mxfp8_gemm_rope_mxfp4_decode M=6",
+   "mxfp8_gemm_rope_mxfp4_decode M=8"
+  ],
+  "pr991_as_is_receipts_tally": {
+   "cells": 45,
+   "gain": 7,
+   "within": 33,
+   "worse": 5
+  },
+  "graph_replay_tally": {
+   "cells": 45,
+   "r1_faster_beyond_interval": 45,
+   "r1_slower_beyond_interval": 0
+  },
+  "graph_note": "scripts/bench_graph_companion.py: the PR bench unchanged plus, per case, each arm's launches captured in a CUDA graph (25 or 5 per graph, 80 interleaved AB/BA replays); per-launch us; its 1107 arm is the bench's in-run arm (the receipts have no graph data)",
+  "cupti_kernel_median_us": {
+   "r1_boots": {
+    "gemm": [
+     {
+      "M": 1,
+      "sw": [
+       5.088,
+       5.088
+      ],
+      "module": [
+       4.896,
+       4.896
+      ],
+      "hw_serial": [
+       4.896,
+       4.896
+      ]
+     },
+     {
+      "M": 2,
+      "sw": [
+       5.12,
+       5.12
+      ],
+      "module": [
+       4.896,
+       4.896
+      ],
+      "hw_serial": [
+       4.896,
+       4.896
+      ]
+     },
+     {
+      "M": 4,
+      "sw": [
+       5.152,
+       5.154
+      ],
+      "module": [
+       4.928,
+       4.959
+      ],
+      "hw_serial": [
+       4.928,
+       4.929
+      ]
+     },
+     {
+      "M": 8,
+      "sw": [
+       5.6,
+       5.584
+      ],
+      "module": [
+       5.313,
+       5.312
+      ],
+      "hw_serial": [
+       5.312,
+       5.312
+      ]
+     },
+     {
+      "M": 16,
+      "sw": [
+       6.56,
+       6.56
+      ],
+      "module": [
+       6.24,
+       6.272
+      ],
+      "hw_serial": [
+       6.24,
+       6.272
+      ]
+     },
+     {
+      "M": 32,
+      "sw": [
+       9.408,
+       9.408
+      ],
+      "module": [
+       9.056,
+       9.056
+      ],
+      "hw_serial": [
+       9.056,
+       9.056
+      ]
+     },
+     {
+      "M": 64,
+      "sw": [
+       15.68,
+       15.552
+      ],
+      "module": [
+       15.008,
+       14.88
+      ],
+      "hw_serial": [
+       15.008,
+       14.88
+      ]
+     }
+    ],
+    "paged": [
+     {
+      "M": 1,
+      "sw": [
+       1.952,
+       1.952
+      ],
+      "module": [
+       1.216,
+       1.216
+      ]
+     },
+     {
+      "M": 2,
+      "sw": [
+       1.984,
+       1.984
+      ],
+      "module": [
+       1.248,
+       1.248
+      ]
+     },
+     {
+      "M": 4,
+      "sw": [
+       1.984,
+       2.016
+      ],
+      "module": [
+       1.248,
+       1.248
+      ]
+     },
+     {
+      "M": 6,
+      "sw": [
+       2.08,
+       2.08
+      ],
+      "module": [
+       1.312,
+       1.312
+      ]
+     },
+     {
+      "M": 8,
+      "sw": [
+       2.08,
+       2.081
+      ],
+      "module": [
+       1.312,
+       1.344
+      ]
+     },
+     {
+      "M": 16,
+      "sw": [
+       2.176,
+       2.176
+      ],
+      "module": [
+       1.408,
+       1.408
+      ]
+     },
+     {
+      "M": 32,
+      "sw": [
+       2.592,
+       2.592
+      ],
+      "module": [
+       1.824,
+       1.824
+      ]
+     },
+     {
+      "M": 512,
+      "sw": [
+       2.592,
+       2.592
+      ],
+      "module": [
+       1.792,
+       1.792
+      ]
+     },
+     {
+      "M": 2048,
+      "sw": [
+       3.904,
+       3.904
+      ],
+      "module": [
+       2.624,
+       2.624
+      ]
+     },
+     {
+      "M": 8192,
+      "sw": [
+       13.632,
+       13.472
+      ],
+      "module": [
+       5.92,
+       5.92
+      ]
+     }
+    ]
+   },
+   "pr_as_is_diag": {
+    "gemm": [
+     {
+      "M": 1,
+      "sw": 5.152,
+      "pr": 5.12,
+      "hw_serial": 4.928
+     },
+     {
+      "M": 2,
+      "sw": 5.12,
+      "pr": 5.12,
+      "hw_serial": 4.928
+     },
+     {
+      "M": 4,
+      "sw": 5.184,
+      "pr": 5.12,
+      "hw_serial": 4.96
+     },
+     {
+      "M": 8,
+      "sw": 5.664,
+      "pr": 5.536,
+      "hw_serial": 5.408
+     },
+     {
+      "M": 16,
+      "sw": 6.656,
+      "pr": 6.432,
+      "hw_serial": 6.304
+     },
+     {
+      "M": 32,
+      "sw": 9.376,
+      "pr": 8.992,
+      "hw_serial": 9.024
+     },
+     {
+      "M": 64,
+      "sw": 15.616,
+      "pr": 14.881,
+      "hw_serial": 14.913
+     }
+    ]
+   },
+   "note": "torch.profiler/CUPTI device time, 3 x 100 isolated launches (synchronize after each) per arm and M; 'module' is the mounted r1 gemm.py / image indexer.py, 'hw_serial' the same epilogue built in scripts/diag_variants.py (identical, as expected)"
+  },
+  "boot2_overlap": "bench-r1-boot2 ran 08:22:05-08:22:51Z while silly_spence (another session's container, not under the GPU lock) ran 08:21:10-08:23:31Z; kept, and bench-r1-boot3 was added with a check that no other container ran (raw/bench-r1-boot3-neighbors.log: none)."
+ },
+ "cells": [
+  {
+   "bench": "mxfp8_gemm_rope_mxfp4_decode",
+   "M": 1,
+   "1107_receipt_boots_us": [
+    6.2765,
+    6.2611
+   ],
+   "pr991_receipt_boots_us": [
+    6.3168,
+    6.3098
+   ],
+   "r1_boots_us": {
+    "boot1": 6.1466,
+    "boot2_overlapped": 5.8278,
+    "boot3": 6.1786
+   },
+   "verdict_vs_1107_boots_1_3": "gain",
+   "verdict_vs_1107_boots_1_2_3": "gain",
+   "speedup_of_means_vs_1107_boots_1_3": 1.017,
+   "in_run_1107_arm_us": {
+    "boot1": 6.4122,
+    "boot2_overlapped": 6.4902,
+    "boot3": 6.3923
+   },
+   "in_run_paired_delta_pct": {
+    "boot1": -4.14,
+    "boot2_overlapped": -10.21,
+    "boot3": -3.34
+   },
+   "graph_us_per_launch": {
+    "1107_boots": [
+     5.0099,
+     5.0112
+    ],
+    "r1_boots": [
+     4.7795,
+     4.8448
+    ],
+    "speedup_of_means": 1.041,
+    "r1_faster_beyond_interval": true,
+    "r1_slower_beyond_interval": false
+   },
+   "bit_exact": true
+  },
+  {
+   "bench": "mxfp8_gemm_rope_mxfp4_decode",
+   "M": 2,
+   "1107_receipt_boots_us": [
+    6.2432,
+    6.3539
+   ],
+   "pr991_receipt_boots_us": [
+    6.0461,
+    6.329
+   ],
+   "r1_boots_us": {
+    "boot1": 6.2272,
+    "boot2_overlapped": 6.4538,
+    "boot3": 6.4461
+   },
+   "verdict_vs_1107_boots_1_3": "within",
+   "verdict_vs_1107_boots_1_2_3": "within",
+   "speedup_of_means_vs_1107_boots_1_3": 0.994,
+   "in_run_1107_arm_us": {
+    "boot1": 6.4346,
+    "boot2_overlapped": 6.3565,
+    "boot3": 6.4
+   },
+   "in_run_paired_delta_pct": {
+    "boot1": -3.22,
+    "boot2_overlapped": 1.53,
+    "boot3": 0.72
+   },
+   "graph_us_per_launch": {
+    "1107_boots": [
+     5.0093,
+     5.0598
+    ],
+    "r1_boots": [
+     4.8256,
+     4.864
+    ],
+    "speedup_of_means": 1.039,
+    "r1_faster_beyond_interval": true,
+    "r1_slower_beyond_interval": false
+   },
+   "bit_exact": true
+  },
+  {
+   "bench": "mxfp8_gemm_rope_mxfp4_decode",
+   "M": 4,
+   "1107_receipt_boots_us": [
+    6.4358,
+    6.3552
+   ],
+   "pr991_receipt_boots_us": [
+    6.3712,
+    6.2733
+   ],
+   "r1_boots_us": {
+    "boot1": 6.304,
+    "boot2_overlapped": 7.0227,
+    "boot3": 6.9389
+   },
+   "verdict_vs_1107_boots_1_3": "within",
+   "verdict_vs_1107_boots_1_2_3": "within",
+   "speedup_of_means_vs_1107_boots_1_3": 0.966,
+   "in_run_1107_arm_us": {
+    "boot1": 6.5133,
+    "boot2_overlapped": 6.4858,
+    "boot3": 6.4435
+   },
+   "in_run_paired_delta_pct": {
+    "boot1": -3.21,
+    "boot2_overlapped": 8.28,
+    "boot3": 7.69
+   },
+   "graph_us_per_launch": {
+    "1107_boots": [
+     5.0944,
+     5.0867
+    ],
+    "r1_boots": [
+     4.8538,
+     4.8422
+    ],
+    "speedup_of_means": 1.05,
+    "r1_faster_beyond_interval": true,
+    "r1_slower_beyond_interval": false
+   },
+   "bit_exact": true
+  },
+  {
+   "bench": "mxfp8_gemm_rope_mxfp4_decode",
+   "M": 6,
+   "1107_receipt_boots_us": [
+    6.1978,
+    5.833
+   ],
+   "pr991_receipt_boots_us": [
+    6.5357,
+    5.8778
+   ],
+   "r1_boots_us": {
+    "boot1": 6.5216,
+    "boot2_overlapped": 6.4,
+    "boot3": 6.361
+   },
+   "verdict_vs_1107_boots_1_3": "worse",
+   "verdict_vs_1107_boots_1_2_3": "worse",
+   "speedup_of_means_vs_1107_boots_1_3": 0.934,
+   "in_run_1107_arm_us": {
+    "boot1": 6.2714,
+    "boot2_overlapped": 5.7126,
+    "boot3": 5.7062
+   },
+   "in_run_paired_delta_pct": {
+    "boot1": 3.99,
+    "boot2_overlapped": 12.03,
+    "boot3": 11.48
+   },
+   "graph_us_per_launch": {
+    "1107_boots": [
+     5.5123,
+     5.4918
+    ],
+    "r1_boots": [
+     5.2429,
+     5.2448
+    ],
+    "speedup_of_means": 1.049,
+    "r1_faster_beyond_interval": true,
+    "r1_slower_beyond_interval": false
+   },
+   "bit_exact": true
+  },
+  {
+   "bench": "mxfp8_gemm_rope_mxfp4_decode",
+   "M": 8,
+   "1107_receipt_boots_us": [
+    6.1158,
+    5.8739
+   ],
+   "pr991_receipt_boots_us": [
+    6.5741,
+    5.7459
+   ],
+   "r1_boots_us": {
+    "boot1": 6.4013,
+    "boot2_overlapped": 6.4499,
+    "boot3": 6.4026
+   },
+   "verdict_vs_1107_boots_1_3": "worse",
+   "verdict_vs_1107_boots_1_2_3": "worse",
+   "speedup_of_means_vs_1107_boots_1_3": 0.936,
+   "in_run_1107_arm_us": {
+    "boot1": 6.3987,
+    "boot2_overlapped": 5.8291,
+    "boot3": 5.7882
+   },
+   "in_run_paired_delta_pct": {
+    "boot1": 0.04,
+    "boot2_overlapped": 10.65,
+    "boot3": 10.61
+   },
+   "graph_us_per_launch": {
+    "1107_boots": [
+     5.5642,
+     5.5731
+    ],
+    "r1_boots": [
+     5.2973,
+     5.3299
+    ],
+    "speedup_of_means": 1.048,
+    "r1_faster_beyond_interval": true,
+    "r1_slower_beyond_interval": false
+   },
+   "bit_exact": true
+  },
+  {
+   "bench": "mxfp8_gemm_rope_mxfp4_decode",
+   "M": 16,
+   "1107_receipt_boots_us": [
+    6.8102,
+    7.1706
+   ],
+   "pr991_receipt_boots_us": [
+    6.6029,
+    6.9536
+   ],
+   "r1_boots_us": {
+    "boot1": 6.4045,
+    "boot2_overlapped": 6.448,
+    "boot3": 6.7258
+   },
+   "verdict_vs_1107_boots_1_3": "gain",
+   "verdict_vs_1107_boots_1_2_3": "gain",
+   "speedup_of_means_vs_1107_boots_1_3": 1.065,
+   "in_run_1107_arm_us": {
+    "boot1": 6.7686,
+    "boot2_overlapped": 6.777,
+    "boot3": 7.0093
+   },
+   "in_run_paired_delta_pct": {
+    "boot1": -5.38,
+    "boot2_overlapped": -4.85,
+    "boot3": -4.04
+   },
+   "graph_us_per_launch": {
+    "1107_boots": [
+     6.6669,
+     6.4858
+    ],
+    "r1_boots": [
+     6.423,
+     6.2022
+    ],
+    "speedup_of_means": 1.042,
+    "r1_faster_beyond_interval": true,
+    "r1_slower_beyond_interval": false
+   },
+   "bit_exact": true
+  },
+  {
+   "bench": "mxfp8_gemm_rope_mxfp4_decode",
+   "M": 32,
+   "1107_receipt_boots_us": [
+    9.8202,
+    9.5078
+   ],
+   "pr991_receipt_boots_us": [
+    9.3933,
+    9.1245
+   ],
+   "r1_boots_us": {
+    "boot1": 9.175,
+    "boot2_overlapped": 9.1373,
+    "boot3": 9.1053
+   },
+   "verdict_vs_1107_boots_1_3": "gain",
+   "verdict_vs_1107_boots_1_2_3": "gain",
+   "speedup_of_means_vs_1107_boots_1_3": 1.057,
+   "in_run_1107_arm_us": {
+    "boot1": 9.545,
+    "boot2_overlapped": 9.5034,
+    "boot3": 9.5059
+   },
+   "in_run_paired_delta_pct": {
+    "boot1": -3.88,
+    "boot2_overlapped": -3.85,
+    "boot3": -4.21
+   },
+   "graph_us_per_launch": {
+    "1107_boots": [
+     9.2659,
+     9.2435
+    ],
+    "r1_boots": [
+     8.9344,
+     8.9043
+    ],
+    "speedup_of_means": 1.038,
+    "r1_faster_beyond_interval": true,
+    "r1_slower_beyond_interval": false
+   },
+   "bit_exact": true
+  },
+  {
+   "bench": "mxfp8_gemm_rope_mxfp4_decode",
+   "M": 64,
+   "1107_receipt_boots_us": [
+    15.8976,
+    15.6966
+   ],
+   "pr991_receipt_boots_us": [
+    15.0662,
+    14.8864
+   ],
+   "r1_boots_us": {
+    "boot1": 14.8723,
+    "boot2_overlapped": 15.2768,
+    "boot3": 14.8749
+   },
+   "verdict_vs_1107_boots_1_3": "gain",
+   "verdict_vs_1107_boots_1_2_3": "gain",
+   "speedup_of_means_vs_1107_boots_1_3": 1.062,
+   "in_run_1107_arm_us": {
+    "boot1": 15.4438,
+    "boot2_overlapped": 15.9354,
+    "boot3": 15.5827
+   },
+   "in_run_paired_delta_pct": {
+    "boot1": -3.7,
+    "boot2_overlapped": -4.13,
+    "boot3": -4.54
+   },
+   "graph_us_per_launch": {
+    "1107_boots": [
+     15.5437,
+     15.4752
+    ],
+    "r1_boots": [
+     14.8544,
+     14.7974
+    ],
+    "speedup_of_means": 1.046,
+    "r1_faster_beyond_interval": true,
+    "r1_slower_beyond_interval": false
+   },
+   "bit_exact": true
+  },
+  {
+   "bench": "mxfp4_quantize_v41_query_rope",
+   "M": 1,
+   "1107_receipt_boots_us": [
+    4.2682,
+    12.4307
+   ],
+   "pr991_receipt_boots_us": [
+    4.2714,
+    12.4403
+   ],
+   "r1_boots_us": {
+    "boot1": 11.8214,
+    "boot2_overlapped": 4.327,
+    "boot3": 4.327
+   },
+   "verdict_vs_1107_boots_1_3": "within",
+   "verdict_vs_1107_boots_1_2_3": "within",
+   "speedup_of_means_vs_1107_boots_1_3": 1.034,
+   "in_run_1107_arm_us": {
+    "boot1": 11.5053,
+    "boot2_overlapped": 4.3341,
+    "boot3": 4.3686
+   },
+   "in_run_paired_delta_pct": {
+    "boot1": 2.75,
+    "boot2_overlapped": -0.16,
+    "boot3": -0.95
+   },
+   "graph_us_per_launch": {
+    "1107_boots": [
+     2.6291,
+     2.6266
+    ],
+    "r1_boots": [
+     1.6518,
+     1.664
+    ],
+    "speedup_of_means": 1.585,
+    "r1_faster_beyond_interval": true,
+    "r1_slower_beyond_interval": false
+   },
+   "bit_exact": true
+  },
+  {
+   "bench": "mxfp4_quantize_v41_query_rope",
+   "M": 2,
+   "1107_receipt_boots_us": [
+    4.2739,
+    4.3955
+   ],
+   "pr991_receipt_boots_us": [
+    4.2726,
+    4.3693
+   ],
+   "r1_boots_us": {
+    "boot1": 4.313,
+    "boot2_overlapped": 4.313,
+    "boot3": 4.3181
+   },
+   "verdict_vs_1107_boots_1_3": "within",
+   "verdict_vs_1107_boots_1_2_3": "within",
+   "speedup_of_means_vs_1107_boots_1_3": 1.004,
+   "in_run_1107_arm_us": {
+    "boot1": 4.311,
+    "boot2_overlapped": 4.2957,
+    "boot3": 4.3046
+   },
+   "in_run_paired_delta_pct": {
+    "boot1": 0.05,
+    "boot2_overlapped": 0.4,
+    "boot3": 0.31
+   },
+   "graph_us_per_launch": {
+    "1107_boots": [
+     2.6522,
+     2.633
+    ],
+    "r1_boots": [
+     1.6966,
+     1.6614
+    ],
+    "speedup_of_means": 1.574,
+    "r1_faster_beyond_interval": true,
+    "r1_slower_beyond_interval": false
+   },
+   "bit_exact": true
+  },
+  {
+   "bench": "mxfp4_quantize_v41_query_rope",
+   "M": 4,
+   "1107_receipt_boots_us": [
+    4.3725,
+    5.232
+   ],
+   "pr991_receipt_boots_us": [
+    4.3494,
+    5.0368
+   ],
+   "r1_boots_us": {
+    "boot1": 4.3021,
+    "boot2_overlapped": 4.3219,
+    "boot3": 4.3098
+   },
+   "verdict_vs_1107_boots_1_3": "gain",
+   "verdict_vs_1107_boots_1_2_3": "gain",
+   "speedup_of_means_vs_1107_boots_1_3": 1.115,
+   "in_run_1107_arm_us": {
+    "boot1": 4.2957,
+    "boot2_overlapped": 4.3046,
+    "boot3": 4.3091
+   },
+   "in_run_paired_delta_pct": {
+    "boot1": 0.15,
+    "boot2_overlapped": 0.4,
+    "boot3": 0.02
+   },
+   "graph_us_per_launch": {
+    "1107_boots": [
+     2.7085,
+     2.7072
+    ],
+    "r1_boots": [
+     1.7229,
+     1.7242
+    ],
+    "speedup_of_means": 1.571,
+    "r1_faster_beyond_interval": true,
+    "r1_slower_beyond_interval": false
+   },
+   "bit_exact": true
+  },
+  {
+   "bench": "mxfp4_quantize_v41_query_rope",
+   "M": 6,
+   "1107_receipt_boots_us": [
+    4.2688,
+    4.9888
+   ],
+   "pr991_receipt_boots_us": [
+    4.2707,
+    4.7821
+   ],
+   "r1_boots_us": {
+    "boot1": 4.2976,
+    "boot2_overlapped": 4.329,
+    "boot3": 4.2918
+   },
+   "verdict_vs_1107_boots_1_3": "within",
+   "verdict_vs_1107_boots_1_2_3": "within",
+   "speedup_of_means_vs_1107_boots_1_3": 1.078,
+   "in_run_1107_arm_us": {
+    "boot1": 4.3117,
+    "boot2_overlapped": 4.3206,
+    "boot3": 4.2931
+   },
+   "in_run_paired_delta_pct": {
+    "boot1": -0.33,
+    "boot2_overlapped": 0.19,
+    "boot3": -0.03
+   },
+   "graph_us_per_launch": {
+    "1107_boots": [
+     2.7104,
+     2.7296
+    ],
+    "r1_boots": [
+     1.7254,
+     1.744
+    ],
+    "speedup_of_means": 1.568,
+    "r1_faster_beyond_interval": true,
+    "r1_slower_beyond_interval": false
+   },
+   "bit_exact": true
+  },
+  {
+   "bench": "mxfp4_quantize_v41_query_rope",
+   "M": 8,
+   "1107_receipt_boots_us": [
+    4.2803,
+    4.4813
+   ],
+   "pr991_receipt_boots_us": [
+    4.2944,
+    4.5766
+   ],
+   "r1_boots_us": {
+    "boot1": 4.2957,
+    "boot2_overlapped": 4.3155,
+    "boot3": 4.3072
+   },
+   "verdict_vs_1107_boots_1_3": "within",
+   "verdict_vs_1107_boots_1_2_3": "within",
+   "speedup_of_means_vs_1107_boots_1_3": 1.018,
+   "in_run_1107_arm_us": {
+    "boot1": 4.2835,
+    "boot2_overlapped": 4.3123,
+    "boot3": 4.2899
+   },
+   "in_run_paired_delta_pct": {
+    "boot1": 0.28,
+    "boot2_overlapped": 0.07,
+    "boot3": 0.4
+   },
+   "graph_us_per_launch": {
+    "1107_boots": [
+     2.7149,
+     2.7206
+    ],
+    "r1_boots": [
+     1.7254,
+     1.7267
+    ],
+    "speedup_of_means": 1.575,
+    "r1_faster_beyond_interval": true,
+    "r1_slower_beyond_interval": false
+   },
+   "bit_exact": true
+  },
+  {
+   "bench": "mxfp4_quantize_v41_query_rope",
+   "M": 16,
+   "1107_receipt_boots_us": [
+    4.2765,
+    4.3302
+   ],
+   "pr991_receipt_boots_us": [
+    4.2797,
+    4.3251
+   ],
+   "r1_boots_us": {
+    "boot1": 4.3162,
+    "boot2_overlapped": 4.3021,
+    "boot3": 4.2944
+   },
+   "verdict_vs_1107_boots_1_3": "within",
+   "verdict_vs_1107_boots_1_2_3": "within",
+   "speedup_of_means_vs_1107_boots_1_3": 1.0,
+   "in_run_1107_arm_us": {
+    "boot1": 4.2662,
+    "boot2_overlapped": 4.3142,
+    "boot3": 4.2906
+   },
+   "in_run_paired_delta_pct": {
+    "boot1": 1.17,
+    "boot2_overlapped": -0.28,
+    "boot3": 0.09
+   },
+   "graph_us_per_launch": {
+    "1107_boots": [
+     2.7174,
+     2.7469
+    ],
+    "r1_boots": [
+     1.7331,
+     1.751
+    ],
+    "speedup_of_means": 1.568,
+    "r1_faster_beyond_interval": true,
+    "r1_slower_beyond_interval": false
+   },
+   "bit_exact": true
+  },
+  {
+   "bench": "mxfp4_quantize_v41_query_rope",
+   "M": 32,
+   "1107_receipt_boots_us": [
+    4.2918,
+    4.3738
+   ],
+   "pr991_receipt_boots_us": [
+    4.304,
+    4.3309
+   ],
+   "r1_boots_us": {
+    "boot1": 4.3162,
+    "boot2_overlapped": 4.3872,
+    "boot3": 4.2931
+   },
+   "verdict_vs_1107_boots_1_3": "within",
+   "verdict_vs_1107_boots_1_2_3": "within",
+   "speedup_of_means_vs_1107_boots_1_3": 1.007,
+   "in_run_1107_arm_us": {
+    "boot1": 4.279,
+    "boot2_overlapped": 4.3219,
+    "boot3": 4.2854
+   },
+   "in_run_paired_delta_pct": {
+    "boot1": 0.87,
+    "boot2_overlapped": 1.51,
+    "boot3": 0.18
+   },
+   "graph_us_per_launch": {
+    "1107_boots": [
+     2.7648,
+     2.7706
+    ],
+    "r1_boots": [
+     1.7504,
+     1.7587
+    ],
+    "speedup_of_means": 1.577,
+    "r1_faster_beyond_interval": true,
+    "r1_slower_beyond_interval": false
+   },
+   "bit_exact": true
+  },
+  {
+   "bench": "mxfp4_quantize_v41_query_rope",
+   "M": 512,
+   "1107_receipt_boots_us": [
+    19.4566,
+    19.4285
+   ],
+   "pr991_receipt_boots_us": [
+    12.464,
+    12.5421
+   ],
+   "r1_boots_us": {
+    "boot1": 12.4998,
+    "boot2_overlapped": 12.505,
+    "boot3": 12.4986
+   },
+   "verdict_vs_1107_boots_1_3": "gain",
+   "verdict_vs_1107_boots_1_2_3": "gain",
+   "speedup_of_means_vs_1107_boots_1_3": 1.556,
+   "in_run_1107_arm_us": {
+    "boot1": 19.4931,
+    "boot2_overlapped": 19.4253,
+    "boot3": 19.3485
+   },
+   "in_run_paired_delta_pct": {
+    "boot1": -35.88,
+    "boot2_overlapped": -35.63,
+    "boot3": -35.4
+   },
+   "graph_us_per_launch": {
+    "1107_boots": [
+     19.4195,
+     19.2218
+    ],
+    "r1_boots": [
+     12.2227,
+     12.2707
+    ],
+    "speedup_of_means": 1.578,
+    "r1_faster_beyond_interval": true,
+    "r1_slower_beyond_interval": false
+   },
+   "bit_exact": true
+  },
+  {
+   "bench": "mxfp4_quantize_v41_query_rope",
+   "M": 2048,
+   "1107_receipt_boots_us": [
+    75.6096,
+    76.5696
+   ],
+   "pr991_receipt_boots_us": [
+    76.5664,
+    80.8384
+   ],
+   "r1_boots_us": {
+    "boot1": 56.8896,
+    "boot2_overlapped": 48.1376,
+    "boot3": 66.1568
+   },
+   "verdict_vs_1107_boots_1_3": "gain",
+   "verdict_vs_1107_boots_1_2_3": "gain",
+   "speedup_of_means_vs_1107_boots_1_3": 1.237,
+   "in_run_1107_arm_us": {
+    "boot1": 72.1632,
+    "boot2_overlapped": 69.1136,
+    "boot3": 72.4352
+   },
+   "in_run_paired_delta_pct": {
+    "boot1": -21.17,
+    "boot2_overlapped": -30.35,
+    "boot3": -8.67
+   },
+   "graph_us_per_launch": {
+    "1107_boots": [
+     72.1344,
+     68.6016
+    ],
+    "r1_boots": [
+     53.1936,
+     61.072
+    ],
+    "speedup_of_means": 1.232,
+    "r1_faster_beyond_interval": true,
+    "r1_slower_beyond_interval": false
+   },
+   "bit_exact": true
+  },
+  {
+   "bench": "mxfp4_quantize_v41_query_rope",
+   "M": 8192,
+   "1107_receipt_boots_us": [
+    597.5552,
+    651.072
+   ],
+   "pr991_receipt_boots_us": [
+    596.1696,
+    650.8608
+   ],
+   "r1_boots_us": {
+    "boot1": 607.3984,
+    "boot2_overlapped": 582.2208,
+    "boot3": 607.8304
+   },
+   "verdict_vs_1107_boots_1_3": "within",
+   "verdict_vs_1107_boots_1_2_3": "within",
+   "speedup_of_means_vs_1107_boots_1_3": 1.027,
+   "in_run_1107_arm_us": {
+    "boot1": 609.6672,
+    "boot2_overlapped": 582.7328,
+    "boot3": 609.1552
+   },
+   "in_run_paired_delta_pct": {
+    "boot1": -0.37,
+    "boot2_overlapped": -0.09,
+    "boot3": -0.22
+   },
+   "graph_us_per_launch": {
+    "1107_boots": [
+     617.6608,
+     618.1376
+    ],
+    "r1_boots": [
+     615.6832,
+     616.7808
+    ],
+    "speedup_of_means": 1.003,
+    "r1_faster_beyond_interval": true,
+    "r1_slower_beyond_interval": false
+   },
+   "bit_exact": true
+  },
+  {
+   "bench": "mxfp4_quantize_v41_paged_keys",
+   "M": 1,
+   "1107_receipt_boots_us": [
+    4.1638,
+    4.0838
+   ],
+   "pr991_receipt_boots_us": [
+    4.0858,
+    4.1082
+   ],
+   "r1_boots_us": {
+    "boot1": 10.2458,
+    "boot2_overlapped": 3.9206,
+    "boot3": 11.6186
+   },
+   "verdict_vs_1107_boots_1_3": "worse",
+   "verdict_vs_1107_boots_1_2_3": "within",
+   "speedup_of_means_vs_1107_boots_1_3": 0.377,
+   "in_run_1107_arm_us": {
+    "boot1": 10.3008,
+    "boot2_overlapped": 3.929,
+    "boot3": 11.319
+   },
+   "in_run_paired_delta_pct": {
+    "boot1": -0.53,
+    "boot2_overlapped": -0.21,
+    "boot3": 2.65
+   },
+   "graph_us_per_launch": {
+    "1107_boots": [
+     1.6422,
+     1.7197
+    ],
+    "r1_boots": [
+     0.7411,
+     0.8307
+    ],
+    "speedup_of_means": 2.139,
+    "r1_faster_beyond_interval": true,
+    "r1_slower_beyond_interval": false
+   },
+   "bit_exact": true
+  },
+  {
+   "bench": "mxfp4_quantize_v41_paged_keys",
+   "M": 2,
+   "1107_receipt_boots_us": [
+    4.361,
+    4.3232
+   ],
+   "pr991_receipt_boots_us": [
+    4.4659,
+    4.3654
+   ],
+   "r1_boots_us": {
+    "boot1": 3.8848,
+    "boot2_overlapped": 3.9014,
+    "boot3": 11.3594
+   },
+   "verdict_vs_1107_boots_1_3": "within",
+   "verdict_vs_1107_boots_1_2_3": "within",
+   "speedup_of_means_vs_1107_boots_1_3": 0.57,
+   "in_run_1107_arm_us": {
+    "boot1": 3.8982,
+    "boot2_overlapped": 3.9104,
+    "boot3": 11.1456
+   },
+   "in_run_paired_delta_pct": {
+    "boot1": -0.34,
+    "boot2_overlapped": -0.23,
+    "boot3": 1.92
+   },
+   "graph_us_per_launch": {
+    "1107_boots": [
+     1.6422,
+     1.6563
+    ],
+    "r1_boots": [
+     0.7552,
+     0.8064
+    ],
+    "speedup_of_means": 2.112,
+    "r1_faster_beyond_interval": true,
+    "r1_slower_beyond_interval": false
+   },
+   "bit_exact": true
+  },
+  {
+   "bench": "mxfp4_quantize_v41_paged_keys",
+   "M": 4,
+   "1107_receipt_boots_us": [
+    4.3878,
+    4.3802
+   ],
+   "pr991_receipt_boots_us": [
+    4.4435,
+    4.4563
+   ],
+   "r1_boots_us": {
+    "boot1": 3.8778,
+    "boot2_overlapped": 3.9142,
+    "boot3": 11.5053
+   },
+   "verdict_vs_1107_boots_1_3": "within",
+   "verdict_vs_1107_boots_1_2_3": "within",
+   "speedup_of_means_vs_1107_boots_1_3": 0.57,
+   "in_run_1107_arm_us": {
+    "boot1": 3.8925,
+    "boot2_overlapped": 3.9194,
+    "boot3": 11.2397
+   },
+   "in_run_paired_delta_pct": {
+    "boot1": -0.38,
+    "boot2_overlapped": -0.13,
+    "boot3": 2.36
+   },
+   "graph_us_per_launch": {
+    "1107_boots": [
+     1.6538,
+     1.6595
+    ],
+    "r1_boots": [
+     0.8179,
+     0.8218
+    ],
+    "speedup_of_means": 2.021,
+    "r1_faster_beyond_interval": true,
+    "r1_slower_beyond_interval": false
+   },
+   "bit_exact": true
+  },
+  {
+   "bench": "mxfp4_quantize_v41_paged_keys",
+   "M": 6,
+   "1107_receipt_boots_us": [
+    4.3123,
+    4.3552
+   ],
+   "pr991_receipt_boots_us": [
+    4.3731,
+    4.4205
+   ],
+   "r1_boots_us": {
+    "boot1": 3.8912,
+    "boot2_overlapped": 3.9226,
+    "boot3": 11.4208
+   },
+   "verdict_vs_1107_boots_1_3": "within",
+   "verdict_vs_1107_boots_1_2_3": "within",
+   "speedup_of_means_vs_1107_boots_1_3": 0.566,
+   "in_run_1107_arm_us": {
+    "boot1": 3.895,
+    "boot2_overlapped": 3.927,
+    "boot3": 11.1802
+   },
+   "in_run_paired_delta_pct": {
+    "boot1": -0.1,
+    "boot2_overlapped": -0.11,
+    "boot3": 2.15
+   },
+   "graph_us_per_launch": {
+    "1107_boots": [
+     1.7613,
+     1.7958
+    ],
+    "r1_boots": [
+     0.9062,
+     0.9069
+    ],
+    "speedup_of_means": 1.962,
+    "r1_faster_beyond_interval": true,
+    "r1_slower_beyond_interval": false
+   },
+   "bit_exact": true
+  },
+  {
+   "bench": "mxfp4_quantize_v41_paged_keys",
+   "M": 8,
+   "1107_receipt_boots_us": [
+    4.2931,
+    4.3443
+   ],
+   "pr991_receipt_boots_us": [
+    4.3059,
+    4.4154
+   ],
+   "r1_boots_us": {
+    "boot1": 3.8938,
+    "boot2_overlapped": 3.9117,
+    "boot3": 11.1194
+   },
+   "verdict_vs_1107_boots_1_3": "within",
+   "verdict_vs_1107_boots_1_2_3": "within",
+   "speedup_of_means_vs_1107_boots_1_3": 0.575,
+   "in_run_1107_arm_us": {
+    "boot1": 3.897,
+    "boot2_overlapped": 3.9194,
+    "boot3": 10.9222
+   },
+   "in_run_paired_delta_pct": {
+    "boot1": -0.08,
+    "boot2_overlapped": -0.2,
+    "boot3": 1.81
+   },
+   "graph_us_per_launch": {
+    "1107_boots": [
+     1.8093,
+     1.8074
+    ],
+    "r1_boots": [
+     0.9101,
+     0.9082
+    ],
+    "speedup_of_means": 1.989,
+    "r1_faster_beyond_interval": true,
+    "r1_slower_beyond_interval": false
+   },
+   "bit_exact": true
+  },
+  {
+   "bench": "mxfp4_quantize_v41_paged_keys",
+   "M": 16,
+   "1107_receipt_boots_us": [
+    4.2598,
+    4.3347
+   ],
+   "pr991_receipt_boots_us": [
+    4.2592,
+    4.3302
+   ],
+   "r1_boots_us": {
+    "boot1": 3.8925,
+    "boot2_overlapped": 3.9219,
+    "boot3": 6.7552
+   },
+   "verdict_vs_1107_boots_1_3": "within",
+   "verdict_vs_1107_boots_1_2_3": "within",
+   "speedup_of_means_vs_1107_boots_1_3": 0.807,
+   "in_run_1107_arm_us": {
+    "boot1": 3.8957,
+    "boot2_overlapped": 3.9168,
+    "boot3": 6.8224
+   },
+   "in_run_paired_delta_pct": {
+    "boot1": -0.08,
+    "boot2_overlapped": 0.13,
+    "boot3": -0.98
+   },
+   "graph_us_per_launch": {
+    "1107_boots": [
+     1.9814,
+     1.9712
+    ],
+    "r1_boots": [
+     1.079,
+     1.0688
+    ],
+    "speedup_of_means": 1.84,
+    "r1_faster_beyond_interval": true,
+    "r1_slower_beyond_interval": false
+   },
+   "bit_exact": true
+  },
+  {
+   "bench": "mxfp4_quantize_v41_paged_keys",
+   "M": 32,
+   "1107_receipt_boots_us": [
+    4.5318,
+    4.4602
+   ],
+   "pr991_receipt_boots_us": [
+    4.2618,
+    4.3123
+   ],
+   "r1_boots_us": {
+    "boot1": 3.9008,
+    "boot2_overlapped": 3.9232,
+    "boot3": 3.9309
+   },
+   "verdict_vs_1107_boots_1_3": "gain",
+   "verdict_vs_1107_boots_1_2_3": "gain",
+   "speedup_of_means_vs_1107_boots_1_3": 1.148,
+   "in_run_1107_arm_us": {
+    "boot1": 3.9027,
+    "boot2_overlapped": 3.9187,
+    "boot3": 3.92
+   },
+   "in_run_paired_delta_pct": {
+    "boot1": -0.05,
+    "boot2_overlapped": 0.11,
+    "boot3": 0.28
+   },
+   "graph_us_per_launch": {
+    "1107_boots": [
+     2.3981,
+     2.3821
+    ],
+    "r1_boots": [
+     1.495,
+     1.4816
+    ],
+    "speedup_of_means": 1.606,
+    "r1_faster_beyond_interval": true,
+    "r1_slower_beyond_interval": false
+   },
+   "bit_exact": true
+  },
+  {
+   "bench": "mxfp4_quantize_v41_paged_keys",
+   "M": 512,
+   "1107_receipt_boots_us": [
+    4.7546,
+    4.679
+   ],
+   "pr991_receipt_boots_us": [
+    4.256,
+    4.3149
+   ],
+   "r1_boots_us": {
+    "boot1": 3.9014,
+    "boot2_overlapped": 3.9117,
+    "boot3": 3.9117
+   },
+   "verdict_vs_1107_boots_1_3": "gain",
+   "verdict_vs_1107_boots_1_2_3": "gain",
+   "speedup_of_means_vs_1107_boots_1_3": 1.207,
+   "in_run_1107_arm_us": {
+    "boot1": 3.8912,
+    "boot2_overlapped": 3.9117,
+    "boot3": 3.9085
+   },
+   "in_run_paired_delta_pct": {
+    "boot1": 0.26,
+    "boot2_overlapped": 0.0,
+    "boot3": 0.08
+   },
+   "graph_us_per_launch": {
+    "1107_boots": [
+     2.4269,
+     2.4064
+    ],
+    "r1_boots": [
+     1.5168,
+     1.4957
+    ],
+    "speedup_of_means": 1.604,
+    "r1_faster_beyond_interval": true,
+    "r1_slower_beyond_interval": false
+   },
+   "bit_exact": true
+  },
+  {
+   "bench": "mxfp4_quantize_v41_paged_keys",
+   "M": 2048,
+   "1107_receipt_boots_us": [
+    5.2928,
+    5.3952
+   ],
+   "pr991_receipt_boots_us": [
+    5.6224,
+    5.6512
+   ],
+   "r1_boots_us": {
+    "boot1": 4.7232,
+    "boot2_overlapped": 4.7104,
+    "boot3": 4.6848
+   },
+   "verdict_vs_1107_boots_1_3": "gain",
+   "verdict_vs_1107_boots_1_2_3": "gain",
+   "speedup_of_means_vs_1107_boots_1_3": 1.136,
+   "in_run_1107_arm_us": {
+    "boot1": 4.832,
+    "boot2_overlapped": 4.8128,
+    "boot3": 4.8
+   },
+   "in_run_paired_delta_pct": {
+    "boot1": -2.25,
+    "boot2_overlapped": -2.13,
+    "boot3": -2.4
+   },
+   "graph_us_per_launch": {
+    "1107_boots": [
+     4.3296,
+     4.1696
+    ],
+    "r1_boots": [
+     3.1328,
+     2.9504
+    ],
+    "speedup_of_means": 1.397,
+    "r1_faster_beyond_interval": true,
+    "r1_slower_beyond_interval": false
+   },
+   "bit_exact": true
+  },
+  {
+   "bench": "mxfp4_quantize_v41_paged_keys",
+   "M": 8192,
+   "1107_receipt_boots_us": [
+    15.5168,
+    15.6352
+   ],
+   "pr991_receipt_boots_us": [
+    7.7536,
+    7.7824
+   ],
+   "r1_boots_us": {
+    "boot1": 7.6192,
+    "boot2_overlapped": 7.5776,
+    "boot3": 7.4528
+   },
+   "verdict_vs_1107_boots_1_3": "gain",
+   "verdict_vs_1107_boots_1_2_3": "gain",
+   "speedup_of_means_vs_1107_boots_1_3": 2.067,
+   "in_run_1107_arm_us": {
+    "boot1": 15.3888,
+    "boot2_overlapped": 15.4496,
+    "boot3": 15.2384
+   },
+   "in_run_paired_delta_pct": {
+    "boot1": -50.49,
+    "boot2_overlapped": -50.95,
+    "boot3": -51.09
+   },
+   "graph_us_per_launch": {
+    "1107_boots": [
+     14.8832,
+     14.896
+    ],
+    "r1_boots": [
+     7.008,
+     7.0336
+    ],
+    "speedup_of_means": 2.121,
+    "r1_faster_beyond_interval": true,
+    "r1_slower_beyond_interval": false
+   },
+   "bit_exact": true
+  },
+  {
+   "bench": "mxfp4_norm_rope_quantize_v41_shards1",
+   "M": 1,
+   "1107_receipt_boots_us": [
+    4.9267,
+    5.5706
+   ],
+   "pr991_receipt_boots_us": [
+    4.761,
+    5.5706
+   ],
+   "r1_boots_us": {
+    "boot1": 4.6394,
+    "boot2_overlapped": 13.8707,
+    "boot3": 4.5594
+   },
+   "verdict_vs_1107_boots_1_3": "gain",
+   "verdict_vs_1107_boots_1_2_3": "within",
+   "speedup_of_means_vs_1107_boots_1_3": 1.141,
+   "in_run_1107_arm_us": {
+    "boot1": 4.6682,
+    "boot2_overlapped": 13.6691,
+    "boot3": 4.5594
+   },
+   "in_run_paired_delta_pct": {
+    "boot1": -0.62,
+    "boot2_overlapped": 1.47,
+    "boot3": 0.0
+   },
+   "graph_us_per_launch": {
+    "1107_boots": [
+     1.2339,
+     1.2346
+    ],
+    "r1_boots": [
+     0.9024,
+     0.9088
+    ],
+    "speedup_of_means": 1.363,
+    "r1_faster_beyond_interval": true,
+    "r1_slower_beyond_interval": false
+   },
+   "bit_exact": true
+  },
+  {
+   "bench": "mxfp4_norm_rope_quantize_v41_shards1",
+   "M": 2,
+   "1107_receipt_boots_us": [
+    4.5894,
+    5.5443
+   ],
+   "pr991_receipt_boots_us": [
+    4.5786,
+    5.5539
+   ],
+   "r1_boots_us": {
+    "boot1": 5.4592,
+    "boot2_overlapped": 4.6099,
+    "boot3": 4.5574
+   },
+   "verdict_vs_1107_boots_1_3": "within",
+   "verdict_vs_1107_boots_1_2_3": "within",
+   "speedup_of_means_vs_1107_boots_1_3": 1.012,
+   "in_run_1107_arm_us": {
+    "boot1": 5.44,
+    "boot2_overlapped": 4.6259,
+    "boot3": 4.5594
+   },
+   "in_run_paired_delta_pct": {
+    "boot1": 0.35,
+    "boot2_overlapped": -0.35,
+    "boot3": -0.04
+   },
+   "graph_us_per_launch": {
+    "1107_boots": [
+     1.2352,
+     1.232
+    ],
+    "r1_boots": [
+     0.9056,
+     0.9094
+    ],
+    "speedup_of_means": 1.359,
+    "r1_faster_beyond_interval": true,
+    "r1_slower_beyond_interval": false
+   },
+   "bit_exact": true
+  },
+  {
+   "bench": "mxfp4_norm_rope_quantize_v41_shards1",
+   "M": 4,
+   "1107_receipt_boots_us": [
+    4.5882,
+    5.5475
+   ],
+   "pr991_receipt_boots_us": [
+    4.5728,
+    5.5654
+   ],
+   "r1_boots_us": {
+    "boot1": 5.5277,
+    "boot2_overlapped": 4.5875,
+    "boot3": 4.5734
+   },
+   "verdict_vs_1107_boots_1_3": "within",
+   "verdict_vs_1107_boots_1_2_3": "within",
+   "speedup_of_means_vs_1107_boots_1_3": 1.003,
+   "in_run_1107_arm_us": {
+    "boot1": 5.5187,
+    "boot2_overlapped": 4.6125,
+    "boot3": 4.5677
+   },
+   "in_run_paired_delta_pct": {
+    "boot1": 0.16,
+    "boot2_overlapped": -0.54,
+    "boot3": 0.12
+   },
+   "graph_us_per_launch": {
+    "1107_boots": [
+     1.2294,
+     1.232
+    ],
+    "r1_boots": [
+     0.9088,
+     0.9011
+    ],
+    "speedup_of_means": 1.36,
+    "r1_faster_beyond_interval": true,
+    "r1_slower_beyond_interval": false
+   },
+   "bit_exact": true
+  },
+  {
+   "bench": "mxfp4_norm_rope_quantize_v41_shards1",
+   "M": 6,
+   "1107_receipt_boots_us": [
+    4.5734,
+    5.5622
+   ],
+   "pr991_receipt_boots_us": [
+    4.5587,
+    5.5603
+   ],
+   "r1_boots_us": {
+    "boot1": 5.4822,
+    "boot2_overlapped": 4.6528,
+    "boot3": 4.5882
+   },
+   "verdict_vs_1107_boots_1_3": "within",
+   "verdict_vs_1107_boots_1_2_3": "within",
+   "speedup_of_means_vs_1107_boots_1_3": 1.006,
+   "in_run_1107_arm_us": {
+    "boot1": 5.4938,
+    "boot2_overlapped": 4.6291,
+    "boot3": 4.585
+   },
+   "in_run_paired_delta_pct": {
+    "boot1": -0.21,
+    "boot2_overlapped": 0.51,
+    "boot3": 0.07
+   },
+   "graph_us_per_launch": {
+    "1107_boots": [
+     1.2493,
+     1.2442
+    ],
+    "r1_boots": [
+     0.9261,
+     0.9197
+    ],
+    "speedup_of_means": 1.351,
+    "r1_faster_beyond_interval": true,
+    "r1_slower_beyond_interval": false
+   },
+   "bit_exact": true
+  },
+  {
+   "bench": "mxfp4_norm_rope_quantize_v41_shards1",
+   "M": 8,
+   "1107_receipt_boots_us": [
+    4.5728,
+    5.5616
+   ],
+   "pr991_receipt_boots_us": [
+    4.5555,
+    5.5539
+   ],
+   "r1_boots_us": {
+    "boot1": 5.4944,
+    "boot2_overlapped": 4.5786,
+    "boot3": 4.5677
+   },
+   "verdict_vs_1107_boots_1_3": "within",
+   "verdict_vs_1107_boots_1_2_3": "within",
+   "speedup_of_means_vs_1107_boots_1_3": 1.007,
+   "in_run_1107_arm_us": {
+    "boot1": 5.4893,
+    "boot2_overlapped": 4.6272,
+    "boot3": 4.5613
+   },
+   "in_run_paired_delta_pct": {
+    "boot1": 0.09,
+    "boot2_overlapped": -1.05,
+    "boot3": 0.14
+   },
+   "graph_us_per_launch": {
+    "1107_boots": [
+     1.2448,
+     1.2339
+    ],
+    "r1_boots": [
+     0.9229,
+     0.9101
+    ],
+    "speedup_of_means": 1.352,
+    "r1_faster_beyond_interval": true,
+    "r1_slower_beyond_interval": false
+   },
+   "bit_exact": true
+  },
+  {
+   "bench": "mxfp4_norm_rope_quantize_v41_shards1",
+   "M": 16,
+   "1107_receipt_boots_us": [
+    5.3805,
+    5.5354
+   ],
+   "pr991_receipt_boots_us": [
+    5.4304,
+    5.5392
+   ],
+   "r1_boots_us": {
+    "boot1": 5.5104,
+    "boot2_overlapped": 4.5792,
+    "boot3": 4.5677
+   },
+   "verdict_vs_1107_boots_1_3": "within",
+   "verdict_vs_1107_boots_1_2_3": "within",
+   "speedup_of_means_vs_1107_boots_1_3": 1.083,
+   "in_run_1107_arm_us": {
+    "boot1": 5.4835,
+    "boot2_overlapped": 4.5978,
+    "boot3": 4.567
+   },
+   "in_run_paired_delta_pct": {
+    "boot1": 0.49,
+    "boot2_overlapped": -0.4,
+    "boot3": 0.02
+   },
+   "graph_us_per_launch": {
+    "1107_boots": [
+     1.239,
+     1.2595
+    ],
+    "r1_boots": [
+     0.9101,
+     0.9357
+    ],
+    "speedup_of_means": 1.354,
+    "r1_faster_beyond_interval": true,
+    "r1_slower_beyond_interval": false
+   },
+   "bit_exact": true
+  },
+  {
+   "bench": "mxfp4_norm_rope_quantize_v41_shards1",
+   "M": 32,
+   "1107_receipt_boots_us": [
+    4.576,
+    5.5091
+   ],
+   "pr991_receipt_boots_us": [
+    4.5542,
+    5.52
+   ],
+   "r1_boots_us": {
+    "boot1": 5.4976,
+    "boot2_overlapped": 4.5798,
+    "boot3": 4.5843
+   },
+   "verdict_vs_1107_boots_1_3": "within",
+   "verdict_vs_1107_boots_1_2_3": "within",
+   "speedup_of_means_vs_1107_boots_1_3": 1.0,
+   "in_run_1107_arm_us": {
+    "boot1": 5.4842,
+    "boot2_overlapped": 4.608,
+    "boot3": 4.5818
+   },
+   "in_run_paired_delta_pct": {
+    "boot1": 0.24,
+    "boot2_overlapped": -0.61,
+    "boot3": 0.05
+   },
+   "graph_us_per_launch": {
+    "1107_boots": [
+     1.2384,
+     1.2531
+    ],
+    "r1_boots": [
+     0.9101,
+     0.9357
+    ],
+    "speedup_of_means": 1.35,
+    "r1_faster_beyond_interval": true,
+    "r1_slower_beyond_interval": false
+   },
+   "bit_exact": true
+  },
+  {
+   "bench": "mxfp4_norm_rope_quantize_v41_shards1",
+   "M": 512,
+   "1107_receipt_boots_us": [
+    4.6848,
+    5.5494
+   ],
+   "pr991_receipt_boots_us": [
+    4.6061,
+    5.5379
+   ],
+   "r1_boots_us": {
+    "boot1": 5.4694,
+    "boot2_overlapped": 4.5709,
+    "boot3": 4.5882
+   },
+   "verdict_vs_1107_boots_1_3": "within",
+   "verdict_vs_1107_boots_1_2_3": "within",
+   "speedup_of_means_vs_1107_boots_1_3": 1.018,
+   "in_run_1107_arm_us": {
+    "boot1": 5.4893,
+    "boot2_overlapped": 4.599,
+    "boot3": 4.585
+   },
+   "in_run_paired_delta_pct": {
+    "boot1": -0.36,
+    "boot2_overlapped": -0.61,
+    "boot3": 0.07
+   },
+   "graph_us_per_launch": {
+    "1107_boots": [
+     1.3197,
+     1.3146
+    ],
+    "r1_boots": [
+     0.9978,
+     0.9958
+    ],
+    "speedup_of_means": 1.321,
+    "r1_faster_beyond_interval": true,
+    "r1_slower_beyond_interval": false
+   },
+   "bit_exact": true
+  },
+  {
+   "bench": "mxfp4_norm_rope_quantize_v41_shards1",
+   "M": 2048,
+   "1107_receipt_boots_us": [
+    5.3664,
+    6.2816
+   ],
+   "pr991_receipt_boots_us": [
+    5.3696,
+    6.3808
+   ],
+   "r1_boots_us": {
+    "boot1": 5.8016,
+    "boot2_overlapped": 5.3952,
+    "boot3": 5.3952
+   },
+   "verdict_vs_1107_boots_1_3": "within",
+   "verdict_vs_1107_boots_1_2_3": "within",
+   "speedup_of_means_vs_1107_boots_1_3": 1.04,
+   "in_run_1107_arm_us": {
+    "boot1": 5.8112,
+    "boot2_overlapped": 5.4144,
+    "boot3": 5.3824
+   },
+   "in_run_paired_delta_pct": {
+    "boot1": -0.17,
+    "boot2_overlapped": -0.35,
+    "boot3": 0.24
+   },
+   "graph_us_per_launch": {
+    "1107_boots": [
+     2.8832,
+     2.7872
+    ],
+    "r1_boots": [
+     2.0832,
+     2.08
+    ],
+    "speedup_of_means": 1.362,
+    "r1_faster_beyond_interval": true,
+    "r1_slower_beyond_interval": false
+   },
+   "bit_exact": true
+  },
+  {
+   "bench": "mxfp4_norm_rope_quantize_v41_shards1",
+   "M": 8192,
+   "1107_receipt_boots_us": [
+    6.9216,
+    7.024
+   ],
+   "pr991_receipt_boots_us": [
+    5.3536,
+    5.8848
+   ],
+   "r1_boots_us": {
+    "boot1": 6.1888,
+    "boot2_overlapped": 5.4016,
+    "boot3": 5.392
+   },
+   "verdict_vs_1107_boots_1_3": "gain",
+   "verdict_vs_1107_boots_1_2_3": "gain",
+   "speedup_of_means_vs_1107_boots_1_3": 1.204,
+   "in_run_1107_arm_us": {
+    "boot1": 7.0432,
+    "boot2_overlapped": 7.0016,
+    "boot3": 6.9696
+   },
+   "in_run_paired_delta_pct": {
+    "boot1": -12.13,
+    "boot2_overlapped": -22.85,
+    "boot3": -22.64
+   },
+   "graph_us_per_launch": {
+    "1107_boots": [
+     6.2848,
+     6.2944
+    ],
+    "r1_boots": [
+     4.208,
+     4.208
+    ],
+    "speedup_of_means": 1.495,
+    "r1_faster_beyond_interval": true,
+    "r1_slower_beyond_interval": false
+   },
+   "bit_exact": true
+  },
+  {
+   "bench": "mxfp4_norm_rope_quantize_v41_shards6",
+   "M": 1,
+   "1107_receipt_boots_us": [
+    5.4464,
+    4.5824
+   ],
+   "pr991_receipt_boots_us": [
+    5.383,
+    4.5875
+   ],
+   "r1_boots_us": {
+    "boot1": 4.5274,
+    "boot2_overlapped": 13.9475,
+    "boot3": 4.5709
+   },
+   "verdict_vs_1107_boots_1_3": "gain",
+   "verdict_vs_1107_boots_1_2_3": "within",
+   "speedup_of_means_vs_1107_boots_1_3": 1.102,
+   "in_run_1107_arm_us": {
+    "boot1": 4.5402,
+    "boot2_overlapped": 13.6947,
+    "boot3": 4.5696
+   },
+   "in_run_paired_delta_pct": {
+    "boot1": -0.28,
+    "boot2_overlapped": 1.85,
+    "boot3": 0.03
+   },
+   "graph_us_per_launch": {
+    "1107_boots": [
+     1.481,
+     1.4829
+    ],
+    "r1_boots": [
+     1.1533,
+     1.1546
+    ],
+    "speedup_of_means": 1.284,
+    "r1_faster_beyond_interval": true,
+    "r1_slower_beyond_interval": false
+   },
+   "bit_exact": true
+  },
+  {
+   "bench": "mxfp4_norm_rope_quantize_v41_shards6",
+   "M": 2,
+   "1107_receipt_boots_us": [
+    5.5027,
+    4.5792
+   ],
+   "pr991_receipt_boots_us": [
+    5.5578,
+    4.5901
+   ],
+   "r1_boots_us": {
+    "boot1": 4.5619,
+    "boot2_overlapped": 4.6368,
+    "boot3": 4.553
+   },
+   "verdict_vs_1107_boots_1_3": "gain",
+   "verdict_vs_1107_boots_1_2_3": "within",
+   "speedup_of_means_vs_1107_boots_1_3": 1.106,
+   "in_run_1107_arm_us": {
+    "boot1": 4.5632,
+    "boot2_overlapped": 4.6374,
+    "boot3": 4.5421
+   },
+   "in_run_paired_delta_pct": {
+    "boot1": -0.03,
+    "boot2_overlapped": -0.01,
+    "boot3": 0.24
+   },
+   "graph_us_per_launch": {
+    "1107_boots": [
+     1.5014,
+     1.4976
+    ],
+    "r1_boots": [
+     1.2275,
+     1.2288
+    ],
+    "speedup_of_means": 1.221,
+    "r1_faster_beyond_interval": true,
+    "r1_slower_beyond_interval": false
+   },
+   "bit_exact": true
+  },
+  {
+   "bench": "mxfp4_norm_rope_quantize_v41_shards6",
+   "M": 4,
+   "1107_receipt_boots_us": [
+    5.5571,
+    4.5747
+   ],
+   "pr991_receipt_boots_us": [
+    5.593,
+    4.583
+   ],
+   "r1_boots_us": {
+    "boot1": 4.553,
+    "boot2_overlapped": 4.592,
+    "boot3": 4.5299
+   },
+   "verdict_vs_1107_boots_1_3": "gain",
+   "verdict_vs_1107_boots_1_2_3": "within",
+   "speedup_of_means_vs_1107_boots_1_3": 1.115,
+   "in_run_1107_arm_us": {
+    "boot1": 4.5632,
+    "boot2_overlapped": 4.5946,
+    "boot3": 4.5222
+   },
+   "in_run_paired_delta_pct": {
+    "boot1": -0.22,
+    "boot2_overlapped": -0.06,
+    "boot3": 0.17
+   },
+   "graph_us_per_launch": {
+    "1107_boots": [
+     1.5667,
+     1.5846
+    ],
+    "r1_boots": [
+     1.239,
+     1.2672
+    ],
+    "speedup_of_means": 1.257,
+    "r1_faster_beyond_interval": true,
+    "r1_slower_beyond_interval": false
+   },
+   "bit_exact": true
+  },
+  {
+   "bench": "mxfp4_norm_rope_quantize_v41_shards6",
+   "M": 6,
+   "1107_receipt_boots_us": [
+    5.5034,
+    4.5773
+   ],
+   "pr991_receipt_boots_us": [
+    5.5424,
+    4.5965
+   ],
+   "r1_boots_us": {
+    "boot1": 4.5446,
+    "boot2_overlapped": 4.5811,
+    "boot3": 4.544
+   },
+   "verdict_vs_1107_boots_1_3": "gain",
+   "verdict_vs_1107_boots_1_2_3": "within",
+   "speedup_of_means_vs_1107_boots_1_3": 1.109,
+   "in_run_1107_arm_us": {
+    "boot1": 4.5402,
+    "boot2_overlapped": 4.5862,
+    "boot3": 4.5312
+   },
+   "in_run_paired_delta_pct": {
+    "boot1": 0.1,
+    "boot2_overlapped": -0.11,
+    "boot3": 0.28
+   },
+   "graph_us_per_launch": {
+    "1107_boots": [
+     1.7178,
+     1.6992
+    ],
+    "r1_boots": [
+     1.3792,
+     1.3862
+    ],
+    "speedup_of_means": 1.236,
+    "r1_faster_beyond_interval": true,
+    "r1_slower_beyond_interval": false
+   },
+   "bit_exact": true
+  },
+  {
+   "bench": "mxfp4_norm_rope_quantize_v41_shards6",
+   "M": 8,
+   "1107_receipt_boots_us": [
+    5.4458,
+    4.5715
+   ],
+   "pr991_receipt_boots_us": [
+    5.4714,
+    4.5914
+   ],
+   "r1_boots_us": {
+    "boot1": 5.0035,
+    "boot2_overlapped": 4.5734,
+    "boot3": 4.567
+   },
+   "verdict_vs_1107_boots_1_3": "within",
+   "verdict_vs_1107_boots_1_2_3": "within",
+   "speedup_of_means_vs_1107_boots_1_3": 1.047,
+   "in_run_1107_arm_us": {
+    "boot1": 4.7034,
+    "boot2_overlapped": 4.5811,
+    "boot3": 4.5568
+   },
+   "in_run_paired_delta_pct": {
+    "boot1": 6.38,
+    "boot2_overlapped": -0.17,
+    "boot3": 0.22
+   },
+   "graph_us_per_launch": {
+    "1107_boots": [
+     1.744,
+     1.7274
+    ],
+    "r1_boots": [
+     1.431,
+     1.408
+    ],
+    "speedup_of_means": 1.223,
+    "r1_faster_beyond_interval": true,
+    "r1_slower_beyond_interval": false
+   },
+   "bit_exact": true
+  },
+  {
+   "bench": "mxfp4_norm_rope_quantize_v41_shards6",
+   "M": 16,
+   "1107_receipt_boots_us": [
+    5.4893,
+    4.5683
+   ],
+   "pr991_receipt_boots_us": [
+    5.4899,
+    4.5779
+   ],
+   "r1_boots_us": {
+    "boot1": 5.3952,
+    "boot2_overlapped": 4.5715,
+    "boot3": 4.5709
+   },
+   "verdict_vs_1107_boots_1_3": "within",
+   "verdict_vs_1107_boots_1_2_3": "within",
+   "speedup_of_means_vs_1107_boots_1_3": 1.009,
+   "in_run_1107_arm_us": {
+    "boot1": 5.3734,
+    "boot2_overlapped": 4.5843,
+    "boot3": 4.5594
+   },
+   "in_run_paired_delta_pct": {
+    "boot1": 0.41,
+    "boot2_overlapped": -0.28,
+    "boot3": 0.25
+   },
+   "graph_us_per_launch": {
+    "1107_boots": [
+     1.9738,
+     2.0211
+    ],
+    "r1_boots": [
+     1.6499,
+     1.6998
+    ],
+    "speedup_of_means": 1.193,
+    "r1_faster_beyond_interval": true,
+    "r1_slower_beyond_interval": false
+   },
+   "bit_exact": true
+  },
+  {
+   "bench": "mxfp4_norm_rope_quantize_v41_shards6",
+   "M": 32,
+   "1107_receipt_boots_us": [
+    5.4534,
+    4.5741
+   ],
+   "pr991_receipt_boots_us": [
+    5.4758,
+    4.5786
+   ],
+   "r1_boots_us": {
+    "boot1": 4.5338,
+    "boot2_overlapped": 4.5773,
+    "boot3": 4.5382
+   },
+   "verdict_vs_1107_boots_1_3": "gain",
+   "verdict_vs_1107_boots_1_2_3": "within",
+   "speedup_of_means_vs_1107_boots_1_3": 1.105,
+   "in_run_1107_arm_us": {
+    "boot1": 4.537,
+    "boot2_overlapped": 4.5734,
+    "boot3": 4.5312
+   },
+   "in_run_paired_delta_pct": {
+    "boot1": -0.07,
+    "boot2_overlapped": 0.09,
+    "boot3": 0.15
+   },
+   "graph_us_per_launch": {
+    "1107_boots": [
+     2.0211,
+     1.975
+    ],
+    "r1_boots": [
+     1.6966,
+     1.6474
+    ],
+    "speedup_of_means": 1.195,
+    "r1_faster_beyond_interval": true,
+    "r1_slower_beyond_interval": false
+   },
+   "bit_exact": true
+  }
+ ],
+ "diagnostics": {
+  "diag/paged-1.json": "paged-key store variants (1107, PR 128-bit, hw+16 byte stores, hw+4x32-bit, hw+2x64-bit, null kernel): eager all within 0.03 us at M<=512 (launch floor); graph: PR at the null kernel's time; byte stores with hw conversion lose most of the gain at M>=512",
+  "diag/gemm-1.json": "GEMM epilogue variants (1107, PR rolled, hw serial, 1107 rolled): graph per-launch M=1 5.011/5.002/4.769/5.011 us; bm64 PR 14.63 vs serial 14.76",
+  "diag/bench-pr-asis.json, diag/graph-pr-asis.json": "the unchanged PR on the image, today: the receipts' small-M paged-key and M=2048 slowdowns do not reproduce (paired -0.3..-2.5%); GEMM M=1..2 graph -0.1/-0.2% (no gain)",
+  "diag/cupti-1.json": "kernel time of 1107 / PR / unrolled for GEMM and 1107 / PR for paged keys"
+ },
+ "notes": [
+  "Cross-session comparison against the receipts is confounded in the launch-bound cells: today's launch floor for the quantizers was ~3.9 us against ~4.1-4.4 us at receipt time, so several 'gain' cells (paged keys M=2..512, norm-RoPE shards6 small M) are launch-floor drift with in-run paired deltas near 0, not kernel gains. They are not claimed.",
+  "First-cell-after-compile slow phases hit both arms in every session: receipts query RoPE M=1 boot2 12.43 us; r1 paged keys M=1 10.25 (boot1) and M=1..8 11.1-11.6 (boot3); norm-RoPE M=1 13.9 (boot2).",
+  "Claims kept for r1 (bench, beyond the interval vs 1107 receipts, boots 1 and 3): GEMM M=1 1.017x, M=16 1.065x, M=32 1.057x, M=64 1.062x; query RoPE M=512 1.556x; paged keys M=8192 2.067x; norm-RoPE shards1 M=8192 1.204x. Kernel time: GEMM 3.7-5.1% faster at every M, paged keys 30-57% faster at every M.",
+  "The PR's static-SASS table for the GEMM no longer applies: unrolled, the bm16/32/64 epilogue kernels are 720/608/728 SASS instructions (PR rolled 440/496/608, 1107 488/536/656).",
+  "The bench's 1107 arm is not bit-for-bit 1107's module code only in that it lacks 0764's T.import_source of the E2M1 header and the unused paged+RoPE prim_func; its kernels' bodies match 1107's indexer.py/gemm.py."
+ ]
+}

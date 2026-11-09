@@ -1,0 +1,570 @@
+{
+ "pr": 1005,
+ "pr_head": "9fc2775b2577963d3190711f15d68dc18b76ebd6",
+ "patch": "0765-perf-dsv41-skip-empty-moe-swiglu-slabs-and-restore-p.patch",
+ "mark": "Its FFN sublayer bench against the 1107 image: gain beyond the interval, bit-exact",
+ "host": "sp4 (spark-0012, NVIDIA GB10, driver 580.178.04)",
+ "images": {
+  "1107": "sha256:3f32a962ce04b7c8d85337cd427a8946b8b6bcaadd97cc8d8a8cd14e8d68a6ce",
+  "candidate-47": "the same image with the 26 candidate-47 files bind-mounted read-only; ../common/overlay-sha.txt"
+ },
+ "evidence": "One session on sp4, ABBA: the PR's bench_moe_swiglu_and_dual_stream.py on the 1107 image and the candidate image (bench-*.json). The bench already times CUDA-graph replay (standalone moe_swiglu_cast: 35 windows x 20 replays; FFN sublayer: warm 10-layer graphs and cold-L2 + FFN-prefetch 1-layer graphs, 25 interleaved windows over four modes) and asserts bit-equality of every mode, eager and replayed. No extra harness was needed.",
+ "readme_command_defects": [
+  "The README's docker commands give no --entrypoint; the image's entrypoint is `vllm serve`, so they would start a server with 'pytest' / 'python3' as the model. We ran the bench with --entrypoint python3 (no server was started)",
+  "The README passes --out; the script's flag is --output (argparse accepts the prefix)",
+  "The README describes E=72 routed experts and I_shared 576/768; the script uses E=384 and shared_I 1152/1536",
+  "The bench never imports moe_runner.py or shared_experts.py: its baseline_1107 and candidate_full modes are hand-written stream schedules. The PR's second change (the restored post-gate hook and early _input_ready_event) is not exercised by its own bench; only its moe_swiglu_cast change is",
+  "On the candidate image the bench's MoE plans carry 0763's evict_first GEMMs in every mode, so the cross-image change of any one mode includes #966"
+ ],
+ "measured": {
+  "standalone_moe_swiglu_cast_graph_us": {
+   "I576_M1": {
+    "c47_b1_b2_1107copy_vs_candidate_us": [
+     [
+      1.048,
+      1.019
+     ],
+     [
+      1.048,
+      1.003
+     ]
+    ],
+    "1107_b1_b2_A/A_us": [
+     [
+      1.056,
+      1.059
+     ],
+     [
+      1.037,
+      1.022
+     ]
+    ]
+   },
+   "I576_M6": {
+    "c47_b1_b2_1107copy_vs_candidate_us": [
+     [
+      1.354,
+      1.168
+     ],
+     [
+      1.302,
+      1.179
+     ]
+    ],
+    "1107_b1_b2_A/A_us": [
+     [
+      1.296,
+      1.294
+     ],
+     [
+      1.298,
+      1.302
+     ]
+    ]
+   },
+   "I576_M24": {
+    "c47_b1_b2_1107copy_vs_candidate_us": [
+     [
+      3.12,
+      2.419
+     ],
+     [
+      3.142,
+      2.434
+     ]
+    ],
+    "1107_b1_b2_A/A_us": [
+     [
+      3.131,
+      3.163
+     ],
+     [
+      3.122,
+      3.136
+     ]
+    ]
+   },
+   "I576_M48": {
+    "c47_b1_b2_1107copy_vs_candidate_us": [
+     [
+      5.085,
+      3.63
+     ],
+     [
+      5.051,
+      3.67
+     ]
+    ],
+    "1107_b1_b2_A/A_us": [
+     [
+      5.082,
+      5.066
+     ],
+     [
+      5.075,
+      5.09
+     ]
+    ]
+   },
+   "I768_M1": {
+    "c47_b1_b2_1107copy_vs_candidate_us": [
+     [
+      1.662,
+      1.509
+     ],
+     [
+      1.278,
+      1.272
+     ]
+    ],
+    "1107_b1_b2_A/A_us": [
+     [
+      1.63,
+      1.477
+     ],
+     [
+      1.302,
+      1.28
+     ]
+    ]
+   },
+   "I768_M6": {
+    "c47_b1_b2_1107copy_vs_candidate_us": [
+     [
+      1.85,
+      1.627
+     ],
+     [
+      1.467,
+      1.381
+     ]
+    ],
+    "1107_b1_b2_A/A_us": [
+     [
+      1.851,
+      1.683
+     ],
+     [
+      1.534,
+      1.48
+     ]
+    ]
+   },
+   "I768_M24": {
+    "c47_b1_b2_1107copy_vs_candidate_us": [
+     [
+      2.622,
+      2.246
+     ],
+     [
+      2.621,
+      2.285
+     ]
+    ],
+    "1107_b1_b2_A/A_us": [
+     [
+      2.614,
+      2.611
+     ],
+     [
+      2.616,
+      2.614
+     ]
+    ]
+   },
+   "I768_M48": {
+    "c47_b1_b2_1107copy_vs_candidate_us": [
+     [
+      3.758,
+      3.267
+     ],
+     [
+      3.76,
+      3.272
+     ]
+    ],
+    "1107_b1_b2_A/A_us": [
+     [
+      3.786,
+      3.789
+     ],
+     [
+      3.75,
+      3.781
+     ]
+    ]
+   }
+  },
+  "ffn_sublayer_graph_us": {
+   "TP4_cold_l2pf_graph_us": {
+    "1": {
+     "pr_increment_c47_cand_full_minus_baseline_mode_b1_b2": [
+      0.83,
+      0.9
+     ],
+     "aa_floor_1107_swiglu_only_minus_baseline_b1_b2": [
+      2.15,
+      1.15
+     ],
+     "cross_image_c47_cand_full_minus_1107_baseline": -2.51,
+     "of_which_0763_same_mode_across_images": -3.37
+    },
+    "2": {
+     "pr_increment_c47_cand_full_minus_baseline_mode_b1_b2": [
+      1.38,
+      2.11
+     ],
+     "aa_floor_1107_swiglu_only_minus_baseline_b1_b2": [
+      2.05,
+      1.03
+     ],
+     "cross_image_c47_cand_full_minus_1107_baseline": -0.34,
+     "of_which_0763_same_mode_across_images": -2.08
+    },
+    "3": {
+     "pr_increment_c47_cand_full_minus_baseline_mode_b1_b2": [
+      -2.81,
+      -3.13
+     ],
+     "aa_floor_1107_swiglu_only_minus_baseline_b1_b2": [
+      1.28,
+      0.13
+     ],
+     "cross_image_c47_cand_full_minus_1107_baseline": -0.5,
+     "of_which_0763_same_mode_across_images": 2.46
+    },
+    "6": {
+     "pr_increment_c47_cand_full_minus_baseline_mode_b1_b2": [
+      3.08,
+      2.08
+     ],
+     "aa_floor_1107_swiglu_only_minus_baseline_b1_b2": [
+      0.07,
+      -0.99
+     ],
+     "cross_image_c47_cand_full_minus_1107_baseline": -4.77,
+     "of_which_0763_same_mode_across_images": -7.35
+    },
+    "12": {
+     "pr_increment_c47_cand_full_minus_baseline_mode_b1_b2": [
+      -3.07,
+      -2.05
+     ],
+     "aa_floor_1107_swiglu_only_minus_baseline_b1_b2": [
+      1.18,
+      0.83
+     ],
+     "cross_image_c47_cand_full_minus_1107_baseline": -10.69,
+     "of_which_0763_same_mode_across_images": -8.13
+    },
+    "24": {
+     "pr_increment_c47_cand_full_minus_baseline_mode_b1_b2": [
+      -7.17,
+      1.03
+     ],
+     "aa_floor_1107_swiglu_only_minus_baseline_b1_b2": [
+      -1.95,
+      -0.26
+     ],
+     "cross_image_c47_cand_full_minus_1107_baseline": -17.01,
+     "of_which_0763_same_mode_across_images": -13.94
+    },
+    "48": {
+     "pr_increment_c47_cand_full_minus_baseline_mode_b1_b2": [
+      -4.1,
+      -1.12
+     ],
+     "aa_floor_1107_swiglu_only_minus_baseline_b1_b2": [
+      -0.26,
+      -2.05
+     ],
+     "cross_image_c47_cand_full_minus_1107_baseline": -22.66,
+     "of_which_0763_same_mode_across_images": -20.05
+    }
+   },
+   "TP4_warm_graph_us": {
+    "1": {
+     "pr_increment_c47_cand_full_minus_baseline_mode_b1_b2": [
+      0.85,
+      1.33
+     ],
+     "aa_floor_1107_swiglu_only_minus_baseline_b1_b2": [
+      -5.23,
+      -0.01
+     ],
+     "cross_image_c47_cand_full_minus_1107_baseline": -50.64,
+     "of_which_0763_same_mode_across_images": -51.73
+    },
+    "2": {
+     "pr_increment_c47_cand_full_minus_baseline_mode_b1_b2": [
+      1.06,
+      0.72
+     ],
+     "aa_floor_1107_swiglu_only_minus_baseline_b1_b2": [
+      -0.14,
+      0.44
+     ],
+     "cross_image_c47_cand_full_minus_1107_baseline": -38.78,
+     "of_which_0763_same_mode_across_images": -39.66
+    },
+    "3": {
+     "pr_increment_c47_cand_full_minus_baseline_mode_b1_b2": [
+      1.18,
+      1.26
+     ],
+     "aa_floor_1107_swiglu_only_minus_baseline_b1_b2": [
+      0.55,
+      0.02
+     ],
+     "cross_image_c47_cand_full_minus_1107_baseline": -27.63,
+     "of_which_0763_same_mode_across_images": -28.85
+    },
+    "6": {
+     "pr_increment_c47_cand_full_minus_baseline_mode_b1_b2": [
+      1.66,
+      0.69
+     ],
+     "aa_floor_1107_swiglu_only_minus_baseline_b1_b2": [
+      -0.07,
+      -0.19
+     ],
+     "cross_image_c47_cand_full_minus_1107_baseline": -18.96,
+     "of_which_0763_same_mode_across_images": -20.13
+    },
+    "12": {
+     "pr_increment_c47_cand_full_minus_baseline_mode_b1_b2": [
+      1.07,
+      0.36
+     ],
+     "aa_floor_1107_swiglu_only_minus_baseline_b1_b2": [
+      0.38,
+      -0.53
+     ],
+     "cross_image_c47_cand_full_minus_1107_baseline": -1.72,
+     "of_which_0763_same_mode_across_images": -2.43
+    },
+    "24": {
+     "pr_increment_c47_cand_full_minus_baseline_mode_b1_b2": [
+      -0.95,
+      0.11
+     ],
+     "aa_floor_1107_swiglu_only_minus_baseline_b1_b2": [
+      -1.43,
+      -0.09
+     ],
+     "cross_image_c47_cand_full_minus_1107_baseline": -6.83,
+     "of_which_0763_same_mode_across_images": -6.41
+    },
+    "48": {
+     "pr_increment_c47_cand_full_minus_baseline_mode_b1_b2": [
+      -0.88,
+      -1.96
+     ],
+     "aa_floor_1107_swiglu_only_minus_baseline_b1_b2": [
+      -0.34,
+      -1.22
+     ],
+     "cross_image_c47_cand_full_minus_1107_baseline": -10.62,
+     "of_which_0763_same_mode_across_images": -9.2
+    }
+   },
+   "TP3_cold_l2pf_graph_us": {
+    "1": {
+     "pr_increment_c47_cand_full_minus_baseline_mode_b1_b2": [
+      0.84,
+      0.93
+     ],
+     "aa_floor_1107_swiglu_only_minus_baseline_b1_b2": [
+      2.02,
+      -0.51
+     ],
+     "cross_image_c47_cand_full_minus_1107_baseline": -1.58,
+     "of_which_0763_same_mode_across_images": -2.46
+    },
+    "2": {
+     "pr_increment_c47_cand_full_minus_baseline_mode_b1_b2": [
+      1.02,
+      0.77
+     ],
+     "aa_floor_1107_swiglu_only_minus_baseline_b1_b2": [
+      2.11,
+      0.36
+     ],
+     "cross_image_c47_cand_full_minus_1107_baseline": 0.59,
+     "of_which_0763_same_mode_across_images": -0.3
+    },
+    "3": {
+     "pr_increment_c47_cand_full_minus_baseline_mode_b1_b2": [
+      -0.8,
+      -1.57
+     ],
+     "aa_floor_1107_swiglu_only_minus_baseline_b1_b2": [
+      0.2,
+      -0.6
+     ],
+     "cross_image_c47_cand_full_minus_1107_baseline": -2.73,
+     "of_which_0763_same_mode_across_images": -1.54
+    },
+    "6": {
+     "pr_increment_c47_cand_full_minus_baseline_mode_b1_b2": [
+      -2.88,
+      -0.41
+     ],
+     "aa_floor_1107_swiglu_only_minus_baseline_b1_b2": [
+      -2.24,
+      -0.22
+     ],
+     "cross_image_c47_cand_full_minus_1107_baseline": -9.22,
+     "of_which_0763_same_mode_across_images": -7.57
+    },
+    "12": {
+     "pr_increment_c47_cand_full_minus_baseline_mode_b1_b2": [
+      -0.67,
+      -4.09
+     ],
+     "aa_floor_1107_swiglu_only_minus_baseline_b1_b2": [
+      0.03,
+      1.34
+     ],
+     "cross_image_c47_cand_full_minus_1107_baseline": -14.58,
+     "of_which_0763_same_mode_across_images": -12.2
+    },
+    "24": {
+     "pr_increment_c47_cand_full_minus_baseline_mode_b1_b2": [
+      -6.56,
+      -2.78
+     ],
+     "aa_floor_1107_swiglu_only_minus_baseline_b1_b2": [
+      0.36,
+      -0.32
+     ],
+     "cross_image_c47_cand_full_minus_1107_baseline": -31.54,
+     "of_which_0763_same_mode_across_images": -26.87
+    },
+    "48": {
+     "pr_increment_c47_cand_full_minus_baseline_mode_b1_b2": [
+      -1.03,
+      -0.22
+     ],
+     "aa_floor_1107_swiglu_only_minus_baseline_b1_b2": [
+      -2.02,
+      -1.69
+     ],
+     "cross_image_c47_cand_full_minus_1107_baseline": -48.66,
+     "of_which_0763_same_mode_across_images": -48.03
+    }
+   },
+   "TP3_warm_graph_us": {
+    "1": {
+     "pr_increment_c47_cand_full_minus_baseline_mode_b1_b2": [
+      1.47,
+      2.6
+     ],
+     "aa_floor_1107_swiglu_only_minus_baseline_b1_b2": [
+      0.32,
+      0.05
+     ],
+     "cross_image_c47_cand_full_minus_1107_baseline": -24.29,
+     "of_which_0763_same_mode_across_images": -26.33
+    },
+    "2": {
+     "pr_increment_c47_cand_full_minus_baseline_mode_b1_b2": [
+      2.35,
+      1.37
+     ],
+     "aa_floor_1107_swiglu_only_minus_baseline_b1_b2": [
+      0.01,
+      0.1
+     ],
+     "cross_image_c47_cand_full_minus_1107_baseline": -21.23,
+     "of_which_0763_same_mode_across_images": -23.09
+    },
+    "3": {
+     "pr_increment_c47_cand_full_minus_baseline_mode_b1_b2": [
+      2.56,
+      2.37
+     ],
+     "aa_floor_1107_swiglu_only_minus_baseline_b1_b2": [
+      -0.13,
+      -0.18
+     ],
+     "cross_image_c47_cand_full_minus_1107_baseline": -15.92,
+     "of_which_0763_same_mode_across_images": -18.39
+    },
+    "6": {
+     "pr_increment_c47_cand_full_minus_baseline_mode_b1_b2": [
+      2.0,
+      1.75
+     ],
+     "aa_floor_1107_swiglu_only_minus_baseline_b1_b2": [
+      0.45,
+      0.02
+     ],
+     "cross_image_c47_cand_full_minus_1107_baseline": -14.6,
+     "of_which_0763_same_mode_across_images": -16.48
+    },
+    "12": {
+     "pr_increment_c47_cand_full_minus_baseline_mode_b1_b2": [
+      1.54,
+      1.3
+     ],
+     "aa_floor_1107_swiglu_only_minus_baseline_b1_b2": [
+      -0.02,
+      0.35
+     ],
+     "cross_image_c47_cand_full_minus_1107_baseline": -10.12,
+     "of_which_0763_same_mode_across_images": -11.54
+    },
+    "24": {
+     "pr_increment_c47_cand_full_minus_baseline_mode_b1_b2": [
+      0.43,
+      0.72
+     ],
+     "aa_floor_1107_swiglu_only_minus_baseline_b1_b2": [
+      0.6,
+      -0.99
+     ],
+     "cross_image_c47_cand_full_minus_1107_baseline": -17.9,
+     "of_which_0763_same_mode_across_images": -18.48
+    },
+    "48": {
+     "pr_increment_c47_cand_full_minus_baseline_mode_b1_b2": [
+      1.5,
+      0.35
+     ],
+     "aa_floor_1107_swiglu_only_minus_baseline_b1_b2": [
+      1.31,
+      -0.5
+     ],
+     "cross_image_c47_cand_full_minus_1107_baseline": -32.36,
+     "of_which_0763_same_mode_across_images": -33.28
+    }
+   }
+  },
+  "interval": "the bench records one median per mode and boot. The A/A floor is the 1107 image's swiglu_only minus baseline_1107 (the same 1107 kernel twice, same schedule); the PR's increment is candidate_full minus baseline_1107 inside the candidate image, both boots"
+ },
+ "bit_exact": "pass: the bench asserts uint16 equality of every FFN mode (eager, 1-layer and 10-layer graphs) and E4M3/UE8M0 equality of the standalone kernel on both images, all four runs exit 0",
+ "parts": [
+  {
+   "part": "moe_swiglu_cast kernel",
+   "verdict": "gain",
+   "detail": "graph replay 0.03..1.45 us faster per layer than the 1107 kernel copy in the same process (I=576 M=48: 5.09/5.05 -> 3.63/3.67 us; M=6: 1.35/1.30 -> 1.17/1.18 us); on the 1107 image the copy and the image kernel agree (A/A)"
+  },
+  {
+   "part": "FFN sublayer, PR's increment",
+   "verdict": "no gain beyond the interval",
+   "detail": "warm graphs: candidate_full is 0.4..2.6 us slower than baseline_1107 at M=1..12 on both shapes and boots (A/A floor about 0.5 us). Cold-L2 + FFN-prefetch graphs: 0.8..3.1 us slower at M=1, 2 (both shapes) and M=6 (TP4); 2..7 us faster on both boots only at TP4 M=3 (-2.8/-3.1) and M=12 (-3.1/-2.1) and TP3 M=24 (-6.6/-2.8); the rest is mixed between boots or inside the A/A floor (which reaches 2 us at cold M=1..2)"
+  },
+  {
+   "part": "FFN sublayer against the 1107 image",
+   "verdict": "gain, but #966's",
+   "detail": "candidate_full on the candidate image beats baseline_1107 on the 1107 image (TP4 warm M=1 -50.6 us, cold M=1 -2.5 us, cold M=48 -22.7 us), but the identical baseline_1107 mode moves by the same amount across images (-51.7, -3.4, -20.1 us): that is 0763's evict_first, not this PR"
+  }
+ ],
+ "verdict": "miss",
+ "reason": "The moe_swiglu_cast change is a real gain of 0.03..1.45 us per layer, but at the FFN sublayer, the mark's metric, the PR's own increment is not a gain beyond the interval: slower in warm graphs at M=1..12, slower in cold-L2 graphs at M=1..2, faster only at a few cold points (M=3/12 on TP4, M=24 on TP3). The large gain of the candidate image over the 1107 image belongs to #966 (0763): the PR-independent baseline mode moves by the same amount. The post-gate hook change is not measured by this bench at all.",
+ "notes": [
+  "commands.txt holds every run's command, host state and UTC times",
+  "summary.txt (../common/analyze/a1005.py) lists every mode, M and run; summary-deltas.json (a1005_deltas.py) the increments, A/A floor and cross-image split"
+ ]
+}

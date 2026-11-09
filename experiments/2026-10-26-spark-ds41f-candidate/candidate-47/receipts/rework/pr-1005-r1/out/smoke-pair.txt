@@ -1,0 +1,40 @@
+INFO 11-09 11:04:32 [__init__.py:119] Registered model loader `<class 'b12x.integration.vllm.loader.B12xModelLoader'>` with load format `b12x`
+WARNING 11-09 11:04:32 [envs.py:2719] Unknown vLLM environment variable detected: VLLM_L2_PREFETCH_GRID
+WARNING 11-09 11:04:32 [envs.py:2719] Unknown vLLM environment variable detected: VLLM_L2_PREFETCH_KERNELS
+WARNING 11-09 11:04:32 [envs.py:2719] Unknown vLLM environment variable detected: VLLM_NATIVE_CACHE_DIR
+INFO 11-09 11:04:32 [config.py:852] Detected quantization_config.scale_fmt=ue8m0; enabling UE8M0 for DeepGEMM.
+INFO 11-09 11:04:40 [model.py:693] Resolved architecture: DeepseekV41ForCausalLM
+INFO 11-09 11:04:40 [model.py:716] Defaulting to tokenizer_mode='deepseek_v41' for DeepseekV41ForCausalLM
+INFO 11-09 11:04:40 [model.py:2066] Using max model len 65536
+WARNING 11-09 11:04:40 [model.py:997] Model does not support mm_device_do_normalize, forcing mm_device_do_normalize = False.
+INFO 11-09 11:04:40 [scheduler.py:436] Chunked prefill is enabled with max_num_batched_tokens=16384.
+INFO 11-09 11:04:40 [vllm.py:1521] Resolved Engram configuration: EngramConfig(cpu_offload=True, embedding_across_dp=False, dp_shared_memory=False, table_memory='device', projection_tp=False, disk_resident_scales=False)
+INFO 11-09 11:04:40 [kernel.py:435] Final IR op priority after setting platform defaults: IrOpPriorityConfig(rms_norm=['native'], fused_add_rms_norm=['native'], gelu_and_mul_sparse=['triton', 'native'])
+INFO 11-09 11:04:40 [compilation.py:336] Enabled custom fusions: norm_quant, act_quant
+INFO 11-09 11:04:40 [parallel_state.py:1953] world_size=1 rank=0 local_rank=0 distributed_init_method=tcp://127.0.0.1:29517 backend=nccl
+INFO 11-09 11:04:40 [parallel_state.py:2393] rank 0 in world size 1 is assigned as DP rank 0, PP rank 0, PCP rank 0, TP rank 0, ETP rank 0, EP rank 0, EPLB rank N/A
+INFO 11-09 11:04:41 [mxfp4.py:464] Using 'TILELANG_MXFP4_MXFP8' Mxfp4 MoE backend.
+INFO 11-09 11:04:42 [mxfp4.py:2011] Using MoEPrepareAndFinalizeNoDPEPModular
+INFO 11-09 11:04:42 [mxfp4.py:2012] Using TileLangExperts
+2026-11-09 11:04:45  [TileLang:tilelang.cache.kernel_cache:WARNING] (kernel_cache.py:421): Found kernel 'moe_dispatch' in memory cache. For better performance, consider using `@tilelang.jit` instead of direct kernel caching.
+2026-11-09 11:04:45  [TileLang:tilelang.cache.kernel_cache:WARNING] (kernel_cache.py:421): Found kernel 'moe_dispatch' in memory cache. For better performance, consider using `@tilelang.jit` instead of direct kernel caching.
+2026-11-09 11:04:45  [TileLang:tilelang.cache.kernel_cache:WARNING] (kernel_cache.py:421): Found kernel 'moe_dispatch' in memory cache. For better performance, consider using `@tilelang.jit` instead of direct kernel caching.
+2026-11-09 11:04:45  [TileLang:tilelang.cache.kernel_cache:WARNING] (kernel_cache.py:421): Found kernel 'moe_dispatch' in memory cache. For better performance, consider using `@tilelang.jit` instead of direct kernel caching.
+2026-11-09 11:04:46  [TileLang:tilelang.jit.kernel:INFO] (kernel.py:137): TileLang begins to compile kernel `moe_swiglu_cast_kernel` with `out_idx=None`
+2026-11-09 11:04:47  [TileLang:tilelang.jit.kernel:INFO] (kernel.py:145): TileLang completes to compile kernel `moe_swiglu_cast_kernel`
+[tp4] built in 15.6s; swiglu args (576, 16, 10.0); alt kernel differs True
+[tp4] base: M=1 ['shared.maybe_forward_async(recorded=False)', 'router(no hook)']
+[tp4] kern: M=1 ['shared.maybe_forward_async(recorded=False)', 'router(no hook)']
+[tp4] hook: M=1 ['shared.record_input_ready->True', 'router(post_gate_hook)', 'shared.maybe_forward_async(recorded=True)']
+[tp4] c47: M=1 ['shared.record_input_ready->True', 'router(post_gate_hook)', 'shared.maybe_forward_async(recorded=True)']
+[tp4] post: M=1 ['shared.record_input_ready->False', 'router(post_gate_hook)', 'shared.maybe_forward_async(recorded=False)']
+[tp4] postk: M=1 ['shared.record_input_ready->False', 'router(post_gate_hook)', 'shared.maybe_forward_async(recorded=False)']
+INFO 11-09 11:04:47 [l2_prefetch.py:541] [l2_prefetch] persisting L2 set-aside on cuda:0: L2 25 MB, max 19 MB, requested 0 MB, now 0 MB
+INFO 11-09 11:04:47 [l2_prefetch.py:267] [l2_prefetch] TileLang kernel ready (grid=2 block=128 chunk=4096)
+[tp4] captured 24 graphs
+[tp4] chain M= 1 base   191.54 | kern  -0.37 | hook  -0.94 | c47  +3.24 | post  -1.46 | postk  +5.61
+[tp4] chain M=48 base  3959.25 | kern +12.01 | hook +97.49 | c47  -2.01 | post +38.09 | postk  -2.35
+[tp4] cold  M= 1 base   245.43 | kern  -0.06 | hook +12.46 | c47  +9.16 | post  +9.03 | postk  +7.82
+[tp4] cold  M=48 base  3996.98 | kern  +4.80 | hook  -0.08 | c47 +34.27 | post  -1.70 | postk  -3.61
+done
+[rank0]:[W1109 11:04:57.705418133 ProcessGroupNCCL.cpp:1624] Warning: WARNING: destroy_process_group() was not called before program exit, which can leak resources. For more info, please see https://pytorch.org/docs/stable/distributed.html#shutdown (function operator())

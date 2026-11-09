@@ -1,0 +1,38 @@
+# Candidate-47 own-mark checks: shared setup (sp1 = spark-0009, sp3 = spark-0011, sp4 = spark-0012).
+# Work dir on each host: ~/spark-lab/agents/candidate-47-own-marks (B). No build, no push, no cluster
+# operation, nothing on dgx, sp2 or sp5..sp8. GPU commands ran under flock /tmp/spark-lab-gpu.lock (om.sh
+# takes the lock, then records loadavg, docker ps and ~/spark-hold.json inside it, and refuses to run when
+# the hold file exists).
+#
+# Pre-checks 2026-11-09T09:37Z: docker ps empty on sp1, sp3, sp4 (sp2 ran the other agent's
+# c48rw980-stepcost-1107-boot1; not used by us); ~/spark-hold.json absent on sp1..sp4.
+# Hosts: NVIDIA GB10, driver 580.178.04, kernel 7.0.0-1024-nvidia.
+# Image (all arms): spark-ds41f:1107 = sha256:3f32a962ce04b7c8d85337cd427a8946b8b6bcaadd97cc8d8a8cd14e8d68a6ce
+#   (created 2026-11-07T17:53:37Z), entrypoint ["vllm","serve"], so every run passes --entrypoint.
+#
+# 1. Patches: candidate-47/vllm/0762..0769 copied to B/patches (tar over ssh); SHA-256 prefixes on every host
+#    e5ff5250 9c87a2cd 9dd02964 24ae9169 d52742a8 15752055 50f4161c a94953a2 (equal to the source folder).
+#    git patch-id --stable of each PR head's experiment patch equals the candidate-47 patch:
+#      #966 6e73345253f7 (0763)  #997 77ccc56cdf0f (0764)  #1005 5a737acea977 (0765)
+#      #1016 79f9cf8f9625 (0768)  #964 03d7e54776ed (0769)
+# 2. Trees (setup_trees.sh): docker create the 1107 image; docker cp /opt/spark-ds41f/candidate/vllm -> B/vllm-1107;
+#    cp -a -> B/vllm-c47; git apply --check && git apply 0762..0769 in series order (all 8 apply cleanly);
+#    the 26 files the patches touch (changed-files.txt; none added or deleted) copied to B/ovl/c47.
+#    overlay-sha.txt: 1107 and candidate-47 SHA-256 prefixes of each; identical on sp1, sp3, sp4.
+# 3. Arms: "1107" = the plain image. "c47" = the same image with the 26 candidate-47 files bind-mounted
+#    read-only at /opt/spark-ds41f/candidate/vllm/<path> (om.sh). verify-c47.txt shows the container sees the
+#    candidate SHA-256s and imports the patched modules from those paths (the image ships no __pycache__ for
+#    them, so nothing stale is loaded). Each arm has its own TileLang cache dir (B/c/tl-<arm>, mounted at
+#    /root/.tilelang, TILELANG_CACHE_DIR=/root/.tilelang/cache).
+# 4. PR experiments: git clone --reference ~/projects/spark-ds41f https://github.com/christopherowen/spark-ds41f.git
+#    B/src/repo on each host; git fetch origin pull/<N>/head:pr-<N>; extract.sh exports the experiment dir.
+#    Heads: #966 06695dd7b829a7aa0fc7c427b5af97ced282df04  #997 32151eb3cfed689d78c2a51c077cf69c2dca5e8d
+#           #1005 9fc2775b2577963d3190711f15d68dc18b76ebd6  #1016 a272efff662e3016e9732106dad417e9ed1ec838
+#           #964 d6d69b92afb9054cda51b5d2d0d55f3b7161787c   (all equal to candidate-47's README table)
+# 5. Order: every PR's runs are ABBA in one session on one host: 1107 boot1, c47 boot1, c47 boot2, 1107 boot2
+#    (a "boot" is a fresh container). First the PR's own bench as its README gives it (queue A), then our
+#    graph-replay harness h<N>.py (queue B), same order.
+# 6. Analysis: common/analyze/*.py read the raw outputs; each PR's summary.txt is that script's output.
+# 7. sp2 was not used. Cleanup ~10:25Z: vllm-1107, vllm-c47, the TileLang caches (root-owned, removed through a
+#    non-GPU container of the same image) and the private clones deleted on sp1, sp3, sp4; about 3 MB of
+#    scripts, overlay files and outputs remain in B on each host.

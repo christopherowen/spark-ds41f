@@ -1,0 +1,78 @@
+# PR #1005 rework, round 1 (candidate-47). All work on sp3 (spark-0011, NVIDIA GB10, driver 580.178.04),
+# in W = /home/chris/spark-lab/agents/candidate-47-rework-1005. No build, no push, no commit, no cluster
+# operation, no other host. Before every GPU run, rw.sh took /tmp/spark-lab-gpu.lock and recorded, inside the
+# lock, loadavg, GPU clock/temperature, docker ps and ~/spark-hold.json (absent and no container running before
+# every run: commands-runs.log). Every run's exact docker command, start/end UTC and exit code are in
+# commands-runs.log (verbatim, in issue order); raw outputs in out/.
+
+## Pre-checks (2026-11-09T10:14Z)
+ssh sp3 'docker ps; ls ~/spark-hold.json ~/spark-request.json'      # no containers; neither file exists
+# GPU idle at 208 MHz, 36 C.
+
+## Sources (sp3, 10:15-10:20Z)
+scp candidate-47/vllm/076*.patch sp3:$W/patches/                    # SHA-256 equal on both ends (e5ff5250 9c87a2cd
+                                                                     # 9dd02964 24ae9169 d52742a8 15752055 50f4161c a94953a2)
+cid=$(docker create spark-ds41f:1107)                               # sha256:3f32a962ce04b7c8d85337cd427a8946b8b6bcaadd97cc8d8a8cd14e8d68a6ce
+docker cp $cid:/opt/spark-ds41f/candidate/vllm $W/vllm-1107; docker rm $cid
+grep -h '^diff --git' patches/076*.patch | awk '{print substr($4,3)}' | sort -u > changed-files.txt   # 26 files
+# tree/: git repo of the 26 files as the 1107 image ships them (1c9443a), then git am 0762..0769 (all apply):
+#   master = candidate-47, head 72e9de2, tree 42b63090  (tag c47-head; 0765 = 9566fc9)
+#   no1005 = git am 0762, 0763, 0764, 0766, 0767, 0768, 0769 (all apply without 0765), head a3cb50b, tree c84785e7
+#   git diff --stat c47-head no1005-head: exactly 0765's 5 files (102 insertions, 264 deletions)
+scripts/snap.sh no1005-head no1005; scripts/snap.sh c47-head c47    # overlays/*.sha; ovl/c47 equals the
+                                                                     # own-marks candidate-47 overlay (all 26 SHA-256 prefixes)
+# kern = no1005 + c47's moe.py (+ its test file): 0765's kernel half alone
+# hook = no1005 + c47's moe_runner.py, shared_experts.py (+ test_deepseek_v4_1_l2_schedule.py): 0765's hook half alone
+git clone --reference ~/projects/spark-ds41f https://github.com/christopherowen/spark-ds41f.git $W/repo
+git -C $W/repo fetch origin pull/1005/head:pr-1005                  # 9fc2775b2577963d3190711f15d68dc18b76ebd6 (= README table)
+
+## Harness (scripts/, ours; mounted read-only at /h)
+# rw.sh: one container per run: spark-ds41f:1107 with an arm's 26 files bind-mounted read-only over
+#   /opt/spark-ds41f/candidate/vllm, --entrypoint python3, the served checkpoint's HF hub dir at /hub (ro; only
+#   config.json is read), serving env (VLLM_USE_V2_MODEL_RUNNER=1, VLLM_L2_PREFETCH_KERNELS=tilelang,
+#   VLLM_L2_PREFETCH_GRID=2, VLLM_USE_BREAKABLE_CUDAGRAPH=0, VLLM_DS41_HEAD_DTYPE=float32,
+#   CUDA_DEVICE_MAX_CONNECTIONS=32), one TileLang cache dir per arm.
+# ffnlayer.py: builds vLLM's own DeepseekV4DecoderLayer (deepseek_v4_1/nvidia/model.py) under a VllmConfig from
+#   EngineArgs (the checkpoint's config.json; tilelang attention/linear/MoE backends; max_num_batched_tokens 16384;
+#   TP 1 with moe_intermediate_size 576 / 768 = TP4 / TP3 per-rank shapes), attention replaced by a stub that owns
+#   nothing; random weights in checkpoint dtypes through process_weights_after_loading and
+#   prepare.declare_modules; the FFN sublayer is forward()'s second half (mhc.post_pre, then ffn(x, input_ids)
+#   inside kernels.mxfp8_inputs) under a forward context with the V2 runner's is_padding. The MoE runs through
+#   MoERunner._forward_impl / _apply_quant_method, SharedExperts, TileLangGateRouter and TileLangExperts'
+#   MoeExpertsV41Plan, captured in torch.cuda.CUDAGraph.
+# ffnbench.py (session 1): per shape 6 layers; per M two graphs: chain (6 layers back to back, each: issue the
+#   layer's FFN L2 prefetch, FFN sublayer, join) timed around 10 replays; cold (each layer: write 96 MiB, then the
+#   same between two in-graph timing events). >= 1.5 s of replays before the first window; 15 windows
+#   interleaving every (mode, M); medians. Eager pass traces the shared-expert schedule; every graph's outputs
+#   hashed (eager, after capture, after timing).
+# pairbench.py (session 2): the same layers in one process with candidate-47's moe.py, moe_runner.py and
+#   shared_experts.py at /alt; their own functions (compiled from source by ast in the live modules' namespace)
+#   are switched in while a variant's graphs are captured (kernel: bound as the plan's decode swiglu kernel;
+#   hook: MoERunner._forward_impl/_apply_quant_method, SharedExperts.maybe_forward_async/record_input_ready).
+#   12 windows; in each, every variant's graph of a (mode, M) in shuffled order; paired deltas per window.
+# summarize.py / pairsum.py: the tables in result.json.
+
+## Runs (commands-runs.log, verbatim). Exploration and smoke runs first (all kept):
+# explore-no1005      failed: WorkspaceManager not initialized (fixed: init_workspace_manager in ffnlayer)
+# explore-no1005-b    no1005: workspace_size 0, MULTI_STREAM_OVERLAPPED, fold TileLangExperts: shared expert
+#                     launched before the router gate (pre-gate), post-gate hook never used, at M = 1, 6, 48
+# smoke-no1005        failed: build_l2_prefetch(nxt) needs the next layer's attention weights (fixed: nxt=None,
+#                     FFN window only; the NEXT window is not planned in any arm)
+# smoke-no1005-b      failed: device assert "gate logits contain nan or inf" after capture: a graph's input
+#                     tensors were freed by the next M's loop (fixed: inputs kept alive, warm all M before capture)
+# smoke-no1005-c, smoke-c47, smoke-kern, smoke-hook   3 windows, tp4, M 1 and 48: all bit-exact
+# smoke-pair          pairbench, 2 windows, tp4, M 1 and 48: all six variants bit-exact
+## Session 1 (10:37-11:00Z), scripts/q1.sh: palindromic order, each run a fresh container (a boot):
+W/scripts/rw.sh s1-<arm>-b<k> <arm> -- python3 /h/ffnbench.py s1-<arm>-b<k> --windows 15 --replays 10 --layers 6 \
+   --shapes tp4,tp3 --ms 1,2,3,4,6,8,12,16,20,24,28,32,40,48
+#   order: no1005 b1, kern b1, hook b1, c47 b1, c47 b2, hook b2, kern b2, no1005 b2 (all exit 0)
+python3 scripts/summarize.py out s1 no1005 kern hook c47           # -> out/s1-summary.json
+## Session 2 (11:05-11:18Z), scripts/q2.sh: two boots of the paired screen (live tree ovl/no1005):
+W/scripts/rw.sh s2-pair-b<k> no1005 -v ovl/c47/.../moe.py:/alt/moe.py:ro -v ovl/c47/.../moe_runner.py:/alt/moe_runner.py:ro \
+   -v ovl/c47/.../shared_experts.py:/alt/shared_experts.py:ro -- python3 /h/pairbench.py s2-pair-b<k> --windows 12 \
+   --replays 8 --layers 6 --shapes tp4,tp3 --ms 1,2,3,4,6,8,12,16,24,32,48 --variants base,kern,hook,c47,post,postk
+python3 scripts/pairsum.py out s2-pair-b1 s2-pair-b2               # -> out/s2-pair-summary.json
+
+## Cleanup (11:21Z): vllm-1107 (763 MB), the repo clone (432 MB) and the TileLang caches (root-owned, removed
+## through a non-GPU container of the same image) deleted on sp3; ~10 MB (patches, 26-file tree and overlays,
+## scripts, outputs) remain in W. No patch produced (verdict no-defensible-correction).

@@ -98,6 +98,10 @@ bin/spark --cluster-config <dir>/image-dgx4.json build prepare --only vllm --loc
   ```bash
   python3 -m unittest discover -s tests -p "test_*.py"
   ```
+  - A fresh clone lacks the node's git-ignored site maps. Copy `config/nodes.json`,
+    `config/nodes-*.local.json` and `config/site.json` from the node's deployment checkout
+    first. Without them, the tests that resolve a configuration (`test_agentx`,
+    `test_candidate_15`..`18`) stop on a missing node map.
   - It must pass in full there.
   - A run on the owner's laptop (macOS) does not count. Some tests need Linux: the sandboxed
     model-output parser and the CPU-affinity build sizing.

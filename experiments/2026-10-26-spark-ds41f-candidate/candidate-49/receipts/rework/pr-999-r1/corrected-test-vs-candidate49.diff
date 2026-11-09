@@ -1,0 +1,54 @@
+--- c49-orig/test_deepseek_v41_tilelang.py	2026-11-09 07:57:36.177020741 +0000
++++ corrected/test_deepseek_v41_tilelang.py	2026-11-09 07:57:36.175304929 +0000
+@@ -847,6 +847,51 @@
+         assert torch.equal(counts, expected_counts)
+ 
+ 
++@pytest.mark.parametrize(
++    "width, candidates",
++    [
++        (CANDIDATE_BLOCKS * CANDIDATE_BLOCK, False),  # one pass (short prefill)
++        (CANDIDATE_BLOCKS * CANDIDATE_BLOCK, True),  # one pass (reindex rows)
++        (524288, False),  # one merge over 2..32 live lists
++    ],
++)
++def test_topk_partial_extent_compaction(width, candidates):
++    """Extents that fill a segment or a merge group only partly, at counts that are
++    not multiples of the CTA's threads, keep the score-then-position order exactly:
++    compaction spreads the live keys over every thread and counts the ties kept
++    before a thread as min(ties needed, ties before it)."""
++    raw_lengths = [513, 1000, 2047, 2048, 3073, 4095, 5000, 8191, 12345, 16383]
++    if width > CANDIDATE_BLOCKS * CANDIDATE_BLOCK:
++        raw_lengths += [2 * 16384 + 5, 7 * 16384 - 3, 31 * 16384 + 700, 32 * 16384]
++    rows = len(raw_lengths)
++    scores = _tie_scores(rows, width, seed=23)
++    lengths = torch.tensor(raw_lengths, dtype=torch.int32, device=DEVICE)
++    indices = torch.full((rows, INDEX_TOPK), -7, dtype=torch.int32, device=DEVICE)
++    values = torch.empty((rows, INDEX_TOPK), dtype=torch.bfloat16, device=DEVICE)
++    op = IndexerTopK(width, INDEX_TOPK, 1, candidates)
++    if candidates:
++        gen = _gen(29)
++        ids = torch.stack(
++            [
++                torch.randperm(4 * CANDIDATE_BLOCKS, generator=gen, device=DEVICE)[
++                    :CANDIDATE_BLOCKS
++                ]
++                .sort()
++                .values
++                for _ in range(rows)
++            ]
++        ).to(torch.int32)
++        j = torch.arange(width, device=DEVICE)
++        positions = ids[:, j // CANDIDATE_BLOCK] * CANDIDATE_BLOCK + j % CANDIDATE_BLOCK
++        op.run(scores, lengths, None, indices, values, gather=ids)
++        expected, _ = _ref_topk(scores, raw_lengths, INDEX_TOPK, gather=positions)
++    else:
++        active = torch.tensor([width], dtype=torch.int32, device=DEVICE)
++        op.run(scores, lengths, active, indices, values)
++        expected, _ = _ref_topk(scores, raw_lengths, INDEX_TOPK)
++    assert torch.equal(indices, expected)
++
++
+ 
+ # --------------------------------------------------------------------------
+ # Sparse MLA
