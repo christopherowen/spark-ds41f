@@ -148,6 +148,14 @@ prefill at 32K and 256K.
 
 - For every PR, re-run its own evidence (its README's commands) on the candidate image on sp8,
   two boots each. Use the base image as the baseline where the PR compared against it.
+- **Run the baseline in the same session, interleaved (ABBA).** Microbenchmark spreads between
+  sessions are larger than one session's interval. A candidate compared with baseline numbers
+  recorded in another session shows "slower" cells that re-running unchanged code also shows
+  (#996 round 2). The baseline arm of a PR's kernel A/B is not a release record, so the rule
+  against re-measuring a release does not apply to it. Reworks follow the same rule.
+- **Judge on the path serving takes.** Decode kernels run from CUDA graphs, so for them CUDA-graph
+  replay or kernel time decides. A loop of eager launches measures the launch cost, not the kernel
+  (#991 round 1). Record both.
 - Receipts go in `receipts/own-marks/pr-<N>/`, with a `result.json`.
 - One sub-agent per candidate does this.
 
