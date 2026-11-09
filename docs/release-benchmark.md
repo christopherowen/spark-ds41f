@@ -28,6 +28,7 @@ Each round follows the steps below. Candidates 47-49 are the worked example
 Owner rules for these rounds (2026-11-09):
 - Testing on the dgx and spaceport nodes needs no further approval, and neither does
   merging the round's own PRs. The hold-file rules in AGENTS.md still apply.
+- Every merge of the round's PRs follows a passing unit-suite run on a dgx node (step 3).
 - Builds never run on the owner's laptop.
 - Every test result is kept.
 
@@ -87,7 +88,17 @@ bin/spark --cluster-config <dir>/image-dgx4.json build prepare --only vllm --loc
 - Run `scripts/release_tests.py check <prepared tree> <base revision> HEAD <dir>/release-tests.json`,
   starting from the base release's classification, and classify every new or changed test
   file. Then run `gate` and `bundle`.
-- Run `bin/spark doctor` on every configuration, the unit suite on Linux, and `git diff --check`.
+- **Unit suite on a dgx node.** Run it in that checkout, at the commit being merged:
+  ```bash
+  python3 -m unittest discover -s tests -p "test_*.py"
+  ```
+  - It must pass in full there.
+  - A run on the owner's laptop (macOS) does not count. Some tests need Linux: the sandboxed
+    model-output parser and the CPU-affinity build sizing.
+  - Use a node that is not part of a running measurement. Test load on a measured node
+    perturbs the bench. When every dgx node is measuring, wait for a gap between jobs or for
+    the window to close.
+- Run `bin/spark doctor` on every configuration, and `git diff --check`.
 - Merge the folder to `main`. The lab opens a window only on a published commit.
 
 ### 4. Build and release tests (dgx window)
