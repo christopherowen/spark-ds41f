@@ -1,0 +1,104 @@
+diff --git a/tests/v1/spec_decode/test_adaptive_verification.py b/tests/v1/spec_decode/test_adaptive_verification.py
+index a7a6f05ee..95c2b90c0 100644
+--- a/tests/v1/spec_decode/test_adaptive_verification.py
++++ b/tests/v1/spec_decode/test_adaptive_verification.py
+@@ -1139,7 +1139,7 @@ def test_sampler_hands_configured_seed_to_sampling_states():
+     assert first_unseeded_seed(7) != first_unseeded_seed(8)
+ 
+ 
+-def test_single_request_tile_spill_caps_16th_copy_draft_at_16_rows_and_masks_shrunk_tail() -> None:
++def test_single_request_tile_spill_caps_16th_copy_draft_at_16_rows() -> None:
+     # Single-request (c1) initial copy proposal at 0.95 confidence across 16 drafts:
+     # capping at 15 drafts (16 rows = 1 MMA tile) beats spilling 1 row into a 2nd MMA tile.
+     mgr_c1 = make_manager(np.full((1, 16), 0.95, dtype=np.float32), row_cost=0.035)
+@@ -1170,17 +1170,3 @@ def test_single_request_tile_spill_caps_16th_copy_draft_at_16_rows_and_masks_shr
+     )
+     assert mgr_c2._batch_budget[2] == 32
+     assert total_c2 == 34
+-
+-    # On wide copy steps (step_steps=16 > num_draft_steps=5), dead_row_args returns a
+-    # sentinel log_tau=-1e30 even when dead_rows_tau is 0.0 so -1 placeholder rows
+-    # (confidence 0.0 -> log(0) = -inf < -1e30) are masked as padding.
+-    mgr_c1._confidence_probs = torch.ones((1, 16), dtype=torch.float32)
+-    mgr_c1._dead_row_cut = torch.zeros(1, dtype=torch.int32)
+-    mgr_c1._has_admitted_drafts = True
+-    is_padding = torch.zeros(17, dtype=torch.bool)
+-    mgr_c1.step_steps = 5
+-    assert mgr_c1.dead_row_args(is_padding, 1) is None
+-    mgr_c1.step_steps = 16
+-    dead = mgr_c1.dead_row_args(is_padding, 1)
+-    assert dead is not None
+-    assert dead.log_tau == pytest.approx(-1e30, rel=1e-5)
+diff --git a/tests/v1/worker/test_prepare_kernels.py b/tests/v1/worker/test_prepare_kernels.py
+index 5d8ce611d..8e77d19d2 100644
+--- a/tests/v1/worker/test_prepare_kernels.py
++++ b/tests/v1/worker/test_prepare_kernels.py
+@@ -280,9 +280,6 @@ def test_dead_row_caps_are_declared_before_the_manager_exists(monkeypatch):
+         )
+         runner_module.GPUModelRunner.declare_step_kernels(runner)
+         assert declared.pop()["dead_rows"] is enabled
+-    runner.copy_drafter = SimpleNamespace(register_warmups=lambda: None)
+-    runner_module.GPUModelRunner.declare_step_kernels(runner)
+-    assert declared.pop()["dead_rows"] is True
+     assert not declared
+ 
+ 
+diff --git a/vllm/v1/worker/gpu/model_runner.py b/vllm/v1/worker/gpu/model_runner.py
+index 5294aad92..d4381aa0a 100644
+--- a/vllm/v1/worker/gpu/model_runner.py
++++ b/vllm/v1/worker/gpu/model_runner.py
+@@ -2284,11 +2284,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
+         # The manager is built with the KV cache, after preparation; the
+         # speculator's flag is what decides it exists.
+         adaptive = bool(getattr(self.speculator, "enable_adaptive_verification", False))
+-        dead_rows = (
+-            adaptive
+-            and (dead_rows_enabled() or self.copy_drafter is not None)
+-            and self.batch_sharder is None
+-        )
++        dead_rows = adaptive and dead_rows_enabled() and self.batch_sharder is None
+         samples = self.is_last_pp_rank and not self.is_pooling_model
+         if not samples:
+             # A stage before the last commits what the last stage sampled.
+diff --git a/vllm/v1/worker/gpu/spec_decode/adaptive_verification.py b/vllm/v1/worker/gpu/spec_decode/adaptive_verification.py
+index d547910f1..81bac7496 100644
+--- a/vllm/v1/worker/gpu/spec_decode/adaptive_verification.py
++++ b/vllm/v1/worker/gpu/spec_decode/adaptive_verification.py
+@@ -56,7 +56,6 @@ EXPLORE_AFTER_IDLE_STEPS = 32
+ HIGH_ROW_COST_KNEE = 16
+ HIGH_ROW_COST_SCALE = 0.55
+ SINGLE_REQ_TILE_SPILL_SCALE = 2.0
+-_ZERO_CONFIDENCE_LOG_TAU = -1e30
+ 
+ 
+ def resolve_adaptive_cudagraph_mode(
+@@ -487,26 +486,16 @@ class AdaptiveVerificationManager:
+         """Arguments for the fused dead-row marking, or None when disabled.
+ 
+         The confidences are the current drafts', broadcast from rank 0, so
+-        every rank marks the same rows. On wide copy-draft steps
+-        (``step_steps > num_draft_steps``), trailing ``-1`` placeholder rows
+-        from a shrunk proposal carry ``confidence == 0`` (``log(0) = -inf``),
+-        so a finite floor ``_ZERO_CONFIDENCE_LOG_TAU`` masks them as padding
+-        even when ``dead_rows_tau`` is 0.
++        every rank marks the same rows.
+         """
+-        if not getattr(self, "_has_admitted_drafts", True):
+-            return None
+         tau = self.effective_dead_rows_tau()
+-        has_copy_tail = getattr(self, "step_steps", 0) > getattr(
+-            self, "num_draft_steps", self.num_speculative_steps
+-        )
+-        if tau <= 0 and not has_copy_tail:
++        if tau <= 0 or not getattr(self, "_has_admitted_drafts", True):
+             return None
+-        log_tau = float(np.log(tau)) if tau > 0 else _ZERO_CONFIDENCE_LOG_TAU
+         return DeadRows(
+             self._confidence_probs,
+             is_padding,
+             self._dead_row_cut[:num_reqs],
+-            log_tau,
++            float(np.log(tau)),
+         )
+ 
+     def get_verified_draft_counts(

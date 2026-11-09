@@ -1,0 +1,719 @@
+{
+ "pr": 977,
+ "pr_head": "4e0244deb7d53736b2caa0cc176755e2fbcf2008",
+ "patch": "0783-perf-spec-decode-copy-drafter-long-context-scan.patch (SHA-256 6ebb4590..., equal to the PR head's patch)",
+ "mark": "Its bench_copy_match_long_context.py on the image, 2 boots: copy_match at 64K..1M faster beyond the interval, unchanged at <=32K (still a dense scan); copy drafts identical at <=32K",
+ "host": "sp8 (spark-0016, NVIDIA GB10, driver 580.178.04)",
+ "images": {
+  "base": "spark-ds41f:candidate-50 sha256:8c1ea1f62f62... + no1009/overlay (4 files, ro)",
+  "candidate-53": "the same image + 33 candidate-53 files (ro); ../common/overlay-sha.txt"
+ },
+ "evidence": [
+  "The PR's bench_copy_match_long_context.py from its head, unmodified (CUDA-graph replay, 64 MiB flush before each of 21 replays, median; UVA history; 7 scenarios x 1/8/16 requests x 4K..1M), as the image A/B the PR ran: --label base on the base arm, --label candidate on the candidate arm, ABBA (base-boot*.jsonl, candidate-boot*.jsonl).",
+  "Confirmation of the <=32K cells (harness confirm977.py, ABBA): the same bench module imported unmodified with CONTEXTS narrowed to 4K/16K/32K and its timer at 201 replays a cell (confirm-*.jsonl, confirm-analysis.json), because the 21-replay medians at short contexts are bimodal.",
+  "Draft identity (harness ids977.py, ABBA): copy_match's sources table (what copy_alloc/copy_apply turn into drafts) for every case of the bench plus 32K, SHA-256 per case, compared across images.",
+  "The PR's other commands on the image: pytest -o addopts= --noconftest -v tests/v1/spec_decode/test_copy_drafts.py (candidate arm, twice) and benchmarks/kernels/benchmark_copy_drafts.py --gate --cases copy (both arms, ABBA). The gate's end-to-end copy step (copy_match + copy_alloc + copy_apply) also carries #971's copy_apply change, which shares tilelang_copy.py."
+ ],
+ "measured": {
+  "copy_match_64K_1M": {
+   "cells": 105,
+   "better": 105,
+   "same": 0,
+   "worse": 0,
+   "delta_pct_range": [
+    -89.97,
+    -15.75
+   ],
+   "at_1M": {
+    "boilerplate_16/c1/1048576": {
+     "base_us": [
+      124.93,
+      124.67
+     ],
+     "candidate_us": [
+      14.34,
+      14.34
+     ],
+     "delta_pct": -88.51,
+     "verdict": "better"
+    },
+    "boilerplate_16/c8/1048576": {
+     "base_us": [
+      305.15,
+      305.76
+     ],
+     "candidate_us": [
+      30.53,
+      30.72
+     ],
+     "delta_pct": -89.97,
+     "verdict": "better"
+    },
+    "boilerplate_16/c16/1048576": {
+     "base_us": [
+      470.75,
+      469.66
+     ],
+     "candidate_us": [
+      48.93,
+      47.14
+     ],
+     "delta_pct": -89.78,
+     "verdict": "better"
+    },
+    "deep_match_256/c1/1048576": {
+     "base_us": [
+      92.16,
+      91.84
+     ],
+     "candidate_us": [
+      22.5,
+      22.37
+     ],
+     "delta_pct": -75.61,
+     "verdict": "better"
+    },
+    "deep_match_256/c8/1048576": {
+     "base_us": [
+      231.42,
+      231.14
+     ],
+     "candidate_us": [
+      36.86,
+      34.94
+     ],
+     "delta_pct": -84.48,
+     "verdict": "better"
+    },
+    "deep_match_256/c16/1048576": {
+     "base_us": [
+      386.78,
+      385.98
+     ],
+     "candidate_us": [
+      55.01,
+      53.28
+     ],
+     "delta_pct": -85.99,
+     "verdict": "better"
+    },
+    "no_match/c1/1048576": {
+     "base_us": [
+      73.54,
+      73.73
+     ],
+     "candidate_us": [
+      10.53,
+      10.37
+     ],
+     "delta_pct": -85.81,
+     "verdict": "better"
+    },
+    "no_match/c8/1048576": {
+     "base_us": [
+      231.1,
+      231.42
+     ],
+     "candidate_us": [
+      28.29,
+      26.34
+     ],
+     "delta_pct": -88.19,
+     "verdict": "better"
+    },
+    "no_match/c16/1048576": {
+     "base_us": [
+      372.42,
+      372.58
+     ],
+     "candidate_us": [
+      45.06,
+      43.01
+     ],
+     "delta_pct": -88.18,
+     "verdict": "better"
+    },
+    "recent_match_16/c1/1048576": {
+     "base_us": [
+      75.78,
+      75.46
+     ],
+     "candidate_us": [
+      12.29,
+      12.32
+     ],
+     "delta_pct": -83.73,
+     "verdict": "better"
+    },
+    "recent_match_16/c8/1048576": {
+     "base_us": [
+      231.42,
+      231.1
+     ],
+     "candidate_us": [
+      26.91,
+      26.53
+     ],
+     "delta_pct": -88.45,
+     "verdict": "better"
+    },
+    "recent_match_16/c16/1048576": {
+     "base_us": [
+      372.74,
+      374.66
+     ],
+     "candidate_us": [
+      44.99,
+      43.04
+     ],
+     "delta_pct": -88.22,
+     "verdict": "better"
+    },
+    "recent_match_256/c1/1048576": {
+     "base_us": [
+      75.46,
+      75.78
+     ],
+     "candidate_us": [
+      20.19,
+      18.85
+     ],
+     "delta_pct": -74.19,
+     "verdict": "better"
+    },
+    "recent_match_256/c8/1048576": {
+     "base_us": [
+      230.11,
+      231.1
+     ],
+     "candidate_us": [
+      34.5,
+      30.75
+     ],
+     "delta_pct": -85.85,
+     "verdict": "better"
+    },
+    "recent_match_256/c16/1048576": {
+     "base_us": [
+      371.71,
+      373.44
+     ],
+     "candidate_us": [
+      49.15,
+      44.8
+     ],
+     "delta_pct": -87.39,
+     "verdict": "better"
+    },
+    "recent_match_32/c1/1048576": {
+     "base_us": [
+      75.49,
+      75.78
+     ],
+     "candidate_us": [
+      12.29,
+      12.26
+     ],
+     "delta_pct": -83.77,
+     "verdict": "better"
+    },
+    "recent_match_32/c8/1048576": {
+     "base_us": [
+      233.15,
+      241.34
+     ],
+     "candidate_us": [
+      28.38,
+      26.62
+     ],
+     "delta_pct": -88.41,
+     "verdict": "better"
+    },
+    "recent_match_32/c16/1048576": {
+     "base_us": [
+      373.44,
+      377.06
+     ],
+     "candidate_us": [
+      44.99,
+      43.01
+     ],
+     "delta_pct": -88.27,
+     "verdict": "better"
+    },
+    "recent_match_8/c1/1048576": {
+     "base_us": [
+      79.78,
+      75.78
+     ],
+     "candidate_us": [
+      12.0,
+      12.29
+     ],
+     "delta_pct": -84.39,
+     "verdict": "better"
+    },
+    "recent_match_8/c8/1048576": {
+     "base_us": [
+      233.31,
+      233.12
+     ],
+     "candidate_us": [
+      28.35,
+      26.66
+     ],
+     "delta_pct": -88.21,
+     "verdict": "better"
+    },
+    "recent_match_8/c16/1048576": {
+     "base_us": [
+      374.46,
+      375.49
+     ],
+     "candidate_us": [
+      45.15,
+      43.04
+     ],
+     "delta_pct": -88.24,
+     "verdict": "better"
+    }
+   }
+  },
+  "copy_match_le_16K_pr_bench_21_replays": {
+   "cells": 42,
+   "better": 20,
+   "same": 19,
+   "worse": 3,
+   "worse_cells": {
+    "recent_match_8/c16/4096": {
+     "base_us": [
+      8.19,
+      8.38
+     ],
+     "candidate_us": [
+      9.95,
+      9.82
+     ],
+     "delta_pct": 19.31,
+     "verdict": "worse"
+    },
+    "recent_match_8/c16/16384": {
+     "base_us": [
+      18.24,
+      18.37
+     ],
+     "candidate_us": [
+      18.43,
+      18.46
+     ],
+     "delta_pct": 0.76,
+     "verdict": "worse"
+    },
+    "recent_match_16/c16/16384": {
+     "base_us": [
+      18.14,
+      18.24
+     ],
+     "candidate_us": [
+      18.43,
+      18.46
+     ],
+     "delta_pct": 1.4,
+     "verdict": "worse"
+    }
+   },
+   "note": "recent_match_8 uses min_match 8, which serving does not (CopyDraftsConfig.min_match is 16, derived, not an option); recent_match_16/c16/16384 is +0.26 us"
+  },
+  "copy_match_le_32K_confirmation_201_replays": {
+   "cells": 63,
+   "better": 28,
+   "same": 35,
+   "worse": 0,
+   "former_worse_cells": {
+    "recent_match_8/c16/4096": {
+     "base_us": [
+      8.19,
+      10.02
+     ],
+     "candidate_us": [
+      9.89,
+      8.45
+     ],
+     "delta_pct": 0.71,
+     "verdict": "same"
+    },
+    "recent_match_8/c16/16384": {
+     "base_us": [
+      18.4,
+      18.18
+     ],
+     "candidate_us": [
+      18.11,
+      18.46
+     ],
+     "delta_pct": -0.03,
+     "verdict": "same"
+    },
+    "recent_match_16/c16/16384": {
+     "base_us": [
+      18.3,
+      18.27
+     ],
+     "candidate_us": [
+      18.11,
+      18.46
+     ],
+     "delta_pct": 0.0,
+     "verdict": "same"
+    }
+   }
+  },
+  "draft_identity": {
+   "cases": 168,
+   "boot_repeats_identical": true,
+   "identical_le_32K": "63 of 63",
+   "differ_gt_32K": [
+    "deep_match_256/c1/131072",
+    "deep_match_256/c8/65536",
+    "deep_match_256/c8/131072",
+    "deep_match_256/c8/262144",
+    "deep_match_256/c8/524288",
+    "deep_match_256/c8/1048576",
+    "deep_match_256/c16/65536",
+    "deep_match_256/c16/131072",
+    "deep_match_256/c16/262144",
+    "deep_match_256/c16/524288",
+    "deep_match_256/c16/1048576"
+   ],
+   "differ_note": "only deep_match_256 past 32K (the declared change); in every differing case both images still find a match at all five levels for every request (found_entries and per-level counts equal), at a different position"
+  },
+  "gate_copy_drafts": {
+   "slower": "[] on all four runs (base and candidate, both boots)",
+   "end_to_end_us_cross_image": {
+    "1/4096/uva": {
+     "base": [
+      30.72,
+      30.82
+     ],
+     "candidate": [
+      22.27,
+      22.43
+     ],
+     "delta_pct": -27.36,
+     "verdict": "better"
+    },
+    "1/65536/uva": {
+     "base": [
+      26.62,
+      28.67
+     ],
+     "candidate": [
+      16.35,
+      16.38
+     ],
+     "delta_pct": -40.8,
+     "verdict": "better"
+    },
+    "1/262144/uva": {
+     "base": [
+      43.01,
+      39.3
+     ],
+     "candidate": [
+      22.5,
+      20.77
+     ],
+     "delta_pct": -47.43,
+     "verdict": "better"
+    },
+    "1/1048576/uva": {
+     "base": [
+      79.58,
+      76.03
+     ],
+     "candidate": [
+      24.58,
+      24.58
+     ],
+     "delta_pct": -68.41,
+     "verdict": "better"
+    },
+    "8/4096/uva": {
+     "base": [
+      30.46,
+      28.67
+     ],
+     "candidate": [
+      22.5,
+      20.22
+     ],
+     "delta_pct": -27.75,
+     "verdict": "better"
+    },
+    "8/65536/uva": {
+     "base": [
+      39.01,
+      38.66
+     ],
+     "candidate": [
+      28.38,
+      26.62
+     ],
+     "delta_pct": -29.19,
+     "verdict": "better"
+    },
+    "8/262144/uva": {
+     "base": [
+      85.66,
+      79.58
+     ],
+     "candidate": [
+      30.43,
+      28.67
+     ],
+     "delta_pct": -64.23,
+     "verdict": "better"
+    },
+    "8/1048576/uva": {
+     "base": [
+      223.23,
+      234.5
+     ],
+     "candidate": [
+      42.66,
+      40.74
+     ],
+     "delta_pct": -81.78,
+     "verdict": "better"
+    },
+    "16/4096/uva": {
+     "base": [
+      32.48,
+      32.45
+     ],
+     "candidate": [
+      24.74,
+      24.58
+     ],
+     "delta_pct": -24.04,
+     "verdict": "better"
+    },
+    "16/65536/uva": {
+     "base": [
+      48.9,
+      50.88
+     ],
+     "candidate": [
+      36.74,
+      30.85
+     ],
+     "delta_pct": -32.26,
+     "verdict": "better"
+    },
+    "16/262144/uva": {
+     "base": [
+      100.06,
+      102.02
+     ],
+     "candidate": [
+      40.7,
+      34.56
+     ],
+     "delta_pct": -62.76,
+     "verdict": "better"
+    },
+    "16/1048576/uva": {
+     "base": [
+      370.75,
+      371.26
+     ],
+     "candidate": [
+      51.2,
+      53.25
+     ],
+     "delta_pct": -85.92,
+     "verdict": "better"
+    },
+    "1/4096/device": {
+     "base": [
+      24.32,
+      24.26
+     ],
+     "candidate": [
+      16.06,
+      16.0
+     ],
+     "delta_pct": -34.01,
+     "verdict": "better"
+    },
+    "1/65536/device": {
+     "base": [
+      26.34,
+      26.3
+     ],
+     "candidate": [
+      16.06,
+      14.59
+     ],
+     "delta_pct": -41.77,
+     "verdict": "better"
+    },
+    "1/262144/device": {
+     "base": [
+      36.86,
+      36.54
+     ],
+     "candidate": [
+      22.5,
+      22.69
+     ],
+     "delta_pct": -38.43,
+     "verdict": "better"
+    },
+    "1/1048576/device": {
+     "base": [
+      77.82,
+      77.5
+     ],
+     "candidate": [
+      22.98,
+      24.29
+     ],
+     "delta_pct": -69.57,
+     "verdict": "better"
+    },
+    "8/4096/device": {
+     "base": [
+      24.29,
+      24.29
+     ],
+     "candidate": [
+      16.06,
+      16.1
+     ],
+     "delta_pct": -33.8,
+     "verdict": "better"
+    },
+    "8/65536/device": {
+     "base": [
+      36.61,
+      36.58
+     ],
+     "candidate": [
+      22.27,
+      22.53
+     ],
+     "delta_pct": -38.79,
+     "verdict": "better"
+    },
+    "8/262144/device": {
+     "base": [
+      86.02,
+      89.82
+     ],
+     "candidate": [
+      28.58,
+      30.43
+     ],
+     "delta_pct": -66.44,
+     "verdict": "better"
+    },
+    "8/1048576/device": {
+     "base": [
+      271.07,
+      270.88
+     ],
+     "candidate": [
+      40.67,
+      39.65
+     ],
+     "delta_pct": -85.18,
+     "verdict": "better"
+    },
+    "16/4096/device": {
+     "base": [
+      26.37,
+      26.56
+     ],
+     "candidate": [
+      16.51,
+      18.24
+     ],
+     "delta_pct": -34.35,
+     "verdict": "better"
+    },
+    "16/65536/device": {
+     "base": [
+      48.86,
+      49.28
+     ],
+     "candidate": [
+      26.59,
+      28.42
+     ],
+     "delta_pct": -43.95,
+     "verdict": "better"
+    },
+    "16/262144/device": {
+     "base": [
+      115.42,
+      142.05
+     ],
+     "candidate": [
+      34.98,
+      35.23
+     ],
+     "delta_pct": -72.73,
+     "verdict": "better"
+    },
+    "16/1048576/device": {
+     "base": [
+      382.69,
+      407.26
+     ],
+     "candidate": [
+      51.33,
+      51.2
+     ],
+     "delta_pct": -87.02,
+     "verdict": "better"
+    }
+   },
+   "end_to_end_summary": "24 of 24 cells better (-24% to -87%), UVA and device history, 4K..1M"
+  },
+  "pytest_candidate": {
+   "boot1": "45 passed in 14.33s",
+   "boot2": "45 passed in 14.30s",
+   "pr_receipt": "45 passed"
+  }
+ },
+ "parts": [
+  {
+   "part": "copy_match at 64K..1M faster beyond the interval",
+   "verdict": "pass",
+   "detail": "105 of 105 cells better, -15.8% to -90.0% (1M: 73.5-470.8 us -> 10.4-55.0 us)"
+  },
+  {
+   "part": "unchanged at <=32K, no slower cells",
+   "verdict": "pass",
+   "detail": "at 201 replays, 63 cells at 4K/16K/32K: 28 better, 35 same, 0 worse. The PR bench's 21-replay run flagged 3 cells worse (+0.76% to +19.3%, two of them at min_match 8, which serving does not use); none reproduced at 201 replays, where the same cells read -0.03% to +0.71%, same. The dense region is not unchanged in the other direction: the anchor filter and 8-wide walk make 256-token and boilerplate matches 9-44% faster at 4K-16K"
+  },
+  {
+   "part": "copy drafts identical at <=32K",
+   "verdict": "pass",
+   "detail": "copy_match output byte-identical across images in all 63 cases at 4K/16K/32K, and in 94 of 105 past 32K"
+  },
+  {
+   "part": "temperature-0 text unchanged; sampled realizations",
+   "verdict": "cannot-evaluate-on-sp8",
+   "detail": "the determinism gate and the tp3-switched screen's sampled companion"
+  }
+ ],
+ "verdict": "pass",
+ "verdict_scope": "sp8-evaluable parts; temperature-0 text and sampled decode are the gate's and the screen's",
+ "reason": "The bounded scan makes copy_match 16-90% faster on every 64K-1M cell beyond the two-boot interval, its output is byte-identical to the base's at every context up to 32K, and the end-to-end copy step is faster on every gate cell; no short-context cell is slower once each is timed with 201 replays.",
+ "notes": [
+  "The three 21-replay 'worse' flags are kept in analysis.json. The verdict rests on the 201-replay confirmation of the same bench; if the coordinator reads the 21-replay cells as binding, recent_match_16/c16/16384 (+1.4%, +0.26 us) is the only one at serving's min_match.",
+  "The PR README's own table shows 16K no_match c1 at 0.80x; here that cell is same (21 replays: 7.87/6.34 -> 6.59/6.43 us; 201 replays: 6.24/7.90 -> 6.27/7.04 us)."
+ ]
+}

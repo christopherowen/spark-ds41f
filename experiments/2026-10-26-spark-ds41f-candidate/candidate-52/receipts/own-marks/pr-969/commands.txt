@@ -1,0 +1,198 @@
+# PR #969 (0783, direct-insert packed Engram cache rows, split aligned cache arrays) own-mark check for
+# candidate-52. Host sp8 (spark-0016), NVIDIA GB10, driver 580.178.04. Shared setup: ../common/setup.txt.
+# Wrapper ../common/om.sh, queue ../common/queue.sh section 969, run by ../common/run_all.sh, which held
+# /tmp/spark-lab-gpu.lock for the whole section (18:07:14Z..18:10:17Z): no other job ran between these runs.
+# Image of every run: spark-ds41f:candidate-50 = sha256:8c1ea1f62f62c3e2adc03b645c091a5499cf7163101aca32875c894b96f155db;
+#   arm base adds candidate-50's 4 no1009 files; arm c52 adds candidate-52's 13 files, _reader.c and _row_plan.h
+#   included, which _native.py compiles at first use (../common/setup.txt item 4; reader extension per run in
+#   raw/bench-cache-*.json "reader_extension").
+# B = /home/chris/spark-lab/agents/candidate-52-own-marks on sp8; B/nvme (ext4 on /dev/nvme0n1p2, the NVMe root)
+#   is mounted at /mnt/nvme, the reader's O_DIRECT bench directory, as the PR's /mnt/nvme was.
+#
+# The bench. The PR's README runs `b.run_cache_and_packed_benchmark(bench_dir='/mnt/nvme/engram_bench_test')` from a
+#   module bench_and_verify that the PR does not commit (its head aad967cbe897 has only the receipts). The module of
+#   that name on main is experiments/2026-11-06-engram-step-and-cache/bench_and_verify.py (0750's experiment, sha256
+#   603f1303e83a, copied here as bench_and_verify.0750.py); its run_cache_and_packed_benchmark has the PR receipts'
+#   exact rows (hot M 1,4,8,16,32,48,64,128; Zipfian M 4,16,48,128; cold M 4,16,32; four modes) but a fixed
+#   /cache path and a required boot label. What we wrote, bench_and_verify.py (sha256 cec3c96e2517), is that file
+#   with one change (bench_and_verify.diff): the signature takes boot_label (default $BOOT_LABEL) and bench_dir
+#   (default the old /cache path), so the README's call runs unchanged. Workload identity: rep 1 of our c52 boot1
+#   reproduces all 228 cache-hit, cache-miss, hit-rate and read-call counters of the PR's receipts/bench-cache-boot1.json
+#   (pr-receipt-bench-cache-boot1.json) exactly, with the same keys and rows.
+# Queue A = run969.py LABEL 20: the README's call 20 times in one container (rep 1 is the PR's single call), ABBA;
+#   queue B = rows969.py (cross-arm row identity), ABBA; queue C = the PR's pytest (--noconftest -v
+#   tests/kernels/test_deepseek_v41_engram_rows.py) on c52, two boots. Docker options as the PR's: --cap-add=IPC_LOCK
+#   --ulimit=memlock=-1:-1 --security-opt=seccomp=unconfined --security-opt=label=disable, plus
+#   ENGRAM_ROWS_TEST_DIR=/mnt/nvme/engram-rows-test so the tests' O_DIRECT tables are on the NVMe mount.
+# Each block: issued_utc = when om.sh was called; start_utc = after the lock check; end_utc, exit_code, output.
+
+### bench-cache-base-boot1
+host: spark-0016 (sp8)
+arm: base
+image: sha256:8c1ea1f62f62c3e2adc03b645c091a5499cf7163101aca32875c894b96f155db (spark-ds41f:candidate-50) + no1009 overlay (4 files, ro)
+issued_utc: 2026-11-09T18:07:14Z
+start_utc: 2026-11-09T18:07:14Z
+loadavg_before: 1.38 1.44 1.52
+docker_ps_before: none
+hold_file: absent
+serving_container: no
+gpu_lock: held by the enclosing queue section (flock /tmp/spark-lab-gpu.lock bash queue.sh)
+command: flock /tmp/spark-lab-gpu.lock docker run --rm --name c52om-969-bench-cache-base-boot1 --gpus all --ipc=host -e HF_HUB_OFFLINE=1 -e TILELANG_CACHE_DIR=/root/.tilelang/cache -v /home/chris/spark-lab/agents/candidate-52-own-marks/c/tl-base:/root/.tilelang -v /home/chris/spark-lab/agents/candidate-52-own-marks/out/pr-969:/out -w /opt/spark-ds41f/candidate/vllm -v /home/chris/spark-lab/agents/candidate-52-own-marks/ovl/no1009/vllm/models/deepseek_v4_1/attention.py:/opt/spark-ds41f/candidate/vllm/vllm/models/deepseek_v4_1/attention.py:ro -v /home/chris/spark-lab/agents/candidate-52-own-marks/ovl/no1009/vllm/models/deepseek_v4_1/sp_prefill.py:/opt/spark-ds41f/candidate/vllm/vllm/models/deepseek_v4_1/sp_prefill.py:ro -v /home/chris/spark-lab/agents/candidate-52-own-marks/ovl/no1009/vllm/models/deepseek_v4_1/tilelang/cache_writer.py:/opt/spark-ds41f/candidate/vllm/vllm/models/deepseek_v4_1/tilelang/cache_writer.py:ro -v /home/chris/spark-lab/agents/candidate-52-own-marks/ovl/no1009/vllm/models/deepseek_v4_1/tilelang/front.py:/opt/spark-ds41f/candidate/vllm/vllm/models/deepseek_v4_1/tilelang/front.py:ro --cap-add=IPC_LOCK --ulimit=memlock=-1:-1 --security-opt=seccomp=unconfined --security-opt=label=disable -v /home/chris/spark-lab/agents/candidate-52-own-marks/nvme:/mnt/nvme -v /home/chris/spark-lab/agents/candidate-52-own-marks/bench969:/bench969:ro -e ENGRAM_ROWS_TEST_DIR=/mnt/nvme/engram-rows-test --entrypoint python3 sha256:8c1ea1f62f62c3e2adc03b645c091a5499cf7163101aca32875c894b96f155db /bench969/run969.py base-boot1 20 
+end_utc: 2026-11-09T18:07:29Z
+loadavg_after: 1.58 1.49 1.54
+exit_code: 0
+output: bench-cache-base-boot1.txt
+
+### bench-cache-c52-boot1
+host: spark-0016 (sp8)
+arm: c52
+image: sha256:8c1ea1f62f62c3e2adc03b645c091a5499cf7163101aca32875c894b96f155db (spark-ds41f:candidate-50) + candidate-52 overlay (13 files, ro; overlay-sha.txt)
+issued_utc: 2026-11-09T18:07:29Z
+start_utc: 2026-11-09T18:07:29Z
+loadavg_before: 1.58 1.49 1.54
+docker_ps_before: none
+hold_file: absent
+serving_container: no
+gpu_lock: held by the enclosing queue section (flock /tmp/spark-lab-gpu.lock bash queue.sh)
+command: flock /tmp/spark-lab-gpu.lock docker run --rm --name c52om-969-bench-cache-c52-boot1 --gpus all --ipc=host -e HF_HUB_OFFLINE=1 -e TILELANG_CACHE_DIR=/root/.tilelang/cache -v /home/chris/spark-lab/agents/candidate-52-own-marks/c/tl-c52:/root/.tilelang -v /home/chris/spark-lab/agents/candidate-52-own-marks/out/pr-969:/out -w /opt/spark-ds41f/candidate/vllm -v /home/chris/spark-lab/agents/candidate-52-own-marks/ovl/c52/tests/kernels/moe/test_deepseek_v41_tilelang_moe.py:/opt/spark-ds41f/candidate/vllm/tests/kernels/moe/test_deepseek_v41_tilelang_moe.py:ro -v /home/chris/spark-lab/agents/candidate-52-own-marks/ovl/c52/tests/kernels/test_deepseek_v41_engram_rows.py:/opt/spark-ds41f/candidate/vllm/tests/kernels/test_deepseek_v41_engram_rows.py:ro -v /home/chris/spark-lab/agents/candidate-52-own-marks/ovl/c52/tests/kernels/test_deepseek_v41_tilelang_front.py:/opt/spark-ds41f/candidate/vllm/tests/kernels/test_deepseek_v41_tilelang_front.py:ro -v /home/chris/spark-lab/agents/candidate-52-own-marks/ovl/c52/tests/models/test_deepseek_v4_1_attention.py:/opt/spark-ds41f/candidate/vllm/tests/models/test_deepseek_v4_1_attention.py:ro -v /home/chris/spark-lab/agents/candidate-52-own-marks/ovl/c52/tests/v1/core/test_copy_drafts_scheduler.py:/opt/spark-ds41f/candidate/vllm/tests/v1/core/test_copy_drafts_scheduler.py:ro -v /home/chris/spark-lab/agents/candidate-52-own-marks/ovl/c52/vllm/models/deepseek_v4_1/attention.py:/opt/spark-ds41f/candidate/vllm/vllm/models/deepseek_v4_1/attention.py:ro -v /home/chris/spark-lab/agents/candidate-52-own-marks/ovl/c52/vllm/models/deepseek_v4_1/engram_rows/_reader.c:/opt/spark-ds41f/candidate/vllm/vllm/models/deepseek_v4_1/engram_rows/_reader.c:ro -v /home/chris/spark-lab/agents/candidate-52-own-marks/ovl/c52/vllm/models/deepseek_v4_1/engram_rows/_row_plan.h:/opt/spark-ds41f/candidate/vllm/vllm/models/deepseek_v4_1/engram_rows/_row_plan.h:ro -v /home/chris/spark-lab/agents/candidate-52-own-marks/ovl/c52/vllm/models/deepseek_v4_1/sp_prefill.py:/opt/spark-ds41f/candidate/vllm/vllm/models/deepseek_v4_1/sp_prefill.py:ro -v /home/chris/spark-lab/agents/candidate-52-own-marks/ovl/c52/vllm/models/deepseek_v4_1/tilelang/cache_writer.py:/opt/spark-ds41f/candidate/vllm/vllm/models/deepseek_v4_1/tilelang/cache_writer.py:ro -v /home/chris/spark-lab/agents/candidate-52-own-marks/ovl/c52/vllm/models/deepseek_v4_1/tilelang/front.py:/opt/spark-ds41f/candidate/vllm/vllm/models/deepseek_v4_1/tilelang/front.py:ro -v /home/chris/spark-lab/agents/candidate-52-own-marks/ovl/c52/vllm/models/deepseek_v4_1/tilelang/moe.py:/opt/spark-ds41f/candidate/vllm/vllm/models/deepseek_v4_1/tilelang/moe.py:ro -v /home/chris/spark-lab/agents/candidate-52-own-marks/ovl/c52/vllm/v1/core/sched/scheduler.py:/opt/spark-ds41f/candidate/vllm/vllm/v1/core/sched/scheduler.py:ro --cap-add=IPC_LOCK --ulimit=memlock=-1:-1 --security-opt=seccomp=unconfined --security-opt=label=disable -v /home/chris/spark-lab/agents/candidate-52-own-marks/nvme:/mnt/nvme -v /home/chris/spark-lab/agents/candidate-52-own-marks/bench969:/bench969:ro -e ENGRAM_ROWS_TEST_DIR=/mnt/nvme/engram-rows-test --entrypoint python3 sha256:8c1ea1f62f62c3e2adc03b645c091a5499cf7163101aca32875c894b96f155db /bench969/run969.py c52-boot1 20 
+end_utc: 2026-11-09T18:07:43Z
+loadavg_after: 1.68 1.51 1.55
+exit_code: 0
+output: bench-cache-c52-boot1.txt
+
+### bench-cache-c52-boot2
+host: spark-0016 (sp8)
+arm: c52
+image: sha256:8c1ea1f62f62c3e2adc03b645c091a5499cf7163101aca32875c894b96f155db (spark-ds41f:candidate-50) + candidate-52 overlay (13 files, ro; overlay-sha.txt)
+issued_utc: 2026-11-09T18:07:43Z
+start_utc: 2026-11-09T18:07:43Z
+loadavg_before: 1.68 1.51 1.55
+docker_ps_before: none
+hold_file: absent
+serving_container: no
+gpu_lock: held by the enclosing queue section (flock /tmp/spark-lab-gpu.lock bash queue.sh)
+command: flock /tmp/spark-lab-gpu.lock docker run --rm --name c52om-969-bench-cache-c52-boot2 --gpus all --ipc=host -e HF_HUB_OFFLINE=1 -e TILELANG_CACHE_DIR=/root/.tilelang/cache -v /home/chris/spark-lab/agents/candidate-52-own-marks/c/tl-c52:/root/.tilelang -v /home/chris/spark-lab/agents/candidate-52-own-marks/out/pr-969:/out -w /opt/spark-ds41f/candidate/vllm -v /home/chris/spark-lab/agents/candidate-52-own-marks/ovl/c52/tests/kernels/moe/test_deepseek_v41_tilelang_moe.py:/opt/spark-ds41f/candidate/vllm/tests/kernels/moe/test_deepseek_v41_tilelang_moe.py:ro -v /home/chris/spark-lab/agents/candidate-52-own-marks/ovl/c52/tests/kernels/test_deepseek_v41_engram_rows.py:/opt/spark-ds41f/candidate/vllm/tests/kernels/test_deepseek_v41_engram_rows.py:ro -v /home/chris/spark-lab/agents/candidate-52-own-marks/ovl/c52/tests/kernels/test_deepseek_v41_tilelang_front.py:/opt/spark-ds41f/candidate/vllm/tests/kernels/test_deepseek_v41_tilelang_front.py:ro -v /home/chris/spark-lab/agents/candidate-52-own-marks/ovl/c52/tests/models/test_deepseek_v4_1_attention.py:/opt/spark-ds41f/candidate/vllm/tests/models/test_deepseek_v4_1_attention.py:ro -v /home/chris/spark-lab/agents/candidate-52-own-marks/ovl/c52/tests/v1/core/test_copy_drafts_scheduler.py:/opt/spark-ds41f/candidate/vllm/tests/v1/core/test_copy_drafts_scheduler.py:ro -v /home/chris/spark-lab/agents/candidate-52-own-marks/ovl/c52/vllm/models/deepseek_v4_1/attention.py:/opt/spark-ds41f/candidate/vllm/vllm/models/deepseek_v4_1/attention.py:ro -v /home/chris/spark-lab/agents/candidate-52-own-marks/ovl/c52/vllm/models/deepseek_v4_1/engram_rows/_reader.c:/opt/spark-ds41f/candidate/vllm/vllm/models/deepseek_v4_1/engram_rows/_reader.c:ro -v /home/chris/spark-lab/agents/candidate-52-own-marks/ovl/c52/vllm/models/deepseek_v4_1/engram_rows/_row_plan.h:/opt/spark-ds41f/candidate/vllm/vllm/models/deepseek_v4_1/engram_rows/_row_plan.h:ro -v /home/chris/spark-lab/agents/candidate-52-own-marks/ovl/c52/vllm/models/deepseek_v4_1/sp_prefill.py:/opt/spark-ds41f/candidate/vllm/vllm/models/deepseek_v4_1/sp_prefill.py:ro -v /home/chris/spark-lab/agents/candidate-52-own-marks/ovl/c52/vllm/models/deepseek_v4_1/tilelang/cache_writer.py:/opt/spark-ds41f/candidate/vllm/vllm/models/deepseek_v4_1/tilelang/cache_writer.py:ro -v /home/chris/spark-lab/agents/candidate-52-own-marks/ovl/c52/vllm/models/deepseek_v4_1/tilelang/front.py:/opt/spark-ds41f/candidate/vllm/vllm/models/deepseek_v4_1/tilelang/front.py:ro -v /home/chris/spark-lab/agents/candidate-52-own-marks/ovl/c52/vllm/models/deepseek_v4_1/tilelang/moe.py:/opt/spark-ds41f/candidate/vllm/vllm/models/deepseek_v4_1/tilelang/moe.py:ro -v /home/chris/spark-lab/agents/candidate-52-own-marks/ovl/c52/vllm/v1/core/sched/scheduler.py:/opt/spark-ds41f/candidate/vllm/vllm/v1/core/sched/scheduler.py:ro --cap-add=IPC_LOCK --ulimit=memlock=-1:-1 --security-opt=seccomp=unconfined --security-opt=label=disable -v /home/chris/spark-lab/agents/candidate-52-own-marks/nvme:/mnt/nvme -v /home/chris/spark-lab/agents/candidate-52-own-marks/bench969:/bench969:ro -e ENGRAM_ROWS_TEST_DIR=/mnt/nvme/engram-rows-test --entrypoint python3 sha256:8c1ea1f62f62c3e2adc03b645c091a5499cf7163101aca32875c894b96f155db /bench969/run969.py c52-boot2 20 
+end_utc: 2026-11-09T18:07:57Z
+loadavg_after: 1.61 1.50 1.54
+exit_code: 0
+output: bench-cache-c52-boot2.txt
+
+### bench-cache-base-boot2
+host: spark-0016 (sp8)
+arm: base
+image: sha256:8c1ea1f62f62c3e2adc03b645c091a5499cf7163101aca32875c894b96f155db (spark-ds41f:candidate-50) + no1009 overlay (4 files, ro)
+issued_utc: 2026-11-09T18:07:57Z
+start_utc: 2026-11-09T18:07:57Z
+loadavg_before: 1.61 1.50 1.54
+docker_ps_before: none
+hold_file: absent
+serving_container: no
+gpu_lock: held by the enclosing queue section (flock /tmp/spark-lab-gpu.lock bash queue.sh)
+command: flock /tmp/spark-lab-gpu.lock docker run --rm --name c52om-969-bench-cache-base-boot2 --gpus all --ipc=host -e HF_HUB_OFFLINE=1 -e TILELANG_CACHE_DIR=/root/.tilelang/cache -v /home/chris/spark-lab/agents/candidate-52-own-marks/c/tl-base:/root/.tilelang -v /home/chris/spark-lab/agents/candidate-52-own-marks/out/pr-969:/out -w /opt/spark-ds41f/candidate/vllm -v /home/chris/spark-lab/agents/candidate-52-own-marks/ovl/no1009/vllm/models/deepseek_v4_1/attention.py:/opt/spark-ds41f/candidate/vllm/vllm/models/deepseek_v4_1/attention.py:ro -v /home/chris/spark-lab/agents/candidate-52-own-marks/ovl/no1009/vllm/models/deepseek_v4_1/sp_prefill.py:/opt/spark-ds41f/candidate/vllm/vllm/models/deepseek_v4_1/sp_prefill.py:ro -v /home/chris/spark-lab/agents/candidate-52-own-marks/ovl/no1009/vllm/models/deepseek_v4_1/tilelang/cache_writer.py:/opt/spark-ds41f/candidate/vllm/vllm/models/deepseek_v4_1/tilelang/cache_writer.py:ro -v /home/chris/spark-lab/agents/candidate-52-own-marks/ovl/no1009/vllm/models/deepseek_v4_1/tilelang/front.py:/opt/spark-ds41f/candidate/vllm/vllm/models/deepseek_v4_1/tilelang/front.py:ro --cap-add=IPC_LOCK --ulimit=memlock=-1:-1 --security-opt=seccomp=unconfined --security-opt=label=disable -v /home/chris/spark-lab/agents/candidate-52-own-marks/nvme:/mnt/nvme -v /home/chris/spark-lab/agents/candidate-52-own-marks/bench969:/bench969:ro -e ENGRAM_ROWS_TEST_DIR=/mnt/nvme/engram-rows-test --entrypoint python3 sha256:8c1ea1f62f62c3e2adc03b645c091a5499cf7163101aca32875c894b96f155db /bench969/run969.py base-boot2 20 
+end_utc: 2026-11-09T18:08:11Z
+loadavg_after: 1.51 1.48 1.54
+exit_code: 0
+output: bench-cache-base-boot2.txt
+
+### rows-base-boot1
+host: spark-0016 (sp8)
+arm: base
+image: sha256:8c1ea1f62f62c3e2adc03b645c091a5499cf7163101aca32875c894b96f155db (spark-ds41f:candidate-50) + no1009 overlay (4 files, ro)
+issued_utc: 2026-11-09T18:08:11Z
+start_utc: 2026-11-09T18:08:11Z
+loadavg_before: 1.51 1.48 1.54
+docker_ps_before: none
+hold_file: absent
+serving_container: no
+gpu_lock: held by the enclosing queue section (flock /tmp/spark-lab-gpu.lock bash queue.sh)
+command: flock /tmp/spark-lab-gpu.lock docker run --rm --name c52om-969-rows-base-boot1 --gpus all --ipc=host -e HF_HUB_OFFLINE=1 -e TILELANG_CACHE_DIR=/root/.tilelang/cache -v /home/chris/spark-lab/agents/candidate-52-own-marks/c/tl-base:/root/.tilelang -v /home/chris/spark-lab/agents/candidate-52-own-marks/out/pr-969:/out -w /opt/spark-ds41f/candidate/vllm -v /home/chris/spark-lab/agents/candidate-52-own-marks/ovl/no1009/vllm/models/deepseek_v4_1/attention.py:/opt/spark-ds41f/candidate/vllm/vllm/models/deepseek_v4_1/attention.py:ro -v /home/chris/spark-lab/agents/candidate-52-own-marks/ovl/no1009/vllm/models/deepseek_v4_1/sp_prefill.py:/opt/spark-ds41f/candidate/vllm/vllm/models/deepseek_v4_1/sp_prefill.py:ro -v /home/chris/spark-lab/agents/candidate-52-own-marks/ovl/no1009/vllm/models/deepseek_v4_1/tilelang/cache_writer.py:/opt/spark-ds41f/candidate/vllm/vllm/models/deepseek_v4_1/tilelang/cache_writer.py:ro -v /home/chris/spark-lab/agents/candidate-52-own-marks/ovl/no1009/vllm/models/deepseek_v4_1/tilelang/front.py:/opt/spark-ds41f/candidate/vllm/vllm/models/deepseek_v4_1/tilelang/front.py:ro --cap-add=IPC_LOCK --ulimit=memlock=-1:-1 --security-opt=seccomp=unconfined --security-opt=label=disable -v /home/chris/spark-lab/agents/candidate-52-own-marks/nvme:/mnt/nvme -v /home/chris/spark-lab/agents/candidate-52-own-marks/bench969:/bench969:ro -e ENGRAM_ROWS_TEST_DIR=/mnt/nvme/engram-rows-test --entrypoint python3 sha256:8c1ea1f62f62c3e2adc03b645c091a5499cf7163101aca32875c894b96f155db /bench969/rows969.py base-boot1 
+end_utc: 2026-11-09T18:08:19Z
+loadavg_after: 1.43 1.47 1.53
+exit_code: 0
+output: rows-base-boot1.txt
+
+### rows-c52-boot1
+host: spark-0016 (sp8)
+arm: c52
+image: sha256:8c1ea1f62f62c3e2adc03b645c091a5499cf7163101aca32875c894b96f155db (spark-ds41f:candidate-50) + candidate-52 overlay (13 files, ro; overlay-sha.txt)
+issued_utc: 2026-11-09T18:08:19Z
+start_utc: 2026-11-09T18:08:19Z
+loadavg_before: 1.43 1.47 1.53
+docker_ps_before: none
+hold_file: absent
+serving_container: no
+gpu_lock: held by the enclosing queue section (flock /tmp/spark-lab-gpu.lock bash queue.sh)
+command: flock /tmp/spark-lab-gpu.lock docker run --rm --name c52om-969-rows-c52-boot1 --gpus all --ipc=host -e HF_HUB_OFFLINE=1 -e TILELANG_CACHE_DIR=/root/.tilelang/cache -v /home/chris/spark-lab/agents/candidate-52-own-marks/c/tl-c52:/root/.tilelang -v /home/chris/spark-lab/agents/candidate-52-own-marks/out/pr-969:/out -w /opt/spark-ds41f/candidate/vllm -v /home/chris/spark-lab/agents/candidate-52-own-marks/ovl/c52/tests/kernels/moe/test_deepseek_v41_tilelang_moe.py:/opt/spark-ds41f/candidate/vllm/tests/kernels/moe/test_deepseek_v41_tilelang_moe.py:ro -v /home/chris/spark-lab/agents/candidate-52-own-marks/ovl/c52/tests/kernels/test_deepseek_v41_engram_rows.py:/opt/spark-ds41f/candidate/vllm/tests/kernels/test_deepseek_v41_engram_rows.py:ro -v /home/chris/spark-lab/agents/candidate-52-own-marks/ovl/c52/tests/kernels/test_deepseek_v41_tilelang_front.py:/opt/spark-ds41f/candidate/vllm/tests/kernels/test_deepseek_v41_tilelang_front.py:ro -v /home/chris/spark-lab/agents/candidate-52-own-marks/ovl/c52/tests/models/test_deepseek_v4_1_attention.py:/opt/spark-ds41f/candidate/vllm/tests/models/test_deepseek_v4_1_attention.py:ro -v /home/chris/spark-lab/agents/candidate-52-own-marks/ovl/c52/tests/v1/core/test_copy_drafts_scheduler.py:/opt/spark-ds41f/candidate/vllm/tests/v1/core/test_copy_drafts_scheduler.py:ro -v /home/chris/spark-lab/agents/candidate-52-own-marks/ovl/c52/vllm/models/deepseek_v4_1/attention.py:/opt/spark-ds41f/candidate/vllm/vllm/models/deepseek_v4_1/attention.py:ro -v /home/chris/spark-lab/agents/candidate-52-own-marks/ovl/c52/vllm/models/deepseek_v4_1/engram_rows/_reader.c:/opt/spark-ds41f/candidate/vllm/vllm/models/deepseek_v4_1/engram_rows/_reader.c:ro -v /home/chris/spark-lab/agents/candidate-52-own-marks/ovl/c52/vllm/models/deepseek_v4_1/engram_rows/_row_plan.h:/opt/spark-ds41f/candidate/vllm/vllm/models/deepseek_v4_1/engram_rows/_row_plan.h:ro -v /home/chris/spark-lab/agents/candidate-52-own-marks/ovl/c52/vllm/models/deepseek_v4_1/sp_prefill.py:/opt/spark-ds41f/candidate/vllm/vllm/models/deepseek_v4_1/sp_prefill.py:ro -v /home/chris/spark-lab/agents/candidate-52-own-marks/ovl/c52/vllm/models/deepseek_v4_1/tilelang/cache_writer.py:/opt/spark-ds41f/candidate/vllm/vllm/models/deepseek_v4_1/tilelang/cache_writer.py:ro -v /home/chris/spark-lab/agents/candidate-52-own-marks/ovl/c52/vllm/models/deepseek_v4_1/tilelang/front.py:/opt/spark-ds41f/candidate/vllm/vllm/models/deepseek_v4_1/tilelang/front.py:ro -v /home/chris/spark-lab/agents/candidate-52-own-marks/ovl/c52/vllm/models/deepseek_v4_1/tilelang/moe.py:/opt/spark-ds41f/candidate/vllm/vllm/models/deepseek_v4_1/tilelang/moe.py:ro -v /home/chris/spark-lab/agents/candidate-52-own-marks/ovl/c52/vllm/v1/core/sched/scheduler.py:/opt/spark-ds41f/candidate/vllm/vllm/v1/core/sched/scheduler.py:ro --cap-add=IPC_LOCK --ulimit=memlock=-1:-1 --security-opt=seccomp=unconfined --security-opt=label=disable -v /home/chris/spark-lab/agents/candidate-52-own-marks/nvme:/mnt/nvme -v /home/chris/spark-lab/agents/candidate-52-own-marks/bench969:/bench969:ro -e ENGRAM_ROWS_TEST_DIR=/mnt/nvme/engram-rows-test --entrypoint python3 sha256:8c1ea1f62f62c3e2adc03b645c091a5499cf7163101aca32875c894b96f155db /bench969/rows969.py c52-boot1 
+end_utc: 2026-11-09T18:08:27Z
+loadavg_after: 1.45 1.47 1.53
+exit_code: 0
+output: rows-c52-boot1.txt
+
+### rows-c52-boot2
+host: spark-0016 (sp8)
+arm: c52
+image: sha256:8c1ea1f62f62c3e2adc03b645c091a5499cf7163101aca32875c894b96f155db (spark-ds41f:candidate-50) + candidate-52 overlay (13 files, ro; overlay-sha.txt)
+issued_utc: 2026-11-09T18:08:27Z
+start_utc: 2026-11-09T18:08:27Z
+loadavg_before: 1.45 1.47 1.53
+docker_ps_before: none
+hold_file: absent
+serving_container: no
+gpu_lock: held by the enclosing queue section (flock /tmp/spark-lab-gpu.lock bash queue.sh)
+command: flock /tmp/spark-lab-gpu.lock docker run --rm --name c52om-969-rows-c52-boot2 --gpus all --ipc=host -e HF_HUB_OFFLINE=1 -e TILELANG_CACHE_DIR=/root/.tilelang/cache -v /home/chris/spark-lab/agents/candidate-52-own-marks/c/tl-c52:/root/.tilelang -v /home/chris/spark-lab/agents/candidate-52-own-marks/out/pr-969:/out -w /opt/spark-ds41f/candidate/vllm -v /home/chris/spark-lab/agents/candidate-52-own-marks/ovl/c52/tests/kernels/moe/test_deepseek_v41_tilelang_moe.py:/opt/spark-ds41f/candidate/vllm/tests/kernels/moe/test_deepseek_v41_tilelang_moe.py:ro -v /home/chris/spark-lab/agents/candidate-52-own-marks/ovl/c52/tests/kernels/test_deepseek_v41_engram_rows.py:/opt/spark-ds41f/candidate/vllm/tests/kernels/test_deepseek_v41_engram_rows.py:ro -v /home/chris/spark-lab/agents/candidate-52-own-marks/ovl/c52/tests/kernels/test_deepseek_v41_tilelang_front.py:/opt/spark-ds41f/candidate/vllm/tests/kernels/test_deepseek_v41_tilelang_front.py:ro -v /home/chris/spark-lab/agents/candidate-52-own-marks/ovl/c52/tests/models/test_deepseek_v4_1_attention.py:/opt/spark-ds41f/candidate/vllm/tests/models/test_deepseek_v4_1_attention.py:ro -v /home/chris/spark-lab/agents/candidate-52-own-marks/ovl/c52/tests/v1/core/test_copy_drafts_scheduler.py:/opt/spark-ds41f/candidate/vllm/tests/v1/core/test_copy_drafts_scheduler.py:ro -v /home/chris/spark-lab/agents/candidate-52-own-marks/ovl/c52/vllm/models/deepseek_v4_1/attention.py:/opt/spark-ds41f/candidate/vllm/vllm/models/deepseek_v4_1/attention.py:ro -v /home/chris/spark-lab/agents/candidate-52-own-marks/ovl/c52/vllm/models/deepseek_v4_1/engram_rows/_reader.c:/opt/spark-ds41f/candidate/vllm/vllm/models/deepseek_v4_1/engram_rows/_reader.c:ro -v /home/chris/spark-lab/agents/candidate-52-own-marks/ovl/c52/vllm/models/deepseek_v4_1/engram_rows/_row_plan.h:/opt/spark-ds41f/candidate/vllm/vllm/models/deepseek_v4_1/engram_rows/_row_plan.h:ro -v /home/chris/spark-lab/agents/candidate-52-own-marks/ovl/c52/vllm/models/deepseek_v4_1/sp_prefill.py:/opt/spark-ds41f/candidate/vllm/vllm/models/deepseek_v4_1/sp_prefill.py:ro -v /home/chris/spark-lab/agents/candidate-52-own-marks/ovl/c52/vllm/models/deepseek_v4_1/tilelang/cache_writer.py:/opt/spark-ds41f/candidate/vllm/vllm/models/deepseek_v4_1/tilelang/cache_writer.py:ro -v /home/chris/spark-lab/agents/candidate-52-own-marks/ovl/c52/vllm/models/deepseek_v4_1/tilelang/front.py:/opt/spark-ds41f/candidate/vllm/vllm/models/deepseek_v4_1/tilelang/front.py:ro -v /home/chris/spark-lab/agents/candidate-52-own-marks/ovl/c52/vllm/models/deepseek_v4_1/tilelang/moe.py:/opt/spark-ds41f/candidate/vllm/vllm/models/deepseek_v4_1/tilelang/moe.py:ro -v /home/chris/spark-lab/agents/candidate-52-own-marks/ovl/c52/vllm/v1/core/sched/scheduler.py:/opt/spark-ds41f/candidate/vllm/vllm/v1/core/sched/scheduler.py:ro --cap-add=IPC_LOCK --ulimit=memlock=-1:-1 --security-opt=seccomp=unconfined --security-opt=label=disable -v /home/chris/spark-lab/agents/candidate-52-own-marks/nvme:/mnt/nvme -v /home/chris/spark-lab/agents/candidate-52-own-marks/bench969:/bench969:ro -e ENGRAM_ROWS_TEST_DIR=/mnt/nvme/engram-rows-test --entrypoint python3 sha256:8c1ea1f62f62c3e2adc03b645c091a5499cf7163101aca32875c894b96f155db /bench969/rows969.py c52-boot2 
+end_utc: 2026-11-09T18:08:36Z
+loadavg_after: 1.41 1.46 1.53
+exit_code: 0
+output: rows-c52-boot2.txt
+
+### rows-base-boot2
+host: spark-0016 (sp8)
+arm: base
+image: sha256:8c1ea1f62f62c3e2adc03b645c091a5499cf7163101aca32875c894b96f155db (spark-ds41f:candidate-50) + no1009 overlay (4 files, ro)
+issued_utc: 2026-11-09T18:08:36Z
+start_utc: 2026-11-09T18:08:36Z
+loadavg_before: 1.41 1.46 1.53
+docker_ps_before: none
+hold_file: absent
+serving_container: no
+gpu_lock: held by the enclosing queue section (flock /tmp/spark-lab-gpu.lock bash queue.sh)
+command: flock /tmp/spark-lab-gpu.lock docker run --rm --name c52om-969-rows-base-boot2 --gpus all --ipc=host -e HF_HUB_OFFLINE=1 -e TILELANG_CACHE_DIR=/root/.tilelang/cache -v /home/chris/spark-lab/agents/candidate-52-own-marks/c/tl-base:/root/.tilelang -v /home/chris/spark-lab/agents/candidate-52-own-marks/out/pr-969:/out -w /opt/spark-ds41f/candidate/vllm -v /home/chris/spark-lab/agents/candidate-52-own-marks/ovl/no1009/vllm/models/deepseek_v4_1/attention.py:/opt/spark-ds41f/candidate/vllm/vllm/models/deepseek_v4_1/attention.py:ro -v /home/chris/spark-lab/agents/candidate-52-own-marks/ovl/no1009/vllm/models/deepseek_v4_1/sp_prefill.py:/opt/spark-ds41f/candidate/vllm/vllm/models/deepseek_v4_1/sp_prefill.py:ro -v /home/chris/spark-lab/agents/candidate-52-own-marks/ovl/no1009/vllm/models/deepseek_v4_1/tilelang/cache_writer.py:/opt/spark-ds41f/candidate/vllm/vllm/models/deepseek_v4_1/tilelang/cache_writer.py:ro -v /home/chris/spark-lab/agents/candidate-52-own-marks/ovl/no1009/vllm/models/deepseek_v4_1/tilelang/front.py:/opt/spark-ds41f/candidate/vllm/vllm/models/deepseek_v4_1/tilelang/front.py:ro --cap-add=IPC_LOCK --ulimit=memlock=-1:-1 --security-opt=seccomp=unconfined --security-opt=label=disable -v /home/chris/spark-lab/agents/candidate-52-own-marks/nvme:/mnt/nvme -v /home/chris/spark-lab/agents/candidate-52-own-marks/bench969:/bench969:ro -e ENGRAM_ROWS_TEST_DIR=/mnt/nvme/engram-rows-test --entrypoint python3 sha256:8c1ea1f62f62c3e2adc03b645c091a5499cf7163101aca32875c894b96f155db /bench969/rows969.py base-boot2 
+end_utc: 2026-11-09T18:08:44Z
+loadavg_after: 1.35 1.45 1.52
+exit_code: 0
+output: rows-base-boot2.txt
+
+### pytest-c52-boot1
+host: spark-0016 (sp8)
+arm: c52
+image: sha256:8c1ea1f62f62c3e2adc03b645c091a5499cf7163101aca32875c894b96f155db (spark-ds41f:candidate-50) + candidate-52 overlay (13 files, ro; overlay-sha.txt)
+issued_utc: 2026-11-09T18:08:44Z
+start_utc: 2026-11-09T18:08:44Z
+loadavg_before: 1.35 1.45 1.52
+docker_ps_before: none
+hold_file: absent
+serving_container: no
+gpu_lock: held by the enclosing queue section (flock /tmp/spark-lab-gpu.lock bash queue.sh)
+command: flock /tmp/spark-lab-gpu.lock docker run --rm --name c52om-969-pytest-c52-boot1 --gpus all --ipc=host -e HF_HUB_OFFLINE=1 -e TILELANG_CACHE_DIR=/root/.tilelang/cache -v /home/chris/spark-lab/agents/candidate-52-own-marks/c/tl-c52:/root/.tilelang -v /home/chris/spark-lab/agents/candidate-52-own-marks/out/pr-969:/out -w /opt/spark-ds41f/candidate/vllm -v /home/chris/spark-lab/agents/candidate-52-own-marks/ovl/c52/tests/kernels/moe/test_deepseek_v41_tilelang_moe.py:/opt/spark-ds41f/candidate/vllm/tests/kernels/moe/test_deepseek_v41_tilelang_moe.py:ro -v /home/chris/spark-lab/agents/candidate-52-own-marks/ovl/c52/tests/kernels/test_deepseek_v41_engram_rows.py:/opt/spark-ds41f/candidate/vllm/tests/kernels/test_deepseek_v41_engram_rows.py:ro -v /home/chris/spark-lab/agents/candidate-52-own-marks/ovl/c52/tests/kernels/test_deepseek_v41_tilelang_front.py:/opt/spark-ds41f/candidate/vllm/tests/kernels/test_deepseek_v41_tilelang_front.py:ro -v /home/chris/spark-lab/agents/candidate-52-own-marks/ovl/c52/tests/models/test_deepseek_v4_1_attention.py:/opt/spark-ds41f/candidate/vllm/tests/models/test_deepseek_v4_1_attention.py:ro -v /home/chris/spark-lab/agents/candidate-52-own-marks/ovl/c52/tests/v1/core/test_copy_drafts_scheduler.py:/opt/spark-ds41f/candidate/vllm/tests/v1/core/test_copy_drafts_scheduler.py:ro -v /home/chris/spark-lab/agents/candidate-52-own-marks/ovl/c52/vllm/models/deepseek_v4_1/attention.py:/opt/spark-ds41f/candidate/vllm/vllm/models/deepseek_v4_1/attention.py:ro -v /home/chris/spark-lab/agents/candidate-52-own-marks/ovl/c52/vllm/models/deepseek_v4_1/engram_rows/_reader.c:/opt/spark-ds41f/candidate/vllm/vllm/models/deepseek_v4_1/engram_rows/_reader.c:ro -v /home/chris/spark-lab/agents/candidate-52-own-marks/ovl/c52/vllm/models/deepseek_v4_1/engram_rows/_row_plan.h:/opt/spark-ds41f/candidate/vllm/vllm/models/deepseek_v4_1/engram_rows/_row_plan.h:ro -v /home/chris/spark-lab/agents/candidate-52-own-marks/ovl/c52/vllm/models/deepseek_v4_1/sp_prefill.py:/opt/spark-ds41f/candidate/vllm/vllm/models/deepseek_v4_1/sp_prefill.py:ro -v /home/chris/spark-lab/agents/candidate-52-own-marks/ovl/c52/vllm/models/deepseek_v4_1/tilelang/cache_writer.py:/opt/spark-ds41f/candidate/vllm/vllm/models/deepseek_v4_1/tilelang/cache_writer.py:ro -v /home/chris/spark-lab/agents/candidate-52-own-marks/ovl/c52/vllm/models/deepseek_v4_1/tilelang/front.py:/opt/spark-ds41f/candidate/vllm/vllm/models/deepseek_v4_1/tilelang/front.py:ro -v /home/chris/spark-lab/agents/candidate-52-own-marks/ovl/c52/vllm/models/deepseek_v4_1/tilelang/moe.py:/opt/spark-ds41f/candidate/vllm/vllm/models/deepseek_v4_1/tilelang/moe.py:ro -v /home/chris/spark-lab/agents/candidate-52-own-marks/ovl/c52/vllm/v1/core/sched/scheduler.py:/opt/spark-ds41f/candidate/vllm/vllm/v1/core/sched/scheduler.py:ro --cap-add=IPC_LOCK --ulimit=memlock=-1:-1 --security-opt=seccomp=unconfined --security-opt=label=disable -v /home/chris/spark-lab/agents/candidate-52-own-marks/nvme:/mnt/nvme -v /home/chris/spark-lab/agents/candidate-52-own-marks/bench969:/bench969:ro -e ENGRAM_ROWS_TEST_DIR=/mnt/nvme/engram-rows-test --entrypoint python3 sha256:8c1ea1f62f62c3e2adc03b645c091a5499cf7163101aca32875c894b96f155db -m pytest --noconftest -v tests/kernels/test_deepseek_v41_engram_rows.py 
+end_utc: 2026-11-09T18:09:43Z
+loadavg_after: 1.41 1.44 1.52
+exit_code: 0
+output: pytest-c52-boot1.txt
+
+### pytest-c52-boot2
+host: spark-0016 (sp8)
+arm: c52
+image: sha256:8c1ea1f62f62c3e2adc03b645c091a5499cf7163101aca32875c894b96f155db (spark-ds41f:candidate-50) + candidate-52 overlay (13 files, ro; overlay-sha.txt)
+issued_utc: 2026-11-09T18:09:43Z
+start_utc: 2026-11-09T18:09:43Z
+loadavg_before: 1.41 1.44 1.52
+docker_ps_before: none
+hold_file: absent
+serving_container: no
+gpu_lock: held by the enclosing queue section (flock /tmp/spark-lab-gpu.lock bash queue.sh)
+command: flock /tmp/spark-lab-gpu.lock docker run --rm --name c52om-969-pytest-c52-boot2 --gpus all --ipc=host -e HF_HUB_OFFLINE=1 -e TILELANG_CACHE_DIR=/root/.tilelang/cache -v /home/chris/spark-lab/agents/candidate-52-own-marks/c/tl-c52:/root/.tilelang -v /home/chris/spark-lab/agents/candidate-52-own-marks/out/pr-969:/out -w /opt/spark-ds41f/candidate/vllm -v /home/chris/spark-lab/agents/candidate-52-own-marks/ovl/c52/tests/kernels/moe/test_deepseek_v41_tilelang_moe.py:/opt/spark-ds41f/candidate/vllm/tests/kernels/moe/test_deepseek_v41_tilelang_moe.py:ro -v /home/chris/spark-lab/agents/candidate-52-own-marks/ovl/c52/tests/kernels/test_deepseek_v41_engram_rows.py:/opt/spark-ds41f/candidate/vllm/tests/kernels/test_deepseek_v41_engram_rows.py:ro -v /home/chris/spark-lab/agents/candidate-52-own-marks/ovl/c52/tests/kernels/test_deepseek_v41_tilelang_front.py:/opt/spark-ds41f/candidate/vllm/tests/kernels/test_deepseek_v41_tilelang_front.py:ro -v /home/chris/spark-lab/agents/candidate-52-own-marks/ovl/c52/tests/models/test_deepseek_v4_1_attention.py:/opt/spark-ds41f/candidate/vllm/tests/models/test_deepseek_v4_1_attention.py:ro -v /home/chris/spark-lab/agents/candidate-52-own-marks/ovl/c52/tests/v1/core/test_copy_drafts_scheduler.py:/opt/spark-ds41f/candidate/vllm/tests/v1/core/test_copy_drafts_scheduler.py:ro -v /home/chris/spark-lab/agents/candidate-52-own-marks/ovl/c52/vllm/models/deepseek_v4_1/attention.py:/opt/spark-ds41f/candidate/vllm/vllm/models/deepseek_v4_1/attention.py:ro -v /home/chris/spark-lab/agents/candidate-52-own-marks/ovl/c52/vllm/models/deepseek_v4_1/engram_rows/_reader.c:/opt/spark-ds41f/candidate/vllm/vllm/models/deepseek_v4_1/engram_rows/_reader.c:ro -v /home/chris/spark-lab/agents/candidate-52-own-marks/ovl/c52/vllm/models/deepseek_v4_1/engram_rows/_row_plan.h:/opt/spark-ds41f/candidate/vllm/vllm/models/deepseek_v4_1/engram_rows/_row_plan.h:ro -v /home/chris/spark-lab/agents/candidate-52-own-marks/ovl/c52/vllm/models/deepseek_v4_1/sp_prefill.py:/opt/spark-ds41f/candidate/vllm/vllm/models/deepseek_v4_1/sp_prefill.py:ro -v /home/chris/spark-lab/agents/candidate-52-own-marks/ovl/c52/vllm/models/deepseek_v4_1/tilelang/cache_writer.py:/opt/spark-ds41f/candidate/vllm/vllm/models/deepseek_v4_1/tilelang/cache_writer.py:ro -v /home/chris/spark-lab/agents/candidate-52-own-marks/ovl/c52/vllm/models/deepseek_v4_1/tilelang/front.py:/opt/spark-ds41f/candidate/vllm/vllm/models/deepseek_v4_1/tilelang/front.py:ro -v /home/chris/spark-lab/agents/candidate-52-own-marks/ovl/c52/vllm/models/deepseek_v4_1/tilelang/moe.py:/opt/spark-ds41f/candidate/vllm/vllm/models/deepseek_v4_1/tilelang/moe.py:ro -v /home/chris/spark-lab/agents/candidate-52-own-marks/ovl/c52/vllm/v1/core/sched/scheduler.py:/opt/spark-ds41f/candidate/vllm/vllm/v1/core/sched/scheduler.py:ro --cap-add=IPC_LOCK --ulimit=memlock=-1:-1 --security-opt=seccomp=unconfined --security-opt=label=disable -v /home/chris/spark-lab/agents/candidate-52-own-marks/nvme:/mnt/nvme -v /home/chris/spark-lab/agents/candidate-52-own-marks/bench969:/bench969:ro -e ENGRAM_ROWS_TEST_DIR=/mnt/nvme/engram-rows-test --entrypoint python3 sha256:8c1ea1f62f62c3e2adc03b645c091a5499cf7163101aca32875c894b96f155db -m pytest --noconftest -v tests/kernels/test_deepseek_v41_engram_rows.py 
+end_utc: 2026-11-09T18:10:17Z
+loadavg_after: 1.24 1.39 1.50
+exit_code: 0
+output: pytest-c52-boot2.txt
+

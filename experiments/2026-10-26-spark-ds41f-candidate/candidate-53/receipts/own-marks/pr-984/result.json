@@ -1,0 +1,627 @@
+{
+ "pr": 984,
+ "pr_head": "737aec88ed621f27376f500fa73002ce8718dc1c",
+ "patch": "0784-perf-worker-reclaim-uma-heap-and-allocator-slack-acr.patch (SHA-256 b82e1eec..., equal to the PR head's patch)",
+ "mark": "Its bench_uma_allocator_hygiene.py on the image, 2 boots, and the screen's startup record: each rank's lowest MemAvailable at startup higher than the base's beyond the interval, time to ready not worse, no JIT after readiness; short-request TTFT during a long prefill not worse (its post-prefill cache flush runs on the serving path); KV capacity unchanged (the recipe fixes --kv-cache-memory-bytes)",
+ "host": "sp8 (spark-0016, NVIDIA GB10, driver 580.178.04)",
+ "images": {
+  "base": "spark-ds41f:candidate-50 sha256:8c1ea1f62f62... + no1009/overlay (4 files, ro)",
+  "candidate-53": "the same image + 33 candidate-53 files (ro); ../common/overlay-sha.txt"
+ },
+ "evidence": [
+  "The PR's bench_uma_allocator_hygiene.py from its head, unmodified (--mode both: a baseline and a candidate lifecycle, each in its own subprocess), with --security-opt seccomp=unconfined --ulimit memlock=-1:-1, the Hugging Face cache read-only and PYTHONPATH=/opt/spark-ds41f/candidate/vllm, ABBA on both arms (bench-<arm>-boot<k>.json). No warm.py: a CUDA context in the parent would move the MemAvailable its children measure.",
+  "The PR's tests on the candidate arm, twice: pytest -v -k 'not test_memory_profiling' on its six files, PYTHONPATH with tests/vllm_test_utils and /tmp/stub_pkgs. The PR's /tmp/stub_pkgs was never committed; collection without it stops on ModuleNotFoundError tblib (../common/setup-runs/collect-984-c53.txt), so ../common/stub_pkgs/tblib (install() a no-op, as the release bundle's tblib_stub) stands in, and nothing else was missing.",
+  "Supplement (harness flush984.py, flush984b.py; candidate arm, twice): host time of the post-prefill flush the patch adds on the first FULL decode step after an eager prefill (reclaim_uma_memory(device, synchronize=False)), by component, under the recipe's allocator settings, and what the next prefill then pays to take the memory back."
+ ],
+ "measured": {
+  "pr_bench_in_process_deltas_candidate_minus_baseline": {
+   "base-boot1": {
+    "stage1_after_load.vm_rss_mib": -213.97,
+    "stage1_after_load.anon_mmap_rss_mib": -199.27,
+    "stage1_after_load.mem_avail_mib": 628.92,
+    "stage2_after_profile.vm_rss_mib": -401.79,
+    "stage2_after_profile.peak_reserved_during_attn_mib": -384.0,
+    "stage2_after_profile.non_kv_cache_memory_mib": -1145.36,
+    "stage2_after_profile.mem_avail_mib": 822.83,
+    "stage3_startup_complete.vm_rss_mib": -114.59,
+    "stage3_startup_complete.torch_reserved_mib": -384.0,
+    "stage3_startup_complete.torch_slack_mib": -384.0,
+    "stage3_startup_complete.mem_avail_mib": 731.43,
+    "stage3_startup_complete.cuda_free_mib": 717.48,
+    "stage4_after_prefill_transition.vm_rss_mib": -123.69,
+    "stage4_after_prefill_transition.torch_reserved_mib": -1920.0,
+    "stage4_after_prefill_transition.torch_slack_mib": -1920.0,
+    "stage4_after_prefill_transition.mem_avail_mib": 2223.01,
+    "stage4_after_prefill_transition.cuda_free_mib": 2133.44,
+    "stage4_steady_state_decode.p50_us": 5.91
+   },
+   "c53-boot1": {
+    "stage1_after_load.vm_rss_mib": -200.2,
+    "stage1_after_load.anon_mmap_rss_mib": -186.14,
+    "stage1_after_load.mem_avail_mib": 688.8,
+    "stage2_after_profile.vm_rss_mib": -391.51,
+    "stage2_after_profile.peak_reserved_during_attn_mib": -384.0,
+    "stage2_after_profile.non_kv_cache_memory_mib": -1021.43,
+    "stage2_after_profile.mem_avail_mib": 722.48,
+    "stage3_startup_complete.vm_rss_mib": -111.98,
+    "stage3_startup_complete.torch_reserved_mib": -384.0,
+    "stage3_startup_complete.torch_slack_mib": -384.0,
+    "stage3_startup_complete.mem_avail_mib": 613.45,
+    "stage3_startup_complete.cuda_free_mib": 246.67,
+    "stage4_after_prefill_transition.vm_rss_mib": -120.04,
+    "stage4_after_prefill_transition.torch_reserved_mib": -1920.0,
+    "stage4_after_prefill_transition.torch_slack_mib": -1920.0,
+    "stage4_after_prefill_transition.mem_avail_mib": 2136.45,
+    "stage4_after_prefill_transition.cuda_free_mib": 1769.65,
+    "stage4_steady_state_decode.p50_us": -1.08
+   },
+   "c53-boot2": {
+    "stage1_after_load.vm_rss_mib": -193.47,
+    "stage1_after_load.anon_mmap_rss_mib": -186.04,
+    "stage1_after_load.mem_avail_mib": 25.77,
+    "stage2_after_profile.vm_rss_mib": -385.11,
+    "stage2_after_profile.peak_reserved_during_attn_mib": -384.0,
+    "stage2_after_profile.non_kv_cache_memory_mib": -314.5,
+    "stage2_after_profile.mem_avail_mib": 132.8,
+    "stage3_startup_complete.vm_rss_mib": -105.71,
+    "stage3_startup_complete.torch_reserved_mib": -384.0,
+    "stage3_startup_complete.torch_slack_mib": -384.0,
+    "stage3_startup_complete.mem_avail_mib": 252.21,
+    "stage3_startup_complete.cuda_free_mib": -118.58,
+    "stage4_after_prefill_transition.vm_rss_mib": -115.16,
+    "stage4_after_prefill_transition.torch_reserved_mib": -1920.0,
+    "stage4_after_prefill_transition.torch_slack_mib": -1920.0,
+    "stage4_after_prefill_transition.mem_avail_mib": 2009.45,
+    "stage4_after_prefill_transition.cuda_free_mib": 1931.8,
+    "stage4_steady_state_decode.p50_us": -4.92
+   },
+   "base-boot2": {
+    "stage1_after_load.vm_rss_mib": -209.56,
+    "stage1_after_load.anon_mmap_rss_mib": -201.33,
+    "stage1_after_load.mem_avail_mib": -61.04,
+    "stage2_after_profile.vm_rss_mib": -397.74,
+    "stage2_after_profile.peak_reserved_during_attn_mib": -384.0,
+    "stage2_after_profile.non_kv_cache_memory_mib": -336.69,
+    "stage2_after_profile.mem_avail_mib": 101.36,
+    "stage3_startup_complete.vm_rss_mib": -110.7,
+    "stage3_startup_complete.torch_reserved_mib": -384.0,
+    "stage3_startup_complete.torch_slack_mib": -384.0,
+    "stage3_startup_complete.mem_avail_mib": 44.35,
+    "stage3_startup_complete.cuda_free_mib": -327.52,
+    "stage4_after_prefill_transition.vm_rss_mib": -119.79,
+    "stage4_after_prefill_transition.torch_reserved_mib": -1920.0,
+    "stage4_after_prefill_transition.torch_slack_mib": -1920.0,
+    "stage4_after_prefill_transition.mem_avail_mib": 1625.91,
+    "stage4_after_prefill_transition.cuda_free_mib": 1254.04,
+    "stage4_steady_state_decode.p50_us": 5.53
+   }
+  },
+  "pr_bench_reproduces": "On the candidate image, both boots: stage-1 RSS -200/-193 MiB (PR -198/-199), stage-2 attention-profile peak reserved -384 MiB (PR -384), non_kv_cache_memory -1,021/-315 MiB (PR -798/-1,255), stage-3 allocator slack 403 -> 19 MiB, stage-4 slack -1,920 MiB (PR -1,920), MemAvailable after the prefill transition +2,136/+2,009 MiB (PR +2,293/+2,533), chunk-to-chunk segment reuse kept, steady decode p50 -1.1/-4.9 us.",
+  "bench_is_code_independent": "The same bench on the base image, which has none of the patch, gives the same in-process savings (base boots: RSS -214/-210 MiB, peak -384 MiB, slack -1,920 MiB, MemAvailable +2,223/+1,626 MiB). Its candidate mode calls its own trim_host_heap/reclaim_uma_memory copies at every point the patch hooks; candidate mode on the base image against candidate mode on the candidate image is the same within the interval on 15 of 18 metrics (cross_image_candidate_mode_base_vs_c53), the other three being host MemAvailable at -95/-117 MiB and decode p50 at -3.8 us. So the bench shows what trimming at those points reclaims; it does not show that the patch's code does it in a serving worker.",
+  "cross_image_candidate_mode_base_vs_c53": {
+   "stage1_after_load.vm_rss_mib": {
+    "base_image": [
+     1348.46,
+     1346.24
+    ],
+    "candidate_image": [
+     1349.94,
+     1348.98
+    ],
+    "delta": 2.11,
+    "verdict": "same"
+   },
+   "stage1_after_load.anon_mmap_rss_mib": {
+    "base_image": [
+     428.68,
+     426.59
+    ],
+    "candidate_image": [
+     429.56,
+     428.56
+    ],
+    "delta": 1.425,
+    "verdict": "same"
+   },
+   "stage1_after_load.mem_avail_mib": {
+    "base_image": [
+     114618.52,
+     114601.42
+    ],
+    "candidate_image": [
+     114525.29,
+     114504.34
+    ],
+    "delta": -95.155,
+    "verdict": "worse"
+   },
+   "stage2_after_profile.vm_rss_mib": {
+    "base_image": [
+     1349.5,
+     1347.25
+    ],
+    "candidate_image": [
+     1350.91,
+     1349.97
+    ],
+    "delta": 2.065,
+    "verdict": "same"
+   },
+   "stage2_after_profile.peak_reserved_during_attn_mib": {
+    "base_image": [
+     1724.0,
+     1724.0
+    ],
+    "candidate_image": [
+     1724.0,
+     1724.0
+    ],
+    "delta": 0.0,
+    "verdict": "same"
+   },
+   "stage2_after_profile.non_kv_cache_memory_mib": {
+    "base_image": [
+     2248.5,
+     2442.77
+    ],
+    "candidate_image": [
+     2333.21,
+     2362.02
+    ],
+    "delta": 1.98,
+    "verdict": "same"
+   },
+   "stage2_after_profile.mem_avail_mib": {
+    "base_image": [
+     114139.87,
+     114077.93
+    ],
+    "candidate_image": [
+     114017.41,
+     113965.49
+    ],
+    "delta": -117.45,
+    "verdict": "worse"
+   },
+   "stage3_startup_complete.vm_rss_mib": {
+    "base_image": [
+     1580.11,
+     1577.89
+    ],
+    "candidate_image": [
+     1581.59,
+     1580.57
+    ],
+    "delta": 2.08,
+    "verdict": "same"
+   },
+   "stage3_startup_complete.torch_reserved_mib": {
+    "base_image": [
+     1522.0,
+     1522.0
+    ],
+    "candidate_image": [
+     1522.0,
+     1522.0
+    ],
+    "delta": 0.0,
+    "verdict": "same"
+   },
+   "stage3_startup_complete.torch_slack_mib": {
+    "base_image": [
+     18.82,
+     18.82
+    ],
+    "candidate_image": [
+     18.82,
+     18.82
+    ],
+    "delta": 0.0,
+    "verdict": "same"
+   },
+   "stage3_startup_complete.mem_avail_mib": {
+    "base_image": [
+     113331.51,
+     113261.82
+    ],
+    "candidate_image": [
+     113292.01,
+     113258.36
+    ],
+    "delta": -21.48,
+    "verdict": "same"
+   },
+   "stage3_startup_complete.cuda_free_mib": {
+    "base_image": [
+     15135.75,
+     13885.89
+    ],
+    "candidate_image": [
+     14374.07,
+     13969.04
+    ],
+    "delta": -339.265,
+    "verdict": "same"
+   },
+   "stage4_after_prefill_transition.vm_rss_mib": {
+    "base_image": [
+     1580.19,
+     1577.98
+    ],
+    "candidate_image": [
+     1581.7,
+     1580.29
+    ],
+    "delta": 1.91,
+    "verdict": "same"
+   },
+   "stage4_after_prefill_transition.torch_reserved_mib": {
+    "base_image": [
+     1522.0,
+     1522.0
+    ],
+    "candidate_image": [
+     1522.0,
+     1522.0
+    ],
+    "delta": 0.0,
+    "verdict": "same"
+   },
+   "stage4_after_prefill_transition.torch_slack_mib": {
+    "base_image": [
+     18.82,
+     18.82
+    ],
+    "candidate_image": [
+     18.82,
+     18.82
+    ],
+    "delta": 0.0,
+    "verdict": "same"
+   },
+   "stage4_after_prefill_transition.mem_avail_mib": {
+    "base_image": [
+     113260.65,
+     113276.57
+    ],
+    "candidate_image": [
+     113251.13,
+     113449.14
+    ],
+    "delta": 81.525,
+    "verdict": "same"
+   },
+   "stage4_after_prefill_transition.cuda_free_mib": {
+    "base_image": [
+     14989.27,
+     13900.64
+    ],
+    "candidate_image": [
+     14333.16,
+     14452.96
+    ],
+    "delta": -51.895,
+    "verdict": "same"
+   },
+   "stage4_steady_state_decode.p50_us": {
+    "base_image": [
+     451.31,
+     448.52
+    ],
+    "candidate_image": [
+     445.64,
+     446.66
+    ],
+    "delta": -3.765,
+    "verdict": "better"
+   }
+  },
+  "cross_image_c53_candidate_mode_vs_base_baseline_mode": {
+   "stage1_after_load.vm_rss_mib": {
+    "base_image_baseline_mode": [
+     1562.43,
+     1555.8
+    ],
+    "candidate_image_candidate_mode": [
+     1349.94,
+     1348.98
+    ],
+    "delta": -209.655,
+    "verdict": "better"
+   },
+   "stage1_after_load.anon_mmap_rss_mib": {
+    "base_image_baseline_mode": [
+     627.95,
+     627.92
+    ],
+    "candidate_image_candidate_mode": [
+     429.56,
+     428.56
+    ],
+    "delta": -198.875,
+    "verdict": "better"
+   },
+   "stage1_after_load.mem_avail_mib": {
+    "base_image_baseline_mode": [
+     113989.6,
+     114662.46
+    ],
+    "candidate_image_candidate_mode": [
+     114525.29,
+     114504.34
+    ],
+    "delta": 188.785,
+    "verdict": "same"
+   },
+   "stage2_after_profile.vm_rss_mib": {
+    "base_image_baseline_mode": [
+     1751.29,
+     1744.99
+    ],
+    "candidate_image_candidate_mode": [
+     1350.91,
+     1349.97
+    ],
+    "delta": -397.7,
+    "verdict": "better"
+   },
+   "stage2_after_profile.peak_reserved_during_attn_mib": {
+    "base_image_baseline_mode": [
+     2108.0,
+     2108.0
+    ],
+    "candidate_image_candidate_mode": [
+     1724.0,
+     1724.0
+    ],
+    "delta": -384.0,
+    "verdict": "better"
+   },
+   "stage2_after_profile.non_kv_cache_memory_mib": {
+    "base_image_baseline_mode": [
+     3393.86,
+     2779.46
+    ],
+    "candidate_image_candidate_mode": [
+     2333.21,
+     2362.02
+    ],
+    "delta": -739.045,
+    "verdict": "better"
+   },
+   "stage2_after_profile.mem_avail_mib": {
+    "base_image_baseline_mode": [
+     113317.04,
+     113976.57
+    ],
+    "candidate_image_candidate_mode": [
+     114017.41,
+     113965.49
+    ],
+    "delta": 344.645,
+    "verdict": "same"
+   },
+   "stage3_startup_complete.vm_rss_mib": {
+    "base_image_baseline_mode": [
+     1694.7,
+     1688.59
+    ],
+    "candidate_image_candidate_mode": [
+     1581.59,
+     1580.57
+    ],
+    "delta": -110.565,
+    "verdict": "better"
+   },
+   "stage3_startup_complete.torch_reserved_mib": {
+    "base_image_baseline_mode": [
+     1906.0,
+     1906.0
+    ],
+    "candidate_image_candidate_mode": [
+     1522.0,
+     1522.0
+    ],
+    "delta": -384.0,
+    "verdict": "better"
+   },
+   "stage3_startup_complete.torch_slack_mib": {
+    "base_image_baseline_mode": [
+     402.82,
+     402.82
+    ],
+    "candidate_image_candidate_mode": [
+     18.82,
+     18.82
+    ],
+    "delta": -384.0,
+    "verdict": "better"
+   },
+   "stage3_startup_complete.mem_avail_mib": {
+    "base_image_baseline_mode": [
+     112600.08,
+     113217.47
+    ],
+    "candidate_image_candidate_mode": [
+     113292.01,
+     113258.36
+    ],
+    "delta": 366.41,
+    "verdict": "same"
+   },
+   "stage3_startup_complete.cuda_free_mib": {
+    "base_image_baseline_mode": [
+     14418.27,
+     14213.41
+    ],
+    "candidate_image_candidate_mode": [
+     14374.07,
+     13969.04
+    ],
+    "delta": -144.285,
+    "verdict": "same"
+   },
+   "stage4_after_prefill_transition.vm_rss_mib": {
+    "base_image_baseline_mode": [
+     1703.88,
+     1697.77
+    ],
+    "candidate_image_candidate_mode": [
+     1581.7,
+     1580.29
+    ],
+    "delta": -119.83,
+    "verdict": "better"
+   },
+   "stage4_after_prefill_transition.torch_reserved_mib": {
+    "base_image_baseline_mode": [
+     3442.0,
+     3442.0
+    ],
+    "candidate_image_candidate_mode": [
+     1522.0,
+     1522.0
+    ],
+    "delta": -1920.0,
+    "verdict": "better"
+   },
+   "stage4_after_prefill_transition.torch_slack_mib": {
+    "base_image_baseline_mode": [
+     1938.82,
+     1938.82
+    ],
+    "candidate_image_candidate_mode": [
+     18.82,
+     18.82
+    ],
+    "delta": -1920.0,
+    "verdict": "better"
+   },
+   "stage4_after_prefill_transition.mem_avail_mib": {
+    "base_image_baseline_mode": [
+     111037.64,
+     111650.66
+    ],
+    "candidate_image_candidate_mode": [
+     113251.13,
+     113449.14
+    ],
+    "delta": 2005.985,
+    "verdict": "better"
+   },
+   "stage4_after_prefill_transition.cuda_free_mib": {
+    "base_image_baseline_mode": [
+     12855.83,
+     12646.6
+    ],
+    "candidate_image_candidate_mode": [
+     14333.16,
+     14452.96
+    ],
+    "delta": 1641.845,
+    "verdict": "better"
+   },
+   "stage4_steady_state_decode.p50_us": {
+    "base_image_baseline_mode": [
+     445.4,
+     442.99
+    ],
+    "candidate_image_candidate_mode": [
+     445.64,
+     446.66
+    ],
+    "delta": 1.955,
+    "verdict": "same"
+   }
+  },
+  "post_prefill_flush_host_ms": {
+   "boot1": {
+    "0": {
+     "reclaim_uma_memory_ms_median": 31.935,
+     "gc_collect_ms_median": 0.016,
+     "empty_cache_ms_median": 27.365,
+     "trim_host_heap_ms_median": 4.28,
+     "next_prefill_1p5GiB_after_flush_ms_median": 73.86,
+     "next_prefill_1p5GiB_cached_ms_median": 8.175
+    },
+    "100000": {
+     "reclaim_uma_memory_ms_median": 35.121,
+     "gc_collect_ms_median": 7.211,
+     "empty_cache_ms_median": 27.178,
+     "trim_host_heap_ms_median": 5.745,
+     "next_prefill_1p5GiB_after_flush_ms_median": 68.87,
+     "next_prefill_1p5GiB_cached_ms_median": 8.164
+    },
+    "1000000": {
+     "reclaim_uma_memory_ms_median": 120.365,
+     "gc_collect_ms_median": 90.23,
+     "empty_cache_ms_median": 27.23,
+     "trim_host_heap_ms_median": 5.153,
+     "next_prefill_1p5GiB_after_flush_ms_median": 69.627,
+     "next_prefill_1p5GiB_cached_ms_median": 8.198
+    }
+   },
+   "boot2": {
+    "0": {
+     "reclaim_uma_memory_ms_median": 33.287,
+     "gc_collect_ms_median": 0.019,
+     "empty_cache_ms_median": 27.39,
+     "trim_host_heap_ms_median": 5.124,
+     "next_prefill_1p5GiB_after_flush_ms_median": 73.139,
+     "next_prefill_1p5GiB_cached_ms_median": 8.199
+    },
+    "100000": {
+     "reclaim_uma_memory_ms_median": 34.551,
+     "gc_collect_ms_median": 5.919,
+     "empty_cache_ms_median": 26.782,
+     "trim_host_heap_ms_median": 4.763,
+     "next_prefill_1p5GiB_after_flush_ms_median": 74.925,
+     "next_prefill_1p5GiB_cached_ms_median": 8.15
+    },
+    "1000000": {
+     "reclaim_uma_memory_ms_median": 116.138,
+     "gc_collect_ms_median": 85.026,
+     "empty_cache_ms_median": 27.748,
+     "trim_host_heap_ms_median": 5.143,
+     "next_prefill_1p5GiB_after_flush_ms_median": 73.761,
+     "next_prefill_1p5GiB_cached_ms_median": 8.169
+    }
+   }
+  },
+  "post_prefill_flush_summary": "With 1.5 GiB of freed allocator blocks and the recipe's PYTORCH_CUDA_ALLOC_CONF (expandable_segments:True,garbage_collection_threshold:0.6): the flush takes 32-35 ms on the host (empty_cache 27 ms, trim_host_heap 4-6 ms, gc.collect 0-7 ms at up to 1e5 live unfrozen objects), 116-120 ms with 1e6 (gc.collect 85-90 ms). The next prefill then maps its 1.5 GiB afresh: 69-75 ms against 8.2 ms from the cache. Without the expandable-segment setting (flush984.py): 33-36 ms, 114-118 ms at 1e6.",
+  "pytest_candidate": {
+   "boot1": "236 passed, 1 deselected in 66.57s",
+   "boot2": "236 passed, 1 deselected in 61.27s",
+   "pr_receipt": "233 passed, 1 deselected"
+  }
+ },
+ "parts": [
+  {
+   "part": "its bench on the image, 2 boots",
+   "verdict": "pass (reproduces), uninformative",
+   "detail": "the in-process savings reproduce on the candidate image, but the bench gives the same savings on the base image, so it cannot attribute them to the patch"
+  },
+  {
+   "part": "each rank's lowest MemAvailable at startup higher, time to ready not worse, no JIT after readiness, KV capacity unchanged",
+   "verdict": "cannot-evaluate-on-sp8",
+   "detail": "a serving boot of the model needs the three tp3-switched ranks: the coordinator's screen startup record (memory and startup lines of each rank)"
+  },
+  {
+   "part": "short-request TTFT during a long prefill not worse",
+   "verdict": "cannot-evaluate-on-sp8",
+   "detail": "release-tp3's stall rows on the coordinator's tp3-switched screen. Risk measured here: the flush blocks the host 32-35 ms (up to ~120 ms with a large unfrozen heap) on the first FULL decode step after an eager prefill, and the next prefill pays about +61-67 ms to remap 1.5 GiB. If FULL decode steps fall between a long prompt's chunks (the recipe's --prefill-yield short lets short requests run between them), each one pays both."
+  },
+  {
+   "part": "the PR's tests",
+   "verdict": "pass",
+   "detail": "236 passed, 1 deselected, both boots"
+  }
+ ],
+ "verdict": "cannot-evaluate",
+ "verdict_scope": "sp8 shows no blocker; the decisive parts are the tp3-switched screen's (startup record, KV capacity) and release-tp3's (TTFT/stall rows)",
+ "reason": "#984's mark is decided by each rank's startup MemAvailable floor, time to ready and the TTFT during a long prefill, which need the three-rank boot. On sp8 its tests pass and its bench reproduces, but that bench simulates the patch's hooks with its own code and gives the same savings on the base image, so it is no evidence for the patch's code. The post-prefill flush costs 32-35 ms of host time per call plus about 65 ms on the next prefill's allocation, which the stall rows must clear.",
+ "notes": [
+  "Run release-tp3's stall rows with attention to the decode step right after each prefill chunk; a per-step trace of host time around sample_tokens on the first FULL step after a NONE step would show the flush directly.",
+  "Host MemAvailable differs between processes by several hundred MiB from run to run (base-image baseline-mode stage-3 112,600 vs 113,217 MiB across boots), so the bench's cross-process MemAvailable rows are noisy; its in-process deltas are the stable ones."
+ ]
+}

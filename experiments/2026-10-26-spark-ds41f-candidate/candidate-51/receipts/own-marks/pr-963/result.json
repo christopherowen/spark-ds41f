@@ -1,0 +1,78 @@
+{
+ "pr": 963,
+ "pr_head": "e5db47f172cfef9bbe77d4af8b061f6fc683969a",
+ "patch": "0782-perf-dsv41-unconditional-pack12-plane-loads-and-swar.patch",
+ "mark": "Its screen_pack12_kernels.py on the image, 2 boots, ABBA against the base image, by kernel time and CUDA-graph replay: packed BF16 GEMM (compressor_up, M=1..256) and packed vocab projection and greedy partials faster beyond the interval, 0 ULP, including through #997's certified screen (in the base)",
+ "host": "sp8 (spark-0016, NVIDIA GB10)",
+ "arms": {
+  "base": "spark-ds41f:candidate-50 sha256:8c1ea1f62f62c3e2adc03b645c091a5499cf7163101aca32875c894b96f155db + candidate-50 no1009/overlay (4 files, ro): tree 14c5a2dc",
+  "c51": "the same image + the 15 files where candidate-51's tree differs (ro): tree 987ba058 (cc1115c5)"
+ },
+ "evidence": "As candidate-51's README directs, only the timing half of the PR's screen_pack12_kernels.py runs (its candidate half text-patches gemm.py and overwrites vocab.py from a /tmp copy, which the candidate tree already carries, with #987 and #1001 in the same files). h963.py (ours, recorded) keeps the PR's shapes, weights (seed 42; every 290th / 300th element 1e-6, 0.35% exceptions), M lists and tile choices and runs the image's own kernels unchanged on both arms, ABBA in one session, timing each cell by CUDA-graph replay (20 back-to-back calls a graph, L2-hot), CUPTI kernel time with a sync after each call (kernel_isolated), CUPTI back-to-back kernel time, and the PR's eager loop. It adds: M=256 to the GEMM (the mark's range), the other TILE_CONFIGS[128] variant at the 128-row vocab tile (so #963 is compared at a fixed config, apart from #1001), the certified two-pass greedy screen (project_head_greedy_pairs through prepare_packed_head, FP32 head: the path serving's greedy verification takes), and TileLangSplitLinearMethod's split-K decode at the TP4 compressor shapes (the only serving caller of the packed-BF16 header #963 changes). Output hashes give the cross-image 0-ULP check. Then the PR's four test files on c51, two boots.",
+ "measured": {
+  "A_packed_bf16_gemm_graph_us_base_boots_to_c51_boots": {
+   "compressor_up_5120x512 (the mark)": {
+    "M=1": "7.68/7.32 -> 6.74/6.75 (1.112x, faster)",
+    "M=6": "8.10/7.70 -> 7.17/7.13 (1.105x, faster)",
+    "M=16": "8.12/7.79 -> 7.16/7.37 (1.095x, faster)",
+    "M=32": "13.17/13.23 -> 12.07/12.54 (1.073x, faster)",
+    "M=64": "16.82/17.05 -> 15.75/15.80 (1.074x, faster)",
+    "M=128": "31.25/31.21 -> 30.09/30.24 (1.035x, faster)",
+    "M=256": "55.56/56.00 -> 53.00/53.14 (1.051x, faster)",
+    "M=512": "103.98/105.84 -> 101.97/103.13 (1.023x, faster)",
+    "kernel_isolated": "faster at M=1, 6, 16, 32, 256, 512 (1.04-1.45x), same at 64 and 128"
+   },
+   "indexer_wq_b_4096x1280": "faster at all 8 M (1.011-1.090x); kernel_isolated faster 3, same 5",
+   "compressor_down_512x10240": "SLOWER at all 8 M: 83.79/84.59 -> 87.35/87.68 at M=1 (0.962x) ... 122.62/124.50 -> 133.52/133.39 at M=256 (0.926x); kernel_isolated slower at all 8 (0.85-0.97x). The PR's README table leaves this shape out",
+   "indexer_wk_128x5120": "SLOWER at all 8 M: 42.44/42.14 -> 42.94/43.35 at M=1 (0.980x) ... 60.25/60.83 -> 61.81/62.52 at M=512 (0.974x); kernel_isolated slower at 7 of 8. The PR's README reports 1.01-1.03x faster",
+   "counts (32 cells)": "graph 16 faster, 16 slower; kernel_isolated 9 faster, 8 same, 15 slower; eager 22 faster, 5 same, 5 slower",
+   "back_to_back_cupti_kernel_time": "about 2x on c51 for every shape (e.g. compressor_down M=1 84.46 -> 173.53 us): #963 adds pdl.chain() to the kernel, and a PDL launch's early-launch wait is counted in its span; kernel_isolated is the kernel's own time",
+   "serving_note": "packed_bf16_gemm and packed_bf16_gemm_two are imported by tilelang/linear.py but called by no serving code (git grep at cc1115c5); section A is the PR's microbench, not a serving path"
+  },
+  "B_packed_vocab_projection_graph_us (full logits, project_head; stressed 0.35% exceptions)": {
+   "own_config_each_arm": "faster in all 26 cells, 2.42-3.79x (e.g. TP4 M=1 2652/2665 -> 1084/1082; M=107 8670/8685 -> 2477/2495; TP3 M=128 12167/12104 -> 4036/4013)",
+   "same TILE_CONFIGS[128] on both arms (#963 alone, M=96..2048)": "s4a2 faster 10/10 (2.53-3.62x); s2 faster 10/10 (2.75-3.73x)",
+   "at the #1001 bench's natural exception density (pr-1001 receipts, image_ab, #963 with #1001)": "M<=64 (tiles #1001 does not change): 1.00-1.05x; M=72..128: 1.16-1.34x"
+  },
+  "C_packed_vocab_greedy_partials_plus_finish_graph_us (the PR's greedy metric)": "faster in all 22 cells, 2.38-3.78x; same-config tile-128 cells faster 12/12",
+  "D_certified_greedy_screen_graph_us (project_head_greedy_pairs, serving's greedy verification path; stressed weights)": {
+   "TP4 32320": {
+    "M=1": "758.39/761.31 -> 750.12/751.92 (1.012x, faster)",
+    "M=16": "803.17/800.27 -> 794.29/794.41 (1.009x, faster)",
+    "M=64": "987.04/980.67 -> 979.90/990.90 (same)",
+    "M=96": "1291.85/1304.54 -> 1273.88/1277.61 (1.018x, faster)",
+    "M=97": "1300.72/1300.15 -> 1310.36/1306.87 (0.994x, SLOWER)",
+    "M=104": "1357.62/1363.02 -> 1384.98/1386.60 (0.982x, SLOWER)",
+    "M=107": "1394.60/1382.49 -> 1408.78/1408.62 (0.986x, SLOWER)",
+    "M=112": "1411.81/1405.86 -> 1443.34/1449.24 (0.974x, SLOWER)",
+    "M=120": "1475.71/1492.36 -> 1515.45/1516.68 (0.979x, SLOWER)",
+    "M=128": "1594.11/1583.65 -> 1581.15/1603.23 (same)"
+   },
+   "TP3 43096": "M<=96 same or faster (1.000-1.005x); M=97 0.982x, 104 0.987x, 107 0.978x, 120 0.979x SLOWER; 112 and 128 same",
+   "kernel_isolated": "12 same, 9 faster, 3 slower (TP4 M=64 0.988x; TP3 M=104 0.985x, M=107 0.976x)",
+   "counts (24 cells)": "graph 7 faster, 8 same, 9 slower (all 9 at M=97..120); eager 8 faster, 7 same, 9 slower",
+   "corroboration": "pr-1001's bench, independent weights and inputs at natural exception density, image_ab greedy epilogue (the same project_head_greedy_pairs; #1001 does not change the screen kernels): slower at TP4 FP32 M=97, 104, 107, 112, 120 (0.988-0.997x), TP4 BF16 M=97, 104 (0.987x, 0.993x) and TP3 BF16 M=120 (0.986x); its in-process A/A of identical screen kernels shows no such pattern at M=97..128 (21 same, 3 faster). The refine kernel of the screen calls vllm_vocab_decode_vec16, which #963 rewrites"
+  },
+  "E_split_k_compressor_decode_graph_us (TileLangSplitLinearMethod, the serving caller of the changed header)": {
+   "1024x5120 x2 FP32 (ratio 2)": "0 faster, 5 same, 5 slower by 0.4-1.1% (M=6, 16, 32, 96, 128; e.g. M=6 15.54/15.47 -> 15.62/15.69, M=128 51.03/50.97 -> 51.35/51.62)",
+   "512x5120 BF16 (ratio 1)": "1 faster (M=16, 1.005x), 5 same, 4 slower (M=32 0.984x, 64 0.987x, 96 0.943x from one boot at 31.38, 128 0.988x)",
+   "kernel_isolated": "14 same, 2 faster, 4 slower",
+   "reading": "no gain on the serving GEMM path; the 0.4-1.6% slower cells are at the size of this interval rule's A/A false positives (see pr-1001 in-process A/A), with one larger single-boot outlier"
+  },
+  "pytest_c51": {
+   "boot1": "282 passed, 14 warnings in 670.23s",
+   "boot2": "282 passed, 14 warnings in 93.01s",
+   "files": "test_deepseek_v41_tilelang_vocab.py, test_deepseek_v41_tilelang_linear.py, tests/kernels/test_deepseek_v41_tilelang_embedding.py, tests/kernels/test_deepseek_v41_tilelang_pdl.py (the PR: 274 passed; the candidate tree adds #987's and #1001's tests to the first two files)"
+  }
+ },
+ "bit_exact": true,
+ "bit_exact_detail": "Every output hash (GEMM outputs, projection logits, greedy (max, index) pairs, certified-screen pairs, split-K outputs) is equal across all four runs of both arms in every cell, and across the two TILE_CONFIGS[128] variants: 0 ULP.",
+ "verdict": "miss",
+ "reason": "The packed vocab projection and greedy-partials kernels are much faster (2.4-3.8x at the PR's 0.35% exception density; 15-20% at the 128-row tile at natural density) and compressor_up's packed GEMM is faster at every M (1.02-1.11x), all bit-exact. But the mark includes the certified screen, and that path, which serving's greedy verification takes, is slower beyond the interval at M=97..120 on TP4 (0.6-2.6% by graph replay; the rows c16 with CopyDrafter replays, 104 and 112), corroborated at natural density by #1001's bench (0.3-1.4%). Two of the PR's own four GEMM shapes are also slower at every M (compressor_down 512x10240 2.5-7.4%, indexer_wk 128x5120 2-3%, also by isolated kernel time), although packed_bf16_gemm has no serving caller; and the split-K compressor GEMM that serving runs shows no gain. Rework: keep the vocab projection/greedy-partials changes, find why the screen's refine kernel (which calls the rewritten vllm_vocab_decode_vec16) loses at 97..120 rows, and check pdl.chain()/the row-bounds change on the narrow packed GEMMs.",
+ "notes": [
+  "Measured on spark-ds41f:candidate-50 with candidate-51's tree mounted; at the 128-row vocab tile the c51 arm also carries #1001 (TILE_CONFIGS[128] num_stages 2), so 'own_config' cells there combine both PRs; the same-config cells separate them.",
+  "h963.py is ours (../common/h/h963.py), written because the PR's script cannot run on a tree that already carries its change; its section A and B/C lines match the PR's timing half (shapes, seeds, weights, M lists, row tiles, warmup/rep counts for the eager loop).",
+  "The PR's README ran on sp7 against 1107; our base is candidate-50 without #1009 (it carries #997's certified screen, which the 1107 base lacked).",
+  "start_utc in commands.txt is after the GPU lock was taken; other agents' jobs ran between runs."
+ ]
+}
