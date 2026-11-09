@@ -977,8 +977,8 @@ Promoted as `spark-ds41f-1107` ([manifests/baselines/2026-11-07-spark-ds41f-1107
 switchless `tp4-ring` and `tp3-triangle` (`dgx1..dgx4`), and switched `tp3-switched` through
 `tp8-switched` (`sp1..sp8`).
 
-- **Source & Image:** [1107/vllm/series](1107/vllm/series) (`641` active patches through `0761`,
-  `patch_head` `2756478b`, `expected_tree` `ed1bdb7a`, `patchset_sha256` `26fac4e5`) and
+- **Source & Image:** [1107/vllm/series](1107/vllm/series) (`642` active patches through `0762`,
+  `patch_head` `af035d07`, `expected_tree` `819d1233`, `patchset_sha256` `5809f21f`) and
   [1107/sparknet/series](1107/sparknet/series) (`3` active patches `0002..0004`, `patch_head`
   `1f84980b`, `expected_tree` `b86dc07f`, `patchset_sha256` `5394417f`); image `spark-ds41f:1107`
   (`sha256:3f32a962ce04b7c8d85337cd427a8946b8b6bcaadd97cc8d8a8cd14e8d68a6ce`).

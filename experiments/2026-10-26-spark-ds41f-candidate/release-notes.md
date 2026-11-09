@@ -5,8 +5,8 @@
 named after the day it is promoted. The model is DeepSeek-V4.1-Flash-1017, DeepSeek's checkpoint,
 with native weights.
 
-It advances `spark-ds41f-1030` across vLLM (`641` active patches through `0761` in
-[1107/vllm/series](1107/vllm/series); `patch_head` `2756478b`, `expected_tree` `ed1bdb7a`) and
+It advances `spark-ds41f-1030` across vLLM (`642` active patches through `0762` in
+[1107/vllm/series](1107/vllm/series); `patch_head` `af035d07`, `expected_tree` `819d1233`) and
 `sparknet` (`3` active patches `0002..0004` in [1107/sparknet/series](1107/sparknet/series);
 `patch_head` `1f84980b`, `expected_tree` `b86dc07f`). Image `spark-ds41f:1107`
 (`sha256:3f32a962ce04b7c8d85337cd427a8946b8b6bcaadd97cc8d8a8cd14e8d68a6ce`).
@@ -42,6 +42,14 @@ For the first time, the release is qualified across all eight supported topologi
   glibc's host arena between weight load, kernel warmup, KV cache allocation, CUDA Graph capture,
   and speculator capture, raising `tp3-switched` cold-boot `min_available_gib` on `sp5..sp7` from
   `<3.46 GiB` to `6.03..6.45 GiB` on head `sp5` (`7.94..8.10 GiB` on followers `sp6..sp7`).
+- **Fixed: the literal image token in request text is escaped, not a 400 (`0762`).** A typed
+  `<｜deepseek_image｜>` spelling in a message, text part, tool result, reasoning or tool-call
+  arguments was rejected by `_normalize_messages` with a `ValueError` for every role, so any
+  replayed conversation that had ever echoed the spelling (an agent's own reasoning, or a tool
+  result quoting this very issue) 400'd every subsequent request and permanently poisoned the
+  session (#1031). The spelling is now escaped to the ordinary-text spelling, which is in no
+  added-token vocabulary and encodes as plain text, as on DeepSeek's hosted API; image parts
+  still render the placeholder, and requests without the spelling are byte-identical.
 - **Release Gate, Quality Evals, and AgentX:**
   - Image unit/contract test suite: `648 passed, 0 failed` (`build-check` `6/6`, `patch-contracts`
     `337/337`, `test-suites` `305/305`).
