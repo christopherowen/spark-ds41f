@@ -1,0 +1,1498 @@
+{
+ "pr": 979,
+ "round": 1,
+ "candidate": 49,
+ "pr_head": "c1d1bf3b76bc412aa4a87892726d107caa07bd6e",
+ "original_patch": {
+  "name": "0766-perf-dsv41-sp-prefill-sparknet-routing.patch",
+  "sha256": "1a95ed84e8c0018d205b8a26ae236712160919cac861d2da420e675e91c7ce2f"
+ },
+ "corrected_patch": {
+  "name": "0766-perf-dsv41-pipeline-the-sliced-SP-Engram-row-exchang.patch",
+  "sha256": "bc4c5e7a196eb6312e07044d80648575f3f8ea80d077030ebea99892b45152f0",
+  "author": "Christopher Owen <3221756+christopherowen@users.noreply.github.com> (original author and date kept)",
+  "sp_prefill_py_sha256": "cd10236f284af1ed43e1d7a00c74971935cc82864a4729a2925ac811de573f1a",
+  "applies": "on 0762..0765 in series order; 0767 applies cleanly after it; 0762..0765 + this + 0767 reproduces the measured overlay byte for byte (15 files)",
+  "git_diff_check": "clean"
+ },
+ "verdict": "corrected-meets-mark",
+ "reason": "The corrected 0766 keeps #979's mark: project_exchange_rows at T>=6144 is faster than the baseline (candidate-49 without #979) beyond the two-boot interval on both served topologies, slowest rank and rank 0: ring4 T=6144 -16.4% (rank0 -17.2%), T=8192 -18.3% (-17.2%); direct T=6144 -18.9% (-18.1%), T=8192 -14.3% (-15.2%); the original #979 measured -17.9/-18.7/-18.8/-15.0% in the same session. Outputs are bit-exact. Everywhere else it runs the baseline's code: gather_mxfp8 is 1107's grouped PyNCCL all-gather at every T on both topologies, and project_exchange_rows below 6,144 tokens is 1107's serial path. So the only cells where its code differs from the baseline are the four T>=6144 project_exchange_rows cells, all gains. The 13 cells where it reads slower than the baseline beyond the two-boot interval all run identical code, and the A/A shows that reading is the interval, not the code: the baseline against itself (boots 3-4 vs 1-2, same session) reads beyond the interval in 8 of 32 cells on the slowest rank and 8 of 32 on rank 0, and identical-code pairs across arms in 45 of 113 (slowest rank). Miss 1 is removed (direct gather_mxfp8 no longer takes the one-shot route; #979 reproduced its loss at T=2048: +46.3% slowest rank, +18.2% rank0) and Miss 2 is removed (no one-slice side-stream path).",
+ "gating_rule": {
+  "rule": "project_exchange_rows: under the one-shot RoCE policy, one slice (T < ENGRAM_SLICE_TOKENS = 6,144) takes 1107's path (full-row projection, then(), exchange_rows); two or more slices (T >= 6,144) take the PyNCCL copy_self=False side-stream pipeline (#979's gain). gather_many / gather_mxfp8: 1107's grouped PyNCCL all-gather on every topology and T; the one-shot RoCE gather route is not taken anywhere.",
+  "code": "sp_prefill.py: `if comm is None or (roce_rows and slices == 1):` -> serial 1107 path, where roce_rows = the TP group's one-shot communicator offers should_all_to_all_rows and comm = _tp_pynccl_comm() (now returned beside the one-shot one); gather_many reverted to 1107 byte for byte.",
+  "how_chosen": "Two corrected variants were measured as arms, with the choice pre-registered in raw/plan.txt before the first run: corrA kept #979's one-shot gather on sparknet ring4 only (gate: runtime.topology == 'ring4', T<=1024 at the 2 MB cap), corrB dropped it. corrA was to be chosen only if, on ring4 at the routed T, both corrA and #979 (identical gather code) were faster than the baseline beyond the interval at >=1 T and neither slower at any T. #979 read slower beyond the interval at ring4 T=512 (+17.1% slowest rank) and T=1024 (+59.5%, rank0 +98.6%), while corrA (same gather code) read faster at T=512 (-30.8%): no consistent win, so corrB.",
+  "evidence": {
+   "one_shot_gather_direct": "never faster than grouped PyNCCL beyond the interval on the slowest rank in either session: own mark +9..+50% (loss at T=160..2048); this session #979 vs baseline T=160 -7.4% within, 256 -8.8% within, 512 -11.0% within, 1024 -6.1% within (rank0 -25.5% 'gain', own mark -0.5% within), 2048 +46.3% loss (rank0 +18.2% loss)",
+   "one_shot_gather_ring4": "own mark: -33%/-24% gain at T=160/256, within at 512/1024; this session #979 vs baseline: +6.6% within, +42.6% within, +17.1% loss, +59.5% loss (rank0 +98.6% loss) at T=160/256/512/1024; corrA (same code): +0.5% within, -13.5% within, -30.8% gain, +1.3% within. The own mark's ring4 gains did not repeat.",
+   "one_slice_overlap": "#979's side-stream overlap of the one-slice exchange with then(): own mark loss at ring4 T=160/2048/4096 and gains at ring4 256/512, direct 1024/2048; this session #979 vs baseline loss at ring4 T=512/4096, direct 256/512/1024, gain at ring4 2048. No gain held across sessions; it can hide at most then(), one elementwise RankOrderParts sum.",
+   "sliced_pipeline": "the T>=6144 code is the same in the corrected arm as in #979 and so is the gain: corrected vs #979 slowest-rank boots ring4 T=6144 [9914, 10061] vs [9762, 9868] us (+1.8%, reads loss), T=8192 [12630, 12753] vs [12608, 12626] (+0.6%, reads loss), direct T=6144 [8983, 8836] vs [9068, 8759] (within), T=8192 [11829, 11948] vs [11679, 11900] (within); the two ring4 readings are identical-code A/A pairs"
+  },
+  "served_shapes": "every shape in config/cluster.json uses a one-shot transport (oneshot-ring4 = ring4 for tp4-ring; oneshot-direct / oneshot-switched = direct for tp3-triangle and the switched shapes), so the rule covers serving on both topologies the bench measures."
+ },
+ "key_cells": {
+  "mark_project_exchange_rows_T_ge_6144": {
+   "ring4_T6144": {
+    "corrected_max_rank_us": [
+     9913.63,
+     10061.28
+    ],
+    "corrected_rank0_us": [
+     9404.54,
+     9581.34
+    ],
+    "baseline_max_rank_us": [
+     12128.83,
+     11771.87
+    ],
+    "baseline_rank0_us": [
+     11761.66,
+     11165.5
+    ],
+    "baseline_aa_boots_3_4_max_rank_us": [
+     11833.73,
+     11217.6
+    ],
+    "baseline_aa_boots_3_4_rank0_us": [
+     11230.75,
+     11050.69
+    ],
+    "original_979_max_rank_us": [
+     9762.05,
+     9868.35
+    ],
+    "original_979_rank0_us": [
+     9549.41,
+     9295.33
+    ],
+    "paths": {
+     "corrected": "sliced-pipeline(#979)",
+     "baseline": "serial(1107)",
+     "original_979": "sliced-pipeline(#979)"
+    },
+    "corrected_vs_baseline": {
+     "change_pct": -16.4,
+     "change_us": -1962.9,
+     "max_rank": "gain",
+     "rank0_change_pct": -17.2,
+     "rank0": "gain",
+     "identical_code": false
+    },
+    "original_979_vs_baseline": {
+     "change_pct": -17.9,
+     "change_us": -2135.1,
+     "max_rank": "gain",
+     "rank0_change_pct": -17.8,
+     "rank0": "gain",
+     "identical_code": false
+    },
+    "bit_exact_across_runs": true,
+    "equal_to_in_process_anchor": true
+   },
+   "ring4_T8192": {
+    "corrected_max_rank_us": [
+     12629.89,
+     12752.74
+    ],
+    "corrected_rank0_us": [
+     12377.38,
+     12412.96
+    ],
+    "baseline_max_rank_us": [
+     15650.62,
+     15403.04
+    ],
+    "baseline_rank0_us": [
+     14985.06,
+     14968.16
+    ],
+    "baseline_aa_boots_3_4_max_rank_us": [
+     15360.13,
+     15485.18
+    ],
+    "baseline_aa_boots_3_4_rank0_us": [
+     14577.89,
+     15259.2
+    ],
+    "original_979_max_rank_us": [
+     12607.62,
+     12625.73
+    ],
+    "original_979_rank0_us": [
+     12359.04,
+     12249.25
+    ],
+    "paths": {
+     "corrected": "sliced-pipeline(#979)",
+     "baseline": "serial(1107)",
+     "original_979": "sliced-pipeline(#979)"
+    },
+    "corrected_vs_baseline": {
+     "change_pct": -18.3,
+     "change_us": -2835.5,
+     "max_rank": "gain",
+     "rank0_change_pct": -17.2,
+     "rank0": "gain",
+     "identical_code": false
+    },
+    "original_979_vs_baseline": {
+     "change_pct": -18.7,
+     "change_us": -2910.2,
+     "max_rank": "gain",
+     "rank0_change_pct": -17.8,
+     "rank0": "gain",
+     "identical_code": false
+    },
+    "bit_exact_across_runs": true,
+    "equal_to_in_process_anchor": true
+   },
+   "direct_T6144": {
+    "corrected_max_rank_us": [
+     8982.91,
+     8836.29
+    ],
+    "corrected_rank0_us": [
+     8779.3,
+     8486.66
+    ],
+    "baseline_max_rank_us": [
+     11408.1,
+     10556.8
+    ],
+    "baseline_rank0_us": [
+     10983.23,
+     10098.56
+    ],
+    "baseline_aa_boots_3_4_max_rank_us": [
+     11960.64,
+     10724.26
+    ],
+    "baseline_aa_boots_3_4_rank0_us": [
+     11328.74,
+     10434.46
+    ],
+    "original_979_max_rank_us": [
+     9068.42,
+     8758.66
+    ],
+    "original_979_rank0_us": [
+     8675.65,
+     8439.46
+    ],
+    "paths": {
+     "corrected": "sliced-pipeline(#979)",
+     "baseline": "serial(1107)",
+     "original_979": "sliced-pipeline(#979)"
+    },
+    "corrected_vs_baseline": {
+     "change_pct": -18.9,
+     "change_us": -2072.9,
+     "max_rank": "gain",
+     "rank0_change_pct": -18.1,
+     "rank0": "gain",
+     "identical_code": false
+    },
+    "original_979_vs_baseline": {
+     "change_pct": -18.8,
+     "change_us": -2068.9,
+     "max_rank": "gain",
+     "rank0_change_pct": -18.8,
+     "rank0": "gain",
+     "identical_code": false
+    },
+    "bit_exact_across_runs": true,
+    "equal_to_in_process_anchor": true
+   },
+   "direct_T8192": {
+    "corrected_max_rank_us": [
+     11828.9,
+     11948.13
+    ],
+    "corrected_rank0_us": [
+     11359.07,
+     11668.42
+    ],
+    "baseline_max_rank_us": [
+     13999.36,
+     13751.46
+    ],
+    "baseline_rank0_us": [
+     13650.02,
+     13504.45
+    ],
+    "baseline_aa_boots_3_4_max_rank_us": [
+     14057.5,
+     13976.13
+    ],
+    "baseline_aa_boots_3_4_rank0_us": [
+     13686.53,
+     13747.39
+    ],
+    "original_979_max_rank_us": [
+     11678.82,
+     11900.45
+    ],
+    "original_979_rank0_us": [
+     11301.79,
+     11277.41
+    ],
+    "paths": {
+     "corrected": "sliced-pipeline(#979)",
+     "baseline": "serial(1107)",
+     "original_979": "sliced-pipeline(#979)"
+    },
+    "corrected_vs_baseline": {
+     "change_pct": -14.3,
+     "change_us": -1986.9,
+     "max_rank": "gain",
+     "rank0_change_pct": -15.2,
+     "rank0": "gain",
+     "identical_code": false
+    },
+    "original_979_vs_baseline": {
+     "change_pct": -15.0,
+     "change_us": -2085.8,
+     "max_rank": "gain",
+     "rank0_change_pct": -16.8,
+     "rank0": "gain",
+     "identical_code": false
+    },
+    "bit_exact_across_runs": true,
+    "equal_to_in_process_anchor": true
+   }
+  },
+  "miss1_gather_mxfp8_direct_one_shot_route": {
+   "direct_T160": {
+    "corrected_max_rank_us": [
+     926.91,
+     1066.11
+    ],
+    "corrected_rank0_us": [
+     642.14,
+     732.93
+    ],
+    "baseline_max_rank_us": [
+     906.5,
+     823.46
+    ],
+    "baseline_rank0_us": [
+     693.76,
+     624.99
+    ],
+    "baseline_aa_boots_3_4_max_rank_us": [
+     902.46,
+     651.39
+    ],
+    "baseline_aa_boots_3_4_rank0_us": [
+     772.06,
+     481.7
+    ],
+    "original_979_max_rank_us": [
+     848.96,
+     753.57
+    ],
+    "original_979_rank0_us": [
+     500.93,
+     674.27
+    ],
+    "paths": {
+     "corrected": "pynccl-group(1107)",
+     "baseline": "pynccl-group(1107)",
+     "original_979": "roce-oneshot(#979)"
+    },
+    "corrected_vs_baseline": {
+     "change_pct": 15.2,
+     "change_us": 131.5,
+     "max_rank": "loss",
+     "rank0_change_pct": 4.3,
+     "rank0": "within",
+     "identical_code": true
+    },
+    "original_979_vs_baseline": {
+     "change_pct": -7.4,
+     "change_us": -63.7,
+     "max_rank": "within",
+     "rank0_change_pct": -10.9,
+     "rank0": "within",
+     "identical_code": false
+    },
+    "bit_exact_across_runs": true,
+    "equal_to_in_process_anchor": true
+   },
+   "direct_T256": {
+    "corrected_max_rank_us": [
+     1022.05,
+     1031.04
+    ],
+    "corrected_rank0_us": [
+     896.19,
+     759.49
+    ],
+    "baseline_max_rank_us": [
+     1088.42,
+     800.51
+    ],
+    "baseline_rank0_us": [
+     777.47,
+     626.3
+    ],
+    "baseline_aa_boots_3_4_max_rank_us": [
+     767.04,
+     813.5
+    ],
+    "baseline_aa_boots_3_4_rank0_us": [
+     683.2,
+     585.02
+    ],
+    "original_979_max_rank_us": [
+     1112.48,
+     610.88
+    ],
+    "original_979_rank0_us": [
+     935.23,
+     497.12
+    ],
+    "paths": {
+     "corrected": "pynccl-group(1107)",
+     "baseline": "pynccl-group(1107)",
+     "original_979": "roce-oneshot(#979)"
+    },
+    "corrected_vs_baseline": {
+     "change_pct": 8.7,
+     "change_us": 82.1,
+     "max_rank": "within",
+     "rank0_change_pct": 17.9,
+     "rank0": "within",
+     "identical_code": true
+    },
+    "original_979_vs_baseline": {
+     "change_pct": -8.8,
+     "change_us": -82.8,
+     "max_rank": "within",
+     "rank0_change_pct": 2.0,
+     "rank0": "within",
+     "identical_code": false
+    },
+    "bit_exact_across_runs": true,
+    "equal_to_in_process_anchor": true
+   },
+   "direct_T512": {
+    "corrected_max_rank_us": [
+     926.98,
+     1085.76
+    ],
+    "corrected_rank0_us": [
+     705.63,
+     875.33
+    ],
+    "baseline_max_rank_us": [
+     1146.24,
+     721.6
+    ],
+    "baseline_rank0_us": [
+     820.74,
+     613.18
+    ],
+    "baseline_aa_boots_3_4_max_rank_us": [
+     771.23,
+     738.3
+    ],
+    "baseline_aa_boots_3_4_rank0_us": [
+     579.33,
+     603.17
+    ],
+    "original_979_max_rank_us": [
+     969.86,
+     692.83
+    ],
+    "original_979_rank0_us": [
+     597.66,
+     632.67
+    ],
+    "paths": {
+     "corrected": "pynccl-group(1107)",
+     "baseline": "pynccl-group(1107)",
+     "original_979": "roce-oneshot(#979)"
+    },
+    "corrected_vs_baseline": {
+     "change_pct": 7.8,
+     "change_us": 72.4,
+     "max_rank": "within",
+     "rank0_change_pct": 10.3,
+     "rank0": "within",
+     "identical_code": true
+    },
+    "original_979_vs_baseline": {
+     "change_pct": -11.0,
+     "change_us": -102.6,
+     "max_rank": "within",
+     "rank0_change_pct": -14.2,
+     "rank0": "within",
+     "identical_code": false
+    },
+    "bit_exact_across_runs": true,
+    "equal_to_in_process_anchor": true
+   },
+   "direct_T1024": {
+    "corrected_max_rank_us": [
+     787.14,
+     1165.38
+    ],
+    "corrected_rank0_us": [
+     598.66,
+     850.59
+    ],
+    "baseline_max_rank_us": [
+     819.46,
+     897.44
+    ],
+    "baseline_rank0_us": [
+     669.95,
+     702.56
+    ],
+    "baseline_aa_boots_3_4_max_rank_us": [
+     905.02,
+     1019.1
+    ],
+    "baseline_aa_boots_3_4_rank0_us": [
+     696.83,
+     773.76
+    ],
+    "original_979_max_rank_us": [
+     860.9,
+     750.59
+    ],
+    "original_979_rank0_us": [
+     490.4,
+     532.61
+    ],
+    "paths": {
+     "corrected": "pynccl-group(1107)",
+     "baseline": "pynccl-group(1107)",
+     "original_979": "roce-oneshot(#979)"
+    },
+    "corrected_vs_baseline": {
+     "change_pct": 13.7,
+     "change_us": 117.8,
+     "max_rank": "within",
+     "rank0_change_pct": 5.6,
+     "rank0": "within",
+     "identical_code": true
+    },
+    "original_979_vs_baseline": {
+     "change_pct": -6.1,
+     "change_us": -52.7,
+     "max_rank": "within",
+     "rank0_change_pct": -25.5,
+     "rank0": "gain",
+     "identical_code": false
+    },
+    "bit_exact_across_runs": true,
+    "equal_to_in_process_anchor": true
+   },
+   "direct_T2048": {
+    "corrected_max_rank_us": [
+     1108.06,
+     1360.8
+    ],
+    "corrected_rank0_us": [
+     833.02,
+     1010.72
+    ],
+    "baseline_max_rank_us": [
+     990.27,
+     1094.72
+    ],
+    "baseline_rank0_us": [
+     840.22,
+     861.86
+    ],
+    "baseline_aa_boots_3_4_max_rank_us": [
+     1138.82,
+     1043.97
+    ],
+    "baseline_aa_boots_3_4_rank0_us": [
+     853.22,
+     961.79
+    ],
+    "original_979_max_rank_us": [
+     1566.37,
+     1484.1
+    ],
+    "original_979_rank0_us": [
+     907.1,
+     1105.57
+    ],
+    "paths": {
+     "corrected": "pynccl-group(1107)",
+     "baseline": "pynccl-group(1107)",
+     "original_979": "roce-oneshot(#979)"
+    },
+    "corrected_vs_baseline": {
+     "change_pct": 18.4,
+     "change_us": 191.9,
+     "max_rank": "loss",
+     "rank0_change_pct": 8.3,
+     "rank0": "within",
+     "identical_code": true
+    },
+    "original_979_vs_baseline": {
+     "change_pct": 46.3,
+     "change_us": 482.7,
+     "max_rank": "loss",
+     "rank0_change_pct": 18.2,
+     "rank0": "loss",
+     "identical_code": false
+    },
+    "bit_exact_across_runs": true,
+    "equal_to_in_process_anchor": true
+   }
+  },
+  "miss2_project_exchange_rows_below_6144": {
+   "ring4_T160": {
+    "corrected_max_rank_us": [
+     1383.42,
+     1300.51
+    ],
+    "corrected_rank0_us": [
+     964.9,
+     744.26
+    ],
+    "baseline_max_rank_us": [
+     1140.74,
+     1221.79
+    ],
+    "baseline_rank0_us": [
+     678.59,
+     1107.04
+    ],
+    "baseline_aa_boots_3_4_max_rank_us": [
+     1246.56,
+     1020.42
+    ],
+    "baseline_aa_boots_3_4_rank0_us": [
+     1093.09,
+     899.94
+    ],
+    "original_979_max_rank_us": [
+     1153.89,
+     1297.41
+    ],
+    "original_979_rank0_us": [
+     1008.06,
+     837.06
+    ],
+    "paths": {
+     "corrected": "serial(1107)",
+     "baseline": "serial(1107)",
+     "original_979": "side-stream-overlap-roce"
+    },
+    "corrected_vs_baseline": {
+     "change_pct": 13.6,
+     "change_us": 160.7,
+     "max_rank": "loss",
+     "rank0_change_pct": -4.3,
+     "rank0": "within",
+     "identical_code": true
+    },
+    "original_979_vs_baseline": {
+     "change_pct": 3.8,
+     "change_us": 44.4,
+     "max_rank": "within",
+     "rank0_change_pct": 3.3,
+     "rank0": "within",
+     "identical_code": false
+    },
+    "bit_exact_across_runs": true,
+    "equal_to_in_process_anchor": true
+   },
+   "ring4_T2048": {
+    "corrected_max_rank_us": [
+     4026.69,
+     3924.19
+    ],
+    "corrected_rank0_us": [
+     3862.02,
+     3721.09
+    ],
+    "baseline_max_rank_us": [
+     4124.64,
+     4037.89
+    ],
+    "baseline_rank0_us": [
+     3556.06,
+     3884.35
+    ],
+    "baseline_aa_boots_3_4_max_rank_us": [
+     4095.1,
+     4084.38
+    ],
+    "baseline_aa_boots_3_4_rank0_us": [
+     3818.66,
+     3766.02
+    ],
+    "original_979_max_rank_us": [
+     3823.71,
+     3937.31
+    ],
+    "original_979_rank0_us": [
+     3712.77,
+     3678.4
+    ],
+    "paths": {
+     "corrected": "serial(1107)",
+     "baseline": "serial(1107)",
+     "original_979": "side-stream-overlap-pynccl"
+    },
+    "corrected_vs_baseline": {
+     "change_pct": -2.6,
+     "change_us": -105.8,
+     "max_rank": "gain",
+     "rank0_change_pct": 1.9,
+     "rank0": "within",
+     "identical_code": true
+    },
+    "original_979_vs_baseline": {
+     "change_pct": -4.9,
+     "change_us": -200.8,
+     "max_rank": "gain",
+     "rank0_change_pct": -0.7,
+     "rank0": "within",
+     "identical_code": false
+    },
+    "bit_exact_across_runs": true,
+    "equal_to_in_process_anchor": true
+   },
+   "ring4_T4096": {
+    "corrected_max_rank_us": [
+     7414.14,
+     7187.33
+    ],
+    "corrected_rank0_us": [
+     7056.54,
+     6912.0
+    ],
+    "baseline_max_rank_us": [
+     7342.46,
+     7370.08
+    ],
+    "baseline_rank0_us": [
+     6749.73,
+     7183.49
+    ],
+    "baseline_aa_boots_3_4_max_rank_us": [
+     7237.41,
+     7483.26
+    ],
+    "baseline_aa_boots_3_4_rank0_us": [
+     7053.73,
+     7459.71
+    ],
+    "original_979_max_rank_us": [
+     7411.87,
+     7438.4
+    ],
+    "original_979_rank0_us": [
+     7050.88,
+     7180.26
+    ],
+    "paths": {
+     "corrected": "serial(1107)",
+     "baseline": "serial(1107)",
+     "original_979": "side-stream-overlap-pynccl"
+    },
+    "corrected_vs_baseline": {
+     "change_pct": -0.8,
+     "change_us": -55.5,
+     "max_rank": "within",
+     "rank0_change_pct": 0.3,
+     "rank0": "within",
+     "identical_code": true
+    },
+    "original_979_vs_baseline": {
+     "change_pct": 0.9,
+     "change_us": 68.9,
+     "max_rank": "loss",
+     "rank0_change_pct": 2.1,
+     "rank0": "within",
+     "identical_code": false
+    },
+    "bit_exact_across_runs": true,
+    "equal_to_in_process_anchor": true
+   },
+   "direct_T4096": {
+    "corrected_max_rank_us": [
+     6680.64,
+     6685.63
+    ],
+    "corrected_rank0_us": [
+     6265.73,
+     6304.93
+    ],
+    "baseline_max_rank_us": [
+     6811.46,
+     6633.73
+    ],
+    "baseline_rank0_us": [
+     6356.45,
+     6406.14
+    ],
+    "baseline_aa_boots_3_4_max_rank_us": [
+     6638.56,
+     6607.58
+    ],
+    "baseline_aa_boots_3_4_rank0_us": [
+     6239.46,
+     6382.94
+    ],
+    "original_979_max_rank_us": [
+     6786.78,
+     6775.94
+    ],
+    "original_979_rank0_us": [
+     6511.23,
+     6310.98
+    ],
+    "paths": {
+     "corrected": "serial(1107)",
+     "baseline": "serial(1107)",
+     "original_979": "side-stream-overlap-pynccl"
+    },
+    "corrected_vs_baseline": {
+     "change_pct": -0.6,
+     "change_us": -39.5,
+     "max_rank": "within",
+     "rank0_change_pct": -1.5,
+     "rank0": "gain",
+     "identical_code": true
+    },
+    "original_979_vs_baseline": {
+     "change_pct": 0.9,
+     "change_us": 58.8,
+     "max_rank": "within",
+     "rank0_change_pct": 0.5,
+     "rank0": "within",
+     "identical_code": false
+    },
+    "bit_exact_across_runs": true,
+    "equal_to_in_process_anchor": true
+   }
+  },
+  "ring4_gather_mxfp8_one_shot_route": {
+   "ring4_T160": {
+    "corrected_max_rank_us": [
+     1182.43,
+     1158.66
+    ],
+    "corrected_rank0_us": [
+     763.33,
+     780.22
+    ],
+    "baseline_max_rank_us": [
+     970.05,
+     489.57
+    ],
+    "baseline_rank0_us": [
+     602.24,
+     449.95
+    ],
+    "baseline_aa_boots_3_4_max_rank_us": [
+     886.82,
+     744.26
+    ],
+    "baseline_aa_boots_3_4_rank0_us": [
+     466.43,
+     546.24
+    ],
+    "original_979_max_rank_us": [
+     791.04,
+     765.41
+    ],
+    "original_979_rank0_us": [
+     465.12,
+     541.86
+    ],
+    "paths": {
+     "corrected": "pynccl-group(1107)",
+     "baseline": "pynccl-group(1107)",
+     "original_979": "roce-oneshot(#979)"
+    },
+    "corrected_vs_baseline": {
+     "change_pct": 60.4,
+     "change_us": 440.7,
+     "max_rank": "loss",
+     "rank0_change_pct": 46.7,
+     "rank0": "loss",
+     "identical_code": true
+    },
+    "original_979_vs_baseline": {
+     "change_pct": 6.6,
+     "change_us": 48.4,
+     "max_rank": "within",
+     "rank0_change_pct": -4.3,
+     "rank0": "within",
+     "identical_code": false
+    },
+    "bit_exact_across_runs": true,
+    "equal_to_in_process_anchor": true,
+    "ring4_gated_variant_corrA_max_rank_us": [
+     702.3,
+     765.15
+    ],
+    "ring4_gated_variant_corrA_rank0_us": [
+     488.45,
+     498.94
+    ],
+    "corrA_vs_baseline": {
+     "change_pct": 0.5,
+     "change_us": 3.9,
+     "max_rank": "within",
+     "rank0_change_pct": -6.2,
+     "rank0": "within",
+     "identical_code": false
+    }
+   },
+   "ring4_T256": {
+    "corrected_max_rank_us": [
+     1038.72,
+     885.82
+    ],
+    "corrected_rank0_us": [
+     792.58,
+     580.06
+    ],
+    "baseline_max_rank_us": [
+     813.82,
+     637.95
+    ],
+    "baseline_rank0_us": [
+     493.44,
+     461.98
+    ],
+    "baseline_aa_boots_3_4_max_rank_us": [
+     1061.86,
+     945.38
+    ],
+    "baseline_aa_boots_3_4_rank0_us": [
+     673.79,
+     812.93
+    ],
+    "original_979_max_rank_us": [
+     612.83,
+     1457.95
+    ],
+    "original_979_rank0_us": [
+     308.9,
+     1269.34
+    ],
+    "paths": {
+     "corrected": "pynccl-group(1107)",
+     "baseline": "pynccl-group(1107)",
+     "original_979": "roce-oneshot(#979)"
+    },
+    "corrected_vs_baseline": {
+     "change_pct": 32.6,
+     "change_us": 236.4,
+     "max_rank": "loss",
+     "rank0_change_pct": 43.7,
+     "rank0": "loss",
+     "identical_code": true
+    },
+    "original_979_vs_baseline": {
+     "change_pct": 42.6,
+     "change_us": 309.5,
+     "max_rank": "within",
+     "rank0_change_pct": 65.2,
+     "rank0": "within",
+     "identical_code": false
+    },
+    "bit_exact_across_runs": true,
+    "equal_to_in_process_anchor": true,
+    "ring4_gated_variant_corrA_max_rank_us": [
+     555.36,
+     700.67
+    ],
+    "ring4_gated_variant_corrA_rank0_us": [
+     401.31,
+     562.34
+    ],
+    "corrA_vs_baseline": {
+     "change_pct": -13.5,
+     "change_us": -97.9,
+     "max_rank": "within",
+     "rank0_change_pct": 0.9,
+     "rank0": "within",
+     "identical_code": false
+    }
+   },
+   "ring4_T512": {
+    "corrected_max_rank_us": [
+     997.76,
+     1039.04
+    ],
+    "corrected_rank0_us": [
+     884.93,
+     676.93
+    ],
+    "baseline_max_rank_us": [
+     935.26,
+     917.82
+    ],
+    "baseline_rank0_us": [
+     928.93,
+     849.7
+    ],
+    "baseline_aa_boots_3_4_max_rank_us": [
+     1062.3,
+     1100.19
+    ],
+    "baseline_aa_boots_3_4_rank0_us": [
+     687.65,
+     839.23
+    ],
+    "original_979_max_rank_us": [
+     1077.31,
+     1093.18
+    ],
+    "original_979_rank0_us": [
+     736.22,
+     942.94
+    ],
+    "paths": {
+     "corrected": "pynccl-group(1107)",
+     "baseline": "pynccl-group(1107)",
+     "original_979": "roce-oneshot(#979)"
+    },
+    "corrected_vs_baseline": {
+     "change_pct": 9.9,
+     "change_us": 91.9,
+     "max_rank": "loss",
+     "rank0_change_pct": -12.2,
+     "rank0": "within",
+     "identical_code": true
+    },
+    "original_979_vs_baseline": {
+     "change_pct": 17.1,
+     "change_us": 158.7,
+     "max_rank": "loss",
+     "rank0_change_pct": -5.6,
+     "rank0": "within",
+     "identical_code": false
+    },
+    "bit_exact_across_runs": true,
+    "equal_to_in_process_anchor": true,
+    "ring4_gated_variant_corrA_max_rank_us": [
+     572.99,
+     709.41
+    ],
+    "ring4_gated_variant_corrA_rank0_us": [
+     391.2,
+     616.96
+    ],
+    "corrA_vs_baseline": {
+     "change_pct": -30.8,
+     "change_us": -285.3,
+     "max_rank": "gain",
+     "rank0_change_pct": -43.3,
+     "rank0": "gain",
+     "identical_code": false
+    }
+   },
+   "ring4_T1024": {
+    "corrected_max_rank_us": [
+     1220.29,
+     1338.69
+    ],
+    "corrected_rank0_us": [
+     918.75,
+     960.54
+    ],
+    "baseline_max_rank_us": [
+     831.94,
+     986.98
+    ],
+    "baseline_rank0_us": [
+     824.1,
+     592.22
+    ],
+    "baseline_aa_boots_3_4_max_rank_us": [
+     789.82,
+     1026.27
+    ],
+    "baseline_aa_boots_3_4_rank0_us": [
+     775.42,
+     635.3
+    ],
+    "original_979_max_rank_us": [
+     1276.7,
+     1624.7
+    ],
+    "original_979_rank0_us": [
+     1257.79,
+     1554.69
+    ],
+    "paths": {
+     "corrected": "pynccl-group(1107)",
+     "baseline": "pynccl-group(1107)",
+     "original_979": "roce-oneshot(#979)"
+    },
+    "corrected_vs_baseline": {
+     "change_pct": 40.7,
+     "change_us": 370.0,
+     "max_rank": "loss",
+     "rank0_change_pct": 32.7,
+     "rank0": "loss",
+     "identical_code": true
+    },
+    "original_979_vs_baseline": {
+     "change_pct": 59.5,
+     "change_us": 541.2,
+     "max_rank": "loss",
+     "rank0_change_pct": 98.6,
+     "rank0": "loss",
+     "identical_code": false
+    },
+    "bit_exact_across_runs": true,
+    "equal_to_in_process_anchor": true,
+    "ring4_gated_variant_corrA_max_rank_us": [
+     918.08,
+     925.06
+    ],
+    "ring4_gated_variant_corrA_rank0_us": [
+     661.41,
+     640.83
+    ],
+    "corrA_vs_baseline": {
+     "change_pct": 1.3,
+     "change_us": 12.1,
+     "max_rank": "within",
+     "rank0_change_pct": -8.1,
+     "rank0": "within",
+     "identical_code": false
+    }
+   }
+  }
+ },
+ "cells_where_corrected_code_differs_from_baseline": [
+  "ring4 project_exchange_rows T=6144: -16.4% max-rank gain, rank0 -17.2% gain",
+  "ring4 project_exchange_rows T=8192: -18.3% max-rank gain, rank0 -17.2% gain",
+  "direct project_exchange_rows T=6144: -18.9% max-rank gain, rank0 -18.1% gain",
+  "direct project_exchange_rows T=8192: -14.3% max-rank gain, rank0 -15.2% gain"
+ ],
+ "corrected_slower_cells_all_identical_code": {
+  "count": 13,
+  "all_identical_code": true,
+  "cells": [
+   {
+    "cell": "ring4 project_exchange_rows T=160",
+    "identical_code": true,
+    "corrB_max_rank_us": [
+     1383.42,
+     1300.51
+    ],
+    "base0_4_boots_max_rank_us": [
+     1140.74,
+     1221.79,
+     1246.56,
+     1020.42
+    ],
+    "corrB_rank0_us": [
+     964.9,
+     744.26
+    ],
+    "base0_4_boots_rank0_us": [
+     678.59,
+     1107.04,
+     1093.09,
+     899.94
+    ],
+    "corrB_vs_base0": "max-rank loss (+13.6%), rank0 within (-4.3%)",
+    "corrB_vs_base0_4_boots": "max-rank loss, rank0 within",
+    "aa_same_cell": "max-rank within (-4.0%), rank0 within (+11.6%)"
+   },
+   {
+    "cell": "ring4 gather_mxfp8 T=160",
+    "identical_code": true,
+    "corrB_max_rank_us": [
+     1182.43,
+     1158.66
+    ],
+    "base0_4_boots_max_rank_us": [
+     970.05,
+     489.57,
+     886.82,
+     744.26
+    ],
+    "corrB_rank0_us": [
+     763.33,
+     780.22
+    ],
+    "base0_4_boots_rank0_us": [
+     602.24,
+     449.95,
+     466.43,
+     546.24
+    ],
+    "corrB_vs_base0": "max-rank loss (+60.4%), rank0 loss (+46.7%)",
+    "corrB_vs_base0_4_boots": "max-rank loss, rank0 loss",
+    "aa_same_cell": "max-rank within (+11.7%), rank0 within (-3.8%)"
+   },
+   {
+    "cell": "ring4 gather_mxfp8 T=256",
+    "identical_code": true,
+    "corrB_max_rank_us": [
+     1038.72,
+     885.82
+    ],
+    "base0_4_boots_max_rank_us": [
+     813.82,
+     637.95,
+     1061.86,
+     945.38
+    ],
+    "corrB_rank0_us": [
+     792.58,
+     580.06
+    ],
+    "base0_4_boots_rank0_us": [
+     493.44,
+     461.98,
+     673.79,
+     812.93
+    ],
+    "corrB_vs_base0": "max-rank loss (+32.6%), rank0 loss (+43.7%)",
+    "corrB_vs_base0_4_boots": "max-rank within, rank0 within",
+    "aa_same_cell": "max-rank loss (+38.3%), rank0 loss (+55.6%)"
+   },
+   {
+    "cell": "ring4 gather_mxfp8 T=512",
+    "identical_code": true,
+    "corrB_max_rank_us": [
+     997.76,
+     1039.04
+    ],
+    "base0_4_boots_max_rank_us": [
+     935.26,
+     917.82,
+     1062.3,
+     1100.19
+    ],
+    "corrB_rank0_us": [
+     884.93,
+     676.93
+    ],
+    "base0_4_boots_rank0_us": [
+     928.93,
+     849.7,
+     687.65,
+     839.23
+    ],
+    "corrB_vs_base0": "max-rank loss (+9.9%), rank0 within (-12.2%)",
+    "corrB_vs_base0_4_boots": "max-rank within, rank0 within",
+    "aa_same_cell": "max-rank loss (+16.7%), rank0 gain (-14.2%)"
+   },
+   {
+    "cell": "ring4 gather_mxfp8 T=1024",
+    "identical_code": true,
+    "corrB_max_rank_us": [
+     1220.29,
+     1338.69
+    ],
+    "base0_4_boots_max_rank_us": [
+     831.94,
+     986.98,
+     789.82,
+     1026.27
+    ],
+    "corrB_rank0_us": [
+     918.75,
+     960.54
+    ],
+    "base0_4_boots_rank0_us": [
+     824.1,
+     592.22,
+     775.42,
+     635.3
+    ],
+    "corrB_vs_base0": "max-rank loss (+40.7%), rank0 loss (+32.7%)",
+    "corrB_vs_base0_4_boots": "max-rank loss, rank0 loss",
+    "aa_same_cell": "max-rank within (-0.2%), rank0 within (-0.4%)"
+   },
+   {
+    "cell": "ring4 gather_mxfp8 T=4096",
+    "identical_code": true,
+    "corrB_max_rank_us": [
+     1546.21,
+     1883.97
+    ],
+    "base0_4_boots_max_rank_us": [
+     1598.05,
+     1618.3,
+     1479.33,
+     1588.9
+    ],
+    "corrB_rank0_us": [
+     1404.58,
+     1494.05
+    ],
+    "base0_4_boots_rank0_us": [
+     1303.2,
+     1249.57,
+     1374.08,
+     1404.61
+    ],
+    "corrB_vs_base0": "max-rank within (+6.6%), rank0 loss (+13.5%)",
+    "corrB_vs_base0_4_boots": "max-rank within, rank0 within",
+    "aa_same_cell": "max-rank gain (-4.6%), rank0 loss (+8.8%)"
+   },
+   {
+    "cell": "direct project_exchange_rows T=512",
+    "identical_code": true,
+    "corrB_max_rank_us": [
+     1483.81,
+     1655.36
+    ],
+    "base0_4_boots_max_rank_us": [
+     1374.72,
+     1353.5,
+     1758.14,
+     1390.59
+    ],
+    "corrB_rank0_us": [
+     1327.04,
+     1434.82
+    ],
+    "base0_4_boots_rank0_us": [
+     1248.9,
+     1272.77,
+     1161.06,
+     1344.96
+    ],
+    "corrB_vs_base0": "max-rank loss (+15.1%), rank0 loss (+9.5%)",
+    "corrB_vs_base0_4_boots": "max-rank within, rank0 within",
+    "aa_same_cell": "max-rank loss (+15.4%), rank0 within (-0.6%)"
+   },
+   {
+    "cell": "direct project_exchange_rows T=1024",
+    "identical_code": true,
+    "corrB_max_rank_us": [
+     1971.14,
+     2077.22
+    ],
+    "base0_4_boots_max_rank_us": [
+     1962.53,
+     1897.02,
+     2306.08,
+     1926.4
+    ],
+    "corrB_rank0_us": [
+     1822.4,
+     1857.7
+    ],
+    "base0_4_boots_rank0_us": [
+     1654.05,
+     1850.75,
+     1961.82,
+     1695.97
+    ],
+    "corrB_vs_base0": "max-rank loss (+4.9%), rank0 within (+5.0%)",
+    "corrB_vs_base0_4_boots": "max-rank within, rank0 within",
+    "aa_same_cell": "max-rank within (+9.7%), rank0 within (+4.4%)"
+   },
+   {
+    "cell": "direct project_exchange_rows T=2048",
+    "identical_code": true,
+    "corrB_max_rank_us": [
+     3690.3,
+     3664.8
+    ],
+    "base0_4_boots_max_rank_us": [
+     3624.83,
+     3575.78,
+     3749.02,
+     3494.34
+    ],
+    "corrB_rank0_us": [
+     3060.32,
+     3389.57
+    ],
+    "base0_4_boots_rank0_us": [
+     3155.33,
+     3457.89,
+     3491.81,
+     3243.49
+    ],
+    "corrB_vs_base0": "max-rank loss (+2.1%), rank0 within (-2.5%)",
+    "corrB_vs_base0_4_boots": "max-rank within, rank0 within",
+    "aa_same_cell": "max-rank within (+0.6%), rank0 within (+1.8%)"
+   },
+   {
+    "cell": "direct gather_mxfp8 T=160",
+    "identical_code": true,
+    "corrB_max_rank_us": [
+     926.91,
+     1066.11
+    ],
+    "base0_4_boots_max_rank_us": [
+     906.5,
+     823.46,
+     902.46,
+     651.39
+    ],
+    "corrB_rank0_us": [
+     642.14,
+     732.93
+    ],
+    "base0_4_boots_rank0_us": [
+     693.76,
+     624.99,
+     772.06,
+     481.7
+    ],
+    "corrB_vs_base0": "max-rank loss (+15.2%), rank0 within (+4.3%)",
+    "corrB_vs_base0_4_boots": "max-rank loss, rank0 within",
+    "aa_same_cell": "max-rank within (-10.2%), rank0 within (-4.9%)"
+   },
+   {
+    "cell": "direct gather_mxfp8 T=2048",
+    "identical_code": true,
+    "corrB_max_rank_us": [
+     1108.06,
+     1360.8
+    ],
+    "base0_4_boots_max_rank_us": [
+     990.27,
+     1094.72,
+     1138.82,
+     1043.97
+    ],
+    "corrB_rank0_us": [
+     833.02,
+     1010.72
+    ],
+    "base0_4_boots_rank0_us": [
+     840.22,
+     861.86,
+     853.22,
+     961.79
+    ],
+    "corrB_vs_base0": "max-rank loss (+18.4%), rank0 within (+8.3%)",
+    "corrB_vs_base0_4_boots": "max-rank within, rank0 within",
+    "aa_same_cell": "max-rank within (+4.7%), rank0 within (+6.6%)"
+   },
+   {
+    "cell": "direct gather_mxfp8 T=6144",
+    "identical_code": true,
+    "corrB_max_rank_us": [
+     1814.66,
+     2031.65
+    ],
+    "base0_4_boots_max_rank_us": [
+     1783.55,
+     1791.33,
+     1797.25,
+     1951.97
+    ],
+    "corrB_rank0_us": [
+     1460.45,
+     1720.16
+    ],
+    "base0_4_boots_rank0_us": [
+     1499.87,
+     1580.74,
+     1562.24,
+     1734.11
+    ],
+    "corrB_vs_base0": "max-rank loss (+7.6%), rank0 within (+3.2%)",
+    "corrB_vs_base0_4_boots": "max-rank within, rank0 within",
+    "aa_same_cell": "max-rank loss (+4.9%), rank0 within (+7.0%)"
+   },
+   {
+    "cell": "direct gather_mxfp8 T=8192",
+    "identical_code": true,
+    "corrB_max_rank_us": [
+     2369.98,
+     2346.3
+    ],
+    "base0_4_boots_max_rank_us": [
+     2120.64,
+     2079.78,
+     2272.06,
+     2311.97
+    ],
+    "corrB_rank0_us": [
+     1967.94,
+     2128.74
+    ],
+    "base0_4_boots_rank0_us": [
+     1857.47,
+     1832.42,
+     1901.7,
+     2065.38
+    ],
+    "corrB_vs_base0": "max-rank loss (+12.3%), rank0 loss (+11.0%)",
+    "corrB_vs_base0_4_boots": "max-rank loss, rank0 within",
+    "aa_same_cell": "max-rank loss (+9.1%), rank0 loss (+7.5%)"
+   }
+  ],
+  "why_not_regressions": "In each of these cells the timed function is the same code in the corrected arm and the baseline (gather_mxfp8: 1107's gather_many byte for byte; project_exchange_rows below 6,144: the same project, then(), exchange_rows calls). The baseline against itself reads beyond the two-boot interval in 25% of cells (aa.json), and the in-process anchor, identical bench code in every arm, moves with the boot: at ring4 gather_mxfp8 T=1024 the anchor's slowest-rank medians were 1,162/1,338 us in the corrected boots against 610/910/758/980 us in the four baseline boots, while integrated-minus-anchor was 58/1 us against 222/77/32/47 us. The same identical-code readings hit the arms in both directions (e.g. corrected vs #979 at ring4 T=6144, identical sliced-pipeline code, reads 'loss'; corrA vs #979 at ring4 gather T=512/1024, identical one-shot code, reads 'gain')."
+ },
+ "aa": {
+  "baseline_vs_itself": {
+   "cells_total": 32,
+   "beyond_max_rank": 8,
+   "beyond_rank0": 8,
+   "false_positive_rate_max_rank": 0.25,
+   "false_positive_rate_rank0": 0.25
+  },
+  "identical_code_pairs_across_arms": {
+   "pairs": 113,
+   "beyond_max_rank": 45,
+   "beyond_rank0": 34,
+   "false_positive_rate_max_rank": 0.398,
+   "false_positive_rate_rank0": 0.301
+  },
+  "in_process_anchor_across_arms": {
+   "pairs": 96,
+   "beyond_max_rank": 37,
+   "beyond_rank0": 34
+  },
+  "how": "base0 boots 3-4 ran right after the main sequence (12:34-12:37Z), same session, same code; compared with base0 boots 1-2 by the same two-boot rule (aa.json). Identical-code pairs: every pair of arms whose timed function takes the same path at a cell (analysis.json identical_code_aa)."
+ },
+ "bit_exact": true,
+ "bit_exact_detail": "At every T, op and topology, every rank's output digest (sha256 of the real rows of project_exchange_rows; of values, scales, weights and ids for gather_mxfp8) is equal across all 20 runs here (4 arms x 2 boots x 2 topologies, plus the 4 A/A boots) and the own mark's 8 runs, the same on ring4 and direct, and every rank equals its in-process anchor (then() output included).",
+ "tests": {
+  "host": "sp2 (spark-0010), under /tmp/spark-lab-gpu.lock, spark-ds41f:1107 with the corrected tree's 15 touched files bound read-only, tests/conftest.py with scripts/release_tests/tblib_stub.py",
+  "corrected_gpu": "tests/models/test_deepseek_v41_sp_project_reduce_scatter.py tests/models/test_deepseek_v4_1_sp_prefill.py: 396 passed, 14 warnings (104.44 s)",
+  "corrected_cpu": "tests/models/test_deepseek_v4_1_sp_prefill.py tests/models/test_deepseek_v4_1_engram.py, --gpus all with CUDA_VISIBLE_DEVICES empty: 219 passed, 17 skipped (55.25 s)",
+  "corrA_variant": "GPU 396 passed; CPU 219 passed, 17 skipped",
+  "same_counts_as_original": "the own mark's #979 counts were 396 GPU and 219 passed / 17 skipped CPU",
+  "changed_tests": "#979's test_project_exchange_rows_cuda_with_active_roce_comm and test_project_exchange_rows_roce_and_pynccl_coexistence now assert the one-slice order (projection, then(), row exchange through exchange_rows; one-shot when it fits) and the two-slice PyNCCL pipeline; test_gather_many_routes_roce_and_packs_small_tensors is replaced by test_gather_many_keeps_grouped_pynccl_beside_roce; test_engram_slices and test_exchange_into_passes_send_and_recv_to_should_exchange are unchanged."
+ },
+ "hosts": "sp1..sp4 (spark-0009..spark-0012), NVIDIA GB10, one rank per node, 200G dual-rail switched RoCE; tp4-switched profile of releases/spark-ds41f-1107/cluster.json (the own mark's rendered container command, only name/port/overlay/arm/label substituted)",
+ "image": "spark-ds41f:1107 sha256:3f32a962ce04b7c8d85337cd427a8946b8b6bcaadd97cc8d8a8cd14e8d68a6ce on all four nodes, no build; arms bind 7 vLLM files read-only",
+ "arms": {
+  "corrected (corrB)": "0762..0765 + corrected 0766 + 0767; sp_prefill.py cd10236f284a...",
+  "baseline (base0)": "candidate-49 without #979: 0762..0765 + 0767; sp_prefill.py 880ff323bde3..., identical to the own mark's no979 overlay",
+  "original #979 (orig)": "0762..0767; sp_prefill.py 58e7f2579b73..., identical to the own mark's c49 overlay",
+  "ring4-gated variant (corrA, not delivered)": "corrected + #979's one-shot gather on ring4 only; sp_prefill.py cf8b0302dd38...; variants/corrA-vs-corrected.diff"
+ },
+ "method": "Same session, 12:20:06-12:34:10Z: per topology (ring4, then direct) corrA, corrB, base0, orig, orig, base0, corrB, corrA (mirrored ABBA), two boots per arm, each boot a fresh 4-container launch; then base0 boots 3-4 per topology as the A/A (12:34:33-12:37:44Z). Bench: the own mark's bench_979_integrated.py unchanged (sha256 b05cd7965f53...): the PR's workload, T=160..8192, 12 warmup + 40 timed iterations with a barrier before each, CUDA events, each rank >=200 ms of back-to-back 4096^3 BF16 GEMMs before timing (minimum measured 200.1 ms). Metric: median over the 40 iterations of the per-iteration max over the 4 ranks, and rank 0's median; interval = an arm's two boot medians; 'gain'/'loss' when two arms' intervals do not overlap.",
+ "notes": [
+  "Narrowness: against the baseline, the corrected 0766 changes only project_exchange_rows' branch condition (one slice under the one-shot policy -> 1107's path; two or more slices -> the existing PyNCCL pipeline), _tp_pynccl_comm() / _tp_roce_comm(), ENGRAM_SLICE_TOKENS 2048 -> 6144, and exchange_into's should_exchange(send, recv) (routing unchanged wherever 1107's call did not raise, since the one-shot exchange itself checks both). Against #979 it removes the one-shot gather route, the small-tensor packing, and the one-slice side-stream overlap (variants/corrected-vs-pr979.diff).",
+  "ENGRAM_SLICE_TOKENS = 6144 also moves where a profile without the one-shot communicator (pure PyNCCL) starts slicing (2,048 -> 6,144). No served shape runs without it, and this bench does not measure that profile.",
+  "With the one-shot communicator present but lacking should_all_to_all_rows (B12X PCIe all-reduce), project_exchange_rows keeps 1107's behaviour (pipeline at any slice count), because the one-slice condition tests should_all_to_all_rows as 1107's _tp_pynccl_comm() did.",
+  "The bench's small-T cells are dominated by barrier skew and boot-to-boot drift (the slowest-rank medians at T=160 are 2-3x the per-rank minima). Two boots per arm cannot resolve differences there; the decision for those cells rests on the code being identical, shown by the A/A.",
+  "Miss 1 reproduced at direct T=2048 only in this session (#979 +46.3% slowest rank, +18.2% rank0); at T=160..1024 #979's direct one-shot gather read within the interval here, never a gain on the slowest rank in either session.",
+  "Every node was idle, without a hold or request file, with all four GPU locks held, before each run (run records in commands.txt). The first bench run waited on sp2's lock for this agent's own test job.",
+  "The A/A appendix was added after the main runs were seen; it only re-runs the baseline arm, so it cannot favour the candidate."
+ ],
+ "files": {
+  "0766-perf-dsv41-pipeline-the-sliced-SP-Engram-row-exchang.patch": "the corrected patch, git format-patch, original author and date, rationale rewritten",
+  "commands.txt": "setup commands, the pre-registered plan, every bench run's record (lock/start/end UTC, per-node image/load/docker ps/hold, exact per-rank command, exit codes) and every test run's record",
+  "raw/": "each run's per-rank stdout+stderr (<label>-sp1..sp4.txt), rank 0's JSON (<label>.json, per-iteration times of every rank), sequence logs, driver logs, plan.txt, test outputs (test-*.txt), arm overlay hashes",
+  "analysis.json": "scripts/analyze4.py over raw/ (all arms, all cells, identical-code A/A, anchor A/A, digests)",
+  "aa.json": "scripts/aa.py: baseline boots 3-4 vs 1-2, and every corrected 'loss' cell against the A/A and against the baseline's four boots",
+  "scripts/": "bench (unchanged), render.py + templates (the own mark's rendered commands), run4.sh, sequence.sh, runtest.sh, tests.sh, analyze4.py, show4.py, aa.py",
+  "variants/": "corrected-vs-pr979.diff, corrA-ring4-gated-gather-vs-pre0766.diff (the measured, not delivered variant), corrA-vs-corrected.diff"
+ }
+}

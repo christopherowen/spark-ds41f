@@ -1,0 +1,664 @@
+diff --git a/tests/models/test_deepseek_v41_sp_project_reduce_scatter.py b/tests/models/test_deepseek_v41_sp_project_reduce_scatter.py
+index e7d3ac7..439542e 100644
+--- a/tests/models/test_deepseek_v41_sp_project_reduce_scatter.py
++++ b/tests/models/test_deepseek_v41_sp_project_reduce_scatter.py
+@@ -415,8 +415,9 @@ def test_row_all_to_all_over_cabled_pairs(topology, world, short, rows=10):
+ 
+ 
+ def test_engram_slices():
+-    assert sp_prefill.engram_slices(2047) == 1
+-    assert sp_prefill.engram_slices(2048) == 2
++    assert sp_prefill.engram_slices(2048) == 1
++    assert sp_prefill.engram_slices(6143) == 1
++    assert sp_prefill.engram_slices(6144) == 2
+ 
+ 
+ @pytest.mark.parametrize("world", [3, 4])
+@@ -481,3 +482,118 @@ def test_project_exchange_rows_over_cabled_pairs(
+                 got[:real].view(torch.int16),
+                 inputs[source][me * local : me * local + real].view(torch.int16),
+             )
++
++
++@pytest.mark.parametrize("roce_fits", [True, False])
++@pytest.mark.parametrize("slices", [1, 2])
++def test_project_exchange_rows_cuda_with_active_roce_comm(
++    monkeypatch, topology, roce_fits, slices, world=4, rows=10
++):
++    """On CUDA streams when ``b12x_ar_comm`` is active alongside ``pynccl_comm``:
++    - at ``slices=1``, one full-row projection, then ``then()``, then the TP group's
++      row exchange (``exchange_rows``: ``b12x_ar_comm`` when its
++      ``should_all_to_all_rows`` accepts the rows, else ``pynccl_comm``), in order
++      on the current stream;
++    - at ``slices=2``, sliced ``copy_self=False`` exchange runs over ``pynccl_comm``
++      and ``b12x_ar_comm`` is not used."""
++    from types import SimpleNamespace
++
++    total = world * rows - 3
++    fabric = _Fabric(world)
++    inputs = [
++        torch.randn(total, 6, device="cuda", dtype=torch.bfloat16)
++        for _ in range(world)
++    ]
++    outputs: list[torch.Tensor | None] = [None] * world
++    steps: list[list[str]] = [[] for _ in range(world)]
++    roce_counts = [0] * world
++    local_state = threading.local()
++
++    monkeypatch.setattr(
++        sp_prefill,
++        "get_tp_group",
++        lambda: SimpleNamespace(
++            device_communicator=SimpleNamespace(
++                pynccl_comm=local_state.comm, b12x_ar_comm=local_state.roce
++            )
++        ),
++    )
++
++    def all_to_all_rows(x, n):  # the TP group's row exchange, as CudaCommunicator's
++        steps[local_state.rank].append("exchange")
++        if local_state.roce.should_all_to_all_rows(x, n):
++            return local_state.roce.all_to_all_rows(x, n)
++        out = x.new_empty((world, n, *x.shape[1:]))
++        local_state.comm.all_to_all_rows(out, x.contiguous(), n)
++        return out
++
++    monkeypatch.setattr(
++        sp_prefill, "tensor_model_parallel_all_to_all_rows", all_to_all_rows
++    )
++    errors = []
++
++    def run(rank: int) -> None:
++        try:
++            local_state.rank = rank
++            local_state.comm = fabric.comm(rank)
++            sp = sp_prefill.SPRows(num_tokens=total, world_size=world, rank=rank)
++            real = sp.real_rows
++
++            class _Roce:
++                disabled = False
++
++                def should_all_to_all_rows(self, x, l_rows):
++                    return roce_fits
++
++                def all_to_all_rows(self, x, l_rows):
++                    roce_counts[rank] += 1
++                    out = torch.zeros(
++                        (world, l_rows, 6), device=x.device, dtype=x.dtype
++                    )
++                    for s in range(world):
++                        out[s, :real].copy_(
++                            inputs[s][rank * l_rows : rank * l_rows + real]
++                        )
++                    return out
++
++            local_state.roce = _Roce()
++
++            def project(start, stop, dest):
++                steps[rank].append("project")
++                dest.copy_(inputs[rank][start:stop])
++
++            outputs[rank] = sp.project_exchange_rows(
++                project,
++                (6,),
++                torch.bfloat16,
++                inputs[rank].device,
++                slices=slices,
++                then=lambda: steps[rank].append("then"),
++            )
++            torch.cuda.synchronize()
++        except BaseException as error:
++            errors.append((rank, error))
++            fabric.barrier.abort()
++
++    threads = [threading.Thread(target=run, args=(r,)) for r in range(world)]
++    for thread in threads:
++        thread.start()
++    for thread in threads:
++        thread.join()
++    assert not errors, errors
++    local = sp_prefill.SPRows(num_tokens=total, world_size=world, rank=0).local_rows
++    for me in range(world):
++        assert steps[me].count("then") == 1
++        if slices == 1:
++            assert steps[me] == ["project", "then", "exchange"]
++            assert roce_counts[me] == (1 if roce_fits else 0)
++        else:
++            assert steps[me].count("project") > 1 and "exchange" not in steps[me]
++            assert roce_counts[me] == 0
++        real = max(0, min(local, total - me * local))
++        for source in range(world):
++            got = outputs[me][source]
++            assert torch.equal(
++                got[:real].view(torch.int16),
++                inputs[source][me * local : me * local + real].view(torch.int16),
++            )
+diff --git a/tests/models/test_deepseek_v4_1_sp_prefill.py b/tests/models/test_deepseek_v4_1_sp_prefill.py
+index 248a5cf..b79d944 100644
+--- a/tests/models/test_deepseek_v4_1_sp_prefill.py
++++ b/tests/models/test_deepseek_v4_1_sp_prefill.py
+@@ -1081,8 +1081,9 @@ def test_model_forward_sp_sink_columns_with_rank_order_parts(monkeypatch):
+ 
+ 
+ def test_engram_slices():
+-    assert sp_prefill.engram_slices(2047) == 1
+-    assert sp_prefill.engram_slices(2048) == 2
++    assert sp_prefill.engram_slices(2048) == 1
++    assert sp_prefill.engram_slices(6143) == 1
++    assert sp_prefill.engram_slices(6144) == 2
+     assert sp_prefill.engram_slices(8192) == 2
+     assert sp_prefill.engram_slices(16384) == 2
+ 
+@@ -1981,3 +1982,270 @@ def test_tilelang_linear_apply_shards_single_cast_and_bit_exact(
+     assert torch.equal(
+         actual[:, :rows].view(torch.int16), expected.view(torch.int16)
+     )
++
++
++def test_gather_many_routes_roce_and_packs_small_tensors(monkeypatch):
++    """On sparknet's ``ring4`` topology, when ``b12x_ar_comm`` accepts all tensors in
++    ``gather_many``, large tensors are gathered directly into the destination buffer
++    while small trailing tensors (``<= 512`` B/row, such as MXFP8 scales and top-k
++    routes) are packed into one ``uint8`` all-gather, reducing 4 collectives to 2.
++    On ``direct``, without a one-shot runtime, or when any tensor exceeds
++    ``should_all_gather``, ``gather_many`` uses grouped ``pynccl_comm``."""
++    layout = sp_prefill.SPRows(10, 3, 2)  # padded=12, local=4, real=2
++    vals = torch.arange(4 * 1024, dtype=torch.uint8).reshape(4, 1024)
++    scales = torch.arange(4 * 32, dtype=torch.uint8).reshape(4, 32)
++    weights = torch.arange(4 * 6, dtype=torch.float32).reshape(4, 6)
++    ids = torch.arange(4 * 6, dtype=torch.int32).reshape(4, 6)
++
++    roce_calls = []
++    pynccl_calls = []
++
++    class _FakeRuntime:
++        def __init__(self, topology: str):
++            self.topology = topology
++
++        def all_gather(self, inp, dim=0, out=None):
++            assert dim == 0 and out is not None
++            roce_calls.append(("runtime_ag", tuple(inp.shape), inp.dtype))
++            out.copy_(inp.repeat(3, *([1] * (inp.ndim - 1))))
++            return out
++
++    class _FakeRoce:
++        disabled = False
++
++        def __init__(self, max_bytes: int, topology: str | None = "ring4"):
++            self.max_bytes = max_bytes
++            self._runtime = _FakeRuntime(topology) if topology else None
++
++        def should_all_gather(self, inp, dim=0):
++            assert dim == 0
++            return inp.numel() * inp.element_size() <= self.max_bytes
++
++    class _FakePyNccl:
++        disabled = False
++
++        def group_start(self):
++            pynccl_calls.append("group_start")
++
++        def all_gather(self, full, local):
++            pynccl_calls.append(("pynccl_ag", tuple(full.shape), tuple(local.shape)))
++            full.copy_(local.repeat(3, *([1] * (local.ndim - 1))))
++
++        def group_end(self):
++            pynccl_calls.append("group_end")
++
++    def route(roce: _FakeRoce) -> None:
++        roce_calls.clear()
++        pynccl_calls.clear()
++        monkeypatch.setattr(
++            sp_prefill,
++            "get_tp_group",
++            lambda: SimpleNamespace(
++                device_communicator=SimpleNamespace(
++                    b12x_ar_comm=roce, pynccl_comm=_FakePyNccl()
++                )
++            ),
++        )
++
++    monkeypatch.setattr(sp_prefill, "model_parallel_is_initialized", lambda: True)
++    route(_FakeRoce(max_bytes=16384))
++    out_v, out_s, out_w, out_i = layout.gather_many(
++        vals, scales, weights, ids, padded_rows=(64, 64)
++    )
++    # 1 direct call for vals (1024 B/row > 512) + 1 packed call for
++    # (scales, weights, ids) (32 + 24 + 24 = 80 B/row)
++    assert roce_calls == [
++        ("runtime_ag", (4, 1024), torch.uint8),
++        ("runtime_ag", (4, 80), torch.uint8),
++    ]
++    assert pynccl_calls == []
++    assert out_v.shape == (64, 1024)
++    assert out_s.shape == (64, 32)
++    assert out_w.shape == (10, 6) and out_w.dtype == torch.float32
++    assert out_i.shape == (10, 6) and out_i.dtype == torch.int32
++    torch.testing.assert_close(out_v[:12], vals.repeat(3, 1), rtol=0, atol=0)
++    torch.testing.assert_close(out_s[:12], scales.repeat(3, 1), rtol=0, atol=0)
++    torch.testing.assert_close(out_w, weights.repeat(3, 1)[:10], rtol=0, atol=0)
++    torch.testing.assert_close(out_i, ids.repeat(3, 1)[:10], rtol=0, atol=0)
++
++    # On direct, without a runtime, or when vals exceeds max_bytes: grouped PyNCCL.
++    for roce in (
++        _FakeRoce(max_bytes=16384, topology="direct"),
++        _FakeRoce(max_bytes=16384, topology=None),
++        _FakeRoce(max_bytes=1024),
++    ):
++        route(roce)
++        got = layout.gather_many(vals, scales, weights, ids, padded_rows=(64, 64))
++        assert roce_calls == []
++        assert pynccl_calls[0] == "group_start" and pynccl_calls[-1] == "group_end"
++        assert len(pynccl_calls) == 6
++        for a, b in zip(got, (out_v[:12], out_s[:12], out_w, out_i)):
++            torch.testing.assert_close(a[: b.shape[0]], b, rtol=0, atol=0)
++
++
++def test_project_exchange_rows_roce_and_pynccl_coexistence(monkeypatch):
++    """When ``b12x_ar_comm`` is present alongside ``pynccl_comm``:
++    - ``_tp_pynccl_comm()`` remains available for multi-slice exchanges;
++    - at ``slices == 1``, ``project_exchange_rows`` projects all rows in one call,
++      runs ``then()`` and then the TP group's row exchange (``exchange_rows``, here
++      ``b12x_ar_comm.all_to_all_rows``, whose ``should_all_to_all_rows`` is True);
++    - at ``slices == 2`` (``T >= ENGRAM_SLICE_TOKENS``), ``project_exchange_rows`` uses
++      the sliced ``copy_self=False`` exchange via ``pynccl_comm``."""
++    world, total, block_cols = 3, 10, 4
++    gen = torch.Generator().manual_seed(42)
++    inputs = [
++        torch.randn((total, block_cols), generator=gen, dtype=torch.bfloat16)
++        for _ in range(world)
++    ]
++
++    # Case 1: slices == 1 is one projection call, then(), then the row exchange.
++    proj_calls = [[] for _ in range(world)]
++    roce_a2a_calls = [0] * world
++
++    for rank in range(world):
++        sp = sp_prefill.SPRows(num_tokens=total, world_size=world, rank=rank)
++        local = sp.local_rows
++        real = sp.real_rows
++
++        class _RoceComm:
++            disabled = False
++
++            def should_all_to_all_rows(self, x, l_rows):
++                return l_rows == local and x.shape == (total, block_cols)
++
++            def all_to_all_rows(self, x, l_rows):
++                roce_a2a_calls[rank] += 1
++                out = torch.zeros((world, l_rows, block_cols), dtype=x.dtype)
++                for s in range(world):
++                    out[s, :real].copy_(inputs[s][rank * l_rows : rank * l_rows + real])
++                return out
++
++        roce = _RoceComm()
++        steps = []
++
++        def all_to_all_rows(x, n, rc=roce, steps=steps):  # the TP group's exchange
++            steps.append("exchange")
++            assert rc.should_all_to_all_rows(x, n)
++            return rc.all_to_all_rows(x, n)
++
++        monkeypatch.setattr(
++            sp_prefill,
++            "get_tp_group",
++            lambda rc=roce: SimpleNamespace(
++                device_communicator=SimpleNamespace(
++                    b12x_ar_comm=rc, pynccl_comm=SimpleNamespace(disabled=False)
++                )
++            ),
++        )
++        monkeypatch.setattr(
++            sp_prefill, "tensor_model_parallel_all_to_all_rows", all_to_all_rows
++        )
++        assert sp_prefill._tp_pynccl_comm() is not None
++        assert sp_prefill._tp_roce_comm() is not None
++        got = sp.project_exchange_rows(
++            lambda start, stop, dst, r=rank: (
++                proj_calls[r].append((start, stop)),
++                dst.copy_(inputs[r][start:stop]),
++            )[-1],
++            (block_cols,),
++            torch.bfloat16,
++            torch.device("cpu"),
++            slices=1,
++            then=lambda steps=steps: steps.append("then"),
++        )
++        assert proj_calls[rank] == [(0, total)]
++        assert roce_a2a_calls[rank] == 1
++        assert steps == ["then", "exchange"]
++        for s in range(world):
++            assert torch.equal(
++                got[s, :real].view(torch.int16),
++                inputs[s][rank * local : rank * local + real].view(torch.int16),
++            )
++
++    # Case 2: slices == 2 with active b12x_ar_comm still routes sliced copy_self=False via pynccl_comm.
++    fabric = _RowExchangeFabric(world)
++    local_comm = threading.local()
++
++    class _RoceNoA2A:
++        disabled = False
++
++        def should_all_to_all_rows(self, x, l_rows):
++            return False
++
++        def all_to_all_rows(self, x, l_rows):
++            raise AssertionError("should not call roce all_to_all_rows when False")
++
++    monkeypatch.setattr(
++        sp_prefill,
++        "get_tp_group",
++        lambda: SimpleNamespace(
++            device_communicator=SimpleNamespace(
++                pynccl_comm=local_comm.comm, b12x_ar_comm=_RoceNoA2A()
++            )
++        ),
++    )
++    outputs: list[torch.Tensor | None] = [None] * world
++    errors = []
++
++    def run(rank: int) -> None:
++        try:
++            local_comm.comm = fabric.comm(rank)
++            sp = sp_prefill.SPRows(num_tokens=total, world_size=world, rank=rank)
++            outputs[rank] = sp.project_exchange_rows(
++                lambda start, stop, dst: dst.copy_(inputs[rank][start:stop]),
++                (block_cols,),
++                torch.bfloat16,
++                torch.device("cpu"),
++                slices=2,
++            )
++        except BaseException as exc:
++            errors.append((rank, exc))
++            fabric.barrier.abort()
++
++    threads = [threading.Thread(target=run, args=(r,)) for r in range(world)]
++    for t in threads:
++        t.start()
++    for t in threads:
++        t.join()
++    assert not errors, errors
++    for me in range(world):
++        sp = sp_prefill.SPRows(num_tokens=total, world_size=world, rank=me)
++        for s in range(world):
++            assert torch.equal(
++                outputs[me][s, : sp.real_rows].view(torch.int16),
++                inputs[s][sp.start : sp.start + sp.real_rows].view(torch.int16),
++            )
++
++
++def test_exchange_into_passes_send_and_recv_to_should_exchange(monkeypatch):
++    sp = sp_prefill.SPRows(num_tokens=8, world_size=4, rank=1)
++    send = torch.ones((4, 2, 4), dtype=torch.bfloat16)
++    recv = torch.zeros((4, 2, 4), dtype=torch.bfloat16)
++    seen = []
++
++    class _RoceEx:
++        disabled = False
++
++        def should_exchange(self, inp, out):
++            seen.append(("should_exchange", inp is send, out is recv))
++            return True
++
++        def exchange_into(self, inp, out):
++            seen.append(("exchange_into", inp is send, out is recv))
++            out.copy_(inp)
++
++    monkeypatch.setattr(
++        sp_prefill,
++        "get_tp_group",
++        lambda: SimpleNamespace(
++            device_communicator=SimpleNamespace(
++                pynccl_comm=None, b12x_ar_comm=_RoceEx()
++            )
++        ),
++    )
++    sp.exchange_into(send, recv)
++    assert seen == [
++        ("should_exchange", True, True),
++        ("exchange_into", True, True),
++    ]
++    assert torch.equal(recv, send)
+diff --git a/vllm/models/deepseek_v4_1/sp_prefill.py b/vllm/models/deepseek_v4_1/sp_prefill.py
+index 94c8dd2..3cc6a37 100644
+--- a/vllm/models/deepseek_v4_1/sp_prefill.py
++++ b/vllm/models/deepseek_v4_1/sp_prefill.py
+@@ -222,7 +222,9 @@ class SPRows:
+         self, *tensors: torch.Tensor, padded_rows: tuple[int, ...] = ()
+     ) -> tuple[torch.Tensor, ...]:
+         """All-gather several L-row tensors into their first T rows (or ``padded_rows``
+-        when given for a tensor) in one grouped PyNCCL collective when available."""
++        when given for a tensor) via one-shot RoCE (packing small trailing tensors)
++        on the topologies of ``ROCE_GATHER_TOPOLOGIES``, else in one grouped PyNCCL
++        collective when available."""
+         inputs = []
+         for x in tensors:
+             x = materialize(x)
+@@ -231,13 +233,71 @@ class SPRows:
+                     f"SP gather expects {self.local_rows} rows, got {x.shape}"
+                 )
+             inputs.append(x)
++        if not inputs:
++            return ()
+         limits = padded_rows + (self.num_tokens,) * (len(inputs) - len(padded_rows))
+-        comm = (
+-            getattr(get_tp_group().device_communicator, "pynccl_comm", None)
+-            if model_parallel_is_initialized()
+-            else None
+-        )
+-        if comm is None or comm.disabled:
++        is_init = model_parallel_is_initialized()
++        roce_comm = _tp_roce_comm() if is_init else None
++        if (
++            roce_comm is not None
++            and _roce_gathers(roce_comm)
++            and all(_roce_should_all_gather(roce_comm, x) for x in inputs)
++        ):
++            outs: list[torch.Tensor | None] = [None] * len(inputs)
++            small_idxs = [
++                i
++                for i, x in enumerate(inputs)
++                if self.local_rows > 0
++                and 0 < (x.numel() // self.local_rows) * x.element_size() <= 512
++            ]
++            packed_views = None
++            packed_in = None
++            if len(small_idxs) >= 2:
++                views = [
++                    inputs[i].contiguous().view(self.local_rows, -1).view(torch.uint8)
++                    for i in small_idxs
++                ]
++                candidate_in = torch.cat(views, dim=1)
++                if _roce_should_all_gather(roce_comm, candidate_in):
++                    packed_views = views
++                    packed_in = candidate_in
++            packed_set = set(small_idxs) if packed_in is not None else set()
++            for i, (x, rows) in enumerate(zip(inputs, limits)):
++                if i not in packed_set:
++                    outs[i] = _roce_all_gather_one(
++                        roce_comm, x, self.padded_rows, rows
++                    )
++            if packed_in is not None and packed_views is not None:
++                packed_out = _roce_all_gather_one(
++                    roce_comm, packed_in, self.padded_rows, self.padded_rows
++                )
++                offset = 0
++                for i, view in zip(small_idxs, packed_views):
++                    width = view.shape[1]
++                    x = inputs[i]
++                    rows = limits[i]
++                    col = packed_out[:, offset : offset + width]
++                    offset += width
++                    if rows > self.padded_rows:
++                        buf = torch.empty(
++                            (rows, *x.shape[1:]), dtype=x.dtype, device=x.device
++                        )
++                        buf[: self.padded_rows].copy_(
++                            col.contiguous()
++                            .view(x.dtype)
++                            .view(self.padded_rows, *x.shape[1:])
++                        )
++                        outs[i] = buf
++                    else:
++                        outs[i] = (
++                            col[:rows]
++                            .contiguous()
++                            .view(x.dtype)
++                            .view(rows, *x.shape[1:])
++                        )
++            return tuple(outs)  # type: ignore[return-value]
++        comm = _tp_pynccl_comm() if is_init else None
++        if comm is None:
+             outs = []
+             for x, rows in zip(inputs, limits):
+                 gathered = tensor_model_parallel_all_gather(x, dim=0)
+@@ -328,17 +388,25 @@ class SPRows:
+         ``out[rank, lo : lo + real]`` without allocating a full-row intermediate or
+         copying the self-block. ``then()`` runs on the current stream after the last
+         projection, before the last exchange is awaited. Rows past this rank's real
+-        rows are not written."""
++        rows are not written.
++
++        Under the one-shot RoCE policy, one slice is one full-row projection,
++        ``then()`` and the TP group's row exchange (``exchange_rows``, one-shot RoCE
++        when the rows fit, else PyNCCL); two or more slices take the PyNCCL
++        pipeline above."""
+         local, world, tokens = self.local_rows, self.world_size, self.num_tokens
+         comm = _tp_pynccl_comm()
+-        if comm is None:
++        slices = max(slices, 1)
++        roce_rows = (
++            getattr(_tp_roce_comm(), "should_all_to_all_rows", None) is not None
++        )
++        if comm is None or (roce_rows and slices == 1):
+             local_kv = torch.empty((tokens, *row_shape), dtype=dtype, device=device)
+             if tokens:
+                 project(0, tokens, local_kv)
+             if then is not None:
+                 then()
+             return self.exchange_rows(local_kv)
+-        slices = max(slices, 1)
+         out = torch.empty((world, local, *row_shape), dtype=dtype, device=device)
+         send = torch.empty((world * local, *row_shape), dtype=dtype, device=device)
+         bounds = [local * i // slices for i in range(slices + 1)]
+@@ -542,18 +610,13 @@ class SPRows:
+ 
+         dev_comm = get_tp_group().device_communicator
+         comm = dev_comm.pynccl_comm
+-        roce_comm = getattr(dev_comm, "b12x_ar_comm", None)
+-        should_ex = getattr(roce_comm, "should_exchange", None)
+-        ex_into = getattr(roce_comm, "exchange_into", None)
++        roce_comm = _tp_roce_comm()
+         if (
+             isinstance(recv, torch.Tensor)
+             and roce_comm is not None
+-            and not roce_comm.disabled
+-            and should_ex is not None
+-            and ex_into is not None
+-            and should_ex(send)
++            and _roce_should_exchange(roce_comm, send, recv)
+         ):
+-            ex_into(send, recv)
++            roce_comm.exchange_into(send, recv)
+             return
+         exchange_into(comm, send, recv, self.rank, self.world_size)
+ 
+@@ -569,8 +632,9 @@ def wo_slices(num_tokens: int) -> int:
+ 
+ 
+ # The Engram projection's row exchange runs in two slices from this many tokens,
+-# so each slice's peer exchange runs under this rank's own block and the next slice.
+-ENGRAM_SLICE_TOKENS = 2048
++# so each slice's peer exchange runs under this rank's own block and the next slice
++# once the per-slice projection GEMM is large enough to amortize weight streaming.
++ENGRAM_SLICE_TOKENS = 6144
+ 
+ 
+ def engram_slices(num_tokens: int) -> int:
+@@ -644,18 +708,23 @@ def project_reduce_scatter_current(
+ _SIDE_STREAMS: dict = {}
+ 
+ 
+-def _tp_pynccl_comm():
+-    """The TP group's PyNCCL communicator when active, else None."""
++def _tp_roce_comm():
++    """The TP group's one-shot RoCE communicator when active, else None."""
+     try:
+         dev_comm = get_tp_group().device_communicator
+     except Exception:
+         return None
+     roce_comm = getattr(dev_comm, "b12x_ar_comm", None)
+-    if (
+-        roce_comm is not None
+-        and not getattr(roce_comm, "disabled", False)
+-        and getattr(roce_comm, "should_all_to_all_rows", None) is not None
+-    ):
++    if roce_comm is None or getattr(roce_comm, "disabled", False):
++        return None
++    return roce_comm
++
++
++def _tp_pynccl_comm():
++    """The TP group's PyNCCL communicator when active, else None."""
++    try:
++        dev_comm = get_tp_group().device_communicator
++    except Exception:
+         return None
+     comm = getattr(dev_comm, "pynccl_comm", None)
+     if comm is None or getattr(comm, "disabled", False):
+@@ -663,6 +732,54 @@ def _tp_pynccl_comm():
+     return comm
+ 
+ 
++# Sparknet topologies on which ``SPRows.gather_many`` takes the one-shot RoCE
++# all-gather. On ``direct`` (every peer one hop away: the three-node triangle and
++# the switched shapes) one grouped PyNCCL all-gather was faster at every size the
++# one-shot cap admits, so gather_many keeps it there.
++ROCE_GATHER_TOPOLOGIES = ("ring4",)
++
++
++def _roce_gathers(roce_comm) -> bool:
++    """Whether ``gather_many`` routes through ``roce_comm``'s one-shot all-gather."""
++    runtime = getattr(roce_comm, "_runtime", None)
++    return (
++        runtime is not None
++        and getattr(runtime, "topology", None) in ROCE_GATHER_TOPOLOGIES
++    )
++
++
++def _roce_should_all_gather(roce_comm, x: torch.Tensor) -> bool:
++    should_ag = getattr(roce_comm, "should_all_gather", None)
++    if should_ag is None:
++        return False
++    try:
++        return bool(should_ag(x, 0))
++    except TypeError:
++        return bool(should_ag(x))
++
++
++def _roce_all_gather_one(
++    roce_comm, inp: torch.Tensor, padded_rows: int, rows: int
++) -> torch.Tensor:
++    inp = inp.contiguous()
++    alloc_rows = max(padded_rows, rows)
++    out = torch.empty((alloc_rows, *inp.shape[1:]), dtype=inp.dtype, device=inp.device)
++    roce_comm._runtime.all_gather(inp, dim=0, out=out[:padded_rows])
++    return out[:rows]
++
++
++def _roce_should_exchange(
++    roce_comm, send: torch.Tensor, recv: torch.Tensor
++) -> bool:
++    should_ex = getattr(roce_comm, "should_exchange", None)
++    if should_ex is None or getattr(roce_comm, "exchange_into", None) is None:
++        return False
++    try:
++        return bool(should_ex(send, recv))
++    except TypeError:
++        return bool(should_ex(send))
++
++
+ def _side_stream(device: torch.device) -> torch.cuda.Stream:
+     """One stream per device for the reduce-scatters of sliced projections."""
+     if device not in _SIDE_STREAMS:
