@@ -17,6 +17,140 @@ fails step 2 by construction and needs its own correctness evidence against Deep
 reference; its speed is then judged on distinct prompts, because the bench's text changes
 with it ([lab.md](lab.md#release-comparison)).
 
+## Candidates
+
+A candidate is the latest release plus a selection of PRs. Several candidates are tested
+at once, one per testbed. Every PR that passes is carried into all later candidates, and a
+PR that misses goes to rework ([methodology](methodology.md#round-purpose-report-and-drop-rule)).
+Each round follows the steps below. Candidates 47-49 are the worked example
+([experiments/2026-10-26-spark-ds41f-candidate](../experiments/2026-10-26-spark-ds41f-candidate/README.md)).
+
+Owner rules for these rounds (2026-11-09):
+- Testing on the dgx and spaceport nodes needs no further approval, and neither does
+  merging the round's own PRs. The hold-file rules in AGENTS.md still apply.
+- Builds never run on the owner's laptop.
+- Every test result is kept.
+
+### Testbeds
+
+| Testbed | Nodes | Use |
+| --- | --- | --- |
+| `tp4-ring` | dgx1..dgx4 | Production, so a window takes it down: `scripts/lab_idle_start.sh 10 <log>` on dgx1 waits for 10 idle minutes first. Image builds and release tests run here. |
+| `tp4-switched` | sp1..sp4 (head sp1) | A candidate's gate and screen |
+| `tp3-switched` | sp5..sp7 (head sp5) | A candidate's gate and screen |
+| one GPU | sp8 | Each PR's own benchmark. Several jobs share the GPU through `flock /tmp/spark-lab-gpu.lock`. |
+
+- `tp3-triangle` (dgx1..dgx3) needs the dgx fabric re-cabled. The merged candidate qualifies there too.
+- Each spaceport head names its shape once (`bin/spark site shape <shape> --apply`, then `cluster sync`).
+- The release serves on each spaceport testbed, so a window has a profile to restore.
+
+### 1. Select
+
+- Fetch each open PR's head (`git fetch origin pull/<N>/head`).
+- Apply each PR's patches alone on the base tree. Then, for every pair that touches a common
+  file, apply one and check the other.
+- A candidate holds no conflicting pair. The candidates of one round overlap at most in test files.
+- The base is the release's series plus every PR that has passed so far.
+
+### 2. Assemble
+
+The folder is `experiments/2026-10-26-spark-ds41f-candidate/candidate-<N>/`.
+
+- `vllm/series`: the base series (relative paths), then each PR's patches copied from its
+  head and renumbered in application order. `receipts/selection.json` records each patch's
+  PR, head and SHA-256; `receipts/stack.log` records the stack.
+- **Cluster configurations:** one for every shape of `releases/<release>/cluster.json`, each
+  with its `-dev` file. Each extends the release recipe at its shape and sets only the image
+  `spark-ds41f:candidate-<N>`, its tree labels and the lock. They let anyone run the
+  candidate on their own setup; only the testbed's is measured.
+- `image-dgx4.json`: a build-only profile that extends a dgx shape.
+- **Controls for pure-Python PRs:** `<shape>-no<PR>.json` mounts the base's copies of the PR's
+  files from `no<PR>/overlay/` over the same image. Two conditions hold first: no other patch
+  in the candidate touches those files, and the PR's patch applies cleanly to the overlay
+  files (`git apply --check`).
+- `README.md`: the PRs, the testbed, the runs, and each PR's mark, declared before building.
+- **Specs:**
+  - `build.json` (sync, image, kernel), or `candidate-<shape>.json`, which adds the gate;
+  - `release-<shape>.json`.
+
+### 3. Lock and check (on a dgx node)
+
+Work in a checkout outside the deployment one (`~/spark-lab/agents/candidate-<N>/spark-ds41f`),
+at the pushed commit:
+
+```bash
+bin/spark --cluster-config <dir>/image-dgx4.json build prepare --only vllm --lock
+```
+
+- `--lock` writes `patch_head`, `expected_tree` and `patchset_sha256` into `source.json`. Copy
+  them into `upstreams.lock.json`, as 1107's lock carries them.
+- Run `scripts/release_tests.py check <prepared tree> <base revision> HEAD <dir>/release-tests.json`,
+  starting from the base release's classification, and classify every new or changed test
+  file. Then run `gate` and `bundle`.
+- Run `bin/spark doctor` on every configuration, the unit suite on Linux, and `git diff --check`.
+- Merge the folder to `main`. The lab opens a window only on a published commit.
+
+### 4. Build and release tests (dgx window)
+
+- **Build:** the `image` job builds each candidate on dgx4 and copies it along the ring.
+- **Release tests:** ONE `kernel` job runs every candidate's release-test bundle at once, each
+  on its own node. A bundle takes about 45-50 minutes.
+- **Spaceport copies:** dgx does not reach spaceport, so stream each spaceport candidate's
+  image to its testbed head:
+  ```bash
+  ssh dgx1 docker save spark-ds41f:candidate-<N> | ssh <head> docker load
+  ```
+  Then run `bin/spark --cluster-config <dir>/<shape>.json build distribute --apply` from the
+  head, and check that every node shows the same image ID.
+
+### 5. Gate first
+
+Each testbed runs its candidate's gate before anything else. A startup failure then costs
+one boot instead of a release run.
+
+### 6. Screen
+
+`release-<shape>.json` runs the release suite (`release-tp3` at TP3) with `single-stream`, on
+two candidate boots.
+- **Reference:** the base's recorded runs (`"reference": "release"`). Where no suite record
+  exists at that shape, boot the previous release as the middle arm, and keep its run as the
+  reference for later candidates.
+- **`sampled`:** add it only when a PR's mark depends on temperature > 0 or on drafting.
+
+### 7. Own marks
+
+- For every PR, re-run its own evidence (its README's commands) on the candidate image on sp8,
+  two boots each. Use the base image as the baseline where the PR compared against it.
+- Receipts go in `receipts/own-marks/pr-<N>/`, with a `result.json`.
+- One sub-agent per candidate does this.
+
+### 8. Verdicts, attribution and rework
+
+- **Correctness fix:** passes when its functional evidence passes and no core metric is worse.
+- **Performance change:** passes when it improves its own metric and no unrelated metric is
+  worse. A slower cell of its own bench, on a shape serving uses, counts as worse.
+- **Attribution:** when a core metric is worse in the release table, remove suspects one at a
+  time with `no<PR>` controls on the same image. Measure only the step that moved: a suite
+  file with that step alone, as in `candidate-48/grid-suite.json`.
+- **Rework:** a miss goes to a sub-agent. It writes to `receipts/rework/pr-<N>-r<K>/`: the
+  analysis, the corrected patch, the commands, the raw outputs and `result.json`. Then apply
+  the drop rule.
+- **Receipts:** keep every one, unfavourable runs included. `experiments/**/receipts/**` is
+  exempt from whitespace checks, so receipts stay byte-for-byte.
+
+### 9. Merge the winners
+
+- **The next candidate** is the base plus every PR that passed, including every reworked PR that meets its mark.
+- **Every shape:** it is qualified on every shape the release serves, `tp3-triangle` included.
+- **Every testing layer** of [testing.md](testing.md):
+  - the release tests;
+  - the determinism gate;
+  - cold boots;
+  - the full release set (`release`, `single-stream`, `sampled`);
+  - the quality evals the previous release recorded (LongBench v2, RULER, EvalPlus HumanEval, Vision Eval, tool-eval-bench, the 960K needle, a 1-hour AgentX run);
+  - the live functional checks of its fixes.
+- **Then promotion** (section 4).
+
 ## Arms
 
 Each build under test is an arm: a cluster configuration that extends the recipe. A release
@@ -112,9 +246,18 @@ python3 scripts/distinct_streams.py http://<head>:8000 --streams 16 --samples 4 
 
 Pass: `identical: true` with zero token and log-probability differences in every scenario
 (c8, staggered, mixed, cached, again, mixed15), and the four output hashes equal to the
-previous release's (since the 1017 checkpoint: `3eab5112` / `db25fde3` with log
-probabilities, `c9cf9dbe` / `c6bb4f4e` as text). The distinct-stream throughputs are a first
-look only; step 3 decides speed.
+previous release's at the same shape.
+
+- **Recorded hashes are out of date.** The 1017 checkpoint's hashes recorded here
+  (`3eab5112` / `db25fde3` with log probabilities, `c9cf9dbe` / `c6bb4f4e` as text) are no
+  longer current. Candidates 47 and 48 on spark-ds41f-1107, neither declaring an output
+  change, give `8e46794a` / `11ec073c` and `8b549cc4` / `12fd8257` at both tp4-ring and
+  tp4-switched.
+- **Missing hashes.** Where the previous release's hashes at a shape are not recorded, the
+  identity check is the release suite's model step: greedy responses identical (256/256)
+  against it.
+
+The distinct-stream throughputs are a first look only; step 3 decides speed.
 
 ## 3. Release comparison
 
