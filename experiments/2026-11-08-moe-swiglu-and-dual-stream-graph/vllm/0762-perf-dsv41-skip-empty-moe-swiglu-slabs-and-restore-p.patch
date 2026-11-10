@@ -1,30 +1,84 @@
-From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From c037e46a4904915daac5137bcdefe2c6be6d7ba7 Mon Sep 17 00:00:00 2001
 From: Christopher Owen <3221756+christopherowen@users.noreply.github.com>
 Date: Sun, 8 Nov 2026 21:00:00 +0100
-Subject: [PATCH] perf(dsv41): skip empty moe_swiglu_cast slabs and cascade
- 1-row PDL preloads
+Subject: [PATCH] perf(dsv41): optimize routed MoE dispatch scan, grouped GEMM
+ sync, and empty-slab SwiGLU skip
 
 Base: 1107 vLLM patch head 2756478b60b90700b9918b457aeb38657da637b5.
 
 Rationale:
-In vllm/models/deepseek_v4_1/tilelang/moe.py, moe_swiglu_cast unconditionally preloaded all rows_per_cta Order and Weights entries before pdl.chain(), and after pdl.chain() stepped through every row r in 0..rows_per_cta-1 inside an unrolled loop even when orders[0] < 0 (an empty slab, which represents 75% of active-tile CTAs in decode since active experts average 1.0-2.1 rows out of 16) or orders[1] < 0 (a 1-row tile, which represents 68%-100% of slab == 0 CTAs in decode).
-Preserve rows_per_cta = 4 if warps >= 4 else 2 (keeping TP3 at rows_per_cta = 2 as measured in experiments/2026-10-18-r6w-swiglu), cascade Order and Weights preloads before pdl.chain() so empty slabs only read orders[0] and 1-row tiles only read orders[0..1] and weights[0], exit empty slabs immediately after pdl.chain() via if expert >= 0 and orders[0] >= 0:, and guard rows 1..rows_per_cta-1 behind if rows_per_cta > 1 and orders[1] >= 0:.
+In vllm/models/deepseek_v4_1/tilelang/moe.py:
+1. _dispatch_macros.layout() previously computed the 512-thread per-expert padded route prefix sum via a 9-step Hillis-Steele shared-memory scan with 18 CTA-wide __syncthreads() barriers (25 total in fused moe_dispatch_v41). Replace the shared-memory scan with a two-level warp-shuffle prefix scan (__shfl_up_sync within each warp, a single shared-memory warp-total write and __syncthreads(), and an in-register warp-prefix scan via __shfl_up_sync + __shfl_sync), reducing CTA barriers in fused moe_dispatch_v41 from 25 to 7.
+2. Enable TL_DISABLE_THREAD_STORAGE_SYNC and TL_DISABLE_SAFE_MEMORY_ACCESS across grouped_fp8_fp4_gemm, moe_swiglu_cast, moe_dispatch_v41, and moe_combine_v41; remove redundant ptx_commit_group() / ptx_wait_group(stages - 1) in grouped_fp8_fp4_gemm (since cp_async_barrier_noinc(loaded[s]) already tracks each stage's cp.async transactions); use __syncwarp() instead of __syncthreads() after SFB_shared scale expansion when block_M == 16 and sfb_copies == 1 (1-warp decode CTAs); and unify non-gather metadata preload (TileExpert, Order, SFBase, Narrow) before pdl.wait() / pdl.chain() with early exit before pdl.wait() on empty CTAs.
+3. In moe_swiglu_cast, preserve rows_per_cta = 4 if warps >= 4 else 2, cascade Order and Weights preloads before pdl.chain() so empty slabs only read orders[0] and 1-row tiles only read orders[0..1] and weights[0], exit empty slabs immediately after pdl.chain() via if expert >= 0 and orders[0] >= 0:, and guard rows 1..rows_per_cta-1 behind if rows_per_cta > 1 and orders[1] >= 0:.
 
 Quality:
-Bit-identical (torch.equal, 0 uint16 diffs, max_abs_diff == 0.0) across all TP4 and TP3 shapes (M = 1..48), both standalone and end-to-end inside captured decode CUDA graphs.
+Bit-identical (0 uint16 diffs, identical SHA-256 digests) across all TP4 (I=576) and TP3 (I=768) decode batch sizes M in 1..48, both eager and inside captured CUDA graphs (chain and cold-L2 + _l2pf_ffn modes). Across 2 fresh container boots (24 interleaved paired windows per cell on 6 serving DeepseekV4DecoderLayers), 25/26 TP4 cells and 22/26 TP3 cells have faster paired medians (30/52 cells statistically significantly faster by 95% bootstrap CI, 0/52 slower), saving up to -2.55 us/layer (+1.20%) at M=1, -5.29 us/layer at M=28, and -15.30 us/layer at M=48.
+
+Tests:
+- pytest tests/kernels/moe/test_deepseek_v41_tilelang_moe.py tests/models/deepseek_v4_1/test_deepseek_v4_1_l2_schedule.py (139 passed across 2 fresh container boots).
+
+Upstream status: local DeepSeek-V4.1 TileLang MoE optimization for SM120/SM121.
 ---
- .../moe/test_deepseek_v41_tilelang_moe.py     |   8 +
- vllm/models/deepseek_v4_1/tilelang/moe.py     | 263 ++++++++++++------
- 2 files changed, 183 insertions(+), 88 deletions(-)
+ .../moe/test_deepseek_v41_tilelang_moe.py     |  54 ++-
+ vllm/models/deepseek_v4_1/tilelang/moe.py     | 345 ++++++++++++------
+ 2 files changed, 264 insertions(+), 135 deletions(-)
 
 diff --git a/tests/kernels/moe/test_deepseek_v41_tilelang_moe.py b/tests/kernels/moe/test_deepseek_v41_tilelang_moe.py
-index f4381b8de..7a0f4c4bc 100644
+index f4381b8de..56430d358 100644
 --- a/tests/kernels/moe/test_deepseek_v41_tilelang_moe.py
 +++ b/tests/kernels/moe/test_deepseek_v41_tilelang_moe.py
-@@ -926,6 +926,14 @@ def test_routed_moe_pdl_preloads_before_wait():
-     assert down_src.index("SFBase[") < wait_pos
-     assert down_src.index("Narrow[") < wait_pos
- 
+@@ -906,25 +906,41 @@ def test_routed_moe_pdl_preloads_before_wait():
+         wait_pos = d_src.index("cudaGridDependencySynchronize()")
+         topk_pos = d_src.index("TopkIdx[")
+         assert clear_pos < wait_pos < topk_pos
+-
+-    down_src = grouped_fp8_fp4_gemm(
+-        384,
+-        5120,
+-        576,
+-        6,
+-        False,
+-        16,
+-        128,
+-        num_stages=2,
+-        coded_scales=True,
+-        narrow_codes=True,
+-        trigger_after_loop=False,
+-    ).get_kernel_source()
+-    wait_pos = down_src.index("cudaGridDependencySynchronize()")
+-    assert down_src.index("TileExpert[") < wait_pos
+-    assert down_src.index("Order[") < wait_pos
+-    assert down_src.index("SFBase[") < wait_pos
+-    assert down_src.index("Narrow[") < wait_pos
++        if part == "fused":
++            assert "__shfl_up_sync" in d_src
++            assert "__shfl_sync" in d_src
++            assert d_src.count("__syncthreads()") == 7
++
++    for late in (False, True):
++        down_src = grouped_fp8_fp4_gemm(
++            384,
++            5120,
++            576,
++            6,
++            False,
++            16,
++            128,
++            num_stages=2,
++            coded_scales=True,
++            narrow_codes=True,
++            trigger_after_loop=late,
++        ).get_kernel_source()
++        wait_pos = down_src.index("cudaGridDependencySynchronize()")
++        assert down_src.index("TileExpert[") < wait_pos
++        assert down_src.index("Order[") < wait_pos
++        assert down_src.index("SFBase[") < wait_pos
++        assert down_src.index("Narrow[") < wait_pos
++        assert "__syncwarp()" in down_src
++        assert "cp_async_gs()" not in down_src
++        assert "cp_async_wait<" not in down_src
++
 +    swiglu_src = moe_swiglu_cast(768, 16, LIMIT).get_kernel_source()
 +    wait_pos = swiglu_src.index("cudaGridDependencySynchronize()")
 +    assert swiglu_src.index("TileExpert[") < wait_pos
@@ -32,15 +86,206 @@ index f4381b8de..7a0f4c4bc 100644
 +    assert swiglu_src.index("Weights[") < wait_pos
 +    assert "if ((0 <= expert) && (0 <= orders[0]))" in swiglu_src[wait_pos:]
 +    assert wait_pos < swiglu_src.index("*(uint4*)(H + ")
-+
+ 
      comb_src = moe_combine_v41(
          5120, 6, shared=True, weighted=True, out_dtype=T.bfloat16
-     ).get_kernel_source()
 diff --git a/vllm/models/deepseek_v4_1/tilelang/moe.py b/vllm/models/deepseek_v4_1/tilelang/moe.py
-index b12b53a35..dd632eadf 100644
+index b12b53a35..20ff9c868 100644
 --- a/vllm/models/deepseek_v4_1/tilelang/moe.py
 +++ b/vllm/models/deepseek_v4_1/tilelang/moe.py
-@@ -1213,6 +1213,99 @@ def moe_swiglu_cast(intermediate, block_M, limit, rows_per_cta=None):
+@@ -71,7 +71,7 @@ LATE_TRIGGER_ROWS = 16
+ 
+ def _dispatch_macros(num_experts, threads):
+     warps = threads // 32
+-    steps = threads.bit_length() - 1
++    warp_steps = (warps - 1).bit_length()
+     assert threads >= num_experts and threads & (threads - 1) == 0
+ 
+     @T.macro
+@@ -141,23 +141,37 @@ def _dispatch_macros(num_experts, threads):
+     ):
+         """From per-expert route counts: padded offsets, tile map and padding rows."""
+         padded = T.alloc_var(T.int32)
+-        carry = T.alloc_var(T.int32)
++        val = T.alloc_var(T.int32)
++        prior = T.alloc_var(T.int32)
++        w_val = T.alloc_var(T.int32)
++        warp_base = T.alloc_var(T.int32)
+         offset = T.alloc_var(T.int32)
+         used_tiles = T.alloc_var(T.int32)
++        lane = tx % 32
++        warp = tx // 32
+         padded = T.if_then_else(
+             tx < num_experts, T.ceildiv(count, block_M) * block_M, 0
+         )
+         # scan may share storage with buffers the caller read last.
+         T.sync_threads()
+-        scan[tx] = padded
++        val = padded
++        for s in T.unroll(5):
++            prior = T.shfl_up(val, 1 << s)
++            if lane >= (1 << s):
++                val += prior
++        if lane == 31:
++            scan[warp] = val
+         T.sync_threads()
+-        for s in T.serial(steps):
+-            carry = T.if_then_else(tx >= (1 << s), scan[T.max(tx - (1 << s), 0)], 0)
+-            T.sync_threads()
+-            scan[tx] += carry
+-            T.sync_threads()
+-        offset = scan[tx] - padded
+-        used_tiles = scan[threads - 1] // block_M
++        w_val = T.if_then_else(lane < warps, scan[T.min(lane, warps - 1)], 0)
++        for s in T.unroll(warp_steps):
++            prior = T.shfl_up(w_val, 1 << s)
++            if lane >= (1 << s):
++                w_val += prior
++        warp_base = T.if_then_else(
++            warp > 0, T.shfl_sync(w_val, T.max(warp - 1, 0)), 0
++        )
++        offset = warp_base + val - padded
++        used_tiles = T.shfl_sync(w_val, warps - 1) // block_M
+         if tx < num_experts:
+             ExpertCount[tx] = count
+             ExpertOffset[tx] = offset
+@@ -178,7 +192,10 @@ def _dispatch_macros(num_experts, threads):
+ 
+ 
+ @tilelang.jit(
+-    pass_configs={tilelang.PassConfigKey.TL_DISABLE_THREAD_STORAGE_SYNC: True}
++    pass_configs={
++        tilelang.PassConfigKey.TL_DISABLE_THREAD_STORAGE_SYNC: True,
++        tilelang.PassConfigKey.TL_DISABLE_SAFE_MEMORY_ACCESS: True,
++    }
+ )
+ def moe_dispatch_v41(
+     num_experts: int,
+@@ -356,6 +373,7 @@ def moe_dispatch_v41(
+     pass_configs={
+         tilelang.PassConfigKey.TL_DISABLE_WARP_SPECIALIZED: True,
+         tilelang.PassConfigKey.TL_DISABLE_THREAD_STORAGE_SYNC: True,
++        tilelang.PassConfigKey.TL_DISABLE_SAFE_MEMORY_ACCESS: True,
+     },
+ )
+ def moe_combine_v41(
+@@ -631,7 +649,13 @@ class MoeDispatchV41Plan:
+ FP4_TMA_K = 128
+ 
+ 
+-@tilelang.jit(pass_configs={tilelang.PassConfigKey.TL_DISABLE_WARP_SPECIALIZED: True})
++@tilelang.jit(
++    pass_configs={
++        tilelang.PassConfigKey.TL_DISABLE_WARP_SPECIALIZED: True,
++        tilelang.PassConfigKey.TL_DISABLE_THREAD_STORAGE_SYNC: True,
++        tilelang.PassConfigKey.TL_DISABLE_SAFE_MEMORY_ACCESS: True,
++    },
++)
+ def grouped_fp8_fp4_gemm(
+     num_experts: int,
+     N: int,
+@@ -814,10 +838,8 @@ def grouped_fp8_fp4_gemm(
+                         T.access_ptr(SFB[expert, bx * block_N + j, ko], "r", 1),
+                         1,
+                     )
+-        T.ptx_commit_group()
+         # The arrival waits for this thread's copies to land, so the wait on
+-        # loaded[s] publishes every thread's codes to the expand, which reads
+-        # rows other threads copied (ptx_wait_group covers only its own).
++        # loaded[s] publishes every thread's copies and codes across the CTA.
+         cp_async_barrier_noinc(loaded[s])
+ 
+     @T.macro
+@@ -825,7 +847,7 @@ def grouped_fp8_fp4_gemm(
+         with T.Kernel(T.ceildiv(N, block_N), tiles, threads=threads) as (bx, t):
+             if swizzle_panel > 0:
+                 T.use_swizzle(panel_size=swizzle_panel)
+-            if gather or trigger_after_loop:
++            if gather:
+                 if trigger_after_loop:
+                     pdl.wait()
+                 else:
+@@ -861,7 +883,7 @@ def grouped_fp8_fp4_gemm(
+             expert = TileExpert[t]
+             if (gather or trigger_after_loop) and expert < 0:
+                 T.thread_return()
+-            if not gather and not trigger_after_loop:
++            if not gather:
+                 if expert >= 0:
+                     if tx < block_M:
+                         route_reg = Order[t * block_M + tx]
+@@ -879,9 +901,12 @@ def grouped_fp8_fp4_gemm(
+                                 (code_base >> 1) * n_blocks
+                                 + bx * (2 - Narrow_flag)
+                             ) * k_blocks
+-                pdl.chain()
+-                if expert < 0:
+-                    T.thread_return()
++                if trigger_after_loop:
++                    pdl.wait()
++                else:
++                    pdl.chain()
++                    if expert < 0:
++                        T.thread_return()
+                 if tx < block_M:
+                     rows_shared[tx] = T.if_then_else(
+                         route_reg >= 0, t * block_M + tx, -1
+@@ -914,11 +939,13 @@ def grouped_fp8_fp4_gemm(
+                 loaded = T.alloc_barrier([threads] * stages)
+                 # Each thread copies the same rows at every K block.
+                 for c in T.unroll(a_copies):
++                    e = c * threads + tx
+                     a_row[c] = rows_shared[
+-                        T.min((c * threads + tx) // row_segments, block_M - 1)
++                        T.min(e // row_segments, block_M - 1)
+                     ]
+                 for c in T.unroll(sfa_copies):
+-                    sfa_row[c] = rows_shared[T.min(c * threads + tx, block_M - 1)]
++                    i = c * threads + tx
++                    sfa_row[c] = rows_shared[T.min(i, block_M - 1)]
+                 sf_dest = SFC_shared if coded_scales else SFB_shared
+ 
+                 T.clear(C_local)
+@@ -932,8 +959,6 @@ def grouped_fp8_fp4_gemm(
+                             load(A, SFA, B, BT, SFB, A_shared, B_shared, SFA_shared,
+                                  sf_dest, a_row, sfa_row, loaded, expert, bx, tx, p,
+                                  p, SFB, SFB_shared)  # fmt: skip
+-                    else:
+-                        T.ptx_commit_group()
+                 for ko in T.serial(k_blocks):
+                     # The stage loaded next was last read by iteration ko - 1.
+                     T.sync_threads()
+@@ -947,9 +972,6 @@ def grouped_fp8_fp4_gemm(
+                             load(A, SFA, B, BT, SFB, A_shared, B_shared, SFA_shared,
+                                  sf_dest, a_row, sfa_row, loaded, expert, bx, tx, nxt,
+                                  nxt % stages, SFB, SFB_shared)  # fmt: skip
+-                    else:
+-                        T.ptx_commit_group()
+-                    T.ptx_wait_group(stages - 1)
+                     T.barrier_wait(loaded[ko % stages], (ko // stages) % 2)
+                     s = ko % stages
+                     if coded_scales:
+@@ -985,7 +1007,10 @@ def grouped_fp8_fp4_gemm(
+                                         | ((code >> 8) & T.uint32(0xF)) << 16
+                                         | ((code >> 12) & T.uint32(0xF)) << 24
+                                     ) + base_words[c]
+-                    T.sync_threads()
++                        if block_M == 16 and sfb_copies == 1:
++                            T.sync_warp()
++                        else:
++                            T.sync_threads()
+                     if ko < k_full:
+                         T.mma_gemm_blockscaled(
+                             A_shared[s, :, :],
+@@ -1159,6 +1184,7 @@ def tile_expert_weights(b_packed, block_N):
+     pass_configs={
+         tilelang.PassConfigKey.TL_DISABLE_WARP_SPECIALIZED: True,
+         tilelang.PassConfigKey.TL_DISABLE_THREAD_STORAGE_SYNC: True,
++        tilelang.PassConfigKey.TL_DISABLE_SAFE_MEMORY_ACCESS: True,
+     },
+ )
+ def moe_swiglu_cast(intermediate, block_M, limit, rows_per_cta=None):
+@@ -1213,6 +1239,99 @@ def moe_swiglu_cast(intermediate, block_M, limit, rows_per_cta=None):
      tiles = T.dynamic("tiles")
      rows = tiles * block_M
  
@@ -140,7 +385,7 @@ index b12b53a35..dd632eadf 100644
      @T.prim_func
      def moe_swiglu_cast_kernel(
          H: T.Tensor((rows, 2 * intermediate), in_dtype),
-@@ -1235,99 +1328,93 @@ def moe_swiglu_cast(intermediate, block_M, limit, rows_per_cta=None):
+@@ -1235,99 +1354,93 @@ def moe_swiglu_cast(intermediate, block_M, limit, rows_per_cta=None):
              stored = T.alloc_local((vec,), T.float8_e4m3fn)
              amax = T.alloc_local((2,), T.float32)
              cert_min_l = T.alloc_local((2,), T.float32)
@@ -323,5 +568,5 @@ index b12b53a35..dd632eadf 100644
      return moe_swiglu_cast_kernel
  
 -- 
-2.54.0 (Apple Git-157)
+2.43.0
 
