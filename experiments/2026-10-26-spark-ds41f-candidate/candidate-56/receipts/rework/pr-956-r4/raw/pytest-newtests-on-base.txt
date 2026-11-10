@@ -1,0 +1,1797 @@
+FFFFFFFFFFFFFFFFFF                                                       [100%]
+=================================== FAILURES ===================================
+________________ test_sp_ratio2_projection_matches_full_rows[2] ________________
+
+monkeypatch = <_pytest.monkeypatch.MonkeyPatch object at 0xe34ad7ff5640>
+world_size = 2
+
+    @pytest.mark.parametrize("world_size", [2, 3, 4, 5, 6, 7, 8])
+    def test_sp_ratio2_projection_matches_full_rows(monkeypatch, world_size):
+        """The ratio-2 SP projection, bound as serving binds it, gives the sharded
+        projection's values and gates bit for bit: every rank's ``bf16_gemm_two`` on its
+        local rows, gathered, equals the ranks' ``project_parts`` of every row plus
+        ``gather_columns_into`` (the path without SP) and TP1's ``project_parts``. bind()
+        gathers the unpacked shards once and unpads each part into ``[wkv; wgate]``; the
+        decode projection keeps the rank's packed shard."""
+        if not torch.cuda.is_available() or torch.cuda.get_device_capability()[0] != 12:
+            pytest.skip("DeepSeek-V4.1 compression requires SM12x")
+        pytest.importorskip("tilelang")
+    
+        import vllm.models.deepseek_v4_1.compressor as comp_mod
+        import vllm.v1.worker.workspace as workspace
+        from vllm.model_executor import parameter
+        from vllm.model_executor.layers import linear
+        from vllm.models.deepseek_v4_1 import sp_prefill
+        from vllm.models.deepseek_v4_1.compressor import (
+            DeepseekCompressor,
+            _compressor_part_cols,
+        )
+        from vllm.models.deepseek_v4_1.tilelang.linear import (
+            project_parts,
+            unpack_bf16_layer,
+        )
+    
+        device = torch.device("cuda", torch.cuda.current_device())
+        monkeypatch.setattr(workspace, "_manager", workspace.WorkspaceManager(device))
+        monkeypatch.setattr(workspace, "dbo_current_ubatch_id", lambda: 0)
+        capacity, requests, hidden = 16384, 4, 5120
+        config = SimpleNamespace(
+            scheduler_config=SimpleNamespace(
+                max_num_batched_tokens=capacity, max_num_seqs=requests
+            ),
+            compilation_config=SimpleNamespace(static_forward_context={}),
+            parallel_config=SimpleNamespace(decode_context_parallel_size=1),
+            speculative_config=None,
+        )
+        gen = torch.Generator(device=device).manual_seed(9562 + world_size)
+        wkv = (torch.randn((512, hidden), generator=gen, device=device) * 0.02).bfloat16()
+        wgate = (torch.randn((512, hidden), generator=gen, device=device) * 0.02).bfloat16()
+    
+        def build_rank(tp_rank: int, tp_size: int) -> DeepseekCompressor:
+            for mod in (linear, parameter):
+                monkeypatch.setattr(mod, "get_tensor_model_parallel_rank", lambda: tp_rank)
+                monkeypatch.setattr(
+                    mod, "get_tensor_model_parallel_world_size", lambda: tp_size
+                )
+            comp = DeepseekCompressor(
+                config, 2, hidden, 512, prefix=f"sp2_r{tp_rank}_{tp_size}"
+            ).to(device)
+            param = comp.fused_wkv_wgate.weight
+            param.weight_loader(param, wkv, 0)
+            param.weight_loader(param, wgate, 1)
+            comp.fused_wkv_wgate.process_weights_after_loading()
+            comp.fused_wkv_wgate.quant_method.declare_layer_kernels(comp.fused_wkv_wgate)
+            return comp
+    
+        part_cols = _compressor_part_cols(world_size)
+        with torch.no_grad(), workspace.use_workspace_lane(0):
+            tp1 = build_rank(0, 1)
+            assert not tp1._sp_enabled
+            tp1._ensure_capacity_buffers(device, capacity, requests)
+            ranks = [build_rank(r, world_size) for r in range(world_size)]
+            for comp in ranks:
+>               assert comp._sp_enabled and comp.fused_wkv_wgate.tp_size == world_size
+E               assert (False)
+E                +  where False = DeepseekCompressor(\n  (fused_wkv_wgate): _PaddedSplitColumnParallelLinear(in_features=5120, output_features=512, bias=False, tp_size=2, gather_output=False)\n  (norm): Module()\n  (state_cache): CompressorStateCache()\n)._sp_enabled
+
+tests/models/test_deepseek_v4_1_compressor.py:736: AssertionError
+________________ test_sp_ratio2_projection_matches_full_rows[3] ________________
+
+monkeypatch = <_pytest.monkeypatch.MonkeyPatch object at 0xe34ad7d2cc20>
+world_size = 3
+
+    @pytest.mark.parametrize("world_size", [2, 3, 4, 5, 6, 7, 8])
+    def test_sp_ratio2_projection_matches_full_rows(monkeypatch, world_size):
+        """The ratio-2 SP projection, bound as serving binds it, gives the sharded
+        projection's values and gates bit for bit: every rank's ``bf16_gemm_two`` on its
+        local rows, gathered, equals the ranks' ``project_parts`` of every row plus
+        ``gather_columns_into`` (the path without SP) and TP1's ``project_parts``. bind()
+        gathers the unpacked shards once and unpads each part into ``[wkv; wgate]``; the
+        decode projection keeps the rank's packed shard."""
+        if not torch.cuda.is_available() or torch.cuda.get_device_capability()[0] != 12:
+            pytest.skip("DeepSeek-V4.1 compression requires SM12x")
+        pytest.importorskip("tilelang")
+    
+        import vllm.models.deepseek_v4_1.compressor as comp_mod
+        import vllm.v1.worker.workspace as workspace
+        from vllm.model_executor import parameter
+        from vllm.model_executor.layers import linear
+        from vllm.models.deepseek_v4_1 import sp_prefill
+        from vllm.models.deepseek_v4_1.compressor import (
+            DeepseekCompressor,
+            _compressor_part_cols,
+        )
+        from vllm.models.deepseek_v4_1.tilelang.linear import (
+            project_parts,
+            unpack_bf16_layer,
+        )
+    
+        device = torch.device("cuda", torch.cuda.current_device())
+        monkeypatch.setattr(workspace, "_manager", workspace.WorkspaceManager(device))
+        monkeypatch.setattr(workspace, "dbo_current_ubatch_id", lambda: 0)
+        capacity, requests, hidden = 16384, 4, 5120
+        config = SimpleNamespace(
+            scheduler_config=SimpleNamespace(
+                max_num_batched_tokens=capacity, max_num_seqs=requests
+            ),
+            compilation_config=SimpleNamespace(static_forward_context={}),
+            parallel_config=SimpleNamespace(decode_context_parallel_size=1),
+            speculative_config=None,
+        )
+        gen = torch.Generator(device=device).manual_seed(9562 + world_size)
+        wkv = (torch.randn((512, hidden), generator=gen, device=device) * 0.02).bfloat16()
+        wgate = (torch.randn((512, hidden), generator=gen, device=device) * 0.02).bfloat16()
+    
+        def build_rank(tp_rank: int, tp_size: int) -> DeepseekCompressor:
+            for mod in (linear, parameter):
+                monkeypatch.setattr(mod, "get_tensor_model_parallel_rank", lambda: tp_rank)
+                monkeypatch.setattr(
+                    mod, "get_tensor_model_parallel_world_size", lambda: tp_size
+                )
+            comp = DeepseekCompressor(
+                config, 2, hidden, 512, prefix=f"sp2_r{tp_rank}_{tp_size}"
+            ).to(device)
+            param = comp.fused_wkv_wgate.weight
+            param.weight_loader(param, wkv, 0)
+            param.weight_loader(param, wgate, 1)
+            comp.fused_wkv_wgate.process_weights_after_loading()
+            comp.fused_wkv_wgate.quant_method.declare_layer_kernels(comp.fused_wkv_wgate)
+            return comp
+    
+        part_cols = _compressor_part_cols(world_size)
+        with torch.no_grad(), workspace.use_workspace_lane(0):
+            tp1 = build_rank(0, 1)
+            assert not tp1._sp_enabled
+            tp1._ensure_capacity_buffers(device, capacity, requests)
+            ranks = [build_rank(r, world_size) for r in range(world_size)]
+            for comp in ranks:
+>               assert comp._sp_enabled and comp.fused_wkv_wgate.tp_size == world_size
+E               assert (False)
+E                +  where False = DeepseekCompressor(\n  (fused_wkv_wgate): _PaddedSplitColumnParallelLinear(in_features=5120, output_features=384, bias=False, tp_size=3, gather_output=False)\n  (norm): Module()\n  (state_cache): CompressorStateCache()\n)._sp_enabled
+
+tests/models/test_deepseek_v4_1_compressor.py:736: AssertionError
+________________ test_sp_ratio2_projection_matches_full_rows[4] ________________
+
+monkeypatch = <_pytest.monkeypatch.MonkeyPatch object at 0xe34ad7d17320>
+world_size = 4
+
+    @pytest.mark.parametrize("world_size", [2, 3, 4, 5, 6, 7, 8])
+    def test_sp_ratio2_projection_matches_full_rows(monkeypatch, world_size):
+        """The ratio-2 SP projection, bound as serving binds it, gives the sharded
+        projection's values and gates bit for bit: every rank's ``bf16_gemm_two`` on its
+        local rows, gathered, equals the ranks' ``project_parts`` of every row plus
+        ``gather_columns_into`` (the path without SP) and TP1's ``project_parts``. bind()
+        gathers the unpacked shards once and unpads each part into ``[wkv; wgate]``; the
+        decode projection keeps the rank's packed shard."""
+        if not torch.cuda.is_available() or torch.cuda.get_device_capability()[0] != 12:
+            pytest.skip("DeepSeek-V4.1 compression requires SM12x")
+        pytest.importorskip("tilelang")
+    
+        import vllm.models.deepseek_v4_1.compressor as comp_mod
+        import vllm.v1.worker.workspace as workspace
+        from vllm.model_executor import parameter
+        from vllm.model_executor.layers import linear
+        from vllm.models.deepseek_v4_1 import sp_prefill
+        from vllm.models.deepseek_v4_1.compressor import (
+            DeepseekCompressor,
+            _compressor_part_cols,
+        )
+        from vllm.models.deepseek_v4_1.tilelang.linear import (
+            project_parts,
+            unpack_bf16_layer,
+        )
+    
+        device = torch.device("cuda", torch.cuda.current_device())
+        monkeypatch.setattr(workspace, "_manager", workspace.WorkspaceManager(device))
+        monkeypatch.setattr(workspace, "dbo_current_ubatch_id", lambda: 0)
+        capacity, requests, hidden = 16384, 4, 5120
+        config = SimpleNamespace(
+            scheduler_config=SimpleNamespace(
+                max_num_batched_tokens=capacity, max_num_seqs=requests
+            ),
+            compilation_config=SimpleNamespace(static_forward_context={}),
+            parallel_config=SimpleNamespace(decode_context_parallel_size=1),
+            speculative_config=None,
+        )
+        gen = torch.Generator(device=device).manual_seed(9562 + world_size)
+        wkv = (torch.randn((512, hidden), generator=gen, device=device) * 0.02).bfloat16()
+        wgate = (torch.randn((512, hidden), generator=gen, device=device) * 0.02).bfloat16()
+    
+        def build_rank(tp_rank: int, tp_size: int) -> DeepseekCompressor:
+            for mod in (linear, parameter):
+                monkeypatch.setattr(mod, "get_tensor_model_parallel_rank", lambda: tp_rank)
+                monkeypatch.setattr(
+                    mod, "get_tensor_model_parallel_world_size", lambda: tp_size
+                )
+            comp = DeepseekCompressor(
+                config, 2, hidden, 512, prefix=f"sp2_r{tp_rank}_{tp_size}"
+            ).to(device)
+            param = comp.fused_wkv_wgate.weight
+            param.weight_loader(param, wkv, 0)
+            param.weight_loader(param, wgate, 1)
+            comp.fused_wkv_wgate.process_weights_after_loading()
+            comp.fused_wkv_wgate.quant_method.declare_layer_kernels(comp.fused_wkv_wgate)
+            return comp
+    
+        part_cols = _compressor_part_cols(world_size)
+        with torch.no_grad(), workspace.use_workspace_lane(0):
+            tp1 = build_rank(0, 1)
+            assert not tp1._sp_enabled
+            tp1._ensure_capacity_buffers(device, capacity, requests)
+            ranks = [build_rank(r, world_size) for r in range(world_size)]
+            for comp in ranks:
+>               assert comp._sp_enabled and comp.fused_wkv_wgate.tp_size == world_size
+E               assert (False)
+E                +  where False = DeepseekCompressor(\n  (fused_wkv_wgate): _PaddedSplitColumnParallelLinear(in_features=5120, output_features=256, bias=False, tp_size=4, gather_output=False)\n  (norm): Module()\n  (state_cache): CompressorStateCache()\n)._sp_enabled
+
+tests/models/test_deepseek_v4_1_compressor.py:736: AssertionError
+________________ test_sp_ratio2_projection_matches_full_rows[5] ________________
+
+monkeypatch = <_pytest.monkeypatch.MonkeyPatch object at 0xe34ad7ef1eb0>
+world_size = 5
+
+    @pytest.mark.parametrize("world_size", [2, 3, 4, 5, 6, 7, 8])
+    def test_sp_ratio2_projection_matches_full_rows(monkeypatch, world_size):
+        """The ratio-2 SP projection, bound as serving binds it, gives the sharded
+        projection's values and gates bit for bit: every rank's ``bf16_gemm_two`` on its
+        local rows, gathered, equals the ranks' ``project_parts`` of every row plus
+        ``gather_columns_into`` (the path without SP) and TP1's ``project_parts``. bind()
+        gathers the unpacked shards once and unpads each part into ``[wkv; wgate]``; the
+        decode projection keeps the rank's packed shard."""
+        if not torch.cuda.is_available() or torch.cuda.get_device_capability()[0] != 12:
+            pytest.skip("DeepSeek-V4.1 compression requires SM12x")
+        pytest.importorskip("tilelang")
+    
+        import vllm.models.deepseek_v4_1.compressor as comp_mod
+        import vllm.v1.worker.workspace as workspace
+        from vllm.model_executor import parameter
+        from vllm.model_executor.layers import linear
+        from vllm.models.deepseek_v4_1 import sp_prefill
+        from vllm.models.deepseek_v4_1.compressor import (
+            DeepseekCompressor,
+            _compressor_part_cols,
+        )
+        from vllm.models.deepseek_v4_1.tilelang.linear import (
+            project_parts,
+            unpack_bf16_layer,
+        )
+    
+        device = torch.device("cuda", torch.cuda.current_device())
+        monkeypatch.setattr(workspace, "_manager", workspace.WorkspaceManager(device))
+        monkeypatch.setattr(workspace, "dbo_current_ubatch_id", lambda: 0)
+        capacity, requests, hidden = 16384, 4, 5120
+        config = SimpleNamespace(
+            scheduler_config=SimpleNamespace(
+                max_num_batched_tokens=capacity, max_num_seqs=requests
+            ),
+            compilation_config=SimpleNamespace(static_forward_context={}),
+            parallel_config=SimpleNamespace(decode_context_parallel_size=1),
+            speculative_config=None,
+        )
+        gen = torch.Generator(device=device).manual_seed(9562 + world_size)
+        wkv = (torch.randn((512, hidden), generator=gen, device=device) * 0.02).bfloat16()
+        wgate = (torch.randn((512, hidden), generator=gen, device=device) * 0.02).bfloat16()
+    
+        def build_rank(tp_rank: int, tp_size: int) -> DeepseekCompressor:
+            for mod in (linear, parameter):
+                monkeypatch.setattr(mod, "get_tensor_model_parallel_rank", lambda: tp_rank)
+                monkeypatch.setattr(
+                    mod, "get_tensor_model_parallel_world_size", lambda: tp_size
+                )
+            comp = DeepseekCompressor(
+                config, 2, hidden, 512, prefix=f"sp2_r{tp_rank}_{tp_size}"
+            ).to(device)
+            param = comp.fused_wkv_wgate.weight
+            param.weight_loader(param, wkv, 0)
+            param.weight_loader(param, wgate, 1)
+            comp.fused_wkv_wgate.process_weights_after_loading()
+            comp.fused_wkv_wgate.quant_method.declare_layer_kernels(comp.fused_wkv_wgate)
+            return comp
+    
+        part_cols = _compressor_part_cols(world_size)
+        with torch.no_grad(), workspace.use_workspace_lane(0):
+            tp1 = build_rank(0, 1)
+            assert not tp1._sp_enabled
+            tp1._ensure_capacity_buffers(device, capacity, requests)
+            ranks = [build_rank(r, world_size) for r in range(world_size)]
+            for comp in ranks:
+>               assert comp._sp_enabled and comp.fused_wkv_wgate.tp_size == world_size
+E               assert (False)
+E                +  where False = DeepseekCompressor(\n  (fused_wkv_wgate): _PaddedSplitColumnParallelLinear(in_features=5120, output_features=256, bias=False, tp_size=5, gather_output=False)\n  (norm): Module()\n  (state_cache): CompressorStateCache()\n)._sp_enabled
+
+tests/models/test_deepseek_v4_1_compressor.py:736: AssertionError
+________________ test_sp_ratio2_projection_matches_full_rows[6] ________________
+
+monkeypatch = <_pytest.monkeypatch.MonkeyPatch object at 0xe34ad7ec8d40>
+world_size = 6
+
+    @pytest.mark.parametrize("world_size", [2, 3, 4, 5, 6, 7, 8])
+    def test_sp_ratio2_projection_matches_full_rows(monkeypatch, world_size):
+        """The ratio-2 SP projection, bound as serving binds it, gives the sharded
+        projection's values and gates bit for bit: every rank's ``bf16_gemm_two`` on its
+        local rows, gathered, equals the ranks' ``project_parts`` of every row plus
+        ``gather_columns_into`` (the path without SP) and TP1's ``project_parts``. bind()
+        gathers the unpacked shards once and unpads each part into ``[wkv; wgate]``; the
+        decode projection keeps the rank's packed shard."""
+        if not torch.cuda.is_available() or torch.cuda.get_device_capability()[0] != 12:
+            pytest.skip("DeepSeek-V4.1 compression requires SM12x")
+        pytest.importorskip("tilelang")
+    
+        import vllm.models.deepseek_v4_1.compressor as comp_mod
+        import vllm.v1.worker.workspace as workspace
+        from vllm.model_executor import parameter
+        from vllm.model_executor.layers import linear
+        from vllm.models.deepseek_v4_1 import sp_prefill
+        from vllm.models.deepseek_v4_1.compressor import (
+            DeepseekCompressor,
+            _compressor_part_cols,
+        )
+        from vllm.models.deepseek_v4_1.tilelang.linear import (
+            project_parts,
+            unpack_bf16_layer,
+        )
+    
+        device = torch.device("cuda", torch.cuda.current_device())
+        monkeypatch.setattr(workspace, "_manager", workspace.WorkspaceManager(device))
+        monkeypatch.setattr(workspace, "dbo_current_ubatch_id", lambda: 0)
+        capacity, requests, hidden = 16384, 4, 5120
+        config = SimpleNamespace(
+            scheduler_config=SimpleNamespace(
+                max_num_batched_tokens=capacity, max_num_seqs=requests
+            ),
+            compilation_config=SimpleNamespace(static_forward_context={}),
+            parallel_config=SimpleNamespace(decode_context_parallel_size=1),
+            speculative_config=None,
+        )
+        gen = torch.Generator(device=device).manual_seed(9562 + world_size)
+        wkv = (torch.randn((512, hidden), generator=gen, device=device) * 0.02).bfloat16()
+        wgate = (torch.randn((512, hidden), generator=gen, device=device) * 0.02).bfloat16()
+    
+        def build_rank(tp_rank: int, tp_size: int) -> DeepseekCompressor:
+            for mod in (linear, parameter):
+                monkeypatch.setattr(mod, "get_tensor_model_parallel_rank", lambda: tp_rank)
+                monkeypatch.setattr(
+                    mod, "get_tensor_model_parallel_world_size", lambda: tp_size
+                )
+            comp = DeepseekCompressor(
+                config, 2, hidden, 512, prefix=f"sp2_r{tp_rank}_{tp_size}"
+            ).to(device)
+            param = comp.fused_wkv_wgate.weight
+            param.weight_loader(param, wkv, 0)
+            param.weight_loader(param, wgate, 1)
+            comp.fused_wkv_wgate.process_weights_after_loading()
+            comp.fused_wkv_wgate.quant_method.declare_layer_kernels(comp.fused_wkv_wgate)
+            return comp
+    
+        part_cols = _compressor_part_cols(world_size)
+        with torch.no_grad(), workspace.use_workspace_lane(0):
+            tp1 = build_rank(0, 1)
+            assert not tp1._sp_enabled
+            tp1._ensure_capacity_buffers(device, capacity, requests)
+            ranks = [build_rank(r, world_size) for r in range(world_size)]
+            for comp in ranks:
+>               assert comp._sp_enabled and comp.fused_wkv_wgate.tp_size == world_size
+E               assert (False)
+E                +  where False = DeepseekCompressor(\n  (fused_wkv_wgate): _PaddedSplitColumnParallelLinear(in_features=5120, output_features=256, bias=False, tp_size=6, gather_output=False)\n  (norm): Module()\n  (state_cache): CompressorStateCache()\n)._sp_enabled
+
+tests/models/test_deepseek_v4_1_compressor.py:736: AssertionError
+________________ test_sp_ratio2_projection_matches_full_rows[7] ________________
+
+monkeypatch = <_pytest.monkeypatch.MonkeyPatch object at 0xe34ad7ec86e0>
+world_size = 7
+
+    @pytest.mark.parametrize("world_size", [2, 3, 4, 5, 6, 7, 8])
+    def test_sp_ratio2_projection_matches_full_rows(monkeypatch, world_size):
+        """The ratio-2 SP projection, bound as serving binds it, gives the sharded
+        projection's values and gates bit for bit: every rank's ``bf16_gemm_two`` on its
+        local rows, gathered, equals the ranks' ``project_parts`` of every row plus
+        ``gather_columns_into`` (the path without SP) and TP1's ``project_parts``. bind()
+        gathers the unpacked shards once and unpads each part into ``[wkv; wgate]``; the
+        decode projection keeps the rank's packed shard."""
+        if not torch.cuda.is_available() or torch.cuda.get_device_capability()[0] != 12:
+            pytest.skip("DeepSeek-V4.1 compression requires SM12x")
+        pytest.importorskip("tilelang")
+    
+        import vllm.models.deepseek_v4_1.compressor as comp_mod
+        import vllm.v1.worker.workspace as workspace
+        from vllm.model_executor import parameter
+        from vllm.model_executor.layers import linear
+        from vllm.models.deepseek_v4_1 import sp_prefill
+        from vllm.models.deepseek_v4_1.compressor import (
+            DeepseekCompressor,
+            _compressor_part_cols,
+        )
+        from vllm.models.deepseek_v4_1.tilelang.linear import (
+            project_parts,
+            unpack_bf16_layer,
+        )
+    
+        device = torch.device("cuda", torch.cuda.current_device())
+        monkeypatch.setattr(workspace, "_manager", workspace.WorkspaceManager(device))
+        monkeypatch.setattr(workspace, "dbo_current_ubatch_id", lambda: 0)
+        capacity, requests, hidden = 16384, 4, 5120
+        config = SimpleNamespace(
+            scheduler_config=SimpleNamespace(
+                max_num_batched_tokens=capacity, max_num_seqs=requests
+            ),
+            compilation_config=SimpleNamespace(static_forward_context={}),
+            parallel_config=SimpleNamespace(decode_context_parallel_size=1),
+            speculative_config=None,
+        )
+        gen = torch.Generator(device=device).manual_seed(9562 + world_size)
+        wkv = (torch.randn((512, hidden), generator=gen, device=device) * 0.02).bfloat16()
+        wgate = (torch.randn((512, hidden), generator=gen, device=device) * 0.02).bfloat16()
+    
+        def build_rank(tp_rank: int, tp_size: int) -> DeepseekCompressor:
+            for mod in (linear, parameter):
+                monkeypatch.setattr(mod, "get_tensor_model_parallel_rank", lambda: tp_rank)
+                monkeypatch.setattr(
+                    mod, "get_tensor_model_parallel_world_size", lambda: tp_size
+                )
+            comp = DeepseekCompressor(
+                config, 2, hidden, 512, prefix=f"sp2_r{tp_rank}_{tp_size}"
+            ).to(device)
+            param = comp.fused_wkv_wgate.weight
+            param.weight_loader(param, wkv, 0)
+            param.weight_loader(param, wgate, 1)
+            comp.fused_wkv_wgate.process_weights_after_loading()
+            comp.fused_wkv_wgate.quant_method.declare_layer_kernels(comp.fused_wkv_wgate)
+            return comp
+    
+        part_cols = _compressor_part_cols(world_size)
+        with torch.no_grad(), workspace.use_workspace_lane(0):
+            tp1 = build_rank(0, 1)
+            assert not tp1._sp_enabled
+            tp1._ensure_capacity_buffers(device, capacity, requests)
+            ranks = [build_rank(r, world_size) for r in range(world_size)]
+            for comp in ranks:
+>               assert comp._sp_enabled and comp.fused_wkv_wgate.tp_size == world_size
+E               assert (False)
+E                +  where False = DeepseekCompressor(\n  (fused_wkv_wgate): _PaddedSplitColumnParallelLinear(in_features=5120, output_features=256, bias=False, tp_size=7, gather_output=False)\n  (norm): Module()\n  (state_cache): CompressorStateCache()\n)._sp_enabled
+
+tests/models/test_deepseek_v4_1_compressor.py:736: AssertionError
+________________ test_sp_ratio2_projection_matches_full_rows[8] ________________
+
+monkeypatch = <_pytest.monkeypatch.MonkeyPatch object at 0xe34ad7d2d760>
+world_size = 8
+
+    @pytest.mark.parametrize("world_size", [2, 3, 4, 5, 6, 7, 8])
+    def test_sp_ratio2_projection_matches_full_rows(monkeypatch, world_size):
+        """The ratio-2 SP projection, bound as serving binds it, gives the sharded
+        projection's values and gates bit for bit: every rank's ``bf16_gemm_two`` on its
+        local rows, gathered, equals the ranks' ``project_parts`` of every row plus
+        ``gather_columns_into`` (the path without SP) and TP1's ``project_parts``. bind()
+        gathers the unpacked shards once and unpads each part into ``[wkv; wgate]``; the
+        decode projection keeps the rank's packed shard."""
+        if not torch.cuda.is_available() or torch.cuda.get_device_capability()[0] != 12:
+            pytest.skip("DeepSeek-V4.1 compression requires SM12x")
+        pytest.importorskip("tilelang")
+    
+        import vllm.models.deepseek_v4_1.compressor as comp_mod
+        import vllm.v1.worker.workspace as workspace
+        from vllm.model_executor import parameter
+        from vllm.model_executor.layers import linear
+        from vllm.models.deepseek_v4_1 import sp_prefill
+        from vllm.models.deepseek_v4_1.compressor import (
+            DeepseekCompressor,
+            _compressor_part_cols,
+        )
+        from vllm.models.deepseek_v4_1.tilelang.linear import (
+            project_parts,
+            unpack_bf16_layer,
+        )
+    
+        device = torch.device("cuda", torch.cuda.current_device())
+        monkeypatch.setattr(workspace, "_manager", workspace.WorkspaceManager(device))
+        monkeypatch.setattr(workspace, "dbo_current_ubatch_id", lambda: 0)
+        capacity, requests, hidden = 16384, 4, 5120
+        config = SimpleNamespace(
+            scheduler_config=SimpleNamespace(
+                max_num_batched_tokens=capacity, max_num_seqs=requests
+            ),
+            compilation_config=SimpleNamespace(static_forward_context={}),
+            parallel_config=SimpleNamespace(decode_context_parallel_size=1),
+            speculative_config=None,
+        )
+        gen = torch.Generator(device=device).manual_seed(9562 + world_size)
+        wkv = (torch.randn((512, hidden), generator=gen, device=device) * 0.02).bfloat16()
+        wgate = (torch.randn((512, hidden), generator=gen, device=device) * 0.02).bfloat16()
+    
+        def build_rank(tp_rank: int, tp_size: int) -> DeepseekCompressor:
+            for mod in (linear, parameter):
+                monkeypatch.setattr(mod, "get_tensor_model_parallel_rank", lambda: tp_rank)
+                monkeypatch.setattr(
+                    mod, "get_tensor_model_parallel_world_size", lambda: tp_size
+                )
+            comp = DeepseekCompressor(
+                config, 2, hidden, 512, prefix=f"sp2_r{tp_rank}_{tp_size}"
+            ).to(device)
+            param = comp.fused_wkv_wgate.weight
+            param.weight_loader(param, wkv, 0)
+            param.weight_loader(param, wgate, 1)
+            comp.fused_wkv_wgate.process_weights_after_loading()
+            comp.fused_wkv_wgate.quant_method.declare_layer_kernels(comp.fused_wkv_wgate)
+            return comp
+    
+        part_cols = _compressor_part_cols(world_size)
+        with torch.no_grad(), workspace.use_workspace_lane(0):
+            tp1 = build_rank(0, 1)
+            assert not tp1._sp_enabled
+            tp1._ensure_capacity_buffers(device, capacity, requests)
+            ranks = [build_rank(r, world_size) for r in range(world_size)]
+            for comp in ranks:
+>               assert comp._sp_enabled and comp.fused_wkv_wgate.tp_size == world_size
+E               assert (False)
+E                +  where False = DeepseekCompressor(\n  (fused_wkv_wgate): _PaddedSplitColumnParallelLinear(in_features=5120, output_features=128, bias=False, tp_size=8, gather_output=False)\n  (norm): Module()\n  (state_cache): CompressorStateCache()\n)._sp_enabled
+
+tests/models/test_deepseek_v4_1_compressor.py:736: AssertionError
+_ test_sp_ratio2_compressor_projects_local_rows_and_gathers_values_and_gates[5-3] _
+
+monkeypatch = <_pytest.monkeypatch.MonkeyPatch object at 0xe34ad7ff1250>
+world_size = 3, tokens = 5
+
+    @pytest.mark.parametrize("world_size", [3, 4])
+    @pytest.mark.parametrize("tokens", [5, 13, 31, 32, 33])
+    def test_sp_ratio2_compressor_projects_local_rows_and_gathers_values_and_gates(
+        monkeypatch, world_size, tokens
+    ):
+        from tests.models.test_deepseek_v4_1_sp_prefill import _World
+        from vllm.models.deepseek_v4_1 import sp_prefill
+    
+        world = _World(world_size)
+        monkeypatch.setattr(
+            sp_prefill, "tensor_model_parallel_all_gather", world.all_gather
+        )
+        full_input = torch.arange(tokens * 32, dtype=torch.float32).reshape(tokens, 32)
+        expected_values = full_input[:, :1].expand(tokens, 512) * 0.5
+        expected_gates = full_input[:, 1:2].expand(tokens, 512) * 0.25
+        metadata = object()
+        state_meta = object()
+    
+        def run(rank):
+            sp = sp_prefill.SPRows(tokens, world_size, rank)
+            compressor = _compressor(2)
+            compressor.fused_wkv_wgate.tp_size = world_size
+            compressor.state_cache = SimpleNamespace(prefix="state")
+            compressor._values = torch.empty(tokens + world_size, 512, dtype=torch.float32)
+            compressor._gates = torch.empty(tokens + world_size, 512, dtype=torch.float32)
+            compressor._latent = torch.empty(tokens + world_size, 512, dtype=torch.bfloat16)
+            compressor._slots = torch.empty(tokens + world_size, dtype=torch.int64)
+            compressor._sp_weight = object()
+            seen = []
+    
+            def project_two(inputs, weight, out_values, out_gates):
+                assert inputs.shape[0] == sp.local_rows and weight is compressor._sp_weight
+                assert out_values.shape == (sp.local_rows, 512)
+                assert out_gates.shape == (sp.local_rows, 512)
+                out_values.copy_(inputs[:, :1].expand(sp.local_rows, 512) * 0.5)
+                out_gates.copy_(inputs[:, 1:2].expand(sp.local_rows, 512) * 0.25)
+    
+            def normalize(rows, main, state, *, values, gates, **kwargs):
+                assert rows == tokens and main is metadata and state is state_meta
+                assert values.shape == (tokens, 512) and gates.shape == (tokens, 512)
+                assert torch.equal(values, expected_values)
+                assert torch.equal(gates, expected_gates)
+                seen.append((values.shape, gates.shape))
+                compressor._latent[:rows].copy_(values.to(torch.bfloat16))
+                compressor._slots[:rows].copy_(torch.arange(rows))
+    
+            compressor._sp_kernel = project_two
+            compressor._forward_tilelang = normalize
+            output, slots = compressor.forward(
+                sp.local_slice(full_input),
+                metadata,
+                state_metadata=state_meta,
+                sp_rows=sp,
+            )
+            assert seen == [((tokens, 512), (tokens, 512))]
+            assert torch.equal(output, expected_values.to(torch.bfloat16))
+            assert torch.equal(slots, torch.arange(tokens))
+            return output.clone()
+    
+>       assert len(world.run(run)) == world_size
+                   ^^^^^^^^^^^^^^
+
+tests/models/test_deepseek_v4_1_compressor_prepare.py:384: 
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
+tests/models/test_deepseek_v4_1_sp_prefill.py:776: in run
+    return [future.result() for future in futures]
+            ^^^^^^^^^^^^^^^
+/usr/lib/python3.12/concurrent/futures/_base.py:449: in result
+    return self.__get_result()
+           ^^^^^^^^^^^^^^^^^^^
+/usr/lib/python3.12/concurrent/futures/_base.py:401: in __get_result
+    raise self._exception
+/usr/lib/python3.12/concurrent/futures/thread.py:58: in run
+    result = self.fn(*self.args, **self.kwargs)
+             ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+tests/models/test_deepseek_v4_1_sp_prefill.py:772: in rank_main
+    return fn(rank)
+           ^^^^^^^^
+tests/models/test_deepseek_v4_1_compressor_prepare.py:373: in run
+    output, slots = compressor.forward(
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
+
+self = DeepseekCompressor()
+hidden_states = tensor([[ 0.,  1.,  2.,  3.,  4.,  5.,  6.,  7.,  8.,  9., 10., 11., 12., 13.,
+         14., 15., 16., 17., 18., 19., ...44., 45.,
+         46., 47., 48., 49., 50., 51., 52., 53., 54., 55., 56., 57., 58., 59.,
+         60., 61., 62., 63.]])
+metadata = <object object at 0xe34d16db9e20>
+state_metadata = <object object at 0xe34d16db9ee0>, kv_cache = None
+token_positions = None, cos_sin = None, kv_page_size = None
+sp_rows = SPRows(num_tokens=5, world_size=3, rank=0, unreduced=False)
+
+    def forward(
+        self,
+        hidden_states,
+        metadata,
+        state_metadata=None,
+        *,
+        kv_cache=None,
+        token_positions=None,
+        cos_sin=None,
+        kv_page_size=None,
+        sp_rows=None,
+    ):
+        rows = hidden_states.shape[0]
+        if self._values is None:
+            raise RuntimeError("compressor kernels must be bound before forwarding")
+        values = None
+        if sp_rows is not None:
+            if self.compress_ratio != 1 or self._sp_kernel is None:
+>               raise RuntimeError(
+                    "ratio-one SP projection must be bound before forwarding"
+                )
+E               RuntimeError: ratio-one SP projection must be bound before forwarding
+
+vllm/models/deepseek_v4_1/compressor.py:507: RuntimeError
+_ test_sp_ratio2_compressor_projects_local_rows_and_gathers_values_and_gates[5-4] _
+
+monkeypatch = <_pytest.monkeypatch.MonkeyPatch object at 0xe34e6d358e90>
+world_size = 4, tokens = 5
+
+    @pytest.mark.parametrize("world_size", [3, 4])
+    @pytest.mark.parametrize("tokens", [5, 13, 31, 32, 33])
+    def test_sp_ratio2_compressor_projects_local_rows_and_gathers_values_and_gates(
+        monkeypatch, world_size, tokens
+    ):
+        from tests.models.test_deepseek_v4_1_sp_prefill import _World
+        from vllm.models.deepseek_v4_1 import sp_prefill
+    
+        world = _World(world_size)
+        monkeypatch.setattr(
+            sp_prefill, "tensor_model_parallel_all_gather", world.all_gather
+        )
+        full_input = torch.arange(tokens * 32, dtype=torch.float32).reshape(tokens, 32)
+        expected_values = full_input[:, :1].expand(tokens, 512) * 0.5
+        expected_gates = full_input[:, 1:2].expand(tokens, 512) * 0.25
+        metadata = object()
+        state_meta = object()
+    
+        def run(rank):
+            sp = sp_prefill.SPRows(tokens, world_size, rank)
+            compressor = _compressor(2)
+            compressor.fused_wkv_wgate.tp_size = world_size
+            compressor.state_cache = SimpleNamespace(prefix="state")
+            compressor._values = torch.empty(tokens + world_size, 512, dtype=torch.float32)
+            compressor._gates = torch.empty(tokens + world_size, 512, dtype=torch.float32)
+            compressor._latent = torch.empty(tokens + world_size, 512, dtype=torch.bfloat16)
+            compressor._slots = torch.empty(tokens + world_size, dtype=torch.int64)
+            compressor._sp_weight = object()
+            seen = []
+    
+            def project_two(inputs, weight, out_values, out_gates):
+                assert inputs.shape[0] == sp.local_rows and weight is compressor._sp_weight
+                assert out_values.shape == (sp.local_rows, 512)
+                assert out_gates.shape == (sp.local_rows, 512)
+                out_values.copy_(inputs[:, :1].expand(sp.local_rows, 512) * 0.5)
+                out_gates.copy_(inputs[:, 1:2].expand(sp.local_rows, 512) * 0.25)
+    
+            def normalize(rows, main, state, *, values, gates, **kwargs):
+                assert rows == tokens and main is metadata and state is state_meta
+                assert values.shape == (tokens, 512) and gates.shape == (tokens, 512)
+                assert torch.equal(values, expected_values)
+                assert torch.equal(gates, expected_gates)
+                seen.append((values.shape, gates.shape))
+                compressor._latent[:rows].copy_(values.to(torch.bfloat16))
+                compressor._slots[:rows].copy_(torch.arange(rows))
+    
+            compressor._sp_kernel = project_two
+            compressor._forward_tilelang = normalize
+            output, slots = compressor.forward(
+                sp.local_slice(full_input),
+                metadata,
+                state_metadata=state_meta,
+                sp_rows=sp,
+            )
+            assert seen == [((tokens, 512), (tokens, 512))]
+            assert torch.equal(output, expected_values.to(torch.bfloat16))
+            assert torch.equal(slots, torch.arange(tokens))
+            return output.clone()
+    
+>       assert len(world.run(run)) == world_size
+                   ^^^^^^^^^^^^^^
+
+tests/models/test_deepseek_v4_1_compressor_prepare.py:384: 
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
+tests/models/test_deepseek_v4_1_sp_prefill.py:776: in run
+    return [future.result() for future in futures]
+            ^^^^^^^^^^^^^^^
+/usr/lib/python3.12/concurrent/futures/_base.py:449: in result
+    return self.__get_result()
+           ^^^^^^^^^^^^^^^^^^^
+/usr/lib/python3.12/concurrent/futures/_base.py:401: in __get_result
+    raise self._exception
+/usr/lib/python3.12/concurrent/futures/thread.py:58: in run
+    result = self.fn(*self.args, **self.kwargs)
+             ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+tests/models/test_deepseek_v4_1_sp_prefill.py:772: in rank_main
+    return fn(rank)
+           ^^^^^^^^
+tests/models/test_deepseek_v4_1_compressor_prepare.py:373: in run
+    output, slots = compressor.forward(
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
+
+self = DeepseekCompressor()
+hidden_states = tensor([[ 0.,  1.,  2.,  3.,  4.,  5.,  6.,  7.,  8.,  9., 10., 11., 12., 13.,
+         14., 15., 16., 17., 18., 19., ...44., 45.,
+         46., 47., 48., 49., 50., 51., 52., 53., 54., 55., 56., 57., 58., 59.,
+         60., 61., 62., 63.]])
+metadata = <object object at 0xe34ac9117960>
+state_metadata = <object object at 0xe34ac9117970>, kv_cache = None
+token_positions = None, cos_sin = None, kv_page_size = None
+sp_rows = SPRows(num_tokens=5, world_size=4, rank=0, unreduced=False)
+
+    def forward(
+        self,
+        hidden_states,
+        metadata,
+        state_metadata=None,
+        *,
+        kv_cache=None,
+        token_positions=None,
+        cos_sin=None,
+        kv_page_size=None,
+        sp_rows=None,
+    ):
+        rows = hidden_states.shape[0]
+        if self._values is None:
+            raise RuntimeError("compressor kernels must be bound before forwarding")
+        values = None
+        if sp_rows is not None:
+            if self.compress_ratio != 1 or self._sp_kernel is None:
+>               raise RuntimeError(
+                    "ratio-one SP projection must be bound before forwarding"
+                )
+E               RuntimeError: ratio-one SP projection must be bound before forwarding
+
+vllm/models/deepseek_v4_1/compressor.py:507: RuntimeError
+_ test_sp_ratio2_compressor_projects_local_rows_and_gathers_values_and_gates[13-3] _
+
+monkeypatch = <_pytest.monkeypatch.MonkeyPatch object at 0xe34e6d50f6b0>
+world_size = 3, tokens = 13
+
+    @pytest.mark.parametrize("world_size", [3, 4])
+    @pytest.mark.parametrize("tokens", [5, 13, 31, 32, 33])
+    def test_sp_ratio2_compressor_projects_local_rows_and_gathers_values_and_gates(
+        monkeypatch, world_size, tokens
+    ):
+        from tests.models.test_deepseek_v4_1_sp_prefill import _World
+        from vllm.models.deepseek_v4_1 import sp_prefill
+    
+        world = _World(world_size)
+        monkeypatch.setattr(
+            sp_prefill, "tensor_model_parallel_all_gather", world.all_gather
+        )
+        full_input = torch.arange(tokens * 32, dtype=torch.float32).reshape(tokens, 32)
+        expected_values = full_input[:, :1].expand(tokens, 512) * 0.5
+        expected_gates = full_input[:, 1:2].expand(tokens, 512) * 0.25
+        metadata = object()
+        state_meta = object()
+    
+        def run(rank):
+            sp = sp_prefill.SPRows(tokens, world_size, rank)
+            compressor = _compressor(2)
+            compressor.fused_wkv_wgate.tp_size = world_size
+            compressor.state_cache = SimpleNamespace(prefix="state")
+            compressor._values = torch.empty(tokens + world_size, 512, dtype=torch.float32)
+            compressor._gates = torch.empty(tokens + world_size, 512, dtype=torch.float32)
+            compressor._latent = torch.empty(tokens + world_size, 512, dtype=torch.bfloat16)
+            compressor._slots = torch.empty(tokens + world_size, dtype=torch.int64)
+            compressor._sp_weight = object()
+            seen = []
+    
+            def project_two(inputs, weight, out_values, out_gates):
+                assert inputs.shape[0] == sp.local_rows and weight is compressor._sp_weight
+                assert out_values.shape == (sp.local_rows, 512)
+                assert out_gates.shape == (sp.local_rows, 512)
+                out_values.copy_(inputs[:, :1].expand(sp.local_rows, 512) * 0.5)
+                out_gates.copy_(inputs[:, 1:2].expand(sp.local_rows, 512) * 0.25)
+    
+            def normalize(rows, main, state, *, values, gates, **kwargs):
+                assert rows == tokens and main is metadata and state is state_meta
+                assert values.shape == (tokens, 512) and gates.shape == (tokens, 512)
+                assert torch.equal(values, expected_values)
+                assert torch.equal(gates, expected_gates)
+                seen.append((values.shape, gates.shape))
+                compressor._latent[:rows].copy_(values.to(torch.bfloat16))
+                compressor._slots[:rows].copy_(torch.arange(rows))
+    
+            compressor._sp_kernel = project_two
+            compressor._forward_tilelang = normalize
+            output, slots = compressor.forward(
+                sp.local_slice(full_input),
+                metadata,
+                state_metadata=state_meta,
+                sp_rows=sp,
+            )
+            assert seen == [((tokens, 512), (tokens, 512))]
+            assert torch.equal(output, expected_values.to(torch.bfloat16))
+            assert torch.equal(slots, torch.arange(tokens))
+            return output.clone()
+    
+>       assert len(world.run(run)) == world_size
+                   ^^^^^^^^^^^^^^
+
+tests/models/test_deepseek_v4_1_compressor_prepare.py:384: 
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
+tests/models/test_deepseek_v4_1_sp_prefill.py:776: in run
+    return [future.result() for future in futures]
+            ^^^^^^^^^^^^^^^
+/usr/lib/python3.12/concurrent/futures/_base.py:449: in result
+    return self.__get_result()
+           ^^^^^^^^^^^^^^^^^^^
+/usr/lib/python3.12/concurrent/futures/_base.py:401: in __get_result
+    raise self._exception
+/usr/lib/python3.12/concurrent/futures/thread.py:58: in run
+    result = self.fn(*self.args, **self.kwargs)
+             ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+tests/models/test_deepseek_v4_1_sp_prefill.py:772: in rank_main
+    return fn(rank)
+           ^^^^^^^^
+tests/models/test_deepseek_v4_1_compressor_prepare.py:373: in run
+    output, slots = compressor.forward(
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
+
+self = DeepseekCompressor()
+hidden_states = tensor([[  0.,   1.,   2.,   3.,   4.,   5.,   6.,   7.,   8.,   9.,  10.,  11.,
+          12.,  13.,  14.,  15.,  16.... 142., 143., 144., 145., 146., 147., 148., 149., 150., 151.,
+         152., 153., 154., 155., 156., 157., 158., 159.]])
+metadata = <object object at 0xe34d16db9ee0>
+state_metadata = <object object at 0xe34d16db9c10>, kv_cache = None
+token_positions = None, cos_sin = None, kv_page_size = None
+sp_rows = SPRows(num_tokens=13, world_size=3, rank=0, unreduced=False)
+
+    def forward(
+        self,
+        hidden_states,
+        metadata,
+        state_metadata=None,
+        *,
+        kv_cache=None,
+        token_positions=None,
+        cos_sin=None,
+        kv_page_size=None,
+        sp_rows=None,
+    ):
+        rows = hidden_states.shape[0]
+        if self._values is None:
+            raise RuntimeError("compressor kernels must be bound before forwarding")
+        values = None
+        if sp_rows is not None:
+            if self.compress_ratio != 1 or self._sp_kernel is None:
+>               raise RuntimeError(
+                    "ratio-one SP projection must be bound before forwarding"
+                )
+E               RuntimeError: ratio-one SP projection must be bound before forwarding
+
+vllm/models/deepseek_v4_1/compressor.py:507: RuntimeError
+_ test_sp_ratio2_compressor_projects_local_rows_and_gathers_values_and_gates[13-4] _
+
+monkeypatch = <_pytest.monkeypatch.MonkeyPatch object at 0xe34ad7d2d2b0>
+world_size = 4, tokens = 13
+
+    @pytest.mark.parametrize("world_size", [3, 4])
+    @pytest.mark.parametrize("tokens", [5, 13, 31, 32, 33])
+    def test_sp_ratio2_compressor_projects_local_rows_and_gathers_values_and_gates(
+        monkeypatch, world_size, tokens
+    ):
+        from tests.models.test_deepseek_v4_1_sp_prefill import _World
+        from vllm.models.deepseek_v4_1 import sp_prefill
+    
+        world = _World(world_size)
+        monkeypatch.setattr(
+            sp_prefill, "tensor_model_parallel_all_gather", world.all_gather
+        )
+        full_input = torch.arange(tokens * 32, dtype=torch.float32).reshape(tokens, 32)
+        expected_values = full_input[:, :1].expand(tokens, 512) * 0.5
+        expected_gates = full_input[:, 1:2].expand(tokens, 512) * 0.25
+        metadata = object()
+        state_meta = object()
+    
+        def run(rank):
+            sp = sp_prefill.SPRows(tokens, world_size, rank)
+            compressor = _compressor(2)
+            compressor.fused_wkv_wgate.tp_size = world_size
+            compressor.state_cache = SimpleNamespace(prefix="state")
+            compressor._values = torch.empty(tokens + world_size, 512, dtype=torch.float32)
+            compressor._gates = torch.empty(tokens + world_size, 512, dtype=torch.float32)
+            compressor._latent = torch.empty(tokens + world_size, 512, dtype=torch.bfloat16)
+            compressor._slots = torch.empty(tokens + world_size, dtype=torch.int64)
+            compressor._sp_weight = object()
+            seen = []
+    
+            def project_two(inputs, weight, out_values, out_gates):
+                assert inputs.shape[0] == sp.local_rows and weight is compressor._sp_weight
+                assert out_values.shape == (sp.local_rows, 512)
+                assert out_gates.shape == (sp.local_rows, 512)
+                out_values.copy_(inputs[:, :1].expand(sp.local_rows, 512) * 0.5)
+                out_gates.copy_(inputs[:, 1:2].expand(sp.local_rows, 512) * 0.25)
+    
+            def normalize(rows, main, state, *, values, gates, **kwargs):
+                assert rows == tokens and main is metadata and state is state_meta
+                assert values.shape == (tokens, 512) and gates.shape == (tokens, 512)
+                assert torch.equal(values, expected_values)
+                assert torch.equal(gates, expected_gates)
+                seen.append((values.shape, gates.shape))
+                compressor._latent[:rows].copy_(values.to(torch.bfloat16))
+                compressor._slots[:rows].copy_(torch.arange(rows))
+    
+            compressor._sp_kernel = project_two
+            compressor._forward_tilelang = normalize
+            output, slots = compressor.forward(
+                sp.local_slice(full_input),
+                metadata,
+                state_metadata=state_meta,
+                sp_rows=sp,
+            )
+            assert seen == [((tokens, 512), (tokens, 512))]
+            assert torch.equal(output, expected_values.to(torch.bfloat16))
+            assert torch.equal(slots, torch.arange(tokens))
+            return output.clone()
+    
+>       assert len(world.run(run)) == world_size
+                   ^^^^^^^^^^^^^^
+
+tests/models/test_deepseek_v4_1_compressor_prepare.py:384: 
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
+tests/models/test_deepseek_v4_1_sp_prefill.py:776: in run
+    return [future.result() for future in futures]
+            ^^^^^^^^^^^^^^^
+/usr/lib/python3.12/concurrent/futures/_base.py:456: in result
+    return self.__get_result()
+           ^^^^^^^^^^^^^^^^^^^
+/usr/lib/python3.12/concurrent/futures/_base.py:401: in __get_result
+    raise self._exception
+/usr/lib/python3.12/concurrent/futures/thread.py:58: in run
+    result = self.fn(*self.args, **self.kwargs)
+             ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+tests/models/test_deepseek_v4_1_sp_prefill.py:772: in rank_main
+    return fn(rank)
+           ^^^^^^^^
+tests/models/test_deepseek_v4_1_compressor_prepare.py:373: in run
+    output, slots = compressor.forward(
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
+
+self = DeepseekCompressor()
+hidden_states = tensor([[  0.,   1.,   2.,   3.,   4.,   5.,   6.,   7.,   8.,   9.,  10.,  11.,
+          12.,  13.,  14.,  15.,  16.... 110., 111., 112., 113., 114., 115., 116., 117., 118., 119.,
+         120., 121., 122., 123., 124., 125., 126., 127.]])
+metadata = <object object at 0xe34ac9571490>
+state_metadata = <object object at 0xe34ac9571440>, kv_cache = None
+token_positions = None, cos_sin = None, kv_page_size = None
+sp_rows = SPRows(num_tokens=13, world_size=4, rank=0, unreduced=False)
+
+    def forward(
+        self,
+        hidden_states,
+        metadata,
+        state_metadata=None,
+        *,
+        kv_cache=None,
+        token_positions=None,
+        cos_sin=None,
+        kv_page_size=None,
+        sp_rows=None,
+    ):
+        rows = hidden_states.shape[0]
+        if self._values is None:
+            raise RuntimeError("compressor kernels must be bound before forwarding")
+        values = None
+        if sp_rows is not None:
+            if self.compress_ratio != 1 or self._sp_kernel is None:
+>               raise RuntimeError(
+                    "ratio-one SP projection must be bound before forwarding"
+                )
+E               RuntimeError: ratio-one SP projection must be bound before forwarding
+
+vllm/models/deepseek_v4_1/compressor.py:507: RuntimeError
+_ test_sp_ratio2_compressor_projects_local_rows_and_gathers_values_and_gates[31-3] _
+
+monkeypatch = <_pytest.monkeypatch.MonkeyPatch object at 0xe34cf001bd10>
+world_size = 3, tokens = 31
+
+    @pytest.mark.parametrize("world_size", [3, 4])
+    @pytest.mark.parametrize("tokens", [5, 13, 31, 32, 33])
+    def test_sp_ratio2_compressor_projects_local_rows_and_gathers_values_and_gates(
+        monkeypatch, world_size, tokens
+    ):
+        from tests.models.test_deepseek_v4_1_sp_prefill import _World
+        from vllm.models.deepseek_v4_1 import sp_prefill
+    
+        world = _World(world_size)
+        monkeypatch.setattr(
+            sp_prefill, "tensor_model_parallel_all_gather", world.all_gather
+        )
+        full_input = torch.arange(tokens * 32, dtype=torch.float32).reshape(tokens, 32)
+        expected_values = full_input[:, :1].expand(tokens, 512) * 0.5
+        expected_gates = full_input[:, 1:2].expand(tokens, 512) * 0.25
+        metadata = object()
+        state_meta = object()
+    
+        def run(rank):
+            sp = sp_prefill.SPRows(tokens, world_size, rank)
+            compressor = _compressor(2)
+            compressor.fused_wkv_wgate.tp_size = world_size
+            compressor.state_cache = SimpleNamespace(prefix="state")
+            compressor._values = torch.empty(tokens + world_size, 512, dtype=torch.float32)
+            compressor._gates = torch.empty(tokens + world_size, 512, dtype=torch.float32)
+            compressor._latent = torch.empty(tokens + world_size, 512, dtype=torch.bfloat16)
+            compressor._slots = torch.empty(tokens + world_size, dtype=torch.int64)
+            compressor._sp_weight = object()
+            seen = []
+    
+            def project_two(inputs, weight, out_values, out_gates):
+                assert inputs.shape[0] == sp.local_rows and weight is compressor._sp_weight
+                assert out_values.shape == (sp.local_rows, 512)
+                assert out_gates.shape == (sp.local_rows, 512)
+                out_values.copy_(inputs[:, :1].expand(sp.local_rows, 512) * 0.5)
+                out_gates.copy_(inputs[:, 1:2].expand(sp.local_rows, 512) * 0.25)
+    
+            def normalize(rows, main, state, *, values, gates, **kwargs):
+                assert rows == tokens and main is metadata and state is state_meta
+                assert values.shape == (tokens, 512) and gates.shape == (tokens, 512)
+                assert torch.equal(values, expected_values)
+                assert torch.equal(gates, expected_gates)
+                seen.append((values.shape, gates.shape))
+                compressor._latent[:rows].copy_(values.to(torch.bfloat16))
+                compressor._slots[:rows].copy_(torch.arange(rows))
+    
+            compressor._sp_kernel = project_two
+            compressor._forward_tilelang = normalize
+            output, slots = compressor.forward(
+                sp.local_slice(full_input),
+                metadata,
+                state_metadata=state_meta,
+                sp_rows=sp,
+            )
+            assert seen == [((tokens, 512), (tokens, 512))]
+            assert torch.equal(output, expected_values.to(torch.bfloat16))
+            assert torch.equal(slots, torch.arange(tokens))
+            return output.clone()
+    
+>       assert len(world.run(run)) == world_size
+                   ^^^^^^^^^^^^^^
+
+tests/models/test_deepseek_v4_1_compressor_prepare.py:384: 
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
+tests/models/test_deepseek_v4_1_sp_prefill.py:776: in run
+    return [future.result() for future in futures]
+            ^^^^^^^^^^^^^^^
+/usr/lib/python3.12/concurrent/futures/_base.py:449: in result
+    return self.__get_result()
+           ^^^^^^^^^^^^^^^^^^^
+/usr/lib/python3.12/concurrent/futures/_base.py:401: in __get_result
+    raise self._exception
+/usr/lib/python3.12/concurrent/futures/thread.py:58: in run
+    result = self.fn(*self.args, **self.kwargs)
+             ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+tests/models/test_deepseek_v4_1_sp_prefill.py:772: in rank_main
+    return fn(rank)
+           ^^^^^^^^
+tests/models/test_deepseek_v4_1_compressor_prepare.py:373: in run
+    output, slots = compressor.forward(
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
+
+self = DeepseekCompressor()
+hidden_states = tensor([[  0.,   1.,   2.,   3.,   4.,   5.,   6.,   7.,   8.,   9.,  10.,  11.,
+          12.,  13.,  14.,  15.,  16.... 334., 335., 336., 337., 338., 339., 340., 341., 342., 343.,
+         344., 345., 346., 347., 348., 349., 350., 351.]])
+metadata = <object object at 0xe34ac9115010>
+state_metadata = <object object at 0xe34ac9115040>, kv_cache = None
+token_positions = None, cos_sin = None, kv_page_size = None
+sp_rows = SPRows(num_tokens=31, world_size=3, rank=0, unreduced=False)
+
+    def forward(
+        self,
+        hidden_states,
+        metadata,
+        state_metadata=None,
+        *,
+        kv_cache=None,
+        token_positions=None,
+        cos_sin=None,
+        kv_page_size=None,
+        sp_rows=None,
+    ):
+        rows = hidden_states.shape[0]
+        if self._values is None:
+            raise RuntimeError("compressor kernels must be bound before forwarding")
+        values = None
+        if sp_rows is not None:
+            if self.compress_ratio != 1 or self._sp_kernel is None:
+>               raise RuntimeError(
+                    "ratio-one SP projection must be bound before forwarding"
+                )
+E               RuntimeError: ratio-one SP projection must be bound before forwarding
+
+vllm/models/deepseek_v4_1/compressor.py:507: RuntimeError
+_ test_sp_ratio2_compressor_projects_local_rows_and_gathers_values_and_gates[31-4] _
+
+monkeypatch = <_pytest.monkeypatch.MonkeyPatch object at 0xe34ad7ec8950>
+world_size = 4, tokens = 31
+
+    @pytest.mark.parametrize("world_size", [3, 4])
+    @pytest.mark.parametrize("tokens", [5, 13, 31, 32, 33])
+    def test_sp_ratio2_compressor_projects_local_rows_and_gathers_values_and_gates(
+        monkeypatch, world_size, tokens
+    ):
+        from tests.models.test_deepseek_v4_1_sp_prefill import _World
+        from vllm.models.deepseek_v4_1 import sp_prefill
+    
+        world = _World(world_size)
+        monkeypatch.setattr(
+            sp_prefill, "tensor_model_parallel_all_gather", world.all_gather
+        )
+        full_input = torch.arange(tokens * 32, dtype=torch.float32).reshape(tokens, 32)
+        expected_values = full_input[:, :1].expand(tokens, 512) * 0.5
+        expected_gates = full_input[:, 1:2].expand(tokens, 512) * 0.25
+        metadata = object()
+        state_meta = object()
+    
+        def run(rank):
+            sp = sp_prefill.SPRows(tokens, world_size, rank)
+            compressor = _compressor(2)
+            compressor.fused_wkv_wgate.tp_size = world_size
+            compressor.state_cache = SimpleNamespace(prefix="state")
+            compressor._values = torch.empty(tokens + world_size, 512, dtype=torch.float32)
+            compressor._gates = torch.empty(tokens + world_size, 512, dtype=torch.float32)
+            compressor._latent = torch.empty(tokens + world_size, 512, dtype=torch.bfloat16)
+            compressor._slots = torch.empty(tokens + world_size, dtype=torch.int64)
+            compressor._sp_weight = object()
+            seen = []
+    
+            def project_two(inputs, weight, out_values, out_gates):
+                assert inputs.shape[0] == sp.local_rows and weight is compressor._sp_weight
+                assert out_values.shape == (sp.local_rows, 512)
+                assert out_gates.shape == (sp.local_rows, 512)
+                out_values.copy_(inputs[:, :1].expand(sp.local_rows, 512) * 0.5)
+                out_gates.copy_(inputs[:, 1:2].expand(sp.local_rows, 512) * 0.25)
+    
+            def normalize(rows, main, state, *, values, gates, **kwargs):
+                assert rows == tokens and main is metadata and state is state_meta
+                assert values.shape == (tokens, 512) and gates.shape == (tokens, 512)
+                assert torch.equal(values, expected_values)
+                assert torch.equal(gates, expected_gates)
+                seen.append((values.shape, gates.shape))
+                compressor._latent[:rows].copy_(values.to(torch.bfloat16))
+                compressor._slots[:rows].copy_(torch.arange(rows))
+    
+            compressor._sp_kernel = project_two
+            compressor._forward_tilelang = normalize
+            output, slots = compressor.forward(
+                sp.local_slice(full_input),
+                metadata,
+                state_metadata=state_meta,
+                sp_rows=sp,
+            )
+            assert seen == [((tokens, 512), (tokens, 512))]
+            assert torch.equal(output, expected_values.to(torch.bfloat16))
+            assert torch.equal(slots, torch.arange(tokens))
+            return output.clone()
+    
+>       assert len(world.run(run)) == world_size
+                   ^^^^^^^^^^^^^^
+
+tests/models/test_deepseek_v4_1_compressor_prepare.py:384: 
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
+tests/models/test_deepseek_v4_1_sp_prefill.py:776: in run
+    return [future.result() for future in futures]
+            ^^^^^^^^^^^^^^^
+/usr/lib/python3.12/concurrent/futures/_base.py:449: in result
+    return self.__get_result()
+           ^^^^^^^^^^^^^^^^^^^
+/usr/lib/python3.12/concurrent/futures/_base.py:401: in __get_result
+    raise self._exception
+/usr/lib/python3.12/concurrent/futures/thread.py:58: in run
+    result = self.fn(*self.args, **self.kwargs)
+             ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+tests/models/test_deepseek_v4_1_sp_prefill.py:772: in rank_main
+    return fn(rank)
+           ^^^^^^^^
+tests/models/test_deepseek_v4_1_compressor_prepare.py:373: in run
+    output, slots = compressor.forward(
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
+
+self = DeepseekCompressor()
+hidden_states = tensor([[  0.,   1.,   2.,   3.,   4.,   5.,   6.,   7.,   8.,   9.,  10.,  11.,
+          12.,  13.,  14.,  15.,  16.... 238., 239., 240., 241., 242., 243., 244., 245., 246., 247.,
+         248., 249., 250., 251., 252., 253., 254., 255.]])
+metadata = <object object at 0xe34d16dba180>
+state_metadata = <object object at 0xe34d16dba010>, kv_cache = None
+token_positions = None, cos_sin = None, kv_page_size = None
+sp_rows = SPRows(num_tokens=31, world_size=4, rank=0, unreduced=False)
+
+    def forward(
+        self,
+        hidden_states,
+        metadata,
+        state_metadata=None,
+        *,
+        kv_cache=None,
+        token_positions=None,
+        cos_sin=None,
+        kv_page_size=None,
+        sp_rows=None,
+    ):
+        rows = hidden_states.shape[0]
+        if self._values is None:
+            raise RuntimeError("compressor kernels must be bound before forwarding")
+        values = None
+        if sp_rows is not None:
+            if self.compress_ratio != 1 or self._sp_kernel is None:
+>               raise RuntimeError(
+                    "ratio-one SP projection must be bound before forwarding"
+                )
+E               RuntimeError: ratio-one SP projection must be bound before forwarding
+
+vllm/models/deepseek_v4_1/compressor.py:507: RuntimeError
+_ test_sp_ratio2_compressor_projects_local_rows_and_gathers_values_and_gates[32-3] _
+
+monkeypatch = <_pytest.monkeypatch.MonkeyPatch object at 0xe34e6d50f3e0>
+world_size = 3, tokens = 32
+
+    @pytest.mark.parametrize("world_size", [3, 4])
+    @pytest.mark.parametrize("tokens", [5, 13, 31, 32, 33])
+    def test_sp_ratio2_compressor_projects_local_rows_and_gathers_values_and_gates(
+        monkeypatch, world_size, tokens
+    ):
+        from tests.models.test_deepseek_v4_1_sp_prefill import _World
+        from vllm.models.deepseek_v4_1 import sp_prefill
+    
+        world = _World(world_size)
+        monkeypatch.setattr(
+            sp_prefill, "tensor_model_parallel_all_gather", world.all_gather
+        )
+        full_input = torch.arange(tokens * 32, dtype=torch.float32).reshape(tokens, 32)
+        expected_values = full_input[:, :1].expand(tokens, 512) * 0.5
+        expected_gates = full_input[:, 1:2].expand(tokens, 512) * 0.25
+        metadata = object()
+        state_meta = object()
+    
+        def run(rank):
+            sp = sp_prefill.SPRows(tokens, world_size, rank)
+            compressor = _compressor(2)
+            compressor.fused_wkv_wgate.tp_size = world_size
+            compressor.state_cache = SimpleNamespace(prefix="state")
+            compressor._values = torch.empty(tokens + world_size, 512, dtype=torch.float32)
+            compressor._gates = torch.empty(tokens + world_size, 512, dtype=torch.float32)
+            compressor._latent = torch.empty(tokens + world_size, 512, dtype=torch.bfloat16)
+            compressor._slots = torch.empty(tokens + world_size, dtype=torch.int64)
+            compressor._sp_weight = object()
+            seen = []
+    
+            def project_two(inputs, weight, out_values, out_gates):
+                assert inputs.shape[0] == sp.local_rows and weight is compressor._sp_weight
+                assert out_values.shape == (sp.local_rows, 512)
+                assert out_gates.shape == (sp.local_rows, 512)
+                out_values.copy_(inputs[:, :1].expand(sp.local_rows, 512) * 0.5)
+                out_gates.copy_(inputs[:, 1:2].expand(sp.local_rows, 512) * 0.25)
+    
+            def normalize(rows, main, state, *, values, gates, **kwargs):
+                assert rows == tokens and main is metadata and state is state_meta
+                assert values.shape == (tokens, 512) and gates.shape == (tokens, 512)
+                assert torch.equal(values, expected_values)
+                assert torch.equal(gates, expected_gates)
+                seen.append((values.shape, gates.shape))
+                compressor._latent[:rows].copy_(values.to(torch.bfloat16))
+                compressor._slots[:rows].copy_(torch.arange(rows))
+    
+            compressor._sp_kernel = project_two
+            compressor._forward_tilelang = normalize
+            output, slots = compressor.forward(
+                sp.local_slice(full_input),
+                metadata,
+                state_metadata=state_meta,
+                sp_rows=sp,
+            )
+            assert seen == [((tokens, 512), (tokens, 512))]
+            assert torch.equal(output, expected_values.to(torch.bfloat16))
+            assert torch.equal(slots, torch.arange(tokens))
+            return output.clone()
+    
+>       assert len(world.run(run)) == world_size
+                   ^^^^^^^^^^^^^^
+
+tests/models/test_deepseek_v4_1_compressor_prepare.py:384: 
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
+tests/models/test_deepseek_v4_1_sp_prefill.py:776: in run
+    return [future.result() for future in futures]
+            ^^^^^^^^^^^^^^^
+/usr/lib/python3.12/concurrent/futures/_base.py:449: in result
+    return self.__get_result()
+           ^^^^^^^^^^^^^^^^^^^
+/usr/lib/python3.12/concurrent/futures/_base.py:401: in __get_result
+    raise self._exception
+/usr/lib/python3.12/concurrent/futures/thread.py:58: in run
+    result = self.fn(*self.args, **self.kwargs)
+             ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+tests/models/test_deepseek_v4_1_sp_prefill.py:772: in rank_main
+    return fn(rank)
+           ^^^^^^^^
+tests/models/test_deepseek_v4_1_compressor_prepare.py:373: in run
+    output, slots = compressor.forward(
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
+
+self = DeepseekCompressor()
+hidden_states = tensor([[  0.,   1.,   2.,   3.,   4.,   5.,   6.,   7.,   8.,   9.,  10.,  11.,
+          12.,  13.,  14.,  15.,  16.... 334., 335., 336., 337., 338., 339., 340., 341., 342., 343.,
+         344., 345., 346., 347., 348., 349., 350., 351.]])
+metadata = <object object at 0xe34ac95732c0>
+state_metadata = <object object at 0xe34ac95733d0>, kv_cache = None
+token_positions = None, cos_sin = None, kv_page_size = None
+sp_rows = SPRows(num_tokens=32, world_size=3, rank=0, unreduced=False)
+
+    def forward(
+        self,
+        hidden_states,
+        metadata,
+        state_metadata=None,
+        *,
+        kv_cache=None,
+        token_positions=None,
+        cos_sin=None,
+        kv_page_size=None,
+        sp_rows=None,
+    ):
+        rows = hidden_states.shape[0]
+        if self._values is None:
+            raise RuntimeError("compressor kernels must be bound before forwarding")
+        values = None
+        if sp_rows is not None:
+            if self.compress_ratio != 1 or self._sp_kernel is None:
+>               raise RuntimeError(
+                    "ratio-one SP projection must be bound before forwarding"
+                )
+E               RuntimeError: ratio-one SP projection must be bound before forwarding
+
+vllm/models/deepseek_v4_1/compressor.py:507: RuntimeError
+_ test_sp_ratio2_compressor_projects_local_rows_and_gathers_values_and_gates[32-4] _
+
+monkeypatch = <_pytest.monkeypatch.MonkeyPatch object at 0xe34ad7dac1a0>
+world_size = 4, tokens = 32
+
+    @pytest.mark.parametrize("world_size", [3, 4])
+    @pytest.mark.parametrize("tokens", [5, 13, 31, 32, 33])
+    def test_sp_ratio2_compressor_projects_local_rows_and_gathers_values_and_gates(
+        monkeypatch, world_size, tokens
+    ):
+        from tests.models.test_deepseek_v4_1_sp_prefill import _World
+        from vllm.models.deepseek_v4_1 import sp_prefill
+    
+        world = _World(world_size)
+        monkeypatch.setattr(
+            sp_prefill, "tensor_model_parallel_all_gather", world.all_gather
+        )
+        full_input = torch.arange(tokens * 32, dtype=torch.float32).reshape(tokens, 32)
+        expected_values = full_input[:, :1].expand(tokens, 512) * 0.5
+        expected_gates = full_input[:, 1:2].expand(tokens, 512) * 0.25
+        metadata = object()
+        state_meta = object()
+    
+        def run(rank):
+            sp = sp_prefill.SPRows(tokens, world_size, rank)
+            compressor = _compressor(2)
+            compressor.fused_wkv_wgate.tp_size = world_size
+            compressor.state_cache = SimpleNamespace(prefix="state")
+            compressor._values = torch.empty(tokens + world_size, 512, dtype=torch.float32)
+            compressor._gates = torch.empty(tokens + world_size, 512, dtype=torch.float32)
+            compressor._latent = torch.empty(tokens + world_size, 512, dtype=torch.bfloat16)
+            compressor._slots = torch.empty(tokens + world_size, dtype=torch.int64)
+            compressor._sp_weight = object()
+            seen = []
+    
+            def project_two(inputs, weight, out_values, out_gates):
+                assert inputs.shape[0] == sp.local_rows and weight is compressor._sp_weight
+                assert out_values.shape == (sp.local_rows, 512)
+                assert out_gates.shape == (sp.local_rows, 512)
+                out_values.copy_(inputs[:, :1].expand(sp.local_rows, 512) * 0.5)
+                out_gates.copy_(inputs[:, 1:2].expand(sp.local_rows, 512) * 0.25)
+    
+            def normalize(rows, main, state, *, values, gates, **kwargs):
+                assert rows == tokens and main is metadata and state is state_meta
+                assert values.shape == (tokens, 512) and gates.shape == (tokens, 512)
+                assert torch.equal(values, expected_values)
+                assert torch.equal(gates, expected_gates)
+                seen.append((values.shape, gates.shape))
+                compressor._latent[:rows].copy_(values.to(torch.bfloat16))
+                compressor._slots[:rows].copy_(torch.arange(rows))
+    
+            compressor._sp_kernel = project_two
+            compressor._forward_tilelang = normalize
+            output, slots = compressor.forward(
+                sp.local_slice(full_input),
+                metadata,
+                state_metadata=state_meta,
+                sp_rows=sp,
+            )
+            assert seen == [((tokens, 512), (tokens, 512))]
+            assert torch.equal(output, expected_values.to(torch.bfloat16))
+            assert torch.equal(slots, torch.arange(tokens))
+            return output.clone()
+    
+>       assert len(world.run(run)) == world_size
+                   ^^^^^^^^^^^^^^
+
+tests/models/test_deepseek_v4_1_compressor_prepare.py:384: 
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
+tests/models/test_deepseek_v4_1_sp_prefill.py:776: in run
+    return [future.result() for future in futures]
+            ^^^^^^^^^^^^^^^
+/usr/lib/python3.12/concurrent/futures/_base.py:449: in result
+    return self.__get_result()
+           ^^^^^^^^^^^^^^^^^^^
+/usr/lib/python3.12/concurrent/futures/_base.py:401: in __get_result
+    raise self._exception
+/usr/lib/python3.12/concurrent/futures/thread.py:58: in run
+    result = self.fn(*self.args, **self.kwargs)
+             ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+tests/models/test_deepseek_v4_1_sp_prefill.py:772: in rank_main
+    return fn(rank)
+           ^^^^^^^^
+tests/models/test_deepseek_v4_1_compressor_prepare.py:373: in run
+    output, slots = compressor.forward(
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
+
+self = DeepseekCompressor()
+hidden_states = tensor([[  0.,   1.,   2.,   3.,   4.,   5.,   6.,   7.,   8.,   9.,  10.,  11.,
+          12.,  13.,  14.,  15.,  16.... 238., 239., 240., 241., 242., 243., 244., 245., 246., 247.,
+         248., 249., 250., 251., 252., 253., 254., 255.]])
+metadata = <object object at 0xe34d16dba200>
+state_metadata = <object object at 0xe34d16dba210>, kv_cache = None
+token_positions = None, cos_sin = None, kv_page_size = None
+sp_rows = SPRows(num_tokens=32, world_size=4, rank=0, unreduced=False)
+
+    def forward(
+        self,
+        hidden_states,
+        metadata,
+        state_metadata=None,
+        *,
+        kv_cache=None,
+        token_positions=None,
+        cos_sin=None,
+        kv_page_size=None,
+        sp_rows=None,
+    ):
+        rows = hidden_states.shape[0]
+        if self._values is None:
+            raise RuntimeError("compressor kernels must be bound before forwarding")
+        values = None
+        if sp_rows is not None:
+            if self.compress_ratio != 1 or self._sp_kernel is None:
+>               raise RuntimeError(
+                    "ratio-one SP projection must be bound before forwarding"
+                )
+E               RuntimeError: ratio-one SP projection must be bound before forwarding
+
+vllm/models/deepseek_v4_1/compressor.py:507: RuntimeError
+_ test_sp_ratio2_compressor_projects_local_rows_and_gathers_values_and_gates[33-3] _
+
+monkeypatch = <_pytest.monkeypatch.MonkeyPatch object at 0xe34ad7dff680>
+world_size = 3, tokens = 33
+
+    @pytest.mark.parametrize("world_size", [3, 4])
+    @pytest.mark.parametrize("tokens", [5, 13, 31, 32, 33])
+    def test_sp_ratio2_compressor_projects_local_rows_and_gathers_values_and_gates(
+        monkeypatch, world_size, tokens
+    ):
+        from tests.models.test_deepseek_v4_1_sp_prefill import _World
+        from vllm.models.deepseek_v4_1 import sp_prefill
+    
+        world = _World(world_size)
+        monkeypatch.setattr(
+            sp_prefill, "tensor_model_parallel_all_gather", world.all_gather
+        )
+        full_input = torch.arange(tokens * 32, dtype=torch.float32).reshape(tokens, 32)
+        expected_values = full_input[:, :1].expand(tokens, 512) * 0.5
+        expected_gates = full_input[:, 1:2].expand(tokens, 512) * 0.25
+        metadata = object()
+        state_meta = object()
+    
+        def run(rank):
+            sp = sp_prefill.SPRows(tokens, world_size, rank)
+            compressor = _compressor(2)
+            compressor.fused_wkv_wgate.tp_size = world_size
+            compressor.state_cache = SimpleNamespace(prefix="state")
+            compressor._values = torch.empty(tokens + world_size, 512, dtype=torch.float32)
+            compressor._gates = torch.empty(tokens + world_size, 512, dtype=torch.float32)
+            compressor._latent = torch.empty(tokens + world_size, 512, dtype=torch.bfloat16)
+            compressor._slots = torch.empty(tokens + world_size, dtype=torch.int64)
+            compressor._sp_weight = object()
+            seen = []
+    
+            def project_two(inputs, weight, out_values, out_gates):
+                assert inputs.shape[0] == sp.local_rows and weight is compressor._sp_weight
+                assert out_values.shape == (sp.local_rows, 512)
+                assert out_gates.shape == (sp.local_rows, 512)
+                out_values.copy_(inputs[:, :1].expand(sp.local_rows, 512) * 0.5)
+                out_gates.copy_(inputs[:, 1:2].expand(sp.local_rows, 512) * 0.25)
+    
+            def normalize(rows, main, state, *, values, gates, **kwargs):
+                assert rows == tokens and main is metadata and state is state_meta
+                assert values.shape == (tokens, 512) and gates.shape == (tokens, 512)
+                assert torch.equal(values, expected_values)
+                assert torch.equal(gates, expected_gates)
+                seen.append((values.shape, gates.shape))
+                compressor._latent[:rows].copy_(values.to(torch.bfloat16))
+                compressor._slots[:rows].copy_(torch.arange(rows))
+    
+            compressor._sp_kernel = project_two
+            compressor._forward_tilelang = normalize
+            output, slots = compressor.forward(
+                sp.local_slice(full_input),
+                metadata,
+                state_metadata=state_meta,
+                sp_rows=sp,
+            )
+            assert seen == [((tokens, 512), (tokens, 512))]
+            assert torch.equal(output, expected_values.to(torch.bfloat16))
+            assert torch.equal(slots, torch.arange(tokens))
+            return output.clone()
+    
+>       assert len(world.run(run)) == world_size
+                   ^^^^^^^^^^^^^^
+
+tests/models/test_deepseek_v4_1_compressor_prepare.py:384: 
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
+tests/models/test_deepseek_v4_1_sp_prefill.py:776: in run
+    return [future.result() for future in futures]
+            ^^^^^^^^^^^^^^^
+/usr/lib/python3.12/concurrent/futures/_base.py:449: in result
+    return self.__get_result()
+           ^^^^^^^^^^^^^^^^^^^
+/usr/lib/python3.12/concurrent/futures/_base.py:401: in __get_result
+    raise self._exception
+/usr/lib/python3.12/concurrent/futures/thread.py:58: in run
+    result = self.fn(*self.args, **self.kwargs)
+             ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+tests/models/test_deepseek_v4_1_sp_prefill.py:772: in rank_main
+    return fn(rank)
+           ^^^^^^^^
+tests/models/test_deepseek_v4_1_compressor_prepare.py:373: in run
+    output, slots = compressor.forward(
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
+
+self = DeepseekCompressor()
+hidden_states = tensor([[  0.,   1.,   2.,   3.,   4.,   5.,   6.,   7.,   8.,   9.,  10.,  11.,
+          12.,  13.,  14.,  15.,  16.... 334., 335., 336., 337., 338., 339., 340., 341., 342., 343.,
+         344., 345., 346., 347., 348., 349., 350., 351.]])
+metadata = <object object at 0xe34ac9114cd0>
+state_metadata = <object object at 0xe34ac9114ce0>, kv_cache = None
+token_positions = None, cos_sin = None, kv_page_size = None
+sp_rows = SPRows(num_tokens=33, world_size=3, rank=0, unreduced=False)
+
+    def forward(
+        self,
+        hidden_states,
+        metadata,
+        state_metadata=None,
+        *,
+        kv_cache=None,
+        token_positions=None,
+        cos_sin=None,
+        kv_page_size=None,
+        sp_rows=None,
+    ):
+        rows = hidden_states.shape[0]
+        if self._values is None:
+            raise RuntimeError("compressor kernels must be bound before forwarding")
+        values = None
+        if sp_rows is not None:
+            if self.compress_ratio != 1 or self._sp_kernel is None:
+>               raise RuntimeError(
+                    "ratio-one SP projection must be bound before forwarding"
+                )
+E               RuntimeError: ratio-one SP projection must be bound before forwarding
+
+vllm/models/deepseek_v4_1/compressor.py:507: RuntimeError
+_ test_sp_ratio2_compressor_projects_local_rows_and_gathers_values_and_gates[33-4] _
+
+monkeypatch = <_pytest.monkeypatch.MonkeyPatch object at 0xe34ad7dfe240>
+world_size = 4, tokens = 33
+
+    @pytest.mark.parametrize("world_size", [3, 4])
+    @pytest.mark.parametrize("tokens", [5, 13, 31, 32, 33])
+    def test_sp_ratio2_compressor_projects_local_rows_and_gathers_values_and_gates(
+        monkeypatch, world_size, tokens
+    ):
+        from tests.models.test_deepseek_v4_1_sp_prefill import _World
+        from vllm.models.deepseek_v4_1 import sp_prefill
+    
+        world = _World(world_size)
+        monkeypatch.setattr(
+            sp_prefill, "tensor_model_parallel_all_gather", world.all_gather
+        )
+        full_input = torch.arange(tokens * 32, dtype=torch.float32).reshape(tokens, 32)
+        expected_values = full_input[:, :1].expand(tokens, 512) * 0.5
+        expected_gates = full_input[:, 1:2].expand(tokens, 512) * 0.25
+        metadata = object()
+        state_meta = object()
+    
+        def run(rank):
+            sp = sp_prefill.SPRows(tokens, world_size, rank)
+            compressor = _compressor(2)
+            compressor.fused_wkv_wgate.tp_size = world_size
+            compressor.state_cache = SimpleNamespace(prefix="state")
+            compressor._values = torch.empty(tokens + world_size, 512, dtype=torch.float32)
+            compressor._gates = torch.empty(tokens + world_size, 512, dtype=torch.float32)
+            compressor._latent = torch.empty(tokens + world_size, 512, dtype=torch.bfloat16)
+            compressor._slots = torch.empty(tokens + world_size, dtype=torch.int64)
+            compressor._sp_weight = object()
+            seen = []
+    
+            def project_two(inputs, weight, out_values, out_gates):
+                assert inputs.shape[0] == sp.local_rows and weight is compressor._sp_weight
+                assert out_values.shape == (sp.local_rows, 512)
+                assert out_gates.shape == (sp.local_rows, 512)
+                out_values.copy_(inputs[:, :1].expand(sp.local_rows, 512) * 0.5)
+                out_gates.copy_(inputs[:, 1:2].expand(sp.local_rows, 512) * 0.25)
+    
+            def normalize(rows, main, state, *, values, gates, **kwargs):
+                assert rows == tokens and main is metadata and state is state_meta
+                assert values.shape == (tokens, 512) and gates.shape == (tokens, 512)
+                assert torch.equal(values, expected_values)
+                assert torch.equal(gates, expected_gates)
+                seen.append((values.shape, gates.shape))
+                compressor._latent[:rows].copy_(values.to(torch.bfloat16))
+                compressor._slots[:rows].copy_(torch.arange(rows))
+    
+            compressor._sp_kernel = project_two
+            compressor._forward_tilelang = normalize
+            output, slots = compressor.forward(
+                sp.local_slice(full_input),
+                metadata,
+                state_metadata=state_meta,
+                sp_rows=sp,
+            )
+            assert seen == [((tokens, 512), (tokens, 512))]
+            assert torch.equal(output, expected_values.to(torch.bfloat16))
+            assert torch.equal(slots, torch.arange(tokens))
+            return output.clone()
+    
+>       assert len(world.run(run)) == world_size
+                   ^^^^^^^^^^^^^^
+
+tests/models/test_deepseek_v4_1_compressor_prepare.py:384: 
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
+tests/models/test_deepseek_v4_1_sp_prefill.py:776: in run
+    return [future.result() for future in futures]
+            ^^^^^^^^^^^^^^^
+/usr/lib/python3.12/concurrent/futures/_base.py:449: in result
+    return self.__get_result()
+           ^^^^^^^^^^^^^^^^^^^
+/usr/lib/python3.12/concurrent/futures/_base.py:401: in __get_result
+    raise self._exception
+/usr/lib/python3.12/concurrent/futures/thread.py:58: in run
+    result = self.fn(*self.args, **self.kwargs)
+             ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+tests/models/test_deepseek_v4_1_sp_prefill.py:772: in rank_main
+    return fn(rank)
+           ^^^^^^^^
+tests/models/test_deepseek_v4_1_compressor_prepare.py:373: in run
+    output, slots = compressor.forward(
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
+
+self = DeepseekCompressor()
+hidden_states = tensor([[  0.,   1.,   2.,   3.,   4.,   5.,   6.,   7.,   8.,   9.,  10.,  11.,
+          12.,  13.,  14.,  15.,  16.... 270., 271., 272., 273., 274., 275., 276., 277., 278., 279.,
+         280., 281., 282., 283., 284., 285., 286., 287.]])
+metadata = <object object at 0xe34d16dba240>
+state_metadata = <object object at 0xe34d16dba190>, kv_cache = None
+token_positions = None, cos_sin = None, kv_page_size = None
+sp_rows = SPRows(num_tokens=33, world_size=4, rank=0, unreduced=False)
+
+    def forward(
+        self,
+        hidden_states,
+        metadata,
+        state_metadata=None,
+        *,
+        kv_cache=None,
+        token_positions=None,
+        cos_sin=None,
+        kv_page_size=None,
+        sp_rows=None,
+    ):
+        rows = hidden_states.shape[0]
+        if self._values is None:
+            raise RuntimeError("compressor kernels must be bound before forwarding")
+        values = None
+        if sp_rows is not None:
+            if self.compress_ratio != 1 or self._sp_kernel is None:
+>               raise RuntimeError(
+                    "ratio-one SP projection must be bound before forwarding"
+                )
+E               RuntimeError: ratio-one SP projection must be bound before forwarding
+
+vllm/models/deepseek_v4_1/compressor.py:507: RuntimeError
+_____ test_ced_encoder_only_plan_stops_at_boundary_after_global_kv_prepare _____
+
+monkeypatch = <_pytest.monkeypatch.MonkeyPatch object at 0xe34ad7dfe450>
+
+    def test_ced_encoder_only_plan_stops_at_boundary_after_global_kv_prepare(monkeypatch):
+        from vllm.models.deepseek_v4_1.nvidia.model_state import DeepseekV41ModelState
+    
+        monkeypatch.setattr(
+            native,
+            "get_pp_group",
+            lambda: SimpleNamespace(is_first_rank=True, is_last_rank=True),
+        )
+        monkeypatch.setattr(native, "get_tensor_model_parallel_world_size", lambda: 1)
+        monkeypatch.setattr(native.l2_prefetch, "ENABLED", False)
+    
+        target_model = SimpleNamespace(_ced_encoder_only=False)
+        state = DeepseekV41ModelState.__new__(DeepseekV41ModelState)
+        state.ced_state = SimpleNamespace(
+            stage=lambda *args, **kwargs: None,
+            encoder_only=False,
+        )
+        state.ced_models = [target_model]
+        state._ced_prompt_logprobs = set()
+        state._ced_prefix_start = {}
+        state._ced_recovery_prompt_end = {}
+    
+        non_final_batch = SimpleNamespace(
+            req_ids=["req-0"],
+            num_reqs=1,
+            query_start_loc=torch.tensor([0, 16384], dtype=torch.int32),
+            seq_lens=torch.tensor([16384], dtype=torch.int32),
+            num_scheduled_tokens=[16384],
+            num_computed_prefill_tokens_np=[0],
+            prefill_len_np=[65536],
+        )
+        state._stage_ced(non_final_batch)
+>       assert state.ced_state.encoder_only and target_model._ced_encoder_only
+E       assert (False)
+E        +  where False = namespace(stage=<function test_ced_encoder_only_plan_stops_at_boundary_after_global_kv_prepare.<locals>.<lambda> at 0xe34ac9485260>, encoder_only=False).encoder_only
+E        +    where namespace(stage=<function test_ced_encoder_only_plan_stops_at_boundary_after_global_kv_prepare.<locals>.<lambda> at 0xe34ac9485260>, encoder_only=False) = <vllm.models.deepseek_v4_1.nvidia.model_state.DeepseekV41ModelState object at 0xe34ad7dfe690>.ced_state
+
+tests/models/test_deepseek_v4_1_ced_model.py:489: AssertionError
+=============================== warnings summary ===============================
+../../../../usr/local/lib/python3.12/dist-packages/torch/jit/_script.py:365: 14 warnings
+  /usr/local/lib/python3.12/dist-packages/torch/jit/_script.py:365: DeprecationWarning: `torch.jit.script_method` is deprecated. Please switch to `torch.compile` or `torch.export`.
+    warnings.warn(
+
+-- Docs: https://docs.pytest.org/en/stable/how-to/capture-warnings.html
+=========================== short test summary info ============================
+FAILED tests/models/test_deepseek_v4_1_compressor.py::test_sp_ratio2_projection_matches_full_rows[2]
+FAILED tests/models/test_deepseek_v4_1_compressor.py::test_sp_ratio2_projection_matches_full_rows[3]
+FAILED tests/models/test_deepseek_v4_1_compressor.py::test_sp_ratio2_projection_matches_full_rows[4]
+FAILED tests/models/test_deepseek_v4_1_compressor.py::test_sp_ratio2_projection_matches_full_rows[5]
+FAILED tests/models/test_deepseek_v4_1_compressor.py::test_sp_ratio2_projection_matches_full_rows[6]
+FAILED tests/models/test_deepseek_v4_1_compressor.py::test_sp_ratio2_projection_matches_full_rows[7]
+FAILED tests/models/test_deepseek_v4_1_compressor.py::test_sp_ratio2_projection_matches_full_rows[8]
+FAILED tests/models/test_deepseek_v4_1_compressor_prepare.py::test_sp_ratio2_compressor_projects_local_rows_and_gathers_values_and_gates[5-3]
+FAILED tests/models/test_deepseek_v4_1_compressor_prepare.py::test_sp_ratio2_compressor_projects_local_rows_and_gathers_values_and_gates[5-4]
+FAILED tests/models/test_deepseek_v4_1_compressor_prepare.py::test_sp_ratio2_compressor_projects_local_rows_and_gathers_values_and_gates[13-3]
+FAILED tests/models/test_deepseek_v4_1_compressor_prepare.py::test_sp_ratio2_compressor_projects_local_rows_and_gathers_values_and_gates[13-4]
+FAILED tests/models/test_deepseek_v4_1_compressor_prepare.py::test_sp_ratio2_compressor_projects_local_rows_and_gathers_values_and_gates[31-3]
+FAILED tests/models/test_deepseek_v4_1_compressor_prepare.py::test_sp_ratio2_compressor_projects_local_rows_and_gathers_values_and_gates[31-4]
+FAILED tests/models/test_deepseek_v4_1_compressor_prepare.py::test_sp_ratio2_compressor_projects_local_rows_and_gathers_values_and_gates[32-3]
+FAILED tests/models/test_deepseek_v4_1_compressor_prepare.py::test_sp_ratio2_compressor_projects_local_rows_and_gathers_values_and_gates[32-4]
+FAILED tests/models/test_deepseek_v4_1_compressor_prepare.py::test_sp_ratio2_compressor_projects_local_rows_and_gathers_values_and_gates[33-3]
+FAILED tests/models/test_deepseek_v4_1_compressor_prepare.py::test_sp_ratio2_compressor_projects_local_rows_and_gathers_values_and_gates[33-4]
+FAILED tests/models/test_deepseek_v4_1_ced_model.py::test_ced_encoder_only_plan_stops_at_boundary_after_global_kv_prepare
+18 failed, 14 warnings in 11.69s

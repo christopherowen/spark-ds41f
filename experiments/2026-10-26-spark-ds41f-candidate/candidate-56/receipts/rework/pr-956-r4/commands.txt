@@ -1,0 +1,63 @@
+# PR #956 round 3 rebase without #957 part 1 (0796 r4, candidate-56, tp4-switched): commands.
+# Host for every git, test and GPU command: sp8 (spark-0016, NVIDIA GB10). Agent dir:
+#   B=~/spark-lab/agents/round3-956-r4
+# Nothing was built, applied or replayed on the laptop except reading files and writing the
+# candidate-56 profile/spec JSON; no image was built; nothing was committed or pushed in spark-ds41f;
+# no cluster, window or hold operation. Every GPU command ran under flock /tmp/spark-lab-gpu.lock,
+# after shim/run.sh checked that ~/spark-hold.json was absent and no serving container ran;
+# raw/commands.txt (shim/run.sh's log) records each command verbatim with its UTC start/end, load,
+# the containers running before it, its exit code and an 'end_of: <label>' line.
+
+## 1. Inputs
+# Base: candidate-54, sp8 ~/spark-lab/agents/round-55-57-select/c54-vllm at 4e8133ff10a1 (tree 5f021d9a7f01).
+# PR #956 head ecb3812cb8: its 0762 patch (sha256 0c20c2e2...), and the first round-3 rebase
+#   (round3-956: 56-02-956-..., patch head abb26187 on candidate-54 + 957-p1) for the files 957-p1 does not touch.
+
+## 2. Tree
+git clone -q --no-checkout ~/spark-lab/agents/round3-956/vllm $B/vllm
+git -C $B/vllm checkout -q -B c54 4e8133ff10a125b90753c2727f162e29fe37f30c
+git checkout -q -B r956r4 c54
+# The six files 957-p1 does not touch, taken whole from the first rebase (their diff against candidate-54
+# is the first rebase's diff, since 957-p1 leaves them alone): attention.py, ced.py, nvidia/model.py,
+# nvidia/model_state.py, sp_prefill.py, tests/models/test_deepseek_v4_1_ced_model.py,
+# tests/models/test_deepseek_v4_1_compressor_prepare.py
+git checkout r956-r3 -- <those files>
+# compressor.py: the PR's own hunks, which apply to candidate-54 as written
+git apply --include=vllm/models/deepseek_v4_1/compressor.py ../956-orig.patch
+# then by hand: bind()'s comment (5 MiB at ratio one, 10 MiB at ratio two), sp_prefill's notes (every
+# compressor layer keeps one full BF16 weight for SP), and test_sp_ratio2_projection_matches_full_rows
+# rewritten for the sharded, packed base (appended to tests/models/test_deepseek_v4_1_compressor.py).
+git add -A; GIT_AUTHOR_DATE/GIT_COMMITTER_DATE="Sun, 8 Nov 2026 11:30:00 +0100" git commit -F commit-msg.txt
+#   (amended once with the results; tree 703f24a32e1c unchanged)
+git format-patch -1 r956r4 --stdout > 0796-perf-dsv41-sp-ratio2-compressor-and-ced-encoder-only-chunks.patch
+# worktrees: $B/tree-base = c54, $B/tree-cand = r956r4
+
+## 3. Arms (shim/env.sh)
+# Image spark-ds41f:candidate-56 built on sp8, sha256:0f65de863418... (its vLLM: candidate-54 + 0795 + the
+# first 0796, patch head abb26187). Each arm mounts read-only every file its tree changes against the image's:
+#   base = candidate-54 (10 files: 0795's and 0796's, at candidate-54's versions)
+#   cand = candidate-54 + 0796 r4 (4 files differ from the image: compressor.py, tilelang/linear.py,
+#          sp_prefill.py, tests/models/test_deepseek_v4_1_compressor.py)
+# Serving environment entries: VLLM_USE_BREAKABLE_CUDAGRAPH=0, VLLM_USE_V2_MODEL_RUNNER=1,
+# CUDA_DEVICE_MAX_CONNECTIONS=32, PYTORCH_CUDA_ALLOC_CONF as served.
+
+## 4. GPU runs (all under flock; raw/commands.txt has each exact command)
+# tests:    shim/batch-tests.sh   the rebase's new tests on cand; the file list on cand x 2 boots and base x 1;
+#           the rebase's test files over the base's code.
+# harness:  shim/batch-harness.sh  attn_harness.py --compressor tp1: base/cand x TP4/TP3 x 2 boots (boot 2 in
+#           reverse arm order), serving env; then base/cand TP4 with breakable graphs. Each run also does the
+#           engine-grid decode check (1, 4, 8, 16 requests x 6 rows, no SP: outputs, caches, CUDA kernels).
+#           The first launch stopped on a too-small page pool for the 16-request grid shape (160 pages; now 320):
+#           kept as *-pages160-aborted.
+#           python3 shim/compare.py out/json raw/json/harness-compare-*.json <labels>
+# bench:    shim/batch-bench.sh   bench_layers.py (compressor rank mode), ABBA in one session: base, cand, cand,
+#           base. python3 shim/cells.py out/json raw/json/bench-cells.json
+
+## 5. Apply check (CPU)
+shim/apply_check.sh <0796 r4 patch>   # -> raw/apply-check.txt: fresh clone at 4e8133ff, git apply --check,
+#   git am (fixed committer, --committer-date-is-author-date), tree = the GPU runs' cand tree, diff --check.
+
+## 6. Testbed files (candidate-56/, for the coordinator to add)
+# tp4-switched-956r4.json (+ -dev): candidate-56's image with 956r4/overlay mounted (the 7 non-test files 0795
+# and 0796 change, at candidate-54 + 0796 r4); attribute-956r4-tp4-switched.json: the prefill suite ABBA against
+# tp4-switched-no957p1-no956, then the grid step alone ABBA against tp4-switched-no957p1-no956-dev.

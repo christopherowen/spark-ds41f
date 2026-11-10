@@ -1,0 +1,934 @@
+{
+ "pr": 956,
+ "title": "perf(dsv41): SP ratio-2 compressor projection and CED encoder-only chunks",
+ "round": 3,
+ "revision": "r4: the round-3 rebase re-derived on candidate-54 alone, without #957 part 1 (0795 dropped from the round)",
+ "candidate": "candidate-56 (0796)",
+ "testbed": "tp4-switched (sp1..sp4)",
+ "verdict": "ready",
+ "verdict_reason": "The patch applies to candidate-54 (4e8133ff) alone. Every output the layer harness compares (SP prefill, chunked prefill, SP decode) is byte-identical to candidate-54's. Decode without SP gives the same bytes and launches the same CUDA kernels in the same order. On one GPU at TP4 rank shapes, layer 2's SP prefill step per rank is 14.7-20.0% faster at 4K-64K, with every candidate boot below every base boot. Static memory rises by 10 MiB per ratio-2 layer per rank (30 MiB). The testbed runs (prefill ABBA, then the grid step ABBA against tp4-switched-no957p1-no956) are the coordinator's; the profile and spec are in candidate-56/.",
+ "inputs": {
+  "base": {
+   "name": "candidate-54",
+   "patch_head": "4e8133ff10a125b90753c2727f162e29fe37f30c",
+   "tree": "5f021d9a7f01c03e2389dd3d8021759cfa19ea34"
+  },
+  "pr_head": "ecb3812cb8faa6423ebccceab1d658d2c8a9a30d",
+  "source_sha256": "0c20c2e22ea1a42a8fde769569ff5444d6f15ef096bb460a722fc10b315e4cd6",
+  "first_round3_rebase": "round3-956/56-02-956-... (sha256 d9b71b04..., on candidate-54 + 957-p1); its six files that 957-p1 does not touch are carried whole"
+ },
+ "patch": {
+  "file": "0796-perf-dsv41-sp-ratio2-compressor-and-ced-encoder-only-chunks.patch",
+  "author": "Christopher Owen <3221756+christopherowen@users.noreply.github.com>",
+  "date": "Sun, 8 Nov 2026 11:30:00 +0100 (the PR's own author date; committer date equal, fixed committer)",
+  "applies_on": "candidate-54 (4e8133ff) alone",
+  "patch_head": "23b10140d1b45039d7a1558d56bdc033951094c5",
+  "tree": "703f24a32e1c09ab8631f53828698e4277090b7c",
+  "diffstat": "9 files, +456 -37",
+  "files": [
+   "tests/models/test_deepseek_v4_1_ced_model.py",
+   "tests/models/test_deepseek_v4_1_compressor.py",
+   "tests/models/test_deepseek_v4_1_compressor_prepare.py",
+   "vllm/models/deepseek_v4_1/attention.py",
+   "vllm/models/deepseek_v4_1/ced.py",
+   "vllm/models/deepseek_v4_1/compressor.py",
+   "vllm/models/deepseek_v4_1/nvidia/model.py",
+   "vllm/models/deepseek_v4_1/nvidia/model_state.py",
+   "vllm/models/deepseek_v4_1/sp_prefill.py"
+  ],
+  "message": "the PR's message (Upstream base: candidate-54) plus a 'Round 3 rebase, without #957 part 1 (candidate-56)' section with what each base patch changed, the bit-exactness evidence, tests, the own mark and the memory (raw/commit-msg.txt)",
+  "sha256": "35e0ab0a7d5f6d924e04182c3dd37ead0c0ff55efa9bf950643edf62c1e6bf30"
+ },
+ "changes_from_the_first_round3_rebase": {
+  "compressor.py": "built on candidate-54's packed, column-sharded fused_wkv_wgate (no 0795). The PR's compressor hunks apply as written. At every TP > 1, bind() gathers the unpacked shards once before memory profiling and unpads each 512-column part into one [1024, 5120] BF16 weight for the ratio-2 SP projection. bf16_gemm_two(512, 5120, float32) uses the sharded layer's split (shards=5, blocked=True, the same K reduction as the decode/full-row projection). Decode keeps candidate-54's packed shard, kernels and column gather unchanged. The comment now gives 5 MiB at ratio one and 10 MiB at ratio two.",
+  "tilelang/linear.py": "not touched (candidate-54's: compressor weights packed at every TP)",
+  "sp_prefill.py": "module notes: every compressor layer (the CED boundary's ratio one, the encoder's ratio two) keeps one full BF16 weight for its SP projection (the first rebase said: only above TP4)",
+  "tests/models/test_deepseek_v4_1_compressor.py": "test_sp_ratio2_projection_matches_full_rows rewritten for the sharded, packed base: TP2..TP8 ranks as serving builds them; bind() makes one weight gather per rank; the SP weight is a separate [1024, 5120] tensor equal to [wkv; wgate]; the SP projection equals the ranks' project_parts plus gather_columns_into (the path without SP) and TP1's project_parts",
+  "unchanged": "attention.py (_sp_front path for SP compressor layers on #1009 r1; the SP global-KV call beside #1012 r1's decode overlap), ced.py (CEDState.encoder_only beside #960 r1's pinned rings), nvidia/model.py, nvidia/model_state.py, the two other test files: byte-identical to the first rebase and to the candidate-56 image's"
+ },
+ "bit_exactness": {
+  "verdict": "byte-identical to candidate-54 in every compared output",
+  "projection_test": {
+   "test": "tests/models/test_deepseek_v4_1_compressor.py::test_sp_ratio2_projection_matches_full_rows[2..8]",
+   "result": "7/7 world sizes equal bit for bit (values and gates as int32 bits) at 129, 205, 206, 207, 257, 385, 4,097 and 16,384 rows, finite and NaN/Inf inputs, against both the sharded path without SP and TP1; fails on candidate-54's code (no ratio-2 SP projection)"
+  },
+  "attention_harness": {
+   "script": "shim/attn_harness.py --compressor tp1",
+   "compressor_mode": "One process cannot hold W ranks' column shards in one module. The compressor is built as TP1 builds it (the whole packed weight), with _sp_enabled set by each arm's own rule at world size W (a probe constructed at W). This stands in for a TP-W rank because two checks hold. Candidate-54's own test asserts the TP1 projection gives the sharded projection plus the column gather's bits. The new test asserts the SP projection gives both at 129..16,384 rows.",
+   "scenarios": "whole prefills of 4,096, 4,097 and 16,384 rows; a chunked prefill 4,097 + 4,096 + 2,051 rows with caches and the ratio-2 state ring carried; 90 decode rows beside a 4,006-row prefill; SP decode steps of 214 and 216 rows; plus the engine-grid decode check below",
+   "also": "the candidate's outputs equal the first round-3 rebase's (on 957-p1) in all 18 TP4 cells",
+   "tp4_serving_env": {
+    "runs": [
+     "base-tp4-boot1",
+     "cand-tp4-boot1",
+     "cand-tp4-boot2",
+     "base-tp4-boot2"
+    ],
+    "sp_cells": 18,
+    "sp_identical": 18,
+    "grid_cells": 8,
+    "grid_identical": 8,
+    "grid_identical_with_per_stream_order": 8,
+    "problems": [],
+    "grid": [
+     {
+      "scenario": "grid-decode-c1",
+      "layer": 2,
+      "kernels": {
+       "base-tp4-boot1": 18,
+       "base-tp4-boot2": 18,
+       "cand-tp4-boot1": 18,
+       "cand-tp4-boot2": 18
+      },
+      "identical": true
+     },
+     {
+      "scenario": "grid-decode-c1",
+      "layer": 20,
+      "kernels": {
+       "base-tp4-boot1": 18,
+       "base-tp4-boot2": 18,
+       "cand-tp4-boot1": 18,
+       "cand-tp4-boot2": 18
+      },
+      "identical": true
+     },
+     {
+      "scenario": "grid-decode-c16",
+      "layer": 2,
+      "kernels": {
+       "base-tp4-boot1": 23,
+       "base-tp4-boot2": 23,
+       "cand-tp4-boot1": 23,
+       "cand-tp4-boot2": 23
+      },
+      "identical": true
+     },
+     {
+      "scenario": "grid-decode-c16",
+      "layer": 20,
+      "kernels": {
+       "base-tp4-boot1": 24,
+       "base-tp4-boot2": 24,
+       "cand-tp4-boot1": 24,
+       "cand-tp4-boot2": 24
+      },
+      "identical": true
+     },
+     {
+      "scenario": "grid-decode-c4",
+      "layer": 2,
+      "kernels": {
+       "base-tp4-boot1": 18,
+       "base-tp4-boot2": 18,
+       "cand-tp4-boot1": 18,
+       "cand-tp4-boot2": 18
+      },
+      "identical": true
+     },
+     {
+      "scenario": "grid-decode-c4",
+      "layer": 20,
+      "kernels": {
+       "base-tp4-boot1": 18,
+       "base-tp4-boot2": 18,
+       "cand-tp4-boot1": 18,
+       "cand-tp4-boot2": 18
+      },
+      "identical": true
+     },
+     {
+      "scenario": "grid-decode-c8",
+      "layer": 2,
+      "kernels": {
+       "base-tp4-boot1": 17,
+       "base-tp4-boot2": 17,
+       "cand-tp4-boot1": 17,
+       "cand-tp4-boot2": 17
+      },
+      "identical": true
+     },
+     {
+      "scenario": "grid-decode-c8",
+      "layer": 20,
+      "kernels": {
+       "base-tp4-boot1": 17,
+       "base-tp4-boot2": 17,
+       "cand-tp4-boot1": 17,
+       "cand-tp4-boot2": 17
+      },
+      "identical": true
+     }
+    ]
+   },
+   "tp3_serving_env": {
+    "runs": [
+     "base-tp3-boot1",
+     "cand-tp3-boot1",
+     "cand-tp3-boot2",
+     "base-tp3-boot2"
+    ],
+    "sp_cells": 18,
+    "sp_identical": 18,
+    "grid_cells": 8,
+    "grid_identical": 8,
+    "grid_identical_with_per_stream_order": 8,
+    "problems": [],
+    "grid": [
+     {
+      "scenario": "grid-decode-c1",
+      "layer": 2,
+      "kernels": {
+       "base-tp3-boot1": 18,
+       "base-tp3-boot2": 18,
+       "cand-tp3-boot1": 18,
+       "cand-tp3-boot2": 18
+      },
+      "identical": true
+     },
+     {
+      "scenario": "grid-decode-c1",
+      "layer": 20,
+      "kernels": {
+       "base-tp3-boot1": 18,
+       "base-tp3-boot2": 18,
+       "cand-tp3-boot1": 18,
+       "cand-tp3-boot2": 18
+      },
+      "identical": true
+     },
+     {
+      "scenario": "grid-decode-c16",
+      "layer": 2,
+      "kernels": {
+       "base-tp3-boot1": 23,
+       "base-tp3-boot2": 23,
+       "cand-tp3-boot1": 23,
+       "cand-tp3-boot2": 23
+      },
+      "identical": true
+     },
+     {
+      "scenario": "grid-decode-c16",
+      "layer": 20,
+      "kernels": {
+       "base-tp3-boot1": 24,
+       "base-tp3-boot2": 24,
+       "cand-tp3-boot1": 24,
+       "cand-tp3-boot2": 24
+      },
+      "identical": true
+     },
+     {
+      "scenario": "grid-decode-c4",
+      "layer": 2,
+      "kernels": {
+       "base-tp3-boot1": 18,
+       "base-tp3-boot2": 18,
+       "cand-tp3-boot1": 18,
+       "cand-tp3-boot2": 18
+      },
+      "identical": true
+     },
+     {
+      "scenario": "grid-decode-c4",
+      "layer": 20,
+      "kernels": {
+       "base-tp3-boot1": 18,
+       "base-tp3-boot2": 18,
+       "cand-tp3-boot1": 18,
+       "cand-tp3-boot2": 18
+      },
+      "identical": true
+     },
+     {
+      "scenario": "grid-decode-c8",
+      "layer": 2,
+      "kernels": {
+       "base-tp3-boot1": 17,
+       "base-tp3-boot2": 17,
+       "cand-tp3-boot1": 17,
+       "cand-tp3-boot2": 17
+      },
+      "identical": true
+     },
+     {
+      "scenario": "grid-decode-c8",
+      "layer": 20,
+      "kernels": {
+       "base-tp3-boot1": 17,
+       "base-tp3-boot2": 17,
+       "cand-tp3-boot1": 17,
+       "cand-tp3-boot2": 17
+      },
+      "identical": true
+     }
+    ]
+   },
+   "tp4_breakable_graphs": {
+    "runs": [
+     "base-tp4-breakable",
+     "cand-tp4-breakable"
+    ],
+    "sp_cells": 18,
+    "sp_identical": 18,
+    "grid_cells": 8,
+    "grid_identical": 8,
+    "grid_identical_with_per_stream_order": 8,
+    "problems": [],
+    "grid": [
+     {
+      "scenario": "grid-decode-c1",
+      "layer": 2,
+      "kernels": {
+       "base-tp4-breakable": 22,
+       "cand-tp4-breakable": 22
+      },
+      "identical": true
+     },
+     {
+      "scenario": "grid-decode-c1",
+      "layer": 20,
+      "kernels": {
+       "base-tp4-breakable": 22,
+       "cand-tp4-breakable": 22
+      },
+      "identical": true
+     },
+     {
+      "scenario": "grid-decode-c16",
+      "layer": 2,
+      "kernels": {
+       "base-tp4-breakable": 27,
+       "cand-tp4-breakable": 27
+      },
+      "identical": true
+     },
+     {
+      "scenario": "grid-decode-c16",
+      "layer": 20,
+      "kernels": {
+       "base-tp4-breakable": 28,
+       "cand-tp4-breakable": 28
+      },
+      "identical": true
+     },
+     {
+      "scenario": "grid-decode-c4",
+      "layer": 2,
+      "kernels": {
+       "base-tp4-breakable": 22,
+       "cand-tp4-breakable": 22
+      },
+      "identical": true
+     },
+     {
+      "scenario": "grid-decode-c4",
+      "layer": 20,
+      "kernels": {
+       "base-tp4-breakable": 22,
+       "cand-tp4-breakable": 22
+      },
+      "identical": true
+     },
+     {
+      "scenario": "grid-decode-c8",
+      "layer": 2,
+      "kernels": {
+       "base-tp4-breakable": 21,
+       "cand-tp4-breakable": 21
+      },
+      "identical": true
+     },
+     {
+      "scenario": "grid-decode-c8",
+      "layer": 20,
+      "kernels": {
+       "base-tp4-breakable": 21,
+       "cand-tp4-breakable": 21
+      },
+      "identical": true
+     }
+    ]
+   }
+  },
+  "ced_encoder_only": "unchanged from the first rebase. Not measurable on one GPU (it needs the full model). It applies only to steps whose every request is a non-final chunk ending at or before its replay floor: one dummy row per request, replayed from itself, read by no later decoder or draft window, its sampled token discarded. End-to-end confirmation: the screen's greedy identity at multi-chunk prefills."
+ },
+ "decode_unchanged": {
+  "how": "the harness's grid-decode scenarios: without SP, 1, 4, 8 and 16 requests of 6 rows (bonus + 5 drafts) at 1.5-3K context, layers 2 and 20, one warm-up then one profiled forward (torch.profiler, CUDA kernels): output, top-k and owned-cache digests, kernel name counts, and per-stream launch order. Through the decode overlap (#1012 r1) at 1-8 requests (two streams), one stream at 16.",
+  "code": "the decode path's code is not changed: the diff touches SP branches (sp_rows is not None), the compressor's SP projection and bind(), and the CED boundary's encoder-only exit (prefill only). The decode projection, its packed shard, its kernels and the column gather are candidate-54's. bind() adds one gather of the unpacked shards and binds the SP kernel. _tilelang_calls also lists sp_front_call and swa_records_call for SP compressor layers; these are keys the compressor-less layers already declare.",
+  "harness_grid": {
+   "tp4": "8/8",
+   "tp3": "8/8",
+   "tp4_breakable": "8/8",
+   "with_per_stream_launch_order": {
+    "tp4": 8,
+    "tp3": 8,
+    "tp4_breakable": 8
+   }
+  }
+ },
+ "tests": {
+  "files": "the PR's six (test_deepseek_v4_1_compressor_prepare, _compressor, _attention, _ced_model, _ced_sp, _sp_prefill) plus tests/kernels/test_deepseek_v41_tilelang_front.py, tests/models/test_deepseek_v4_1_prepare.py, tests/v1/attention/test_b12x_v41_ced_metadata.py, tests/v1/worker/test_gpu_model_runner_v2.py, tests/kernels/attention/test_deepseek_v41_ced_replay.py",
+  "errors": "test_gpu_model_runner_v2.py::test_profile_run_releases_generic_outputs_before_deepseek_profile and ::test_moe_output_buffer_is_reused_and_disjoint_from_workspace_scratch need conftest's workspace_init fixture; the image lacks tblib, so the runs use --noconftest and both arms error at setup identically",
+  "how": "pytest --noconftest -p no:cacheprovider in spark-ds41f:candidate-56 with the arm's tree mounted, serving environment, under flock",
+  "not_run": "the dgx unit suite of spark-ds41f (step 3) belongs to the candidate's assembly",
+  "newtests_cand": "18 passed, 14 warnings in 27.24s",
+  "cand_boot1": "600 passed, 15 warnings, 2 errors in 63.46s (0:01:03)",
+  "cand_boot2": "600 passed, 15 warnings, 2 errors in 49.06s",
+  "base_boot1": "582 passed, 15 warnings, 2 errors in 48.96s",
+  "newtests_on_base_code": "18 failed, 14 warnings in 11.69s"
+ },
+ "own_mark": {
+  "what": "a rank's SP prefill forward of one compressor layer (shim/bench_layers.py): layers 2 (ratio 2, the changed path of layers 2, 8, 14) and 20 (ratio 1, as an ordinary SP layer); one request's chunk of T rows; TP4 rank shapes on one GPU. The compressor is built as TP4 rank 0 builds it (its packed column shard), so the base's full-row projection and its column all-gather run at a rank's shapes, and the candidate's bind() gathers and unpads. All-gathers are device copies (no fabric). CUDA events around each forward; 8 warmup + 40 timed forwards a cell, ranks alternating.",
+  "arms": "spark-ds41f:candidate-56 (0f65de863418) with base = candidate-54's code mounted, cand = candidate-54 + 0796 r4",
+  "order": "one session, ABBA: base boot1, cand boot1, cand boot2, base boot2 (fresh container each, serving environment)",
+  "statistic": "each boot's median over all ranks' forwards; the change is the mean of boot medians with a Student-t 95% interval (df 2). slowest_rank = the largest per-rank median (the SP step waits for it).",
+  "bytes": "Per local row, SP gathers send 7,992 bytes (cand) instead of 12,288 (base) at ratio 2; at ratio 1 it's 4,920 instead of 12,288. The base's compressor column all-gather (1,024 bytes a row of the step on every rank at TP4, ratio 2) is removed.",
+  "64K_cell": "65,535 rows: CUDA's grid.y limit on the sparse MLA extend kernel (both arms); tp4-switched serves chunks of at most 16,384 rows",
+  "not_in_it": "fabric time and the CED encoder-only saving",
+  "cells_layer2_all_ranks": [
+   {
+    "T": 4096,
+    "base_ms": 7.23,
+    "cand_ms": 5.949,
+    "base_boots_ms": [
+     7.202,
+     7.258
+    ],
+    "cand_boots_ms": [
+     5.918,
+     5.98
+    ],
+    "delta_pct": -17.71,
+    "ci95_pct": [
+     -20.18,
+     -15.23
+    ],
+    "boots_separate": true,
+    "sp_gathered_bytes_per_local_row": {
+     "base": 12288,
+     "cand": 7992
+    }
+   },
+   {
+    "T": 8192,
+    "base_ms": 15.351,
+    "cand_ms": 12.287,
+    "base_boots_ms": [
+     15.316,
+     15.386
+    ],
+    "cand_boots_ms": [
+     12.251,
+     12.324
+    ],
+    "delta_pct": -19.96,
+    "ci95_pct": [
+     -21.37,
+     -18.54
+    ],
+    "boots_separate": true,
+    "sp_gathered_bytes_per_local_row": {
+     "base": 12288,
+     "cand": 7992
+    }
+   },
+   {
+    "T": 16384,
+    "base_ms": 32.9,
+    "cand_ms": 26.681,
+    "base_boots_ms": [
+     32.624,
+     33.175
+    ],
+    "cand_boots_ms": [
+     26.192,
+     27.17
+    ],
+    "delta_pct": -18.9,
+    "ci95_pct": [
+     -26.25,
+     -11.56
+    ],
+    "boots_separate": true,
+    "sp_gathered_bytes_per_local_row": {
+     "base": 12288,
+     "cand": 7992
+    }
+   },
+   {
+    "T": 32768,
+    "base_ms": 72.206,
+    "cand_ms": 58.648,
+    "base_boots_ms": [
+     72.067,
+     72.344
+    ],
+    "cand_boots_ms": [
+     58.293,
+     59.002
+    ],
+    "delta_pct": -18.78,
+    "ci95_pct": [
+     -21.04,
+     -16.51
+    ],
+    "boots_separate": true,
+    "sp_gathered_bytes_per_local_row": {
+     "base": 12288,
+     "cand": 7992
+    }
+   },
+   {
+    "T": 65535,
+    "base_ms": 168.36,
+    "cand_ms": 143.56,
+    "base_boots_ms": [
+     162.502,
+     174.219
+    ],
+    "cand_boots_ms": [
+     139.127,
+     147.994
+    ],
+    "delta_pct": -14.73,
+    "ci95_pct": [
+     -33.51,
+     4.05
+    ],
+    "boots_separate": true,
+    "sp_gathered_bytes_per_local_row": {
+     "base": 12288,
+     "cand": 7992
+    }
+   }
+  ],
+  "cells_layer20_all_ranks": [
+   {
+    "T": 4096,
+    "base_ms": 7.501,
+    "cand_ms": 6.125,
+    "base_boots_ms": [
+     7.464,
+     7.537
+    ],
+    "cand_boots_ms": [
+     6.106,
+     6.144
+    ],
+    "delta_pct": -18.34,
+    "ci95_pct": [
+     -20.71,
+     -15.96
+    ],
+    "boots_separate": true,
+    "sp_gathered_bytes_per_local_row": {
+     "base": 12288,
+     "cand": 4920
+    }
+   },
+   {
+    "T": 8192,
+    "base_ms": 16.014,
+    "cand_ms": 12.865,
+    "base_boots_ms": [
+     15.973,
+     16.055
+    ],
+    "cand_boots_ms": [
+     12.84,
+     12.891
+    ],
+    "delta_pct": -19.66,
+    "ci95_pct": [
+     -20.96,
+     -18.36
+    ],
+    "boots_separate": true,
+    "sp_gathered_bytes_per_local_row": {
+     "base": 12288,
+     "cand": 4920
+    }
+   },
+   {
+    "T": 16384,
+    "base_ms": 35.576,
+    "cand_ms": 28.332,
+    "base_boots_ms": [
+     34.918,
+     36.233
+    ],
+    "cand_boots_ms": [
+     28.32,
+     28.345
+    ],
+    "delta_pct": -20.36,
+    "ci95_pct": [
+     -28.31,
+     -12.41
+    ],
+    "boots_separate": true,
+    "sp_gathered_bytes_per_local_row": {
+     "base": 12288,
+     "cand": 4920
+    }
+   },
+   {
+    "T": 32768,
+    "base_ms": 81.69,
+    "cand_ms": 69.653,
+    "base_boots_ms": [
+     79.667,
+     83.712
+    ],
+    "cand_boots_ms": [
+     68.766,
+     70.539
+    ],
+    "delta_pct": -14.73,
+    "ci95_pct": [
+     -26.37,
+     -3.1
+    ],
+    "boots_separate": true,
+    "sp_gathered_bytes_per_local_row": {
+     "base": 12288,
+     "cand": 4920
+    }
+   },
+   {
+    "T": 65535,
+    "base_ms": 200.954,
+    "cand_ms": 178.892,
+    "base_boots_ms": [
+     199.23,
+     202.677
+    ],
+    "cand_boots_ms": [
+     173.324,
+     184.46
+    ],
+    "delta_pct": -10.98,
+    "ci95_pct": [
+     -23.46,
+     1.5
+    ],
+    "boots_separate": true,
+    "sp_gathered_bytes_per_local_row": {
+     "base": 12288,
+     "cand": 4920
+    }
+   }
+  ],
+  "cells_slowest_rank": {
+   "layer2": [
+    {
+     "T": 4096,
+     "base_ms": 7.299,
+     "cand_ms": 6.035,
+     "base_boots_ms": [
+      7.29,
+      7.307
+     ],
+     "cand_boots_ms": [
+      6.008,
+      6.062
+     ],
+     "delta_pct": -17.31,
+     "ci95_pct": [
+      -18.96,
+      -15.67
+     ],
+     "boots_separate": true,
+     "sp_gathered_bytes_per_local_row": {
+      "base": 12288,
+      "cand": 7992
+     }
+    },
+    {
+     "T": 8192,
+     "base_ms": 16.002,
+     "cand_ms": 12.637,
+     "base_boots_ms": [
+      16.027,
+      15.978
+     ],
+     "cand_boots_ms": [
+      12.636,
+      12.638
+     ],
+     "delta_pct": -21.03,
+     "ci95_pct": [
+      -21.7,
+      -20.36
+     ],
+     "boots_separate": true,
+     "sp_gathered_bytes_per_local_row": {
+      "base": 12288,
+      "cand": 7992
+     }
+    },
+    {
+     "T": 16384,
+     "base_ms": 34.885,
+     "cand_ms": 28.379,
+     "base_boots_ms": [
+      34.494,
+      35.276
+     ],
+     "cand_boots_ms": [
+      28.075,
+      28.683
+     ],
+     "delta_pct": -18.65,
+     "ci95_pct": [
+      -24.75,
+      -12.55
+     ],
+     "boots_separate": true,
+     "sp_gathered_bytes_per_local_row": {
+      "base": 12288,
+      "cand": 7992
+     }
+    },
+    {
+     "T": 32768,
+     "base_ms": 78.319,
+     "cand_ms": 65.029,
+     "base_boots_ms": [
+      77.869,
+      78.769
+     ],
+     "cand_boots_ms": [
+      65.018,
+      65.039
+     ],
+     "delta_pct": -16.97,
+     "ci95_pct": [
+      -19.44,
+      -14.5
+     ],
+     "boots_separate": true,
+     "sp_gathered_bytes_per_local_row": {
+      "base": 12288,
+      "cand": 7992
+     }
+    },
+    {
+     "T": 65535,
+     "base_ms": 192.268,
+     "cand_ms": 166.352,
+     "base_boots_ms": [
+      191.34,
+      193.196
+     ],
+     "cand_boots_ms": [
+      166.098,
+      166.607
+     ],
+     "delta_pct": -13.48,
+     "ci95_pct": [
+      -15.63,
+      -11.32
+     ],
+     "boots_separate": true,
+     "sp_gathered_bytes_per_local_row": {
+      "base": 12288,
+      "cand": 7992
+     }
+    }
+   ],
+   "layer20": [
+    {
+     "T": 4096,
+     "base_ms": 7.661,
+     "cand_ms": 6.319,
+     "base_boots_ms": [
+      7.647,
+      7.674
+     ],
+     "cand_boots_ms": [
+      6.286,
+      6.352
+     ],
+     "delta_pct": -17.51,
+     "ci95_pct": [
+      -19.52,
+      -15.51
+     ],
+     "boots_separate": true,
+     "sp_gathered_bytes_per_local_row": {
+      "base": 12288,
+      "cand": 4920
+     }
+    },
+    {
+     "T": 8192,
+     "base_ms": 17.019,
+     "cand_ms": 13.676,
+     "base_boots_ms": [
+      16.917,
+      17.12
+     ],
+     "cand_boots_ms": [
+      13.693,
+      13.659
+     ],
+     "delta_pct": -19.64,
+     "ci95_pct": [
+      -22.23,
+      -17.05
+     ],
+     "boots_separate": true,
+     "sp_gathered_bytes_per_local_row": {
+      "base": 12288,
+      "cand": 4920
+     }
+    },
+    {
+     "T": 16384,
+     "base_ms": 39.224,
+     "cand_ms": 31.728,
+     "base_boots_ms": [
+      39.121,
+      39.327
+     ],
+     "cand_boots_ms": [
+      31.747,
+      31.709
+     ],
+     "delta_pct": -19.11,
+     "ci95_pct": [
+      -20.26,
+      -17.96
+     ],
+     "boots_separate": true,
+     "sp_gathered_bytes_per_local_row": {
+      "base": 12288,
+      "cand": 4920
+     }
+    },
+    {
+     "T": 32768,
+     "base_ms": 93.924,
+     "cand_ms": 80.64,
+     "base_boots_ms": [
+      93.929,
+      93.92
+     ],
+     "cand_boots_ms": [
+      80.363,
+      80.916
+     ],
+     "delta_pct": -14.14,
+     "ci95_pct": [
+      -15.41,
+      -12.88
+     ],
+     "boots_separate": true,
+     "sp_gathered_bytes_per_local_row": {
+      "base": 12288,
+      "cand": 4920
+     }
+    },
+    {
+     "T": 65535,
+     "base_ms": 261.859,
+     "cand_ms": 235.656,
+     "base_boots_ms": [
+      260.281,
+      263.436
+     ],
+     "cand_boots_ms": [
+      235.323,
+      235.989
+     ],
+     "delta_pct": -10.01,
+     "ci95_pct": [
+      -12.66,
+      -7.36
+     ],
+     "boots_separate": true,
+     "sp_gathered_bytes_per_local_row": {
+      "base": 12288,
+      "cand": 4920
+     }
+    }
+   ]
+  },
+  "summary": "layer 2: -17.7% (4K: 7.23 -> 5.95 ms), -20.0% (8K), -18.9% (16K, the served chunk: 32.90 -> 26.68 ms), -18.8% (32K), -14.7% (64K). Every candidate boot is below every base boot in every cell. Layer 20: -11.0 to -20.4%. At 16K that is about 6.2 ms per ratio-2 layer of rank compute and local copies, about 19 ms over layers 2, 8 and 14, before any fabric saving. The 64K all-ranks interval [-33.5%, +4.1%] is wide because both arms' boots spread (base 162.5/174.2 ms, cand 139.1/148.0 ms); its slowest-rank cell is -13.5% [-15.6%, -11.3%]. Without 957-p1 the base's ratio-2 layer is slightly faster on one GPU than with it (32.90 vs 33.41 ms at 16K), so the candidate's relative gain is a little smaller than in the first rebase (-18.9% vs -22.0%)."
+ },
+ "static_memory": {
+  "per_rank": "+10 MiB per ratio-2 layer (the [1024, 5120] BF16 SP weight, separate from the packed shard), +30 MiB over layers 2, 8 and 14, at every TP > 1. The ratio-1 boundary's 5 MiB SP weight is candidate-54's already.",
+  "testbed": "the startup_memory arms of attribute-956r4-tp4-switched.json record it on tp4-switched; the KV pool sizes from the memory left, so its startup token count may read about 30 MiB of KV lower",
+  "measured_one_gpu": {
+   "allocated_after_declare_bytes": {
+    "base-boot1": 1601362944,
+    "cand-boot1": 1611848704,
+    "cand-boot2": 1611848704,
+    "base-boot2": 1601362944
+   },
+   "sp_weight_bytes": {
+    "base-boot1": {
+     "2": 0,
+     "20": 5242880
+    },
+    "cand-boot1": {
+     "2": 10485760,
+     "20": 5242880
+    },
+    "cand-boot2": {
+     "2": 10485760,
+     "20": 5242880
+    },
+    "base-boot2": {
+     "2": 0,
+     "20": 5242880
+    }
+   },
+   "delta_cand_minus_base_bytes": [
+    10485760
+   ]
+  }
+ },
+ "apply_check": {
+  "result": "git apply --check and git am on a fresh candidate-54 clone: clean. Tree = the GPU runs' candidate tree; git diff --check clean.",
+  "other_round3_sets": "no file in common with candidates 55 (1008, 978, 988-deadrow, 995-guard) or 57 (957-p2, 957-p4, 957-p5); 1006 (queued) shares attention.py and nvidia/model.py",
+  "receipt_lines": [
+   "base: 4e8133ff10a125b90753c2727f162e29fe37f30c tree 5f021d9a7f01c03e2389dd3d8021759cfa19ea34",
+   "956 r4 sha256: 35e0ab0a7d5f6d924e04182c3dd37ead0c0ff55efa9bf950643edf62c1e6bf30",
+   "git apply --check on candidate-54: clean",
+   "git am on candidate-54: ok, patch head 23b10140d1b45039d7a1558d56bdc033951094c5, tree 703f24a32e1c09ab8631f53828698e4277090b7c",
+   "git diff --check base..HEAD: clean",
+   "tree of the GPU runs' cand arm: 703f24a32e1c09ab8631f53828698e4277090b7c",
+   "author: Christopher Owen <3221756+christopherowen@users.noreply.github.com> Sun Nov 8 11:30:00 2026 +0100",
+   "committer: Christopher Owen <3221756+christopherowen@users.noreply.github.com> Sun Nov 8 11:30:00 2026 +0100",
+   "9 files changed, 456 insertions(+), 37 deletions(-)",
+   "APPLY_DONE"
+  ]
+ },
+ "testbed_files_for_coordinator": {
+  "candidate-56/tp4-switched-956r4.json": "extends candidate-56/tp4-switched.json and mounts candidate-56/956r4/overlay over the image: the 7 non-test files 0795 and 0796 change, at candidate-54 + 0796 r4. compressor.py, tilelang/linear.py and sp_prefill.py differ from the image; attention.py, ced.py, nvidia/model.py and nvidia/model_state.py equal it. No tree hash in its notes.",
+  "candidate-56/tp4-switched-956r4-dev.json": "the same with VLLM_SERVER_DEV_MODE=1, for the engine grid",
+  "candidate-56/attribute-956r4-tp4-switched.json": "run candidate-56-attribute-956r4-tp4-switched: sync; the prefill suite (candidate-56/prefill-suite.json) ABBA with startup memory: 956r4, no957p1-no956, no957p1-no956-again, 956r4-again; then the grid step alone (candidate-48/grid-suite.json) ABBA: no957p1-no956-dev, 956r4-dev, 956r4-dev again, no957p1-no956-dev again (distinct labels per job)",
+  "candidate-56/956r4/overlay/": "the 7 files"
+ },
+ "deliverables": {
+  "patch": "0796-perf-dsv41-sp-ratio2-compressor-and-ced-encoder-only-chunks.patch",
+  "overlay": "overlay/: every file the patch changes, as in tree 703f24a3 (vllm/... and tests/...)",
+  "candidate-56": "the testbed profile, dev profile, spec and 956r4/overlay",
+  "commands": "commands.txt (summary) and raw/commands.txt (every GPU command verbatim with UTC times, load, running containers, exit code, end_of label)",
+  "raw": "raw/: every output, aborted runs included, json results, compare and cells summaries, apply check",
+  "scripts": "shim/"
+ },
+ "runs_kept_that_failed": [
+  "harness-base-tp4-boot1-pages160-aborted: the 16-request grid shape needed 289 SWA pages of a 160-page pool (AssertionError in the harness's page allocator); the pool is 320 pages in the kept runs; the batch was restarted from its first run so every compared run has the same pool"
+ ],
+ "environment": {
+  "host": "sp8 (spark-0016, NVIDIA GB10)",
+  "image": "spark-ds41f:candidate-56 sha256:0f65de863418e6ebfc08562b8ac6be43ffea51a0db1e845cafe416cdfbf474bc (built on sp8)",
+  "gpu_lock": "every GPU command under flock /tmp/spark-lab-gpu.lock after checking ~/spark-hold.json absent and no serving container",
+  "no": "no pushes, commits in spark-ds41f, PRs, image builds, testbed, cluster or window operations; nothing built or replayed on the laptop"
+ }
+}
