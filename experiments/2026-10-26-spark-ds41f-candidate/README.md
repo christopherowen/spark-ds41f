@@ -1091,3 +1091,13 @@ candidate-54 plus #957 (its parts 2 and 4), tested at `tp3-switched` (sp5..sp7).
 - **Series:** [candidate-57/vllm/series](candidate-57/vllm/series) (`0001..0798`, 673 patches;
   `patchset_sha256` `5131e020`, `patch_head` `d74e38ee`, `expected_tree` `72b40d71`).
 - **Status:** prepared and locked; not built, not measured.
+
+## Candidate 58 ([candidate-58/](candidate-58))
+
+The merged base of round 3: candidate-54 plus every PR that passed PR validation in candidates 55-57 (#1008 with its sparknet patch, #988's dead-row part, #956 r4, #957's parts 2 and 4), each reworked PR as its corrected patch, and TP3's L2 prefetch caps (15/12/12 MB, from candidate-54's cap sweep) as its own recipe variable. #978 fails the gate after its second rework (a third rework is under way by owner exception), #957's parts 1 and 5 and #984 are dropped, and #995's guard is inert, so they are left out. It is verified, not release-qualified, on `tp4-ring`, `tp4-switched` and `tp3-switched`: the gate, the screen against candidate-54's recorded screens, and the carried fixes' live checks. Verified on all three, it becomes the first frozen candidate. Sources, stacking and the runs are in its README.
+
+- **Series:** [candidate-58/vllm/series](candidate-58/vllm/series) (`0001..0796`, 676 patches;
+  `patchset_sha256` `e22e7270`, `patch_head` `e5911bdf`, `expected_tree` `4815b7a0`) and
+  [candidate-58/sparknet/series](candidate-58/sparknet/series) (`0001` on 1107's pin; `patchset_sha256` `55c0ea53`,
+  `patch_head` `d50a1b4c`, `expected_tree` `dab8c457`).
+- **Status:** prepared and locked; not built, not measured.
