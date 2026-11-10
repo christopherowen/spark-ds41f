@@ -207,4 +207,12 @@ Built on sp8 (`spark-ds41f:candidate-57`, image ID `ba512cb2`). Its release test
 | --- | --- | --- |
 | `tp3-switched` | identical outputs; candidate-54's TP3 hashes 5c22ce41/bce6092e | grid the same (4-request shapes 1.7-1.9% faster), c8 decode 0.56% faster (one boot), `single-stream` and `sampled` the same, greedy identical; prefill not measured (sp5's 4 GiB bench floor) ([receipts/tp3-switched](receipts/tp3-switched/README.md)) |
 
-Pending: the release tests and the own marks of #957 parts 2 and 4 (sp8).
+Its release tests pass on sp8 (10,174 passed, 311 skipped, 0 failed). Both own marks are met
+([receipts/own-marks](receipts/own-marks/README.md)):
+- **#957 part 2:** confirmed on 4+4 boots in one session: TP3 12- and 16-row cells 2.7-3.8% faster a call beyond the
+  interval, no TP4 cell slower (the c1 shape +0.2%, the same), outputs bit-identical. Predicted serving share about
+  -0.05% at TP3 c1: a micro gain below serving resolution, carried forward.
+- **#957 part 4:** the fused calibration faster in 5/5 cells, within 1-2 FP32 ULP; the dummy run now drafts the
+  active requests through the (4, 20) graph.
+
+**Verdict: candidate-57 passes.** #957 parts 2 and 4 join the next merged base.
