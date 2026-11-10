@@ -1,0 +1,154 @@
+{
+ "953": {
+  "tests/v1/spec_decode/test_adaptive_verification.py": [
+   {
+    "base_lines": 221,
+    "pr_lines": 56,
+    "base_head": "def test_sampling_states_unseeded_requests_stay_lockstep_across_tp_ranks():\n    \"\"\"Unseeded temperature > 0 requests must draw identical per-request seeds on\n    every TP rank even when rank-local callers perturb the global NumPy RNG.\"\"\"\n    from vllm.sampling_params import SamplingParams\n    from v",
+    "pr_head": "def test_high_row_cost_ceiling_bounds_c16_prose_without_penalizing_code():\n    \"\"\"Above 40 rows, the second 32-row CTA / MXFP8 block slope prunes low-yield\n    2nd and 3rd prose drafts at c16 while still admitting high-confidence code drafts.\"\"\"\n    req_ids = [f\"r{i}\" for i in range(16)]\n    num_tok"
+   }
+  ],
+  "vllm/v1/worker/gpu/spec_decode/adaptive_verification.py": [
+   {
+    "base_lines": 1,
+    "pr_lines": 3,
+    "base_head": "SINGLE_REQ_TILE_SPILL_SCALE = 2.0\n",
+    "pr_head": "HIGH_ROW_COST_CEILING = 40\nHIGH_ROW_COST_ABOVE_SCALE = 0.78\nCOHORT_CONFIDENCE_TOL = 0.025\n"
+   },
+   {
+    "base_lines": 1,
+    "pr_lines": 5,
+    "base_head": "        self.single_req_tile_spill_scale = SINGLE_REQ_TILE_SPILL_SCALE\n",
+    "pr_head": "        self.high_row_cost_ceiling = HIGH_ROW_COST_CEILING\n        self.high_row_cost_above_scale = HIGH_ROW_COST_ABOVE_SCALE\n        self.cohort_confidence_tol = COHORT_CONFIDENCE_TOL\n        self._capacities_cpu_override: dict[str, int] | None = None\n        self._cohort_locked = False\n"
+   },
+   {
+    "base_lines": 22,
+    "pr_lines": 8,
+    "base_head": "    def _step_cost(\n        self, rows: np.ndarray, *, num_sampling_requests: int = 1\n    ) -> np.ndarray:\n        \"\"\"Relative verification step cost with a 16-row Tensor Core MMA tile knee.\n\n        Across concurrent decode requests (``num_sampling_requests > 1``), rows\n        above ``HIGH_ROW_COS",
+    "pr_head": "    def _step_cost(self, rows: np.ndarray) -> np.ndarray:\n        \"\"\"Relative verification step cost with a 16..40-row coalesced tile band.\"\"\"\n        knee = getattr(self, \"high_row_cost_knee\", HIGH_ROW_COST_KNEE)\n        scale = getattr(self, \"high_row_cost_scale\", HIGH_ROW_COST_SCALE)\n        ceil"
+   },
+   {
+    "base_lines": 12,
+    "pr_lines": 76,
+    "base_head": "        num_sampling_requests = np.count_nonzero(\n            self.req_states.num_computed_tokens_np[slots] + num_non_draft_tokens\n            >= self.req_states.prefill_len.np[slots]\n        )\n        expected_tokens = np.concatenate(\n            ([num_sampling_requests], num_sampling_requests + np",
+    "pr_head": "        num_sampling_requests = int(np.count_nonzero(is_sampling))\n        capacities_cpu: np.ndarray | None = None\n        if cohorts:\n            in_cohort = np.zeros(num_reqs, dtype=bool)\n            units: list[tuple[float, list[int]]] = []\n            for idxs in cohorts.values():\n             "
+   },
+   {
+    "base_lines": 10,
+    "pr_lines": 5,
+    "base_head": "            if num_reqs == 1:\n                scheduled_drafts[0] = draft_budget\n            async_tensor_h2d(scheduled_drafts, out=capacities)\n            if draft_budget < int(scheduled_drafts.sum()):\n                tilelang_inputs.assign_draft_budget(\n                    self._confidence_probs[:",
+    "pr_head": "            if override is not None:\n                cohort_caps = np.fromiter(\n                    (override[req_id] for req_id in req_ids),\n                    dtype=np.int32,\n                    count=num_reqs,\n"
+   }
+  ]
+ },
+ "956": {
+  "vllm/models/deepseek_v4_1/attention.py": [
+   {
+    "base_lines": 7,
+    "pr_lines": 11,
+    "base_head": "        else:\n            # _sp_front: prefill SP's local q MXFP8 cast + SWA record front and the\n            # gathered SWA record writer.\n            calls.append(sp_front_call(self.q_norm.variance_epsilon))\n            calls.append(\n                swa_records_call(self.swa_cache_layer.block_size",
+    "pr_head": "        # _gather_front: prefill SP's BF16 front, the index head weights beside\n        # the normalized halves.\n        from vllm.models.deepseek_v4_1.tilelang import columns\n\n        widths = (self.q_lora_rank, 512)\n        if self.indexer is not None:\n            widths += (self.indexer.heads,)\n "
+   },
+   {
+    "base_lines": 2,
+    "pr_lines": 10,
+    "base_head": "        q_cast = None\n        if sp_rows is not None and self.compressor is None:\n",
+    "pr_head": "        local_hidden = None\n        if sp_rows is not None and (\n            self.compressor is None\n            or (\n                type(self.compressor) is DeepseekCompressor\n                and getattr(self.compressor, \"_sp_kernel\", None) is not None\n            )\n        ):\n            if self."
+   },
+   {
+    "base_lines": 3,
+    "pr_lines": 17,
+    "base_head": "            if overlap_decode:\n                index_query = self._forward_decode_overlapped(\n                    q,\n",
+    "pr_head": "            if swa is original_swa:\n                if hidden_states is not None:\n                    self._prepare_global_kv(positions, hidden_states)\n                elif local_hidden is not None:\n                    self._prepare_global_kv(\n                        positions, local_hidden, sp_rows"
+   }
+  ],
+  "vllm/models/deepseek_v4_1/ced.py": [
+   {
+    "base_lines": 11,
+    "pr_lines": 1,
+    "base_head": "        pin = self.indices.device.type == \"cuda\"\n        self._limits_host_ring = tuple(\n            torch.empty(max_requests, dtype=torch.int32, device=\"cpu\", pin_memory=pin)\n            for _ in range(self._STAGE_RING_SIZE)\n        )\n        self._floors_host_ring = tuple(\n            torch.empty(",
+    "pr_head": "        self.encoder_only: bool = False\n"
+   }
+  ]
+ },
+ "967": {
+  "tests/kernels/attention/test_deepseek_v41_tilelang.py": [
+   {
+    "base_lines": 31,
+    "pr_lines": 23,
+    "base_head": "@pytest.mark.parametrize(\"heads\", [16, 24])\ndef test_sparse_mla_short_indexed_segments_match_across_routes(heads, rows=6):\n    \"\"\"Ragged indexed lengths spanning 0..300 exercise 1..4 active segments per row\n    in extend (active_segs), decode (skip_inactive=True), and split\n    (skip_inactive=False)",
+    "pr_head": "def test_sparse_mla_vectorizes_swa_dequant_and_merges_readstate_segment_ifs():\n    \"\"\"``sparse_mla`` vectorizes ``dequant_swa``'s ``T.reinterpret`` scale path\n    and merges adjacent ``seg_active`` ``IfThenElse`` blocks in Stage 1 and Stage 2.\"\"\"\n    from tvm.ir import Op\n\n    assert bool(Op.get(\"ti"
+   }
+  ]
+ },
+ "978": {
+  "vllm/v1/engine/async_llm.py": [
+   {
+    "base_lines": 16,
+    "pr_lines": 3,
+    "base_head": "        # Starlette StreamingResponse cancels an AnyIO scope on client\n        # disconnect. Once output_processor has removed local state, shield the\n        # EngineCore abort notification so it cannot be dropped mid-await.\n        with anyio.CancelScope(shield=True):\n            abort_task = asyn",
+    "pr_head": "        for req_id in all_request_ids:\n            self._pending_mm_retries.pop(req_id, None)\n        await self.engine_core.abort_requests_async(all_request_ids)\n"
+   }
+  ]
+ },
+ "995": {
+  "tests/v1/spec_decode/test_copy_drafts.py": [
+   {
+    "base_lines": 39,
+    "pr_lines": 238,
+    "base_head": "def test_copy_match_long_context_two_tier_scan():\n    \"\"\"Above 32K tokens, copy_match finds recent-window matches, initial-prefix\n    matches, and sparse first-quarter 256-token matches exactly.\"\"\"\n    rng = np.random.default_rng(20261108)\n    length = 131072\n    history = _history(3, length + 64)\n ",
+    "pr_head": "def test_negative_slot_bounds_guard_in_alloc_and_apply():\n    \"\"\"Negative entries in idx_mapping never read or write slot -1 of history,\n    total_len, int_state, or float_state, and fall back to DSpark proposals.\"\"\"\n    rng = np.random.default_rng(20261108)\n    width = 256\n    # Allocate with a lea"
+   }
+  ],
+  "vllm/v1/worker/gpu/spec_decode/tilelang_copy.py": [
+   {
+    "base_lines": 5,
+    "pr_lines": 23,
+    "base_head": "            matched[0] = 1\n        if matched[0] != 0:\n            count_run(slot, history, key, e, run, stepping, ok)\n            if run[0] >= need_len[0]:\n                hit[0] = 1\n",
+    "pr_head": "            run = T.alloc_var(T.int32, init=1)\n            # The shortest level first: most ends fail on its first\n            # token. A token is loaded only while the run reaches it.\n            for j in T.unroll(1, min_match):\n                if run == j:  # noqa: SIM102\n                    if hi"
+   },
+   {
+    "base_lines": 202,
+    "pr_lines": 33,
+    "base_head": "                searching[0] = 1\n                if top_aligned <= _DENSE_SCAN_LIMIT:\n                    while warp_tile + 32 >= min_match and searching[0] != 0:\n                        hit[0] = 0\n                        e = warp_tile + tx % 32 + 1\n                        if min_match <= e and e <=",
+    "pr_head": "                searching = T.alloc_var(T.int32, init=1)\n                while warp_tile + 32 >= need_len and searching != 0:\n                    hit[0] = 0\n                    e = warp_tile + tx % 32 + 1\n                    if need_len <= e and e <= full_last:\n                        evaluate_end(\n"
+   }
+  ]
+ },
+ "1003": {
+  "tests/v1/spec_decode/test_adaptive_verification.py": [
+   {
+    "base_lines": 221,
+    "pr_lines": 76,
+    "base_head": "def test_sampling_states_unseeded_requests_stay_lockstep_across_tp_ranks():\n    \"\"\"Unseeded temperature > 0 requests must draw identical per-request seeds on\n    every TP rank even when rank-local callers perturb the global NumPy RNG.\"\"\"\n    from vllm.sampling_params import SamplingParams\n    from v",
+    "pr_head": "def test_single_tile_sunk_draft_cost_retains_positive_throughput_drafts_at_c1_and_c2():\n    \"\"\"Including sunk sequential drafting cost (DRAFT_COST_RATIO) and single-tile\n    marginal row slope (SINGLE_TILE_ROW_COST_SCALE) retains position 4 on c1/c2\n    while preserving multi-tile c8/c16 budgets.\"\"\""
+   }
+  ],
+  "vllm/v1/worker/gpu/spec_decode/adaptive_verification.py": [
+   {
+    "base_lines": 22,
+    "pr_lines": 60,
+    "base_head": "    def _step_cost(\n        self, rows: np.ndarray, *, num_sampling_requests: int = 1\n    ) -> np.ndarray:\n        \"\"\"Relative verification step cost with a 16-row Tensor Core MMA tile knee.\n\n        Across concurrent decode requests (``num_sampling_requests > 1``), rows\n        above ``HIGH_ROW_COS",
+    "pr_head": "    def _is_calibrated(self) -> bool:\n        calibrated = getattr(self, \"calibrated_confidence\", False)\n        if callable(calibrated):\n            return bool(calibrated())\n        return bool(calibrated)\n\n    def max_draft_steps_for_batch(self, num_reqs: int) -> int:\n        \"\"\"Maximum per-reque"
+   }
+  ]
+ },
+ "1006": {
+  "vllm/model_executor/layers/quantization/online/packed_bf16.py": [
+   {
+    "base_lines": 3,
+    "pr_lines": 1,
+    "base_head": "                packed = pack_bf16_weight(weight, in_place=True)\n        from vllm.v1.worker import display_carveout\n\n",
+    "pr_head": "                packed = pack_bf16_weight(weight, in_place=True, cache_tag=\"lm_head\")\n"
+   }
+  ],
+  "vllm/models/deepseek_v4_1/tilelang/embedding.py": [
+   {
+    "base_lines": 3,
+    "pr_lines": 1,
+    "base_head": "        from vllm.v1.worker import display_carveout\n\n        packed = pack_bf16_weight(data, in_place=True)\n",
+    "pr_head": "        packed = pack_bf16_weight(data, in_place=True, cache_tag=\"embed_tokens\")\n"
+   }
+  ]
+ }
+}

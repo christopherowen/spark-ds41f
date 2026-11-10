@@ -1,0 +1,68 @@
+From 4dce1f58fd43ee4c81db18ea20013e721f8620a9 Mon Sep 17 00:00:00 2001
+From: Christopher Owen <3221756+christopherowen@users.noreply.github.com>
+Date: Sun, 8 Nov 2026 11:30:00 +0100
+Subject: [PATCH] perf(dsv41): TP3/TP4 decode compressor, sparse MLA, and
+ spec-decode fusions
+
+Upstream base: 1107 vLLM patch head 320021e3c4dbb202d911ab70e2cd924c75420488.
+
+Rationale:
+1. DeepseekCompressor sharded and 12-bit packed fused_wkv_wgate across TP=3 and TP=4 (30 MiB total across the 4 compressor layers), adding 4 RoCE all-gathers and 4 column-gather launches per step plus L2-resident 12-bit unpack overhead over the COMP L2 prefetch window. Replicate fused_wkv_wgate in uncompressed BF16 for tp_size <= 4 (pack_bf16 = not disable_tp) while retaining sharded 12-bit packing above TP=4.
+2. In sparse_mla_fwd_v41 decode_body, Stage 2 guarded the 5 scalar online-softmax lines inside the unrolled segment loop with seg_active(c, SwaLengths, IdxLengths, rc), preventing full unrolling across segments. Write the (-inf, 0.0) online-softmax identity in Stage 1 for inactive segments and execute the scalar online-softmax update unconditionally in Stage 2 (guarding only the D=512 vector FMA loop with PartialStats[rc, c, hc, 1] > 0).
+3. GPUModelRunner.execute_model ran 5 eager PyTorch ops per decode step to filter dead_row_cut, sink_events, and copy_drafter.int_state before OnlineAcceptanceEstimator.step, and called adaptive_verification.get_verified_draft_counts twice per step. Fuse dead-row clamping, sink-rejection zeroing, and CopyDrafter slot masking directly into _accumulate_kernel (and _step_cpu) and reuse num_verified_draft_tokens.
+4. DSparkSpeculator launched dspark_confidence_kernel followed by _calibrate_confidence_kernel on every draft step, lazily allocated _tilelang_vocab_bias_scratch on markov_w2, and execute_model(dummy_run=True) overwrote active num_reqs with batch_desc.num_reqs (inflating DSpark drafting on 4x24 from 4 to 8 requests). Add fused dspark_confidence_calibrate_kernel / TileLangConfidenceHead.probability_and_calibrate, preallocate _tilelang_vocab_bias_scratch in process_weights_after_loading, and preserve active num_reqs alongside num_reqs_after_padding in InputBatch.make_dummy.
+5. On TP=3 each rank executes a wider MoE intermediate (768 vs 576) and 24 MLA heads (2 head tiles vs 1), increasing marginal verification row cost above the 16-row MMA knee. Use topology-aware HIGH_ROW_COST_SCALE_TP3 = 0.85 and MIN_CALIBRATED_DEAD_ROWS_TAU_TP3 = 0.12 when tp_size == 3.
+
+Quality implications:
+- Compressor BF16 projection matches TP=1 bit-for-bit across all row counts.
+- Sparse MLA Stage-1/Stage-2 online-softmax identity (-inf, 0.0) produces bit-identical outputs to the branched seg_active guard.
+- Fused _accumulate_kernel and dspark_confidence_calibrate_kernel match the unfused paths within FP32 rounding.
+
+Tests:
+- pytest tests/models/test_deepseek_v4_1_compressor.py tests/kernels/test_deepseek_v41_tilelang_confidence.py tests/v1/spec_decode/test_acceptance_estimator.py tests/v1/spec_decode/test_adaptive_verification.py tests/kernels/attention/test_deepseek_v41_tilelang.py
+
+Upstream status: local DeepSeek-V4.1 SM121 TP=3/TP=4 decode optimization.
+
+Split at selection for candidates 55-57 (957-p2): this patch keeps vllm/models/deepseek_v4_1/tilelang/sparse_mla.py (whole). Every kept line is unchanged; the other hunks are left out (receipts/selection-proposal.json).
+---
+ .../models/deepseek_v4_1/tilelang/sparse_mla.py | 17 +++++++++++------
+ 1 file changed, 11 insertions(+), 6 deletions(-)
+
+diff --git a/vllm/models/deepseek_v4_1/tilelang/sparse_mla.py b/vllm/models/deepseek_v4_1/tilelang/sparse_mla.py
+index 97d01798e..344458b90 100644
+--- a/vllm/models/deepseek_v4_1/tilelang/sparse_mla.py
++++ b/vllm/models/deepseek_v4_1/tilelang/sparse_mla.py
+@@ -768,6 +768,11 @@ def sparse_mla_fwd_v41(
+                     if h0 + h < heads:
+                         PartialStats[row, seg, h0 + h, 0] = m_g[h]
+                         PartialStats[row, seg, h0 + h, 1] = l_g[h]
++            else:
++                for h in T.Parallel(block_H):
++                    if h0 + h < heads:
++                        PartialStats[row, seg, h0 + h, 0] = -T.infinity(accum_dtype)
++                        PartialStats[row, seg, h0 + h, 1] = T.Cast(accum_dtype, 0)
+ 
+         # Fold the segment partials in order from the sink; store WO-A's input.
+         with T.Kernel(heads, rows, threads=128) as (hc, rc):
+@@ -793,12 +798,12 @@ def sparse_mla_fwd_v41(
+             pdl.chain()
+             if not skip_inactive or row_active(SwaLengths, IdxLengths, rc):
+                 for c in T.unroll(segments):
+-                    if not skip_inactive or seg_active(c, SwaLengths, IdxLengths, rc):
+-                        m_new = T.max(M, PartialStats[rc, c, hc, 0])
+-                        a = T.exp2(M - m_new)
+-                        b = T.exp2(PartialStats[rc, c, hc, 0] - m_new)
+-                        L = T.fma(PartialStats[rc, c, hc, 1], b, T.fmul(L, a))
+-                        M = m_new
++                    m_new = T.max(M, PartialStats[rc, c, hc, 0])
++                    a = T.exp2(M - m_new)
++                    b = T.exp2(PartialStats[rc, c, hc, 0] - m_new)
++                    L = T.fma(PartialStats[rc, c, hc, 1], b, T.fmul(L, a))
++                    M = m_new
++                    if not skip_inactive or PartialStats[rc, c, hc, 1] > 0:
+                         for d in T.Parallel(D):
+                             o[d] = T.fma(Partial[rc, c, hc, d], b, T.fmul(o[d], a))
+                 L = 1.0 / L
+-- 
+2.43.0
+

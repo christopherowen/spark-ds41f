@@ -1,0 +1,135 @@
+{
+ "note": "The proposed patches, as format-patch of each candidate's stack on the candidate-54 base (sp8). A PR that applies as published is its own file byte for byte. A hunk-level split keeps whole hunks of the PR's patch, every kept line unchanged, and adds a paragraph to the PR's message naming what it keeps. The two context-only rebases (#978, proposed; #967, not proposed) are recorded with their before and after SHA-256, the rebased diff (<N>-context-only.diff) and the diff between the PR's patch and it (<N>-context-only.interdiff).",
+ "context_only_rebases": {
+  "978": {
+   "before": "v/978/vllm/0762-perf-multimodal-prefix-cache-fastpath-under-mm-proce.patch",
+   "before_sha256": "f5b3787945852ead8b53d0d1e104c22a8d999861f56ab337d7c14efad3b6a920",
+   "after": "978-context-only.diff",
+   "after_sha256": "fae5fa6d4ff2f5c52ffd7e1414f3c65463d9c9db31c3d3e464650c9c0573f71e",
+   "resolved": {
+    "vllm/v1/engine/async_llm.py": [
+     "PR inserts before a region the base changed"
+    ]
+   },
+   "lines_check": {
+    "extra_added": {},
+    "missing_added": {},
+    "extra_removed": {},
+    "missing_removed": {}
+   }
+  },
+  "967": {
+   "before": "v/967/vllm/0762-perf-dsv41-tilelang-vectorize-reinterpret-and-merge-readstate-ifs.patch",
+   "before_sha256": "a1966df874c4d3582e95ff753ef925d0b026bafe103b891679a2a4f6da02114a",
+   "after": "967-context-only.diff",
+   "after_sha256": "07b45cd0fde774c882ce2b7d14ab12423a4e9cbf1efae77702e08f354a27478d",
+   "resolved": {
+    "tests/kernels/attention/test_deepseek_v41_tilelang.py": [
+     "test-append union (base, then PR)"
+    ]
+   },
+   "lines_check": {
+    "extra_added": {},
+    "missing_added": {},
+    "extra_removed": {},
+    "missing_removed": {}
+   }
+  }
+ },
+ "context_only_resolution": {
+  "978": "vllm/v1/engine/async_llm.py, AsyncLLM.abort: against the merge base the PR inserts two lines (pop each aborted request's _pending_mm_retries entry) before the `await self.engine_core.abort_requests_async(...)` line that the base's #972 (0771) replaced with its shielded abort block. The rebase puts the PR's two lines before #972's block. No line of either side is edited; the pops are synchronous, so the shield still covers the only await",
+  "967": "tests/kernels/attention/test_deepseek_v41_tilelang.py: a test appended where a base patch appended one; base, then PR"
+ },
+ "files": {
+  "55-01-perf-worker-roce-proxy-and-rank0-fast-core-affinity.patch": {
+   "pr": 1008,
+   "label": "1008",
+   "method": "git am",
+   "source_patch": "0762-perf-worker-roce-proxy-and-rank0-fast-core-affinity.patch",
+   "source_sha256": "c1cb8d079f457711dfa1072c22956152888c614cd0c35ea762a2a4618b9f2d2d",
+   "sha256": "c1cb8d079f457711dfa1072c22956152888c614cd0c35ea762a2a4618b9f2d2d"
+  },
+  "55-02-perf-multimodal-prefix-cache-fastpath-under-mm-proce.patch": {
+   "pr": 978,
+   "label": "978",
+   "method": "context-only rebase",
+   "source_patch": "0762-perf-multimodal-prefix-cache-fastpath-under-mm-proce.patch",
+   "source_sha256": "f5b3787945852ead8b53d0d1e104c22a8d999861f56ab337d7c14efad3b6a920",
+   "sha256": "0beb02afbb56e13d59b85e43ef1fb7ace7be697adf3d87e69a09f08a30154105",
+   "verification": "context-only (rebase-context check: every added and removed line equals the PR's)"
+  },
+  "55-03-988-deadrow-perf-spec-decode-sampler-dead-row-skip-and-sparse-topk.patch": {
+   "pr": 988,
+   "label": "988-deadrow",
+   "method": "hunk-level split",
+   "source_patch": "0762-perf-spec-decode-sampler-dead-row-skip-and-sparse-topk.patch",
+   "source_sha256": "ddf963daad8e05804a95b668f761ad0554683a6798f473b725bd61720e649934",
+   "sha256": "8a214c505ab76e2a3340cb5f516a28dbf67d68350008fd65f0ed1a3b3705f55d",
+   "kept": {
+    "tests/v1/worker/test_dead_rows.py": "all",
+    "vllm/v1/worker/gpu/sample/sampler.py": "all",
+    "vllm/v1/worker/gpu/sample/tilelang_auxiliary.py": "all",
+    "vllm/v1/worker/gpu/sample/tilelang_bias.py": "all",
+    "vllm/v1/worker/gpu/sample/tilelang_controls.py": "all",
+    "vllm/v1/worker/gpu/sample/tilelang_sampling.py": [
+     0,
+     1,
+     2,
+     3,
+     4,
+     5
+    ],
+    "vllm/v1/worker/gpu/sample/tilelang_thinking.py": "all",
+    "vllm/v1/worker/gpu/spec_decode/rejection_sampler.py": "all",
+    "vllm/v1/worker/gpu/tilelang_inputs.py": "all"
+   },
+   "verification": "hunk-level split: the kept hunks applied plainly on the base and the result adds and removes exactly the kept hunks' lines (lines_exact)"
+  },
+  "56-01-957-p1-perf-dsv41-tp3-decode-compressor-mla-and-spec-fusions.patch": {
+   "pr": 957,
+   "label": "957-p1",
+   "method": "hunk-level split",
+   "source_patch": "0762-perf-dsv41-tp3-decode-compressor-mla-and-spec-fusions.patch",
+   "source_sha256": "44412274ff72075c37afed64dbd9cb638cf604a34901b10f11b6fee128385e71",
+   "sha256": "db4704c89e085d81985bd49b26ab3ab20fd1fd3b03e16c23575995bc62cf4db2",
+   "kept": {
+    "tests/models/test_deepseek_v4_1_compressor.py": "all",
+    "vllm/models/deepseek_v4_1/compressor.py": "all",
+    "vllm/models/deepseek_v4_1/tilelang/linear.py": "all"
+   },
+   "verification": "hunk-level split: the kept hunks applied plainly on the base and the result adds and removes exactly the kept hunks' lines (lines_exact)"
+  },
+  "57-01-957-p2-perf-dsv41-tp3-decode-compressor-mla-and-spec-fusions.patch": {
+   "pr": 957,
+   "label": "957-p2",
+   "method": "hunk-level split",
+   "source_patch": "0762-perf-dsv41-tp3-decode-compressor-mla-and-spec-fusions.patch",
+   "source_sha256": "44412274ff72075c37afed64dbd9cb638cf604a34901b10f11b6fee128385e71",
+   "sha256": "67ed1f5fc27d4799e56098703899b35f68b72273d8cf2ac8739e4149eb301f4d",
+   "kept": {
+    "vllm/models/deepseek_v4_1/tilelang/sparse_mla.py": "all"
+   },
+   "verification": "hunk-level split: the kept hunks applied plainly on the base and the result adds and removes exactly the kept hunks' lines (lines_exact)"
+  },
+  "57-02-957-p4-perf-dsv41-tp3-decode-compressor-mla-and-spec-fusions.patch": {
+   "pr": 957,
+   "label": "957-p4",
+   "method": "hunk-level split",
+   "source_patch": "0762-perf-dsv41-tp3-decode-compressor-mla-and-spec-fusions.patch",
+   "source_sha256": "44412274ff72075c37afed64dbd9cb638cf604a34901b10f11b6fee128385e71",
+   "sha256": "b8f0bf3a661cccc0aaf856eed06a717b3a98ed230aca61d22c86cc77385cfd73",
+   "kept": {
+    "tests/kernels/test_deepseek_v41_tilelang_confidence.py": "all",
+    "vllm/models/deepseek_v4_1/nvidia/dspark.py": "all",
+    "vllm/models/deepseek_v4_1/tilelang/confidence.py": "all",
+    "vllm/v1/worker/gpu/input_batch.py": "all",
+    "vllm/v1/worker/gpu/model_runner.py": [
+     0,
+     1
+    ],
+    "vllm/v1/worker/gpu/spec_decode/dspark/speculator.py": "all"
+   },
+   "verification": "hunk-level split: the kept hunks applied plainly on the base and the result adds and removes exactly the kept hunks' lines (lines_exact)"
+  }
+ }
+}

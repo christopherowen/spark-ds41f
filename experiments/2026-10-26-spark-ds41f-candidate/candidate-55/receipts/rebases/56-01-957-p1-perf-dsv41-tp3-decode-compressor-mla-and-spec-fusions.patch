@@ -1,0 +1,123 @@
+From dbb574175463a1ff6a85122cda9f67ceb2a9ac10 Mon Sep 17 00:00:00 2001
+From: Christopher Owen <3221756+christopherowen@users.noreply.github.com>
+Date: Sun, 8 Nov 2026 11:30:00 +0100
+Subject: [PATCH] perf(dsv41): TP3/TP4 decode compressor, sparse MLA, and
+ spec-decode fusions
+
+Upstream base: 1107 vLLM patch head 320021e3c4dbb202d911ab70e2cd924c75420488.
+
+Rationale:
+1. DeepseekCompressor sharded and 12-bit packed fused_wkv_wgate across TP=3 and TP=4 (30 MiB total across the 4 compressor layers), adding 4 RoCE all-gathers and 4 column-gather launches per step plus L2-resident 12-bit unpack overhead over the COMP L2 prefetch window. Replicate fused_wkv_wgate in uncompressed BF16 for tp_size <= 4 (pack_bf16 = not disable_tp) while retaining sharded 12-bit packing above TP=4.
+2. In sparse_mla_fwd_v41 decode_body, Stage 2 guarded the 5 scalar online-softmax lines inside the unrolled segment loop with seg_active(c, SwaLengths, IdxLengths, rc), preventing full unrolling across segments. Write the (-inf, 0.0) online-softmax identity in Stage 1 for inactive segments and execute the scalar online-softmax update unconditionally in Stage 2 (guarding only the D=512 vector FMA loop with PartialStats[rc, c, hc, 1] > 0).
+3. GPUModelRunner.execute_model ran 5 eager PyTorch ops per decode step to filter dead_row_cut, sink_events, and copy_drafter.int_state before OnlineAcceptanceEstimator.step, and called adaptive_verification.get_verified_draft_counts twice per step. Fuse dead-row clamping, sink-rejection zeroing, and CopyDrafter slot masking directly into _accumulate_kernel (and _step_cpu) and reuse num_verified_draft_tokens.
+4. DSparkSpeculator launched dspark_confidence_kernel followed by _calibrate_confidence_kernel on every draft step, lazily allocated _tilelang_vocab_bias_scratch on markov_w2, and execute_model(dummy_run=True) overwrote active num_reqs with batch_desc.num_reqs (inflating DSpark drafting on 4x24 from 4 to 8 requests). Add fused dspark_confidence_calibrate_kernel / TileLangConfidenceHead.probability_and_calibrate, preallocate _tilelang_vocab_bias_scratch in process_weights_after_loading, and preserve active num_reqs alongside num_reqs_after_padding in InputBatch.make_dummy.
+5. On TP=3 each rank executes a wider MoE intermediate (768 vs 576) and 24 MLA heads (2 head tiles vs 1), increasing marginal verification row cost above the 16-row MMA knee. Use topology-aware HIGH_ROW_COST_SCALE_TP3 = 0.85 and MIN_CALIBRATED_DEAD_ROWS_TAU_TP3 = 0.12 when tp_size == 3.
+
+Quality implications:
+- Compressor BF16 projection matches TP=1 bit-for-bit across all row counts.
+- Sparse MLA Stage-1/Stage-2 online-softmax identity (-inf, 0.0) produces bit-identical outputs to the branched seg_active guard.
+- Fused _accumulate_kernel and dspark_confidence_calibrate_kernel match the unfused paths within FP32 rounding.
+
+Tests:
+- pytest tests/models/test_deepseek_v4_1_compressor.py tests/kernels/test_deepseek_v41_tilelang_confidence.py tests/v1/spec_decode/test_acceptance_estimator.py tests/v1/spec_decode/test_adaptive_verification.py tests/kernels/attention/test_deepseek_v41_tilelang.py
+
+Upstream status: local DeepSeek-V4.1 SM121 TP=3/TP=4 decode optimization.
+
+Split at selection for candidates 55-57 (957-p1): this patch keeps tests/models/test_deepseek_v4_1_compressor.py (whole); vllm/models/deepseek_v4_1/compressor.py (whole); vllm/models/deepseek_v4_1/tilelang/linear.py (whole). Every kept line is unchanged; the other hunks are left out (receipts/selection-proposal.json).
+---
+ tests/models/test_deepseek_v4_1_compressor.py | 28 +++++++++++++++----
+ vllm/models/deepseek_v4_1/compressor.py       |  6 +++-
+ vllm/models/deepseek_v4_1/tilelang/linear.py  |  5 ++--
+ 3 files changed, 30 insertions(+), 9 deletions(-)
+
+diff --git a/tests/models/test_deepseek_v4_1_compressor.py b/tests/models/test_deepseek_v4_1_compressor.py
+index 5fabb558c..fd512227b 100644
+--- a/tests/models/test_deepseek_v4_1_compressor.py
++++ b/tests/models/test_deepseek_v4_1_compressor.py
+@@ -533,11 +533,8 @@ def test_compressor_tp_sharded_fused_wkv_wgate_matches_tp1(monkeypatch, ratio):
+ 
+         tp1 = build_rank(0, 1)
+         assert tp1.fused_wkv_wgate.tp_size == 1
+-        assert hasattr(tp1.fused_wkv_wgate, "packed_bf16_exponent_base")
+-        assert tp1.fused_wkv_wgate.weight.shape == (
+-            512 * ratio,
+-            hidden + hidden // 2,
+-        )
++        assert not hasattr(tp1.fused_wkv_wgate, "packed_bf16_exponent_base")
++        assert tp1.fused_wkv_wgate.weight.shape == (512 * ratio, hidden)
+         assert unpack_bf16_layer(tp1.fused_wkv_wgate).shape == (512 * ratio, hidden)
+ 
+         x = torch.randn(
+@@ -555,7 +552,26 @@ def test_compressor_tp_sharded_fused_wkv_wgate_matches_tp1(monkeypatch, ratio):
+         from vllm.models.deepseek_v4_1.compressor import _compressor_part_cols
+         from vllm.models.deepseek_v4_1.tilelang.linear import project_parts
+ 
+-        for tp_size in (2, 3, 4, 5, 6, 7, 8):
++        for tp_size in (2, 3, 4):
++            ranks = [build_rank(r, tp_size) for r in range(tp_size)]
++            for comp in ranks:
++                assert comp.fused_wkv_wgate.tp_size == 1
++                assert not hasattr(comp.fused_wkv_wgate, "packed_bf16_exponent_base")
++                assert comp.fused_wkv_wgate.weight.shape == (512 * ratio, hidden)
++            for rows in (1, 7, 16, 64, 160):
++                inp = x[:rows]
++                ref_values, ref_gates = expected_by_rows[rows]
++                ranks[0]._project(inp)
++                assert torch.equal(
++                    ranks[0]._values[:rows], ref_values
++                ), f"tp={tp_size} rows={rows}"
++                if ratio == 2:
++                    assert torch.equal(
++                        ranks[0]._gates[:rows], ref_gates
++                    ), f"tp={tp_size} rows={rows}"
++                assert not ranks[0].fused_wkv_wgate.tilelang_counters.any()
++
++        for tp_size in (5, 6, 7, 8):
+             part_cols = _compressor_part_cols(tp_size)
+             ranks = [build_rank(r, tp_size) for r in range(tp_size)]
+             for r, comp in enumerate(ranks):
+diff --git a/vllm/models/deepseek_v4_1/compressor.py b/vllm/models/deepseek_v4_1/compressor.py
+index 999fe061a..5ea1d9a3c 100644
+--- a/vllm/models/deepseek_v4_1/compressor.py
++++ b/vllm/models/deepseek_v4_1/compressor.py
+@@ -220,7 +220,10 @@ class DeepseekCompressor(nn.Module):
+         tp_size = linear_layers.get_tensor_model_parallel_world_size()
+         self._sp_enabled = compress_ratio == 1 and tp_size > 1
+         self._sp_weight = self._sp_kernel = None
+-        disable_tp = tp_size <= 1
++        # Replicate the 4 compressor layers (30 MiB total across the model) in
++        # uncompressed BF16 up through TP4 so decode avoids 4 RoCE all-gathers,
++        # 4 column-gather launches, and L2-resident 12-bit unpack overhead.
++        disable_tp = tp_size <= 4
+         self.fused_wkv_wgate = _PaddedSplitColumnParallelLinear(
+             hidden_size,
+             compress_ratio,
+@@ -235,6 +238,7 @@ class DeepseekCompressor(nn.Module):
+         from vllm.models.deepseek_v4_1.tilelang.linear import TileLangSplitLinearMethod
+ 
+         # wkv and wgate (ratio 2) each project into their own buffer.
++        self.fused_wkv_wgate.pack_bf16 = not disable_tp
+         self.fused_wkv_wgate.quant_method = TileLangSplitLinearMethod(compress_ratio)
+         self.fused_wkv_wgate.out_dtype = (
+             torch.float32 if compress_ratio == 2 else torch.bfloat16
+diff --git a/vllm/models/deepseek_v4_1/tilelang/linear.py b/vllm/models/deepseek_v4_1/tilelang/linear.py
+index 0b14d7bba..00ab36530 100644
+--- a/vllm/models/deepseek_v4_1/tilelang/linear.py
++++ b/vllm/models/deepseek_v4_1/tilelang/linear.py
+@@ -1136,10 +1136,11 @@ class TileLangSplitLinearMethod(UnquantizedLinearMethod):
+         return dict(shards=split["shards"], blocked=split["blocked"], decode=decode)
+ 
+     def process_weights_after_loading(self, layer: nn.Module) -> None:
+-        """Pack the compressor's BF16 weight into exact 12-bit storage."""
++        """Pack the compressor's BF16 weight into exact 12-bit storage when enabled."""
+         if hasattr(layer, "_zero_pad_rows"):
+             layer._zero_pad_rows()
+-        pack_bf16_layer(layer, self._split(layer)["shards"])
++        if getattr(layer, "pack_bf16", True):
++            pack_bf16_layer(layer, self._split(layer)["shards"])
+ 
+     def _kernels(self, layer: nn.Module) -> dict:
+         """Every kernel of the split projection, as calls."""
+-- 
+2.43.0
+

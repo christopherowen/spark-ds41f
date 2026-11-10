@@ -1,0 +1,342 @@
+# Write receipts/selection-proposal.json for candidates 55-57 from the stack (sp8/stack.json), the scan and
+# the placement decisions below. Run on the laptop from the scratch directory, after receipts.py:
+#   python3 -I scripts/selection.py <scratch dir> <receipts dir>
+import json, sys, glob, os, hashlib
+
+S, R = sys.argv[1], sys.argv[2]
+stack = json.load(open(f"{S}/sp8/stack.json")); scan = json.load(open(f"{S}/scan.json"))
+prs = {p["number"]: p for p in json.load(open(f"{S}/prs.json"))}
+def head(n): return prs[n]["headRefOid"]
+def srcpath(n): return [e["path"] for e in scan[str(n)]["patches"] if e["component"] == "vllm"][0]
+def srcsha(n): return hashlib.sha256(open(sorted(glob.glob(f"{S}/v/{n}/vllm/*.patch"))[0], "rb").read()).hexdigest()
+P = {(c, r["label"]): r for c, v in stack["candidates"].items() if c != "union" for r in v["patches"]}
+
+def ready(cand, label, pr, **kw):
+    r = P[(cand, label)]
+    return dict(pr=pr, label=label, status="ready", title=prs[pr]["title"], author=prs[pr]["author"]["login"],
+                pr_head=head(pr), source_patch=srcpath(pr), source_sha256=srcsha(pr), method=r["method"],
+                proposed_patch=f"rebases/{cand}-{r['file']}", proposed_sha256=r["sha256"], **kw)
+
+def pending(pr, label, **kw):
+    return dict(pr=pr, label=label, status="pending rework", title=prs[pr]["title"], author=prs[pr]["author"]["login"],
+                pr_head=head(pr), source_patch=srcpath(pr), source_sha256=srcsha(pr), **kw)
+
+C55 = [
+    pending(995, "995-guard", kind="fix", category="F",
+        rework="see rework_needed[995-guard]",
+        own_mark="Functional: test_negative_slot_bounds_guard_in_alloc_and_apply (canary rows at slot -1 of history, total_len, "
+                 "int_state and float_state stay untouched, and negative rows fall back to DSpark's proposals) passes on the "
+                 "candidate image; the copy-drafter tests and benchmark_copy_drafts.py --gate unchanged for valid slots; and "
+                 "the rework states whether a serving path passes a negative slot to copy_alloc or copy_apply (candidate-54's "
+                 "model_runner passes input_batch.idx_mapping to both; only copy_match receives -1 rows, for mid-prefill "
+                 "requests, and it already guards slot >= 0). No core metric worse",
+        declared_output_change="none",
+        placement="fixes first; tilelang_copy.py and test_copy_drafts.py are touched by no other proposed patch; the copy "
+                  "drafter runs at every shape, so the production shape's gate checks it"),
+    ready("55", "1008", 1008, kind="perf (host)", category="H",
+        own_mark="Its bench_roce_core_affinity.py and pytest (tests/v1/worker/test_roce_cpu_affinity.py, "
+                 "tests/kernels/test_deepseek_v41_engram_host_placement.py) and the sparknet unit tests on the candidate image, "
+                 "2 boots, ABBA against the candidate-54 image in the same session. Against the base's placement (the recipe "
+                 "already runs the shared big-core regime: SPARKNET_ROCE_PROXY_CPU=big, --cpuset-cpus=5-9,15-19), the PR "
+                 "shows the mean per-step 116-collective time 0.106 and 0.084 ms (two boots) -> 0.081 and 0.082 ms, and "
+                 "removes rank-0 preemption spikes (step p99 0.939 ms on one shared-big boot): pass needs the step p99 under rank-0 API load lower beyond the "
+                 "interval and the mean not worse. On tp4-ring: the screen's 16-stream closed loop (paired decode, ITL "
+                 "percentiles) and time to ready not worse",
+        declared_output_change="none",
+        sparknet=dict(patch=scan["1008"]["patches"][0]["path"], sha256=hashlib.sha256(open(
+            f"{S}/v/1008/sparknet/0001-perf-oneshot-pin-RoCE-proxy-thread-to-dedicated-fast.patch", "rb").read()).hexdigest(),
+            applies_on="1fd6a1fb (1107's pin)", tree="dab8c4577ac1cd87f7abc59a9c44a8e9d146f579 (the PR's stated tree)",
+            assembly="needs a sparknet patch series in 55's lock (precedent: rc18/upstreams.lock.json and rc18/sparknet/series)"),
+        acts="every shape: configure_worker_cpu_affinity replaces the symbolic SPARKNET_ROCE_PROXY_CPU=big with its planned "
+             "core and VLLM_ROCE_CPU_AFFINITY defaults to on",
+        placement="needs a multi-rank TP4 testbed with the rank-0 API server under load (its own bench is one node); shares "
+                  "vllm/v1/engine/core.py with #978, so the two share a candidate"),
+    ready("55", "978", 978, kind="perf (host)", category="H",
+        own_mark="Its bench_mm_prefix_fastpath.py and tests/multimodal/test_prefix_cache_fastpath.py on the candidate image, "
+                 "2 boots, ABBA against the candidate-54 image: turn-2+ host processing of repeated images faster beyond "
+                 "the interval (the PR: 1302x1302 JPEG 18.1 -> 1.4 ms, 4 x 3840x2160 PNG 705 -> 40 ms), prompt token ids "
+                 "and mm hashes identical; plus a live two-turn image chat on the testbed whose second turn returns the "
+                 "base's text at temperature 0 (it exercises #972's abort path and the retry map this rebase touches). The "
+                 "screen sends no images, so on the testbed it shows only that no core metric is worse",
+        declared_output_change="none",
+        acts="image requests: the recipe sets --mm-processor-cache-gb 0 (cache None, the fast path's condition) and "
+             "DeepseekV4VLMultiModalProcessor inherits BaseMultiModalProcessor._cached_apply_hf_processor",
+        placement="host-side; shares core.py with #1008; context-only rebase onto #972 (rebases/rebases.json)"),
+    ready("55", "988-deadrow", 988, kind="perf (sampler)", category="P",
+        own_mark="Its screen_dead_row_and_sparse_topk.py, dead-row cells only, and tests/v1/worker/test_dead_rows.py on the "
+                 "candidate image, 2 boots, ABBA: Sampler.apply_sampling_params with dead_row_cut faster beyond the interval "
+                 "at 8 and 16 requests with top_p < 1, top_k, min_p or penalties; live rows bit-exact. Kernel time and "
+                 "CUDA-graph replay where the path is captured, both recorded",
+        declared_output_change="none (live verification rows bit-exact; dead rows are never read)",
+        acts="only on verification steps where a request needs non-temperature logits processing (top_k, top_p < 1, min_p, "
+             "penalties, logit_bias or min_tokens, bad_words, a thinking budget). The recipe's defaults (temperature 1.0, "
+             "top_p 1.0) and every screen suite send none of these, so the screen sees only its startup (the masked "
+             "copy_logits and mask_dead_rows kernels are declared) and 'no core metric worse'",
+        placement="TP4's 16 streams give the most verification rows; touches no other proposed patch's file"),
+]
+C56 = [
+    ready("56", "957-p1", 957, kind="perf", category="K1",
+        own_mark="Its screen_tp3_decode.py compressor cells and tests/models/test_deepseek_v4_1_compressor.py on the "
+                 "candidate image, 2 boots, ABBA against the candidate-54 image, by CUDA-graph replay and kernel time: the 4 "
+                 "compressor projections' local time lower beyond the interval (the PR: 103.6-107.6 -> 51.6-53.1 us a step) "
+                 "and the decode step lower by the 4 removed all-gathers (the PR: about 135-155 us a step); compressor "
+                 "outputs torch.equal to TP1 at TP2..TP4. On the testbed: engine-grid decode cells not worse, SP prefill "
+                 "at 32K and 256K not worse (at TP <= 4 the SP projection reads the replicated weight, no all-gather); the "
+                 "static memory delta recorded (the PR: +21.9..24.4 MiB a rank)",
+        declared_output_change="none (the existing test already required the sharded path to equal TP1; the replicated "
+                               "path is TP1's)",
+        acts="TP3 and TP4 (disable_tp = tp_size <= 4); TP5..TP8 unchanged",
+        placement="acts at TP4 and TP3; must share a candidate with #956, which edits compressor.py too and whose served "
+                  "prefill evidence was taken on tp4-switched"),
+    pending(956, "956", kind="perf (prefill)", category="K2", rework="see rework_needed[956]",
+        own_mark="Its servebench prefill on tp4-switched (the PR: 32K +2% against 1107's tp4-switched record; longer "
+                 "contexts in its README) as part of the screen's prefill steps, and its bf16_gemm_two bit-exactness check; "
+                 "outputs bit-exact",
+        declared_output_change="none (the PR declares bit-exact)",
+        placement="tp4-switched, where its served prefill screen was taken; with 957-p1 (compressor.py)"),
+]
+C57 = [
+    ready("57", "957-p2", 957, kind="perf", category="K1",
+        own_mark="Its screen_tp3_decode.py sparse-MLA cells on the candidate image, 2 boots, ABBA, by CUDA-graph replay: "
+                 "stage 2 at TP3 (24 heads, 12 and 16 rows) faster beyond the interval (the PR: -49..-62 us a step at 12 "
+                 "rows and -46..-99 us at 16, over 30 indexed layers), outputs torch.equal; TP4 cells (16 heads) not worse. "
+                 "On the testbed: engine-grid decode not worse",
+        declared_output_change="none: stage 2 starts M at the sink logit (finite), so an inactive segment's (-inf, 0) "
+                               "partial leaves M, L and o exactly as the skipped update did; the split decode kernel "
+                               "(skip_inactive=False) is unchanged",
+        acts="every shape's decode sparse MLA (skip_inactive defaults True)",
+        placement="measured at TP3 (24 heads); the TP3 parts go to tp3-switched"),
+    ready("57", "957-p4", 957, kind="perf (spec-decode bookkeeping)", category="P",
+        own_mark="Its screen_tp3_decode.py confidence cells and tests/kernels/test_deepseek_v41_tilelang_confidence.py on "
+                 "the candidate image, 2 boots, ABBA: probability_and_calibrate faster than probability plus "
+                 "calibrate_confidence_probs beyond the interval (the PR: 17.2-19.0 -> 8.5-9.2 us), calibrated confidences "
+                 "within FP32 rounding of the two-step path; the (4, 24) dummy run captures the (4, 20) DSpark draft graph "
+                 "(functional); paired decode at 4 and 8 streams not worse",
+        declared_output_change="draft confidences within FP32 rounding of the two-step path, so verification rows may "
+                               "differ; temperature-0 text must not change; sampled realizations may change",
+        acts="every shape with the confidence head (DSpark sample_idx_mapping is int32, the fused path's condition)",
+        semantic_review="model_runner.py is shared with the base's 0764 (#965 r1), 0769 (#980 r1), 0788 (#960 r1) and "
+                        "0791 (#998 r1); the hunks apply cleanly, but the dummy-run change alters the active num_reqs that "
+                        "#960 r1's FULL-graph capture builds its metadata for: read the two together at assembly",
+        placement="three variables in one PR part (as the PR numbers its parts); kept with 957-p2 on tp3-switched because "
+                  "#1003, its model_runner.py and dspark/speculator.py partner, is queued; touches no file of 55 or 56"),
+    pending(957, "957-p5", kind="perf (policy)", category="P", rework="see rework_needed[957-p5]",
+        own_mark="Its screen_tp3_decode.py adaptive-verification cells at TP3: c1 5 -> 4 total rows and c8 medium "
+                 "confidence 40 -> 32 rows (the PR's), paired decode at 1 and 8 streams better or not worse; TP4 unchanged",
+        declared_output_change="verification rows at TP3; temperature-0 text must not change; sampled realizations may change",
+        placement="TP3 only (tp_size == 3); the one adaptive-verification policy PR of this round (#1003 and #953 conflict "
+                  "with it and are queued)"),
+]
+
+proposal = dict(
+    round="candidates 55, 56 and 57 (round 3; PR validation, steps 1-8 of docs/release-benchmark.md)",
+    date="2026-11-10",
+    base=dict(name="candidate-54", patch_count=671, patch_head=stack["base_commit"], tree=stack["base_tree"],
+              lock="experiments/2026-10-26-spark-ds41f-candidate/candidate-54/upstreams.lock.json",
+              built="sp8, ~/spark-lab/agents/round-55-57-select/c54-vllm (scripts-as-run/build_base.sh)"),
+    owner_rules_checked=[
+        "only patches that act on DeepSeek V4.1 Flash on GB10 (left_out lists every patch left out, with its reason)",
+        "only christopherowen's PRs: gh pr view --json author for every pool PR (scripts-as-run/outputs/authors.tsv), and "
+        "every proposed patch's From: is Christopher Owen (pr-patch-targets.json). Exceptions are raised, not decided "
+        "(exceptions_for_owner)",
+    ],
+    candidates={
+        "55": dict(testbed="tp4-ring", nodes="dgx1..dgx4", shape="tp4-ring",
+                   theme="the copy-slot guard fix (pending its rework), the rank-0 and RoCE-proxy CPU affinity, the "
+                         "multimodal prefix fast path and the dead-row sampler skip. All declare no output change, so 55's "
+                         "gate on production's shape is a pure identity check",
+                   order=["995-guard", "1008", "978", "988-deadrow"], prs=C55,
+                   stack_ready=dict(order=stack["candidates"]["55"]["order"], tree=stack["candidates"]["55"]["stack_tree"],
+                                    diff_check=stack["candidates"]["55"]["check"]),
+                   lock_change="sparknet patch series with #1008's 0001 (sparknet tree dab8c457)",
+                   controls="988-deadrow's files are touched by no other 55 patch, so a tp4-no988 overlay control is "
+                            "possible; #978 and #1008 share core.py and #1008's proxy is C in sparknet, so neither has a "
+                            "pure overlay control"),
+        "56": dict(testbed="tp4-switched", nodes="sp1..sp4 (head sp1)", shape="tp4-switched",
+                   theme="#957 part 1, the replicated BF16 compressor at TP <= 4, with #956 (pending its rework), which "
+                         "edits compressor.py too",
+                   order=["957-p1", "956"], prs=C56,
+                   stack_ready=dict(order=stack["candidates"]["56"]["order"], tree=stack["candidates"]["56"]["stack_tree"],
+                                    diff_check=stack["candidates"]["56"]["check"]),
+                   note="if #956's rework does not land before assembly, 56 carries 957-p1 alone. That is still a "
+                        "measurement worth a testbed (the pool's largest expected decode gain, measured in isolation); "
+                        "it could instead join 55 (no file overlap), leaving two candidates"),
+        "57": dict(testbed="tp3-switched", nodes="sp5..sp7 (head sp5)", shape="tp3-switched",
+                   theme="#957's TP3 parts: the branchless sparse-MLA stage 2 (measured at TP3's 24 heads), the fused "
+                         "DSpark confidence calibration with the (4, 24) dummy-run fix, and (pending its rework) the TP3 "
+                         "adaptive-verification constants",
+                   order=["957-p2", "957-p4", "957-p5"], prs=C57,
+                   stack_ready=dict(order=stack["candidates"]["57"]["order"], tree=stack["candidates"]["57"]["stack_tree"],
+                                    diff_check=stack["candidates"]["57"]["check"])),
+    },
+    union=dict(applies=stack["candidates"]["union"]["applies"], tree=stack["candidates"]["union"]["tree"],
+               note="the ready stacks of 55, 56 and 57 on one tree, in that order; the three touch no common file, test "
+                    "files included"),
+    rules_checked=[
+        "no conflicting pair inside a candidate: the 7 applicable sets give 2 overlapping pairs (967/957-p2 in "
+        "sparse_mla.py, 978/1008 in core.py), both clean in both orders (pairwise-conflicts.json)",
+        "the candidates overlap in no file at all, test files included (the rule allows test files); the pending reworks' "
+        "current files keep that true (pairwise-conflicts.json, file_overlaps_with_pending_reworks)",
+        "each PR on the testbed that best measures its mark (each entry's placement)",
+        "fixes first, then the biggest likely gain: 995-guard leads 55",
+        "conflicting spec-decode policy PRs one per candidate: of the adaptive_verification.py group (957-p5, #1003, "
+        "#953) only 957-p5 is placed (57); 988-deadrow and 957-p4 conflict with no policy PR",
+    ],
+    left_out=[
+        dict(pr=988, label="988-topk", part="sparse top-k DSpark draft sampling: tilelang_sampling.py hunk 7 (the topk_* "
+             "kernels and topk_drafting_calls), dspark/speculator.py (the _cached_topk_indices path, two getattr guards, "
+             "_sample_sequential_topk), nvidia/dspark.py and qwen3_dspark.py (apply_markov_bias_topk), "
+             "tests/v1/spec_decode/test_dspark_topk.py and test_dspark_v41_gathered_markov.py",
+             reason="does nothing on this deployment: it runs only when dspark_draft_topk is set, and neither the recipe nor "
+                    "the 1017 checkpoint's config sets it (drafts are greedy)",
+             disposition="left out at selection (hunk-level split); the split is sp8's rebased/988-topk.diff (applies plainly)"),
+        dict(pr=957, label="957-p3", part="part 3, fused post-step verification bookkeeping (acceptance_estimator.py, "
+             "speculator.py, model_runner.py hunks 3-4, tests/v1/spec_decode/test_acceptance_estimator.py)",
+             reason="superseded: the base's 0764 (#965 round 1) already carries the same observe_verification fusion and "
+                    "verified-count reuse in model_runner.py, with 0769 (#980 round 1); its hunks conflict with them",
+             disposition="left out (as candidates 51-53 recorded)"),
+        dict(pr=995, label="995-ramp", part="SPARK_DS41F_COPY_MAX_DRAFTS (vllm/config/speculative.py), greedy_rejection_kernel "
+             "widths above 32 (tilelang_sampling.py), benchmark_copy_drafts.py --lookahead, "
+             "test_wide_lookahead_31_and_63_greedy_verification_and_ramp",
+             reason="does nothing on this deployment: the 31/63-draft ramp is opt-in; the recipe keeps max_drafts at 16 (17 rows)",
+             disposition="left out at selection"),
+        dict(pr=1006, label="1006-cache", part="vllm/models/deepseek_v4_1/tilelang/postload_cache.py and its hooks "
+             "(cache_tag arguments, loading_done barrier, cached reads)",
+             reason="does nothing on this deployment: it reads or writes only when VLLM_POSTLOAD_CACHE_DIR or "
+                    "SPARK_DS41F_POSTLOAD_CACHE_DIR is set; the recipe sets neither",
+             disposition="PR queued: its rework leaves the cache out"),
+        dict(pr=1006, label="1006-vl41", part="vllm/models/deepseek_v41/nvidia/vl_model.py",
+             reason="does nothing on GB10: vllm/models/deepseek_v41 routes capability family 120 to vllm/models/deepseek_v4_1",
+             disposition="PR queued"),
+    ],
+    rework_needed={
+        "995-guard": dict(why="the guard and the cap decay share copy_alloc_kernel's one hunk (the guard wraps the block in "
+                              "`if slot < 0: ... else:` and the decay rewrites the doublings update inside it), so the "
+                              "guard cannot be split out without editing a line",
+            needs=["take tilelang_copy.py hunks 1, 5 and 6 (docstring, copy_alloc, copy_apply): they apply 3-way-clean on "
+                   "candidate-54 (sp8 split 995-alloc-apply, sha256 3c150312...); copy_apply's context moved with #971 r1's "
+                   "survival loop (0789)",
+                   "in copy_alloc keep the base's `T.if_then_else(accepted >= live, T.min(doublings + 1, MAX_DOUBLINGS), 0)` "
+                   "inside the new else branch, and drop the docstring's decay sentence",
+                   "test: test_negative_slot_bounds_guard_in_alloc_and_apply alone, appended after #977's "
+                   "test_copy_match_long_context_two_tier_scan; leave ref_select and design_walk unchanged (they model "
+                   "the decay)",
+                   "state whether any serving path passes a negative slot to copy_alloc or copy_apply",
+                   "leave out the 31/63 ramp (left_out) and the copy_match anchor pruning (it conflicts with #977's two-tier "
+                   "scan in three hunks: its own experiment on the new base)"],
+            placement="55, first"),
+        "956": dict(why="semantic conflicts in attention.py with 0765 (#1012 r1, decode overlap) and 0778 (#1009 r1, "
+                        "sp_front_call replaced the BF16 front the PR edits), and in ced.py with 0788 (#960 r1, pinned "
+                        "host rings at the spot where the PR adds encoder_only)",
+            needs=["re-derive _gather_front for layers 2, 8 and 14 on #1009 r1's sp_front_call and #1012 r1's decode overlap",
+                   "add CEDState.encoder_only beside #960 r1's pinned rings",
+                   "build on 957-p1 (56's first patch): at TP <= 4 fused_wkv_wgate is replicated, so the ratio-2 SP "
+                   "projection reads the full weight (no all-gather)",
+                   "keep the PR's bit-exactness check (bf16_gemm_two against project_parts + gather_columns_into) and its "
+                   "servebench prefill on tp4-switched",
+                   "pair-check the result against 957-p1"],
+            placement="56, after 957-p1"),
+        "957-p5": dict(why="semantic conflict with 0789 (#971 r1): both set the row-cost scale (#971 adds the single-request "
+                           "SINGLE_REQ_TILE_SPILL_SCALE branch to _step_cost; part 5 picks HIGH_ROW_COST_SCALE_TP3 in "
+                           "__init__ and adds a calibrated dead-row floor)",
+            needs=["decide how HIGH_ROW_COST_SCALE_TP3 composes with #971 r1's single-request spill scale at c1",
+                   "re-derive the test's expected budgets (c8: 24 drafts, 32 rows; c1: position 3 pruned at floor 0.12) on "
+                   "candidate-54",
+                   "keep TP4 bit-for-bit unchanged"],
+            placement="57, last"),
+        "1003": dict(why="semantic conflict with 0789 (#971 r1) in _step_cost: both reprice c1 (the single-request tile "
+                         "spill against the single-tile sunk draft cost)",
+            needs=["one c1/c2 cost model on top of #971 r1, or a measured case that #1003's replaces it",
+                   "measured evidence: its c1 +6% has identical numbers on both boots (modelled, as the last triage noted)",
+                   "its halt in _sample_sequential_topk does nothing here (dspark_draft_topk unset)"],
+            placement="queued: next round, a TP4 candidate. It edits model_runner.py and dspark/speculator.py, which 57's "
+                      "957-p4 edits, and conflicts in policy with 957-p5, so no candidate of this round can hold it"),
+        "953": dict(why="semantic conflict with 0789 (#971 r1) in _step_cost and the get_num_tokens budget code",
+            needs=["rework the cohort budget and the 16..40 row band onto #971 r1",
+                   "a round that runs tp6..tp8-switched"],
+            placement="queued (cannot_measure_this_round)"),
+        "1006": dict(why="five variables in one patch, and the artifact cache's hooks sit inside hunks of model_loader/utils.py "
+                         "(with the empty_cache guard), vocab.py (with the in-place pack), moe.py, scale_codes.py, linear.py, "
+                         "packed_bf16.py and embedding.py, so no hunk-level split leaves the cache out. Its only conflicts "
+                         "with the base are cache_tag lines next to 0791 (#998 r1)",
+            needs=["one patch a variable: vectorized post-load prep (scale codes, FP4 tiles); in-place pack12 staging; "
+                   "wq_b trim on packed tiles; the empty_cache pressure guard; lazy deepseek_v41 import and the tokenizer's "
+                   "config reuse; first-prefill L2-prefetch and SP side-stream warm-up",
+                   "leave out postload_cache.py and deepseek_v41/nvidia/vl_model.py (left_out)",
+                   "each judged on time to ready and the startup MemAvailable floor"],
+            placement="queued: next round (it overlaps 957-p1 in linear.py and #956 in attention.py and nvidia/model.py)"),
+    },
+    cannot_measure_this_round=[
+        dict(pr=953, why="its mark is the TP6..TP8 switched prose c16 regression (1030 -> 1107: -9.6%, -9.6%, -13.5%), and "
+                         "no testbed this round runs those shapes: tp4-switched holds sp1..sp4, tp3-switched sp5..sp7 and "
+                         "sp8 is the single-GPU node, so TP6..TP8 needs sp1..sp8 together. At TP3 or TP4 only 'no metric "
+                         "worse' could be judged, not its mark. It cannot be judged this round. Its burst coalescing "
+                         "(core.py, test_late_admission.py) is file-separable and applies, but it is one of the three "
+                         "mechanisms behind that same TP6..TP8 regression, and it shares core.py with 55's #978 and #1008"),
+        dict(pr=988, label="988-deadrow", why="no screen or release suite sends non-temperature sampling parameters: only "
+                         "its own bench (step 7, sp8) measures its mark"),
+        dict(pr=978, why="no screen suite sends images: only its own bench and a live two-turn image check measure its mark"),
+        dict(pr=1003, why="its only evidence is modelled (identical on both boots); not measured until its rework"),
+        dict(pr=967, why="not proposed (queued.967)"),
+    ],
+    queued=[
+        dict(pr=967, category="K1 (toolchain)",
+             why="a compiler-wide TileLang pass change (loop_vectorize.cc, merge_if_stmt.cc): every TileLang kernel "
+                 "recompiles under it. It can be built here, since its TileLang 0014 applies on 1107's TileLang tree (tree "
+                 "eb89b5f3) and its vLLM half is a context-only test rebase (rebases/967-context-only.diff). But it would "
+                 "change the code of every other PR's kernels in its candidate, confounding their marks and any "
+                 "attribution, and it shares sparse_mla.py with 57's 957-p2",
+             next="owner: with the #974/#1015 toolchain track. Measured alone (its own candidate, with an every-kernel "
+                  "bit-identity screen) or with that track, not inside a PR batch"),
+        dict(pr=995, label="995-decay-and-anchor", category="P",
+             why="the cap decay (P) and copy_match's anchor pruning: separate variables from the guard; the pruning "
+                 "conflicts with #977's two-tier scan",
+             next="their own experiments on the new base after the guard's verdict"),
+        dict(pr=1003, next="rework_needed[1003]"), dict(pr=953, next="rework_needed[953]"),
+        dict(pr=1006, next="rework_needed[1006]"),
+        dict(pr=1008, note="placed in 55; listed here only for its lock change"),
+    ],
+    not_inert_notes=[
+        "#1008 acts by default: configure_worker_cpu_affinity replaces the recipe's symbolic SPARKNET_ROCE_PROXY_CPU=big "
+        "with its planned core, and VLLM_ROCE_CPU_AFFINITY defaults to 1",
+        "#978 acts on image requests: --mm-processor-cache-gb 0 makes the processor cache None, the fast path's condition, "
+        "and DeepSeek V4.1's processor inherits the method it changes",
+        "957-p2 acts: decode sparse MLA uses skip_inactive=True by default",
+        "957-p4's fused calibration acts: the confidence head is on with adaptive verification, and DSpark's "
+        "sample_idx_mapping is int32",
+        "988-deadrow is not inert for the deployment (client requests with top_p < 1 and the like), only for the suites",
+    ],
+    new_prs=[
+        dict(pr=1047, author="JordiPosthumus", created="2026-11-09T17:23Z", head=head(1047),
+             what="fix(1107): escape a literal <｜deepseek_image｜> typed in request text instead of returning 400 (#1031)",
+             finding="the only open PR since 2026-11-09 that no list covers. Not christopherowen's; its patch's From: is "
+                     "Jordi Posthumus. It acts on this deployment (vllm/tokenizers/deepseek_v41*.py). It is written against "
+                     "the 1107 release, not as a candidate PR: it adds 1107/vllm/0762, rewrites releases/spark-ds41f-1107/"
+                     "cluster.json and config/cluster.json, and edits the published baseline "
+                     "manifests/baselines/2026-11-07-spark-ds41f-1107.json, which AGENTS.md calls immutable. On candidate-54 "
+                     "its patch conflicts with 0774 (#973) in vllm/tokenizers/deepseek_v41.py. Not placed",
+             raise_to="owner"),
+    ],
+    exceptions_for_owner=[
+        "#1047 (JordiPosthumus): outside the christopherowen-only rule, and it edits an immutable baseline; include, restage "
+        "as a candidate patch, or leave",
+        "#1005 (christopherowen, dropped after round-1 rework): two commits pushed since the drop (c42ad695 at "
+        "2026-11-09T15:00Z, 8071740d at 2026-11-10T00:19Z, 'optimize routed MoE dispatch scan, grouped GEMM sync, and "
+        "empty-slab SwiGLU skip'); no list covers the new head. Whether it re-enters a pool",
+        "#967: whether a TileLang compiler change is measured now (its own candidate) or waits for the #974 track",
+    ],
+    decided_not_in_pool=dict(
+        in_base=[966, 997, 965, 1012, 1016, 964, 955, 980, 1013, 972, 1011, 973, 999, 993, 991, 979, 996, 1009,
+                 961, 963, 987, 1001, 1030, 968, 969, 960, 971, 977, 998],
+        in_rework=[984], dropped=[986, 1005, 1010],
+        housekeeping=[970, 959, 1007, 958, 1000, 1017, 949, 975, 976, 938, 985, 974],
+        park=[954, 1014, 1004, 1002, 981, 983, 989, 982, 962, 992, 994, 1015],
+        note="as candidate-51's triage lists them; the process PRs (#1038, #1040 and later) are closed"),
+    for_assembly="Ready patches are rebases/<candidate>-NN-*.patch: #1008's is its PR patch byte for byte (git am); the "
+                 "splits and #978's rebase are format-patch output with the PR's author, date and message. Pending "
+                 "entries join only as their rework's corrected patch, after a pair check against their candidate. 55's "
+                 "lock adds a sparknet series with #1008's 0001. Each split keeps the PR's subject; the coordinator may "
+                 "retitle it for the part it carries.",
+)
+json.dump(proposal, open(f"{R}/selection-proposal.json", "w"), indent=1, ensure_ascii=False)
+print("wrote selection-proposal.json")

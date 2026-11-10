@@ -1,0 +1,244 @@
+diff --git a/tests/kernels/attention/test_deepseek_v41_tilelang.py b/tests/kernels/attention/test_deepseek_v41_tilelang.py
+index 53cd29825..370987343 100644
+--- a/tests/kernels/attention/test_deepseek_v41_tilelang.py
++++ b/tests/kernels/attention/test_deepseek_v41_tilelang.py
+@@ -1370,3 +1370,28 @@ def test_indexer_score_vectorizes_kpool_loads_and_coschedules_dense_rows():
+ 
+     cand_src = indexer_score_v41(16384, 256, candidates=True).get_kernel_source()
+     assert "__tl_load_k_shared_candidates(" in cand_src
++
++
++def test_sparse_mla_vectorizes_swa_dequant_and_merges_readstate_segment_ifs():
++    """``sparse_mla`` vectorizes ``dequant_swa``'s ``T.reinterpret`` scale path
++    and merges adjacent ``seg_active`` ``IfThenElse`` blocks in Stage 1 and Stage 2."""
++    from tvm.ir import Op
++
++    assert bool(Op.get("tirx.reinterpret").get_attr("TVectorizable")) is True
++    assert getattr(tilelang.transform.MergeIfStmt, "_dsv41_readstate_merge_if", False)
++
++    routes = SparseMlaV41Plan.routes(
++        heads=40, swa_width=128, idx_width=512, idx_page_size=64, max_rows=32
++    )
++    fn, args, kwargs = routes.kernels["decode"]
++    kernel = fn.compile(*args, **kwargs)
++    src = kernel.get_kernel_source()
++    stage1, stage2 = src.split("__launch_bounds__(128, 1) sparse_mla_kernel_1", 1)
++
++    # dequant_swa vectorizes 8 elements into 2 x float4 iterations instead of vec < 8.
++    assert "for (int vec = 0; vec < 8; ++vec)" not in stage1, stage1
++    assert "for (int vec = 0; vec < 2; ++vec)" in stage1, stage1
++    # Stage 1 merges the 10 split seg_active guards into 2 (separated only by syncs),
++    # and Stage 2 merges the 6 per-segment guards into 1 per segment (5 total).
++    assert stage1.count("if (swa_seg_active |") == 2, stage1
++    assert stage2.count("if (swa_seg_active |") == 1, stage2
+diff --git a/vllm/models/deepseek_v4_1/tilelang/sparse_mla.py b/vllm/models/deepseek_v4_1/tilelang/sparse_mla.py
+index 97d01798e..c9f795788 100644
+--- a/vllm/models/deepseek_v4_1/tilelang/sparse_mla.py
++++ b/vllm/models/deepseek_v4_1/tilelang/sparse_mla.py
+@@ -75,6 +75,191 @@ import torch
+ from . import pdl, prepare
+ from .gemm import _reference_roundtrip
+ 
++
++def _install_tirx_compiler_fixes() -> None:
++    """Enable TIRx reinterpret vectorization and read-state IfThenElse merging.
++
++    1. ``VectorizePlanner`` in ``LegalizeVectorizedLoop`` checks the ``Op``
++       attribute ``TVectorizable`` before allowing loop-variant arguments inside
++       a ``CallNode``. ``TLVectorizer::MutateReinterpretExpr_`` already
++       vectorizes ``builtin::reinterpret()`` across lanes, but
++       ``tirx.reinterpret`` lacks ``TVectorizable = True``, causing ``dequant_swa``
++       to fall back to a serial 8-lane loop after ``DecoupleTypeCast`` stages
++       the UE8M0 scale bytes.
++    2. ``IfStmtBinding`` distributes ``IfThenElse`` (without ``else``) across
++       ``SeqStmt`` statements when a ``CallEffectKind::kReadState`` condition
++       reads buffers that the body does not write, but ``MergeIfStmt`` only
++       re-merges ``CallEffectKind::kPure`` conditions, leaving 10 split
++       ``seg_active`` branches in decode Stage 1 and 30 in unrolled Stage 2.
++    """
++    from tvm import tirx
++    from tvm.ir import Op, structural_equal
++    from tvm.tirx import (
++        Bind,
++        BufferLoad,
++        BufferStore,
++        Call,
++        IfThenElse,
++        PrimFunc,
++        PyStmtExprMutator,
++        SeqStmt,
++        Var,
++    )
++    from tvm.tirx.stmt_functor import post_order_visit
++    from tvm.tirx.transform import prim_func_pass
++
++    reinterpret_op = Op.get("tirx.reinterpret")
++    if not reinterpret_op.get_attr("TVectorizable"):
++        reinterpret_op.set_attr("TVectorizable", True)
++
++    orig_merge_if = tilelang.transform.MergeIfStmt
++    if getattr(orig_merge_if, "_dsv41_readstate_merge_if", False):
++        return
++
++    def _collect_reads(expr):
++        bufs, vars_ = set(), set()
++        has_bad_effect = False
++
++        def _visit(node):
++            nonlocal has_bad_effect
++            if isinstance(node, BufferLoad):
++                bufs.add(node.buffer.data)
++            elif isinstance(node, Var):
++                vars_.add(node)
++            elif isinstance(node, Call):
++                if isinstance(node.op, Op):
++                    eff = node.op.get_attr("TCallEffectKind")
++                    if eff is None or int(eff) > 1:
++                        has_bad_effect = True
++                    if (
++                        node.op.name in ("tirx.tvm_access_ptr", "tl.access_ptr")
++                        and len(node.args) >= 2
++                        and isinstance(node.args[1], Var)
++                    ):
++                        bufs.add(node.args[1])
++                else:
++                    has_bad_effect = True
++
++        post_order_visit(expr, _visit)
++        return bufs, vars_, has_bad_effect
++
++    def _collect_writes_and_defs(stmt):
++        written_bufs, defined_vars = set(), set()
++
++        def _visit(node):
++            if isinstance(node, BufferStore):
++                written_bufs.add(node.buffer.data)
++            elif isinstance(node, Bind):
++                defined_vars.add(node.var)
++            elif isinstance(node, Call) and isinstance(node.op, Op):
++                if node.op.name == "tirx.tvm_access_ptr" and len(node.args) >= 5:
++                    mask = node.args[4]
++                    if not (hasattr(mask, "value") and int(mask.value) == 1):
++                        if isinstance(node.args[1], Var):
++                            written_bufs.add(node.args[1])
++                elif node.op.name == "tl.access_ptr" and len(node.args) >= 3:
++                    mask = node.args[2]
++                    if not (hasattr(mask, "value") and int(mask.value) == 1):
++                        if isinstance(node.args[0], BufferLoad):
++                            written_bufs.add(node.args[0].buffer.data)
++
++        post_order_visit(stmt, _visit)
++        return written_bufs, defined_vars
++
++    def _flatten_seq(stmt, out):
++        if isinstance(stmt, SeqStmt):
++            for s in stmt.seq:
++                _flatten_seq(s, out)
++        else:
++            out.append(stmt)
++
++    @tirx.functor.mutator
++    class _ReadStateMergeIfMutator(PyStmtExprMutator):
++        def __init__(self, func_written_bufs):
++            super().__init__()
++            self.func_written_bufs = func_written_bufs
++
++        def visit_seq_stmt_(self, op: SeqStmt):
++            flat = []
++            for s in op.seq:
++                _flatten_seq(self.visit_stmt(s), flat)
++            new_seq = []
++            cur_cond = None
++            cur_bodies = []
++            cur_cond_bufs = set()
++            cur_cond_vars = set()
++            cur_written_bufs = set()
++            cur_defined_vars = set()
++
++            def flush():
++                nonlocal cur_cond, cur_bodies, cur_cond_bufs, cur_cond_vars
++                nonlocal cur_written_bufs, cur_defined_vars
++                if cur_bodies:
++                    body = (
++                        cur_bodies[0]
++                        if len(cur_bodies) == 1
++                        else self.visit_stmt(SeqStmt(cur_bodies))
++                    )
++                    new_seq.append(IfThenElse(cur_cond, body, None))
++                    cur_cond = None
++                    cur_bodies = []
++                    cur_cond_bufs = set()
++                    cur_cond_vars = set()
++                    cur_written_bufs = set()
++                    cur_defined_vars = set()
++
++            for stmt in flat:
++                if isinstance(stmt, IfThenElse) and stmt.else_case is None:
++                    bufs, vars_, bad = _collect_reads(stmt.condition)
++                    if not bad:
++                        w_bufs, d_vars = _collect_writes_and_defs(stmt.then_case)
++                        if (
++                            cur_cond is not None
++                            and structural_equal(cur_cond, stmt.condition)
++                            and cur_cond_bufs.isdisjoint(cur_written_bufs)
++                            and cur_cond_vars.isdisjoint(cur_defined_vars)
++                            and cur_cond_bufs.isdisjoint(self.func_written_bufs)
++                        ):
++                            cur_bodies.append(stmt.then_case)
++                            cur_written_bufs |= w_bufs
++                            cur_defined_vars |= d_vars
++                            continue
++                        flush()
++                        cur_cond = stmt.condition
++                        cur_bodies = [stmt.then_case]
++                        cur_cond_bufs, cur_cond_vars = bufs, vars_
++                        cur_written_bufs = set(w_bufs)
++                        cur_defined_vars = set(d_vars)
++                        continue
++                flush()
++                new_seq.append(stmt)
++            flush()
++            return new_seq[0] if len(new_seq) == 1 else SeqStmt(new_seq)
++
++    def _merge_if_stmt():
++        base_pass = orig_merge_if()
++
++        def _pass_fn(func: PrimFunc, mod, ctx) -> PrimFunc:
++            written_bufs, _ = _collect_writes_and_defs(func.body)
++            return func.with_body(
++                _ReadStateMergeIfMutator(written_bufs).visit_stmt(func.body)
++            )
++
++        readstate_pass = prim_func_pass(
++            _pass_fn, opt_level=0, name="tl.MergeReadStateIfStmt"
++        )
++
++        def _combined(mod):
++            return base_pass(readstate_pass(mod))
++
++        return _combined
++
++    _merge_if_stmt._dsv41_readstate_merge_if = True
++    tilelang.transform.MergeIfStmt = _merge_if_stmt
++
++
++_install_tirx_compiler_fixes()
++
+ HEAD_DIM = 512
+ ROPE_DIM = 64  # each head's trailing RoPE coordinates
+ NOPE_DIM = HEAD_DIM - ROPE_DIM
+@@ -437,11 +622,11 @@ def sparse_mla_fwd_v41(
+ 
+     @T.macro
+     def seg_active(seg, SwaLengths, IdxLengths, row):
+-        swa_active = (seg * G < swa_blocks) & (seg * G * BI < SwaLengths[row])
++        swa_seg_active = (seg * G < swa_blocks) & (seg * G * BI < SwaLengths[row])
+         if not idx_blocks:
+-            return swa_active
++            return swa_seg_active
+         idx_first = T.max(seg * G - swa_blocks, 0) * BI
+-        return swa_active | (
++        return swa_seg_active | (
+             (seg * G + G > swa_blocks)
+             & (seg * G < chunks)
+             & (idx_first < IdxLengths[row])

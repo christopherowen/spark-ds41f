@@ -1,0 +1,775 @@
+{
+ "base": {
+  "description": "candidate-54 (merged base of round 2): spark-ds41f-1107 (0001..0761) plus candidate-50's 0762..0780 (#1009 round 1 as 0778) and round 2's 0781..0791; 671 patches",
+  "how": "built on sp8 from candidate-54/vllm/series (origin/main 920e1d50): vLLM 19f2c20ed + git am of the 671 active patches with the fixed committer and --committer-date-is-author-date (scripts-as-run/build_base.sh)",
+  "vllm_revision": "19f2c20ed4d64ae22bd009ceacadd85e2a81e354",
+  "patch_head": "4e8133ff10a125b90753c2727f162e29fe37f30c",
+  "tree": "5f021d9a7f01c03e2389dd3d8021759cfa19ea34",
+  "check": "patch_head 4e8133ff and tree 5f021d9a equal candidate-54/upstreams.lock.json's patch_head and expected_tree; git diff --check clean",
+  "tilelang": "2123e412 plus 1107/tilelang/series (13 patches): tip 3b0c7814, tree e2b001828fd4 (candidate-54's lock pins TileLang as 1107)",
+  "sparknet": "1fd6a1fb (no series): tree 8cc28a5cd3e6 (as 1107)",
+  "where": "sp8, ~/spark-lab/agents/round-55-57-select (CPU only; sp8's GPU was not touched)"
+ },
+ "method": "each pool PR's vLLM patch alone on the base (git apply --index; on failure git apply -3). A conflict whose only kind is a test appended where the base appended one, or a PR insertion next to a region the base changed, is rebased context-only (rebase_context.py: no line of either side edited; added and removed lines equal the PR's); a conflict where the PR edits a line the base also edits is semantic and goes to rework. Splits keep whole hunks (split_hunks.py). Then, for every pair of applicable sets touching a common file: A applied, B checked with git apply --check, both orders (pairs.py). TileLang and sparknet patches on 1107's pinned trees",
+ "applies_alone": {
+  "953": {
+   "plain": "fail",
+   "plain_fail": [
+    "tests/v1/spec_decode/test_adaptive_verification.py",
+    "vllm/v1/worker/gpu/spec_decode/adaptive_verification.py"
+   ],
+   "three_way": "conflict",
+   "three_way_conflicts": [
+    "tests/v1/spec_decode/test_adaptive_verification.py",
+    "vllm/v1/worker/gpu/spec_decode/adaptive_verification.py"
+   ],
+   "classification": "semantic conflict with the base: rework"
+  },
+  "956": {
+   "plain": "fail",
+   "plain_fail": [
+    "vllm/models/deepseek_v4_1/attention.py",
+    "vllm/models/deepseek_v4_1/ced.py",
+    "vllm/models/deepseek_v4_1/nvidia/model_state.py"
+   ],
+   "three_way": "conflict",
+   "three_way_conflicts": [
+    "vllm/models/deepseek_v4_1/attention.py",
+    "vllm/models/deepseek_v4_1/ced.py"
+   ],
+   "classification": "semantic conflict with the base: rework"
+  },
+  "957": {
+   "plain": "fail",
+   "plain_fail": [
+    "tests/v1/spec_decode/test_adaptive_verification.py",
+    "vllm/v1/worker/gpu/model_runner.py",
+    "vllm/v1/worker/gpu/spec_decode/acceptance_estimator.py",
+    "vllm/v1/worker/gpu/spec_decode/adaptive_verification.py",
+    "vllm/v1/worker/gpu/spec_decode/speculator.py"
+   ],
+   "three_way": "conflict",
+   "three_way_conflicts": [
+    "tests/v1/spec_decode/test_adaptive_verification.py",
+    "vllm/v1/worker/gpu/model_runner.py",
+    "vllm/v1/worker/gpu/spec_decode/acceptance_estimator.py",
+    "vllm/v1/worker/gpu/spec_decode/adaptive_verification.py",
+    "vllm/v1/worker/gpu/spec_decode/speculator.py"
+   ],
+   "classification": "semantic conflict with the base: rework"
+  },
+  "967": {
+   "plain": "fail",
+   "plain_fail": [
+    "tests/kernels/attention/test_deepseek_v41_tilelang.py"
+   ],
+   "three_way": "conflict",
+   "three_way_conflicts": [
+    "tests/kernels/attention/test_deepseek_v41_tilelang.py"
+   ],
+   "classification": "context-only rebase"
+  },
+  "978": {
+   "plain": "fail",
+   "plain_fail": [
+    "vllm/v1/engine/async_llm.py"
+   ],
+   "three_way": "conflict",
+   "three_way_conflicts": [
+    "vllm/v1/engine/async_llm.py"
+   ],
+   "classification": "context-only rebase"
+  },
+  "988": {
+   "plain": "ok",
+   "plain_fail": [],
+   "three_way": null,
+   "three_way_conflicts": [],
+   "classification": "applies as published"
+  },
+  "995": {
+   "plain": "fail",
+   "plain_fail": [
+    "vllm/v1/worker/gpu/spec_decode/tilelang_copy.py"
+   ],
+   "three_way": "conflict",
+   "three_way_conflicts": [
+    "tests/v1/spec_decode/test_copy_drafts.py",
+    "vllm/v1/worker/gpu/spec_decode/tilelang_copy.py"
+   ],
+   "classification": "semantic conflict with the base: rework"
+  },
+  "1003": {
+   "plain": "fail",
+   "plain_fail": [
+    "tests/v1/spec_decode/test_adaptive_verification.py",
+    "vllm/v1/worker/gpu/spec_decode/acceptance_estimator.py",
+    "vllm/v1/worker/gpu/spec_decode/adaptive_verification.py"
+   ],
+   "three_way": "conflict",
+   "three_way_conflicts": [
+    "tests/v1/spec_decode/test_adaptive_verification.py",
+    "vllm/v1/worker/gpu/spec_decode/adaptive_verification.py"
+   ],
+   "classification": "semantic conflict with the base: rework"
+  },
+  "1006": {
+   "plain": "fail",
+   "plain_fail": [
+    "vllm/model_executor/layers/quantization/online/packed_bf16.py",
+    "vllm/models/deepseek_v4_1/tilelang/embedding.py"
+   ],
+   "three_way": "conflict",
+   "three_way_conflicts": [
+    "vllm/model_executor/layers/quantization/online/packed_bf16.py",
+    "vllm/models/deepseek_v4_1/tilelang/embedding.py"
+   ],
+   "classification": "semantic conflict with the base: rework"
+  },
+  "1008": {
+   "plain": "ok",
+   "plain_fail": [],
+   "three_way": null,
+   "three_way_conflicts": [],
+   "classification": "applies as published"
+  }
+ },
+ "semantic_conflicts": {
+  "953": {
+   "refused_files": [
+    "vllm/v1/worker/gpu/spec_decode/adaptive_verification.py"
+   ],
+   "regions": {
+    "tests/v1/spec_decode/test_adaptive_verification.py": [
+     "test-append union (base, then PR)"
+    ],
+    "vllm/v1/worker/gpu/spec_decode/adaptive_verification.py": [
+     "both insert at one spot (code): refused",
+     "both insert at one spot (code): refused",
+     "PR edits a line the base edits: refused",
+     "PR inserts after a region the base changed",
+     "PR edits a line the base edits: refused",
+     "PR edits a line the base edits: refused"
+    ]
+   }
+  },
+  "956": {
+   "refused_files": [
+    "vllm/models/deepseek_v4_1/attention.py",
+    "vllm/models/deepseek_v4_1/ced.py"
+   ],
+   "regions": {
+    "vllm/models/deepseek_v4_1/attention.py": [
+     "PR edits a line the base edits: refused",
+     "PR edits a line the base edits: refused",
+     "PR edits a line the base edits: refused"
+    ],
+    "vllm/models/deepseek_v4_1/ced.py": [
+     "both insert at one spot (code): refused"
+    ]
+   }
+  },
+  "995": {
+   "refused_files": [
+    "vllm/v1/worker/gpu/spec_decode/tilelang_copy.py"
+   ],
+   "regions": {
+    "tests/v1/spec_decode/test_copy_drafts.py": [
+     "test-append union (base, then PR)"
+    ],
+    "vllm/v1/worker/gpu/spec_decode/tilelang_copy.py": [
+     "PR edits a line the base edits: refused",
+     "PR edits a line the base edits: refused",
+     "PR edits a line the base edits: refused"
+    ]
+   }
+  },
+  "1003": {
+   "refused_files": [
+    "vllm/v1/worker/gpu/spec_decode/adaptive_verification.py"
+   ],
+   "regions": {
+    "tests/v1/spec_decode/test_adaptive_verification.py": [
+     "test-append union (base, then PR)"
+    ],
+    "vllm/v1/worker/gpu/spec_decode/adaptive_verification.py": [
+     "PR edits a line the base edits: refused",
+     "PR inserts after a region the base changed"
+    ]
+   }
+  },
+  "1006": {
+   "refused_files": [
+    "vllm/model_executor/layers/quantization/online/packed_bf16.py",
+    "vllm/models/deepseek_v4_1/tilelang/embedding.py"
+   ],
+   "regions": {
+    "vllm/model_executor/layers/quantization/online/packed_bf16.py": [
+     "PR edits a line the base edits: refused"
+    ],
+    "vllm/models/deepseek_v4_1/tilelang/embedding.py": [
+     "PR edits a line the base edits: refused"
+    ]
+   }
+  },
+  "957-p5": {
+   "refused_files": [
+    "vllm/v1/worker/gpu/spec_decode/adaptive_verification.py"
+   ],
+   "regions": {
+    "tests/v1/spec_decode/test_adaptive_verification.py": [
+     "test-append union (base, then PR)"
+    ],
+    "vllm/v1/worker/gpu/spec_decode/adaptive_verification.py": [
+     "both insert at one spot (code): refused",
+     "PR edits a line the base edits: refused"
+    ]
+   }
+  },
+  "957-p3": {
+   "refused_files": [
+    "vllm/v1/worker/gpu/model_runner.py",
+    "vllm/v1/worker/gpu/spec_decode/acceptance_estimator.py",
+    "vllm/v1/worker/gpu/spec_decode/speculator.py"
+   ],
+   "regions": {
+    "vllm/v1/worker/gpu/model_runner.py": [
+     "PR edits a line the base edits: refused",
+     "PR edits a line the base edits: refused"
+    ],
+    "vllm/v1/worker/gpu/spec_decode/acceptance_estimator.py": [
+     "both insert at one spot (code): refused",
+     "both insert at one spot (code): refused",
+     "both insert at one spot (code): refused",
+     "both insert at one spot (code): refused",
+     "both insert at one spot (code): refused",
+     "PR edits a line the base edits: refused",
+     "both insert at one spot (code): refused",
+     "both insert at one spot (code): refused"
+    ],
+    "vllm/v1/worker/gpu/spec_decode/speculator.py": [
+     "both insert at one spot (code): refused",
+     "PR edits a line the base edits: refused"
+    ]
+   }
+  }
+ },
+ "base_patches_in_the_conflicts": {
+  "953": "0789 (#971 round 1): _step_cost (num_sampling_requests, SINGLE_REQ_TILE_SPILL_SCALE) and the budget code in get_num_tokens",
+  "1003": "0789 (#971 round 1): _step_cost",
+  "957-p5": "0789 (#971 round 1): the constants block and _step_cost's scale",
+  "957-p3": "0764 (#965 round 1) already carries the same observe_verification fusion and verified-count reuse in model_runner.py; 0769 (#980 round 1) in speculator.py",
+  "995": "0790 (#977): copy_match's two-tier long-context scan (the anchor-pruning hunks); copy_alloc and copy_apply hunks apply 3-way-clean (split 995-alloc-apply)",
+  "956": "0765 (#1012 round 1) decode overlap and 0778 (#1009 round 1) sp_front_call in attention.py; 0788 (#960 round 1) CED pinned ring in ced.py",
+  "1006": "0791 (#998 round 1): the display_carveout import beside pack_bf16_weight in packed_bf16.py and embedding.py; the PR's lines there add cache_tag (the artifact cache)"
+ },
+ "splits": {
+  "988-deadrow": {
+   "source": "v/988/vllm/0762-perf-spec-decode-sampler-dead-row-skip-and-sparse-topk.patch",
+   "source_sha256": "ddf963daad8e05804a95b668f761ad0554683a6798f473b725bd61720e649934",
+   "kept": {
+    "tests/v1/worker/test_dead_rows.py": "all",
+    "vllm/v1/worker/gpu/sample/sampler.py": "all",
+    "vllm/v1/worker/gpu/sample/tilelang_auxiliary.py": "all",
+    "vllm/v1/worker/gpu/sample/tilelang_bias.py": "all",
+    "vllm/v1/worker/gpu/sample/tilelang_controls.py": "all",
+    "vllm/v1/worker/gpu/sample/tilelang_sampling.py": [
+     0,
+     1,
+     2,
+     3,
+     4,
+     5
+    ],
+    "vllm/v1/worker/gpu/sample/tilelang_thinking.py": "all",
+    "vllm/v1/worker/gpu/spec_decode/rejection_sampler.py": "all",
+    "vllm/v1/worker/gpu/tilelang_inputs.py": "all"
+   },
+   "applied": "plain",
+   "lines_exact": true,
+   "sha256": "85d180b3b0fe96054245d1165ea684cdbadb4969aef45af8e9216eff0ea6d53d",
+   "files": [
+    "tests/v1/worker/test_dead_rows.py",
+    "vllm/v1/worker/gpu/sample/sampler.py",
+    "vllm/v1/worker/gpu/sample/tilelang_auxiliary.py",
+    "vllm/v1/worker/gpu/sample/tilelang_bias.py",
+    "vllm/v1/worker/gpu/sample/tilelang_controls.py",
+    "vllm/v1/worker/gpu/sample/tilelang_sampling.py",
+    "vllm/v1/worker/gpu/sample/tilelang_thinking.py",
+    "vllm/v1/worker/gpu/spec_decode/rejection_sampler.py",
+    "vllm/v1/worker/gpu/tilelang_inputs.py"
+   ]
+  },
+  "988-topk": {
+   "source": "v/988/vllm/0762-perf-spec-decode-sampler-dead-row-skip-and-sparse-topk.patch",
+   "source_sha256": "ddf963daad8e05804a95b668f761ad0554683a6798f473b725bd61720e649934",
+   "kept": {
+    "tests/v1/spec_decode/test_dspark_topk.py": "all",
+    "tests/v1/spec_decode/test_dspark_v41_gathered_markov.py": "all",
+    "vllm/model_executor/models/qwen3_dspark.py": "all",
+    "vllm/models/deepseek_v4_1/nvidia/dspark.py": "all",
+    "vllm/v1/worker/gpu/sample/tilelang_sampling.py": [
+     6
+    ],
+    "vllm/v1/worker/gpu/spec_decode/dspark/speculator.py": "all"
+   },
+   "applied": "plain",
+   "lines_exact": true,
+   "sha256": "4a5ca7123b15e9563b57761872afcc4ca09881c84168a4a0ba4868b4e5cd8054",
+   "files": [
+    "tests/v1/spec_decode/test_dspark_topk.py",
+    "tests/v1/spec_decode/test_dspark_v41_gathered_markov.py",
+    "vllm/model_executor/models/qwen3_dspark.py",
+    "vllm/models/deepseek_v4_1/nvidia/dspark.py",
+    "vllm/v1/worker/gpu/sample/tilelang_sampling.py",
+    "vllm/v1/worker/gpu/spec_decode/dspark/speculator.py"
+   ]
+  },
+  "957-p1": {
+   "source": "v/957/vllm/0762-perf-dsv41-tp3-decode-compressor-mla-and-spec-fusions.patch",
+   "source_sha256": "44412274ff72075c37afed64dbd9cb638cf604a34901b10f11b6fee128385e71",
+   "kept": {
+    "tests/models/test_deepseek_v4_1_compressor.py": "all",
+    "vllm/models/deepseek_v4_1/compressor.py": "all",
+    "vllm/models/deepseek_v4_1/tilelang/linear.py": "all"
+   },
+   "applied": "plain",
+   "lines_exact": true,
+   "sha256": "49e36b07322883f54c001b641b4f23637d074809a31fa6e551d9acb10d154bb1",
+   "files": [
+    "tests/models/test_deepseek_v4_1_compressor.py",
+    "vllm/models/deepseek_v4_1/compressor.py",
+    "vllm/models/deepseek_v4_1/tilelang/linear.py"
+   ]
+  },
+  "957-p2": {
+   "source": "v/957/vllm/0762-perf-dsv41-tp3-decode-compressor-mla-and-spec-fusions.patch",
+   "source_sha256": "44412274ff72075c37afed64dbd9cb638cf604a34901b10f11b6fee128385e71",
+   "kept": {
+    "vllm/models/deepseek_v4_1/tilelang/sparse_mla.py": "all"
+   },
+   "applied": "plain",
+   "lines_exact": true,
+   "sha256": "90af0b7a13e4247b8097db21d50a47aa2398ba8bf4d7ede9d98a715c5f4d682e",
+   "files": [
+    "vllm/models/deepseek_v4_1/tilelang/sparse_mla.py"
+   ]
+  },
+  "957-p3": {
+   "source": "v/957/vllm/0762-perf-dsv41-tp3-decode-compressor-mla-and-spec-fusions.patch",
+   "kept": {
+    "tests/v1/spec_decode/test_acceptance_estimator.py": "all",
+    "vllm/v1/worker/gpu/model_runner.py": [
+     2,
+     3
+    ],
+    "vllm/v1/worker/gpu/spec_decode/acceptance_estimator.py": "all",
+    "vllm/v1/worker/gpu/spec_decode/speculator.py": "all"
+   },
+   "result": "conflict",
+   "conflicts": [
+    "vllm/v1/worker/gpu/model_runner.py",
+    "vllm/v1/worker/gpu/spec_decode/acceptance_estimator.py",
+    "vllm/v1/worker/gpu/spec_decode/speculator.py"
+   ],
+   "stderr": "Applied patch to 'tests/v1/spec_decode/test_acceptance_estimator.py' cleanly.\nApplied patch to 'vllm/v1/worker/gpu/model_runner.py' with conflicts.\nApplied patch to 'vllm/v1/worker/gpu/spec_decode/acceptance_estimator.py' with conflicts.\nApplied patch to 'vllm/v1/worker/gpu/spec_decode/speculator.py' with conflicts.\nU vllm/v1/worker/gpu/model_runner.py\nU vllm/v1/worker/gpu/spec_decode/acceptance_estimator.py\nU vllm/v1/worker/gpu/spec_decode/speculator.py\n"
+  },
+  "957-p4": {
+   "source": "v/957/vllm/0762-perf-dsv41-tp3-decode-compressor-mla-and-spec-fusions.patch",
+   "source_sha256": "44412274ff72075c37afed64dbd9cb638cf604a34901b10f11b6fee128385e71",
+   "kept": {
+    "tests/kernels/test_deepseek_v41_tilelang_confidence.py": "all",
+    "vllm/models/deepseek_v4_1/nvidia/dspark.py": "all",
+    "vllm/models/deepseek_v4_1/tilelang/confidence.py": "all",
+    "vllm/v1/worker/gpu/input_batch.py": "all",
+    "vllm/v1/worker/gpu/model_runner.py": [
+     0,
+     1
+    ],
+    "vllm/v1/worker/gpu/spec_decode/dspark/speculator.py": "all"
+   },
+   "applied": "plain",
+   "lines_exact": true,
+   "sha256": "c4bc7d0378b107543595217c3666bf3b9a60e97485cf6e6180cb7a8304b51ca3",
+   "files": [
+    "tests/kernels/test_deepseek_v41_tilelang_confidence.py",
+    "vllm/models/deepseek_v4_1/nvidia/dspark.py",
+    "vllm/models/deepseek_v4_1/tilelang/confidence.py",
+    "vllm/v1/worker/gpu/input_batch.py",
+    "vllm/v1/worker/gpu/model_runner.py",
+    "vllm/v1/worker/gpu/spec_decode/dspark/speculator.py"
+   ]
+  },
+  "957-p5": {
+   "source": "v/957/vllm/0762-perf-dsv41-tp3-decode-compressor-mla-and-spec-fusions.patch",
+   "kept": {
+    "tests/v1/spec_decode/test_adaptive_verification.py": "all",
+    "vllm/v1/worker/gpu/spec_decode/adaptive_verification.py": "all"
+   },
+   "result": "conflict",
+   "conflicts": [
+    "tests/v1/spec_decode/test_adaptive_verification.py",
+    "vllm/v1/worker/gpu/spec_decode/adaptive_verification.py"
+   ],
+   "stderr": "Applied patch to 'tests/v1/spec_decode/test_adaptive_verification.py' with conflicts.\nApplied patch to 'vllm/v1/worker/gpu/spec_decode/adaptive_verification.py' with conflicts.\nU tests/v1/spec_decode/test_adaptive_verification.py\nU vllm/v1/worker/gpu/spec_decode/adaptive_verification.py\n"
+  },
+  "957-p5code": {
+   "source": "v/957/vllm/0762-perf-dsv41-tp3-decode-compressor-mla-and-spec-fusions.patch",
+   "kept": {
+    "vllm/v1/worker/gpu/spec_decode/adaptive_verification.py": "all"
+   },
+   "result": "conflict",
+   "conflicts": [
+    "vllm/v1/worker/gpu/spec_decode/adaptive_verification.py"
+   ],
+   "stderr": "Applied patch to 'vllm/v1/worker/gpu/spec_decode/adaptive_verification.py' with conflicts.\nU vllm/v1/worker/gpu/spec_decode/adaptive_verification.py\n"
+  },
+  "995-alloc-apply": {
+   "source": "v/995/vllm/0762-perf-spec-decode-copy-drafter-guards-and-wide-ramp.patch",
+   "source_sha256": "b4040c07950344e3978f4e4fe3bcd58e513d84170c475ef51ae783f900228218",
+   "kept": {
+    "vllm/v1/worker/gpu/spec_decode/tilelang_copy.py": [
+     0,
+     4,
+     5
+    ]
+   },
+   "applied": "3-way",
+   "lines_exact": true,
+   "sha256": "3c150312aa85ca39fd409541187493973ee75ab4cea02bef9560ffc9c58e8b93",
+   "files": [
+    "vllm/v1/worker/gpu/spec_decode/tilelang_copy.py"
+   ]
+  },
+  "995-match": {
+   "source": "v/995/vllm/0762-perf-spec-decode-copy-drafter-guards-and-wide-ramp.patch",
+   "kept": {
+    "vllm/v1/worker/gpu/spec_decode/tilelang_copy.py": [
+     1,
+     2,
+     3
+    ]
+   },
+   "result": "conflict",
+   "conflicts": [
+    "vllm/v1/worker/gpu/spec_decode/tilelang_copy.py"
+   ],
+   "stderr": "Applied patch to 'vllm/v1/worker/gpu/spec_decode/tilelang_copy.py' with conflicts.\nU vllm/v1/worker/gpu/spec_decode/tilelang_copy.py\n"
+  }
+ },
+ "sets_paired": [
+  "967",
+  "978",
+  "988-deadrow",
+  "957-p1",
+  "957-p2",
+  "957-p4",
+  "1008"
+ ],
+ "overlapping_pairs": 2,
+ "conflicting_pairs": 0,
+ "pairs": [
+  {
+   "a": "967",
+   "b": "957-p2",
+   "common": [
+    "vllm/models/deepseek_v4_1/tilelang/sparse_mla.py"
+   ],
+   "957-p2_after_967": "clean",
+   "967_after_957-p2": "clean",
+   "conflict": false
+  },
+  {
+   "a": "978",
+   "b": "1008",
+   "common": [
+    "vllm/v1/engine/core.py"
+   ],
+   "1008_after_978": "clean",
+   "978_after_1008": "clean",
+   "conflict": false
+  }
+ ],
+ "file_overlaps_with_pending_reworks": {
+  "note": "the PRs that need a rework cannot be pair-checked until the rework exists; these are the files they share with the proposed sets (from their current patches). Each reworked patch is pair-checked before assembly",
+  "overlaps": [
+   {
+    "a": "957-p1",
+    "b": "956",
+    "common": [
+     "vllm/models/deepseek_v4_1/compressor.py"
+    ],
+    "consequence": "same candidate (56); #956's rework builds on 957-p1"
+   },
+   {
+    "a": "957-p1",
+    "b": "1006",
+    "common": [
+     "vllm/models/deepseek_v4_1/tilelang/linear.py"
+    ],
+    "consequence": "#1006 queued"
+   },
+   {
+    "a": "978",
+    "b": "953",
+    "common": [
+     "vllm/v1/engine/core.py"
+    ],
+    "consequence": "#953 queued"
+   },
+   {
+    "a": "1008",
+    "b": "953",
+    "common": [
+     "vllm/v1/engine/core.py"
+    ],
+    "consequence": "#953 queued"
+   },
+   {
+    "a": "957-p4",
+    "b": "1003",
+    "common": [
+     "vllm/v1/worker/gpu/model_runner.py",
+     "vllm/v1/worker/gpu/spec_decode/dspark/speculator.py"
+    ],
+    "consequence": "#1003 queued"
+   },
+   {
+    "a": "957-p2",
+    "b": "967",
+    "common": [
+     "vllm/models/deepseek_v4_1/tilelang/sparse_mla.py"
+    ],
+    "consequence": "#967 not proposed (toolchain track); clean both orders"
+   },
+   {
+    "a": "957-p5",
+    "b": "1003",
+    "common": [
+     "vllm/v1/worker/gpu/spec_decode/adaptive_verification.py",
+     "tests/v1/spec_decode/test_adaptive_verification.py"
+    ],
+    "consequence": "conflicting spec-decode policy: one per candidate"
+   },
+   {
+    "a": "957-p5",
+    "b": "953",
+    "common": [
+     "vllm/v1/worker/gpu/spec_decode/adaptive_verification.py",
+     "tests/v1/spec_decode/test_adaptive_verification.py"
+    ],
+    "consequence": "conflicting spec-decode policy: one per candidate"
+   },
+   {
+    "a": "1003",
+    "b": "953",
+    "common": [
+     "vllm/v1/worker/gpu/spec_decode/adaptive_verification.py",
+     "tests/v1/spec_decode/test_adaptive_verification.py"
+    ],
+    "consequence": "conflicting spec-decode policy"
+   },
+   {
+    "a": "956",
+    "b": "1006",
+    "common": [
+     "vllm/models/deepseek_v4_1/attention.py",
+     "vllm/models/deepseek_v4_1/nvidia/model.py"
+    ],
+    "consequence": "#1006 queued"
+   }
+  ]
+ },
+ "shared_with_base_patches": {
+  "978": {
+   "vllm/v1/core/sched/scheduler.py": [
+    "1475da08c perf(spec_decode): clamp scheduled decode verify rows to remaining max_tokens"
+   ],
+   "vllm/v1/engine/async_llm.py": [
+    "55a961f43 Enable periodic SSE keep-alive heartbeats and shield streaming abort cleanup"
+   ]
+  },
+  "1008": {
+   "vllm/models/deepseek_v4_1/engram_rows/_reader.c": [
+    "f297875de perf(dsv41): direct-insert packed Engram cache rows and align split cache arrays"
+   ]
+  },
+  "988-deadrow": {
+   "vllm/v1/worker/gpu/sample/sampler.py": [
+    "d928d3bc9 perf(spec_decode): elide TP confidence broadcasts and lockstep TP sampling seeds"
+   ]
+  },
+  "957-p1": {
+   "vllm/models/deepseek_v4_1/compressor.py": [
+    "737823543 perf(dsv41): overlap decode KV/indexer-key writes with query/index-query on aux_stream"
+   ]
+  },
+  "957-p2": {
+   "vllm/models/deepseek_v4_1/tilelang/sparse_mla.py": [
+    "2d6d365ca perf(dsv41): sparse MLA stage-1 KV gather and staging barrier opt"
+   ]
+  },
+  "957-p4": {
+   "vllm/v1/worker/gpu/model_runner.py": [
+    "4e8133ff1 perf(worker): compact packed vocab tables and expand display carve-out weights",
+    "972053790 perf(cudagraph): capture target FULL attention/CED metadata replay and deduplicate DFlash padding",
+    "d928d3bc9 perf(spec_decode): elide TP confidence broadcasts and lockstep TP sampling seeds",
+    "2c74b76ba perf(worker): eliminate decode-step redundant H2D transfers, UVA copies, and eager ATen ops"
+   ]
+  },
+  "995": {
+   "vllm/v1/worker/gpu/spec_decode/tilelang_copy.py": [
+    "21eda114d perf(spec_decode): bound CopyDrafter long-context history scan in copy_match",
+    "8a61d4815 perf(spec_decode): use cumulative survival in copy_apply and cap single-req copy tile spill"
+   ]
+  },
+  "956": {
+   "vllm/models/deepseek_v4_1/attention.py": [
+    "3157f85d9 perf(dsv41): fuse SP prefill local attention front and keep index_weights local",
+    "737823543 perf(dsv41): overlap decode KV/indexer-key writes with query/index-query on aux_stream"
+   ],
+   "vllm/models/deepseek_v4_1/ced.py": [
+    "972053790 perf(cudagraph): capture target FULL attention/CED metadata replay and deduplicate DFlash padding"
+   ],
+   "vllm/models/deepseek_v4_1/compressor.py": [
+    "737823543 perf(dsv41): overlap decode KV/indexer-key writes with query/index-query on aux_stream"
+   ],
+   "vllm/models/deepseek_v4_1/nvidia/model_state.py": [
+    "972053790 perf(cudagraph): capture target FULL attention/CED metadata replay and deduplicate DFlash padding",
+    "f4cf51df5 fix(structured-output): enforce completions grammar under reasoning parser"
+   ]
+  },
+  "957-p5": {
+   "vllm/v1/worker/gpu/spec_decode/adaptive_verification.py": [
+    "8a61d4815 perf(spec_decode): use cumulative survival in copy_apply and cap single-req copy tile spill"
+   ]
+  }
+ },
+ "tilelang_and_sparknet": [
+  "tilelang 1107 tip 3b0c78142cd09d5addc69c2e523b6071fe012aab tree e2b001828fd4e38e6a2eee61f818d5083cb1335f",
+  "sparknet 1107 tip 1fd6a1fbd8dc4884057046d1ebd93d585c9e4bcf tree 8cc28a5cd3e683c1f114ed843453e3ce34f323e0",
+  "#967 tilelang: OK v/967/tilelang/0014-transform-vectorize-reinterpret-and-merge-readstate-ifs.patch -> tree eb89b5f32b424879b5a76715d60ddb843476aa50",
+  "#1008 sparknet: OK v/1008/sparknet/0001-perf-oneshot-pin-RoCE-proxy-thread-to-dedicated-fast.patch -> tree dab8c4577ac1cd87f7abc59a9c44a8e9d146f579",
+  "after: tilelang 3b0c78142cd09d5addc69c2e523b6071fe012aab, sparknet 1fd6a1fbd8dc4884057046d1ebd93d585c9e4bcf"
+ ],
+ "files_by_set": {
+  "978": [
+   "tests/multimodal/test_prefix_cache_fastpath.py",
+   "vllm/multimodal/hasher.py",
+   "vllm/multimodal/inputs.py",
+   "vllm/multimodal/media/image.py",
+   "vllm/multimodal/processing/processor.py",
+   "vllm/renderers/base.py",
+   "vllm/v1/core/sched/scheduler.py",
+   "vllm/v1/engine/async_llm.py",
+   "vllm/v1/engine/core.py"
+  ],
+  "1008": [
+   "tests/v1/worker/test_roce_cpu_affinity.py",
+   "vllm/entrypoints/cli/serve.py",
+   "vllm/entrypoints/launchers/api_server/entry.py",
+   "vllm/models/deepseek_v4_1/engram_rows/_reader.c",
+   "vllm/utils/cpu_affinity.py",
+   "vllm/v1/engine/core.py",
+   "vllm/v1/worker/gpu_worker.py"
+  ],
+  "988-deadrow": [
+   "tests/v1/worker/test_dead_rows.py",
+   "vllm/v1/worker/gpu/sample/sampler.py",
+   "vllm/v1/worker/gpu/sample/tilelang_auxiliary.py",
+   "vllm/v1/worker/gpu/sample/tilelang_bias.py",
+   "vllm/v1/worker/gpu/sample/tilelang_controls.py",
+   "vllm/v1/worker/gpu/sample/tilelang_sampling.py",
+   "vllm/v1/worker/gpu/sample/tilelang_thinking.py",
+   "vllm/v1/worker/gpu/spec_decode/rejection_sampler.py",
+   "vllm/v1/worker/gpu/tilelang_inputs.py"
+  ],
+  "957-p1": [
+   "tests/models/test_deepseek_v4_1_compressor.py",
+   "vllm/models/deepseek_v4_1/compressor.py",
+   "vllm/models/deepseek_v4_1/tilelang/linear.py"
+  ],
+  "957-p2": [
+   "vllm/models/deepseek_v4_1/tilelang/sparse_mla.py"
+  ],
+  "957-p4": [
+   "tests/kernels/test_deepseek_v41_tilelang_confidence.py",
+   "vllm/models/deepseek_v4_1/nvidia/dspark.py",
+   "vllm/models/deepseek_v4_1/tilelang/confidence.py",
+   "vllm/v1/worker/gpu/input_batch.py",
+   "vllm/v1/worker/gpu/model_runner.py",
+   "vllm/v1/worker/gpu/spec_decode/dspark/speculator.py"
+  ],
+  "967": [
+   "tests/kernels/attention/test_deepseek_v41_tilelang.py",
+   "vllm/models/deepseek_v4_1/tilelang/sparse_mla.py"
+  ],
+  "995": [
+   "benchmarks/kernels/benchmark_copy_drafts.py",
+   "tests/v1/spec_decode/test_copy_drafts.py",
+   "vllm/config/speculative.py",
+   "vllm/v1/worker/gpu/sample/tilelang_sampling.py",
+   "vllm/v1/worker/gpu/spec_decode/tilelang_copy.py"
+  ],
+  "956": [
+   "tests/models/test_deepseek_v4_1_ced_model.py",
+   "tests/models/test_deepseek_v4_1_compressor_prepare.py",
+   "vllm/models/deepseek_v4_1/attention.py",
+   "vllm/models/deepseek_v4_1/ced.py",
+   "vllm/models/deepseek_v4_1/compressor.py",
+   "vllm/models/deepseek_v4_1/nvidia/model.py",
+   "vllm/models/deepseek_v4_1/nvidia/model_state.py"
+  ],
+  "957-p5": [
+   "tests/v1/spec_decode/test_adaptive_verification.py",
+   "vllm/v1/worker/gpu/spec_decode/adaptive_verification.py"
+  ],
+  "1003": [
+   "tests/v1/spec_decode/test_acceptance_estimator.py",
+   "tests/v1/spec_decode/test_adaptive_verification.py",
+   "tests/v1/worker/test_dspark_greedy_markov.py",
+   "vllm/v1/worker/gpu/model_runner.py",
+   "vllm/v1/worker/gpu/spec_decode/acceptance_estimator.py",
+   "vllm/v1/worker/gpu/spec_decode/adaptive_verification.py",
+   "vllm/v1/worker/gpu/spec_decode/dspark/speculator.py"
+  ],
+  "953": [
+   "tests/v1/engine/test_late_admission.py",
+   "tests/v1/spec_decode/test_adaptive_verification.py",
+   "vllm/v1/engine/core.py",
+   "vllm/v1/worker/gpu/spec_decode/adaptive_verification.py"
+  ],
+  "1006": [
+   "tests/kernels/test_deepseek_v41_postload_startup.py",
+   "vllm/model_executor/layers/quantization/online/packed_bf16.py",
+   "vllm/model_executor/model_loader/utils.py",
+   "vllm/models/deepseek_v41/__init__.py",
+   "vllm/models/deepseek_v41/nvidia/vl_model.py",
+   "vllm/models/deepseek_v4_1/attention.py",
+   "vllm/models/deepseek_v4_1/nvidia/model.py",
+   "vllm/models/deepseek_v4_1/nvidia/vl_model.py",
+   "vllm/models/deepseek_v4_1/tilelang/embedding.py",
+   "vllm/models/deepseek_v4_1/tilelang/gemm.py",
+   "vllm/models/deepseek_v4_1/tilelang/linear.py",
+   "vllm/models/deepseek_v4_1/tilelang/moe.py",
+   "vllm/models/deepseek_v4_1/tilelang/postload_cache.py",
+   "vllm/models/deepseek_v4_1/tilelang/scale_codes.py",
+   "vllm/models/deepseek_v4_1/tilelang/vocab.py",
+   "vllm/tokenizers/registry.py"
+  ],
+  "957-p3": [
+   "tests/v1/spec_decode/test_acceptance_estimator.py",
+   "vllm/v1/worker/gpu/model_runner.py",
+   "vllm/v1/worker/gpu/spec_decode/acceptance_estimator.py",
+   "vllm/v1/worker/gpu/spec_decode/speculator.py"
+  ],
+  "988-topk": [
+   "tests/v1/spec_decode/test_dspark_topk.py",
+   "tests/v1/spec_decode/test_dspark_v41_gathered_markov.py",
+   "vllm/model_executor/models/qwen3_dspark.py",
+   "vllm/models/deepseek_v4_1/nvidia/dspark.py",
+   "vllm/v1/worker/gpu/sample/tilelang_sampling.py",
+   "vllm/v1/worker/gpu/spec_decode/dspark/speculator.py"
+  ]
+ }
+}

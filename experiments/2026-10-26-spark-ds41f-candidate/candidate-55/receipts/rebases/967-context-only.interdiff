@@ -1,0 +1,70 @@
+--- PR #967 patch (before)
++++ rebased on candidate-54 (after)
+@@ -1,37 +1,11 @@
+-From 66b5b3e10231603235ae6e204e69dad123d7dc9b Mon Sep 17 00:00:00 2001
+-From: Christopher Owen <christopherowen@users.noreply.github.com>
+-Date: Sun, 8 Nov 2026 12:43:05 +0000
+-Subject: [PATCH] perf(dsv41): vectorize TileLang reinterpret and merge
+- read-state IfThenElse in sparse_mla
+-
+-Base: 1107 vLLM patch head 320021e3c4dbb202d911ab70e2cd924c75420488.
+-
+-Rationale:
+-1. In sparse_mla.py, dequant_swa computes the UE8M0 scale via T.reinterpret(T.shift_left(T.cast(staged[i, D + d // SWA_GROUP], T.uint32), 23), accum_dtype). After DecoupleTypeCast stages the scale bytes into a thread-local array indexed by the vectorized loop variable vec, LegalizeVectorizedLoop invokes VectorizePlanner (src/transform/loop_vectorize.cc), which checks Op::GetAttrMap<TVectorizable>("TVectorizable"). Even though TLVectorizer::MutateReinterpretExpr_ already vectorizes builtin::reinterpret() across lanes, tirx.reinterpret is registered without TVectorizable = true, causing VectorizePlanner to reject loop-variant arguments inside reinterpret and fall back to a serial 8-iteration loop.
+-2. In decode Stage 1 and Stage 2, IfStmtBinding distributes if seg_active(...) across every statement in SeqStmt because IsReplayableScalarBind allows CallEffectKind::kReadState conditions (reading SwaLengths and IdxLengths) when the body does not write to those buffers. However, MergeIfStmt only re-merges adjacent IfThenElse blocks when SideEffect(condition) <= CallEffectKind::kPure, leaving 10 split if blocks in Stage 1 and 6 split if blocks per unrolled segment (30 branches across 5 segments) in Stage 2.
+-
+-Register TVectorizable = True on tirx.reinterpret and wrap tilelang.transform.MergeIfStmt with a read-state IfThenElse merger that coalesces consecutive IfThenElse blocks (without else) sharing an identical read-only condition when intermediate statements do not write to any buffer or redefine any variable read by the condition.
+-
+-Quality:
+-Bitwise-identical uint16 outputs across all sparse_mla routes (split, decode, extend). Eliminates all LegalizeVectorizedLoop serial-fallback warnings on sparse_mla, vectorizes dequant_swa into 2 x float4 iterations, collapses Stage 1+2 seg_active branches from 16 (30 unrolled in Stage 2) down to 3 (5 unrolled in Stage 2), and reduces decode (rows=8, H=40) latency by 5.2% median (17.28 us -> 16.39 us).
+-
+-Tests:
+-- pytest --noconftest -p tests.kernels.deepseek_v41_pdl_sources tests/kernels/attention/test_deepseek_v41_tilelang.py -k "sparse_mla or wo_input" tests/kernels/attention/test_deepseek_v41_ced_replay.py (24 passed, 0 PDL violations across 2 boots).
+-
+-Upstream status: local runtime compiler pass activation paired with TileLang C++ patch 0014.
+----
+- .../attention/test_deepseek_v41_tilelang.py   |  25 +++
+- .../deepseek_v4_1/tilelang/sparse_mla.py      | 191 +++++++++++++++++-
+- 2 files changed, 213 insertions(+), 3 deletions(-)
+-
+ diff --git a/tests/kernels/attention/test_deepseek_v41_tilelang.py b/tests/kernels/attention/test_deepseek_v41_tilelang.py
+-index 849113154..75f9037d7 100644
++index 53cd29825..370987343 100644
+ --- a/tests/kernels/attention/test_deepseek_v41_tilelang.py
+ +++ b/tests/kernels/attention/test_deepseek_v41_tilelang.py
+-@@ -1286,3 +1286,28 @@ def test_sparse_mla_plan_routes_right_sizes_head_block_and_decode_waves(monkeypa
+-     assert swa24.segments == 1
+-     assert swa24.split_max_rows == 24
+-     assert swa24.decode_max_rows == 144
++@@ -1370,3 +1370,28 @@ def test_indexer_score_vectorizes_kpool_loads_and_coschedules_dense_rows():
++ 
++     cand_src = indexer_score_v41(16384, 256, candidates=True).get_kernel_source()
++     assert "__tl_load_k_shared_candidates(" in cand_src
+ +
+ +
+ +def test_sparse_mla_vectorizes_swa_dequant_and_merges_readstate_segment_ifs():
+@@ -58,7 +32,7 @@
+ +    assert stage1.count("if (swa_seg_active |") == 2, stage1
+ +    assert stage2.count("if (swa_seg_active |") == 1, stage2
+ diff --git a/vllm/models/deepseek_v4_1/tilelang/sparse_mla.py b/vllm/models/deepseek_v4_1/tilelang/sparse_mla.py
+-index da22b50ab..55146e2cc 100644
++index 97d01798e..c9f795788 100644
+ --- a/vllm/models/deepseek_v4_1/tilelang/sparse_mla.py
+ +++ b/vllm/models/deepseek_v4_1/tilelang/sparse_mla.py
+ @@ -75,6 +75,191 @@ import torch
+@@ -253,7 +227,7 @@
+  HEAD_DIM = 512
+  ROPE_DIM = 64  # each head's trailing RoPE coordinates
+  NOPE_DIM = HEAD_DIM - ROPE_DIM
+-@@ -393,11 +578,11 @@ def sparse_mla_fwd_v41(
++@@ -437,11 +622,11 @@ def sparse_mla_fwd_v41(
+  
+      @T.macro
+      def seg_active(seg, SwaLengths, IdxLengths, row):
+@@ -268,6 +242,3 @@
+              (seg * G + G > swa_blocks)
+              & (seg * G < chunks)
+              & (idx_first < IdxLengths[row])
+--- 
+-2.43.0
+-
