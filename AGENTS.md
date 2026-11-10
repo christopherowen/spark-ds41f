@@ -24,6 +24,9 @@ the open levers, measured dead ends, and the lean screening routine.
   `bin/spark bench` run. It is immutable too; a new promotion adds its own.
   A profile of another topology names its own run in `benchmark_reference`
   (`manifests/benchmarks/<baseline>-tp4.json` for the `tp4-ring` shape).
+- `manifests/frozen/candidate-<N>.json` records a frozen candidate: a verified merged base published as
+  the GitHub pre-release `spark-ds41f-candidate-<N>` (docs/release-benchmark.md, "Frozen candidates").
+  It is immutable, and so are its tag and its candidate folder; a later freeze adds its own.
 - `experiments/` is the only place for unpromoted tuning.
 - `docs/inspiration.md` is a research watchlist, never a source or deployment
   authority. It names each source, what to review it for, and the adoption

@@ -10,6 +10,10 @@ spark-ds41f-1025's [rc6/](../2026-10-25-spark-ds41f-candidate/rc6).
 [release notes](release-notes.md)). Previously released (2026-10-30): candidate 14 is
 `spark-ds41f-1030` on the ring and triangle ([below](#candidate-14-rc14)).
 
+**Frozen candidates (from 2026-11-10):** each merged base verified on all three testbeds is frozen,
+recorded in `manifests/frozen/`, tagged `spark-ds41f-candidate-<N>` and published as a GitHub pre-release; the
+next round's candidates are built on it ([release-benchmark](../../docs/release-benchmark.md#frozen-candidates-pre-releases)).
+
 **Status (2026-10-26, CET):** candidate 7's image built on dgx4; its release tests passed on dgx4
 (6,417 passed, 163 skipped, 0 failed). **Candidate 8** ([below](#candidate-8-rc8)) adds 0533, the
 MoE output fix; its image is built and its release tests show two order-dependent test failures,

@@ -24,6 +24,9 @@ A candidate is the latest release plus a selection of PRs. The work has two phas
 - **PR validation** (steps 1-8) is quick. It shows whether each PR earns its keep.
 - **Release qualification** (step 9) measures the final candidate once, completely, and
   produces the benchmark data for the release notes and announcement.
+- **Freezing** (between rounds) publishes each verified merged base as a pre-release for
+  external users, and makes it the next round's base ([Frozen candidates](#frozen-candidates-pre-releases),
+  owner, 2026-11-10).
 
 AgentX, quality evals, cold boots and the full release set belong to release qualification
 only. Several candidates are tested at once, one per testbed. Every PR that passes is carried into all later candidates, and a
@@ -203,6 +206,9 @@ prefill at 32K and 256K.
   screen reference where none exists), and the live checks of the fixes it carries. No release set,
   quality evals, AgentX or cold boots.
 - **Its screens are the next round's reference:** later PRs are judged against the accumulated base.
+- **Then it is frozen:** a merged base verified on all three testbeds is frozen and published as a
+  pre-release ([Frozen candidates](#frozen-candidates-pre-releases)). The next round's three candidates are
+  built on it.
 
 The release candidate is the base plus every PR that passed PR validation, including every
 reworked PR that met its mark. It is measured once, completely, on every shape the release
@@ -232,6 +238,48 @@ serves, `tp3-triangle` included.
 - the startup memory floor.
 
 Then promotion (section 4).
+
+### Frozen candidates (pre-releases)
+
+A merged base is **frozen** once the rework cycle that produced it is done and it has passed verification on all
+three testbeds (`tp4-ring`, `tp4-switched`, `tp3-switched`): the gate, the screen, the live checks of the fixes it
+carries, and its release tests. It is then supplied to external users as a GitHub pre-release, and the next round's
+three candidates, one per testbed, are made with it as their base (owner, 2026-11-10).
+
+Freezing is not promotion. `config/cluster.json` and the release's baseline do not change; promotion still needs
+release qualification (step 9) and the owner's acceptance (section 4).
+
+**What a freeze records:**
+- **The candidate's folder is frozen.** Its series, lock, profiles and verification receipts never change again. Later
+  findings about it go into the next candidate's README, not this one.
+- **A freeze manifest:** `manifests/frozen/candidate-<N>.json`, immutable like a baseline; a later freeze adds its own.
+  It records:
+  - the commit, the tag, the date and the base it was built on (the previous frozen candidate or the release);
+  - the lock (`patch_head`, `expected_tree`, `patchset_sha256` for vLLM and every upstream series);
+  - the image ID on each testbed and the host that built it;
+  - the profile for each shape, and the shapes it was verified on, with each gate's hashes;
+  - every PR it carries since its base, with its verdict, and every PR dropped or left out on the way, with the reason;
+  - the over/under against the current release, per testbed;
+  - known issues: unmeasured metrics, open regressions, and caveats such as single-boot figures.
+- **A tag** `spark-ds41f-candidate-<N>` on the commit that adds the manifest. It is never moved or deleted.
+- **A GitHub pre-release** on that tag. It is marked pre-release, so the release (for example `spark-ds41f-1107`)
+  stays "Latest" and the default. Its notes give:
+  - what changed since the base, PR by PR;
+  - the over/under table, with the verified shapes;
+  - the known issues;
+  - how to run it: check out the tag, then `bin/spark build prepare`,
+    `bin/spark --cluster-config experiments/2026-10-26-spark-ds41f-candidate/candidate-<N>/<shape>.json build image --apply`,
+    `build distribute --apply` and `cluster start --apply` ([setup](setup.md)).
+- **No binary assets:** users build the image from the lock, as for a release. Nothing is pushed to a registry.
+
+**Publishing:**
+- The coordinator prepares the manifest and the notes, then asks the owner before creating the tag and the
+  pre-release (it is public). Tags, releases and pushes go from the owner's laptop only.
+- When the next freeze is published, the previous pre-release's notes gain a line "Superseded by
+  `spark-ds41f-candidate-<M>`". Old pre-release pages may be deleted later; their tags stay.
+
+**The next round** selects its PRs against the frozen candidate, builds its three candidates on its series, and
+judges them against the frozen candidate's recorded screens.
 
 ## Arms
 
