@@ -18,7 +18,7 @@ and renders:
    ``README.md``, ``docs/current-state.md``, and ``TODO.md``.
 2. The self-contained interactive GitHub Pages dashboard at ``docs/index.html``
    (plus ``docs/.nojekyll``, and ``<site-dir>/index.html`` + ``<site-dir>/data.json``
-   when ``--site-dir`` is given).
+   + the ``docs/logo.png`` favicon when ``--site-dir`` is given).
 """
 
 from __future__ import annotations
@@ -29,6 +29,7 @@ import html
 import json
 import math
 import re
+import shutil
 import sys
 from pathlib import Path
 from typing import Any
@@ -851,6 +852,7 @@ def render_site_html(data: dict[str, Any]) -> str:
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <title>{html.escape(title)}</title>
+  <link rel="icon" type="image/png" href="logo.png">
   <style>
     :root {{
       --bg: #0b0f17;
@@ -1970,6 +1972,7 @@ def main(argv: list[str] | None = None) -> int:
         out_dir.mkdir(parents=True, exist_ok=True)
         (out_dir / "index.html").write_text(targets[ROOT / "docs/index.html"])
         (out_dir / ".nojekyll").write_text("")
+        shutil.copyfile(ROOT / "docs/logo.png", out_dir / "logo.png")
         payload = {
             k: v for k, v in data.items() if k != "suites_by_path"
         }
