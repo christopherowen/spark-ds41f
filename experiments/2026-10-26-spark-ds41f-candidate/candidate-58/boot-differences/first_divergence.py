@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """The first committed position, collective and rank where two runs of one prompt differ.
 
-usage: first_divergence.py BOOT_DIR [--pair first-vs-each|all] [--json OUT]
+usage: first_divergence.py BOOT_DIR [--pair first-vs-each|all] [--across OTHER_BOOT_DIR] [--json OUT]
 
 BOOT_DIR holds one boot's collected traces (collect_traces.py): every rank's
 rows-*.bin (the row trace) and steps-*.jsonl. Requests served alone (one request in
@@ -9,6 +9,9 @@ each of their steps) are grouped by their prompt (the token ids of their prefill
 step, from position 0: prefix-cache hits are left out); a prompt served alone more
 than once (the gate's reference and again, in both runs) is compared pairwise, by
 default its first occurrence (the first run's reference) against each later one.
+With --across, each prompt's i-th occurrence in BOOT_DIR is compared with its i-th in
+OTHER_BOOT_DIR instead: the same request on two boots, so a target difference that
+leaves the tokens alone (which the gate cannot see without logprobs) shows too.
 
 A row is committed when its position is below the request's next step's first
 position (the verified drafts and the bonus row; rejected and dead rows are not).
@@ -63,7 +66,7 @@ def requests_of(path):
     """req_id -> list of step records (time order), for requests alone in their steps."""
     by_req = {}
     for rec in records(path):
-        if len(rec.get("req_ids", [])) != 1 or "ring" not in rec:
+        if len(rec.get("req_ids", [])) != 1 or ("ring" not in rec and "ring_bytes" not in rec):
             continue
         by_req.setdefault(rec["req_ids"][0], []).append(rec)
     for steps in by_req.values():
@@ -92,9 +95,6 @@ KINDS = {1: "all-reduce", 2: "all-gather (last dim)", 3: "all-gather (dim 0)",
 def tap(step, k, j, row):
     """Digest j (0 input, 1 output) of tap k for the step's row, or None when the tap
     is not row-aligned with it (a per-request carry for another row, a dim-0 gather)."""
-    ring = step["ring"]
-    if k >= len(ring):
-        return None
     layout = step.get("layout") or []
     entry = layout[k] if k < len(layout) else None
     rows = (entry[1] if j == 0 else entry[2]) if entry else step["rows"]
@@ -104,8 +104,15 @@ def tap(step, k, j, row):
         index = 0
     else:
         return None
-    values = ring[k][j]
-    return int(values[index]) if index < len(values) else None
+    if "ring_bytes" in step:  # [calls, 2, ring_width] little-endian int64
+        width = step["ring_width"]
+        if k >= step["calls"] or index >= width:
+            return None
+        return struct.unpack_from("<q", step["ring_bytes"], ((k * 2 + j) * width + index) * 8)[0]
+    ring = step["ring"]  # the first format: nested lists
+    if k >= len(ring) or index >= len(ring[k][j]):
+        return None
+    return int(ring[k][j][index])
 
 
 def layer_of(layout, k):
@@ -135,32 +142,52 @@ def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     parser.add_argument("boot")
     parser.add_argument("--pair", default="first-vs-each", choices=("first-vs-each", "all"))
+    parser.add_argument("--across")
     parser.add_argument("--json")
     args = parser.parse_args()
-    files = sorted(glob.glob(os.path.join(args.boot, "**", "rows-*.bin"), recursive=True))
-    if not files:
-        raise SystemExit(f"{args.boot}: no rows-*.bin")
-    ranks = {}
-    for path in files:
-        ranks.setdefault(rank_of(path), {}).update(requests_of(path))
+
+    def load_boot(directory, prefix=""):
+        files = sorted(glob.glob(os.path.join(directory, "**", "rows-*.bin"), recursive=True))
+        if not files:
+            raise SystemExit(f"{directory}: no rows-*.bin")
+        out = {}
+        for path in files:
+            for req, steps in requests_of(path).items():
+                out.setdefault(rank_of(path), {})[prefix + req] = steps
+        return out
+
+    def prompts_of(reqs):
+        prompts = {}
+        for req, steps in reqs.items():
+            first = steps[0]
+            if int(first["positions"][0]) != 0:
+                continue
+            key = tuple(int(x) for x in first["ids"][: int(first["num_tokens"])])
+            prompts.setdefault(key, []).append((steps[0]["t"], req))
+        return {key: [r for _, r in sorted(occ)] for key, occ in prompts.items()}
+
+    ranks = load_boot(args.boot)
+    other_prompts = None
+    if args.across:
+        other = load_boot(args.across, "B:")
+        for rank, reqs in other.items():
+            ranks.setdefault(rank, {}).update(reqs)
+        other_prompts = prompts_of(other[min(other)])
     rank_ids = sorted(ranks)
-    base = ranks[rank_ids[0]]
-    prompts = {}
-    for req, steps in base.items():
-        first = steps[0]
-        if int(first["positions"][0]) != 0:
+    base = {r: s for r, s in ranks[rank_ids[0]].items() if not r.startswith("B:")}
+    prompts = prompts_of(base)
+    report = {"boot": args.boot, "across": args.across, "ranks": rank_ids, "requests_alone": len(base),
+              "prompts": [], "differences": []}
+    for key, reqs in prompts.items():
+        if other_prompts is not None:
+            theirs = other_prompts.get(key, [])
+            pairs = list(zip(reqs, theirs))
+        elif len(reqs) < 2:
             continue
-        key = tuple(int(x) for x in first["ids"][: int(first["num_tokens"])])
-        prompts.setdefault(key, []).append((steps[0]["t"], req))
-    report = {"boot": args.boot, "ranks": rank_ids, "requests_alone": len(base), "prompts": [], "differences": []}
-    for key, occ in prompts.items():
-        occ.sort()
-        reqs = [r for _, r in occ]
-        if len(reqs) < 2:
-            continue
-        pairs = [(reqs[0], r) for r in reqs[1:]] if args.pair == "first-vs-each" else \
-            [(reqs[i], reqs[j]) for i in range(len(reqs)) for j in range(i + 1, len(reqs))]
-        report["prompts"].append({"prompt_tokens": len(key), "occurrences": len(reqs)})
+        else:
+            pairs = [(reqs[0], r) for r in reqs[1:]] if args.pair == "first-vs-each" else \
+                [(reqs[i], reqs[j]) for i in range(len(reqs)) for j in range(i + 1, len(reqs))]
+        report["prompts"].append({"prompt_tokens": len(key), "occurrences": len(reqs), "pairs": len(pairs)})
         for ra, rb in pairs:
             ca = {r: committed(ranks[r][ra]) for r in rank_ids if ra in ranks[r]}
             cb = {r: committed(ranks[r][rb]) for r in rank_ids if rb in ranks[r]}
