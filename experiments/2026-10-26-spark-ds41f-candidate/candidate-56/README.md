@@ -249,3 +249,7 @@ and column gather exactly.
 - **Testbed:** [attribute-956r4-tp4-switched.json](attribute-956r4-tp4-switched.json): the prefill suite at 32K-256K
   ABBA against `tp4-switched-no957p1-no956` (candidate-54's code on this image), then the grid step alone ABBA against
   the same control, to confirm decode is unchanged.
+
+**#956 r4 on the testbed** ([receipts/tp4-switched-956r4](receipts/tp4-switched-956r4/README.md)): prefill 3.4%, 2.8%
+and 3.8% faster at 64K, 128K and 256K than candidate-54's code in the same session, 32K the same, the grid the same.
+**#956 passes** and joins the next merged base; #957 part 1 is dropped.
