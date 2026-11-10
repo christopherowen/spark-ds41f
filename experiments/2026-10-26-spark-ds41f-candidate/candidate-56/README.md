@@ -180,7 +180,14 @@ later candidates. The round's selection receipts are in [candidate-55/receipts](
 
 ## Status
 
-Prepared and locked. Not built, not measured.
+Built on sp8 (`spark-ds41f:candidate-56`, image ID `0f65de86`); its release tests run on sp8 (`kernel-local`).
+
+| Testbed | Gate | Screen against candidate-54 | Own serving marks |
+| --- | --- | --- | --- |
+| `tp4-switched` | identical outputs; candidate-54's TP4 hashes | grid 2.85% slower at small batches; c16 the same; 256K prefill 3.3% faster | #956 meets its mark (prefill +2.3-2.4% at 64K and 256K); #957 part 1 misses (1-request decode 10-12% slower) ([receipts/tp4-switched](receipts/tp4-switched/README.md)) |
+
+#957 part 1 goes to rework. #956 builds on it (it reads part 1's replicated compressor weight at TP <= 4), so #956
+carries forward only with part 1's rework or rebased onto its gather path.
 
 ## Engine-grid attribution (2026-11-10)
 
