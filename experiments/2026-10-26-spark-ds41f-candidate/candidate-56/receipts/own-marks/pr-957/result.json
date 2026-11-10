@@ -1,0 +1,147 @@
+{
+ "pr": 957,
+ "part": 1,
+ "label": "957-p1",
+ "patch": "0795-perf-dsv41-replicate-the-BF16-compressor-projection-.patch (e4b134ab, on candidate-54 4e8133ff)",
+ "candidate": "candidate-56",
+ "pr_head": "e464d364431a26b031a6e91f5dd610f429129c46",
+ "verdict": "misses",
+ "verdict_reason": "At TP4 rank shapes, by CUDA-graph replay, the replicated BF16 projection is not the PR's 2x win. With L2 hot (the PR's condition) the four owner layers' projection is 3.0-3.6 us a step lower at 1-6 rows and 2.4-8.3 us higher at 16, 32 and 48 rows. With L2 cold it is 226-238 us a step higher at every row count. The PR's 103.6-107.6 -> 51.6-53.1 us came from an eager loop, which measures launches: eager reproduces it here (base 45-54 us a layer, candidate 17-18). On one GPU the full TP4-rank decode step is 0.23-0.35 ms (1.1-1.6%) slower at 1-4 requests and 2-8 rows, all beyond the interval, and the same at 16x32. The loss sits in the three ratio-2 owner layers and comes from the COMP L2 window. Outputs are bit-identical to TP1 (test passes) and the static cost is +23.4 MiB a rank.",
+ "rule": "Performance change: it must improve its own metric beyond the interval, and no cell of its own bench on a serving shape may be slower. Interval rule as candidates 49-53's: faster when the slower candidate boot beats the faster base boot, slower when the faster candidate boot is slower than the slower base boot, else the same.",
+ "arms": {
+  "base": "spark-ds41f:candidate-54 sha256:e1de71bed3b41dff3a969c19adc09072c0ab1c947f34afe7117cb8b6389e23ea, its own tree 5f021d9a (verified: 7,831 files match)",
+  "c56p1": "the same image + 0795's 3 files at e4b134ab, read-only (verified: candidate-54 + 0795 exactly)",
+  "why_one_image": "Both arms run on the dgx4-built candidate-54 image, so the build host is not a variable. The sp1 grid attribution ruled it out separately (grid +0.24%)."
+ },
+ "host": "sp8 (spark-0016, one GB10), 2026-11-10 06:12-07:37Z; ABBA in one session for every bench",
+ "mark": "screen_tp3_decode.py compressor cells and the compressor test on the candidate, 2 boots, ABBA against candidate-54, by CUDA-graph replay and kernel time. Required: the 4 compressor projections' local time lower beyond the interval (PR: 103.6-107.6 -> 51.6-53.1 us a step); the decode step lower by the 4 removed all-gathers (PR: about 135-155 us a step); compressor outputs torch.equal to TP1 at TP2..TP4; the static memory delta recorded (PR: +21.9..24.4 MiB a rank).",
+ "measured": {
+  "projection_cells": {
+   "what": "h957k.py: real DeepseekCompressor ranks (rank 0 at TP4 and TP3, built as the compressor test builds them) and their whole decode projection _project(x). Base: 12-bit packed split-K over the rank's shard, then the all-gather (a local copy stand-in, so no RoCE time) and gather_columns_into. 0795: BF16 split-K over the full 512/1024 columns. Each cell is timed four ways: CUDA-graph replay of 20 back-to-back calls (L2 hot); one-call graph replay after a 256 MiB write evicts L2 (L2 cold); CUPTI kernel time; eager.",
+   "per_step_owner_layers": "The checkpoint's kv_source_layer_ids [2, 8, 14, 20] have compress ratios 2, 2, 2 and 1, so a step runs 3 ratio-2 projections and 1 ratio-1, not the PR's 2+2. The PR's formula is kept beside it in raw/analysis/projection-cells.json.",
+   "tp4_step_us_graph_hot_base_to_cand": {
+    "m1": "32.39/32.53 -> 29.20/28.83 (-3.4, faster)",
+    "m2": "33.16/33.30 -> 29.79/29.49 (-3.6, faster)",
+    "m4": "33.57/34.20 -> 31.08/30.67 (-3.0, faster)",
+    "m6": "34.62/35.14 -> 32.42/32.01 (-2.7, faster)",
+    "m8": "34.76/35.27 -> 33.81/33.58 (-1.3, faster)",
+    "m12": "35.69/38.87 -> 36.40/36.08 (same)",
+    "m16": "36.24/36.41 -> 39.14/39.04 (+2.8, slower)",
+    "m24": "40.02/39.77 -> 39.79/39.89 (same)",
+    "m32": "41.72/41.67 -> 44.32/43.85 (+2.4, slower)",
+    "m48": "47.44/47.25 -> 55.84/55.53 (+8.3, slower)"
+   },
+   "tp4_step_us_graph_cold_base_to_cand": {
+    "m1": "128.5/123.5 -> 352.5/360.1 (+230, slower)",
+    "m6": "135.1/131.1 -> 355.3/365.6 (+227, slower)",
+    "m16": "142.9/138.5 -> 365.1/372.4 (+228, slower)",
+    "m48": "161.3/158.2 -> 394.2/401.4 (+238, slower)",
+    "all": "slower at all 11 row counts, +226..+238 us a step"
+   },
+   "tp4_per_layer_graph_hot_us": "ratio-2 at m1 8.37/8.38 -> 8.08/7.97; at m16 9.02/9.05 -> 10.70/10.67; at m48 11.89/11.75 -> 15.05/14.98. Ratio-1 at m1 7.28/7.39 -> 4.96/4.92; at m48 11.77/12.00 -> 10.69/10.59",
+   "tp4_per_layer_graph_cold_us": "ratio-2 about 35-43 -> 100-112; ratio-1 about 20-31 -> 54-65",
+   "tp3_step_us": "graph hot 37.4-59.8 -> 29.1-56.1 (faster at every row count, -2.1..-9.4 us); graph cold 161-198 -> 326-397 (+152..+199 us, slower at every row count)",
+   "eager_us_per_layer": "TP4 base 45.4-54.0 -> candidate 16.5-18.5 (the PR's kind of number: launch cost, not the kernels)",
+   "kernel_us": "CUPTI per call follows graph-hot: ratio-1 faster at all rows; ratio-2 faster at m1-m4 and slower from m6",
+   "tp1_outputs": "TP1's projected values and gates (rows 1, 7, 16, 64, 160) hash identically in both arms and all four boots: the replicated path is bit-identical to candidate-54's"
+  },
+  "decode_step_one_gpu": {
+   "what": "step957.py runs the full 40-layer model plus the DSpark drafter's 3 layers in one process on one GB10, with dummy weights at one TP4 rank's shapes: 16 heads, 2 output groups, a 576-wide expert intermediate, no Engram (the 2026-10-31 iket harness's TP_SHAPES[4]). The engine grid (GPUModelRunner.engine_grid, as servebench times it on the testbed) runs at 4K context, 10 replays. Capture ladder 1-32, max_num_seqs 16, the recipe's environment. DeepseekCompressor is built with TP world size 4 and rank 0, so the base shards and packs and 0795 replicates. The all-gather is a local copy stand-in, so the 4 RoCE all-gathers 0795 removes are not counted for the base.",
+   "step_ms_median_base_to_cand": {
+    "1x2": "21.590/21.608 -> 21.837/21.830 (+0.235, +1.09%, slower)",
+    "1x3": "21.551/21.586 -> 21.816/21.899 (+0.289, +1.34%, slower)",
+    "1x4": "21.631/21.605 -> 21.910/21.880 (+0.277, +1.28%, slower)",
+    "1x6": "21.631/21.709 -> 21.977/22.061 (+0.349, +1.61%, slower)",
+    "2x4": "21.710/21.617 -> 21.944/21.927 (+0.272, +1.25%, slower)",
+    "2x6": "21.722/21.749 -> 22.107/22.031 (+0.334, +1.54%, slower)",
+    "3x6": "22.152/21.934 -> 22.381/22.343 (+0.319, +1.45%, slower)",
+    "4x8": "22.870/22.602 -> 23.037/22.992 (+0.278, +1.22%, slower)",
+    "4x12": "23.480/23.280 -> 23.446/23.485 (same)",
+    "4x24": "27.070/26.987 -> 27.302/27.082 (+0.163, +0.60%, slower)",
+    "16x32": "27.260/27.364 -> 27.300/27.365 (same)"
+   },
+   "target_forward_ms_1x2": "13.726/13.703 -> 14.068/14.070 (+0.355 ms, +2.6%); the drafter is 0.07 ms lower",
+   "answer_can_part1_add_1_to_2_ms_at_batch_1": "Part 1 adds time at batch 1, and one GPU shows where, but only about a fifth of the testbed's amount: +0.24-0.35 ms a step (+0.36 ms of target forward) against the sp1 grid's +1.6-1.8 ms at 1x2/1x3. The local mechanism is the COMP window. The rest of the testbed loss needs the testbed, where the prefetch stream overlaps the RoCE all-reduces. One GPU cannot reproduce that interaction: with prefetch off, the one-GPU forward is 1.95 ms faster (11.76 vs 13.71 ms), while on tp3-switched prefetch off is 11.6% slower."
+  },
+  "where_the_time_goes": {
+   "what": "nsys 2025.3.2 with --cuda-graph-trace=node: one boot an arm, a profiler window over the 1x2 and 1x6 grid steps. raw/analysis/nsys-per-layer-1x2.json splits steps at the LM head and layers at attention_front_kernel; 9 complete steps an arm, mixing 1x2 and 1x6 in the same order in both arms.",
+   "per_layer_span_us_base_to_cand": "the ratio-2 owner layers 2, 8 and 14: 344.9 -> 424.7, 354.2 -> 430.8, 359.8 -> 444.5 (+77..+85 each). The ratio-1 owner layer 20: 360.3 -> 366.7 (+6). The other 36 target layers together: 12,670 -> 12,783 (+113, about +3 each)",
+   "owner_layer_kernels_us_summed_over_layers_2_8_14_20": {
+    "gemm_bf16_splitk_kernel (replicated projection)": "0 -> 265.1",
+    "gemm_packed_bf16_splitk_kernel (sharded projection)": "116.4 -> 0",
+    "compress_gather_partial_state_kernel (the next kernel; stretched)": "24.9 -> 168.9",
+    "compress_kernel": "82.2 -> 129.6",
+    "gemm_mxfp8_kernel": "811.9 -> 888.9",
+    "gemm_bf16_partials_kernel": "342.4 -> 406.9",
+    "l2_prefetch_kernel (prefetch stream)": "1,335.8 -> 1,661.5"
+   },
+   "l2_windows": "COMP is 2.0 MB (ratio 2) and 1.0 MB (ratio 1) at base, 10.5 MB and 5.2 MB with 0795: +29.7 MB a step on 2,268 MB of prefetch a step (WO 813, FFN 628, NEXT 820, COMP 7 MB). WO, issued right after the compressor, is 18.9 MB. COMP + WO is 20.9 MB at base and 29.4 MB with 0795, against GB10's 24 MB L2.",
+   "prefetch_stream": "Prefetch kernels are busy 14.15 -> 14.60 ms a profiled step (median). On one GPU the forward does not wait at the join (join wait 0 in every step), so the prefetch stream is not on this harness's critical path.",
+   "kernels_whole_step": "raw/analysis/nsys-kernels-1x2-1x6.json, by kernel name. The 1x2 split is clean: +474 us of l2_prefetch_kernel, +264 us of gemm_mxfp8_kernel, +145 us of the projection itself, +144 us of compress_gather_partial_state_kernel, gather_columns_into -12 us. Its 1x6 split merged two steps once, so read 1x6 from the per-layer file."
+  },
+  "controls_one_variable_each": {
+   "l2_prefetch_off": {
+    "setting": "VLLM_DS41_L2_PREFETCH=0 in both arms, ABBA",
+    "step_ms": "1x2 19.707/19.584 -> 19.847/19.760 (+0.158, slower); 1x3 +0.185 (slower); 1x6 +0.129 (same); 4x8 -0.055 (same); 16x32 -0.093 (same)",
+    "reading": "Without any prefetch the replicated weight still costs about 0.13-0.19 ms at one request: its extra 28 MiB are read cold. On the testbed the 4 removed all-gathers (PR: about 80-100 us) offset part of that. One GPU's prefetch level is not the testbed's (prefetch off is faster here, 11.6% slower on tp3-switched), so this control only shows the patch with prefetch held off."
+   },
+   "comp_window_dropped": {
+    "setting": "step957.py --no-comp-window in both arms: every layer's L2 windows built as usual, then the COMP window removed before capture; ABBA",
+    "step_ms": "1x2 21.550/21.484 -> 21.375/21.334 (-0.162, faster); 1x3 -0.147 (faster); 1x6 -0.232 (same); 4x8 -0.402 (faster); 16x32 -0.442 (faster)",
+    "against_base_with_comp": "0795 without COMP against candidate-54 with COMP (the step runs, same session): 1x2 21.35 vs 21.60 ms (-0.25 ms)",
+    "reading": "Remove only the COMP window and part 1's one-GPU loss turns into a 0.15-0.44 ms gain at every shape tested. On this harness the loss is the COMP window's 10.5 MB fill racing the replicated GEMM."
+   }
+  },
+  "torch_equal_to_tp1": {
+   "test": "pytest --noconftest -q tests/models/test_deepseek_v4_1_compressor.py",
+   "results": "c56p1 boot1 9 passed; c56p1 boot2 9 passed; base boot1 9 passed",
+   "covers": "test_compressor_tp_sharded_fused_wkv_wgate_matches_tp1: on 0795, ranks at TP2..TP4 hold the replicated BF16 weight and _project equals TP1 bit for bit at rows 1, 7, 16, 64 and 160; TP5..TP8 keep the sharded path equal to TP1"
+  },
+  "static_memory": {
+   "tp4_per_rank": "compressor weights 12,128,748 B -> 36,700,160 B: +24,571,412 B (+23.4 MiB). The base's figure includes the ratio-1 layer's 5 MiB BF16 SP copy (_sp_weight), which 0795 no longer needs, since its SP projection reads the replicated weight. From the loaded model in step-*-boot1.json.",
+   "tp3_per_rank": "from h957k's layouts: 1,475,976 + 3 x 2,951,876 + 5,242,880 (SP copy) = 15,574,484 B -> 36,700,160 B: +21,125,676 B (+20.1 MiB)",
+   "pr": "+21.9..24.4 MiB: consistent"
+  }
+ },
+ "cause": {
+  "summary": "The replicated ratio-2 compressor weight (10.5 MB, against the 2.0 MB rank shard) is what the COMP L2 window prefetches. COMP is built with the WO budget (20 MB), so it takes the whole weight. Its fill is issued after Q-B and cannot finish before the compressor's split-K GEMM reads the weight. So the GEMM reads mostly from DRAM while the 10.5 MB fill and the 18.9 MB WO fill queued behind it compete for the same bandwidth. COMP + WO (29.4 MB) also exceeds the 24 MB L2, where the base's 20.9 MB fit.",
+  "evidence": [
+   "one GPU, nsys: the loss is in the three ratio-2 owner layers (+77..+85 us each), with a small spill (+3 us a layer) into the rest. The ratio-1 owner layer, with a 5.2 MB COMP, is +6 us.",
+   "projection cells: the replicated GEMM is about as fast as the shard with L2 hot (-3 us a step at 1-6 rows), but +226-238 us a step when it reads from DRAM",
+   "dropping only the COMP window removes the whole one-GPU loss and leaves a 0.15-0.44 ms gain",
+   "TP3 (coordinator, candidate-54 on sp5): #961's small-batch grid loss is the L2 prefetch windows' size, and capping them recovers it. So on the testbed at small batch the prefetch stream is near the critical path, and every extra byte there costs. On one GPU it is not critical (join wait 0), which is why one GPU shows +0.24-0.35 ms where the testbed shows +1.6-1.8 ms."
+  ],
+  "ruled_out": [
+   "the build host (sp1 grid attribution: candidate-56's image with candidate-54's code equals candidate-54's image)",
+   "an untuned or non-captured GEMM: (512, 5120) and (1024, 5120) have tuned SPLIT_BF16 decode tiles and declared split-K kernels; graph-hot cells are at par with the shard at small M",
+   "lost overlap behind the removed all-gather: on one GPU the all-gather stand-in is a copy, and the step still loses with COMP and gains without it, so the loss does not need the all-gather"
+  ],
+  "not_shown_on_one_gpu": "The testbed's 5x larger loss (1.6-1.8 ms against 0.24-0.35 ms) depends on how the prefetch stream overlaps the RoCE all-reduces. A tp4-switched grid run must confirm the fix."
+ },
+ "fix_direction": {
+  "recommended": "Keep the replicated weight, but stop COMP prefetching it whole. Give COMP its own budget instead of BUDGET_WO in DeepseekV4DecoderLayer.build_l2_prefetch (nvidia/model.py), e.g. a new VLLM_DS41_L2_PREFETCH_COMP_MB. Default it to the sharded bytes (about 2 MB), or 0 when fused_wkv_wgate is replicated and unpacked. One GPU's control (COMP dropped) measures this direction: 0.15-0.44 ms faster than candidate-54, with the 4 all-gathers gone on top on the testbed.",
+  "alternative": "Replicate only for SP prefill, or by row count: decode keeps the sharded packed weight (2.0/1.0 MB, prefetched hot), and prefill and #956's SP projection read the replicated BF16 copy. The base already holds such a copy for ratio 1 (_sp_weight). Choosing by rows does not help, because the cold replicated read loses at every row count; only the L2-hot cells favour it at 1-8 rows. This option keeps the 4 all-gathers at decode.",
+  "env_answer": {
+   "comp_only_cap": "No existing setting caps COMP alone. COMP's plan uses BUDGET_WO, so VLLM_DS41_L2_PREFETCH_WO_MB caps WO and COMP together, slicing a segment's head. A COMP-sized value (VLLM_DS41_L2_PREFETCH_WO_MB=2) would also cut every layer's 18.9 MB WO window to 2 MB, so it is not a fix.",
+   "tp3_caps_at_tp4": "VLLM_DS41_L2_PREFETCH_WO_MB=15 VLLM_DS41_L2_PREFETCH_FFN_MB=12 VLLM_DS41_L2_PREFETCH_NEXT_MB=12 leave the 10.5 MB COMP window whole (it is under 15 MB). They trim WO 18.9 -> 15 MB, so COMP + WO is 25.5 MB, still over the 24 MB L2. They cut a step's prefetch from 2,298 to 1,690 MB, about 20 times the 29.7 MB 0795 adds. If the TP4 loss is the stream's total load near the critical path (the TP3 mechanism), the caps should recover most of it. If it is COMP's race with its own GEMM, they will not. One GPU can't decide this, since its prefetch is not critical.",
+   "test_to_run": "tp4-switched grid suite (candidate-48/grid-suite.json), ABBA in one session: candidate-56-no956 (957-p1 alone) and its no957p1-no956 control, each with the 15/12/12 caps, against the same pair without caps. The caps' effect on candidate-54 at TP4 is unknown: #961 made TP4's grid 3.7% faster at candidate-51, so caps may lose some of that."
+  }
+ },
+ "predicted_serving_share": {
+  "anchors": "candidate-57/receipts/rework/pr-957-p5-r1/result.json served steps (TP3): c1 38.03 ms, c4 about 71.0 ms, c8 115.61 ms. TP4 c16 129.1 ms (1000/7.747 steps/s, candidate-54's tp4-switched screen). No TP4 c1 served step is recorded, so TP3's c1 anchor stands in.",
+  "tp4_c1": "testbed grid +1.6-1.8 ms a 1-request step: about -4.2% to -4.7% of throughput against the 38.03 ms anchor. The one-GPU part alone (+0.24-0.35 ms) is -0.6% to -0.9%.",
+  "tp4_c16": "about 0: the 16-request grid cells are the same on the testbed and on one GPU (16x32 +0.02 ms)",
+  "tp3": "not measured on the testbed. 0795 replicates at TP3 too, and TP3's COMP grows 2.95 -> 10.5 MB, so the same loss is expected.",
+  "if_fixed": "with COMP capped, one GPU predicts -0.15..-0.44 ms a step (0.4-1.2% at c1, 0.3% at c16), plus the 4 removed all-gathers (PR: about 80-100 us) on the testbed"
+ },
+ "not_run": "No testbed run: the screen and the sp1 grid attribution are the coordinator's. No RoCE all-gather timing exists on one GPU.",
+ "files": {
+  "raw/json": "proj-*, step-*, nsys-*, nopf-*, nocomp-* (each boot's full output)",
+  "raw/logs": "each run's container log, the pytest outputs included",
+  "raw/commands-sp8.txt": "every run's om.sh block: lock, hold file, loadavg, MemAvailable, docker ps, the exact docker command, exit code",
+  "raw/analysis": "projection-cells.json, step-grid*.json, nsys-*.json (written by h/aom.py, raw/harness/ansys.py, ajoin.py, alayer.py)",
+  "raw/harness": "h957k.py, step957.py and the nsys analysis scripts, as run",
+  "raw/nsys-sqlite-sha256.txt": "SHA-256 of the two nsys sqlite exports (11 MB each) and reports, kept on sp8 at ~/spark-lab/agents/round3-own-marks/out/pr-957p1/nsys/"
+ },
+ "hosts_and_rules": "sp8 only. Every GPU run went through common/bin/om.sh under flock /tmp/spark-lab-gpu.lock, one boot a hold; the hold file was absent and no serving container ran at every start. No push, commit, PR, image build, cluster, window or testbed operation."
+}

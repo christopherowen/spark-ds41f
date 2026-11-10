@@ -1,0 +1,36 @@
+# On sp8, B=~/spark-lab/agents/round3-own-marks. Every GPU line ran through B/bin/om.sh (common/bin/om.sh):
+# flock /tmp/spark-lab-gpu.lock, hold file and serving-container checks, one fresh container a run, on
+# spark-ds41f:candidate-54 (sha256:e1de71be...) with the arm's overlay (common/files-ARM.txt) read-only.
+# Each run's exact docker command, times, loadavg, MemAvailable and exit code: raw/commands-sp8.txt.
+# Setup (no GPU): bash B/bin/setup.sh; bash B/bin/verify.sh (common/setup.txt).
+# Queue: bash B/bin/run_all.sh pr-957p1k pr-957p1s pr-957p1n pr-957p2 pr-957p4 pr-988 pr-957p1t pr-957p1v pr-957p4d
+#        (05:45:43Z start; 07:43:25Z end; every script rc=0; common/progress.log)
+
+# #988 dead-row part (0794)
+
+## B/bin/pr-988.sh
+# #988 dead-row part (0794): sampler cells (h988.py), ABBA, then the PR's tests.
+B=$HOME/spark-lab/agents/round3-own-marks; OM=$B/bin/om.sh; . $B/bin/env.sh; mkdir -p $B/out/pr-988/json
+for spec in "base 1" "c55dr 1" "c55dr 2" "base 2"; do set -- $spec
+  $OM 988 sampler-$1-boot$2 $1 "${RECIPE_ENV[@]}" -- python3 /h/h988.py --arm $1 --boot $2 --out /out/json/sampler-$1-boot$2.json
+done
+for k in 1 2; do
+  $OM 988 pytest-c55dr-boot$k c55dr -- pytest --noconftest -o cache_dir=/tmp/pc -q tests/v1/worker/test_dead_rows.py \
+    tests/v1/worker/test_gpu_sampling_states_gather.py tests/kernels/test_deepseek_v41_copy_logits.py tests/v1/worker/test_prepare_kernels.py
+done
+
+## analysis
+python3 common/h/aom.py 988 raw/json > raw/analysis/sampler-cells.json
+
+## env.sh
+# Recipe environment for the one-GPU runs (releases/spark-ds41f-1107/cluster.json "environment",
+# the entries that act in one process), as docker -e options.
+RECIPE_ENV=(-e CUDA_DEVICE_MAX_CONNECTIONS=32 -e "PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True,garbage_collection_threshold:0.6"
+  -e SPARK_DS41F_DSPARK_DEAD_ROWS_TAU=0.2 -e SPARK_DS41F_DSPARK_MAIN_PROJ_TP=1 -e SPARK_DS41F_DSPARK_VOCAB_PARALLEL=1
+  -e VLLM_ALLOW_LONG_MAX_MODEL_LEN=1 -e VLLM_DS41_HEAD_DTYPE=float32 -e VLLM_DS41_PACKED_BF16_LM_HEAD=1
+  -e VLLM_L2_PREFETCH_GRID=2 -e VLLM_L2_PREFETCH_KERNELS=tilelang -e VLLM_LATE_ADMISSION_LAYER=30
+  -e VLLM_USE_BREAKABLE_CUDAGRAPH=0 -e VLLM_USE_V2_MODEL_RUNNER=1 -e VLLM_DS41_KERNEL_BACKEND=tilelang
+  -e TRANSFORMERS_OFFLINE=1 -e OMP_NUM_THREADS=8 -e MALLOC_ARENA_MAX=2 -e VLLM_ENGINE_READY_TIMEOUT_S=3600
+  -e VLLM_NO_USAGE_STATS=1 -e VLLM_PLUGINS= -e TRITON_CACHE_DIR=/root/.tilelang/triton -e VLLM_CACHE_ROOT=/root/.tilelang/vllm)
+HUB=(-v $HOME/.cache/huggingface/hub:/hf/hub:ro)
+NSYS=(-v /opt/nvidia/nsight-systems/2025.3.2:/opt/nsys:ro)
