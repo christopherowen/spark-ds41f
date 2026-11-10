@@ -309,3 +309,7 @@ carries, and its release tests), candidate-58 is the first frozen candidate.
 ## Status
 
 Prepared and locked; not built, not measured.
+
+**Added during verification (2026-11-10):** [single-stream-tp4.json](single-stream-tp4.json), c1 at `tp4-ring` in one
+session against candidate-54 (candidate-58, candidate-54, candidate-58 again), as candidate-55's was. c1 decode on
+`tp4-ring` is one of the release targets, and the merged-base screen does not measure it.
