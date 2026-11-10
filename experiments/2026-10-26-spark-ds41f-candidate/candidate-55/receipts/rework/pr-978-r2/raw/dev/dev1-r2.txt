@@ -1,0 +1,681 @@
+# label=dev/dev1-r2 image=spark-ds41f:candidate-54 (sha256:e1de71bed3b41dff3a969c19adc09072c0ab1c947f34afe7117cb8b6389e23ea) arm=/home/chris/spark-lab/agents/candidate-55-rework-978-r2/arms/r2dev gpu=none
+# mounted: 27 files; sha256 of each:
+#   d7990ddfaebf7d1bff56589e33cad9793cde1287a49e903d75b6e7ae440aeff0  ./tests/multimodal/test_prefix_cache_fastpath.py
+#   c756c783b8211afc9ea6de0d350b73ae93deb2fc1357702e8d03c61ef3888c0a  ./tests/v1/core/test_stripped_mm_scheduling.py
+#   cfec76e7bf455805395a13df5b56a9a1764b4f0b26be69454c63ed77ad21861a  ./tests/v1/engine/test_request_submission_cleanup.py
+#   9153b93e62b4724041c4b44dc8a417e521ae83ad1a1b52d9b5bd16bf1a9ba975  ./tests/v1/worker/test_dead_rows.py
+#   f4caee411cfcd534a7e788fe1a6bbd3bec2233c473ec3a9aa5dd6ad2707a50e7  ./tests/v1/worker/test_roce_cpu_affinity.py
+#   28c26a60e860e7ac2ba181986fb70a94b76cb5ad89f0b57a06351f2e62929c9e  ./vllm/entrypoints/cli/serve.py
+#   b3c312259b478f0519764eee88bc60f78c353554a9867432e4f1b8fb2b123119  ./vllm/entrypoints/launchers/api_server/entry.py
+#   59ab079206d1a92582bdd571ff8de8d3a465cc646bbb648be1f44d39fa7be3c6  ./vllm/multimodal/hasher.py
+#   84692be153dd1c086ea1b1f60e105752b53a1768eb332f4bc7130364b1c0e89b  ./vllm/multimodal/inputs.py
+#   024ffc54287537f05f62289016991deec12cd98cf013a3050705e745c3efaf5f  ./vllm/multimodal/media/image.py
+#   7cee31025bc25323bc2344225e6809391a4ebd36df637f14f1b14eb31d8c21b6  ./vllm/multimodal/processing/context.py
+#   00b3d74c97bbbf4e75a31def508b562834ae358045134353c8388cf7b1ec3e6f  ./vllm/multimodal/processing/processor.py
+#   d9a243edd0cc7d5eeb390d748381507ba154cb44b0d0fd78d514df632cf9ec9e  ./vllm/multimodal/registry.py
+#   0507db6d1a0ae31c9588a7ef391c79f34bd75e5ac08581b80ca08464ab9d6128  ./vllm/renderers/base.py
+#   b179933c7ebc7e3975ce365ec0f0da87f7afe18e455e65f73e68e22ac4789444  ./vllm/utils/cpu_affinity.py
+#   2ddca1b9cbd2eae63a33908c0fef7264bbd66b8cda10f56e4b93d67972b019cd  ./vllm/v1/core/sched/scheduler.py
+#   dd776d8fc758328a298109fc3254c5b74780fe01b6560c344d760b327fe47545  ./vllm/v1/engine/async_llm.py
+#   e00afb407b7345b858808f1a97f851a3b45db3277ac31f2ff39596f8e62e4d4a  ./vllm/v1/engine/core.py
+#   3f22a100e312abc0a6c8e8b6b31790393591ca0032b064908571b50d265743b9  ./vllm/v1/worker/gpu/sample/sampler.py
+#   55e69117cfbeb3849f2f453d15c74e87fb70c6783e1188e5a443b75b9b68f300  ./vllm/v1/worker/gpu/sample/tilelang_auxiliary.py
+#   5e983a0501b18d9a1a3aa0685cf2526d3ac45f6167c4b7235cc9692b5574ceb0  ./vllm/v1/worker/gpu/sample/tilelang_bias.py
+#   e6a08abc744059a3eaa992608394481714d3e605d5a827fbace91153d5c50795  ./vllm/v1/worker/gpu/sample/tilelang_controls.py
+#   656b801012eb4d95ce238696658bdc0c586652758288b739cd0841e4d31bce46  ./vllm/v1/worker/gpu/sample/tilelang_sampling.py
+#   fed581af45edbf4f7cad44d8849a078a0f25bff123c1ebcbbc98ffefe986d2a2  ./vllm/v1/worker/gpu/sample/tilelang_thinking.py
+#   e1e3764733a2c52df85a63930eaaeecc79dae59292d659a0f1f9201d59ed81fe  ./vllm/v1/worker/gpu/spec_decode/rejection_sampler.py
+#   981212a2284d192901f453c76967bb845413e290ceaaabdf4855e9da8d5147ee  ./vllm/v1/worker/gpu/tilelang_inputs.py
+#   53dcb35aca21fee6a6f2b585d98349ac1b945ee024853e6ffa1068639c479e59  ./vllm/v1/worker/gpu_worker.py
+# started 2026-11-10T08:09:46Z
+...................................FFFFFF                                [100%]
+=================================== FAILURES ===================================
+__________ test_serving_frontend_sends_repeat_images_without_data[0] ___________
+
+mm_processor_cache_gb = 0
+
+    @pytest.mark.parametrize("mm_processor_cache_gb", [0, 4])
+    def test_serving_frontend_sends_repeat_images_without_data(mm_processor_cache_gb):
+        """The API server's path: the renderer builds the processor from the
+        served DS4.1 config with the recipe's multimodal flags, and AsyncLLM sends
+        a conversation's repeated image without its tensors from the second turn
+        (with --mm-processor-cache-gb 0 only)."""
+        snapshot = os.environ.get("DS41F_SNAPSHOT")
+        if not snapshot:
+            pytest.skip("needs the DS4.1 checkpoint (DS41F_SNAPSHOT)")
+        from vllm.engine.arg_utils import AsyncEngineArgs
+        from vllm.models.deepseek_v41.common.mm_preprocess import IMAGE_PLACEHOLDER
+        from vllm.sampling_params import SamplingParams
+        from vllm.usage.usage_lib import UsageContext
+        from vllm.v1.engine.core_client import EngineCoreClient
+    
+        args = AsyncEngineArgs(
+            model=snapshot,
+            tokenizer_mode="deepseek_v41",
+            dtype="bfloat16",
+            block_size=256,
+            enable_prefix_caching=True,
+            max_model_len=32768,
+            limit_mm_per_prompt={"image": 67},
+            mm_processor_cache_gb=mm_processor_cache_gb,
+            enforce_eager=True,
+        )
+>       vllm_config = args.create_engine_config(UsageContext.OPENAI_API_SERVER)
+                      ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+tests/multimodal/test_prefix_cache_fastpath.py:549: 
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
+vllm/engine/arg_utils.py:2215: in create_engine_config
+    device_config = DeviceConfig(device=cast(Device, current_platform.device_type))
+                    ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
+
+self = DeviceConfig(device='', device_type='')
+
+    def __post_init__(self):
+        if self.device == "auto":
+            # Automated device type detection
+            from vllm.platforms import current_platform
+    
+            self.device_type = current_platform.device_type
+            if not self.device_type:
+                raise RuntimeError(
+                    "Failed to infer device type, please set "
+                    "the environment variable `VLLM_LOGGING_LEVEL=DEBUG` "
+                    "to turn on verbose logging to help debug the issue."
+                )
+        else:
+            # Device type is assigned explicitly
+            if isinstance(self.device, str):
+                self.device_type = self.device
+            elif isinstance(self.device, torch.device):
+                self.device_type = self.device.type
+    
+        # Some platforms require processing inputs on CPU.
+        from vllm.platforms import current_platform
+    
+        if (
+            current_platform.uses_host_device_handling()
+            and self.device_type == current_platform.device_type
+        ):
+            self.device = None
+        else:
+            # Set device with device type
+>           self.device = torch.device(self.device_type)
+                          ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+E           RuntimeError: Device string must not be empty
+
+vllm/config/device.py:78: RuntimeError
+----------------------------- Captured stdout call -----------------------------
+INFO 11-10 08:09:57 [__init__.py:119] Registered model loader `<class 'b12x.integration.vllm.loader.B12xModelLoader'>` with load format `b12x`
+------------------------------ Captured log call -------------------------------
+INFO     vllm.model_executor.model_loader:__init__.py:119 Registered model loader `<class 'b12x.integration.vllm.loader.B12xModelLoader'>` with load format `b12x`
+__________ test_serving_frontend_sends_repeat_images_without_data[4] ___________
+
+mm_processor_cache_gb = 4
+
+    @pytest.mark.parametrize("mm_processor_cache_gb", [0, 4])
+    def test_serving_frontend_sends_repeat_images_without_data(mm_processor_cache_gb):
+        """The API server's path: the renderer builds the processor from the
+        served DS4.1 config with the recipe's multimodal flags, and AsyncLLM sends
+        a conversation's repeated image without its tensors from the second turn
+        (with --mm-processor-cache-gb 0 only)."""
+        snapshot = os.environ.get("DS41F_SNAPSHOT")
+        if not snapshot:
+            pytest.skip("needs the DS4.1 checkpoint (DS41F_SNAPSHOT)")
+        from vllm.engine.arg_utils import AsyncEngineArgs
+        from vllm.models.deepseek_v41.common.mm_preprocess import IMAGE_PLACEHOLDER
+        from vllm.sampling_params import SamplingParams
+        from vllm.usage.usage_lib import UsageContext
+        from vllm.v1.engine.core_client import EngineCoreClient
+    
+        args = AsyncEngineArgs(
+            model=snapshot,
+            tokenizer_mode="deepseek_v41",
+            dtype="bfloat16",
+            block_size=256,
+            enable_prefix_caching=True,
+            max_model_len=32768,
+            limit_mm_per_prompt={"image": 67},
+            mm_processor_cache_gb=mm_processor_cache_gb,
+            enforce_eager=True,
+        )
+>       vllm_config = args.create_engine_config(UsageContext.OPENAI_API_SERVER)
+                      ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+tests/multimodal/test_prefix_cache_fastpath.py:549: 
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
+vllm/engine/arg_utils.py:2215: in create_engine_config
+    device_config = DeviceConfig(device=cast(Device, current_platform.device_type))
+                    ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
+
+self = DeviceConfig(device='', device_type='')
+
+    def __post_init__(self):
+        if self.device == "auto":
+            # Automated device type detection
+            from vllm.platforms import current_platform
+    
+            self.device_type = current_platform.device_type
+            if not self.device_type:
+                raise RuntimeError(
+                    "Failed to infer device type, please set "
+                    "the environment variable `VLLM_LOGGING_LEVEL=DEBUG` "
+                    "to turn on verbose logging to help debug the issue."
+                )
+        else:
+            # Device type is assigned explicitly
+            if isinstance(self.device, str):
+                self.device_type = self.device
+            elif isinstance(self.device, torch.device):
+                self.device_type = self.device.type
+    
+        # Some platforms require processing inputs on CPU.
+        from vllm.platforms import current_platform
+    
+        if (
+            current_platform.uses_host_device_handling()
+            and self.device_type == current_platform.device_type
+        ):
+            self.device = None
+        else:
+            # Set device with device type
+>           self.device = torch.device(self.device_type)
+                          ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+E           RuntimeError: Device string must not be empty
+
+vllm/config/device.py:78: RuntimeError
+_____________ test_stripped_item_held_nowhere_is_a_retryable_miss ______________
+
+    def test_stripped_item_held_nowhere_is_a_retryable_miss():
+>       scheduler = create_scheduler(enable_prefix_caching=True)
+                    ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+tests/v1/core/test_stripped_mm_scheduling.py:48: 
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
+
+model = 'facebook/opt-125m', max_num_seqs = 16, max_num_batched_tokens = 8192
+enable_chunked_prefill = True, enable_prefix_caching = True
+long_prefill_token_threshold = 0, prefill_compute_share = None
+prefill_compute_half_life = None, max_num_prefill_tokens_per_step = 0
+max_parallel_prefills = 1, prefill_policy = 'round-robin'
+decode_refill_target = 'auto', scheduling_policy = 'fcfs', device = 'auto'
+disable_chunked_mm_input = False, use_kv_connector = None, kv_role = 'kv_both'
+num_blocks = 10000, block_size = 16, max_model_len = None
+num_speculative_tokens = None, speculative_method = None
+parallel_drafting = False, skip_tokenizer_init = False, async_scheduling = False
+pipeline_parallel_size = 1, data_parallel_size = 1
+num_speculative_tokens_per_batch_size = None
+adaptive_speculative_tokens_window = None
+adaptive_speculative_tokens_initial = None, use_ec_connector = False
+ec_role = None, use_v2_model_runner = None, kv_cache_spec = None
+per_request_spec_decode_metrics = 'none'
+
+    def create_scheduler(
+        model: str = "facebook/opt-125m",
+        max_num_seqs: int = 16,
+        max_num_batched_tokens: int = 8192,
+        enable_chunked_prefill: bool = True,
+        enable_prefix_caching: bool = False,
+        long_prefill_token_threshold: int = 0,
+        prefill_compute_share: PrefillComputeShare | None = None,
+        prefill_compute_half_life: PrefillComputeHalfLife | None = None,
+        max_num_prefill_tokens_per_step: int = 0,
+        max_parallel_prefills: MaxParallelPrefills = 1,
+        prefill_policy: PrefillPolicy = "round-robin",
+        decode_refill_target: DecodeRefillTarget = "auto",
+        scheduling_policy: SchedulerPolicy = "fcfs",
+        device: str = "auto",
+        disable_chunked_mm_input: bool = False,
+        use_kv_connector: None | bool | str | MockKVConfig = None,
+        kv_role: str = "kv_both",
+        num_blocks: int = 10000,
+        block_size: int = 16,
+        max_model_len: int | None = None,
+        num_speculative_tokens: int | None = None,
+        speculative_method: str | None = None,
+        parallel_drafting: bool = False,
+        skip_tokenizer_init: bool = False,
+        async_scheduling: bool = False,
+        pipeline_parallel_size: int = 1,
+        data_parallel_size: int = 1,
+        num_speculative_tokens_per_batch_size: list[tuple[int, int, int]] | None = None,
+        adaptive_speculative_tokens_window: int | None = None,
+        adaptive_speculative_tokens_initial: int | None = None,
+        use_ec_connector: bool = False,
+        ec_role: str | None = None,
+        use_v2_model_runner: bool | None = None,
+        kv_cache_spec: KVCacheSpec | None = None,
+        per_request_spec_decode_metrics: str = "none",
+    ) -> Scheduler | AsyncScheduler:
+        """Create scheduler under test.
+    
+        Args:
+          model: model under test
+          max_num_seqs: max sequences to schedule
+          max_num_batch_tokens: max num tokens to batch
+          enable_prefix_caching: optionally force APC config
+                                 (True/False) or use default
+                                 (False)
+    
+        Returns:
+          {class}`Scheduler` instance
+        """
+>       model_config = ModelConfig(
+            model=model,
+            trust_remote_code=True,
+            dtype="float16",
+            seed=42,
+            skip_tokenizer_init=skip_tokenizer_init,
+            # The scheduler reads model_config.max_model_len, not the
+            # SchedulerConfig one, so both must agree.
+            max_model_len=max_model_len,
+        )
+E       pydantic_core._pydantic_core.ValidationError: 1 validation error for ModelConfig
+E         Value error, Model architectures ['DeepseekV41ForCausalLM'] failed to be inspected. Please check the logs for more details. [type=value_error, input_value=ArgsKwargs((), {'model': ... 'max_model_len': None}), input_type=ArgsKwargs]
+E           For further information visit https://errors.pydantic.dev/2.13/v/value_error
+
+tests/v1/core/utils.py:110: ValidationError
+----------------------------- Captured stdout call -----------------------------
+INFO 11-10 08:09:58 [config.py:852] Detected quantization_config.scale_fmt=ue8m0; enabling UE8M0 for DeepGEMM.
+ERROR 11-10 08:10:03 [registry.py:1131] Error in inspecting model architecture 'DeepseekV41ForCausalLM'
+ERROR 11-10 08:10:03 [registry.py:1131] Traceback (most recent call last):
+ERROR 11-10 08:10:03 [registry.py:1131]   File "/opt/spark-ds41f/candidate/vllm/vllm/model_executor/models/registry.py", line 1572, in _run_in_subprocess
+ERROR 11-10 08:10:03 [registry.py:1131]     returned.check_returncode()
+ERROR 11-10 08:10:03 [registry.py:1131]   File "/usr/lib/python3.12/subprocess.py", line 502, in check_returncode
+ERROR 11-10 08:10:03 [registry.py:1131]     raise CalledProcessError(self.returncode, self.args, self.stdout,
+ERROR 11-10 08:10:03 [registry.py:1131] subprocess.CalledProcessError: Command '['/usr/bin/python3', '-m', 'vllm.model_executor.models.registry']' returned non-zero exit status 1.
+ERROR 11-10 08:10:03 [registry.py:1131] 
+ERROR 11-10 08:10:03 [registry.py:1131] The above exception was the direct cause of the following exception:
+ERROR 11-10 08:10:03 [registry.py:1131] 
+ERROR 11-10 08:10:03 [registry.py:1131] Traceback (most recent call last):
+ERROR 11-10 08:10:03 [registry.py:1131]   File "/opt/spark-ds41f/candidate/vllm/vllm/model_executor/models/registry.py", line 1129, in _try_inspect_model_cls
+ERROR 11-10 08:10:03 [registry.py:1131]     return model.inspect_model_cls()
+ERROR 11-10 08:10:03 [registry.py:1131]            ^^^^^^^^^^^^^^^^^^^^^^^^^
+ERROR 11-10 08:10:03 [registry.py:1131]   File "/opt/spark-ds41f/candidate/vllm/vllm/logging_utils/log_time.py", line 21, in _wrapper
+ERROR 11-10 08:10:03 [registry.py:1131]     result = func(*args, **kwargs)
+ERROR 11-10 08:10:03 [registry.py:1131]              ^^^^^^^^^^^^^^^^^^^^^
+ERROR 11-10 08:10:03 [registry.py:1131]   File "/opt/spark-ds41f/candidate/vllm/vllm/model_executor/models/registry.py", line 1090, in inspect_model_cls
+ERROR 11-10 08:10:03 [registry.py:1131]     mi = _run_in_subprocess(
+ERROR 11-10 08:10:03 [registry.py:1131]          ^^^^^^^^^^^^^^^^^^^
+ERROR 11-10 08:10:03 [registry.py:1131]   File "/opt/spark-ds41f/candidate/vllm/vllm/model_executor/models/registry.py", line 1575, in _run_in_subprocess
+ERROR 11-10 08:10:03 [registry.py:1131]     raise RuntimeError(
+ERROR 11-10 08:10:03 [registry.py:1131] RuntimeError: Error raised in subprocess:
+ERROR 11-10 08:10:03 [registry.py:1131] <frozen runpy>:128: RuntimeWarning: 'vllm.model_executor.models.registry' found in sys.modules after import of package 'vllm.model_executor.models', but prior to execution of 'vllm.model_executor.models.registry'; this may result in unpredictable behaviour
+ERROR 11-10 08:10:03 [registry.py:1131] W1110 08:10:01.893000 126 torch/utils/cpp_extension.py:178] No CUDA runtime is found, using CUDA_HOME='/usr/local/cuda'
+ERROR 11-10 08:10:03 [registry.py:1131] Traceback (most recent call last):
+ERROR 11-10 08:10:03 [registry.py:1131]   File "<frozen runpy>", line 198, in _run_module_as_main
+ERROR 11-10 08:10:03 [registry.py:1131]   File "<frozen runpy>", line 88, in _run_code
+ERROR 11-10 08:10:03 [registry.py:1131]   File "/opt/spark-ds41f/candidate/vllm/vllm/model_executor/models/registry.py", line 1598, in <module>
+ERROR 11-10 08:10:03 [registry.py:1131]     _run()
+ERROR 11-10 08:10:03 [registry.py:1131]   File "/opt/spark-ds41f/candidate/vllm/vllm/model_executor/models/registry.py", line 1591, in _run
+ERROR 11-10 08:10:03 [registry.py:1131]     result = fn()
+ERROR 11-10 08:10:03 [registry.py:1131]              ^^^^
+ERROR 11-10 08:10:03 [registry.py:1131]   File "/opt/spark-ds41f/candidate/vllm/vllm/model_executor/models/registry.py", line 1091, in <lambda>
+ERROR 11-10 08:10:03 [registry.py:1131]     lambda: _ModelInfo.from_model_cls(self.load_model_cls())
+ERROR 11-10 08:10:03 [registry.py:1131]                                       ^^^^^^^^^^^^^^^^^^^^^
+ERROR 11-10 08:10:03 [registry.py:1131]   File "/opt/spark-ds41f/candidate/vllm/vllm/model_executor/models/registry.py", line 1105, in load_model_cls
+ERROR 11-10 08:10:03 [registry.py:1131]     return getattr(mod, self.class_name)
+ERROR 11-10 08:10:03 [registry.py:1131]            ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+ERROR 11-10 08:10:03 [registry.py:1131]   File "/opt/spark-ds41f/candidate/vllm/vllm/models/deepseek_v41/__init__.py", line 24, in __getattr__
+ERROR 11-10 08:10:03 [registry.py:1131]     from .nvidia.dspark import DSparkDeepseekV4ForCausalLM
+ERROR 11-10 08:10:03 [registry.py:1131]   File "/opt/spark-ds41f/candidate/vllm/vllm/models/deepseek_v41/nvidia/dspark.py", line 53, in <module>
+ERROR 11-10 08:10:03 [registry.py:1131]     from .model import (
+ERROR 11-10 08:10:03 [registry.py:1131]   File "/opt/spark-ds41f/candidate/vllm/vllm/models/deepseek_v41/nvidia/model.py", line 66, in <module>
+ERROR 11-10 08:10:03 [registry.py:1131]     from vllm.models.deepseek_v41.attention import DeepseekV4Attention
+ERROR 11-10 08:10:03 [registry.py:1131]   File "/opt/spark-ds41f/candidate/vllm/vllm/models/deepseek_v41/attention.py", line 29, in <module>
+ERROR 11-10 08:10:03 [registry.py:1131]     from vllm.model_executor.layers.sparse_mqa_indexer import SparseMQAIndexer
+ERROR 11-10 08:10:03 [registry.py:1131]   File "/opt/spark-ds41f/candidate/vllm/vllm/model_executor/layers/sparse_mqa_indexer.py", line 20, in <module>
+ERROR 11-10 08:10:03 [registry.py:1131]     from vllm.model_executor.kernels.attention.dsa.sparse_mqa_logits import (
+ERROR 11-10 08:10:03 [registry.py:1131]   File "/opt/spark-ds41f/candidate/vllm/vllm/model_executor/kernels/attention/dsa/sparse_mqa_logits.py", line 73, in <module>
+ERROR 11-10 08:10:03 [registry.py:1131]     _INT32_BIG = tl.constexpr(2**31 - 1)
+ERROR 11-10 08:10:03 [registry.py:1131]                  ^^^^^^^^^^^^^^^^^^^^^^^
+ERROR 11-10 08:10:03 [registry.py:1131] TypeError: 'NoneType' object is not callable
+ERROR 11-10 08:10:03 [registry.py:1131] 
+------------------------------ Captured log call -------------------------------
+INFO     vllm.transformers_utils.config:config.py:852 Detected quantization_config.scale_fmt=ue8m0; enabling UE8M0 for DeepGEMM.
+ERROR    vllm.model_executor.models.registry:registry.py:1131 Error in inspecting model architecture 'DeepseekV41ForCausalLM'
+Traceback (most recent call last):
+  File "/opt/spark-ds41f/candidate/vllm/vllm/model_executor/models/registry.py", line 1572, in _run_in_subprocess
+    returned.check_returncode()
+  File "/usr/lib/python3.12/subprocess.py", line 502, in check_returncode
+    raise CalledProcessError(self.returncode, self.args, self.stdout,
+subprocess.CalledProcessError: Command '['/usr/bin/python3', '-m', 'vllm.model_executor.models.registry']' returned non-zero exit status 1.
+
+The above exception was the direct cause of the following exception:
+
+Traceback (most recent call last):
+  File "/opt/spark-ds41f/candidate/vllm/vllm/model_executor/models/registry.py", line 1129, in _try_inspect_model_cls
+    return model.inspect_model_cls()
+           ^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/opt/spark-ds41f/candidate/vllm/vllm/logging_utils/log_time.py", line 21, in _wrapper
+    result = func(*args, **kwargs)
+             ^^^^^^^^^^^^^^^^^^^^^
+  File "/opt/spark-ds41f/candidate/vllm/vllm/model_executor/models/registry.py", line 1090, in inspect_model_cls
+    mi = _run_in_subprocess(
+         ^^^^^^^^^^^^^^^^^^^
+  File "/opt/spark-ds41f/candidate/vllm/vllm/model_executor/models/registry.py", line 1575, in _run_in_subprocess
+    raise RuntimeError(
+RuntimeError: Error raised in subprocess:
+<frozen runpy>:128: RuntimeWarning: 'vllm.model_executor.models.registry' found in sys.modules after import of package 'vllm.model_executor.models', but prior to execution of 'vllm.model_executor.models.registry'; this may result in unpredictable behaviour
+W1110 08:10:01.893000 126 torch/utils/cpp_extension.py:178] No CUDA runtime is found, using CUDA_HOME='/usr/local/cuda'
+Traceback (most recent call last):
+  File "<frozen runpy>", line 198, in _run_module_as_main
+  File "<frozen runpy>", line 88, in _run_code
+  File "/opt/spark-ds41f/candidate/vllm/vllm/model_executor/models/registry.py", line 1598, in <module>
+    _run()
+  File "/opt/spark-ds41f/candidate/vllm/vllm/model_executor/models/registry.py", line 1591, in _run
+    result = fn()
+             ^^^^
+  File "/opt/spark-ds41f/candidate/vllm/vllm/model_executor/models/registry.py", line 1091, in <lambda>
+    lambda: _ModelInfo.from_model_cls(self.load_model_cls())
+                                      ^^^^^^^^^^^^^^^^^^^^^
+  File "/opt/spark-ds41f/candidate/vllm/vllm/model_executor/models/registry.py", line 1105, in load_model_cls
+    return getattr(mod, self.class_name)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/opt/spark-ds41f/candidate/vllm/vllm/models/deepseek_v41/__init__.py", line 24, in __getattr__
+    from .nvidia.dspark import DSparkDeepseekV4ForCausalLM
+  File "/opt/spark-ds41f/candidate/vllm/vllm/models/deepseek_v41/nvidia/dspark.py", line 53, in <module>
+    from .model import (
+  File "/opt/spark-ds41f/candidate/vllm/vllm/models/deepseek_v41/nvidia/model.py", line 66, in <module>
+    from vllm.models.deepseek_v41.attention import DeepseekV4Attention
+  File "/opt/spark-ds41f/candidate/vllm/vllm/models/deepseek_v41/attention.py", line 29, in <module>
+    from vllm.model_executor.layers.sparse_mqa_indexer import SparseMQAIndexer
+  File "/opt/spark-ds41f/candidate/vllm/vllm/model_executor/layers/sparse_mqa_indexer.py", line 20, in <module>
+    from vllm.model_executor.kernels.attention.dsa.sparse_mqa_logits import (
+  File "/opt/spark-ds41f/candidate/vllm/vllm/model_executor/kernels/attention/dsa/sparse_mqa_logits.py", line 73, in <module>
+    _INT32_BIG = tl.constexpr(2**31 - 1)
+                 ^^^^^^^^^^^^^^^^^^^^^^^
+TypeError: 'NoneType' object is not callable
+_____________ test_stripped_item_in_the_encoder_cache_is_scheduled _____________
+
+    def test_stripped_item_in_the_encoder_cache_is_scheduled():
+>       scheduler = create_scheduler(enable_prefix_caching=True)
+                    ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+tests/v1/core/test_stripped_mm_scheduling.py:80: 
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
+
+model = 'facebook/opt-125m', max_num_seqs = 16, max_num_batched_tokens = 8192
+enable_chunked_prefill = True, enable_prefix_caching = True
+long_prefill_token_threshold = 0, prefill_compute_share = None
+prefill_compute_half_life = None, max_num_prefill_tokens_per_step = 0
+max_parallel_prefills = 1, prefill_policy = 'round-robin'
+decode_refill_target = 'auto', scheduling_policy = 'fcfs', device = 'auto'
+disable_chunked_mm_input = False, use_kv_connector = None, kv_role = 'kv_both'
+num_blocks = 10000, block_size = 16, max_model_len = None
+num_speculative_tokens = None, speculative_method = None
+parallel_drafting = False, skip_tokenizer_init = False, async_scheduling = False
+pipeline_parallel_size = 1, data_parallel_size = 1
+num_speculative_tokens_per_batch_size = None
+adaptive_speculative_tokens_window = None
+adaptive_speculative_tokens_initial = None, use_ec_connector = False
+ec_role = None, use_v2_model_runner = None, kv_cache_spec = None
+per_request_spec_decode_metrics = 'none'
+
+    def create_scheduler(
+        model: str = "facebook/opt-125m",
+        max_num_seqs: int = 16,
+        max_num_batched_tokens: int = 8192,
+        enable_chunked_prefill: bool = True,
+        enable_prefix_caching: bool = False,
+        long_prefill_token_threshold: int = 0,
+        prefill_compute_share: PrefillComputeShare | None = None,
+        prefill_compute_half_life: PrefillComputeHalfLife | None = None,
+        max_num_prefill_tokens_per_step: int = 0,
+        max_parallel_prefills: MaxParallelPrefills = 1,
+        prefill_policy: PrefillPolicy = "round-robin",
+        decode_refill_target: DecodeRefillTarget = "auto",
+        scheduling_policy: SchedulerPolicy = "fcfs",
+        device: str = "auto",
+        disable_chunked_mm_input: bool = False,
+        use_kv_connector: None | bool | str | MockKVConfig = None,
+        kv_role: str = "kv_both",
+        num_blocks: int = 10000,
+        block_size: int = 16,
+        max_model_len: int | None = None,
+        num_speculative_tokens: int | None = None,
+        speculative_method: str | None = None,
+        parallel_drafting: bool = False,
+        skip_tokenizer_init: bool = False,
+        async_scheduling: bool = False,
+        pipeline_parallel_size: int = 1,
+        data_parallel_size: int = 1,
+        num_speculative_tokens_per_batch_size: list[tuple[int, int, int]] | None = None,
+        adaptive_speculative_tokens_window: int | None = None,
+        adaptive_speculative_tokens_initial: int | None = None,
+        use_ec_connector: bool = False,
+        ec_role: str | None = None,
+        use_v2_model_runner: bool | None = None,
+        kv_cache_spec: KVCacheSpec | None = None,
+        per_request_spec_decode_metrics: str = "none",
+    ) -> Scheduler | AsyncScheduler:
+        """Create scheduler under test.
+    
+        Args:
+          model: model under test
+          max_num_seqs: max sequences to schedule
+          max_num_batch_tokens: max num tokens to batch
+          enable_prefix_caching: optionally force APC config
+                                 (True/False) or use default
+                                 (False)
+    
+        Returns:
+          {class}`Scheduler` instance
+        """
+>       model_config = ModelConfig(
+            model=model,
+            trust_remote_code=True,
+            dtype="float16",
+            seed=42,
+            skip_tokenizer_init=skip_tokenizer_init,
+            # The scheduler reads model_config.max_model_len, not the
+            # SchedulerConfig one, so both must agree.
+            max_model_len=max_model_len,
+        )
+E       pydantic_core._pydantic_core.ValidationError: 1 validation error for ModelConfig
+E         Value error, Model architectures ['DeepseekV41ForCausalLM'] failed to be inspected. Please check the logs for more details. [type=value_error, input_value=ArgsKwargs((), {'model': ... 'max_model_len': None}), input_type=ArgsKwargs]
+E           For further information visit https://errors.pydantic.dev/2.13/v/value_error
+
+tests/v1/core/utils.py:110: ValidationError
+_______ test_chunked_prefill_reaching_an_evicted_stripped_item_is_a_miss _______
+
+    def test_chunked_prefill_reaching_an_evicted_stripped_item_is_a_miss():
+        # The first chunk covers the first image (sent with data). The second needs
+        # the stripped second image, which nothing holds any more.
+>       scheduler = create_scheduler(
+            enable_prefix_caching=True, max_num_batched_tokens=200
+        )
+
+tests/v1/core/test_stripped_mm_scheduling.py:104: 
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
+
+model = 'facebook/opt-125m', max_num_seqs = 16, max_num_batched_tokens = 200
+enable_chunked_prefill = True, enable_prefix_caching = True
+long_prefill_token_threshold = 0, prefill_compute_share = None
+prefill_compute_half_life = None, max_num_prefill_tokens_per_step = 0
+max_parallel_prefills = 1, prefill_policy = 'round-robin'
+decode_refill_target = 'auto', scheduling_policy = 'fcfs', device = 'auto'
+disable_chunked_mm_input = False, use_kv_connector = None, kv_role = 'kv_both'
+num_blocks = 10000, block_size = 16, max_model_len = None
+num_speculative_tokens = None, speculative_method = None
+parallel_drafting = False, skip_tokenizer_init = False, async_scheduling = False
+pipeline_parallel_size = 1, data_parallel_size = 1
+num_speculative_tokens_per_batch_size = None
+adaptive_speculative_tokens_window = None
+adaptive_speculative_tokens_initial = None, use_ec_connector = False
+ec_role = None, use_v2_model_runner = None, kv_cache_spec = None
+per_request_spec_decode_metrics = 'none'
+
+    def create_scheduler(
+        model: str = "facebook/opt-125m",
+        max_num_seqs: int = 16,
+        max_num_batched_tokens: int = 8192,
+        enable_chunked_prefill: bool = True,
+        enable_prefix_caching: bool = False,
+        long_prefill_token_threshold: int = 0,
+        prefill_compute_share: PrefillComputeShare | None = None,
+        prefill_compute_half_life: PrefillComputeHalfLife | None = None,
+        max_num_prefill_tokens_per_step: int = 0,
+        max_parallel_prefills: MaxParallelPrefills = 1,
+        prefill_policy: PrefillPolicy = "round-robin",
+        decode_refill_target: DecodeRefillTarget = "auto",
+        scheduling_policy: SchedulerPolicy = "fcfs",
+        device: str = "auto",
+        disable_chunked_mm_input: bool = False,
+        use_kv_connector: None | bool | str | MockKVConfig = None,
+        kv_role: str = "kv_both",
+        num_blocks: int = 10000,
+        block_size: int = 16,
+        max_model_len: int | None = None,
+        num_speculative_tokens: int | None = None,
+        speculative_method: str | None = None,
+        parallel_drafting: bool = False,
+        skip_tokenizer_init: bool = False,
+        async_scheduling: bool = False,
+        pipeline_parallel_size: int = 1,
+        data_parallel_size: int = 1,
+        num_speculative_tokens_per_batch_size: list[tuple[int, int, int]] | None = None,
+        adaptive_speculative_tokens_window: int | None = None,
+        adaptive_speculative_tokens_initial: int | None = None,
+        use_ec_connector: bool = False,
+        ec_role: str | None = None,
+        use_v2_model_runner: bool | None = None,
+        kv_cache_spec: KVCacheSpec | None = None,
+        per_request_spec_decode_metrics: str = "none",
+    ) -> Scheduler | AsyncScheduler:
+        """Create scheduler under test.
+    
+        Args:
+          model: model under test
+          max_num_seqs: max sequences to schedule
+          max_num_batch_tokens: max num tokens to batch
+          enable_prefix_caching: optionally force APC config
+                                 (True/False) or use default
+                                 (False)
+    
+        Returns:
+          {class}`Scheduler` instance
+        """
+>       model_config = ModelConfig(
+            model=model,
+            trust_remote_code=True,
+            dtype="float16",
+            seed=42,
+            skip_tokenizer_init=skip_tokenizer_init,
+            # The scheduler reads model_config.max_model_len, not the
+            # SchedulerConfig one, so both must agree.
+            max_model_len=max_model_len,
+        )
+E       pydantic_core._pydantic_core.ValidationError: 1 validation error for ModelConfig
+E         Value error, Model architectures ['DeepseekV41ForCausalLM'] failed to be inspected. Please check the logs for more details. [type=value_error, input_value=ArgsKwargs((), {'model': ... 'max_model_len': None}), input_type=ArgsKwargs]
+E           For further information visit https://errors.pydantic.dev/2.13/v/value_error
+
+tests/v1/core/utils.py:110: ValidationError
+___________________ test_a_miss_does_not_hold_other_requests ___________________
+
+    def test_a_miss_does_not_hold_other_requests():
+>       scheduler = create_scheduler(enable_prefix_caching=True)
+                    ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+tests/v1/core/test_stripped_mm_scheduling.py:133: 
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
+
+model = 'facebook/opt-125m', max_num_seqs = 16, max_num_batched_tokens = 8192
+enable_chunked_prefill = True, enable_prefix_caching = True
+long_prefill_token_threshold = 0, prefill_compute_share = None
+prefill_compute_half_life = None, max_num_prefill_tokens_per_step = 0
+max_parallel_prefills = 1, prefill_policy = 'round-robin'
+decode_refill_target = 'auto', scheduling_policy = 'fcfs', device = 'auto'
+disable_chunked_mm_input = False, use_kv_connector = None, kv_role = 'kv_both'
+num_blocks = 10000, block_size = 16, max_model_len = None
+num_speculative_tokens = None, speculative_method = None
+parallel_drafting = False, skip_tokenizer_init = False, async_scheduling = False
+pipeline_parallel_size = 1, data_parallel_size = 1
+num_speculative_tokens_per_batch_size = None
+adaptive_speculative_tokens_window = None
+adaptive_speculative_tokens_initial = None, use_ec_connector = False
+ec_role = None, use_v2_model_runner = None, kv_cache_spec = None
+per_request_spec_decode_metrics = 'none'
+
+    def create_scheduler(
+        model: str = "facebook/opt-125m",
+        max_num_seqs: int = 16,
+        max_num_batched_tokens: int = 8192,
+        enable_chunked_prefill: bool = True,
+        enable_prefix_caching: bool = False,
+        long_prefill_token_threshold: int = 0,
+        prefill_compute_share: PrefillComputeShare | None = None,
+        prefill_compute_half_life: PrefillComputeHalfLife | None = None,
+        max_num_prefill_tokens_per_step: int = 0,
+        max_parallel_prefills: MaxParallelPrefills = 1,
+        prefill_policy: PrefillPolicy = "round-robin",
+        decode_refill_target: DecodeRefillTarget = "auto",
+        scheduling_policy: SchedulerPolicy = "fcfs",
+        device: str = "auto",
+        disable_chunked_mm_input: bool = False,
+        use_kv_connector: None | bool | str | MockKVConfig = None,
+        kv_role: str = "kv_both",
+        num_blocks: int = 10000,
+        block_size: int = 16,
+        max_model_len: int | None = None,
+        num_speculative_tokens: int | None = None,
+        speculative_method: str | None = None,
+        parallel_drafting: bool = False,
+        skip_tokenizer_init: bool = False,
+        async_scheduling: bool = False,
+        pipeline_parallel_size: int = 1,
+        data_parallel_size: int = 1,
+        num_speculative_tokens_per_batch_size: list[tuple[int, int, int]] | None = None,
+        adaptive_speculative_tokens_window: int | None = None,
+        adaptive_speculative_tokens_initial: int | None = None,
+        use_ec_connector: bool = False,
+        ec_role: str | None = None,
+        use_v2_model_runner: bool | None = None,
+        kv_cache_spec: KVCacheSpec | None = None,
+        per_request_spec_decode_metrics: str = "none",
+    ) -> Scheduler | AsyncScheduler:
+        """Create scheduler under test.
+    
+        Args:
+          model: model under test
+          max_num_seqs: max sequences to schedule
+          max_num_batch_tokens: max num tokens to batch
+          enable_prefix_caching: optionally force APC config
+                                 (True/False) or use default
+                                 (False)
+    
+        Returns:
+          {class}`Scheduler` instance
+        """
+>       model_config = ModelConfig(
+            model=model,
+            trust_remote_code=True,
+            dtype="float16",
+            seed=42,
+            skip_tokenizer_init=skip_tokenizer_init,
+            # The scheduler reads model_config.max_model_len, not the
+            # SchedulerConfig one, so both must agree.
+            max_model_len=max_model_len,
+        )
+E       pydantic_core._pydantic_core.ValidationError: 1 validation error for ModelConfig
+E         Value error, Model architectures ['DeepseekV41ForCausalLM'] failed to be inspected. Please check the logs for more details. [type=value_error, input_value=ArgsKwargs((), {'model': ... 'max_model_len': None}), input_type=ArgsKwargs]
+E           For further information visit https://errors.pydantic.dev/2.13/v/value_error
+
+tests/v1/core/utils.py:110: ValidationError
+=============================== warnings summary ===============================
+../../../../usr/local/lib/python3.12/dist-packages/torch/jit/_script.py:365: 14 warnings
+  /usr/local/lib/python3.12/dist-packages/torch/jit/_script.py:365: DeprecationWarning: `torch.jit.script_method` is deprecated. Please switch to `torch.compile` or `torch.export`.
+    warnings.warn(
+
+-- Docs: https://docs.pytest.org/en/stable/how-to/capture-warnings.html
+=========================== short test summary info ============================
+FAILED tests/multimodal/test_prefix_cache_fastpath.py::test_serving_frontend_sends_repeat_images_without_data[0]
+FAILED tests/multimodal/test_prefix_cache_fastpath.py::test_serving_frontend_sends_repeat_images_without_data[4]
+FAILED tests/v1/core/test_stripped_mm_scheduling.py::test_stripped_item_held_nowhere_is_a_retryable_miss
+FAILED tests/v1/core/test_stripped_mm_scheduling.py::test_stripped_item_in_the_encoder_cache_is_scheduled
+FAILED tests/v1/core/test_stripped_mm_scheduling.py::test_chunked_prefill_reaching_an_evicted_stripped_item_is_a_miss
+FAILED tests/v1/core/test_stripped_mm_scheduling.py::test_a_miss_does_not_hold_other_requests
+6 failed, 35 passed, 14 warnings in 13.36s
+# exit 1, finished 2026-11-10T08:10:06Z

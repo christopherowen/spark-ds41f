@@ -1,0 +1,101 @@
+# #978 round 2 (candidate-55's last rework of 0793). Commands as run, 2026-11-10.
+# Work dir on sp8: ~/spark-lab/agents/candidate-55-rework-978-r2 (WD below); round 1's work dir
+# ~/spark-lab/agents/candidate-55-rework-978 (R1). Scripts are in scripts/.
+# No pushes, commits to the repository, PRs, image builds, cluster, window or testbed operations.
+# The only commits are in WD's disposable vLLM clone (needed for git format-patch).
+# Every GPU run: ~/spark-hold.json absent, then flock /tmp/spark-lab-gpu.lock (taken by
+# serving_session.sh itself, or wrapped around run_tests.sh, which does not take it).
+
+## Round 1's record (laptop, read only)
+git -C ~/projects/spark-ds41f fetch origin; git archive origin/main experiments/2026-10-26-spark-ds41f-candidate/candidate-55 | tar -x
+#   receipts/rework/pr-978-r1/{result.json,0793-*.patch,scripts/,raw/}
+
+## Source
+cd WD && git clone --no-checkout R1/vllm vllm      # round 1's clone: c55 (410463b3), r1 (6444081a)
+git -C vllm checkout -b r2 origin/r1                # 0792 7e36cafc, 0793-r1 c628316b, 0794 6444081a
+# edits on the laptop (scratchpad/work/), copied into vllm/ with tar over ssh:
+#   vllm/multimodal/processing/context.py, vllm/multimodal/registry.py,
+#   vllm/multimodal/processing/processor.py, vllm/renderers/base.py, vllm/v1/engine/async_llm.py,
+#   vllm/v1/core/sched/scheduler.py, vllm/v1/engine/core.py, vllm/multimodal/media/image.py,
+#   vllm/multimodal/hasher.py, tests/multimodal/test_prefix_cache_fastpath.py,
+#   tests/v1/engine/test_request_submission_cleanup.py, tests/v1/core/test_stripped_mm_scheduling.py (new)
+
+## Arms (files mounted read-only over spark-ds41f:candidate-54's /opt/spark-ds41f/candidate/vllm)
+#   arms/none          candidate-54 as built (4e8133ff, tree 5f021d9a)
+#   arms/r1            round 1: git diff --name-only 4e8133ff1 origin/r1 (24 .py), git archive origin/r1
+#   arms/h978          candidate-54 + round 1's vllm/multimodal/hasher.py only
+#   arms/img978        candidate-54 + round 1's vllm/multimodal/media/image.py only
+#   arms/img978st      img978 with the header digest single-threaded (blake3(data))
+#   arms/r1st          r1 with both hashes single-threaded (base hasher.py, img978st's image.py)
+#   arms/fe978         candidate-54 + round 1's six frontend files (built, not run)
+#   arms/r2dev         the working tree's 27 changed .py files (development)
+#   arms/r2            round 2: git diff --name-only 4e8133ff1 r2c (27 .py), git archive r2c
+#   arms/r1-newtests   arms/r1 + round 2's three test files
+
+## JPEG slowdown: bisection and stage diagnostics (scripts/serving_session.sh, one hold each)
+scripts/serving_session.sh bisect1 b1-base:none b1-r1:r1 b1-img:img978 b1-h:h978 b1-r1b:r1 b1-baseb:none
+BENCH=serving_stage_diag.py scripts/serving_session.sh diag1 d1-base:none d1-r1:r1 d1-img:img978 d1-h:h978
+BENCH=serving_stage_diag.py scripts/serving_session.sh diag2 d2-base:none d2-r1:r1 d2-r1st:r1st d2-img:img978 d2-imgst:img978st d2-base2:none
+#   serving_stage_diag.py: round 1's bench with each stage wrapped at runtime (wall, thread CPU,
+#   system time, minor faults, involuntary switches, little-core share); diag1 ran before the
+#   fault counters were added
+# hash speeds (CPU only, outside the lock):
+docker run --rm -v WD/exp:/opt/exp --entrypoint python3 spark-ds41f:candidate-54 -c '<blake3 single/AUTO, sha256, sha512, blake2b, sha1 on the bench images>'
+
+## Development (raw/dev/; CPU-only runs outside the lock, GPU runs under it)
+scripts/run_tests.sh arms/r2dev dev/dev1-r2 -- tests/v1/engine/test_request_submission_cleanup.py tests/multimodal/test_prefix_cache_fastpath.py tests/v1/core/test_stripped_mm_scheduling.py
+flock /tmp/spark-lab-gpu.lock scripts/run_tests.sh arms/r2dev dev/dev2-r2-gpu --gpu -- tests/multimodal/test_prefix_cache_fastpath.py tests/v1/core/test_stripped_mm_scheduling.py
+flock /tmp/spark-lab-gpu.lock scripts/run_tests.sh arms/r2dev dev/dev3-r2-gpu --gpu -- tests/v1/core/test_stripped_mm_scheduling.py   # chunk size for DS4.1's aligned prefill
+flock /tmp/spark-lab-gpu.lock scripts/run_tests.sh arms/r2dev dev/dev4-r2-gpu --gpu -- tests/v1/core/test_stripped_mm_scheduling.py   # 4 passed
+scripts/run_tests.sh arms/r2dev dev5-r2 -- -k "not serving_frontend" <PR tests, media/test_image, test_hasher, cleanup>
+scripts/run_tests.sh arms/r2dev dev6-r2 -- -k "not serving_frontend" <same + test_api_cancellation>   # 104 passed
+scripts/serving_session.sh screen1 s1-base:none s1-r2:r2dev                        # first serving screen (sync SHA-256 key)
+BENCH=serving_stage_diag.py scripts/serving_session.sh diag3 d3-base:none d3-r2:r2dev d3-r2b:r2dev d3-baseb:none
+BENCH=serving_stage_diag.py scripts/serving_session.sh diag4 d4-base:none d4-r2:r2dev d4-r2b:r2dev d4-baseb:none   # pre-key + background record
+
+## Earlier round-2 trees (raw/superseded/; kept, not the result)
+scripts/serving_session.sh screen1 s1-base:none s1-r2:r2dev
+BENCH=serving_stage_diag.py scripts/serving_session.sh diag3|diag4 ...           # r2dev: SHA-256 key inline, then pre-key + background record
+scripts/measure.sh, first version (mark, prodenv, diag5 on arms/r2: blake3 on every core for >= 4 MiB)
+scripts/serving_session.sh mark2|mark3 ... (mark3 adds arms/r2inline: the record inline)
+BENCH=serving_stage_diag.py scripts/serving_session.sh diag6 ...                # found the A725 placement after the rayon hash
+ARM=r2 PREFIX=final scripts/measure.sh (final-mark, final-text, final-prodenv, final-diag: hash reverted, digest alongside decode)
+BENCH=cold_path_microbench.py scripts/serving_session.sh coldpath cold-r2-1:r2 cold-r2-2:r2   # where turn 1's extra time went
+scripts/final_tests.sh on arms/r2 (raw/superseded/tests-pre-final: found the scheduler attribute; the chain broke at
+  its last step when the script file was replaced while it ran)
+# Each change: edit on the laptop, tar into WD/vllm and WD/commitwt, git commit --amend (dates fixed as below),
+# re-cherry-pick 0794, rebuild the arm with git archive r2c $(cat WD/r2-final-changed-files.txt)
+
+## Patch (WD/commitwt, a worktree of the clone)
+git -C vllm diff HEAD > r2-work.diff                                 # the working tree against round 1's series head
+git -C vllm worktree add -b r2c WD/commitwt 7e36cafc1                # 0792
+GIT_COMMITTER_DATE="Sun Nov 8 14:53:04 2026 +0000" git cherry-pick c628316be   # round 1's 0793
+git apply --index ../r2-work.diff                                    # later changes copied in and amended the same way
+GIT_COMMITTER_DATE="Sun Nov 8 14:53:04 2026 +0000" git commit --amend -F ../msg-r2-final.txt   # author and date kept
+GIT_COMMITTER_DATE="Sun Nov 8 15:56:25 2026 +0000" git cherry-pick 6444081a4   # 0794
+git -C commitwt format-patch --start-number 793 -1 HEAD~1 -o WD/patch          # sha256 c6a66756...
+scripts/apply_check.sh > raw/apply-check.txt
+git -C commitwt diff c628316be HEAD~1 > raw/interdiff-0793-r1-to-0793-r2.diff
+# overlay: the files candidate-55-r2's series head changes against candidate-55 (410463b3), from git archive r2c;
+# check: a worktree of 410463b3 with overlay/ copied over it writes tree cc4ac485 (the series tree)
+
+## Final candidate (arms/r2f = git archive r2c of the 26 .py files changed against 4e8133ff1)
+scripts/run_tests.sh arms/r2f dev11-r2f -- -k "not serving_frontend" <PR tests, media/test_image, test_hasher, cleanup>   # CPU, 63 passed
+BENCH=serving_stage_diag.py scripts/serving_session.sh diag7 d7-base:none d7-r2f:r2f d7-r2fb:r2f d7-baseb:none   # raw/serving-supplementary/stage-diag-screen
+ARM=r2f PREFIX=final2 scripts/measure.sh
+#   final2-mark    -> raw/mark            (THE MARK: round 1's bench, base r2 r2 base)
+#   final2-text    -> raw/text            (text-only, base r2 r2 base)
+#   final2-prodenv -> raw/serving-supplementary/prodenv   (recipe environment)
+#   final2-diag    -> raw/serving-supplementary/stage-diag (base r1 r2 r2 r1 base)
+ARM=r2f NEWTESTS=r1-newtests-f SUFFIX=-final scripts/final_tests.sh   # raw/tests/*-final.txt, final-tests-final.log
+BENCH=serving_stage_diag.py scripts/serving_session.sh prodenv-diag pd-base-1:none:$ENV pd-r2f-1:r2f:$ENV pd-r2f-2:r2f:$ENV pd-base-2:none:$ENV
+#   ENV=MALLOC_ARENA_MAX=2,MALLOC_MMAP_THRESHOLD_=1048576,OMP_NUM_THREADS=8,VLLM_MAX_IMAGE_PIXELS=16777216
+python3 scripts/analyze_serving.py raw/mark/summary.json --base raw/mark/serving-base-boot{1,2}.json --cand raw/mark/serving-r2-boot{1,2}.json
+python3 scripts/analyze_text.py raw/text/summary.json --base raw/text/text-base-boot{1,2}.json --cand raw/text/text-r2-boot{1,2}.json
+python3 scripts/analyze_serving.py <prodenv>/summary.json --base <prodenv>/prodenv-base-boot{1,2}.json --cand <prodenv>/prodenv-r2-boot{1,2}.json
+python3 scripts/test_counts.py raw <labels> > raw/tests/test-counts.json
+# laptop: scripts/fill_result.py then scripts/build_result.py -> result.json
+
+## check_978_image_chat.py (not run: needs a live server; for the testbed, tp4-ring, base arm first)
+python3 experiments/2026-10-26-spark-ds41f-candidate/candidate-55/check_978_image_chat.py http://<head>:8000 --label base > 978-base.jsonl
+python3 experiments/2026-10-26-spark-ds41f-candidate/candidate-55/check_978_image_chat.py http://<head>:8000 --label 978-r2 --against 978-base.jsonl > 978-r2.jsonl

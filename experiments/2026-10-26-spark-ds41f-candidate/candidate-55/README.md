@@ -240,3 +240,21 @@ serving path with `check_978_image_chat.py`.
 3f534a18), mounted by [tp4-no978.json](tp4-no978.json). Its gate, screen (with #1008's affinity check) and
 single-stream run as [candidate-tp4-no978.json](candidate-tp4-no978.json),
 [screen-tp4-no978.json](screen-tp4-no978.json) and [single-stream-tp4-no978.json](single-stream-tp4-no978.json).
+
+## #978 round 2
+
+[receipts/rework/pr-978-r2](receipts/rework/pr-978-r2/result.json), its second and last rework.
+- **The fast path engages in the server.** A new `mm_prefix_metadata_cache` flag on the processing context, which the
+  renderer sets only with no processor cache, prefix caching on, one engine per frontend and no KV or EC transfer.
+- **The JPEG slowdown was #978's own:** lazy loading moved the decode into the processor's thread (about 3x the page
+  faults), and multithreaded blake3 woke that thread on the slow cores. The header cache now runs only on the fast
+  path, and `hasher.py` is candidate-54's again.
+- **The four risks are closed:** a schedule-time retryable miss for stripped items, every sampled child keeps its
+  retry materializers, identifier tracking is bounded (LRU 4096), and retries run off the output handler.
+- **Its mark, round 1's real-`AsyncLLM` bench on sp8, ABBA against candidate-54, two boots:** all 12 image cells are
+  faster beyond the interval: turn 2 onward 4.2-9.5x, turn 1 2-15% faster. Prompt token ids and mm hashes are
+  candidate-54's, and text-only requests are the same. One caveat: under the recipe's process environment (not part
+  of the mark), 1920 PNG turn 1 was slower on one of two boots.
+- **On the testbed:** [validate-978r2-tp4.json](validate-978r2-tp4.json) boots candidate-55 with the round-2 files
+  (`tp4-978r2.json`, from [978r2/overlay](978r2/overlay)): the gate, then `check_978_image_chat.py` against
+  candidate-54 under #1008's real thread placement.

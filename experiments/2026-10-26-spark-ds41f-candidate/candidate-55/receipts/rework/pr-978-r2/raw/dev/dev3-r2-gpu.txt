@@ -1,0 +1,92 @@
+# label=dev/dev3-r2-gpu image=spark-ds41f:candidate-54 (sha256:e1de71bed3b41dff3a969c19adc09072c0ab1c947f34afe7117cb8b6389e23ea) arm=/home/chris/spark-lab/agents/candidate-55-rework-978-r2/arms/r2dev gpu=--gpus all
+# mounted: 27 files; sha256 of each:
+#   d7990ddfaebf7d1bff56589e33cad9793cde1287a49e903d75b6e7ae440aeff0  ./tests/multimodal/test_prefix_cache_fastpath.py
+#   da9de1d22b7febcdc8c7bce6c3f23d1cf33d886a479292c9cbcd7e6fd8f4a3fc  ./tests/v1/core/test_stripped_mm_scheduling.py
+#   cfec76e7bf455805395a13df5b56a9a1764b4f0b26be69454c63ed77ad21861a  ./tests/v1/engine/test_request_submission_cleanup.py
+#   9153b93e62b4724041c4b44dc8a417e521ae83ad1a1b52d9b5bd16bf1a9ba975  ./tests/v1/worker/test_dead_rows.py
+#   f4caee411cfcd534a7e788fe1a6bbd3bec2233c473ec3a9aa5dd6ad2707a50e7  ./tests/v1/worker/test_roce_cpu_affinity.py
+#   28c26a60e860e7ac2ba181986fb70a94b76cb5ad89f0b57a06351f2e62929c9e  ./vllm/entrypoints/cli/serve.py
+#   b3c312259b478f0519764eee88bc60f78c353554a9867432e4f1b8fb2b123119  ./vllm/entrypoints/launchers/api_server/entry.py
+#   59ab079206d1a92582bdd571ff8de8d3a465cc646bbb648be1f44d39fa7be3c6  ./vllm/multimodal/hasher.py
+#   84692be153dd1c086ea1b1f60e105752b53a1768eb332f4bc7130364b1c0e89b  ./vllm/multimodal/inputs.py
+#   024ffc54287537f05f62289016991deec12cd98cf013a3050705e745c3efaf5f  ./vllm/multimodal/media/image.py
+#   7cee31025bc25323bc2344225e6809391a4ebd36df637f14f1b14eb31d8c21b6  ./vllm/multimodal/processing/context.py
+#   00b3d74c97bbbf4e75a31def508b562834ae358045134353c8388cf7b1ec3e6f  ./vllm/multimodal/processing/processor.py
+#   d9a243edd0cc7d5eeb390d748381507ba154cb44b0d0fd78d514df632cf9ec9e  ./vllm/multimodal/registry.py
+#   0507db6d1a0ae31c9588a7ef391c79f34bd75e5ac08581b80ca08464ab9d6128  ./vllm/renderers/base.py
+#   b179933c7ebc7e3975ce365ec0f0da87f7afe18e455e65f73e68e22ac4789444  ./vllm/utils/cpu_affinity.py
+#   2ddca1b9cbd2eae63a33908c0fef7264bbd66b8cda10f56e4b93d67972b019cd  ./vllm/v1/core/sched/scheduler.py
+#   dd776d8fc758328a298109fc3254c5b74780fe01b6560c344d760b327fe47545  ./vllm/v1/engine/async_llm.py
+#   e00afb407b7345b858808f1a97f851a3b45db3277ac31f2ff39596f8e62e4d4a  ./vllm/v1/engine/core.py
+#   3f22a100e312abc0a6c8e8b6b31790393591ca0032b064908571b50d265743b9  ./vllm/v1/worker/gpu/sample/sampler.py
+#   55e69117cfbeb3849f2f453d15c74e87fb70c6783e1188e5a443b75b9b68f300  ./vllm/v1/worker/gpu/sample/tilelang_auxiliary.py
+#   5e983a0501b18d9a1a3aa0685cf2526d3ac45f6167c4b7235cc9692b5574ceb0  ./vllm/v1/worker/gpu/sample/tilelang_bias.py
+#   e6a08abc744059a3eaa992608394481714d3e605d5a827fbace91153d5c50795  ./vllm/v1/worker/gpu/sample/tilelang_controls.py
+#   656b801012eb4d95ce238696658bdc0c586652758288b739cd0841e4d31bce46  ./vllm/v1/worker/gpu/sample/tilelang_sampling.py
+#   fed581af45edbf4f7cad44d8849a078a0f25bff123c1ebcbbc98ffefe986d2a2  ./vllm/v1/worker/gpu/sample/tilelang_thinking.py
+#   e1e3764733a2c52df85a63930eaaeecc79dae59292d659a0f1f9201d59ed81fe  ./vllm/v1/worker/gpu/spec_decode/rejection_sampler.py
+#   981212a2284d192901f453c76967bb845413e290ceaaabdf4855e9da8d5147ee  ./vllm/v1/worker/gpu/tilelang_inputs.py
+#   53dcb35aca21fee6a6f2b585d98349ac1b945ee024853e6ffa1068639c479e59  ./vllm/v1/worker/gpu_worker.py
+# started 2026-11-10T08:11:40Z
+..F.                                                                     [100%]
+=================================== FAILURES ===================================
+_______ test_chunked_prefill_reaching_an_evicted_stripped_item_is_a_miss _______
+
+    def test_chunked_prefill_reaching_an_evicted_stripped_item_is_a_miss():
+        # The first chunk covers the first image (sent with data). The second needs
+        # the stripped second image, which nothing holds any more.
+>       scheduler = make_scheduler(
+            max_num_batched_tokens=200, long_prefill_token_threshold=200
+        )
+
+tests/v1/core/test_stripped_mm_scheduling.py:113: 
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
+tests/v1/core/test_stripped_mm_scheduling.py:26: in make_scheduler
+    return create_scheduler(enable_prefix_caching=True, **kwargs)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+tests/v1/core/utils.py:242: in create_scheduler
+    scheduler = scheduler_cls(
+vllm/v1/core/sched/scheduler.py:406: in __init__
+    self._check_aligned_prefill_chunks()
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
+
+self = <vllm.v1.core.sched.scheduler.Scheduler object at 0xe3bbf194e120>
+
+    def _check_aligned_prefill_chunks(self) -> None:
+        """A whole aligned chunk must fit beside every decoding request's rows, or
+        a long prompt would wait for the decodes to end."""
+        threshold = self.scheduler_config.long_prefill_token_threshold
+        decode_rows = self.max_decode_rows
+        if threshold <= 0 or threshold + decode_rows > self.max_num_scheduled_tokens:
+>           raise ValueError(
+                "aligned prefill chunks need long_prefill_token_threshold "
+                f"({threshold}) plus {decode_rows} decode rows within the "
+                f"{self.max_num_scheduled_tokens}-token step budget"
+            )
+E           ValueError: aligned prefill chunks need long_prefill_token_threshold (200) plus 16 decode rows within the 200-token step budget
+
+vllm/v1/core/sched/scheduler.py:1027: ValueError
+----------------------------- Captured stdout call -----------------------------
+INFO 11-10 08:11:59 [model.py:693] Resolved architecture: DeepseekV41ForCausalLM
+INFO 11-10 08:11:59 [model.py:716] Defaulting to tokenizer_mode='deepseek_v41' for DeepseekV41ForCausalLM
+WARNING 11-10 08:11:59 [model.py:2400] Casting torch.bfloat16 to torch.float16.
+INFO 11-10 08:11:59 [model.py:2066] Using max model len 1048576
+INFO 11-10 08:11:59 [scheduler.py:436] Chunked prefill is enabled with max_num_batched_tokens=200.
+INFO 11-10 08:11:59 [kernel.py:435] Final IR op priority after setting platform defaults: IrOpPriorityConfig(rms_norm=['vllm_c', 'native'], fused_add_rms_norm=['vllm_c', 'native'], gelu_and_mul_sparse=['triton', 'native'])
+------------------------------ Captured log call -------------------------------
+INFO     vllm.config.model:model.py:693 Resolved architecture: DeepseekV41ForCausalLM
+INFO     vllm.config.model:model.py:716 Defaulting to tokenizer_mode='deepseek_v41' for DeepseekV41ForCausalLM
+WARNING  vllm.config.model:model.py:2400 Casting torch.bfloat16 to torch.float16.
+INFO     vllm.config.model:model.py:2066 Using max model len 1048576
+INFO     vllm.config.scheduler:scheduler.py:436 Chunked prefill is enabled with max_num_batched_tokens=200.
+INFO     vllm.config.kernel:kernel.py:435 Final IR op priority after setting platform defaults: IrOpPriorityConfig(rms_norm=['vllm_c', 'native'], fused_add_rms_norm=['vllm_c', 'native'], gelu_and_mul_sparse=['triton', 'native'])
+=============================== warnings summary ===============================
+../../../../usr/local/lib/python3.12/dist-packages/torch/jit/_script.py:365: 14 warnings
+  /usr/local/lib/python3.12/dist-packages/torch/jit/_script.py:365: DeprecationWarning: `torch.jit.script_method` is deprecated. Please switch to `torch.compile` or `torch.export`.
+    warnings.warn(
+
+-- Docs: https://docs.pytest.org/en/stable/how-to/capture-warnings.html
+=========================== short test summary info ============================
+FAILED tests/v1/core/test_stripped_mm_scheduling.py::test_chunked_prefill_reaching_an_evicted_stripped_item_is_a_miss
+1 failed, 3 passed, 14 warnings in 14.85s
+# exit 1, finished 2026-11-10T08:12:01Z
