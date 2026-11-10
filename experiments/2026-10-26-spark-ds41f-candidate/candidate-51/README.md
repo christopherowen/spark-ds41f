@@ -117,6 +117,26 @@ Each testbed opens its window with `scripts/lab.py`, after the hold and idle gua
      ([step 6](../../../docs/release-benchmark.md#6-screen): a reference is recorded by the run that first
      needs it). 1107's recorded run (`manifests/suites/2026-11-07-spark-ds41f-1107-tp4-single-stream`) is
      from another session, so it is printed beside the table, not used for the verdict.
+   - **Result** (dgx1 window 2026-11-09 23:52Z to 2026-11-10 00:21Z,
+     [table](receipts/tp4-ring/lab/candidate-51-single-stream-tp4-table.txt)): against candidate-50 without
+     #1009, one-stream paired decode is 1.17% better (margin 0.39%), on both boots (+1.14% and +1.20%).
+     - Output: 81.82 tok/s for the base, 82.94 and 82.97 tok/s for candidate-51 (window row +1.36% ±5.85%, same).
+     - Engine steps a second +0.96% and +1.01%, tokens a step +0.43% and +0.40%: each the same within its interval.
+     - The candidate's repeat: +0.04% paired.
+     - So the grid's 4.4-8.4% on one-request rows reaches one-stream serving as about 1.2%.
+   - **Against 1107's recorded run** (another session,
+     [table](receipts/tp4-ring/lab/candidate-51-single-stream-tp4-vs-1107-table.txt)): paired decode +0.42%
+     (margin 0.57%), the same; output 82.62 against 82.94 tok/s; paired TTFT 1.11% worse (±0.27%). The base
+     measured here reads 1.0% below 1107's record. This run cannot tell a session difference from an effect
+     of candidate-50's PRs at one stream: no 1107 arm ran in this window.
+   - **Receipts:** `receipts/tp4-ring/suites/candidate-51-single-stream-tp4/`,
+     `receipts/tp4-ring/determinism/candidate-51-single-stream-tp4/` (startup memory, telemetry) and
+     `receipts/tp4-ring/lab/candidate-51-single-stream-tp4*` (the run's log, tables and mounted-file hashes).
+   - **How it was started:** `queue add` on dgx1, then
+     [candidate-51-single-stream-tp4-idle_then_queue.sh](receipts/tp4-ring/lab/candidate-51-single-stream-tp4-idle_then_queue.sh):
+     `scripts/lab_idle_start.sh`'s rule of 10 idle minutes, with the runner started as
+     `queue run --idle-minutes 2` so the window closed and production was restored once the queue emptied
+     ([its log](receipts/tp4-ring/lab/candidate-51-single-stream-tp4-idle.log)).
 
 ## Marks
 
