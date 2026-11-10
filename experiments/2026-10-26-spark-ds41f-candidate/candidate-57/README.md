@@ -109,7 +109,9 @@ Each testbed opens its window with `scripts/lab.py`, after the hold and idle gua
 
 1. [build.json](build.json) (`candidate-57-image`), in a dgx window
    ([step 4](../../../docs/release-benchmark.md#4-build-and-release-tests-dgx-window)): build the image on dgx4, copy it
-   along the ring, then one `kernel` job with this candidate's release-test bundle on dgx4.
+   along the ring. Its release-test bundle runs in candidate-55's `kernel` job, on dgx2,
+   beside 55's on dgx4, as candidate-53's build ran round 2's three bundles. The dgx window builds 56 and 57
+   first, then 55, whose spec ends with that job.
    - The image then crosses through the laptop once, to sp1, and goes on over the fabric to sp5:
      `ssh sp1 'docker save spark-ds41f:candidate-57 | ssh sp5 docker load'`.
    - Distribute it from sp5 with

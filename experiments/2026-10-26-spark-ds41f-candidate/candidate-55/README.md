@@ -100,7 +100,8 @@ Each testbed opens its window with `scripts/lab.py`, after the hold and idle gua
 
 1. [build.json](build.json) (`candidate-55-image`), in a dgx window
    ([step 4](../../../docs/release-benchmark.md#4-build-and-release-tests-dgx-window)): build the image on dgx4, copy it
-   along the ring, then one `kernel` job with this candidate's release-test bundle on dgx4.
+   along the ring, then one `kernel` job with round 3's three release-test bundles at once: 55's on dgx4, 56's on
+   dgx3 and 57's on dgx2, as candidate-53's build ran round 2's. The dgx window builds 56 and 57 first, then 55.
 2. [candidate-tp4.json](candidate-tp4.json) (`candidate-55-tp4`): the determinism gate at `tp4-ring`, first
    ([step 5](../../../docs/release-benchmark.md#5-gate-first)).
 3. [screen-tp4.json](screen-tp4.json) (`candidate-55-screen-tp4`), two jobs

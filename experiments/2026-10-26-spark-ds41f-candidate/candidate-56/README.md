@@ -102,7 +102,9 @@ Each testbed opens its window with `scripts/lab.py`, after the hold and idle gua
 
 1. [build.json](build.json) (`candidate-56-image`), in a dgx window
    ([step 4](../../../docs/release-benchmark.md#4-build-and-release-tests-dgx-window)): build the image on dgx4, copy it
-   along the ring, then one `kernel` job with this candidate's release-test bundle on dgx4. Then stream it once to sp1
+   along the ring. Its release-test bundle runs in candidate-55's `kernel` job, on dgx3,
+   beside 55's on dgx4, as candidate-53's build ran round 2's three bundles. The dgx window builds 56 and 57
+   first, then 55, whose spec ends with that job. Then stream it once to sp1
    (`ssh dgx1 docker save spark-ds41f:candidate-56 | ssh sp1 docker load`) and distribute it from there with
    `bin/spark --cluster-config experiments/2026-10-26-spark-ds41f-candidate/candidate-56/tp4-switched.json build distribute --apply`.
    Every rank shows the same image ID.
