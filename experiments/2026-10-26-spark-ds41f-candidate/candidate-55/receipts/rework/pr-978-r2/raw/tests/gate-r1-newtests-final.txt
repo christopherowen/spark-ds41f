@@ -1,0 +1,594 @@
+# label=gate-r1-newtests-final image=spark-ds41f:candidate-54 (sha256:e1de71bed3b41dff3a969c19adc09072c0ab1c947f34afe7117cb8b6389e23ea) arm=/home/chris/spark-lab/agents/candidate-55-rework-978-r2/arms/r1-newtests-f gpu=--gpus all
+# mounted: 25 files; sha256 of each:
+#   199242bd8db78dba4f261c1f679e1eb99e2c0592c79fce229554b4869f270f63  ./tests/multimodal/test_prefix_cache_fastpath.py
+#   bde0162f5f8eef919e9ef9e97c20c06a6ffbb343b9f9352982572fe9b3e0229a  ./tests/v1/core/test_stripped_mm_scheduling.py
+#   a1db813a12cc6bcec17d7484db0c6ac6495dd9220d470b9a79d283fa99dd2a60  ./tests/v1/engine/test_request_submission_cleanup.py
+#   9153b93e62b4724041c4b44dc8a417e521ae83ad1a1b52d9b5bd16bf1a9ba975  ./tests/v1/worker/test_dead_rows.py
+#   f4caee411cfcd534a7e788fe1a6bbd3bec2233c473ec3a9aa5dd6ad2707a50e7  ./tests/v1/worker/test_roce_cpu_affinity.py
+#   28c26a60e860e7ac2ba181986fb70a94b76cb5ad89f0b57a06351f2e62929c9e  ./vllm/entrypoints/cli/serve.py
+#   b3c312259b478f0519764eee88bc60f78c353554a9867432e4f1b8fb2b123119  ./vllm/entrypoints/launchers/api_server/entry.py
+#   f0755c58209f1941bdbad7771e5b3debbc75dc3612229889d9142e5adf5edd25  ./vllm/multimodal/hasher.py
+#   84692be153dd1c086ea1b1f60e105752b53a1768eb332f4bc7130364b1c0e89b  ./vllm/multimodal/inputs.py
+#   13a3d54c6ce268482bc94bbdb5a564f4977fd4a7a5ce842826b60014faace284  ./vllm/multimodal/media/image.py
+#   6d506bf53b83f248ae3dea5523cbcab27e3fc0b9a3c32ceed2cf720e3b14cd73  ./vllm/multimodal/processing/processor.py
+#   2974e0a72bc65733db461883660ab92ee179f5ee713e9e873d469238e5b54404  ./vllm/renderers/base.py
+#   b179933c7ebc7e3975ce365ec0f0da87f7afe18e455e65f73e68e22ac4789444  ./vllm/utils/cpu_affinity.py
+#   e248d713b76c28dabc829285219f9b940523d456390d90283c238bf0e294a717  ./vllm/v1/core/sched/scheduler.py
+#   39da11e49744067440c942ad778d99740e26aedd075fcb90c316671a0cbfe503  ./vllm/v1/engine/async_llm.py
+#   6f5a6ce809f6e41a6c0a9323e62bf8379e348fbbe5d0c49e277c881e478862fb  ./vllm/v1/engine/core.py
+#   3f22a100e312abc0a6c8e8b6b31790393591ca0032b064908571b50d265743b9  ./vllm/v1/worker/gpu/sample/sampler.py
+#   55e69117cfbeb3849f2f453d15c74e87fb70c6783e1188e5a443b75b9b68f300  ./vllm/v1/worker/gpu/sample/tilelang_auxiliary.py
+#   5e983a0501b18d9a1a3aa0685cf2526d3ac45f6167c4b7235cc9692b5574ceb0  ./vllm/v1/worker/gpu/sample/tilelang_bias.py
+#   e6a08abc744059a3eaa992608394481714d3e605d5a827fbace91153d5c50795  ./vllm/v1/worker/gpu/sample/tilelang_controls.py
+#   656b801012eb4d95ce238696658bdc0c586652758288b739cd0841e4d31bce46  ./vllm/v1/worker/gpu/sample/tilelang_sampling.py
+#   fed581af45edbf4f7cad44d8849a078a0f25bff123c1ebcbbc98ffefe986d2a2  ./vllm/v1/worker/gpu/sample/tilelang_thinking.py
+#   e1e3764733a2c52df85a63930eaaeecc79dae59292d659a0f1f9201d59ed81fe  ./vllm/v1/worker/gpu/spec_decode/rejection_sampler.py
+#   981212a2284d192901f453c76967bb845413e290ceaaabdf4855e9da8d5147ee  ./vllm/v1/worker/gpu/tilelang_inputs.py
+#   53dcb35aca21fee6a6f2b585d98349ac1b945ee024853e6ffa1068639c479e59  ./vllm/v1/worker/gpu_worker.py
+# started 2026-11-10T10:01:50Z
+.....................FFFFFF.........................................     [100%]
+=================================== FAILURES ===================================
+_____________ test_sampled_children_each_keep_retry_materializers ______________
+
+    def test_sampled_children_each_keep_retry_materializers():
+        async def run(executor):
+            llm = make_mm_llm(executor)
+            llm._p1_cached_mm_identifiers.add("image-1")
+            materializer = Materializer()
+            request = make_mm_request(materializer, n=3)
+            await llm.add_request(request.request_id, request, request.sampling_params)
+            children = list(llm.engine_core.submitted)
+            assert len(children) == 3
+            # Every child went without the image and keeps its own retry entry.
+            assert llm.engine_core.stripped == [(True,)] * 3
+            assert set(llm._pending_mm_retries) == set(children)
+            for child_id in children:
+                sent, materializers = llm._pending_mm_retries[child_id]
+                assert sent.request_id == child_id
+                assert sent.mm_features[0].data is None
+                assert list(materializers) == [0]
+            assert materializer.calls == 0
+    
+            outputs, _ = start_output_handler(llm)
+            try:
+                # P1 lost the image before the last child was scheduled.
+                outputs.put_nowait(miss_for(children[2]))
+                await until(lambda: len(llm.engine_core.submitted) == 4)
+                await until(lambda: not llm._mm_retry_tasks)
+                assert llm.engine_core.submitted[3] == children[2]
+                assert llm.engine_core.stripped[3] == (False,)
+                assert materializer.calls == 1
+                assert set(llm._pending_mm_retries) == set(children[:2])
+                assert len(llm.output_processor.request_states) == 3
+            finally:
+                await stop_output_handler(llm)
+    
+>       run_with_mm_executor(run)
+
+tests/v1/engine/test_request_submission_cleanup.py:568: 
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
+tests/v1/engine/test_request_submission_cleanup.py:294: in run_with_mm_executor
+    asyncio.run(run(executor))
+/usr/lib/python3.12/asyncio/runners.py:194: in run
+    return runner.run(main)
+           ^^^^^^^^^^^^^^^^
+/usr/lib/python3.12/asyncio/runners.py:118: in run
+    return self._loop.run_until_complete(task)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+/usr/lib/python3.12/asyncio/base_events.py:687: in run_until_complete
+    return future.result()
+           ^^^^^^^^^^^^^^^
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
+
+executor = <concurrent.futures.thread.ThreadPoolExecutor object at 0xf2630a2fae70>
+
+    async def run(executor):
+        llm = make_mm_llm(executor)
+        llm._p1_cached_mm_identifiers.add("image-1")
+        materializer = Materializer()
+        request = make_mm_request(materializer, n=3)
+        await llm.add_request(request.request_id, request, request.sampling_params)
+        children = list(llm.engine_core.submitted)
+        assert len(children) == 3
+        # Every child went without the image and keeps its own retry entry.
+        assert llm.engine_core.stripped == [(True,)] * 3
+>       assert set(llm._pending_mm_retries) == set(children)
+E       AssertionError: assert {'0_shared-ex...d-internal-1'} == {'0_shared-ex...d-internal-1'}
+E         
+E         Extra items in the right set:
+E         '2_shared-external-id-internal-1'
+E         '1_shared-external-id-internal-1'
+E         Use -v to get more diff
+
+tests/v1/engine/test_request_submission_cleanup.py:546: AssertionError
+__________________ test_mm_retry_runs_off_the_output_handler ___________________
+
+fut = <coroutine object RequestOutputCollector.get at 0xf2630a48d970>
+timeout = 2
+
+    async def wait_for(fut, timeout):
+        """Wait for the single Future or coroutine to complete, with timeout.
+    
+        Coroutine will be wrapped in Task.
+    
+        Returns result of the Future or coroutine.  When a timeout occurs,
+        it cancels the task and raises TimeoutError.  To avoid the task
+        cancellation, wrap it in shield().
+    
+        If the wait is cancelled, the task is also cancelled.
+    
+        If the task suppresses the cancellation and returns a value instead,
+        that value is returned.
+    
+        This function is a coroutine.
+        """
+        # The special case for timeout <= 0 is for the following case:
+        #
+        # async def test_waitfor():
+        #     func_started = False
+        #
+        #     async def func():
+        #         nonlocal func_started
+        #         func_started = True
+        #
+        #     try:
+        #         await asyncio.wait_for(func(), 0)
+        #     except asyncio.TimeoutError:
+        #         assert not func_started
+        #     else:
+        #         assert False
+        #
+        # asyncio.run(test_waitfor())
+    
+    
+        if timeout is not None and timeout <= 0:
+            fut = ensure_future(fut)
+    
+            if fut.done():
+                return fut.result()
+    
+            await _cancel_and_wait(fut)
+            try:
+                return fut.result()
+            except exceptions.CancelledError as exc:
+                raise TimeoutError from exc
+    
+        async with timeouts.timeout(timeout):
+>           return await fut
+                   ^^^^^^^^^
+
+/usr/lib/python3.12/asyncio/tasks.py:520: 
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
+vllm/v1/engine/output_processor.py:91: in get
+    await self.ready.wait()
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
+
+self = <asyncio.locks.Event object at 0xf2630a0eb410 [unset]>
+
+    async def wait(self):
+        """Block until the internal flag is true.
+    
+        If the internal flag is true on entry, return True
+        immediately.  Otherwise, block until another coroutine calls
+        set() to set the flag to true, then return True.
+        """
+        if self._value:
+            return True
+    
+        fut = self._get_loop().create_future()
+        self._waiters.append(fut)
+        try:
+>           await fut
+E           asyncio.exceptions.CancelledError
+
+/usr/lib/python3.12/asyncio/locks.py:212: CancelledError
+
+The above exception was the direct cause of the following exception:
+
+    def test_mm_retry_runs_off_the_output_handler():
+        async def run(executor):
+            llm = make_mm_llm(executor)
+            llm._p1_cached_mm_identifiers.add("image-1")
+            materializer = Materializer(released=False)
+            image = make_mm_request(materializer, request_id="image-request")
+            text = make_request(request_id="text-request")
+            await llm.add_request(image.request_id, image, image.sampling_params)
+            text_queue = await llm.add_request(
+                text.request_id, text, text.sampling_params
+            )
+            image_id, text_id = llm.engine_core.submitted
+    
+            outputs, _ = start_output_handler(llm)
+            try:
+                outputs.put_nowait(miss_for(image_id))
+                assert await asyncio.to_thread(materializer.started.wait, 2)
+                # The retry is still materializing; other requests' outputs flow.
+                outputs.put_nowait(
+                    EngineCoreOutputs(
+                        outputs=[
+                            EngineCoreOutput(
+                                request_id=text_id,
+                                new_token_ids=[1],
+                                finish_reason=FinishReason.STOP,
+                            )
+                        ],
+                        finished_requests={text_id},
+                    )
+                )
+                result = await asyncio.wait_for(text_queue.get(), timeout=2)
+                assert result.finished
+                assert not materializer.release.is_set()
+            finally:
+                materializer.release.set()
+            try:
+                await until(lambda: not llm._mm_retry_tasks)
+                assert llm.engine_core.submitted == [image_id, text_id, image_id]
+                assert llm.engine_core.stripped[2] == (False,)
+                assert "image-1" in llm._p1_cached_mm_identifiers
+                assert not llm._pending_mm_retries
+            finally:
+                await stop_output_handler(llm)
+    
+>       run_with_mm_executor(run)
+
+tests/v1/engine/test_request_submission_cleanup.py:615: 
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
+tests/v1/engine/test_request_submission_cleanup.py:294: in run_with_mm_executor
+    asyncio.run(run(executor))
+/usr/lib/python3.12/asyncio/runners.py:194: in run
+    return runner.run(main)
+           ^^^^^^^^^^^^^^^^
+/usr/lib/python3.12/asyncio/runners.py:118: in run
+    return self._loop.run_until_complete(task)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+/usr/lib/python3.12/asyncio/base_events.py:687: in run_until_complete
+    return future.result()
+           ^^^^^^^^^^^^^^^
+tests/v1/engine/test_request_submission_cleanup.py:601: in run
+    result = await asyncio.wait_for(text_queue.get(), timeout=2)
+             ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+/usr/lib/python3.12/asyncio/tasks.py:519: in wait_for
+    async with timeouts.timeout(timeout):
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
+
+self = <Timeout [expired]>
+exc_type = <class 'asyncio.exceptions.CancelledError'>
+exc_val = CancelledError(), exc_tb = <traceback object at 0xf26309a98c40>
+
+    async def __aexit__(
+        self,
+        exc_type: Optional[Type[BaseException]],
+        exc_val: Optional[BaseException],
+        exc_tb: Optional[TracebackType],
+    ) -> Optional[bool]:
+        assert self._state in (_State.ENTERED, _State.EXPIRING)
+    
+        if self._timeout_handler is not None:
+            self._timeout_handler.cancel()
+            self._timeout_handler = None
+    
+        if self._state is _State.EXPIRING:
+            self._state = _State.EXPIRED
+    
+            if self._task.uncancel() <= self._cancelling and exc_type is exceptions.CancelledError:
+                # Since there are no new cancel requests, we're
+                # handling this.
+>               raise TimeoutError from exc_val
+E               TimeoutError
+
+/usr/lib/python3.12/asyncio/timeouts.py:115: TimeoutError
+__________ test_miss_after_output_was_returned_finishes_with_an_error __________
+
+fut = <coroutine object RequestOutputCollector.get at 0xf2630ae41a40>
+timeout = 2
+
+    async def wait_for(fut, timeout):
+        """Wait for the single Future or coroutine to complete, with timeout.
+    
+        Coroutine will be wrapped in Task.
+    
+        Returns result of the Future or coroutine.  When a timeout occurs,
+        it cancels the task and raises TimeoutError.  To avoid the task
+        cancellation, wrap it in shield().
+    
+        If the wait is cancelled, the task is also cancelled.
+    
+        If the task suppresses the cancellation and returns a value instead,
+        that value is returned.
+    
+        This function is a coroutine.
+        """
+        # The special case for timeout <= 0 is for the following case:
+        #
+        # async def test_waitfor():
+        #     func_started = False
+        #
+        #     async def func():
+        #         nonlocal func_started
+        #         func_started = True
+        #
+        #     try:
+        #         await asyncio.wait_for(func(), 0)
+        #     except asyncio.TimeoutError:
+        #         assert not func_started
+        #     else:
+        #         assert False
+        #
+        # asyncio.run(test_waitfor())
+    
+    
+        if timeout is not None and timeout <= 0:
+            fut = ensure_future(fut)
+    
+            if fut.done():
+                return fut.result()
+    
+            await _cancel_and_wait(fut)
+            try:
+                return fut.result()
+            except exceptions.CancelledError as exc:
+                raise TimeoutError from exc
+    
+        async with timeouts.timeout(timeout):
+>           return await fut
+                   ^^^^^^^^^
+
+/usr/lib/python3.12/asyncio/tasks.py:520: 
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
+vllm/v1/engine/output_processor.py:91: in get
+    await self.ready.wait()
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
+
+self = <asyncio.locks.Event object at 0xf2630a2fb050 [unset]>
+
+    async def wait(self):
+        """Block until the internal flag is true.
+    
+        If the internal flag is true on entry, return True
+        immediately.  Otherwise, block until another coroutine calls
+        set() to set the flag to true, then return True.
+        """
+        if self._value:
+            return True
+    
+        fut = self._get_loop().create_future()
+        self._waiters.append(fut)
+        try:
+>           await fut
+E           asyncio.exceptions.CancelledError
+
+/usr/lib/python3.12/asyncio/locks.py:212: CancelledError
+
+The above exception was the direct cause of the following exception:
+
+    def test_miss_after_output_was_returned_finishes_with_an_error():
+        # A request preempted after its first token can only be restarted from its
+        # prompt, which would repeat output the client has: it ends with the error.
+        async def run(executor):
+            llm = make_mm_llm(executor)
+            llm._p1_cached_mm_identifiers.add("image-1")
+            materializer = Materializer()
+            request = make_mm_request(materializer)
+            queue = await llm.add_request(
+                request.request_id, request, request.sampling_params
+            )
+            [request_id] = llm.engine_core.submitted
+    
+            outputs, _ = start_output_handler(llm)
+            try:
+                outputs.put_nowait(
+                    EngineCoreOutputs(
+                        outputs=[EngineCoreOutput(request_id=request_id, new_token_ids=[7])]
+                    )
+                )
+                outputs.put_nowait(miss_for(request_id))
+                final = None
+                while final is None or not final.finished:
+                    final = await asyncio.wait_for(queue.get(), timeout=2)
+                assert final.outputs[0].finish_reason == "error"
+                assert final.outputs[0].token_ids == [7]
+                assert llm.engine_core.submitted == [request_id]
+                assert materializer.calls == 0
+                assert not llm._mm_retry_tasks
+                assert not llm._pending_mm_retries
+                assert "image-1" not in llm._p1_cached_mm_identifiers
+                assert_empty(llm)
+            finally:
+                await stop_output_handler(llm)
+    
+>       run_with_mm_executor(run)
+
+tests/v1/engine/test_request_submission_cleanup.py:653: 
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
+tests/v1/engine/test_request_submission_cleanup.py:294: in run_with_mm_executor
+    asyncio.run(run(executor))
+/usr/lib/python3.12/asyncio/runners.py:194: in run
+    return runner.run(main)
+           ^^^^^^^^^^^^^^^^
+/usr/lib/python3.12/asyncio/runners.py:118: in run
+    return self._loop.run_until_complete(task)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+/usr/lib/python3.12/asyncio/base_events.py:687: in run_until_complete
+    return future.result()
+           ^^^^^^^^^^^^^^^
+tests/v1/engine/test_request_submission_cleanup.py:641: in run
+    final = await asyncio.wait_for(queue.get(), timeout=2)
+            ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+/usr/lib/python3.12/asyncio/tasks.py:519: in wait_for
+    async with timeouts.timeout(timeout):
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
+
+self = <Timeout [expired]>
+exc_type = <class 'asyncio.exceptions.CancelledError'>
+exc_val = CancelledError(), exc_tb = <traceback object at 0xf263080c0700>
+
+    async def __aexit__(
+        self,
+        exc_type: Optional[Type[BaseException]],
+        exc_val: Optional[BaseException],
+        exc_tb: Optional[TracebackType],
+    ) -> Optional[bool]:
+        assert self._state in (_State.ENTERED, _State.EXPIRING)
+    
+        if self._timeout_handler is not None:
+            self._timeout_handler.cancel()
+            self._timeout_handler = None
+    
+        if self._state is _State.EXPIRING:
+            self._state = _State.EXPIRED
+    
+            if self._task.uncancel() <= self._cancelling and exc_type is exceptions.CancelledError:
+                # Since there are no new cancel requests, we're
+                # handling this.
+>               raise TimeoutError from exc_val
+E               TimeoutError
+
+/usr/lib/python3.12/asyncio/timeouts.py:115: TimeoutError
+_______________ test_retry_entries_end_with_a_stop_string_finish _______________
+
+    def test_retry_entries_end_with_a_stop_string_finish():
+        async def run(executor):
+            llm = make_mm_llm(executor)
+            llm._p1_cached_mm_identifiers.add("image-1")
+            request = make_mm_request(Materializer())
+            await llm.add_request(request.request_id, request, request.sampling_params)
+            [request_id] = llm.engine_core.submitted
+            assert request_id in llm._pending_mm_retries
+    
+            # The frontend finishes the request (a stop string): no engine output
+            # will end it, so its retry entry goes with the engine abort.
+            llm.output_processor.process_outputs = lambda *a, **k: SimpleNamespace(
+                request_outputs=[], reqs_to_abort=[request_id]
+            )
+            outputs, _ = start_output_handler(llm)
+            try:
+                outputs.put_nowait(
+                    EngineCoreOutputs(
+                        outputs=[EngineCoreOutput(request_id=request_id, new_token_ids=[7])]
+                    )
+                )
+                await until(lambda: request_id in llm.engine_core.aborted)
+                assert not llm._pending_mm_retries
+            finally:
+                await stop_output_handler(llm)
+    
+>       run_with_mm_executor(run)
+
+tests/v1/engine/test_request_submission_cleanup.py:682: 
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
+tests/v1/engine/test_request_submission_cleanup.py:294: in run_with_mm_executor
+    asyncio.run(run(executor))
+/usr/lib/python3.12/asyncio/runners.py:194: in run
+    return runner.run(main)
+           ^^^^^^^^^^^^^^^^
+/usr/lib/python3.12/asyncio/runners.py:118: in run
+    return self._loop.run_until_complete(task)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+/usr/lib/python3.12/asyncio/base_events.py:687: in run_until_complete
+    return future.result()
+           ^^^^^^^^^^^^^^^
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
+
+executor = <concurrent.futures.thread.ThreadPoolExecutor object at 0xf2630a0e9d30>
+
+    async def run(executor):
+        llm = make_mm_llm(executor)
+        llm._p1_cached_mm_identifiers.add("image-1")
+        request = make_mm_request(Materializer())
+        await llm.add_request(request.request_id, request, request.sampling_params)
+        [request_id] = llm.engine_core.submitted
+        assert request_id in llm._pending_mm_retries
+    
+        # The frontend finishes the request (a stop string): no engine output
+        # will end it, so its retry entry goes with the engine abort.
+        llm.output_processor.process_outputs = lambda *a, **k: SimpleNamespace(
+            request_outputs=[], reqs_to_abort=[request_id]
+        )
+        outputs, _ = start_output_handler(llm)
+        try:
+            outputs.put_nowait(
+                EngineCoreOutputs(
+                    outputs=[EngineCoreOutput(request_id=request_id, new_token_ids=[7])]
+                )
+            )
+            await until(lambda: request_id in llm.engine_core.aborted)
+>           assert not llm._pending_mm_retries
+E           AssertionError: assert not {'shared-external-id-internal-1': (EngineCoreRequest(request_id='shared-external-id-internal-1', prompt_token_ids=[0, ...one, recurrent_instruction_boundary=None), {'image-1': <bound method MultiModalKwargsItem.materialize_and_get of {}>})}
+E            +  where {'shared-external-id-internal-1': (EngineCoreRequest(request_id='shared-external-id-internal-1', prompt_token_ids=[0, ...one, recurrent_instruction_boundary=None), {'image-1': <bound method MultiModalKwargsItem.materialize_and_get of {}>})} = <vllm.v1.engine.async_llm.AsyncLLM object at 0xf2630a0e9730>._pending_mm_retries
+
+tests/v1/engine/test_request_submission_cleanup.py:678: AssertionError
+__________________ test_sent_mm_identifier_marks_are_bounded ___________________
+
+    def test_sent_mm_identifier_marks_are_bounded():
+        marks = SentMMIdentifiers(3)
+        for identifier in "abcd":
+            marks.add(identifier)
+>       assert list(marks) == ["b", "c", "d"]
+E       AssertionError: assert ['c', 'd', 'b', 'a'] == ['b', 'c', 'd']
+E         
+E         At index 0 diff: 'c' != 'b'
+E         Left contains one more item: 'a'
+E         Use -v to get more diff
+
+tests/v1/engine/test_request_submission_cleanup.py:689: AssertionError
+_____________ test_streaming_input_items_are_sent_with_their_data ______________
+
+    def test_streaming_input_items_are_sent_with_their_data():
+        async def run(executor):
+            llm = make_mm_llm(executor)
+            llm._p1_cached_mm_identifiers.add("image-1")
+            materializer = Materializer()
+            request = make_mm_request(materializer)
+            request.resumable = True
+            await llm._prepare_mm_features_for_prefix_cache(request)
+            assert request.mm_features[0].data is not None
+            assert not request.mm_features[0].data.is_lazy
+            assert materializer.calls == 1
+            assert not llm._pending_mm_retries
+    
+>       run_with_mm_executor(run)
+
+tests/v1/engine/test_request_submission_cleanup.py:728: 
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
+tests/v1/engine/test_request_submission_cleanup.py:294: in run_with_mm_executor
+    asyncio.run(run(executor))
+/usr/lib/python3.12/asyncio/runners.py:194: in run
+    return runner.run(main)
+           ^^^^^^^^^^^^^^^^
+/usr/lib/python3.12/asyncio/runners.py:118: in run
+    return self._loop.run_until_complete(task)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+/usr/lib/python3.12/asyncio/base_events.py:687: in run_until_complete
+    return future.result()
+           ^^^^^^^^^^^^^^^
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
+
+executor = <concurrent.futures.thread.ThreadPoolExecutor object at 0xf2630a2f9070>
+
+    async def run(executor):
+        llm = make_mm_llm(executor)
+        llm._p1_cached_mm_identifiers.add("image-1")
+        materializer = Materializer()
+        request = make_mm_request(materializer)
+        request.resumable = True
+        await llm._prepare_mm_features_for_prefix_cache(request)
+>       assert request.mm_features[0].data is not None
+E       AssertionError: assert None is not None
+E        +  where None = MultiModalFeatureSpec(data=None, modality='image', identifier='image-1', mm_position=PlaceholderRange(offset=4, length=10, is_embed=None), mm_hash='image-1').data
+
+tests/v1/engine/test_request_submission_cleanup.py:723: AssertionError
+=============================== warnings summary ===============================
+../../../../usr/local/lib/python3.12/dist-packages/torch/jit/_script.py:365: 14 warnings
+  /usr/local/lib/python3.12/dist-packages/torch/jit/_script.py:365: DeprecationWarning: `torch.jit.script_method` is deprecated. Please switch to `torch.compile` or `torch.export`.
+    warnings.warn(
+
+-- Docs: https://docs.pytest.org/en/stable/how-to/capture-warnings.html
+=========================== short test summary info ============================
+FAILED tests/v1/engine/test_request_submission_cleanup.py::test_sampled_children_each_keep_retry_materializers
+FAILED tests/v1/engine/test_request_submission_cleanup.py::test_mm_retry_runs_off_the_output_handler
+FAILED tests/v1/engine/test_request_submission_cleanup.py::test_miss_after_output_was_returned_finishes_with_an_error
+FAILED tests/v1/engine/test_request_submission_cleanup.py::test_retry_entries_end_with_a_stop_string_finish
+FAILED tests/v1/engine/test_request_submission_cleanup.py::test_sent_mm_identifier_marks_are_bounded
+FAILED tests/v1/engine/test_request_submission_cleanup.py::test_streaming_input_items_are_sent_with_their_data
+6 failed, 62 passed, 14 warnings in 14.30s
+# exit 1, finished 2026-11-10T10:02:10Z

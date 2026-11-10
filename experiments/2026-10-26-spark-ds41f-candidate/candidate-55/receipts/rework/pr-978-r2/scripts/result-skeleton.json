@@ -1,0 +1,218 @@
+{
+ "pr": 978,
+ "label": "978-r2",
+ "kind": "perf (host)",
+ "round": "candidate-55 round 2, its last rework (patch 0793)",
+ "date": "2026-11-10",
+ "verdict": "meets-mark",
+ "verdict_basis": [
+  "Fast path engages in the server: the renderer now tells its processor (InputProcessingContext.mm_prefix_metadata_cache) when there is no processor cache and prefix caching is on. Through the real AsyncLLM frontend every workload's turn 2+ request goes with its repeated images stripped (6-25 KB instead of 10-41 MB), and the DS4.1-checkpoint test shows it only with --mm-processor-cache-gb 0.",
+  "The mark, round 1's bench unchanged, ABBA against candidate-54, two boots per arm: all 12 image cells are faster beyond the interval. Turn 2+ is 4.2x to 9.5x faster (1302x1302 JPEG x1 7.05x, x4 8.74x; 1920x1080 PNG 5.01x; 3840x2160 PNG x1 4.24x, x4 4.29x; 4032x3024 JPEG x4 9.51x). Turn 1 is 2% to 15% faster (JPEG 1302 x1 0.964, x4 0.959; PNG 1920 0.892; 3840 x1 0.849, x4 0.875; JPEG 4032 x4 0.981), so no cell is slower. Prompt token ids and mm hashes equal candidate-54's in every workload and turn.",
+  "Text-only requests through the same frontend (short, long, n=4), ABBA, two boots per arm: no cell slower beyond the interval (all within); a text request runs no round-2 code beyond two empty checks.",
+  "The JPEG slowdown was #978's own and is removed: the lazy-image header cache (moved decodes into the processor's thread, 3x the page faults in the HF work) now runs only with the fast path, and MultiModalHasher's multithreaded blake3 (woke the processor's thread onto Cortex-A725 cores) is reverted.",
+  "The four risks are closed with tests: a schedule-time retryable miss, a retry materializer for every sampled child, bounded marks (LRU 4096), and retries off the output handler. Round 1's fixes and #972's rollback and shielded abort hold: the gate files pass (68, 6 more than round 1), and the six new AsyncLLM tests fail on round 1's tree.",
+  "check_978_image_chat.py could not run (no live server on sp8; the command for the testbed is given). Caveat for the owner: with the recipe's process environment added to the bench (not the mark), 1920x1080 PNG turn 1 was slower beyond the interval (80.9/79.7 ms against 72.0/70.2) while the other 11 cells were faster or within; its stage diagnostic shows the processor's thread running the HF work on Cortex-A725 cores in one of two r2 boots (46 ms against 31 ms), the other boot faster than base. Production also pins the API server mostly to A725 cores (0792), which no bench here applies."
+ ],
+ "what_changed_in_round_2": {
+  "fast_path_engages_in_the_server": "InputProcessingContext gains mm_prefix_metadata_cache (default False); MultiModalRegistry.create_processor takes it; BaseRenderer sets it for its serving processor when there is no processor cache, prefix caching is on, the frontend has one engine (DP 1 or an external load balancer) and there is no KV or EC transfer (_uses_mm_prefix_fastpath). BaseMultiModalProcessor reads only that flag (prefix_metadata_cache_enabled) instead of ctx.vllm_config, which the server's context never carried. AsyncLLM._mm_prefix_fastpath is the processor's flag. Elsewhere (a processor cache, profiling and dummy inputs, any context without the flag) the processor is unchanged.",
+  "jpeg_slowdown_removed": "see jpeg_finding",
+  "new_images_cost_no_more": "with the fast path on and no item from bytes loaded before, the processor runs its usual path (HF processor, prompt updates) while one helper thread (vllm-mm-hash) computes the hashes, then records the items' metadata; the header cache keys on SHA-256, looks new bytes up by a pre-key (length, first and last 16 KiB) and hashes them in full on a helper thread (vllm-image-digest) alongside their decode (64 KiB or more)",
+  "risks": "see risks"
+ },
+ "serving_path_cells": {
+  "mark": {
+   "what": "round 1's real-AsyncLLM frontend bench, unchanged (scripts/serving_path_bench.py, sha256 ea3a02fe46780a0ec750b5c03ca8ad3de1858b52b2314eaadbfa30617936b867 = round 1's exp/serving_path_bench.py): VllmConfig from the served DS4.1 checkpoint with the recipe's --tokenizer-mode deepseek_v41 --enable-prefix-caching --mm-processor-cache-gb 0 --limit-mm-per-prompt {\"image\":67} --block-size 256; the real renderer, DS4.1 processor, InputProcessor and AsyncLLM.generate; base64 images loaded with ImageMediaIO.load_base64; a fake engine core that msgpack-encodes each request (the IPC send) and finishes it. 3 conversations x 5 turns per workload; times load_base64 start -> request encoded. Each boot's cell is the median over the conversations.",
+   "session": "sp8, one hold 09:44:37-09:47:59Z, order base r2 r2 base (raw/mark/session.log); base = spark-ds41f:candidate-54 as built, r2 = its image with candidate-55-r2's 26 changed Python files mounted (arms/r2f)",
+   "rule": "faster (slower) beyond the interval: both r2 boots' medians below (above) both base boots'",
+   "result": "met: turn 2+ faster beyond the interval in 6 of 6 workloads (4.2x-9.5x); turn 1 faster beyond the interval in 6 of 6; no cell slower; prompt token ids and mm hashes equal candidate-54's",
+   "note_turn1_4img": "the bench's seeds give image 0 of each 4-image workload the bytes of the same size's 1-image workload, so under r2 one of the four images on turn 1 is already marked and goes without its tensors (turn-1 request 30.6 MB, not 40.7 MB, for 1302x1302 x4); the 1-image cells are cold on turn 1",
+   "cells": {}
+  },
+  "text_only": {
+   "what": "scripts/serving_text_bench.py: the same frontend and flags, text prompts only: ~60 tokens, ~4,000 tokens, and n=4 sampling on the short prompt; 3 rounds x 40 requests each, per-request medians of generate() -> encoded (submit) and -> final output (round trip)",
+   "session": "sp8, one hold 09:47:59-09:49:18Z, order base r2 r2 base (raw/text/)",
+   "result": "not slower: every cell (submit and round trip, short, long and n=4) within the interval",
+   "code_on_the_text_path": "a text-only request runs no round-2 code beyond a request.mm_features check in _add_request and an empty-dict check in the output handler and abort(); sub-millisecond medians move between boots by up to 3x with thread placement (raw/superseded/text, text2: two earlier sessions on earlier r2 trees, same text path code)",
+   "cells": {}
+  },
+  "supplementary_recipe_environment": {
+   "what": "the mark's bench with the recipe's process environment for the frontend added (config/cluster.json: MALLOC_ARENA_MAX=2, MALLOC_MMAP_THRESHOLD_=1048576, OMP_NUM_THREADS=8, VLLM_MAX_IMAGE_PIXELS=16777216); round 1's bench runs without it. Not the mark.",
+   "session": "sp8, one hold 09:49:18-09:53:01Z, base r2 r2 base (raw/serving-supplementary/prodenv/), and the stage diagnostic under the same environment (raw/serving-supplementary/prodenv-diag/)",
+   "result": "turn 2+ faster beyond the interval in 6 of 6 (4.6x-11.3x); turn 1 faster beyond the interval in 4, within in 1 (1302x1302 JPEG x1), slower beyond the interval in 1 (1920x1080 PNG x1: r2 80.92/79.67 ms against 72.04/70.19); identity equal. Its stage diagnostic (prodenv-diag) puts the slow boot's HF work on A725 cores (little-core share 1.0, 46.0 ms against base 31.3/31.1), the other r2 boot at 65.1 ms against base 70.0/70.6.",
+   "cells": {}
+  },
+  "production_affinity_not_reproduced": "0792 (in candidate-55) pins the rank-0 API server to its api_server_cpus: the Cortex-A725 cores 0-4, 10-14 and one or two X925 cores (vllm/utils/cpu_affinity.py). Neither bench applies it (both construct AsyncLLM directly, as round 1's did), so the frontend's per-request times in serving will differ from these on all arms; check_978_image_chat.py on the testbed is the end-to-end check."
+ },
+ "jpeg_finding": {
+  "summary": "The slowdown was #978's own, from two changes that ran with the fast path off (round 1 never engaged it in the server), and neither changed a result. (a) image.py: the validated-header cache returned repeat bytes as _LazyPILImage, which moved their decode into the processor's thread (the renderer's MM executor). From then on the HF processor's work took about three times the minor page faults (14,544 against 4,981 for a 1302x1302 JPEG request, turn 1 included: the process's allocator state changes) and ~9 ms more kernel time: 1302x1302 JPEG, turn 1 HF stage 19.1 ms against 12.2 ms. A CPU-only stage split in one thread (round 1's) cannot show this. Hashing the header key single-threaded did not remove it (img978st: 14,549 faults). (b) hasher.py: blake3 on every core (rayon). The processor's thread blocks on the pool and is woken onto whichever core is free, often a Cortex-A725 (cpus 0-4, 10-14), and the HF work after it ran there: 1302x1302 JPEG turn 2+, HF 13.2 ms with 42% of samples on A725 cores against 8.9 ms (h978 alone, raw/jpeg-bisect/diag1); for a 0.9 MB JPEG the pool saved less than its wake-up (hash 1.6 ms wall against 1.26 ms single-threaded). Each change alone reproduced part of round 1's 1302 JPEG loss (bisect1: base 22.3/24.8 ms turn 1, image.py alone 31.0, hasher alone 27.6, round 1 40.9/41.8). In round 2 the same placement effect bit the multithreaded hash's large-image gain: with it, 1920x1080 PNG turn 1 was bimodal (54.8 or 71.2 ms against base 58.8; HF 41 ms with two thirds on A725 cores), so it was removed (raw/superseded/mark2, mark3, diag6).",
+  "fix": "the validated-header cache is on only with the fast path (set_validated_image_meta_cache_enabled, set by the renderer), where a repeat image is never decoded; without the fast path loading is candidate-54's; MultiModalHasher is candidate-54's again (hashes on its own thread; mm hashes never depended on threading); new images under the fast path take the processor's usual path with their hashes computed alongside on one helper thread",
+  "method": "bisection by file over candidate-54 (arms h978, img978, img978st, r1st) with round 1's bench, then serving_stage_diag.py: round 1's bench with each stage wrapped at runtime (wall, thread CPU, system time, minor faults via getrusage(RUSAGE_THREAD), share of samples on A725 cores via sched_getcpu)",
+  "evidence": {}
+ },
+ "risks": {
+  "stripped_item_loses_coverage_before_scheduling": {
+   "disposition": "closed: a schedule-time retryable miss",
+   "how": "Scheduler._try_schedule_encoder_inputs: when an encoder input that came without data must run and its encoder output is not cached, it borrows another live request's data; failing that it records the miss (stripped_mm_misses) and leaves the request unscheduled this step (num_new_tokens 0), never scheduling the encoder without data (which made the worker raise 'Encoder cache miss' and stop the engine). update_from_output finishes those requests with FINISHED_ERROR and mm_cache_miss_hashes, beside the grammar-error path. The frontend restarts a request that has returned nothing yet (RequestState.is_prefilling) with all its items' data under the same id; one that already returned output (preempted after its first token) ends with the error, since a restart would repeat that output. Add-time verification and its encoder-cache pin are unchanged.",
+   "tests": [
+    "tests/v1/core/test_stripped_mm_scheduling.py::test_stripped_item_held_nowhere_is_a_retryable_miss",
+    "::test_stripped_item_in_the_encoder_cache_is_scheduled",
+    "::test_chunked_prefill_reaching_an_evicted_stripped_item_is_a_miss",
+    "::test_a_miss_does_not_hold_other_requests",
+    "tests/v1/engine/test_request_submission_cleanup.py::test_miss_after_output_was_returned_finishes_with_an_error"
+   ]
+  },
+  "only_first_sampled_child_keeps_retry_materializer": {
+   "disposition": "closed",
+   "how": "_prepare_mm_features_for_prefix_cache replaces a stripped item in a copy of the child's own mm_features list (dataclasses.replace) instead of setting f.data on the feature specs the children share, so each child sees the lazy item, strips it and keeps its own materializer (keyed by feature index)",
+   "tests": [
+    "tests/v1/engine/test_request_submission_cleanup.py::test_sampled_children_each_keep_retry_materializers"
+   ]
+  },
+  "unbounded_p1_identifier_tracking": {
+   "disposition": "closed",
+   "how": "SentMMIdentifiers: an LRU of MAX_SENT_MM_IDENTIFIERS = 4096 identifiers (the processor's metadata cache holds 512 items; only those can go stripped); a stripped item refreshes its mark; a dropped mark only means the item is sent with its data again",
+   "tests": [
+    "tests/v1/engine/test_request_submission_cleanup.py::test_sent_mm_identifier_marks_are_bounded"
+   ]
+  },
+  "retry_materializes_on_the_output_handler": {
+   "disposition": "closed",
+   "how": "the output handler starts each retry as its own task (AsyncLLM._mm_retry_tasks, cancelled at shutdown) and goes on; the task materializes all stripped items on the MM executor with the processor's torch thread setting, skips the resubmission if the request was aborted meanwhile, marks and resends, and finishes the request with an error if that fails",
+   "tests": [
+    "tests/v1/engine/test_request_submission_cleanup.py::test_mm_retry_runs_off_the_output_handler",
+    "::test_abort_during_mm_retry_materialize_does_not_resubmit (round 1, adapted to the task)"
+   ]
+  },
+  "also_closed": {
+   "retry_entry_after_a_stop_string_finish": "dropped with the engine abort (test_retry_entries_end_with_a_stop_string_finish)",
+   "streaming_input_requests": "always send their items' data, since they cannot be restarted from their first chunk (test_streaming_input_items_are_sent_with_their_data)",
+   "a_retry_that_could_miss_again": "a retry resends every stripped item of the request, not only the missed ones",
+   "dead_ced_lookup": "the unused getattr(self.scheduler, 'ced_Prompt_replay_tokens', 0) in _verify_or_resolve_stripped_mm_features is removed; get_computed_blocks already caps the hit at the replay boundary"
+  },
+  "remaining": [
+   "A cancelled materialization keeps running on the single-worker MM executor until it ends (unchanged from round 1).",
+   "A request preempted after its first token whose stripped item is no longer held anywhere ends with an error instead of being served; candidate-54 would have served it from the data it carried. It needs eviction of both the encoder output and the prefix blocks while the request is preempted.",
+   "With KV connectors a finished request's blocks can be freed late; the fast path is off with any KV or EC transfer, so the same-id resubmission never meets that."
+  ]
+ },
+ "guarantees_kept": {
+  "round_1_fixes": "Callable import; text-only requests never reach the renderer or the fast path; get_computed_blocks()[1]; a request whose send fails leaves no retry entry and unmarks what it marked; an aborted retry is not resubmitted",
+  "pr_972": "the materialization await stays between local registration and the engine send inside add_request()'s rollback; abort() pops retry entries before the shielded engine abort, which is unchanged; tests/v1/engine/test_request_submission_cleanup.py and tests/entrypoints/serve/utils/test_api_cancellation.py pass"
+ },
+ "tests": {
+  "harness": "scripts/run_tests.sh (round 1's): spark-ds41f:candidate-54, --gpus all, an arm's files mounted, the release bundle's plugins (tblib_stub, offline_skip, deepseek_models), HF_HUB_OFFLINE=1, DS41F_SNAPSHOT; each run's header lists every mounted file's sha256. scripts/final_tests.sh ARM=r2f NEWTESTS=r1-newtests-f SUFFIX=-final, four lock holds.",
+  "interpretation": {
+   "gate_files (test_request_submission_cleanup.py, test_api_cancellation.py)": "r2: 68 passed (round 1: 62; +6 new). Round 1's tree with round 2's tests: 6 failed, 62 passed - exactly the six new AsyncLLM tests (children's materializers, retry off the handler, miss after returned output, stop-string finish, bounded marks, streaming input).",
+   "pr978 (test_prefix_cache_fastpath, test_stripped_mm_scheduling, test_hasher, media/test_image, test_cache, test_deepseek_v4_1_image_span; round 1's -k exclusions)": "r2: 56 passed on two boots. Round 1's tree with round 2's tests: 9 failed, 5 errors (the four scheduler tests - the encoder scheduled without data, and the attribute the cached-encoder test reads; the serving-frontend test [0] and [4] - no flag on the server's context; the renderer conditions; loading without the fast path; the self-heal test's index-keyed materializers; the header-cache and processor tests error in their fixture without set_validated_image_meta_cache_enabled). candidate-54 (the four files it has): 40 passed.",
+   "dirs (tests/v1/engine, tests/entrypoints/serve/utils, --continue-on-collection-errors)": "r2: 261 passed, 17 failed, 43 skipped, 6 errors; candidate-54 (round 1's recorded run, same image and command): 244 passed, 17 failed, 43 skipped, 6 errors. The 17 failures and 6 errors are identical (environmental: async tests without an async plugin, hub models absent offline, no ray, CUDA before fork); +17 passed are round 1's 11 and round 2's 6 new cases.",
+   "extra (test_scheduler, test_async_scheduler, test_encoder_cache_manager, multimodal test_processing/test_registry/test_inputs/test_image, renderers test_warmup/test_multimodal_hashes)": "r2: 153 passed, 2 failed, 234 skipped, 1 error; candidate-54 in the same hold: identical (test_schedule_concurrent_partial_requests[False|True] fail and tests/renderers/test_multimodal_hashes.py errors at collection, a hub model absent offline, on both). The pre-final r2 tree failed 2 more (test_abort_request_when_structured_output_fsm_cannot_advance in test_scheduler.py and test_async_scheduler.py: a scheduler built without __init__ lacked stripped_mm_misses), fixed by the class-level default (raw/superseded/tests-pre-final).",
+   "development": "raw/dev/: CPU-only and GPU development runs; dev10-r2f mounted a wrongly built arm (the whole tree) and is superseded by dev11-r2f"
+  },
+  "runs": {}
+ },
+ "check_978_image_chat": {
+  "run": false,
+  "why": "it needs a live DS4.1 server; one GB10 (sp8) cannot load the TP4 model, and testbed use is out of scope for this rework",
+  "command_for_the_testbed": [
+   "# base arm first (candidate-55 without #978, or candidate-54), then the candidate (candidate-55 with this 0793, or the overlay over spark-ds41f:candidate-55), same recipe, tp4-ring:",
+   "python3 experiments/2026-10-26-spark-ds41f-candidate/candidate-55/check_978_image_chat.py http://<head>:8000 --label base > 978-base.jsonl",
+   "python3 experiments/2026-10-26-spark-ds41f-candidate/candidate-55/check_978_image_chat.py http://<head>:8000 --label 978-r2 --against 978-base.jsonl > 978-r2.jsonl",
+   "# passes when every turn's text and prompt token count equal the base's (exit 0)"
+  ],
+  "what_stands_in_here": "tests/multimodal/test_prefix_cache_fastpath.py::test_serving_frontend_sends_repeat_images_without_data[0|4]: a real AsyncLLM from the served DS4.1 checkpoint with the recipe's flags sends a three-turn conversation's repeated image without data from turn 2, with turn 1's mm hash, placement and prompt prefix (only with --mm-processor-cache-gb 0)"
+ },
+ "patch": {
+  "file": "0793-perf-multimodal-prefix-cache-fastpath-under-mm-proce.patch",
+  "author": "Christopher Owen <christopherowen@users.noreply.github.com>",
+  "date": "Sun, 8 Nov 2026 14:53:04 +0000 (the PR patch's)",
+  "message": "round 1's message with a 'Round 2 (candidate-55)' section after round 1's, a Round 2 line under Quality and a Round 2 item under Tests",
+  "replaces": "candidate-55's 0793 (commit 3feb241e) and round 1's (c628316b)",
+  "files_vs_candidate_54": [
+   "tests/multimodal/test_prefix_cache_fastpath.py",
+   "tests/v1/core/test_stripped_mm_scheduling.py (new)",
+   "tests/v1/engine/test_request_submission_cleanup.py",
+   "vllm/multimodal/inputs.py",
+   "vllm/multimodal/media/image.py",
+   "vllm/multimodal/processing/context.py",
+   "vllm/multimodal/processing/processor.py",
+   "vllm/multimodal/registry.py",
+   "vllm/renderers/base.py",
+   "vllm/v1/core/sched/scheduler.py",
+   "vllm/v1/engine/async_llm.py",
+   "vllm/v1/engine/core.py"
+  ],
+  "hasher_py": "no longer touched (candidate-54's)",
+  "interdiff": "raw/interdiff-0793-r1-to-0793-r2.diff"
+ },
+ "overlay": {
+  "mount_root": "/opt/spark-ds41f/candidate/vllm (overlay/<path> -> /opt/spark-ds41f/candidate/vllm/<path>)",
+  "files": {
+   "tests/multimodal/test_prefix_cache_fastpath.py": "64cfc4ff2d8543c618f1de621e91a8c352b068d6fa853543a6cecadcc82b545c",
+   "tests/v1/core/test_stripped_mm_scheduling.py": "bde0162f5f8eef919e9ef9e97c20c06a6ffbb343b9f9352982572fe9b3e0229a",
+   "tests/v1/engine/test_request_submission_cleanup.py": "cfec76e7bf455805395a13df5b56a9a1764b4f0b26be69454c63ed77ad21861a",
+   "vllm/multimodal/hasher.py": "29b456ff3be793cd10585323e5dbb660a521d820fadb1898fd620ca21139965e",
+   "vllm/multimodal/media/image.py": "7ec51428617513c30088ab3f3d51b7c54ec4da36f89d2bc68936cce08efd3164",
+   "vllm/multimodal/processing/context.py": "7cee31025bc25323bc2344225e6809391a4ebd36df637f14f1b14eb31d8c21b6",
+   "vllm/multimodal/processing/processor.py": "7c3d7daaa12fe33bb19ce5a8dde2cf607fb7c09d5970df7c8428729c37c85572",
+   "vllm/multimodal/registry.py": "d9a243edd0cc7d5eeb390d748381507ba154cb44b0d0fd78d514df632cf9ec9e",
+   "vllm/renderers/base.py": "0507db6d1a0ae31c9588a7ef391c79f34bd75e5ac08581b80ca08464ab9d6128",
+   "vllm/v1/core/sched/scheduler.py": "7b363ee317d536b9d990359c3729628cf8addf512e6d97766462beb292705cd7",
+   "vllm/v1/engine/async_llm.py": "313f9ae016d0f5eda64ff18ac0d1e0ff2c10510fa26122e2ba06ef8faa78774a",
+   "vllm/v1/engine/core.py": "e00afb407b7345b858808f1a97f851a3b45db3277ac31f2ff39596f8e62e4d4a"
+  },
+  "over_candidate_55_image_gives": "candidate-55-r2's series tree cc4ac4853e71544fc81632d8f260ed341485d945 (git check: candidate-55's tree e39b835c plus overlay/)",
+  "verified": "git: candidate-55's tree (410463b3, e39b835c) with overlay/ copied over it writes the round-2 series tree; spark-ds41f:candidate-55 is not on sp8, so the mount itself was not run here",
+  "boot_needs": "the nine vllm/ files (hasher.py is candidate-54's content, undoing candidate-55's)"
+ },
+ "host": {
+  "node": "sp8 (spark-0016)",
+  "gpu_lock": "/tmp/spark-lab-gpu.lock, taken per session after checking ~/spark-hold.json (absent throughout)",
+  "image": "spark-ds41f:candidate-54 sha256:e1de71bed3b41dff3a969c19adc09072c0ab1c947f34afe7117cb8b6389e23ea",
+  "workdir": "~/spark-lab/agents/candidate-55-rework-978-r2",
+  "concurrency": "other agents' jobs shared sp8 during the sessions; some ran without the lock (a candidate-57 indexer pytest around 07:46Z); each session log records the load average at every run"
+ },
+ "arms": {
+  "base": "spark-ds41f:candidate-54 as built (4e8133ff, tree 5f021d9a)",
+  "r1": "round 1: candidate-55-r1's 24 changed Python files",
+  "r2f": "round 2 (final): candidate-55-r2's 26 changed Python files (0792, this 0793, 0794)",
+  "r1-newtests-f": "r1 with round 2's three test files; their imports of round 2's new names fall back to a plain set on round 1 (a shim in this diagnostic arm only)",
+  "bisection_arms": "h978, img978, img978st, r1st: candidate-54 with one of round 1's files, or round 1 with a hash single-threaded",
+  "superseded_r2_trees": "r2dev, r2, r2inline: earlier round-2 trees (multithreaded MM hash, background header record); their runs are kept in raw/superseded/"
+ },
+ "development_history": [
+  "screen1, diag3, diag4 (r2dev: SHA-256 header key inline, then pre-key plus a background record): fast path engaged (stripped items, 7-10x turn 2+); 1920x1080 PNG turn 1 about 1 ms slower with the key inline, bimodal with the background record.",
+  "mark-pre-amend and mark2 (r2 with blake3 on every core for items of 4 MiB or more, background record): turn 2+ 7-18x faster in both; 1920x1080 PNG turn 1 faster in the first (55.5/58.0 against 58.0/58.6) and 25% slower in the second (73.4/71.8 against 58.5/58.1).",
+  "mark3 (r2, and r2inline with the record inline): r2's 1920x1080 PNG turn 1 54.8 or 71.2 ms against base 58.8/58.3; inline 59.7/58.7. diag6 found the cause (processor thread on A725 cores after the rayon hash).",
+  "final-mark (multithreaded hash removed, digest alongside the decode): no rayon effect, but three turn-1 cells slower beyond the interval by 0.8-3% (the hash-first order of the metadata path and the inline digest of small images); cold_path_microbench located them (load +0.45 ms for a 0.9 MB JPEG; apply +1 ms for a 1920x1080 PNG).",
+  "r2f (final): new images take the processor's usual path with hashes on a helper thread; digests of 64 KiB or more alongside the decode; the mark above. Pre-final test runs (raw/superseded/tests-pre-final) found the scheduler's stripped_mm_misses missing on schedulers built without __init__ (2 tests of test_scheduler.py and test_async_scheduler.py), fixed with a class-level default before the final runs."
+ ],
+ "not_verified": [
+  "a TP4 boot with this 0793 (one GB10 cannot load the model)",
+  "check_978_image_chat.py against a live server (command above)",
+  "the overlay mounted over spark-ds41f:candidate-55 (not on sp8; verified at git level)",
+  "the frontend under 0792's API-server CPU affinity (production) - neither bench applies it",
+  "the streaming-input path with images end to end (it now never strips; unit test only)"
+ ],
+ "notes": [
+  "No pushes, commits to the repository, PRs, image builds, cluster, window or testbed operations. The only commits are in the sp8 work dir's disposable vLLM clone (worktree commitwt, branch r2c), for git format-patch.",
+  "Development test runs without --gpus ran outside the lock (CPU only); every recorded run and every bench session ran under the lock.",
+  "Unfavourable runs are kept: raw/superseded/ holds every session of the earlier round-2 trees, including the ones where 1920x1080 PNG turn 1 was slower (mark2, mark3, final-mark) and the pre-final test runs (extra-r2's AttributeError, which led to the scheduler's class-level default)."
+ ],
+ "files": {
+  "patch": "0793-perf-multimodal-prefix-cache-fastpath-under-mm-proce.patch",
+  "overlay": "overlay/",
+  "commands": "commands.txt",
+  "scripts": "scripts/",
+  "raw": {
+   "mark": "the mark session (final candidate) and its summary",
+   "text": "the text-only session and its summary",
+   "serving-supplementary": "prodenv (recipe environment), prodenv-diag, stage-diag (base r1 r2 r2 r1 base), stage-diag-screen (base r2 r2 base)",
+   "jpeg-bisect": "bisect1 (round 1's bench by file), diag1, diag2 (stage diagnostics)",
+   "tests": "the final test runs (*-final.txt, final-tests-final.log)",
+   "apply-check.txt": "apply and pair checks of the final patch",
+   "interdiff-0793-r1-to-0793-r2.diff": "what round 2 changed",
+   "dev": "development test runs",
+   "superseded": "runs of earlier round-2 trees and the pre-final tests"
+  }
+ }
+}
