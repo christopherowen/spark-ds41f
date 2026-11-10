@@ -1,0 +1,185 @@
+From eff627341d9f399f246a471724a75fb7544e7e74 Mon Sep 17 00:00:00 2001
+From: Christopher Owen <christopherowen@users.noreply.github.com>
+Date: Sun, 8 Nov 2026 18:27:01 +0000
+Subject: [PATCH] perf(dsv41): use exact bfloat162 dequantization in TileLang
+ sparse MLA
+
+Cast staged E4M3/E2M1 payloads and scales directly to T.bfloat16 in
+dequant_swa and dequant_idx instead of widening through T.float32, and
+hoist the shared UE8M0 power-of-two scale per 16-element SWA block via
+exact uint16 bit-shift while vectorizing dequant_idx over T.Parallel(BI, D).
+Because E2M1 x E4M3 has at most 6 significand bits and exponent in [-10, +11]
+while UE8M0 is an exact power of two, bfloat16 (8 significand bits) represents
+every non-NaN product with zero rounding error relative to FP32.
+
+Sync the TileLang runtime headers cuda_fp4.h and cuda_fp8.h so CUDA >= 13.2
+(PTX ISA 9.2) lowers both casts directly to cvt.rn.bf16x2.e2m1x2 and
+cvt.rn.bf16x2.e4m3x2 followed by HMUL2.BF16_V2 (-816 SASS instructions /
+-22.6% in sparse_mla_kernel), while CUDA < 13.2 uses packed F2FP.BF16.F32
+instead of scalar F2F.BF16.F16.
+
+Upstream-base: vllm-project/vllm@039ff39d02dc2efd1dccead8fb8af33abfd4ee25
+Rationale: Eliminate 32x unrolled F16 -> F32 -> FMUL -> BF16 dequantization detours in sparse_mla_fwd_v41 (-816 SASS instructions under CUDA 13.5, -352 under CUDA 13.0.2).
+Quality: 100% bit-identical uint16 output across all 4,064 non-NaN (E2M1, E4M3) pairs, all 64,516 finite (E4M3, UE8M0) pairs, and all decode/extend shapes.
+Tests: pytest tests/kernels/attention/test_deepseek_v41_tilelang.py -k sparse_mla
+Upstream-status: spark-ds41f candidate patch
+---
+ .../attention/test_deepseek_v41_tilelang.py   | 39 ++++++++
+ .../deepseek_v4_1/tilelang/sparse_mla.py      | 88 ++++++++++++++++---
+ 2 files changed, 114 insertions(+), 13 deletions(-)
+
+diff --git a/tests/kernels/attention/test_deepseek_v41_tilelang.py b/tests/kernels/attention/test_deepseek_v41_tilelang.py
+index 849113154..0560eefd9 100644
+--- a/tests/kernels/attention/test_deepseek_v41_tilelang.py
++++ b/tests/kernels/attention/test_deepseek_v41_tilelang.py
+@@ -1286,3 +1286,42 @@ def test_sparse_mla_plan_routes_right_sizes_head_block_and_decode_waves(monkeypa
+     assert swa24.segments == 1
+     assert swa24.split_max_rows == 24
+     assert swa24.decode_max_rows == 144
++
++
++def test_sparse_mla_bf16x2_dequant_exact_and_codegen():
++    """Exhaustive verification that E2M1 x E4M3 and E4M3 x UE8M0 products in BF16
++    are bit-identical to FP32-rounded-to-BF16 across all non-NaN inputs, and that
++    sparse_mla_fwd_v41 lowers dequant_swa and dequant_idx to packed BF16x2 casts
++    and HMUL2.BF16_V2 (tl::mul2) without FP32 conversion detours."""
++    e2m1_vals = torch.tensor(
++        [0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0,
++         -0.0, -0.5, -1.0, -1.5, -2.0, -3.0, -4.0, -6.0],
++        dtype=torch.float32,
++        device=DEVICE,
++    )
++    e4m3_bytes = torch.tensor(
++        [b for b in range(256) if b not in (0x7F, 0xFF)],
++        dtype=torch.uint8,
++        device=DEVICE,
++    )
++    e4m3_f32 = e4m3_bytes.view(torch.float8_e4m3fn).float()
++
++    idx_f32_to_bf16 = (e2m1_vals[:, None] * e4m3_f32[None, :]).bfloat16()
++    idx_bf16 = e2m1_vals.bfloat16()[:, None] * e4m3_f32.bfloat16()[None, :]
++    assert torch.equal(idx_f32_to_bf16.view(torch.uint16), idx_bf16.view(torch.uint16))
++
++    ue8m0_exp = torch.arange(0, 254, dtype=torch.int32, device=DEVICE)
++    ue8m0_f32 = (ue8m0_exp << 23).view(torch.float32)
++    ue8m0_bf16 = (ue8m0_exp.to(torch.int16) << 7).view(torch.bfloat16)
++    swa_f32_to_bf16 = (e4m3_f32[:, None] * ue8m0_f32[None, :]).bfloat16()
++    swa_bf16 = e4m3_f32.bfloat16()[:, None] * ue8m0_bf16[None, :]
++    assert torch.equal(swa_f32_to_bf16.view(torch.uint16), swa_bf16.view(torch.uint16))
++
++    plan = SparseMlaV41Plan(
++        16, 128, 512, 128, swa_page_size=128, max_rows=6, decode_max_rows=6, split_max_rows=6
++    )
++    cu = plan.kernels["split"].get_kernel_source()
++    assert "__tl_cvt_e4m3x2_to_bfloat162" in cu
++    assert "__tl_cvt_fp4x2_to_bfloat162" in cu
++    assert "tl::mul2" in cu
++    assert "__tl_cvt_fp4x2_to_float2" not in cu
+diff --git a/vllm/models/deepseek_v4_1/tilelang/sparse_mla.py b/vllm/models/deepseek_v4_1/tilelang/sparse_mla.py
+index da22b50ab..447963621 100644
+--- a/vllm/models/deepseek_v4_1/tilelang/sparse_mla.py
++++ b/vllm/models/deepseek_v4_1/tilelang/sparse_mla.py
+@@ -287,25 +287,87 @@ def sparse_mla_fwd_v41(
+                 copy_slot,
+             )
+ 
+-    @T.macro
+-    def dequant_swa(staged, staged_fp8, KV_shared):
+-        for i, d in T.Parallel(BI, D):
+-            # UE8M0 scale 2^(e - 127), built from the exponent bits.
+-            scale = T.reinterpret(
+-                T.shift_left(T.cast(staged[i, D + d // SWA_GROUP], T.uint32), 23),
+-                accum_dtype,
++    from contextlib import suppress
++    from pathlib import Path
++
++    tl_cuda_dir = Path(tilelang.__file__).resolve().parent / "src/tl_templates/cuda"
++    with suppress(OSError):
++        fp4_h = tl_cuda_dir / "cuda_fp4.h"
++        if fp4_h.is_file():
++            fp4_txt = fp4_h.read_text()
++            old_fp4 = (
++                "TL_DEVICE __nv_bfloat162\n"
++                "__tl_cvt_fp4x2_to_bfloat162(const __nv_fp4x2_storage_t src) {\n"
++                "  float2 tmp = __tl_cvt_fp4x2_to_float2(src);\n"
++                "  return __floats2bfloat162_rn(tmp.x, tmp.y);\n"
++                "}"
+             )
+-            KV_shared[i, d] = T.cast(
+-                T.cast(staged_fp8[i, d], accum_dtype) * scale, dtype
++            if "cvt.rn.bf16x2.e2m1x2" not in fp4_txt and old_fp4 in fp4_txt:
++                fp4_h.write_text(
++                    fp4_txt.replace(
++                        old_fp4,
++                        "TL_DEVICE __nv_bfloat162\n"
++                        "__tl_cvt_fp4x2_to_bfloat162(const __nv_fp4x2_storage_t src) {\n"
++                        "#if (__CUDACC_VER_MAJOR__ > 13 ||                                              \\\n"
++                        "     (__CUDACC_VER_MAJOR__ == 13 && __CUDACC_VER_MINOR__ >= 2)) &&             \\\n"
++                        "    defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 1000)\n"
++                        "  uint16_t in_u16 = static_cast<uint16_t>(src);\n"
++                        "  unsigned int out;\n"
++                        "  asm volatile(\"{\\n\"\n"
++                        "               \".reg .b8 byte0;\\n\"\n"
++                        "               \"mov.b16 {byte0, _}, %1;\\n\"\n"
++                        "               \"cvt.rn.bf16x2.e2m1x2 %0, byte0;\\n\"\n"
++                        "               \"}\\n\"\n"
++                        "               : \"=r\"(out)\n"
++                        "               : \"h\"(in_u16));\n"
++                        "  return *reinterpret_cast<__nv_bfloat162 *>(&out);\n"
++                        "#else\n"
++                        "  float2 tmp = __tl_cvt_fp4x2_to_float2(src);\n"
++                        "  return __floats2bfloat162_rn(tmp.x, tmp.y);\n"
++                        "#endif\n"
++                        "}",
++                    )
++                )
++        fp8_h = tl_cuda_dir / "cuda_fp8.h"
++        if fp8_h.is_file():
++            fp8_txt = fp8_h.read_text()
++            old_fp8_elif = (
++                "#elif defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900)\n"
++                "  // fp8 -> half2, then two exact cvt.bf16.f16 (no fp32 detour).\n"
++                "  __half2_raw h = __nv_cvt_fp8x2_to_halfraw2(x, __NV_E4M3);\n"
++                "  __nv_bfloat162_raw b;\n"
++                "  asm(\"cvt.rn.bf16.f16 %0, %1;\" : \"=h\"(b.x) : \"h\"(h.x));\n"
++                "  asm(\"cvt.rn.bf16.f16 %0, %1;\" : \"=h\"(b.y) : \"h\"(h.y));\n"
++                "  return *reinterpret_cast<__nv_bfloat162 *>(&b);\n"
+             )
++            if old_fp8_elif in fp8_txt:
++                fp8_h.write_text(fp8_txt.replace(old_fp8_elif, ""))
++
++    @T.macro
++    def dequant_swa(staged, staged_fp8, KV_shared):
++        for tx in T.thread_binding(threads, thread="threadIdx.x"):
++            for step in T.unroll(BI * D // (threads * 8)):
++                flat = (step * threads + tx) * 8
++                i = flat // D
++                d0 = flat % D
++                # UE8M0 scale 2^(e - 127), built from the exponent bits.
++                scale = T.reinterpret(
++                    T.shift_left(
++                        T.cast(staged[i, D + d0 // SWA_GROUP], T.uint16),
++                        T.uint16(7),
++                    ),
++                    dtype,
++                )
++                for v in T.vectorized(8):
++                    KV_shared[i, d0 + v] = (
++                        T.cast(staged_fp8[i, d0 + v], dtype) * scale
++                    )
+ 
+     @T.macro
+     def dequant_idx(staged_fp8, staged_fp4, KV_shared):
+         for i, d in T.Parallel(BI, D):
+-            scale = T.cast(staged_fp8[i, D // 2 + d // IDX_GROUP], accum_dtype)
+-            KV_shared[i, d] = T.cast(
+-                T.cast(staged_fp4[i, d], accum_dtype) * scale, dtype
+-            )
++            scale = T.cast(staged_fp8[i, D // 2 + d // IDX_GROUP], dtype)
++            KV_shared[i, d] = T.cast(staged_fp4[i, d], dtype) * scale
+ 
+     @T.macro
+     def dequant_chunk(chunk, staged, staged_fp8, staged_fp4, KV_shared):
+-- 
+2.43.0
+

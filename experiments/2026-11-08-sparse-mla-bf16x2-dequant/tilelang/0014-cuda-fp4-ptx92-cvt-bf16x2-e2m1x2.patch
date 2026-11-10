@@ -1,0 +1,71 @@
+From 00d00f3e26ca8b562a79e98409154e3b4d3848e6 Mon Sep 17 00:00:00 2001
+From: Christopher Owen <christopherowen@users.noreply.github.com>
+Date: Sun, 8 Nov 2026 18:29:00 +0000
+Subject: [PATCH] perf(cuda): add PTX 9.2 cvt.rn.bf16x2.e2m1x2 in cuda_fp4.h
+ and packed fallback in cuda_fp8.h
+
+Use PTX ISA 9.2 cvt.rn.bf16x2.e2m1x2 (F2FP.BF16.E2M1.UNPACK_B) in
+__tl_cvt_fp4x2_to_bfloat162 under CUDA >= 13.2, matching
+__tl_cvt_e4m3x2_to_bfloat162 in cuda_fp8.h. On CUDA < 13.2, use packed
+__floats2bfloat162_rn / __float22bfloat162_rn (F2FP.BF16.F32.PACK_AB) instead
+of scalar cvt.rn.bf16.f16 (F2F.BF16.F16).
+
+Upstream-base: tile-ai/tilelang@2123e412ce2217b324c50c4ec967213906456ac5
+Rationale: Lower vectorized E2M1 -> BF16 casts to single-instruction F2FP.BF16.E2M1.UNPACK_B under CUDA >= 13.2 and avoid slow-pipe scalar F2F.BF16.F16 on sm_121a under CUDA < 13.2.
+Quality: Bit-identical BF16 conversions across all 16 E2M1 values and 254 finite E4M3 values.
+Tests: pytest tests/kernels/attention/test_deepseek_v41_tilelang.py -k sparse_mla
+Upstream-status: spark-ds41f candidate patch
+---
+ src/tl_templates/cuda/cuda_fp4.h | 15 +++++++++++++++
+ src/tl_templates/cuda/cuda_fp8.h |  7 -------
+ 2 files changed, 15 insertions(+), 7 deletions(-)
+
+diff --git a/src/tl_templates/cuda/cuda_fp4.h b/src/tl_templates/cuda/cuda_fp4.h
+index 47156c2..c1947b5 100644
+--- a/src/tl_templates/cuda/cuda_fp4.h
++++ b/src/tl_templates/cuda/cuda_fp4.h
+@@ -356,8 +356,23 @@ TL_DEVICE __nv_bfloat16 __tl_cvt_fp4_to_bfloat16(const __nv_fp4_storage_t src) {
+ // fp4_e2m1x2 -> bfloat162
+ TL_DEVICE __nv_bfloat162
+ __tl_cvt_fp4x2_to_bfloat162(const __nv_fp4x2_storage_t src) {
++#if (__CUDACC_VER_MAJOR__ > 13 ||                                              \
++     (__CUDACC_VER_MAJOR__ == 13 && __CUDACC_VER_MINOR__ >= 2)) &&             \
++    defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 1000)
++  uint16_t in_u16 = static_cast<uint16_t>(src);
++  unsigned int out;
++  asm volatile("{\n"
++               ".reg .b8 byte0;\n"
++               "mov.b16 {byte0, _}, %1;\n"
++               "cvt.rn.bf16x2.e2m1x2 %0, byte0;\n"
++               "}\n"
++               : "=r"(out)
++               : "h"(in_u16));
++  return *reinterpret_cast<__nv_bfloat162 *>(&out);
++#else
+   float2 tmp = __tl_cvt_fp4x2_to_float2(src);
+   return __floats2bfloat162_rn(tmp.x, tmp.y);
++#endif
+ }
+ 
+ // bfloat16 -> fp4_e2m1
+diff --git a/src/tl_templates/cuda/cuda_fp8.h b/src/tl_templates/cuda/cuda_fp8.h
+index d840d27..d0e376e 100644
+--- a/src/tl_templates/cuda/cuda_fp8.h
++++ b/src/tl_templates/cuda/cuda_fp8.h
+@@ -225,13 +225,6 @@ __tl_cvt_e4m3x2_to_bfloat162(const __nv_fp8x2_storage_t x) {
+   unsigned int packed;
+   asm("cvt.rn.bf16x2.e4m3x2 %0, %1;" : "=r"(packed) : "h"(x));
+   return *reinterpret_cast<__nv_bfloat162 *>(&packed);
+-#elif defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900)
+-  // fp8 -> half2, then two exact cvt.bf16.f16 (no fp32 detour).
+-  __half2_raw h = __nv_cvt_fp8x2_to_halfraw2(x, __NV_E4M3);
+-  __nv_bfloat162_raw b;
+-  asm("cvt.rn.bf16.f16 %0, %1;" : "=h"(b.x) : "h"(h.x));
+-  asm("cvt.rn.bf16.f16 %0, %1;" : "=h"(b.y) : "h"(h.y));
+-  return *reinterpret_cast<__nv_bfloat162 *>(&b);
+ #else
+   half2 tmp = __nv_cvt_fp8x2_to_halfraw2(x, __NV_E4M3);
+   return __float22bfloat162_rn(make_float2((float)tmp.x, (float)tmp.y));
+-- 
+2.43.0
+
