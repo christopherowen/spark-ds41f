@@ -259,3 +259,10 @@ single-stream run as [candidate-tp4-no978.json](candidate-tp4-no978.json),
 - **On the testbed:** [validate-978r2-tp4.json](validate-978r2-tp4.json) boots candidate-55 with the round-2 files
   (`tp4-978r2.json`, from [978r2/overlay](978r2/overlay)): the gate, then `check_978_image_chat.py` against
   candidate-54 under #1008's real thread placement.
+
+**#978 round 2 on the testbed** ([receipts/tp4-ring-978r2](receipts/tp4-ring-978r2/README.md)): the live image chat
+passes, but the gate's `again` scenario (prompts re-run on prefix-cache hits) differs in one request in both runs,
+where candidate-55 without #978 is identical. **#978 is dropped from this release** after its second rework.
+
+**Verdict for candidate-55:** #1008 and #988's dead-row part pass and join the next merged base; #995's guard is left
+out; #978 is dropped.
