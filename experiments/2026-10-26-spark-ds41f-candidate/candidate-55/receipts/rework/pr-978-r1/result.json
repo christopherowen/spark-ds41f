@@ -1,0 +1,673 @@
+{
+ "pr": 978,
+ "label": "978-r1",
+ "kind": "perf (host)",
+ "round": "candidate-55 round 1, its one rework (patch 0793)",
+ "date": "2026-11-10",
+ "verdict": "fixed but misses its mark on the serving path",
+ "verdict_basis": [
+  "Correctness: the corrected 0793 fixes candidate-55's boot failure (NameError in AsyncLLM.__init__ on every tp4-ring boot) and the 13 release-test failures; tests/v1/engine and tests/entrypoints/serve/utils now fail exactly where candidate-54 fails (environmental), with 11 new cases passing.",
+  "Own mark as declared (the PR's bench_mm_prefix_fastpath.py, ABBA against candidate-54, 2 boots each): met. Turn-2+ host time is faster beyond the interval in 8 of 8 workloads (7.5x to 23x), the turn-2+ payload is 1,465x to 1,600x smaller, and prompt token ids and mm hashes equal candidate-54's.",
+  "On the path the API server takes, the mark is missed, and so was it before this rework. BaseMultiModalProcessor enables its metadata cache only when getattr(self.info.ctx, 'vllm_config').cache_config.enable_prefix_caching is true, and the server's InputProcessingContext has only model_config and tokenizer. So items are never lazy and nothing is sent stripped. The PR's bench builds its own context with vllm_config, which is why it engages there. Through a real AsyncLLM frontend with the recipe's flags (fake engine core only), against candidate-54, ABBA, 2 boots each: turn 2+ sends the full ~10-41 MB every turn. 1302x1302 JPEG is 57% slower (1 image) and 35% slower (4 images), and 4032x3024 JPEG x4 is 4% slower, all beyond the interval. PNG is 5-7% faster. Step 8 counts a slower cell of the PR's own bench, on a shape serving uses, as worse.",
+  "Under the drop rule, #978 misses as a performance change on the serving path. The owner decides whether the bench result shows enough promise for a second rework (see second_rework_scope)."
+ ],
+ "answers_to_coordinator": {
+  "callable_import": "Callable is now imported (from collections.abc import AsyncGenerator, Callable, Iterable, Mapping); Any was already imported (from typing import Any) on every base. Not a rebase artifact: #978's own patch (PR head 67792978, sha256 f5b37879...) adds no import, and async_llm.py does not import Callable on its 1107 base (320021e3, read from the spark-ds41f:1107 image), on candidate-50, on candidate-54 (4e8133ff) or in candidate-55's 0793 (3feb241e). raw/static/static-checks.txt.",
+  "does_it_explain_the_13": "No. Those tests replace _run_output_handler with a no-op, so they never reach the NameError. They failed on the renderer and retry-map coupling: 10 AttributeError ('AsyncLLM' object has no attribute 'renderer'), 3 TimeoutError (the send was never reached), and 3 EngineGenerateError wrapping the same AttributeError (raw/tests/gate-c55.txt).",
+  "import_and_real_construction": "python -c 'import vllm.v1.engine.async_llm' passes on both trees; importing never triggered the error. A real AsyncLLM was constructed in a running event loop with VllmConfig from the served DS4.1 checkpoint and the recipe's --tokenizer-mode deepseek_v41 --enable-prefix-caching --mm-processor-cache-gb 0 --limit-mm-per-prompt {\"image\":67} --block-size 256. The real renderer, DS4.1 multimodal processor, InputProcessor and OutputProcessor were used, and only the engine-core client was an in-process fake, because one GB10 cannot load the TP4 model. Candidate-55's tree fails in __init__ with NameError: name 'Callable' is not defined, the boots' traceback. The corrected tree constructs, the output handler runs with _mm_prefix_fastpath true, and it serves a text request and a two-turn image chat through generate(); shutdown is clean (raw/construct/). The construction step expected turn 2 to go stripped and it did not, on both the corrected tree and candidate-55 with only the import fixed: that is the dormant serving path above, not a regression.",
+  "overlay_over_candidate_55_image": "Yes, as-is. The overlay is the four files that differ between candidate-55 (410463b3) and candidate-55-r1, all Python: vllm/v1/engine/async_llm.py, vllm/v1/engine/core.py and two test files. Mounted over spark-ds41f:candidate-55's /opt/spark-ds41f/candidate/vllm, they give exactly candidate-55-r1's tree (25787be1). Booting needs only the two vllm/ files. No compiled part changes, and core.py carries 0792's run_engine_core hunk unchanged. The AsyncLLM.__init__ path where candidate-55 died passes on this tree. A full TP4 boot was not possible on sp8; validate it in the dgx window (tp4-978r1.json). The image's vllm tree label will still read e39b835c.",
+  "mount_lines": [
+   "-v <rework>/overlay/vllm/v1/engine/async_llm.py:/opt/spark-ds41f/candidate/vllm/vllm/v1/engine/async_llm.py:ro",
+   "-v <rework>/overlay/vllm/v1/engine/core.py:/opt/spark-ds41f/candidate/vllm/vllm/v1/engine/core.py:ro"
+  ]
+ },
+ "root_cause": {
+  "boot": "vllm/v1/engine/async_llm.py, _run_output_handler: the nested `async def _retry_mm_cache_miss(retry_req: EngineCoreRequest, materializers: dict[str, Callable[[], Any]], ...)` annotates with Callable. Python 3.12 evaluates parameter annotations whenever the def runs, i.e. every time the output handler starts (AsyncLLM.__init__ in a running loop, or the first add_request). Callable was never imported, so every API server start raised NameError. All three candidate-55 boots on 2026-11-10 (04:04, 04:08 and 04:13Z) died this way (raw/candidate-55-boot/boot-failure-excerpt.txt). It is the only unbound name in candidate-55's 23 changed Python files (raw/static).",
+  "release_tests": "_add_request evaluated `self.renderer.mm_processor_cache is None and self.vllm_config.cache_config.enable_prefix_caching and request.mm_features`, renderer first, for every request. abort() popped self._pending_mm_retries for every aborted id. 0723's (rollback) and 0771's (#972) tests build AsyncLLM via __new__ with the text path's attributes only, so: (a) text-only submissions raised AttributeError before the engine send. The 3 disconnect tests then timed out, because the send they wait in was never reached. The api-cancellation test got EngineGenerateError. (b) The rollback's abort() raised AttributeError after removing local state, and add_request logged it as a failed notification, so the engine abort was never sent. In production the attributes exist, so this was a coupling defect, not a serving one. The text path should not depend on multimodal state.",
+  "engine_stripped_item": "Found while reworking: vllm/v1/engine/core.py, _verify_or_resolve_stripped_mm_features did `_, num_computed_tokens = kv_cache_manager.get_computed_blocks(request)`, but this tree's get_computed_blocks returns (blocks, computed tokens, shared_prefix_boundary). The first request with a stripped item would raise ValueError in EngineCoreProc._handle_client_request, which only catches MultiModalCacheMissError, and stop the engine. #978's test stub returned a 2-tuple and hid it.",
+  "await_window": "The materialization await sits between output_processor.add_request (local registration) and engine_core.add_request_async, inside add_request()'s `except BaseException` rollback (0723) and before abort()'s shielded engine notification (0771/#972). Structurally it keeps #972's guarantees: cancellation or failure there rolls back the registration and every registered child, and the abort is shielded. Two leaks remained. A request whose send failed left its new identifiers in _p1_cached_mm_identifiers. A cache-miss retry whose request was aborted during its materialization was resubmitted anyway, as an engine request with no client, and its items were re-marked."
+ },
+ "fix": {
+  "files": {
+   "vllm/v1/engine/async_llm.py": [
+    "import Callable from collections.abc",
+    "class attribute _mm_prefix_fastpath = False; __init__ sets it once: renderer.mm_processor is not None and renderer.mm_processor_cache is None and cache_config.enable_prefix_caching (the renderer's cache is fixed at construction)",
+    "_add_request: `if request.mm_features and self._mm_prefix_fastpath:` (text-only requests check one request attribute and never reach the renderer or the fast path); the await stays inside add_request()'s rollback",
+    "_prepare_mm_features_for_prefix_cache returns the identifiers it newly marked (deduplicated, not already present); its effects are otherwise unchanged, so the PR's bench still drives it directly",
+    "the engine send is wrapped: if it raises or is cancelled, a fast-path request drops its retry entry and unmarks the identifiers it marked (a request whose send did not complete leaves no fast-path state)",
+    "abort(): the retry-map cleanup runs only when the fast path is on and the map is not empty; still before the shielded abort",
+    "_retry_mm_cache_miss: after materializing, if output_processor no longer has the request (aborted meanwhile), return without re-marking or resubmitting"
+   ],
+   "vllm/v1/engine/core.py": [
+    "_verify_or_resolve_stripped_mm_features: num_computed_tokens = get_computed_blocks(request)[1], as scheduler.py does"
+   ],
+   "tests/v1/engine/test_request_submission_cleanup.py": [
+    "6 tests, 11 cases (below)"
+   ],
+   "tests/multimodal/test_prefix_cache_fastpath.py": [
+    "the get_computed_blocks stub returns the real 3 values, and the test asserts KVCacheManager.get_computed_blocks' return annotation has 3 elements with int at index 1"
+   ]
+  },
+  "marks_semantics": "An identifier is marked as sent to P1 only by a request whose engine send completed. A request rolled back before its send completed unmarks what it marked. Marks made by a delivered request stay, as after any ordinary abort: an earlier turn, or an earlier sampled child of the same submission whose send completed before a later child failed. P1 verifies every stripped item (encoder cache, prefix coverage, another request's data) and otherwise returns a retryable miss.",
+  "new_tests": {
+   "test_text_only_requests_skip_the_multimodal_fast_path[False|True]": "fast-path engine whose renderer raises on any attribute read; text submission, abort and a failed send roll back cleanly",
+   "test_disconnect_during_mm_materialize_rolls_back_all_children[1|3]": "the materializer blocks on the MM executor; generate() is cancelled; local state, children and maps are empty; the abort covers every registered child; nothing was sent",
+   "test_disconnect_during_stripped_mm_send_leaves_no_retry_entry[1-1|3-2|3-3]": "turn 2+ (stripped, retry entry), send blocked then cancelled: no retry entry left, the earlier turn's mark kept, nothing materialized",
+   "test_failed_mm_submission_unmarks_items_it_did_not_deliver[1|3]": "n=1 failed send: unmarked; n=3, last child fails: the first child's delivered mark stays; retry map empty",
+   "test_output_handler_starts_on_a_fast_path_engine": "the boot failure: starting the real output handler (fails with NameError on candidate-55)",
+   "test_abort_during_mm_retry_materialize_does_not_resubmit": "the real output handler gets a retryable miss; the client aborts during the retry's materialization; not resubmitted, not re-marked"
+  }
+ },
+ "patch": {
+  "file": "0793-perf-multimodal-prefix-cache-fastpath-under-mm-proce.patch",
+  "sha256": "0f60c31afc2ada321e94733175c36ee972527607455f2680371a0576ceab9f76",
+  "commit": "c628316be980b614f7912c02d63dd358a1d3696a",
+  "tree": "c571848664392f0e19cfb629c48335999493f829",
+  "author": "Christopher Owen <christopherowen@users.noreply.github.com>",
+  "date": "Sun, 8 Nov 2026 14:53:04 +0000 (the PR patch's)",
+  "message": "the original message, plus a 'Round 1 (candidate-55)' section before Quality, a Round 1 line under Quality and a Round 1 item under Tests",
+  "replaces": "candidate-55/vllm/0793-perf-multimodal-prefix-cache-fastpath-under-mm-proce.patch (commit 3feb241e)",
+  "interdiff": "raw/interdiff-0793-to-0793-r1.diff: tests/multimodal/test_prefix_cache_fastpath.py +14/-4; tests/v1/engine/test_request_submission_cleanup.py +301/-2; vllm/v1/engine/async_llm.py +49/-14; vllm/v1/engine/core.py +3/-2",
+  "applies_as_0793": "git am --committer-date-is-author-date with the stack's committer, on a fresh worktree of candidate-54's head 4e8133ff: 0792 -> 7e36cafc (tree 07d61ecc), 0793-r1 -> c628316b (tree c5718486; git diff --check clean), 0794 -> 6444081a (tree 25787be1). The locked series (0792, 0793, 0794) reproduces 410463b3 / e39b835c in the same harness (raw/apply-check.txt).",
+  "pair_checks": {
+   "0792": "both orders give tree c5718486. The only shared file is vllm/v1/engine/core.py: 0792 adds apply_role_cpu_affinity in EngineCoreProc.run_engine_core; 0793-r1 adds EngineCore._has_stripped_mm_data/_verify_or_resolve_stripped_mm_features and touches EngineCore.add_request, EngineCoreProc._handle_client_request and _handle_mm_cache_miss (different functions; round 1 changes one line inside _verify_or_resolve_stripped_mm_features)",
+   "0794": "no shared file; both orders give tree 027be5b5",
+   "alone_on_candidate_54": "applies, tree 7cc1bdfe"
+  },
+  "lock_values_for_a_candidate_with_it": "patch_head 6444081a430ab896f4057cdc61e30a1d5b3510d4, expected_tree 25787be10b998c2ca9a9fd497084d351aa532097 (this harness's committer and dates; recompute with bin/spark build prepare --lock)"
+ },
+ "overlay": {
+  "files": {
+   "tests/multimodal/test_prefix_cache_fastpath.py": "8f5968cd77fb9192b0fc1a2d27a2d1760c61fd513ecc1447caa02d4120186141",
+   "tests/v1/engine/test_request_submission_cleanup.py": "3e582236d3e83b6760b643aab35bf51238d5fffa721242d4b4df949754d19fd9",
+   "vllm/v1/engine/async_llm.py": "39da11e49744067440c942ad778d99740e26aedd075fcb90c316671a0cbfe503",
+   "vllm/v1/engine/core.py": "6f5a6ce809f6e41a6c0a9323e62bf8379e348fbbe5d0c49e277c881e478862fb"
+  },
+  "mount_root": "/opt/spark-ds41f/candidate/vllm (overlay/<path> -> /opt/spark-ds41f/candidate/vllm/<path>)",
+  "over_candidate_55_image_gives": "candidate-55-r1's tree 25787be1 exactly"
+ },
+ "host": {
+  "node": "sp8 (spark-0016)",
+  "gpu_lock": "/tmp/spark-lab-gpu.lock",
+  "hold_file": "~/spark-hold.json absent before every hold",
+  "image": "spark-ds41f:candidate-54 sha256:e1de71bed3b41dff3a969c19adc09072c0ab1c947f34afe7117cb8b6389e23ea (copied from sp5 over the fabric at 04:07-04:10Z; sp8 had none)",
+  "workdir": "~/spark-lab/agents/candidate-55-rework-978"
+ },
+ "arms": {
+  "base": "spark-ds41f:candidate-54 as built (4e8133ff, tree 5f021d9a)",
+  "c55": "candidate-54 image + candidate-55's 23 changed Python files (410463b3; 0792's _reader.c not mounted)",
+  "r1": "candidate-54 image + candidate-55-r1's 24 changed Python files (0792, corrected 0793, 0794)",
+  "c55-newtests": "c55 + r1's two changed test files (shows which new tests catch which defect)",
+  "c55-callable": "c55 with only Callable added to async_llm.py's import (attribution of the dormant fast path)"
+ },
+ "tests": {
+  "gate_files (test_request_submission_cleanup.py, test_api_cancellation.py)": {
+   "c55": "13 failed, 38 passed: the release's 13 exactly (raw/tests/gate-c55.txt)",
+   "r1": "62 passed (raw/tests/gate-r1.txt)",
+   "c55-newtests": "24 failed, 38 passed: the 13, plus all 11 new cases (NameError, AttributeError renderer/mm_processor_cache, TimeoutError, renderer-read assertion) (raw/tests/gate-c55-newtests.txt)"
+  },
+  "pr978_pytest (test_prefix_cache_fastpath, test_hasher, media/test_image, test_cache, test_deepseek_v4_1_image_span; the PR's -k exclusions)": {
+   "c55": "45 passed, 7 deselected",
+   "r1_boot1": "45 passed, 7 deselected",
+   "r1_boot2": "45 passed, 7 deselected",
+   "c55-newtests": "1 failed (ValueError: too many values to unpack (expected 2) in _verify_or_resolve_stripped_mm_features), 44 passed"
+  },
+  "dirs (tests/v1/engine, tests/entrypoints/serve/utils, --continue-on-collection-errors)": {
+   "candidate-54": "244 passed, 17 failed, 43 skipped, 6 errors",
+   "c55": "231 passed, 30 failed, 43 skipped, 6 errors: candidate-54's 17 + the 13",
+   "r1": "255 passed, 17 failed, 43 skipped, 6 errors: failures and errors identical to candidate-54's; +11 new cases",
+   "shared_17_and_6": "environmental, identical on all three arms. Failures: 15 async tests with no async plugin in this harness (test_sse_keep_alive x10, test_abort_final_step x2, test_output_processor x2, test_admission_control x1); test_llm_engine::test_engine_metrics (engine core init with an offline stand-in model); test_preprocess_error_handling (CUDA initialized before fork). Errors: collection of test_async_llm, test_engine_core and test_engine_core_client (hub models absent offline) and test_core_engine_actor_manager (no ray); test_llm_engine::test_parallel_sampling[False|True] (engine core init). Of these files only test_api_cancellation and the other gate files are in the release gate, and they pass.",
+   "note": "the first dirs attempt stopped at collection errors without --continue-on-collection-errors (raw/tests/dirs/*-attempt1.txt)"
+  },
+  "harness": "scripts/run_tests.sh: --gpus all, the release bundle's plugins (tblib_stub, offline_skip, deepseek_models), HF_HUB_OFFLINE=1, DS41F_SNAPSHOT, each mounted file's sha256 in the output header"
+ },
+ "construction": {
+  "c55": "import ok; create_engine_config ok; AsyncLLM.__init__: NameError: name 'Callable' is not defined",
+  "c55-callable": "constructs; text ok; turn 1 full data; turn 2 full data (not stripped)",
+  "r1": "constructs (_mm_prefix_fastpath true); text ok; turn 1 full data and marked; turn 2 full data (not stripped: the processor never returns lazy items in the server's context); shutdown ok",
+  "files": "raw/construct/"
+ },
+ "own_mark": {
+  "declared": "#978's bench_mm_prefix_fastpath.py (67792978, sha256 c948e8e1...) on both images ABBA, 2 boots: turn-2+ host processing of repeated images faster beyond the interval; prompt token ids and mm hashes identical",
+  "session": "sp8, one hold 06:07-06:11Z, order base r1 c55 c55 r1 base, then the identity check (raw/own-mark/own-mark-session.log)",
+  "result": "met: 8 of 8 workloads faster beyond the interval against candidate-54",
+  "workloads": {
+   "1302x1302_jpeg_1img": {
+    "base_turn2plus_ms": [
+     17.917,
+     15.808
+    ],
+    "r1_turn2plus_ms": [
+     2.265,
+     2.233
+    ],
+    "c55_turn2plus_ms": [
+     2.3,
+     2.506
+    ],
+    "speedup_r1_vs_base": 7.5,
+    "faster_beyond_interval": true,
+    "payload_bytes_turn2plus": "10186417 -> 6951",
+    "base_turn1_ms": [
+     17.314,
+     15.206
+    ],
+    "r1_turn1_ms": [
+     22.186,
+     23.813
+    ],
+    "c55_turn1_ms": [
+     20.851,
+     22.186
+    ],
+    "r1_vs_c55_turn2plus": "overlapping or faster"
+   },
+   "1302x1302_jpeg_4img": {
+    "base_turn2plus_ms": [
+     67.123,
+     67.391
+    ],
+    "r1_turn2plus_ms": [
+     9.041,
+     8.842
+    ],
+    "c55_turn2plus_ms": [
+     7.801,
+     5.996
+    ],
+    "speedup_r1_vs_base": 7.52,
+    "faster_beyond_interval": true,
+    "payload_bytes_turn2plus": "40743691 -> 25611",
+    "base_turn1_ms": [
+     70.247,
+     71.861
+    ],
+    "r1_turn1_ms": [
+     93.575,
+     80.786
+    ],
+    "c55_turn1_ms": [
+     75.571,
+     78.013
+    ],
+    "r1_vs_c55_turn2plus": "slower beyond the interval"
+   },
+   "1920x1080_png_1img": {
+    "base_turn2plus_ms": [
+     53.997,
+     53.955
+    ],
+    "r1_turn2plus_ms": [
+     3.92,
+     4.301
+    ],
+    "c55_turn2plus_ms": [
+     4.327,
+     5.111
+    ],
+    "speedup_r1_vs_base": 13.13,
+    "faster_beyond_interval": true,
+    "payload_bytes_turn2plus": "9914397 -> 6795",
+    "base_turn1_ms": [
+     54.172,
+     55.211
+    ],
+    "r1_turn1_ms": [
+     51.676,
+     58.54
+    ],
+    "c55_turn1_ms": [
+     57.593,
+     61.804
+    ],
+    "r1_vs_c55_turn2plus": "overlapping or faster"
+   },
+   "1920x1080_png_4img": {
+    "base_turn2plus_ms": [
+     216.913,
+     219.367
+    ],
+    "r1_turn2plus_ms": [
+     15.507,
+     17.538
+    ],
+    "c55_turn2plus_ms": [
+     19.718,
+     16.834
+    ],
+    "speedup_r1_vs_base": 13.2,
+    "faster_beyond_interval": true,
+    "payload_bytes_turn2plus": "39655611 -> 24987",
+    "base_turn1_ms": [
+     214.149,
+     216.126
+    ],
+    "r1_turn1_ms": [
+     208.345,
+     213.031
+    ],
+    "c55_turn1_ms": [
+     206.19,
+     205.973
+    ],
+    "r1_vs_c55_turn2plus": "overlapping or faster"
+   },
+   "3840x2160_png_1img": {
+    "base_turn2plus_ms": [
+     178.196,
+     178.488
+    ],
+    "r1_turn2plus_ms": [
+     10.15,
+     10.332
+    ],
+    "c55_turn2plus_ms": [
+     11.298,
+     10.413
+    ],
+    "speedup_r1_vs_base": 17.41,
+    "faster_beyond_interval": true,
+    "payload_bytes_turn2plus": "9914397 -> 6795",
+    "base_turn1_ms": [
+     177.488,
+     179.05
+    ],
+    "r1_turn1_ms": [
+     169.392,
+     170.637
+    ],
+    "c55_turn1_ms": [
+     161.067,
+     163.931
+    ],
+    "r1_vs_c55_turn2plus": "overlapping or faster"
+   },
+   "3840x2160_png_4img": {
+    "base_turn2plus_ms": [
+     705.778,
+     721.521
+    ],
+    "r1_turn2plus_ms": [
+     41.506,
+     40.276
+    ],
+    "c55_turn2plus_ms": [
+     51.096,
+     40.863
+    ],
+    "speedup_r1_vs_base": 17.45,
+    "faster_beyond_interval": true,
+    "payload_bytes_turn2plus": "39655611 -> 24987",
+    "base_turn1_ms": [
+     708.205,
+     721.722
+    ],
+    "r1_turn1_ms": [
+     661.575,
+     665.957
+    ],
+    "c55_turn1_ms": [
+     683.185,
+     661.977
+    ],
+    "r1_vs_c55_turn2plus": "overlapping or faster"
+   },
+   "4032x3024_jpeg_1img": {
+    "base_turn2plus_ms": [
+     121.557,
+     121.607
+    ],
+    "r1_turn2plus_ms": [
+     7.546,
+     8.011
+    ],
+    "c55_turn2plus_ms": [
+     5.444,
+     5.301
+    ],
+    "speedup_r1_vs_base": 15.63,
+    "faster_beyond_interval": true,
+    "payload_bytes_turn2plus": "10302939 -> 6993",
+    "base_turn1_ms": [
+     121.827,
+     121.225
+    ],
+    "r1_turn1_ms": [
+     149.357,
+     137.27
+    ],
+    "c55_turn1_ms": [
+     118.26,
+     136.548
+    ],
+    "r1_vs_c55_turn2plus": "slower beyond the interval"
+   },
+   "4032x3024_jpeg_4img": {
+    "base_turn2plus_ms": [
+     488.571,
+     481.219
+    ],
+    "r1_turn2plus_ms": [
+     21.114,
+     20.617
+    ],
+    "c55_turn2plus_ms": [
+     19.438,
+     19.308
+    ],
+    "speedup_r1_vs_base": 23.24,
+    "faster_beyond_interval": true,
+    "payload_bytes_turn2plus": "41209779 -> 25779",
+    "base_turn1_ms": [
+     483.967,
+     482.243
+    ],
+    "r1_turn1_ms": [
+     497.409,
+     495.601
+    ],
+    "c55_turn1_ms": [
+     502.779,
+     495.33
+    ],
+    "r1_vs_c55_turn2plus": "slower beyond the interval"
+   }
+  },
+  "identity": "prompt token ids, placeholder ranges and mm hashes identical to candidate-54's on 5 workloads x 3 turns (raw/own-mark/identity-*.json)",
+  "turn1_note": "the bench's cold turn 1 is slower than candidate-54's for small JPEGs on both #978 arms (1302x1302 x1: 15.2-17.3 -> 20.9-23.8 ms; x4: 70-72 -> 76-94 ms), and faster for large PNGs; the PR's README reported only turn 2+",
+  "r1_vs_c55": "r1 and c55 differ on this path only in _prepare_mm_features_for_prefix_cache. 3 of 8 cells show r1 slower beyond the two-boot interval (1302x1302_jpeg_4img, 4032x3024_jpeg_1img, 4032x3024_jpeg_4img), but the difference is in the load and processor stages, whose code is byte-identical between the arms. The function that did change, timed alone (300 calls, arms interleaved c55 r1 r1 c55, CPU only), costs the same on both: warm (stripped) 35-51 us on c55 against 35-44 us on r1, cold (marking) 65-71 us against 64-69 us. Session noise, not the rework (raw/own-mark/microbench/).",
+  "microbench_medians_us": {
+   "prep-c55-1": {
+    "1img_warm": {
+     "median_us": 43.58,
+     "p10_us": 25.41,
+     "mean_us": 47.16
+    },
+    "1img_cold": {
+     "median_us": 69.27,
+     "p10_us": 55.76,
+     "mean_us": 101.59
+    },
+    "4img_warm": {
+     "median_us": 50.8,
+     "p10_us": 32.67,
+     "mean_us": 57.21
+    },
+    "4img_cold": {
+     "median_us": 70.63,
+     "p10_us": 61.34,
+     "mean_us": 95.23
+    }
+   },
+   "prep-c55-2": {
+    "1img_warm": {
+     "median_us": 35.82,
+     "p10_us": 18.27,
+     "mean_us": 37.56
+    },
+    "1img_cold": {
+     "median_us": 65.16,
+     "p10_us": 59.1,
+     "mean_us": 65.93
+    },
+    "4img_warm": {
+     "median_us": 44.0,
+     "p10_us": 25.18,
+     "mean_us": 46.42
+    },
+    "4img_cold": {
+     "median_us": 67.07,
+     "p10_us": 61.38,
+     "mean_us": 68.05
+    }
+   },
+   "prep-r1-1": {
+    "1img_warm": {
+     "median_us": 35.43,
+     "p10_us": 19.2,
+     "mean_us": 36.74
+    },
+    "1img_cold": {
+     "median_us": 63.73,
+     "p10_us": 57.15,
+     "mean_us": 64.89
+    },
+    "4img_warm": {
+     "median_us": 43.08,
+     "p10_us": 32.43,
+     "mean_us": 46.94
+    },
+    "4img_cold": {
+     "median_us": 69.14,
+     "p10_us": 62.62,
+     "mean_us": 70.36
+    }
+   },
+   "prep-r1-2": {
+    "1img_warm": {
+     "median_us": 38.34,
+     "p10_us": 17.87,
+     "mean_us": 40.21
+    },
+    "1img_cold": {
+     "median_us": 66.61,
+     "p10_us": 58.4,
+     "mean_us": 68.26
+    },
+    "4img_warm": {
+     "median_us": 43.79,
+     "p10_us": 24.38,
+     "mean_us": 45.94
+    },
+    "4img_cold": {
+     "median_us": 69.19,
+     "p10_us": 62.08,
+     "mean_us": 71.64
+    }
+   }
+  }
+ },
+ "serving_path_mark": {
+  "what": "the same idea measured where the API server runs it: scripts/serving_path_bench.py builds a real AsyncLLM frontend (recipe flags, real renderer and DS4.1 processor), loads base64 images with ImageMediaIO.load_base64 as the chat parser does, and times load -> request msgpack-encoded for the engine; 3 conversations x 5 turns per workload; base (candidate-54) vs r1, order base r1 r1 base, one hold 07:01-07:05Z",
+  "result": "missed: no item is ever stripped (turn 2+ payload stays 10-41 MB); JPEG slower beyond the interval, PNG 5-7% faster; prompt token ids and mm hashes identical",
+  "workloads": {
+   "1302x1302_jpeg_1img": {
+    "base_turn2plus_ms": [
+     19.771,
+     23.342
+    ],
+    "r1_turn2plus_ms": [
+     32.48,
+     35.028
+    ],
+    "turn2plus": "x1.566 (slower beyond the interval)",
+    "base_turn1_ms": [
+     23.316,
+     30.622
+    ],
+    "r1_turn1_ms": [
+     39.037,
+     42.571
+    ],
+    "turn1": "x1.513 (slower beyond the interval)",
+    "turn2plus_payload_bytes": 10185900,
+    "stripped_items": [
+     0,
+     0
+    ],
+    "prompt_token_ids_and_mm_hashes_equal_base": true
+   },
+   "1302x1302_jpeg_4img": {
+    "base_turn2plus_ms": [
+     74.298,
+     74.183
+    ],
+    "r1_turn2plus_ms": [
+     98.283,
+     102.558
+    ],
+    "turn2plus": "x1.353 (slower beyond the interval)",
+    "base_turn1_ms": [
+     82.951,
+     83.391
+    ],
+    "r1_turn1_ms": [
+     105.448,
+     106.992
+    ],
+    "turn1": "x1.277 (slower beyond the interval)",
+    "turn2plus_payload_bytes": 40743119,
+    "stripped_items": [
+     0,
+     0
+    ],
+    "prompt_token_ids_and_mm_hashes_equal_base": true
+   },
+   "1920x1080_png_1img": {
+    "base_turn2plus_ms": [
+     57.987,
+     58.994
+    ],
+    "r1_turn2plus_ms": [
+     56.53,
+     55.112
+    ],
+    "turn2plus": "x0.954 (faster beyond the interval)",
+    "base_turn1_ms": [
+     58.867,
+     59.861
+    ],
+    "r1_turn1_ms": [
+     60.084,
+     57.548
+    ],
+    "turn1": "x0.991 (within the interval)",
+    "turn2plus_payload_bytes": 9913882,
+    "stripped_items": [
+     0,
+     0
+    ],
+    "prompt_token_ids_and_mm_hashes_equal_base": true
+   },
+   "3840x2160_png_1img": {
+    "base_turn2plus_ms": [
+     181.081,
+     182.844
+    ],
+    "r1_turn2plus_ms": [
+     184.04,
+     159.159
+    ],
+    "turn2plus": "x0.943 (within the interval)",
+    "base_turn1_ms": [
+     180.346,
+     183.24
+    ],
+    "r1_turn1_ms": [
+     173.35,
+     160.737
+    ],
+    "turn1": "x0.919 (faster beyond the interval)",
+    "turn2plus_payload_bytes": 9913882,
+    "stripped_items": [
+     0,
+     0
+    ],
+    "prompt_token_ids_and_mm_hashes_equal_base": true
+   },
+   "3840x2160_png_4img": {
+    "base_turn2plus_ms": [
+     720.525,
+     719.966
+    ],
+    "r1_turn2plus_ms": [
+     665.288,
+     671.729
+    ],
+    "turn2plus": "x0.928 (faster beyond the interval)",
+    "base_turn1_ms": [
+     722.679,
+     721.712
+    ],
+    "r1_turn1_ms": [
+     647.586,
+     634.796
+    ],
+    "turn1": "x0.888 (faster beyond the interval)",
+    "turn2plus_payload_bytes": 39655039,
+    "stripped_items": [
+     0,
+     0
+    ],
+    "prompt_token_ids_and_mm_hashes_equal_base": true
+   },
+   "4032x3024_jpeg_4img": {
+    "base_turn2plus_ms": [
+     501.158,
+     510.396
+    ],
+    "r1_turn2plus_ms": [
+     520.16,
+     528.358
+    ],
+    "turn2plus": "x1.037 (slower beyond the interval)",
+    "base_turn1_ms": [
+     510.164,
+     507.012
+    ],
+    "r1_turn1_ms": [
+     485.944,
+     499.479
+    ],
+    "turn1": "x0.969 (faster beyond the interval)",
+    "turn2plus_payload_bytes": 41209207,
+    "stripped_items": [
+     0,
+     0
+    ],
+    "prompt_token_ids_and_mm_hashes_equal_base": true
+   }
+  },
+  "stage_split_cpu_only": "diagnostic, CPU only (no vllm._C), the server's processor context, arms interleaved: with the header cache, load_base64 returns a _LazyPILImage on repeat bytes (1302 JPEG load 8.4 -> 0.8 ms), and the decode moves into apply(), which grows by about the same (8-12 -> 16-20 ms); 4032x3024 JPEG and 1920x1080 PNG totals are 10-20% lower. This does not reproduce the GPU-container frontend's JPEG slowdown, so its cause is not isolated (raw/serving-stage-split/)",
+  "attribution": "the media, hasher and processor code on this path is byte-identical between candidate-55 and r1; construct-c55-callable shows candidate-55 behaves the same (nothing stripped). This is #978's behaviour, not the rework's"
+ },
+ "residual_risks_not_fixed": [
+  "The fast path is dormant in serving (above). Enabling it means telling the processor that prefix caching is on: the renderer knows (config.cache_config), and InputProcessingContext does not carry it. Doing that would put stripped requests into serving for the first time.",
+  "If stripped items were ever sent: the engine accepts a stripped item that is only covered by the prefix cache, without a pin. If those blocks are evicted before the request is scheduled, or the request is preempted and its encoder entry is evicted, the scheduler can only borrow the data from another live request. Otherwise it schedules the encoder with data None, and the worker raises 'Encoder cache miss' (gpu/mm/encoder_runner.py), stopping the engine. A schedule-time retryable miss is needed before this path can serve.",
+  "n>1 with stripped items: sampled children share mm_features (shallow copy). Only the first child keeps a retry materializer, so a P1 miss on a later child finishes it with an error.",
+  "_p1_cached_mm_identifiers is unbounded (one entry per distinct image until a reset).",
+  "A cache-miss retry materializes inline in the output handler, which stalls all requests' outputs for that time.",
+  "A cancelled materialization keeps running on the single-worker MM executor until its batch ends.",
+  "getattr(self.scheduler, 'ced_Prompt_replay_tokens', 0) names no attribute, so it is dead code; get_computed_blocks already caps the hit at the replay boundary."
+ ],
+ "second_rework_scope": "Only if the owner sees promise: (1) the renderer tells the processor that prefix caching is on; (2) a schedule-time retryable miss (or a pin) for stripped items whose coverage is lost; (3) find the frontend JPEG slowdown (header cache and _LazyPILImage path); (4) judge on serving_path_bench.py against candidate-54, ABBA, plus check_978_image_chat.py at tp4-ring.",
+ "not_verified": [
+  "a TP4 boot with the overlay (one GB10 cannot load the model; the coordinator's tp4-978r1.json)",
+  "check_978_image_chat.py at tp4-ring",
+  "the streaming-input path (_add_streaming_input_request) with images"
+ ],
+ "notes": [
+  "No pushes, PRs, image builds, or cluster or window operations. The only commits are in the disposable vLLM clone in the sp8 work dir, made so that format-patch could be used.",
+  "Development runs (raw/dev/) were CPU-only, outside the GPU lock. So were the _prepare microbench and the stage split, since they use no GPU. Every recorded test run, the bench sessions and the construction checks ran under the lock with --gpus all.",
+  "The hold queue: candidate-56's and candidate-57's release tests held the lock 04:30-06:04Z and 06:12-07:01Z."
+ ],
+ "files": {
+  "patch": "0793-perf-multimodal-prefix-cache-fastpath-under-mm-proce.patch",
+  "overlay": "overlay/",
+  "commands": "commands.txt",
+  "scripts": "scripts/",
+  "raw": {
+   "candidate-55-release-tests": "the dgx4 output and the dgx1 verdicts",
+   "candidate-55-boot": "the NameError in all three boots (dgx1 failed-starts)",
+   "static": "unbound-name checks; Callable/Any imports on 1107, candidate-54, 0793 and r1; InputProcessingContext fields; the processor's fast-path condition",
+   "tests": "gate, #978's pytest, dirs (c54, c55, r1)",
+   "construct": "the real AsyncLLM construction (c55, c55-callable, r1)",
+   "own-mark": "bench JSON and logs, identity, summary, microbench",
+   "own-mark-serving": "the serving-path bench and its summary",
+   "serving-stage-split": "the CPU-only stage split",
+   "apply-check.txt": "apply and pair checks",
+   "interdiff-0793-to-0793-r1.diff": "what round 1 changed",
+   "image": "the candidate-54 image copy"
+  }
+ }
+}

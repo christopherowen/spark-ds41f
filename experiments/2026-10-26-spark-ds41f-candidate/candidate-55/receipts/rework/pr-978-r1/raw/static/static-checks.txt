@@ -1,0 +1,52 @@
+== arm-c55: check_runtime_annotations
+./vllm/v1/engine/async_llm.py:890: _retry_mm_cache_miss: 'Callable' is evaluated at runtime but never bound
+23 files, 1 unbound runtime annotation names
+== arm-c55: check_unbound_loads
+./vllm/v1/engine/async_llm.py:540: 'Callable' is loaded but never bound
+./vllm/v1/engine/async_llm.py:890: 'Callable' is loaded but never bound
+./vllm/v1/engine/async_llm.py:199: 'Callable' is loaded but never bound
+23 files, 3 unbound loads
+== arm-c54-same: check_runtime_annotations
+20 files, 0 unbound runtime annotation names
+== arm-c54-same: check_unbound_loads
+20 files, 0 unbound loads
+== arm-r1: check_runtime_annotations
+24 files, 0 unbound runtime annotation names
+== arm-r1: check_unbound_loads
+24 files, 0 unbound loads
+== Callable/Any imports in vllm/v1/engine/async_llm.py
+1107 (320021e3, #978s base), from the spark-ds41f:1107 image:
+8:from collections.abc import AsyncGenerator, Iterable, Mapping
+10:from typing import Any
+4e8133ff1:
+8:from collections.abc import AsyncGenerator, Iterable, Mapping
+10:from typing import Any
+3feb241ea:
+8:from collections.abc import AsyncGenerator, Iterable, Mapping
+10:from typing import Any
+r1:
+8:from collections.abc import AsyncGenerator, Callable, Iterable, Mapping
+10:from typing import Any
+== InputProcessingContext fields (r1)
+    model_config: ModelConfig
+    tokenizer: TokenizerLike | None
+== processor fast-path condition (r1)
+1585:        if cache is None:
+1586-            vllm_config = getattr(self.info.ctx, "vllm_config", None)
+1587-            cache_config = getattr(vllm_config, "cache_config", None)
+1588-            if getattr(cache_config, "enable_prefix_caching", False):
+1589-                return self._apply_hf_processor_with_prefix_metadata_cache(
+1590-                    inputs, timing_ctx
+1591-                )
+1592-            return self._apply_hf_processor(inputs, timing_ctx)
+1593-
+== #978's own patch (PR head 67792978, experiments/2026-11-08-multimodal-prefix-cache-fastpath/vllm/0762-...patch, sha256 f5b3787945852ead8b53d0d1e104c22a8d999861f56ab337d7c14efad3b6a920): async_llm.py hunks and any import lines
+4:@@ -193,6 +193,10 @@ class AsyncLLM(EngineClient):
+15:@@ -525,6 +529,53 @@ class AsyncLLM(EngineClient):
+69:@@ -541,6 +592,13 @@ class AsyncLLM(EngineClient):
+83:@@ -822,8 +880,45 @@ class AsyncLLM(EngineClient):
+129:@@ -842,6 +937,26 @@ class AsyncLLM(EngineClient):
+156:@@ -896,6 +1011,8 @@ class AsyncLLM(EngineClient):
+165:@@ -1099,12 +1216,14 @@ class AsyncLLM(EngineClient):
+180:@@ -1116,10 +1235,12 @@ class AsyncLLM(EngineClient):
+(no import hunk: the PR never imported Callable)

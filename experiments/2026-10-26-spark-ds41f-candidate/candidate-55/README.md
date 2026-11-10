@@ -214,3 +214,27 @@ later candidates. The round's selection receipts are here, in [receipts](receipt
 Built on dgx4 (`spark-ds41f:candidate-55`, image ID `41d961dc`). **It does not boot**, and its release tests fail
 (13 tests); both come from #978 (0793), which is in rework ([receipts/tp4-ring](receipts/tp4-ring/README.md)).
 #1008 and #988's dead-row part wait for a boot with #978's corrected files.
+
+## #978 round 1, and candidate-55 without #978
+
+**#978's round 1** ([receipts/rework/pr-978-r1](receipts/rework/pr-978-r1/result.json)) fixes the three defects in 0793:
+- the boot failure: `Callable` was never imported in `async_llm.py` (not a rebase loss; the PR's base lacks it too);
+- the 13 release-test failures: text-only requests read multimodal state (`renderer.mm_processor_cache`,
+  `_pending_mm_retries`); the fast path is now decided once and text-only requests never reach it;
+- a latent engine crash: `get_computed_blocks` returns three values, and the stripped-item check unpacked two.
+The two release-gate files pass (62), #978's tests pass on two boots, and the wider engine and serve tests fail only
+where candidate-54's fail (environmental).
+
+**It misses its mark on the serving path.** The PR's bench meets it (7.5-23x on all 8 workloads), but only because the
+bench builds a processing context that carries `vllm_config`. The server's context does not, so the metadata cache
+never engages: items are never lazy and the full image payload crosses IPC every turn. Through a real `AsyncLLM`
+frontend against candidate-54, 1302x1302 JPEG requests are 57% slower with one image and 35% with four, and PNG 5-7%
+faster; the original #978 behaves the same. #978 goes to its second and last rework: wire the setting through to the
+server's processor, add a schedule-time retryable miss for stripped items, find the JPEG slowdown, and measure on the
+serving path with `check_978_image_chat.py`.
+
+**candidate-55 without #978.** So #1008 and #988's dead-row part are measured now, on the candidate-55 image with
+0793 reverted: [no978/overlay](no978/overlay) holds the 8 non-test files 0793 changes, at their reverted versions (tree
+3f534a18), mounted by [tp4-no978.json](tp4-no978.json). Its gate, screen (with #1008's affinity check) and
+single-stream run as [candidate-tp4-no978.json](candidate-tp4-no978.json),
+[screen-tp4-no978.json](screen-tp4-no978.json) and [single-stream-tp4-no978.json](single-stream-tp4-no978.json).

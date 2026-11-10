@@ -1,0 +1,106 @@
+# #978 round 1 (candidate-55 rework of 0793). Commands as run, 2026-11-10.
+# Work dir on sp8: ~/spark-lab/agents/candidate-55-rework-978 (WD below). Scripts are in scripts/.
+# No pushes, PRs, image builds, cluster or window operations. The only commits are in WD's
+# disposable vLLM clone (needed for git format-patch).
+
+## Evidence of the miss (read only)
+ssh dgx4 cat ~/spark-lab/results/candidate-55-image/release-tests-dgx4/output.txt     # raw/candidate-55-release-tests/
+scp dgx1:projects/spark-ds41f/results/private/lab/candidate-55-image/verdicts.json .  # raw/candidate-55-release-tests/dgx1-verdicts.json
+# candidate-55's three tp4-ring boots (gate, screen, single-stream) on dgx1:
+ssh dgx1 'sed -n 1034,1078p ~/projects/spark-ds41f/results/private/failed-starts/20261110T040446Z-spark-ds41f/dgx1.log'
+ssh dgx1 'grep -c "NameError: name .Callable. is not defined" ~/projects/spark-ds41f/results/private/failed-starts/20261110T04*-spark-ds41f/dgx1.log'
+#   -> raw/candidate-55-boot/boot-failure-excerpt.txt
+
+## Image (sp8 had no candidate-54; checked no copy was in flight first)
+ssh sp8 'docker images -q spark-ds41f:candidate-54; ps aux | grep -E "docker (load|save)"'   # empty, none
+ssh sp5 'docker save spark-ds41f:candidate-54 | ssh sp8 docker load'                       # 04:07:22Z..04:10:12Z
+ssh sp8 docker image inspect spark-ds41f:candidate-54 --format '{{.Id}}'
+#   sha256:e1de71bed3b41dff3a969c19adc09072c0ab1c947f34afe7117cb8b6389e23ea (= sp5's)
+#   labels: vllm patch-head 4e8133ff, tree 5f021d9a (candidate-54); PYTHONPATH=/opt/spark-ds41f/candidate/vllm
+
+## Source: candidate-55's stack, reproduced
+cd WD && git clone --no-checkout ~/spark-lab/agents/candidates-55-57/stack-vllm vllm
+git -C vllm checkout -b c55 origin/candidate-55       # 410463b3c, tree e39b835c (the lock's patch_head/expected_tree)
+git -C vllm config user.name "Christopher Owen"; git -C vllm config user.email 3221756+christopherowen@users.noreply.github.com
+git -C vllm checkout -b r1 7e36cafc1                   # 0792
+GIT_COMMITTER_DATE="Sun Nov 8 14:53:04 2026 +0000" git -C vllm cherry-pick 3feb241ea   # reproduces 0793's commit 3feb241ea exactly
+# edits (laptop, small files): vllm/v1/engine/async_llm.py, vllm/v1/engine/core.py,
+#   tests/v1/engine/test_request_submission_cleanup.py, tests/multimodal/test_prefix_cache_fastpath.py
+GIT_COMMITTER_DATE="Sun Nov 8 14:53:04 2026 +0000" git -C vllm commit --amend -F msg   # author/date kept: Sun, 8 Nov 2026 14:53:04 +0000
+GIT_COMMITTER_DATE="Sun Nov 8 15:56:25 2026 +0000" git -C vllm cherry-pick 410463b3c   # 0794 on top
+git -C vllm diff --check 4e8133ff1 r1                  # clean
+git -C vllm format-patch --start-number 793 -1 <0793-r1 commit> -o WD/patch
+
+## Static check for the boot failure class (names evaluated at runtime but never bound)
+(cd arm-c55 && python3 ../scripts/check_runtime_annotations.py $(find . -name '*.py'))   # async_llm.py:890 Callable
+(cd arm-c55 && python3 ../scripts/check_unbound_loads.py $(find . -name '*.py'))          # Callable x3, nothing else
+(cd arm-c54-same && python3 ../scripts/check_unbound_loads.py $(find . -name '*.py'))     # 0 (candidate-54's same files)
+(cd arm-r1 && python3 ../scripts/check_*.py $(find . -name '*.py'))                        # 0 and 0
+
+## Arms (files mounted read-only over spark-ds41f:candidate-54's /opt/spark-ds41f/candidate/vllm)
+git -C vllm diff --name-only 4e8133ff1 410463b3c > c55-changed-files.txt     # 24 files; the 23 .py are mounted (not _reader.c)
+git -C vllm archive 410463b3c <.py files> | tar -x -C arm-c55
+git -C vllm diff --name-only 4e8133ff1 r1 > r1-changed-files.txt; git -C vllm archive r1 <.py files> | tar -x -C arm-r1   # 24 .py
+arm-c55-newtests = arm-c55 + r1's tests/v1/engine/test_request_submission_cleanup.py and tests/multimodal/test_prefix_cache_fastpath.py
+
+## Development runs (CPU only, no --gpus, outside the GPU lock; not the recorded results)
+scripts/run_tests.sh arm-r1dev dev-r1-cleanup -- tests/v1/engine/test_request_submission_cleanup.py tests/entrypoints/serve/utils/test_api_cancellation.py
+#   found the NameError: test_abort_during_mm_retry_materialize_does_not_resubmit failed in _run_output_handler
+scripts/run_tests.sh arm-r1dev dev3-r1 -- <gate files> tests/multimodal/test_prefix_cache_fastpath.py           # 67 passed
+scripts/run_tests.sh arm-c55-newtests dev3-c55-newtests -- tests/multimodal/test_prefix_cache_fastpath.py    # ValueError: too many values to unpack (expected 2)
+docker run --rm <arm-r1 mounts> -v WD/exp:/opt/exp ... spark-ds41f:candidate-54 /opt/exp/identity_978.py smoke ...  # smoke of the identity script
+
+## Recorded runs: scripts/final_tests.sh (nohup), each hold under flock /tmp/spark-lab-gpu.lock, after checking ~/spark-hold.json is absent
+# run_tests.sh: docker run --rm --gpus all --ipc=host --shm-size=8g, HF_HUB_OFFLINE=1, DS41F_SNAPSHOT=<DS4.1 snapshot>,
+#   the release bundle's plugins (-p tblib_stub -p offline_skip -p deepseek_models, PYTHONPATH=/b), ~/.cache/huggingface/hub at /hub:ro,
+#   python3 -m pytest -q -rfEs -p no:cacheprovider -o faulthandler_timeout=300 ...; output raw/<label>.txt with each mounted file's sha256
+# Hold 1:
+scripts/run_tests.sh arm-c55 gate-c55 --gpu -- tests/v1/engine/test_request_submission_cleanup.py tests/entrypoints/serve/utils/test_api_cancellation.py
+scripts/run_tests.sh arm-r1 gate-r1 --gpu -- <same>
+scripts/run_tests.sh arm-c55-newtests gate-c55-newtests --gpu -- <same>
+scripts/run_tests.sh arm-c55 pr978-c55 --gpu -- -k 'not (test_ipc_enable_disable_consistency or test_cache_eviction_lru_cache or test_cache_eviction_shm_cache or test_processor_cache_shared_across_loras or test_sleep_wake_preserves_mm_cache_consistency)' tests/multimodal/test_prefix_cache_fastpath.py tests/multimodal/test_hasher.py tests/multimodal/media/test_image.py tests/multimodal/test_cache.py tests/models/test_deepseek_v4_1_image_span.py
+scripts/run_tests.sh arm-r1 pr978-r1-boot1 --gpu -- <same>
+scripts/run_tests.sh arm-r1 pr978-r1-boot2 --gpu -- <same>
+scripts/run_tests.sh arm-c55-newtests pr978-c55-newtests --gpu -- <same>
+scripts/own_mark.sh    # bench_mm_prefix_fastpath.py at 67792978 (sha256 c948e8e1...), order base r1 c55 c55 r1 base,
+                       # docker run --rm --gpus all --ipc=host <arm mounts> -v WD/exp:/opt/exp spark-ds41f:candidate-54
+                       #   python3 /opt/exp/bench_mm_prefix_fastpath.py <arm> /opt/exp/receipts/bench-<arm>-boot<k>.json
+                       # then identity_978.py on base and r1
+# Holds 2 and 3:
+timeout 3600 scripts/run_tests.sh arm-c55 dirs-c55 --gpu -- tests/v1/engine tests/entrypoints/serve/utils
+timeout 3600 scripts/run_tests.sh arm-r1 dirs-r1 --gpu -- tests/v1/engine tests/entrypoints/serve/utils
+
+## Apply checks (git only)
+scripts/apply_check.sh    # raw/apply-check.txt
+
+## Actual run order of the recorded holds (all under flock /tmp/spark-lab-gpu.lock unless marked)
+# 04:36 first queue attempt (scripts not executable, then killed and relaunched as one hold): raw/final-tests-attempt1.log
+# 06:04-06:11 hold 1: gate-*, pr978-*, own_mark.sh            -> raw/tests/, raw/own-mark/
+# 06:11-06:12 construct hold: run_construct.sh arm-c55 / arm-r1 -> raw/construct/
+#   (the chain's first dirs runs, 07:01 and 07:05, stopped at collection errors: raw/tests/dirs/dirs-*-attempt1.txt)
+# 07:01-07:05 own_mark_serving.sh (base r1 r1 base)           -> raw/own-mark-serving/
+# 07:05 construct2 hold: run_construct.sh arm-c55-callable     -> raw/construct/construct-c55-callable.*
+#   arm-c55-callable = arm-c55 with only "Callable" added to async_llm.py's collections.abc import
+# 07:09-07:14 dirs2 hold: run_tests.sh arm-c55|arm-r1 dirs-<arm> --gpu -- --continue-on-collection-errors tests/v1/engine tests/entrypoints/serve/utils
+# 07:17-07:19 run_tests.sh arm-none dirs-c54 --gpu -- --continue-on-collection-errors tests/v1/engine tests/entrypoints/serve/utils   (candidate-54 as built)
+
+## Real AsyncLLM frontend construction (scripts/construct_async_llm.py via scripts/run_construct.sh)
+scripts/run_construct.sh arm-c55 construct-c55 --gpu            # NameError: name 'Callable' is not defined in AsyncLLM.__init__
+scripts/run_construct.sh arm-r1 construct-r1 --gpu              # constructs; text + two-turn image chat served
+scripts/run_construct.sh arm-c55-callable construct-c55-callable --gpu
+scripts/run_construct.sh arm-r1 dev-construct-r1-cpu            # (dev, no GPU) platform needs a device: "Device string must not be empty"
+
+## Serving-path mark and diagnostics
+scripts/own_mark_serving.sh      # exp/serving_path_bench.py, base r1 r1 base; analysis: scripts/analyze_serving.py raw/own-mark-serving raw/own-mark-serving/serving-summary.json
+# CPU only, no --gpus, outside the GPU lock (no GPU use; arms interleaved):
+docker run --rm <arm mounts> -v WD/exp:/opt/exp ... spark-ds41f:candidate-54 /opt/exp/prepare_microbench.py prep-<arm>-<k> ... 300   # order c55 r1 r1 c55 -> raw/own-mark/microbench/
+docker run --rm <arm mounts> -v WD/exp:/opt/exp ... spark-ds41f:candidate-54 /opt/exp/serving_stage_split.py split-<arm>-<k> ...     # order base r1 r1 base -> raw/serving-stage-split/
+python3 scripts/analyze_bench.py exp/receipts exp/receipts/own-mark-summary.json    # -> raw/own-mark/own-mark-summary.json
+
+## Final patch
+GIT_COMMITTER_DATE="Sun Nov 8 14:53:04 2026 +0000" git -C vllm commit --amend -F msg-r1-final.txt   # 0793-r1 commit c628316b, tree c5718486
+GIT_COMMITTER_DATE="Sun Nov 8 15:56:25 2026 +0000" git -C vllm cherry-pick 410463b3c                # 0794 -> 6444081a, tree 25787be1
+git -C vllm format-patch --start-number 793 -1 c628316b -o patch     # sha256 0f60c31a...
+scripts/apply_check.sh > raw/apply-check.txt
+git -C vllm diff 3feb241ea c628316be > raw/interdiff-0793-to-0793-r1.diff
+git -C vllm archive r1 $(git -C vllm diff --name-only 410463b3c r1) | tar -x -C overlay

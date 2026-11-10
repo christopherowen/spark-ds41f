@@ -1,0 +1,2591 @@
+# label=dev2-c55-newtests image=spark-ds41f:candidate-54 (sha256:e1de71bed3b41dff3a969c19adc09072c0ab1c947f34afe7117cb8b6389e23ea) arm=/home/chris/spark-lab/agents/candidate-55-rework-978/arm-c55-newtests gpu=none
+# mounted: 24 files; sha256 of each:
+#   9bca90ca8aa2a1c939b25eff42e087bff096b25ded510bb0622aa8cd114923da  ./tests/multimodal/test_prefix_cache_fastpath.py
+#   3e582236d3e83b6760b643aab35bf51238d5fffa721242d4b4df949754d19fd9  ./tests/v1/engine/test_request_submission_cleanup.py
+#   9153b93e62b4724041c4b44dc8a417e521ae83ad1a1b52d9b5bd16bf1a9ba975  ./tests/v1/worker/test_dead_rows.py
+#   f4caee411cfcd534a7e788fe1a6bbd3bec2233c473ec3a9aa5dd6ad2707a50e7  ./tests/v1/worker/test_roce_cpu_affinity.py
+#   28c26a60e860e7ac2ba181986fb70a94b76cb5ad89f0b57a06351f2e62929c9e  ./vllm/entrypoints/cli/serve.py
+#   b3c312259b478f0519764eee88bc60f78c353554a9867432e4f1b8fb2b123119  ./vllm/entrypoints/launchers/api_server/entry.py
+#   f0755c58209f1941bdbad7771e5b3debbc75dc3612229889d9142e5adf5edd25  ./vllm/multimodal/hasher.py
+#   84692be153dd1c086ea1b1f60e105752b53a1768eb332f4bc7130364b1c0e89b  ./vllm/multimodal/inputs.py
+#   13a3d54c6ce268482bc94bbdb5a564f4977fd4a7a5ce842826b60014faace284  ./vllm/multimodal/media/image.py
+#   6d506bf53b83f248ae3dea5523cbcab27e3fc0b9a3c32ceed2cf720e3b14cd73  ./vllm/multimodal/processing/processor.py
+#   2974e0a72bc65733db461883660ab92ee179f5ee713e9e873d469238e5b54404  ./vllm/renderers/base.py
+#   b179933c7ebc7e3975ce365ec0f0da87f7afe18e455e65f73e68e22ac4789444  ./vllm/utils/cpu_affinity.py
+#   e248d713b76c28dabc829285219f9b940523d456390d90283c238bf0e294a717  ./vllm/v1/core/sched/scheduler.py
+#   ebc51608e1c5862c3fb49710fb4961965fc57d52d83e7b0a035557474eee4bdf  ./vllm/v1/engine/async_llm.py
+#   bcf8d8fa7ef2eea5aaddd4d534161ebe2d6b10e9ce6d49aea291423349ffba19  ./vllm/v1/engine/core.py
+#   3f22a100e312abc0a6c8e8b6b31790393591ca0032b064908571b50d265743b9  ./vllm/v1/worker/gpu/sample/sampler.py
+#   55e69117cfbeb3849f2f453d15c74e87fb70c6783e1188e5a443b75b9b68f300  ./vllm/v1/worker/gpu/sample/tilelang_auxiliary.py
+#   5e983a0501b18d9a1a3aa0685cf2526d3ac45f6167c4b7235cc9692b5574ceb0  ./vllm/v1/worker/gpu/sample/tilelang_bias.py
+#   e6a08abc744059a3eaa992608394481714d3e605d5a827fbace91153d5c50795  ./vllm/v1/worker/gpu/sample/tilelang_controls.py
+#   656b801012eb4d95ce238696658bdc0c586652758288b739cd0841e4d31bce46  ./vllm/v1/worker/gpu/sample/tilelang_sampling.py
+#   fed581af45edbf4f7cad44d8849a078a0f25bff123c1ebcbbc98ffefe986d2a2  ./vllm/v1/worker/gpu/sample/tilelang_thinking.py
+#   e1e3764733a2c52df85a63930eaaeecc79dae59292d659a0f1f9201d59ed81fe  ./vllm/v1/worker/gpu/spec_decode/rejection_sampler.py
+#   981212a2284d192901f453c76967bb845413e290ceaaabdf4855e9da8d5147ee  ./vllm/v1/worker/gpu/tilelang_inputs.py
+#   53dcb35aca21fee6a6f2b585d98349ac1b945ee024853e6ffa1068639c479e59  ./vllm/v1/worker/gpu_worker.py
+# started 2026-11-10T04:27:20Z
+FFFFFFFFFFFFFFFFFFFFF                                                    [100%]
+=================================== FAILURES ===================================
+__________ test_failed_submission_rolls_back_registered_prompt[False] __________
+
+abort_error = False
+
+    @pytest.mark.parametrize("abort_error", [False, True])
+    def test_failed_submission_rolls_back_registered_prompt(abort_error):
+        async def run():
+            llm = make_llm()
+            llm.engine_core.fail_at = 1
+            llm.engine_core.abort_error = abort_error
+            request = make_request()
+            with pytest.raises(RuntimeError, match="^submission failed$"):
+                await llm.add_request(request.request_id, request, request.sampling_params)
+            assert_empty(llm)
+            assert llm.engine_core.aborted == llm.engine_core.submitted
+    
+>       asyncio.run(run())
+
+tests/v1/engine/test_request_submission_cleanup.py:123: 
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
+/usr/lib/python3.12/asyncio/runners.py:194: in run
+    return runner.run(main)
+           ^^^^^^^^^^^^^^^^
+/usr/lib/python3.12/asyncio/runners.py:118: in run
+    return self._loop.run_until_complete(task)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+/usr/lib/python3.12/asyncio/base_events.py:687: in run_until_complete
+    return future.result()
+           ^^^^^^^^^^^^^^^
+tests/v1/engine/test_request_submission_cleanup.py:119: in run
+    await llm.add_request(request.request_id, request, request.sampling_params)
+vllm/v1/engine/async_llm.py:498: in add_request
+    await self._add_request(request, prompt_text, None, 0, queue)
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
+
+self = <vllm.v1.engine.async_llm.AsyncLLM object at 0xfea943552210>
+request = EngineCoreRequest(request_id='shared-external-id-internal-1', prompt_token_ids=[0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, ...nded=None, reasoning_parser_kwargs=None, abort_immediately=False, session_id=None, recurrent_instruction_boundary=None)
+prompt = None, parent_req = None, index = 0
+queue = <vllm.v1.engine.output_processor.RequestOutputCollector object at 0xfea9435528a0>
+
+    async def _add_request(
+        self,
+        request: EngineCoreRequest,
+        prompt: str | None,
+        parent_req: ParentRequest | None,
+        index: int,
+        queue: RequestOutputCollector,
+    ):
+        if parent_req is None and not self.output_processor.has_request(
+            request.request_id
+        ):
+            self.check_admission(request_id=request.request_id)
+    
+        # Register locally before the first await so concurrent tasks see this request.
+        self.output_processor.add_request(request, prompt, parent_req, index, queue)
+    
+        if (
+>           self.renderer.mm_processor_cache is None
+            ^^^^^^^^^^^^^
+            and self.vllm_config.cache_config.enable_prefix_caching
+            and request.mm_features
+        ):
+E       AttributeError: 'AsyncLLM' object has no attribute 'renderer'
+
+vllm/v1/engine/async_llm.py:597: AttributeError
+----------------------------- Captured stdout call -----------------------------
+WARNING 11-10 04:27:24 [async_llm.py:430] Passing EngineCoreRequest to AsyncLLM.generate() and .add_requests() is deprecated and will be removed in the future. You should instead pass the outputs of Renderer.render_cmpl() or Renderer.render_chat().
+ERROR 11-10 04:27:24 [async_llm.py:527] Failed to notify the engine about failed submission shared-external-id-internal-1
+ERROR 11-10 04:27:24 [async_llm.py:527] Traceback (most recent call last):
+ERROR 11-10 04:27:24 [async_llm.py:527]   File "/opt/spark-ds41f/candidate/vllm/vllm/v1/engine/async_llm.py", line 498, in add_request
+ERROR 11-10 04:27:24 [async_llm.py:527]     await self._add_request(request, prompt_text, None, 0, queue)
+ERROR 11-10 04:27:24 [async_llm.py:527]   File "/opt/spark-ds41f/candidate/vllm/vllm/v1/engine/async_llm.py", line 597, in _add_request
+ERROR 11-10 04:27:24 [async_llm.py:527]     self.renderer.mm_processor_cache is None
+ERROR 11-10 04:27:24 [async_llm.py:527]     ^^^^^^^^^^^^^
+ERROR 11-10 04:27:24 [async_llm.py:527] AttributeError: 'AsyncLLM' object has no attribute 'renderer'
+ERROR 11-10 04:27:24 [async_llm.py:527] 
+ERROR 11-10 04:27:24 [async_llm.py:527] During handling of the above exception, another exception occurred:
+ERROR 11-10 04:27:24 [async_llm.py:527] 
+ERROR 11-10 04:27:24 [async_llm.py:527] Traceback (most recent call last):
+ERROR 11-10 04:27:24 [async_llm.py:527]   File "/opt/spark-ds41f/candidate/vllm/vllm/v1/engine/async_llm.py", line 523, in add_request
+ERROR 11-10 04:27:24 [async_llm.py:527]     await self.abort(queue.request_id, internal=True)
+ERROR 11-10 04:27:24 [async_llm.py:527]   File "/opt/spark-ds41f/candidate/vllm/vllm/v1/engine/async_llm.py", line 1016, in abort
+ERROR 11-10 04:27:24 [async_llm.py:527]     self._pending_mm_retries.pop(req_id, None)
+ERROR 11-10 04:27:24 [async_llm.py:527]     ^^^^^^^^^^^^^^^^^^^^^^^^
+ERROR 11-10 04:27:24 [async_llm.py:527] AttributeError: 'AsyncLLM' object has no attribute '_pending_mm_retries'
+------------------------------ Captured log call -------------------------------
+WARNING  vllm.v1.engine.async_llm:async_llm.py:430 Passing EngineCoreRequest to AsyncLLM.generate() and .add_requests() is deprecated and will be removed in the future. You should instead pass the outputs of Renderer.render_cmpl() or Renderer.render_chat().
+ERROR    vllm.v1.engine.async_llm:async_llm.py:527 Failed to notify the engine about failed submission shared-external-id-internal-1
+Traceback (most recent call last):
+  File "/opt/spark-ds41f/candidate/vllm/vllm/v1/engine/async_llm.py", line 498, in add_request
+    await self._add_request(request, prompt_text, None, 0, queue)
+  File "/opt/spark-ds41f/candidate/vllm/vllm/v1/engine/async_llm.py", line 597, in _add_request
+    self.renderer.mm_processor_cache is None
+    ^^^^^^^^^^^^^
+AttributeError: 'AsyncLLM' object has no attribute 'renderer'
+
+During handling of the above exception, another exception occurred:
+
+Traceback (most recent call last):
+  File "/opt/spark-ds41f/candidate/vllm/vllm/v1/engine/async_llm.py", line 523, in add_request
+    await self.abort(queue.request_id, internal=True)
+  File "/opt/spark-ds41f/candidate/vllm/vllm/v1/engine/async_llm.py", line 1016, in abort
+    self._pending_mm_retries.pop(req_id, None)
+    ^^^^^^^^^^^^^^^^^^^^^^^^
+AttributeError: 'AsyncLLM' object has no attribute '_pending_mm_retries'
+__________ test_failed_submission_rolls_back_registered_prompt[True] ___________
+
+abort_error = True
+
+    @pytest.mark.parametrize("abort_error", [False, True])
+    def test_failed_submission_rolls_back_registered_prompt(abort_error):
+        async def run():
+            llm = make_llm()
+            llm.engine_core.fail_at = 1
+            llm.engine_core.abort_error = abort_error
+            request = make_request()
+            with pytest.raises(RuntimeError, match="^submission failed$"):
+                await llm.add_request(request.request_id, request, request.sampling_params)
+            assert_empty(llm)
+            assert llm.engine_core.aborted == llm.engine_core.submitted
+    
+>       asyncio.run(run())
+
+tests/v1/engine/test_request_submission_cleanup.py:123: 
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
+/usr/lib/python3.12/asyncio/runners.py:194: in run
+    return runner.run(main)
+           ^^^^^^^^^^^^^^^^
+/usr/lib/python3.12/asyncio/runners.py:118: in run
+    return self._loop.run_until_complete(task)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+/usr/lib/python3.12/asyncio/base_events.py:687: in run_until_complete
+    return future.result()
+           ^^^^^^^^^^^^^^^
+tests/v1/engine/test_request_submission_cleanup.py:119: in run
+    await llm.add_request(request.request_id, request, request.sampling_params)
+vllm/v1/engine/async_llm.py:498: in add_request
+    await self._add_request(request, prompt_text, None, 0, queue)
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
+
+self = <vllm.v1.engine.async_llm.AsyncLLM object at 0xfea9481a0b90>
+request = EngineCoreRequest(request_id='shared-external-id-internal-1', prompt_token_ids=[0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, ...nded=None, reasoning_parser_kwargs=None, abort_immediately=False, session_id=None, recurrent_instruction_boundary=None)
+prompt = None, parent_req = None, index = 0
+queue = <vllm.v1.engine.output_processor.RequestOutputCollector object at 0xfea9481a10a0>
+
+    async def _add_request(
+        self,
+        request: EngineCoreRequest,
+        prompt: str | None,
+        parent_req: ParentRequest | None,
+        index: int,
+        queue: RequestOutputCollector,
+    ):
+        if parent_req is None and not self.output_processor.has_request(
+            request.request_id
+        ):
+            self.check_admission(request_id=request.request_id)
+    
+        # Register locally before the first await so concurrent tasks see this request.
+        self.output_processor.add_request(request, prompt, parent_req, index, queue)
+    
+        if (
+>           self.renderer.mm_processor_cache is None
+            ^^^^^^^^^^^^^
+            and self.vllm_config.cache_config.enable_prefix_caching
+            and request.mm_features
+        ):
+E       AttributeError: 'AsyncLLM' object has no attribute 'renderer'
+
+vllm/v1/engine/async_llm.py:597: AttributeError
+----------------------------- Captured stdout call -----------------------------
+ERROR 11-10 04:27:24 [async_llm.py:527] Failed to notify the engine about failed submission shared-external-id-internal-1
+ERROR 11-10 04:27:24 [async_llm.py:527] Traceback (most recent call last):
+ERROR 11-10 04:27:24 [async_llm.py:527]   File "/opt/spark-ds41f/candidate/vllm/vllm/v1/engine/async_llm.py", line 498, in add_request
+ERROR 11-10 04:27:24 [async_llm.py:527]     await self._add_request(request, prompt_text, None, 0, queue)
+ERROR 11-10 04:27:24 [async_llm.py:527]   File "/opt/spark-ds41f/candidate/vllm/vllm/v1/engine/async_llm.py", line 597, in _add_request
+ERROR 11-10 04:27:24 [async_llm.py:527]     self.renderer.mm_processor_cache is None
+ERROR 11-10 04:27:24 [async_llm.py:527]     ^^^^^^^^^^^^^
+ERROR 11-10 04:27:24 [async_llm.py:527] AttributeError: 'AsyncLLM' object has no attribute 'renderer'
+ERROR 11-10 04:27:24 [async_llm.py:527] 
+ERROR 11-10 04:27:24 [async_llm.py:527] During handling of the above exception, another exception occurred:
+ERROR 11-10 04:27:24 [async_llm.py:527] 
+ERROR 11-10 04:27:24 [async_llm.py:527] Traceback (most recent call last):
+ERROR 11-10 04:27:24 [async_llm.py:527]   File "/opt/spark-ds41f/candidate/vllm/vllm/v1/engine/async_llm.py", line 523, in add_request
+ERROR 11-10 04:27:24 [async_llm.py:527]     await self.abort(queue.request_id, internal=True)
+ERROR 11-10 04:27:24 [async_llm.py:527]   File "/opt/spark-ds41f/candidate/vllm/vllm/v1/engine/async_llm.py", line 1016, in abort
+ERROR 11-10 04:27:24 [async_llm.py:527]     self._pending_mm_retries.pop(req_id, None)
+ERROR 11-10 04:27:24 [async_llm.py:527]     ^^^^^^^^^^^^^^^^^^^^^^^^
+ERROR 11-10 04:27:24 [async_llm.py:527] AttributeError: 'AsyncLLM' object has no attribute '_pending_mm_retries'
+------------------------------ Captured log call -------------------------------
+ERROR    vllm.v1.engine.async_llm:async_llm.py:527 Failed to notify the engine about failed submission shared-external-id-internal-1
+Traceback (most recent call last):
+  File "/opt/spark-ds41f/candidate/vllm/vllm/v1/engine/async_llm.py", line 498, in add_request
+    await self._add_request(request, prompt_text, None, 0, queue)
+  File "/opt/spark-ds41f/candidate/vllm/vllm/v1/engine/async_llm.py", line 597, in _add_request
+    self.renderer.mm_processor_cache is None
+    ^^^^^^^^^^^^^
+AttributeError: 'AsyncLLM' object has no attribute 'renderer'
+
+During handling of the above exception, another exception occurred:
+
+Traceback (most recent call last):
+  File "/opt/spark-ds41f/candidate/vllm/vllm/v1/engine/async_llm.py", line 523, in add_request
+    await self.abort(queue.request_id, internal=True)
+  File "/opt/spark-ds41f/candidate/vllm/vllm/v1/engine/async_llm.py", line 1016, in abort
+    self._pending_mm_retries.pop(req_id, None)
+    ^^^^^^^^^^^^^^^^^^^^^^^^
+AttributeError: 'AsyncLLM' object has no attribute '_pending_mm_retries'
+______ test_repeated_failed_submissions_do_not_accumulate_prompt_history _______
+
+    def test_repeated_failed_submissions_do_not_accumulate_prompt_history():
+        async def run():
+            llm = make_llm()
+            for index in range(16):
+                llm.engine_core.fail_at = len(llm.engine_core.submitted) + 1
+                request = make_request(request_id=f"failed-{index}")
+                with pytest.raises(RuntimeError, match="submission failed"):
+                    await llm.add_request(
+                        request.request_id, request, request.sampling_params
+                    )
+            # The uncorrected code retains sixteen prompts (1,048,576 token IDs)
+            # even though none reached the engine and no request can finish them.
+            assert_empty(llm)
+    
+>       asyncio.run(run())
+
+tests/v1/engine/test_request_submission_cleanup.py:140: 
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
+/usr/lib/python3.12/asyncio/runners.py:194: in run
+    return runner.run(main)
+           ^^^^^^^^^^^^^^^^
+/usr/lib/python3.12/asyncio/runners.py:118: in run
+    return self._loop.run_until_complete(task)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+/usr/lib/python3.12/asyncio/base_events.py:687: in run_until_complete
+    return future.result()
+           ^^^^^^^^^^^^^^^
+tests/v1/engine/test_request_submission_cleanup.py:133: in run
+    await llm.add_request(
+vllm/v1/engine/async_llm.py:498: in add_request
+    await self._add_request(request, prompt_text, None, 0, queue)
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
+
+self = <vllm.v1.engine.async_llm.AsyncLLM object at 0xfea9481a1790>
+request = EngineCoreRequest(request_id='failed-0-internal-1', prompt_token_ids=[0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14...nded=None, reasoning_parser_kwargs=None, abort_immediately=False, session_id=None, recurrent_instruction_boundary=None)
+prompt = None, parent_req = None, index = 0
+queue = <vllm.v1.engine.output_processor.RequestOutputCollector object at 0xfea9481a25d0>
+
+    async def _add_request(
+        self,
+        request: EngineCoreRequest,
+        prompt: str | None,
+        parent_req: ParentRequest | None,
+        index: int,
+        queue: RequestOutputCollector,
+    ):
+        if parent_req is None and not self.output_processor.has_request(
+            request.request_id
+        ):
+            self.check_admission(request_id=request.request_id)
+    
+        # Register locally before the first await so concurrent tasks see this request.
+        self.output_processor.add_request(request, prompt, parent_req, index, queue)
+    
+        if (
+>           self.renderer.mm_processor_cache is None
+            ^^^^^^^^^^^^^
+            and self.vllm_config.cache_config.enable_prefix_caching
+            and request.mm_features
+        ):
+E       AttributeError: 'AsyncLLM' object has no attribute 'renderer'
+
+vllm/v1/engine/async_llm.py:597: AttributeError
+----------------------------- Captured stdout call -----------------------------
+ERROR 11-10 04:27:24 [async_llm.py:527] Failed to notify the engine about failed submission failed-0-internal-1
+ERROR 11-10 04:27:24 [async_llm.py:527] Traceback (most recent call last):
+ERROR 11-10 04:27:24 [async_llm.py:527]   File "/opt/spark-ds41f/candidate/vllm/vllm/v1/engine/async_llm.py", line 498, in add_request
+ERROR 11-10 04:27:24 [async_llm.py:527]     await self._add_request(request, prompt_text, None, 0, queue)
+ERROR 11-10 04:27:24 [async_llm.py:527]   File "/opt/spark-ds41f/candidate/vllm/vllm/v1/engine/async_llm.py", line 597, in _add_request
+ERROR 11-10 04:27:24 [async_llm.py:527]     self.renderer.mm_processor_cache is None
+ERROR 11-10 04:27:24 [async_llm.py:527]     ^^^^^^^^^^^^^
+ERROR 11-10 04:27:24 [async_llm.py:527] AttributeError: 'AsyncLLM' object has no attribute 'renderer'
+ERROR 11-10 04:27:24 [async_llm.py:527] 
+ERROR 11-10 04:27:24 [async_llm.py:527] During handling of the above exception, another exception occurred:
+ERROR 11-10 04:27:24 [async_llm.py:527] 
+ERROR 11-10 04:27:24 [async_llm.py:527] Traceback (most recent call last):
+ERROR 11-10 04:27:24 [async_llm.py:527]   File "/opt/spark-ds41f/candidate/vllm/vllm/v1/engine/async_llm.py", line 523, in add_request
+ERROR 11-10 04:27:24 [async_llm.py:527]     await self.abort(queue.request_id, internal=True)
+ERROR 11-10 04:27:24 [async_llm.py:527]   File "/opt/spark-ds41f/candidate/vllm/vllm/v1/engine/async_llm.py", line 1016, in abort
+ERROR 11-10 04:27:24 [async_llm.py:527]     self._pending_mm_retries.pop(req_id, None)
+ERROR 11-10 04:27:24 [async_llm.py:527]     ^^^^^^^^^^^^^^^^^^^^^^^^
+ERROR 11-10 04:27:24 [async_llm.py:527] AttributeError: 'AsyncLLM' object has no attribute '_pending_mm_retries'
+------------------------------ Captured log call -------------------------------
+ERROR    vllm.v1.engine.async_llm:async_llm.py:527 Failed to notify the engine about failed submission failed-0-internal-1
+Traceback (most recent call last):
+  File "/opt/spark-ds41f/candidate/vllm/vllm/v1/engine/async_llm.py", line 498, in add_request
+    await self._add_request(request, prompt_text, None, 0, queue)
+  File "/opt/spark-ds41f/candidate/vllm/vllm/v1/engine/async_llm.py", line 597, in _add_request
+    self.renderer.mm_processor_cache is None
+    ^^^^^^^^^^^^^
+AttributeError: 'AsyncLLM' object has no attribute 'renderer'
+
+During handling of the above exception, another exception occurred:
+
+Traceback (most recent call last):
+  File "/opt/spark-ds41f/candidate/vllm/vllm/v1/engine/async_llm.py", line 523, in add_request
+    await self.abort(queue.request_id, internal=True)
+  File "/opt/spark-ds41f/candidate/vllm/vllm/v1/engine/async_llm.py", line 1016, in abort
+    self._pending_mm_retries.pop(req_id, None)
+    ^^^^^^^^^^^^^^^^^^^^^^^^
+AttributeError: 'AsyncLLM' object has no attribute '_pending_mm_retries'
+________ test_disconnect_during_submission_rolls_back_all_children[1-1] ________
+
+fut = <coroutine object Event.wait at 0xfea9435a51c0>, timeout = 2
+
+    async def wait_for(fut, timeout):
+        """Wait for the single Future or coroutine to complete, with timeout.
+    
+        Coroutine will be wrapped in Task.
+    
+        Returns result of the Future or coroutine.  When a timeout occurs,
+        it cancels the task and raises TimeoutError.  To avoid the task
+        cancellation, wrap it in shield().
+    
+        If the wait is cancelled, the task is also cancelled.
+    
+        If the task suppresses the cancellation and returns a value instead,
+        that value is returned.
+    
+        This function is a coroutine.
+        """
+        # The special case for timeout <= 0 is for the following case:
+        #
+        # async def test_waitfor():
+        #     func_started = False
+        #
+        #     async def func():
+        #         nonlocal func_started
+        #         func_started = True
+        #
+        #     try:
+        #         await asyncio.wait_for(func(), 0)
+        #     except asyncio.TimeoutError:
+        #         assert not func_started
+        #     else:
+        #         assert False
+        #
+        # asyncio.run(test_waitfor())
+    
+    
+        if timeout is not None and timeout <= 0:
+            fut = ensure_future(fut)
+    
+            if fut.done():
+                return fut.result()
+    
+            await _cancel_and_wait(fut)
+            try:
+                return fut.result()
+            except exceptions.CancelledError as exc:
+                raise TimeoutError from exc
+    
+        async with timeouts.timeout(timeout):
+>           return await fut
+                   ^^^^^^^^^
+
+/usr/lib/python3.12/asyncio/tasks.py:520: 
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
+
+self = <asyncio.locks.Event object at 0xfea9481a1d90 [unset]>
+
+    async def wait(self):
+        """Block until the internal flag is true.
+    
+        If the internal flag is true on entry, return True
+        immediately.  Otherwise, block until another coroutine calls
+        set() to set the flag to true, then return True.
+        """
+        if self._value:
+            return True
+    
+        fut = self._get_loop().create_future()
+        self._waiters.append(fut)
+        try:
+>           await fut
+E           asyncio.exceptions.CancelledError
+
+/usr/lib/python3.12/asyncio/locks.py:212: CancelledError
+
+The above exception was the direct cause of the following exception:
+
+n = 1, block_at = 1
+
+    @pytest.mark.parametrize("n, block_at", [(1, 1), (3, 2), (3, 3)])
+    def test_disconnect_during_submission_rolls_back_all_children(n, block_at):
+        async def run():
+            llm = make_llm()
+            llm.engine_core.block_at = block_at
+            request = make_request(n)
+            # Exercise generate(): its queue handle has not yet been assigned when
+            # cancellation interrupts add_request(). No engine output will arrive.
+            generator = llm.generate(
+                request, request.sampling_params, request.request_id
+            )
+            task = asyncio.create_task(anext(generator))
+            await asyncio.wait_for(llm.engine_core.entered.wait(), timeout=2)
+            assert len(llm.output_processor.request_states) == block_at
+            assert llm.output_processor.get_num_queued_tokens() == block_at * 65536
+            task.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await task
+            await generator.aclose()
+            assert_empty(llm)
+            assert set(llm.engine_core.aborted) == set(llm.engine_core.submitted)
+    
+>       asyncio.run(run())
+
+tests/v1/engine/test_request_submission_cleanup.py:165: 
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
+/usr/lib/python3.12/asyncio/runners.py:194: in run
+    return runner.run(main)
+           ^^^^^^^^^^^^^^^^
+/usr/lib/python3.12/asyncio/runners.py:118: in run
+    return self._loop.run_until_complete(task)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+/usr/lib/python3.12/asyncio/base_events.py:687: in run_until_complete
+    return future.result()
+           ^^^^^^^^^^^^^^^
+tests/v1/engine/test_request_submission_cleanup.py:155: in run
+    await asyncio.wait_for(llm.engine_core.entered.wait(), timeout=2)
+/usr/lib/python3.12/asyncio/tasks.py:519: in wait_for
+    async with timeouts.timeout(timeout):
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
+
+self = <Timeout [expired]>
+exc_type = <class 'asyncio.exceptions.CancelledError'>
+exc_val = CancelledError(), exc_tb = <traceback object at 0xfea9434f0bc0>
+
+    async def __aexit__(
+        self,
+        exc_type: Optional[Type[BaseException]],
+        exc_val: Optional[BaseException],
+        exc_tb: Optional[TracebackType],
+    ) -> Optional[bool]:
+        assert self._state in (_State.ENTERED, _State.EXPIRING)
+    
+        if self._timeout_handler is not None:
+            self._timeout_handler.cancel()
+            self._timeout_handler = None
+    
+        if self._state is _State.EXPIRING:
+            self._state = _State.EXPIRED
+    
+            if self._task.uncancel() <= self._cancelling and exc_type is exceptions.CancelledError:
+                # Since there are no new cancel requests, we're
+                # handling this.
+>               raise TimeoutError from exc_val
+E               TimeoutError
+
+/usr/lib/python3.12/asyncio/timeouts.py:115: TimeoutError
+----------------------------- Captured stdout call -----------------------------
+ERROR 11-10 04:27:24 [async_llm.py:527] Failed to notify the engine about failed submission shared-external-id-internal-1
+ERROR 11-10 04:27:24 [async_llm.py:527] Traceback (most recent call last):
+ERROR 11-10 04:27:24 [async_llm.py:527]   File "/opt/spark-ds41f/candidate/vllm/vllm/v1/engine/async_llm.py", line 498, in add_request
+ERROR 11-10 04:27:24 [async_llm.py:527]     await self._add_request(request, prompt_text, None, 0, queue)
+ERROR 11-10 04:27:24 [async_llm.py:527]   File "/opt/spark-ds41f/candidate/vllm/vllm/v1/engine/async_llm.py", line 597, in _add_request
+ERROR 11-10 04:27:24 [async_llm.py:527]     self.renderer.mm_processor_cache is None
+ERROR 11-10 04:27:24 [async_llm.py:527]     ^^^^^^^^^^^^^
+ERROR 11-10 04:27:24 [async_llm.py:527] AttributeError: 'AsyncLLM' object has no attribute 'renderer'
+ERROR 11-10 04:27:24 [async_llm.py:527] 
+ERROR 11-10 04:27:24 [async_llm.py:527] During handling of the above exception, another exception occurred:
+ERROR 11-10 04:27:24 [async_llm.py:527] 
+ERROR 11-10 04:27:24 [async_llm.py:527] Traceback (most recent call last):
+ERROR 11-10 04:27:24 [async_llm.py:527]   File "/opt/spark-ds41f/candidate/vllm/vllm/v1/engine/async_llm.py", line 523, in add_request
+ERROR 11-10 04:27:24 [async_llm.py:527]     await self.abort(queue.request_id, internal=True)
+ERROR 11-10 04:27:24 [async_llm.py:527]   File "/opt/spark-ds41f/candidate/vllm/vllm/v1/engine/async_llm.py", line 1016, in abort
+ERROR 11-10 04:27:24 [async_llm.py:527]     self._pending_mm_retries.pop(req_id, None)
+ERROR 11-10 04:27:24 [async_llm.py:527]     ^^^^^^^^^^^^^^^^^^^^^^^^
+ERROR 11-10 04:27:24 [async_llm.py:527] AttributeError: 'AsyncLLM' object has no attribute '_pending_mm_retries'
+------------------------------ Captured log call -------------------------------
+ERROR    vllm.v1.engine.async_llm:async_llm.py:527 Failed to notify the engine about failed submission shared-external-id-internal-1
+Traceback (most recent call last):
+  File "/opt/spark-ds41f/candidate/vllm/vllm/v1/engine/async_llm.py", line 498, in add_request
+    await self._add_request(request, prompt_text, None, 0, queue)
+  File "/opt/spark-ds41f/candidate/vllm/vllm/v1/engine/async_llm.py", line 597, in _add_request
+    self.renderer.mm_processor_cache is None
+    ^^^^^^^^^^^^^
+AttributeError: 'AsyncLLM' object has no attribute 'renderer'
+
+During handling of the above exception, another exception occurred:
+
+Traceback (most recent call last):
+  File "/opt/spark-ds41f/candidate/vllm/vllm/v1/engine/async_llm.py", line 523, in add_request
+    await self.abort(queue.request_id, internal=True)
+  File "/opt/spark-ds41f/candidate/vllm/vllm/v1/engine/async_llm.py", line 1016, in abort
+    self._pending_mm_retries.pop(req_id, None)
+    ^^^^^^^^^^^^^^^^^^^^^^^^
+AttributeError: 'AsyncLLM' object has no attribute '_pending_mm_retries'
+________ test_disconnect_during_submission_rolls_back_all_children[3-2] ________
+
+fut = <coroutine object Event.wait at 0xfea9435a4ba0>, timeout = 2
+
+    async def wait_for(fut, timeout):
+        """Wait for the single Future or coroutine to complete, with timeout.
+    
+        Coroutine will be wrapped in Task.
+    
+        Returns result of the Future or coroutine.  When a timeout occurs,
+        it cancels the task and raises TimeoutError.  To avoid the task
+        cancellation, wrap it in shield().
+    
+        If the wait is cancelled, the task is also cancelled.
+    
+        If the task suppresses the cancellation and returns a value instead,
+        that value is returned.
+    
+        This function is a coroutine.
+        """
+        # The special case for timeout <= 0 is for the following case:
+        #
+        # async def test_waitfor():
+        #     func_started = False
+        #
+        #     async def func():
+        #         nonlocal func_started
+        #         func_started = True
+        #
+        #     try:
+        #         await asyncio.wait_for(func(), 0)
+        #     except asyncio.TimeoutError:
+        #         assert not func_started
+        #     else:
+        #         assert False
+        #
+        # asyncio.run(test_waitfor())
+    
+    
+        if timeout is not None and timeout <= 0:
+            fut = ensure_future(fut)
+    
+            if fut.done():
+                return fut.result()
+    
+            await _cancel_and_wait(fut)
+            try:
+                return fut.result()
+            except exceptions.CancelledError as exc:
+                raise TimeoutError from exc
+    
+        async with timeouts.timeout(timeout):
+>           return await fut
+                   ^^^^^^^^^
+
+/usr/lib/python3.12/asyncio/tasks.py:520: 
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
+
+self = <asyncio.locks.Event object at 0xfea9481a30b0 [unset]>
+
+    async def wait(self):
+        """Block until the internal flag is true.
+    
+        If the internal flag is true on entry, return True
+        immediately.  Otherwise, block until another coroutine calls
+        set() to set the flag to true, then return True.
+        """
+        if self._value:
+            return True
+    
+        fut = self._get_loop().create_future()
+        self._waiters.append(fut)
+        try:
+>           await fut
+E           asyncio.exceptions.CancelledError
+
+/usr/lib/python3.12/asyncio/locks.py:212: CancelledError
+
+The above exception was the direct cause of the following exception:
+
+n = 3, block_at = 2
+
+    @pytest.mark.parametrize("n, block_at", [(1, 1), (3, 2), (3, 3)])
+    def test_disconnect_during_submission_rolls_back_all_children(n, block_at):
+        async def run():
+            llm = make_llm()
+            llm.engine_core.block_at = block_at
+            request = make_request(n)
+            # Exercise generate(): its queue handle has not yet been assigned when
+            # cancellation interrupts add_request(). No engine output will arrive.
+            generator = llm.generate(
+                request, request.sampling_params, request.request_id
+            )
+            task = asyncio.create_task(anext(generator))
+            await asyncio.wait_for(llm.engine_core.entered.wait(), timeout=2)
+            assert len(llm.output_processor.request_states) == block_at
+            assert llm.output_processor.get_num_queued_tokens() == block_at * 65536
+            task.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await task
+            await generator.aclose()
+            assert_empty(llm)
+            assert set(llm.engine_core.aborted) == set(llm.engine_core.submitted)
+    
+>       asyncio.run(run())
+
+tests/v1/engine/test_request_submission_cleanup.py:165: 
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
+/usr/lib/python3.12/asyncio/runners.py:194: in run
+    return runner.run(main)
+           ^^^^^^^^^^^^^^^^
+/usr/lib/python3.12/asyncio/runners.py:118: in run
+    return self._loop.run_until_complete(task)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+/usr/lib/python3.12/asyncio/base_events.py:687: in run_until_complete
+    return future.result()
+           ^^^^^^^^^^^^^^^
+tests/v1/engine/test_request_submission_cleanup.py:155: in run
+    await asyncio.wait_for(llm.engine_core.entered.wait(), timeout=2)
+/usr/lib/python3.12/asyncio/tasks.py:519: in wait_for
+    async with timeouts.timeout(timeout):
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
+
+self = <Timeout [expired]>
+exc_type = <class 'asyncio.exceptions.CancelledError'>
+exc_val = CancelledError(), exc_tb = <traceback object at 0xfea942b210c0>
+
+    async def __aexit__(
+        self,
+        exc_type: Optional[Type[BaseException]],
+        exc_val: Optional[BaseException],
+        exc_tb: Optional[TracebackType],
+    ) -> Optional[bool]:
+        assert self._state in (_State.ENTERED, _State.EXPIRING)
+    
+        if self._timeout_handler is not None:
+            self._timeout_handler.cancel()
+            self._timeout_handler = None
+    
+        if self._state is _State.EXPIRING:
+            self._state = _State.EXPIRED
+    
+            if self._task.uncancel() <= self._cancelling and exc_type is exceptions.CancelledError:
+                # Since there are no new cancel requests, we're
+                # handling this.
+>               raise TimeoutError from exc_val
+E               TimeoutError
+
+/usr/lib/python3.12/asyncio/timeouts.py:115: TimeoutError
+----------------------------- Captured stdout call -----------------------------
+ERROR 11-10 04:27:27 [async_llm.py:527] Failed to notify the engine about failed submission shared-external-id-internal-1
+ERROR 11-10 04:27:27 [async_llm.py:527] Traceback (most recent call last):
+ERROR 11-10 04:27:27 [async_llm.py:527]   File "/opt/spark-ds41f/candidate/vllm/vllm/v1/engine/async_llm.py", line 511, in add_request
+ERROR 11-10 04:27:27 [async_llm.py:527]     await self._add_request(
+ERROR 11-10 04:27:27 [async_llm.py:527]   File "/opt/spark-ds41f/candidate/vllm/vllm/v1/engine/async_llm.py", line 597, in _add_request
+ERROR 11-10 04:27:27 [async_llm.py:527]     self.renderer.mm_processor_cache is None
+ERROR 11-10 04:27:27 [async_llm.py:527]     ^^^^^^^^^^^^^
+ERROR 11-10 04:27:27 [async_llm.py:527] AttributeError: 'AsyncLLM' object has no attribute 'renderer'
+ERROR 11-10 04:27:27 [async_llm.py:527] 
+ERROR 11-10 04:27:27 [async_llm.py:527] During handling of the above exception, another exception occurred:
+ERROR 11-10 04:27:27 [async_llm.py:527] 
+ERROR 11-10 04:27:27 [async_llm.py:527] Traceback (most recent call last):
+ERROR 11-10 04:27:27 [async_llm.py:527]   File "/opt/spark-ds41f/candidate/vllm/vllm/v1/engine/async_llm.py", line 523, in add_request
+ERROR 11-10 04:27:27 [async_llm.py:527]     await self.abort(queue.request_id, internal=True)
+ERROR 11-10 04:27:27 [async_llm.py:527]   File "/opt/spark-ds41f/candidate/vllm/vllm/v1/engine/async_llm.py", line 1016, in abort
+ERROR 11-10 04:27:27 [async_llm.py:527]     self._pending_mm_retries.pop(req_id, None)
+ERROR 11-10 04:27:27 [async_llm.py:527]     ^^^^^^^^^^^^^^^^^^^^^^^^
+ERROR 11-10 04:27:27 [async_llm.py:527] AttributeError: 'AsyncLLM' object has no attribute '_pending_mm_retries'
+------------------------------ Captured log call -------------------------------
+ERROR    vllm.v1.engine.async_llm:async_llm.py:527 Failed to notify the engine about failed submission shared-external-id-internal-1
+Traceback (most recent call last):
+  File "/opt/spark-ds41f/candidate/vllm/vllm/v1/engine/async_llm.py", line 511, in add_request
+    await self._add_request(
+  File "/opt/spark-ds41f/candidate/vllm/vllm/v1/engine/async_llm.py", line 597, in _add_request
+    self.renderer.mm_processor_cache is None
+    ^^^^^^^^^^^^^
+AttributeError: 'AsyncLLM' object has no attribute 'renderer'
+
+During handling of the above exception, another exception occurred:
+
+Traceback (most recent call last):
+  File "/opt/spark-ds41f/candidate/vllm/vllm/v1/engine/async_llm.py", line 523, in add_request
+    await self.abort(queue.request_id, internal=True)
+  File "/opt/spark-ds41f/candidate/vllm/vllm/v1/engine/async_llm.py", line 1016, in abort
+    self._pending_mm_retries.pop(req_id, None)
+    ^^^^^^^^^^^^^^^^^^^^^^^^
+AttributeError: 'AsyncLLM' object has no attribute '_pending_mm_retries'
+---------------------------- Captured log teardown -----------------------------
+ERROR    asyncio:base_events.py:1821 Task exception was never retrieved
+future: <Task finished name='Task-11' coro=<<async_generator_asend without __name__>()> exception=EngineGenerateError()>
+Traceback (most recent call last):
+  File "/opt/spark-ds41f/candidate/vllm/vllm/v1/engine/async_llm.py", line 773, in generate
+    q = await self.add_request(
+        ^^^^^^^^^^^^^^^^^^^^^^^
+  File "/opt/spark-ds41f/candidate/vllm/vllm/v1/engine/async_llm.py", line 498, in add_request
+    await self._add_request(request, prompt_text, None, 0, queue)
+  File "/opt/spark-ds41f/candidate/vllm/vllm/v1/engine/async_llm.py", line 597, in _add_request
+    self.renderer.mm_processor_cache is None
+    ^^^^^^^^^^^^^
+AttributeError: 'AsyncLLM' object has no attribute 'renderer'
+
+The above exception was the direct cause of the following exception:
+
+Traceback (most recent call last):
+  File "/opt/spark-ds41f/candidate/vllm/vllm/v1/engine/async_llm.py", line 854, in generate
+    raise EngineGenerateError() from e
+vllm.v1.engine.exceptions.EngineGenerateError
+________ test_disconnect_during_submission_rolls_back_all_children[3-3] ________
+
+fut = <coroutine object Event.wait at 0xfea943569700>, timeout = 2
+
+    async def wait_for(fut, timeout):
+        """Wait for the single Future or coroutine to complete, with timeout.
+    
+        Coroutine will be wrapped in Task.
+    
+        Returns result of the Future or coroutine.  When a timeout occurs,
+        it cancels the task and raises TimeoutError.  To avoid the task
+        cancellation, wrap it in shield().
+    
+        If the wait is cancelled, the task is also cancelled.
+    
+        If the task suppresses the cancellation and returns a value instead,
+        that value is returned.
+    
+        This function is a coroutine.
+        """
+        # The special case for timeout <= 0 is for the following case:
+        #
+        # async def test_waitfor():
+        #     func_started = False
+        #
+        #     async def func():
+        #         nonlocal func_started
+        #         func_started = True
+        #
+        #     try:
+        #         await asyncio.wait_for(func(), 0)
+        #     except asyncio.TimeoutError:
+        #         assert not func_started
+        #     else:
+        #         assert False
+        #
+        # asyncio.run(test_waitfor())
+    
+    
+        if timeout is not None and timeout <= 0:
+            fut = ensure_future(fut)
+    
+            if fut.done():
+                return fut.result()
+    
+            await _cancel_and_wait(fut)
+            try:
+                return fut.result()
+            except exceptions.CancelledError as exc:
+                raise TimeoutError from exc
+    
+        async with timeouts.timeout(timeout):
+>           return await fut
+                   ^^^^^^^^^
+
+/usr/lib/python3.12/asyncio/tasks.py:520: 
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
+
+self = <asyncio.locks.Event object at 0xfea9481bfec0 [unset]>
+
+    async def wait(self):
+        """Block until the internal flag is true.
+    
+        If the internal flag is true on entry, return True
+        immediately.  Otherwise, block until another coroutine calls
+        set() to set the flag to true, then return True.
+        """
+        if self._value:
+            return True
+    
+        fut = self._get_loop().create_future()
+        self._waiters.append(fut)
+        try:
+>           await fut
+E           asyncio.exceptions.CancelledError
+
+/usr/lib/python3.12/asyncio/locks.py:212: CancelledError
+
+The above exception was the direct cause of the following exception:
+
+n = 3, block_at = 3
+
+    @pytest.mark.parametrize("n, block_at", [(1, 1), (3, 2), (3, 3)])
+    def test_disconnect_during_submission_rolls_back_all_children(n, block_at):
+        async def run():
+            llm = make_llm()
+            llm.engine_core.block_at = block_at
+            request = make_request(n)
+            # Exercise generate(): its queue handle has not yet been assigned when
+            # cancellation interrupts add_request(). No engine output will arrive.
+            generator = llm.generate(
+                request, request.sampling_params, request.request_id
+            )
+            task = asyncio.create_task(anext(generator))
+            await asyncio.wait_for(llm.engine_core.entered.wait(), timeout=2)
+            assert len(llm.output_processor.request_states) == block_at
+            assert llm.output_processor.get_num_queued_tokens() == block_at * 65536
+            task.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await task
+            await generator.aclose()
+            assert_empty(llm)
+            assert set(llm.engine_core.aborted) == set(llm.engine_core.submitted)
+    
+>       asyncio.run(run())
+
+tests/v1/engine/test_request_submission_cleanup.py:165: 
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
+/usr/lib/python3.12/asyncio/runners.py:194: in run
+    return runner.run(main)
+           ^^^^^^^^^^^^^^^^
+/usr/lib/python3.12/asyncio/runners.py:118: in run
+    return self._loop.run_until_complete(task)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+/usr/lib/python3.12/asyncio/base_events.py:687: in run_until_complete
+    return future.result()
+           ^^^^^^^^^^^^^^^
+tests/v1/engine/test_request_submission_cleanup.py:155: in run
+    await asyncio.wait_for(llm.engine_core.entered.wait(), timeout=2)
+/usr/lib/python3.12/asyncio/tasks.py:519: in wait_for
+    async with timeouts.timeout(timeout):
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
+
+self = <Timeout [expired]>
+exc_type = <class 'asyncio.exceptions.CancelledError'>
+exc_val = CancelledError(), exc_tb = <traceback object at 0xfea9430d0500>
+
+    async def __aexit__(
+        self,
+        exc_type: Optional[Type[BaseException]],
+        exc_val: Optional[BaseException],
+        exc_tb: Optional[TracebackType],
+    ) -> Optional[bool]:
+        assert self._state in (_State.ENTERED, _State.EXPIRING)
+    
+        if self._timeout_handler is not None:
+            self._timeout_handler.cancel()
+            self._timeout_handler = None
+    
+        if self._state is _State.EXPIRING:
+            self._state = _State.EXPIRED
+    
+            if self._task.uncancel() <= self._cancelling and exc_type is exceptions.CancelledError:
+                # Since there are no new cancel requests, we're
+                # handling this.
+>               raise TimeoutError from exc_val
+E               TimeoutError
+
+/usr/lib/python3.12/asyncio/timeouts.py:115: TimeoutError
+----------------------------- Captured stdout call -----------------------------
+ERROR 11-10 04:27:29 [async_llm.py:527] Failed to notify the engine about failed submission shared-external-id-internal-1
+ERROR 11-10 04:27:29 [async_llm.py:527] Traceback (most recent call last):
+ERROR 11-10 04:27:29 [async_llm.py:527]   File "/opt/spark-ds41f/candidate/vllm/vllm/v1/engine/async_llm.py", line 511, in add_request
+ERROR 11-10 04:27:29 [async_llm.py:527]     await self._add_request(
+ERROR 11-10 04:27:29 [async_llm.py:527]   File "/opt/spark-ds41f/candidate/vllm/vllm/v1/engine/async_llm.py", line 597, in _add_request
+ERROR 11-10 04:27:29 [async_llm.py:527]     self.renderer.mm_processor_cache is None
+ERROR 11-10 04:27:29 [async_llm.py:527]     ^^^^^^^^^^^^^
+ERROR 11-10 04:27:29 [async_llm.py:527] AttributeError: 'AsyncLLM' object has no attribute 'renderer'
+ERROR 11-10 04:27:29 [async_llm.py:527] 
+ERROR 11-10 04:27:29 [async_llm.py:527] During handling of the above exception, another exception occurred:
+ERROR 11-10 04:27:29 [async_llm.py:527] 
+ERROR 11-10 04:27:29 [async_llm.py:527] Traceback (most recent call last):
+ERROR 11-10 04:27:29 [async_llm.py:527]   File "/opt/spark-ds41f/candidate/vllm/vllm/v1/engine/async_llm.py", line 523, in add_request
+ERROR 11-10 04:27:29 [async_llm.py:527]     await self.abort(queue.request_id, internal=True)
+ERROR 11-10 04:27:29 [async_llm.py:527]   File "/opt/spark-ds41f/candidate/vllm/vllm/v1/engine/async_llm.py", line 1016, in abort
+ERROR 11-10 04:27:29 [async_llm.py:527]     self._pending_mm_retries.pop(req_id, None)
+ERROR 11-10 04:27:29 [async_llm.py:527]     ^^^^^^^^^^^^^^^^^^^^^^^^
+ERROR 11-10 04:27:29 [async_llm.py:527] AttributeError: 'AsyncLLM' object has no attribute '_pending_mm_retries'
+------------------------------ Captured log call -------------------------------
+ERROR    vllm.v1.engine.async_llm:async_llm.py:527 Failed to notify the engine about failed submission shared-external-id-internal-1
+Traceback (most recent call last):
+  File "/opt/spark-ds41f/candidate/vllm/vllm/v1/engine/async_llm.py", line 511, in add_request
+    await self._add_request(
+  File "/opt/spark-ds41f/candidate/vllm/vllm/v1/engine/async_llm.py", line 597, in _add_request
+    self.renderer.mm_processor_cache is None
+    ^^^^^^^^^^^^^
+AttributeError: 'AsyncLLM' object has no attribute 'renderer'
+
+During handling of the above exception, another exception occurred:
+
+Traceback (most recent call last):
+  File "/opt/spark-ds41f/candidate/vllm/vllm/v1/engine/async_llm.py", line 523, in add_request
+    await self.abort(queue.request_id, internal=True)
+  File "/opt/spark-ds41f/candidate/vllm/vllm/v1/engine/async_llm.py", line 1016, in abort
+    self._pending_mm_retries.pop(req_id, None)
+    ^^^^^^^^^^^^^^^^^^^^^^^^
+AttributeError: 'AsyncLLM' object has no attribute '_pending_mm_retries'
+---------------------------- Captured log teardown -----------------------------
+ERROR    asyncio:base_events.py:1821 Task exception was never retrieved
+future: <Task finished name='Task-16' coro=<<async_generator_asend without __name__>()> exception=EngineGenerateError()>
+Traceback (most recent call last):
+  File "/opt/spark-ds41f/candidate/vllm/vllm/v1/engine/async_llm.py", line 773, in generate
+    q = await self.add_request(
+        ^^^^^^^^^^^^^^^^^^^^^^^
+  File "/opt/spark-ds41f/candidate/vllm/vllm/v1/engine/async_llm.py", line 511, in add_request
+    await self._add_request(
+  File "/opt/spark-ds41f/candidate/vllm/vllm/v1/engine/async_llm.py", line 597, in _add_request
+    self.renderer.mm_processor_cache is None
+    ^^^^^^^^^^^^^
+AttributeError: 'AsyncLLM' object has no attribute 'renderer'
+
+The above exception was the direct cause of the following exception:
+
+Traceback (most recent call last):
+  File "/opt/spark-ds41f/candidate/vllm/vllm/v1/engine/async_llm.py", line 854, in generate
+    raise EngineGenerateError() from e
+vllm.v1.engine.exceptions.EngineGenerateError
+______ test_failure_does_not_abort_another_request_reusing_external_id[1] ______
+
+n = 1
+
+    @pytest.mark.parametrize("n", [1, 3])
+    def test_failure_does_not_abort_another_request_reusing_external_id(n):
+        async def run():
+            llm = make_llm()
+            first = make_request()
+            queue = await llm.add_request(
+                first.request_id, first, first.sampling_params
+            )
+            original_id = first.request_id
+            llm.engine_core.fail_at = 1 + n
+            request = make_request(n)
+            with pytest.raises(RuntimeError, match="submission failed"):
+                await llm.add_request(request.request_id, request, request.sampling_params)
+            assert set(llm.output_processor.request_states) == {original_id}
+            assert not llm.output_processor.parent_requests
+            assert llm.output_processor.external_req_ids == {
+                "shared-external-id": [original_id]
+            }
+            assert original_id not in llm.engine_core.aborted
+            await llm.abort(queue.request_id, internal=True)
+            assert_empty(llm)
+    
+>       asyncio.run(run())
+
+tests/v1/engine/test_request_submission_cleanup.py:190: 
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
+/usr/lib/python3.12/asyncio/runners.py:194: in run
+    return runner.run(main)
+           ^^^^^^^^^^^^^^^^
+/usr/lib/python3.12/asyncio/runners.py:118: in run
+    return self._loop.run_until_complete(task)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+/usr/lib/python3.12/asyncio/base_events.py:687: in run_until_complete
+    return future.result()
+           ^^^^^^^^^^^^^^^
+tests/v1/engine/test_request_submission_cleanup.py:173: in run
+    queue = await llm.add_request(
+vllm/v1/engine/async_llm.py:498: in add_request
+    await self._add_request(request, prompt_text, None, 0, queue)
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
+
+self = <vllm.v1.engine.async_llm.AsyncLLM object at 0xfea9481a0b30>
+request = EngineCoreRequest(request_id='shared-external-id-internal-1', prompt_token_ids=[0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, ...nded=None, reasoning_parser_kwargs=None, abort_immediately=False, session_id=None, recurrent_instruction_boundary=None)
+prompt = None, parent_req = None, index = 0
+queue = <vllm.v1.engine.output_processor.RequestOutputCollector object at 0xfea9481a1df0>
+
+    async def _add_request(
+        self,
+        request: EngineCoreRequest,
+        prompt: str | None,
+        parent_req: ParentRequest | None,
+        index: int,
+        queue: RequestOutputCollector,
+    ):
+        if parent_req is None and not self.output_processor.has_request(
+            request.request_id
+        ):
+            self.check_admission(request_id=request.request_id)
+    
+        # Register locally before the first await so concurrent tasks see this request.
+        self.output_processor.add_request(request, prompt, parent_req, index, queue)
+    
+        if (
+>           self.renderer.mm_processor_cache is None
+            ^^^^^^^^^^^^^
+            and self.vllm_config.cache_config.enable_prefix_caching
+            and request.mm_features
+        ):
+E       AttributeError: 'AsyncLLM' object has no attribute 'renderer'
+
+vllm/v1/engine/async_llm.py:597: AttributeError
+----------------------------- Captured stdout call -----------------------------
+ERROR 11-10 04:27:31 [async_llm.py:527] Failed to notify the engine about failed submission shared-external-id-internal-1
+ERROR 11-10 04:27:31 [async_llm.py:527] Traceback (most recent call last):
+ERROR 11-10 04:27:31 [async_llm.py:527]   File "/opt/spark-ds41f/candidate/vllm/vllm/v1/engine/async_llm.py", line 498, in add_request
+ERROR 11-10 04:27:31 [async_llm.py:527]     await self._add_request(request, prompt_text, None, 0, queue)
+ERROR 11-10 04:27:31 [async_llm.py:527]   File "/opt/spark-ds41f/candidate/vllm/vllm/v1/engine/async_llm.py", line 597, in _add_request
+ERROR 11-10 04:27:31 [async_llm.py:527]     self.renderer.mm_processor_cache is None
+ERROR 11-10 04:27:31 [async_llm.py:527]     ^^^^^^^^^^^^^
+ERROR 11-10 04:27:31 [async_llm.py:527] AttributeError: 'AsyncLLM' object has no attribute 'renderer'
+ERROR 11-10 04:27:31 [async_llm.py:527] 
+ERROR 11-10 04:27:31 [async_llm.py:527] During handling of the above exception, another exception occurred:
+ERROR 11-10 04:27:31 [async_llm.py:527] 
+ERROR 11-10 04:27:31 [async_llm.py:527] Traceback (most recent call last):
+ERROR 11-10 04:27:31 [async_llm.py:527]   File "/opt/spark-ds41f/candidate/vllm/vllm/v1/engine/async_llm.py", line 523, in add_request
+ERROR 11-10 04:27:31 [async_llm.py:527]     await self.abort(queue.request_id, internal=True)
+ERROR 11-10 04:27:31 [async_llm.py:527]   File "/opt/spark-ds41f/candidate/vllm/vllm/v1/engine/async_llm.py", line 1016, in abort
+ERROR 11-10 04:27:31 [async_llm.py:527]     self._pending_mm_retries.pop(req_id, None)
+ERROR 11-10 04:27:31 [async_llm.py:527]     ^^^^^^^^^^^^^^^^^^^^^^^^
+ERROR 11-10 04:27:31 [async_llm.py:527] AttributeError: 'AsyncLLM' object has no attribute '_pending_mm_retries'
+------------------------------ Captured log call -------------------------------
+ERROR    vllm.v1.engine.async_llm:async_llm.py:527 Failed to notify the engine about failed submission shared-external-id-internal-1
+Traceback (most recent call last):
+  File "/opt/spark-ds41f/candidate/vllm/vllm/v1/engine/async_llm.py", line 498, in add_request
+    await self._add_request(request, prompt_text, None, 0, queue)
+  File "/opt/spark-ds41f/candidate/vllm/vllm/v1/engine/async_llm.py", line 597, in _add_request
+    self.renderer.mm_processor_cache is None
+    ^^^^^^^^^^^^^
+AttributeError: 'AsyncLLM' object has no attribute 'renderer'
+
+During handling of the above exception, another exception occurred:
+
+Traceback (most recent call last):
+  File "/opt/spark-ds41f/candidate/vllm/vllm/v1/engine/async_llm.py", line 523, in add_request
+    await self.abort(queue.request_id, internal=True)
+  File "/opt/spark-ds41f/candidate/vllm/vllm/v1/engine/async_llm.py", line 1016, in abort
+    self._pending_mm_retries.pop(req_id, None)
+    ^^^^^^^^^^^^^^^^^^^^^^^^
+AttributeError: 'AsyncLLM' object has no attribute '_pending_mm_retries'
+---------------------------- Captured log teardown -----------------------------
+ERROR    asyncio:base_events.py:1821 Task exception was never retrieved
+future: <Task finished name='Task-21' coro=<<async_generator_asend without __name__>()> exception=EngineGenerateError()>
+Traceback (most recent call last):
+  File "/opt/spark-ds41f/candidate/vllm/vllm/v1/engine/async_llm.py", line 773, in generate
+    q = await self.add_request(
+        ^^^^^^^^^^^^^^^^^^^^^^^
+  File "/opt/spark-ds41f/candidate/vllm/vllm/v1/engine/async_llm.py", line 511, in add_request
+    await self._add_request(
+  File "/opt/spark-ds41f/candidate/vllm/vllm/v1/engine/async_llm.py", line 597, in _add_request
+    self.renderer.mm_processor_cache is None
+    ^^^^^^^^^^^^^
+AttributeError: 'AsyncLLM' object has no attribute 'renderer'
+
+The above exception was the direct cause of the following exception:
+
+Traceback (most recent call last):
+  File "/opt/spark-ds41f/candidate/vllm/vllm/v1/engine/async_llm.py", line 854, in generate
+    raise EngineGenerateError() from e
+vllm.v1.engine.exceptions.EngineGenerateError
+______ test_failure_does_not_abort_another_request_reusing_external_id[3] ______
+
+n = 3
+
+    @pytest.mark.parametrize("n", [1, 3])
+    def test_failure_does_not_abort_another_request_reusing_external_id(n):
+        async def run():
+            llm = make_llm()
+            first = make_request()
+            queue = await llm.add_request(
+                first.request_id, first, first.sampling_params
+            )
+            original_id = first.request_id
+            llm.engine_core.fail_at = 1 + n
+            request = make_request(n)
+            with pytest.raises(RuntimeError, match="submission failed"):
+                await llm.add_request(request.request_id, request, request.sampling_params)
+            assert set(llm.output_processor.request_states) == {original_id}
+            assert not llm.output_processor.parent_requests
+            assert llm.output_processor.external_req_ids == {
+                "shared-external-id": [original_id]
+            }
+            assert original_id not in llm.engine_core.aborted
+            await llm.abort(queue.request_id, internal=True)
+            assert_empty(llm)
+    
+>       asyncio.run(run())
+
+tests/v1/engine/test_request_submission_cleanup.py:190: 
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
+/usr/lib/python3.12/asyncio/runners.py:194: in run
+    return runner.run(main)
+           ^^^^^^^^^^^^^^^^
+/usr/lib/python3.12/asyncio/runners.py:118: in run
+    return self._loop.run_until_complete(task)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+/usr/lib/python3.12/asyncio/base_events.py:687: in run_until_complete
+    return future.result()
+           ^^^^^^^^^^^^^^^
+tests/v1/engine/test_request_submission_cleanup.py:173: in run
+    queue = await llm.add_request(
+vllm/v1/engine/async_llm.py:498: in add_request
+    await self._add_request(request, prompt_text, None, 0, queue)
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
+
+self = <vllm.v1.engine.async_llm.AsyncLLM object at 0xfea9481a37d0>
+request = EngineCoreRequest(request_id='shared-external-id-internal-1', prompt_token_ids=[0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, ...nded=None, reasoning_parser_kwargs=None, abort_immediately=False, session_id=None, recurrent_instruction_boundary=None)
+prompt = None, parent_req = None, index = 0
+queue = <vllm.v1.engine.output_processor.RequestOutputCollector object at 0xfea9481a21e0>
+
+    async def _add_request(
+        self,
+        request: EngineCoreRequest,
+        prompt: str | None,
+        parent_req: ParentRequest | None,
+        index: int,
+        queue: RequestOutputCollector,
+    ):
+        if parent_req is None and not self.output_processor.has_request(
+            request.request_id
+        ):
+            self.check_admission(request_id=request.request_id)
+    
+        # Register locally before the first await so concurrent tasks see this request.
+        self.output_processor.add_request(request, prompt, parent_req, index, queue)
+    
+        if (
+>           self.renderer.mm_processor_cache is None
+            ^^^^^^^^^^^^^
+            and self.vllm_config.cache_config.enable_prefix_caching
+            and request.mm_features
+        ):
+E       AttributeError: 'AsyncLLM' object has no attribute 'renderer'
+
+vllm/v1/engine/async_llm.py:597: AttributeError
+----------------------------- Captured stdout call -----------------------------
+ERROR 11-10 04:27:31 [async_llm.py:527] Failed to notify the engine about failed submission shared-external-id-internal-1
+ERROR 11-10 04:27:31 [async_llm.py:527] Traceback (most recent call last):
+ERROR 11-10 04:27:31 [async_llm.py:527]   File "/opt/spark-ds41f/candidate/vllm/vllm/v1/engine/async_llm.py", line 498, in add_request
+ERROR 11-10 04:27:31 [async_llm.py:527]     await self._add_request(request, prompt_text, None, 0, queue)
+ERROR 11-10 04:27:31 [async_llm.py:527]   File "/opt/spark-ds41f/candidate/vllm/vllm/v1/engine/async_llm.py", line 597, in _add_request
+ERROR 11-10 04:27:31 [async_llm.py:527]     self.renderer.mm_processor_cache is None
+ERROR 11-10 04:27:31 [async_llm.py:527]     ^^^^^^^^^^^^^
+ERROR 11-10 04:27:31 [async_llm.py:527] AttributeError: 'AsyncLLM' object has no attribute 'renderer'
+ERROR 11-10 04:27:31 [async_llm.py:527] 
+ERROR 11-10 04:27:31 [async_llm.py:527] During handling of the above exception, another exception occurred:
+ERROR 11-10 04:27:31 [async_llm.py:527] 
+ERROR 11-10 04:27:31 [async_llm.py:527] Traceback (most recent call last):
+ERROR 11-10 04:27:31 [async_llm.py:527]   File "/opt/spark-ds41f/candidate/vllm/vllm/v1/engine/async_llm.py", line 523, in add_request
+ERROR 11-10 04:27:31 [async_llm.py:527]     await self.abort(queue.request_id, internal=True)
+ERROR 11-10 04:27:31 [async_llm.py:527]   File "/opt/spark-ds41f/candidate/vllm/vllm/v1/engine/async_llm.py", line 1016, in abort
+ERROR 11-10 04:27:31 [async_llm.py:527]     self._pending_mm_retries.pop(req_id, None)
+ERROR 11-10 04:27:31 [async_llm.py:527]     ^^^^^^^^^^^^^^^^^^^^^^^^
+ERROR 11-10 04:27:31 [async_llm.py:527] AttributeError: 'AsyncLLM' object has no attribute '_pending_mm_retries'
+------------------------------ Captured log call -------------------------------
+ERROR    vllm.v1.engine.async_llm:async_llm.py:527 Failed to notify the engine about failed submission shared-external-id-internal-1
+Traceback (most recent call last):
+  File "/opt/spark-ds41f/candidate/vllm/vllm/v1/engine/async_llm.py", line 498, in add_request
+    await self._add_request(request, prompt_text, None, 0, queue)
+  File "/opt/spark-ds41f/candidate/vllm/vllm/v1/engine/async_llm.py", line 597, in _add_request
+    self.renderer.mm_processor_cache is None
+    ^^^^^^^^^^^^^
+AttributeError: 'AsyncLLM' object has no attribute 'renderer'
+
+During handling of the above exception, another exception occurred:
+
+Traceback (most recent call last):
+  File "/opt/spark-ds41f/candidate/vllm/vllm/v1/engine/async_llm.py", line 523, in add_request
+    await self.abort(queue.request_id, internal=True)
+  File "/opt/spark-ds41f/candidate/vllm/vllm/v1/engine/async_llm.py", line 1016, in abort
+    self._pending_mm_retries.pop(req_id, None)
+    ^^^^^^^^^^^^^^^^^^^^^^^^
+AttributeError: 'AsyncLLM' object has no attribute '_pending_mm_retries'
+_______ test_successful_submission_and_completion_keep_normal_cleanup[1] _______
+
+n = 1
+
+    @pytest.mark.parametrize("n", [1, 3])
+    def test_successful_submission_and_completion_keep_normal_cleanup(n):
+        async def run():
+            llm = make_llm()
+            request = make_request(n)
+            queue = await llm.add_request(
+                request.request_id, request, request.sampling_params
+            )
+            assert len(llm.output_processor.request_states) == n
+            assert not llm.engine_core.aborted
+            outputs = [
+                EngineCoreOutput(
+                    request_id=internal_id,
+                    new_token_ids=[1],
+                    finish_reason=FinishReason.STOP,
+                )
+                for internal_id in llm.engine_core.submitted
+            ]
+            llm.output_processor.process_outputs(outputs)
+            assert_empty(llm)
+            result = await queue.get()
+            assert result.finished
+            assert len(result.outputs) == n
+            assert not llm.engine_core.aborted
+    
+>       asyncio.run(run())
+
+tests/v1/engine/test_request_submission_cleanup.py:218: 
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
+/usr/lib/python3.12/asyncio/runners.py:194: in run
+    return runner.run(main)
+           ^^^^^^^^^^^^^^^^
+/usr/lib/python3.12/asyncio/runners.py:118: in run
+    return self._loop.run_until_complete(task)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+/usr/lib/python3.12/asyncio/base_events.py:687: in run_until_complete
+    return future.result()
+           ^^^^^^^^^^^^^^^
+tests/v1/engine/test_request_submission_cleanup.py:198: in run
+    queue = await llm.add_request(
+vllm/v1/engine/async_llm.py:498: in add_request
+    await self._add_request(request, prompt_text, None, 0, queue)
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
+
+self = <vllm.v1.engine.async_llm.AsyncLLM object at 0xfea9481bea20>
+request = EngineCoreRequest(request_id='shared-external-id-internal-1', prompt_token_ids=[0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, ...nded=None, reasoning_parser_kwargs=None, abort_immediately=False, session_id=None, recurrent_instruction_boundary=None)
+prompt = None, parent_req = None, index = 0
+queue = <vllm.v1.engine.output_processor.RequestOutputCollector object at 0xfea9481be3f0>
+
+    async def _add_request(
+        self,
+        request: EngineCoreRequest,
+        prompt: str | None,
+        parent_req: ParentRequest | None,
+        index: int,
+        queue: RequestOutputCollector,
+    ):
+        if parent_req is None and not self.output_processor.has_request(
+            request.request_id
+        ):
+            self.check_admission(request_id=request.request_id)
+    
+        # Register locally before the first await so concurrent tasks see this request.
+        self.output_processor.add_request(request, prompt, parent_req, index, queue)
+    
+        if (
+>           self.renderer.mm_processor_cache is None
+            ^^^^^^^^^^^^^
+            and self.vllm_config.cache_config.enable_prefix_caching
+            and request.mm_features
+        ):
+E       AttributeError: 'AsyncLLM' object has no attribute 'renderer'
+
+vllm/v1/engine/async_llm.py:597: AttributeError
+----------------------------- Captured stdout call -----------------------------
+ERROR 11-10 04:27:31 [async_llm.py:527] Failed to notify the engine about failed submission shared-external-id-internal-1
+ERROR 11-10 04:27:31 [async_llm.py:527] Traceback (most recent call last):
+ERROR 11-10 04:27:31 [async_llm.py:527]   File "/opt/spark-ds41f/candidate/vllm/vllm/v1/engine/async_llm.py", line 498, in add_request
+ERROR 11-10 04:27:31 [async_llm.py:527]     await self._add_request(request, prompt_text, None, 0, queue)
+ERROR 11-10 04:27:31 [async_llm.py:527]   File "/opt/spark-ds41f/candidate/vllm/vllm/v1/engine/async_llm.py", line 597, in _add_request
+ERROR 11-10 04:27:31 [async_llm.py:527]     self.renderer.mm_processor_cache is None
+ERROR 11-10 04:27:31 [async_llm.py:527]     ^^^^^^^^^^^^^
+ERROR 11-10 04:27:31 [async_llm.py:527] AttributeError: 'AsyncLLM' object has no attribute 'renderer'
+ERROR 11-10 04:27:31 [async_llm.py:527] 
+ERROR 11-10 04:27:31 [async_llm.py:527] During handling of the above exception, another exception occurred:
+ERROR 11-10 04:27:31 [async_llm.py:527] 
+ERROR 11-10 04:27:31 [async_llm.py:527] Traceback (most recent call last):
+ERROR 11-10 04:27:31 [async_llm.py:527]   File "/opt/spark-ds41f/candidate/vllm/vllm/v1/engine/async_llm.py", line 523, in add_request
+ERROR 11-10 04:27:31 [async_llm.py:527]     await self.abort(queue.request_id, internal=True)
+ERROR 11-10 04:27:31 [async_llm.py:527]   File "/opt/spark-ds41f/candidate/vllm/vllm/v1/engine/async_llm.py", line 1016, in abort
+ERROR 11-10 04:27:31 [async_llm.py:527]     self._pending_mm_retries.pop(req_id, None)
+ERROR 11-10 04:27:31 [async_llm.py:527]     ^^^^^^^^^^^^^^^^^^^^^^^^
+ERROR 11-10 04:27:31 [async_llm.py:527] AttributeError: 'AsyncLLM' object has no attribute '_pending_mm_retries'
+------------------------------ Captured log call -------------------------------
+ERROR    vllm.v1.engine.async_llm:async_llm.py:527 Failed to notify the engine about failed submission shared-external-id-internal-1
+Traceback (most recent call last):
+  File "/opt/spark-ds41f/candidate/vllm/vllm/v1/engine/async_llm.py", line 498, in add_request
+    await self._add_request(request, prompt_text, None, 0, queue)
+  File "/opt/spark-ds41f/candidate/vllm/vllm/v1/engine/async_llm.py", line 597, in _add_request
+    self.renderer.mm_processor_cache is None
+    ^^^^^^^^^^^^^
+AttributeError: 'AsyncLLM' object has no attribute 'renderer'
+
+During handling of the above exception, another exception occurred:
+
+Traceback (most recent call last):
+  File "/opt/spark-ds41f/candidate/vllm/vllm/v1/engine/async_llm.py", line 523, in add_request
+    await self.abort(queue.request_id, internal=True)
+  File "/opt/spark-ds41f/candidate/vllm/vllm/v1/engine/async_llm.py", line 1016, in abort
+    self._pending_mm_retries.pop(req_id, None)
+    ^^^^^^^^^^^^^^^^^^^^^^^^
+AttributeError: 'AsyncLLM' object has no attribute '_pending_mm_retries'
+_______ test_successful_submission_and_completion_keep_normal_cleanup[3] _______
+
+n = 3
+
+    @pytest.mark.parametrize("n", [1, 3])
+    def test_successful_submission_and_completion_keep_normal_cleanup(n):
+        async def run():
+            llm = make_llm()
+            request = make_request(n)
+            queue = await llm.add_request(
+                request.request_id, request, request.sampling_params
+            )
+            assert len(llm.output_processor.request_states) == n
+            assert not llm.engine_core.aborted
+            outputs = [
+                EngineCoreOutput(
+                    request_id=internal_id,
+                    new_token_ids=[1],
+                    finish_reason=FinishReason.STOP,
+                )
+                for internal_id in llm.engine_core.submitted
+            ]
+            llm.output_processor.process_outputs(outputs)
+            assert_empty(llm)
+            result = await queue.get()
+            assert result.finished
+            assert len(result.outputs) == n
+            assert not llm.engine_core.aborted
+    
+>       asyncio.run(run())
+
+tests/v1/engine/test_request_submission_cleanup.py:218: 
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
+/usr/lib/python3.12/asyncio/runners.py:194: in run
+    return runner.run(main)
+           ^^^^^^^^^^^^^^^^
+/usr/lib/python3.12/asyncio/runners.py:118: in run
+    return self._loop.run_until_complete(task)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+/usr/lib/python3.12/asyncio/base_events.py:687: in run_until_complete
+    return future.result()
+           ^^^^^^^^^^^^^^^
+tests/v1/engine/test_request_submission_cleanup.py:198: in run
+    queue = await llm.add_request(
+vllm/v1/engine/async_llm.py:511: in add_request
+    await self._add_request(
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
+
+self = <vllm.v1.engine.async_llm.AsyncLLM object at 0xfea9481a2630>
+request = EngineCoreRequest(request_id='0_shared-external-id-internal-1', prompt_token_ids=[0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11...nded=None, reasoning_parser_kwargs=None, abort_immediately=False, session_id=None, recurrent_instruction_boundary=None)
+prompt = None
+parent_req = <vllm.v1.engine.parallel_sampling.ParentRequest object at 0xfea9481a12b0>
+index = 0
+queue = <vllm.v1.engine.output_processor.RequestOutputCollector object at 0xfea9481a2f00>
+
+    async def _add_request(
+        self,
+        request: EngineCoreRequest,
+        prompt: str | None,
+        parent_req: ParentRequest | None,
+        index: int,
+        queue: RequestOutputCollector,
+    ):
+        if parent_req is None and not self.output_processor.has_request(
+            request.request_id
+        ):
+            self.check_admission(request_id=request.request_id)
+    
+        # Register locally before the first await so concurrent tasks see this request.
+        self.output_processor.add_request(request, prompt, parent_req, index, queue)
+    
+        if (
+>           self.renderer.mm_processor_cache is None
+            ^^^^^^^^^^^^^
+            and self.vllm_config.cache_config.enable_prefix_caching
+            and request.mm_features
+        ):
+E       AttributeError: 'AsyncLLM' object has no attribute 'renderer'
+
+vllm/v1/engine/async_llm.py:597: AttributeError
+----------------------------- Captured stdout call -----------------------------
+ERROR 11-10 04:27:32 [async_llm.py:527] Failed to notify the engine about failed submission shared-external-id-internal-1
+ERROR 11-10 04:27:32 [async_llm.py:527] Traceback (most recent call last):
+ERROR 11-10 04:27:32 [async_llm.py:527]   File "/opt/spark-ds41f/candidate/vllm/vllm/v1/engine/async_llm.py", line 511, in add_request
+ERROR 11-10 04:27:32 [async_llm.py:527]     await self._add_request(
+ERROR 11-10 04:27:32 [async_llm.py:527]   File "/opt/spark-ds41f/candidate/vllm/vllm/v1/engine/async_llm.py", line 597, in _add_request
+ERROR 11-10 04:27:32 [async_llm.py:527]     self.renderer.mm_processor_cache is None
+ERROR 11-10 04:27:32 [async_llm.py:527]     ^^^^^^^^^^^^^
+ERROR 11-10 04:27:32 [async_llm.py:527] AttributeError: 'AsyncLLM' object has no attribute 'renderer'
+ERROR 11-10 04:27:32 [async_llm.py:527] 
+ERROR 11-10 04:27:32 [async_llm.py:527] During handling of the above exception, another exception occurred:
+ERROR 11-10 04:27:32 [async_llm.py:527] 
+ERROR 11-10 04:27:32 [async_llm.py:527] Traceback (most recent call last):
+ERROR 11-10 04:27:32 [async_llm.py:527]   File "/opt/spark-ds41f/candidate/vllm/vllm/v1/engine/async_llm.py", line 523, in add_request
+ERROR 11-10 04:27:32 [async_llm.py:527]     await self.abort(queue.request_id, internal=True)
+ERROR 11-10 04:27:32 [async_llm.py:527]   File "/opt/spark-ds41f/candidate/vllm/vllm/v1/engine/async_llm.py", line 1016, in abort
+ERROR 11-10 04:27:32 [async_llm.py:527]     self._pending_mm_retries.pop(req_id, None)
+ERROR 11-10 04:27:32 [async_llm.py:527]     ^^^^^^^^^^^^^^^^^^^^^^^^
+ERROR 11-10 04:27:32 [async_llm.py:527] AttributeError: 'AsyncLLM' object has no attribute '_pending_mm_retries'
+------------------------------ Captured log call -------------------------------
+ERROR    vllm.v1.engine.async_llm:async_llm.py:527 Failed to notify the engine about failed submission shared-external-id-internal-1
+Traceback (most recent call last):
+  File "/opt/spark-ds41f/candidate/vllm/vllm/v1/engine/async_llm.py", line 511, in add_request
+    await self._add_request(
+  File "/opt/spark-ds41f/candidate/vllm/vllm/v1/engine/async_llm.py", line 597, in _add_request
+    self.renderer.mm_processor_cache is None
+    ^^^^^^^^^^^^^
+AttributeError: 'AsyncLLM' object has no attribute 'renderer'
+
+During handling of the above exception, another exception occurred:
+
+Traceback (most recent call last):
+  File "/opt/spark-ds41f/candidate/vllm/vllm/v1/engine/async_llm.py", line 523, in add_request
+    await self.abort(queue.request_id, internal=True)
+  File "/opt/spark-ds41f/candidate/vllm/vllm/v1/engine/async_llm.py", line 1016, in abort
+    self._pending_mm_retries.pop(req_id, None)
+    ^^^^^^^^^^^^^^^^^^^^^^^^
+AttributeError: 'AsyncLLM' object has no attribute '_pending_mm_retries'
+_________ test_text_only_requests_skip_the_multimodal_fast_path[False] _________
+
+fail = False
+
+    @pytest.mark.parametrize("fail", [False, True])
+    def test_text_only_requests_skip_the_multimodal_fast_path(fail):
+        async def run():
+            llm = make_llm()
+            llm._mm_prefix_fastpath = True
+            llm._p1_cached_mm_identifiers = set()
+            llm._pending_mm_retries = {}
+            llm.renderer = NoRenderer()
+            request = make_request()
+            if fail:
+                llm.engine_core.fail_at = 1
+                with pytest.raises(RuntimeError, match="^submission failed$"):
+                    await llm.add_request(
+                        request.request_id, request, request.sampling_params
+                    )
+            else:
+                queue = await llm.add_request(
+                    request.request_id, request, request.sampling_params
+                )
+                await llm.abort(queue.request_id, internal=True)
+            assert_empty(llm)
+            assert llm.engine_core.aborted == llm.engine_core.submitted
+    
+>       asyncio.run(run())
+
+tests/v1/engine/test_request_submission_cleanup.py:326: 
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
+/usr/lib/python3.12/asyncio/runners.py:194: in run
+    return runner.run(main)
+           ^^^^^^^^^^^^^^^^
+/usr/lib/python3.12/asyncio/runners.py:118: in run
+    return self._loop.run_until_complete(task)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+/usr/lib/python3.12/asyncio/base_events.py:687: in run_until_complete
+    return future.result()
+           ^^^^^^^^^^^^^^^
+tests/v1/engine/test_request_submission_cleanup.py:319: in run
+    queue = await llm.add_request(
+vllm/v1/engine/async_llm.py:498: in add_request
+    await self._add_request(request, prompt_text, None, 0, queue)
+vllm/v1/engine/async_llm.py:597: in _add_request
+    self.renderer.mm_processor_cache is None
+    ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
+
+self = <tests.v1.engine.test_request_submission_cleanup.NoRenderer object at 0xfea9481bc470>
+name = 'mm_processor_cache'
+
+    def __getattr__(self, name):
+>       raise AssertionError(f"a text-only request read renderer.{name}")
+E       AssertionError: a text-only request read renderer.mm_processor_cache
+
+tests/v1/engine/test_request_submission_cleanup.py:300: AssertionError
+_________ test_text_only_requests_skip_the_multimodal_fast_path[True] __________
+
+fail = True
+
+    @pytest.mark.parametrize("fail", [False, True])
+    def test_text_only_requests_skip_the_multimodal_fast_path(fail):
+        async def run():
+            llm = make_llm()
+            llm._mm_prefix_fastpath = True
+            llm._p1_cached_mm_identifiers = set()
+            llm._pending_mm_retries = {}
+            llm.renderer = NoRenderer()
+            request = make_request()
+            if fail:
+                llm.engine_core.fail_at = 1
+                with pytest.raises(RuntimeError, match="^submission failed$"):
+                    await llm.add_request(
+                        request.request_id, request, request.sampling_params
+                    )
+            else:
+                queue = await llm.add_request(
+                    request.request_id, request, request.sampling_params
+                )
+                await llm.abort(queue.request_id, internal=True)
+            assert_empty(llm)
+            assert llm.engine_core.aborted == llm.engine_core.submitted
+    
+>       asyncio.run(run())
+
+tests/v1/engine/test_request_submission_cleanup.py:326: 
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
+/usr/lib/python3.12/asyncio/runners.py:194: in run
+    return runner.run(main)
+           ^^^^^^^^^^^^^^^^
+/usr/lib/python3.12/asyncio/runners.py:118: in run
+    return self._loop.run_until_complete(task)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+/usr/lib/python3.12/asyncio/base_events.py:687: in run_until_complete
+    return future.result()
+           ^^^^^^^^^^^^^^^
+tests/v1/engine/test_request_submission_cleanup.py:315: in run
+    await llm.add_request(
+vllm/v1/engine/async_llm.py:498: in add_request
+    await self._add_request(request, prompt_text, None, 0, queue)
+vllm/v1/engine/async_llm.py:597: in _add_request
+    self.renderer.mm_processor_cache is None
+    ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
+
+self = <tests.v1.engine.test_request_submission_cleanup.NoRenderer object at 0xfea9481a26f0>
+name = 'mm_processor_cache'
+
+    def __getattr__(self, name):
+>       raise AssertionError(f"a text-only request read renderer.{name}")
+E       AssertionError: a text-only request read renderer.mm_processor_cache
+
+tests/v1/engine/test_request_submission_cleanup.py:300: AssertionError
+_______ test_disconnect_during_mm_materialize_rolls_back_all_children[1] _______
+
+n = 1
+
+    @pytest.mark.parametrize("n", [1, 3])
+    def test_disconnect_during_mm_materialize_rolls_back_all_children(n):
+        async def run(executor):
+            llm = make_mm_llm(executor)
+            materializer = Materializer(released=False)
+            request = make_mm_request(materializer, n)
+            generator = llm.generate(
+                request, request.sampling_params, request.request_id
+            )
+            task = asyncio.create_task(anext(generator))
+            try:
+                assert await asyncio.to_thread(materializer.started.wait, 2)
+                # The first child is registered and materializing; nothing is sent.
+                registered = set(llm.output_processor.request_states)
+                assert len(registered) == 1
+                assert llm.output_processor.get_num_queued_tokens() == 65536
+                task.cancel()
+                with pytest.raises(asyncio.CancelledError):
+                    await task
+                await generator.aclose()
+            finally:
+                materializer.release.set()
+            await drain(executor)
+            assert_empty(llm)
+            assert not llm.engine_core.submitted
+            assert set(llm.engine_core.aborted) == registered
+            assert not llm._pending_mm_retries
+            assert not llm._p1_cached_mm_identifiers
+    
+>       run_with_mm_executor(run)
+
+tests/v1/engine/test_request_submission_cleanup.py:358: 
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
+tests/v1/engine/test_request_submission_cleanup.py:279: in run_with_mm_executor
+    asyncio.run(run(executor))
+/usr/lib/python3.12/asyncio/runners.py:194: in run
+    return runner.run(main)
+           ^^^^^^^^^^^^^^^^
+/usr/lib/python3.12/asyncio/runners.py:118: in run
+    return self._loop.run_until_complete(task)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+/usr/lib/python3.12/asyncio/base_events.py:687: in run_until_complete
+    return future.result()
+           ^^^^^^^^^^^^^^^
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
+
+executor = <concurrent.futures.thread.ThreadPoolExecutor object at 0xfea9481bcef0>
+
+    async def run(executor):
+        llm = make_mm_llm(executor)
+        materializer = Materializer(released=False)
+        request = make_mm_request(materializer, n)
+        generator = llm.generate(
+            request, request.sampling_params, request.request_id
+        )
+        task = asyncio.create_task(anext(generator))
+        try:
+>           assert await asyncio.to_thread(materializer.started.wait, 2)
+E           assert False
+
+tests/v1/engine/test_request_submission_cleanup.py:340: AssertionError
+_______ test_disconnect_during_mm_materialize_rolls_back_all_children[3] _______
+
+n = 3
+
+    @pytest.mark.parametrize("n", [1, 3])
+    def test_disconnect_during_mm_materialize_rolls_back_all_children(n):
+        async def run(executor):
+            llm = make_mm_llm(executor)
+            materializer = Materializer(released=False)
+            request = make_mm_request(materializer, n)
+            generator = llm.generate(
+                request, request.sampling_params, request.request_id
+            )
+            task = asyncio.create_task(anext(generator))
+            try:
+                assert await asyncio.to_thread(materializer.started.wait, 2)
+                # The first child is registered and materializing; nothing is sent.
+                registered = set(llm.output_processor.request_states)
+                assert len(registered) == 1
+                assert llm.output_processor.get_num_queued_tokens() == 65536
+                task.cancel()
+                with pytest.raises(asyncio.CancelledError):
+                    await task
+                await generator.aclose()
+            finally:
+                materializer.release.set()
+            await drain(executor)
+            assert_empty(llm)
+            assert not llm.engine_core.submitted
+            assert set(llm.engine_core.aborted) == registered
+            assert not llm._pending_mm_retries
+            assert not llm._p1_cached_mm_identifiers
+    
+>       run_with_mm_executor(run)
+
+tests/v1/engine/test_request_submission_cleanup.py:358: 
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
+tests/v1/engine/test_request_submission_cleanup.py:279: in run_with_mm_executor
+    asyncio.run(run(executor))
+/usr/lib/python3.12/asyncio/runners.py:194: in run
+    return runner.run(main)
+           ^^^^^^^^^^^^^^^^
+/usr/lib/python3.12/asyncio/runners.py:118: in run
+    return self._loop.run_until_complete(task)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+/usr/lib/python3.12/asyncio/base_events.py:687: in run_until_complete
+    return future.result()
+           ^^^^^^^^^^^^^^^
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
+
+executor = <concurrent.futures.thread.ThreadPoolExecutor object at 0xfea9481a2060>
+
+    async def run(executor):
+        llm = make_mm_llm(executor)
+        materializer = Materializer(released=False)
+        request = make_mm_request(materializer, n)
+        generator = llm.generate(
+            request, request.sampling_params, request.request_id
+        )
+        task = asyncio.create_task(anext(generator))
+        try:
+>           assert await asyncio.to_thread(materializer.started.wait, 2)
+E           assert False
+
+tests/v1/engine/test_request_submission_cleanup.py:340: AssertionError
+---------------------------- Captured log teardown -----------------------------
+ERROR    asyncio:base_events.py:1821 Task exception was never retrieved
+future: <Task finished name='Task-46' coro=<<async_generator_asend without __name__>()> exception=EngineGenerateError()>
+Traceback (most recent call last):
+  File "/opt/spark-ds41f/candidate/vllm/vllm/v1/engine/async_llm.py", line 773, in generate
+    q = await self.add_request(
+        ^^^^^^^^^^^^^^^^^^^^^^^
+  File "/opt/spark-ds41f/candidate/vllm/vllm/v1/engine/async_llm.py", line 498, in add_request
+    await self._add_request(request, prompt_text, None, 0, queue)
+  File "/opt/spark-ds41f/candidate/vllm/vllm/v1/engine/async_llm.py", line 597, in _add_request
+    self.renderer.mm_processor_cache is None
+    ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+AttributeError: 'types.SimpleNamespace' object has no attribute 'mm_processor_cache'
+
+The above exception was the direct cause of the following exception:
+
+Traceback (most recent call last):
+  File "/opt/spark-ds41f/candidate/vllm/vllm/v1/engine/async_llm.py", line 854, in generate
+    raise EngineGenerateError() from e
+vllm.v1.engine.exceptions.EngineGenerateError
+______ test_disconnect_during_stripped_mm_send_leaves_no_retry_entry[1-1] ______
+
+fut = <coroutine object Event.wait at 0xfea9435698c0>, timeout = 2
+
+    async def wait_for(fut, timeout):
+        """Wait for the single Future or coroutine to complete, with timeout.
+    
+        Coroutine will be wrapped in Task.
+    
+        Returns result of the Future or coroutine.  When a timeout occurs,
+        it cancels the task and raises TimeoutError.  To avoid the task
+        cancellation, wrap it in shield().
+    
+        If the wait is cancelled, the task is also cancelled.
+    
+        If the task suppresses the cancellation and returns a value instead,
+        that value is returned.
+    
+        This function is a coroutine.
+        """
+        # The special case for timeout <= 0 is for the following case:
+        #
+        # async def test_waitfor():
+        #     func_started = False
+        #
+        #     async def func():
+        #         nonlocal func_started
+        #         func_started = True
+        #
+        #     try:
+        #         await asyncio.wait_for(func(), 0)
+        #     except asyncio.TimeoutError:
+        #         assert not func_started
+        #     else:
+        #         assert False
+        #
+        # asyncio.run(test_waitfor())
+    
+    
+        if timeout is not None and timeout <= 0:
+            fut = ensure_future(fut)
+    
+            if fut.done():
+                return fut.result()
+    
+            await _cancel_and_wait(fut)
+            try:
+                return fut.result()
+            except exceptions.CancelledError as exc:
+                raise TimeoutError from exc
+    
+        async with timeouts.timeout(timeout):
+>           return await fut
+                   ^^^^^^^^^
+
+/usr/lib/python3.12/asyncio/tasks.py:520: 
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
+
+self = <asyncio.locks.Event object at 0xfea9438c8290 [unset]>
+
+    async def wait(self):
+        """Block until the internal flag is true.
+    
+        If the internal flag is true on entry, return True
+        immediately.  Otherwise, block until another coroutine calls
+        set() to set the flag to true, then return True.
+        """
+        if self._value:
+            return True
+    
+        fut = self._get_loop().create_future()
+        self._waiters.append(fut)
+        try:
+>           await fut
+E           asyncio.exceptions.CancelledError
+
+/usr/lib/python3.12/asyncio/locks.py:212: CancelledError
+
+The above exception was the direct cause of the following exception:
+
+n = 1, block_at = 1
+
+    @pytest.mark.parametrize("n, block_at", [(1, 1), (3, 2), (3, 3)])
+    def test_disconnect_during_stripped_mm_send_leaves_no_retry_entry(n, block_at):
+        async def run(executor):
+            llm = make_mm_llm(executor)
+            # An earlier turn sent the image to P1, so this one goes stripped and
+            # keeps a retry materializer in case P1 has since evicted it.
+            llm._p1_cached_mm_identifiers.add("image-1")
+            llm.engine_core.block_at = block_at
+            materializer = Materializer()
+            request = make_mm_request(materializer, n)
+            generator = llm.generate(
+                request, request.sampling_params, request.request_id
+            )
+            task = asyncio.create_task(anext(generator))
+            await asyncio.wait_for(llm.engine_core.entered.wait(), timeout=2)
+            assert len(llm.output_processor.request_states) == block_at
+            assert llm._pending_mm_retries
+            task.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await task
+            await generator.aclose()
+            assert_empty(llm)
+            assert set(llm.engine_core.aborted) == set(llm.engine_core.submitted)
+            assert not llm._pending_mm_retries
+            # The mark is the earlier turn's delivered request's, not this one's.
+            assert llm._p1_cached_mm_identifiers == {"image-1"}
+            assert materializer.calls == 0
+    
+>       run_with_mm_executor(run)
+
+tests/v1/engine/test_request_submission_cleanup.py:389: 
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
+tests/v1/engine/test_request_submission_cleanup.py:279: in run_with_mm_executor
+    asyncio.run(run(executor))
+/usr/lib/python3.12/asyncio/runners.py:194: in run
+    return runner.run(main)
+           ^^^^^^^^^^^^^^^^
+/usr/lib/python3.12/asyncio/runners.py:118: in run
+    return self._loop.run_until_complete(task)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+/usr/lib/python3.12/asyncio/base_events.py:687: in run_until_complete
+    return future.result()
+           ^^^^^^^^^^^^^^^
+tests/v1/engine/test_request_submission_cleanup.py:375: in run
+    await asyncio.wait_for(llm.engine_core.entered.wait(), timeout=2)
+/usr/lib/python3.12/asyncio/tasks.py:519: in wait_for
+    async with timeouts.timeout(timeout):
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
+
+self = <Timeout [expired]>
+exc_type = <class 'asyncio.exceptions.CancelledError'>
+exc_val = CancelledError(), exc_tb = <traceback object at 0xfea942937300>
+
+    async def __aexit__(
+        self,
+        exc_type: Optional[Type[BaseException]],
+        exc_val: Optional[BaseException],
+        exc_tb: Optional[TracebackType],
+    ) -> Optional[bool]:
+        assert self._state in (_State.ENTERED, _State.EXPIRING)
+    
+        if self._timeout_handler is not None:
+            self._timeout_handler.cancel()
+            self._timeout_handler = None
+    
+        if self._state is _State.EXPIRING:
+            self._state = _State.EXPIRED
+    
+            if self._task.uncancel() <= self._cancelling and exc_type is exceptions.CancelledError:
+                # Since there are no new cancel requests, we're
+                # handling this.
+>               raise TimeoutError from exc_val
+E               TimeoutError
+
+/usr/lib/python3.12/asyncio/timeouts.py:115: TimeoutError
+---------------------------- Captured log teardown -----------------------------
+ERROR    asyncio:base_events.py:1821 Task exception was never retrieved
+future: <Task finished name='Task-52' coro=<<async_generator_asend without __name__>()> exception=EngineGenerateError()>
+Traceback (most recent call last):
+  File "/opt/spark-ds41f/candidate/vllm/vllm/v1/engine/async_llm.py", line 773, in generate
+    q = await self.add_request(
+        ^^^^^^^^^^^^^^^^^^^^^^^
+  File "/opt/spark-ds41f/candidate/vllm/vllm/v1/engine/async_llm.py", line 511, in add_request
+    await self._add_request(
+  File "/opt/spark-ds41f/candidate/vllm/vllm/v1/engine/async_llm.py", line 597, in _add_request
+    self.renderer.mm_processor_cache is None
+    ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+AttributeError: 'types.SimpleNamespace' object has no attribute 'mm_processor_cache'
+
+The above exception was the direct cause of the following exception:
+
+Traceback (most recent call last):
+  File "/opt/spark-ds41f/candidate/vllm/vllm/v1/engine/async_llm.py", line 854, in generate
+    raise EngineGenerateError() from e
+vllm.v1.engine.exceptions.EngineGenerateError
+______ test_disconnect_during_stripped_mm_send_leaves_no_retry_entry[3-2] ______
+
+fut = <coroutine object Event.wait at 0xfea9435a4200>, timeout = 2
+
+    async def wait_for(fut, timeout):
+        """Wait for the single Future or coroutine to complete, with timeout.
+    
+        Coroutine will be wrapped in Task.
+    
+        Returns result of the Future or coroutine.  When a timeout occurs,
+        it cancels the task and raises TimeoutError.  To avoid the task
+        cancellation, wrap it in shield().
+    
+        If the wait is cancelled, the task is also cancelled.
+    
+        If the task suppresses the cancellation and returns a value instead,
+        that value is returned.
+    
+        This function is a coroutine.
+        """
+        # The special case for timeout <= 0 is for the following case:
+        #
+        # async def test_waitfor():
+        #     func_started = False
+        #
+        #     async def func():
+        #         nonlocal func_started
+        #         func_started = True
+        #
+        #     try:
+        #         await asyncio.wait_for(func(), 0)
+        #     except asyncio.TimeoutError:
+        #         assert not func_started
+        #     else:
+        #         assert False
+        #
+        # asyncio.run(test_waitfor())
+    
+    
+        if timeout is not None and timeout <= 0:
+            fut = ensure_future(fut)
+    
+            if fut.done():
+                return fut.result()
+    
+            await _cancel_and_wait(fut)
+            try:
+                return fut.result()
+            except exceptions.CancelledError as exc:
+                raise TimeoutError from exc
+    
+        async with timeouts.timeout(timeout):
+>           return await fut
+                   ^^^^^^^^^
+
+/usr/lib/python3.12/asyncio/tasks.py:520: 
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
+
+self = <asyncio.locks.Event object at 0xfea9481b2360 [unset]>
+
+    async def wait(self):
+        """Block until the internal flag is true.
+    
+        If the internal flag is true on entry, return True
+        immediately.  Otherwise, block until another coroutine calls
+        set() to set the flag to true, then return True.
+        """
+        if self._value:
+            return True
+    
+        fut = self._get_loop().create_future()
+        self._waiters.append(fut)
+        try:
+>           await fut
+E           asyncio.exceptions.CancelledError
+
+/usr/lib/python3.12/asyncio/locks.py:212: CancelledError
+
+The above exception was the direct cause of the following exception:
+
+n = 3, block_at = 2
+
+    @pytest.mark.parametrize("n, block_at", [(1, 1), (3, 2), (3, 3)])
+    def test_disconnect_during_stripped_mm_send_leaves_no_retry_entry(n, block_at):
+        async def run(executor):
+            llm = make_mm_llm(executor)
+            # An earlier turn sent the image to P1, so this one goes stripped and
+            # keeps a retry materializer in case P1 has since evicted it.
+            llm._p1_cached_mm_identifiers.add("image-1")
+            llm.engine_core.block_at = block_at
+            materializer = Materializer()
+            request = make_mm_request(materializer, n)
+            generator = llm.generate(
+                request, request.sampling_params, request.request_id
+            )
+            task = asyncio.create_task(anext(generator))
+            await asyncio.wait_for(llm.engine_core.entered.wait(), timeout=2)
+            assert len(llm.output_processor.request_states) == block_at
+            assert llm._pending_mm_retries
+            task.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await task
+            await generator.aclose()
+            assert_empty(llm)
+            assert set(llm.engine_core.aborted) == set(llm.engine_core.submitted)
+            assert not llm._pending_mm_retries
+            # The mark is the earlier turn's delivered request's, not this one's.
+            assert llm._p1_cached_mm_identifiers == {"image-1"}
+            assert materializer.calls == 0
+    
+>       run_with_mm_executor(run)
+
+tests/v1/engine/test_request_submission_cleanup.py:389: 
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
+tests/v1/engine/test_request_submission_cleanup.py:279: in run_with_mm_executor
+    asyncio.run(run(executor))
+/usr/lib/python3.12/asyncio/runners.py:194: in run
+    return runner.run(main)
+           ^^^^^^^^^^^^^^^^
+/usr/lib/python3.12/asyncio/runners.py:118: in run
+    return self._loop.run_until_complete(task)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+/usr/lib/python3.12/asyncio/base_events.py:687: in run_until_complete
+    return future.result()
+           ^^^^^^^^^^^^^^^
+tests/v1/engine/test_request_submission_cleanup.py:375: in run
+    await asyncio.wait_for(llm.engine_core.entered.wait(), timeout=2)
+/usr/lib/python3.12/asyncio/tasks.py:519: in wait_for
+    async with timeouts.timeout(timeout):
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
+
+self = <Timeout [expired]>
+exc_type = <class 'asyncio.exceptions.CancelledError'>
+exc_val = CancelledError(), exc_tb = <traceback object at 0xfea942b4af00>
+
+    async def __aexit__(
+        self,
+        exc_type: Optional[Type[BaseException]],
+        exc_val: Optional[BaseException],
+        exc_tb: Optional[TracebackType],
+    ) -> Optional[bool]:
+        assert self._state in (_State.ENTERED, _State.EXPIRING)
+    
+        if self._timeout_handler is not None:
+            self._timeout_handler.cancel()
+            self._timeout_handler = None
+    
+        if self._state is _State.EXPIRING:
+            self._state = _State.EXPIRED
+    
+            if self._task.uncancel() <= self._cancelling and exc_type is exceptions.CancelledError:
+                # Since there are no new cancel requests, we're
+                # handling this.
+>               raise TimeoutError from exc_val
+E               TimeoutError
+
+/usr/lib/python3.12/asyncio/timeouts.py:115: TimeoutError
+---------------------------- Captured log teardown -----------------------------
+ERROR    asyncio:base_events.py:1821 Task exception was never retrieved
+future: <Task finished name='Task-58' coro=<<async_generator_asend without __name__>()> exception=EngineGenerateError()>
+Traceback (most recent call last):
+  File "/opt/spark-ds41f/candidate/vllm/vllm/v1/engine/async_llm.py", line 773, in generate
+    q = await self.add_request(
+        ^^^^^^^^^^^^^^^^^^^^^^^
+  File "/opt/spark-ds41f/candidate/vllm/vllm/v1/engine/async_llm.py", line 498, in add_request
+    await self._add_request(request, prompt_text, None, 0, queue)
+  File "/opt/spark-ds41f/candidate/vllm/vllm/v1/engine/async_llm.py", line 597, in _add_request
+    self.renderer.mm_processor_cache is None
+    ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+AttributeError: 'types.SimpleNamespace' object has no attribute 'mm_processor_cache'
+
+The above exception was the direct cause of the following exception:
+
+Traceback (most recent call last):
+  File "/opt/spark-ds41f/candidate/vllm/vllm/v1/engine/async_llm.py", line 854, in generate
+    raise EngineGenerateError() from e
+vllm.v1.engine.exceptions.EngineGenerateError
+______ test_disconnect_during_stripped_mm_send_leaves_no_retry_entry[3-3] ______
+
+fut = <coroutine object Event.wait at 0xfea9435a4ac0>, timeout = 2
+
+    async def wait_for(fut, timeout):
+        """Wait for the single Future or coroutine to complete, with timeout.
+    
+        Coroutine will be wrapped in Task.
+    
+        Returns result of the Future or coroutine.  When a timeout occurs,
+        it cancels the task and raises TimeoutError.  To avoid the task
+        cancellation, wrap it in shield().
+    
+        If the wait is cancelled, the task is also cancelled.
+    
+        If the task suppresses the cancellation and returns a value instead,
+        that value is returned.
+    
+        This function is a coroutine.
+        """
+        # The special case for timeout <= 0 is for the following case:
+        #
+        # async def test_waitfor():
+        #     func_started = False
+        #
+        #     async def func():
+        #         nonlocal func_started
+        #         func_started = True
+        #
+        #     try:
+        #         await asyncio.wait_for(func(), 0)
+        #     except asyncio.TimeoutError:
+        #         assert not func_started
+        #     else:
+        #         assert False
+        #
+        # asyncio.run(test_waitfor())
+    
+    
+        if timeout is not None and timeout <= 0:
+            fut = ensure_future(fut)
+    
+            if fut.done():
+                return fut.result()
+    
+            await _cancel_and_wait(fut)
+            try:
+                return fut.result()
+            except exceptions.CancelledError as exc:
+                raise TimeoutError from exc
+    
+        async with timeouts.timeout(timeout):
+>           return await fut
+                   ^^^^^^^^^
+
+/usr/lib/python3.12/asyncio/tasks.py:520: 
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
+
+self = <asyncio.locks.Event object at 0xfea9481bf7d0 [unset]>
+
+    async def wait(self):
+        """Block until the internal flag is true.
+    
+        If the internal flag is true on entry, return True
+        immediately.  Otherwise, block until another coroutine calls
+        set() to set the flag to true, then return True.
+        """
+        if self._value:
+            return True
+    
+        fut = self._get_loop().create_future()
+        self._waiters.append(fut)
+        try:
+>           await fut
+E           asyncio.exceptions.CancelledError
+
+/usr/lib/python3.12/asyncio/locks.py:212: CancelledError
+
+The above exception was the direct cause of the following exception:
+
+n = 3, block_at = 3
+
+    @pytest.mark.parametrize("n, block_at", [(1, 1), (3, 2), (3, 3)])
+    def test_disconnect_during_stripped_mm_send_leaves_no_retry_entry(n, block_at):
+        async def run(executor):
+            llm = make_mm_llm(executor)
+            # An earlier turn sent the image to P1, so this one goes stripped and
+            # keeps a retry materializer in case P1 has since evicted it.
+            llm._p1_cached_mm_identifiers.add("image-1")
+            llm.engine_core.block_at = block_at
+            materializer = Materializer()
+            request = make_mm_request(materializer, n)
+            generator = llm.generate(
+                request, request.sampling_params, request.request_id
+            )
+            task = asyncio.create_task(anext(generator))
+            await asyncio.wait_for(llm.engine_core.entered.wait(), timeout=2)
+            assert len(llm.output_processor.request_states) == block_at
+            assert llm._pending_mm_retries
+            task.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await task
+            await generator.aclose()
+            assert_empty(llm)
+            assert set(llm.engine_core.aborted) == set(llm.engine_core.submitted)
+            assert not llm._pending_mm_retries
+            # The mark is the earlier turn's delivered request's, not this one's.
+            assert llm._p1_cached_mm_identifiers == {"image-1"}
+            assert materializer.calls == 0
+    
+>       run_with_mm_executor(run)
+
+tests/v1/engine/test_request_submission_cleanup.py:389: 
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
+tests/v1/engine/test_request_submission_cleanup.py:279: in run_with_mm_executor
+    asyncio.run(run(executor))
+/usr/lib/python3.12/asyncio/runners.py:194: in run
+    return runner.run(main)
+           ^^^^^^^^^^^^^^^^
+/usr/lib/python3.12/asyncio/runners.py:118: in run
+    return self._loop.run_until_complete(task)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+/usr/lib/python3.12/asyncio/base_events.py:687: in run_until_complete
+    return future.result()
+           ^^^^^^^^^^^^^^^
+tests/v1/engine/test_request_submission_cleanup.py:375: in run
+    await asyncio.wait_for(llm.engine_core.entered.wait(), timeout=2)
+/usr/lib/python3.12/asyncio/tasks.py:519: in wait_for
+    async with timeouts.timeout(timeout):
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
+
+self = <Timeout [expired]>
+exc_type = <class 'asyncio.exceptions.CancelledError'>
+exc_val = CancelledError(), exc_tb = <traceback object at 0xfea942f7de80>
+
+    async def __aexit__(
+        self,
+        exc_type: Optional[Type[BaseException]],
+        exc_val: Optional[BaseException],
+        exc_tb: Optional[TracebackType],
+    ) -> Optional[bool]:
+        assert self._state in (_State.ENTERED, _State.EXPIRING)
+    
+        if self._timeout_handler is not None:
+            self._timeout_handler.cancel()
+            self._timeout_handler = None
+    
+        if self._state is _State.EXPIRING:
+            self._state = _State.EXPIRED
+    
+            if self._task.uncancel() <= self._cancelling and exc_type is exceptions.CancelledError:
+                # Since there are no new cancel requests, we're
+                # handling this.
+>               raise TimeoutError from exc_val
+E               TimeoutError
+
+/usr/lib/python3.12/asyncio/timeouts.py:115: TimeoutError
+---------------------------- Captured log teardown -----------------------------
+ERROR    asyncio:base_events.py:1821 Task exception was never retrieved
+future: <Task finished name='Task-64' coro=<<async_generator_asend without __name__>()> exception=EngineGenerateError()>
+Traceback (most recent call last):
+  File "/opt/spark-ds41f/candidate/vllm/vllm/v1/engine/async_llm.py", line 773, in generate
+    q = await self.add_request(
+        ^^^^^^^^^^^^^^^^^^^^^^^
+  File "/opt/spark-ds41f/candidate/vllm/vllm/v1/engine/async_llm.py", line 511, in add_request
+    await self._add_request(
+  File "/opt/spark-ds41f/candidate/vllm/vllm/v1/engine/async_llm.py", line 597, in _add_request
+    self.renderer.mm_processor_cache is None
+    ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+AttributeError: 'types.SimpleNamespace' object has no attribute 'mm_processor_cache'
+
+The above exception was the direct cause of the following exception:
+
+Traceback (most recent call last):
+  File "/opt/spark-ds41f/candidate/vllm/vllm/v1/engine/async_llm.py", line 854, in generate
+    raise EngineGenerateError() from e
+vllm.v1.engine.exceptions.EngineGenerateError
+________ test_failed_mm_submission_unmarks_items_it_did_not_deliver[1] _________
+
+n = 1
+
+    @pytest.mark.parametrize("n", [1, 3])
+    def test_failed_mm_submission_unmarks_items_it_did_not_deliver(n):
+        async def run(executor):
+            llm = make_mm_llm(executor)
+            llm.engine_core.fail_at = n
+            materializer = Materializer()
+            request = make_mm_request(materializer, n)
+            with pytest.raises(RuntimeError, match="^submission failed$"):
+                await llm.add_request(request.request_id, request, request.sampling_params)
+            assert_empty(llm)
+            assert set(llm.engine_core.aborted) == set(llm.engine_core.submitted)
+            assert not llm._pending_mm_retries
+            assert materializer.calls == 1
+            if n == 1:
+                # Its only send failed: P1 never received the image.
+                assert not llm._p1_cached_mm_identifiers
+            else:
+                # The first child delivered the image before the last send failed.
+                # As for any aborted request, the mark stays a hint: P1 verifies a
+                # stripped item and returns a retryable miss if it lacks it.
+                assert llm._p1_cached_mm_identifiers == {"image-1"}
+    
+>       run_with_mm_executor(run)
+
+tests/v1/engine/test_request_submission_cleanup.py:414: 
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
+tests/v1/engine/test_request_submission_cleanup.py:279: in run_with_mm_executor
+    asyncio.run(run(executor))
+/usr/lib/python3.12/asyncio/runners.py:194: in run
+    return runner.run(main)
+           ^^^^^^^^^^^^^^^^
+/usr/lib/python3.12/asyncio/runners.py:118: in run
+    return self._loop.run_until_complete(task)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+/usr/lib/python3.12/asyncio/base_events.py:687: in run_until_complete
+    return future.result()
+           ^^^^^^^^^^^^^^^
+tests/v1/engine/test_request_submission_cleanup.py:400: in run
+    await llm.add_request(request.request_id, request, request.sampling_params)
+vllm/v1/engine/async_llm.py:498: in add_request
+    await self._add_request(request, prompt_text, None, 0, queue)
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
+
+self = <vllm.v1.engine.async_llm.AsyncLLM object at 0xfea9438c8c20>
+request = EngineCoreRequest(request_id='shared-external-id-internal-1', prompt_token_ids=[0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, ...nded=None, reasoning_parser_kwargs=None, abort_immediately=False, session_id=None, recurrent_instruction_boundary=None)
+prompt = None, parent_req = None, index = 0
+queue = <vllm.v1.engine.output_processor.RequestOutputCollector object at 0xfea9481a1430>
+
+    async def _add_request(
+        self,
+        request: EngineCoreRequest,
+        prompt: str | None,
+        parent_req: ParentRequest | None,
+        index: int,
+        queue: RequestOutputCollector,
+    ):
+        if parent_req is None and not self.output_processor.has_request(
+            request.request_id
+        ):
+            self.check_admission(request_id=request.request_id)
+    
+        # Register locally before the first await so concurrent tasks see this request.
+        self.output_processor.add_request(request, prompt, parent_req, index, queue)
+    
+        if (
+>           self.renderer.mm_processor_cache is None
+            ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+            and self.vllm_config.cache_config.enable_prefix_caching
+            and request.mm_features
+        ):
+E       AttributeError: 'types.SimpleNamespace' object has no attribute 'mm_processor_cache'
+
+vllm/v1/engine/async_llm.py:597: AttributeError
+---------------------------- Captured log teardown -----------------------------
+ERROR    asyncio:base_events.py:1821 Task exception was never retrieved
+future: <Task finished name='Task-70' coro=<<async_generator_asend without __name__>()> exception=EngineGenerateError()>
+Traceback (most recent call last):
+  File "/opt/spark-ds41f/candidate/vllm/vllm/v1/engine/async_llm.py", line 773, in generate
+    q = await self.add_request(
+        ^^^^^^^^^^^^^^^^^^^^^^^
+  File "/opt/spark-ds41f/candidate/vllm/vllm/v1/engine/async_llm.py", line 511, in add_request
+    await self._add_request(
+  File "/opt/spark-ds41f/candidate/vllm/vllm/v1/engine/async_llm.py", line 597, in _add_request
+    self.renderer.mm_processor_cache is None
+    ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+AttributeError: 'types.SimpleNamespace' object has no attribute 'mm_processor_cache'
+
+The above exception was the direct cause of the following exception:
+
+Traceback (most recent call last):
+  File "/opt/spark-ds41f/candidate/vllm/vllm/v1/engine/async_llm.py", line 854, in generate
+    raise EngineGenerateError() from e
+vllm.v1.engine.exceptions.EngineGenerateError
+________ test_failed_mm_submission_unmarks_items_it_did_not_deliver[3] _________
+
+n = 3
+
+    @pytest.mark.parametrize("n", [1, 3])
+    def test_failed_mm_submission_unmarks_items_it_did_not_deliver(n):
+        async def run(executor):
+            llm = make_mm_llm(executor)
+            llm.engine_core.fail_at = n
+            materializer = Materializer()
+            request = make_mm_request(materializer, n)
+            with pytest.raises(RuntimeError, match="^submission failed$"):
+                await llm.add_request(request.request_id, request, request.sampling_params)
+            assert_empty(llm)
+            assert set(llm.engine_core.aborted) == set(llm.engine_core.submitted)
+            assert not llm._pending_mm_retries
+            assert materializer.calls == 1
+            if n == 1:
+                # Its only send failed: P1 never received the image.
+                assert not llm._p1_cached_mm_identifiers
+            else:
+                # The first child delivered the image before the last send failed.
+                # As for any aborted request, the mark stays a hint: P1 verifies a
+                # stripped item and returns a retryable miss if it lacks it.
+                assert llm._p1_cached_mm_identifiers == {"image-1"}
+    
+>       run_with_mm_executor(run)
+
+tests/v1/engine/test_request_submission_cleanup.py:414: 
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
+tests/v1/engine/test_request_submission_cleanup.py:279: in run_with_mm_executor
+    asyncio.run(run(executor))
+/usr/lib/python3.12/asyncio/runners.py:194: in run
+    return runner.run(main)
+           ^^^^^^^^^^^^^^^^
+/usr/lib/python3.12/asyncio/runners.py:118: in run
+    return self._loop.run_until_complete(task)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+/usr/lib/python3.12/asyncio/base_events.py:687: in run_until_complete
+    return future.result()
+           ^^^^^^^^^^^^^^^
+tests/v1/engine/test_request_submission_cleanup.py:400: in run
+    await llm.add_request(request.request_id, request, request.sampling_params)
+vllm/v1/engine/async_llm.py:511: in add_request
+    await self._add_request(
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
+
+self = <vllm.v1.engine.async_llm.AsyncLLM object at 0xfea9481a0ec0>
+request = EngineCoreRequest(request_id='0_shared-external-id-internal-1', prompt_token_ids=[0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11...nded=None, reasoning_parser_kwargs=None, abort_immediately=False, session_id=None, recurrent_instruction_boundary=None)
+prompt = None
+parent_req = <vllm.v1.engine.parallel_sampling.ParentRequest object at 0xfea9438c8b30>
+index = 0
+queue = <vllm.v1.engine.output_processor.RequestOutputCollector object at 0xfea9438ca660>
+
+    async def _add_request(
+        self,
+        request: EngineCoreRequest,
+        prompt: str | None,
+        parent_req: ParentRequest | None,
+        index: int,
+        queue: RequestOutputCollector,
+    ):
+        if parent_req is None and not self.output_processor.has_request(
+            request.request_id
+        ):
+            self.check_admission(request_id=request.request_id)
+    
+        # Register locally before the first await so concurrent tasks see this request.
+        self.output_processor.add_request(request, prompt, parent_req, index, queue)
+    
+        if (
+>           self.renderer.mm_processor_cache is None
+            ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+            and self.vllm_config.cache_config.enable_prefix_caching
+            and request.mm_features
+        ):
+E       AttributeError: 'types.SimpleNamespace' object has no attribute 'mm_processor_cache'
+
+vllm/v1/engine/async_llm.py:597: AttributeError
+_______________ test_output_handler_starts_on_a_fast_path_engine _______________
+
+    def test_output_handler_starts_on_a_fast_path_engine():
+        # Starting the handler defines the cache-miss retry coroutine, and Python
+        # evaluates its annotations then: a name the module does not import makes
+        # every server start fail.
+        async def run(executor):
+            llm = make_mm_llm(executor)
+            start_output_handler(llm)
+            try:
+                await asyncio.sleep(0)
+                assert not llm.output_handler.done()
+            finally:
+                await stop_output_handler(llm)
+    
+>       run_with_mm_executor(run)
+
+tests/v1/engine/test_request_submission_cleanup.py:454: 
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
+tests/v1/engine/test_request_submission_cleanup.py:279: in run_with_mm_executor
+    asyncio.run(run(executor))
+/usr/lib/python3.12/asyncio/runners.py:194: in run
+    return runner.run(main)
+           ^^^^^^^^^^^^^^^^
+/usr/lib/python3.12/asyncio/runners.py:118: in run
+    return self._loop.run_until_complete(task)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+/usr/lib/python3.12/asyncio/base_events.py:687: in run_until_complete
+    return future.result()
+           ^^^^^^^^^^^^^^^
+tests/v1/engine/test_request_submission_cleanup.py:447: in run
+    start_output_handler(llm)
+tests/v1/engine/test_request_submission_cleanup.py:431: in start_output_handler
+    AsyncLLM._run_output_handler(llm)
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
+
+self = <vllm.v1.engine.async_llm.AsyncLLM object at 0xfea9438c9460>
+
+    def _run_output_handler(self):
+        """Background loop: pulls from EngineCore and pushes to AsyncStreams."""
+    
+        if self.output_handler is not None:
+            return
+    
+        # Ensure that the task doesn't have a circular ref back to the AsyncLLM
+        # object, or else it won't be garbage collected and cleaned up properly.
+        engine_core = self.engine_core
+        output_processor = self.output_processor
+        log_stats = self.log_stats
+        # We use a mutable list for logger_manager so that it can be updated
+        # during elastic EP scaling (see scale_elastic_ep) without creating
+        # a circular reference via self.
+        self._logger_ref = [self.logger_manager]
+        logger_ref = self._logger_ref
+        renderer = self.renderer
+        # P0 multi-modal sender ("shadow") cache; None for text-only models.
+        mm_processor_cache = renderer.mm_processor_cache
+        pending_mm_retries = self._pending_mm_retries
+        p1_cached_mm_identifiers = self._p1_cached_mm_identifiers
+        chunk_size = envs.VLLM_V1_OUTPUT_PROC_CHUNK_SIZE
+    
+        async def _retry_mm_cache_miss(
+            retry_req: EngineCoreRequest,
+>           materializers: dict[str, Callable[[], Any]],
+                                     ^^^^^^^^
+            missed_hashes: list[str],
+        ) -> None:
+E       NameError: name 'Callable' is not defined
+
+vllm/v1/engine/async_llm.py:890: NameError
+___________ test_abort_during_mm_retry_materialize_does_not_resubmit ___________
+
+    def test_abort_during_mm_retry_materialize_does_not_resubmit():
+        async def run(executor):
+            llm = make_mm_llm(executor)
+            llm._p1_cached_mm_identifiers.add("image-1")
+            materializer = Materializer(released=False)
+            request = make_mm_request(materializer)
+            queue = await llm.add_request(
+                request.request_id, request, request.sampling_params
+            )
+            request_id = queue.request_id
+            assert request.mm_features[0].data is None
+            assert request_id in llm._pending_mm_retries
+    
+            outputs, polls = start_output_handler(llm)
+            try:
+                # P1 has evicted the image from both caches: a retryable miss.
+                outputs.put_nowait(
+                    EngineCoreOutputs(
+                        outputs=[
+                            EngineCoreOutput(
+                                request_id=request_id,
+                                new_token_ids=[],
+                                finish_reason=FinishReason.ERROR,
+                                mm_cache_miss_hashes=["image-1"],
+                            )
+                        ],
+                        finished_requests={request_id},
+                    )
+                )
+                try:
+                    assert await asyncio.to_thread(materializer.started.wait, 2)
+                    # The client disconnects while the retry materializes the image.
+                    await llm.abort(request_id, internal=True)
+                finally:
+                    materializer.release.set()
+                await drain(executor)
+                # The handler has finished the batch once it asks for the next one.
+                await until(lambda: polls[0] == 2)
+                assert llm.engine_core.submitted == [request_id]
+                assert "image-1" not in llm._p1_cached_mm_identifiers
+                assert not llm._pending_mm_retries
+                assert_empty(llm)
+                assert not llm.output_handler.done()
+            finally:
+                await stop_output_handler(llm)
+    
+>       run_with_mm_executor(run)
+
+tests/v1/engine/test_request_submission_cleanup.py:503: 
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
+tests/v1/engine/test_request_submission_cleanup.py:279: in run_with_mm_executor
+    asyncio.run(run(executor))
+/usr/lib/python3.12/asyncio/runners.py:194: in run
+    return runner.run(main)
+           ^^^^^^^^^^^^^^^^
+/usr/lib/python3.12/asyncio/runners.py:118: in run
+    return self._loop.run_until_complete(task)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+/usr/lib/python3.12/asyncio/base_events.py:687: in run_until_complete
+    return future.result()
+           ^^^^^^^^^^^^^^^
+tests/v1/engine/test_request_submission_cleanup.py:463: in run
+    queue = await llm.add_request(
+vllm/v1/engine/async_llm.py:498: in add_request
+    await self._add_request(request, prompt_text, None, 0, queue)
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
+
+self = <vllm.v1.engine.async_llm.AsyncLLM object at 0xfea9438c9f10>
+request = EngineCoreRequest(request_id='shared-external-id-internal-1', prompt_token_ids=[0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, ...nded=None, reasoning_parser_kwargs=None, abort_immediately=False, session_id=None, recurrent_instruction_boundary=None)
+prompt = None, parent_req = None, index = 0
+queue = <vllm.v1.engine.output_processor.RequestOutputCollector object at 0xfea9438c8110>
+
+    async def _add_request(
+        self,
+        request: EngineCoreRequest,
+        prompt: str | None,
+        parent_req: ParentRequest | None,
+        index: int,
+        queue: RequestOutputCollector,
+    ):
+        if parent_req is None and not self.output_processor.has_request(
+            request.request_id
+        ):
+            self.check_admission(request_id=request.request_id)
+    
+        # Register locally before the first await so concurrent tasks see this request.
+        self.output_processor.add_request(request, prompt, parent_req, index, queue)
+    
+        if (
+>           self.renderer.mm_processor_cache is None
+            ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+            and self.vllm_config.cache_config.enable_prefix_caching
+            and request.mm_features
+        ):
+E       AttributeError: 'types.SimpleNamespace' object has no attribute 'mm_processor_cache'
+
+vllm/v1/engine/async_llm.py:597: AttributeError
+=============================== warnings summary ===============================
+../../../../usr/local/lib/python3.12/dist-packages/torch/jit/_script.py:365: 14 warnings
+  /usr/local/lib/python3.12/dist-packages/torch/jit/_script.py:365: DeprecationWarning: `torch.jit.script_method` is deprecated. Please switch to `torch.compile` or `torch.export`.
+    warnings.warn(
+
+-- Docs: https://docs.pytest.org/en/stable/how-to/capture-warnings.html
+=========================== short test summary info ============================
+FAILED tests/v1/engine/test_request_submission_cleanup.py::test_failed_submission_rolls_back_registered_prompt[False]
+FAILED tests/v1/engine/test_request_submission_cleanup.py::test_failed_submission_rolls_back_registered_prompt[True]
+FAILED tests/v1/engine/test_request_submission_cleanup.py::test_repeated_failed_submissions_do_not_accumulate_prompt_history
+FAILED tests/v1/engine/test_request_submission_cleanup.py::test_disconnect_during_submission_rolls_back_all_children[1-1]
+FAILED tests/v1/engine/test_request_submission_cleanup.py::test_disconnect_during_submission_rolls_back_all_children[3-2]
+FAILED tests/v1/engine/test_request_submission_cleanup.py::test_disconnect_during_submission_rolls_back_all_children[3-3]
+FAILED tests/v1/engine/test_request_submission_cleanup.py::test_failure_does_not_abort_another_request_reusing_external_id[1]
+FAILED tests/v1/engine/test_request_submission_cleanup.py::test_failure_does_not_abort_another_request_reusing_external_id[3]
+FAILED tests/v1/engine/test_request_submission_cleanup.py::test_successful_submission_and_completion_keep_normal_cleanup[1]
+FAILED tests/v1/engine/test_request_submission_cleanup.py::test_successful_submission_and_completion_keep_normal_cleanup[3]
+FAILED tests/v1/engine/test_request_submission_cleanup.py::test_text_only_requests_skip_the_multimodal_fast_path[False]
+FAILED tests/v1/engine/test_request_submission_cleanup.py::test_text_only_requests_skip_the_multimodal_fast_path[True]
+FAILED tests/v1/engine/test_request_submission_cleanup.py::test_disconnect_during_mm_materialize_rolls_back_all_children[1]
+FAILED tests/v1/engine/test_request_submission_cleanup.py::test_disconnect_during_mm_materialize_rolls_back_all_children[3]
+FAILED tests/v1/engine/test_request_submission_cleanup.py::test_disconnect_during_stripped_mm_send_leaves_no_retry_entry[1-1]
+FAILED tests/v1/engine/test_request_submission_cleanup.py::test_disconnect_during_stripped_mm_send_leaves_no_retry_entry[3-2]
+FAILED tests/v1/engine/test_request_submission_cleanup.py::test_disconnect_during_stripped_mm_send_leaves_no_retry_entry[3-3]
+FAILED tests/v1/engine/test_request_submission_cleanup.py::test_failed_mm_submission_unmarks_items_it_did_not_deliver[1]
+FAILED tests/v1/engine/test_request_submission_cleanup.py::test_failed_mm_submission_unmarks_items_it_did_not_deliver[3]
+FAILED tests/v1/engine/test_request_submission_cleanup.py::test_output_handler_starts_on_a_fast_path_engine
+FAILED tests/v1/engine/test_request_submission_cleanup.py::test_abort_during_mm_retry_materialize_does_not_resubmit
+21 failed, 14 warnings in 19.82s
+# exit 1, finished 2026-11-10T04:27:45Z
