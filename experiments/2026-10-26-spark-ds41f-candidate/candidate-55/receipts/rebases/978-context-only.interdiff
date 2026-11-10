@@ -1,0 +1,182 @@
+--- PR #978 patch (before)
++++ rebased on candidate-54 (after)
+@@ -1,4 +1,4 @@
+-From ef9b08de18e75554d46d4cc5c3acd3b166f245e0 Mon Sep 17 00:00:00 2001
++From 23c4e75aa3d58247720d07d4be923499768e2f1d Mon Sep 17 00:00:00 2001
+ From: Christopher Owen <christopherowen@users.noreply.github.com>
+ Date: Sun, 8 Nov 2026 14:53:04 +0000
+ Subject: [PATCH] perf(multimodal): prefix-cache fastpath under
+@@ -40,7 +40,7 @@
+ 
+ diff --git a/tests/multimodal/test_prefix_cache_fastpath.py b/tests/multimodal/test_prefix_cache_fastpath.py
+ new file mode 100644
+-index 0000000..81f3471
++index 000000000..81f3471a4
+ --- /dev/null
+ +++ b/tests/multimodal/test_prefix_cache_fastpath.py
+ @@ -0,0 +1,380 @@
+@@ -425,7 +425,7 @@
+ +    assert not lazy_kw.is_lazy
+ +    assert hf_calls == 2
+ diff --git a/vllm/multimodal/hasher.py b/vllm/multimodal/hasher.py
+-index a432afd..09e806c 100644
++index a432afdc9..09e806cb6 100644
+ --- a/vllm/multimodal/hasher.py
+ +++ b/vllm/multimodal/hasher.py
+ @@ -38,7 +38,7 @@ def _get_hasher_factory(
+@@ -438,7 +438,7 @@
+          return hashlib.sha256
+      elif algorithm == "sha512":
+ diff --git a/vllm/multimodal/inputs.py b/vllm/multimodal/inputs.py
+-index bd1fc16..34a30a0 100644
++index bd1fc169d..34a30a009 100644
+ --- a/vllm/multimodal/inputs.py
+ +++ b/vllm/multimodal/inputs.py
+ @@ -3,7 +3,7 @@
+@@ -559,7 +559,7 @@
+  
+  
+ diff --git a/vllm/multimodal/media/image.py b/vllm/multimodal/media/image.py
+-index 5b05176..4af3fa4 100644
++index 5b05176f5..4af3fa41f 100644
+ --- a/vllm/multimodal/media/image.py
+ +++ b/vllm/multimodal/media/image.py
+ @@ -2,12 +2,16 @@
+@@ -763,7 +763,7 @@
+  
+      def load_base64(self, media_type: str, data: str) -> MediaWithBytes[Image.Image]:
+ diff --git a/vllm/multimodal/processing/processor.py b/vllm/multimodal/processing/processor.py
+-index 3db8204..ed4ff01 100644
++index 3db820458..ed4ff014a 100644
+ --- a/vllm/multimodal/processing/processor.py
+ +++ b/vllm/multimodal/processing/processor.py
+ @@ -1,7 +1,8 @@
+@@ -983,7 +983,7 @@
+  
+          with timing_ctx.record("get_mm_hashes"):
+ diff --git a/vllm/renderers/base.py b/vllm/renderers/base.py
+-index 4aca17f..2f7eedf 100644
++index 4aca17fa4..2f7eedf9c 100644
+ --- a/vllm/renderers/base.py
+ +++ b/vllm/renderers/base.py
+ @@ -225,6 +225,8 @@ class BaseRenderer(ABC, Generic[_T]):
+@@ -1004,10 +1004,10 @@
+      def _warmup_mm_processor(
+          self,
+ diff --git a/vllm/v1/core/sched/scheduler.py b/vllm/v1/core/sched/scheduler.py
+-index b61ec52..fc9b431 100644
++index d1015e71b..80a265a04 100644
+ --- a/vllm/v1/core/sched/scheduler.py
+ +++ b/vllm/v1/core/sched/scheduler.py
+-@@ -3367,6 +3367,30 @@ class Scheduler(SchedulerInterface):
++@@ -3415,6 +3415,30 @@ class Scheduler(SchedulerInterface):
+                  num_embeds_to_schedule += num_encoder_embeds
+                  continue
+  
+@@ -1039,10 +1039,10 @@
+              encoder_compute_budget -= num_encoder_embeds
+              mm_hashes_to_schedule.add(item_identifier)
+ diff --git a/vllm/v1/engine/async_llm.py b/vllm/v1/engine/async_llm.py
+-index 32c2be3..8f7ead9 100644
++index 2efa75eee..83f48cb2a 100644
+ --- a/vllm/v1/engine/async_llm.py
+ +++ b/vllm/v1/engine/async_llm.py
+-@@ -193,6 +193,10 @@ class AsyncLLM(EngineClient):
++@@ -194,6 +194,10 @@ class AsyncLLM(EngineClient):
+              self.logger_manager.log_engine_initialized()
+  
+          self._client_count = client_count
+@@ -1053,7 +1053,7 @@
+  
+          self.output_handler: asyncio.Task | None = None
+          try:
+-@@ -525,6 +529,53 @@ class AsyncLLM(EngineClient):
++@@ -526,6 +530,53 @@ class AsyncLLM(EngineClient):
+                  )
+              raise
+  
+@@ -1107,7 +1107,7 @@
+      async def _add_request(
+          self,
+          request: EngineCoreRequest,
+-@@ -541,6 +592,13 @@ class AsyncLLM(EngineClient):
++@@ -542,6 +593,13 @@ class AsyncLLM(EngineClient):
+          # Register locally before the first await so concurrent tasks see this request.
+          self.output_processor.add_request(request, prompt, parent_req, index, queue)
+  
+@@ -1121,7 +1121,7 @@
+          # Add the EngineCoreRequest to EngineCore (separate process).
+          await self.engine_core.add_request_async(request)
+  
+-@@ -822,8 +880,45 @@ class AsyncLLM(EngineClient):
++@@ -823,8 +881,45 @@ class AsyncLLM(EngineClient):
+          renderer = self.renderer
+          # P0 multi-modal sender ("shadow") cache; None for text-only models.
+          mm_processor_cache = renderer.mm_processor_cache
+@@ -1167,7 +1167,7 @@
+          async def output_handler():
+              try:
+                  while True:
+-@@ -842,6 +937,26 @@ class AsyncLLM(EngineClient):
++@@ -843,6 +938,26 @@ class AsyncLLM(EngineClient):
+                      for start in range(0, num_outputs, chunk_size):
+                          end = start + chunk_size
+                          outputs_slice = engine_core_outputs[start:end]
+@@ -1194,16 +1194,16 @@
+                          # 2) Process EngineCoreOutputs.
+                          processed_outputs = output_processor.process_outputs(
+                              outputs_slice, outputs.timestamp, iteration_stats
+-@@ -896,6 +1011,8 @@ class AsyncLLM(EngineClient):
++@@ -897,6 +1012,8 @@ class AsyncLLM(EngineClient):
+              (request_id,) if isinstance(request_id, str) else as_list(request_id)
+          )
+          all_request_ids = self.output_processor.abort_requests(request_ids, internal)
+ +        for req_id in all_request_ids:
+ +            self._pending_mm_retries.pop(req_id, None)
+-         await self.engine_core.abort_requests_async(all_request_ids)
+- 
+-         if self.log_requests:
+-@@ -1099,12 +1216,14 @@ class AsyncLLM(EngineClient):
++         # Starlette StreamingResponse cancels an AnyIO scope on client
++         # disconnect. Once output_processor has removed local state, shield the
++         # EngineCore abort notification so it cannot be dropped mid-await.
++@@ -1115,12 +1232,14 @@ class AsyncLLM(EngineClient):
+          # Join the background MM warmup first: the mm_processor_cache is not
+          # safe for concurrent access with its apply/clear.
+          self.renderer._join_mm_warmup()
+@@ -1218,7 +1218,7 @@
+          return await self.engine_core.reset_prefix_cache_async(
+              reset_running_requests, reset_connector
+          )
+-@@ -1116,10 +1235,12 @@ class AsyncLLM(EngineClient):
++@@ -1132,10 +1251,12 @@ class AsyncLLM(EngineClient):
+          return await self.engine_core.set_prefill_fairness_async(config)
+  
+      async def reset_encoder_cache(self) -> None:
+@@ -1232,7 +1232,7 @@
+          await self.engine_core.sleep_async(level, mode)
+  
+ diff --git a/vllm/v1/engine/core.py b/vllm/v1/engine/core.py
+-index 8c28414..d07a0c5 100644
++index 78ee820ac..90434dbb6 100644
+ --- a/vllm/v1/engine/core.py
+ +++ b/vllm/v1/engine/core.py
+ @@ -477,6 +477,77 @@ class EngineCore:
+@@ -1323,7 +1323,7 @@
+          self.scheduler.add_request(request)
+          if request.abort_immediately:
+              # Immediately abort so the connector's request_finished hook runs
+-@@ -1759,7 +1833,11 @@ class EngineCoreProc(EngineCore):
++@@ -1762,7 +1836,11 @@ class EngineCoreProc(EngineCore):
+                  )
+              if self._reject_add_in_shutdown(req):
+                  return
+@@ -1336,7 +1336,7 @@
+          elif request_type == EngineCoreRequestType.ABORT:
+              self.abort_requests(request)
+          elif request_type == EngineCoreRequestType.UTILITY:
+-@@ -2077,7 +2155,7 @@ class EngineCoreProc(EngineCore):
++@@ -2080,7 +2158,7 @@ class EngineCoreProc(EngineCore):
+                      reuse_buffers.append(buffer)
+  
+      def _handle_mm_cache_miss(

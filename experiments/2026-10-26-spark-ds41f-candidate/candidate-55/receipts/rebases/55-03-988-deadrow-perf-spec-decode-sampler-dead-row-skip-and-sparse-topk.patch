@@ -1,0 +1,658 @@
+From 86879cc917a84f10d7e654633b25960f5cb89d5b Mon Sep 17 00:00:00 2001
+From: Christopher Owen <christopherowen@users.noreply.github.com>
+Date: Sun, 8 Nov 2026 15:56:25 +0000
+Subject: [PATCH] perf(spec_decode,sample): skip dead verification rows in
+ sampler and sample DSpark top-k sparsely
+
+Base: 1107 vLLM patch head 2756478b60b90700b9918b457aeb38657da637b5 (tree ed1bdb7a7684da33d403a055521ac0c4dd7ca670).
+
+Rationale:
+1. When speculative block verification runs with a per-request verification cap (dead_row_cut from remaining max_tokens, adaptive confidence gating, or CED/local draft cuts) and non-temperature sampling parameters (top_k, top_p, min_p, penalties, logit_bias, bad_words, thinking_budget), RejectionSampler._verify previously passed the full [num_tokens, vocab_size] logits tensor to Sampler.apply_sampling_params without dead_row_cut. Every dead row past dead_row_cut[r] was copied from BF16 to FP32 (517 KB/row at V=129,280) and processed through bias, penalties, bad_words, thinking_budget, temperature, min_p, and tilelang_topk_topp before rejection_sample ignored all rows past dead_row_cut[r].
+2. When DSparkSpeculator._sample_sequential_topk ran with dspark_draft_topk=K, it previously filled the entire [num_reqs, n_spec, vocab_size] base_logits buffer with -inf, scattered the K Markov-corrected candidate scores back into base_logits[:, i] at each step, and launched full-vocabulary argmax or 127-block gumbel_sample + gumbel_finish over all 129,280 columns per step.
+
+Changes:
+1. Add tilelang_inputs.mask_dead_rows to compute live_idx_mapping (-1 on dead rows where row - cu_num_logits[r] > dead_row_cut[r]) and per-row (row_top_k, row_top_p) (neutral vocab_size and 1.0 on dead rows) in a single 1-block launch when dead_row_cut is present and processed logprobs are not requested.
+2. Thread live_idx_mapping into tilelang_sampling.copy_logits, logit_bias, penalties, bad_words, thinking_budget, temperature, and min_p so dead verification rows exit before reading or writing vocabulary rows, and pass (row_top_k, row_top_p) directly into tilelang_topk_topp.apply_top_k_top_p.
+3. Add apply_markov_bias_topk on DSparkDeepseekV4ForCausalLM and Qwen3DSparkForCausalLM / DSparkMarkovHead, and add tilelang_sampling.topk_greedy_sample and tilelang_sampling.topk_gumbel_sample (keying Philox draws and tie-breaking by each candidate's global vocabulary index and maintaining draft_logits by clearing only the previous step's K candidate indices before writing the new K candidates).
+
+Quality:
+Bit-exact on all live verification rows, verified tokens, drafted tokens, and cached draft_logits across greedy and stochastic sampling; also prevents NaN or near-uniform unverified dead rows from perturbing or stalling Sampler.apply_sampling_params.
+
+Tests:
+- pytest tests/v1/worker/test_dead_rows.py tests/v1/spec_decode/test_dspark_topk.py tests/v1/spec_decode/test_dspark_v41_gathered_markov.py tests/v1/worker/test_gpu_sampling_states_gather.py tests/kernels/test_deepseek_v41_copy_logits.py tests/v1/worker/test_prepare_kernels.py tests/v1/spec_decode/test_tilelang_rejection.py tests/v1/spec_decode/test_rejection_sampler_utils.py (935 passed across 2 boots on GB10).
+
+Upstream status: local speculative-decoding and TileLang sampler optimization for DeepSeek-V4.1-Flash on GB10.
+
+Split at selection for candidates 55-57 (988-deadrow): this patch keeps tests/v1/worker/test_dead_rows.py (whole); vllm/v1/worker/gpu/sample/sampler.py (whole); vllm/v1/worker/gpu/sample/tilelang_auxiliary.py (whole); vllm/v1/worker/gpu/sample/tilelang_bias.py (whole); vllm/v1/worker/gpu/sample/tilelang_controls.py (whole); vllm/v1/worker/gpu/sample/tilelang_sampling.py (hunks 1, 2, 3, 4, 5, 6 of the PR's); vllm/v1/worker/gpu/sample/tilelang_thinking.py (whole); vllm/v1/worker/gpu/spec_decode/rejection_sampler.py (whole); vllm/v1/worker/gpu/tilelang_inputs.py (whole). Every kept line is unchanged; the other hunks are left out (receipts/selection-proposal.json).
+---
+ tests/v1/worker/test_dead_rows.py             | 153 ++++++++++++++++++
+ vllm/v1/worker/gpu/sample/sampler.py          |  38 ++++-
+ .../worker/gpu/sample/tilelang_auxiliary.py   |   2 +-
+ vllm/v1/worker/gpu/sample/tilelang_bias.py    |  24 ++-
+ .../v1/worker/gpu/sample/tilelang_controls.py |  20 ++-
+ .../v1/worker/gpu/sample/tilelang_sampling.py |  78 ++++++++-
+ .../v1/worker/gpu/sample/tilelang_thinking.py |   5 +-
+ .../gpu/spec_decode/rejection_sampler.py      |  13 ++
+ vllm/v1/worker/gpu/tilelang_inputs.py         | 101 ++++++++++++
+ 9 files changed, 413 insertions(+), 21 deletions(-)
+
+diff --git a/tests/v1/worker/test_dead_rows.py b/tests/v1/worker/test_dead_rows.py
+index e395cf731..959c26362 100644
+--- a/tests/v1/worker/test_dead_rows.py
++++ b/tests/v1/worker/test_dead_rows.py
+@@ -217,3 +217,156 @@ def test_sample_contiguous_fastpath_skips_gather_and_lazy_expands_on_fallback(
+     assert batch._deferred_expand_max_len is None
+     assert batch.expanded_idx_mapping.tolist() == [2, 2, 2, 0, 0, 0]
+     assert batch.expanded_local_pos.tolist() == [0, 1, 2, 0, 1, 2]
++
++
++
++def test_mask_dead_rows_and_copy_logits_skip_dead_verification_rows():
++    from vllm.v1.worker.gpu import tilelang_inputs
++    from vllm.v1.worker.gpu.sample import tilelang_sampling
++
++    dev = torch.device("cuda")
++    # 3 requests: req 0 (slot 2) has 6 rows with cut=2 (rows 0,1,2 live; 3,4,5 dead)
++    # req 1 (slot 0) has 4 rows with cut=0 (row 6 live; 7,8,9 dead)
++    # req 2 (slot 3) has 6 rows with cut=5 (all 6 rows live: 10..15)
++    expanded_idx_mapping = torch.tensor(
++        [2, 2, 2, 2, 2, 2, 0, 0, 0, 0, 3, 3, 3, 3, 3, 3],
++        dtype=torch.int64,
++        device=dev,
++    )
++    cu_num_logits = torch.tensor([0, 6, 10, 16], dtype=torch.int32, device=dev)
++    dead_row_cut = torch.tensor([2, 0, 5], dtype=torch.int32, device=dev)
++    top_k_gpu = torch.tensor([10, 20, 30, 40], dtype=torch.int32, device=dev)
++    top_p_gpu = torch.tensor([0.5, 0.6, 0.7, 0.8], dtype=torch.float32, device=dev)
++    vocab_size = 256
++
++    live_idx, row_k, row_p = tilelang_inputs.mask_dead_rows(
++        expanded_idx_mapping,
++        cu_num_logits,
++        dead_row_cut,
++        top_k_gpu,
++        top_p_gpu,
++        vocab_size,
++    )
++    expected_live_idx = [2, 2, 2, -1, -1, -1, 0, -1, -1, -1, 3, 3, 3, 3, 3, 3]
++    assert live_idx.tolist() == expected_live_idx
++    assert row_k is not None and row_p is not None
++    expected_k = [
++        30 if m == 2 else (10 if m == 0 else (40 if m == 3 else vocab_size))
++        for m in expected_live_idx
++    ]
++    expected_p = [
++        0.7 if m == 2 else (0.5 if m == 0 else (0.8 if m == 3 else 1.0))
++        for m in expected_live_idx
++    ]
++    assert row_k.tolist() == expected_k
++    torch.testing.assert_close(
++        row_p, torch.tensor(expected_p, dtype=torch.float32, device=dev)
++    )
++
++    # Verify copy_logits with live_idx_mapping copies live rows and ignores NaNs on dead rows.
++    raw = torch.randn((16, vocab_size), dtype=torch.bfloat16, device=dev)
++    raw_with_dead_nans = raw.clone()
++    dead_mask = live_idx < 0
++    raw_with_dead_nans[dead_mask] = float("nan")
++
++    ref_copy = tilelang_sampling.copy_logits(raw)
++    masked_copy = tilelang_sampling.copy_logits(raw_with_dead_nans, live_idx)
++    assert torch.equal(masked_copy[~dead_mask], ref_copy[~dead_mask])
++
++
++def test_sampler_apply_sampling_params_skips_dead_rows_bit_exact():
++    import numpy as np
++    from vllm.v1.worker.gpu.sample.sampler import Sampler
++    from vllm.v1.worker.gpu.states import RequestState
++
++    dev = torch.device("cuda")
++    vocab_size = 1024
++    req_states = RequestState(
++        max_num_reqs=4,
++        max_model_len=64,
++        max_num_batched_tokens=32,
++        num_speculative_steps=5,
++        vocab_size=vocab_size,
++        device=dev,
++    )
++    sampler = Sampler(
++        max_num_reqs=4,
++        vocab_size=vocab_size,
++        device=dev,
++        req_states=req_states,
++    )
++    from vllm.sampling_params import SamplingParams
++
++    # Configure non-temperature sampling controls across all 4 slots.
++    for s_idx in range(4):
++        req_states.add_request(
++            req_id=f"req_{s_idx}",
++            prompt_len=4,
++            all_token_ids=[1, 5, 10, 15, 20, 5, 10, 25],
++            num_computed_tokens=8,
++            max_tokens=32,
++        )
++        req_slot = req_states.req_id_to_index[f"req_{s_idx}"]
++        params = SamplingParams(
++            temperature=0.8,
++            top_k=64,
++            top_p=0.9,
++            min_p=0.05,
++            repetition_penalty=1.2,
++            frequency_penalty=0.3,
++            presence_penalty=0.4,
++            logit_bias={7: 1.5, 12: -2.0},
++            seed=1234 + req_slot,
++        )
++        params._bad_words_token_ids = [[5, 6], [19]]
++        sampler.add_request(req_slot, 4, params)
++    req_states.apply_staged_writes()
++    sampler.apply_staged_writes()
++
++    idx_mapping_np = np.array([2, 0], dtype=np.int64)
++    idx_mapping = torch.from_numpy(idx_mapping_np).to(dev)
++    expanded_idx_mapping = torch.tensor(
++        [2, 2, 2, 2, 2, 2, 0, 0, 0, 0, 0, 0], dtype=torch.int64, device=dev
++    )
++    expanded_local_pos = torch.tensor(
++        [0, 1, 2, 3, 4, 5, 0, 1, 2, 3, 4, 5], dtype=torch.int32, device=dev
++    )
++    cu_num_logits = torch.tensor([0, 6, 12], dtype=torch.int32, device=dev)
++    dead_row_cut = torch.tensor([2, 1], dtype=torch.int32, device=dev)
++    pos = torch.tensor(
++        [8, 9, 10, 11, 12, 13, 8, 9, 10, 11, 12, 13], dtype=torch.int64, device=dev
++    )
++    input_ids = torch.tensor(
++        [5, 6, 7, 8, 9, 10, 15, 16, 17, 18, 19, 20], dtype=torch.int32, device=dev
++    )
++
++    torch.manual_seed(0)
++    raw = torch.randn((12, vocab_size), dtype=torch.bfloat16, device=dev)
++    raw_dead_nan = raw.clone()
++    live_rows = torch.tensor(
++        [True, True, True, False, False, False, True, True, False, False, False, False],
++        device=dev,
++    )
++    raw_dead_nan[~live_rows] = float("nan")
++
++    ref_processed = sampler.apply_sampling_params(
++        raw,
++        expanded_idx_mapping,
++        idx_mapping,
++        idx_mapping_np,
++        pos,
++        input_ids,
++        expanded_local_pos,
++    )
++    masked_processed = sampler.apply_sampling_params(
++        raw_dead_nan,
++        expanded_idx_mapping,
++        idx_mapping,
++        idx_mapping_np,
++        pos,
++        input_ids,
++        expanded_local_pos,
++        dead_row_cut=dead_row_cut,
++        cu_num_logits=cu_num_logits,
++    )
++    assert torch.equal(masked_processed[live_rows], ref_processed[live_rows])
+diff --git a/vllm/v1/worker/gpu/sample/sampler.py b/vllm/v1/worker/gpu/sample/sampler.py
+index 6ffcce85f..2ab76349d 100644
+--- a/vllm/v1/worker/gpu/sample/sampler.py
++++ b/vllm/v1/worker/gpu/sample/sampler.py
+@@ -346,6 +346,8 @@ class Sampler:
+         expanded_local_pos: torch.Tensor,
+         skip_top_k_top_p: bool = False,
+         skip_temperature: bool = False,
++        dead_row_cut: torch.Tensor | None = None,
++        cu_num_logits: torch.Tensor | None = None,
+     ) -> torch.Tensor:
+         if skip_temperature:
+             if not self.any_non_temperature_logits_processing(idx_mapping_np):
+@@ -353,8 +355,26 @@ class Sampler:
+         elif not np.any(self.needs_logits_processing[idx_mapping_np]):
+             return logits
+ 
+-        # Copy logits to a new FP32 tensor.
+-        logits = tilelang_sampling.copy_logits(logits)
++        live_idx_mapping: torch.Tensor | None = None
++        row_top_k: torch.Tensor | None = None
++        row_top_p: torch.Tensor | None = None
++        if dead_row_cut is not None and cu_num_logits is not None:
++            from vllm.v1.worker.gpu import tilelang_inputs
++
++            expanded_idx_mapping, row_top_k, row_top_p = (
++                tilelang_inputs.mask_dead_rows(
++                    expanded_idx_mapping,
++                    cu_num_logits,
++                    dead_row_cut,
++                    self.sampling_states.top_k.gpu,
++                    self.sampling_states.top_p.gpu,
++                    self.sampling_states.vocab_size,
++                )
++            )
++            live_idx_mapping = expanded_idx_mapping
++
++        # Copy logits to a new FP32 tensor (skipping dead rows when masked).
++        logits = tilelang_sampling.copy_logits(logits, live_idx_mapping)
+ 
+         # Apply logit bias (e.g., allowed_token_ids, min_tokens) in place.
+         self.logit_bias_state.apply_logit_bias(
+@@ -402,6 +422,20 @@ class Sampler:
+         if skip_top_k_top_p:
+             return logits
+ 
++        if live_idx_mapping is not None:
++            states = self.sampling_states
++            do_top_k = bool(
++                np.any(states.top_k.np[idx_mapping_np] != states.vocab_size)
++            )
++            do_top_p = bool(np.any(states.top_p.np[idx_mapping_np] != 1.0))
++            if not do_top_k and not do_top_p:
++                return logits
++            return tilelang_topk_topp.apply_top_k_top_p(
++                logits,
++                row_top_k if do_top_k else None,
++                row_top_p if do_top_p else None,
++            )
++
+         # Apply top_k and/or top_p. This might or might not return a new tensor.
+         return self.sampling_states.apply_top_k_top_p(
+             logits, expanded_idx_mapping, idx_mapping_np
+diff --git a/vllm/v1/worker/gpu/sample/tilelang_auxiliary.py b/vllm/v1/worker/gpu/sample/tilelang_auxiliary.py
+index c02526cbe..8b6675a45 100644
+--- a/vllm/v1/worker/gpu/sample/tilelang_auxiliary.py
++++ b/vllm/v1/worker/gpu/sample/tilelang_auxiliary.py
+@@ -92,7 +92,7 @@ def bad_words_kernel(
+             actual = T.alloc_local((1,), "int32")
+             matches = T.alloc_local((1,), "int32")
+             req[0] = mapping[row]
+-            if word < num_words[req[0]]:
++            if (req[0] >= 0) & (word < num_words[T.max(req[0], T.int64(0))]):
+                 start = offsets[req[0], word]
+                 end = offsets[req[0], word + 1]
+                 prefix = end - start - 1
+diff --git a/vllm/v1/worker/gpu/sample/tilelang_bias.py b/vllm/v1/worker/gpu/sample/tilelang_bias.py
+index 48b55a538..354309835 100644
+--- a/vllm/v1/worker/gpu/sample/tilelang_bias.py
++++ b/vllm/v1/worker/gpu/sample/tilelang_bias.py
+@@ -162,13 +162,27 @@ def bias_kernel(
+             tx = T.get_thread_binding()
+             row = T.cast(block, "int64")
+             req = T.alloc_var(T.int64, init=T.cast(mapping[block], "int64"))
+-            n_allowed = T.alloc_var(T.int32, init=num_allowed[req])
+-            n_bias = T.alloc_var(T.int32, init=num_bias[req])
+-            n_stops = T.alloc_var(T.int32, init=num_stops[req])
++            safe_req = T.max(req, T.int64(0))
++            n_allowed = T.alloc_var(
++                T.int32, init=T.if_then_else(req >= 0, num_allowed[safe_req], 0)
++            )
++            n_bias = T.alloc_var(
++                T.int32, init=T.if_then_else(req >= 0, num_bias[safe_req], 0)
++            )
++            n_stops = T.alloc_var(
++                T.int32, init=T.if_then_else(req >= 0, num_stops[safe_req], 0)
++            )
+             position = T.alloc_var(position_dtype, init=positions[block])
+-            min_len = T.alloc_var(T.int32, init=min_lens[req])
++            min_len = T.alloc_var(
++                T.int32, init=T.if_then_else(req >= 0, min_lens[safe_req], 0)
++            )
+             # Whether this row restores its stop tokens when nothing else is left.
+-            keep = T.alloc_var(T.int32, init=restore_row[req] if restore else 0)
++            keep = T.alloc_var(
++                T.int32,
++                init=T.if_then_else(req >= 0, restore_row[safe_req], 0)
++                if restore
++                else 0,
++            )
+             ids = T.alloc_local((per,), "int32")
+             allowed_ids = T.alloc_local((per,), "int32")
+             values = T.alloc_local((per,), "float32")
+diff --git a/vllm/v1/worker/gpu/sample/tilelang_controls.py b/vllm/v1/worker/gpu/sample/tilelang_controls.py
+index 31f0fa7e8..da2a30b55 100644
+--- a/vllm/v1/worker/gpu/sample/tilelang_controls.py
++++ b/vllm/v1/worker/gpu/sample/tilelang_controls.py
+@@ -175,7 +175,12 @@ def min_p_kernel(
+             best = T.alloc_local((1,), "float32")
+             minimum = T.alloc_local((1,), "float32")
+             partial = T.alloc_shared((warps,), "float32")
+-            minimum[0] = thresholds[mapping[block]]
++            req = T.alloc_var(T.int64, init=T.cast(mapping[block], "int64"))
++            minimum[0] = T.if_then_else(
++                req >= T.int64(0),
++                thresholds[T.max(req, T.int64(0))],
++                T.float32(0),
++            )
+             if minimum[0] != 0:
+                 best[0] = -T.infinity("float32")
+                 for start in T.serial(full):
+@@ -294,9 +299,16 @@ def penalties_kernel(
+             values = T.alloc_fragment((block,), "float32")
+             counts = T.alloc_fragment((block,), "int32")
+             req[0] = mapping[row]
+-            rep[0] = repetition[req[0]]
+-            freq[0] = frequency[req[0]]
+-            pres[0] = presence[req[0]]
++            safe_req = T.max(req[0], T.int64(0))
++            rep[0] = T.if_then_else(
++                req[0] >= 0, repetition[safe_req], T.float32(1)
++            )
++            freq[0] = T.if_then_else(
++                req[0] >= 0, frequency[safe_req], T.float32(0)
++            )
++            pres[0] = T.if_then_else(
++                req[0] >= 0, presence[safe_req], T.float32(0)
++            )
+             if (rep[0] != 1) | (freq[0] != 0) | (pres[0] != 0):
+                 for col in T.Parallel(block):
+                     index = blk * block + col
+diff --git a/vllm/v1/worker/gpu/sample/tilelang_sampling.py b/vllm/v1/worker/gpu/sample/tilelang_sampling.py
+index 05dbc6718..efe3d7977 100644
+--- a/vllm/v1/worker/gpu/sample/tilelang_sampling.py
++++ b/vllm/v1/worker/gpu/sample/tilelang_sampling.py
+@@ -3164,7 +3164,8 @@ def temperature_kernel(
+             if run > 1:
+                 # The launch checked it: a 16-byte base and a stride of 16 elements.
+                 T.assume(logits_stride % 16 == 0)
+-            temp[0] = temperature[T.cast(idx_mapping[t], T.int64)]
++            req = T.alloc_var(T.int64, init=T.cast(idx_mapping[t], T.int64))
++            temp[0] = T.if_then_else(req >= 0, temperature[req], T.float32(1))
+             if (temp[0] != T.float32(0)) & (temp[0] != T.float32(1)):
+                 for r in T.unroll(runs):
+                     col0 = blk * block + r * (threads * run) + run * tx
+@@ -3439,13 +3440,20 @@ def declare(calls: Callable[[], list]) -> None:
+ 
+ 
+ @tilelang.jit(pass_configs=_PASS)
+-def copy_logits_kernel(dtype: str, vectorized: bool = False):
+-    """Own an FP32 logits copy, including cast and non-contiguous source rows."""
++def copy_logits_kernel(
++    dtype: str, vectorized: bool = False, idx_dtype: str | None = None
++):
++    """Own an FP32 logits copy, including cast and non-contiguous source rows.
++    When idx_dtype is given, rows with idx_mapping[row] < 0 (dead
++    verification rows past dead_row_cut) exit before reading src."""
+     rows, cols, row_stride, col_stride = T.dynamic("rows, cols, row_stride, col_stride")
+     source_strides = (row_stride, 1) if vectorized else (row_stride, col_stride)
++    has_idx = idx_dtype is not None
++    if not has_idx:
++        idx_dtype = "int64"
+ 
+     @T.prim_func
+-    def copy_logits(
++    def copy_logits_unmasked(
+         src: T.StridedTensor((rows, cols), source_strides, dtype),
+         dst: T.Tensor((rows, cols), T.float32),
+     ):
+@@ -3468,7 +3476,35 @@ def copy_logits_kernel(dtype: str, vectorized: bool = False):
+                     if col < cols:
+                         dst[row, col] = T.cast(src[row, col], T.float32)
+ 
+-    return copy_logits
++    idx_len = T.dynamic("idx_len")
++
++    @T.prim_func
++    def copy_logits_masked(
++        src: T.StridedTensor((rows, cols), source_strides, dtype),
++        dst: T.Tensor((rows, cols), T.float32),
++        idx_mapping: T.Tensor((idx_len,), idx_dtype),
++    ):
++        grid_x = T.ceildiv(cols, 1024) if vectorized else rows
++        grid_y = rows if vectorized else T.ceildiv(cols, 1024)
++        with T.Kernel(grid_x, grid_y, threads=256) as (bx, by):
++            row = by if vectorized else bx
++            block = bx if vectorized else by
++            tx = T.get_thread_binding()
++            if idx_mapping[row] >= 0:
++                if vectorized:
++                    T.assume(row_stride % 4 == 0)
++                    T.assume(cols % 4 == 0)
++                    col = block * 1024 + tx * 4
++                    if col + 4 <= cols:
++                        for j in T.vectorized(4):
++                            dst[row, col + j] = T.cast(src[row, col + j], T.float32)
++                else:
++                    for j in T.unroll(4):
++                        col = block * 1024 + j * 256 + tx
++                        if col < cols:
++                            dst[row, col] = T.cast(src[row, col], T.float32)
++
++    return copy_logits_masked if has_idx else copy_logits_unmasked
+ 
+ 
+ def _pitched_logits_copy(logits: torch.Tensor, out: torch.Tensor) -> None:
+@@ -3486,11 +3522,16 @@ def _pitched_logits_copy(logits: torch.Tensor, out: torch.Tensor) -> None:
+         raise RuntimeError(f"pitched logits copy failed: {error}")
+ 
+ 
+-def copy_logits(logits: torch.Tensor) -> torch.Tensor:
++def copy_logits(
++    logits: torch.Tensor,
++    live_idx_mapping: torch.Tensor | None = None,
++) -> torch.Tensor:
+     """FP32-owned logits for processing; leave the raw logits unchanged.
+ 
+     Dense FP32 uses PyTorch's DMA path. Wide aligned FP32 matrices above 8 MiB
+     use pitched DMA; smaller copies, casts and other strides use TileLang.
++    When live_idx_mapping is provided, dead rows (live_idx_mapping[row] < 0)
++    are skipped by the TileLang copy kernel.
+     Tensor allocation and views do not launch compute kernels.
+     """
+     if (
+@@ -3502,7 +3543,20 @@ def copy_logits(logits: torch.Tensor) -> torch.Tensor:
+     out = torch.empty(logits.shape, dtype=torch.float32, device=logits.device)
+     if not logits.numel():
+         return out
+-    if logits.dtype == torch.float32 and logits.is_contiguous():
++    if live_idx_mapping is not None:
++        vectorized = (
++            logits.stride(1) == 1
++            and logits.shape[0] <= 65535
++            and logits.shape[1] % 4 == 0
++            and _triton_run(logits) > 1
++        )
++        _kernel(
++            copy_logits_kernel,
++            _DTYPES[logits.dtype],
++            vectorized,
++            _DTYPES[live_idx_mapping.dtype],
++        )(logits, out, live_idx_mapping.contiguous())
++    elif logits.dtype == torch.float32 and logits.is_contiguous():
+         out.copy_(logits)
+     elif (
+         logits.dtype == torch.float32
+@@ -3555,6 +3609,16 @@ def sampling_calls(
+         for dtype in dict.fromkeys(logits_dtypes)
+         for vectorized in (False, True)
+     ]
++    calls += [
++        _call(
++            copy_logits_kernel,
++            _DTYPES[dtype],
++            vectorized,
++            _DTYPES[RUNNER_IDX_DTYPE],
++        )
++        for dtype in dict.fromkeys(logits_dtypes)
++        for vectorized in (False, True)
++    ]
+     if temperature:
+         calls += [
+             _call(temperature_kernel, _DTYPES[RUNNER_IDX_DTYPE], run, block)
+diff --git a/vllm/v1/worker/gpu/sample/tilelang_thinking.py b/vllm/v1/worker/gpu/sample/tilelang_thinking.py
+index 106b079cc..7b7adab8c 100644
+--- a/vllm/v1/worker/gpu/sample/tilelang_thinking.py
++++ b/vllm/v1/worker/gpu/sample/tilelang_thinking.py
+@@ -190,15 +190,16 @@ def thinking_kernel(
+     ):
+         with T.Kernel(rows, threads=1) as row:
+             req = mapping[row]
++            safe_req = T.max(T.cast(req, "int64"), T.int64(0))
+             first = T.cast(row, "int64") - positions[row]
+-            total = lengths[req]
++            total = T.if_then_else(req >= 0, lengths[safe_req], 0)
+             length = total + positions[row]
+             last_start = T.alloc_local((1,), "int32")
+             last_end = T.alloc_local((1,), "int32")
+             prefix = T.alloc_local((1,), "int32")
+             actual = T.alloc_local((1,), "int32")
+             match = T.alloc_local((1,), "bool")
+-            if budgets[req] >= 0:
++            if (req >= 0) & (budgets[safe_req] >= 0):
+                 last_start[0] = cached_start[req]
+                 last_end[0] = cached_end[req]
+                 for pos in T.serial(
+diff --git a/vllm/v1/worker/gpu/spec_decode/rejection_sampler.py b/vllm/v1/worker/gpu/spec_decode/rejection_sampler.py
+index 463022c3a..553cbd9fa 100644
+--- a/vllm/v1/worker/gpu/spec_decode/rejection_sampler.py
++++ b/vllm/v1/worker/gpu/spec_decode/rejection_sampler.py
+@@ -167,6 +167,8 @@ class RejectionSampler:
+                 dead_rows=dead_rows,
+             )
+         tilelang_inputs.declare(tilelang_inputs.flatten_sampled_calls)
++        if dead_rows and self.use_block_verification:
++            tilelang_inputs.declare(tilelang_inputs.mask_dead_rows_calls)
+         use_processed = self.sampler.logprobs_mode in PROCESSED_LOGPROBS_MODES
+         register_topk_scores_warmup(
+             logits=processed_logits if use_processed else logits,
+@@ -266,6 +268,12 @@ class RejectionSampler:
+             and bool(np.any(self.sampler.needs_logits_processing[idx_mapping_np]))
+             and not self.sampler.any_non_temperature_logits_processing(idx_mapping_np)
+         )
++        live_row_cut = (
++            dead_row_cut
++            if self.use_block_verification
++            and self.sampler.logprobs_mode not in PROCESSED_LOGPROBS_MODES
++            else None
++        )
+         processed_logits = self.sampler.apply_sampling_params(
+             logits,
+             expanded_idx_mapping,
+@@ -275,6 +283,11 @@ class RejectionSampler:
+             draft_sampled,
+             expanded_local_pos,
+             skip_temperature=in_kernel_temperature,
++            **(
++                {"dead_row_cut": live_row_cut, "cu_num_logits": cu_num_logits}
++                if live_row_cut is not None
++                else {}
++            ),
+         )
+         cut = None
+         if sink is not None:
+diff --git a/vllm/v1/worker/gpu/tilelang_inputs.py b/vllm/v1/worker/gpu/tilelang_inputs.py
+index 436c94e57..4d20a0f3c 100644
+--- a/vllm/v1/worker/gpu/tilelang_inputs.py
++++ b/vllm/v1/worker/gpu/tilelang_inputs.py
+@@ -814,6 +814,107 @@ def flatten_sampled_calls() -> list:
+     return [_call(flatten_sampled_kernel)]
+ 
+ 
++@tilelang.jit(pass_configs=_PASS)
++def mask_dead_rows_kernel(idx_dtype: str):
++    """Mask expanded_idx_mapping to -1 on dead verification rows
++    (row - cu_num_logits[r] > dead_row_cut[r]) and gather each row's
++    top_k and top_p with neutral values (vocab_size and 1.0)
++    on dead rows."""
++    num_logits, num_reqs, cu_len, states = T.dynamic(
++        "num_logits, num_reqs, cu_len, states"
++    )
++
++    @T.prim_func
++    def mask_dead_rows(
++        out_idx: T.Tensor((num_logits,), idx_dtype),
++        out_k: T.Tensor((num_logits,), T.int32),
++        out_p: T.Tensor((num_logits,), T.float32),
++        expanded_idx_mapping: T.Tensor((num_logits,), idx_dtype),
++        cu_num_logits: T.Tensor((cu_len,), T.int32),
++        dead_row_cut: T.Tensor((num_reqs,), T.int32),
++        top_k_state: T.Tensor((states,), T.int32),
++        top_p_state: T.Tensor((states,), T.float32),
++        vocab_size: T.int32,
++    ):
++        with T.Kernel(
++            T.ceildiv(num_logits, _FLATTEN_THREADS), threads=_FLATTEN_THREADS
++        ) as b:
++            row = b * _FLATTEN_THREADS + T.get_thread_binding()
++            req = T.alloc_var(T.int32, init=-1)
++            for r in T.serial(num_reqs):
++                if (cu_num_logits[r] <= row) & (row < cu_num_logits[r + 1]):
++                    req = r
++            if row < num_logits:
++                slot = T.alloc_var(
++                    T.int64, init=T.cast(expanded_idx_mapping[row], T.int64)
++                )
++                live = (
++                    (req >= 0)
++                    & (slot >= T.int64(0))
++                    & (
++                        row - cu_num_logits[T.max(req, 0)]
++                        <= dead_row_cut[T.max(req, 0)]
++                    )
++                )
++                safe_slot = T.max(slot, T.int64(0))
++                out_idx[row] = T.if_then_else(
++                    live, expanded_idx_mapping[row], T.cast(-1, idx_dtype)
++                )
++                out_k[row] = T.if_then_else(
++                    live, top_k_state[safe_slot], vocab_size
++                )
++                out_p[row] = T.if_then_else(
++                    live, top_p_state[safe_slot], T.float32(1)
++                )
++
++    return mask_dead_rows
++
++
++def mask_dead_rows_key(idx_dtype: torch.dtype) -> tuple:
++    return (_DTYPES[idx_dtype],)
++
++
++def mask_dead_rows(
++    expanded_idx_mapping: torch.Tensor,
++    cu_num_logits: torch.Tensor,
++    dead_row_cut: torch.Tensor,
++    top_k_state: torch.Tensor,
++    top_p_state: torch.Tensor,
++    vocab_size: int,
++) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
++    """Return (live_idx_mapping, row_top_k, row_top_p) where rows past each
++    request's dead_row_cut are masked to -1, vocab_size, and 1.0."""
++    num_logits = expanded_idx_mapping.shape[0]
++    device = expanded_idx_mapping.device
++    out_idx = torch.empty_like(expanded_idx_mapping)
++    out_k = torch.empty(num_logits, dtype=torch.int32, device=device)
++    out_p = torch.empty(num_logits, dtype=torch.float32, device=device)
++    if num_logits:
++        num_reqs = dead_row_cut.shape[0]
++        _kernel(
++            mask_dead_rows_kernel,
++            *mask_dead_rows_key(expanded_idx_mapping.dtype),
++        )(
++            out_idx,
++            out_k,
++            out_p,
++            expanded_idx_mapping.contiguous(),
++            _as(cu_num_logits[: num_reqs + 1], torch.int32),
++            _as(dead_row_cut, torch.int32),
++            top_k_state,
++            top_p_state,
++            int(vocab_size),
++        )
++    return out_idx, out_k, out_p
++
++
++def mask_dead_rows_calls() -> list:
++    return [
++        _call(mask_dead_rows_kernel, *mask_dead_rows_key(dtype))
++        for dtype in (torch.int32, torch.int64)
++    ]
++
++
+ # --- Per-request row scatters ---------------------------------------------------
+ 
+ _SCATTER_THREADS = 128
+-- 
+2.43.0
+
