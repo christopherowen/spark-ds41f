@@ -261,7 +261,7 @@ skipped).
 | Testbed | Gate | Screen against 1107 | Live checks |
 | --- | --- | --- | --- |
 | `tp4-ring` | identical outputs; #1030's TP4 hashes 18d61961/d6568649 | faster on every core metric: grid 4.78%, c16 decode 1.61%, prefill 3.5% at 32K and 7.8% at 256K | stopped before running ([receipts/tp4-ring](receipts/tp4-ring/README.md)); run at `tp4-switched` instead |
-| `tp4-switched` | pending | pending | pending |
+| `tp4-switched` | identical outputs; the same TP4 hashes | grid 4.29% faster, c16 output 1.6% faster, c16 decode the same, prefill the same at 32K and 7.5% faster at 256K ([receipts/tp4-switched](receipts/tp4-switched/README.md)) | #955, #1013 and #972 pass |
 | `tp3-switched` | identical outputs; new TP3 hashes 5c22ce41/bce6092e (#1030's declared change) | pending | |
 
 The screen references the next round uses are in [receipts/references](receipts/references). Their greedy corpora
