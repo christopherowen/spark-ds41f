@@ -1273,12 +1273,16 @@ class RowTrace:
     always changes it.
     """
 
-    MAX_CALLS = 384
+    MAX_CALLS = 512
     MAX_WORDS = 1 << 15
     SLOTS = 8
 
-    def __init__(self, directory: str, max_rows: int):
+    def __init__(self, directory: str, max_rows: int, name: str = "rows"):
         self.directory = directory
+        self.name = name
+        # Records made while this trace is inactive go to the delegate (the
+        # drafter's traces while the drafter runs).
+        self.delegate = None
         self.max_rows = int(max_rows)
         self.buf = None
         self.failed = None
@@ -1343,7 +1347,11 @@ class RowTrace:
                 self.ids[:n].copy_(input_ids.reshape(-1)[:n])
 
     def record(self, kind: int, inp, out) -> None:
-        if not self.active or self.k >= self.MAX_CALLS:
+        if not self.active:
+            if self.delegate is not None:
+                self.delegate.record(kind, inp, out)
+            return
+        if self.k >= self.MAX_CALLS:
             return
         k = self.k
         self.k += 1
@@ -1371,6 +1379,9 @@ class RowTrace:
         slot = self.free.get()
         self.pinned[slot].copy_(self.buf, non_blocking=True)
         self.events[slot].record()
+        if self.name != "rows":
+            # A drafter trace: a step without a drafter forward then reads as empty.
+            self.meta.zero_()
         self.pending.put((slot, dict(info, padded=n, layout=self.layouts.get(n))))
 
     def _writer(self) -> None:
@@ -1387,7 +1398,7 @@ class RowTrace:
         except Exception:  # noqa: BLE001 - outside a TP group
             rank = -1
         os.makedirs(self.directory, exist_ok=True)
-        path = os.path.join(self.directory, f"rows-{socket.gethostname()}-tp{rank}-pid{os.getpid()}-"
+        path = os.path.join(self.directory, f"{self.name}-{socket.gethostname()}-tp{rank}-pid{os.getpid()}-"
                                             f"{int(time.time())}.bin")
         R = self.max_rows
         with open(path, "ab") as f:
@@ -1397,6 +1408,8 @@ class RowTrace:
                 b = self.pinned[slot].numpy()
                 calls, rows = int(b[0]), int(b[1])
                 rec = dict(info, calls=calls, rows=rows)
+                if self.name != "rows":  # the drafter's forwards have their own row counts
+                    rec["layout"] = self.layouts.get(rows)
                 if 0 < rows <= R:
                     # Lists and raw little-endian int64 bytes ([calls, 2, rows]): the
                     # analysis needs no numpy, and a step is about 13 KB at four rows.
@@ -1413,6 +1426,13 @@ class RowTrace:
 
 ROW_TRACE = (RowTrace(ROW_TRACE_DIR, int(_rt_os.environ.get("SPARK_DS41F_ROW_TRACE_MAX_ROWS", "64")))
              if ROW_TRACE_DIR else None)
+# The drafter's context preparation and query forward, each its own buffer and file.
+DRAFT_CTX_TRACE = DRAFT_QUERY_TRACE = None
+if ROW_TRACE is not None and _rt_os.environ.get("SPARK_DS41F_ROW_TRACE_DRAFTER") == "1":
+    DRAFT_CTX_TRACE = RowTrace(ROW_TRACE_DIR, ROW_TRACE.max_rows, name="rows-dctx")
+    DRAFT_QUERY_TRACE = RowTrace(ROW_TRACE_DIR, ROW_TRACE.max_rows, name="rows-dquery")
+    ROW_TRACE.delegate = DRAFT_CTX_TRACE
+    DRAFT_CTX_TRACE.delegate = DRAFT_QUERY_TRACE
 
 if ROW_TRACE is not None:
     _untraced_all_reduce = CudaCommunicator.all_reduce

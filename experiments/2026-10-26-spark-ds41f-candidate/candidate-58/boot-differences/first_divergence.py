@@ -28,7 +28,16 @@ the final hidden state. The first differing tap names the stage and its layer:
   - attention output (7) with equal compressor and top-k taps: sparse MLA, or the
     KV, compressed KV it reads (written by earlier rows: see the history printed);
   - an all-reduce input differing on some ranks: the computation after the previous
-    tap on those ranks; equal inputs with another output: the collective itself;
+    tap on those ranks; equal inputs with another output: the collective itself
+    (the input's digest is taken after the collective: an input changed while it
+    ran also shows here);
+  - with SPARK_DS41F_ROW_TRACE_MOE, inside a MoE layer: router ids/weights (20),
+    the input's MXFP8 cast (24), the shared expert (21: equal input, other output =
+    the shared expert, which runs on the aux stream), the rank's output (22: equal
+    20, 21, 24 = routed experts or their combine), the output at the reduction's
+    entry (23: equal 22 = changed between the experts and the reduction), and an
+    all-reduce input differing with 23 equal = changed during the pre-reduce hook
+    (L2 prefetch issue) or the collective;
   - only the final digest: after the last collective (final mHC, norm);
   - everything equal but the tokens: the head or the sampler.
 The steps holding that position in both runs are printed (rows, positions, token ids,
@@ -89,7 +98,12 @@ def committed(steps):
 
 KINDS = {1: "all-reduce", 2: "all-gather (last dim)", 3: "all-gather (dim 0)",
          4: "compressor (values -> latents)", 5: "compressor ring carry (first row)",
-         6: "indexer top-k", 7: "attention output (before WO)", 8: "Engram (table rows -> output)"}
+         6: "indexer top-k", 7: "attention output (before WO)", 8: "Engram (table rows -> output)",
+         20: "MoE router (top-k ids -> weights)", 21: "MoE shared expert (input -> output)",
+         22: "MoE (input -> this rank's output)", 23: "MoE output at the reduction's entry",
+         24: "MoE input MXFP8 cast (values -> scales)"}
+# Taps that follow their layer's attention output: the layer of the last kind 7.
+AFTER_ATTENTION = {1, 2, 3, 20, 21, 22, 23, 24}
 
 
 def tap(step, k, j, row):
@@ -117,10 +131,10 @@ def tap(step, k, j, row):
 
 def layer_of(layout, k):
     """The decoder layer of tap k: attention outputs (kind 7) counted before it; a
-    collective belongs to the last attention before it (-1: the embedding)."""
+    collective or MoE tap belongs to the last attention before it (-1: the embedding)."""
     count = sum(1 for entry in layout[:k] if entry and entry[0] == 7)
     kind = layout[k][0] if k < len(layout) and layout[k] else None
-    return count - 1 if kind in (1, 2, 3) else count
+    return count - 1 if kind in AFTER_ATTENTION else count
 
 
 def history(steps, positions):
@@ -147,7 +161,9 @@ def main() -> int:
     args = parser.parse_args()
 
     def load_boot(directory, prefix=""):
-        files = sorted(glob.glob(os.path.join(directory, "**", "rows-*.bin"), recursive=True))
+        files = sorted(path for path in glob.glob(os.path.join(directory, "**", "rows-*.bin"), recursive=True)
+                       # the drafter's traces (rows-dctx-*, rows-dquery-*): diff_draft_traces.py
+                       if os.path.basename(path).split("-")[1] not in ("dctx", "dquery"))
         if not files:
             raise SystemExit(f"{directory}: no rows-*.bin")
         out = {}

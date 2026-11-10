@@ -28,6 +28,24 @@ the overlay without them serves exactly as the image does:
   positions, token ids and final hidden states. The digests are kernels on the
   stream that produced the tensor, so CUDA graphs capture and replay them.
 
+- SPARK_DS41F_ROW_TRACE_DRAFTER=1 (with the row trace): the same digests for the
+  DSpark drafter's two forwards on every rank, written to their own files
+  (rows-dctx-*, rows-dquery-*): the context preparation (the target's auxiliary
+  states copied in, the combined context states, every collective) and the query
+  forward (its token ids and positions, every collective, every attention output,
+  the head hidden state, the confidence head's inputs and output).
+- SPARK_DS41F_ROW_TRACE_MOE=all or a decoder-layer range a-b (with the row trace):
+  inside each traced MoE layer (fused_moe/runner/moe_runner.py), the router's top-k
+  ids and weights (20), the input's MXFP8 cast the routed GEMM reads (24), the
+  shared expert's input and output (21), the input and this rank's output, routed
+  plus shared (22), and that output at the final reduction's entry (23). The
+  drafter's MoE layers record into its traces.
+- Drafter arms, one variable each (dflash/speculator.py): SPARK_DS41F_DSPARK_SYNC=1
+  synchronizes the device at the drafter's entry, before and after its context
+  preparation and after its query forward; SPARK_DS41F_DSPARK_EAGER=context|query|all
+  runs the context preparation, the query forward, or both eagerly instead of
+  replaying their CUDA graphs.
+
 --check verifies that the overlay files in --out equal what this script builds.
 """
 import argparse
@@ -44,6 +62,9 @@ FILES = {
     "attention": "vllm/models/deepseek_v4_1/attention.py",
     "compressor": "vllm/models/deepseek_v4_1/compressor.py",
     "engram": "vllm/models/deepseek_v4_1/common/engram.py",
+    "dflash": "vllm/v1/worker/gpu/spec_decode/dflash/speculator.py",
+    "dspark": "vllm/models/deepseek_v4_1/nvidia/dspark.py",
+    "moe_runner": "vllm/model_executor/layers/fused_moe/runner/moe_runner.py",
 }
 
 ROW_TRACE = r'''
@@ -71,12 +92,16 @@ class RowTrace:
     always changes it.
     """
 
-    MAX_CALLS = 384
+    MAX_CALLS = 512
     MAX_WORDS = 1 << 15
     SLOTS = 8
 
-    def __init__(self, directory: str, max_rows: int):
+    def __init__(self, directory: str, max_rows: int, name: str = "rows"):
         self.directory = directory
+        self.name = name
+        # Records made while this trace is inactive go to the delegate (the
+        # drafter's traces while the drafter runs).
+        self.delegate = None
         self.max_rows = int(max_rows)
         self.buf = None
         self.failed = None
@@ -141,7 +166,11 @@ class RowTrace:
                 self.ids[:n].copy_(input_ids.reshape(-1)[:n])
 
     def record(self, kind: int, inp, out) -> None:
-        if not self.active or self.k >= self.MAX_CALLS:
+        if not self.active:
+            if self.delegate is not None:
+                self.delegate.record(kind, inp, out)
+            return
+        if self.k >= self.MAX_CALLS:
             return
         k = self.k
         self.k += 1
@@ -169,6 +198,9 @@ class RowTrace:
         slot = self.free.get()
         self.pinned[slot].copy_(self.buf, non_blocking=True)
         self.events[slot].record()
+        if self.name != "rows":
+            # A drafter trace: a step without a drafter forward then reads as empty.
+            self.meta.zero_()
         self.pending.put((slot, dict(info, padded=n, layout=self.layouts.get(n))))
 
     def _writer(self) -> None:
@@ -185,7 +217,7 @@ class RowTrace:
         except Exception:  # noqa: BLE001 - outside a TP group
             rank = -1
         os.makedirs(self.directory, exist_ok=True)
-        path = os.path.join(self.directory, f"rows-{socket.gethostname()}-tp{rank}-pid{os.getpid()}-"
+        path = os.path.join(self.directory, f"{self.name}-{socket.gethostname()}-tp{rank}-pid{os.getpid()}-"
                                             f"{int(time.time())}.bin")
         R = self.max_rows
         with open(path, "ab") as f:
@@ -195,6 +227,8 @@ class RowTrace:
                 b = self.pinned[slot].numpy()
                 calls, rows = int(b[0]), int(b[1])
                 rec = dict(info, calls=calls, rows=rows)
+                if self.name != "rows":  # the drafter's forwards have their own row counts
+                    rec["layout"] = self.layouts.get(rows)
                 if 0 < rows <= R:
                     # Lists and raw little-endian int64 bytes ([calls, 2, rows]): the
                     # analysis needs no numpy, and a step is about 13 KB at four rows.
@@ -211,6 +245,13 @@ class RowTrace:
 
 ROW_TRACE = (RowTrace(ROW_TRACE_DIR, int(_rt_os.environ.get("SPARK_DS41F_ROW_TRACE_MAX_ROWS", "64")))
              if ROW_TRACE_DIR else None)
+# The drafter's context preparation and query forward, each its own buffer and file.
+DRAFT_CTX_TRACE = DRAFT_QUERY_TRACE = None
+if ROW_TRACE is not None and _rt_os.environ.get("SPARK_DS41F_ROW_TRACE_DRAFTER") == "1":
+    DRAFT_CTX_TRACE = RowTrace(ROW_TRACE_DIR, ROW_TRACE.max_rows, name="rows-dctx")
+    DRAFT_QUERY_TRACE = RowTrace(ROW_TRACE_DIR, ROW_TRACE.max_rows, name="rows-dquery")
+    ROW_TRACE.delegate = DRAFT_CTX_TRACE
+    DRAFT_CTX_TRACE.delegate = DRAFT_QUERY_TRACE
 
 if ROW_TRACE is not None:
     _untraced_all_reduce = CudaCommunicator.all_reduce
@@ -306,6 +347,19 @@ RUNNER_RECORD_ANCHOR = '''        # Post-step KV connector related operations.
 '''
 RUNNER_RECORD = '''        if _STEP_TRACE is not None:
             _STEP_TRACE.record(self, input_batch, locals())
+        for _draft_trace in _DRAFT_TRACES:
+            _draft_trace.harvest(
+                input_batch,
+                None,
+                {
+                    "t": time.monotonic(),
+                    "req_ids": list(input_batch.req_ids),
+                    "num_scheduled_tokens": input_batch.num_scheduled_tokens.tolist(),
+                    "num_tokens": int(input_batch.num_tokens),
+                    "num_reqs": int(input_batch.num_reqs),
+                    "query_per_req": getattr(getattr(self, "speculator", None), "num_query_per_req", None),
+                },
+            )
 
 '''
 STEP_TRACE = r'''
@@ -468,8 +522,12 @@ if _STEP_TRACE is not None:
     logger.warning("debug step trace on: every step's policy inputs to %s", _STEP_TRACE_DIR)
 
 from vllm.distributed.device_communicators.cuda_communicator import (  # noqa: E402
+    DRAFT_CTX_TRACE as _DRAFT_CTX_TRACE,
+    DRAFT_QUERY_TRACE as _DRAFT_QUERY_TRACE,
     ROW_TRACE as _ROW_TRACE,
 )
+
+_DRAFT_TRACES = tuple(t for t in (_DRAFT_CTX_TRACE, _DRAFT_QUERY_TRACE) if t is not None)
 '''
 
 IMPORT_ROW_TRACE = """
@@ -521,6 +579,8 @@ if _ROW_TRACE is not None:
 
     DeepseekCompressor._forward_tilelang = _traced_forward_tilelang
 """
+MOE_TAP = '\n\n# ---------------------------------------------------------------------------\n# MoE taps (boot-differences overlay): off unless SPARK_DS41F_ROW_TRACE_DIR is set and\n# SPARK_DS41F_ROW_TRACE_MOE is "all" or a decoder-layer range "a-b". For each traced\n# MoE layer, in order: 20 the router\'s top-k ids -> weights, 24 the MoE input\'s MXFP8\n# cast (values -> scales, what the routed GEMM reads), 21 the shared expert\'s input ->\n# output, 22 the MoE input -> this rank\'s output (routed plus shared), 23 that output\n# again at the final reduction\'s entry (before the pre-reduce hook and the all-reduce).\nimport os as _bd_os  # noqa: E402\n\nfrom vllm.distributed.device_communicators.cuda_communicator import (  # noqa: E402\n    ROW_TRACE as _ROW_TRACE,\n)\n\n_BD_MOE = _bd_os.environ.get("SPARK_DS41F_ROW_TRACE_MOE", "")\n\nif _ROW_TRACE is not None and _BD_MOE:\n    if _BD_MOE == "all":\n        _BD_MOE_LAYERS = None\n    else:\n        _lo, _, _hi = _BD_MOE.partition("-")\n        _BD_MOE_LAYERS = range(int(_lo), int(_hi or _lo) + 1)\n    _untraced_apply_quant_method = MoERunner._apply_quant_method\n    _untraced_reduce_final_output = MoERunner._maybe_reduce_final_output\n\n    def _bd_moe_traced(runner) -> bool:\n        traced = runner.__dict__.get("_bd_moe_traced")\n        if traced is None:\n            try:\n                layer = runner.layer_id\n            except Exception:  # noqa: BLE001 - a name without a layer index\n                layer = None\n            traced = _BD_MOE_LAYERS is None or (layer is not None and layer in _BD_MOE_LAYERS)\n            runner.__dict__["_bd_moe_traced"] = traced\n        return traced\n\n    def _bd_trace_router(router) -> None:\n        if router is None or getattr(router, "_bd_select_traced", False):\n            return\n        untraced_select = router.select_experts\n\n        def select_experts(*args, **kwargs):\n            topk_weights, topk_ids = untraced_select(*args, **kwargs)\n            _ROW_TRACE.record(20, topk_ids, topk_weights)\n            return topk_weights, topk_ids\n\n        router.select_experts = select_experts\n        router._bd_select_traced = True\n\n    def _traced_apply_quant_method(self, hidden_states, router_logits, shared_experts_input,\n                                   input_ids=None, shared_experts_overlapping=False):\n        if not _bd_moe_traced(self):\n            return _untraced_apply_quant_method(self, hidden_states, router_logits,\n                                                shared_experts_input, input_ids,\n                                                shared_experts_overlapping)\n        _bd_trace_router(self.router)\n        shared_output, fused_out = _untraced_apply_quant_method(\n            self, hidden_states, router_logits, shared_experts_input, input_ids,\n            shared_experts_overlapping)\n        try:\n            from vllm.model_executor.layers.fused_moe.tilelang import _provided_mxfp8\n\n            q = _provided_mxfp8(hidden_states)\n            _ROW_TRACE.record(24, q.values, q.scales)\n        except Exception:  # noqa: BLE001 - no provided cast (another backend)\n            pass\n        if isinstance(shared_output, torch.Tensor) and isinstance(shared_experts_input, torch.Tensor):\n            _ROW_TRACE.record(21, shared_experts_input, shared_output)\n        if isinstance(fused_out, torch.Tensor):\n            _ROW_TRACE.record(22, hidden_states, fused_out)\n        return shared_output, fused_out\n\n    def _traced_reduce_final_output(self, states, trunc_size, output_is_reduced=None, *,\n                                    in_place=False):\n        if isinstance(states, torch.Tensor) and _bd_moe_traced(self):\n            _ROW_TRACE.record(23, states, states)\n        return _untraced_reduce_final_output(self, states, trunc_size, output_is_reduced,\n                                             in_place=in_place)\n\n    MoERunner._apply_quant_method = _traced_apply_quant_method\n    MoERunner._maybe_reduce_final_output = _traced_reduce_final_output\n'
+
 ENGRAM_TAP = """
 
 # Debug row trace taps (boot-differences overlay): None unless SPARK_DS41F_ROW_TRACE_DIR.
@@ -634,6 +694,155 @@ _SCHED_TRACE = (_SchedulerTrace(_st_os.environ["SPARK_DS41F_STEP_TRACE_DIR"])
 '''
 
 
+DFLASH_ENTRY_ANCHOR = """        num_reqs = input_batch.num_reqs
+        num_target_tokens = input_batch.num_tokens
+        num_query_tokens = num_reqs * self.num_query_per_req
+"""
+DFLASH_ENTRY = """        _bd_sync()
+        num_reqs = input_batch.num_reqs
+        num_target_tokens = input_batch.num_tokens
+        num_query_tokens = num_reqs * self.num_query_per_req
+"""
+DFLASH_CTXGRAPH_ANCHOR = """            and self._context_preparer.can_run(num_target_tokens)
+        )
+"""
+DFLASH_CTXGRAPH = """            and self._context_preparer.can_run(num_target_tokens)
+        )
+        if _BD_DSPARK_EAGER in ("context", "all"):
+            use_context_graph = False
+"""
+DFLASH_BEFORE_CTX_ANCHOR = """        if use_context_graph:
+            assert self._context_preparer is not None
+            self._context_preparer.run(aux_hidden_states, num_target_tokens)
+"""
+DFLASH_BEFORE_CTX = """        _bd_sync()
+        if use_context_graph:
+            assert self._context_preparer is not None
+            self._context_preparer.run(aux_hidden_states, num_target_tokens)
+"""
+DFLASH_AFTER_CTX_ANCHOR = """        if num_speculative_tokens == 0:
+            # No drafts are needed: the context K/V has been stored above to
+"""
+DFLASH_AFTER_CTX = """        _bd_sync()
+        if num_speculative_tokens == 0:
+            # No drafts are needed: the context K/V has been stored above to
+"""
+DFLASH_EAGER_ANCHOR = """            need_eager=is_profile,
+"""
+DFLASH_EAGER = """            need_eager=is_profile or _BD_DSPARK_EAGER in ("query", "all"),
+"""
+DFLASH_RETURN_ANCHOR = """        return self.draft_tokens[:num_reqs]
+
+
+# The Triton reference's BLOCK_SIZE"""
+DFLASH_RETURN = """        _bd_sync()
+        return self.draft_tokens[:num_reqs]
+
+
+# The Triton reference's BLOCK_SIZE"""
+DFLASH_TAIL = '''
+
+# ---------------------------------------------------------------------------
+# Drafter arms (boot-differences overlay), one variable each, off when unset:
+# SPARK_DS41F_DSPARK_SYNC=1 synchronizes the device at the drafter's entry, before and
+# after its context preparation and after its query forward; SPARK_DS41F_DSPARK_EAGER=
+# context|query|all runs those eagerly instead of replaying their CUDA graphs.
+import os as _bd_os  # noqa: E402
+
+_BD_DSPARK_SYNC = _bd_os.environ.get("SPARK_DS41F_DSPARK_SYNC") == "1"
+_BD_DSPARK_EAGER = _bd_os.environ.get("SPARK_DS41F_DSPARK_EAGER", "")
+if _BD_DSPARK_EAGER not in ("", "context", "query", "all"):
+    raise ValueError("SPARK_DS41F_DSPARK_EAGER must be context, query or all")
+if _BD_DSPARK_SYNC or _BD_DSPARK_EAGER:
+    logger.warning("drafter arm: sync=%s eager=%s", _BD_DSPARK_SYNC, _BD_DSPARK_EAGER or "off")
+
+
+def _bd_sync() -> None:
+    if _BD_DSPARK_SYNC and not torch.cuda.is_current_stream_capturing():
+        torch.cuda.synchronize()
+'''
+DSPARK_TAIL = '''
+
+# ---------------------------------------------------------------------------
+# Drafter taps (boot-differences overlay): off unless SPARK_DS41F_ROW_TRACE_DIR and
+# SPARK_DS41F_ROW_TRACE_DRAFTER=1. Kinds: 10 the target's auxiliary states copied in
+# (context graph), 11 the combined context states the KV projections read, 12 the
+# query forward's head hidden state, 13 the confidence head's hidden input and its
+# output, 14 its Markov embeddings, 15 each draft layer's raw context KV, 16 its
+# slots, 17 the confidence rows' request slots, 18 the estimator's slope and
+# intercepts; collectives and attention outputs inside these forwards record with
+# their own kinds (1-3, 7).
+from vllm.distributed.device_communicators.cuda_communicator import (  # noqa: E402
+    DRAFT_CTX_TRACE as _DRAFT_CTX_TRACE,
+    DRAFT_QUERY_TRACE as _DRAFT_QUERY_TRACE,
+)
+
+if _DRAFT_CTX_TRACE is not None and _DRAFT_QUERY_TRACE is not None:
+    _untraced_context_forward = DSparkContextCudaGraphs._forward
+    _untraced_store_context = DSparkDeepseekV4Model.precompute_and_store_context_kv
+    _untraced_draft_forward = DSparkDeepseekV4Model.forward
+    _untraced_confidence = DSparkDeepseekV4ForCausalLM.compute_and_calibrate_confidence
+
+    def _traced_context_forward(self, capacity):
+        _DRAFT_CTX_TRACE.begin(None, self.positions[:capacity])
+        _DRAFT_CTX_TRACE.record(10, self.aux[:capacity], self.aux[:capacity])
+        _untraced_context_forward(self, capacity)
+        _DRAFT_CTX_TRACE.end()
+
+    def _traced_store_context(self, main_x, context_positions, context_slot_mappings=None):
+        began = not _DRAFT_CTX_TRACE.active
+        if began:  # the eager context path (the graph path began in _forward)
+            _DRAFT_CTX_TRACE.begin(None, context_positions)
+        _DRAFT_CTX_TRACE.record(11, main_x, main_x)
+        for layer in self.layers:
+            _wrap_context_insert(layer.attn)
+        _untraced_store_context(self, main_x, context_positions, context_slot_mappings)
+        if began:
+            _DRAFT_CTX_TRACE.end()
+
+    def _traced_draft_forward(self, input_ids, positions, inputs_embeds=None):
+        _DRAFT_QUERY_TRACE.begin(input_ids, positions)
+        out = _untraced_draft_forward(self, input_ids, positions, inputs_embeds)
+        _DRAFT_QUERY_TRACE.record(12, out, out)
+        return out
+
+    def _wrap_context_insert(attn):
+        # Each draft layer's context KV (before its norm, RoPE and quantization) and
+        # the slots it is written to.
+        if getattr(attn, "_bd_traced_insert", False) or not hasattr(attn, "insert_raw_context_kv"):
+            return
+        untraced = attn.insert_raw_context_kv
+
+        def traced(kv_raw, *args, **kwargs):
+            _DRAFT_CTX_TRACE.record(15, kv_raw, kv_raw)
+            slots = kwargs.get("slot_mapping", args[-1] if args else None)
+            if isinstance(slots, torch.Tensor):
+                _DRAFT_CTX_TRACE.record(16, slots, slots)
+            return untraced(kv_raw, *args, **kwargs)
+
+        attn.insert_raw_context_kv = traced
+        attn._bd_traced_insert = True
+
+    def _traced_confidence(self, head_hidden, markov_embed, out, estimator, idx_mapping):
+        probs = _untraced_confidence(self, head_hidden, markov_embed, out, estimator, idx_mapping)
+        _DRAFT_QUERY_TRACE.record(13, head_hidden, probs)
+        _DRAFT_QUERY_TRACE.record(14, markov_embed, markov_embed)
+        if isinstance(idx_mapping, torch.Tensor):
+            _DRAFT_QUERY_TRACE.record(17, idx_mapping, idx_mapping)
+        slope = getattr(estimator, "slope", None)
+        intercepts = getattr(estimator, "intercepts", None)
+        if isinstance(slope, torch.Tensor) and isinstance(intercepts, torch.Tensor):
+            _DRAFT_QUERY_TRACE.record(18, slope.reshape(1, -1), intercepts.reshape(1, -1))
+        _DRAFT_QUERY_TRACE.end()
+        return probs
+
+    DSparkContextCudaGraphs._forward = _traced_context_forward
+    DSparkDeepseekV4Model.precompute_and_store_context_kv = _traced_store_context
+    DSparkDeepseekV4Model.forward = _traced_draft_forward
+    DSparkDeepseekV4ForCausalLM.compute_and_calibrate_confidence = _traced_confidence
+'''
+
+
 def replace_once(text: str, old: str, new: str, what: str) -> str:
     count = text.count(old)
     if count != 1:
@@ -680,6 +889,30 @@ def build(tree: Path) -> dict[str, str]:
     if "\nclass Engram(nn.Module):" not in text or "\nimport torch\n" not in text:
         raise SystemExit("engram: Engram class or torch import not found")
     out[FILES["engram"]] = text.rstrip("\n") + "\n" + ENGRAM_TAP
+
+    text = (tree / FILES["dflash"]).read_text()
+    for old, new, what in ((DFLASH_ENTRY_ANCHOR, DFLASH_ENTRY, "drafter entry"),
+                           (DFLASH_CTXGRAPH_ANCHOR, DFLASH_CTXGRAPH, "drafter context graph switch"),
+                           (DFLASH_BEFORE_CTX_ANCHOR, DFLASH_BEFORE_CTX, "drafter before context"),
+                           (DFLASH_AFTER_CTX_ANCHOR, DFLASH_AFTER_CTX, "drafter after context"),
+                           (DFLASH_EAGER_ANCHOR, DFLASH_EAGER, "drafter query eager switch"),
+                           (DFLASH_RETURN_ANCHOR, DFLASH_RETURN, "drafter return")):
+        text = replace_once(text, old, new, what)
+    out[FILES["dflash"]] = text.rstrip("\n") + "\n" + DFLASH_TAIL
+
+    text = (tree / FILES["dspark"]).read_text()
+    for name in ("class DSparkContextCudaGraphs:", "class DSparkDeepseekV4Model(nn.Module):",
+                 "class DSparkDeepseekV4ForCausalLM(nn.Module):", "    def compute_and_calibrate_confidence("):
+        if text.count(name) != 1:
+            raise SystemExit(f"dspark: {name!r} not found once")
+    out[FILES["dspark"]] = text.rstrip("\n") + "\n" + DSPARK_TAIL
+
+    text = (tree / FILES["moe_runner"]).read_text()
+    for name in ("class MoERunner(MoERunnerInterface):", "    def _apply_quant_method(",
+                 "    def _maybe_reduce_final_output("):
+        if text.count(name) != 1:
+            raise SystemExit(f"moe_runner: {name!r} not found once")
+    out[FILES["moe_runner"]] = text.rstrip("\n") + "\n" + MOE_TAP
     return out
 
 
