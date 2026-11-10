@@ -3830,6 +3830,19 @@ class GPUModelRunner(LoRAModelRunnerMixin):
 
         if _STEP_TRACE is not None:
             _STEP_TRACE.record(self, input_batch, locals())
+        for _draft_trace in _DRAFT_TRACES:
+            _draft_trace.harvest(
+                input_batch,
+                None,
+                {
+                    "t": time.monotonic(),
+                    "req_ids": list(input_batch.req_ids),
+                    "num_scheduled_tokens": input_batch.num_scheduled_tokens.tolist(),
+                    "num_tokens": int(input_batch.num_tokens),
+                    "num_reqs": int(input_batch.num_reqs),
+                    "query_per_req": getattr(getattr(self, "speculator", None), "num_query_per_req", None),
+                },
+            )
 
         # Post-step KV connector related operations.
         kv_connector_output = self.kv_connector.post_forward(finished_req_ids)
@@ -4165,5 +4178,9 @@ if _STEP_TRACE is not None:
     logger.warning("debug step trace on: every step's policy inputs to %s", _STEP_TRACE_DIR)
 
 from vllm.distributed.device_communicators.cuda_communicator import (  # noqa: E402
+    DRAFT_CTX_TRACE as _DRAFT_CTX_TRACE,
+    DRAFT_QUERY_TRACE as _DRAFT_QUERY_TRACE,
     ROW_TRACE as _ROW_TRACE,
 )
+
+_DRAFT_TRACES = tuple(t for t in (_DRAFT_CTX_TRACE, _DRAFT_QUERY_TRACE) if t is not None)
