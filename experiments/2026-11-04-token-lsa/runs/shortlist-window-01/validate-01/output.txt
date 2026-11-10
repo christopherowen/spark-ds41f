@@ -1,0 +1,245 @@
+[19:36:16] /workspace/tilelang/3rdparty/tvm/src/tirx/script/printer/expr.cc:75: Warning: Didn't find variable definition for: rows
+[19:36:17] /workspace/tilelang/3rdparty/tvm/src/script/printer/ir/./../utils.h:53: Warning: TVMScript printer falls back to the basic address printer with the error:
+Variable is not defined in the environment: rows
+[19:36:17] /workspace/tilelang/3rdparty/tvm/src/tirx/script/printer/expr.cc:75: Warning: Didn't find variable definition for: visible
+[19:36:17] /workspace/tilelang/3rdparty/tvm/src/script/printer/ir/./../utils.h:53: Warning: TVMScript printer falls back to the basic address printer with the error:
+Variable is not defined in the environment: visible
+2026-11-04 19:36:09  [TileLang:tilelang.jit.kernel:INFO] (kernel.py:137): TileLang begins to compile kernel `score` with `out_idx=None`
+2026-11-04 19:36:13  [TileLang:tilelang.jit.kernel:INFO] (kernel.py:145): TileLang completes to compile kernel `score`
+2026-11-04 19:36:13  [TileLang:tilelang.jit.kernel:INFO] (kernel.py:137): TileLang begins to compile kernel `indexer_topk_segment` with `out_idx=None`
+2026-11-04 19:36:14  [TileLang:tilelang.jit.kernel:INFO] (kernel.py:145): TileLang completes to compile kernel `indexer_topk_segment`
+2026-11-04 19:36:15  [TileLang:tilelang.jit.kernel:INFO] (kernel.py:137): TileLang begins to compile kernel `indexer_topk_merge` with `out_idx=None`
+2026-11-04 19:36:16  [TileLang:tilelang.jit.kernel:INFO] (kernel.py:145): TileLang completes to compile kernel `indexer_topk_merge`
+2026-11-04 19:36:17  [TileLang:tilelang.language.eager.builder:CRITICAL] (builder.py:1797): Failed to build prim_func from flags
+args={'Selected': Selected, 'Membership': Membership, 'Length': Length, 'Active': Active, 'Local': Local, 'Counts': Counts}
+source=def make_closure(budget, ctas, rows, search_steps, width):
+
+    def flags(__tb):
+        __tb_fl = '/opt/spark-ds41f/candidate/vllm/vllm/models/deepseek_v4_1/tilelang/shortlist_indexer.py'
+        __tb_fn = 'flags'
+        __tb.set_fileline(__tb_fl, 83, __tb_fn)
+
+        def flags(Selected, Membership, Length, Active, Local, Counts, **__kwargs):
+            __tb.set_fileline(__tb_fl, 83, __tb_fn)
+            Selected = __tb.arg('Selected', Selected)
+            __tb.set_fileline(__tb_fl, 83, __tb_fn)
+            Membership = __tb.arg('Membership', Membership)
+            __tb.set_fileline(__tb_fl, 84, __tb_fn)
+            Length = __tb.arg('Length', Length)
+            __tb.set_fileline(__tb_fl, 84, __tb_fn)
+            Active = __tb.arg('Active', Active)
+            __tb.set_fileline(__tb_fl, 85, __tb_fn)
+            Local = __tb.arg('Local', Local)
+            __tb.set_fileline(__tb_fl, 85, __tb_fn)
+            Counts = __tb.arg('Counts', Counts)
+            __tb.set_fileline(__tb_fl, 1, __tb_fn)
+            if __tb.skip_kernel_ctx():
+                __tb.set_fileline(__tb_fl, 1, __tb_fn)
+                return
+            __tb.set_fileline(__tb_fl, 86, __tb_fn)
+            with __tb.ctx_with(__tb.resolve_call(__tb.rval('T', T).Kernel)(__tb.rval('ctas', ctas), __tb.rval('rows', rows), threads=128)) as (cta, row):
+                __tb.set_fileline(__tb_fl, 87, __tb_fn)
+                keep = __tb.bind('keep', __tb.resolve_call(__tb.rval('T', T).alloc_fragment)([__tb.rval('TILE', TILE)], __tb.rval('T', T).int32))
+                __tb.set_fileline(__tb_fl, 88, __tb_fn)
+                prefix = __tb.bind('prefix', __tb.resolve_call(__tb.rval('T', T).alloc_fragment)([__tb.rval('TILE', TILE)], __tb.rval('T', T).int32))
+                __tb.set_fileline(__tb_fl, 89, __tb_fn)
+                low = __tb.bind('low', __tb.resolve_call(__tb.rval('T', T).alloc_fragment)([__tb.rval('TILE', TILE)], __tb.rval('T', T).int32))
+                __tb.set_fileline(__tb_fl, 90, __tb_fn)
+                high = __tb.bind('high', __tb.resolve_call(__tb.rval('T', T).alloc_fragment)([__tb.rval('TILE', TILE)], __tb.rval('T', T).int32))
+                __tb.set_fileline(__tb_fl, 91, __tb_fn)
+                extent = __tb.bind('extent', __tb.resolve_call(__tb.rval('T', T).min)(__tb.resolve_call(__tb.rval('T', T).max)(__tb.rval('Length', Length)[__tb.rval('row', row)], 0), __tb.resolve_call(__tb.rval('T', T).max)(__tb.resolve_call(__tb.rval('T', T).min)(__tb.rval('Active', Active)[0], __tb.rval('width', width)), 0)))
+                __tb.set_fileline(__tb_fl, 92, __tb_fn)
+                visible = __tb.bind('visible', __tb.resolve_call(__tb.rval('T', T).ceildiv)(__tb.rval('extent', extent), __tb.rval('BLOCK', BLOCK)))
+                __tb.set_fileline(__tb_fl, 93, __tb_fn)
+                complete = __tb.bind('complete', __tb.rval('extent', extent) // __tb.rval('CHUNK', CHUNK) * (__tb.rval('CHUNK', CHUNK) // __tb.rval('BLOCK', BLOCK)))
+                __tb.set_fileline(__tb_fl, 94, __tb_fn)
+                for __11 in __tb.ctx_for(__tb.iter_call(__tb.resolve_call(__tb.rval('T', T).serial), __tb.resolve_call(__tb.rval('T', T).ceildiv)(__tb.resolve_call(__tb.rval('T', T).max)(__tb.resolve_call(__tb.rval('T', T).ceildiv)(__tb.rval('visible', visible), __tb.rval('TILE', TILE)) - __tb.rval('cta', cta), 0), __tb.rval('ctas', ctas)))):
+                    __tb.set_fileline(__tb_fl, 94, __tb_fn)
+                    iteration = __tb.bind('iteration', __11, loop_target=True)
+                    __tb.set_fileline(__tb_fl, 95, __tb_fn)
+                    tile = __tb.bind('tile', __tb.rval('cta', cta) + __tb.rval('iteration', iteration) * __tb.rval('ctas', ctas))
+                    __tb.set_fileline(__tb_fl, 96, __tb_fn)
+                    for __0 in __tb.ctx_for(__tb.iter_call(__tb.resolve_call(__tb.rval('T', T).Parallel), __tb.rval('TILE', TILE))):
+                        __tb.set_fileline(__tb_fl, 96, __tb_fn)
+                        i = __tb.bind('i', __0, loop_target=True)
+                        __tb.set_fileline(__tb_fl, 97, __tb_fn)
+                        __tb.assign_slice(__tb.rval('low', low), __tb.rval('i', i), 0)
+                        __tb.set_fileline(__tb_fl, 98, __tb_fn)
+                        __tb.assign_slice(__tb.rval('high', high), __tb.rval('i', i), __tb.rval('budget', budget))
+                    __tb.set_fileline(__tb_fl, 101, __tb_fn)
+                    for __4 in __tb.ctx_for(__tb.iter_call(__tb.resolve_call(__tb.rval('T', T).serial), __tb.rval('search_steps', search_steps))):
+                        __tb.set_fileline(__tb_fl, 101, __tb_fn)
+                        step = __tb.bind('step', __4, loop_target=True)
+                        __tb.set_fileline(__tb_fl, 102, __tb_fn)
+                        for __3 in __tb.ctx_for(__tb.iter_call(__tb.resolve_call(__tb.rval('T', T).Parallel), __tb.rval('TILE', TILE))):
+                            __tb.set_fileline(__tb_fl, 102, __tb_fn)
+                            i = __tb.bind('i', __3, loop_target=True)
+                            __tb.set_fileline(__tb_fl, 103, __tb_fn)
+                            block = __tb.bind('block', __tb.rval('tile', tile) * __tb.rval('TILE', TILE) + __tb.rval('i', i))
+                            __tb.set_fileline(__tb_fl, 104, __tb_fn)
+                            for __2 in __tb.ctx_if((__tb.rval('block', block) < __tb.rval('complete', complete)) & (__tb.rval('low', low)[__tb.rval('i', i)] < __tb.rval('high', high)[__tb.rval('i', i)])):
+                                __tb.set_fileline(__tb_fl, 104, __tb_fn)
+                                for _ in __tb.ctx_then(__2):
+                                    __tb.set_fileline(__tb_fl, 105, __tb_fn)
+                                    middle = __tb.bind('middle', (__tb.rval('low', low)[__tb.rval('i', i)] + __tb.rval('high', high)[__tb.rval('i', i)]) // 2)
+                                    __tb.set_fileline(__tb_fl, 106, __tb_fn)
+                                    selected = __tb.bind('selected', __tb.rval('Selected', Selected)[__tb.rval('row', row), __tb.resolve_call(__tb.rval('T', T).min)(__tb.rval('middle', middle), __tb.rval('budget', budget) - 1)])
+                                    __tb.set_fileline(__tb_fl, 107, __tb_fn)
+                                    selected = __tb.bind('selected', __tb.resolve_call(__tb.rval('T', T).if_then_else)(__tb.rval('selected', selected) < 0, 2147483647, __tb.rval('selected', selected)))
+                                    __tb.set_fileline(__tb_fl, 108, __tb_fn)
+                                    for __1 in __tb.ctx_if(__tb.rval('selected', selected) < __tb.rval('Membership', Membership)[__tb.rval('block', block)]):
+                                        __tb.set_fileline(__tb_fl, 108, __tb_fn)
+                                        for _ in __tb.ctx_then(__1):
+                                            __tb.set_fileline(__tb_fl, 109, __tb_fn)
+                                            __tb.assign_slice(__tb.rval('low', low), __tb.rval('i', i), __tb.rval('middle', middle) + 1)
+                                        __tb.set_fileline(__tb_fl, 108, __tb_fn)
+                                        for _ in __tb.ctx_else(__1):
+                                            __tb.set_fileline(__tb_fl, 111, __tb_fn)
+                                            __tb.assign_slice(__tb.rval('high', high), __tb.rval('i', i), __tb.rval('middle', middle))
+                    __tb.set_fileline(__tb_fl, 112, __tb_fn)
+                    for __7 in __tb.ctx_for(__tb.iter_call(__tb.resolve_call(__tb.rval('T', T).Parallel), __tb.rval('TILE', TILE))):
+                        __tb.set_fileline(__tb_fl, 112, __tb_fn)
+                        i = __tb.bind('i', __7, loop_target=True)
+                        __tb.set_fileline(__tb_fl, 113, __tb_fn)
+                        block = __tb.bind('block', __tb.rval('tile', tile) * __tb.rval('TILE', TILE) + __tb.rval('i', i))
+                        __tb.set_fileline(__tb_fl, 114, __tb_fn)
+                        __tb.assign_slice(__tb.rval('keep', keep), __tb.rval('i', i), 0)
+                        __tb.set_fileline(__tb_fl, 115, __tb_fn)
+                        for __6 in __tb.ctx_if(__tb.rval('block', block) < __tb.rval('visible', visible)):
+                            __tb.set_fileline(__tb_fl, 115, __tb_fn)
+                            for _ in __tb.ctx_then(__6):
+                                __tb.set_fileline(__tb_fl, 116, __tb_fn)
+                                chosen = __tb.bind('chosen', (__tb.rval('block', block) >= __tb.rval('complete', complete)) | (__tb.rval('block', block) == __tb.rval('visible', visible) - 1))
+                                __tb.set_fileline(__tb_fl, 117, __tb_fn)
+                                for __5 in __tb.ctx_if(__tb.rval('block', block) < __tb.rval('complete', complete)):
+                                    __tb.set_fileline(__tb_fl, 117, __tb_fn)
+                                    for _ in __tb.ctx_then(__5):
+                                        __tb.set_fileline(__tb_fl, 118, __tb_fn)
+                                        chosen = __tb.bind('chosen', __tb.rval('chosen', chosen) | (__tb.rval('low', low)[__tb.rval('i', i)] < __tb.rval('budget', budget)) & (__tb.rval('Selected', Selected)[__tb.rval('row', row), __tb.resolve_call(__tb.rval('T', T).min)(__tb.rval('low', low)[__tb.rval('i', i)], __tb.rval('budget', budget) - 1)] == __tb.rval('Membership', Membership)[__tb.rval('block', block)]))
+                                __tb.set_fileline(__tb_fl, 120, __tb_fn)
+                                __tb.assign_slice(__tb.rval('keep', keep), __tb.rval('i', i), __tb.resolve_call(__tb.rval('T', T).cast)(__tb.rval('chosen', chosen), __tb.rval('T', T).int32))
+                    __tb.set_fileline(__tb_fl, 121, __tb_fn)
+                    __tb.eval(__tb.resolve_call(__tb.rval('T', T).cumsum)(__tb.rval('keep', keep), __tb.rval('prefix', prefix), dim=0))
+                    __tb.set_fileline(__tb_fl, 122, __tb_fn)
+                    for __10 in __tb.ctx_for(__tb.iter_call(__tb.resolve_call(__tb.rval('T', T).Parallel), __tb.rval('TILE', TILE))):
+                        __tb.set_fileline(__tb_fl, 122, __tb_fn)
+                        i = __tb.bind('i', __10, loop_target=True)
+                        __tb.set_fileline(__tb_fl, 123, __tb_fn)
+                        block = __tb.bind('block', __tb.rval('tile', tile) * __tb.rval('TILE', TILE) + __tb.rval('i', i))
+                        __tb.set_fileline(__tb_fl, 124, __tb_fn)
+                        for __8 in __tb.ctx_if(__tb.rval('block', block) < __tb.rval('visible', visible)):
+                            __tb.set_fileline(__tb_fl, 124, __tb_fn)
+                            for _ in __tb.ctx_then(__8):
+                                __tb.set_fileline(__tb_fl, 125, __tb_fn)
+                                __tb.assign_slice(__tb.rval('Local', Local), (__tb.rval('row', row), __tb.rval('block', block)), __tb.resolve_call(__tb.rval('T', T).if_then_else)(__tb.rval('keep', keep)[__tb.rval('i', i)] > 0, __tb.rval('prefix', prefix)[__tb.rval('i', i)], 0))
+                        __tb.set_fileline(__tb_fl, 126, __tb_fn)
+                        for __9 in __tb.ctx_if(__tb.rval('i', i) == __tb.rval('TILE', TILE) - 1):
+                            __tb.set_fileline(__tb_fl, 126, __tb_fn)
+                            for _ in __tb.ctx_then(__9):
+                                __tb.set_fileline(__tb_fl, 127, __tb_fn)
+                                __tb.assign_slice(__tb.rval('Counts', Counts), (__tb.rval('row', row), __tb.rval('tile', tile)), __tb.rval('prefix', prefix)[__tb.rval('i', i)])
+        return flags
+    return flags
+RESULT {"passed": false, "cases": [], "scope": "out-of-band structural, evaluated-score and graph tests; generated-token equivalence not yet tested", "error": "Traceback (most recent call last):\n  File \"/tmp/validate.py\", line 50, in main\n    data,args,plan,construction,span = setup(path)\n                                       ^^^^^^^^^^^\n  File \"/tmp/fixture.py\", line 34, in setup\n    plan = ShortlistPlan(data['width'],data['page_size'],512 if source else budget,\n           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^\n  File \"/opt/spark-ds41f/candidate/vllm/vllm/models/deepseek_v4_1/tilelang/shortlist_indexer.py\", line 209, in __init__\n    self.flags = shortlist_flags(width,budget)\n                 ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^\n  File \"/usr/local/lib/python3.12/dist-packages/tilelang/jit/__init__.py\", line 567, in __call__\n    kernel = self.compile(*args, **kwargs)\n             ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^\n  File \"/usr/local/lib/python3.12/dist-packages/tilelang/jit/__init__.py\", line 480, in compile\n    prim_func = self.get_tir(*args, **kwargs)\n                ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^\n  File \"/usr/local/lib/python3.12/dist-packages/tilelang/jit/__init__.py\", line 388, in get_tir\n    tir = self.func(*args, **kwargs)\n          ^^^^^^^^^^^^^^^^^^^^^^^^^^\n  File \"/usr/local/lib/python3.12/dist-packages/tilelang/language/eager/builder.py\", line 1719, in __call__\n    return self.get_tir(*args, **kwargs)\n           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^\n  File \"/usr/local/lib/python3.12/dist-packages/tilelang/language/eager/builder.py\", line 1711, in get_tir\n    self.p1_cache[bound.p1_key] = self._build_tir_template(**bound.compile_kwargs)\n                                  ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^\n  File \"/usr/local/lib/python3.12/dist-packages/tilelang/language/eager/builder.py\", line 1679, in _build_tir_template\n    return TirTemplate.from_lazy_style(self.orig_func.__name__, self.orig_func(*args, **kwargs))\n                                                                ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^\n  File \"/opt/spark-ds41f/candidate/vllm/vllm/models/deepseek_v4_1/tilelang/shortlist_indexer.py\", line 82, in shortlist_flags\n    @T.prim_func\n     ^^^^^^^^^^^\n  File \"/usr/local/lib/python3.12/dist-packages/tilelang/language/eager/builder.py\", line 1800, in prim_func\n    return impl(func) if func is not None else impl\n           ^^^^^^^^^^\n  File \"/usr/local/lib/python3.12/dist-packages/tilelang/language/eager/builder.py\", line 1798, in impl\n    raise e\n  File \"/usr/local/lib/python3.12/dist-packages/tilelang/language/eager/builder.py\", line 1791, in impl\n    ir_gen.gen(builder)(**annot)\n  File \"/opt/spark-ds41f/candidate/vllm/vllm/models/deepseek_v4_1/tilelang/shortlist_indexer.py\", line 120, in flags\n    keep[i] = T.cast(chosen,T.int32)\n                 ^^^^^^\n  File \"/usr/local/lib/python3.12/dist-packages/tilelang/language/eager/builder.py\", line 910, in rval\n    raise RuntimeError(\nRuntimeError: Immutable variable `chosen` is used outside its defining region!\nvariable `chosen` is defined in frame: script.ir_builder.tirx.IfFrame(stmts=(), condition=block < complete, then_stmts=(chosen = T.bool()\nlow = T.Buffer((256,), \"int32\", scope=\"local.fragment\")\ni = T.int32()\nrows = T.int32()\nSelected = T.Buffer((rows, 64), \"int32\", strides=(64, 1))\nby = T.int32()\nMembership = T.Buffer((65536,), \"int32\", strides=(1,))\nblock = T.int32()\nchosen_1: T.bool = T.bitwise_or(chosen, T.bitwise_and(low[i] < 64, Selected[by, T.min(low[i], 63)] == Membership[block])),), else_stmts=None), current frames: [script.ir_builder.tirx.PrimFuncFrame(stmts=(), name=\"flags\", args=(Selected_handle, Membership_handle, Length_handle, Active_handle, Local_handle, Counts_handle), is_private=False, ret_type=None, buffer_map={Selected_handle: Selected, Membership_handle: Membership, Length_handle: Length, Active_handle: Active, Local_handle: Local, Counts_handle: Counts}, attrs={}, env_threads={}, root_alloc_buffers=()), tl.KernelLaunchFrame(stmts=(), frames=(script.ir_builder.tirx.ForFrame(stmts=(), vars=(bx,), doms=(I.Range(0, 128),)), script.ir_builder.tirx.ForFrame(stmts=(), vars=(by,), doms=(ir.Range(0x4d80f070),)), script.ir_builder.tirx.ForFrame(stmts=(), vars=(tx, ty, tz), doms=(I.Range(0, 1), I.Range(0, 1), I.Range(0, 1))), script.ir_builder.tirx.SSBlockFrame(stmts=(rows = T.int32()\nLength = T.Buffer((rows,), \"int32\", strides=(1,))\nby = T.int32()\nActive = T.Buffer((1,), \"int32\", strides=(1,))\nextent: T.int32 = T.min(T.max(Length[by], 0), T.max(T.min(Active[0], 524288), 0)), extent = T.int32()\nvisible: T.int32 = (extent + 8 - 1) // 8, extent = T.int32()\ncomplete: T.int32 = extent // 512 * 64), name=\"tilelang_root\", iter_vars=(), reads=(), writes=(), init=None, alloc_buffers=(keep, prefix, low, high), match_buffers=(), annotations={\"tl.launch_threads\": (128, 1, 1)}, iter_values=(), predicate=None, no_realize=False)), grid_vars=(bx, by), grid_extents=(128, rows), thread_vars=(tx, ty, tz), thread_extents=(128, 1, 1)), script.ir_builder.tirx.ForFrame(stmts=(bx = T.int32()\niteration = T.int32()\ntile: T.int32 = bx + iteration * 128, for i in T.parallel(256):\n    low = T.Buffer((256,), \"int32\", scope=\"local.fragment\")\n    low[i] = 0\n    high = T.Buffer((256,), \"int32\", scope=\"local.fragment\")\n    high[i] = 64, for step in range(7):\n    for i in T.parallel(256):\n        tile = T.int32()\n        block: T.int32 = tile * 256 + i\n        complete = T.int32()\n        low = T.Buffer((256,), \"int32\", scope=\"local.fragment\")\n        high = T.Buffer((256,), \"int32\", scope=\"local.fragment\")\n        if T.bitwise_and(block < complete, low[i] < high[i]):\n            middle: T.int32 = (low[i] + high[i]) // 2\n            rows = T.int32()\n            Selected = T.Buffer((rows, 64), \"int32\", strides=(64, 1))\n            by = T.int32()\n            selected: T.int32 = Selected[by, T.min(middle, 63)]\n            selected_1: T.int32 = T.if_then_else(selected < 0, 2147483647, selected)\n            Membership = T.Buffer((65536,), \"int32\", strides=(1,))\n            if selected_1 < Membership[block]:\n                low[i] = middle + 1\n            else:\n                high[i] = middle), vars=(iteration,), doms=(ir.Range(0x49ef3b30),)), script.ir_builder.tirx.ForFrame(stmts=(tile = T.int32()\ni = T.int32()\nblock: T.int32 = tile * 256 + i, keep = T.Buffer((256,), \"int32\", scope=\"local.fragment\")\ni = T.int32()\nkeep[i] = 0), vars=(i,), doms=(I.Range(0, 256),)), script.ir_builder.tirx.IfFrame(stmts=(), condition=block < visible, then_stmts=None, else_stmts=None), script.ir_builder.tirx.ThenFrame(stmts=(block = T.int32()\ncomplete = T.int32()\nvisible = T.int32()\nchosen: T.bool = T.bitwise_or(block >= complete, block == visible - 1), block = T.int32()\ncomplete = T.int32()\nif block < complete:\n    chosen = T.bool()\n    low = T.Buffer((256,), \"int32\", scope=\"local.fragment\")\n    i = T.int32()\n    rows = T.int32()\n    Selected = T.Buffer((rows, 64), \"int32\", strides=(64, 1))\n    by = T.int32()\n    Membership = T.Buffer((65536,), \"int32\", strides=(1,))\n    chosen_1: T.bool = T.bitwise_or(chosen, T.bitwise_and(low[i] < 64, Selected[by, T.min(low[i], 63)] == Membership[block]))))].\n"}
+Traceback (most recent call last):
+  File "/tmp/validate.py", line 92, in <module>
+    main()
+  File "/tmp/validate.py", line 50, in main
+    data,args,plan,construction,span = setup(path)
+                                       ^^^^^^^^^^^
+  File "/tmp/fixture.py", line 34, in setup
+    plan = ShortlistPlan(data['width'],data['page_size'],512 if source else budget,
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/opt/spark-ds41f/candidate/vllm/vllm/models/deepseek_v4_1/tilelang/shortlist_indexer.py", line 209, in __init__
+    self.flags = shortlist_flags(width,budget)
+                 ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/usr/local/lib/python3.12/dist-packages/tilelang/jit/__init__.py", line 567, in __call__
+    kernel = self.compile(*args, **kwargs)
+             ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/usr/local/lib/python3.12/dist-packages/tilelang/jit/__init__.py", line 480, in compile
+    prim_func = self.get_tir(*args, **kwargs)
+                ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/usr/local/lib/python3.12/dist-packages/tilelang/jit/__init__.py", line 388, in get_tir
+    tir = self.func(*args, **kwargs)
+          ^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/usr/local/lib/python3.12/dist-packages/tilelang/language/eager/builder.py", line 1719, in __call__
+    return self.get_tir(*args, **kwargs)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/usr/local/lib/python3.12/dist-packages/tilelang/language/eager/builder.py", line 1711, in get_tir
+    self.p1_cache[bound.p1_key] = self._build_tir_template(**bound.compile_kwargs)
+                                  ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/usr/local/lib/python3.12/dist-packages/tilelang/language/eager/builder.py", line 1679, in _build_tir_template
+    return TirTemplate.from_lazy_style(self.orig_func.__name__, self.orig_func(*args, **kwargs))
+                                                                ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/opt/spark-ds41f/candidate/vllm/vllm/models/deepseek_v4_1/tilelang/shortlist_indexer.py", line 82, in shortlist_flags
+    @T.prim_func
+     ^^^^^^^^^^^
+  File "/usr/local/lib/python3.12/dist-packages/tilelang/language/eager/builder.py", line 1800, in prim_func
+    return impl(func) if func is not None else impl
+           ^^^^^^^^^^
+  File "/usr/local/lib/python3.12/dist-packages/tilelang/language/eager/builder.py", line 1798, in impl
+    raise e
+  File "/usr/local/lib/python3.12/dist-packages/tilelang/language/eager/builder.py", line 1791, in impl
+    ir_gen.gen(builder)(**annot)
+  File "/opt/spark-ds41f/candidate/vllm/vllm/models/deepseek_v4_1/tilelang/shortlist_indexer.py", line 120, in flags
+    keep[i] = T.cast(chosen,T.int32)
+                 ^^^^^^
+  File "/usr/local/lib/python3.12/dist-packages/tilelang/language/eager/builder.py", line 910, in rval
+    raise RuntimeError(
+RuntimeError: Immutable variable `chosen` is used outside its defining region!
+variable `chosen` is defined in frame: script.ir_builder.tirx.IfFrame(stmts=(), condition=block < complete, then_stmts=(chosen = T.bool()
+low = T.Buffer((256,), "int32", scope="local.fragment")
+i = T.int32()
+rows = T.int32()
+Selected = T.Buffer((rows, 64), "int32", strides=(64, 1))
+by = T.int32()
+Membership = T.Buffer((65536,), "int32", strides=(1,))
+block = T.int32()
+chosen_1: T.bool = T.bitwise_or(chosen, T.bitwise_and(low[i] < 64, Selected[by, T.min(low[i], 63)] == Membership[block])),), else_stmts=None), current frames: [script.ir_builder.tirx.PrimFuncFrame(stmts=(), name="flags", args=(Selected_handle, Membership_handle, Length_handle, Active_handle, Local_handle, Counts_handle), is_private=False, ret_type=None, buffer_map={Selected_handle: Selected, Membership_handle: Membership, Length_handle: Length, Active_handle: Active, Local_handle: Local, Counts_handle: Counts}, attrs={}, env_threads={}, root_alloc_buffers=()), tl.KernelLaunchFrame(stmts=(), frames=(script.ir_builder.tirx.ForFrame(stmts=(), vars=(bx,), doms=(I.Range(0, 128),)), script.ir_builder.tirx.ForFrame(stmts=(), vars=(by,), doms=(ir.Range(0x4d80f070),)), script.ir_builder.tirx.ForFrame(stmts=(), vars=(tx, ty, tz), doms=(I.Range(0, 1), I.Range(0, 1), I.Range(0, 1))), script.ir_builder.tirx.SSBlockFrame(stmts=(rows = T.int32()
+Length = T.Buffer((rows,), "int32", strides=(1,))
+by = T.int32()
+Active = T.Buffer((1,), "int32", strides=(1,))
+extent: T.int32 = T.min(T.max(Length[by], 0), T.max(T.min(Active[0], 524288), 0)), extent = T.int32()
+visible: T.int32 = (extent + 8 - 1) // 8, extent = T.int32()
+complete: T.int32 = extent // 512 * 64), name="tilelang_root", iter_vars=(), reads=(), writes=(), init=None, alloc_buffers=(keep, prefix, low, high), match_buffers=(), annotations={"tl.launch_threads": (128, 1, 1)}, iter_values=(), predicate=None, no_realize=False)), grid_vars=(bx, by), grid_extents=(128, rows), thread_vars=(tx, ty, tz), thread_extents=(128, 1, 1)), script.ir_builder.tirx.ForFrame(stmts=(bx = T.int32()
+iteration = T.int32()
+tile: T.int32 = bx + iteration * 128, for i in T.parallel(256):
+    low = T.Buffer((256,), "int32", scope="local.fragment")
+    low[i] = 0
+    high = T.Buffer((256,), "int32", scope="local.fragment")
+    high[i] = 64, for step in range(7):
+    for i in T.parallel(256):
+        tile = T.int32()
+        block: T.int32 = tile * 256 + i
+        complete = T.int32()
+        low = T.Buffer((256,), "int32", scope="local.fragment")
+        high = T.Buffer((256,), "int32", scope="local.fragment")
+        if T.bitwise_and(block < complete, low[i] < high[i]):
+            middle: T.int32 = (low[i] + high[i]) // 2
+            rows = T.int32()
+            Selected = T.Buffer((rows, 64), "int32", strides=(64, 1))
+            by = T.int32()
+            selected: T.int32 = Selected[by, T.min(middle, 63)]
+            selected_1: T.int32 = T.if_then_else(selected < 0, 2147483647, selected)
+            Membership = T.Buffer((65536,), "int32", strides=(1,))
+            if selected_1 < Membership[block]:
+                low[i] = middle + 1
+            else:
+                high[i] = middle), vars=(iteration,), doms=(ir.Range(0x49ef3b30),)), script.ir_builder.tirx.ForFrame(stmts=(tile = T.int32()
+i = T.int32()
+block: T.int32 = tile * 256 + i, keep = T.Buffer((256,), "int32", scope="local.fragment")
+i = T.int32()
+keep[i] = 0), vars=(i,), doms=(I.Range(0, 256),)), script.ir_builder.tirx.IfFrame(stmts=(), condition=block < visible, then_stmts=None, else_stmts=None), script.ir_builder.tirx.ThenFrame(stmts=(block = T.int32()
+complete = T.int32()
+visible = T.int32()
+chosen: T.bool = T.bitwise_or(block >= complete, block == visible - 1), block = T.int32()
+complete = T.int32()
+if block < complete:
+    chosen = T.bool()
+    low = T.Buffer((256,), "int32", scope="local.fragment")
+    i = T.int32()
+    rows = T.int32()
+    Selected = T.Buffer((rows, 64), "int32", strides=(64, 1))
+    by = T.int32()
+    Membership = T.Buffer((65536,), "int32", strides=(1,))
+    chosen_1: T.bool = T.bitwise_or(chosen, T.bitwise_and(low[i] < 64, Selected[by, T.min(low[i], 63)] == Membership[block]))))].

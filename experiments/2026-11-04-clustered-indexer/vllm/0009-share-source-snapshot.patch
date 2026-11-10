@@ -1,0 +1,102 @@
+From 85a41fe2575f9345b33c5bbcd3636efa62bb6c4a Mon Sep 17 00:00:00 2001
+From: Christopher Owen <root@your.mom>
+Date: Wed, 4 Nov 2026 14:17:25 +0100
+Subject: [PATCH] Share a fresh owned snapshot across exact source queries
+
+Base: promoted vLLM tree ea1281f880e7535e3d87725be0156a8e38fc2fb2 plus the first eight experiment patches. Rationale: source rows of a known cache owner need the same visible key metadata; repeating it per query wastes time and memory. This is a separate API with explicit one-owner table and 1..256 row contract. Only fresh envelope construction and the tensor-bound metadata row vary; native source scoring, exact cutoff, stable compaction, block handoff and reindex order are unchanged. No persistent state or serving registration. Tests: unchanged existing GPU-kernel ASTs, fresh patch/source checks and superset bound CPU oracle; repeated grouped source/handoff/reindex, graph, allocation and sanitizer GPU gates pending. Upstream status: local experiment, not submitted.
+---
+ .../tilelang/grouped_source_indexer.py        | 44 +++++++++++++++++++
+ .../deepseek_v4_1/tilelang/source_indexer.py  | 12 +++--
+ 2 files changed, 52 insertions(+), 4 deletions(-)
+ create mode 100644 vllm/models/deepseek_v4_1/tilelang/grouped_source_indexer.py
+
+diff --git a/vllm/models/deepseek_v4_1/tilelang/grouped_source_indexer.py b/vllm/models/deepseek_v4_1/tilelang/grouped_source_indexer.py
+new file mode 100644
+index 0000000000..306241c153
+--- /dev/null
++++ b/vllm/models/deepseek_v4_1/tilelang/grouped_source_indexer.py
+@@ -0,0 +1,44 @@
++# SPDX-License-Identifier: Apache-2.0
++# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
++"""Exact source handoff with a fresh snapshot shared by one known owner."""
++import torch
++
++from .clustered_indexer import CLUSTER, cluster_bounds_tensor
++from .grouped_indexer import shared_extent, shared_tables
++from .indexer import INDEX_DIM, page_bytes
++from .source_indexer import SourceClusteredIndexerPlan
++
++
++class GroupedSourceClusteredIndexerPlan(SourceClusteredIndexerPlan):
++    """One explicitly owned cache table and 1..256 source queries.
++
++    All visible keys must be written. No metadata persists between invocations;
++    graph replay rebuilds maximum extent, per-row tables and bounds from live input.
++    """
++
++    def __init__(self, width, page_size):
++        super().__init__(width, page_size)
++        self.maximum = shared_extent(width)
++        self.tables = shared_tables(width, page_size)
++        if not self.native_fallback:
++            self.search.bounds = cluster_bounds_tensor(width, shared_metadata=True)
++
++    def run(self, q, scales, weights, pool, table, lengths, active):
++        rows = q.shape[0]
++        if not 0 < rows <= 256 or table.shape[0] != 1:
++            raise ValueError('grouped source search requires 1..256 queries and one owned page table')
++        if table.shape[1] * self.page_size < self.width:
++            raise ValueError('owned table must cover the planned width')
++        expanded = torch.empty((rows, table.shape[1]), dtype=torch.int32, device=q.device)
++        self.tables(table, lengths, active, expanded)
++        if self.native_fallback:
++            return super().run(q, scales, weights, pool, expanded, lengths, active)
++        maximum = torch.empty((1,), dtype=torch.int32, device=q.device)
++        lower = torch.empty((1, self.width // CLUSTER, INDEX_DIM), dtype=torch.float32, device=q.device)
++        upper = torch.empty_like(lower)
++        self.maximum(lengths, active, maximum)
++        self.search.envelope(pool[:, :page_bytes(self.page_size)], table, maximum, active, lower, upper)
++        result, evidence = super().run(q, scales, weights, pool, expanded, lengths, active,
++                                      _metadata=(lower, upper))
++        evidence['metadata_elements'] = lower.numel() + upper.numel()
++        return result, evidence
+diff --git a/vllm/models/deepseek_v4_1/tilelang/source_indexer.py b/vllm/models/deepseek_v4_1/tilelang/source_indexer.py
+index f67b2606fb..4cb13c3985 100644
+--- a/vllm/models/deepseek_v4_1/tilelang/source_indexer.py
++++ b/vllm/models/deepseek_v4_1/tilelang/source_indexer.py
+@@ -211,7 +211,7 @@ class SourceClusteredIndexerPlan:
+         self.restore = restore_source_scores(width)
+         self.compact = source_surviving_candidates(width, CANDIDATE_BLOCKS)
+ 
+-    def run(self, q, scales, weights, pool, table, lengths, active):
++    def run(self, q, scales, weights, pool, table, lengths, active, *, _metadata=None):
+         rows, device = q.shape[0], q.device
+         def empty(shape, dtype):
+             return torch.empty(shape, dtype=dtype, device=device)
+@@ -224,8 +224,11 @@ class SourceClusteredIndexerPlan:
+                          'native_fallback': True}
+         plan = self.search
+         clusters = self.width // CLUSTER
+-        lower = empty((rows, clusters, 128), torch.float32)
+-        upper = torch.empty_like(lower)
++        if _metadata is None:
++            lower = empty((rows, clusters, 128), torch.float32)
++            upper = torch.empty_like(lower)
++        else:
++            lower, upper = _metadata
+         bounds = empty((rows, clusters), torch.bfloat16)
+         counts = empty((rows,), torch.int32)
+         coarse_ids = empty((rows, plan.seeds), torch.int32)
+@@ -241,7 +244,8 @@ class SourceClusteredIndexerPlan:
+         cutoff_positions = empty((rows,), torch.int32)
+         candidates = empty((rows, self.width // 8), torch.int32)
+         candidate_counts = empty((rows,), torch.int32)
+-        plan.envelope(pool[:, :page_bytes(self.page_size)], table, lengths, active, lower, upper)
++        if _metadata is None:
++            plan.envelope(pool[:, :page_bytes(self.page_size)], table, lengths, active, lower, upper)
+         plan.bounds(q.view(torch.uint8), scales.view(torch.uint8).reshape(rows, 32, 4),
+                     weights, lower, upper, lengths, active, bounds, counts)
+         plan.coarse.run(bounds, counts, active, coarse_ids, coarse_values)
+-- 
+2.54.0 (Apple Git-157)
+
