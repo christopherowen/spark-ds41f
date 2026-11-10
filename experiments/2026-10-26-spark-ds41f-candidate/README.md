@@ -1053,3 +1053,11 @@ candidate-50 without #1009 plus #960, #971, #977, #984, #998, tested at `tp3-swi
 - **Series:** [candidate-53/vllm/series](candidate-53/vllm/series) (`0001..0785`, 664 patches;
   `patchset_sha256` `f7f2d13c`, `patch_head` `62df12dc`, `expected_tree` `c0e25ff1`).
 - **Status:** prepared and locked; not built, not measured.
+
+## Candidate 54 ([candidate-54/](candidate-54))
+
+The merged base of round 2: candidate-50 with #1009 round 1, plus every PR that passed PR validation in candidates 51-53 (#961, #963, #987's WO-B part, #1001, #1030, #968, #969, #960, #971, #977, #998), each reworked PR as its corrected patch. #984 missed and is in rework, so it is left out; round 2 ends with #998 round 1. It is verified, not release-qualified, on `tp4-ring`, `tp4-switched` and `tp3-switched`: the gate, the screen against 1107's recorded screens, and the carried fixes' live checks. Its screens are the next round's reference. #1030 changes temperature-0 text, so the gate's hashes differ from the 1017 checkpoint's by construction. Sources, stacking and the runs are in its README.
+
+- **Series:** [candidate-54/vllm/series](candidate-54/vllm/series) (`0001..0791`, 671 patches;
+  `patchset_sha256` `fd767123`, `patch_head` `4e8133ff`, `expected_tree` `5f021d9a`).
+- **Status:** prepared and locked; not built, not measured.
