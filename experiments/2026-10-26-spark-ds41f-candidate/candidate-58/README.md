@@ -313,3 +313,10 @@ Prepared and locked; not built, not measured.
 **Added during verification (2026-11-10):** [single-stream-tp4.json](single-stream-tp4.json), c1 at `tp4-ring` in one
 session against candidate-54 (candidate-58, candidate-54, candidate-58 again), as candidate-55's was. c1 decode on
 `tp4-ring` is one of the release targets, and the merged-base screen does not measure it.
+
+**c1 attribution (2026-11-10).** The same-session `single-stream` run at `tp4-ring` finds candidate-58's c1 paired
+decode 0.35% below candidate-54's (81.93/81.90 against 82.24 tok/s; margin 0.31%). #1008 and #988's dead-row part
+were the same as candidate-54 at c1 (candidate-55 without #978), so [attribute-c1-tp4.json](attribute-c1-tp4.json)
+runs c1 in one session on candidate-58, candidate-58 without each of #957 part 4, #957 part 2 and #956 r4 (their
+files at their pre-patch versions, `no957p4/`, `no957p2/`, `no956/`; the three share no file), candidate-54, and
+candidate-58 again.
