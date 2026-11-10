@@ -1,0 +1,379 @@
+From dd9f15c187a551aa8ebfd93f6f4b583161768b21 Mon Sep 17 00:00:00 2001
+From: Christopher Owen <christopherowen@users.noreply.github.com>
+Date: Sun, 8 Nov 2026 15:37:19 +0000
+Subject: [PATCH] perf(worker): trim the host heap once when startup freezes
+ the GC heap
+
+Base: candidate-53's series before 0784 (1107's 0001..0761, candidate-50's
+0762..0777, 0779 and 0780, then 0781..0783). It applies with or without 0781
+(#960), and 0785 (#998) applies on top. Round 0 (PR head 737aec88) was based
+on the 1107 vLLM patch head 320021e3c4dbb202d911ab70e2cd924c75420488.
+
+Rationale:
+On 128 GB unified-memory GB10 nodes, host memory and the CUDA caching allocator
+draw from the same LPDDR5x pool, so host heap pages that a process freed during
+startup and never returned lower MemAvailable for as long as the server runs.
+PyTorch's CPU tensor allocator in libc10.so (c10::alloc_cpu / c10::free_cpu) is
+statically linked mimalloc, while Python objects and C++ containers use glibc
+ptmalloc; neither returns freed pages to the OS unless asked.
+
+Add trim_host_heap() in vllm.utils.mem_utils: libc10's mimalloc mi_collect(true)
+(resolved from .symtab relative to _ZN3c108free_cpuEPv) and glibc
+malloc_trim(0). Call it once, in freeze_gc_heap() after its last collection and
+before gc.freeze(). The worker, the engine core and the API server each reach
+freeze_gc_heap() at the end of startup. The worker now logs its startup memory
+breakdown after the freeze, so the breakdown shows the trimmed state.
+
+Quality:
+No numerical, scheduling or serving-path change. Nothing runs after readiness,
+and no flush runs on the prefill or decode path. On one tp3-switched rank (rank
+0's shard, sp8), the trim returns 66 MiB of the worker's host heap at the end of
+startup (mi_collect 59 MiB, malloc_trim 7 MiB) in 5 ms. RssAnon at readiness is
+2736/2756 MiB against 2820/2820 MiB without the patch, and time to ready is
+88.4/89.3 s against 89.0/87.8 s. MemAvailable cannot resolve the difference on
+one node: its boot-to-boot spread there is about 0.15 GiB.
+
+Round 1:
+Round 0 added about 77 s to every tp3-switched boot. Its startup floor was
+0.03-0.12 GiB a rank higher, and its post-prefill flush blocked the host on the
+decode path. The time was spent in gc.collect(), not in the trims. Round 0 added
+gc.collect() and trim_host_heap() to release_device_memory_under_pressure().
+process_weights_after_loading() calls that function after every quantized module.
+On a TP3 rank, under UMA pressure, it releases 277 times across the target's
+and the draft's post-processing. Each full collection of the loaded heap takes
+about 0.25 s, so loading took 109 s instead of 40 s. The 302 trims took 0.08 s
+in all. Round 1 keeps only the end-of-startup trim:
+- removed the gc.collect() and trim in the UMA pressure release, the
+  reclaim_uma_memory() at the end of DirectModelLoader.load_model(), and the gc
+  and trim in bind_weight_arena(). These are 1107's per-module flush and the
+  points around it.
+- removed the trims in DeviceMemoryProfiler, memory_profiling(), profile_run(),
+  profile_cudagraph_memory(), the profiling teardown, capture_model(),
+  freeze_gc_for_cudagraph_capture(), Worker.init_device(), the B12X preparation
+  steps, determine_available_memory(), initialize_from_config(), the two warm-up
+  flushes, the model cleanup, TileLang release_host_memory() and the executor's
+  _trim_host_heap(). They ran mid-startup, the floor is set at readiness, and
+  the final trim returns the same pages: RssAnon at readiness is the same as
+  round 0's (2746/2745 MiB). The recipe fixes --kv-cache-memory-bytes, so
+  profiling does not size the KV cache.
+- removed the post-prefill flush (_pending_post_prefill_cache_flush and
+  reclaim_uma_memory() after the first FULL decode step following an eager step).
+  It blocked the host for 32-35 ms per call (116-120 ms with a large unfrozen
+  heap) on the first FULL decode step after an eager step, and the next prefill
+  then took about 61-67 ms to remap the memory. With --prefill-yield short,
+  decode steps run between a long prefill's chunks, so the flush ran after every
+  chunk: round 0's attribution measured stall-3 prefill under decode 2.37% slower,
+  beyond the interval.
+- removed reclaim_uma_memory() and its test, the capture-freeze trim test and the
+  post-prefill flush test, and imported pytest in test_mem_utils.py, which
+  calls pytest.skip.
+
+Tests:
+- pytest -v -k 'not test_memory_profiling' tests/utils_/test_mem_utils.py
+  tests/utils_/test_gc_utils.py tests/v1/worker/test_gpu_model_runner_v2.py
+  tests/v1/worker/test_gpu_worker.py
+  tests/model_executor/model_loader/test_direct_loader.py
+  tests/model_executor/model_loader/test_direct_loader_cuda.py, with
+  tests/vllm_test_utils and a tblib stub on PYTHONPATH (233 passed, 1 deselected,
+  two runs).
+
+Upstream status: local unified-memory allocator hygiene for GB10.
+---
+ tests/utils_/test_gc_utils.py  |  26 +++++++
+ tests/utils_/test_mem_utils.py |  35 +++++++++-
+ vllm/utils/gc_utils.py         |   2 +
+ vllm/utils/mem_utils.py        | 123 ++++++++++++++++++++++++++++++++-
+ vllm/v1/worker/gpu_worker.py   |   8 +--
+ 5 files changed, 188 insertions(+), 6 deletions(-)
+
+diff --git a/tests/utils_/test_gc_utils.py b/tests/utils_/test_gc_utils.py
+index f1d0de87c..683ef084d 100644
+--- a/tests/utils_/test_gc_utils.py
++++ b/tests/utils_/test_gc_utils.py
+@@ -7,6 +7,7 @@ from vllm.utils.gc_utils import (
+     GCDebugConfig,
+     _compute_detailed_type,
+     _compute_top_gc_collected_objects,
++    freeze_gc_heap,
+ )
+ 
+ 
+@@ -83,3 +84,28 @@ def test_gc_debug_config():
+     config = GCDebugConfig('{"top_objects":5}')
+     assert config.enabled
+     assert config.top_objects == 5
++
++
++def test_freeze_gc_heap_trims_before_freeze(monkeypatch):
++    events: list[object] = []
++    monkeypatch.setattr(
++        "vllm.utils.gc_utils.gc.collect",
++        lambda gen=None: events.append(("collect", gen)) or 0,
++    )
++    monkeypatch.setattr(
++        "vllm.utils.gc_utils.trim_host_heap",
++        lambda: events.append("trim") or True,
++    )
++    monkeypatch.setattr(
++        "vllm.utils.gc_utils.gc.freeze", lambda: events.append("freeze")
++    )
++
++    freeze_gc_heap()
++
++    assert events == [
++        ("collect", 0),
++        ("collect", 1),
++        ("collect", 2),
++        "trim",
++        "freeze",
++    ]
+diff --git a/tests/utils_/test_mem_utils.py b/tests/utils_/test_mem_utils.py
+index 19690d1f3..f24813688 100644
+--- a/tests/utils_/test_mem_utils.py
++++ b/tests/utils_/test_mem_utils.py
+@@ -2,10 +2,16 @@
+ # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+ from unittest.mock import MagicMock, patch
+ 
++import pytest
+ import torch
+ from vllm_test_utils.monitor import monitor
+ 
+-from vllm.utils.mem_utils import MemorySnapshot, memory_profiling
++from vllm.utils.mem_utils import (
++    MemorySnapshot,
++    _get_c10_mi_collect,
++    memory_profiling,
++    trim_host_heap,
++)
+ 
+ from ..utils import create_new_process_for_each_test
+ 
+@@ -148,3 +154,30 @@ def test_memory_snapshot_uses_cuda_on_discrete_gpu():
+         assert snapshot.free_memory == mock_cuda_free
+         assert snapshot.total_memory == mock_cuda_total
+         mock_psutil.virtual_memory.assert_not_called()
++
++
++def test_trim_host_heap_reclaims_cpu_tensor_and_glibc_arenas():
++    import gc
++    import sys
++
++    if sys.platform != "linux":
++        pytest.skip("Linux-only host arena trim test")
++
++    def read_rss_kib() -> int:
++        with open("/proc/self/status") as f:
++            for line in f:
++                if line.startswith("VmRSS:"):
++                    return int(line.split()[1])
++        return 0
++
++    trim_host_heap()
++    t = torch.ones((32 * 1024 * 1024,), dtype=torch.float32, device="cpu")
++    buf = bytearray(64 * 1024 * 1024)
++    buf[0 : len(buf) : 4096] = b"\x01" * (len(buf) // 4096)
++    rss_peak = read_rss_kib()
++    del t, buf
++    gc.collect()
++    assert trim_host_heap() is True
++    rss_after = read_rss_kib()
++    if _get_c10_mi_collect() is not None:
++        assert rss_after < rss_peak - 64 * 1024
+diff --git a/vllm/utils/gc_utils.py b/vllm/utils/gc_utils.py
+index 32bdfb764..6f87c6734 100644
+--- a/vllm/utils/gc_utils.py
++++ b/vllm/utils/gc_utils.py
+@@ -9,6 +9,7 @@ from typing import Any
+ 
+ import vllm.envs as envs
+ from vllm.logger import init_logger
++from vllm.utils.mem_utils import trim_host_heap
+ 
+ logger = init_logger(__name__)
+ 
+@@ -132,6 +133,7 @@ def freeze_gc_heap() -> None:
+     gc.collect(0)
+     gc.collect(1)
+     gc.collect(2)
++    trim_host_heap()
+     # Freeze all GC tracked objects
+     gc.freeze()
+ 
+diff --git a/vllm/utils/mem_utils.py b/vllm/utils/mem_utils.py
+index c092dff41..e856bab0f 100644
+--- a/vllm/utils/mem_utils.py
++++ b/vllm/utils/mem_utils.py
+@@ -1,11 +1,15 @@
+ # SPDX-License-Identifier: Apache-2.0
+ # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+ import contextlib
++import ctypes
+ import gc
++import struct
++import sys
+ import time
+-from collections.abc import Generator
++from collections.abc import Callable, Generator
+ from dataclasses import dataclass, field
+ from functools import cache
++from pathlib import Path
+ 
+ import psutil
+ import torch
+@@ -47,6 +51,123 @@ _UMA_PRESSURE_THRESHOLD = 0.8
+ _UMA_MIN_RELEASE_BYTES = 512 * MiB_bytes
+ 
+ 
++@cache
++def _get_malloc_trim() -> Callable[[int], int] | None:
++    if sys.platform != "linux":
++        return None
++    with contextlib.suppress(Exception):
++        libc = ctypes.CDLL("libc.so.6")
++        malloc_trim = libc.malloc_trim
++        malloc_trim.argtypes = [ctypes.c_size_t]
++        malloc_trim.restype = ctypes.c_int
++        return malloc_trim
++    return None
++
++
++@cache
++def _get_c10_mi_collect() -> Callable[[bool], None] | None:
++    """Resolve mimalloc's ``mi_collect(bool force)`` inside ``libc10.so`` when
++    PyTorch's CPU tensor allocator (``c10::alloc_cpu`` / ``c10::free_cpu``) is
++    built with statically linked mimalloc.
++    """
++    if sys.platform != "linux":
++        return None
++    with contextlib.suppress(Exception):
++        libc10_path = Path(torch.__file__).resolve().parent / "lib" / "libc10.so"
++        if not libc10_path.is_file():
++            return None
++        lib = ctypes.CDLL(str(libc10_path))
++        mi_collect = getattr(lib, "mi_collect", None)
++        if mi_collect is not None:
++            mi_collect.argtypes = [ctypes.c_bool]
++            mi_collect.restype = None
++            return mi_collect
++
++        free_cpu_ptr = ctypes.cast(lib._ZN3c108free_cpuEPv, ctypes.c_void_p).value
++        if not free_cpu_ptr:
++            return None
++
++        with libc10_path.open("rb") as f:
++            ident = f.read(64)
++            if (
++                len(ident) < 64
++                or ident[:4] != b"\x7fELF"
++                or ident[4] != 2
++                or ident[5] != 1
++            ):
++                return None
++            e_shoff = struct.unpack_from("<Q", ident, 40)[0]
++            e_shentsize, e_shnum = struct.unpack_from("<HH", ident, 58)
++            if e_shoff == 0 or e_shnum == 0 or e_shentsize < 64:
++                return None
++            f.seek(e_shoff)
++            shdrs = f.read(e_shentsize * e_shnum)
++            symtab_hdr = None
++            for idx in range(e_shnum):
++                sh = struct.unpack_from("<IIQQQQIIQQ", shdrs, idx * e_shentsize)
++                if sh[1] == 2:  # SHT_SYMTAB
++                    symtab_hdr = sh
++                    break
++            if symtab_hdr is None:
++                return None
++            _, _, _, _, sh_offset, sh_size, sh_link, _, _, sh_entsize = symtab_hdr
++            if sh_entsize != 24 or sh_link >= e_shnum:
++                return None
++            strtab_sh = struct.unpack_from(
++                "<IIQQQQIIQQ", shdrs, sh_link * e_shentsize
++            )
++            str_offset, str_size = strtab_sh[4], strtab_sh[5]
++            f.seek(str_offset)
++            strtab = f.read(str_size)
++            f.seek(sh_offset)
++            symtab = f.read(sh_size)
++
++        target_free = b"_ZN3c108free_cpuEPv\x00"
++        target_mi = b"mi_collect\x00"
++        free_val = 0
++        mi_val = 0
++        for offset in range(0, len(symtab) - 23, 24):
++            st_name, st_info, _, _, st_value, _ = struct.unpack_from(
++                "<IBBHQQ", symtab, offset
++            )
++            if st_value == 0 or (st_info & 0xF) != 2:  # STT_FUNC
++                continue
++            if strtab[st_name : st_name + 20] == target_free:
++                free_val = st_value
++            elif strtab[st_name : st_name + 11] == target_mi:
++                mi_val = st_value
++            if free_val and mi_val:
++                break
++
++        if free_val and mi_val:
++            fn_type = ctypes.CFUNCTYPE(None, ctypes.c_bool)
++            return fn_type(free_cpu_ptr - free_val + mi_val)
++    return None
++
++
++def trim_host_heap() -> bool:
++    """Return unused host heap pages from PyTorch's CPU tensor allocator and
++    glibc's malloc arenas back to the OS.
++
++    On Unified Memory Architecture (UMA) platforms such as GB10, freed CPU
++    tensor segments in ``libc10`` (mimalloc) and freed heap chunks in ``glibc``
++    (ptmalloc) remain committed against the shared physical memory pool until
++    explicitly purged.
++    """
++    trimmed = False
++    mi_collect = _get_c10_mi_collect()
++    if mi_collect is not None:
++        with contextlib.suppress(Exception):
++            mi_collect(True)
++            trimmed = True
++    malloc_trim = _get_malloc_trim()
++    if malloc_trim is not None:
++        with contextlib.suppress(Exception):
++            malloc_trim(0)
++            trimmed = True
++    return trimmed
++
++
+ def release_device_memory_under_pressure(device: torch.device) -> bool:
+     """On integrated (UMA) GPUs, release caching-allocator memory back to the
+     OS when system memory pressure is high. The OS may start thrashing before
+diff --git a/vllm/v1/worker/gpu_worker.py b/vllm/v1/worker/gpu_worker.py
+index d7358d233..d5a8df097 100644
+--- a/vllm/v1/worker/gpu_worker.py
++++ b/vllm/v1/worker/gpu_worker.py
+@@ -1194,8 +1194,6 @@ class Worker(WorkerBase):
+             self._startup_heartbeat.stop()
+             self._startup_heartbeat = None
+ 
+-        log_startup_memory_breakdown(self, cuda_graph_memory_bytes)
+-
+         # All warmup is done — start monitoring for unexpected JIT
+         # compilations that would cause latency spikes during inference.
+         from vllm.utils.jit_monitor import activate as activate_jit_monitor
+@@ -1211,11 +1209,13 @@ class Worker(WorkerBase):
+                 "vLLM warm-up is complete"
+             )
+ 
+-        # Freeze the worker heap so the GC won't scan static objects
+-        # (model weights, KV caches, CUDA graphs) during inference.
++        # Freeze the worker heap and trim host arenas before logging the
++        # steady-state startup memory breakdown.
+         freeze_gc_heap()
+         maybe_attach_gc_debug_callback()
+ 
++        log_startup_memory_breakdown(self, cuda_graph_memory_bytes)
++
+         # Warmup / first-compile is done — activate the `VLLM_GPU_SYNC_CHECK`
+         # gate so subsequent `execute_model` / `sample_tokens` calls enforce it.
+         enable_gpu_sync_check()
+-- 
+2.43.0
+

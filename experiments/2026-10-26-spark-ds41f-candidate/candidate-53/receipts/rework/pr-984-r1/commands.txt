@@ -1,0 +1,68 @@
+# rework-984-r1: commands, in order. The receipts are in raw/.
+# Hosts: sp5 (read only), sp8 (one GB10, GPU work under flock /tmp/spark-lab-gpu.lock).
+# Sources: origin/main d0dee4dc00 (candidate-53 and candidate-50/no1009 as merged then).
+# Image on sp8: spark-ds41f:candidate-50 = sha256:8c1ea1f62f62c3e2adc03b645c091a5499cf7163101aca32875c894b96f155db.
+# No pushes, commits to the deployment repo, PRs, image builds, cluster or window operations.
+
+## 1. Read the attribution (sp5, read only)
+ssh sp5 cat ~/projects/spark-ds41f/results/private/lab/candidate-53-attribute-984-tp3-switched-table.txt
+ssh sp5 cat ~/projects/spark-ds41f/results/private/determinism/candidate-53-attribute-984-tp3-switched/startup-memory-*.json
+ssh sp5 sed -n 4401,4456p ~/projects/spark-ds41f/results/private/lab/candidate-50-spark-0013-window.log   # and 4573-4612, 4731-4770, 4889-4928
+#   The attribution boots saved no engine logs; the phase lines come from the two engine logs
+#   of the same images that exist on sp5:
+#     with #984:    suites/candidate-53-screen-tp3-switched/candidate-53-no960-no998-again.engine-sp{5,6,7}.log
+#     without #984: suites/candidate-50-companions-tp3-switched/candidate-50-no1009.engine-sp{5,6,7}.log
+#   grep -E "Loading weights took|TileLangExperts|Packed the BF16|Direct loader: weights loaded|Model loading took|Prepared .* TileLang|Graph capturing|memory_breakdown|init engine" ...
+#   -> raw/sp5-read-only/{engine-phase-lines-all-ranks.txt,window-log-boot-lines.txt,lab/,determinism/}
+
+## 2. Trees (sp8; no GPU)
+# candidate-53's 33 changed files over candidate-50 (prior own-marks workspace, checked against its
+# overlay-sha.txt: 33/33 equal), with candidate-53/no960-no998/overlay on top -> c53nn/ (22 non-test files).
+# c53nn/ against candidate-53/no960-no998-no984/overlay: exactly #984's 8 files differ -> no984/.
+# fix/ = c53nn/ with #984's files corrected (raw/trees/fix; overlay/ = the 16 files that differ from
+# the candidate-53 image).
+docker create spark-ds41f:candidate-50; docker cp <id>:/opt/spark-ds41f/candidate/vllm/vllm c50tree-vllm   # source reading only
+
+## 3. The one-rank tp3-switched startup harness (sp8)
+# raw/sp8/harness/boot_tp3r0.py: the real engine startup (LLMEngine.from_engine_args, external launcher,
+# EngineCore in process), the 1107 recipe resolved at tp3-switched (scripts/recipe.py resolve(),
+# raw/sp8/harness/serve-args.json, env.list), rank 0 of a 3-rank fake process group. Stand-ins are listed
+# in its docstring and are the same in every arm. raw/sp8/harness/run.sh is the docker command (the
+# recipe's docker_run_args without /dev/infiniband; /hub, /cache (workspace copy), GLP vector, display
+# card mounts); it takes the GPU lock, refuses if ~/spark-hold.json exists or any container runs, and logs
+# each run block to raw/sp8/out/commands.txt (full docker command lines are there).
+harness/run.sh smoke-base base     # failed: sparknet one-shot needs NCCL (stubbed next)
+harness/run.sh smoke2-base base    # hung in the TP shared-memory broadcaster; killed (docker kill), exit 137
+harness/run.sh smoke3-base base    # failed: B12X preparation store exchange timeout (single-rank decisions next)
+harness/run.sh smoke4-base base    # failed in profile_run: PyNCCL disabled (no-transfer PyNCCL stand-in next); cold TileLang compile 261 s
+harness/run.sh smoke5-base base    # failed: B12X stage with nothing to prepare left active (settled next)
+harness/run.sh smoke6-base base    # first complete startup (93.9 s)
+# The session, back to back (raw/sp8/harness/queue.sh; queue.log):
+harness/run.sh warm-fix fix        # warm-up of the candidate trees' kernels
+harness/run.sh base-1 base
+harness/run.sh fix-1  fix
+harness/run.sh c984-1 c984
+harness/run.sh c984-2 c984
+harness/run.sh fix-2  fix
+harness/run.sh base-2 base
+python3 harness/analyze.py out base-1=base fix-1=fix c984-1=c984 c984-2=c984 fix-2=fix base-2=base > abba-summary.json
+
+## 4. The corrected patch (sp8; git in a scratch repository of the 11 files #984 touches)
+git init pr984git   # base commit: no984/ non-test files + candidate-50 image's three test files
+git am main/.../candidate-53/vllm/0784-perf-worker-reclaim-uma-heap-and-allocator-slack-acr.patch
+#   -> applies; its 8 non-test files equal c53nn/ and its tests equal candidate-53's (overlay-sha.txt)
+cp fix/<8 files> . ; edit the three test files ; git commit --amend -F harness/commit-msg.txt   # author and date kept
+git format-patch --abbrev=9 -1   # -> 0784-perf-worker-trim-the-host-heap-once-when-startup-freezes.patch
+git diff --check HEAD~1          # clean
+# Apply checks: git am on the no960 base (the files equal fix/); git am on candidate-53's own tree
+# before 0784 (candidate-53 files with 0785 then 0784 reverted, so 0781 is in); 0785 still applies
+# on top (git apply --check). All pass.
+
+## 5. Tests of the corrected patch (sp8, two runs; raw/sp8/harness/pytest.sh)
+harness/pytest.sh pytest-fix-boot1   # 233 passed, 1 deselected
+harness/pytest.sh pytest-fix-boot2   # 233 passed, 1 deselected
+#   pytest -v -k "not test_memory_profiling" tests/utils_/test_mem_utils.py tests/utils_/test_gc_utils.py
+#   tests/v1/worker/test_gpu_model_runner_v2.py tests/v1/worker/test_gpu_worker.py
+#   tests/model_executor/model_loader/test_direct_loader.py tests/model_executor/model_loader/test_direct_loader_cuda.py
+#   on spark-ds41f:candidate-50 with fix/ and the corrected test files mounted, PYTHONPATH with
+#   tests/vllm_test_utils and the own-marks tblib stub.

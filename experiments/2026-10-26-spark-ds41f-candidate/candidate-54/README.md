@@ -73,7 +73,13 @@ without #984, on the same image at `tp3-switched`:
 - **Time to ready:** #984 adds about 77 s a boot: 203 and 199 s with it, against 121.5 and 126.9 s without.
 - **Startup `MemAvailable` floor:** it improves only 0.03-0.12 GiB a rank. On the first boots that is
   5.83/7.65/7.57 against 5.80/7.60/7.45 GiB.
-- **Stall-3 and prefill:** #984 does not move them.
+- **Prefill:** unchanged. **Stall-3:** worse with #984. Prefill under decode is 2.37% slower (margin 1.27%),
+  and decode p90 during it is 0.77% higher. *(Corrected 2026-11-10: this line first said #984 did not move
+  stall-3.)*
+
+Round 1 ([candidate-53/receipts/rework/pr-984-r1](../candidate-53/receipts/rework/pr-984-r1/result.json)) keeps
+one heap trim at the end of startup and drops the rest. Its TP3 check is
+[candidate-53/attribute-984r1-tp3-switched.json](../candidate-53/attribute-984r1-tp3-switched.json).
 
 Its own mark on sp8 was [cannot-evaluate](../candidate-53/receipts/own-marks/pr-984/result.json). #998 round 1
 applies without #984 before it ([stack.log](receipts/stack.log), section 2), so round 2 ends with #998 round 1
