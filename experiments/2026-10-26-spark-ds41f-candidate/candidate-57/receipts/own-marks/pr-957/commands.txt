@@ -53,3 +53,19 @@ RECIPE_ENV=(-e CUDA_DEVICE_MAX_CONNECTIONS=32 -e "PYTORCH_CUDA_ALLOC_CONF=expand
   -e VLLM_NO_USAGE_STATS=1 -e VLLM_PLUGINS= -e TRITON_CACHE_DIR=/root/.tilelang/triton -e VLLM_CACHE_ROOT=/root/.tilelang/vllm)
 HUB=(-v $HOME/.cache/huggingface/hub:/hf/hub:ro)
 NSYS=(-v /opt/nvidia/nsight-systems/2025.3.2:/opt/nsys:ro)
+
+# ---------------------------------------------------------------------------------------------
+# Part 2 confirmation (2026-11-10 08:00-08:02Z; step 8, "Confirm in one session first")
+# h957p2.py gained --only (a cell filter; plans, inputs and timing unchanged): raw/harness/h957p2.py,
+# the first run's file kept as raw/harness/h957p2.v1.py.
+# bash B/bin/run_all.sh pr-957p2c   (08:00:20Z start, 08:02:28Z end, rc=0)
+
+## B/bin/pr-957p2c.sh
+B=$HOME/spark-lab/agents/round3-own-marks; OM=$B/bin/om.sh; . $B/bin/env.sh; mkdir -p $B/out/pr-957p2c/json
+ONLY="tp3:12,16;tp4:6,12,16,32"
+for spec in "base 1" "c57p2 1" "c57p2 2" "base 2" "base 3" "c57p2 3" "c57p2 4" "base 4"; do set -- $spec
+  $OM 957p2c mlac-$1-boot$2 $1 "${RECIPE_ENV[@]}" -- python3 /h/h957p2.py --boot $2 --only "$ONLY" --out /out/json/mlac-$1-boot$2.json
+done
+
+## analysis
+python3 raw/harness/a957p2c.py raw/part2-confirmation/json > raw/analysis/part2-confirmation-cells.json

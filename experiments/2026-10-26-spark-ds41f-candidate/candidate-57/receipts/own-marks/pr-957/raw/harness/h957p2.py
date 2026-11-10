@@ -1,6 +1,9 @@
 """#957 part 2 (0797): the sparse-MLA decode plan (stage 2) at TP3 and TP4 rank shapes.
 
-usage: python3 /h/h957p2.py --boot K --out FILE
+usage: python3 /h/h957p2.py --boot K --out FILE [--only "tp3:12,16;tp4:6,12,16,32"]
+
+``--only`` runs a subset of the cells (each listed row count at both index-length mixes) with
+the same plans, inputs and timing; without it every cell runs.
 
 The PR's bench_sparse_mla_tp3 workload (screen_tp3_decode.py at e464d364): SWA width 128,
 index width 512, page 128, max_rows 48, q/KV random, sinks 0, positions 1024, with the
@@ -26,7 +29,12 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--boot", required=True)
     ap.add_argument("--out", required=True)
+    ap.add_argument("--only", default="")
     args = ap.parse_args()
+    only = {}
+    for item in filter(None, args.only.split(";")):
+        tp_s, rows_s = item.split(":")
+        only[int(tp_s.replace("tp", ""))] = {int(r) for r in rows_s.split(",")}
     from vllm.models.deepseek_v4_1.tilelang.sparse_mla import (
         HEAD_DIM, IDX_RECORD_BYTES, SWA_RECORD_BYTES, SparseMlaV41Plan)
     from vllm.v1.worker.workspace import init_workspace_manager
@@ -34,7 +42,8 @@ def main():
     device = torch.device("cuda", 0)
     init_workspace_manager(device)
     warm = gpu_warmup()
-    out = {"boot": args.boot, "env": env_info(), "gpu_warmup_ms": warm, "plans": {}, "cells": {}}
+    out = {"boot": args.boot, "env": env_info(), "gpu_warmup_ms": warm, "plans": {}, "cells": {},
+           "only": args.only}
     swa_width, idx_width, page_size, max_rows, num_pages = 128, 512, 128, 48, 64
     for tp, heads in ((3, 24), (4, 16)):
         plan = SparseMlaV41Plan(heads, swa_width, idx_width, page_size, swa_page_size=page_size,
@@ -63,6 +72,8 @@ def main():
         }
         for mix, idx_lens in mixes.items():
             for r in ROWS:
+                if only and r not in only.get(tp, ()):
+                    continue
                 def run(r=r, idx_lens=idx_lens):
                     plan.run(q[:r], swa_kv, swa_indices[:r], swa_lens[:r], sinks, positions[:r], cos_sin, o[:r],
                              idx_cache=idx_kv, idx_indices=idx_indices[:r], idx_lengths=idx_lens[:r],
