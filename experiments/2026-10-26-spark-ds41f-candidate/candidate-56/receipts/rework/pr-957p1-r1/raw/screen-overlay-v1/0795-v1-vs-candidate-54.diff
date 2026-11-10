@@ -1,0 +1,185 @@
+diff --git a/tests/models/test_deepseek_v4_1_compressor.py b/tests/models/test_deepseek_v4_1_compressor.py
+index 5fabb558c..fd512227b 100644
+--- a/tests/models/test_deepseek_v4_1_compressor.py
++++ b/tests/models/test_deepseek_v4_1_compressor.py
+@@ -533,11 +533,8 @@ def test_compressor_tp_sharded_fused_wkv_wgate_matches_tp1(monkeypatch, ratio):
+ 
+         tp1 = build_rank(0, 1)
+         assert tp1.fused_wkv_wgate.tp_size == 1
+-        assert hasattr(tp1.fused_wkv_wgate, "packed_bf16_exponent_base")
+-        assert tp1.fused_wkv_wgate.weight.shape == (
+-            512 * ratio,
+-            hidden + hidden // 2,
+-        )
++        assert not hasattr(tp1.fused_wkv_wgate, "packed_bf16_exponent_base")
++        assert tp1.fused_wkv_wgate.weight.shape == (512 * ratio, hidden)
+         assert unpack_bf16_layer(tp1.fused_wkv_wgate).shape == (512 * ratio, hidden)
+ 
+         x = torch.randn(
+@@ -555,7 +552,26 @@ def test_compressor_tp_sharded_fused_wkv_wgate_matches_tp1(monkeypatch, ratio):
+         from vllm.models.deepseek_v4_1.compressor import _compressor_part_cols
+         from vllm.models.deepseek_v4_1.tilelang.linear import project_parts
+ 
+-        for tp_size in (2, 3, 4, 5, 6, 7, 8):
++        for tp_size in (2, 3, 4):
++            ranks = [build_rank(r, tp_size) for r in range(tp_size)]
++            for comp in ranks:
++                assert comp.fused_wkv_wgate.tp_size == 1
++                assert not hasattr(comp.fused_wkv_wgate, "packed_bf16_exponent_base")
++                assert comp.fused_wkv_wgate.weight.shape == (512 * ratio, hidden)
++            for rows in (1, 7, 16, 64, 160):
++                inp = x[:rows]
++                ref_values, ref_gates = expected_by_rows[rows]
++                ranks[0]._project(inp)
++                assert torch.equal(
++                    ranks[0]._values[:rows], ref_values
++                ), f"tp={tp_size} rows={rows}"
++                if ratio == 2:
++                    assert torch.equal(
++                        ranks[0]._gates[:rows], ref_gates
++                    ), f"tp={tp_size} rows={rows}"
++                assert not ranks[0].fused_wkv_wgate.tilelang_counters.any()
++
++        for tp_size in (5, 6, 7, 8):
+             part_cols = _compressor_part_cols(tp_size)
+             ranks = [build_rank(r, tp_size) for r in range(tp_size)]
+             for r, comp in enumerate(ranks):
+diff --git a/tests/models/test_deepseek_v4_1_l2_schedule.py b/tests/models/test_deepseek_v4_1_l2_schedule.py
+index b11d3cf8f..060723eae 100644
+--- a/tests/models/test_deepseek_v4_1_l2_schedule.py
++++ b/tests/models/test_deepseek_v4_1_l2_schedule.py
+@@ -3,6 +3,7 @@
+ """Where each layer type issues its L2 prefetch windows (``l2_prefetch``), on fake
+ layers: the windows are cache hints, so what matters is the point and the plan."""
+ 
++import os
+ from types import SimpleNamespace
+ 
+ import pytest
+@@ -154,6 +155,37 @@ def test_owner_layer_gets_a_compressor_window(segments):
+     assert plain.attn._l2pf_comp is None
+ 
+ 
++def test_compressor_window_has_its_own_budget(segments, monkeypatch):
++    budgets = {}
++
++    def make_plan(segs, budget, device):
++        if segs:
++            budgets[segs[0]] = budget
++        return _Plan(segs) if segs else None
++
++    monkeypatch.setattr(l2_prefetch, "make_plan", make_plan)
++    DeepseekV4DecoderLayer.build_l2_prefetch(_layer(owner=True), _layer())
++    assert budgets["compressor"] == l2_prefetch.BUDGET_COMP
++    assert budgets["wo"] == l2_prefetch.BUDGET_WO
++
++
++def test_compressor_budget_fills_a_shard():
++    """The default COMP budget takes a TP rank's whole 12-bit shard (TP5 and up),
++    and only a shard's worth of the replicated BF16 weight (TP4 and below)."""
++    from vllm.models.glm5next.nvidia import l2_prefetch as base
++
++    if os.getenv("VLLM_DS41_L2_PREFETCH_COMP_MB") is not None:
++        pytest.skip("VLLM_DS41_L2_PREFETCH_COMP_MB overrides the default")
++    budget = l2_prefetch.BUDGET_COMP
++    shard = 256 * 7680  # ratio two at TP5: 2 x 128 columns, 12-bit, H=5120
++    taken, rest = base.take_budget([("compressor.weight", 0, shard)], budget)
++    assert taken == [("compressor.weight", 0, shard)] and not rest
++    replicated = 1024 * 5120 * 2  # ratio two through TP4: BF16, every column
++    taken, rest = base.take_budget([("compressor.weight", 0, replicated)], budget)
++    assert len(taken) == 1 and shard <= taken[0][2] <= 2_000_000
++    assert rest[0][1] == taken[0][2]
++
++
+ def test_engram_layer_moves_next_after_its_projection(segments, issued):
+     layer, nxt = _layer(), _layer(engram=True)
+     DeepseekV4DecoderLayer.build_l2_prefetch(layer, nxt)
+diff --git a/vllm/models/deepseek_v4_1/compressor.py b/vllm/models/deepseek_v4_1/compressor.py
+index 999fe061a..5ea1d9a3c 100644
+--- a/vllm/models/deepseek_v4_1/compressor.py
++++ b/vllm/models/deepseek_v4_1/compressor.py
+@@ -220,7 +220,10 @@ class DeepseekCompressor(nn.Module):
+         tp_size = linear_layers.get_tensor_model_parallel_world_size()
+         self._sp_enabled = compress_ratio == 1 and tp_size > 1
+         self._sp_weight = self._sp_kernel = None
+-        disable_tp = tp_size <= 1
++        # Replicate the 4 compressor layers (30 MiB total across the model) in
++        # uncompressed BF16 up through TP4 so decode avoids 4 RoCE all-gathers,
++        # 4 column-gather launches, and L2-resident 12-bit unpack overhead.
++        disable_tp = tp_size <= 4
+         self.fused_wkv_wgate = _PaddedSplitColumnParallelLinear(
+             hidden_size,
+             compress_ratio,
+@@ -235,6 +238,7 @@ class DeepseekCompressor(nn.Module):
+         from vllm.models.deepseek_v4_1.tilelang.linear import TileLangSplitLinearMethod
+ 
+         # wkv and wgate (ratio 2) each project into their own buffer.
++        self.fused_wkv_wgate.pack_bf16 = not disable_tp
+         self.fused_wkv_wgate.quant_method = TileLangSplitLinearMethod(compress_ratio)
+         self.fused_wkv_wgate.out_dtype = (
+             torch.float32 if compress_ratio == 2 else torch.bfloat16
+diff --git a/vllm/models/deepseek_v4_1/l2_prefetch.py b/vllm/models/deepseek_v4_1/l2_prefetch.py
+index cc9722de5..1c040c429 100644
+--- a/vllm/models/deepseek_v4_1/l2_prefetch.py
++++ b/vllm/models/deepseek_v4_1/l2_prefetch.py
+@@ -43,7 +43,7 @@ spin kernels standing in for the attention core and all-reduces
+ 
+ Environment:
+   VLLM_DS41_L2_PREFETCH=0/1           default on for SM121 (GB10)
+-  VLLM_DS41_L2_PREFETCH_{WO,FFN,NEXT}_MB   per-window fill budgets
++  VLLM_DS41_L2_PREFETCH_{WO,COMP,FFN,NEXT}_MB   per-window fill budgets
+ """
+ 
+ from __future__ import annotations
+@@ -73,6 +73,13 @@ ENABLED = _enabled()
+ BUDGET_WO = _l2pf._mb("VLLM_DS41_L2_PREFETCH_WO_MB", "20")
+ BUDGET_FFN = _l2pf._mb("VLLM_DS41_L2_PREFETCH_FFN_MB", "16")
+ BUDGET_NEXT = _l2pf._mb("VLLM_DS41_L2_PREFETCH_NEXT_MB", "20")
++# COMP has its own budget: it is issued after Q-B, close to the compressor's
++# projection that reads it, and WO's 18.9 MB fill queues behind it. A TP rank's
++# 12-bit shard (1-2 MB) lands in time. The replicated BF16 weight through TP4
++# (10.5 MB at ratio two, 5.2 MB at ratio one) does not: the projection then reads
++# DRAM while the fill competes with it, and COMP plus WO overflow the 24 MB L2.
++# So COMP fills the head of its weight, as much as a shard.
++BUDGET_COMP = _l2pf._mb("VLLM_DS41_L2_PREFETCH_COMP_MB", "2")
+ 
+ 
+ def linear_segments(name: str, linear: torch.nn.Module | None) -> list[Segment]:
+diff --git a/vllm/models/deepseek_v4_1/nvidia/model.py b/vllm/models/deepseek_v4_1/nvidia/model.py
+index b5baa9f0a..075100a5e 100644
+--- a/vllm/models/deepseek_v4_1/nvidia/model.py
++++ b/vllm/models/deepseek_v4_1/nvidia/model.py
+@@ -264,11 +264,13 @@ class DeepseekV4DecoderLayer(nn.Module):
+         attn._l2pf_ffn = l2_prefetch.make_plan(ffn, l2_prefetch.BUDGET_FFN, device)
+         if attn.compressor is not None:
+             # COMP: the compressor's projection, the first weight an owner layer
+-            # reads after Q-B.
++            # reads after Q-B, within its own budget (``l2_prefetch.BUDGET_COMP``).
+             comp = l2_prefetch.linear_segments(
+                 "compressor", attn.compressor.fused_wkv_wgate
+             )
+-            attn._l2pf_comp = l2_prefetch.make_plan(comp, l2_prefetch.BUDGET_WO, device)
++            attn._l2pf_comp = l2_prefetch.make_plan(
++                comp, l2_prefetch.BUDGET_COMP, device
++            )
+         plan_next = None
+         if nxt is not None:
+             segments = l2_prefetch.param_segments(
+diff --git a/vllm/models/deepseek_v4_1/tilelang/linear.py b/vllm/models/deepseek_v4_1/tilelang/linear.py
+index 0b14d7bba..00ab36530 100644
+--- a/vllm/models/deepseek_v4_1/tilelang/linear.py
++++ b/vllm/models/deepseek_v4_1/tilelang/linear.py
+@@ -1136,10 +1136,11 @@ class TileLangSplitLinearMethod(UnquantizedLinearMethod):
+         return dict(shards=split["shards"], blocked=split["blocked"], decode=decode)
+ 
+     def process_weights_after_loading(self, layer: nn.Module) -> None:
+-        """Pack the compressor's BF16 weight into exact 12-bit storage."""
++        """Pack the compressor's BF16 weight into exact 12-bit storage when enabled."""
+         if hasattr(layer, "_zero_pad_rows"):
+             layer._zero_pad_rows()
+-        pack_bf16_layer(layer, self._split(layer)["shards"])
++        if getattr(layer, "pack_bf16", True):
++            pack_bf16_layer(layer, self._split(layer)["shards"])
+ 
+     def _kernels(self, layer: nn.Module) -> dict:
+         """Every kernel of the split projection, as calls."""

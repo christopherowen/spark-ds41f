@@ -1,0 +1,62 @@
+# #957 part 1, round 1 rework (candidate-56). Host sp8 (spark-0016), W=~/spark-lab/agents/candidate-56-rework-957p1.
+# Every GPU line ran through W/bin/om.sh (raw/bin/om.sh), which takes flock /tmp/spark-lab-gpu.lock itself and
+# refuses to run with ~/spark-hold.json present or a serving container up. One fresh container a run.
+# Each run's exact docker command, times, loadavg, MemAvailable and exit code: raw/commands-sp8.txt.
+
+## Sources (no GPU)
+# The candidate-54 and candidate-56 deepseek_v4_1 trees, read from the images:
+#   docker create spark-ds41f:candidate-5{4,6}; docker cp <id>:/opt/spark-ds41f/candidate/vllm/vllm/models/deepseek_v4_1 W/src/<tag>/
+# The patch tree: a clone of candidate-54's vLLM repository at its head.
+git clone -q --no-checkout ~/spark-lab/agents/round-55-57-select/c54-vllm W/vllm
+git -C W/vllm checkout -q -B rework-957p1-r1 4e8133ff10a125b90753c2727f162e29fe37f30c
+git -C W/vllm -c user.name="Christopher Owen" -c user.email=3221756+christopherowen@users.noreply.github.com am --quiet --committer-date-is-author-date W/in/0795-perf-dsv41-replicate-the-BF16-compressor-projection-.patch
+#   -> e4b134ab, tree 3959b211 (the selection's 957-p1 tree)
+# Edits: l2_prefetch.py (BUDGET_COMP, comp_budget), nvidia/model.py (COMP's plan takes comp_budget), the L2 schedule test.
+#   The screen ran a first version (a constant 2 MB COMP budget; raw/screen-overlay-v1, commit 2127830e, tree 44311688);
+#   the final default (no window for a replicated weight) is tree affbc2b0. Each by git commit --amend, author and date kept.
+git -C W/vllm commit -q --amend -F W/in/msg-r1.txt     # the original message plus the Round 1 section
+git -C W/vllm format-patch -1 HEAD -o W/deliver          # renamed to 0795-perf-dsv41-replicate-the-BF16-compressor-projection-.patch
+
+## Setup and tree identity (no GPU)
+bash W/bin/setup.sh          # r1 overlay (files-r1.txt), lists/, TileLang caches copied from round3-own-marks/c (tl-base, tl-c56p1 -> tl-r1) through a container
+bash W/bin/setup-c56r1.sh    # c56r1: candidate-54 + 0795-r1 + 0796 (tree 95187ad3), the testbed overlay and its tests
+bash W/bin/verify.sh         # raw/verify: base 7831/7831 (5f021d9a), r1 7831/7831 (affbc2b0), c56r1 7831/7831 (95187ad3) on candidate-56's image
+
+## GPU runs, in order (each script's boots each take the lock)
+bash W/bin/tests.sh          # 08:11Z  pytest r1 (screen-time code) and base
+bash W/bin/step-screen.sh    # 08:12Z  base, r1 (2 MB head), r1c0 (VLLM_DS41_L2_PREFETCH_COMP_MB=0), r1c0, r1, base
+#   -> the default: no window (raw/analysis/cells-screen.json, cells-screen-c0-vs-c2.json); the code changed to it, then:
+bash W/bin/tests-final.sh    # 08:24Z  pytest r1 (final) and base; then c56r1 on candidate-56's image with #956's tests
+bash W/bin/step-mark.sh      # 08:27Z  the mark: base, r1, r1, base (final code, environment unset)
+bash W/bin/step-tp3.sh       # 08:31Z  TP3 rank shapes: base, r1, r1, base
+bash W/bin/step-mark2.sh     # 08:51Z  the mark repeated in a second session
+# Cells: python3 W/bin/cells.py W/out/json <base prefix> <arm prefix>... (raw/analysis/cells-*.json)
+
+## Pair check (no GPU)
+bash W/bin/pair_check.sh W/deliver/0795-perf-dsv41-replicate-the-BF16-compressor-projection-.patch W/in/0796-perf-dsv41-sp-ratio2-compressor-and-ced-encoder-only-chunks.patch
+#   -> raw/pair-check.txt
+
+## The testbed overlay against candidate-56's image (no GPU)
+#   for f in attention.py ced.py compressor.py l2_prefetch.py nvidia/model.py nvidia/model_state.py sp_prefill.py tilelang/linear.py; do
+#     cmp -s W/ovl/c56r1/vllm/models/deepseek_v4_1/$f W/src/candidate-56/deepseek_v4_1/$f && echo "same  $f" || echo "DIFF  $f"; done
+#   same  attention.py
+#   same  ced.py
+#   same  compressor.py
+#   DIFF  l2_prefetch.py
+#   DIFF  nvidia/model.py
+#   same  nvidia/model_state.py
+#   same  sp_prefill.py
+#   same  tilelang/linear.py
+
+## Profile and spec checks (laptop, no GPU, on a scratch copy of origin/main e979f5ba (main at the check; later main commits touch no candidate-56 file but a receipts script) with these files added and
+## sp8's config/nodes-switched.local.json; the repository was not changed)
+python3 bin/spark --cluster-config experiments/2026-10-26-spark-ds41f-candidate/candidate-56/tp4-switched-957p1r1.json doctor        # configuration OK
+python3 bin/spark --cluster-config experiments/2026-10-26-spark-ds41f-candidate/candidate-56/tp4-switched-957p1r1-dev.json doctor    # configuration OK
+python3 bin/spark --cluster-config experiments/2026-10-26-spark-ds41f-candidate/candidate-56/tp4-switched-no957p1-no956-dev.json doctor  # configuration OK
+#   spark_ds41f.build.arm_note_problems on each: notes OK (the control's base profile alone cites tree 5f021d9a; its -dev, which the spec boots, passes)
+python3 scripts/lab.py run --dry-run --production-config config/cluster.json experiments/2026-10-26-spark-ds41f-candidate/candidate-56/attribute-grid-957p1r1-tp4-switched.json
+#   14 steps, no problems
+
+## For the coordinator (testbed, not run here)
+#   scripts/lab.py run experiments/2026-10-26-spark-ds41f-candidate/candidate-56/attribute-grid-957p1r1-tp4-switched.json
+#   (on sp1, after the hold and idle guards; the overlay must be at candidate-56/957p1r1/overlay on the published commit)

@@ -1,0 +1,126 @@
+diff --git a/tests/models/test_deepseek_v4_1_l2_schedule.py b/tests/models/test_deepseek_v4_1_l2_schedule.py
+index b11d3cf8f..16d796a3f 100644
+--- a/tests/models/test_deepseek_v4_1_l2_schedule.py
++++ b/tests/models/test_deepseek_v4_1_l2_schedule.py
+@@ -154,6 +154,47 @@ def test_owner_layer_gets_a_compressor_window(segments):
+     assert plain.attn._l2pf_comp is None
+ 
+ 
++@pytest.mark.parametrize(
++    "tp_size, budget_comp, expected",
++    [
++        # a TP rank's 12-bit shard (above TP4): prefetched whole, within WO's budget
++        (8, None, "wo"),
++        # the replicated BF16 weight (through TP4): no window by default
++        (1, None, 0),
++        # VLLM_DS41_L2_PREFETCH_COMP_MB sets one budget for both
++        (8, 2_000_000, 2_000_000),
++        (1, 2_000_000, 2_000_000),
++    ],
++)
++def test_compressor_window_has_its_own_budget(
++    segments, monkeypatch, tp_size, budget_comp, expected
++):
++    budgets = {}
++
++    def make_plan(segs, budget, device):
++        if segs:
++            budgets[segs[0]] = budget
++        return _Plan(segs) if segs else None
++
++    monkeypatch.setattr(l2_prefetch, "make_plan", make_plan)
++    monkeypatch.setattr(l2_prefetch, "BUDGET_COMP", budget_comp)
++    layer = _layer(owner=True)
++    layer.attn.compressor.fused_wkv_wgate = SimpleNamespace(tp_size=tp_size)
++    DeepseekV4DecoderLayer.build_l2_prefetch(layer, _layer())
++    expected = l2_prefetch.BUDGET_WO if expected == "wo" else expected
++    assert budgets["compressor"] == expected
++    assert budgets["wo"] == l2_prefetch.BUDGET_WO
++
++
++def test_replicated_compressor_has_no_window():
++    """A zero budget makes no plan, so an owner layer issues no COMP window."""
++    replicated = [("compressor.weight", 1 << 20, 1024 * 5120 * 2)]
++    assert l2_prefetch.make_plan(replicated, 0, torch.device("cpu")) is None
++    shard = [("compressor.weight", 1 << 20, 256 * 7680)]
++    plan = l2_prefetch.make_plan(shard, l2_prefetch.BUDGET_WO, torch.device("cpu"))
++    assert plan is not None and plan.total_bytes == 256 * 7680
++
++
+ def test_engram_layer_moves_next_after_its_projection(segments, issued):
+     layer, nxt = _layer(), _layer(engram=True)
+     DeepseekV4DecoderLayer.build_l2_prefetch(layer, nxt)
+diff --git a/vllm/models/deepseek_v4_1/l2_prefetch.py b/vllm/models/deepseek_v4_1/l2_prefetch.py
+index cc9722de5..98e7f06a7 100644
+--- a/vllm/models/deepseek_v4_1/l2_prefetch.py
++++ b/vllm/models/deepseek_v4_1/l2_prefetch.py
+@@ -20,7 +20,8 @@ issued while the one before it still fills starts when that one ends):
+         owns a compressor (and an indexer) issues it right after the compressor
+         instead: issued after Q-B, its lines did not survive the compressor's
+         projection, and WO-A ran at DRAM speed with its fill long done.
+-  COMP  an owner layer's compressor projection, after Q-B in WO's place. (The
++  COMP  an owner layer's compressor projection, after Q-B in WO's place: a TP
++        rank's shard; a replicated weight gets none (``comp_budget``). (The
+         indexer's projections after it gained nothing in this window: the WO
+         fill behind it evicted them before they ran.)
+   FFN   before the attention all-reduce: router, mHC FFN mix, shared expert
+@@ -43,7 +44,7 @@ spin kernels standing in for the attention core and all-reduces
+ 
+ Environment:
+   VLLM_DS41_L2_PREFETCH=0/1           default on for SM121 (GB10)
+-  VLLM_DS41_L2_PREFETCH_{WO,FFN,NEXT}_MB   per-window fill budgets
++  VLLM_DS41_L2_PREFETCH_{WO,COMP,FFN,NEXT}_MB   per-window fill budgets
+ """
+ 
+ from __future__ import annotations
+@@ -73,6 +74,29 @@ ENABLED = _enabled()
+ BUDGET_WO = _l2pf._mb("VLLM_DS41_L2_PREFETCH_WO_MB", "20")
+ BUDGET_FFN = _l2pf._mb("VLLM_DS41_L2_PREFETCH_FFN_MB", "16")
+ BUDGET_NEXT = _l2pf._mb("VLLM_DS41_L2_PREFETCH_NEXT_MB", "20")
++# COMP's budget, when set: None takes ``comp_budget``'s default.
++BUDGET_COMP = (
++    _l2pf._mb("VLLM_DS41_L2_PREFETCH_COMP_MB", "0")
++    if os.getenv("VLLM_DS41_L2_PREFETCH_COMP_MB") is not None
++    else None
++)
++
++
++def comp_budget(linear: torch.nn.Module) -> int:
++    """The COMP window's fill budget for a compressor projection.
++
++    COMP is issued after Q-B, close to the projection that reads it, and WO's
++    18.9 MB fill queues behind it. A TP rank's 12-bit shard (1-2 MB above TP4)
++    lands in time, so it is prefetched whole, within WO's budget. The replicated
++    BF16 weight through TP4 (10.5 MB at ratio two, 5.2 MB at ratio one) does not:
++    its fill races the projection, which then reads DRAM beside it, and COMP plus
++    WO overflow the 24 MB L2. So a replicated weight gets no window: the
++    projection streams it once. ``VLLM_DS41_L2_PREFETCH_COMP_MB`` sets one budget
++    for every compressor instead.
++    """
++    if BUDGET_COMP is not None:
++        return BUDGET_COMP
++    return BUDGET_WO if getattr(linear, "tp_size", 1) > 1 else 0
+ 
+ 
+ def linear_segments(name: str, linear: torch.nn.Module | None) -> list[Segment]:
+diff --git a/vllm/models/deepseek_v4_1/nvidia/model.py b/vllm/models/deepseek_v4_1/nvidia/model.py
+index b5baa9f0a..8c9f6836b 100644
+--- a/vllm/models/deepseek_v4_1/nvidia/model.py
++++ b/vllm/models/deepseek_v4_1/nvidia/model.py
+@@ -264,11 +264,12 @@ class DeepseekV4DecoderLayer(nn.Module):
+         attn._l2pf_ffn = l2_prefetch.make_plan(ffn, l2_prefetch.BUDGET_FFN, device)
+         if attn.compressor is not None:
+             # COMP: the compressor's projection, the first weight an owner layer
+-            # reads after Q-B.
+-            comp = l2_prefetch.linear_segments(
+-                "compressor", attn.compressor.fused_wkv_wgate
++            # reads after Q-B, within its own budget (``l2_prefetch.comp_budget``).
++            projection = attn.compressor.fused_wkv_wgate
++            comp = l2_prefetch.linear_segments("compressor", projection)
++            attn._l2pf_comp = l2_prefetch.make_plan(
++                comp, l2_prefetch.comp_budget(projection), device
+             )
+-            attn._l2pf_comp = l2_prefetch.make_plan(comp, l2_prefetch.BUDGET_WO, device)
+         plan_next = None
+         if nxt is not None:
+             segments = l2_prefetch.param_segments(
