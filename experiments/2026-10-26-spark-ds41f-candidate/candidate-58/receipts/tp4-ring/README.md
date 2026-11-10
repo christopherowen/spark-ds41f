@@ -29,8 +29,9 @@ candidate-58-noC51, four boots each, with the gate's records kept per call.
 | spark-ds41f-1107 | 4 of 4 | 8e46794a / 11ec073c |
 
 candidate-58's boot 3 failed in its first c1 run (`reference`), not in `again`; every later scenario and the boot's
-later greedy run read the canonical hashes. One request diverged: prompt 7 (43 prompt tokens). Its logprobs are
-equal to token 113, differ from token 114 (-0.00038 against -0.00046) and widely from token 115 (-0.907 against
--0.635); its text differs from token 155. The first differing forward is at absolute position 156. A difference of
-that size is not a rounding flip: some state the target read differed. The cause is under investigation
-(`determinism-investigation/`).
+later greedy run read the canonical hashes. One request diverged: prompt 7 (17 prompt tokens with thinking off, as
+the gate sends it). Its logprobs are equal to token 113, differ from token 114 (-0.00038 against -0.00046) and
+widely from token 115 (-0.907 against -0.635); its text differs from token 155. The first differing forward is at
+absolute position 130. The size of the change does not by itself say whether the first difference was large: a
+difference far below one rounding step can flip a near-tied discrete choice (the MoE router's experts, the indexer's
+top-k) and give a jump of this size. The cause is under investigation (`determinism-investigation/`).

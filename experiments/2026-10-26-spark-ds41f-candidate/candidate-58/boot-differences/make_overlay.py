@@ -19,11 +19,14 @@ the overlay without them serves exactly as the image does:
   host by non-blocking copies behind an event, written by a thread: no sync on
   the step's path, nothing inside a CUDA graph.
 - SPARK_DS41F_ROW_TRACE_DIR (device side, the target forward): a 64-bit digest of
-  every row of each all-reduce's input (this rank's partial) and output, and each
-  all-gather's, for steps of at most SPARK_DS41F_ROW_TRACE_MAX_ROWS rows (64),
-  plus the step's positions and token ids and the final hidden states. The
-  digests are kernels on the forward's stream, so CUDA graphs capture and replay
-  them.
+  every row, for steps of at most SPARK_DS41F_ROW_TRACE_MAX_ROWS rows (64), of
+  each tap in forward order: every all-reduce's input (this rank's partial) and
+  output and every all-gather's (kinds 1-3), each compressor's projected values
+  and emitted latents (4) and, at ratio 2, the first request's ring carry (5),
+  each indexer's top-k selection (6), each attention layer's output before WO (7),
+  and each Engram layer's gathered table rows and output (8); plus the step's
+  positions, token ids and final hidden states. The digests are kernels on the
+  stream that produced the tensor, so CUDA graphs capture and replay them.
 
 --check verifies that the overlay files in --out equal what this script builds.
 """
@@ -38,6 +41,9 @@ FILES = {
     "model": "vllm/models/deepseek_v4_1/nvidia/model.py",
     "model_runner": "vllm/v1/worker/gpu/model_runner.py",
     "scheduler": "vllm/v1/core/sched/scheduler.py",
+    "attention": "vllm/models/deepseek_v4_1/attention.py",
+    "compressor": "vllm/models/deepseek_v4_1/compressor.py",
+    "engram": "vllm/models/deepseek_v4_1/common/engram.py",
 }
 
 ROW_TRACE = r'''
@@ -65,7 +71,7 @@ class RowTrace:
     always changes it.
     """
 
-    MAX_CALLS = 320
+    MAX_CALLS = 384
     MAX_WORDS = 1 << 15
     SLOTS = 8
 
@@ -465,6 +471,76 @@ from vllm.distributed.device_communicators.cuda_communicator import (  # noqa: E
 )
 '''
 
+IMPORT_ROW_TRACE = """
+
+# Debug row trace taps (boot-differences overlay): None unless SPARK_DS41F_ROW_TRACE_DIR.
+from vllm.distributed.device_communicators.cuda_communicator import (  # noqa: E402
+    ROW_TRACE as _ROW_TRACE,
+)
+"""
+
+ATTN_TOPK_ANCHOR = '''        if pending_aux is not None:
+            torch.cuda.current_stream(q.device).wait_stream(pending_aux)
+        if getattr(self, "n_local_heads", 1) == 0:
+            return
+'''
+ATTN_TOPK = '''        if pending_aux is not None:
+            torch.cuda.current_stream(q.device).wait_stream(pending_aux)
+        if _ROW_TRACE is not None and self.indexer is not None:
+            # The step's top-k selection, after both streams joined.
+            _ROW_TRACE.record(6, self.topk_indices_buffer[:rows], self.topk_indices_buffer[:rows])
+        if getattr(self, "n_local_heads", 1) == 0:
+            return
+'''
+ATTN_OUT_ANCHOR = '''        return self._o_proj(output, sp_rows=sp_rows)
+'''
+ATTN_OUT = '''        if _ROW_TRACE is not None:
+            _ROW_TRACE.record(7, output, output)
+        return self._o_proj(output, sp_rows=sp_rows)
+'''
+COMPRESSOR_TAP = """
+
+# Debug row trace taps (boot-differences overlay): None unless SPARK_DS41F_ROW_TRACE_DIR.
+from vllm.distributed.device_communicators.cuda_communicator import (  # noqa: E402
+    ROW_TRACE as _ROW_TRACE,
+)
+
+if _ROW_TRACE is not None:
+    _untraced_forward_tilelang = DeepseekCompressor._forward_tilelang
+
+    def _traced_forward_tilelang(self, rows, *args, **kwargs):
+        _untraced_forward_tilelang(self, rows, *args, **kwargs)
+        n = int(rows)
+        values = kwargs.get("values")
+        values = self._values if values is None else values
+        _ROW_TRACE.record(4, values[:n], self._latent[:n])
+        if self.compress_ratio == 2:
+            # The first request's ring carry (its odd first row's even predecessor).
+            _ROW_TRACE.record(5, self._pending_values[:1], self._pending_gates[:1])
+
+    DeepseekCompressor._forward_tilelang = _traced_forward_tilelang
+"""
+ENGRAM_TAP = """
+
+# Debug row trace taps (boot-differences overlay): None unless SPARK_DS41F_ROW_TRACE_DIR.
+from vllm.distributed.device_communicators.cuda_communicator import (  # noqa: E402
+    ROW_TRACE as _ROW_TRACE,
+)
+
+if _ROW_TRACE is not None:
+    _untraced_engram_forward = Engram.forward
+
+    def _traced_engram_forward(self, hidden_states, *args, **kwargs):
+        out = _untraced_engram_forward(self, hidden_states, *args, **kwargs)
+        n = int(out.shape[0]) if out.dim() else 0
+        staged = getattr(self, "staged_rows", None)
+        rows = staged[:n] if isinstance(staged, torch.Tensor) and staged.shape[0] >= n else out
+        _ROW_TRACE.record(8, rows, out)
+        return out
+
+    Engram.forward = _traced_engram_forward
+"""
+
 SCHED_RETURN_OUT_ANCHOR = '''            controller.dispatch(
                 scheduler_output.compute_service_class,
                 contended=scheduler_output.compute_contention,
@@ -588,6 +664,21 @@ def build(tree: Path) -> dict[str, str]:
     text = replace_once(text, SCHED_RETURN_OUT_ANCHOR, SCHED_RETURN_OUT, "scheduler schedule")
     text = replace_once(text, SCHED_UPDATE_ANCHOR, SCHED_UPDATE, "scheduler update")
     out[FILES["scheduler"]] = text.rstrip("\n") + "\n" + SCHED_TRACE
+
+    text = (tree / FILES["attention"]).read_text()
+    text = replace_once(text, ATTN_TOPK_ANCHOR, ATTN_TOPK, "attention top-k tap")
+    text = replace_once(text, ATTN_OUT_ANCHOR, ATTN_OUT, "attention output tap")
+    out[FILES["attention"]] = text.rstrip("\n") + "\n" + IMPORT_ROW_TRACE
+
+    text = (tree / FILES["compressor"]).read_text()
+    if "class DeepseekCompressor(" not in text:
+        raise SystemExit("compressor: DeepseekCompressor not found")
+    out[FILES["compressor"]] = text.rstrip("\n") + "\n" + COMPRESSOR_TAP
+
+    text = (tree / FILES["engram"]).read_text()
+    if "\nclass Engram(nn.Module):" not in text or "\nimport torch\n" not in text:
+        raise SystemExit("engram: Engram class or torch import not found")
+    out[FILES["engram"]] = text.rstrip("\n") + "\n" + ENGRAM_TAP
     return out
 
 

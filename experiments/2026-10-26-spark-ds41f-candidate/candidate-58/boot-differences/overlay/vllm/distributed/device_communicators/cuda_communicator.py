@@ -1273,7 +1273,7 @@ class RowTrace:
     always changes it.
     """
 
-    MAX_CALLS = 320
+    MAX_CALLS = 384
     MAX_WORDS = 1 << 15
     SLOTS = 8
 
