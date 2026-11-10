@@ -54,3 +54,25 @@ Against candidate-54 without #961:
   (`tp3-switched-l2-tp4-budget-dev.json`, 19/15/15 MB) and the prefetch off (`tp3-switched-l2-off-dev.json`), against
   candidate-54 and candidate-54 without #961.
 
+## Recipe-only fix (sp5, 2026-11-10, 06:08-06:28Z)
+
+[../../attribute-tp3-prefetch-tp3-switched.json](../../attribute-tp3-prefetch-tp3-switched.json), the grid step alone,
+six boots in one session (`lab/candidate-54-tp3-prefetch-tp3-switched-table.txt`; the table's base is
+`candidate-54-l2-tp4-budget`, the windows capped at TP4's planned sizes, 19/15/15 MB):
+
+| Arm | Grid geometric mean | 1x2 rows at 4K | 1x3 rows at 4K | 4x8 rows at 4K | 8x48 rows at 4K |
+| --- | --- | --- | --- | --- | --- |
+| windows 19/15/15 MB | (base) | 18.66 ms | 18.90 ms | 20.79 ms | 28.51 ms |
+| windows 19/15/15 MB again | -0.28% | -0.13% | -0.39% | +0.11% | -0.51% |
+| candidate-54 (20/16/20) | +2.20% | +6.58% | +7.75% | +1.31% | +0.47% |
+| candidate-54 again | +1.56% | +4.48% | +6.03% | +1.14% | +0.29% |
+| without #961 | -1.08% | +0.55% | -0.56% | -2.25% | +0.92% |
+| prefetch off | +11.64% | +13.60% | +13.47% | +10.50% | +10.33% |
+
+- **Capping TP3's windows at TP4's sizes removes the 1-request loss** (1x3: 18.90 against 20.37/20.05 ms, and 18.80
+  without #961). The grid stays 1.1% behind candidate-54 without #961, mostly at 4 requests (4x8: -2.25% without #961).
+- The prefetch is worth about 11% at TP3: the loss is #961's paced windows at TP3's cap-sized windows, not the
+  prefetch itself.
+- **Next:** [../../attribute-tp3-prefetch-sweep-tp3-switched.json](../../attribute-tp3-prefetch-sweep-tp3-switched.json)
+  tries smaller caps (17/13/13 and 15/12/12 MB) against 19/15/15 and against candidate-54 without #961.
+
