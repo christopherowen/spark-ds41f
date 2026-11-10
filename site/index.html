@@ -180,10 +180,16 @@
     .cable { fill: none; stroke: var(--accent); stroke-width: 2; stroke-linecap: round; stroke-dasharray: 600; stroke-dashoffset: 600; animation: draw 0.9s ease forwards; }
     .cable-glow { fill: none; stroke: var(--accent); stroke-width: 9; opacity: 0.09; stroke-linecap: round; }
     .pulse { fill: var(--ink); opacity: 0.9; }
-    .node rect { fill: var(--panel-2); stroke: var(--accent); stroke-width: 1.4; }
-    .node .slot { stroke: var(--line-2); stroke-width: 1.2; }
-    .node text { font: 500 12px var(--mono); fill: var(--ink-2); text-anchor: middle; }
-    .node .led { fill: var(--accent); }
+    .node polygon { stroke: var(--accent); stroke-width: 1.1; stroke-linejoin: round; }
+    .node .lid { fill: color-mix(in srgb, var(--accent) 46%, var(--panel-2)); }
+    .node .flank { fill: color-mix(in srgb, var(--accent) 24%, var(--panel-2)); }
+    .node .face { fill: color-mix(in srgb, var(--accent) 12%, var(--panel-2)); }
+    .node .foam { fill: url(#foam); stroke: none; }
+    .node .grip { fill: color-mix(in srgb, var(--accent) 40%, var(--panel-2)); stroke-width: 0.9; }
+    .node .shade { fill: #000; stroke: none; opacity: 0.28; }
+    html[data-theme="light"] .node .shade { opacity: 0.1; }
+    .node text { font-family: var(--mono); font-weight: 500; fill: var(--ink); text-anchor: middle; }
+    #foam circle { fill: var(--accent); }
     .node { animation: pop 0.5s ease backwards; }
     .hub-ghost { fill: none; stroke: var(--ink-3); stroke-width: 1.2; stroke-dasharray: 3 5; }
     .hub-label { font: 400 11.5px var(--mono); fill: var(--ink-3); text-anchor: middle; letter-spacing: 0.06em; }
@@ -836,7 +842,7 @@ __MANIFEST_DATA__
 
     function drawFabric() {
       const { fabric, nodes: n } = state;
-      const cx = 220, cy = 200, R = n > 6 ? 150 : 142, half = n > 6 ? 23 : 28;
+      const cx = 220, cy = 200, R = n > 6 ? 150 : 142;
       const g = geometry(fabric, n, cx, cy, R);
       let out = "";
       out += `<circle cx="${cx}" cy="${cy}" r="${R}" fill="none" stroke="var(--line)" stroke-dasharray="1 7"/>`;
@@ -846,8 +852,8 @@ __MANIFEST_DATA__
       if (!still) {
         g.edges.forEach((d, i) => {
           const dur = (fabric === "switched" ? 1.5 : 2.3) + (i % 3) * 0.17;
-          out += `<circle class="pulse" r="2.6"><animateMotion dur="${dur}s" begin="${(i * 0.31).toFixed(2)}s" repeatCount="indefinite" path="${d}"/></circle>`;
-          out += `<circle class="pulse" r="2.6"><animateMotion dur="${dur}s" begin="${(i * 0.31 + dur / 2).toFixed(2)}s" repeatCount="indefinite" path="${d}" keyPoints="1;0" keyTimes="0;1" calcMode="linear"/></circle>`;
+          out += `<circle class="pulse" r="2.6"><animateMotion dur="${dur}s" begin="-${(i * 0.31).toFixed(2)}s" repeatCount="indefinite" path="${d}"/></circle>`;
+          out += `<circle class="pulse" r="2.6"><animateMotion dur="${dur}s" begin="-${(i * 0.31 + dur / 2).toFixed(2)}s" repeatCount="indefinite" path="${d}" keyPoints="1;0" keyTimes="0;1" calcMode="linear"/></circle>`;
         });
       }
       if (fabric === "switched") {
@@ -855,13 +861,26 @@ __MANIFEST_DATA__
       } else {
         out += `<circle class="hub-ghost" cx="${cx}" cy="${cy}" r="34"/><text class="hub-label" x="${cx}" y="${cy + 4}">no switch</text>`;
       }
+      // A Spark, drawn as its own low slab: plain lid and flank, a foam front with a grip at each end.
+      const k = n <= 4 ? 1.6 : n <= 6 ? 1.34 : 1.08;
       g.pts.forEach((p, i) => {
+        const at = (x, y) => `${(p[0] + x * k).toFixed(1)},${(p[1] + y * k).toFixed(1)}`;
+        const poly = (cls, pts) => `<polygon class="${cls}" points="${pts.map(q => at(q[0], q[1])).join(" ")}"/>`;
+        // The front face runs from its near corner (0, 7.5) to the right corner (26, -5.5) and is 11 tall.
+        const face = (u0, u1, v0, v1) => [[26 * u0, 7.5 - 13 * u0 + 11 * v0], [26 * u1, 7.5 - 13 * u1 + 11 * v0],
+          [26 * u1, 7.5 - 13 * u1 + 11 * v1], [26 * u0, 7.5 - 13 * u0 + 11 * v1]];
         out += `<g class="node" style="transform-origin:${p[0]}px ${p[1]}px;animation-delay:${i * 60}ms">` +
-          `<rect x="${p[0] - half}" y="${p[1] - half}" width="${half * 2}" height="${half * 2}" rx="${half * 0.42}"/>` +
-          `<line class="slot" x1="${p[0] - half + 9}" y1="${p[1] - half + 11}" x2="${p[0] + half - 16}" y2="${p[1] - half + 11}"/>` +
-          `<circle class="led" cx="${p[0] + half - 10}" cy="${p[1] - half + 11}" r="2"/>` +
-          `<text x="${p[0]}" y="${p[1] + 9}">${i + 1}</text></g>`;
+          poly("shade", [[0, -3], [29, 11.5], [0, 26], [-29, 11.5]]) +
+          poly("flank", [[-26, -5.5], [0, 7.5], [0, 18.5], [-26, 5.5]]) +
+          poly("face", face(0, 1, 0, 1)) +
+          poly("foam", face(0.25, 0.75, 0.1, 0.9)) +
+          poly("grip", face(0.07, 0.2, 0.2, 0.8)) +
+          poly("grip", face(0.8, 0.93, 0.2, 0.8)) +
+          poly("lid", [[0, -18.5], [26, -5.5], [0, 7.5], [-26, -5.5]]) +
+          `<text x="${p[0]}" y="${(p[1] - 2.2 * k).toFixed(1)}" font-size="${(8.4 * k).toFixed(1)}">${i + 1}</text></g>`;
       });
+      out = `<defs><pattern id="foam" width="2.6" height="2.6" patternUnits="userSpaceOnUse" patternTransform="matrix(1 -0.5 0 1 0 0)">` +
+        `<circle cx="0.7" cy="0.7" r="0.42"/><circle cx="2" cy="1.9" r="0.36"/></pattern></defs>` + out;
       $("#fabric-svg").innerHTML = out;
     }
 
