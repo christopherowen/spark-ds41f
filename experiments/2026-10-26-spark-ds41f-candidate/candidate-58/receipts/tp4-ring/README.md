@@ -18,3 +18,19 @@ candidate-54's.
 **Open (2026-11-10):** the determinism gate's `again` scenario at tp4-ring has failed in 2 of 5 boots since
 candidate-51 (0 of 147 before), though not in candidate-58's boot. candidate-54 is being revised with the fixes
 (`spark-ds41f:candidate-54-r1`), and candidate-58 is rebuilt on it before any freeze.
+
+**Gate repeat (2026-11-10, `gate-repeat/`).** Twelve boots, interleaved: candidate-58, spark-ds41f-1107 and
+candidate-58-noC51, four boots each, with the gate's records kept per call.
+
+| Arm | Boots identical | Hashes (logprobs) |
+| --- | ---: | --- |
+| candidate-58 | 3 of 4 | 18d61961 / d6568649; boot 3's reference f06c3f3c |
+| candidate-58-noC51 | 4 of 4 | 18d61961 / d6568649 |
+| spark-ds41f-1107 | 4 of 4 | 8e46794a / 11ec073c |
+
+candidate-58's boot 3 failed in its first c1 run (`reference`), not in `again`; every later scenario and the boot's
+later greedy run read the canonical hashes. One request diverged: prompt 7 (43 prompt tokens). Its logprobs are
+equal to token 113, differ from token 114 (-0.00038 against -0.00046) and widely from token 115 (-0.907 against
+-0.635); its text differs from token 155. The first differing forward is at absolute position 156. A difference of
+that size is not a rounding flip: some state the target read differed. The cause is under investigation
+(`determinism-investigation/`).
