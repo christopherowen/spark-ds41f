@@ -185,6 +185,8 @@ prefill at 32K and 256K.
 - **Attribution:** when a core metric is worse in the release table, remove suspects one at a
   time with `no<PR>` controls on the same image. Measure only the step that moved: a suite
   file with that step alone, as in `candidate-48/grid-suite.json`.
+- **Confirm in one session first.** A change near its margin against a recorded reference can be drift between sessions. Before attributing it to a PR, run the base and the candidate ABBA in one session.
+  - On 2026-11-09, candidate-53's stall-3 read 2.1% slower against candidate-50's run from earlier the same evening. In one session the two were within one boot spread.
 - **Rework:** a miss goes to a sub-agent. It writes to `receipts/rework/pr-<N>-r<K>/`: the
   analysis, the corrected patch, the commands, the raw outputs and `result.json`. Then apply
   the drop rule.
