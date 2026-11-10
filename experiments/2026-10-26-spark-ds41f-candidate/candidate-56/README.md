@@ -181,3 +181,18 @@ later candidates. The round's selection receipts are in [candidate-55/receipts](
 ## Status
 
 Prepared and locked. Not built, not measured.
+
+## Engine-grid attribution (2026-11-10)
+
+The screen against candidate-54's recorded `tp4-switched` screen finds the engine grid 2.85% slower (±0.18%), all of
+it at small batches: 1-request shapes 6-13% slower (1x2 rows at 4K: 14.47 -> 16.35 ms), the 16-request shapes the
+same. 256K prefill is 3.3% faster; c16 decode and output are the same.
+
+This is the first image built on sp8, and candidate-54's was built on dgx4. So
+[attribute-grid-tp4-switched.json](attribute-grid-tp4-switched.json) runs the grid step alone
+([candidate-48/grid-suite.json](../candidate-48/grid-suite.json)) in one session, on six boots:
+- candidate-54's image (`../candidate-54/tp4-switched-dev.json`), first and last;
+- candidate-56's image with candidate-54's code, `tp4-switched-no957p1-no956`, twice: the seven non-test files 0795
+  and 0796 change, at candidate-54's versions (tree 5f021d9a), in [no957p1-no956/overlay](no957p1-no956/overlay).
+  Against candidate-54's image it measures the build host alone;
+- `tp4-switched-no956` (957 part 1 alone) and candidate-56.
