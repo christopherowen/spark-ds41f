@@ -1,0 +1,163 @@
+{
+ "pr": 957,
+ "part": 1,
+ "round": 1,
+ "label": "957-p1-r1",
+ "candidate": "candidate-56 (candidate-54 + 0795 + 0796, tp4-switched)",
+ "patch": {
+  "file": "0795-perf-dsv41-replicate-the-BF16-compressor-projection-.patch",
+  "sha256": "fbb54efd66159c03eab1e9b3a5cf08ef97e334b0be959028e481861831495fc4",
+  "author": "Christopher Owen <3221756+christopherowen@users.noreply.github.com>, Sun, 8 Nov 2026 11:30:00 +0100 (the original's)",
+  "message": "the original 0795 message, unchanged, plus a 'Round 1' section",
+  "on_candidate_54": "git am on 4e8133ff (tree 5f021d9a): patch head df87757b, tree affbc2b0",
+  "with_0796": "0796 (#956 round 3, unchanged, sha256 d9b71b04) git am after it: patch head 9ba4edc2, tree 95187ad3. git diff --check clean. 0796 still does not apply without 0795-r1 (compressor.py), by design.",
+  "against_0795": "0795-r1 = 0795 plus three files: vllm/models/deepseek_v4_1/l2_prefetch.py, vllm/models/deepseek_v4_1/nvidia/model.py, tests/models/test_deepseek_v4_1_l2_schedule.py (raw/0795-r1-vs-0795.diff). compressor.py, tilelang/linear.py and the compressor test are 0795's, byte for byte.",
+  "candidate_56_vs_r1": "candidate-56's tree 0c848613 -> 95187ad3 changes only l2_prefetch.py, nvidia/model.py and the L2 schedule test (raw/pair-check.txt)"
+ },
+ "verdict": "ready for the testbed check",
+ "verdict_reason": "The COMP window was the cause, and giving it its own budget removes the one-GPU loss: 0795-r1 is not slower than candidate-54 at any grid shape in any of three same-session ABBA comparisons (0795 was 0.16-0.35 ms slower at 9 of the 10 1-4-request shapes, the same harness in another session). The mark's second half holds on balance but not cell by cell: at 1-4 requests the step is faster beyond the two-boot interval in 22 of 30 session-cells and the same in 8, with a lower mean in 28 of 30. One GPU cannot credit the 4 removed RoCE all-gathers, and it under-reads prefetch effects at small batch (TP3 lesson), so the tp4-switched grid spec delivered here decides.",
+ "chosen_budget": {
+  "rule": "l2_prefetch.comp_budget(projection): a replicated weight (tp_size 1, TP <= 4 with 0795) gets 0, so no COMP window; a TP rank's 12-bit shard (TP5..TP8, at most 1.97 MB) keeps WO's budget, so it is prefetched whole as before. VLLM_DS41_L2_PREFETCH_COMP_MB, when set, is one budget for every compressor. The recipe sets nothing.",
+  "why_0_not_2MB": "Measured in one session (raw/analysis/cells-screen-c0-vs-c2.json): no window against a 2 MB head of the replicated weight (1.97 MB after the 64 KiB slice, the old shard's size) is faster at 1x6, 2x6, 3x6 and 4x12, the same at the other 7 shapes, never slower, and its target forward is lower at all 11 shapes (-0.07..-0.33 ms). Against candidate-54 the 2 MB head was faster at 7 shapes and the same at 4; no window was faster at 10 and the same at 1.",
+  "plans_as_built": "TP4 owner layers 2, 8, 14, 20: candidate-54 COMP 2.0/2.0/2.0/1.0 MB shards; 0795 10.5/10.5/10.5/5.2 MB; 0795-r1 none (raw/json/mark-r1-boot*.json model.owner_plans is empty; l2_windows show 'COMP -'). WO stays 18.9 MB, issued after the compressor as before. TP3: candidate-54 2.9/2.9/2.9/1.5 MB; 0795-r1 none.",
+  "tp5_to_tp8": "unchanged: the sharded, packed weight keeps WO's 20 MB budget and is prefetched whole (test_compressor_window_has_its_own_budget, tp_size 8). Not measured on a GPU: no TP5+ harness shape, and the code path there is candidate-54's."
+ },
+ "fallback": "Not needed on one GPU. If the testbed still shows a small-batch loss, the next step is the task's fallback: decode keeps the packed shard and the replicated BF16 copy serves only SP prefill and #956. Choosing by row count is ruled out (the own mark's cold read loses at every row count).",
+ "harness": {
+  "what": "round 3's own-mark decode step (h/step957.py, sha256 7ca27617, identical to candidate-56/receipts/own-marks/pr-957/raw/harness/step957.py): the full 40-layer model plus the DSpark drafter's 3 layers on one GB10 at one TP4 rank's shapes, dummy weights, DeepseekCompressor built as TP4 rank 0 (TP3 rank 0 for the TP3 run), the all-gather a local copy stand-in, the engine grid at 4K context, 10 replays, capture ladder 1-32, the recipe's environment (bin/env.sh).",
+  "arms": "base = spark-ds41f:candidate-54 (sha256:e1de71be, its own tree 5f021d9a, verified 7,831 files). r1 = the same image + 0795-r1's 6 files read-only (files-r1.txt), verified as candidate-54 + 0795-r1 (tree affbc2b0, 7,831 files). r1c0 (screen only) = the screen-time r1 overlay (raw/screen-overlay-v1, tree 44311688: a constant 2 MB COMP budget, verified 7,831 files at the time) with VLLM_DS41_L2_PREFETCH_COMP_MB=0, which builds the same plans as the final default at TP4 (no COMP window).",
+  "interval_rule": "round 3's: faster when the slower candidate boot beats the faster base boot, slower when the faster candidate boot is slower than the slower base boot, else the same. Cells are each boot's median step (ms); the delta is the mean of two boots minus the mean of two.",
+  "sessions": "every boot a fresh container under flock /tmp/spark-lab-gpu.lock (bin/om.sh takes it), hold file absent and no serving container at every start (raw/commands-sp8.txt). Other agents' jobs interleaved between boots."
+ },
+ "cells": {
+  "screen_2026-11-10T08:12-08:21Z": {
+   "order": "base, r1 (2 MB head), r1c0 (no window), r1c0, r1, base",
+   "r1c0_no_window_vs_candidate_54": {
+    "1x2": "21.513/21.734 -> 21.295/21.380 (-0.286 ms, -1.32%, faster; forward -0.152)",
+    "1x3": "21.460/21.669 -> 21.294/21.501 (-0.167 ms, -0.78%, same; forward -0.141)",
+    "1x4": "21.534/21.686 -> 21.406/21.475 (-0.170 ms, -0.79%, faster; forward -0.112)",
+    "1x6": "21.486/21.831 -> 21.474/21.436 (-0.203 ms, -0.94%, faster; forward -0.210)",
+    "2x4": "21.569/21.833 -> 21.331/21.423 (-0.324 ms, -1.49%, faster; forward -0.136)",
+    "2x6": "21.573/21.916 -> 21.380/21.505 (-0.302 ms, -1.39%, faster; forward -0.164)",
+    "3x6": "21.900/22.146 -> 21.606/21.708 (-0.366 ms, -1.66%, faster; forward -0.219)",
+    "4x8": "22.581/22.991 -> 22.320/22.522 (-0.365 ms, -1.60%, faster; forward -0.259)",
+    "4x12": "23.203/23.565 -> 22.828/22.920 (-0.510 ms, -2.18%, faster; forward -0.312)",
+    "4x24": "26.850/26.866 -> 26.656/26.652 (-0.204 ms, -0.76%, faster; forward -0.263)",
+    "16x32": "27.081/27.095 -> 26.593/26.889 (-0.347 ms, -1.28%, faster; forward -0.244)"
+   },
+   "r1_2MB_head_vs_candidate_54": {
+    "1x2": "21.513/21.734 -> 21.294/21.356 (-0.298 ms, -1.38%, faster; forward -0.081)",
+    "1x3": "21.460/21.669 -> 21.382/21.435 (-0.156 ms, -0.73%, faster; forward -0.065)",
+    "1x4": "21.534/21.686 -> 21.453/21.519 (-0.124 ms, -0.57%, faster; forward -0.024)",
+    "1x6": "21.486/21.831 -> 21.516/21.510 (-0.145 ms, -0.67%, same; forward -0.065)",
+    "2x4": "21.569/21.833 -> 21.417/21.495 (-0.245 ms, -1.13%, faster; forward -0.035)",
+    "2x6": "21.573/21.916 -> 21.580/21.679 (-0.115 ms, -0.53%, same; forward +0.007)",
+    "3x6": "21.900/22.146 -> 21.784/21.843 (-0.209 ms, -0.95%, faster; forward +0.009)",
+    "4x8": "22.581/22.991 -> 22.512/22.624 (-0.218 ms, -0.96%, same; forward -0.012)",
+    "4x12": "23.203/23.565 -> 23.205/23.198 (-0.182 ms, -0.78%, same; forward +0.016)",
+    "4x24": "26.850/26.866 -> 26.518/26.795 (-0.201 ms, -0.75%, faster; forward -0.087)",
+    "16x32": "27.081/27.095 -> 26.892/26.695 (-0.294 ms, -1.09%, faster; forward -0.045)"
+   },
+   "no_window_vs_2MB_head": {
+    "1x2": "21.294/21.356 -> 21.295/21.380 (+0.012 ms, +0.06%, same; forward -0.071)",
+    "1x3": "21.382/21.435 -> 21.294/21.501 (-0.011 ms, -0.05%, same; forward -0.076)",
+    "1x4": "21.453/21.519 -> 21.406/21.475 (-0.046 ms, -0.21%, same; forward -0.089)",
+    "1x6": "21.516/21.510 -> 21.474/21.436 (-0.058 ms, -0.27%, faster; forward -0.145)",
+    "2x4": "21.417/21.495 -> 21.331/21.423 (-0.079 ms, -0.37%, same; forward -0.101)",
+    "2x6": "21.580/21.679 -> 21.380/21.505 (-0.187 ms, -0.86%, faster; forward -0.172)",
+    "3x6": "21.784/21.843 -> 21.606/21.708 (-0.156 ms, -0.72%, faster; forward -0.229)",
+    "4x8": "22.512/22.624 -> 22.320/22.522 (-0.147 ms, -0.65%, same; forward -0.247)",
+    "4x12": "23.205/23.198 -> 22.828/22.920 (-0.328 ms, -1.41%, faster; forward -0.328)",
+    "4x24": "26.518/26.795 -> 26.656/26.652 (-0.003 ms, -0.01%, same; forward -0.176)",
+    "16x32": "26.892/26.695 -> 26.593/26.889 (-0.053 ms, -0.20%, same; forward -0.200)"
+   }
+  },
+  "mark_2026-11-10T08:27-08:31Z": {
+   "order": "base, r1, r1, base (final code, environment unset)",
+   "r1_vs_candidate_54": {
+    "1x2": "21.331/21.472 -> 21.343/21.272 (-0.094 ms, -0.44%, same; forward -0.168)",
+    "1x3": "21.369/21.455 -> 21.366/21.223 (-0.117 ms, -0.55%, faster; forward -0.170)",
+    "1x4": "21.455/21.528 -> 21.431/21.304 (-0.124 ms, -0.58%, faster; forward -0.134)",
+    "1x6": "21.484/21.594 -> 21.329/21.349 (-0.200 ms, -0.93%, faster; forward -0.254)",
+    "2x4": "21.496/21.497 -> 21.420/21.269 (-0.152 ms, -0.71%, faster; forward -0.133)",
+    "2x6": "21.509/21.610 -> 21.393/21.400 (-0.163 ms, -0.76%, faster; forward -0.176)",
+    "3x6": "21.780/21.859 -> 21.581/21.641 (-0.208 ms, -0.95%, faster; forward -0.179)",
+    "4x8": "22.539/22.654 -> 22.590/22.524 (-0.039 ms, -0.17%, same; forward -0.053)",
+    "4x12": "23.012/23.056 -> 22.887/22.908 (-0.136 ms, -0.59%, faster; forward -0.189)",
+    "4x24": "26.591/26.556 -> 26.443/26.564 (-0.070 ms, -0.26%, same; forward -0.128)",
+    "16x32": "26.910/26.710 -> 26.911/26.581 (-0.064 ms, -0.24%, same; forward -0.144)"
+   }
+  },
+  "mark_repeat_2026-11-10T08:51-09:03Z": {
+   "order": "base, r1, r1, base (final code, environment unset)",
+   "r1_vs_candidate_54": {
+    "1x2": "21.410/21.409 -> 21.354/21.244 (-0.110 ms, -0.51%, faster; forward -0.138)",
+    "1x3": "21.424/21.308 -> 21.507/21.394 (+0.084 ms, +0.39%, same; forward +0.034)",
+    "1x4": "21.477/21.421 -> 21.494/21.424 (+0.010 ms, +0.05%, same; forward -0.057)",
+    "1x6": "21.539/21.417 -> 21.535/21.223 (-0.099 ms, -0.46%, same; forward -0.151)",
+    "2x4": "21.470/21.478 -> 21.441/21.457 (-0.025 ms, -0.12%, faster; forward -0.048)",
+    "2x6": "21.614/21.630 -> 21.606/21.362 (-0.138 ms, -0.64%, faster; forward -0.127)",
+    "3x6": "21.818/21.903 -> 21.841/21.527 (-0.177 ms, -0.81%, same; forward -0.181)",
+    "4x8": "22.616/22.582 -> 22.482/22.421 (-0.147 ms, -0.65%, faster; forward -0.216)",
+    "4x12": "23.046/22.974 -> 22.880/22.882 (-0.129 ms, -0.56%, faster; forward -0.146)",
+    "4x24": "26.862/26.792 -> 26.410/26.315 (-0.464 ms, -1.73%, faster; forward -0.291)",
+    "16x32": "27.017/26.472 -> 26.644/26.654 (-0.095 ms, -0.36%, same; forward -0.061)"
+   }
+  },
+  "tp3_2026-11-10T08:31-08:51Z": {
+   "order": "base, r1, r1, base (--tp-shape 3, shapes to 8x16, max_num_seqs 8)",
+   "r1_vs_candidate_54": {
+    "1x2": "25.706/25.366 -> 25.273/24.975 (-0.412 ms, -1.61%, faster; forward -0.380)",
+    "1x3": "25.750/25.451 -> 25.301/25.061 (-0.419 ms, -1.64%, faster; forward -0.477)",
+    "1x4": "25.799/25.545 -> 25.533/25.174 (-0.318 ms, -1.24%, faster; forward -0.401)",
+    "1x6": "26.000/25.812 -> 25.846/25.438 (-0.264 ms, -1.02%, same; forward -0.338)",
+    "2x4": "26.060/25.594 -> 25.611/25.147 (-0.448 ms, -1.73%, same; forward -0.442)",
+    "2x6": "26.111/25.875 -> 26.010/25.579 (-0.199 ms, -0.77%, same; forward -0.278)",
+    "3x6": "26.459/26.171 -> 26.199/25.677 (-0.377 ms, -1.43%, same; forward -0.292)",
+    "4x8": "27.175/27.058 -> 27.014/26.673 (-0.273 ms, -1.01%, faster; forward -0.262)",
+    "4x12": "27.651/27.166 -> 27.302/27.106 (-0.204 ms, -0.75%, same; forward -0.284)",
+    "4x24": "28.583/27.992 -> 28.329/28.312 (+0.033 ms, +0.12%, same; forward -0.059)",
+    "8x16": "27.942/27.446 -> 27.559/27.164 (-0.333 ms, -1.20%, same; forward -0.366)"
+   }
+  },
+  "summary": {
+   "tp4_no_window_three_sessions": "33 cells: slower 0; faster 23; the same 10. Mean step lower in 31 (by 0.025-0.510 ms); mean higher in 2, both within the interval (repeat session 1x3 +0.084 ms, 1x4 +0.010 ms). Target forward lower in 32 of 33.",
+   "tp4_1_to_4_requests": "30 session-cells (1x2..4x24): faster 22, the same 8 (screen 1x3; mark 1x2, 4x8, 4x24; repeat 1x3, 1x4, 1x6, 3x6), slower 0.",
+   "tp4_16x32": "faster in the screen (-0.347 ms), the same in both marks (-0.064, -0.095 ms)",
+   "tp3": "11 cells: slower 0; faster 4 (1x2, 1x3, 1x4, 4x8, -0.27..-0.42 ms); the same 7; mean lower in 10 (4x24 +0.033 ms). Base boots spread up to 0.59 ms here (4x24), so most cells stay within the interval.",
+   "against_0795": "the own mark's 0795 cells (same harness, another session): +0.163..+0.349 ms, slower at 9 of 11 shapes (1x2..4x8 and 4x24; 4x12 and 16x32 the same). 0795-r1 is lower on average in 31 of 33 cells, by 0.025-0.510 ms."
+  }
+ },
+ "tests": {
+  "r1_on_candidate_54_image": "pytest --noconftest -q tests/models/test_deepseek_v4_1_compressor.py tests/models/test_deepseek_v4_1_l2_schedule.py: 21 passed (final code, pytest-r1-boot2); 18 passed with the screen-time code (pytest-r1-boot1)",
+  "candidate_54_same_files": "16 passed, twice (pytest-base-boot1, -boot2)",
+  "testbed_code_on_candidate_56_image": "candidate-56 image + candidate-54 + 0795-r1 + 0796 (12 files, verified tree 95187ad3): pytest --noconftest -q tests/models/test_deepseek_v4_1_compressor.py tests/models/test_deepseek_v4_1_compressor_prepare.py tests/models/test_deepseek_v4_1_ced_model.py tests/models/test_deepseek_v4_1_l2_schedule.py: 83 passed, 0 skipped (pytest-c56r1-boot1). It includes #956's test_sp_ratio2_projection_matches_full_rows.",
+  "torch_equal_to_tp1": "test_compressor_tp_sharded_fused_wkv_wgate_matches_tp1 passes in every run: TP2..TP4 ranks hold the replicated BF16 weight and _project equals TP1 bit for bit at rows 1, 7, 16, 64, 160; TP5..TP8 keep the sharded path equal to TP1. 0795-r1 does not touch the compressor or its test.",
+  "new_tests": "test_compressor_window_has_its_own_budget (4 cases: a TP8 shard gets WO's budget, a replicated weight 0, the override for both) and test_replicated_compressor_has_no_window (a zero budget makes no plan; a 1.97 MB shard is taken whole)",
+  "not_run": "the release-test bundle and the unit suite on a dgx node (no build here); ruff (not installed on sp8 or in the image; added lines are under 88 columns)"
+ },
+ "static_memory": "unchanged from 0795: compressor weights 12,128,748 -> 36,700,160 B a TP4 rank (+23.4 MiB), 15,571,748 -> 36,700,160 B at TP3 (+20.1 MiB), from the loaded models in raw/json/mark-*-boot1.json and tp3-*-boot1.json",
+ "testbed_check": {
+  "profile": "experiments/2026-10-26-spark-ds41f-candidate/candidate-56/tp4-switched-957p1r1.json (+ -dev): candidate-56's image with 957p1r1/overlay's 8 non-test files (candidate-54 + 0795-r1 + 0796). Only l2_prefetch.py and nvidia/model.py differ from the image (commands.txt, 'The testbed overlay against candidate-56's image'); the other six equal it.",
+  "spec": "experiments/2026-10-26-spark-ds41f-candidate/candidate-56/attribute-grid-957p1r1-tp4-switched.json: sync, then the grid step alone (candidate-48/grid-suite.json) on candidate-56-no957p1-no956, candidate-56-957p1r1, candidate-56-957p1r1-again, candidate-56-no957p1-no956-again",
+  "checks": "bin/spark doctor: configuration OK for both new profiles and the control's -dev (on a scratch copy of main with sp8's nodes-switched.local.json). arm_note_problems: notes OK for both (they cite no tree hash). scripts/lab.py run --dry-run: 14 steps, no problems. The control's base profile tp4-switched-no957p1-no956.json cites tree 5f021d9a in its notes, but the spec boots its -dev file, whose own notes pass.",
+  "pass": "the 1-request rows (1x2, 1x3 at 4K) back to the control or faster (0795 alone: 14.51 -> 16.29 ms at 1x2), no grid cell slower than the control beyond its two boots"
+ },
+ "files": {
+  "0795-perf-dsv41-replicate-the-BF16-compressor-projection-.patch": "the corrected 0795",
+  "overlay/": "candidate-54 + 0795-r1 + 0796: the 8 non-test files the profile mounts, and the 4 test files the sp8 test run mounted",
+  "experiments/2026-10-26-spark-ds41f-candidate/candidate-56/": "the two profiles, the grid spec, and 957p1r1/overlay (the same 8 non-test files at the path the profile mounts)",
+  "raw/json": "every boot's step957 output (step-* screen, mark-*, mark2-*, tp3-*)",
+  "raw/logs": "each run's container log, the pytest outputs included",
+  "raw/commands-sp8.txt": "every run's block: lock, hold file, loadavg, MemAvailable, docker ps, the exact docker command, exit code",
+  "raw/analysis": "cells-*.json (bin/cells.py)",
+  "raw/bin": "the scripts as run (om.sh, env.sh, setup*.sh, verify.sh, tests*.sh, step-*.sh, pair_check.sh, cells.py). om.sh and verify.sh gained the c56r1 arm after the screen; the screen's runs used the r1 and base arms, unchanged since.",
+  "raw/screen-overlay-v1": "the screen-time r1 files that differ from the final (a constant 2 MB COMP budget), their diff and identity",
+  "raw/pair-check.txt": "the final patch's pair check with 0796",
+  "raw/verify": "tree identity of the base, r1 and c56r1 arms as their containers see them",
+  "raw/harness": "h/ as mounted: step957.py, omlib.py, verify_tree.py, tblib_stub.py (raw/h-sha256.txt; step957.py and omlib.py equal round 3's own-mark copies)"
+ },
+ "memory_observations": "MemAvailable about 115-116 GiB before every run. TP4 step boots went down to 29 GiB, the tests to 103-113 GiB. TP3 boots went down to 7-8 GiB in both arms (the 6 GiB guard did not fire); allocated 102.6 GiB in both arms. No OOM, no kill, every exit code 0.",
+ "host": "sp8 (spark-0016, one GB10), 2026-11-10 08:11-09:03Z",
+ "rules": "sp8 only, in ~/spark-lab/agents/candidate-56-rework-957p1. Every GPU run through bin/om.sh under flock /tmp/spark-lab-gpu.lock, one boot a hold, hold file absent and no serving container at each start. The laptop's ssh link dropped once (08:43-09:10Z); the queued runs on sp8 continued and finished with exit 0. No push, commit to the repository, PR, image build, cluster, window or testbed operation."
+}

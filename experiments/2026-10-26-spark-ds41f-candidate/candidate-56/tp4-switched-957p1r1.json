@@ -1,0 +1,57 @@
+{
+  "notes": "candidate-56 with #957 part 1 round 1 and #956 round 3: the same image, with the 8 non-test files 0795-r1 and 0796 change, at their versions on candidate-54 plus 0795-r1 plus 0796, mounted from 957p1r1/overlay. 0795-r1 keeps the replicated BF16 compressor weight and gives the COMP L2 prefetch window its own budget: a replicated weight gets no COMP window, where 0795 prefetched all 10.5 MB within WO's 20 MB budget (VLLM_DS41_L2_PREFETCH_COMP_MB overrides; the recipe sets none). 0796 is unchanged. Only l2_prefetch.py and nvidia/model.py differ from the image; the other six equal it. The test files are not mounted.",
+  "extends": {
+    "config": "experiments/2026-10-26-spark-ds41f-candidate/candidate-56/tp4-switched.json"
+  },
+  "set": {
+    "container": {
+      "mounts": [
+        [
+          "{checkout}/cache",
+          "/cache",
+          "rw"
+        ],
+        [
+          "{checkout}/experiments/2026-10-26-spark-ds41f-candidate/candidate-56/957p1r1/overlay/vllm/models/deepseek_v4_1/attention.py",
+          "/opt/spark-ds41f/candidate/vllm/vllm/models/deepseek_v4_1/attention.py",
+          "ro"
+        ],
+        [
+          "{checkout}/experiments/2026-10-26-spark-ds41f-candidate/candidate-56/957p1r1/overlay/vllm/models/deepseek_v4_1/ced.py",
+          "/opt/spark-ds41f/candidate/vllm/vllm/models/deepseek_v4_1/ced.py",
+          "ro"
+        ],
+        [
+          "{checkout}/experiments/2026-10-26-spark-ds41f-candidate/candidate-56/957p1r1/overlay/vllm/models/deepseek_v4_1/compressor.py",
+          "/opt/spark-ds41f/candidate/vllm/vllm/models/deepseek_v4_1/compressor.py",
+          "ro"
+        ],
+        [
+          "{checkout}/experiments/2026-10-26-spark-ds41f-candidate/candidate-56/957p1r1/overlay/vllm/models/deepseek_v4_1/l2_prefetch.py",
+          "/opt/spark-ds41f/candidate/vllm/vllm/models/deepseek_v4_1/l2_prefetch.py",
+          "ro"
+        ],
+        [
+          "{checkout}/experiments/2026-10-26-spark-ds41f-candidate/candidate-56/957p1r1/overlay/vllm/models/deepseek_v4_1/nvidia/model.py",
+          "/opt/spark-ds41f/candidate/vllm/vllm/models/deepseek_v4_1/nvidia/model.py",
+          "ro"
+        ],
+        [
+          "{checkout}/experiments/2026-10-26-spark-ds41f-candidate/candidate-56/957p1r1/overlay/vllm/models/deepseek_v4_1/nvidia/model_state.py",
+          "/opt/spark-ds41f/candidate/vllm/vllm/models/deepseek_v4_1/nvidia/model_state.py",
+          "ro"
+        ],
+        [
+          "{checkout}/experiments/2026-10-26-spark-ds41f-candidate/candidate-56/957p1r1/overlay/vllm/models/deepseek_v4_1/sp_prefill.py",
+          "/opt/spark-ds41f/candidate/vllm/vllm/models/deepseek_v4_1/sp_prefill.py",
+          "ro"
+        ],
+        [
+          "{checkout}/experiments/2026-10-26-spark-ds41f-candidate/candidate-56/957p1r1/overlay/vllm/models/deepseek_v4_1/tilelang/linear.py",
+          "/opt/spark-ds41f/candidate/vllm/vllm/models/deepseek_v4_1/tilelang/linear.py",
+          "ro"
+        ]
+      ]
+    }
+  }
+}

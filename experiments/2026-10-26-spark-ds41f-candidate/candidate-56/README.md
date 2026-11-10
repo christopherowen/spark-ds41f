@@ -203,3 +203,20 @@ This is the first image built on sp8, and candidate-54's was built on dgx4. So
   and 0796 change, at candidate-54's versions (tree 5f021d9a), in [no957p1-no956/overlay](no957p1-no956/overlay).
   Against candidate-54's image it measures the build host alone;
 - `tp4-switched-no956` (957 part 1 alone) and candidate-56.
+
+## #957 part 1, round 1
+
+[receipts/rework/pr-957p1-r1](receipts/rework/pr-957p1-r1/result.json). The own mark found part 1's COMP L2 prefetch
+window, sized by the WO budget, prefetching the whole 10.5 MB replicated weight, which the compressor's own GEMM then
+read cold. Round 1 gives the COMP window its own budget: 0 for a replicated weight (TP <= 4), the WO budget for a
+TP5-TP8 shard, so those shapes are unchanged. `VLLM_DS41_L2_PREFETCH_COMP_MB` overrides it; the recipe sets nothing.
+The weight stays replicated, so #956 still reads it with no all-gather.
+
+- **One GPU, TP4 rank shapes, three same-session ABBA sessions against candidate-54:** 33 cells, 0 slower, 23 faster
+  beyond the interval, 10 the same; at 1-4 requests 22 faster, 8 the same. TP3: none slower.
+- **Correctness:** compressor outputs `torch.equal` to TP1 at TP2..TP4; the compressor, L2 schedule, ced and
+  prepare tests pass (83).
+- **Testbed check:** [attribute-grid-957p1r1-tp4-switched.json](attribute-grid-957p1r1-tp4-switched.json), the grid
+  step alone in one session: the control (`tp4-switched-no957p1-no956-dev`, candidate-54's code on this image),
+  `tp4-switched-957p1r1-dev` (candidate-54 + 0795 round 1 + 0796, from [957p1r1/overlay](957p1r1/overlay)) twice,
+  then the control again. It passes if 1x2 and 1x3 rows at 4K are back to the control or faster and no cell is slower.
