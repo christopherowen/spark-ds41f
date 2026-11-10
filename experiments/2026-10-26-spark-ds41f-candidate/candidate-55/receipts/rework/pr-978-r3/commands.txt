@@ -1,0 +1,127 @@
+# #978 round 3 (candidate-55; the owner's exception of 2026-11-10 beyond two reworks). Commands as run, 2026-11-10.
+# Work dir on sp8: ~/spark-lab/agents/candidate-55-rework-978-r3 (WD below); round 2's work dir
+# ~/spark-lab/agents/candidate-55-rework-978-r2 (R2): its clone, arms (none, r2f), bundle and benches are reused.
+# Scripts are in scripts/ (copies of what ran; the bench scripts are round 2's, unchanged).
+# No pushes, commits to the repository, PRs, image builds, cluster, window or testbed operations.
+# The only commits are in WD's disposable vLLM clone (needed for git format-patch).
+# GPU runs: ~/spark-hold.json absent, then flock /tmp/spark-lab-gpu.lock, taken by run_exp.sh,
+# serving_session.sh and final_tests.sh themselves (final_tests.sh wraps run_tests.sh, which does not take it),
+# or by an explicit flock around run_tests.sh. One exception, recorded: the first ds41_kv_specs.py probe below.
+
+## The record (laptop, read only)
+git -C ~/projects/spark-ds41f fetch origin
+git -C ~/projects/spark-ds41f archive origin/main experiments/2026-10-26-spark-ds41f-candidate/candidate-55 \
+    experiments/2026-10-26-spark-ds41f-candidate/candidate-54 patches scripts | tar -x -C scratchpad/ref
+#   candidate-55/receipts/tp4-ring-978r2/ (the failed gate), receipts/tp4-ring-no978/, receipts/rework/pr-978-r2/
+git -C ~/projects/spark-ds41f show origin/main:experiments/2026-10-12-r6g/token_determinism_text.py   # what "again" does
+# every recorded "again" scenario on main (raw/gate-history.json):
+git -C ~/projects/spark-ds41f grep -l '"scenario": "again"' origin/main -- experiments   # then each file parsed
+# config/cluster.json and scripts/recipe.py on origin/main: the recipe's serve args and tp4-ring sizing
+
+## Source (sp8)
+git clone --no-checkout R2/vllm WD/vllm                             # c54 4e8133ff1, 0792 7e36cafc1, 0793-r2 0335680a5, 0794 92dd70815
+git -C WD/vllm worktree add -b r3c WD/commitwt 0335680a5            # round 2's 0793 on 0792
+# edits on the laptop (scratchpad/work/r3/), copied into commitwt with tar over ssh:
+#   vllm/v1/engine/core.py, vllm/v1/engine/async_llm.py, tests/v1/core/test_text_request_scheduling.py (new)
+C="GIT_COMMITTER_NAME='Christopher Owen' GIT_COMMITTER_EMAIL=3221756+christopherowen@users.noreply.github.com"
+# first round-3 tree (r3-pre: the handler read req.mm_features directly), 11:33Z:
+cd WD/commitwt && git add -A && env $C GIT_COMMITTER_DATE="Sun Nov 8 14:53:04 2026 +0000" git commit --amend -F WD/msg-r3-draft.txt
+env $C GIT_COMMITTER_DATE="Sun Nov 8 15:56:25 2026 +0000" git cherry-pick 92dd70815            # 0794
+git diff --name-only 4e8133ff1 HEAD | grep '\.py$' > WD/r3-changed-files.txt                    # 27 files
+git archive HEAD $(cat WD/r3-changed-files.txt) | tar -x -C WD/arms/r3                           # = arms/r3dev (cmp)
+# final tree, 11:55Z (after dirs found test_stall_diagnostics failing on r3-pre: both guards use getattr,
+# plus the stand-in test): git reset --hard HEAD~1; copy the three files; amend; cherry-pick 0794;
+# arms/r3-pre kept, arms/r3 rebuilt by git archive (27 files, same list)
+# final message (msg-r3-final.txt), twice, 12:31Z and 12:33Z (the tree unchanged, checked):
+git reset -q --hard HEAD~1 && env $C GIT_COMMITTER_DATE="Sun Nov 8 14:53:04 2026 +0000" git commit -q --amend -F WD/msg-r3-final.txt
+env $C GIT_COMMITTER_DATE="Sun Nov 8 15:56:25 2026 +0000" git cherry-pick 92dd70815
+git format-patch -q --start-number 793 -1 HEAD~1 -o WD/patch      # sha256 635589b3...
+git -C WD/commitwt diff 0335680a5 HEAD~1 > raw/interdiff-0793-r2-to-0793-r3.diff
+
+## Arms (files mounted read-only over spark-ds41f:candidate-54's /opt/spark-ds41f/candidate/vllm)
+#   none          candidate-54 as built (4e8133ff, image sha256:e1de71be...)
+#   R2/arms/r2f   round 2: candidate-55-r2's 26 changed .py files (0792, 0793-r2, 0794)
+#   r3            round 3: candidate-55-r3's 27 changed .py files (0792, 0793-r3, 0794), the final tree
+#   r3-pre        the first round-3 tree (raw/superseded/); r3dev-pre the same before its commit
+#   r2-newtest    r2f plus round 3's new test file
+#   c54-newtest   candidate-54 plus round 3's new test file
+#   *-async       c54 (none), r2f, r3 plus scripts/test_zz_hidden_async.py (dev only: test_admission_control.py's
+#                 async test under asyncio.run)
+
+## DS4.1's KV cache specs (for the replay), from the worker's own get_kv_cache_spec on a meta-device model
+# FIRST ATTEMPT RAN WITHOUT THE GPU LOCK (a slip; it failed at once): Engram's table is allocated on the
+# device even under torch.device("meta"), so it tried 91.6 GiB, hit OOM and exited (raw/dev/ds41-kv-specs-oom.txt).
+docker run --rm --gpus all ... spark-ds41f:candidate-54 /opt/exp/ds41_kv_specs.py /c/ds41_specs.pkl   # no lock, OOM
+# with engram table_memory "disk" (the recipe's own setting on tp4-ring), under the lock:
+scripts/run_exp.sh none raw/dev/ds41-kv-specs.txt ds41_kv_specs.py /c/ds41_specs.pkl
+#   51 layers: 40 SlidingWindowMLASpec (block 128, window 128), 8 MLAAttentionSpec (block 256), 3 CircularBufferSpec (32)
+
+## Prompt lengths as the server renders them (CPU, no lock)
+docker run --rm ... spark-ds41f:candidate-54 /opt/exp/gate_prompt_lengths.py
+#   PROMPTS 18 19 20 19 18 17 16 17; MORE_PROMPTS 17 17 18 15 14 16 22; long (700 lines) 14820
+
+## The dynamic check: the gate's requests through the real frontend and engine (exp/gate_replay.py)
+# development (raw/dev/replay-dev*): dev1-dev3 fixed the stand-in model (sink rejection's draft zero,
+# the empty step's output, prefill stats); dev4 ran on none and on R2/arms/r2f
+EXTRA_ENV="-e VLLM_LATE_ADMISSION_LAYER=30" scripts/run_exp.sh none raw/dev/replay-dev4-c54.txt gate_replay.py dev4-c54 /c/replay-dev4-c54.json
+EXTRA_ENV="-e VLLM_LATE_ADMISSION_LAYER=30" scripts/run_exp.sh R2/arms/r2f raw/dev/replay-dev4-r2f.txt gate_replay.py dev4-r2f /c/replay-dev4-r2f.json
+# recorded: none r2f r3 r3 r2f none, one lock hold each; first on r3-pre (raw/superseded/replay-r3pre/),
+# then on the final tree (raw/replay/, summary.json)
+scripts/replay_session.sh
+# positive controls on candidate-54 (raw/replay/replay-control-*.json)
+for c in nohit late; do EXTRA_ENV="-e VLLM_LATE_ADMISSION_LAYER=30 -e REPLAY_CONTROL=$c" \
+  scripts/run_exp.sh none raw/replay/control-$c.txt gate_replay.py control-$c /c/replay-control-$c.json; done
+
+## The new test's pinned values, recorded on candidate-54 (under the lock; the model config needs the GPU)
+flock /tmp/spark-lab-gpu.lock scripts/run_tests.sh arms/c54-newtest dev/record-c54-gpu --gpu -- -s \
+  tests/v1/core/test_zz_record_text_schedule.py tests/v1/core/test_text_request_scheduling.py -k "record or enters_the_engine"
+#   (test_zz_record_text_schedule.py: exp/record_text_schedule.py with a relative import, dev arm only, removed after)
+# development runs of the new test on c54-newtest, r2-newtest, r3dev: raw/dev/newtest-*.txt, newtest2-*.txt
+
+## Recorded tests (scripts/final_tests.sh; raw/tests/)
+# first run, on r3-pre (11:39-11:52Z; raw/superseded/tests-r3-pre/): new, gate, pr978 (labels tests/<name> made
+# --basetemp /c/pytest-tmp-tests/<name> without its parent, so media/test_image.py's 4 tmp_path tests errored
+# in setup; mkdir -p WD/cache/pytest-tmp-tests), dirs (18 failed: test_stall_diagnostics.py's
+# test_add_request_waiting_in_the_input_queue_is_reported, an AttributeError on r3-pre's req.mm_features);
+# extra and a queued pr978 rerun (scripts/pr978_rerun.sh) were stopped before running (kill), superseded.
+# final run, on the final tree (11:56-12:08Z):
+scripts/final_tests.sh
+#   new:   c54-newtest (-k 'not stripped_item_miss'), r2-newtest, r3 on tests/v1/core/test_text_request_scheduling.py
+#   async: c54-async, r2-async, r3-async on tests/v1/engine/test_zz_hidden_async.py
+#   gate:  r3 on test_request_submission_cleanup.py, test_api_cancellation.py
+#   pr978: r3, two boots, #978's pytest set with test_stripped_mm_scheduling.py and the new file (round 2's -k)
+#   dirs:  r3 on tests/v1/engine, tests/entrypoints/serve/utils
+#   extra: none and r3 on round 2's extra set plus test_sink_draft_zero.py and test_prefix_caching.py
+python3 scripts/test_counts.py raw/tests new-c54 new-r2 new-r3 async-c54 async-r2 async-r3 gate-r3 \
+    pr978-r3-boot1 pr978-r3-boot2 dirs-r3 extra-c54 extra-r3 > raw/tests/test-counts.json
+
+## Serving-path bench (scripts/measure.sh; round 2's benches unchanged)
+# first run, on r3-pre (11:40-11:50Z; raw/superseded/r3pre-{mark,text,prodenv}), and a 4-boot text repeat
+# (raw/superseded/r3pre-text2) after its 2-boot text run had one sub-millisecond cell 'slower':
+BENCH=serving_text_bench.py scripts/serving_session.sh r3-text2 text2-base-boot1:none text2-r3-boot1:r3 \
+  text2-r3-boot2:r3 text2-base-boot2:none text2-base-boot3:none text2-r3-boot3:r3 text2-r3-boot4:r3 text2-base-boot4:none
+# final tree, after the final tests and the replay (one chain: final_tests.sh; replay_session.sh; measure.sh):
+scripts/measure.sh            # r3-mark (base r3 r3 base), r3-text (ABBA twice), r3-prodenv (base r3 r3 base)
+ENV=MALLOC_ARENA_MAX=2,MALLOC_MMAP_THRESHOLD_=1048576,OMP_NUM_THREADS=8,VLLM_MAX_IMAGE_PIXELS=16777216
+scripts/serving_session.sh r3-prodenv2 prodenv2-base-boot1:none:$ENV prodenv2-r3-boot1:r3:$ENV \
+  prodenv2-r3-boot2:r3:$ENV prodenv2-base-boot2:none:$ENV prodenv2-base-boot3:none:$ENV prodenv2-r3-boot3:r3:$ENV \
+  prodenv2-r3-boot4:r3:$ENV prodenv2-base-boot4:none:$ENV      # the recipe environment again, 4 boots each
+python3 scripts/analyze_serving.py raw/mark/summary.json --base raw/r3-mark/serving-base-boot{1,2}.json --cand raw/r3-mark/serving-r3-boot{1,2}.json
+python3 scripts/analyze_text.py raw/text/summary.json --base raw/r3-text/text-base-boot{1,2,3,4}.json --cand raw/r3-text/text-r3-boot{1,2,3,4}.json
+python3 scripts/analyze_serving.py raw/prodenv/summary.json --base raw/r3-prodenv/prodenv-base-boot{1,2}.json --cand raw/r3-prodenv/prodenv-r3-boot{1,2}.json
+python3 scripts/analyze_serving.py raw/prodenv2/summary.json --base raw/r3-prodenv2/prodenv2-base-boot{1,2,3,4}.json --cand raw/r3-prodenv2/prodenv2-r3-boot{1,2,3,4}.json
+# (in this delivery each session's files and its summary are together in raw/{mark,text,prodenv,prodenv2}/)
+
+## Apply and pair checks (git only, sp8), on the final patch
+scripts/apply_check.sh > raw/apply-check.txt
+# overlay: the files candidate-55-r3's series head changes against candidate-55 (410463b3), git archive of HEAD;
+# check: a worktree of 410463b3 with overlay/ copied over it writes the series head's tree (apply-check.txt)
+
+## Laptop
+python3 scripts/build_result.py <this directory>     # result.json from raw/ and scripts/result-narrative.json
+# raw/gate-history.json: every 'again' row on origin/main (git grep and git show, as above)
+# raw/static-hunks.txt: git diff 7e36cafc1 HEAD~1 of scheduler.py, async_llm.py, core.py with a note per hunk
+
+## Testbed (not run here; the owner runs it)
+#   experiments/2026-10-26-spark-ds41f-candidate/candidate-55/validate-978r3-tp4.json:
+#   the gate on tp4-978r3.json (a boot and a repeat boot), then check_978_image_chat.py on candidate-54, then on 978r3

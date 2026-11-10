@@ -266,3 +266,10 @@ where candidate-55 without #978 is identical. **#978 is dropped from this releas
 
 **Verdict for candidate-55:** #1008 and #988's dead-row part pass and join the next merged base; #995's guard is left
 out; #978 is dropped.
+
+**Correction (2026-11-10).** The `again` difference that dropped #978 also occurs without it (candidate-51's gate,
+one run in about 500), so it is not shown to be #978's ([receipts/tp4-ring-978r2](receipts/tp4-ring-978r2/README.md)).
+#978's round 3 (owner exception; [receipts/rework/pr-978-r3](receipts/rework/pr-978-r3/result.json)) puts text-only
+requests on candidate-54's own statements and fixes a hidden admission-control test regression from round 2; its mark
+holds (image turns 2 onward 4.25-9.59x faster, no text cell slower). It is judged in the next round on candidate-58,
+with a two-boot gate ([validate-978r3-tp4.json](validate-978r3-tp4.json) is the candidate-55 form).
