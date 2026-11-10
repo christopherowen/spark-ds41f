@@ -1,0 +1,860 @@
+From 873f7e6417345827e037f7421c1e7175c1114752 Mon Sep 17 00:00:00 2001
+From: Christopher Owen <christopherowen@users.noreply.github.com>
+Date: Sun, 8 Nov 2026 15:37:19 +0000
+Subject: [PATCH] perf(worker): reclaim UMA heap and allocator slack across
+ lifecycle
+
+Base: 1107 vLLM patch head 320021e3c4dbb202d911ab70e2cd924c75420488.
+
+Rationale:
+On 128 GB unified-memory GB10 nodes, host virtual memory arenas and PyTorch's CUDA caching allocator draw from the same physical LPDDR5x memory pool, and MemorySnapshot samples psutil.virtual_memory().available directly on integrated GPUs. Disassembly of libc10.so on aarch64 shows that PyTorch's CPU tensor allocator (c10::alloc_cpu / c10::free_cpu) is backed by statically linked mimalloc (mi_malloc_aligned / mi_free), while Python objects, safetensors headers, and C++ containers use glibc ptmalloc. Calling gc.collect() or malloc_trim(0) alone leaves hundreds of MiB of freed CPU tensor pages pinned in mimalloc segments across weight loading, memory profiling, CUDA graph capture, and long-prefill transitions.
+
+Introduce dual-allocator host heap trimming and coordinated UMA reclamation across the worker lifecycle:
+1. Add trim_host_heap() and reclaim_uma_memory() in vllm.utils.mem_utils that invoke both libc10's statically linked mi_collect(True) (resolved from .symtab relative to _ZN3c108free_cpuEPv) and glibc malloc_trim(0), alongside gc.collect() and torch.accelerator.empty_cache().
+2. Reclaim CPU snapshot and loader staging arenas in bind_weight_arena(), DirectModelLoader.load_model(), DeviceMemoryProfiler, and TileLang release_host_memory().
+3. Reclaim generic profiling activations and host heap slack in GPUModelRunner.profile_run() before _profile_deepseek_v4_attention(), at the end of profile_run(), and inside memory_profiling() before sampling after_profile so UMA KV cache sizing does not treat reclaimable host heap slack as permanent non_torch_memory.
+4. Trim host heap in freeze_gc_for_cudagraph_capture(), after capture_model() tail warmup, and in freeze_gc_heap() before logging the startup memory breakdown.
+5. Track eager prefill executions (CUDAGraphMode.NONE) via _pending_post_prefill_cache_flush on GPUModelRunner and flush UMA allocator and host heap slack once after the first transition back to CUDAGraphMode.FULL decode, preserving 100% segment reuse across consecutive chunked-prefill steps with zero steady-state decode overhead.
+
+Quality:
+No numerical or scheduling changes. Reclaims 198-391 MiB of process RSS during weight loading and profiling, reduces peak reserved memory during attention profiling by 384 MiB, reduces startup non_kv_cache_memory by 798-1,255 MiB, and reclaims 1,920 MiB of CUDA reserved slack plus 120 MiB of host RSS (~2.29-2.53 GiB MemAvailable per rank) on the first decode step after a 32k eager prefill with zero steady-state decode latency impact.
+
+Tests:
+- pytest -k 'not test_memory_profiling' tests/utils_/test_mem_utils.py tests/utils_/test_gc_utils.py tests/v1/worker/test_gpu_model_runner_v2.py tests/v1/worker/test_gpu_worker.py tests/model_executor/model_loader/test_direct_loader.py tests/model_executor/model_loader/test_direct_loader_cuda.py (233 passed across 2 boots).
+
+Upstream status: local unified-memory allocator hygiene for GB10 worker lifecycle.
+---
+ tests/utils_/test_gc_utils.py                 |  58 +++++++
+ tests/utils_/test_mem_utils.py                |  60 ++++++-
+ tests/v1/worker/test_gpu_model_runner_v2.py   |  79 +++++++++
+ .../model_loader/direct_loader.py             |   6 +-
+ vllm/models/deepseek_v4_1/tilelang/prepare.py |  19 +--
+ vllm/utils/gc_utils.py                        |   4 +
+ vllm/utils/mem_utils.py                       | 150 +++++++++++++++++-
+ vllm/v1/executor/multiproc_executor.py        |  11 +-
+ vllm/v1/worker/gpu/cudagraph_utils.py         |   3 +
+ vllm/v1/worker/gpu/model_runner.py            |  44 ++++-
+ vllm/v1/worker/gpu_worker.py                  |  18 ++-
+ 11 files changed, 423 insertions(+), 29 deletions(-)
+
+diff --git a/tests/utils_/test_gc_utils.py b/tests/utils_/test_gc_utils.py
+index f1d0de87c..2e29f1c9d 100644
+--- a/tests/utils_/test_gc_utils.py
++++ b/tests/utils_/test_gc_utils.py
+@@ -7,6 +7,8 @@ from vllm.utils.gc_utils import (
+     GCDebugConfig,
+     _compute_detailed_type,
+     _compute_top_gc_collected_objects,
++    freeze_gc_for_cudagraph_capture,
++    freeze_gc_heap,
+ )
+ 
+ 
+@@ -83,3 +85,59 @@ def test_gc_debug_config():
+     config = GCDebugConfig('{"top_objects":5}')
+     assert config.enabled
+     assert config.top_objects == 5
++
++
++def test_freeze_gc_for_cudagraph_capture_trims_host_heap(monkeypatch):
++    events: list[str] = []
++    monkeypatch.setattr("vllm.utils.gc_utils.envs.VLLM_ENABLE_CUDAGRAPH_GC", False)
++    monkeypatch.setattr(
++        "vllm.utils.gc_utils.gc.collect", lambda *a: events.append("collect") or 0
++    )
++    monkeypatch.setattr(
++        "vllm.utils.gc_utils.gc.freeze", lambda: events.append("freeze")
++    )
++    monkeypatch.setattr(
++        "vllm.utils.gc_utils.gc.unfreeze", lambda: events.append("unfreeze")
++    )
++    monkeypatch.setattr(
++        "vllm.utils.gc_utils.trim_host_heap",
++        lambda: events.append("trim") or True,
++    )
++
++    with freeze_gc_for_cudagraph_capture():
++        events.append("body")
++
++    assert events == [
++        "collect",
++        "trim",
++        "freeze",
++        "body",
++        "unfreeze",
++        "collect",
++        "trim",
++    ]
++
++
++def test_freeze_gc_heap_trims_before_freeze(monkeypatch):
++    events: list[object] = []
++    monkeypatch.setattr(
++        "vllm.utils.gc_utils.gc.collect",
++        lambda gen=None: events.append(("collect", gen)) or 0,
++    )
++    monkeypatch.setattr(
++        "vllm.utils.gc_utils.trim_host_heap",
++        lambda: events.append("trim") or True,
++    )
++    monkeypatch.setattr(
++        "vllm.utils.gc_utils.gc.freeze", lambda: events.append("freeze")
++    )
++
++    freeze_gc_heap()
++
++    assert events == [
++        ("collect", 0),
++        ("collect", 1),
++        ("collect", 2),
++        "trim",
++        "freeze",
++    ]
+diff --git a/tests/utils_/test_mem_utils.py b/tests/utils_/test_mem_utils.py
+index 19690d1f3..efb84e3ff 100644
+--- a/tests/utils_/test_mem_utils.py
++++ b/tests/utils_/test_mem_utils.py
+@@ -5,7 +5,13 @@ from unittest.mock import MagicMock, patch
+ import torch
+ from vllm_test_utils.monitor import monitor
+ 
+-from vllm.utils.mem_utils import MemorySnapshot, memory_profiling
++from vllm.utils.mem_utils import (
++    MemorySnapshot,
++    _get_c10_mi_collect,
++    memory_profiling,
++    reclaim_uma_memory,
++    trim_host_heap,
++)
+ 
+ from ..utils import create_new_process_for_each_test
+ 
+@@ -148,3 +154,55 @@ def test_memory_snapshot_uses_cuda_on_discrete_gpu():
+         assert snapshot.free_memory == mock_cuda_free
+         assert snapshot.total_memory == mock_cuda_total
+         mock_psutil.virtual_memory.assert_not_called()
++
++
++def test_reclaim_uma_memory_invokes_gc_empty_cache_and_trim(monkeypatch):
++    events: list[object] = []
++    monkeypatch.setattr("vllm.utils.mem_utils.gc.collect", lambda: events.append("gc"))
++    monkeypatch.setattr("torch.cuda.is_available", lambda: True)
++    monkeypatch.setattr(
++        "torch.accelerator.synchronize",
++        lambda dev=None: events.append(("sync", dev)),
++    )
++    monkeypatch.setattr(
++        "torch.accelerator.empty_cache",
++        lambda: events.append("empty_cache"),
++    )
++    monkeypatch.setattr(
++        "vllm.utils.mem_utils.trim_host_heap",
++        lambda: events.append("trim") or True,
++    )
++
++    reclaim_uma_memory("cuda:0", synchronize=True)
++    assert events == ["gc", ("sync", "cuda:0"), "empty_cache", "trim"]
++
++    events.clear()
++    reclaim_uma_memory("cuda:0", synchronize=False)
++    assert events == ["gc", "empty_cache", "trim"]
++
++
++def test_trim_host_heap_reclaims_cpu_tensor_and_glibc_arenas():
++    import gc
++    import sys
++
++    if sys.platform != "linux":
++        pytest.skip("Linux-only host arena trim test")
++
++    def read_rss_kib() -> int:
++        with open("/proc/self/status") as f:
++            for line in f:
++                if line.startswith("VmRSS:"):
++                    return int(line.split()[1])
++        return 0
++
++    trim_host_heap()
++    t = torch.ones((32 * 1024 * 1024,), dtype=torch.float32, device="cpu")
++    buf = bytearray(64 * 1024 * 1024)
++    buf[0 : len(buf) : 4096] = b"\x01" * (len(buf) // 4096)
++    rss_peak = read_rss_kib()
++    del t, buf
++    gc.collect()
++    assert trim_host_heap() is True
++    rss_after = read_rss_kib()
++    if _get_c10_mi_collect() is not None:
++        assert rss_after < rss_peak - 64 * 1024
+diff --git a/tests/v1/worker/test_gpu_model_runner_v2.py b/tests/v1/worker/test_gpu_model_runner_v2.py
+index 05c019566..e251b4fda 100644
+--- a/tests/v1/worker/test_gpu_model_runner_v2.py
++++ b/tests/v1/worker/test_gpu_model_runner_v2.py
+@@ -927,6 +927,85 @@ def test_pipeline_drafts_do_not_depend_on_boundary_checkpoints(
+         runner.draft_tokens_handler.set_draft_tokens.assert_not_called()
+ 
+ 
++def test_post_prefill_transition_flushes_uma_cache_once_on_full_decode(monkeypatch):
++    from unittest.mock import Mock
++
++    reclaim_calls: list[tuple[object, bool]] = []
++    monkeypatch.setattr(
++        model_runner_module,
++        "reclaim_uma_memory",
++        lambda dev=None, *, synchronize=False: reclaim_calls.append(
++            (dev, synchronize)
++        ),
++    )
++    monkeypatch.setattr(model_runner_module, "AsyncOutput", lambda **kwargs: kwargs)
++
++    batch = SimpleNamespace(
++        req_ids=["request"],
++        num_reqs=1,
++        idx_mapping=torch.tensor([0]),
++        query_start_loc=torch.tensor([0, 1]),
++        num_draft_tokens_per_req=None,
++    )
++    states = SimpleNamespace(
++        draft_tokens=torch.tensor([[3, 4]]),
++        all_token_ids=SimpleNamespace(gpu=None),
++        num_computed_tokens=SimpleNamespace(gpu=None),
++        prompt_len=SimpleNamespace(np=None),
++    )
++    sampler_output = SimpleNamespace(sampled_token_ids=torch.tensor([[1]]))
++
++    def make_state():
++        return model_runner_module.ExecuteModelState(
++            input_batch=batch,
++            attn_metadata=None,
++            slot_mappings_by_layer=None,
++            hidden_states=torch.ones(1, 8),
++            aux_hidden_states=None,
++            dp_sync=None,
++            finished_req_ids=set(),
++            ec_connector_output=None,
++            routed_experts=None,
++            cudagraph_stats=None,
++            num_spec_tokens_to_schedule=0,
++        )
++
++    runner = SimpleNamespace(
++        execute_model_state=make_state(),
++        _pending_post_prefill_cache_flush=True,
++        _last_batch_cg_mode=model_runner_module.CUDAGraphMode.FULL,
++        is_last_pp_rank=True,
++        pcp_manager=None,
++        pp_handler=None,
++        sample=lambda *args: (sampler_output, torch.tensor([1]), torch.tensor([0])),
++        prompt_logprobs_worker=SimpleNamespace(compute_prompt_logprobs=lambda *a: {}),
++        model=SimpleNamespace(compute_logits=None),
++        req_states=states,
++        adaptive_verification=None,
++        boundary_checkpoint_state=None,
++        main_stream=None,
++        output_copy_stream=None,
++        check_ep_fault=False,
++        speculator=None,
++        sink=None,
++        num_speculative_steps=0,
++        device=torch.device("cpu"),
++        postprocess_sampled=Mock(),
++        block_tables=None,
++        draft_tokens_handler=SimpleNamespace(set_draft_tokens=Mock()),
++        kv_connector=SimpleNamespace(post_forward=lambda *a: None),
++        eplb=SimpleNamespace(step=Mock()),
++    )
++
++    GPUModelRunner.sample_tokens(runner, None)
++    assert runner._pending_post_prefill_cache_flush is False
++    assert reclaim_calls == [(torch.device("cpu"), False)]
++
++    runner.execute_model_state = make_state()
++    GPUModelRunner.sample_tokens(runner, None)
++    assert len(reclaim_calls) == 1
++
++
+ def test_moe_output_buffer_is_reused_and_disjoint_from_workspace_scratch(
+     monkeypatch, workspace_init
+ ):
+diff --git a/vllm/model_executor/model_loader/direct_loader.py b/vllm/model_executor/model_loader/direct_loader.py
+index 24ec1f48e..0bd68c20e 100644
+--- a/vllm/model_executor/model_loader/direct_loader.py
++++ b/vllm/model_executor/model_loader/direct_loader.py
+@@ -39,6 +39,7 @@ shared read group, IPC-exportable allocations or progress panel.
+ """
+ 
+ import dataclasses
++import gc
+ import heapq
+ import json
+ import math
+@@ -50,6 +51,7 @@ import torch
+ from transformers.utils import SAFE_WEIGHTS_INDEX_NAME
+ 
+ from vllm.logger import init_logger
++from vllm.utils.mem_utils import reclaim_uma_memory, trim_host_heap
+ from vllm.model_executor.model_loader import weight_utils
+ from vllm.model_executor.model_loader.default_loader import DefaultModelLoader
+ from vllm.model_executor.model_loader.direct_io import (
+@@ -312,6 +314,8 @@ def bind_weight_arena(
+         if sponge:
+             sponge.clear()
+             torch.accelerator.empty_cache()
++        gc.collect()
++        trim_host_heap()
+ 
+     return arena
+ 
+@@ -379,7 +383,7 @@ class DirectModelLoader(DefaultModelLoader):
+                 stats = session.stats()
+             finally:
+                 self._session = None
+-        torch.accelerator.empty_cache()
++        reclaim_uma_memory(device, synchronize=True)
+         seconds = (
+             self.counter_after_loading_weights - self.counter_before_loading_weights
+         )
+diff --git a/vllm/models/deepseek_v4_1/tilelang/prepare.py b/vllm/models/deepseek_v4_1/tilelang/prepare.py
+index 5dee71059..30123c14b 100644
+--- a/vllm/models/deepseek_v4_1/tilelang/prepare.py
++++ b/vllm/models/deepseek_v4_1/tilelang/prepare.py
+@@ -238,20 +238,11 @@ def prepare_declared(registry: JitWarmupRegistry) -> int:
+ 
+ def release_host_memory() -> None:
+     """Return the compile threads' freed heap and warmup allocator blocks to the
+-    system (glibc keeps a malloc arena per thread), so memory profiling starts
+-    from what serving holds."""
+-    import contextlib
+-    import ctypes
+-    import gc
+-
+-    import torch
+-
+-    gc.collect()
+-    if torch.cuda.is_available():
+-        torch.accelerator.synchronize()
+-        torch.accelerator.empty_cache()
+-    with contextlib.suppress(OSError, AttributeError):
+-        ctypes.CDLL("libc.so.6").malloc_trim(0)
++    system (glibc keeps a malloc arena per thread and libc10 retains mimalloc
++    CPU tensor segments), so memory profiling starts from what serving holds."""
++    from vllm.utils.mem_utils import reclaim_uma_memory
++
++    reclaim_uma_memory(synchronize=True)
+ 
+ 
+ _SAFE_CELL_ATOMS = (int, float, str, bytes, bool, type(None), type)
+diff --git a/vllm/utils/gc_utils.py b/vllm/utils/gc_utils.py
+index 32bdfb764..71c3adfa8 100644
+--- a/vllm/utils/gc_utils.py
++++ b/vllm/utils/gc_utils.py
+@@ -9,6 +9,7 @@ from typing import Any
+ 
+ import vllm.envs as envs
+ from vllm.logger import init_logger
++from vllm.utils.mem_utils import trim_host_heap
+ 
+ logger = init_logger(__name__)
+ 
+@@ -103,6 +104,7 @@ def freeze_gc_for_cudagraph_capture():
+     """
+     gc_was_enabled = gc.isenabled()
+     gc.collect()
++    trim_host_heap()
+     should_freeze = not envs.VLLM_ENABLE_CUDAGRAPH_GC
+     if should_freeze:
+         gc.freeze()
+@@ -114,6 +116,7 @@ def freeze_gc_for_cudagraph_capture():
+             try:
+                 gc.unfreeze()
+                 gc.collect()
++                trim_host_heap()
+             finally:
+                 if gc_was_enabled:
+                     gc.enable()
+@@ -132,6 +135,7 @@ def freeze_gc_heap() -> None:
+     gc.collect(0)
+     gc.collect(1)
+     gc.collect(2)
++    trim_host_heap()
+     # Freeze all GC tracked objects
+     gc.freeze()
+ 
+diff --git a/vllm/utils/mem_utils.py b/vllm/utils/mem_utils.py
+index c092dff41..025153b03 100644
+--- a/vllm/utils/mem_utils.py
++++ b/vllm/utils/mem_utils.py
+@@ -1,11 +1,15 @@
+ # SPDX-License-Identifier: Apache-2.0
+ # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+ import contextlib
++import ctypes
+ import gc
++import struct
++import sys
+ import time
+-from collections.abc import Generator
++from collections.abc import Callable, Generator
+ from dataclasses import dataclass, field
+ from functools import cache
++from pathlib import Path
+ 
+ import psutil
+ import torch
+@@ -47,6 +51,142 @@ _UMA_PRESSURE_THRESHOLD = 0.8
+ _UMA_MIN_RELEASE_BYTES = 512 * MiB_bytes
+ 
+ 
++@cache
++def _get_malloc_trim() -> Callable[[int], int] | None:
++    if sys.platform != "linux":
++        return None
++    with contextlib.suppress(Exception):
++        libc = ctypes.CDLL("libc.so.6")
++        malloc_trim = libc.malloc_trim
++        malloc_trim.argtypes = [ctypes.c_size_t]
++        malloc_trim.restype = ctypes.c_int
++        return malloc_trim
++    return None
++
++
++@cache
++def _get_c10_mi_collect() -> Callable[[bool], None] | None:
++    """Resolve mimalloc's ``mi_collect(bool force)`` inside ``libc10.so`` when
++    PyTorch's CPU tensor allocator (``c10::alloc_cpu`` / ``c10::free_cpu``) is
++    built with statically linked mimalloc.
++    """
++    if sys.platform != "linux":
++        return None
++    with contextlib.suppress(Exception):
++        libc10_path = Path(torch.__file__).resolve().parent / "lib" / "libc10.so"
++        if not libc10_path.is_file():
++            return None
++        lib = ctypes.CDLL(str(libc10_path))
++        mi_collect = getattr(lib, "mi_collect", None)
++        if mi_collect is not None:
++            mi_collect.argtypes = [ctypes.c_bool]
++            mi_collect.restype = None
++            return mi_collect
++
++        free_cpu_ptr = ctypes.cast(lib._ZN3c108free_cpuEPv, ctypes.c_void_p).value
++        if not free_cpu_ptr:
++            return None
++
++        with libc10_path.open("rb") as f:
++            ident = f.read(64)
++            if (
++                len(ident) < 64
++                or ident[:4] != b"\x7fELF"
++                or ident[4] != 2
++                or ident[5] != 1
++            ):
++                return None
++            e_shoff = struct.unpack_from("<Q", ident, 40)[0]
++            e_shentsize, e_shnum = struct.unpack_from("<HH", ident, 58)
++            if e_shoff == 0 or e_shnum == 0 or e_shentsize < 64:
++                return None
++            f.seek(e_shoff)
++            shdrs = f.read(e_shentsize * e_shnum)
++            symtab_hdr = None
++            for idx in range(e_shnum):
++                sh = struct.unpack_from("<IIQQQQIIQQ", shdrs, idx * e_shentsize)
++                if sh[1] == 2:  # SHT_SYMTAB
++                    symtab_hdr = sh
++                    break
++            if symtab_hdr is None:
++                return None
++            _, _, _, _, sh_offset, sh_size, sh_link, _, _, sh_entsize = symtab_hdr
++            if sh_entsize != 24 or sh_link >= e_shnum:
++                return None
++            strtab_sh = struct.unpack_from(
++                "<IIQQQQIIQQ", shdrs, sh_link * e_shentsize
++            )
++            str_offset, str_size = strtab_sh[4], strtab_sh[5]
++            f.seek(str_offset)
++            strtab = f.read(str_size)
++            f.seek(sh_offset)
++            symtab = f.read(sh_size)
++
++        target_free = b"_ZN3c108free_cpuEPv\x00"
++        target_mi = b"mi_collect\x00"
++        free_val = 0
++        mi_val = 0
++        for offset in range(0, len(symtab) - 23, 24):
++            st_name, st_info, _, _, st_value, _ = struct.unpack_from(
++                "<IBBHQQ", symtab, offset
++            )
++            if st_value == 0 or (st_info & 0xF) != 2:  # STT_FUNC
++                continue
++            if strtab[st_name : st_name + 20] == target_free:
++                free_val = st_value
++            elif strtab[st_name : st_name + 11] == target_mi:
++                mi_val = st_value
++            if free_val and mi_val:
++                break
++
++        if free_val and mi_val:
++            fn_type = ctypes.CFUNCTYPE(None, ctypes.c_bool)
++            return fn_type(free_cpu_ptr - free_val + mi_val)
++    return None
++
++
++def trim_host_heap() -> bool:
++    """Return unused host heap pages from PyTorch's CPU tensor allocator and
++    glibc's malloc arenas back to the OS.
++
++    On Unified Memory Architecture (UMA) platforms such as GB10, freed CPU
++    tensor segments in ``libc10`` (mimalloc) and freed heap chunks in ``glibc``
++    (ptmalloc) remain committed against the shared physical memory pool until
++    explicitly purged.
++    """
++    trimmed = False
++    mi_collect = _get_c10_mi_collect()
++    if mi_collect is not None:
++        with contextlib.suppress(Exception):
++            mi_collect(True)
++            trimmed = True
++    malloc_trim = _get_malloc_trim()
++    if malloc_trim is not None:
++        with contextlib.suppress(Exception):
++            malloc_trim(0)
++            trimmed = True
++    return trimmed
++
++
++def reclaim_uma_memory(
++    device: torch.types.Device | None = None,
++    *,
++    synchronize: bool = False,
++) -> None:
++    """Collect unreachable Python objects, release cached device allocator
++    blocks, and return unused host heap pages to the OS.
++    """
++    gc.collect()
++    if torch.cuda.is_available():
++        if synchronize:
++            if device is None:
++                torch.accelerator.synchronize()
++            else:
++                torch.accelerator.synchronize(device)
++        torch.accelerator.empty_cache()
++    trim_host_heap()
++
++
+ def release_device_memory_under_pressure(device: torch.device) -> bool:
+     """On integrated (UMA) GPUs, release caching-allocator memory back to the
+     OS when system memory pressure is high. The OS may start thrashing before
+@@ -69,8 +209,10 @@ def release_device_memory_under_pressure(device: torch.device) -> bool:
+     if mem.available > (1 - _UMA_PRESSURE_THRESHOLD) * mem.total:
+         return False
+ 
++    gc.collect()
+     torch.accelerator.synchronize(device)
+     torch.accelerator.empty_cache()
++    trim_host_heap()
+     logger.debug(
+         "Released %sGiB of cached device memory under memory pressure",
+         format_gib(releasable),
+@@ -85,6 +227,7 @@ class DeviceMemoryProfiler:
+     def current_memory_usage(self) -> float:
+         # Return the memory usage in bytes.
+         gc.collect()
++        trim_host_heap()
+         return current_platform.get_current_memory_usage(self.device)
+ 
+     def __enter__(self):
+@@ -96,8 +239,9 @@ class DeviceMemoryProfiler:
+         self.final_memory = self.current_memory_usage()
+         self.consumed_memory = self.final_memory - self.initial_memory
+ 
+-        # Force garbage collection
++        # Force garbage collection and return host arena slack to the OS.
+         gc.collect()
++        trim_host_heap()
+ 
+ 
+ @dataclass
+@@ -283,6 +427,7 @@ def memory_profiling(
+     """
+     gc.collect()
+     torch.accelerator.empty_cache()
++    trim_host_heap()
+     torch.accelerator.reset_peak_memory_stats(baseline_snapshot.device_)
+ 
+     result = MemoryProfilingResult(
+@@ -297,6 +442,7 @@ def memory_profiling(
+ 
+     gc.collect()
+     torch.accelerator.empty_cache()
++    trim_host_heap()
+ 
+     result.after_profile.measure()
+ 
+diff --git a/vllm/v1/executor/multiproc_executor.py b/vllm/v1/executor/multiproc_executor.py
+index 562a34326..3ec9ec7bc 100644
+--- a/vllm/v1/executor/multiproc_executor.py
++++ b/vllm/v1/executor/multiproc_executor.py
+@@ -89,12 +89,13 @@ RESPONSE_WAIT_SLICE_MS = 50
+ 
+ 
+ def _trim_host_heap() -> None:
+-    """Release unreachable Python objects and return free glibc heap pages to the OS."""
++    """Release unreachable Python objects and return free host heap pages to the OS."""
++    from vllm.utils.mem_utils import trim_host_heap
++
+     gc.collect()
+-    if sys.platform != "linux":
+-        return
+-    with suppress(Exception):
+-        ctypes.CDLL("libc.so.6").malloc_trim(0)
++    if not trim_host_heap() and sys.platform == "linux":
++        with suppress(Exception):
++            ctypes.CDLL("libc.so.6").malloc_trim(0)
+ 
+ 
+ def _check_response(rank: int, status: Any, result: Any) -> Any:
+diff --git a/vllm/v1/worker/gpu/cudagraph_utils.py b/vllm/v1/worker/gpu/cudagraph_utils.py
+index 3c5cd1271..4c62a94e7 100644
+--- a/vllm/v1/worker/gpu/cudagraph_utils.py
++++ b/vllm/v1/worker/gpu/cudagraph_utils.py
+@@ -37,6 +37,7 @@ from vllm.model_executor.offloader.base import get_offloader
+ from vllm.platforms import current_platform
+ from vllm.sequence import IntermediateTensors
+ from vllm.utils.math_utils import round_up
++from vllm.utils.mem_utils import trim_host_heap
+ from vllm.utils.torch_utils import current_stream
+ from vllm.v1.hisparse.binding import release_hisparse_profiling_cache
+ from vllm.v1.kv_cache_interface import KVCacheConfig
+@@ -1341,6 +1342,7 @@ def profile_cudagraph_memory(
+ 
+     gc.collect()
+     torch.accelerator.empty_cache()
++    trim_host_heap()
+ 
+     # Run the whole profiling phase against a throwaway CUDA graph pool by
+     # pointing the global graph pool singleton at it: objects that bind the
+@@ -1641,3 +1643,4 @@ def _teardown_profiling_state(runner: "GPUModelRunner") -> None:
+     gc.collect()
+     torch.accelerator.synchronize()
+     torch.accelerator.empty_cache()
++    trim_host_heap()
+diff --git a/vllm/v1/worker/gpu/model_runner.py b/vllm/v1/worker/gpu/model_runner.py
+index 173432af0..b901f2540 100644
+--- a/vllm/v1/worker/gpu/model_runner.py
++++ b/vllm/v1/worker/gpu/model_runner.py
+@@ -75,7 +75,12 @@ from vllm.multimodal.encoder_budget import (
+ from vllm.sequence import IntermediateTensors
+ from vllm.tasks import SupportedTask
+ from vllm.utils.gc_utils import freeze_gc_for_cudagraph_capture
+-from vllm.utils.mem_utils import DeviceMemoryProfiler, format_gib
++from vllm.utils.mem_utils import (
++    DeviceMemoryProfiler,
++    format_gib,
++    reclaim_uma_memory,
++    trim_host_heap,
++)
+ from vllm.utils.torch_utils import STR_DTYPE_TO_TORCH_DTYPE, async_tensor_h2d
+ from vllm.v1.core.boundary_checkpoint import NUM_BOUNDARY_CHECKPOINT_SLOTS
+ from vllm.v1.core.sched.output import GrammarOutput, SchedulerOutput
+@@ -461,6 +466,8 @@ class GPUModelRunner(LoRAModelRunnerMixin):
+ 
+         # For transferring state from execute_model to subsequent sample_tokens call.
+         self.execute_model_state: ExecuteModelState | None = None
++        self._pending_post_prefill_cache_flush: bool = False
++        self._last_batch_cg_mode: CUDAGraphMode = CUDAGraphMode.NONE
+         # Late admission: the event each step records at VLLM_LATE_ADMISSION_LAYER.
+         self.layer_progress: LayerProgress | None = None
+ 
+@@ -1337,10 +1344,12 @@ class GPUModelRunner(LoRAModelRunnerMixin):
+         # transient peak instead of an unreachable sum of both passes.
+         torch.accelerator.synchronize()
+         del hidden_states, sample_hidden_states
++        reclaim_uma_memory(synchronize=False)
+         self._profile_deepseek_v4_attention(prepare_profile_state)
+         current_workspace_manager().reserve_by_lane()
+         self.reset_encoder_cache()
+         gc.collect()
++        trim_host_heap()
+ 
+     @torch.inference_mode()
+     def _profile_deepseek_v4_attention(
+@@ -1469,6 +1478,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
+         start_time = time.perf_counter()
+         with freeze_gc_for_cudagraph_capture():
+             torch.accelerator.empty_cache()
++            trim_host_heap()
+             start_free_gpu_memory = torch.accelerator.get_memory_info()[0]
+ 
+             with self.maybe_setup_dummy_loras(self.lora_config):
+@@ -1512,8 +1522,10 @@ class GPUModelRunner(LoRAModelRunnerMixin):
+                     self.cudagraph_manager.captured_token_counts(),
+                 )
+                 self.adaptive_verification.load_draft_budget_kernels()
++            gc.collect()
+ 
+         torch.accelerator.empty_cache()
++        trim_host_heap()
+         end_free_gpu_memory = torch.accelerator.get_memory_info()[0]
+ 
+         if not profile_only:
+@@ -3250,6 +3262,18 @@ class GPUModelRunner(LoRAModelRunnerMixin):
+             self.model_config, input_batch.num_tokens, ubatch_slices
+         )
+ 
++        if not dummy_run:
++            self._last_batch_cg_mode = batch_desc.cg_mode
++            max_cg_tokens = (
++                getattr(self.compilation_config, "max_cudagraph_capture_size", None)
++                or 0
++            )
++            if batch_desc.cg_mode == CUDAGraphMode.NONE and (
++                input_batch.num_tokens_after_padding > max_cg_tokens
++                or bool(scheduler_output.scheduled_encoder_inputs)
++            ):
++                self._pending_post_prefill_cache_flush = True
++
+         self.step_timing.record_batch(
+             input_batch, batch_desc.cg_mode == CUDAGraphMode.FULL
+         )
+@@ -3376,9 +3400,17 @@ class GPUModelRunner(LoRAModelRunnerMixin):
+             # Non-last PP rank: return IntermediateTensors for sending.
+             assert output_intermediate_tensors is not None
+             assert self.pp_handler is not None
+-            return self.pp_handler.relay_aux_hidden_states(
++            relayed = self.pp_handler.relay_aux_hidden_states(
+                 model_inputs["intermediate_tensors"], output_intermediate_tensors
+             )
++            if (
++                not dummy_run
++                and batch_desc.cg_mode == CUDAGraphMode.FULL
++                and getattr(self, "_pending_post_prefill_cache_flush", False)
++            ):
++                self._pending_post_prefill_cache_flush = False
++                reclaim_uma_memory(getattr(self, "device", None), synchronize=False)
++            return relayed
+         if self.layer_progress is not None and not dummy_run:
+             # The engine core decides the next step once this one reaches the layer.
+             return self.layer_progress.reply()
+@@ -3780,6 +3812,13 @@ class GPUModelRunner(LoRAModelRunnerMixin):
+         model_runner_output.kv_connector_output = kv_connector_output
+         model_runner_output.ec_connector_output = ec_connector_output
+ 
++        if (
++            getattr(self, "_pending_post_prefill_cache_flush", False)
++            and getattr(self, "_last_batch_cg_mode", None) == CUDAGraphMode.FULL
++        ):
++            self._pending_post_prefill_cache_flush = False
++            reclaim_uma_memory(getattr(self, "device", None), synchronize=False)
++
+         return async_output
+ 
+     def take_draft_token_ids(self) -> DraftTokenIds | None:
+@@ -3868,6 +3907,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
+ 
+         gc.collect()
+         torch.accelerator.empty_cache()
++        trim_host_heap()
+         logger.debug("Cleaned up model weights, KV caches, and workspace")
+ 
+     ########### EPLB methods start ###########
+diff --git a/vllm/v1/worker/gpu_worker.py b/vllm/v1/worker/gpu_worker.py
+index d7358d233..66ac77da1 100644
+--- a/vllm/v1/worker/gpu_worker.py
++++ b/vllm/v1/worker/gpu_worker.py
+@@ -80,6 +80,7 @@ from vllm.utils.mem_utils import (
+     MemorySnapshot,
+     format_gib,
+     memory_profiling,
++    trim_host_heap,
+ )
+ from vllm.utils.torch_utils import set_random_seed, set_torch_threads_for_runtime
+ from vllm.v1.attention.backends.utils import record_kv_cache_layout
+@@ -536,6 +537,7 @@ class Worker(WorkerBase):
+             # Now take memory snapshot after NCCL is initialized
+             gc.collect()
+             torch.accelerator.empty_cache()
++            trim_host_heap()
+ 
+             # take current memory snapshot
+             self.init_snapshot = init_snapshot = MemorySnapshot(device=self.device)
+@@ -648,6 +650,7 @@ class Worker(WorkerBase):
+             gc.collect()
+             torch.accelerator.synchronize()
+             torch.accelerator.empty_cache()
++            trim_host_heap()
+ 
+     def advance_b12x_preparation(
+         self, *, cancel_tuning: bool = False
+@@ -667,6 +670,7 @@ class Worker(WorkerBase):
+             gc.collect()
+             torch.accelerator.synchronize()
+             torch.accelerator.empty_cache()
++            trim_host_heap()
+         return outcome
+ 
+     def abort_b12x_preparation(self) -> dict[str, object]:
+@@ -760,6 +764,7 @@ class Worker(WorkerBase):
+         gc.collect()
+         torch.accelerator.synchronize()
+         torch.accelerator.empty_cache()
++        trim_host_heap()
+ 
+         # Backend and CUDA-graph profiling can initialize communication pools,
+         # compiled modules, and other persistent device allocations after the
+@@ -942,6 +947,7 @@ class Worker(WorkerBase):
+         gc.collect()
+         torch.accelerator.synchronize()
+         torch.accelerator.empty_cache()
++        trim_host_heap()
+ 
+         # Update local config with adjusted num blocks after profiling,
+         # so that it's available to the warmup stage.
+@@ -1050,8 +1056,10 @@ class Worker(WorkerBase):
+         if self.use_v2_model_runner:
+             # A workspace resize after capture frees what the graphs point at.
+             warmup_kernels(self.model_runner, self.execute_model, self.sample_tokens)
++            gc.collect()
+             torch.accelerator.synchronize()
+             torch.accelerator.empty_cache()
++            trim_host_heap()
+ 
+         cuda_graph_memory_bytes = 0
+         if not self.model_config.enforce_eager:
+@@ -1152,8 +1160,10 @@ class Worker(WorkerBase):
+                     self.sample_tokens,
+                     post_capture=True,
+                 )
++                gc.collect()
+                 torch.accelerator.synchronize()
+                 torch.accelerator.empty_cache()
++                trim_host_heap()
+         elif get_pp_group().is_last_rank:
+             # V1: Warm up sampler and preallocate memory buffer for logits and other
+             # sampling related tensors of max possible shape to avoid memory
+@@ -1194,8 +1204,6 @@ class Worker(WorkerBase):
+             self._startup_heartbeat.stop()
+             self._startup_heartbeat = None
+ 
+-        log_startup_memory_breakdown(self, cuda_graph_memory_bytes)
+-
+         # All warmup is done — start monitoring for unexpected JIT
+         # compilations that would cause latency spikes during inference.
+         from vllm.utils.jit_monitor import activate as activate_jit_monitor
+@@ -1211,11 +1219,13 @@ class Worker(WorkerBase):
+                 "vLLM warm-up is complete"
+             )
+ 
+-        # Freeze the worker heap so the GC won't scan static objects
+-        # (model weights, KV caches, CUDA graphs) during inference.
++        # Freeze the worker heap and trim host arenas before logging the
++        # steady-state startup memory breakdown.
+         freeze_gc_heap()
+         maybe_attach_gc_debug_callback()
+ 
++        log_startup_memory_breakdown(self, cuda_graph_memory_bytes)
++
+         # Warmup / first-compile is done — activate the `VLLM_GPU_SYNC_CHECK`
+         # gate so subsequent `execute_model` / `sample_tokens` calls enforce it.
+         enable_gpu_sync_check()
+-- 
+2.43.0
+
