@@ -96,6 +96,17 @@ Coordinate through `~/spark-hold.json` on dgx1:
 Inside a window, run jobs back to back without restoring the promoted service in
 between; restore it once, when the window closes. See `docs/lab.md`.
 
+Existing groups with disjoint physical nodes may run concurrently under explicit
+pool reservations. Each reservation must name its nodes, exact holder and token,
+published controller, restore profile and commit, and independent restoration
+watchdog. Check the dgx1 hold and every participating node's hold before acting.
+An unscoped hold remains global: only its holder may record a verified node scope;
+never infer an exemption from an idle GPU or an absent local hold. The coordinator
+records the disjoint allocations in `~/spark-coordination.json` on dgx1, which is
+scheduling advice and grants no lease. Keep earlier requests attached to their
+claimed pool. Do not share a node, GPU, serving group, or timing cohort between
+owners, and restore every node in a serving group together before releasing it.
+
 ## Upstream work
 
 Never make durable changes in exported vLLM or B12X trees. Start from the commit in
@@ -113,6 +124,24 @@ Each local patch must state its upstream base, rationale, quality implications,
 tests, and upstream status. Prefer a narrowly scoped patch that can become one
 upstream commit. When upstream accepts a change, replace the local patch with the
 new upstream commit pin rather than carrying both.
+
+## Work location and disk use
+
+Keep the Mac for lightweight source editing, Git review, documentation, and small
+evidence files. Run upstream preparation, dependency installation, compilation,
+image builds, tests, and bulk downloads on the DGX or Spaceports, using published
+Git revisions and task-specific scratch paths. Check remote free space before
+starting and remove unused, regenerable artifacts after the work is preserved.
+
+Do not accumulate local prepared trees, build contexts, dependency caches, image
+archives, or bulk run outputs. Fetch only the Git refs needed for a task; avoid
+repeated broad fetches into the shared checkout. Clean up only confirmed unused
+temporary files and disposable artifacts. Preserve source changes, experiment
+evidence, active files, model weights, credentials, and other tasks' data.
+Before removing a source tree, check its registered worktrees and shared Git
+object storage; keep any Git database or alternates target another checkout uses.
+
+Remote work still follows the shared cluster window and deployment rules above.
 
 ## Safety and secrets
 
