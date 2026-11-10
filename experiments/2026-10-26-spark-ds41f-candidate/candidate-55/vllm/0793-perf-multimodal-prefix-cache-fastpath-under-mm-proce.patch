@@ -1,0 +1,1350 @@
+From 23c4e75aa3d58247720d07d4be923499768e2f1d Mon Sep 17 00:00:00 2001
+From: Christopher Owen <christopherowen@users.noreply.github.com>
+Date: Sun, 8 Nov 2026 14:53:04 +0000
+Subject: [PATCH] perf(multimodal): prefix-cache fastpath under
+ --mm-processor-cache-gb 0
+
+Base: 1107 vLLM patch head 320021e3c4dbb202d911ab70e2cd924c75420488.
+
+Rationale:
+When serving multimodal workloads on 128 GB unified-memory Sparks with --mm-processor-cache-gb 0 and --enable-prefix-caching, every follow-up turn (Turn 2+) in a multi-turn chat completion conversation previously re-ran three expensive host stages even when Turn 1 already populated the P1 prefix cache or encoder cache for the same mm_hash:
+1. ImageMediaIO.load_bytes() ran full PIL pixel decompression (Image.open + image.load() + RGB mode conversion) on every turn before reaching the processor.
+2. BaseMultiModalProcessor._cached_apply_hf_processor() saw self.cache is None and fell back to _apply_hf_processor(), running full CPU image padding, normalization, and patch tensor extraction (~10 MB per image) just to recompute the prompt placeholder token expansion.
+3. AsyncLLM serialized the full ~10-41 MB pixel/patch tensors over ZMQ IPC to EngineCore on every turn, only for Scheduler._update_from_kv_cache() and strip_covered_mm_data() to discard those tensors on a prefix cache hit before sending SchedulerOutput to the worker.
+
+Introduce a zero-tensor-footprint multimodal prefix-cache fastpath under --mm-processor-cache-gb 0:
+1. Use multithreaded blake3(max_threads=blake3.AUTO) in MultiModalHasher.get_hasher().
+2. Add a bounded LRU validated-header cache (_VALIDATED_IMAGE_META_CACHE) and _LazyPILImage in ImageMediaIO.load_bytes() so repeat image bytes skip pixel decompression unless pixel access is actually requested.
+3. Add a bounded LRU metadata-only cache (_prefix_metadata_cache, ~2 KB/image) on BaseMultiModalProcessor storing only keep_on_cpu fields and ResolvedPromptUpdate token expansions per mm_hash, returning a lazy MultiModalKwargsItem on repeat turns without running the HF image processor.
+4. Track P1-resident mm_hash identifiers in AsyncLLM and strip device tensors before ZMQ IPC serialization on Turn 2+, with automatic self-healing in Scheduler/EngineCore/AsyncLLM (MMCacheMissError -> mm_cache_miss_hashes -> P0 lazy materialization and transparent resubmit) if P1 ever evicts both the KV prefix blocks and encoder cache entry.
+
+Quality:
+Bit- and token-identical prompt token expansions, mm_hashes, and KV block hashes. Cold Turn 1 requests execute the exact full processor pipeline; warm Turn 2+ requests that hit in P1 prefix or encoder cache skip redundant host pixel decode, tensor normalization, and multi-megabyte ZMQ tensor transfers while automatically self-healing on P1 cache eviction.
+
+Tests:
+- pytest tests/multimodal/test_prefix_cache_fastpath.py tests/multimodal/test_hasher.py tests/multimodal/media/test_image.py tests/multimodal/test_cache.py tests/models/test_deepseek_v4_1_image_span.py (45 passed across 2 boots).
+
+Upstream status: local multimodal prefix-cache host fastpath for unified-memory GB10 nodes.
+---
+ .../multimodal/test_prefix_cache_fastpath.py  | 380 ++++++++++++++++++
+ vllm/multimodal/hasher.py                     |   2 +-
+ vllm/multimodal/inputs.py                     |  96 ++++-
+ vllm/multimodal/media/image.py                | 159 +++++++-
+ vllm/multimodal/processing/processor.py       | 181 ++++++++-
+ vllm/renderers/base.py                        |   3 +
+ vllm/v1/core/sched/scheduler.py               |  24 ++
+ vllm/v1/engine/async_llm.py                   | 121 ++++++
+ vllm/v1/engine/core.py                        |  82 +++-
+ 9 files changed, 1040 insertions(+), 8 deletions(-)
+ create mode 100644 tests/multimodal/test_prefix_cache_fastpath.py
+
+diff --git a/tests/multimodal/test_prefix_cache_fastpath.py b/tests/multimodal/test_prefix_cache_fastpath.py
+new file mode 100644
+index 000000000..81f3471a4
+--- /dev/null
++++ b/tests/multimodal/test_prefix_cache_fastpath.py
+@@ -0,0 +1,380 @@
++# SPDX-License-Identifier: Apache-2.0
++# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
++
++import asyncio
++from io import BytesIO
++from types import SimpleNamespace
++from unittest.mock import MagicMock, patch
++
++import numpy as np
++import pybase64
++import pytest
++import torch
++from blake3 import blake3
++from PIL import Image, ImageOps
++
++from vllm.multimodal.hasher import MultiModalHasher, _get_hasher_factory
++from vllm.multimodal.inputs import (
++    MultiModalFieldConfig,
++    MultiModalFlatField,
++    MultiModalKwargsItem,
++    MultiModalKwargsItems,
++    MultiModalSharedField,
++    PlaceholderRange,
++)
++from vllm.multimodal.media.image import (
++    _VALIDATED_IMAGE_META_CACHE,
++    ImageMediaIO,
++    _LazyPILImage,
++)
++from vllm.v1.engine import EngineCoreOutput, EngineCoreOutputs, EngineCoreRequest, FinishReason
++from vllm.v1.engine.async_llm import AsyncLLM
++from vllm.v1.engine.core import EngineCore
++from vllm.v1.structured_output.backend_types import StructuredOutputKey
++
++
++def _make_png_bytes(width: int = 256, height: int = 256, seed: int = 42, mode: str = "RGB") -> bytes:
++    rng = np.random.default_rng(seed)
++    channels = 4 if mode == "RGBA" else 3
++    arr = rng.integers(0, 256, size=(height, width, channels), dtype=np.uint8)
++    img = Image.fromarray(arr, mode=mode)
++    buf = BytesIO()
++    img.save(buf, format="PNG")
++    return buf.getvalue()
++
++
++def test_parallel_blake3_hasher_equivalence():
++    _get_hasher_factory.cache_clear()
++    factory = _get_hasher_factory("blake3")
++    raw_bytes = _make_png_bytes(512, 512, seed=7)
++    b64_data = pybase64.b64encode(raw_bytes).decode("ascii")
++
++    media_io = ImageMediaIO()
++    loaded = media_io.load_base64("image/png", b64_data)
++
++    digest_fast = MultiModalHasher.hash_kwargs(
++        "blake3",
++        model_id="deepseek-v4.1",
++        image=loaded,
++    )
++
++    expected_hasher = blake3(max_threads=1)
++    for k, v in sorted({"model_id": "deepseek-v4.1", "image": loaded}.items()):
++        for chunk in MultiModalHasher.iter_item_to_bytes(k, v):
++            expected_hasher.update(chunk)
++    assert digest_fast == expected_hasher.hexdigest()
++    assert factory().hexdigest() == blake3().hexdigest()
++
++
++def test_image_media_io_validated_header_cache_and_lazy_pil():
++    _VALIDATED_IMAGE_META_CACHE.clear()
++    media_io = ImageMediaIO()
++
++    with pytest.raises(ValueError, match="Failed to load image"):
++        media_io.load_bytes(b"not-a-valid-image-payload")
++
++    raw_bytes = _make_png_bytes(320, 240, seed=99, mode="RGBA")
++    # Turn 1: cold validation -> eager PIL decode + RGBA->RGB conversion
++    turn1 = media_io.load_bytes(raw_bytes)
++    assert isinstance(turn1.media, Image.Image)
++    assert not isinstance(turn1.media, _LazyPILImage)
++    assert turn1.media.size == (320, 240)
++    assert turn1.media.mode == "RGB"
++    assert turn1.io_config == {
++        "image_mode": "RGB",
++        "rgba_background_color": (255, 255, 255),
++    }
++
++    # Turn 2: warm validation cache -> returns _LazyPILImage without Image.open
++    with patch("vllm.multimodal.media.image.Image.open", side_effect=AssertionError("should not decode")) as mock_open:
++        turn2 = media_io.load_bytes(raw_bytes)
++        assert mock_open.call_count == 0
++        assert isinstance(turn2.media, Image.Image)
++        assert isinstance(turn2.media, _LazyPILImage)
++        assert not turn2.media.is_materialized
++        assert turn2.media.size == (320, 240)
++        assert turn2.media.width == 320
++        assert turn2.media.height == 240
++        assert turn2.media.mode == "RGB"
++        assert len(turn2.media.getexif()) == 0
++        assert turn2.io_config == turn1.io_config
++        assert not turn2.media.is_materialized
++
++    # On-demand materialization when pixel data is requested
++    padded = ImageOps.pad(turn2.media, (320, 240))
++    assert turn2.media.is_materialized
++    np.testing.assert_array_equal(np.asarray(turn1.media), np.asarray(turn2.media))
++    np.testing.assert_array_equal(np.asarray(turn1.media), np.asarray(padded))
++
++
++def test_lazy_multimodal_kwargs_item_materialization_and_stripping():
++    calls = 0
++
++    def _materialize():
++        nonlocal calls
++        calls += 1
++        return {
++            "pixel_values": MultiModalFieldConfig.flat("image", [slice(0, 4)]).build_elems(
++                " pixel_values", torch.ones((4, 8), dtype=torch.float32)
++            )[0],
++            "image_grid_thw": MultiModalFieldConfig.shared(
++                "image", 1, keep_on_cpu=True
++            ).build_elems("image_grid_thw", torch.tensor([1, 2, 2]))[0],
++        }
++
++    cpu_elem = MultiModalFieldConfig.shared("image", 1, keep_on_cpu=True).build_elems(
++        "image_grid_thw", torch.tensor([1, 2, 2])
++    )[0]
++
++    lazy_item = MultiModalKwargsItem(
++        lazy_materializer=_materialize,
++        lazy_mm_hash="hash-abc",
++        keep_on_cpu_elems={"image_grid_thw": cpu_elem},
++    )
++    assert lazy_item.is_lazy
++    assert calls == 0
++
++    # Stripping for non-MRoPE returns None without materializing
++    assert lazy_item.get_stripped_for_prefix_cache(uses_mrope=False) is None
++    assert lazy_item.is_lazy
++    assert calls == 0
++
++    # Stripping for MRoPE returns CPU-only metadata without materializing pixel_values
++    stripped_mrope = lazy_item.get_stripped_for_prefix_cache(uses_mrope=True)
++    assert stripped_mrope is not None
++    assert not stripped_mrope.is_lazy
++    assert list(stripped_mrope.keys()) == ["image_grid_thw"]
++    assert calls == 0
++
++    # Accessing keys/items/getitem materializes automatically
++    assert "pixel_values" in lazy_item
++    assert not lazy_item.is_lazy
++    assert calls == 1
++    assert lazy_item["pixel_values"].data.shape == (4, 8)
++
++
++def test_async_llm_and_engine_core_strip_and_self_heal():
++    from vllm.multimodal.cache import MultiModalCacheMissError
++    from vllm.multimodal.inputs import MultiModalFeatureSpec
++
++    materialized_calls = 0
++
++    def _make_lazy_feature():
++        def _mat():
++            nonlocal materialized_calls
++            materialized_calls += 1
++            return {
++                "image_patches": MultiModalFieldConfig.shared("image", 1).build_elems(
++                    "image_patches", torch.ones((2, 16), dtype=torch.bfloat16)
++                )[0]
++            }
++
++        item = MultiModalKwargsItem(
++            lazy_materializer=_mat,
++            lazy_mm_hash="mm-hash-1",
++            keep_on_cpu_elems={},
++        )
++        return MultiModalFeatureSpec(
++            data=item,
++            modality="image",
++            identifier="mm-hash-1",
++            mm_position=PlaceholderRange(offset=4, length=10),
++            mm_hash="mm-hash-1",
++        )
++
++    class _DummyAsyncLLM:
++        def __init__(self):
++            self._p1_cached_mm_identifiers = set()
++            self._pending_mm_retries = {}
++            self.model_config = SimpleNamespace(uses_mrope=False)
++            self.renderer = SimpleNamespace(_mm_executor=None)
++
++        _prepare_mm_features_for_prefix_cache = (
++            AsyncLLM._prepare_mm_features_for_prefix_cache
++        )
++
++    dummy_llm = _DummyAsyncLLM()
++
++    # Turn 1: not yet in _p1_cached_mm_identifiers -> materializes before send
++    req1 = SimpleNamespace(
++        request_id="req-1",
++        mm_features=[_make_lazy_feature()],
++    )
++    asyncio.run(dummy_llm._prepare_mm_features_for_prefix_cache(req1))
++    assert materialized_calls == 1
++    assert req1.mm_features[0].data is not None
++    assert not req1.mm_features[0].data.is_lazy
++    assert "mm-hash-1" in dummy_llm._p1_cached_mm_identifiers
++    assert "req-1" not in dummy_llm._pending_mm_retries
++
++    # Turn 2: identifier is in _p1_cached_mm_identifiers -> strips data to None!
++    req2 = SimpleNamespace(
++        request_id="req-2",
++        mm_features=[_make_lazy_feature()],
++    )
++    asyncio.run(dummy_llm._prepare_mm_features_for_prefix_cache(req2))
++    assert materialized_calls == 1  # Still 1: zero HF processor work on Turn 2!
++    assert req2.mm_features[0].data is None
++    assert "req-2" in dummy_llm._pending_mm_retries
++
++    # Verify EngineCore._verify_or_resolve_stripped_mm_features behavior:
++    # 1) Hit in encoder_cache_manager -> accepted and pinned
++    pinned = []
++    dummy_core = SimpleNamespace(
++        vllm_config=SimpleNamespace(
++            cache_config=SimpleNamespace(enable_prefix_caching=True)
++        ),
++        scheduler=SimpleNamespace(
++            kv_cache_manager=SimpleNamespace(
++                get_computed_blocks=lambda r: (None, 0)
++            ),
++            encoder_cache_manager=SimpleNamespace(
++                cached={"mm-hash-1": set()},
++                check_and_update_cache=lambda r, idx: pinned.append((r.request_id, idx)),
++            ),
++            requests={},
++            ced_Prompt_replay_tokens=128,
++        ),
++        _has_stripped_mm_data=EngineCore._has_stripped_mm_data,
++    )
++    req2_core = SimpleNamespace(
++        request_id="req-2",
++        skip_reading_prefix_cache=False,
++        num_prompt_tokens=200,
++        mm_features=req2.mm_features,
++    )
++    EngineCore._verify_or_resolve_stripped_mm_features(dummy_core, req2_core)
++    assert pinned == [("req-2", 0)]
++
++    # 2) Evicted from encoder_cache_manager, covered by KV prefix cache beyond CED replay window -> accepted
++    dummy_core.scheduler.encoder_cache_manager.cached.clear()
++    dummy_core.scheduler.kv_cache_manager.get_computed_blocks = lambda r: (None, 160)
++    # offset=4, length=10 => end=14 <= min(160, 200-128=72) => covered!
++    EngineCore._verify_or_resolve_stripped_mm_features(dummy_core, req2_core)
++
++    # 3) Evicted from both encoder_cache_manager and kv_cache_manager -> raises MultiModalCacheMissError
++    dummy_core.scheduler.kv_cache_manager.get_computed_blocks = lambda r: (None, 0)
++    with pytest.raises(MultiModalCacheMissError) as exc_info:
++        EngineCore._verify_or_resolve_stripped_mm_features(dummy_core, req2_core)
++    assert exc_info.value.mm_hashes == ["mm-hash-1"]
++
++    # And the saved retry materializer in _pending_mm_retries self-heals req2 on demand:
++    saved_req, materializers = dummy_llm._pending_mm_retries.pop("req-2")
++    saved_req.mm_features[0].data = materializers["mm-hash-1"]()
++    assert materialized_calls == 2
++    assert saved_req.mm_features[0].data is not None
++    assert "image_patches" in saved_req.mm_features[0].data
++
++
++def test_base_mm_processor_prefix_metadata_cache_turn2_skip():
++    from vllm.multimodal.parse import MultiModalDataParser
++    from vllm.multimodal.processing.context import TimingContext
++    from vllm.multimodal.processing.inputs import ProcessorInputs
++    from vllm.multimodal.processing.processor import (
++        BaseMultiModalProcessor,
++        PromptReplacement,
++        PromptUpdateDetails,
++    )
++    from transformers.feature_extraction_utils import BatchFeature
++
++    hf_calls = 0
++
++    class _DummyTokenizer:
++        def encode(self, text, **kwargs):
++            return [ord(c) for c in text]
++
++        def decode(self, ids, **kwargs):
++            return "".join(chr(i) for i in ids)
++
++    class _DummyInfo:
++        model_id = "dummy-vl"
++
++        def __init__(self):
++            self.ctx = SimpleNamespace(
++                tokenizer=_DummyTokenizer(),
++                vllm_config=SimpleNamespace(
++                    cache_config=SimpleNamespace(enable_prefix_caching=True)
++                ),
++                get_mm_config=lambda: SimpleNamespace(mm_hasher_algorithm="blake3"),
++            )
++
++        def get_tokenizer(self):
++            return self.ctx.tokenizer
++
++        def get_data_parser(self):
++            return MultiModalDataParser()
++
++        def parse_mm_data(self, mm_data, validate=True):
++            parser = self.get_data_parser()
++            return parser.parse_mm_data(mm_data)
++
++    class _DummyProcessor(BaseMultiModalProcessor):
++        def _apply_hf_processor_main(self, mm_items, hf_processor_mm_kwargs, **kwargs):
++            nonlocal hf_calls
++            hf_calls += 1
++            n = mm_items.get_count("image", strict=False)
++            return BatchFeature(
++                {
++                    "patches": torch.ones((n * 4, 8), dtype=torch.bfloat16),
++                    "patch_sizes": torch.tensor([4] * n, dtype=torch.long),
++                    "types": torch.ones((n * 6,), dtype=torch.long),
++                    "types_sizes": torch.tensor([6] * n, dtype=torch.long),
++                }
++            )
++
++        def _get_mm_fields_config(self, hf_inputs, hf_processor_mm_kwargs):
++            patch_sizes = hf_inputs.get("patch_sizes", torch.empty(0, dtype=torch.long))
++            types_sizes = hf_inputs.get("types_sizes", torch.empty(0, dtype=torch.long))
++            return {
++                "patches": MultiModalFieldConfig.flat_from_sizes("image", patch_sizes),
++                "types": MultiModalFieldConfig.flat_from_sizes(
++                    "image", types_sizes, keep_on_cpu=True
++                ),
++            }
++
++        def _get_prompt_updates(self, mm_items, hf_processor_mm_kwargs, out_mm_kwargs):
++            def _repl(item_idx: int):
++                n_toks = out_mm_kwargs["image"][item_idx]["types"].data.numel()
++                return PromptUpdateDetails.select_token_id([999] * n_toks, 999)
++
++            return [
++                PromptReplacement(
++                    modality="image",
++                    target=[ord("@")],
++                    replacement=_repl,
++                )
++            ]
++
++    proc = _DummyProcessor(_DummyInfo(), dummy_inputs=MagicMock(), cache=None)
++    media_io = ImageMediaIO()
++    raw_bytes = _make_png_bytes(128, 128, seed=123)
++    img1 = media_io.load_bytes(raw_bytes)
++
++    # Turn 1: runs _apply_hf_processor_main once
++    inputs1 = ProcessorInputs(
++        prompt=[ord("A"), ord("@"), ord("B")],
++        mm_data_items=proc.info.parse_mm_data({"image": [img1]}),
++    )
++    out1 = proc.apply(inputs1, TimingContext())
++    assert hf_calls == 1
++    assert out1["prompt_token_ids"] == [ord("A"), *([999] * 6), ord("B")]
++    assert not out1["mm_kwargs"]["image"][0].is_lazy
++
++    # Turn 2 with same image: skips _apply_hf_processor_main completely!
++    img2 = media_io.load_bytes(raw_bytes)
++    inputs2 = ProcessorInputs(
++        prompt=[ord("A"), ord("@"), ord("B"), ord("C")],
++        mm_data_items=proc.info.parse_mm_data({"image": [img2]}),
++    )
++    out2 = proc.apply(inputs2, TimingContext())
++    assert hf_calls == 1  # Zero HF processor calls on Turn 2!
++    assert out2["prompt_token_ids"] == [ord("A"), *([999] * 6), ord("B"), ord("C")]
++    assert out2["mm_hashes"] == out1["mm_hashes"]
++    assert out2["mm_placeholders"] == out1["mm_placeholders"]
++    lazy_kw = out2["mm_kwargs"]["image"][0]
++    assert lazy_kw.is_lazy
++
++    # Materializes on demand if accessed directly
++    assert torch.equal(lazy_kw["patches"].data, out1["mm_kwargs"]["image"][0]["patches"].data)
++    assert not lazy_kw.is_lazy
++    assert hf_calls == 2
+diff --git a/vllm/multimodal/hasher.py b/vllm/multimodal/hasher.py
+index a432afdc9..09e806cb6 100644
+--- a/vllm/multimodal/hasher.py
++++ b/vllm/multimodal/hasher.py
+@@ -38,7 +38,7 @@ def _get_hasher_factory(
+     if algorithm == "blake3":
+         from blake3 import blake3
+ 
+-        return blake3
++        return functools.partial(blake3, max_threads=blake3.AUTO)
+     elif algorithm == "sha256":
+         return hashlib.sha256
+     elif algorithm == "sha512":
+diff --git a/vllm/multimodal/inputs.py b/vllm/multimodal/inputs.py
+index bd1fc169d..34a30a009 100644
+--- a/vllm/multimodal/inputs.py
++++ b/vllm/multimodal/inputs.py
+@@ -3,7 +3,7 @@
+ 
+ from abc import ABC, abstractmethod
+ from collections import UserDict, defaultdict
+-from collections.abc import Mapping, Sequence
++from collections.abc import Callable, Mapping, Sequence
+ from dataclasses import dataclass
+ from functools import cached_property, partial
+ from itertools import accumulate
+@@ -890,6 +890,98 @@ class MultiModalKwargsItem(UserDict[str, MultiModalFieldElem]):
+     [`MultiModalDataItems`][vllm.multimodal.parse.MultiModalDataItems].
+     """
+ 
++    def __init__(
++        self,
++        dict: Mapping[str, MultiModalFieldElem] | None = None,
++        /,
++        *,
++        lazy_materializer: Callable[[], Mapping[str, MultiModalFieldElem]] | None = None,
++        lazy_mm_hash: str | None = None,
++        keep_on_cpu_elems: Mapping[str, MultiModalFieldElem] | None = None,
++    ) -> None:
++        self._lazy_materializer = None
++        super().__init__(dict)
++        self._lazy_materializer = lazy_materializer
++        self._lazy_mm_hash = lazy_mm_hash
++        self._keep_on_cpu_elems = (
++            {k: v for k, v in keep_on_cpu_elems.items()}
++            if keep_on_cpu_elems is not None
++            else None
++        )
++
++    @property
++    def is_lazy(self) -> bool:
++        return self._lazy_materializer is not None
++
++    def materialize(self) -> None:
++        materializer = self._lazy_materializer
++        if materializer is not None:
++            self._lazy_materializer = None
++            self.data.update(materializer())
++
++    def materialize_and_get(self) -> "MultiModalKwargsItem":
++        self.materialize()
++        return self
++
++    def get_stripped_for_prefix_cache(
++        self, uses_mrope: bool = False
++    ) -> "MultiModalKwargsItem | None":
++        if not uses_mrope:
++            return None
++        if self._keep_on_cpu_elems is not None:
++            return MultiModalKwargsItem(self._keep_on_cpu_elems)
++        self.materialize()
++        return MultiModalKwargsItem(
++            {k: elem for k, elem in self.data.items() if elem.field.keep_on_cpu}
++        )
++
++    def __getitem__(self, key: str) -> MultiModalFieldElem:
++        if self._lazy_materializer is not None:
++            self.materialize()
++        return super().__getitem__(key)
++
++    def __iter__(self):
++        if self._lazy_materializer is not None:
++            self.materialize()
++        return super().__iter__()
++
++    def __len__(self) -> int:
++        if self._lazy_materializer is not None:
++            self.materialize()
++        return super().__len__()
++
++    def __contains__(self, key: object) -> bool:
++        if self._lazy_materializer is not None:
++            self.materialize()
++        return super().__contains__(key)
++
++    def keys(self):
++        if self._lazy_materializer is not None:
++            self.materialize()
++        return super().keys()
++
++    def items(self):
++        if self._lazy_materializer is not None:
++            self.materialize()
++        return super().items()
++
++    def values(self):
++        if self._lazy_materializer is not None:
++            self.materialize()
++        return super().values()
++
++    def get(self, key: str, default: Any = None) -> Any:
++        if self._lazy_materializer is not None:
++            self.materialize()
++        return super().get(key, default)
++
++    def __eq__(self, other: object) -> bool:
++        if self._lazy_materializer is not None:
++            self.materialize()
++        if isinstance(other, MultiModalKwargsItem) and other._lazy_materializer is not None:
++            other.materialize()
++        return super().__eq__(other)
++
+     @staticmethod
+     def dummy(nbytes: int = 1):
+         """Convenience class for testing."""
+@@ -900,6 +992,8 @@ class MultiModalKwargsItem(UserDict[str, MultiModalFieldElem]):
+         return MultiModalKwargsItem({"dummy": mm_elem})
+ 
+     def get_data(self) -> dict[str, NestedTensors]:
++        if self._lazy_materializer is not None:
++            self.materialize()
+         return {key: elem.data for key, elem in self.items()}
+ 
+ 
+diff --git a/vllm/multimodal/media/image.py b/vllm/multimodal/media/image.py
+index 5b05176f5..4af3fa41f 100644
+--- a/vllm/multimodal/media/image.py
++++ b/vllm/multimodal/media/image.py
+@@ -2,12 +2,16 @@
+ # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+ 
+ import math
++import threading
++from collections import OrderedDict
++from collections.abc import Callable
+ from io import BytesIO
+ from pathlib import Path
+ 
+ import numpy as np
+ import pybase64
+ import torch
++from blake3 import blake3
+ from PIL import Image
+ 
+ import vllm.envs as envs
+@@ -23,6 +27,112 @@ from .base import MediaIO, MediaWithBytes
+ MAGIC_NUMPY_PREFIX = b"\x93NUMPY"  # https://numpy.org/devdocs/reference/generated/numpy.lib.format.html#format-version-1-0
+ 
+ 
++_VALIDATED_IMAGE_META_MAX_ENTRIES = 512
++_VALIDATED_IMAGE_META_CACHE: OrderedDict[
++    tuple[bytes, str | None, tuple[int, int, int], int],
++    tuple[tuple[int, int], str, dict[str, object] | None],
++] = OrderedDict()
++_VALIDATED_IMAGE_META_LOCK = threading.Lock()
++
++
++class _LazyPILImage(Image.Image):
++    """A PIL.Image subclass for previously validated image bytes that exposes
++    `.size`, `.width`, `.height`, and `.mode` without decoding pixel data,
++    materializing the underlying PIL Image on demand if pixel operations are
++    invoked.
++    """
++
++    def __init__(
++        self,
++        raw_bytes: bytes,
++        loader: Callable[[bytes], Image.Image],
++        size: tuple[int, int],
++        mode: str,
++    ) -> None:
++        super().__init__()
++        self._raw_bytes = raw_bytes
++        self._loader = loader
++        self._size = size
++        self._mode = mode
++        self._materialized: Image.Image | None = None
++
++    @property
++    def is_materialized(self) -> bool:
++        return self._materialized is not None
++
++    def _materialize(self) -> Image.Image:
++        img = self._materialized
++        if img is None:
++            img = self._loader(self._raw_bytes)
++            self.im = img.im
++            self._mode = img.mode
++            self._size = img.size
++            self.info = img.info
++            self.palette = img.palette
++            self.readonly = img.readonly
++            self._exif = getattr(img, "_exif", None)
++            self._materialized = img
++        return img
++
++    def getexif(self) -> Image.Exif:
++        if self._materialized is not None:
++            return self._materialized.getexif()
++        return Image.Exif()
++
++    def load(self):
++        return self._materialize().load()
++
++    def copy(self) -> Image.Image:
++        return self._materialize().copy()
++
++    def convert(self, *args, **kwargs) -> Image.Image:
++        return self._materialize().convert(*args, **kwargs)
++
++    def resize(self, *args, **kwargs) -> Image.Image:
++        return self._materialize().resize(*args, **kwargs)
++
++    def crop(self, *args, **kwargs) -> Image.Image:
++        return self._materialize().crop(*args, **kwargs)
++
++    def draft(self, *args, **kwargs):
++        return self._materialize().draft(*args, **kwargs)
++
++    def thumbnail(self, *args, **kwargs) -> None:
++        self._materialize().thumbnail(*args, **kwargs)
++        self._size = self._materialized.size
++
++    def save(self, *args, **kwargs) -> None:
++        self._materialize().save(*args, **kwargs)
++
++    def tobytes(self, *args, **kwargs) -> bytes:
++        return self._materialize().tobytes(*args, **kwargs)
++
++    def getdata(self, *args, **kwargs):
++        return self._materialize().getdata(*args, **kwargs)
++
++    def getpixel(self, *args, **kwargs):
++        return self._materialize().getpixel(*args, **kwargs)
++
++    def putpixel(self, *args, **kwargs) -> None:
++        self._materialize().putpixel(*args, **kwargs)
++
++    def split(self):
++        return self._materialize().split()
++
++    def getbands(self) -> tuple[str, ...]:
++        return Image.getmodebands(self.mode)
++
++    def getbbox(self, *args, **kwargs):
++        return self._materialize().getbbox(*args, **kwargs)
++
++    def getextrema(self):
++        return self._materialize().getextrema()
++
++    @property
++    def __array_interface__(self):
++        return self._materialize().__array_interface__
++
++
+ class ImageMediaIO(MediaIO[Image.Image]):
+     """Configuration values can be user-provided either by --media-io-kwargs or
+     by the runtime API field "media_io_kwargs". Ensure proper validation and
+@@ -82,7 +192,9 @@ class ImageMediaIO(MediaIO[Image.Image]):
+         scale = math.sqrt(max_pixels / (w * h))
+         return max(1, int(math.floor(w * scale))), max(1, int(math.floor(h * scale)))
+ 
+-    def load_bytes(self, data: bytes) -> MediaWithBytes[Image.Image]:
++    def _decode_and_convert_bytes(
++        self, data: bytes
++    ) -> tuple[Image.Image, dict[str, object] | None]:
+         try:
+             image = Image.open(BytesIO(data))
+             w, h = image.size
+@@ -104,7 +216,7 @@ class ImageMediaIO(MediaIO[Image.Image]):
+         except (OSError, Image.UnidentifiedImageError) as e:
+             raise ValueError(f"Failed to load image: {e}") from e
+ 
+-        io_config = None
++        io_config: dict[str, object] | None = None
+         if converted is not image:
+             io_config = {
+                 "image_mode": self.image_mode,
+@@ -112,6 +224,49 @@ class ImageMediaIO(MediaIO[Image.Image]):
+             }
+         if downscaled:
+             io_config = {**(io_config or {}), "max_pixels": max_pixels}
++        return converted, io_config
++
++    def load_bytes(self, data: bytes) -> MediaWithBytes[Image.Image]:
++        max_pixels = envs.VLLM_MAX_IMAGE_PIXELS
++        digest = (
++            blake3(data, max_threads=blake3.AUTO).digest()
++            if len(data) >= 524288
++            else blake3(data).digest()
++        )
++        cache_key = (
++            digest,
++            self.image_mode,
++            self.rgba_background_color,
++            max_pixels,
++        )
++        with _VALIDATED_IMAGE_META_LOCK:
++            cached = _VALIDATED_IMAGE_META_CACHE.get(cache_key)
++            if cached is not None:
++                _VALIDATED_IMAGE_META_CACHE.move_to_end(cache_key)
++
++        if cached is not None:
++            size, mode, cached_io_config = cached
++            io_config = dict(cached_io_config) if cached_io_config is not None else None
++            lazy_img = _LazyPILImage(
++                data,
++                lambda raw: self._decode_and_convert_bytes(raw)[0],
++                size,
++                mode,
++            )
++            return MediaWithBytes(lazy_img, data, io_config)
++
++        converted, io_config = self._decode_and_convert_bytes(data)
++        if Image.ExifTags.Base.ImageID not in converted.getexif():
++            with _VALIDATED_IMAGE_META_LOCK:
++                _VALIDATED_IMAGE_META_CACHE[cache_key] = (
++                    converted.size,
++                    converted.mode,
++                    dict(io_config) if io_config is not None else None,
++                )
++                _VALIDATED_IMAGE_META_CACHE.move_to_end(cache_key)
++                while len(_VALIDATED_IMAGE_META_CACHE) > _VALIDATED_IMAGE_META_MAX_ENTRIES:
++                    _VALIDATED_IMAGE_META_CACHE.popitem(last=False)
++
+         return MediaWithBytes(converted, data, io_config)
+ 
+     def load_base64(self, media_type: str, data: str) -> MediaWithBytes[Image.Image]:
+diff --git a/vllm/multimodal/processing/processor.py b/vllm/multimodal/processing/processor.py
+index 3db820458..ed4ff014a 100644
+--- a/vllm/multimodal/processing/processor.py
++++ b/vllm/multimodal/processing/processor.py
+@@ -1,7 +1,8 @@
+ # SPDX-License-Identifier: Apache-2.0
+ # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+ from abc import ABC, abstractmethod
+-from collections import defaultdict, deque
++import threading
++from collections import OrderedDict, defaultdict, deque
+ from collections.abc import Callable, Generator, ItemsView, Iterable, Mapping, Sequence
+ from dataclasses import dataclass, field, replace
+ from enum import Enum
+@@ -31,6 +32,7 @@ from vllm.utils.collection_utils import flatten_2d_lists, full_groupby
+ 
+ from ..inputs import (
+     MultiModalFieldConfig,
++    MultiModalFieldElem,
+     MultiModalKwargsItem,
+     MultiModalKwargsItems,
+     MultiModalKwargsOptionalItems,
+@@ -1057,6 +1059,15 @@ class BaseMultiModalProcessor(ABC, Generic[_I]):
+         self.cache = cache
+ 
+         self.data_parser = self.info.get_data_parser()
++        self._prefix_metadata_cache_max_entries = 512
++        self._prefix_metadata_cache: OrderedDict[
++            str, tuple[dict[str, MultiModalFieldElem], Sequence[ResolvedPromptUpdate]]
++        ] = OrderedDict()
++        self._prefix_metadata_lock = threading.Lock()
++
++    def clear_prefix_metadata_cache(self) -> None:
++        with self._prefix_metadata_lock:
++            self._prefix_metadata_cache.clear()
+ 
+     def __call__(
+         self,
+@@ -1399,6 +1410,164 @@ class BaseMultiModalProcessor(ABC, Generic[_I]):
+ 
+         return mm_info
+ 
++    def _apply_hf_processor_with_prefix_metadata_cache(
++        self,
++        inputs: ProcessorInputs,
++        timing_ctx: TimingContext,
++    ) -> MultiModalProcessingInfo:
++        with timing_ctx.record("get_mm_hashes"):
++            mm_hashes = inputs.get_mm_hashes(
++                self.info.model_id,
++                self.info.ctx.get_mm_config().mm_hasher_algorithm,
++            )
++
++        mm_is_cached: dict[str, list[bool]] = {}
++        mm_missing_data: dict[str, list[object]] = {}
++        has_missing = False
++        any_cached = False
++        with self._prefix_metadata_lock:
++            for modality, hashes in mm_hashes.items():
++                modality_items = inputs.mm_data_items.get(modality, [])
++                is_cached_list: list[bool] = []
++                missing_list: list[object] = []
++                for idx, item_hash in enumerate(hashes):
++                    raw_item = modality_items[idx] if idx < len(modality_items) else None
++                    cached = (
++                        raw_item is not None
++                        and item_hash in self._prefix_metadata_cache
++                    )
++                    if cached:
++                        any_cached = True
++                        self._prefix_metadata_cache.move_to_end(item_hash)
++                    else:
++                        if raw_item is None:
++                            raise ValueError(
++                                f"Cache miss for {modality} at index {idx} "
++                                f"but data is not provided."
++                            )
++                        missing_list.append(raw_item)
++                        has_missing = True
++                    is_cached_list.append(cached)
++                mm_is_cached[modality] = is_cached_list
++                mm_missing_data[modality] = missing_list
++
++        if has_missing:
++            if not any_cached:
++                mm_missing_data_items = inputs.mm_data_items
++            else:
++                mm_missing_data_items = self.info.parse_mm_data(
++                    mm_missing_data, validate=False
++                )
++            with timing_ctx.record("apply_hf_processor"):
++                mm_missing_processed_data = self._apply_hf_processor_main(
++                    mm_items=mm_missing_data_items,
++                    hf_processor_mm_kwargs=inputs.hf_processor_mm_kwargs,
++                )
++            mm_missing_kwargs = MultiModalKwargsItems.from_hf_inputs(
++                mm_missing_processed_data,
++                self._get_mm_fields_config(
++                    mm_missing_processed_data, inputs.hf_processor_mm_kwargs
++                ),
++            )
++            mm_missing_prompt_updates = self._get_mm_prompt_updates(
++                mm_missing_data_items,
++                inputs.hf_processor_mm_kwargs,
++                mm_missing_kwargs,
++            )
++        else:
++            mm_missing_kwargs = MultiModalKwargsItems()
++            mm_missing_prompt_updates = {}
++
++        mm_missing_next_idx = defaultdict[str, int](lambda: 0)
++        merged_kwargs = defaultdict[str, list[MultiModalKwargsItem | None]](list)
++        merged_prompt_updates = defaultdict[str, list[Sequence[ResolvedPromptUpdate]]](
++            list
++        )
++
++        for modality, hashes in mm_hashes.items():
++            missing_kwargs = mm_missing_kwargs.get(modality, [])
++            missing_prompt_updates = mm_missing_prompt_updates.get(modality, [])
++            modality_items = inputs.mm_data_items.get(modality, [])
++
++            for item_idx, item_hash in enumerate(hashes):
++                if not mm_is_cached[modality][item_idx]:
++                    missing_next_idx = mm_missing_next_idx[modality]
++                    kwargs_item = missing_kwargs[missing_next_idx]
++                    updates_item = missing_prompt_updates[missing_next_idx]
++                    mm_missing_next_idx[modality] += 1
++
++                    keep_on_cpu_elems = {
++                        k: elem
++                        for k, elem in kwargs_item.items()
++                        if elem.field.keep_on_cpu
++                    }
++                    with self._prefix_metadata_lock:
++                        self._prefix_metadata_cache[item_hash] = (
++                            keep_on_cpu_elems,
++                            updates_item,
++                        )
++                        self._prefix_metadata_cache.move_to_end(item_hash)
++                        while (
++                            len(self._prefix_metadata_cache)
++                            > self._prefix_metadata_cache_max_entries
++                        ):
++                            self._prefix_metadata_cache.popitem(last=False)
++
++                    merged_kwargs[modality].append(kwargs_item)
++                    merged_prompt_updates[modality].append(
++                        [
++                            self._recompute_cached_prompt_update(update, item_idx)
++                            for update in updates_item
++                        ]
++                    )
++                else:
++                    with self._prefix_metadata_lock:
++                        keep_on_cpu_elems, cached_updates = (
++                            self._prefix_metadata_cache[item_hash]
++                        )
++                    raw_item = modality_items[item_idx]
++                    hf_kwargs = inputs.hf_processor_mm_kwargs
++
++                    def _make_materializer(
++                        _mod: str = modality,
++                        _raw: object = raw_item,
++                        _hf_kw: Mapping[str, object] = hf_kwargs,
++                    ) -> Callable[[], Mapping[str, MultiModalFieldElem]]:
++                        def _materialize() -> Mapping[str, MultiModalFieldElem]:
++                            single_items = self.info.parse_mm_data(
++                                {_mod: [_raw]}, validate=False
++                            )
++                            processed = self._apply_hf_processor_main(
++                                mm_items=single_items,
++                                hf_processor_mm_kwargs=_hf_kw,
++                            )
++                            kw_items = MultiModalKwargsItems.from_hf_inputs(
++                                processed,
++                                self._get_mm_fields_config(processed, _hf_kw),
++                            )
++                            return kw_items[_mod][0].data
++
++                        return _materialize
++
++                    lazy_kwargs_item = MultiModalKwargsItem(
++                        lazy_materializer=_make_materializer(),
++                        lazy_mm_hash=item_hash,
++                        keep_on_cpu_elems=keep_on_cpu_elems,
++                    )
++                    merged_kwargs[modality].append(lazy_kwargs_item)
++                    merged_prompt_updates[modality].append(
++                        [
++                            self._recompute_cached_prompt_update(update, item_idx)
++                            for update in cached_updates
++                        ]
++                    )
++
++        return MultiModalProcessingInfo(
++            kwargs=MultiModalKwargsItems(merged_kwargs),
++            hashes=mm_hashes,
++            prompt_updates=dict(merged_prompt_updates),
++        )
++
+     def _cached_apply_hf_processor(
+         self,
+         inputs: ProcessorInputs,
+@@ -1411,7 +1580,15 @@ class BaseMultiModalProcessor(ABC, Generic[_I]):
+         cache = self.cache
+ 
+         _, passthrough_data = self._get_hf_mm_data(inputs.mm_data_items)
+-        if cache is None or passthrough_data:
++        if passthrough_data:
++            return self._apply_hf_processor(inputs, timing_ctx)
++        if cache is None:
++            vllm_config = getattr(self.info.ctx, "vllm_config", None)
++            cache_config = getattr(vllm_config, "cache_config", None)
++            if getattr(cache_config, "enable_prefix_caching", False):
++                return self._apply_hf_processor_with_prefix_metadata_cache(
++                    inputs, timing_ctx
++                )
+             return self._apply_hf_processor(inputs, timing_ctx)
+ 
+         with timing_ctx.record("get_mm_hashes"):
+diff --git a/vllm/renderers/base.py b/vllm/renderers/base.py
+index 4aca17fa4..2f7eedf9c 100644
+--- a/vllm/renderers/base.py
++++ b/vllm/renderers/base.py
+@@ -225,6 +225,8 @@ class BaseRenderer(ABC, Generic[_T]):
+         mm_processor_cache = self.mm_processor_cache
+         if mm_processor_cache is not None:
+             mm_processor_cache.clear_cache()
++        if self.mm_processor is not None:
++            self.mm_processor.clear_prefix_metadata_cache()
+ 
+         if self._mm_cache_stats is not None:
+             self._mm_cache_stats.reset = True
+@@ -239,6 +241,7 @@ class BaseRenderer(ABC, Generic[_T]):
+         processor_cache = processor.cache
+         if processor_cache is not None:
+             processor_cache.clear_cache()
++        processor.clear_prefix_metadata_cache()
+ 
+     def _warmup_mm_processor(
+         self,
+diff --git a/vllm/v1/core/sched/scheduler.py b/vllm/v1/core/sched/scheduler.py
+index d1015e71b..80a265a04 100644
+--- a/vllm/v1/core/sched/scheduler.py
++++ b/vllm/v1/core/sched/scheduler.py
+@@ -3415,6 +3415,30 @@ class Scheduler(SchedulerInterface):
+                 num_embeds_to_schedule += num_encoder_embeds
+                 continue
+ 
++            if mm_feature.data is None or (
++                bool(mm_feature.data)
++                and all(elem.field.keep_on_cpu for elem in mm_feature.data.values())
++            ):
++                for other_req in self.requests.values():
++                    for other_f in other_req.mm_features:
++                        if (
++                            other_f.identifier == item_identifier
++                            and other_f.data is not None
++                            and not (
++                                bool(other_f.data)
++                                and all(
++                                    elem.field.keep_on_cpu
++                                    for elem in other_f.data.values()
++                                )
++                            )
++                        ):
++                            mm_feature.data = other_f.data
++                            break
++                    if mm_feature.data is not None and not all(
++                        elem.field.keep_on_cpu for elem in mm_feature.data.values()
++                    ):
++                        break
++
+             num_embeds_to_schedule += num_encoder_embeds
+             encoder_compute_budget -= num_encoder_embeds
+             mm_hashes_to_schedule.add(item_identifier)
+diff --git a/vllm/v1/engine/async_llm.py b/vllm/v1/engine/async_llm.py
+index 2efa75eee..83f48cb2a 100644
+--- a/vllm/v1/engine/async_llm.py
++++ b/vllm/v1/engine/async_llm.py
+@@ -194,6 +194,10 @@ class AsyncLLM(EngineClient):
+             self.logger_manager.log_engine_initialized()
+ 
+         self._client_count = client_count
++        self._p1_cached_mm_identifiers: set[str] = set()
++        self._pending_mm_retries: dict[
++            str, tuple[EngineCoreRequest, dict[str, Callable[[], Any]]]
++        ] = {}
+ 
+         self.output_handler: asyncio.Task | None = None
+         try:
+@@ -526,6 +530,53 @@ class AsyncLLM(EngineClient):
+                 )
+             raise
+ 
++    async def _prepare_mm_features_for_prefix_cache(
++        self, request: EngineCoreRequest
++    ) -> None:
++        if not request.mm_features:
++            return
++        to_materialize: list[Any] = []
++        new_identifiers: list[str] = []
++        retry_materializers: dict[str, Callable[[], Any]] = {}
++        uses_mrope = self.model_config.uses_mrope
++
++        for f in request.mm_features:
++            if f.data is None:
++                continue
++            if getattr(f.data, "is_lazy", False):
++                if (
++                    f.identifier in self._p1_cached_mm_identifiers
++                    and f.mm_hash == getattr(f.data, "_lazy_mm_hash", None)
++                ):
++                    mat = f.data.materialize_and_get
++                    retry_materializers[f.identifier] = mat
++                    if f.mm_hash:
++                        retry_materializers[f.mm_hash] = mat
++                    f.data = f.data.get_stripped_for_prefix_cache(uses_mrope)
++                else:
++                    to_materialize.append(f.data)
++                    new_identifiers.append(f.identifier)
++            else:
++                new_identifiers.append(f.identifier)
++
++        if to_materialize:
++            loop = asyncio.get_running_loop()
++
++            def _materialize_batch() -> None:
++                for item in to_materialize:
++                    item.materialize()
++
++            await loop.run_in_executor(self.renderer._mm_executor, _materialize_batch)
++
++        for ident in new_identifiers:
++            self._p1_cached_mm_identifiers.add(ident)
++
++        if retry_materializers:
++            self._pending_mm_retries[request.request_id] = (
++                request,
++                retry_materializers,
++            )
++
+     async def _add_request(
+         self,
+         request: EngineCoreRequest,
+@@ -542,6 +593,13 @@ class AsyncLLM(EngineClient):
+         # Register locally before the first await so concurrent tasks see this request.
+         self.output_processor.add_request(request, prompt, parent_req, index, queue)
+ 
++        if (
++            self.renderer.mm_processor_cache is None
++            and self.vllm_config.cache_config.enable_prefix_caching
++            and request.mm_features
++        ):
++            await self._prepare_mm_features_for_prefix_cache(request)
++
+         # Add the EngineCoreRequest to EngineCore (separate process).
+         await self.engine_core.add_request_async(request)
+ 
+@@ -823,8 +881,45 @@ class AsyncLLM(EngineClient):
+         renderer = self.renderer
+         # P0 multi-modal sender ("shadow") cache; None for text-only models.
+         mm_processor_cache = renderer.mm_processor_cache
++        pending_mm_retries = self._pending_mm_retries
++        p1_cached_mm_identifiers = self._p1_cached_mm_identifiers
+         chunk_size = envs.VLLM_V1_OUTPUT_PROC_CHUNK_SIZE
+ 
++        async def _retry_mm_cache_miss(
++            retry_req: EngineCoreRequest,
++            materializers: dict[str, Callable[[], Any]],
++            missed_hashes: list[str],
++        ) -> None:
++            missed_set = set(missed_hashes)
++            for h in missed_set:
++                p1_cached_mm_identifiers.discard(h)
++            if retry_req.mm_features:
++                for f in retry_req.mm_features:
++                    if f.identifier in missed_set or f.mm_hash in missed_set:
++                        p1_cached_mm_identifiers.discard(f.identifier)
++
++            def _materialize_missed() -> None:
++                if not retry_req.mm_features:
++                    return
++                for f in retry_req.mm_features:
++                    mat = materializers.get(f.identifier) or materializers.get(
++                        f.mm_hash
++                    )
++                    if mat is not None and (
++                        f.identifier in missed_set
++                        or f.mm_hash in missed_set
++                        or f.data is None
++                    ):
++                        f.data = mat()
++
++            loop = asyncio.get_running_loop()
++            await loop.run_in_executor(renderer._mm_executor, _materialize_missed)
++            if retry_req.mm_features:
++                for f in retry_req.mm_features:
++                    if f.data is not None:
++                        p1_cached_mm_identifiers.add(f.identifier)
++            await engine_core.add_request_async(retry_req)
++
+         async def output_handler():
+             try:
+                 while True:
+@@ -843,6 +938,26 @@ class AsyncLLM(EngineClient):
+                     for start in range(0, num_outputs, chunk_size):
+                         end = start + chunk_size
+                         outputs_slice = engine_core_outputs[start:end]
++                        if pending_mm_retries:
++                            filtered_slice = []
++                            for eco in outputs_slice:
++                                if (
++                                    eco.mm_cache_miss_hashes
++                                    and eco.request_id in pending_mm_retries
++                                ):
++                                    retry_req, materializers = pending_mm_retries.pop(
++                                        eco.request_id
++                                    )
++                                    await _retry_mm_cache_miss(
++                                        retry_req,
++                                        materializers,
++                                        eco.mm_cache_miss_hashes,
++                                    )
++                                    continue
++                                if eco.finished:
++                                    pending_mm_retries.pop(eco.request_id, None)
++                                filtered_slice.append(eco)
++                            outputs_slice = filtered_slice
+                         # 2) Process EngineCoreOutputs.
+                         processed_outputs = output_processor.process_outputs(
+                             outputs_slice, outputs.timestamp, iteration_stats
+@@ -897,6 +1012,8 @@ class AsyncLLM(EngineClient):
+             (request_id,) if isinstance(request_id, str) else as_list(request_id)
+         )
+         all_request_ids = self.output_processor.abort_requests(request_ids, internal)
++        for req_id in all_request_ids:
++            self._pending_mm_retries.pop(req_id, None)
+         # Starlette StreamingResponse cancels an AnyIO scope on client
+         # disconnect. Once output_processor has removed local state, shield the
+         # EngineCore abort notification so it cannot be dropped mid-await.
+@@ -1115,12 +1232,14 @@ class AsyncLLM(EngineClient):
+         # Join the background MM warmup first: the mm_processor_cache is not
+         # safe for concurrent access with its apply/clear.
+         self.renderer._join_mm_warmup()
++        self._p1_cached_mm_identifiers.clear()
+         await self.renderer.clear_mm_cache_async()
+         await self.engine_core.reset_mm_cache_async()
+ 
+     async def reset_prefix_cache(
+         self, reset_running_requests: bool = False, reset_connector: bool = False
+     ) -> bool:
++        self._p1_cached_mm_identifiers.clear()
+         return await self.engine_core.reset_prefix_cache_async(
+             reset_running_requests, reset_connector
+         )
+@@ -1132,10 +1251,12 @@ class AsyncLLM(EngineClient):
+         return await self.engine_core.set_prefill_fairness_async(config)
+ 
+     async def reset_encoder_cache(self) -> None:
++        self._p1_cached_mm_identifiers.clear()
+         await self.engine_core.reset_encoder_cache_async()
+ 
+     async def sleep(self, level: int = 1, mode: PauseMode = "abort") -> None:
+         if level >= 1:
++            self._p1_cached_mm_identifiers.clear()
+             await self.renderer.clear_mm_cache_async()
+         await self.engine_core.sleep_async(level, mode)
+ 
+diff --git a/vllm/v1/engine/core.py b/vllm/v1/engine/core.py
+index 78ee820ac..90434dbb6 100644
+--- a/vllm/v1/engine/core.py
++++ b/vllm/v1/engine/core.py
+@@ -477,6 +477,77 @@ class EngineCore:
+             supported_pooling_tasks,
+         )
+ 
++    @staticmethod
++    def _has_stripped_mm_data(f: Any) -> bool:
++        if f.data is None:
++            return True
++        return bool(f.data) and all(
++            elem.field.keep_on_cpu for elem in f.data.values()
++        )
++
++    def _verify_or_resolve_stripped_mm_features(self, request: Request) -> None:
++        stripped_indices = [
++            i
++            for i, f in enumerate(request.mm_features)
++            if self._has_stripped_mm_data(f)
++        ]
++        if not stripped_indices:
++            return
++
++        effective_computed_tokens = 0
++        if (
++            self.vllm_config.cache_config.enable_prefix_caching
++            and not request.skip_reading_prefix_cache
++        ):
++            _, num_computed_tokens = self.scheduler.kv_cache_manager.get_computed_blocks(
++                request
++            )
++            ced_replay = getattr(self.scheduler, "ced_Prompt_replay_tokens", 0)
++            if ced_replay > 0 and num_computed_tokens > 0:
++                effective_computed_tokens = max(
++                    0, min(num_computed_tokens, request.num_prompt_tokens - ced_replay)
++                )
++            else:
++                effective_computed_tokens = num_computed_tokens
++
++        encoder_pin_indices: list[int] = []
++        resolved_data: list[tuple[int, Any]] = []
++        missing_hashes: list[str] = []
++
++        for i in stripped_indices:
++            f = request.mm_features[i]
++            if f.identifier in self.scheduler.encoder_cache_manager.cached:
++                encoder_pin_indices.append(i)
++                continue
++            if (
++                f.mm_position.offset + f.mm_position.length
++                <= effective_computed_tokens
++            ):
++                continue
++            found_data = None
++            for other_req in self.scheduler.requests.values():
++                for other_f in other_req.mm_features:
++                    if (
++                        other_f.identifier == f.identifier
++                        and not self._has_stripped_mm_data(other_f)
++                    ):
++                        found_data = other_f.data
++                        break
++                if found_data is not None:
++                    break
++            if found_data is not None:
++                resolved_data.append((i, found_data))
++                continue
++            missing_hashes.append(f.mm_hash or f.identifier)
++
++        if missing_hashes:
++            raise MultiModalCacheMissError(missing_hashes)
++
++        for i, data in resolved_data:
++            request.mm_features[i].data = data
++        for i in encoder_pin_indices:
++            self.scheduler.encoder_cache_manager.check_and_update_cache(request, i)
++
+     def add_request(self, request: Request, request_wave: int = 0):
+         """Add request to the scheduler.
+ 
+@@ -517,6 +588,9 @@ class EngineCore:
+                 "Disabling ECTransfer for this request."
+             )
+ 
++        if self.mm_receiver_cache is None and request.mm_features:
++            self._verify_or_resolve_stripped_mm_features(request)
++
+         self.scheduler.add_request(request)
+         if request.abort_immediately:
+             # Immediately abort so the connector's request_finished hook runs
+@@ -1762,7 +1836,11 @@ class EngineCoreProc(EngineCore):
+                 )
+             if self._reject_add_in_shutdown(req):
+                 return
+-            self.add_request(req, request_wave)
++            try:
++                self.add_request(req, request_wave)
++            except MultiModalCacheMissError as e:
++                self._handle_mm_cache_miss(req, e)
++                return
+         elif request_type == EngineCoreRequestType.ABORT:
+             self.abort_requests(request)
+         elif request_type == EngineCoreRequestType.UTILITY:
+@@ -2080,7 +2158,7 @@ class EngineCoreProc(EngineCore):
+                     reuse_buffers.append(buffer)
+ 
+     def _handle_mm_cache_miss(
+-        self, request: EngineCoreRequest, err: MultiModalCacheMissError
++        self, request: EngineCoreRequest | Request, err: MultiModalCacheMissError
+     ) -> None:
+         """Return a retryable response for a P0/P1 cache-drift miss.
+ 
+-- 
+2.43.0
+

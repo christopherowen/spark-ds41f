@@ -1,0 +1,621 @@
+From 673fedf2bf814f8238894f1dafe9b65472c9719f Mon Sep 17 00:00:00 2001
+From: Christopher Owen <3221756+christopherowen@users.noreply.github.com>
+Date: Sun, 8 Nov 2026 18:27:04 +0000
+Subject: [PATCH] perf(spec_decode): guard negative copy slots, step down cap
+ gently, and unlock 31/63-token copy ramp
+
+Base: 1107 vLLM patch head 2756478b60b90700b9918b457aeb38657da637b5.
+
+Rationale:
+1. copy_match_kernel guarded slot >= 0 before reading total_len[slot], whereas copy_alloc_kernel and copy_apply_kernel indexed total_len[slot], int_state[slot], float_state[slot], and history[slot] unconditionally even when idx_mapping contained negative padded slots.
+2. When a copy proposal of length live > initial was partially accepted (initial <= accepted < live, such as 15/16 on a single edited token inside a copied block), copy_alloc_kernel reset doublings = 0 all the way back to initial (4), requiring three consecutive full-cap steps (4 -> 8 -> 16) to recover lookahead.
+3. In copy_match_kernel, each candidate tile probed every ladder level 0..count-1 without checking the target level anchor token history[slot, e - levels[i]] == key[levels[i] - 1] first, walked tiles below need_len, and executed 5 * count = 25 warp shfl_xor reductions on every hit tile even when only hit[0] was needed to test tile emptiness.
+4. greedy_rejection_kernel in tilelang_sampling.py restricted width <= 32 (max_drafts <= 31), preventing greedy speculative verification from evaluating max_drafts = 63 (64 total rows = 1 decode_64 MMA tile and 1 DECODE_CHUNK = 64 indexer wave) even though copy_apply_kernel, assign_draft_budget_kernel, and verify_kernel already support up to 64 drafts.
+
+Guard slot >= 0 in copy_alloc_kernel and copy_apply_kernel; step doublings down by 1 (T.max(doublings - 1, 0)) when initial <= accepted < live while resetting doublings = 0 when accepted < initial; add the level-anchor probe, need_len tile bound, and 1-variable hit[0] warp reduction in copy_match_kernel; and support multi-pass width <= 65 in greedy_rejection_kernel alongside SPARK_DS41F_COPY_MAX_DRAFTS in SpeculativeConfig and --lookahead in benchmark_copy_drafts.py.
+
+Quality:
+Bit-exact match selection and greedy rejection semantics for all valid slots; prevents out-of-bounds global memory reads/writes on negative padded slots, speeds up 16-256K suffix matching by up to 1.18x on boilerplate-heavy histories, and unlocks 31- and 63-token copy lookahead ramps (1.85x and 3.53x fewer decode steps on 2,048-token verbatim copies; 1.32x and 1.47x fewer decode steps on spliced copies).
+
+Tests:
+- pytest --noconftest tests/v1/spec_decode/test_copy_drafts.py tests/v1/core/test_copy_drafts_scheduler.py (63 passed across 2 container boots on GB10).
+- python3 benchmarks/kernels/benchmark_copy_drafts.py --gate (0 slower across all 12 cells across 2 container boots on GB10).
+
+Upstream status: local speculative decoding optimization for unified-memory GB10 nodes.
+---
+ benchmarks/kernels/benchmark_copy_drafts.py   |   3 +
+ tests/v1/spec_decode/test_copy_drafts.py      | 257 +++++++++++++++++-
+ vllm/config/speculative.py                    |  10 +-
+ .../v1/worker/gpu/sample/tilelang_sampling.py |  39 +--
+ .../worker/gpu/spec_decode/tilelang_copy.py   | 127 +++++----
+ 5 files changed, 361 insertions(+), 75 deletions(-)
+
+diff --git a/benchmarks/kernels/benchmark_copy_drafts.py b/benchmarks/kernels/benchmark_copy_drafts.py
+index 17b7e63c0..1c7ce19bc 100644
+--- a/benchmarks/kernels/benchmark_copy_drafts.py
++++ b/benchmarks/kernels/benchmark_copy_drafts.py
+@@ -224,11 +224,14 @@ def verify_case(method, num_reqs, wide, seed):
+ 
+ 
+ def main():
++    global LOOKAHEAD
+     parser = argparse.ArgumentParser()
+     parser.add_argument("--gate", action="store_true")
+     parser.add_argument("--seed", type=int, default=7123)
++    parser.add_argument("--lookahead", type=int, default=LOOKAHEAD)
+     parser.add_argument("--cases", default="copy,verify")
+     args = parser.parse_args()
++    LOOKAHEAD = args.lookahead
+     results = []
+     cases = args.cases.split(",")
+     if "copy" in cases:
+diff --git a/tests/v1/spec_decode/test_copy_drafts.py b/tests/v1/spec_decode/test_copy_drafts.py
+index 24ccd43cb..fc4dadeda 100644
+--- a/tests/v1/spec_decode/test_copy_drafts.py
++++ b/tests/v1/spec_decode/test_copy_drafts.py
+@@ -101,7 +101,9 @@ def ref_select(
+         if live > 0:
+             accepted = min(num_sampled - 1, live)
+             state.doublings = (
+-                min(state.doublings + 1, tlc.MAX_DOUBLINGS) if accepted >= live else 0
++                min(state.doublings + 1, tlc.MAX_DOUBLINGS)
++                if accepted >= live
++                else (max(state.doublings - 1, 0) if accepted >= INITIAL else 0)
+             )
+             state.hits = np.float32(state.hits * np.float32(tlc.DECAY) + accepted)
+             state.trials = np.float32(
+@@ -537,8 +539,9 @@ def design_walk(S, start, end):
+     ``k = 16``, policy ``grow`` with the allocation lag, over one turn. Each step
+     is ``(kind, allocated rows, live rows, tokens)``."""
+     steps = []
+-    p, prose_i, alloc, grow = start, 0, 1 + BLOCK, INITIAL
++    p, prose_i, alloc, doublings = start, 0, 1 + BLOCK, 0
+     while p < end:
++        grow = min(INITIAL << doublings, LOOKAHEAD)
+         source = ref_source(S, p)
+         length = p - source if source >= 0 else 0
+         offered = min(LOOKAHEAD, length)
+@@ -555,7 +558,12 @@ def design_walk(S, start, end):
+             tokens = min(accepted + 1, end - p)
+             steps.append(("suffix", alloc, 1 + drafts, tokens))
+             predicted = min(min(LOOKAHEAD, 2 * grow), length)
+-            grow = min(LOOKAHEAD, 2 * grow) if accepted == drafts else INITIAL
++            if accepted == drafts:
++                doublings = min(doublings + 1, tlc.MAX_DOUBLINGS)
++            elif accepted >= INITIAL:
++                doublings = max(doublings - 1, 0)
++            else:
++                doublings = 0
+             next_alloc = 1 + max(BLOCK, predicted)
+         else:
+             run = _copy_run(S, p, BLOCK, end)
+@@ -566,7 +574,7 @@ def design_walk(S, start, end):
+                 tokens = min(PROSE[prose_i & 3], end - p)
+                 prose_i += 1
+                 steps.append(("dspark_prose", alloc, 0, tokens))
+-            grow = INITIAL
++            doublings = 0
+             next_alloc = 1 + BLOCK
+         alloc = next_alloc
+         p += tokens
+@@ -1518,3 +1526,244 @@ def test_copy_match_boilerplate_anchor_pruning_is_bit_identical():
+     sources = _run_match(history, total_len, idx)
+     for row, S in enumerate(streams):
+         assert _best(sources[row], length) == ref_source(S, length)
++
++
++
++def test_negative_slot_bounds_guard_in_alloc_and_apply():
++    """Negative entries in idx_mapping never read or write slot -1 of history,
++    total_len, int_state, or float_state, and fall back to DSpark proposals."""
++    rng = np.random.default_rng(20261108)
++    width = 256
++    # Allocate with a leading canary row at index 0, and pass slices starting at
++    # row 1 so any out-of-bounds access at slot = -1 hits row 0 of the base tensor.
++    history_base = _history(5, width)
++    history_base[0].fill_(777777)
++    history = history_base[1:]
++
++    total_len_base = torch.full((5,), 999999, dtype=torch.int32, device=DEVICE)
++    total_len = total_len_base[1:]
++
++    int_state_base = torch.full(
++        (5, tlc.STATE_COLUMNS), 888888, dtype=torch.int32, device=DEVICE
++    )
++    float_state_base = torch.full(
++        (5, tlc.STATE_COLUMNS), 555555.0, dtype=torch.float32, device=DEVICE
++    )
++    int_state = int_state_base[1:]
++    float_state = float_state_base[1:]
++    int_state.zero_()
++    float_state.zero_()
++    total_len.zero_()
++
++    repeated = np.tile(rng.integers(10, VOCAB, 32, dtype=np.int32), 4)
++    slot = 2
++    history[slot, :96] = torch.from_numpy(repeated[:96]).to(DEVICE)
++    total_len[slot] = 96
++
++    idx_mapping = torch.tensor([-1, slot, -1], dtype=torch.int64, device=DEVICE)
++    sources = _run_match(history, total_len, idx_mapping)
++    assert (sources[0] == -1).all()
++    assert (sources[2] == -1).all()
++
++    sampled = torch.tensor([4, 1, 4], dtype=torch.int32, device=DEVICE)
++    verified = torch.tensor([8, 0, 8], dtype=torch.int32, device=DEVICE)
++    dspark = (
++        torch.arange(3 * BLOCK, dtype=torch.int64, device=DEVICE).view(3, BLOCK) + 500,
++        torch.full((3, BLOCK), 0.6, dtype=torch.float32, device=DEVICE),
++    )
++    drafts, confs, planned, alloc, _ = _propose(
++        history,
++        total_len,
++        idx_mapping,
++        sources,
++        int_state,
++        float_state,
++        sampled,
++        verified,
++        verified,
++        dspark=dspark,
++    )
++    # Canary row 0 (index -1 of the sliced views) must be completely untouched.
++    assert (history_base[0] == 777777).all()
++    assert int(total_len_base[0]) == 999999
++    assert (int_state_base[0] == 888888).all()
++    assert (float_state_base[0] == 555555.0).all()
++
++    # Negative slots fall back to DSpark and report BLOCK allocation.
++    for neg_row in (0, 2):
++        assert int(alloc[neg_row]) == BLOCK
++        assert drafts[neg_row, :BLOCK].tolist() == dspark[0][neg_row].tolist()
++        assert drafts[neg_row, BLOCK:].tolist() == [-1] * (LOOKAHEAD - BLOCK)
++        torch.testing.assert_close(confs[neg_row, :BLOCK], dspark[1][neg_row])
++    assert int(alloc[1]) == 2 * INITIAL
++    assert int(int_state[slot, 1]) == INITIAL
++
++    # Even if copy_apply is invoked directly with a positive chosen source on a
++    # negative slot, slot < 0 guards both history reads and int_state resets.
++    forged_chosen = torch.tensor(
++        [[16, 8, 16], [32, 8, 16], [16, 8, 16]], dtype=torch.int32, device=DEVICE
++    )
++    low_estimates = torch.tensor([0.1, 0.95, 0.99], dtype=torch.float32, device=DEVICE)
++    tlc.copy_apply(
++        idx_mapping,
++        history,
++        forged_chosen,
++        low_estimates,
++        int_state,
++        dspark[0],
++        dspark[1],
++        drafts,
++        confs,
++        planned,
++    )
++    assert (history_base[0] == 777777).all()
++    assert (int_state_base[0] == 888888).all()
++    for neg_row in (0, 2):
++        assert drafts[neg_row, :BLOCK].tolist() == dspark[0][neg_row].tolist()
++
++
++def test_partial_acceptance_steps_down_cap_doublings_gently():
++    """Accepting at least initial_drafts of a wider copy proposal steps doublings
++    down by 1 instead of resetting to 0, while shorter acceptances reset to 0."""
++    rng = np.random.default_rng(42)
++    S = np.tile(rng.integers(10, VOCAB, 80, dtype=np.int32), 6)
++    slot = 1
++    history = _history(4, len(S) + 64)
++    history[slot, : len(S)] = torch.from_numpy(S).to(DEVICE)
++    total_len = torch.tensor([0, len(S), 0, 0], dtype=torch.int32, device=DEVICE)
++    idx_mapping = torch.tensor([slot], dtype=torch.int64, device=DEVICE)
++    lookahead = 31
++    sources = _run_match(history, total_len, idx_mapping, lookahead=lookahead)
++    dspark = (
++        torch.zeros((1, BLOCK), dtype=torch.int64, device=DEVICE),
++        torch.full((1, BLOCK), 0.3, dtype=torch.float32, device=DEVICE),
++    )
++    chosen = torch.empty((1, tlc.CHOSEN_COLUMNS), dtype=torch.int32, device=DEVICE)
++    estimates = torch.empty((1,), dtype=torch.float32, device=DEVICE)
++    alloc = torch.empty((1,), dtype=torch.int32, device=DEVICE)
++    drafts = torch.empty((1, lookahead), dtype=torch.int64, device=DEVICE)
++    confs = torch.empty((1, lookahead), dtype=torch.float32, device=DEVICE)
++    planned = torch.empty((1, lookahead), dtype=torch.float32, device=DEVICE)
++    int_state, float_state = _state(4)
++
++    def step(num_sampled, verified):
++        s_t = torch.tensor([num_sampled], dtype=torch.int32, device=DEVICE)
++        v_t = torch.tensor([verified], dtype=torch.int32, device=DEVICE)
++        tlc.copy_alloc(
++            idx_mapping,
++            total_len,
++            sources,
++            s_t,
++            v_t,
++            v_t,
++            int_state,
++            float_state,
++            chosen,
++            estimates,
++            alloc,
++            MIN_MATCH,
++            lookahead,
++            BLOCK,
++            INITIAL,
++        )
++        tlc.copy_apply(
++            idx_mapping,
++            history,
++            chosen,
++            estimates,
++            int_state,
++            dspark[0],
++            dspark[1],
++            drafts,
++            confs,
++            planned,
++        )
++        return int(int_state[slot, 0]), int(int_state[slot, 1])
++
++    # Initial copy step: doublings=0, offered=8.
++    assert step(1, 0) == (0, 8)
++    # Full 8 accepted (num_sampled=9): doublings=1, offered=16.
++    assert step(9, 8) == (1, 16)
++    # Full 16 accepted (num_sampled=17): doublings=2, offered=31.
++    assert step(17, 16) == (2, 31)
++    # Partial acceptance of 20/31 drafts (accepted=20 >= INITIAL=8): steps down
++    # doublings from 2 to 1 (offered=16) rather than collapsing to 0 (offered=8).
++    assert step(21, 31) == (1, 16)
++    # Full 16 accepted again: doublings returns to 2 (offered=31) in a single step.
++    assert step(17, 16) == (2, 31)
++    # Short partial acceptance of 5/31 drafts (accepted=5 < INITIAL=8): resets to 0.
++    assert step(6, 31) == (0, 8)
++
++
++@pytest.mark.parametrize("wide_lookahead", [31, 63])
++def test_wide_lookahead_31_and_63_greedy_verification_and_ramp(wide_lookahead):
++    """CopyDrafter and greedy_rejection_sample operate across 31-draft (32-row
++    decode_32 MMA tile) and 63-draft (64-row decode_64 MMA tile) lookaheads while
++    producing bit-identical temperature-0 target text."""
++    rng = np.random.default_rng(700 + wide_lookahead)
++    states = RequestState(
++        max_num_reqs=MAX_REQS,
++        max_model_len=8192,
++        max_num_batched_tokens=4096,
++        num_speculative_steps=wide_lookahead,
++        vocab_size=VOCAB,
++        device=DEVICE,
++    )
++    config = CopyDraftsConfig(
++        min_match=MIN_MATCH, max_drafts=wide_lookahead, initial_drafts=INITIAL
++    )
++    drafter = CopyDrafter(config, states, num_draft_steps=BLOCK, device=DEVICE)
++    target = ToyTarget(1, order=2, table=97)
++    prompt = np.tile(rng.integers(1, VOCAB, 32), 4).tolist()
++    slot = _set_history(states, "wide_req", prompt)
++    drafter.add_request(slot)
++    drafter.apply_staged_writes()
++
++    idx = torch.tensor([slot], dtype=torch.int64, device=DEVICE)
++    text = list(prompt)
++    out = []
++    num_sampled = torch.ones(1, dtype=torch.int32, device=DEVICE)
++    verified = torch.zeros(1, dtype=torch.int32, device=DEVICE)
++    max_offered = 0
++
++    from vllm.v1.worker.gpu.spec_decode.greedy_verification import (
++        greedy_rejection_sample,
++        vocab_parallel_pairs,
++    )
++
++    while len(out) < 400:
++        _set_history(states, "wide_req", text)
++        dspark_drafts = torch.zeros((1, BLOCK), dtype=torch.int64, device=DEVICE)
++        dspark_conf = torch.full((1, BLOCK), 0.5, device=DEVICE)
++        drafter.prepare_alloc(idx, num_sampled, verified, None)
++        drafts, confs, _ = drafter.propose(idx, dspark_drafts, dspark_conf)
++        width = int((confs[0] > 0).sum())
++        max_offered = max(max_offered, int(drafter.int_state[slot, 1]))
++        proposal = drafts[0, :width].tolist()
++        ctx = list(text)
++        row_targets = [target.next(ctx)]
++        for tok in proposal:
++            ctx.append(tok)
++            row_targets.append(target.next(ctx))
++        rows = len(row_targets)
++        logits = torch.zeros((rows, VOCAB), dtype=torch.float32, device=DEVICE)
++        logits[
++            torch.arange(rows, device=DEVICE),
++            torch.tensor(row_targets, dtype=torch.int64, device=DEVICE),
++        ] = 1.0
++        inputs = torch.tensor(
++            [text[-1], *proposal], dtype=torch.int32, device=DEVICE
++        )
++        cu = torch.tensor([0, rows], dtype=torch.int32, device=DEVICE)
++        pairs = vocab_parallel_pairs(logits, VOCAB, 0, 1)
++        sampled, n_sampled = greedy_rejection_sample(
++            pairs, inputs, cu, wide_lookahead
++        )
++        committed = sampled[0, : int(n_sampled[0])].tolist()
++        text.extend(committed)
++        out.extend(committed)
++        num_sampled = torch.tensor([len(committed)], dtype=torch.int32, device=DEVICE)
++        verified = torch.tensor([width], dtype=torch.int32, device=DEVICE)
++
++    assert max_offered == wide_lookahead
++    assert out[:400] == target.greedy(prompt, 400)
+diff --git a/vllm/config/speculative.py b/vllm/config/speculative.py
+index d7cf118ba..35899848c 100644
+--- a/vllm/config/speculative.py
++++ b/vllm/config/speculative.py
+@@ -3,6 +3,7 @@
+ 
+ import copy
+ import functools
++import os
+ from collections.abc import Callable, Mapping
+ from dataclasses import field
+ from pathlib import Path
+@@ -1810,11 +1811,14 @@ class SpeculativeConfig:
+             # verifies; copy drafts are one-hot proposals, as greedy DSpark
+             # drafts are, so no draft logits exist for them. The lookahead is at
+             # least DSpark's block.
+-            self.copy_drafts = CopyDraftsConfig(
+-                max_drafts=max(
+-                    CopyDraftsConfig().max_drafts, self.num_speculative_tokens
++            default_max_drafts = int(
++                os.environ.get(
++                    "SPARK_DS41F_COPY_MAX_DRAFTS", str(CopyDraftsConfig().max_drafts)
+                 )
+             )
++            self.copy_drafts = CopyDraftsConfig(
++                max_drafts=max(default_max_drafts, self.num_speculative_tokens)
++            )
+ 
+         if (
+             self.adaptive_speculative_tokens_initial is not None
+diff --git a/vllm/v1/worker/gpu/sample/tilelang_sampling.py b/vllm/v1/worker/gpu/sample/tilelang_sampling.py
+index 05dbc6718..3ea7c5b11 100644
+--- a/vllm/v1/worker/gpu/sample/tilelang_sampling.py
++++ b/vllm/v1/worker/gpu/sample/tilelang_sampling.py
+@@ -3022,11 +3022,12 @@ def greedy_rejection_kernel(width: int, drafts_dtype: str, ranks: int, pair_widt
+     the target, and a fully accepted block commits the bonus position's. Positions
+     after the first mismatch are not written; ``num_sampled`` is the accepted
+     count plus one."""
+-    if not 1 <= width <= 32:
+-        raise ValueError(f"{width} sampled tokens a request: a warp takes them")
++    if not 1 <= width <= 65:
++        raise ValueError(f"{width} sampled tokens a request: at most 64 drafts")
+     if not 1 <= ranks <= 32 or pair_width < 2:
+         raise ValueError(f"{ranks} ranks of {pair_width}-column pairs")
+     span = 1 << max(ranks - 1, 0).bit_length()
++    passes = -(-width // 32)
+     reqs, cu_len, drafts_len, rows, cols = T.dynamic(
+         "reqs, cu_len, drafts_len, rows, cols"
+     )
+@@ -3055,21 +3056,25 @@ def greedy_rejection_kernel(width: int, drafts_dtype: str, ranks: int, pair_widt
+             num_drafts = T.alloc_var(
+                 T.int64, init=T.cast(cu_num_logits[req + 1], T.int64) - start - 1
+             )
+-            if (tx < width) & (T.cast(tx, T.int64) <= num_drafts):
+-                for k in tuple(range(ranks)):
+-                    values[k] = pairs[start + tx, pair_width * k]
+-                    indices[k] = T.cast(pairs[start + tx, pair_width * k + 1], T.int32)
+-                best[0] = values[0]
+-                best_index[0] = indices[0]
+-                for k in tuple(range(1, ranks)):
+-                    _first_keep_or_take(best, best_index, values[k], indices[k])
+-                if span > ranks:
+-                    _first_keep_or_take(
+-                        best, best_index, -T.infinity(T.float32), _MASKED_INDEX
+-                    )
+-                targets[tx] = T.cast(best_index[0], T.int64)
+-                if T.cast(tx, T.int64) < num_drafts:
+-                    drafts[tx] = T.cast(draft_sampled[start + tx + 1], T.int64)
++            for p in T.unroll(passes):
++                pos = p * 32 + tx
++                if (pos < width) & (T.cast(pos, T.int64) <= num_drafts):
++                    for k in tuple(range(ranks)):
++                        values[k] = pairs[start + pos, pair_width * k]
++                        indices[k] = T.cast(
++                            pairs[start + pos, pair_width * k + 1], T.int32
++                        )
++                    best[0] = values[0]
++                    best_index[0] = indices[0]
++                    for k in tuple(range(1, ranks)):
++                        _first_keep_or_take(best, best_index, values[k], indices[k])
++                    if span > ranks:
++                        _first_keep_or_take(
++                            best, best_index, -T.infinity(T.float32), _MASKED_INDEX
++                        )
++                    targets[pos] = T.cast(best_index[0], T.int64)
++                    if T.cast(pos, T.int64) < num_drafts:
++                        drafts[pos] = T.cast(draft_sampled[start + pos + 1], T.int64)
+             T.sync_threads()
+             if tx == 0:
+                 accepted[0] = 0
+diff --git a/vllm/v1/worker/gpu/spec_decode/tilelang_copy.py b/vllm/v1/worker/gpu/spec_decode/tilelang_copy.py
+index 32eab0055..030714283 100644
+--- a/vllm/v1/worker/gpu/spec_decode/tilelang_copy.py
++++ b/vllm/v1/worker/gpu/spec_decode/tilelang_copy.py
+@@ -29,8 +29,10 @@ candidate is omitted unless it cannot improve the result.
+   First the copy state of the request's last proposal is updated from this
+   step's verification of it: a copy whose live verified drafts (its admitted
+   drafts, at most the dead-row cut) were all accepted doubles its cap (from
+-  ``initial`` up to the lookahead), a rejection or a proposal without a copy
+-  returns it to ``initial``, and the accepted and judged drafts update the
++  ``initial`` up to the lookahead), a partial acceptance of at least
++  ``initial`` drafts steps its doubling level down by one, a shorter acceptance
++  or a proposal without a copy returns it to ``initial``, and the accepted and
++  judged drafts update the
+   request's acceptance estimate (decayed counts over a prior). Then the longest
+   level with a source over the chunks, its highest-priority source decoded to
+   its position, and the choice (``chosen``: the source, the
+@@ -123,15 +125,22 @@ def copy_match_kernel(min_match: int, lookahead: int, idx_dtype: str):
+                 if run == j:  # noqa: SIM102
+                     if history[slot, e - 1 - j] == key[j]:
+                         run = j + 1
+-            # A longer level only past a full match of the one before.
++            # A longer level only past a full match of the one before and its
++            # end anchor token.
+             for i in tuple(range(1, count)):
+-                if run == levels[i - 1]:
+-                    for j in T.serial(levels[i - 1], levels[i]):
+-                        if run == j and j < e:  # noqa: SIM102
++                if (
++                    run == levels[i - 1]
++                    and e >= levels[i]
++                    and history[slot, e - levels[i]] == key[levels[i] - 1]
++                ):
++                    for j in T.serial(levels[i - 1], levels[i] - 1):
++                        if run == j:  # noqa: SIM102
+                             if history[slot, e - 1 - j] == key[j]:
+                                 run = j + 1
++                    if run == levels[i] - 1:
++                        run = levels[i]
+             if run >= need_len:
+-                hit[0] = 1
++                hit[0] = run
+                 for i in tuple(range(count)):
+                     if run >= levels[i]:
+                         best[i] = T.max(best[i], priority)
+@@ -183,10 +192,10 @@ def copy_match_kernel(min_match: int, lookahead: int, idx_dtype: str):
+                     init=top_aligned - (c + 1) * _MATCH_THREADS + (tx // 32) * 32,
+                 )
+                 searching = T.alloc_var(T.int32, init=1)
+-                while warp_tile + 32 >= min_match and searching != 0:
++                while warp_tile + 32 >= need_len and searching != 0:
+                     hit[0] = 0
+                     e = warp_tile + tx % 32 + 1
+-                    if min_match <= e and e <= full_last:
++                    if need_len <= e and e <= full_last:
+                         evaluate_end(
+                             slot,
+                             history,
+@@ -207,13 +216,12 @@ def copy_match_kernel(min_match: int, lookahead: int, idx_dtype: str):
+                         )
+                         != 0
+                     ):
+-                        for i in tuple(range(count)):
+-                            for distance in (16, 8, 4, 2, 1):
+-                                best[i] = T.max(best[i], T.shfl_xor(best[i], distance))
++                        for distance in (16, 8, 4, 2, 1):
++                            hit[0] = T.max(hit[0], T.shfl_xor(hit[0], distance))
+                         for i in tuple(range(count - 1)):
+-                            if best[i] >= 0:
++                            if hit[0] >= levels[i]:
+                                 need_len = levels[i + 1]
+-                        if best[count - 1] >= 0:
++                        if hit[0] >= levels[count - 1]:
+                             searching = 0
+                     warp_tile -= span
+                 # Stage 2: short continuations (at most lookahead - 1 ends) in block 0.
+@@ -286,42 +294,55 @@ def copy_alloc_kernel(
+                 if latest >= 0:
+                     source = latest
+             if tx == 0:
+-                length = total_len[slot]
+-                if source >= 0:
+-                    source = T.if_then_else(
+-                        source >= lookahead, source - lookahead, length - source
+-                    )
+-                doublings = T.alloc_var(T.int32, init=int_state[slot, 0])
+-                pending = int_state[slot, 1]
+-                hits = T.alloc_var(T.float32, init=float_state[slot, 0])
+-                trials = T.alloc_var(T.float32, init=float_state[slot, 1])
+-                if pending > 0 and num_sampled[r] > 0:
+-                    live = T.min(pending, T.min(verified[r], cut[r]))
+-                    if live > 0:
+-                        accepted = T.min(num_sampled[r] - 1, live)
+-                        doublings = T.if_then_else(
+-                            accepted >= live, T.min(doublings + 1, MAX_DOUBLINGS), 0
+-                        )
+-                        hits = hits * DECAY + T.cast(accepted, T.float32)
+-                        trials = trials * DECAY + T.cast(
+-                            T.min(accepted + 1, live), T.float32
++                if slot < 0:
++                    chosen[r, 0] = -1
++                    chosen[r, 1] = 0
++                    chosen[r, 2] = 0
++                    estimates[r] = T.float32(PRIOR_HITS / PRIOR_TRIALS)
++                    alloc[r] = block
++                else:
++                    length = total_len[slot]
++                    if source >= 0:
++                        source = T.if_then_else(
++                            source >= lookahead, source - lookahead, length - source
+                         )
+-                cap = T.min(T.int32(initial) << doublings, lookahead)
+-                distance = length - source
+-                offered = T.if_then_else(source >= 0, T.min(cap, distance), 0)
+-                after = T.if_then_else(
+-                    source >= 0, T.min(T.min(2 * cap, lookahead), distance), 0
+-                )
+-                # A step without a copy (DSpark's) starts the next copy afresh.
+-                int_state[slot, 0] = T.if_then_else(source >= 0, doublings, 0)
+-                int_state[slot, 1] = offered
+-                float_state[slot, 0] = hits
+-                float_state[slot, 1] = trials
+-                chosen[r, 0] = source
+-                chosen[r, 1] = offered
+-                chosen[r, 2] = after
+-                estimates[r] = (hits + PRIOR_HITS) / (trials + PRIOR_TRIALS)
+-                alloc[r] = T.max(after, block)
++                    doublings = T.alloc_var(T.int32, init=int_state[slot, 0])
++                    pending = int_state[slot, 1]
++                    hits = T.alloc_var(T.float32, init=float_state[slot, 0])
++                    trials = T.alloc_var(T.float32, init=float_state[slot, 1])
++                    if pending > 0 and num_sampled[r] > 0:
++                        live = T.min(pending, T.min(verified[r], cut[r]))
++                        if live > 0:
++                            accepted = T.min(num_sampled[r] - 1, live)
++                            doublings = T.if_then_else(
++                                accepted >= live,
++                                T.min(doublings + 1, MAX_DOUBLINGS),
++                                T.if_then_else(
++                                    accepted >= initial,
++                                    T.max(doublings - 1, 0),
++                                    0,
++                                ),
++                            )
++                            hits = hits * DECAY + T.cast(accepted, T.float32)
++                            trials = trials * DECAY + T.cast(
++                                T.min(accepted + 1, live), T.float32
++                            )
++                    cap = T.min(T.int32(initial) << doublings, lookahead)
++                    distance = length - source
++                    offered = T.if_then_else(source >= 0, T.min(cap, distance), 0)
++                    after = T.if_then_else(
++                        source >= 0, T.min(T.min(2 * cap, lookahead), distance), 0
++                    )
++                    # A step without a copy (DSpark's) starts the next copy afresh.
++                    int_state[slot, 0] = T.if_then_else(source >= 0, doublings, 0)
++                    int_state[slot, 1] = offered
++                    float_state[slot, 0] = hits
++                    float_state[slot, 1] = trials
++                    chosen[r, 0] = source
++                    chosen[r, 1] = offered
++                    chosen[r, 2] = after
++                    estimates[r] = (hits + PRIOR_HITS) / (trials + PRIOR_TRIALS)
++                    alloc[r] = T.max(after, block)
+ 
+     return copy_alloc
+ 
+@@ -366,9 +387,13 @@ def copy_apply_kernel(lookahead: int, block: int, idx_dtype: str):
+             for j in T.unroll(block):
+                 dspark_yield += dspark_confidences[r, j]
+             use_copy = T.alloc_var(T.int32, init=0)
+-            if start >= 0 and T.cast(offered, T.float32) * estimate >= dspark_yield:
++            if (
++                slot >= 0
++                and start >= 0
++                and T.cast(offered, T.float32) * estimate >= dspark_yield
++            ):
+                 use_copy = 1
+-            if start >= 0 and use_copy == 0 and tx == 0:
++            if slot >= 0 and start >= 0 and use_copy == 0 and tx == 0:
+                 int_state[slot, 0] = 0
+                 int_state[slot, 1] = 0
+             for k in T.unroll(passes):
+-- 
+2.43.0
+

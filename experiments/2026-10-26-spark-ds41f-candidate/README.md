@@ -1061,3 +1061,29 @@ The merged base of round 2: candidate-50 with #1009 round 1, plus every PR that 
 - **Series:** [candidate-54/vllm/series](candidate-54/vllm/series) (`0001..0791`, 671 patches;
   `patchset_sha256` `fd767123`, `patch_head` `4e8133ff`, `expected_tree` `5f021d9a`).
 - **Status:** prepared and locked; not built, not measured.
+
+## Candidate 55 ([candidate-55/](candidate-55))
+
+candidate-54 plus #1008 (with its sparknet patch), #978, #988 (its dead-row part), tested at `tp4-ring` (dgx1..dgx4). Candidates 55, 56 and 57 are tested at the same time, one per testbed, on the accumulated base: candidate-54. The PRs that pass are carried into all later candidates. Marks, runs, own-mark commands and rework rules are in its README. #995's guard is left out: its rework is bit-exact, but no serving path passes a negative slot to the kernels it guards.
+
+- **Series:** [candidate-55/vllm/series](candidate-55/vllm/series) (`0001..0794`, 674 patches;
+  `patchset_sha256` `6a1f3da3`, `patch_head` `410463b3`, `expected_tree` `e39b835c`) and
+  [candidate-55/sparknet/series](candidate-55/sparknet/series) (`0001` on 1107's pin; `patchset_sha256` `d58b3be5`,
+  `patch_head` `d50a1b4c`, `expected_tree` `dab8c457`).
+- **Status:** prepared and locked; not built, not measured.
+
+## Candidate 56 ([candidate-56/](candidate-56))
+
+candidate-54 plus #957 (its part 1) and #956 round 3, tested at `tp4-switched` (sp1..sp4). Candidates 55, 56 and 57 are tested at the same time, one per testbed, on the accumulated base: candidate-54. The PRs that pass are carried into all later candidates. Marks, runs, own-mark commands and rework rules are in its README. #956 round 3 builds on 957-p1, and its `no956` control isolates it on the same image.
+
+- **Series:** [candidate-56/vllm/series](candidate-56/vllm/series) (`0001..0796`, 673 patches;
+  `patchset_sha256` `0a6aa2ea`, `patch_head` `295c2ced`, `expected_tree` `0c848613`).
+- **Status:** prepared and locked; not built, not measured.
+
+## Candidate 57 ([candidate-57/](candidate-57))
+
+candidate-54 plus #957 (its parts 2 and 4), tested at `tp3-switched` (sp5..sp7). Candidates 55, 56 and 57 are tested at the same time, one per testbed, on the accumulated base: candidate-54. The PRs that pass are carried into all later candidates. Marks, runs, own-mark commands and rework rules are in its README. #957's part 5 is dropped after its rework. Its series has no `0795..0796`, which are candidate-56's.
+
+- **Series:** [candidate-57/vllm/series](candidate-57/vllm/series) (`0001..0798`, 673 patches;
+  `patchset_sha256` `5131e020`, `patch_head` `d74e38ee`, `expected_tree` `72b40d71`).
+- **Status:** prepared and locked; not built, not measured.

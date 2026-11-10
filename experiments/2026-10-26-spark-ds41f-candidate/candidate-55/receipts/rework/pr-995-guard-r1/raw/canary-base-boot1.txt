@@ -1,0 +1,83 @@
+============================= test session starts ==============================
+platform linux -- Python 3.12.3, pytest-9.1.1, pluggy-1.6.0 -- /usr/bin/python3
+rootdir: /tmp/canary
+plugins: anyio-4.15.1
+collecting ... collected 46 items / 45 deselected / 1 selected
+
+../../../../tmp/canary/test_copy_drafts.py::test_negative_slot_bounds_guard_in_alloc_and_apply FAILED [100%]
+
+=================================== FAILURES ===================================
+______________ test_negative_slot_bounds_guard_in_alloc_and_apply ______________
+
+    def test_negative_slot_bounds_guard_in_alloc_and_apply():
+        """Negative entries in idx_mapping never read or write slot -1 of history,
+        total_len, int_state, or float_state, and fall back to DSpark proposals."""
+        rng = np.random.default_rng(20261108)
+        width = 256
+        # Allocate with a leading canary row at index 0, and pass slices starting at
+        # row 1 so any out-of-bounds access at slot = -1 hits row 0 of the base tensor.
+        history_base = _history(5, width)
+        history_base[0].fill_(777777)
+        history = history_base[1:]
+    
+        total_len_base = torch.full((5,), 999999, dtype=torch.int32, device=DEVICE)
+        total_len = total_len_base[1:]
+    
+        int_state_base = torch.full(
+            (5, tlc.STATE_COLUMNS), 888888, dtype=torch.int32, device=DEVICE
+        )
+        float_state_base = torch.full(
+            (5, tlc.STATE_COLUMNS), 555555.0, dtype=torch.float32, device=DEVICE
+        )
+        int_state = int_state_base[1:]
+        float_state = float_state_base[1:]
+        int_state.zero_()
+        float_state.zero_()
+        total_len.zero_()
+    
+        repeated = np.tile(rng.integers(10, VOCAB, 32, dtype=np.int32), 4)
+        slot = 2
+        history[slot, :96] = torch.from_numpy(repeated[:96]).to(DEVICE)
+        total_len[slot] = 96
+    
+        idx_mapping = torch.tensor([-1, slot, -1], dtype=torch.int64, device=DEVICE)
+        sources = _run_match(history, total_len, idx_mapping)
+        assert (sources[0] == -1).all()
+        assert (sources[2] == -1).all()
+    
+        sampled = torch.tensor([4, 1, 4], dtype=torch.int32, device=DEVICE)
+        verified = torch.tensor([8, 0, 8], dtype=torch.int32, device=DEVICE)
+        dspark = (
+            torch.arange(3 * BLOCK, dtype=torch.int64, device=DEVICE).view(3, BLOCK) + 500,
+            torch.full((3, BLOCK), 0.6, dtype=torch.float32, device=DEVICE),
+        )
+        drafts, confs, planned, alloc, _ = _propose(
+            history,
+            total_len,
+            idx_mapping,
+            sources,
+            int_state,
+            float_state,
+            sampled,
+            verified,
+            verified,
+            dspark=dspark,
+        )
+        # Canary row 0 (index -1 of the sliced views) must be completely untouched.
+        assert (history_base[0] == 777777).all()
+        assert int(total_len_base[0]) == 999999
+>       assert (int_state_base[0] == 888888).all()
+E       AssertionError: assert tensor(False, device='cuda:0')
+E        +  where tensor(False, device='cuda:0') = <built-in method all of Tensor object at 0xe97adee19ae0>()
+E        +    where <built-in method all of Tensor object at 0xe97adee19ae0> = tensor([0, 0], device='cuda:0', dtype=torch.int32) == 888888.all
+
+/tmp/canary/test_copy_drafts.py:1650: AssertionError
+=============================== warnings summary ===============================
+../../../../usr/local/lib/python3.12/dist-packages/torch/jit/_script.py:365: 14 warnings
+  /usr/local/lib/python3.12/dist-packages/torch/jit/_script.py:365: DeprecationWarning: `torch.jit.script_method` is deprecated. Please switch to `torch.compile` or `torch.export`.
+    warnings.warn(
+
+-- Docs: https://docs.pytest.org/en/stable/how-to/capture-warnings.html
+=========================== short test summary info ============================
+FAILED ../../../../tmp/canary/test_copy_drafts.py::test_negative_slot_bounds_guard_in_alloc_and_apply
+================ 1 failed, 45 deselected, 14 warnings in 5.50s =================

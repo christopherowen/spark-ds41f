@@ -1,0 +1,880 @@
+From 60cb03efd0724da97e10f88ffd10843e6846809d Mon Sep 17 00:00:00 2001
+From: Christopher Owen <3221756+christopherowen@users.noreply.github.com>
+Date: Sat, 1 Jan 2000 00:00:00 +0000
+Subject: [PATCH] perf(worker): roce proxy and rank0 fast-core affinity
+ partition
+
+Partition GB10 Cortex-X925 performance cores into disjoint affinity sets
+across sparknet RoCE proxy, VLLM::Worker_TP* main and background threads,
+VLLM::EngineCore, and Rank-0 APIServer processes.
+
+Upstream base: 19f2c20ed4d6f491081bd1dcbb70f3205fb0bf8a
+Rationale: On GB10, Rank 0 runs APIServer, EngineCore, Worker_TP0 (with
+28 background threads), and sparknet-proxy in a shared 10-core pool,
+causing preemption and arrival skew across the 116 per-step one-shot RoCE
+collectives.
+Quality implications: None (deterministic thread scheduling only).
+Tests: pytest tests/v1/worker/test_roce_cpu_affinity.py
+Upstream status: local experiment.
+---
+ tests/v1/worker/test_roce_cpu_affinity.py     | 199 ++++++++
+ vllm/entrypoints/cli/serve.py                 |   7 +
+ .../entrypoints/launchers/api_server/entry.py |   6 +
+ .../deepseek_v4_1/engram_rows/_reader.c       |  52 ++
+ vllm/utils/cpu_affinity.py                    | 456 ++++++++++++++++++
+ vllm/v1/engine/core.py                        |   3 +
+ vllm/v1/worker/gpu_worker.py                  |  11 +
+ 7 files changed, 734 insertions(+)
+ create mode 100644 tests/v1/worker/test_roce_cpu_affinity.py
+ create mode 100644 vllm/utils/cpu_affinity.py
+
+diff --git a/tests/v1/worker/test_roce_cpu_affinity.py b/tests/v1/worker/test_roce_cpu_affinity.py
+new file mode 100644
+index 000000000..bf37805ea
+--- /dev/null
++++ b/tests/v1/worker/test_roce_cpu_affinity.py
+@@ -0,0 +1,199 @@
++# SPDX-License-Identifier: Apache-2.0
++# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
++"""Tests for GB10 heterogeneous CPU topology discovery and RoCE proxy / worker /
++Rank-0 API server deterministic core affinity partitioning."""
++
++from __future__ import annotations
++
++from pathlib import Path
++
++import pytest
++
++from vllm.models.deepseek_v4_1.engram_rows import host_hash
++from vllm.utils import cpu_affinity
++
++
++def _populate_gb10_sysfs(
++    root: Path,
++    *,
++    with_cpufreq: bool = True,
++    with_capacity: bool = True,
++    with_l2: bool = True,
++) -> None:
++    """Create a synthetic 20-core NVIDIA GB10 sysfs CPU hierarchy."""
++    for cpu in range(20):
++        is_x925 = (5 <= cpu <= 9) or (15 <= cpu <= 19)
++        cpu_dir = root / f"cpu{cpu}"
++        cpu_dir.mkdir(parents=True, exist_ok=True)
++        if with_cpufreq:
++            freq_dir = cpu_dir / "cpufreq"
++            freq_dir.mkdir(exist_ok=True)
++            (freq_dir / "cpuinfo_max_freq").write_text(
++                "3900000\n" if is_x925 else "2808000\n",
++                encoding="utf-8",
++            )
++        if with_capacity:
++            (cpu_dir / "cpu_capacity").write_text(
++                "1024\n" if is_x925 else "725\n",
++                encoding="utf-8",
++            )
++        if with_l2:
++            l2_dir = cpu_dir / "cache" / "index2"
++            l2_dir.mkdir(parents=True, exist_ok=True)
++            (l2_dir / "size").write_text(
++                "2048K\n" if is_x925 else "512K\n",
++                encoding="utf-8",
++            )
++
++
++def test_parse_and_format_cpu_list_round_trip():
++    cpus = [5, 6, 7, 8, 9, 15, 16, 17, 18, 19]
++    assert cpu_affinity.format_cpu_list(cpus) == "5-9,15-19"
++    assert cpu_affinity.parse_cpu_list("5-9,15-19") == cpus
++    assert cpu_affinity.parse_cpu_list("19") == [19]
++    assert cpu_affinity.format_cpu_list([19]) == "19"
++    with pytest.raises(ValueError):
++        cpu_affinity.parse_cpu_list("9-5")
++
++
++@pytest.mark.parametrize(
++    "flags",
++    [
++        {"with_cpufreq": True, "with_capacity": True, "with_l2": True},
++        {"with_cpufreq": False, "with_capacity": True, "with_l2": False},
++        {"with_cpufreq": False, "with_capacity": False, "with_l2": True},
++    ],
++)
++def test_discover_gb10_topology_across_metric_sources(tmp_path: Path, flags: dict):
++    _populate_gb10_sysfs(tmp_path, **flags)
++    fast, eff = cpu_affinity.discover_cpu_topology(
++        sysfs_root=tmp_path, allowed=set(range(20))
++    )
++    assert fast == (5, 6, 7, 8, 9, 15, 16, 17, 18, 19)
++    assert eff == (0, 1, 2, 3, 4, 10, 11, 12, 13, 14)
++
++    # Even when the container cpuset only exposes the 10 Cortex-X925 cores,
++    # host-wide threshold discovery still classifies all 10 as fast cores.
++    fast_cpuset, eff_cpuset = cpu_affinity.discover_cpu_topology(
++        sysfs_root=tmp_path, allowed={5, 6, 7, 8, 9, 15, 16, 17, 18, 19}
++    )
++    assert fast_cpuset == (5, 6, 7, 8, 9, 15, 16, 17, 18, 19)
++    assert eff_cpuset == ()
++
++
++def test_partition_gb10_cpuset_produces_strictly_disjoint_roles(tmp_path: Path):
++    _populate_gb10_sysfs(tmp_path)
++
++    # 1. Container cpuset = 5-9,15-19 (the promoted cluster.json cpuset)
++    plan_10 = cpu_affinity.partition_cpu_affinity(
++        allowed={5, 6, 7, 8, 9, 15, 16, 17, 18, 19},
++        sysfs_root=tmp_path,
++        proxy_cpu_spec="big",
++    )
++    assert plan_10.proxy_cpus == (19,)
++    assert plan_10.worker_main_cpus == (18,)
++    assert plan_10.engine_core_cpus == (17,)
++    assert plan_10.api_server_cpus == (15, 16)
++    assert plan_10.worker_aux_cpus == (5, 6, 7, 8, 9)
++
++    roles_10 = [
++        set(plan_10.proxy_cpus),
++        set(plan_10.worker_main_cpus),
++        set(plan_10.engine_core_cpus),
++        set(plan_10.api_server_cpus),
++        set(plan_10.worker_aux_cpus),
++    ]
++    for i, a in enumerate(roles_10):
++        for j, b in enumerate(roles_10):
++            if i != j:
++                assert a.isdisjoint(b), f"role {i} ({a}) overlaps role {j} ({b})"
++
++    # 2. Full 20-core host cpuset = 0-19 (API server also gets efficiency cores)
++    plan_20 = cpu_affinity.partition_cpu_affinity(
++        allowed=set(range(20)),
++        sysfs_root=tmp_path,
++        proxy_cpu_spec="big",
++    )
++    assert plan_20.proxy_cpus == (19,)
++    assert plan_20.worker_main_cpus == (18,)
++    assert plan_20.engine_core_cpus == (17,)
++    assert plan_20.worker_aux_cpus == (5, 6, 7, 8, 9)
++    assert plan_20.api_server_cpus == (0, 1, 2, 3, 4, 10, 11, 12, 13, 14, 15, 16)
++    assert set(plan_20.proxy_cpus).isdisjoint(plan_20.api_server_cpus)
++    assert set(plan_20.worker_main_cpus).isdisjoint(plan_20.api_server_cpus)
++
++
++def test_configure_and_apply_worker_and_role_thread_affinity(
++    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
++):
++    sysfs = tmp_path / "sysfs"
++    _populate_gb10_sysfs(sysfs)
++    task_dir = tmp_path / "task"
++    for tid, comm in [
++        (100, "VLLM::Worker_TP"),
++        (101, "gloo_tcp_loop"),
++        (102, "pt_nccl_watchdg"),
++        (103, "sparknet-proxy"),
++        (104, "engram-reader"),
++    ]:
++        td = task_dir / str(tid)
++        td.mkdir(parents=True)
++        (td / "comm").write_text(f"{comm}\n", encoding="utf-8")
++
++    calls: dict[int, set[int]] = {}
++    monkeypatch.setattr(
++        cpu_affinity.os,
++        "sched_getaffinity",
++        lambda pid: {5, 6, 7, 8, 9, 15, 16, 17, 18, 19},
++    )
++    monkeypatch.setattr(
++        cpu_affinity.os,
++        "sched_setaffinity",
++        lambda pid, cpus: calls.__setitem__(int(pid), set(cpus)),
++    )
++    monkeypatch.delenv(cpu_affinity.ENV_CONTAINER_CPUSET, raising=False)
++    monkeypatch.setenv(cpu_affinity.ENV_SPARKNET_PROXY_CPU, "big")
++    monkeypatch.delenv(cpu_affinity.ENV_ENGRAM_CPU_AFFINITY, raising=False)
++
++    plan = cpu_affinity.configure_worker_cpu_affinity(0, sysfs_root=sysfs)
++    assert plan is not None
++    assert cpu_affinity.os.environ[cpu_affinity.ENV_SPARKNET_PROXY_CPU] == "19"
++    assert cpu_affinity.os.environ[cpu_affinity.ENV_ENGRAM_CPU_AFFINITY] == "5-9"
++    assert calls[0] == {5, 6, 7, 8, 9}
++
++    applied = cpu_affinity.apply_worker_thread_affinity(
++        plan, sysfs_root=sysfs, task_root=task_dir, main_tid=100
++    )
++    assert calls[100] == {18}
++    assert calls[103] == {19}
++    assert calls[101] == {5, 6, 7, 8, 9}
++    assert calls[102] == {5, 6, 7, 8, 9}
++    assert calls[104] == {5, 6, 7, 8, 9}
++    assert applied["worker-main:100"] == (18,)
++    assert applied["sparknet-proxy:103"] == (19,)
++
++    # EngineCore and APIServer roles use the saved container cpuset and pin to
++    # disjoint cores (17 and 15-16).
++    ec_cpus = cpu_affinity.apply_role_cpu_affinity(
++        "engine_core", sysfs_root=sysfs, task_root=tmp_path / "no-task"
++    )
++    assert ec_cpus == (17,)
++    assert calls[0] == {17}
++
++    api_cpus = cpu_affinity.apply_role_cpu_affinity(
++        "api_server", sysfs_root=sysfs, task_root=tmp_path / "no-task"
++    )
++    assert api_cpus == (15, 16)
++    assert calls[0] == {15, 16}
++
++    # HostEngramHash instantiated after worker main thread is pinned to {18}
++    # keeps {18} instead of widening back to all 10 fast cores.
++    monkeypatch.setattr(host_hash.os, "sched_getaffinity", lambda pid: {18})
++    monkeypatch.setattr(
++        host_hash.os,
++        "sched_setaffinity",
++        lambda pid, cpus: calls.__setitem__(int(pid), set(cpus)),
++    )
++    pinned = host_hash.pin_to_max_l2_cpus(0, sysfs_root=sysfs)
++    assert pinned == [18]
++    assert calls[0] == {18}
+diff --git a/vllm/entrypoints/cli/serve.py b/vllm/entrypoints/cli/serve.py
+index c6a570e4a..291e96ad2 100644
+--- a/vllm/entrypoints/cli/serve.py
++++ b/vllm/entrypoints/cli/serve.py
+@@ -255,7 +255,11 @@ def run_headless(args: argparse.Namespace):
+             head_node_address,
+         )
+ 
++        from vllm.utils.cpu_affinity import apply_role_cpu_affinity, get_container_cpuset
++
++        get_container_cpuset(record_env=True)
+         executor = MultiprocExecutor(vllm_config, monitor_workers=False)
++        apply_role_cpu_affinity("engine_core")
+         executor.start_worker_monitor(inline=True)
+         return
+ 
+@@ -359,6 +363,9 @@ def run_multi_api_server(args: argparse.Namespace):
+         defer_api_server_ports=not (rust_frontend_path or is_ray_dp),
+     )
+ 
++    from vllm.utils.cpu_affinity import get_container_cpuset
++
++    get_container_cpuset(record_env=True)
+     with launch_core_engines(
+         vllm_config, executor_class, log_stats, addresses
+     ) as engine_launch:
+diff --git a/vllm/entrypoints/launchers/api_server/entry.py b/vllm/entrypoints/launchers/api_server/entry.py
+index 7f557b2bd..14da42a46 100644
+--- a/vllm/entrypoints/launchers/api_server/entry.py
++++ b/vllm/entrypoints/launchers/api_server/entry.py
+@@ -136,6 +136,9 @@ async def build_and_serve(
+     app = build_app(args, supported_tasks, model_config)
+     await init_app_state(engine_client, app.state, args, supported_tasks)
+ 
++    from vllm.utils.cpu_affinity import apply_role_cpu_affinity
++
++    apply_role_cpu_affinity("api_server")
+     logger.info("Starting vLLM server on %s", listen_address)
+ 
+     return await serve_http(
+@@ -187,6 +190,9 @@ async def run_server_worker(
+     if args.reasoning_parser_plugin and len(args.reasoning_parser_plugin) > 3:
+         ReasoningParserManager.import_reasoning_parser(args.reasoning_parser_plugin)
+ 
++    from vllm.utils.cpu_affinity import get_container_cpuset
++
++    get_container_cpuset(record_env=True)
+     async with build_async_engine_client(
+         args,
+         client_config=client_config,
+diff --git a/vllm/models/deepseek_v4_1/engram_rows/_reader.c b/vllm/models/deepseek_v4_1/engram_rows/_reader.c
+index d438f7259..949507983 100644
+--- a/vllm/models/deepseek_v4_1/engram_rows/_reader.c
++++ b/vllm/models/deepseek_v4_1/engram_rows/_reader.c
+@@ -628,12 +628,64 @@ static unsigned read_cpu_l2_kib(int cpu) {
+     return (unsigned)val;
+ }
+ 
++static int parse_cpu_list_mask(const char *spec, const cpu_set_t *allowed, cpu_set_t *out) {
++    CPU_ZERO(out);
++    if (!spec || !*spec) return 0;
++    const char *p = spec;
++    int count = 0;
++    while (*p != '\0') {
++        while (*p == ' ' || *p == '\t') p++;
++        char *end = NULL;
++        long start = strtol(p, &end, 10);
++        if (end == p || start < 0 || start >= CPU_SETSIZE) return 0;
++        long stop = start;
++        p = end;
++        if (*p == '-') {
++            p++;
++            stop = strtol(p, &end, 10);
++            if (end == p || stop < start || stop >= CPU_SETSIZE) return 0;
++            p = end;
++        }
++        for (long c = start; c <= stop; c++) {
++            if (!allowed || CPU_ISSET((int)c, allowed)) {
++                if (!CPU_ISSET((int)c, out)) {
++                    CPU_SET((int)c, out);
++                    count++;
++                }
++            }
++        }
++        while (*p == ' ' || *p == '\t') p++;
++        if (*p == ',') p++;
++        else if (*p != '\0') return 0;
++    }
++    return count;
++}
++
+ static void pin_worker_to_max_l2_cpus(void) {
++    pthread_setname_np(pthread_self(), "engram-reader");
+     const char *env = getenv("SPARK_DS41F_ENGRAM_CPU_AFFINITY");
+     if (env && strcmp(env, "0") == 0) return;
+     cpu_set_t allowed;
+     CPU_ZERO(&allowed);
+     if (sched_getaffinity(0, sizeof(allowed), &allowed) != 0) return;
++    if (env && *env && strcmp(env, "1") != 0 && strcmp(env, "auto") != 0) {
++        cpu_set_t explicit_set;
++        if (parse_cpu_list_mask(env, &allowed, &explicit_set) > 0 ||
++            parse_cpu_list_mask(env, NULL, &explicit_set) > 0) {
++            if (sched_setaffinity(0, sizeof(explicit_set), &explicit_set) == 0) {
++                unsigned max_kib = 0;
++                for (int cpu = 0; cpu < CPU_SETSIZE; cpu++) {
++                    if (!CPU_ISSET(cpu, &explicit_set)) continue;
++                    unsigned kib = read_cpu_l2_kib(cpu);
++                    if (kib > max_kib) max_kib = kib;
++                }
++                if (max_kib > 0) {
++                    __atomic_store_n(&worker_l2_kib, max_kib, __ATOMIC_RELAXED);
++                }
++                return;
++            }
++        }
++    }
+     unsigned max_kib = 0;
+     cpu_set_t best;
+     CPU_ZERO(&best);
+diff --git a/vllm/utils/cpu_affinity.py b/vllm/utils/cpu_affinity.py
+new file mode 100644
+index 000000000..9534cf45a
+--- /dev/null
++++ b/vllm/utils/cpu_affinity.py
+@@ -0,0 +1,456 @@
++# SPDX-License-Identifier: Apache-2.0
++# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
++"""Deterministic CPU core affinity partitioning for heterogeneous ARMv9 / GB10 nodes.
++
++On NVIDIA GB10 (20 ARMv9 cores across two L3 clusters: 10x Cortex-A725 efficiency
++cores cpu0..4, cpu10..14 at 2.808 GHz / 512 KiB L2 and 10x Cortex-X925 performance
++cores cpu5..9, cpu15..19 at 3.900 GHz / 2048 KiB L2), running the Rank-0 API server,
++EngineCore, GPU worker main thread, 25+ worker background threads (gloo_tcp_loop,
++pt_nccl_watchdg, engram-reader, OpenMP), and the sparknet RoCE proxy thread in a
++shared unpartitioned pool causes frequent context-switch preemption of both
++sparknet-proxy and VLLM::Worker_TP0 across the 116 per-step one-shot RoCE
++collectives.
++
++This module discovers fast performance cores and efficiency cores dynamically from
++sysfs (`cpufreq/cpuinfo_max_freq`, `cpu_capacity`, `cache/index2/size`) intersected
++with the container's allowed cpuset (`sched_getaffinity`), and partitions them into
++mutually disjoint core sets for:
++- `proxy_cpus`: dedicated fast core (CPU 19 on GB10) for `sparknet-proxy`
++- `worker_main_cpus`: dedicated fast core in the same L3 cluster (CPU 18 on GB10)
++  for the latency-critical `VLLM::Worker_TP*` main thread
++- `worker_aux_cpus`: disjoint fast cores (CPUs 5..9 on GB10) for worker background
++  threads (`engram-reader`, OpenMP, `gloo_tcp_loop`, `pt_nccl_watchdg`)
++- `engine_core_cpus`: disjoint core (CPU 17 on GB10) for `VLLM::EngineCore`
++- `api_server_cpus`: disjoint cores (CPUs 15..16 plus any allowed efficiency cores
++  0..4, 10..14 on GB10) for the Rank-0 API server, ZMQ frontend, and tokenizers.
++"""
++
++from __future__ import annotations
++
++import contextlib
++import os
++import threading
++from collections.abc import Iterable, Set
++from dataclasses import dataclass
++from pathlib import Path
++
++from vllm.logger import init_logger
++
++logger = init_logger(__name__)
++
++ENV_ROCE_CPU_AFFINITY = "VLLM_ROCE_CPU_AFFINITY"
++ENV_CONTAINER_CPUSET = "VLLM_CONTAINER_CPUSET"
++ENV_SPARKNET_PROXY_CPU = "SPARKNET_ROCE_PROXY_CPU"
++ENV_ENGRAM_CPU_AFFINITY = "SPARK_DS41F_ENGRAM_CPU_AFFINITY"
++_SYMBOLIC_PROXY_VALUES = {"", "big", "fast", "auto", "dedicated"}
++
++
++@dataclass(frozen=True)
++class CpuAffinityPlan:
++    allowed_cpus: tuple[int, ...]
++    fast_cpus: tuple[int, ...]
++    efficiency_cpus: tuple[int, ...]
++    proxy_cpus: tuple[int, ...]
++    worker_main_cpus: tuple[int, ...]
++    worker_aux_cpus: tuple[int, ...]
++    engine_core_cpus: tuple[int, ...]
++    api_server_cpus: tuple[int, ...]
++
++
++def parse_cpu_list(spec: str) -> list[int]:
++    """Parse a Linux CPU list string such as `'5-9,15-19'` into sorted unique ints."""
++    cpus: set[int] = set()
++    for raw_part in spec.split(","):
++        part = raw_part.strip()
++        if not part:
++            continue
++        if "-" in part:
++            start_s, stop_s = part.split("-", 1)
++            start, stop = int(start_s), int(stop_s)
++            if start < 0 or stop < start:
++                raise ValueError(f"invalid CPU range {part!r} in {spec!r}")
++            cpus.update(range(start, stop + 1))
++        else:
++            cpu = int(part)
++            if cpu < 0:
++                raise ValueError(f"invalid CPU number {part!r} in {spec!r}")
++            cpus.add(cpu)
++    return sorted(cpus)
++
++
++def format_cpu_list(cpus: Iterable[int]) -> str:
++    """Format a set/sequence of CPU IDs into compact range notation (`'5-9,15-19'`)."""
++    ordered = sorted(set(int(c) for c in cpus))
++    if not ordered:
++        return ""
++    ranges: list[str] = []
++    start = prev = ordered[0]
++    for cpu in ordered[1:]:
++        if cpu == prev + 1:
++            prev = cpu
++            continue
++        ranges.append(f"{start}-{prev}" if start != prev else f"{start}")
++        start = prev = cpu
++    ranges.append(f"{start}-{prev}" if start != prev else f"{start}")
++    return ",".join(ranges)
++
++
++def _parse_cache_kib(raw: str) -> int:
++    text = raw.strip().upper()
++    if not text:
++        return 0
++    if text.endswith("K"):
++        return int(text[:-1])
++    if text.endswith("M"):
++        return int(text[:-1]) * 1024
++    if text.endswith("G"):
++        return int(text[:-1]) * 1024 * 1024
++    return max(1, int(text) // 1024)
++
++
++def _read_int(path: Path) -> int:
++    try:
++        return int(path.read_text(encoding="utf-8").strip())
++    except (OSError, ValueError):
++        return -1
++
++
++def _cpu_metric_map(root: Path) -> dict[int, int]:
++    """Return a host-wide performance metric per CPU from sysfs.
++
++    Prefers `cpufreq/cpuinfo_max_freq` (kHz), then `cpu_capacity`, then
++    `cache/index2/size` (KiB).
++    """
++    if not root.is_dir():
++        return {}
++    cpus: list[int] = []
++    for entry in root.iterdir():
++        name = entry.name
++        if name.startswith("cpu") and name[3:].isdigit():
++            cpus.append(int(name[3:]))
++    cpus.sort()
++    if not cpus:
++        return {}
++
++    freqs = {
++        cpu: _read_int(root / f"cpu{cpu}" / "cpufreq" / "cpuinfo_max_freq")
++        for cpu in cpus
++    }
++    if any(v > 0 for v in freqs.values()):
++        return {cpu: val for cpu, val in freqs.items() if val > 0}
++
++    caps = {
++        cpu: _read_int(root / f"cpu{cpu}" / "cpu_capacity")
++        for cpu in cpus
++    }
++    if any(v > 0 for v in caps.values()):
++        return {cpu: val for cpu, val in caps.items() if val > 0}
++
++    l2s: dict[int, int] = {}
++    for cpu in cpus:
++        size_path = root / f"cpu{cpu}" / "cache" / "index2" / "size"
++        try:
++            kib = _parse_cache_kib(size_path.read_text(encoding="utf-8"))
++        except OSError:
++            continue
++        if kib > 0:
++            l2s[cpu] = kib
++    return l2s
++
++
++def get_container_cpuset(*, record_env: bool = True) -> set[int]:
++    """Return the container/process initial allowed CPU set before role narrowing."""
++    env_spec = os.environ.get(ENV_CONTAINER_CPUSET, "").strip()
++    if env_spec:
++        with contextlib.suppress(ValueError):
++            parsed = parse_cpu_list(env_spec)
++            if parsed:
++                return set(parsed)
++    allowed: set[int] = set()
++    if hasattr(os, "sched_getaffinity"):
++        with contextlib.suppress(OSError):
++            allowed = set(os.sched_getaffinity(0))
++    if not allowed:
++        count = os.cpu_count() or 1
++        allowed = set(range(count))
++    if record_env and ENV_CONTAINER_CPUSET not in os.environ:
++        os.environ[ENV_CONTAINER_CPUSET] = format_cpu_list(allowed)
++    return allowed
++
++
++def discover_cpu_topology(
++    sysfs_root: str | os.PathLike[str] = "/sys/devices/system/cpu",
++    allowed: Set[int] | None = None,
++) -> tuple[tuple[int, ...], tuple[int, ...]]:
++    """Classify allowed CPUs into `(fast_cpus, efficiency_cpus)`.
++
++    The threshold is computed across all online CPUs in `sysfs_root` first so that
++    containers started with `--cpuset-cpus=5-9,15-19` on GB10 still recognize all
++    10 Cortex-X925 cores as fast performance cores.
++    """
++    root = Path(sysfs_root)
++    allowed_set = (
++        set(int(c) for c in allowed)
++        if allowed is not None
++        else get_container_cpuset()
++    )
++    metrics = _cpu_metric_map(root)
++    if not metrics:
++        ordered = tuple(sorted(allowed_set))
++        return ordered, ()
++
++    best = max(metrics.values())
++    worst = min(metrics.values())
++    threshold = (best + worst) // 2
++
++    candidates = sorted(allowed_set) if allowed_set else sorted(metrics)
++    fast: list[int] = []
++    efficiency: list[int] = []
++    for cpu in candidates:
++        score = metrics.get(cpu)
++        if score is None:
++            continue
++        if best == worst or score > threshold:
++            fast.append(cpu)
++        else:
++            efficiency.append(cpu)
++
++    if not fast and efficiency:
++        # Allowed cpuset contains only efficiency cores; treat them as the usable pool.
++        return tuple(efficiency), ()
++    if not fast and not efficiency:
++        ordered = tuple(sorted(allowed_set))
++        return ordered, ()
++    return tuple(fast), tuple(efficiency)
++
++
++def partition_cpu_affinity(
++    allowed: Set[int] | None = None,
++    sysfs_root: str | os.PathLike[str] = "/sys/devices/system/cpu",
++    proxy_cpu_spec: str | None = None,
++) -> CpuAffinityPlan:
++    """Compute a deterministic, non-overlapping CPU core partition across roles."""
++    allowed_set = (
++        set(int(c) for c in allowed)
++        if allowed is not None
++        else get_container_cpuset()
++    )
++    fast_cpus, efficiency_cpus = discover_cpu_topology(
++        sysfs_root=sysfs_root, allowed=allowed_set
++    )
++    ordered_allowed = tuple(sorted(allowed_set)) if allowed_set else fast_cpus
++    if not fast_cpus:
++        fast_cpus = ordered_allowed
++
++    if proxy_cpu_spec is None:
++        proxy_cpu_spec = os.environ.get(ENV_SPARKNET_PROXY_CPU, "").strip()
++    else:
++        proxy_cpu_spec = proxy_cpu_spec.strip()
++
++    explicit_proxy: list[int] = []
++    if proxy_cpu_spec and proxy_cpu_spec not in _SYMBOLIC_PROXY_VALUES and proxy_cpu_spec != "none":
++        with contextlib.suppress(ValueError):
++            parsed = [c for c in parse_cpu_list(proxy_cpu_spec) if c in fast_cpus or c in ordered_allowed]
++            if parsed:
++                explicit_proxy = [parsed[-1]]
++
++    if explicit_proxy:
++        proxy_cpus = (explicit_proxy[0],)
++        remaining_fast = tuple(c for c in fast_cpus if c != proxy_cpus[0]) or fast_cpus
++    else:
++        proxy_cpus = (fast_cpus[-1],)
++        remaining_fast = fast_cpus[:-1] if len(fast_cpus) > 1 else fast_cpus
++
++    n_rem = len(remaining_fast)
++    if n_rem >= 5:
++        # GB10 (10 fast cores -> 9 remaining after proxy=19):
++        # worker_main = (18,) (same L3 cluster 15..19 as proxy=19)
++        # engine_core = (17,)
++        # api_server_fast = (15, 16) (when n_rem >= 6) or (16,)
++        # worker_aux = (5, 6, 7, 8, 9) (Cluster 0 fast cores)
++        worker_main_cpus = (remaining_fast[-1],)
++        engine_core_cpus = (remaining_fast[-2],)
++        api_fast_count = 2 if n_rem >= 6 else 1
++        api_fast = remaining_fast[-(2 + api_fast_count):-2]
++        worker_aux_cpus = remaining_fast[:-(2 + api_fast_count)]
++        api_server_cpus = tuple(sorted(set(efficiency_cpus) | set(api_fast)))
++    elif n_rem == 4:
++        worker_main_cpus = (remaining_fast[-1],)
++        engine_core_cpus = (remaining_fast[-2],)
++        api_server_cpus = tuple(sorted(set(efficiency_cpus) | {remaining_fast[-3]}))
++        worker_aux_cpus = (remaining_fast[0],)
++    elif n_rem == 3:
++        worker_main_cpus = (remaining_fast[-1],)
++        engine_core_cpus = (remaining_fast[-2],)
++        worker_aux_cpus = (remaining_fast[0],)
++        api_server_cpus = (
++            tuple(efficiency_cpus)
++            if efficiency_cpus
++            else (remaining_fast[-2],)
++        )
++    elif n_rem == 2:
++        worker_main_cpus = (remaining_fast[-1],)
++        worker_aux_cpus = (remaining_fast[0],)
++        engine_core_cpus = (
++            tuple(efficiency_cpus) if efficiency_cpus else (remaining_fast[0],)
++        )
++        api_server_cpus = (
++            tuple(efficiency_cpus) if efficiency_cpus else (remaining_fast[0],)
++        )
++    else:
++        worker_main_cpus = remaining_fast
++        worker_aux_cpus = remaining_fast
++        engine_core_cpus = tuple(efficiency_cpus) if efficiency_cpus else remaining_fast
++        api_server_cpus = tuple(efficiency_cpus) if efficiency_cpus else remaining_fast
++
++    return CpuAffinityPlan(
++        allowed_cpus=ordered_allowed,
++        fast_cpus=fast_cpus,
++        efficiency_cpus=efficiency_cpus,
++        proxy_cpus=proxy_cpus,
++        worker_main_cpus=worker_main_cpus,
++        worker_aux_cpus=worker_aux_cpus,
++        engine_core_cpus=engine_core_cpus,
++        api_server_cpus=api_server_cpus,
++    )
++
++
++def is_affinity_enabled() -> bool:
++    return os.environ.get(ENV_ROCE_CPU_AFFINITY, "1").strip() not in ("0", "false", "none")
++
++
++def configure_worker_cpu_affinity(
++    local_rank: int = 0,
++    sysfs_root: str | os.PathLike[str] = "/sys/devices/system/cpu",
++) -> CpuAffinityPlan | None:
++    """Prepare worker CPU environment variables and default thread affinity before
++    distributed/communicator initialization."""
++    del local_rank
++    if not is_affinity_enabled() or not hasattr(os, "sched_setaffinity"):
++        return None
++    plan = partition_cpu_affinity(sysfs_root=sysfs_root)
++    if not plan.fast_cpus:
++        return None
++
++    raw_proxy = os.environ.get(ENV_SPARKNET_PROXY_CPU, "").strip()
++    if raw_proxy in _SYMBOLIC_PROXY_VALUES and plan.proxy_cpus:
++        os.environ[ENV_SPARKNET_PROXY_CPU] = format_cpu_list(plan.proxy_cpus)
++
++    if ENV_ENGRAM_CPU_AFFINITY not in os.environ and plan.worker_aux_cpus:
++        os.environ[ENV_ENGRAM_CPU_AFFINITY] = format_cpu_list(plan.worker_aux_cpus)
++
++    # Set the worker process mask to worker_aux_cpus while distributed groups and
++    # helper threads (gloo_tcp_loop, pt_nccl_watchdg, pt_tcpstore_uv) spawn so
++    # they inherit worker_aux_cpus instead of the main worker core or proxy core.
++    if plan.worker_aux_cpus:
++        with contextlib.suppress(OSError):
++            os.sched_setaffinity(0, set(plan.worker_aux_cpus))
++    return plan
++
++
++def apply_worker_thread_affinity(
++    plan: CpuAffinityPlan | None = None,
++    *,
++    sysfs_root: str | os.PathLike[str] = "/sys/devices/system/cpu",
++    task_root: str | os.PathLike[str] = "/proc/self/task",
++    main_tid: int | None = None,
++) -> dict[str, tuple[int, ...]]:
++    """Pin the worker main thread, sparknet-proxy, and auxiliary worker threads to
++    their disjoint core partitions."""
++    if not is_affinity_enabled() or not hasattr(os, "sched_setaffinity"):
++        return {}
++    if plan is None:
++        plan = partition_cpu_affinity(sysfs_root=sysfs_root)
++    if not plan.fast_cpus:
++        return {}
++
++    if main_tid is None:
++        main_tid = threading.main_thread().native_id or os.getpid()
++
++    applied: dict[str, tuple[int, ...]] = {}
++    task_dir = Path(task_root)
++    if task_dir.is_dir():
++        for entry in sorted(task_dir.iterdir(), key=lambda p: p.name):
++            if not entry.name.isdigit():
++                continue
++            tid = int(entry.name)
++            comm = ""
++            with contextlib.suppress(OSError):
++                comm = (entry / "comm").read_text(encoding="utf-8").strip()
++            if comm == "sparknet-proxy":
++                target = plan.proxy_cpus
++                key = f"sparknet-proxy:{tid}"
++            elif tid == main_tid:
++                target = plan.worker_main_cpus
++                key = f"worker-main:{tid}"
++            else:
++                target = plan.worker_aux_cpus
++                key = f"{comm or 'worker-aux'}:{tid}"
++            if target:
++                with contextlib.suppress(OSError):
++                    os.sched_setaffinity(tid, set(target))
++                    applied[key] = target
++    else:
++        with contextlib.suppress(OSError):
++            os.sched_setaffinity(0, set(plan.worker_main_cpus))
++            applied[f"worker-main:{main_tid}"] = plan.worker_main_cpus
++    return applied
++
++
++def apply_role_cpu_affinity(
++    role: str,
++    *,
++    sysfs_root: str | os.PathLike[str] = "/sys/devices/system/cpu",
++    task_root: str | os.PathLike[str] = "/proc/self/task",
++) -> tuple[int, ...]:
++    """Pin an `engine_core` or `api_server` process (and its threads) to its
++    disjoint CPU core set."""
++    if not is_affinity_enabled() or not hasattr(os, "sched_setaffinity"):
++        return ()
++    plan = partition_cpu_affinity(sysfs_root=sysfs_root)
++    if role == "engine_core":
++        target = plan.engine_core_cpus
++    elif role == "api_server":
++        target = plan.api_server_cpus
++    else:
++        raise ValueError(f"unknown CPU affinity role: {role!r}")
++    if not target:
++        return ()
++
++    target_set = set(target)
++    task_dir = Path(task_root)
++    if task_dir.is_dir():
++        for entry in task_dir.iterdir():
++            if entry.name.isdigit():
++                with contextlib.suppress(OSError):
++                    os.sched_setaffinity(int(entry.name), target_set)
++    with contextlib.suppress(OSError):
++        os.sched_setaffinity(0, target_set)
++    logger.debug(
++        "Pinned %s (pid=%d) to CPUs %s (proxy=%s, worker_main=%s, worker_aux=%s)",
++        role,
++        os.getpid(),
++        format_cpu_list(target),
++        format_cpu_list(plan.proxy_cpus),
++        format_cpu_list(plan.worker_main_cpus),
++        format_cpu_list(plan.worker_aux_cpus),
++    )
++    return target
++
++
++__all__ = [
++    "CpuAffinityPlan",
++    "ENV_CONTAINER_CPUSET",
++    "ENV_ENGRAM_CPU_AFFINITY",
++    "ENV_ROCE_CPU_AFFINITY",
++    "ENV_SPARKNET_PROXY_CPU",
++    "apply_role_cpu_affinity",
++    "apply_worker_thread_affinity",
++    "configure_worker_cpu_affinity",
++    "discover_cpu_topology",
++    "format_cpu_list",
++    "get_container_cpuset",
++    "is_affinity_enabled",
++    "parse_cpu_list",
++    "partition_cpu_affinity",
++]
+diff --git a/vllm/v1/engine/core.py b/vllm/v1/engine/core.py
+index 8c28414a1..78ee820ac 100644
+--- a/vllm/v1/engine/core.py
++++ b/vllm/v1/engine/core.py
+@@ -1536,6 +1536,9 @@ class EngineCoreProc(EngineCore):
+             signal.signal(signal.SIGTERM, signal_handler)
+             signal.signal(signal.SIGINT, signal_handler)
+ 
++            from vllm.utils.cpu_affinity import apply_role_cpu_affinity
++
++            apply_role_cpu_affinity("engine_core")
+             engine_core.run_busy_loop()
+ 
+         except SystemExit as e:
+diff --git a/vllm/v1/worker/gpu_worker.py b/vllm/v1/worker/gpu_worker.py
+index d7358d233..bb3245136 100644
+--- a/vllm/v1/worker/gpu_worker.py
++++ b/vllm/v1/worker/gpu_worker.py
+@@ -72,6 +72,10 @@ from vllm.profiler.wrapper import (
+ from vllm.sequence import IntermediateTensors
+ from vllm.tasks import SupportedTask
+ from vllm.tracing import instrument
++from vllm.utils.cpu_affinity import (
++    apply_worker_thread_affinity,
++    configure_worker_cpu_affinity,
++)
+ from vllm.utils.gc_utils import freeze_gc_heap, maybe_attach_gc_debug_callback
+ from vllm.utils.gpu_sync_debug import enable_gpu_sync_check, with_gpu_sync_check
+ from vllm.utils.mem_constants import GiB_bytes
+@@ -508,6 +512,8 @@ class Worker(WorkerBase):
+ 
+             current_platform.check_if_supports_dtype(self.model_config.dtype)
+ 
++            self._cpu_affinity_plan = configure_worker_cpu_affinity(self.local_rank)
++
+             # Initialize the distributed environment BEFORE taking
+             # memory snapshot
+             # This ensures NCCL buffers are allocated before we measure
+@@ -584,6 +590,8 @@ class Worker(WorkerBase):
+                 )
+             self.model_runner = GPUModelRunnerV1(self.vllm_config, self.device)
+ 
++        apply_worker_thread_affinity(getattr(self, "_cpu_affinity_plan", None))
++
+         if self.rank == 0:
+             # If usage stat is enabled, collect relevant info.
+             report_usage_stats(self.vllm_config)
+@@ -611,6 +619,7 @@ class Worker(WorkerBase):
+                 self.device,
+                 self.model_runner.get_model(),
+             )
++        apply_worker_thread_affinity(getattr(self, "_cpu_affinity_plan", None))
+ 
+     def update_config(self, overrides: dict[str, Any]) -> None:
+         self.model_runner.update_config(overrides)
+@@ -1211,6 +1220,8 @@ class Worker(WorkerBase):
+                 "vLLM warm-up is complete"
+             )
+ 
++        apply_worker_thread_affinity(getattr(self, "_cpu_affinity_plan", None))
++
+         # Freeze the worker heap so the GC won't scan static objects
+         # (model weights, KV caches, CUDA graphs) during inference.
+         freeze_gc_heap()

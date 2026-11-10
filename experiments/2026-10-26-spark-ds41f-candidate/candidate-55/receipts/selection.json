@@ -1,0 +1,185 @@
+{
+ "candidate": 55,
+ "shape": "tp4-ring",
+ "nodes": "dgx1..dgx4",
+ "purpose": "PR validation (docs/release-benchmark.md, steps 1-8): one of candidates 55, 56 and 57, tested at the same time, one per testbed",
+ "theme": "the rank-0 and RoCE-proxy CPU affinity (#1008, with its sparknet patch), the multimodal prefix-cache fast path (#978) and the dead-row sampler skip (#988's dead-row part). All declare no output change, so 55's gate on production's shape is a pure identity check. #995's guard is left out (left_out)",
+ "base": "candidate-54",
+ "base_series": "candidate-54's vllm/series by relative path (spark-ds41f-1107's 0001..0761, 641 active; candidate-50's 0762..0780 with #1009 round 1 in place of its 0778; round 2's 0781..0791): 671 patches",
+ "base_lock": "experiments/2026-10-26-spark-ds41f-candidate/candidate-54/upstreams.lock.json",
+ "base_head": "4e8133ff10a125b90753c2727f162e29fe37f30c",
+ "base_tree": "5f021d9a7f01c03e2389dd3d8021759cfa19ea34",
+ "stack_head": "410463b3c58362448e6d440503b677e72e87153a",
+ "stack_tree": "e39b835cbb6c4e5d148c260af1f1b5b0cefb322e",
+ "patchset_sha256": "6a1f3da3620455e6ed5a7f2bf7f0ef1f313cf4fded17f58852256366ce1302d9",
+ "order": [
+  1008,
+  978,
+  988
+ ],
+ "patches": [
+  {
+   "patch": "0792-perf-worker-roce-proxy-and-rank0-fast-core-affinity.patch",
+   "pr": 1008,
+   "label": "1008",
+   "pr_title": "perf(worker): roce proxy and rank0 fast-core affinity partition",
+   "pr_head": "7f29f8934f00c6b49996cb0e25be9ce5f56aa91c",
+   "source_patch": "experiments/2026-11-08-roce-proxy-fast-core-affinity/vllm/0762-perf-worker-roce-proxy-and-rank0-fast-core-affinity.patch",
+   "source_sha256": "c1cb8d079f457711dfa1072c22956152888c614cd0c35ea762a2a4618b9f2d2d",
+   "method": "git am",
+   "proposed_patch": "experiments/2026-10-26-spark-ds41f-candidate/candidate-55/receipts/rebases/55-01-perf-worker-roce-proxy-and-rank0-fast-core-affinity.patch",
+   "proposed_sha256": "c1cb8d079f457711dfa1072c22956152888c614cd0c35ea762a2a4618b9f2d2d",
+   "applied": "clean; the PR's patch byte for byte (git am)",
+   "sha256": "c1cb8d079f457711dfa1072c22956152888c614cd0c35ea762a2a4618b9f2d2d",
+   "subject": "perf(worker): roce proxy and rank0 fast-core affinity partition",
+   "author": "Christopher Owen <3221756+christopherowen@users.noreply.github.com>",
+   "commit": "7e36cafc16cf07163d8ba5db2aaa65b7ed90ea65",
+   "tree": "07d61ecc499a74c51eaa7b8628473c211caee14c",
+   "kind": "perf (host)",
+   "category": "H",
+   "own_mark": "Its bench_roce_core_affinity.py and pytest (tests/v1/worker/test_roce_cpu_affinity.py, tests/kernels/test_deepseek_v41_engram_host_placement.py) and the sparknet unit tests on the candidate image, 2 boots, ABBA against the candidate-54 image in the same session. Against the base's placement (the recipe already runs the shared big-core regime: SPARKNET_ROCE_PROXY_CPU=big, --cpuset-cpus=5-9,15-19), the PR shows the mean per-step 116-collective time 0.106 and 0.084 ms (two boots) -> 0.081 and 0.082 ms, and removes rank-0 preemption spikes (step p99 0.939 ms on one shared-big boot): pass needs the step p99 under rank-0 API load lower beyond the interval and the mean not worse. On tp4-ring: the screen's 16-stream closed loop (paired decode, ITL percentiles) and time to ready not worse",
+   "declared_output_change": "none",
+   "acts": "every shape: configure_worker_cpu_affinity replaces the symbolic SPARKNET_ROCE_PROXY_CPU=big with its planned core and VLLM_ROCE_CPU_AFFINITY defaults to on",
+   "placement": "needs a multi-rank TP4 testbed with the rank-0 API server under load (its own bench is one node); shares vllm/v1/engine/core.py with #978, so the two share a candidate"
+  },
+  {
+   "patch": "0793-perf-multimodal-prefix-cache-fastpath-under-mm-proce.patch",
+   "pr": 978,
+   "label": "978",
+   "pr_title": "perf(multimodal): prefix-cache host fastpath under --mm-processor-cache-gb 0",
+   "pr_head": "67792978d16d3c5ce77666b983012cd28bf82dce",
+   "source_patch": "experiments/2026-11-08-multimodal-prefix-cache-fastpath/vllm/0762-perf-multimodal-prefix-cache-fastpath-under-mm-proce.patch",
+   "source_sha256": "f5b3787945852ead8b53d0d1e104c22a8d999861f56ab337d7c14efad3b6a920",
+   "method": "context-only rebase",
+   "proposed_patch": "experiments/2026-10-26-spark-ds41f-candidate/candidate-55/receipts/rebases/55-02-perf-multimodal-prefix-cache-fastpath-under-mm-proce.patch",
+   "proposed_sha256": "0beb02afbb56e13d59b85e43ef1fb7ace7be697adf3d87e69a09f08a30154105",
+   "applied": "clean; the selection's context-only rebase (receipts/rebases/rebases.json, context_only_resolution.978): every added and removed line is the PR's",
+   "sha256": "0beb02afbb56e13d59b85e43ef1fb7ace7be697adf3d87e69a09f08a30154105",
+   "subject": "perf(multimodal): prefix-cache fastpath under --mm-processor-cache-gb 0",
+   "author": "Christopher Owen <christopherowen@users.noreply.github.com>",
+   "commit": "3feb241eaa077d6835b37ec8fd1af5ab617a375b",
+   "tree": "d369eac60860046089ec553c687691ecf9c39da3",
+   "kind": "perf (host)",
+   "category": "H",
+   "own_mark": "Its bench_mm_prefix_fastpath.py and tests/multimodal/test_prefix_cache_fastpath.py on the candidate image, 2 boots, ABBA against the candidate-54 image: turn-2+ host processing of repeated images faster beyond the interval (the PR: 1302x1302 JPEG 18.1 -> 1.4 ms, 4 x 3840x2160 PNG 705 -> 40 ms), prompt token ids and mm hashes identical; plus a live two-turn image chat on the testbed whose second turn returns the base's text at temperature 0 (it exercises #972's abort path and the retry map this rebase touches). The screen sends no images, so on the testbed it shows only that no core metric is worse",
+   "declared_output_change": "none",
+   "acts": "image requests: the recipe sets --mm-processor-cache-gb 0 (cache None, the fast path's condition) and DeepseekV4VLMultiModalProcessor inherits BaseMultiModalProcessor._cached_apply_hf_processor",
+   "placement": "host-side; shares core.py with #1008; context-only rebase onto #972 (rebases/rebases.json)"
+  },
+  {
+   "patch": "0794-perf-spec_decode-sample-skip-dead-verification-rows-.patch",
+   "pr": 988,
+   "label": "988-deadrow",
+   "pr_title": "experiments: add dead-row verification sampler skip and sparse top-k draft sampling",
+   "pr_head": "cfb7069e6882dc53e2b1b65bef80c9477c3f14d9",
+   "source_patch": "experiments/2026-11-08-sampler-dead-row-skip-and-sparse-topk/vllm/0762-perf-spec-decode-sampler-dead-row-skip-and-sparse-topk.patch",
+   "source_sha256": "ddf963daad8e05804a95b668f761ad0554683a6798f473b725bd61720e649934",
+   "method": "hunk-level split",
+   "proposed_patch": "experiments/2026-10-26-spark-ds41f-candidate/candidate-55/receipts/rebases/55-03-988-deadrow-perf-spec-decode-sampler-dead-row-skip-and-sparse-topk.patch",
+   "proposed_sha256": "8a214c505ab76e2a3340cb5f516a28dbf67d68350008fd65f0ed1a3b3705f55d",
+   "applied": "clean; the selection's hunk-level split (every kept line unchanged), retitled for the part it carries: the Subject and one body line naming the PR's subject changed, no diff byte",
+   "sha256": "a31fb8269bc0b75ddda67a8b812490e0710dc83e0cf934be56bf1adf3c2accbf",
+   "subject": "perf(spec_decode,sample): skip dead verification rows in sampler",
+   "pr_subject": "perf(spec_decode,sample): skip dead verification rows in sampler and sample DSpark top-k sparsely",
+   "author": "Christopher Owen <christopherowen@users.noreply.github.com>",
+   "commit": "410463b3c58362448e6d440503b677e72e87153a",
+   "tree": "e39b835cbb6c4e5d148c260af1f1b5b0cefb322e",
+   "kind": "perf (sampler)",
+   "category": "P",
+   "own_mark": "Its screen_dead_row_and_sparse_topk.py, dead-row cells only, and tests/v1/worker/test_dead_rows.py on the candidate image, 2 boots, ABBA: Sampler.apply_sampling_params with dead_row_cut faster beyond the interval at 8 and 16 requests with top_p < 1, top_k, min_p or penalties; live rows bit-exact. Kernel time and CUDA-graph replay where the path is captured, both recorded",
+   "declared_output_change": "none (live verification rows bit-exact; dead rows are never read)",
+   "acts": "only on verification steps where a request needs non-temperature logits processing (top_k, top_p < 1, min_p, penalties, logit_bias or min_tokens, bad_words, a thinking budget). The recipe's defaults (temperature 1.0, top_p 1.0) and every screen suite send none of these, so the screen sees only its startup (the masked copy_logits and mask_dead_rows kernels are declared) and 'no core metric worse'",
+   "placement": "TP4's 16 streams give the most verification rows; touches no other proposed patch's file"
+  }
+ ],
+ "sparknet": {
+  "series": "experiments/2026-10-26-spark-ds41f-candidate/candidate-55/sparknet/series",
+  "patch": "0001-perf-oneshot-pin-RoCE-proxy-thread-to-dedicated-fast.patch",
+  "pr": 1008,
+  "pr_head": "7f29f8934f00c6b49996cb0e25be9ce5f56aa91c",
+  "source_patch": "experiments/2026-11-08-roce-proxy-fast-core-affinity/sparknet/0001-perf-oneshot-pin-RoCE-proxy-thread-to-dedicated-fast.patch",
+  "source_sha256": "888ae62c8fd10eb709a80325849b7b443081c62df289afc1c0b3c4c0ffaa13cc",
+  "sha256": "888ae62c8fd10eb709a80325849b7b443081c62df289afc1c0b3c4c0ffaa13cc",
+  "method": "git am, byte for byte from the PR head",
+  "on": "1107's pin 1fd6a1fbd8dc4884057046d1ebd93d585c9e4bcf (tree 8cc28a5cd3e683c1f114ed843453e3ce34f323e0)",
+  "patch_head": "d50a1b4c3c5380b97b934ed882c98a707e09c180",
+  "expected_tree": "dab8c4577ac1cd87f7abc59a9c44a8e9d146f579",
+  "patchset_sha256": "d58b3be5f948cbc58c9f3181a56ce6c0a3fe23da78589123b799186f3dcdc2ee",
+  "author": "Christopher Owen <3221756+christopherowen@users.noreply.github.com>",
+  "precedent": "experiments/2026-10-26-spark-ds41f-candidate/rc18/upstreams.lock.json and rc18/sparknet/series (and #1008's own lock)",
+  "note": "The PR's README names the sparknet commit 88366d5f; build prepare's git am with the fixed committer gives d50a1b4c, the commit the patch's From line names, with the PR's stated tree dab8c457."
+ },
+ "left_out": [
+  {
+   "pr": 995,
+   "label": "995-guard",
+   "patch": "experiments/2026-10-26-spark-ds41f-candidate/candidate-55/receipts/rework/pr-995-guard-r1/0781-fix-spec_decode-guard-negative-slots-in-copy_alloc-a.patch",
+   "part": "the negative-slot guard in copy_alloc and copy_apply (tilelang_copy.py) and its canary test, as reworked in round 3",
+   "reason": "does nothing on this deployment: its rework's caller trace shows that no serving path passes a negative slot to copy_alloc or copy_apply (both get input_batch.idx_mapping, real slots from RequestState; only copy_match receives -1 rows, and it already guards slot >= 0). So it guards a path nothing takes, and under step 1's deployment-only rule it does not belong in a candidate. The rework is bit-exact and costs nothing measurable at the copy-step bench (about 40 ns of device time a step at kernel level)",
+   "trace": "experiments/2026-10-26-spark-ds41f-candidate/candidate-55/receipts/rework/pr-995-guard-r1/result.json (serving_effect.caller_trace)",
+   "rework_verdict": "ready",
+   "rework": "experiments/2026-10-26-spark-ds41f-candidate/candidate-55/receipts/rework/pr-995-guard-r1",
+   "disposition": "left out at assembly (coordinator, 2026-11-10); the rework's deliverables are kept"
+  },
+  {
+   "pr": 995,
+   "label": "995-ramp",
+   "part": "SPARK_DS41F_COPY_MAX_DRAFTS (vllm/config/speculative.py), greedy_rejection_kernel widths above 32 (tilelang_sampling.py), benchmark_copy_drafts.py --lookahead, test_wide_lookahead_31_and_63_greedy_verification_and_ramp",
+   "reason": "does nothing on this deployment: the 31/63-draft ramp is opt-in; the recipe keeps max_drafts at 16 (17 rows)",
+   "disposition": "left out at selection"
+  },
+  {
+   "pr": 995,
+   "label": "995-decay-and-anchor",
+   "part": "the copy_alloc cap decay and copy_match's anchor pruning",
+   "reason": "separate variables from the guard; the pruning conflicts with #977's two-tier scan",
+   "disposition": "queued as their own experiments on the new base (selection-proposal.json, queued)"
+  },
+  {
+   "pr": 988,
+   "label": "988-topk",
+   "part": "sparse top-k DSpark draft sampling: tilelang_sampling.py hunk 7 (the topk_* kernels and topk_drafting_calls), dspark/speculator.py (the _cached_topk_indices path, two getattr guards, _sample_sequential_topk), nvidia/dspark.py and qwen3_dspark.py (apply_markov_bias_topk), tests/v1/spec_decode/test_dspark_topk.py and test_dspark_v41_gathered_markov.py",
+   "reason": "does nothing on this deployment: it runs only when dspark_draft_topk is set, and neither the recipe nor the 1017 checkpoint's config sets it (drafts are greedy)",
+   "disposition": "left out at selection (hunk-level split); the split is sp8's rebased/988-topk.diff (applies plainly)"
+  }
+ ],
+ "semantic_review": {
+  "summary": "No semantic conflict found. #1008 and #978 share vllm/v1/engine/core.py and apply cleanly in both orders (receipts/stack.log, section 4); #988's dead-row part shares no file with either. Files a 55 patch shares with a base patch were read hunk by hunk at the stacked commits.",
+  "files": [
+   {
+    "file": "vllm/v1/engine/core.py",
+    "patches": [
+     "0792 #1008",
+     "0793 #978"
+    ],
+    "review": "#1008: run_engine_core applies apply_role_cpu_affinity('engine_core') when the engine core process starts. #978: EngineCore._has_stripped_mm_data and _verify_or_resolve_stripped_mm_features, on the request path, resolve P1-resident multimodal items the frontend stripped. Different functions."
+   },
+   {
+    "file": "vllm/v1/engine/async_llm.py",
+    "patches": [
+     "0771 #972 (base)",
+     "0793 #978"
+    ],
+    "review": "the selection's context-only rebase: #978's two retry-map pops go before #972's shielded abort block; no line of either is edited (receipts/rebases/rebases.json)"
+   },
+   {
+    "file": "vllm/v1/core/sched/scheduler.py",
+    "patches": [
+     "0786 #968 (base)",
+     "0793 #978"
+    ],
+    "review": "#968: the decode verify-row clamp (hunks at 380-1625); #978: the multimodal cache-miss hand-off (a hunk at 3415). Different functions."
+   },
+   {
+    "file": "vllm/v1/worker/gpu/sample/sampler.py",
+    "patches": [
+     "0769 #980 round 1 (base)",
+     "0794 #988 dead-row"
+    ],
+    "review": "#980 round 1: the sampler's seed argument (hunks at 54, 441, 470); #988: dead_row_cut and live_idx_mapping through apply_sampling_params (hunks at 346-402). Different statements; #988 acts only with non-temperature parameters."
+   }
+  ]
+ },
+ "authors": "Every PR is christopherowen's (the selection's gh pr view, scripts-as-run/outputs/authors.tsv). Every patch's From: is Christopher Owen's (christopherowen@users.noreply.github.com or 3221756+christopherowen@users.noreply.github.com), checked in receipts/stack.log.",
+ "selection_receipts": "experiments/2026-10-26-spark-ds41f-candidate/candidate-55/receipts/selection-proposal.json"
+}

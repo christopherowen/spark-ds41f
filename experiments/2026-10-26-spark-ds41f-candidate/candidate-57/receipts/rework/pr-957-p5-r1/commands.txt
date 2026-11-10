@@ -1,0 +1,88 @@
+# #957 part 5 (TP3 adaptive-verification constants), round 3 rebase onto candidate-54 for candidate-57
+# (tp3-switched), last after 957-p2 and 957-p4. Commands as run, 2026-11-10.
+# Host: sp8 (spark-0016, NVIDIA GB10). B = sp8:~/spark-lab/agents/round3-957p5. L = this folder (laptop scratchpad).
+# Laptop: git fetch and git show of receipts, file transfers, text work (editing the two files, scripts, the
+# message, result.json). No series replay and no build there. No push, commit to this repository, PR, image
+# build, cluster or window operation. Every container went through scripts/run.sh: it takes
+# flock /tmp/spark-lab-gpu.lock, then checks that ~/spark-hold.json is absent and docker ps is empty inside
+# the lock, and logs the block. raw/out/commands.log is the log of every container as run.
+
+## 0. Inputs (laptop)
+git fetch origin main; git fetch origin pull/957/head         # origin/main 6de8656022; PR head e464d364431a
+git show FETCH_HEAD:experiments/2026-11-08-tp3-decode-recovery/{README.md,vllm/0762-perf-dsv41-tp3-decode-compressor-mla-and-spec-fusions.patch}
+#   0762 sha256 44412274... = selection-proposal.json's source_sha256
+git show origin/main:docs/release-benchmark.md                  # Candidates, steps 7 and 8
+git show origin/main:releases/spark-ds41f-1107/cluster.json     # tau 0.2, row cost 0.035, 5 drafts; TP3 max_num_seqs 8
+git show origin/main:scripts/recipe.py                          # capture ladder (TP3: ..., 32, 40, 48)
+git show origin/main:experiments/2026-10-26-spark-ds41f-candidate/candidate-53/receipts/rework/pr-971-r1/{result.json,commands.txt}
+P=experiments/2026-10-26-spark-ds41f-candidate/candidate-47/receipts/rework/pr-986-r1
+git show origin/main:$P/{analysis.md,commands.txt,served_targets.json,replay-seed0.json,replay-seed1.json,scripts/replay_budget.py}
+R=experiments/2026-10-26-spark-ds41f-candidate/candidate-50/receipts/references
+git show origin/main:$R/candidate-50-no1009-tp3-switched-screen{,-again}/grid.json     # the TP3 grid
+git show origin/main:$R/candidate-50-no1009-tp4-switched-screen{,-again}/grid.json     # comparison only
+git show origin/main:$R/candidate-50-no1009-tp3-switched-screen{,-again}/c8.json       # served c8 anchor + counters
+git show origin/main:$R/candidate-50-no1009-tp3-switched-screen-single-stream/c1.json  # served c1 anchor + counters
+# read: round3-select/.../candidate-55/receipts/{selection-proposal.json,pr-triage-2026-11-10.md}, rebases/57-0{1,2}-*.patch
+#   (sha256 67ed1f5f..., b8f0bf3a... = selection-proposal.json); sp8 ~/spark-lab/agents/round-55-57-select (splits/957-p5.patch)
+scp <inputs> sp8:B/in/                                         # sha256 in result.json inputs.sha256
+
+## 1. Tree and patch (sp8)
+cd B && git clone -q --shared ~/spark-lab/agents/round-55-57-select/c54-vllm vllm && cd vllm
+git checkout -q -b p5 <cand-57>                                # f7a66bbed: candidate-54 4e8133ff + 957-p2 + 957-p4, tree 72b40d71
+#   adaptive_verification.py and its test equal candidate-54's (sha256 69f6aad9..., eb522ceb...)
+# edits made on the laptop on copies of those two files (L/../work957p5), then scp'd back:
+#   adaptive_verification.py: HIGH_ROW_COST_SCALE_TP3, MIN_CALIBRATED_DEAD_ROWS_TAU_TP3, _tp_world_size() (the PR's);
+#   __init__ picks high_row_cost_scale and min_calibrated_dead_rows_tau by TP size, keeps single_req_tile_spill_scale;
+#   effective_dead_rows_tau floors the calibrated break-even (the PR's); docstrings
+#   test_adaptive_verification.py: the PR's appended TP3 block (24/32) plus a TP4 block, and 3 new tests (6 cases)
+git diff --check                                               # clean
+git -c user.name="Christopher Owen" -c user.email="3221756+christopherowen@users.noreply.github.com" commit \
+  --author="Christopher Owen <3221756+christopherowen@users.noreply.github.com>" --date="Sun, 8 Nov 2026 11:30:00 +0100" \
+  -F ../patches/msg-p5.txt                                     # committer date set to the same (GIT_COMMITTER_DATE)
+git commit --amend -F ../patches/msg-p5.txt                     # once, after the replay: the message's replay ranges; tree 5016d620 unchanged
+git format-patch -1 HEAD --start-number 3 -o ../fp              # -> L/57-03-957-p5-perf-dsv41-tp3-decode-compressor-mla-and-spec-fusions.patch
+#   (the first format, before the amend, was af86f107...; the delivered one is ffefecae...)
+
+## 2. Overlays (sp8, no container)
+C50=d5778ab56647a20d94710ecb94cfd9a4de27bee9                    # spark-ds41f:candidate-50's vLLM tree (image label); sp8 has no candidate-54 image
+git diff --name-only --diff-filter=AM $C50 4e8133ff1 > ../in/changed-c54.txt      # 36 files
+git diff --name-only --diff-filter=AM $C50          > ../in/changed-c57p5.txt    # 42 files (candidate-57 + this patch, working tree)
+# (no deletions either way); ovl/c54/<f> = git show 4e8133ff1:<f>; ovl/c57p5/<f> = the working tree's
+cp ovl/c54/.../adaptive_verification.py in/av_c54.py; cp vllm/.../adaptive_verification.py in/av_p5.py
+#   av_c54 69f6aad9..., av_p5 e1434cdc... (= series tree, = overlay/)
+
+## 3. Containers (sp8, each through scripts/run.sh; image spark-ds41f:candidate-50 = 8c1ea1f62f62)
+scripts/run.sh quick-budget ... python3 /w/scripts/quick_budget.py               # numpy emulation, no vllm (out/quick-budget.txt)
+scripts/run.sh image-paths ...                                                 # vllm at /opt/spark-ds41f/candidate/vllm
+scripts/replay.sh smoke-seed0 0 300                                            # smoke, kept (out/smoke-seed0.*)
+scripts/pytest.sh pytest-c57p5-run1 c57p5                                      # 52 passed, 1 skipped
+scripts/fit_tp3.sh 0; scripts/fit_tp3.sh 1                                     # #986's fit_conf on TP3 served counters (CPU only)
+nohup scripts/q.sh > out/q.log &                                               # 01:33Z; each job takes the lock on its own:
+#   replay.sh replay-986fit-seed0 0 20000          (#986 r1's fitted profile, seed 0)
+#   replay.sh replay-986fit-seed1 1 20000          (seed 1)
+#   replay.sh replay-tp3fit-seed0 0 20000 /w/out/fit-tp3-seed0.json   (sensitivity: TP3 served fit)
+#   replay.sh replay-tp3fit-seed1 1 20000 /w/out/fit-tp3-seed1.json
+#   pytest.sh pytest-c57p5-run2 c57p5              52 passed, 1 skipped
+#   pytest.sh pytest-c54 c54                       46 passed, 1 skipped (the base)
+scripts/run.sh summ-986fit-seed0 / summ-all ... python3 /w/scripts/summ.py <replays>   # text summaries
+#   summ-all exited 1: it ran between queue jobs, before replay-tp3fit-seed1.json existed, so it summarizes the
+#   other three. cells.py reads all four replays directly.
+# replay.sh: --gpus all --network none --cpus 4 -e SPARK_DS41F_DSPARK_DEAD_ROWS_TAU=0.2, candidate-54's 36 files
+#   mounted ro over /opt/spark-ds41f/candidate/vllm, python3 /w/scripts/replay_957p5.py --c54 in/av_c54.py
+#   --p5 in/av_p5.py --served in/986-served_targets.json --fit <fit> --grid3 <2 TP3 grids> --grid4 <2 TP4-switched
+#   grids> --tp3-c8 <2> --tp3-c1 <1> --steps 20000 (each replay ran about 23 s)
+# pytest.sh: --gpus all --network none --ipc=host, the arm's files mounted ro, -w /opt/spark-ds41f/candidate/vllm,
+#   python3 -m pytest --noconftest -p no:cacheprovider -v tests/v1/spec_decode/test_adaptive_verification.py
+
+## 4. Series check (sp8, no container) -> raw/series-check.txt
+git clone -q --shared vllm series-check && cd series-check && git checkout -q --detach 4e8133ff10a125b90753c2727f162e29fe37f30c
+git am -q --committer-date-is-author-date ../patches/57-01-957-p2-*.patch ../patches/57-02-957-p4-*.patch   # tree 72b40d71
+git am -q --committer-date-is-author-date ../patches/57-03-957-p5-*.patch                                   # tree 5016d620
+git diff --check 4e8133ff1 HEAD                                                                             # clean
+# the 42 measured overlay files equal the series tree's (raw/overlay-sha.txt); git apply --check of the patch on
+# candidate-54's two files (no957p5/overlay/) passes
+
+## 5. Analysis (laptop)
+rsync -a sp8:B/out/ raw/out/; rsync -a sp8:B/scripts/ raw/scripts/; rsync sp8:B/in/{av_*.py,changed-*.txt,deleted-*.txt} raw/in/
+python3 -I raw/scripts/cells.py raw/out <986 replay-seed0.json> <986 replay-seed1.json> raw/cells.json   # + #986's model M
+python3 -I raw/scripts/mkresult.py .                                                                    # -> result.json

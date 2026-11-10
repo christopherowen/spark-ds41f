@@ -1,0 +1,2103 @@
+{
+ "pr": 995,
+ "label": "995-guard",
+ "kind": "fix (robustness)",
+ "round": "candidate-55 (round 3), rework of the selection's rework_needed[995-guard]",
+ "date": "2026-11-10",
+ "verdict": "ready",
+ "verdict_basis": [
+  "Canary: test_negative_slot_bounds_guard_in_alloc_and_apply passes on the candidate arm in both boots (63 passed each; candidate-54's own suite: 62 passed), and fails on candidate-54's kernels (copy_alloc writes int_state[-1]: the canary row 888888 reads 0, 0).",
+  "Bit-exact: 882 copy steps a boot (copy_match, copy_alloc, copy_apply; 126 cells; copy state carried over seven steps; a mid-prefill step; 5,892 copies taken and 120 refused) hash the same on all four boots of both arms.",
+  "Copy-step bench (benchmark_copy_drafts.py --gate --cases copy, the copy step of #977's own-mark harness, unmodified): within budget on every boot of both arms; against candidate-54, ABBA in one session, the six boots an arm at 201 replays pooled: 24 of 24 cells same (-3.2%..+5.9%). Single ABBA sets flag 0-5 cells either way, a different cell each time (bimodal medians); no cell is flagged slower in two sets, and several flagged-slower cells are flagged faster in another set."
+ ],
+ "verdict_caveat": "The guard is not free at kernel level. With launch latency amortized (32 copy_alloc + copy_apply pairs in one CUDA graph, 4 boots an arm, ABBA twice) the candidate's two kernels are slower in all 24 cells by +0.004..+0.079 us a pair (mean +0.040 us on 3.07..3.39 us, +0.1%..+2.4%; minimum replay +0.05 us); 3 of 24 cells are beyond the pooled boot range, 9 and 10 in the two ABBA sets. That is about 40 ns of device time a decode step, below the copy-step bench's resolution (its boot-to-boot spread is 0.3-2 us) and about 1e-6 of a 33 ms c1 step; serving launches these kernels eagerly, and the eager timing shows no cell slower (3 faster). The mark names 'a copy-step bench' and points at #971's/#977's own-mark harness: on that bench nothing is slower. If the coordinator counts the 32-pair kernel bench as a copy-step bench, the mark is missed by that ~40 ns and the verdict becomes not-defensible (a robustness fix for a path no serving caller takes, at a small but real cost).",
+ "serving_effect": {
+  "any_serving_path_passes_negative_slot_to_copy_alloc_or_copy_apply": false,
+  "statement": "No serving path passes a negative slot to copy_alloc or copy_apply. The guard is a robustness fix with no serving effect: serving output and copy state are bit-identical to candidate-54's, and the only cost is the guard's branches (about 40 ns of device time a step).",
+  "caller_trace": [
+   "Every caller of tilelang_copy.copy_alloc/copy_apply in the tree (git grep, candidate-54 5f021d9a): vllm/v1/worker/gpu/spec_decode/copy_drafts.py (CopyDrafter._prepare -> copy_alloc, line 179; CopyDrafter.propose -> copy_apply, line 233), benchmarks/kernels/benchmark_copy_drafts.py (idx = arange) and tests/v1/spec_decode/test_copy_drafts.py.",
+   "CopyDrafter.prepare_alloc and propose are called only from GPUModelRunner.sample_tokens (model_runner.py 3687 and 3740), both with input_batch.idx_mapping, and only on the last PP rank (a non-last rank returns at 3455-3473).",
+   "input_batch is execute_model_state.input_batch: either prepare_inputs (model_runner.py 1806-1807: async_tensor_h2d(batch_req_state.idx_mapping_np)), whose idx_mapping_np is req_states.req_id_to_index[req_id] for each scheduled request (1747-1748, dict __getitem__, no default), or InputBatch.make_dummy (input_batch.py 213-214: arange(num_reqs)). Slots come from RequestState.add_request: free_indices.pop(), free_indices = list(range(max_num_reqs)) (states.py 31, 115-117). maybe_restore_pcp_for_sampling returns the batch unchanged without prefill context parallelism (pcp_manager.py 837-839). idx_mapping is not padded to num_reqs_after_padding (a separate count).",
+   "The copy path's only -1 entries: match_idx_mapping = np.where(incomplete_prefill, -1, idx_mapping_np) (model_runner.py 3671-3684), passed to copy_match alone (copy_drafts.py 171-178), which reads total_len[slot] only if slot >= 0 (tilelang_copy.py 235-238) and so writes no source for those rows; copy_alloc/copy_apply get the real slots for the same rows.",
+   "Other -1 producers do not reach the copy kernels: PPHandler.get_prev_sampled_outputs (pp_utils.py 140) feeds postprocess_sampled only (model_runner.py 1589); tilelang_inputs' out_sample_idx_mapping -1 entries (tilelang_inputs.py 2509, 2747) are sampler-side.",
+   "Warm-up: CopyDrafter.register_warmups -> tilelang_inputs.declare(copy_calls) -> prepare.declare -> tilelang.prepare: compiles, launches nothing.",
+   "The copy kernels run eagerly in sample_tokens (no CUDA-graph capture around them)."
+  ]
+ },
+ "patch": {
+  "file": "0781-fix-spec_decode-guard-negative-slots-in-copy_alloc-a.patch",
+  "sha256": "d31e915591e6fa006529d59c41e3fa6aea455fa24a2c88b883b1076198f5fab4",
+  "commit": "78ce3c6e3e7624675db7351421e253f44f449962",
+  "tree": "f77fc74bb76e72fc9b33046c461bbcd0bb3d4589",
+  "author": "Christopher Owen <3221756+christopherowen@users.noreply.github.com>",
+  "date": "Sun, 8 Nov 2026 18:27:04 +0000 (the PR patch's)",
+  "subject": "fix(spec_decode): guard negative slots in copy_alloc and copy_apply",
+  "base": {
+   "patch_head": "4e8133ff10a125b90753c2727f162e29fe37f30c",
+   "tree": "5f021d9a7f01c03e2389dd3d8021759cfa19ea34",
+   "series": "candidate-54/vllm/series (671 patches)"
+  },
+  "applies_as_0781": "git am --committer-date-is-author-date with the fixed committer on a fresh checkout of 4e8133ff reproduces commit 78ce3c6e, tree f77fc74b; git diff --check clean against 4e8133ff and against vLLM 19f2c20e (raw/amcheck.txt)",
+  "pair_check_candidate_55": "with round-55-57-select/out/55 (1008, 978, 988-deadrow), git am in both orders: tree 06a2f3d420a70893a03a9d707e6fc9dd32e07f9b both ways; no shared file (raw/pair-check-55.txt, raw/pair-check-55-files.txt)",
+  "numbering_note": "Named 0781 as asked: it applies first after candidate-54's series. candidate-54's own folder also has a 0781 (64k-chunked L2 prefetch); if candidate-55 numbers on from candidate-54's last patch, rename it 0792 (git format-patch --start-number 792); the content does not change.",
+  "files": {
+   "vllm/v1/worker/gpu/spec_decode/tilelang_copy.py": "+48 -37 (copy_alloc_kernel, copy_apply_kernel)",
+   "tests/v1/spec_decode/test_copy_drafts.py": "+93"
+  },
+  "source": {
+   "pr_head": "aa65752e9864badb8873de80b29cc9ea7211c1aa",
+   "pr_patch": "experiments/2026-11-08-copy-drafter-wide-ramp-and-guards/vllm/0762-perf-spec-decode-copy-drafter-guards-and-wide-ramp.patch",
+   "pr_patch_sha256": "b4040c07950344e3978f4e4fe3bcd58e513d84170c475ef51ae783f900228218",
+   "split_995_alloc_apply_sha256": "eac25e5c9a5e72e847b55e9cfe3fc816a79cfdd0af8c886d06fc18a1fb139618",
+   "split_3way_result_sha256": "3c150312aa85ca39fd409541187493973ee75ab4cea02bef9560ffc9c58e8b93 (reproduced)"
+  }
+ },
+ "taken_from_995": [
+  "tilelang_copy.py hunk 5 (copy_alloc_kernel: `if slot < 0:` writes chosen (-1, 0, 0), estimates PRIOR_HITS / PRIOR_TRIALS, alloc block; the rest moves into `else:`), every line as the PR has it except the doublings update's argument line",
+  "tilelang_copy.py hunk 6 (copy_apply_kernel: `slot >= 0` added to the use_copy condition and to the pending-state reset), unchanged; applied 3-way, its context moved with 0789's survival loop",
+  "test_negative_slot_bounds_guard_in_alloc_and_apply, its 91 lines unchanged, appended after test_copy_match_long_context_two_tier_scan (two blank lines before it; the PR had three)"
+ ],
+ "left_out_of_995": [
+  "Cap decay (PR rationale 2): the else branch keeps the base's `T.if_then_else(accepted >= live, T.min(doublings + 1, MAX_DOUBLINGS), 0)`, re-indented; with it ref_select's and design_walk's decay changes and test_partial_acceptance_steps_down_cap_doublings_gently",
+  "Hunk 1 (module docstring): it holds only the decay sentence, so dropping the sentence drops the hunk; the docstring is the base's",
+  "copy_match anchor pruning, need_len tile bound and one-variable hit reduction (PR rationale 3, hunks 2-4): conflicts with #977's two-tier scan (0790) in three hunks; to be its own later experiment on the new base, measured with #977's bench_copy_match_long_context.py",
+  "31/63-draft ramp (PR rationale 4): SPARK_DS41F_COPY_MAX_DRAFTS (vllm/config/speculative.py), greedy_rejection_kernel widths above 32 (tilelang_sampling.py), benchmark_copy_drafts.py --lookahead, test_wide_lookahead_31_and_63_greedy_verification_and_ramp: opt-in, the recipe keeps 16 drafts"
+ ],
+ "host": "sp8 (spark-0016, NVIDIA GB10), 2026-11-10T01:27Z..01:47Z; shared with another agent's jobs (never concurrent with ours: docker_ps_before none in all 36 blocks)",
+ "arms": {
+  "image": "spark-ds41f:candidate-50 sha256:8c1ea1f62f62c3e2adc03b645c091a5499cf7163101aca32875c894b96f155db (vllm.tree d5778ab5)",
+  "base": "+ the 36 files that differ between d5778ab5 and candidate-54's tree 5f021d9a, mounted read-only (all modified, none added or removed; 2 are C sources of engram_rows, not on the copy path)",
+  "cand": "+ the same 36 paths from the guard's tree f77fc74b: differs from base in tilelang_copy.py and test_copy_drafts.py only (raw/overlay-sha.txt; container-side hashes in raw/verify-*.txt; tilelang_copy imported from the mounted path, SHA-256 93173530 base / b38cf4c9 cand, in every bench boot)",
+  "order": "ABBA in one session: base, cand, cand, base (q.sh, q2.sh, q3.sh), then base, cand, cand, base, base, cand, cand, base (q4.sh); a boot is a fresh container; separate TileLang caches per arm (removed afterwards)"
+ },
+ "tests": {
+  "pytest-cand-boot1": {
+   "result": "63 passed, 14 warnings",
+   "canary": [
+    [
+     "tests/v1/spec_decode/test_copy_drafts.py::test_negative_slot_bounds_guard_in_alloc_and_apply",
+     "PASSED"
+    ]
+   ],
+   "failed": [],
+   "first_error_lines": []
+  },
+  "pytest-cand-boot2": {
+   "result": "63 passed, 14 warnings",
+   "canary": [
+    [
+     "tests/v1/spec_decode/test_copy_drafts.py::test_negative_slot_bounds_guard_in_alloc_and_apply",
+     "PASSED"
+    ]
+   ],
+   "failed": [],
+   "first_error_lines": []
+  },
+  "pytest-base-boot1": {
+   "result": "62 passed, 14 warnings",
+   "canary": [],
+   "failed": [],
+   "first_error_lines": []
+  },
+  "canary-base-boot1": {
+   "result": "1 failed, 45 deselected, 14 warnings",
+   "canary": [
+    [
+     "../../../../tmp/canary/test_copy_drafts.py::test_negative_slot_bounds_guard_in_alloc_and_apply",
+     "FAILED"
+    ]
+   ],
+   "failed": [
+    "../../../../tmp/canary/test_copy_drafts.py::test_negative_slot_bounds_guard_in_alloc_and_apply"
+   ],
+   "first_error_lines": [
+    "E       AssertionError: assert tensor(False, device='cuda:0')",
+    "E        +  where tensor(False, device='cuda:0') = <built-in method all of Tensor object at 0xe97adee19ae0>()",
+    "E        +    where <built-in method all of Tensor object at 0xe97adee19ae0> = tensor([0, 0], device='cuda:0', dtype=torch.int32) == 888888.all"
+   ]
+  }
+ },
+ "identity": {
+  "main": {
+   "cells": 84,
+   "steps_hashed_per_boot": 588,
+   "all_cells_sha": {
+    "base-boot1": [
+     "fc59344d9e7f5285"
+    ],
+    "cand-boot1": [
+     "fc59344d9e7f5285"
+    ],
+    "cand-boot2": [
+     "fc59344d9e7f5285"
+    ],
+    "base-boot2": [
+     "fc59344d9e7f5285"
+    ]
+   },
+   "cells_differing_between_any_boots": [],
+   "bit_exact": true,
+   "coverage_base_boot1": {
+    "steps": 588,
+    "offered_rows": 4008,
+    "copy_rows": 4008,
+    "refused_rows": null,
+    "steps_with_doublings_ge_2": 263
+   },
+   "tilelang_copy_sha256": {
+    "base-boot1": "93173530282b",
+    "cand-boot1": "b38cf4c94464",
+    "cand-boot2": "b38cf4c94464",
+    "base-boot2": "93173530282b"
+   }
+  },
+  "refusals": {
+   "cells": 42,
+   "steps_hashed_per_boot": 294,
+   "all_cells_sha": {
+    "base-boot1": [
+     "83c8f0fe994692df"
+    ],
+    "cand-boot1": [
+     "83c8f0fe994692df"
+    ],
+    "cand-boot2": [
+     "83c8f0fe994692df"
+    ],
+    "base-boot2": [
+     "83c8f0fe994692df"
+    ]
+   },
+   "cells_differing_between_any_boots": [],
+   "bit_exact": true,
+   "coverage_base_boot1": {
+    "steps": 294,
+    "offered_rows": 2004,
+    "copy_rows": 1884,
+    "refused_rows": 120,
+    "steps_with_doublings_ge_2": 153
+   },
+   "tilelang_copy_sha256": {
+    "base-boot1": "93173530282b",
+    "cand-boot1": "b38cf4c94464",
+    "cand-boot2": "b38cf4c94464",
+    "base-boot2": "93173530282b"
+   }
+  },
+  "harness_note": "guard995.py's docstring says its DSpark confidences admit and refuse copies; in the run every offered copy was taken (a fresh copy state's 0.95 prior beats any DSpark yield), so the refusal branch whose condition the guard edits was covered by ids995b.py (q2.sh) instead: 120 refused row-steps, bit-exact on all four boots."
+ },
+ "bench": {
+  "copy_step_gate_21_replays": {
+   "what": "benchmark_copy_drafts.py --gate --cases copy, unmodified (CUDA-graph replay of copy_match + copy_alloc + copy_apply, 64 MiB flush, median of 21); boots 1-2 an arm",
+   "budget": "0 slower on all 4 boots",
+   "summary": {
+    "cells": 24,
+    "better": 0,
+    "same": 19,
+    "worse": 5,
+    "delta_pct_range": [
+     -5.21,
+     11.55
+    ]
+   },
+   "cells": {
+    "uva/c1/4096": {
+     "base": [
+      22.27,
+      22.4
+     ],
+     "cand": [
+      22.53,
+      22.34
+     ],
+     "delta_pct": 0.45,
+     "verdict": "same"
+    },
+    "uva/c1/65536": {
+     "base": [
+      16.38,
+      18.11
+     ],
+     "cand": [
+      16.32,
+      18.18
+     ],
+     "delta_pct": 0.03,
+     "verdict": "same"
+    },
+    "uva/c1/262144": {
+     "base": [
+      22.53,
+      24.26
+     ],
+     "cand": [
+      22.21,
+      22.53
+     ],
+     "delta_pct": -4.38,
+     "verdict": "same"
+    },
+    "uva/c1/1048576": {
+     "base": [
+      24.58,
+      24.26
+     ],
+     "cand": [
+      24.29,
+      24.45
+     ],
+     "delta_pct": -0.2,
+     "verdict": "same"
+    },
+    "uva/c8/4096": {
+     "base": [
+      20.48,
+      22.21
+     ],
+     "cand": [
+      22.24,
+      20.48
+     ],
+     "delta_pct": 0.07,
+     "verdict": "same"
+    },
+    "uva/c8/65536": {
+     "base": [
+      26.72,
+      27.81
+     ],
+     "cand": [
+      30.4,
+      30.43
+     ],
+     "delta_pct": 11.55,
+     "verdict": "worse"
+    },
+    "uva/c8/262144": {
+     "base": [
+      28.7,
+      28.38
+     ],
+     "cand": [
+      30.72,
+      30.43
+     ],
+     "delta_pct": 7.13,
+     "verdict": "worse"
+    },
+    "uva/c8/1048576": {
+     "base": [
+      38.91,
+      38.85
+     ],
+     "cand": [
+      38.94,
+      39.07
+     ],
+     "delta_pct": 0.32,
+     "verdict": "same"
+    },
+    "uva/c16/4096": {
+     "base": [
+      22.85,
+      22.53
+     ],
+     "cand": [
+      24.58,
+      24.42
+     ],
+     "delta_pct": 7.98,
+     "verdict": "worse"
+    },
+    "uva/c16/65536": {
+     "base": [
+      32.86,
+      30.72
+     ],
+     "cand": [
+      34.82,
+      32.67
+     ],
+     "delta_pct": 6.15,
+     "verdict": "same"
+    },
+    "uva/c16/262144": {
+     "base": [
+      38.85,
+      36.54
+     ],
+     "cand": [
+      38.62,
+      36.9
+     ],
+     "delta_pct": 0.17,
+     "verdict": "same"
+    },
+    "uva/c16/1048576": {
+     "base": [
+      51.2,
+      52.96
+     ],
+     "cand": [
+      53.02,
+      51.2
+     ],
+     "delta_pct": 0.06,
+     "verdict": "same"
+    },
+    "device/c1/4096": {
+     "base": [
+      16.1,
+      16.32
+     ],
+     "cand": [
+      16.38,
+      16.1
+     ],
+     "delta_pct": 0.19,
+     "verdict": "same"
+    },
+    "device/c1/65536": {
+     "base": [
+      14.56,
+      14.69
+     ],
+     "cand": [
+      14.37,
+      14.69
+     ],
+     "delta_pct": -0.65,
+     "verdict": "same"
+    },
+    "device/c1/262144": {
+     "base": [
+      22.53,
+      22.98
+     ],
+     "cand": [
+      22.53,
+      22.53
+     ],
+     "delta_pct": -0.99,
+     "verdict": "same"
+    },
+    "device/c1/1048576": {
+     "base": [
+      24.58,
+      22.91
+     ],
+     "cand": [
+      24.58,
+      24.58
+     ],
+     "delta_pct": 3.52,
+     "verdict": "same"
+    },
+    "device/c8/4096": {
+     "base": [
+      16.1,
+      16.06
+     ],
+     "cand": [
+      16.1,
+      14.56
+     ],
+     "delta_pct": -4.66,
+     "verdict": "same"
+    },
+    "device/c8/65536": {
+     "base": [
+      22.46,
+      22.24
+     ],
+     "cand": [
+      22.53,
+      24.16
+     ],
+     "delta_pct": 4.45,
+     "verdict": "same"
+    },
+    "device/c8/262144": {
+     "base": [
+      30.72,
+      30.56
+     ],
+     "cand": [
+      28.67,
+      30.43
+     ],
+     "delta_pct": -3.56,
+     "verdict": "same"
+    },
+    "device/c8/1048576": {
+     "base": [
+      38.75,
+      38.72
+     ],
+     "cand": [
+      38.91,
+      38.98
+     ],
+     "delta_pct": 0.54,
+     "verdict": "worse"
+    },
+    "device/c16/4096": {
+     "base": [
+      16.48,
+      18.08
+     ],
+     "cand": [
+      16.38,
+      16.38
+     ],
+     "delta_pct": -5.21,
+     "verdict": "same"
+    },
+    "device/c16/65536": {
+     "base": [
+      28.67,
+      28.38
+     ],
+     "cand": [
+      27.01,
+      28.48
+     ],
+     "delta_pct": -2.73,
+     "verdict": "same"
+    },
+    "device/c16/262144": {
+     "base": [
+      34.82,
+      34.5
+     ],
+     "cand": [
+      36.58,
+      36.67
+     ],
+     "delta_pct": 5.67,
+     "verdict": "worse"
+    },
+    "device/c16/1048576": {
+     "base": [
+      51.2,
+      48.83
+     ],
+     "cand": [
+      50.91,
+      49.15
+     ],
+     "delta_pct": 0.03,
+     "verdict": "same"
+    }
+   }
+  },
+  "copy_step_harness_21_replays": {
+   "what": "guard995.py: the same cells and launch, its own containers",
+   "summary": {
+    "cells": 24,
+    "better": 0,
+    "same": 23,
+    "worse": 1,
+    "delta_pct_range": [
+     -4.87,
+     4.78
+    ]
+   },
+   "cells": {
+    "device/c1/4096": {
+     "base": [
+      14.752,
+      14.688
+     ],
+     "cand": [
+      14.784,
+      16.064
+     ],
+     "delta_pct": 4.78,
+     "verdict": "same"
+    },
+    "device/c1/65536": {
+     "base": [
+      16.096,
+      14.368
+     ],
+     "cand": [
+      14.368,
+      16.032
+     ],
+     "delta_pct": -0.21,
+     "verdict": "same"
+    },
+    "device/c1/262144": {
+     "base": [
+      22.528,
+      20.608
+     ],
+     "cand": [
+      22.528,
+      22.208
+     ],
+     "delta_pct": 3.71,
+     "verdict": "same"
+    },
+    "device/c1/1048576": {
+     "base": [
+      22.912,
+      23.008
+     ],
+     "cand": [
+      22.624,
+      24.256
+     ],
+     "delta_pct": 2.09,
+     "verdict": "same"
+    },
+    "device/c8/4096": {
+     "base": [
+      16.096,
+      16.128
+     ],
+     "cand": [
+      16.096,
+      14.56
+     ],
+     "delta_pct": -4.87,
+     "verdict": "same"
+    },
+    "device/c8/65536": {
+     "base": [
+      22.528,
+      22.528
+     ],
+     "cand": [
+      22.272,
+      22.528
+     ],
+     "delta_pct": -0.57,
+     "verdict": "same"
+    },
+    "device/c8/262144": {
+     "base": [
+      28.672,
+      28.384
+     ],
+     "cand": [
+      28.768,
+      28.384
+     ],
+     "delta_pct": 0.17,
+     "verdict": "same"
+    },
+    "device/c8/1048576": {
+     "base": [
+      38.816,
+      38.912
+     ],
+     "cand": [
+      40.672,
+      38.912
+     ],
+     "delta_pct": 2.39,
+     "verdict": "same"
+    },
+    "device/c16/4096": {
+     "base": [
+      16.416,
+      16.448
+     ],
+     "cand": [
+      16.576,
+      16.544
+     ],
+     "delta_pct": 0.78,
+     "verdict": "worse"
+    },
+    "device/c16/65536": {
+     "base": [
+      28.416,
+      26.656
+     ],
+     "cand": [
+      26.624,
+      28.672
+     ],
+     "delta_pct": 0.41,
+     "verdict": "same"
+    },
+    "device/c16/262144": {
+     "base": [
+      32.576,
+      38.688
+     ],
+     "cand": [
+      37.088,
+      34.816
+     ],
+     "delta_pct": 0.9,
+     "verdict": "same"
+    },
+    "device/c16/1048576": {
+     "base": [
+      51.2,
+      52.928
+     ],
+     "cand": [
+      51.2,
+      51.456
+     ],
+     "delta_pct": -1.41,
+     "verdict": "same"
+    },
+    "uva/c1/4096": {
+     "base": [
+      22.24,
+      22.528
+     ],
+     "cand": [
+      22.528,
+      22.24
+     ],
+     "delta_pct": 0.0,
+     "verdict": "same"
+    },
+    "uva/c1/65536": {
+     "base": [
+      18.272,
+      18.528
+     ],
+     "cand": [
+      18.336,
+      18.112
+     ],
+     "delta_pct": -0.96,
+     "verdict": "same"
+    },
+    "uva/c1/262144": {
+     "base": [
+      22.272,
+      24.576
+     ],
+     "cand": [
+      22.272,
+      24.256
+     ],
+     "delta_pct": -0.68,
+     "verdict": "same"
+    },
+    "uva/c1/1048576": {
+     "base": [
+      24.288,
+      24.544
+     ],
+     "cand": [
+      24.288,
+      24.256
+     ],
+     "delta_pct": -0.59,
+     "verdict": "same"
+    },
+    "uva/c8/4096": {
+     "base": [
+      20.192,
+      22.528
+     ],
+     "cand": [
+      20.736,
+      20.32
+     ],
+     "delta_pct": -3.9,
+     "verdict": "same"
+    },
+    "uva/c8/65536": {
+     "base": [
+      29.696,
+      28.704
+     ],
+     "cand": [
+      32.768,
+      28.384
+     ],
+     "delta_pct": 4.71,
+     "verdict": "same"
+    },
+    "uva/c8/262144": {
+     "base": [
+      30.816,
+      30.72
+     ],
+     "cand": [
+      30.72,
+      28.768
+     ],
+     "delta_pct": -3.33,
+     "verdict": "same"
+    },
+    "uva/c8/1048576": {
+     "base": [
+      38.944,
+      41.184
+     ],
+     "cand": [
+      38.848,
+      39.936
+     ],
+     "delta_pct": -1.68,
+     "verdict": "same"
+    },
+    "uva/c16/4096": {
+     "base": [
+      22.528,
+      24.608
+     ],
+     "cand": [
+      24.32,
+      24.576
+     ],
+     "delta_pct": 3.73,
+     "verdict": "same"
+    },
+    "uva/c16/65536": {
+     "base": [
+      30.72,
+      34.848
+     ],
+     "cand": [
+      36.864,
+      30.72
+     ],
+     "delta_pct": 3.07,
+     "verdict": "same"
+    },
+    "uva/c16/262144": {
+     "base": [
+      36.864,
+      38.912
+     ],
+     "cand": [
+      41.312,
+      36.992
+     ],
+     "delta_pct": 3.34,
+     "verdict": "same"
+    },
+    "uva/c16/1048576": {
+     "base": [
+      54.656,
+      53.248
+     ],
+     "cand": [
+      53.344,
+      52.96
+     ],
+     "delta_pct": -1.48,
+     "verdict": "same"
+    }
+   }
+  },
+  "copy_step_confirm_201_replays": {
+   "what": "confirm995.py: the gate's module unmodified, timer at 201 replays (as candidate-53's confirm977.py); three ABBA sets, boots 1-6 an arm",
+   "sets": {
+    "set1_boots1-2": {
+     "summary": {
+      "cells": 24,
+      "better": 2,
+      "same": 21,
+      "worse": 1,
+      "delta_pct_range": [
+       -5.33,
+       5.28
+      ]
+     },
+     "flagged": {
+      "uva/c1/1048576": {
+       "base": [
+        24.58,
+        24.58
+       ],
+       "cand": [
+        24.26,
+        24.29
+       ],
+       "delta_pct": -1.24,
+       "verdict": "better"
+      },
+      "uva/c16/1048576": {
+       "base": [
+        55.01,
+        53.25
+       ],
+       "cand": [
+        51.07,
+        51.42
+       ],
+       "delta_pct": -5.33,
+       "verdict": "better"
+      },
+      "device/c1/4096": {
+       "base": [
+        14.66,
+        14.5
+       ],
+       "cand": [
+        14.78,
+        14.72
+       ],
+       "delta_pct": 1.17,
+       "verdict": "worse"
+      }
+     }
+    },
+    "set2_boots3-4": {
+     "summary": {
+      "cells": 24,
+      "better": 3,
+      "same": 21,
+      "worse": 0,
+      "delta_pct_range": [
+       -7.35,
+       6.7
+      ]
+     },
+     "flagged": {
+      "uva/c8/4096": {
+       "base": [
+        20.8,
+        20.54
+       ],
+       "cand": [
+        20.16,
+        20.19
+       ],
+       "delta_pct": -2.39,
+       "verdict": "better"
+      },
+      "device/c1/262144": {
+       "base": [
+        24.26,
+        24.58
+       ],
+       "cand": [
+        22.53,
+        22.72
+       ],
+       "delta_pct": -7.35,
+       "verdict": "better"
+      },
+      "device/c8/1048576": {
+       "base": [
+        40.64,
+        40.54
+       ],
+       "cand": [
+        38.62,
+        38.85
+       ],
+       "delta_pct": -4.57,
+       "verdict": "better"
+      }
+     }
+    },
+    "set3_boots5-6": {
+     "summary": {
+      "cells": 24,
+      "better": 1,
+      "same": 21,
+      "worse": 2,
+      "delta_pct_range": [
+       -7.56,
+       6.88
+      ]
+     },
+     "flagged": {
+      "uva/c16/4096": {
+       "base": [
+        24.26,
+        24.58
+       ],
+       "cand": [
+        22.53,
+        22.62
+       ],
+       "delta_pct": -7.56,
+       "verdict": "better"
+      },
+      "uva/c16/1048576": {
+       "base": [
+        50.91,
+        51.2
+       ],
+       "cand": [
+        52.96,
+        53.25
+       ],
+       "delta_pct": 4.02,
+       "verdict": "worse"
+      },
+      "device/c16/1048576": {
+       "base": [
+        48.86,
+        48.83
+       ],
+       "cand": [
+        49.15,
+        49.22
+       ],
+       "delta_pct": 0.7,
+       "verdict": "worse"
+      }
+     }
+    }
+   },
+   "pooled_6_boots_summary": {
+    "cells": 24,
+    "better": 0,
+    "same": 24,
+    "worse": 0,
+    "delta_pct_range": [
+     -3.22,
+     5.94
+    ]
+   },
+   "pooled_cells": {
+    "uva/c1/4096": {
+     "base": [
+      22.53,
+      22.56,
+      22.53,
+      22.21,
+      22.53,
+      22.24
+     ],
+     "cand": [
+      22.21,
+      22.53,
+      22.24,
+      22.24,
+      22.53,
+      22.53
+     ],
+     "delta_pct": -0.24,
+     "welch95": [
+      -0.238,
+      0.132
+     ],
+     "verdict": "same"
+    },
+    "uva/c1/65536": {
+     "base": [
+      16.38,
+      16.38,
+      16.35,
+      16.29,
+      16.38,
+      16.19
+     ],
+     "cand": [
+      18.11,
+      16.38,
+      18.11,
+      16.38,
+      18.43,
+      16.38
+     ],
+     "delta_pct": 5.94,
+     "welch95": [
+      0.157,
+      1.783
+     ],
+     "verdict": "same"
+    },
+    "uva/c1/262144": {
+     "base": [
+      20.86,
+      22.53,
+      22.53,
+      24.26,
+      22.53,
+      24.22
+     ],
+     "cand": [
+      22.21,
+      22.53,
+      22.21,
+      24.29,
+      22.27,
+      24.29
+     ],
+     "delta_pct": 0.64,
+     "welch95": [
+      -1.167,
+      1.457
+     ],
+     "verdict": "same"
+    },
+    "uva/c1/1048576": {
+     "base": [
+      24.58,
+      24.58,
+      24.58,
+      24.26,
+      24.58,
+      24.26
+     ],
+     "cand": [
+      24.26,
+      24.29,
+      22.4,
+      24.26,
+      24.58,
+      24.54
+     ],
+     "delta_pct": -1.71,
+     "welch95": [
+      -1.09,
+      0.254
+     ],
+     "verdict": "same"
+    },
+    "uva/c8/4096": {
+     "base": [
+      18.75,
+      20.48,
+      20.8,
+      20.54,
+      22.24,
+      20.16
+     ],
+     "cand": [
+      20.16,
+      20.67,
+      20.16,
+      20.19,
+      20.48,
+      20.48
+     ],
+     "delta_pct": -0.67,
+     "welch95": [
+      -1.053,
+      0.776
+     ],
+     "verdict": "same"
+    },
+    "uva/c8/65536": {
+     "base": [
+      26.72,
+      30.43,
+      26.62,
+      26.34,
+      28.83,
+      28.54
+     ],
+     "cand": [
+      30.37,
+      26.62,
+      28.48,
+      26.34,
+      26.62,
+      30.72
+     ],
+     "delta_pct": 1.0,
+     "welch95": [
+      -1.769,
+      2.326
+     ],
+     "verdict": "same"
+    },
+    "uva/c8/262144": {
+     "base": [
+      28.67,
+      30.72,
+      28.96,
+      30.4,
+      26.91,
+      28.35
+     ],
+     "cand": [
+      30.4,
+      28.67,
+      30.4,
+      30.43,
+      28.67,
+      28.67
+     ],
+     "delta_pct": 1.86,
+     "welch95": [
+      -0.818,
+      1.894
+     ],
+     "verdict": "same"
+    },
+    "uva/c8/1048576": {
+     "base": [
+      38.91,
+      39.1,
+      39.04,
+      38.62,
+      38.91,
+      38.69
+     ],
+     "cand": [
+      38.98,
+      38.98,
+      40.64,
+      38.72,
+      39.01,
+      38.91
+     ],
+     "delta_pct": 0.84,
+     "welch95": [
+      -0.26,
+      0.916
+     ],
+     "verdict": "same"
+    },
+    "uva/c16/4096": {
+     "base": [
+      24.58,
+      24.58,
+      24.26,
+      22.75,
+      24.26,
+      24.58
+     ],
+     "cand": [
+      24.58,
+      24.58,
+      22.85,
+      24.58,
+      22.53,
+      22.62
+     ],
+     "delta_pct": -2.26,
+     "welch95": [
+      -1.562,
+      0.472
+     ],
+     "verdict": "same"
+    },
+    "uva/c16/65536": {
+     "base": [
+      30.69,
+      34.53,
+      30.43,
+      30.72,
+      30.59,
+      32.77
+     ],
+     "cand": [
+      34.5,
+      32.9,
+      34.53,
+      30.72,
+      31.07,
+      30.69
+     ],
+     "delta_pct": 2.47,
+     "welch95": [
+      -1.201,
+      2.761
+     ],
+     "verdict": "same"
+    },
+    "uva/c16/262144": {
+     "base": [
+      36.77,
+      38.91,
+      40.51,
+      38.62,
+      36.58,
+      36.86
+     ],
+     "cand": [
+      38.91,
+      38.82,
+      38.91,
+      37.06,
+      41.06,
+      36.86
+     ],
+     "delta_pct": 1.48,
+     "welch95": [
+      -1.192,
+      2.316
+     ],
+     "verdict": "same"
+    },
+    "uva/c16/1048576": {
+     "base": [
+      55.01,
+      53.25,
+      50.88,
+      53.02,
+      50.91,
+      51.2
+     ],
+     "cand": [
+      51.07,
+      51.42,
+      53.25,
+      52.99,
+      52.96,
+      53.25
+     ],
+     "delta_pct": 0.21,
+     "welch95": [
+      -1.435,
+      1.658
+     ],
+     "verdict": "same"
+    },
+    "device/c1/4096": {
+     "base": [
+      14.66,
+      14.5,
+      16.06,
+      14.75,
+      16.06,
+      14.72
+     ],
+     "cand": [
+      14.78,
+      14.72,
+      16.22,
+      16.1,
+      14.66,
+      14.72
+     ],
+     "delta_pct": 0.5,
+     "welch95": [
+      -0.76,
+      0.91
+     ],
+     "verdict": "same"
+    },
+    "device/c1/65536": {
+     "base": [
+      14.62,
+      14.34,
+      16.06,
+      14.59,
+      16.03,
+      14.34
+     ],
+     "cand": [
+      14.43,
+      14.34,
+      14.72,
+      16.1,
+      14.56,
+      14.66
+     ],
+     "delta_pct": -1.3,
+     "welch95": [
+      -1.033,
+      0.643
+     ],
+     "verdict": "same"
+    },
+    "device/c1/262144": {
+     "base": [
+      22.5,
+      22.53,
+      24.26,
+      24.58,
+      24.26,
+      22.53
+     ],
+     "cand": [
+      22.72,
+      22.5,
+      22.53,
+      22.72,
+      24.32,
+      22.53
+     ],
+     "delta_pct": -2.37,
+     "welch95": [
+      -1.55,
+      0.436
+     ],
+     "verdict": "same"
+    },
+    "device/c1/1048576": {
+     "base": [
+      24.26,
+      24.29,
+      24.26,
+      24.58,
+      24.26,
+      24.58
+     ],
+     "cand": [
+      22.94,
+      24.54,
+      22.88,
+      24.29,
+      24.58,
+      24.58
+     ],
+     "delta_pct": -1.65,
+     "welch95": [
+      -1.078,
+      0.271
+     ],
+     "verdict": "same"
+    },
+    "device/c8/4096": {
+     "base": [
+      14.4,
+      16.13,
+      14.66,
+      16.06,
+      16.1,
+      14.4
+     ],
+     "cand": [
+      16.03,
+      14.53,
+      16.06,
+      16.06,
+      14.43,
+      14.72
+     ],
+     "delta_pct": 0.09,
+     "welch95": [
+      -0.954,
+      0.981
+     ],
+     "verdict": "same"
+    },
+    "device/c8/65536": {
+     "base": [
+      24.58,
+      22.53,
+      22.85,
+      24.26,
+      22.53,
+      22.24
+     ],
+     "cand": [
+      22.21,
+      22.53,
+      22.21,
+      24.16,
+      22.53,
+      22.53
+     ],
+     "delta_pct": -2.03,
+     "welch95": [
+      -1.46,
+      0.52
+     ],
+     "verdict": "same"
+    },
+    "device/c8/262144": {
+     "base": [
+      32.51,
+      28.67,
+      31.01,
+      32.45,
+      30.72,
+      30.43
+     ],
+     "cand": [
+      28.67,
+      30.88,
+      26.34,
+      32.48,
+      30.72,
+      30.72
+     ],
+     "delta_pct": -3.22,
+     "welch95": [
+      -3.063,
+      1.069
+     ],
+     "verdict": "same"
+    },
+    "device/c8/1048576": {
+     "base": [
+      38.94,
+      38.91,
+      40.64,
+      40.54,
+      39.07,
+      38.91
+     ],
+     "cand": [
+      38.82,
+      38.91,
+      38.62,
+      38.85,
+      38.91,
+      38.94
+     ],
+     "delta_pct": -1.67,
+     "welch95": [
+      -1.343,
+      0.023
+     ],
+     "verdict": "same"
+    },
+    "device/c16/4096": {
+     "base": [
+      16.42,
+      16.42,
+      16.38,
+      16.51,
+      16.38,
+      16.29
+     ],
+     "cand": [
+      16.35,
+      16.54,
+      16.42,
+      16.16,
+      16.38,
+      16.38
+     ],
+     "delta_pct": -0.17,
+     "welch95": [
+      -0.143,
+      0.086
+     ],
+     "verdict": "same"
+    },
+    "device/c16/65536": {
+     "base": [
+      26.91,
+      26.62,
+      26.62,
+      28.35,
+      26.85,
+      26.34
+     ],
+     "cand": [
+      28.35,
+      26.62,
+      26.3,
+      28.35,
+      26.62,
+      28.35
+     ],
+     "delta_pct": 1.79,
+     "welch95": [
+      -0.509,
+      1.476
+     ],
+     "verdict": "same"
+    },
+    "device/c16/262144": {
+     "base": [
+      34.78,
+      34.82,
+      37.25,
+      36.48,
+      34.82,
+      38.62
+     ],
+     "cand": [
+      36.51,
+      34.82,
+      34.5,
+      36.61,
+      36.86,
+      34.82
+     ],
+     "delta_pct": -1.22,
+     "welch95": [
+      -1.987,
+      1.104
+     ],
+     "verdict": "same"
+    },
+    "device/c16/1048576": {
+     "base": [
+      47.1,
+      49.12,
+      48.9,
+      48.83,
+      48.86,
+      48.83
+     ],
+     "cand": [
+      48.8,
+      49.15,
+      47.04,
+      48.86,
+      49.15,
+      49.22
+     ],
+     "delta_pct": 0.2,
+     "welch95": [
+      -0.798,
+      0.991
+     ],
+     "verdict": "same"
+    }
+   },
+   "budget": "0 slower on all 12 boots"
+  },
+  "alloc_apply_graph_201_replays": {
+   "what": "guard995.py: copy_alloc + copy_apply alone, one pair a graph",
+   "summary": {
+    "cells": 24,
+    "better": 0,
+    "same": 24,
+    "worse": 0,
+    "delta_pct_range": [
+     -1.95,
+     0.59
+    ]
+   },
+   "note": "medians sit on the event timer's quantum (8.192 us in most cells)"
+  },
+  "alloc_apply_eager": {
+   "what": "guard995.py: 200 back-to-back eager copy_alloc + copy_apply launches, wall us a pair, median of 5 (the serving path's launch mode)",
+   "summary": {
+    "cells": 24,
+    "better": 3,
+    "same": 21,
+    "worse": 0,
+    "delta_pct_range": [
+     -2.74,
+     0.98
+    ]
+   }
+  },
+  "alloc_apply_32_pairs_a_graph": {
+   "what": "k32995.py: 32 pairs a CUDA graph, 51 replays, median / 32; boots 3-6 an arm (two ABBA sets)",
+   "sets": {
+    "boots3-4": {
+     "summary": {
+      "cells": 24,
+      "better": 0,
+      "same": 15,
+      "worse": 9,
+      "delta_pct_range": [
+       0.14,
+       1.93
+      ]
+     }
+    },
+    "boots5-6": {
+     "summary": {
+      "cells": 24,
+      "better": 0,
+      "same": 14,
+      "worse": 10,
+      "delta_pct_range": [
+       0.0,
+       3.98
+      ]
+     }
+    }
+   },
+   "pooled_4_boots_summary": {
+    "cells": 24,
+    "better": 0,
+    "same": 21,
+    "worse": 3,
+    "delta_pct_range": [
+     0.13,
+     2.41
+    ]
+   },
+   "pooled_cells": {
+    "uva/c1/4096": {
+     "base": [
+      3.328,
+      3.334,
+      3.328,
+      3.329
+     ],
+     "cand": [
+      3.389,
+      3.392,
+      3.384,
+      3.392
+     ],
+     "delta_pct": 1.79,
+     "welch95": [
+      0.055,
+      0.064
+     ],
+     "verdict": "worse"
+    },
+    "uva/c1/65536": {
+     "base": [
+      3.264,
+      3.265,
+      3.264,
+      3.264
+     ],
+     "cand": [
+      3.328,
+      3.327,
+      3.389,
+      3.328
+     ],
+     "delta_pct": 2.41,
+     "welch95": [
+      0.049,
+      0.109
+     ],
+     "verdict": "worse"
+    },
+    "uva/c1/262144": {
+     "base": [
+      3.264,
+      3.264,
+      3.328,
+      3.269
+     ],
+     "cand": [
+      3.329,
+      3.325,
+      3.319,
+      3.328
+     ],
+     "delta_pct": 1.34,
+     "welch95": [
+      0.013,
+      0.075
+     ],
+     "verdict": "same"
+    },
+    "uva/c1/1048576": {
+     "base": [
+      3.329,
+      3.339,
+      3.332,
+      3.329
+     ],
+     "cand": [
+      3.392,
+      3.392,
+      3.392,
+      3.392
+     ],
+     "delta_pct": 1.79,
+     "welch95": [
+      0.055,
+      0.064
+     ],
+     "verdict": "worse"
+    },
+    "uva/c8/4096": {
+     "base": [
+      3.264,
+      3.272,
+      3.277,
+      3.336
+     ],
+     "cand": [
+      3.328,
+      3.328,
+      3.327,
+      3.392
+     ],
+     "delta_pct": 1.72,
+     "welch95": [
+      0.011,
+      0.102
+     ],
+     "verdict": "same"
+    },
+    "uva/c8/65536": {
+     "base": [
+      3.328,
+      3.275,
+      3.264,
+      3.328
+     ],
+     "cand": [
+      3.328,
+      3.392,
+      3.391,
+      3.392
+     ],
+     "delta_pct": 2.33,
+     "welch95": [
+      0.031,
+      0.123
+     ],
+     "verdict": "same"
+    },
+    "uva/c8/262144": {
+     "base": [
+      3.392,
+      3.329,
+      3.383,
+      3.328
+     ],
+     "cand": [
+      3.392,
+      3.392,
+      3.383,
+      3.392
+     ],
+     "delta_pct": 0.95,
+     "welch95": [
+      -0.002,
+      0.066
+     ],
+     "verdict": "same"
+    },
+    "uva/c8/1048576": {
+     "base": [
+      3.332,
+      3.338,
+      3.33,
+      3.392
+     ],
+     "cand": [
+      3.391,
+      3.392,
+      3.392,
+      3.405
+     ],
+     "delta_pct": 1.4,
+     "welch95": [
+      0.017,
+      0.077
+     ],
+     "verdict": "same"
+    },
+    "uva/c16/4096": {
+     "base": [
+      3.265,
+      3.339,
+      3.264,
+      3.269
+     ],
+     "cand": [
+      3.327,
+      3.328,
+      3.338,
+      3.455
+     ],
+     "delta_pct": 2.37,
+     "welch95": [
+      0.007,
+      0.148
+     ],
+     "verdict": "same"
+    },
+    "uva/c16/65536": {
+     "base": [
+      3.328,
+      3.329,
+      3.328,
+      3.328
+     ],
+     "cand": [
+      3.344,
+      3.329,
+      3.325,
+      3.393
+     ],
+     "delta_pct": 0.59,
+     "welch95": [
+      -0.011,
+      0.05
+     ],
+     "verdict": "same"
+    },
+    "uva/c16/262144": {
+     "base": [
+      3.327,
+      3.383,
+      3.331,
+      3.328
+     ],
+     "cand": [
+      3.392,
+      3.392,
+      3.392,
+      3.392
+     ],
+     "delta_pct": 1.49,
+     "welch95": [
+      0.023,
+      0.076
+     ],
+     "verdict": "same"
+    },
+    "uva/c16/1048576": {
+     "base": [
+      3.342,
+      3.384,
+      3.328,
+      3.392
+     ],
+     "cand": [
+      3.391,
+      3.392,
+      3.392,
+      3.393
+     ],
+     "delta_pct": 0.91,
+     "welch95": [
+      -0.0,
+      0.061
+     ],
+     "verdict": "same"
+    },
+    "device/c1/4096": {
+     "base": [
+      3.127,
+      3.128,
+      3.08,
+      3.083
+     ],
+     "cand": [
+      3.137,
+      3.136,
+      3.133,
+      3.136
+     ],
+     "delta_pct": 1.0,
+     "welch95": [
+      0.005,
+      0.057
+     ],
+     "verdict": "same"
+    },
+    "device/c1/65536": {
+     "base": [
+      3.073,
+      3.128,
+      3.127,
+      3.135
+     ],
+     "cand": [
+      3.136,
+      3.136,
+      3.136,
+      3.136
+     ],
+     "delta_pct": 0.65,
+     "welch95": [
+      -0.008,
+      0.048
+     ],
+     "verdict": "same"
+    },
+    "device/c1/262144": {
+     "base": [
+      3.125,
+      3.136,
+      3.088,
+      3.127
+     ],
+     "cand": [
+      3.136,
+      3.136,
+      3.135,
+      3.136
+     ],
+     "delta_pct": 0.54,
+     "welch95": [
+      -0.004,
+      0.038
+     ],
+     "verdict": "same"
+    },
+    "device/c1/1048576": {
+     "base": [
+      3.072,
+      3.128,
+      3.128,
+      3.077
+     ],
+     "cand": [
+      3.136,
+      3.146,
+      3.136,
+      3.136
+     ],
+     "delta_pct": 1.2,
+     "welch95": [
+      0.007,
+      0.068
+     ],
+     "verdict": "same"
+    },
+    "device/c8/4096": {
+     "base": [
+      3.127,
+      3.136,
+      3.136,
+      3.127
+     ],
+     "cand": [
+      3.136,
+      3.136,
+      3.136,
+      3.136
+     ],
+     "delta_pct": 0.14,
+     "welch95": [
+      -0.001,
+      0.01
+     ],
+     "verdict": "same"
+    },
+    "device/c8/65536": {
+     "base": [
+      3.127,
+      3.128,
+      3.127,
+      3.084
+     ],
+     "cand": [
+      3.136,
+      3.136,
+      3.133,
+      3.136
+     ],
+     "delta_pct": 0.6,
+     "welch95": [
+      -0.003,
+      0.04
+     ],
+     "verdict": "same"
+    },
+    "device/c8/262144": {
+     "base": [
+      3.136,
+      3.076,
+      3.077,
+      3.074
+     ],
+     "cand": [
+      3.137,
+      3.136,
+      3.136,
+      3.136
+     ],
+     "delta_pct": 1.47,
+     "welch95": [
+      0.016,
+      0.075
+     ],
+     "verdict": "same"
+    },
+    "device/c8/1048576": {
+     "base": [
+      3.085,
+      3.136,
+      3.136,
+      3.075
+     ],
+     "cand": [
+      3.136,
+      3.136,
+      3.136,
+      3.136
+     ],
+     "delta_pct": 0.9,
+     "welch95": [
+      -0.004,
+      0.06
+     ],
+     "verdict": "same"
+    },
+    "device/c16/4096": {
+     "base": [
+      3.128,
+      3.128,
+      3.136,
+      3.136
+     ],
+     "cand": [
+      3.136,
+      3.136,
+      3.136,
+      3.136
+     ],
+     "delta_pct": 0.13,
+     "welch95": [
+      -0.001,
+      0.009
+     ],
+     "verdict": "same"
+    },
+    "device/c16/65536": {
+     "base": [
+      3.136,
+      3.077,
+      3.085,
+      3.072
+     ],
+     "cand": [
+      3.142,
+      3.136,
+      3.136,
+      3.136
+     ],
+     "delta_pct": 1.46,
+     "welch95": [
+      0.016,
+      0.074
+     ],
+     "verdict": "same"
+    },
+    "device/c16/262144": {
+     "base": [
+      3.128,
+      3.079,
+      3.076,
+      3.079
+     ],
+     "cand": [
+      3.136,
+      3.136,
+      3.135,
+      3.136
+     ],
+     "delta_pct": 1.46,
+     "welch95": [
+      0.021,
+      0.07
+     ],
+     "verdict": "same"
+    },
+    "device/c16/1048576": {
+     "base": [
+      3.128,
+      3.082,
+      3.127,
+      3.075
+     ],
+     "cand": [
+      3.141,
+      3.136,
+      3.136,
+      3.136
+     ],
+     "delta_pct": 1.1,
+     "welch95": [
+      0.006,
+      0.062
+     ],
+     "verdict": "same"
+    }
+   },
+   "all_cells_delta": "candidate higher in 24/24 cells on the median (+0.004..+0.079 us, mean +0.040), the minimum (mean +0.050) and the graph median"
+  },
+  "cell_rule": "candidate-53 own marks (analyze/common.py): two boots an arm, 'worse' only when every candidate boot is above every base boot and |delta| exceeds the larger within-arm boot change; pooled: the same over all boots an arm, with the larger within-arm range, and a Welch 95% interval on the boot medians"
+ },
+ "files": {
+  "patch": "0781-fix-spec_decode-guard-negative-slots-in-copy_alloc-a.patch",
+  "overlay": [
+   "overlay/vllm/v1/worker/gpu/spec_decode/tilelang_copy.py (sha256 b38cf4c9...)",
+   "overlay/tests/v1/spec_decode/test_copy_drafts.py (sha256 356687ff...)"
+  ],
+  "commands": "commands.txt",
+  "raw": "raw/ (every output as run, raw/commands.txt one block a container, raw/analysis.json, raw/inputs, raw/setup)",
+  "scripts": "scripts/ (setup.sh, run.sh, verify.sh, q.sh..q4.sh, harness/guard995.py, ids995b.py, confirm995.py, k32995.py, analyze.py, mkresult.py, msg-0781.txt); harness/warm.py is candidate-53's, unchanged (on sp8)",
+  "sp8": "~/spark-lab/agents/round3-995-guard: vllm clone (branch guard-995 = 78ce3c6e), overlays, scripts, outputs, patch/"
+ }
+}

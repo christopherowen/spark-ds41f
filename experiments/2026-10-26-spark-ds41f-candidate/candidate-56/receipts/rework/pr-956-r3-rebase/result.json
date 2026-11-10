@@ -1,0 +1,730 @@
+{
+ "pr": 956,
+ "title": "perf(dsv41): SP ratio-2 compressor projection and CED encoder-only chunks",
+ "round": 3,
+ "candidate": "candidate-56",
+ "testbed": "tp4-switched (sp1..sp4)",
+ "verdict": "ready",
+ "verdict_reason": "The rebase keeps both of #956's mechanisms on the new base and keeps the gain. Every output the harness compares is byte-identical to candidate-54 + 957-p1. On one GPU at TP4 rank shapes, a ratio-2 layer's SP prefill step is 16.8-22.9% faster at 4K-64K rows, with every candidate boot below every base boot. The patch applies after 957-p1 and the pair check is clean. The fabric share of the gain and the CED encoder-only gain need the coordinator's servebench prefill on tp4-switched.",
+ "inputs": {
+  "pr_head": "ecb3812cb8faa6423ebccceab1d658d2c8a9a30d",
+  "source_patch": "experiments/2026-11-08-sp-compressor-ced-encoder-only/vllm/0762-perf-dsv41-sp-ratio2-compressor-and-ced-encoder-only-chunks.patch",
+  "source_sha256": "0c20c2e22ea1a42a8fde769569ff5444d6f15ef096bb460a722fc10b315e4cd6",
+  "source_patch_copy": "raw/956-pr-head-0762-original.patch",
+  "base": {
+   "name": "candidate-54",
+   "patch_count": 671,
+   "patch_head": "4e8133ff10a125b90753c2727f162e29fe37f30c",
+   "tree": "5f021d9a7f01c03e2389dd3d8021759cfa19ea34",
+   "where": "sp8 ~/spark-lab/agents/round-55-57-select/c54-vllm"
+  },
+  "built_on": {
+   "label": "957-p1",
+   "file": "56-01-957-p1-perf-dsv41-tp3-decode-compressor-mla-and-spec-fusions.patch",
+   "sha256": "db4704c89e085d81985bd49b26ab3ab20fd1fd3b03e16c23575995bc62cf4db2",
+   "copied_unchanged_from": "round3-select receipts rebases/56-01-...patch (= sp8 round-55-57-select/out/56/01-...patch)",
+   "patch_head": "0c4142a20017a1359159dd3644c50fb280a84aa6",
+   "tree": "3959b21147bc9f98f4ebcd48e2c80e0f42d4e2ef"
+  }
+ },
+ "patch": {
+  "file": "56-02-956-perf-dsv41-sp-ratio2-compressor-and-ced-encoder-only-chunks.patch",
+  "sha256": "d9b71b04550c4a3bec9d0cb36334da66cdc94050298bffea64d95228a51241b6",
+  "author": "Christopher Owen <3221756+christopherowen@users.noreply.github.com>",
+  "date": "Sun, 8 Nov 2026 11:30:00 +0100 (the PR's own author date; committer date equal, fixed committer, as build.py applies the series)",
+  "applies_after": "957-p1 on candidate-54 (git am)",
+  "patch_head_after_pair": "abb261871df2043ec5edee7e5ff2d1c42944b009",
+  "tree_after_pair": "0c84861318b7435cb9f7e0549fbf66e93dbd9da3",
+  "files": [
+   "tests/models/test_deepseek_v4_1_ced_model.py",
+   "tests/models/test_deepseek_v4_1_compressor.py",
+   "tests/models/test_deepseek_v4_1_compressor_prepare.py",
+   "vllm/models/deepseek_v4_1/attention.py",
+   "vllm/models/deepseek_v4_1/ced.py",
+   "vllm/models/deepseek_v4_1/compressor.py",
+   "vllm/models/deepseek_v4_1/nvidia/model.py",
+   "vllm/models/deepseek_v4_1/nvidia/model_state.py",
+   "vllm/models/deepseek_v4_1/sp_prefill.py"
+  ],
+  "diffstat": "9 files, +440 -37",
+  "message": "the PR's message (Upstream base line updated to candidate-54 + 957-p1) plus a 'Round 3 rebase (candidate-56, after #957 part 1 on candidate-54)' section: what each base patch changed, the bit-exactness evidence, the round-3 tests and the own mark (raw/commit-msg.txt)"
+ },
+ "rebase": {
+  "semantics_kept": [
+   "DeepseekCompressor._sp_enabled for compress_ratio in (1, 2); at ratio 2, _sp_projection_call is bf16_gemm_two(512, 5120, out_dtype=float32, shards/blocked of the layer's split); forward() projects this rank's local rows into _values/_gates and gathers both with sp_rows.gather_many before the TileLang compression, whose new gates argument defaults to self._gates",
+   "layers 2, 8, 14 (ratio-2 compressor) and 20 (ratio 1, when it runs as an ordinary SP layer) take the SP local attention front instead of gathering the BF16 hidden state, and their global KV comes from _prepare_global_kv(local rows, sp_rows)",
+   "CEDState.encoder_only / DeepseekV4Model._ced_encoder_only: a step in which every request is a non-final prefill chunk ending at or before its replay floor stops at the CED boundary after mhc.pre and prepare_global_kv and returns preallocated zeros (hidden and aux states; sink columns zeroed); model.py and model_state.py hunks unchanged from the PR"
+  ],
+  "conflicts": {
+   "attention.py vs 0778 (#1009 round 1, sp_front_call)": "#1009 r1 replaced the BF16 _gather_front (norms + copy_columns/split_columns + one BF16 gather) that the PR extended to compressor layers with _sp_front: sp_attention_front writes the MXFP8 q cast and 528-byte SWA records on local rows, one grouped gather_mxfp8 carries them, write_swa_records stores them, and index head weights stay rank-local in prefill steps (gathered in SP decode steps). The rebase routes the SP compressor layers into that branch (condition: compressor is None, or a DeepseekCompressor whose _sp_kernel is bound) instead of re-adding the BF16 front, keeps the local rows for the compressor, and declares sp_front_call and swa_records_call for SP compressor layers (the PR's copy_columns/split_columns declarations had no caller left). forward_mqa never reads kv, so the front's kv=None suffices for compressor layers.",
+   "attention.py vs 0765 (#1012 round 1, decode overlap)": "_can_overlap_decode refuses SP steps (sp_rows is not None), so the PR's SP global-KV call sits in the non-overlapped branch beside the full-row call it replaced; the overlapped path (full rows, _project_local/_finish_project then _forward_tilelang without values/gates) reads the same buffers as before because the new gates argument defaults to self._gates.",
+   "ced.py vs 0788 (#960 round 1, pinned host rings)": "CEDState.encoder_only is declared after self.plan, beside the pinned limits/floors staging rings; warm_metadata resets it as in the PR. stage_floors (FULL-graph staging) does not touch it: the model reads its flag only at the CED boundary, which runs only with compacted ced_indices, and those come only from _stage_ced, which sets the flag every eager step.",
+   "compressor.py with 957-p1": "957-p1 replicates fused_wkv_wgate unpacked through TP4 (tp_size 1), so bind() takes the tp_size <= 1 branch: the ratio-2 SP weight is the [1024, 5120] layer weight itself (same storage, no all-gather, no extra memory), and the SP kernel is the same bf16_gemm_two call the replicated layer's own prefill GEMM makes. Above TP4 the PR's gather-and-unpad of the sharded weight is kept (10 MiB a ratio-2 layer a rank). The hunks merged cleanly; the bind() comment and sp_prefill's module notes were updated."
+  },
+  "added": [
+   "tests/models/test_deepseek_v4_1_compressor.py::test_sp_ratio2_projection_matches_full_rows (GPU): the PR's bf16_gemm_two check, as a test, at TP2..TP8 through the real bind()",
+   "sp_prefill.py module notes: compressor layers take the local front; the full-weight exception holds only above TP4"
+  ],
+  "not_changed_on_purpose": [
+   "model_state.stage_full_cudagraph_attn leaves the encoder_only flag (see ced.py above); a stale flag cannot act without compacted indices",
+   "ced_sp_saves_bytes stays ratio-1 only (the boundary is ratio 1)"
+  ]
+ },
+ "bit_exactness": {
+  "verdict": "bit-identical to candidate-54 + 957-p1 in every compared output",
+  "projection_test": {
+   "test": "tests/models/test_deepseek_v4_1_compressor.py::test_sp_ratio2_projection_matches_full_rows[2..8]",
+   "what": "each rank's bf16_gemm_two on its SP local rows (bound by declare_kernels/bind as serving binds it), gathered, against TP1 project_parts on all rows (= every TP<=4 rank's replicated projection; = the sharded project_parts + gather_columns_into above TP4, which 957-p1's test checks equal to TP1), 129/205/206/207/257/385/4097/16384 rows, finite and NaN/Inf inputs, values and gates compared as int32 bits",
+   "result": "7/7 world sizes equal bit for bit; through TP4 the SP weight shares the layer weight's storage and bind() makes no all-gather; above TP4 bind() gathers once and the unpadded weight equals [wkv; wgate]",
+   "on_base": "fails on candidate-54 + 957-p1 (ratio 2 has no SP projection there)"
+  },
+  "attention_harness": {
+   "script": "shim/attn_harness.py (adapted from candidate-50 receipts rework/pr-1009-r1/shim/attn_harness.py)",
+   "what": "vLLM's own DeepseekV41TileLangAttention for layers 2 (ratio-2 KV/index/candidate source with state ring) and 20 (ratio 1) at TP rank shapes on one GPU, compressor built as a TP-W rank builds it, random checkpoint-dtype weights, real caches and B12X metadata; each rank's forward under SPRows with the TP all-gather simulated to a fixed point; compared per rank: WO input (attention output), top-k indices, and every owned cache (SWA, main KV, index K, ratio-2 state ring)",
+   "scenarios": "whole prefills of 4,096, 4,097 and 16,384 rows; a chunked prefill 4,097 + 4,096 + 2,051 rows with caches and the state ring carried between chunks; 90 decode rows beside a 4,006-row prefill; SP decode steps of 214 and 216 rows",
+   "tp4_serving_env": {
+    "runs": [
+     "base-tp4-boot1",
+     "cand-tp4-boot1",
+     "cand-tp4-boot2",
+     "base-tp4-boot2"
+    ],
+    "cells": 18,
+    "identical_cells": 18,
+    "problems": [],
+    "scenarios": [
+     "chunked-4097+4096+2051 step 0 layer 2",
+     "chunked-4097+4096+2051 step 0 layer 20",
+     "chunked-4097+4096+2051 step 1 layer 2",
+     "chunked-4097+4096+2051 step 1 layer 20",
+     "chunked-4097+4096+2051 step 2 layer 2",
+     "chunked-4097+4096+2051 step 2 layer 20",
+     "decode-ctx-216 step 0 layer 2",
+     "decode-ctx-216 step 0 layer 20",
+     "decode-tail-214 step 0 layer 2",
+     "decode-tail-214 step 0 layer 20",
+     "mixed-90+4006 step 0 layer 2",
+     "mixed-90+4006 step 0 layer 20",
+     "prefill-16384 step 0 layer 2",
+     "prefill-16384 step 0 layer 20",
+     "prefill-4096 step 0 layer 2",
+     "prefill-4096 step 0 layer 20",
+     "prefill-4097 step 0 layer 2",
+     "prefill-4097 step 0 layer 20"
+    ],
+    "all_outputs_finite": true
+   },
+   "tp3_serving_env": {
+    "runs": [
+     "base-tp3-boot1",
+     "cand-tp3-boot1",
+     "cand-tp3-boot2",
+     "base-tp3-boot2"
+    ],
+    "cells": 18,
+    "identical_cells": 18,
+    "problems": [],
+    "scenarios": [
+     "chunked-4097+4096+2051 step 0 layer 2",
+     "chunked-4097+4096+2051 step 0 layer 20",
+     "chunked-4097+4096+2051 step 1 layer 2",
+     "chunked-4097+4096+2051 step 1 layer 20",
+     "chunked-4097+4096+2051 step 2 layer 2",
+     "chunked-4097+4096+2051 step 2 layer 20",
+     "decode-ctx-216 step 0 layer 2",
+     "decode-ctx-216 step 0 layer 20",
+     "decode-tail-214 step 0 layer 2",
+     "decode-tail-214 step 0 layer 20",
+     "mixed-90+4006 step 0 layer 2",
+     "mixed-90+4006 step 0 layer 20",
+     "prefill-16384 step 0 layer 2",
+     "prefill-16384 step 0 layer 20",
+     "prefill-4096 step 0 layer 2",
+     "prefill-4096 step 0 layer 20",
+     "prefill-4097 step 0 layer 2",
+     "prefill-4097 step 0 layer 20"
+    ],
+    "all_outputs_finite": true
+   },
+   "tp4_breakable_graphs": {
+    "runs": [
+     "base-tp4-breakable",
+     "cand-tp4-breakable"
+    ],
+    "cells": 18,
+    "identical_cells": 18,
+    "problems": [],
+    "scenarios": [
+     "chunked-4097+4096+2051 step 0 layer 2",
+     "chunked-4097+4096+2051 step 0 layer 20",
+     "chunked-4097+4096+2051 step 1 layer 2",
+     "chunked-4097+4096+2051 step 1 layer 20",
+     "chunked-4097+4096+2051 step 2 layer 2",
+     "chunked-4097+4096+2051 step 2 layer 20",
+     "decode-ctx-216 step 0 layer 2",
+     "decode-ctx-216 step 0 layer 20",
+     "decode-tail-214 step 0 layer 2",
+     "decode-tail-214 step 0 layer 20",
+     "mixed-90+4006 step 0 layer 2",
+     "mixed-90+4006 step 0 layer 20",
+     "prefill-16384 step 0 layer 2",
+     "prefill-16384 step 0 layer 20",
+     "prefill-4096 step 0 layer 2",
+     "prefill-4096 step 0 layer 20",
+     "prefill-4097 step 0 layer 2",
+     "prefill-4097 step 0 layer 20"
+    ],
+    "all_outputs_finite": true
+   },
+   "result": "18/18 cells byte-identical across base and candidate and across boots at TP4 and TP3 (serving environment, no breakable graphs), and 18/18 with breakable graphs (the fallback front); every rank agrees with every other on output, top-k and caches; all outputs finite. The base gathers the 10,240-byte BF16 hidden row; the candidate gathers the MXFP8 q cast (1,320 B), SWA records (528 B) and FP32 values+gates (4,096 B at ratio 2, 1,024 B BF16 values at ratio 1).",
+   "decode": "non-SP decode never enters the changed code (the decode overlap and the full-row path are the base's); SP decode steps (214, 216 rows) are covered above"
+  },
+  "ced_encoder_only": "not measurable on one GPU (needs the full model). The early exit applies only when every request of the step is a non-final prefill chunk ending at or before its replay floor (replay_rows gives each such request one dummy row, its last, replayed from itself: requests_kernel replay = min(floor, position)). Its decoder rows and DSpark context rows lie before the floor, and every later decoder or draft window starts at or after it (CED replay start; bind_draft_replay_start), so no later output reads them; the runner discards the chunk's sampled token. The final chunk is never encoder-only, so its decoder rows and logits are the base's. test_deepseek_v41_ced_receptive_field.py's oracle states the same property. End-to-end confirmation: the screen's greedy identity at 32K and 256K prefill on tp4-switched (multi-chunk prompts).",
+  "pr_check_kept": "the PR's bf16_gemm_two vs project_parts + gather_columns_into check is now the GPU test above (TP5..TP8 sharded; TP2..TP4 against the replicated projection 957-p1 makes)"
+ },
+ "tests": {
+  "files": "the PR's six (test_deepseek_v4_1_compressor_prepare, _compressor, _attention, _ced_model, _ced_sp, _sp_prefill) plus tests/kernels/test_deepseek_v41_tilelang_front.py, tests/models/test_deepseek_v4_1_prepare.py, tests/v1/attention/test_b12x_v41_ced_metadata.py, tests/v1/worker/test_gpu_model_runner_v2.py, tests/kernels/attention/test_deepseek_v41_ced_replay.py",
+  "candidate_boot1": "600 passed, 2 errors (raw/pytest-cand-boot1.txt)",
+  "candidate_boot2": "600 passed, 2 errors (raw/pytest-cand-boot2.txt)",
+  "base_boot1": "582 passed, 2 errors (raw/pytest-base-boot1.txt)",
+  "new_tests_on_base_code": "18 failed of 18 (the rebase's test files over candidate-54 + 957-p1's code; raw/pytest-newtests-on-base.txt)",
+  "errors": "test_gpu_model_runner_v2.py::test_profile_run_releases_generic_outputs_before_deepseek_profile and ::test_moe_output_buffer_is_reused_and_disjoint_from_workspace_scratch need conftest's workspace_init fixture; the image lacks tblib, so the runs use --noconftest and both arms error at setup identically",
+  "how": "pytest --noconftest -p no:cacheprovider in spark-ds41f:candidate-50 with the arm's tree mounted, serving environment, under flock",
+  "not_run": "the dgx unit suite of spark-ds41f (step 3) belongs to the candidate's assembly"
+ },
+ "own_mark": {
+  "what": "a rank's SP prefill forward of one compressor layer (shim/bench_layers.py): layers 2 (ratio 2, the changed path of layers 2, 8, 14) and 20 (ratio 1, as an ordinary SP layer), one request's chunk of T rows, TP4 rank shapes on one GPU; each all-gather is a device copy of the gathered rows (no fabric); CUDA events around each forward, 8 warmup + 40 timed forwards a cell, ranks alternating",
+  "arms": "base = spark-ds41f:candidate-50 (8c1ea1f62f62) + candidate-54 + 957-p1 tree mounted; cand = the same + the rebased 956",
+  "order": "one session, ABBA: base boot1, cand boot1, cand boot2, base boot2 (fresh container each, serving environment)",
+  "statistic": "each boot's median over all ranks' forwards; the change is the mean of boot medians with a Student-t 95% interval (df 2); 'slowest_rank' is in raw/json/bench-cells.json",
+  "cells_layer2_all_ranks_ms": [
+   {
+    "layer": 2,
+    "T": 4096,
+    "base_ms": 7.549,
+    "cand_ms": 5.926,
+    "base_boots_ms": [
+     7.523,
+     7.574
+    ],
+    "cand_boots_ms": [
+     5.937,
+     5.914
+    ],
+    "delta_pct": -21.5,
+    "ci95_pct": [
+     -23.09,
+     -19.92
+    ],
+    "boots_separate": true,
+    "gathered_bytes_per_row": {
+     "base": 12288,
+     "cand": 7992
+    }
+   },
+   {
+    "layer": 2,
+    "T": 8192,
+    "base_ms": 15.798,
+    "cand_ms": 12.187,
+    "base_boots_ms": [
+     15.893,
+     15.702
+    ],
+    "cand_boots_ms": [
+     12.217,
+     12.156
+    ],
+    "delta_pct": -22.86,
+    "ci95_pct": [
+     -25.59,
+     -20.13
+    ],
+    "boots_separate": true,
+    "gathered_bytes_per_row": {
+     "base": 12288,
+     "cand": 7992
+    }
+   },
+   {
+    "layer": 2,
+    "T": 16384,
+    "base_ms": 33.405,
+    "cand_ms": 26.057,
+    "base_boots_ms": [
+     33.56,
+     33.25
+    ],
+    "cand_boots_ms": [
+     26.173,
+     25.941
+    ],
+    "delta_pct": -22.0,
+    "ci95_pct": [
+     -24.49,
+     -19.5
+    ],
+    "boots_separate": true,
+    "gathered_bytes_per_row": {
+     "base": 12288,
+     "cand": 7992
+    }
+   },
+   {
+    "layer": 2,
+    "T": 32768,
+    "base_ms": 73.094,
+    "cand_ms": 58.199,
+    "base_boots_ms": [
+     73.561,
+     72.628
+    ],
+    "cand_boots_ms": [
+     58.279,
+     58.119
+    ],
+    "delta_pct": -20.38,
+    "ci95_pct": [
+     -23.16,
+     -17.59
+    ],
+    "boots_separate": true,
+    "gathered_bytes_per_row": {
+     "base": 12288,
+     "cand": 7992
+    }
+   },
+   {
+    "layer": 2,
+    "T": 65535,
+    "base_ms": 165.974,
+    "cand_ms": 138.055,
+    "base_boots_ms": [
+     166.337,
+     165.611
+    ],
+    "cand_boots_ms": [
+     138.205,
+     137.906
+    ],
+    "delta_pct": -16.82,
+    "ci95_pct": [
+     -17.84,
+     -15.8
+    ],
+    "boots_separate": true,
+    "gathered_bytes_per_row": {
+     "base": 12288,
+     "cand": 7992
+    }
+   }
+  ],
+  "cells_layer20_all_ranks_ms": [
+   {
+    "layer": 20,
+    "T": 4096,
+    "base_ms": 7.564,
+    "cand_ms": 6.076,
+    "base_boots_ms": [
+     7.566,
+     7.563
+    ],
+    "cand_boots_ms": [
+     6.083,
+     6.068
+    ],
+    "delta_pct": -19.68,
+    "ci95_pct": [
+     -20.11,
+     -19.24
+    ],
+    "boots_separate": true,
+    "gathered_bytes_per_row": {
+     "base": 12288,
+     "cand": 4920
+    }
+   },
+   {
+    "layer": 20,
+    "T": 8192,
+    "base_ms": 16.057,
+    "cand_ms": 12.524,
+    "base_boots_ms": [
+     16.115,
+     15.999
+    ],
+    "cand_boots_ms": [
+     12.621,
+     12.427
+    ],
+    "delta_pct": -22.0,
+    "ci95_pct": [
+     -25.03,
+     -18.98
+    ],
+    "boots_separate": true,
+    "gathered_bytes_per_row": {
+     "base": 12288,
+     "cand": 4920
+    }
+   },
+   {
+    "layer": 20,
+    "T": 16384,
+    "base_ms": 35.908,
+    "cand_ms": 28.615,
+    "base_boots_ms": [
+     35.3,
+     36.517
+    ],
+    "cand_boots_ms": [
+     28.112,
+     29.119
+    ],
+    "delta_pct": -20.31,
+    "ci95_pct": [
+     -29.77,
+     -10.85
+    ],
+    "boots_separate": true,
+    "gathered_bytes_per_row": {
+     "base": 12288,
+     "cand": 4920
+    }
+   },
+   {
+    "layer": 20,
+    "T": 32768,
+    "base_ms": 80.453,
+    "cand_ms": 66.896,
+    "base_boots_ms": [
+     80.479,
+     80.426
+    ],
+    "cand_boots_ms": [
+     67.363,
+     66.429
+    ],
+    "delta_pct": -16.85,
+    "ci95_pct": [
+     -19.35,
+     -14.35
+    ],
+    "boots_separate": true,
+    "gathered_bytes_per_row": {
+     "base": 12288,
+     "cand": 4920
+    }
+   },
+   {
+    "layer": 20,
+    "T": 65535,
+    "base_ms": 202.21,
+    "cand_ms": 173.056,
+    "base_boots_ms": [
+     203.753,
+     200.666
+    ],
+    "cand_boots_ms": [
+     171.291,
+     174.822
+    ],
+    "delta_pct": -14.42,
+    "ci95_pct": [
+     -19.41,
+     -9.43
+    ],
+    "boots_separate": true,
+    "gathered_bytes_per_row": {
+     "base": 12288,
+     "cand": 4920
+    }
+   }
+  ],
+  "cells_slowest_rank_ms": [
+   {
+    "layer": 2,
+    "T": 4096,
+    "base_ms": 7.73,
+    "cand_ms": 6.012,
+    "base_boots_ms": [
+     7.61,
+     7.85
+    ],
+    "cand_boots_ms": [
+     6.036,
+     5.988
+    ],
+    "delta_pct": -22.23,
+    "ci95_pct": [
+     -29.05,
+     -15.41
+    ],
+    "boots_separate": true,
+    "gathered_bytes_per_row": {
+     "base": 12288,
+     "cand": 7992
+    }
+   },
+   {
+    "layer": 2,
+    "T": 8192,
+    "base_ms": 16.384,
+    "cand_ms": 12.542,
+    "base_boots_ms": [
+     16.419,
+     16.348
+    ],
+    "cand_boots_ms": [
+     12.565,
+     12.519
+    ],
+    "delta_pct": -23.45,
+    "ci95_pct": [
+     -24.55,
+     -22.34
+    ],
+    "boots_separate": true,
+    "gathered_bytes_per_row": {
+     "base": 12288,
+     "cand": 7992
+    }
+   },
+   {
+    "layer": 2,
+    "T": 16384,
+    "base_ms": 35.277,
+    "cand_ms": 27.938,
+    "base_boots_ms": [
+     35.518,
+     35.035
+    ],
+    "cand_boots_ms": [
+     28.177,
+     27.698
+    ],
+    "delta_pct": -20.8,
+    "ci95_pct": [
+     -24.96,
+     -16.65
+    ],
+    "boots_separate": true,
+    "gathered_bytes_per_row": {
+     "base": 12288,
+     "cand": 7992
+    }
+   },
+   {
+    "layer": 2,
+    "T": 32768,
+    "base_ms": 79.407,
+    "cand_ms": 65.015,
+    "base_boots_ms": [
+     79.878,
+     78.937
+    ],
+    "cand_boots_ms": [
+     65.07,
+     64.96
+    ],
+    "delta_pct": -18.12,
+    "ci95_pct": [
+     -20.69,
+     -15.56
+    ],
+    "boots_separate": true,
+    "gathered_bytes_per_row": {
+     "base": 12288,
+     "cand": 7992
+    }
+   },
+   {
+    "layer": 2,
+    "T": 65535,
+    "base_ms": 194.124,
+    "cand_ms": 166.486,
+    "base_boots_ms": [
+     194.095,
+     194.153
+    ],
+    "cand_boots_ms": [
+     166.887,
+     166.085
+    ],
+    "delta_pct": -14.24,
+    "ci95_pct": [
+     -15.13,
+     -13.35
+    ],
+    "boots_separate": true,
+    "gathered_bytes_per_row": {
+     "base": 12288,
+     "cand": 7992
+    }
+   },
+   {
+    "layer": 20,
+    "T": 4096,
+    "base_ms": 7.758,
+    "cand_ms": 6.262,
+    "base_boots_ms": [
+     7.759,
+     7.756
+    ],
+    "cand_boots_ms": [
+     6.262,
+     6.261
+    ],
+    "delta_pct": -19.28,
+    "ci95_pct": [
+     -19.37,
+     -19.2
+    ],
+    "boots_separate": true,
+    "gathered_bytes_per_row": {
+     "base": 12288,
+     "cand": 4920
+    }
+   },
+   {
+    "layer": 20,
+    "T": 8192,
+    "base_ms": 17.156,
+    "cand_ms": 13.491,
+    "base_boots_ms": [
+     17.162,
+     17.149
+    ],
+    "cand_boots_ms": [
+     13.481,
+     13.501
+    ],
+    "delta_pct": -21.36,
+    "ci95_pct": [
+     -21.66,
+     -21.06
+    ],
+    "boots_separate": true,
+    "gathered_bytes_per_row": {
+     "base": 12288,
+     "cand": 4920
+    }
+   },
+   {
+    "layer": 20,
+    "T": 16384,
+    "base_ms": 39.092,
+    "cand_ms": 31.51,
+    "base_boots_ms": [
+     39.174,
+     39.01
+    ],
+    "cand_boots_ms": [
+     31.587,
+     31.433
+    ],
+    "delta_pct": -19.39,
+    "ci95_pct": [
+     -20.63,
+     -18.16
+    ],
+    "boots_separate": true,
+    "gathered_bytes_per_row": {
+     "base": 12288,
+     "cand": 4920
+    }
+   },
+   {
+    "layer": 20,
+    "T": 32768,
+    "base_ms": 94.385,
+    "cand_ms": 80.237,
+    "base_boots_ms": [
+     95.079,
+     93.692
+    ],
+    "cand_boots_ms": [
+     79.844,
+     80.63
+    ],
+    "delta_pct": -14.99,
+    "ci95_pct": [
+     -18.62,
+     -11.36
+    ],
+    "boots_separate": true,
+    "gathered_bytes_per_row": {
+     "base": 12288,
+     "cand": 4920
+    }
+   },
+   {
+    "layer": 20,
+    "T": 65535,
+    "base_ms": 262.248,
+    "cand_ms": 233.409,
+    "base_boots_ms": [
+     263.126,
+     261.37
+    ],
+    "cand_boots_ms": [
+     233.156,
+     233.663
+    ],
+    "delta_pct": -11.0,
+    "ci95_pct": [
+     -12.5,
+     -9.5
+    ],
+    "boots_separate": true,
+    "gathered_bytes_per_row": {
+     "base": 12288,
+     "cand": 4920
+    }
+   }
+  ],
+  "summary": "layer 2: -21.5% (4K), -22.9% (8K), -22.0% (16K, the served chunk: 33.41 -> 26.06 ms), -20.4% (32K), -16.8% (64K); every candidate boot below every base boot in every cell; layer 20 -14.4..-22.0%. Per 16K chunk this is about 7.3 ms a ratio-2 layer of rank compute and local copies, about 22 ms over layers 2, 8 and 14, before any fabric saving; each rank sends 7,992 instead of 12,288 bytes a row at ratio 2 (4,920 at ratio 1).",
+  "64K_cell": "the largest chunk is 65,535 rows: the sparse MLA extend kernel's grid.y is the row count and CUDA caps it at 65,535, so 65,536 rows fail to launch in both arms (the first attempt, kept as raw/bench-base-boot1-T65536-aborted.txt, ran the base to 32K before stopping there). tp4-switched serves chunks of at most 16,384 rows.",
+  "not_in_it": "fabric time and the CED encoder-only saving (the decoder layers it skips need the full model and the cluster's MoE all-to-all)"
+ },
+ "servebench_for_coordinator": {
+  "what": "the PR's own evidence: servebench prefill on tp4-switched, bin/spark --cluster-config <candidate-56 tp4-switched config> --shape tp4-switched bench, 3 repeats a context, deterministic source-text slice, at 32,768 / 65,536 / 131,072 / 262,144 target tokens (the PR on 1107: +2.31% / +0.44% / +1.67% / +1.71% vs 1107's tp4-switched record; raw/956 README numbers in the PR folder)",
+  "how": "same session, ABBA, two boots each: candidate-56 (957-p1 + 956) against a no956 control on the same image (no956/overlay/: candidate-54 + 957-p1's copies of 956's six source files; 957-p1 is the only other patch touching them and 956 applies after it), so the mark isolates #956 from 957-p1's own prefill change; the screen's prefill steps at 32K and 256K with greedy identity cover the bit-exactness end to end",
+  "expected": "prefill tok/s not worse at any context, better at 32K-256K: the ratio-2 layers' local front and projection (this mark) plus the encoder-only exit on every non-final 16K chunk (the PR: about 28-32 ms a non-final chunk on tp4-switched)",
+  "watch": "an encoder-only step returns zero hidden states, so its discarded sample row reaches the greedy vocabulary screen (0762+ certified two-pass head) with a zero vector, where every column ties and the screen refines the whole vocabulary shard for that row: about one head GEMV (~1 ms) a non-final chunk, an estimate not measured here, well under the decoder work skipped"
+ },
+ "memory": "TP <= 4: no static change (the SP weight is the replicated layer weight); transient per ratio-2 layer at T rows: FP32 values+gates gathers of T x 4,096 B instead of the T x 10,240 B BF16 hidden gather and its MXFP8 cast. TP5..TP8: +10 MiB a ratio-2 layer a rank (30 MiB), the PR's gathered weight.",
+ "pair_check": {
+  "result": "clean in the candidate's order",
+  "steps": [
+   "candidate-54 (4e8133ff, tree 5f021d9a) + git am 957-p1 (db4704c8): tree 3959b211 (= the selection's stack_ready tree)",
+   "+ git am the rebased 956 (d9b71b04): patch head abb26187, tree 0c848613 = the GPU runs' candidate tree; git diff --check base..HEAD clean",
+   "pairs.py's order 957-p1 then 956 (git apply --index / --check): clean",
+   "956 alone on candidate-54: does not apply (compressor.py:218, the context of 957-p1's lines) - by design, it builds on 957-p1 (selection: '#956's rework builds on 957-p1'), so the reverse order is not a valid stack"
+  ],
+  "other_round3_sets": "no file in common with candidates 55 (1008, 978, 988-deadrow, 995-guard) or 57 (957-p2, 957-p4, 957-p5); 1006 (queued) shares attention.py and nvidia/model.py",
+  "receipt": "raw/pair-check.txt"
+ },
+ "deliverables": {
+  "patch": "56-02-956-perf-dsv41-sp-ratio2-compressor-and-ced-encoder-only-chunks.patch",
+  "957_p1_patch": "56-01-957-p1-perf-dsv41-tp3-decode-compressor-mla-and-spec-fusions.patch",
+  "overlay": "overlay/: every file the pair (957-p1 + 956) changes, as in tree 0c848613 (vllm/... and tests/...)",
+  "no956_overlay": "no956/overlay/: candidate-54 + 957-p1's copies of 956's six source files, for a no956 control",
+  "commands": "commands.txt (summary) and raw/commands.txt (every GPU command verbatim with UTC times, load, running containers, exit code)",
+  "raw": "raw/: every output, aborted runs included (*-aborted), json results, compare and cells summaries, pair check",
+  "scripts": "shim/",
+  "commands_note": "the harness, bench and test batches ran concurrently as three scripts, each GPU job taking the flock in turn, so raw/commands.txt's start and end records interleave; until run.sh added an 'end_of: <label>' line (from bench-base-boot1 of the restarted bench on), match each end record by its output file and by the batch logs' rc= lines (raw/batch-*.log), which are in each batch's own order"
+ },
+ "runs_kept_that_failed": [
+  "pytest-dev-newtests-cand first try without --noconftest (tblib missing, rc 4): not kept as a file (overwritten by the rerun of the same label); raw/commands.txt records both",
+  "harness-dev2-cand-tp4: the harness bound the FP32 state ring as uint8 (kernel dtype error in layer 2); fixed in the harness",
+  "batch-harness-pages96-aborted: 96 cache pages were too few for 16,384 rows (SWA needs 129); fixed to 160",
+  "bench-base-boot1-T65536-aborted: 65,536-row chunk cannot launch the sparse MLA extend kernel (grid.y > 65,535) in either arm; chunks capped at 65,535"
+ ],
+ "environment": {
+  "host": "sp8 (spark-0016, NVIDIA GB10)",
+  "image": "spark-ds41f:candidate-50 sha256:8c1ea1f62f62c3e2adc03b645c091a5499cf7163101aca32875c894b96f155db (vLLM tree d5778ab5; tilelang e2b00182 = candidate-54's lock)",
+  "gpu_lock": "every GPU command under flock /tmp/spark-lab-gpu.lock after checking ~/spark-hold.json absent and no serving container",
+  "no": "no pushes, commits in spark-ds41f, PRs, image builds, cluster or window operations; nothing built or replayed on the laptop"
+ }
+}

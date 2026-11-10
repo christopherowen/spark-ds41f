@@ -1,0 +1,123 @@
+{
+ "candidate": 56,
+ "shape": "tp4-switched",
+ "nodes": "sp1..sp4 (head sp1)",
+ "purpose": "PR validation (docs/release-benchmark.md, steps 1-8): one of candidates 55, 56 and 57, tested at the same time, one per testbed",
+ "theme": "#957 part 1, the replicated BF16 compressor at TP <= 4, then #956 round 3 (the SP ratio-2 compressor projection and CED encoder-only chunks, rebased on 957-p1). Neither declares an output change",
+ "base": "candidate-54",
+ "base_series": "candidate-54's vllm/series by relative path (spark-ds41f-1107's 0001..0761, 641 active; candidate-50's 0762..0780 with #1009 round 1 in place of its 0778; round 2's 0781..0791): 671 patches",
+ "base_lock": "experiments/2026-10-26-spark-ds41f-candidate/candidate-54/upstreams.lock.json",
+ "base_head": "4e8133ff10a125b90753c2727f162e29fe37f30c",
+ "base_tree": "5f021d9a7f01c03e2389dd3d8021759cfa19ea34",
+ "stack_head": "295c2ced6d84e0654aa6a4545833af071c12fc84",
+ "stack_tree": "0c84861318b7435cb9f7e0549fbf66e93dbd9da3",
+ "patchset_sha256": "0a6aa2ea67c2c1c948be6996dffc42bb8dc1a2feaf16b7b851f5fc7b06e46ae5",
+ "order": [
+  957,
+  956
+ ],
+ "patches": [
+  {
+   "patch": "0795-perf-dsv41-replicate-the-BF16-compressor-projection-.patch",
+   "pr": 957,
+   "label": "957-p1",
+   "pr_title": "TP3/TP4 decode compressor, sparse MLA, and spec-decode fusions",
+   "pr_head": "e464d364431a26b031a6e91f5dd610f429129c46",
+   "source_patch": "experiments/2026-11-08-tp3-decode-recovery/vllm/0762-perf-dsv41-tp3-decode-compressor-mla-and-spec-fusions.patch",
+   "source_sha256": "44412274ff72075c37afed64dbd9cb638cf604a34901b10f11b6fee128385e71",
+   "method": "hunk-level split",
+   "proposed_patch": "experiments/2026-10-26-spark-ds41f-candidate/candidate-55/receipts/rebases/56-01-957-p1-perf-dsv41-tp3-decode-compressor-mla-and-spec-fusions.patch",
+   "proposed_sha256": "db4704c89e085d81985bd49b26ab3ab20fd1fd3b03e16c23575995bc62cf4db2",
+   "applied": "clean; the selection's hunk-level split, retitled for the part it carries (Subject and one body line; no diff byte changed)",
+   "sha256": "5121fd22e9d355d6abdc851269f8d836babc3e04b96e54347ec24cad033ddd38",
+   "subject": "perf(dsv41): replicate the BF16 compressor projection at TP <= 4",
+   "pr_subject": "perf(dsv41): TP3/TP4 decode compressor, sparse MLA, and spec-decode fusions",
+   "author": "Christopher Owen <3221756+christopherowen@users.noreply.github.com>",
+   "commit": "e4b134ab757ebfee9997c84bdfa061756724e9ca",
+   "tree": "3959b21147bc9f98f4ebcd48e2c80e0f42d4e2ef",
+   "kind": "perf",
+   "category": "K1",
+   "own_mark": "Its screen_tp3_decode.py compressor cells and tests/models/test_deepseek_v4_1_compressor.py on the candidate image, 2 boots, ABBA against the candidate-54 image, by CUDA-graph replay and kernel time: the 4 compressor projections' local time lower beyond the interval (the PR: 103.6-107.6 -> 51.6-53.1 us a step) and the decode step lower by the 4 removed all-gathers (the PR: about 135-155 us a step); compressor outputs torch.equal to TP1 at TP2..TP4. On the testbed: engine-grid decode cells not worse, SP prefill at 32K and 256K not worse (at TP <= 4 the SP projection reads the replicated weight, no all-gather); the static memory delta recorded (the PR: +21.9..24.4 MiB a rank)",
+   "declared_output_change": "none (the existing test already required the sharded path to equal TP1; the replicated path is TP1's)",
+   "acts": "TP3 and TP4 (disable_tp = tp_size <= 4); TP5..TP8 unchanged",
+   "placement": "acts at TP4 and TP3; must share a candidate with #956, which edits compressor.py too and whose served prefill evidence was taken on tp4-switched"
+  },
+  {
+   "patch": "0796-perf-dsv41-sp-ratio2-compressor-and-ced-encoder-only-chunks.patch",
+   "pr": 956,
+   "label": "956",
+   "pr_title": "perf(dsv41): SP ratio-2 compressor projection and CED encoder-only chunks",
+   "pr_head": "ecb3812cb8faa6423ebccceab1d658d2c8a9a30d",
+   "source_patch": "experiments/2026-11-08-sp-compressor-ced-encoder-only/vllm/0762-perf-dsv41-sp-ratio2-compressor-and-ced-encoder-only-chunks.patch",
+   "source_sha256": "0c20c2e22ea1a42a8fde769569ff5444d6f15ef096bb460a722fc10b315e4cd6",
+   "method": "round-3 rebase onto candidate-54 + 957-p1 (rework)",
+   "rework": "experiments/2026-10-26-spark-ds41f-candidate/candidate-56/receipts/rework/pr-956-r3-rebase",
+   "rework_verdict": "ready",
+   "rework_patch": "experiments/2026-10-26-spark-ds41f-candidate/candidate-56/receipts/rework/pr-956-r3-rebase/56-02-956-perf-dsv41-sp-ratio2-compressor-and-ced-encoder-only-chunks.patch",
+   "applied": "clean after 0795, not alone (by design: it builds on 957-p1); #956 round 3's rebase, byte for byte",
+   "sha256": "d9b71b04550c4a3bec9d0cb36334da66cdc94050298bffea64d95228a51241b6",
+   "subject": "perf(dsv41): SP ratio-2 compressor projection and CED encoder-only chunks",
+   "author": "Christopher Owen <3221756+christopherowen@users.noreply.github.com>",
+   "commit": "295c2ced6d84e0654aa6a4545833af071c12fc84",
+   "tree": "0c84861318b7435cb9f7e0549fbf66e93dbd9da3",
+   "kind": "perf (prefill)",
+   "category": "K2",
+   "own_mark": "Its servebench prefill on tp4-switched (the PR: 32K +2% against 1107's tp4-switched record; longer contexts in its README) as part of the screen's prefill steps, and its bf16_gemm_two bit-exactness check; outputs bit-exact",
+   "declared_output_change": "none (the PR declares bit-exact)",
+   "placement": "tp4-switched, where its served prefill screen was taken; with 957-p1 (compressor.py)"
+  }
+ ],
+ "controls": {
+  "no956": {
+   "configs": [
+    "experiments/2026-10-26-spark-ds41f-candidate/candidate-56/tp4-switched-no956.json",
+    "experiments/2026-10-26-spark-ds41f-candidate/candidate-56/tp4-switched-no956-dev.json"
+   ],
+   "overlay": "experiments/2026-10-26-spark-ds41f-candidate/candidate-56/no956/overlay",
+   "what": "#956's six source files as they are on candidate-54 + 0795 (957-p1), mounted over the candidate-56 image; each equals the tree's blob (receipts/stack.log, section 3a), and 0796 applies to that tree. 957-p1 is the only other patch touching them (compressor.py), and its change stays in, so the control isolates #956 from 957-p1",
+   "copied_from": "experiments/2026-10-26-spark-ds41f-candidate/candidate-56/receipts/rework/pr-956-r3-rebase/no956/overlay"
+  }
+ },
+ "rework": {
+  "956": {
+   "receipts": "experiments/2026-10-26-spark-ds41f-candidate/candidate-56/receipts/rework/pr-956-r3-rebase",
+   "verdict": "ready",
+   "patch_head_in_rework": "abb261871df2043ec5edee7e5ff2d1c42944b009",
+   "tree": "0c84861318b7435cb9f7e0549fbf66e93dbd9da3",
+   "note": "candidate-56's 0795 is 957-p1 retitled, so its commit and the stack head (295c2ced6d84) differ from the rework's (0c4142a2, abb26187); the tree is the same, 0c84861318b7"
+  }
+ },
+ "left_out": [
+  {
+   "pr": 957,
+   "label": "957-p3",
+   "part": "part 3, fused post-step verification bookkeeping (acceptance_estimator.py, speculator.py, model_runner.py hunks 3-4, tests/v1/spec_decode/test_acceptance_estimator.py)",
+   "reason": "superseded: the base's 0764 (#965 round 1) already carries the same observe_verification fusion and verified-count reuse in model_runner.py, with 0769 (#980 round 1); its hunks conflict with them",
+   "disposition": "left out at selection: superseded by the base's 0764 (#965 round 1) and 0769 (#980 round 1)"
+  }
+ ],
+ "semantic_review": {
+  "summary": "0796 (#956 round 3) is built on 0795 (957-p1): both edit compressor.py, and 0796 applies only after 0795. #956's semantic conflicts with the base (attention.py against #1009 round 1's sp_front_call and #1012 round 1's decode overlap; ced.py against #960 round 1's pinned host rings) were resolved in its round-3 rework, which compares every output with candidate-54 + 957-p1 bit for bit.",
+  "files": [
+   {
+    "file": "vllm/models/deepseek_v4_1/compressor.py",
+    "patches": [
+     "0765 #1012 round 1 (base)",
+     "0795 957-p1",
+     "0796 #956 round 3"
+    ],
+    "review": "#1012 round 1: decode KV writes (hunks at 286-334); 957-p1: the replicated BF16 projection at TP <= 4 (init); #956: the ratio-2 SP projection on 957-p1's replicated weight (rework result.json, rebase.semantics_kept)."
+   },
+   {
+    "file": "vllm/models/deepseek_v4_1/attention.py, ced.py, nvidia/model.py, nvidia/model_state.py, sp_prefill.py",
+    "patches": [
+     "0778 #1009 round 1, 0765 #1012 round 1, 0788 #960 round 1 (base)",
+     "0796 #956 round 3"
+    ],
+    "review": "re-derived in the rework: experiments/2026-10-26-spark-ds41f-candidate/candidate-56/receipts/rework/pr-956-r3-rebase/result.json (rebase.conflicts)"
+   }
+  ]
+ },
+ "authors": "Every PR is christopherowen's (the selection's gh pr view, scripts-as-run/outputs/authors.tsv). Every patch's From: is Christopher Owen's (christopherowen@users.noreply.github.com or 3221756+christopherowen@users.noreply.github.com), checked in receipts/stack.log.",
+ "selection_receipts": "experiments/2026-10-26-spark-ds41f-candidate/candidate-55/receipts/selection-proposal.json"
+}

@@ -1,0 +1,79 @@
+# #995 guard rework for candidate-55 (round 3), 2026-11-10. Commands as run, in order.
+# Hosts: the laptop (reading, scripts, analysis) and sp8 (spark-0016, NVIDIA GB10). Work dir on sp8:
+# W=~/spark-lab/agents/round3-995-guard. No push, commit to any shared repository, PR, image build,
+# cluster or window operation. Every GPU container ran through scripts/run.sh, which takes
+# /tmp/spark-lab-gpu.lock and, inside it, refuses (exit 3, retried every 60 s) when ~/spark-hold.json
+# exists or any container runs; raw/commands.txt has one block per container (36 blocks: hold_file
+# absent and docker_ps_before none in every one; no run was refused). sp8 was shared with another
+# agent (its r3-957p5-* and r3-956-* containers ran between ours, never during one).
+# The no-GPU verify containers took the same lock.
+
+## Laptop: inputs (read only)
+git -C ~/projects/spark-ds41f fetch -q origin                      # origin/main 920e1d50
+git show origin/main:docs/release-benchmark.md                    # Candidates, steps 1, 7, 8
+# round-3 selection receipts (scratchpad round3-select/.../candidate-55/receipts): selection-proposal.json
+# (rework_needed["995-guard"], left_out), pr-triage-2026-11-10.md
+git show origin/main:experiments/2026-10-26-spark-ds41f-candidate/candidate-53/receipts/own-marks/...   # #971/#977 own-mark harness
+# #977's own mark ran the copy step as benchmarks/kernels/benchmark_copy_drafts.py --gate --cases copy
+# ("gate_e2e_cells"); its bench_copy_match_long_context.py times copy_match only, which the guard does not touch.
+
+## sp8: base tree and the guard
+ssh sp8 'ls ~/spark-hold.json; docker ps'                          # absent; none
+git clone -q --no-hardlinks --no-checkout ~/spark-lab/agents/round-55-57-select/c54-vllm $W/vllm
+cd $W/vllm && git config gc.auto 0 && git checkout -q -B guard-995 4e8133ff10a125b90753c2727f162e29fe37f30c
+git rev-parse HEAD HEAD^{tree}                                     # 4e8133ff..., 5f021d9a... (candidate-54's lock)
+cp ~/spark-lab/agents/round-55-57-select/{v/995/vllm/0762-*.patch,splits/995-alloc-apply.patch,rebased/995-alloc-apply.diff} $W/inputs/
+#   sha256 b4040c07... (PR patch), eac25e5c... (split: hunks 1, 5, 6), 3c150312... (its 3-way result)
+git config merge.conflictstyle diff3
+git apply --3way $W/inputs/995-alloc-apply.patch                   # "Applied ... cleanly"; git diff HEAD | sha256sum = 3c150312 (raw/setup/step1-3way-diff.txt)
+python3 - (exact-string edits)                                     # docstring decay sentence back to the base's text;
+                                                                   # doublings update back to the base's expression, re-indented
+python3 - (append)                                                 # test_negative_slot_bounds_guard_in_alloc_and_apply from the PR
+                                                                   # patch's + lines, unchanged, after two blank lines, at the end of
+                                                                   # tests/v1/spec_decode/test_copy_drafts.py (after #977's two-tier test)
+git diff --check HEAD                                              # clean
+GIT_AUTHOR_NAME="Christopher Owen" GIT_AUTHOR_EMAIL=3221756+christopherowen@users.noreply.github.com \
+GIT_AUTHOR_DATE="Sun, 8 Nov 2026 18:27:04 +0000" GIT_COMMITTER_* (same name, email, date) git commit   # provisional message
+# check: every added line of tilelang_copy.py is one of #995's hunk 1/5/6 + lines except the doublings
+# argument line, which is the base's; the test's 93 added lines = 2 blank + the PR test's 91 lines.
+
+## sp8: arms (scripts/setup.sh, scripts/verify.sh)
+bash setup.sh > setup.txt                                          # image 8c1ea1f6 (spark-ds41f:candidate-50, vllm.tree d5778ab5);
+                                                                   # 36 files differ d5778ab5 -> 5f021d9a (all modified; files.txt);
+                                                                   # ovl/base = candidate-54's, ovl/cand = guard tree f77fc74b's;
+                                                                   # the arms differ in exactly 2 files (overlay-sha.txt)
+./verify.sh base > verify-base.txt; ./verify.sh cand > verify-cand.txt   # container-side SHA-256s equal overlay-sha.txt; guard text
+                                                                   # only on cand; 0789 and 0790 present on both; base decay on both
+# (verify.sh's first version imported tilelang_copy without a GPU and failed: tilelang is None there; replaced by grep.)
+
+## sp8: queues (scripts/q.sh, q2.sh, q3.sh, q4.sh; harness/warm.py from candidate-53's own marks, unchanged)
+nohup setsid bash q.sh > q.log &       # 01:27Z-01:31Z
+#  ABBA base1, cand1, cand2, base2: run.sh bench-<arm>-boot<N> <arm> -- python3 /h/warm.py /h/guard995.py --label .. --out /out/bench-...jsonl
+#                                   run.sh gate-<arm>-boot<N>  <arm> -- python3 benchmarks/kernels/benchmark_copy_drafts.py --gate --cases copy
+#  then: run.sh pytest-cand-boot1 cand -- python3 -m pytest -o addopts= --noconftest -p no:cacheprovider -v \
+#            tests/v1/spec_decode/test_copy_drafts.py tests/v1/core/test_copy_drafts_scheduler.py
+#        run.sh canary-base-boot1 base -v $W/ovl/cand/tests/v1/spec_decode/test_copy_drafts.py:/tmp/canary/test_copy_drafts.py:ro -- \
+#            python3 -m pytest ... /tmp/canary/test_copy_drafts.py -k test_negative_slot_bounds_guard_in_alloc_and_apply
+#        run.sh pytest-cand-boot2 cand -- (as boot1);  run.sh pytest-base-boot1 base -- (the base's own two test files)
+nohup setsid bash q2.sh > q2.log &     # 01:31Z-01:32Z: ABBA ids2-<arm>-boot<N>: python3 /h/ids995b.py (identity with refused copies;
+                                       # guard995.py's identity took every offered copy, so copy_apply's refusal branch had not run)
+nohup setsid bash q3.sh > q3.log &     # 01:33Z-01:36Z: ABBA confirm-<arm>-boot1..2: python3 /h/confirm995.py (the gate's copy cells,
+                                       # module unmodified, timer at 201 replays: the 21-replay gate flagged 5 cells, bimodal medians)
+nohup setsid bash q4.sh > q4.log &     # 01:37Z-01:46Z: ABBA twice, boots 3..6: confirm995.py, then k32995.py (32 copy_alloc +
+                                       # copy_apply pairs a CUDA graph: the guarded kernels' device time without launch latency)
+
+## Laptop: analysis
+python3 -I scripts/analyze.py raw      # raw/analysis.json (cell rule of candidate-53's own marks; pooled rule for 6 and 4 boots an arm)
+
+## sp8: patch
+git commit --amend -F msg-0781.txt (same author, committer and dates)    # commit 78ce3c6e, tree f77fc74b
+git format-patch -1 --start-number 781 -o $W/patch HEAD                  # 0781-fix-spec_decode-guard-negative-slots-in-copy_alloc-a.patch, sha256 d31e9155...
+git clone -q --no-checkout ~/spark-lab/agents/round-55-57-select/c54-vllm $W/amcheck; git checkout -B spark/build 4e8133ff
+git -c user.name="Christopher Owen" -c user.email=3221756+christopherowen@users.noreply.github.com am --quiet --committer-date-is-author-date 0781-*.patch
+#   -> commit 78ce3c6e, tree f77fc74b; git diff --check clean against 4e8133ff and against 19f2c20e (raw/amcheck.txt)
+# pair check with candidate-55's ready stack (round-55-57-select/out/55: 1008, 978, 988-deadrow), both orders, git am:
+#   guard then stack and stack then guard both give tree 06a2f3d4; no shared file (raw/pair-check-55*.txt)
+
+## sp8: cleanup
+# TileLang caches (root-owned, c/tl-base, c/tl-cand, 4.3 MB each) removed through a no-GPU container under the lock;
+# amcheck removed. Kept in $W (265 MB): vllm clone (branch guard-995 = 78ce3c6e), overlays, scripts, outputs, patch.

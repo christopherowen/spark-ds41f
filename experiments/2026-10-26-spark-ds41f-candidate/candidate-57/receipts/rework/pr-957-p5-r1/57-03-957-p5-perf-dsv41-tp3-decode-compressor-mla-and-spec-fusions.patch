@@ -1,0 +1,216 @@
+From fcb4eda904c47bce50fb9c6451d3262d26f8f7fb Mon Sep 17 00:00:00 2001
+From: Christopher Owen <3221756+christopherowen@users.noreply.github.com>
+Date: Sun, 8 Nov 2026 11:30:00 +0100
+Subject: [PATCH] perf(dsv41): TP3/TP4 decode compressor, sparse MLA, and
+ spec-decode fusions
+
+Upstream base: candidate-54 vLLM patch head 4e8133ff10a125b90753c2727f162e29fe37f30c (671 patches) with #957's parts 2 and 4 (957-p2, 957-p4) applied, tree 72b40d7102ab56384a68885ad3a61733afe1c5a2. Written against 1107 vLLM patch head 320021e3c4dbb202d911ab70e2cd924c75420488.
+
+This is part 5 of #957: the TP3 adaptive-verification constants.
+
+Rationale:
+5. On TP=3 each rank executes a wider MoE intermediate (768 vs 576) and 24 MLA heads (2 head tiles vs 1), increasing marginal verification row cost above the 16-row MMA knee. Use topology-aware HIGH_ROW_COST_SCALE_TP3 = 0.85 and MIN_CALIBRATED_DEAD_ROWS_TAU_TP3 = 0.12 when tp_size == 3.
+
+Quality implications:
+- Only which draft rows a TP=3 step verifies changes. Every admitted row is verified by the same rejection sampler, so temperature-0 text must not change; sampled realizations may change.
+- TP sizes other than 3 select the existing constants (multi-request scale 0.55, no floor) and keep every budget.
+
+Tests:
+- pytest tests/v1/spec_decode/test_adaptive_verification.py
+
+Upstream status: local DeepSeek-V4.1 SM121 TP=3 decode policy; not proposed upstream.
+
+Round 3 rebase (candidate-57, after 957-p2 and 957-p4 on candidate-54):
+- Conflict: candidate-54's 0789 (#971 round 1) prices rows past the 16-row knee with SINGLE_REQ_TILE_SPILL_SCALE = 2.0 when one request samples and with HIGH_ROW_COST_SCALE (0.55) when several do. Part 5 replaced HIGH_ROW_COST_SCALE at TP=3 for every step.
+- Composition: HIGH_ROW_COST_SCALE_TP3 replaces only the multi-request scale (self.high_row_cost_scale). A single sampling request keeps 2.0 on every TP size, the stricter of the two. Taking 0.85 at c1 instead would reopen the step #971 round 1 caps: a c1 copy proposal at 0.95 x 16 would go from 15 drafts (16 rows, the 16-row graph) back to 16 drafts (17 rows, the 24-row graph), the step it measured 5.5% slower at TP3.
+- The calibrated dead-row floor acts at the recipe's settings, so it stays. With SPARK_DS41F_DSPARK_DEAD_ROWS_TAU=0.2 and row cost 0.035, the calibrated threshold is min(0.2, 0.0633) = 0.0633 on candidate-54. With this patch at TP=3 it is min(0.2, max(0.12, 0.0633)) = 0.12, once the estimator has refit. It applies to host admission and to device dead rows.
+- Test budgets, re-derived on candidate-54:
+  - c8 medium confidence: 24 drafts, 32 rows at TP=3 (32 and 40 at TP=4).
+  - c1 typical: 3 drafts, 4 rows. Position 3 (survival 0.0686) falls below 0.12 (TP=4: 4 drafts, 5 rows).
+  - c1 copy 0.95 x 16: 15 drafts, 16 rows on both.
+  New tests cover the c1 floor, the single-request cap under TP=3 constants, and the constants each TP size selects in __init__.
+- TP=4 is unchanged: the patch's own __init__ at world size 4 gives the same budget as candidate-54's on every step of the policy replay (c1, c4, c8, c16) and in every fixed case.
+- Policy replay on sp8, of candidate-54's manager with and without this patch, using #986 round 1's served acceptance profile and candidate-50's tp3-switched screen grid. At TP=3 the patch trims rows that the grid prices below the tokens they carry:
+  - c8: drafts a step 17.4 -> 14.5, tokens -3.8%, grid step -2.5%. Throughput -1.2% to -1.3% on the grid step alone, -3.1% to -3.3% on the served step.
+  - c1, from the floor alone: drafts 2.57 -> 2.27, tokens -1.2% to -1.3%. Throughput -0.9% to -1.0% on the grid step, -1.0% to -1.2% on the served step.
+  - c4: throughput -0.2% on the grid step, -0.4% to -0.5% on the served step.
+  No step-time model built on the grid predicts a gain.
+---
+ .../spec_decode/test_adaptive_verification.py | 79 +++++++++++++++++++
+ .../gpu/spec_decode/adaptive_verification.py  | 37 +++++++--
+ 2 files changed, 110 insertions(+), 6 deletions(-)
+
+diff --git a/tests/v1/spec_decode/test_adaptive_verification.py b/tests/v1/spec_decode/test_adaptive_verification.py
+index 95c2b90c0..985f866b5 100644
+--- a/tests/v1/spec_decode/test_adaptive_verification.py
++++ b/tests/v1/spec_decode/test_adaptive_verification.py
+@@ -948,6 +948,85 @@ def test_high_concurrency_row_cost_knee_admits_coalesced_drafts():
+     assert knee_budget == 32
+     assert total == 40
+ 
++    # On TP3 (scale=0.85, calibrated survival floor=0.12), c8 trims to 24 draft
++    # rows (total 32 rows). The floor does not bind: position 4 survives 0.2067.
++    manager.high_row_cost_scale = 0.85
++    manager.min_calibrated_dead_rows_tau = 0.12
++    manager.calibrated_confidence = True
++    assert np.isclose(manager.effective_dead_rows_tau(), 0.12)
++    total_tp3 = manager.get_num_tokens(num_tokens_per_req, draft_tokens)
++    _, _, tp3_budget = manager._batch_budget
++    assert tp3_budget == 24
++    assert total_tp3 == 32
++
++    # TP4's constants (scale=0.55, no floor) keep the calibrated c8 budget.
++    manager.high_row_cost_scale = 0.55
++    manager.min_calibrated_dead_rows_tau = 0.0
++    assert manager.get_num_tokens(num_tokens_per_req, draft_tokens) == 40
++    assert manager._batch_budget[2] == 32
++
++
++@pytest.mark.parametrize(
++    ("scale", "floor", "budget"), [(0.55, 0.0, 4), (0.85, 0.12, 3)], ids=["tp4", "tp3"]
++)
++def test_tp3_survival_floor_prunes_the_typical_c1_tail(scale, floor, budget):
++    """The calibrated c1 break-even (0.0633 at row cost 0.035) admits position 3
++    (survival 0.0686) on TP4; TP3's floor of 0.12 prunes it (4 -> 3 drafts)."""
++    typical = np.array([[0.677, 0.556, 0.396, 0.460, 0.638]], dtype=np.float32)
++    manager = make_manager(typical, row_cost=0.035)
++    manager.req_states.req_id_to_index = {"r0": 0}
++    manager.dead_rows_tau = 0.20
++    manager.calibrated_confidence = True
++    manager.high_row_cost_scale = scale
++    manager.min_calibrated_dead_rows_tau = floor
++    assert np.isclose(
++        manager.effective_dead_rows_tau(),
++        max(floor, 2.0 * 0.035 / (1.0 + 3.0 * 0.035)),
++    )
++    total = manager.get_num_tokens({"r0": 6}, {"r0": [1, 2, 3, 4, 5]})
++    assert manager._batch_budget[2] == budget
++    assert total == 1 + budget
++
++
++def test_tp3_constants_keep_the_single_request_tile_spill_cap():
++    """A single request prices rows past the knee with the tile-spill scale on
++    every TP size: TP3's multi-request scale does not reopen the 17-row step."""
++    manager = make_manager(np.full((1, 16), 0.95, dtype=np.float32), row_cost=0.035)
++    manager.req_states.req_id_to_index = {"r0": 0}
++    manager.num_draft_steps = 5
++    manager.dead_rows_tau = 0.20
++    manager.calibrated_confidence = True
++    manager.high_row_cost_scale = 0.85
++    manager.min_calibrated_dead_rows_tau = 0.12
++    assert manager.get_num_tokens({"r0": 17}, {"r0": list(range(16))}) == 16
++    assert manager._batch_budget[2] == 15
++
++
++@pytest.mark.parametrize(
++    ("world_size", "scale", "floor"), [(1, 0.55, 0.0), (3, 0.85, 0.12), (4, 0.55, 0.0)]
++)
++def test_tp_size_selects_the_row_cost_constants(monkeypatch, world_size, scale, floor):
++    if not torch.cuda.is_available():
++        pytest.skip("requires CUDA")
++    monkeypatch.setattr(
++        adaptive_module,
++        "get_tp_group",
++        lambda: SimpleNamespace(world_size=world_size),
++    )
++    req_states = SimpleNamespace(
++        num_speculative_steps=5, device=torch.device("cuda"), max_num_reqs=2
++    )
++    manager = AdaptiveVerificationManager(
++        req_states,
++        torch.zeros(3, dtype=torch.int32, device="cuda"),
++        1,
++        max_total_logits=1024,
++        row_cost=0.035,
++    )
++    assert manager.high_row_cost_scale == scale
++    assert manager.min_calibrated_dead_rows_tau == floor
++    assert manager.single_req_tile_spill_scale == 2.0
++
+ 
+ def test_sampling_states_unseeded_requests_stay_lockstep_across_tp_ranks():
+     """Unseeded temperature > 0 requests must draw identical per-request seeds on
+diff --git a/vllm/v1/worker/gpu/spec_decode/adaptive_verification.py b/vllm/v1/worker/gpu/spec_decode/adaptive_verification.py
+index 81bac7496..ff7c4761e 100644
+--- a/vllm/v1/worker/gpu/spec_decode/adaptive_verification.py
++++ b/vllm/v1/worker/gpu/spec_decode/adaptive_verification.py
+@@ -52,10 +52,23 @@ EXPLORE_AFTER_IDLE_STEPS = 32
+ 
+ # Two-slope verification row-cost knee: once a step crosses one 16-row Tensor
+ # Core MMA tile, additional verification rows share the already-launched expert
+-# and dense weight tiles at a reduced marginal cost.
++# and dense weight tiles at a reduced marginal cost. On TP3 each rank holds a
++# wider MoE shard (768 vs 576) and 24 MLA heads (2 head tiles vs 1), so rows
++# past the knee of a multi-request step remain closer to the base marginal cost
++# and single-request tail pruning uses a higher calibrated survival floor. A
++# single request keeps SINGLE_REQ_TILE_SPILL_SCALE on every TP size.
+ HIGH_ROW_COST_KNEE = 16
+ HIGH_ROW_COST_SCALE = 0.55
++HIGH_ROW_COST_SCALE_TP3 = 0.85
+ SINGLE_REQ_TILE_SPILL_SCALE = 2.0
++MIN_CALIBRATED_DEAD_ROWS_TAU_TP3 = 0.12
++
++
++def _tp_world_size() -> int:
++    try:
++        return int(get_tp_group().world_size)
++    except Exception:
++        return 1
+ 
+ 
+ def resolve_adaptive_cudagraph_mode(
+@@ -114,9 +127,15 @@ class AdaptiveVerificationManager:
+         # cost: a recipe constant, so the budget is a rule of the inputs, the same
+         # on every build and boot, with nothing timed.
+         self.row_cost = row_cost
++        tp_size = _tp_world_size()
+         self.high_row_cost_knee = HIGH_ROW_COST_KNEE
+-        self.high_row_cost_scale = HIGH_ROW_COST_SCALE
++        self.high_row_cost_scale = (
++            HIGH_ROW_COST_SCALE_TP3 if tp_size == 3 else HIGH_ROW_COST_SCALE
++        )
+         self.single_req_tile_spill_scale = SINGLE_REQ_TILE_SPILL_SCALE
++        self.min_calibrated_dead_rows_tau = (
++            MIN_CALIBRATED_DEAD_ROWS_TAU_TP3 if tp_size == 3 else 0.0
++        )
+         self.tp_invariant_confidence = tp_invariant_confidence
+         self.calibrated_confidence = calibrated_confidence
+         self.dead_rows_tau = _DEAD_ROWS_TAU
+@@ -294,8 +313,9 @@ class AdaptiveVerificationManager:
+ 
+         Across concurrent decode requests (``num_sampling_requests > 1``), rows
+         above ``HIGH_ROW_COST_KNEE`` (16) share already-launched expert and
+-        dense weight tiles at a discounted marginal cost (``high_row_cost_scale``).
+-        For a single decode request (``num_sampling_requests <= 1``), crossing
++        dense weight tiles at a discounted marginal cost (``high_row_cost_scale``,
++        ``HIGH_ROW_COST_SCALE_TP3`` on TP3). For a single decode request
++        (``num_sampling_requests <= 1``) on every TP size, crossing
+         16 rows spills 1 row into a second 16-row Tensor Core MMA wave and the
+         24-row CUDA graph, facing a higher marginal cost unless sustained copy
+         acceptance justifies the second wave.
+@@ -325,7 +345,8 @@ class AdaptiveVerificationManager:
+         calibration fits the per-position intercepts, survival probabilities are
+         already on the true acceptance scale, so the threshold matches the
+         single-request marginal row-cost break-even ``2 * row_cost / (1 + 3 * row_cost)``
+-        instead of double-counting the tail decay.
++        instead of double-counting the tail decay. On TP3 that break-even is
++        floored at ``MIN_CALIBRATED_DEAD_ROWS_TAU_TP3``, never above ``tau``.
+         """
+         tau = float(getattr(self, "dead_rows_tau", 0.0))
+         if tau <= 0.0:
+@@ -334,7 +355,11 @@ class AdaptiveVerificationManager:
+         if callable(calibrated):
+             calibrated = bool(calibrated())
+         if calibrated and self.row_cost > 0.0:
+-            return min(tau, 2.0 * self.row_cost / (1.0 + 3.0 * self.row_cost))
++            floor = float(getattr(self, "min_calibrated_dead_rows_tau", 0.0))
++            return min(
++                tau,
++                max(floor, 2.0 * self.row_cost / (1.0 + 3.0 * self.row_cost)),
++            )
+         return tau
+ 
+     def get_num_tokens(
+-- 
+2.43.0
+

@@ -1,0 +1,33 @@
+perf(dsv41): TP3/TP4 decode compressor, sparse MLA, and spec-decode fusions
+
+Upstream base: candidate-54 vLLM patch head 4e8133ff10a125b90753c2727f162e29fe37f30c (671 patches) with #957's parts 2 and 4 (957-p2, 957-p4) applied, tree 72b40d7102ab56384a68885ad3a61733afe1c5a2. Written against 1107 vLLM patch head 320021e3c4dbb202d911ab70e2cd924c75420488.
+
+This is part 5 of #957: the TP3 adaptive-verification constants.
+
+Rationale:
+5. On TP=3 each rank executes a wider MoE intermediate (768 vs 576) and 24 MLA heads (2 head tiles vs 1), increasing marginal verification row cost above the 16-row MMA knee. Use topology-aware HIGH_ROW_COST_SCALE_TP3 = 0.85 and MIN_CALIBRATED_DEAD_ROWS_TAU_TP3 = 0.12 when tp_size == 3.
+
+Quality implications:
+- Only which draft rows a TP=3 step verifies changes. Every admitted row is verified by the same rejection sampler, so temperature-0 text must not change; sampled realizations may change.
+- TP sizes other than 3 select the existing constants (multi-request scale 0.55, no floor) and keep every budget.
+
+Tests:
+- pytest tests/v1/spec_decode/test_adaptive_verification.py
+
+Upstream status: local DeepSeek-V4.1 SM121 TP=3 decode policy; not proposed upstream.
+
+Round 3 rebase (candidate-57, after 957-p2 and 957-p4 on candidate-54):
+- Conflict: candidate-54's 0789 (#971 round 1) prices rows past the 16-row knee with SINGLE_REQ_TILE_SPILL_SCALE = 2.0 when one request samples and with HIGH_ROW_COST_SCALE (0.55) when several do. Part 5 replaced HIGH_ROW_COST_SCALE at TP=3 for every step.
+- Composition: HIGH_ROW_COST_SCALE_TP3 replaces only the multi-request scale (self.high_row_cost_scale). A single sampling request keeps 2.0 on every TP size, the stricter of the two. Taking 0.85 at c1 instead would reopen the step #971 round 1 caps: a c1 copy proposal at 0.95 x 16 would go from 15 drafts (16 rows, the 16-row graph) back to 16 drafts (17 rows, the 24-row graph), the step it measured 5.5% slower at TP3.
+- The calibrated dead-row floor acts at the recipe's settings, so it stays. With SPARK_DS41F_DSPARK_DEAD_ROWS_TAU=0.2 and row cost 0.035, the calibrated threshold is min(0.2, 0.0633) = 0.0633 on candidate-54. With this patch at TP=3 it is min(0.2, max(0.12, 0.0633)) = 0.12, once the estimator has refit. It applies to host admission and to device dead rows.
+- Test budgets, re-derived on candidate-54:
+  - c8 medium confidence: 24 drafts, 32 rows at TP=3 (32 and 40 at TP=4).
+  - c1 typical: 3 drafts, 4 rows. Position 3 (survival 0.0686) falls below 0.12 (TP=4: 4 drafts, 5 rows).
+  - c1 copy 0.95 x 16: 15 drafts, 16 rows on both.
+  New tests cover the c1 floor, the single-request cap under TP=3 constants, and the constants each TP size selects in __init__.
+- TP=4 is unchanged: the patch's own __init__ at world size 4 gives the same budget as candidate-54's on every step of the policy replay (c1, c4, c8, c16) and in every fixed case.
+- Policy replay on sp8, of candidate-54's manager with and without this patch, using #986 round 1's served acceptance profile and candidate-50's tp3-switched screen grid. At TP=3 the patch trims rows that the grid prices below the tokens they carry:
+  - c8: drafts a step 17.4 -> 14.5, tokens -3.8%, grid step -2.5%. Throughput -1.2% to -1.3% on the grid step alone, -3.1% to -3.3% on the served step.
+  - c1, from the floor alone: drafts 2.57 -> 2.27, tokens -1.2% to -1.3%. Throughput -0.9% to -1.0% on the grid step, -1.0% to -1.2% on the served step.
+  - c4: throughput -0.2% on the grid step, -0.4% to -0.5% on the served step.
+  No step-time model built on the grid predicts a gain.

@@ -1,0 +1,71 @@
+# PR #956 round 3 rebase (candidate-56, tp4-switched): commands.
+# Host for every git, test and GPU command: sp8 (spark-0016, NVIDIA GB10). Agent dir:
+#   B=~/spark-lab/agents/round3-956
+# Nothing was built, applied or replayed on the laptop except reading files; no image was built;
+# nothing was committed or pushed in spark-ds41f; no cluster, window or hold operation.
+# Every GPU command ran under flock /tmp/spark-lab-gpu.lock, after shim/run.sh checked that
+# ~/spark-hold.json was absent and no serving container ran; raw/commands.txt (shim/run.sh's log)
+# records each command verbatim with its UTC start/end, load, the containers running before it
+# and its exit code.
+
+## 1. Inputs
+# PR head: git fetch origin pull/956/head (laptop) -> ecb3812cb8faa6423ebccceab1d658d2c8a9a30d
+git show ecb3812cb8:experiments/2026-11-08-sp-compressor-ced-encoder-only/vllm/0762-perf-dsv41-sp-ratio2-compressor-and-ced-encoder-only-chunks.patch
+#   sha256 0c20c2e22ea1a42a8fde769569ff5444d6f15ef096bb460a722fc10b315e4cd6 (= selection-proposal source_sha256)
+# 957-p1: sp8 ~/spark-lab/agents/round-55-57-select/out/56/01-957-p1-perf-dsv41-tp3-decode-compressor-mla-and-spec-fusions.patch
+#   sha256 db4704c89e085d81985bd49b26ab3ab20fd1fd3b03e16c23575995bc62cf4db2 (= proposed_sha256; copied here unchanged
+#   as 56-01-957-p1-perf-dsv41-tp3-decode-compressor-mla-and-spec-fusions.patch, from the receipts' rebases/)
+# Base: sp8 ~/spark-lab/agents/round-55-57-select/c54-vllm at 4e8133ff10a1 (tree 5f021d9a7f01), as built by the
+#   selection (scripts-as-run/build_base.sh).
+
+## 2. Tree
+git clone -q --no-checkout ~/spark-lab/agents/round-55-57-select/c54-vllm $B/vllm
+git -C $B/vllm checkout -q -B c54 4e8133ff10a125b90753c2727f162e29fe37f30c
+git -c user.name="Christopher Owen" -c user.email=3221756+christopherowen@users.noreply.github.com \
+  am --quiet --committer-date-is-author-date <957-p1 patch>      # -> 0c4142a20017, tree 3959b211 (= stack_ready tree)
+git checkout -q -B r956 c54-957p1
+git apply -3 ../956-orig.patch      # conflicts: attention.py, ced.py (as the selection found); the other five files merge
+# attention.py and ced.py were then re-derived by hand from the base (the conflicted merge discarded), the
+# compressor.py, model.py, model_state.py and two test-file hunks kept as git apply -3 placed them, and
+# sp_prefill.py's module notes and one new GPU test (tests/models/test_deepseek_v4_1_compressor.py) added.
+git add -A; GIT_AUTHOR_DATE/GIT_COMMITTER_DATE="Sun, 8 Nov 2026 11:30:00 +0100" git commit -F commit-msg.txt
+git format-patch -1 r956 --stdout > 56-02-956-perf-dsv41-sp-ratio2-compressor-and-ced-encoder-only-chunks.patch
+# worktrees: $B/tree-base = c54-957p1, $B/tree-cand = r956
+
+## 3. Arms (shim/env.sh)
+# Image spark-ds41f:candidate-50, sha256:8c1ea1f62f62... (vLLM tree d5778ab5, patch head ba7400d9). Each arm mounts
+# read-only every file its tree changes against ba7400d9 (mounts()), so each container runs the arm's whole tree:
+#   base = candidate-54 + 957-p1; cand = base + rebased 956.
+# Serving environment entries that select code paths (config/cluster.json): VLLM_USE_BREAKABLE_CUDAGRAPH=0,
+# VLLM_USE_V2_MODEL_RUNNER=1, CUDA_DEVICE_MAX_CONNECTIONS=32, PYTORCH_CUDA_ALLOC_CONF as served.
+
+## 4. GPU runs (all under flock; see raw/commands.txt for each exact command)
+# dev:      shim/run.sh pytest-dev-newtests-cand ... pytest --noconftest <new tests>: 62 passed  (a first try without
+#           --noconftest stopped on the image's missing tblib, rc=4; its output file was overwritten by the rerun of the
+#           same label, raw/commands.txt keeps both records)
+#           harness-dev{,2,3}-cand-tp4 (dev3 = the serving env and FP32 state-ring binding; dev2 shows the harness's
+#           first binding error, kept)
+# harness:  shim/batch-harness.sh  (first launch aborted on a too-small page pool, outputs kept as *-pages96-aborted)
+#           base/cand x TP4/TP3 x 2 boots (boot 2 in reverse arm order), serving env; then base/cand TP4 with
+#           breakable graphs (the fallback front).
+#           python3 shim/compare.py out/json raw/harness-compare.json <labels>
+# bench:    shim/batch-bench.sh  ABBA in one session: base, cand, cand, base (first launch aborted at a 65,536-row
+#           chunk, which the sparse MLA kernel cannot launch in either arm: grid.y <= 65,535; kept as *-T65536-aborted)
+#           python3 shim/cells.py out/json raw/bench-cells.json
+# tests:    shim/batch-tests.sh  cand x 2 boots, base x 1, and the rebase's new tests over the base's code.
+
+## 5. Final patch and pair check (CPU)
+git commit --amend -F commit-msg.txt (committer date kept = author date): patch head abb261871df2, tree 0c84861318b7 (unchanged)
+git format-patch -1 HEAD --stdout > 56-02-956-perf-dsv41-sp-ratio2-compressor-and-ced-encoder-only-chunks.patch
+#   sha256 d9b71b04550c4a3bec9d0cb36334da66cdc94050298bffea64d95228a51241b6
+shim/pair_check.sh <956 patch> <957-p1 patch>   # -> raw/pair-check.txt: fresh clone of c54-vllm at 4e8133ff, git am 957-p1
+#   (tree 3959b211), git am 956 (patch head abb26187, tree 0c848613 = the GPU runs' tree), diff --check clean;
+#   957-p1 then 956 by git apply --check: clean; 956 alone on candidate-54: does not apply (builds on 957-p1)
+
+## 6. Overlays
+# overlay/: tree-cand's copies of every file the pair changes against 4e8133ff (git diff --name-only 4e8133ff HEAD)
+# no956/overlay/: tree-base's (candidate-54 + 957-p1) copies of 956's six source files
+
+## Note on raw/commands.txt
+# The three batches ran concurrently (each GPU job under the flock in turn), so start/end records interleave; from the
+# restarted bench on, run.sh writes 'end_of: <label>' before each end record. raw/batch-*.log hold each batch's rc= lines in order.
