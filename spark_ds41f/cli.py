@@ -42,6 +42,7 @@ from .doctor import *  # noqa: F401,F403
 from .cluster import *  # noqa: F401,F403
 from .build import *  # noqa: F401,F403
 from .bench import *  # noqa: F401,F403
+from . import candidate as candidate_commands
 
 def int_list(value: str) -> list[int]:
     try:
@@ -344,6 +345,7 @@ def parser() -> argparse.ArgumentParser:
     workload.add_argument("--json", metavar="PATH", help="also write the summary as JSON")
     workload.add_argument("run", nargs=argparse.REMAINDER, help="-- command to time the window around")
     workload.set_defaults(func=command_workload)
+    candidate_commands.add_parser(commands)
     return root
 
 
