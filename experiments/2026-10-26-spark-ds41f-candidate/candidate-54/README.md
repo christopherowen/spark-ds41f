@@ -224,7 +224,7 @@ release set, quality evals, AgentX or cold boots; those belong to release qualif
 | Testbed | Gate | Screen: two candidate-54 boots | Live checks |
 | --- | --- | --- | --- |
 | `tp4-ring` | [candidate-tp4.json](candidate-tp4.json) | [screen-tp4.json](screen-tp4.json) | [live-checks-tp4.json](live-checks-tp4.json) |
-| `tp4-switched` | [candidate-tp4-switched.json](candidate-tp4-switched.json) | [screen-tp4-switched.json](screen-tp4-switched.json) | |
+| `tp4-switched` | [candidate-tp4-switched.json](candidate-tp4-switched.json) | [screen-tp4-switched.json](screen-tp4-switched.json) | [live-checks-tp4-switched.json](live-checks-tp4-switched.json) |
 | `tp3-switched` | [candidate-tp3-switched.json](candidate-tp3-switched.json) | [screen-tp3-switched.json](screen-tp3-switched.json) | |
 
 - **Gates:** candidate-50's gates at each testbed (the same extras), on this candidate's arm.
@@ -255,4 +255,14 @@ release set, quality evals, AgentX or cold boots; those belong to release qualif
 
 ## Status
 
-Prepared and locked. Not built, not measured.
+Built (`spark-ds41f:candidate-54`, image ID `e1de71be`); its release tests passed on dgx4 (10,171 passed, 311
+skipped).
+
+| Testbed | Gate | Screen against 1107 | Live checks |
+| --- | --- | --- | --- |
+| `tp4-ring` | identical outputs; #1030's TP4 hashes 18d61961/d6568649 | faster on every core metric: grid 4.78%, c16 decode 1.61%, prefill 3.5% at 32K and 7.8% at 256K | stopped before running ([receipts/tp4-ring](receipts/tp4-ring/README.md)); run at `tp4-switched` instead |
+| `tp4-switched` | pending | pending | pending |
+| `tp3-switched` | identical outputs; new TP3 hashes 5c22ce41/bce6092e (#1030's declared change) | pending | |
+
+The screen references the next round uses are in [receipts/references](receipts/references). Their greedy corpora
+stay on the nodes, listed with their SHA-256 in `large-files-on-nodes.tsv`.
