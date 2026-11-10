@@ -245,6 +245,29 @@ The gate decodes greedily, so its hashes must still equal the 1017 checkpoint's.
 One of candidates 51, 52 and 53, tested at the same time, one per testbed. The PRs that pass are carried into
 all later candidates. The selection receipts are in [candidate-51/receipts](../candidate-51/receipts).
 
+## #984 round 1
+
+The rework's record is [receipts/rework/pr-984-r1](receipts/rework/pr-984-r1/result.json). Its patch is
+`0784-perf-worker-trim-the-host-heap-once-when-startup-freezes.patch`.
+- **Where round 0's 77 s went:** round 0 added `gc.collect()` and a heap trim to the per-module UMA release that
+  `process_weights_after_loading()` calls. At TP3 it fires 277 times, and each full collection of the loaded heap
+  takes about 0.25 s. The trims cost almost nothing.
+- **What round 1 keeps:** `trim_host_heap()` (mimalloc's `mi_collect(true)` and glibc's `malloc_trim(0)`), called
+  once in `freeze_gc_heap()` at the end of startup. It drops every mid-startup collection and the post-prefill
+  flush, which blocked the host for 32–35 ms on the decode path.
+- **sp8, one rank at tp3-switched rank shapes, same session:**
+  - Time to ready is 88.4/89.3 s, against the base's 89.0/87.8 s (round 0: 157.7/156.1 s).
+  - The trim returns 66 MiB in 5 ms.
+  - The `MemAvailable` floor difference is inside the boot spread (about 0.15 GiB).
+- **Deciding check:** [attribute-984r1-tp3-switched.json](attribute-984r1-tp3-switched.json) runs ABBA on this image
+  at `tp3-switched` against `tp3-switched-no960-no998-no984.json`, with startup memory and the stall-3 suite.
+  [984r1/overlay](984r1/overlay) differs from the control's overlay in three files: `gc_utils.py`, `mem_utils.py` and
+  `gpu_worker.py`.
+- **Its mark stays #984's:** the startup floor higher beyond the interval, time to ready and stall-3 not worse, KV
+  capacity unchanged. If the floor is the same, #984 has no metric left and is dropped.
+
 ## Status
 
-Prepared and locked. Not built, not measured.
+Built (`spark-ds41f:candidate-53`). The full candidate does not boot (#960; its round 1 fixes it). The results
+without #960 and #998 are in [receipts/tp3-switched](receipts/tp3-switched/README.md). Its PRs, reworked where needed
+and without #984, are in [candidate-54](../candidate-54/README.md). #984 round 1 waits for its TP3 check.

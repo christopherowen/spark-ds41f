@@ -19,9 +19,9 @@ The reference is candidate-50's runs recorded in the same window, earlier.
 1. **#984:** `attribute-984-tp3-switched` runs with and without #984.
    - It adds about 77 s to time to ready: 203/199 s with it, 121.5/126.9 s without.
    - It raises the startup MemAvailable floor by only 0.03–0.12 GiB.
-   - Stall-3 and prefill are unchanged.
+   - Prefill is unchanged. Stall-3 is worse with #984: prefill under decode is 2.37% slower (margin 1.27%), and decode p90 during that prefill is 0.77% higher (interval 0.30%). *(Corrected 2026-11-10: this line first said stall-3 was unchanged.)*
    - Verdict: #984 misses, and is in rework.
 2. **#971 and #977:** `attribute-stall3-tp3-switched` runs candidate-50 and candidate-53 without #960, #998 and #984.
    - Stall-3: candidate-50 4,760/4,767 tok/s, candidate-53 4,783/4,722 tok/s.
    - Prefill and time to ready are within the boot spread.
-   - So the stall-3 gap against the recorded run was drift between sessions. #971 (round 1) and #977 pass.
+   - So without #984, candidate-53 matches candidate-50 at stall-3. The screen's 2.1% stall-3 gap is #984's (item 1), not drift between sessions. #971 (round 1) and #977 pass. *(Corrected 2026-11-10: this line first called the gap drift.)*

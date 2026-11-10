@@ -1,0 +1,575 @@
+{
+ "pr": 984,
+ "round": 1,
+ "patch": {
+  "file": "0784-perf-worker-trim-the-host-heap-once-when-startup-freezes.patch",
+  "sha256": "79de11354e8d5922f3c591293853a0f06951229681242f893452dfc253c3c7b2",
+  "author": "Christopher Owen <christopherowen@users.noreply.github.com>, Sun, 8 Nov 2026 15:37:19 +0000 (kept)",
+  "subject": "perf(worker): trim the host heap once when startup freezes the GC heap",
+  "replaces": "candidate-53 vllm/0784-perf-worker-reclaim-uma-heap-and-allocator-slack-acr.patch (PR head 737aec88)",
+  "applies": [
+   "git am on candidate-53's tree before 0784 (0781 included); 0785 still applies on top",
+   "git am on candidate-53 without #960, #998 and #984 (the overlay's base); result equals overlay/"
+  ],
+  "git_diff_check": "clean",
+  "files": [
+   "vllm/utils/mem_utils.py (+123: trim_host_heap, _get_c10_mi_collect, _get_malloc_trim)",
+   "vllm/utils/gc_utils.py (+2: trim_host_heap() in freeze_gc_heap before gc.freeze)",
+   "vllm/v1/worker/gpu_worker.py (log_startup_memory_breakdown moved after freeze_gc_heap)",
+   "tests/utils_/test_gc_utils.py, tests/utils_/test_mem_utils.py"
+  ]
+ },
+ "verdict": "corrected",
+ "verdict_detail": "#984 round 1 is the end-of-startup host-heap trim and nothing else. It removes all of round 0's startup cost and its decode-path flush, and keeps round 0's whole host-memory reclaim at readiness. The reclaim is small: the worker's RssAnon is 64-84 MiB lower at ready, and round 0's TP3 floor gain was 0.03-0.12 GiB a rank. The decisive TP3 boot will most likely show the floor 'same', not higher beyond the interval. If it does, #984 has no serving metric left and should be dropped: no-defensible-correction at that point.",
+ "where_the_77s_went": {
+  "answer": "Round 0 added gc.collect() (plus trim_host_heap()) to release_device_memory_under_pressure(), 1107's UMA flush. process_weights_after_loading() calls that function after every quantized module. Under UMA pressure on a TP3 rank it releases 277 times across the target's and the draft's post-processing, and each full gc.collect() of the loaded heap takes about 0.25 s. The trims are not the cost: 302 trim_host_heap() calls took 0.08 s in all.",
+  "tp3_switched_sp5_engine_logs": {
+   "source": "read only: candidate-53-no960-no998-again (with #984) and candidate-50-no1009 (without) engine logs, the same images as the attribution arms (the attribution boots saved no engine logs)",
+   "model_loading_s": {
+    "with_984": [
+     110.36,
+     110.93,
+     110.82
+    ],
+    "without": [
+     40.7,
+     40.72,
+     40.77
+    ],
+    "ranks": [
+     "sp5",
+     "sp6",
+     "sp7"
+    ]
+   },
+   "target_post_processing_s (TileLangExperts -> LM head packed)": {
+    "with_984": [
+     65,
+     69,
+     68
+    ],
+    "without": [
+     8,
+     8,
+     8
+    ]
+   },
+   "draft_post_processing_s": {
+    "with_984": [
+     6,
+     7,
+     6
+    ],
+    "without": [
+     0,
+     0,
+     1
+    ]
+   },
+   "load_end_reclaim_s (LM head -> direct loader done)": {
+    "with_984": [
+     4,
+     1,
+     2
+    ],
+    "without": [
+     0,
+     0,
+     0
+    ]
+   },
+   "prepare_kernels_s (rank 0)": {
+    "with_984": 23.5,
+    "without": 23.7
+   },
+   "init_engine_s (rank 0; profile, KV, capture, warm-up)": {
+    "with_984": 36.43,
+    "without": 35.34
+   },
+   "graph_capture_s": {
+    "with_984": 5,
+    "without": 5
+   },
+   "engine_init_to_server_start_s (rank 0)": {
+    "with_984": 167,
+    "without": 96
+   }
+  },
+  "sp8_one_rank_startup_phases_s": {
+   "how": "raw/sp8/harness/boot_tp3r0.py: the real engine startup of tp3-switched rank 0 (1107 recipe arguments and environment, rank-0 shard: 92.88 GiB weights, 4.91 GiB KV; the memory breakdown matches sp5 rank 0's) on one GB10, with a 3-rank fake process group. Same session, two boots of each arm, order base, fix, c984, c984, fix, base, after one warm-up boot (warm-fix).",
+   "arms": {
+    "base": "spark-ds41f:candidate-50 + its no1009 overlay",
+    "fix": "+ candidate-53 without #960/#998, #984 round 1 (raw/trees/fix)",
+    "c984": "+ candidate-53 without #960/#998, #984 round 0 (raw/trees/c53nn)"
+   },
+   "total_to_ready": {
+    "base": [
+     89.02,
+     87.84
+    ],
+    "fix": [
+     88.4,
+     89.31
+    ],
+    "c984": [
+     157.7,
+     156.13
+    ]
+   },
+   "init_device": {
+    "base": [
+     1.74,
+     1.752
+    ],
+    "fix": [
+     1.755,
+     1.788
+    ],
+    "c984": [
+     1.779,
+     1.746
+    ]
+   },
+   "load_model (weight load + post-processing)": {
+    "base": [
+     39.948,
+     40.805
+    ],
+    "fix": [
+     40.161,
+     40.982
+    ],
+    "c984": [
+     109.434,
+     108.251
+    ]
+   },
+   "post_processing_target": {
+    "base": [
+     8.227,
+     8.528
+    ],
+    "fix": [
+     8.459,
+     8.31
+    ],
+    "c984": [
+     70.941,
+     68.762
+    ]
+   },
+   "post_processing_draft": {
+    "base": [
+     0.22,
+     0.213
+    ],
+    "fix": [
+     0.21,
+     0.221
+    ],
+    "c984": [
+     6.032,
+     6.247
+    ]
+   },
+   "kernel_preparation (TileLang prepare)": {
+    "base": [
+     23.667,
+     22.885
+    ],
+    "fix": [
+     23.195,
+     23.447
+    ],
+    "c984": [
+     23.468,
+     23.013
+    ]
+   },
+   "memory_profiling (determine_available_memory incl. preparation)": {
+    "base": [
+     26.561,
+     25.812
+    ],
+    "fix": [
+     26.189,
+     26.38
+    ],
+    "c984": [
+     26.647,
+     26.143
+    ]
+   },
+   "kv_cache_init (initialize_from_config)": {
+    "base": [
+     1.186,
+     0.402
+    ],
+    "fix": [
+     0.676,
+     0.442
+    ],
+    "c984": [
+     0.413,
+     0.425
+    ]
+   },
+   "graph_capture": {
+    "base": [
+     5.554,
+     4.714
+    ],
+    "fix": [
+     5.855,
+     5.143
+    ],
+    "c984": [
+     4.954,
+     5.236
+    ]
+   },
+   "warm_up (compile_or_warm_up_model total)": {
+    "base": [
+     7.169,
+     5.973
+    ],
+    "fix": [
+     7.18,
+     6.466
+    ],
+    "c984": [
+     6.938,
+     7.365
+    ]
+   },
+   "freeze_gc_heap": {
+    "base": [
+     0.274,
+     0.252
+    ],
+    "fix": [
+     0.254,
+     0.258
+    ],
+    "c984": [
+     0.25,
+     0.272
+    ]
+   }
+  },
+  "sp8_calls": {
+   "uma_release_calls_in_post_processing": {
+    "base": [
+     375,
+     375
+    ],
+    "fix": [
+     375,
+     375
+    ],
+    "c984": [
+     375,
+     375
+    ]
+   },
+   "uma_release_fired": {
+    "base": [
+     277,
+     277
+    ],
+    "fix": [
+     277,
+     277
+    ],
+    "c984": [
+     277,
+     277
+    ]
+   },
+   "uma_release_seconds": {
+    "base": [
+     2.133,
+     2.1256
+    ],
+    "fix": [
+     2.1466,
+     2.1033
+    ],
+    "c984": [
+     70.3641,
+     68.5975
+    ]
+   },
+   "gc_collect_calls": {
+    "base": [
+     19,
+     19
+    ],
+    "fix": [
+     19,
+     19
+    ],
+    "c984": [
+     305,
+     305
+    ]
+   },
+   "gc_collect_seconds": {
+    "base": [
+     3.3068,
+     3.2028
+    ],
+    "fix": [
+     3.3863,
+     3.3957
+    ],
+    "c984": [
+     73.905,
+     72.3849
+    ]
+   },
+   "gc_collect_seconds_in_post_processing": {
+    "base": [
+     0,
+     0
+    ],
+    "fix": [
+     0,
+     0
+    ],
+    "c984": [
+     68.6609,
+     66.9308
+    ]
+   },
+   "trim_host_heap_calls": {
+    "base": [
+     0,
+     0
+    ],
+    "fix": [
+     2,
+     2
+    ],
+    "c984": [
+     302,
+     302
+    ]
+   },
+   "trim_host_heap_seconds": {
+    "base": [
+     0,
+     0
+    ],
+    "fix": [
+     0.0051,
+     0.0048
+    ],
+    "c984": [
+     0.0788,
+     0.077
+    ]
+   }
+  },
+  "deltas": {
+   "c984_minus_base_time_to_ready_s": 68.5,
+   "c984_minus_base_load_model_s": 68.5,
+   "c984_gc_collect_in_post_processing_s": [
+    68.66,
+    66.93
+   ],
+   "fix_minus_base_time_to_ready_s": 0.42,
+   "fix_minus_base_note": "within the boots' spread (base 87.84-89.02, fix 88.40-89.31)"
+  }
+ },
+ "memory": {
+  "kept_trim_at_end_of_startup": {
+   "rss_freed_mib_per_boot": {
+    "base": [
+     0,
+     0
+    ],
+    "fix": [
+     66.1,
+     66.6
+    ],
+    "c984": [
+     7.3,
+     7.4
+    ]
+   },
+   "mi_collect_mib": {
+    "base": [
+     0,
+     0
+    ],
+    "fix": [
+     58.8,
+     58.9
+    ],
+    "c984": [
+     0,
+     0
+    ]
+   },
+   "malloc_trim_mib": {
+    "base": [
+     0,
+     0
+    ],
+    "fix": [
+     7.3,
+     7.7
+    ],
+    "c984": [
+     7.3,
+     7.4
+    ]
+   },
+   "seconds": {
+    "base": [
+     0,
+     0
+    ],
+    "fix": [
+     0.0051,
+     0.0048
+    ],
+    "c984": [
+     0.0788,
+     0.077
+    ]
+   }
+  },
+  "rss_anon_at_ready_mib": {
+   "base": [
+    2819.7,
+    2820.3
+   ],
+   "fix": [
+    2735.9,
+    2755.6
+   ],
+   "c984": [
+    2745.7,
+    2745.4
+   ]
+  },
+  "memavailable_floor_startup_gib": {
+   "base": [
+    8.248,
+    8.094
+   ],
+   "fix": [
+    8.217,
+    8.067
+   ],
+   "c984": [
+    8.073,
+    8.125
+   ]
+  },
+  "memavailable_at_ready_gib": {
+   "base": [
+    8.992,
+    8.863
+   ],
+   "fix": [
+    9.058,
+    8.813
+   ],
+   "c984": [
+    8.846,
+    8.819
+   ]
+  },
+  "memavailable_settled_5s_gib": {
+   "base": [
+    8.833,
+    8.769
+   ],
+   "fix": [
+    9.094,
+    8.854
+   ],
+   "c984": [
+    8.797,
+    8.788
+   ]
+  },
+  "cuda_allocator_slack_mib": {
+   "base": [
+    575.4,
+    575.4
+   ],
+   "fix": [
+    575.4,
+    575.4
+   ],
+   "c984": [
+    575.4,
+    575.4
+   ]
+  },
+  "reading": "fix and c984 end startup with the same anonymous RSS (2746 MiB mean each, against base's 2820 MiB). So round 0's 300 mid-startup trims add nothing to the state at readiness, which is where the floor is set (sp5 and sp8 both record the minimum at ready). The 66 MiB from the kept trim is below MemAvailable's boot-to-boot spread on sp8 (about 0.15 GiB), so the floor rows show 'same' there. On TP3, round 0 gave the floor 0.03-0.12 GiB a rank, matching about 70 MiB. In serving the engine-core and API-server processes also run the trim in their freeze_gc_heap (7 MiB more here, in process). CUDA allocator slack is 575 MiB in every arm: the added gc.collect() calls before empty_cache freed nothing.",
+  "kv_capacity": "unchanged; the recipe fixes --kv-cache-memory-bytes (5,485,052 tokens in every arm)"
+ },
+ "kept": [
+  "trim_host_heap(): mimalloc mi_collect(true) in libc10 (symtab resolution) + glibc malloc_trim(0)",
+  "one call in freeze_gc_heap() after its last collection: the worker, engine core and API server each reach it at the end of startup; 66 MiB, 5 ms, on rank 0's worker",
+  "log_startup_memory_breakdown after freeze_gc_heap (logging only)",
+  "tests: test_freeze_gc_heap_trims_before_freeze, test_trim_host_heap_reclaims_cpu_tensor_and_glibc_arenas (+ import pytest, which it calls)"
+ ],
+ "dropped": [
+  {
+   "what": "gc.collect() + trim_host_heap() in release_device_memory_under_pressure()",
+   "why": "the 77 s: 277 full collections at about 0.25 s each in process_weights_after_loading (1107's per-module UMA flush)"
+  },
+  {
+   "what": "reclaim_uma_memory() at the end of DirectModelLoader.load_model(); gc.collect() + trim in bind_weight_arena(); trims in DeviceMemoryProfiler",
+   "why": "each adds a full collection on the loaded heap (TP3 log: 1-4 s after the LM head); mid-startup, so no effect on the state at readiness"
+  },
+  {
+   "what": "trims and reclaim in memory_profiling(), profile_run(), profile_cudagraph_memory(), _teardown_profiling_state(), capture_model() (and its added gc.collect), freeze_gc_for_cudagraph_capture(), Worker.init_device(), the B12X preparation steps, _determine_available_memory(), initialize_from_config(), both warm-up flushes (and their added gc.collect), the model cleanup, TileLang release_host_memory() and the executor's _trim_host_heap()",
+   "why": "mid-startup: RssAnon at ready is the same with or without them (c984 2746 MiB, fix 2746 MiB); each added gc.collect() costs about 0.25 s; the recipe fixes the KV size, so profiling does not size it"
+  },
+  {
+   "what": "the post-prefill flush (_pending_post_prefill_cache_flush, _last_batch_cg_mode, reclaim_uma_memory() on the first FULL decode step after an eager step, in execute_model and sample_tokens)",
+   "why": "blocks the host 32-35 ms (116-120 ms unfrozen) on the decode path. The next prefill takes about 61-67 ms to remap the memory (own-mark flush984). With --prefill-yield short, decode steps run between a long prefill's chunks, so it runs after every chunk."
+  },
+  {
+   "what": "reclaim_uma_memory() and its test; test_freeze_gc_for_cudagraph_capture_trims_host_heap; test_post_prefill_transition_flushes_uma_cache_once_on_full_decode",
+   "why": "their code is gone"
+  }
+ ],
+ "tests": {
+  "command": "pytest -v -k 'not test_memory_profiling' tests/utils_/test_mem_utils.py tests/utils_/test_gc_utils.py tests/v1/worker/test_gpu_model_runner_v2.py tests/v1/worker/test_gpu_worker.py tests/model_executor/model_loader/test_direct_loader.py tests/model_executor/model_loader/test_direct_loader_cuda.py (PYTHONPATH with tests/vllm_test_utils and the own-marks tblib stub)",
+  "boot1": "233 passed, 1 deselected",
+  "boot2": "233 passed, 1 deselected"
+ },
+ "attribution_note": {
+  "finding": "In the round-0 attribution table, with #984 against without it, stall-3 prefill 131,072 under decode is -2.37% (margin 1.27%), and decode step p90 during the prefill is +0.77% (interval 0.30%), both verdict 'worse'. The repeat of the arm without #984 is 'same' (+0.55%). attribute-stall3 shows candidate-53 without #984 'same' as candidate-50 (+0.49%). The brief and the merged receipts README (6cac4642) say stall-3 is unchanged and call the screen's 2.1% stall-3 gap drift. The table instead puts that gap on #984, consistent with the post-prefill flush running after every chunk. Round 1 removes the flush.",
+  "source": "sp5 lab/candidate-53-attribute-984-tp3-switched-table.txt (raw/sp5-read-only/lab/)"
+ },
+ "decisive_check": {
+  "what": "tp3-switched boot (coordinator): candidate-53 image + overlay/ (16 files, the same set as no960-no998-no984/overlay). Suggested profile: tp3-switched-no960-no998-984r1.json, whose mounts assume the overlay is committed at candidate-53/984r1/overlay. ABBA against tp3-switched-no960-no998-no984.json, with startup memory and prefill-stall3-suite.json.",
+  "expect": {
+   "time_to_ready_s": "the no984 arm's (121.5/126.9), not 199-203",
+   "startup_floor": "about +0.07 GiB a rank, likely within the interval",
+   "stall_3": "the no984 arm's (round 0's -2.37% gone)",
+   "kv_capacity": "unchanged"
+  }
+ },
+ "fidelity_limits_sp8": [
+  "One rank: collectives move no data (fake group, PyNCCL stand-in, no sparknet one-shot), so forward values are not meaningful and graph capture holds no NCCL or sparknet buffers. Capture's logged memory is a free-memory delta and is noisy on one node: -0.63 to +0.84 GiB across the six boots, against 1.65-1.75 GiB at TP3. B12X preparation decides on rank 0 alone, and the startup rendezvous returns at once.",
+  "EngineCore runs in the worker's process (external launcher), so the engine core's freeze_gc_heap trim lands in the same RSS; the API server is not started.",
+  "Model loading on sp8 is 40 s against 40.7 s on sp5; preparation 23.5 s against 23.7 s; round 0's load is 109 s against 110 s: the phases match TP3 rank 0."
+ ],
+ "receipts": {
+  "commands": "commands.txt",
+  "sp8": "raw/sp8/out/ (per-run json with phases, ops by phase, MemAvailable samples, logs; commands.txt with each docker command and host state; queue.log), raw/sp8/abba-summary.json, raw/sp8/phase-table.json, raw/sp8/harness/",
+  "sp5": "raw/sp5-read-only/",
+  "trees": "raw/trees/{c53nn,no984,fix} (22 non-test files each over candidate-50)",
+  "unfavorable_or_failed_runs": "smoke-base..smoke5-base are harness bring-up failures (sparknet, broadcaster hang killed with docker kill, B12X store exchange, PyNCCL, B12X stage); smoke6-base is the first complete boot; all are kept in raw/sp8/out"
+ }
+}
