@@ -211,4 +211,6 @@ later candidates. The round's selection receipts are here, in [receipts](receipt
 
 ## Status
 
-Prepared and locked. Not built, not measured.
+Built on dgx4 (`spark-ds41f:candidate-55`, image ID `41d961dc`). **It does not boot**, and its release tests fail
+(13 tests); both come from #978 (0793), which is in rework ([receipts/tp4-ring](receipts/tp4-ring/README.md)).
+#1008 and #988's dead-row part wait for a boot with #978's corrected files.
