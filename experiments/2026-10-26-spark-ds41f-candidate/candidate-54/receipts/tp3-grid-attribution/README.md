@@ -29,3 +29,28 @@ for a second pass.
 **The one-GPU harness did not run:** the coordinator's release-test script on sp8 wrapped `kernel-local` in `flock`
 on the GPU lock, which `kernel-local` takes itself, and deadlocked the lock from 03:10:50Z to 04:30:49Z
 (`raw/gpu-lock-deadlock.txt`).
+
+## Result on sp5 (2026-11-10, 05:19-05:52Z)
+
+`lab/candidate-54-attribute-tp3-grid-tp3-switched-table.txt` (the table's base is its first-sorted arm,
+`candidate-54-no961`), the window log in `lab/candidate-54-attribute-tp3-grid-window.log`, the runs in `suites/`.
+Against candidate-54 without #961:
+
+| Arm | Grid geometric mean | 1x2 rows at 4K | 1x3 rows at 4K | 8x48 rows at 4K |
+| --- | --- | --- | --- | --- |
+| without #961 | (base) 18.70 ms | 18.70 ms | 18.87 ms | 28.84 ms |
+| candidate-54 | +2.90% | +5.26% | +7.12% | -0.51% |
+| candidate-54 again | +2.84% | +5.71% | +7.41% | -0.44% |
+| without #998 | +2.45% | +4.30% | +6.40% | -0.51% |
+| without #960 | +2.34% | +4.54% | +6.46% | -0.67% |
+| without #963 and #1030 | +3.28% | +5.21% | +7.12% | -0.01% |
+
+- **#961 causes the TP3 small-batch loss.** Without it the grid matches 1107's (`../tp3-switched/`). Its candidate-54
+  repeat agrees within 0.06%.
+- Smaller effects, one boot each: without #998 or #960 the grid is 0.45% or 0.56% faster than candidate-54; without
+  #963 and #1030 it is 0.38% slower.
+- **Next:** [../../attribute-tp3-prefetch-tp3-switched.json](../../attribute-tp3-prefetch-tp3-switched.json) tests
+  recipe-only fixes on candidate-54's image: the prefetch windows capped at TP4's planned sizes
+  (`tp3-switched-l2-tp4-budget-dev.json`, 19/15/15 MB) and the prefetch off (`tp3-switched-l2-off-dev.json`), against
+  candidate-54 and candidate-54 without #961.
+
