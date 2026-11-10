@@ -76,3 +76,24 @@ six boots in one session (`lab/candidate-54-tp3-prefetch-tp3-switched-table.txt`
 - **Next:** [../../attribute-tp3-prefetch-sweep-tp3-switched.json](../../attribute-tp3-prefetch-sweep-tp3-switched.json)
   tries smaller caps (17/13/13 and 15/12/12 MB) against 19/15/15 and against candidate-54 without #961.
 
+## Cap sweep (sp5, 2026-11-10, 06:32-06:53Z)
+
+[../../attribute-tp3-prefetch-sweep-tp3-switched.json](../../attribute-tp3-prefetch-sweep-tp3-switched.json), six boots
+in one session (`lab/candidate-54-tp3-prefetch-sweep-tp3-switched-table.txt`; the table's base is 17/13/13 MB):
+
+| Arm | Grid geometric mean | 1x2 rows at 4K | 1x3 rows at 4K | 4x8 rows at 4K | 8x48 rows at 4K |
+| --- | --- | --- | --- | --- | --- |
+| 17/13/13 MB | (base) | 18.61 ms | 18.82 ms | 20.83 ms | 28.66 ms |
+| 17/13/13 MB again | -0.25% | -0.04% | -0.10% | -0.47% | -0.51% |
+| 19/15/15 MB | -0.42% | +0.24% | +0.15% | -0.27% | -0.66% |
+| 19/15/15 MB again | -0.41% | -0.01% | -0.20% | -0.45% | +0.91% |
+| **15/12/12 MB** | **-0.83%** | **-0.62%** | **-0.80%** | **-1.69%** | +0.20% |
+| without #961 | -1.29% | +0.49% | -0.05% | -2.34% | +0.38% |
+
+- **15/12/12 MB is the best cap measured**: as fast as candidate-54 without #961 at 1 request (1x2 18.49 against
+  18.70 ms), within about 0.5% of it in the grid geometric mean, the gap mostly at 4 requests.
+- **Recommendation:** carry `VLLM_DS41_L2_PREFETCH_WO_MB=15`, `_FFN_MB=12`, `_NEXT_MB=12` in the TP3 shapes'
+  environment (`tp3-triangle`, `tp3-triangle-4k`, `tp3-switched`) in the next merged base, as its own variable, with
+  TP4's recipe unchanged so #961's TP4 gain stays. The remaining 0.5% belongs to a #961 rework (pacing derived from
+  each window's size) if one is wanted.
+
