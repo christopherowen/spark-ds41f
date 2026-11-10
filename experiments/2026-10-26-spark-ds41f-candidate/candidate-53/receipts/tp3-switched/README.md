@@ -25,3 +25,12 @@ The reference is candidate-50's runs recorded in the same window, earlier.
    - Stall-3: candidate-50 4,760/4,767 tok/s, candidate-53 4,783/4,722 tok/s.
    - Prefill and time to ready are within the boot spread.
    - So without #984, candidate-53 matches candidate-50 at stall-3. The screen's 2.1% stall-3 gap is #984's (item 1), not drift between sessions. #971 (round 1) and #977 pass. *(Corrected 2026-11-10: this line first called the gap drift.)*
+3. **#984 round 1:** `attribute-984r1-tp3-switched` runs candidate-53 without #960 and #998, with #984's round 1 and
+   without #984, ABBA (`lab/candidate-53-attribute-984r1-tp3-switched-table.txt`, the window's log in
+   `lab/candidate-53-attribute-984r1-window.log`).
+   - Time to ready: 126.8/127.8 s with round 1, 124.4/124.9 s without.
+   - Lowest `MemAvailable` during the boot, with round 1 against without, first and second boots:
+     sp5 5.092/5.187 against 5.075/4.933 GiB, sp6 7.424/7.482 against 7.398/7.479, sp7 7.208/7.295 against 7.203/7.266.
+   - Prefill and stall-3 are the same against the run's own repeat. Decode p90 during the stall-3 prefill is 0.8% lower
+     without round 1 (interval 0.54%).
+   - Verdict: the floor is not higher beyond the boot spread, so #984 misses again and is dropped.

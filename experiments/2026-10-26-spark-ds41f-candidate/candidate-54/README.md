@@ -78,8 +78,10 @@ without #984, on the same image at `tp3-switched`:
   stall-3.)*
 
 Round 1 ([candidate-53/receipts/rework/pr-984-r1](../candidate-53/receipts/rework/pr-984-r1/result.json)) keeps
-one heap trim at the end of startup and drops the rest. Its TP3 check is
-[candidate-53/attribute-984r1-tp3-switched.json](../candidate-53/attribute-984r1-tp3-switched.json).
+one heap trim at the end of startup and drops the rest. Its TP3 check,
+[candidate-53/attribute-984r1-tp3-switched.json](../candidate-53/attribute-984r1-tp3-switched.json), removes round 0's
+startup and stall-3 costs but finds no floor gain beyond the boot spread. #984 is dropped from this release
+([candidate-53](../candidate-53/README.md#984-round-1)).
 
 Its own mark on sp8 was [cannot-evaluate](../candidate-53/receipts/own-marks/pr-984/result.json). #998 round 1
 applies without #984 before it ([stack.log](receipts/stack.log), section 2), so round 2 ends with #998 round 1

@@ -265,9 +265,16 @@ The rework's record is [receipts/rework/pr-984-r1](receipts/rework/pr-984-r1/res
   `gpu_worker.py`.
 - **Its mark stays #984's:** the startup floor higher beyond the interval, time to ready and stall-3 not worse, KV
   capacity unchanged. If the floor is the same, #984 has no metric left and is dropped.
+- **Result (sp5 window, 2026-11-10, [receipts/tp3-switched](receipts/tp3-switched/README.md), item 3):**
+  - Time to ready: 126.8/127.8 s, against the control's 124.4/124.9 s. Round 0's 77 s is gone.
+  - Startup `MemAvailable` floor: +0.14, +0.01 and +0.02 GiB at sp5, sp6 and sp7. sp6 and sp7 are inside their boot
+    spread; sp5's control repeat had 6.1 GiB of page cache at its low point, against 3.9 GiB on the other boots.
+  - Stall-3 and prefill: the same. Round 0's 2.37% stall-3 loss is gone.
+- **Verdict: #984 misses and is dropped from this release.** The floor does not rise beyond the interval, and what
+  remains of the PR is a 66 MiB trim at the end of startup, so a second rework has nothing to build on.
 
 ## Status
 
 Built (`spark-ds41f:candidate-53`). The full candidate does not boot (#960; its round 1 fixes it). The results
 without #960 and #998 are in [receipts/tp3-switched](receipts/tp3-switched/README.md). Its PRs, reworked where needed
-and without #984, are in [candidate-54](../candidate-54/README.md). #984 round 1 waits for its TP3 check.
+and without #984, are in [candidate-54](../candidate-54/README.md). #984 is dropped after its round 1 (above).
