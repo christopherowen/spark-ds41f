@@ -213,7 +213,9 @@ later candidates. The round's selection receipts are here, in [receipts](receipt
 
 Built on dgx4 (`spark-ds41f:candidate-55`, image ID `41d961dc`). **It does not boot**, and its release tests fail
 (13 tests); both come from #978 (0793), which is in rework ([receipts/tp4-ring](receipts/tp4-ring/README.md)).
-#1008 and #988's dead-row part wait for a boot with #978's corrected files.
+Without #978 ([receipts/tp4-ring-no978](receipts/tp4-ring-no978/README.md)): the gate keeps candidate-54's TP4
+hashes, and the screen and `single-stream` are the same as candidate-54's. **#988's dead-row part passes.** #1008's
+thread partition works, and its own bench decides its timing mark.
 
 ## #978 round 1, and candidate-55 without #978
 
