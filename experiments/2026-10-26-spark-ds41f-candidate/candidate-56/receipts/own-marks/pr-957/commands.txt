@@ -1,0 +1,76 @@
+# On sp8, B=~/spark-lab/agents/round3-own-marks. Every GPU line ran through B/bin/om.sh (common/bin/om.sh):
+# flock /tmp/spark-lab-gpu.lock, hold file and serving-container checks, one fresh container a run, on
+# spark-ds41f:candidate-54 (sha256:e1de71be...) with the arm's overlay (common/files-ARM.txt) read-only.
+# Each run's exact docker command, times, loadavg, MemAvailable and exit code: raw/commands-sp8.txt.
+# Setup (no GPU): bash B/bin/setup.sh; bash B/bin/verify.sh (common/setup.txt).
+# Queue: bash B/bin/run_all.sh pr-957p1k pr-957p1s pr-957p1n pr-957p2 pr-957p4 pr-988 pr-957p1t pr-957p1v pr-957p4d
+#        (05:45:43Z start; 07:43:25Z end; every script rc=0; common/progress.log)
+
+# #957 part 1 (0795)
+
+## B/bin/pr-957p1k.sh
+# #957 part 1 (0795): the compressor projection cells (h957k.py), ABBA, then the PR's test.
+B=$HOME/spark-lab/agents/round3-own-marks; OM=$B/bin/om.sh; . $B/bin/env.sh; mkdir -p $B/out/pr-957p1/json
+for spec in "base 1" "c56p1 1" "c56p1 2" "base 2"; do set -- $spec
+  $OM 957p1 proj-$1-boot$2 $1 "${RECIPE_ENV[@]}" -- python3 /h/h957k.py --boot $2 --out /out/json/proj-$1-boot$2.json
+done
+
+## B/bin/pr-957p1s.sh
+# #957 part 1 (0795): the decode step at TP4 rank shapes on one GPU (step957.py), ABBA.
+B=$HOME/spark-lab/agents/round3-own-marks; OM=$B/bin/om.sh; . $B/bin/env.sh; mkdir -p $B/out/pr-957p1/json
+for spec in "base 1" "c56p1 1" "c56p1 2" "base 2"; do set -- $spec
+  MINMEM_GIB=95 $OM 957p1 step-$1-boot$2 $1 "${RECIPE_ENV[@]}" "${HUB[@]}" -- python3 /h/step957.py --out /out/json/step-$1-boot$2.json
+done
+
+## B/bin/pr-957p1n.sh
+# #957 part 1 (0795): one nsys boot an arm (kernel timeline of the grid's 1x2 and 1x6 steps,
+# graph nodes traced), after the timing boots.
+B=$HOME/spark-lab/agents/round3-own-marks; OM=$B/bin/om.sh; . $B/bin/env.sh; mkdir -p $B/out/pr-957p1/json $B/out/pr-957p1/nsys
+for arm in base c56p1; do
+  MINMEM_GIB=95 $OM 957p1 nsys-$arm $arm "${RECIPE_ENV[@]}" "${HUB[@]}" "${NSYS[@]}" -- /opt/nsys/bin/nsys profile \
+    --trace=cuda --sample=none --cpuctxsw=none --cuda-graph-trace=node --capture-range=cudaProfilerApi \
+    --capture-range-end=stop --export=sqlite --force-overwrite=true --output /out/nsys/nsys-$arm \
+    python3 /h/step957.py --out /out/json/nsys-$arm.json --shapes 1x2,1x6,16x32 --replays 3 \
+    --profile-shapes 1x2,1x6 --profile-replays 4
+done
+
+## B/bin/pr-957p1t.sh
+# #957 part 1 (0795): tests/models/test_deepseek_v4_1_compressor.py, as candidate-56's README runs it.
+B=$HOME/spark-lab/agents/round3-own-marks; OM=$B/bin/om.sh
+for spec in "c56p1 1" "c56p1 2" "base 1"; do set -- $spec
+  $OM 957p1 pytest-$1-boot$2 $1 -- pytest --noconftest -o cache_dir=/tmp/pc -q tests/models/test_deepseek_v4_1_compressor.py
+done
+
+## B/bin/pr-957p1v.sh
+# #957 part 1 (0795): mechanism controls, one variable each: the L2 prefetch off
+# (VLLM_DS41_L2_PREFETCH=0), and only the COMP window dropped (--no-comp-window).
+B=$HOME/spark-lab/agents/round3-own-marks; OM=$B/bin/om.sh; . $B/bin/env.sh
+S=1x2,1x3,1x6,4x8,16x32
+for spec in "base 1" "c56p1 1" "c56p1 2" "base 2"; do set -- $spec
+  MINMEM_GIB=95 $OM 957p1 nopf-$1-boot$2 $1 "${RECIPE_ENV[@]}" -e VLLM_DS41_L2_PREFETCH=0 "${HUB[@]}" -- python3 /h/step957.py --shapes $S --out /out/json/nopf-$1-boot$2.json
+done
+for spec in "base 1" "c56p1 1" "c56p1 2" "base 2"; do set -- $spec
+  MINMEM_GIB=95 $OM 957p1 nocomp-$1-boot$2 $1 "${RECIPE_ENV[@]}" "${HUB[@]}" -- python3 /h/step957.py --shapes $S --no-comp-window --out /out/json/nocomp-$1-boot$2.json
+done
+
+## analysis (laptop, on the copied raw/json and nsys sqlite)
+python3 common/h/aom.py 957p1k raw/json > raw/analysis/projection-cells.json
+python3 common/h/aom.py 957p1s raw/json step > raw/analysis/step-grid(-*).json
+python3 common/h/aom.py 957p1s raw/json nopf > raw/analysis/step-grid(-*).json
+python3 common/h/aom.py 957p1s raw/json nocomp > raw/analysis/step-grid(-*).json
+python3 raw/harness/ansys.py nsys-base.sqlite nsys-c56p1.sqlite raw/analysis/nsys-kernels-1x2-1x6.json
+python3 raw/harness/ajoin.py nsys-base.sqlite nsys-c56p1.sqlite > raw/analysis/nsys-prefetch-join.json
+python3 raw/harness/alayer.py nsys-base.sqlite nsys-c56p1.sqlite raw/analysis/nsys-per-layer-1x2.json
+
+## env.sh (RECIPE_ENV, HUB, NSYS)
+# Recipe environment for the one-GPU runs (releases/spark-ds41f-1107/cluster.json "environment",
+# the entries that act in one process), as docker -e options.
+RECIPE_ENV=(-e CUDA_DEVICE_MAX_CONNECTIONS=32 -e "PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True,garbage_collection_threshold:0.6"
+  -e SPARK_DS41F_DSPARK_DEAD_ROWS_TAU=0.2 -e SPARK_DS41F_DSPARK_MAIN_PROJ_TP=1 -e SPARK_DS41F_DSPARK_VOCAB_PARALLEL=1
+  -e VLLM_ALLOW_LONG_MAX_MODEL_LEN=1 -e VLLM_DS41_HEAD_DTYPE=float32 -e VLLM_DS41_PACKED_BF16_LM_HEAD=1
+  -e VLLM_L2_PREFETCH_GRID=2 -e VLLM_L2_PREFETCH_KERNELS=tilelang -e VLLM_LATE_ADMISSION_LAYER=30
+  -e VLLM_USE_BREAKABLE_CUDAGRAPH=0 -e VLLM_USE_V2_MODEL_RUNNER=1 -e VLLM_DS41_KERNEL_BACKEND=tilelang
+  -e TRANSFORMERS_OFFLINE=1 -e OMP_NUM_THREADS=8 -e MALLOC_ARENA_MAX=2 -e VLLM_ENGINE_READY_TIMEOUT_S=3600
+  -e VLLM_NO_USAGE_STATS=1 -e VLLM_PLUGINS= -e TRITON_CACHE_DIR=/root/.tilelang/triton -e VLLM_CACHE_ROOT=/root/.tilelang/vllm)
+HUB=(-v $HOME/.cache/huggingface/hub:/hf/hub:ro)
+NSYS=(-v /opt/nvidia/nsight-systems/2025.3.2:/opt/nsys:ro)

@@ -1,0 +1,78 @@
+{
+ "pr": 957,
+ "candidate": "candidate-57",
+ "pr_head": "e464d364431a26b031a6e91f5dd610f429129c46",
+ "host": "sp8 (spark-0016, one GB10), 2026-11-10 07:23-07:43Z; ABBA in one session for each part",
+ "arms": {
+  "base": "spark-ds41f:candidate-54 sha256:e1de71bed3b41dff3a969c19adc09072c0ab1c947f34afe7117cb8b6389e23ea, its own tree 5f021d9a (verified: 7,831 files match)",
+  "c57p2": "the same image + 0797's file (tilelang/sparse_mla.py) at 4fc8de11, read-only: candidate-54 + part 2 alone (verified)",
+  "c57p4": "the same image + 0798's 6 files at d74e38ee, read-only: candidate-54 + part 4 alone (verified; 0797 touches none of them)"
+ },
+ "rule": "Interval rule as candidates 49-53's: faster when the slower candidate boot beats the faster base boot, slower when the faster candidate boot is slower than the slower base boot, else the same. Decode kernels are judged by CUDA-graph replay.",
+ "parts": {
+  "2": {
+   "label": "957-p2",
+   "patch": "0797-perf-dsv41-branchless-sparse-MLA-stage-2-online-soft.patch (4fc8de11)",
+   "verdict": "misses",
+   "verdict_reason": "By graph replay the patch is lower on the mean in all 16 TP3 cells (24 heads), and both adjacent boot pairs are lower in each TP3 decode-route cell. But only the 6-row cells are faster beyond the interval. The mark's 12- and 16-row cells are the same: the first boots of both arms ran 1-9 us slower than the second, which widens the interval. At TP4 (16 heads) two cells are slower beyond the interval: 6 rows, mixed lengths, +0.12 us (+1.0%; c1's shape at TP4); 32 rows, mixed, +0.15 us (+0.3%). Five cells are faster (12, 16 and 24 rows, -0.5..-0.7 us). Outputs are bit-identical in every cell, and the PR's route test passes.",
+   "mark": "screen_tp3_decode.py's sparse-MLA cells, 2 boots, ABBA against candidate-54, by CUDA-graph replay: stage 2 at TP3 (24 heads, 12 and 16 rows) faster beyond the interval (PR: -49..-62 us a step at 12 rows, -46..-99 at 16, over 30 indexed layers), outputs torch.equal; TP4 cells (16 heads) not worse",
+   "what": "h957p2.py: the PR's bench_sparse_mla_tp3 workload (SWA width 128, index width 512, page 128, max_rows 48, sinks 0, positions 1024), with each arm's own SparseMlaV41Plan, at 24 and 16 heads and two index-length mixes. 'mixed' is the PR's [128, 256, 384, 512], with inactive segments in 3 of 4 rows. 'full' is all 512, every segment active, as at long context. KV bytes are drawn from 0..119 (the PR drew 0..254) so no FP8 code or scale is NaN and outputs compare bit for bit. Timed by CUDA-graph replay of 20 calls (L2 hot), with CUPTI and eager beside it.",
+   "routes": "identical in both arms (split_max_rows 4 at TP3 and 9 at TP4, decode_max_rows 28): TP3 split at 4 rows, decode at 6-24, extend at 32-48; TP4 split at 4-8, decode at 12-24, extend at 32-48",
+   "cells_graph_hot_us_per_call_base_to_cand": {
+    "tp3_mixed_m6": "14.37/13.88 -> 13.79/13.32 (-0.57, faster)",
+    "tp3_mixed_m12": "20.14/16.35 -> 18.88/15.77 (-0.92 mean; pairs -1.26, -0.58; same)",
+    "tp3_mixed_m16": "28.96/25.87 -> 27.38/25.24 (-1.10 mean; pairs -1.58, -0.63; same)",
+    "tp3_full_m6": "15.64/15.10 -> 15.02/14.40 (-0.66, faster)",
+    "tp3_full_m12": "37.23/27.11 -> 28.05/26.63 (-4.83 mean; pairs -9.18, -0.48; same)",
+    "tp3_full_m16": "33.44/28.67 -> 31.38/28.42 (-1.16 mean; pairs -2.06, -0.25; same)",
+    "tp4_mixed_m6": "11.56/11.46 -> 11.63/11.62 (+0.12, slower)",
+    "tp4_mixed_m12": "13.83/14.04 -> 13.30/13.21 (-0.68, faster)",
+    "tp4_mixed_m16": "22.03/22.11 -> 21.30/21.46 (-0.69, faster)",
+    "tp4_mixed_m32": "47.94/47.91 -> 48.10/48.06 (+0.15, slower)",
+    "tp4_full_m12": "23.03/23.23 -> 22.58/22.39 (-0.65, faster)",
+    "tp4_full_m16": "25.06/25.21 -> 24.67/24.26 (-0.67, faster)",
+    "all": "raw/analysis/part2-sparse-mla-cells.json (32 cells, with CUPTI and eager)"
+   },
+   "counts": "TP3: 2 faster, 14 same, 0 slower; all 16 lower on the mean. TP4: 5 faster, 9 same, 2 slower.",
+   "per_step_30_layers": "TP3 12 rows -27.6 (mixed) and -144.9 (full, one outlier boot) us on the means, about -17 us on the second boot pair; 16 rows -33.1 and -34.6 us. The PR claimed -49..-62 and -46..-99. TP4 6 rows +3.5 us (mixed).",
+   "outputs": "out_hash identical across all four boots in all 32 cells",
+   "test": "pytest --noconftest tests/kernels/attention/test_deepseek_v41_tilelang.py -k test_sparse_mla_plan_routes: 1 passed in both boots of c57p2",
+   "predicted_serving_share": "TP3 (anchors from pr-957-p5-r1): c1, 6 rows, about -17..-20 us a step = -0.05% of 38.03 ms; c4, 12-24 rows, about -18..-33 us = -0.03..-0.05% of 71.0 ms; c8, 16-40 rows, about -10..-35 us = -0.01..-0.03% of 115.61 ms. TP4: c1, 6 rows, about +2..+4 us (+0.01%); c16, 32+ rows on the extend route, about 0. Below serving resolution either way. nsys shows 43 launches of each sparse_mla kernel a step at TP4 1x2, so the 30-layer figures may scale up to about x1.4.",
+   "next": "A 4+4-boot confirmation of TP3 12/16 rows and TP4 6/32 rows would settle it: the miss is the 2-boot interval at TP3 plus a +0.1 us effect at TP4."
+  },
+  "4": {
+   "label": "957-p4",
+   "patch": "0798-perf-dsv41-fuse-DSpark-confidence-calibration-and-ke.patch (d74e38ee)",
+   "verdict": "meets-mark",
+   "verdict_reason": "The fused probability_and_calibrate is faster than probability plus calibrate_confidence_probs beyond the interval in all 5 cells by graph replay (2.41-3.93 -> 1.78-2.83 us), and by eager (19.2-19.6 -> 9.5-9.8 us, the PR's kind of number). Calibrated probabilities are within 1-2 FP32 ULP of the two-step path (max abs 6.0e-8). The test passes in both boots. The (4, 24) dummy step drafts for its 4 active requests through the (4, 20) FULL draft graph, where candidate-54 drafts 8 eagerly. candidate-57's tp3-switched screen shows no metric worse.",
+   "mark": "screen_tp3_decode.py's confidence cells and test_deepseek_v41_tilelang_confidence.py on the candidate, 2 boots, ABBA: probability_and_calibrate faster than the two-step path beyond the interval (PR: 17.2-19.0 -> 8.5-9.2 us), calibrated confidences within FP32 rounding of the two-step path; the (4, 24) dummy run captures the (4, 20) DSpark draft graph (functional). On the testbed: paired decode at 4 and 8 streams, single-stream and sampled not worse.",
+   "what": "h957p4.py: the PR's bench_confidence_calibration workload (hidden 5120, Markov rank 256, 5 draft steps, FP32 head weight), with the estimator's slope at 1.3 and intercepts at -0.5..0.5, so the calibration is not the identity. Each arm times its own speculator's call. Base: two kernels, dspark_confidence_kernel then _calibrate_confidence_kernel. 0798: one, dspark_confidence_calibrate_kernel. Graph replay of 20 calls, CUPTI and eager.",
+   "cells_graph_hot_us_base_to_cand": {
+    "r1": "2.46/2.41 -> 1.78/1.79 (-0.65, faster)",
+    "r2": "3.07/3.93 -> 2.19/2.11 (-1.35, faster)",
+    "r4": "3.20/3.16 -> 2.34/2.41 (-0.81, faster)",
+    "r8": "3.35/3.42 -> 2.81/2.52 (-0.72, faster)",
+    "r16": "3.82/3.77 -> 2.83/2.83 (-0.97, faster)"
+   },
+   "cells_eager_us_base_to_cand": "r1 19.34/19.62 -> 9.57/9.46; r16 19.51/19.36 -> 9.68/9.54 (the PR's 17.2-19.0 -> 8.5-9.2 reproduces in eager; graph replay saves about 0.7-1.4 us)",
+   "numerics": "fused against the two-step path in process: max abs 5.96e-8, max 1 ULP (2 at 16 requests); features max abs 1.19e-7, predictions 5.96e-8; not bit-equal, within FP32 rounding as declared. The two-step path's outputs hash identically in both arms: 0798 leaves it unchanged.",
+   "test": "pytest --noconftest tests/kernels/test_deepseek_v41_tilelang_confidence.py: 22 passed in both boots of c57p4",
+   "dummy_run_dispatch": {
+    "what": "step957.py --tp-shape 3 --log-draft-dispatch: the full model at TP3 rank shapes on one GPU (24 heads, 3 output groups, 768-wide experts, max_num_seqs 8), engine grid 1x6, 4x8, 4x20, 4x24, 8x16; every DSpark draft dispatch recorded (requests, tokens, CUDA-graph mode). One boot an arm.",
+    "base": "in the grid: (8, 40, NONE) x56, (1, 5, FULL) x14. Every 4-request dummy step drafts for 8 requests eagerly. Drafter 7.55-7.56 ms at 4x8/4x20/4x24.",
+    "c57p4": "in the grid: (4, 20, FULL) x42, (8, 40, NONE) x14, (1, 5, FULL) x14. The 4-request dummy steps draft for 4 requests through the (4, 20) FULL draft graph. Drafter 6.72-6.73 ms (-0.83 ms).",
+    "at_startup": "identical in both arms: (1, 5, NONE), (2, 10, FULL), (2, 10, NONE), (8, 40, NONE). The (4, 20) draft graph is captured by the speculator's own capture loop in both arms, not by a (4, 24) target dummy run.",
+    "serving_reading": "A real step dispatches the draft on its real request count (input_batch.num_reqs), and 0798 does not change the speculator's draft-graph capture loop. So a served 4-request step reaches the (4, 20) graph in both arms; this run shows only the dummy steps. The change corrects the dummy steps the engine grid times: it explains the tp3-switched screen's 4-request grid cells being 1.7-1.9% faster. It is not a served-decode gain."
+   },
+   "testbed": "candidate-57's tp3-switched screen (receipts/tp3-switched): grid the same (4-request shapes 1.7-1.9% faster), c8 paired decode +0.56% (first boot), single-stream and sampled the same, greedy outputs identical",
+   "predicted_serving_share": "one fused call a draft step saves 0.65-1.35 us: 0.002-0.004% of TP3's c1 served step (38.03 ms), about 0.001% at c8 (115.61 ms). The dummy-run change has no served share; it moves only the engine grid's 4-request cells (-0.83 ms of drafter time on one GPU)."
+  }
+ },
+ "files": {
+  "raw/part2": "mla-*-boot*.txt and json/, pytest-c57p2-boot*.txt, commands-sp8.txt (every run's om.sh block)",
+  "raw/part4": "conf-*-boot*.txt and json/, dispatch-tp3-*.txt and json/, pytest-c57p4-boot*.txt, commands-sp8.txt",
+  "raw/analysis": "part2-sparse-mla-cells.json, part4-confidence-cells.json (common/h/aom.py)",
+  "raw/harness": "h957p2.py, h957p4.py, step957.py as run"
+ },
+ "hosts_and_rules": "sp8 only; every GPU run went through common/bin/om.sh under flock /tmp/spark-lab-gpu.lock, one boot a hold; hold file absent and no serving container at every start. No push, commit, PR, image build, cluster, window or testbed operation."
+}

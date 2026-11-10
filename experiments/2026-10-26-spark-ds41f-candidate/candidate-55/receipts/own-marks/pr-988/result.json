@@ -1,0 +1,53 @@
+{
+ "pr": 988,
+ "part": "dead-row (0794)",
+ "label": "988-deadrow",
+ "patch": "0794-perf-spec_decode-sample-skip-dead-verification-rows-.patch (410463b3 in candidate-55's tree; its 9 files touch no other candidate-55 patch's)",
+ "candidate": "candidate-55",
+ "pr_head": "cfb7069e6882dc53e2b1b65bef80c9477c3f14d9",
+ "verdict": "meets-mark",
+ "verdict_reason": "Sampler.apply_sampling_params, as each arm's RejectionSampler._verify calls it, is faster beyond the interval in all 12 cells: 1.06-1.14x at 1 request, 1.36-1.53x at 4, 2.25-2.83x at 8 and 2.26-3.68x at 16, with every non-temperature control on. The mark names 8 and 16 requests. Live rows are bit-exact with every dead row's input set to NaN, rejection_sample's outputs are equal, and the live rows hash identically to candidate-54's processing. The PR's tests pass in both boots.",
+ "mark": "screen_dead_row_and_sparse_topk.py, dead-row cells only, and test_dead_rows.py on the candidate, 2 boots, ABBA: Sampler.apply_sampling_params with dead_row_cut faster beyond the interval at 8 and 16 requests with top_p < 1, top_k, min_p or penalties; live rows bit-exact. Kernel time and CUDA-graph replay where the path is captured, both recorded.",
+ "rule": "Interval rule as candidates 49-53's: faster when the slower candidate boot beats the faster base boot.",
+ "host": "sp8 (spark-0016, one GB10), 2026-11-10 07:26-07:29Z, ABBA in one session",
+ "arms": {
+  "base": "spark-ds41f:candidate-54 sha256:e1de71bed3b41dff3a969c19adc09072c0ab1c947f34afe7117cb8b6389e23ea, its own tree 5f021d9a (verified)",
+  "c55dr": "the same image + 0794's 9 files at 410463b3, read-only: candidate-54 + 0794 alone (verified; their pre-patch blobs are candidate-54's)"
+ },
+ "what": "h988.py: the PR's dead-row cells (cfb7069e) with its parameters: temperature 0.8, top_k 64, top_p 0.9, min_p 0.05, repetition 1.15, frequency 0.2, presence 0.3, logit_bias {7: 1.5, 12: -2.0}, bad words [[15, 16], [25]]. V = 129,280, 6 verification rows a request, dead_row_cut 1 or 2, plus the PR's top_p-only case with flat dead rows. Each arm times its own serving call. Base: every row processed (candidate-54 has no dead_row_cut argument). 0794: dead_row_cut and cu_num_logits passed. The sampler runs outside the CUDA graphs in serving, so the eager call's stream time (events around each call, 100 calls after 25 warm-up, median) is the serving path; CUPTI kernel time is beside it. Nothing here is captured, so there is no graph-replay cell.",
+ "cells_events_median_us_base_to_cand": {
+  "normal_B1_cut1": "163.63/165.09 -> 144.51/144.38 (1.14x, faster)",
+  "normal_B1_cut2": "163.07/160.99 -> 152.80/151.81 (1.06x, faster)",
+  "top_p_only_flat_dead_B1_cut1": "154.78/154.85 -> 146.66/142.62 (1.07x, faster)",
+  "normal_B4_cut1": "441.52/435.01 -> 285.92/286.00 (1.53x, faster)",
+  "normal_B4_cut2": "441.41/435.30 -> 322.64/322.83 (1.36x, faster)",
+  "top_p_only_flat_dead_B4_cut1": "466.05/461.94 -> 329.09/318.58 (1.43x, faster)",
+  "normal_B8_cut1": "973.01/974.96 -> 345.23/342.30 (2.83x, faster)",
+  "normal_B8_cut2": "1016.98/1001.78 -> 438.54/437.44 (2.30x, faster)",
+  "top_p_only_flat_dead_B8_cut1": "1319.82/1289.30 -> 582.94/575.62 (2.25x, faster)",
+  "normal_B16_cut1": "2494.14/2491.42 -> 675.87/680.11 (3.68x, faster)",
+  "normal_B16_cut2": "2695.84/2741.30 -> 1212.53/1193.94 (2.26x, faster)",
+  "top_p_only_flat_dead_B16_cut1": "3338.56/3372.29 -> 970.02/977.14 (3.45x, faster)"
+ },
+ "cells_kernel_us": "CUPTI per call follows the events: 12 of 12 faster (for example B16 cut1 2492.6/2512.1 -> 660.3/664.9). raw/analysis/sampler-cells.json.",
+ "in_process_reference": "0794's own call without the cut runs at the base arm's speed (for example B16 cut1 2608/2674 us, B8 cut1 976/962 us), so the gain is the cut and not the build",
+ "correctness": {
+  "live_rows_bit_exact_with_nan_dead_rows": "true in all 12 cells, both boots",
+  "rejection_sample_equal": "true in all 12 cells, both boots (accepted counts and tokens)",
+  "live_rows_hash_equal_to_candidate_54": "true in all 12 cells",
+  "tests": "pytest --noconftest test_dead_rows.py, test_gpu_sampling_states_gather.py, test_deepseek_v41_copy_logits.py, test_prepare_kernels.py: 131 passed in both boots of c55dr"
+ },
+ "acts_when": "only on verification steps where a request carries non-temperature processing (top_k, top_p < 1, min_p, penalties, logit_bias, min_tokens, bad_words, a thinking budget). The recipe's defaults (temperature 1.0, top_p 1.0) and every screen suite send none, so the screen sees only startup and 'no core metric worse'.",
+ "predicted_serving_share": {
+  "anchors": "TP4 c16 129.1 ms (candidate-54's tp4-switched screen, 1000/7.747 steps/s); TP3 c1 38.03, c4 about 71.0 and c8 115.61 ms (pr-957-p5-r1) stand in where TP4 has no record",
+  "requests_with_sampling_parameters": "c16: -1.5..-2.4 ms a step = 1.2-1.8% of 129.1 ms; c8: -0.57..-0.73 ms = 0.5-0.6% of 115.6 ms; c4: -0.12..-0.15 ms = 0.16-0.21% of 71.0 ms; c1: -10..-20 us = 0.03-0.05% of 38.03 ms",
+  "recipe_defaults_and_screen": "0"
+ },
+ "files": {
+  "raw/json": "sampler-*-boot*.json (every cell, both timings, hashes)",
+  "raw": "sampler-*-boot*.txt and pytest-c55dr-boot*.txt (container logs), commands-sp8.txt (every run's om.sh block)",
+  "raw/analysis": "sampler-cells.json (common/h/aom.py)",
+  "raw/harness": "h988.py as run"
+ },
+ "hosts_and_rules": "sp8 only; every GPU run went through common/bin/om.sh under flock /tmp/spark-lab-gpu.lock, one boot a hold; hold file absent and no serving container at every start. No push, commit, PR, image build, cluster, window or testbed operation."
+}

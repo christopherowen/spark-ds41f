@@ -1,0 +1,62 @@
+# Round 3 own marks (candidates 55, 56, 57): shared setup on sp8 (spark-0016, NVIDIA GB10), 2026-11-10.
+# Work dir B = ~/spark-lab/agents/round3-own-marks. No push, commit, PR, image build, cluster,
+# window or testbed operation. Every GPU command ran under flock /tmp/spark-lab-gpu.lock through
+# bin/om.sh, which records loadavg, MemAvailable, docker ps and ~/spark-hold.json inside the lock
+# and refuses to run when the hold file exists or a "vllm serve" container runs. One run (one
+# fresh container, "a boot") per lock hold, so other agents' jobs interleave between runs.
+#
+# 1. Sources (read-only use of the round's clean clone ~/spark-lab/agents/candidates-55-57/spark-ds41f):
+#    prepared trees .work/build/*/src/vllm at 295c2ced (56), d74e38ee (57), 410463b3 (55);
+#    candidate-54's head 4e8133ff (tree 5f021d9a) is their common ancestor.
+#    PR experiment dirs exported with git archive from that clone:
+#      #957 e464d364431a26b031a6e91f5dd610f429129c46 experiments/2026-11-08-tp3-decode-recovery
+#      #988 cfb7069e6882dc53e2b1b65bef80c9477c3f14d9 experiments/2026-11-08-sampler-dead-row-skip-and-sparse-topk
+#
+# 2. Arms (bin/setup.sh, bin/om.sh): one image for every arm, spark-ds41f:candidate-54
+#    sha256:e1de71bed3b41dff3a969c19adc09072c0ab1c947f34afe7117cb8b6389e23ea (built on dgx4,
+#    labels vllm.patch-head 4e8133ff, vllm.tree 5f021d9a). Each candidate arm mounts only one
+#    patch's files, read-only, at the patch's commit; setup.sh checks each file's pre-patch blob
+#    equals candidate-54's, so every arm is candidate-54 plus exactly one patch:
+#      base  = the plain image (candidate-54's tree 5f021d9a)
+#      c56p1 = + 0795 (#957 part 1) at e4b134ab: compressor.py, tilelang/linear.py, its test
+#      c57p2 = + 0797 (#957 part 2) at 4fc8de11: tilelang/sparse_mla.py
+#      c57p4 = + 0798 (#957 part 4) at d74e38ee: dspark.py, tilelang/confidence.py, input_batch.py,
+#              model_runner.py, dspark/speculator.py, its test
+#      c55dr = + 0794 (#988 dead-row part) at 410463b3: the sampler, tilelang_* sampling, the
+#              rejection sampler, tilelang_inputs.py, test_dead_rows.py
+#    Every changed file is Python or TileLang JIT source, so the overlay represents each change.
+#    verify.sh: each arm's container sees its expected tree exactly (7,831 files match, 0 differ):
+#    verify-tree-*.txt. Using candidate-54's image for both arms keeps the build host out of every
+#    A/B (candidate-56's and 57's images were built on sp8; the sp1 grid attribution ruled the
+#    build host out separately).
+#    Each arm has its own TileLang cache (B/c/tl-<arm>, seeded from the release tests' cache
+#    ~/.cache/spark-lab/compile/tilelang-release-tests), env TILELANG_CACHE_DIR, HF_HUB_OFFLINE=1,
+#    PYTHONPATH=/opt/spark-ds41f/candidate/vllm:/h, workdir /opt/spark-ds41f/candidate/vllm.
+#    Full-model runs add the recipe's environment (bin/env.sh, from releases/spark-ds41f-1107
+#    cluster.json) and the hub read-only; MINMEM_GIB=95 refuses a full-model run below 95 GiB
+#    MemAvailable, and a guard kills only the run's own container under 6 GiB.
+#
+# 3. Method: ABBA in one session per PR, base boot1, candidate boot1, candidate boot2, base boot2.
+#    Interval rule (candidates 49-53): a cell is faster when the slower candidate boot beats the
+#    faster base boot, slower when the faster candidate boot is slower than the slower base boot,
+#    else the same. Decode kernels are judged by CUDA-graph replay (and CUPTI kernel time); the
+#    sampler (eager in serving) by eager stream time. Every timed script starts with >= 250 ms of
+#    GPU warm-up (h/omlib.gpu_warmup, candidate-51's omlib.py unchanged).
+#
+# 4. Full-model runs (step957.py; #957 parts 1 and 4): the whole 40-layer model plus the DSpark
+#    drafter in one process (VLLM_ENABLE_V1_MULTIPROCESSING=0) at tensor-parallel size 1 with one
+#    TP4 (or TP3) rank's shapes and dummy weights, no Engram, as the 2026-10-31 iket harness runs it;
+#    DeepseekCompressor alone is built with the TP world size it has at that shape (rank 0) and a
+#    local all-gather stand-in. Steps are GPUModelRunner.engine_grid's dummy runs. What one GPU
+#    cannot show: RoCE collectives (the all-reduces are no-ops at TP1, so the L2 prefetch windows
+#    have no all-reduce waits to fill: prefetch off is ~2 ms faster here, 11.6% slower on
+#    tp3-switched), and the full-vocabulary head and embedding of TP1 (a 1x2 step is 21.6 ms here,
+#    14.5 ms on tp4-switched). Both arms carry the same differences.
+#
+# 5. Order on sp8 (common/progress.log): 957p1k, 957p1s, 957p1n, 957p2, 957p4, 988, 957p1t,
+#    957p1v, 957p4d, 05:45:43Z to 07:43:25Z, every script rc=0. Other agents' jobs and candidate-57's
+#    release tests took the lock between runs (docker_ps_before in each run's block); the longest
+#    gap was between 957p1k's base boot 1 (06:12Z) and its candidate boots (07:01Z).
+#
+# 6. Left on sp8: B/out (every output, the nsys .sqlite/.nsys-rep files included) and the arms'
+#    TileLang caches B/c/tl-* (about 0.5 GB each, root-owned).
