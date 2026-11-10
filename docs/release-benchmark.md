@@ -203,7 +203,16 @@ prefill at 32K and 256K.
   `bin/spark candidate overlay <dir> no<PR> --tree <host>:<prepared tree> --revert <commit> --apply`
   writes a control's overlay and profiles.
 - **Confirm in one session first.** A change near its margin against a recorded reference can be drift between sessions. Before attributing it to a PR, run the base and the candidate ABBA in one session.
-  - On 2026-11-09, candidate-53's stall-3 read 2.1% slower against candidate-50's run from earlier the same evening. In one session the two were within one boot spread.
+  - On 2026-11-09, candidate-53's stall-3 read 2.1% slower against candidate-50's run from earlier the same evening.
+    The ABBA in one session showed that this was #984's, not drift: with #984, 2.37% slower; without it, level with
+    candidate-50 ([candidate-53/receipts/tp3-switched](../experiments/2026-10-26-spark-ds41f-candidate/candidate-53/receipts/tp3-switched/README.md)).
+    The same image measured in different sessions of candidates 50-58 moved no more than its boot-to-boot spread
+    (candidate-54's grid: sd 0.23% over 7 boots in 4 sessions at tp3-switched, 0.07% over 5 boots in 3 sessions at
+    tp4-switched; its c1 within 0.06% across 3 sessions at tp4-ring).
+- **First boots and time to ready.** An image's first boot on a node compiles its changed kernels into the
+  host-mounted cache (candidate-58: 273 TileLang kernels on sp1 and 427 on sp5 in the gate's boot, none in the screen's),
+  which adds up to about two minutes to its time to ready. The lab marks such boots in the window log, and
+  `bin/spark candidate verdicts` leaves them out of its time-to-ready comparison ([lab.md](lab.md#runs)).
 - **Rework:** a miss goes to a sub-agent. It writes to `receipts/rework/pr-<N>-r<K>/`: the
   analysis, the corrected patch, the commands, the raw outputs and `result.json`. Then apply
   the drop rule.
@@ -507,11 +516,49 @@ its 95% interval plus the repeat's own change; **same** means it does not.
 The closed loops' verdict row is **decode tok/s, paired**. Each request is paired with the
 same prompt on the other build, and the row gives the median ratio over both candidate
 boots. Its margin is the interval over requests and a boot floor in quadrature. The floor
-is the recorded A/A bound (`AA_FLOOR_PCT` in the table script: 0.35% at one stream), or the
-repeat when larger, shrunk by sqrt(3/4) for two candidate boots. The window row
-(output tok/s) stays beside it, with its old interval. Together they resolve changes of
-about 0.3% at one stream, where the window row's ±3.7% resolved none
+is the recorded A/A bound, or the repeat when larger, shrunk by sqrt(3/4) for two candidate
+boots. The window row (output tok/s) stays beside it, with its old interval. Together they
+resolve changes of about 0.3% at one stream, where the window row's ±3.7% resolved none
 ([experiments/2026-10-26-paired-verdict](../experiments/2026-10-26-paired-verdict/README.md)).
+The engine grid's **decode geometric mean** is judged the same way, against its own recorded
+floor, over both candidate boots; it no longer takes its interval plus one draw of the repeat,
+whose margin swung between 0.13% and 0.74% with the luck of that draw.
+
+**Both boots of each.** When the reference has a repeat boot, every headline row is the mean
+over all four pairings of the reference's two boots and the candidate's two. The repeat is
+found by name: an arm or record called `<reference>-again`, or `<reference>-again-<suite>`
+for a companion's record (as in `candidate-54/receipts/references/`); a suite job's
+`"reference_repeat"` names it when it is called otherwise. Each side's boot noise is bounded by
+the floor or that side's own repeat, whichever is larger, and the boot term is
+sqrt(F_candidate^2/2b + F_reference^2/2r) for b and r boots averaged: the floor itself for one
+boot of each, x0.866 for two candidate boots, x0.707 for two of each, 18% less than with one
+reference boot. Rows without a floor (window throughput, prefill, stall) add the two repeats'
+boot term the same way to their interval, the largest of the four pairings'. The verdict line
+says which boots were averaged, and each row says "both boots of each" with the reference's
+repeat. Without a repeat the reference is one boot and rows are judged as before.
+
+**Floors.** `scripts/servebench_suite_table.py` holds them with their provenance:
+`AA_FLOOR_PCT` (closed loops, from the pairs of 2026-10-15..25: 0.35% at c1, 0.27% c4, 0.39% c8,
+0.43% c16), `GRID_FLOOR_PCT` (0.43% for an engine grid's geometric mean, from 31 same-build
+pairs of candidates 50-58) and `FLOORS` by testbed and suite, from the same-build pairs of
+candidates 50-58 (2026-11-09..10). A testbed's floor replaces the default with at least 4
+pairs and goes below it only with at least 6; otherwise the default stays, and the table's
+`floors (...)` line says what the pairs showed.
+
+| Testbed, suite | Floors | Kept at the default |
+| --- | --- | --- |
+| tp4-ring, screen | grid 0.37%, c16 0.39% (6 pairs each) | |
+| tp4-switched, screen | grid 0.33%, c16 0.34% (7 pairs each) | |
+| tp4-switched, grid | grid 0.41% (6 pairs) | |
+| tp3-switched, grid-tp3 | grid 0.60% (7 pairs) | |
+| tp3-switched, sampled | c16 0.96% (4 pairs) | c8 (3 pairs, 0.85%), c1 (2 pairs, 1.22%) |
+| tp3-switched, screen-tp3 | | grid (5 pairs, 0.32%), c8 (3 pairs, 0.52%) |
+| tp4-ring, single-stream | | c1 (4 pairs, 0.25%) |
+| tp3-switched, single-stream | | c1 (4 pairs, 0.32%) |
+
+The testbed is read from the candidate run's recorded identity (node count and transport).
+Re-reading receipts: `--suites-dir <receipts>/suites` reads the arms from a copied run;
+`--no-reference-repeat` judges against one reference boot.
 A rows-a-step block follows: for each arm and closed loop, tokens and verified rows a
 step, row yield, wasted rows, and survival and coverage by draft position. The blocks after
 it show every metric of every step for each pair.

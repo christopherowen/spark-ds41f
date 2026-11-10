@@ -69,12 +69,17 @@ server scenario, GuideLLM and AIPerf.
   their exact interval. The comparison warns when the two runs' workloads differ.
 - **Boots.** A paired interval is a few hundredths of a percent, but a boot moves a build
   by a few tenths. A suite's verdict block (`suite.with_floor`) therefore judges the paired
-  decode row against a recorded A/A floor that the caller supplies by step: the 95% bound
-  of one boot against another. The run's own repeat widens it when larger. With a second
-  candidate boot, the change is the mean over both boots and the floor shrinks by
-  sqrt(3/4). The margin is the interval and the floor in quadrature. A single repeat is one
-  draw of the boot noise: judged against it alone, a build differs from itself half the
-  time.
+  decode row, and an engine grid step's geometric mean, against a recorded A/A floor that
+  the caller supplies by step: the 95% bound of one boot against another. The run's own
+  repeat widens it when larger. With a second candidate boot, the change is the mean over
+  both boots and the floor shrinks by sqrt(3/4). The margin is the interval and the floor in
+  quadrature. A single repeat is one draw of the boot noise: judged against it alone, a
+  build differs from itself half the time.
+- **Both boots of each.** Given the reference's own repeat (`reference_repeat`, and the
+  reference's second boot against both candidate boots), every headline row is the mean
+  over all four pairings and the boot term counts both boots on each side
+  (`suite.boot_term`: sqrt(F_c^2/2b + F_r^2/2r), x0.707 of one pair's for two of each).
+  Without it, rows are judged as before.
 
 ## Suites
 
