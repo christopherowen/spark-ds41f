@@ -1,0 +1,1570 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Christopher Owen <christopherowen@users.noreply.github.com>
+Date: Sun, 8 Nov 2026 15:56:25 +0000
+Subject: [PATCH] perf(spec_decode,sample): skip dead verification rows in
+ sampler and sample DSpark top-k sparsely
+
+Base: 1107 vLLM patch head 2756478b60b90700b9918b457aeb38657da637b5 (tree ed1bdb7a7684da33d403a055521ac0c4dd7ca670).
+
+Rationale:
+1. When speculative block verification runs with a per-request verification cap (dead_row_cut from remaining max_tokens, adaptive confidence gating, or CED/local draft cuts) and non-temperature sampling parameters (top_k, top_p, min_p, penalties, logit_bias, bad_words, thinking_budget), RejectionSampler._verify previously passed the full [num_tokens, vocab_size] logits tensor to Sampler.apply_sampling_params without dead_row_cut. Every dead row past dead_row_cut[r] was copied from BF16 to FP32 (517 KB/row at V=129,280) and processed through bias, penalties, bad_words, thinking_budget, temperature, min_p, and tilelang_topk_topp before rejection_sample ignored all rows past dead_row_cut[r].
+2. When DSparkSpeculator._sample_sequential_topk ran with dspark_draft_topk=K, it previously filled the entire [num_reqs, n_spec, vocab_size] base_logits buffer with -inf, scattered the K Markov-corrected candidate scores back into base_logits[:, i] at each step, and launched full-vocabulary argmax or 127-block gumbel_sample + gumbel_finish over all 129,280 columns per step.
+
+Changes:
+1. Add tilelang_inputs.mask_dead_rows to compute live_idx_mapping (-1 on dead rows where row - cu_num_logits[r] > dead_row_cut[r]) and per-row (row_top_k, row_top_p) (neutral vocab_size and 1.0 on dead rows) in a single 1-block launch when dead_row_cut is present and processed logprobs are not requested.
+2. Thread live_idx_mapping into tilelang_sampling.copy_logits, logit_bias, penalties, bad_words, thinking_budget, temperature, and min_p so dead verification rows exit before reading or writing vocabulary rows, and pass (row_top_k, row_top_p) directly into tilelang_topk_topp.apply_top_k_top_p.
+3. Add apply_markov_bias_topk on DSparkDeepseekV4ForCausalLM and Qwen3DSparkForCausalLM / DSparkMarkovHead, and add tilelang_sampling.topk_greedy_sample and tilelang_sampling.topk_gumbel_sample (keying Philox draws and tie-breaking by each candidate's global vocabulary index and maintaining draft_logits by clearing only the previous step's K candidate indices before writing the new K candidates).
+
+Quality:
+Bit-exact on all live verification rows, verified tokens, drafted tokens, and cached draft_logits across greedy and stochastic sampling; also prevents NaN or near-uniform unverified dead rows from perturbing or stalling Sampler.apply_sampling_params.
+
+Tests:
+- pytest tests/v1/worker/test_dead_rows.py tests/v1/spec_decode/test_dspark_topk.py tests/v1/spec_decode/test_dspark_v41_gathered_markov.py tests/v1/worker/test_gpu_sampling_states_gather.py tests/kernels/test_deepseek_v41_copy_logits.py tests/v1/worker/test_prepare_kernels.py tests/v1/spec_decode/test_tilelang_rejection.py tests/v1/spec_decode/test_rejection_sampler_utils.py (935 passed across 2 boots on GB10).
+
+Upstream status: local speculative-decoding and TileLang sampler optimization for DeepSeek-V4.1-Flash on GB10.
+---
+ tests/v1/spec_decode/test_dspark_topk.py      |  94 ++++
+ .../test_dspark_v41_gathered_markov.py        |  18 +
+ tests/v1/worker/test_dead_rows.py             | 153 ++++++
+ vllm/model_executor/models/qwen3_dspark.py    |  54 ++
+ vllm/models/deepseek_v4_1/nvidia/dspark.py    |  33 +-
+ vllm/v1/worker/gpu/sample/sampler.py          |  38 +-
+ .../worker/gpu/sample/tilelang_auxiliary.py   |   2 +-
+ vllm/v1/worker/gpu/sample/tilelang_bias.py    |  24 +-
+ .../v1/worker/gpu/sample/tilelang_controls.py |  20 +-
+ .../v1/worker/gpu/sample/tilelang_sampling.py | 484 +++++++++++++++++-
+ .../v1/worker/gpu/sample/tilelang_thinking.py |   5 +-
+ .../gpu/spec_decode/dspark/speculator.py      | 178 ++++++-
+ .../gpu/spec_decode/rejection_sampler.py      |  13 +
+ vllm/v1/worker/gpu/tilelang_inputs.py         | 101 ++++
+ 14 files changed, 1159 insertions(+), 58 deletions(-)
+
+diff --git a/tests/v1/spec_decode/test_dspark_topk.py b/tests/v1/spec_decode/test_dspark_topk.py
+index 7aa1616..4833aa6 100644
+--- a/tests/v1/spec_decode/test_dspark_topk.py
++++ b/tests/v1/spec_decode/test_dspark_topk.py
+@@ -262,6 +262,10 @@ def test_dspark_revisited_position_uses_step_seed(use_fp64):
+     mapping = torch.arange(batch, device=device)
+     positions = torch.full((batch,), 22, dtype=torch.int64, device=device)
+ 
++    if use_fp64:
++        with pytest.raises(ValueError, match="FP32 only"):
++            spec._sample_logits(logits, mapping, positions, 1)
++        return
+     first = spec._sample_logits(logits, mapping, positions, 1)
+     repeated = spec._sample_logits(logits, mapping, positions, 1)
+     next_round = spec._sample_logits(logits, mapping, positions, 0)
+@@ -281,3 +285,93 @@ def test_dspark_revisited_position_uses_step_seed(use_fp64):
+     torch.testing.assert_close(next_round, expected)
+     mismatch_rate = (first != next_round).float().mean().item()
+     assert 0.35 < mismatch_rate < 0.5
++
++
++
++@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
++@pytest.mark.parametrize("topk", [64, 128, 256])
++def test_topk_greedy_and_gumbel_sample_match_dense_scatter(topk: int):
++    from vllm.v1.worker.gpu.sample import tilelang_sampling
++
++    torch.manual_seed(7)
++    device = torch.device("cuda")
++    batch = 8
++    n_spec = 5
++    vocab_size = 4096
++
++    base_logits = torch.randn(batch, vocab_size, dtype=torch.bfloat16, device=device)
++    cand_logits, cand_indices = base_logits.topk(topk, dim=-1)
++
++    dense_logits = torch.full_like(base_logits, float("-inf"))
++    dense_logits.scatter_(1, cand_indices, cand_logits)
++
++    # 1. Greedy argmax bit-exactness (including ties and all -inf).
++    sparse_greedy = tilelang_sampling.topk_greedy_sample(
++        cand_logits, cand_indices, vocab_size
++    )
++    dense_greedy = dense_logits.argmax(dim=-1)
++    assert torch.equal(sparse_greedy, dense_greedy)
++
++    all_neg_inf = torch.full_like(cand_logits, float("-inf"))
++    assert torch.equal(
++        tilelang_sampling.topk_greedy_sample(all_neg_inf, cand_indices, vocab_size),
++        torch.zeros(batch, dtype=torch.int64, device=device),
++    )
++
++    # 2. Gumbel-max sampling bit-exactness and cached draft_logits bit-exactness
++    # across two consecutive steps (verifying old top-k indices are cleared to -inf).
++    idx_mapping = torch.arange(batch, dtype=torch.int64, device=device)
++    temperature = torch.linspace(0.4, 1.3, batch, dtype=torch.float32, device=device)
++    temperature[batch // 2] = 0.0  # Include a greedy row inside the batch.
++    seeds = torch.arange(100, 100 + batch, dtype=torch.int64, device=device)
++    pos = torch.arange(30, 30 + batch, dtype=torch.int64, device=device)
++    step_col = torch.tensor([2], dtype=torch.int32, device=device)
++
++    dense_cache = torch.full(
++        (batch, n_spec, vocab_size), float("-inf"), dtype=torch.bfloat16, device=device
++    )
++    sparse_cache = torch.full(
++        (batch, n_spec, vocab_size), float("-inf"), dtype=torch.bfloat16, device=device
++    )
++    cached_indices = torch.zeros(
++        (batch, n_spec, topk), dtype=torch.int64, device=device
++    )
++
++    for round_idx in range(2):
++        step_base = torch.randn(batch, vocab_size, dtype=torch.bfloat16, device=device)
++        c_logits, c_indices = step_base.topk(topk, dim=-1)
++        d_logits = torch.full_like(step_base, float("-inf")).scatter_(
++            1, c_indices, c_logits
++        )
++        cur_pos = pos + round_idx
++        ref_sampled = gumbel_sample(
++            d_logits,
++            idx_mapping,
++            temperature,
++            seeds,
++            cur_pos,
++            apply_temperature=True,
++            is_drafting=True,
++            logits_cache=dense_cache,
++            logits_cache_col=step_col[0],
++            use_fp64=False,
++        )
++        got_sampled = tilelang_sampling.topk_gumbel_sample(
++            c_logits,
++            c_indices,
++            idx_mapping,
++            temperature,
++            seeds,
++            cur_pos,
++            True,
++            vocab_size,
++            is_drafting=True,
++            logits_cache=sparse_cache,
++            logits_cache_col=step_col[0],
++            cached_indices=cached_indices,
++        )
++        assert torch.equal(got_sampled, ref_sampled)
++        assert torch.equal(
++            sparse_cache[:, 2].view(torch.int16),
++            dense_cache[:, 2].view(torch.int16),
++        )
+diff --git a/tests/v1/spec_decode/test_dspark_v41_gathered_markov.py b/tests/v1/spec_decode/test_dspark_v41_gathered_markov.py
+index 8aaa8e9..f03dc14 100644
+--- a/tests/v1/spec_decode/test_dspark_v41_gathered_markov.py
++++ b/tests/v1/spec_decode/test_dspark_v41_gathered_markov.py
+@@ -88,3 +88,21 @@ def test_gathered_markov_bias_with_packed_bf16_w2():
+         embed, torch.full_like(base, float("-inf")), values, index
+     )
+     assert torch.equal(packed_out.view(torch.int16), unpacked_out.view(torch.int16))
++
++
++
++@pytest.mark.parametrize("scale", [1.0, 0.5])
++def test_markov_bias_topk_matches_gathered_candidates(scale):
++    torch.manual_seed(3)
++    vocab, rank, reqs, k = 512, 16, 3, 64
++    weight = torch.randn(vocab, rank, dtype=torch.float32)
++    embed = torch.randn(reqs, rank, dtype=torch.float32)
++    base = torch.randn(reqs, vocab, dtype=torch.float32)
++    values, index = base.topk(k, dim=-1)
++    draft = _draft(weight, scale)
++
++    cand = draft.apply_markov_bias_topk(embed, values, index)
++    gathered = draft.apply_markov_bias_gathered(
++        embed, torch.full_like(base, float("-inf")), values, index
++    )
++    assert torch.equal(cand, gathered.gather(1, index))
+diff --git a/tests/v1/worker/test_dead_rows.py b/tests/v1/worker/test_dead_rows.py
+index e395cf7..959c263 100644
+--- a/tests/v1/worker/test_dead_rows.py
++++ b/tests/v1/worker/test_dead_rows.py
+@@ -217,3 +217,156 @@ def test_sample_contiguous_fastpath_skips_gather_and_lazy_expands_on_fallback(
+     assert batch._deferred_expand_max_len is None
+     assert batch.expanded_idx_mapping.tolist() == [2, 2, 2, 0, 0, 0]
+     assert batch.expanded_local_pos.tolist() == [0, 1, 2, 0, 1, 2]
++
++
++
++def test_mask_dead_rows_and_copy_logits_skip_dead_verification_rows():
++    from vllm.v1.worker.gpu import tilelang_inputs
++    from vllm.v1.worker.gpu.sample import tilelang_sampling
++
++    dev = torch.device("cuda")
++    # 3 requests: req 0 (slot 2) has 6 rows with cut=2 (rows 0,1,2 live; 3,4,5 dead)
++    # req 1 (slot 0) has 4 rows with cut=0 (row 6 live; 7,8,9 dead)
++    # req 2 (slot 3) has 6 rows with cut=5 (all 6 rows live: 10..15)
++    expanded_idx_mapping = torch.tensor(
++        [2, 2, 2, 2, 2, 2, 0, 0, 0, 0, 3, 3, 3, 3, 3, 3],
++        dtype=torch.int64,
++        device=dev,
++    )
++    cu_num_logits = torch.tensor([0, 6, 10, 16], dtype=torch.int32, device=dev)
++    dead_row_cut = torch.tensor([2, 0, 5], dtype=torch.int32, device=dev)
++    top_k_gpu = torch.tensor([10, 20, 30, 40], dtype=torch.int32, device=dev)
++    top_p_gpu = torch.tensor([0.5, 0.6, 0.7, 0.8], dtype=torch.float32, device=dev)
++    vocab_size = 256
++
++    live_idx, row_k, row_p = tilelang_inputs.mask_dead_rows(
++        expanded_idx_mapping,
++        cu_num_logits,
++        dead_row_cut,
++        top_k_gpu,
++        top_p_gpu,
++        vocab_size,
++    )
++    expected_live_idx = [2, 2, 2, -1, -1, -1, 0, -1, -1, -1, 3, 3, 3, 3, 3, 3]
++    assert live_idx.tolist() == expected_live_idx
++    assert row_k is not None and row_p is not None
++    expected_k = [
++        30 if m == 2 else (10 if m == 0 else (40 if m == 3 else vocab_size))
++        for m in expected_live_idx
++    ]
++    expected_p = [
++        0.7 if m == 2 else (0.5 if m == 0 else (0.8 if m == 3 else 1.0))
++        for m in expected_live_idx
++    ]
++    assert row_k.tolist() == expected_k
++    torch.testing.assert_close(
++        row_p, torch.tensor(expected_p, dtype=torch.float32, device=dev)
++    )
++
++    # Verify copy_logits with live_idx_mapping copies live rows and ignores NaNs on dead rows.
++    raw = torch.randn((16, vocab_size), dtype=torch.bfloat16, device=dev)
++    raw_with_dead_nans = raw.clone()
++    dead_mask = live_idx < 0
++    raw_with_dead_nans[dead_mask] = float("nan")
++
++    ref_copy = tilelang_sampling.copy_logits(raw)
++    masked_copy = tilelang_sampling.copy_logits(raw_with_dead_nans, live_idx)
++    assert torch.equal(masked_copy[~dead_mask], ref_copy[~dead_mask])
++
++
++def test_sampler_apply_sampling_params_skips_dead_rows_bit_exact():
++    import numpy as np
++    from vllm.v1.worker.gpu.sample.sampler import Sampler
++    from vllm.v1.worker.gpu.states import RequestState
++
++    dev = torch.device("cuda")
++    vocab_size = 1024
++    req_states = RequestState(
++        max_num_reqs=4,
++        max_model_len=64,
++        max_num_batched_tokens=32,
++        num_speculative_steps=5,
++        vocab_size=vocab_size,
++        device=dev,
++    )
++    sampler = Sampler(
++        max_num_reqs=4,
++        vocab_size=vocab_size,
++        device=dev,
++        req_states=req_states,
++    )
++    from vllm.sampling_params import SamplingParams
++
++    # Configure non-temperature sampling controls across all 4 slots.
++    for s_idx in range(4):
++        req_states.add_request(
++            req_id=f"req_{s_idx}",
++            prompt_len=4,
++            all_token_ids=[1, 5, 10, 15, 20, 5, 10, 25],
++            num_computed_tokens=8,
++            max_tokens=32,
++        )
++        req_slot = req_states.req_id_to_index[f"req_{s_idx}"]
++        params = SamplingParams(
++            temperature=0.8,
++            top_k=64,
++            top_p=0.9,
++            min_p=0.05,
++            repetition_penalty=1.2,
++            frequency_penalty=0.3,
++            presence_penalty=0.4,
++            logit_bias={7: 1.5, 12: -2.0},
++            seed=1234 + req_slot,
++        )
++        params._bad_words_token_ids = [[5, 6], [19]]
++        sampler.add_request(req_slot, 4, params)
++    req_states.apply_staged_writes()
++    sampler.apply_staged_writes()
++
++    idx_mapping_np = np.array([2, 0], dtype=np.int64)
++    idx_mapping = torch.from_numpy(idx_mapping_np).to(dev)
++    expanded_idx_mapping = torch.tensor(
++        [2, 2, 2, 2, 2, 2, 0, 0, 0, 0, 0, 0], dtype=torch.int64, device=dev
++    )
++    expanded_local_pos = torch.tensor(
++        [0, 1, 2, 3, 4, 5, 0, 1, 2, 3, 4, 5], dtype=torch.int32, device=dev
++    )
++    cu_num_logits = torch.tensor([0, 6, 12], dtype=torch.int32, device=dev)
++    dead_row_cut = torch.tensor([2, 1], dtype=torch.int32, device=dev)
++    pos = torch.tensor(
++        [8, 9, 10, 11, 12, 13, 8, 9, 10, 11, 12, 13], dtype=torch.int64, device=dev
++    )
++    input_ids = torch.tensor(
++        [5, 6, 7, 8, 9, 10, 15, 16, 17, 18, 19, 20], dtype=torch.int32, device=dev
++    )
++
++    torch.manual_seed(0)
++    raw = torch.randn((12, vocab_size), dtype=torch.bfloat16, device=dev)
++    raw_dead_nan = raw.clone()
++    live_rows = torch.tensor(
++        [True, True, True, False, False, False, True, True, False, False, False, False],
++        device=dev,
++    )
++    raw_dead_nan[~live_rows] = float("nan")
++
++    ref_processed = sampler.apply_sampling_params(
++        raw,
++        expanded_idx_mapping,
++        idx_mapping,
++        idx_mapping_np,
++        pos,
++        input_ids,
++        expanded_local_pos,
++    )
++    masked_processed = sampler.apply_sampling_params(
++        raw_dead_nan,
++        expanded_idx_mapping,
++        idx_mapping,
++        idx_mapping_np,
++        pos,
++        input_ids,
++        expanded_local_pos,
++        dead_row_cut=dead_row_cut,
++        cu_num_logits=cu_num_logits,
++    )
++    assert torch.equal(masked_processed[live_rows], ref_processed[live_rows])
+diff --git a/vllm/model_executor/models/qwen3_dspark.py b/vllm/model_executor/models/qwen3_dspark.py
+index 2c1c186..49de761 100644
+--- a/vllm/model_executor/models/qwen3_dspark.py
++++ b/vllm/model_executor/models/qwen3_dspark.py
+@@ -188,6 +188,47 @@ class DSparkMarkovHead(nn.Module):
+         )
+         return logits.scatter_(1, index, corrected.squeeze(-1))
+ 
++    def apply_bias_topk(
++        self,
++        markov_embed: torch.Tensor,
++        values: torch.Tensor,
++        index: torch.Tensor,
++        scale: float = 1.0,
++    ) -> torch.Tensor:
++        """Return ``values + markov_bias`` ([num_reqs, k]) on the selected candidates
++        without scattering into a dense vocabulary buffer."""
++        if self.markov_w2._retain_weight_for_gather and self.markov_w2.is_w4a16_nvfp4:
++            flat_index = index.reshape(-1)
++            packed_weight = self.markov_w2._nvfp4_weight_for_gather.index_select(
++                0, flat_index
++            )
++            weight_scale = self.markov_w2._nvfp4_weight_scale_for_gather.index_select(
++                0, flat_index
++            )
++            weight = dequantize_to_dtype(
++                packed_weight,
++                weight_scale,
++                self.markov_w2._nvfp4_weight_global_scale_for_gather,
++                dtype=markov_embed.dtype,
++                block_size=self.markov_w2._nvfp4_group_size_for_gather,
++                swizzle=False,
++            ).view(*index.shape, -1)
++        else:
++            weight = self.markov_w2.weight[index]
++            if weight.dtype != markov_embed.dtype:
++                raise RuntimeError(
++                    "Gathered Markov projection requires unquantized weights or "
++                    "retained ModelOpt W4A16 NVFP4 weights."
++                )
++        corrected = values.unsqueeze(-1).clone()
++        corrected.baddbmm_(
++            weight,
++            markov_embed.unsqueeze(-1),
++            beta=1.0,
++            alpha=scale,
++        )
++        return corrected.squeeze(-1)
++
+ 
+ class DSparkConfidenceHead(nn.Module):
+     """DSpark acceptance-confidence head."""
+@@ -340,6 +381,19 @@ class Qwen3DSparkForCausalLM(DFlashQwen3ForCausalLM):
+             self.logits_processor.scale,
+         )
+ 
++    def apply_markov_bias_topk(
++        self,
++        markov_embed: torch.Tensor,
++        values: torch.Tensor,
++        index: torch.Tensor,
++    ) -> torch.Tensor:
++        return self.model.markov_head.apply_bias_topk(
++            markov_embed,
++            values,
++            index,
++            self.logits_processor.scale,
++        )
++
+     def compute_confidence(
+         self,
+         head_hidden: torch.Tensor,
+diff --git a/vllm/models/deepseek_v4_1/nvidia/dspark.py b/vllm/models/deepseek_v4_1/nvidia/dspark.py
+index 7ac9d3e..8cef180 100644
+--- a/vllm/models/deepseek_v4_1/nvidia/dspark.py
++++ b/vllm/models/deepseek_v4_1/nvidia/dspark.py
+@@ -783,21 +783,14 @@ class DSparkDeepseekV4ForCausalLM(nn.Module):
+             top2=top2,
+         )
+ 
+-    def apply_markov_bias_gathered(
++    def apply_markov_bias_topk(
+         self,
+         markov_embed: torch.Tensor,
+-        logits: torch.Tensor,
+         values: torch.Tensor,
+         index: torch.Tensor,
+     ) -> torch.Tensor:
+-        """Add the Markov bias to the top-k base-logit candidates only.
+-
+-        Reads k rows of the replicated ``markov_w2`` per request instead of
+-        the whole vocabulary projection at every draft position. ``logits``
+-        is the caller's ``-inf``-filled buffer; the corrected candidates are
+-        scattered into it. The target still verifies every draft, so this
+-        can change acceptance but not the output.
+-        """
++        """Return ``values + markov_bias`` ([num_reqs, k]) on the top-k candidates
++        without scattering into a full-vocabulary buffer."""
+         w2 = self.model.markov_head.markov_w2
+         if hasattr(w2, "packed_bf16_exponent_base"):
+             from ..tilelang.embedding import vocab_embedding_packed
+@@ -831,7 +824,25 @@ class DSparkDeepseekV4ForCausalLM(nn.Module):
+         bias = bias.squeeze(-1).to(values.dtype)
+         if self.logits_processor.scale != 1.0:
+             bias = bias * self.logits_processor.scale
+-        return logits.scatter_(1, index, (values + bias).to(logits.dtype))
++        return values + bias
++
++    def apply_markov_bias_gathered(
++        self,
++        markov_embed: torch.Tensor,
++        logits: torch.Tensor,
++        values: torch.Tensor,
++        index: torch.Tensor,
++    ) -> torch.Tensor:
++        """Add the Markov bias to the top-k base-logit candidates only.
++
++        Reads k rows of the replicated ``markov_w2`` per request instead of
++        the whole vocabulary projection at every draft position. ``logits``
++        is the caller's ``-inf``-filled buffer; the corrected candidates are
++        scattered into it. The target still verifies every draft, so this
++        can change acceptance but not the output.
++        """
++        cand = self.apply_markov_bias_topk(markov_embed, values, index)
++        return logits.scatter_(1, index, cand.to(logits.dtype))
+ 
+     def compute_confidence(
+         self,
+diff --git a/vllm/v1/worker/gpu/sample/sampler.py b/vllm/v1/worker/gpu/sample/sampler.py
+index cdcd3a8..ee3eb64 100644
+--- a/vllm/v1/worker/gpu/sample/sampler.py
++++ b/vllm/v1/worker/gpu/sample/sampler.py
+@@ -344,6 +344,8 @@ class Sampler:
+         expanded_local_pos: torch.Tensor,
+         skip_top_k_top_p: bool = False,
+         skip_temperature: bool = False,
++        dead_row_cut: torch.Tensor | None = None,
++        cu_num_logits: torch.Tensor | None = None,
+     ) -> torch.Tensor:
+         if skip_temperature:
+             if not self.any_non_temperature_logits_processing(idx_mapping_np):
+@@ -351,8 +353,26 @@ class Sampler:
+         elif not np.any(self.needs_logits_processing[idx_mapping_np]):
+             return logits
+ 
+-        # Copy logits to a new FP32 tensor.
+-        logits = tilelang_sampling.copy_logits(logits)
++        live_idx_mapping: torch.Tensor | None = None
++        row_top_k: torch.Tensor | None = None
++        row_top_p: torch.Tensor | None = None
++        if dead_row_cut is not None and cu_num_logits is not None:
++            from vllm.v1.worker.gpu import tilelang_inputs
++
++            expanded_idx_mapping, row_top_k, row_top_p = (
++                tilelang_inputs.mask_dead_rows(
++                    expanded_idx_mapping,
++                    cu_num_logits,
++                    dead_row_cut,
++                    self.sampling_states.top_k.gpu,
++                    self.sampling_states.top_p.gpu,
++                    self.sampling_states.vocab_size,
++                )
++            )
++            live_idx_mapping = expanded_idx_mapping
++
++        # Copy logits to a new FP32 tensor (skipping dead rows when masked).
++        logits = tilelang_sampling.copy_logits(logits, live_idx_mapping)
+ 
+         # Apply logit bias (e.g., allowed_token_ids, min_tokens) in place.
+         self.logit_bias_state.apply_logit_bias(
+@@ -400,6 +420,20 @@ class Sampler:
+         if skip_top_k_top_p:
+             return logits
+ 
++        if live_idx_mapping is not None:
++            states = self.sampling_states
++            do_top_k = bool(
++                np.any(states.top_k.np[idx_mapping_np] != states.vocab_size)
++            )
++            do_top_p = bool(np.any(states.top_p.np[idx_mapping_np] != 1.0))
++            if not do_top_k and not do_top_p:
++                return logits
++            return tilelang_topk_topp.apply_top_k_top_p(
++                logits,
++                row_top_k if do_top_k else None,
++                row_top_p if do_top_p else None,
++            )
++
+         # Apply top_k and/or top_p. This might or might not return a new tensor.
+         return self.sampling_states.apply_top_k_top_p(
+             logits, expanded_idx_mapping, idx_mapping_np
+diff --git a/vllm/v1/worker/gpu/sample/tilelang_auxiliary.py b/vllm/v1/worker/gpu/sample/tilelang_auxiliary.py
+index c02526c..8b6675a 100644
+--- a/vllm/v1/worker/gpu/sample/tilelang_auxiliary.py
++++ b/vllm/v1/worker/gpu/sample/tilelang_auxiliary.py
+@@ -92,7 +92,7 @@ def bad_words_kernel(
+             actual = T.alloc_local((1,), "int32")
+             matches = T.alloc_local((1,), "int32")
+             req[0] = mapping[row]
+-            if word < num_words[req[0]]:
++            if (req[0] >= 0) & (word < num_words[T.max(req[0], T.int64(0))]):
+                 start = offsets[req[0], word]
+                 end = offsets[req[0], word + 1]
+                 prefix = end - start - 1
+diff --git a/vllm/v1/worker/gpu/sample/tilelang_bias.py b/vllm/v1/worker/gpu/sample/tilelang_bias.py
+index 48b55a5..3543098 100644
+--- a/vllm/v1/worker/gpu/sample/tilelang_bias.py
++++ b/vllm/v1/worker/gpu/sample/tilelang_bias.py
+@@ -162,13 +162,27 @@ def bias_kernel(
+             tx = T.get_thread_binding()
+             row = T.cast(block, "int64")
+             req = T.alloc_var(T.int64, init=T.cast(mapping[block], "int64"))
+-            n_allowed = T.alloc_var(T.int32, init=num_allowed[req])
+-            n_bias = T.alloc_var(T.int32, init=num_bias[req])
+-            n_stops = T.alloc_var(T.int32, init=num_stops[req])
++            safe_req = T.max(req, T.int64(0))
++            n_allowed = T.alloc_var(
++                T.int32, init=T.if_then_else(req >= 0, num_allowed[safe_req], 0)
++            )
++            n_bias = T.alloc_var(
++                T.int32, init=T.if_then_else(req >= 0, num_bias[safe_req], 0)
++            )
++            n_stops = T.alloc_var(
++                T.int32, init=T.if_then_else(req >= 0, num_stops[safe_req], 0)
++            )
+             position = T.alloc_var(position_dtype, init=positions[block])
+-            min_len = T.alloc_var(T.int32, init=min_lens[req])
++            min_len = T.alloc_var(
++                T.int32, init=T.if_then_else(req >= 0, min_lens[safe_req], 0)
++            )
+             # Whether this row restores its stop tokens when nothing else is left.
+-            keep = T.alloc_var(T.int32, init=restore_row[req] if restore else 0)
++            keep = T.alloc_var(
++                T.int32,
++                init=T.if_then_else(req >= 0, restore_row[safe_req], 0)
++                if restore
++                else 0,
++            )
+             ids = T.alloc_local((per,), "int32")
+             allowed_ids = T.alloc_local((per,), "int32")
+             values = T.alloc_local((per,), "float32")
+diff --git a/vllm/v1/worker/gpu/sample/tilelang_controls.py b/vllm/v1/worker/gpu/sample/tilelang_controls.py
+index 31f0fa7..da2a30b 100644
+--- a/vllm/v1/worker/gpu/sample/tilelang_controls.py
++++ b/vllm/v1/worker/gpu/sample/tilelang_controls.py
+@@ -175,7 +175,12 @@ def min_p_kernel(
+             best = T.alloc_local((1,), "float32")
+             minimum = T.alloc_local((1,), "float32")
+             partial = T.alloc_shared((warps,), "float32")
+-            minimum[0] = thresholds[mapping[block]]
++            req = T.alloc_var(T.int64, init=T.cast(mapping[block], "int64"))
++            minimum[0] = T.if_then_else(
++                req >= T.int64(0),
++                thresholds[T.max(req, T.int64(0))],
++                T.float32(0),
++            )
+             if minimum[0] != 0:
+                 best[0] = -T.infinity("float32")
+                 for start in T.serial(full):
+@@ -294,9 +299,16 @@ def penalties_kernel(
+             values = T.alloc_fragment((block,), "float32")
+             counts = T.alloc_fragment((block,), "int32")
+             req[0] = mapping[row]
+-            rep[0] = repetition[req[0]]
+-            freq[0] = frequency[req[0]]
+-            pres[0] = presence[req[0]]
++            safe_req = T.max(req[0], T.int64(0))
++            rep[0] = T.if_then_else(
++                req[0] >= 0, repetition[safe_req], T.float32(1)
++            )
++            freq[0] = T.if_then_else(
++                req[0] >= 0, frequency[safe_req], T.float32(0)
++            )
++            pres[0] = T.if_then_else(
++                req[0] >= 0, presence[safe_req], T.float32(0)
++            )
+             if (rep[0] != 1) | (freq[0] != 0) | (pres[0] != 0):
+                 for col in T.Parallel(block):
+                     index = blk * block + col
+diff --git a/vllm/v1/worker/gpu/sample/tilelang_sampling.py b/vllm/v1/worker/gpu/sample/tilelang_sampling.py
+index 05dbc67..db60337 100644
+--- a/vllm/v1/worker/gpu/sample/tilelang_sampling.py
++++ b/vllm/v1/worker/gpu/sample/tilelang_sampling.py
+@@ -3164,7 +3164,8 @@ def temperature_kernel(
+             if run > 1:
+                 # The launch checked it: a 16-byte base and a stride of 16 elements.
+                 T.assume(logits_stride % 16 == 0)
+-            temp[0] = temperature[T.cast(idx_mapping[t], T.int64)]
++            req = T.alloc_var(T.int64, init=T.cast(idx_mapping[t], T.int64))
++            temp[0] = T.if_then_else(req >= 0, temperature[req], T.float32(1))
+             if (temp[0] != T.float32(0)) & (temp[0] != T.float32(1)):
+                 for r in T.unroll(runs):
+                     col0 = blk * block + r * (threads * run) + run * tx
+@@ -3439,13 +3440,20 @@ def declare(calls: Callable[[], list]) -> None:
+ 
+ 
+ @tilelang.jit(pass_configs=_PASS)
+-def copy_logits_kernel(dtype: str, vectorized: bool = False):
+-    """Own an FP32 logits copy, including cast and non-contiguous source rows."""
++def copy_logits_kernel(
++    dtype: str, vectorized: bool = False, idx_dtype: str | None = None
++):
++    """Own an FP32 logits copy, including cast and non-contiguous source rows.
++    When idx_dtype is given, rows with idx_mapping[row] < 0 (dead
++    verification rows past dead_row_cut) exit before reading src."""
+     rows, cols, row_stride, col_stride = T.dynamic("rows, cols, row_stride, col_stride")
+     source_strides = (row_stride, 1) if vectorized else (row_stride, col_stride)
++    has_idx = idx_dtype is not None
++    if not has_idx:
++        idx_dtype = "int64"
+ 
+     @T.prim_func
+-    def copy_logits(
++    def copy_logits_unmasked(
+         src: T.StridedTensor((rows, cols), source_strides, dtype),
+         dst: T.Tensor((rows, cols), T.float32),
+     ):
+@@ -3468,7 +3476,35 @@ def copy_logits_kernel(dtype: str, vectorized: bool = False):
+                     if col < cols:
+                         dst[row, col] = T.cast(src[row, col], T.float32)
+ 
+-    return copy_logits
++    idx_len = T.dynamic("idx_len")
++
++    @T.prim_func
++    def copy_logits_masked(
++        src: T.StridedTensor((rows, cols), source_strides, dtype),
++        dst: T.Tensor((rows, cols), T.float32),
++        idx_mapping: T.Tensor((idx_len,), idx_dtype),
++    ):
++        grid_x = T.ceildiv(cols, 1024) if vectorized else rows
++        grid_y = rows if vectorized else T.ceildiv(cols, 1024)
++        with T.Kernel(grid_x, grid_y, threads=256) as (bx, by):
++            row = by if vectorized else bx
++            block = bx if vectorized else by
++            tx = T.get_thread_binding()
++            if idx_mapping[row] >= 0:
++                if vectorized:
++                    T.assume(row_stride % 4 == 0)
++                    T.assume(cols % 4 == 0)
++                    col = block * 1024 + tx * 4
++                    if col + 4 <= cols:
++                        for j in T.vectorized(4):
++                            dst[row, col + j] = T.cast(src[row, col + j], T.float32)
++                else:
++                    for j in T.unroll(4):
++                        col = block * 1024 + j * 256 + tx
++                        if col < cols:
++                            dst[row, col] = T.cast(src[row, col], T.float32)
++
++    return copy_logits_masked if has_idx else copy_logits_unmasked
+ 
+ 
+ def _pitched_logits_copy(logits: torch.Tensor, out: torch.Tensor) -> None:
+@@ -3486,11 +3522,16 @@ def _pitched_logits_copy(logits: torch.Tensor, out: torch.Tensor) -> None:
+         raise RuntimeError(f"pitched logits copy failed: {error}")
+ 
+ 
+-def copy_logits(logits: torch.Tensor) -> torch.Tensor:
++def copy_logits(
++    logits: torch.Tensor,
++    live_idx_mapping: torch.Tensor | None = None,
++) -> torch.Tensor:
+     """FP32-owned logits for processing; leave the raw logits unchanged.
+ 
+     Dense FP32 uses PyTorch's DMA path. Wide aligned FP32 matrices above 8 MiB
+     use pitched DMA; smaller copies, casts and other strides use TileLang.
++    When live_idx_mapping is provided, dead rows (live_idx_mapping[row] < 0)
++    are skipped by the TileLang copy kernel.
+     Tensor allocation and views do not launch compute kernels.
+     """
+     if (
+@@ -3502,7 +3543,20 @@ def copy_logits(logits: torch.Tensor) -> torch.Tensor:
+     out = torch.empty(logits.shape, dtype=torch.float32, device=logits.device)
+     if not logits.numel():
+         return out
+-    if logits.dtype == torch.float32 and logits.is_contiguous():
++    if live_idx_mapping is not None:
++        vectorized = (
++            logits.stride(1) == 1
++            and logits.shape[0] <= 65535
++            and logits.shape[1] % 4 == 0
++            and _triton_run(logits) > 1
++        )
++        _kernel(
++            copy_logits_kernel,
++            _DTYPES[logits.dtype],
++            vectorized,
++            _DTYPES[live_idx_mapping.dtype],
++        )(logits, out, live_idx_mapping.contiguous())
++    elif logits.dtype == torch.float32 and logits.is_contiguous():
+         out.copy_(logits)
+     elif (
+         logits.dtype == torch.float32
+@@ -3555,6 +3609,16 @@ def sampling_calls(
+         for dtype in dict.fromkeys(logits_dtypes)
+         for vectorized in (False, True)
+     ]
++    calls += [
++        _call(
++            copy_logits_kernel,
++            _DTYPES[dtype],
++            vectorized,
++            _DTYPES[RUNNER_IDX_DTYPE],
++        )
++        for dtype in dict.fromkeys(logits_dtypes)
++        for vectorized in (False, True)
++    ]
+     if temperature:
+         calls += [
+             _call(temperature_kernel, _DTYPES[RUNNER_IDX_DTYPE], run, block)
+@@ -3596,6 +3660,412 @@ def drafting_calls(
+     ]
+ 
+ 
++
++
++# --- Sparse top-k draft sampling ----------------------------------------------
++
++
++@tilelang.jit(pass_configs=_PASS)
++def topk_greedy_sample_kernel(
++    logits_dtype: str,
++    index_dtype: str = "int64",
++    threads: int = _THREADS,
++    per_thread: int = 2,
++):
++    """Sparse-support greedy argmax over topk candidate logits and their
++    vocabulary indices cand_indices. Tie-breaking follows _first_argmax
++    on global vocabulary indices (lowest vocabulary index wins ties; NaN beats
++    finite values). When topk < vocab, column 0 of the implicit -inf
++    background is seeded so an all--inf candidate set still selects token 0
++    just as logits.fill_(-inf) + scatter_ + argmax(-1) does."""
++    tokens, topk = T.dynamic("tokens, topk")
++    logits_stride, idx_stride = T.dynamic("logits_stride, idx_stride", "int64")
++    warps = threads // 32
++
++    @T.prim_func
++    def topk_greedy_sample(
++        cand_logits: T.StridedTensor((tokens, topk), (logits_stride, 1), logits_dtype),
++        cand_indices: T.StridedTensor((tokens, topk), (idx_stride, 1), index_dtype),
++        sampled: T.Tensor((tokens,), T.int64),
++        vocab: T.int32,
++    ):
++        with T.Kernel(tokens, threads=threads) as t:
++            T.import_source(_HEADER)
++            tx = T.get_thread_binding()
++            best = T.alloc_local((1,), T.float32)
++            best_index = T.alloc_local((1,), T.int32)
++            other = T.alloc_local((1,), T.float32)
++            other_index = T.alloc_local((1,), T.int32)
++            partial = T.alloc_shared((warps,), T.float32)
++            partial_index = T.alloc_shared((warps,), T.int32)
++
++            best[0] = -T.infinity(T.float32)
++            best_index[0] = T.if_then_else(
++                (tx == 0) & (topk < vocab), T.int32(0), T.int32(_INT32_MAX)
++            )
++            for r in T.unroll(per_thread):
++                c = r * threads + tx
++                if c < topk:
++                    val = T.cast(cand_logits[t, c], T.float32)
++                    idx = T.cast(cand_indices[t, c], T.int32)
++                    _first_keep_or_take(best, best_index, val, idx)
++
++            _first_exchange(best, best_index, other, other_index, 16)
++            _first_exchange(best, best_index, other, other_index, 8)
++            _first_exchange(best, best_index, other, other_index, 4)
++            _first_exchange(best, best_index, other, other_index, 2)
++            _first_exchange(best, best_index, other, other_index, 1)
++            if tx % 32 == 0:
++                partial[tx // 32] = best[0]
++                partial_index[tx // 32] = best_index[0]
++            T.sync_threads()
++            if tx < warps:
++                best[0] = partial[tx]
++                best_index[0] = partial_index[tx]
++            _first_exchange(best, best_index, other, other_index, 2)
++            _first_exchange(best, best_index, other, other_index, 1)
++            if tx == 0:
++                sampled[t] = T.cast(best_index[0], T.int64)
++
++    return topk_greedy_sample
++
++
++def topk_greedy_sample_key(
++    logits_dtype: torch.dtype,
++    index_dtype: torch.dtype = torch.int64,
++    topk: int = 128,
++) -> tuple:
++    per_thread = max(-(-topk // _THREADS), 1)
++    return (_DTYPES[logits_dtype], _DTYPES[index_dtype], _THREADS, per_thread)
++
++
++def topk_greedy_sample(
++    cand_logits: torch.Tensor,
++    cand_indices: torch.Tensor,
++    vocab_size: int,
++) -> torch.Tensor:
++    """Sparse-support argmax(dim=-1) over (cand_logits, cand_indices)."""
++    num_tokens, topk = cand_logits.shape
++    sampled = torch.empty(num_tokens, dtype=torch.int64, device=cand_logits.device)
++    if num_tokens == 0:
++        return sampled
++    if cand_logits.stride(-1) != 1:
++        cand_logits = cand_logits.contiguous()
++    if cand_indices.stride(-1) != 1:
++        cand_indices = cand_indices.contiguous()
++    key = topk_greedy_sample_key(cand_logits.dtype, cand_indices.dtype, topk)
++    _kernel(topk_greedy_sample_kernel, *key)(
++        cand_logits, cand_indices, sampled, int(vocab_size)
++    )
++    return sampled
++
++
++@tilelang.jit(pass_configs=_PASS)
++def topk_gumbel_sample_kernel(
++    logits_dtype: str,
++    idx_dtype: str,
++    apply_temperature: bool,
++    is_drafting: bool,
++    cache_dtype: str | None,
++    col_dtype: str | None,
++    per_token_col: bool,
++    per_thread: int = 2,
++    pos_dtype: str = "int64",
++    cand_idx_dtype: str = "int64",
++):
++    """Sparse-support Gumbel-max sampling over topk candidates (cand_logits,
++    cand_indices). Each candidate's Philox word is drawn at its global vocabulary
++    index index = cand_indices[t, c] using vllm_randint32(word_seed[0], index)
++    so the random stream and tie-breaking match full-vocabulary gumbel_sample on a
++    -inf-masked vocabulary tensor bit for bit. When cache_dtype is given, the
++    previous step's topk cached indices cached_indices[req, col, :] are first
++    cleared to -inf in cache before writing the new topk candidate scores
++    and updating cached_indices."""
++    tokens, topk = T.dynamic("tokens, topk")
++    idx_len, pos_len, seed_len, temp_len = T.dynamic(
++        "idx_len, pos_len, seed_len, temp_len"
++    )
++    logits_stride, cand_idx_stride = T.dynamic(
++        "logits_stride, cand_idx_stride", "int64"
++    )
++    cached = cache_dtype is not None
++    cache_reqs, cache_cols, cache_vocab, num_cols = T.dynamic(
++        "cache_reqs, cache_cols, cache_vocab, num_cols"
++    )
++    cache_stride_0, cache_stride_1 = T.dynamic(
++        "cache_stride_0, cache_stride_1", "int64"
++    )
++    cached_idx_stride_0, cached_idx_stride_1 = T.dynamic(
++        "cached_idx_stride_0, cached_idx_stride_1", "int64"
++    )
++    if not cached:
++        cache_dtype, col_dtype = "float32", "int64"
++
++    @T.prim_func
++    def topk_gumbel_sample(
++        sampled: T.Tensor((tokens,), T.int64),
++        cand_logits: T.StridedTensor((tokens, topk), (logits_stride, 1), logits_dtype),
++        cand_indices: T.StridedTensor((tokens, topk), (cand_idx_stride, 1), cand_idx_dtype),
++        idx_mapping: T.Tensor((idx_len,), idx_dtype),
++        seeds: T.Tensor((seed_len,), T.int64),
++        pos: T.Tensor((pos_len,), pos_dtype),
++        temperature: T.Tensor((temp_len,), T.float32),
++        cache: T.StridedTensor(
++            (cache_reqs, cache_cols, cache_vocab),
++            (cache_stride_0, cache_stride_1, 1),
++            cache_dtype,
++        ),
++        cache_col: T.Tensor((num_cols,), col_dtype),
++        cached_indices: T.StridedTensor(
++            (cache_reqs, cache_cols, topk),
++            (cached_idx_stride_0, cached_idx_stride_1, 1),
++            cand_idx_dtype,
++        ),
++        vocab: T.int32,
++    ):
++        with T.Kernel(tokens, threads=_THREADS) as t:
++            T.import_source(_HEADER)
++            tx = T.get_thread_binding()
++            req = T.alloc_local((1,), T.int64)
++            temp = T.alloc_local((1,), T.float32)
++            seed = T.alloc_local((1,), T.int64)
++            col = T.alloc_local((1,), T.int64)
++            word_seed = T.alloc_local((1,), T.uint32)
++            score = T.alloc_local((1,), T.float32)
++            best = T.alloc_local((1,), T.float32)
++            best_index = T.alloc_local((1,), T.int32)
++            other = T.alloc_local((1,), T.float32)
++            other_index = T.alloc_local((1,), T.int32)
++            partial = T.alloc_shared((_WARPS,), T.float32)
++            partial_index = T.alloc_shared((_WARPS,), T.int32)
++
++            req[0] = T.cast(idx_mapping[t], T.int64)
++            temp[0] = T.float32(0)
++            seed[0] = T.int64(0)
++            if req[0] >= 0:
++                temp[0] = temperature[req[0]]
++                seed[0] = seeds[req[0]]
++            if cached:
++                if per_token_col:
++                    col[0] = T.cast(cache_col[t], T.int64)
++                else:
++                    col[0] = T.cast(cache_col[0], T.int64)
++                seed[0] = seed[0] ^ T.shift_left(col[0], T.int64(32))
++                if req[0] >= 0:
++                    for r in T.unroll(per_thread):
++                        c = r * _THREADS + tx
++                        if c < topk:
++                            old_idx = T.cast(cached_indices[req[0], col[0], c], T.int32)
++                            if (old_idx >= 0) & (old_idx < vocab):
++                                cache[req[0], col[0], old_idx] = T.cast(
++                                    -T.infinity(T.float32), cache_dtype
++                                )
++                T.sync_threads()
++            word_seed[0] = _randint_at(seed[0], pos[t], pos_dtype, is_drafting)
++
++            best[0] = -T.infinity(T.float32)
++            best_index[0] = T.if_then_else(
++                (tx == 0) & (topk < vocab), T.int32(0), T.int32(_INT32_MAX)
++            )
++            if temp[0] != T.float32(0):
++                for r in T.unroll(per_thread):
++                    c = r * _THREADS + tx
++                    if c < topk:
++                        index = T.cast(cand_indices[t, c], T.int32)
++                        word = T.alloc_var(
++                            T.uint32,
++                            init=T.call_extern(
++                                "uint32", "vllm_randint32", word_seed[0], index
++                            ),
++                        )
++                        score[0] = T.cast(cand_logits[t, c], T.float32)
++                        if cached:
++                            if req[0] >= 0:
++                                cache[req[0], col[0], index] = T.cast(
++                                    score[0], cache_dtype
++                                )
++                                cached_indices[req[0], col[0], c] = T.cast(
++                                    index, cand_idx_dtype
++                                )
++                        if apply_temperature:
++                            score[0] = T.call_extern(
++                                "float32", "vllm_div_full", score[0], temp[0]
++                            )
++                        score[0] = T.call_extern(
++                            "float32", "vllm_gumbel_score", score[0], word
++                        )
++                        _first_keep_or_take(best, best_index, score[0], index)
++            else:
++                for r in T.unroll(per_thread):
++                    c = r * _THREADS + tx
++                    if c < topk:
++                        index = T.cast(cand_indices[t, c], T.int32)
++                        score[0] = T.cast(cand_logits[t, c], T.float32)
++                        if cached:
++                            if req[0] >= 0:
++                                cache[req[0], col[0], index] = T.cast(
++                                    score[0], cache_dtype
++                                )
++                                cached_indices[req[0], col[0], c] = T.cast(
++                                    index, cand_idx_dtype
++                                )
++                        _first_keep_or_take(best, best_index, score[0], index)
++
++            _first_exchange(best, best_index, other, other_index, 16)
++            _first_exchange(best, best_index, other, other_index, 8)
++            _first_exchange(best, best_index, other, other_index, 4)
++            _first_exchange(best, best_index, other, other_index, 2)
++            _first_exchange(best, best_index, other, other_index, 1)
++            if tx % 32 == 0:
++                partial[tx // 32] = best[0]
++                partial_index[tx // 32] = best_index[0]
++            T.sync_threads()
++            if tx < _WARPS:
++                best[0] = partial[tx]
++                best_index[0] = partial_index[tx]
++            _first_exchange(best, best_index, other, other_index, 2)
++            _first_exchange(best, best_index, other, other_index, 1)
++            if tx == 0:
++                sampled[t] = T.cast(best_index[0], T.int64)
++
++    return topk_gumbel_sample
++
++
++def topk_gumbel_sample_key(
++    logits_dtype: torch.dtype,
++    idx_dtype: torch.dtype,
++    apply_temperature: bool,
++    is_drafting: bool,
++    cache_dtype: torch.dtype | None = None,
++    col_dtype: torch.dtype | None = None,
++    per_token_col: bool = False,
++    topk: int = 128,
++    pos_dtype: torch.dtype = torch.int64,
++    cand_idx_dtype: torch.dtype = torch.int64,
++) -> tuple:
++    per_thread = max(-(-topk // _THREADS), 1)
++    return (
++        _DTYPES[logits_dtype],
++        _DTYPES[idx_dtype],
++        apply_temperature,
++        is_drafting,
++        None if cache_dtype is None else _DTYPES[cache_dtype],
++        None if cache_dtype is None or col_dtype is None else _DTYPES[col_dtype],
++        bool(cache_dtype is not None and per_token_col),
++        per_thread,
++        _DTYPES[pos_dtype],
++        _DTYPES[cand_idx_dtype],
++    )
++
++
++def topk_gumbel_sample(
++    cand_logits: torch.Tensor,
++    cand_indices: torch.Tensor,
++    idx_mapping: torch.Tensor,
++    temperature: torch.Tensor,
++    seeds: torch.Tensor,
++    pos: torch.Tensor,
++    apply_temperature: bool,
++    vocab_size: int,
++    *,
++    is_drafting: bool = False,
++    logits_cache: torch.Tensor | None = None,
++    logits_cache_col: torch.Tensor | None = None,
++    cached_indices: torch.Tensor | None = None,
++) -> torch.Tensor:
++    """Sparse-support gumbel_sample over (cand_logits, cand_indices)."""
++    num_tokens, topk = cand_logits.shape
++    sampled = torch.empty(num_tokens, dtype=torch.int64, device=cand_logits.device)
++    if num_tokens == 0:
++        return sampled
++    if cand_logits.stride(-1) != 1:
++        cand_logits = cand_logits.contiguous()
++    if cand_indices.stride(-1) != 1:
++        cand_indices = cand_indices.contiguous()
++    idx_mapping = idx_mapping.contiguous()
++    pos = pos.contiguous()
++    if logits_cache is None:
++        cache = torch.empty((1, 1, 1), dtype=torch.float32, device=cand_logits.device)
++        col = torch.empty((1,), dtype=torch.int64, device=cand_logits.device)
++        cached_idx = torch.empty(
++            (1, 1, topk), dtype=cand_indices.dtype, device=cand_logits.device
++        )
++        cache_dtype = None
++        col_dtype = None
++        per_token_col = False
++    else:
++        assert logits_cache_col is not None
++        assert cached_indices is not None
++        if logits_cache.stride(-1) != 1:
++            raise ValueError("logits_cache must be contiguous along the vocabulary")
++        cache = logits_cache
++        col = logits_cache_col.contiguous().view(-1)
++        cached_idx = cached_indices
++        cache_dtype = cache.dtype
++        col_dtype = col.dtype
++        per_token_col = col.numel() > 1
++
++    key = topk_gumbel_sample_key(
++        cand_logits.dtype,
++        idx_mapping.dtype,
++        apply_temperature,
++        is_drafting,
++        cache_dtype,
++        col_dtype,
++        per_token_col,
++        topk,
++        pos.dtype,
++        cand_indices.dtype,
++    )
++    _kernel(topk_gumbel_sample_kernel, *key)(
++        sampled,
++        cand_logits,
++        cand_indices,
++        idx_mapping,
++        seeds,
++        pos,
++        temperature,
++        cache,
++        col,
++        cached_idx,
++        int(vocab_size),
++    )
++    return sampled
++
++
++def topk_drafting_calls(
++    logits_dtype: torch.dtype,
++    cache_dtype: torch.dtype | None,
++    col_dtype: torch.dtype | None,
++    per_token_col: bool,
++    topk: int,
++    cand_idx_dtype: torch.dtype = torch.int64,
++) -> list:
++    """Sparse top-k draft sampling calls (greedy and Gumbel-max)."""
++    calls = [
++        _call(
++            topk_greedy_sample_kernel,
++            *topk_greedy_sample_key(logits_dtype, cand_idx_dtype, topk),
++        ),
++        _call(
++            topk_gumbel_sample_kernel,
++            *topk_gumbel_sample_key(
++                logits_dtype,
++                RUNNER_IDX_DTYPE,
++                True,
++                True,
++                cache_dtype,
++                col_dtype,
++                per_token_col,
++                topk,
++                torch.int64,
++                cand_idx_dtype,
++            ),
++        ),
++    ]
++    return _unique(calls)
++
++
+ def _unique(calls: list) -> list:
+     """``calls`` without repeats (a call's keyword arguments are unhashable)."""
+     seen: set = set()
+diff --git a/vllm/v1/worker/gpu/sample/tilelang_thinking.py b/vllm/v1/worker/gpu/sample/tilelang_thinking.py
+index 106b079..7b7adab 100644
+--- a/vllm/v1/worker/gpu/sample/tilelang_thinking.py
++++ b/vllm/v1/worker/gpu/sample/tilelang_thinking.py
+@@ -190,15 +190,16 @@ def thinking_kernel(
+     ):
+         with T.Kernel(rows, threads=1) as row:
+             req = mapping[row]
++            safe_req = T.max(T.cast(req, "int64"), T.int64(0))
+             first = T.cast(row, "int64") - positions[row]
+-            total = lengths[req]
++            total = T.if_then_else(req >= 0, lengths[safe_req], 0)
+             length = total + positions[row]
+             last_start = T.alloc_local((1,), "int32")
+             last_end = T.alloc_local((1,), "int32")
+             prefix = T.alloc_local((1,), "int32")
+             actual = T.alloc_local((1,), "int32")
+             match = T.alloc_local((1,), "bool")
+-            if budgets[req] >= 0:
++            if (req >= 0) & (budgets[safe_req] >= 0):
+                 last_start[0] = cached_start[req]
+                 last_end[0] = cached_end[req]
+                 for pos in T.serial(
+diff --git a/vllm/v1/worker/gpu/spec_decode/dspark/speculator.py b/vllm/v1/worker/gpu/spec_decode/dspark/speculator.py
+index 710d549..066bf6e 100644
+--- a/vllm/v1/worker/gpu/spec_decode/dspark/speculator.py
++++ b/vllm/v1/worker/gpu/spec_decode/dspark/speculator.py
+@@ -124,6 +124,16 @@ class DSparkSpeculator(DFlashSpeculator):
+         self._draft_topk: int | None = getattr(
+             self.draft_model_config.hf_config, "dspark_draft_topk", None
+         )
++        self._cached_topk_indices: torch.Tensor | None = None
++        if self._draft_topk is not None and self.draft_logits is not None:
++            self.draft_logits.fill_(float("-inf"))
++            self._cached_topk_indices = torch.zeros(
++                self.max_num_reqs,
++                self.num_speculative_steps,
++                self._draft_topk,
++                dtype=torch.int64,
++                device=device,
++            )
+ 
+         self.use_confidence_head: bool = False
+         self._top2_branch_margin: float = float(
+@@ -269,7 +279,7 @@ class DSparkSpeculator(DFlashSpeculator):
+     def tp_invariant_confidence(self) -> bool:
+         """Whether every TP rank computes bitwise-identical draft confidences
+         when TP reductions are rank-ordered."""
+-        if not self.use_confidence_head:
++        if not getattr(self, "use_confidence_head", False):
+             return False
+         head = getattr(getattr(self.model, "model", None), "confidence_head", None)
+         return bool(getattr(head, "tp_invariant", False))
+@@ -281,7 +291,7 @@ class DSparkSpeculator(DFlashSpeculator):
+         sample_pos: torch.Tensor,
+         step: int,
+     ) -> torch.Tensor:
+-        if not self.use_confidence_head:
++        if not getattr(self, "use_confidence_head", False):
+             self._maybe_predict_acceptance(logits, idx_map, self._step_cols[step])
+         if self.draft_logits is None:
+             draft_ids = logits.argmax(dim=-1)
+@@ -341,6 +351,37 @@ class DSparkSpeculator(DFlashSpeculator):
+         super().register_warmups(block_table_layouts)
+         local_head = getattr(self.model, "supports_local_draft_argmax", lambda: False)()
+         if self._draft_topk is not None:
++            if not getattr(self, "sample_from_anchor", False):
++                tilelang_inputs.declare(
++                    lambda: tilelang_inputs.gather_hidden_rows_calls(
++                        self.hidden_states.dtype, self.hidden_states.shape[1]
++                    )
++                )
++            if self._can_sample_sparse_topk():
++                from vllm.v1.worker.gpu.sample import tilelang_sampling
++
++                processor = getattr(self.model, "logits_processor", None)
++                logits_dtype = (
++                    processor.head_dtype
++                    if processor is not None and hasattr(processor, "head_dtype")
++                    else self.dtype
++                )
++                cache_dtype = (
++                    self.draft_logits.dtype if self.draft_logits is not None else None
++                )
++                col_dtype = (
++                    self._step_cols.dtype if self.draft_logits is not None else None
++                )
++                topk = int(self._draft_topk)
++                tilelang_sampling.declare(
++                    lambda: tilelang_sampling.topk_drafting_calls(
++                        logits_dtype,
++                        cache_dtype,
++                        col_dtype,
++                        False,
++                        topk,
++                    )
++                )
+             return
+         if not self._vocab_parallel_greedy(local_head):
+             processor = getattr(self.model, "logits_processor", None)
+@@ -594,13 +635,42 @@ class DSparkSpeculator(DFlashSpeculator):
+                 self.sample_idx_mapping[:num_sample],
+             )
+ 
++    def _can_sample_sparse_topk(self) -> bool:
++        """Whether top-k sequential Markov sampling can operate directly on the
++        compact ``[num_reqs, k]`` candidate tensors without filling or
++        scattering into the full-vocabulary ``[num_reqs, n_spec, vocab_size]``
++        buffer."""
++        w2 = getattr(
++            getattr(getattr(self.model, "model", None), "markov_head", None),
++            "markov_w2",
++            None,
++        )
++        uses_fused_nvfp4_scatter = bool(
++            w2 is not None
++            and getattr(w2, "_retain_weight_for_gather", False)
++            and getattr(w2, "is_w4a16_nvfp4", False)
++        )
++        return (
++            hasattr(self.model, "apply_markov_bias_topk")
++            and not uses_fused_nvfp4_scatter
++            and not _needs_logits_for_acceptance(self)
++            and getattr(self, "_d2t_scatter_index", None) is None
++            and getattr(self, "draft_watermarker", None) is None
++            and not (
++                self.draft_logits is not None
++                and getattr(self, "use_fp64_gumbel", False)
++            )
++        )
++
+     def _sample_sequential_topk(self, num_reqs: int, head_hidden: torch.Tensor) -> None:
+         """Apply the sequential Markov head only to top-k base-logit candidates.
+ 
+-        Candidate selection is done once for all draft positions. At each
+-        sequential step, the selected logits are corrected in place and every
+-        other entry is set to ``-inf``. The normal dense sampling and rejection
+-        paths then consume that truncated distribution unchanged.
++        Candidate selection is done once for all draft positions. When
++        ``_can_sample_sparse_topk`` holds, each sequential step adds the Markov
++        bias on the compact ``[num_reqs, k]`` slice and samples directly over
++        the ``k`` candidates (keying Gumbel draws and tie-breaking by
++        ``draft_indices``), avoiding the full-vocabulary ``-inf`` fill,
++        per-step scatter, and full-vocabulary sampler scan.
+         """
+         assert self._draft_topk is not None
+         n_spec = self.num_speculative_steps
+@@ -613,32 +683,88 @@ class DSparkSpeculator(DFlashSpeculator):
+             )
+         )
+         base_logits = self.model.compute_draft_logits(sample_hidden)
+-        base_logits = base_logits.view(num_reqs, n_spec, -1)
++        vocab_size = base_logits.shape[-1]
++        base_logits = base_logits.view(num_reqs, n_spec, vocab_size)
+         base_values, draft_indices = base_logits.topk(self._draft_topk, dim=-1)
+-        # Reuse the dense backbone output as the normal sampler's input. Fill
+-        # once for all positions, then scatter only the corrected candidates
+-        # during the sequential loop.
+-        base_logits.fill_(float("-inf"))
+         idx_map = self.sample_idx_mapping[:num_sample].view(num_reqs, n_spec)
+         sample_pos = self.sample_pos[:num_sample].view(num_reqs, n_spec)
+         confidence_markov_embeds = []
+         prev = self.input_buffers.input_ids[self._anchor_idx[:num_reqs]]
+ 
+-        for i in range(n_spec):
+-            markov_embed = self.model.markov_embed(prev)
+-            if self.use_confidence_head:
+-                confidence_markov_embeds.append(markov_embed)
+-            logits_i = self.model.apply_markov_bias_gathered(
+-                markov_embed,
+-                base_logits[:, i],
+-                base_values[:, i],
+-                draft_indices[:, i],
+-            )
+-            draft_sampled_i = self._sample_logits(
+-                logits_i, idx_map[:, i], sample_pos[:, i], i
+-            )
+-            self.draft_tokens[:num_reqs, i] = draft_sampled_i
+-            prev = draft_sampled_i
++        if self._can_sample_sparse_topk():
++            from vllm.v1.worker.gpu.sample import tilelang_sampling
++
++            if self.draft_logits is not None:
++                cached_idx = getattr(self, "_cached_topk_indices", None)
++                expected_shape = (
++                    self.draft_logits.shape[0],
++                    self.draft_logits.shape[1],
++                    int(self._draft_topk),
++                )
++                if cached_idx is None or cached_idx.shape != expected_shape:
++                    self.draft_logits.fill_(float("-inf"))
++                    cached_idx = torch.zeros(
++                        expected_shape,
++                        dtype=torch.int64,
++                        device=self.draft_logits.device,
++                    )
++                    self._cached_topk_indices = cached_idx
++            else:
++                cached_idx = None
++
++            for i in range(n_spec):
++                markov_embed = self.model.markov_embed(prev)
++                if self.use_confidence_head:
++                    confidence_markov_embeds.append(markov_embed)
++                cand_logits_i = self.model.apply_markov_bias_topk(
++                    markov_embed,
++                    base_values[:, i],
++                    draft_indices[:, i],
++                )
++                if self.draft_logits is None:
++                    draft_ids = tilelang_sampling.topk_greedy_sample(
++                        cand_logits_i,
++                        draft_indices[:, i],
++                        vocab_size,
++                    )
++                    draft_sampled_i = self.model.map_draft_to_target(draft_ids)
++                else:
++                    draft_sampled_i = tilelang_sampling.topk_gumbel_sample(
++                        cand_logits_i,
++                        draft_indices[:, i],
++                        idx_map[:, i],
++                        self.temperature,
++                        self.seeds,
++                        sample_pos[:, i] - 1,
++                        True,
++                        vocab_size,
++                        is_drafting=True,
++                        logits_cache=self.draft_logits,
++                        logits_cache_col=self._step_cols[i],
++                        cached_indices=cached_idx,
++                    )
++                self.draft_tokens[:num_reqs, i] = draft_sampled_i
++                prev = draft_sampled_i
++        else:
++            # Reuse the dense backbone output as the normal sampler's input. Fill
++            # once for all positions, then scatter only the corrected candidates
++            # during the sequential loop.
++            base_logits.fill_(float("-inf"))
++            for i in range(n_spec):
++                markov_embed = self.model.markov_embed(prev)
++                if self.use_confidence_head:
++                    confidence_markov_embeds.append(markov_embed)
++                logits_i = self.model.apply_markov_bias_gathered(
++                    markov_embed,
++                    base_logits[:, i],
++                    base_values[:, i],
++                    draft_indices[:, i],
++                )
++                draft_sampled_i = self._sample_logits(
++                    logits_i, idx_map[:, i], sample_pos[:, i], i
++                )
++                self.draft_tokens[:num_reqs, i] = draft_sampled_i
++                prev = draft_sampled_i
+ 
+         if self.use_confidence_head:
+             self.model.compute_confidence(
+diff --git a/vllm/v1/worker/gpu/spec_decode/rejection_sampler.py b/vllm/v1/worker/gpu/spec_decode/rejection_sampler.py
+index 463022c..553cbd9 100644
+--- a/vllm/v1/worker/gpu/spec_decode/rejection_sampler.py
++++ b/vllm/v1/worker/gpu/spec_decode/rejection_sampler.py
+@@ -167,6 +167,8 @@ class RejectionSampler:
+                 dead_rows=dead_rows,
+             )
+         tilelang_inputs.declare(tilelang_inputs.flatten_sampled_calls)
++        if dead_rows and self.use_block_verification:
++            tilelang_inputs.declare(tilelang_inputs.mask_dead_rows_calls)
+         use_processed = self.sampler.logprobs_mode in PROCESSED_LOGPROBS_MODES
+         register_topk_scores_warmup(
+             logits=processed_logits if use_processed else logits,
+@@ -266,6 +268,12 @@ class RejectionSampler:
+             and bool(np.any(self.sampler.needs_logits_processing[idx_mapping_np]))
+             and not self.sampler.any_non_temperature_logits_processing(idx_mapping_np)
+         )
++        live_row_cut = (
++            dead_row_cut
++            if self.use_block_verification
++            and self.sampler.logprobs_mode not in PROCESSED_LOGPROBS_MODES
++            else None
++        )
+         processed_logits = self.sampler.apply_sampling_params(
+             logits,
+             expanded_idx_mapping,
+@@ -275,6 +283,11 @@ class RejectionSampler:
+             draft_sampled,
+             expanded_local_pos,
+             skip_temperature=in_kernel_temperature,
++            **(
++                {"dead_row_cut": live_row_cut, "cu_num_logits": cu_num_logits}
++                if live_row_cut is not None
++                else {}
++            ),
+         )
+         cut = None
+         if sink is not None:
+diff --git a/vllm/v1/worker/gpu/tilelang_inputs.py b/vllm/v1/worker/gpu/tilelang_inputs.py
+index 436c94e..4d20a0f 100644
+--- a/vllm/v1/worker/gpu/tilelang_inputs.py
++++ b/vllm/v1/worker/gpu/tilelang_inputs.py
+@@ -814,6 +814,107 @@ def flatten_sampled_calls() -> list:
+     return [_call(flatten_sampled_kernel)]
+ 
+ 
++@tilelang.jit(pass_configs=_PASS)
++def mask_dead_rows_kernel(idx_dtype: str):
++    """Mask expanded_idx_mapping to -1 on dead verification rows
++    (row - cu_num_logits[r] > dead_row_cut[r]) and gather each row's
++    top_k and top_p with neutral values (vocab_size and 1.0)
++    on dead rows."""
++    num_logits, num_reqs, cu_len, states = T.dynamic(
++        "num_logits, num_reqs, cu_len, states"
++    )
++
++    @T.prim_func
++    def mask_dead_rows(
++        out_idx: T.Tensor((num_logits,), idx_dtype),
++        out_k: T.Tensor((num_logits,), T.int32),
++        out_p: T.Tensor((num_logits,), T.float32),
++        expanded_idx_mapping: T.Tensor((num_logits,), idx_dtype),
++        cu_num_logits: T.Tensor((cu_len,), T.int32),
++        dead_row_cut: T.Tensor((num_reqs,), T.int32),
++        top_k_state: T.Tensor((states,), T.int32),
++        top_p_state: T.Tensor((states,), T.float32),
++        vocab_size: T.int32,
++    ):
++        with T.Kernel(
++            T.ceildiv(num_logits, _FLATTEN_THREADS), threads=_FLATTEN_THREADS
++        ) as b:
++            row = b * _FLATTEN_THREADS + T.get_thread_binding()
++            req = T.alloc_var(T.int32, init=-1)
++            for r in T.serial(num_reqs):
++                if (cu_num_logits[r] <= row) & (row < cu_num_logits[r + 1]):
++                    req = r
++            if row < num_logits:
++                slot = T.alloc_var(
++                    T.int64, init=T.cast(expanded_idx_mapping[row], T.int64)
++                )
++                live = (
++                    (req >= 0)
++                    & (slot >= T.int64(0))
++                    & (
++                        row - cu_num_logits[T.max(req, 0)]
++                        <= dead_row_cut[T.max(req, 0)]
++                    )
++                )
++                safe_slot = T.max(slot, T.int64(0))
++                out_idx[row] = T.if_then_else(
++                    live, expanded_idx_mapping[row], T.cast(-1, idx_dtype)
++                )
++                out_k[row] = T.if_then_else(
++                    live, top_k_state[safe_slot], vocab_size
++                )
++                out_p[row] = T.if_then_else(
++                    live, top_p_state[safe_slot], T.float32(1)
++                )
++
++    return mask_dead_rows
++
++
++def mask_dead_rows_key(idx_dtype: torch.dtype) -> tuple:
++    return (_DTYPES[idx_dtype],)
++
++
++def mask_dead_rows(
++    expanded_idx_mapping: torch.Tensor,
++    cu_num_logits: torch.Tensor,
++    dead_row_cut: torch.Tensor,
++    top_k_state: torch.Tensor,
++    top_p_state: torch.Tensor,
++    vocab_size: int,
++) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
++    """Return (live_idx_mapping, row_top_k, row_top_p) where rows past each
++    request's dead_row_cut are masked to -1, vocab_size, and 1.0."""
++    num_logits = expanded_idx_mapping.shape[0]
++    device = expanded_idx_mapping.device
++    out_idx = torch.empty_like(expanded_idx_mapping)
++    out_k = torch.empty(num_logits, dtype=torch.int32, device=device)
++    out_p = torch.empty(num_logits, dtype=torch.float32, device=device)
++    if num_logits:
++        num_reqs = dead_row_cut.shape[0]
++        _kernel(
++            mask_dead_rows_kernel,
++            *mask_dead_rows_key(expanded_idx_mapping.dtype),
++        )(
++            out_idx,
++            out_k,
++            out_p,
++            expanded_idx_mapping.contiguous(),
++            _as(cu_num_logits[: num_reqs + 1], torch.int32),
++            _as(dead_row_cut, torch.int32),
++            top_k_state,
++            top_p_state,
++            int(vocab_size),
++        )
++    return out_idx, out_k, out_p
++
++
++def mask_dead_rows_calls() -> list:
++    return [
++        _call(mask_dead_rows_kernel, *mask_dead_rows_key(dtype))
++        for dtype in (torch.int32, torch.int64)
++    ]
++
++
+ # --- Per-request row scatters ---------------------------------------------------
+ 
+ _SCATTER_THREADS = 128
+-- 
+2.43.0
+
