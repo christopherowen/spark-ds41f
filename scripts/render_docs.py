@@ -19,13 +19,15 @@ and renders:
 2. The GitHub Pages site at ``docs/index.html``: the page in ``site/index.html``
    with the manifest data embedded
    (plus ``docs/.nojekyll``, and ``<site-dir>/index.html`` + ``<site-dir>/data.json``
-   + the ``docs/logo.png`` favicon when ``--site-dir`` is given).
+   + the ``docs/logo.png`` favicon and the ``docs/og.png`` link-preview image when
+   ``--site-dir`` is given; ``scripts/render-og`` renders that image from the page).
 """
 
 from __future__ import annotations
 
 import argparse
 import difflib
+import hashlib
 import html
 import json
 import math
@@ -45,6 +47,7 @@ from servebench import stats as sb_stats  # noqa: E402
 
 SITE_TEMPLATE = ROOT / "site/index.html"
 SITE_DATA_MARKER = "__MANIFEST_DATA__"
+SITE_VERSION_MARKER = "__SITE_VERSION__"
 
 MARKER_RE = re.compile(
     r"(<!-- BEGIN GENERATED: ([a-z0-9_-]+) -->)\n.*?(<!-- END GENERATED: \2 -->)",
@@ -852,7 +855,10 @@ def render_site_html(data: dict[str, Any]) -> str:
     template = SITE_TEMPLATE.read_text()
     if template.count(SITE_DATA_MARKER) != 1:
         raise ValueError(f"{SITE_TEMPLATE.relative_to(ROOT)} must contain {SITE_DATA_MARKER} exactly once")
-    return template.replace(SITE_DATA_MARKER, embedded_json)
+    # The link-preview image's URL carries a digest of the page, so a crawler that cached the
+    # previous image fetches the new one whenever the page or its numbers change.
+    version = hashlib.sha256((template + embedded_json).encode()).hexdigest()[:10]
+    return template.replace(SITE_VERSION_MARKER, version).replace(SITE_DATA_MARKER, embedded_json)
 
 
 def render_targets(data: dict[str, Any]) -> dict[Path, str]:
@@ -949,6 +955,8 @@ def main(argv: list[str] | None = None) -> int:
         (out_dir / "index.html").write_text(targets[ROOT / "docs/index.html"])
         (out_dir / ".nojekyll").write_text("")
         shutil.copyfile(ROOT / "docs/logo.png", out_dir / "logo.png")
+        # The committed link-preview image; the Pages workflow replaces it with a fresh render.
+        shutil.copyfile(ROOT / "docs/og.png", out_dir / "og.png")
         payload = {
             k: v for k, v in data.items() if k != "suites_by_path"
         }

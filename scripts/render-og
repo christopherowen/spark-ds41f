@@ -1,0 +1,66 @@
+#!/usr/bin/env bash
+# Render the site's link-preview image: a 2400x1260 photograph of the page's card view.
+#
+# Usage: scripts/render-og <index.html> <og.png>
+#
+# The page (site/index.html, rendered by scripts/render_docs.py) shows only its 1200x630
+# preview card when opened with ?card. This opens it in a headless Chrome and saves the
+# screenshot, so the image carries the same manifest numbers as the page. The output is
+# replaced only when the render succeeds; on any failure the existing file is kept.
+#
+# CHROME names the browser binary; otherwise the first of google-chrome, chromium,
+# chromium-browser and chrome on PATH is used.
+set -euo pipefail
+
+if [ "$#" -ne 2 ]; then
+  echo "usage: $0 <index.html> <og.png>" >&2
+  exit 2
+fi
+page=$(cd "$(dirname "$1")" && pwd)/$(basename "$1")
+out=$2
+
+chrome=${CHROME:-}
+if [ -z "$chrome" ]; then
+  for name in google-chrome chromium chromium-browser chrome; do
+    if command -v "$name" >/dev/null 2>&1; then
+      chrome=$name
+      break
+    fi
+  done
+fi
+if [ -z "$chrome" ]; then
+  echo "render-og: no Chrome found; set CHROME to the browser binary" >&2
+  exit 1
+fi
+
+work=$(mktemp -d)
+trap 'rm -rf "$work" 2>/dev/null || true' EXIT
+
+# The virtual time budget lets the web fonts and the logo finish loading before the capture.
+# A browser that has not exited after 90 seconds is killed, so a deploy never waits on it.
+"$chrome" --headless --no-sandbox --disable-gpu --hide-scrollbars \
+  --user-data-dir="$work/profile" \
+  --window-size=1200,630 --force-device-scale-factor=2 \
+  --virtual-time-budget=8000 \
+  --screenshot="$work/og.png" "file://$page?card" >"$work/log" 2>&1 &
+pid=$!
+( sleep 90; kill -9 "$pid" ) >/dev/null 2>&1 &
+watchdog=$!
+status=0
+wait "$pid" || status=$?
+kill "$watchdog" 2>/dev/null || true
+wait "$watchdog" 2>/dev/null || true
+if [ "$status" -ne 0 ] || [ ! -s "$work/og.png" ]; then
+  cat "$work/log" >&2
+  echo "render-og: the browser did not produce a capture (status $status)" >&2
+  exit 1
+fi
+
+# A blank or truncated capture is far smaller than a real card.
+size=$(wc -c <"$work/og.png" | tr -d ' ')
+if [ "$size" -lt 40000 ]; then
+  echo "render-og: the capture is only $size bytes; keeping the existing image" >&2
+  exit 1
+fi
+mv "$work/og.png" "$out"
+echo "render-og: wrote $out ($size bytes)"
