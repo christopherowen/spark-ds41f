@@ -1,0 +1,231 @@
+{
+ "task": "Attribute candidate-54's tp3-switched engine-grid regression (2.87% slower, all at small batches) to the patches first measured at TP3 in candidate-54, and prepare its testbed confirmation.",
+ "candidate": {
+  "name": "candidate-54",
+  "patch_count": 671,
+  "patch_head": "4e8133ff10a125b90753c2727f162e29fe37f30c",
+  "tree": "5f021d9a7f01c03e2389dd3d8021759cfa19ea34",
+  "image": "spark-ds41f:candidate-54 sha256:e1de71be..."
+ },
+ "status": "partial: sp8 GPU measurements NOT run. The sp8 GPU lock has been self-deadlocked since 03:10:50Z by candidates 56-57's build script (see blocker). Receipts and code narrow the suspects; the sp8 harness, the testbed overlays, profiles and the 6-boot spec are ready.",
+ "blocker": {
+  "what": "~/spark-lab/agents/candidates-55-57/build-56-57.sh line 15 runs 'flock /tmp/spark-lab-gpu.lock python3 scripts/lab.py kernel-local ...', and kernel-local takes the same lock itself (spark_ds41f/lab.py:2391-2392: open() then fcntl.flock LOCK_EX on a second open file description). The outer flock (pid 3957638) holds the lock; its child lab.py (pid 3957639) waits on it forever (wchan locks_lock_inode_wait; /proc/locks). Candidate-56's release tests have not started (build log ends at '03:10:50Z KERNEL 56'); KERNEL 57 would deadlock the same way. Every other flock waiter on sp8 waits behind it.",
+  "evidence": "raw/gpu-lock-deadlock.txt",
+  "what_i_did": "Did not touch the deadlocked job. Queued one c54 boot at 04:16:52Z under the lock; it never started; I cancelled my own waiter at 04:25:25Z so nothing of mine runs unattended.",
+  "unblock": "Whoever owns candidates 55-57 kills the outer flock 3957638 (its child then takes the lock and runs candidate-56's tests) or restarts the script without the outer flock around kernel-local. Then start W/tools/queue.sh (commands.txt section 5).",
+  "also_seen": "While the lock is deadlocked, another agent's spark-ds41f:1107 containers (experiments/2026-11-10-shm-broadcast-busy-loop, one started with --gpus all at about 04:05Z) ran on sp8 outside the lock."
+ },
+ "receipts_analysis": {
+  "where": "The whole loss is in the target forward (engine-grid forward_ms), not the drafter or the host: at 1 request forward_ms is +0.95..+1.20 ms against candidate-50 at every context (4K..1016K), step_ms moves by the same amount, and drafter_ms is unchanged at 1-2 requests and 0.14-0.19 ms faster at 4-8 requests (#998 r1's draft-MoE gain, as its rework measured). The forward loss shrinks with rows (2-6 rows ~+1.0-1.2 ms, 8 rows +0.8, 12 rows +0.46, 16 rows +0.30, 24 rows +0.10..+0.20, 48 rows -0.12): a fixed per-step cost that larger batches hide.",
+  "mirror": "candidate-51's four patches (#961, #963, #987, #1001) made the same tp4-ring cells faster by almost exactly what TP3 lost: 1x3 -1.24 ms (TP3 +1.20), 1x2 -1.00 (+0.95), 1x6 -0.57 (+0.97), 4x8 -0.49 (+0.80), 2x12 -0.32 (+0.46), 8x16 -0.19 (+0.30), 4x24/8x24 ~0 (~+0.1). candidate-52's patches did nothing at tp4-switched, and candidate-54 at TP4 equals candidate-51 (the round's other patches and #1009 r1 net ~0 there). candidate-53 (round 2's TP3 PRs without #960, #998) is level with candidate-50 at TP3.",
+  "per_shape_ms": {
+   "decode 1x2 rows @4K": {
+    "tp3_forward_c50_ms": 14.53,
+    "tp3_forward_c54_ms": 15.48,
+    "tp3_forward_delta_ms": 0.95,
+    "tp3_drafter_delta_ms": -0.01,
+    "tp3_step_delta_ms": 0.95,
+    "tp4ring_forward_delta_c51_ms": -1.0,
+    "tp4ring_forward_delta_c54_ms": -1.09
+   },
+   "decode 4x8 rows @4K": {
+    "tp3_forward_c50_ms": 15.49,
+    "tp3_forward_c54_ms": 16.28,
+    "tp3_forward_delta_ms": 0.8,
+    "tp3_drafter_delta_ms": -0.19,
+    "tp3_step_delta_ms": 0.62,
+    "tp4ring_forward_delta_c51_ms": -0.49,
+    "tp4ring_forward_delta_c54_ms": -0.46
+   },
+   "decode 8x16 rows @4K": {
+    "tp3_forward_c50_ms": 16.6,
+    "tp3_forward_c54_ms": 16.9,
+    "tp3_forward_delta_ms": 0.3,
+    "tp3_drafter_delta_ms": -0.19,
+    "tp3_step_delta_ms": 0.13,
+    "tp4ring_forward_delta_c51_ms": -0.19,
+    "tp4ring_forward_delta_c54_ms": -0.15
+   },
+   "decode 1x3 rows @4K": {
+    "tp3_forward_c50_ms": 14.71,
+    "tp3_forward_c54_ms": 15.91,
+    "tp3_forward_delta_ms": 1.2,
+    "tp3_drafter_delta_ms": 0.02,
+    "tp3_step_delta_ms": 1.23,
+    "tp4ring_forward_delta_c51_ms": -1.24,
+    "tp4ring_forward_delta_c54_ms": -1.17
+   },
+   "decode 4x12 rows @4K": {
+    "tp3_forward_c50_ms": 15.99,
+    "tp3_forward_c54_ms": 16.45,
+    "tp3_forward_delta_ms": 0.46,
+    "tp3_drafter_delta_ms": -0.15,
+    "tp3_step_delta_ms": 0.31,
+    "tp4ring_forward_delta_c51_ms": -0.16,
+    "tp4ring_forward_delta_c54_ms": -0.2
+   },
+   "decode 8x24 rows @4K": {
+    "tp3_forward_c50_ms": 18.11,
+    "tp3_forward_c54_ms": 18.25,
+    "tp3_forward_delta_ms": 0.14,
+    "tp3_drafter_delta_ms": -0.14,
+    "tp3_step_delta_ms": 0.02,
+    "tp4ring_forward_delta_c51_ms": 0.11,
+    "tp4ring_forward_delta_c54_ms": 0.19
+   },
+   "decode 1x6 rows @4K": {
+    "tp3_forward_c50_ms": 15.32,
+    "tp3_forward_c54_ms": 16.29,
+    "tp3_forward_delta_ms": 0.97,
+    "tp3_drafter_delta_ms": 0.0,
+    "tp3_step_delta_ms": 0.98,
+    "tp4ring_forward_delta_c51_ms": -0.57,
+    "tp4ring_forward_delta_c54_ms": -0.56
+   },
+   "decode 2x12 rows @4K": {
+    "tp3_forward_c50_ms": 16.11,
+    "tp3_forward_c54_ms": 16.57,
+    "tp3_forward_delta_ms": 0.46,
+    "tp3_drafter_delta_ms": -0.01,
+    "tp3_step_delta_ms": 0.45,
+    "tp4ring_forward_delta_c51_ms": -0.32,
+    "tp4ring_forward_delta_c54_ms": -0.22
+   },
+   "decode 4x24 rows @4K": {
+    "tp3_forward_c50_ms": 18.22,
+    "tp3_forward_c54_ms": 18.31,
+    "tp3_forward_delta_ms": 0.1,
+    "tp3_drafter_delta_ms": -0.14,
+    "tp3_step_delta_ms": -0.03,
+    "tp4ring_forward_delta_c51_ms": -0.06,
+    "tp4ring_forward_delta_c54_ms": -0.03
+   },
+   "decode 8x48 rows @4K": {
+    "tp3_forward_c50_ms": 23.69,
+    "tp3_forward_c54_ms": 23.56,
+    "tp3_forward_delta_ms": -0.12,
+    "tp3_drafter_delta_ms": -0.15,
+    "tp3_step_delta_ms": -0.26,
+    "tp4ring_forward_delta_c51_ms": -0.5,
+    "tp4ring_forward_delta_c54_ms": -0.61
+   },
+   "decode 1x3 rows @64K": {
+    "tp3_forward_c50_ms": 14.96,
+    "tp3_forward_c54_ms": 16.06,
+    "tp3_forward_delta_ms": 1.11,
+    "tp3_drafter_delta_ms": -0.01,
+    "tp3_step_delta_ms": 1.12,
+    "tp4ring_forward_delta_c51_ms": -1.03,
+    "tp4ring_forward_delta_c54_ms": -1.01
+   },
+   "decode 8x24 rows @64K": {
+    "tp3_forward_c50_ms": 18.05,
+    "tp3_forward_c54_ms": 18.25,
+    "tp3_forward_delta_ms": 0.2,
+    "tp3_drafter_delta_ms": -0.15,
+    "tp3_step_delta_ms": 0.06,
+    "tp4ring_forward_delta_c51_ms": 0.03,
+    "tp4ring_forward_delta_c54_ms": 0.07
+   },
+   "decode 1x3 rows @256K": {
+    "tp3_forward_c50_ms": 14.89,
+    "tp3_forward_c54_ms": 16.09,
+    "tp3_forward_delta_ms": 1.2,
+    "tp3_drafter_delta_ms": 0.0,
+    "tp3_step_delta_ms": 1.21,
+    "tp4ring_forward_delta_c51_ms": -0.99,
+    "tp4ring_forward_delta_c54_ms": -0.97
+   },
+   "decode 8x24 rows @256K": {
+    "tp3_forward_c50_ms": 18.11,
+    "tp3_forward_c54_ms": 18.26,
+    "tp3_forward_delta_ms": 0.15,
+    "tp3_drafter_delta_ms": -0.17,
+    "tp3_step_delta_ms": -0.01,
+    "tp4ring_forward_delta_c51_ms": 0.11,
+    "tp4ring_forward_delta_c54_ms": 0.12
+   },
+   "decode 1x3 rows @1016K": {
+    "tp3_forward_c50_ms": 14.81,
+    "tp3_forward_c54_ms": 15.91,
+    "tp3_forward_delta_ms": 1.1,
+    "tp3_drafter_delta_ms": -0.01,
+    "tp3_step_delta_ms": 1.1,
+    "tp4ring_forward_delta_c51_ms": -1.08,
+    "tp4ring_forward_delta_c54_ms": -1.1
+   }
+  },
+  "files": "raw/grid-split-from-receipts.txt (all columns), raw/gridcmp.py"
+ },
+ "suspects": {
+  "excluded_from_the_grid_by_code": {
+   "#987 (0783)": "adds a 128-row WO-B tile (WIDE_DECODE 128 and DECODE_FP8_CONFIGS[...][128]) used only at 97..128 rows; TP3 decode tops out at 8 x 6 = 48 rows. Inert in every TP3 grid cell.",
+   "#1001 r1 (0784)": "changes TILE_CONFIGS[128] and SCREEN_TILE_CONFIGS[128], the 65..128-row vocab tiles. Inert at <= 48 rows.",
+   "#968 (0786)": "scheduler only (scheduler.py); the grid's dummy steps are not scheduled.",
+   "#969 (0787)": "the Engram disk-row reader (_reader.c, _row_plan.h, compiled at run time by _native.py); a dummy step stages no rows (engram.py stage_no_rows: 'the gather writes zeros and waits for nothing'), so the reader does not run in the grid."
+  },
+  "ranking": [
+   {
+    "rank": 1,
+    "pr": 961,
+    "patch": "0781",
+    "likelihood": "high",
+    "why": "The only suspect whose cost scales with the per-rank shard and was never judged at TP3 (candidate-51's own mark: 'TP3's grid-4 case ... recorded ... but not judged'). Its single-thread issuer walks each window in 64 KiB chunks with a 200 ns %globaltimer pause between chunks, so a window's side-stream time is at least (chunks-2) x 200 ns regardless of how fast DRAM could fill it. TP3's windows are all at their budget caps (WO 20.0, FFN 16.0, NEXT 20.0 MB = 56.0 MB a layer, about 857 chunks) against TP4's 18.9/14.8/14.8 MB (48.5 MB, about 741 chunks): +16% bytes and pace floor, about 170 vs 148 us a layer. Windows queue on one side stream (a window issued while the previous one still fills starts when it ends), and the side stream rejoins the main stream only once, at model end (l2_prefetch.join in DeepseekV41Model.forward), so any lag accumulated over 40 layers lands on forward_ms, and a late fill also stops being an L2 hit and competes with the consumer's own DRAM read. That fits a fixed cost at 1 request that longer layers (more rows) absorb, and the exact mirror of the TP4 gain the same patch brought. Not yet measured: the sp8 A/B (c54 vs no961) decides it.",
+    "evidence": "raw/boot-logs/ (plan sizes at TP3 and TP4), vllm/models/glm5next/nvidia/l2_prefetch.py L2Prefetcher.issue/join, vllm/models/deepseek_v4_1/l2_prefetch.py"
+   },
+   {
+    "rank": 2,
+    "pr": 998,
+    "patch": "0791 (r1)",
+    "likelihood": "low-medium",
+    "why": "TP3-only by construction: it acts only with the display carve-out, which only TP3 turns on (SPARK_DS41F_DISPLAY_CARVEOUT_WEIGHTS=1). But on the target side it only compacts embed_tokens into a new carve-out buffer (the head keeps its buffer and screening table); its other moves (markov_w1, 960 MiB of draft-expert slabs) are drafter-side, and the drafter got faster at 4-8 requests, as its own mark says. No mechanism for +1 ms of target forward is known."
+   },
+   {
+    "rank": 3,
+    "pr": 960,
+    "patch": "0788 (r1)",
+    "likelihood": "low",
+    "why": "Moves FULL-step attention/CED metadata prep into the captured target graph, so its device work now sits inside the forward_ms window (its own mark: 33-42 us device, less than before). Shape-agnostic, and candidate-54 equals candidate-51 at TP4 with it, so it would need a TP3-only path to explain this."
+   },
+   {
+    "rank": 4,
+    "pr": 963,
+    "patch": "0782 (r1)",
+    "likelihood": "low",
+    "why": "Kernel-level packed-BF16 GEMM and vocab-exception changes; its rework timed TP3 and TP4 cells (decode M up to 128) and found no slower cell."
+   },
+   {
+    "rank": 5,
+    "pr": 1030,
+    "patch": "0785",
+    "likelihood": "low",
+    "why": "One more BF16 rounding in moe_swiglu_cast; its own mark timed TP3's inter=768 and found it not worse; a per-element cost would grow with rows, not shrink."
+   }
+  ],
+  "sp8_numbers": "none yet (blocked). The harness predicts about 12/40 of the screen's loss in its 12-layer stack, ~0.35 ms at 1x3, if the cost is per layer."
+ },
+ "cause": {
+  "found": false,
+  "leading_hypothesis": "#961's paced single-issuer L2 prefetch: at TP3 the capped 20/16/20 MB windows take longer to issue than TP4's, the one prefetch side stream falls behind the main stream at small batches, and the model-end join waits for it.",
+  "how_to_confirm_on_sp8": "W/tools/queue.sh: c54 vs no961 (and noAll, no998, no960, no963-no1030) ABBA, forward_ms per cell. Then the variants in commands.txt section 5: prefetch off in both arms (the delta should vanish), TP4-sized budgets on c54 (VLLM_DS41_L2_PREFETCH_WO_MB=18.9, FFN 14.8, NEXT 14.8: should recover most of it if the window bytes are the cause), all-reduce stand-in 0 vs 30 us, and an Nsight Systems node trace of 1x3 in both arms showing whether the side stream ends after the main stream's last kernel."
+ },
+ "fix_direction": {
+  "if_961": [
+   "First, recipe-only, measurable at once: cap TP3's windows at the bytes TP4 fills, through the existing per-window budgets in tp3-triangle's (so tp3-switched's and tp3-triangle-4k's) environment: VLLM_DS41_L2_PREFETCH_WO_MB / _FFN_MB / _NEXT_MB. It keeps #961's TP4 gain and changes no code.",
+   "Otherwise a narrow code follow-up to #961: make the pace follow the window, not a fixed 200 ns (e.g., a per-plan pace from its bytes, or a pace and issuer count from the environment, set per shape), so a TP3 window ends inside its window; or go back to the grid-2 4 KiB kernel at TP3 only.",
+   "Judge it by the same TP3 grid cells (sp8 harness, then the 6-boot spec) and keep TP4's cells where candidate-54 has them."
+  ],
+  "if_998": "Keep embed_tokens' compaction out (it is the only target-side change), then re-measure; the draft-slab moves can stay if the grid recovers.",
+  "if_none": "If no single arm recovers the loss, the grouped arms (noAll, noC51) in the sp8 queue show whether it is an interaction; re-group the testbed spec accordingly."
+ },
+ "deliverables": {
+  "overlays": "experiments/2026-10-26-spark-ds41f-candidate/candidate-54/no<PR>/overlay/vllm/... for no961, no963, no987, no1001, no1030, no960, no998, noC51 (0781-0784), no963-no1030: each the non-test files that differ when that commit is reverted (git revert, newest first) from a prepared candidate-54 tree (4e8133ff, tree 5f021d9a); every file's blob checked against the reverted tree. Shared files keep the other PRs' changes. All reverts applied cleanly.",
+  "compiled_code": "No suspect changes code built into the image. All are Python/TileLang (JIT at run time), except #969's _reader.c/_row_plan.h, which _native.py compiles at run time keyed by digest (candidate-52's own mark: overlay-representable), and #969 has no overlay here because it cannot act in the grid.",
+  "profiles": "candidate-54/tp3-switched-<arm>.json and tp3-switched-<arm>-dev.json, extending candidate-54/tp3-switched.json and mounting {checkout}/cache plus the overlay, as candidate-53's tp3-switched-no960-no998 does.",
+  "suite": "candidate-54/grid-tp3-suite.json: screen-tp3's grid step alone (replays 100, settle 1, max_requests 8). candidate-48/grid-suite.json has no max_requests, so at TP3 (max_num_seqs 8) its 12- and 16-request shapes cannot run.",
+  "spec": "candidate-54/attribute-tp3-grid-tp3-switched.json: sync, then one measure job of 6 boots, all with startup memory: candidate-54, candidate-54-no961, candidate-54-no998, candidate-54-no960, candidate-54-no963-no1030 (the two kernel-level suspects grouped), candidate-54-again. #987, #1001, #968, #969 are left out: they cannot act in a TP3 grid cell. If the sp8 queue singles out one arm first, the spec can drop the others for a repeat of that arm (no<PR>-again).",
+  "sp8_harness": "raw/harness/: tp3_grid.py (the engine grid's dummy steps through vLLM's own serving code at one TP3 rank's shapes, built on experiments/2026-10-31-iket-full-43l-and-runtime-opt/harness/iket_step.py), run2.sh (one boot per flock hold, candidate-50 image + the arm's 22-file set, blob-checked), queue.sh (smoke + 12-boot ABBA), make_trees.sh, overlay_sets.py, expect.py, blobs.py. Installed in W/h and W/tools; trees in W/c54 and W/trees/<arm>.",
+  "not_done": "No sp8 numbers. The image was not copied to sp8 (sp5 was inside a window running candidate-57's timed gate); the sp8 arms use spark-ds41f:candidate-50 with candidate-54's 22 differing non-test files mounted, which reproduces candidate-54's sources exactly (raw/sp8-setup/c54-vs-image-c50.txt)."
+ },
+ "workspace": "sp8:~/spark-lab/agents/tp3-grid-attribution (one stray clone made in ~/spark-lab/agents/c54 by a failed cd was moved there within a minute)"
+}
