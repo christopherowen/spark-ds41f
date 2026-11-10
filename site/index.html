@@ -9,6 +9,17 @@
   <meta property="og:description" content="Native weights, a million tokens of context, correctness first, then speed. No switch required.*">
   <meta property="og:type" content="website">
   <meta property="og:url" content="https://switchle.ss/">
+  <meta property="og:site_name" content="switchless">
+  <meta property="og:image" content="https://switchle.ss/og.png?v=__SITE_VERSION__">
+  <meta property="og:image:type" content="image/png">
+  <meta property="og:image:width" content="2400">
+  <meta property="og:image:height" content="1260">
+  <meta property="og:image:alt" content="DeepSeek V4.1 Flash on DGX Sparks. No switch required. Four Sparks cabled in a ring, with the current release's context, sessions and decode speed.">
+  <meta name="twitter:card" content="summary_large_image">
+  <meta name="twitter:title" content="switchless* · DeepSeek V4.1 Flash on DGX Spark">
+  <meta name="twitter:description" content="Native weights, a million tokens of context, correctness first, then speed. No switch required.*">
+  <meta name="twitter:image" content="https://switchle.ss/og.png?v=__SITE_VERSION__">
+  <meta name="theme-color" content="#0f0d0b">
   <link rel="icon" type="image/png" href="logo.png">
   <link rel="preconnect" href="https://fonts.googleapis.com">
   <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
@@ -20,6 +31,8 @@
       if (t !== "light" && t !== "dark") {
         t = window.matchMedia && window.matchMedia("(prefers-color-scheme: light)").matches ? "light" : "dark";
       }
+      // ?card shows only the 1200x630 link-preview card; scripts/render-og photographs it on each deploy.
+      if (/[?&]card\b/.test(location.search)) { t = "dark"; document.documentElement.className = "og-mode"; }
       document.documentElement.setAttribute("data-theme", t);
     })();
   </script>
@@ -158,7 +171,6 @@
       background: none; border: 0; padding: 0; cursor: pointer; text-align: left;
     }
     .footnote:hover { color: var(--ink-2); }
-    .footnote u { text-decoration-color: var(--line-2); text-underline-offset: 3px; white-space: nowrap; }
 
     .fabric {
       position: relative; border: 1px solid var(--line); border-radius: 22px;
@@ -362,6 +374,34 @@
     .foot ul a { text-decoration: none; } .foot ul a:hover { color: var(--ink); }
     .colophon { margin-top: 44px; padding-top: 20px; border-top: 1px solid var(--line); font: 400 12px/1.6 var(--mono); color: var(--ink-3); display: flex; flex-wrap: wrap; justify-content: space-between; gap: 10px; }
 
+    /* ---------- link-preview card (?card) ---------- */
+    .og { display: none; }
+    html.og-mode, html.og-mode body { width: 1200px; height: 630px; overflow: hidden; }
+    html.og-mode body > :not(.og) { display: none !important; }
+    html.og-mode .cable { animation: none; stroke-dashoffset: 0; }
+    html.og-mode .node { animation: none; }
+    html.og-mode .og {
+      display: grid; grid-template-columns: 700px minmax(0, 1fr); grid-template-rows: auto minmax(0, 1fr) auto;
+      width: 1200px; height: 630px; padding: 44px 56px 40px;
+      background:
+        radial-gradient(640px 480px at 81% 46%, var(--glow), transparent 70%),
+        radial-gradient(560px 400px at 0% 0%, color-mix(in srgb, var(--copper) 13%, transparent), transparent 70%),
+        var(--bg);
+    }
+    .og-brand { grid-column: 1 / -1; display: flex; align-items: center; gap: 14px; }
+    .og-brand img { width: 46px; height: 46px; }
+    .og-brand .wordmark { font-size: 36px; }
+    .og-brand .og-rel { margin-left: auto; font: 500 17px/1 var(--mono); letter-spacing: 0.14em; text-transform: uppercase; color: var(--ink-3); }
+    .og-h { align-self: center; font: 300 67px/1.05 var(--serif); letter-spacing: -0.025em; white-space: nowrap; }
+    .og-h em { color: var(--accent); }
+    .og-r { display: flex; flex-direction: column; align-items: center; justify-content: center; gap: 2px; }
+    #og-svg { width: 380px; height: 345px; }
+    .og-r .fn { font: 400 18px/1 var(--mono); color: var(--ink-2); }
+    .og-stats { grid-column: 1 / -1; display: flex; align-items: flex-end; gap: 48px; border-top: 1px solid var(--line-2); padding-top: 22px; white-space: nowrap; }
+    .og-stats b { display: block; font: 300 52px/1 var(--serif); letter-spacing: -0.02em; margin-bottom: 9px; }
+    .og-stats .gold b { color: var(--accent); }
+    .og-stats span { font: 500 15px/1 var(--mono); letter-spacing: 0.1em; text-transform: uppercase; color: var(--ink-2); }
+
     .reveal { opacity: 0; transform: translateY(14px); transition: opacity 0.7s ease, transform 0.7s ease; }
     .reveal.in { opacity: 1; transform: none; }
 
@@ -408,6 +448,22 @@
   </style>
 </head>
 <body>
+  <div class="og" aria-hidden="true">
+    <div class="og-brand">
+      <img class="heart" src="logo.png" alt="" width="46" height="46">
+      <span class="wordmark">switchless<span class="ast">*</span></span>
+      <span class="og-rel" id="og-rel"></span>
+    </div>
+    <div class="og-h">DeepSeek V4.1 Flash<br>on DGX Sparks.<br><em>No switch required.</em><span class="ast">*</span></div>
+    <div class="og-r"><svg id="og-svg" viewBox="0 0 440 400"></svg><span class="fn"><span class="ast">*</span> we do support switches</span></div>
+    <div class="og-stats">
+      <div class="gold"><b id="og-ctx"></b><span>token context</span></div>
+      <div class="gold"><b id="og-seq"></b><span>sessions at once</span></div>
+      <div><b id="og-c1"></b><span>tok/s, one stream</span></div>
+      <div><b id="og-cn"></b><span id="og-cn-k">tok/s, sixteen streams</span></div>
+      <div id="og-pf-box"><b id="og-pf"></b><span>tok/s prefill</span></div>
+    </div>
+  </div>
   <header class="nav">
     <div class="wrap nav-in">
       <a class="brand" href="#top" aria-label="switchless, home">
@@ -445,7 +501,7 @@
             <a class="btn primary" href="https://github.com/christopherowen/spark-ds41f#quick-start" rel="noopener">Get the recipe <span aria-hidden="true">→</span></a>
             <a class="btn" href="#numbers">See the numbers <span aria-hidden="true">↓</span></a>
           </div>
-          <button class="footnote" id="fn" type="button"><span class="ast">*</span> We do support switches. <span id="fn-range">Three to eight Sparks</span>, same recipe. <u>Plug one in</u></button>
+          <button class="footnote" id="fn" type="button"><span class="ast">*</span> We do support switches. <span id="fn-range">Three to eight Sparks</span>, same recipe.</button>
         </div>
 
         <div class="fabric" aria-label="Cluster fabric explorer">
@@ -746,7 +802,8 @@ __MANIFEST_DATA__
     const esc = v => v === null || v === undefined ? "" : String(v)
       .replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;").replace(/"/g, "&quot;");
     const int = n => Math.round(n).toLocaleString("en-US");
-    const still = window.matchMedia && window.matchMedia("(prefers-reduced-motion: reduce)").matches;
+    const CARD = document.documentElement.classList.contains("og-mode");
+    const still = CARD || (window.matchMedia && window.matchMedia("(prefers-reduced-motion: reduce)").matches);
     const WORDS = ["zero", "one", "two", "three", "four", "five", "six", "seven", "eight", "nine", "ten",
       "eleven", "twelve", "thirteen", "fourteen", "fifteen", "sixteen"];
     const word = n => WORDS[n] || String(n);
@@ -881,7 +938,8 @@ __MANIFEST_DATA__
       });
       out = `<defs><pattern id="foam" width="2.6" height="2.6" patternUnits="userSpaceOnUse" patternTransform="matrix(1 -0.5 0 1 0 0)">` +
         `<circle cx="0.7" cy="0.7" r="0.42"/><circle cx="2" cy="1.9" r="0.36"/></pattern></defs>` + out;
-      $("#fabric-svg").innerHTML = out;
+      // Only one SVG is drawn: a pattern defined inside a hidden SVG is not reliably available to a visible one.
+      $(CARD ? "#og-svg" : "#fabric-svg").innerHTML = out;
     }
 
     function tween(el, to, fmt) {
@@ -1203,6 +1261,21 @@ __MANIFEST_DATA__
     $("#choice-q").addEventListener("input", e => drawChoices(e.target.value));
     $("#cap-count").textContent = `${(DATA.capabilities || []).length} declared`;
     $("#caps").innerHTML = (DATA.capabilities || []).map(c => `<span>${esc(c)}</span>`).join("");
+
+    /* ---------- link-preview card ---------- */
+    if (CARD) {
+      const s = SHAPES.find(x => x.name === DATA.default_shape) || SHAPES[0], suite = suiteFor(s);
+      const top = suite && suite.runs.c16 ? 16 : 8, run = suite && suite.runs["c" + top];
+      $("#og-rel").textContent = `release ${shortRel(DATA.promoted_short)} · ${s.nodes} Sparks, ${s.fabric === "switched" ? "switched" : s.nodes === 3 ? "triangle" : "ring"}`;
+      $("#og-ctx").textContent = s.max_model_len >= 1e6 ? Math.floor(s.max_model_len / 1e6) + "M" : Math.round(s.max_model_len / 1024) + "K";
+      $("#og-seq").textContent = s.max_num_seqs;
+      $("#og-c1").textContent = suite && suite.runs.c1 ? suite.runs.c1.output_tps.toFixed(1) : "–";
+      $("#og-cn").textContent = run ? run.output_tps.toFixed(1) : "–";
+      $("#og-cn-k").textContent = `tok/s, ${word(top)} streams`;
+      const pf = suite && (suite.prefill || []).find(q => q.size === 131072);
+      $("#og-pf-box").hidden = !pf;
+      if (pf) $("#og-pf").textContent = int(pf.tps);
+    }
 
     /* ---------- go ---------- */
     selectShape();
