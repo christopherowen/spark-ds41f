@@ -1,0 +1,606 @@
+From f467c438ac1e1c8fe11ff9669715f6b5841aaaeb Mon Sep 17 00:00:00 2001
+From: Christopher Owen <3221756+christopherowen@users.noreply.github.com>
+Date: Sun, 8 Nov 2026 11:30:00 +0100
+Subject: [PATCH] perf(dsv41): SP ratio-2 compressor projection and CED
+ encoder-only chunks
+
+Upstream base: 1107 vLLM patch series (tree ed1bdb7a7684da33d403a055521ac0c4dd7ca670).
+
+Rationale:
+1. On encoder layers 2, 8, and 14 (compress_ratio == 2), DeepseekCompressor._sp_enabled was restricted to compress_ratio == 1. During SP prefill, these three layers disabled _gather_front, gathered the full [rows, 5120] BF16 hidden state across TP ranks before attention, ran fused_wqa_wkv and fused_wkv_wgate on all rows on every rank, and performed an extra column all-gather for the compressor projection. Enable _sp_enabled for compress_ratio in (1, 2) using bf16_gemm_two(512, 5120, out_dtype="float32", shards=split["shards"], blocked=split["blocked"]) on sp_rows.local_rows and sp_rows.gather_many(local_values, local_gates), and enable _gather_front on layers 2, 8, and 14 so both the attention front and compressor project only local SP rows.
+2. On multi-chunk prefill requests, non-final chunks ending at or before the CED decoder replay floor (start + q <= floor) select 0 real decoder replay rows (padded to 1 dummy row [0] solely to keep compact decoder tensors non-empty). Previously, the forward pass still executed layer 20's decoder attention and MoE plus all 19 decoder layers (layers 21..39) on that dummy row and ran two [rows, 5120] scatter_rows zero-fills. Track encoder_only on CEDState when every request in the step is a non-final prefill chunk ending at or before floor, stop at the CED boundary layer immediately after mhc.pre and prepare_global_kv, and return preallocated zeros.
+
+Quality implications:
+Lossless and bit-exact. bf16_gemm_two with shards=5, blocked=True reproduces the column-parallel fused_wkv_wgate split-K reduction bit for bit, and non-final prefill chunks ending at or before the CED replay floor have no selected decoder replay rows or sampled output logits.
+
+Tests:
+- pytest tests/models/test_deepseek_v4_1_compressor_prepare.py tests/models/test_deepseek_v4_1_compressor.py tests/models/test_deepseek_v4_1_attention.py tests/models/test_deepseek_v4_1_ced_model.py tests/models/test_deepseek_v4_1_ced_sp.py tests/models/test_deepseek_v4_1_sp_prefill.py (347 passed).
+
+Upstream status:
+Local DeepSeek-V4.1-Flash prefill optimization for GB10 clusters.
+---
+ tests/models/test_deepseek_v4_1_ced_model.py  | 84 +++++++++++++++++++
+ .../test_deepseek_v4_1_compressor_prepare.py  | 62 ++++++++++++++
+ vllm/models/deepseek_v4_1/attention.py        | 46 ++++++----
+ vllm/models/deepseek_v4_1/ced.py              |  2 +
+ vllm/models/deepseek_v4_1/compressor.py       | 59 +++++++++----
+ vllm/models/deepseek_v4_1/nvidia/model.py     | 54 +++++++++++-
+ .../deepseek_v4_1/nvidia/model_state.py       | 25 ++++++
+ 7 files changed, 299 insertions(+), 33 deletions(-)
+
+diff --git a/tests/models/test_deepseek_v4_1_ced_model.py b/tests/models/test_deepseek_v4_1_ced_model.py
+index 5712eee34..59681308f 100644
+--- a/tests/models/test_deepseek_v4_1_ced_model.py
++++ b/tests/models/test_deepseek_v4_1_ced_model.py
+@@ -452,3 +452,87 @@ def test_decoder_layer_and_model_release_transient_activations_early(monkeypatch
+     )
+     assert output.shape == (4, 2) and len(aux) == 2
+     assert refs["ffn_cast"]() is None
++
++
++def test_ced_encoder_only_plan_stops_at_boundary_after_global_kv_prepare(monkeypatch):
++    from vllm.models.deepseek_v4_1.nvidia.model_state import DeepseekV41ModelState
++
++    monkeypatch.setattr(
++        native,
++        "get_pp_group",
++        lambda: SimpleNamespace(is_first_rank=True, is_last_rank=True),
++    )
++    monkeypatch.setattr(native, "get_tensor_model_parallel_world_size", lambda: 1)
++    monkeypatch.setattr(native.l2_prefetch, "ENABLED", False)
++
++    target_model = SimpleNamespace(_ced_encoder_only=False)
++    state = DeepseekV41ModelState.__new__(DeepseekV41ModelState)
++    state.ced_state = SimpleNamespace(
++        stage=lambda *args, **kwargs: None,
++        encoder_only=False,
++    )
++    state.ced_models = [target_model]
++    state._ced_prompt_logprobs = set()
++    state._ced_prefix_start = {}
++    state._ced_recovery_prompt_end = {}
++
++    non_final_batch = SimpleNamespace(
++        req_ids=["req-0"],
++        num_reqs=1,
++        query_start_loc=torch.tensor([0, 16384], dtype=torch.int32),
++        seq_lens=torch.tensor([16384], dtype=torch.int32),
++        num_scheduled_tokens=[16384],
++        num_computed_prefill_tokens_np=[0],
++        prefill_len_np=[65536],
++    )
++    state._stage_ced(non_final_batch)
++    assert state.ced_state.encoder_only and target_model._ced_encoder_only
++
++    final_batch = SimpleNamespace(
++        req_ids=["req-0"],
++        num_reqs=1,
++        query_start_loc=torch.tensor([0, 16384], dtype=torch.int32),
++        seq_lens=torch.tensor([65536], dtype=torch.int32),
++        num_scheduled_tokens=[16384],
++        num_computed_prefill_tokens_np=[49152],
++        prefill_len_np=[65536],
++    )
++    state._stage_ced(final_batch)
++    assert not state.ced_state.encoder_only and not target_model._ced_encoder_only
++
++    shared: dict[str, torch.Tensor | int] = {}
++    row_work: list[tuple[str, int, int]] = []
++    layers = nn.ModuleList(_Layer(i, shared, row_work) for i in range(4))
++    inputs = torch.ones((6, 2), dtype=torch.float32)
++    target = SimpleNamespace(
++        embed_input_ids=lambda _: inputs.clone(),
++        config=SimpleNamespace(hidden_size=2),
++        use_mega_moe=False,
++        use_sequence_parallel=False,
++        prefill_sp_min_rows=0,
++        disk_engram=False,
++        engram_hash=None,
++        start_layer=0,
++        end_layer=4,
++        ced_decoder_start=2,
++        _ced_encoder_only=True,
++        layers=layers,
++        aux_hidden_state_layers={3, 4},
++        _sink_columns=None,
++        _graph_out=lambda index, rows: None,
++        glp=None,
++        norm=lambda hidden: hidden,
++    )
++    output, aux = native.DeepseekV4Model.forward(
++        target,
++        torch.arange(6),
++        torch.arange(6),
++        None,
++        ced_indices=torch.zeros(1, dtype=torch.int32),
++    )
++    assert output.shape == (6, 2) and torch.count_nonzero(output) == 0
++    assert len(aux) == 2 and all(
++        t.shape == (6, 2) and torch.count_nonzero(t) == 0 for t in aux
++    )
++    assert shared["global_rows"] == 6
++    assert [entry for entry in row_work if entry[1] >= 2] == []
+diff --git a/tests/models/test_deepseek_v4_1_compressor_prepare.py b/tests/models/test_deepseek_v4_1_compressor_prepare.py
+index ff9d5f5a2..3d2e74707 100644
+--- a/tests/models/test_deepseek_v4_1_compressor_prepare.py
++++ b/tests/models/test_deepseek_v4_1_compressor_prepare.py
+@@ -320,3 +320,65 @@ def test_ced_sp_dispatch_keeps_unsupported_compressor_on_full_path():
+             1,
+             4,
+         )
++
++
++@pytest.mark.parametrize("world_size", [3, 4])
++@pytest.mark.parametrize("tokens", [5, 13, 31, 32, 33])
++def test_sp_ratio2_compressor_projects_local_rows_and_gathers_values_and_gates(
++    monkeypatch, world_size, tokens
++):
++    from tests.models.test_deepseek_v4_1_sp_prefill import _World
++    from vllm.models.deepseek_v4_1 import sp_prefill
++
++    world = _World(world_size)
++    monkeypatch.setattr(
++        sp_prefill, "tensor_model_parallel_all_gather", world.all_gather
++    )
++    full_input = torch.arange(tokens * 32, dtype=torch.float32).reshape(tokens, 32)
++    expected_values = full_input[:, :1].expand(tokens, 512) * 0.5
++    expected_gates = full_input[:, 1:2].expand(tokens, 512) * 0.25
++    metadata = object()
++    state_meta = object()
++
++    def run(rank):
++        sp = sp_prefill.SPRows(tokens, world_size, rank)
++        compressor = _compressor(2)
++        compressor.fused_wkv_wgate.tp_size = world_size
++        compressor.state_cache = SimpleNamespace(prefix="state")
++        compressor._values = torch.empty(tokens + world_size, 512, dtype=torch.float32)
++        compressor._gates = torch.empty(tokens + world_size, 512, dtype=torch.float32)
++        compressor._latent = torch.empty(tokens + world_size, 512, dtype=torch.bfloat16)
++        compressor._slots = torch.empty(tokens + world_size, dtype=torch.int64)
++        compressor._sp_weight = object()
++        seen = []
++
++        def project_two(inputs, weight, out_values, out_gates):
++            assert inputs.shape[0] == sp.local_rows and weight is compressor._sp_weight
++            assert out_values.shape == (sp.local_rows, 512)
++            assert out_gates.shape == (sp.local_rows, 512)
++            out_values.copy_(inputs[:, :1].expand(sp.local_rows, 512) * 0.5)
++            out_gates.copy_(inputs[:, 1:2].expand(sp.local_rows, 512) * 0.25)
++
++        def normalize(rows, main, state, *, values, gates, **kwargs):
++            assert rows == tokens and main is metadata and state is state_meta
++            assert values.shape == (tokens, 512) and gates.shape == (tokens, 512)
++            assert torch.equal(values, expected_values)
++            assert torch.equal(gates, expected_gates)
++            seen.append((values.shape, gates.shape))
++            compressor._latent[:rows].copy_(values.to(torch.bfloat16))
++            compressor._slots[:rows].copy_(torch.arange(rows))
++
++        compressor._sp_kernel = project_two
++        compressor._forward_tilelang = normalize
++        output, slots = compressor.forward(
++            sp.local_slice(full_input),
++            metadata,
++            state_metadata=state_meta,
++            sp_rows=sp,
++        )
++        assert seen == [((tokens, 512), (tokens, 512))]
++        assert torch.equal(output, expected_values.to(torch.bfloat16))
++        assert torch.equal(slots, torch.arange(tokens))
++        return output.clone()
++
++    assert len(world.run(run)) == world_size
+diff --git a/vllm/models/deepseek_v4_1/attention.py b/vllm/models/deepseek_v4_1/attention.py
+index cf600a675..5ba08f40b 100644
+--- a/vllm/models/deepseek_v4_1/attention.py
++++ b/vllm/models/deepseek_v4_1/attention.py
+@@ -866,18 +866,17 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase):
+                     ratio=self.compress_ratio,
+                 )
+             )
+-        else:
+-            # _gather_front: prefill SP's BF16 front, the index head weights beside
+-            # the normalized halves.
+-            from vllm.models.deepseek_v4_1.tilelang import columns
++        # _gather_front: prefill SP's BF16 front, the index head weights beside
++        # the normalized halves.
++        from vllm.models.deepseek_v4_1.tilelang import columns
+ 
+-            widths = (self.q_lora_rank, 512)
+-            if self.indexer is not None:
+-                widths += (self.indexer.heads,)
+-                key = columns.copy_columns_key(self.indexer.heads, torch.bfloat16)
+-                calls.append(prepare.call(columns.copy_columns_kernel, *key))
+-            key = columns.split_columns_key(widths, torch.bfloat16)
+-            calls.append(prepare.call(columns.split_columns_kernel, *key))
++        widths = (self.q_lora_rank, 512)
++        if self.indexer is not None:
++            widths += (self.indexer.heads,)
++            key = columns.copy_columns_key(self.indexer.heads, torch.bfloat16)
++            calls.append(prepare.call(columns.copy_columns_kernel, *key))
++        key = columns.split_columns_key(widths, torch.bfloat16)
++        calls.append(prepare.call(columns.split_columns_kernel, *key))
+         return calls
+ 
+     def _prepare(self, device):
+@@ -1003,7 +1002,7 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase):
+             raise RuntimeError("V4.1 global KV source requires an indexer")
+         if sp_rows is not None and (
+             type(self.compressor) is not DeepseekCompressor
+-            or self.compressor.compress_ratio != 1
++            or self.compressor.compress_ratio not in (1, 2)
+         ):
+             hidden_states = sp_rows.gather(hidden_states)
+             sp_rows = None
+@@ -1130,7 +1129,16 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase):
+         sp_rows = sp_prefill.current()
+         index_weights = None
+         front = None
+-        if sp_rows is not None and self.compressor is None:
++        local_hidden = None
++        if sp_rows is not None and (
++            self.compressor is None
++            or (
++                type(self.compressor) is DeepseekCompressor
++                and getattr(self.compressor, "_sp_kernel", None) is not None
++            )
++        ):
++            if self.compressor is not None:
++                local_hidden = hidden_states
+             if getattr(self.fused_wqa_wkv, "tp_size", 1) == 1 or getattr(
+                 self.fused_wqa_wkv, "replicated_sp_prefill", False
+             ):
+@@ -1223,7 +1231,7 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase):
+         if not isinstance(metadata, dict):
+             # Memory profiling has no cache pages; serving does not use this branch.
+             q_cast = None
+-            del qr, kv, hidden_states, index_weights, q_cast
++            del qr, kv, hidden_states, local_hidden, index_weights, q_cast
+             output = torch.zeros_like(q)
+             del q
+         else:
+@@ -1231,8 +1239,14 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase):
+             swa = self._query_metadata(original_swa)
+             if not front_wrote_kv:  # the front's kernel wrote the record
+                 self._cache_context_kv(kv, positions)
+-            if swa is original_swa and hidden_states is not None:
+-                self._prepare_global_kv(positions, hidden_states)
++            if swa is original_swa:
++                if hidden_states is not None:
++                    self._prepare_global_kv(positions, hidden_states)
++                elif local_hidden is not None:
++                    self._prepare_global_kv(
++                        positions, local_hidden, sp_rows=sp_rows
++                    )
++            del local_hidden
+             index_query = None
+             if self.indexer is not None:
+                 # Sequence-parallel prefill: the indexer is replicated, so each
+diff --git a/vllm/models/deepseek_v4_1/ced.py b/vllm/models/deepseek_v4_1/ced.py
+index 8ecaa4fde..68f6732fa 100644
+--- a/vllm/models/deepseek_v4_1/ced.py
++++ b/vllm/models/deepseek_v4_1/ced.py
+@@ -185,6 +185,7 @@ class CEDState:
+         self.limits = torch.empty(max_requests, dtype=torch.int32, device=device)
+         self.floors = torch.empty_like(self.request_positions)
+         self.plan: CEDPlan | None = None
++        self.encoder_only: bool = False
+ 
+     def warmup(
+         self, hidden_size: int, hc_mult: int, *, pipeline: bool, sink_columns: bool
+@@ -227,6 +228,7 @@ class CEDState:
+         def warm_metadata():
+             self.stage(starts, seq, [count], [False], [0])
+             self.plan = None
++            self.encoder_only = False
+             self.replay_start.zero_()
+ 
+         prepare.declare(
+diff --git a/vllm/models/deepseek_v4_1/compressor.py b/vllm/models/deepseek_v4_1/compressor.py
+index 65831409b..899a5486e 100644
+--- a/vllm/models/deepseek_v4_1/compressor.py
++++ b/vllm/models/deepseek_v4_1/compressor.py
+@@ -218,7 +218,7 @@ class DeepseekCompressor(nn.Module):
+         hf = getattr(model_cfg, "hf_config", None) if model_cfg is not None else None
+         self._rope_dim = int(getattr(hf, "qk_rope_head_dim", 64))
+         tp_size = linear_layers.get_tensor_model_parallel_world_size()
+-        self._sp_enabled = compress_ratio == 1 and tp_size > 1
++        self._sp_enabled = compress_ratio in (1, 2) and tp_size > 1
+         self._sp_weight = self._sp_kernel = None
+         disable_tp = tp_size <= 1
+         self.fused_wkv_wgate = _PaddedSplitColumnParallelLinear(
+@@ -375,11 +375,20 @@ class DeepseekCompressor(nn.Module):
+     def _sp_projection_call(self):
+         """Use the original TP shard's K reduction for the full row projection."""
+         from vllm.models.deepseek_v4_1.tilelang import prepare
+-        from vllm.models.deepseek_v4_1.tilelang.gemm import bf16_gemm
++        from vllm.models.deepseek_v4_1.tilelang.gemm import bf16_gemm, bf16_gemm_two
+         from vllm.models.deepseek_v4_1.tilelang.linear import _bf16_shape
+ 
+         layer = self.fused_wkv_wgate
+         split = layer.quant_method._split(layer)
++        if self.compress_ratio == 2:
++            return prepare.call(
++                bf16_gemm_two,
++                512,
++                _bf16_shape(layer)[1],
++                out_dtype="float32",
++                shards=split["shards"],
++                blocked=split["blocked"],
++            )
+         return prepare.call(
+             bf16_gemm,
+             512,
+@@ -413,11 +422,23 @@ class DeepseekCompressor(nn.Module):
+                 # SP prefill gathers the ratio-one weight once before memory profiling
+                 # (5 MiB at H=5120) and slices any trailing TP column padding.
+                 weight = unpack_bf16_layer(self.fused_wkv_wgate).detach()
+-                self._sp_weight = (
+-                    tensor_model_parallel_all_gather(weight, dim=0)[:512]
+-                    if self.fused_wkv_wgate.tp_size > 1
+-                    else weight
+-                )
++                tp_size = self.fused_wkv_wgate.tp_size
++                if tp_size <= 1:
++                    self._sp_weight = weight
++                elif self.compress_ratio == 1:
++                    self._sp_weight = tensor_model_parallel_all_gather(weight, dim=0)[
++                        :512
++                    ]
++                else:
++                    part_cols = _compressor_part_cols(tp_size)
++                    gathered = tensor_model_parallel_all_gather(weight, dim=0)
++                    self._sp_weight = (
++                        gathered.view(tp_size, self.compress_ratio, part_cols, -1)
++                        .permute(1, 0, 2, 3)
++                        .reshape(self.compress_ratio, tp_size * part_cols, -1)[:, :512]
++                        .reshape(self.compress_ratio * 512, -1)
++                        .contiguous()
++                    )
+                 self._sp_kernel = prepare.launch(sp_call)
+ 
+         prepare.declare(
+@@ -436,12 +457,14 @@ class DeepseekCompressor(nn.Module):
+         cos_sin=None,
+         kv_page_size=None,
+         values=None,
++        gates=None,
+     ):
+         """The TileLang compression: at ratio 2 the requests' carries from the state
+         ring, then one launch over the step's rows that also saves the ring."""
+         from vllm.models.deepseek_v4_1.tilelang import compress as tl
+ 
+         values = self._values if values is None else values
++        gates = self._gates if gates is None else gates
+         kv_kwargs = {}
+         if kv_cache is not None and token_positions is not None and cos_sin is not None:
+             kv_kwargs = dict(
+@@ -468,7 +491,7 @@ class DeepseekCompressor(nn.Module):
+             self._local_ids, page=page,
+         )  # fmt: skip
+         tl.compress(
+-            rows, 2, self._values, self._gates, self.norm.weight,
++            rows, 2, values, gates, self.norm.weight,
+             metadata.query_start_loc, metadata.request_positions, self._local_ids,
+             metadata.slot_mapping, metadata.live_counts, self._latent, self._emitted,
+             self._slots, pending_values=self._pending_values,
+@@ -491,22 +514,30 @@ class DeepseekCompressor(nn.Module):
+         rows = hidden_states.shape[0]
+         if self._values is None:
+             raise RuntimeError("compressor kernels must be bound before forwarding")
+-        values = None
++        values = gates = None
+         if sp_rows is not None:
+-            if self.compress_ratio != 1 or self._sp_kernel is None:
++            if self.compress_ratio not in (1, 2) or self._sp_kernel is None:
+                 raise RuntimeError(
+-                    "ratio-one SP projection must be bound before forwarding"
++                    "ratio-one/two SP projection must be bound before forwarding"
+                 )
+             if rows != sp_rows.local_rows:
+                 raise ValueError("SP compressor input does not match local rows")
+             local = self._values[:rows]
+             # Always use the prefill GEMM, even for a short local slice: it keeps
+             # the global prefill's K reduction and needs no decode workspace.
+-            self._sp_kernel(hidden_states, self._sp_weight, local)
+-            values = sp_rows.gather(local)
++            if self.compress_ratio == 1:
++                self._sp_kernel(hidden_states, self._sp_weight, local)
++                values = sp_rows.gather(local)
++                fg_kwargs = {"values": values}
++            else:
++                local_gates = self._gates[:rows]
++                self._sp_kernel(hidden_states, self._sp_weight, local, local_gates)
++                values, gates = sp_rows.gather_many(local, local_gates)
++                fg_kwargs = {"values": values, "gates": gates}
+             rows = sp_rows.num_tokens
+         else:
+             self._project(hidden_states)
++            fg_kwargs = {"values": None}
+         self._forward_tilelang(
+             rows,
+             metadata,
+@@ -515,6 +546,6 @@ class DeepseekCompressor(nn.Module):
+             token_positions=token_positions,
+             cos_sin=cos_sin,
+             kv_page_size=kv_page_size,
+-            values=values,
++            **fg_kwargs,
+         )
+         return self._latent[:rows], self._slots[:rows]
+diff --git a/vllm/models/deepseek_v4_1/nvidia/model.py b/vllm/models/deepseek_v4_1/nvidia/model.py
+index b5baa9f0a..d49f0ee07 100644
+--- a/vllm/models/deepseek_v4_1/nvidia/model.py
++++ b/vllm/models/deepseek_v4_1/nvidia/model.py
+@@ -337,6 +337,7 @@ class DeepseekV4DecoderLayer(nn.Module):
+         ced_positions: torch.Tensor | None = None,
+         ced_input_ids: torch.Tensor | None = None,
+         aux_out: torch.Tensor | None = None,
++        encoder_only: bool = False,
+     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+         if isinstance(x, list):
+             # Pop the caller's carry list in place so nn.Module.__call__'s *args
+@@ -403,6 +404,10 @@ class DeepseekV4DecoderLayer(nn.Module):
+             # Decoder global KV needs every encoder row, but decoder queries,
+             # residual updates and experts only need the selected replay rows.
+             del x_q
++            if encoder_only:
++                self.attn.prepare_global_kv(positions, x, sp_rows=sp_rows)
++                del x, residual, post_mix, res_mix, attn_pre
++                return None, None, None, None, None
+             if sp_rows is not None:
+                 # Global KV projects local rows and gathers its narrow latent.
+                 # Decoder queries and residual updates only need replay rows.
+@@ -618,11 +623,16 @@ class DeepseekV4Model(nn.Module, EagleModelMixin):
+         self._sink_column = sink_config.column if sink_config is not None else -1
+         self._sink_columns: torch.Tensor | None = None
+         if get_pp_group().is_last_rank and sink_config is not None:
+-            self._sink_columns = torch.empty(
++            self._sink_columns = torch.zeros(
+                 vllm_config.scheduler_config.max_num_batched_tokens,
+                 self.hc_mult,
+                 dtype=torch.float32,
+             )
++        self._ced_encoder_only: bool = False
++        self._encoder_only_zeros: torch.Tensor | None = None
++        self._max_num_batched_tokens = (
++            vllm_config.scheduler_config.max_num_batched_tokens
++        )
+         # GLP steering (glp.py) when WEIGHTLESS_STEER_PATH and WEIGHTLESS_STEER_MODEL
+         # are set; None otherwise, which leaves the forward as it is.
+         self.glp = glp_steering(
+@@ -919,14 +929,21 @@ class DeepseekV4Model(nn.Module, EagleModelMixin):
+         pending_aux_out: torch.Tensor | None = None
+         if l2_prefetch.ENABLED and not self._l2pf_ready:
+             self._build_l2_prefetch()
++        encoder_only = (
++            getattr(self, "_ced_encoder_only", False)
++            and get_pp_group().is_last_rank
++            and not torch.cuda.is_current_stream_capturing()
++        )
+         for idx, layer in enumerate(
+             islice(self.layers, self.start_layer, self.end_layer),
+             start=self.start_layer,
+         ):
+             boundary_indices = ced_indices if idx == self.ced_decoder_start else None
++            boundary_encoder_only = boundary_indices is not None and encoder_only
+             if (
+                 sp is not None
+                 and boundary_indices is not None
++                and not boundary_encoder_only
+                 and not layer.attn.ced_sp_saves_bytes(
+                     sp, boundary_indices.numel(), layer.hc_mult
+                 )
+@@ -940,12 +957,14 @@ class DeepseekV4Model(nn.Module, EagleModelMixin):
+                 sp = None
+             ced_positions = (
+                 gather_rows(positions, boundary_indices)
+-                if boundary_indices is not None
++                if boundary_indices is not None and not boundary_encoder_only
+                 else None
+             )
+             ced_input_ids = (
+                 gather_rows(input_ids, boundary_indices)
+-                if boundary_indices is not None and input_ids is not None
++                if boundary_indices is not None
++                and not boundary_encoder_only
++                and input_ids is not None
+                 else None
+             )
+             carry = [residual, res_mix, post_mix, pre_mix, hidden_states]
+@@ -965,6 +984,7 @@ class DeepseekV4Model(nn.Module, EagleModelMixin):
+                 ced_positions=ced_positions,
+                 ced_input_ids=ced_input_ids,
+                 aux_out=pending_aux_out,
++                encoder_only=boundary_encoder_only,
+             )
+             if boundary_indices is not None:
+                 sp = None  # The boundary returns replicated compact decoder rows.
+@@ -978,6 +998,34 @@ class DeepseekV4Model(nn.Module, EagleModelMixin):
+                         aux_hidden_state, ced_indices, full_num_tokens
+                     )
+                 aux_hidden_states.append(aux_hidden_state)
++            if boundary_encoder_only:
++                l2_prefetch.join()
++                if self._sink_columns is not None:
++                    from ..tilelang import columns as columns_mod
++
++                    columns_mod.zero_(self._sink_columns[:full_num_tokens])
++                zeros = getattr(self, "_encoder_only_zeros", None)
++                if (
++                    zeros is None
++                    or zeros.shape[0] < full_num_tokens
++                    or zeros.device != positions.device
++                ):
++                    cap = max(
++                        full_num_tokens,
++                        getattr(self, "_max_num_batched_tokens", full_num_tokens),
++                    )
++                    zeros = torch.zeros(
++                        (cap, self.config.hidden_size),
++                        dtype=layer.attn_norm.weight.dtype,
++                        device=positions.device,
++                    )
++                    self._encoder_only_zeros = zeros
++                out_hidden = zeros[:full_num_tokens]
++                if len(self.aux_hidden_state_layers) > 0:
++                    return out_hidden, [
++                        out_hidden for _ in self.aux_hidden_state_layers
++                    ]
++                return out_hidden
+             if boundary_indices is not None:
+                 assert ced_positions is not None
+                 positions = ced_positions
+diff --git a/vllm/models/deepseek_v4_1/nvidia/model_state.py b/vllm/models/deepseek_v4_1/nvidia/model_state.py
+index 0a6fdf43f..c57470c0e 100644
+--- a/vllm/models/deepseek_v4_1/nvidia/model_state.py
++++ b/vllm/models/deepseek_v4_1/nvidia/model_state.py
+@@ -139,6 +139,12 @@ class DeepseekV41ModelState(DefaultModelState):
+             for module in model.modules()
+             if isinstance(module, DeepseekV4Model) and module.disk_engram
+         )
++        self.ced_models = tuple(
++            module
++            for module in model.modules()
++            if isinstance(module, DeepseekV4Model)
++            and module.ced_decoder_start is not None
++        )
+         # Disk Engram: each live request's prefill tokens (prompt, and on resumption
+         # the outputs it recomputes), for the host's hash of its prefill chunks.
+         self._prefill_tokens: dict[str, np.ndarray] = {}
+@@ -290,6 +296,22 @@ class DeepseekV41ModelState(DefaultModelState):
+             floors,
+             limits,
+         )
++        encoder_only = (
++            not force_full
++            and nr > 0
++            and all(
++                not keep_full[i]
++                and int(input_batch.num_computed_prefill_tokens_np[i])
++                < int(input_batch.prefill_len_np[i])
++                and int(input_batch.num_computed_prefill_tokens_np[i])
++                + int(input_batch.num_scheduled_tokens[i])
++                <= floors[i]
++                for i in range(nr)
++            )
++        )
++        state.encoder_only = encoder_only
++        for m in getattr(self, "ced_models", ()):
++            m._ced_encoder_only = encoder_only
+         self._ced_batch = input_batch
+ 
+     def prepare_attn(
+@@ -465,6 +487,9 @@ class DeepseekV41ModelState(DefaultModelState):
+             # Capture their noncompact branch, regardless of dummy split;
+             # long real queries are forced off FULL graphs by the runner.
+             self.ced_state.plan = None
++            self.ced_state.encoder_only = False
++            for m in getattr(self, "ced_models", ()):
++                m._ced_encoder_only = False
+             self.ced_state.replay_start.zero_()
+             self._ced_batch = None
+             model_inputs["ced_indices"] = None
+-- 
+2.54.0 (Apple Git-157)
+

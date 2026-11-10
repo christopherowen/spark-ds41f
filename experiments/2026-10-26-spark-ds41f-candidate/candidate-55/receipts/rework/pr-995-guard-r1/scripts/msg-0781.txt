@@ -1,0 +1,24 @@
+fix(spec_decode): guard negative slots in copy_alloc and copy_apply
+
+Base: candidate-54 vLLM patch head 4e8133ff10a125b90753c2727f162e29fe37f30c (tree 5f021d9a7f01c03e2389dd3d8021759cfa19ea34). The slot guard of #995 (head aa65752e9864, patch 0762-perf-spec-decode-copy-drafter-guards-and-wide-ramp.patch on 1107 vLLM patch head 2756478b60b9), alone, reworked for candidate-55.
+
+Rationale:
+copy_match_kernel reads total_len[slot] and history[slot] only for slot >= 0, whereas copy_alloc_kernel and copy_apply_kernel indexed total_len[slot], int_state[slot], float_state[slot] and history[slot] unconditionally: a negative idx_mapping entry would read and write the row before each tensor. Guard slot >= 0 in both. For a negative slot, copy_alloc_kernel writes no copy (chosen (-1, 0, 0), the prior estimate PRIOR_HITS / PRIOR_TRIALS, alloc = block) and reads and writes no per-slot state; copy_apply_kernel takes DSpark's drafts and clears no per-slot state, whatever chosen holds.
+
+Serving effect: none. No serving path passes a negative slot to copy_alloc or copy_apply. GPUModelRunner.sample_tokens passes input_batch.idx_mapping to CopyDrafter.prepare_alloc and propose; prepare_inputs builds it from req_states.req_id_to_index (slots from free_indices, range(max_num_reqs)) and InputBatch.make_dummy as arange(num_reqs). The copy path's only -1 rows, match_idx_mapping's for requests still mid-prefill, go to copy_match alone, which already guards them. Pipeline parallelism's -1 entries (PPHandler.get_prev_sampled_outputs) reach postprocess_sampled only, and copy_calls only declares the kernels for compilation. The guard is a robustness fix for direct callers of the kernels.
+
+From #995:
+- Taken: tilelang_copy.py hunks 5 and 6 (the copy_alloc_kernel and copy_apply_kernel guards), every line as the PR has it except the doublings update below, applied 3-way (copy_apply's context moved with 0789's survival loop); and test_negative_slot_bounds_guard_in_alloc_and_apply unchanged, appended after test_copy_match_long_context_two_tier_scan.
+- Left out, the cap decay (its rationale 2): inside the new else branch, copy_alloc_kernel keeps the base's T.if_then_else(accepted >= live, T.min(doublings + 1, MAX_DOUBLINGS), 0), re-indented. Hunk 1, the module docstring's decay sentence, goes with it, so the docstring is unchanged; so do the decay's ref_select and design_walk changes and test_partial_acceptance_steps_down_cap_doublings_gently.
+- Left out, copy_match's level-anchor probe, need_len tile bound and one-variable hit reduction (its rationale 3, hunks 2-4): they conflict with 0790's two-tier scan (#977) and are their own experiment on this base.
+- Left out, the 31/63-draft ramp (its rationale 4: SPARK_DS41F_COPY_MAX_DRAFTS, greedy_rejection_kernel widths above 32, benchmark_copy_drafts.py --lookahead, test_wide_lookahead_31_and_63_greedy_verification_and_ramp): it is opt-in, and the recipe keeps 16 drafts.
+
+Quality:
+Bit-identical for every non-negative slot. Measured on GB10 (sp8), spark-ds41f:candidate-50 with candidate-54's files mounted (base) or this tree's (candidate), ABBA in one session, a fresh container a boot: 882 copy steps (copy_match, copy_alloc, copy_apply over 126 cells: 7 scenarios, 1/8/16 requests, 4K..1M tokens, the copy state carried over seven steps, a mid-prefill step, 5,892 copies taken and 120 refused) hash the same on every boot of both arms. The guard's branches cost the two kernels about 0.04 us of device time a step (32 copy_alloc + copy_apply pairs a CUDA graph: +0.004..+0.079 us on 3.1..3.4 us a pair, in every cell). The copy step does not measurably move: benchmark_copy_drafts.py's 24 copy cells at 201 replays, six boots an arm, are unchanged (-3.2%..+5.9%), and every boot is within the gate's budget.
+
+Tests:
+- pytest -o addopts= --noconftest tests/v1/spec_decode/test_copy_drafts.py tests/v1/core/test_copy_drafts_scheduler.py: 63 passed in each of 2 boots (candidate-54: 62 passed). The new test fails on candidate-54's kernels: copy_alloc writes int_state[-1].
+- python3 benchmarks/kernels/benchmark_copy_drafts.py --gate --cases copy: 0 slower on every boot of both arms.
+- Applies as 0781 after candidate-54's series with git am; git diff --check clean.
+
+Upstream status: local robustness fix for CopyDrafter's TileLang kernels.

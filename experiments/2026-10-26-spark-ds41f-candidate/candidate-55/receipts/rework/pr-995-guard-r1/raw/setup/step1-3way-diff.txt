@@ -1,0 +1,124 @@
+diff --git a/vllm/v1/worker/gpu/spec_decode/tilelang_copy.py b/vllm/v1/worker/gpu/spec_decode/tilelang_copy.py
+index 72ff29050..f940e0aef 100644
+--- a/vllm/v1/worker/gpu/spec_decode/tilelang_copy.py
++++ b/vllm/v1/worker/gpu/spec_decode/tilelang_copy.py
+@@ -29,8 +29,10 @@ a sparse ``256``-stride phase-aligned anchor scan across the first quarter for
+   First the copy state of the request's last proposal is updated from this
+   step's verification of it: a copy whose live verified drafts (its admitted
+   drafts, at most the dead-row cut) were all accepted doubles its cap (from
+-  ``initial`` up to the lookahead), a rejection or a proposal without a copy
+-  returns it to ``initial``, and the accepted and judged drafts update the
++  ``initial`` up to the lookahead), a partial acceptance of at least
++  ``initial`` drafts steps its doubling level down by one, a shorter acceptance
++  or a proposal without a copy returns it to ``initial``, and the accepted and
++  judged drafts update the
+   request's acceptance estimate (decayed counts over a prior). Then the longest
+   level with a source over the chunks, its highest-priority source decoded to
+   its position, and the choice (``chosen``: the source, the
+@@ -551,42 +553,55 @@ def copy_alloc_kernel(
+                 if latest >= 0:
+                     source = latest
+             if tx == 0:
+-                length = total_len[slot]
+-                if source >= 0:
+-                    source = T.if_then_else(
+-                        source >= lookahead, source - lookahead, length - source
+-                    )
+-                doublings = T.alloc_var(T.int32, init=int_state[slot, 0])
+-                pending = int_state[slot, 1]
+-                hits = T.alloc_var(T.float32, init=float_state[slot, 0])
+-                trials = T.alloc_var(T.float32, init=float_state[slot, 1])
+-                if pending > 0 and num_sampled[r] > 0:
+-                    live = T.min(pending, T.min(verified[r], cut[r]))
+-                    if live > 0:
+-                        accepted = T.min(num_sampled[r] - 1, live)
+-                        doublings = T.if_then_else(
+-                            accepted >= live, T.min(doublings + 1, MAX_DOUBLINGS), 0
+-                        )
+-                        hits = hits * DECAY + T.cast(accepted, T.float32)
+-                        trials = trials * DECAY + T.cast(
+-                            T.min(accepted + 1, live), T.float32
++                if slot < 0:
++                    chosen[r, 0] = -1
++                    chosen[r, 1] = 0
++                    chosen[r, 2] = 0
++                    estimates[r] = T.float32(PRIOR_HITS / PRIOR_TRIALS)
++                    alloc[r] = block
++                else:
++                    length = total_len[slot]
++                    if source >= 0:
++                        source = T.if_then_else(
++                            source >= lookahead, source - lookahead, length - source
+                         )
+-                cap = T.min(T.int32(initial) << doublings, lookahead)
+-                distance = length - source
+-                offered = T.if_then_else(source >= 0, T.min(cap, distance), 0)
+-                after = T.if_then_else(
+-                    source >= 0, T.min(T.min(2 * cap, lookahead), distance), 0
+-                )
+-                # A step without a copy (DSpark's) starts the next copy afresh.
+-                int_state[slot, 0] = T.if_then_else(source >= 0, doublings, 0)
+-                int_state[slot, 1] = offered
+-                float_state[slot, 0] = hits
+-                float_state[slot, 1] = trials
+-                chosen[r, 0] = source
+-                chosen[r, 1] = offered
+-                chosen[r, 2] = after
+-                estimates[r] = (hits + PRIOR_HITS) / (trials + PRIOR_TRIALS)
+-                alloc[r] = T.max(after, block)
++                    doublings = T.alloc_var(T.int32, init=int_state[slot, 0])
++                    pending = int_state[slot, 1]
++                    hits = T.alloc_var(T.float32, init=float_state[slot, 0])
++                    trials = T.alloc_var(T.float32, init=float_state[slot, 1])
++                    if pending > 0 and num_sampled[r] > 0:
++                        live = T.min(pending, T.min(verified[r], cut[r]))
++                        if live > 0:
++                            accepted = T.min(num_sampled[r] - 1, live)
++                            doublings = T.if_then_else(
++                                accepted >= live,
++                                T.min(doublings + 1, MAX_DOUBLINGS),
++                                T.if_then_else(
++                                    accepted >= initial,
++                                    T.max(doublings - 1, 0),
++                                    0,
++                                ),
++                            )
++                            hits = hits * DECAY + T.cast(accepted, T.float32)
++                            trials = trials * DECAY + T.cast(
++                                T.min(accepted + 1, live), T.float32
++                            )
++                    cap = T.min(T.int32(initial) << doublings, lookahead)
++                    distance = length - source
++                    offered = T.if_then_else(source >= 0, T.min(cap, distance), 0)
++                    after = T.if_then_else(
++                        source >= 0, T.min(T.min(2 * cap, lookahead), distance), 0
++                    )
++                    # A step without a copy (DSpark's) starts the next copy afresh.
++                    int_state[slot, 0] = T.if_then_else(source >= 0, doublings, 0)
++                    int_state[slot, 1] = offered
++                    float_state[slot, 0] = hits
++                    float_state[slot, 1] = trials
++                    chosen[r, 0] = source
++                    chosen[r, 1] = offered
++                    chosen[r, 2] = after
++                    estimates[r] = (hits + PRIOR_HITS) / (trials + PRIOR_TRIALS)
++                    alloc[r] = T.max(after, block)
+ 
+     return copy_alloc
+ 
+@@ -633,9 +648,13 @@ def copy_apply_kernel(lookahead: int, block: int, idx_dtype: str):
+                 dspark_survival *= dspark_confidences[r, j]
+                 dspark_yield += dspark_survival
+             use_copy = T.alloc_var(T.int32, init=0)
+-            if start >= 0 and T.cast(offered, T.float32) * estimate >= dspark_yield:
++            if (
++                slot >= 0
++                and start >= 0
++                and T.cast(offered, T.float32) * estimate >= dspark_yield
++            ):
+                 use_copy = 1
+-            if start >= 0 and use_copy == 0 and tx == 0:
++            if slot >= 0 and start >= 0 and use_copy == 0 and tx == 0:
+                 int_state[slot, 0] = 0
+                 int_state[slot, 1] = 0
+             for k in T.unroll(passes):

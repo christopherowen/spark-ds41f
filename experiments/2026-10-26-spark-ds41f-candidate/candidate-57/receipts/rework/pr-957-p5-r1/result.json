@@ -1,0 +1,1415 @@
+{
+ "pr": 957,
+ "part": 5,
+ "label": "957-p5",
+ "round": 3,
+ "candidate": "candidate-57",
+ "testbed": "tp3-switched",
+ "placement": "candidate-57's last patch, after 957-p2 and 957-p4 on candidate-54",
+ "pr_head": "e464d364431a26b031a6e91f5dd610f429129c46",
+ "source_patch": "experiments/2026-11-08-tp3-decode-recovery/vllm/0762-perf-dsv41-tp3-decode-compressor-mla-and-spec-fusions.patch (sha256 44412274ff72075c37afed64dbd9cb638cf604a34901b10f11b6fee128385e71); part 5 = its adaptive_verification.py hunks and the block appended to test_high_concurrency_row_cost_knee_admits_coalesced_drafts",
+ "verdict": "not-defensible",
+ "verdict_reason": "Part 5 does change budgets at TP3, but the replay predicts no gain anywhere. It trims draft rows that candidate-50's tp3-switched grid prices below the tokens they carry. Every step-time model built on that grid predicts lower throughput at c1, c4 and c8, and at c1 and c8 the loss is beyond the 0.35-0.4% A/A floor. The scale drives c4 and c8: at c8, -1.2% to -1.3% on the grid step alone and -3.1% to -3.3% on the served step. The dead-row floor drives c1: -0.9% to -1.0% on the grid step and -1.0% to -1.2% on the served step. #986's blend calibrated on the 2026-10-18 row-cost A/B also predicts a loss: -0.3% to -1.2% at c1 and -0.2% to -1.3% at c8. Only #986's tp4-ring serving regression taken alone (model B) predicts a c1 gain (+1.0% to +1.1%). It prices a wasted row at 1.98 ms, against the TP3 grid's 0.17 ms a row, and the A/B-calibrated blend gives it at most 43% weight at c1. Recommendation (the coordinator decides): leave 957-p5 out of candidate-57. If it is carried, the no957p5 overlay supports an attribution control on the same image.",
+ "a_a_floor_pct": {
+  "c16": 0.43,
+  "c8": 0.39,
+  "c1": 0.35,
+  "source": "candidate-47/receipts/rework/pr-986-r1 (A/A floor of the screen's paired decode)"
+ },
+ "clears_floor": {
+  "c1": "yes, in the wrong direction: the grid predicts -0.9% to -1.2%. Only model B alone predicts +1.0%, and the A/B-calibrated blend predicts -0.3% to -1.2%",
+  "c4": "no: -0.2% (grid step) to -0.5% (served step), at or inside the floor, and negative",
+  "c8": "yes, in the wrong direction: -1.2% to -3.3% on the grid. Blend: -0.2% (central) to -1.3%"
+ },
+ "patch": {
+  "file": "57-03-957-p5-perf-dsv41-tp3-decode-compressor-mla-and-spec-fusions.patch",
+  "sha256": "ffefecaeae017d31bde2009d69d56b72c8db192bee43531c14f392be5d812d8e",
+  "form": "git format-patch; author Christopher Owen <3221756+christopherowen@users.noreply.github.com>, author date Sun, 8 Nov 2026 11:30:00 +0100 (the PR's, as 957-p2 and 957-p4 carry it); subject kept as the PR's (as the split parts keep it); rationale with a 'Round 3 rebase' section",
+  "files": {
+   "vllm/v1/worker/gpu/spec_decode/adaptive_verification.py": "+31/-6",
+   "tests/v1/spec_decode/test_adaptive_verification.py": "+79/-0"
+  },
+  "applies": "fresh clone at candidate-54's patch head 4e8133ff, git am 57-01 (957-p2), 57-02 (957-p4): tree 72b40d71 (= the selection's candidate-57 stack); git am this patch: tree 5016d620c2d4a6e208f5799c3ecc673222b253f4; git diff --check 4e8133ff..HEAD clean (raw/series-check.txt)",
+  "applies_to_no957p5_overlay": "git apply --check passes on candidate-54's two files (no957p5/overlay/), which no other candidate-57 patch touches (957-p2 and 957-p4 touch neither)",
+  "overlay": {
+   "overlay/vllm/v1/worker/gpu/spec_decode/adaptive_verification.py": "e1434cdc4a5b3d7d4529479852996a8fc952ba797ce46d38db2e4d6c2d577c0d",
+   "overlay/tests/v1/spec_decode/test_adaptive_verification.py": "e2bf203f3535e8a1cad433d68b220008367a056e7c920ca35ae8073dab5a224c",
+   "no957p5/overlay/vllm/v1/worker/gpu/spec_decode/adaptive_verification.py": "69f6aad9a731ae177235ebf5e218fae24797cbd9f24dafb658cff69ece2e1590",
+   "no957p5/overlay/tests/v1/spec_decode/test_adaptive_verification.py": "eb522ceba49d9dbad3b90eff39a2fffe9c89c8d415030b951695494fad3dde77",
+   "note": "overlay/ is candidate-57's two files with this patch (equal to the series tree 5016d620); no957p5/overlay/ is candidate-54's (= candidate-57's without part 5)"
+  }
+ },
+ "base": {
+  "name": "candidate-54",
+  "patch_count": 671,
+  "patch_head": "4e8133ff10a125b90753c2727f162e29fe37f30c",
+  "tree": "5f021d9a7f01c03e2389dd3d8021759cfa19ea34",
+  "candidate_57_stack_before_p5": "72b40d7102ab56384a68885ad3a61733afe1c5a2 (957-p2, 957-p4)",
+  "workspace": "sp8:~/spark-lab/agents/round3-957p5 (vllm/ cloned --shared from round-55-57-select/c54-vllm, branch p5-final)"
+ },
+ "conflict": {
+  "0789_971_r1": "_step_cost prices rows past HIGH_ROW_COST_KNEE (16) with single_req_tile_spill_scale = SINGLE_REQ_TILE_SPILL_SCALE (2.0) when num_sampling_requests <= 1, else high_row_cost_scale (HIGH_ROW_COST_SCALE 0.55); get_num_tokens passes num_sampling_requests",
+  "part_5": "picks HIGH_ROW_COST_SCALE_TP3 (0.85) for self.high_row_cost_scale in __init__ when tp_size == 3 (written on 1107, where that scale priced every step) and floors the calibrated dead-row threshold at MIN_CALIBRATED_DEAD_ROWS_TAU_TP3 (0.12)"
+ },
+ "composition": {
+  "decision": "HIGH_ROW_COST_SCALE_TP3 replaces only the multi-request scale (self.high_row_cost_scale, num_sampling_requests > 1). A single sampling request keeps #971 round 1's SINGLE_REQ_TILE_SPILL_SCALE = 2.0 on every TP size. At c1 the effective scale is therefore max(2.0, 0.85) = 2.0. No TP3-specific single-request scale is added.",
+  "why": [
+   "The two scales model different things. 0.55 and 0.85 are the shared-weight-tile discount for rows past the 16-row MMA tile when several requests coalesce. 2.0 is the single-request penalty for spilling the 17th row into a second MMA wave and the 24-row graph. #971 round 1 measured that step at TP3 (initial c1 copy step, 24-row graph to 16-row graph, -5.52%, Welch95 [-9.0, -7.6] ms) with the 2.0 scale.",
+   "Part 5 was written on 1107, where one scale priced every step, so on its own base it replaced the c1 price too. Carried that way onto candidate-54, it would undo #971 round 1 at TP3. The fixed cell c1_copy_0.95x16 gives 15 drafts and 16 rows with this patch at TP3, and 16 drafts and 17 rows if 0.85 also priced single requests (raw/out/replay-*.json, deterministic).",
+   "There is no TP3 evidence for a different single-request scale. A multiplied scale (2.0 x 0.85 / 0.55) would be a new, unmeasured constant.",
+   "A c1 step with a prefill in the batch has two sampling requests, so it uses the multi-request branch, TP3's 0.85 included. That is #971 round 1's own definition, unchanged."
+  ]
+ },
+ "dead_row_floor": {
+  "acts_at_recipe_tau_0.2": true,
+  "why": "The recipe sets SPARK_DS41F_DSPARK_DEAD_ROWS_TAU=0.2 and adaptive_verification_row_cost 0.035, and the model runner passes calibrated_confidence = (estimator _refits > 0 and the confidence head is used). Once the estimator has refit, candidate-54's effective_dead_rows_tau is min(0.2, 2*0.035/(1+3*0.035)) = 0.0633. With part 5 at TP3 it is min(0.2, max(0.12, 0.0633)) = 0.12 (the replay's managers report 0.0633 and 0.1200). Before the first refit both return 0.2. So the floor is not inert; it raises the host admission cut and the device dead-row cut at TP3.",
+  "kept": "yes. The deployment-only rule leaves out only what does nothing here, and the floor acts. It is also the whole of part 5's effect at c1, where the replay predicts a loss.",
+  "where_it_binds": "c1 only, in effect: 22-29% of c1 steps change budget, 1.3-1.9% of c4 steps, about 0.01% of c8 steps. At c4 and c8 the budget's own cut is already above 0.12."
+ },
+ "test_budgets_rederived_on_candidate_54": {
+  "c8_medium [0.78, 0.72, 0.71, 0.71, 0.73] x 8, row cost 0.035, tau 0.2 calibrated": {
+   "tp3": "24 drafts, 32 rows",
+   "tp4": "32 drafts, 40 rows (unchanged)",
+   "flat_scale_1.0": "24 drafts",
+   "floor_binds": false
+  },
+  "c1_typical [0.677, 0.556, 0.396, 0.460, 0.638] (survival 0.677, 0.376, 0.149, 0.0686, 0.0437)": {
+   "tp3": "3 drafts, 4 rows (position 3 below 0.12)",
+   "tp4": "4 drafts, 5 rows (unchanged; 0.0686 >= 0.0633)"
+  },
+  "c1_copy 0.95 x 16": {
+   "tp3": "15 drafts, 16 rows",
+   "tp4": "15 drafts, 16 rows",
+   "rejected_composition_0.85_at_c1": "16 drafts, 17 rows"
+  },
+  "c2_copy 0.95 x 16": {
+   "tp3": "32 drafts, 34 rows",
+   "tp4": "32 drafts, 34 rows"
+  },
+  "c4_medium x 4": {
+   "tp3": "16 drafts, 20 rows",
+   "tp4": "20 drafts, 24 rows"
+  },
+  "derived_by": "the test file, plus the replay's fixed cells run through each module's own __init__ (raw/out/replay-*.json 'deterministic'; raw/out/quick-budget.txt is the first numpy emulation)",
+  "tests_added": [
+   "test_high_concurrency_row_cost_knee_admits_coalesced_drafts: the TP3 block (24 drafts, 32 rows; effective tau 0.12) and a TP4 block (32 drafts, 40 rows)",
+   "test_tp3_survival_floor_prunes_the_typical_c1_tail[tp4|tp3]: 4 drafts and 3 drafts",
+   "test_tp3_constants_keep_the_single_request_tile_spill_cap: c1 copy 0.95 x 16 stays 15 drafts under the TP3 constants",
+   "test_tp_size_selects_the_row_cost_constants[1|3|4]: the constants __init__ picks with get_tp_group patched (CUDA)"
+  ]
+ },
+ "tests": {
+  "file": "tests/v1/spec_decode/test_adaptive_verification.py, pytest -v --noconftest, spark-ds41f:candidate-50 with the candidate overlay (GPU container under the lock)",
+  "candidate_57_with_p5_run1": "52 passed, 1 skipped, 15 warnings in 11.22s",
+  "candidate_57_with_p5_run2": "52 passed, 1 skipped, 15 warnings in 10.87s",
+  "candidate_54": "46 passed, 1 skipped, 15 warnings in 10.60s",
+  "note": "6 new cases: 46 + 6 = 52; the one skip is the base's two-GPU distributed test"
+ },
+ "tp4_bit_for_bit": {
+  "result": "unchanged",
+  "evidence": [
+   "Every replay step of every profile (c1, c4, c4-theta-c1, c8, c16; 20,000 steps each; two seeds; two acceptance profiles) gives the same budget with the patch's own __init__ at world size 4 as with candidate-54's: 0 differing steps (tp4_bit_for_bit in each raw/out/replay-*.json)",
+   "The fixed cells are equal at TP4 (deterministic_equal true), effective tau 0.0633 on both, and __init__ at world size 4 picks scale 0.55, floor 0.0, spill 2.0",
+   "candidate-54 has no TP dependence: c54@tp3 equals c54@tp4 on every step",
+   "test_tp_size_selects_the_row_cost_constants[4-0.55-0.0] and [1-0.55-0.0] pass"
+  ]
+ },
+ "replay": {
+  "what": "a policy replay of the real AdaptiveVerificationManager. Candidate-54's adaptive_verification.py and the rebased part 5's were loaded by path in spark-ds41f:candidate-50 with candidate-54's 36 changed files mounted, so every vllm import is candidate-54's. Each manager was built through its own __init__ (small CUDA buffers) with get_tp_group patched to world size 3 or 4. get_num_tokens drove each step; one manager per arm persisted across the steps, so its idle-explore counter carries as in serving.",
+  "recipe_inputs": "5 drafts, 16 verification steps (copy drafter on), row cost 0.035, SPARK_DS41F_DSPARK_DEAD_ROWS_TAU=0.2 (env), calibrated confidence (lambda: True), max_total_logits = get_max_chunk_logits(129280) (never binds)",
+  "acceptance_profile": "#986 round 1's served profile (candidate-47/receipts/rework/pr-986-r1): its fitted two-component logit-normal confidence model per concurrency (theta from replay-seed0.json and replay-seed1.json), its step sampler (served requests a step plus one 21-token prefill at the served prompt rate), and calibrated acceptance (expected tokens = admitted survival). c4 has no served record: it uses c8's theta at half c8's requests and prompt rate, and c1's theta as a sensitivity (c4-theta-c1).",
+  "sensitivity_profile": "#986's fit_conf, imported unchanged, refit to candidate-50's tp3-switched served counters (c8 two boots, single-stream c1). The c1 fit loss is 0.0016 / 0.0005, against #986's tp4 c1 fit at 0.0057 (raw/out/fit-tp3-seed*.txt). Same draws as the primary run.",
+  "fidelity": {
+   "tp3_served_counters_candidate_50": {
+    "c8": {
+     "coverage": [
+      1.0,
+      0.7205494650432394,
+      0.3950251213070212,
+      0.2038708634351471,
+      0.10474778209929525
+     ],
+     "survival": [
+      0.6768804309982142,
+      0.3722668281663577,
+      0.18444118150887137,
+      0.09769068930410207,
+      0.05295539018847255
+     ],
+     "output_tokens_per_step": 18.192938437301216
+    },
+    "c1": {
+     "coverage": [
+      1.0,
+      0.8722630853343393,
+      0.5011260528248953,
+      0.25241611061642666,
+      0.12367239120328774
+     ],
+     "survival": [
+      0.657556277854176,
+      0.3825939362912497,
+      0.1846731284182911,
+      0.0967464506515252,
+      0.05276447475357828
+     ],
+     "output_tokens_per_step": 2.375283720366518
+    }
+   },
+   "replay_c54_c8_coverage_survival_seed0": [
+    [
+     1.0,
+     0.712675397245945,
+     0.38121159153000767,
+     0.1955778216677104,
+     0.10045212747655062
+    ],
+    [
+     0.6883047313967259,
+     0.36082866865058816,
+     0.17360442564891096,
+     0.09629595032886874,
+     0.06056174521618135
+    ],
+    17.86185819890667
+   ],
+   "replay_c54_c1_coverage_survival_seed0": [
+    [
+     1.0,
+     0.8385267591942539,
+     0.5095317816060917,
+     0.2471782686180267,
+     0.1808068261597451
+    ],
+    [
+     0.6976264885652333,
+     0.41944038440789116,
+     0.18531710248460215,
+     0.07607284292098583,
+     0.05281829785915243
+    ],
+    2.3339960663688273
+   ],
+   "note": "TP3's served per-position acceptance matches tp4-ring's closely: c8 survival 0.677/0.372/0.184/0.098/0.053 against 0.679/0.367/0.178/0.093/0.051. That supports #986's profile at TP3."
+  },
+  "step_time": {
+   "grid": "candidate-50's tp3-switched screen grid, two boots (receipts/references/candidate-50-no1009-tp3-switched-screen{,-again}/grid.json), fitted at 4K: t = a + b n + c1 min(R,16) + c2 max(R-16,0); rows padded to the TP3 capture ladder [1,2,3,4,6,8,12,16,20,24,28,32,40,48] (eager above 48)",
+   "grid_fit_tp3": {
+    "a_ms": 18.568516238772897,
+    "per_request_ms": 0.07458581917368495,
+    "per_row_le16_ms": 0.16970827344155115,
+    "per_row_above16_ms": 0.2196791685862071
+   },
+   "grid_fit_tp3_rmse_ms": 0.2227698197577035,
+   "grid_tp3_implied_knee_scale": 1.2944517325601472,
+   "grid_fit_tp4_switched_for_comparison": {
+    "a_ms": 15.189928817823498,
+    "per_request_ms": 0.002287438400159547,
+    "per_row_le16_ms": 0.25545429725224245,
+    "per_row_above16_ms": 0.27189351927275557
+   },
+   "grid_tp4_switched_implied_knee_scale": 1.0643528889407587,
+   "interp_check": "piecewise-linear between the grid's own points at the same request count (decode steps the grid covers): c8 GPU step -2.77% to -2.83% against the fit's -2.45% to -2.59%",
+   "model_A": "grid + constant served overhead, anchored so candidate-54's replayed mean equals candidate-50's tp3-switched served step: c1 1000/26.293 = 38.03 ms (single-stream), c8 1000/8.650 = 115.61 ms (screen c8, two boots); c4 overhead interpolated in requests (49.5 ms)",
+   "model_B": "#986's tp4-ring per-batch serving regression (intercept + ms/token + ms/wasted row). A sensitivity only: it is TP4's and prices a wasted row at 1.98 ms at c1 and 0.46 ms at c8.",
+   "model_M": "#986's blend w A + (1 - w) B, with its weights calibrated on the 2026-10-18 row-cost A/B (c1 w 0.57/0.86/1.0, c8 w 0.0/0.01/0.30). The weights were fitted with TP4's model A, so applying them at TP3 is an approximation."
+  },
+  "arms": "c54@tp3, c54@tp4, p5@tp3, p5@tp4; decomposition p5-scale-only@tp3 (floor forced 0) and p5-floor-only@tp3 (scale forced 0.55)",
+  "headline_p5_vs_c54_at_tp3": {
+   "c1": {
+    "draft_budget_per_step_c54": [
+     2.553,
+     2.57
+    ],
+    "draft_budget_per_step_p5": [
+     2.228,
+     2.273
+    ],
+    "steps_budget_differs_pct": [
+     22.1,
+     28.98
+    ],
+    "tokens_per_step_pct": [
+     -1.31,
+     -1.165
+    ],
+    "grid_gpu_step_pct": [
+     -0.33,
+     -0.276
+    ],
+    "grid_interp_gpu_step_pct": [
+     -0.356,
+     -0.282
+    ],
+    "throughput_grid_gpu_only_pct": [
+     -1.009,
+     -0.891
+    ],
+    "served_step_pct_model_A": [
+     -0.168,
+     -0.14
+    ],
+    "throughput_model_A_pct": [
+     -1.158,
+     -1.026
+    ],
+    "throughput_model_B_tp4_regression_pct": [
+     0.992,
+     1.118
+    ],
+    "throughput_model_M_pct": [
+     -1.159,
+     -0.307
+    ]
+   },
+   "c4": {
+    "draft_budget_per_step_c54": [
+     8.668,
+     8.735
+    ],
+    "draft_budget_per_step_p5": [
+     8.415,
+     8.472
+    ],
+    "steps_budget_differs_pct": [
+     11.97,
+     14.44
+    ],
+    "tokens_per_step_pct": [
+     -0.552,
+     -0.503
+    ],
+    "grid_gpu_step_pct": [
+     -0.307,
+     -0.281
+    ],
+    "grid_interp_gpu_step_pct": [
+     -0.275,
+     -0.241
+    ],
+    "throughput_grid_gpu_only_pct": [
+     -0.25,
+     -0.222
+    ],
+    "served_step_pct_model_A": [
+     -0.093,
+     -0.085
+    ],
+    "throughput_model_A_pct": [
+     -0.461,
+     -0.418
+    ],
+    "throughput_model_B_tp4_regression_pct": [
+     -0.1,
+     -0.083
+    ]
+   },
+   "c8": {
+    "draft_budget_per_step_c54": [
+     17.238,
+     17.364
+    ],
+    "draft_budget_per_step_p5": [
+     14.333,
+     14.491
+    ],
+    "steps_budget_differs_pct": [
+     93.97,
+     96.17
+    ],
+    "tokens_per_step_pct": [
+     -3.848,
+     -3.633
+    ],
+    "grid_gpu_step_pct": [
+     -2.589,
+     -2.452
+    ],
+    "grid_interp_gpu_step_pct": [
+     -2.828,
+     -2.765
+    ],
+    "throughput_grid_gpu_only_pct": [
+     -1.32,
+     -1.211
+    ],
+    "served_step_pct_model_A": [
+     -0.55,
+     -0.524
+    ],
+    "throughput_model_A_pct": [
+     -3.323,
+     -3.126
+    ],
+    "throughput_model_B_tp4_regression_pct": [
+     -0.171,
+     -0.155
+    ],
+    "throughput_model_M_pct": [
+     -1.328,
+     -0.155
+    ]
+   }
+  },
+  "decomposition": {
+   "c1": {
+    "scale_only": {
+     "draft_budget_per_step_c54": [
+      2.553,
+      2.57
+     ],
+     "draft_budget_per_step_p5": [
+      2.553,
+      2.57
+     ],
+     "steps_budget_differs_pct": [
+      0.0,
+      0.01
+     ],
+     "tokens_per_step_pct": [
+      0.0,
+      0.0
+     ],
+     "grid_gpu_step_pct": [
+      0.0,
+      0.0
+     ],
+     "grid_interp_gpu_step_pct": [
+      0.0,
+      0.0
+     ],
+     "throughput_grid_gpu_only_pct": [
+      0.0,
+      0.0
+     ],
+     "served_step_pct_model_A": [
+      0.0,
+      0.0
+     ],
+     "throughput_model_A_pct": [
+      0.0,
+      0.0
+     ],
+     "throughput_model_B_tp4_regression_pct": [
+      0.0,
+      0.0
+     ],
+     "throughput_model_M_pct": [
+      -0.002,
+      -0.001
+     ]
+    },
+    "floor_only": {
+     "draft_budget_per_step_c54": [
+      2.553,
+      2.57
+     ],
+     "draft_budget_per_step_p5": [
+      2.228,
+      2.273
+     ],
+     "steps_budget_differs_pct": [
+      22.1,
+      28.98
+     ],
+     "tokens_per_step_pct": [
+      -1.31,
+      -1.165
+     ],
+     "grid_gpu_step_pct": [
+      -0.33,
+      -0.276
+     ],
+     "grid_interp_gpu_step_pct": [
+      -0.356,
+      -0.282
+     ],
+     "throughput_grid_gpu_only_pct": [
+      -1.009,
+      -0.891
+     ],
+     "served_step_pct_model_A": [
+      -0.168,
+      -0.14
+     ],
+     "throughput_model_A_pct": [
+      -1.158,
+      -1.026
+     ],
+     "throughput_model_B_tp4_regression_pct": [
+      0.992,
+      1.118
+     ],
+     "throughput_model_M_pct": [
+      -1.159,
+      -0.307
+     ]
+    }
+   },
+   "c4": {
+    "scale_only": {
+     "draft_budget_per_step_c54": [
+      8.668,
+      8.735
+     ],
+     "draft_budget_per_step_p5": [
+      8.418,
+      8.475
+     ],
+     "steps_budget_differs_pct": [
+      11.86,
+      14.34
+     ],
+     "tokens_per_step_pct": [
+      -0.548,
+      -0.499
+     ],
+     "grid_gpu_step_pct": [
+      -0.304,
+      -0.275
+     ],
+     "grid_interp_gpu_step_pct": [
+      -0.275,
+      -0.241
+     ],
+     "throughput_grid_gpu_only_pct": [
+      -0.251,
+      -0.224
+     ],
+     "served_step_pct_model_A": [
+      -0.092,
+      -0.083
+     ],
+     "throughput_model_A_pct": [
+      -0.458,
+      -0.416
+     ],
+     "throughput_model_B_tp4_regression_pct": [
+      -0.1,
+      -0.083
+     ]
+    },
+    "floor_only": {
+     "draft_budget_per_step_c54": [
+      8.668,
+      8.735
+     ],
+     "draft_budget_per_step_p5": [
+      8.639,
+      8.706
+     ],
+     "steps_budget_differs_pct": [
+      1.29,
+      1.94
+     ],
+     "tokens_per_step_pct": [
+      -0.035,
+      -0.02
+     ],
+     "grid_gpu_step_pct": [
+      -0.036,
+      -0.022
+     ],
+     "grid_interp_gpu_step_pct": [
+      -0.002,
+      0.0
+     ],
+     "throughput_grid_gpu_only_pct": [
+      -0.005,
+      0.002
+     ],
+     "served_step_pct_model_A": [
+      -0.011,
+      -0.007
+     ],
+     "throughput_model_A_pct": [
+      -0.026,
+      -0.013
+     ],
+     "throughput_model_B_tp4_regression_pct": [
+      0.002,
+      0.004
+     ]
+    }
+   },
+   "c8": {
+    "scale_only": {
+     "draft_budget_per_step_c54": [
+      17.238,
+      17.364
+     ],
+     "draft_budget_per_step_p5": [
+      14.333,
+      14.491
+     ],
+     "steps_budget_differs_pct": [
+      93.97,
+      96.17
+     ],
+     "tokens_per_step_pct": [
+      -3.848,
+      -3.633
+     ],
+     "grid_gpu_step_pct": [
+      -2.589,
+      -2.452
+     ],
+     "grid_interp_gpu_step_pct": [
+      -2.828,
+      -2.765
+     ],
+     "throughput_grid_gpu_only_pct": [
+      -1.32,
+      -1.211
+     ],
+     "served_step_pct_model_A": [
+      -0.55,
+      -0.524
+     ],
+     "throughput_model_A_pct": [
+      -3.323,
+      -3.126
+     ],
+     "throughput_model_B_tp4_regression_pct": [
+      -0.171,
+      -0.155
+     ],
+     "throughput_model_M_pct": [
+      -1.328,
+      -0.155
+     ]
+    },
+    "floor_only": {
+     "draft_budget_per_step_c54": [
+      17.238,
+      17.364
+     ],
+     "draft_budget_per_step_p5": [
+      17.238,
+      17.364
+     ],
+     "steps_budget_differs_pct": [
+      0.0,
+      0.01
+     ],
+     "tokens_per_step_pct": [
+      -0.0,
+      -0.0
+     ],
+     "grid_gpu_step_pct": [
+      -0.001,
+      0.0
+     ],
+     "grid_interp_gpu_step_pct": [
+      -0.001,
+      0.0
+     ],
+     "throughput_grid_gpu_only_pct": [
+      -0.0,
+      0.001
+     ],
+     "served_step_pct_model_A": [
+      0.0,
+      0.0
+     ],
+     "throughput_model_A_pct": [
+      -0.0,
+      -0.0
+     ],
+     "throughput_model_B_tp4_regression_pct": [
+      0.0,
+      0.0
+     ],
+     "throughput_model_M_pct": [
+      0.0,
+      0.0
+     ]
+    }
+   }
+  },
+  "padded_rows_histogram_seed0": {
+   "c1": {
+    "c54@tp3": {
+     "1": 1467,
+     "2": 2964,
+     "3": 6037,
+     "4": 4820,
+     "6": 4535,
+     "24": 97,
+     "28": 80
+    },
+    "p5@tp3": {
+     "1": 2335,
+     "2": 3867,
+     "3": 5994,
+     "4": 3995,
+     "6": 3632,
+     "24": 118,
+     "28": 59
+    }
+   },
+   "c4": {
+    "c54@tp3": {
+     "4": 1,
+     "6": 67,
+     "8": 911,
+     "12": 9720,
+     "16": 6201,
+     "20": 2266,
+     "24": 142,
+     "28": 2,
+     "32": 63,
+     "40": 608,
+     "48": 19
+    },
+    "p5@tp3": {
+     "4": 1,
+     "6": 67,
+     "8": 911,
+     "12": 9725,
+     "16": 7314,
+     "20": 1263,
+     "24": 27,
+     "28": 10,
+     "32": 146,
+     "40": 527,
+     "48": 9
+    }
+   },
+   "c8": {
+    "c54@tp3": {
+     "12": 13,
+     "16": 153,
+     "20": 1292,
+     "24": 6692,
+     "28": 7628,
+     "32": 2533,
+     "40": 296,
+     "48": 919,
+     "49": 138,
+     "50": 112,
+     "51": 88,
+     "52": 63,
+     "53": 37,
+     "54": 20,
+     "55": 9,
+     "56": 4,
+     "58": 3
+    },
+    "p5@tp3": {
+     "12": 14,
+     "16": 602,
+     "20": 5105,
+     "24": 8694,
+     "28": 3659,
+     "32": 470,
+     "40": 148,
+     "48": 1113,
+     "49": 78,
+     "50": 52,
+     "51": 36,
+     "52": 19,
+     "53": 9,
+     "55": 1
+    }
+   }
+  },
+  "cells": {
+   "c1": {
+    "986fit": [
+     {
+      "seed": 0,
+      "vs": "c54@tp3",
+      "effective_dead_rows_tau": 0.12,
+      "draft_budget_per_step": [
+       2.57,
+       2.273
+      ],
+      "rows_per_step": [
+       3.756,
+       3.459
+      ],
+      "tokens_per_step": [
+       2.334,
+       2.3068
+      ],
+      "steps_budget_differs_pct": 22.1,
+      "tokens_per_step_pct": -1.165,
+      "grid_gpu_step_ms": [
+       19.298,
+       19.244
+      ],
+      "grid_gpu_step_pct": -0.276,
+      "grid_interp_gpu_step_pct": -0.282,
+      "throughput_grid_gpu_only_pct": -0.891,
+      "served_step_ms_model_A": [
+       38.032,
+       37.979
+      ],
+      "served_step_pct_model_A": -0.14,
+      "throughput_model_A_pct": -1.026,
+      "throughput_model_A_pct_bootstrap95": [
+       -1.059,
+       -0.991
+      ],
+      "throughput_model_B_tp4_regression_pct": 0.992,
+      "throughput_model_M_pct": {
+       "central": -0.813,
+       "minus_0.5": -0.307,
+       "plus_0.5": -1.027
+      }
+     },
+     {
+      "seed": 1,
+      "vs": "c54@tp3",
+      "effective_dead_rows_tau": 0.12,
+      "draft_budget_per_step": [
+       2.553,
+       2.228
+      ],
+      "rows_per_step": [
+       3.749,
+       3.424
+      ],
+      "tokens_per_step": [
+       2.28,
+       2.2502
+      ],
+      "steps_budget_differs_pct": 24.32,
+      "tokens_per_step_pct": -1.31,
+      "grid_gpu_step_ms": [
+       19.3,
+       19.241
+      ],
+      "grid_gpu_step_pct": -0.304,
+      "grid_interp_gpu_step_pct": -0.316,
+      "throughput_grid_gpu_only_pct": -1.009,
+      "served_step_ms_model_A": [
+       38.032,
+       37.974
+      ],
+      "served_step_pct_model_A": -0.154,
+      "throughput_model_A_pct": -1.158,
+      "throughput_model_A_pct_bootstrap95": [
+       -1.189,
+       -1.124
+      ],
+      "throughput_model_B_tp4_regression_pct": 1.055,
+      "throughput_model_M_pct": {
+       "central": -0.92,
+       "minus_0.5": -0.384,
+       "plus_0.5": -1.159
+      }
+     }
+    ],
+    "tp3fit": [
+     {
+      "seed": 0,
+      "vs": "c54@tp3",
+      "effective_dead_rows_tau": 0.12,
+      "draft_budget_per_step": [
+       2.71,
+       2.382
+      ],
+      "rows_per_step": [
+       3.896,
+       3.567
+      ],
+      "tokens_per_step": [
+       2.3464,
+       2.3163
+      ],
+      "steps_budget_differs_pct": 27.71,
+      "tokens_per_step_pct": -1.285,
+      "grid_gpu_step_ms": [
+       19.332,
+       19.269
+      ],
+      "grid_gpu_step_pct": -0.327,
+      "grid_interp_gpu_step_pct": -0.352,
+      "throughput_grid_gpu_only_pct": -0.961,
+      "served_step_ms_model_A": [
+       38.032,
+       37.969
+      ],
+      "served_step_pct_model_A": -0.166,
+      "throughput_model_A_pct": -1.121,
+      "throughput_model_A_pct_bootstrap95": [
+       -1.151,
+       -1.095
+      ],
+      "throughput_model_B_tp4_regression_pct": 1.074,
+      "throughput_model_M_pct": {
+       "central": -0.888,
+       "minus_0.5": -0.335,
+       "plus_0.5": -1.122
+      }
+     },
+     {
+      "seed": 1,
+      "vs": "c54@tp3",
+      "effective_dead_rows_tau": 0.12,
+      "draft_budget_per_step": [
+       2.659,
+       2.323
+      ],
+      "rows_per_step": [
+       3.856,
+       3.519
+      ],
+      "tokens_per_step": [
+       2.3446,
+       2.3139
+      ],
+      "steps_budget_differs_pct": 28.98,
+      "tokens_per_step_pct": -1.31,
+      "grid_gpu_step_ms": [
+       19.323,
+       19.259
+      ],
+      "grid_gpu_step_pct": -0.33,
+      "grid_interp_gpu_step_pct": -0.356,
+      "throughput_grid_gpu_only_pct": -0.984,
+      "served_step_ms_model_A": [
+       38.032,
+       37.969
+      ],
+      "served_step_pct_model_A": -0.168,
+      "throughput_model_A_pct": -1.145,
+      "throughput_model_A_pct_bootstrap95": [
+       -1.174,
+       -1.117
+      ],
+      "throughput_model_B_tp4_regression_pct": 1.118,
+      "throughput_model_M_pct": {
+       "central": -0.9,
+       "minus_0.5": -0.349,
+       "plus_0.5": -1.146
+      }
+     }
+    ]
+   },
+   "c4": {
+    "986fit": [
+     {
+      "seed": 0,
+      "vs": "c54@tp3",
+      "effective_dead_rows_tau": 0.12,
+      "draft_budget_per_step": [
+       8.735,
+       8.472
+      ],
+      "rows_per_step": [
+       13.341,
+       13.079
+      ],
+      "tokens_per_step": [
+       8.9303,
+       8.8831
+      ],
+      "steps_budget_differs_pct": 12.55,
+      "tokens_per_step_pct": -0.528,
+      "grid_gpu_step_ms": [
+       21.469,
+       21.405
+      ],
+      "grid_gpu_step_pct": -0.296,
+      "grid_interp_gpu_step_pct": -0.25,
+      "throughput_grid_gpu_only_pct": -0.233,
+      "served_step_ms_model_A": [
+       71.019,
+       70.955
+      ],
+      "served_step_pct_model_A": -0.09,
+      "throughput_model_A_pct": -0.439,
+      "throughput_model_A_pct_bootstrap95": [
+       -0.459,
+       -0.422
+      ],
+      "throughput_model_B_tp4_regression_pct": -0.09
+     },
+     {
+      "seed": 1,
+      "vs": "c54@tp3",
+      "effective_dead_rows_tau": 0.12,
+      "draft_budget_per_step": [
+       8.668,
+       8.415
+      ],
+      "rows_per_step": [
+       13.256,
+       13.003
+      ],
+      "tokens_per_step": [
+       8.9224,
+       8.8775
+      ],
+      "steps_budget_differs_pct": 11.97,
+      "tokens_per_step_pct": -0.503,
+      "grid_gpu_step_ms": [
+       21.451,
+       21.391
+      ],
+      "grid_gpu_step_pct": -0.281,
+      "grid_interp_gpu_step_pct": -0.241,
+      "throughput_grid_gpu_only_pct": -0.222,
+      "served_step_ms_model_A": [
+       71.024,
+       70.963
+      ],
+      "served_step_pct_model_A": -0.085,
+      "throughput_model_A_pct": -0.418,
+      "throughput_model_A_pct_bootstrap95": [
+       -0.436,
+       -0.397
+      ],
+      "throughput_model_B_tp4_regression_pct": -0.083
+     }
+    ],
+    "tp3fit": [
+     {
+      "seed": 0,
+      "vs": "c54@tp3",
+      "effective_dead_rows_tau": 0.12,
+      "draft_budget_per_step": [
+       8.787,
+       8.508
+      ],
+      "rows_per_step": [
+       13.393,
+       13.115
+      ],
+      "tokens_per_step": [
+       8.9516,
+       8.9022
+      ],
+      "steps_budget_differs_pct": 12.95,
+      "tokens_per_step_pct": -0.552,
+      "grid_gpu_step_ms": [
+       21.477,
+       21.412
+      ],
+      "grid_gpu_step_pct": -0.303,
+      "grid_interp_gpu_step_pct": -0.265,
+      "throughput_grid_gpu_only_pct": -0.25,
+      "served_step_ms_model_A": [
+       71.003,
+       70.938
+      ],
+      "served_step_pct_model_A": -0.092,
+      "throughput_model_A_pct": -0.461,
+      "throughput_model_A_pct_bootstrap95": [
+       -0.481,
+       -0.444
+      ],
+      "throughput_model_B_tp4_regression_pct": -0.091
+     },
+     {
+      "seed": 1,
+      "vs": "c54@tp3",
+      "effective_dead_rows_tau": 0.12,
+      "draft_budget_per_step": [
+       9.117,
+       8.851
+      ],
+      "rows_per_step": [
+       13.706,
+       13.439
+      ],
+      "tokens_per_step": [
+       9.0908,
+       9.0408
+      ],
+      "steps_budget_differs_pct": 14.44,
+      "tokens_per_step_pct": -0.55,
+      "grid_gpu_step_ms": [
+       21.538,
+       21.472
+      ],
+      "grid_gpu_step_pct": -0.307,
+      "grid_interp_gpu_step_pct": -0.275,
+      "throughput_grid_gpu_only_pct": -0.244,
+      "served_step_ms_model_A": [
+       71.014,
+       70.948
+      ],
+      "served_step_pct_model_A": -0.093,
+      "throughput_model_A_pct": -0.457,
+      "throughput_model_A_pct_bootstrap95": [
+       -0.474,
+       -0.442
+      ],
+      "throughput_model_B_tp4_regression_pct": -0.1
+     }
+    ]
+   },
+   "c4-theta-c1": {
+    "986fit": [
+     {
+      "seed": 0,
+      "vs": "c54@tp3",
+      "effective_dead_rows_tau": 0.12,
+      "draft_budget_per_step": [
+       7.566,
+       7.435
+      ],
+      "rows_per_step": [
+       12.167,
+       12.036
+      ],
+      "tokens_per_step": [
+       8.7068,
+       8.6838
+      ],
+      "steps_budget_differs_pct": 6.25,
+      "tokens_per_step_pct": -0.265,
+      "grid_gpu_step_ms": [
+       21.24,
+       21.205
+      ],
+      "grid_gpu_step_pct": -0.164,
+      "grid_interp_gpu_step_pct": -0.125,
+      "throughput_grid_gpu_only_pct": -0.101,
+      "served_step_ms_model_A": [
+       70.79,
+       70.755
+      ],
+      "served_step_pct_model_A": -0.049,
+      "throughput_model_A_pct": -0.216,
+      "throughput_model_A_pct_bootstrap95": [
+       -0.23,
+       -0.202
+      ],
+      "throughput_model_B_tp4_regression_pct": -0.044
+     },
+     {
+      "seed": 1,
+      "vs": "c54@tp3",
+      "effective_dead_rows_tau": 0.12,
+      "draft_budget_per_step": [
+       7.421,
+       7.312
+      ],
+      "rows_per_step": [
+       12.001,
+       11.892
+      ],
+      "tokens_per_step": [
+       8.5238,
+       8.5049
+      ],
+      "steps_budget_differs_pct": 5.44,
+      "tokens_per_step_pct": -0.221,
+      "grid_gpu_step_ms": [
+       21.207,
+       21.178
+      ],
+      "grid_gpu_step_pct": -0.136,
+      "grid_interp_gpu_step_pct": -0.103,
+      "throughput_grid_gpu_only_pct": -0.085,
+      "served_step_ms_model_A": [
+       70.78,
+       70.751
+      ],
+      "served_step_pct_model_A": -0.041,
+      "throughput_model_A_pct": -0.18,
+      "throughput_model_A_pct_bootstrap95": [
+       -0.194,
+       -0.166
+      ],
+      "throughput_model_B_tp4_regression_pct": -0.037
+     }
+    ],
+    "tp3fit": [
+     {
+      "seed": 0,
+      "vs": "c54@tp3",
+      "effective_dead_rows_tau": 0.12,
+      "draft_budget_per_step": [
+       7.912,
+       7.787
+      ],
+      "rows_per_step": [
+       12.513,
+       12.387
+      ],
+      "tokens_per_step": [
+       8.7318,
+       8.7096
+      ],
+      "steps_budget_differs_pct": 6.92,
+      "tokens_per_step_pct": -0.254,
+      "grid_gpu_step_ms": [
+       21.308,
+       21.273
+      ],
+      "grid_gpu_step_pct": -0.163,
+      "grid_interp_gpu_step_pct": -0.121,
+      "throughput_grid_gpu_only_pct": -0.091,
+      "served_step_ms_model_A": [
+       70.834,
+       70.799
+      ],
+      "served_step_pct_model_A": -0.049,
+      "throughput_model_A_pct": -0.205,
+      "throughput_model_A_pct_bootstrap95": [
+       -0.22,
+       -0.192
+      ],
+      "throughput_model_B_tp4_regression_pct": -0.043
+     },
+     {
+      "seed": 1,
+      "vs": "c54@tp3",
+      "effective_dead_rows_tau": 0.12,
+      "draft_budget_per_step": [
+       7.731,
+       7.632
+      ],
+      "rows_per_step": [
+       12.311,
+       12.212
+      ],
+      "tokens_per_step": [
+       8.7505,
+       8.7328
+      ],
+      "steps_budget_differs_pct": 5.54,
+      "tokens_per_step_pct": -0.202,
+      "grid_gpu_step_ms": [
+       21.268,
+       21.241
+      ],
+      "grid_gpu_step_pct": -0.128,
+      "grid_interp_gpu_step_pct": -0.089,
+      "throughput_grid_gpu_only_pct": -0.075,
+      "served_step_ms_model_A": [
+       70.745,
+       70.718
+      ],
+      "served_step_pct_model_A": -0.038,
+      "throughput_model_A_pct": -0.164,
+      "throughput_model_A_pct_bootstrap95": [
+       -0.177,
+       -0.152
+      ],
+      "throughput_model_B_tp4_regression_pct": -0.035
+     }
+    ]
+   },
+   "c8": {
+    "986fit": [
+     {
+      "seed": 0,
+      "vs": "c54@tp3",
+      "effective_dead_rows_tau": 0.12,
+      "draft_budget_per_step": [
+       17.364,
+       14.491
+      ],
+      "rows_per_step": [
+       26.625,
+       23.752
+      ],
+      "tokens_per_step": [
+       17.8619,
+       17.1802
+      ],
+      "steps_budget_differs_pct": 94.67,
+      "tokens_per_step_pct": -3.816,
+      "grid_gpu_step_ms": [
+       24.545,
+       23.924
+      ],
+      "grid_gpu_step_pct": -2.53,
+      "grid_interp_gpu_step_pct": -2.772,
+      "throughput_grid_gpu_only_pct": -1.32,
+      "served_step_ms_model_A": [
+       115.607,
+       114.986
+      ],
+      "served_step_pct_model_A": -0.537,
+      "throughput_model_A_pct": -3.297,
+      "throughput_model_A_pct_bootstrap95": [
+       -3.324,
+       -3.269
+      ],
+      "throughput_model_B_tp4_regression_pct": -0.163,
+      "throughput_model_M_pct": {
+       "central": -0.208,
+       "minus_0.5": -0.163,
+       "plus_0.5": -1.328
+      }
+     },
+     {
+      "seed": 1,
+      "vs": "c54@tp3",
+      "effective_dead_rows_tau": 0.12,
+      "draft_budget_per_step": [
+       17.238,
+       14.333
+      ],
+      "rows_per_step": [
+       26.394,
+       23.489
+      ],
+      "tokens_per_step": [
+       17.8341,
+       17.1479
+      ],
+      "steps_budget_differs_pct": 93.97,
+      "tokens_per_step_pct": -3.848,
+      "grid_gpu_step_ms": [
+       24.492,
+       23.864
+      ],
+      "grid_gpu_step_pct": -2.563,
+      "grid_interp_gpu_step_pct": -2.806,
+      "throughput_grid_gpu_only_pct": -1.318,
+      "served_step_ms_model_A": [
+       115.607,
+       114.979
+      ],
+      "served_step_pct_model_A": -0.543,
+      "throughput_model_A_pct": -3.323,
+      "throughput_model_A_pct_bootstrap95": [
+       -3.349,
+       -3.296
+      ],
+      "throughput_model_B_tp4_regression_pct": -0.159,
+      "throughput_model_M_pct": {
+       "central": -0.242,
+       "minus_0.5": -0.159,
+       "plus_0.5": -1.321
+      }
+     }
+    ],
+    "tp3fit": [
+     {
+      "seed": 0,
+      "vs": "c54@tp3",
+      "effective_dead_rows_tau": 0.12,
+      "draft_budget_per_step": [
+       17.4,
+       14.486
+      ],
+      "rows_per_step": [
+       26.661,
+       23.747
+      ],
+      "tokens_per_step": [
+       17.8882,
+       17.2003
+      ],
+      "steps_budget_differs_pct": 94.3,
+      "tokens_per_step_pct": -3.845,
+      "grid_gpu_step_ms": [
+       24.556,
+       23.92
+      ],
+      "grid_gpu_step_pct": -2.589,
+      "grid_interp_gpu_step_pct": -2.828,
+      "throughput_grid_gpu_only_pct": -1.29,
+      "served_step_ms_model_A": [
+       115.607,
+       114.971
+      ],
+      "served_step_pct_model_A": -0.55,
+      "throughput_model_A_pct": -3.314,
+      "throughput_model_A_pct_bootstrap95": [
+       -3.342,
+       -3.288
+      ],
+      "throughput_model_B_tp4_regression_pct": -0.155,
+      "throughput_model_M_pct": {
+       "central": -0.2,
+       "minus_0.5": -0.155,
+       "plus_0.5": -1.328
+      }
+     },
+     {
+      "seed": 1,
+      "vs": "c54@tp3",
+      "effective_dead_rows_tau": 0.12,
+      "draft_budget_per_step": [
+       18.094,
+       15.364
+      ],
+      "rows_per_step": [
+       27.25,
+       24.519
+      ],
+      "tokens_per_step": [
+       18.158,
+       17.4982
+      ],
+      "steps_budget_differs_pct": 96.17,
+      "tokens_per_step_pct": -3.633,
+      "grid_gpu_step_ms": [
+       24.684,
+       24.079
+      ],
+      "grid_gpu_step_pct": -2.452,
+      "grid_interp_gpu_step_pct": -2.765,
+      "throughput_grid_gpu_only_pct": -1.211,
+      "served_step_ms_model_A": [
+       115.607,
+       115.002
+      ],
+      "served_step_pct_model_A": -0.524,
+      "throughput_model_A_pct": -3.126,
+      "throughput_model_A_pct_bootstrap95": [
+       -3.148,
+       -3.106
+      ],
+      "throughput_model_B_tp4_regression_pct": -0.171,
+      "throughput_model_M_pct": {
+       "central": -0.247,
+       "minus_0.5": -0.171,
+       "plus_0.5": -1.244
+      }
+     }
+    ]
+   }
+  },
+  "files": {
+   "986fit-seed0": "raw/out/replay-986fit-seed0.json",
+   "986fit-seed1": "raw/out/replay-986fit-seed1.json",
+   "tp3fit-seed0": "raw/out/replay-tp3fit-seed0.json",
+   "tp3fit-seed1": "raw/out/replay-tp3fit-seed1.json"
+  }
+ },
+ "why_no_gain": [
+  "The grid prices rows far below the budget's own price. At TP3 a row costs 0.170 ms up to 16 rows and 0.220 ms past 16, on an 18.6 ms fixed step: 0.9% and 1.2% of the step. The recipe's row cost is 3.5% of the step. At c8 (about 26 rows) candidate-54 already charges a row past 16 about 1.1% of its modelled step, against the grid's 0.9% of the GPU step and 0.19% of the served step. Part 5's 0.85 raises that to about 1.6%, so it trims rows whose survival (about 0.2-0.3) is worth more tokens than the 0.22 ms they cost.",
+  "At c1 the floor rejects slots with survival between 0.063 and 0.12. On the grid, such a slot pays for itself above roughly 0.02 survival (tokens 2.3 x 0.17 ms / 19.3 ms GPU step), or 0.01 on the served step.",
+  "The PR's premise, that TP3 rows past the knee cost more than TP4's, does not show in the grids. TP3-switched rows cost 0.170 and 0.220 ms; TP4-switched rows cost 0.255 and 0.272 ms (0.9% against 1.7% of the step). Neither grid shows the knee discount: the slope ratio past 16 is 1.29 at TP3 and 1.06 at TP4.",
+  "At TP3 a c8 step of 40 rows runs the 40-row graph. The ladder holds 40, so the PR's '40 rows -> padded to 48' does not apply here."
+ ],
+ "serving_judgment": "candidate-57's tp3-switched screen with single-stream and sampled companions. Predicted if part 5 is carried: c8 paired decode lower (the grid alone says 1.2% to 3.3%), single-stream c1 lower by about 1%, and temperature-0 text unchanged. A no957p5 control on the same image needs only no957p5/overlay/.",
+ "not_run": [
+  "No serving run and no step-time measurement of my own: the grid is the step-time evidence named in the brief, and a one-GPU sp8 profile cannot run TP3 shapes",
+  "No copy-draft replay beyond the fixed cells: the screen's prompts give coverage past position 4 of 0.0002 at c8 and 0 at c1"
+ ],
+ "hosts_and_rules": "sp8 (spark-0016) only. Every container went through raw/scripts/run.sh: flock /tmp/spark-lab-gpu.lock, ~/spark-hold.json absent and docker ps empty checked inside the lock, each block logged in raw/out/commands.log. The GPU work was tiny CUDA buffers for the managers' __init__ and the unit tests. No push, commit to this repository, PR, image build, cluster or window operation. The laptop did file transfers and text work only (no series replay, no build).",
+ "inputs": {
+  "origin_main": "6de8656022eddfa1ef14c10c99ee78c3138493be (read with git show)",
+  "pr_957_head": "e464d364431a26b031a6e91f5dd610f429129c46 (git fetch origin pull/957/head)",
+  "round3_selection": "candidate-55/receipts/selection-proposal.json (rework_needed['957-p5'], candidates['57']); rebases/57-01 (sha256 67ed1f5f...), 57-02 (b8f0bf3a...)",
+  "sha256": {
+   "986 served_targets.json": "08cca565bc715e3dbc90d9a7729d6ebc939a7f8812d0beb4c49e6c5b1d2faaa5",
+   "986 replay-seed0.json": "f2d6f31fbcdec11909ab2dbcdc88b8a5c382fd275dadf670fe2aa2422c2cbe1b",
+   "986 replay-seed1.json": "d2811540d06f4f0624dbbfbeb1d9baa589c52cfb3cca2997b4aa38967ff709de",
+   "986 replay_budget.py": "3d1c94f7563e16aa7b6945c6e58e643ca730f90edb4a3c25d68b70b08505cfa1",
+   "candidate-50-no1009-tp3-switched-screen grid.json": "11fa55d8466093980e467033903a2fb17dd1638bd11a5445a59ea0ce4166f1ec",
+   "candidate-50-no1009-tp3-switched-screen-again grid.json": "b047c4333ec255de1f9e455251fadfae28a9e51be40bbbabc80c202cc56aac34",
+   "candidate-50-no1009-tp4-switched-screen grid.json": "c906c72ebaf1112846c71ad2a4ce57bf90df202c0837a16b17939eeaa2e7ed4c",
+   "candidate-50-no1009-tp4-switched-screen-again grid.json": "9983297a2eb3703c4e03a396e7a6b373bb4c73a6efa2e6a87f0197cacaeee5f4",
+   "candidate-50 tp3-switched c8.json": "b69624cc9755da920e37f277af0721280651edc5bc9e92f1e5c664b9e1ea9174",
+   "candidate-50 tp3-switched-again c8.json": "7bac75fa29bcc5aee908b408a106117549cea59d4d50ad1f556deaa0daa18ab6",
+   "candidate-50 tp3-switched single-stream c1.json": "79e62348c0a2734bb7a7adf09ff31679b63c984f27fb8427459ce662ed627aff",
+   "av_c54.py (candidate-54 adaptive_verification.py)": "69f6aad9a731ae177235ebf5e218fae24797cbd9f24dafb658cff69ece2e1590",
+   "av_p5.py (rebased)": "e1434cdc4a5b3d7d4529479852996a8fc952ba797ce46d38db2e4d6c2d577c0d"
+  },
+  "image": "spark-ds41f:candidate-50 (8c1ea1f62f62, vLLM tree d5778ab5) + candidate-54's 36 changed files (raw/in/changed-c54.txt) for the replay, or candidate-57-with-p5's 42 (raw/in/changed-c57p5.txt) for its tests; sp8 has no candidate-54 image"
+ }
+}

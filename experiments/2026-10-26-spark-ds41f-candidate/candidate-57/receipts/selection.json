@@ -1,0 +1,129 @@
+{
+ "candidate": 57,
+ "shape": "tp3-switched",
+ "nodes": "sp5..sp7 (head sp5)",
+ "purpose": "PR validation (docs/release-benchmark.md, steps 1-8): one of candidates 55, 56 and 57, tested at the same time, one per testbed",
+ "theme": "#957's TP3 parts: the branchless sparse-MLA stage 2 (measured at TP3's 24 heads) and the fused DSpark confidence calibration with the (4, 24) dummy-run fix. Part 5 (the TP3 adaptive-verification constants) is dropped after its rework (left_out)",
+ "base": "candidate-54",
+ "base_series": "candidate-54's vllm/series by relative path (spark-ds41f-1107's 0001..0761, 641 active; candidate-50's 0762..0780 with #1009 round 1 in place of its 0778; round 2's 0781..0791): 671 patches",
+ "base_lock": "experiments/2026-10-26-spark-ds41f-candidate/candidate-54/upstreams.lock.json",
+ "base_head": "4e8133ff10a125b90753c2727f162e29fe37f30c",
+ "base_tree": "5f021d9a7f01c03e2389dd3d8021759cfa19ea34",
+ "stack_head": "d74e38eefbda4004daaebb50dc7c45337b72df7a",
+ "stack_tree": "72b40d7102ab56384a68885ad3a61733afe1c5a2",
+ "patchset_sha256": "5131e0208c0cb0d530b0ddbcd2220ee2c6bc86ea74eacd6298a56e9529407130",
+ "order": [
+  957,
+  957
+ ],
+ "patches": [
+  {
+   "patch": "0797-perf-dsv41-branchless-sparse-MLA-stage-2-online-soft.patch",
+   "pr": 957,
+   "label": "957-p2",
+   "pr_title": "TP3/TP4 decode compressor, sparse MLA, and spec-decode fusions",
+   "pr_head": "e464d364431a26b031a6e91f5dd610f429129c46",
+   "source_patch": "experiments/2026-11-08-tp3-decode-recovery/vllm/0762-perf-dsv41-tp3-decode-compressor-mla-and-spec-fusions.patch",
+   "source_sha256": "44412274ff72075c37afed64dbd9cb638cf604a34901b10f11b6fee128385e71",
+   "method": "hunk-level split",
+   "proposed_patch": "experiments/2026-10-26-spark-ds41f-candidate/candidate-55/receipts/rebases/57-01-957-p2-perf-dsv41-tp3-decode-compressor-mla-and-spec-fusions.patch",
+   "proposed_sha256": "67ed1f5fc27d4799e56098703899b35f68b72273d8cf2ac8739e4149eb301f4d",
+   "applied": "clean; the selection's hunk-level split, retitled for the part it carries (Subject and one body line; no diff byte changed)",
+   "sha256": "500ed5992f12867a1168a724b09594ab9a0f0557369f7a443c992f751410075f",
+   "subject": "perf(dsv41): branchless sparse MLA stage-2 online softmax over inactive segments",
+   "pr_subject": "perf(dsv41): TP3/TP4 decode compressor, sparse MLA, and spec-decode fusions",
+   "author": "Christopher Owen <3221756+christopherowen@users.noreply.github.com>",
+   "commit": "9241066bbf8851112bc815814503a335aa62b561",
+   "tree": "f7402e1e5d1a4dadf580d4e42c3d3699fbba1991",
+   "kind": "perf",
+   "category": "K1",
+   "own_mark": "Its screen_tp3_decode.py sparse-MLA cells on the candidate image, 2 boots, ABBA, by CUDA-graph replay: stage 2 at TP3 (24 heads, 12 and 16 rows) faster beyond the interval (the PR: -49..-62 us a step at 12 rows and -46..-99 us at 16, over 30 indexed layers), outputs torch.equal; TP4 cells (16 heads) not worse. On the testbed: engine-grid decode not worse",
+   "declared_output_change": "none: stage 2 starts M at the sink logit (finite), so an inactive segment's (-inf, 0) partial leaves M, L and o exactly as the skipped update did; the split decode kernel (skip_inactive=False) is unchanged",
+   "acts": "every shape's decode sparse MLA (skip_inactive defaults True)",
+   "placement": "measured at TP3 (24 heads); the TP3 parts go to tp3-switched"
+  },
+  {
+   "patch": "0798-perf-dsv41-fuse-DSpark-confidence-calibration-and-ke.patch",
+   "pr": 957,
+   "label": "957-p4",
+   "pr_title": "TP3/TP4 decode compressor, sparse MLA, and spec-decode fusions",
+   "pr_head": "e464d364431a26b031a6e91f5dd610f429129c46",
+   "source_patch": "experiments/2026-11-08-tp3-decode-recovery/vllm/0762-perf-dsv41-tp3-decode-compressor-mla-and-spec-fusions.patch",
+   "source_sha256": "44412274ff72075c37afed64dbd9cb638cf604a34901b10f11b6fee128385e71",
+   "method": "hunk-level split",
+   "proposed_patch": "experiments/2026-10-26-spark-ds41f-candidate/candidate-55/receipts/rebases/57-02-957-p4-perf-dsv41-tp3-decode-compressor-mla-and-spec-fusions.patch",
+   "proposed_sha256": "b8f0bf3a661cccc0aaf856eed06a717b3a98ed230aca61d22c86cc77385cfd73",
+   "applied": "clean; the selection's hunk-level split, retitled for the part it carries (Subject and one body line; no diff byte changed)",
+   "sha256": "671daa2fdcf9395a14fd97612ec01f665d7063f96746d0b54bea82150cbd6a51",
+   "subject": "perf(dsv41): fuse DSpark confidence calibration and keep active num_reqs in dummy runs",
+   "pr_subject": "perf(dsv41): TP3/TP4 decode compressor, sparse MLA, and spec-decode fusions",
+   "author": "Christopher Owen <3221756+christopherowen@users.noreply.github.com>",
+   "commit": "fc18ad3d4975c91d953cbbc831759521b3c47371",
+   "tree": "1ba414cdbce1c37b95477576002eac4a6a6cc802",
+   "kind": "perf (spec-decode bookkeeping)",
+   "category": "P",
+   "own_mark": "Its screen_tp3_decode.py confidence cells and tests/kernels/test_deepseek_v41_tilelang_confidence.py on the candidate image, 2 boots, ABBA: probability_and_calibrate faster than probability plus calibrate_confidence_probs beyond the interval (the PR: 17.2-19.0 -> 8.5-9.2 us), calibrated confidences within FP32 rounding of the two-step path; the (4, 24) dummy run captures the (4, 20) DSpark draft graph (functional); paired decode at 4 and 8 streams not worse",
+   "declared_output_change": "draft confidences within FP32 rounding of the two-step path, so verification rows may differ; temperature-0 text must not change; sampled realizations may change",
+   "acts": "every shape with the confidence head (DSpark sample_idx_mapping is int32, the fused path's condition)",
+   "placement": "three variables in one PR part (as the PR numbers its parts); kept with 957-p2 on tp3-switched because #1003, its model_runner.py and dspark/speculator.py partner, is queued; touches no file of 55 or 56",
+   "semantic_review": "model_runner.py is shared with the base's 0764 (#965 r1), 0769 (#980 r1), 0788 (#960 r1) and 0791 (#998 r1); the hunks apply cleanly, but the dummy-run change alters the active num_reqs that #960 r1's FULL-graph capture builds its metadata for: read the two together at assembly"
+  }
+ ],
+ "left_out": [
+  {
+   "pr": 957,
+   "label": "957-p5",
+   "patch": "experiments/2026-10-26-spark-ds41f-candidate/candidate-57/receipts/rework/pr-957-p5-r1/57-03-957-p5-perf-dsv41-tp3-decode-compressor-mla-and-spec-fusions.patch",
+   "part": "part 5, the TP3 adaptive-verification constants (HIGH_ROW_COST_SCALE_TP3 = 0.85, MIN_CALIBRATED_DEAD_ROWS_TAU_TP3 = 0.12)",
+   "reason": "dropped after its round-3 rework (verdict not-defensible): its replay of the real budget policy predicts a TP3 throughput loss at every concurrency, about -1% at c1 and -3% at c8 by served step time, beyond the 0.35-0.4% A/A floor at c1 and c8. Its premise, that TP3 rows past the knee cost more than TP4's, does not hold on our grid (TP3-switched rows 0.170/0.220 ms, TP4-switched 0.255/0.272 ms)",
+   "rework_verdict": "not-defensible",
+   "rework": "experiments/2026-10-26-spark-ds41f-candidate/candidate-57/receipts/rework/pr-957-p5-r1",
+   "disposition": "dropped (coordinator, 2026-11-10)"
+  },
+  {
+   "pr": 957,
+   "label": "957-p3",
+   "part": "part 3, fused post-step verification bookkeeping (acceptance_estimator.py, speculator.py, model_runner.py hunks 3-4, tests/v1/spec_decode/test_acceptance_estimator.py)",
+   "reason": "superseded: the base's 0764 (#965 round 1) already carries the same observe_verification fusion and verified-count reuse in model_runner.py, with 0769 (#980 round 1); its hunks conflict with them",
+   "disposition": "left out at selection: superseded by the base's 0764 (#965 round 1) and 0769 (#980 round 1)"
+  },
+  {
+   "pr": 957,
+   "label": "957-p1",
+   "part": "part 1, the replicated BF16 compressor at TP <= 4",
+   "reason": "placed in candidate-56 (0795), with #956",
+   "disposition": "candidate-56"
+  }
+ ],
+ "reserved_numbers": {
+  "0795": "candidate-56's 957-p1",
+  "0796": "candidate-56's #956 round 3",
+  "applies_without_them": "receipts/stack.log, section 3"
+ },
+ "semantic_review": {
+  "summary": "No semantic conflict found. 957-p4's model_runner.py hunks were read with 0788 (#960 round 1), as the selection asked, and with 0764 (#965 round 1), 0769 (#980 round 1) and 0791 (#998 round 1). 957-p2 shares sparse_mla.py with 0767 (#964).",
+  "files": [
+   {
+    "file": "vllm/v1/worker/gpu/model_runner.py",
+    "patches": [
+     "0764 #965 r1",
+     "0769 #980 r1",
+     "0788 #960 r1",
+     "0791 #998 r1",
+     "0798 957-p4"
+    ],
+    "review": "957-p4: prepare_dummy_attn builds dummy block tables and state slots for num_reqs_after_padding; execute_model's dummy branch keeps the active num_reqs (when not profiling, without PCP, and when the active requests cover the batch's tokens) and passes the graph's request count as num_reqs_after_padding. #960 round 1: on a non-dummy FULL step with captured metadata (no KV connector, a speculator that does not read the target's metadata) execute_model calls model_state.stage_full_cudagraph_attn(input_batch) instead of prepare_attn. Read together: #960's staging runs only on real steps and stages the real batch (CED floors), never the capture's count; at capture, FULL-mode prepare_attn sizes metadata by num_reqs_after_padding (model_states/default.py), which 957-p4 leaves at the graph's request count, so the captured metadata keeps its padded extent. 957-p4 changes only the active rows of the dummy batch: its tail rows become empty requests (seq_len 0, query_start_loc at num_tokens), the layout prepare_inputs gives a real padded step, and the speculator drafts for the active requests, so the (4, 24) target capture captures the (4, 20) DSpark draft graph (957-p4's functional mark). #965, #980 and #998 round 1 edit add_requests, prepare_inputs, sample_tokens and load_model: different functions. Not settled by reading: a captured kernel whose launch size follows the active count; the boot (no JIT after readiness), the TP3 gate and 957-p4's own capture test settle it."
+   },
+   {
+    "file": "vllm/models/deepseek_v4_1/tilelang/sparse_mla.py",
+    "patches": [
+     "0767 #964 (base)",
+     "0797 957-p2"
+    ],
+    "review": "#964: the stage-1 KV gather and staging barrier (hunks at 195-656); 957-p2: decode stage 2's online-softmax update and the stage-1 identity for inactive segments (hunks at 768-798). Different code."
+   }
+  ]
+ },
+ "authors": "Every PR is christopherowen's (the selection's gh pr view, scripts-as-run/outputs/authors.tsv). Every patch's From: is Christopher Owen's (christopherowen@users.noreply.github.com or 3221756+christopherowen@users.noreply.github.com), checked in receipts/stack.log.",
+ "selection_receipts": "experiments/2026-10-26-spark-ds41f-candidate/candidate-55/receipts/selection-proposal.json"
+}

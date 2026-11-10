@@ -1,0 +1,242 @@
+From 78ce3c6e3e7624675db7351421e253f44f449962 Mon Sep 17 00:00:00 2001
+From: Christopher Owen <3221756+christopherowen@users.noreply.github.com>
+Date: Sun, 8 Nov 2026 18:27:04 +0000
+Subject: [PATCH] fix(spec_decode): guard negative slots in copy_alloc and
+ copy_apply
+
+Base: candidate-54 vLLM patch head 4e8133ff10a125b90753c2727f162e29fe37f30c (tree 5f021d9a7f01c03e2389dd3d8021759cfa19ea34). The slot guard of #995 (head aa65752e9864, patch 0762-perf-spec-decode-copy-drafter-guards-and-wide-ramp.patch on 1107 vLLM patch head 2756478b60b9), alone, reworked for candidate-55.
+
+Rationale:
+copy_match_kernel reads total_len[slot] and history[slot] only for slot >= 0, whereas copy_alloc_kernel and copy_apply_kernel indexed total_len[slot], int_state[slot], float_state[slot] and history[slot] unconditionally: a negative idx_mapping entry would read and write the row before each tensor. Guard slot >= 0 in both. For a negative slot, copy_alloc_kernel writes no copy (chosen (-1, 0, 0), the prior estimate PRIOR_HITS / PRIOR_TRIALS, alloc = block) and reads and writes no per-slot state; copy_apply_kernel takes DSpark's drafts and clears no per-slot state, whatever chosen holds.
+
+Serving effect: none. No serving path passes a negative slot to copy_alloc or copy_apply. GPUModelRunner.sample_tokens passes input_batch.idx_mapping to CopyDrafter.prepare_alloc and propose; prepare_inputs builds it from req_states.req_id_to_index (slots from free_indices, range(max_num_reqs)) and InputBatch.make_dummy as arange(num_reqs). The copy path's only -1 rows, match_idx_mapping's for requests still mid-prefill, go to copy_match alone, which already guards them. Pipeline parallelism's -1 entries (PPHandler.get_prev_sampled_outputs) reach postprocess_sampled only, and copy_calls only declares the kernels for compilation. The guard is a robustness fix for direct callers of the kernels.
+
+From #995:
+- Taken: tilelang_copy.py hunks 5 and 6 (the copy_alloc_kernel and copy_apply_kernel guards), every line as the PR has it except the doublings update below, applied 3-way (copy_apply's context moved with 0789's survival loop); and test_negative_slot_bounds_guard_in_alloc_and_apply unchanged, appended after test_copy_match_long_context_two_tier_scan.
+- Left out, the cap decay (its rationale 2): inside the new else branch, copy_alloc_kernel keeps the base's T.if_then_else(accepted >= live, T.min(doublings + 1, MAX_DOUBLINGS), 0), re-indented. Hunk 1, the module docstring's decay sentence, goes with it, so the docstring is unchanged; so do the decay's ref_select and design_walk changes and test_partial_acceptance_steps_down_cap_doublings_gently.
+- Left out, copy_match's level-anchor probe, need_len tile bound and one-variable hit reduction (its rationale 3, hunks 2-4): they conflict with 0790's two-tier scan (#977) and are their own experiment on this base.
+- Left out, the 31/63-draft ramp (its rationale 4: SPARK_DS41F_COPY_MAX_DRAFTS, greedy_rejection_kernel widths above 32, benchmark_copy_drafts.py --lookahead, test_wide_lookahead_31_and_63_greedy_verification_and_ramp): it is opt-in, and the recipe keeps 16 drafts.
+
+Quality:
+Bit-identical for every non-negative slot. Measured on GB10 (sp8), spark-ds41f:candidate-50 with candidate-54's files mounted (base) or this tree's (candidate), ABBA in one session, a fresh container a boot: 882 copy steps (copy_match, copy_alloc, copy_apply over 126 cells: 7 scenarios, 1/8/16 requests, 4K..1M tokens, the copy state carried over seven steps, a mid-prefill step, 5,892 copies taken and 120 refused) hash the same on every boot of both arms. The guard's branches cost the two kernels about 0.04 us of device time a step (32 copy_alloc + copy_apply pairs a CUDA graph: +0.004..+0.079 us on 3.1..3.4 us a pair, in every cell). The copy step does not measurably move: benchmark_copy_drafts.py's 24 copy cells at 201 replays, six boots an arm, are unchanged (-3.2%..+5.9%), and every boot is within the gate's budget.
+
+Tests:
+- pytest -o addopts= --noconftest tests/v1/spec_decode/test_copy_drafts.py tests/v1/core/test_copy_drafts_scheduler.py: 63 passed in each of 2 boots (candidate-54: 62 passed). The new test fails on candidate-54's kernels: copy_alloc writes int_state[-1].
+- python3 benchmarks/kernels/benchmark_copy_drafts.py --gate --cases copy: 0 slower on every boot of both arms.
+- Applies as 0781 after candidate-54's series with git am; git diff --check clean.
+
+Upstream status: local robustness fix for CopyDrafter's TileLang kernels.
+---
+ tests/v1/spec_decode/test_copy_drafts.py      | 93 +++++++++++++++++++
+ .../worker/gpu/spec_decode/tilelang_copy.py   | 85 +++++++++--------
+ 2 files changed, 141 insertions(+), 37 deletions(-)
+
+diff --git a/tests/v1/spec_decode/test_copy_drafts.py b/tests/v1/spec_decode/test_copy_drafts.py
+index a34d75a69..7ab9968cd 100644
+--- a/tests/v1/spec_decode/test_copy_drafts.py
++++ b/tests/v1/spec_decode/test_copy_drafts.py
+@@ -1588,3 +1588,96 @@ def test_copy_match_long_context_two_tier_scan():
+     sources = _run_match(history, total_len, idx)
+     for row, S in enumerate(streams):
+         assert _best(sources[row], length) == ref_source(S, length)
++
++
++def test_negative_slot_bounds_guard_in_alloc_and_apply():
++    """Negative entries in idx_mapping never read or write slot -1 of history,
++    total_len, int_state, or float_state, and fall back to DSpark proposals."""
++    rng = np.random.default_rng(20261108)
++    width = 256
++    # Allocate with a leading canary row at index 0, and pass slices starting at
++    # row 1 so any out-of-bounds access at slot = -1 hits row 0 of the base tensor.
++    history_base = _history(5, width)
++    history_base[0].fill_(777777)
++    history = history_base[1:]
++
++    total_len_base = torch.full((5,), 999999, dtype=torch.int32, device=DEVICE)
++    total_len = total_len_base[1:]
++
++    int_state_base = torch.full(
++        (5, tlc.STATE_COLUMNS), 888888, dtype=torch.int32, device=DEVICE
++    )
++    float_state_base = torch.full(
++        (5, tlc.STATE_COLUMNS), 555555.0, dtype=torch.float32, device=DEVICE
++    )
++    int_state = int_state_base[1:]
++    float_state = float_state_base[1:]
++    int_state.zero_()
++    float_state.zero_()
++    total_len.zero_()
++
++    repeated = np.tile(rng.integers(10, VOCAB, 32, dtype=np.int32), 4)
++    slot = 2
++    history[slot, :96] = torch.from_numpy(repeated[:96]).to(DEVICE)
++    total_len[slot] = 96
++
++    idx_mapping = torch.tensor([-1, slot, -1], dtype=torch.int64, device=DEVICE)
++    sources = _run_match(history, total_len, idx_mapping)
++    assert (sources[0] == -1).all()
++    assert (sources[2] == -1).all()
++
++    sampled = torch.tensor([4, 1, 4], dtype=torch.int32, device=DEVICE)
++    verified = torch.tensor([8, 0, 8], dtype=torch.int32, device=DEVICE)
++    dspark = (
++        torch.arange(3 * BLOCK, dtype=torch.int64, device=DEVICE).view(3, BLOCK) + 500,
++        torch.full((3, BLOCK), 0.6, dtype=torch.float32, device=DEVICE),
++    )
++    drafts, confs, planned, alloc, _ = _propose(
++        history,
++        total_len,
++        idx_mapping,
++        sources,
++        int_state,
++        float_state,
++        sampled,
++        verified,
++        verified,
++        dspark=dspark,
++    )
++    # Canary row 0 (index -1 of the sliced views) must be completely untouched.
++    assert (history_base[0] == 777777).all()
++    assert int(total_len_base[0]) == 999999
++    assert (int_state_base[0] == 888888).all()
++    assert (float_state_base[0] == 555555.0).all()
++
++    # Negative slots fall back to DSpark and report BLOCK allocation.
++    for neg_row in (0, 2):
++        assert int(alloc[neg_row]) == BLOCK
++        assert drafts[neg_row, :BLOCK].tolist() == dspark[0][neg_row].tolist()
++        assert drafts[neg_row, BLOCK:].tolist() == [-1] * (LOOKAHEAD - BLOCK)
++        torch.testing.assert_close(confs[neg_row, :BLOCK], dspark[1][neg_row])
++    assert int(alloc[1]) == 2 * INITIAL
++    assert int(int_state[slot, 1]) == INITIAL
++
++    # Even if copy_apply is invoked directly with a positive chosen source on a
++    # negative slot, slot < 0 guards both history reads and int_state resets.
++    forged_chosen = torch.tensor(
++        [[16, 8, 16], [32, 8, 16], [16, 8, 16]], dtype=torch.int32, device=DEVICE
++    )
++    low_estimates = torch.tensor([0.1, 0.95, 0.99], dtype=torch.float32, device=DEVICE)
++    tlc.copy_apply(
++        idx_mapping,
++        history,
++        forged_chosen,
++        low_estimates,
++        int_state,
++        dspark[0],
++        dspark[1],
++        drafts,
++        confs,
++        planned,
++    )
++    assert (history_base[0] == 777777).all()
++    assert (int_state_base[0] == 888888).all()
++    for neg_row in (0, 2):
++        assert drafts[neg_row, :BLOCK].tolist() == dspark[0][neg_row].tolist()
+diff --git a/vllm/v1/worker/gpu/spec_decode/tilelang_copy.py b/vllm/v1/worker/gpu/spec_decode/tilelang_copy.py
+index 72ff29050..442728858 100644
+--- a/vllm/v1/worker/gpu/spec_decode/tilelang_copy.py
++++ b/vllm/v1/worker/gpu/spec_decode/tilelang_copy.py
+@@ -551,42 +551,49 @@ def copy_alloc_kernel(
+                 if latest >= 0:
+                     source = latest
+             if tx == 0:
+-                length = total_len[slot]
+-                if source >= 0:
+-                    source = T.if_then_else(
+-                        source >= lookahead, source - lookahead, length - source
+-                    )
+-                doublings = T.alloc_var(T.int32, init=int_state[slot, 0])
+-                pending = int_state[slot, 1]
+-                hits = T.alloc_var(T.float32, init=float_state[slot, 0])
+-                trials = T.alloc_var(T.float32, init=float_state[slot, 1])
+-                if pending > 0 and num_sampled[r] > 0:
+-                    live = T.min(pending, T.min(verified[r], cut[r]))
+-                    if live > 0:
+-                        accepted = T.min(num_sampled[r] - 1, live)
+-                        doublings = T.if_then_else(
+-                            accepted >= live, T.min(doublings + 1, MAX_DOUBLINGS), 0
+-                        )
+-                        hits = hits * DECAY + T.cast(accepted, T.float32)
+-                        trials = trials * DECAY + T.cast(
+-                            T.min(accepted + 1, live), T.float32
++                if slot < 0:
++                    chosen[r, 0] = -1
++                    chosen[r, 1] = 0
++                    chosen[r, 2] = 0
++                    estimates[r] = T.float32(PRIOR_HITS / PRIOR_TRIALS)
++                    alloc[r] = block
++                else:
++                    length = total_len[slot]
++                    if source >= 0:
++                        source = T.if_then_else(
++                            source >= lookahead, source - lookahead, length - source
+                         )
+-                cap = T.min(T.int32(initial) << doublings, lookahead)
+-                distance = length - source
+-                offered = T.if_then_else(source >= 0, T.min(cap, distance), 0)
+-                after = T.if_then_else(
+-                    source >= 0, T.min(T.min(2 * cap, lookahead), distance), 0
+-                )
+-                # A step without a copy (DSpark's) starts the next copy afresh.
+-                int_state[slot, 0] = T.if_then_else(source >= 0, doublings, 0)
+-                int_state[slot, 1] = offered
+-                float_state[slot, 0] = hits
+-                float_state[slot, 1] = trials
+-                chosen[r, 0] = source
+-                chosen[r, 1] = offered
+-                chosen[r, 2] = after
+-                estimates[r] = (hits + PRIOR_HITS) / (trials + PRIOR_TRIALS)
+-                alloc[r] = T.max(after, block)
++                    doublings = T.alloc_var(T.int32, init=int_state[slot, 0])
++                    pending = int_state[slot, 1]
++                    hits = T.alloc_var(T.float32, init=float_state[slot, 0])
++                    trials = T.alloc_var(T.float32, init=float_state[slot, 1])
++                    if pending > 0 and num_sampled[r] > 0:
++                        live = T.min(pending, T.min(verified[r], cut[r]))
++                        if live > 0:
++                            accepted = T.min(num_sampled[r] - 1, live)
++                            doublings = T.if_then_else(
++                                accepted >= live, T.min(doublings + 1, MAX_DOUBLINGS), 0
++                            )
++                            hits = hits * DECAY + T.cast(accepted, T.float32)
++                            trials = trials * DECAY + T.cast(
++                                T.min(accepted + 1, live), T.float32
++                            )
++                    cap = T.min(T.int32(initial) << doublings, lookahead)
++                    distance = length - source
++                    offered = T.if_then_else(source >= 0, T.min(cap, distance), 0)
++                    after = T.if_then_else(
++                        source >= 0, T.min(T.min(2 * cap, lookahead), distance), 0
++                    )
++                    # A step without a copy (DSpark's) starts the next copy afresh.
++                    int_state[slot, 0] = T.if_then_else(source >= 0, doublings, 0)
++                    int_state[slot, 1] = offered
++                    float_state[slot, 0] = hits
++                    float_state[slot, 1] = trials
++                    chosen[r, 0] = source
++                    chosen[r, 1] = offered
++                    chosen[r, 2] = after
++                    estimates[r] = (hits + PRIOR_HITS) / (trials + PRIOR_TRIALS)
++                    alloc[r] = T.max(after, block)
+ 
+     return copy_alloc
+ 
+@@ -633,9 +640,13 @@ def copy_apply_kernel(lookahead: int, block: int, idx_dtype: str):
+                 dspark_survival *= dspark_confidences[r, j]
+                 dspark_yield += dspark_survival
+             use_copy = T.alloc_var(T.int32, init=0)
+-            if start >= 0 and T.cast(offered, T.float32) * estimate >= dspark_yield:
++            if (
++                slot >= 0
++                and start >= 0
++                and T.cast(offered, T.float32) * estimate >= dspark_yield
++            ):
+                 use_copy = 1
+-            if start >= 0 and use_copy == 0 and tx == 0:
++            if slot >= 0 and start >= 0 and use_copy == 0 and tx == 0:
+                 int_state[slot, 0] = 0
+                 int_state[slot, 1] = 0
+             for k in T.unroll(passes):
+-- 
+2.43.0
+
