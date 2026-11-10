@@ -1,11 +1,55 @@
 {
-  "notes": "tp4-trace.json with the device-side row trace on as well: 64-bit digests of every row of each target-forward all-reduce's input and output and each all-gather's, on every rank, for steps of at most 64 rows, inside CUDA graphs. For the first-divergence trace of the determinism gate's again scenario. Costs about six small kernels per collective in the step's graph and one 265 KB device-to-host copy per step. Not a candidate.",
+  "notes": "tp4-trace.json with the device-side row trace on as well, mounting the overlay's three tap files too (attention, compressor, Engram; tp4-trace.json mounts the other four): on every rank, 64-bit digests of every row, for steps of at most 64 rows, of each target-forward tap in order: all-reduce and all-gather inputs and outputs, each compressor's projected values and emitted latents and its ratio-2 ring carry, each indexer's top-k selection, each attention layer's output before WO, and each Engram layer's gathered table rows and output; plus positions, token ids and final hidden states. Inside CUDA graphs. Costs roughly 200 taps a forward (three to six small kernels each, an estimated 15-20% of a c1 step) and one 400 KB device-to-host copy a step. For the first-divergence trace of the determinism gate. Not a candidate.",
   "extends": {
     "config": "experiments/2026-10-26-spark-ds41f-candidate/candidate-58/boot-differences/tp4-trace.json"
   },
   "set": {
     "environment": {
       "SPARK_DS41F_ROW_TRACE_DIR": "/cache/spark-ds41f/boot-traces"
+    },
+    "container": {
+      "mounts": [
+        [
+          "{checkout}/cache",
+          "/cache",
+          "rw"
+        ],
+        [
+          "{checkout}/experiments/2026-10-26-spark-ds41f-candidate/candidate-58/boot-differences/overlay/vllm/distributed/device_communicators/cuda_communicator.py",
+          "/opt/spark-ds41f/candidate/vllm/vllm/distributed/device_communicators/cuda_communicator.py",
+          "ro"
+        ],
+        [
+          "{checkout}/experiments/2026-10-26-spark-ds41f-candidate/candidate-58/boot-differences/overlay/vllm/models/deepseek_v4_1/nvidia/model.py",
+          "/opt/spark-ds41f/candidate/vllm/vllm/models/deepseek_v4_1/nvidia/model.py",
+          "ro"
+        ],
+        [
+          "{checkout}/experiments/2026-10-26-spark-ds41f-candidate/candidate-58/boot-differences/overlay/vllm/v1/worker/gpu/model_runner.py",
+          "/opt/spark-ds41f/candidate/vllm/vllm/v1/worker/gpu/model_runner.py",
+          "ro"
+        ],
+        [
+          "{checkout}/experiments/2026-10-26-spark-ds41f-candidate/candidate-58/boot-differences/overlay/vllm/v1/core/sched/scheduler.py",
+          "/opt/spark-ds41f/candidate/vllm/vllm/v1/core/sched/scheduler.py",
+          "ro"
+        ],
+        [
+          "{checkout}/experiments/2026-10-26-spark-ds41f-candidate/candidate-58/boot-differences/overlay/vllm/models/deepseek_v4_1/attention.py",
+          "/opt/spark-ds41f/candidate/vllm/vllm/models/deepseek_v4_1/attention.py",
+          "ro"
+        ],
+        [
+          "{checkout}/experiments/2026-10-26-spark-ds41f-candidate/candidate-58/boot-differences/overlay/vllm/models/deepseek_v4_1/compressor.py",
+          "/opt/spark-ds41f/candidate/vllm/vllm/models/deepseek_v4_1/compressor.py",
+          "ro"
+        ],
+        [
+          "{checkout}/experiments/2026-10-26-spark-ds41f-candidate/candidate-58/boot-differences/overlay/vllm/models/deepseek_v4_1/common/engram.py",
+          "/opt/spark-ds41f/candidate/vllm/vllm/models/deepseek_v4_1/common/engram.py",
+          "ro"
+        ]
+      ]
     }
   }
 }
