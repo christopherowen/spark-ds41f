@@ -1,0 +1,136 @@
+From 4dbe72f5f147212e3a3a80bfd742d48c5b6b1eb6 Mon Sep 17 00:00:00 2001
+From: Christopher Owen <3221756+christopherowen@users.noreply.github.com>
+Date: Tue, 10 Nov 2026 03:39:25 +0000
+Subject: [PATCH] perf(shm_broadcast): lower SpinCondition busy_loop_s from
+ 1.0s to 2ms
+
+SpinCondition defaults busy_loop_s to 1.0s, causing rank-0 EngineCore and
+local worker MessageQueue readers to spin via sched_yield() across the full
+duration of every GPU decode step (~21 ms) and prefill chunk (200-900 ms)
+without ever entering poller.poll(). That unthrottled spin loop consumes a
+full CPU core and polls shared memory continuously while waiting for the
+GPU step to finish.
+
+Lower the default spin window to SHM_SPIN_BUSY_LOOP_S = 0.002 (2 ms).
+Back-to-back sub-millisecond RPCs and immediate queue handoffs still spin
+with zero socket-poll overhead, while waits exceeding 2 ms park on the ZMQ
+notify socket and wake immediately on writer.enqueue().
+
+Upstream-Base: 19f2c20ed4d64ae22bd009ceacadd85e2a81e354
+Rationale: Eliminate continuous 100% CPU core busy-spinning on shared memory during multi-millisecond GPU decode and prefill steps while preserving sub-2ms fast-path spinning for back-to-back control RPCs.
+Quality-Implications: Bit-exact; changes only host MessageQueue reader spin-to-poll transition threshold.
+Tests: pytest tests/distributed/test_shm_broadcast.py
+Upstream-Status: candidate
+---
+ tests/distributed/test_shm_broadcast.py       | 71 +++++++++++++++++++
+ .../device_communicators/shm_broadcast.py     |  8 ++-
+ 2 files changed, 78 insertions(+), 1 deletion(-)
+
+diff --git a/tests/distributed/test_shm_broadcast.py b/tests/distributed/test_shm_broadcast.py
+index 6997849f7..e4f9cd55c 100644
+--- a/tests/distributed/test_shm_broadcast.py
++++ b/tests/distributed/test_shm_broadcast.py
+@@ -834,3 +834,74 @@ def test_remote_subscribe_addr_unique_concurrent_writers(
+ 
+     for q in queues:
+         q.remote_socket.close(linger=0)
++
++
++def test_spin_condition_default_2ms_busy_loop_parks_on_poller():
++    """Verify SpinCondition defaults to SHM_SPIN_BUSY_LOOP_S (2 ms), spins via
++    sched_yield() inside the 2 ms window, and parks on poller.poll() once elapsed
++    time since last_read exceeds 2 ms, waking cleanly when the writer enqueues.
++    """
++    assert shm_broadcast.SHM_SPIN_BUSY_LOOP_S == pytest.approx(0.002)
++
++    writer = MessageQueue(
++        n_reader=1,
++        n_local_reader=1,
++        max_chunk_bytes=1024,
++        max_chunks=2,
++    )
++    reader = MessageQueue.create_from_handle(writer.export_handle(), rank=0)
++    try:
++        writer.wait_until_ready()
++        reader.wait_until_ready()
++        assert reader._spin_condition.busy_loop_s == pytest.approx(0.002)
++
++        # Prime last_read with an initial message and drain any pending notify ping.
++        writer.enqueue("warmup")
++        assert reader.dequeue(timeout=5) == "warmup"
++        if reader._spin_condition.local_notify_socket.poll(timeout=0):
++            reader._spin_condition.local_notify_socket.recv(
++                flags=shm_broadcast.zmq.NOBLOCK, copy=False
++            )
++
++        yield_calls = 0
++        poll_calls = 0
++        orig_yield = shm_broadcast.sched_yield
++        orig_poll = reader._spin_condition.poller.poll
++
++        def counting_yield():
++            nonlocal yield_calls
++            yield_calls += 1
++            return orig_yield()
++
++        def counting_poll(*args, **kwargs):
++            nonlocal poll_calls
++            poll_calls += 1
++            return orig_poll(*args, **kwargs)
++
++        def delayed_writer():
++            # Simulate a ~21 ms GPU decode step before publishing the response.
++            time.sleep(0.021)
++            writer.enqueue("step-done")
++
++        with (
++            mock.patch.object(
++                shm_broadcast, "sched_yield", side_effect=counting_yield
++            ),
++            mock.patch.object(
++                reader._spin_condition.poller, "poll", side_effect=counting_poll
++            ),
++        ):
++            reader._spin_condition.last_read = time.monotonic()
++            t = threading.Thread(target=delayed_writer, daemon=True)
++            t.start()
++            msg = reader.dequeue(timeout=5)
++            t.join(timeout=5)
++
++        assert msg == "step-done"
++        # Reader spun during the initial 2 ms window and then parked in poller.poll()
++        # for the remainder of the 21 ms step.
++        assert yield_calls >= 1
++        assert 1 <= poll_calls <= 2
++    finally:
++        writer.shutdown()
++        reader.shutdown()
+diff --git a/vllm/distributed/device_communicators/shm_broadcast.py b/vllm/distributed/device_communicators/shm_broadcast.py
+index 78e848d6f..a7410c6fc 100644
+--- a/vllm/distributed/device_communicators/shm_broadcast.py
++++ b/vllm/distributed/device_communicators/shm_broadcast.py
+@@ -69,6 +69,12 @@ SHM_READER_RECHECK_INTERVAL_MS = 5000
+ # but libzmq still queues an internal command per notification until the socket
+ # is polled, so a reader that never goes idle would grow without bound.
+ SHM_NOTIFY_POLL_INTERVAL_S = 2.0
++# How long a reader busy-spins via sched_yield() after its last read before
++# parking on the notify socket. 2 ms covers sub-millisecond control RPC bursts
++# and immediate queue handoffs without socket-poll overhead while letting the
++# waiting reader park during multi-millisecond GPU decode steps (~21 ms) and
++# prefill chunks instead of spinning at 100% of a CPU core.
++SHM_SPIN_BUSY_LOOP_S = 0.002
+ 
+ 
+ from_bytes_big = functools.partial(int.from_bytes, byteorder="big")
+@@ -136,7 +142,7 @@ class SpinCondition:
+         is_reader: bool,
+         context: zmq.Context,
+         notify_address: str,
+-        busy_loop_s: float = 1,
++        busy_loop_s: float = SHM_SPIN_BUSY_LOOP_S,
+     ):
+         self.is_reader = is_reader
+ 
+-- 
+2.43.0
+
