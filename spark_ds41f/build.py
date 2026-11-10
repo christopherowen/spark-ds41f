@@ -53,6 +53,37 @@ def checked(command: list[str], cwd: Path | None = None) -> None:
     subprocess.run(command, cwd=cwd, check=True)
 
 
+DISPOSABLE_GIT_CONFIG = (
+    ("gc.auto", "0"),
+    ("maintenance.auto", "false"),
+)
+DISPOSABLE_GIT_ARGS = ("-c", "gc.auto=0", "-c", "maintenance.auto=false")
+
+
+def init_disposable_git_repo(directory: Path) -> None:
+    """Initialize a temporary Git repository with background auto-GC and maintenance disabled."""
+    checked(["git", *DISPOSABLE_GIT_ARGS, "init", "--quiet"], cwd=directory)
+    for key, value in DISPOSABLE_GIT_CONFIG:
+        checked(["git", "config", key, value], cwd=directory)
+
+
+def apply_patch_series(directory: Path, series_dir: Path, patch_names: list[str]) -> None:
+    """Apply an ordered patch series in a single ``git am`` invocation with auto-GC disabled."""
+    if not patch_names:
+        return
+    checked(
+        [
+            "git",
+            *DISPOSABLE_GIT_ARGS,
+            "-c", f"user.name={PATCH_COMMITTER[0]}",
+            "-c", f"user.email={PATCH_COMMITTER[1]}",
+            "am", "--quiet", "--committer-date-is-author-date",
+            *(str(series_dir / patch_name) for patch_name in patch_names),
+        ],
+        cwd=directory,
+    )
+
+
 def command_upstream(args: argparse.Namespace) -> int:
     _, _, upstreams = configuration(args)
     sources = upstreams["sources"]
@@ -69,19 +100,21 @@ def command_upstream(args: argparse.Namespace) -> int:
     if destination.exists():
         raise SystemExit(f"{destination} already exists; remove it explicitly to recreate")
     destination.parent.mkdir(parents=True, exist_ok=True)
-    checked(["git", "clone", source["upstream"], str(destination)])
+    checked(["git", *DISPOSABLE_GIT_ARGS, "clone", source["upstream"], str(destination)])
+    for key, value in DISPOSABLE_GIT_CONFIG:
+        checked(["git", "config", key, value], cwd=destination)
     checked(["git", "remote", "rename", "origin", "upstream"], cwd=destination)
     contribution = source.get("contribution_remote")
     if contribution:
         checked(["git", "remote", "add", "origin", contribution], cwd=destination)
     # Release commits are not always reachable from the canonical default branch.
     # Fetch the full pinned object explicitly before detaching at it.
-    checked(["git", "fetch", "upstream", source["revision"]], cwd=destination)
+    checked(["git", *DISPOSABLE_GIT_ARGS, "fetch", "upstream", source["revision"]], cwd=destination)
     checked(["git", "checkout", "--detach", source["revision"]], cwd=destination)
     if source.get("submodules"):
-        checked(["git", "submodule", "update", "--init", "--recursive"], cwd=destination)
+        checked(["git", *DISPOSABLE_GIT_ARGS, "submodule", "update", "--init", "--recursive"], cwd=destination)
     for commit in source.get("applied_upstream_commits", []):
-        checked(["git", "fetch", "upstream", commit["revision"]], cwd=destination)
+        checked(["git", *DISPOSABLE_GIT_ARGS, "fetch", "upstream", commit["revision"]], cwd=destination)
         checked(
             ["git", "cherry-pick", "--no-commit", commit["revision"]],
             cwd=destination,
@@ -616,29 +649,20 @@ def lock_build_identifiers(
             BUILD_ROOT.mkdir(parents=True, exist_ok=True)
             temporary = Path(tempfile.mkdtemp(prefix=f".lock-{name}.", dir=BUILD_ROOT))
             try:
-                checked(["git", "init", "--quiet"], cwd=temporary)
+                init_disposable_git_repo(temporary)
                 checked(["git", "remote", "add", "upstream", source["upstream"]], cwd=temporary)
                 checked(
-                    ["git", "fetch", "--quiet", "--filter=blob:none", "--no-tags", "upstream", source["revision"]],
+                    ["git", *DISPOSABLE_GIT_ARGS, "fetch", "--quiet", "--filter=blob:none", "--no-tags", "upstream", source["revision"]],
                     cwd=temporary,
                 )
                 checked(["git", "switch", "--quiet", "--create", "spark/build", "FETCH_HEAD"], cwd=temporary)
                 if source.get("patch_series"):
                     series = ROOT / source["patch_series"]
-                    for patch_name in active_series_patches(series):
-                        checked(
-                            [
-                                "git", "-c", f"user.name={PATCH_COMMITTER[0]}",
-                                "-c", f"user.email={PATCH_COMMITTER[1]}",
-                                "am", "--quiet", "--committer-date-is-author-date",
-                                str(series.parent / patch_name),
-                            ],
-                            cwd=temporary,
-                        )
+                    apply_patch_series(temporary, series.parent, active_series_patches(series))
                 checked(["git", "diff", "--check", source["revision"], "HEAD"], cwd=temporary)
                 if source.get("submodules"):
                     checked(
-                        ["git", "submodule", "update", "--quiet", "--init", "--recursive",
+                        ["git", *DISPOSABLE_GIT_ARGS, "submodule", "update", "--quiet", "--init", "--recursive",
                          "--depth", "1", "--jobs", "4"],
                         cwd=temporary,
                     )
@@ -786,31 +810,22 @@ def prepare_project(directory: Path, name: str, record: dict) -> None:
     source.parent.mkdir(parents=True, exist_ok=True)
     temporary = Path(tempfile.mkdtemp(prefix=f".{name}.", dir=source.parent))
     try:
-        checked(["git", "init", "--quiet"], cwd=temporary)
+        init_disposable_git_repo(temporary)
         checked(["git", "remote", "add", "upstream", record["upstream"]], cwd=temporary)
         checked(
-            ["git", "fetch", "--quiet", "--filter=blob:none", "--no-tags", "upstream", record["revision"]],
+            ["git", *DISPOSABLE_GIT_ARGS, "fetch", "--quiet", "--filter=blob:none", "--no-tags", "upstream", record["revision"]],
             cwd=temporary,
         )
         checked(["git", "switch", "--quiet", "--create", "spark/build", "FETCH_HEAD"], cwd=temporary)
         if record.get("patch_series"):
             series = ROOT / record["patch_series"]
-            for patch_name in read_series(series):
-                checked(
-                    [
-                        "git", "-c", f"user.name={PATCH_COMMITTER[0]}",
-                        "-c", f"user.email={PATCH_COMMITTER[1]}",
-                        "am", "--quiet", "--committer-date-is-author-date",
-                        str(series.parent / patch_name),
-                    ],
-                    cwd=temporary,
-                )
+            apply_patch_series(temporary, series.parent, read_series(series))
         checked(["git", "diff", "--check", record["revision"], "HEAD"], cwd=temporary)
         if record.get("submodules") is not None:
             # The commits the patched superproject records, nested ones
             # included; project_problems compares them with the manifest.
             checked(
-                ["git", "submodule", "update", "--quiet", "--init", "--recursive",
+                ["git", *DISPOSABLE_GIT_ARGS, "submodule", "update", "--quiet", "--init", "--recursive",
                  "--depth", "1", "--jobs", "4"],
                 cwd=temporary,
             )
@@ -832,9 +847,9 @@ def prepare_cutlass(directory: Path, record: dict) -> None:
     source.parent.mkdir(parents=True, exist_ok=True)
     temporary = Path(tempfile.mkdtemp(prefix=".cutlass.", dir=source.parent))
     try:
-        checked(["git", "init", "--quiet"], cwd=temporary)
+        init_disposable_git_repo(temporary)
         checked(["git", "remote", "add", "upstream", record["upstream"]], cwd=temporary)
-        checked(["git", "fetch", "--quiet", "--depth", "1", "upstream", record["revision"]], cwd=temporary)
+        checked(["git", *DISPOSABLE_GIT_ARGS, "fetch", "--quiet", "--depth", "1", "upstream", record["revision"]], cwd=temporary)
         checked(["git", "checkout", "--quiet", "--detach", "FETCH_HEAD"], cwd=temporary)
         if git_output(temporary, "rev-parse", "HEAD") != record["revision"]:
             raise SystemExit("cutlass: fetched revision differs from the lock")
@@ -924,7 +939,7 @@ def vllm_deletions(directory: Path, inputs: dict) -> list[str]:
     )
     if present.returncode:
         checked(
-            ["git", "fetch", "--quiet", "--filter=blob:none", "--no-tags",
+            ["git", *DISPOSABLE_GIT_ARGS, "fetch", "--quiet", "--filter=blob:none", "--no-tags",
              inputs["vllm"]["canonical_upstream"], base],
             cwd=source,
         )

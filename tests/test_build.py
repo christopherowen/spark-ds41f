@@ -366,6 +366,125 @@ class BuildEvidenceTest(unittest.TestCase):
         self.assertNotIn(unrelated.relative_to(self.root).as_posix(), updated)
 
 
+class DisposableGitRepoTest(unittest.TestCase):
+    def test_init_disposable_git_repo_disables_auto_gc_and_maintenance(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            repo = Path(temporary)
+            spark.init_disposable_git_repo(repo)
+            self.assertEqual(spark.git_output(repo, "config", "--get", "gc.auto"), "0")
+            self.assertEqual(spark.git_output(repo, "config", "--get", "maintenance.auto"), "false")
+
+    def test_prepare_project_and_cutlass_disable_auto_gc_and_batch_git_am(self) -> None:
+        import contextlib
+        import io
+        import subprocess
+
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            upstream = root / "upstream"
+            upstream.mkdir()
+            subprocess.run(["git", "init", "--quiet"], cwd=upstream, check=True)
+            subprocess.run(["git", "config", "user.name", "Test Author"], cwd=upstream, check=True)
+            subprocess.run(["git", "config", "user.email", "author@example.com"], cwd=upstream, check=True)
+            (upstream / "file.txt").write_text("base\n", encoding="utf-8")
+            subprocess.run(["git", "add", "file.txt"], cwd=upstream, check=True)
+            subprocess.run(["git", "commit", "--quiet", "-m", "base"], cwd=upstream, check=True)
+            base_revision = spark.git_output(upstream, "rev-parse", "HEAD")
+
+            (upstream / "file.txt").write_text("base\nfirst\n", encoding="utf-8")
+            subprocess.run(["git", "commit", "--quiet", "-am", "first patch"], cwd=upstream, check=True)
+            (upstream / "file.txt").write_text("base\nfirst\nsecond\n", encoding="utf-8")
+            subprocess.run(["git", "commit", "--quiet", "-am", "second patch"], cwd=upstream, check=True)
+
+            patches_dir = root / "patches" / "demo"
+            patches_dir.mkdir(parents=True)
+            subprocess.run(["git", "format-patch", "--quiet", "-o", str(patches_dir), base_revision], cwd=upstream, check=True)
+            patch_names = [p.name for p in sorted(patches_dir.glob("*.patch"))]
+            (patches_dir / "series").write_text("\n".join(patch_names) + "\n", encoding="utf-8")
+
+            # Compute expected patch_head and expected_tree via sequential git am
+            reference = root / "reference"
+            reference.mkdir()
+            spark.init_disposable_git_repo(reference)
+            subprocess.run(["git", "fetch", "--quiet", str(upstream), base_revision], cwd=reference, check=True)
+            subprocess.run(["git", "switch", "--quiet", "--create", "spark/build", "FETCH_HEAD"], cwd=reference, check=True)
+            for name in patch_names:
+                subprocess.run([
+                    "git", "-c", f"user.name={spark.PATCH_COMMITTER[0]}",
+                    "-c", f"user.email={spark.PATCH_COMMITTER[1]}",
+                    "am", "--quiet", "--committer-date-is-author-date",
+                    str(patches_dir / name),
+                ], cwd=reference, check=True)
+            expected_head = spark.git_output(reference, "rev-parse", "HEAD")
+            expected_tree = spark.git_output(reference, "rev-parse", "HEAD^{tree}")
+
+            build_dir = root / "build"
+            record = {
+                "upstream": str(upstream),
+                "revision": base_revision,
+                "patch_series": "patches/demo/series",
+                "patch_head": expected_head,
+                "expected_tree": expected_tree,
+            }
+            commands: list[list[str]] = []
+            real_checked = spark.checked
+
+            def spy_checked(command: list[str], cwd: Path | None = None) -> None:
+                commands.append(list(command))
+                real_checked(command, cwd=cwd)
+
+            with mock.patch.object(spark, "ROOT", root), \
+                    mock.patch.object(spark, "checked", side_effect=spy_checked), \
+                    contextlib.redirect_stdout(io.StringIO()):
+                spark.prepare_project(build_dir, "demo", record)
+                spark.prepare_cutlass(build_dir, {"upstream": str(upstream), "revision": base_revision, "release_tag": "v0"})
+
+            am_commands = [cmd for cmd in commands if "am" in cmd]
+            self.assertEqual(len(am_commands), 1)
+            self.assertIn("gc.auto=0", am_commands[0])
+            self.assertIn("maintenance.auto=false", am_commands[0])
+            self.assertEqual(am_commands[0][-2:], [str(patches_dir / n) for n in patch_names])
+
+            for prepared in (build_dir / "src" / "demo", build_dir / "src" / "cutlass"):
+                self.assertEqual(spark.git_output(prepared, "config", "--get", "gc.auto"), "0")
+                self.assertEqual(spark.git_output(prepared, "config", "--get", "maintenance.auto"), "false")
+
+            # Verify lock_build_identifiers also uses init_disposable_git_repo and a single batched git am
+            commands.clear()
+            (root / "cluster.json").write_text(json.dumps({"upstreams_config": "upstreams.lock.json"}), encoding="utf-8")
+            (root / "source.json").write_text(json.dumps({"vllm": {}}), encoding="utf-8")
+            upstreams_doc = {
+                "source_manifest": "source.json",
+                "sources": {
+                    "vllm": {
+                        "upstream": str(upstream),
+                        "revision": base_revision,
+                        "patch_series": "patches/demo/series",
+                    },
+                    "nccl": {"upstream": str(upstream), "revision": base_revision},
+                },
+            }
+            (root / "upstreams.lock.json").write_text(json.dumps(upstreams_doc), encoding="utf-8")
+            import argparse
+            with mock.patch.object(spark, "ROOT", root), \
+                    mock.patch.object(spark, "BUILD_ROOT", root / ".work/build"), \
+                    mock.patch.object(spark, "checked", side_effect=spy_checked), \
+                    contextlib.redirect_stdout(io.StringIO()):
+                spark.lock_build_identifiers(
+                    argparse.Namespace(cluster_config="cluster.json"),
+                    upstreams_doc,
+                    parts=["vllm"],
+                )
+            lock_am_commands = [cmd for cmd in commands if "am" in cmd]
+            self.assertEqual(len(lock_am_commands), 1)
+            self.assertIn("gc.auto=0", lock_am_commands[0])
+            self.assertIn("maintenance.auto=false", lock_am_commands[0])
+            self.assertEqual(lock_am_commands[0][-2:], [str(patches_dir / n) for n in patch_names])
+            locked_manifest = json.loads((root / "source.json").read_text(encoding="utf-8"))
+            self.assertEqual(locked_manifest["vllm"]["patch_head"], expected_head)
+            self.assertEqual(locked_manifest["vllm"]["expected_tree"], expected_tree)
+
+
 class PackageStructureTest(unittest.TestCase):
     def test_spark_ds41f_submodules_and_thin_entrypoints(self) -> None:
         from spark_ds41f import bench, build, cli, cluster, config, doctor, lab
