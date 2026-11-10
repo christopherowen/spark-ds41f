@@ -12,7 +12,8 @@
   5. Router-bias (`e_score_correction_bias`) / hotlist static seeding (`rank_experts_by_router_bias`), layer-adaptive Shannon-entropy slot budgeting (`plan_layer_slot_budgets`), and UMA `/proc/meminfo` `MemAvailable` auto-budgeting (`compute_uma_slot_budget`),
   6. Zero-staging chunked Boot 1 preparation (`populate_slots_from_chunk_bytes`) + background `O_DIRECT` layer-file writer (`write_layer_expert_file` / `ExpertDiskCache`) with an `8 GiB` free-disk-space safety floor and atomic `<layer>.tmp.<pid>` publication (`loading_done()`), plus Boot 2+ cached startup (`fill_from_disk_cache`) with 4-expert byte-for-byte spot verification (`verify_spot_experts` on `[0, 1, sampled, E - 1]`) and automatic rebuild on mismatch.
 - **Outcome**:
-  - **Memory footprint at `TP=2` (`H=5120, I=1152, E=384, num_slots=288, static_slots=240, dynamic_slots=48`)**: Reduces resident MoE weight memory per layer from `3,612,575,232 B` (`3.364 GiB/layer`) to `2,629,804,032 B` (`2.449 GiB/layer`), saving **`937.24 MiB/layer` (`53.086 GiB/rank` across all 58 MoE layers)** and bringing total per-rank native-weight footprint on a two-node `TP=2` GB10 cluster from `123.75 GiB/rank` down to **`94.83 GiB/rank`** (`~20.2 GiB/rank` headroom on a `115 GiB` usable GB10 node).
+  - **Memory footprint at `TP=2` (`H=5120, I=1152, E=384, num_slots=288, static_slots=240, dynamic_slots=48`)**: Reduces resident MoE weight memory per layer from `3,612,575,232 B` (`3.364 GiB/layer`) to `2,629,804,032 B` (`2.449 GiB/layer`), saving **`937.24 MiB/layer`, `36.61 GiB/rank` across the model's 40 MoE layers**. That is not enough on its own: at `288` slots a rank still needs about `108 GiB` of weights against about `99 GiB` for weights and KV together, so no KV fits. About `256` slots per layer or fewer are needed (section 1). The receipts' `saved_gib_58_layers_per_rank` (`53.086`) multiplies by 58 layers, which this model does not have; section 1 supersedes it.
+  - **Not yet served**: no two-node `TP=2` run has happened. Nothing in serving sets a layer's `slot_cache_config`, so the cache runs only in its tests and this benchmark.
   - **Bitwise parity**: `torch.equal(out_ref, out_slot) == True` (`max_abs_diff = 0.0`) across all-hit decode (`rows=1`, `rows=5`), role-major `w13`/`w2` overlapped cold misses, LBA-sorted multi-miss reads, cross-layer router lookahead prefetches, multi-window prefill batches (`>512` routes), and Boot 2+ warm cached startup.
   - **Startup & disk-cache speedup (`boot-1` & `boot-2` on `sp6`)**: Zero-staging chunked Boot 1 preparation (`chunk_experts=64`) + background `O_DIRECT` write completes main-thread layer build in `24.90 s` / `21.40 s` (`25.39 s` / `21.91 s` after `loading_done()`, vs `32.78 s` synchronous write previously), while Boot 2+ cached start with 4-expert byte-for-byte spot verification (`[0, 1, sampled, 383]`, skipping the remaining `380` experts) + LBA-sorted `O_DIRECT` `io_uring` static-slot fill completes in **`1.635 s` / `1.733 s` (`15.53x` / `12.64x` speedup, mean `14.09x`)**.
   - **All-hit decode latency (`boot-1` & `boot-2` on `sp6`)**: Zero latency penalty (`242.06 µs` / `240.88 µs` for 288-slot zero-copy `pin_memory` vs `251.62 µs` / `250.89 µs` for 384-expert `cudaMalloc` at `rows=1`; `1161.05 µs` / `1139.14 µs` vs `1171.36 µs` / `1171.65 µs` at `rows=5`).
@@ -28,10 +29,11 @@ Every dimension of `DeepSeek-V4.1-Flash` divides cleanly by `TP=2` with zero hea
 
 | Architectural Dimension | Full Model | `TP=3` (`tp3-triangle`) | `TP=2` (2× DGX Spark) |
 |---|---:|---:|---:|
-| Attention query heads (`num_attention_heads`) | `40` | `14 /rank` (padded to `42`) | **`20 /rank` (exact)** |
-| Attention KV heads (`num_key_value_heads`) | `8` | `3 /rank` (padded to `9`) | **`4 /rank` (exact)** |
-| DSA Indexer heads (`index_n_heads`) | `64` | `22 /rank` (padded to `66`) | **`32 /rank` (exact)** |
-| Dense MLP `intermediate_size` | `12,288` | `4,096 /rank` | **`6,144 /rank` (exact)** |
+| Decoder layers (`num_hidden_layers`), every one MoE | `40` (plus 3 DSpark drafter layers) | `40` | **`40`** |
+| Attention query heads (`num_attention_heads`) | `64` | `24 /rank` (padded to `72`) | **`32 /rank` (exact)** |
+| Output groups (`o_groups`) | `8` | `3 /rank` (padded to `9`) | **`4 /rank` (exact)** |
+| KV latent (`num_key_value_heads`) | `1` (512 wide) | replicated | **replicated** |
+| Indexer heads (`index_n_heads`) | `32` | replicated | **replicated** |
 | MoE `moe_intermediate_size` | `2,304` | `768 /rank` (`6 × 128`) | **`1,152 /rank` (`9 × 128`, zero tail waste)** |
 | Shared expert `intermediate_size` | `2,304` | `768 /rank` | **`1,152 /rank` (exact)** |
 | Vocabulary (`vocab_size`) | `129,280` | `43,094 /rank` | **`64,640 /rank` (exact)** |
@@ -49,12 +51,27 @@ At `TP=2` (`hidden_size = 5120`, per-rank `moe_intermediate_size = 1152`), each 
   - `w2` role slab: `2,949,120 B` (`w2_tiles`) + `98,304 B` (`w2_meta`, 4 KiB aligned) = `3,047,424 B`
   - Total per-expert pack stride: **`9,134,080 B` (`8.711 MiB` = `2,230 × 4 KiB` pages)**
 
-| Component (58 MoE layers, `TP=2`) | 100% Resident (`384` experts) | `288` Slots (`75%`: `240` static + `48` dynamic) | `256` Slots (`66.7%`: `208` static + `48` dynamic) |
-|---|---:|---:|---:|
-| Replicated + sharded non-routed weights (`embed`, MLA/DSA, dense MLPs, shared experts, routers, mHC, `pack12` `lm_head`, DSpark drafter) | `24.08 GiB /rank` | `24.08 GiB /rank` | `24.08 GiB /rank` |
-| Routed MoE experts across 58 layers (`narrow_codes=True`) | `94.71 GiB /rank` | **`71.03 GiB /rank`** | **`63.14 GiB /rank`** |
-| **Total Model Weights per Rank** | **`118.79 GiB /rank`** (`123.75 GiB` w/ `uint16` codes) | **`95.11 GiB /rank`** (**`-28.64 GiB`** vs `uint16` 384-exp) | **`87.22 GiB /rank`** (**`-36.53 GiB`** vs `uint16` 384-exp) |
-| **Remaining Headroom on `115 GiB` Usable GB10 Node** | `-3.79 GiB` (OOM) | **`+19.89 GiB /rank`** | **`+27.78 GiB /rank`** |
+A resident slot holds `9,131,264 B` (the tiles, codes and bases above, without the pack file's 4 KiB alignment: `2,629,804,032 B / 288`). One slot in each of the 40 MoE layers is `365,250,560 B` (`0.340 GiB`) per rank.
+
+The budget is built from measured anchors and two estimates:
+
+- **Other weights, about `10.4 GiB` per rank (estimate).** A ring rank loads `72.79 GiB` of weights (`Model loading took`, [2026-10-26-tp3-budget-memory](../2026-10-26-tp3-budget-memory/README.md)). At TP4 the routed experts in this benchmark's full layout are half its layer, `1,806,287,616 B × 40 = 67.29 GiB`, which leaves `5.50 GiB` of other weights. About `0.6 GiB` of that is replicated (Q-A/KV, router, indexer, compressor); the rest is sharded and doubles at TP2.
+- **Weights plus KV, about `99.0 GiB` per rank (estimate).** The triangle at an 8,192-token prefill budget loads `94.12 GiB` of weights beside a `4.91 GiB` KV pool, and its lowest free memory is `6.67 GiB` (same experiment). Keeping that low point, a TP2 rank at the same prefill budget has about `99.0 GiB` for weights and KV together; a 16,384 budget costs about `3.5 GiB` more. TP2's wider per-rank activations are not measured, so this is an upper estimate.
+- **KV: `1,100,393` tokens per GiB per rank**, from the ring's startup line (`11,554,122` tokens in `11,274,289,152 B`). Every rank holds the whole KV latent, so this does not change with TP: a full 1M context is `0.95 GiB` per rank.
+
+| Resident slots per layer | Routed experts / rank | All weights / rank | Left for KV / rank | KV tokens | Full 1M contexts | 100K sessions |
+|---|---:|---:|---:|---:|---:|---:|
+| `384`, all resident (`134.58 GiB` in the production layout with `uint16` codes) | `130.62 GiB` | `141.0 GiB` | `-42.0 GiB`: does not fit | — | — | — |
+| `288`, this benchmark (`240` static + `48` dynamic) | `97.97 GiB` | `108.4 GiB` | `-9.3 GiB`: does not fit | — | — | — |
+| `256` | `87.08 GiB` | `97.5 GiB` | `1.6 GiB` | `1.7M` | `1` | `17` |
+| `248` | `84.36 GiB` | `94.8 GiB` | `4.3 GiB` | `4.7M` | `4` | `47` |
+| `240` | `81.64 GiB` | `92.0 GiB` | `7.0 GiB` | `7.7M` | `7` | `77` |
+| `232` | `78.92 GiB` | `89.3 GiB` | `9.7 GiB` | `10.7M` | `10` | `107` |
+| `224` | `76.20 GiB` | `86.6 GiB` | `12.4 GiB` | `13.7M` | `13` | `137` |
+
+Each slot per layer trades `0.340 GiB`, about `374K` KV tokens. At most `257` slots per layer leave room for one full 1M context. For comparison, the four-node ring holds `11.55M` KV tokens (`11.02` full 1M contexts) with every expert resident.
+
+An earlier version of this table counted 58 MoE layers, 24.08 GiB of non-routed weights and a 115 GiB budget. DS4.1 Flash has 40 decoder layers, all MoE, and no dense MLP layers.
 
 ---
 
@@ -75,7 +92,7 @@ At `TP=2` (`hidden_size = 5120`, per-rank `moe_intermediate_size = 1152`), each 
 4. **Router-Bias Static Seeding, Layer-Adaptive Entropy Slot Planner, & UMA `MemAvailable` Auto-Budgeting (`cache.py`)**:
    - `rank_experts_by_router_bias(e_score_correction_bias, gate_weight=None, hotlist_counts=None)` ranks experts `0..E-1` from highest to lowest routing prior so each layer's `static_slots` pin the checkpoint's true high-bias experts (wired automatically via `router_bias` / `layer.e_score_correction_bias` in `TileLangExperts`).
    - `plan_layer_slot_budgets(layer_biases, total_slot_budget, min_slots_per_layer=64, max_slots_per_layer=384, dynamic_slots_per_layer=48)` distributes a fixed global slot budget across MoE layers proportionally to each layer's routing Shannon entropy so concentrated low-entropy layers use fewer static slots and diffuse high-entropy layers receive more static slots at the identical total memory footprint.
-   - `compute_uma_slot_budget(num_layers=58, expert_bytes=9_134_080, non_routed_bytes=0, kv_reserve_bytes=0, system_reserve_bytes=8*(1<<30))` reads Linux `/proc/meminfo` `MemAvailable` on integrated-memory GB10 hosts, subtracts system, KV, and non-routed reserves, and returns a clamped `[64, 384]` per-layer slot budget.
+   - `compute_uma_slot_budget(num_layers=58, expert_bytes=9_134_080, non_routed_bytes=0, kv_reserve_bytes=0, system_reserve_bytes=8*(1<<30))` reads Linux `/proc/meminfo` `MemAvailable` on integrated-memory GB10 hosts, subtracts system, KV, and non-routed reserves, and returns a clamped `[64, 384]` per-layer slot budget. Its `num_layers` default is `58`; DS4.1 Flash has 40 MoE layers, so a caller must pass `num_layers=40` (nothing in serving calls it yet).
 5. **Zero-Staging Chunked Build, Background `O_DIRECT` Layer Writer, & 4-Expert Spot-Checked Cached Start (`cache.py` + `_reader.c` + `tilelang.py`)**:
    - On Boot 1 (when the per-layer NVMe file does not yet exist), `ExpertDiskCache._build_layer_chunked` prepares experts in bounded slices (`chunk_experts=64`) so no full-384-expert staging tensor sits in memory at once, populates resident `ExpertSlotCache` slots directly in RAM (`populate_slots_from_chunk_bytes`), and enqueues the `4 KiB` metadata header (`DS41EXPK` magic, format version, `ExpertPackMeta` geometry, and `checkpoint_key`) plus `4 KiB`-aligned expert chunks onto a single background writer thread (`write_layer_expert_file`).
    - `write_layer_expert_file` verifies `shutil.disk_usage(parent).free` remains above the `8 GiB` safety floor (`MIN_FREE_DISK_BYTES`), streams `4 KiB`-aligned pages through an `mmap` bounce buffer to `<layer>.tmp.<pid>` with `O_DIRECT` (falling back cleanly to buffered write + `fsync` when `O_DIRECT` is unsupported), and atomically publishes via `os.replace`. `ExpertDiskCache.loading_done()` waits for the background queue to drain and cleans up any stale `.tmp.<dead_pid>` files (`cleanup_stale_tmp_files`).
@@ -122,7 +139,7 @@ done
 |---|---:|---:|---:|
 | Full 384-expert layer bytes | `3,612,575,232 B` (`3.364 GiB`) | `3,612,575,232 B` (`3.364 GiB`) | `3.364 GiB` |
 | 288-slot zero-copy layer bytes | `2,629,804,032 B` (`2.449 GiB`) | `2,629,804,032 B` (`2.449 GiB`) | `2.449 GiB` |
-| Saved across 58 MoE layers per rank | `53.086 GiB` | `53.086 GiB` | **`53.086 GiB`** |
+| Saved per rank across the 40 MoE layers (the receipts' `saved_gib_58_layers_per_rank` multiplies by 58) | `36.61 GiB` | `36.61 GiB` | **`36.61 GiB`** |
 | Bitwise parity (`all_hit` & `cold_miss_overlapped`, `rows=1` & `rows=5`) | `max_abs_diff = 0.0` (`True`) | `max_abs_diff = 0.0` (`True`) | **`0.0` (exact)** |
 | All-hit decode `rows=1`: 384-expert `cudaMalloc` | `251.62 µs` | `250.89 µs` | `251.26 µs` |
 | All-hit decode `rows=1`: 288-slot zero-copy `pin_memory` | `242.06 µs` | `240.88 µs` | **`241.47 µs` (`-9.79 µs`)** |
@@ -150,4 +167,4 @@ done
 
 ## 4. Conclusion
 
-The zero-copy `pin_memory` + role-major `O_DIRECT` `io_uring` (`IORING_OP_READ_FIXED`) expert slot cache reduces per-rank resident MoE weight memory at `TP=2` by `53.086 GiB` across 58 layers (`288` resident slots per layer), preserves bit-identical output (`torch.equal`), matches or slightly improves all-hit decode latency on GB10 unified LPDDR5x, cuts 1-expert cold-miss latency by `11.5%` via role-major `w13`/`w2` split waiting and by `76.7%` via cross-layer router lookahead prefetching, reaches `8.74–9.14 GB/s` on 4-expert LBA-sorted multi-miss reads, eliminates `100%` of cold-start static misses on Layer 0 router-bias traces via `rank_experts_by_router_bias`, and doubles demand hit rate (`33.50% -> 68.00%`) under noisy lookahead via unread lookahead probation.
+The zero-copy `pin_memory` + role-major `O_DIRECT` `io_uring` (`IORING_OP_READ_FIXED`) expert slot cache reduces per-rank resident MoE weight memory at `TP=2` by `36.61 GiB` across the 40 MoE layers at `288` resident slots per layer (not yet enough to leave room for KV: about `256` slots or fewer are needed, section 1), preserves bit-identical output (`torch.equal`), matches or slightly improves all-hit decode latency on GB10 unified LPDDR5x, cuts 1-expert cold-miss latency by `11.5%` via role-major `w13`/`w2` split waiting and by `76.7%` via cross-layer router lookahead prefetching, reaches `8.74–9.14 GB/s` on 4-expert LBA-sorted multi-miss reads, eliminates `100%` of cold-start static misses on Layer 0 router-bias traces via `rank_experts_by_router_bias`, and doubles demand hit rate (`33.50% -> 68.00%`) under noisy lookahead via unread lookahead probation.
