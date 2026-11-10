@@ -1,0 +1,656 @@
+# Every hunk of 0793 r3 in vllm/v1/core/sched/scheduler.py, vllm/v1/engine/async_llm.py and
+# vllm/v1/engine/core.py (git diff 0792 0793-r3), each preceded by what a text-only request
+# (no multimodal items) does there. No other file of the patch is on a text request's engine
+# or scheduler path; kv_cache_manager.py, request.py, async_scheduler.py and the worker are untouched.
+
+diff --git a/vllm/v1/core/sched/scheduler.py b/vllm/v1/core/sched/scheduler.py
+index d1015e71b..94bcc8497 100644
+--- a/vllm/v1/core/sched/scheduler.py
++++ b/vllm/v1/core/sched/scheduler.py
+### TEXT REQUEST: scheduler: _lacks_mm_data helper (module level). Defines a function; not called for a request without items.
+@@ -103,6 +103,14 @@ from vllm.v1.utils import record_function_or_nullcontext
+ logger = init_logger(__name__)
+ 
+ 
++def _lacks_mm_data(data: Any) -> bool:
++    """Whether an item came without its tensors (the multimodal prefix-cache
++    fast path): no data, or only the CPU-side fields M-RoPE keeps."""
++    if data is None:
++        return True
++    return bool(data) and all(elem.field.keep_on_cpu for elem in data.values())
++
++
+ def _build_kv_connector_block_state(
+     kv_cache_config: KVCacheConfig,
+     kv_cache_manager: KVCacheManager,
+### TEXT REQUEST: scheduler: class attribute stripped_mm_misses = None. No request path.
+@@ -154,6 +162,9 @@ def _concat_logprobs(first: LogprobsLists, second: LogprobsLists) -> LogprobsLis
+ 
+ 
+ class Scheduler(SchedulerInterface):
++    # Requests whose encoder input came without its data and is held nowhere
++    # any more (set in __init__; none for a scheduler built without it).
++    stripped_mm_misses: dict[str, list[str]] | None = None
+     # Attention-sink detector and rejection (set in __init__ from the
+     # environment; off for a scheduler built without it).
+     sink_config: SinkConfig | None = None
+### TEXT REQUEST: scheduler.__init__: self.stripped_mm_misses = {}. Construction only.
+@@ -335,6 +346,11 @@ class Scheduler(SchedulerInterface):
+         # Grammar compilation failures to finish as per-request errors in
+         # update_from_output.
+         self.grammar_compile_error_reqs: set[str] = set()
++        # Requests whose encoder input was sent without its data and is no
++        # longer held anywhere (request id -> its hashes): finished in
++        # update_from_output with a retryable miss, so the frontend resends
++        # them with their data.
++        self.stripped_mm_misses = {}
+ 
+         # Encoder-related.
+         # Calculate encoder cache size if applicable
+### TEXT REQUEST: scheduler._try_schedule_encoder_inputs, inside the per-item loop over request.mm_features. The function returns at once 'if num_new_tokens == 0 or not request.has_encoder_inputs' and its callers call it only 'if request.has_encoder_inputs': a text request never reaches it.
+@@ -3415,6 +3431,30 @@ class Scheduler(SchedulerInterface):
+                 num_embeds_to_schedule += num_encoder_embeds
+                 continue
+ 
++            if _lacks_mm_data(mm_feature.data):
++                # Sent without its data, and its encoder output is not cached:
++                # borrow the data from another live request with the item.
++                for other_req in self.requests.values():
++                    for other_f in other_req.mm_features:
++                        if other_f.identifier == item_identifier and not (
++                            _lacks_mm_data(other_f.data)
++                        ):
++                            mm_feature.data = other_f.data
++                            break
++                    if not _lacks_mm_data(mm_feature.data):
++                        break
++                if _lacks_mm_data(mm_feature.data):
++                    # Neither the encoder cache, the prefix cache nor another
++                    # request holds it any more (evicted after the request
++                    # was accepted, or the request was preempted). The encoder
++                    # cannot run without it, so do not schedule the request:
++                    # update_from_output finishes it with a retryable miss.
++                    self.stripped_mm_misses.setdefault(request.request_id, []).append(
++                        mm_feature.mm_hash or item_identifier
++                    )
++                    num_new_tokens = 0
++                    break
++
+             num_embeds_to_schedule += num_encoder_embeds
+             encoder_compute_budget -= num_encoder_embeds
+             mm_hashes_to_schedule.add(item_identifier)
+### TEXT REQUEST: scheduler.update_from_output: 'if self.stripped_mm_misses:' once per step. Filled only by the @@3431 block (multimodal requests); empty in a text-only engine, so false.
+@@ -4028,6 +4068,33 @@ class Scheduler(SchedulerInterface):
+                     )
+                 )
+ 
++        if self.stripped_mm_misses:
++            # Encoder inputs sent without data that nothing holds any more.
++            # The frontend resubmits a request that has returned nothing yet
++            # with its data, and finishes any other with the error.
++            stripped_mm_misses = self.stripped_mm_misses
++            self.stripped_mm_misses = {}
++            for request in self.finish_requests(
++                stripped_mm_misses, RequestStatus.FINISHED_ERROR
++            ):
++                mm_hashes = list(dict.fromkeys(stripped_mm_misses[request.request_id]))
++                logger.warning(
++                    "Multi-modal items %s of request %s were sent without data "
++                    "and are no longer cached; returning a retryable response.",
++                    mm_hashes,
++                    request.request_id,
++                )
++                outputs[request.client_index].append(
++                    EngineCoreOutput(
++                        request_id=request.request_id,
++                        new_token_ids=[],
++                        finish_reason=request.get_finished_reason(),
++                        events=request.take_events(),
++                        trace_headers=request.trace_headers,
++                        mm_cache_miss_hashes=mm_hashes,
++                    )
++                )
++
+         # KV Connector: update state for finished KV Transfers.
+         if kv_connector_output:
+             self._update_from_kv_xfer_finished(kv_connector_output)
+diff --git a/vllm/v1/engine/async_llm.py b/vllm/v1/engine/async_llm.py
+index 2efa75eee..36254ad57 100644
+--- a/vllm/v1/engine/async_llm.py
++++ b/vllm/v1/engine/async_llm.py
+### TEXT REQUEST: async_llm imports (OrderedDict, Callable, replace). No request path.
+@@ -5,8 +5,10 @@ import os
+ import socket
+ import time
+ import warnings
+-from collections.abc import AsyncGenerator, Iterable, Mapping
++from collections import OrderedDict
++from collections.abc import AsyncGenerator, Callable, Iterable, Mapping
+ from copy import copy
++from dataclasses import replace
+ from typing import Any
+ 
+ import anyio
+### TEXT REQUEST: async_llm imports (set_default_torch_num_threads, EngineCoreOutput, FinishReason). No request path.
+@@ -44,7 +46,13 @@ from vllm.transformers_utils.config import maybe_register_config_serialize_by_va
+ from vllm.usage.usage_lib import UsageContext
+ from vllm.utils.async_utils import cancel_task_threadsafe
+ from vllm.utils.collection_utils import as_list
+-from vllm.v1.engine import EngineCoreRequest, PauseMode
++from vllm.utils.torch_utils import set_default_torch_num_threads
++from vllm.v1.engine import (
++    EngineCoreOutput,
++    EngineCoreRequest,
++    FinishReason,
++    PauseMode,
++)
+ from vllm.v1.engine.admission_control import SharedAdmissionStats
+ from vllm.v1.engine.core_client import EngineCoreClient
+ from vllm.v1.engine.exceptions import EngineDeadError, EngineGenerateError
+### TEXT REQUEST: async_llm: SentMMIdentifiers class, MAX_SENT_MM_IDENTIFIERS, AsyncLLM._mm_prefix_fastpath = False class default. Definitions only.
+@@ -77,9 +85,66 @@ class InputStreamError(Exception):
+         super().__init__(str(cause))
+ 
+ 
++class SentMMIdentifiers:
++    """Identifiers of multimodal items this frontend sent to the engine with
++    their data, least recently used dropped first.
++
++    A mark is a hint, never a guarantee: the engine verifies every item sent
++    without data and returns a retryable miss when it no longer holds it. The
++    bound keeps the frontend's memory flat however many distinct items it has
++    seen; an item whose mark was dropped is just sent with its data again.
++    """
++
++    def __init__(self, max_entries: int) -> None:
++        self.max_entries = max_entries
++        self._entries: OrderedDict[str, None] = OrderedDict()
++
++    def __contains__(self, identifier: object) -> bool:
++        return identifier in self._entries
++
++    def __len__(self) -> int:
++        return len(self._entries)
++
++    def __iter__(self):
++        return iter(self._entries)
++
++    def touch(self, identifier: str) -> None:
++        if identifier in self._entries:
++            self._entries.move_to_end(identifier)
++
++    def add(self, identifier: str) -> None:
++        self._entries[identifier] = None
++        self._entries.move_to_end(identifier)
++        while len(self._entries) > self.max_entries:
++            self._entries.popitem(last=False)
++
++    def update(self, identifiers: Iterable[str]) -> None:
++        for identifier in identifiers:
++            self.add(identifier)
++
++    def discard(self, identifier: str) -> None:
++        self._entries.pop(identifier, None)
++
++    def difference_update(self, identifiers: Iterable[str]) -> None:
++        for identifier in identifiers:
++            self._entries.pop(identifier, None)
++
++    def clear(self) -> None:
++        self._entries.clear()
++
++
++# Items the processor can return lazily are those in its metadata cache (512
++# entries); marks beyond a few times that would never be used.
++MAX_SENT_MM_IDENTIFIERS = 4096
++
++
+ class AsyncLLM(EngineClient):
+     """An asynchronous wrapper for the vLLM engine."""
+ 
++    # The multimodal prefix-cache fast path is off unless __init__ enables it,
++    # so text-only submission, rollback and abort paths never touch its state.
++    _mm_prefix_fastpath: bool = False
++
+     def __init__(
+         self,
+         vllm_config: VllmConfig,
+### TEXT REQUEST: AsyncLLM.__init__: _mm_prefix_fastpath from the processor's flag; empty marks, retry map, retry task set. Construction only.
+@@ -194,6 +259,20 @@ class AsyncLLM(EngineClient):
+             self.logger_manager.log_engine_initialized()
+ 
+         self._client_count = client_count
++        # With no P0 processor cache (--mm-processor-cache-gb 0) and prefix
++        # caching on, the renderer's processor returns repeat items lazily
++        # (BaseRenderer._uses_mm_prefix_fastpath), and items already sent to P1
++        # go without their data, each request keeping retry materializers.
++        self._mm_prefix_fastpath = bool(
++            getattr(renderer.mm_processor, "prefix_metadata_cache_enabled", False)
++        )
++        self._p1_cached_mm_identifiers = SentMMIdentifiers(MAX_SENT_MM_IDENTIFIERS)
++        # request id -> (request as sent, {mm_features index: materializer})
++        self._pending_mm_retries: dict[
++            str, tuple[EngineCoreRequest, dict[int, Callable[[], Any]]]
++        ] = {}
++        # Cache-miss retries in flight, off the output handler's path.
++        self._mm_retry_tasks: set[asyncio.Task] = set()
+ 
+         self.output_handler: asyncio.Task | None = None
+         try:
+### TEXT REQUEST: AsyncLLM.shutdown: cancels the retry tasks (an empty set without fast-path misses). Not a request path.
+@@ -292,6 +371,9 @@ class AsyncLLM(EngineClient):
+         if handler is not None:
+             cancel_task_threadsafe(handler)
+ 
++        for task in list(getattr(self, "_mm_retry_tasks", ())):
++            cancel_task_threadsafe(task)
++
+     def get_num_unfinished_requests(self) -> int:
+         return self.output_processor.get_num_unfinished_requests()
+ 
+### TEXT REQUEST: AsyncLLM._prepare_mm_features_for_prefix_cache (new method): called only from the @@698 block under 'getattr(request, "mm_features", None) and self._mm_prefix_fastpath'.
+@@ -526,6 +608,80 @@ class AsyncLLM(EngineClient):
+                 )
+             raise
+ 
++    async def _prepare_mm_features_for_prefix_cache(
++        self, request: EngineCoreRequest
++    ) -> list[str]:
++        """Materialize items P1 lacks and strip those it was sent before.
++
++        A stripped item is replaced in a copy of this request's mm_features
++        list, so sampled children sharing the original list (and its feature
++        specs) each decide, and keep retry materializers, for themselves.
++
++        Returns the identifiers this call newly marked as sent to P1, so that
++        a request that never reaches the engine can unmark them.
++        """
++        mm_features = request.mm_features
++        if not mm_features:
++            return []
++        sent = self._p1_cached_mm_identifiers
++        to_materialize: list[Any] = []
++        new_identifiers: list[str] = []
++        retry_materializers: dict[int, Callable[[], Any]] = {}
++        stripped_features: list[Any] | None = None
++        uses_mrope = self.model_config.uses_mrope
++        # A streaming-input request cannot be retried from its first chunk,
++        # so it always sends its items' data.
++        can_strip = not getattr(request, "resumable", False)
++
++        for i, f in enumerate(mm_features):
++            data = f.data
++            if data is None:
++                continue
++            if getattr(data, "is_lazy", False):
++                if (
++                    can_strip
++                    and f.identifier in sent
++                    and f.mm_hash == getattr(data, "_lazy_mm_hash", None)
++                ):
++                    sent.touch(f.identifier)
++                    retry_materializers[i] = data.materialize_and_get
++                    if stripped_features is None:
++                        stripped_features = list(mm_features)
++                    stripped_features[i] = replace(
++                        f, data=data.get_stripped_for_prefix_cache(uses_mrope)
++                    )
++                else:
++                    to_materialize.append(data)
++                    new_identifiers.append(f.identifier)
++            else:
++                new_identifiers.append(f.identifier)
++
++        if stripped_features is not None:
++            request.mm_features = stripped_features
++
++        if to_materialize:
++            loop = asyncio.get_running_loop()
++
++            def _materialize_batch() -> None:
++                # The processor's own work, with its thread setting.
++                with set_default_torch_num_threads():
++                    for item in to_materialize:
++                        item.materialize()
++
++            await loop.run_in_executor(self.renderer._mm_executor, _materialize_batch)
++
++        marked = [
++            ident for ident in dict.fromkeys(new_identifiers) if ident not in sent
++        ]
++        sent.update(marked)
++
++        if retry_materializers:
++            self._pending_mm_retries[request.request_id] = (
++                request,
++                retry_materializers,
++            )
++        return marked
++
+     async def _add_request(
+         self,
+         request: EngineCoreRequest,
+### TEXT REQUEST: AsyncLLM._add_request: 'if getattr(request, "mm_features", None) and self._mm_prefix_fastpath:' is false for a text request (and for a stand-in without the attribute); its else branch is candidate-54's 'await self.engine_core.add_request_async(request)'. Round 2 read request.mm_features on every request and wrapped every send in try/except BaseException.
+@@ -542,8 +698,24 @@ class AsyncLLM(EngineClient):
+         # Register locally before the first await so concurrent tasks see this request.
+         self.output_processor.add_request(request, prompt, parent_req, index, queue)
+ 
+-        # Add the EngineCoreRequest to EngineCore (separate process).
+-        await self.engine_core.add_request_async(request)
++        if getattr(request, "mm_features", None) and self._mm_prefix_fastpath:
++            # The multimodal prefix-cache fast path. This await is covered like
++            # the send below: if it is cancelled or fails, add_request() rolls
++            # back the registration and every child.
++            mm_marked = await self._prepare_mm_features_for_prefix_cache(request)
++            try:
++                await self.engine_core.add_request_async(request)
++            except BaseException:
++                # The send did not complete, so count none of this request's
++                # items as sent to P1 and drop its retry entry.
++                self._pending_mm_retries.pop(request.request_id, None)
++                self._p1_cached_mm_identifiers.difference_update(mm_marked)
++                raise
++        else:
++            # Every other request (text-only ones included) is sent as before
++            # the fast path.
++            # Add the EngineCoreRequest to EngineCore (separate process).
++            await self.engine_core.add_request_async(request)
+ 
+         if self.log_requests:
+             logger.info("Added request %s.", request.request_id)
+### TEXT REQUEST: AsyncLLM._run_output_handler: locals (the retry map and marks) and the retry coroutine definitions (_retry_mm_cache_miss, _start_mm_retry), started only for an engine output carrying mm_cache_miss_hashes for a request in the retry map.
+@@ -823,8 +995,81 @@ class AsyncLLM(EngineClient):
+         renderer = self.renderer
+         # P0 multi-modal sender ("shadow") cache; None for text-only models.
+         mm_processor_cache = renderer.mm_processor_cache
++        pending_mm_retries = self._pending_mm_retries
++        p1_cached_mm_identifiers = self._p1_cached_mm_identifiers
+         chunk_size = envs.VLLM_V1_OUTPUT_PROC_CHUNK_SIZE
+ 
++        mm_retry_tasks = self._mm_retry_tasks
++
++        async def _retry_mm_cache_miss(
++            retry_req: EngineCoreRequest,
++            materializers: dict[int, Callable[[], Any]],
++        ) -> None:
++            # Runs as its own task: materializing items takes as long as the
++            # processor does, and must not hold up other requests' outputs.
++            request_id = retry_req.request_id
++            try:
++                features = list(retry_req.mm_features or ())
++
++                def _materialize_stripped() -> None:
++                    # Every stripped item, not only the missed ones: the
++                    # resubmitted request carries all its data and cannot miss
++                    # again.
++                    with set_default_torch_num_threads():
++                        for i, materialize in materializers.items():
++                            features[i] = replace(features[i], data=materialize())
++
++                loop = asyncio.get_running_loop()
++                await loop.run_in_executor(
++                    renderer._mm_executor, _materialize_stripped
++                )
++                if not output_processor.has_request(request_id):
++                    # Aborted while its items materialized: resubmitting would
++                    # start an engine request that no client is waiting for.
++                    return
++                retry_req.mm_features = features
++                marked = [
++                    ident
++                    for ident in dict.fromkeys(
++                        f.identifier for f in features if f.data is not None
++                    )
++                    if ident not in p1_cached_mm_identifiers
++                ]
++                p1_cached_mm_identifiers.update(marked)
++                try:
++                    await engine_core.add_request_async(retry_req)
++                except BaseException:
++                    p1_cached_mm_identifiers.difference_update(marked)
++                    raise
++            except asyncio.CancelledError:
++                raise
++            except Exception:
++                logger.exception(
++                    "Multimodal cache-miss retry of request %s failed.", request_id
++                )
++                # Finish the request with an error for its client.
++                output_processor.process_outputs(
++                    [
++                        EngineCoreOutput(
++                            request_id=request_id,
++                            new_token_ids=[],
++                            finish_reason=FinishReason.ERROR,
++                        )
++                    ],
++                    time.monotonic(),
++                    None,
++                )
++
++        def _start_mm_retry(
++            retry_req: EngineCoreRequest,
++            materializers: dict[int, Callable[[], Any]],
++        ) -> None:
++            task = asyncio.create_task(
++                _retry_mm_cache_miss(retry_req, materializers)
++            )
++            mm_retry_tasks.add(task)
++            task.add_done_callback(mm_retry_tasks.discard)
++
+         async def output_handler():
+             try:
+                 while True:
+### TEXT REQUEST: output_handler: 'if pending_mm_retries:' per output chunk; the map is filled only by _prepare_mm_features_for_prefix_cache, so false in a text-only server and for a text request's outputs.
+@@ -843,6 +1088,37 @@ class AsyncLLM(EngineClient):
+                     for start in range(0, num_outputs, chunk_size):
+                         end = start + chunk_size
+                         outputs_slice = engine_core_outputs[start:end]
++                        if pending_mm_retries:
++                            filtered_slice = []
++                            for eco in outputs_slice:
++                                retry = (
++                                    pending_mm_retries.pop(eco.request_id, None)
++                                    if eco.finished
++                                    else None
++                                )
++                                if retry is not None and eco.mm_cache_miss_hashes:
++                                    retry_req, materializers = retry
++                                    # P1 no longer holds these items.
++                                    missed = set(eco.mm_cache_miss_hashes)
++                                    p1_cached_mm_identifiers.difference_update(missed)
++                                    p1_cached_mm_identifiers.difference_update(
++                                        f.identifier
++                                        for f in retry_req.mm_features or ()
++                                        if f.mm_hash in missed
++                                    )
++                                    state = output_processor.request_states.get(
++                                        eco.request_id
++                                    )
++                                    if state is not None and state.is_prefilling:
++                                        # Nothing reached the client yet, so
++                                        # the engine can start the request over.
++                                        _start_mm_retry(retry_req, materializers)
++                                        continue
++                                    # It already returned output (preempted
++                                    # after its first token): finish with the
++                                    # error rather than repeat that output.
++                                filtered_slice.append(eco)
++                            outputs_slice = filtered_slice
+                         # 2) Process EngineCoreOutputs.
+                         processed_outputs = output_processor.process_outputs(
+                             outputs_slice, outputs.timestamp, iteration_stats
+### TEXT REQUEST: output_handler, stop-string aborts: 'if pending_mm_retries:' as above.
+@@ -866,6 +1142,11 @@ class AsyncLLM(EngineClient):
+ 
+                         # 3) Abort any reqs that finished due to stop strings.
+                         if processed_outputs.reqs_to_abort:
++                            if pending_mm_retries:
++                                # Finished here, so no engine output will end
++                                # their retry entries.
++                                for req_id in processed_outputs.reqs_to_abort:
++                                    pending_mm_retries.pop(req_id, None)
+                             await engine_core.abort_requests_async(
+                                 processed_outputs.reqs_to_abort
+                             )
+### TEXT REQUEST: AsyncLLM.abort: 'if self._mm_prefix_fastpath and self._pending_mm_retries:' false without fast-path items.
+@@ -897,6 +1178,9 @@ class AsyncLLM(EngineClient):
+             (request_id,) if isinstance(request_id, str) else as_list(request_id)
+         )
+         all_request_ids = self.output_processor.abort_requests(request_ids, internal)
++        if self._mm_prefix_fastpath and self._pending_mm_retries:
++            for req_id in all_request_ids:
++                self._pending_mm_retries.pop(req_id, None)
+         # Starlette StreamingResponse cancels an AnyIO scope on client
+         # disconnect. Once output_processor has removed local state, shield the
+         # EngineCore abort notification so it cannot be dropped mid-await.
+### TEXT REQUEST: AsyncLLM.reset_mm_cache / reset_prefix_cache: clear the (empty) marks. Utility calls, not a request path.
+@@ -1115,12 +1399,14 @@ class AsyncLLM(EngineClient):
+         # Join the background MM warmup first: the mm_processor_cache is not
+         # safe for concurrent access with its apply/clear.
+         self.renderer._join_mm_warmup()
++        self._p1_cached_mm_identifiers.clear()
+         await self.renderer.clear_mm_cache_async()
+         await self.engine_core.reset_mm_cache_async()
+ 
+     async def reset_prefix_cache(
+         self, reset_running_requests: bool = False, reset_connector: bool = False
+     ) -> bool:
++        self._p1_cached_mm_identifiers.clear()
+         return await self.engine_core.reset_prefix_cache_async(
+             reset_running_requests, reset_connector
+         )
+### TEXT REQUEST: AsyncLLM.reset_encoder_cache / sleep: clear the (empty) marks. Utility calls.
+@@ -1132,10 +1418,12 @@ class AsyncLLM(EngineClient):
+         return await self.engine_core.set_prefill_fairness_async(config)
+ 
+     async def reset_encoder_cache(self) -> None:
++        self._p1_cached_mm_identifiers.clear()
+         await self.engine_core.reset_encoder_cache_async()
+ 
+     async def sleep(self, level: int = 1, mode: PauseMode = "abort") -> None:
+         if level >= 1:
++            self._p1_cached_mm_identifiers.clear()
+             await self.renderer.clear_mm_cache_async()
+         await self.engine_core.sleep_async(level, mode)
+ 
+diff --git a/vllm/v1/engine/core.py b/vllm/v1/engine/core.py
+index 78ee820ac..9af2e03c3 100644
+--- a/vllm/v1/engine/core.py
++++ b/vllm/v1/engine/core.py
+### TEXT REQUEST: core: EngineCore._has_stripped_mm_data and _verify_or_resolve_stripped_mm_features (new methods): called only from the @@583 block.
+@@ -477,6 +477,72 @@ class EngineCore:
+             supported_pooling_tasks,
+         )
+ 
++    @staticmethod
++    def _has_stripped_mm_data(f: Any) -> bool:
++        if f.data is None:
++            return True
++        return bool(f.data) and all(
++            elem.field.keep_on_cpu for elem in f.data.values()
++        )
++
++    def _verify_or_resolve_stripped_mm_features(self, request: Request) -> None:
++        stripped_indices = [
++            i
++            for i, f in enumerate(request.mm_features)
++            if self._has_stripped_mm_data(f)
++        ]
++        if not stripped_indices:
++            return
++
++        effective_computed_tokens = 0
++        if (
++            self.vllm_config.cache_config.enable_prefix_caching
++            and not request.skip_reading_prefix_cache
++        ):
++            # (blocks, computed tokens, shared-prefix boundary); the hit is
++            # already capped where the scheduler would recompute.
++            effective_computed_tokens = (
++                self.scheduler.kv_cache_manager.get_computed_blocks(request)[1]
++            )
++
++        encoder_pin_indices: list[int] = []
++        resolved_data: list[tuple[int, Any]] = []
++        missing_hashes: list[str] = []
++
++        for i in stripped_indices:
++            f = request.mm_features[i]
++            if f.identifier in self.scheduler.encoder_cache_manager.cached:
++                encoder_pin_indices.append(i)
++                continue
++            if (
++                f.mm_position.offset + f.mm_position.length
++                <= effective_computed_tokens
++            ):
++                continue
++            found_data = None
++            for other_req in self.scheduler.requests.values():
++                for other_f in other_req.mm_features:
++                    if (
++                        other_f.identifier == f.identifier
++                        and not self._has_stripped_mm_data(other_f)
++                    ):
++                        found_data = other_f.data
++                        break
++                if found_data is not None:
++                    break
++            if found_data is not None:
++                resolved_data.append((i, found_data))
++                continue
++            missing_hashes.append(f.mm_hash or f.identifier)
++
++        if missing_hashes:
++            raise MultiModalCacheMissError(missing_hashes)
++
++        for i, data in resolved_data:
++            request.mm_features[i].data = data
++        for i in encoder_pin_indices:
++            self.scheduler.encoder_cache_manager.check_and_update_cache(request, i)
++
+     def add_request(self, request: Request, request_wave: int = 0):
+         """Add request to the scheduler.
+ 
+### TEXT REQUEST: EngineCore.add_request: 'if getattr(request, "mm_features", None) and self.mm_receiver_cache is None:' false for a text request (mm_features []); candidate-54's statements before and after.
+@@ -517,6 +583,9 @@ class EngineCore:
+                 "Disabling ECTransfer for this request."
+             )
+ 
++        if getattr(request, "mm_features", None) and self.mm_receiver_cache is None:
++            self._verify_or_resolve_stripped_mm_features(request)
++
+         self.scheduler.add_request(request)
+         if request.abort_immediately:
+             # Immediately abort so the connector's request_finished hook runs
+### TEXT REQUEST: EngineCoreProc._handle_client_request ADD: 'if not getattr(req, "mm_features", None): self.add_request(req, request_wave); return' - candidate-54's statement for a text request; the try/except MultiModalCacheMissError only for a request with items (round 2 wrapped every request).
+@@ -1762,7 +1831,18 @@ class EngineCoreProc(EngineCore):
+                 )
+             if self._reject_add_in_shutdown(req):
+                 return
+-            self.add_request(req, request_wave)
++            if not getattr(req, "mm_features", None):
++                # A request without multimodal items is added as before the
++                # multimodal prefix-cache fast path.
++                self.add_request(req, request_wave)
++                return
++            try:
++                self.add_request(req, request_wave)
++            except MultiModalCacheMissError as e:
++                # An item sent without its data that the engine no longer holds
++                # (_verify_or_resolve_stripped_mm_features).
++                self._handle_mm_cache_miss(req, e)
++                return
+         elif request_type == EngineCoreRequestType.ABORT:
+             self.abort_requests(request)
+         elif request_type == EngineCoreRequestType.UTILITY:
+### TEXT REQUEST: EngineCoreProc._handle_mm_cache_miss: the parameter's type annotation only.
+@@ -2080,7 +2160,7 @@ class EngineCoreProc(EngineCore):
+                     reuse_buffers.append(buffer)
+ 
+     def _handle_mm_cache_miss(
+-        self, request: EngineCoreRequest, err: MultiModalCacheMissError
++        self, request: EngineCoreRequest | Request, err: MultiModalCacheMissError
+     ) -> None:
+         """Return a retryable response for a P0/P1 cache-drift miss.
+ 

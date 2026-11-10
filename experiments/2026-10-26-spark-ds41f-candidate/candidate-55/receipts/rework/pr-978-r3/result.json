@@ -1,0 +1,2620 @@
+{
+ "pr": 978,
+ "label": "978-r3",
+ "kind": "perf (host)",
+ "round": "candidate-55 round 3 (the owner's exception of 2026-11-10 beyond two reworks), patch 0793",
+ "date": "2026-11-10",
+ "verdict": "ready for the testbed; the gate's difference is not #978's",
+ "verdict_basis": [
+  "Cause: #978 (round 2 or 3) does not change how a text-only request is handled. Statically, no line of its engine, scheduler or frontend code is reached by a request without multimodal items beyond an empty-list or empty-dict check, and it changes no KV cache manager, request or worker code. Dynamically, the gate's requests replayed through the real frontend and a real EngineCore/AsyncScheduler/KVCacheManager over DS4.1's KV cache groups give candidate-54's requests byte for byte and its schedule step for step (3,083 steps, every block id, every prefix-cache hit), on round 2 and on round 3, twice each.",
+  "The premise that 'again' re-runs prompts on cached blocks does not hold: every 'again' request carries a fresh cache_salt, and the gate's short prompts render to 14-22 tokens, below one 256-token scheduler block, so no request of the gate hits the prefix cache (the 'cached' pairs included). The replay shows 0 cached tokens in every gate scenario.",
+  "The gate compares a server with itself: in round 2's boot the reference digests (18d61961, d6568649, text 0a2dacdd, 12fd8257) were candidate-54's, and c8, staggered, mixed, cached and mixed15 were identical. A deterministic change to a text request's path would show in those. What differed was one request of the last scenario, a different prompt in each run (2 with logprobs, 4 without), late in its 192 tokens: a run-to-run difference.",
+  "The same kind of difference is on main without #978: candidate-51's gate at tp4-ring (receipts/tp4-ring/determinism/candidate-51-tp4/greedy-candidate-51.jsonl), 'again' prompt 7 from character 112; it was recorded as 'the gate is identical'. Across the 43 recorded 'again' runs on main, 3 have a difference: that one and round 2's two.",
+  "Fix (round 3): the two places where round 2 still touched every request are now gated on the request's multimodal items: the engine's request handler adds a request without items with candidate-54's statement and nothing around it, and AsyncLLM._add_request sends it with candidate-54's statement. Both guards read the items with getattr, so request stand-ins without mm_features also take the earlier statements: round 2's _add_request read request.mm_features on every request, and candidate-54's async admission test (test_admission_control.py::test_concurrent_single_request_admission_respects_limit, collected but never run in the release environment, which has no async plugin) fails on round 2's tree when run with asyncio.run and passes on candidate-54 and round 3. Every other line is round 2's. The new test file pins text-request scheduling on prefix-cache re-runs to candidate-54's recorded schedule (passes on candidate-54, round 2 and round 3) and the handler and frontend paths for requests without items (2 of its tests fail on round 2's tree, all pass on candidate-54 and round 3).",
+  "Kept: round 2's serving-path gain. Its bench (the mark), ABBA against candidate-54, two boots each, on the final tree: all 12 image cells faster beyond the interval, turn 2+ 4.25x-9.59x, turn 1 2.8%-15.4% faster; prompt token ids and mm hashes equal candidate-54's. Text-only requests, ABBA twice (four boots each): every cell within the interval. With the recipe's frontend environment (supplementary, as round 2's): turn 2+ 4.6x-11.9x and turn 1 faster in 5 of 6 workloads in both sessions; 1920x1080 PNG turn 1 is bimodal by boot exactly as round 2 found it (round 2: 80.9/79.7 against 72.0/70.2 ms, the processor's work on Cortex-A725 cores): on the final tree 3 of 6 boots at 78-80 ms and 3 at 61-64 ms against 69-75 ms, so slower beyond the interval in the 2-boot session and within it in the 4-boot one. Round 3 changes no image path. Also kept: the closed risks, #972's guarantees and round 1's fixes (round 2's tests all pass on round 3: the gate files 68, #978's set 60 on two boots, the directories and the scheduler and multimodal set with candidate-54's failures only)."
+ ],
+ "cause": {
+  "question": "Do round 2's scheduler, engine-core or frontend changes reach text-only requests that re-run on cached blocks (a changed prefix-cache hit length, chunk boundary, computed-token count or scheduling order)?",
+  "answer": "No. Not in round 2 and not in round 3. The exact mechanism of the one-request 'again' difference at tp4-ring is not established here (one GB10 cannot run the TP4 model); it lies below the scheduler and frontend, which #978 does not touch for text, and it occurs without #978.",
+  "what_again_does": "token_determinism_text.py (experiments/2026-10-12-r6g): after reference (each prompt alone, fresh salt), c8, staggered, mixed, mixed15 (with --wide) and cached (each prompt twice with one salt, the second compared), 'again' runs the eight prompts one at a time once more, each with a fresh uuid4 cache_salt, and compares them with the reference.",
+  "why_no_prefix_cache_hit": [
+   "cache_salt enters the first block hash (kv_cache_utils.generate_block_hash_extra_keys: [request.cache_salt] for start_token_idx 0), so a fresh salt can match nothing.",
+   "DS4.1's KV cache has 18 groups (40 SlidingWindowMLASpec layers of block 128, 8 MLAAttentionSpec of block 256, 3 CircularBufferSpec of 32; read from the worker's own get_kv_cache_spec): the scheduler block is 256 tokens and a hit needs whole blocks of the prompt short of its last token. The gate's prompts render (DS4.1 tokenizer and template, thinking off) to 18, 19, 20, 19, 18, 17, 16, 17 tokens (and 14-22 for the seven more), so not even 'cached' hits anything. The long prompt (14,820 tokens) always has a fresh salt.",
+   "The replay's prefill stats: num_cached_tokens 0 for every request of every gate scenario; only the re-run beyond the gate with the reference salts gives a hit (the long prompt: 14,592 of 14,820 tokens)."
+  ],
+  "why_not_978_text_path": "see static_argument and dynamic_evidence",
+  "within_server_comparison": "Round 2's boot produced candidate-54's reference digests and identical c8, staggered, mixed, cached and mixed15; a deterministic difference in a text request's path would act on the reference and every scenario alike. Only a state- or timing-dependent effect can make the last scenario alone differ, and #978 adds no state that a text request reads or writes (its frontend marks and retry map and the scheduler's miss record stay empty without multimodal requests).",
+  "precedent": "candidate-51 (candidate-50 without #1009 plus #961, #963, #987's WO-B part and #1001; no #978) at tp4-ring: greedy run, 'again' prompt 7 differs from character 112 (raw/gate-history.json).",
+  "leads_not_verified": [
+   "Physical KV blocks are reused across requests: in the replay, the second reference request's 18 first blocks (32, 18, 31, 17, ...) are all blocks the first one freed, out of 49,483, so every scenario runs on blocks with earlier requests' contents, and which blocks a request gets depends on when the previous request's blocks are freed.",
+   "With async scheduling and late admission (VLLM_LATE_ADMISSION_LAYER=30), when a request is first scheduled and when the previous one's blocks are freed depend on timing in the served engine; the replay fixes arrivals by step and so cannot show it.",
+   "A difference late in a lone request (output tokens 176, 189; character 641; character 112 on candidate-51) on a different prompt each time fits a rare numeric effect of that placement or timing in the worker's kernels or collectives, not a scheduling or prefix-cache change. Measuring the rate needs repeated gates on a build without #978 (candidate-54 or candidate-55 without #978); the round-3 spec boots the candidate twice."
+  ]
+ },
+ "fix": {
+  "what_round_3_changes": [
+   "vllm/v1/engine/core.py, EngineCoreProc._handle_client_request (ADD): 'if not getattr(req, \"mm_features\", None): self.add_request(req, request_wave); return' - candidate-54's statement with nothing around it; only a request with items keeps round 2's MultiModalCacheMissError handling (the add-time stripped-item check). Round 2 wrapped every request.",
+   "vllm/v1/engine/core.py, EngineCore.add_request: 'if getattr(request, \"mm_features\", None) and self.mm_receiver_cache is None:' (the request's items first, read with getattr); the same behaviour for real requests.",
+   "vllm/v1/engine/async_llm.py, AsyncLLM._add_request: 'if getattr(request, \"mm_features\", None) and self._mm_prefix_fastpath:' the fast path's preparation and its send with the unmark-on-failure handling; else candidate-54's 'await self.engine_core.add_request_async(request)'. Round 2 read request.mm_features on every request and wrapped every send.",
+   "tests/v1/core/test_text_request_scheduling.py (new, 4 tests)."
+  ],
+  "unchanged": "Everything else is round 2's, byte for byte: the scheduler (its schedule-time retryable miss), the processor, renderer, registry, context, image loading, inputs, the add-time check itself, the output handler and abort paths, hasher.py at candidate-54's. raw/interdiff-0793-r2-to-0793-r3.diff.",
+  "development": "A first round-3 tree (arms/r3-pre, raw/superseded/tests-r3-pre) read req.mm_features directly in the handler; tests/v1/engine/test_stall_diagnostics.py::test_add_request_waiting_in_the_input_queue_is_reported, which passes a SimpleNamespace request, failed on it (dirs: 18 failed against round 2's 17). Looking for other stand-ins found test_admission_control.py's async test, which round 2 already fails. Both guards now use getattr; the final tree passes both."
+ },
+ "static_argument": {
+  "claim": "A text-only request (no multimodal items: EngineCoreRequest.mm_features None, Request.mm_features []) executes candidate-54's statements in the frontend, the engine core and the scheduler; the only additions it passes are the guards listed, each false for it, and none reads or writes state.",
+  "frontend": {
+   "rendering": "vllm/renderers/base.py _process_tokens(_async): 'if multi_modal_data := prompt.get(\"multi_modal_data\")' else tokens_input(...): the processor (processor.py, image.py, inputs.py, hasher.py) never runs for a text prompt; renderers/base.py's changes are in __init__ (the processor's flag, the header cache switch), clear_mm_cache and _clear_processor_cache only.",
+   "AsyncLLM._add_request": "'if getattr(request, \"mm_features\", None) and self._mm_prefix_fastpath:' false -> else branch: 'await self.engine_core.add_request_async(request)' (candidate-54's statement).",
+   "output handler": "'if pending_mm_retries:' per output chunk and before the stop-string abort: the map is filled only by _prepare_mm_features_for_prefix_cache (fast path, items), so it is empty for a text-only server and false for a text request.",
+   "abort": "'if self._mm_prefix_fastpath and self._pending_mm_retries:' false without fast-path items.",
+   "utilities": "reset_mm_cache, reset_prefix_cache, reset_encoder_cache and sleep clear the (empty) marks; shutdown cancels the (empty) retry task set: not request paths.",
+   "startup": "The renderer's background MM warmup (dummy images, API server only) takes the fast path's processor branch: a helper thread (vllm-mm-hash) hashes beside the HF processor and the dummy's metadata is cleared at the warmup's end (clear_mm_cache). Round 2 the same; no engine or request effect."
+  },
+  "engine_core": {
+   "EngineCoreProc._handle_client_request ADD": "'if not getattr(req, \"mm_features\", None): self.add_request(req, request_wave); return' -> candidate-54's statement.",
+   "EngineCore.add_request": "'if getattr(request, \"mm_features\", None) and self.mm_receiver_cache is None:' false: _verify_or_resolve_stripped_mm_features (the only new caller of KVCacheManager.get_computed_blocks, which can set request.use_boundary_checkpoints and boundary_checkpoint) is not called; then candidate-54's scheduler.add_request.",
+   "_handle_mm_cache_miss": "a type annotation only."
+  },
+  "scheduler": {
+   "_lacks_mm_data, class attribute, __init__": "a helper, 'stripped_mm_misses: ... = None' and 'self.stripped_mm_misses = {}': no request path.",
+   "_try_schedule_encoder_inputs": "the schedule-time miss block is inside the per-item loop of a function that returns at once 'if num_new_tokens == 0 or not request.has_encoder_inputs' and whose callers (waiting and running loops) call it only 'if request.has_encoder_inputs'.",
+   "update_from_output": "'if self.stripped_mm_misses:' (once per step, not per request) is filled only by that block, so it is empty in a text-only engine.",
+   "untouched": "kv_cache_manager.py, kv_cache_coordinator, block_pool, request.py, async_scheduler.py, the worker: not in the patch."
+  },
+  "hunks": "every hunk of 0793 r3 in scheduler.py (5), async_llm.py (13) and core.py (4) against 0792, each annotated with what a text request does there: raw/static-hunks.txt"
+ },
+ "dynamic_evidence": {
+  "harness": "exp/gate_replay.py (scripts/gate_replay.py), on sp8 in spark-ds41f:candidate-54 with each arm's files mounted, --gpus all for platform detection only (no model is loaded), under the GPU lock.",
+  "frontend_part": "A real AsyncLLM from the served DS4.1 checkpoint with the recipe's flags (--enable-prefix-caching, --mm-processor-cache-gb 0, --limit-mm-per-prompt {image:67}, block size 256, chunked prefill, max-num-seqs 16, max-num-batched-tokens 16384, long-prefill threshold 16288, async scheduling, retention interval 8192, generation-config vllm, the DSpark speculative config), the real OnlineRenderer rendering each gate request as the server does (chat template, thinking off, cache_salt, logprobs, temperature 0, ignore_eos), AsyncLLM.generate; the engine-core client an in-process fake that msgpack-encodes each EngineCoreRequest. Round 2 and 3 run with the fast path on (mm_prefix_fastpath true), candidate-54 without it.",
+  "engine_part": "A real EngineCore (its __init__) with a stand-in executor that reports DS4.1's KV cache specs (exp/ds41_kv_specs.py: the model built on the meta device, engram table on disk, the worker's own get_kv_cache_spec) and the recipe's 11,274,289,152 KV bytes: the real AsyncScheduler (sink rejection on, as DS4.1's default; 5 speculative tokens; batch queue 2; late admission on) and KVCacheManager over 18 groups and 49,483 blocks. Each request is decoded from the frontend's frames, preprocessed (preprocess_add_request, the block hasher) and enters through EngineCoreProc._handle_client_request (ADD); the loop is step_with_batch_queue. The stand-in model follows the V2 runner's sink-rejection contract (as tests/v1/core/test_sink_draft_zero.py's scripted worker): tokens and accepted drafts are hashes of the request's own history.",
+  "workload": "The gate in its order and concurrency, in engine steps: reference (alone), the long prompt alone, c8 (together), staggered (8 steps apart), mixed (the long prompt 24 steps later), the seven more alone, mixed15, cached (pairs with one salt), again (alone, fresh salts), then again_salted (the eight and the long prompt with their reference salts: a prefix-cache re-run). 90 requests, 3,083 steps.",
+  "recorded": "Every step's SchedulerOutput: scheduled tokens and drafts per request, computed tokens and block ids of new requests, new block ids, computed tokens and resumption of running ones, preemptions, finishes, common-prefix blocks, encoder inputs; per request its prefill stats (prompt, computed, cached tokens) and outputs; the frontend's encoded requests (id and arrival time fixed).",
+  "result": "Byte-identical on all six runs (candidate-54, round 2, round 3, twice each, order none r2 r3 r3 r2 none): frontend requests sha256 ea07da74..., schedule trace 0aca7a2d..., outputs a1e90195...",
+  "limits": "Arrivals are fixed by step, so the replay cannot show timing effects of the served engine; the stand-in replaces the worker, so worker numerics are not exercised; the drafter's own KV groups are not in the specs (the meta build has the target's layers only). It shows that #978 changes neither what a text request carries into the engine nor any scheduler or KV cache manager decision about it, including on prefix-cache re-runs.",
+  "runs": {
+   "c54-1": {
+    "frontend_requests_sha256": "ea07da741c275b860ff069e99de53f299923360339d1d088439424f56fa5157b",
+    "trace_sha256": "0aca7a2dff57842d073f3096ee0be2a21f5a380f25a308af5a1866f7f5117b13",
+    "outputs_sha256": "a1e90195232108c646f95f4a39f5a07641a333e89e6187ec747b7c1531ce0dd5",
+    "steps": 3083,
+    "requests": 90,
+    "mm_prefix_fastpath": false
+   },
+   "c54-2": {
+    "frontend_requests_sha256": "ea07da741c275b860ff069e99de53f299923360339d1d088439424f56fa5157b",
+    "trace_sha256": "0aca7a2dff57842d073f3096ee0be2a21f5a380f25a308af5a1866f7f5117b13",
+    "outputs_sha256": "a1e90195232108c646f95f4a39f5a07641a333e89e6187ec747b7c1531ce0dd5",
+    "steps": 3083,
+    "requests": 90,
+    "mm_prefix_fastpath": false
+   },
+   "r2-1": {
+    "frontend_requests_sha256": "ea07da741c275b860ff069e99de53f299923360339d1d088439424f56fa5157b",
+    "trace_sha256": "0aca7a2dff57842d073f3096ee0be2a21f5a380f25a308af5a1866f7f5117b13",
+    "outputs_sha256": "a1e90195232108c646f95f4a39f5a07641a333e89e6187ec747b7c1531ce0dd5",
+    "steps": 3083,
+    "requests": 90,
+    "mm_prefix_fastpath": true
+   },
+   "r2-2": {
+    "frontend_requests_sha256": "ea07da741c275b860ff069e99de53f299923360339d1d088439424f56fa5157b",
+    "trace_sha256": "0aca7a2dff57842d073f3096ee0be2a21f5a380f25a308af5a1866f7f5117b13",
+    "outputs_sha256": "a1e90195232108c646f95f4a39f5a07641a333e89e6187ec747b7c1531ce0dd5",
+    "steps": 3083,
+    "requests": 90,
+    "mm_prefix_fastpath": true
+   },
+   "r3-1": {
+    "frontend_requests_sha256": "ea07da741c275b860ff069e99de53f299923360339d1d088439424f56fa5157b",
+    "trace_sha256": "0aca7a2dff57842d073f3096ee0be2a21f5a380f25a308af5a1866f7f5117b13",
+    "outputs_sha256": "a1e90195232108c646f95f4a39f5a07641a333e89e6187ec747b7c1531ce0dd5",
+    "steps": 3083,
+    "requests": 90,
+    "mm_prefix_fastpath": true
+   },
+   "r3-2": {
+    "frontend_requests_sha256": "ea07da741c275b860ff069e99de53f299923360339d1d088439424f56fa5157b",
+    "trace_sha256": "0aca7a2dff57842d073f3096ee0be2a21f5a380f25a308af5a1866f7f5117b13",
+    "outputs_sha256": "a1e90195232108c646f95f4a39f5a07641a333e89e6187ec747b7c1531ce0dd5",
+    "steps": 3083,
+    "requests": 90,
+    "mm_prefix_fastpath": true
+   },
+   "identical_to_candidate_54": {
+    "c54-1": true,
+    "c54-2": true,
+    "r2-1": true,
+    "r2-2": true,
+    "r3-1": true,
+    "r3-2": true
+   }
+  },
+  "engine_as_built": {
+   "scheduler": "AsyncScheduler",
+   "num_blocks": 49483,
+   "kv_cache_groups": [
+    [
+     "SlidingWindowMLASpec",
+     128,
+     3
+    ],
+    [
+     "SlidingWindowMLASpec",
+     128,
+     3
+    ],
+    [
+     "SlidingWindowMLASpec",
+     128,
+     3
+    ],
+    [
+     "SlidingWindowMLASpec",
+     128,
+     3
+    ],
+    [
+     "SlidingWindowMLASpec",
+     128,
+     3
+    ],
+    [
+     "SlidingWindowMLASpec",
+     128,
+     3
+    ],
+    [
+     "SlidingWindowMLASpec",
+     128,
+     2
+    ],
+    [
+     "MLAAttentionSpec",
+     256,
+     8
+    ],
+    [
+     "CircularBufferSpec",
+     32,
+     1
+    ],
+    [
+     "CircularBufferSpec",
+     32,
+     1
+    ],
+    [
+     "CircularBufferSpec",
+     32,
+     1
+    ],
+    [
+     "SlidingWindowMLASpec",
+     128,
+     3
+    ],
+    [
+     "SlidingWindowMLASpec",
+     128,
+     3
+    ],
+    [
+     "SlidingWindowMLASpec",
+     128,
+     3
+    ],
+    [
+     "SlidingWindowMLASpec",
+     128,
+     3
+    ],
+    [
+     "SlidingWindowMLASpec",
+     128,
+     3
+    ],
+    [
+     "SlidingWindowMLASpec",
+     128,
+     3
+    ],
+    [
+     "SlidingWindowMLASpec",
+     128,
+     2
+    ]
+   ],
+   "batch_queue_size": 2,
+   "late_admission": true,
+   "num_spec_tokens": 5,
+   "block_size": 256,
+   "sink_rejection": true,
+   "hash_block_size": 128
+  },
+  "prefix_cache_hits_by_scenario": {
+   "reference": {
+    "requests": 8,
+    "cached_tokens": 0
+   },
+   "long_reference": {
+    "requests": 1,
+    "cached_tokens": 0
+   },
+   "c8": {
+    "requests": 8,
+    "cached_tokens": 0
+   },
+   "staggered": {
+    "requests": 8,
+    "cached_tokens": 0
+   },
+   "mixed": {
+    "requests": 9,
+    "cached_tokens": 0
+   },
+   "more_reference": {
+    "requests": 7,
+    "cached_tokens": 0
+   },
+   "mixed15": {
+    "requests": 16,
+    "cached_tokens": 0
+   },
+   "cached": {
+    "requests": 16,
+    "cached_tokens": 0
+   },
+   "again": {
+    "requests": 8,
+    "cached_tokens": 0
+   },
+   "again_salted": {
+    "requests": 9,
+    "cached_tokens": 14592
+   }
+  },
+  "per_request_prefill_on_candidate_54": {
+   "reference-2": [
+    20,
+    20,
+    0
+   ],
+   "long_reference": [
+    14820,
+    14820,
+    0
+   ],
+   "mixed-long": [
+    14820,
+    14820,
+    0
+   ],
+   "cached-2-a": [
+    20,
+    20,
+    0
+   ],
+   "cached-2-b": [
+    20,
+    20,
+    0
+   ],
+   "again-2": [
+    20,
+    20,
+    0
+   ],
+   "again_salted-2": [
+    20,
+    20,
+    0
+   ],
+   "again_salted-long": [
+    14820,
+    228,
+    14592
+   ]
+  },
+  "first_steps_on_candidate_54": [
+   {
+    "new": [
+     [
+      "reference-0",
+      0,
+      [
+       [
+        1
+       ],
+       [
+        2
+       ],
+       [
+        3
+       ],
+       [
+        4
+       ],
+       [
+        5
+       ],
+       [
+        6
+       ],
+       [
+        7
+       ],
+       [
+        8
+       ],
+       [
+        9
+       ],
+       [
+        10
+       ],
+       [
+        11
+       ],
+       [
+        12
+       ],
+       [
+        13
+       ],
+       [
+        14
+       ],
+       [
+        15
+       ],
+       [
+        16
+       ],
+       [
+        17
+       ],
+       [
+        18
+       ]
+      ],
+      18
+     ]
+    ],
+    "cached": [],
+    "tokens": [
+     [
+      "reference-0",
+      18
+     ]
+    ],
+    "drafts": [],
+    "common_prefix_blocks": [
+     0,
+     0,
+     0,
+     0,
+     0,
+     0,
+     0,
+     1,
+     0,
+     0,
+     0,
+     0,
+     0,
+     0,
+     0,
+     0,
+     0,
+     0
+    ],
+    "finished": [],
+    "preempted": [],
+    "encoder": []
+   },
+   {
+    "new": [
+     [
+      "reference-1",
+      0,
+      [
+       [
+        32
+       ],
+       [
+        18
+       ],
+       [
+        31
+       ],
+       [
+        17
+       ],
+       [
+        30
+       ],
+       [
+        16
+       ],
+       [
+        29
+       ],
+       [
+        15
+       ],
+       [
+        28
+       ],
+       [
+        14
+       ],
+       [
+        27
+       ],
+       [
+        13
+       ],
+       [
+        26
+       ],
+       [
+        12
+       ],
+       [
+        11
+       ],
+       [
+        10
+       ],
+       [
+        9
+       ],
+       [
+        8
+       ]
+      ],
+      19
+     ]
+    ],
+    "cached": [],
+    "tokens": [
+     [
+      "reference-1",
+      19
+     ]
+    ],
+    "drafts": [],
+    "common_prefix_blocks": [
+     0,
+     0,
+     0,
+     0,
+     0,
+     0,
+     0,
+     1,
+     0,
+     0,
+     0,
+     0,
+     0,
+     0,
+     0,
+     0,
+     0,
+     0
+    ],
+    "finished": [],
+    "preempted": [],
+    "encoder": []
+   },
+   {
+    "new": [
+     [
+      "reference-2",
+      0,
+      [
+       [
+        1
+       ],
+       [
+        8
+       ],
+       [
+        19
+       ],
+       [
+        9
+       ],
+       [
+        2
+       ],
+       [
+        10
+       ],
+       [
+        20
+       ],
+       [
+        11
+       ],
+       [
+        3
+       ],
+       [
+        12
+       ],
+       [
+        21
+       ],
+       [
+        26
+       ],
+       [
+        4
+       ],
+       [
+        13
+       ],
+       [
+        27
+       ],
+       [
+        14
+       ],
+       [
+        28
+       ],
+       [
+        15
+       ]
+      ],
+      20
+     ]
+    ],
+    "cached": [],
+    "tokens": [
+     [
+      "reference-2",
+      20
+     ]
+    ],
+    "drafts": [],
+    "common_prefix_blocks": [
+     0,
+     0,
+     0,
+     0,
+     0,
+     0,
+     0,
+     1,
+     0,
+     0,
+     0,
+     0,
+     0,
+     0,
+     0,
+     0,
+     0,
+     0
+    ],
+    "finished": [],
+    "preempted": [],
+    "encoder": []
+   }
+  ],
+  "positive_controls": {
+   "nohit": {
+    "trace_differs_from_candidate_54": true,
+    "outputs_differ": true,
+    "frontend_requests_equal": true,
+    "again_salted": {
+     "requests": 9,
+     "cached_tokens": 0
+    },
+    "steps": 3083
+   },
+   "late": {
+    "trace_differs_from_candidate_54": true,
+    "outputs_differ": false,
+    "frontend_requests_equal": true,
+    "again_salted": {
+     "requests": 9,
+     "cached_tokens": 14592
+    },
+    "steps": 3084
+   }
+  }
+ },
+ "gate_history": {
+  "what": "every recorded run of token_determinism_text.py's 'again' scenario on origin/main (files with per-request rows), with the requests that differed from their reference",
+  "origin_main": "3b7e1a18e9d4977ff2dbea73672910d10e00140c",
+  "runs": 43,
+  "runs_with_a_difference": 3,
+  "differing": [
+   {
+    "file": "experiments/2026-10-26-spark-ds41f-candidate/candidate-51/receipts/tp4-ring/determinism/candidate-51-tp4/greedy-candidate-51.jsonl",
+    "requests": [
+     {
+      "prompt": 7,
+      "first_token_diff": null,
+      "first_char_diff": 112,
+      "first_logprob_diff": null
+     }
+    ]
+   },
+   {
+    "file": "experiments/2026-10-26-spark-ds41f-candidate/candidate-55/receipts/tp4-ring-978r2/determinism/candidate-55-validate-978r2-tp4/determinism-candidate-55-978r2.jsonl",
+    "requests": [
+     {
+      "prompt": 2,
+      "first_token_diff": 189,
+      "first_char_diff": null,
+      "first_logprob_diff": 176
+     }
+    ]
+   },
+   {
+    "file": "experiments/2026-10-26-spark-ds41f-candidate/candidate-55/receipts/tp4-ring-978r2/determinism/candidate-55-validate-978r2-tp4/greedy-candidate-55-978r2.jsonl",
+    "requests": [
+     {
+      "prompt": 4,
+      "first_token_diff": null,
+      "first_char_diff": 641,
+      "first_logprob_diff": null
+     }
+    ]
+   }
+  ],
+  "file": "raw/gate-history.json"
+ },
+ "serving_path_cells": {
+  "what": "round 2's benches unchanged (scripts/serving_path_bench.py sha256 ea3a02fe..., = round 1's; serving_text_bench.py 1d06dad0...): a real AsyncLLM frontend from the served DS4.1 checkpoint with the recipe's flags, base64 images loaded by ImageMediaIO.load_base64, a fake engine core that msgpack-encodes each request; 3 conversations x 5 turns per workload; a boot's cell is its median over the conversations.",
+  "arms": "base = spark-ds41f:candidate-54 as built; r3 = the same image with candidate-55-r3's 27 changed files mounted (arms/r3)",
+  "order": "base r3 r3 base in one lock hold per session",
+  "rule": "faster (slower) beyond the interval: both r3 boots' medians below (above) both base boots'",
+  "round_2_for_comparison": "turn 2+ 4.2x-9.5x, turn 1 2%-15% faster, all 12 image cells faster beyond the interval (receipts/rework/pr-978-r2/raw/mark)",
+  "result": {
+   "mark": "met: all 12 image cells faster beyond the interval (turn 2+ 4.25x-9.59x; turn 1 ratios 0.846-0.972); stripped items on turn 2+; identity equal",
+   "text": "four boots per arm (ABBA twice, because a 2-boot run of the first round-3 tree had the short prompt's sub-millisecond median 'slower beyond the interval' at 0.371/0.650 against 0.368/0.153 ms, and its 4-boot repeat had it within): every cell within the interval; identity equal",
+   "prodenv": "supplementary, recipe environment (MALLOC_ARENA_MAX=2, MALLOC_MMAP_THRESHOLD_=1048576, OMP_NUM_THREADS=8, VLLM_MAX_IMAGE_PIXELS=16777216): 2-boot session - 11 cells faster, 1920x1080 PNG turn 1 slower beyond the interval (78.5/79.2 against 69.7/71.5 ms); 4-boot repeat - 11 faster, that cell within (80.2, 61.7, 60.6, 63.7 against 69.7, 69.3, 75.1, 71.5 ms). Round 2's own run of this bench had the same cell slower (80.9/79.7 against 72.0/70.2), traced there to the HF work landing on A725 cores; the first round-3 tree's run had it faster (59.9/61.4 against 68.9/73.6). The image path is round 2's in round 3."
+  },
+  "mark": {
+   "verdict_counts": {
+    "faster beyond the interval": 12
+   },
+   "mm_prefix_fastpath": {
+    "base": [
+     null,
+     null
+    ],
+    "cand": [
+     true,
+     true
+    ]
+   },
+   "cells": {
+    "1302x1302_jpeg_1img": {
+     "turn1": {
+      "base_ms": [
+       22.913,
+       23.239
+      ],
+      "r3_ms": [
+       22.028,
+       21.95
+      ],
+      "ratio": 0.953,
+      "verdict": "faster beyond the interval"
+     },
+     "turn2plus": {
+      "base_ms": [
+       19.666,
+       19.71
+      ],
+      "r3_ms": [
+       2.768,
+       2.39
+      ],
+      "speedup": 7.63,
+      "verdict": "faster beyond the interval"
+     },
+     "turn2plus_bytes": {
+      "base": 10185900,
+      "cand": 6434
+     },
+     "stripped_items": {
+      "base": [
+       0,
+       0
+      ],
+      "cand": [
+       12,
+       12
+      ]
+     },
+     "prompt_token_ids_and_mm_hashes_equal_base": true
+    },
+    "1302x1302_jpeg_4img": {
+     "turn1": {
+      "base_ms": [
+       78.205,
+       81.452
+      ],
+      "r3_ms": [
+       75.946,
+       75.281
+      ],
+      "ratio": 0.947,
+      "verdict": "faster beyond the interval"
+     },
+     "turn2plus": {
+      "base_ms": [
+       74.725,
+       72.257
+      ],
+      "r3_ms": [
+       8.434,
+       8.44
+      ],
+      "speedup": 8.71,
+      "verdict": "faster beyond the interval"
+     },
+     "turn2plus_bytes": {
+      "base": 40743119,
+      "cand": 25039
+     },
+     "stripped_items": {
+      "base": [
+       0,
+       0
+      ],
+      "cand": [
+       51,
+       51
+      ]
+     },
+     "prompt_token_ids_and_mm_hashes_equal_base": true
+    },
+    "1920x1080_png_1img": {
+     "turn1": {
+      "base_ms": [
+       60.899,
+       58.22
+      ],
+      "r3_ms": [
+       51.382,
+       51.598
+      ],
+      "ratio": 0.865,
+      "verdict": "faster beyond the interval"
+     },
+     "turn2plus": {
+      "base_ms": [
+       57.465,
+       57.533
+      ],
+      "r3_ms": [
+       11.336,
+       11.453
+      ],
+      "speedup": 5.05,
+      "verdict": "faster beyond the interval"
+     },
+     "turn2plus_bytes": {
+      "base": 9913882,
+      "cand": 6280
+     },
+     "stripped_items": {
+      "base": [
+       0,
+       0
+      ],
+      "cand": [
+       12,
+       12
+      ]
+     },
+     "prompt_token_ids_and_mm_hashes_equal_base": true
+    },
+    "3840x2160_png_1img": {
+     "turn1": {
+      "base_ms": [
+       179.692,
+       179.857
+      ],
+      "r3_ms": [
+       152.193,
+       152.073
+      ],
+      "ratio": 0.846,
+      "verdict": "faster beyond the interval"
+     },
+     "turn2plus": {
+      "base_ms": [
+       179.641,
+       180.258
+      ],
+      "r3_ms": [
+       42.358,
+       42.337
+      ],
+      "speedup": 4.25,
+      "verdict": "faster beyond the interval"
+     },
+     "turn2plus_bytes": {
+      "base": 9913882,
+      "cand": 6280
+     },
+     "stripped_items": {
+      "base": [
+       0,
+       0
+      ],
+      "cand": [
+       12,
+       12
+      ]
+     },
+     "prompt_token_ids_and_mm_hashes_equal_base": true
+    },
+    "3840x2160_png_4img": {
+     "turn1": {
+      "base_ms": [
+       715.544,
+       710.339
+      ],
+      "r3_ms": [
+       613.222,
+       619.838
+      ],
+      "ratio": 0.865,
+      "verdict": "faster beyond the interval"
+     },
+     "turn2plus": {
+      "base_ms": [
+       715.324,
+       720.015
+      ],
+      "r3_ms": [
+       166.081,
+       165.602
+      ],
+      "speedup": 4.33,
+      "verdict": "faster beyond the interval"
+     },
+     "turn2plus_bytes": {
+      "base": 39655039,
+      "cand": 24415
+     },
+     "stripped_items": {
+      "base": [
+       0,
+       0
+      ],
+      "cand": [
+       51,
+       51
+      ]
+     },
+     "prompt_token_ids_and_mm_hashes_equal_base": true
+    },
+    "4032x3024_jpeg_4img": {
+     "turn1": {
+      "base_ms": [
+       489.622,
+       503.711
+      ],
+      "r3_ms": [
+       480.33,
+       484.707
+      ],
+      "ratio": 0.972,
+      "verdict": "faster beyond the interval"
+     },
+     "turn2plus": {
+      "base_ms": [
+       495.577,
+       506.735
+      ],
+      "r3_ms": [
+       52.336,
+       52.177
+      ],
+      "speedup": 9.59,
+      "verdict": "faster beyond the interval"
+     },
+     "turn2plus_bytes": {
+      "base": 41209207,
+      "cand": 25207
+     },
+     "stripped_items": {
+      "base": [
+       0,
+       0
+      ],
+      "cand": [
+       48,
+       48
+      ]
+     },
+     "prompt_token_ids_and_mm_hashes_equal_base": true
+    }
+   },
+   "session": "raw/mark/session.log"
+  },
+  "prodenv": {
+   "verdict_counts": {
+    "faster beyond the interval": 11,
+    "slower beyond the interval": 1
+   },
+   "cells": {
+    "1302x1302_jpeg_1img": {
+     "turn1": {
+      "base_ms": [
+       33.32,
+       30.578
+      ],
+      "r3_ms": [
+       28.231,
+       29.562
+      ],
+      "ratio": 0.904,
+      "verdict": "faster beyond the interval"
+     },
+     "turn2plus": {
+      "base_ms": [
+       31.238,
+       28.798
+      ],
+      "r3_ms": [
+       3.345,
+       3.525
+      ],
+      "speedup": 8.74,
+      "verdict": "faster beyond the interval"
+     },
+     "turn2plus_bytes": {
+      "base": 10185900,
+      "cand": 6434
+     },
+     "stripped_items": {
+      "base": [
+       0,
+       0
+      ],
+      "cand": [
+       12,
+       12
+      ]
+     },
+     "prompt_token_ids_and_mm_hashes_equal_base": true
+    },
+    "1302x1302_jpeg_4img": {
+     "turn1": {
+      "base_ms": [
+       105.171,
+       115.767
+      ],
+      "r3_ms": [
+       95.115,
+       96.57
+      ],
+      "ratio": 0.868,
+      "verdict": "faster beyond the interval"
+     },
+     "turn2plus": {
+      "base_ms": [
+       105.412,
+       115.373
+      ],
+      "r3_ms": [
+       11.53,
+       11.284
+      ],
+      "speedup": 9.68,
+      "verdict": "faster beyond the interval"
+     },
+     "turn2plus_bytes": {
+      "base": 40743119,
+      "cand": 25039
+     },
+     "stripped_items": {
+      "base": [
+       0,
+       0
+      ],
+      "cand": [
+       51,
+       51
+      ]
+     },
+     "prompt_token_ids_and_mm_hashes_equal_base": true
+    },
+    "1920x1080_png_1img": {
+     "turn1": {
+      "base_ms": [
+       69.724,
+       71.484
+      ],
+      "r3_ms": [
+       78.486,
+       79.186
+      ],
+      "ratio": 1.117,
+      "verdict": "slower beyond the interval"
+     },
+     "turn2plus": {
+      "base_ms": [
+       68.658,
+       72.837
+      ],
+      "r3_ms": [
+       14.805,
+       14.782
+      ],
+      "speedup": 4.78,
+      "verdict": "faster beyond the interval"
+     },
+     "turn2plus_bytes": {
+      "base": 9913882,
+      "cand": 6280
+     },
+     "stripped_items": {
+      "base": [
+       0,
+       0
+      ],
+      "cand": [
+       12,
+       12
+      ]
+     },
+     "prompt_token_ids_and_mm_hashes_equal_base": true
+    },
+    "3840x2160_png_1img": {
+     "turn1": {
+      "base_ms": [
+       210.449,
+       214.266
+      ],
+      "r3_ms": [
+       179.369,
+       181.631
+      ],
+      "ratio": 0.85,
+      "verdict": "faster beyond the interval"
+     },
+     "turn2plus": {
+      "base_ms": [
+       211.161,
+       215.111
+      ],
+      "r3_ms": [
+       46.013,
+       46.255
+      ],
+      "speedup": 4.62,
+      "verdict": "faster beyond the interval"
+     },
+     "turn2plus_bytes": {
+      "base": 9913882,
+      "cand": 6280
+     },
+     "stripped_items": {
+      "base": [
+       0,
+       0
+      ],
+      "cand": [
+       12,
+       12
+      ]
+     },
+     "prompt_token_ids_and_mm_hashes_equal_base": true
+    },
+    "3840x2160_png_4img": {
+     "turn1": {
+      "base_ms": [
+       831.784,
+       851.221
+      ],
+      "r3_ms": [
+       686.256,
+       689.337
+      ],
+      "ratio": 0.817,
+      "verdict": "faster beyond the interval"
+     },
+     "turn2plus": {
+      "base_ms": [
+       837.099,
+       855.083
+      ],
+      "r3_ms": [
+       180.239,
+       180.063
+      ],
+      "speedup": 4.7,
+      "verdict": "faster beyond the interval"
+     },
+     "turn2plus_bytes": {
+      "base": 39655039,
+      "cand": 24415
+     },
+     "stripped_items": {
+      "base": [
+       0,
+       0
+      ],
+      "cand": [
+       51,
+       51
+      ]
+     },
+     "prompt_token_ids_and_mm_hashes_equal_base": true
+    },
+    "4032x3024_jpeg_4img": {
+     "turn1": {
+      "base_ms": [
+       647.623,
+       649.963
+      ],
+      "r3_ms": [
+       591.363,
+       589.484
+      ],
+      "ratio": 0.91,
+      "verdict": "faster beyond the interval"
+     },
+     "turn2plus": {
+      "base_ms": [
+       641.538,
+       649.484
+      ],
+      "r3_ms": [
+       56.406,
+       56.879
+      ],
+      "speedup": 11.4,
+      "verdict": "faster beyond the interval"
+     },
+     "turn2plus_bytes": {
+      "base": 41209207,
+      "cand": 25207
+     },
+     "stripped_items": {
+      "base": [
+       0,
+       0
+      ],
+      "cand": [
+       48,
+       48
+      ]
+     },
+     "prompt_token_ids_and_mm_hashes_equal_base": true
+    }
+   },
+   "session": "raw/prodenv/session.log"
+  },
+  "prodenv_repeat": {
+   "verdict_counts": {
+    "faster beyond the interval": 11,
+    "within the interval": 1
+   },
+   "cells": {
+    "1302x1302_jpeg_1img": {
+     "turn1": {
+      "base_ms": [
+       30.582,
+       30.031,
+       32.279,
+       35.231
+      ],
+      "r3_ms": [
+       29.001,
+       26.341,
+       28.088,
+       25.799
+      ],
+      "ratio": 0.853,
+      "verdict": "faster beyond the interval"
+     },
+     "turn2plus": {
+      "base_ms": [
+       28.122,
+       28.479,
+       29.778,
+       32.181
+      ],
+      "r3_ms": [
+       3.389,
+       2.718,
+       2.302,
+       2.506
+      ],
+      "speedup": 10.86,
+      "verdict": "faster beyond the interval"
+     },
+     "turn2plus_bytes": {
+      "base": 10185900,
+      "cand": 6434
+     },
+     "stripped_items": {
+      "base": [
+       0,
+       0,
+       0,
+       0
+      ],
+      "cand": [
+       12,
+       12,
+       12,
+       12
+      ]
+     },
+     "prompt_token_ids_and_mm_hashes_equal_base": true
+    },
+    "1302x1302_jpeg_4img": {
+     "turn1": {
+      "base_ms": [
+       107.045,
+       105.655,
+       117.611,
+       106.923
+      ],
+      "r3_ms": [
+       98.659,
+       85.323,
+       84.645,
+       85.377
+      ],
+      "ratio": 0.81,
+      "verdict": "faster beyond the interval"
+     },
+     "turn2plus": {
+      "base_ms": [
+       107.168,
+       107.046,
+       117.639,
+       106.27
+      ],
+      "r3_ms": [
+       11.299,
+       8.463,
+       8.52,
+       8.623
+      ],
+      "speedup": 11.87,
+      "verdict": "faster beyond the interval"
+     },
+     "turn2plus_bytes": {
+      "base": 40743119,
+      "cand": 25039
+     },
+     "stripped_items": {
+      "base": [
+       0,
+       0,
+       0,
+       0
+      ],
+      "cand": [
+       51,
+       51,
+       51,
+       51
+      ]
+     },
+     "prompt_token_ids_and_mm_hashes_equal_base": true
+    },
+    "1920x1080_png_1img": {
+     "turn1": {
+      "base_ms": [
+       69.73,
+       69.279,
+       75.056,
+       71.496
+      ],
+      "r3_ms": [
+       80.249,
+       61.684,
+       60.616,
+       63.745
+      ],
+      "ratio": 0.933,
+      "verdict": "within the interval"
+     },
+     "turn2plus": {
+      "base_ms": [
+       68.893,
+       68.744,
+       73.829,
+       70.194
+      ],
+      "r3_ms": [
+       15.029,
+       11.657,
+       11.482,
+       12.02
+      ],
+      "speedup": 5.61,
+      "verdict": "faster beyond the interval"
+     },
+     "turn2plus_bytes": {
+      "base": 9913882,
+      "cand": 6280
+     },
+     "stripped_items": {
+      "base": [
+       0,
+       0,
+       0,
+       0
+      ],
+      "cand": [
+       12,
+       12,
+       12,
+       12
+      ]
+     },
+     "prompt_token_ids_and_mm_hashes_equal_base": true
+    },
+    "3840x2160_png_1img": {
+     "turn1": {
+      "base_ms": [
+       211.374,
+       210.617,
+       214.047,
+       210.264
+      ],
+      "r3_ms": [
+       181.257,
+       180.06,
+       179.663,
+       179.74
+      ],
+      "ratio": 0.852,
+      "verdict": "faster beyond the interval"
+     },
+     "turn2plus": {
+      "base_ms": [
+       212.035,
+       211.483,
+       217.309,
+       211.259
+      ],
+      "r3_ms": [
+       45.952,
+       45.806,
+       46.095,
+       46.217
+      ],
+      "speedup": 4.63,
+      "verdict": "faster beyond the interval"
+     },
+     "turn2plus_bytes": {
+      "base": 9913882,
+      "cand": 6280
+     },
+     "stripped_items": {
+      "base": [
+       0,
+       0,
+       0,
+       0
+      ],
+      "cand": [
+       12,
+       12,
+       12,
+       12
+      ]
+     },
+     "prompt_token_ids_and_mm_hashes_equal_base": true
+    },
+    "3840x2160_png_4img": {
+     "turn1": {
+      "base_ms": [
+       842.577,
+       830.721,
+       841.706,
+       831.765
+      ],
+      "r3_ms": [
+       694.413,
+       685.037,
+       689.397,
+       693.834
+      ],
+      "ratio": 0.825,
+      "verdict": "faster beyond the interval"
+     },
+     "turn2plus": {
+      "base_ms": [
+       843.99,
+       839.399,
+       851.746,
+       840.03
+      ],
+      "r3_ms": [
+       179.583,
+       179.68,
+       180.374,
+       180.845
+      ],
+      "speedup": 4.68,
+      "verdict": "faster beyond the interval"
+     },
+     "turn2plus_bytes": {
+      "base": 39655039,
+      "cand": 24415
+     },
+     "stripped_items": {
+      "base": [
+       0,
+       0,
+       0,
+       0
+      ],
+      "cand": [
+       51,
+       51,
+       51,
+       51
+      ]
+     },
+     "prompt_token_ids_and_mm_hashes_equal_base": true
+    },
+    "4032x3024_jpeg_4img": {
+     "turn1": {
+      "base_ms": [
+       639.066,
+       638.035,
+       639.633,
+       649.826
+      ],
+      "r3_ms": [
+       598.432,
+       589.259,
+       585.139,
+       606.259
+      ],
+      "ratio": 0.927,
+      "verdict": "faster beyond the interval"
+     },
+     "turn2plus": {
+      "base_ms": [
+       641.698,
+       636.272,
+       644.96,
+       654.533
+      ],
+      "r3_ms": [
+       56.31,
+       56.194,
+       56.876,
+       56.116
+      ],
+      "speedup": 11.43,
+      "verdict": "faster beyond the interval"
+     },
+     "turn2plus_bytes": {
+      "base": 41209207,
+      "cand": 25207
+     },
+     "stripped_items": {
+      "base": [
+       0,
+       0,
+       0,
+       0
+      ],
+      "cand": [
+       48,
+       48,
+       48,
+       48
+      ]
+     },
+     "prompt_token_ids_and_mm_hashes_equal_base": true
+    }
+   },
+   "session": "raw/prodenv2/session.log"
+  },
+  "text": {
+   "verdict_counts": {
+    "within the interval": 6
+   },
+   "cells": {
+    "short_prompt": {
+     "submit_median_ms": {
+      "base_ms": [
+       0.1527,
+       0.148,
+       0.3693,
+       0.8426
+      ],
+      "r3_ms": [
+       0.1937,
+       0.1663,
+       0.1691,
+       0.1531
+      ],
+      "ratio": 0.451,
+      "verdict": "within the interval"
+     },
+     "roundtrip_median_ms": {
+      "base_ms": [
+       0.1636,
+       0.1589,
+       0.3796,
+       0.8807
+      ],
+      "r3_ms": [
+       0.2114,
+       0.18,
+       0.1826,
+       0.164
+      ],
+      "ratio": 0.466,
+      "verdict": "within the interval"
+     },
+     "prompt_token_ids_equal_base": true
+    },
+    "long_prompt": {
+     "submit_median_ms": {
+      "base_ms": [
+       4.6791,
+       4.5227,
+       4.4691,
+       5.3239
+      ],
+      "r3_ms": [
+       4.5486,
+       5.169,
+       4.7643,
+       4.5829
+      ],
+      "ratio": 1.004,
+      "verdict": "within the interval"
+     },
+     "roundtrip_median_ms": {
+      "base_ms": [
+       4.7537,
+       4.5677,
+       4.4993,
+       5.4108
+      ],
+      "r3_ms": [
+       4.5935,
+       5.2285,
+       4.8201,
+       4.6288
+      ],
+      "ratio": 1.002,
+      "verdict": "within the interval"
+     },
+     "prompt_token_ids_equal_base": true
+    },
+    "short_prompt_n4": {
+     "submit_median_ms": {
+      "base_ms": [
+       0.6314,
+       0.6965,
+       0.6589,
+       1.0204
+      ],
+      "r3_ms": [
+       0.5937,
+       0.6037,
+       0.7402,
+       0.1784
+      ],
+      "ratio": 0.704,
+      "verdict": "within the interval"
+     },
+     "roundtrip_median_ms": {
+      "base_ms": [
+       0.6877,
+       0.7627,
+       0.723,
+       1.1148
+      ],
+      "r3_ms": [
+       0.6522,
+       0.6775,
+       0.8121,
+       0.1998
+      ],
+      "ratio": 0.712,
+      "verdict": "within the interval"
+     },
+     "prompt_token_ids_equal_base": true
+    }
+   },
+   "session": "raw/text/session.log"
+  },
+  "first_round_3_tree (r3-pre: the handler read req.mm_features directly; image paths the same)": {
+   "mark": {
+    "verdict_counts": {
+     "faster beyond the interval": 12
+    },
+    "cells": {
+     "1302x1302_jpeg_1img": {
+      "turn1": {
+       "base_ms": [
+        22.549,
+        23.087
+       ],
+       "r3_ms": [
+        21.42,
+        21.381
+       ],
+       "ratio": 0.938,
+       "verdict": "faster beyond the interval"
+      },
+      "turn2plus": {
+       "base_ms": [
+        20.227,
+        20.856
+       ],
+       "r3_ms": [
+        2.796,
+        2.763
+       ],
+       "speedup": 7.39,
+       "verdict": "faster beyond the interval"
+      },
+      "turn2plus_bytes": {
+       "base": 10185900,
+       "cand": 6434
+      },
+      "stripped_items": {
+       "base": [
+        0,
+        0
+       ],
+       "cand": [
+        12,
+        12
+       ]
+      },
+      "prompt_token_ids_and_mm_hashes_equal_base": true
+     },
+     "1302x1302_jpeg_4img": {
+      "turn1": {
+       "base_ms": [
+        80.172,
+        79.844
+       ],
+       "r3_ms": [
+        73.454,
+        73.185
+       ],
+       "ratio": 0.916,
+       "verdict": "faster beyond the interval"
+      },
+      "turn2plus": {
+       "base_ms": [
+        72.842,
+        72.862
+       ],
+       "r3_ms": [
+        8.497,
+        8.404
+       ],
+       "speedup": 8.62,
+       "verdict": "faster beyond the interval"
+      },
+      "turn2plus_bytes": {
+       "base": 40743119,
+       "cand": 25039
+      },
+      "stripped_items": {
+       "base": [
+        0,
+        0
+       ],
+       "cand": [
+        51,
+        51
+       ]
+      },
+      "prompt_token_ids_and_mm_hashes_equal_base": true
+     },
+     "1920x1080_png_1img": {
+      "turn1": {
+       "base_ms": [
+        57.951,
+        58.206
+       ],
+       "r3_ms": [
+        51.015,
+        51.29
+       ],
+       "ratio": 0.881,
+       "verdict": "faster beyond the interval"
+      },
+      "turn2plus": {
+       "base_ms": [
+        57.417,
+        57.33
+       ],
+       "r3_ms": [
+        11.318,
+        11.367
+       ],
+       "speedup": 5.06,
+       "verdict": "faster beyond the interval"
+      },
+      "turn2plus_bytes": {
+       "base": 9913882,
+       "cand": 6280
+      },
+      "stripped_items": {
+       "base": [
+        0,
+        0
+       ],
+       "cand": [
+        12,
+        12
+       ]
+      },
+      "prompt_token_ids_and_mm_hashes_equal_base": true
+     },
+     "3840x2160_png_1img": {
+      "turn1": {
+       "base_ms": [
+        179.211,
+        179.466
+       ],
+       "r3_ms": [
+        151.713,
+        151.429
+       ],
+       "ratio": 0.845,
+       "verdict": "faster beyond the interval"
+      },
+      "turn2plus": {
+       "base_ms": [
+        179.296,
+        179.814
+       ],
+       "r3_ms": [
+        42.344,
+        42.255
+       ],
+       "speedup": 4.24,
+       "verdict": "faster beyond the interval"
+      },
+      "turn2plus_bytes": {
+       "base": 9913882,
+       "cand": 6280
+      },
+      "stripped_items": {
+       "base": [
+        0,
+        0
+       ],
+       "cand": [
+        12,
+        12
+       ]
+      },
+      "prompt_token_ids_and_mm_hashes_equal_base": true
+     },
+     "3840x2160_png_4img": {
+      "turn1": {
+       "base_ms": [
+        707.029,
+        709.169
+       ],
+       "r3_ms": [
+        610.538,
+        614.082
+       ],
+       "ratio": 0.865,
+       "verdict": "faster beyond the interval"
+      },
+      "turn2plus": {
+       "base_ms": [
+        715.057,
+        712.772
+       ],
+       "r3_ms": [
+        165.479,
+        165.606
+       ],
+       "speedup": 4.31,
+       "verdict": "faster beyond the interval"
+      },
+      "turn2plus_bytes": {
+       "base": 39655039,
+       "cand": 24415
+      },
+      "stripped_items": {
+       "base": [
+        0,
+        0
+       ],
+       "cand": [
+        51,
+        51
+       ]
+      },
+      "prompt_token_ids_and_mm_hashes_equal_base": true
+     },
+     "4032x3024_jpeg_4img": {
+      "turn1": {
+       "base_ms": [
+        497.983,
+        490.021
+       ],
+       "r3_ms": [
+        481.067,
+        479.124
+       ],
+       "ratio": 0.972,
+       "verdict": "faster beyond the interval"
+      },
+      "turn2plus": {
+       "base_ms": [
+        497.822,
+        500.118
+       ],
+       "r3_ms": [
+        52.065,
+        52.179
+       ],
+       "speedup": 9.57,
+       "verdict": "faster beyond the interval"
+      },
+      "turn2plus_bytes": {
+       "base": 41209207,
+       "cand": 25207
+      },
+      "stripped_items": {
+       "base": [
+        0,
+        0
+       ],
+       "cand": [
+        48,
+        48
+       ]
+      },
+      "prompt_token_ids_and_mm_hashes_equal_base": true
+     }
+    }
+   },
+   "prodenv": {
+    "verdict_counts": {
+     "faster beyond the interval": 12
+    },
+    "cells": {
+     "1302x1302_jpeg_1img": {
+      "turn1": {
+       "base_ms": [
+        33.026,
+        32.91
+       ],
+       "r3_ms": [
+        28.549,
+        27.376
+       ],
+       "ratio": 0.848,
+       "verdict": "faster beyond the interval"
+      },
+      "turn2plus": {
+       "base_ms": [
+        31.679,
+        29.444
+       ],
+       "r3_ms": [
+        3.268,
+        2.422
+       ],
+       "speedup": 10.74,
+       "verdict": "faster beyond the interval"
+      },
+      "turn2plus_bytes": {
+       "base": 10185900,
+       "cand": 6434
+      },
+      "stripped_items": {
+       "base": [
+        0,
+        0
+       ],
+       "cand": [
+        12,
+        12
+       ]
+      },
+      "prompt_token_ids_and_mm_hashes_equal_base": true
+     },
+     "1302x1302_jpeg_4img": {
+      "turn1": {
+       "base_ms": [
+        103.445,
+        115.151
+       ],
+       "r3_ms": [
+        93.763,
+        84.734
+       ],
+       "ratio": 0.817,
+       "verdict": "faster beyond the interval"
+      },
+      "turn2plus": {
+       "base_ms": [
+        104.544,
+        112.18
+       ],
+       "r3_ms": [
+        11.138,
+        9.257
+       ],
+       "speedup": 10.63,
+       "verdict": "faster beyond the interval"
+      },
+      "turn2plus_bytes": {
+       "base": 40743119,
+       "cand": 25039
+      },
+      "stripped_items": {
+       "base": [
+        0,
+        0
+       ],
+       "cand": [
+        51,
+        51
+       ]
+      },
+      "prompt_token_ids_and_mm_hashes_equal_base": true
+     },
+     "1920x1080_png_1img": {
+      "turn1": {
+       "base_ms": [
+        68.871,
+        73.594
+       ],
+       "r3_ms": [
+        59.857,
+        61.424
+       ],
+       "ratio": 0.851,
+       "verdict": "faster beyond the interval"
+      },
+      "turn2plus": {
+       "base_ms": [
+        67.374,
+        73.348
+       ],
+       "r3_ms": [
+        11.34,
+        11.264
+       ],
+       "speedup": 6.23,
+       "verdict": "faster beyond the interval"
+      },
+      "turn2plus_bytes": {
+       "base": 9913882,
+       "cand": 6280
+      },
+      "stripped_items": {
+       "base": [
+        0,
+        0
+       ],
+       "cand": [
+        12,
+        12
+       ]
+      },
+      "prompt_token_ids_and_mm_hashes_equal_base": true
+     },
+     "3840x2160_png_1img": {
+      "turn1": {
+       "base_ms": [
+        207.877,
+        213.855
+       ],
+       "r3_ms": [
+        176.904,
+        178.669
+       ],
+       "ratio": 0.843,
+       "verdict": "faster beyond the interval"
+      },
+      "turn2plus": {
+       "base_ms": [
+        209.786,
+        213.936
+       ],
+       "r3_ms": [
+        45.6,
+        45.929
+       ],
+       "speedup": 4.63,
+       "verdict": "faster beyond the interval"
+      },
+      "turn2plus_bytes": {
+       "base": 9913882,
+       "cand": 6280
+      },
+      "stripped_items": {
+       "base": [
+        0,
+        0
+       ],
+       "cand": [
+        12,
+        12
+       ]
+      },
+      "prompt_token_ids_and_mm_hashes_equal_base": true
+     },
+     "3840x2160_png_4img": {
+      "turn1": {
+       "base_ms": [
+        827.106,
+        831.331
+       ],
+       "r3_ms": [
+        684.668,
+        685.354
+       ],
+       "ratio": 0.826,
+       "verdict": "faster beyond the interval"
+      },
+      "turn2plus": {
+       "base_ms": [
+        827.647,
+        832.908
+       ],
+       "r3_ms": [
+        178.981,
+        179.813
+       ],
+       "speedup": 4.63,
+       "verdict": "faster beyond the interval"
+      },
+      "turn2plus_bytes": {
+       "base": 39655039,
+       "cand": 24415
+      },
+      "stripped_items": {
+       "base": [
+        0,
+        0
+       ],
+       "cand": [
+        51,
+        51
+       ]
+      },
+      "prompt_token_ids_and_mm_hashes_equal_base": true
+     },
+     "4032x3024_jpeg_4img": {
+      "turn1": {
+       "base_ms": [
+        639.606,
+        642.397
+       ],
+       "r3_ms": [
+        586.856,
+        585.771
+       ],
+       "ratio": 0.915,
+       "verdict": "faster beyond the interval"
+      },
+      "turn2plus": {
+       "base_ms": [
+        639.155,
+        646.946
+       ],
+       "r3_ms": [
+        56.411,
+        56.339
+       ],
+       "speedup": 11.41,
+       "verdict": "faster beyond the interval"
+      },
+      "turn2plus_bytes": {
+       "base": 41209207,
+       "cand": 25207
+      },
+      "stripped_items": {
+       "base": [
+        0,
+        0
+       ],
+       "cand": [
+        48,
+        48
+       ]
+      },
+      "prompt_token_ids_and_mm_hashes_equal_base": true
+     }
+    }
+   },
+   "text": {
+    "verdict_counts": {
+     "faster beyond the interval": 2,
+     "slower beyond the interval": 2,
+     "within the interval": 2
+    },
+    "cells": {
+     "short_prompt": {
+      "submit_median_ms": {
+       "base_ms": [
+        0.3683,
+        0.1527
+       ],
+       "r3_ms": [
+        0.371,
+        0.6499
+       ],
+       "ratio": 1.96,
+       "verdict": "slower beyond the interval"
+      },
+      "roundtrip_median_ms": {
+       "base_ms": [
+        0.3937,
+        0.1637
+       ],
+       "r3_ms": [
+        0.4196,
+        0.6903
+       ],
+       "ratio": 1.991,
+       "verdict": "slower beyond the interval"
+      },
+      "prompt_token_ids_equal_base": true
+     },
+     "long_prompt": {
+      "submit_median_ms": {
+       "base_ms": [
+        4.5173,
+        4.5588
+       ],
+       "r3_ms": [
+        4.4752,
+        4.6127
+       ],
+       "ratio": 1.001,
+       "verdict": "within the interval"
+      },
+      "roundtrip_median_ms": {
+       "base_ms": [
+        4.5649,
+        4.6058
+       ],
+       "r3_ms": [
+        4.5113,
+        4.6647
+       ],
+       "ratio": 1.001,
+       "verdict": "within the interval"
+      },
+      "prompt_token_ids_equal_base": true
+     },
+     "short_prompt_n4": {
+      "submit_median_ms": {
+       "base_ms": [
+        0.6749,
+        0.6596
+       ],
+       "r3_ms": [
+        0.5138,
+        0.2427
+       ],
+       "ratio": 0.567,
+       "verdict": "faster beyond the interval"
+      },
+      "roundtrip_median_ms": {
+       "base_ms": [
+        0.7394,
+        0.7235
+       ],
+       "r3_ms": [
+        0.5492,
+        0.2688
+       ],
+       "ratio": 0.559,
+       "verdict": "faster beyond the interval"
+      },
+      "prompt_token_ids_equal_base": true
+     }
+    }
+   },
+   "text_repeat_4_boots": {
+    "verdict_counts": {
+     "within the interval": 6
+    },
+    "cells": {
+     "short_prompt": {
+      "submit_median_ms": {
+       "base_ms": [
+        0.4524,
+        0.1801,
+        0.5615,
+        0.5445
+       ],
+       "r3_ms": [
+        0.5653,
+        0.3296,
+        0.3915,
+        0.4234
+       ],
+       "ratio": 0.983,
+       "verdict": "within the interval"
+      },
+      "roundtrip_median_ms": {
+       "base_ms": [
+        0.5101,
+        0.195,
+        0.6099,
+        0.5786
+       ],
+       "r3_ms": [
+        0.6112,
+        0.373,
+        0.4378,
+        0.4629
+       ],
+       "ratio": 0.995,
+       "verdict": "within the interval"
+      },
+      "prompt_token_ids_equal_base": true
+     },
+     "long_prompt": {
+      "submit_median_ms": {
+       "base_ms": [
+        4.6765,
+        4.9657,
+        5.2367,
+        4.7998
+       ],
+       "r3_ms": [
+        4.5837,
+        5.0962,
+        5.2142,
+        5.1975
+       ],
+       "ratio": 1.021,
+       "verdict": "within the interval"
+      },
+      "roundtrip_median_ms": {
+       "base_ms": [
+        4.7331,
+        5.0288,
+        5.3035,
+        4.8763
+       ],
+       "r3_ms": [
+        4.6275,
+        5.1561,
+        5.2725,
+        5.2606
+       ],
+       "ratio": 1.019,
+       "verdict": "within the interval"
+      },
+      "prompt_token_ids_equal_base": true
+     },
+     "short_prompt_n4": {
+      "submit_median_ms": {
+       "base_ms": [
+        0.4198,
+        0.6855,
+        0.6841,
+        0.7311
+       ],
+       "r3_ms": [
+        0.651,
+        0.6628,
+        0.4654,
+        0.4338
+       ],
+       "ratio": 0.878,
+       "verdict": "within the interval"
+      },
+      "roundtrip_median_ms": {
+       "base_ms": [
+        0.4872,
+        0.7515,
+        0.747,
+        0.8264
+       ],
+       "r3_ms": [
+        0.7173,
+        0.7255,
+        0.5005,
+        0.4627
+       ],
+       "ratio": 0.856,
+       "verdict": "within the interval"
+      },
+      "prompt_token_ids_equal_base": true
+     }
+    }
+   },
+   "files": "raw/superseded/r3pre-*"
+  }
+ },
+ "tests": {
+  "harness": "scripts/run_tests.sh (round 2's, workdir changed): spark-ds41f:candidate-54, --gpus all, an arm's files mounted, the release bundle's plugins (tblib_stub, offline_skip, deepseek_models), HF_HUB_OFFLINE=1; scripts/final_tests.sh, one lock hold per group.",
+  "new_test": {
+   "file": "tests/v1/core/test_text_request_scheduling.py",
+   "tests": {
+    "test_text_request_enters_the_engine_as_before": "a text request added through EngineCoreProc._handle_client_request is in the scheduler with no prefix lookup before the scheduler's own (KVCacheManager.get_computed_blocks first called by schedule()), and an error raised while adding a request without items surfaces unchanged (no multimodal-miss handling around it).",
+    "test_stripped_item_miss_at_add_is_still_a_retryable_response": "the other side: a request whose item came without data that the engine no longer holds gets the retryable miss, and with its data it is added (round 2's behaviour kept).",
+    "test_text_scheduling_on_prefix_cache_reruns_is_candidate_54s": "a text workload through the engine's handler and the real AsyncScheduler with prefix caching, chunked prefill and a stand-in runner (sink-rejection contract): a 100-token prompt, its re-run with the same salt, with a fresh salt, three short prompts with a re-run arriving among them, a 300-token prompt prefilled in 64-token chunks, its re-run, a 340-token prompt extending it, three more short prompts. Pins each request's computed tokens and blocks at admission (prefix hits 96, 96, 288, 288; 0 elsewhere) and the sha256 of all 73 steps (scheduled tokens, computed tokens, block counts, finishes), both recorded on candidate-54.",
+    "test_requests_without_multimodal_attributes_take_the_earlier_paths": "request stand-ins without mm_features (as test_stall_diagnostics.py and test_admission_control.py build them) go through EngineCoreProc._handle_client_request and AsyncLLM._add_request (fast path on) to candidate-54's add and send."
+   },
+   "results": {
+    "candidate-54 (plus the test file; -k 'not stripped_item_miss', a round-2 feature)": "3 passed",
+    "round 2 (plus the test file)": "2 failed, 2 passed: test_text_request_enters_the_engine_as_before (DID NOT RAISE: round 2's handler turns the error into a multimodal miss for a request without items) and test_requests_without_multimodal_attributes_take_the_earlier_paths (AttributeError: request.mm_features read on a stand-in); the scheduling pin and the stripped-item test pass",
+    "round 3": "4 passed"
+   },
+   "what_failing_on_round_2_means": "The two tests that fail on round 2's tree fail on structural differences: the handler's wrapper around every request, and reading mm_features on every request. Neither is reached by a real text request (add_request raises MultiModalCacheMissError only from the stripped-item check, which needs items; a real EngineCoreRequest always has mm_features). The scheduling pin cannot fail on round 2's tree, because round 2's text scheduling is candidate-54's: the replay shows it on the gate's own requests. So no test failing on round 2 identifies a cause of the gate's difference, and none can; the test that pins scheduling passes on both rounds."
+  },
+  "hidden_async_test": {
+   "what": "tests/v1/engine/test_admission_control.py::test_concurrent_single_request_admission_respects_limit is async; the release environment has no async plugin, so it is collected and fails with 'async def functions are not natively supported' on every arm (one of the 17 shared failures). A dev-only wrapper (scripts/test_zz_hidden_async.py, not part of the patch) runs it with asyncio.run.",
+   "results": {
+    "candidate-54": "1 passed",
+    "round 2": "1 failed (assert 0 == 1: _add_request raised AttributeError on the stand-in's missing mm_features, swallowed by gather(return_exceptions=True))",
+    "round 3": "1 passed"
+   }
+  },
+  "counts": {
+   "new-c54": {
+    "summary": "3 passed, 1 deselected, 15 warnings in 13.93s",
+    "failed": [],
+    "errors": [],
+    "exit": "0"
+   },
+   "new-r2": {
+    "summary": "2 failed, 2 passed, 14 warnings in 14.24s",
+    "failed": [
+     "tests/v1/core/test_text_request_scheduling.py::test_requests_without_multimodal_attributes_take_the_earlier_paths",
+     "tests/v1/core/test_text_request_scheduling.py::test_text_request_enters_the_engine_as_before"
+    ],
+    "errors": [],
+    "exit": "1"
+   },
+   "new-r3": {
+    "summary": "4 passed, 15 warnings in 14.14s",
+    "failed": [],
+    "errors": [],
+    "exit": "0"
+   },
+   "async-c54": {
+    "summary": "1 passed, 15 warnings in 0.23s",
+    "failed": [],
+    "errors": [],
+    "exit": "0"
+   },
+   "async-r2": {
+    "summary": "1 failed, 15 warnings in 0.24s",
+    "failed": [
+     "tests/v1/engine/test_zz_hidden_async.py::test_concurrent_single_request_admission_respects_limit_run"
+    ],
+    "errors": [],
+    "exit": "1"
+   },
+   "async-r3": {
+    "summary": "1 passed, 15 warnings in 0.21s",
+    "failed": [],
+    "errors": [],
+    "exit": "0"
+   },
+   "gate-r3": {
+    "summary": "68 passed, 14 warnings in 10.24s",
+    "failed": [],
+    "errors": [],
+    "exit": "0"
+   },
+   "pr978-r3-boot1": {
+    "summary": "60 passed, 7 deselected, 15 warnings in 29.08s",
+    "failed": [],
+    "errors": [],
+    "exit": "0"
+   },
+   "pr978-r3-boot2": {
+    "summary": "60 passed, 7 deselected, 15 warnings in 27.94s",
+    "failed": [],
+    "errors": [],
+    "exit": "0"
+   },
+   "dirs-r3": {
+    "summary": "17 failed, 261 passed, 43 skipped, 28 warnings, 6 errors in 127.28s (0:02:07)",
+    "failed": [
+     "tests/entrypoints/serve/utils/test_sse_keep_alive.py::test_aclose_closes_upstream",
+     "tests/entrypoints/serve/utils/test_sse_keep_alive.py::test_client_disconnect_cancels_upstream",
+     "tests/entrypoints/serve/utils/test_sse_keep_alive.py::test_empty_generator_returns_immediately",
+     "tests/entrypoints/serve/utils/test_sse_keep_alive.py::test_exception_propagates",
+     "tests/entrypoints/serve/utils/test_sse_keep_alive.py::test_keep_alive_between_chunks_does_not_drop_data",
+     "tests/entrypoints/serve/utils/test_sse_keep_alive.py::test_keep_alive_during_silent_start",
+     "tests/entrypoints/serve/utils/test_sse_keep_alive.py::test_no_keep_alive_when_streaming_is_fast",
+     "tests/entrypoints/serve/utils/test_sse_keep_alive.py::test_streaming_response_disconnect_closes_upstream",
+     "tests/entrypoints/serve/utils/test_sse_keep_alive.py::test_streaming_response_emits_comment",
+     "tests/entrypoints/serve/utils/test_sse_keep_alive.py::test_upstream_cancelled_error_propagates",
+     "tests/v1/engine/test_abort_final_step.py::test_abort_during_final_step[False]",
+     "tests/v1/engine/test_abort_final_step.py::test_abort_during_final_step[True]",
+     "tests/v1/engine/test_admission_control.py::test_concurrent_single_request_admission_respects_limit",
+     "tests/v1/engine/test_llm_engine.py::test_engine_metrics",
+     "tests/v1/engine/test_output_processor.py::test_cumulative_output_collector_n",
+     "tests/v1/engine/test_output_processor.py::test_request_output_collector",
+     "tests/v1/engine/test_preprocess_error_handling.py::test_preprocess_error_handling"
+    ],
+    "errors": [
+     "tests/v1/engine/test_async_llm.py",
+     "tests/v1/engine/test_core_engine_actor_manager.py",
+     "tests/v1/engine/test_engine_core.py",
+     "tests/v1/engine/test_engine_core_client.py",
+     "tests/v1/engine/test_llm_engine.py::test_parallel_sampling[False]",
+     "tests/v1/engine/test_llm_engine.py::test_parallel_sampling[True]"
+    ],
+    "exit": "1"
+   },
+   "extra-c54": {
+    "summary": "2 failed, 474 passed, 234 skipped, 15 warnings, 1 error in 185.19s (0:03:05)",
+    "failed": [
+     "tests/v1/core/test_scheduler.py::test_schedule_concurrent_partial_requests[False]",
+     "tests/v1/core/test_scheduler.py::test_schedule_concurrent_partial_requests[True]"
+    ],
+    "errors": [
+     "tests/renderers/test_multimodal_hashes.py"
+    ],
+    "exit": "1"
+   },
+   "extra-r3": {
+    "summary": "2 failed, 474 passed, 234 skipped, 15 warnings, 1 error in 192.73s (0:03:12)",
+    "failed": [
+     "tests/v1/core/test_scheduler.py::test_schedule_concurrent_partial_requests[False]",
+     "tests/v1/core/test_scheduler.py::test_schedule_concurrent_partial_requests[True]"
+    ],
+    "errors": [
+     "tests/renderers/test_multimodal_hashes.py"
+    ],
+    "exit": "1"
+   }
+  }
+ },
+ "patch": {
+  "author": "Christopher Owen <christopherowen@users.noreply.github.com>",
+  "date": "Sun, 8 Nov 2026 14:53:04 +0000 (the PR patch's)",
+  "committer": "Christopher Owen <3221756+christopherowen@users.noreply.github.com>, Sun Nov 8 14:53:04 2026 +0000 (the stack's)",
+  "message": "round 2's message with a 'Round 3 (candidate-55)' section after round 2's, a Round 3 line under Quality and a Round 3 item under Tests",
+  "replaces": "candidate-55's 0793 (3feb241e), round 1's (c628316b) and round 2's (0335680a)",
+  "applies_as_0793": "git am --committer-date-is-author-date with the stack's committer on a fresh worktree of candidate-54's head 4e8133ff: 0792 -> 7e36cafc (tree 07d61ecc), 0793-r3 -> 91a75498 (tree 73016dad, git diff --check clean), 0794 -> 9cf28274 (tree a4be980f). Pair checks: 0792 and 0793-r3 give one tree in either order (they share only core.py, in disjoint hunks: 0792 at 1538, 0793-r3 at 479, 519, 1765, 2083); 0793-r3 and 0794 likewise. 0793-r3 alone on candidate-54 applies (tree 8140c1f3). candidate-55 (410463b3) with overlay/ copied over it writes the series head's tree a4be980f.",
+  "interdiff": "raw/interdiff-0793-r2-to-0793-r3.diff",
+  "commit": "91a754985c8571695dc22f6faf81e74511a031a8",
+  "tree": "73016dadd096b383a7e7e0c2efbe8146421b5ff7",
+  "files_vs_round_2": "vllm/v1/engine/core.py, vllm/v1/engine/async_llm.py, tests/v1/core/test_text_request_scheduling.py (new); the message gains the Round 3 section, a Round 3 Quality line and a Round 3 Tests item",
+  "file": "0793-perf-multimodal-prefix-cache-fastpath-under-mm-proce.patch",
+  "sha256": "635589b37dbe3539e8342292b0921b4c2cb9c497d8a66b356eb7beb88becb0f9",
+  "apply_check": "raw/apply-check.txt",
+  "apply_check_lines": [
+   "patch sha256 635589b37dbe3539e8342292b0921b4c2cb9c497d8a66b356eb7beb88becb0f9",
+   "base 4e8133ff10a125b90753c2727f162e29fe37f30c tree 5f021d9a7f01c03e2389dd3d8021759cfa19ea34",
+   "== series order 0792, 0793-r3, 0794",
+   "0792 commit 7e36cafc16cf07163d8ba5db2aaa65b7ed90ea65 tree 07d61ecc499a74c51eaa7b8628473c211caee14c",
+   "0793-r3 commit 91a754985c8571695dc22f6faf81e74511a031a8 tree 73016dadd096b383a7e7e0c2efbe8146421b5ff7",
+   "0793-r3 diff --check clean",
+   "0793-r3 author Christopher Owen <christopherowen@users.noreply.github.com>, date Sun Nov 8 14:53:04 2026 +0000",
+   "0793-r3 committer Christopher Owen <3221756+christopherowen@users.noreply.github.com>, date Sun Nov 8 14:53:04 2026 +0000",
+   "0794 commit 9cf28274a3359844870a8699fc197ab3eba92c96 tree a4be980f42dade194c71d24880f2d82cbefb839b",
+   "== candidate-55 as locked (0792, 0793, 0794) and with round 2's 0793",
+   "c55 head 410463b3c58362448e6d440503b677e72e87153a tree e39b835cbb6c4e5d148c260af1f1b5b0cefb322e",
+   "c55-r2 head 92dd7081538f5132bdabd488f76339da282b67aa tree cc4ac4853e71544fc81632d8f260ed341485d945",
+   "== 0793-r3 alone on candidate-54",
+   "tree 8140c1f36544174951bfe54984ef89fd359bf360",
+   "== pair 0792 / 0793-r3, both orders",
+   "0793-r3 then 0792: tree 73016dadd096b383a7e7e0c2efbe8146421b5ff7",
+   "0792 then 0793-r3: tree 73016dadd096b383a7e7e0c2efbe8146421b5ff7",
+   "0792/0793-r3: same tree in both orders",
+   "== pair 0793-r3 / 0794, both orders",
+   "trees 1d031808082565e49fff0d8a90cc40462f3bbd36 1d031808082565e49fff0d8a90cc40462f3bbd36",
+   "0793-r3/0794: same tree in both orders",
+   "== series head 9cf28274a3359844870a8699fc197ab3eba92c96 tree a4be980f42dade194c71d24880f2d82cbefb839b",
+   "== files 0792 and 0793-r3 share",
+   "vllm/v1/engine/core.py",
+   "== core.py hunks of 0792 and of 0793-r3 (on 0792)",
+   "  0792 @@ -1538,0 +1539,3 @@ class EngineCoreProc(EngineCore):",
+   "  0793-r3 @@ -479,0 +480,66 @@ class EngineCore:",
+   "  0793-r3 @@ -519,0 +586,3 @@ class EngineCore:",
+   "  0793-r3 @@ -1765 +1834,12 @@ class EngineCoreProc(EngineCore):",
+   "  0793-r3 @@ -2083 +2163 @@ class EngineCoreProc(EngineCore):",
+   "== files the series head changes against candidate-55 (the overlay)",
+   "tests/multimodal/test_prefix_cache_fastpath.py",
+   "tests/v1/core/test_stripped_mm_scheduling.py",
+   "tests/v1/core/test_text_request_scheduling.py",
+   "tests/v1/engine/test_request_submission_cleanup.py",
+   "vllm/multimodal/hasher.py",
+   "vllm/multimodal/media/image.py",
+   "vllm/multimodal/processing/context.py",
+   "vllm/multimodal/processing/processor.py",
+   "vllm/multimodal/registry.py",
+   "vllm/renderers/base.py",
+   "vllm/v1/core/sched/scheduler.py",
+   "vllm/v1/engine/async_llm.py",
+   "vllm/v1/engine/core.py",
+   "== overlay over candidate-55 gives the series tree",
+   "candidate-55 + overlay: tree a4be980f42dade194c71d24880f2d82cbefb839b",
+   "equals the series head's tree",
+   "64cfc4ff2d8543c618f1de621e91a8c352b068d6fa853543a6cecadcc82b545c  ./tests/multimodal/test_prefix_cache_fastpath.py",
+   "bde0162f5f8eef919e9ef9e97c20c06a6ffbb343b9f9352982572fe9b3e0229a  ./tests/v1/core/test_stripped_mm_scheduling.py",
+   "6cd527f3ff1bc0b560695a1223920337612f8960ea92d2269eb6c4ef3b2faffe  ./tests/v1/core/test_text_request_scheduling.py",
+   "cfec76e7bf455805395a13df5b56a9a1764b4f0b26be69454c63ed77ad21861a  ./tests/v1/engine/test_request_submission_cleanup.py",
+   "29b456ff3be793cd10585323e5dbb660a521d820fadb1898fd620ca21139965e  ./vllm/multimodal/hasher.py",
+   "7ec51428617513c30088ab3f3d51b7c54ec4da36f89d2bc68936cce08efd3164  ./vllm/multimodal/media/image.py",
+   "7cee31025bc25323bc2344225e6809391a4ebd36df637f14f1b14eb31d8c21b6  ./vllm/multimodal/processing/context.py",
+   "7c3d7daaa12fe33bb19ce5a8dde2cf607fb7c09d5970df7c8428729c37c85572  ./vllm/multimodal/processing/processor.py",
+   "d9a243edd0cc7d5eeb390d748381507ba154cb44b0d0fd78d514df632cf9ec9e  ./vllm/multimodal/registry.py",
+   "0507db6d1a0ae31c9588a7ef391c79f34bd75e5ac08581b80ca08464ab9d6128  ./vllm/renderers/base.py",
+   "7b363ee317d536b9d990359c3729628cf8addf512e6d97766462beb292705cd7  ./vllm/v1/core/sched/scheduler.py",
+   "9f71d73272ce80b4dab78421c9dc92cbb24897ee1a69d0498689566e6998966f  ./vllm/v1/engine/async_llm.py",
+   "488dd153bd73e14b43238affb34d1631d0520c3c98e3422ee55fde96c8fd06d5  ./vllm/v1/engine/core.py"
+  ]
+ },
+ "overlay": {
+  "mount_root": "/opt/spark-ds41f/candidate/vllm (overlay/<path> -> /opt/spark-ds41f/candidate/vllm/<path>)",
+  "files": {
+   "tests/multimodal/test_prefix_cache_fastpath.py": "64cfc4ff2d8543c618f1de621e91a8c352b068d6fa853543a6cecadcc82b545c",
+   "tests/v1/core/test_stripped_mm_scheduling.py": "bde0162f5f8eef919e9ef9e97c20c06a6ffbb343b9f9352982572fe9b3e0229a",
+   "tests/v1/core/test_text_request_scheduling.py": "6cd527f3ff1bc0b560695a1223920337612f8960ea92d2269eb6c4ef3b2faffe",
+   "tests/v1/engine/test_request_submission_cleanup.py": "cfec76e7bf455805395a13df5b56a9a1764b4f0b26be69454c63ed77ad21861a",
+   "vllm/multimodal/hasher.py": "29b456ff3be793cd10585323e5dbb660a521d820fadb1898fd620ca21139965e",
+   "vllm/multimodal/media/image.py": "7ec51428617513c30088ab3f3d51b7c54ec4da36f89d2bc68936cce08efd3164",
+   "vllm/multimodal/processing/context.py": "7cee31025bc25323bc2344225e6809391a4ebd36df637f14f1b14eb31d8c21b6",
+   "vllm/multimodal/processing/processor.py": "7c3d7daaa12fe33bb19ce5a8dde2cf607fb7c09d5970df7c8428729c37c85572",
+   "vllm/multimodal/registry.py": "d9a243edd0cc7d5eeb390d748381507ba154cb44b0d0fd78d514df632cf9ec9e",
+   "vllm/renderers/base.py": "0507db6d1a0ae31c9588a7ef391c79f34bd75e5ac08581b80ca08464ab9d6128",
+   "vllm/v1/core/sched/scheduler.py": "7b363ee317d536b9d990359c3729628cf8addf512e6d97766462beb292705cd7",
+   "vllm/v1/engine/async_llm.py": "9f71d73272ce80b4dab78421c9dc92cbb24897ee1a69d0498689566e6998966f",
+   "vllm/v1/engine/core.py": "488dd153bd73e14b43238affb34d1631d0520c3c98e3422ee55fde96c8fd06d5"
+  },
+  "mounted_by_the_profile": "the 9 non-test files, from experiments/2026-10-26-spark-ds41f-candidate/candidate-55/978r3/overlay/"
+ },
+ "check_978_image_chat": {
+  "run": false,
+  "why": "needs a live DS4.1 server at TP4; testbed use is out of scope here",
+  "testbed": "experiments/2026-10-26-spark-ds41f-candidate/candidate-55/validate-978r3-tp4.json: as validate-978r2-tp4.json (sync; the gate - token_determinism_text.py with and without logprobs, --wide, 700 lines - and the c16/c8/c4 distinct streams; then check_978_image_chat.py on candidate-54 and on 978r3 against it), with one change: the gate job boots tp4-978r3.json twice (candidate-55-978r3 and candidate-55-978r3-again), the repeat boot that the methodology asks for, so that a recurrence of a one-request 'again' difference can be told from a one-off. Drop the second arm to keep round 2's spec exactly."
+ },
+ "testbed_files": {
+  "profile": "experiments/2026-10-26-spark-ds41f-candidate/candidate-55/tp4-978r3.json (as tp4-978r2.json; mounts the 9 non-test files from candidate-55/978r3/overlay over the candidate-55 image; its notes cite no tree hash)",
+  "spec": "experiments/2026-10-26-spark-ds41f-candidate/candidate-55/validate-978r3-tp4.json",
+  "overlay_in_repo": "experiments/2026-10-26-spark-ds41f-candidate/candidate-55/978r3/overlay/vllm/... (the 9 files the profile mounts); overlay/ at the top of this delivery holds all 13 files the series head changes against candidate-55, tests included"
+ },
+ "host": {
+  "node": "sp8 (spark-0016)",
+  "image": "spark-ds41f:candidate-54 sha256:e1de71bed3b41dff3a969c19adc09072c0ab1c947f34afe7117cb8b6389e23ea",
+  "workdir": "~/spark-lab/agents/candidate-55-rework-978-r3 (round 2's ~/spark-lab/agents/candidate-55-rework-978-r2 reused for its clone, arms/r2f, bundle and benches)",
+  "gpu_lock": "/tmp/spark-lab-gpu.lock after checking ~/spark-hold.json (absent throughout), except the first KV-spec probe (notes)"
+ },
+ "not_verified": [
+  "The gate on a TP4 boot with this 0793 (one GB10 cannot load the model): the owner's testbed run decides it.",
+  "The exact mechanism of the one-request 'again' differences (round 2's two, candidate-51's one): below the scheduler, timing- or placement-dependent; leads above.",
+  "check_978_image_chat.py against a live server.",
+  "The overlay mounted over spark-ds41f:candidate-55 (not on sp8; verified at git level: candidate-55 plus overlay/ writes the series head's tree)."
+ ],
+ "notes": [
+  "No pushes, commits to the repository, PRs, image builds, cluster, window or testbed operations. The only commits are in the sp8 work dir's disposable vLLM clone (worktree commitwt, branch r3c), for git format-patch.",
+  "A slip, recorded: the first ds41_kv_specs.py probe ran with --gpus all without taking the GPU lock (the hold file had been checked). Engram allocated its 91.6 GiB table on the device despite the meta-device build and the run ended at once with OOM (raw/dev/ds41-kv-specs-oom.txt). Every later GPU run took the lock.",
+  "CPU-only development runs (prompt lengths) ran outside the lock.",
+  "Unfavourable and development runs are kept in raw/dev/ (the replay's stand-in fixes, the new test's first versions)."
+ ]
+}

@@ -1,0 +1,13 @@
+# The first ds41_kv_specs.py probe, 2026-11-10 ~11:12Z, on sp8, run WITHOUT the GPU lock (a slip:
+# ~/spark-hold.json had been checked absent, the lock was not taken). docker run --rm --gpus all
+# spark-ds41f:candidate-54 /opt/exp/ds41_kv_specs.py, engram table_memory at its default (device).
+# It failed within seconds; the console's last lines (the output was not written to a file):
+[rank0]:   File "/opt/spark-ds41f/candidate/vllm/vllm/models/deepseek_v4_1/nvidia/model.py", line 97, in __init__
+[rank0]:     self.engram = Engram(
+[rank0]:   File "/opt/spark-ds41f/candidate/vllm/vllm/models/deepseek_v4_1/common/engram.py", line 930, in __init__
+[rank0]:     self.embed_tokens = ParallelEngramEmbedding(
+[rank0]:   File "/opt/spark-ds41f/candidate/vllm/vllm/models/deepseek_v4_1/common/engram.py", line 604, in __init__
+[rank0]:     torch.empty(
+[rank0]: torch.OutOfMemoryError: CUDA out of memory. Tried to allocate 91.56 GiB. GPU 0 has a total capacity of 121.69 GiB of which 21.22 GiB is free. Including non-PyTorch memory, this process has 94.89 GiB memory in use. Of the allocated memory 94.61 GiB is allocated by PyTorch, and 20.87 MiB is reserved by PyTorch but unallocated.
+# Engram's table is allocated on the device even under torch.device("meta"). Every later probe used
+# table_memory "disk" (the recipe's own setting for tp4-ring) and ran under the lock (ds41-kv-specs.txt).
