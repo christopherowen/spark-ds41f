@@ -1,0 +1,170 @@
+# label=pr978-c55-newtests image=spark-ds41f:candidate-54 (sha256:e1de71bed3b41dff3a969c19adc09072c0ab1c947f34afe7117cb8b6389e23ea) arm=/home/chris/spark-lab/agents/candidate-55-rework-978/arm-c55-newtests gpu=--gpus all
+# mounted: 24 files; sha256 of each:
+#   8f5968cd77fb9192b0fc1a2d27a2d1760c61fd513ecc1447caa02d4120186141  ./tests/multimodal/test_prefix_cache_fastpath.py
+#   3e582236d3e83b6760b643aab35bf51238d5fffa721242d4b4df949754d19fd9  ./tests/v1/engine/test_request_submission_cleanup.py
+#   9153b93e62b4724041c4b44dc8a417e521ae83ad1a1b52d9b5bd16bf1a9ba975  ./tests/v1/worker/test_dead_rows.py
+#   f4caee411cfcd534a7e788fe1a6bbd3bec2233c473ec3a9aa5dd6ad2707a50e7  ./tests/v1/worker/test_roce_cpu_affinity.py
+#   28c26a60e860e7ac2ba181986fb70a94b76cb5ad89f0b57a06351f2e62929c9e  ./vllm/entrypoints/cli/serve.py
+#   b3c312259b478f0519764eee88bc60f78c353554a9867432e4f1b8fb2b123119  ./vllm/entrypoints/launchers/api_server/entry.py
+#   f0755c58209f1941bdbad7771e5b3debbc75dc3612229889d9142e5adf5edd25  ./vllm/multimodal/hasher.py
+#   84692be153dd1c086ea1b1f60e105752b53a1768eb332f4bc7130364b1c0e89b  ./vllm/multimodal/inputs.py
+#   13a3d54c6ce268482bc94bbdb5a564f4977fd4a7a5ce842826b60014faace284  ./vllm/multimodal/media/image.py
+#   6d506bf53b83f248ae3dea5523cbcab27e3fc0b9a3c32ceed2cf720e3b14cd73  ./vllm/multimodal/processing/processor.py
+#   2974e0a72bc65733db461883660ab92ee179f5ee713e9e873d469238e5b54404  ./vllm/renderers/base.py
+#   b179933c7ebc7e3975ce365ec0f0da87f7afe18e455e65f73e68e22ac4789444  ./vllm/utils/cpu_affinity.py
+#   e248d713b76c28dabc829285219f9b940523d456390d90283c238bf0e294a717  ./vllm/v1/core/sched/scheduler.py
+#   ebc51608e1c5862c3fb49710fb4961965fc57d52d83e7b0a035557474eee4bdf  ./vllm/v1/engine/async_llm.py
+#   bcf8d8fa7ef2eea5aaddd4d534161ebe2d6b10e9ce6d49aea291423349ffba19  ./vllm/v1/engine/core.py
+#   3f22a100e312abc0a6c8e8b6b31790393591ca0032b064908571b50d265743b9  ./vllm/v1/worker/gpu/sample/sampler.py
+#   55e69117cfbeb3849f2f453d15c74e87fb70c6783e1188e5a443b75b9b68f300  ./vllm/v1/worker/gpu/sample/tilelang_auxiliary.py
+#   5e983a0501b18d9a1a3aa0685cf2526d3ac45f6167c4b7235cc9692b5574ceb0  ./vllm/v1/worker/gpu/sample/tilelang_bias.py
+#   e6a08abc744059a3eaa992608394481714d3e605d5a827fbace91153d5c50795  ./vllm/v1/worker/gpu/sample/tilelang_controls.py
+#   656b801012eb4d95ce238696658bdc0c586652758288b739cd0841e4d31bce46  ./vllm/v1/worker/gpu/sample/tilelang_sampling.py
+#   fed581af45edbf4f7cad44d8849a078a0f25bff123c1ebcbbc98ffefe986d2a2  ./vllm/v1/worker/gpu/sample/tilelang_thinking.py
+#   e1e3764733a2c52df85a63930eaaeecc79dae59292d659a0f1f9201d59ed81fe  ./vllm/v1/worker/gpu/spec_decode/rejection_sampler.py
+#   981212a2284d192901f453c76967bb845413e290ceaaabdf4855e9da8d5147ee  ./vllm/v1/worker/gpu/tilelang_inputs.py
+#   53dcb35aca21fee6a6f2b585d98349ac1b945ee024853e6ffa1068639c479e59  ./vllm/v1/worker/gpu_worker.py
+# started 2026-11-10T06:06:49Z
+...F.........................................                            [100%]
+=================================== FAILURES ===================================
+______________ test_async_llm_and_engine_core_strip_and_self_heal ______________
+
+    def test_async_llm_and_engine_core_strip_and_self_heal():
+        from vllm.multimodal.cache import MultiModalCacheMissError
+        from vllm.multimodal.inputs import MultiModalFeatureSpec
+    
+        materialized_calls = 0
+    
+        def _make_lazy_feature():
+            def _mat():
+                nonlocal materialized_calls
+                materialized_calls += 1
+                return {
+                    "image_patches": MultiModalFieldConfig.shared("image", 1).build_elems(
+                        "image_patches", torch.ones((2, 16), dtype=torch.bfloat16)
+                    )[0]
+                }
+    
+            item = MultiModalKwargsItem(
+                lazy_materializer=_mat,
+                lazy_mm_hash="mm-hash-1",
+                keep_on_cpu_elems={},
+            )
+            return MultiModalFeatureSpec(
+                data=item,
+                modality="image",
+                identifier="mm-hash-1",
+                mm_position=PlaceholderRange(offset=4, length=10),
+                mm_hash="mm-hash-1",
+            )
+    
+        class _DummyAsyncLLM:
+            def __init__(self):
+                self._p1_cached_mm_identifiers = set()
+                self._pending_mm_retries = {}
+                self.model_config = SimpleNamespace(uses_mrope=False)
+                self.renderer = SimpleNamespace(_mm_executor=None)
+    
+            _prepare_mm_features_for_prefix_cache = (
+                AsyncLLM._prepare_mm_features_for_prefix_cache
+            )
+    
+        dummy_llm = _DummyAsyncLLM()
+    
+        # Turn 1: not yet in _p1_cached_mm_identifiers -> materializes before send
+        req1 = SimpleNamespace(
+            request_id="req-1",
+            mm_features=[_make_lazy_feature()],
+        )
+        asyncio.run(dummy_llm._prepare_mm_features_for_prefix_cache(req1))
+        assert materialized_calls == 1
+        assert req1.mm_features[0].data is not None
+        assert not req1.mm_features[0].data.is_lazy
+        assert "mm-hash-1" in dummy_llm._p1_cached_mm_identifiers
+        assert "req-1" not in dummy_llm._pending_mm_retries
+    
+        # Turn 2: identifier is in _p1_cached_mm_identifiers -> strips data to None!
+        req2 = SimpleNamespace(
+            request_id="req-2",
+            mm_features=[_make_lazy_feature()],
+        )
+        asyncio.run(dummy_llm._prepare_mm_features_for_prefix_cache(req2))
+        assert materialized_calls == 1  # Still 1: zero HF processor work on Turn 2!
+        assert req2.mm_features[0].data is None
+        assert "req-2" in dummy_llm._pending_mm_retries
+    
+        # Verify EngineCore._verify_or_resolve_stripped_mm_features behavior.
+        # Its lookup stub returns what KVCacheManager.get_computed_blocks does.
+        from typing import get_args
+    
+        from vllm.v1.core.kv_cache_manager import KVCacheManager
+    
+        lookup = KVCacheManager.get_computed_blocks.__annotations__["return"]
+        assert get_args(lookup)[1] is int and len(get_args(lookup)) == 3
+    
+        # 1) Hit in encoder_cache_manager -> accepted and pinned
+        pinned = []
+        dummy_core = SimpleNamespace(
+            vllm_config=SimpleNamespace(
+                cache_config=SimpleNamespace(enable_prefix_caching=True)
+            ),
+            scheduler=SimpleNamespace(
+                kv_cache_manager=SimpleNamespace(
+                    # KVCacheManager.get_computed_blocks: (blocks, computed tokens,
+                    # shared-prefix boundary)
+                    get_computed_blocks=lambda r: (None, 0, 0)
+                ),
+                encoder_cache_manager=SimpleNamespace(
+                    cached={"mm-hash-1": set()},
+                    check_and_update_cache=lambda r, idx: pinned.append((r.request_id, idx)),
+                ),
+                requests={},
+                ced_Prompt_replay_tokens=128,
+            ),
+            _has_stripped_mm_data=EngineCore._has_stripped_mm_data,
+        )
+        req2_core = SimpleNamespace(
+            request_id="req-2",
+            skip_reading_prefix_cache=False,
+            num_prompt_tokens=200,
+            mm_features=req2.mm_features,
+        )
+>       EngineCore._verify_or_resolve_stripped_mm_features(dummy_core, req2_core)
+
+tests/multimodal/test_prefix_cache_fastpath.py:256: 
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
+
+self = namespace(vllm_config=namespace(cache_config=namespace(enable_prefix_caching=True)), scheduler=namespace(kv_cache_mana...{}, ced_Prompt_replay_tokens=128), _has_stripped_mm_data=<function EngineCore._has_stripped_mm_data at 0xfb4dcb312840>)
+request = namespace(request_id='req-2', skip_reading_prefix_cache=False, num_prompt_tokens=200, mm_features=[MultiModalFeatureSp...mage', identifier='mm-hash-1', mm_position=PlaceholderRange(offset=4, length=10, is_embed=None), mm_hash='mm-hash-1')])
+
+    def _verify_or_resolve_stripped_mm_features(self, request: Request) -> None:
+        stripped_indices = [
+            i
+            for i, f in enumerate(request.mm_features)
+            if self._has_stripped_mm_data(f)
+        ]
+        if not stripped_indices:
+            return
+    
+        effective_computed_tokens = 0
+        if (
+            self.vllm_config.cache_config.enable_prefix_caching
+            and not request.skip_reading_prefix_cache
+        ):
+>           _, num_computed_tokens = self.scheduler.kv_cache_manager.get_computed_blocks(
+            ^^^^^^^^^^^^^^^^^^^^^^
+                request
+            )
+E           ValueError: too many values to unpack (expected 2)
+
+vllm/v1/engine/core.py:502: ValueError
+=============================== warnings summary ===============================
+../../../../usr/local/lib/python3.12/dist-packages/torch/jit/_script.py:365: 14 warnings
+  /usr/local/lib/python3.12/dist-packages/torch/jit/_script.py:365: DeprecationWarning: `torch.jit.script_method` is deprecated. Please switch to `torch.compile` or `torch.export`.
+    warnings.warn(
+
+-- Docs: https://docs.pytest.org/en/stable/how-to/capture-warnings.html
+=========================== short test summary info ============================
+FAILED tests/multimodal/test_prefix_cache_fastpath.py::test_async_llm_and_engine_core_strip_and_self_heal
+1 failed, 44 passed, 7 deselected, 14 warnings in 15.81s
+# exit 1, finished 2026-11-10T06:07:12Z

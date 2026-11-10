@@ -1,0 +1,196 @@
+# label=dev-r1-cleanup image=spark-ds41f:candidate-54 (sha256:e1de71bed3b41dff3a969c19adc09072c0ab1c947f34afe7117cb8b6389e23ea) arm=/home/chris/spark-lab/agents/candidate-55-rework-978/arm-r1dev gpu=none
+# mounted: 24 files; sha256 of each:
+#   9bca90ca8aa2a1c939b25eff42e087bff096b25ded510bb0622aa8cd114923da  ./tests/multimodal/test_prefix_cache_fastpath.py
+#   d1978e0ca77643591ff4c1811bfd72802d09399be0f24c5d578a7201a4a5b167  ./tests/v1/engine/test_request_submission_cleanup.py
+#   9153b93e62b4724041c4b44dc8a417e521ae83ad1a1b52d9b5bd16bf1a9ba975  ./tests/v1/worker/test_dead_rows.py
+#   f4caee411cfcd534a7e788fe1a6bbd3bec2233c473ec3a9aa5dd6ad2707a50e7  ./tests/v1/worker/test_roce_cpu_affinity.py
+#   28c26a60e860e7ac2ba181986fb70a94b76cb5ad89f0b57a06351f2e62929c9e  ./vllm/entrypoints/cli/serve.py
+#   b3c312259b478f0519764eee88bc60f78c353554a9867432e4f1b8fb2b123119  ./vllm/entrypoints/launchers/api_server/entry.py
+#   f0755c58209f1941bdbad7771e5b3debbc75dc3612229889d9142e5adf5edd25  ./vllm/multimodal/hasher.py
+#   84692be153dd1c086ea1b1f60e105752b53a1768eb332f4bc7130364b1c0e89b  ./vllm/multimodal/inputs.py
+#   13a3d54c6ce268482bc94bbdb5a564f4977fd4a7a5ce842826b60014faace284  ./vllm/multimodal/media/image.py
+#   6d506bf53b83f248ae3dea5523cbcab27e3fc0b9a3c32ceed2cf720e3b14cd73  ./vllm/multimodal/processing/processor.py
+#   2974e0a72bc65733db461883660ab92ee179f5ee713e9e873d469238e5b54404  ./vllm/renderers/base.py
+#   b179933c7ebc7e3975ce365ec0f0da87f7afe18e455e65f73e68e22ac4789444  ./vllm/utils/cpu_affinity.py
+#   e248d713b76c28dabc829285219f9b940523d456390d90283c238bf0e294a717  ./vllm/v1/core/sched/scheduler.py
+#   bb908314a8547c26f818b11dc96d355ad0694761c88becda2474842d03c290fe  ./vllm/v1/engine/async_llm.py
+#   bcf8d8fa7ef2eea5aaddd4d534161ebe2d6b10e9ce6d49aea291423349ffba19  ./vllm/v1/engine/core.py
+#   3f22a100e312abc0a6c8e8b6b31790393591ca0032b064908571b50d265743b9  ./vllm/v1/worker/gpu/sample/sampler.py
+#   55e69117cfbeb3849f2f453d15c74e87fb70c6783e1188e5a443b75b9b68f300  ./vllm/v1/worker/gpu/sample/tilelang_auxiliary.py
+#   5e983a0501b18d9a1a3aa0685cf2526d3ac45f6167c4b7235cc9692b5574ceb0  ./vllm/v1/worker/gpu/sample/tilelang_bias.py
+#   e6a08abc744059a3eaa992608394481714d3e605d5a827fbace91153d5c50795  ./vllm/v1/worker/gpu/sample/tilelang_controls.py
+#   656b801012eb4d95ce238696658bdc0c586652758288b739cd0841e4d31bce46  ./vllm/v1/worker/gpu/sample/tilelang_sampling.py
+#   fed581af45edbf4f7cad44d8849a078a0f25bff123c1ebcbbc98ffefe986d2a2  ./vllm/v1/worker/gpu/sample/tilelang_thinking.py
+#   e1e3764733a2c52df85a63930eaaeecc79dae59292d659a0f1f9201d59ed81fe  ./vllm/v1/worker/gpu/spec_decode/rejection_sampler.py
+#   981212a2284d192901f453c76967bb845413e290ceaaabdf4855e9da8d5147ee  ./vllm/v1/worker/gpu/tilelang_inputs.py
+#   53dcb35aca21fee6a6f2b585d98349ac1b945ee024853e6ffa1068639c479e59  ./vllm/v1/worker/gpu_worker.py
+# started 2026-11-10T04:23:37Z
+...................F.........................................            [100%]
+=================================== FAILURES ===================================
+___________ test_abort_during_mm_retry_materialize_does_not_resubmit ___________
+
+    def test_abort_during_mm_retry_materialize_does_not_resubmit():
+        async def run(executor):
+            llm = make_mm_llm(executor)
+            llm._p1_cached_mm_identifiers.add("image-1")
+            materializer = Materializer(released=False)
+            request = make_mm_request(materializer)
+            queue = await llm.add_request(
+                request.request_id, request, request.sampling_params
+            )
+            request_id = queue.request_id
+            assert request.mm_features[0].data is None
+            assert request_id in llm._pending_mm_retries
+    
+            # Run the real output handler on the stub's engine outputs.
+            outputs = asyncio.Queue()
+            polls = 0
+    
+            async def get_output_async():
+                nonlocal polls
+                polls += 1
+                return await outputs.get()
+    
+            llm.engine_core.get_output_async = get_output_async
+            llm.log_stats = False
+            llm.logger_manager = None
+            llm.renderer.mm_processor_cache = None
+            llm.renderer.stat_mm_cache = lambda: None
+            AsyncLLM._run_output_handler(llm)
+            try:
+                # P1 has evicted the image from both caches: a retryable miss.
+                outputs.put_nowait(
+                    EngineCoreOutputs(
+                        outputs=[
+                            EngineCoreOutput(
+                                request_id=request_id,
+                                new_token_ids=[],
+                                finish_reason=FinishReason.ERROR,
+                                mm_cache_miss_hashes=["image-1"],
+                            )
+                        ],
+                        finished_requests={request_id},
+                    )
+                )
+                try:
+                    assert await asyncio.to_thread(materializer.started.wait, 2)
+                    # The client disconnects while the retry materializes the image.
+                    await llm.abort(request_id, internal=True)
+                finally:
+                    materializer.release.set()
+                await drain(executor)
+                # The handler has finished the batch once it asks for the next one.
+                await until(lambda: polls == 2)
+                assert llm.engine_core.submitted == [request_id]
+                assert "image-1" not in llm._p1_cached_mm_identifiers
+                assert not llm._pending_mm_retries
+                assert_empty(llm)
+                assert not llm.output_handler.done()
+            finally:
+                llm.output_handler.cancel()
+                with pytest.raises(asyncio.CancelledError):
+                    await llm.output_handler
+    
+>       run_with_mm_executor(run)
+
+tests/v1/engine/test_request_submission_cleanup.py:476: 
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
+tests/v1/engine/test_request_submission_cleanup.py:279: in run_with_mm_executor
+    asyncio.run(run(executor))
+/usr/lib/python3.12/asyncio/runners.py:194: in run
+    return runner.run(main)
+           ^^^^^^^^^^^^^^^^
+/usr/lib/python3.12/asyncio/runners.py:118: in run
+    return self._loop.run_until_complete(task)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+/usr/lib/python3.12/asyncio/base_events.py:687: in run_until_complete
+    return future.result()
+           ^^^^^^^^^^^^^^^
+tests/v1/engine/test_request_submission_cleanup.py:441: in run
+    AsyncLLM._run_output_handler(llm)
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
+
+self = <vllm.v1.engine.async_llm.AsyncLLM object at 0xec02ac102fc0>
+
+    def _run_output_handler(self):
+        """Background loop: pulls from EngineCore and pushes to AsyncStreams."""
+    
+        if self.output_handler is not None:
+            return
+    
+        # Ensure that the task doesn't have a circular ref back to the AsyncLLM
+        # object, or else it won't be garbage collected and cleaned up properly.
+        engine_core = self.engine_core
+        output_processor = self.output_processor
+        log_stats = self.log_stats
+        # We use a mutable list for logger_manager so that it can be updated
+        # during elastic EP scaling (see scale_elastic_ep) without creating
+        # a circular reference via self.
+        self._logger_ref = [self.logger_manager]
+        logger_ref = self._logger_ref
+        renderer = self.renderer
+        # P0 multi-modal sender ("shadow") cache; None for text-only models.
+        mm_processor_cache = renderer.mm_processor_cache
+        pending_mm_retries = self._pending_mm_retries
+        p1_cached_mm_identifiers = self._p1_cached_mm_identifiers
+        chunk_size = envs.VLLM_V1_OUTPUT_PROC_CHUNK_SIZE
+    
+        async def _retry_mm_cache_miss(
+            retry_req: EngineCoreRequest,
+>           materializers: dict[str, Callable[[], Any]],
+                                     ^^^^^^^^
+            missed_hashes: list[str],
+        ) -> None:
+E       NameError: name 'Callable' is not defined
+
+vllm/v1/engine/async_llm.py:920: NameError
+=============================== warnings summary ===============================
+../../../../usr/local/lib/python3.12/dist-packages/torch/jit/_script.py:365: 14 warnings
+  /usr/local/lib/python3.12/dist-packages/torch/jit/_script.py:365: DeprecationWarning: `torch.jit.script_method` is deprecated. Please switch to `torch.compile` or `torch.export`.
+    warnings.warn(
+
+tests/v1/engine/test_request_submission_cleanup.py::test_text_only_requests_skip_the_multimodal_fast_path[False]
+tests/v1/engine/test_request_submission_cleanup.py::test_text_only_requests_skip_the_multimodal_fast_path[True]
+  /usr/local/lib/python3.12/dist-packages/_pytest/unraisableexception.py:67: PytestUnraisableExceptionWarning: Exception ignored in: <function AsyncLLM.__del__ at 0xec02a7311260>
+  
+  Traceback (most recent call last):
+    File "/opt/spark-ds41f/candidate/vllm/vllm/v1/engine/async_llm.py", line 295, in __del__
+      self.shutdown()
+    File "/opt/spark-ds41f/candidate/vllm/vllm/v1/engine/async_llm.py", line 302, in shutdown
+      renderer.shutdown()
+      ^^^^^^^^^^^^^^^^^
+    File "/opt/spark-ds41f/candidate/vllm/tests/v1/engine/test_request_submission_cleanup.py", line 297, in __getattr__
+      raise AssertionError(f"a text-only request read renderer.{name}")
+  AssertionError: a text-only request read renderer.shutdown
+  
+  Enable tracemalloc to get traceback where the object was allocated.
+  See https://docs.pytest.org/en/stable/how-to/capture-warnings.html#resource-warnings for more info.
+    warnings.warn(pytest.PytestUnraisableExceptionWarning(msg))
+
+tests/v1/engine/test_request_submission_cleanup.py::test_disconnect_during_mm_materialize_rolls_back_all_children[1]
+tests/v1/engine/test_request_submission_cleanup.py::test_disconnect_during_mm_materialize_rolls_back_all_children[3]
+tests/v1/engine/test_request_submission_cleanup.py::test_disconnect_during_stripped_mm_send_leaves_no_retry_entry[1-1]
+tests/v1/engine/test_request_submission_cleanup.py::test_disconnect_during_stripped_mm_send_leaves_no_retry_entry[3-2]
+tests/v1/engine/test_request_submission_cleanup.py::test_disconnect_during_stripped_mm_send_leaves_no_retry_entry[3-3]
+tests/v1/engine/test_request_submission_cleanup.py::test_failed_mm_submission_unmarks_items_it_did_not_deliver[1]
+tests/v1/engine/test_request_submission_cleanup.py::test_failed_mm_submission_unmarks_items_it_did_not_deliver[3]
+tests/entrypoints/serve/utils/test_api_cancellation.py::test_outer_cancellation_waits_for_both_children[False]
+  /usr/local/lib/python3.12/dist-packages/_pytest/unraisableexception.py:67: PytestUnraisableExceptionWarning: Exception ignored in: <function AsyncLLM.__del__ at 0xec02a7311260>
+  
+  Traceback (most recent call last):
+    File "/opt/spark-ds41f/candidate/vllm/vllm/v1/engine/async_llm.py", line 295, in __del__
+      self.shutdown()
+    File "/opt/spark-ds41f/candidate/vllm/vllm/v1/engine/async_llm.py", line 302, in shutdown
+      renderer.shutdown()
+      ^^^^^^^^^^^^^^^^^
+  AttributeError: 'types.SimpleNamespace' object has no attribute 'shutdown'
+  
+  Enable tracemalloc to get traceback where the object was allocated.
+  See https://docs.pytest.org/en/stable/how-to/capture-warnings.html#resource-warnings for more info.
+    warnings.warn(pytest.PytestUnraisableExceptionWarning(msg))
+
+-- Docs: https://docs.pytest.org/en/stable/how-to/capture-warnings.html
+=========================== short test summary info ============================
+FAILED tests/v1/engine/test_request_submission_cleanup.py::test_abort_during_mm_retry_materialize_does_not_resubmit
+1 failed, 60 passed, 24 warnings in 10.01s
+# exit 1, finished 2026-11-10T04:23:53Z

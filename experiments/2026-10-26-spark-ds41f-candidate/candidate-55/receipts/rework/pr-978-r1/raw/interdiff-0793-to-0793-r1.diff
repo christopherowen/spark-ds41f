@@ -1,0 +1,519 @@
+diff --git a/tests/multimodal/test_prefix_cache_fastpath.py b/tests/multimodal/test_prefix_cache_fastpath.py
+index 81f3471a4..49b5d83a6 100644
+--- a/tests/multimodal/test_prefix_cache_fastpath.py
++++ b/tests/multimodal/test_prefix_cache_fastpath.py
+@@ -217,7 +217,15 @@ def test_async_llm_and_engine_core_strip_and_self_heal():
+     assert req2.mm_features[0].data is None
+     assert "req-2" in dummy_llm._pending_mm_retries
+ 
+-    # Verify EngineCore._verify_or_resolve_stripped_mm_features behavior:
++    # Verify EngineCore._verify_or_resolve_stripped_mm_features behavior.
++    # Its lookup stub returns what KVCacheManager.get_computed_blocks does.
++    from typing import get_args
++
++    from vllm.v1.core.kv_cache_manager import KVCacheManager
++
++    lookup = KVCacheManager.get_computed_blocks.__annotations__["return"]
++    assert get_args(lookup)[1] is int and len(get_args(lookup)) == 3
++
+     # 1) Hit in encoder_cache_manager -> accepted and pinned
+     pinned = []
+     dummy_core = SimpleNamespace(
+@@ -226,7 +234,9 @@ def test_async_llm_and_engine_core_strip_and_self_heal():
+         ),
+         scheduler=SimpleNamespace(
+             kv_cache_manager=SimpleNamespace(
+-                get_computed_blocks=lambda r: (None, 0)
++                # KVCacheManager.get_computed_blocks: (blocks, computed tokens,
++                # shared-prefix boundary)
++                get_computed_blocks=lambda r: (None, 0, 0)
+             ),
+             encoder_cache_manager=SimpleNamespace(
+                 cached={"mm-hash-1": set()},
+@@ -248,12 +258,12 @@ def test_async_llm_and_engine_core_strip_and_self_heal():
+ 
+     # 2) Evicted from encoder_cache_manager, covered by KV prefix cache beyond CED replay window -> accepted
+     dummy_core.scheduler.encoder_cache_manager.cached.clear()
+-    dummy_core.scheduler.kv_cache_manager.get_computed_blocks = lambda r: (None, 160)
++    dummy_core.scheduler.kv_cache_manager.get_computed_blocks = lambda r: (None, 160, 0)
+     # offset=4, length=10 => end=14 <= min(160, 200-128=72) => covered!
+     EngineCore._verify_or_resolve_stripped_mm_features(dummy_core, req2_core)
+ 
+     # 3) Evicted from both encoder_cache_manager and kv_cache_manager -> raises MultiModalCacheMissError
+-    dummy_core.scheduler.kv_cache_manager.get_computed_blocks = lambda r: (None, 0)
++    dummy_core.scheduler.kv_cache_manager.get_computed_blocks = lambda r: (None, 0, 0)
+     with pytest.raises(MultiModalCacheMissError) as exc_info:
+         EngineCore._verify_or_resolve_stripped_mm_features(dummy_core, req2_core)
+     assert exc_info.value.mm_hashes == ["mm-hash-1"]
+diff --git a/tests/v1/engine/test_request_submission_cleanup.py b/tests/v1/engine/test_request_submission_cleanup.py
+index 34ba89185..2ea8619d4 100644
+--- a/tests/v1/engine/test_request_submission_cleanup.py
++++ b/tests/v1/engine/test_request_submission_cleanup.py
+@@ -3,13 +3,27 @@
+ """Submission failures must not retain frontend prompts or orphan sampled children."""
+ 
+ import asyncio
++import threading
+ import time
++from concurrent.futures import ThreadPoolExecutor
+ from types import SimpleNamespace
+ 
+ import pytest
+-
++import torch
++
++from vllm.multimodal.inputs import (
++    MultiModalFeatureSpec,
++    MultiModalFieldConfig,
++    MultiModalKwargsItem,
++    PlaceholderRange,
++)
+ from vllm.sampling_params import SamplingParams
+-from vllm.v1.engine import EngineCoreOutput, EngineCoreRequest, FinishReason
++from vllm.v1.engine import (
++    EngineCoreOutput,
++    EngineCoreOutputs,
++    EngineCoreRequest,
++    FinishReason,
++)
+ from vllm.v1.engine.async_llm import AsyncLLM
+ from vllm.v1.engine.output_processor import OutputProcessor
+ 
+@@ -202,3 +216,288 @@ def test_successful_submission_and_completion_keep_normal_cleanup(n):
+         assert not llm.engine_core.aborted
+ 
+     asyncio.run(run())
++
++
++# Multimodal prefix-cache fast path (--mm-processor-cache-gb 0, prefix caching).
++# Its materialization await sits between local registration and the engine send,
++# so it must keep the guarantees above, and its retry entries and P1 marks must
++# not outlive a request that never reached the engine.
++
++
++class Materializer:
++    """Builds an image item on the MM executor once released."""
++
++    def __init__(self, released=True):
++        self.started = threading.Event()
++        self.release = threading.Event()
++        if released:
++            self.release.set()
++        self.calls = 0
++
++    def __call__(self):
++        self.calls += 1
++        self.started.set()
++        assert self.release.wait(timeout=10)
++        return {
++            "image_patches": MultiModalFieldConfig.shared("image", 1).build_elems(
++                "image_patches", torch.ones((2, 16), dtype=torch.bfloat16)
++            )[0]
++        }
++
++
++def make_mm_llm(executor):
++    llm = make_llm()
++    llm._mm_prefix_fastpath = True
++    llm._p1_cached_mm_identifiers = set()
++    llm._pending_mm_retries = {}
++    llm.model_config = SimpleNamespace(uses_mrope=False)
++    llm.renderer = SimpleNamespace(_mm_executor=executor, shutdown=lambda: None)
++    return llm
++
++
++def make_mm_request(materializer, n=1):
++    # A repeat image as the processor returns it under the fast path.
++    request = make_request(n)
++    request.mm_features = [
++        MultiModalFeatureSpec(
++            data=MultiModalKwargsItem(
++                lazy_materializer=materializer,
++                lazy_mm_hash="image-1",
++                keep_on_cpu_elems={},
++            ),
++            modality="image",
++            identifier="image-1",
++            mm_position=PlaceholderRange(offset=4, length=10),
++            mm_hash="image-1",
++        )
++    ]
++    return request
++
++
++def run_with_mm_executor(run):
++    with ThreadPoolExecutor(max_workers=1) as executor:
++        asyncio.run(run(executor))
++
++
++async def drain(executor):
++    # The executor has one worker: this returns once earlier work finished.
++    await asyncio.get_running_loop().run_in_executor(executor, lambda: None)
++
++
++async def until(condition):
++    for _ in range(500):
++        if condition():
++            return
++        await asyncio.sleep(0.01)
++    raise AssertionError("condition not reached")
++
++
++class NoRenderer:
++    def shutdown(self):
++        pass
++
++    def __getattr__(self, name):
++        raise AssertionError(f"a text-only request read renderer.{name}")
++
++
++@pytest.mark.parametrize("fail", [False, True])
++def test_text_only_requests_skip_the_multimodal_fast_path(fail):
++    async def run():
++        llm = make_llm()
++        llm._mm_prefix_fastpath = True
++        llm._p1_cached_mm_identifiers = set()
++        llm._pending_mm_retries = {}
++        llm.renderer = NoRenderer()
++        request = make_request()
++        if fail:
++            llm.engine_core.fail_at = 1
++            with pytest.raises(RuntimeError, match="^submission failed$"):
++                await llm.add_request(
++                    request.request_id, request, request.sampling_params
++                )
++        else:
++            queue = await llm.add_request(
++                request.request_id, request, request.sampling_params
++            )
++            await llm.abort(queue.request_id, internal=True)
++        assert_empty(llm)
++        assert llm.engine_core.aborted == llm.engine_core.submitted
++
++    asyncio.run(run())
++
++
++@pytest.mark.parametrize("n", [1, 3])
++def test_disconnect_during_mm_materialize_rolls_back_all_children(n):
++    async def run(executor):
++        llm = make_mm_llm(executor)
++        materializer = Materializer(released=False)
++        request = make_mm_request(materializer, n)
++        generator = llm.generate(
++            request, request.sampling_params, request.request_id
++        )
++        task = asyncio.create_task(anext(generator))
++        try:
++            assert await asyncio.to_thread(materializer.started.wait, 2)
++            # The first child is registered and materializing; nothing is sent.
++            registered = set(llm.output_processor.request_states)
++            assert len(registered) == 1
++            assert llm.output_processor.get_num_queued_tokens() == 65536
++            task.cancel()
++            with pytest.raises(asyncio.CancelledError):
++                await task
++            await generator.aclose()
++        finally:
++            materializer.release.set()
++        await drain(executor)
++        assert_empty(llm)
++        assert not llm.engine_core.submitted
++        assert set(llm.engine_core.aborted) == registered
++        assert not llm._pending_mm_retries
++        assert not llm._p1_cached_mm_identifiers
++
++    run_with_mm_executor(run)
++
++
++@pytest.mark.parametrize("n, block_at", [(1, 1), (3, 2), (3, 3)])
++def test_disconnect_during_stripped_mm_send_leaves_no_retry_entry(n, block_at):
++    async def run(executor):
++        llm = make_mm_llm(executor)
++        # An earlier turn sent the image to P1, so this one goes stripped and
++        # keeps a retry materializer in case P1 has since evicted it.
++        llm._p1_cached_mm_identifiers.add("image-1")
++        llm.engine_core.block_at = block_at
++        materializer = Materializer()
++        request = make_mm_request(materializer, n)
++        generator = llm.generate(
++            request, request.sampling_params, request.request_id
++        )
++        task = asyncio.create_task(anext(generator))
++        await asyncio.wait_for(llm.engine_core.entered.wait(), timeout=2)
++        assert len(llm.output_processor.request_states) == block_at
++        assert llm._pending_mm_retries
++        task.cancel()
++        with pytest.raises(asyncio.CancelledError):
++            await task
++        await generator.aclose()
++        assert_empty(llm)
++        assert set(llm.engine_core.aborted) == set(llm.engine_core.submitted)
++        assert not llm._pending_mm_retries
++        # The mark is the earlier turn's delivered request's, not this one's.
++        assert llm._p1_cached_mm_identifiers == {"image-1"}
++        assert materializer.calls == 0
++
++    run_with_mm_executor(run)
++
++
++@pytest.mark.parametrize("n", [1, 3])
++def test_failed_mm_submission_unmarks_items_it_did_not_deliver(n):
++    async def run(executor):
++        llm = make_mm_llm(executor)
++        llm.engine_core.fail_at = n
++        materializer = Materializer()
++        request = make_mm_request(materializer, n)
++        with pytest.raises(RuntimeError, match="^submission failed$"):
++            await llm.add_request(request.request_id, request, request.sampling_params)
++        assert_empty(llm)
++        assert set(llm.engine_core.aborted) == set(llm.engine_core.submitted)
++        assert not llm._pending_mm_retries
++        assert materializer.calls == 1
++        if n == 1:
++            # Its only send failed: P1 never received the image.
++            assert not llm._p1_cached_mm_identifiers
++        else:
++            # The first child delivered the image before the last send failed.
++            # As for any aborted request, the mark stays a hint: P1 verifies a
++            # stripped item and returns a retryable miss if it lacks it.
++            assert llm._p1_cached_mm_identifiers == {"image-1"}
++
++    run_with_mm_executor(run)
++
++
++def start_output_handler(llm):
++    """Run the real output handler on engine outputs the test feeds it."""
++    outputs = asyncio.Queue()
++    polls = [0]
++
++    async def get_output_async():
++        polls[0] += 1
++        return await outputs.get()
++
++    llm.engine_core.get_output_async = get_output_async
++    llm.log_stats = False
++    llm.logger_manager = None
++    llm.renderer.mm_processor_cache = None
++    llm.renderer.stat_mm_cache = lambda: None
++    AsyncLLM._run_output_handler(llm)
++    return outputs, polls
++
++
++async def stop_output_handler(llm):
++    llm.output_handler.cancel()
++    with pytest.raises(asyncio.CancelledError):
++        await llm.output_handler
++
++
++def test_output_handler_starts_on_a_fast_path_engine():
++    # Starting the handler defines the cache-miss retry coroutine, and Python
++    # evaluates its annotations then: a name the module does not import makes
++    # every server start fail.
++    async def run(executor):
++        llm = make_mm_llm(executor)
++        start_output_handler(llm)
++        try:
++            await asyncio.sleep(0)
++            assert not llm.output_handler.done()
++        finally:
++            await stop_output_handler(llm)
++
++    run_with_mm_executor(run)
++
++
++def test_abort_during_mm_retry_materialize_does_not_resubmit():
++    async def run(executor):
++        llm = make_mm_llm(executor)
++        llm._p1_cached_mm_identifiers.add("image-1")
++        materializer = Materializer(released=False)
++        request = make_mm_request(materializer)
++        queue = await llm.add_request(
++            request.request_id, request, request.sampling_params
++        )
++        request_id = queue.request_id
++        assert request.mm_features[0].data is None
++        assert request_id in llm._pending_mm_retries
++
++        outputs, polls = start_output_handler(llm)
++        try:
++            # P1 has evicted the image from both caches: a retryable miss.
++            outputs.put_nowait(
++                EngineCoreOutputs(
++                    outputs=[
++                        EngineCoreOutput(
++                            request_id=request_id,
++                            new_token_ids=[],
++                            finish_reason=FinishReason.ERROR,
++                            mm_cache_miss_hashes=["image-1"],
++                        )
++                    ],
++                    finished_requests={request_id},
++                )
++            )
++            try:
++                assert await asyncio.to_thread(materializer.started.wait, 2)
++                # The client disconnects while the retry materializes the image.
++                await llm.abort(request_id, internal=True)
++            finally:
++                materializer.release.set()
++            await drain(executor)
++            # The handler has finished the batch once it asks for the next one.
++            await until(lambda: polls[0] == 2)
++            assert llm.engine_core.submitted == [request_id]
++            assert "image-1" not in llm._p1_cached_mm_identifiers
++            assert not llm._pending_mm_retries
++            assert_empty(llm)
++            assert not llm.output_handler.done()
++        finally:
++            await stop_output_handler(llm)
++
++    run_with_mm_executor(run)
+diff --git a/vllm/v1/engine/async_llm.py b/vllm/v1/engine/async_llm.py
+index 83f48cb2a..766a35874 100644
+--- a/vllm/v1/engine/async_llm.py
++++ b/vllm/v1/engine/async_llm.py
+@@ -5,7 +5,7 @@ import os
+ import socket
+ import time
+ import warnings
+-from collections.abc import AsyncGenerator, Iterable, Mapping
++from collections.abc import AsyncGenerator, Callable, Iterable, Mapping
+ from copy import copy
+ from typing import Any
+ 
+@@ -80,6 +80,10 @@ class InputStreamError(Exception):
+ class AsyncLLM(EngineClient):
+     """An asynchronous wrapper for the vLLM engine."""
+ 
++    # The multimodal prefix-cache fast path is off unless __init__ enables it,
++    # so text-only submission, rollback and abort paths never touch its state.
++    _mm_prefix_fastpath: bool = False
++
+     def __init__(
+         self,
+         vllm_config: VllmConfig,
+@@ -194,6 +198,14 @@ class AsyncLLM(EngineClient):
+             self.logger_manager.log_engine_initialized()
+ 
+         self._client_count = client_count
++        # With no P0 processor cache (--mm-processor-cache-gb 0) and prefix
++        # caching on, the processor returns repeat items lazily, and items
++        # already sent to P1 go stripped, with a retry materializer per request.
++        self._mm_prefix_fastpath = (
++            renderer.mm_processor is not None
++            and renderer.mm_processor_cache is None
++            and bool(self.vllm_config.cache_config.enable_prefix_caching)
++        )
+         self._p1_cached_mm_identifiers: set[str] = set()
+         self._pending_mm_retries: dict[
+             str, tuple[EngineCoreRequest, dict[str, Callable[[], Any]]]
+@@ -532,9 +544,14 @@ class AsyncLLM(EngineClient):
+ 
+     async def _prepare_mm_features_for_prefix_cache(
+         self, request: EngineCoreRequest
+-    ) -> None:
++    ) -> list[str]:
++        """Materialize items P1 lacks and strip those it was sent before.
++
++        Returns the identifiers this call newly marked as sent to P1, so that
++        a request that never reaches the engine can unmark them.
++        """
+         if not request.mm_features:
+-            return
++            return []
+         to_materialize: list[Any] = []
+         new_identifiers: list[str] = []
+         retry_materializers: dict[str, Callable[[], Any]] = {}
+@@ -568,14 +585,19 @@ class AsyncLLM(EngineClient):
+ 
+             await loop.run_in_executor(self.renderer._mm_executor, _materialize_batch)
+ 
+-        for ident in new_identifiers:
+-            self._p1_cached_mm_identifiers.add(ident)
++        marked = [
++            ident
++            for ident in dict.fromkeys(new_identifiers)
++            if ident not in self._p1_cached_mm_identifiers
++        ]
++        self._p1_cached_mm_identifiers.update(marked)
+ 
+         if retry_materializers:
+             self._pending_mm_retries[request.request_id] = (
+                 request,
+                 retry_materializers,
+             )
++        return marked
+ 
+     async def _add_request(
+         self,
+@@ -593,15 +615,23 @@ class AsyncLLM(EngineClient):
+         # Register locally before the first await so concurrent tasks see this request.
+         self.output_processor.add_request(request, prompt, parent_req, index, queue)
+ 
+-        if (
+-            self.renderer.mm_processor_cache is None
+-            and self.vllm_config.cache_config.enable_prefix_caching
+-            and request.mm_features
+-        ):
+-            await self._prepare_mm_features_for_prefix_cache(request)
++        # Text-only requests never reach the multimodal fast path. For the rest,
++        # this await is covered like the send below: if it is cancelled or
++        # fails, add_request() rolls back the registration and every child.
++        mm_marked: list[str] | None = None
++        if request.mm_features and self._mm_prefix_fastpath:
++            mm_marked = await self._prepare_mm_features_for_prefix_cache(request)
+ 
+         # Add the EngineCoreRequest to EngineCore (separate process).
+-        await self.engine_core.add_request_async(request)
++        try:
++            await self.engine_core.add_request_async(request)
++        except BaseException:
++            if mm_marked is not None:
++                # The send did not complete, so count none of this request's
++                # items as sent to P1 and drop its retry entry.
++                self._pending_mm_retries.pop(request.request_id, None)
++                self._p1_cached_mm_identifiers.difference_update(mm_marked)
++            raise
+ 
+         if self.log_requests:
+             logger.info("Added request %s.", request.request_id)
+@@ -914,6 +944,10 @@ class AsyncLLM(EngineClient):
+ 
+             loop = asyncio.get_running_loop()
+             await loop.run_in_executor(renderer._mm_executor, _materialize_missed)
++            if not output_processor.has_request(retry_req.request_id):
++                # Aborted while its items materialized: resubmitting would
++                # start an engine request that no client is waiting for.
++                return
+             if retry_req.mm_features:
+                 for f in retry_req.mm_features:
+                     if f.data is not None:
+@@ -1012,8 +1046,9 @@ class AsyncLLM(EngineClient):
+             (request_id,) if isinstance(request_id, str) else as_list(request_id)
+         )
+         all_request_ids = self.output_processor.abort_requests(request_ids, internal)
+-        for req_id in all_request_ids:
+-            self._pending_mm_retries.pop(req_id, None)
++        if self._mm_prefix_fastpath and self._pending_mm_retries:
++            for req_id in all_request_ids:
++                self._pending_mm_retries.pop(req_id, None)
+         # Starlette StreamingResponse cancels an AnyIO scope on client
+         # disconnect. Once output_processor has removed local state, shield the
+         # EngineCore abort notification so it cannot be dropped mid-await.
+diff --git a/vllm/v1/engine/core.py b/vllm/v1/engine/core.py
+index 90434dbb6..fe282c6ba 100644
+--- a/vllm/v1/engine/core.py
++++ b/vllm/v1/engine/core.py
+@@ -499,9 +499,10 @@ class EngineCore:
+             self.vllm_config.cache_config.enable_prefix_caching
+             and not request.skip_reading_prefix_cache
+         ):
+-            _, num_computed_tokens = self.scheduler.kv_cache_manager.get_computed_blocks(
++            # (blocks, computed tokens, shared-prefix boundary)
++            num_computed_tokens = self.scheduler.kv_cache_manager.get_computed_blocks(
+                 request
+-            )
++            )[1]
+             ced_replay = getattr(self.scheduler, "ced_Prompt_replay_tokens", 0)
+             if ced_replay > 0 and num_computed_tokens > 0:
+                 effective_computed_tokens = max(
