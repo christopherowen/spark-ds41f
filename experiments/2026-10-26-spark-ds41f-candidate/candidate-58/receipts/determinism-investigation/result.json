@@ -1,0 +1,158 @@
+{
+ "task": "tp4-ring temperature-0 determinism regression in the `again` scenario: root cause by row-invariance test on sp8, trigger from code, fix and testbed confirmation",
+ "date": "2026-11-10",
+ "verdict": {
+  "convicted_kernel": null,
+  "summary": "No kernel is convicted. Every kernel path that candidate-51's four patches (0781 #961, 0782 #963, 0783 #987, 0784 #1001) touch gives a fixed row the same bits for every M from 1 to 128 and every kind of neighbour row, in both versions of #963 and #1001 (the first versions candidate-51 booted, and r1, which candidate-54+ carry). The bits also equal those of candidate-51's base (candidate-50 without #1009). So the regression is not a row-count dependence introduced by candidate-51. The wider check (the decode layer, sparse MLA, the indexer) also finds no M-dependent kernel. The gate record does not single out candidate-51 either. The failures begin in the 1107 era: 1107's 0746 brought the state-dependent calibration. The only tp4-ring evidence before candidate-51 on that stack is 2 clean boots. tp4-switched has run the same TP4 code, with candidate-51's patches, on 3 boots without a failure.",
+  "hypothesis_part_1_trigger": "confirmed from code (see trigger)",
+  "hypothesis_part_2_kernel_made_M_dependent_by_candidate_51": "refuted for #987, #1001, #963 and #961 (see row_invariance)",
+  "hypothesis_part_3_0789": "0789 cannot be the sole cause: candidate-51 has no 0789 and failed. It does not widen a kernel effect, because no kernel is M-dependent. It does add state dependence to M at c1: copy_apply compares against the calibrated DSpark yield, and SINGLE_REQ_TILE_SPILL_SCALE prices a 17th row. On the record, tp4-ring boots with 0789 failed 1 of 4 (candidate-54, candidate-55-no978, candidate-55-978r2, candidate-58), against 1 of 1 without it (candidate-51): no sign that it widens the effect."
+ },
+ "record": {
+  "source": "results/private/determinism/*/{determinism,greedy}-*.jsonl on dgx1 (tp4-ring), sp1 (tp4-switched) and sp5 (tp3-switched); read-only. raw/record/*-gate-runs.txt, raw/record/summary.txt; the failing runs' files are in raw/dgx1-determinism/",
+  "failures_verified": [
+   "candidate-51-tp4/greedy-candidate-51.jsonl: again, prompt 7, first_char_diff 112 (the boot's second run; its reference texts equal the logprob run's)",
+   "candidate-55-validate-978r2-tp4/determinism-candidate-55-978r2.jsonl: again, prompt 2, first_logprob_diff 176, first_token_diff 189",
+   "candidate-55-validate-978r2-tp4/greedy-candidate-55-978r2.jsonl: again, prompt 4, first_char_diff 641"
+  ],
+  "by_testbed_and_era": {
+   "tp4-ring (dgx1..dgx4), 1107 era (from 2026-11-07)": "14 runs, 7 boots: candidate-47 and candidate-50-no1009 pass, candidate-51 fails (greedy), candidate-54 and candidate-55-no978 pass, candidate-55-978r2 fails (both runs), candidate-58 passes. 2 failing boots of 7",
+   "tp4-ring before the 1107 era": "84 runs over 26 run directories, 0 failures (older stacks: no online confidence calibration)",
+   "tp4-switched (sp1..sp4), 1107 era": "16 runs, 8 boots (candidate-48, -50-no1009, -50-1009r1, -52, -52-no1030, -54, -56, -58), 0 failures; candidate-54, -56 and -58 carry candidate-51's four patches",
+   "tp3-switched (sp5..sp7), 1107 era": "14 runs, 7 boots, 0 failures",
+   "dgx1 other and tp3, before 1107": "374 runs, 0 failures"
+  },
+  "reading": "Most of the 462 clean runs before candidate-51 come from stacks older than 1107. 1107's 0746 (Calibrate DSpark confidence head online and align adaptive verification budget, authored 2026-11-06) brought the online calibration and the calibrated dead-row threshold that make M at c1 depend on earlier traffic. With that code, tp4-ring has 2 clean boots before candidate-51 and 2 failing boots of 5 after it. If the per-boot failure rate is 2/7, two clean boots in a row has probability (5/7)^2 = 0.51. The record cannot attribute the onset to candidate-51. It does place it in the 1107 era: 2 failing boots of 22 at any shape, against 0 of about 140 before."
+ },
+ "row_invariance": {
+  "host": "sp8 (spark-0016, one GB10, 48 SMs), one container per run, each under flock /tmp/spark-lab-gpu.lock, with ~/spark-hold.json absent (checked inside the lock and recorded in raw/rowinv/commands.txt)",
+  "work_dir": "~/spark-lab/agents/determinism-regression on sp8",
+  "harness": "h/rowinv.py (sections L, H, S, P, G, A, I); h/summarize.py; bin/rr.sh (the runner: arm mounts, lock, hold and serving checks)",
+  "method": "A fixed target row goes into a batch of M rows, at positions 0, M//2 and M-1. Its neighbours are of four kinds: v0 random, with every intermediate and padding row poisoned with NaN (E4M3 0x7F, UE8M0 0xFF) before each call; v1 random rows routed to the target's own six experts, so they share its expert tiles, with finite garbage in intermediates and padding; v2 garbage rows (+-1e4, some NaN), like dead verification rows; v3 (layer chain) neighbours with -1 routes, which routed MoE skips, as it skips dead rows. For every output, the target row's bits are hashed. A path is row-invariant when every (M, position, neighbour) cell gives the M=1 bits. TP4 serving shapes throughout; the head uses the checkpoint's own head.weight shards (DeepSeek-V4.1-Flash-1017, TP4 ranks 0 and 3), packed as serving packs it.",
+  "M_values": "M = 1..17, 24, 32, 48, 64, 96, 97, 104, 112, 128; target at positions 0, M//2 and M-1",
+  "arms": {
+   "base": "spark-ds41f:candidate-50 (sha256:8c1ea1f62f62...) + candidate-50 no1009/overlay (4 files, ro): candidate-51's base (pre-#961/#963/#987/#1001)",
+   "c51": "spark-ds41f:candidate-50 + the 15 files where candidate-51's tree differs from the image (ro): 0781..0784 in the versions candidate-51 booted (#963 and #1001 first versions)",
+   "c51r1": "the same image + candidate-51's corrected files (#963 r1, #1001 r1): the round-2 files candidate-54+ carry (byte-identical to the candidate-54 image's)",
+   "img54": "spark-ds41f:candidate-54 (sha256:e1de71bed3b4...), as built",
+   "img57": "spark-ds41f:candidate-57 (sha256:ba512cb2662b...), as built (adds #957 parts 2 and 4 on candidate-54: the sparse-MLA stage 2 and the fused confidence calibration)",
+   "overlay_provenance": "copied from candidate-51's own-mark and rework directories on sp8; the sha256 of every file was checked against them (raw/setup/arms.txt). The earlier verify-tree runs matched 7,831 of 7,831 files to candidate-51's tree"
+  },
+  "results": [
+   {
+    "path": "WO-B projection (#987: WIDE_DECODE {96: 96, 128: 128}, DECODE_FP8_CONFIGS[128]); TileLangWOProjection at TP4 (WO-A 2x(1024x4096) grouped, WO-B 5120x2048), through linear._block32_gemm's serving dispatch",
+    "section": "L (outputs wo-a partials, wo_b cast/scales, wo-b)",
+    "arms": "base, c51, c51r1, img54, img57",
+    "cells_per_arm": "225 (pass 1) + 300 (pass 2)",
+    "boundaries_crossed": "decode tiles 16/32/64/96 and the new 128-row tile at 97..128; WO-A split and in-kernel buckets",
+    "verdict": "row-invariant in every arm; same bits in every arm (the 128-row tile equals 2x64, as #987's test claims)"
+   },
+   {
+    "path": "lm_head logits, the logprob path (project_head -> packed_vocab_projection; #963's per-fragment-column exceptions and #1001's TILE_CONFIGS[128] num_stages=2), FP32 head",
+    "section": "H",
+    "arms": "base, c51, c51r1, img54, img57",
+    "cells_per_arm": "225 per shard, shards rank 0 (26,148 exceptions) and rank 3 (27,293)",
+    "boundaries_crossed": "row tiles 16/32/64/128 (16|17, 32|48, 64|96)",
+    "verdict": "row-invariant in every arm; same bits in every arm, so #963's exception rewrite equals the base's"
+   },
+   {
+    "path": "lm_head greedy pairs, the greedy path (project_head_greedy_pairs: #997's certified two-pass screen: x-norm, screen, row thresholds, tile compaction, refine, finish; #963 v1's byte-SWAR vllm_vocab_decode_vec16 in thresholds and refine; #1001 r1's SCREEN_TILE_CONFIGS[128])",
+    "section": "H",
+    "arms": "base, c51, c51r1, img54, img57",
+    "cells_per_arm": "225 per shard",
+    "boundaries_crossed": "as above; v1 neighbours are near copies of the target, so they activate its tiles",
+    "verdict": "row-invariant in every arm; same (max, index) bits in every arm"
+   },
+   {
+    "path": "packed BF16 split-K compressor projections (TileLangSplitLinearMethod: (1024, 5120) x2 FP32 and (512, 5120) BF16; #963 v1 changed vllm_packed_bf16_filter_exc, which these call)",
+    "section": "S",
+    "arms": "all five",
+    "cells_per_arm": "225 per shape",
+    "verdict": "row-invariant; same bits in every arm"
+   },
+   {
+    "path": "packed_bf16_gemm (#963: row bounds, pdl.chain on wide grids); no serving caller at TP4 (only imported by linear.py), checked anyway at its 4 shapes",
+    "section": "P",
+    "arms": "all five",
+    "cells_per_arm": "126 per shape",
+    "verdict": "row-invariant; same bits in every arm"
+   },
+   {
+    "path": "L2 prefetch (#961: one issuer thread, 64 KiB cp.async.bulk.prefetch.L2 chunks paced by %globaltimer)",
+    "section": "G + code",
+    "arms": "all five",
+    "detail": "the layer chain and the head in one CUDA graph with the arm's TileLang prefetch kernel forked on a side stream over the weights (grid 2, as the recipe sets), at 6 and 17 rows (either side of MoE's LATE_TRIGGER_ROWS = 16 PDL change), 200 replays with intermediates poisoned between replays: every replay equals the eager run without prefetch, all rows. Code: the kernel only issues cache-hint prefetches inside its segments and writes no memory; take_budget keeps the 4 KiB slice granule, so the segment tables are unchanged",
+    "verdict": "no numerical effect"
+   },
+   {
+    "path": "the rest of one TP4 decode layer (tests/kernels/deepseek_v41_pdl_chains at TP4 shapes): mHC entries (post_pre projection and finalize, with the MXFP8 cast), fused Q-A/KV 1792x5120, q norm, Q-B 8192x1280 cast and GEMM, shared expert gate/up 1152x5120, SwiGLU, cast and down 5120x576 on the aux stream, routed experts (384, top-6, FP4) dispatch, FC1, SwiGLU, FC2 and the combine",
+    "section": "L",
+    "arms": "all five (pass 1), base, img54, img57 (pass 2 with v3 dead-row routes)",
+    "verdict": "row-invariant in every arm, every output. The layer output's bits change from candidate-54 on (#1030's moe_swiglu_cast alignment), the same for every M"
+   },
+   {
+    "path": "sparse MLA (SparseMlaV41Plan, 16 heads (TP4), SWA 128, with and without the 512-wide index; routes split/decode/extend chosen by rows as serving does)",
+    "section": "A",
+    "arms": "base, img54, img57",
+    "cells_per_arm": "150 per width",
+    "boundaries_crossed": "idx 512: split <= 9, decode <= 28, extend above (all three crossed); idx 0: split <= 48, decode <= 144",
+    "verdict": "row-invariant; same bits in every arm (#957 part 2 included)"
+   },
+   {
+    "path": "indexer scores and top-k (IndexerV41Plan, context 9,000, page 64; dense and candidate-block layers); neighbours change the batch's extent (`active`)",
+    "section": "I",
+    "arms": "base, img54, img57",
+    "cells_per_arm": "120 per layer kind (M <= 64)",
+    "verdict": "row-invariant (scores, top-k positions, candidate blocks); same bits in every arm"
+   }
+  ],
+  "summaries": "raw/rowinv-pass1-summary.txt (L, H, S, P, G; 5 arms), raw/rowinv-pass2-summary.txt (L with dead-row routes, A, I; 3 arms); every run's JSON and log in raw/rowinv/",
+  "not_covered": [
+   "the TP collectives at tp4-ring (sparknet's one-shot ring4 transport and all_reduce_rank_order past it): one GPU cannot run them",
+   "the router (moe_topk_gate_forward), RoPE and the KV, index-key and compressor-state writes as one serving step chains them, CED row packing, Engram lookups, and the sampler and rejection kernels",
+   "the model runner's schedule as a whole"
+  ]
+ },
+ "trigger": {
+  "state_that_persists_across_requests": [
+   "OnlineAcceptanceEstimator (vllm/v1/worker/gpu/spec_decode/acceptance_estimator.py): slope, per-position intercepts, the IRLS accumulators (info, grad, counts), _steps_since_refit and _refits. It is built once per speculator and reset only at load (reset_for_confidence_head, dspark/speculator.py:266), never per request. step() runs once per verification step for the whole batch and refits every REFIT_INTERVAL = 100 steps",
+   "AdaptiveVerificationManager (adaptive_verification.py): effective_dead_rows_tau() is SPARK_DS41F_DSPARK_DEAD_ROWS_TAU = 0.2 until calibrated_confidence() turns true. That callable (model_runner.py:839) is `_refits > 0 and use_confidence_head`. From then on the threshold is min(0.2, 2*0.035/(1+3*0.035)) = 0.0633. _steps_without_drafts (the idle-exploration counter) also carries across requests. Per-slot confidences are reset to 1 for a new request (add_request, apply_staged_writes)",
+   "candidate-54+ (0789, #971): copy_apply compares the copy's expected yield with DSpark's cumulative survival from the calibrated confidences; SINGLE_REQ_TILE_SPILL_SCALE = 2.0 prices a 17th row at c1. candidate-58's 0796 fuses that calibration into the confidence kernel"
+  ],
+  "what_differs_between_reference_and_again": "In the logprob run, reference prompt 0 runs on the cold start (slope 1, intercepts 0, tau 0.2) until the first refit at step 100. The later reference prompts run on early refits. `again` runs after several hundred more verification steps (c8, staggered, mixed with the 10.5K-token long prompt, mixed15, cached), so on a later slope and intercepts. In the greedy run, which follows on the same boot, both reference and again run calibrated, but on different refits. The refit count, slope and intercept values are not logged.",
+  "effect_on_M_at_c1": "Yes. get_num_tokens picks the draft budget per step as the argmax of expected tokens over step cost, from cumulative products of the calibrated stale confidences, and drops slots below the effective tau. The device marks rows past the calibrated survival cut as dead (padding). The copy-versus-DSpark choice reads the calibrated DSpark yield (0789). So the same prompt at c1 verifies a different M (1..17: 5 DSpark drafts, up to 16 copy drafts) and different draft tokens per step in `again` than in `reference`. Exact (1, M) varlen decode graphs are captured for 1..2 requests, so the kernels see the exact M.",
+  "telemetry": "The gate's *.jsonl.telemetry.json files hold per-node SM clocks, power, temperature, clock-event reasons and busy threads only. They record no rows, drafts, budgets or refits per step, so M per step cannot be read from them. The same holds for every telemetry file of the failing boots (raw/dgx1-determinism/).",
+  "why_this_alone_cannot_change_tokens": "The trigger changes only M, the drafts and which rows are dead, never a live row's inputs. The kernels above give a row the same bits whatever M and its neighbours are. The c8, staggered, mixed and mixed15 scenarios run very different row counts and compositions and pass bit for bit, logprobs included, in every run. So the non-invariant part sits in something this test does not reach (not_covered), or is a timing or state effect, not a row-count effect."
+ },
+ "fix_recommendation": {
+  "a_row_invariant_kernel": "Nothing to change: no round-2 kernel (nor any other decode kernel tested) depends on M or on its neighbours, so there is no replacement for 0781..0784. Their performance stays as measured. Cost 0.",
+  "b_estimator_state_not_leaking_into_numerics": "Not recommended as the fix. The state reaches no live row's numerics; it changes M and drafts. Resetting or freezing the calibration per request would replay the reference's schedule in `again`, so the gate would go quiet, but the component that reacts to the schedule would stay, and other traffic would still reach it. It would also give up 0746's calibration: per its message, 43.7x lower survival MAE, and it ends c1 verification starvation. Keep it as a diagnostic arm (below), not a patch.",
+  "which_restores_the_pre_candidate_51_guarantee": "Neither, on this evidence. The kernels never lost row invariance: candidate-51's bits equal its base's. What changed in the 1107 era is that M at c1 depends on earlier traffic. That exposes a remaining non-invariant (or timing-dependent) component outside the round-2 kernels, which still has to be found.",
+  "next_localization": [
+   "Run the gate-repeat spec below. If the candidate-51-free arm (noC51) fails, candidate-51 is cleared on the testbed as well. Its record files keep both whole outputs of every differing request, so the divergent token and its logprob margin can be read.",
+   "If needed, follow with one-variable env arms on candidate-58 (no code change): SPARK_DS41F_DSPARK_DEAD_ROWS_TAU=0 (dead rows off), then a frozen-calibration arm, to tell the dead-row path from the schedule as such.",
+   "Extend the row-invariance test to the components not covered, on a 4-node window for the tp4-ring collectives."
+  ],
+  "performance_cost": "No change is proposed, so no cost: nothing to measure by CUDA-graph replay, ABBA, two boots."
+ },
+ "coordinator_scope_extension": {
+  "patches_for_candidate_54": "None. No replacement for 0781..0784 is warranted, since none is convicted, and no new patch either, since no non-determinism was found to fix. candidate-54's series and lock are unchanged, so no git am replay, patch_head or tree to report. For reference, the candidate-54 tree on sp8 (candidates-55-57/stack-vllm at 4e8133ff1) is 5f021d9a, the image's label.",
+  "candidate_54_r1_spec": "Not written: with no fix there is no candidate-54-r1 to verify. The testbed spec delivered is the attribution run on candidate-58 that the task asked for.",
+  "checked_with_verdicts": "row_invariance.results (9 paths, all row-invariant) and row_invariance.not_covered"
+ },
+ "testbed_spec": {
+  "files": {
+   "experiments/2026-10-26-spark-ds41f-candidate/candidate-58/gate-repeat-tp4.json": "run candidate-58-gate-repeat-tp4: sync, then 8 boots in one session, ABBA BAAB: candidate-58-boot1, -noC51-boot1, -noC51-boot2, -boot2, -noC51-boot3, -boot3, -boot4, -noC51-boot4. Each runs the gate twice (logprobs, then --no-logprobs) with candidate-tp4.json's arguments (--tokens 192 --long-lines 700 --wide). The distinct-stream extras are left out: they run after the gate on each boot and are not part of it",
+   "experiments/2026-10-26-spark-ds41f-candidate/candidate-58/tp4-noC51.json": "extends candidate-58/tp4.json. It mounts the 5 non-test files of 0781..0784 at their pre-0781 versions over the candidate-58 image (the notes cite no tree hash)",
+   "experiments/2026-10-26-spark-ds41f-candidate/candidate-58/noC51/overlay/vllm/...": "gemm.py dccc31b3, vocab.py 0b101db9, wo.py 2acbb963, glm5next/nvidia/l2_prefetch.py dcdf258a, glm5next/nvidia/tilelang/l2_prefetch.py cb18f914 (sha256 prefixes): candidate-54's noC51 overlay, equal to candidate-54's tree at 0780 (git show 00a2c4bae:<file> on sp8). No patch from 0785 to 0796 touches these files. Outside them, only tests use what 0781..0784 add (_PACKED_WIDE_TILES), so the mount is valid on candidate-58",
+   "experiments/2026-10-26-spark-ds41f-candidate/candidate-58/token_determinism_record.py": "experiments/2026-10-12-r6g/token_determinism_text.py run unchanged (the same requests, comparisons and stdout; lab's tables read it as before). It also keeps every response, and both whole responses of each differing request, in results/private/determinism/<run>/record-{determinism,greedy}-<label>.json. Checked against a local fake server: stdout byte-identical to the plain gate's, and a perturbed `again` request is recorded with both outputs"
+  },
+  "validation": "spark_ds41f.lab.measure_steps expands it to 33 steps: 8 boots, 16 gate runs and the table; config paths resolve",
+  "reading": "Count `again` failures per arm. The base rate is about 2 failing boots in 7 at tp4-ring, so 4 boots per arm detect it with probability 0.74. noC51 failing clears candidate-51. Neither arm failing is inconclusive. Only candidate-58 failing is weak evidence against candidate-51.",
+  "how_to_run": "on dgx1, after the hold and idle guards: scripts/lab.py run experiments/2026-10-26-spark-ds41f-candidate/candidate-58/gate-repeat-tp4.json (the files must be on main first; the sync job requires clean node checkouts)"
+ },
+ "corrections_to_the_brief": [
+  "candidate-51's booted image carried #963 and #1001 in their first versions (patch sha256 b0c54984 and c905a493). r1 of both came with candidate-54 (9140ad19, 0ad547d3). Both versions were tested.",
+  "packed_bf16_gemm and packed_bf16_gemm_two have no serving caller at TP4. Serving's packed BF16 GEMMs are the split-K compressor kernels and the vocabulary heads."
+ ]
+}

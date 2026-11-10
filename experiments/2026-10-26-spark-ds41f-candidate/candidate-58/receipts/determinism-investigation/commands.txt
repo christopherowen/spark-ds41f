@@ -1,0 +1,39 @@
+# determinism-regression: commands (2026-11-10). GPU work on sp8 only; each container run
+# takes /tmp/spark-lab-gpu.lock inside bin/rr.sh and records the hold-file check, load and
+# docker ps; the exact docker command of every run is in raw/rowinv/commands.txt.
+
+## Read-only gate record (dgx1 tp4-ring, sp1 tp4-switched, sp5 tp3-switched)
+ssh dgx1 'cd ~/projects/spark-ds41f/results/private/determinism && tar -cf - candidate-50-tp4-no1009/{determinism,greedy}-* candidate-51-tp4/{determinism,greedy}-* candidate-54-tp4/{determinism,greedy}-* candidate-55-tp4-no978/{determinism,greedy}-* candidate-55-validate-978r2-tp4/{determinism,greedy}-* candidate-58-tp4/{determinism,greedy}-*' | tar -xf - -C raw/dgx1-determinism
+for h in dgx1 sp1 sp5; do ssh $h 'cd ~/projects/spark-ds41f/results/private/determinism && find . \( -name "determinism-*.jsonl" -o -name "greedy-*.jsonl" \) -printf "%TY-%Tm-%Td_%TH:%TM %h %f\n" | sort | while read ts d f; do ... again scenario token_diffs, logprob_diffs ...; done' > raw/record/$h-gate-runs.txt; done
+# raw/record/summary.txt groups them by testbed, shape and era (before / from 2026-11-07).
+
+## Source reading (no build): origin/main 00a4cf5ba7 experiments extracted with git archive;
+## image trees extracted from the sp8 images
+git -C ~/projects/spark-ds41f archive origin/main experiments/2026-10-26-spark-ds41f-candidate/candidate-5{0..8} ... | tar -x -C <scratch>/om
+ssh sp8 'cd ~/spark-lab/agents/determinism-regression && for t in 50 54 57; do docker run --rm --entrypoint bash spark-ds41f:candidate-$t -c "cd /opt/spark-ds41f/candidate/vllm && find vllm tests -name \"*.py\" -print0 | tar --null -T - -cf -" | tar -xf - -C trees/img-c$t; done'
+git -C ~/projects/spark-ds41f grep -l -F "def effective_dead_rows_tau" origin/main -- 'experiments/*.patch'   # -> 1107/vllm/0746
+
+## sp8 setup (~/spark-lab/agents/determinism-regression)
+ls ~/spark-hold.json    # absent at every check
+cp -a ../candidate-51-own-marks/ovl/{base,c51} ovl/ ; cp -a ../candidate-51-rework-963-1001/ovl/c51r1 ovl/
+cp ../candidate-51-own-marks/files-{base,c51}.txt . ; cp ../candidate-51-rework-963-1001/files-c51r1.txt .
+for a in base c51 c51r1; do (cd ovl/$a && find . -type f | sort | xargs sha256sum) > ovl-$a.sha256; done   # diffed against the source dirs: identical
+# round-2 files: c51r1 == candidate-54 image (sha256), c51 differs in vocab.py/gemm.py only
+git -C ../candidates-55-57/stack-vllm show 00a2c4bae:<file> | sha256sum   # pre-0781 versions == candidate-54/noC51/overlay (5 files)
+
+## Row-invariance runs (h/rowinv.py through bin/rr.sh; one container each, under the lock)
+bin/rr.sh smoke-c51 c51 -e ROWINV_MS=1,6,17 -- python3 /h/rowinv.py /out/smoke-c51.json L,H,S,P,G
+bin/run_rowinv.sh base c51 c51r1 img54 img57      # rowinv-<arm>: L,H,S,P,G, 20+6 M values
+bin/rr.sh smoke2-img54 img54 -e ROWINV_MS=1,9,10,17 -- python3 /h/rowinv.py /out/smoke2-img54.json L,A,I
+bin/run_rowinv2.sh img54 base img57               # rowinv2-<arm>: L (with dead-row routes), A, I
+
+## Summaries (laptop)
+python3 h/summarize.py raw/rowinv base c51 c51r1 img54 img57 > raw/rowinv-pass1-summary.txt
+PREFIX=rowinv2 python3 h/summarize.py raw/rowinv base img54 img57 > raw/rowinv-pass2-summary.txt
+
+## Testbed spec checks (laptop, no node access)
+python3 -I fake_server.py PORT N & ; python3 -I .../candidate-58/token_determinism_record.py http://127.0.0.1:PORT --record rec.json --tokens 12 --long-lines 5 --wide   # stdout == plain gate's; differing request recorded
+python3 -c 'from spark_ds41f import lab; lab.measure_steps(spec, spec["jobs"][1])'   # 33 steps, 8 boots
+
+## To run (owner): on dgx1 after the hold and idle guards, once the files are on main
+scripts/lab.py run experiments/2026-10-26-spark-ds41f-candidate/candidate-58/gate-repeat-tp4.json

@@ -320,3 +320,13 @@ were the same as candidate-54 at c1 (candidate-55 without #978), so [attribute-c
 runs c1 in one session on candidate-58, candidate-58 without each of #957 part 4, #957 part 2 and #956 r4 (their
 files at their pre-patch versions, `no957p4/`, `no957p2/`, `no956/`; the three share no file), candidate-54, and
 candidate-58 again.
+
+**Determinism investigation (2026-11-10).** [receipts/determinism-investigation](receipts/determinism-investigation/result.json):
+no kernel is convicted. #961, #963 (both versions), #987 and #1001 (both versions), the WO-B and lm_head paths, sparse
+MLA, the indexer and the rest of a TP4 decode layer give a fixed row the same bits at every M from 1 to 128 and with any
+neighbours, on one GPU. The `again` failures are tp4-ring only (2 of 7 boots in the 1107 era; tp4-switched 0 of 8,
+three with candidate-51's patches; tp3 0 of 7), and the online acceptance estimator's state across requests changes
+`again`'s rows and drafts, which alone changes no row's numbers. Not covered on one GPU: the tp4-ring collectives.
+[gate-repeat-tp4.json](gate-repeat-tp4.json) runs the gate twice on each of 12 boots in one session, 4 each of
+candidate-58, spark-ds41f-1107 and candidate-58 without candidate-51's patches (`noC51/`), with a wrapper
+(`token_determinism_record.py`) that keeps both outputs of any differing request.
