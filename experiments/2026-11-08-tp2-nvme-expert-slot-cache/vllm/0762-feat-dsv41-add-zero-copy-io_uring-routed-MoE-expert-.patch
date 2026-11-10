@@ -1,4 +1,4 @@
-From f7fe069ccd44870f3bb625ea1c8124a4a0cc5737 Mon Sep 17 00:00:00 2001
+From c465db390cbebddf14d3c2eb43befd3aac813e08 Mon Sep 17 00:00:00 2001
 From: Christopher Owen <christopherowen@users.noreply.github.com>
 Date: Sun, 8 Nov 2026 15:24:45 +0000
 Subject: [PATCH] feat(dsv41): add zero-copy io_uring routed MoE expert slot
@@ -7,7 +7,7 @@ Subject: [PATCH] feat(dsv41): add zero-copy io_uring routed MoE expert slot
 Base: 1107 vLLM patch head 9942460917d4a107e97d7d8ba690b53d7e9158ec.
 
 Rationale:
-At TP=2 on two 128 GiB GB10 unified-memory nodes, native DeepSeek-V4.1-Flash weights total 123.75 GiB per rank (24.08 GiB replicated + sharded dense/attention/shared-expert/drafter/lm_head + 99.67 GiB routed MoE experts across 58 layers = 1.718 GiB/layer/rank for all 384 experts at hidden=5120, intermediate=1152), exceeding the ~115 GiB usable per-node memory budget by ~17-27 GiB per rank once OS, display carve-out, and KV cache are included.
+At TP=2 on two 128 GiB GB10 unified-memory nodes, native DeepSeek-V4.1-Flash weights total about 141 GiB per rank (about 10.4 GiB of other weights plus 130.6 GiB of routed experts: 40 MoE layers x 384 experts x 9,131,264 B), above the about 99 GiB a rank has for weights and KV together (the triangle's measured weights, KV pool and lowest free memory at an 8,192-token prefill budget).
 At the same time, every TMA tile in tile_expert_weights (block_N=128, FP4_TMA_K=128 = 64 packed bytes) is 8,192 B (2 x 4 KiB pages), so w13_tiles and w2_tiles are exact multiples of 4 KiB per expert, and cudaHostAlloc (pin_memory) buffers on GB10 unified LPDDR5x are mapped zero-copy into the GPU address space at full memory bandwidth.
 
 1. vllm/models/deepseek_v4_1/tilelang/moe.py:
@@ -20,7 +20,7 @@ At the same time, every TMA tile in tile_expert_weights (block_N=128, FP4_TMA_K=
    - Wire optional layer.slot_cache_config (_slot_cache, router_bias/e_score_correction_bias seeding, and _next_lookahead) into TileLangExperts.process_weights_after_loading and TileLangExperts.apply.
 
 Quality:
-Bit-identical (torch.equal, max_abs_diff = 0.0) to full 384-expert resident MoeExpertsV41Plan across all-hit decode, role-major w13/w2 overlapped cold misses, LBA-sorted multi-miss reads, cross-layer router lookahead prefetches, and multi-window prefill batches. At TP=2 geometry (E=384, H=5120, I=1152, num_slots=288, static_slots=240, dynamic_slots=48), reduces resident MoE weight footprint by 937.24 MiB/layer (53.086 GiB across 58 layers) with zero all-hit decode latency overhead.
+Bit-identical (torch.equal, max_abs_diff = 0.0) to full 384-expert resident MoeExpertsV41Plan across all-hit decode, role-major w13/w2 overlapped cold misses, LBA-sorted multi-miss reads, cross-layer router lookahead prefetches, and multi-window prefill batches. At TP=2 geometry (E=384, H=5120, I=1152, num_slots=288, static_slots=240, dynamic_slots=48), reduces resident MoE weight footprint by 937.24 MiB/layer (36.61 GiB across the 40 MoE layers) with zero all-hit decode latency overhead. At 288 slots a rank still needs about 108 GiB of weights, so no KV fits; about 256 slots per layer or fewer do.
 
 Tests:
 - pytest tests/kernels/moe/test_deepseek_v41_expert_slots.py tests/kernels/quantization/test_deepseek_v41_expert_scale_codes.py (38 passed).
@@ -28,14 +28,14 @@ Tests:
 
 Upstream status: local SM121 unified-memory TP=2 native-weight MoE expert slot cache.
 ---
- .../moe/test_deepseek_v41_expert_slots.py     | 1023 ++++++++
+ .../moe/test_deepseek_v41_expert_slots.py     | 1034 ++++++++
  .../layers/fused_moe/tilelang.py              |  129 +-
  .../deepseek_v4_1/expert_slots/__init__.py    |   57 +
  .../deepseek_v4_1/expert_slots/_native.py     |  172 ++
  .../deepseek_v4_1/expert_slots/_reader.c      |  802 ++++++
  .../deepseek_v4_1/expert_slots/cache.py       | 2229 +++++++++++++++++
  vllm/models/deepseek_v4_1/tilelang/moe.py     |  249 +-
- 7 files changed, 4615 insertions(+), 46 deletions(-)
+ 7 files changed, 4626 insertions(+), 46 deletions(-)
  create mode 100644 tests/kernels/moe/test_deepseek_v41_expert_slots.py
  create mode 100644 vllm/models/deepseek_v4_1/expert_slots/__init__.py
  create mode 100644 vllm/models/deepseek_v4_1/expert_slots/_native.py
@@ -44,10 +44,10 @@ Upstream status: local SM121 unified-memory TP=2 native-weight MoE expert slot c
 
 diff --git a/tests/kernels/moe/test_deepseek_v41_expert_slots.py b/tests/kernels/moe/test_deepseek_v41_expert_slots.py
 new file mode 100644
-index 0000000..a8693fe
+index 000000000..377c22b2a
 --- /dev/null
 +++ b/tests/kernels/moe/test_deepseek_v41_expert_slots.py
-@@ -0,0 +1,1023 @@
+@@ -0,0 +1,1034 @@
 +# SPDX-License-Identifier: Apache-2.0
 +# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 +"""Tests for the zero-copy ``pin_memory`` + ``io_uring`` (``READ_FIXED``) MoE expert slot cache."""
@@ -666,22 +666,33 @@ index 0000000..a8693fe
 +def test_compute_uma_slot_budget():
 +    # 115 GiB available, 8 GiB system, 12 GiB KV, 24 GiB non-routed -> 71 GiB for MoE.
 +    gib = 1 << 30
-+    slots_58 = compute_uma_slot_budget(
-+        num_layers=58,
++    slots_40 = compute_uma_slot_budget(
++        num_layers=40,
 +        expert_bytes=9_134_080,
 +        non_routed_bytes=24 * gib,
 +        kv_reserve_bytes=12 * gib,
 +        system_reserve_bytes=8 * gib,
 +        available_bytes=115 * gib,
 +    )
-+    expected = (71 * gib // 58) // 9_134_080
-+    assert slots_58 == expected
-+    assert 64 <= slots_58 <= 384
++    expected = (71 * gib // 40) // 9_134_080
++    assert slots_40 == expected
++    assert 64 <= slots_40 <= 384
++    # The default is DS4.1 Flash's 40 MoE layers.
++    assert (
++        compute_uma_slot_budget(
++            expert_bytes=9_134_080,
++            non_routed_bytes=24 * gib,
++            kv_reserve_bytes=12 * gib,
++            system_reserve_bytes=8 * gib,
++            available_bytes=115 * gib,
++        )
++        == slots_40
++    )
 +
 +    # Clamp to min_slots when available memory is tight, and max_slots when abundant.
 +    assert (
 +        compute_uma_slot_budget(
-+            num_layers=58,
++            num_layers=40,
 +            expert_bytes=9_134_080,
 +            available_bytes=10 * gib,
 +            system_reserve_bytes=8 * gib,
@@ -702,7 +713,7 @@ index 0000000..a8693fe
 +        == 384
 +    )
 +    # Also verify live /proc/meminfo fallback returns a valid clamped slot count.
-+    live_slots = compute_uma_slot_budget(num_layers=58, expert_bytes=9_134_080)
++    live_slots = compute_uma_slot_budget(expert_bytes=9_134_080)
 +    assert 64 <= live_slots <= 384
 +
 +
@@ -1072,7 +1083,7 @@ index 0000000..a8693fe
 +        cache.close()
 +        disk.close()
 diff --git a/vllm/model_executor/layers/fused_moe/tilelang.py b/vllm/model_executor/layers/fused_moe/tilelang.py
-index e767700..8e5f163 100644
+index e76770094..8e5f163ff 100644
 --- a/vllm/model_executor/layers/fused_moe/tilelang.py
 +++ b/vllm/model_executor/layers/fused_moe/tilelang.py
 @@ -20,6 +20,7 @@ rest of the batch.
@@ -1249,7 +1260,7 @@ index e767700..8e5f163 100644
  
 diff --git a/vllm/models/deepseek_v4_1/expert_slots/__init__.py b/vllm/models/deepseek_v4_1/expert_slots/__init__.py
 new file mode 100644
-index 0000000..c17a966
+index 000000000..c17a9661f
 --- /dev/null
 +++ b/vllm/models/deepseek_v4_1/expert_slots/__init__.py
 @@ -0,0 +1,57 @@
@@ -1312,7 +1323,7 @@ index 0000000..c17a966
 +]
 diff --git a/vllm/models/deepseek_v4_1/expert_slots/_native.py b/vllm/models/deepseek_v4_1/expert_slots/_native.py
 new file mode 100644
-index 0000000..a1ef235
+index 000000000..a1ef23552
 --- /dev/null
 +++ b/vllm/models/deepseek_v4_1/expert_slots/_native.py
 @@ -0,0 +1,172 @@
@@ -1490,7 +1501,7 @@ index 0000000..a1ef235
 +    return module
 diff --git a/vllm/models/deepseek_v4_1/expert_slots/_reader.c b/vllm/models/deepseek_v4_1/expert_slots/_reader.c
 new file mode 100644
-index 0000000..147a47e
+index 000000000..147a47ec9
 --- /dev/null
 +++ b/vllm/models/deepseek_v4_1/expert_slots/_reader.c
 @@ -0,0 +1,802 @@
@@ -2298,7 +2309,7 @@ index 0000000..147a47e
 +}
 diff --git a/vllm/models/deepseek_v4_1/expert_slots/cache.py b/vllm/models/deepseek_v4_1/expert_slots/cache.py
 new file mode 100644
-index 0000000..6c25b49
+index 000000000..3a2c27689
 --- /dev/null
 +++ b/vllm/models/deepseek_v4_1/expert_slots/cache.py
 @@ -0,0 +1,2229 @@
@@ -3152,7 +3163,7 @@ index 0000000..6c25b49
 +
 +
 +def compute_uma_slot_budget(
-+    num_layers: int = 58,
++    num_layers: int = 40,
 +    expert_bytes: int = 9_134_080,
 +    non_routed_bytes: int = 0,
 +    kv_reserve_bytes: int = 0,
@@ -4532,7 +4543,7 @@ index 0000000..6c25b49
 +                "prepared_experts_total": self.prepared_experts_total,
 +            }
 diff --git a/vllm/models/deepseek_v4_1/tilelang/moe.py b/vllm/models/deepseek_v4_1/tilelang/moe.py
-index b12b53a..c0e18f6 100644
+index b12b53a35..c0e18f63a 100644
 --- a/vllm/models/deepseek_v4_1/tilelang/moe.py
 +++ b/vllm/models/deepseek_v4_1/tilelang/moe.py
 @@ -138,12 +138,14 @@ def _dispatch_macros(num_experts, threads):

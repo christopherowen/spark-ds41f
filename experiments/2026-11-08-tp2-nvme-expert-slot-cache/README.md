@@ -3,7 +3,7 @@
 ## Summary
 
 - **Base deployment commit**: `cc20ed18b` (`1107` vLLM patch series head `0761` / `320021e3c4dbb202d911ab70e2cd924c75420488`)
-- **Candidate patch**: `experiments/2026-11-08-tp2-nvme-expert-slot-cache/vllm/0762-feat-dsv41-add-zero-copy-io_uring-routed-MoE-expert-.patch` (patch head `792d5df648324a076808ebfee6a3c9fd8b0e4392`, tree `9031d0e65d639e94243830d3106116b854865700`)
+- **Candidate patch**: `experiments/2026-11-08-tp2-nvme-expert-slot-cache/vllm/0762-feat-dsv41-add-zero-copy-io_uring-routed-MoE-expert-.patch` (patch head `c063f7ba0b45a7a77d5d76bd221e7238f5a7121a`, tree `2ff6048d90f1bee5a46f51e45f803d684dbb7ca7`)
 - **Causal variable**: Add a zero-copy `cudaHostAlloc` (`pin_memory`) + `O_DIRECT` `io_uring` (`IORING_OP_READ_FIXED` + `IOSQE_FIXED_FILE`) routed MoE expert slot manager (`vllm/models/deepseek_v4_1/expert_slots/`) with:
   1. In-kernel `ExpertToSlot[e]` dispatch remapping (`slot_map=True` in `moe_dispatch_v41`),
   2. Two-phase role-major `w13`/`w2` NVMe streaming (`wait_w2` callback between `moe_swiglu_cast` and `down_proj`),
@@ -92,7 +92,7 @@ An earlier version of this table counted 58 MoE layers, 24.08 GiB of non-routed 
 4. **Router-Bias Static Seeding, Layer-Adaptive Entropy Slot Planner, & UMA `MemAvailable` Auto-Budgeting (`cache.py`)**:
    - `rank_experts_by_router_bias(e_score_correction_bias, gate_weight=None, hotlist_counts=None)` ranks experts `0..E-1` from highest to lowest routing prior so each layer's `static_slots` pin the checkpoint's true high-bias experts (wired automatically via `router_bias` / `layer.e_score_correction_bias` in `TileLangExperts`).
    - `plan_layer_slot_budgets(layer_biases, total_slot_budget, min_slots_per_layer=64, max_slots_per_layer=384, dynamic_slots_per_layer=48)` distributes a fixed global slot budget across MoE layers proportionally to each layer's routing Shannon entropy so concentrated low-entropy layers use fewer static slots and diffuse high-entropy layers receive more static slots at the identical total memory footprint.
-   - `compute_uma_slot_budget(num_layers=58, expert_bytes=9_134_080, non_routed_bytes=0, kv_reserve_bytes=0, system_reserve_bytes=8*(1<<30))` reads Linux `/proc/meminfo` `MemAvailable` on integrated-memory GB10 hosts, subtracts system, KV, and non-routed reserves, and returns a clamped `[64, 384]` per-layer slot budget. Its `num_layers` default is `58`; DS4.1 Flash has 40 MoE layers, so a caller must pass `num_layers=40` (nothing in serving calls it yet).
+   - `compute_uma_slot_budget(num_layers=40, expert_bytes=9_134_080, non_routed_bytes=0, kv_reserve_bytes=0, system_reserve_bytes=8*(1<<30))` reads Linux `/proc/meminfo` `MemAvailable` on integrated-memory GB10 hosts, subtracts system, KV, and non-routed reserves, and returns a clamped `[64, 384]` per-layer slot budget. The `num_layers` default is DS4.1 Flash's 40 MoE layers (it was `58` before 2026-11-10). Nothing in serving calls it yet.
 5. **Zero-Staging Chunked Build, Background `O_DIRECT` Layer Writer, & 4-Expert Spot-Checked Cached Start (`cache.py` + `_reader.c` + `tilelang.py`)**:
    - On Boot 1 (when the per-layer NVMe file does not yet exist), `ExpertDiskCache._build_layer_chunked` prepares experts in bounded slices (`chunk_experts=64`) so no full-384-expert staging tensor sits in memory at once, populates resident `ExpertSlotCache` slots directly in RAM (`populate_slots_from_chunk_bytes`), and enqueues the `4 KiB` metadata header (`DS41EXPK` magic, format version, `ExpertPackMeta` geometry, and `checkpoint_key`) plus `4 KiB`-aligned expert chunks onto a single background writer thread (`write_layer_expert_file`).
    - `write_layer_expert_file` verifies `shutil.disk_usage(parent).free` remains above the `8 GiB` safety floor (`MIN_FREE_DISK_BYTES`), streams `4 KiB`-aligned pages through an `mmap` bounce buffer to `<layer>.tmp.<pid>` with `O_DIRECT` (falling back cleanly to buffered write + `fsync` when `O_DIRECT` is unsupported), and atomically publishes via `os.replace`. `ExpertDiskCache.loading_done()` waits for the background queue to drain and cleans up any stale `.tmp.<dead_pid>` files (`cleanup_stale_tmp_files`).
@@ -118,6 +118,7 @@ docker run --rm --gpus all --ipc=host --ulimit memlock=-1 --security-opt seccomp
 ```
 - `tests/kernels/moe/test_deepseek_v41_expert_slots.py` (`12 passed`) + `tests/kernels/quantization/test_deepseek_v41_expert_scale_codes.py` (`29 passed`): **`41 passed`**
 - `tests/kernels/moe/test_deepseek_v41_tilelang_moe.py`: **`139 passed`**
+- After the 40-layer default (2026-11-10, `dgx4`, CPU only, no GPU while a lab window held the ring): `test_compute_uma_slot_budget` passes in `spark-ds41f:1107` with the patched `expert_slots` and test mounted. It is the only caller. The GPU tests above were not rerun; they do not call it.
 
 Two-boot `TP=2` geometry benchmark (`E=384, top_k=6, H=5120, I=1152, num_slots=288, static_slots=240, dynamic_slots=48`) on idle `sp6` against real `DeepSeek-V4.1-Flash` `layers.{0..39}.ffn.gate.bias` checkpoint tensors:
 ```bash
