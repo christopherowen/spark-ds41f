@@ -220,3 +220,17 @@ The weight stays replicated, so #956 still reads it with no all-gather.
   step alone in one session: the control (`tp4-switched-no957p1-no956-dev`, candidate-54's code on this image),
   `tp4-switched-957p1r1-dev` (candidate-54 + 0795 round 1 + 0796, from [957p1r1/overlay](957p1r1/overlay)) twice,
   then the control again. It passes if 1x2 and 1x3 rows at 4K are back to the control or faster and no cell is slower.
+
+**Testbed result (sp1, 2026-11-10, 09:30-09:46Z).** `receipts/tp4-switched/lab/candidate-56-attribute-grid-957p1r1-tp4-switched-table.txt`
+(the table's base is `candidate-56-957p1r1`):
+- the control (candidate-54's code on this image) is faster than round 1 in the grid geometric mean on both of its
+  boots, by 0.55% and 0.61% (±0.18%); round 1's own repeat agrees within 0.17%, and the control's within 0.07%;
+- the difference is at 1-request shapes: 1x3 rows 1-2% slower with round 1 at 4K, 64K, 256K and 1016K; the other
+  shapes are the same.
+Round 1 removes most of 0795's loss (+12% at 1x2 rows), but not the cold read of the replicated weight, which costs
+more at decode than the removed all-gathers save, as the own mark's prefetch-off control found.
+
+**Verdict: #957 part 1 is dropped from this release.** The design that removes the harm, decode on the packed shard,
+removes part 1's own benefit, so a second rework has nothing to keep. #956, which passed its mark, carries forward
+without it: it is re-derived on candidate-54 alone, with its gather-and-unpad full-width weight for the SP
+projection at TP <= 4 and decode unchanged.
