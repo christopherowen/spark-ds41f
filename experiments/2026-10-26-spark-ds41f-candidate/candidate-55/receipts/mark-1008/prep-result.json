@@ -1,0 +1,131 @@
+{
+ "task": "Testbed run that decides PR #1008's own timing mark (vLLM 0792 + sparknet 0001) in candidate-55 without #978, tp4-ring dgx1..dgx4",
+ "prepared_on": "sp8 (spark-0016), clone ~/spark-lab/agents/candidate-55-1008-mark/spark-ds41f at main 92a5752c, PR head fetched as pr-1008 = 7f29f8934f00c6b49996cb0e25be9ce5f56aa91c; dgx site map config/nodes-ring4.local.json copied from the laptop's (git-ignored); nothing committed or pushed",
+ "how_the_pr_bench_works": {
+  "how_it_ran": "Its own single-process job, not against a serving cluster and not multi-rank: on sp3 (one GB10, nothing serving), `docker run --rm --gpus all --security-opt seccomp=unconfined --ulimit memlock=-1` of spark-ds41f:1107 with the PR's changed vLLM files and the prepared sparknet tree mounted, once per 'boot' (two fresh containers): sparknet unittest discover (97 OK), then pytest of the two test files (14 passed), then `bench_roce_core_affinity.py --boot-label bootN --warmup-steps 60 --bench-steps 500 --output ...`.",
+  "what_it_measures": "A C harness compiled at run time (gcc) stands in for rank 0: a 'sparknet-proxy' pthread spins on a doorbell and does the TP3 one-shot bf16 sum (3 x 3584 elements = 7168 B, 32-slot ring); the calling thread plays the worker main thread, rings 116 doorbells a step and spins for each completion. Per collective: doorbell-to-done latency, proxy wake (doorbell to proxy seeing it) and doorbell to proxy done ('arrival skew'); per step: the 116 collectives' wall time; RUSAGE_THREAD nivcsw of the proxy and the worker. World size 3, no network, no peers, no sparknet code, no serving vLLM; the only image code used is vllm.utils.cpu_affinity.partition_cpu_affinity (the plan) and torch touching CUDA once. 500 steps at ~0.08 ms is ~40 ms of measurement per regime.",
+  "how_it_applies_rank0_api_load": "Nine synthetic pthreads, each cycling a 256 KiB xorshift working set: 4 'APIServer-Tok' (850 us busy, 150 us asleep), 1 'EngineCore' (700/150), 4 'worker-aux' (600/200), about 7.2 cores of demand, pinned per regime.",
+  "regimes": {
+   "unpinned_0_19": "proxy, worker and all load on 10-14 (A725 efficiency cores)",
+   "shared_big_5_9_15_19": "proxy, worker and all load on 15-19 only: five X925 cores, not the base's ten-core 5-9,15-19 pool despite the name, so ~9 cores of demand on 5",
+   "partitioned_fast_affinity": "the plan for {5-9,15-19}: proxy 19, worker main 18, engine load 17, API load 15-16, aux load 5-9"
+  },
+  "consequence": "The three regimes are hard-coded and compared inside one process, so the result does not depend on the image beyond the plan: on candidate-54 it does not even import (no vllm.utils.cpu_affinity), and on any image with the module it prints the same comparison. It cannot judge an arm. The PR's boot-to-boot swing (shared step p99 0.939 vs 0.085 ms) is one preemption in a ~40 ms sample."
+ },
+ "the_run": {
+  "spec": "experiments/2026-10-26-spark-ds41f-candidate/candidate-55/mark-1008-tp4.json (run candidate-55-mark-1008-tp4)",
+  "jobs": [
+   "sync: node checkouts to origin/main (the files below must be merged to main first)",
+   "kernel (cluster stopped; production stops here) on dgx4, two bundles serialised by the GPU lock = two fresh containers of spark-ds41f:candidate-55 with the no978 overlay mounted (the measured arm): bundles/mark-1008-boot1 and -boot2 run check_1008_tests.py: (1) the sparknet tree check, (2) sparknet unittest discover as the PR ran it, (3) the PR's pytest, (4) the PR's bench_roce_core_affinity.py verbatim (its in-process comparison, kept as it ran). verdict 'status': passes on exit 0. dgx4 because its checkout holds the prepared candidate-55 sparknet tree (.work/build/vllm-19f2c20ed4d6-b12x-236ddff04a5f-f7aa2f2d/src/sparknet, checked read-only: HEAD d50a1b4c, tree dab8c457, clean); dgx1 has none.",
+   "measure, bench false, bracket false, ABBA arms: candidate-54 (tp4-candidate-54-trace.json), candidate-55-no978 (tp4-no978-trace.json), candidate-55-no978-again (same), candidate-54-again; extra check_1008_bench.py, output stem pr-1008-bench"
+  ],
+  "arms": {
+   "tp4-candidate-54-trace.json": "extends ../candidate-54/tp4.json; sets SPARKNET_ROCE_TRACE=1 only",
+   "tp4-no978-trace.json": "extends tp4-no978.json; sets SPARKNET_ROCE_TRACE=1 only",
+   "notes": "cite no tree hash at all; bin/spark doctor passes on both"
+  },
+  "deviation_from_the_brief": "The arms are the named profiles plus SPARKNET_ROCE_TRACE=1, not the bare files. sparknet's own per-op trace is the only per-collective timing on the serving path; without it a live arm yields only client chunk gaps (ms) and thread placement, which cannot resolve a 116-collective step (~1-3 ms). Tracing selects sparknet's separately compiled traced kernel and adds a few GPU stores per op, identically in both arms (sparknet's trace.py is the same in candidate-54's tree 8cc28a5c and candidate-55's dab8c457; the bench checks the image's layout before it measures). If the owner wants untraced arms, the bench cannot produce the per-step numbers; drop the overlays and the run reduces to placement + chunk gaps, as the screen's check already gave.",
+  "bench_check_1008_bench.py": {
+   "load": "the same in every arm: 16 closed-loop chat streams (check_1008_affinity.py's prompts, temperature 0, thinking off, max_tokens 512) plus 2 loops of /tokenize on one fixed ~118 KB text, against rank 0's API server. The client pins itself to dgx1's CPUs outside the container cpuset (0-4,10-14). The /tokenize part is an addition over the screen's affinity check, to load rank 0's tokenizer as the PR's 'APIServer-Tok' threads did; --tokenize-clients 0 removes it",
+   "window": "after 15 s warm-up, rank 0's newest traced sequence opens it; it closes after 60 s or 60,000 sequences (the trace keeps 65,536 records a rank; polled every 2 s); every rank's trace is copied at once to the node's /tmp, then to results/private/lab/candidate-55-mark-1008-tp4/traces-<label>/ on dgx1, verified by size, and the live file is removed from /dev/shm (as scripts/collect_node_traces.py does)",
+   "decisive_number": "ring_step_116_collectives_ms: for each traced all-reduce, the slowest rank's kernel time (start to end on its own GPU %globaltimer: stage, wait for every peer's payload, reduce; no cross-node clock), summed over 116 consecutive all-reduces (the decode step's roce_all_reduce count); p99 and mean, PR's percentile method",
+   "why_the_ring_not_rank0": "rank 0's own kernel completes on its peers' payloads, so a stalled rank-0 proxy shows on its peers' waits, not on rank 0's own op time. The synthetic check confirms it: 60 rank-0 proxy stalls of 800 us moved the ring step p99 from 1.29 to 2.70 ms and left rank 0's own step p99 at 1.23 ms",
+   "supporting": "each rank's own op and step statistics; each rank's proxy wake as excess over its running 1,024-op median (CPU-GPU offset and drift cancel) and counts over 10/100/1000 us; proxy post time; involuntary/voluntary context switches and CPU seconds over the window of every rank's sparknet-proxy and worker main thread (the PR's nivcsw) and the head's engine core and API server; placement and 'partitioned' as check_1008_affinity.py defines it; client chunk gaps and request/tokenize counts",
+   "fails_the_arm_when": "the endpoint, a node probe, a trace or a copy fails; the image's trace layout differs; fewer than 11,600 ring ops; any failed request. A failed extra does not stop the job; the verdict marks the run invalid"
+  },
+  "outputs": {
+   "per_arm": "results/private/determinism/candidate-55-mark-1008-tp4/pr-1008-bench-<label>.jsonl (+ .telemetry.json), traces in results/private/lab/candidate-55-mark-1008-tp4/traces-<label>/ (16 MiB a rank, sha256 in the jsonl; keep out of git), table results/private/lab/candidate-55-mark-1008-tp4-table.txt",
+   "kernel_job": "dgx1: results/private/lab/candidate-55-mark-1008-tp4/verdicts.json; dgx4: ~/spark-lab/results/candidate-55-mark-1008-tp4/mark-1008-boot{1,2}-dgx4/{output.txt,verdict.json} and ~/.cache/spark-lab/compile/mark-1008/candidate-55-mark-1008-tp4/{sparknet-unittest,vllm-pytest,pr-bench}-boot{1,2}.txt, bench-boot{1,2}.json"
+  },
+  "before_the_window": [
+   "merge these files to main (the run's first job syncs the nodes to origin/main; the bundles mount the scripts from the node checkout)",
+   "spark-ds41f:candidate-54 and spark-ds41f:candidate-55 on every dgx node (both were booted at tp4-ring already)",
+   "dgx4's prepared sparknet tree stays as checked (otherwise `bin/spark --cluster-config experiments/2026-10-26-spark-ds41f-candidate/candidate-55/tp4.json build prepare` on dgx4); the runner refuses any other HEAD or tree",
+   "start on dgx1 detached: `ssh dgx1 'cd ~/projects/spark-ds41f && setsid -f scripts/lab.py run experiments/2026-10-26-spark-ds41f-candidate/candidate-55/mark-1008-tp4.json > results/private/lab/candidate-55-mark-1008-tp4.log 2>&1 < /dev/null'`"
+  ],
+  "expected_time": {
+   "sync": "1-2 min",
+   "kernel_job": "5-7 min (stop, cool dgx4 below 55 C, two containers of about 1 min: unittest ~14 s, pytest ~5 s, PR bench seconds)",
+   "per_arm": "6-7 min: boot 4-5 min (115 s start-to-ready in the no978 screen, plus preflight; the traced kernel variant may add a compile at boot) + bench about 2 min (15 s warm-up, 60 s window, up to ~30 s drain of in-flight 512-token requests, copies and analysis ~10 s)",
+   "measure_job": "about 26-29 min for the 4 arms",
+   "close": "4-5 min production boot",
+   "total": "about 40-45 min"
+  }
+ },
+ "reading_the_verdict": {
+  "command": "on dgx1 after the run: python3 experiments/2026-10-26-spark-ds41f-candidate/candidate-55/check_1008_bench.py verdict candidate-55-mark-1008-tp4",
+  "interval_method": "candidates 49-53's rule (as pr-988's result.json): each arm has two boots (candidate-54 and candidate-54-again; candidate-55-no978 and -again). 'lower beyond the interval' = the candidate's higher boot is below the base's lower boot; 'worse/higher' = the candidate's lower boot is above the base's higher boot; otherwise 'same'. The script also prints each arm's repeat margin |boot1 - boot2| and all four base x candidate pairings in percent.",
+  "decides": [
+   "ring_step_116_collectives_ms.p99: must be 'lower' (max of the two candidate boots < min of the two candidate-54 boots)",
+   "ring_step_116_collectives_ms.mean: must not be 'higher' (min of the candidate boots not above max of the candidate-54 boots)",
+   "validity: all four summaries passed; partitioned false on both candidate-54 boots and true on both candidate-55 boots"
+  ],
+  "verdict_values": "meets-mark | misses-mark | invalid",
+  "context_not_deciding": "rank-0 step and op rows, proxy wake excess p99/max and nivcsw (mechanism: should drop on candidate-55 if the partition is what helps), client chunk-gap p99/mean under the load (the 'not worse' side of the trade: rank 0's API server is confined to 15-16 on candidate-55), the kernel job's tests (must pass in both containers) and the PR's in-process numbers (recorded as it ran, not an arm comparison). The mark's tp4-ring part (placement on every rank, screen closed loop, time to ready) is already met on main (receipts/tp4-ring-no978)."
+ },
+ "validation_on_sp8_cpu_only": {
+  "bin/spark doctor (recipe, dgx site map)": "configuration OK",
+  "bin/spark --cluster-config tp4-candidate-54-trace.json doctor": "configuration OK",
+  "bin/spark --cluster-config tp4-no978-trace.json doctor": "configuration OK",
+  "lab dry-run": "16 steps, no problems (output below)",
+  "kernel-local --dry-run of both bundles": "docker command as expected: seccomp unconfined, memlock, the two scripts, dgx4's prepared sparknet tree, the 8 no978 overlay files, workdir vllm",
+  "whitespace": "git diff --no-index --check clean on every new file; both scripts py_compile",
+  "trace analysis vs sparknet.oneshot.trace": "synthetic 4-rank ring4 traces written with sparknet's own pack_header and layout: per rank total/wait/proxy_wake/proxy_post p50 and n identical to trace.phases on 37,675 ops; 60/60 injected rank-0 proxy stalls found by the wake excess; wrapped ring and an in-flight half-written record handled (65,004 valid ops, no garbage)",
+  "trace layout probe": "the bench's layout equals trace.py in both candidate-54's (8cc28a5c) and candidate-55's (dab8c457) sparknet trees",
+  "host probe": "fake docker top + fake live and stale trace files: live/stale told apart by creation time vs owner start (in-container pids repeat across boots: sp8's /dev/shm already holds old r3-p77..p80 traces), roles from thread names, copy byte-identical",
+  "end-to-end mock": "4 fake ranks writing real-layout traces at ~1,000 ops/s, fake EngineCore/APIServer, shimmed ssh/scp/docker, a mock HTTP server: exit 0, all 4 ranks analysed, ring stalls visible (op max 811 us, step p95/p99 2.09 vs p50 1.29 ms), placement 19/18/17/15-16 reported partitioned, nivcsw deltas, chunk gaps, /tokenize calls, traces copied and removed from /dev/shm, staging cleaned. It caught one bug (a shared staging directory), fixed",
+  "verdict": "on four fake summaries: meets-mark with the interval rule and the placement check",
+  "validation_scripts": "mark-1008/validation/ (not repository files)"
+ },
+ "risks": [
+  "Tracing is untested on this exact stack (prior traced arms: r6m, r6n, older sparknet). If a traced boot fails the lab rolls back and the job stops at that arm; the bench then has nothing to read.",
+  "Under the real 16-stream load the base's 10-core pool may rarely preempt the proxy; then the ring p99 reads 'same' and #1008 misses its timing mark on the serving path. That is a valid answer, not a bench fault.",
+  "The window holds about 450-520 steps (~900-1,200 all-reduces a second at c16); a p99 over that is its 5th-6th largest step, the same order as the PR's 500.",
+  "check_1008_bench.py removes each arm's live trace file from /dev/shm via docker exec rm after copying it; a failed arm can leave one 16 MiB file per rank, removable with `docker exec spark-ds41f rm -f /dev/shm/sparknet-trace-r*` before the next boot or `sudo rm` after."
+ ],
+ "readme_section_draft": "### #1008's timing mark (`mark-1008-tp4.json`)\n\n`bench_roce_core_affinity.py` (the PR's, at `7f29f893`, copied unchanged) times three placements simulated in one process; it cannot compare arms. [check_1008_bench.py](check_1008_bench.py) keeps its unit (116 all-reduces a step) and statistics and times the ring's real all-reduces with sparknet's per-op trace, under a fixed rank-0 load (16 chat streams and 2 `/tokenize` loops), on traced arms ([tp4-candidate-54-trace.json](tp4-candidate-54-trace.json), [tp4-no978-trace.json](tp4-no978-trace.json): `SPARKNET_ROCE_TRACE=1` only). ABBA: candidate-54, candidate-55 without #978, again, candidate-54 again. Decides: `ring_step_116_collectives_ms` (each op's slowest rank, summed over 116), p99 lower beyond the interval and mean not higher; `check_1008_bench.py verdict candidate-55-mark-1008-tp4`. Before the arms, a kernel job on dgx4 runs the PR's pytest, sparknet's unit tests and the PR's own bench in two containers of the candidate image ([check_1008_tests.py](check_1008_tests.py), [bundles/mark-1008-boot1](bundles/mark-1008-boot1), [-boot2](bundles/mark-1008-boot2)).",
+ "files": {
+  "experiments/2026-10-26-spark-ds41f-candidate/candidate-55/bench_roce_core_affinity.py": "09fac5253f02d42c932e0adab14e81dadc812ff903e7a491b6d370b1d212e126",
+  "experiments/2026-10-26-spark-ds41f-candidate/candidate-55/bundles/mark-1008-boot1/candidate.json": "2a2f07b8f66617c2f6efcc624b87fd066f1ec4db02c5c5d82c03b20717b58a14",
+  "experiments/2026-10-26-spark-ds41f-candidate/candidate-55/bundles/mark-1008-boot2/candidate.json": "f87e97252ac72a36e539ca6f9007f58a6eab0a27d5d495b643d991da216326a0",
+  "experiments/2026-10-26-spark-ds41f-candidate/candidate-55/check_1008_bench.py": "6107f74f53cbc32f1788ca9f316d484e9ee7578090a3c3a17e207a0a59ac87af",
+  "experiments/2026-10-26-spark-ds41f-candidate/candidate-55/check_1008_tests.py": "1d1743d4a5e79bf472c88f0d64c95564d1be61af5c201e229d485fad2c2b6924",
+  "experiments/2026-10-26-spark-ds41f-candidate/candidate-55/mark-1008-tp4.json": "ed22cf444c5d80f0fb1f585b155db05cc2067729d583dd7f551fdd62e7213cc0",
+  "experiments/2026-10-26-spark-ds41f-candidate/candidate-55/tp4-candidate-54-trace.json": "6c3b82a21ffcdf854167ea88373a87c3bda0435a4fa2d61b4c49c4d115140cee",
+  "experiments/2026-10-26-spark-ds41f-candidate/candidate-55/tp4-no978-trace.json": "651604bb6fc82f4ffda27a849555067b66598e3384735a4991109b0f0758febd"
+ },
+ "dry_run_output": [
+  "?? experiments/2026-10-26-spark-ds41f-candidate/candidate-55/bench_roce_core_affinity.py",
+  "?? experiments/2026-10-26-spark-ds41f-candidate/candidate-55/bundles/mark-1008-boot1/",
+  "?? experiments/2026-10-26-spark-ds41f-candidate/candidate-55/bundles/mark-1008-boot2/",
+  "?? experiments/2026-10-26-spark-ds41f-candidate/candidate-55/check_1008_bench.py",
+  "?? experiments/2026-10-26-spark-ds41f-candidate/candidate-55/check_1008_tests.py",
+  "?? experiments/2026-10-26-spark-ds41f-candidate/candidate-55/mark-1008-tp4.json",
+  "?? experiments/2026-10-26-spark-ds41f-candidate/candidate-55/tp4-candidate-54-trace.json",
+  "?? experiments/2026-10-26-spark-ds41f-candidate/candidate-55/tp4-no978-trace.json",
+  "== doctor (recipe, dgx site map)",
+  "configuration OK",
+  "== doctor experiments/2026-10-26-spark-ds41f-candidate/candidate-55/tp4-candidate-54-trace.json",
+  "configuration OK",
+  "== doctor experiments/2026-10-26-spark-ds41f-candidate/candidate-55/tp4-no978-trace.json",
+  "configuration OK",
+  "== lab dry-run",
+  "run candidate-55-mark-1008-tp4: 16 steps; production config/cluster.json",
+  "  1. sync node checkouts to origin/main",
+  "  2. bin/spark --cluster-config config/cluster.json cluster stop --apply --parallel",
+  "  3. kernel-lab experiments/2026-10-26-spark-ds41f-candidate/candidate-55/bundles/mark-1008-boot1@dgx4, experiments/2026-10-26-spark-ds41f-candidate/candidate-55/bundles/mark-1008-boot2@dgx4",
+  "  4. boot experiments/2026-10-26-spark-ds41f-candidate/candidate-55/tp4-candidate-54-trace.json (candidate-54)",
+  "  5. save the boot's measured step costs > results/private/determinism/candidate-55-mark-1008-tp4/curves-candidate-54.json",
+  "  6. python3 experiments/2026-10-26-spark-ds41f-candidate/candidate-55/check_1008_bench.py http://10.0.1.71:8000 --cluster-config experiments/2026-10-26-spark-ds41f-candidate/candidate-55/tp4.json --label candidate-54 --trace-dir results/private/lab/candidate-55-mark-1008-tp4/traces-candidate-54 --streams 16 --tokenize-clients 2 --warmup 15 --seconds 60 --max-ops 60000 > results/private/determinism/candidate-55-mark-1008-tp4/pr-1008-bench-candidate-54.jsonl",
+  "  7. boot experiments/2026-10-26-spark-ds41f-candidate/candidate-55/tp4-no978-trace.json (candidate-55-no978)",
+  "  8. save the boot's measured step costs > results/private/determinism/candidate-55-mark-1008-tp4/curves-candidate-55-no978.json",
+  "  9. python3 experiments/2026-10-26-spark-ds41f-candidate/candidate-55/check_1008_bench.py http://10.0.1.71:8000 --cluster-config experiments/2026-10-26-spark-ds41f-candidate/candidate-55/tp4.json --label candidate-55-no978 --trace-dir results/private/lab/candidate-55-mark-1008-tp4/traces-candidate-55-no978 --streams 16 --tokenize-clients 2 --warmup 15 --seconds 60 --max-ops 60000 > results/private/determinism/candidate-55-mark-1008-tp4/pr-1008-bench-candidate-55-no978.jsonl",
+  " 10. boot experiments/2026-10-26-spark-ds41f-candidate/candidate-55/tp4-no978-trace.json (candidate-55-no978-again)",
+  " 11. save the boot's measured step costs > results/private/determinism/candidate-55-mark-1008-tp4/curves-candidate-55-no978-again.json",
+  " 12. python3 experiments/2026-10-26-spark-ds41f-candidate/candidate-55/check_1008_bench.py http://10.0.1.71:8000 --cluster-config experiments/2026-10-26-spark-ds41f-candidate/candidate-55/tp4.json --label candidate-55-no978-again --trace-dir results/private/lab/candidate-55-mark-1008-tp4/traces-candidate-55-no978-again --streams 16 --tokenize-clients 2 --warmup 15 --seconds 60 --max-ops 60000 > results/private/determinism/candidate-55-mark-1008-tp4/pr-1008-bench-candidate-55-no978-again.jsonl",
+  " 13. boot experiments/2026-10-26-spark-ds41f-candidate/candidate-55/tp4-candidate-54-trace.json (candidate-54-again)",
+  " 14. save the boot's measured step costs > results/private/determinism/candidate-55-mark-1008-tp4/curves-candidate-54-again.json",
+  " 15. python3 experiments/2026-10-26-spark-ds41f-candidate/candidate-55/check_1008_bench.py http://10.0.1.71:8000 --cluster-config experiments/2026-10-26-spark-ds41f-candidate/candidate-55/tp4.json --label candidate-54-again --trace-dir results/private/lab/candidate-55-mark-1008-tp4/traces-candidate-54-again --streams 16 --tokenize-clients 2 --warmup 15 --seconds 60 --max-ops 60000 > results/private/determinism/candidate-55-mark-1008-tp4/pr-1008-bench-candidate-54-again.jsonl",
+  " 16. python3 experiments/2026-10-26-spark-ds41f-candidate/candidate-55/tables_arms.py candidate-55-mark-1008-tp4 candidate-54 candidate-55-no978 candidate-55-no978-again candidate-54-again > results/private/lab/candidate-55-mark-1008-tp4-table.txt"
+ ]
+}
