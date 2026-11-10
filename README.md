@@ -1,144 +1,38 @@
 # spark-ds41f
 
-Reproducible Docker/vLLM deployment, tuning, and benchmarks for DeepSeek V4.1
-Flash on a switchless three-node or four-node DGX Spark fabric.
+**DeepSeek V4.1 Flash on DGX Sparks. No switch required.\***
 
-The best validated corrected, default-enabled base is
-[candidate-40](experiments/2026-11-04-topk-live-qualification/README.md).
-[C39](experiments/2026-11-04-copy-default-screening/README.md) delivered default
-CopyDrafter behavior without a proven incremental serving-throughput gain;
-C40 retains the independent top-k scratch-read correctness fix with neutral
-aggregate serving performance. [C41's overlap simplification](experiments/2026-11-04-copy-overlap-rework/decision.md)
-was rejected after its engine and cold-prefill costs failed the stated criterion.
-The [PR qualification queue](experiments/2026-11-05-pr-screening/README.md) records
-each source, purpose, outstanding gate and decision. [C42](experiments/2026-11-05-compiler-live-qualification/qualification.md)
-records a built compiler image that failed required IKET prepare/freeze behavior,
-so no serving or performance measurement ran. Its focused
-[C45 correction](experiments/2026-11-05-compiler-prepared-rework/README.md)
-continues qualification; the compiler idea has no performance verdict.
-The metadata-only C44 proposal is withdrawn unmeasured. The built
-[C43 frontend candidate](experiments/2026-11-05-frontend-lifetime-qualification/README.md)
-failed a test-fixture invariant before serving; its distinct
-[C46 correction](experiments/2026-11-06-worker-test-isolation-rework/README.md)
-continues on C40. Preparation or build difficulty is not a performance rejection.
-Each completed round reports compatible saved1030, C36, previous and current
-builds, signed changes, both repeat margins and retained adverse rows.
-The promoted release remains spark-ds41f-1030.
-Loop work follows the candidate's
-[containment scope](experiments/2026-10-26-spark-ds41f-candidate/candidate-38/README.md#loop-containment):
-preserve requested effort, end looping reasoning once, and stop continued
-degeneration while protecting legitimate repeated answers.
+A reproducible deployment of DeepSeek-V4.1-Flash-1017 across three to eight DGX Sparks:
+the Docker/vLLM build, the tuning, and every benchmark behind it. The site,
+[switchle.ss](https://switchle.ss), is rendered from this repository's manifests.
 
-Production is **spark-ds41f-1030**, serving DeepSeek-V4.1-Flash-1017 on the four-node TP4 1M
-profile on the ring the site is cabled as ([release record](experiments/2026-10-26-spark-ds41f-candidate/README.md),
-[release notes](experiments/2026-10-26-spark-ds41f-candidate/release-notes.md)). The release name is
-the date it was promoted; the model is DeepSeek's checkpoint, unchanged. It is spark-ds41f-1025
-with TileLang as the only kernel family and direct checkpoint loading, prefill yield (a short
-request's first token beside a 131K prefill in 3.3-3.6 s instead of 12.4-12.8 s), a second served
-name, `deepseek-v4.1-flash-weightless`, steered per request with msuiche's published GLP vector
-(the stock name bit-identical beside it), the DeepSeek API's effort aliases and prompt semantics,
-PDL along the decode chain and the attention front in one launch, 2-bit expert scale codes, the
-startup KV line's corrected count (11.02 full 1M contexts, #586), and a fix for an engine stop
-under mixed agent and chat traffic (#677). Temperature-0 text outputs are identical to
-spark-ds41f-1025's except for multi-chunk prompts whose final chunk has 1-128 rows (CED now
-replays a prompt's last 128 rows wherever its chunks end). Against spark-ds41f-1025 in one
-session: decode 1.9-3.6% faster at every concurrency (78.3 tok/s at one stream, 198.4 output
-tok/s at eight), decode grid steps 4.6% shorter, prefill 8.4-12.2% faster from 32K to 1M; greedy
-256/256 identical.
-On the triangle (qualified 2026-10-30, 6,144-token budget): decode 2.3-3.8% faster (63.5
-tok/s at one stream, 158.6 output tok/s at eight), prefill 4.1-7.0% faster from 32K to 500K;
-a 131K prefill beside 3 or 6 streams with short requests waiting is 3.7-4.6% slower, while
-those requests' first token comes 2-8x sooner; greedy 256/256 identical. The recipe and lock are frozen in
-[releases/spark-ds41f-1030](releases/spark-ds41f-1030/); spark-ds41f-1025's, the rollback, in
-[releases/spark-ds41f-1025](releases/spark-ds41f-1025/).
+- **Native weights.** DeepSeek's checkpoint, unchanged: the published FP8/FP4/BF16 weights
+  and tokenizer, loaded directly. Nothing is re-quantized.
+- **Correct first.** DeepSeek's reference arithmetic term for term, temperature-0 outputs
+  that do not depend on the batch, and a determinism gate and release tests that every
+  promotion passes ([docs/testing.md](docs/testing.md)).
+- **Then fast.** Every speed-up lands as a measured experiment against the release before
+  it, and the unfavourable runs are kept ([docs/methodology.md](docs/methodology.md)).
 
-Before spark-ds41f-1030, production was **spark-ds41f-1025**, serving DeepSeek-V4.1-Flash-1017 on the
-four-node TP4 1M profile on the ring (since 2026-10-26; on the three-node TP3 1M profile on the
-triangle from 2026-10-25 22:18 until 2026-10-26 08:10) ([release record](experiments/2026-10-25-spark-ds41f-candidate/README.md),
-[release notes](experiments/2026-10-25-spark-ds41f-candidate/release-notes.md)). It is spark-ds41f-1022 with
-every serving kernel in TileLang (except NCCL and a few rare-path ATen copies), the CED row
-selection's nonfinal row skip with the ring's long-prefill budget at 16,384, fresh random draws in
-each block-verification round (a backport of vllm-project/vllm#61161), fixes for a `prompt_logprobs`
-request that killed the engine and for `logprob_token_ids` under speculative decoding, the
-tokenizer's generation controls and the DeepSeek API's `thinking` switch (#447), every response's
-prompt-cache hits in its usage (#469), glibc malloc pinned in every process (#439's memory growth),
-GLP steering available but off unless configured (#401, msuiche's, reworked), the JIT monitor off,
-and the live names moved to spark-ds41f (container, image, labels, paths, variables and caches).
-Temperature-0 text outputs are identical to spark-ds41f-1022's; image answers differ (the TileLang
-vision tower follows DeepSeek's reference arithmetic) and score the same on public benchmarks. At
-most 32 top logprobs are served (the default is 20). Against spark-ds41f-1022 in one session: prefill is 11.8-13.9% faster from
-32K to 1M (the 16,384 budget with the CED skip), decode grid steps are 2.4% shorter, and c16,
-c8, Poisson and one-stream throughput are the same (75.3 tok/s at one stream, 194.9 at eight).
-On the triangle, with its budget doubled to 8,192: prefill 25.5-28.2% faster from 32K to 500K
-and 22.5% at 1M, decode grid steps 1.65% shorter, and the rest the same (60.5 tok/s at one
-stream, 154.7 at eight).
-spark-ds41f-1022's recipe and lock are frozen in `experiments/2026-10-23-next-release/1022`.
+| | |
+| --- | --- |
+| Context | 1,048,576 tokens in one request |
+| Sessions | 16 at once on four or more Sparks, 8 on three |
+| Prompt cache | a KV pool that holds 11 full 1M contexts (5 on three Sparks); every response reports its cache hits |
+| Fabrics | switchless: a triangle of three or a ring of four; switched\*: three to eight |
+| Speed | DSpark and CopyDrafter speculative decoding, the CED row skip, prefill yield, TileLang kernels, one-shot RoCE collectives; current numbers in [Performance](#performance) |
+| Steering | [weightless](https://weightle.ss): a second served name, `deepseek-v4.1-flash-weightless`, steered per request by a GLP vector, with the stock name bit-identical beside it |
+| API | OpenAI-compatible, with the DeepSeek API's effort aliases and `thinking` switch |
 
-Before spark-ds41f-1025, production was **spark-ds41f-1022**, serving DeepSeek-V4.1-Flash-1017 on the four-node TP4
-1M profile on the ring the site is cabled as (2026-10-23; the three-node TP3 1M profile on the
-triangle since 2026-10-22,
-[promotion record](experiments/2026-10-22-spark-ds41f-1022/README.md)), the first release named
-`spark-ds41f-MMDD`. It is r6x with the TP group's broadcast on sparknet's one-shot all-gather
-(serving never touches the PyTorch NCCL process group), sink detection and draft-zero rejection
-on by default for DeepSeek V4.1 (short prompts such as `Say hi.` no longer collapse to an empty
-answer), late admission (the next step is decided at decoder layer 30, so an arrival joins one
-step sooner), control-token spellings in request text kept as plain text (#449), and sparknet
-0.5.0's wider one-shot read phase. Outputs are identical to r6x's. Against r6x in one session on the triangle,
-decode steps are 1.1% faster and eight streams, one stream and prefill level (prefill once
-vLLM 0226 restored it); time to first token is level at four and eight streams, and a request
-alone waits one decode step longer (sink rejection holds its first token one step). On the ring,
-against r6x in one session, decode steps are 1.7% faster and sixteen streams, one stream and
-prefill level, outputs identical. r6x's recipe and lock are frozen in
-`experiments/2026-10-22-spark-ds41f-1022/r6x`.
+\* We do support switches: `tp3-switched` to `tp8-switched`, qualified since
+spark-ds41f-1107 ([docs/switched-fabric.md](docs/switched-fabric.md)). We just never needed one.
 
-Before spark-ds41f-1022, production was **r6x**, serving DeepSeek-V4.1-Flash-1017 on the four-node TP4 1M
-profile on the ring (2026-10-19,
-[promotion record](experiments/2026-10-18-r6x/README.md)), then on the triangle. r6x is r6v with the routed
-experts' SwiGLU over the dispatch layout's live tiles, the routed experts' weight scales
-kept as row bases and 4-bit codes (exact, about 2.1 GiB a rank freed), and a DSpark draft
-budget that is a rule of the inputs (row cost 0.035), so nothing is timed at boot. Outputs
-are identical to r6v's; against r6v decode steps are 2.5% faster and 16 and 8 streams 3.6%
-and 3.8% faster, prefill level. The three-node TP3 profile served r6x at 1M context from
-2026-10-19 (KV for five full 1M contexts at once, from the memory the scale codes freed;
-[experiments/2026-10-19-r6x-tp3-1m](experiments/2026-10-19-r6x-tp3-1m/README.md)). r6v's recipe and lock are frozen
-in `experiments/2026-10-18-r6x/r6v`.
-
-Before r6x, production was **r6v** on both profiles: the
-four-node TP4 1M profile on the ring (2026-10-17,
-[promotion record](experiments/2026-10-17-r6v/README.md)), and the three-node TP3
-512K profile on the triangle, whose path is r6u's (2026-10-17,
-[promotion record](experiments/2026-10-17-r6u/README.md)). r6v is r6u with
-Engram's sequence-parallel row exchange relayed through the neighbours on the
-four-node ring, which has no cable between ranks two apart; against r6n, the
-ring's previous release, prefill is 3.2-4.2% faster from 32K to 1M and decode is
-level. r6u's recipe and lock are frozen in `experiments/2026-10-17-r6v/r6u` (r6s's in
-`experiments/2026-10-17-r6u/r6s`, r6n's in `experiments/2026-10-16-r6s/r6n`). r6u is r6s with every kernel prepared before
-any distributed work: each rank compiles its declared TileLang calls, TileKernels'
-warm calls and the step's Triton kernels before memory profiling, freezes
-TileLang's cache, and meets the other ranks on liveness, so a rank with a cold
-cache can no longer stall a one-shot collective at startup. It follows DeepSeek's
-current reference for both V4.1 Flash checkpoints (WO-A's input through
-`act_quant`, prepared once per row in the attention's output store; the
-2026-10-16 encoding fix), serves the 1017 checkpoint with DeepSeek's sampling
-defaults (temperature 1.0, top_p 1.0), and passes the release tests
-([docs/testing.md](docs/testing.md)) as part of every promotion. Prefill and
-decode are level with r6s on 1017; outputs differ from r6s's by WO-A's input
-quantization. r6s is r6n with faster Engram prefill: the rows of tokens the host already knows are read before the
-step, Engram's sequence-parallel product is exchanged all-to-all instead of
-all-gathered, and each rank's disk shard is whole hash columns, every third (or
-fourth), so every rank reads every n-gram order and the ranks finish together.
-Prefill is 4.8-5.6% faster, decode is level, and the temperature-0 text and the
-model's distributions are identical to r6n's. r6n is r6k with Engram rows
-read by a native worker in layer order and gathered in TileLang (one bounded
-wait per table, this rank's rows only), collectives that stop on a timed-out
-wait instead of falling back or computing on unwritten buffers, a host
-rendezvous at startup, no compile on the decode path, and kernels that keep a
-NaN rather than hide it. Its decode steps are 2.2% shorter, prefill and
-throughput are level, and its temperature-0 text is identical to r6k's. r6k
-before it removed the last known deviation from DeepSeek's reference
-precision: FP32 logits, an exact FP32 mHC projection, the shared expert's
-SwiGLU in FP32, MoE partials rounded once, WO on BF16 activations, and
-temperature-0 outputs that do not depend on the batch.
+Production is **spark-ds41f-1107**, serving DeepSeek-V4.1-Flash-1017 at 1M context
+([release record](experiments/2026-10-26-spark-ds41f-candidate/README.md),
+[release notes](experiments/2026-10-26-spark-ds41f-candidate/release-notes.md), frozen in
+[releases/spark-ds41f-1107](releases/spark-ds41f-1107/)). It is the first release qualified on
+every shape of the recipe: the switchless ring and triangle, and three to eight Sparks through a
+switch. [Release history](#release-history) has what each release changed and measured.
 
 The promoted kernel family is **TileLang** (r6): TileLang kernels for SM121,
 with DeepSeek's TileKernels and the one-shot RoCE collectives of
@@ -153,17 +47,17 @@ has both recipes and their benchmarks, and the
 compares the two families kernel by kernel.
 [docs/fundamentals.md](docs/fundamentals.md) explains the model itself: GEMM
 shapes, number formats, one decoder layer, attention, mHC, Engram, DSpark, and
-how TP3 and TP4 split the layers. Interactive manifest-driven status and
-benchmark charts are in [docs/index.html](docs/index.html).
+how TP3 and TP4 split the layers. The site, [switchle.ss](https://switchle.ss), is
+[docs/index.html](docs/index.html): the page in [site/index.html](site/index.html)
+with the manifests' numbers embedded by `scripts/render_docs.py`.
 
-The deployment tools also generate and validate a
-[four-node switchless ring](docs/switchless-topology.md). One recipe,
-[config/cluster.json](config/cluster.json), serves every shape on one image:
-four nodes in a ring (`tp4-ring`, the checkpoint's full 1,048,576-token
-context with 16 sequences, benchmarked at those limits, see
-[Performance](#performance)) and three in a triangle (`tp3-triangle`, the same
-1,048,576-token context with 8 sequences since r6x). The shapes differ only in their
-cabling (node map, transport, NCCL settings) and their memory sizing.
+One recipe, [config/cluster.json](config/cluster.json), serves every shape on one image:
+four nodes in a [switchless ring](docs/switchless-topology.md) (`tp4-ring`, the checkpoint's
+full 1,048,576-token context with 16 sequences, benchmarked at those limits, see
+[Performance](#performance)), three in a triangle (`tp3-triangle`, the same 1,048,576-token
+context with 8 sequences since r6x), and three to eight through a switch (`tp3-switched` to
+`tp8-switched`, [docs/switched-fabric.md](docs/switched-fabric.md)). The shapes differ only in
+their cabling (node map, transport, NCCL settings) and their memory sizing.
 
 This repository is being promoted from a forensic capture of the running cluster
 into its only operational source of truth. Until the transition checklist is
@@ -172,8 +66,8 @@ state, or an experiment.
 
 ## Quick start
 
-You need three DGX Sparks cabled as a triangle, or four cabled as a ring, on
-DGX OS 26.09.2 or later. Each node needs about 480 GiB of free disk, Docker
+You need three DGX Sparks cabled as a triangle, four cabled as a ring, or three
+to eight cabled into a switch, on DGX OS 26.09.2 or later. Each node needs about 480 GiB of free disk, Docker
 with the NVIDIA runtime, and passwordless SSH and `sudo` from the head node.
 Two Sparks are not supported. [docs/setup.md](docs/setup.md) is the full
 guide: what each stage changes on your machines, how to check it, and how to
@@ -184,6 +78,7 @@ undo it.
 | 3 | `tp3-triangle-4k` | 262,144 | stock 4 KiB | not needed |
 | 3 | `tp3-triangle` | 1,048,576 | 64 KiB | required |
 | 4 | `tp4-ring` | 1,048,576 | 64 KiB | required |
+| 3 to 8, switched | `tp3-switched` to `tp8-switched` ([docs/switched-fabric.md](docs/switched-fabric.md)) | 1,048,576 | 64 KiB | required |
 
 Name your cabling once with `bin/spark site shape NAME --apply`; every command
 then resolves the recipe at that shape (`--shape NAME` overrides it). A site that
@@ -216,12 +111,12 @@ unless told to ([launch preflight](docs/doctor.md#launch-preflight)).
 ## Current baseline
 
 The baseline is
-[manifests/baselines/2026-10-30-spark-ds41f-1030.json](manifests/baselines/2026-10-30-spark-ds41f-1030.json)
+[manifests/baselines/2026-11-07-spark-ds41f-1107.json](manifests/baselines/2026-11-07-spark-ds41f-1107.json)
 ([release record](experiments/2026-10-26-spark-ds41f-candidate/README.md),
 [release notes](experiments/2026-10-26-spark-ds41f-candidate/release-notes.md)), on the ring
-(`tp4-ring`) and the triangle (`tp3-triangle`) at 1M context.
-See [docs/current-state.md](docs/current-state.md) and the manifest-driven dashboard in
-[docs/index.html](docs/index.html) (regenerated and verified by `scripts/render_docs.py`).
+(`tp4-ring`), the triangle (`tp3-triangle`) and three to eight Sparks through a switch, at 1M
+context. See [docs/current-state.md](docs/current-state.md) and [switchle.ss](https://switchle.ss)
+([docs/index.html](docs/index.html), regenerated and verified by `scripts/render_docs.py`).
 
 <!-- BEGIN GENERATED: current-baseline-summary -->
 | Shape | Ranks & transport | Context | Sequences | Batch budget | KV pool / rank | Min free RAM (head / workers) | Full contexts held (startup line) | Qualified reference |
@@ -771,6 +666,162 @@ at 95% confidence; temperature-0 outputs differ between identical requests
 threshold), which moves acceptance from sample to sample. Report:
 [decode, prefill, prefix cache, and admission](manifests/benchmarks/2026-09-29-karmic-kraken-r5l.json).
 See [Benchmarking](#benchmarking) to reproduce them.
+
+## Release history
+
+Production is **spark-ds41f-1107**, serving DeepSeek-V4.1-Flash-1017 at 1M context
+([release record](experiments/2026-10-26-spark-ds41f-candidate/README.md),
+[release notes](experiments/2026-10-26-spark-ds41f-candidate/release-notes.md)). It is
+spark-ds41f-1030 with vLLM 0568-0761 (641 active patches), the TileLang compiler refresh and
+sparknet's single-slot one-shot all-reduce cap, and it is qualified for the first time on every
+shape: `tp4-ring` and `tp3-triangle`, and `tp3-switched` to `tp8-switched` (tensor-parallel
+sizes 3 to 8 with padded uneven shards, vLLM 0756-0759). Against spark-ds41f-1030 in one session
+on the ring: paired decode +5.30% at sixteen streams (272.86 output tok/s), +4.04% at eight
+(207.45) and +4.92% at one (82.62 tok/s); decode grid steps 14.36% shorter (20 of 20 shapes);
+prefill 8.34-17.05% faster from 32K to 1M; a short request's first token beside a 131K prefill
+in 1.02 s with 3 streams (3.30 s) and 1.44 s with 11 (3.59 s); greedy 256/256 identical. On the
+triangle: paired decode +1.70% at eight streams (160.80 output tok/s), +2.04% at four (123.73)
+and +2.59% at one (64.28 tok/s); decode grid steps 15.36% shorter (15 of 15 shapes); prefill
+2.99-10.55% faster from 32K to 1M; greedy 256/256 identical. The recipe and lock are frozen in
+[releases/spark-ds41f-1107](releases/spark-ds41f-1107/); spark-ds41f-1030's, the rollback, in
+[releases/spark-ds41f-1030](releases/spark-ds41f-1030/).
+
+Before spark-ds41f-1107, production was **spark-ds41f-1030**, serving DeepSeek-V4.1-Flash-1017 on the four-node TP4 1M
+profile on the ring the site is cabled as ([release record](experiments/2026-10-26-spark-ds41f-candidate/README.md),
+[release notes](experiments/2026-10-26-spark-ds41f-candidate/release-notes.md)). The release name is
+the date it was promoted; the model is DeepSeek's checkpoint, unchanged. It is spark-ds41f-1025
+with TileLang as the only kernel family and direct checkpoint loading, prefill yield (a short
+request's first token beside a 131K prefill in 3.3-3.6 s instead of 12.4-12.8 s), a second served
+name, `deepseek-v4.1-flash-weightless`, steered per request with msuiche's published GLP vector
+(the stock name bit-identical beside it), the DeepSeek API's effort aliases and prompt semantics,
+PDL along the decode chain and the attention front in one launch, 2-bit expert scale codes, the
+startup KV line's corrected count (11.02 full 1M contexts, #586), and a fix for an engine stop
+under mixed agent and chat traffic (#677). Temperature-0 text outputs are identical to
+spark-ds41f-1025's except for multi-chunk prompts whose final chunk has 1-128 rows (CED now
+replays a prompt's last 128 rows wherever its chunks end). Against spark-ds41f-1025 in one
+session: decode 1.9-3.6% faster at every concurrency (78.3 tok/s at one stream, 198.4 output
+tok/s at eight), decode grid steps 4.6% shorter, prefill 8.4-12.2% faster from 32K to 1M; greedy
+256/256 identical.
+On the triangle (qualified 2026-10-30, 6,144-token budget): decode 2.3-3.8% faster (63.5
+tok/s at one stream, 158.6 output tok/s at eight), prefill 4.1-7.0% faster from 32K to 500K;
+a 131K prefill beside 3 or 6 streams with short requests waiting is 3.7-4.6% slower, while
+those requests' first token comes 2-8x sooner; greedy 256/256 identical. The recipe and lock are frozen in
+[releases/spark-ds41f-1030](releases/spark-ds41f-1030/); spark-ds41f-1025's, the rollback, in
+[releases/spark-ds41f-1025](releases/spark-ds41f-1025/).
+
+Before spark-ds41f-1030, production was **spark-ds41f-1025**, serving DeepSeek-V4.1-Flash-1017 on the
+four-node TP4 1M profile on the ring (since 2026-10-26; on the three-node TP3 1M profile on the
+triangle from 2026-10-25 22:18 until 2026-10-26 08:10) ([release record](experiments/2026-10-25-spark-ds41f-candidate/README.md),
+[release notes](experiments/2026-10-25-spark-ds41f-candidate/release-notes.md)). It is spark-ds41f-1022 with
+every serving kernel in TileLang (except NCCL and a few rare-path ATen copies), the CED row
+selection's nonfinal row skip with the ring's long-prefill budget at 16,384, fresh random draws in
+each block-verification round (a backport of vllm-project/vllm#61161), fixes for a `prompt_logprobs`
+request that killed the engine and for `logprob_token_ids` under speculative decoding, the
+tokenizer's generation controls and the DeepSeek API's `thinking` switch (#447), every response's
+prompt-cache hits in its usage (#469), glibc malloc pinned in every process (#439's memory growth),
+GLP steering available but off unless configured (#401, msuiche's, reworked), the JIT monitor off,
+and the live names moved to spark-ds41f (container, image, labels, paths, variables and caches).
+Temperature-0 text outputs are identical to spark-ds41f-1022's; image answers differ (the TileLang
+vision tower follows DeepSeek's reference arithmetic) and score the same on public benchmarks. At
+most 32 top logprobs are served (the default is 20). Against spark-ds41f-1022 in one session: prefill is 11.8-13.9% faster from
+32K to 1M (the 16,384 budget with the CED skip), decode grid steps are 2.4% shorter, and c16,
+c8, Poisson and one-stream throughput are the same (75.3 tok/s at one stream, 194.9 at eight).
+On the triangle, with its budget doubled to 8,192: prefill 25.5-28.2% faster from 32K to 500K
+and 22.5% at 1M, decode grid steps 1.65% shorter, and the rest the same (60.5 tok/s at one
+stream, 154.7 at eight).
+spark-ds41f-1022's recipe and lock are frozen in `experiments/2026-10-23-next-release/1022`.
+
+Before spark-ds41f-1025, production was **spark-ds41f-1022**, serving DeepSeek-V4.1-Flash-1017 on the four-node TP4
+1M profile on the ring the site is cabled as (2026-10-23; the three-node TP3 1M profile on the
+triangle since 2026-10-22,
+[promotion record](experiments/2026-10-22-spark-ds41f-1022/README.md)), the first release named
+`spark-ds41f-MMDD`. It is r6x with the TP group's broadcast on sparknet's one-shot all-gather
+(serving never touches the PyTorch NCCL process group), sink detection and draft-zero rejection
+on by default for DeepSeek V4.1 (short prompts such as `Say hi.` no longer collapse to an empty
+answer), late admission (the next step is decided at decoder layer 30, so an arrival joins one
+step sooner), control-token spellings in request text kept as plain text (#449), and sparknet
+0.5.0's wider one-shot read phase. Outputs are identical to r6x's. Against r6x in one session on the triangle,
+decode steps are 1.1% faster and eight streams, one stream and prefill level (prefill once
+vLLM 0226 restored it); time to first token is level at four and eight streams, and a request
+alone waits one decode step longer (sink rejection holds its first token one step). On the ring,
+against r6x in one session, decode steps are 1.7% faster and sixteen streams, one stream and
+prefill level, outputs identical. r6x's recipe and lock are frozen in
+`experiments/2026-10-22-spark-ds41f-1022/r6x`.
+
+Before spark-ds41f-1022, production was **r6x**, serving DeepSeek-V4.1-Flash-1017 on the four-node TP4 1M
+profile on the ring (2026-10-19,
+[promotion record](experiments/2026-10-18-r6x/README.md)), then on the triangle. r6x is r6v with the routed
+experts' SwiGLU over the dispatch layout's live tiles, the routed experts' weight scales
+kept as row bases and 4-bit codes (exact, about 2.1 GiB a rank freed), and a DSpark draft
+budget that is a rule of the inputs (row cost 0.035), so nothing is timed at boot. Outputs
+are identical to r6v's; against r6v decode steps are 2.5% faster and 16 and 8 streams 3.6%
+and 3.8% faster, prefill level. The three-node TP3 profile served r6x at 1M context from
+2026-10-19 (KV for five full 1M contexts at once, from the memory the scale codes freed;
+[experiments/2026-10-19-r6x-tp3-1m](experiments/2026-10-19-r6x-tp3-1m/README.md)). r6v's recipe and lock are frozen
+in `experiments/2026-10-18-r6x/r6v`.
+
+Before r6x, production was **r6v** on both profiles: the
+four-node TP4 1M profile on the ring (2026-10-17,
+[promotion record](experiments/2026-10-17-r6v/README.md)), and the three-node TP3
+512K profile on the triangle, whose path is r6u's (2026-10-17,
+[promotion record](experiments/2026-10-17-r6u/README.md)). r6v is r6u with
+Engram's sequence-parallel row exchange relayed through the neighbours on the
+four-node ring, which has no cable between ranks two apart; against r6n, the
+ring's previous release, prefill is 3.2-4.2% faster from 32K to 1M and decode is
+level. r6u's recipe and lock are frozen in `experiments/2026-10-17-r6v/r6u` (r6s's in
+`experiments/2026-10-17-r6u/r6s`, r6n's in `experiments/2026-10-16-r6s/r6n`). r6u is r6s with every kernel prepared before
+any distributed work: each rank compiles its declared TileLang calls, TileKernels'
+warm calls and the step's Triton kernels before memory profiling, freezes
+TileLang's cache, and meets the other ranks on liveness, so a rank with a cold
+cache can no longer stall a one-shot collective at startup. It follows DeepSeek's
+current reference for both V4.1 Flash checkpoints (WO-A's input through
+`act_quant`, prepared once per row in the attention's output store; the
+2026-10-16 encoding fix), serves the 1017 checkpoint with DeepSeek's sampling
+defaults (temperature 1.0, top_p 1.0), and passes the release tests
+([docs/testing.md](docs/testing.md)) as part of every promotion. Prefill and
+decode are level with r6s on 1017; outputs differ from r6s's by WO-A's input
+quantization. r6s is r6n with faster Engram prefill: the rows of tokens the host already knows are read before the
+step, Engram's sequence-parallel product is exchanged all-to-all instead of
+all-gathered, and each rank's disk shard is whole hash columns, every third (or
+fourth), so every rank reads every n-gram order and the ranks finish together.
+Prefill is 4.8-5.6% faster, decode is level, and the temperature-0 text and the
+model's distributions are identical to r6n's. r6n is r6k with Engram rows
+read by a native worker in layer order and gathered in TileLang (one bounded
+wait per table, this rank's rows only), collectives that stop on a timed-out
+wait instead of falling back or computing on unwritten buffers, a host
+rendezvous at startup, no compile on the decode path, and kernels that keep a
+NaN rather than hide it. Its decode steps are 2.2% shorter, prefill and
+throughput are level, and its temperature-0 text is identical to r6k's. r6k
+before it removed the last known deviation from DeepSeek's reference
+precision: FP32 logits, an exact FP32 mHC projection, the shared expert's
+SwiGLU in FP32, MoE partials rounded once, WO on BF16 activations, and
+temperature-0 outputs that do not depend on the batch.
+
+In the candidate rounds before spark-ds41f-1107, the best validated corrected,
+default-enabled base was
+[candidate-40](experiments/2026-11-04-topk-live-qualification/README.md).
+[C39](experiments/2026-11-04-copy-default-screening/README.md) delivered default
+CopyDrafter behavior without a proven incremental serving-throughput gain;
+C40 retains the independent top-k scratch-read correctness fix with neutral
+aggregate serving performance. [C41's overlap simplification](experiments/2026-11-04-copy-overlap-rework/decision.md)
+was rejected after its engine and cold-prefill costs failed the stated criterion.
+The [PR qualification queue](experiments/2026-11-05-pr-screening/README.md) records
+each source, purpose, outstanding gate and decision. [C42](experiments/2026-11-05-compiler-live-qualification/qualification.md)
+records a built compiler image that failed required IKET prepare/freeze behavior,
+so no serving or performance measurement ran. Its focused
+[C45 correction](experiments/2026-11-05-compiler-prepared-rework/README.md)
+continues qualification; the compiler idea has no performance verdict.
+The metadata-only C44 proposal is withdrawn unmeasured. The built
+[C43 frontend candidate](experiments/2026-11-05-frontend-lifetime-qualification/README.md)
+failed a test-fixture invariant before serving; its distinct
+[C46 correction](experiments/2026-11-06-worker-test-isolation-rework/README.md)
+continues on C40. Preparation or build difficulty is not a performance rejection.
+Each completed round reports compatible saved1030, C36, previous and current
+builds, signed changes, both repeat margins and retained adverse rows.
+Loop work follows the candidate's
+[containment scope](experiments/2026-10-26-spark-ds41f-candidate/candidate-38/README.md#loop-containment):
+preserve requested effort, end looping reasoning once, and stop continued
+degeneration while protecting legitimate repeated answers.
 
 ## Names
 
