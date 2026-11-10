@@ -429,3 +429,105 @@ What the rules guard against (each found the hard way, 2026-10-11):
   derives: an arm of one sets the directory it ran with; to compare their step costs, boot
   each with an empty cost directory and `SPARK3_DSPARK_PROFILE_TOKENS=random`
   (experiments/2026-10-11-c16-cost).
+
+## Candidate tooling
+
+`bin/spark candidate` runs the candidate process's orchestration steps
+([release-benchmark.md](release-benchmark.md#candidates)) from the owner's laptop, the one
+host that reaches both the dgx and the spaceport networks. It drives each testbed's head over
+ssh:
+
+| Testbed | Head | Shape profile |
+| --- | --- | --- |
+| `tp4-ring` | dgx1 (dgx2..dgx4) | `tp4.json` |
+| `tp4-switched` | sp1 (sp2..sp4) | `tp4-switched.json` |
+| `tp3-switched` | sp5 (sp6, sp7) | `tp3-switched.json` |
+
+Every node's checkout is `~/projects/spark-ds41f` and its production profile
+`config/cluster.json`.
+
+- **ssh:** every call has a 10 s connect timeout, an overall timeout and retries. A remote
+  read ends with a sentinel, so output cut short is retried and never read as an empty result.
+  Steps that are not idempotent (`queue add`, `window close`) are not retried blindly: `queue`
+  reads the queue again before adding a second time.
+- **Plans:** commands that change anything print the exact remote commands (each runs under
+  `bash -lc` on its node) and act only with `--apply`.
+
+The commands:
+- **`candidate status [testbed...]`:** the hold's holder and `current`; the running, pending,
+  last done and last failed queue entries; the idle watcher and queue runner; the serving
+  container's image and profile.
+- **`candidate queue <testbed> <spec>... [--idle-minutes 10] [--log-name NAME] [--apply]`:**
+  - It refuses a hold that is not the lab queue's.
+  - While a job runs, or a pending one is about to start in an open window, it never moves the
+    checkout. Each job's `sync` moves the checkouts to origin/main when the job starts, and a
+    spec is queued from the node's checkout. So it queues only specs that are there and
+    identical to origin/main; otherwise it refuses and says to retry when the queue is idle.
+  - Otherwise it detaches the head at origin/main and runs `cluster sync --apply`. Then it
+    dry-runs and lints each spec, refusing on any problem, and queues it. Last, unless a window
+    is open or a watcher runs, it starts `scripts/lab_idle_start.sh` detached (`setsid -f`),
+    logging the runner to `results/private/lab/NAME-window.log`.
+  - A run that is already pending or running is not queued again.
+- **`candidate wait [testbed...] [--timeout S] [--interval S]`:** blocks until an entry
+  arrives in `done/` or `failed/`, then prints it and each queue's state.
+  - The two directories are compared as sets, each listed on its own, so a running entry never
+    reads as finished.
+  - A read that fails is no change.
+  - It exits 0 on a change and 2 on timeout.
+- **`candidate ship <image> --from <host> --to <testbed>... [--profile-dir DIR] [--queue TESTBED=SPEC,...] [--apply]`:**
+  - It waits until the image exists on the source.
+  - It streams it once through the laptop to the first spaceport head (one stream at a time),
+    then over the fabric head to head.
+  - Once each testbed's queue runs nothing, it detaches the head, runs `cluster sync --apply`
+    and `build distribute --apply` with `DIR/<shape>.json`. `DIR` defaults to the candidate
+    folder named by the tag.
+  - It checks that every node shows the source's image ID, and prints the IDs.
+  - Running it again resumes: a head or node with the right ID is skipped.
+  - `--queue` queues specs only after a testbed's IDs verify.
+- **`candidate gate <testbed> <run> [--expect REF/LONG] [--expect-text REF/LONG]`:** for each
+  `determinism-*.jsonl` and `greedy-*.jsonl` of the run:
+  - `identical`, the hashes and every scenario with token or log-probability differences,
+    with each differing request's prompt and first-diff positions;
+  - `--expect` is the log-probability run's `reference_sha256`/`long_sha256`, and
+    `--expect-text` the text hashes (`reference_text_sha256`/`long_text_sha256`), so a text
+    hash is never compared with a log-probability hash.
+- **`candidate verdicts <testbed> <run or queue entry>`:** each table's verdict block from the
+  entry's window-log segment, which runs from `QUEUE job X started` to `QUEUE job X done` or
+  `failed`. The table files are overwritten when a spec has two measure jobs. It also prints:
+  - each arm's headline numbers: closed-loop tok/s per concurrency, prefill tok/s per size, the
+    model step's acceptance length and perplexity, and boot ready times;
+  - failed bench steps, by suite, and the tracebacks in the segment.
+- **`candidate receipts <testbed> <run or queue entry> <dest> [--force] [--apply]`:** copies
+  the run's evidence into `<dest>`, a folder under a candidate's `receipts/`:
+  - `lab/`: the run's tables, `overlays-<run>.txt`, the window-log segment as
+    `lab/<run>-window.log` (`*.log` is git-ignored: add it with `git add -f`) and any
+    `lab/<run>/`;
+  - `determinism/<run>/`;
+  - `suites/<run>/` and its companions. Each `model.json.gz` stays on the node, with its
+    sha256, bytes and location in `large-files-on-nodes.tsv`; engine logs are left out.
+  - It refuses a run that has not finished, and never overwrites without `--force`.
+- **`candidate overlay <folder> <name> --tree HOST:TREE --revert COMMIT [--profiles tp4,...] [--allow-later] [--note TEXT] [--apply]`:**
+  a revert control for a pure-Python patch:
+  - the files COMMIT modifies outside `tests/`, at their `COMMIT^` versions, into
+    `<folder>/<name>/overlay/`, by `git archive` of exactly those files;
+  - `<shape>-<name>.json`, which extends `<folder>/<shape>.json` with the base's mounts plus one
+    read-only mount per file at `/opt/spark-ds41f/candidate/vllm/<path>`;
+  - `<shape>-<name>-dev.json` with `VLLM_SERVER_DEV_MODE=1`.
+
+  It refuses a commit that changes no such file, one that adds, deletes or renames files, and
+  one whose files a later commit in the tree also touches. `--allow-later` overrides the last:
+  the overlay then reverts the later change too. The notes cite no hash.
+- **`candidate close <testbed> [--apply]`:** `scripts/lab.py window close` when nothing is
+  running or pending, then `doctor --live`. It never writes `~/spark-request.json`: the
+  runner reads that file between steps and stops the running job.
+- **`candidate lint <file>...`:** `queue` and `overlay` run the same checks:
+  - a profile's notes cite no hex hash but the image's own tree labels and its lock's patch
+    heads;
+  - JSON and Markdown files end in exactly one newline;
+  - a spec's arms name profiles that exist.
+
+```bash
+bin/spark candidate queue tp4-switched experiments/2026-10-26-spark-ds41f-candidate/candidate-<N>/screen-tp4-switched.json --apply
+bin/spark candidate wait tp4-switched tp3-switched
+bin/spark candidate verdicts tp4-switched candidate-<N>-screen-tp4-switched
+```

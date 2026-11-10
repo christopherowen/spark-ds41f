@@ -33,6 +33,9 @@ only. Several candidates are tested at once, one per testbed. Every PR that pass
 PR that misses goes to rework ([methodology](methodology.md#round-purpose-report-and-drop-rule)).
 Each round follows the steps below. Candidates 47-49 are the worked example
 ([experiments/2026-10-26-spark-ds41f-candidate](../experiments/2026-10-26-spark-ds41f-candidate/README.md)).
+The steps that drive the testbeds (queueing, waiting, image copies, gates, verdicts, receipts,
+controls, closing a window) are `bin/spark candidate` commands, run from the owner's laptop
+([lab.md](lab.md#candidate-tooling)).
 
 Owner rules for these rounds (2026-11-09):
 - Testing on the dgx and spaceport nodes needs no further approval, and neither does
@@ -136,6 +139,9 @@ bin/spark --cluster-config <dir>/image-dgx4.json build prepare --only vllm --loc
   - On each head, run `bin/spark --cluster-config <dir>/<shape>.json build distribute --apply`, and
     check that every node shows the same image ID. Over the fabric this took 4–6 minutes for
     3–4 ranks.
+  - `bin/spark candidate ship spark-ds41f:candidate-<N> --from dgx1 --to tp4-switched tp3-switched --apply`
+    does all of this, resumably, and verifies the IDs. With `--queue <testbed>=<spec>` it then
+    queues the testbed's specs.
 - **Production first:** a spaceport window opens only with its production profile live
   (`doctor --live`). If the testbed was stopped, start 1107 there first:
   `bin/spark --cluster-config config/cluster.json cluster start --replace --apply`, after reading
@@ -145,6 +151,9 @@ bin/spark --cluster-config <dir>/image-dgx4.json build prepare --only vllm --loc
 
 Each testbed runs its candidate's gate before anything else. A startup failure then costs
 one boot instead of a release run.
+- Queue it with `bin/spark candidate queue <testbed> <dir>/candidate-<shape>.json --apply`.
+- Read it with `bin/spark candidate gate <testbed> candidate-<N>-<shape> --expect <ref>/<long>`.
+  `--expect` takes the log-probability run's hashes and `--expect-text` the text hashes.
 
 ### 6. Screen
 
@@ -152,6 +161,9 @@ one boot instead of a release run.
 `screen-tp3` at TP3, about 18 minutes a boot. It covers model behaviour (greedy identity
 against the reference), the engine grid, a closed loop (16 streams at TP4, 8 at TP3) and
 prefill at 32K and 256K.
+- `bin/spark candidate wait` returns when a queued job finishes.
+- `bin/spark candidate verdicts <testbed> <run>` prints each table's verdict block and the
+  arms' headline numbers from the window log.
 - **Reference:** the base release's `screen` run at the same shape.
   - Record it once per testbed shape: two boots of the release, as the first job of the
     round that first needs it.
@@ -188,6 +200,8 @@ prefill at 32K and 256K.
 - **Attribution:** when a core metric is worse in the release table, remove suspects one at a
   time with `no<PR>` controls on the same image. Measure only the step that moved: a suite
   file with that step alone, as in `candidate-48/grid-suite.json`.
+  `bin/spark candidate overlay <dir> no<PR> --tree <host>:<prepared tree> --revert <commit> --apply`
+  writes a control's overlay and profiles.
 - **Confirm in one session first.** A change near its margin against a recorded reference can be drift between sessions. Before attributing it to a PR, run the base and the candidate ABBA in one session.
   - On 2026-11-09, candidate-53's stall-3 read 2.1% slower against candidate-50's run from earlier the same evening. In one session the two were within one boot spread.
 - **Rework:** a miss goes to a sub-agent. It writes to `receipts/rework/pr-<N>-r<K>/`: the
@@ -195,6 +209,12 @@ prefill at 32K and 256K.
   the drop rule.
 - **Receipts:** keep every one, unfavourable runs included. `experiments/**/receipts/**` is
   exempt from whitespace checks, so receipts stay byte-for-byte.
+  `bin/spark candidate receipts <testbed> <run> <dir>/receipts/<testbed> --apply` copies a
+  run's tables, window-log segment, determinism and suite outputs, and lists the model text it
+  leaves on the node in `large-files-on-nodes.tsv`.
+- **Closing a window:** `bin/spark candidate close <testbed> --apply` closes it once its queue
+  is empty. Never write `~/spark-request.json` to end a queue: the runner reads it between
+  steps and stops the running job.
 
 ### 9. Release qualification (final benchmarking)
 
