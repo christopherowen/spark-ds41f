@@ -305,10 +305,15 @@ Open levers:
   ranks (`--mm-encoder-tp-mode weights`), saving ~0.68 GiB per rank at TP4 and
   ~0.59 GiB per rank at TP3 (with zero-weight tail padding to 18 heads / 2,880
   MLP / 5,184 aligner on TP3).
-- **Display reserve:** in use for the embedding and output head (842.5 MiB per
-  rank of the 2,032 MiB firmware carve-out; `dgx3` keeps its 8 MiB console
-  framebuffer). About 1.2 GiB remains free for read-once-per-step data
-  (`experiments/2026-09-29-display-carveout-kv`).
+- **Display reserve (`0762`, `experiments/2026-11-08-display-carveout-weight-expansion`):**
+  12-bit packed `embed_tokens` and `lm_head` dumb buffers are compacted in place
+  (`864 -> 640 MiB` at TP3, `640 -> 480 MiB` at TP4), and the remaining budget up
+  to `1,968 MiB` (leaving `64 MiB` of the `2,032 MiB` scanout reserve on `dgx3`
+  for the `8 MiB` console framebuffer) holds DSpark's `markov_w1.weight` (`64 MiB`)
+  plus decode-only DSpark routed-expert `w13_weight`/`w2_weight` slabs (`1,904 MiB`
+  buffers / `1,895.0 MiB` weights at TP3, saving `+1.23 GiB` allocated / `+1.29 GiB`
+  reserved UMA per rank; `1,968 MiB` buffers / `1,936.6 MiB` weights at TP4, saving
+  `+1.43 GiB` per rank). See `experiments/2026-09-29-display-carveout-kv`.
 - **Uneven head split instead of TP3 padding.** TP3 pads DS4.1's 64 heads and 8
   output groups to 72 and 9 with zero weights (24 heads in 3 groups per rank).
   `experiments/2026-10-03-tp3-tp4-comparison/padding.md` documents all TP3
