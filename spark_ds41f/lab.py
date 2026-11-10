@@ -334,6 +334,126 @@ def ready_seconds(lines: list[str]) -> float | None:
     return None
 
 
+# The container's kernel caches (TileLang, Triton, vLLM's compile cache, the CUDA JIT cache):
+# host directories under the cache mount, which persist across boots. Files a boot adds are
+# kernels it compiled; an image's first boot on a node compiles its changed kernels (273 and
+# 427 TileLang files in candidate-58's first boots on sp1 and sp5, none in the boots after),
+# which can add over a minute to its time to ready.
+JIT_CACHE_ENVIRONMENT = ("TILELANG_CACHE_DIR", "TRITON_CACHE_DIR", "VLLM_CACHE_ROOT", "CUDA_CACHE_PATH")
+BOOT_LEDGER = "results/private/lab/boot-ledger.jsonl"
+BOOT_PROBE = (
+    'since="$1"; image="$2"; shift 2; '
+    'echo "image $(docker image inspect --format "{{.Id}}" "$image" 2>/dev/null || echo -)"; '
+    'for d in "$@"; do [ -d "$d" ] || continue; '
+    'echo "jit $(find "$d" -type f -newermt "@$since" 2>/dev/null | wc -l) $d"; done'
+)
+
+
+def jit_cache_dirs(cluster: dict) -> list[str]:
+    """The host directories of the container's kernel caches: each cache variable's path in
+    the container mapped back through the container's mounts to a node path."""
+    environment, mounts, out = cluster.get("environment", {}), cluster.get("container", {}).get("mounts", []), []
+    for key in JIT_CACHE_ENVIRONMENT:
+        inside = environment.get(key)
+        if not inside:
+            continue
+        for mount in mounts:
+            source, target = str(mount[0]), str(mount[1]).rstrip("/")
+            if inside == target or inside.startswith(target + "/"):
+                out.append(spark.host_path(cluster, source.rstrip("/") + inside[len(target):]))
+                break
+    return list(dict.fromkeys(out))
+
+
+def parse_boot_probe(text: str) -> dict:
+    image, files = None, {}
+    for line in text.splitlines():
+        kind, _, rest = line.partition(" ")
+        if kind == "image":
+            image = None if rest.strip() in ("", "-") else rest.strip()
+        elif kind == "jit":
+            count, _, path = rest.partition(" ")
+            if count.isdigit():
+                files[Path(path).name] = int(count)
+    return {"image_id": image, "jit_new_files": files}
+
+
+def probe_boot(config: str, since: float) -> dict:
+    """Each node's image ID and the kernel-cache files created since ``since`` (epoch seconds,
+    the start command's time less a little for clock skew). A node that cannot be read is
+    left out; the probe never fails a boot."""
+    try:
+        cluster = spark.read_cluster(config)
+        dirs, image = jit_cache_dirs(cluster), cluster["container"]["image"]
+        nodes = nodes_config()
+    except Exception:  # noqa: BLE001 - an unreadable profile or node map: no record
+        return {}
+
+    def one(node: dict) -> tuple[str, dict | None]:
+        try:
+            done = subprocess.run(
+                ["ssh", *spark.ssh_options(), spark.ssh_target(nodes, node),
+                 shlex.join(["bash", "-c", BOOT_PROBE, "probe", f"{since:.0f}", image, *dirs])],
+                capture_output=True, text=True, timeout=120, stdin=subprocess.DEVNULL)
+        except Exception:  # noqa: BLE001 - a record only; it never fails the boot
+            return str(node.get("name")), None
+        return node["name"], parse_boot_probe(done.stdout) if done.returncode == 0 else None
+
+    try:
+        with concurrent.futures.ThreadPoolExecutor(max_workers=max(1, len(nodes["nodes"]))) as pool:
+            return {name: found for name, found in pool.map(one, nodes["nodes"]) if found is not None}
+    except Exception:  # noqa: BLE001
+        return {}
+
+
+def mark_first_boots(probe: dict, config: str, ready: float | None, ledger: Path | None = None) -> dict:
+    """Mark each node's boot as the image's first there when the boot ledger (one line a lab
+    boot: time, configuration, ready seconds, each node's image ID and new kernel files) has
+    no earlier boot of that image ID on that node, then append this boot."""
+    if not probe:
+        return probe
+    ledger = ledger or ROOT / BOOT_LEDGER
+    seen = set()
+    try:
+        for line in ledger.read_text().splitlines():
+            try:
+                record = json.loads(line)
+            except ValueError:
+                continue
+            for node, state in (record.get("nodes") or {}).items():
+                if state.get("image_id"):
+                    seen.add((node, state["image_id"]))
+    except OSError:
+        pass
+    for node, state in probe.items():
+        state["first_boot"] = bool(state.get("image_id")) and (node, state["image_id"]) not in seen
+    record = {"time": dt.datetime.now(dt.timezone.utc).isoformat(timespec="seconds"), "config": config,
+              "ready_s": ready, "nodes": probe}
+    try:
+        ledger.parent.mkdir(parents=True, exist_ok=True)
+        with ledger.open("a") as handle:
+            handle.write(json.dumps(record, sort_keys=True) + "\n")
+    except OSError:
+        pass
+    return probe
+
+
+def describe_boot_probe(config: str, probe: dict) -> str | None:
+    """The boot-log line after 'boot ...: ready': the nodes where this was the image's first
+    boot, and the kernel-cache files the boot added per node. candidate verdicts reads it to
+    leave first boots out of time-to-ready comparisons."""
+    if not probe:
+        return None
+    first = [node for node, state in probe.items() if state.get("first_boot")]
+    compiled = {node: sum(state.get("jit_new_files", {}).values()) for node, state in probe.items()}
+    text = f"boot {Path(config).name}: "
+    text += (f"first boot of the image on {', '.join(first)}" if first else "not the image's first boot on any node")
+    text += "; kernel cache " + ", ".join(f"{node} +{count}" for node, count in compiled.items()) + " files"
+    if any(compiled.values()):
+        text += " (kernels compiled during the boot: leave its time to ready out of comparisons)"
+    return text
+
+
 def boot(config: str, dry: bool = False) -> bool:
     # A lab window restores the promoted physical fabric. It cannot undo
     # recabling or safely clean up a candidate with a different node set.
@@ -350,8 +470,13 @@ def boot(config: str, dry: bool = False) -> bool:
     ok = spark_cli("--cluster-config", config, "cluster", "start", "--replace", "--change-shape", "--apply",
                    dry=dry, capture=lines) == 0
     if not dry:
-        log(f"boot {Path(config).name}: ready +{ready_seconds(lines)} s, command {time.time() - started:.0f} s"
+        ready = ready_seconds(lines)
+        log(f"boot {Path(config).name}: ready +{ready} s, command {time.time() - started:.0f} s"
             f"{'' if ok else ' FAILED'}")
+        probe = mark_first_boots(probe_boot(config, started - 5), config, ready)
+        line = describe_boot_probe(config, probe)
+        if line:
+            log(line)
     return ok
 
 
@@ -429,9 +554,19 @@ def stop_memory_samplers(samplers: list[tuple[str, Path, subprocess.Popen]]) -> 
     return out
 
 
+OLD_ENGINE_PEAK_KIB = 2 * 1024 ** 2  # 2 GiB
+
+
 def memory_series(text: str) -> dict:
     """A node's samples through a boot, summarized in GiB: the lowest MemAvailable (the
-    startup guard's measure) and when it fell, the lowest MemFree and the largest page cache."""
+    startup guard's measure) and when it fell, the lowest MemFree and the largest page cache.
+
+    Sampling starts with the start command, while ``cluster start --replace`` still has the
+    previous engine running: its first seconds measure that engine, not the boot. The boot's
+    own figures therefore start where MemAvailable peaks, once the old engine has stopped
+    (with no old engine, the first sample; within 2 GiB of the peak, its plateau's start).
+    The samples before it are summarized apart
+    (``before_old_engine_stopped``); the raw samples are left as they are."""
     samples = []
     for line in text.splitlines():
         fields = line.split()
@@ -448,17 +583,30 @@ def memory_series(text: str) -> dict:
     def gib(kib: int) -> float:
         return round(kib / 1024**2, 3)
 
-    lowest = min(samples, key=lambda sample: sample[1])
-    return {
+    # The old engine has stopped at the first sample within OLD_ENGINE_PEAK_KIB of the peak:
+    # a boot that fails and frees its memory again may end a little higher than that plateau.
+    peak = max(sample[1] for sample in samples)
+    stopped = next(index for index, sample in enumerate(samples) if sample[1] >= peak - OLD_ENGINE_PEAK_KIB)
+    boot, before = samples[stopped:], samples[:stopped]
+    lowest = min(boot, key=lambda sample: sample[1])
+    summary = {
         "samples": len(samples),
         "seconds": round(samples[-1][0] - start, 1),
         "first": {"available_gib": gib(samples[0][1]), "free_gib": gib(samples[0][2]), "cached_gib": gib(samples[0][3])},
+        "old_engine_stopped_at_seconds": round(samples[stopped][0] - start, 1),
+        "available_after_old_engine_stopped_gib": gib(samples[stopped][1]),
+        "cached_after_old_engine_stopped_gib": gib(samples[stopped][3]),
         "min_available_gib": gib(lowest[1]),
         "min_available_at_seconds": round(lowest[0] - start, 1),
-        "min_free_gib": gib(min(sample[2] for sample in samples)),
-        "max_cached_gib": gib(max(sample[3] for sample in samples)),
+        "min_free_gib": gib(min(sample[2] for sample in boot)),
+        "max_cached_gib": gib(max(sample[3] for sample in boot)),
         "last": {"available_gib": gib(samples[-1][1]), "free_gib": gib(samples[-1][2]), "cached_gib": gib(samples[-1][3])},
     }
+    if before:
+        summary["before_old_engine_stopped"] = {"samples": len(before),
+                                                "min_available_gib": gib(min(sample[1] for sample in before)),
+                                                "min_free_gib": gib(min(sample[2] for sample in before))}
+    return summary
 
 
 def stop_arguments(remove: bool = False) -> list[str]:
@@ -991,6 +1139,12 @@ def suite_steps(spec: dict, job: dict, arms: list[dict]) -> list[dict]:
             recorded = reference if name == suites[0] or reference is None else f"{reference}-{name}"
             table["argv"][2:] = [labels[0], recorded or "?", *labels[1:]]
             table.update(reference=recorded, suite=name, arms=len(arms), unresolved=unresolved)
+            # The reference's repeat boot is found by name (<reference>-again, a companion's
+            # <reference>-again-<suite>); "reference_repeat" names it when it is called otherwise.
+            if job.get("reference_repeat"):
+                again = job["reference_repeat"] if name == suites[0] else f"{job['reference_repeat']}-{name}"
+                table["argv"][1:1] = ["--reference-repeat", again]
+                table["reference_repeat"] = again
         steps.append(table)
     return steps
 
@@ -1037,6 +1191,12 @@ def reference_problems(step: dict) -> list[str]:
     if recorded != digest:
         problems.append(f"reference {step['reference']} is a run of suite {step['suite']} {recorded[:12]}, "
                         f"which is now {digest[:12]}; a changed suite is a new suite: measure the reference again")
+    if step.get("reference_repeat"):
+        again = ROOT / step["reference_repeat"]
+        if not (again / "suite.json").is_file():
+            problems.append(f"reference repeat {step['reference_repeat']} is not a suite run (no suite.json)")
+        elif json.loads((again / "suite.json").read_text(encoding="utf-8"))["suite_sha256"] != recorded:
+            problems.append(f"reference repeat {step['reference_repeat']} is not a run of the reference's suite")
     return problems
 
 
@@ -1994,7 +2154,9 @@ def execute(spec: dict, dry: bool, keep_open: bool, close_on_failure: bool = Tru
                         write_json_atomic(ROOT / step["startup_memory_out"], startup)
                         for name, summary in startup.items():
                             log(f"{name}: lowest MemAvailable {summary.get('min_available_gib')} GiB during the boot, "
-                                f"page cache up to {summary.get('max_cached_gib')} GiB")
+                                f"page cache up to {summary.get('max_cached_gib')} GiB"
+                                + (f" (from the old engine's stop at +{summary['old_engine_stopped_at_seconds']} s)"
+                                   if summary.get("before_old_engine_stopped") else ""))
                 if not started:
                     failed = f"boot of {step['config']} failed"
                     # A boot that dies keeps its evidence: the next boot replaces the containers.

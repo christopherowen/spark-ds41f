@@ -202,9 +202,17 @@ before the first boot. `run --dry-run` prints the problems.
   candidate, reference, candidate again; with `"reference"` (a recorded suite run, or
   `"release"`, see Recorded references) the arms are the candidate's two boots and the
   record stands in the table as the second arm. Its verdict block judges the closed loops' paired
-  decode row (requests paired by prompt) over both candidate boots against the recorded
-  A/A floor, so a lean A/B resolves about 0.3% at one stream
+  decode row (requests paired by prompt) and the engine grid's geometric mean over both
+  candidate boots against recorded A/A floors (by testbed and suite where enough repeats were
+  recorded), so a lean A/B resolves about 0.3% at one stream
   ([experiments/2026-10-26-paired-verdict](../experiments/2026-10-26-paired-verdict/README.md)).
+  When the reference has a repeat boot (an arm named `<reference>-again`, or a record beside
+  the recorded one named `<reference>-again`, `<reference>-again-<suite>` for a companion),
+  every headline row averages both boots of each side and the boot term shrinks to x0.707 of
+  one pair's; `"reference_repeat": "<path>"` on the job names a record called otherwise (the
+  plan checks it is a run of the same suite). The table's first line says which boots were
+  averaged; [release-benchmark.md](release-benchmark.md#reading-the-table) gives the arithmetic
+  and the floors.
 - **Companion suites:** `"suite": ["release-tp3", "single-stream"]` runs the release suite,
   then each further suite on the same boot of each arm, into
   `results/private/suites/<run>-<suite>/<label>` with its own table
@@ -272,6 +280,23 @@ before the first boot. `run --dry-run` prints the problems.
   lowest `MemAvailable` (the startup guard's measure) and when it fell, the lowest `MemFree`
   and the largest page cache. The guard only refuses a boot below its line; the sample shows
   the margin. The samplers stop when the boot ends, failed or not, and after an hour at most.
+  - Sampling starts with the start command, while `cluster start --replace` still runs the
+    previous engine, so the summary starts where `MemAvailable` peaks once that engine has
+    stopped (`old_engine_stopped_at_seconds`): the boot's own floor. The samples before it are
+    summarized apart (`before_old_engine_stopped`), and the raw samples are kept unchanged.
+    Before 2026-11-10 the lowest value was usually the previous container's: candidate-57's
+    "4.04-5.31 GiB at boot" on sp5 were the engines before it, and its boots' own floors were
+    6.03 and 6.02 GiB.
+- **First boots and kernel compiles:** after every boot the lab reads each node's image ID and
+  counts the files the boot added to the kernel caches (`TILELANG_CACHE_DIR`,
+  `TRITON_CACHE_DIR`, `VLLM_CACHE_ROOT`, `CUDA_CACHE_PATH`, mapped through the container's
+  mounts to node paths). It appends the boot to `results/private/lab/boot-ledger.jsonl` and logs,
+  after the `boot <profile>: ready` line, where this was the image's first boot (no earlier
+  ledger entry of that image ID on that node) and the kernel-cache files added per node. An
+  image's first boot compiles its changed kernels (candidate-58: 273 TileLang kernels on sp1,
+  427 on sp5, then none), which is not the arm's cost; `candidate verdicts` leaves such boots
+  out of time to ready when they compiled kernels (the first-boot mark alone decides only when no cache could be read, since a ledger started late marks a warm boot first). A node that cannot be read is left out; the probe never fails a boot.
+  The CUDA JIT cache may not be readable as the lab's user, and then reads as 0.
 - **Placeholders:** `{label}` and `{run}` in extras arguments become each arm's label
   and the run's name, so arms that share extras write their own outputs.
 - **Reading results:** `scripts/lab.py report RUN` prints the run's table and each
@@ -495,7 +520,10 @@ The commands:
   entry's window-log segment, which runs from `QUEUE job X started` to `QUEUE job X done` or
   `failed`. The table files are overwritten when a spec has two measure jobs. It also prints:
   - each arm's headline numbers: closed-loop tok/s per concurrency, prefill tok/s per size, the
-    model step's acceptance length and perplexity, and boot ready times;
+    model step's acceptance length and perplexity, and boot ready times, each boot marked as an
+    image's first boot (kernels compiled) or warm;
+  - time to ready per arm over its warm boots only, with the first boots it left out (a log
+    from before the lab's kernel-cache probe counts its boots as warm, and says so);
   - failed bench steps, by suite, and the tracebacks in the segment.
 - **`candidate receipts <testbed> <run or queue entry> <dest> [--force] [--apply]`:** copies
   the run's evidence into `<dest>`, a folder under a candidate's `receipts/`:

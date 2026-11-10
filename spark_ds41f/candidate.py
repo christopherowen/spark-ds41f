@@ -1355,6 +1355,10 @@ def summary_record(line: str) -> tuple[str, dict] | None:
 
 
 BOOT = re.compile(r"^\S+ boot (\S+): ready \+(\S+) s, command (\d+) s( FAILED)?")
+# lab.describe_boot_probe's line after a boot: where it was the image's first boot, and the
+# kernel-cache files it added per node.
+BOOT_PROBE = re.compile(r"^\S+ boot (\S+): (?:first boot of the image on (.+?)|not the image's first boot on any node); "
+                        r"kernel cache (.+) files")
 SUITE_STEP = re.compile(r"^servebench suite (\S+): step ")
 EXIT = re.compile(r"^\S+Z (\S+) (\S+) exit (-?\d+)$")
 
@@ -1363,6 +1367,9 @@ EXIT = re.compile(r"^\S+Z (\S+) (\S+) exit (-?\d+)$")
 class ArmNumbers:
     label: str
     boots: list = dataclasses.field(default_factory=list)  # (config, ready s, command s, failed)
+    # Per boot, parallel to boots: (first-boot nodes, kernel-cache files added) from the lab's
+    # probe line, or None for a log written before the probe.
+    probes: list = dataclasses.field(default_factory=list)
     closed: dict = dataclasses.field(default_factory=dict)  # (suite run, concurrency) -> (tps, ci95 %)
     prefill: dict = dataclasses.field(default_factory=dict)  # (suite run, tokens) -> tps
     model: dict = dataclasses.field(default_factory=dict)  # suite run -> record
@@ -1384,15 +1391,17 @@ def headline_numbers(lines: list[str], labels: list[str]) -> dict[str, ArmNumber
     """Each arm's headline numbers from a window-log segment, in the order arms appear."""
     arms: dict[str, ArmNumbers] = {}
     pending_boot = None
+    pending_probe = None
     suite = None  # the suite whose steps the log shows now
 
     def arm(label: str) -> ArmNumbers:
-        nonlocal pending_boot
+        nonlocal pending_boot, pending_probe
         if label not in arms:
             arms[label] = ArmNumbers(label)
         if pending_boot:
             arms[label].boots.append(pending_boot)
-            pending_boot = None
+            arms[label].probes.append(pending_probe)
+            pending_boot = pending_probe = None
         return arms[label]
 
     def from_output(record: dict, suffix: str) -> tuple[str, str]:
@@ -1412,6 +1421,16 @@ def headline_numbers(lines: list[str], labels: list[str]) -> dict[str, ArmNumber
             suite = None
             ready = None if booted.group(2) == "None" else float(booted.group(2))
             pending_boot = (booted.group(1), ready, int(booted.group(3)), bool(booted.group(4)))
+            pending_probe = None
+            continue
+        probed = BOOT_PROBE.match(line)
+        if probed and pending_boot:
+            files = {}
+            for part in probed.group(3).split(", "):
+                node, _, count = part.partition(" +")
+                if count.isdigit():
+                    files[node] = int(count)
+            pending_probe = ([n for n in (probed.group(2) or "").split(", ") if n], files)
             continue
         exited = EXIT.match(line)
         if exited and exited.group(2) in labels or (exited and not labels and exited.group(1) == "bench"):
@@ -1441,11 +1460,60 @@ def headline_numbers(lines: list[str], labels: list[str]) -> dict[str, ArmNumber
     return arms
 
 
+def cold_boot(probe: tuple | None) -> bool | None:
+    """A boot to leave out of time-to-ready comparisons: one that compiled kernels (an image's
+    first boot on a node does). The ledger's first-boot mark decides only when no kernel cache
+    could be read: a ledger started after an image's first boot marks its next boot first too.
+    None when the log predates the probe."""
+    if probe is None:
+        return None
+    first, files = probe
+    return any(files.values()) if files else bool(first)
+
+
+def ready_comparison(arms: dict[str, ArmNumbers]) -> list[str]:
+    """Time to ready per arm over its warm boots only: an image's first boot on a node
+    compiles its changed kernels (tens of seconds to minutes), which is not the arm's cost."""
+    lines, left_out, unknown = [], [], 0
+    for numbers in arms.values():
+        warm = []
+        for index, (config, ready, command, failed) in enumerate(numbers.boots):
+            probe = numbers.probes[index] if index < len(numbers.probes) else None
+            if ready is None or failed:
+                continue
+            cold = cold_boot(probe)
+            if cold:
+                left_out.append(f"{numbers.label} ({config}, +{ready} s)")
+                continue
+            unknown += cold is None
+            warm.append(ready)
+        if warm:
+            lines.append(f"  {numbers.label}: {sum(warm) / len(warm):.1f} s over {len(warm)} warm boot"
+                         f"{'s' if len(warm) > 1 else ''}")
+    if not lines and not left_out:
+        return []
+    head = ["time to ready (warm boots; an image's first boot on a node, which compiles kernels, is left out):"]
+    tail = ([f"  left out: {'; '.join(left_out)}"] if left_out else [])
+    tail += ([f"  {unknown} boot{'s' if unknown > 1 else ''} without a kernel-cache record (a log before the probe) "
+              "counted as warm"] if unknown else [])
+    return head + lines + tail
+
+
 def describe_arm(numbers: ArmNumbers, run: str) -> list[str]:
     lines = [f"  {numbers.label}"]
-    for config, ready, command, failed in numbers.boots:
+    for index, (config, ready, command, failed) in enumerate(numbers.boots):
+        probe = numbers.probes[index] if index < len(numbers.probes) else None
+        note = ""
+        if probe is not None:
+            first, files = probe
+            compiled = sum(files.values())
+            if cold_boot(probe):
+                note = (f"; {'first boot of the image on ' + ', '.join(first) if first else 'kernels compiled'}"
+                        f", kernel cache +{compiled} files: left out of time-to-ready comparisons")
+            else:
+                note = "; warm (no kernel compiled)"
         lines.append(f"    boot {config}: ready +{ready if ready is not None else '?'} s "
-                     f"(command {command} s){' FAILED' if failed else ''}")
+                     f"(command {command} s){' FAILED' if failed else ''}{note}")
     suite_of = lambda suite_run: "" if suite_run in ("", run) else suite_run.removeprefix(f"{run}-") + " "
     for (suite_run, concurrency), (tps, ci) in sorted(numbers.closed.items(), key=lambda kv: (kv[0][0], -(kv[0][1] or 0))):
         lines.append(f"    {suite_of(suite_run)}closed loop c{concurrency}: {tps:.2f} tok/s"
@@ -1512,9 +1580,12 @@ def command_verdicts(args: argparse.Namespace, ssh: Ssh | None = None) -> int:
                 say(line)
         say("")
         say("arms:")
-        for numbers in headline_numbers(lines, spec_labels(entry.spec)).values():
+        arms = headline_numbers(lines, spec_labels(entry.spec))
+        for numbers in arms.values():
             for line in describe_arm(numbers, run):
                 say(line)
+        for line in ready_comparison(arms):
+            say(line)
         say("")
     return 0
 
