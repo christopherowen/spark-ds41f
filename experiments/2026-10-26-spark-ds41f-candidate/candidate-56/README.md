@@ -234,3 +234,18 @@ more at decode than the removed all-gathers save, as the own mark's prefetch-off
 removes part 1's own benefit, so a second rework has nothing to keep. #956, which passed its mark, carries forward
 without it: it is re-derived on candidate-54 alone, with its gather-and-unpad full-width weight for the SP
 projection at TP <= 4 and decode unchanged.
+
+## #956 without #957 part 1 (round 3 rebase, r4)
+
+[receipts/rework/pr-956-r4](receipts/rework/pr-956-r4/result.json): 0796 re-derived on candidate-54 alone. At every
+TP > 1, `bind()` gathers the unpacked compressor shards once into one [1024, 5120] BF16 weight for the ratio-2 SP
+projection (+10 MiB per ratio-2 layer per rank, +30 MiB in all); decode keeps candidate-54's packed shard, kernels
+and column gather exactly.
+- **Bit-exact:** `test_sp_ratio2_projection_matches_full_rows` at TP2..TP8 (129 to 16,384 rows, NaN/Inf rows), and the
+  layer harness at TP3 and TP4: 18/18 SP cells byte-identical to candidate-54; non-SP decode cells identical, with the
+  same kernels in the same launch order.
+- **One GPU, TP4 rank shapes, ABBA against candidate-54:** layer 2's SP prefill step 14.7-20.0% faster from 4K to
+  64K rows (16K: 32.90 -> 26.68 ms), every candidate boot below every base boot.
+- **Testbed:** [attribute-956r4-tp4-switched.json](attribute-956r4-tp4-switched.json): the prefill suite at 32K-256K
+  ABBA against `tp4-switched-no957p1-no956` (candidate-54's code on this image), then the grid step alone ABBA against
+  the same control, to confirm decode is unchanged.
