@@ -76,38 +76,31 @@ prepared tree (sp8): 215 selected files, 153 gate and 62 excluded
 [release-tests-gate-manifest.json](release-tests-gate-manifest.json) (154 files), and the bundle, written with main's
 tooling, is [bundles/release-tests](bundles/release-tests).
 
-## The build: dgx4, not sp8
+## The build: sp8, outside a window
 
-The coordinator asked for an sp8 build copied to sp1 over the spaceport fabric. The repository has no sound route
-for it:
-- **The kernel job.** A lab window runs a `kernel` job only on its production profile's nodes. No live production
-  profile contains sp8: `tp4-switched` is sp1..sp4 and `tp3-switched` sp5..sp7, and `tp8-switched` is not served this
-  round.
-- **The checkout.** The `image` job builds in the builder's deployment checkout, and a window's `sync` moves only its
-  production nodes' checkouts. sp8's deployment checkout is on another agent's working branch (2026-11-10).
-- **The node map.** The `image` job then requires the same layers on every node of the build profile's node map. No
-  site map names sp8 with sp1 (or sp5) alone, so it would need a new site map.
-- **The precedents on sp8 are other routes.** `2026-11-06-ced-local-projection` assembled a Python-only image on sp8
-  with its own scripts and node map (`sp567-nodes.json`). `2026-11-01-dspark-default-copy-drafts` built thin `FROM`
-  images by hand and never distributed them.
-- **The node's use.** sp8 is the round's one-GPU own-mark node, and a full build there loads its CPU under the
-  benches.
+The lab's `image` and `kernel` jobs cannot target sp8: a window runs them only on its production profile's nodes,
+the `image` job builds in the deployment checkout, and no site map pairs sp8 with sp1 alone. So sp8 builds and
+tests the image by hand, with the same repository commands the jobs run, from a clean clone at the locked commit
+(`~/spark-lab/agents/candidates-55-57/spark-ds41f`), outside sp8's deployment checkout:
+- `bin/spark --cluster-config experiments/2026-10-26-spark-ds41f-candidate/candidate-56/image-sp8.json build prepare`,
+  then `build check`, then `build image --apply` (the build under the memory guard, then the GPU smoke);
+- the release-test bundle on sp8's GPU:
+  `scripts/lab.py kernel-local experiments/2026-10-26-spark-ds41f-candidate/candidate-56/bundles/release-tests`;
+- the image over the spaceport fabric, `ssh sp8 'docker save spark-ds41f:candidate-56 | ssh sp1 docker load'`,
+  once the testbed is idle, then from sp1
+  `bin/spark --cluster-config experiments/2026-10-26-spark-ds41f-candidate/candidate-56/tp4-switched.json build distribute --apply`
+  to sp2..sp4. Every rank shows the same image ID.
 
-So [build.json](build.json) builds on dgx4, as candidate-53's did, and the image crosses to spaceport through the
-laptop once (step 4).
+This skips the laptop stream of a dgx build (16-50 min an image). [image-sp8.json](image-sp8.json) is
+[image-dgx4.json](image-dgx4.json) at `tp4-switched`; the lock and labels are the same. [build.json](build.json), the
+dgx4 route, is kept as the fallback. The script as run and its log are in `receipts/build-candidate-56-image/`
+once the build finishes.
 
 ## Runs
 
 Each testbed opens its window with `scripts/lab.py`, after the hold and idle guards.
 
-1. [build.json](build.json) (`candidate-56-image`), in a dgx window
-   ([step 4](../../../docs/release-benchmark.md#4-build-and-release-tests-dgx-window)): build the image on dgx4, copy it
-   along the ring. Its release-test bundle runs in candidate-55's `kernel` job, on dgx3,
-   beside 55's on dgx4, as candidate-53's build ran round 2's three bundles. The dgx window builds 56 and 57
-   first, then 55, whose spec ends with that job. Then stream it once to sp1
-   (`ssh dgx1 docker save spark-ds41f:candidate-56 | ssh sp1 docker load`) and distribute it from there with
-   `bin/spark --cluster-config experiments/2026-10-26-spark-ds41f-candidate/candidate-56/tp4-switched.json build distribute --apply`.
-   Every rank shows the same image ID.
+1. The image, built and tested on sp8 and copied to sp1 (above).
 2. [candidate-tp4-switched.json](candidate-tp4-switched.json) (`candidate-56-tp4-switched`): the determinism gate at
    `tp4-switched`, first ([step 5](../../../docs/release-benchmark.md#5-gate-first)).
 3. [screen-tp4-switched.json](screen-tp4-switched.json) (`candidate-56-screen-tp4-switched`): the `screen` suite on

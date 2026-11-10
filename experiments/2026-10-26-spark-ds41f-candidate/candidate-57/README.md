@@ -91,32 +91,31 @@ reports no problems on the prepared tree (sp8): 215 selected files, 153 gate and
 [release-tests-gate-manifest.json](release-tests-gate-manifest.json) (154 files), and the bundle, written with main's
 tooling, is [bundles/release-tests](bundles/release-tests).
 
-## The build: dgx4, not sp8
+## The build: sp8, outside a window
 
-The coordinator asked for an sp8 build, copied over the spaceport fabric to sp5. The repository has no sound route
-for it; [candidate-56's README](../candidate-56/README.md#the-build-dgx4-not-sp8) gives the reasons:
-- a window's `kernel` job runs only on its production profile's nodes, and no live production profile contains sp8;
-- the `image` job builds in sp8's deployment checkout, which a window's `sync` does not move, and which is on
-  another agent's branch;
-- no site map names sp8 with sp5 alone, as the `image` job's same-layers check needs;
-- sp8 is the round's own-mark node.
+The lab's `image` and `kernel` jobs cannot target sp8: a window runs them only on its production profile's nodes,
+the `image` job builds in the deployment checkout, and no site map pairs sp8 with sp5 alone. So sp8 builds and
+tests the image by hand, with the same repository commands the jobs run, from a clean clone at the locked commit
+(`~/spark-lab/agents/candidates-55-57/spark-ds41f`), outside sp8's deployment checkout:
+- `bin/spark --cluster-config experiments/2026-10-26-spark-ds41f-candidate/candidate-57/image-sp8.json build prepare`,
+  then `build check`, then `build image --apply` (the build under the memory guard, then the GPU smoke);
+- the release-test bundle on sp8's GPU:
+  `scripts/lab.py kernel-local experiments/2026-10-26-spark-ds41f-candidate/candidate-57/bundles/release-tests`;
+- the image over the spaceport fabric, `ssh sp8 'docker save spark-ds41f:candidate-57 | ssh sp5 docker load'`,
+  once the testbed is idle, then from sp5
+  `bin/spark --cluster-config experiments/2026-10-26-spark-ds41f-candidate/candidate-57/tp3-switched.json build distribute --apply`
+  to sp6 and sp7. Every rank shows the same image ID.
 
-So [build.json](build.json) builds on dgx4, as candidate-53's did.
+This skips the laptop stream of a dgx build (16-50 min an image). [image-sp8.json](image-sp8.json) is
+[image-dgx4.json](image-dgx4.json) at `tp3-switched`; the lock and labels are the same. [build.json](build.json), the
+dgx4 route, is kept as the fallback. The script as run and its log are in `receipts/build-candidate-57-image/`
+once the build finishes.
 
 ## Runs
 
 Each testbed opens its window with `scripts/lab.py`, after the hold and idle guards.
 
-1. [build.json](build.json) (`candidate-57-image`), in a dgx window
-   ([step 4](../../../docs/release-benchmark.md#4-build-and-release-tests-dgx-window)): build the image on dgx4, copy it
-   along the ring. Its release-test bundle runs in candidate-55's `kernel` job, on dgx2,
-   beside 55's on dgx4, as candidate-53's build ran round 2's three bundles. The dgx window builds 56 and 57
-   first, then 55, whose spec ends with that job.
-   - The image then crosses through the laptop once, to sp1, and goes on over the fabric to sp5:
-     `ssh sp1 'docker save spark-ds41f:candidate-57 | ssh sp5 docker load'`.
-   - Distribute it from sp5 with
-     `bin/spark --cluster-config experiments/2026-10-26-spark-ds41f-candidate/candidate-57/tp3-switched.json build distribute --apply`.
-     Every rank shows the same image ID.
+1. The image, built and tested on sp8 and copied to sp5 (above).
 2. [candidate-tp3-switched.json](candidate-tp3-switched.json) (`candidate-57-tp3-switched`): the determinism gate at
    `tp3-switched`, first ([step 5](../../../docs/release-benchmark.md#5-gate-first)).
 3. [screen-tp3-switched.json](screen-tp3-switched.json) (`candidate-57-screen-tp3-switched`): `screen-tp3`,
