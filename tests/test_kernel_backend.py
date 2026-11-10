@@ -558,6 +558,17 @@ def _experiment_configs_and_locks() -> tuple[tuple[str, dict], ...]:
     return tuple(items)
 
 
+    def test_lock_without_b12x_requires_omitting_b12x_tree_label(self):
+        cluster, lock, manifest, _ = self.ready()
+        lock["sources"].pop("b12x", None)
+        manifest.pop("b12x", None)
+        problems = kernel_backend.source_problems(cluster, lock, manifest)
+        self.assertEqual(len(problems), 1)
+        self.assertIn("b12x.tree", problems[0])
+        cluster["container"]["expected_labels"].pop("local.spark-ds41f.b12x.tree", None)
+        self.assertEqual(kernel_backend.source_problems(cluster, lock, manifest), [])
+
+
 class TileLangProfileLabelTest(unittest.TestCase):
     # Diagnostics whose locks moved on to a later series; frozen as they ran.
     HISTORICAL = {
