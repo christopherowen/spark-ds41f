@@ -364,15 +364,10 @@ paths run on TileLang + `sparknet`; retiring the remaining `b12x` build input
 from `upstreams.lock.json` and `docker/Dockerfile` can follow after `1107`).
 
 Remaining kernel-level investigations:
-1. **`mHC: fn` in three bytes.** `project_streams` reads `fn` (`24 x 20,480`
-   FP32, 2 MB per sublayer) near memory bandwidth, and a TF32 MMA consumes only
-   the top 19 bits of each value. Storing the top 24 bits would cut that traffic
-   by 25% with bit-identical results if SM121's TF32 MMA truncates rather than
-   rounds its inputs; verify on hardware first.
-2. **TMA stage releases outside DS4.1's active kernel set**
-   (`experiments/2026-09-30-proxy-fence-audit`): all serving kernels are fenced
-   (and enforced in the compiler via `tilelang/0001..0013` in `1107`); keep the
-   compiler barrier tests in the release gate whenever TileLang is refreshed.
+- **TMA stage releases outside DS4.1's active kernel set**
+  (`experiments/2026-09-30-proxy-fence-audit`): all serving kernels are fenced
+  (and enforced in the compiler via `tilelang/0001..0013` in `1107`); keep the
+  compiler barrier tests in the release gate whenever TileLang is refreshed.
 
 ## Upstream and hygiene
 
@@ -403,7 +398,17 @@ Don't repeat these without a new reason:
   retention windows on GB10 (#928, no gain / regression on unified memory);
   incremental GPU block-table metadata gathers (#932, negligible step impact vs
   state complexity); `0714`/`0716` score-ID host transfer and `0718` TP1-only
-  embedding ID prep (#913, #914: unmeasured / TP1-only).
+  embedding ID prep (#913, #914: unmeasured / TP1-only); 24-bit (top-3-byte)
+  `mHC: fn` weights (`experiments/2026-11-08-mhc-fn24-and-green-ctx-audit`:
+  superseded by `0092`'s 3x-TF32 exact FP32 split; `99.61%` of checkpoint
+  `hc_*_fn` weights have non-zero low 8 bits so 24-bit storage is not bit-exact,
+  and unpacking `uint16+uint8` regresses L2-hot `project_streams` latency by
+  `+2.4–6.1%` across `M=1..64`); CUDA Green Context (`CUgreenCtx`, `2/46` SM
+  split) isolation for side-stream L2 prefetch
+  (`experiments/2026-11-08-mhc-fn24-and-green-ctx-audit`: `+1.71 µs/fork`
+  cross-context event wait inside `CUDAGraph` replay vs `+0.155 µs/fork` on a
+  same-context stream, regressing per-layer decode latency by `+5.3` to
+  `+8.1 µs/layer` [`+1.4–3.5%`] against `VLLM_L2_PREFETCH_GRID=2`).
 - **Prefill:** M32 MoE tile (+1%); fused M32 MoE (no gain, less headroom);
   `NCCL_PROTO=Simple` (no gain); `--max-parallel-prefills 8` (four-64K mean TTFT
   41 → 67 s); sequence parallelism below 205 tokens (+12 ms TTFT on short
