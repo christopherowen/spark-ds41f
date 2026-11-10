@@ -13,6 +13,11 @@ screen's end.
 **First attempts failed:** the gate and screen first started at 01:50Z while `build distribute` was still loading the
 image on sp7 ("image is unavailable"). The coordinator queued them too early; both ran again from 01:52Z.
 
+**The bench memory floor cut the screen short (added 2026-11-10).** sp5's MemAvailable fell to 3.90 GiB in the first
+boot's prefill step and to 3.99 GiB in the second boot's grid step, under the 4 GiB bench floor, and each halt ends
+that suite. So the `screen-tp3` figures below are the **first boot's alone** (grid and c8), with no repeat, and
+TP3's prefill is not measured. `single-stream`, `sampled` and the stall steps ran on both boots.
+
 **Screen against 1107 (`screen-tp3`):**
 - **engine grid geometric mean 2.87% slower (±0.12%), worse.** The loss is at small batches: 1-request shapes are
   5.5-7.2% slower (1x3 rows at 4K: 18.91 -> 20.23 ms), 4x8 3.2%, 2x12 2.1%, 4x12 0.8%; the 8-request shapes are the

@@ -201,4 +201,10 @@ later candidates. The round's selection receipts are in [candidate-55/receipts](
 
 ## Status
 
-Prepared and locked. Not built, not measured.
+Built on sp8 (`spark-ds41f:candidate-57`, image ID `ba512cb2`). Its release tests run on sp8 (`kernel-local`).
+
+| Testbed | Gate | Screen against candidate-54 |
+| --- | --- | --- |
+| `tp3-switched` | identical outputs; candidate-54's TP3 hashes 5c22ce41/bce6092e | grid the same (4-request shapes 1.7-1.9% faster), c8 decode 0.56% faster (one boot), `single-stream` and `sampled` the same, greedy identical; prefill not measured (sp5's 4 GiB bench floor) ([receipts/tp3-switched](receipts/tp3-switched/README.md)) |
+
+Pending: the release tests and the own marks of #957 parts 2 and 4 (sp8).
