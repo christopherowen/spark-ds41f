@@ -196,11 +196,12 @@ class RowTrace:
                 calls, rows = int(b[0]), int(b[1])
                 rec = dict(info, calls=calls, rows=rows)
                 if 0 < rows <= R:
-                    width = min(R, 4 * rows)
-                    # Plain lists: the analysis needs no numpy.
+                    # Lists and raw little-endian int64 bytes ([calls, 2, rows]): the
+                    # analysis needs no numpy, and a step is about 13 KB at four rows.
                     rec["positions"] = b[self._pos:self._pos + rows].tolist()
                     rec["ids"] = b[self._ids:self._ids + rows].tolist()
-                    rec["ring"] = b[self._ring:self._final].reshape(self.MAX_CALLS, 2, R)[:calls, :, :width].tolist()
+                    rec["ring_bytes"] = b[self._ring:self._final].reshape(self.MAX_CALLS, 2, R)[:calls, :, :rows].tobytes()
+                    rec["ring_width"] = rows
                     rec["final"] = b[self._final:self._final + rows].tolist()
                 self.free.put(slot)
                 data = pickle.dumps(rec, protocol=4)
