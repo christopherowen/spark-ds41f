@@ -147,9 +147,12 @@ class LockWithoutB12xTest(unittest.TestCase):
         self.assertNotIn("find_spec", promoted)
         self.assertNotIn("b12x_mla_sparse", without)
         self.assertNotIn("b12x_roce_all_reduce", without)
-        for expected in ('find_spec("b12x") is None', "import vllm.models.deepseek_v4_1.common.engram",
+        for expected in ('find_spec("b12x") is None', "pkgutil.walk_packages(dsv41.__path__",
+                         'name == "b12x" or name.startswith("b12x.")',
                          "import vllm.models.deepseek_v4_1.nvidia.model", "import tilelang\n"):
             self.assertIn(expected, without)
+        # every module it imports by name must exist in the tree it smokes (tilelang.vocab_pack did not)
+        self.assertNotIn("vocab_pack", without)
 
     def test_only_the_b12x_stage_reads_the_b12x_context(self) -> None:
         stages = {}
