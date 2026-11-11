@@ -9,8 +9,9 @@ vLLM ARM64 nightly `af1c0149`. Only vLLM's `_C_stable_libtorch` and
 `_moe_C_stable_libtorch` are rebuilt, for SM121, and NCCL 2.30.7 (the base
 image's version) is rebuilt from its release tag with `patches/nccl`, replacing
 the wheel's `libnccl.so.2`; the image build checks the installed library's
-version and checksum. FlashInfer 0.6.18.post1 comes from the base image. The r1
-and r2 images came from the same recipe in
+version and checksum. The CUDA toolkit is the base image's CUDA 13.0.2 unless the lock
+selects another ([CUDA toolkit](#cuda-toolkit)). FlashInfer 0.6.18.post1 comes from the
+base image. The r1 and r2 images came from the same recipe in
 `experiments/2026-09-23-karmic-kraken-reference/`; r3 was the first built by
 `bin/spark build`. Images are tagged `spark-ds41f:<vLLM base>-<release>` (for example
 `spark-ds41f:19f2c20ed4d6-MMDD`); images before the release after spark-ds41f-1022 were
@@ -33,6 +34,7 @@ input:
 - the patch-series fingerprints, recorded patch heads, and trees;
 - the CUTLASS revision;
 - the CuTe DSL wheel lock;
+- the CUDA toolkit package lock, when the lock lists `cuda_toolkit`;
 - the base image digest.
 
 A hash of those inputs names the directory:
@@ -47,6 +49,7 @@ A hash of those inputs names the directory:
   context/nccl-source
   context/cutlass-source
   context/cutlass-dsl-wheels   # hash-verified wheels
+  context/cuda-toolkit-debs    # hash-verified .deb files (a lock with cuda_toolkit)
   context/vllm-deletions/deleted.txt
   context/empty          # the main context; every COPY uses a named context
   images/<image id>.json # receipt for each image built from it
@@ -110,6 +113,73 @@ labels, and the GPU smoke imports both packages.
 Without those sources the command has no new argument, BuildKit skips the
 TileLang stages and their contexts, and the image is the unchanged `runtime`
 stage.
+
+## CUDA toolkit
+
+Every builder stage and `runtime-core` start from `CUDA_STAGE`, whose default `base` is
+the base image as it is: CUDA 13.0.2 (`nvcc`/`ptxas` 13.0.88, `libcublasLt` 13.1.1.3).
+A lock without `sources.cuda_toolkit` (every lock so far, spark-ds41f-1107 and
+candidate-54 included) builds exactly as before: its inputs, build directory and `build
+image` command are unchanged (`tests/test_build.py` compares the command with the one
+recorded before the option existed), and BuildKit builds neither CUDA 13.5 stage nor
+reads the `cuda-toolkit-debs` context.
+
+A lock that lists the toolkit builds with CUDA 13.5:
+
+```json
+"cuda_toolkit": {
+  "kind": "deb",
+  "upstream": "https://developer.download.nvidia.com/compute/cuda/repos/ubuntu2404/sbsa",
+  "version": "13.5.37",
+  "lockfile": "requirements/cuda-13-5-sbsa.txt",
+  "role": "CUDA 13.5 toolchain and math libraries over the base image's CUDA 13.0.2"
+}
+```
+
+- `requirements/cuda-13-5-sbsa.txt` lists every package the stage installs, one
+  `package=version filename size sha256:<hex>` line each: the 21 toolchain, runtime and
+  math-library packages (`cuda-nvcc-13-5` 13.5.37-1, `cuda-cudart-13-5` 13.5.37-1,
+  `libcublas-13-5` 13.10.0.20-1, ...) and `cuda-toolkit-config-common` and
+  `cuda-toolkit-13-config-common` at 13.5.37-1, which they need upgraded from the base
+  image's 13.0.96-1. `version` must be one the Dockerfile has a stage for
+  (`CUDA_TOOLKIT_STAGES` in `spark_ds41f/build.py`: only 13.5.37), and the lockfile must
+  list its `cuda-nvcc` at that version; `bin/spark doctor` and every build command
+  refuse a malformed entry or lockfile.
+- `prepare` downloads each file from `upstream` into `context/cuda-toolkit-debs`, keeps
+  the files that already match the lock's size and SHA-256, and refuses one that does
+  not; `check` reports missing, unlocked and changed files. `prepare --only
+  cuda_toolkit` prepares just these.
+- `build image` passes the context, `CUDA_STAGE=cuda-13-5` and
+  `RUNTIME_CORE_STAGE=runtime-core-cuda-13-5`. Stage `cuda-13-5` installs exactly the
+  locked files with `dpkg -i`, without the network, so a dependency the set lacks fails
+  the build; it wires `/usr/local/cuda`, `/usr/local/cuda-13`, the alternatives,
+  `nvcc.profile`'s `TOP` and the pip `nvidia/cu13` `bin`, `nvvm` and libraries (which
+  `libtorch_cuda.so`'s `DT_RPATH` and `cuda.pathfinder` search ahead of
+  `/usr/local/cuda`) to `/usr/local/cuda-13.5` with `/usr/local/sbin/spark-wire-cuda-13-5`,
+  and sets `CUDA_HOME`, `PATH`, `LD_LIBRARY_PATH` and the CUDA version variables.
+  `runtime-core-cuda-13-5` runs the wiring again after `runtime-core`'s CuTe DSL wheel
+  reinstall, checks `nvcc`/`ptxas` 13.5.37 (also as `cuda.pathfinder` finds them),
+  `libcublasLt` 131000 through both paths, the `nvidia/cu13` libraries and `libcudart`
+  13050, and labels the image `local.spark-ds41f.cuda.version=13.5.37`, which
+  `build image --apply` checks; the B12X and TileLang runtimes build on it.
+
+To refresh the lockfile, list what apt would install in the base image (no payload is
+downloaded) and take each file's size and SHA-256 from the repository's signed index:
+
+```sh
+image=docker.io/vllm/vllm-openai@sha256:3cf14c52765a0f0c2f09035e05fa79e1e4b2f9788b64afa90fa41c1ff12d29cf
+docker run --rm --network host --user root --entrypoint /bin/sh "$image" -c '
+  apt-get update
+  apt-get install --no-install-recommends --dry-run PACKAGE=VERSION ...  # every Inst line goes in the lock
+  for p in PACKAGE=VERSION ...; do                                        # each Inst line, pinned
+    apt-cache show --no-all-versions "$p" | grep -E "^(Package|Version|Architecture|Filename|Size|SHA256):"
+  done'
+```
+
+Write one line per package, its `Filename` without the leading `./`, and record the
+index date (the `Date` of the repository's `InRelease`) in the header. `apt-get download
+--print-uris` prints the same URLs and sizes with SHA-512. A new toolkit version also
+needs its own Dockerfile stages and `CUDA_TOOLKIT_STAGES` entry.
 
 ## Locks without B12X
 

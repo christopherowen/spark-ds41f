@@ -55,6 +55,19 @@ class SourceLockTest(unittest.TestCase):
         self.assertGreater(checked, 0)
         self.assertEqual(problems, [])
 
+    def test_a_listed_cuda_toolkit_is_one_the_build_can_install(self) -> None:
+        # sources.cuda_toolkit is optional; where a lock lists it, its version needs a
+        # Dockerfile stage and its lockfile must parse (tests/test_build.py, CudaToolkitTest).
+        lock_paths = [ROOT / "upstreams.lock.json", *sorted((ROOT / "releases").glob("*/upstreams.lock.json")),
+                      *sorted((ROOT / "experiments").rglob("upstreams.lock.json"))]
+        problems = []
+        for lock_path in lock_paths:
+            sources = json.loads(lock_path.read_text(encoding="utf-8")).get("sources", {})
+            rel = lock_path.relative_to(ROOT).as_posix()
+            problems += [f"{rel}: {problem}" for problem in spark.cuda_toolkit_problems(sources)]
+        self.assertGreater(len(lock_paths), 3)
+        self.assertEqual(problems, [])
+
     def test_arm_notes_and_expected_labels_match_locks_and_manifests(self) -> None:
         checked, problems = 0, []
         for path in sorted((ROOT / "experiments").rglob("*.json")):
