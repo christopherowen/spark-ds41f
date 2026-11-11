@@ -1,0 +1,2412 @@
+From 3b61d110295479a06e67544f21667117c60b9164 Mon Sep 17 00:00:00 2001
+From: koldfrontier <koldfrontier@users.noreply.github.com>
+Date: Fri, 6 Nov 2026 03:07:37 +0000
+Subject: [PATCH] Require the DSML token for DeepSeek V4.1 tool call markup
+ (#65019)
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Base: 1107 vLLM patch head b9276542af6feba1b8f916b521f857cd23bd1224 (upstream 19f2c20ed4d64ae22bd009ceacadd85e2a81e354 + 641 patches).
+
+Rationale:
+In the DeepSeek V4.1 tokenizer, 128825 (｜DSML｜) is a bare atom token while each full DSML tag (<｜DSML｜ calls>, <｜DSML｜ invoke name="...", <｜DSML｜ parameter name="..." string="...">, and their closing tags) is a composite sequence of ordinary text tokens around 128825. Because the model can also spell "｜DSML｜" out of ordinary text tokens when quoting DSML markup in prose or writing files containing DSML strings (issues #876 and #948), text-only matching treats quoted DSML tags as genuine structural markers:
+- A quoted DSML block in a normal assistant reply is parsed into tool_calls or silently swallowed when the function name is not in request.tools (#876).
+- A literal "</｜DSML｜ parameter>" or "</｜DSML｜ calls>" inside a string tool argument truncates the parameter value or closes the tool call early (#948).
+- An untrusted "<｜DSML｜ parameter ...>" tag after a closed parameter arms the 0643 incremental open-value extender and appends subsequent text into the closed parameter.
+- Splitting "<｜DSML｜ calls>" across streaming deltas when reasoning ends implicitly loses the token-origin span across separate reasoning/tool parser instances in DelegatingParser.
+- Formatting newlines between "</｜DSML｜ invoke>" and "</｜DSML｜ calls>" in TOOL_BETWEEN leak into assistant content when non-whitespace content preceded the tool block.
+- When --tool-call-parser deepseek_v41 or --reasoning-parser deepseek_v41 is configured alone, falling back to DelegatingParser drops model_output_token_ids in non-streaming parse() and leaves ParserEngine in ParserState.REASONING when skip_reasoning_parsing=True.
+
+Track token-ID origin spans through TokenIDScanner, IncrementalLexer, StreamingParserEngine, and ToolCallSlot:
+- Gate composite DSML terminals (TOOL_START, TOOL_END, INVOKE_PREFIX, INVOKE_END, PARAM_START, PARAM_CLOSE) on the presence of a genuine 128825 token span at the "｜DSML｜" offset.
+- Filter parameter header and close matches in DeepSeekV41Parser (_dsml_arg_converter and _dsml_open_value_extender) by recorded token-origin spans, holding back partial genuine headers during incremental string streaming.
+- Route both parse() and parse_delta() through DeepSeekV41ServingParser whenever either --reasoning-parser deepseek_v41 or --tool-call-parser deepseek_v41 is active, and start ParserEngine in ParserState.CONTENT when skip_reasoning_parsing=True, preserving token provenance in combined, tool-only, and reasoning-only configurations while keeping DSML markup as content when tools are absent or tool_choice="none".
+- Hold back pure whitespace in TOOL_BETWEEN unless non-whitespace text follows in the same span so structural newlines between "</｜DSML｜ invoke>" and "</｜DSML｜ calls>" do not append to pre-tool assistant content.
+- Include prompt turn-boundary reasoning checks (set_prompt_token_ids, #61857) so multi-turn and task prompts do not inherit an earlier turn's "</think>".
+
+Quality:
+Sampling-neutral; affects only post-generation output parsing for --reasoning-parser deepseek_v41 and --tool-call-parser deepseek_v41. Preserves bit-identical outputs on clean replies while preventing false tool-call extraction and argument truncation when replies or string arguments quote DSML markup.
+
+Tests:
+- pytest tests/parser/engine/test_deepseek_v41_dsml_provenance.py (86 passed)
+- pytest tests/tool_parsers/test_deepseekv41_tool_parser.py (152 passed)
+- pytest tests/parser/engine/test_deepseek_v41.py tests/parser/engine/test_deepseek_v4.py tests/parser/engine/test_token_id_scanner.py tests/parser/engine/test_parser_engine.py tests/tool_parsers/test_deepseekv4_tool_parser.py tests/tool_parsers/test_deepseekv32_tool_parser.py (389 passed; 627 total passed across 2 container boots)
+- replay_fixtures.py on fixtures/live-1030.json and fixtures/live-1030-thinking.json (all 9 cases pass across whole, stream/1, stream/7, stream/10000 across 2 container boots)
+
+Upstream status: backported from https://github.com/vllm-project/vllm/pull/65019 (with #61857 prompt reasoning state hook) and adapted to the 1107 series.
+---
+ docs/features/tool_calling.md                 |   6 +
+ .../test_deepseek_v41_dsml_provenance.py      | 396 +++++++++++
+ tests/parser/engine/test_token_id_scanner.py  | 122 ++++
+ .../test_deepseekv41_tool_parser.py           | 658 ++++++++++++++++++
+ vllm/parser/deepseek_v4.py                    |   5 +
+ vllm/parser/deepseek_v41.py                   | 260 ++++++-
+ vllm/parser/engine/adapters.py                |   3 +
+ vllm/parser/engine/incremental_lexer.py       |  70 +-
+ vllm/parser/engine/parser_engine.py           |  54 +-
+ vllm/parser/engine/parser_engine_config.py    |   3 +
+ vllm/parser/engine/streaming_parser_engine.py | 101 ++-
+ vllm/parser/engine/token_id_scanner.py        | 168 +++++
+ vllm/parser/parser_manager.py                 |  20 +
+ 13 files changed, 1830 insertions(+), 36 deletions(-)
+ create mode 100644 tests/parser/engine/test_deepseek_v41_dsml_provenance.py
+ create mode 100644 tests/tool_parsers/test_deepseekv41_tool_parser.py
+
+diff --git a/docs/features/tool_calling.md b/docs/features/tool_calling.md
+index 2e8178d39..d8344cf2c 100644
+--- a/docs/features/tool_calling.md
++++ b/docs/features/tool_calling.md
+@@ -380,6 +380,12 @@ DeepSeek-specific role, not a standard OpenAI message role. Other unknown roles
+ remain invalid. The encoding contract follows the
+ [DeepSeek V4.1 reference](https://huggingface.co/deepseek-ai/DeepSeek-V4.1-Flash/blob/dba1be0a40aa45a94ad051997016db3960a90277/encoding/README.md).
+ 
++With `--tool-call-parser deepseek_v41`, output token IDs distinguish genuine DSML markers from copies spelled with ordinary tokens, including inside string arguments. This guard also works without a reasoning parser. Without token IDs, DSML matching remains text-based. In token-ID mode, text between and after tool-call blocks is returned as content.
++
++When auto tool choice is enabled and both `--tool-call-parser deepseek_v41` and `--reasoning-parser deepseek_v41` are selected, one engine parses reasoning and tools together, preserving token provenance across the transition. Text-spelled markers remain text in reasoning too. Requests without tools, or with `tool_choice="none"`, preserve DSML call markup as content instead of dropping it, with or without token IDs. Prompt reasoning-state detection stops at assistant, user and system role boundaries: a prompt that already closes reasoning starts in content, while a closing marker from an earlier turn does not disable reasoning.
++
++Strict required and named tool choices have a remaining limitation: their string-based structural tags can admit markers spelled with ordinary tokens. Such a forced call would remain content under the token-origin guard, rather than become a tool call. This interaction has not been reproduced with constrained model generation. [Token-aware structural tags](https://github.com/vllm-project/vllm/pull/59145) are the intended fix.
++
+ ### OpenAI OSS Models (`openai`)
+ 
+ Supported models:
+diff --git a/tests/parser/engine/test_deepseek_v41_dsml_provenance.py b/tests/parser/engine/test_deepseek_v41_dsml_provenance.py
+new file mode 100644
+index 000000000..80dc24c2b
+--- /dev/null
++++ b/tests/parser/engine/test_deepseek_v41_dsml_provenance.py
+@@ -0,0 +1,396 @@
++# SPDX-License-Identifier: Apache-2.0
++# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
++"""DeepSeek V4.1: DSML is structure only where its atom is the DSML token.
++
++The model writes structural markers with the ``｜DSML｜`` token and spells a
++quoted copy (a file about DSML, a code sample in a reply) in ordinary pieces.
++These tests pin that a quoted copy stays text: in string tool arguments and in
++reply content, streamed and whole. In the templates below ``G`` stands for the
++genuine DSML token; a literal ``｜DSML｜`` is spelled one character a token.
++"""
++
++import json
++
++import pytest
++
++from tests.parser.engine.replay_harness import (
++    MockTokenizer,
++    _test_request,
++    collect_output,
++    replay_streaming,
++)
++from vllm.parser.parser_manager import ParserManager
++
++ATOM = "｜DSML｜"
++ATOM_ID = 128825
++G = "\x00"
++
++WRITE_TOOLS = [
++    {
++        "type": "function",
++        "function": {
++            "name": "write",
++            "parameters": {
++                "type": "object",
++                "properties": {
++                    "path": {"type": "string"},
++                    "content": {"type": "string"},
++                },
++            },
++        },
++    }
++]
++WEATHER_TOOLS = [
++    {
++        "type": "function",
++        "function": {
++            "name": "get_weather",
++            "parameters": {
++                "type": "object",
++                "properties": {"city": {"type": "string"}},
++            },
++        },
++    }
++]
++
++
++def tokenize(template: str):
++    vocab = {ATOM: ATOM_ID, "<think>": 50, "</think>": 51}
++    tokens: list[tuple[int, str]] = []
++    for ch in template:
++        tokens.append((ATOM_ID, ATOM) if ch == G else (1000 + len(tokens), ch))
++    tokenizer = MockTokenizer(vocab, tokens)
++    # As in the real tokenizer, the DSML atom is an added token, not a special one.
++    tokenizer._special_ids = {50, 51}
++    tokenizer._all_special_tokens = ["<think>", "</think>"]
++    return tokenizer, tokens
++
++
++def write_call(*files: tuple[str, str]) -> str:
++    invokes = "\n".join(
++        f"<{G} invoke name=\"write\">\n"
++        f"<{G} parameter name=\"path\" string=\"true\">{path}</{G} parameter>\n"
++        f"<{G} parameter name=\"content\" string=\"true\">{content}</{G} parameter>\n"
++        f"</{G} invoke>"
++        for path, content in files
++    )
++    return f"<{G} calls>\n{invokes}\n</{G} calls>"
++
++
++def parser_for(tokenizer, thinking: bool = False):
++    cls = ParserManager.get_parser(
++        tool_parser_name="deepseek_v41",
++        reasoning_parser_name="deepseek_v41",
++        enable_auto_tools=True,
++    )
++    assert cls is not None
++    return cls(tokenizer, chat_template_kwargs={"thinking": thinking})
++
++
++def streamed(template, tools, chunk_size, thinking: bool = False):
++    tokenizer, tokens = tokenize(template)
++    return collect_output(
++        replay_streaming(
++            parser_for(tokenizer, thinking=thinking),
++            tokens,
++            chunk_size=chunk_size,
++            finished_on_last=True,
++            tools=tools,
++            prompt_token_ids=[50 if thinking else 51],
++        )
++    )
++
++
++def whole(template, tools, thinking: bool = False):
++    tokenizer, tokens = tokenize(template)
++    p = parser_for(tokenizer, thinking=thinking)
++    p.set_prompt_token_ids([50 if thinking else 51])
++    reasoning, content, calls = p.parse(
++        "".join(text for _, text in tokens),
++        _test_request(tools=tools),
++        enable_auto_tools=True,
++        model_output_token_ids=[tid for tid, _ in tokens],
++    )
++    return (
++        content or "",
++        [(call.name, json.loads(call.arguments)) for call in calls or []],
++    )
++
++
++QUOTED_VALUES = [
++    f"DSML closers:\n</{ATOM} parameter>\n</{ATOM} calls>",
++    f"TOOL_END = \"</{ATOM} calls>\"",
++    f"before </{ATOM} invoke> after",
++    f"<{ATOM} parameter name=\"x\" string=\"true\">not a parameter",
++    f"unclosed tag prefix: <{ATOM} parameter name=\"x\"",
++]
++
++
++@pytest.mark.parametrize("value", QUOTED_VALUES)
++@pytest.mark.parametrize("chunk_size", [1, 2, 3, 4, 5, 6, 10000])
++def test_quoted_dsml_in_string_value_survives_streaming(value, chunk_size):
++    output = streamed(write_call(("notes.md", value)), WRITE_TOOLS, chunk_size)
++    assert [json.loads(call["arguments"]) for call in output.tool_calls] == [
++        {"path": "notes.md", "content": value}
++    ]
++    assert ATOM not in output.content
++
++
++@pytest.mark.parametrize("value", QUOTED_VALUES)
++def test_quoted_dsml_in_string_value_survives_whole(value):
++    content, calls = whole(write_call(("notes.md", value)), WRITE_TOOLS)
++    assert calls == [("write", {"path": "notes.md", "content": value})]
++    assert ATOM not in content
++
++
++@pytest.mark.parametrize("chunk_size", [1, 5, 10000])
++def test_two_calls_first_value_quotes_block_closer(chunk_size):
++    quoted = f"end of block: </{ATOM} calls>"
++    template = write_call(("notes.md", quoted), ("two.md", "two"))
++    output = streamed(template, WRITE_TOOLS, chunk_size)
++    assert [json.loads(call["arguments"]) for call in output.tool_calls] == [
++        {"path": "notes.md", "content": quoted},
++        {"path": "two.md", "content": "two"},
++    ]
++    assert whole(template, WRITE_TOOLS)[1] == [
++        ("write", {"path": "notes.md", "content": quoted}),
++        ("write", {"path": "two.md", "content": "two"}),
++    ]
++
++
++@pytest.mark.parametrize("chunk_size", [1, 5, 10000])
++def test_genuine_call_unchanged(chunk_size):
++    template = write_call(("hello.md", "hello world"))
++    output = streamed(template, WRITE_TOOLS, chunk_size)
++    assert [json.loads(call["arguments"]) for call in output.tool_calls] == [
++        {"path": "hello.md", "content": "hello world"}
++    ]
++    assert whole(template, WRITE_TOOLS)[1] == [
++        ("write", {"path": "hello.md", "content": "hello world"})
++    ]
++
++
++@pytest.mark.parametrize("chunk_size", [1, 5, 10000])
++def test_untrusted_param_tag_after_closed_param_does_not_extend_value(chunk_size):
++    # A literal <｜DSML｜ parameter ...> after a closed parameter must not arm
++    # the incremental string-value extender and append into the closed value.
++    template = (
++        f"<{G} calls><{G} invoke name=\"write\">"
++        f"<{G} parameter name=\"path\" string=\"true\">abc</{G} parameter>"
++        f"<{ATOM} parameter name=\"content\" string=\"true\">x y z"
++        f"</{G} invoke></{G} calls>"
++    )
++    output = streamed(template, WRITE_TOOLS, chunk_size)
++    assert [json.loads(call["arguments"]) for call in output.tool_calls] == [
++        {"path": "abc"}
++    ]
++    assert whole(template, WRITE_TOOLS)[1] == [("write", {"path": "abc"})]
++
++
++@pytest.mark.parametrize("chunk_size", [1, 2, 5, 10000])
++def test_implicit_reasoning_end_splits_across_dsml_calls_tag(chunk_size):
++    # When reasoning ends implicitly at <｜DSML｜ calls> without </think>,
++    # splitting <, ｜DSML｜, and " calls>" across deltas must preserve token
++    # provenance across the reasoning-to-tool transition.
++    template = f"Plan first.{write_call(("hello.md", "hello world"))}"
++    output = streamed(template, WRITE_TOOLS, chunk_size, thinking=True)
++    assert output.reasoning == "Plan first."
++    assert [json.loads(call["arguments"]) for call in output.tool_calls] == [
++        {"path": "hello.md", "content": "hello world"}
++    ]
++
++
++def test_genuine_call_without_tools_kept_as_content():
++    # Without tools (or with tool_choice="none"), DSML markup is preserved as
++    # content rather than executed or dropped.
++    template = write_call(("hello.md", "hello world"))
++    expected = template.replace(G, ATOM)
++    content, calls = whole(template, None)
++    assert calls == []
++    assert content == expected
++    output = streamed(template, None, chunk_size=3)
++    assert output.tool_calls == []
++    assert output.content == expected
++
++
++SAMPLE = (
++    f"<{ATOM} calls>\n<{ATOM} invoke name=\"get_weather\">\n"
++    f"<{ATOM} parameter name=\"city\" string=\"true\">Boston</{ATOM} parameter>\n"
++    f"</{ATOM} invoke>\n</{ATOM} calls>"
++)
++QUOTING_REPLY = f"Here is the markup:\n\n```text\n{SAMPLE}\n```\n\nFINISHED"
++
++
++@pytest.mark.parametrize("tools", [WEATHER_TOOLS, None])
++@pytest.mark.parametrize("chunk_size", [1, 2, 3, 4, 5, 6, 10000])
++def test_reply_quoting_dsml_stays_content(tools, chunk_size):
++    output = streamed(QUOTING_REPLY, tools, chunk_size)
++    assert output.tool_calls == []
++    assert output.content == QUOTING_REPLY
++
++
++@pytest.mark.parametrize("tools", [WEATHER_TOOLS, None])
++def test_reply_quoting_dsml_stays_content_whole(tools):
++    content, calls = whole(QUOTING_REPLY, tools)
++    assert calls == []
++    assert content == QUOTING_REPLY
++
++
++@pytest.mark.parametrize("chunk_size", [1, 5, 10000])
++def test_content_before_multiline_tool_call_keeps_exact_whitespace(chunk_size):
++    # Formatting newlines between </｜DSML｜ invoke> and </｜DSML｜ calls> must
++    # not be appended to assistant content that preceded the tool block.
++    preamble = "I'll check that for you.\n\n"
++    template = preamble + write_call(("hello.md", "hello world"))
++    output = streamed(template, WRITE_TOOLS, chunk_size)
++    assert output.content == preamble
++    assert [json.loads(call["arguments"]) for call in output.tool_calls] == [
++        {"path": "hello.md", "content": "hello world"}
++    ]
++    assert whole(template, WRITE_TOOLS) == (
++        preamble,
++        [("write", {"path": "hello.md", "content": "hello world"})],
++    )
++
++
++@pytest.mark.parametrize("chunk_size", [1, 2, 3, 4, 5, 6, 10000])
++def test_mixed_json_and_string_params_quoting_dsml(chunk_size):
++    code_body = (
++        f"# parser test\n{SAMPLE}\n"
++        "<|DSML|function_calls>\n"
++        f"<{ATOM}function_calls>\n"
++    )
++    meta_json = json.dumps(
++        {"tags": [f"<{ATOM} calls>", f"</{ATOM} parameter>", "<|DSML|invoke>"]}
++    )
++    template = (
++        f"<{G} calls>\n<{G} invoke name=\"write\">\n"
++        f"<{G} parameter name=\"path\" string=\"true\">deepseek_v32_tool_parser.py</{G} parameter>\n"
++        f"<{G} parameter name=\"content\" string=\"true\">{code_body}</{G} parameter>\n"
++        f"<{G} parameter name=\"meta\" string=\"false\">{meta_json}</{G} parameter>\n"
++        f"<{G} parameter name=\"lines\">42</{G} parameter>\n"
++        f"</{G} invoke>\n</{G} calls>"
++    )
++    expected = {
++        "path": "deepseek_v32_tool_parser.py",
++        "content": code_body,
++        "meta": json.loads(meta_json),
++        "lines": 42,
++    }
++    output = streamed(template, WRITE_TOOLS, chunk_size)
++    assert [json.loads(call["arguments"]) for call in output.tool_calls] == [expected]
++    assert whole(template, WRITE_TOOLS) == ("", [("write", expected)])
++
++
++@pytest.mark.parametrize("chunk_size", [1, 3, 6, 10000])
++def test_tool_only_parser_preserves_provenance(chunk_size):
++    cls = ParserManager.get_parser(
++        tool_parser_name="deepseek_v41",
++        reasoning_parser_name=None,
++        enable_auto_tools=True,
++    )
++    assert cls is not None
++
++    # 1. Quoted DSML in assistant reply (#876) stays content in whole and streaming.
++    tokenizer, tokens = tokenize(QUOTING_REPLY)
++    parser = cls(tokenizer, WEATHER_TOOLS)
++    reasoning, content, calls = parser.parse(
++        "".join(text for _, text in tokens),
++        _test_request(tools=WEATHER_TOOLS),
++        enable_auto_tools=True,
++        model_output_token_ids=[tid for tid, _ in tokens],
++    )
++    assert reasoning is None and calls is None and content == QUOTING_REPLY
++    out = collect_output(
++        replay_streaming(
++            cls(tokenizer, WEATHER_TOOLS),
++            tokens,
++            chunk_size=chunk_size,
++            finished_on_last=True,
++            tools=WEATHER_TOOLS,
++        )
++    )
++    assert out.reasoning == "" and out.tool_calls == [] and out.content == QUOTING_REPLY
++
++    # 2. Quoted DSML inside string argument (#948) survives in whole and streaming.
++    call_tmpl = write_call(("notes.md", QUOTED_VALUES[0]))
++    tokenizer2, tokens2 = tokenize(call_tmpl)
++    parser2 = cls(tokenizer2, WRITE_TOOLS)
++    reasoning2, content2, calls2 = parser2.parse(
++        "".join(text for _, text in tokens2),
++        _test_request(tools=WRITE_TOOLS),
++        enable_auto_tools=True,
++        model_output_token_ids=[tid for tid, _ in tokens2],
++    )
++    assert reasoning2 is None and not content2
++    assert [(c.name, json.loads(c.arguments)) for c in calls2 or []] == [
++        ("write", {"path": "notes.md", "content": QUOTED_VALUES[0]})
++    ]
++    out2 = collect_output(
++        replay_streaming(
++            cls(tokenizer2, WRITE_TOOLS),
++            tokens2,
++            chunk_size=chunk_size,
++            finished_on_last=True,
++            tools=WRITE_TOOLS,
++        )
++    )
++    assert [json.loads(c["arguments"]) for c in out2.tool_calls] == [
++        {"path": "notes.md", "content": QUOTED_VALUES[0]}
++    ]
++
++    # 3. Genuine DSML call when request.tools is None stays content.
++    out_no_tools = collect_output(
++        replay_streaming(
++            cls(tokenizer2, None),
++            tokens2,
++            chunk_size=chunk_size,
++            finished_on_last=True,
++            tools=None,
++        )
++    )
++    assert out_no_tools.tool_calls == []
++    assert out_no_tools.content == call_tmpl.replace(G, ATOM)
++
++
++@pytest.mark.parametrize("chunk_size", [1, 3, 6, 10000])
++def test_reasoning_only_parser_preserves_provenance(chunk_size):
++    cls = ParserManager.get_parser(
++        tool_parser_name=None,
++        reasoning_parser_name="deepseek_v41",
++        enable_auto_tools=False,
++    )
++    assert cls is not None
++    vocab = {ATOM: ATOM_ID, "<think>": 50, "</think>": 51}
++    thought = f"Quoting </think> and <{ATOM} calls> in thought."
++    answer = "Final answer."
++    tokens: list[tuple[int, str]] = [
++        (1000 + i, ch) for i, ch in enumerate(thought)
++    ]
++    tokens.append((51, "</think>"))
++    tokens.extend((2000 + i, ch) for i, ch in enumerate(answer))
++    tokenizer = MockTokenizer(vocab, tokens)
++    tokenizer._special_ids = {50, 51}
++    tokenizer._all_special_tokens = ["<think>", "</think>"]
++
++    parser = cls(tokenizer, None, chat_template_kwargs={"thinking": True})
++    parser.set_prompt_token_ids([50])
++    reasoning, content, calls = parser.parse(
++        "".join(text for _, text in tokens),
++        _test_request(tools=None),
++        enable_auto_tools=False,
++        model_output_token_ids=[tid for tid, _ in tokens],
++    )
++    assert reasoning == thought and content == answer and calls is None
++
++    out = collect_output(
++        replay_streaming(
++            cls(tokenizer, None, chat_template_kwargs={"thinking": True}),
++            tokens,
++            chunk_size=chunk_size,
++            finished_on_last=True,
++            tools=None,
++            prompt_token_ids=[50],
++        )
++    )
++    assert out.reasoning == thought and out.content == answer and out.tool_calls == []
+diff --git a/tests/parser/engine/test_token_id_scanner.py b/tests/parser/engine/test_token_id_scanner.py
+index 8723ac282..f02f0a315 100644
+--- a/tests/parser/engine/test_token_id_scanner.py
++++ b/tests/parser/engine/test_token_id_scanner.py
+@@ -409,6 +409,128 @@ _QUOTE_TID = 104
+ _TOK = list(range(200, 215))
+ 
+ 
++@pytest.fixture
++def strict_tokenizer():
++    from tokenizers import Tokenizer, decoders, models
++    from transformers import TokenizersBackend
++
++    class CountingTokenizer(TokenizersBackend):
++        decoded_ids = 0
++
++        def decode(self, token_ids, *args, **kwargs):
++            self.decoded_ids += len(token_ids)
++            return super().decode(token_ids, *args, **kwargs)
++
++    backend = Tokenizer(
++        models.WordLevel(
++            {"a": 0, "<bos>": 1, "<call>": 2, "ÿ": 3, "b": 4}, unk_token="a"
++        )
++    )
++    backend.decoder = decoders.ByteLevel()
++    return CountingTokenizer(
++        tokenizer_object=backend,
++        bos_token="<bos>",
++        additional_special_tokens=["<call>"],
++    )
++
++
++@pytest.mark.parametrize("bos_text", ["<bos>", ""])
++def test_strict_scanner_distinguishes_delayed_and_omitted_drop(
++    strict_tokenizer, bos_text
++):
++    """A delayed or skipped BOS must not hide the following trusted terminal."""
++    scanner = TokenIDScanner(
++        {1: DROP_TERMINAL, 2: "TOOL_START"},
++        strict_tokenizer,
++        strict_token_spans=True,
++    )
++    assert scanner.scan("", [1, 2, 0]) == []
++    assert scanner.scan(bos_text[:3], []) == []
++    items = list(scanner.scan(bos_text[3:] + "<call>a", []))
++    items.extend(scanner.flush_pending())
++
++    assert [item.terminal for item in items if isinstance(item, PreLexedTerminal)] == (
++        [DROP_TERMINAL, "TOOL_START"] if bos_text else ["TOOL_START"]
++    )
++    assert "".join(item.text for item in items if isinstance(item, TextChunk)) == "a"
++    assert not scanner.has_pending
++
++
++def test_strict_scanner_delayed_text_has_linear_decode_work(strict_tokenizer):
++    """Releasing a held-back tail must not repeatedly decode all pending IDs."""
++    scanner = TokenIDScanner({}, strict_tokenizer, strict_token_spans=True)
++    token_count = 200
++    items: list[TextChunk | PreLexedTerminal] = []
++    for _ in range(token_count):
++        items.extend(scanner.scan("", [0]))
++    for _ in range(token_count):
++        items.extend(scanner.scan("a", []))
++    items.extend(scanner.flush_pending())
++
++    assert "".join(item.text for item in items) == "a" * token_count
++    assert not scanner.has_pending
++    assert strict_tokenizer.decoded_ids <= 3 * token_count
++
++
++@pytest.mark.parametrize("with_terminal", [False, True])
++def test_strict_scanner_reuses_decode_work_for_aligned_runs(
++    strict_tokenizer, with_terminal
++):
++    """Measure decode work, not timing, on full runs and repeated one-token runs."""
++    scanner = TokenIDScanner(
++        {2: "TOOL_START"}, strict_tokenizer, strict_token_spans=True
++    )
++    ids = [0, 2] if with_terminal else [0, 0]
++    text = "a<call>" if with_terminal else "aa"
++    expected = (
++        [TextChunk("a", token_count=1), PreLexedTerminal("TOOL_START", 2, "<call>")]
++        if with_terminal
++        else [TextChunk("aa", token_count=2)]
++    )
++    for _ in range(32):
++        assert scanner.scan(text, ids) == expected
++    assert not scanner.has_pending
++    assert strict_tokenizer.decoded_ids <= 2
++
++
++def test_composite_terminal_variant_without_atom_stays_content():
++    """A variant lacking its required token atom must fail closed, not crash."""
++    from vllm.parser.engine.incremental_lexer import (
++        CONTENT_TERMINAL,
++        IncrementalLexer,
++        LexToken,
++        terminals_from_literals,
++    )
++
++    atom = "｜DSML｜"
++    trusted = f"<{atom} parameter"
++    lexer = IncrementalLexer(
++        terminals_from_literals({"PARAM_START": (trusted, "parameter")}),
++        token_id_guards={"PARAM_START": atom},
++    )
++    lexer.require_token_ids = True
++    assert lexer.feed("parameter") == [LexToken(CONTENT_TERMINAL, "parameter")]
++    spans = ((1, 1 + len(atom)),)
++    assert lexer.feed(trusted, token_id_spans=spans) == [
++        LexToken("PARAM_START", trusted, token_id_spans=spans)
++    ]
++
++
++def test_strict_scanner_invalid_utf8_does_not_hide_held_back_tokens(strict_tokenizer):
++    """U+FFFD expansion must not make a held-back prefix look byte-aligned."""
++    scanner = TokenIDScanner(
++        {2: "TOOL_START"}, strict_tokenizer, strict_token_spans=True
++    )
++    # ByteLevel piece ÿ represents byte 0xFF; its replacement takes three bytes.
++    assert strict_tokenizer.decode([3, 0, 4]) == "\ufffdab"
++    assert scanner.scan("\ufffd", [3, 0, 4]) == [TextChunk("\ufffd", token_count=1)]
++    assert scanner.scan("ab<call>", [2]) == [
++        TextChunk("ab", token_count=2),
++        PreLexedTerminal("TOOL_START", 2, "<call>"),
++    ]
++    assert not scanner.has_pending
++
++
+ def _gemma4_vocab() -> dict[str, int]:
+     return {
+         _CHANNEL_START_TAG: _CHANNEL_START_TID,
+diff --git a/tests/tool_parsers/test_deepseekv41_tool_parser.py b/tests/tool_parsers/test_deepseekv41_tool_parser.py
+new file mode 100644
+index 000000000..23322b016
+--- /dev/null
++++ b/tests/tool_parsers/test_deepseekv41_tool_parser.py
+@@ -0,0 +1,658 @@
++# SPDX-License-Identifier: Apache-2.0
++# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
++"""DeepSeek V4.1 output parsing through ParserManager with the real tokenizer.
++
++The V4.1 tokenizer spells each DSML marker as ordinary text around the
++``｜DSML｜`` token, so the model can also write any marker with ordinary
++tokens. Only markers whose ``｜DSML｜`` arrived as the token are structure.
++"""
++
++import json
++import os
++import subprocess
++import sys
++import textwrap
++
++import pytest
++
++from vllm.entrypoints.openai.chat_completion.protocol import ChatCompletionRequest
++from vllm.parser.parser_manager import ParserManager
++from vllm.tokenizers import get_tokenizer
++from vllm.tokenizers.detokenizer_utils import detokenize_incrementally
++
++pytestmark = pytest.mark.skip_global_cleanup
++
++MODEL = "deepseek-ai/DeepSeek-V4.1-Flash"
++ATOM = "｜DSML｜"
++THINK_START_ID = 128821
++THINK_END_ID = 128822
++CALL = (
++    '<｜DSML｜ calls><｜DSML｜ invoke name="calc">'
++    '<｜DSML｜ parameter name="value" string="false">42</｜DSML｜ parameter>'
++    "</｜DSML｜ invoke></｜DSML｜ calls>"
++)
++TWIN = CALL.replace(">42<", ">99<")
++INVOKE = CALL.removeprefix("<｜DSML｜ calls>").removesuffix("</｜DSML｜ calls>")
++STRING_HEAD = (
++    '<｜DSML｜ calls><｜DSML｜ invoke name="echo">'
++    '<｜DSML｜ parameter name="text" string="true">'
++)
++STRING_TAIL = "</｜DSML｜ parameter></｜DSML｜ invoke></｜DSML｜ calls>"
++CALC = ("calc", {"value": 42})
++TOOLS = [
++    {
++        "type": "function",
++        "function": {
++            "name": name,
++            "parameters": {
++                "type": "object",
++                "properties": {key: {"type": kind} for key, kind in props},
++            },
++        },
++    }
++    for name, props in (
++        ("calc", [("value", "integer")]),
++        ("echo", [("text", "string"), ("note", "string")]),
++    )
++]
++SCHEDULES = ["nonstream", "one_chunk", "per_token", "text_lag3"]
++
++
++@pytest.fixture(scope="module")
++def tokenizer():
++    from pathlib import Path
++
++    hub = Path(os.environ.get("HF_HUB_CACHE", Path.home() / ".cache/huggingface/hub"))
++    snapshots = sorted(
++        hub.glob("models--deepseek-ai--DeepSeek-V4.1-Flash*/snapshots/*")
++    )
++    for candidate in (
++        *(["/models"] if Path("/models/tokenizer.json").is_file() else []),
++        *(str(s) for s in snapshots),
++        MODEL,
++    ):
++        try:
++            return get_tokenizer(candidate, tokenizer_mode="deepseek_v41")
++        except Exception:
++            if candidate == MODEL:
++                if os.environ.get("HF_HUB_OFFLINE") or os.environ.get(
++                    "TRANSFORMERS_OFFLINE"
++                ):
++                    pytest.skip(f"needs Hugging Face {MODEL} (offline)")
++                raise
++
++
++def marker_ids(tokenizer, text):
++    ids = tokenizer.encode(text, add_special_tokens=False)
++    assert tokenizer.convert_tokens_to_ids(ATOM) in ids
++    return ids
++
++
++def text_ids(tokenizer, text):
++    """Spell *text* with ordinary tokens only, as the model can."""
++    added = set(tokenizer.get_added_vocab().values())
++    ids = []
++    for token_id in tokenizer.encode(text, add_special_tokens=False):
++        if token_id not in added:
++            ids.append(token_id)
++            continue
++        for ch in tokenizer.decode([token_id]):
++            ids += tokenizer.encode(ch, add_special_tokens=False)
++    assert added.isdisjoint(ids) and tokenizer.decode(ids) == text
++    return ids
++
++
++def make_parser(tokenizer, thinking):
++    cls = ParserManager.get_parser(
++        tool_parser_name="deepseek_v41",
++        reasoning_parser_name="deepseek_v41",
++        enable_auto_tools=True,
++    )
++    assert cls is not None
++    request = ChatCompletionRequest(
++        model=MODEL,
++        messages=[{"role": "user", "content": "hi"}],
++        tools=TOOLS,
++        include_reasoning=True,
++        chat_template_kwargs={"thinking": thinking},
++    )
++    parser = cls(tokenizer, TOOLS, chat_template_kwargs={"thinking": thinking})
++    return parser, request, [THINK_START_ID if thinking else THINK_END_ID]
++
++
++def schedule_deltas(tokenizer, ids, prompt_ids, schedule):
++    if schedule == "one_chunk":
++        return [(tokenizer.decode(ids), ids)]
++    deltas = []
++    if schedule == "per_token":
++        tokens, prefix_offset, read_offset = None, 0, 0
++        for index in range(len(ids)):
++            new_tokens, text, prefix_offset, read_offset = detokenize_incrementally(
++                tokenizer,
++                prompt_ids + ids[: index + 1],
++                tokens,
++                prefix_offset,
++                read_offset,
++                skip_special_tokens=False,
++                spaces_between_special_tokens=False,
++            )
++            tokens = new_tokens if tokens is None else tokens + new_tokens
++            deltas.append((text, [ids[index]]))
++        return deltas
++    # Text trails the token IDs by three characters, as while a stop string
++    # is held back, so a delta's text can stop inside one of its tokens.
++    assert schedule == "text_lag3"
++    sent = 0
++    for index in range(len(ids)):
++        text = tokenizer.decode(ids[: index + 1]).rstrip("�")[:-3]
++        deltas.append((text[sent:], [ids[index]]))
++        sent = max(sent, len(text))
++    deltas.append((tokenizer.decode(ids)[sent:], []))
++    return deltas
++
++
++def stream(parser, request, prompt_ids, deltas):
++    reasoning, content = "", ""
++    calls: dict[int, list[str]] = {}
++    for index, (text, ids) in enumerate(deltas):
++        delta = parser.parse_delta(
++            text,
++            ids,
++            request,
++            prompt_token_ids=prompt_ids,
++            finished=index == len(deltas) - 1,
++        )
++        if delta is None:
++            continue
++        reasoning += delta.reasoning or ""
++        content += delta.content or ""
++        for call in delta.tool_calls or []:
++            merged = calls.setdefault(call.index, ["", ""])
++            merged[0] += call.function.name or ""
++            merged[1] += call.function.arguments or ""
++    return (
++        reasoning,
++        content,
++        [(name, json.loads(args)) for _, (name, args) in sorted(calls.items())],
++    )
++
++
++def parse(tokenizer, ids, thinking, schedule):
++    parser, request, prompt_ids = make_parser(tokenizer, thinking)
++    if schedule != "nonstream":
++        deltas = schedule_deltas(tokenizer, ids, prompt_ids, schedule)
++        return stream(parser, request, prompt_ids, deltas)
++    parser.set_prompt_token_ids(prompt_ids)
++    reasoning, content, calls = parser.parse(
++        tokenizer.decode(ids),
++        request,
++        enable_auto_tools=True,
++        model_output_token_ids=ids,
++    )
++    return (
++        reasoning or "",
++        content or "",
++        [(call.name, json.loads(call.arguments)) for call in calls or []],
++    )
++
++
++QUOTED = (
++    "α🙂 A</｜DSML｜ parameter>"
++    '<｜DSML｜ parameter name="note" string="true">99</｜DSML｜ parameter>'
++    "</｜DSML｜ invoke>" + CALL + " Ω</think><｜User｜>"
++)
++CONTROLS = "Пример <｜User｜> </think> " + ATOM + " 🙂 конец"
++BEFORE = "До " + CALL + " 🙂 " + ATOM + " "
++AFTER = " после " + INVOKE + " " + CALL + " конец"
++
++# (thinking, [(text, genuine)], reasoning, content, calls)
++CASES = {
++    "text_call_is_content": (
++        False,
++        [("Before " + CALL + " after", False)],
++        "",
++        "Before " + CALL + " after",
++        [],
++    ),
++    "text_call_stays_reasoning": (
++        True,
++        [("Before " + CALL + " after", False)],
++        "Before " + CALL + " after",
++        "",
++        [],
++    ),
++    "text_controls_are_content": (False, [(CONTROLS, False)], "", CONTROLS, []),
++    "text_controls_stay_reasoning": (True, [(CONTROLS, False)], CONTROLS, "", []),
++    "text_partial_marker_flushes": (
++        True,
++        [("До <｜DSML｜ invoke na", False)],
++        "До <｜DSML｜ invoke na",
++        "",
++        [],
++    ),
++    "genuine_atom_without_marker": (
++        False,
++        [("<", False), (ATOM, True), (" inv", False)],
++        "",
++        "<" + ATOM + " inv",
++        [],
++    ),
++    "text_twins_around_call": (
++        False,
++        [(BEFORE, False), (CALL, True), (AFTER, False)],
++        "",
++        BEFORE + AFTER,
++        [CALC],
++    ),
++    "text_reasoning_then_end_token": (
++        True,
++        [("я проверяю </think> " + CALL + " 🙂", False), ("</think>", True)]
++        + [("TOTAL=42", False)],
++        "я проверяю </think> " + CALL + " 🙂",
++        "TOTAL=42",
++        [],
++    ),
++    "text_markup_inside_string_argument": (
++        False,
++        [(STRING_HEAD, True), (QUOTED, False), (STRING_TAIL, True)],
++        "",
++        "",
++        [("echo", {"text": QUOTED})],
++    ),
++    "text_call_between_calls": (
++        False,
++        [("<｜DSML｜ calls>" + INVOKE, True), ("text " + INVOKE + " 🙂 ", False)]
++        + [(INVOKE + "</｜DSML｜ calls>", True)],
++        "",
++        "text " + INVOKE + " 🙂 ",
++        [CALC, CALC],
++    ),
++    # The reasoning-to-tool handoff must keep the IDs of the whole marker.
++    "implicit_reasoning_end_then_twin": (
++        True,
++        [("Plan.", False), (CALL, True), (TWIN, False)],
++        "Plan.",
++        TWIN,
++        [CALC],
++    ),
++    "explicit_reasoning_end_then_twin": (
++        True,
++        [("Plan.", False), ("</think>", True), (CALL, True), (TWIN, False)],
++        "Plan.",
++        TWIN,
++        [CALC],
++    ),
++    "emoji_then_twin": (
++        False,
++        [("🙂", False), (CALL, True), (TWIN, False)],
++        "",
++        "🙂" + TWIN,
++        [CALC],
++    ),
++    "delayed_bos_before_call": (
++        False,
++        [("<｜begin▁of▁sentence｜>" + CALL, True)],
++        "",
++        "",
++        [CALC],
++    ),
++}
++
++
++@pytest.mark.parametrize("schedule", SCHEDULES)
++@pytest.mark.parametrize("case", CASES)
++def test_only_dsml_token_markers_are_structure(tokenizer, case, schedule):
++    thinking, parts, reasoning, content, calls = CASES[case]
++    ids = []
++    for text, genuine in parts:
++        if text == "</think>" and genuine:
++            ids.append(THINK_END_ID)
++        else:
++            ids += (marker_ids if genuine else text_ids)(tokenizer, text)
++    assert parse(tokenizer, ids, thinking, schedule) == (reasoning, content, calls)
++
++
++def test_split_character_does_not_rebind_marker_to_twin(tokenizer):
++    # The first delta ends inside the emoji, so its text arrives later.
++    emoji = text_ids(tokenizer, "🙂")
++    assert len(emoji) == 2
++    ids = emoji + marker_ids(tokenizer, CALL) + text_ids(tokenizer, TWIN)
++    parser, request, prompt_ids = make_parser(tokenizer, False)
++    deltas = [("", emoji[:1]), (tokenizer.decode(ids), ids[1:])]
++    assert stream(parser, request, prompt_ids, deltas) == ("", "🙂" + TWIN, [CALC])
++
++
++def test_delta_text_inside_token_keeps_alignment(tokenizer):
++    # A delta whose text stops inside its only token must not bypass the
++    # token-ID scanner, or the reasoning end below is read as text.
++    plan = tokenizer.encode("Plan", add_special_tokens=False)
++    assert len(plan) == 1
++    ids = plan + [THINK_END_ID] + marker_ids(tokenizer, CALL)
++    parser, request, prompt_ids = make_parser(tokenizer, True)
++    deltas = [("Pl", plan), (tokenizer.decode(ids)[2:], ids[1:])]
++    assert stream(parser, request, prompt_ids, deltas) == ("Plan", "", [CALC])
++
++
++def test_text_between_calls_keeps_order(tokenizer):
++    # The second delta starts a call after text held over from the first;
++    # the text deferred in the first delta must still come first.
++    first = marker_ids(tokenizer, CALL)
++    middle = text_ids(tokenizer, "note " + INVOKE)
++    last = marker_ids(tokenizer, CALL)
++    ids = first + middle + last
++    cuts = [len(first) + len(text_ids(tokenizer, "note <")), len(ids) - 3, len(ids)]
++    text, deltas, start = tokenizer.decode(ids), [], 0
++    for cut in cuts:
++        sent = len(tokenizer.decode(ids[:start]))
++        deltas.append((text[sent : len(tokenizer.decode(ids[:cut]))], ids[start:cut]))
++        start = cut
++    parser, request, prompt_ids = make_parser(tokenizer, False)
++    assert stream(parser, request, prompt_ids, deltas) == (
++        "",
++        "note " + INVOKE,
++        [CALC, CALC],
++    )
++
++
++@pytest.mark.parametrize("schedule", SCHEDULES)
++def test_text_parameter_tag_does_not_extend_streamed_value(tokenizer, schedule):
++    ids = (
++        marker_ids(tokenizer, STRING_HEAD)
++        + text_ids(tokenizer, "abc")
++        + marker_ids(tokenizer, "</｜DSML｜ parameter>")
++        + text_ids(tokenizer, '<｜DSML｜ parameter name="note" string="true">x y z')
++        + marker_ids(tokenizer, "</｜DSML｜ invoke></｜DSML｜ calls>")
++    )
++    assert parse(tokenizer, ids, False, schedule) == (
++        "",
++        "",
++        [("echo", {"text": "abc"})],
++    )
++
++
++def lagged_deltas(tokenizer, ids, group, lag, *, omit_bos=False):
++    deltas, sent = [], 0
++    for start in range(0, len(ids), group):
++        end = min(start + group, len(ids))
++        text = tokenizer.decode(ids[:end]).rstrip("�")
++        if omit_bos:
++            text = text.removeprefix(tokenizer.bos_token)
++        stop = max(sent, len(text) - lag)
++        deltas.append((text[sent:stop], ids[start:end]))
++        sent = stop
++    deltas.append((text[sent:], []))
++    return deltas
++
++
++@pytest.mark.parametrize("group", [1, 3, 1000])
++@pytest.mark.parametrize("lag", [0, 3, 17])
++@pytest.mark.parametrize("genuine", [False, True])
++@pytest.mark.parametrize("name", ["note", "note>more"])
++def test_unclosed_parameter_followed_by_header(tokenizer, group, lag, genuine, name):
++    header = f'<｜DSML｜ parameter name="{name}" string="true">second'
++    ids = (
++        marker_ids(tokenizer, STRING_HEAD)
++        + text_ids(tokenizer, "a > b")
++        + (marker_ids if genuine else text_ids)(tokenizer, header)
++        + marker_ids(tokenizer, STRING_TAIL)
++    )
++    expected = (
++        {"text": "a > b", name: "second"} if genuine else {"text": "a > b" + header}
++    )
++    parser, request, prompt_ids = make_parser(tokenizer, False)
++    assert stream(
++        parser, request, prompt_ids, lagged_deltas(tokenizer, ids, group, lag)
++    ) == ("", "", [("echo", expected)])
++
++
++@pytest.mark.parametrize("group", [1, 3, 1000])
++@pytest.mark.parametrize("lag", [0, 3, 17])
++@pytest.mark.parametrize("omit_bos", [False, True])
++def test_delayed_drop_keeps_following_call(tokenizer, group, lag, omit_bos):
++    ids = [tokenizer.bos_token_id] + marker_ids(tokenizer, CALL)
++    parser, request, prompt_ids = make_parser(tokenizer, False)
++    assert stream(
++        parser,
++        request,
++        prompt_ids,
++        lagged_deltas(tokenizer, ids, group, lag, omit_bos=omit_bos),
++    ) == ("", "", [CALC])
++
++
++@pytest.mark.parametrize("count", [100, 200])
++@pytest.mark.parametrize("lag", [3, 10000])
++def test_delayed_drop_decode_work_is_linear(tokenizer, monkeypatch, count, lag):
++    ids = [tokenizer.bos_token_id] + text_ids(tokenizer, " hello" * count)
++    parser, request, prompt_ids = make_parser(tokenizer, False)
++    deltas = lagged_deltas(tokenizer, ids, 1, lag)
++    decode = tokenizer.decode
++    decoded_ids = decode_calls = 0
++
++    def counted_decode(token_ids, *args, **kwargs):
++        nonlocal decoded_ids, decode_calls
++        decode_calls += 1
++        decoded_ids += len(token_ids)
++        return decode(token_ids, *args, **kwargs)
++
++    monkeypatch.setattr(tokenizer, "decode", counted_decode)
++    actual = stream(parser, request, prompt_ids, deltas)
++    assert decoded_ids <= 8 * len(ids), (decode_calls, decoded_ids, len(ids))
++    assert actual == ("", " hello" * count, [])
++
++
++@pytest.mark.parametrize("strict_calling", ["0", "1"])
++def test_constrained_tool_choices_follow_adjusted_request(tokenizer, strict_calling):
++    # Adapter capabilities are selected at import time from this env var.
++    result = subprocess.run(
++        [
++            sys.executable,
++            "-c",
++            textwrap.dedent("""\
++                import json
++                import os
++                from itertools import product
++                from tests.tool_parsers.test_deepseekv41_tool_parser import (
++                    CALL, CALC, SCHEDULES, THINK_END_ID, make_parser,
++                    schedule_deltas, stream, text_ids,
++                    tokenizer as tokenizer_fixture,
++                )
++
++                tokenizer = tokenizer_fixture.__wrapped__()
++                strict = os.environ["VLLM_ENFORCE_STRICT_TOOL_CALLING"] == "1"
++                failures = []
++                named = {"type": "function", "function": {"name": "calc"}}
++                for choice in ("required", named):
++                    for thinking, schedule in product((False, True), SCHEDULES):
++                        parser, request, prompt_ids = make_parser(tokenizer, thinking)
++                        request = type(request).model_validate({
++                            **request.model_dump(), "tool_choice": choice,
++                        })
++                        request = parser.adjust_request(request)
++                        assert request.structured_outputs is not None
++                        if strict:
++                            assert request.structured_outputs.structural_tag is not None
++                            text = CALL
++                        else:
++                            assert request.structured_outputs.json is not None
++                            text = ('[{"name":"calc","parameters":{"value":42}}]'
++                                    if choice == "required" else '{"value":42}')
++                        ids = tokenizer.encode(text, add_special_tokens=False)
++                        plan = "Quote </think> as text." if thinking else ""
++                        if thinking:
++                            ids = text_ids(tokenizer, plan) + [THINK_END_ID] + ids
++                            text = tokenizer.decode(ids)
++                        if schedule == "nonstream":
++                            parser.set_prompt_token_ids(prompt_ids)
++                            reasoning, content, calls = parser.parse(
++                                text, request, True, ids)
++                            actual = (reasoning or "", content or "", [
++                                (c.name, json.loads(c.arguments)) for c in calls or []
++                            ])
++                        else:
++                            actual = stream(parser, request, prompt_ids,
++                                schedule_deltas(tokenizer, ids, prompt_ids, schedule))
++                        if actual != (plan, "", [CALC]):
++                            failures.append((choice, thinking, schedule, actual))
++                assert not failures, failures
++                """),
++        ],
++        env={**os.environ, "VLLM_ENFORCE_STRICT_TOOL_CALLING": strict_calling},
++        capture_output=True,
++        text=True,
++    )
++    assert result.returncode == 0, result.stdout + result.stderr
++
++
++@pytest.mark.parametrize("schedule", ["nonstream", "one_chunk", "per_token"])
++def test_unified_parser_records_tool_invocations(tokenizer, schedule):
++    from prometheus_client import REGISTRY
++
++    from vllm.parser.metrics import init_parser_metrics
++
++    model = MODEL + "-dsml-guards"
++    init_parser_metrics(model_name=model)
++    labels = {
++        "model_name": model,
++        "mode": "non_streaming" if schedule == "nonstream" else "streaming",
++        "request_type": "chat_completions",
++        "outcome": "tool_call",
++    }
++
++    def count(outcome):
++        return REGISTRY.get_sample_value(
++            "vllm:tool_call_parser_invocations_total", {**labels, "outcome": outcome}
++        )
++
++    before = count("tool_call")
++    total = before + count("no_tool_call")
++    ids = marker_ids(tokenizer, CALL)
++    assert parse(tokenizer, ids, False, schedule) == ("", "", [CALC])
++    assert count("tool_call") > before
++    invocations = len(ids) if schedule == "per_token" else 1
++    assert count("tool_call") + count("no_tool_call") == total + invocations
++
++
++@pytest.mark.parametrize("schedule", SCHEDULES)
++@pytest.mark.parametrize(
++    "role_token", ["<｜Assistant｜>", "<｜User｜>", "<｜System｜>"]
++)
++def test_task_prompt_does_not_reuse_previous_turn_reasoning_end(
++    tokenizer, schedule, role_token
++):
++    """Task prompts without a think marker cannot inherit an earlier closed block."""
++    ids = text_ids(tokenizer, "new reasoning")
++    parser, request, _ = make_parser(tokenizer, True)
++    prompt_ids = [THINK_END_ID] + tokenizer.encode(
++        role_token + "<｜query｜>", add_special_tokens=False
++    )
++    assert not parser.is_reasoning_end(prompt_ids)
++    if schedule == "nonstream":
++        parser.set_prompt_token_ids(prompt_ids)
++        reasoning, content, _ = parser.parse(tokenizer.decode(ids), request, True, ids)
++        actual = (reasoning or "", content or "")
++    else:
++        deltas = schedule_deltas(tokenizer, ids, prompt_ids, schedule)
++        actual = stream(parser, request, prompt_ids, deltas)[:2]
++    assert actual == ("new reasoning", "")
++    assert parser.count_reasoning_tokens(ids) == len(ids)
++
++
++@pytest.mark.parametrize("schedule", SCHEDULES)
++def test_prompt_that_closes_reasoning_starts_in_content(tokenizer, schedule):
++    ids = text_ids(tokenizer, "already content")
++    parser, request, _ = make_parser(tokenizer, True)
++    prompt_ids = [THINK_START_ID, THINK_END_ID]
++    if schedule == "nonstream":
++        parser.set_prompt_token_ids(prompt_ids)
++        reasoning, content, _ = parser.parse(tokenizer.decode(ids), request, True, ids)
++        actual = (reasoning or "", content or "")
++    else:
++        deltas = schedule_deltas(tokenizer, ids, prompt_ids, schedule)
++        actual = stream(parser, request, prompt_ids, deltas)[:2]
++    assert actual == ("", "already content")
++    assert parser.count_reasoning_tokens(ids) == 0
++
++
++@pytest.mark.parametrize("schedule", SCHEDULES)
++def test_tool_choice_none_keeps_call_as_content(tokenizer, schedule):
++    ids = text_ids(tokenizer, "Sure. ") + marker_ids(tokenizer, CALL)
++    parser, request, prompt_ids = make_parser(tokenizer, False)
++    request.tool_choice = "none"
++    if schedule == "nonstream":
++        parser.set_prompt_token_ids(prompt_ids)
++        reasoning, content, calls = parser.parse(
++            tokenizer.decode(ids), request, True, ids
++        )
++        actual = (reasoning or "", content or "", calls or [])
++    else:
++        deltas = schedule_deltas(tokenizer, ids, prompt_ids, schedule)
++        actual = stream(parser, request, prompt_ids, deltas)
++    assert actual == ("", "Sure. " + CALL, [])
++
++
++@pytest.mark.parametrize("schedule", SCHEDULES)
++def test_tool_only_and_reasoning_only_parsers_keep_token_provenance(
++    tokenizer, schedule
++):
++    # Tool-only configuration (no reasoning parser)
++    tool_only_cls = ParserManager.get_parser(
++        tool_parser_name="deepseek_v41",
++        reasoning_parser_name=None,
++        enable_auto_tools=True,
++    )
++    assert tool_only_cls is not None
++    request = ChatCompletionRequest(
++        model=MODEL,
++        messages=[{"role": "user", "content": "hi"}],
++        tools=TOOLS,
++        include_reasoning=True,
++    )
++    ids = (
++        text_ids(tokenizer, "Before " + CALL + " ")
++        + marker_ids(tokenizer, STRING_HEAD)
++        + text_ids(tokenizer, QUOTED)
++        + marker_ids(tokenizer, STRING_TAIL)
++    )
++    parser = tool_only_cls(tokenizer, TOOLS)
++    prompt_ids = [THINK_END_ID]
++    if schedule == "nonstream":
++        parser.set_prompt_token_ids(prompt_ids)
++        reasoning, content, calls = parser.parse(
++            tokenizer.decode(ids), request, True, ids
++        )
++        actual = (
++            reasoning or "",
++            content or "",
++            [(c.name, json.loads(c.arguments)) for c in calls or []],
++        )
++    else:
++        deltas = schedule_deltas(tokenizer, ids, prompt_ids, schedule)
++        actual = stream(parser, request, prompt_ids, deltas)
++    assert actual == ("", "Before " + CALL + " ", [("echo", {"text": QUOTED})])
++
++    # Reasoning-only configuration (no tool parser)
++    reasoning_only_cls = ParserManager.get_parser(
++        tool_parser_name=None,
++        reasoning_parser_name="deepseek_v41",
++        enable_auto_tools=False,
++    )
++    assert reasoning_only_cls is not None
++    r_ids = (
++        text_ids(tokenizer, "Draft </think> " + CALL)
++        + [THINK_END_ID]
++        + text_ids(tokenizer, "Done")
++    )
++    r_parser = reasoning_only_cls(
++        tokenizer, None, chat_template_kwargs={"thinking": True}
++    )
++    r_prompt_ids = [THINK_START_ID]
++    if schedule == "nonstream":
++        r_parser.set_prompt_token_ids(r_prompt_ids)
++        reasoning, content, calls = r_parser.parse(
++            tokenizer.decode(r_ids), request, False, r_ids
++        )
++        r_actual = (reasoning or "", content or "", calls or [])
++    else:
++        deltas = schedule_deltas(tokenizer, r_ids, r_prompt_ids, schedule)
++        r_actual = stream(r_parser, request, r_prompt_ids, deltas)
++    assert r_actual == ("Draft </think> " + CALL, "Done", [])
+diff --git a/vllm/parser/deepseek_v4.py b/vllm/parser/deepseek_v4.py
+index f18b4ad46..1c7c209a8 100644
+--- a/vllm/parser/deepseek_v4.py
++++ b/vllm/parser/deepseek_v4.py
+@@ -160,7 +160,12 @@ def _dsml_arg_value_extender(
+     name, is_str, _, held_back = open_param
+     if is_str != "true" or name in names or held_back:
+         return None
++    return _dsml_open_value_extender(raw_args, param_start, param_close)
+ 
++
++def _dsml_open_value_extender(
++    raw_args: str, param_start: str, param_close: str
++) -> ArgValueExtender:
+     keep = max(len(param_start), len(param_close)) - 1
+     tail = raw_args[-keep:]
+ 
+diff --git a/vllm/parser/deepseek_v41.py b/vllm/parser/deepseek_v41.py
+index 76c7ad19b..8ef0091bb 100644
+--- a/vllm/parser/deepseek_v41.py
++++ b/vllm/parser/deepseek_v41.py
+@@ -2,17 +2,33 @@
+ # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+ """DeepSeek V4.1 reasoning and spaced DSML tool calls."""
+ 
++from __future__ import annotations
++
+ import functools
++import json
++from collections.abc import Iterable, Sequence
+ from dataclasses import replace
+ 
++import regex as re
++
++from vllm.parser.abstract_parser import DelegatingParser
+ from vllm.parser.deepseek_v4 import (
+     DeepSeekV4Parser,
+     _dsml_arg_converter,
+     _dsml_arg_value_extender,
++    _dsml_open_value_extender,
+     _param_patterns,
++    _unwrap_wrapper_args,
+     deepseek_v4_config,
+ )
++from vllm.parser.engine.adapters import (
++    ParserEngineReasoningAdapter,
++    ParserEngineToolAdapter,
++)
+ from vllm.parser.engine.parser_engine_config import ParserEngineConfig
++from vllm.parser.metrics import record_tool_parser_invocation
++
++DSML_ATOM = "｜DSML｜"
+ 
+ DSML_TOOL_START = "<｜DSML｜ calls>"
+ DSML_TOOL_END = "</｜DSML｜ calls>"
+@@ -22,6 +38,59 @@ DSML_PARAM_START = "<｜DSML｜ parameter"
+ DSML_PARAM_CLOSE = "</｜DSML｜ parameter>"
+ 
+ _PARAM_RE, _PARTIAL_PARAM_RE = _param_patterns(DSML_PARAM_START, DSML_PARAM_CLOSE)
++_PARAM_HEAD_RE = re.compile(
++    re.escape(DSML_PARAM_START) + r'\s+name="([^"]+)"(?:\s+string="([^"]*)")?\s*>'
++)
++
++
++def _token_origin_boundaries(
++    raw_args: str, spans: Iterable[tuple[int, int]]
++) -> list[tuple[int, int, re.Match | None]]:
++    """Parameter tags whose DSML atom came from the DSML token, in text order.
++
++    Each entry is ``(start, end, head)``; ``head`` is ``None`` for a closer
++    or an unfinished header, which must not extend the preceding value.
++    """
++    trusted = set(spans)
++    boundaries = []
++    for head in _PARAM_HEAD_RE.finditer(raw_args, partial=True):
++        atom_start = head.start() + 1
++        if (atom_start, atom_start + len(DSML_ATOM)) in trusted:
++            boundaries.append(
++                (head.start(), head.end(), None if head.partial else head)
++            )
++    for close in re.finditer(re.escape(DSML_PARAM_CLOSE), raw_args):
++        atom_start = close.start() + 2
++        if (atom_start, atom_start + len(DSML_ATOM)) in trusted:
++            boundaries.append((close.start(), close.end(), None))
++    boundaries.sort(key=lambda entry: entry[0])
++    return boundaries
++
++
++def _token_origin_args(
++    raw_args: str, partial: bool, spans: Iterable[tuple[int, int]]
++) -> str:
++    """Parse only parameter boundaries carrying a genuine DSML token atom."""
++    boundaries = _token_origin_boundaries(raw_args, spans)
++    params = {}
++    for index, (_, end, head) in enumerate(boundaries):
++        if head is None:
++            continue
++        complete = index + 1 < len(boundaries)
++        if not complete and not partial:
++            continue
++        value_end = boundaries[index + 1][0] if complete else len(raw_args)
++        value = raw_args[end:value_end]
++        name, is_str = head.group(1), head.group(2)
++        if is_str == "true":
++            params[name] = value
++        else:
++            try:
++                params[name] = json.loads(value)
++            except (json.JSONDecodeError, ValueError):
++                if complete:
++                    params[name] = value
++    return json.dumps(params, ensure_ascii=False)
+ 
+ 
+ @functools.cache
+@@ -38,11 +107,18 @@ def deepseek_v41_config(thinking: bool = False) -> ParserEngineConfig:
+     return replace(
+         config,
+         name="deepseek_v41",
++        turn_boundary_tokens=frozenset(
++            {"<｜Assistant｜>", "<｜User｜>", "<｜System｜>"}
++        ),
+         terminals={**config.terminals, **terminal_overrides},
+         token_id_terminals={
+-            key: terminal_overrides.get(key, value)
+-            for key, value in config.token_id_terminals.items()
++            **{
++                key: terminal_overrides.get(key, value)
++                for key, value in config.token_id_terminals.items()
++            },
++            "DSML_ATOM": DSML_ATOM,
+         },
++        composite_token_id_terminals=dict.fromkeys(terminal_overrides, "DSML_ATOM"),
+         arg_converter=functools.partial(
+             _dsml_arg_converter,
+             param_re=_PARAM_RE,
+@@ -61,3 +137,183 @@ def deepseek_v41_config(thinking: bool = False) -> ParserEngineConfig:
+ 
+ class DeepSeekV41Parser(DeepSeekV4Parser):
+     parser_config = staticmethod(deepseek_v41_config)
++
++    def __init__(self, tokenizer, tools=None, **kwargs) -> None:
++        super().__init__(tokenizer, tools, **kwargs)
++        self._arg_value_extender = self._extend_open_value
++
++    @property
++    def _token_origin(self) -> bool:
++        return self._engine._ever_had_token_ids and self._engine._has_composite_ids
++
++    def _arg_slot(self, raw_args: str):
++        return next(
++            (slot for slot in reversed(self._tool_slots) if slot.args is raw_args), None
++        )
++
++    def _convert_args(self, raw_args: str, partial: bool) -> str:
++        if not self._token_origin:
++            return super()._convert_args(raw_args, partial)
++        slot = self._arg_slot(raw_args)
++        spans = slot.arg_token_id_spans if slot is not None else ()
++        result = _token_origin_args(raw_args, partial, spans or ())
++        return _unwrap_wrapper_args(
++            result, self._tools, slot.name if slot is not None else None
++        )
++
++    def _extend_open_value(self, raw_args: str):
++        extender = self.parser_engine_config.arg_value_extender
++        assert extender is not None
++        if not self._token_origin:
++            return extender(raw_args)
++        # The text-based extender would trust parameter tags spelled in text.
++        slot = self._arg_slot(raw_args)
++        spans = slot.arg_token_id_spans if slot is not None else ()
++        boundaries = _token_origin_boundaries(raw_args, spans or ())
++        if not boundaries or (head := boundaries[-1][2]) is None:
++            return None
++        names = {entry[2].group(1) for entry in boundaries[:-1] if entry[2]}
++        if head.group(2) != "true" or head.group(1) in names:
++            return None
++        return _dsml_open_value_extender(raw_args, DSML_PARAM_START, DSML_PARAM_CLOSE)
++
++    def adjust_initial_state_from_prompt(self, prompt_token_ids: Sequence[int]) -> None:
++        self.set_prompt_token_ids(prompt_token_ids)
++        self._reset()
++
++
++class DeepSeekV41ServingParser(DelegatingParser):
++    """Keep serving adapters and request constraints around one output engine."""
++
++    def __init__(self, tokenizer, tools=None, **kwargs):
++        super().__init__(tokenizer, tools, **kwargs)
++        reasoning_adapter = self._reasoning_parser
++        tool_adapter = self._tool_parser
++        assert reasoning_adapter is None or isinstance(
++            reasoning_adapter, ParserEngineReasoningAdapter
++        )
++        assert tool_adapter is None or isinstance(
++            tool_adapter, ParserEngineToolAdapter
++        )
++        assert reasoning_adapter is not None or tool_adapter is not None
++        self._reasoning_adapter = reasoning_adapter
++        if reasoning_adapter is not None:
++            self._unified_parser = reasoning_adapter._parser_engine
++            self._unified_parser._tools = tools
++            if tool_adapter is not None:
++                tool_adapter._parser_engine = self._unified_parser
++            else:
++                self._unified_parser.skip_tool_parsing = True
++        else:
++            assert tool_adapter is not None
++            self._unified_parser = tool_adapter._parser_engine
++        self._unified_parser._stream_state = self._stream_state
++        self._skip_tools_override = self._tool_parser is None
++
++    @property
++    def skip_tool_parsing(self):
++        return self._unified_parser.skip_tool_parsing
++
++    @skip_tool_parsing.setter
++    def skip_tool_parsing(self, value):
++        self._skip_tools_override = value
++        self._unified_parser.skip_tool_parsing = value
++
++    def _prepare_tools(self, request, enable_auto_tools=True):
++        self._unified_parser.skip_tool_parsing = (
++            self._skip_tools_override
++            or self._tool_parser is None
++            or request.tool_choice == "none"
++            or not request.tools
++            or not enable_auto_tools
++        )
++        self._unified_parser._suppress_tool_calls = False
++
++    def _sync_reasoning(self):
++        if self._reasoning_adapter is not None:
++            self._reasoning_adapter._streaming_count_valid = True
++            self._stream_state.reasoning_ended = self._unified_parser.reasoning_ended
++        else:
++            self._stream_state.reasoning_ended = True
++
++    def set_prompt_token_ids(self, prompt_token_ids):
++        self._unified_parser.set_prompt_token_ids(prompt_token_ids)
++        if self._reasoning_adapter is not None:
++            self._reasoning_adapter._streaming_count_valid = False
++
++    def _uses_json_tool_choice(self, request):
++        return (
++            self._tool_parser is not None
++            and self._tool_parser.supports_required_and_named
++            and request.tool_choice not in (None, "auto", "none")
++        )
++
++    def parse(
++        self, model_output, request, enable_auto_tools=False, model_output_token_ids=()
++    ):
++        if self._uses_json_tool_choice(request):
++            if self._reasoning_adapter is not None:
++                # Reasoning still needs token provenance before JSON tool dispatch.
++                with self._reasoning_adapter._skip_tool_parsing():
++                    reasoning, content, _ = self._unified_parser.parse(
++                        model_output, request, enable_auto_tools, model_output_token_ids
++                    )
++                self._sync_reasoning()
++            else:
++                reasoning, content = None, model_output
++            tool_calls, content = self._extract_tool_calls(
++                content, request, enable_auto_tools
++            )
++            return reasoning, content, tool_calls
++        self._prepare_tools(request, enable_auto_tools)
++        is_tool_called: bool | Exception = False
++        try:
++            result = self._unified_parser.parse(
++                model_output, request, enable_auto_tools, model_output_token_ids
++            )
++            is_tool_called = bool(result[2])
++            self._sync_reasoning()
++            return result
++        except Exception as e:
++            is_tool_called = e
++            raise
++        finally:
++            if self._tool_parser is not None:
++                record_tool_parser_invocation(
++                    is_tool_called=is_tool_called, is_streaming=False, request=request
++                )
++
++    def parse_delta(
++        self, delta_text, delta_token_ids, request, prompt_token_ids=None, *, finished
++    ):
++        if self._uses_json_tool_choice(request):
++            # The required-choice JSON scanner needs accumulated output text.
++            self._stream_state.engine_based = False
++            return super().parse_delta(
++                delta_text,
++                delta_token_ids,
++                request,
++                prompt_token_ids,
++                finished=finished,
++            )
++        self._prepare_tools(request)
++        is_tool_called: bool | Exception = False
++        try:
++            result = self._unified_parser.parse_delta(
++                delta_text,
++                delta_token_ids,
++                request,
++                prompt_token_ids,
++                finished=finished,
++            )
++            is_tool_called = bool(result and result.tool_calls)
++            self._sync_reasoning()
++            return result
++        except Exception as e:
++            is_tool_called = e
++            raise
++        finally:
++            if self._tool_parser is not None:
++                record_tool_parser_invocation(
++                    is_tool_called=is_tool_called, is_streaming=True, request=request
++                )
+diff --git a/vllm/parser/engine/adapters.py b/vllm/parser/engine/adapters.py
+index 3e2488f16..c5979f350 100644
+--- a/vllm/parser/engine/adapters.py
++++ b/vllm/parser/engine/adapters.py
+@@ -144,6 +144,9 @@ class ParserEngineReasoningAdapter(ReasoningParser):
+             self._counting_parser_engine = self._parser_engine_cls(
+                 self.model_tokenizer, **self._parser_engine_kwargs
+             )  # type: ignore[call-arg]
++            self._counting_parser_engine._prompt_closes_reasoning = (
++                self._parser_engine._prompt_closes_reasoning
++            )
+         self._counting_parser_engine._single_pass_parse(
+             self.model_tokenizer.decode(token_ids), token_ids
+         )
+diff --git a/vllm/parser/engine/incremental_lexer.py b/vllm/parser/engine/incremental_lexer.py
+index 8c3820b59..91efb8127 100644
+--- a/vllm/parser/engine/incremental_lexer.py
++++ b/vllm/parser/engine/incremental_lexer.py
+@@ -26,6 +26,7 @@ class LexToken:
+     terminal: str
+     value: str
+     token_count: int = 0
++    token_id_spans: tuple[tuple[int, int], ...] = ()
+ 
+ 
+ class LexerShape:
+@@ -97,6 +98,7 @@ class IncrementalLexer:
+         self,
+         terminals: list[TerminalDef] | LexerShape,
+         content_terminal: str = CONTENT_TERMINAL,
++        token_id_guards: Mapping[str, str] | None = None,
+     ) -> None:
+         if isinstance(terminals, LexerShape):
+             shape = terminals
+@@ -107,6 +109,9 @@ class IncrementalLexer:
+         self.content_terminal = content_terminal
+         self.buffer = ""
+         self._token_counts: list[int] = []
++        self._token_id_guards = token_id_guards or {}
++        self.require_token_ids = False
++        self._token_id_spans: list[tuple[int, int]] = []
+ 
+         self._literal_strings = shape.literal_strings
+         self._max_literal_len = shape.max_literal_len
+@@ -118,12 +123,15 @@ class IncrementalLexer:
+     def reset(self) -> None:
+         self.buffer = ""
+         self._token_counts.clear()
++        self._token_id_spans.clear()
++        self.require_token_ids = False
+ 
+     def feed(
+         self,
+         text: str,
+         token_texts: tuple[str, ...] = (),
+         token_count: int = 0,
++        token_id_spans: tuple[tuple[int, int], ...] = (),
+     ) -> list[LexToken]:
+         char_token_counts = self._char_token_counts(text, token_texts, token_count)
+         if not self.buffer and self._has_only_literals and self._literal_first_chars:
+@@ -131,7 +139,18 @@ class IncrementalLexer:
+                 if ch in self._literal_first_chars:
+                     break
+             else:
+-                return [LexToken(self.content_terminal, text, sum(char_token_counts))]
++                return [
++                    LexToken(
++                        self.content_terminal,
++                        text,
++                        sum(char_token_counts),
++                        token_id_spans,
++                    )
++                ]
++        offset = len(self.buffer)
++        self._token_id_spans.extend(
++            (start + offset, end + offset) for start, end in token_id_spans
++        )
+         self.buffer += text
+         self._token_counts.extend(char_token_counts)
+         return self._drain()
+@@ -142,7 +161,7 @@ class IncrementalLexer:
+             tokens.extend(self._drain(final=True))
+         if self.buffer:
+             tokens.append(
+-                LexToken(self.content_terminal, self.buffer, sum(self._token_counts))
++                self._make_token(self.content_terminal, self.buffer, len(self.buffer))
+             )
+             self.buffer = ""
+             self._token_counts.clear()
+@@ -176,10 +195,27 @@ class IncrementalLexer:
+             counts[0] = token_count
+         return counts
+ 
+-    def _pop_token_count(self, length: int) -> int:
++    def _make_token(self, terminal: str, value: str, length: int) -> LexToken:
+         token_count = sum(self._token_counts[:length])
+         del self._token_counts[:length]
+-        return token_count
++        spans = tuple(
++            (start, end) for start, end in self._token_id_spans if end <= length
++        )
++        self._token_id_spans = [
++            (start - length, end - length)
++            for start, end in self._token_id_spans
++            if start >= length
++        ]
++        return LexToken(terminal, value, token_count, spans)
++
++    def _accept_match(self, terminal: str, literal: str) -> bool:
++        atom = self._token_id_guards.get(terminal)
++        if not self.require_token_ids or atom is None:
++            return True
++        offset = literal.find(atom)
++        if offset < 0:
++            return False
++        return (offset, offset + len(atom)) in self._token_id_spans
+ 
+     def _drain(self, *, final: bool = False) -> list[LexToken]:
+         tokens: list[LexToken] = []
+@@ -198,7 +234,9 @@ class IncrementalLexer:
+                         break
+                 if not has_potential:
+                     tokens.append(
+-                        LexToken(content_terminal, self.buffer, sum(self._token_counts))
++                        self._make_token(
++                            content_terminal, self.buffer, len(self.buffer)
++                        )
+                     )
+                     self.buffer = ""
+                     self._token_counts.clear()
+@@ -208,8 +246,10 @@ class IncrementalLexer:
+ 
+             first = self.buffer[0]
+             for lit, name in literals_by_first.get(first, ()):
+-                if self.buffer.startswith(lit) and (
+-                    best_match is None or len(lit) > best_match[2]
++                if (
++                    self.buffer.startswith(lit)
++                    and self._accept_match(name, lit)
++                    and (best_match is None or len(lit) > best_match[2])
+                 ):
+                     best_match = (name, lit, len(lit))
+ 
+@@ -226,10 +266,10 @@ class IncrementalLexer:
+                             break
+                     if not longer_match:
+                         tokens.append(
+-                            LexToken(
++                            self._make_token(
+                                 best_match[0],
+                                 best_match[1],
+-                                self._pop_token_count(best_match[2]),
++                                best_match[2],
+                             )
+                         )
+                         self.buffer = self.buffer[best_match[2] :]
+@@ -240,10 +280,10 @@ class IncrementalLexer:
+ 
+             if best_match is not None:
+                 tokens.append(
+-                    LexToken(
++                    self._make_token(
+                         best_match[0],
+                         best_match[1],
+-                        self._pop_token_count(best_match[2]),
++                        best_match[2],
+                     )
+                 )
+                 self.buffer = self.buffer[best_match[2] :]
+@@ -251,19 +291,19 @@ class IncrementalLexer:
+                 content_end = self._find_content_boundary()
+                 if content_end > 0:
+                     tokens.append(
+-                        LexToken(
++                        self._make_token(
+                             content_terminal,
+                             self.buffer[:content_end],
+-                            self._pop_token_count(content_end),
++                            content_end,
+                         )
+                     )
+                     self.buffer = self.buffer[content_end:]
+                 else:
+                     tokens.append(
+-                        LexToken(
++                        self._make_token(
+                             content_terminal,
+                             self.buffer[0],
+-                            self._pop_token_count(1),
++                            1,
+                         )
+                     )
+                     self.buffer = self.buffer[1:]
+diff --git a/vllm/parser/engine/parser_engine.py b/vllm/parser/engine/parser_engine.py
+index d9df0357b..3f66f83f1 100644
+--- a/vllm/parser/engine/parser_engine.py
++++ b/vllm/parser/engine/parser_engine.py
+@@ -61,6 +61,8 @@ class ToolCallSlot:
+         "_streamed_joined",
+         "extend_open_value",
+         "open_value_streams",
++        "arg_token_id_spans",
++        "_args_length",
+     )
+ 
+     def __init__(self) -> None:
+@@ -74,6 +76,8 @@ class ToolCallSlot:
+         self._streamed_joined: str | None = ""
+         self.extend_open_value: ArgValueExtender | None = None
+         self.open_value_streams: bool = False
++        self.arg_token_id_spans: list[tuple[int, int]] | None = None
++        self._args_length = 0
+ 
+     @property
+     def args(self) -> str:
+@@ -81,7 +85,17 @@ class ToolCallSlot:
+             self._args_joined = "".join(self._args_parts)
+         return self._args_joined
+ 
+-    def append_args(self, value: str) -> None:
++    def append_args(
++        self, value: str, token_id_spans: tuple[tuple[int, int], ...] = ()
++    ) -> None:
++        if token_id_spans:
++            if self.arg_token_id_spans is None:
++                self.arg_token_id_spans = []
++            self.arg_token_id_spans.extend(
++                (start + self._args_length, end + self._args_length)
++                for start, end in token_id_spans
++            )
++        self._args_length += len(value)
+         self._args_parts.append(value)
+         self._args_joined = None
+ 
+@@ -140,6 +154,7 @@ class ParserEngine(Parser):
+             or parser_engine_config.initial_state == ParserState.REASONING
+         )
+         self._reasoning_ended: bool = not self._has_reasoning
++        self._prompt_closes_reasoning: bool = False
+         self._streaming_initialized: bool = False
+         self._prompt_streaming_prepared: bool = False
+ 
+@@ -211,6 +226,9 @@ class ParserEngine(Parser):
+     @skip_reasoning_parsing.setter
+     def skip_reasoning_parsing(self, value: bool) -> None:
+         self._engine.skip_reasoning_parsing = value
++        if value and self._engine.state == ParserState.REASONING:
++            self._engine.state = ParserState.CONTENT
++            self._reasoning_ended = True
+ 
+     @property
+     def reasoning_ended(self) -> bool:
+@@ -224,6 +242,18 @@ class ParserEngine(Parser):
+             self._streaming_initialized = True
+             self._reset(initial_state=initial_state)
+ 
++    def set_prompt_token_ids(self, prompt_token_ids: Sequence[int]) -> None:
++        """Start parsing in content when the prompt already closes reasoning,
++        as with continue_final_message or a template that switches thinking
++        off. Only configs with turn boundaries can tell a closed block in
++        this turn from one in an earlier turn, so others are left as is.
++        """
++        self._prompt_closes_reasoning = (
++            self.parser_engine_config.initial_state is ParserState.REASONING
++            and bool(self._turn_boundary_token_ids)
++            and self.is_reasoning_end(list(prompt_token_ids))
++        )
++
+     def adjust_initial_state_from_prompt(self, prompt_token_ids: Sequence[int]) -> None:
+         """See :meth:`ReasoningParser.adjust_initial_state_from_prompt`."""
+         return
+@@ -235,8 +265,13 @@ class ParserEngine(Parser):
+         return None
+ 
+     def _reset(self, initial_state: ParserState | None = None) -> None:
+-        self._engine.reset(initial_state=initial_state)
+-        self._reasoning_ended = not self._has_reasoning
++        prompt_closed = initial_state is None and (
++            self._prompt_closes_reasoning or self.skip_reasoning_parsing
++        )
++        self._engine.reset(
++            initial_state=ParserState.CONTENT if prompt_closed else initial_state
++        )
++        self._reasoning_ended = not self._has_reasoning or prompt_closed
+         self._tool_slots.clear()
+         self._deferred_content = ""
+         self._deferred_reasoning = ""
+@@ -826,12 +861,15 @@ class ParserEngine(Parser):
+         # Content always precedes the tool calls in a message, so only
+         # whitespace from before the first call can be kept as content.
+         before_first_tool = not self._tool_slots
++        # Token-ID composite parsers keep text between tool calls; text must
++        # not overtake content deferred from an earlier delta.
++        defer_text = bool(carried_deferred) and self._engine._has_composite_ids
+         seen_tool_event = False
+         suppress = self._suppress_tool_calls
+         for event in events:
+             match event.type:
+                 case EventType.TEXT_CHUNK:
+-                    if seen_tool_event:
++                    if seen_tool_event or defer_text:
+                         self._deferred_content += event.value
+                     else:
+                         content_parts.append(event.value)
+@@ -873,7 +911,11 @@ class ParserEngine(Parser):
+             self._deferred_content = self._deferred_content[len(carried_deferred) :]
+             carried_deferred = ""
+ 
+-        if self._deferred_content and (not seen_tool_event or not tool_call_deltas):
++        if self._deferred_content and (
++            not seen_tool_event
++            or not tool_call_deltas
++            or (finished and self._engine._has_composite_ids)
++        ):
+             # Deferred content carried in from a previous delta precedes this
+             # delta's content; content deferred during this call (text after
+             # an unpromoted tool event) follows it.
+@@ -963,7 +1005,7 @@ class ParserEngine(Parser):
+         idx = event.tool_index
+         slot = self._tool_slots[idx]
+         if event.value:
+-            slot.append_args(event.value)
++            slot.append_args(event.value, getattr(event, "token_id_spans", ()))
+ 
+         if not slot.name_sent:
+             if slot.name:
+diff --git a/vllm/parser/engine/parser_engine_config.py b/vllm/parser/engine/parser_engine_config.py
+index d2b9ddd85..56e7ed022 100644
+--- a/vllm/parser/engine/parser_engine_config.py
++++ b/vllm/parser/engine/parser_engine_config.py
+@@ -127,6 +127,9 @@ class ParserEngineConfig:
+         default_factory=dict,
+     )
+ 
++    # Composite terminals require a genuine token-ID atom inside their spelling.
++    composite_token_id_terminals: dict[str, str] = field(default_factory=dict)
++
+     def __post_init__(self) -> None:
+         if self.arg_value_extender is not None and (
+             self.arg_converter is None or not self.stream_arg_deltas
+diff --git a/vllm/parser/engine/streaming_parser_engine.py b/vllm/parser/engine/streaming_parser_engine.py
+index dba922831..7cae7c63b 100644
+--- a/vllm/parser/engine/streaming_parser_engine.py
++++ b/vllm/parser/engine/streaming_parser_engine.py
+@@ -36,6 +36,11 @@ class _DropInfo:
+     extra_token_ids: dict[int, str]
+ 
+ 
++@dataclass(slots=True)
++class _TokenOriginEvent(SemanticEvent):
++    token_id_spans: tuple[tuple[int, int], ...] = ()
++
++
+ def _build_drop_info(
+     config: ParserEngineConfig,
+     tokenizer,
+@@ -139,17 +144,30 @@ class StreamingParserEngine:
+ 
+         self._resolved_token_ids = resolved_token_ids
+         self._has_drops = drop_info is not None
++        self._composite_atoms = frozenset(
++            config.composite_token_id_terminals.values()
++        ) & frozenset(resolved_token_ids.values())
++        self._has_composite_ids = bool(self._composite_atoms)
+ 
+         self._scanner = TokenIDScanner(
+             resolved_token_ids,
+             tokenizer,
++            strict_token_spans=self._has_composite_ids,
+         )
+ 
+         self._token_id_terminal_names: frozenset[str] = frozenset(
+             resolved_token_ids.values()
+         )
+ 
+-        self._lexer = IncrementalLexer(lexer_shape, content_terminal=CONTENT_TERMINAL)
++        self._lexer = IncrementalLexer(
++            lexer_shape,
++            content_terminal=CONTENT_TERMINAL,
++            token_id_guards={
++                terminal: config.token_id_terminals[atom]
++                for terminal, atom in config.composite_token_id_terminals.items()
++                if atom in self._composite_atoms
++            },
++        )
+ 
+         self._tool_terminals: frozenset[str] = frozenset(
+             terminal
+@@ -211,6 +229,8 @@ class StreamingParserEngine:
+         self._lexer.reset()
+         self._message_header_buffer = ""
+         self._message_header_token_count = 0
++        self._tool_between_ws = ""
++        self._tool_between_has_nonws = False
+         self._in_skipped_tool_span = False
+         self._reset_args_state()
+ 
+@@ -221,13 +241,17 @@ class StreamingParserEngine:
+     ) -> list[SemanticEvent]:
+         if delta_token_ids:
+             self._ever_had_token_ids = True
++            self._lexer.require_token_ids = True
+ 
+         # Fast path: skip scanner and lexer when the delta is plain
+         # content with no special tokens and no terminal-starting chars.
++        # Token spans need the scanner even then: a delta's text may stop
++        # inside its last token, e.g. while a stop string is held back.
+         if (
+             delta_text
++            and not (self._has_composite_ids and self._ever_had_token_ids)
+             and not self._lexer.buffer
+-            and not self._scanner._deferred_terminals
++            and not self._scanner.has_pending
+             and self._lexer._literal_first_chars.isdisjoint(delta_text)
+         ):
+             has_special = False
+@@ -247,7 +271,11 @@ class StreamingParserEngine:
+         if len(scanner_items) == 1 and isinstance(scanner_items[0], TextChunk):
+             item = scanner_items[0]
+             lex_tokens = self._lexer.feed(item.text, item.token_texts, item.token_count)
+-            if len(lex_tokens) == 1 and lex_tokens[0].terminal == CONTENT_TERMINAL:
++            if (
++                len(lex_tokens) == 1
++                and lex_tokens[0].terminal == CONTENT_TERMINAL
++                and not lex_tokens[0].token_id_spans
++            ):
+                 events = self._emit_for_state(
+                     lex_tokens[0].value,
+                     token_count=lex_tokens[0].token_count,
+@@ -267,6 +295,17 @@ class StreamingParserEngine:
+         events: list[SemanticEvent] = []
+         for item in items:
+             if isinstance(item, PreLexedTerminal):
++                if item.terminal in self._composite_atoms:
++                    events.extend(
++                        self._process_lex_tokens(
++                            self._lexer.feed(
++                                item.text,
++                                token_count=1,
++                                token_id_spans=((0, len(item.text)),),
++                            )
++                        )
++                    )
++                    continue
+                 events.extend(self._process_lex_tokens(self._lexer.flush()))
+                 events.extend(self._on_terminal(item.terminal, item.text))
+             elif isinstance(item, TextChunk):
+@@ -348,10 +387,14 @@ class StreamingParserEngine:
+         strict = self._token_id_terminal_names if self._ever_had_token_ids else None
+         for tok in tokens:
+             if tok.terminal == CONTENT_TERMINAL or (strict and tok.terminal in strict):
+-                events.extend(self._on_content(tok.value, tok.token_count))
++                events.extend(
++                    self._on_content(tok.value, tok.token_count, tok.token_id_spans)
++                )
+             else:
+                 events.extend(
+-                    self._on_terminal(tok.terminal, tok.value, tok.token_count)
++                    self._on_terminal(
++                        tok.terminal, tok.value, tok.token_count, tok.token_id_spans
++                    )
+                 )
+         return events
+ 
+@@ -397,7 +440,11 @@ class StreamingParserEngine:
+         return markers
+ 
+     def _on_terminal(
+-        self, terminal: str, value: str, token_count: int = 0
++        self,
++        terminal: str,
++        value: str,
++        token_count: int = 0,
++        token_id_spans: tuple[tuple[int, int], ...] = (),
+     ) -> list[SemanticEvent]:
+         key = (self.state, terminal)
+         transition = self.config.transitions.get(key)
+@@ -408,10 +455,10 @@ class StreamingParserEngine:
+             # The projected skip state may not define the wrapper closer.
+             if self.skip_tool_parsing and terminal in self._tool_exit_terminals:
+                 self._in_skipped_tool_span = False
+-            return self._emit_for_state(value, token_count)
++            return self._emit_for_state(value, token_count, token_id_spans)
+ 
+         if self.skip_reasoning_parsing and terminal in self._reasoning_markup_terminals:
+-            return self._emit_for_state(value, token_count)
++            return self._emit_for_state(value, token_count, token_id_spans)
+ 
+         if self.skip_tool_parsing and terminal in self._tool_terminals:
+             # Inkling reuses one terminal for tool, text, and reasoning exits.
+@@ -466,11 +513,16 @@ class StreamingParserEngine:
+                 return []
+ 
+         if transition.skip_in_token_id_mode and self._ever_had_token_ids:
+-            return self._emit_for_state(value, token_count)
++            return self._emit_for_state(value, token_count, token_id_spans)
+ 
+         return self._apply_transition(transition, value, token_count)
+ 
+-    def _emit_for_state(self, text: str, token_count: int = 0) -> list[SemanticEvent]:
++    def _emit_for_state(
++        self,
++        text: str,
++        token_count: int = 0,
++        token_id_spans: tuple[tuple[int, int], ...] = (),
++    ) -> list[SemanticEvent]:
+         transition = self.config.non_whitespace_transitions.get(self.state)
+         if transition is not None and text.strip():
+             return self._apply_transition(transition, text, token_count)
+@@ -481,15 +533,31 @@ class StreamingParserEngine:
+         if self.state == ParserState.TOOL_ARGS:
+             if self.config.tool_args_json:
+                 return self._feed_args_text(text)
++            event_cls = _TokenOriginEvent if token_id_spans else SemanticEvent
++            origin = {"token_id_spans": token_id_spans} if token_id_spans else {}
+             return [
+-                SemanticEvent(
++                event_cls(
+                     EventType.ARG_VALUE_CHUNK,
+                     value=text,
+                     tool_index=self.tool_index,
+                     token_count=token_count,
++                    **origin,
+                 )
+             ]
+         content_type = self.config.content_events.get(self.state)
++        if (
++            self.state == ParserState.TOOL_BETWEEN
++            and self._has_composite_ids
++            and self._ever_had_token_ids
++        ):
++            if not self._tool_between_has_nonws:
++                if not text.strip():
++                    self._tool_between_ws += text
++                    return []
++                self._tool_between_has_nonws = True
++                text = self._tool_between_ws + text
++                self._tool_between_ws = ""
++            content_type = EventType.TEXT_CHUNK
+         if content_type is not None:
+             return [
+                 SemanticEvent(
+@@ -501,10 +569,15 @@ class StreamingParserEngine:
+             ]
+         return []
+ 
+-    def _on_content(self, text: str, token_count: int = 0) -> list[SemanticEvent]:
++    def _on_content(
++        self,
++        text: str,
++        token_count: int = 0,
++        token_id_spans: tuple[tuple[int, int], ...] = (),
++    ) -> list[SemanticEvent]:
+         if not text:
+             return []
+-        return self._emit_for_state(text, token_count)
++        return self._emit_for_state(text, token_count, token_id_spans)
+ 
+     def _apply_transition(
+         self,
+@@ -537,6 +610,8 @@ class StreamingParserEngine:
+             self._message_header_buffer = ""
+             self._message_header_token_count = 0
+ 
++        self._tool_between_ws = ""
++        self._tool_between_has_nonws = False
+         self.state = transition.next_state
+ 
+         for event_type in transition.events:
+diff --git a/vllm/parser/engine/token_id_scanner.py b/vllm/parser/engine/token_id_scanner.py
+index f663849f2..004accca9 100644
+--- a/vllm/parser/engine/token_id_scanner.py
++++ b/vllm/parser/engine/token_id_scanner.py
+@@ -5,10 +5,17 @@ pre-lexed terminals and plain text chunks."""
+ 
+ from __future__ import annotations
+ 
++import json
+ from collections.abc import Sequence
+ from dataclasses import dataclass
++from typing import Any
+ 
+ DROP_TERMINAL = "__DROP__"
++_BYTE_LEVEL_ALPHABET = frozenset(
++    chr(code)
++    for start, end in ((33, 127), (161, 173), (174, 324))
++    for code in range(start, end)
++)
+ 
+ 
+ @dataclass(slots=True)
+@@ -46,6 +53,8 @@ class TokenIDScanner:
+         self,
+         token_id_to_terminal: dict[int, str],
+         tokenizer,
++        *,
++        strict_token_spans: bool = False,
+     ) -> None:
+         self.token_id_to_terminal = token_id_to_terminal
+         self.tokenizer = tokenizer
+@@ -54,6 +63,80 @@ class TokenIDScanner:
+         self._deferred_prefix_token_counts: list[int] = []
+         self._deferred_trailing_token_count = 0
+         self._deferred_post_text: str = ""
++        self._strict_token_spans = strict_token_spans
++        self._span_mode = False
++        self._pending_ids: list[int] = []
++        self._pending_text = ""
++        self._byte_level = False
++        self._added_ids: set[int] = set()
++        self._token_byte_lengths: dict[int, int | None] = {}
++        if strict_token_spans:
++            backend = getattr(tokenizer, "backend_tokenizer", None)
++            decoder: Any = getattr(backend, "decoder", None)
++            try:
++                self._byte_level = (
++                    json.loads(decoder.__getstate__()).get("type") == "ByteLevel"
++                )
++                if self._byte_level:
++                    self._added_ids = set(tokenizer.get_added_vocab().values())
++            except (AttributeError, TypeError, ValueError):
++                self._byte_level = False
++
++    def _byte_prefix(self, token_ids: list[int], text: str) -> tuple[int, str] | None:
++        byte_budget = len(text.encode("utf-8"))
++        byte_count = 0
++        prefix_length = 0
++        for tid in token_ids:
++            if tid not in self._token_byte_lengths:
++                length = None
++                try:
++                    if tid in self._added_ids:
++                        length = len(self._decode_token(tid).encode("utf-8"))
++                    else:
++                        piece = self.tokenizer.convert_ids_to_tokens(tid)
++                        # ByteLevel vocab characters each represent one source byte;
++                        # added tokens instead carry their literal UTF-8 spelling.
++                        if isinstance(piece, str) and _BYTE_LEVEL_ALPHABET.issuperset(
++                            piece
++                        ):
++                            length = len(piece)
++                except (AttributeError, TypeError, ValueError, UnicodeError):
++                    pass
++                self._token_byte_lengths[tid] = length
++            length = self._token_byte_lengths[tid]
++            if length is None:
++                prefix = (
++                    self._decode_token(token_ids[0])
++                    if len(token_ids) == 1
++                    else self.tokenizer.decode(token_ids, skip_special_tokens=False)
++                )
++                if prefix and text.startswith(prefix):
++                    return len(token_ids), prefix
++                return None
++            if byte_count + length > byte_budget:
++                break
++            byte_count += length
++            prefix_length += 1
++        # Replacement characters can expand invalid source bytes and hide holdback.
++        if (
++            prefix_length == len(token_ids)
++            and byte_count == byte_budget
++            and "\ufffd" not in text
++        ):
++            return prefix_length, text
++        # A token boundary can bisect a four-byte UTF-8 character. Only the
++        # decoded prefix proves alignment for a partial run or trailing text.
++        for length in range(prefix_length, max(0, prefix_length - 4), -1):
++            prefix = (
++                self._decode_token(token_ids[0])
++                if length == 1
++                else self.tokenizer.decode(
++                    token_ids[:length], skip_special_tokens=False
++                )
++            )
++            if prefix and text.startswith(prefix):
++                return length, prefix
++        return None
+ 
+     def reset(self) -> None:
+         """Clear mutable state for reuse. Preserves the token text cache."""
+@@ -61,6 +144,79 @@ class TokenIDScanner:
+         self._deferred_prefix_token_counts.clear()
+         self._deferred_trailing_token_count = 0
+         self._deferred_post_text = ""
++        self._span_mode = False
++        self._pending_ids.clear()
++        self._pending_text = ""
++
++    @property
++    def has_pending(self) -> bool:
++        return bool(self._deferred_terminals or self._pending_ids or self._pending_text)
++
++    def _scan_token_spans(
++        self, delta_text: str, delta_token_ids: Sequence[int]
++    ) -> list[LexerInput]:
++        self._pending_ids.extend(delta_token_ids)
++        self._pending_text += delta_text
++        results: list[LexerInput] = []
++        consumed = 0
++        ids = self._pending_ids
++        while consumed < len(ids):
++            tid = ids[consumed]
++            terminal = self.token_id_to_terminal.get(tid)
++            if terminal is not None:
++                text = self._decode_token(tid)
++                if text and self._pending_text.startswith(text):
++                    results.append(PreLexedTerminal(terminal, tid, text))
++                    self._pending_text = self._pending_text[len(text) :]
++                    consumed += 1
++                    continue
++                if terminal == DROP_TERMINAL and not text.startswith(
++                    self._pending_text
++                ):
++                    consumed += 1
++                    continue
++                break
++
++            if not self._pending_text:
++                break
++            end = consumed + 1
++            while end < len(ids) and ids[end] not in self.token_id_to_terminal:
++                end += 1
++            run = ids[consumed:end]
++            if self._byte_level:
++                matched = self._byte_prefix(run, self._pending_text)
++                if matched is None:
++                    break
++                length, text = matched
++                run = run[:length]
++            else:
++                text = (
++                    self._decode_token(run[0])
++                    if len(run) == 1
++                    else self.tokenizer.decode(run, skip_special_tokens=False)
++                )
++            if not self._pending_text.startswith(text):
++                # Detokenizers may withhold text, including incomplete UTF-8.
++                # Match source prefixes only; repeated marker spellings are
++                # never used as positional anchors.
++                for length in range(len(run) - 1, 0, -1):
++                    prefix = self.tokenizer.decode(
++                        run[:length], skip_special_tokens=False
++                    )
++                    if prefix and self._pending_text.startswith(prefix):
++                        run = run[:length]
++                        text = prefix
++                        break
++                else:
++                    break
++            if not text:
++                break
++            results.append(TextChunk(text, token_count=len(run)))
++            consumed += len(run)
++            self._pending_text = self._pending_text[len(text) :]
++        if consumed:
++            del ids[:consumed]
++        return results
+ 
+     def _decode_token(self, token_id: int) -> str:
+         if token_id not in self._token_text_cache:
+@@ -82,6 +238,9 @@ class TokenIDScanner:
+         delta_text: str,
+         delta_token_ids: Sequence[int],
+     ) -> Sequence[LexerInput]:
++        if self._strict_token_spans and (delta_token_ids or self._span_mode):
++            self._span_mode = True
++            return self._scan_token_spans(delta_text, delta_token_ids)
+         prefix_items: list[LexerInput] = []
+         effective_text = delta_text
+         deferred_trailing_count = 0
+@@ -186,6 +345,15 @@ class TokenIDScanner:
+         return prefix_items + results
+ 
+     def flush_pending(self) -> list[LexerInput]:
++        if self._span_mode:
++            aligned = self._scan_token_spans("", ())
++            # Unaligned text has no provable token origin. Preserve the text
++            # supplied by the detokenizer without inventing special tokens.
++            if self._pending_text:
++                aligned.append(TextChunk(self._pending_text))
++            self._pending_ids.clear()
++            self._pending_text = ""
++            return aligned
+         if not self._deferred_terminals and not self._deferred_post_text:
+             return []
+         results: list[LexerInput] = []
+diff --git a/vllm/parser/parser_manager.py b/vllm/parser/parser_manager.py
+index cc9dd3a6c..397ebc278 100644
+--- a/vllm/parser/parser_manager.py
++++ b/vllm/parser/parser_manager.py
+@@ -141,6 +141,26 @@ class ParserManager:
+ 
+             return _CohereCommandParser
+ 
++        active_tool_parser_name = tool_parser_name if enable_auto_tools else None
++        if (
++            reasoning_parser_name in (None, "deepseek_v41")
++            and active_tool_parser_name in (None, "deepseek_v41")
++            and (
++                reasoning_parser_name == "deepseek_v41"
++                or active_tool_parser_name == "deepseek_v41"
++            )
++        ):
++            from vllm.parser.deepseek_v41 import DeepSeekV41ServingParser
++
++            r_cls = reasoning_parser_cls
++            t_cls = tool_parser_cls
++
++            class _DeepSeekV41Parser(DeepSeekV41ServingParser):
++                reasoning_parser_cls = r_cls
++                tool_parser_cls = t_cls
++
++            return _DeepSeekV41Parser
++
+         from vllm.parser.abstract_parser import DelegatingParser
+ 
+         r_cls = reasoning_parser_cls
+-- 
+2.43.0
+
