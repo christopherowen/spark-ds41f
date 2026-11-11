@@ -84,12 +84,34 @@ unchanged. The control can: it must give candidate-54's TP4 hashes `18d61961`/`d
 adds (`tests/quantization/test_mxfp4_csf.py` and `tests/v1/core/test_contiguous_kv_packing.py` by #1096,
 `tests/v1/worker/test_roce_cpu_affinity.py` by #1134), less the exclusion of the deleted
 `tests/model_executor/model_loader/test_b12x_loader.py`. `scripts/release_tests.py check` on the prepared tree: 217
-selected files (156 gate, 61 excluded), 0 problems; the gate manifest has 157 files, bundled in
-[bundles/release-tests](bundles/release-tests). `0803`'s `test_sparknet_oneshot_collectives_pdl_sources` is a gate
+selected files (156 gate, 61 excluded), 0 problems; the gate manifest has 157 files and 16 deselected tests, bundled
+in [bundles/release-tests](bundles/release-tests). `0803`'s `test_sparknet_oneshot_collectives_pdl_sources` is a gate
 test that passes only with sparknet `0003` in the image.
+
+**First build** (image `8793529c`, dgx4, 2,656 s): 2 failed, 10,242 passed, 357 skipped
+([receipts/release-tests-8793529c](receipts/release-tests-8793529c)). The two failures were
+`tests/v1/worker/test_workspace.py::test_dsv4_metadata_free_profile_does_not_reserve_split_attention[0]` and `[384]`,
+both `ModuleNotFoundError: No module named 'b12x'`. They test DeepSeek V4's B12X attention backend
+(`vllm/models/deepseek_v4/nvidia/b12x.py`, not on DS4.1's path) and import `b12x.attention` directly. #1096's own
+without-B12X run did not select this file. Both are now deselected with that reason, and the file's other tests still
+run. The vLLM tree is unchanged.
 
 ## Status
 
 Assembled (2026-11-11). `bin/spark doctor` passes on every configuration (the switched shapes with the example site
-maps), and the unit suite passes in full on dgx4 (889 tests). Next: the build job ([build.json](build.json)) in
-dgx1's window.
+maps), and the unit suite passes in full on dgx4 (889 tests).
+
+**First build** (dgx1's window, job `20261111T193116-build.json`, deployment `e90b1e8a`):
+
+| Image | Image ID | Layers | Note |
+| --- | --- | --- | --- |
+| `spark-ds41f:candidate-55` | `8793529c` | 56 | Built by job `20261111T182946`, reused here because its tree label matched |
+| `spark-ds41f:candidate-55-no974` | `f870f811` | 53 | Built on dgx4 in 466 s |
+
+- Each image has the same layers on all of dgx1..dgx4.
+- **Smoke:** job `20261111T182946` failed only at its smoke, which named a module no B12X-free series has. With
+  that fixed (#1138), the smoke passes on both images on dgx4's GPU: the 66 DS4.1 modules import without B12X.
+- **Release tests:** see above.
+
+**Next:** both images are rebuilt once #1134's corrected `0800` lands, because that fix changes the vLLM tree. The
+rebuilt images then go through the release tests and the gates.
