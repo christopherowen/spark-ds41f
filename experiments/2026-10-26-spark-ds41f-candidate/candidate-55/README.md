@@ -17,10 +17,11 @@ release-qualified.
 ## Selection
 
 - **Authors:** every PR is christopherowen's, and every patch's `From:` is Christopher Owen's.
-- **#1134 is carried in part:** its vLLM and sparknet patches only. Its `scripts/memguard.sh`,
-  `scripts/memguard-start.sh`, `spark_ds41f/lab.py` telemetry pinning and servebench changes (`trim_stall_tail`, an
-  untimed prefill warm-up) are deployment tooling, not image content: memguard runs on production nodes, and the
-  servebench changes alter the measurement this candidate is judged by. They go to `main` on their own.
+- **#1134 is carried in part:** its vLLM and sparknet patches only, at head `d9b04765` (byte-identical to the
+  earlier head `2d0c6c0b` they were first taken from). Its `scripts/memguard.sh`, `scripts/memguard-start.sh` and
+  `spark_ds41f/lab.py` telemetry pinning are deployment tooling, not image content: memguard runs on production nodes.
+  They go to `main` on their own. Its servebench changes (`trim_stall_tail`, an untimed prefill warm-up), which would
+  alter the measurement this candidate is judged by, have since left #1134.
 - **#1134 contains #1008:** its `0801` adds `vllm/utils/cpu_affinity.py` with #1008's partition, and its sparknet
   `0001` is #1008's sparknet patch (the same tree, `dab8c457`). #1008 is not carried separately.
 - **#982 is carried in part:** Part A (PDL chaining). Part B (`next_send_buffer` zero-copy staging) has no caller in
@@ -36,10 +37,19 @@ release-qualified.
 ## Source
 
 - vLLM ([vllm/series](vllm/series)): candidate-54's 672 patches by relative path, then `0800`, `0801` (#1134's files,
-  unchanged), `0802` (#1096 rebased) and `0803` (#982's test entry).
-- sparknet ([sparknet/series](sparknet/series)) on `1fd6a1fb`: `0001` (#1134), `0002` (#989), `0003` (#982 Part A).
-- No B12X source. CUDA 13.5.37 through `sources.cuda_toolkit`. Every other source is candidate-54's.
-- `patch_head`, `expected_tree` and `patchset_sha256` are recorded by `bin/spark build prepare --lock` on dgx4.
+  unchanged), `0802` (#1096 rebased, [receipts/b12x-rebase](receipts/b12x-rebase/README.md)) and `0803` (#982's test
+  entry). 676 patches, `patch_head` `a64a804c`, `expected_tree` `980e3812`, `patchset_sha256` `cff45647`.
+- sparknet ([sparknet/series](sparknet/series)) on `1fd6a1fb`: `0001` (#1134), `0002` (#989), `0003` (#982 Part A,
+  [receipts/sparknet-stack](receipts/sparknet-stack/README.md)). `patch_head` `1fdf8dc7`, `expected_tree` `e06f6a06`,
+  `patchset_sha256` `60bb1942`.
+- No B12X source. CUDA 13.5.37 through `sources.cuda_toolkit` ([requirements/cuda-13-5-sbsa.txt](../../../requirements/cuda-13-5-sbsa.txt), 23
+  debs, 1.51 GB). Every other source is candidate-54's.
+- Recorded by `bin/spark build prepare --lock` on dgx4 for both locks (the same vLLM and sparknet trees), the heads
+  copied into each `upstreams.lock.json`; the 23 debs downloaded and verified against the lockfile there. The
+  provenance, SHA-256 and author of each patch are in [receipts/selection.json](receipts/selection.json).
+- **What #1096 changes on the serving path:** one TileLang kernel, `engram_resident_lookup_kernel`, whose row bound
+  is now `0 <= n_tok <= tokens` (bit-identical inside it, recompiled); the rest is renames, dead fields, the deleted
+  B12X loader and startup rounds skipped without B12X ([receipts/b12x-rebase](receipts/b12x-rebase/README.md)).
 
 ## The control: candidate-55-no974
 
@@ -68,7 +78,18 @@ unchanged. The control can: it must give candidate-54's TP4 hashes `18d61961`/`d
 - **Screens:** two boots against candidate-54's recorded screens
   ([candidate-54/receipts/references](../candidate-54/receipts/references), `candidate-54-0799-<testbed>-…`).
 
+## Release tests
+
+[release-tests.json](release-tests.json) is candidate-54's classification plus three gate files the series changes or
+adds (`tests/quantization/test_mxfp4_csf.py` and `tests/v1/core/test_contiguous_kv_packing.py` by #1096,
+`tests/v1/worker/test_roce_cpu_affinity.py` by #1134), less the exclusion of the deleted
+`tests/model_executor/model_loader/test_b12x_loader.py`. `scripts/release_tests.py check` on the prepared tree: 217
+selected files (156 gate, 61 excluded), 0 problems; the gate manifest has 157 files, bundled in
+[bundles/release-tests](bundles/release-tests). `0803`'s `test_sparknet_oneshot_collectives_pdl_sources` is a gate
+test that passes only with sparknet `0003` in the image.
+
 ## Status
 
-Assembling (2026-11-11): #1096's rebase and the sparknet stack are being prepared on dgx3 and sp8, and #974's lock
-selection on a tooling branch.
+Assembled (2026-11-11). `bin/spark doctor` passes on every configuration (the switched shapes with the example site
+maps), and the unit suite passes in full on dgx4 (889 tests). Next: the build job ([build.json](build.json)) in
+dgx1's window.
