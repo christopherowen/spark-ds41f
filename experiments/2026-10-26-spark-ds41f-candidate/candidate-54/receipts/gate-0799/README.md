@@ -5,7 +5,7 @@ PDL wait. Specs: [gate-0799-tp4.json](../../gate-0799-tp4.json) (12 boots at `tp
 [gate-0799-tp4-switched.json](../../gate-0799-tp4-switched.json) and
 [gate-0799-tp3-switched.json](../../gate-0799-tp3-switched.json) (4 boots each). Each boot runs the recorded
 `determinism` and `greedy` scenarios twice through
-[token_determinism_record.py](../../../candidate-58/token_determinism_record.py), then the gate's distinct-stream
+[token_determinism_record.py](../../../../2026-11-10-tp4-ring-determinism/token_determinism_record.py), then the gate's distinct-stream
 checks.
 
 **Image:** `spark-ds41f:candidate-54`, image ID `1e556e80`. This is `0799`'s first build: tree `b20b199d`, built on
@@ -27,7 +27,7 @@ every run. The hashes are candidate-54's recorded ones: #1030's TP4 hashes, and 
 candidate-54's earlier gate.
 
 **Against the record at `tp4-ring`:** before `0799`, 4 of 12 boots failed (3 of 8 in candidate-58's row trace, 1 of 4
-in its gate repeat). After it, 0 of 12 did.
+in its [gate repeat](../../../../2026-11-10-tp4-ring-determinism/receipts/gate-repeat)). After it, 0 of 12 did.
 - If the failure rate were unchanged at 1 boot in 3, 12 passing boots would have probability (2/3)^12 = 0.8%.
 - Fisher's exact test on the 24 boots, one-sided: p = 0.047.
 - `tp4-switched` and `tp3-switched` had not failed before (0 of 8 and 0 of 7), so their boots show only that `0799`
@@ -61,9 +61,9 @@ Per testbed, `<testbed>/`:
 
 ## Corroboration from before the fix (candidate-58, 2026-11-10)
 
-**c1 at `tp4-switched`** ([c1-drafter-arms-tp4-switched.json](../../../candidate-58/c1-drafter-arms-tp4-switched.json),
+**c1 at `tp4-switched`** ([c1-drafter-arms-tp4-switched.json](https://github.com/christopherowen/spark-ds41f/blob/07b2adfe7ec/experiments/2026-10-26-spark-ds41f-candidate/candidate-58/c1-drafter-arms-tp4-switched.json),
 7 arms of 3 boots, each request's per-step token counts compared between boots by
-[c1_decisions.py](../../../candidate-58/boot-differences/c1_decisions.py)):
+[c1_decisions.py](../../../../2026-11-10-tp4-ring-determinism/boot-differences/c1_decisions.py)):
 
 | Arm | Boots that agree | Accepted per draft |
 | --- | --- | --- |

@@ -1060,44 +1060,20 @@ candidate-50 without #1009 plus #960, #971, #977, #984, #998, tested at `tp3-swi
 
 ## Candidate 54 ([candidate-54/](candidate-54))
 
-The merged base of round 2: candidate-50 with #1009 round 1, plus every PR that passed PR validation in candidates 51-53 (#961, #963, #987's WO-B part, #1001, #1030, #968, #969, #960, #971, #977, #998), each reworked PR as its corrected patch. #984 missed and is in rework, so it is left out; round 2 ends with #998 round 1. It is verified, not release-qualified, on `tp4-ring`, `tp4-switched` and `tp3-switched`: the gate, the screen against 1107's recorded screens, and the carried fixes' live checks. Its screens are the next round's reference. #1030 changes temperature-0 text, so the gate's hashes differ from the 1017 checkpoint's by construction. Sources, stacking and the runs are in its README.
+The merged base of round 2: candidate-50 with #1009 round 1, plus every PR that passed PR validation in candidates 51-53 (#961, #963, #987's WO-B part, #1001, #1030, #968, #969, #960, #971, #977, #998), each reworked PR as its corrected patch. #984 missed and is in rework, so it is left out; round 2 ends with #998 round 1. Added on 2026-11-11: `0799`, the MoE combine's shared-row load after the PDL wait, which fixes the `tp4-ring` determinism failures, and TP3's L2 prefetch caps (15/12/12 MB) as a recipe variable (owner). It is verified, not release-qualified, on `tp4-ring`, `tp4-switched` and `tp3-switched`: the gate, the screen against 1107's recorded screens, and the carried fixes' live checks. Verified on all three, it becomes the first frozen candidate, and the next round is built on it. #1030 changes temperature-0 text, so the gate's hashes differ from the 1017 checkpoint's by construction. Sources, stacking and the runs are in its README.
 
-- **Series:** [candidate-54/vllm/series](candidate-54/vllm/series) (`0001..0791`, 671 patches;
-  `patchset_sha256` `fd767123`, `patch_head` `4e8133ff`, `expected_tree` `5f021d9a`).
-- **Status:** prepared and locked; not built, not measured.
+- **Series:** [candidate-54/vllm/series](candidate-54/vllm/series) (`0001..0799`, 672 patches;
+  `patchset_sha256` `d990ee5d`, `patch_head` `15833ed1`, `expected_tree` `ad2dc11f`).
+- **Status:** built (`spark-ds41f:candidate-54`, image ID `d502217e`); release tests pass; verification on the three
+  testbeds in its README.
 
-## Candidate 55 ([candidate-55/](candidate-55))
+## Candidates 55-58 (removed 2026-11-11)
 
-candidate-54 plus #1008 (with its sparknet patch), #978, #988 (its dead-row part), tested at `tp4-ring` (dgx1..dgx4). Candidates 55, 56 and 57 are tested at the same time, one per testbed, on the accumulated base: candidate-54. The PRs that pass are carried into all later candidates. Marks, runs, own-mark commands and rework rules are in its README. #995's guard is left out: its rework is bit-exact, but no serving path passes a negative slot to the kernels it guards.
+Round 3 (candidates 55, 56 and 57, and their merged base, candidate-58) was built on candidate-54 before `0799` and the
+TP3 caps. The owner removed them on 2026-11-11: they are rebuilt on frozen candidate-54 once it is accepted. Their PRs
+(#1008 with its sparknet patch, #978, #988, #957 and #956) stay open and re-enter that round with fresh validation;
+round 3's verdicts do not carry. Round 4's candidates 59-61 had been prepared on sp8 only, outside the repository, and are not started.
 
-- **Series:** [candidate-55/vllm/series](candidate-55/vllm/series) (`0001..0794`, 674 patches;
-  `patchset_sha256` `6a1f3da3`, `patch_head` `410463b3`, `expected_tree` `e39b835c`) and
-  [candidate-55/sparknet/series](candidate-55/sparknet/series) (`0001` on 1107's pin; `patchset_sha256` `d58b3be5`,
-  `patch_head` `d50a1b4c`, `expected_tree` `dab8c457`).
-- **Status:** prepared and locked; not built, not measured.
-
-## Candidate 56 ([candidate-56/](candidate-56))
-
-candidate-54 plus #957 (its part 1) and #956 round 3, tested at `tp4-switched` (sp1..sp4). Candidates 55, 56 and 57 are tested at the same time, one per testbed, on the accumulated base: candidate-54. The PRs that pass are carried into all later candidates. Marks, runs, own-mark commands and rework rules are in its README. #956 round 3 builds on 957-p1, and its `no956` control isolates it on the same image.
-
-- **Series:** [candidate-56/vllm/series](candidate-56/vllm/series) (`0001..0796`, 673 patches;
-  `patchset_sha256` `0a6aa2ea`, `patch_head` `295c2ced`, `expected_tree` `0c848613`).
-- **Status:** prepared and locked; not built, not measured.
-
-## Candidate 57 ([candidate-57/](candidate-57))
-
-candidate-54 plus #957 (its parts 2 and 4), tested at `tp3-switched` (sp5..sp7). Candidates 55, 56 and 57 are tested at the same time, one per testbed, on the accumulated base: candidate-54. The PRs that pass are carried into all later candidates. Marks, runs, own-mark commands and rework rules are in its README. #957's part 5 is dropped after its rework. Its series has no `0795..0796`, which are candidate-56's.
-
-- **Series:** [candidate-57/vllm/series](candidate-57/vllm/series) (`0001..0798`, 673 patches;
-  `patchset_sha256` `5131e020`, `patch_head` `d74e38ee`, `expected_tree` `72b40d71`).
-- **Status:** prepared and locked; not built, not measured.
-
-## Candidate 58 ([candidate-58/](candidate-58))
-
-The merged base of round 3: candidate-54 plus every PR that passed PR validation in candidates 55-57 (#1008 with its sparknet patch, #988's dead-row part, #956 r4, #957's parts 2 and 4), each reworked PR as its corrected patch, and TP3's L2 prefetch caps (15/12/12 MB, from candidate-54's cap sweep) as its own recipe variable. #978 fails the gate after its second rework (a third rework is under way by owner exception), #957's parts 1 and 5 and #984 are dropped, and #995's guard is inert, so they are left out. It is verified, not release-qualified, on `tp4-ring`, `tp4-switched` and `tp3-switched`: the gate, the screen against candidate-54's recorded screens, and the carried fixes' live checks. Verified on all three, it becomes the first frozen candidate. Sources, stacking and the runs are in its README.
-
-- **Series:** [candidate-58/vllm/series](candidate-58/vllm/series) (`0001..0796`, 676 patches;
-  `patchset_sha256` `e22e7270`, `patch_head` `e5911bdf`, `expected_tree` `4815b7a0`) and
-  [candidate-58/sparknet/series](candidate-58/sparknet/series) (`0001` on 1107's pin; `patchset_sha256` `55c0ea53`,
-  `patch_head` `d50a1b4c`, `expected_tree` `dab8c457`).
-- **Status:** prepared and locked; not built, not measured.
+- Their folders are in Git at commit `07b2adfe`.
+- The determinism investigation that found `0799` moved out of candidate-58 to
+  [../2026-11-10-tp4-ring-determinism/](../2026-11-10-tp4-ring-determinism/README.md).
