@@ -1,0 +1,226 @@
+From f713f7456b6675e55e48d57216189e10a120c958 Mon Sep 17 00:00:00 2001
+From: Christopher Owen <3221756+christopherowen@users.noreply.github.com>
+Date: Wed, 11 Nov 2026 17:47:30 +0000
+Subject: [PATCH 3/3] perf(oneshot): chain the one-shot collectives with
+ programmatic dependent launch
+
+Upstream base: christopherowen/dgx-spark-networking 1fd6a1fbd8dc4884057046d1ebd93d585c9e4bcf
+with the proxy-pinning patch (tree dab8c4577ac1) and the single-kernel
+multi-stage collectives (dgx-spark-networking#7, spark-ds41f#989) applied.
+
+Source: Part A of spark-ds41f#982 / dgx-spark-networking#6, re-placed into
+#989's multi-stage kernels. Part B of that change (the zero-copy
+next_send_buffer(shape, dtype, *, slot=None) API on RoceOneshotAllReduce and
+SparknetOneShotAllReduce with its _send_dev slot views and _host_seq
+counter, roce_same_ptr, the `if (src != dst)` guard in roce_copy_pack, the
+`if (input != send)` guard in roce_stage_gather_pack, and their CPU and GPU
+tests) is left out: no vLLM code calls next_send_buffer, so it does nothing
+in this deployment.
+
+Rationale:
+The four TileLang collective kernels (oneshot_allreduce, oneshot_allgather,
+oneshot_reducescatter, oneshot_exchange) neither waited on nor triggered
+programmatic dependent launch, so in a captured graph the edges into and out
+of every collective stayed full dependencies while the producers (WO-B,
+moe_combine, fused_wqa_wkv) and consumers (mhc_post, attention_front,
+gather_columns_into) around them are on the PDL chain.
+
+1. T.pdl_sync() (cudaGridDependencySynchronize) is the first statement of
+   each kernel, at the top level so every thread waits, before the epoch
+   load of counters[0] and before any access to inp, out or the pinned
+   region; the generated CUDA has only local declarations ahead of it.
+   TileLang launches a kernel with a wait with programmatic stream
+   serialization, so the collective's grid can be resident while its
+   producer drains.
+2. T.pdl_trigger() (launch_dependents) follows the doorbell. The all-reduce
+   has one stage and triggers right after it, as #982 did. In the
+   multi-stage kernels the trigger sits inside `for s in T.serial(num_stages)`
+   after the doorbell block, guarded by `if s == num_stages - 1`: once per
+   launch, after the last stage's doorbell and before that stage's
+   roce_wait_peers. A single-stage launch therefore runs exactly #982's
+   measured pdl_post_doorbell placement; every captured (decode) launch is
+   single-stage, because the runtime pipelines only outside capture.
+   Triggering after stage 0 instead would make dependents' CTAs resident,
+   blocked in griddepcontrol.wait, for every remaining stage, holding SMs
+   that #989 leaves to the main stream (8 CTAs, 2 of 20 GB10 SMs) during
+   SP prefill overlap.
+
+Correctness of the trigger position: a dependent's griddepcontrol.wait
+returns only after the whole primary grid has completed and its memory
+operations are visible, so out (every stage), counters[0] (roce_tail) and
+the send slots are final before any dependent that waits reads them; the
+position changes only when dependents launch. Dependents launch only after
+every CTA of the collective has executed the trigger or exited, so all of
+its CTAs are already resident and the doorbell/arrival protocol, which
+needs the whole grid, cannot be starved by them. The 2-slot ping-pong
+argument of #989 is unchanged: within a launch stage s+1 stages into
+send[(epoch+s+1)&1] only after roce_wait_peers(epoch+s); across launches
+the next collective reads counters[0] and stages its send slot only after
+its own pdl_sync, that is after this grid has completed, the same order as
+without PDL.
+
+Quality implications:
+Launch timing only: bit-identical reductions, gathers and exchanges, wire
+ABI 10 unchanged. Consumers that read a collective's output must do so
+after their own griddepcontrol.wait (the deployment's PDL source audit
+requires it of chain kernels).
+
+Tests:
+- python3 -m unittest discover -s tests -v (99 passed, including the
+  ASan/UBSan proxy simulator and test_tilelang_kernels_emit_pdl_sync_and_trigger,
+  which also checks the multi-stage kernels trigger once, under the
+  last-stage guard, after the doorbell).
+- Single GB10, spark-ds41f:candidate-54 image (TileLang 0.1.15): all four
+  kernels (world 1, 2, 4, ring4, traced all-reduce) pass vLLM's
+  deepseek_v41_pdl_sources.violations with the collectives on CHAIN; a
+  captured slow PDL producer -> collective -> PDL consumer graph has 2/2
+  programmatic edges, and 20 replays per case (world 1 with 1 and 4
+  stages, world 2 with peer slots and flags pre-filled, 1 and 2 stages)
+  with every buffer poisoned give exact outputs and advance the epoch by
+  num_stages. A consumer that loads before its wait sees exactly the last
+  stage's output stale, which places the trigger after the last stage's
+  doorbell and before its data phase.
+- Multi-rank RoCE suite (tests/gpu/test_oneshot_gpu.py): not run.
+
+Upstream status: local candidate patch for dgx-spark-networking; replaces
+the Part A half of dgx-spark-networking#6 on top of #7.
+---
+ sparknet/oneshot/_allgather_tilelang.py     |  6 ++++++
+ sparknet/oneshot/_exchange_tilelang.py      |  6 ++++++
+ sparknet/oneshot/_oneshot_tilelang.py       |  4 ++++
+ sparknet/oneshot/_reducescatter_tilelang.py |  6 ++++++
+ tests/test_oneshot_cpu.py                   | 24 +++++++++++++++++++++
+ 5 files changed, 46 insertions(+)
+
+diff --git a/sparknet/oneshot/_allgather_tilelang.py b/sparknet/oneshot/_allgather_tilelang.py
+index f782b47..b16bb8f 100644
+--- a/sparknet/oneshot/_allgather_tilelang.py
++++ b/sparknet/oneshot/_allgather_tilelang.py
+@@ -66,6 +66,8 @@ def _build(world_size: int, rank: int, threads: int, slots: int, flag_stride: in
+             with T.Kernel(grid_x, threads=threads) as bx:
+                 T.annotate_min_blocks_per_sm(resident)
+                 T.import_source(source)
++                # PDL: wait for the producer grid before any global read (counters[0], inp)
++                T.pdl_sync()
+                 tx = T.get_thread_binding()
+                 epoch = T.alloc_var(T.uint32)
+                 epoch = T.call_extern("roce_ld_relaxed_gpu_u32", T.address_of(counters[0]), dtype=T.uint32)
+@@ -123,6 +125,10 @@ def _build(world_size: int, rank: int, threads: int, slots: int, flag_stride: in
+                         )
+                         if rang != T.uint32(0):
+                             T.call_extern("roce_st_release_gpu_u32", T.address_of(counters[rung_index]), seq, dtype="handle")
++                    # PDL: after the last stage's doorbell let dependents launch (they read out
++                    # only after their own pdl_sync, which waits for this whole grid)
++                    if s == num_stages - 1:
++                        T.pdl_trigger()
+                     # 3. block 0 waits for every peer's payload-stripe flags, the other blocks for block 0
+                     T.call_extern(
+                         "roce_wait_peers",
+diff --git a/sparknet/oneshot/_exchange_tilelang.py b/sparknet/oneshot/_exchange_tilelang.py
+index 392943b..029bd32 100644
+--- a/sparknet/oneshot/_exchange_tilelang.py
++++ b/sparknet/oneshot/_exchange_tilelang.py
+@@ -82,6 +82,8 @@ def _build(
+             with T.Kernel(grid_x, threads=threads) as bx:
+                 T.annotate_min_blocks_per_sm(resident)
+                 T.import_source(source)
++                # PDL: wait for the producer grid before any global read (counters[0], inp)
++                T.pdl_sync()
+                 tx = T.get_thread_binding()
+                 epoch = T.alloc_var(T.uint32)
+                 epoch = T.call_extern(
+@@ -154,6 +156,10 @@ def _build(
+                                 seq,
+                                 dtype="handle",
+                             )
++                    # PDL: after the last stage's doorbell let dependents launch (they read out
++                    # only after their own pdl_sync, which waits for this whole grid)
++                    if s == num_stages - 1:
++                        T.pdl_trigger()
+                     # 3. block 0 waits for every peer's payload-stripe flags, the other blocks for block 0
+                     T.call_extern(
+                         "roce_wait_peers",
+diff --git a/sparknet/oneshot/_oneshot_tilelang.py b/sparknet/oneshot/_oneshot_tilelang.py
+index 5c9bbbf..952d9f9 100644
+--- a/sparknet/oneshot/_oneshot_tilelang.py
++++ b/sparknet/oneshot/_oneshot_tilelang.py
+@@ -107,6 +107,8 @@ def _build(dtype_name: str, world_size: int, rank: int, threads: int, slots: int
+             with T.Kernel(grid_x, threads=threads) as bx:
+                 T.annotate_min_blocks_per_sm(resident)
+                 T.import_source(source)
++                # PDL: wait for the producer grid before any global read (counters[0], inp)
++                T.pdl_sync()
+                 tx = T.get_thread_binding()
+                 # Every block reads the epoch before any block can advance it:
+                 # the advance happens only after all blocks arrived at the tail.
+@@ -144,6 +146,8 @@ def _build(dtype_name: str, world_size: int, rank: int, threads: int, slots: int
+                         T.call_extern("roce_st_release_gpu_u32", T.address_of(counters[rung_index]), seq, dtype="handle")
+                         if traced:
+                             T.call_extern("roce_trace_stamp", trace_base, seq, w_doorbell, dtype="handle")
++                # PDL: let dependents launch; they read out only after their own pdl_sync
++                T.pdl_trigger()
+                 # 3. block 0 waits for every peer's payload-stripe flags, the other blocks for block 0
+                 if traced:
+                     T.call_extern("roce_wait_peers", bx, tx, T.call_extern("roce_ptr", region_base + T.cast(flag_off, T.int64), dtype="handle"), seq,
+diff --git a/sparknet/oneshot/_reducescatter_tilelang.py b/sparknet/oneshot/_reducescatter_tilelang.py
+index 15d0698..73395ef 100644
+--- a/sparknet/oneshot/_reducescatter_tilelang.py
++++ b/sparknet/oneshot/_reducescatter_tilelang.py
+@@ -86,6 +86,8 @@ def _build(
+             with T.Kernel(grid_x, threads=threads) as bx:
+                 T.annotate_min_blocks_per_sm(resident)
+                 T.import_source(source)
++                # PDL: wait for the producer grid before any global read (counters[0], inp)
++                T.pdl_sync()
+                 tx = T.get_thread_binding()
+                 epoch = T.alloc_var(T.uint32)
+                 epoch = T.call_extern(
+@@ -148,6 +150,10 @@ def _build(
+                                 seq,
+                                 dtype="handle",
+                             )
++                    # PDL: after the last stage's doorbell let dependents launch (they read out
++                    # only after their own pdl_sync, which waits for this whole grid)
++                    if s == num_stages - 1:
++                        T.pdl_trigger()
+ 
+                     T.call_extern(
+                         "roce_wait_peers",
+diff --git a/tests/test_oneshot_cpu.py b/tests/test_oneshot_cpu.py
+index 534fad1..8bce85b 100644
+--- a/tests/test_oneshot_cpu.py
++++ b/tests/test_oneshot_cpu.py
+@@ -128,6 +128,30 @@ class KernelFamilyTest(unittest.TestCase):
+             self.assertIn("T.annotate_min_blocks_per_sm(resident)", text, module_name)
+             self.assertIn("_resident_blocks(threads)", text, module_name)
+ 
++    def test_tilelang_kernels_emit_pdl_sync_and_trigger(self):
++        for module_name in ("_oneshot_tilelang.py", "_allgather_tilelang.py", "_reducescatter_tilelang.py", "_exchange_tilelang.py"):
++            text = (ROCE / module_name).read_text()
++            sync_pos = text.find("T.pdl_sync()")
++            trigger_pos = text.find("T.pdl_trigger()")
++            first_addr = text.find("T.address_of(")
++            doorbell_pos = text.find("roce_doorbell")
++            wait_pos = text.find("roce_wait_peers")
++            self.assertGreater(sync_pos, 0, module_name)
++            self.assertGreater(first_addr, sync_pos, module_name)
++            self.assertGreater(trigger_pos, doorbell_pos, module_name)
++            self.assertLess(trigger_pos, wait_pos, module_name)
++            self.assertEqual(text.count("T.pdl_sync()"), 1, module_name)
++            self.assertEqual(text.count("T.pdl_trigger()"), 1, module_name)
++        # Multi-stage kernels trigger once, after the last stage's doorbell, so
++        # dependents do not hold SMs while stages remain.
++        for module_name in ("_allgather_tilelang.py", "_reducescatter_tilelang.py", "_exchange_tilelang.py"):
++            text = (ROCE / module_name).read_text()
++            loop_pos = text.find("for s in T.serial(num_stages):")
++            guard = re.search(r"if s == num_stages - 1:\n\s+T\.pdl_trigger\(\)", text)
++            self.assertIsNotNone(guard, module_name)
++            self.assertGreater(guard.start(), loop_pos, module_name)
++            self.assertGreater(guard.start(), text.find("roce_doorbell"), module_name)
++
+     def test_runtime_routes_launchers_to_the_tilelang_kernels(self):
+         runtime = (ROCE / "runtime.py").read_text()
+         self.assertIn("reduce_launcher(*self._launcher_key(dtype))", runtime)
+-- 
+2.43.0
+

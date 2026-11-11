@@ -1068,6 +1068,18 @@ The merged base of round 2: candidate-50 with #1009 round 1, plus every PR that 
   and frozen as `candidate-54`: [manifest](../../manifests/frozen/candidate-54.json),
   [pre-release notes](candidate-54/pre-release-notes.md).
 
+## Candidate 55 ([candidate-55/](candidate-55))
+
+The first candidate on frozen candidate-54 (owner, 2026-11-11): five of the owner's platform PRs. #1134 (weight
+arenas from whole 2 MiB blocks, L3-aware CPU placement; it contains #1008), #1096 (B12X removed), #989 and #982 Part A
+(sparknet multi-stage collectives and PDL chaining) and #974 (the CUDA 13.5.37 toolchain, selected per lock since
+#1135). Its control, `no974/`, is the same build on CUDA 13.0.2. Marks, sources and the verification plan are in its
+README.
+
+- **Series:** [candidate-55/vllm/series](candidate-55/vllm/series) (`0001..0803`, 676 patches; `patch_head`
+  `a64a804c`, `expected_tree` `980e3812`); sparknet `0001..0003` on `1fd6a1fb` (tree `e06f6a06`).
+- **Status:** assembled; the build job is next.
+
 ## Candidates 55-58 (removed 2026-11-11)
 
 Round 3 (candidates 55, 56 and 57, and their merged base, candidate-58) was built on candidate-54 before `0799` and the
