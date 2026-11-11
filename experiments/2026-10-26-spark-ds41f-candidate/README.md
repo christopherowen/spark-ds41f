@@ -1077,10 +1077,12 @@ arenas from whole 2 MiB blocks, L3-aware CPU placement; it contains #1008), #109
 README.
 
 - **Series:** [candidate-55/vllm/series](candidate-55/vllm/series) (`0001..0803`, 676 patches; `patch_head`
-  `a64a804c`, `expected_tree` `980e3812`); sparknet `0001..0003` on `1fd6a1fb` (tree `e06f6a06`).
-- **Status:** first build done (images `8793529c` and the control's `f870f811` on dgx1..dgx4). Its release tests
-  failed 2 DeepSeek V4 B12X attention tests that import `b12x`, now deselected. The rebuild waits for #1134's
-  corrected `0800`.
+  `003fd4cc`, `expected_tree` `ed91c273`, with #1134 at `37a7f0ac`); sparknet `0001..0003` on `1fd6a1fb` (tree
+  `e06f6a06`).
+- **Status:**
+  - The first build (tree `980e3812`, images `8793529c` and the control's `f870f811`) is superseded.
+  - Its release tests failed 2 DeepSeek V4 B12X attention tests that import `b12x`. Those tests are now deselected.
+  - #1134's new `0800` is folded in, and the rebuild is next.
 
 ## Candidates 55-58 (removed 2026-11-11)
 

@@ -8,7 +8,7 @@ release-qualified.
 
 | PR | What | Carried as |
 | --- | --- | --- |
-| #1134 | Weight arenas and MoE slabs take whole free blocks of 2 MiB or more at load (both kernel page sizes), and the RoCE proxy, TP worker and EngineCore are placed by L3 size | vLLM `0800`, `0801`; sparknet `0001` |
+| #1134 | Weight arenas and MoE slabs take whole free blocks of 2 MiB or more at load (both kernel page sizes). The buddy sponge is held from model creation through post-load weight processing, with a 6 GiB `MemAvailable` floor. The RoCE proxy, TP worker and EngineCore are placed by L3 size | vLLM `0800`, `0801`; sparknet `0001` |
 | #1096 | B12X removed: no B12X source in the lock, no B12X import on DS4.1 runtime or loader paths, its startup rounds skipped | vLLM `0802` (rebased on candidate-54 and #1134) |
 | #989 | sparknet: one persistent multi-stage kernel per collective, 8 thread blocks, no single-slot cap, so SP prefill collectives up to 16 MiB stay on sparknet | sparknet `0002` |
 | #982 | sparknet: PDL chaining of the four one-shot collectives (Part A) | sparknet `0003` (re-placed in #989's stage loop); vLLM `0803` (its PDL-chain test entry) |
@@ -16,12 +16,20 @@ release-qualified.
 
 ## Selection
 
-- **Authors:** every PR is christopherowen's, and every patch's `From:` is Christopher Owen's.
-- **#1134 is carried in part:** its vLLM and sparknet patches only, at head `d9b04765` (byte-identical to the
-  earlier head `2d0c6c0b` they were first taken from). Its `scripts/memguard.sh`, `scripts/memguard-start.sh` and
-  `spark_ds41f/lab.py` telemetry pinning are deployment tooling, not image content: memguard runs on production nodes.
-  They go to `main` on their own. Its servebench changes (`trim_stall_tail`, an untimed prefill warm-up), which would
-  alter the measurement this candidate is judged by, have since left #1134.
+- **Authors:** every PR is christopherowen's. Every patch's `From:` is Christopher Owen's except #1134's `0800`,
+  whose `From:` reads `test <test@example.com>`. It is carried exactly as the PR has it.
+- **#1134 is carried in part:** its vLLM and sparknet patches only, at head `37a7f0ac` (owner, 2026-11-11: "the
+  batch is ready to fold in").
+  - **This head's `0800`** replaces the one first carried (heads `2d0c6c0b` and `d9b04765`). It keeps the sponge
+    from model creation through `process_weights_after_loading`, where the earlier one released it at the end of
+    `create_model()`. It also bounds the sponge by a 6 GiB `MemAvailable` floor rather than a 10 GiB headroom.
+  - **`0801` and sparknet `0001`** have the same diffs as at `d9b04765`.
+  - **Not carried: its deployment tooling**, which is not image content. That is `scripts/memguard.sh`,
+    `scripts/memguard-start.sh`, `spark_ds41f/lab.py`'s telemetry pinning, and `spark_ds41f/cluster.py`'s pre-launch
+    defragmentation. The defragmentation runs `sudo sync; drop_caches=3; compact_memory` on every node at every
+    cluster start, for every profile, production included.
+  - **The servebench changes** (`trim_stall_tail`, an untimed prefill warm-up) would have altered the measurement
+    this candidate is judged by. They have since left #1134.
 - **#1134 contains #1008:** its `0801` adds `vllm/utils/cpu_affinity.py` with #1008's partition, and its sparknet
   `0001` is #1008's sparknet patch (the same tree, `dab8c457`). #1008 is not carried separately.
 - **#982 is carried in part:** Part A (PDL chaining). Part B (`next_send_buffer` zero-copy staging) has no caller in
@@ -38,14 +46,15 @@ release-qualified.
 
 - vLLM ([vllm/series](vllm/series)): candidate-54's 672 patches by relative path, then `0800`, `0801` (#1134's files,
   unchanged), `0802` (#1096 rebased, [receipts/b12x-rebase](receipts/b12x-rebase/README.md)) and `0803` (#982's test
-  entry). 676 patches, `patch_head` `a64a804c`, `expected_tree` `980e3812`, `patchset_sha256` `cff45647`.
+  entry). 676 patches, `patch_head` `003fd4cc`, `expected_tree` `ed91c273`, `patchset_sha256` `1fb1e320`.
 - sparknet ([sparknet/series](sparknet/series)) on `1fd6a1fb`: `0001` (#1134), `0002` (#989), `0003` (#982 Part A,
   [receipts/sparknet-stack](receipts/sparknet-stack/README.md)). `patch_head` `1fdf8dc7`, `expected_tree` `e06f6a06`,
   `patchset_sha256` `60bb1942`.
 - No B12X source. CUDA 13.5.37 through `sources.cuda_toolkit` ([requirements/cuda-13-5-sbsa.txt](../../../requirements/cuda-13-5-sbsa.txt), 23
   debs, 1.51 GB). Every other source is candidate-54's.
 - Recorded by `bin/spark build prepare --lock` on dgx4 for both locks (the same vLLM and sparknet trees), the heads
-  copied into each `upstreams.lock.json`; the 23 debs downloaded and verified against the lockfile there. The
+  copied into each `upstreams.lock.json`; the 23 debs downloaded and verified against the lockfile there. Recorded
+  again for #1134 at `37a7f0ac`: the vLLM tree is `ed91c273`, the same tree a replay on dgx3 gives. The
   provenance, SHA-256 and author of each patch are in [receipts/selection.json](receipts/selection.json).
 - **What #1096 changes on the serving path:** one TileLang kernel, `engram_resident_lookup_kernel`, whose row bound
   is now `0 <= n_tok <= tokens` (bit-identical inside it, recompiled); the rest is renames, dead fields, the deleted
@@ -84,8 +93,9 @@ unchanged. The control can: it must give candidate-54's TP4 hashes `18d61961`/`d
 adds (`tests/quantization/test_mxfp4_csf.py` and `tests/v1/core/test_contiguous_kv_packing.py` by #1096,
 `tests/v1/worker/test_roce_cpu_affinity.py` by #1134), less the exclusion of the deleted
 `tests/model_executor/model_loader/test_b12x_loader.py`. `scripts/release_tests.py check` on the prepared tree: 217
-selected files (156 gate, 61 excluded), 0 problems; the gate manifest has 157 files and 16 deselected tests, bundled
-in [bundles/release-tests](bundles/release-tests). `0803`'s `test_sparknet_oneshot_collectives_pdl_sources` is a gate
+selected files (156 gate, 61 excluded), 0 problems, the same at both trees. The gate manifest has 157 files and 16
+deselected tests at `003fd4cc`, bundled in [bundles/release-tests](bundles/release-tests). The test files of #1134's
+new `0800` (`test_direct_loader.py`, `test_direct_loader_cuda.py`) are gate files. `0803`'s `test_sparknet_oneshot_collectives_pdl_sources` is a gate
 test that passes only with sparknet `0003` in the image.
 
 **First build** (image `8793529c`, dgx4, 2,656 s): 2 failed, 10,242 passed, 357 skipped
@@ -94,14 +104,15 @@ test that passes only with sparknet `0003` in the image.
 both `ModuleNotFoundError: No module named 'b12x'`. They test DeepSeek V4's B12X attention backend
 (`vllm/models/deepseek_v4/nvidia/b12x.py`, not on DS4.1's path) and import `b12x.attention` directly. #1096's own
 without-B12X run did not select this file. Both are now deselected with that reason, and the file's other tests still
-run. The vLLM tree is unchanged.
+run. The deselection leaves the vLLM tree unchanged.
 
 ## Status
 
 Assembled (2026-11-11). `bin/spark doctor` passes on every configuration (the switched shapes with the example site
 maps), and the unit suite passes in full on dgx4 (889 tests).
 
-**First build** (dgx1's window, job `20261111T193116-build.json`, deployment `e90b1e8a`):
+**First build** (vLLM tree `980e3812`, #1134 at `d9b04765`; dgx1's window, job `20261111T193116-build.json`,
+deployment `e90b1e8a`):
 
 | Image | Image ID | Layers | Note |
 | --- | --- | --- | --- |
@@ -113,5 +124,5 @@ maps), and the unit suite passes in full on dgx4 (889 tests).
   that fixed (#1138), the smoke passes on both images on dgx4's GPU: the 66 DS4.1 modules import without B12X.
 - **Release tests:** see above.
 
-**Next:** both images are rebuilt once #1134's corrected `0800` lands, because that fix changes the vLLM tree. The
-rebuilt images then go through the release tests and the gates.
+**#1134 at `37a7f0ac` folded in** (2026-11-11): vLLM tree `ed91c273`, both locks re-recorded. Next: the build job
+rebuilds both images, then runs the release tests on candidate-55's. The gates follow.
