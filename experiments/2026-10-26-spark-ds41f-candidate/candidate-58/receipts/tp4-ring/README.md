@@ -16,8 +16,8 @@ Each run's window-log segment is in `lab/`.
 candidate-54's.
 
 **Open (2026-11-10):** the determinism gate's `again` scenario at tp4-ring has failed in 2 of 5 boots since
-candidate-51 (0 of 147 before), though not in candidate-58's boot. candidate-54 is being revised with the fixes
-(`spark-ds41f:candidate-54-r1`), and candidate-58 is rebuilt on it before any freeze.
+candidate-51 (0 of 147 before), though not in candidate-58's boot. candidate-54 carries the fix (`0799`, added
+2026-11-11), and candidate-58 is rebuilt on it before any freeze.
 
 **Gate repeat (2026-11-10, `gate-repeat/`).** Twelve boots, interleaved: candidate-58, spark-ds41f-1107 and
 candidate-58-noC51, four boots each, with the gate's records kept per call.
