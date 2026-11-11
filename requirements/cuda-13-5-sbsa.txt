@@ -1,0 +1,36 @@
+# Ubuntu 24.04 SBSA CUDA 13.5 toolchain and math libraries for docker/Dockerfile's
+# cuda-13-5 stage, selected by a lock that lists sources.cuda_toolkit at 13.5.37:
+# nvcc/ptxas 13.5.37, libcudart 13.5.37, libcublas/libcublasLt 13.10.0.20, and
+# the two config packages they need upgraded from the base image's 13.0.96-1
+# (cuda-toolkit-config-common, cuda-toolkit-13-config-common).
+# The set is what `apt-get install --no-install-recommends` resolves for those
+# packages in docker.io/vllm/vllm-openai@sha256:3cf14c52765a0f0c2f09035e05fa79e1e4b2f9788b64afa90fa41c1ff12d29cf.
+# Files are relative to https://developer.download.nvidia.com/compute/cuda/repos/ubuntu2404/sbsa/;
+# sizes and SHA-256 are from the repository's signed package index (InRelease dated
+# 2026-11-11 04:02:54 UTC). bin/spark build prepare downloads and verifies every
+# file; the image installs exactly this set with dpkg -i. Refreshing it is
+# described in docker/README.md.
+# package=version  filename  size  sha256
+cccl-13-5=13.3.5.0.6-1 cccl-13-5_13.3.5.0.6-1_arm64.deb 1548150 sha256:1e893c0c62d4bf8a08b91bc0681a58659df2b1807ccaa04026d90d0664ae7d29
+cuda-compat-13-5=620.70.06-1ubuntu1 cuda-compat-13-5_620.70.06-1ubuntu1_arm64.deb 95125014 sha256:0f88f27fba2bacdbb69383206ba1d5dff4c350f3ce8d70e1f6c5fdf2cc7164a7
+cuda-crt-13-5=13.5.37-1 cuda-crt-13-5_13.5.37-1_arm64.deb 112276 sha256:344e4cfd761d66fecc3d5610cd242239d1addfda9975065530e24cce9bcabc47
+cuda-cudart-13-5=13.5.37-1 cuda-cudart-13-5_13.5.37-1_arm64.deb 192546 sha256:1327025987116841627af9cea6d8cc8311b51482f440a64a8174b7c96d3643fd
+cuda-cudart-dev-13-5=13.5.37-1 cuda-cudart-dev-13-5_13.5.37-1_arm64.deb 1577072 sha256:05dfcdccda0b6304a399f8d336b08ccc26256c23f07ef544aca967a71dbefba0
+cuda-culibos-dev-13-5=13.5.25-1 cuda-culibos-dev-13-5_13.5.25-1_arm64.deb 23910 sha256:eb5425069f4fe4ff2485e191a9da26922ed45a875aa284b0b2781efbf7a17cf1
+cuda-cuobjdump-13-5=13.5.37-1 cuda-cuobjdump-13-5_13.5.37-1_arm64.deb 275610 sha256:df513d526f0c58798817495a9ee04e99dde6a9d4b360e8d2f88db1436dbaf7ee
+cuda-driver-dev-13-5=13.5.37-1 cuda-driver-dev-13-5_13.5.37-1_arm64.deb 36650 sha256:9fe74d33e1575dce8a8e812b599ede552aa713ac284d9b58704113ee354f0917
+cuda-nvcc-13-5=13.5.37-1 cuda-nvcc-13-5_13.5.37-1_arm64.deb 27971012 sha256:648357ca544a389aedb80405381d97305f4ae9839052e986f12f19187b30a368
+cuda-nvdisasm-13-5=13.5.37-1 cuda-nvdisasm-13-5_13.5.37-1_arm64.deb 4994912 sha256:a04d9024a1db19544feb16c41da4076918da271e1fa03443e3276d6c3152a4e9
+cuda-nvrtc-13-5=13.5.37-1 cuda-nvrtc-13-5_13.5.37-1_arm64.deb 37369620 sha256:dd820b2cee98614a144c201669288f83cdb05e6b3297d9cb45864c6ea90aa066
+cuda-nvrtc-dev-13-5=13.5.37-1 cuda-nvrtc-dev-13-5_13.5.37-1_arm64.deb 34461604 sha256:8d9849b329ee413dcb7b1d9fd9c4b95a2441217d11de27878f6348837436e638
+cuda-toolkit-13-5-config-common=13.5.37-1 cuda-toolkit-13-5-config-common_13.5.37-1_all.deb 21162 sha256:aa0a5ebb09b32af21e5e0a69ec25c342a793041d42f24d3ffcb4b6b9d96f2812
+cuda-toolkit-13-config-common=13.5.37-1 cuda-toolkit-13-config-common_13.5.37-1_all.deb 21170 sha256:a96eea43226de7478e025f3a05174e2eff041ee2a9ffb0528c2231cf25ee7c6e
+cuda-toolkit-config-common=13.5.37-1 cuda-toolkit-config-common_13.5.37-1_all.deb 21142 sha256:43cfadd80f20c878128813ad3fd0c26c5b4be684101dd9d5526284bb30934729
+libcublas-13-5=13.10.0.20-1 libcublas-13-5_13.10.0.20-1_arm64.deb 528950246 sha256:af658f7b12cf7917fd119106c7db4308e34403faabd13edc66d90aee0857fa67
+libcublas-dev-13-5=13.10.0.20-1 libcublas-dev-13-5_13.10.0.20-1_arm64.deb 586480430 sha256:e2abf0c98b7283598265f69c86345c8f7074b124a98283c8b1198ca57ecdf029
+libcurand-13-5=10.4.5.25-1 libcurand-13-5_10.4.5.25-1_arm64.deb 42927492 sha256:4f873f237e40bc763d32da8e4652336792fdbf185581e05a7bd25a73b855b15b
+libcurand-dev-13-5=10.4.5.25-1 libcurand-dev-13-5_10.4.5.25-1_arm64.deb 43088070 sha256:3712ba995afd74bac9ff23a04735b3ba5fd8e74a878d924c790168a00557bb84
+libnvjitlink-13-5=13.5.37-1 libnvjitlink-13-5_13.5.37-1_arm64.deb 30041508 sha256:422dd250d5519402da366714c3594a234dcf75ddba8025da44e3cf2e70bffd8c
+libnvjitlink-dev-13-5=13.5.37-1 libnvjitlink-dev-13-5_13.5.37-1_arm64.deb 29080004 sha256:ff4002cb3d127adf9c0e3e4e430b7df0f045c182b1e1f493c8a3650402b78239
+libnvptxcompiler-13-5=13.5.37-1 libnvptxcompiler-13-5_13.5.37-1_arm64.deb 21542 sha256:6b502460c992bbf6a98d06b3de869f771ac31d38bc6b272773d3ff545791c6ab
+libnvvm-13-5=13.5.37-1 libnvvm-13-5_13.5.37-1_arm64.deb 46535636 sha256:0d9ebf3aee616b63a08e109b04b530aa307fad2ec3a32c2077cc7d598bdca577

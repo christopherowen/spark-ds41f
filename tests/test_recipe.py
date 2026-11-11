@@ -709,6 +709,23 @@ class OverlayTest(unittest.TestCase):
         with self.assertRaises(SystemExit):
             recipe.overlay({"extends": {}, "container": {}}, base)
 
+    def test_unset_removes_a_dotted_key_inside_a_dict_target(self):
+        # An image label key holds dots itself; the longest key the target holds is removed.
+        base = recipe.resolve(load("releases/spark-ds41f-1107/cluster.json"), "tp4-ring")
+        label = "local.spark-ds41f.b12x.tree"
+        self.assertIn(label, base["container"]["expected_labels"])
+        cluster = recipe.overlay(
+            {"extends": {"config": "releases/spark-ds41f-1107/cluster.json", "shape": "tp4-ring"},
+             "unset": [f"container.expected_labels.{label}"]},
+            base,
+        )
+        self.assertNotIn(label, cluster["container"]["expected_labels"])
+        self.assertIn("local.spark-ds41f.vllm.tree", cluster["container"]["expected_labels"])
+        self.assertIn(label, base["container"]["expected_labels"])  # the base is not changed
+        with self.assertRaises(SystemExit):
+            recipe.overlay({"extends": {}, "unset": ["container.expected_labels.local.spark-ds41f.nothing.tree"]},
+                           base)
+
     def test_serve_options_change_one_value_and_follow_every_other_argument(self):
         base = recipe.resolve(load(FIXTURE), "tp3-triangle")
         arm = {"extends": {"config": FIXTURE, "shape": "tp3-triangle"},

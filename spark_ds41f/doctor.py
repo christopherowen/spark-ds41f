@@ -113,7 +113,7 @@ def local_doctor(cluster: dict, nodes: dict, upstreams: dict) -> list[str]:
     for name, source in upstreams["sources"].items():
         if not source.get("upstream"):
             problems.append(f"{name}: canonical upstream is not recorded")
-        if source["kind"] == "git":
+        if source.get("kind") == "git":
             if len(source["revision"]) != 40:
                 problems.append(f"{name}: revision is not a full commit SHA")
             if not source.get("tracking_ref"):
@@ -132,6 +132,7 @@ def local_doctor(cluster: dict, nodes: dict, upstreams: dict) -> list[str]:
         lockfile = source.get("lockfile")
         if lockfile and not (ROOT / lockfile).is_file():
             problems.append(f"{name}: missing dependency lock {lockfile}")
+    problems.extend(cuda_toolkit_problems(upstreams["sources"]))
     watchlist_path = ROOT / "docs/inspiration.md"
     watchlist = (
         watchlist_path.read_text(encoding="utf-8") if watchlist_path.is_file() else ""
