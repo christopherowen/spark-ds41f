@@ -1,0 +1,116 @@
+From 3e3075d1e3201bd57d43a7569e8a8458bee7c248 Mon Sep 17 00:00:00 2001
+From: Christopher Owen <christopherowen@users.noreply.github.com>
+Date: Sun, 8 Nov 2026 23:33:51 +0000
+Subject: [PATCH] fix(structured-output): enforce completions grammar under
+ reasoning parser
+
+Upstream base: 2756478b60b90700b9918b457aeb38657da637b5 (1107 vLLM patch head).
+
+Rationale:
+1. When serving with --reasoning-parser deepseek_v41 (or deepseek_v3), DeepSeekV4Parser defaults thinking=True (initial_state=ParserState.REASONING, wait_for_reasoning=True) whenever chat_template_kwargs is absent or empty. Unlike /v1/chat/completions and /v1/responses, which populate reasoning_parser_kwargs={"chat_template_kwargs": ...} and/or reasoning_ended, /v1/completions and raw LLM.generate() calls leave reasoning_ended=None, reasoning_parser_kwargs=None (or {}), and reasoner=None. StructuredOutputManager._get_constraint_start previously instantiated a request-local reasoner with empty kwargs, checked reasoner.is_reasoning_end(prompt_token_ids) (which returns False when no </think> token is in the raw prompt), and latched structured_req.reasoning_ended=False. Consequently, _get_constraint_start returned len(spec_tokens) + 1 on every step, causing trim_spec_tokens to retain invalid draft tokens, grammar_bitmask to leave all bitmask rows unconstrained (-1), and accept_tokens to skip grammar FSM advancement. Return 0 immediately in _get_constraint_start when structured_req.reasoning_ended is None, not structured_req.reasoning_parser_kwargs, and structured_req.reasoner is None.
+2. DeepseekV41ModelState.prepare_attn was missing the ubatch_idx: int = 0 parameter declared on ModelState.prepare_attn and DefaultModelState.prepare_attn and passed by UBatchRunner.
+
+Quality:
+Enforces structured-output JSON/grammar bitmasks and speculative draft trimming from token 0 on /v1/completions and raw generation requests while keeping /v1/chat/completions, /v1/responses, and MTP mid-window reasoning-end handling unchanged.
+
+Tests:
+- pytest tests/v1/structured_output/test_structured_output_manager.py tests/v1/spec_decode/test_mtp_structured_output.py (80 passed).
+
+Upstream status: local fix for structured-output grammar enforcement under reasoning parsers.
+---
+ .../test_structured_output_manager.py         | 51 +++++++++++++++++++
+ .../deepseek_v4_1/nvidia/model_state.py       |  1 +
+ vllm/v1/structured_output/__init__.py         |  6 ++-
+ 3 files changed, 57 insertions(+), 1 deletion(-)
+
+diff --git a/tests/v1/structured_output/test_structured_output_manager.py b/tests/v1/structured_output/test_structured_output_manager.py
+index 25c0e519ba..f8cf48e6c8 100644
+--- a/tests/v1/structured_output/test_structured_output_manager.py
++++ b/tests/v1/structured_output/test_structured_output_manager.py
+@@ -439,3 +439,54 @@ def test_initial_constraint_activation(
+         structured_req = request.structured_output_request
+         assert structured_req is not None
+         assert structured_req.reasoner is None
++
++
++@pytest.mark.parametrize("backend", BACKENDS)
++@pytest.mark.parametrize("reasoning_parser_kwargs", [None, {}], ids=["none", "empty"])
++def test_completions_request_Without_reasoning_kwargs_constrains_from_first_token(
++    tokenizer,
++    backend: str,
++    reasoning_parser_kwargs: dict | None,
++):
++    """A /v1/completions request has no chat_template_kwargs, so
++    reasoning_ended is None and reasoning_parser_kwargs is None/{}. Even when
++    the configured reasoning parser defaults to thinking=True on empty kwargs,
++    structured-output grammar must constrain token 0 immediately without
++    instantiating a per-request reasoner."""
++
++    class DefaultThinkingReasoner(MockReasoner):
++        def __init__(self, tokenizer, **kwargs):
++            chat_kwargs = kwargs.get("chat_template_kwargs") or {}
++            thinking = chat_kwargs.get("thinking", True)
++            marker = _single_token(tokenizer, THINK_END) if thinking else None
++            super().__init__(tokenizer, marker=marker)
++
++    manager, request = _build_harness(
++        tokenizer,
++        backend,
++        use_reasoner=False,
++        reasoning_ended=None,
++        enable_in_reasoning=False,
++        reasoning_parser_kwargs=reasoning_parser_kwargs,
++        structured_outputs=StructuredOutputsParams(regex=DIGITS_REGEX),
++    )
++    manager.reasoner_cls = DefaultThinkingReasoner
++
++    spec_tokens = _to_token_ids(tokenizer, ("1", "z", "2", -1))
++    trimmed = manager.trim_spec_tokens(request, spec_tokens)
++    assert trimmed == spec_tokens[:2]
++
++    bitmask = manager.grammar_bitmask(
++        requests={request.request_id: request},
++        structured_output_request_ids=[request.request_id],
++        scheduled_spec_decode_tokens={request.request_id: trimmed},
++    )
++    assert bitmask is not None
++    assert _row_pattern(bitmask) == "CCU"
++    request.append_output_token_ids(trimmed[:1])
++    assert manager.accept_tokens(request, trimmed[:1])
++
++    structured_req = request.structured_output_request
++    assert structured_req is not None
++    assert structured_req.reasoner is None
++    assert structured_req.reasoning_ended is True
+diff --git a/vllm/models/deepseek_v4_1/nvidia/model_state.py b/vllm/models/deepseek_v4_1/nvidia/model_state.py
+index 0a6fdf43fe..d531cbdce2 100644
+--- a/vllm/models/deepseek_v4_1/nvidia/model_state.py
++++ b/vllm/models/deepseek_v4_1/nvidia/model_state.py
+@@ -301,6 +301,7 @@ class DeepseekV41ModelState(DefaultModelState):
+         attn_groups: list[list[AttentionGroup]],
+         kv_cache_config: KVCacheConfig,
+         for_capture: bool = False,
++        ubatch_idx: int = 0,
+     ) -> dict[str, Any]:
+         # Runtime prepares attention before model inputs. Capture does the reverse;
+         # both paths populate the same persistent packing buffers.
+diff --git a/vllm/v1/structured_output/__init__.py b/vllm/v1/structured_output/__init__.py
+index 1925a08e6c..c1ac615cb1 100644
+--- a/vllm/v1/structured_output/__init__.py
++++ b/vllm/v1/structured_output/__init__.py
+@@ -237,7 +237,11 @@ class StructuredOutputManager:
+ 
+         structured_req = request.structured_output_request
+         assert structured_req is not None
+-        if structured_req.reasoning_ended:
++        if structured_req.reasoning_ended or (
++            structured_req.reasoning_ended is None
++            and not structured_req.reasoning_parser_kwargs
++            and structured_req.reasoner is None
++        ):
+             return 0
+ 
+         reasoner = self._get_reasoner(request)
+-- 
+2.43.0
+
