@@ -30,14 +30,17 @@ ARG TILELANG_BASE_STAGE=runtime
 # The base image as it is: CUDA 13.0.2 (nvcc/ptxas 13.0.88, libcublasLt 13.1.1.3).
 FROM ${BASE_IMAGE} AS base
 
-# CUDA 13.5 (nvcc/ptxas 13.5.37, libcudart 13.5.37, libcublasLt 13.10.0.20) over the
-# base image's CUDA 13.0.2, from the lock's packages (requirements/cuda-13-5-sbsa.txt,
-# verified by `bin/spark build prepare`). dpkg installs exactly that set with no
-# network access, so a dependency the set lacks fails the build. /usr/local/cuda,
-# /usr/local/cuda-13 and the pip nvidia/cu13 directory, which libtorch_cuda.so's
-# DT_RPATH and cuda.pathfinder search ahead of /usr/local/cuda, are wired to
-# /usr/local/cuda-13.5; nvcc reads TOP from its nvcc.profile because it does not
-# resolve the nvidia/cu13/bin link it may be called through.
+# CUDA 13.5 (nvcc/ptxas 13.5.37, libcudart 13.5.37) over the base image's CUDA 13.0.2,
+# from the lock's packages (requirements/cuda-13-5-sbsa.txt, verified by `bin/spark
+# build prepare`). dpkg installs exactly that set with no network access, so a
+# dependency the set lacks fails the build. /usr/local/cuda, /usr/local/cuda-13 and
+# the pip nvidia/cu13 directory, which libtorch_cuda.so's DT_RPATH and
+# cuda.pathfinder search ahead of /usr/local/cuda, are wired to /usr/local/cuda-13.5;
+# nvcc reads TOP from its nvcc.profile because it does not resolve the nvidia/cu13/bin
+# link it may be called through. cuBLAS stays the base image's 13.1.1.3: the files of
+# its libcublas-13-0 and libcublas-dev-13-0 packages are linked into the 13.5 tree
+# (CMake and torch's extensions find its headers and libraries there), and the pip
+# nvidia/cu13 copies torch loads are left as they are.
 FROM ${BASE_IMAGE} AS cuda-13-5
 
 USER root
@@ -46,7 +49,7 @@ ENV CUDA_HOME=/usr/local/cuda \
     CUDA_VERSION=13.5.0 \
     NV_CUDA_CUDART_VERSION=13.5.37-1 \
     NV_CUDA_LIB_VERSION=13.5.0-1 \
-    NV_LIBCUBLAS_VERSION=13.10.0.20-1 \
+    NV_LIBCUBLAS_VERSION=13.1.1.3-1 \
     PATH=/usr/local/cuda-13.5/bin:/usr/local/cuda/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin \
     LD_LIBRARY_PATH=/usr/local/cuda-13.5/targets/sbsa-linux/lib:/usr/local/cuda/targets/sbsa-linux/lib:/usr/local/cuda/lib64
 
@@ -67,9 +70,18 @@ RUN --mount=type=bind,from=cuda-toolkit-debs,target=/tmp/cuda-toolkit-debs \
       'rm -rf "${cu13_dir}/bin" "${cu13_dir}/nvvm"' \
       'ln -s /usr/local/cuda-13.5/bin "${cu13_dir}/bin"' \
       'ln -s /usr/local/cuda-13.5/nvvm "${cu13_dir}/nvvm"' \
-      'for lib in libcublas.so.13 libcublasLt.so.13 libnvblas.so.13 libcudart.so.13 libcudart_static.a libcudadevrt.a libnvJitLink.so.13 libnvrtc.so.13 libnvrtc-builtins.so.13.5 libnvptxcompiler_static.a libcurand.so.10; do' \
+      'for lib in libcudart.so.13 libcudart_static.a libcudadevrt.a libnvJitLink.so.13 libnvrtc.so.13 libnvrtc-builtins.so.13.5 libnvptxcompiler_static.a libcurand.so.10; do' \
       '  ln -sfn "${cuda_lib}/${lib}" "${cu13_dir}/lib/${lib}"' \
       'done' \
+      'dpkg-query -L libcublas-13-0 libcublas-dev-13-0 | while read -r path; do' \
+      '  case "${path}" in /usr/local/cuda-13.0/targets/sbsa-linux/*) ;; *) continue ;; esac' \
+      '  if [ -d "${path}" ] && [ ! -L "${path}" ]; then continue; fi' \
+      '  link="/usr/local/cuda-13.5${path#/usr/local/cuda-13.0}"' \
+      '  mkdir -p "$(dirname "${link}")"' \
+      '  ln -sfn "${path}" "${link}"' \
+      'done' \
+      'test -e /usr/local/cuda-13.5/targets/sbsa-linux/include/cublas_v2.h' \
+      'test -e /usr/local/cuda-13.5/targets/sbsa-linux/lib/libcublasLt.so.13' \
       'rm -f "${cu13_dir}/lib/libnvrtc-builtins.so.13.0" "${cu13_dir}/lib/libnvrtc-builtins.so.13.2"' \
       'ln -sfn /usr/local/cuda-13.5/nvvm/lib64/libnvvm.so.4.0.0 "${cu13_dir}/lib/libnvvm.so.4"' \
       'ldconfig' \
@@ -345,7 +357,8 @@ PY
 # the libraries torch, cuda.pathfinder and ctypes resolve.
 FROM runtime-core AS runtime-core-cuda-13-5
 
-LABEL local.spark-ds41f.cuda.version="13.5.37"
+LABEL local.spark-ds41f.cuda.version="13.5.37" \
+      local.spark-ds41f.cuda.cublas.version="13.1.1.3"
 
 RUN /usr/local/sbin/spark-wire-cuda-13-5
 RUN python3 - <<'PY'
@@ -360,15 +373,17 @@ for tool in ("nvcc", "ptxas"):
     assert "release 13.5, V13.5.37" in out, out
     resolved = Path(find_nvidia_binary_utility(tool)).resolve()
     assert resolved == Path(f"/usr/local/cuda-13.5/bin/{tool}"), resolved
-for lib_path in (
-    "/usr/local/cuda/lib64/libcublasLt.so.13",
-    "/usr/local/lib/python3.12/dist-packages/nvidia/cu13/lib/libcublasLt.so.13",
+# cuBLAS is the base image's 13.1.1.3 on every path: the 13.5 tree links to its
+# libcublas-13-0 files, and torch's pip nvidia/cu13 copies are not re-wired.
+for lib_path, resolved_in in (
+    ("/usr/local/cuda/lib64/libcublasLt.so.13", "/usr/local/cuda-13.0/targets/sbsa-linux/lib"),
+    ("/usr/local/lib/python3.12/dist-packages/nvidia/cu13/lib/libcublasLt.so.13",
+     "/usr/local/lib/python3.12/dist-packages/nvidia/cu13/lib"),
 ):
-    assert Path(lib_path).resolve() == Path(
-        "/usr/local/cuda-13.5/targets/sbsa-linux/lib/libcublasLt.so.13.10.0.20"
-    ), Path(lib_path).resolve()
-    assert ctypes.CDLL(lib_path).cublasLtGetVersion() == 131000
-for name in ("libcudart.so.13", "libnvrtc.so.13", "libnvJitLink.so.13", "libcublas.so.13"):
+    resolved = Path(lib_path).resolve()
+    assert resolved.is_relative_to(resolved_in), resolved
+    assert ctypes.CDLL(lib_path).cublasLtGetVersion() == 130101
+for name in ("libcudart.so.13", "libnvrtc.so.13", "libnvJitLink.so.13"):
     resolved = Path(f"/usr/local/lib/python3.12/dist-packages/nvidia/cu13/lib/{name}").resolve()
     assert resolved.is_relative_to("/usr/local/cuda-13.5/targets/sbsa-linux/lib"), resolved
 cudart = ctypes.CDLL("/usr/local/cuda/lib64/libcudart.so.13")
