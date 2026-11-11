@@ -18,14 +18,16 @@ dgx1..dgx4, `tp4-switched` sp1..sp4, `tp3-switched` sp5..sp7).
   - round 2: 11 patches copied from `main` and renumbered from `0781` in this order: candidate-51's, candidate-52's,
     then candidate-53's, ending with #998 round 1. Each is the PR's patch as its candidate carried it, or the
     rework's corrected patch. #984 missed and is left out (below).
-  - revision 1 (2026-11-11): `0799`, the MoE combine's shared-row load after the PDL wait (below).
+  - added 2026-11-11: `0799`, the MoE combine's shared-row load after the PDL wait (below).
 - The provenance, SHA-256 and author of each patch are in [receipts/selection.json](receipts/selection.json), and the
   stack log is [receipts/stack.log](receipts/stack.log).
-- Revision 1 (`spark-ds41f:candidate-54-r1`): `patch_count` 672, `patch_head` `707688e7`, `expected_tree`
-  `b20b199d`, `patchset_sha256` `1b31f510`, recorded by `bin/spark build prepare --lock` ([source.json](source.json),
-  [upstreams.lock.json](upstreams.lock.json)). Every receipt below predates it and is the record of
-  `spark-ds41f:candidate-54` (`patch_count` 671, `patch_head` `4e8133ff`, `expected_tree` `5f021d9a`,
-  `patchset_sha256` `fd767123`).
+- `patch_count` 672, `patch_head` `707688e7`, `expected_tree` `b20b199d`, `patchset_sha256` `1b31f510`, recorded by
+  `bin/spark build prepare --lock` ([source.json](source.json), [upstreams.lock.json](upstreams.lock.json)). Every
+  receipt below predates `0799`: it is the record of the earlier build (`patch_count` 671, `patch_head` `4e8133ff`,
+  `expected_tree` `5f021d9a`, `patchset_sha256` `fd767123`, image ID `e1de71be`). The image is rebuilt under the
+  same tag, `spark-ds41f:candidate-54`. `build image` refuses a tag that exists, so the earlier image's tag is removed
+  from each node before the build and its copies; each profile's `local.spark-ds41f.vllm.tree` label (`b20b199d`)
+  refuses the earlier image wherever it remains.
 - Every other source is 1107's.
 - **Authors:** every carried PR is christopherowen's. Every patch's `From:` is Christopher Owen's, except
   `0768` (#955), which is koldfrontier's: an owner-approved exception.
@@ -62,9 +64,9 @@ dgx1..dgx4, `tp4-switched` sp1..sp4, `tp3-switched` sp5..sp7).
 | `0789-perf-spec-decode-copy-drafter-survival-and-tile-cap.patch` | #971 | perf(spec-decode): cumulative survival in copy_apply, single-req 16-row tile cap, and wide-step dead-row mask | [#971 round 1](../candidate-53/receipts/rework/pr-971-r1) (candidate-53) | [corrected-meets-mark](../candidate-53/receipts/rework/pr-971-r1/result.json) |
 | `0790-perf-spec-decode-copy-drafter-long-context-scan.patch` | #977 | perf(spec_decode): bound CopyDrafter long-context history scan in copy_match | candidate-53, PR head `4e0244deb7d5` | [pass](../candidate-53/receipts/own-marks/pr-977/result.json) |
 | `0791-perf-worker-compact-packed-vocab-tables-and-expand-d.patch` | #998 | perf(worker): compact packed vocab tables and expand display carve-out weights | [#998 round 1](../candidate-53/receipts/rework/pr-998-r1) (candidate-53) | [corrected-meets-mark](../candidate-53/receipts/rework/pr-998-r1/result.json) |
-| `0799-fix-dsv41-read-the-MoE-combine-s-shared-rows-after-t.patch` | revision 1 | fix(dsv41): read the MoE combine's shared rows after the PDL wait | owner's fix, on `0791` | not yet verified: the gate on the three testbeds, several boots |
+| `0799-fix-dsv41-read-the-MoE-combine-s-shared-rows-after-t.patch` | owner's fix | fix(dsv41): read the MoE combine's shared rows after the PDL wait | owner's fix, on `0791` | not yet verified: the gate on the three testbeds, several boots |
 
-**Revision 1.** `moe_combine_v41` (`tilelang/moe.py`, from 1107's `0756`) loaded the shared expert's output
+**`0799`.** `moe_combine_v41` (`tilelang/moe.py`, from 1107's `0756`) loaded the shared expert's output
 before `pdl.chain()`, its `griddepcontrol.wait`. The shared expert runs on the aux stream; the combine joins it
 with an event wait just before its PDL launch, and in a captured graph that dependency can be a programmatic
 edge, which orders only what follows the wait. `0799` moves `pdl.chain()` above the shared load. The `RoutePos`
@@ -165,7 +167,7 @@ release tests crash. Round 1's guard is that fix. No semantic conflict was found
 
 ## Cluster configurations
 
-A cluster configuration for every shape the recipe serves, so the candidate can be run on any setup: `bin/spark --cluster-config experiments/2026-10-26-spark-ds41f-candidate/candidate-54/<file> …` with your site's node map. Each one extends `releases/spark-ds41f-1107/cluster.json` at its shape and sets only the image `spark-ds41f:candidate-54-r1` (revision 1), its tree labels and this lock; no PR changes the recipe. The `-dev` file adds the dev-mode collective RPC that the screen's engine grid needs. This candidate is verified at the three testbeds marked; the other files are configurations, not part of its runs.
+A cluster configuration for every shape the recipe serves, so the candidate can be run on any setup: `bin/spark --cluster-config experiments/2026-10-26-spark-ds41f-candidate/candidate-54/<file> …` with your site's node map. Each one extends `releases/spark-ds41f-1107/cluster.json` at its shape and sets only the image `spark-ds41f:candidate-54`, its tree labels and this lock; no PR changes the recipe. The `-dev` file adds the dev-mode collective RPC that the screen's engine grid needs. This candidate is verified at the three testbeds marked; the other files are configurations, not part of its runs.
 
 | Shape | Configuration | With dev RPC | |
 | --- | --- | --- | --- |
