@@ -87,8 +87,8 @@ its gate repeat. `0799` passes when every run of every boot gives candidate-54's
   they are: [screen-0799-tp4.json](screen-0799-tp4.json), [screen-0799-tp4-switched.json](screen-0799-tp4-switched.json),
   [screen-0799-tp3-switched.json](screen-0799-tp3-switched.json) and
   [live-checks-0799-tp4-switched.json](live-checks-0799-tp4-switched.json), each the earlier spec with its run renamed;
-- [c1-decisions-tp4-switched.json](c1-decisions-tp4-switched.json): c1 on 4 boots at `tp4-switched`, saving each
-  request's per-step token counts. In candidate-58's c1 arms at `tp4-switched`
+- [c1-decisions-tp4-switched.json](c1-decisions-tp4-switched.json) and [c1-decisions-tp4.json](c1-decisions-tp4.json):
+  c1 on 4 boots at `tp4-switched` and at `tp4-ring`, saving each request's per-step token counts. In candidate-58's c1 arms at `tp4-switched`
   ([c1-drafter-arms-tp4-switched.json](../candidate-58/c1-drafter-arms-tp4-switched.json), 3 boots each), the boots'
   accept decisions split, except where the shared expert left the aux stream, the drafter's query forward ran without
   its graph, or row taps were on. The drafter's layers are `DeepseekV4DecoderLayer`s, so its MoE runs the same combine.
