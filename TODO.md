@@ -79,14 +79,15 @@ Before promoting `1107`:
    under the widened `max_decode_rows` (`59` on TP3, `107` on TP4) plus 69
    target CUDA graphs on TP3 (`60 -> 69`), confirming headroom stays comfortably
    above the 5 GiB startup and 3 GiB steady-state guards.
-3. **Retire legacy `bin/spark bench` suites** once no active workflow references
-   them; servebench suites (`docs/release-benchmark.md`) are the release
+3. **Retire the measurement matrix** (`bin/spark bench` without `--suite`, now
+   Sonar's `matrix`) once no active workflow references it; the suites in
+   `config/suites/`, run by Sonar (`docs/release-benchmark.md`), are the release
    benchmark authority.
 
 ## Current reference
 
 <!-- BEGIN GENERATED: current-reference -->
-Active baseline manifest: [`manifests/baselines/2026-11-07-spark-ds41f-1107.json`](manifests/baselines/2026-11-07-spark-ds41f-1107.json) (`spark-ds41f-1107`). Releases are judged by the servebench release, single-stream and sampled suites (`docs/release-benchmark.md`, `scripts/servebench_suite_table.py`). Current benchmark references are [`manifests/suites/2026-11-07-spark-ds41f-1107-tp4`](manifests/suites/2026-11-07-spark-ds41f-1107-tp4/) for `tp4-ring` and [`manifests/suites/2026-11-07-spark-ds41f-1107-tp3`](manifests/suites/2026-11-07-spark-ds41f-1107-tp3/) for `tp3-triangle`:
+Active baseline manifest: [`manifests/baselines/2026-11-07-spark-ds41f-1107.json`](manifests/baselines/2026-11-07-spark-ds41f-1107.json) (`spark-ds41f-1107`). Releases are judged by the release, single-stream and sampled suites, measured with Sonar (`docs/release-benchmark.md`, `scripts/sonar_table.py`). Current benchmark references are [`manifests/suites/2026-11-07-spark-ds41f-1107-tp4`](manifests/suites/2026-11-07-spark-ds41f-1107-tp4/) for `tp4-ring` and [`manifests/suites/2026-11-07-spark-ds41f-1107-tp3`](manifests/suites/2026-11-07-spark-ds41f-1107-tp3/) for `tp3-triangle`:
 
 | Measure | `tp4-ring` (`spark-ds41f-1107`, 1M, 16 seqs, 16K batch) | `tp3-triangle` (`spark-ds41f-1107`, 1M, 8 seqs, 8K/6K batch) |
 | --- | ---: | ---: |
@@ -125,7 +126,7 @@ Report one and eight streams for every decode change, and sixteen on TP4.
   on generated text varies between samples: accepted drafts per step,
   prefix-cache hits, output length. Fixed-row step time is stable to about
   ±0.5 ms with three samples; acceptance is not. For changes that move
-  acceptance, use paired multi-prompt suites (`servebench`) across two boots.
+  acceptance, use paired multi-prompt suites (Sonar's) across two boots.
 - **When a decision hinges on 2.5% or less**, watch boot-to-boot variance across
   repeat boots before attributing a small delta to a kernel or policy change.
 - **Python-only vLLM changes need no image build to screen.** Bind-mount the
@@ -237,7 +238,7 @@ Open levers:
   high-acceptance code at one stream (`+14–18%`), whereas live agent traffic and
   8–16 stream prose accept fewer tokens per step. Screen load-aware
   (`num_speculative_tokens_per_batch_size`) or per-request acceptance-aware
-  draft depth schedules on recorded agent traffic and the paired servebench
+  draft depth schedules on recorded agent traffic and the paired Sonar
   suites.
 - **Drafter reuse of the target's token selection.** Check whether reusing the
   target model's indexer top-k selection from the anchor position in DSpark

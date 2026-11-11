@@ -137,7 +137,7 @@ A promotion commit must:
 5. prove all configured ranks use the same content-addressed image;
 6. pass `bin/spark doctor --live` after coordinated deployment;
 7. record the promoted build's release run as the reference later runs compare with:
-   the candidate arm's servebench suite run, as `manifests/suites/<baseline>-<shape>/`
+   the candidate arm's suite run, as `manifests/suites/<baseline>-<shape>/`
    (every step's output except the model step's generated text, plus the release
    table), named by that shape's `benchmark_reference`. `bin/spark bench --suite`
    compares with it. Releases before r6l recorded a `bin/spark bench` report as

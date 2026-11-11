@@ -43,8 +43,10 @@ sys.path.insert(0, str(ROOT / "scripts"))
 
 import kv_capacity  # noqa: E402
 import recipe  # noqa: E402
-from servebench import prompts as sb_prompts  # noqa: E402
-from servebench import stats as sb_stats  # noqa: E402
+from spark_ds41f import sonar  # noqa: E402
+
+sb_prompts = sonar.module("prompts")
+sb_stats = sonar.module("stats")
 
 SITE_TEMPLATE = ROOT / "site/index.html"
 SITE_DATA_MARKER = "__MANIFEST_DATA__"
@@ -89,7 +91,7 @@ def _count_series_patches(series_rel_path: str | None) -> int | None:
     )
 
 
-# servebench's default prompt set crosses sixteen task styles with topics. Two styles ask for
+# Sonar's default prompt set crosses sixteen task styles with topics. Two styles ask for
 # code and one for a JSON object, which is neither prose nor code; the other thirteen ask for prose.
 _CODE_STYLES = ("Python function", "SQL schema")
 _STRUCTURED_STYLES = ("JSON object",)
@@ -842,7 +844,7 @@ def render_todo_current_reference(data: dict[str, Any]) -> str:
 
     lines = [
         f"Active baseline manifest: [`manifests/baselines/{data['promoted_baseline']}.json`](manifests/baselines/{data['promoted_baseline']}.json) (`{data['promoted_short']}`). "
-        "Releases are judged by the servebench release, single-stream and sampled suites (`docs/release-benchmark.md`, `scripts/servebench_suite_table.py`). "
+        "Releases are judged by the release, single-stream and sampled suites, measured with Sonar (`docs/release-benchmark.md`, `scripts/sonar_table.py`). "
         f"Current benchmark references are [`{tp4_ref['path']}`]({tp4_ref['path']}/) for `tp4-ring` and [`{tp3_ref['path']}`]({tp3_ref['path']}/) for `tp3-triangle`:",
         "",
         f"| Measure | `tp4-ring` (`{tp4_ref['release']}`, 1M, 16 seqs, 16K batch) | `tp3-triangle` (`{tp3_ref['release']}`, 1M, 8 seqs, 8K/6K batch) |",

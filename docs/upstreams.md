@@ -59,6 +59,13 @@ Inference Lab integration branch is the serving source.
 | `cutlass_dsl` | NVIDIA packages on PyPI | not applicable | SHA-256-locked ARM64 CuTe DSL wheel set |
 | `model` | `deepseek-ai/DeepSeek-V4.1-Flash` | not applicable | unchanged native model weights and tokenizer |
 
+The benchmark client is not an image input and so not in this lock:
+[Sonar](https://github.com/christopherowen/Sonar) (`christopherowen/Sonar`, `main`) is pinned
+in `config/sonar.json` by URL and full revision, checked out on first use under
+`.work/sonar/<revision>`, and the same for every arm a run compares. To move the pin, merge
+the change into Sonar, set the new revision there, and record in the change which outputs
+(suite digests, request payloads, result formats) it leaves unchanged.
+
 The URL and full immutable revision in `upstreams.lock.json`, not a directory
 name or Docker tag, define identity. The `tracking_ref` says which canonical
 branch to inspect for future pulls; it does not float the build.

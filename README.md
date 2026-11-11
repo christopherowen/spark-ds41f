@@ -948,9 +948,23 @@ policy boundary are documented in [docs/recovery.md](docs/recovery.md).
 
 ## Benchmarking
 
-A release is benchmarked against the previous one with servebench suites in a lab session:
+Every measurement runs through [Sonar](https://github.com/christopherowen/Sonar), the
+benchmark client this checkout pins in [config/sonar.json](config/sonar.json): steady-state
+load, the engine grid, model behaviour, prefill and stalls, suites and verdict tables, the
+determinism gate, the quick probes and the measurement matrix below. The pinned commit is
+checked out on first use under `.work/sonar/<revision>` and verified there
+([spark_ds41f/sonar.py](spark_ds41f/sonar.py)); `bin/spark sonar ARGS...` runs it directly.
+What stays here is the deployment's own: the suites sized to its shapes
+([config/suites/](config/suites/)), the A/A floors its testbeds recorded
+([scripts/sonar_table.py](scripts/sonar_table.py)), the chat template's reasoning switch, and
+the conditions every bench runs under (cooling, fan curve, memory and temperature watch, the
+deployment's identity in the run). The lab's extras are thin shims over Sonar commands
+(`scripts/sonar_*.py`, and `scripts/distinct_streams.py` and `scripts/acceptance_sweep.py` under
+their old names); each sends the requests the script it replaced sent.
+
+A release is benchmarked against the previous one with Sonar suites in a lab session:
 [docs/release-benchmark.md](docs/release-benchmark.md) has the commands. `bin/spark bench`
-measures the live service from the head node and writes one
+measures the live service from the head node with Sonar's measurement matrix and writes one
 self-contained report to `results/private/bench/<UTC time>/bench.json`
 (`--output` to change). By default it is a quick check of about six minutes:
 the quality gate and every decode point with three or four samples each.
@@ -958,8 +972,8 @@ the quality gate and every decode point with three or four samples each.
 point to its precision target, about 35 minutes; use it for experiments that
 need to resolve small differences. Before sending anything it runs the `doctor --live`
 comparison and refuses a cluster that differs from its configuration. It also
-records the configuration hash, each node's image ID and checkout, and the
-client commit.
+records the configuration hash, each node's image ID and checkout, the
+client commit and the Sonar revision.
 
 Suites of the full run, in order (`--suites` selects a subset):
 

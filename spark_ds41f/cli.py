@@ -229,7 +229,7 @@ def parser() -> argparse.ArgumentParser:
     bench.add_argument(
         "--suite",
         metavar="NAME",
-        help="run this servebench suite (servebench/suites/<NAME>.json, or a JSON file) instead of the "
+        help="run this Sonar suite (config/suites/<NAME>.json, a Sonar built-in, or a JSON file) instead of the "
         "bench below, under the same cooling, fan curve, memory and temperature watch, with the "
         "deployment's identity stored in the run; --output is the run directory (default "
         "results/private/suites/<UTC time>); exits 2 when refused, 1 when a step failed",
@@ -239,7 +239,8 @@ def parser() -> argparse.ArgumentParser:
                        help="--suite: model steps score this earlier model result's text (the first arm's)")
     bench.add_argument(
         "--suites",
-        help="comma-separated subset of: " + ", ".join(BENCH_SUITES),
+        help="comma-separated subset of Sonar's matrix suites: quality, compliance, decode, sampled, prefill, "
+        "prefix, admission",
     )
     bench.add_argument("--url", help="API base URL (default: head node management IP)")
     bench.add_argument(
@@ -286,13 +287,13 @@ def parser() -> argparse.ArgumentParser:
         type=lambda value: [case.strip() for case in value.split(",") if case.strip()],
         default=["prose", "code"],
         help=(
-            "comma-separated decode cases (default prose,code): "
-            f"{', '.join(DECODE_CASES)}; groups: {', '.join(DECODE_CASE_GROUPS)}"
+            "comma-separated decode cases (default prose,code): Sonar's matrix cases and groups "
+            "(portable, precision); `bin/spark sonar matrix --help` lists them"
         ),
     )
     bench.add_argument(
         "--converge-on",
-        choices=CONVERGENCE_METRICS,
+        choices=("tps", "step_ms", "accepted_per_verified"),
         help="the per-sample metric whose 95%% CI must reach --precision before a decode point stops "
         "sampling; default: the case's choice (step_ms for the precision group), otherwise tps",
     )
@@ -345,6 +346,16 @@ def parser() -> argparse.ArgumentParser:
     workload.add_argument("--json", metavar="PATH", help="also write the summary as JSON")
     workload.add_argument("run", nargs=argparse.REMAINDER, help="-- command to time the window around")
     workload.set_defaults(func=command_workload)
+    client = commands.add_parser(
+        "sonar",
+        help="run the pinned Sonar (the benchmark client) with these arguments",
+        description="Check out the Sonar commit upstreams.lock.json pins (once, under .work/sonar/), then run "
+        "`python3 -m sonar ARGS...` with it; --path prints the checkout instead. Deployment suites are "
+        "config/suites/*.json.",
+    )
+    client.add_argument("--path", action="store_true", help="print the pinned checkout's path and exit")
+    client.add_argument("arguments", nargs=argparse.REMAINDER, help="Sonar's own command and arguments")
+    client.set_defaults(func=command_sonar)
     candidate_commands.add_parser(commands)
     return root
 

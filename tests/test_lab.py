@@ -600,20 +600,20 @@ class PlanProblemsTest(unittest.TestCase):
             {"kind": "measure", "bench": False, "extras": extras,
              "arms": [{"config": "experiments/2026-10-14-servebench/engine-r6k.json", "label": "a"}]}]}
 
-    def test_good_servebench_arguments_pass(self) -> None:
-        spec = self.measure([["scripts/servebench_run.py", ["--mode", "closed", "--concurrency", "16"], "c16"],
-                             ["scripts/servebench_engine.py", ["--replays", "100"], "grid"]])
+    def test_good_sonar_arguments_pass(self) -> None:
+        spec = self.measure([["scripts/sonar_run.py", ["--mode", "closed", "--concurrency", "16"], "c16"],
+                             ["scripts/sonar_engine.py", ["--replays", "100"], "grid"]])
         self.assertEqual(lab.plan_problems(lab.plan(spec)), [])
 
     def test_extras_name_each_arm(self) -> None:
-        spec = self.measure([["scripts/servebench_engine.py", ["--label", "{label}", "--output", "out/{run}-{label}.json"], "g"]])
+        spec = self.measure([["scripts/sonar_engine.py", ["--label", "{label}", "--output", "out/{run}-{label}.json"], "g"]])
         spec["jobs"][0]["arms"].append({"config": "experiments/2026-10-14-servebench/engine-r6h.json", "label": "b"})
         with mock.patch.object(lab, "head_url", return_value="http://h:8000"):
             outputs = [s["argv"][-1] for s in lab.plan(spec) if s["kind"] == "script"]
         self.assertEqual(outputs, ["out/r-a.json", "out/r-b.json"])
 
     def test_telemetry_switch(self) -> None:
-        spec = self.measure([["scripts/servebench_run.py", ["--mode", "closed"], "c"]])
+        spec = self.measure([["scripts/sonar_run.py", ["--mode", "closed"], "c"]])
         with mock.patch.object(lab, "head_url", return_value="http://h:8000"):
             on = [s for s in lab.plan(spec) if s["kind"] == "script"]
             spec["jobs"][0]["telemetry"] = False
@@ -636,7 +636,7 @@ class PlanProblemsTest(unittest.TestCase):
                           "--label", "cand"])
         self.assertEqual(benches[1]["argv"][-2:], ["--corpus", "results/private/suites/s/cand/model.json.gz"])
         self.assertEqual(benches[0]["telemetry_out"], "results/private/determinism/s/suite-cand")
-        self.assertEqual(steps[-1]["argv"], ["scripts/servebench_suite_table.py", "s", "cand", "base"])
+        self.assertEqual(steps[-1]["argv"], ["scripts/sonar_table.py", "s", "cand", "base"])
         self.assertTrue(all("fail_on_suite_error" not in step for step in benches))
         spec["jobs"][0]["fail_on_suite_error"] = True
         required = [step for step in lab.plan(spec) if step["kind"] == "cli"]
@@ -723,17 +723,21 @@ class PlanProblemsTest(unittest.TestCase):
         self.assertIn("cannot resolve", why)
 
     def test_bad_arguments_missing_files_and_configs(self) -> None:
-        spec = self.measure([["scripts/servebench_run.py", ["--mode", "sideways"], "c16"],
+        spec = self.measure([["scripts/sonar_run.py", ["--mode", "sideways"], "c16"],
                              ["no_such_script.py", [], "x"]])
         spec["jobs"][0]["arms"].append({"config": "missing.json", "label": "b"})
         problems = lab.plan_problems(lab.plan(spec))
-        self.assertTrue(any("servebench_run.py" in p and "invalid choice" in p for p in problems), problems)
+        self.assertTrue(any("sonar_run.py" in p and "invalid choice" in p for p in problems), problems)
+        self.assertTrue(any("no_such_script.py does not exist" in p for p in problems), problems)
+        retired = self.measure([["scripts/servebench_run.py", ["--mode", "closed"], "c16"]])
+        self.assertIn("script scripts/servebench_run.py does not exist; Sonar's scripts/sonar_run.py replaced it",
+                      lab.plan_problems(lab.plan(retired)))
         self.assertTrue(any("no_such_script.py does not exist" in p for p in problems), problems)
         self.assertTrue(any("missing.json does not exist" in p for p in problems), problems)
 
     def test_queue_rejects_without_a_sync_and_warns_with_one(self) -> None:
         with tempfile.TemporaryDirectory() as directory, mock.patch.object(lab, "QUEUE", Path(directory) / "q"):
-            bad = self.measure([["scripts/servebench_run.py", ["--mode", "sideways"], "c16"]])
+            bad = self.measure([["scripts/sonar_run.py", ["--mode", "sideways"], "c16"]])
             path = Path(directory) / "bad.json"
             path.write_text(json.dumps(bad))
             with self.assertRaises(SystemExit), contextlib.redirect_stderr(io.StringIO()):

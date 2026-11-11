@@ -109,8 +109,10 @@ window if none of ours is open.
 
 Specs are checked before anything boots:
 - every arm configuration and script must exist;
-- the arguments of servebench extras (`scripts/servebench_run.py`, `_engine.py`,
-  `_model.py`) must parse with servebench's own parser.
+- the arguments of Sonar extras (`scripts/sonar_run.py`, `_engine.py`, `_model.py`,
+  `_suite.py`, `_determinism.py`, `_single.py`, `_ttft.py`, `_mixed.py`, and
+  `scripts/distinct_streams.py` and `scripts/acceptance_sweep.py`) must parse with Sonar's
+  own parser, which the check fetches first (the pinned commit in `config/sonar.json`).
 
 `queue add` refuses a spec that fails. One whose jobs start with a `sync` is only warned
 about, because its files may arrive with the sync; the run checks again after the sync,
@@ -186,8 +188,9 @@ before the first boot. `run --dry-run` prints the problems.
 - **`kernel`:** runs kernel-lab bundles on the named nodes concurrently, with the cluster
   stopped. It writes `results/private/lab/<run>/verdicts.json` and checks that the
   nodes agree.
-- **`measure` with `"suite": "<name>"`** (servebench's `screen`, `release`, `screen-tp3`
-  or `release-tp3`, or a suite file) replaces `extras`, `bench` and the profile. Each arm
+- **`measure` with `"suite": "<name>"`** (a deployment suite in `config/suites/`: `screen`,
+  `release`, `screen-tp3`, `release-tp3`, `single-stream`, `sampled`; or a Sonar built-in or a
+  suite file) replaces `extras`, `bench` and the profile. Each arm
   boots and runs `bin/spark bench --suite <name> --compare none` into
   `results/private/suites/<run>/<label>`. That brings every bench's conditions: the nodes
   cooled, the fan performance curve running, the memory floor and temperature ceilings
@@ -197,7 +200,7 @@ before the first boot. `run --dry-run` prints the problems.
   its arm, no fan curve) ends the job. A suite with an engine grid step needs an arm with
   `VLLM_SERVER_DEV_MODE=1`, which the pre-boot check enforces. Arms after
   the first score the first arm's text in model steps. The table
-  (`scripts/servebench_suite_table.py`) compares the second arm, the reference, with
+  (`scripts/sonar_table.py`, over Sonar's `table`) compares the second arm, the reference, with
   every other arm, and the first arm with the last as the run's own repeat. Order arms
   candidate, reference, candidate again; with `"reference"` (a recorded suite run, or
   `"release"`, see Recorded references) the arms are the candidate's two boots and the
@@ -216,7 +219,7 @@ before the first boot. `run --dry-run` prints the problems.
 - **Companion suites:** `"suite": ["release-tp3", "single-stream"]` runs the release suite,
   then each further suite on the same boot of each arm, into
   `results/private/suites/<run>-<suite>/<label>` with its own table
-  (`results/private/lab/<run>-<suite>-table.txt`). A changed suite is a new suite (servebench
+  (`results/private/lab/<run>-<suite>-table.txt`). A changed suite is a new suite (Sonar
   compares only runs of the same definition), so measurements added to every release go in a
   companion suite and the release suite and its recorded references stay unchanged. Every
   release runs `single-stream` (one conversation at a time, concurrency 1 on distinct prompts):
@@ -420,7 +423,7 @@ the whole release benchmark (release tests, determinism gate, this comparison) a
   previous release: a suite job's `"reference": "release"` reads the recorded runs of the
   release the first arm is built on (the `benchmark_reference` of the recipe shape its
   `extends` chain ends at, companions at `<reference>-<suite>`), and
-  `scripts/servebench_suite_table.py` takes a recorded run's path in place of a label. A
+  `scripts/sonar_table.py` takes a recorded run's path in place of a label. A
   promotion keeps the release's suite runs whole, request tables included (only the model
   step's text may be left out), so the next candidate's paired verdict can read them.
 - **The `release` profile (`scripts/lab.py`):**

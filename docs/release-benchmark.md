@@ -377,8 +377,8 @@ Boot the candidate at the recipe shape and compare its outputs with the previous
  "jobs": [{"kind": "sync"},
           {"kind": "measure", "bench": false, "bracket": false,
            "extras": [
-             ["experiments/2026-10-12-r6g/token_determinism_text.py", ["--tokens", "192", "--long-lines", "700", "--wide"], "determinism"],
-             ["experiments/2026-10-12-r6g/token_determinism_text.py", ["--tokens", "192", "--long-lines", "700", "--wide", "--no-logprobs"], "greedy"],
+             ["scripts/sonar_determinism.py", ["--tokens", "192", "--long-lines", "700", "--wide"], "determinism"],
+             ["scripts/sonar_determinism.py", ["--tokens", "192", "--long-lines", "700", "--wide", "--no-logprobs"], "greedy"],
              ["scripts/distinct_streams.py", ["--streams", "16", "--samples", "4", "--tokens", "256"], "c16-distinct"],
              ["scripts/distinct_streams.py", ["--streams", "8", "--samples", "4", "--tokens", "256"], "c8-distinct"],
              ["scripts/distinct_streams.py", ["--streams", "4", "--samples", "4", "--tokens", "256"], "c4-distinct"]],
@@ -392,11 +392,11 @@ python3 scripts/lab.py queue add <experiment>/gate-tp4-1017.json
 Without the lab, the same scripts run against the live service (`http://<head>:8000`):
 
 ```bash
-python3 experiments/2026-10-12-r6g/token_determinism_text.py http://<head>:8000 --tokens 192 --long-lines 700 --wide
+python3 scripts/sonar_determinism.py http://<head>:8000 --tokens 192 --long-lines 700 --wide
 ```
 
 ```bash
-python3 experiments/2026-10-12-r6g/token_determinism_text.py http://<head>:8000 --tokens 192 --long-lines 700 --wide --no-logprobs
+python3 scripts/sonar_determinism.py http://<head>:8000 --tokens 192 --long-lines 700 --wide --no-logprobs
 ```
 
 ```bash
@@ -418,6 +418,10 @@ previous release's at the same shape.
 
 The distinct-stream throughputs are a first look only; step 3 decides speed.
 
+`scripts/sonar_determinism.py` is Sonar's `determinism` with the chat template's reasoning
+switch: it sends the requests `experiments/2026-10-12-r6g/token_determinism_text.py` sent, so
+its hashes compare with the recorded ones. Gate specs written before it still run that script.
+
 ## 3. Release comparison
 
 The candidate boots twice, back to back, and is compared with the previous release's
@@ -428,7 +432,7 @@ measured again. The record is the shape's `benchmark_reference` in the recipe
 beyond its interval plus that spread. The previous release is measured again, as the middle
 of three arms, only when its record cannot serve: a suite changed since it was recorded (a
 changed suite is a new suite, and the lab refuses the record), or the record predates
-servebench's request tables (1025 and earlier), which leaves only the window verdict and not
+request tables (1025 and earlier), which leaves only the window verdict and not
 the paired decode verdict.
 
 ### Suites
@@ -443,7 +447,10 @@ the paired decode verdict.
 Every release runs its shape's release suite with `single-stream` as a companion on the
 same boot; r6x also ran `sampled` (added 2026-10-18), which the example below includes. The release and single-stream suites decode greedily; only
 `sampled` measures draft acceptance under sampling. Suite definitions are data in
-[servebench/suites/](../servebench/suites/); a changed suite is a new suite.
+[config/suites/](../config/suites/); a changed suite is a new suite. Sonar runs them
+([config/sonar.json](../config/sonar.json) pins it; `bin/spark sonar suites` lists its own
+built-in suites, which this deployment does not use for releases). The files moved here from
+`servebench/suites/` unchanged, so their digests are the recorded references' own.
 
 ### With the lab (the usual way)
 
@@ -471,7 +478,7 @@ suite: `results/private/lab/<run>-table.txt`, `<run>-single-stream-table.txt` an
 `<run>-sampled-table.txt`. To print a table again:
 
 ```bash
-python3 scripts/servebench_suite_table.py <run> <candidate> manifests/suites/<release>-<shape> <candidate>-again
+python3 scripts/sonar_table.py <run> <candidate> manifests/suites/<release>-<shape> <candidate>-again
 ```
 
 A label with a `/` is a recorded suite run (repository-relative); with a measured previous
@@ -502,7 +509,7 @@ bin/spark --cluster-config <arm>-dev.json bench --suite sampled --compare none -
 
 For the second and third arms, add `--corpus results/private/suites/<run>/<candidate>/model.json.gz`
 to the release suite, so their model behaviour is scored on the first arm's text. Then
-print each table with `scripts/servebench_suite_table.py` as above (`<run>`,
+print each table with `scripts/sonar_table.py` as above (`<run>`,
 `<run>-single-stream`, `<run>-sampled`). `bin/spark bench` cools every node first, runs the
 fan performance curve, watches memory and temperature (a breach stops the run) and records
 the deployment's identity in the run; it refuses a cluster that differs from its arm.
@@ -537,7 +544,8 @@ boot term the same way to their interval, the largest of the four pairings'. The
 says which boots were averaged, and each row says "both boots of each" with the reference's
 repeat. Without a repeat the reference is one boot and rows are judged as before.
 
-**Floors.** `scripts/servebench_suite_table.py` holds them with their provenance:
+**Floors.** `scripts/sonar_table.py` holds them with their provenance (Sonar's `table` judges
+with whatever floors it is given):
 `AA_FLOOR_PCT` (closed loops, from the pairs of 2026-10-15..25: 0.35% at c1, 0.27% c4, 0.39% c8,
 0.43% c16), `GRID_FLOOR_PCT` (0.43% for an engine grid's geometric mean, from 31 same-build
 pairs of candidates 50-58) and `FLOORS` by testbed and suite, from the same-build pairs of
