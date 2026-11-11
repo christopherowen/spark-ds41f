@@ -92,7 +92,23 @@ its gate repeat. `0799` passes when every run of every boot gives candidate-54's
   ([c1-drafter-arms-tp4-switched.json](../candidate-58/c1-drafter-arms-tp4-switched.json), 3 boots each), the boots'
   accept decisions split, except where the shared expert left the aux stream, the drafter's query forward ran without
   its graph, or row taps were on. The drafter's layers are `DeepseekV4DecoderLayer`s, so its MoE runs the same combine.
-  [c1_decisions.py](../candidate-58/boot-differences/c1_decisions.py) compares the boots request by request.
+  [c1_decisions.py](../candidate-58/boot-differences/c1_decisions.py) compares the boots request by request;
+- at `tp3-switched`, [gate-caps-tp3-switched.json](gate-caps-tp3-switched.json): the gate on 2 boots with TP3's
+  prefetch caps (below), since the `0799` gate there ran without them.
+
+**TP3's L2 prefetch caps (added 2026-11-11, owner).** The TP3 profiles ([tp3.json](tp3.json),
+[tp3-triangle-4k.json](tp3-triangle-4k.json), [tp3-switched.json](tp3-switched.json), and their `-dev` files through
+them) set `VLLM_DS41_L2_PREFETCH_WO_MB=15`, `VLLM_DS41_L2_PREFETCH_FFN_MB=12` and
+`VLLM_DS41_L2_PREFETCH_NEXT_MB=12`. The code defaults are 20/16/20 MB, and 1107's recipe sets none of them. TP4's
+profiles are unchanged, so #961's TP4 gain stays.
+- **Why:** #961's paced prefetch made TP3's 1-request grid shapes 5.5-7.2% slower than 1107. TP3's windows sit at
+  their caps, about 857 chunks of 64 KiB a layer, and the fixed pause between chunks adds up
+  ([receipts/tp3-grid-attribution](receipts/tp3-grid-attribution/README.md)).
+- **Measured** at `tp3-switched` on the earlier candidate-54 image, the grid step alone, in one session:
+  15/12/12 MB gives 1x2 rows at 4K 18.49 ms against 18.70 ms without #961, and a grid geometric mean within about 0.5%
+  of candidate-54 without #961. The remaining gap is mostly at 4 requests.
+- **No output change:** the windows are cache hints, and the arithmetic is unchanged.
+- A recipe variable, not a patch: the image and the lock are the same.
 
 **#1009 round 1 returns.** It fixes candidate-50's `tp4-ring` boot failure
 ([candidate-50/receipts/tp4-boot-failure](../candidate-50/receipts/tp4-boot-failure)). Its coordinator's verdict
@@ -189,7 +205,7 @@ release tests crash. Round 1's guard is that fix. No semantic conflict was found
 
 ## Cluster configurations
 
-A cluster configuration for every shape the recipe serves, so the candidate can be run on any setup: `bin/spark --cluster-config experiments/2026-10-26-spark-ds41f-candidate/candidate-54/<file> …` with your site's node map. Each one extends `releases/spark-ds41f-1107/cluster.json` at its shape and sets only the image `spark-ds41f:candidate-54`, its tree labels and this lock; no PR changes the recipe. The `-dev` file adds the dev-mode collective RPC that the screen's engine grid needs. This candidate is verified at the three testbeds marked; the other files are configurations, not part of its runs.
+A cluster configuration for every shape the recipe serves, so the candidate can be run on any setup: `bin/spark --cluster-config experiments/2026-10-26-spark-ds41f-candidate/candidate-54/<file> …` with your site's node map. Each one extends `releases/spark-ds41f-1107/cluster.json` at its shape and sets the image `spark-ds41f:candidate-54`, its tree labels and this lock; no PR changes the recipe. The TP3 shapes also cap the L2 prefetch windows at 15/12/12 MB (above). The `-dev` file adds the dev-mode collective RPC that the screen's engine grid needs. This candidate is verified at the three testbeds marked; the other files are configurations, not part of its runs.
 
 | Shape | Configuration | With dev RPC | |
 | --- | --- | --- | --- |
