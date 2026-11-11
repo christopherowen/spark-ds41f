@@ -1,0 +1,708 @@
+From 5b4f3275851e2d5bcb6d1c1de8753da789a4bf5d Mon Sep 17 00:00:00 2001
+From: Christopher Owen <3221756+christopherowen@users.noreply.github.com>
+Date: Sun, 8 Nov 2026 13:52:45 +0000
+Subject: [PATCH] perf(dsv41): fast-path multi-turn chat rendering and segment
+ tokenization
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Eliminate quadratic message scanning, redundant full-conversation deep
+copies, unfactored 1,283-branch control-spelling regex backtracking, and
+single-threaded full-prompt re-tokenization on deep (100-500+ turn)
+DeepSeek-V4.1 coding-agent conversations:
+
+- Compute `last_user_idx = find_last_user_index(full_messages)` once in
+  `encode_messages()` and forward it into `_drop_thinking_messages()` and
+  `render_message()`, avoiding O(M^2) backward scans across merged tool
+  turns; join rendered message chunks in a single pass, replace
+  per-message `copy.deepcopy()` in `_normalize_messages()` and
+  `merge_tool_messages()` with shallow message/block copies, and skip
+  single-item group/block sorting allocations in `order_tool_results()`
+  and `sort_tool_results_by_call_order()`.
+- Compile `_ControlSpellings` and `template_controls` patterns as
+  prefix-factored character tries (`_compile_trie_regex`) instead of
+  1,283-branch flat alternations, skip `json.loads()` in `_strings()`
+  when tool arguments contain no backslash escapes, check candidate
+  private-use sentinels with O(1) UCS-4 membership (`chr(code) in text`),
+  and guard `controls.restore()` with `self.open not in text`.
+- Split rendered prompts along structural added-token boundaries
+  (`<｜end▁of▁sentence｜>`, `<｜User｜>`, `<｜Assistant｜>`) when
+  `can_split_segments` holds, caching tokenized turn segments in a
+  bounded `_SEGMENT_CACHES` map (`_MAX_SEGMENT_CACHE = 8192`) and
+  encoding uncached segments in parallel via
+  `backend_tokenizer.encode_batch(..., add_special_tokens=False)` (or
+  direct `backend_tokenizer.encode` for small incremental deltas); also
+  deduplicate and cache plain-text pieces in `encode_with_text_spellings`.
+- Fast-path `content is None` and `isinstance(content, str)` in
+  `_parse_chat_message_content()` without allocating a
+  `MultiModalContentParser` or `ChatCompletionContentPartTextParam`
+  wrapper per text message while preserving reserved prompt-embeds
+  placeholder rejection.
+
+Base: 19f2c20ed4d64ae22bd009ceacadd85e2a81e354
+Quality: 100% bitwise-identical prompt strings and token ID sequences
+across all reference fixtures, multi-turn tool-call benchmarks, and
+control-spelling injection locations.
+Tests: pytest tests/tokenizers_/test_deepseek_v41.py tests/tokenizers_/test_deepseek_v41_effort.py tests/tokenizers_/test_deepseek_v4.py tests/parser/engine/test_deepseek_v4.py tests/parser/engine/test_deepseek_v41.py tests/entrypoints/openai/test_reasoning_enable_thinking.py tests/entrypoints/openai/test_tool_calls_serialization.py (413 passed across 2 boots)
+Upstream status: spark-ds41f local optimization for DeepSeek-V4.1 chat serving
+---
+ tests/tokenizers_/test_deepseek_v41.py   | 134 +++++++++++++++
+ vllm/entrypoints/chat_utils.py           |  36 +++--
+ vllm/tokenizers/deepseek_v41.py          | 197 ++++++++++++++++++++---
+ vllm/tokenizers/deepseek_v41_encoding.py |  69 +++++---
+ 4 files changed, 382 insertions(+), 54 deletions(-)
+
+diff --git a/tests/tokenizers_/test_deepseek_v41.py b/tests/tokenizers_/test_deepseek_v41.py
+index 8cb8ef757..bf63aadd5 100644
+--- a/tests/tokenizers_/test_deepseek_v41.py
++++ b/tests/tokenizers_/test_deepseek_v41.py
+@@ -1062,3 +1062,137 @@ def test_final_assistant_prefix_continues_that_message():
+                 {"role": "user", "content": "q2"},
+             ]
+         )
++
++
++def test_trie_regex_matches_longest_first_and_overlapping_prefixes():
++    import re
++    from vllm.tokenizers.deepseek_v41 import _compile_trie_regex
++
++    words = ["<foo", "<foobar", "<foobaz", "<f", "｜DSML｜", "<think>", "</think>"]
++    ref_re = re.compile(
++        "|".join(re.escape(s) for s in sorted(words, key=len, reverse=True))
++    )
++    trie_re = _compile_trie_regex(words)
++    assert trie_re is not None
++    for sample in [
++        "a<foobaz!<foobar?<foo.<f><fo_x<int>",
++        "x｜DSML｜<think>code with i < n</think>",
++    ]:
++        ref_matches = [(m.start(), m.end(), m.group(0)) for m in ref_re.finditer(sample)]
++        trie_matches = [
++            (m.start(), m.end(), m.group(0)) for m in trie_re.finditer(sample)
++        ]
++        assert trie_matches == ref_matches
++
++
++def test_segment_split_and_cache_preserve_exact_token_ids_and_immutability():
++    from vllm.tokenizers.deepseek_v41 import _split_prompt_segments
++
++    tokenizer = byte_level_tokenizer()
++    if hasattr(tokenizer, "_segment_cache"):
++        tokenizer._segment_cache.clear()
++    if hasattr(tokenizer, "_plain_cache"):
++        tokenizer._plain_cache.clear()
++
++    messages_t1 = [
++        {"role": "system", "content": "Follow tool schemas."},
++        {"role": "user", "content": "Look up item A1 and B2."},
++        {
++            "role": "assistant",
++            "content": "",
++            "reasoning_content": "First check A1.",
++            "tool_calls": [
++                {
++                    "id": "call_1",
++                    "type": "function",
++                    "function": {"name": "lookup", "arguments": '{"q": "A1"}'},
++                }
++            ],
++        },
++        {"role": "tool", "tool_call_id": "call_1", "content": "A1 is available."},
++    ]
++    tools = [copy.deepcopy(LOOKUP)]
++    orig_t1 = copy.deepcopy(messages_t1)
++    orig_tools = copy.deepcopy(tools)
++
++    prompt_t1 = tokenizer.apply_chat_template(
++        messages_t1, tools=tools, tokenize=False, add_generation_prompt=True
++    )
++    segments = _split_prompt_segments(prompt_t1)
++    assert "".join(segments) == prompt_t1
++    assert len(segments) >= 4
++
++    ids_cold = tokenizer.apply_chat_template(
++        messages_t1, tools=tools, tokenize=True, add_generation_prompt=True
++    )
++    assert ids_cold == tokenizer.encode(prompt_t1, add_special_tokens=False)
++    assert messages_t1 == orig_t1
++    assert tools == orig_tools
++
++    # Ensure prior direct encode(truncation=True, max_length=...) does not leak
++    # truncation state into subsequent segment-cached apply_chat_template calls.
++    _ = tokenizer.encode("short text for truncation check", truncation=True, max_length=4)
++
++    messages_t2 = messages_t1 + [
++        {
++            "role": "assistant",
++            "content": "",
++            "reasoning_content": "Now check B2.",
++            "tool_calls": [
++                {
++                    "id": "call_2",
++                    "type": "function",
++                    "function": {"name": "lookup", "arguments": '{"q": "B2"}'},
++                }
++            ],
++        },
++        {"role": "tool", "tool_call_id": "call_2", "content": "B2 is backordered."},
++    ]
++    prompt_t2 = tokenizer.apply_chat_template(
++        messages_t2, tools=tools, tokenize=False, add_generation_prompt=True
++    )
++    ids_warm = tokenizer.apply_chat_template(
++        messages_t2, tools=tools, tokenize=True, add_generation_prompt=True
++    )
++    assert ids_warm == tokenizer.encode(prompt_t2, add_special_tokens=False)
++
++
++def test_parse_chat_message_content_fastpath_string_and_none():
++    from types import SimpleNamespace
++    from vllm.entrypoints.chat_utils import (
++        PROMPT_EMBEDS_PLACEHOLDER_TOKEN,
++        parse_chat_messages,
++    )
++    from vllm.exceptions import VLLMValidationError
++
++    cfg = SimpleNamespace(
++        multimodal_config=None,
++        is_multimodal_model=False,
++        allowed_local_media_path="",
++        allowed_media_domains=None,
++        enable_prompt_embeds=False,
++        encoder_config=None,
++    )
++    msgs = [
++        {"role": "system", "content": "sys"},
++        {"role": "user", "content": ""},
++        {"role": "assistant", "content": None, "reasoning": "think"},
++    ]
++    conv_str, _, _ = parse_chat_messages(msgs, cfg, content_format="string")
++    assert conv_str[0]["content"] == "sys"
++    assert conv_str[1]["content"] == ""
++    assert conv_str[2]["content"] == ""
++    assert conv_str[2]["reasoning_content"] == "think"
++
++    conv_oai, _, _ = parse_chat_messages(msgs, cfg, content_format="openai")
++    assert conv_oai[0]["content"] == [{"type": "text", "text": "sys"}]
++    assert conv_oai[1]["content"] == [{"type": "text", "text": ""}]
++    assert conv_oai[2]["content"] == []
++
++    cfg_embeds = SimpleNamespace(**{**cfg.__dict__, "enable_prompt_embeds": True})
++    with pytest.raises(VLLMValidationError):
++        parse_chat_messages(
++            [{"role": "user", "content": f"bad {PROMPT_EMBEDS_PLACEHOLDER_TOKEN}"}],
++            cfg_embeds,
++            content_format="string",
++        )
+diff --git a/vllm/entrypoints/chat_utils.py b/vllm/entrypoints/chat_utils.py
+index addcc5f76..873baf853 100644
+--- a/vllm/entrypoints/chat_utils.py
++++ b/vllm/entrypoints/chat_utils.py
+@@ -2013,17 +2013,33 @@ def _parse_chat_message_content(
+     reasoning = message.get("reasoning")
+ 
+     if content is None:
+-        content = []
++        result = [
++            ConversationMessage(
++                role=role,
++                content=[] if content_format == "openai" else "",  # type: ignore[arg-type]
++            )
++        ]
+     elif isinstance(content, str):
+-        content = [ChatCompletionContentPartTextParam(type="text", text=content)]
+-    result = _parse_chat_message_content_parts(
+-        role,
+-        content,  # type: ignore
+-        mm_tracker,
+-        wrap_dicts=(content_format == "openai"),
+-        interleave_strings=interleave_strings,
+-        mm_processor_kwargs=mm_processor_kwargs,
+-    )
++        _reject_reserved_placeholder_in_text(content, mm_tracker._model_config)
++        result = [
++            ConversationMessage(
++                role=role,
++                content=(
++                    [{"type": "text", "text": content}]
++                    if content_format == "openai"
++                    else content
++                ),  # type: ignore[arg-type]
++            )
++        ]
++    else:
++        result = _parse_chat_message_content_parts(
++            role,
++            content,  # type: ignore
++            mm_tracker,
++            wrap_dicts=(content_format == "openai"),
++            interleave_strings=interleave_strings,
++            mm_processor_kwargs=mm_processor_kwargs,
++        )
+ 
+     for result_msg in result:
+         if role == "assistant":
+diff --git a/vllm/tokenizers/deepseek_v41.py b/vllm/tokenizers/deepseek_v41.py
+index ff12f7215..36aadd045 100644
+--- a/vllm/tokenizers/deepseek_v41.py
++++ b/vllm/tokenizers/deepseek_v41.py
+@@ -15,6 +15,7 @@ from .deepseek_v41_encoding import (
+     ASSISTANT_SP_TOKEN,
+     IMAGE_PLACEHOLDER,
+     REASONING_EFFORT_MAPPINGS,
++    USER_SP_TOKEN,
+     encode_messages,
+     eos_token,
+     insert_system_prompt_fields,
+@@ -27,6 +28,76 @@ from .protocol import TokenizerLike
+ # Keys whose values are protocol identifiers, never rendered request text.
+ _PROTOCOL_KEYS = frozenset({"role", "type"})
+ 
++# Bounded per-tokenizer segment cache capacity (message/turn chunks -> token IDs).
++_MAX_SEGMENT_CACHE = 8192
++_SEGMENT_CACHES: dict[tuple[int, int], dict[str, tuple[int, ...]]] = {}
++_PLAIN_CACHES: dict[tuple[int, int], dict[str, tuple[int, ...]]] = {}
++
++
++def _compile_trie_regex(spellings: list[str]) -> re.Pattern[str] | None:
++    """Compile a prefix-trie regex matching longest spelling first at any position.
++
++    Factoring shared prefixes (such as the 800+ `<｜place▁holder...` and 440+
++    `<|place_holder_mm_span...` added tokens) avoids O(V) backtracking at every
++    `<` character in code or DSML markup.
++    """
++    if not spellings:
++        return None
++    root: dict[str, Any] = {}
++    for spelling in spellings:
++        node = root
++        for ch in spelling:
++            node = node.setdefault(ch, {})
++        node[""] = None
++
++    def _render(node: dict[str, Any]) -> str:
++        is_end = "" in node
++        children = [k for k in node if k != ""]
++        if not children:
++            return ""
++        if len(children) == 1 and not is_end:
++            ch = children[0]
++            return re.escape(ch) + _render(node[ch])
++        parts = [
++            re.escape(ch) + _render(node[ch])
++            for ch in sorted(children, reverse=True)
++        ]
++        body = "|".join(parts)
++        return f"(?:{body}|)" if is_end else f"(?:{body})"
++
++    return re.compile(_render(root))
++
++
++def _split_prompt_segments(prompt: str) -> list[str]:
++    """Split a rendered V4.1 prompt along structural added-token boundaries.
++
++    Every split point is immediately after `<｜end▁of▁sentence｜>` or immediately
++    before `<｜User｜>` or `<｜Assistant｜>`, so the system header/tool catalog,
++    each user/tool-result turn, and each assistant turn form cacheable segments
++    whose concatenation equals `prompt`.
++    """
++    raw_turns = prompt.split(eos_token)
++    chunks: list[str] = []
++    last_idx = len(raw_turns) - 1
++    for i, turn in enumerate(raw_turns):
++        if i < last_idx:
++            turn = turn + eos_token
++        elif not turn:
++            break
++        if i == 0 and USER_SP_TOKEN in turn:
++            sys_part, sep, rest = turn.partition(USER_SP_TOKEN)
++            if sys_part:
++                chunks.append(sys_part)
++            turn = sep + rest
++        if ASSISTANT_SP_TOKEN in turn:
++            u_part, sep, a_part = turn.partition(ASSISTANT_SP_TOKEN)
++            if u_part:
++                chunks.append(u_part)
++            chunks.append(sep + a_part)
++        else:
++            chunks.append(turn)
++    return chunks
++
+ 
+ class _ControlSpellings:
+     """Keeps control-token spellings written in request text out of the vocabulary.
+@@ -46,14 +117,14 @@ class _ControlSpellings:
+ 
+     @staticmethod
+     def compile(spellings: list[str]) -> re.Pattern[str] | None:
+-        """One alternation, longest spelling first; built once per tokenizer."""
+-        ordered = sorted(spellings, key=len, reverse=True)
+-        return re.compile("|".join(re.escape(s) for s in ordered)) if ordered else None
++        """One prefix-factored pattern, longest spelling first; built once per tokenizer."""
++        return _compile_trie_regex(spellings)
+ 
+     def __init__(self, pattern: re.Pattern[str] | None) -> None:
+         self.pattern = pattern
+         self.originals: list[str] = []
+         self.open = self.close = ""
++        self._sentinel_re: re.Pattern[str] | None = None
+ 
+     def protect(self, *values: Any) -> list[Any]:
+         """Return the values with control spellings in text replaced by sentinels.
+@@ -67,6 +138,9 @@ class _ControlSpellings:
+         ):
+             return list(values)
+         self.open, self.close = _unused_private_pair(values)
++        self._sentinel_re = re.compile(
++            f"{re.escape(self.open)}(\\d+){re.escape(self.close)}"
++        )
+         return [self._protect(value) for value in values]
+ 
+     @property
+@@ -97,10 +171,12 @@ class _ControlSpellings:
+         return f"{self.open}{len(self.originals) - 1}{self.close}"
+ 
+     def restore(self, text: str) -> str:
+-        if not self.originals:
++        if not self.originals or self.open not in text:
+             return text
+-        sentinel = re.compile(f"{re.escape(self.open)}(\\d+){re.escape(self.close)}")
+-        return sentinel.sub(lambda m: self.originals[int(m.group(1))], text)
++        assert self._sentinel_re is not None
++        return self._sentinel_re.sub(
++            lambda m: self.originals[int(m.group(1))], text
++        )
+ 
+ 
+ def _decode_arguments(arguments: str) -> Any:
+@@ -118,7 +194,7 @@ def _decode_arguments(arguments: str) -> Any:
+ def _strings(value: Any, key: str | None = None):
+     if isinstance(value, str):
+         yield value
+-        if key == "arguments":
++        if key == "arguments" and "\\" in value:
+             decoded = _decode_arguments(value)
+             if not isinstance(decoded, str):
+                 yield from _strings(decoded)
+@@ -132,10 +208,12 @@ def _strings(value: Any, key: str | None = None):
+ 
+ def _unused_private_pair(values: tuple[Any, ...]) -> tuple[str, str]:
+     """Two supplementary private-use characters that no request string contains."""
+-    used: set[str] = set()
+-    for text in _strings(values):
+-        used.update(text)
+-    free = (chr(code) for code in range(0xF0000, 0xFFFFE) if chr(code) not in used)
++    texts = list(_strings(values))
++    free = (
++        chr(code)
++        for code in range(0xF0000, 0xFFFFE)
++        if not any(chr(code) in text for text in texts)
++    )
+     return next(free), next(free)
+ 
+ 
+@@ -159,7 +237,7 @@ def _plain_text_encoder(tokenizer: Any) -> Callable[[list[str]], list[list[int]]
+ def _normalize_messages(
+     messages: list[ChatCompletionMessageParam],
+ ) -> list[dict[str, Any]]:
+-    result = [dict(message) for message in copy.deepcopy(messages)]
++    result = [dict(message) for message in messages]
+     for message in result:
+         role = message.get("role")
+         if role not in (
+@@ -284,17 +362,73 @@ def get_deepseek_v41_tokenizer(tokenizer: HfTokenizer) -> HfTokenizer:
+     added_vocab = tokenizer.get_added_vocab()
+     # Every added-token spelling splits the rendered prompt; all but the image
+     # placeholder are kept out of the vocabulary when they occur in request text.
+-    template_controls = (
+-        re.compile(
+-            "|".join(re.escape(s) for s in sorted(added_vocab, key=len, reverse=True))
+-        )
+-        if added_vocab
+-        else None
+-    )
++    template_controls = _compile_trie_regex(list(added_vocab))
+     text_spellings = _ControlSpellings.compile(
+         [s for s in added_vocab if s != IMAGE_PLACEHOLDER]
+     )
+     plain_encoder: list[Callable[[list[str]], list[list[int]]]] = []
++    backend_tokenizer = getattr(tokenizer, "backend_tokenizer", None)
++    can_split_segments = (
++        isinstance(tokenizer, TokenizersBackend)
++        and backend_tokenizer is not None
++        and eos_token in added_vocab
++        and USER_SP_TOKEN in added_vocab
++        and ASSISTANT_SP_TOKEN in added_vocab
++        and not any("<" in s[1:] for s in added_vocab)
++        and not any(
++            s != d and s.startswith(d)
++            for s in added_vocab
++            for d in (eos_token, USER_SP_TOKEN, ASSISTANT_SP_TOKEN)
++        )
++    )
++    cache_key = (int(getattr(tokenizer, "vocab_size", 0)), len(added_vocab))
++    segment_cache = _SEGMENT_CACHES.setdefault(cache_key, {})
++    plain_cache = _PLAIN_CACHES.setdefault(cache_key, {})
++
++    def encode_prompt_segments(tok_self: Any, prompt: str) -> list[int]:
++        assert backend_tokenizer is not None
++        if getattr(tok_self, "split_special_tokens", False):
++            return tok_self.encode(prompt, add_special_tokens=False)
++        if backend_tokenizer.truncation is not None:
++            backend_tokenizer.no_truncation()
++        if backend_tokenizer.padding is not None:
++            backend_tokenizer.no_padding()
++        if backend_tokenizer.encode_special_tokens:
++            backend_tokenizer.encode_special_tokens = False
++
++        chunks = _split_prompt_segments(prompt)
++        if not chunks:
++            return []
++
++        missing = [c for c in dict.fromkeys(chunks) if c not in segment_cache]
++        if missing:
++            total_missing_chars = sum(len(c) for c in missing)
++            if len(missing) == 1 or (
++                len(missing) <= 8 and total_missing_chars < 4096
++            ):
++                for chunk in missing:
++                    enc = backend_tokenizer.encode(
++                        chunk, add_special_tokens=False
++                    )
++                    segment_cache[chunk] = tuple(enc.ids)
++            else:
++                for chunk, enc in zip(
++                    missing,
++                    backend_tokenizer.encode_batch(
++                        missing, add_special_tokens=False
++                    ),
++                ):
++                    segment_cache[chunk] = tuple(enc.ids)
++            while len(segment_cache) > _MAX_SEGMENT_CACHE:
++                try:
++                    segment_cache.pop(next(iter(segment_cache)))
++                except (StopIteration, KeyError):
++                    break
++
++        ids: list[int] = []
++        for chunk in chunks:
++            ids.extend(segment_cache[chunk])
++        return ids
+ 
+     def encode_with_text_spellings(
+         prompt: str, controls: _ControlSpellings
+@@ -312,12 +446,27 @@ def get_deepseek_v41_tokenizer(tokenizer: HfTokenizer) -> HfTokenizer:
+             position = match.end()
+         if position < len(prompt):
+             pieces.append(controls.restore(prompt[position:]))
+-        texts = [piece for piece in pieces if isinstance(piece, str)]
+-        encoded = iter(plain_encoder[0](texts))
++        missing = [
++            piece
++            for piece in dict.fromkeys(
++                p for p in pieces if isinstance(p, str)
++            )
++            if piece not in plain_cache
++        ]
++        if missing:
++            for text_piece, token_ids in zip(
++                missing, plain_encoder[0](missing)
++            ):
++                plain_cache[text_piece] = tuple(token_ids)
++            while len(plain_cache) > _MAX_SEGMENT_CACHE:
++                try:
++                    plain_cache.pop(next(iter(plain_cache)))
++                except (StopIteration, KeyError):
++                    break
+         ids: list[int] = []
+         for piece in pieces:
+             if isinstance(piece, str):
+-                ids.extend(next(encoded))
++                ids.extend(plain_cache[piece])
+             else:
+                 ids.append(piece)
+         return ids
+@@ -410,6 +559,8 @@ def get_deepseek_v41_tokenizer(tokenizer: HfTokenizer) -> HfTokenizer:
+                     if key in kwargs
+                 }
+                 if not controls.active:
++                    if can_split_segments and not tokenizer_kwargs:
++                        return encode_prompt_segments(self, prompt)
+                     return self.encode(
+                         prompt, add_special_tokens=False, **tokenizer_kwargs
+                     )
+@@ -434,6 +585,8 @@ def get_deepseek_v41_tokenizer(tokenizer: HfTokenizer) -> HfTokenizer:
+         def __reduce__(self):
+             return get_deepseek_v41_tokenizer, (tokenizer,)
+ 
++    wrapped._segment_cache = segment_cache
++    wrapped._plain_cache = plain_cache
+     _DeepseekV41Tokenizer.__name__ = f"DSV41{tokenizer.__class__.__name__}"
+     wrapped.__class__ = _DeepseekV41Tokenizer
+     return wrapped
+diff --git a/vllm/tokenizers/deepseek_v41_encoding.py b/vllm/tokenizers/deepseek_v41_encoding.py
+index b5ce25826..1f39bf47a 100644
+--- a/vllm/tokenizers/deepseek_v41_encoding.py
++++ b/vllm/tokenizers/deepseek_v41_encoding.py
+@@ -237,7 +237,6 @@ def merge_tool_messages(messages: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+     merged: List[Dict[str, Any]] = []
+ 
+     for msg in messages:
+-        msg = copy.deepcopy(msg)
+         role = msg.get("role")
+ 
+         if role == "tool":
+@@ -265,6 +264,8 @@ def merge_tool_messages(messages: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+             content_blocks = msg.get("content_blocks")
+             if content_blocks is None:
+                 content_blocks = [{"type": "text", "text": msg.get("content", "")}]
++            else:
++                content_blocks = list(content_blocks)
+             if (
+                 merged
+                 and merged[-1].get("role") == "user"
+@@ -274,7 +275,7 @@ def merge_tool_messages(messages: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+                 merged[-1]["content_blocks"].extend(content_blocks)
+             else:
+                 # Preserve structured content and all message-level metadata.
+-                new_msg = msg
++                new_msg = dict(msg)
+                 new_msg["content_blocks"] = content_blocks
+                 merged.append(new_msg)
+         else:
+@@ -302,10 +303,14 @@ def sort_tool_results_by_call_order(
+                     last_tool_call_order[tc_id] = idx
+ 
+         elif role == "user" and msg.get("content_blocks"):
+-            tool_blocks = [
+-                b for b in msg["content_blocks"] if b.get("type") == "tool_result"
+-            ]
+-            if len(tool_blocks) > 1 and last_tool_call_order:
++            content_blocks = msg["content_blocks"]
++            if len(content_blocks) > 1 and last_tool_call_order:
++                tool_blocks = [
++                    b for b in content_blocks if b.get("type") == "tool_result"
++                ]
++            else:
++                tool_blocks = []
++            if len(tool_blocks) > 1:
+                 sorted_blocks = sorted(
+                     tool_blocks,
+                     key=lambda b: last_tool_call_order.get(b.get("tool_use_id", ""), 0),
+@@ -348,11 +353,11 @@ def order_tool_results(messages: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+         elif role == "user" and group and group_task is None:
+             group.append(idx)
+         elif role == "user":
+-            if group:
++            if len(group) > 1 and call_order:
+                 groups.append((group, dict(call_order)))
+             group, group_task = [idx], msg.get("task")
+         else:
+-            if group:
++            if len(group) > 1 and call_order:
+                 groups.append((group, dict(call_order)))
+             group, group_task = [], None
+             if role == "assistant" and msg.get("tool_calls"):
+@@ -361,7 +366,7 @@ def order_tool_results(messages: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+                     call_id = call.get("id") or call.get("function", {}).get("id", "")
+                     if call_id:
+                         call_order[call_id] = position
+-    if group:
++    if len(group) > 1 and call_order:
+         groups.append((group, dict(call_order)))
+     for indices, calls in groups:
+         tool_positions = [i for i in indices if order[i].get("role") == "tool"]
+@@ -535,6 +540,7 @@ def render_message(
+     thinking_mode: str,
+     drop_thinking: bool = True,
+     reasoning_effort: Union[str, int, None] = None,
++    last_user_idx: Optional[int] = None,
+ ) -> str:
+     """
+     Render a single message at the given index into its V4.1 encoded string form.
+@@ -545,7 +551,8 @@ def render_message(
+     )
+ 
+     msg = messages[index]
+-    last_user_idx = find_last_user_index(messages)
++    if last_user_idx is None:
++        last_user_idx = find_last_user_index(messages)
+ 
+     role = msg.get("role")
+     content = msg.get("content")
+@@ -714,12 +721,16 @@ def render_message(
+     return prompt
+ 
+ 
+-def _drop_thinking_messages(messages: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
++def _drop_thinking_messages(
++    messages: List[Dict[str, Any]],
++    last_user_idx: Optional[int] = None,
++) -> List[Dict[str, Any]]:
+     """
+     Drop reasoning_content and non-essential messages before the last user message.
+     Same as V4, but uses the V4.1 last-user definition (mid systems count).
+     """
+-    last_user_idx = find_last_user_index(messages)
++    if last_user_idx is None:
++        last_user_idx = find_last_user_index(messages)
+     result = []
+     keep_roles = {"user", "system", "tool", "latest_reminder", "direct_search_results"}
+ 
+@@ -755,28 +766,42 @@ def encode_messages(
+ 
+     full_messages = context + messages
+ 
+-    prompt = bos_token if add_default_bos_token and len(context) == 0 else ""
++    parts: List[str] = (
++        [bos_token] if add_default_bos_token and len(context) == 0 else []
++    )
+ 
+     # Resolve drop_thinking: if any message has tools defined, don't drop thinking
+     effective_drop_thinking = drop_thinking
+     if any(m.get("tools") for m in full_messages):
+         effective_drop_thinking = False
+ 
++    last_user_idx = find_last_user_index(full_messages)
++
+     if thinking_mode == "thinking" and effective_drop_thinking:
+-        full_messages = _drop_thinking_messages(full_messages)
+-        num_to_render = len(full_messages) - len(_drop_thinking_messages(context))
++        prev_len = len(full_messages)
++        full_messages = _drop_thinking_messages(
++            full_messages, last_user_idx=last_user_idx
++        )
++        if len(full_messages) != prev_len:
++            last_user_idx = find_last_user_index(full_messages)
++        num_to_render = len(full_messages) - (
++            len(_drop_thinking_messages(context)) if context else 0
++        )
+         context_len = len(full_messages) - num_to_render
+     else:
+         num_to_render = len(messages)
+         context_len = len(context)
+ 
+     for idx in range(num_to_render):
+-        prompt += render_message(
+-            idx + context_len,
+-            full_messages,
+-            thinking_mode=thinking_mode,
+-            drop_thinking=effective_drop_thinking,
+-            reasoning_effort=reasoning_effort,
++        parts.append(
++            render_message(
++                idx + context_len,
++                full_messages,
++                thinking_mode=thinking_mode,
++                drop_thinking=effective_drop_thinking,
++                reasoning_effort=reasoning_effort,
++                last_user_idx=last_user_idx,
++            )
+         )
+ 
+-    return prompt
++    return "".join(parts)
+-- 
+2.43.0
+
