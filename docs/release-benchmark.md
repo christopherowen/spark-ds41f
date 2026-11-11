@@ -296,9 +296,10 @@ release qualification (step 9) and the owner's acceptance (section 4).
   - what changed since the base, PR by PR;
   - the over/under table, with the verified shapes;
   - the known issues;
-  - how to run it: check out the tag, then `bin/spark build prepare`,
-    `bin/spark --cluster-config experiments/2026-10-26-spark-ds41f-candidate/candidate-<N>/<shape>.json build image --apply`,
-    `build distribute --apply` and `cluster start --apply` ([setup](setup.md)).
+  - how to run it: check out the tag, then
+    `bin/spark --cluster-config experiments/2026-10-26-spark-ds41f-candidate/candidate-<N>/<shape>.json build prepare`
+    (the profile selects the candidate's lock; without it `build prepare` prepares the release's), then `build image
+    --apply`, `build distribute --apply` and `cluster start --apply` with the same profile ([setup](setup.md)).
 - **No binary assets:** users build the image from the lock, as for a release. Nothing is pushed to a registry.
 
 **Publishing:**
