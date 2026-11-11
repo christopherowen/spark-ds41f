@@ -21,12 +21,12 @@ dgx1..dgx4, `tp4-switched` sp1..sp4, `tp3-switched` sp5..sp7).
   - added 2026-11-11: `0799`, the MoE combine's shared-row load after the PDL wait (below).
 - The provenance, SHA-256 and author of each patch are in [receipts/selection.json](receipts/selection.json), and the
   stack log is [receipts/stack.log](receipts/stack.log).
-- `patch_count` 672, `patch_head` `707688e7`, `expected_tree` `b20b199d`, `patchset_sha256` `1b31f510`, recorded by
+- `patch_count` 672, `patch_head` `15833ed1`, `expected_tree` `ad2dc11f`, `patchset_sha256` `d990ee5d`, recorded by
   `bin/spark build prepare --lock` ([source.json](source.json), [upstreams.lock.json](upstreams.lock.json)). Every
   receipt below predates `0799`: it is the record of the earlier build (`patch_count` 671, `patch_head` `4e8133ff`,
   `expected_tree` `5f021d9a`, `patchset_sha256` `fd767123`, image ID `e1de71be`). The image is rebuilt under the
   same tag, `spark-ds41f:candidate-54`. `build image` refuses a tag that exists, so the earlier image's tag is removed
-  from each node before the build and its copies; each profile's `local.spark-ds41f.vllm.tree` label (`b20b199d`)
+  from each node before the build and its copies; each profile's `local.spark-ds41f.vllm.tree` label (`ad2dc11f`)
   refuses the earlier image wherever it remains.
 - Every other source is 1107's.
 - **Authors:** every carried PR is christopherowen's. Every patch's `From:` is Christopher Owen's, except
@@ -70,7 +70,10 @@ dgx1..dgx4, `tp4-switched` sp1..sp4, `tp3-switched` sp5..sp7).
 before `pdl.chain()`, its `griddepcontrol.wait`. The shared expert runs on the aux stream; the combine joins it
 with an event wait just before its PDL launch, and in a captured graph that dependency can be a programmatic
 edge, which orders only what follows the wait. `0799` moves `pdl.chain()` above the shared load. The `RoutePos`
-and `Weights` loads stay before it. It applies unchanged on candidate-58's head.
+and `Weights` loads stay before it. `0799` also updates `test_routed_moe_pdl_preloads_before_wait`, which asserted
+the old order: the first build of `0799` (tree `b20b199d`, image `1e556e80`) failed that one release test (1 failed,
+10,170 passed), and the corrected patch passes the TileLang MoE file on GB10 (140 passed). It applies unchanged on
+candidate-58's head.
 
 Its gate, declared before the runs: [gate-0799-tp4.json](gate-0799-tp4.json) (12 boots at `tp4-ring`),
 [gate-0799-tp4-switched.json](gate-0799-tp4-switched.json) and [gate-0799-tp3-switched.json](gate-0799-tp3-switched.json)
