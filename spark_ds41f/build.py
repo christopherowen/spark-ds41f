@@ -250,16 +250,25 @@ print("GPU import smoke passed")
 # collectives with the kernel-family switch.
 B12X_ROCE_IMPORT = "import vllm.distributed.device_communicators.b12x_roce_all_reduce  # noqa: F401\n"
 B12X_MLA_IMPORT = "import vllm.v1.attention.backends.mla.b12x_mla_sparse  # noqa: F401\n"
-# An image whose lock does not list B12X: the package must be absent, and the DS4.1
-# modules that used it (Engram, the packed head's packer) import without it.
+# An image whose lock does not list B12X: the package must be absent, and every DS4.1
+# module imports without it and loads no B12X module. (It named one module,
+# tilelang.vocab_pack, which no B12X-free series has: candidate-55's #1096 moves the
+# packed head off B12X in place.)
 WITHOUT_B12X_SMOKE = """\
+import importlib
 import importlib.util
+import pkgutil
+import sys
 
 assert importlib.util.find_spec("b12x") is None, "B12X is installed"
-import vllm.models.deepseek_v4_1.common.engram  # noqa: F401
-import vllm.models.deepseek_v4_1.tilelang.vocab_pack  # noqa: F401
+import vllm.models.deepseek_v4_1 as dsv41
 
-print("B12X is not installed; the DS4.1 modules import without it")
+names = sorted(info.name for info in pkgutil.walk_packages(dsv41.__path__, dsv41.__name__ + "."))
+for name in names:
+    importlib.import_module(name)
+loaded = sorted(name for name in sys.modules if name == "b12x" or name.startswith("b12x."))
+assert not loaded, loaded
+print(f"B12X is not installed; the {len(names)} DS4.1 modules import without it")
 """
 
 
