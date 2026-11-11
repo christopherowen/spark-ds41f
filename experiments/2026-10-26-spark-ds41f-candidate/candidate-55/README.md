@@ -24,10 +24,12 @@ release-qualified.
     from model creation through `process_weights_after_loading`, where the earlier one released it at the end of
     `create_model()`. It also bounds the sponge by a 6 GiB `MemAvailable` floor rather than a 10 GiB headroom.
   - **`0801` and sparknet `0001`** have the same diffs as at `d9b04765`.
-  - **Not carried: its deployment tooling**, which is not image content. That is `scripts/memguard.sh`,
-    `scripts/memguard-start.sh`, `spark_ds41f/lab.py`'s telemetry pinning, and `spark_ds41f/cluster.py`'s pre-launch
-    defragmentation. The defragmentation runs `sudo sync; drop_caches=3; compact_memory` on every node at every
-    cluster start, for every profile, production included.
+  - **Its pre-launch defragmentation is on `main`** (owner, 2026-11-11: "add it default on, and a config parameter
+    to disable it to each profile"). `cluster start` runs `sudo sync; drop_caches=3; compact_memory` on every node
+    before launch. Its switch is `host.defragment_before_start`: true by default, and set true in each of this
+    candidate's serving profiles, which the `-dev` profiles inherit.
+  - **Not carried: its other deployment tooling**, which is not image content: `scripts/memguard.sh`,
+    `scripts/memguard-start.sh` and `spark_ds41f/lab.py`'s telemetry pinning.
   - **The servebench changes** (`trim_stall_tail`, an untimed prefill warm-up) would have altered the measurement
     this candidate is judged by. They have since left #1134.
 - **#1134 contains #1008:** its `0801` adds `vllm/utils/cpu_affinity.py` with #1008's partition, and its sparknet
@@ -86,6 +88,9 @@ unchanged. The control can: it must give candidate-54's TP4 hashes `18d61961`/`d
 - **c1 decision check:** 4 boots at `tp4-ring` and `tp4-switched`.
 - **Screens:** two boots against candidate-54's recorded screens
   ([candidate-54/receipts/references](../candidate-54/receipts/references), `candidate-54-0799-<testbed>-…`).
+- **Pre-launch defragmentation:** candidate-55's and the control's boots defragment before launch, but candidate-54's
+  recorded references were taken without it. A difference against those references includes the defragmentation,
+  which counts as part of #1134.
 
 ## Release tests
 

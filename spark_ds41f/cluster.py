@@ -656,6 +656,44 @@ def wait_for_memory_recovery(
         sleep(MEMORY_SETTLE_INTERVAL_SECONDS)
 
 
+def defragment_before_start(cluster: dict) -> bool:
+    """Whether cluster start defragments buddy memory before launch
+    (host.defragment_before_start, default true; a profile sets it false to skip)."""
+    return cluster.get("host", {}).get("defragment_before_start", True) is not False
+
+
+def defragment_buddy_memory(nodes: dict, target_nodes: list[dict]) -> None:
+    """Drop reclaimable VFS page/slab caches and compact buddy memory on stopped nodes.
+
+    On GB10 UMA, clean VFS page-cache and dentry pages scattered across 2 MiB
+    pageblocks consume ``MemFree`` and block ``kcompactd`` from coalescing
+    ``>= 2 MiB`` contiguous physical blocks before ``cuMemCreate`` weight loading.
+    Runs only after any existing serving container has stopped and before rank launch.
+    """
+    if not target_nodes:
+        return
+
+    def compact_one(node: dict) -> str | None:
+        res = run_ssh(
+            nodes,
+            node,
+            "sudo",
+            "-n",
+            "sh",
+            "-c",
+            "sync; echo 3 > /proc/sys/vm/drop_caches; echo 1 > /proc/sys/vm/compact_memory",
+        )
+        if res.returncode:
+            detail = (res.stderr or res.stdout).strip() or f"exit {res.returncode}"
+            return f"{node['name']}: buddy memory defragmentation skipped ({detail})"
+        return None
+
+    with concurrent.futures.ThreadPoolExecutor(max_workers=len(target_nodes)) as pool:
+        warnings = [w for w in pool.map(compact_one, target_nodes) if w]
+    for warning in warnings:
+        print(f"WARN: {warning}", file=sys.stderr, flush=True)
+
+
 def wait_for_api(cluster: dict, nodes: dict) -> None:
     head = next(node for node in nodes["nodes"] if node["head"])
     name = cluster["container"]["name"]
@@ -983,6 +1021,10 @@ def command_cluster_start(args: argparse.Namespace) -> int:
     print(f"plan:    {engine_text(planned)}, image {cluster['container']['image']}")
     print("shape:   " + (f"CHANGES {', '.join(changes)}" if changes else "new engine" if live is None else "unchanged"))
     print("start plan (fail-closed startup memory guards):")
+    if defragment_before_start(cluster):
+        print("  every node: drop clean caches and compact memory (host.defragment_before_start)")
+    else:
+        print("  no defragmentation before launch (host.defragment_before_start is false)")
     for node in order:
         print(f"  {node['name']}: pre-arm startup memguard, launch rank {node['rank']}")
         if getattr(args, "verbose", False):
@@ -1060,6 +1102,8 @@ def command_cluster_start(args: argparse.Namespace) -> int:
             wait_for_memory_recovery(
                 cluster, nodes, [node for node in nodes["nodes"] if node["name"] in backups]
             )
+        if defragment_before_start(cluster):
+            defragment_buddy_memory(nodes, order)
         def launch_node(node: dict) -> tuple[dict | None, str | None, str | None]:
             start_memguard(cluster, nodes, node, "startup", prelaunch=True)
             if not memguard_is_active(cluster, nodes, node):
