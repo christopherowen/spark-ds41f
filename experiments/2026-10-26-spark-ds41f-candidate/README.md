@@ -11,7 +11,7 @@ spark-ds41f-1025's [rc6/](../2026-10-25-spark-ds41f-candidate/rc6).
 `spark-ds41f-1030` on the ring and triangle ([below](#candidate-14-rc14)).
 
 **Frozen candidates (from 2026-11-10):** each merged base verified on all three testbeds is frozen,
-recorded in `manifests/frozen/`, tagged `spark-ds41f-candidate-<N>` and published as a GitHub pre-release; the
+recorded in `manifests/frozen/`, tagged `candidate-<N>` and published as a GitHub pre-release; the
 next round's candidates are built on it ([release-benchmark](../../docs/release-benchmark.md#frozen-candidates-pre-releases)).
 
 **Status (2026-10-26, CET):** candidate 7's image built on dgx4; its release tests passed on dgx4
@@ -1064,8 +1064,9 @@ The merged base of round 2: candidate-50 with #1009 round 1, plus every PR that 
 
 - **Series:** [candidate-54/vllm/series](candidate-54/vllm/series) (`0001..0799`, 672 patches;
   `patchset_sha256` `d990ee5d`, `patch_head` `15833ed1`, `expected_tree` `ad2dc11f`).
-- **Status:** built (`spark-ds41f:candidate-54`, image ID `d502217e`); release tests pass; verification on the three
-  testbeds in its README.
+- **Status:** verified on the three testbeds (image ID `d502217e`; release tests pass; [final receipts](candidate-54/receipts/final))
+  and frozen as `candidate-54`: [manifest](../../manifests/frozen/candidate-54.json),
+  [pre-release notes](candidate-54/pre-release-notes.md).
 
 ## Candidates 55-58 (removed 2026-11-11)
 
