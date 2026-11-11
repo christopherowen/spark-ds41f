@@ -64,7 +64,7 @@ dgx1..dgx4, `tp4-switched` sp1..sp4, `tp3-switched` sp5..sp7).
 | `0789-perf-spec-decode-copy-drafter-survival-and-tile-cap.patch` | #971 | perf(spec-decode): cumulative survival in copy_apply, single-req 16-row tile cap, and wide-step dead-row mask | [#971 round 1](../candidate-53/receipts/rework/pr-971-r1) (candidate-53) | [corrected-meets-mark](../candidate-53/receipts/rework/pr-971-r1/result.json) |
 | `0790-perf-spec-decode-copy-drafter-long-context-scan.patch` | #977 | perf(spec_decode): bound CopyDrafter long-context history scan in copy_match | candidate-53, PR head `4e0244deb7d5` | [pass](../candidate-53/receipts/own-marks/pr-977/result.json) |
 | `0791-perf-worker-compact-packed-vocab-tables-and-expand-d.patch` | #998 | perf(worker): compact packed vocab tables and expand display carve-out weights | [#998 round 1](../candidate-53/receipts/rework/pr-998-r1) (candidate-53) | [corrected-meets-mark](../candidate-53/receipts/rework/pr-998-r1/result.json) |
-| `0799-fix-dsv41-read-the-MoE-combine-s-shared-rows-after-t.patch` | owner's fix | fix(dsv41): read the MoE combine's shared rows after the PDL wait | owner's fix, on `0791` | not yet verified: the gate on the three testbeds, several boots |
+| `0799-fix-dsv41-read-the-MoE-combine-s-shared-rows-after-t.patch` | owner's fix | fix(dsv41): read the MoE combine's shared rows after the PDL wait | owner's fix, on `0791` | [gate passes](receipts/gate-0799/README.md): 12, 4 and 4 boots, every run on the recorded hashes |
 
 **`0799`.** `moe_combine_v41` (`tilelang/moe.py`, from 1107's `0756`) loaded the shared expert's output
 before `pdl.chain()`, its `griddepcontrol.wait`. The shared expert runs on the aux stream; the combine joins it
@@ -306,7 +306,14 @@ release set, quality evals, AgentX or cold boots; those belong to release qualif
 
 ## Status
 
-Built (`spark-ds41f:candidate-54`, image ID `e1de71be`); its release tests passed on dgx4 (10,171 passed, 311
+**With `0799` (2026-11-11):** the gate passes on all three testbeds, every run of every boot on the recorded hashes:
+`tp4-ring` 12 of 12 boots (48 runs), `tp4-switched` 4 of 4 and `tp3-switched` 4 of 4
+([receipts/gate-0799](receipts/gate-0799/README.md)). Before it, 4 of 12 `tp4-ring` boots failed. The gate ran on
+`0799`'s first build (image `1e556e80`, tree `b20b199d`), which failed one release test; the rebuilt image (tree
+`ad2dc11f`) differs only in that test file. Its release tests, screens, live checks, the c1 decision check and the
+capped TP3 gate are next. The table below is the earlier build's record.
+
+Earlier build (`spark-ds41f:candidate-54`, image ID `e1de71be`): its release tests passed on dgx4 (10,171 passed, 311
 skipped).
 
 | Testbed | Gate | Screen against 1107 | Live checks |
