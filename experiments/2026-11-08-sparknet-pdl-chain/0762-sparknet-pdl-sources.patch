@@ -1,0 +1,50 @@
+--- a/tests/kernels/deepseek_v41_pdl_sources.py
++++ b/tests/kernels/deepseek_v41_pdl_sources.py
+@@ -70,6 +70,10 @@
+     "moe_dispatch",
+     "moe_grouped_fp8_fp4_gemm",
+     "moe_swiglu_cast_kernel",
++    "oneshot_allgather",
++    "oneshot_allreduce",
++    "oneshot_exchange",
++    "oneshot_reducescatter",
+     "rope",
+     "router_partials",
+     "routing_masks",
+--- a/tests/kernels/test_deepseek_v41_tilelang_pdl.py
++++ b/tests/kernels/test_deepseek_v41_tilelang_pdl.py
+@@ -509,3 +509,34 @@
+         assert torch.equal(out.view(torch.int16), expected_out.view(torch.int16))
+         assert torch.equal(emitted, expected_emitted)
+         assert torch.equal(emitted_slots, expected_slots)
++
++
++
++def test_sparknet_oneshot_collectives_pdl_sources():
++    """All four sparknet.oneshot TileLang collective kernels are on CHAIN and pass
++    deepseek_v41_pdl_sources.violations with zero violations."""
++    from sparknet.oneshot._allgather_tilelang import _build as build_ag
++    from sparknet.oneshot._exchange_tilelang import _build as build_ex
++    from sparknet.oneshot._oneshot_tilelang import _build as build_ar
++    from sparknet.oneshot._reducescatter_tilelang import _build as build_rs
++    from tests.kernels import deepseek_v41_pdl_sources as pdl_sources
++
++    for name in (
++        "oneshot_allreduce",
++        "oneshot_allgather",
++        "oneshot_reducescatter",
++        "oneshot_exchange",
++    ):
++        assert name in pdl_sources.CHAIN
++
++    kernels = [
++        build_ar("bfloat16", 4, 0, 256, 2, 64, 2, False, False)(),
++        build_ar("bfloat16", 4, 0, 256, 2, 64, 2, False, True)(),
++        build_ag(4, 0, 256, 2, 64, 2, False)(),
++        build_rs("bfloat16", 4, 0, 256, 2, 64, 2, False)(),
++        build_ex(4, 0, 256, 2, 64, 2, False)(),
++    ]
++    for kernel in kernels:
++        pdl_sources._kernels.setdefault(id(kernel), kernel)
++        src = kernel.get_kernel_source()
++        assert pdl_sources.violations(src, False) == []
