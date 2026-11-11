@@ -89,10 +89,10 @@ its gate repeat. `0799` passes when every run of every boot gives candidate-54's
   [live-checks-0799-tp4-switched.json](live-checks-0799-tp4-switched.json), each the earlier spec with its run renamed;
 - [c1-decisions-tp4-switched.json](c1-decisions-tp4-switched.json) and [c1-decisions-tp4.json](c1-decisions-tp4.json):
   c1 on 4 boots at `tp4-switched` and at `tp4-ring`, saving each request's per-step token counts. In candidate-58's c1 arms at `tp4-switched`
-  ([c1-drafter-arms-tp4-switched.json](../candidate-58/c1-drafter-arms-tp4-switched.json), 3 boots each), the boots'
+  ([c1-drafter-arms-tp4-switched.json](https://github.com/christopherowen/spark-ds41f/blob/07b2adfe7ec/experiments/2026-10-26-spark-ds41f-candidate/candidate-58/c1-drafter-arms-tp4-switched.json), 3 boots each), the boots'
   accept decisions split, except where the shared expert left the aux stream, the drafter's query forward ran without
   its graph, or row taps were on. The drafter's layers are `DeepseekV4DecoderLayer`s, so its MoE runs the same combine.
-  [c1_decisions.py](../candidate-58/boot-differences/c1_decisions.py) compares the boots request by request;
+  [c1_decisions.py](../../2026-11-10-tp4-ring-determinism/boot-differences/c1_decisions.py) compares the boots request by request;
 - at `tp3-switched`, [gate-caps-tp3-switched.json](gate-caps-tp3-switched.json): the gate on 2 boots with TP3's
   prefetch caps (below), since the `0799` gate there ran without them;
 - at `tp4-ring` and `tp4-switched`, [gate-final-tp4.json](gate-final-tp4.json) and

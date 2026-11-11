@@ -415,7 +415,7 @@ class VerdictsTest(unittest.TestCase):
 
 
 class OverlayTest(unittest.TestCase):
-    folder = "experiments/2026-10-26-spark-ds41f-candidate/candidate-58"
+    folder = "experiments/2026-10-26-spark-ds41f-candidate/candidate-54"
 
     def args(self, **changes):
         values = dict(folder=self.folder, name="no999", tree="dgx1:~/spark-lab/vllm", revert="c0ffee1",
