@@ -90,8 +90,8 @@ its gate repeat. `0799` passes when every run of every boot gives candidate-54's
 - [c1-decisions-tp4-switched.json](c1-decisions-tp4-switched.json): c1 on 4 boots at `tp4-switched`, saving each
   request's per-step token counts. In candidate-58's c1 arms at `tp4-switched`
   ([c1-drafter-arms-tp4-switched.json](../candidate-58/c1-drafter-arms-tp4-switched.json), 3 boots each), the boots'
-  accept decisions split, except where the shared expert left the aux stream or the drafter's query forward ran without
-  its graph. The drafter's layers are `DeepseekV4DecoderLayer`s, so its MoE runs the same combine.
+  accept decisions split, except where the shared expert left the aux stream, the drafter's query forward ran without
+  its graph, or row taps were on. The drafter's layers are `DeepseekV4DecoderLayer`s, so its MoE runs the same combine.
   [c1_decisions.py](../candidate-58/boot-differences/c1_decisions.py) compares the boots request by request.
 
 **#1009 round 1 returns.** It fixes candidate-50's `tp4-ring` boot failure
