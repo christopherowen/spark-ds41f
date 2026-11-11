@@ -16,7 +16,9 @@ HERE = Path(__file__).resolve().parent
 sys.path.insert(0, str(ROOT))
 import spark_ds41f as spark
 from spark_ds41f import lab
-from servebench import suite
+from spark_ds41f import sonar
+
+suite = sonar.module("suite")
 
 HOLDER = "spark-lab: owner-authorized lossless memory qualification"
 STREAM_POLICY = "recorded-1030"
@@ -519,7 +521,7 @@ def main():
                     run(["env", "SPARK_DS41F_BENCH_STREAM_POLICY=" + STREAM_POLICY, *argv], f"suite-{label}-{i}")
                     if args.component == "engram":
                         save_io("after-suite-" + str(i))
-                    observed = native_suite_gate(directory, suite.load(name), profile, commit, receipt["images"])
+                    observed = native_suite_gate(directory, sonar.load_suite(name), profile, commit, receipt["images"])
                     if starts is not None and starts != observed:
                         raise ValueError("companion suites changed boot")
                     starts = observed
@@ -546,7 +548,7 @@ def main():
             for i, name in enumerate(job["suite"]):
                 suffix = "" if i == 0 else "-" + name
                 reference = job["reference"] + ("" if i == 0 else "-" + name)
-                run([sys.executable, "scripts/servebench_suite_table.py", release["run"] + suffix,
+                run([sys.executable, "scripts/sonar_table.py", release["run"] + suffix,
                      job["arms"][0]["label"], reference, job["arms"][1]["label"]], f"table-{i}")
             receipt["two_serving_boots_complete"] = True
             receipt["recorded_model_identity_passed"] = True

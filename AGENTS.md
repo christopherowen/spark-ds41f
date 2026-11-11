@@ -18,6 +18,10 @@ the open levers, measured dead ends, and the lean screening routine.
   Experimental cluster profiles may select a repository-relative
   `upstreams_config` lock with their own source manifest and patch series.
 - `requirements/` owns hashed non-Git build inputs.
+- `config/sonar.json` pins the benchmark client, Sonar (a separate repository): every
+  measurement runs through it (`spark_ds41f/sonar.py`). It is host-side, not an image
+  input, so it is not in a release's upstreams lock. `config/suites/` owns the deployment's
+  suites; a changed suite is a new suite, so never edit one a recorded reference ran.
 - `patches/*/series` owns the ordered local patch stacks.
 - `manifests/baselines/` is immutable evidence. Never rewrite a published baseline.
 - `manifests/benchmarks/<baseline>.json` is that baseline's reference

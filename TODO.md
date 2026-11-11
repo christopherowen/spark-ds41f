@@ -8,7 +8,7 @@ owner.
 
 ## Recent candidate decisions
 
-- **Candidate `1107`** ([`experiments/2026-10-26-spark-ds41f-candidate/1107`](experiments/2026-10-26-spark-ds41f-candidate/1107/README.md), PR [#937](https://github.com/christopherowen/spark-ds41f/pull/937)) consolidates the C45 TileLang compiler (`tilelang/0001..0013` with explicit wrapper-cache and disk-streamed IKET controls), full TileLang runtime closure (`0690..0713`, `0717`, `0752..0754`), CopyDrafter continuation priority, warp early-exit pruning and expected-yield gating against DSpark (`0744..0745`), native-depth CUDA graph retention under copy verification (`0728`), online confidence calibration (`0746`), per-layer SP WO local MXFP8 exchange (`0737`), SP Engram prefill column exchange (`0738`), TP3 6-channel NCCL Ring and sparse-MLA `block_H=16` occupancy (`0740`), 2-launch mHC PDL (`0739` + `0755`), selective pack12 KV compressor (`0749`), fused indexer `wq_b` RoPE + scale (`0748`), packed 264-byte Engram reader with multi-CTA step, hot-row cache and negative `col_delta` guard (`0750`), deep-context scheduler interleave (`0751`), tensor-parallel vision tower (`0758`), and native `TP2..TP8` cross-topology parity (`0747`). Ready for consolidated image build and full servebench qualification on `tp4-ring` and `tp3-triangle`.
+- **Candidate `1107`** ([`experiments/2026-10-26-spark-ds41f-candidate/1107`](experiments/2026-10-26-spark-ds41f-candidate/1107/README.md), PR [#937](https://github.com/christopherowen/spark-ds41f/pull/937)) consolidates the C45 TileLang compiler (`tilelang/0001..0013` with explicit wrapper-cache and disk-streamed IKET controls), full TileLang runtime closure (`0690..0713`, `0717`, `0752..0754`), CopyDrafter continuation priority, warp early-exit pruning and expected-yield gating against DSpark (`0744..0745`), native-depth CUDA graph retention under copy verification (`0728`), online confidence calibration (`0746`), per-layer SP WO local MXFP8 exchange (`0737`), SP Engram prefill column exchange (`0738`), TP3 6-channel NCCL Ring and sparse-MLA `block_H=16` occupancy (`0740`), 2-launch mHC PDL (`0739` + `0755`), selective pack12 KV compressor (`0749`), fused indexer `wq_b` RoPE + scale (`0748`), packed 264-byte Engram reader with multi-CTA step, hot-row cache and negative `col_delta` guard (`0750`), deep-context scheduler interleave (`0751`), tensor-parallel vision tower (`0758`), and native `TP2..TP8` cross-topology parity (`0747`). Ready for consolidated image build and full suite qualification on `tp4-ring` and `tp3-triangle`.
 - C39 delivered default CopyDrafter behavior, but its optional preparation-overlap
   performance claim showed no proven serving-throughput gain against either
   saved C38 recipe. Preserve the adverse engine-grid cost and original collector
@@ -71,7 +71,7 @@ Production is **spark-ds41f-1107** (`manifests/baselines/2026-11-07-spark-ds41f-
 <!-- END GENERATED: next-release-status -->
 
 Before promoting `1107`:
-1. **Build and qualify `spark-ds41f:1107`** across the full servebench release,
+1. **Build and qualify `spark-ds41f:1107`** across the full release,
    single-stream, and sampled suites on `tp4-ring` and `tp3-triangle` against
    `spark-ds41f-1030`.
 2. **Verify `dgx1` memory headroom and native-depth graph capture (`0728`)**:
@@ -79,14 +79,15 @@ Before promoting `1107`:
    under the widened `max_decode_rows` (`59` on TP3, `107` on TP4) plus 69
    target CUDA graphs on TP3 (`60 -> 69`), confirming headroom stays comfortably
    above the 5 GiB startup and 3 GiB steady-state guards.
-3. **Retire legacy `bin/spark bench` suites** once no active workflow references
-   them; servebench suites (`docs/release-benchmark.md`) are the release
+3. **Retire the measurement matrix** (`bin/spark bench` without `--suite`, now
+   Sonar's `matrix`) once no active workflow references it; the suites in
+   `config/suites/`, run by Sonar (`docs/release-benchmark.md`), are the release
    benchmark authority.
 
 ## Current reference
 
 <!-- BEGIN GENERATED: current-reference -->
-Active baseline manifest: [`manifests/baselines/2026-11-07-spark-ds41f-1107.json`](manifests/baselines/2026-11-07-spark-ds41f-1107.json) (`spark-ds41f-1107`). Releases are judged by the servebench release, single-stream and sampled suites (`docs/release-benchmark.md`, `scripts/servebench_suite_table.py`). Current benchmark references are [`manifests/suites/2026-11-07-spark-ds41f-1107-tp4`](manifests/suites/2026-11-07-spark-ds41f-1107-tp4/) for `tp4-ring` and [`manifests/suites/2026-11-07-spark-ds41f-1107-tp3`](manifests/suites/2026-11-07-spark-ds41f-1107-tp3/) for `tp3-triangle`:
+Active baseline manifest: [`manifests/baselines/2026-11-07-spark-ds41f-1107.json`](manifests/baselines/2026-11-07-spark-ds41f-1107.json) (`spark-ds41f-1107`). Releases are judged by the release, single-stream and sampled suites, measured with Sonar (`docs/release-benchmark.md`, `scripts/sonar_table.py`). Current benchmark references are [`manifests/suites/2026-11-07-spark-ds41f-1107-tp4`](manifests/suites/2026-11-07-spark-ds41f-1107-tp4/) for `tp4-ring` and [`manifests/suites/2026-11-07-spark-ds41f-1107-tp3`](manifests/suites/2026-11-07-spark-ds41f-1107-tp3/) for `tp3-triangle`:
 
 | Measure | `tp4-ring` (`spark-ds41f-1107`, 1M, 16 seqs, 16K batch) | `tp3-triangle` (`spark-ds41f-1107`, 1M, 8 seqs, 8K/6K batch) |
 | --- | ---: | ---: |
@@ -125,7 +126,7 @@ Report one and eight streams for every decode change, and sixteen on TP4.
   on generated text varies between samples: accepted drafts per step,
   prefix-cache hits, output length. Fixed-row step time is stable to about
   ±0.5 ms with three samples; acceptance is not. For changes that move
-  acceptance, use paired multi-prompt suites (`servebench`) across two boots.
+  acceptance, use paired multi-prompt suites (Sonar's) across two boots.
 - **When a decision hinges on 2.5% or less**, watch boot-to-boot variance across
   repeat boots before attributing a small delta to a kernel or policy change.
 - **Python-only vLLM changes need no image build to screen.** Bind-mount the
@@ -237,7 +238,7 @@ Open levers:
   high-acceptance code at one stream (`+14–18%`), whereas live agent traffic and
   8–16 stream prose accept fewer tokens per step. Screen load-aware
   (`num_speculative_tokens_per_batch_size`) or per-request acceptance-aware
-  draft depth schedules on recorded agent traffic and the paired servebench
+  draft depth schedules on recorded agent traffic and the paired Sonar
   suites.
 - **Drafter reuse of the target's token selection.** Check whether reusing the
   target model's indexer top-k selection from the anchor position in DSpark

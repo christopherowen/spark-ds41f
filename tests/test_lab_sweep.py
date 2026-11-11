@@ -1,4 +1,4 @@
-"""Host-independent tests for the sweep writer (scripts/lab_sweep.py) and its stream workload."""
+"""Host-independent tests for the sweep writer (scripts/lab_sweep.py)."""
 
 from __future__ import annotations
 
@@ -24,7 +24,6 @@ def load(name: str, path: str):
 
 
 sweep_module = load("lab_sweep", "scripts/lab_sweep.py")
-streams_module = load("distinct_streams", "scripts/distinct_streams.py")
 from spark_ds41f import lab
 
 
@@ -101,31 +100,6 @@ class SweepTest(unittest.TestCase):
         for place in ("config", "experiments", "results/private/lab/x", "experiments/../config"):
             with self.assertRaises(ValueError):
                 sweep_module.check_destination(place)
-
-
-class DistinctStreamsTest(unittest.TestCase):
-    def test_summary_is_the_line_lab_tables_read(self) -> None:
-        line = streams_module.summary(4, [100.0, 102.0, 101.0])
-        self.assertEqual(line["summary"], "c4 distinct prompts")
-        self.assertEqual((line["tps_mean"], line["samples"]), (101.0, 3))
-        self.assertGreater(line["ci95_pct"], 0)
-
-    def test_prompts_are_distinct(self) -> None:
-        self.assertEqual(len(set(streams_module.PROMPTS)), len(streams_module.PROMPTS))
-        self.assertGreaterEqual(len(streams_module.PROMPTS), 16)
-
-    def test_requests_beyond_the_samples_own_are_foreign(self) -> None:
-        """A sample counts the server's finished requests: its own streams are expected,
-        anything more was someone else's load on the server (2026-10-18: a production
-        client on a lab arm made a gate read 3-4x slow)."""
-        def fake_stream(base, model, prompt, tokens, out):
-            out.update(start=0.0, first=1.0, last=3.0, tokens=tokens, offset=0.0)
-
-        for counts, foreign in (([10.0, 14.0], 0), ([10.0, 21.0], 7), ([None, 14.0], None)):
-            with mock.patch.object(streams_module, "stream", fake_stream), \
-                    mock.patch.object(streams_module, "finished_requests", side_effect=counts):
-                result = streams_module.sample("http://x", "m", streams_module.PROMPTS[:4], 16)
-            self.assertEqual(result["foreign_requests"], foreign)
 
 
 if __name__ == "__main__":

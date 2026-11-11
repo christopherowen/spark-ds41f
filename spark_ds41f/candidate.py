@@ -1082,7 +1082,8 @@ def determinism_script(run: str) -> str:
 
 
 def parse_determinism(text: str) -> dict:
-    """One token_determinism_text.py output: its scenario records and summary."""
+    """One determinism gate output (sonar determinism, or token_determinism_text.py before
+    it): its scenario records and summary."""
     scenarios, summary = [], None
     for line in text.splitlines():
         line = line.strip()
@@ -1359,7 +1360,8 @@ BOOT = re.compile(r"^\S+ boot (\S+): ready \+(\S+) s, command (\d+) s( FAILED)?"
 # kernel-cache files it added per node.
 BOOT_PROBE = re.compile(r"^\S+ boot (\S+): (?:first boot of the image on (.+?)|not the image's first boot on any node); "
                         r"kernel cache (.+) files")
-SUITE_STEP = re.compile(r"^servebench suite (\S+): step ")
+# Sonar's suite log lines; window logs recorded before Sonar name the client otherwise.
+SUITE_STEP = re.compile(r"^(?:sonar|servebench) suite (\S+): step ")
 EXIT = re.compile(r"^\S+Z (\S+) (\S+) exit (-?\d+)$")
 
 
@@ -1442,15 +1444,15 @@ def headline_numbers(lines: list[str], labels: list[str]) -> dict[str, ArmNumber
         if not found:
             continue
         prefix, record = found
-        kind = record["summary"]
-        if kind == "servebench closed":
+        kind = record["summary"].replace("servebench ", "sonar ", 1)
+        if kind == "sonar closed":
             label, run = from_output(record, f"-c{record.get('concurrency')}")
             arm(label).closed[(run, record.get("concurrency"))] = (record.get("tps_mean"), record.get("ci95_pct"))
-        elif kind == "servebench prefill":
+        elif kind == "sonar prefill":
             label, run = from_output(record, "-prefill")
             for tokens, tps in (record.get("tps") or {}).items():
                 arm(label).prefill[(run, int(tokens))] = tps
-        elif kind == "servebench model":
+        elif kind == "sonar model":
             label, run = from_output(record, "-model")
             arm(label).model[run] = record
         elif kind.endswith("distinct prompts") and prefix:

@@ -73,7 +73,7 @@ ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 import spark_ds41f as spark
-from spark_ds41f import functional_evidence
+from spark_ds41f import functional_evidence, sonar
 _agentx_loader = importlib.machinery.SourceFileLoader("agentx", str(ROOT / "scripts" / "agentx.py"))
 agentx = importlib.util.module_from_spec(importlib.util.spec_from_loader("agentx", _agentx_loader))
 _agentx_loader.exec_module(agentx)
@@ -100,29 +100,33 @@ TRACE_LOG_DIR = "/cache/spark-ds41f/moe-checksums"
 GPU_CLOCKS_MARKER = LAB_HOME / "gpu-clocks-locked.json"
 
 # Measurement profiles: (script, extra arguments, output stem). The bench command is built apart.
+# Every script is a Sonar command (spark_ds41f/sonar.py); their requests are those of the
+# experiment scripts they replaced (experiments/2026-09-29-determinism, 2026-10-09's
+# token_determinism.py), so earlier profile runs compare with new ones.
 PROFILES = {
     "full": {
         "bench": ["--min-samples", "5", "--max-samples", "5", "--prefill-sizes", "1024,4096,16384,65536",
                   "--prefill-repeats", "3"],
-        "extras": [("c1_distinct.py", ["--tokens", "256"], "c1-distinct"),
-                   ("c8_distinct.py", ["--samples", "3", "--tokens", "256"], "c8-distinct"),
-                   ("ttft_short.py", [], "ttft"),
-                   ("mixed_latency.py", ["--rounds", "3"], "mixed")],
+        "extras": [("scripts/sonar_single.py", ["--tokens", "256"], "c1-distinct"),
+                   ("scripts/distinct_streams.py", ["--streams", "8", "--samples", "3", "--tokens", "256"],
+                    "c8-distinct"),
+                   ("scripts/sonar_ttft.py", [], "ttft"),
+                   ("scripts/sonar_mixed.py", ["--rounds", "3"], "mixed")],
     },
     "lean": {
         "bench": ["--min-samples", "3", "--max-samples", "3", "--prefill-sizes", "1024,16384",
                   "--prefill-repeats", "2"],
-        "extras": [("c1_distinct.py", ["--tokens", "256", "--prompts", "12"], "c1-distinct"),
-                   ("c8_distinct.py", ["--samples", "2", "--tokens", "256"], "c8-distinct"),
-                   ("ttft_short.py", ["--reps", "3"], "ttft"),
-                   ("mixed_latency.py", ["--rounds", "3"], "mixed")],
+        "extras": [("scripts/sonar_single.py", ["--tokens", "256", "--prompts", "12"], "c1-distinct"),
+                   ("scripts/distinct_streams.py", ["--streams", "8", "--samples", "2", "--tokens", "256"],
+                    "c8-distinct"),
+                   ("scripts/sonar_ttft.py", ["--reps", "3"], "ttft"),
+                   ("scripts/sonar_mixed.py", ["--rounds", "3"], "mixed")],
     },
 }
 # The release comparison (docs/lab.md, "Release comparison"): the previous release and
 # the candidate in one session, with the same workloads every release.
 # scripts/release_table.py writes the over/under table.
-_DETERMINISM = "experiments/2026-10-09-tilelang-migration/token_determinism.py"
-_LATENCY = "experiments/2026-09-29-determinism"
+_DETERMINISM = "scripts/sonar_determinism.py"
 PROFILES["release"] = {
     "bench_args": ["--suites", "quality,decode,prefill", "--min-samples", "5", "--max-samples", "10",
                    "--precision", "2", "--concurrency", "1,2,4,8,16", "--decode-cases", "prose,code",
@@ -131,11 +135,11 @@ PROFILES["release"] = {
     "extras": [(_DETERMINISM, ["--tokens", "192", "--long-lines", "700", "--wide"], "determinism"),
                ("scripts/acceptance_sweep.py", ["--tokens", "256"], "sweep"),
                # One stream: twelve prompts one at a time (distinct_streams.py --streams 1 is one prompt).
-               (f"{_LATENCY}/c1_distinct.py", ["--tokens", "256", "--prompts", "12"], "c1-distinct"),
+               ("scripts/sonar_single.py", ["--tokens", "256", "--prompts", "12"], "c1-distinct"),
                *[("scripts/distinct_streams.py", ["--streams", str(n), "--samples", str(s), "--tokens", "256"],
                   f"c{n}-distinct") for n, s in ((4, 3), (8, 4), (16, 4))],
-               (f"{_LATENCY}/ttft_short.py", ["--reps", "3"], "ttft"),
-               (f"{_LATENCY}/mixed_latency.py", ["--rounds", "3"], "mixed")],
+               ("scripts/sonar_ttft.py", ["--reps", "3"], "ttft"),
+               ("scripts/sonar_mixed.py", ["--rounds", "3"], "mixed")],
     "table": "scripts/release_table.py",
 }
 # TP3's recipe limits: eight streams, 1M context (sizes below max-model-len - 64).
@@ -1094,7 +1098,7 @@ def measure_steps(spec: dict, job: dict) -> list[dict]:
 
 
 def suite_steps(spec: dict, job: dict, arms: list[dict]) -> list[dict]:
-    """A measure job with "suite": each arm boots and runs the servebench suite through
+    """A measure job with "suite": each arm boots and runs the Sonar suite through
     bin/spark bench --suite (cooled nodes, the fan performance curve, the memory and
     temperature watch, the arm's identity in the run) into results/private/suites/<run>/<label>;
     arms after the first score the first arm's text in model steps; the table compares the
@@ -1132,7 +1136,7 @@ def suite_steps(spec: dict, job: dict, arms: list[dict]) -> list[dict]:
     reference, unresolved = (recorded_reference(experiment, job["reference"], arms[0]["config"])
                              if "reference" in job else (None, None))
     for name in suites:
-        table = {"kind": "table", "argv": ["scripts/servebench_suite_table.py", run_of(name), *labels],
+        table = {"kind": "table", "argv": ["scripts/sonar_table.py", run_of(name), *labels],
                  "out": f"results/private/lab/{run_of(name)}-table.txt",
                  "curves": [f"results/private/determinism/{run}/curves-{label}.json" for label in labels]}
         if "reference" in job:
@@ -1181,10 +1185,10 @@ def reference_problems(step: dict) -> list[str]:
     path = ROOT / step["reference"]
     if not (path / "suite.json").is_file():
         return problems + [f"reference {step['reference']} is not a suite run (no suite.json)"]
-    sys.path.insert(0, str(ROOT))
-    from servebench import suite
     try:
-        digest = suite.digest(suite.load(step["suite"]))
+        digest = sonar.module("suite").digest(sonar.load_suite(step["suite"]))
+    except sonar.SonarUnavailable as error:
+        return problems + [f"the benchmark client: {error}"]
     except (ValueError, OSError):
         return problems
     recorded = json.loads((path / "suite.json").read_text(encoding="utf-8"))["suite_sha256"]
@@ -1449,14 +1453,33 @@ def agentx_problems(step: dict) -> list[str]:
     return problems
 
 
-# Lab extras that are servebench commands; their arguments are checked with its parser.
-SERVEBENCH_SHIMS = {"scripts/servebench_run.py": "run", "scripts/servebench_engine.py": "engine",
-                    "scripts/servebench_model.py": "model", "scripts/servebench_suite.py": "suite"}
+# Lab extras that are Sonar commands (spark_ds41f/sonar.py); their arguments are checked with
+# Sonar's parser, as each shim will pass them.
+SONAR_SHIMS = {"scripts/sonar_run.py": "run", "scripts/sonar_engine.py": "engine",
+               "scripts/sonar_model.py": "model", "scripts/sonar_suite.py": "suite",
+               "scripts/sonar_determinism.py": "determinism", "scripts/sonar_single.py": "single",
+               "scripts/sonar_ttft.py": "ttft", "scripts/sonar_mixed.py": "mixed",
+               "scripts/distinct_streams.py": "streams", "scripts/acceptance_sweep.py": "acceptance"}
+
+
+def sonar_parse(command: str, args: list[str]):
+    """Parse a shim's arguments as Sonar will, and for a suite every step's too."""
+    main = sonar.module("sonar.__main__")
+    if command == "suite":
+        args = sonar.suite_arguments(args)
+    elif command == "mixed":
+        args = sonar.mixed_arguments(args)
+    parsed = main.build_parser().parse_args([command, *args])
+    if command == "suite":
+        suite = sonar.module("suite")
+        for suite_step in suite.load(parsed.suite)["steps"]:
+            main.build_parser().parse_args(suite.arguments(suite_step, parsed.url, "o.json", "l", parsed.corpus))
+    return parsed
 
 
 def plan_problems(steps: list[dict]) -> list[str]:
     """What would fail only after a boot: a missing arm configuration or script, or
-    servebench arguments its parser rejects."""
+    Sonar arguments its parser rejects."""
     problems = []
     for step in steps:
         if step["kind"] in ("boot", "image", "fabric"):
@@ -1485,20 +1508,15 @@ def plan_problems(steps: list[dict]) -> list[str]:
                 problems.append(f"{step['out']}: prior required evidence exists; use a distinct run")
         if not (ROOT / script).is_file():
             problems.append(f"script {script} does not exist")
-        elif script in SERVEBENCH_SHIMS:
-            sys.path.insert(0, str(ROOT))
-            from servebench.__main__ import build_parser
+        elif script in SONAR_SHIMS:
             errors = io.StringIO()
             try:
                 with contextlib.redirect_stderr(errors):
-                    parsed = build_parser().parse_args([SERVEBENCH_SHIMS[script], *args])
-                    if SERVEBENCH_SHIMS[script] == "suite":
-                        # Every step of the suite, as the suite will run it.
-                        from servebench import suite
-                        for suite_step in suite.load(parsed.suite)["steps"]:
-                            build_parser().parse_args(suite.arguments(suite_step, parsed.url, "o.json", "l", parsed.corpus))
+                    sonar_parse(SONAR_SHIMS[script], args)
             except SystemExit:
                 problems.append(f"{script} {shlex.join(args[1:])}: {errors.getvalue().strip().splitlines()[-1]}")
+            except sonar.SonarUnavailable as error:
+                problems.append(f"{script}: the benchmark client: {error}")
             except (ValueError, OSError) as error:
                 problems.append(f"{script} {shlex.join(args[1:])}: {error}")
     return list(dict.fromkeys(problems))
@@ -1513,15 +1531,17 @@ def arm_problems(config: str) -> list[str]:
 
 
 def suite_problems(step: dict) -> list[str]:
-    """A bench --suite step: the suite and every step's servebench arguments parse, and a
+    """A bench --suite step: the suite and every step's Sonar arguments parse, and a
     suite that times the engine grid runs on an arm with the dev-mode collective RPC."""
-    sys.path.insert(0, str(ROOT))
-    from servebench import suite
-    from servebench.__main__ import build_parser
     config = step["argv"][step["argv"].index("--cluster-config") + 1]
     errors = io.StringIO()
     try:
-        definition = suite.load(step["suite"])
+        suite = sonar.module("suite")
+        build_parser = sonar.module("sonar.__main__").build_parser
+    except sonar.SonarUnavailable as error:
+        return [f"suite {step['suite']}: the benchmark client: {error}"]
+    try:
+        definition = sonar.load_suite(step["suite"])
         with contextlib.redirect_stderr(errors):
             for suite_step in definition["steps"]:
                 build_parser().parse_args(suite.arguments(suite_step, "http://head:8000", "o.json", "l", None))
@@ -2119,7 +2139,7 @@ def execute(spec: dict, dry: bool, keep_open: bool, close_on_failure: bool = Tru
         current["note"] = describe_step(step)
         beat(current["note"])
         if step["kind"] != "sync" and not validated:
-            # After any sync, before the first boot: every file and servebench argument
+            # After any sync, before the first boot: every file and Sonar argument
             # the run needs, so a mistake costs seconds rather than a boot.
             validated = True
             problems = plan_problems(steps)

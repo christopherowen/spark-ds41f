@@ -41,11 +41,13 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
-from servebench import stats  # noqa: E402
+from spark_ds41f import sonar  # noqa: E402
+
+stats = sonar.module("stats")
 
 BUDGET = 3.0  # percent, for metrics without an interval
 DISTINCT = (1, 4, 8, 16)
-C1_BOOT_FLOOR = 0.35  # percent: one boot against another (scripts/servebench_suite_table.py AA_FLOOR_PCT)
+C1_BOOT_FLOOR = 0.35  # percent: one boot against another (scripts/sonar_table.py AA_FLOOR_PCT)
 
 
 def bench(run, arm):

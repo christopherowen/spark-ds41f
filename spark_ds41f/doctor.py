@@ -132,6 +132,14 @@ def local_doctor(cluster: dict, nodes: dict, upstreams: dict) -> list[str]:
         lockfile = source.get("lockfile")
         if lockfile and not (ROOT / lockfile).is_file():
             problems.append(f"{name}: missing dependency lock {lockfile}")
+    # The benchmark client (Sonar) is the checkout's tool, pinned apart from any image's lock.
+    from . import sonar as sonar_client
+    try:
+        sonar_pin = json.loads(sonar_client.LOCK.read_text(encoding="utf-8"))
+    except (OSError, ValueError) as error:
+        problems.append(f"config/sonar.json: the benchmark client is not pinned: {error}")
+    else:
+        problems.extend(f"config/sonar.json: {problem}" for problem in sonar_client.lock_problems(sonar_pin))
     watchlist_path = ROOT / "docs/inspiration.md"
     watchlist = (
         watchlist_path.read_text(encoding="utf-8") if watchlist_path.is_file() else ""

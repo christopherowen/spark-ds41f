@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
-"""The lab table for a suite job: servebench comparisons between its arms' suite runs.
+"""The lab table for a suite job: Sonar's verdict table over its arms' suite runs.
 
-usage: scripts/servebench_suite_table.py [--suites-dir DIR] [--reference-repeat LABEL | --no-reference-repeat]
-                                         RUN LABEL [LABEL...]
+usage: scripts/sonar_table.py [--suites-dir DIR] [--reference-repeat LABEL | --no-reference-repeat]
+                              RUN LABEL [LABEL...]
 
 Arms run candidate first (heat soak), then the reference, then the candidate again. With
 two or more arms, the second arm is the reference: it is compared against every other arm,
@@ -10,15 +10,19 @@ and the first against the last as the run's own repeat. A LABEL with a "/" is a 
 suite run, repository-relative (a release's manifests/suites/<name>): a released build's
 numbers never change, so the reference is read from its record instead of measured again.
 
-The verdict block judges the paired decode row (servebench's per-request pairs) and the
+The verdict block judges the paired decode row (Sonar's per-request pairs) and the
 engine grid's geometric mean against recorded A/A floors (``floors_for``: by testbed and
 suite where enough repeats were recorded, else the defaults), over both candidate boots;
 the other headline rows keep the run's own repeat. When the reference has a repeat boot
 (``reference_repeat``: an arm or record named ``<reference>-again``, or
 ``<reference>-again-<suite>`` for a companion's record, or ``--reference-repeat``), every
 headline row is the mean over both reference boots and both candidate boots, and the boot
-term shrinks to x0.707 of one pair's (servebench.suite.boot_term). Rows a step follow, one
+term shrinks to x0.707 of one pair's (sonar.suite.boot_term). Rows a step follow, one
 line per arm and closed-loop step.
+
+Sonar computes and prints the table (``sonar table``); what is this deployment's stays here:
+where its arms' runs live, how a reference's repeat is named, and the A/A floors its testbeds
+recorded.
 """
 import argparse
 import json
@@ -28,8 +32,7 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 
-from servebench import suite  # noqa: E402
-from servebench.__main__ import compare_results, main, read_json  # noqa: E402
+from spark_ds41f import sonar  # noqa: E402
 
 # The 95% bound of one boot against another, in % (1.96 x the sd of A/A changes), by
 # suite step: the "X -> X-again" pairs of 2026-10-15 to 10-25 (release, single-stream and
@@ -143,7 +146,7 @@ def floors_for(index: dict) -> tuple[dict, str]:
     where = f"floors ({testbed or 'testbed not recorded'}, {name}): "
     if not parts:
         return floors, where + "no step of this suite takes a recorded floor"
-    source = (f"; same-build pairs of {FLOORS_DATE}, servebench_suite_table.FLOORS" if own or kept
+    source = (f"; same-build pairs of {FLOORS_DATE}, sonar_table.FLOORS" if own or kept
               else "; the recorded defaults")
     return floors, where + "; ".join(parts) + source
 
@@ -227,32 +230,43 @@ def reference_repeat(run: str, labels: list[str], suites_dir: Path | None = None
     return None, why
 
 
+def resolved_repeat(run: str, labels: list[str], suites_dir: Path | None = None,
+                    repeat_of_reference: str | None = None, average_reference: bool = True
+                    ) -> tuple[str | None, str | None]:
+    """The reference repeat the verdicts average, and why a named one is not used."""
+    if len(labels) < 3 or not average_reference:
+        return None, None
+    return reference_repeat(run, labels, suites_dir, repeat_of_reference)
+
+
 def verdicts(run: str, labels: list[str], suites_dir: Path | None = None, repeat_of_reference: str | None = None,
              average_reference: bool = True) -> str:
     """The verdict block: reference -> candidate, judged against the candidate's own repeat
     (and the reference's, when it has one) and the recorded floors."""
-    judge = lambda b, c: compare_results(b, c, 3.0)
+    main = sonar.module("sonar.__main__")
+    verdict = sonar.module("sonar.verdict")
     at = lambda label: directory(run, label, suites_dir)
-    candidate, reference, again = labels[0], labels[1], labels[-1]
-    reference_to_candidate = suite.compare(read_json, at(reference), at(candidate), judge)
-    repeat = suite.compare(read_json, at(candidate), at(again), judge)
-    reference_to_repeat = suite.compare(read_json, at(reference), at(again), judge)
-    floors, note = floors_for(suite_index(at(candidate)) or {})
-    extra, warning = {}, None
-    second = None
-    if average_reference:
-        second, warning = reference_repeat(run, labels, suites_dir, repeat_of_reference)
-    if second:
-        extra = {"reference_repeat": suite.compare(read_json, at(reference), at(second), judge),
-                 "reference_again_to_candidate": suite.compare(read_json, at(second), at(candidate), judge),
-                 "reference_again_to_repeat": suite.compare(read_json, at(second), at(again), judge)}
-    rows = suite.with_floor(reference_to_candidate, repeat, floors=floors, reference_to_repeat=reference_to_repeat,
-                            **extra)
-    text = suite.format_floor(rows, name(reference), candidate, again,
-                              reference_repeat=name(second) if second else None, floors_note=note)
+    floors, note = floors_for(suite_index(at(labels[0])) or {})
+    second, warning = resolved_repeat(run, labels, suites_dir, repeat_of_reference, average_reference)
+    text = verdict.verdicts([at(label) for label in labels], [name(label) for label in labels], floors,
+                            main.compare_results, main.read_json,
+                            reference_repeat=(at(second), name(second)) if second else None, floors_note=note)
     if warning:
         text = text.replace("\n", f"\n{warning}\n", 1)
     return text
+
+
+def table(run: str, labels: list[str], suites_dir: Path | None = None, repeat_of_reference: str | None = None,
+          average_reference: bool = True) -> None:
+    """The whole table: verdicts, rows a step, and every pair's comparison."""
+    main = sonar.module("sonar.__main__")
+    verdict = sonar.module("sonar.verdict")
+    at = lambda label: directory(run, label, suites_dir)
+    floors, note = floors_for(suite_index(at(labels[0])) or {}) if labels else ({}, None)
+    second, warning = resolved_repeat(run, labels, suites_dir, repeat_of_reference, average_reference)
+    verdict.table([at(label) for label in labels], [name(label) for label in labels], floors,
+                  main.compare_results, main.read_json, main.main,
+                  reference_repeat=(at(second), name(second)) if second else None, floors_note=note, warning=warning)
 
 
 def parse(argv: list[str]) -> argparse.Namespace:
@@ -270,17 +284,6 @@ def parse(argv: list[str]) -> argparse.Namespace:
 
 if __name__ == "__main__":
     args = parse(sys.argv[1:])
-    run, labels = args.run, args.labels
-    second = None
-    if len(labels) > 2:
-        # The verdict first: reference -> candidate, judged against the candidate's own repeat.
-        print(verdicts(run, labels, args.suites_dir, args.reference_repeat, not args.no_reference_repeat))
-        if not args.no_reference_repeat:
-            second = reference_repeat(run, labels, args.suites_dir, args.reference_repeat)[0]
-    if labels:
-        shown = labels + ([second] if second and second not in labels else [])
-        print("\n" + suite.format_accounting({name(label): suite.step_accounting(read_json, directory(run, label, args.suites_dir))
-                                              for label in shown}))
-    for base, candidate in pairs(labels, second):
-        print(f"\n######## {name(base)} -> {name(candidate)}", flush=True)
-        main(["compare", directory(run, base, args.suites_dir), directory(run, candidate, args.suites_dir)])
+    import os
+    os.environ.update(sonar.environment())
+    table(args.run, args.labels, args.suites_dir, args.reference_repeat, not args.no_reference_repeat)
