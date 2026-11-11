@@ -297,10 +297,9 @@ class CudaToolkitTest(unittest.TestCase):
         self.assertEqual({k: v for k, v in toolkit.items() if k != "cuda_toolkit"}, plain)
         self.assertEqual(spark.build_contexts(toolkit), (*spark.build_contexts(plain), "cuda-toolkit-debs"))
         debs = toolkit["cuda_toolkit"]["debs"]
-        self.assertEqual(len(debs), 21)
+        self.assertEqual(len(debs), 23)
         self.assertEqual(debs["cuda-nvcc-13-5_13.5.37-1_arm64.deb"]["version"], "13.5.37-1")
-        # cuBLAS stays the base image's 13.1.1.3 (owner, 2026-11-12).
-        self.assertFalse([name for name in debs if name.startswith("libcublas")])
+        self.assertEqual(debs["libcublas-13-5_13.10.0.20-1_arm64.deb"]["size"], 528950246)
         for name in ("cuda-toolkit-config-common", "cuda-toolkit-13-config-common"):
             self.assertIn(f"{name}_13.5.37-1_all.deb", debs)
         # A changed package moves the build directory.

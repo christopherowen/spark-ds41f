@@ -12,7 +12,7 @@ release-qualified.
 | #1096 | B12X removed: no B12X source in the lock, no B12X import on DS4.1 runtime or loader paths, its startup rounds skipped | vLLM `0802` (rebased on candidate-54 and #1134) |
 | #989 | sparknet: one persistent multi-stage kernel per collective, 8 thread blocks, no single-slot cap, so SP prefill collectives up to 16 MiB stay on sparknet | sparknet `0002` |
 | #982 | sparknet: PDL chaining of the four one-shot collectives (Part A) | sparknet `0003` (re-placed in #989's stage loop); vLLM `0803` (its PDL-chain test entry) |
-| #974 | CUDA 13.5.37 toolchain (nvcc/ptxas, cudart). Its cuBLASLt 13.10.0.20 upgrade is left out (owner, 2026-11-12), so cuBLAS stays the base image's 13.1.1.3 | `sources.cuda_toolkit` in this lock (hash-locked debs) |
+| #974 | CUDA 13.5.37 toolchain (nvcc/ptxas, cudart) and cuBLASLt 13.10.0.20 | `sources.cuda_toolkit` in this lock (hash-locked debs) |
 
 ## Selection
 
@@ -52,10 +52,10 @@ release-qualified.
 - sparknet ([sparknet/series](sparknet/series)) on `1fd6a1fb`: `0001` (#1134), `0002` (#989), `0003` (#982 Part A,
   [receipts/sparknet-stack](receipts/sparknet-stack/README.md)). `patch_head` `1fdf8dc7`, `expected_tree` `e06f6a06`,
   `patchset_sha256` `60bb1942`.
-- No B12X source. CUDA 13.5.37 through `sources.cuda_toolkit` ([requirements/cuda-13-5-sbsa.txt](../../../requirements/cuda-13-5-sbsa.txt), 21
-  debs, 0.40 GB, without #974's two cuBLAS packages). Every other source is candidate-54's.
+- No B12X source. CUDA 13.5.37 through `sources.cuda_toolkit` ([requirements/cuda-13-5-sbsa.txt](../../../requirements/cuda-13-5-sbsa.txt), 23
+  debs, 1.51 GB). Every other source is candidate-54's.
 - Recorded by `bin/spark build prepare --lock` on dgx4 for both locks (the same vLLM and sparknet trees), the heads
-  copied into each `upstreams.lock.json`; the debs downloaded and verified against the lockfile there. Recorded
+  copied into each `upstreams.lock.json`; the 23 debs downloaded and verified against the lockfile there. Recorded
   again for #1134 at `37a7f0ac`: the vLLM tree is `ed91c273`, the same tree a replay on dgx3 gives. The
   provenance, SHA-256 and author of each patch are in [receipts/selection.json](receipts/selection.json).
 - **What #1096 changes on the serving path:** one TileLang kernel, `engram_resident_lookup_kernel`, whose row bound
@@ -66,14 +66,14 @@ release-qualified.
 
 [no974/](no974) is the same series and sources without `sources.cuda_toolkit`: image
 `spark-ds41f:candidate-55-no974`, on CUDA 13.0.2. #974 very likely changes temperature-0 output (new SASS from ptxas
-13.5), so candidate-55's gate alone cannot show that the other four PRs leave outputs
+13.5, other cuBLASLt algorithms), so candidate-55's gate alone cannot show that the other four PRs leave outputs
 unchanged. The control can: it must give candidate-54's TP4 hashes `18d61961`/`d6568649`.
 
 ## Marks, declared before the build
 
 | PR | Own mark | Serving |
 | --- | --- | --- |
-| #974 | Its sp6 study (`experiments/2026-11-08-cuda-13-5-compiler-cublaslt`) on sp8, candidate-55 against the control, 2 boots each: the `sm_121a` `LDGSTS.E.64` encoding fix (outputs bit-equal on `down_384x576_evict_first`), and the dense MXFP8 kernels faster beyond the interval. Its cuBLASLt half is gone with the cuBLAS upgrade: DS4.1 serving sends almost nothing through cuBLAS (3 kernels, 0.004 ms of a 46.8 ms decode step on 2026-10-24) | candidate-55 against the control at `tp4-ring`: grid, c16 and prefill not worse |
+| #974 | Its sp6 study (`experiments/2026-11-08-cuda-13-5-compiler-cublaslt`) on sp8, candidate-55 against the control, 2 boots each: the `sm_121a` `LDGSTS.E.64` encoding fix (outputs bit-equal on `down_384x576_evict_first`), and the dense MXFP8 kernels and cuBLASLt FP8/BF16 matmuls faster beyond the interval | candidate-55 against the control at `tp4-ring`: grid, c16 and prefill not worse |
 | #1134 | Its 8-boot `ABBAABBA` single-GPU screen on sp8 (`bench_one_boot.py`): boot-to-boot spread of the target forward lower and its mean not slower, the control against candidate-54's image | Every boot reaches ready (no memory-floor halt from the 10 GiB `MemAvailable` floor); the screens' two boots no further apart than candidate-54's |
 | #1096 | Its release-test selection passes; no B12X module is imported at startup | Inert: the control's gate gives candidate-54's hashes; time to ready not worse (three startup RPC rounds skipped) |
 | #989 | Its `bench_pipelined_collectives.py` on sp1..sp4 (TP4) and sp1..sp3 (TP3): collectives of 4-16 MiB faster than PyNCCL beyond the interval, outputs bit-exact | Prefill at 32K and 256K not worse at `tp4-ring` and `tp4-switched` |

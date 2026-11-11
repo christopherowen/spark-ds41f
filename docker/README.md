@@ -137,11 +137,11 @@ A lock that lists the toolkit builds with CUDA 13.5:
 ```
 
 - `requirements/cuda-13-5-sbsa.txt` lists every package the stage installs, one
-  `package=version filename size sha256:<hex>` line each: the 19 toolchain and runtime
-  packages (`cuda-nvcc-13-5` 13.5.37-1, `cuda-cudart-13-5` 13.5.37-1, ...) and
-  `cuda-toolkit-config-common` and `cuda-toolkit-13-config-common` at 13.5.37-1, which
-  they need upgraded from the base image's 13.0.96-1. It does not list cuBLAS (owner,
-  2026-11-12): the image keeps the base image's 13.1.1.3. `version` must be one the Dockerfile has a stage for
+  `package=version filename size sha256:<hex>` line each: the 21 toolchain, runtime and
+  math-library packages (`cuda-nvcc-13-5` 13.5.37-1, `cuda-cudart-13-5` 13.5.37-1,
+  `libcublas-13-5` 13.10.0.20-1, ...) and `cuda-toolkit-config-common` and
+  `cuda-toolkit-13-config-common` at 13.5.37-1, which they need upgraded from the base
+  image's 13.0.96-1. `version` must be one the Dockerfile has a stage for
   (`CUDA_TOOLKIT_STAGES` in `spark_ds41f/build.py`: only 13.5.37), and the lockfile must
   list its `cuda-nvcc` at that version; `bin/spark doctor` and every build command
   refuse a malformed entry or lockfile.
@@ -156,17 +156,12 @@ A lock that lists the toolkit builds with CUDA 13.5:
   `nvcc.profile`'s `TOP` and the pip `nvidia/cu13` `bin`, `nvvm` and libraries (which
   `libtorch_cuda.so`'s `DT_RPATH` and `cuda.pathfinder` search ahead of
   `/usr/local/cuda`) to `/usr/local/cuda-13.5` with `/usr/local/sbin/spark-wire-cuda-13-5`,
-  and sets `CUDA_HOME`, `PATH`, `LD_LIBRARY_PATH` and the CUDA version variables. The
-  same script links every file of the base image's `libcublas-13-0` and
-  `libcublas-dev-13-0` packages into the 13.5 tree, where CMake and torch's extensions
-  look for cuBLAS. The pip `nvidia/cu13` cuBLAS libraries, which torch loads, are left
-  as they are.
+  and sets `CUDA_HOME`, `PATH`, `LD_LIBRARY_PATH` and the CUDA version variables.
   `runtime-core-cuda-13-5` runs the wiring again after `runtime-core`'s CuTe DSL wheel
   reinstall, checks `nvcc`/`ptxas` 13.5.37 (also as `cuda.pathfinder` finds them),
-  `libcublasLt` 130101 (13.1.1.3) through both paths, the `nvidia/cu13` libraries and
-  `libcudart` 13050. It labels the image `local.spark-ds41f.cuda.version=13.5.37`, which
-  `build image --apply` checks, and `local.spark-ds41f.cuda.cublas.version=13.1.1.3`.
-  The B12X and TileLang runtimes build on it.
+  `libcublasLt` 131000 through both paths, the `nvidia/cu13` libraries and `libcudart`
+  13050, and labels the image `local.spark-ds41f.cuda.version=13.5.37`, which
+  `build image --apply` checks; the B12X and TileLang runtimes build on it.
 
 To refresh the lockfile, list what apt would install in the base image (no payload is
 downloaded) and take each file's size and SHA-256 from the repository's signed index:
