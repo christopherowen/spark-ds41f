@@ -18,7 +18,7 @@ import spark_ds41f as spark
 from spark_ds41f import lab
 from spark_ds41f import sonar
 
-suite = sonar.module("suite")  # servebench's suite module, now Sonar's
+suite = sonar.module("suite")
 
 HOLDER = "spark-lab: owner-authorized lossless memory qualification"
 STREAM_POLICY = "recorded-1030"

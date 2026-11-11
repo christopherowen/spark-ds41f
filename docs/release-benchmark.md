@@ -449,8 +449,10 @@ same boot; r6x also ran `sampled` (added 2026-10-18), which the example below in
 `sampled` measures draft acceptance under sampling. Suite definitions are data in
 [config/suites/](../config/suites/); a changed suite is a new suite. Sonar runs them
 ([config/sonar.json](../config/sonar.json) pins it; `bin/spark sonar suites` lists its own
-built-in suites, which this deployment does not use for releases). The files moved here from
-`servebench/suites/` unchanged, so their digests are the recorded references' own.
+built-in suites, which this deployment does not use for releases). They are the definitions
+the recorded references ran, unchanged, so their digests are the references' own; results
+recorded before Sonar name their schemas otherwise, and `spark_ds41f/sonar.py` maps those names
+to Sonar's.
 
 ### With the lab (the usual way)
 

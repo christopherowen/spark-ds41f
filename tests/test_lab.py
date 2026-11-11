@@ -728,10 +728,7 @@ class PlanProblemsTest(unittest.TestCase):
         spec["jobs"][0]["arms"].append({"config": "missing.json", "label": "b"})
         problems = lab.plan_problems(lab.plan(spec))
         self.assertTrue(any("sonar_run.py" in p and "invalid choice" in p for p in problems), problems)
-        self.assertTrue(any("no_such_script.py does not exist" in p for p in problems), problems)
-        retired = self.measure([["scripts/servebench_run.py", ["--mode", "closed"], "c16"]])
-        self.assertIn("script scripts/servebench_run.py does not exist; Sonar's scripts/sonar_run.py replaced it",
-                      lab.plan_problems(lab.plan(retired)))
+
         self.assertTrue(any("no_such_script.py does not exist" in p for p in problems), problems)
         self.assertTrue(any("missing.json does not exist" in p for p in problems), problems)
 

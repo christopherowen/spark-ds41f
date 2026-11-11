@@ -44,15 +44,28 @@ REASONING_OFF_JSON = json.dumps(REASONING_OFF)
 # identity as client_stream_policy) and Sonar's.
 STREAM_POLICY_ENV = "SPARK_DS41F_BENCH_STREAM_POLICY"
 STREAM_POLICIES = {"current": "current", "recorded-1030": "text-chunks"}
-# servebench's model barrier read this; Sonar's reads SONAR_MODEL_CONTRACT with a contract of
-# its own format. A run that still sets the old name is refused rather than run unguarded.
+# The model barrier's variable before Sonar; Sonar's barrier reads SONAR_MODEL_CONTRACT with a
+# contract of its own format. A run that still sets the old name is refused, not run unguarded.
 LEGACY_CONTRACT_ENV = "SPARK_DS41F_SUITE_MODEL_CONTRACT"
+# The schema names this repository's results were recorded under before Sonar (every run in
+# manifests/suites/ and manifests/benchmarks/ through 1107): the same formats as Sonar's, so
+# Sonar reads them as its own (sonar.add_schema_aliases; SONAR_SCHEMA_ALIASES for children).
+RECORDED_SCHEMAS = {
+    "servebench/1": "sonar-run/1",
+    "servebench-engine/1": "sonar-engine/1",
+    "servebench-model/1": "sonar-model/1",
+    "servebench-prefill/1": "sonar-prefill/1",
+    "servebench-stall/1": "sonar-stall/1",
+    "servebench-suite/1": "sonar-suite/1",
+    "servebench-model-evidence/1": "sonar-model-evidence/1",
+}
+RECORDED_SCHEMAS_JSON = json.dumps(RECORDED_SCHEMAS, sort_keys=True)
 
 
 def legacy_contract_problem(env: dict | None = None) -> str | None:
     env = os.environ if env is None else env
     if env.get(LEGACY_CONTRACT_ENV) or env.get(LEGACY_CONTRACT_ENV + "_SHA256"):
-        return (f"{LEGACY_CONTRACT_ENV} is servebench's model barrier, which Sonar does not read: write a "
+        return (f"{LEGACY_CONTRACT_ENV} is the model barrier from before Sonar, which Sonar does not read: write a "
                 "sonar-model-evidence/1 contract and set SONAR_MODEL_CONTRACT and SONAR_MODEL_CONTRACT_SHA256 "
                 "(Sonar's sonar/model_evidence.py), or run the experiment at its base commit")
     return None
@@ -161,6 +174,7 @@ def module(name: str = "sonar"):
     path = str(checkout())
     if path not in sys.path:
         sys.path.insert(0, path)
+    importlib.import_module("sonar").add_schema_aliases(RECORDED_SCHEMAS)
     return importlib.import_module(name if name == "sonar" or name.startswith("sonar.") else f"sonar.{name}")
 
 
@@ -176,6 +190,7 @@ def environment(base: dict | None = None) -> dict:
     if policy not in STREAM_POLICIES:
         raise ValueError(f"unsupported stream collector policy: {policy}")
     env["SONAR_STREAM_COLLECTOR"] = STREAM_POLICIES[policy]
+    env["SONAR_SCHEMA_ALIASES"] = RECORDED_SCHEMAS_JSON
     return env
 
 

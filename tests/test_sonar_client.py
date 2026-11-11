@@ -87,8 +87,8 @@ class CheckoutTest(unittest.TestCase):
 
 class SuitesTest(unittest.TestCase):
     def test_the_current_references_are_runs_of_the_deployment_suites(self):
-        """The suites moved from servebench/suites/ unchanged: every reference a profile names
-        is still a run of its suite, so a candidate compares with it."""
+        """The suites are the definitions the recorded references ran, unchanged: every
+        reference a profile names is still a run of its suite, so a candidate compares with it."""
         suite = sonar.module("suite")
         recipe = json.loads((ROOT / "config/cluster.json").read_text())
         references = {entry.get("benchmark_reference") for entry in recipe["shapes"].values()}
@@ -99,6 +99,19 @@ class SuitesTest(unittest.TestCase):
                 index = json.loads((ROOT / (reference + companion) / "suite.json").read_text())
                 with self.subTest(reference=reference + companion):
                     self.assertEqual(suite.digest(sonar.load_suite(index["suite"]["name"])), index["suite_sha256"])
+
+    def test_recorded_results_read_as_sonar_results(self):
+        """Every reference was recorded under the schema names before Sonar; Sonar reads them as
+        its own, in-process and in the child processes bench and the table run."""
+        reference = ROOT / "manifests/suites/2026-11-07-spark-ds41f-1107-tp4-single-stream"
+        main = sonar.module("sonar.__main__")
+        recorded = main.read_json(str(reference / "c1.json"))
+        self.assertNotEqual(recorded["schema"], "sonar-run/1")
+        schema, result = main.compare_results(recorded, recorded, 3.0)
+        self.assertEqual(schema, "sonar-run/1")
+        self.assertTrue(result["rows"])
+        self.assertEqual(sonar.run("compare", str(reference), str(reference), stdout=subprocess.DEVNULL), 0)
+        self.assertEqual(json.loads(sonar.environment()["SONAR_SCHEMA_ALIASES"]), sonar.RECORDED_SCHEMAS)
 
     def test_names_resolve_to_the_deployment_files_first(self):
         self.assertEqual(sonar.suite_name("release"), str(ROOT / "config/suites/release.json"))

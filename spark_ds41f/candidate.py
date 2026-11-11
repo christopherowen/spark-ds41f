@@ -1360,7 +1360,7 @@ BOOT = re.compile(r"^\S+ boot (\S+): ready \+(\S+) s, command (\d+) s( FAILED)?"
 # kernel-cache files it added per node.
 BOOT_PROBE = re.compile(r"^\S+ boot (\S+): (?:first boot of the image on (.+?)|not the image's first boot on any node); "
                         r"kernel cache (.+) files")
-# Sonar's suite log lines; window logs written before Sonar say "servebench" instead.
+# Sonar's suite log lines; window logs recorded before Sonar name the client otherwise.
 SUITE_STEP = re.compile(r"^(?:sonar|servebench) suite (\S+): step ")
 EXIT = re.compile(r"^\S+Z (\S+) (\S+) exit (-?\d+)$")
 

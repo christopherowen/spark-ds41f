@@ -222,7 +222,7 @@ arrive:
   keep a NaN instead of hiding it; ten kernel families have non-finite contract
   tests (r6l).
 
-r6n was released on the servebench release suite. Its run
+r6n was released on the release suite. Its run
 ([manifests/suites/2026-10-15-karmic-kraken-r6n-tp4](../manifests/suites/2026-10-15-karmic-kraken-r6n-tp4/))
 was `tp4-ring`'s `benchmark_reference` until r6v. It ran release version 1; r6v's release
 recorded the first version 2 run (with the Poisson step).

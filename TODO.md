@@ -8,7 +8,7 @@ owner.
 
 ## Recent candidate decisions
 
-- **Candidate `1107`** ([`experiments/2026-10-26-spark-ds41f-candidate/1107`](experiments/2026-10-26-spark-ds41f-candidate/1107/README.md), PR [#937](https://github.com/christopherowen/spark-ds41f/pull/937)) consolidates the C45 TileLang compiler (`tilelang/0001..0013` with explicit wrapper-cache and disk-streamed IKET controls), full TileLang runtime closure (`0690..0713`, `0717`, `0752..0754`), CopyDrafter continuation priority, warp early-exit pruning and expected-yield gating against DSpark (`0744..0745`), native-depth CUDA graph retention under copy verification (`0728`), online confidence calibration (`0746`), per-layer SP WO local MXFP8 exchange (`0737`), SP Engram prefill column exchange (`0738`), TP3 6-channel NCCL Ring and sparse-MLA `block_H=16` occupancy (`0740`), 2-launch mHC PDL (`0739` + `0755`), selective pack12 KV compressor (`0749`), fused indexer `wq_b` RoPE + scale (`0748`), packed 264-byte Engram reader with multi-CTA step, hot-row cache and negative `col_delta` guard (`0750`), deep-context scheduler interleave (`0751`), tensor-parallel vision tower (`0758`), and native `TP2..TP8` cross-topology parity (`0747`). Ready for consolidated image build and full servebench qualification on `tp4-ring` and `tp3-triangle`.
+- **Candidate `1107`** ([`experiments/2026-10-26-spark-ds41f-candidate/1107`](experiments/2026-10-26-spark-ds41f-candidate/1107/README.md), PR [#937](https://github.com/christopherowen/spark-ds41f/pull/937)) consolidates the C45 TileLang compiler (`tilelang/0001..0013` with explicit wrapper-cache and disk-streamed IKET controls), full TileLang runtime closure (`0690..0713`, `0717`, `0752..0754`), CopyDrafter continuation priority, warp early-exit pruning and expected-yield gating against DSpark (`0744..0745`), native-depth CUDA graph retention under copy verification (`0728`), online confidence calibration (`0746`), per-layer SP WO local MXFP8 exchange (`0737`), SP Engram prefill column exchange (`0738`), TP3 6-channel NCCL Ring and sparse-MLA `block_H=16` occupancy (`0740`), 2-launch mHC PDL (`0739` + `0755`), selective pack12 KV compressor (`0749`), fused indexer `wq_b` RoPE + scale (`0748`), packed 264-byte Engram reader with multi-CTA step, hot-row cache and negative `col_delta` guard (`0750`), deep-context scheduler interleave (`0751`), tensor-parallel vision tower (`0758`), and native `TP2..TP8` cross-topology parity (`0747`). Ready for consolidated image build and full suite qualification on `tp4-ring` and `tp3-triangle`.
 - C39 delivered default CopyDrafter behavior, but its optional preparation-overlap
   performance claim showed no proven serving-throughput gain against either
   saved C38 recipe. Preserve the adverse engine-grid cost and original collector
@@ -71,7 +71,7 @@ Production is **spark-ds41f-1107** (`manifests/baselines/2026-11-07-spark-ds41f-
 <!-- END GENERATED: next-release-status -->
 
 Before promoting `1107`:
-1. **Build and qualify `spark-ds41f:1107`** across the full servebench release,
+1. **Build and qualify `spark-ds41f:1107`** across the full release,
    single-stream, and sampled suites on `tp4-ring` and `tp3-triangle` against
    `spark-ds41f-1030`.
 2. **Verify `dgx1` memory headroom and native-depth graph capture (`0728`)**:

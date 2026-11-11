@@ -522,7 +522,7 @@ r6k is never slower on these measures, and it is faster at eight prompts and on
 the longest prefills, while computing WO at the reference's precision. Its
 temperature-0 text differs from r6h's: scored on the same tokens, r6h agrees
 with r6k on the most likely token at 95.1% of positions, with a KL divergence of
-0.021 nats ([servebench](experiments/2026-10-14-servebench/README.md)). The
+0.021 nats ([experiment](experiments/2026-10-14-servebench/README.md)). The
 bench's single-prompt decode points follow the text and moved 9-14% either way
 with draft acceptance, so the table judges different prompts at once.
 

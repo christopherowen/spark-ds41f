@@ -1460,12 +1460,6 @@ SONAR_SHIMS = {"scripts/sonar_run.py": "run", "scripts/sonar_engine.py": "engine
                "scripts/sonar_determinism.py": "determinism", "scripts/sonar_single.py": "single",
                "scripts/sonar_ttft.py": "ttft", "scripts/sonar_mixed.py": "mixed",
                "scripts/distinct_streams.py": "streams", "scripts/acceptance_sweep.py": "acceptance"}
-# Shims that existed before Sonar, and what replaced them.
-RETIRED_SHIMS = {"scripts/servebench_run.py": "scripts/sonar_run.py",
-                 "scripts/servebench_engine.py": "scripts/sonar_engine.py",
-                 "scripts/servebench_model.py": "scripts/sonar_model.py",
-                 "scripts/servebench_suite.py": "scripts/sonar_suite.py",
-                 "scripts/servebench_suite_table.py": "scripts/sonar_table.py"}
 
 
 def sonar_parse(command: str, args: list[str]):
@@ -1513,8 +1507,7 @@ def plan_problems(steps: list[dict]) -> list[str]:
             if any(path.exists() for path in prior):
                 problems.append(f"{step['out']}: prior required evidence exists; use a distinct run")
         if not (ROOT / script).is_file():
-            replaced = RETIRED_SHIMS.get(script)
-            problems.append(f"script {script} does not exist" + (f"; Sonar's {replaced} replaced it" if replaced else ""))
+            problems.append(f"script {script} does not exist")
         elif script in SONAR_SHIMS:
             errors = io.StringIO()
             try:
