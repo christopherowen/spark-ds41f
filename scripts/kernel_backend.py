@@ -138,4 +138,12 @@ def source_problems(cluster: dict, upstreams: dict, manifest: dict) -> list[str]
                 f"kernel_backend tilelang requires container.expected_labels "
                 f"{source_labels.key(labels, f'{name}.tree')} to match its source manifest tree"
             )
+    if (
+        "b12x" not in upstreams.get("sources", {})
+        and source_labels.get(labels, "b12x.tree") is not None
+    ):
+        errors.append(
+            f"kernel_backend tilelang without b12x requires omitting "
+            f"{source_labels.key(labels, 'b12x.tree')} from container.expected_labels"
+        )
     return errors
