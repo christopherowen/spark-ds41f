@@ -86,6 +86,8 @@ def local_doctor(cluster: dict, nodes: dict, upstreams: dict) -> list[str]:
         problems.append("host.memguard_warn_gib must exceed host.memguard_gib")
     if not isinstance(host.get("fan_control", True), bool):
         problems.append("host.fan_control must be a boolean")
+    if not isinstance(host.get("defragment_before_start", True), bool):
+        problems.append("host.defragment_before_start must be a boolean")
     for key in ("memguard_interval_seconds", "startup_memguard_interval_seconds"):
         value = host.get(key)
         if (

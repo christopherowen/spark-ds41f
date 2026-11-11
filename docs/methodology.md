@@ -118,7 +118,14 @@ our 0.100 s (#503), and a change that speeds up plain decode would raise it.
 Every target-hardware startup must be fail-closed. Pre-arm the configured
 startup memory guard before each container launch, verify it remains active
 through API readiness, and reject the run on any driver allocation failure or
-guard stop. Do not repeat a coordinated launch after management-path loss until
+guard stop.
+
+Before any rank launches, `cluster start` drops clean caches and compacts memory
+on every node (`sudo -n sh -c 'sync; echo 3 > /proc/sys/vm/drop_caches; echo 1 >
+/proc/sys/vm/compact_memory'`). Cached file pages scattered through 2 MiB
+pageblocks otherwise keep weight loading from finding whole 2 MiB blocks. This is
+`host.defragment_before_start`: true by default, and a profile sets it false to
+skip. A node that refuses `sudo -n` prints a warning and starts without it. Do not repeat a coordinated launch after management-path loss until
 the failure is isolated with bounded tests and the owner explicitly authorizes
 new hardware work.
 
