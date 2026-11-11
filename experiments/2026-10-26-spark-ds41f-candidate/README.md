@@ -1078,7 +1078,9 @@ README.
 
 - **Series:** [candidate-55/vllm/series](candidate-55/vllm/series) (`0001..0803`, 676 patches; `patch_head`
   `a64a804c`, `expected_tree` `980e3812`); sparknet `0001..0003` on `1fd6a1fb` (tree `e06f6a06`).
-- **Status:** assembled; the build job is next.
+- **Status:** first build done (images `8793529c` and the control's `f870f811` on dgx1..dgx4). Its release tests
+  failed 2 DeepSeek V4 B12X attention tests that import `b12x`, now deselected. The rebuild waits for #1134's
+  corrected `0800`.
 
 ## Candidates 55-58 (removed 2026-11-11)
 
