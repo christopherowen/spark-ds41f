@@ -22,6 +22,7 @@ HISTORICAL_PROFILES = {
     "experiments/2026-10-04-tilelang-1m/diagnostics/shapes8.json",
     "experiments/2026-10-23-next-release/rc2/cluster.json",
     "experiments/2026-10-23-next-release/rc3/cluster.json",
+    "experiments/2026-10-26-spark-ds41f-candidate/candidate-56/tp4-switched-no957p1-no956.json",
 }
 
 # Early TileLang experiments whose locks pointed at the mutable root series

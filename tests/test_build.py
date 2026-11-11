@@ -88,6 +88,8 @@ class LockWithoutB12xTest(unittest.TestCase):
 
         output = io.StringIO()
         cluster = spark.read_json("config/cluster.json")
+        if "b12x" not in lock.get("sources", {}):
+            cluster["container"]["expected_labels"].pop("local.spark-ds41f.b12x.tree", None)
         with mock.patch.object(spark, "configuration", return_value=(cluster, None, lock)), \
                 mock.patch.object(spark, "build_problems", return_value=[]), \
                 mock.patch.object(spark, "repository_dirty", return_value=""), \

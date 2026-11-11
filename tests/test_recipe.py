@@ -851,5 +851,23 @@ class GLPTest(unittest.TestCase):
             )
 
 
+    def test_unset_removes_dotted_expected_label_key(self):
+        base = recipe.resolve(load("releases/spark-ds41f-1107/cluster.json"), "tp4-ring")
+        cluster = recipe.overlay(
+            {
+                "extends": {
+                    "config": "releases/spark-ds41f-1107/cluster.json",
+                    "shape": "tp4-ring",
+                },
+                "unset": ["container.expected_labels.local.spark-ds41f.b12x.tree"],
+            },
+            base,
+        )
+        self.assertNotIn(
+            "local.spark-ds41f.b12x.tree",
+            cluster["container"]["expected_labels"],
+        )
+
+
 if __name__ == "__main__":
     unittest.main()
