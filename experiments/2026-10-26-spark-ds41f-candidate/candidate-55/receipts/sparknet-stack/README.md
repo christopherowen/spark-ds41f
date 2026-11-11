@@ -7,7 +7,7 @@ sparknet `1fd6a1fb`. Every GPU command ran under `flock /tmp/spark-lab-gpu.lock`
 | Patch | Source | Commit (sp8) | Tree |
 | --- | --- | --- | --- |
 | base | sparknet `1fd6a1fb` | `1fd6a1f` | `8cc28a5c` |
-| [0001](../../sparknet/0001-perf-oneshot-pin-RoCE-proxy-thread-to-dedicated-fast.patch) | #1134 (= #1008's sparknet patch), byte-identical | `d3d5b1f` | `dab8c457` |
+| [0001](../../sparknet/0001-perf-oneshot-pin-RoCE-proxy-thread-to-dedicated-fast.patch) | #1134 (= #1008's sparknet patch): the same diff, header re-exported in this series | `d3d5b1f` | `dab8c457` |
 | [0002](../../sparknet/0002-oneshot-add-single-kernel-multi-stage-pipelined-RoCE.patch) | #989 (= dgx-spark-networking#7), `git am -3`, no conflict | `85a1ea1` | `d8010d07` |
 | [0003](../../sparknet/0003-perf-oneshot-chain-the-one-shot-collectives-with-pro.patch) | #982 Part A (= dgx-spark-networking#6), re-placed by hand | `f713f74` | `e06f6a06` |
 

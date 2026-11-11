@@ -83,3 +83,24 @@ and was in effect another with-B12X run (1,108 passed); its log is kept
 ([c55-without-b12x-attempt1-b12x-still-present.log](c55-without-b12x-attempt1-b12x-still-present.log)).
 
 Not run here: `0803`'s test, the release gate and the image build; they run on candidate-55's image.
+
+## Replayed on #1134 at `37a7f0ac`, 2026-11-11
+
+#1134's new `0800` (`retain-UMA-buddy-sponge-across-post-load`) replaces the one above. On dgx3 (same tree, branch
+`candidate-55-r2` from `15833ed1`), all four patches apply with plain `git am`, `0802` and `0803` unchanged:
+
+| State | Commit | Tree |
+| --- | --- | --- |
+| candidate-54 | `15833ed1` | `ad2dc11f` |
+| + `0800` (#1134, `37a7f0ac`) | `269ed23a` | `3825fd66` |
+| + `0801` (#1134) | `53e00d6b` | `578bc4a6` (#1134's recorded tree) |
+| + `0802` (#1096) | `6b7c1b2b` | `e35a906f` |
+| + `0803` (#982) | `dfccbaec` | `ed91c273` (the lock's, recorded on dgx4) |
+
+- **Where the patches meet:** the new `0800` and `0802` share one file, `direct_loader.py`, and there `0802`
+  changes only the module docstring.
+- **No new B12X reference:** in the six files the new `0800` changes, B12X is named only in provenance headers and
+  docstrings.
+- **Checks:** `git diff --check` is clean, and `py_compile` passes on those six files. pyflakes is not installed on
+  dgx3 or in the image, so it was not run. The release tests on the rebuilt image import and run both of `0800`'s
+  test files (gate files).
