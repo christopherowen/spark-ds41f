@@ -19,17 +19,22 @@ including cancellation and a submission failure.
 
 ## Paired results
 
-Same-image, same-boot pairs within each clock policy on switched TP8, official
-DeepSeek-V4.1-Flash-1017, disk Engram, 10.5 GiB KV per rank, and the original
-adaptive-five DSpark profile. Both arms used the same buffered endpoint and
-changed only the header. Each cell had ten counterbalanced pairs, with cold
-prefixes (zero observed prefix-cache hits), temperature 0, seed 42, and the
+There were two separate campaigns: **GPU capped at 2 GHz** and **GPU uncapped
+(stock automatic clocks)**. Ordinary and atomic admission were paired on the
+same image and boot within each campaign. The percentages compare admission
+modes at the same GPU clock policy.
+
+Both campaigns used switched TP8, official DeepSeek-V4.1-Flash-1017, disk
+Engram, 10.5 GiB KV per rank, and the original adaptive-five DSpark profile.
+Both arms used the same buffered endpoint and changed only the header. Each
+cell had ten counterbalanced pairs, with cold prefixes (zero observed
+prefix-cache hits), temperature 0, seed 42, and the
 original [code and prose prompts](../../spark_ds41f/bench.py)
 (75/68 native input tokens). All responses reached 256 native output tokens in
 reasoning. The rates include prefill, queuing, and completion of the last
 request. They do not measure time to first token or completed coding tasks.
 
-| Workload | 2 GHz ordinary → atomic tok/s | Stock ordinary → atomic tok/s |
+| Workload | GPU capped at 2 GHz: ordinary → atomic tok/s | GPU uncapped (stock automatic): ordinary → atomic tok/s |
 | --- | ---: | ---: |
 | C8 code | 529.3 → 543.3 (+2.6%) | 549.3 → 569.7 (+3.7%) |
 | C8 prose | 424.4 → 500.3 (+17.9%) | 450.5 → 526.1 (+16.8%) |
@@ -42,17 +47,17 @@ Rates are medians; percentages compare medians. Each completed campaign had
 120 timed waves and another 24 ramp/warmup waves. All 1,860 lanes per campaign
 matched the fresh single-request native token IDs and decoded text. The engine
 trace showed the intended fresh prefill shape in all 60 timed atomic waves per
-campaign. The split code case on stock clocks shows little measured gain.
+campaign. The split code case in the uncapped campaign shows little measured gain.
 
-[Results](results.json) and the [capped](runs/capped.json) and
-[stock](runs/stock.json) per-wave receipts preserve the observed group sizes,
+[Results](results.json) and the [GPU-capped](runs/capped.json) and
+[GPU-uncapped](runs/stock.json) per-wave receipts preserve the observed group sizes,
 native token totals, rates, and trace counts. The
-[first stock attempt](runs/stock-incomplete.json) stopped when 11 of 16 lanes in
+[first GPU-uncapped attempt](runs/stock-incomplete.json) stopped when 11 of 16 lanes in
 an ordinary 8+8 prose wave diverged from the exact reference. It retained 113
-passing timed waves, the divergent wave, and six unrun waves. The subsequent complete
-run does not establish the cause. Whole-window minimum available RAM was 38.03
-GiB capped and 38.09 GiB stock; no OOM counter increase was observed. The capped
-run had a swap I/O delta.
+passing timed waves, the divergent wave, and six unrun waves. The subsequent
+complete run does not establish the cause. Whole-window minimum available RAM
+was 38.03 GiB capped and 38.09 GiB uncapped; no OOM counter increase was
+observed. The capped run had a swap I/O delta.
 
 ## Reproduction and status
 
