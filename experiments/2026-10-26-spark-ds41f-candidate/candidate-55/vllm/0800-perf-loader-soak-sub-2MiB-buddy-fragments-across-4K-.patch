@@ -1,0 +1,374 @@
+From 80622eaedbd75582f2483988c466f530674c6538 Mon Sep 17 00:00:00 2001
+From: Christopher Owen <3221756+christopherowen@users.noreply.github.com>
+Date: Wed, 11 Nov 2026 15:15:00 +0000
+Subject: [PATCH 1/2] perf(loader): soak sub-2MiB buddy fragments across 4K and
+ 64K UMA kernels
+
+Upstream base: local-inference-lab/vllm 19f2c20ed4d64ae22bd009ceacadd85e2a81e354 (after candidate-54 0799).
+
+Rationale:
+In nvidia.ko (nv_alloc_system_pages), non-contiguous system-memory cuMemCreate allocations satisfy 20 MiB segments by draining smaller free physical buddy orders from 64 KiB upward (64K -> 128K -> 256K -> 512K -> 1M) before touching >= 2 MiB contiguous blocks. On GB10 (SM121, 24 MiB physically-indexed L2), scattered 64 KiB..256 KiB physical fragments self-conflict across L2 cache slices during 15-20 MiB decode L2 weight prefetches (+12-13% slower than >= 2 MiB contiguous blocks). Previously, _allocate_order13_sponge returned empty on all 4 KiB-page kernels and on 64 KiB-page kernels whenever 512 MiB (Order-13) blocks reached 0, and budgeted free memory from cudaMemGetInfo (MemFree) instead of UMA /proc/meminfo MemAvailable.
+
+Changes:
+- Generalize direct_loader.py buddy sponge across both 4 KiB and 64 KiB base page sizes (parse_buddyinfo_blocks, select_buddy_sponge_target, _available_uma_or_gpu_bytes): soak >= 64 KiB sub-2 MiB buddy fragments (or < 512 MiB when Order-13 blocks exist) bounded by UMA MemAvailable with a 10 GiB untouched floor so both the contiguous weight arena and MoE expert slabs draw directly from >= 2 MiB contiguous physical blocks on the first allocation, then release the sponge immediately.
+- Bind contiguous weight arenas in DummyModelLoader.create_model on CUDA and zero non-floating-point dummy parameters on CUDA in initialize_single_dummy_weight.
+
+Quality implications:
+None. Weight values, dtypes, and kernel arithmetic are bit-identical.
+
+Tests:
+- pytest tests/model_executor/model_loader/test_direct_loader.py tests/model_executor/model_loader/test_direct_loader_cuda.py (88 passed on GB10).
+
+Upstream status: spark-ds41f local candidate patch.
+---
+ .../model_loader/test_direct_loader.py        |  25 +++
+ .../model_loader/test_direct_loader_cuda.py   |  33 ++++
+ .../model_loader/direct_loader.py             | 169 ++++++++++++++++--
+ .../model_loader/dummy_loader.py              |  17 ++
+ .../model_loader/weight_utils.py              |   8 +-
+ 5 files changed, 230 insertions(+), 22 deletions(-)
+
+diff --git a/tests/model_executor/model_loader/test_direct_loader.py b/tests/model_executor/model_loader/test_direct_loader.py
+index 6c378e977..2ab1e3897 100644
+--- a/tests/model_executor/model_loader/test_direct_loader.py
++++ b/tests/model_executor/model_loader/test_direct_loader.py
+@@ -706,3 +706,28 @@ def test_prebuilt_native_helpers_resolve_without_compiler(tmp_path, monkeypatch)
+         expected.parent.mkdir(parents=True, exist_ok=True)
+         expected.write_bytes(b"\x7fELFprebuilt")
+         assert mod._build() == expected
++
++
++def test_select_buddy_sponge_target_covers_both_4k_and_64k_kernels():
++    # 1. 4 KiB kernel (e.g. sp1..sp8): orders 0..3 (<64K) ignored, orders 4..8 (64K..1M) soaked so order 9+ (2M+) serves weights.
++    buddy_4k = (
++        "Node 0, zone   Normal   1000 500 200 100  512 256 128 64 32  400 10 0 0 0\n"
++    )
++    target, sub_b, high_b = direct_loader.select_buddy_sponge_target(
++        buddy_4k, required_bytes=512 << 20, page_bytes=4096
++    )
++    assert target == 2 << 20
++    # 512*64K + 256*128K + 128*256K + 64*512K + 32*1M = 5 * 32 MiB = 160 MiB (orders 0..3 excluded!)
++    assert sub_b == 160 << 20
++    assert high_b == (400 * (2 << 20)) + (10 * (4 << 20))
++
++    # 2. 64 KiB kernel with Order 13 depleted (e.g. dgx1..dgx4 after uptime): falls back to >= 2 MiB (Order 5+).
++    buddy_64k_no13 = (
++        "Node 0, zone   Normal     32 16 0 0 0 200 50 0 0 0 0 0 0 0\n"
++    )
++    target64, sub64, high64 = direct_loader.select_buddy_sponge_target(
++        buddy_64k_no13, required_bytes=512 << 20, page_bytes=65536
++    )
++    assert target64 == 2 << 20
++    assert sub64 == (32 * 65536) + (16 * 131072)
++    assert high64 == (200 * (2 << 20)) + (50 * (4 << 20))
+diff --git a/tests/model_executor/model_loader/test_direct_loader_cuda.py b/tests/model_executor/model_loader/test_direct_loader_cuda.py
+index 4517a83cc..8e75f35c0 100644
+--- a/tests/model_executor/model_loader/test_direct_loader_cuda.py
++++ b/tests/model_executor/model_loader/test_direct_loader_cuda.py
+@@ -670,3 +670,36 @@ def test_padded_2d_destinations_batch_strided_rows_and_detect_overlaps(tmp_path)
+         with pytest.raises(RuntimeError, match="overlapping batch destinations"):
+             session.flush()
+     assert torch.count_nonzero(overlap_target) == 0
++
++
++def test_buddy_hugepage_sponge_on_4k_and_64k_and_dummy_zeroing(tmp_path):
++    from vllm.model_executor.model_loader.weight_utils import (
++        initialize_single_dummy_weight,
++    )
++
++    packed = torch.full((256, 64), 173, dtype=torch.uint8, device="cuda")
++    initialize_single_dummy_weight(packed)
++    assert int(packed.max().item()) == 0
++
++    # Verify 4 KiB kernel sponge soaks orders 4..8 (64K..1M) and leaves zero leaked memory after clear().
++    buddy_4k = tmp_path / "buddy_4k"
++    buddy_4k.write_text(
++        "Node 0, zone   Normal   100 50 20 10  64 0 0 0 0  64 0 0 0 0\n",
++        encoding="utf-8",
++    )
++    torch.cuda.synchronize()
++    torch.cuda.empty_cache()
++    before_alloc = torch.cuda.memory_allocated()
++    sponge = direct_loader._allocate_order13_sponge(
++        torch.device("cuda"),
++        required_bytes=4 << 20,
++        buddyinfo_path=buddy_4k,
++        page_bytes=4096,
++        headroom_bytes=0,
++        chunk_bytes=2 << 20,
++    )
++    # 64 * 64 KiB = 4 MiB sub-2M + 1 extra 2 MiB margin chunk = 3 chunks of 2 MiB
++    assert len(sponge) == 3
++    sponge.clear()
++    torch.cuda.empty_cache()
++    assert torch.cuda.memory_allocated() == before_alloc
+diff --git a/vllm/model_executor/model_loader/direct_loader.py b/vllm/model_executor/model_loader/direct_loader.py
+index 24ec1f48e..f7cb50712 100644
+--- a/vllm/model_executor/model_loader/direct_loader.py
++++ b/vllm/model_executor/model_loader/direct_loader.py
+@@ -66,8 +66,11 @@ _ARENA_ALIGN_BYTES = 256
+ _PRESERVE_STORAGE_MAX_BYTES = 1 << 20
+ _TOUCH_STRIDE_BYTES = 1 << 21
+ _SPONGE_CHUNK_BYTES = 1 << 27
+-_SPONGE_HEADROOM_BYTES = 4 << 30
+-_SPONGE_MIN_MODEL_BYTES = 1 << 30
++_SPONGE_MIN_CHUNK_BYTES = 1 << 21
++_SPONGE_HEADROOM_BYTES = 10 << 30
++_SPONGE_MIN_MODEL_BYTES = 256 << 20
++_NVIDIA_MIN_SYS_ALLOC_BYTES = 65536
++_GPU_HUGEPAGE_BYTES = 1 << 21
+ 
+ 
+ def _align_up(value: int, alignment: int) -> int:
+@@ -108,45 +111,168 @@ def parse_buddyinfo_order13(
+     return sub_order13, order13_plus
+ 
+ 
++def parse_buddyinfo_blocks(
++    text: str, page_bytes: int | None = None
++) -> dict[int, int]:
++    """Return ``{block_size_bytes: total_free_bytes}`` across all zones in
++    ``/proc/buddyinfo`` for any base OS page size (both 4 KiB and 64 KiB)."""
++    if page_bytes is None:
++        try:
++            page_bytes = os.sysconf("SC_PAGE_SIZE")
++        except (AttributeError, OSError, ValueError):
++            return {}
++    if page_bytes <= 0:
++        return {}
++    blocks: dict[int, int] = {}
++    for line in text.splitlines():
++        parts = line.split()
++        if len(parts) <= 4 or parts[0] != "Node" or parts[2] != "zone":
++            continue
++        for order, raw in enumerate(parts[4:]):
++            try:
++                count = int(raw)
++            except ValueError:
++                continue
++            if count <= 0:
++                continue
++            bsz = page_bytes << order
++            blocks[bsz] = blocks.get(bsz, 0) + count * bsz
++    return blocks
++
++
++def select_buddy_sponge_target(
++    text: str,
++    *,
++    required_bytes: int,
++    page_bytes: int | None = None,
++    min_alloc_bytes: int = _NVIDIA_MIN_SYS_ALLOC_BYTES,
++) -> tuple[int, int, int]:
++    """Choose ``(target_block_bytes, sub_target_bytes, at_or_above_target_bytes)``.
++
++    ``nvidia.ko`` (`nv_alloc_system_pages`) satisfies `cuMemCreate` allocations on
++    UMA by draining smaller buddy orders from ``64 KiB`` upward before splitting
++    ``>= 2 MiB`` physical blocks. Low-order ``64 KiB .. 256 KiB`` physical fragments
++    self-conflict across GB10's physically-indexed 24 MiB L2 slices (+12-13% slower
++    prefetched GEMMs vs ``>= 2 MiB`` contiguous blocks).
++
++    1. On 64 KiB kernels with ample ``512 MiB`` (`Order 13`) blocks, target ``512 MiB``.
++    2. Otherwise, pick the highest block size in ``(2 MiB, 1 MiB, 512 KiB)`` whose
++       cumulative free bytes at or above that order cover ``min(required_bytes, 512 MiB)``,
++       counting only ``>= 64 KiB`` blocks in ``sub_target_bytes`` (the orders ``nvidia.ko``
++       consumes ahead of the target).
++    """
++    sub13, ord13 = parse_buddyinfo_order13(text, page_bytes=page_bytes)
++    if ord13 >= max(required_bytes, _SPONGE_CHUNK_BYTES) and sub13 > 0:
++        return 65536 << 13, sub13, ord13
++
++    blocks = parse_buddyinfo_blocks(text, page_bytes=page_bytes)
++    if not blocks:
++        return 0, 0, 0
++
++    min_high_needed = min(max(required_bytes // 4, _GPU_HUGEPAGE_BYTES), 512 << 20)
++    for target_bsz in (_GPU_HUGEPAGE_BYTES, 1 << 20, 512 << 10):
++        high_bytes = sum(tot for bsz, tot in blocks.items() if bsz >= target_bsz)
++        sub_bytes = sum(
++            tot for bsz, tot in blocks.items() if min_alloc_bytes <= bsz < target_bsz
++        )
++        if high_bytes >= min_high_needed and sub_bytes > 0:
++            return target_bsz, sub_bytes, high_bytes
++    return 0, 0, 0
++
++
++def _available_uma_or_gpu_bytes(
++    device: torch.device,
++    *,
++    meminfo_path: Path | None = Path("/proc/meminfo"),
++) -> int:
++    """Return usable free bytes before KV allocation.
++
++    On integrated UMA GPUs (GB10), ``cudaMemGetInfo`` reports ``MemFree`` and omits
++    reclaimable clean VFS page cache, underreporting usable memory by tens of GiB
++    compared to ``/proc/meminfo`` ``MemAvailable`` (the metric vLLM's ``MemorySnapshot``
++    and ``memguard`` enforce).
++    """
++    gpu_free = 0
++    try:
++        gpu_free, _ = torch.accelerator.get_memory_info(device)
++    except Exception:  # noqa: BLE001
++        gpu_free = 0
++    if meminfo_path is not None:
++        try:
++            if capabilities(device.index or 0).get("integrated", 0):
++                for line in meminfo_path.read_text(encoding="utf-8").splitlines():
++                    if line.startswith("MemAvailable:"):
++                        avail_kib = int(line.split()[1])
++                        return max(gpu_free, avail_kib * 1024)
++        except Exception:  # noqa: BLE001
++            pass
++    return gpu_free
++
++
+ def _allocate_order13_sponge(
+     device: torch.device,
+     *,
+     required_bytes: int,
+     buddyinfo_path: Path = Path("/proc/buddyinfo"),
++    meminfo_path: Path | None = None,
+     page_bytes: int | None = None,
+     headroom_bytes: int = _SPONGE_HEADROOM_BYTES,
+     chunk_bytes: int = _SPONGE_CHUNK_BYTES,
+ ) -> list[torch.Tensor]:
+-    """Temporarily soak ``< 512 MiB`` buddy blocks so subsequent model weight
+-    allocations draw from ``Order 13`` (``512 MiB``) blocks first."""
++    """Temporarily soak fragmented sub-hugepage buddy blocks (``64 KiB .. 1 MiB``,
++    or ``< 512 MiB`` when Order-13 blocks exist) so subsequent model weight arena
++    allocations draw directly from ``>= 2 MiB`` (or ``512 MiB``) contiguous physical
++    blocks on both 4 KiB and 64 KiB kernels."""
+     try:
+-        text = buddyinfo_path.read_text()
++        text = buddyinfo_path.read_text(encoding="utf-8")
+     except OSError:
+         return []
+-    sub_order13_bytes, order13_bytes = parse_buddyinfo_order13(
+-        text, page_bytes=page_bytes
++    target_bsz, sub_target_bytes, high_target_bytes = select_buddy_sponge_target(
++        text, required_bytes=required_bytes, page_bytes=page_bytes
+     )
+-    if sub_order13_bytes < chunk_bytes or order13_bytes < chunk_bytes:
++    if target_bsz == 0:
+         return []
+-    try:
+-        free_gpu_bytes, _ = torch.accelerator.get_memory_info(device)
+-    except Exception:
++    eff_chunk = min(chunk_bytes, max(_SPONGE_MIN_CHUNK_BYTES, sub_target_bytes))
++    # Round eff_chunk down to 2 MiB multiple so PyTorch expandable_segments maps clean handles.
++    eff_chunk = max(_SPONGE_MIN_CHUNK_BYTES, (eff_chunk // _SPONGE_MIN_CHUNK_BYTES) * _SPONGE_MIN_CHUNK_BYTES)
++    if sub_target_bytes < eff_chunk or high_target_bytes < _SPONGE_MIN_CHUNK_BYTES:
+         return []
+-    budget = min(sub_order13_bytes, free_gpu_bytes - required_bytes - headroom_bytes)
+-    num_chunks = budget // chunk_bytes
++    default_meminfo = (
++        Path("/proc/meminfo")
++        if meminfo_path is None and buddyinfo_path == Path("/proc/buddyinfo")
++        else meminfo_path
++    )
++    avail_bytes = _available_uma_or_gpu_bytes(device, meminfo_path=default_meminfo)
++    if avail_bytes <= 0:
++        return []
++    # Include one extra chunk of margin when soaking sub-2MiB orders so per-CPU pcp lists drain cleanly.
++    soak_goal = sub_target_bytes + (eff_chunk if target_bsz <= _GPU_HUGEPAGE_BYTES else 0)
++    budget = min(soak_goal, avail_bytes - required_bytes - headroom_bytes)
++    num_chunks = int(budget // eff_chunk)
+     if num_chunks <= 0:
+         return []
++    t0 = time.monotonic()
+     sponge: list[torch.Tensor] = []
+     try:
+-        for _ in range(int(num_chunks)):
+-            chunk = torch.empty((chunk_bytes,), dtype=torch.uint8, device=device)
+-            if chunk_bytes >= _TOUCH_STRIDE_BYTES:
++        for _ in range(num_chunks):
++            chunk = torch.empty((eff_chunk,), dtype=torch.uint8, device=device)
++            if eff_chunk >= _TOUCH_STRIDE_BYTES:
+                 chunk[::_TOUCH_STRIDE_BYTES].zero_()
+-            elif chunk_bytes > 0:
++            elif eff_chunk > 0:
+                 chunk[:1].zero_()
+             sponge.append(chunk)
+         if sponge:
+             torch.accelerator.synchronize(device)
++            logger.info(
++                "Buddy hugepage sponge soaked %.1f MiB (%d chunks) in %.2f s so %.1f MiB "
++                "of weights draw >= %.1f MiB contiguous physical blocks (%.1f MiB available)",
++                (len(sponge) * eff_chunk) / (1 << 20),
++                len(sponge),
++                time.monotonic() - t0,
++                required_bytes / (1 << 20),
++                target_bsz / (1 << 20),
++                high_target_bytes / (1 << 20),
++            )
+     except torch.OutOfMemoryError:
+         pass
+     return sponge
+@@ -309,9 +435,16 @@ def bind_weight_arena(
+         if sponge or total_bytes >= _TOUCH_STRIDE_BYTES:
+             torch.accelerator.synchronize(device)
+     finally:
++        cpu_snapshots.clear()
+         if sponge:
+             sponge.clear()
+-            torch.accelerator.empty_cache()
++        import ctypes, gc
++        gc.collect()
++        torch.accelerator.empty_cache()
++        try:
++            ctypes.CDLL("libc.so.6").malloc_trim(0)
++        except Exception:  # noqa: BLE001
++            pass
+ 
+     return arena
+ 
+diff --git a/vllm/model_executor/model_loader/dummy_loader.py b/vllm/model_executor/model_loader/dummy_loader.py
+index 0f263fe11..93942d079 100644
+--- a/vllm/model_executor/model_loader/dummy_loader.py
++++ b/vllm/model_executor/model_loader/dummy_loader.py
+@@ -32,6 +32,23 @@ class DummyModelLoader(BaseModelLoader):
+     def download_model(self, model_config: ModelConfig) -> None:
+         pass  # Nothing to download
+ 
++    def create_model(self, vllm_config, model_config: ModelConfig, prefix: str = "") -> nn.Module:
++        import os
++        import torch
++
++        model = super().create_model(vllm_config, model_config, prefix)
++        if os.environ.get("VLLM_DUMMY_WEIGHT_ARENA", "1").strip() not in ("0", "false", "none"):
++            device = torch.device(
++                self.load_config.device or vllm_config.device_config.device
++            )
++            if device.type == "cuda":
++                from vllm.model_executor.model_loader.direct_loader import (
++                    bind_weight_arena,
++                )
++
++                bind_weight_arena(model, device)
++        return model
++
+     def load_weights(self, model: nn.Module, model_config: ModelConfig) -> None:
+         for layer in model.modules():
+             info = get_layerwise_info(layer)
+diff --git a/vllm/model_executor/model_loader/weight_utils.py b/vllm/model_executor/model_loader/weight_utils.py
+index cee0ba045..4dd9095e4 100644
+--- a/vllm/model_executor/model_loader/weight_utils.py
++++ b/vllm/model_executor/model_loader/weight_utils.py
+@@ -1972,10 +1972,10 @@ def initialize_single_dummy_weight(
+         return
+ 
+     if not torch.is_floating_point(param):
+-        if current_platform.is_rocm():
+-            # On ROCm, integer params (e.g. GPTQ qweight/qzeros) are left
+-            # as torch.empty() by default, giving non-deterministic values
+-            # across processes. Zero them for reproducibility.
++        if current_platform.is_rocm() or current_platform.is_cuda():
++            # On CUDA/ROCm, integer and packed FP4/UE8M0 params are left
++            # as torch.empty() by default, giving non-deterministic bytes
++            # across processes and boots. Zero them for reproducibility.
+             param.zero_()
+         return
+ 
+-- 
+2.43.0
+
