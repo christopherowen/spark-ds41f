@@ -290,7 +290,10 @@ release qualification (step 9) and the owner's acceptance (section 4).
   - every PR it carries since its base, with its verdict, and every PR dropped or left out on the way, with the reason;
   - the over/under against the current release, per testbed;
   - known issues: unmeasured metrics, open regressions, and caveats such as single-boot figures.
-- **A tag** `spark-ds41f-candidate-<N>` on the commit that adds the manifest. It is never moved or deleted.
+- **A tag** `candidate-<N>` on the commit that adds the manifest. It is never moved or deleted.
+  - The candidate's own PR branch is usually also named `candidate-<N>`. Delete that merged branch, on `origin` and
+    locally, before tagging: with both, `git checkout candidate-<N>` takes the branch, the candidate as first
+    assembled, not the frozen commit (owner, 2026-11-11). The branch's commits stay in `main`'s history.
 - **A GitHub pre-release** on that tag. It is marked pre-release, so the release (for example `spark-ds41f-1107`)
   stays "Latest" and the default. Its notes give:
   - what changed since the base, PR by PR;
@@ -306,7 +309,7 @@ release qualification (step 9) and the owner's acceptance (section 4).
 - The coordinator prepares the manifest and the notes, then asks the owner before creating the tag and the
   pre-release (it is public). Tags, releases and pushes go from the owner's laptop only.
 - When the next freeze is published, the previous pre-release's notes gain a line "Superseded by
-  `spark-ds41f-candidate-<M>`". Old pre-release pages may be deleted later; their tags stay.
+  `candidate-<M>`". Old pre-release pages may be deleted later; their tags stay.
 
 **The next round** selects its PRs against the frozen candidate, builds its three candidates on its series, and
 judges them against the frozen candidate's recorded screens.

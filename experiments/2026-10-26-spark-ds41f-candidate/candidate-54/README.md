@@ -8,7 +8,7 @@ candidate ([release-benchmark](../../../docs/release-benchmark.md#9-release-qual
 Verification: the determinism gate, the screen and the carried fixes' live checks, on the three testbeds (`tp4-ring`
 dgx1..dgx4, `tp4-switched` sp1..sp4, `tp3-switched` sp5..sp7).
 
-**Frozen** as `spark-ds41f-candidate-54` after its verification on 2026-11-11 (Status, below): the freeze manifest is
+**Frozen** as `candidate-54` after its verification on 2026-11-11 (Status, below): the freeze manifest is
 [manifests/frozen/candidate-54.json](../../../manifests/frozen/candidate-54.json) and the pre-release notes are
 [pre-release-notes.md](pre-release-notes.md). This folder no longer changes; later findings about it go into the next
 candidate's README.

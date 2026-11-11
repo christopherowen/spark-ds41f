@@ -1,4 +1,4 @@
-# spark-ds41f-candidate-54 (pre-release)
+# candidate-54 (pre-release)
 
 A frozen candidate: the merged base of the second round of PR validation, verified on three testbeds and supplied
 for testing ahead of the next release. It is not a release: `spark-ds41f-1107` stays the latest release and the
@@ -105,7 +105,7 @@ c16/c8/c1, and the prefill-under-decode stall steps (stall-3's prefill 1.8% fast
 
 ## How to run it
 
-Check out the tag, then, with your site's node map ([docs/setup.md](https://github.com/christopherowen/spark-ds41f/blob/spark-ds41f-candidate-54/docs/setup.md)):
+Check out the tag, then, with your site's node map ([docs/setup.md](https://github.com/christopherowen/spark-ds41f/blob/candidate-54/docs/setup.md)):
 
 ```bash
 bin/spark --cluster-config experiments/2026-10-26-spark-ds41f-candidate/candidate-54/<shape>.json build prepare
@@ -121,5 +121,5 @@ bin/spark --cluster-config experiments/2026-10-26-spark-ds41f-candidate/candidat
   `build prepare` prepares the release's.
 - The image is built from the lock; no binary is published.
 
-The freeze manifest is [manifests/frozen/candidate-54.json](https://github.com/christopherowen/spark-ds41f/blob/spark-ds41f-candidate-54/manifests/frozen/candidate-54.json), and the
-candidate's record is [its README](https://github.com/christopherowen/spark-ds41f/blob/spark-ds41f-candidate-54/experiments/2026-10-26-spark-ds41f-candidate/candidate-54/README.md).
+The freeze manifest is [manifests/frozen/candidate-54.json](https://github.com/christopherowen/spark-ds41f/blob/candidate-54/manifests/frozen/candidate-54.json), and the
+candidate's record is [its README](https://github.com/christopherowen/spark-ds41f/blob/candidate-54/experiments/2026-10-26-spark-ds41f-candidate/candidate-54/README.md).
