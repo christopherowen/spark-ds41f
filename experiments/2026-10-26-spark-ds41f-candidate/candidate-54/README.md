@@ -94,7 +94,10 @@ its gate repeat. `0799` passes when every run of every boot gives candidate-54's
   its graph, or row taps were on. The drafter's layers are `DeepseekV4DecoderLayer`s, so its MoE runs the same combine.
   [c1_decisions.py](../candidate-58/boot-differences/c1_decisions.py) compares the boots request by request;
 - at `tp3-switched`, [gate-caps-tp3-switched.json](gate-caps-tp3-switched.json): the gate on 2 boots with TP3's
-  prefetch caps (below), since the `0799` gate there ran without them.
+  prefetch caps (below), since the `0799` gate there ran without them;
+- at `tp4-ring` and `tp4-switched`, [gate-final-tp4.json](gate-final-tp4.json) and
+  [gate-final-tp4-switched.json](gate-final-tp4-switched.json): the gate on one boot of the rebuilt image itself, ahead
+  of each screen. The `0799` gate ran on its first build, the same serving code under another image ID.
 
 **TP3's L2 prefetch caps (added 2026-11-11, owner).** The TP3 profiles ([tp3.json](tp3.json),
 [tp3-triangle-4k.json](tp3-triangle-4k.json), [tp3-switched.json](tp3-switched.json), and their `-dev` files through
