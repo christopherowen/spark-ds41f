@@ -72,6 +72,13 @@ with an event wait just before its PDL launch, and in a captured graph that depe
 edge, which orders only what follows the wait. `0799` moves `pdl.chain()` above the shared load. The `RoutePos`
 and `Weights` loads stay before it. It applies unchanged on candidate-58's head.
 
+Its gate, declared before the runs: [gate-0799-tp4.json](gate-0799-tp4.json) (12 boots at `tp4-ring`),
+[gate-0799-tp4-switched.json](gate-0799-tp4-switched.json) and [gate-0799-tp3-switched.json](gate-0799-tp3-switched.json)
+(4 boots each). Each boot runs the recorded `determinism` and `greedy` scenarios twice, plus the gate's distinct-stream
+checks. The comparison is the record at `tp4-ring`: 3 of 8 boots failing in candidate-58's row trace, and 1 of 4 in
+its gate repeat. `0799` passes when every run of every boot gives candidate-54's recorded hashes: TP4 18d61961/d6568649, TP3
+5c22ce41/bce6092e.
+
 **#1009 round 1 returns.** It fixes candidate-50's `tp4-ring` boot failure
 ([candidate-50/receipts/tp4-boot-failure](../candidate-50/receipts/tp4-boot-failure)). Its coordinator's verdict
 ([analysis.md](../candidate-50/receipts/rework/pr-1009-r1/analysis.md)) waited for a boot at TP4 sizing. On the
