@@ -82,6 +82,18 @@ checks. The comparison is the record at `tp4-ring`: 3 of 8 boots failing in cand
 its gate repeat. `0799` passes when every run of every boot gives candidate-54's recorded hashes: TP4 18d61961/d6568649, TP3
 5c22ce41/bce6092e.
 
+**On the rebuilt image** (tree `ad2dc11f`), after the gate:
+- the screens and the live checks under their own run names, so the earlier runs' directories on the nodes stay as
+  they are: [screen-0799-tp4.json](screen-0799-tp4.json), [screen-0799-tp4-switched.json](screen-0799-tp4-switched.json),
+  [screen-0799-tp3-switched.json](screen-0799-tp3-switched.json) and
+  [live-checks-0799-tp4-switched.json](live-checks-0799-tp4-switched.json), each the earlier spec with its run renamed;
+- [c1-decisions-tp4-switched.json](c1-decisions-tp4-switched.json): c1 on 4 boots at `tp4-switched`, saving each
+  request's per-step token counts. In candidate-58's c1 arms at `tp4-switched`
+  ([c1-drafter-arms-tp4-switched.json](../candidate-58/c1-drafter-arms-tp4-switched.json), 3 boots each), the boots'
+  accept decisions split, except where the shared expert left the aux stream or the drafter's query forward ran without
+  its graph. The drafter's layers are `DeepseekV4DecoderLayer`s, so its MoE runs the same combine.
+  [c1_decisions.py](../candidate-58/boot-differences/c1_decisions.py) compares the boots request by request.
+
 **#1009 round 1 returns.** It fixes candidate-50's `tp4-ring` boot failure
 ([candidate-50/receipts/tp4-boot-failure](../candidate-50/receipts/tp4-boot-failure)). Its coordinator's verdict
 ([analysis.md](../candidate-50/receipts/rework/pr-1009-r1/analysis.md)) waited for a boot at TP4 sizing. On the
