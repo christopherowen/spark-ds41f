@@ -43,6 +43,7 @@ sys.path.insert(0, str(ROOT / "scripts"))
 
 import kv_capacity  # noqa: E402
 import recipe  # noqa: E402
+from servebench import prompts as sb_prompts  # noqa: E402
 from servebench import stats as sb_stats  # noqa: E402
 
 SITE_TEMPLATE = ROOT / "site/index.html"
@@ -88,6 +89,61 @@ def _count_series_patches(series_rel_path: str | None) -> int | None:
     )
 
 
+# servebench's default prompt set crosses sixteen task styles with topics. Two styles ask for
+# code and one for a JSON object, which is neither prose nor code; the other thirteen ask for prose.
+_CODE_STYLES = ("Python function", "SQL schema")
+_STRUCTURED_STYLES = ("JSON object",)
+
+
+def _prompt_styles() -> tuple[str, dict[str, str]]:
+    """The default prompt set's digest, and each prompt id's style (prose, code or structured)."""
+    prompts = sb_prompts.default_prompts()
+    styles = {}
+    for prompt in prompts:
+        text = prompt["text"]
+        if any(marker in text for marker in _CODE_STYLES):
+            styles[prompt["id"]] = "code"
+        elif any(marker in text for marker in _STRUCTURED_STYLES):
+            styles[prompt["id"]] = "structured"
+        else:
+            styles[prompt["id"]] = "prose"
+    return sb_prompts.digest(prompts), styles
+
+
+def _tps_by_style(data: dict[str, Any]) -> dict[str, Any] | None:
+    """One stream's output tokens per second on prose and on code prompts, from a run's request table.
+
+    Each style's rate is its requests' output tokens over their time from send to end, for the
+    error-free requests that lie inside the measurement window: the same accounting as the run's
+    ``output_tps``, which is their mix. None unless the run used the default prompt set unchanged
+    and has at least five requests of each style."""
+    table = data.get("request_table") or {}
+    window = table.get("window")
+    digest, styles = _prompt_styles()
+    workload = data.get("workload", {})
+    if not table.get("rows") or not window or workload.get("prompts_sha256") != digest:
+        return None
+    at = {name: i for i, name in enumerate(table["columns"])}
+    totals: dict[str, list[float]] = {}
+    for row in table["rows"]:
+        sent, end, tokens = row[at["sent"]], row[at["end"]], row[at["completion_tokens"]]
+        style = styles.get(row[at["prompt"]])
+        if row[at["error"]] or style is None or sent is None or end is None or not tokens:
+            continue
+        if sent < window[0] or end > window[1] or end <= sent:
+            continue
+        total = totals.setdefault(style, [0.0, 0.0, 0])
+        total[0] += tokens
+        total[1] += end - sent
+        total[2] += 1
+    if any(totals.get(style, [0, 0, 0])[2] < 5 for style in ("prose", "code")):
+        return None
+    return {
+        style: {"tps": round(totals[style][0] / totals[style][1], 1), "requests": totals[style][2]}
+        for style in ("prose", "code")
+    }
+
+
 def _parse_run_step(path: Path) -> dict[str, Any] | None:
     if not path.is_file():
         return None
@@ -102,6 +158,7 @@ def _parse_run_step(path: Path) -> dict[str, Any] | None:
     slo = latency.get("slo", {})
     return {
         "concurrency": data.get("workload", {}).get("concurrency"),
+        "tps_by_style": _tps_by_style(data),
         "mode": data.get("workload", {}).get("mode", "closed"),
         "rate": data.get("workload", {}).get("rate"),
         "output_tps": round(out_tps.get("mean", 0.0), 2) if out_tps else None,
