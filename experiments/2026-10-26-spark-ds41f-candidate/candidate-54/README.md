@@ -22,8 +22,9 @@ dgx1..dgx4, `tp4-switched` sp1..sp4, `tp3-switched` sp5..sp7).
 - The provenance, SHA-256 and author of each patch are in [receipts/selection.json](receipts/selection.json), and the
   stack log is [receipts/stack.log](receipts/stack.log).
 - `patch_count` 672, `patch_head` `15833ed1`, `expected_tree` `ad2dc11f`, `patchset_sha256` `d990ee5d`, recorded by
-  `bin/spark build prepare --lock` ([source.json](source.json), [upstreams.lock.json](upstreams.lock.json)). Every
-  receipt below predates `0799`: it is the record of the earlier build (`patch_count` 671, `patch_head` `4e8133ff`,
+  `bin/spark build prepare --lock` ([source.json](source.json), [upstreams.lock.json](upstreams.lock.json)).
+  [receipts/gate-0799](receipts/gate-0799/README.md) and [receipts/final](receipts/final) are `0799`'s; every other
+  receipt predates `0799`: it is the record of the earlier build (`patch_count` 671, `patch_head` `4e8133ff`,
   `expected_tree` `5f021d9a`, `patchset_sha256` `fd767123`, image ID `e1de71be`). The image is rebuilt under the
   same tag, `spark-ds41f:candidate-54`. `build image` refuses a tag that exists, so the earlier image's tag is removed
   from each node before the build and its copies; each profile's `local.spark-ds41f.vllm.tree` label (`ad2dc11f`)
@@ -309,12 +310,23 @@ release set, quality evals, AgentX or cold boots; those belong to release qualif
 
 ## Status
 
-**With `0799` (2026-11-11):** the gate passes on all three testbeds, every run of every boot on the recorded hashes:
-`tp4-ring` 12 of 12 boots (48 runs), `tp4-switched` 4 of 4 and `tp3-switched` 4 of 4
-([receipts/gate-0799](receipts/gate-0799/README.md)). Before it, 4 of 12 `tp4-ring` boots failed. The gate ran on
-`0799`'s first build (image `1e556e80`, tree `b20b199d`), which failed one release test; the rebuilt image (tree
-`ad2dc11f`) differs only in that test file. Its release tests, screens, live checks, the c1 decision check and the
-capped TP3 gate are next. The table below is the earlier build's record.
+**Verified with `0799` (2026-11-11)** on the rebuilt image, `spark-ds41f:candidate-54`, image ID `d502217e` (tree
+`ad2dc11f`), the same on all three testbeds. Its release tests pass on dgx4: 10,171 passed, 311 skipped
+([receipts/final/tp4-ring](receipts/final/tp4-ring/README.md)).
+
+| Testbed | Gate | Screen against 1107 | Live checks | c1 decisions between boots |
+| --- | --- | --- | --- | --- |
+| `tp4-ring` | 12 of 12 boots on `0799`'s first build ([receipts/gate-0799](receipts/gate-0799/README.md)), then 1 of 1 on the rebuilt image; TP4 hashes 18d61961/d6568649 | grid 4.94% faster, c16 output 1.74% and paired decode 1.35% faster, prefill the same at 32K (+2.1%) and 7.35% faster at 256K ([receipts/final/tp4-ring](receipts/final/tp4-ring/README.md)) | run at `tp4-switched` | identical on 4 of 4 boots, 58 requests |
+| `tp4-switched` | 4 of 4, then 1 of 1; the same TP4 hashes | grid 4.24% faster, c16 output 1.50% and paired decode 1.13% faster, prefill the same at 32K (+3.4%) and 7.56% faster at 256K ([receipts/final/tp4-switched](receipts/final/tp4-switched/README.md)) | #955, #1013 and #972 pass | identical on 4 of 4 boots, 57 requests |
+| `tp3-switched`, with the caps | 4 of 4 without the caps, then 2 of 2 with them; TP3 hashes 5c22ce41/bce6092e | grid the same (-0.10%; 8x24 and 4x24 shapes 0.8-2.3% slower, 1-request shapes up to 1.5% faster); c8 the same (+0.87%, one boot); prefill not measured (sp5's 4 GiB bench floor). Against candidate-50: `single-stream`, `sampled` and the stall steps the same, stall-3's prefill 1.8% faster ([receipts/final/tp3-switched](receipts/final/tp3-switched/README.md)) | | |
+
+- The final gates ran one boot at each TP4 testbed and two at TP3; the boot-to-boot evidence is `0799`'s gate on 12,
+  4 and 4 boots, on a build whose serving code is the rebuilt image's.
+- c1 paired decode against 1107 is not measured on the rebuilt image: the TP4 screens carry no c1 step. The c1
+  decision checks give 80.55-80.65 tok/s output at `tp4-ring` and 79.63-79.75 at `tp4-switched`, a different workload
+  from the screens'.
+- **The final screens are the next round's references,** in [receipts/references](receipts/references)
+  (`candidate-54-0799-<testbed>-screen…`, and at TP3 `candidate-54-0799-tp3-switched-<suite>`).
 
 Earlier build (`spark-ds41f:candidate-54`, image ID `e1de71be`): its release tests passed on dgx4 (10,171 passed, 311
 skipped).
@@ -325,5 +337,5 @@ skipped).
 | `tp4-switched` | identical outputs; the same TP4 hashes | grid 4.29% faster, c16 output 1.6% faster, c16 decode the same, prefill the same at 32K and 7.5% faster at 256K ([receipts/tp4-switched](receipts/tp4-switched/README.md)) | #955, #1013 and #972 pass |
 | `tp3-switched` | identical outputs; new TP3 hashes 5c22ce41/bce6092e (#1030's declared change) | **grid 2.87% slower**, at small batches (1-request shapes 5.5-7.2%); c8, `single-stream`, `sampled` and the stall steps the same; grid and c8 from one boot and prefill not measured (sp5's 4 GiB bench floor) ([receipts/tp3-switched](receipts/tp3-switched/README.md)) | |
 
-The screen references the next round uses are in [receipts/references](receipts/references). Their greedy corpora
-stay on the nodes, listed with their SHA-256 in `large-files-on-nodes.tsv`.
+The earlier build's screens are in [receipts/references](receipts/references) too (`candidate-54-<testbed>-screen…`).
+Every screen's greedy corpus stays on its node, listed with its SHA-256 in `large-files-on-nodes.tsv`.
