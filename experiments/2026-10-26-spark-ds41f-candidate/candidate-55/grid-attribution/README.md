@@ -32,6 +32,9 @@ finds which change causes it and what removes it.
    (+0.26%) in the wrong direction. Hypotheses 2 and 3 below, as written for 24 rows and more, are not supported:
    the moved trigger and the priorities leave those rows unchanged.
 
+6. **`tp4-ring` agrees.** There the caps make candidate-55's grid 2.51% faster (margin 0.34%, two boots each): 1x2
+   rows 16.2 to 13.5 ms and 1x3 rows 14.8 to 14.0 ms, against candidate-54's recorded 14.5 ms for both.
+
 **The fix is a recipe variable:** candidate-55's TP4 profiles cap the windows at 15/12/12 MB, as candidate-54's TP3
 profiles do. The image and the locks are unchanged, and sparknet `0003` stays as #982 placed it. The moved trigger is
 not taken: it gains nothing measurable once the windows are capped.
@@ -74,7 +77,8 @@ kernels compile into their own `TILELANG_CACHE_DIR`.
 The third build's arm profiles are `tp4-switched-<arm>-dev.json`, on `tp4-switched-b3-dev.json` and this folder's
 lock of that build. The fourth build's are `tp4-switched-b4-<arm>-dev.json`, on
 [tp4-switched-b4-dev.json](tp4-switched-b4-dev.json): candidate-55's `tp4-switched-dev.json` with the default
-windows, as it stood at `6c3e98b56` when the run was taken, before the caps entered it.
+windows, as it stood at `6c3e98b56` when the run was taken, before the caps entered it. The `tp4-ring` arms are on
+[tp4-b4-dev.json](tp4-b4-dev.json), the same for `tp4-dev.json`.
 
 ## Commands
 
@@ -146,6 +150,25 @@ Job `20261112T194852-confirm-fix-grid-tp4-switched.json`, 2026-11-12 19:49Z to 2
 - candidate-54 without the caps was not booted again; its two boots in the attribution run are the comparison
   (1x2 15.16 and 15.30 ms; with the caps 13.83 and 13.98 ms).
 - Every boot reached ready and no memory guard fired.
+
+## Check at tp4-ring: fourth build, two boots an arm
+
+Job `20261112T204239-confirm-fix-grid-tp4.json`, 2026-11-12 21:17Z to 21:33Z, deployment `d8a24bf9`
+([table](../receipts/grid-attribution/tp4-ring/lab/candidate-55-confirm-fix-grid-tp4-table.txt)). `tp4-ring` is the
+testbed the targets are measured at, and its 1x3 rows had not regressed in the screens as `tp4-switched`'s did.
+
+| Arm | 1x2 | 1x3 | 1x6 | 4x8 | 8x16 | 8x24 | 16x32 | 12x72 | 16x96 | 1x3 at 1016K | Grid |
+| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |
+| `candidate-55` | 16.23 | 14.71 | 15.11 | 15.87 | 18.29 | 21.41 | 22.96 | 35.64 | 38.76 | 14.69 | |
+| `candidate-55-again` | 16.17 | 14.96 | 15.10 | 15.78 | 18.39 | 21.37 | 23.01 | 35.53 | 38.85 | 14.89 | +0.24% |
+| `candidate-55-l2cap` | 13.57 | 13.94 | 15.13 | 16.03 | 18.11 | 21.04 | 22.93 | 35.02 | 38.31 | 13.87 | -2.54% |
+| `candidate-55-l2cap-again` | 13.48 | 14.05 | 15.15 | 16.08 | 18.42 | 21.15 | 23.09 | 34.89 | 38.38 | 13.89 | -2.24% |
+
+- **Verdict of the run:** grid -2.51%, margin 0.34%, better (both boots of each).
+- **By shape group**, against `candidate-55`: 1x2 -15.6%, 1x3 -5.1% (long contexts the same), 6 to 16 rows +0.1%,
+  24 rows -0.9%, 32 rows and more -1.0%.
+- The gain is smaller than at `tp4-switched` (-4.66%) because the ring's 1x3 rows lost less to begin with.
+- candidate-54 and the moved trigger were not measured at `tp4-ring`.
 
 ## Single-GPU screen on sp8, one boot an arm
 
