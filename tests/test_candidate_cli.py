@@ -4,12 +4,14 @@ from __future__ import annotations
 
 import argparse
 import contextlib
+import hashlib
 import io
 import json
 import shlex
 import shutil
 import subprocess
 import sys
+import tarfile
 import tempfile
 import unittest
 import unittest.mock
@@ -670,6 +672,118 @@ class ShipTest(unittest.TestCase):
         self.assertEqual([h for h, _ in distributes], ["sp5"])
         self.assertIn(f"{folder}/tp3-switched.json", distributes[0][1])
         self.assertIn("every node already holds", out)
+        self.assertNotIn("DIFFERS", out)
+
+    def test_blob_filter_drops_named_members_and_counts_what_it_writes(self):
+        archive = io.BytesIO()
+        with tarfile.open(fileobj=archive, mode="w") as tar:
+            for name, data in (("blobs/sha256/aa", b"a" * 5000), ("blobs/sha256/bb", b"b" * 7000),
+                               ("index.json", b"{}")):
+                member = tarfile.TarInfo(name)
+                member.size = len(data)
+                tar.addfile(member, io.BytesIO(data))
+        done = subprocess.run([sys.executable, "-c", candidate.BLOB_FILTER, "blobs/sha256/bb"],
+                              input=archive.getvalue(), capture_output=True, check=True)
+        with tarfile.open(fileobj=io.BytesIO(done.stdout)) as tar:
+            self.assertEqual(tar.getnames(), ["blobs/sha256/aa", "index.json"])
+            self.assertEqual(tar.extractfile("blobs/sha256/aa").read(), b"a" * 5000)
+        self.assertEqual(done.stderr.decode().strip(), f"@@sent {len(done.stdout)} "
+                         f"{hashlib.sha256(done.stdout).hexdigest()} dropped 1 of 1")
+
+    def test_layer_blobs_from_a_manifest_after_login_output(self):
+        manifest = [{"Config": "blobs/sha256/cc", "Layers": ["blobs/sha256/aa", "blobs/sha256/bb"]}]
+        self.assertEqual(candidate.parse_layer_blobs("Welcome to the node\n" + json.dumps(manifest)),
+                         ["blobs/sha256/aa", "blobs/sha256/bb"])
+        self.assertIsNone(candidate.parse_layer_blobs("Welcome\n[not json"))
+        self.assertIsNone(candidate.parse_layer_blobs(json.dumps([{"Layers": ["../etc/passwd"]}])))
+
+    def relay_answer(self, received_sha: str, loads: list):
+        sha = "e" * 64
+
+        def answer(host, script):
+            if script.startswith("getent hosts storage"):
+                return 0, "Welcome\n10.0.1.70"
+            if "nohup setsid" in script:
+                if "docker load -i" in script:
+                    loads.append(host)
+                return 0, "started"
+            if "ss -Hltn" in script:
+                return 0, ""
+            if script.startswith("cat /var/tmp/spark-ship-40000.send.log"):
+                return 0, f"@@sent 10 {sha} dropped 2 of 2\n@@exit 0"
+            if script.startswith("cat /var/tmp/spark-ship-40000.receive.log"):
+                return 0, f"@@received 10 {received_sha}\n@@exit 0"
+            if script.startswith("cat /var/tmp/spark-ship-40000.forward.log"):
+                return 0, "@@exit 0"
+            if script.startswith("cat /var/tmp/spark-ship-40000.load.log"):
+                return 0, "Loaded image: spark-ds41f:candidate-99\n@@exit 0"
+            if "pkill -s" in script:
+                return 0, ""
+            return None
+        return answer, sha
+
+    def test_relay_copy_does_not_load_a_stream_that_differs(self):
+        loads: list = []
+        answer, _ = self.relay_answer("f" * 64, loads)
+        ssh, run = fake_ssh(answer)
+        with unittest.mock.patch.object(candidate, "ship_port", return_value=40000):
+            ok, message = quiet(candidate.relay_copy, ssh, "dgx1", "docker save x | python3 -c f", "sp5",
+                                candidate.SPACEPORT_RELAY, timeout=60, interval=1, sleep=lambda _: None,
+                                resolve=lambda host: "192.168.20.39")[0]
+        self.assertFalse(ok)
+        self.assertIn("not loaded", message)
+        self.assertEqual(loads, [])
+        cleaned = [host for host, script in run.calls if "pkill -s" in script]
+        self.assertEqual(sorted(cleaned), ["dgx1", "sp5", "storage"])
+
+    def test_ship_relays_through_storage_leaving_out_held_blobs(self):
+        image, wanted, old = "spark-ds41f:candidate-99", "sha256:" + "1" * 64, "sha256:" + "2" * 64
+        folder = "experiments/2026-10-26-spark-ds41f-candidate/candidate-99"
+        profile = {"extends": {"config": "config/cluster.json", "shape": "tp3-switched"},
+                   "set": {"container": {"image": image}}}
+        local = FakeLocal({f"{folder}/tp3-switched.json": json.dumps(profile) + "\n",
+                           "config/cluster.json": (ROOT / "config/cluster.json").read_text()})
+        loads: list = []
+        relay, sha = self.relay_answer("e" * 64, loads)
+        held = {"dgx1"}
+        manifest = [{"Config": "blobs/sha256/cc", "Layers": ["blobs/sha256/aa", "blobs/sha256/bb"]}]
+
+        def answer(host, script):
+            if script.startswith("docker image inspect"):
+                if host in held or (host == "sp5" and loads):
+                    return 0, wanted
+                return (0, old) if host == "sp5" else (1, "")
+            if "tar -xOf - manifest.json" in script:
+                return 0, json.dumps(manifest)
+            if "@@section hold" in script:
+                return 0, state_output()
+            if "build distribute" in script:
+                held.update({"sp6", "sp7"})
+                return 0, "sp6: loaded"
+            found = relay(host, script)
+            return found if found is not None else (0, "5" * 40)
+        ssh, run = fake_ssh(answer)
+        ssh.popen = lambda *a, **k: self.fail("streamed through the laptop")
+        args = argparse.Namespace(image=image, source="dgx1", to=["tp3-switched"], profile_dir=None, queue=None,
+                                  idle_minutes=10, log_name=None, wait_timeout=10, stream_timeout=60, interval=1,
+                                  attempts=2, apply=True, via="relay", full=False)
+        with unittest.mock.patch.object(candidate, "ship_port", return_value=40000), \
+                unittest.mock.patch.object(candidate, "ssh_hostname", return_value="192.168.20.39"), \
+                unittest.mock.patch.object(candidate, "Lock", lambda path: contextlib.nullcontext()):
+            code, out = quiet(candidate.command_ship, args, ssh=ssh, local=local, sleep=lambda _: None)
+        self.assertEqual(code, 0, out)
+        self.assertEqual(loads, ["sp5"])
+        started = {host: script for host, script in run.calls if "nohup setsid" in script and "docker load" not in script}
+        self.assertIn("nc -l 192.168.20.39 40000 > /var/tmp/spark-ship-40000.tar", started["sp5"])
+        self.assertIn("nc -l 10.0.1.70 40000", started["storage"])
+        self.assertIn("docker exec -i dgx-spark-bench-wg nc -N 192.168.20.39 40000", started["storage"])
+        send = shlex.split(started["dgx1"].split("nohup setsid bash -c ", 1)[1])[0]
+        self.assertIn("docker save spark-ds41f:candidate-99 | python3 -c", send)
+        self.assertIn("blobs/sha256/bb; } | timeout 60 nc -N 10.0.1.70 40000\n) > /var/tmp/spark-ship-40000.send.log",
+                      send)
+        self.assertIn("blobs/sha256/aa blobs/sha256/bb", send)
+        self.assertIn("its spark-ds41f:candidate-99 holds 2 layer blobs", out)
+        self.assertIn("SHA-256 as sent (dropped 2 of 2)", out)
         self.assertNotIn("DIFFERS", out)
 
 

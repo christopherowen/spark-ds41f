@@ -127,13 +127,15 @@ bin/spark --cluster-config <dir>/image-dgx4.json build prepare --only vllm --loc
 - **Build:** the `image` job builds each candidate on dgx4 and copies it along the ring.
 - **Release tests:** ONE `kernel` job runs every candidate's release-test bundle at once, each
   on its own node. A bundle takes about 45-50 minutes.
-- **Spaceport copies:** dgx does not reach spaceport, so each image crosses through the owner's
-  laptop once, to sp1, and fans out over the spaceport fabric:
-  ```bash
-  ssh dgx1 docker save spark-ds41f:candidate-<N> | ssh sp1 docker load
-  ```
-  - Stream one image at a time. On 2026-11-09, two parallel streams ran at about 2.5 MB/s each,
-    and each 10.5 GB image took 108 minutes.
+- **Spaceport copies:** dgx has no route to spaceport; only the WireGuard container
+  `dgx-spark-bench-wg` on `storage` reaches it. `candidate ship` (below) copies each image once,
+  dgx1 -> `storage` -> that container -> the first head, and it fans out over the spaceport fabric.
+  - It leaves out the layer blobs the head's previous build already holds. On 2026-11-12,
+    candidate-55's fourth build reached sp5 as 822 MB of its 12.4 GB, and the copy took under
+    6 minutes, about 2 of them reading sp5's manifest. The tunnel carried 8.6 MB/s.
+  - Through the laptop (`--via laptop`), the image crosses the laptop's VPN twice. On 2026-11-09, two parallel
+    streams ran at about 2.5 MB/s each, and each 10.5 GB image took 108 minutes. On 2026-11-12,
+    one ran at 0.9-2.3 MB/s, and three full copies broke when the laptop's connection dropped.
   - A candidate for `tp3-switched` goes on from sp1 to its head, over the fabric:
     `ssh sp1 'docker save spark-ds41f:candidate-<N> | ssh sp5 docker load'`.
   - On each head, run `bin/spark --cluster-config <dir>/<shape>.json build distribute --apply`, and

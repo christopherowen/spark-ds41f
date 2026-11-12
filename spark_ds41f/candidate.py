@@ -17,6 +17,7 @@ import fcntl
 import fnmatch
 import json
 import os
+import random
 import re
 import shlex
 import shutil
@@ -896,6 +897,207 @@ def image_ids(ssh: Ssh, hosts: Iterable[str], image: str) -> dict[str, str | Non
     return {host: image_id(ssh, host, image) for host in hosts}
 
 
+# The dgx nodes have no route to spaceport: only a WireGuard container on storage reaches its
+# network. ``--via relay`` copies dgx -> storage (the site network) -> that container -> the head,
+# through one-shot netcat listeners the laptop starts; the image itself never crosses the laptop.
+@dataclasses.dataclass(frozen=True)
+class Relay:
+    host: str       # its ssh name; the source resolves the same name to the relay's address
+    container: str  # the container on it that routes to the spaceport network
+
+
+SPACEPORT_RELAY = Relay("storage", "dgx-spark-bench-wg")
+SHIP_SPOOL = "/var/tmp/spark-ship"  # <prefix>-<port>.tar and its step logs, on each node of a copy
+
+# ``docker save`` on stdin, the same archive without the named members on stdout, and the size
+# and SHA-256 of what it wrote on stderr. A dropped member is a layer blob the target's image
+# store already holds (the containerd store names blobs by digest), so the load finds it there.
+BLOB_FILTER = r'''
+import hashlib, sys, tarfile
+drop = set(sys.argv[1:])
+class Counted:
+    def __init__(self, raw):
+        self.raw, self.digest, self.size = raw, hashlib.sha256(), 0
+    def write(self, data):
+        self.digest.update(data)
+        self.size += len(data)
+        return self.raw.write(data)
+out, dropped = Counted(sys.stdout.buffer), 0
+with tarfile.open(fileobj=sys.stdin.buffer, mode="r|", bufsize=1 << 20) as source, \
+        tarfile.open(fileobj=out, mode="w|", bufsize=1 << 20, format=tarfile.PAX_FORMAT) as sink:
+    for member in source:
+        if member.name in drop:
+            dropped += 1
+            continue
+        sink.addfile(member, source.extractfile(member) if member.isfile() else None)
+sys.stdout.buffer.flush()
+print(f"@@sent {out.size} {out.digest.hexdigest()} dropped {dropped} of {len(drop)}", file=sys.stderr)
+'''
+
+
+def save_pipeline(image: str, held: Iterable[str] = (), *, counted: bool = False) -> str:
+    """``docker save image``, through BLOB_FILTER when it drops the layer blobs in ``held`` or
+    when the copy needs the stream's size and SHA-256 (``counted``)."""
+    save = f"docker save {shlex.quote(image)}"
+    held = sorted(set(held))
+    if not held and not counted:
+        return save
+    return " ".join([save, "| python3 -c", shlex.quote(BLOB_FILTER), *map(shlex.quote, held)])
+
+
+def layer_blobs_command(image: str) -> str:
+    return f"set -o pipefail; docker save {shlex.quote(image)} | tar -xOf - manifest.json"
+
+
+def parse_layer_blobs(text: str) -> list[str] | None:
+    """The layer blob paths a ``docker save`` manifest.json lists, in order; None if none parse."""
+    for line in reversed(text.splitlines()):
+        line = line.strip()
+        if not line.startswith("["):
+            continue
+        try:
+            entries = json.loads(line)
+        except ValueError:
+            continue
+        blobs = [layer for entry in entries if isinstance(entry, dict) for layer in entry.get("Layers") or []]
+        if blobs and all(isinstance(blob, str) and blob.startswith("blobs/") for blob in blobs):
+            return list(dict.fromkeys(blobs))
+    return None
+
+
+def held_blobs(ssh: Ssh, target: str, image: str, *, timeout: float) -> list[str]:
+    """The layer blobs of ``image`` as ``target`` holds it now (its previous build): the copy leaves
+    them out. Any doubt (no such image, a failed read) sends every blob."""
+    if image_id(ssh, target, image) is None:
+        return []
+    try:
+        result = ssh.call(target, layer_blobs_command(image), timeout=timeout)
+    except RemoteError as error:
+        warn(f"{target}: reading its {image} manifest failed ({error}); sending every blob")
+        return []
+    blobs = parse_layer_blobs(result.stdout) if result.returncode == 0 else None
+    if not blobs:
+        warn(f"{target}: no manifest for its {image} (exit {result.returncode}); sending every blob")
+        return []
+    say(f"{target}: its {image} holds {len(blobs)} layer blobs; the copy leaves those out")
+    return blobs
+
+
+def ssh_hostname(host: str, run: Callable = subprocess.run) -> str:
+    """The address the laptop's ssh configuration gives ``host``."""
+    result = run(["ssh", "-G", host], capture_output=True, text=True, timeout=30, stdin=subprocess.DEVNULL)
+    for line in (result.stdout or "").splitlines():
+        key, _, value = line.partition(" ")
+        if key == "hostname" and re.fullmatch(r"[0-9A-Fa-f.:]+", value.strip()):
+            return value.strip()
+    raise Refused(f"ssh -G {host} gives no numeric hostname; the relay needs the head's address")
+
+
+def ship_port() -> int:
+    return random.randint(20000, 59999)
+
+
+def detached(script: str, base: str, step: str) -> str:
+    """Run ``script`` in its own session, so a dropped ssh connection does not stop it. Its output
+    and then ``@@exit <status>`` go to ``<base>.<step>.log``, its session ID to ``<base>.<step>.sid``."""
+    log, sid = f"{base}.{step}.log", f"{base}.{step}.sid"
+    body = f'echo $$ > {sid}\n(\n{script}\n) > {log} 2>&1 < /dev/null\necho "@@exit $?" >> {log}'
+    return f"rm -f {log} {sid}; nohup setsid bash -c {shlex.quote(body)} > /dev/null 2>&1 < /dev/null & echo started"
+
+
+def step_result(ssh: Ssh, host: str, base: str, step: str, *, deadline: float, interval: float,
+                sleep: Callable[[float], None], clock: Callable[[], float] = time.monotonic) -> tuple[int, str]:
+    """Poll a detached step's log until it records its exit status (-1 past ``deadline``)."""
+    while True:
+        try:
+            result = ssh.call(host, f"cat {base}.{step}.log 2>/dev/null")
+        except RemoteError as error:
+            warn(f"{host}: {error}; polling its {step} again")
+        else:
+            found = re.search(r"^@@exit (\d+)\s*$", result.stdout, re.M)
+            if found:
+                return int(found.group(1)), result.stdout[:found.start()].strip()
+        if clock() >= deadline:
+            return -1, f"{host}: its {step} did not finish in time"
+        sleep(interval)
+
+
+def listening(ssh: Ssh, host: str, port: int) -> bool:
+    script = f'for i in $(seq 1 60); do ss -Hltn "sport = :{port}" | grep -q . && exit 0; sleep 0.5; done; exit 1'
+    return ssh.call(host, script, timeout=90).returncode == 0
+
+
+def stop_steps(ssh: Ssh, host: str, base: str) -> None:
+    """Stop a copy's unfinished detached steps on ``host`` (each its own session; a finished one,
+    whose log records its exit, is left alone) and remove the copy's files there."""
+    script = (f'for f in {base}.*.sid; do [ -f "$f" ] || continue; '
+              f'grep -q "^@@exit" "${{f%.sid}}.log" 2>/dev/null || pkill -s "$(cat "$f")"; done; '
+              f'rm -f {base}.*; true')
+    try:
+        ssh.call(host, script, timeout=60)
+    except RemoteError as error:
+        warn(f"{host}: cleaning up {base}.* failed ({error})")
+
+
+def relay_copy(ssh: Ssh, source: str, send: str, target: str, relay: Relay, *, timeout: float,
+               interval: float, sleep: Callable[[float], None], resolve: Callable[[str], str] | None = None,
+               clock: Callable[[], float] = time.monotonic) -> tuple[bool, str]:
+    """``send`` (a ``docker save`` pipeline) on ``source`` into ``docker load`` on ``target``, once:
+    the source sends to a one-shot listener on the relay host, which forwards through the relay's
+    container to a one-shot listener on the target. The target keeps the stream in a file and
+    loads it only when its size and SHA-256 are what the source sent."""
+    port = ship_port()
+    target_address = (resolve or ssh_hostname)(target)
+    found = ssh.call(source, f"getent hosts {shlex.quote(relay.host)} | awk '{{print $1; exit}}'")
+    lines = found.stdout.strip().splitlines()
+    relay_address = lines[-1].strip() if lines else ""
+    if found.returncode or not re.fullmatch(r"[0-9A-Fa-f.:]+", relay_address):
+        return False, f"{source} does not resolve {relay.host}"
+    seconds, base = max(60, int(timeout)), f"{SHIP_SPOOL}-{port}"
+    spool = f"{base}.tar"
+    receive = (f"timeout {seconds} nc -l {target_address} {port} > {spool} || exit 3\n"
+               f"echo \"@@received $(stat -c %s {spool}) $(sha256sum < {spool} | cut -d' ' -f1)\"")
+    forward = (f"set -o pipefail; timeout {seconds} nc -l {relay_address} {port}"
+               f" | docker exec -i {shlex.quote(relay.container)} nc -N {target_address} {port}")
+    sending = f"set -o pipefail; {{ {send}; }} | timeout {seconds} nc -N {relay_address} {port}"
+    say(f"  relay {source} -> {relay.host} ({relay_address}:{port}) -> {relay.container} -> "
+        f"{target} ({target_address}:{port})")
+    hosts = (target, relay.host, source)
+
+    def fail(message: str) -> tuple[bool, str]:
+        for host in hosts:
+            stop_steps(ssh, host, base)
+        return False, message
+
+    for host, script, step in ((target, receive, "receive"), (relay.host, forward, "forward")):
+        if ssh.call(host, detached(script, base, step)).returncode or not listening(ssh, host, port):
+            return fail(f"{host}: its {step} listener did not start on port {port}")
+    if ssh.call(source, detached(sending, base, "send")).returncode:
+        return fail(f"{source}: the send did not start")
+    sent = step_result(ssh, source, base, "send", deadline=clock() + timeout, interval=interval,
+                       sleep=sleep, clock=clock)
+    received = step_result(ssh, target, base, "receive", deadline=clock() + 300, interval=min(interval, 10),
+                           sleep=sleep, clock=clock)
+    forwarded = step_result(ssh, relay.host, base, "forward", deadline=clock() + 60, interval=min(interval, 10),
+                            sleep=sleep, clock=clock)
+    said = re.search(r"@@sent (\d+) ([0-9a-f]{64}) (dropped .*)", sent[1])
+    got = re.search(r"@@received (\d+) ([0-9a-f]{64})", received[1])
+    if sent[0] or not said:
+        return fail(f"{source}: send exited {sent[0]}: {sent[1][-300:]}")
+    if received[0] or forwarded[0] or not got or got.groups() != said.groups()[:2]:
+        return fail(f"{target}: received {got.groups() if got else 'nothing'} (exit {received[0]}), "
+                    f"sent {said.groups()[:2]}; forward exit {forwarded[0]} {forwarded[1][-200:]}; not loaded")
+    say(f"  {target}: received {int(got.group(1)):,} bytes, SHA-256 as sent ({said.group(3)}); loading")
+    load = f"docker load -i {spool}; rc=$?; rm -f {spool}; exit $rc"
+    if ssh.call(target, detached(load, base, "load")).returncode:
+        return fail(f"{target}: the load did not start")
+    loaded = step_result(ssh, target, base, "load", deadline=clock() + 3600, interval=min(interval, 10),
+                         sleep=sleep, clock=clock)
+    for host in hosts:
+        stop_steps(ssh, host, base)
+    return loaded[0] == 0, loaded[1]
+
+
 def default_profile_dir(image: str) -> str:
     match = re.fullmatch(r"spark-ds41f:(candidate-\d+)", image)
     if not match:
@@ -914,7 +1116,7 @@ def parse_queue_options(values: list[str] | None, targets: list[str]) -> dict[st
 
 
 class Lock:
-    """One image stream through the laptop at a time (two parallel streams each crawl)."""
+    """One image copy to spaceport at a time (two parallel copies each crawl)."""
 
     def __init__(self, path: Path):
         self.path = path
@@ -967,9 +1169,9 @@ def command_ship(args: argparse.Namespace, ssh: Ssh | None = None, local: Local 
     heads = list(dict.fromkeys(testbed.head for testbed in testbeds))
     first = heads[0]
     load = "docker load"
-    save = f"docker save {shlex.quote(image)}"
-    relay = lambda target: (f"set -o pipefail; docker save {shlex.quote(image)} | ssh {' '.join(SSH_OPTIONS)} "
-                            f"{shlex.quote(target)} docker load")
+    via, full = getattr(args, "via", "relay"), getattr(args, "full", False)
+    fabric = lambda target: (f"set -o pipefail; docker save {shlex.quote(image)} | ssh {' '.join(SSH_OPTIONS)} "
+                             f"{shlex.quote(target)} docker load")
     say(f"ship {image} from {source} to {', '.join(targets)} (profiles in {profile_dir})")
     say("every remote command runs under bash -lc on its node")
     local.fetch()
@@ -987,10 +1189,16 @@ def command_ship(args: argparse.Namespace, ssh: Ssh | None = None, local: Local 
         source_id = image_id(ssh, source, image)
         say(f"  {source}: {image} {source_id or 'not present yet (ship waits for it)'}")
         ids = image_ids(ssh, heads, image)
-        say(f"  laptop: ssh {source} {save} | ssh {first} {load}"
-            + ("   (skipped: same ID)" if source_id and ids[first] == source_id else ""))
+        skipped = "   (skipped: same ID)" if source_id and ids[first] == source_id else ""
+        held = "" if full else f", leaving out the layer blobs {first}'s current {image} holds"
+        if via == "relay":
+            relay = SPACEPORT_RELAY
+            say(f"  {source}$ docker save {image}{held} -> {relay.host} -> {relay.container} -> {first}, "
+                f"spooled there and loaded only if its size and SHA-256 match{skipped}")
+        else:
+            say(f"  laptop: ssh {source} docker save {image}{held} | ssh {first} {load}{skipped}")
         for head in heads[1:]:
-            say(f"  {first}$ {relay(head)}" + ("   (skipped: same ID)" if source_id and ids[head] == source_id else ""))
+            say(f"  {first}$ {fabric(head)}" + ("   (skipped: same ID)" if source_id and ids[head] == source_id else ""))
         for testbed in testbeds:
             profile = f"{profile_dir}/{testbed.profile}"
             say(f"  {testbed.name}: wait until its queue runs nothing, then")
@@ -1020,14 +1228,23 @@ def command_ship(args: argparse.Namespace, ssh: Ssh | None = None, local: Local 
             sleep(args.interval)
         raise Refused(f"{target}: {image} did not arrive with ID {source_id}")
 
+    def to_first() -> tuple[bool, str]:
+        # Each attempt reads what the head holds again: a failed load leaves the previous build.
+        held = [] if full else held_blobs(ssh, first, image, timeout=1800)
+        if via == "laptop":
+            return ssh.pipe(source, f"set -o pipefail; {save_pipeline(image, held)}", first, load,
+                            timeout=args.stream_timeout)
+        return relay_copy(ssh, source, save_pipeline(image, held, counted=True), first, SPACEPORT_RELAY,
+                          timeout=args.stream_timeout, interval=min(args.interval, 30), sleep=sleep)
+
     if image_id(ssh, first, image) != source_id:
         with Lock(ROOT / RESULTS / "candidate-ship.lock"):
-            copy(first, lambda: ssh.pipe(source, save, first, load, timeout=args.stream_timeout))
+            copy(first, to_first)
     else:
         say(f"{first}: already holds {image} {source_id[:19]}; skipped")
     def relayed(target: str) -> tuple[bool, str]:
         try:
-            result = ssh.call(first, relay(target), timeout=args.stream_timeout, retry=False)
+            result = ssh.call(first, fabric(target), timeout=args.stream_timeout, retry=False)
         except RemoteError as error:
             return False, str(error)
         return result.returncode == 0, (result.stdout + result.stderr).strip()
@@ -2028,6 +2245,11 @@ def add_parser(commands) -> None:
     ship.add_argument("--stream-timeout", type=float, default=4 * 3600, help="seconds a copy may take (4 h)")
     ship.add_argument("--interval", type=float, default=60)
     ship.add_argument("--attempts", type=int, default=3, help="copy attempts per head (default 3)")
+    ship.add_argument("--via", choices=("relay", "laptop"), default="relay",
+                      help="relay: dgx -> storage's WireGuard container -> the first head (default); "
+                           "laptop: stream through this machine")
+    ship.add_argument("--full", action="store_true",
+                      help="send every layer blob, not only those the first head's current image lacks")
     ship.add_argument("--apply", action="store_true")
     ship.set_defaults(func=guarded(command_ship))
 

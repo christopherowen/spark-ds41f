@@ -502,10 +502,23 @@ The commands:
     reads as finished.
   - A read that fails is no change.
   - It exits 0 on a change and 2 on timeout.
-- **`candidate ship <image> --from <host> --to <testbed>... [--profile-dir DIR] [--queue TESTBED=SPEC,...] [--apply]`:**
+- **`candidate ship <image> --from <host> --to <testbed>... [--profile-dir DIR] [--queue TESTBED=SPEC,...] [--via relay|laptop] [--full] [--apply]`:**
   - It waits until the image exists on the source.
-  - It streams it once through the laptop to the first spaceport head (one stream at a time),
-    then over the fabric head to head.
+  - It copies it once to the first spaceport head (one copy at a time), then over the fabric
+    head to head.
+  - **`--via relay` (the default):** the dgx nodes have no route to spaceport; only the
+    WireGuard container `dgx-spark-bench-wg` on `storage` reaches it. The laptop starts three
+    detached steps, so a dropped laptop connection does not stop a copy:
+    - a one-shot `nc` listener on the head, spooling to `/var/tmp/spark-ship-<port>.tar`;
+    - a one-shot listener on `storage`'s site address, forwarding through the container to the head;
+    - `docker save` on the source, sent to `storage`.
+    The head loads the spool only when its size and SHA-256 are what the source sent, then
+    removes it. `--via laptop` streams through the laptop as before.
+  - **Layer blobs the head holds stay behind:** before each attempt, ship reads the manifest of
+    the head's current image under the same tag (its previous build) and leaves those layer
+    blobs out of the stream. The containerd image store names blobs by digest, so the load finds
+    them there and the head ends with the complete image. A head without the tag, or a manifest
+    that does not read, gets every blob, and so does `--full`.
   - Once each testbed's queue runs nothing, it detaches the head, runs `cluster sync --apply`
     and `build distribute --apply` with `DIR/<shape>.json`. `DIR` defaults to the candidate
     folder named by the tag.
