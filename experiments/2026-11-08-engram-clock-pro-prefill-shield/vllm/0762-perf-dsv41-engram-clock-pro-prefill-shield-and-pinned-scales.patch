@@ -1,0 +1,523 @@
+From 7de04d6bf0e9a4047ccf8985d74fdcf4f771b7b4 Mon Sep 17 00:00:00 2001
+From: Christopher Owen <3221756+christopherowen@users.noreply.github.com>
+Date: Sun, 8 Nov 2026 15:30:00 +0000
+Subject: [PATCH] perf(dsv41): shield Engram row cache from prefill floods and
+ support pinned scales
+
+Base: 1107 vLLM patch head 4652b632a3c6bf5f65da7d2bfb750b203e671aa2.
+
+Rationale:
+1. In _row_plan.h, the 65,536-row 4-way set-associative host Engram row cache previously used pure FIFO replacement (advancing set->clock on every cache miss without recording hits or distinguishing large prefill chunks from decode steps). After 0750 enabled the row cache across all batch sizes, a 32K-64K chunked prefill (8-16 chunks of 4,096 tokens = 262,144-524,288 owned lookups on TP3, 4x-8x the cache capacity) streams one-time prompt n-grams through all four ways of every cache set, evicting the active decode working set and causing interleaved prefill_yield and post-prefill decode steps to suffer cold NVMe misses.
+2. Add 2-bit saturating usage counters (uint8_t usage[4] + uint8_t reserved[3] placed in the existing 7-byte struct padding after uint8_t clock in ple_cache_set_t, keeping sizeof(ple_cache_set_t) at 1,096 bytes while 8-byte aligning weights and scales) and prefill probationary insertion:
+   - Promote set->usage[w] up to PLE_CACHE_MAX_USAGE (3) on cache hits in ple_plan() and on duplicate in-step hits in ple_cache_insert().
+   - Classify each ple_plan() pass as a prefill chunk when its live rank-owned column lookups exceed PLE_CACHE_MAX_TOKENS (64 tokens) and it is not an explicit background prefetch. Because serve() plans step.early and reader->late separately, mixed prefill+decode steps treat the early prompt chunk as probationary and the late decode tokens as protected decode rows.
+   - On cache misses in ple_cache_insert(), fill empty ways (ids[w] < 0) first and existing probationary ways (usage[w] == 0) second. When all four ways hold protected rows (usage >= 1), prefill misses (is_prefill) claim at most one single-touch way (usage == 1) per set as a probationary slot (usage = 0) without aging the remaining three ways and never evict multi-hit ways (usage >= 2), while decode/verify misses (!is_prefill) sweep set->clock with 2-bit Clock decay until a way reaches zero.
+3. Add opt-in two-plane scale pinning (SPARK_DS41F_ENGRAM_PIN_SCALES=1 or EngramDiskRows(..., pin_scales=True)) so two-plane mode can preload the 8-byte-per-row scale shard into host memory via pread + POSIX_FADV_DONTNEED and serve scale bytes on cache misses without issuing a second 4 KiB O_DIRECT io_uring read per miss.
+
+Quality:
+Bit-exact (torch.equal) with the baseline packed and two-plane disk Engram readers across all batch sizes and sharding modes.
+
+Tests:
+- pytest --noconftest tests/kernels/test_deepseek_v41_engram_rows.py (52 passed across 2 boots), including test_row_cache_clock_pro_prefill_shield_preserves_decode_working_set and test_two_plane_pinned_scales_halves_read_calls_and_matches_reference.
+
+Upstream status: local DeepSeek-V4.1 disk Engram optimization.
+---
+ .../kernels/test_deepseek_v41_engram_rows.py  | 158 ++++++++++++++++++
+ .../deepseek_v4_1/engram_rows/_reader.c       |   8 +-
+ .../deepseek_v4_1/engram_rows/_row_plan.h     | 136 +++++++++++++--
+ vllm/models/deepseek_v4_1/engram_rows/rows.py |  11 +-
+ 4 files changed, 299 insertions(+), 14 deletions(-)
+
+diff --git a/tests/kernels/test_deepseek_v41_engram_rows.py b/tests/kernels/test_deepseek_v41_engram_rows.py
+index eb7496e..4005166 100644
+--- a/tests/kernels/test_deepseek_v41_engram_rows.py
++++ b/tests/kernels/test_deepseek_v41_engram_rows.py
+@@ -1197,3 +1197,161 @@ def test_multi_cta_step_kernel_matches_three_launch_across_batches(columns: int,
+             torch.testing.assert_close(out_step.cpu(), expected, rtol=0, atol=0, equal_nan=True)
+     finally:
+         rows.close()
++
++
++def test_row_cache_clock_pro_prefill_shield_preserves_decode_working_set():
++    """2-bit Clock + prefill probationary insertion preserves hot multi-hit decode
++    rows across a multi-chunk prefill flood (>30x cache capacity) while graduating
++    repeated prompt n-grams."""
++    big_rows = 4096
++    rng = np.random.default_rng(109)
++    root = _table_dir()
++    codes = rng.integers(0, 256, size=(big_rows, ROW_BYTES), dtype=np.uint8)
++    codes[codes == 0x7F] = 1
++    codes[codes == 0xFF] = 1
++    scales = rng.integers(120, 134, size=(big_rows, SCALE_BYTES), dtype=np.uint8)
++    w_path = os.path.join(root, "big_weights.bin")
++    s_path = os.path.join(root, "big_scales.bin")
++    with open(w_path, "wb") as f:
++        f.write(codes.tobytes())
++    with open(s_path, "wb") as f:
++        f.write(scales.tobytes())
++
++    rows = EngramDiskRows(
++        device="cuda",
++        table_rows=big_rows,
++        shard_start=0,
++        shard_end=big_rows,
++        max_lookups=128 * HEADS,
++        columns=TP3_RANK1,
++        cache_rows=256,
++    )
++    rows.add_source(w_path, 0, scale=False)
++    rows.add_source(s_path, 0, scale=True)
++
++    def wait_idle():
++        torch.cuda.synchronize()
++        deadline = time.monotonic() + 5.0
++        while rows.stats()["queued"] and time.monotonic() < deadline:
++            time.sleep(0.001)
++
++    try:
++        # Build a 16-token decode step (16 * 8 = 128 distinct owned rows in 0..127).
++        decode_ids = torch.zeros((16, HEADS), dtype=torch.int64)
++        owned_cols = [c for c in range(HEADS) if (TP3_RANK1 >> c) & 1]
++        for t in range(16):
++            for idx, c in enumerate(owned_cols):
++                decode_ids[t, c] = t * 8 + idx
++        decode_gpu = decode_ids.cuda()
++        expected_decode = _reference(
++            torch.from_numpy(codes), torch.from_numpy(scales),
++            decode_ids, 16, 0, big_rows, TP3_RANK1,
++        )
++
++        # Warm decode working set twice so all 128 decode rows reach usage >= 2.
++        out_w1, _ = _step(rows, decode_gpu, 16, early=decode_ids.numpy())
++        torch.testing.assert_close(out_w1.cpu(), expected_decode, rtol=0, atol=0)
++        wait_idle()
++        out_w2, _ = _step(rows, decode_gpu, 16, early=decode_ids.numpy())
++        torch.testing.assert_close(out_w2.cpu(), expected_decode, rtol=0, atol=0)
++        wait_idle()
++        s_after_warm = rows.stats()
++        assert s_after_warm["cache_hits"] == 128
++
++        # Stream 8 prefill chunks of 128 tokens (8 * 1024 = 8192 owned lookups = 32x
++        # the 256-row cache capacity) using one-time row IDs in [256, 4096), plus 8
++        # recurring prompt header rows in [192, 200) on token 0 of every chunk.
++        cursor = 256
++        for chunk in range(8):
++            pf_ids = torch.zeros((128, HEADS), dtype=torch.int64)
++            for idx, c in enumerate(owned_cols):
++                pf_ids[0, c] = 192 + idx
++            for t in range(1, 128):
++                for idx, c in enumerate(owned_cols):
++                    pf_ids[t, c] = cursor
++                    cursor = 256 + ((cursor - 256 + 1) % (big_rows - 256))
++            pf_gpu = pf_ids.cuda()
++            out_pf, _ = _step(rows, pf_gpu, 128, early=pf_ids.numpy())
++            expected_pf = _reference(
++                torch.from_numpy(codes), torch.from_numpy(scales),
++                pf_ids, 128, 0, big_rows, TP3_RANK1,
++            )
++            torch.testing.assert_close(out_pf.cpu(), expected_pf, rtol=0, atol=0)
++            wait_idle()
++
++        # Verify all 128 hot decode working-set rows survived the 32x prefill flood
++        # with zero disk read calls.
++        s_before_decode = rows.stats()
++        out_post, _ = _step(rows, decode_gpu, 16, early=decode_ids.numpy())
++        torch.testing.assert_close(out_post.cpu(), expected_decode, rtol=0, atol=0)
++        wait_idle()
++        s_after_decode = rows.stats()
++        assert s_after_decode["cache_hits"] - s_before_decode["cache_hits"] == 128
++        assert s_after_decode["read_calls"] == s_before_decode["read_calls"]
++    finally:
++        rows.close()
++
++
++def test_two_plane_pinned_scales_halves_read_calls_and_matches_reference():
++    """Opt-in scale plane pinning in two-plane mode matches unpinned two-plane and
++    packed outputs bit-for-bit while eliminating scale.bin O_DIRECT read calls."""
++    codes, scales, paths = _write_table(_table_dir(), seed=113)
++    unpinned = EngramDiskRows(
++        device="cuda",
++        table_rows=TABLE_ROWS,
++        shard_start=0,
++        shard_end=TABLE_ROWS,
++        max_lookups=16 * HEADS,
++        columns=TP3_RANK1,
++        cache_rows=256,
++        pin_scales=False,
++    )
++    pinned = EngramDiskRows(
++        device="cuda",
++        table_rows=TABLE_ROWS,
++        shard_start=0,
++        shard_end=TABLE_ROWS,
++        max_lookups=16 * HEADS,
++        columns=TP3_RANK1,
++        cache_rows=256,
++        pin_scales=True,
++    )
++    for r in (unpinned, pinned):
++        r.add_source(paths["weights"], 0, scale=False)
++        r.add_source(paths["scales"], 0, scale=True)
++
++    def wait_reader(r):
++        torch.cuda.synchronize()
++        deadline = time.monotonic() + 5.0
++        while r.stats()["queued"] and time.monotonic() < deadline:
++            time.sleep(0.001)
++
++    try:
++        gen = torch.Generator().manual_seed(127)
++        ids = torch.randint(0, TABLE_ROWS, (16, HEADS), generator=gen, dtype=torch.int64)
++        ids_gpu = ids.cuda()
++        expected = _reference(codes, scales, ids, 16, 0, TABLE_ROWS, TP3_RANK1)
++
++        out_u1, _ = _step(unpinned, ids_gpu, 16, early=ids.numpy())
++        out_p1, _ = _step(pinned, ids_gpu, 16, early=ids.numpy())
++        wait_reader(unpinned)
++        wait_reader(pinned)
++        torch.testing.assert_close(out_u1.cpu(), expected, rtol=0, atol=0)
++        torch.testing.assert_close(out_p1.cpu(), expected, rtol=0, atol=0)
++        assert torch.equal(out_u1.view(torch.uint16), out_p1.view(torch.uint16))
++
++        su1 = unpinned.stats()
++        sp1 = pinned.stats()
++        assert sp1["read_calls"] > 0
++        assert su1["read_calls"] == sp1["read_calls"] * 2
++
++        # Second identical step hits 100% in the row cache with 0 additional read calls.
++        out_p2, _ = _step(pinned, ids_gpu, 16, early=ids.numpy())
++        wait_reader(pinned)
++        torch.testing.assert_close(out_p2.cpu(), expected, rtol=0, atol=0)
++        sp2 = pinned.stats()
++        assert sp2["read_calls"] == sp1["read_calls"]
++        assert sp2["cache_hits"] - sp1["cache_hits"] == 16 * 8
++    finally:
++        unpinned.close()
++        pinned.close()
+diff --git a/vllm/models/deepseek_v4_1/engram_rows/_reader.c b/vllm/models/deepseek_v4_1/engram_rows/_reader.c
+index d438f72..8e15e3f 100644
+--- a/vllm/models/deepseek_v4_1/engram_rows/_reader.c
++++ b/vllm/models/deepseek_v4_1/engram_rows/_reader.c
+@@ -503,8 +503,10 @@ static void serve(reader_t *reader, step_t step) {
+     failure_t failure = {{0}};
+     if (step.is_prefetch) {
+         if (step.early && reader->plan.cache_sets) {
++            reader->plan.is_prefetch = true;
+             failure = read_rows_into(reader, (const char *)step.early, step.count,
+                                      reader->early_weights, reader->early_scales, true);
++            reader->plan.is_prefetch = false;
+             if (!failure.message[0] && !reader->poisoned) {
+                 ple_cache_commit(&reader->plan);
+             }
+@@ -731,9 +733,10 @@ static PyObject *py_reader(PyObject *self, PyObject *args) {
+     double ids_timeout, delay;
+     int check_early, timeline;
+     long long cache_rows = PLE_DEFAULT_CACHE_ROWS;
+-    if (!PyArg_ParseTuple(args, "LLLILiKKKKddpp|L", &table_rows, &shard_start, &shard_end, &columns, &max_lookups,
++    int pin_scales = -1;
++    if (!PyArg_ParseTuple(args, "LLLILiKKKKddpp|Li", &table_rows, &shard_start, &shard_end, &columns, &max_lookups,
+                           &depth, &ids, &weights, &scales, &control, &ids_timeout, &delay, &check_early,
+-                          &timeline, &cache_rows))
++                          &timeline, &cache_rows, &pin_scales))
+         return NULL;
+     if (table_rows <= 0 || shard_start < 0 || shard_end < shard_start || shard_end > table_rows ||
+         !columns || (columns & ~PLE_ALL_COLUMNS) || cache_rows < 0 ||
+@@ -751,6 +754,7 @@ static PyObject *py_reader(PyObject *self, PyObject *args) {
+         return error == ENOMEM ? PyErr_NoMemory()
+                                : PyErr_Format(PyExc_ValueError, "Engram row plan: %s", strerror(error));
+     }
++    if (pin_scales >= 0) reader->plan.pin_scales = pin_scales != 0;
+     reader->ids = (const char *)(uintptr_t)ids;
+     reader->weights = (char *)(uintptr_t)weights;
+     reader->scales = (char *)(uintptr_t)scales;
+diff --git a/vllm/models/deepseek_v4_1/engram_rows/_row_plan.h b/vllm/models/deepseek_v4_1/engram_rows/_row_plan.h
+index 77bdcf6..1135621 100644
+--- a/vllm/models/deepseek_v4_1/engram_rows/_row_plan.h
++++ b/vllm/models/deepseek_v4_1/engram_rows/_row_plan.h
+@@ -16,6 +16,7 @@
+ #define PLE_PACKED_ROW_BYTES 264u
+ #define PLE_PACKED_ROWS_PER_PAGE 15u
+ #define PLE_CACHE_WAYS 4u
++#define PLE_CACHE_MAX_USAGE 3u
+ #define PLE_DEFAULT_CACHE_ROWS 65536
+ #define PLE_CACHE_MAX_TOKENS 64u
+ #define PLE_CACHE_MAX_LOOKUPS (PLE_CACHE_MAX_TOKENS * PLE_COLUMNS)
+@@ -23,6 +24,8 @@
+ typedef struct {
+     int64_t ids[PLE_CACHE_WAYS];
+     uint8_t clock;
++    uint8_t usage[PLE_CACHE_WAYS];
++    uint8_t reserved[3];
+     char weights[PLE_CACHE_WAYS][256];
+     char scales[PLE_CACHE_WAYS][8];
+ } ple_cache_set_t;
+@@ -39,6 +42,7 @@ typedef struct {
+     int64_t offset;
+     size_t file;
+     bool scale;
++    char *pinned_scales;
+ } ple_source_t;
+ 
+ typedef struct {
+@@ -60,7 +64,7 @@ typedef struct {
+ typedef struct {
+     int64_t shard_rows, padded_rows, tp_start, tp_end;
+     uint32_t columns;
+-    bool packed, has_col_map;
++    bool packed, has_col_map, pin_scales, is_prefetch, miss_is_prefill;
+     int64_t col_start[PLE_COLUMNS], col_end[PLE_COLUMNS], col_delta[PLE_COLUMNS];
+     size_t weight_bytes, scale_bytes, max_lookups, capacity;
+     ple_fragment_t *fragments;
+@@ -92,6 +96,7 @@ static inline int ple_source_compare(const void *left, const void *right) {
+ 
+ static inline void ple_plan_release(ple_plan_t *reader) {
+     for (size_t i = 0; i < reader->file_count; i++) close(reader->files[i].fd);
++    for (size_t i = 0; i < reader->source_count; i++) free(reader->sources[i].pinned_scales);
+     free(reader->files);
+     free(reader->sources);
+     free(reader->fragments);
+@@ -126,6 +131,8 @@ static inline int ple_plan_init(ple_plan_t *reader, int64_t shard_rows,
+     reader->weight_bytes = weight_bytes;
+     reader->scale_bytes = scale_bytes;
+     reader->max_lookups = max_lookups;
++    const char *pin_env = getenv("SPARK_DS41F_ENGRAM_PIN_SCALES");
++    reader->pin_scales = pin_env && strcmp(pin_env, "1") == 0;
+     reader->capacity = (size_t)max_lookups * per_row;
+     reader->fragments = calloc(reader->capacity, sizeof(*reader->fragments));
+     reader->jobs = calloc(reader->capacity, sizeof(*reader->jobs));
+@@ -224,8 +231,50 @@ static inline int ple_add_source_rows(ple_plan_t *reader, int64_t shard, const c
+                 } else if (reader->files[file].bytes != status.st_size) {
+                     snprintf(failure.message, sizeof(failure.message), "PLE source file size changed during registration");
+                 }
++                char *pinned_scales = NULL;
++                if (!failure.message[0] && scale && !reader->packed && reader->pin_scales && span_bytes > 0) {
++                    pinned_scales = malloc((size_t)span_bytes);
++                    if (!pinned_scales) {
++                        snprintf(failure.message, sizeof(failure.message),
++                                 "could not allocate pinned PLE scale plane");
++                    } else {
++                        int pin_fd = open(path, O_RDONLY | O_CLOEXEC);
++                        if (pin_fd < 0) {
++                            system_error(&failure, "open pinned PLE scale source");
++                        } else {
++                            size_t done = 0;
++                            while (done < (size_t)span_bytes) {
++                                ssize_t n = pread(pin_fd, pinned_scales + done,
++                                                  (size_t)span_bytes - done,
++                                                  (off_t)(offset + (int64_t)done));
++                                if (n < 0) {
++                                    if (errno == EINTR) continue;
++                                    system_error(&failure, "read pinned PLE scale source");
++                                    break;
++                                }
++                                if (n == 0) {
++                                    snprintf(failure.message, sizeof(failure.message),
++                                             "short read while pinning PLE scale source");
++                                    break;
++                                }
++                                done += (size_t)n;
++                            }
++                            const char *drop_env = getenv("SPARK_DS41F_ENGRAM_DROP_PAGE_CACHE");
++                            if (!drop_env || strcmp(drop_env, "0") != 0) {
++                                (void)posix_fadvise(pin_fd, (off_t)offset, (off_t)span_bytes,
++                                                    POSIX_FADV_DONTNEED);
++                            }
++                            close(pin_fd);
++                        }
++                        if (failure.message[0]) {
++                            free(pinned_scales);
++                            pinned_scales = NULL;
++                        }
++                    }
++                }
+                 if (!failure.message[0]) {
+-                    reader->sources[reader->source_count++] = (ple_source_t){shard, offset, file, scale != 0};
++                    reader->sources[reader->source_count++] =
++                        (ple_source_t){shard, offset, file, scale != 0, pinned_scales};
+                     qsort(reader->sources, reader->source_count, sizeof(*sources), ple_source_compare);
+                     const char *drop_env = getenv("SPARK_DS41F_ENGRAM_DROP_PAGE_CACHE");
+                     if (!drop_env || strcmp(drop_env, "0") != 0) {
+@@ -399,17 +448,65 @@ static inline void ple_stash_job(ple_plan_t *reader, size_t index) {
+ }
+ 
+ static inline void ple_cache_insert(ple_plan_t *reader, int64_t id,
+-        const char *weight_src, const char *scale_src) {
++        const char *weight_src, const char *scale_src, bool is_prefill) {
+     size_t set_idx = ple_cache_set_index(id, reader->cache_set_mask);
+     ple_cache_set_t *set = &reader->cache[set_idx];
+     for (unsigned w = 0; w < PLE_CACHE_WAYS; w++) {
+-        if (set->ids[w] == id) return;
++        if (set->ids[w] == id) {
++            if (set->usage[w] < PLE_CACHE_MAX_USAGE) set->usage[w]++;
++            return;
++        }
++    }
++    unsigned start = set->clock & (PLE_CACHE_WAYS - 1);
++    for (unsigned step = 0; step < PLE_CACHE_WAYS; step++) {
++        unsigned w = (start + step) & (PLE_CACHE_WAYS - 1);
++        if (set->ids[w] < 0) {
++            set->clock = (uint8_t)((w + 1) & (PLE_CACHE_WAYS - 1));
++            set->ids[w] = id;
++            set->usage[w] = is_prefill ? 0u : 1u;
++            memcpy(set->weights[w], weight_src, 256u);
++            memcpy(set->scales[w], scale_src, 8u);
++            reader->cache_populated++;
++            return;
++        }
++    }
++    for (unsigned step = 0; step < PLE_CACHE_WAYS; step++) {
++        unsigned w = (start + step) & (PLE_CACHE_WAYS - 1);
++        if (set->usage[w] == 0u) {
++            set->clock = (uint8_t)((w + 1) & (PLE_CACHE_WAYS - 1));
++            set->ids[w] = id;
++            set->usage[w] = is_prefill ? 0u : 1u;
++            memcpy(set->weights[w], weight_src, 256u);
++            memcpy(set->scales[w], scale_src, 8u);
++            reader->cache_populated++;
++            return;
++        }
+     }
+-    unsigned w = set->clock & (PLE_CACHE_WAYS - 1);
+-    set->clock = (uint8_t)((w + 1) & (PLE_CACHE_WAYS - 1));
+-    set->ids[w] = id;
+-    memcpy(set->weights[w], weight_src, 256u);
+-    memcpy(set->scales[w], scale_src, 8u);
++    if (is_prefill) {
++        for (unsigned step = 0; step < PLE_CACHE_WAYS; step++) {
++            unsigned w = (start + step) & (PLE_CACHE_WAYS - 1);
++            if (set->usage[w] == 1u) {
++                set->clock = (uint8_t)((w + 1) & (PLE_CACHE_WAYS - 1));
++                set->ids[w] = id;
++                set->usage[w] = 0u;
++                memcpy(set->weights[w], weight_src, 256u);
++                memcpy(set->scales[w], scale_src, 8u);
++                reader->cache_populated++;
++                return;
++            }
++        }
++        return;
++    }
++    unsigned victim = start;
++    for (;;) {
++        if (--set->usage[victim] == 0u) break;
++        victim = (victim + 1) & (PLE_CACHE_WAYS - 1);
++    }
++    set->clock = (uint8_t)((victim + 1) & (PLE_CACHE_WAYS - 1));
++    set->ids[victim] = id;
++    set->usage[victim] = 1u;
++    memcpy(set->weights[victim], weight_src, 256u);
++    memcpy(set->scales[victim], scale_src, 8u);
+     reader->cache_populated++;
+ }
+ 
+@@ -424,12 +521,14 @@ static inline void ple_cache_commit(ple_plan_t *reader) {
+         w_base = reader->miss_weights;
+         s_base = reader->miss_scales;
+     }
++    bool is_prefill = reader->miss_is_prefill;
+     for (size_t k = 0; k < reader->miss_count; k++) {
+         uint32_t lookup = reader->miss_lookups[k];
+         int64_t id = reader->miss_ids[k];
+         ple_cache_insert(reader, id,
+                          w_base + (size_t)lookup * 256u,
+-                         s_base + (size_t)lookup * 8u);
++                         s_base + (size_t)lookup * 8u,
++                         is_prefill);
+     }
+     reader->miss_count = 0;
+ }
+@@ -443,10 +542,13 @@ static inline bool ple_plan(ple_plan_t *reader, const char *ids, size_t count,
+     bool fill_cache = use_cache;
+     reader->miss_src_weights = dst_is_cached ? dst_weights : NULL;
+     reader->miss_src_scales = dst_is_cached ? dst_scales : NULL;
++    size_t live_col_lookups = 0;
+     for (size_t i = 0; i < count; i++) {
+         int64_t id;
+         memcpy(&id, ids + i * sizeof(id), sizeof(id));
+         unsigned col = (unsigned)(i % PLE_COLUMNS);
++        if (id >= 0 && ((reader->columns >> col) & 1u))
++            live_col_lookups++;
+         /* Another rank's row (or a dead lookup): its slot is not read; the gather writes
+          * zeros for it without loading the slot. */
+         if (id < reader->tp_start || id >= reader->tp_end ||
+@@ -474,6 +576,8 @@ static inline bool ple_plan(ple_plan_t *reader, const char *ids, size_t count,
+                 }
+             }
+             if (hit_way >= 0) {
++                if (set->usage[hit_way] < PLE_CACHE_MAX_USAGE)
++                    set->usage[hit_way]++;
+                 memcpy(dst_weights + i * 256u, set->weights[hit_way], 256u);
+                 memcpy(dst_scales + i * 8u, set->scales[hit_way], 8u);
+                 reader->cache_hits++;
+@@ -500,6 +604,14 @@ static inline bool ple_plan(ple_plan_t *reader, const char *ids, size_t count,
+             size_t bytes = plane ? reader->scale_bytes : reader->weight_bytes;
+             size_t destination = i * bytes;
+             int64_t rel_row = phys_id % reader->shard_rows;
++            if (plane && source->pinned_scales) {
++                const char *scale_src = source->pinned_scales + (size_t)rel_row * bytes;
++                memcpy(dst_scales + destination, scale_src, bytes);
++                if (fill_cache && !dst_is_cached) {
++                    memcpy(reader->miss_scales + destination, scale_src, bytes);
++                }
++                continue;
++            }
+             int64_t offset = reader->packed
+                 ? source->offset + (rel_row / (int64_t)PLE_PACKED_ROWS_PER_PAGE) * (int64_t)PLE_BLOCK +
+                       (rel_row % (int64_t)PLE_PACKED_ROWS_PER_PAGE) * (int64_t)PLE_PACKED_ROW_BYTES
+@@ -516,6 +628,10 @@ static inline bool ple_plan(ple_plan_t *reader, const char *ids, size_t count,
+             }
+         }
+     }
++    size_t max_decode_owned =
++        (size_t)PLE_CACHE_MAX_TOKENS * (size_t)__builtin_popcount(reader->columns);
++    reader->miss_is_prefill =
++        !reader->is_prefetch && (live_col_lookups > max_decode_owned);
+     ple_sort(reader);
+     size_t cursor = 0;
+     while (cursor < reader->fragment_count) {
+diff --git a/vllm/models/deepseek_v4_1/engram_rows/rows.py b/vllm/models/deepseek_v4_1/engram_rows/rows.py
+index 9e4c135..d65d322 100644
+--- a/vllm/models/deepseek_v4_1/engram_rows/rows.py
++++ b/vllm/models/deepseek_v4_1/engram_rows/rows.py
+@@ -19,6 +19,7 @@ the Python side is.
+ """
+ 
+ import math
++import os
+ import sys
+ from contextlib import suppress
+ 
+@@ -203,7 +204,8 @@ class EngramDiskRows:
+                  ids_timeout_s: float = 20.0,
+                  rows_timeout_s: float = 10.0, delay_s: float = 0.0,
+                  check_early: bool = False, timeline: bool = False,
+-                 cache_rows: int = DEFAULT_CACHE_ROWS):
++                 cache_rows: int = DEFAULT_CACHE_ROWS,
++                 pin_scales: bool | None = None):
+         self.native = load()
+         self.device = _indexed(device)
+         self.shard_start, self.shard_end = int(shard_start), int(shard_end)
+@@ -214,6 +216,11 @@ class EngramDiskRows:
+         self.check_early = bool(check_early)
+         self.timeline_enabled = bool(timeline)
+         self.cache_rows = int(cache_rows)
++        self.pin_scales = (
++            os.environ.get("SPARK_DS41F_ENGRAM_PIN_SCALES") == "1"
++            if pin_scales is None
++            else bool(pin_scales)
++        )
+         self._allocations = []
+         self.ids = torch.empty(self.max_lookups, dtype=torch.int64, pin_memory=True)
+         self._ids_mlocked = mlock_memory(self.ids.data_ptr(), self.ids.nbytes)
+@@ -228,7 +235,7 @@ class EngramDiskRows:
+             table_rows, self.shard_start, self.shard_end, self.columns, self.max_lookups, queue_depth,
+             self.ids.data_ptr(), self.weights.pointer, self.scales.pointer, self.control.pointer,
+             float(ids_timeout_s), float(delay_s), self.check_early,
+-            self.timeline_enabled, self.cache_rows,
++            self.timeline_enabled, self.cache_rows, int(self.pin_scales),
+         )
+         self._ids_seq_device = self.control.device_view.data_ptr() + 4 * self.native.CTRL_IDS_SEQ
+         self._sequence = 0
+-- 
+2.43.0
+
