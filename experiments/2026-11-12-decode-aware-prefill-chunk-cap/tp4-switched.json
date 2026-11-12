@@ -1,0 +1,22 @@
+{
+  "notes": "Opt-in decode-aware prefill chunk cap on 1107: SPARK_DS41F_PREFILL_MIX_CHUNK=8192 caps prefill chunks below 256K context while decodes are runnable. No production or site configuration change.",
+  "extends": {
+    "config": "releases/spark-ds41f-1107/cluster.json",
+    "shape": "tp4-switched"
+  },
+  "set": {
+    "container": {
+      "image": "spark-ds41f:1107-mix-chunk-cap",
+      "expected_labels": {
+        "local.spark-ds41f.vllm.tree": "2eb7063c9620984729cbfbea159172d37197e36a"
+      }
+    },
+    "upstreams_config": "experiments/2026-11-12-decode-aware-prefill-chunk-cap/upstreams.lock.json",
+    "environment": {
+      "SPARK_DS41F_PREFILL_MIX_CHUNK": "8192"
+    },
+    "deployment": {
+      "launch_enabled": false
+    }
+  }
+}
