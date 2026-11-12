@@ -3,8 +3,9 @@
 The first candidate on frozen [candidate-54](../candidate-54/README.md) (tag `candidate-54`): six of the owner's PRs
 that change the platform under the model rather than one kernel. Chosen by the owner on 2026-11-11 ("check 1134 and
 include the cuda 13.5 setup for candidate-55", "also add the b12x removal", "also add the sparknet rework PR": "both
-#989 and #982"), with #1134's new head and #1145 added on 2026-11-12 ("Yes, rebuild"). It is a candidate, not a
-merged base: verified against candidate-54's recorded runs, not release-qualified.
+#989 and #982"), with #1134's new head and #1145 added on 2026-11-12 ("Yes, rebuild"), and #738's GLP Spec v3 runtime
+added the same day ("prepare the GLP update into candidate-55"). It is a candidate, not a merged base: verified
+against candidate-54's recorded runs, not release-qualified.
 
 | PR | What | Carried as |
 | --- | --- | --- |
@@ -14,11 +15,21 @@ merged base: verified against candidate-54's recorded runs, not release-qualifie
 | #989 | sparknet: one persistent multi-stage kernel per collective, 8 thread blocks, no single-slot cap, so SP prefill collectives up to 16 MiB stay on sparknet | sparknet `0002` |
 | #982 | sparknet: PDL chaining of the four one-shot collectives (Part A) | sparknet `0003` (re-placed in #989's stage loop); vLLM `0803` (its PDL-chain test entry) |
 | #974 | CUDA 13.5.37 toolchain (nvcc/ptxas, cudart) and cuBLASLt 13.10.0.20 | `sources.cuda_toolkit` in this lock (hash-locked debs) |
+| #738 | GLP's reader takes Spec v3 (`hc_fold_pre_engram`) beside Spec v1; a Spec v3 vector folds the stream mean and projects each covered layer's attention write. A Spec v1 vector (GLP-39) steers as before | vLLM `0805` (rebased on candidate-55, [receipts/glp-rebase](receipts/glp-rebase/README.md)) |
 
 ## Selection
 
-- **Authors:** every PR is christopherowen's, and every patch's `From:` is Christopher Owen's. #1134's `0800` at
-  `37a7f0ac` read `test <test@example.com>`; at `6757c7a1` it is Christopher Owen's.
+- **Authors:** every PR but #738 is christopherowen's, and every other patch's `From:` is Christopher Owen's. #1134's
+  `0800` at `37a7f0ac` read `test <test@example.com>`; at `6757c7a1` it is Christopher Owen's.
+- **#738 is an exception to the owner-only rule, on the owner's instruction** (2026-11-12: "prepare the GLP update
+  into candidate-55"). #738 is msuiche's PR, merged to `main` as an experiment folder
+  ([2026-10-31-glp-specv3-fold-steering](../../2026-10-31-glp-specv3-fold-steering/README.md)), and its patch's
+  `From:` is Matt Suiche, co-authored by Christopher Owen. `0805` keeps that authorship.
+- **#738 is carried as its patch:** `0805`, rebased by hand in two `nvidia/model.py` hunks. Its GLP-27 profiles are
+  replaced by [glp27-tp4.json](glp27-tp4.json), which extends this candidate's `tp4.json`.
+- **#985 is not carried.** It switches the default vector to GLP-27 in `config/cluster.json`, which `spark-ds41f-1107`'s
+  image cannot read. Every measured arm here keeps GLP-39, and GLP-27 runs on a qualification arm only. The switch
+  belongs in the promotion commit of a release whose image reads Spec v3.
 - **#1134 is carried in part:** its vLLM and sparknet patches only, at head `6757c7a1` (owner, 2026-11-12: "Yes,
   rebuild").
   - **This head's `0800`** replaces the one of `37a7f0ac`, which replaced the one first carried (heads `2d0c6c0b` and
@@ -53,8 +64,8 @@ merged base: verified against candidate-54's recorded runs, not release-qualifie
 
 - vLLM ([vllm/series](vllm/series)): candidate-54's 672 patches by relative path, then `0800`, `0801` (#1134's files,
   unchanged), `0802` (#1096 rebased, [receipts/b12x-rebase](receipts/b12x-rebase/README.md)), `0803` (#982's test
-  entry) and `0804` (#1145's file, unchanged). 677 patches, `patch_head` `3987ee2f`, `expected_tree` `e8c20f54`,
-  `patchset_sha256` `6d17c16f`.
+  entry), `0804` (#1145's file, unchanged) and `0805` (#738 rebased, [receipts/glp-rebase](receipts/glp-rebase/README.md)).
+  678 patches, `patch_head` `d6d4319e`, `expected_tree` `8aaae3df`, `patchset_sha256` `6fdf03dc`.
 - sparknet ([sparknet/series](sparknet/series)) on `1fd6a1fb`: `0001` (#1134), `0002` (#989), `0003` (#982 Part A,
   [receipts/sparknet-stack](receipts/sparknet-stack/README.md)). `patch_head` `1fdf8dc7`, `expected_tree` `e06f6a06`,
   `patchset_sha256` `60bb1942`.
@@ -62,8 +73,8 @@ merged base: verified against candidate-54's recorded runs, not release-qualifie
   debs, 1.51 GB). Every other source is candidate-54's.
 - Recorded by `bin/spark build prepare --lock` on dgx4 for both locks (the same vLLM and sparknet trees), the heads
   copied into each `upstreams.lock.json`; the 23 debs downloaded and verified against the lockfile there. Recorded
-  again for #1134 at `37a7f0ac` (vLLM tree `ed91c273`), and for #1134 at `6757c7a1` with #1145 (tree `e8c20f54`).
-  Both times a `git am` replay on dgx3 gives the same tree. The provenance, SHA-256 and author of each patch are in
+  again for #1134 at `37a7f0ac` (vLLM tree `ed91c273`), for #1134 at `6757c7a1` with #1145 (tree `e8c20f54`), and with
+  #738's `0805` (tree `8aaae3df`). Each time a `git am` replay on dgx3 gives the same tree. The provenance, SHA-256 and author of each patch are in
   [receipts/selection.json](receipts/selection.json).
 - **What #1096 changes on the serving path:** one TileLang kernel, `engram_resident_lookup_kernel`, whose row bound
   is now `0 <= n_tok <= tokens` (bit-identical inside it, recompiled); the rest is renames, dead fields, the deleted
@@ -85,6 +96,7 @@ unchanged. The control can: it must give candidate-54's TP4 hashes `18d61961`/`d
 | #1096 | Its release-test selection passes; no B12X module is imported at startup | Inert: the control's gate gives candidate-54's hashes; time to ready not worse (three startup RPC rounds skipped) |
 | #989 | Its `bench_pipelined_collectives.py` on sp1..sp4 (TP4) and sp1..sp3 (TP3): collectives of 4-16 MiB faster than PyNCCL beyond the interval, outputs bit-exact | Prefill at 32K and 256K not worse at `tp4-ring` and `tp4-switched` |
 | #982 | Its `bench_pdl_direct_stage.py` chains on sp1..sp4, Part A only: chain time at M=1..32 faster beyond the interval; the PDL-chain source test passes | The gate on 12 boots at `tp4-ring` and the c1 decision check: every boot identical. #982 makes more graph edges programmatic, the class of hazard `0799` fixed |
+| #738 (declared 2026-11-12, before the fourth build) | Its suite passes in the release tests: the GLP kernel and model tests, `glp_steer_write`'s PDL-chain entry, the weightless, CED and SP-prefill model tests. The image's reader accepts GLP-39 and GLP-27 on the head (`doctor`'s GLP reader check, #1149, on `tp4.json` and `glp27-tp4.json`) | **Spec v1 unchanged:** GLP-39's steered replies ([glp39-steered-tp4.json](glp39-steered-tp4.json), `dual_probe.py`) identical in token IDs and log probabilities to the third build's. **Stock unchanged:** every gate gives candidate-54's hashes with GLP-39 configured, and [qualify-glp27-tp4.json](qualify-glp27-tp4.json)'s gate runs give them with GLP-27 configured. **GLP-27 qualified at `tp4-ring`:** every `dual_probe.py` check passes on both boots; its steered speed and AdvBench rates are recorded, not gated |
 | #1145 (declared 2026-11-12, before the third build) | Its test (`test_external_dmabuf_carveout_loads_and_rejects_out_of_bounds`) passes where `/dev/dri/card0` exists, and the release tests pass | Every `tp3-switched` boot loads its weights (no `batch destination exceeds CUDA device allocation`); inert at `tp4-ring`, where the carve-out is off: the gate gives candidate-54's hashes |
 
 ## Verification
@@ -96,6 +108,12 @@ unchanged. The control can: it must give candidate-54's TP4 hashes `18d61961`/`d
 - **c1 decision check:** 4 boots at `tp4-ring` and `tp4-switched`.
 - **Screens:** two boots against candidate-54's recorded screens
   ([candidate-54/receipts/references](../candidate-54/receipts/references), `candidate-54-0799-<testbed>-…`).
+- **GLP (from the fourth build):** GLP-39's steered replies on 2 boots at `tp4-ring`, against the third build's
+  ([glp39-steered-tp4.json](glp39-steered-tp4.json), run `-b3` before the fourth build and `-b4` after). The GLP-27
+  qualification on 2 boots at `tp4-ring` ([qualify-glp27-tp4.json](qualify-glp27-tp4.json)): the temperature-0 gate
+  on the stock name, [dual_probe.py](../../2026-10-28-glp-dual-serving/dual_probe.py) `--speed`, 16 distinct streams
+  and [advbench.py](../../2026-10-28-glp-dual-serving/advbench.py), as GLP-39 was qualified for `glp-3`
+  ([2026-10-28-glp-dual-serving](../../2026-10-28-glp-dual-serving/README.md)). GLP-27 at TP3 is not qualified.
 - **Pre-launch defragmentation:** candidate-55's and the control's boots defragment before launch, but candidate-54's
   recorded references were taken without it. A difference against those references includes the defragmentation,
   which counts as part of #1134.
@@ -109,7 +127,9 @@ adds (`tests/quantization/test_mxfp4_csf.py` and `tests/v1/core/test_contiguous_
 selected files (156 gate, 61 excluded), 0 problems, the same at both trees. The gate manifest has 157 files and 16
 deselected tests at `003fd4cc`, bundled in [bundles/release-tests](bundles/release-tests). The test files of #1134's
 new `0800` (`test_direct_loader.py`, `test_direct_loader_cuda.py`) are gate files. `0803`'s `test_sparknet_oneshot_collectives_pdl_sources` is a gate
-test that passes only with sparknet `0003` in the image.
+test that passes only with sparknet `0003` in the image. #738's test files (`test_deepseek_v41_tilelang_glp.py`,
+`test_deepseek_v4_1_glp.py`) were gate files already, and so are the other files of its suite. With `0805` the check
+is unchanged (217 files, 0 problems), and the gate manifest changes only its head (`d6d4319e`).
 
 **First build** (image `8793529c`, dgx4, 2,656 s): 2 failed, 10,242 passed, 357 skipped
 ([receipts/release-tests-8793529c](receipts/release-tests-8793529c)). The two failures were
@@ -250,3 +270,13 @@ Marks after the third build:
 boots `tp4.json` (the third build's image, GLP-39 configured, as every measured arm) twice at `tp4-ring` and runs
 [dual_probe.py](../../2026-10-28-glp-dual-serving/dual_probe.py) without `--speed`. Its steered replies (token IDs and
 log probabilities, greedy) are the reference for #738's claim that a Spec v1 vector steers as before.
+
+**#738 folded in** (2026-11-12, owner: "prepare the GLP update into candidate-55"):
+- **Series and locks:** `0805` added after `0804`. The vLLM tree is `8aaae3df`, both locks are re-recorded, and
+  every profile's `vllm.tree` label follows.
+- **GLP-27:** [glp27-tp4.json](glp27-tp4.json) adds it, with [qualify-glp27-tp4.json](qualify-glp27-tp4.json) and
+  #738's marks declared above. The file is in the Hugging Face cache on dgx1..dgx4 at revision `4d570926`, with
+  sha256 `24e97d41`. AdvBench's data is on dgx1.
+- **Third build:** its images and results are of tree `e8c20f54` and stay as its record.
+- **Fourth build:** it replaces both images and runs every gate, check and screen again. Its specs' runs are named
+  `<run>-b4`.
