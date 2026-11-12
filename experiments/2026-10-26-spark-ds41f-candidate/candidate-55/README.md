@@ -191,4 +191,5 @@ to candidate-54.
 **#1134 at `6757c7a1` and #1145 folded in** (2026-11-12, owner: "Yes, rebuild"): `0800` fixed for 4 KiB pages,
 `0804` added; vLLM tree `e8c20f54`, both locks re-recorded. The second build's images and every result above are of
 tree `ed91c273` and stay as its record. The third build replaces both images, and its gates and screens are run
-again at every testbed.
+again at every testbed. Their specs' runs are named `<run>-b3`, so the second build's result folders on the nodes
+(which the receipts list by hash) are not overwritten.
