@@ -169,13 +169,36 @@ guards) and the engine's own time from launch to API ready. Each image's first b
   build's 176.3 s boot (gate, boot 11) was the same, launch at +68 s. That is 3 of 66 boots over both builds. The log
   does not time the pre-launch steps separately.
 
+## GLP-39's steered replies, the reference for #738
+
+Job `20261112T133400-glp39-steered-tp4.json` ([glp39-steered-tp4.json](../../glp39-steered-tp4.json), run
+`candidate-55-glp39-steered-tp4-b3`, 13:34-13:40Z, deployment `7e839152`). Two boots of `tp4.json` (image `ad905a6d`,
+GLP-39 configured) ran [dual_probe.py](../../../../2026-10-28-glp-dual-serving/dual_probe.py) without `--speed`.
+Both boots reached ready in 116.8 s and 116.7 s.
+
+| Boot | `dual_probe.py` | Prompts steering changed | Stock replies | Steered replies |
+| --- | --- | --- | --- | --- |
+| 1 | every check passes | 8 of 8 | `9872053e` | `739b8abc` |
+| 2 | every check passes | 8 of 8 | `9872053e` | `739b8abc` |
+
+- The hashes are SHA-256 over each name's eight greedy replies (token IDs and log probabilities), from
+  [dual_replies.py](../../dual_replies.py):
+
+  ```
+  python3 dual_replies.py receipts/third-build/tp4-ring/determinism/candidate-55-glp39-steered-tp4-b3/dual-*.jsonl
+  ```
+
+- Steered replies repeat between boots, so a fourth build with #738's `0805` steers GLP-39 as before only if it
+  gives `739b8abc`.
+
 ## Files
 
 - `<testbed>/lab/`: each job's table, window-log segment (`*-window.log`), overlay list (none) and, for the gates,
   `<run>-records.sha256`. The record files (`record-*.json`) stay on each testbed's head (dgx1, sp1, sp5) under
   `results/private/determinism/<run>/`; each list was checked against the head's copies. No run differed, so they
   hold no differing request.
-- `<testbed>/determinism/<run>/`: each run's summary and telemetry, and each distinct-stream run.
+- `<testbed>/determinism/<run>/`: each run's summary and telemetry, each distinct-stream run, and the GLP-39
+  reference's `dual_probe.py` output (its eight prompts are ordinary tasks).
 - `<testbed>/suites/<run>/`: the screens' suite runs. Each `model.json.gz` stays on the head, listed in
   `<testbed>/large-files-on-nodes.tsv`.
 - `<testbed>/boot-differences/`: each c1 boot's `c1.json`, with every request's per-step token counts.
