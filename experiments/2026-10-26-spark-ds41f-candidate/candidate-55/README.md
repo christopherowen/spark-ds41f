@@ -180,6 +180,30 @@ With the recipe above, at each TP4 testbed:
 Their runs are named `…-caps-…-b4`. The fourth build's own gates and screens ran before the recipe and stay as its
 record.
 
+### Verified, 2026-11-12
+
+Details and every run in [receipts/tp4-recipe](receipts/tp4-recipe/README.md) (20:42Z to 22:56Z). All 16 boots
+reached ready, and every mark is met.
+
+| Check | `tp4-ring` | `tp4-switched` |
+| --- | --- | --- |
+| Gate, 2 boots | 8 of 8 runs identical; candidate-54's TP4 hashes 18d61961/d6568649 | the same |
+| c1 decisions, 4 boots | agree, and with candidate-54's on the 58 requests both sent | agree, and with candidate-54's on the 57 both sent |
+| c1 paired decode against candidate-54 | **-1.62% ± 0.15%** decode time (+1.69% tok/s; 86.07-86.33 tok/s) | **-2.84% ± 0.13%** (+2.95% tok/s; 86.17-86.29 tok/s) |
+| Screen against candidate-54: grid | **1.55% faster** (was 0.25% slower, the same, on the fourth build without the recipe; 0.67% slower on the third) | **3.11% faster** (was 1.01% slower) |
+| c16 paired decode, output | +0.47%, +0.45% (same) | +1.45%, +1.47% (better) |
+| Prefill | 32K the same (+0.78%), **256K the same (-0.04%; was 3.05% slower)** | 32K and 256K the same |
+
+- **Both regressions the screens found at TP4 are gone:** the grid, by the caps, and the ring's 256K prefill, by the
+  collective limit. #989's serving mark (prefill not worse at 32K and 256K) is now met at `tp4-ring` as well.
+- **A single stream gains little from the caps:** c1 decode is 0.16% (`tp4-ring`, inside the interval) and 0.35%
+  (`tp4-switched`) faster than the fourth build without them. The 1x2 and 1x3 grid rows the caps repair are replayed
+  back to back in the grid.
+- **Still open at `tp4-ring`:** four shapes of 24 and 32 rows are 1% to 2% slower than candidate-54's on both boots
+  (1.3% to 3.3% without the caps). Not attributed; c16 is not slower.
+- **Still open:** the engine's startup is about 4 s longer than candidate-54's at `tp4-ring`, as the third build
+  recorded; nothing here changes it.
+
 ## Release tests
 
 [release-tests.json](release-tests.json) is candidate-54's classification plus three gate files the series changes or
