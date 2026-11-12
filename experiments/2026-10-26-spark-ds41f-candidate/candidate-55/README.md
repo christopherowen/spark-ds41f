@@ -245,3 +245,8 @@ Marks after the third build:
 | #989 | Not run | Prefill not worse: **met** at `tp4-switched`, **missed** at `tp4-ring` (256K 3.37% slower, the control too; not attributed) |
 | #982 | Not run | **Met:** 12 of 12 gate boots identical at `tp4-ring`, and the c1 decision checks agree |
 | #1145 | **Met:** its test passes on dgx4 (`/dev/dri/card0`), and the release tests pass | **Met:** every `tp3-switched` boot loads its weights; inert at TP4 (candidate-54's hashes) |
+
+**GLP-39's steered replies on the third build** (2026-11-12, before #738 is folded in): [glp39-steered-tp4.json](glp39-steered-tp4.json)
+boots `tp4.json` (the third build's image, GLP-39 configured, as every measured arm) twice at `tp4-ring` and runs
+[dual_probe.py](../../2026-10-28-glp-dual-serving/dual_probe.py) without `--speed`. Its steered replies (token IDs and
+log probabilities, greedy) are the reference for #738's claim that a Spec v1 vector steers as before.
