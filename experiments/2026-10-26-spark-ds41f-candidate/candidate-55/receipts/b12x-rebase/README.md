@@ -104,3 +104,25 @@ Not run here: `0803`'s test, the release gate and the image build; they run on c
 - **Checks:** `git diff --check` is clean, and `py_compile` passes on those six files. pyflakes is not installed on
   dgx3 or in the image, so it was not run. The release tests on the rebuilt image import and run both of `0800`'s
   test files (gate files).
+
+## Replayed on #1134 at `6757c7a1` with #1145's `0804`, 2026-11-12
+
+#1134's `0800` at `6757c7a1` (12 GiB `MemAvailable` floor, a 48/49 page-table discount on 4 KiB-page kernels, a trim
+after the arena binds) replaces the one of `37a7f0ac`, and #1145's `0804` follows `0803`. On dgx3 (branch
+`candidate-55-r3` from `15833ed1`), all five patches apply with plain `git am`, `0802` and `0803` unchanged:
+
+| State | Commit | Tree |
+| --- | --- | --- |
+| candidate-54 | `15833ed1` | `ad2dc11f` |
+| + `0800` (#1134, `6757c7a1`) | `143acd56` | `b56da3b4` |
+| + `0801` (#1134) | `19d6725b` | `8854bfa1` (#1134's recorded tree) |
+| + `0802` (#1096) | `386f750b` | `ab9d5136` |
+| + `0803` (#982) | `3b3c27b5` | `20d60f72` |
+| + `0804` (#1145) | `6517d177` | `e8c20f54` (the lock's, recorded on dgx4, and the tree #1145 states) |
+
+- **Where the patches meet:** `0802` shares only `direct_loader.py` with `0800` and `0804`, and there it changes
+  only the module docstring. `0800` and `0804` share `test_direct_loader_cuda.py`, in different hunks.
+- **No new B12X reference:** no line `0800` or `0804` adds names B12X.
+- **Checks:** `git diff --check` is clean, and `py_compile` passes on every Python file the series changes. The
+  release tests on the rebuilt image run both test files (gate files), including `0804`'s new test, which skips
+  where `/dev/dri/card0` is absent.

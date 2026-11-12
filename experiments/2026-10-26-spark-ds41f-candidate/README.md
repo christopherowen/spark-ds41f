@@ -1070,19 +1070,25 @@ The merged base of round 2: candidate-50 with #1009 round 1, plus every PR that 
 
 ## Candidate 55 ([candidate-55/](candidate-55))
 
-The first candidate on frozen candidate-54 (owner, 2026-11-11): five of the owner's platform PRs. #1134 (weight
+The first candidate on frozen candidate-54 (owner, 2026-11-11): six of the owner's platform PRs. #1134 (weight
 arenas from whole 2 MiB blocks, L3-aware CPU placement; it contains #1008), #1096 (B12X removed), #989 and #982 Part A
-(sparknet multi-stage collectives and PDL chaining) and #974 (the CUDA 13.5.37 toolchain, selected per lock since
-#1135). Its control, `no974/`, is the same build on CUDA 13.0.2. Marks, sources and the verification plan are in its
+(sparknet multi-stage collectives and PDL chaining), #974 (the CUDA 13.5.37 toolchain, selected per lock since
+#1135) and, from 2026-11-12, #1145 (the direct loader accepts the TP3 display carve-out under CUDA 13.5's compat
+driver). Its control, `no974/`, is the same build on CUDA 13.0.2. Marks, sources and the verification plan are in its
 README.
 
-- **Series:** [candidate-55/vllm/series](candidate-55/vllm/series) (`0001..0803`, 676 patches; `patch_head`
-  `003fd4cc`, `expected_tree` `ed91c273`, with #1134 at `37a7f0ac`); sparknet `0001..0003` on `1fd6a1fb` (tree
+- **Series:** [candidate-55/vllm/series](candidate-55/vllm/series) (`0001..0804`, 677 patches; `patch_head`
+  `3987ee2f`, `expected_tree` `e8c20f54`, with #1134 at `6757c7a1`); sparknet `0001..0003` on `1fd6a1fb` (tree
   `e06f6a06`).
 - **Status:**
-  - The first build (tree `980e3812`, images `8793529c` and the control's `f870f811`) is superseded.
-  - Its release tests failed 2 DeepSeek V4 B12X attention tests that import `b12x`. Those tests are now deselected.
-  - #1134's new `0800` is folded in, and the rebuild is next.
+  - The first build (tree `980e3812`, images `8793529c` and the control's `f870f811`) is superseded. Its release
+    tests failed 2 DeepSeek V4 B12X attention tests that import `b12x`. Those tests are now deselected.
+  - The second build (tree `ed91c273`, #1134 at `37a7f0ac`; images `4aff1368` and the control's `6c9d7c02`) passed
+    its release tests and gave candidate-54's hashes at `tp4-ring`. Its screen there had grid 0.77% slower and 256K
+    prefill 3.25% slower, and the control showed the same. No switched boot reached ready: sp1's memguard stopped
+    `tp4-switched` (#1134's `0800` on 4 KiB pages), and `tp3-switched` failed at weight load (#974's compat driver
+    with the TP3 carve-out).
+  - #1134 at `6757c7a1` and #1145 are folded in, and the third build is next.
 
 ## Candidates 55-58 (removed 2026-11-11)
 
