@@ -129,5 +129,48 @@ deployment `e90b1e8a`):
   that fixed (#1138), the smoke passes on both images on dgx4's GPU: the 66 DS4.1 modules import without B12X.
 - **Release tests:** see above.
 
-**#1134 at `37a7f0ac` folded in** (2026-11-11): vLLM tree `ed91c273`, both locks re-recorded. Next: the build job
-rebuilds both images, then runs the release tests on candidate-55's. The gates follow.
+**#1134 at `37a7f0ac` folded in** (2026-11-11): vLLM tree `ed91c273`, both locks re-recorded.
+
+**Second build** (dgx1's window, job `20261111T223443-build.json`, deployment `804cef6c`, 22:34-23:54Z):
+
+| Image | Image ID | Layers | Note |
+| --- | --- | --- | --- |
+| `spark-ds41f:candidate-55` | `4aff1368` | 56 | Built on dgx4 in 11 min |
+| `spark-ds41f:candidate-55-no974` | `6c9d7c02` | 53 | Built on dgx4 in 10 min |
+
+- Each image has the same layers on all of dgx1..dgx4. `4aff1368` was then shipped to sp1..sp4 and sp5..sp7.
+- **Release tests on `4aff1368`:** pass, 10,242 passed, 357 skipped, 0 failed, 2,652 s on dgx4
+  ([receipts/release-tests-4aff1368](receipts/release-tests-4aff1368)).
+
+### `tp4-ring`: gates pass, screen mixed
+
+Details and every run in [receipts/tp4-ring](receipts/tp4-ring/README.md) (2026-11-11 23:56Z to 2026-11-12 04:17Z).
+
+| Check | candidate-55 | Control (`no974`) |
+| --- | --- | --- |
+| Gate | 12 of 12 boots, 48 of 48 runs identical; candidate-54's TP4 hashes 18d61961/d6568649 | 2 of 2 boots, 8 of 8 runs; the same hashes |
+| c1 decisions | the same on 4 of 4 boots (59 requests), and the same as candidate-54's 4 boots on the 58 requests both sent | not run |
+| c1 paired decode against candidate-54 | -1.59% ± 0.13% decode time per request (+1.64% tok/s; cross-session) | not run |
+| Screen against candidate-54 | grid **0.77% slower**, c16 output 0.94% and paired decode 0.91% faster, prefill the same at 32K (-1.52%) and **3.25% slower at 256K** | grid 0.40% slower, c16 output the same, prefill **2.50% slower at 32K and 3.80% at 256K** |
+| Time to ready, warm boots | 111.7-124.7 s, one at 176.3 s; candidate-54's gate 110.3-113.8 s | 111.5-119.2 s |
+
+- **#974 does not change temperature-0 output at TP4**, contrary to the expectation above: both images give
+  candidate-54's hashes.
+- **Against the control on the same window, candidate-55 is the same or better:** grid, c16 and 32K the same, 256K
+  0.80% faster, the model step identical (KL 0). #974's serving mark at `tp4-ring` passes.
+- **The prefill and grid regressions are in the control too**, so they come from #1134, #1096, #989, #982 or the
+  pre-launch defragmentation. The series misses #989's serving mark (prefill not worse at 32K and 256K) at
+  `tp4-ring`. Which change causes it is not yet measured.
+
+### `tp4-switched` and `tp3-switched`: no boot reaches ready
+
+The failed starts' logs are in [receipts/failed-starts](receipts/failed-starts); each failure rolled the testbed back
+to candidate-54.
+
+- **`tp4-switched`** (gate and c1 check, 23:59Z and 00:03Z): the startup memguard stopped sp1's engine (exit 137) both
+  times, at `MemAvailable` 4.78 GiB and 4.89 GiB (5 GiB threshold), after weight load. sp1's sponge soaked 32,512 MiB
+  (254 chunks) with 58,110 MiB available on this 4 KiB-page kernel, and `0800` holds it through post-load processing.
+- **`tp3-switched`** (gate, 00:04Z): sp6's engine exited 1 during weight load with `RuntimeError: batch destination
+  exceeds CUDA device allocation`, from the direct loader's `batch_execute` in `finish_weight_transfers()`.
+- **Both fail #1134's serving mark** (every boot reaches ready). Neither appears on `tp4-ring`'s 64 KiB-page kernel.
+  No switched screen is queued until `0800` is fixed for 4 KiB pages.
