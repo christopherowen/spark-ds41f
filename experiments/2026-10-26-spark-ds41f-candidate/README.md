@@ -1074,11 +1074,11 @@ The first candidate on frozen candidate-54 (owner, 2026-11-11): six of the owner
 arenas from whole 2 MiB blocks, L3-aware CPU placement; it contains #1008), #1096 (B12X removed), #989 and #982 Part A
 (sparknet multi-stage collectives and PDL chaining), #974 (the CUDA 13.5.37 toolchain, selected per lock since
 #1135) and, from 2026-11-12, #1145 (the direct loader accepts the TP3 display carve-out under CUDA 13.5's compat
-driver). Its control, `no974/`, is the same build on CUDA 13.0.2. Marks, sources and the verification plan are in its
-README.
+driver), and #738 (GLP Spec v3 runtime; msuiche's, included on the owner's instruction). Its control, `no974/`, is the
+same build on CUDA 13.0.2. Marks, sources and the verification plan are in its README.
 
-- **Series:** [candidate-55/vllm/series](candidate-55/vllm/series) (`0001..0804`, 677 patches; `patch_head`
-  `3987ee2f`, `expected_tree` `e8c20f54`, with #1134 at `6757c7a1`); sparknet `0001..0003` on `1fd6a1fb` (tree
+- **Series:** [candidate-55/vllm/series](candidate-55/vllm/series) (`0001..0805`, 678 patches; `patch_head`
+  `d6d4319e`, `expected_tree` `8aaae3df`, with #1134 at `6757c7a1` and #738's `0805`); sparknet `0001..0003` on `1fd6a1fb` (tree
   `e06f6a06`).
 - **Status:**
   - The first build (tree `980e3812`, images `8793529c` and the control's `f870f811`) is superseded. Its release
@@ -1099,6 +1099,9 @@ README.
     - Against the control at `tp4-ring`, everything is the same.
     - The own marks of #974, #1134, #989 and #982 are not yet run
       ([receipts/third-build](candidate-55/receipts/third-build/README.md)).
+  - #738 is folded in as `0805` (tree `8aaae3df`), with a GLP-27 qualification arm at `tp4-ring`. Every measured
+    arm keeps GLP-39. GLP-39's steered replies were recorded on the third build as #738's reference. The fourth
+    build is next.
 
 ## Candidates 55-58 (removed 2026-11-11)
 
