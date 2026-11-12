@@ -1,0 +1,11 @@
+# candidate-55: attributing and fixing the TP4 engine-grid regressions
+
+Base commit: `aa31800e5` (`candidate-55` build 3 image `spark-ds41f:candidate-55`, `ad905a6d2872`, `vllm.tree = e8c20f549a19b40499c6e92402b16e7a5ab9d2bf` against `spark-ds41f:candidate-54`, `d502217ec7f7`).
+
+## Hypotheses under test
+
+1. **1x2 (+16.6%) and 1x3 (+10.3%) at TP4 (`candidate-55-l2cap`):** TP4 keeps the default `20/16/20 MB` L2 prefetch budgets (`~741` 64 KiB chunks/layer with 200 ns `%globaltimer` pacing on `L2Prefetcher.side`, `~250 us/layer`), whereas TP3 caps them at `15/12/12 MB` (`da4e21493f4`) and sees `-3.72%` at `1x2` and `-3.42%` at `1x3`. Faster `main_stream` steps in `candidate-55` (`~227-235 us/layer` at `M=2,3`) drop below `L2Prefetcher.side`, causing `self.side` to fall behind across the 40 layers, evict live L2 lines with stale prefetches, contend for LPDDR5X bandwidth, and stall `l2_prefetch.join()`.
+2. **M >= 24 (+1.5..2.8%) RoCE wait SM contention (`candidate-55-pdlpostwait`, `candidate-55-no982`):** `sparknet` patch `0003` (`#982`) triggers `T.pdl_trigger()` right after `roce_doorbell` before `roce_wait_peers`. At `M <= 16`, `mhc_project_streams` launches 40 CTAs (`40 + 2 <= 48` GB10 SMs), leaving SMs free for `l2_prefetch_kernel (1, 1, 1)`. At `M >= 24`, `mhc_project_streams` launches `80..200` CTAs, filling all remaining SMs in `cudaGridDependencySynchronize()` during `roce_wait_peers` and delaying `l2_prefetch_kernel` out of the RoCE idle window. `pdlpostwait` moves `T.pdl_trigger()` to right after `roce_wait_peers` (before the local reduction/gather phase).
+3. **M >= 24 CUDA 13.5 equal-priority stream inversion (`candidate-55-streamprio`):** Under `libcuda 620.70.06` (`#974`), equal-priority (`0`) graph forks let `aux_stream` (`SharedExperts`) preempt `main_stream`'s MoE router and let `80..200`-CTA dependents delay `L2Prefetcher.side`'s 1-CTA prefetch kernel. `streamprio` sets `L2Prefetcher.side` priority `-2`, `main_stream` priority `-1`, and leaves `aux_stream` at `0`.
+4. **Combined candidate (`candidate-55-all3`):** `15/12/12 MB` L2 prefetch caps + `pdlpostwait` + `main_stream`/`L2Prefetcher.side` priority `-1`.
+5. **Controls (`candidate-55-no989`, `candidate-55-noaffinity`, `candidate-55-again`, `candidate-54-again`):** Isolate RoCE proxy core pinning (`#989`), host thread affinity (`#1103`), and boot-to-boot variance.
