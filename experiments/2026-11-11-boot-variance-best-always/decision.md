@@ -1,0 +1,9 @@
+# Decision: Retain Root-Cause Candidate for Multi-Node Suite Qualification
+
+- **Status**: Validated on single-GPU GB10 (`sp8`, `spark-ds41f:candidate-54`, two 8-boot balanced `ABBAABBA` suites + 200 vLLM `pytest` tests + local deployment unit suite) with zero multi-arena timing workarounds; ready for multi-node candidate qualification once the active `dgx1`/`sp1`/`sp5` lab windows close.
+- **Summary**:
+  1. `vllm/0800` + `spark_ds41f/cluster.py` (`defragment_buddy_memory`) pre-compacts host buddy memory (`drop_caches=3; compact_memory`) on stopped nodes before container launch and retains `model._direct_buddy_sponge` across `create_model` -> `load_weights` -> `process_weights_after_loading` (stopping at the `MIGRATE_UNMOVABLE` knee in `0.36 s`) so 100% of both Target (`33.5 GiB`) and DSpark (`2.95 GiB`) weights draw `>= 2 MiB` contiguous physical blocks.
+  2. `vllm/0801` + `sparknet/0001` rank fast cores by `sysfs` `cache/index3/size` (`16 MiB` Cluster 1 vs `8 MiB` Cluster 0) and isolate Cluster-1 sibling efficiency cores (`10-14`).
+  3. `scripts/memguard.sh`, `scripts/memguard-start.sh`, and `spark_ds41f/lab.py` eliminate steady-state `docker inspect` / `awk` subprocess forks and confine host monitoring to Cluster-0 efficiency cores (`0-4`).
+  4. Across 8 fixed-clock `ABBAABBA` boots on `sp8`, whole-step boot-to-boot SD dropped **`12.6x`** (`0.756% -> 0.060%` SD, **`22.6 µs` / `0.145%` max-min range across 4 boots**; `p10`: **`0.048%` SD / `16.8 µs` range**; DSpark drafter: **`0.166%` SD / `27.7 µs` range**; host overhead: **`16.4x` lower SD**).
+  5. Benchmark-client stall trimming and cold-prefill warmup live in [christopherowen/Sonar#1](https://github.com/christopherowen/Sonar/pull/1) so this branch merges conflict-free alongside [#1133](https://github.com/christopherowen/spark-ds41f/pull/1133). Spaceport fan control was left unchanged as requested.

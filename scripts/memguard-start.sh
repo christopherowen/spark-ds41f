@@ -72,6 +72,67 @@ fi
 ready_file=$(mktemp "$runtime_dir/${name}-memguard.XXXXXX")
 rm -f -- "$ready_file"
 
+# On heterogeneous hosts (e.g. GB10: Cluster 0 efficiency cores 0-4 in 8 MiB L3 vs
+# Cluster 1 serving cores 15-19 in 16 MiB L3), confine memguard's periodic docker/proc
+# checks to the smallest-L3 cluster's efficiency cores so Cluster 1 L3 is undisturbed.
+resolve_housekeeping_cpus() {
+  local root=${MEMGUARD_SYSFS_CPU_ROOT:-/sys/devices/system/cpu}
+  [[ -d "$root" ]] || return 0
+  python3 - "$root" 2>/dev/null <<'PY' || true
+import os, sys
+root = sys.argv[1]
+def read_int(p):
+    try:
+        t = open(p, encoding="utf-8").read().strip().upper()
+        if t.endswith("K"): return int(t[:-1])
+        if t.endswith("M"): return int(t[:-1]) * 1024
+        return int(t)
+    except Exception:
+        return -1
+def parse_list(s):
+    out = []
+    for part in s.strip().split(","):
+        if not part: continue
+        lo, _, hi = part.partition("-")
+        out.extend(range(int(lo), int(hi or lo) + 1))
+    return out
+cpus = sorted(int(n[3:]) for n in os.listdir(root) if n.startswith("cpu") and n[3:].isdigit())
+scores = {c: read_int(f"{root}/cpu{c}/cpufreq/cpuinfo_max_freq") for c in cpus}
+if not any(v > 0 for v in scores.values()):
+    scores = {c: read_int(f"{root}/cpu{c}/cpu_capacity") for c in cpus}
+scores = {c: v for c, v in scores.items() if v > 0}
+if not scores or min(scores.values()) == max(scores.values()):
+    sys.exit(0)
+mid = (min(scores.values()) + max(scores.values())) // 2
+eff = {c for c, v in scores.items() if v <= mid}
+if not eff:
+    sys.exit(0)
+clusters = []
+for c in cpus:
+    try:
+        grp = tuple(parse_list(open(f"{root}/cpu{c}/cache/index3/shared_cpu_list", encoding="utf-8").read()))
+    except Exception:
+        continue
+    kib = read_int(f"{root}/cpu{c}/cache/index3/size")
+    if grp and (kib, grp) not in clusters:
+        clusters.append((kib if kib > 0 else 1 << 30, grp))
+if clusters:
+    clusters.sort(key=lambda x: (x[0], x[1][0]))
+    for _, grp in clusters:
+        cand = sorted(c for c in grp if c in eff)
+        if cand:
+            print(",".join(map(str, cand)))
+            sys.exit(0)
+print(",".join(map(str, sorted(eff))))
+PY
+}
+
+cpu_prop=()
+housekeeping_cpus=$(resolve_housekeeping_cpus)
+if [[ -n "$housekeeping_cpus" ]]; then
+  cpu_prop=(--property="AllowedCPUs=$housekeeping_cpus")
+fi
+
 # A collected transient unit may still have a failed record from a prior stop.
 sudo -n install -d -m 0755 -o "$(id -un)" /var/log/spark-memguard >/dev/null 2>&1 || true
 sudo -n systemctl stop "$unit" >/dev/null 2>&1 || true
@@ -85,6 +146,7 @@ sudo -n systemd-run --quiet \
   --property=OOMScoreAdjust=-1000 \
   --property=MemoryMin=64M \
   --property=CPUWeight=1000 \
+  ${cpu_prop[@]+"${cpu_prop[@]}"} \
   --setenv="THRESHOLD_GIB=$guard_gib" \
   --setenv="INTERVAL=$interval" \
   --setenv="CONTAINER_NAME=$name" \
