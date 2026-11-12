@@ -120,14 +120,18 @@ unchanged. The control can: it must give candidate-54's TP4 hashes `18d61961`/`d
   recorded references were taken without it. A difference against those references includes the defragmentation,
   which counts as part of #1134.
 
-## TP4's L2 prefetch caps
+## TP4's recipe: L2 prefetch caps, and the ring's collective limit
 
-**Added 2026-11-12, after the fourth build's screens.** candidate-55's `tp4-switched` profile
-([tp4-switched.json](tp4-switched.json), and its `-dev` file through it) sets `VLLM_DS41_L2_PREFETCH_WO_MB=15`,
+**Added 2026-11-12, after the fourth build's screens.** Two recipe variables answer the two regressions the screens
+found at TP4. Neither changes the image or the locks.
+
+### L2 prefetch caps, at `tp4-ring` and `tp4-switched`
+
+candidate-55's TP4 profiles ([tp4.json](tp4.json), [tp4-switched.json](tp4-switched.json), and their `-dev` files
+and [glp27-tp4.json](glp27-tp4.json) through them) set `VLLM_DS41_L2_PREFETCH_WO_MB=15`,
 `VLLM_DS41_L2_PREFETCH_FFN_MB=12` and `VLLM_DS41_L2_PREFETCH_NEXT_MB=12`, the caps candidate-54's TP3 profiles carry.
-The code defaults are 20/16/20 MB. [tp4.json](tp4.json) follows once the caps are measured at `tp4-ring`
-([grid-attribution/confirm-fix-grid-tp4.json](grid-attribution/confirm-fix-grid-tp4.json)). TP5 to TP8 are not
-measured and keep the defaults.
+The code defaults are 20/16/20 MB. TP5 to TP8 are not measured and keep the defaults, and so does the control
+([no974/tp4.json](no974/tp4.json)).
 
 - **Why:** the grid regression at TP4 is in the 1-request rows: 1x2 rows are 9% slower than candidate-54 and 1x3
   rows 8% slower at `tp4-switched`. #982's `T.pdl_trigger()` before `roce_wait_peers` causes it, and only while the
@@ -136,16 +140,45 @@ measured and keep the defaults.
   make the grid 4.66% faster than candidate-55 as built (1x2 rows 18%, 1x3 rows 13%), and 1.7% faster than
   candidate-54 with the same caps. Moving #982's trigger after the wait gives 2.5% alone and nothing under the caps,
   so sparknet `0003` is unchanged.
+- **Measured** at `tp4-ring` the same way: the grid 2.51% faster than candidate-55 as built (margin 0.34%), 1x2 rows
+  16.2 to 13.5 ms and 1x3 rows 14.8 to 14.0 ms, where candidate-54's recorded screen has 14.5 ms for both.
 - **The windows were already too large for candidate-54 at TP4:** with the caps its 1x2 rows are 9% faster. So the
   caps are a gain of their own as well as the fix, and candidate-54's recorded TP4 screens are without them.
 - **No output change:** the windows are cache hints, and the arithmetic is unchanged.
 - A recipe variable, not a patch: the image and the locks are the fourth build's.
 
-**Marks, declared before the runs:** with the caps, the gate on 2 boots gives candidate-54's TP4 hashes
-([gate-caps-tp4-switched.json](gate-caps-tp4-switched.json)), and the screen's grid is not slower than candidate-54's
-recorded screen, with c16 and prefill not worse than the fourth build's screen without the caps
-([screen-caps-tp4-switched.json](screen-caps-tp4-switched.json)). Their runs are named `…-caps-…-b4`; the fourth
-build's own gates and screens ran before the caps and stay as its record.
+### The collective limit, at `tp4-ring` only
+
+[tp4.json](tp4.json) sets `SPARKNET_ROCE_MAX_COLLECTIVE_BYTES=2097152`, the ring's slot. Reduce-scatters and
+exchanges above one slot go to PyNCCL again, as before #989; #989's default is 64 MiB.
+
+- **Why:** candidate-55's prefill at `tp4-ring` is 3.4% slower than candidate-54 at 262,144 tokens, in the control
+  too, and unchanged at `tp4-switched`. #989 keeps those collectives on sparknet. The ring's slot is 2 MiB (4 MiB
+  switched), its opposite rank is relayed, and #989's own mark was measured on switched testbeds
+  ([prefill-attribution](prefill-attribution/README.md)).
+- **Measured** at `tp4-ring` on the fourth build, the prefill step alone, two boots an arm in one session: with the
+  limit, prefill is 3.4% faster than candidate-55 as built at 262,144 tokens and 3.3% at 32,768, which is
+  candidate-54's on the same suite (+0.2% and -0.7%). The sliced all-gather and the pre-launch defragmentation
+  change nothing.
+- **What it gives up:** #989's routing of large collectives at `tp4-ring`. Its multi-stage kernels still carry the
+  collectives of one slot or less, and `tp4-switched` keeps #989 whole, where prefill is not slower.
+- **No output change:** both backends reduce in fixed rank order; the gate below checks it.
+
+### Marks, declared before the runs
+
+With the recipe above, at each TP4 testbed:
+
+- the gate on 2 boots gives candidate-54's TP4 hashes ([gate-caps-tp4.json](gate-caps-tp4.json),
+  [gate-caps-tp4-switched.json](gate-caps-tp4-switched.json));
+- the screen's grid is not slower than candidate-54's recorded screen, and c16 and prefill are not worse than the
+  fourth build's screen without the recipe ([screen-caps-tp4.json](screen-caps-tp4.json),
+  [screen-caps-tp4-switched.json](screen-caps-tp4-switched.json));
+- at `tp4-ring`, prefill at 262,144 tokens is not slower than candidate-54's recorded screen, and the c1 decision
+  check's 4 boots agree with each other and with candidate-54's
+  ([c1-decisions-caps-tp4.json](c1-decisions-caps-tp4.json)); its paired c1 decode time is recorded.
+
+Their runs are named `…-caps-…-b4`. The fourth build's own gates and screens ran before the recipe and stay as its
+record.
 
 ## Release tests
 
