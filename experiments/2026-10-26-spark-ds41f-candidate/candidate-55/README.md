@@ -120,6 +120,33 @@ unchanged. The control can: it must give candidate-54's TP4 hashes `18d61961`/`d
   recorded references were taken without it. A difference against those references includes the defragmentation,
   which counts as part of #1134.
 
+## TP4's L2 prefetch caps
+
+**Added 2026-11-12, after the fourth build's screens.** candidate-55's `tp4-switched` profile
+([tp4-switched.json](tp4-switched.json), and its `-dev` file through it) sets `VLLM_DS41_L2_PREFETCH_WO_MB=15`,
+`VLLM_DS41_L2_PREFETCH_FFN_MB=12` and `VLLM_DS41_L2_PREFETCH_NEXT_MB=12`, the caps candidate-54's TP3 profiles carry.
+The code defaults are 20/16/20 MB. [tp4.json](tp4.json) follows once the caps are measured at `tp4-ring`
+([grid-attribution/confirm-fix-grid-tp4.json](grid-attribution/confirm-fix-grid-tp4.json)). TP5 to TP8 are not
+measured and keep the defaults.
+
+- **Why:** the grid regression at TP4 is in the 1-request rows: 1x2 rows are 9% slower than candidate-54 and 1x3
+  rows 8% slower at `tp4-switched`. #982's `T.pdl_trigger()` before `roce_wait_peers` causes it, and only while the
+  prefetch windows are at their defaults ([grid-attribution](grid-attribution/README.md)).
+- **Measured** at `tp4-switched` on the fourth build, the grid step alone, two boots an arm in one session: the caps
+  make the grid 4.66% faster than candidate-55 as built (1x2 rows 18%, 1x3 rows 13%), and 1.7% faster than
+  candidate-54 with the same caps. Moving #982's trigger after the wait gives 2.5% alone and nothing under the caps,
+  so sparknet `0003` is unchanged.
+- **The windows were already too large for candidate-54 at TP4:** with the caps its 1x2 rows are 9% faster. So the
+  caps are a gain of their own as well as the fix, and candidate-54's recorded TP4 screens are without them.
+- **No output change:** the windows are cache hints, and the arithmetic is unchanged.
+- A recipe variable, not a patch: the image and the locks are the fourth build's.
+
+**Marks, declared before the runs:** with the caps, the gate on 2 boots gives candidate-54's TP4 hashes
+([gate-caps-tp4-switched.json](gate-caps-tp4-switched.json)), and the screen's grid is not slower than candidate-54's
+recorded screen, with c16 and prefill not worse than the fourth build's screen without the caps
+([screen-caps-tp4-switched.json](screen-caps-tp4-switched.json)). Their runs are named `…-caps-…-b4`; the fourth
+build's own gates and screens ran before the caps and stay as its record.
+
 ## Release tests
 
 [release-tests.json](release-tests.json) is candidate-54's classification plus three gate files the series changes or
