@@ -1193,6 +1193,10 @@ class GLPReaderTest(unittest.TestCase):
         problems, _ = self.head(127, "/usr/bin/timeout: failed to run command 'python3': No such file or directory\n")
         self.assertEqual(problems, [f"dgx1: cannot run {self.IMAGE}'s GLP reader: /usr/bin/timeout: "
                                     "failed to run command 'python3': No such file or directory"])
+        problems, _ = self.head(125, "docker: Error response from daemon: invalid mount config\n\n"
+                                     "Run 'docker run --help' for more information\n")
+        self.assertEqual(problems, [f"dgx1: cannot run {self.IMAGE}'s GLP reader: "
+                                    "docker: Error response from daemon: invalid mount config"])
         problems, _ = self.head(124)
         self.assertEqual(problems, [f"dgx1: {self.IMAGE}'s GLP reader did not finish within 120s"])
 

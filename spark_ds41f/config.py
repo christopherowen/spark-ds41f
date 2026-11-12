@@ -558,13 +558,15 @@ def glp_reader_problems(cluster: dict, nodes: dict, node: dict, path: str) -> li
     if result.returncode == 0:
         return []
     detail = result.stderr.strip() or result.stdout.strip()
-    last = detail.splitlines()[-1] if detail else f"exit status {result.returncode}"
+    lines = detail.splitlines() or [f"exit status {result.returncode}"]
+    # Docker's and SSH's own errors lead with their reason; the reader's traceback ends with it.
+    first, last = lines[0], lines[-1]
     if (result.returncode == 125 and "no such image" in detail.lower()) or "docker.sock" in detail:
         return []
     if result.returncode == 255:
-        return [f"{node['name']}: cannot check the GLP steering file with {image}'s reader: {last}"]
+        return [f"{node['name']}: cannot check the GLP steering file with {image}'s reader: {first}"]
     if result.returncode in (125, 126, 127):
-        return [f"{node['name']}: cannot run {image}'s GLP reader: {last}"]
+        return [f"{node['name']}: cannot run {image}'s GLP reader: {first}"]
     if result.returncode == 124:
         return [f"{node['name']}: {image}'s GLP reader did not finish within {GLP_READER_TIMEOUT}"]
     return [f"{node['name']}: {image} cannot read the GLP steering file {path} "
