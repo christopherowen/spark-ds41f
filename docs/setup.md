@@ -575,8 +575,9 @@ The file is 803,392 bytes, sha256
 `9c66d47701e0ceb42c33906f2d3789c0f1f16b21e7d97185f20f7f3f09fbf5cf`. A node without a
 token can take a copy from another node instead: the snapshot path and the
 `hub/blobs` file it links to. `bin/spark doctor --live` and the launch preflight
-report a node whose file is missing or differs, with this command
-([doctor](doctor.md#glp-steering-file)).
+report a node whose file is missing or differs, with this command, and run the
+image's own GLP reader on the head's copy, so a vector the image cannot read is
+refused before a boot ([doctor](doctor.md#glp-steering-file)).
 
 ## 6. Image
 

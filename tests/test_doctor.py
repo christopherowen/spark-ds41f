@@ -2,8 +2,10 @@
 
 from __future__ import annotations
 
+import base64
 import contextlib
 import io
+import struct
 import subprocess
 import sys
 import unittest
@@ -1115,6 +1117,104 @@ class GLPTest(unittest.TestCase):
         problems = self.node(self.cluster(), 255, stderr="ssh: connect to host dgx2 port 22: Connection refused\n")
         self.assertEqual(problems, ["dgx2: cannot check the GLP steering file: "
                                     "ssh: connect to host dgx2 port 22: Connection refused"])
+
+
+class GLPReaderTest(unittest.TestCase):
+    """On the head, the profile image's own GLP reader reads the file as the engine mounts it."""
+
+    GLP, SHA256 = GLPTest.GLP, GLPTest.SHA256
+    IMAGE = "spark-ds41f:1107"
+    READER = ("docker", "run", "--rm", "--pull=never", "--network=none",
+              "--entrypoint=/usr/bin/timeout", "--volume", f"{GLP}:/glp/vector.gguf:ro", IMAGE,
+              "--signal=TERM", "--kill-after=10s", "120s",
+              "python3", "-m", "vllm.models.deepseek_v4_1.glp", "/glp/vector.gguf")
+    SPEC_V3 = {"glp.mode": "project", "glp.spec_version": 3, "glp.hook_point": "hc_fold_pre_engram"}
+    REFUSAL = ("Traceback (most recent call last):\n"
+               '  File "<frozen runpy>", line 198, in _run_module_as_main\n'
+               "ValueError: /glp/vector.gguf: glp.spec_version is 3; this reader implements "
+               "version 1 (rank 1, no alpha scaling keys)\n")
+
+    @staticmethod
+    def gguf(fields: dict) -> bytes:
+        """A GGUF header with these keys (an int as uint32, a str as a string) and no tensors."""
+        def string(text: str) -> bytes:
+            return struct.pack("<Q", len(text.encode())) + text.encode()
+        body = b"".join(string(key) + (struct.pack("<II", 4, value) if isinstance(value, int)
+                                       else struct.pack("<I", 8) + string(value))
+                        for key, value in fields.items())
+        return b"GGUF" + struct.pack("<IQQ", 3, 0, len(fields)) + body
+
+    def head(self, returncode: int, stderr: str = "", header: bytes = b"",
+             digest: str = SHA256) -> tuple[list[str], list[tuple]]:
+        cluster = GLPTest().cluster()
+        cluster["container"]["image"] = self.IMAGE
+        calls = []
+
+        def run_ssh(nodes, node, *argv):
+            calls.append(argv)
+            if argv[0] == "sha256sum":
+                return subprocess.CompletedProcess(argv, 0, f"{digest}  {self.GLP}\n", "")
+            if argv[0] == "docker":
+                return subprocess.CompletedProcess(argv, returncode, "", stderr)
+            return subprocess.CompletedProcess(argv, 0, base64.b64encode(header).decode(), "")
+
+        with mock.patch.object(spark, "run_ssh", run_ssh):
+            problems = spark.node_glp_problems(cluster, {}, {"name": "dgx1", "head": True})
+        return problems, calls
+
+    def test_a_vector_the_image_reads_passes(self) -> None:
+        problems, calls = self.head(0)
+        self.assertEqual(problems, [])
+        self.assertEqual(calls, [("sha256sum", self.GLP), self.READER])
+        self.assertFalse(any(argument.startswith("--gpus") for argument in calls[1]))
+
+    def test_a_vector_the_image_refuses_is_reported_with_its_spec_and_hook(self) -> None:
+        problems, calls = self.head(1, self.REFUSAL, self.gguf(self.SPEC_V3))
+        self.assertEqual(len(problems), 1)
+        self.assertTrue(problems[0].startswith(
+            f"dgx1: {self.IMAGE} cannot read the GLP steering file {self.GLP} "
+            "(glp.spec_version 3, glp.hook_point 'hc_fold_pre_engram'): ValueError: "
+            "/glp/vector.gguf: glp.spec_version is 3; this reader implements version 1"))
+        self.assertIn("would not start, the stock model name included", problems[0])
+        self.assertEqual(calls[2], ("sh", "-c", f"head -c 65536 {self.GLP} | base64 -w0"))
+
+    def test_a_refusal_without_readable_metadata_still_fails(self) -> None:
+        problems, _ = self.head(1, "ValueError: /glp/vector.gguf: not a GGUF file\n", b"\0" * 64)
+        self.assertIn("(its GGUF metadata is unreadable): ValueError", problems[0])
+        problems, _ = self.head(1, "ValueError: boom\n", self.gguf({"glp.mode": "project"}))
+        self.assertIn("(no glp.spec_version, no glp.hook_point): ValueError: boom", problems[0])
+
+    def test_an_image_the_head_lacks_is_left_to_the_image_checks(self) -> None:
+        problems, calls = self.head(125, f"docker: Error response from daemon: No such image: {self.IMAGE}.\n")
+        self.assertEqual(problems, [])
+        self.assertEqual(calls, [("sha256sum", self.GLP), self.READER])
+
+    def test_a_reader_that_cannot_run_or_finish_is_reported(self) -> None:
+        problems, _ = self.head(127, "/usr/bin/timeout: failed to run command 'python3': No such file or directory\n")
+        self.assertEqual(problems, [f"dgx1: cannot run {self.IMAGE}'s GLP reader: /usr/bin/timeout: "
+                                    "failed to run command 'python3': No such file or directory"])
+        problems, _ = self.head(125, "docker: Error response from daemon: invalid mount config\n\n"
+                                     "Run 'docker run --help' for more information\n")
+        self.assertEqual(problems, [f"dgx1: cannot run {self.IMAGE}'s GLP reader: "
+                                    "docker: Error response from daemon: invalid mount config"])
+        problems, _ = self.head(124)
+        self.assertEqual(problems, [f"dgx1: {self.IMAGE}'s GLP reader did not finish within 120s"])
+
+    def test_only_the_head_runs_the_reader_and_only_on_the_pinned_file(self) -> None:
+        problems, calls = self.head(1, self.REFUSAL, digest="0" * 64)
+        self.assertIn("not glp.sha256", problems[0])
+        self.assertEqual(calls, [("sha256sum", self.GLP)])
+
+    def test_metadata_is_read_as_far_as_the_bytes_reach(self) -> None:
+        header = self.gguf({"glp.spec_version": 1, "glp.hook_point": "residual_stream_post_layer"})
+        self.assertEqual(spark.gguf_metadata(header),
+                         {"glp.spec_version": 1, "glp.hook_point": "residual_stream_post_layer"})
+        self.assertEqual(spark.gguf_metadata(header[:-4]), {"glp.spec_version": 1})
+        array = (b"GGUF" + struct.pack("<IQQ", 3, 0, 1) + struct.pack("<Q", 10) + b"glp.layers"
+                 + struct.pack("<IIQ", 9, 5, 2) + struct.pack("<ii", 11, 37))
+        self.assertEqual(spark.gguf_metadata(array), {"glp.layers": [11, 37]})
+        with self.assertRaisesRegex(ValueError, "not a GGUF file"):
+            spark.gguf_metadata(b"GGML")
 
 
 class NewUserOnboardingTest(unittest.TestCase):
