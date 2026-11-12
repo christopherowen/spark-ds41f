@@ -158,6 +158,15 @@ The check runs whether or not the service is up. A missing or unreadable file, o
 one whose sha256 is not `glp.sha256`, is an error, and the error prints the
 `hf download` command for the pinned revision ([setup](setup.md#glp-steering-file)).
 
+On the head, the profile's image then reads the file with its own GLP reader
+(`python3 -m vllm.models.deepseek_v4_1.glp`), mounted at `/glp/vector.gguf` as the
+engine mounts it, in a `docker run --rm --pull=never --network=none` with no GPU.
+The engine reads the file while it builds the model, so a vector its reader refuses
+(another `glp.spec_version` or `glp.hook_point`, for example) would stop the whole
+engine, the stock model name included. A refusal is an error naming the image, the
+file's `glp.spec_version` and `glp.hook_point`, and the reader's reason. The check is
+skipped when the head lacks the image; the image checks report that.
+
 ### CPU pinning
 
 When a profile pins serving to CPUs (`--cpuset-cpus=` in `container.docker_run_args`),
@@ -197,7 +206,8 @@ a start cannot survive, on every node, and refuses to launch on any failure:
 - `bin/spark doctor` passes on the node itself;
 - every mount source exists (writable for read-write mounts);
 - the `glp` file, if the profile has one, is readable and has `glp.sha256`, with
-  its download command when it is not (above);
+  its download command when it is not, and the image's own GLP reader accepts it on
+  the head (above);
 - the image is present with the expected tree labels;
 - no container with the serving name exists unless you pass `--replace`;
 - passwordless `sudo` works (the memory guards need it).
