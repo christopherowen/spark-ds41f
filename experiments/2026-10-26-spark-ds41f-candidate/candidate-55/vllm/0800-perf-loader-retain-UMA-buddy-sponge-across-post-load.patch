@@ -1,17 +1,19 @@
-From f89baf5be042cf2e03fd0caf922b84462fe3a773 Mon Sep 17 00:00:00 2001
-From: test <test@example.com>
-Date: Wed, 11 Nov 2026 19:29:01 +0000
-Subject: [PATCH] perf(loader): retain UMA buddy sponge across post-load weight
- processing
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Christopher Owen <3221756+christopherowen@users.noreply.github.com>
+Date: Thu, 12 Nov 2026 02:13:27 +0000
+Subject: [PATCH 1/2] perf(loader): retain UMA buddy sponge across post-load
+ weight processing
 
 Upstream base: local-inference-lab/vllm 19f2c20ed4d64ae22bd009ceacadd85e2a81e354 (after candidate-54 0799).
 
 Rationale:
 In nvidia.ko (nv_alloc_system_pages), non-contiguous system-memory cuMemCreate allocations satisfy 20 MiB segments by draining smaller free physical buddy orders from 64 KiB upward (64K -> 128K -> 256K -> 512K -> 1M) before touching >= 2 MiB contiguous blocks. On GB10 (SM121, 24 MiB physically-indexed L2), scattered 64 KiB..256 KiB physical fragments self-conflict across L2 cache slices during 15-20 MiB decode L2 weight prefetches (+12-13% slower than >= 2 MiB contiguous blocks). Previously, _allocate_order13_sponge returned empty on all 4 KiB-page kernels and on 64 KiB-page kernels whenever 512 MiB (Order-13) blocks reached 0, budgeted free memory from cudaMemGetInfo (MemFree) instead of UMA /proc/meminfo MemAvailable, and released its sponge at the end of create_model() before process_weights_after_loading() re-allocated repacked MoE expert slabs and FP8 block-scale words.
 
+On 4 KiB-page kernels after stopping a full 40-layer serving container, MIGRATE_UNMOVABLE sub-2 MiB fragments can exceed 32 GiB alongside ~58-64 GiB of >= 2 MiB blocks, and CPU/GPU 4 KiB page tables plus UVM metadata consume an extra ~2% (~20 MiB/GiB) of non-reclaimable RAM. Holding >30 GiB of sponge across load_weights and TileLangExperts repacking with only a 6 GiB MemAvailable floor drove MemAvailable below the 5 GiB startup memguard even when weights had already consumed the entire >= 2 MiB pool.
+
 Changes:
-- Generalize direct_loader.py buddy sponge across both 4 KiB and 64 KiB base page sizes (parse_buddyinfo_blocks, select_buddy_sponge_target, _available_uma_or_gpu_bytes, _try_thp_buddy_defrag): soak >= 64 KiB sub-2 MiB buddy fragments (or < 512 MiB when Order-13 blocks exist) bounded by both UMA MemAvailable (6 GiB untouched floor) and remaining >= 64 KiB buddy capacity so allocations never fall into order-4 slowpath page-cache reclaim.
-- Retain model._direct_buddy_sponge across create_model -> load_weights -> process_weights_after_loading (released in BaseModelLoader.load_model finally via release_weight_arena_sponge) so repacked TileLang MoE slabs, tails, and FP8 scale words also draw >= 2 MiB contiguous blocks; allocate replaceable MoE slabs before the persistent dense weight arena so _direct_weight_arena receives the highest contiguous buddy orders.
+- Generalize direct_loader.py buddy sponge across both 4 KiB and 64 KiB base page sizes (parse_buddyinfo_blocks, select_buddy_sponge_target, _available_uma_or_gpu_bytes, _try_thp_buddy_defrag): soak >= 64 KiB sub-2 MiB buddy fragments (or < 512 MiB when Order-13 blocks exist) bounded by UMA MemAvailable (12 GiB untouched floor, plus 48/49 page-table overhead discounting on 4 KiB kernels) and remaining >= 64 KiB buddy capacity, stopping at the exact MIGRATE_UNMOVABLE knee so zero >= 2 MiB blocks are consumed inside the sponge.
+- Retain model._direct_buddy_sponge across create_model -> load_weights -> process_weights_after_loading (released in BaseModelLoader.load_model finally via release_weight_arena_sponge), while _trim_sponge_for_post_load() releases the sponge immediately after bind_weight_arena() when < 256 MiB of >= target_bsz blocks remain or trims/releases chunks to preserve >= 16 GiB of post-load MemAvailable headroom.
 - Refresh module slice views (_refresh_views, e.g. shard_weight) after arena rebinding and copy TILE_CONTIGUOUS_FP8 repacked tiles (wq_b / indexer.wq_b) in place into the contiguous arena storage instead of stranding arena slices.
 - Bind contiguous weight arenas in DummyModelLoader.create_model on CUDA (when online quantization is not active) and zero non-floating-point CUDA parameters in initialize_single_dummy_weight.
 
@@ -19,17 +21,17 @@ Quality implications:
 None. Weight values, dtypes, and kernel arithmetic are bit-identical.
 
 Tests:
-- pytest tests/model_executor/model_loader/test_direct_loader.py tests/model_executor/model_loader/test_direct_loader_cuda.py tests/kernels/quantization/test_deepseek_v41_tilelang_linear.py (193 passed on GB10).
+- pytest tests/model_executor/model_loader/test_direct_loader.py tests/model_executor/model_loader/test_direct_loader_cuda.py tests/kernels/quantization/test_deepseek_v41_tilelang_linear.py.
 
 Upstream status: spark-ds41f local candidate patch.
 ---
- .../model_loader/test_direct_loader.py        |  23 ++
- .../model_loader/test_direct_loader_cuda.py   |  71 ++++
- .../model_loader/base_loader.py               |  63 ++--
- .../model_loader/direct_loader.py             | 340 ++++++++++++++++--
- .../model_loader/dummy_loader.py              |  25 ++
+ .../model_loader/test_direct_loader.py        |  23 +
+ .../model_loader/test_direct_loader_cuda.py   | 140 ++++++
+ .../model_loader/base_loader.py               |  63 +--
+ .../model_loader/direct_loader.py             | 447 +++++++++++++++++-
+ .../model_loader/dummy_loader.py              |  25 +
  .../model_loader/weight_utils.py              |   8 +-
- 6 files changed, 479 insertions(+), 51 deletions(-)
+ 6 files changed, 655 insertions(+), 51 deletions(-)
 
 diff --git a/tests/model_executor/model_loader/test_direct_loader.py b/tests/model_executor/model_loader/test_direct_loader.py
 index 6c378e977..74a920e6c 100644
@@ -63,10 +65,10 @@ index 6c378e977..74a920e6c 100644
 +    assert sub64 == (32 * 65536) + (16 * 131072)
 +    assert high64 == (200 * (2 << 20)) + (50 * (4 << 20))
 diff --git a/tests/model_executor/model_loader/test_direct_loader_cuda.py b/tests/model_executor/model_loader/test_direct_loader_cuda.py
-index 4517a83cc..7c385056c 100644
+index 4517a83cc..690cd1c0e 100644
 --- a/tests/model_executor/model_loader/test_direct_loader_cuda.py
 +++ b/tests/model_executor/model_loader/test_direct_loader_cuda.py
-@@ -670,3 +670,74 @@ def test_padded_2d_destinations_batch_strided_rows_and_detect_overlaps(tmp_path)
+@@ -670,3 +670,143 @@ def test_padded_2d_destinations_batch_strided_rows_and_detect_overlaps(tmp_path)
          with pytest.raises(RuntimeError, match="overlapping batch destinations"):
              session.flush()
      assert torch.count_nonzero(overlap_target) == 0
@@ -141,6 +143,75 @@ index 4517a83cc..7c385056c 100644
 +    )
 +    direct_loader.release_weight_arena_sponge(m, torch.device("cuda"))
 +    assert not hasattr(m, "_direct_buddy_sponge")
++
++
++    # 3. Verify 4 KiB PTE overhead discounting and _trim_sponge_for_post_load
++    # release/trim guards prevent 4 KiB-page post-load MemAvailable exhaustion.
++    meminfo_tight = tmp_path / "meminfo_tight"
++    meminfo_tight.write_text(
++        f"MemAvailable: {(64 << 10)} kB\n",
++        encoding="utf-8",
++    )
++    buddy_ample = tmp_path / "buddy_ample"
++    buddy_ample.write_text(
++        "Node 0, zone   Normal   0 0 0 0  512 0 0 0 0  512 0 0 0 0\n",
++        encoding="utf-8",
++    )
++    sp_4k = direct_loader._allocate_order13_sponge(
++        torch.device("cuda"),
++        required_bytes=32 << 20,
++        buddyinfo_path=buddy_ample,
++        meminfo_path=meminfo_tight,
++        page_bytes=4096,
++        headroom_bytes=16 << 20,
++        chunk_bytes=2 << 20,
++    )
++    sp_64k = direct_loader._allocate_order13_sponge(
++        torch.device("cuda"),
++        required_bytes=32 << 20,
++        buddyinfo_path=buddy_ample,
++        meminfo_path=meminfo_tight,
++        page_bytes=65536,
++        headroom_bytes=16 << 20,
++        chunk_bytes=2 << 20,
++    )
++    # 64 MiB avail - 16 MiB headroom = 48 MiB; on 4 KiB kernels 48*(48/49)=47 MiB
++    # -> 47-32=15 MiB (7 chunks) vs 64 KiB's 48-32=16 MiB (8 chunks).
++    assert len(sp_4k) == 7 and len(sp_64k) == 8
++    sp_64k.clear()
++
++    # Trim when post-arena MemAvailable is below post_load_headroom_bytes:
++    meminfo_post = tmp_path / "meminfo_post"
++    meminfo_post.write_text(f"MemAvailable: {(10 << 10)} kB\n", encoding="utf-8")
++    trimmed = direct_loader._trim_sponge_for_post_load(
++        sp_4k,
++        torch.device("cuda"),
++        target_bsz=2 << 20,
++        buddyinfo_path=buddy_ample,
++        meminfo_path=meminfo_post,
++        page_bytes=4096,
++        post_load_headroom_bytes=16 << 20,
++        min_high_bytes=4 << 20,
++    )
++    assert len(trimmed) == 4  # dropped ceil(6 MiB / 2 MiB) = 3 chunks from 7
++
++    # Full release when remaining >= target_bsz blocks are exhausted:
++    buddy_exhausted = tmp_path / "buddy_exhausted"
++    buddy_exhausted.write_text(
++        "Node 0, zone   Normal   0 0 0 0  64 0 0 0 0  0 0 0 0 0\n",
++        encoding="utf-8",
++    )
++    released = direct_loader._trim_sponge_for_post_load(
++        trimmed,
++        torch.device("cuda"),
++        target_bsz=2 << 20,
++        buddyinfo_path=buddy_exhausted,
++        meminfo_path=meminfo_tight,
++        page_bytes=4096,
++        post_load_headroom_bytes=16 << 20,
++        min_high_bytes=4 << 20,
++    )
++    assert len(released) == 0
 diff --git a/vllm/model_executor/model_loader/base_loader.py b/vllm/model_executor/model_loader/base_loader.py
 index 8e147ec8e..a6163d927 100644
 --- a/vllm/model_executor/model_loader/base_loader.py
@@ -218,17 +289,19 @@ index 8e147ec8e..a6163d927 100644
          return model.eval()
  
 diff --git a/vllm/model_executor/model_loader/direct_loader.py b/vllm/model_executor/model_loader/direct_loader.py
-index 24ec1f48e..8a0d9dd70 100644
+index 24ec1f48e..e1a0ae9de 100644
 --- a/vllm/model_executor/model_loader/direct_loader.py
 +++ b/vllm/model_executor/model_loader/direct_loader.py
-@@ -66,8 +66,13 @@ _ARENA_ALIGN_BYTES = 256
+@@ -66,8 +66,15 @@ _ARENA_ALIGN_BYTES = 256
  _PRESERVE_STORAGE_MAX_BYTES = 1 << 20
  _TOUCH_STRIDE_BYTES = 1 << 21
  _SPONGE_CHUNK_BYTES = 1 << 27
 -_SPONGE_HEADROOM_BYTES = 4 << 30
 -_SPONGE_MIN_MODEL_BYTES = 1 << 30
 +_SPONGE_MIN_CHUNK_BYTES = 1 << 21
-+_SPONGE_HEADROOM_BYTES = 6 << 30
++_SPONGE_HEADROOM_BYTES = 12 << 30
++_SPONGE_POST_LOAD_HEADROOM_BYTES = 16 << 30
++_SPONGE_POST_LOAD_MIN_HIGH_BYTES = 256 << 20
 +_SPONGE_MIN_MODEL_BYTES = 256 << 20
 +_SPONGE_POST_LOAD_SCRATCH_BYTES = 512 << 20
 +_SPONGE_RESERVE_HIGH_MAX_BYTES = 512 << 20
@@ -237,7 +310,7 @@ index 24ec1f48e..8a0d9dd70 100644
  
  
  def _align_up(value: int, alignment: int) -> int:
-@@ -108,50 +113,318 @@ def parse_buddyinfo_order13(
+@@ -108,50 +115,396 @@ def parse_buddyinfo_order13(
      return sub_order13, order13_plus
  
  
@@ -333,7 +406,7 @@ index 24ec1f48e..8a0d9dd70 100644
 +                for line in meminfo_path.read_text(encoding="utf-8").splitlines():
 +                    if line.startswith("MemAvailable:"):
 +                        avail_kib = int(line.split()[1])
-+                        return max(gpu_free, avail_kib * 1024)
++                        return avail_kib * 1024
 +        except Exception:  # noqa: BLE001
 +            pass
 +    return gpu_free
@@ -472,9 +545,20 @@ index 24ec1f48e..8a0d9dd70 100644
 +    soak_goal = sub_target_bytes + (
 +        eff_chunk if target_bsz <= _GPU_HUGEPAGE_BYTES else 0
 +    )
++    eff_page_bytes = page_bytes
++    if eff_page_bytes is None:
++        try:
++            eff_page_bytes = os.sysconf("SC_PAGE_SIZE")
++        except (AttributeError, OSError, ValueError):
++            eff_page_bytes = 0
++    # 4 KiB kernels spend ~2% (~20 MiB/GiB) of additional non-reclaimable RAM on
++    # CPU/GPU PTEs and UVM metadata across sponge + weight mappings.
++    usable_after_headroom = avail_bytes - headroom_bytes
++    if eff_page_bytes == 4096 and headroom_bytes > 0 and usable_after_headroom > 0:
++        usable_after_headroom = (usable_after_headroom * 48) // 49
 +    reserve_high = min(_SPONGE_RESERVE_HIGH_MAX_BYTES, high_target_bytes // 4)
 +    buddy_cap = (sub_target_bytes + high_target_bytes) - required_bytes - reserve_high
-+    mem_cap = avail_bytes - required_bytes - headroom_bytes
++    mem_cap = usable_after_headroom - required_bytes
 +    budget = min(soak_goal, buddy_cap, mem_cap)
 +    num_chunks = int(budget // eff_chunk)
      if num_chunks <= 0:
@@ -536,6 +620,73 @@ index 24ec1f48e..8a0d9dd70 100644
      return sponge
  
  
++def _trim_sponge_for_post_load(
++    sponge: list[torch.Tensor],
++    device: torch.device,
++    *,
++    target_bsz: int,
++    buddyinfo_path: Path = Path("/proc/buddyinfo"),
++    meminfo_path: Path | None = Path("/proc/meminfo"),
++    page_bytes: int | None = None,
++    post_load_headroom_bytes: int = _SPONGE_POST_LOAD_HEADROOM_BYTES,
++    min_high_bytes: int = _SPONGE_POST_LOAD_MIN_HIGH_BYTES,
++) -> list[torch.Tensor]:
++    """Release or trim the sponge after arena + MoE allocation when either no
++    ``>= target_bsz`` blocks remain to protect or ``MemAvailable`` would fall
++    below ``post_load_headroom_bytes`` during ``load_weights`` / post-load."""
++    if not sponge:
++        return sponge
++    chunk_bytes = sponge[0].numel() * sponge[0].element_size()
++    initial_mib = (len(sponge) * chunk_bytes) / (1 << 20)
++    if target_bsz > 0:
++        try:
++            cur_blocks = parse_buddyinfo_blocks(
++                buddyinfo_path.read_text(encoding="utf-8"),
++                page_bytes=page_bytes,
++            )
++            cur_high = sum(
++                tot for bsz, tot in cur_blocks.items() if bsz >= target_bsz
++            )
++            if cur_high < min_high_bytes:
++                logger.info(
++                    "Releasing %.1f MiB buddy sponge before weight load "
++                    "(%.1f MiB of >= %.1f MiB blocks remain; weights already "
++                    "claimed the high-order pool)",
++                    initial_mib,
++                    cur_high / (1 << 20),
++                    target_bsz / (1 << 20),
++                )
++                sponge.clear()
++                torch.accelerator.empty_cache()
++                return sponge
++        except OSError:
++            pass
++    avail_after = _available_uma_or_gpu_bytes(device, meminfo_path=meminfo_path)
++    if 0 < avail_after < post_load_headroom_bytes and chunk_bytes > 0:
++        deficit = post_load_headroom_bytes - avail_after
++        drop_chunks = min(len(sponge), (deficit + chunk_bytes - 1) // chunk_bytes)
++        if drop_chunks >= len(sponge):
++            logger.info(
++                "Releasing %.1f MiB buddy sponge before weight load to preserve "
++                "%.1f MiB post-load MemAvailable headroom (%.1f MiB available)",
++                initial_mib,
++                post_load_headroom_bytes / (1 << 20),
++                avail_after / (1 << 20),
++            )
++            sponge.clear()
++        elif drop_chunks > 0:
++            del sponge[-drop_chunks:]
++            logger.info(
++                "Trimmed buddy sponge by %.1f MiB (retaining %.1f MiB) to preserve "
++                "%.1f MiB post-load MemAvailable headroom",
++                (drop_chunks * chunk_bytes) / (1 << 20),
++                (len(sponge) * chunk_bytes) / (1 << 20),
++                post_load_headroom_bytes / (1 << 20),
++            )
++        torch.accelerator.empty_cache()
++    return sponge
++
++
 +def release_weight_arena_sponge(
 +    model: torch.nn.Module,
 +    device: torch.device | None = None,
@@ -571,7 +722,7 @@ index 24ec1f48e..8a0d9dd70 100644
  def bind_weight_arena(
      model: torch.nn.Module,
      device: torch.device,
-@@ -160,6 +433,7 @@ def bind_weight_arena(
+@@ -160,6 +513,7 @@ def bind_weight_arena(
      sponge_min_model_bytes: int = _SPONGE_MIN_MODEL_BYTES,
      buddyinfo_path: Path = Path("/proc/buddyinfo"),
      page_bytes: int | None = None,
@@ -579,7 +730,7 @@ index 24ec1f48e..8a0d9dd70 100644
  ) -> torch.Tensor | None:
      """Pack persistent CUDA model parameters into a 256-byte-aligned contiguous
      ``uint8`` arena (``model._direct_weight_arena``) before ``load_weights``.
-@@ -259,12 +533,21 @@ def bind_weight_arena(
+@@ -259,12 +613,40 @@ def bind_weight_arena(
                      del src, orig_storage
                  for param, _, _, _, _ in views:
                      param.set_(empty_storage, 0, (0,), (1,))
@@ -591,9 +742,28 @@ index 24ec1f48e..8a0d9dd70 100644
 +        _SPONGE_POST_LOAD_SCRATCH_BYTES,
 +        max(total_bytes // 4, _GPU_HUGEPAGE_BYTES),
 +    )
-+    sponge_required_bytes = (
-+        total_bytes + post_load_allowance if retain_sponge else total_bytes
++    live_buddy = buddyinfo_path == Path("/proc/buddyinfo")
++    avail_pre_sponge = (
++        _available_uma_or_gpu_bytes(device) if live_buddy and retain_sponge else 0
 +    )
++    can_retain_post_load = retain_sponge and (
++        not live_buddy
++        or avail_pre_sponge - total_bytes
++        >= _SPONGE_POST_LOAD_HEADROOM_BYTES + post_load_allowance
++    )
++    sponge_required_bytes = (
++        total_bytes + post_load_allowance if can_retain_post_load else total_bytes
++    )
++    sponge_target_bsz = 0
++    if order13_sponge and total_bytes >= sponge_min_model_bytes:
++        try:
++            sponge_target_bsz, _, _ = select_buddy_sponge_target(
++                buddyinfo_path.read_text(encoding="utf-8"),
++                required_bytes=sponge_required_bytes,
++                page_bytes=page_bytes,
++            )
++        except OSError:
++            sponge_target_bsz = 0
      sponge = (
          _allocate_order13_sponge(
              device,
@@ -602,7 +772,7 @@ index 24ec1f48e..8a0d9dd70 100644
              buddyinfo_path=buddyinfo_path,
              page_bytes=page_bytes,
          )
-@@ -272,6 +555,7 @@ def bind_weight_arena(
+@@ -272,6 +654,7 @@ def bind_weight_arena(
          else []
      )
      arena: torch.Tensor | None = None
@@ -610,7 +780,7 @@ index 24ec1f48e..8a0d9dd70 100644
      try:
          with torch.no_grad():
              if arena_bytes > 0:
-@@ -306,12 +590,27 @@ def bind_weight_arena(
+@@ -306,12 +689,35 @@ def bind_weight_arena(
                      param.set_(moe_storage, orig_offset, shape, stride)
                  del moe_buf, moe_storage
  
@@ -618,6 +788,14 @@ index 24ec1f48e..8a0d9dd70 100644
 +
          if sponge or total_bytes >= _TOUCH_STRIDE_BYTES:
              torch.accelerator.synchronize(device)
++        if retain_sponge and sponge and live_buddy:
++            sponge = _trim_sponge_for_post_load(
++                sponge,
++                device,
++                target_bsz=sponge_target_bsz,
++                buddyinfo_path=buddyinfo_path,
++                page_bytes=page_bytes,
++            )
 +        if retain_sponge and sponge:
 +            model._direct_buddy_sponge = sponge
 +            kept_sponge = True
@@ -640,7 +818,7 @@ index 24ec1f48e..8a0d9dd70 100644
  
      return arena
  
-@@ -349,6 +648,7 @@ class DirectModelLoader(DefaultModelLoader):
+@@ -349,6 +755,7 @@ class DirectModelLoader(DefaultModelLoader):
                  model,
                  device,
                  order13_sponge=self.order13_sponge,
@@ -703,6 +881,3 @@ index cee0ba045..4dd9095e4 100644
              param.zero_()
          return
  
--- 
-2.43.0
-

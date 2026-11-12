@@ -1,0 +1,162 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Christopher Owen <3221756+christopherowen@users.noreply.github.com>
+Date: Thu, 12 Nov 2026 02:13:27 +0000
+Subject: [PATCH] fix(direct_io): accept external dma-buf device mappings under
+ CUDA 13.5 compat
+
+Upstream base: local-inference-lab/vllm 19f2c20ed4d64ae22bd009ceacadd85e2a81e354 (after candidate-54 0799).
+
+Rationale:
+On TP3 profiles (SPARK_DS41F_DISPLAY_CARVEOUT_WEIGHTS=1), display_carveout.allocate() places vocabulary-sized tables (embed_tokens.weight, lm_head.weight, DSpark markov_w1.weight) in GB10 scanout dumb buffers (/dev/dri/card0) imported via cuImportExternalMemory + cuExternalMemoryGetMappedBuffer. When CUDA 13.5's forward-compatibility driver (cuda-compat-13-5 620.70.06 over a 580.178.04 host kernel driver) is active, querying an imported external dma-buf device pointer returns CU_MEMORYTYPE_HOST (1) from CU_POINTER_ATTRIBUTE_MEMORY_TYPE (despite CU_POINTER_ATTRIBUTE_HOST_POINTER failing with CUDA_ERROR_INVALID_VALUE and CU_POINTER_ATTRIBUTE_DEVICE_POINTER returning the device pointer) and base == 0 from cuMemGetAddressRange (while CU_POINTER_ATTRIBUTE_RANGE_START_ADDR and CU_POINTER_ATTRIBUTE_RANGE_SIZE return the exact non-zero base and buffer size). This caused direct_io/_cuda_range.h:device_range() to reject embed_tokens.weight with "RuntimeError: batch destination exceeds CUDA device allocation" during DirectWeightSession.flush().
+
+Changes:
+- Update direct_io/_cuda_range.h (is_device_only_mapping, device_range) to accept CUDA mappings whose CU_POINTER_ATTRIBUTE_MEMORY_TYPE is CU_MEMORYTYPE_HOST only when CU_POINTER_ATTRIBUTE_HOST_POINTER fails (excluding all pinned/registered host memory) and CU_POINTER_ATTRIBUTE_DEVICE_POINTER equals the pointer, resolving base == 0 from cuMemGetAddressRange via CU_POINTER_ATTRIBUTE_RANGE_START_ADDR when CU_POINTER_ATTRIBUTE_RANGE_SIZE matches size.
+- Add test_external_dmabuf_carveout_loads_and_rejects_out_of_bounds in tests/model_executor/model_loader/test_direct_loader_cuda.py verifying DirectWeightSession loading into a display_carveout buffer alongside out-of-bounds and pinned-host rejections.
+
+Quality implications:
+None. Weight values, dtypes, and copy semantics are unchanged; host buffers and out-of-bounds device ranges remain rejected before any I/O runs.
+
+Tests:
+- pytest tests/model_executor/model_loader/test_direct_loader.py tests/model_executor/model_loader/test_direct_loader_cuda.py tests/v1/worker/test_display_carveout.py under both host libcuda 580.178.04 (13000) and cuda-compat-13-5 libcuda 620.70.06 (13050).
+
+Upstream status: spark-ds41f local candidate patch.
+---
+ .../model_loader/test_direct_loader_cuda.py   | 62 +++++++++++++++++++
+ .../model_loader/direct_io/_cuda_range.h      | 37 +++++++++--
+ 2 files changed, 94 insertions(+), 5 deletions(-)
+
+diff --git a/tests/model_executor/model_loader/test_direct_loader_cuda.py b/tests/model_executor/model_loader/test_direct_loader_cuda.py
+index 4517a83cc..29bb74f5a 100644
+--- a/tests/model_executor/model_loader/test_direct_loader_cuda.py
++++ b/tests/model_executor/model_loader/test_direct_loader_cuda.py
+@@ -432,6 +432,68 @@ def test_expandable_weights_span_cuda_mappings_and_reject_unmapped_tail(tmp_path
+     )
+ 
+ 
++def test_external_dmabuf_carveout_loads_and_rejects_out_of_bounds(
++    tmp_path, monkeypatch
++):
++    """Imported DRM dma-buf weights (display_carveout) must pass device_range
++    including under CUDA 13.5 forward compatibility, while still rejecting
++    out-of-bounds extents and pinned host buffers."""
++    from vllm.v1.worker import display_carveout
++
++    if not Path(display_carveout._DRM_NODE).exists():
++        pytest.skip("requires /dev/dri/card0")
++    torch.cuda.set_device(0)
++    monkeypatch.setattr(display_carveout, "_REQUIRED", True)
++    monkeypatch.setattr(display_carveout, "_carveouts", [])
++    expected = torch.arange((64 << 20) // 2, dtype=torch.int32).to(
++        torch.bfloat16
++    ).reshape(8192, 4096)
++    path = tmp_path / "carveout.safetensors"
++    save_file({"weight": expected}, path)
++    try:
++        target = display_carveout.allocate(
++            expected.shape, expected.dtype, "cuda:0"
++        )
++    except RuntimeError as exc:
++        pytest.skip(f"display carve-out unavailable: {exc}")
++    assert target is not None
++    carve_bytes = display_carveout._carveouts[0].nbytes
++    try:
++        with DirectWeightSession() as session:
++            source = dict(session.weights([path]))["weight"]
++            assert session(target, source)
++            session.flush()
++            torch.testing.assert_close(target.cpu(), expected, rtol=0, atol=0)
++            with pytest.raises(RuntimeError, match="CUDA device allocation"):
++                session._execute(
++                    array(
++                        "Q",
++                        (
++                            session.files[0],
++                            0,
++                            carve_bytes + 4096,
++                            target.data_ptr(),
++                            0,
++                            1,
++                            0,
++                            0,
++                        ),
++                    )
++                )
++            pinned = torch.empty(8192, dtype=torch.uint8, pin_memory=True)
++            with pytest.raises(RuntimeError, match="CUDA device allocation"):
++                session._execute(
++                    array(
++                        "Q",
++                        (session.files[0], 0, 4096, pinned.data_ptr(), 0, 1, 0, 0),
++                    )
++                )
++    finally:
++        for carveout in list(display_carveout._carveouts):
++            carveout.close()
++        display_carveout._carveouts.clear()
++
++
+ def test_capabilities_report_the_attributes_the_loader_checks():
+     reported = capabilities(torch.accelerator.current_device_index())
+     assert set(reported) == {
+diff --git a/vllm/model_executor/model_loader/direct_io/_cuda_range.h b/vllm/model_executor/model_loader/direct_io/_cuda_range.h
+index 75bdd9e14..0f89a5ad9 100644
+--- a/vllm/model_executor/model_loader/direct_io/_cuda_range.h
++++ b/vllm/model_executor/model_loader/direct_io/_cuda_range.h
+@@ -5,12 +5,30 @@
+  * Whether a pointer range lies in CUDA device allocations of one device.
+  *
+  * Ported from local-inference-lab/b12x b12x/loader/_cuda_range.h at 236ddff04a5f
+- * (Apache-2.0). Changed: the include guard's name.
++ * (Apache-2.0). Changed: the include guard's name, and external dma-buf device
++ * mappings under CUDA 13.5 forward compatibility.
+  */
+ #ifndef VLLM_DIRECT_IO_CUDA_RANGE_H
+ #define VLLM_DIRECT_IO_CUDA_RANGE_H
+ #include <cuda.h>
+ 
++/* External dma-buf device mappings (cuImportExternalMemory +
++ * cuExternalMemoryGetMappedBuffer, such as display_carveout's DRM dumb buffers)
++ * report CU_MEMORYTYPE_HOST with no host pointer and base == 0 in
++ * cuMemGetAddressRange under CUDA 13.5 forward compatibility (cuda-compat-13-5
++ * 620.x over a 580.x host driver), while CU_POINTER_ATTRIBUTE_DEVICE_POINTER,
++ * CU_POINTER_ATTRIBUTE_RANGE_START_ADDR and CU_POINTER_ATTRIBUTE_RANGE_SIZE
++ * still identify the mapped device buffer. */
++static bool is_device_only_mapping(uintptr_t pointer, CUmemorytype kind) {
++    if (kind == CU_MEMORYTYPE_DEVICE) return true;
++    if (kind != CU_MEMORYTYPE_HOST) return false;
++    void *host_ptr = NULL;
++    CUdeviceptr dev_ptr = 0;
++    return cuPointerGetAttribute(&host_ptr, CU_POINTER_ATTRIBUTE_HOST_POINTER, pointer) != CUDA_SUCCESS &&
++           cuPointerGetAttribute(&dev_ptr, CU_POINTER_ATTRIBUTE_DEVICE_POINTER, pointer) == CUDA_SUCCESS &&
++           dev_ptr == (CUdeviceptr)pointer;
++}
++
+ /* Expandable tensors can span several adjacent CUDA mappings. */
+ static bool device_range(uintptr_t pointer, uint64_t bytes, int device) {
+     if (bytes > UINTPTR_MAX - pointer) return false;
+@@ -20,12 +38,21 @@ static bool device_range(uintptr_t pointer, uint64_t bytes, int device) {
+         CUdeviceptr base;
+         size_t size;
+         if (cuPointerGetAttribute(&kind, CU_POINTER_ATTRIBUTE_MEMORY_TYPE, pointer) != CUDA_SUCCESS ||
+-            kind != CU_MEMORYTYPE_DEVICE ||
++            !is_device_only_mapping(pointer, kind) ||
+             cuPointerGetAttribute(&ordinal, CU_POINTER_ATTRIBUTE_DEVICE_ORDINAL, pointer) != CUDA_SUCCESS ||
+             ordinal != device ||
+-            cuMemGetAddressRange(&base, &size, pointer) != CUDA_SUCCESS ||
+-            pointer < base || pointer - base >= size) return false;
+-        size_t available = size - (pointer - base);
++            cuMemGetAddressRange(&base, &size, pointer) != CUDA_SUCCESS) return false;
++        if (base == 0 && kind == CU_MEMORYTYPE_HOST) {
++            CUdeviceptr range_start = 0;
++            size_t range_size = 0;
++            if (cuPointerGetAttribute(&range_start, CU_POINTER_ATTRIBUTE_RANGE_START_ADDR, pointer) != CUDA_SUCCESS ||
++                cuPointerGetAttribute(&range_size, CU_POINTER_ATTRIBUTE_RANGE_SIZE, pointer) != CUDA_SUCCESS ||
++                range_start == 0 ||
++                range_size != size) return false;
++            base = range_start;
++        }
++        if ((CUdeviceptr)pointer < base || (CUdeviceptr)pointer - base >= size) return false;
++        size_t available = size - (size_t)((CUdeviceptr)pointer - base);
+         if (bytes <= available) return true;
+         pointer += available;
+         bytes -= available;
