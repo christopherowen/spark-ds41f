@@ -150,7 +150,7 @@ deployment `e90b1e8a`):
 - **Release tests on `4aff1368`:** pass, 10,242 passed, 357 skipped, 0 failed, 2,652 s on dgx4
   ([receipts/release-tests-4aff1368](receipts/release-tests-4aff1368)).
 
-### `tp4-ring`: gates pass, screen mixed
+### Second build at `tp4-ring`: gates pass, screen mixed
 
 Details and every run in [receipts/tp4-ring](receipts/tp4-ring/README.md) (2026-11-11 23:56Z to 2026-11-12 04:17Z).
 
@@ -170,7 +170,7 @@ Details and every run in [receipts/tp4-ring](receipts/tp4-ring/README.md) (2026-
   pre-launch defragmentation. The series misses #989's serving mark (prefill not worse at 32K and 256K) at
   `tp4-ring`. Which change causes it is not yet measured.
 
-### `tp4-switched` and `tp3-switched`: no boot reaches ready
+### Second build at `tp4-switched` and `tp3-switched`: no boot reaches ready
 
 The failed starts' logs are in [receipts/failed-starts](receipts/failed-starts); each failure rolled the testbed back
 to candidate-54.
@@ -193,3 +193,55 @@ to candidate-54.
 tree `ed91c273` and stay as its record. The third build replaces both images, and its gates and screens are run
 again at every testbed. Their specs' runs are named `<run>-b3`, so the second build's result folders on the nodes
 (which the receipts list by hash) are not overwritten.
+
+**Third build** (dgx1's window, jobs `20261112T070706-build.json` and `20261112T073136-build.json`, 07:07-08:38Z):
+
+| Image | Image ID | Layers | Note |
+| --- | --- | --- | --- |
+| `spark-ds41f:candidate-55` | `ad905a6d` | 56 | Built on dgx4 in 11 min by the first job, which then failed on a stale control image still referenced by exited containers |
+| `spark-ds41f:candidate-55-no974` | `1d02f07b` | 53 | Built on dgx4 in 10 min by the second job |
+
+- Each image has the same layers on all of dgx1..dgx4. `ad905a6d` was then shipped to sp1..sp4 and sp5..sp7.
+- **Release tests on `ad905a6d`:** pass, 10,243 passed, 357 skipped, 0 failed, 2,628 s on dgx4
+  ([receipts/release-tests-ad905a6d](receipts/release-tests-ad905a6d)). The one pass more than `4aff1368` is
+  `0804`'s carve-out test, which ran because dgx4 has `/dev/dri/card0`.
+
+### Third build: every boot ready, every gate identical
+
+Details and every run in [receipts/third-build](receipts/third-build/README.md) (2026-11-12 08:02Z to 13:02Z, deployment
+`bbfe2618`). Every boot reached ready (44 of 44) and no memory guard fired.
+
+| Check | `tp4-ring` | `tp4-switched` | `tp3-switched` |
+| --- | --- | --- | --- |
+| Gate | 12 of 12 boots, 48 of 48 runs; control 2 of 2, 8 of 8; candidate-54's TP4 hashes 18d61961/d6568649 | 4 of 4, 16 of 16; the same hashes | 4 of 4, 16 of 16; candidate-54's TP3 hashes 5c22ce41/bce6092e |
+| c1 decisions | 4 of 4 boots agree, and with candidate-54's 4 on the 58 requests both sent | 4 of 4, and with candidate-54's on the 57 both sent | not run |
+| c1 paired decode against candidate-54 | **-1.59% ± 0.17%** decode time (+1.63% tok/s) | **-2.28% ± 0.08%** (+2.35% tok/s) | `single-stream` +1.42% decode, `sampled` c1 +1.60% |
+| Screen against candidate-54: grid | **0.67% slower** (control 0.22%, same) | **1.11% slower** | 2.29% faster |
+| c16 (c8 at TP3) | paired decode +0.75% (better), output +0.86% (same) | +1.49% and +1.47% (better) | +0.43% and +0.57% (same) |
+| Prefill | 32K the same (-2.31%), **256K 3.37% slower** (control 3.08%) | 32K and 256K the same | 32K 6,401 and 256K 6,329 tok/s (first TP3 measurement); `stall-3` **1.32% slower** |
+| candidate-55 against the control, same window | grid, c16 and prefill the same; model step identical (KL 0) | | |
+| Time to ready, engine | 105.0 s mean, candidate-54 101.0 s; the control the same as candidate-55 | 117-127 s | 112-126 s |
+
+All screen and c1 comparisons are against candidate-54's recorded runs, so cross-session.
+
+- **The third build fixes both switched failures:** #1134's `0800` at `6757c7a1` passes sp1's memguard on 4 KiB pages,
+  and #1145's `0804` lets `tp3-switched` load its weights.
+- **#974 changes no temperature-0 output at TP3 either**, and its serving mark at `tp4-ring` passes again: against
+  the control, grid, c16 and prefill are the same.
+- **The 256K regression at `tp4-ring` is in the control too**, and does not appear at `tp4-switched`. Its cause is
+  among #1134, #1096, #989, #982 and the pre-launch defragmentation.
+- **The grid is slower on both TP4 testbeds and faster at TP3.** The cause is under investigation separately.
+- **Boot times:** the engine's startup is about 4 s longer than candidate-54's at `tp4-ring`, in the control too. In
+  3 of 66 boots over both builds, the time before launch (stopping the previous engine and the pre-launch
+  defragmentation) was about 57 s longer than usual; the engine's own time was normal.
+
+Marks after the third build:
+
+| PR | Own mark | Serving mark |
+| --- | --- | --- |
+| #974 | Not run | **Met** at `tp4-ring`: not worse than the control on grid, c16 and prefill |
+| #1134 | Not run | Every boot reaches ready: **met** (44 of 44). The screens' repeat boots differ by 0.4% or less on the grid and decode rows, inside the recorded A/A floors; against candidate-54's repeats some rows are further apart and some closer, which two boots cannot separate |
+| #1096 | Release tests pass; the no-B12X smoke passed on the first build's images | Inert: **met** (the control gives candidate-54's hashes). Time to ready not worse: **not met as measured** (engine +4 s, cross-session; not attributed between #1134 and #1096) |
+| #989 | Not run | Prefill not worse: **met** at `tp4-switched`, **missed** at `tp4-ring` (256K 3.37% slower, the control too; not attributed) |
+| #982 | Not run | **Met:** 12 of 12 gate boots identical at `tp4-ring`, and the c1 decision checks agree |
+| #1145 | **Met:** its test passes on dgx4 (`/dev/dri/card0`), and the release tests pass | **Met:** every `tp3-switched` boot loads its weights; inert at TP4 (candidate-54's hashes) |
