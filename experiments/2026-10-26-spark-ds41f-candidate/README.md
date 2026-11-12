@@ -1088,7 +1088,17 @@ README.
     prefill 3.25% slower, and the control showed the same. No switched boot reached ready: sp1's memguard stopped
     `tp4-switched` (#1134's `0800` on 4 KiB pages), and `tp3-switched` failed at weight load (#974's compat driver
     with the TP3 carve-out).
-  - #1134 at `6757c7a1` and #1145 are folded in, and the third build is next.
+  - The third build (tree `e8c20f54`, #1134 at `6757c7a1` and #1145; images `ad905a6d` and the control's
+    `1d02f07b`) passed its release tests, and every boot reached ready on all three testbeds. Every gate gave
+    candidate-54's hashes, TP4 and TP3. Against candidate-54's recorded runs (cross-session):
+    - c1 decode is 1.63% faster at `tp4-ring` and 2.35% faster at `tp4-switched`.
+    - At `tp4-ring`, the grid is 0.67% slower and 256K prefill 3.37% slower; the control shows the 256K
+      regression too.
+    - At `tp4-switched`, the grid is 1.11% slower and prefill the same.
+    - At `tp3-switched`, the grid is 2.29% faster and `stall-3` 1.32% slower.
+    - Against the control at `tp4-ring`, everything is the same.
+    - The own marks of #974, #1134, #989 and #982 are not yet run
+      ([receipts/third-build](candidate-55/receipts/third-build/README.md)).
 
 ## Candidates 55-58 (removed 2026-11-11)
 
