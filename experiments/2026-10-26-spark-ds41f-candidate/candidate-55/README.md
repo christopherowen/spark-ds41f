@@ -17,6 +17,7 @@ against candidate-54's recorded runs, not release-qualified.
 | #974 | CUDA 13.5.37 toolchain (nvcc/ptxas, cudart) and cuBLASLt 13.10.0.20 | `sources.cuda_toolkit` in this lock (hash-locked debs) |
 | Kernel cache key (owner, 2026-11-13) | TileLang's kernel cache key names the CUDA device compiler and its version, so a node whose cache an earlier toolkit filled compiles this build's kernels instead of loading the old ones | TileLang `0014` ([tilelang/series](tilelang/series): `spark-ds41f-1107`'s thirteen patches, then `0014`) |
 | Row-band WO window (owner, 2026-11-13: fifth build "with both patches") | `VLLM_DS41_L2_PREFETCH_WO_BANDS` sizes the WO prefetch window, and COMP's, by the forward's row count; unset, nothing changes. The TP4 recipe sets `17-32=10` | vLLM `0806` ([the experiment](../../2026-11-13-l2-prefetch-row-bands/README.md)) |
+| Vision GELU table (2026-11-13, the fifth build's release tests) | The aligner's fused GELU reads torch's own `F.gelu` of each BF16 value from a table instead of calling the compiling toolkit's `erff`, so it is DeepSeek's reference under CUDA 13.5 as under 13.0 | vLLM `0807` |
 | #738 | GLP's reader takes Spec v3 (`hc_fold_pre_engram`) beside Spec v1; a Spec v3 vector folds the stream mean and projects each covered layer's attention write. A Spec v1 vector (GLP-39) steers as before | vLLM `0805` (rebased on candidate-55, [receipts/glp-rebase](receipts/glp-rebase/README.md)) |
 
 ## Selection
@@ -73,7 +74,9 @@ against candidate-54's recorded runs, not release-qualified.
   678 patches, `patch_head` `d6d4319e`, `expected_tree` `8aaae3df`, `patchset_sha256` `6fdf03dc`, through the fourth
   build. The fifth build adds `0806` (the row-band WO window): 679 patches, `patch_head` `1878808a`, `expected_tree`
   `7d05b12b`, `patchset_sha256` `ece15474`, recorded by `bin/spark build prepare --only vllm --lock` on sp8 for both
-  locks. `7d05b12b` is the tree the row-band experiment measured as an overlay.
+  locks. `7d05b12b` is the tree the row-band experiment measured as an overlay. The sixth build adds `0807` (the
+  vision GELU table): 680 patches, `patch_head` `0f55693e`, `expected_tree` `e630ad15`, `patchset_sha256` `7ce17bdf`,
+  recorded the same way.
 - sparknet ([sparknet/series](sparknet/series)) on `1fd6a1fb`: `0001` (#1134), `0002` (#989), `0003` (#982 Part A,
   [receipts/sparknet-stack](receipts/sparknet-stack/README.md)). `patch_head` `1fdf8dc7`, `expected_tree` `e06f6a06`,
   `patchset_sha256` `60bb1942`.
@@ -307,6 +310,11 @@ and `[gemv]` (7 of the BF16 inputs a projection can produce, the same seven in b
   the fifth build compile its own.
 - **Effect:** image inputs. The text gates are unaffected (candidate-54's hashes at all three testbeds on these
   kernels). Not fixed in this build.
+- **Fix: vLLM `0807`, for the sixth build.** `gelu_table` is `F.gelu` of each of the 65,536 BF16 values, built by
+  torch on the device; the GEMM's and the GEMV's GELU epilogues take it as an operand and read the entry at the
+  rounded biased value's bits. The epilogue is then torch's result under any toolkit. Mounted over the fifth build on
+  sp8 with an empty kernel cache: the vision file's 108 tests pass, and the first projection with its epilogue takes
+  the same time with either epilogue (404 to 408 us at 4 and 8 rows, 790 to 801 us at 144, 1,948 to 1,964 us at 576).
 
 ## Status
 
@@ -489,3 +497,16 @@ Against `spark-ds41f-1107`, composed from candidate-54's recorded screens agains
 | Grid | 7.05% faster | 8.20% faster |
 | c16 paired decode | +1.71% | +2.54% |
 | Prefill 262,144 | +6.24% | +6.66% |
+
+### Sixth build: the fifth with vLLM `0807`
+
+The sixth build's tree differs from the fifth's in three files: the vision kernels, the aligner and their test. Its
+specs' runs are named `<run>-b6`. Marks, declared before the build:
+
+1. **Release tests:** none fails on the sixth build's image, with the kernel cache CUDA 13.5 filled.
+2. **Outputs:** the gate gives candidate-54's hashes on every boot at `tp4-ring`, `tp4-switched` (18d61961/d6568649)
+   and `tp3-switched` (5c22ce41/bce6092e).
+3. **Serving:** at each TP4 testbed the screen's grid, c16 and prefill rows are the same as the fifth build's two
+   boots, within the margin. No text path changes, so a difference would be a finding about the build, not the patch.
+
+Not run again: the c1 decision checks and `tp3-switched`'s screen, which stand as the fifth build's.
