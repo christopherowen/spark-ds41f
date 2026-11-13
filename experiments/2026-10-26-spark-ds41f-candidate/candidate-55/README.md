@@ -96,7 +96,7 @@ unchanged. The control can: it must give candidate-54's TP4 hashes `18d61961`/`d
 | #1096 | Its release-test selection passes; no B12X module is imported at startup | Inert: the control's gate gives candidate-54's hashes; time to ready not worse (three startup RPC rounds skipped) |
 | #989 | Its `bench_pipelined_collectives.py` on sp1..sp4 (TP4) and sp1..sp3 (TP3): collectives of 4-16 MiB faster than PyNCCL beyond the interval, outputs bit-exact | Prefill at 32K and 256K not worse at `tp4-ring` and `tp4-switched` |
 | #982 | Its `bench_pdl_direct_stage.py` chains on sp1..sp4, Part A only: chain time at M=1..32 faster beyond the interval; the PDL-chain source test passes | The gate on 12 boots at `tp4-ring` and the c1 decision check: every boot identical. #982 makes more graph edges programmatic, the class of hazard `0799` fixed |
-| #738 (declared 2026-11-12, before the fourth build) | Its suite passes in the release tests: the GLP kernel and model tests, `glp_steer_write`'s PDL-chain entry, the weightless, CED and SP-prefill model tests. The image's reader accepts GLP-39 and GLP-27 on the head (#1149's GLP reader check in `cluster start`'s preflight, at the boots of `tp4.json` and `glp27-tp4.json`) | **Spec v1 unchanged:** GLP-39's steered replies ([glp39-steered-tp4.json](glp39-steered-tp4.json), `dual_probe.py`) identical in token IDs and log probabilities to the third build's on both boots: steered `739b8abc`, stock `9872053e` ([dual_replies.py](dual_replies.py)). **Stock unchanged:** every gate gives candidate-54's hashes with GLP-39 configured, and [qualify-glp27-tp4.json](qualify-glp27-tp4.json)'s gate runs give them with GLP-27 configured. **GLP-27 qualified at `tp4-ring`:** every `dual_probe.py` check passes on both boots; its steered speed and AdvBench rates are recorded, not gated |
+| #738 (declared 2026-11-12, before the fourth build) | Its suite passes in the release tests: the GLP kernel and model tests, `glp_steer_write`'s PDL-chain entry, the weightless, CED and SP-prefill model tests. The image's reader accepts GLP-39 and GLP-27 on the head (#1149's GLP reader check in `cluster start`'s preflight, at the boots of `tp4.json` and `glp27-tp4.json`) | **Spec v1 unchanged:** GLP-39's steered replies ([glp39-steered-tp4.json](glp39-steered-tp4.json), `dual_probe.py`) identical in token IDs and log probabilities to the third build's on both boots: steered `739b8abc`, stock `9872053e` ([dual_replies.py](dual_replies.py)). **Stock unchanged:** every gate gives candidate-54's hashes with GLP-39 configured, and [qualify-glp27-tp4.json](qualify-glp27-tp4.json)'s gate runs give them with GLP-27 configured. **GLP-27 qualified at `tp4-ring`:** every `dual_probe.py` check passes on both boots; its steered speed and AdvBench rates are recorded, not gated. **GLP-27 qualified at `tp4-switched` and `tp3-switched`** (2026-11-13): the same, on both boots of each; the stock name keeps each shape's hashes, and both TP4 testbeds give the same steered replies ([receipts/glp](receipts/glp/README.md)) |
 | #1145 (declared 2026-11-12, before the third build) | Its test (`test_external_dmabuf_carveout_loads_and_rejects_out_of_bounds`) passes where `/dev/dri/card0` exists, and the release tests pass | Every `tp3-switched` boot loads its weights (no `batch destination exceeds CUDA device allocation`); inert at `tp4-ring`, where the carve-out is off: the gate gives candidate-54's hashes |
 
 ## Verification
@@ -113,9 +113,11 @@ unchanged. The control can: it must give candidate-54's TP4 hashes `18d61961`/`d
   qualification on 2 boots at `tp4-ring` ([qualify-glp27-tp4.json](qualify-glp27-tp4.json)): the temperature-0 gate
   on the stock name, [dual_probe.py](../../2026-10-28-glp-dual-serving/dual_probe.py) `--speed`, 16 distinct streams
   and [advbench.py](../../2026-10-28-glp-dual-serving/advbench.py), as GLP-39 was qualified for `glp-3`
-  ([2026-10-28-glp-dual-serving](../../2026-10-28-glp-dual-serving/README.md)). GLP-27 at TP3 is not qualified.
-  `advbench.py` prints every reply; its output stays on dgx1 under `results/private`, and the receipts keep only each
-  boot's summary line (the rates per name).
+  ([2026-10-28-glp-dual-serving](../../2026-10-28-glp-dual-serving/README.md)). Added 2026-11-13: the same
+  qualification at `tp4-switched` and `tp3-switched` ([qualify-glp27-tp4-switched.json](qualify-glp27-tp4-switched.json),
+  [qualify-glp27-tp3-switched.json](qualify-glp27-tp3-switched.json)); every GLP run's results are in
+  [receipts/glp](receipts/glp/README.md). `advbench.py` prints every reply; its output stays on the testbed's head
+  under `results/private`, and the receipts keep only each boot's summary line (the rates per name).
 - **Pre-launch defragmentation:** candidate-55's and the control's boots defragment before launch, but candidate-54's
   recorded references were taken without it. A difference against those references includes the defragmentation,
   which counts as part of #1134.
@@ -390,7 +392,8 @@ pass every check, steering changes all 8 prompts, and both give the same replies
   every profile's `vllm.tree` label follows.
 - **GLP-27:** [glp27-tp4.json](glp27-tp4.json) adds it, with [qualify-glp27-tp4.json](qualify-glp27-tp4.json) and
   #738's marks declared above. The file is in the Hugging Face cache on dgx1..dgx4 at revision `4d570926`, with
-  sha256 `24e97d41`. AdvBench's data is on dgx1.
+  sha256 `24e97d41`, and on sp1..sp7 at the same revision and sha256. AdvBench's data is on dgx1, and on sp1 and sp5
+  (copied from dgx1 on 2026-11-13, sha256 `7cafb159`).
 - **Third build:** its images and results are of tree `e8c20f54` and stay as its record.
 - **Fourth build:** it replaces both images and runs every gate, check and screen again. Its specs' runs are named
   `<run>-b4`.
