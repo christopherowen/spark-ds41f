@@ -18,6 +18,9 @@ against candidate-54's recorded runs, not release-qualified.
 | Kernel cache key (owner, 2026-11-13) | TileLang's kernel cache key names the CUDA device compiler and its version, so a node whose cache an earlier toolkit filled compiles this build's kernels instead of loading the old ones | TileLang `0014` ([tilelang/series](tilelang/series): `spark-ds41f-1107`'s thirteen patches, then `0014`) |
 | Row-band WO window (owner, 2026-11-13: fifth build "with both patches") | `VLLM_DS41_L2_PREFETCH_WO_BANDS` sizes the WO prefetch window, and COMP's, by the forward's row count; unset, nothing changes. The TP4 recipe sets `17-32=10` | vLLM `0806` ([the experiment](../../2026-11-13-l2-prefetch-row-bands/README.md)) |
 | Vision GELU table (2026-11-13, the fifth build's release tests) | The aligner's fused GELU reads torch's own `F.gelu` of each BF16 value from a table instead of calling the compiling toolkit's `erff`, so it is DeepSeek's reference under CUDA 13.5 as under 13.0 | vLLM `0807` |
+| Torch for the toolkit (owner, 2026-11-13: "we should update pytorch to match our cuda build", "use tonight's nightly", "just add it to candidate-55") | torch `2.16.0.dev20261113+cu135` over the base image's `2.13.0+cu130`, from 22 hash-locked wheels; every native extension is built against it. PyTorch has no stable cu135 build, and no cu135 torchvision, torchaudio or torchcodec: those are the cu134 nightlies of its date | `sources.torch` in this lock ([requirements/torch-2-16-cu135-aarch64.txt](../../../requirements/torch-2-16-cu135-aarch64.txt)) |
+| NCCL 2.32.3 (required by that torch) | Its `libtorch_cuda.so` binds nine NCCL symbols 2.30.7 lacks, so the four NCCL patches are rebased onto `v2.32.3-1` | [nccl/series](nccl/series) |
+| Split canonicalization (required from torch 2.15) | Upstream vLLM #57299: torch 2.15 regenerates split outputs as slices, which stopped two fusion passes from matching | vLLM `0808` |
 | #738 | GLP's reader takes Spec v3 (`hc_fold_pre_engram`) beside Spec v1; a Spec v3 vector folds the stream mean and projects each covered layer's attention write. A Spec v1 vector (GLP-39) steers as before | vLLM `0805` (rebased on candidate-55, [receipts/glp-rebase](receipts/glp-rebase/README.md)) |
 
 ## Selection
@@ -76,7 +79,15 @@ against candidate-54's recorded runs, not release-qualified.
   `7d05b12b`, `patchset_sha256` `ece15474`, recorded by `bin/spark build prepare --only vllm --lock` on sp8 for both
   locks. `7d05b12b` is the tree the row-band experiment measured as an overlay. The sixth build adds `0807` (the
   vision GELU table): 680 patches, `patch_head` `0f55693e`, `expected_tree` `e630ad15`, `patchset_sha256` `7ce17bdf`,
-  recorded the same way.
+  recorded the same way. The seventh build adds `0808` (upstream #57299): 681 patches, `patch_head` `5a190b19`,
+  `expected_tree` `3782bf90`.
+- NCCL ([nccl/series](nccl/series)) on `v2.32.3-1` (`12df1a11`), from the seventh build: `0001` and `0002` applied
+  unchanged, `0003` with one conflict in a log line, `0004` ported by hand to `src/tuning/tuning_general.cc`, where
+  2.31 moved the sizing. `patch_head` `d39a5a7b`, `expected_tree` `f6e56acc`. The rebuilt library exports the 60 NCCL
+  symbols torch needs. Builds one to six, and the `no974` control, are on `v2.30.7-1` with the 2026-10-03 series.
+- torch `2.16.0.dev20261113+cu135` from the seventh build (`sources.torch`); its CUDA libraries are the toolkit's
+  versions (13.5.37, cuBLAS 13.10.0.20). Not carried: upstream #58189 (this torch has the fix), and a
+  `tokenspeed-mla` bump (nothing on DS4.1's path imports it; it conflicts with Triton 3.9 only when loaded).
 - sparknet ([sparknet/series](sparknet/series)) on `1fd6a1fb`: `0001` (#1134), `0002` (#989), `0003` (#982 Part A,
   [receipts/sparknet-stack](receipts/sparknet-stack/README.md)). `patch_head` `1fdf8dc7`, `expected_tree` `e06f6a06`,
   `patchset_sha256` `60bb1942`.
@@ -535,3 +546,35 @@ on every node. Receipts: [receipts/sixth-build](receipts/sixth-build),
 | Prefill 262,144 | -1.02% (8,773 and 8,755 tok/s; worse) | -1.03% | -0.39% (8,697 and 8,739 tok/s; the same) | -0.84% |
 
 Open, carried from the fifth build: 256K prefill at `tp4-ring` is 1% behind candidate-54 beyond the margin.
+
+### Seventh build: torch for the toolkit, NCCL 2.32.3, vLLM `0808`
+
+Three variables that cannot be separated: this torch does not load without NCCL 2.32.3, and vLLM's fusion passes
+need `0808` on it. The `no974` control cannot take them (no CUDA 13.5 toolkit) and stays the sixth build's. Specs'
+runs are named `<run>-b7`. Built on sp8 as `spark-ds41f:candidate-55-b7`, image ID `71293710`; the sixth build keeps
+`spark-ds41f:candidate-55` until this one is distributed.
+
+Before the testbeds, on sp8 (2026-11-13):
+
+- The image build's checks pass: torch is the lock's, reports CUDA 13.5 and NCCL 2.32.3, and loads the patched
+  library and no other; the GPU, TileLang and sparknet smokes pass and the 66 DS4.1 modules import.
+- torch's compiled architectures stop at `sm_120`, which GB10 (12.1) runs: a BF16 matmul and a CUDA graph capture
+  and replay work.
+- **torch's own GELU moved with the toolkit.** At the seven inputs of the fifth build's failures, this torch's
+  `erff` is CUDA 13.5's and its `F.gelu` gives the values the 13.5-compiled kernel gave before `0807`. The kernel
+  reads torch's table, so it differs from torch at 0 inputs on either torch. Image inputs therefore differ from
+  candidate-54's at those inputs on this build, with the reference.
+- vLLM `0808`'s tests on torch 2.13: 15 passed, 33 skipped (they need a model the node does not hold).
+- NCCL 2.32.3 with the rebased patches has run no collective yet.
+
+Marks, declared before the testbed runs:
+
+1. **Release tests:** none fails on the seventh build's image.
+2. **Every boot reaches ready** at `tp4-ring`, `tp4-switched` and `tp3-switched` (NCCL's ring and channel patches on
+   a reworked tuner).
+3. **Outputs:** every boot of a testbed gives the same hashes. The text hashes are candidate-54's
+   (0a2dacdd/12fd8257 at TP4, 26a739a9/12cfee9b at TP3). The log-probability hashes are candidate-54's too, or the
+   difference is shown to be torch's own arithmetic on the logits, not a kernel's.
+4. **Serving:** at each testbed the screen's rows are not worse than the sixth build's two boots beyond the margin
+   (the fifth build's at `tp3-switched`), and the c1 decisions agree on 4 of 4 boots at both TP4 testbeds.
+5. **Time to ready** not longer than the sixth build's warm boots by more than 5 s.
