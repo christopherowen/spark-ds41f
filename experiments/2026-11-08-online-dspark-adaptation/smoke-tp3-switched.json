@@ -1,0 +1,54 @@
+{
+ "experiment": "experiments/2026-11-08-online-dspark-adaptation",
+ "run": "online-dspark-adaptation-smoke-tp3-switched",
+ "jobs": [
+  {
+   "kind": "sync"
+  },
+  {
+   "kind": "measure",
+   "bench": false,
+   "bracket": false,
+   "arms": [
+    {
+     "config": "experiments/2026-11-08-online-dspark-adaptation/tp3-switched-on-smoke.json",
+     "label": "adapt-on-smoke"
+    }
+   ],
+   "extras": [
+    [
+     "online_adaptation_workload.py",
+     [
+      "--turn-tokens",
+      "128",
+      "--heldout-tokens",
+      "64"
+     ],
+     "workload"
+    ],
+    [
+     "scripts/distinct_streams.py",
+     [
+      "--streams",
+      "8",
+      "--samples",
+      "1",
+      "--tokens",
+      "128"
+     ],
+     "c8-distinct"
+    ],
+    [
+     "collect_adaptation_digests.py",
+     [
+      "--nodes",
+      "localhost",
+      "sp6",
+      "sp7"
+     ],
+     "digests"
+    ]
+   ]
+  }
+ ]
+}
