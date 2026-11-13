@@ -1,0 +1,673 @@
+From 1424ccf6becb87698bb42dbb69928cc5b3da1324 Mon Sep 17 00:00:00 2001
+From: Christopher Owen <chris@owen.org>
+Date: Tue, 10 Nov 2026 04:39:56 +0000
+Subject: [PATCH] perf(v1): pack NewRequestData token IDs as int32 PickleBuffer
+ and stage arrays directly
+
+Upstream base: 19f2c20ed4d6ca2efe9bc9f3da8a6c0efc2effc9
+
+Rationale: On request admission, Scheduler.schedule() constructs NewRequestData with both prompt_token_ids and prefill_token_ids (req._all_token_ids, initialized as prompt_token_ids.copy()). Pickling SchedulerOutput across MessageQueue therefore serializes two distinct Python list[int] objects element-by-element (~10 bytes/token total) and allocates 2 * N PyLongObjects on every TP worker process, followed by another O(N) Python list-to-int32 conversion in StagedWriteTensor.stage_write/apply_write and model_state.add_request. Deduplicating fresh prefill_token_ids against prompt_token_ids, pre-packing long prompts (>= 256 tokens) into a 1D int32 array wrapped in Int32TokenIds (serialized via protocol-5 PickleBuffer with a single prefix-length sentinel for prompt_token_ids), and staging ndarray views directly in StagedWriteTensor eliminates per-token Python object serialization and conversion across all ranks.
+
+Quality implications: None (bit-identical int32 token IDs; falls back to list[int] for < 256 tokens or out-of-int32-range values).
+
+Tests: pytest tests/v1/core/test_new_request_data_ipc.py
+
+Upstream status: Local spark-ds41f patch
+---
+ tests/v1/core/test_new_request_data_ipc.py | 185 ++++++++++++++++
+ vllm/v1/core/sched/output.py               | 238 ++++++++++++++++++++-
+ vllm/v1/request.py                         |  33 +++
+ vllm/v1/worker/gpu/buffer_utils.py         |  48 ++++-
+ 4 files changed, 494 insertions(+), 10 deletions(-)
+ create mode 100644 tests/v1/core/test_new_request_data_ipc.py
+
+diff --git a/tests/v1/core/test_new_request_data_ipc.py b/tests/v1/core/test_new_request_data_ipc.py
+new file mode 100644
+index 000000000..61c2df142
+--- /dev/null
++++ b/tests/v1/core/test_new_request_data_ipc.py
+@@ -0,0 +1,185 @@
++# SPDX-License-Identifier: Apache-2.0
++# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
++
++import pickle
++
++import numpy as np
++import pytest
++import torch
++
++from vllm.distributed.device_communicators.shm_broadcast import MessageQueue
++from vllm.sampling_params import SamplingParams
++from vllm.v1.core.sched.output import (
++    INT32_TOKEN_IDS_MIN_LEN,
++    Int32TokenIds,
++    NewRequestData,
++)
++from vllm.v1.request import Request
++
++
++def _make_request(prompt_tokens: list[int], req_id: str = "req-1") -> Request:
++    return Request(
++        request_id=req_id,
++        prompt_token_ids=prompt_tokens,
++        sampling_params=SamplingParams(max_tokens=16),
++        pooling_params=None,
++    )
++
++
++def test_int32_token_ids_sequence_protocol():
++    raw = [i * 3 - 7 for i in range(512)]
++    packed = Int32TokenIds.from_sequence(raw)
++    assert packed is not None
++    assert len(packed) == 512
++    assert bool(packed) is True
++    assert not bool(Int32TokenIds(np.empty(0, dtype=np.int32)))
++    assert isinstance(packed[0], int)
++    assert packed[0] == raw[0]
++    assert packed[-1] == raw[-1]
++    sliced = packed[10:50]
++    assert isinstance(sliced, Int32TokenIds)
++    assert sliced == raw[10:50]
++    assert packed == raw
++    assert packed.tolist() == raw
++    assert list(packed) == raw
++    copied = packed.copy()
++    assert copied == packed
++    assert copied._arr is not packed._arr
++    arr_view = np.asarray(packed, dtype=np.int32)
++    assert np. shares_memory(arr_view, packed._arr)
++
++
++def test_new_request_data_from_request_fresh_and_resumed():
++    tokens = [i % 100000 for i in range(4096)]
++    req = _make_request(tokens)
++
++    # Fresh request: prompt_token_ids and prefill_token_ids share one Int32TokenIds
++    data = NewRequestData.from_request(
++        req, block_ids=([1, 2, 3],), prefill_token_ids=req._all_token_ids
++    )
++    assert isinstance(data.prompt_token_ids, Int32TokenIds)
++    assert data.prefill_token_ids is data.prompt_token_ids
++    assert data.prompt_len == 4096
++    assert data.prompt_token_ids == tokens
++
++    # Single PickleBuffer emitted for both fields combined
++    buffers = []
++    blob = pickle.dumps(
++        data, protocol=pickle.HIGHEST_PROTOCOL, buffer_callback=buffers.append
++    )
++    assert len(buffers) == 1
++    raw_views = [b.raw() for b in buffers]
++    restored = pickle.loads(blob, buffers=raw_views)
++    assert isinstance(restored.prompt_token_ids, Int32TokenIds)
++    assert restored.prefill_token_ids is restored.prompt_token_ids
++    assert restored.prompt_token_ids == tokens
++
++    # Resumed request with output tokens appended
++    req.append_output_token_ids([99991, 99992, 99993])
++    resumed = NewRequestData.from_request(
++        req, block_ids=([1, 2, 3, 4],), prefill_token_ids=req._all_token_ids
++    )
++    assert resumed.prompt_len == 4096
++    assert len(resumed.prefill_token_ids) == 4099
++    assert resumed.prompt_token_ids == tokens
++    assert resumed.prefill_token_ids == tokens + [99991, 99992, 99993]
++
++    buffers_resumed = []
++    blob_resumed = pickle.dumps(
++        resumed,
++        protocol=pickle.HIGHEST_PROTOCOL,
++        buffer_callback=buffers_resumed.append,
++    )
++    assert len(buffers_resumed) == 1
++    restored_resumed = pickle.loads(
++        blob_resumed, buffers=[b.raw() for b in buffers_resumed]
++    )
++    assert restored_resumed.prompt_len == 4096
++    assert restored_resumed.prompt_token_ids == tokens
++    assert restored_resumed.prefill_token_ids == tokens + [99991, 99992, 99993]
++
++
++def test_new_request_data_short_and_overflow_fallback():
++    short_tokens = list(range(32))
++    assert len(short_tokens) < INT32_TOKEN_IDS_MIN_LEN
++    req_short = _make_request(short_tokens, req_id="short")
++    data_short = NewRequestData.from_request(
++        req_short, block_ids=([1],), prefill_token_ids=req_short._all_token_ids
++    )
++    assert isinstance(data_short.prompt_token_ids, list)
++    assert data_short.prefill_token_ids is data_short.prompt_token_ids
++
++    huge_tokens = [1 << 40] * 512
++    req_huge = _make_request(huge_tokens, req_id="huge")
++    data_huge = NewRequestData.from_request(
++        req_huge, block_ids=([1],), prefill_token_ids=req_huge._all_token_ids
++    )
++    assert isinstance(data_huge.prompt_token_ids, list)
++    restored_huge = pickle.loads(pickle.dumps(data_huge, protocol=5))
++    assert restored_huge.prompt_token_ids == huge_tokens
++
++
++@pytest.mark.parametrize("num_tokens", [4096, 32768, 300000])
++def test_message_queue_new_request_data_roundtrip(num_tokens: int):
++    tokens = [(i * 17 + 5) % 128000 for i in range(num_tokens)]
++    req = _make_request(tokens, req_id=f"mq-{num_tokens}")
++    data = NewRequestData.from_request(
++        req,
++        block_ids=(list(range(num_tokens // 64)),),
++        prefill_token_ids=req._all_token_ids,
++    )
++
++    mq_writer = MessageQueue(
++        n_reader=1,
++        n_local_reader=1,
++        local_reader_ranks=[0],
++        max_chunk_bytes=2 * 1024 * 1024,
++        max_chunks=2,
++    )
++    mq_reader = MessageQueue.create_from_handle(mq_writer.export_handle(), rank=0)
++    try:
++        mq_writer.enqueue(data, timeout=5.0)
++        received = mq_reader.dequeue(timeout=5.0)
++        assert isinstance(received.prompt_token_ids, Int32TokenIds)
++        assert received.prefill_token_ids is received.prompt_token_ids
++        assert received.prompt_len == num_tokens
++        assert np.array_equal(
++            np.asarray(received.prefill_token_ids, dtype=np.int32),
++            np.asarray(tokens, dtype=np.int32),
++        )
++    finally:
++        mq_writer.shutdown()
++        mq_reader.shutdown()
++
++
++@pytest.mark.skipif(not torch.cuda.is_available(), reason="Requires CUDA for UVA")
++def test_staged_write_tensor_with_int32_token_ids():
++    from vllm.v1.worker.gpu.buffer_utils import StagedWriteTensor
++
++    device = torch.device("cuda:0")
++    tensor = StagedWriteTensor(
++        (4, 8192), dtype=torch.int32, device=device, uva_instead_of_gpu=True
++    )
++    toks0 = Int32TokenIds(np.arange(100, 4196, dtype=np.int32))
++    toks1 = Int32TokenIds(np.arange(5000, 7048, dtype=np.int32))
++
++    tensor.stage_write(0, 0, toks0)
++    tensor.stage_write(2, 10, toks1)
++    tensor.apply_write()
++    torch.cuda.synchronize()
++
++    row0 = tensor.gpu[0, : len(toks0)].cpu().numpy()
++    row2 = tensor.gpu[2, 10 : 10 + len(toks1)].cpu().numpy()
++    assert np.array_equal(row0, toks0._arr)
++    assert np.array_equal(row2, toks1._arr)
++
++    # Also verify mixed array + list + elem staging fallback
++    tensor.stage_write(1, 0, toks0[:128])
++    tensor.stage_write(1, 128, [77, 88, 99])
++    tensor.stage_write_elem(3, 42)
++    tensor.apply_write()
++    torch.cuda.synchronize()
++
++    assert np.array_equal(tensor.gpu[1, :128].cpu().numpy(), toks0._arr[:128])
++    assert tensor.gpu[1, 128:131].cpu().tolist() == [77, 88, 99]
++    assert int(tensor.gpu[3, 0].cpu().item()) == 42
+diff --git a/vllm/v1/core/sched/output.py b/vllm/v1/core/sched/output.py
+index 63abeb97c..3c9be4054 100644
+--- a/vllm/v1/core/sched/output.py
++++ b/vllm/v1/core/sched/output.py
+@@ -1,10 +1,14 @@
+ # SPDX-License-Identifier: Apache-2.0
+ # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+ 
+-from collections.abc import Callable
++import array
++from collections.abc import Callable, Sequence
+ from dataclasses import dataclass
+ from functools import cached_property
+-from typing import TYPE_CHECKING
++from pickle import PickleBuffer
++from typing import TYPE_CHECKING, Any, overload
++
++import numpy as np
+ 
+ from vllm.config.ec_manager_config import EncoderCacheManagerMetadata
+ from vllm.multimodal.utils import strip_covered_mm_data
+@@ -36,10 +40,118 @@ else:
+     BoundaryCheckpoint = object
+ 
+ 
++# Minimum token-sequence length packed into an int32 PickleBuffer for
++# zero-copy / single-memcpy IPC across EngineCore -> worker MessageQueue.
++INT32_TOKEN_IDS_MIN_LEN = 256
++_PROMPT_PREFIX_SENTINEL = "_PromptPrefixLen"
++
++
++def _rebuild_int32_token_ids(buf: Any) -> "Int32TokenIds":
++    # In-band PickleBuffer (< 1 MiB) arrives as a freshly allocated bytearray;
++    # ZMQ overflow frames own their message buffer independently. Both can be
++    # wrapped with zero copies. Shared-memory ring chunks arrive as memoryview
++    # and must be copied before the ring slot is released.
++    if isinstance(buf, (bytearray, bytes)) or type(buf).__name__ == "Frame":
++        try:
++            return Int32TokenIds(np.frombuffer(buf, dtype=np.int32))
++        except ValueError:
++            pass
++    return Int32TokenIds(np.frombuffer(buf, dtype=np.int32).copy())
++
++
++class Int32TokenIds(Sequence[int]):
++    """Compact 1D int32 token-ID sequence backed by a NumPy array.
++
++    Serializes through protocol-5 ``PickleBuffer`` so ``MessageQueue`` transfers
++    one contiguous 4-byte/token buffer instead of pickling and allocating one
++    ``PyLongObject`` per token on every worker rank, while exposing both
++    ``Sequence[int]`` operations and ``__array__`` for zero-copy NumPy/UVA
++    consumers.
++    """
++
++    __slots__ = ("_arr", "_list_cache")
++
++    def __init__(self, arr: np.ndarray) -> None:
++        self._arr = np.ascontiguousarray(arr, dtype=np.int32)
++        self._list_cache: list[int] | None = None
++
++    @classmethod
++    def from_sequence(
++        cls, tokens: Sequence[int] | np.ndarray | array.array
++    ) -> "Int32TokenIds | None":
++        if isinstance(tokens, Int32TokenIds):
++            return tokens
++        if isinstance(tokens, np.ndarray):
++            if tokens.dtype == np.int32 and tokens.ndim == 1:
++                return cls(tokens)
++            try:
++                return cls(tokens.astype(np.int32, copy=False))
++            except (OverflowError, TypeError, ValueError):
++                return None
++        if isinstance(tokens, array.array) and tokens.typecode == "i":
++            return cls(np.frombuffer(tokens, dtype=np.int32))
++        try:
++            arr = array.array("i", tokens)
++        except (OverflowError, TypeError):
++            return None
++        return cls(np.frombuffer(arr, dtype=np.int32))
++
++    def __len__(self) -> int:
++        return int(self._arr.shape[0])
++
++    def __bool__(self) -> bool:
++        return bool(self._arr.shape[0])
++
++    @overload
++    def __getitem__(self, idx: int) -> int: ...
++
++    @overload
++    def __getitem__(self, idx: slice) -> "Int32TokenIds": ...
++
++    def __getitem__(self, idx: int | slice) -> "int | Int32TokenIds":
++        if isinstance(idx, slice):
++            return Int32TokenIds(self._arr[idx])
++        return int(self._arr[idx])
++
++    def __iter__(self):
++        return iter(self.tolist())
++
++    def __array__(self, dtype: Any = None, copy: bool | None = None) -> np.ndarray:
++        if dtype is None and not copy:
++            return self._arr
++        return np.asarray(self._arr, dtype=dtype, copy=copy)
++
++    def tolist(self) -> list[int]:
++        if self._list_cache is None:
++            self._list_cache = self._arr.tolist()
++        return self._list_cache
++
++    def copy(self) -> "Int32TokenIds":
++        return Int32TokenIds(self._arr.copy())
++
++    def __eq__(self, other: object) -> bool:
++        if isinstance(other, Int32TokenIds):
++            return np.array_equal(self._arr, other._arr)
++        if isinstance(other, list):
++            return len(self._arr) == len(other) and self.tolist() == other
++        return NotImplemented
++
++    def __repr__(self) -> str:
++        return repr(self.tolist())
++
++    def __reduce_ex__(self, protocol: int):
++        if protocol >= 5:
++            return (
++                _rebuild_int32_token_ids,
++                (PickleBuffer(self._arr.view(np.uint8)),),
++            )
++        return (_rebuild_int32_token_ids, (self._arr.tobytes(),))
++
++
+ @dataclass
+ class NewRequestData:
+     req_id: str
+-    prompt_token_ids: list[int] | None
++    prompt_token_ids: list[int] | Int32TokenIds | None
+     mm_features: list[MultiModalFeatureSpec]
+     sampling_params: SamplingParams | None
+     pooling_params: PoolingParams | None
+@@ -50,7 +162,7 @@ class NewRequestData:
+     prompt_is_token_ids: list[bool] | None = None
+ 
+     # Only used for v2 model runner.
+-    prefill_token_ids: list[int] | None = None
++    prefill_token_ids: list[int] | Int32TokenIds | None = None
+     # Durable even after the final input sentinel clears Request.resumable.
+     is_streaming_input: bool = False
+     boundary_checkpoint: BoundaryCheckpoint | None = None
+@@ -63,12 +175,57 @@ class NewRequestData:
+         cls,
+         request: Request,
+         block_ids: tuple[list[int], ...],
+-        prefill_token_ids: list[int] | None = None,
++        prefill_token_ids: list[int] | Int32TokenIds | None = None,
+         uses_mrope: bool = False,
+     ) -> "NewRequestData":
++        prompt_token_ids: list[int] | Int32TokenIds | None = request.prompt_token_ids
++        if (
++            request.prompt_is_token_ids is None
++            and prompt_token_ids is not None
++        ):
++            is_request_all_tokens = prefill_token_ids is getattr(
++                request, "_all_token_ids", None
++            )
++            output_tokens = getattr(request, "_output_token_ids", None)
++            if is_request_all_tokens and not output_tokens:
++                prefill_token_ids = prompt_token_ids
++
++            if len(prompt_token_ids) >= INT32_TOKEN_IDS_MIN_LEN:
++                get_packed = getattr(request, "_get_packed_prompt_token_ids", None)
++                packed_arr = get_packed() if get_packed is not None else None
++                prompt_packed = (
++                    Int32TokenIds.from_sequence(packed_arr)
++                    if packed_arr is not None
++                    else Int32TokenIds.from_sequence(prompt_token_ids)
++                )
++                if prompt_packed is not None:
++                    if prefill_token_ids is prompt_token_ids:
++                        prompt_token_ids = prompt_packed
++                        prefill_token_ids = prompt_packed
++                    elif prefill_token_ids is None:
++                        prompt_token_ids = prompt_packed
++                    elif is_request_all_tokens and output_tokens:
++                        tail_packed = Int32TokenIds.from_sequence(output_tokens)
++                        if tail_packed is not None:
++                            full_arr = np.empty(
++                                len(prompt_packed) + len(tail_packed), dtype=np.int32
++                            )
++                            full_arr[: len(prompt_packed)] = prompt_packed._arr
++                            full_arr[len(prompt_packed) :] = tail_packed._arr
++                            prefill_packed = Int32TokenIds(full_arr)
++                            prefill_token_ids = prefill_packed
++                            prompt_token_ids = prefill_packed[: len(prompt_packed)]
++                        else:
++                            prompt_token_ids = prompt_packed
++                    elif len(prefill_token_ids) >= INT32_TOKEN_IDS_MIN_LEN:
++                        prefill_packed = Int32TokenIds.from_sequence(prefill_token_ids)
++                        if prefill_packed is not None:
++                            prefill_token_ids = prefill_packed
++                        prompt_token_ids = prompt_packed
++
+         return cls(
+             req_id=request.request_id,
+-            prompt_token_ids=request.prompt_token_ids,
++            prompt_token_ids=prompt_token_ids,
+             mm_features=strip_covered_mm_data(
+                 request.mm_features,
+                 request.num_computed_tokens,
+@@ -89,6 +246,75 @@ class NewRequestData:
+             recurrent_prefill_tail_boundary=request.recurrent_prefill_tail_boundary,
+         )
+ 
++    def __getstate__(self) -> dict[str, Any]:
++        state = self.__dict__.copy()
++        prompt_ids = state.get("prompt_token_ids")
++        prefill_ids = state.get("prefill_token_ids")
++        if self.prompt_is_token_ids is None:
++            if (
++                prompt_ids is not None
++                and prefill_ids is not None
++                and len(prefill_ids) >= INT32_TOKEN_IDS_MIN_LEN
++            ):
++                if prompt_ids is prefill_ids:
++                    packed = Int32TokenIds.from_sequence(prefill_ids)
++                    if packed is not None:
++                        state["prefill_token_ids"] = packed
++                        state["prompt_token_ids"] = (
++                            _PROMPT_PREFIX_SENTINEL,
++                            len(packed),
++                        )
++                        return state
++                packed_prefill = Int32TokenIds.from_sequence(prefill_ids)
++                packed_prompt = Int32TokenIds.from_sequence(prompt_ids)
++                if packed_prefill is not None and packed_prompt is not None:
++                    state["prefill_token_ids"] = packed_prefill
++                    prompt_len = len(packed_prompt)
++                    if prompt_len <= len(packed_prefill) and np.array_equal(
++                        packed_prefill._arr[:prompt_len], packed_prompt._arr
++                    ):
++                        state["prompt_token_ids"] = (
++                            _PROMPT_PREFIX_SENTINEL,
++                            prompt_len,
++                        )
++                    else:
++                        state["prompt_token_ids"] = packed_prompt
++                    return state
++
++            if (
++                prompt_ids is not None
++                and not isinstance(prompt_ids, Int32TokenIds)
++                and len(prompt_ids) >= INT32_TOKEN_IDS_MIN_LEN
++            ):
++                packed_prompt = Int32TokenIds.from_sequence(prompt_ids)
++                if packed_prompt is not None:
++                    state["prompt_token_ids"] = packed_prompt
++            if (
++                prefill_ids is not None
++                and not isinstance(prefill_ids, Int32TokenIds)
++                and len(prefill_ids) >= INT32_TOKEN_IDS_MIN_LEN
++            ):
++                packed_prefill = Int32TokenIds.from_sequence(prefill_ids)
++                if packed_prefill is not None:
++                    state["prefill_token_ids"] = packed_prefill
++        return state
++
++    def __setstate__(self, state: dict[str, Any]) -> None:
++        prompt_ids = state.get("prompt_token_ids")
++        if (
++            isinstance(prompt_ids, tuple)
++            and len(prompt_ids) == 2
++            and prompt_ids[0] == _PROMPT_PREFIX_SENTINEL
++        ):
++            prompt_len = int(prompt_ids[1])
++            prefill_ids = state.get("prefill_token_ids")
++            assert prefill_ids is not None
++            if prompt_len == len(prefill_ids):
++                state["prompt_token_ids"] = prefill_ids
++            else:
++                state["prompt_token_ids"] = prefill_ids[:prompt_len]
++        self.__dict__.update(state)
++
+     @property
+     def prompt_len(self) -> int:
+         if self.prompt_token_ids is not None:
+diff --git a/vllm/v1/request.py b/vllm/v1/request.py
+index 7dd1ddd79..48a2c843d 100644
+--- a/vllm/v1/request.py
++++ b/vllm/v1/request.py
+@@ -1,6 +1,7 @@
+ # SPDX-License-Identifier: Apache-2.0
+ # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+ 
++import array
+ import enum
+ import time
+ from collections import deque
+@@ -159,10 +160,18 @@ class Request:
+         # must not move the endpoint while workers own its private storage.
+         self.recurrent_prefill_tail_boundary: int | None = None
+         self._output_token_ids: list[int] = []
++        self._prompt_token_ids_i32: array.array | None = None
+         if self.prompt_token_ids is None:
+             self._all_token_ids: list[int] = [0] * self.num_prompt_tokens
+         elif self.prompt_is_token_ids is None:
+             self._all_token_ids = self.prompt_token_ids.copy()
++            if len(self.prompt_token_ids) >= 256:
++                try:
++                    self._prompt_token_ids_i32 = array.array(
++                        "i", self.prompt_token_ids
++                    )
++                except (OverflowError, TypeError):
++                    self._prompt_token_ids_i32 = None
+         else:
+             # Mixed-mode prompt: positions covered by prompt_embeds hold a sentinel
+             # special token id that may lie outside the embedding. Zero them, matching
+@@ -332,6 +341,30 @@ class Request:
+             recurrent_instruction_boundary=request.recurrent_instruction_boundary,
+         )
+ 
++    def _get_packed_prompt_token_ids(self) -> array.array | None:
++        if (
++            self.prompt_token_ids is None
++            or self.prompt_is_token_ids is not None
++            or len(self.prompt_token_ids) < 256
++        ):
++            return None
++        packed = self._prompt_token_ids_i32
++        if packed is None:
++            try:
++                packed = array.array("i", self.prompt_token_ids)
++            except (OverflowError, TypeError):
++                return None
++            self._prompt_token_ids_i32 = packed
++        elif len(packed) < len(self.prompt_token_ids):
++            try:
++                packed.extend(self.prompt_token_ids[len(packed) :])
++            except (OverflowError, TypeError):
++                self._prompt_token_ids_i32 = None
++                return None
++        elif len(packed) > len(self.prompt_token_ids):
++            del packed[len(self.prompt_token_ids) :]
++        return packed
++
+     def append_output_token_ids(
+         self,
+         token_ids: int | list[int],
+diff --git a/vllm/v1/worker/gpu/buffer_utils.py b/vllm/v1/worker/gpu/buffer_utils.py
+index e0209af9a..281470476 100644
+--- a/vllm/v1/worker/gpu/buffer_utils.py
++++ b/vllm/v1/worker/gpu/buffer_utils.py
+@@ -163,9 +163,15 @@ class StagedWriteTensor:
+         # The write kernel addresses rows of the flat tensor by its row stride.
+         self._flat_gpu = self.gpu.view(-1)
+ 
++        self._np_dtype = {
++            torch.int32: np.int32,
++            torch.int64: np.int64,
++            torch.float32: np.float32,
++        }[dtype]
+         self._staged_write_indices: list[int] = []
+         self._staged_write_starts: list[int] = []
+         self._staged_write_contents: list[int | float] = []
++        self._staged_write_arrays: list[np.ndarray] = []
+         self._staged_write_cu_lens: list[int] = []
+ 
+         new_buffer = partial(UvaBufferPool, max_concurrency=max_concurrency)
+@@ -175,13 +181,36 @@ class StagedWriteTensor:
+         self.write_cu_lens = new_buffer(self.num_rows, dtype=torch.int32)
+         self.write_contents = new_buffer(1, dtype=dtype) if uva_instead_of_gpu else None
+ 
++    def _flush_staged_arrays(self) -> None:
++        if self._staged_write_arrays:
++            for arr in self._staged_write_arrays:
++                self._staged_write_contents.extend(arr.tolist())
++            self._staged_write_arrays.clear()
++
+     def stage_write(
+         self, index: int, start: int, x: Iterable[int] | Iterable[float]
+     ) -> None:
+         assert index >= 0
+         assert start >= 0
++        if isinstance(x, np.ndarray) or hasattr(x, "__array__"):
++            arr = np.asarray(x, dtype=self._np_dtype).reshape(-1)
++            if arr.size == 0:
++                return
++            if not self._staged_write_contents:
++                self._staged_write_indices.append(index)
++                self._staged_write_starts.append(start)
++                self._staged_write_arrays.append(arr)
++                prev_cu = (
++                    self._staged_write_cu_lens[-1]
++                    if self._staged_write_cu_lens
++                    else 0
++                )
++                self._staged_write_cu_lens.append(prev_cu + int(arr.size))
++                return
++            x = arr.tolist()
+         if not x:
+             return
++        self._flush_staged_arrays()
+         self._staged_write_indices.append(index)
+         self._staged_write_starts.append(start)
+         self._staged_write_contents.extend(x)
+@@ -189,6 +218,7 @@ class StagedWriteTensor:
+ 
+     def stage_write_elem(self, index: int, x: int) -> None:
+         assert index >= 0
++        self._flush_staged_arrays()
+         self._staged_write_indices.append(index)
+         self._staged_write_starts.append(0)
+         self._staged_write_contents.append(x)
+@@ -203,14 +233,22 @@ class StagedWriteTensor:
+         starts_uva = self.write_starts.copy_to_uva(self._staged_write_starts)
+         cu_lens_uva = self.write_cu_lens.copy_to_uva(self._staged_write_cu_lens)
+ 
++        if self._staged_write_arrays and not self._staged_write_contents:
++            contents_src: np.ndarray | list[int | float] = (
++                self._staged_write_arrays[0]
++                if len(self._staged_write_arrays) == 1
++                else np.concatenate(self._staged_write_arrays)
++            )
++        else:
++            self._flush_staged_arrays()
++            contents_src = self._staged_write_contents
++
+         if self.write_contents is None:
+             write_contents = async_tensor_h2d(
+-                self._staged_write_contents, device=self.device, dtype=self.dtype
++                contents_src, device=self.device, dtype=self.dtype
+             )
+         else:
+-            write_contents = self.write_contents.copy_to_uva(
+-                self._staged_write_contents
+-            )
++            write_contents = self.write_contents.copy_to_uva(contents_src)
+ 
+         from vllm.v1.worker.gpu import tilelang_inputs
+ 
+@@ -240,6 +278,7 @@ class StagedWriteTensor:
+         self._staged_write_indices.clear()
+         self._staged_write_starts.clear()
+         self._staged_write_contents.clear()
++        self._staged_write_arrays.clear()
+         self._staged_write_cu_lens.clear()
+ 
+ 
+@@ -287,6 +326,7 @@ class FusedStagedWriter:
+             if n == 0:
+                 continue
+ 
++            t._flush_staged_arrays()
+             group_ids.extend([group_id] * n)
+             indices.extend(t._staged_write_indices)
+             starts.extend(t._staged_write_starts)
+-- 
+2.43.0
+
