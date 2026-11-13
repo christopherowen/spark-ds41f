@@ -61,6 +61,10 @@ def fan_control_enabled(cluster: dict) -> bool:
     return cluster.get("host", {}).get("fan_control", True) is not False
 
 
+# Every key of the container section that a command reads.
+CONTAINER_KEYS = frozenset(("name", "image", "expected_labels", "docker_run_args", "mounts"))
+
+
 def local_doctor(cluster: dict, nodes: dict, upstreams: dict) -> list[str]:
     problems: list[str] = topology.problems(cluster, nodes)
     problems.extend(kernel_backend.problems(cluster))
@@ -70,6 +74,13 @@ def local_doctor(cluster: dict, nodes: dict, upstreams: dict) -> list[str]:
     problems.extend(benchmark_reference_problems(cluster, nodes))
     if cluster.get("promoted_baseline") != upstreams.get("generated_from_baseline"):
         problems.append("cluster and upstream locks name different baselines")
+    # A key no command reads is a setting that silently does nothing: an arm that names
+    # its overlay under container.extra_mounts boots the image unchanged.
+    for key in sorted(set(cluster.get("container", {})) - CONTAINER_KEYS):
+        problems.append(
+            f"container.{key} is not a container setting (known: {', '.join(sorted(CONTAINER_KEYS))}); "
+            "files are mounted through container.mounts, as [source, target, mode]"
+        )
     host = cluster.get("host", {})
     for key in (
         "memguard_gib",

@@ -134,18 +134,35 @@ The code defaults are 20/16/20 MB. TP5 to TP8 are not measured and keep the defa
 ([no974/tp4.json](no974/tp4.json)).
 
 - **Why:** the grid regression at TP4 is in the 1-request rows: 1x2 rows are 9% slower than candidate-54 and 1x3
-  rows 8% slower at `tp4-switched`. #982's `T.pdl_trigger()` before `roce_wait_peers` causes it, and only while the
-  prefetch windows are at their defaults ([grid-attribution](grid-attribution/README.md)).
+  rows 8% slower at `tp4-switched`, while the prefetch windows are at their defaults
+  ([grid-attribution](grid-attribution/README.md)). **Corrected 2026-11-13:** this read "#982's `T.pdl_trigger()`
+  before `roce_wait_peers` causes it". The arms behind that mounted nothing; no run tests #982's trigger.
 - **Measured** at `tp4-switched` on the fourth build, the grid step alone, two boots an arm in one session: the caps
   make the grid 4.66% faster than candidate-55 as built (1x2 rows 18%, 1x3 rows 13%), and 1.7% faster than
-  candidate-54 with the same caps. Moving #982's trigger after the wait gives 2.5% alone and nothing under the caps,
-  so sparknet `0003` is unchanged.
+  candidate-54 with the same caps. sparknet `0003` is unchanged. **Corrected 2026-11-13:** the arm read here as
+  "moving #982's trigger" (2.5% alone, nothing under the caps) changed only the kernel cache directory; see below.
 - **Measured** at `tp4-ring` the same way: the grid 2.51% faster than candidate-55 as built (margin 0.34%), 1x2 rows
   16.2 to 13.5 ms and 1x3 rows 14.8 to 14.0 ms, where candidate-54's recorded screen has 14.5 ms for both.
 - **The windows were already too large for candidate-54 at TP4:** with the caps its 1x2 rows are 9% faster. So the
   caps are a gain of their own as well as the fix, and candidate-54's recorded TP4 screens are without them.
 - **No output change:** the windows are cache hints, and the arithmetic is unchanged.
 - A recipe variable, not a patch: the image and the locks are the fourth build's.
+
+### Found 2026-11-13: candidate-55 has been running kernels compiled before #974
+
+TileLang's compiled-kernel cache is keyed by the kernel's source, target and options, not by the compiler's version
+(`tilelang/cache/cuda_binary_cache.py`). The nodes' caches were filled by CUDA 13.0.2 builds: on dgx1, 84 of the 7,033
+files in the cache directory candidate-55 uses are newer than its first build, and on sp1 56 of 8,699. So wherever a
+kernel's source is candidate-54's, candidate-55 loads the binary an earlier build compiled, and #974's `nvcc` and
+`ptxas` compile only the kernels whose source changed. Every gate, check and screen above was taken that way.
+
+- **A node with an empty cache compiles every kernel with CUDA 13.5** and is a different thing from what was
+  verified. Two attribution arms booted that way by accident and were 5.9% and 10.8% faster at 1x2 and 1x3 with the
+  default windows ([grid-attribution](grid-attribution/README.md)).
+- **#974's marks are open again:** "changes no temperature-0 output" and its serving marks were measured on kernels
+  its compiler did not build; they hold for its runtime libraries only.
+- [2026-11-13-kernel-cache-toolchain](../../2026-11-13-kernel-cache-toolchain/README.md) measures candidate-55 on its
+  own kernels, gate first.
 
 ### The collective limit, at `tp4-ring` only
 
