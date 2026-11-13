@@ -1,0 +1,1478 @@
+From 698d097b221447ee6f3e95e09f8ca7729b4a2bf3 Mon Sep 17 00:00:00 2001
+From: Christopher Owen <root@your.mom>
+Date: Sun, 8 Nov 2026 13:31:13 +0100
+Subject: [PATCH] oneshot: trace all collectives, split CTA-0 wait, and export
+ Perfetto
+
+Extend SPARKNET_ROCE_TRACE across allgather, reducescatter, and exchange
+with op-kind metadata in W_META, separate CTA-0 RDMA peer flag polling
+(roce_wait_peers) from non-zero CTA local barrier waiting (roce_wait_cta0)
+with warp-0 synchronization for IKET lane-0 accuracy, and add NTP-aligned
+Chrome/Perfetto timeline export (perfetto_events, export_perfetto).
+
+Upstream-Base: 1fd6a1fbd8dc4884057046d1ebd93d585c9e4bcf
+Rationale: SPARKNET_ROCE_TRACE previously instrumented only oneshot_allreduce,
+leaving allgather, reducescatter, and exchange untraced, while calling
+roce_wait_peers from every CTA caused TileLang IKET to label non-zero CTA
+local barrier spins as wait.flags.
+Quality-Implications: None. Untraced kernels (SPARKNET_ROCE_TRACE=0, default)
+compile without trace calls and cache separately; traced kernels preserve
+identical collective semantics and bit-exact outputs.
+Tests: python3 -m unittest discover -s tests; pytest tests/gpu/test_oneshot_gpu.py
+Upstream-Status: Candidate for dgx-spark-networking main.
+---
+ sparknet/oneshot/_allgather_tilelang.py     |  60 +++-
+ sparknet/oneshot/_device.py                 |  44 ++-
+ sparknet/oneshot/_exchange_tilelang.py      | 159 +++++++--
+ sparknet/oneshot/_oneshot_tilelang.py       |  22 +-
+ sparknet/oneshot/_reducescatter_tilelang.py | 145 +++++++--
+ sparknet/oneshot/_roce_proxy.c              |   4 +-
+ sparknet/oneshot/runtime.py                 |   2 +
+ sparknet/oneshot/trace.py                   | 342 +++++++++++++++++++-
+ tests/gpu/test_oneshot_gpu.py               |  32 ++
+ tests/test_oneshot_cpu.py                   |   1 +
+ tests/test_trace.py                         |  88 ++++-
+ 11 files changed, 807 insertions(+), 92 deletions(-)
+
+diff --git a/sparknet/oneshot/_allgather_tilelang.py b/sparknet/oneshot/_allgather_tilelang.py
+index 869298e..1d047f3 100644
+--- a/sparknet/oneshot/_allgather_tilelang.py
++++ b/sparknet/oneshot/_allgather_tilelang.py
+@@ -16,6 +16,7 @@ import logging
+ import time
+ from typing import Callable
+ 
++from . import trace as _trace
+ from ._device import PACK_BYTES, render_source
+ from ._freeze import raise_if_kernel_resolution_frozen
+ from ._kernels import Launch
+@@ -26,14 +27,18 @@ logger = logging.getLogger(__name__)
+ _PREPARED_LAUNCHERS: set[tuple[object, ...]] = set()
+ 
+ 
+-def _build(world_size: int, rank: int, threads: int, slots: int, flag_stride: int, hca_count: int, ring4: bool):
++def _build(world_size: int, rank: int, threads: int, slots: int, flag_stride: int, hca_count: int, ring4: bool,
++           traced: bool = False):
+     import tilelang
+     import tilelang.language as T
+ 
+     lanes, neighbor_lanes = _lanes(hca_count, ring4)
+     source = render_source(world_size=world_size, rank=rank, slots=slots, flag_stride=flag_stride,
+-                           hca_count=lanes, neighbor_lanes=neighbor_lanes)
++                           hca_count=lanes, neighbor_lanes=neighbor_lanes,
++                           trace=_trace.device_defines() if traced else None)
+     resident = _resident_blocks(threads)
++    w_doorbell, w_wait_done, w_end = _trace.W_DOORBELL, _trace.W_WAIT_DONE, _trace.W_END
++    op_code = _trace.OP_CODES["allgather"]
+ 
+     @tilelang.jit(pass_configs=_pass_configs())
+     def program():
+@@ -59,6 +64,7 @@ def _build(world_size: int, rank: int, threads: int, slots: int, flag_stride: in
+             rung_index: T.int32,
+             arrival_index: T.int32,
+             grid_x: T.int32,
++            trace_base: T.int64,
+         ):
+             with T.Kernel(grid_x, threads=threads) as bx:
+                 T.annotate_min_blocks_per_sm(resident)
+@@ -76,6 +82,11 @@ def _build(world_size: int, rank: int, threads: int, slots: int, flag_stride: in
+                 index = bx * threads + tx
+                 stride = T.alloc_var(T.int32)
+                 stride = grid_x * threads
++                if traced:
++                    if bx == 0:
++                        if tx == 0:
++                            T.call_extern("roce_trace_begin", trace_base, seq, T.cast(nbytes, T.uint32),
++                                          T.cast(grid_x, T.uint32), T.uint32(op_code), dtype="handle")
+                 # 1. stage the local shard into the pinned send slot and its own column block of the output
+                 count = T.alloc_var(T.int32)
+                 count = T.max(0, (shard_packs - index + stride - 1) // stride)
+@@ -91,14 +102,31 @@ def _build(world_size: int, rank: int, threads: int, slots: int, flag_stride: in
+                                          T.call_extern("roce_ptr", region_base + T.cast(ctrl_off, T.int64), dtype="handle"), T.cast(nbytes, T.uint32), seq, dtype=T.uint32)
+                     if rang != T.uint32(0):
+                         T.call_extern("roce_st_release_gpu_u32", T.address_of(counters[rung_index]), seq, dtype="handle")
++                        if traced:
++                            T.call_extern("roce_trace_stamp", trace_base, seq, w_doorbell, dtype="handle")
+                 # 3. block 0 waits for every peer's payload-stripe flags, the other blocks for block 0
+-                T.call_extern("roce_wait_peers", bx, tx, T.call_extern("roce_ptr", region_base + T.cast(flag_off, T.int64), dtype="handle"), seq,
+-                              T.call_extern("roce_ptr", region_base + T.cast(ctrl_off, T.int64), dtype="handle"),
+-                              T.address_of(counters[rung_index]), T.address_of(counters[arrival_index]), dtype="handle")
++                if bx == 0:
++                    if traced:
++                        T.call_extern("roce_wait_peers", bx, tx, T.call_extern("roce_ptr", region_base + T.cast(flag_off, T.int64), dtype="handle"), seq,
++                                      T.call_extern("roce_ptr", region_base + T.cast(ctrl_off, T.int64), dtype="handle"),
++                                      T.address_of(counters[rung_index]), T.address_of(counters[arrival_index]),
++                                      T.call_extern("roce_trace_record_if", trace_base, seq, T.cast(bx == 0, T.int32), dtype="handle"), dtype="handle")
++                    else:
++                        T.call_extern("roce_wait_peers", bx, tx, T.call_extern("roce_ptr", region_base + T.cast(flag_off, T.int64), dtype="handle"), seq,
++                                      T.call_extern("roce_ptr", region_base + T.cast(ctrl_off, T.int64), dtype="handle"),
++                                      T.address_of(counters[rung_index]), T.address_of(counters[arrival_index]), dtype="handle")
++                else:
++                    T.call_extern("roce_wait_cta0", tx, seq,
++                                  T.call_extern("roce_ptr", region_base + T.cast(ctrl_off, T.int64), dtype="handle"),
++                                  T.address_of(counters[arrival_index]), dtype="handle")
+                 T.sync_threads()
+                 if bx == 0:
+                     if tx == 0:
+                         T.call_extern("roce_st_release_gpu_u32", T.address_of(counters[arrival_index]), seq, dtype="handle")
++                if traced:
++                    if bx == 0:
++                        if tx == 0:
++                            T.call_extern("roce_trace_stamp", trace_base, seq, w_wait_done, dtype="handle")
+                 # 4. concatenate: shard s occupies column block s of every output row
+                 for i in T.serial(count):
+                     T.call_extern("roce_gather_pack", T.call_extern("roce_ptr", region_base + T.cast(recv_off, T.int64), dtype="handle"),
+@@ -108,17 +136,21 @@ def _build(world_size: int, rank: int, threads: int, slots: int, flag_stride: in
+                 T.call_extern("roce_fence_sc_gpu", dtype="handle")
+                 T.sync_threads()
+                 if tx == 0:
+-                    T.call_extern("roce_tail", T.address_of(counters[tail_index]), T.cast(grid_x, T.uint32),
+-                                  T.address_of(counters[0]), seq, dtype="handle")
++                    last = T.alloc_var(T.uint32)
++                    last = T.call_extern("roce_tail", T.address_of(counters[tail_index]), T.cast(grid_x, T.uint32),
++                                         T.address_of(counters[0]), seq, dtype=T.uint32)
++                    if traced:
++                        if last != T.uint32(0):
++                            T.call_extern("roce_trace_stamp", trace_base, seq, w_end, dtype="handle")
+ 
+         return oneshot_allgather
+ 
+     return program
+ 
+ 
+-def _process_key(world_size, rank, threads, slots, flag_stride, hca_count, device_index, ring4=False):
++def _process_key(world_size, rank, threads, slots, flag_stride, hca_count, device_index, ring4=False, trace=False):
+     return (int(world_size), int(rank), int(threads), int(slots), int(flag_stride), int(hca_count), int(device_index),
+-            bool(ring4))
++            bool(ring4), bool(trace))
+ 
+ 
+ def is_launcher_prepared(*key) -> bool:
+@@ -136,6 +168,7 @@ def get_launcher(
+     hca_count: int,
+     device_index: int,
+     ring4: bool = False,
++    trace: bool = False,
+ ) -> Callable[[Launch], None]:
+     """Compile the launcher for the key once and return it."""
+     lanes, _ = _lanes(hca_count, ring4)
+@@ -144,11 +177,13 @@ def get_launcher(
+             "RoCE kernels need threads >= world_size * hca_count (one thread per stripe flag), "
+             f"got threads={threads} world_size={world_size} hca_count={lanes}"
+         )
+-    process_key = _process_key(world_size, rank, threads, slots, flag_stride, hca_count, device_index, ring4)
+-    cache_key = process_key[:-2] + (bool(ring4),)
++    if trace and int(world_size) * lanes > _trace.MAX_FLAG_WORDS:
++        raise ValueError(f"the trace record holds {_trace.MAX_FLAG_WORDS} peer lanes, got {int(world_size) * lanes}")
++    process_key = _process_key(world_size, rank, threads, slots, flag_stride, hca_count, device_index, ring4, trace)
++    cache_key = process_key[:6] + process_key[7:]
+     raise_if_kernel_resolution_frozen("tilelang.jit", target="oneshot_allgather", cache_key=cache_key)
+     started = time.monotonic()
+-    kernel = _build(world_size, rank, threads, slots, flag_stride, hca_count, ring4)()
++    kernel = _build(world_size, rank, threads, slots, flag_stride, hca_count, ring4, bool(trace))()
+     logger.info("compiled tilelang oneshot.allgather %s in %.1f s", cache_key, time.monotonic() - started)
+ 
+     def run(launch: Launch) -> None:
+@@ -160,6 +195,7 @@ def get_launcher(
+             int(launch.recv_off), int(launch.flag_off),
+             int(launch.send_off), int(launch.ctrl_off), int(launch.slot_bytes), int(launch.stage_index),
+             int(launch.tail_index), int(launch.rung_index), int(launch.arrival_index), int(launch.grid_x),
++            int(launch.trace_base),
+         )
+ 
+     _PREPARED_LAUNCHERS.add(process_key)
+diff --git a/sparknet/oneshot/_device.py b/sparknet/oneshot/_device.py
+index 7ec8ec3..6ab850e 100644
+--- a/sparknet/oneshot/_device.py
++++ b/sparknet/oneshot/_device.py
+@@ -40,6 +40,7 @@ FUNCTIONS = (
+     "roce_doorbell_exchange",
+     "roce_wait_flags",
+     "roce_wait_device_eq",
++    "roce_wait_cta0",
+     "roce_wait_peers",
+     "roce_tail",
+     "roce_reduce_pack_f32",
+@@ -125,12 +126,15 @@ __device__ __forceinline__ roce_byte *roce_trace_record_if(long long trace_base,
+     return take ? roce_trace_record(trace_base, seq) : nullptr;
+ }
+ 
+-// The op's first words: start time, sequence, and nbytes | grid << 32.
+-__device__ __forceinline__ void roce_trace_begin(long long trace_base, roce_u32 seq, roce_u32 nbytes, roce_u32 grid) {
++// The op's first words: start time, sequence, and nbytes | grid << 32 | op << 48.
++__device__ __forceinline__ void roce_trace_begin(long long trace_base, roce_u32 seq, roce_u32 nbytes, roce_u32 grid,
++                                                 roce_u32 op = 0u) {
+     roce_byte *record = roce_trace_record(trace_base, seq);
+     roce_trace_store(record, ROCE_TRACE_W_START, roce_globaltimer());
+     roce_trace_store(record, ROCE_TRACE_W_SEQ, (unsigned long long)seq);
+-    roce_trace_store(record, ROCE_TRACE_W_META, (unsigned long long)nbytes | ((unsigned long long)grid << 32));
++    roce_trace_store(record, ROCE_TRACE_W_META,
++                     (unsigned long long)nbytes | ((unsigned long long)(grid & 0xffffu) << 32)
++                         | ((unsigned long long)(op & 0xffffu) << 48));
+ }
+ 
+ // The current time into one word of the op's record.
+@@ -315,13 +319,26 @@ __device__ __forceinline__ void roce_wait_device_eq(const void *word, roce_u32 s
+     }
+ }
+ 
+-// Phase 3 for every block: block 0 polls the peers' flags, and only once the
+-// doorbell has rung (``rung``, set by the block that rang it). A system-scope
+-// poll of the pinned region slows the system-scope stores of blocks still
+-// staging, and every poller is one more, so no other block polls it: they wait
+-// in device memory for block 0's ``arrival`` word, which block 0 sets after its
+-// barrier. Block 0's flag wait records a missing peer and stops the GPU; the
+-// device-memory waits share its timeout and stop the GPU only after it.
++// Phase 3 for non-zero blocks: wait in device memory for block 0's ``arrival``
++// word, which block 0 sets after every peer's flags have arrived.
++__device__ __forceinline__ void roce_wait_cta0(int tidx, roce_u32 seq, const roce_byte *ctrl,
++                                               const void *arrival) {
++    if (tidx == 0) {
++        roce_wait_device_eq(arrival, seq, ctrl);
++    }
++    if (tidx < 32) {
++        __syncwarp();
++    }
++}
++
++// Phase 3 for block 0 (or every block when called directly): block 0 polls the
++// peers' flags, and only once the doorbell has rung (``rung``, set by the block
++// that rang it). A system-scope poll of the pinned region slows the
++// system-scope stores of blocks still staging, and every poller is one more, so
++// no other block polls it: they wait in device memory for block 0's ``arrival``
++// word, which block 0 sets after its barrier. Block 0's flag wait records a
++// missing peer and stops the GPU; the device-memory waits share its timeout and
++// stop the GPU only after it.
+ __device__ __forceinline__ void roce_wait_peers(int block, int tidx, const roce_byte *flags, roce_u32 seq,
+                                                 roce_byte *ctrl, const void *rung, const void *arrival,
+                                                 roce_byte *trace_record = nullptr) {
+@@ -330,8 +347,11 @@ __device__ __forceinline__ void roce_wait_peers(int block, int tidx, const roce_
+             roce_wait_device_eq(rung, seq, ctrl);
+             roce_wait_flags(tidx, flags, seq, ctrl, trace_record);
+         }
+-    } else if (tidx == 0) {
+-        roce_wait_device_eq(arrival, seq, ctrl);
++        if (tidx < 32) {
++            __syncwarp();
++        }
++    } else {
++        roce_wait_cta0(tidx, seq, ctrl, arrival);
+     }
+ }
+ 
+diff --git a/sparknet/oneshot/_exchange_tilelang.py b/sparknet/oneshot/_exchange_tilelang.py
+index cc21259..cfe0eea 100644
+--- a/sparknet/oneshot/_exchange_tilelang.py
++++ b/sparknet/oneshot/_exchange_tilelang.py
+@@ -14,6 +14,7 @@ import logging
+ import time
+ from typing import Callable
+ 
++from . import trace as _trace
+ from ._device import PACK_BYTES, render_source
+ from ._freeze import raise_if_kernel_resolution_frozen
+ from ._kernels import Launch
+@@ -32,6 +33,7 @@ def _build(
+     flag_stride: int,
+     hca_count: int,
+     ring4: bool,
++    traced: bool = False,
+ ):
+     import tilelang
+     import tilelang.language as T
+@@ -44,8 +46,11 @@ def _build(
+         flag_stride=flag_stride,
+         hca_count=lanes,
+         neighbor_lanes=neighbor_lanes,
++        trace=_trace.device_defines() if traced else None,
+     )
+     resident = _resident_blocks(threads)
++    w_doorbell, w_wait_done, w_end = _trace.W_DOORBELL, _trace.W_WAIT_DONE, _trace.W_END
++    op_code = _trace.OP_CODES["exchange"]
+ 
+     @tilelang.jit(pass_configs=_pass_configs())
+     def program():
+@@ -74,6 +79,7 @@ def _build(
+             rung_index: T.int32,
+             arrival_index: T.int32,
+             grid_x: T.int32,
++            trace_base: T.int64,
+         ):
+             with T.Kernel(grid_x, threads=threads) as bx:
+                 T.annotate_min_blocks_per_sm(resident)
+@@ -93,6 +99,18 @@ def _build(
+                 index = bx * threads + tx
+                 stride = T.alloc_var(T.int32)
+                 stride = grid_x * threads
++                if traced:
++                    if bx == 0:
++                        if tx == 0:
++                            T.call_extern(
++                                "roce_trace_begin",
++                                trace_base,
++                                seq,
++                                T.cast(chunk_bytes, T.uint32),
++                                T.cast(grid_x, T.uint32),
++                                T.uint32(op_code),
++                                dtype="handle",
++                            )
+                 # 1. stage each peer's chunk into its slice of the pinned send slot
+                 count = T.alloc_var(T.int32)
+                 count = T.max(0, (chunk_packs - index + stride - 1) // stride)
+@@ -139,26 +157,76 @@ def _build(
+                             seq,
+                             dtype="handle",
+                         )
++                        if traced:
++                            T.call_extern(
++                                "roce_trace_stamp",
++                                trace_base,
++                                seq,
++                                w_doorbell,
++                                dtype="handle",
++                            )
+                 # 3. block 0 waits for every peer's payload-stripe flags, the other blocks for block 0
+-                T.call_extern(
+-                    "roce_wait_peers",
+-                    bx,
+-                    tx,
+-                    T.call_extern(
+-                        "roce_ptr",
+-                        region_base + T.cast(flag_off, T.int64),
+-                        dtype="handle",
+-                    ),
+-                    seq,
++                if bx == 0:
++                    if traced:
++                        T.call_extern(
++                            "roce_wait_peers",
++                            bx,
++                            tx,
++                            T.call_extern(
++                                "roce_ptr",
++                                region_base + T.cast(flag_off, T.int64),
++                                dtype="handle",
++                            ),
++                            seq,
++                            T.call_extern(
++                                "roce_ptr",
++                                region_base + T.cast(ctrl_off, T.int64),
++                                dtype="handle",
++                            ),
++                            T.address_of(counters[rung_index]),
++                            T.address_of(counters[arrival_index]),
++                            T.call_extern(
++                                "roce_trace_record_if",
++                                trace_base,
++                                seq,
++                                T.cast(bx == 0, T.int32),
++                                dtype="handle",
++                            ),
++                            dtype="handle",
++                        )
++                    else:
++                        T.call_extern(
++                            "roce_wait_peers",
++                            bx,
++                            tx,
++                            T.call_extern(
++                                "roce_ptr",
++                                region_base + T.cast(flag_off, T.int64),
++                                dtype="handle",
++                            ),
++                            seq,
++                            T.call_extern(
++                                "roce_ptr",
++                                region_base + T.cast(ctrl_off, T.int64),
++                                dtype="handle",
++                            ),
++                            T.address_of(counters[rung_index]),
++                            T.address_of(counters[arrival_index]),
++                            dtype="handle",
++                        )
++                else:
+                     T.call_extern(
+-                        "roce_ptr",
+-                        region_base + T.cast(ctrl_off, T.int64),
++                        "roce_wait_cta0",
++                        tx,
++                        seq,
++                        T.call_extern(
++                            "roce_ptr",
++                            region_base + T.cast(ctrl_off, T.int64),
++                            dtype="handle",
++                        ),
++                        T.address_of(counters[arrival_index]),
+                         dtype="handle",
+-                    ),
+-                    T.address_of(counters[rung_index]),
+-                    T.address_of(counters[arrival_index]),
+-                    dtype="handle",
+-                )
++                    )
+                 T.sync_threads()
+                 if bx == 0:
+                     if tx == 0:
+@@ -168,6 +236,16 @@ def _build(
+                             seq,
+                             dtype="handle",
+                         )
++                if traced:
++                    if bx == 0:
++                        if tx == 0:
++                            T.call_extern(
++                                "roce_trace_stamp",
++                                trace_base,
++                                seq,
++                                w_wait_done,
++                                dtype="handle",
++                            )
+                 # 4. copy each peer's received chunk into its slice of out
+                 for i in T.serial(count):
+                     T.call_extern(
+@@ -189,14 +267,24 @@ def _build(
+                 T.call_extern("roce_fence_sc_gpu", dtype="handle")
+                 T.sync_threads()
+                 if tx == 0:
+-                    T.call_extern(
++                    last = T.alloc_var(T.uint32)
++                    last = T.call_extern(
+                         "roce_tail",
+                         T.address_of(counters[tail_index]),
+                         T.cast(grid_x, T.uint32),
+                         T.address_of(counters[0]),
+                         seq,
+-                        dtype="handle",
++                        dtype=T.uint32,
+                     )
++                    if traced:
++                        if last != T.uint32(0):
++                            T.call_extern(
++                                "roce_trace_stamp",
++                                trace_base,
++                                seq,
++                                w_end,
++                                dtype="handle",
++                            )
+ 
+         return oneshot_exchange
+ 
+@@ -204,7 +292,15 @@ def _build(
+ 
+ 
+ def _process_key(
+-    world_size, rank, threads, slots, flag_stride, hca_count, device_index, ring4=False
++    world_size,
++    rank,
++    threads,
++    slots,
++    flag_stride,
++    hca_count,
++    device_index,
++    ring4=False,
++    trace=False,
+ ):
+     return (
+         int(world_size),
+@@ -215,6 +311,7 @@ def _process_key(
+         int(hca_count),
+         int(device_index),
+         bool(ring4),
++        bool(trace),
+     )
+ 
+ 
+@@ -233,6 +330,7 @@ def get_launcher(
+     hca_count: int,
+     device_index: int,
+     ring4: bool = False,
++    trace: bool = False,
+ ) -> Callable[[Launch], None]:
+     """Compile the launcher for the key once and return it."""
+     lanes, _ = _lanes(hca_count, ring4)
+@@ -241,15 +339,29 @@ def get_launcher(
+             "RoCE kernels need threads >= world_size * hca_count (one thread per stripe flag), "
+             f"got threads={threads} world_size={world_size} hca_count={lanes}"
+         )
++    if trace and int(world_size) * lanes > _trace.MAX_FLAG_WORDS:
++        raise ValueError(
++            f"the trace record holds {_trace.MAX_FLAG_WORDS} peer lanes, got {int(world_size) * lanes}"
++        )
+     process_key = _process_key(
+-        world_size, rank, threads, slots, flag_stride, hca_count, device_index, ring4
++        world_size,
++        rank,
++        threads,
++        slots,
++        flag_stride,
++        hca_count,
++        device_index,
++        ring4,
++        trace,
+     )
+-    cache_key = process_key[:-2] + (bool(ring4),)
++    cache_key = process_key[:6] + process_key[7:]
+     raise_if_kernel_resolution_frozen(
+         "tilelang.jit", target="oneshot_exchange", cache_key=cache_key
+     )
+     started = time.monotonic()
+-    kernel = _build(world_size, rank, threads, slots, flag_stride, hca_count, ring4)()
++    kernel = _build(
++        world_size, rank, threads, slots, flag_stride, hca_count, ring4, bool(trace)
++    )()
+     logger.info(
+         "compiled tilelang oneshot.exchange %s in %.1f s",
+         cache_key,
+@@ -297,6 +409,7 @@ def get_launcher(
+             int(launch.rung_index),
+             int(launch.arrival_index),
+             int(launch.grid_x),
++            int(launch.trace_base),
+         )
+ 
+     _PREPARED_LAUNCHERS.add(process_key)
+diff --git a/sparknet/oneshot/_oneshot_tilelang.py b/sparknet/oneshot/_oneshot_tilelang.py
+index 5c9bbbf..2268eaf 100644
+--- a/sparknet/oneshot/_oneshot_tilelang.py
++++ b/sparknet/oneshot/_oneshot_tilelang.py
+@@ -79,6 +79,7 @@ def _build(dtype_name: str, world_size: int, rank: int, threads: int, slots: int
+     resident = _resident_blocks(threads)
+     pack_words = PACK_BYTES // 4
+     w_doorbell, w_wait_done, w_end = _trace.W_DOORBELL, _trace.W_WAIT_DONE, _trace.W_END
++    op_code = _trace.OP_CODES["allreduce"]
+ 
+     @tilelang.jit(pass_configs=_pass_configs())
+     def program():
+@@ -126,7 +127,7 @@ def _build(dtype_name: str, world_size: int, rank: int, threads: int, slots: int
+                     if bx == 0:
+                         if tx == 0:
+                             T.call_extern("roce_trace_begin", trace_base, seq, T.cast(nbytes, T.uint32),
+-                                          T.cast(grid_x, T.uint32), dtype="handle")
++                                          T.cast(grid_x, T.uint32), T.uint32(op_code), dtype="handle")
+                 # 1. stage the input into the pinned send slot
+                 count = T.alloc_var(T.int32)
+                 count = T.max(0, (size_packs - index + stride - 1) // stride)
+@@ -145,15 +146,20 @@ def _build(dtype_name: str, world_size: int, rank: int, threads: int, slots: int
+                         if traced:
+                             T.call_extern("roce_trace_stamp", trace_base, seq, w_doorbell, dtype="handle")
+                 # 3. block 0 waits for every peer's payload-stripe flags, the other blocks for block 0
+-                if traced:
+-                    T.call_extern("roce_wait_peers", bx, tx, T.call_extern("roce_ptr", region_base + T.cast(flag_off, T.int64), dtype="handle"), seq,
+-                                  T.call_extern("roce_ptr", region_base + T.cast(ctrl_off, T.int64), dtype="handle"),
+-                                  T.address_of(counters[rung_index]), T.address_of(counters[arrival_index]),
+-                                  T.call_extern("roce_trace_record_if", trace_base, seq, T.cast(bx == 0, T.int32), dtype="handle"), dtype="handle")
++                if bx == 0:
++                    if traced:
++                        T.call_extern("roce_wait_peers", bx, tx, T.call_extern("roce_ptr", region_base + T.cast(flag_off, T.int64), dtype="handle"), seq,
++                                      T.call_extern("roce_ptr", region_base + T.cast(ctrl_off, T.int64), dtype="handle"),
++                                      T.address_of(counters[rung_index]), T.address_of(counters[arrival_index]),
++                                      T.call_extern("roce_trace_record_if", trace_base, seq, T.cast(bx == 0, T.int32), dtype="handle"), dtype="handle")
++                    else:
++                        T.call_extern("roce_wait_peers", bx, tx, T.call_extern("roce_ptr", region_base + T.cast(flag_off, T.int64), dtype="handle"), seq,
++                                      T.call_extern("roce_ptr", region_base + T.cast(ctrl_off, T.int64), dtype="handle"),
++                                      T.address_of(counters[rung_index]), T.address_of(counters[arrival_index]), dtype="handle")
+                 else:
+-                    T.call_extern("roce_wait_peers", bx, tx, T.call_extern("roce_ptr", region_base + T.cast(flag_off, T.int64), dtype="handle"), seq,
++                    T.call_extern("roce_wait_cta0", tx, seq,
+                                   T.call_extern("roce_ptr", region_base + T.cast(ctrl_off, T.int64), dtype="handle"),
+-                                  T.address_of(counters[rung_index]), T.address_of(counters[arrival_index]), dtype="handle")
++                                  T.address_of(counters[arrival_index]), dtype="handle")
+                 T.sync_threads()
+                 if bx == 0:
+                     if tx == 0:
+diff --git a/sparknet/oneshot/_reducescatter_tilelang.py b/sparknet/oneshot/_reducescatter_tilelang.py
+index 78d6ca8..e48bae0 100644
+--- a/sparknet/oneshot/_reducescatter_tilelang.py
++++ b/sparknet/oneshot/_reducescatter_tilelang.py
+@@ -14,6 +14,7 @@ import logging
+ import time
+ from typing import Callable
+ 
++from . import trace as _trace
+ from ._device import PACK_BYTES, render_source
+ from ._freeze import raise_if_kernel_resolution_frozen
+ from ._kernels import Launch
+@@ -39,6 +40,7 @@ def _build(
+     flag_stride: int,
+     hca_count: int,
+     ring4: bool,
++    traced: bool = False,
+ ):
+     import tilelang
+     import tilelang.language as T
+@@ -51,10 +53,13 @@ def _build(
+         flag_stride=flag_stride,
+         hca_count=lanes,
+         neighbor_lanes=neighbor_lanes,
++        trace=_trace.device_defines() if traced else None,
+     )
+     reduce_pack = _REDUCE_FUNCTION[dtype_name]
+     resident = _resident_blocks(threads)
+     pack_words = PACK_BYTES // 4
++    w_doorbell, w_wait_done, w_end = _trace.W_DOORBELL, _trace.W_WAIT_DONE, _trace.W_END
++    op_code = _trace.OP_CODES["reducescatter"]
+ 
+     @tilelang.jit(pass_configs=_pass_configs())
+     def program():
+@@ -79,6 +84,7 @@ def _build(
+             rung_index: T.int32,
+             arrival_index: T.int32,
+             grid_x: T.int32,
++            trace_base: T.int64,
+         ):
+             with T.Kernel(grid_x, threads=threads) as bx:
+                 T.annotate_min_blocks_per_sm(resident)
+@@ -98,6 +104,18 @@ def _build(
+                 index = bx * threads + tx
+                 stride = T.alloc_var(T.int32)
+                 stride = grid_x * threads
++                if traced:
++                    if bx == 0:
++                        if tx == 0:
++                            T.call_extern(
++                                "roce_trace_begin",
++                                trace_base,
++                                seq,
++                                T.cast(chunk_bytes, T.uint32),
++                                T.cast(grid_x, T.uint32),
++                                T.uint32(op_code),
++                                dtype="handle",
++                            )
+                 # 1. stage each peer's chunk into its slice of the pinned send slot
+                 count = T.alloc_var(T.int32)
+                 count = T.max(0, (chunk_packs - index + stride - 1) // stride)
+@@ -139,26 +157,76 @@ def _build(
+                             seq,
+                             dtype="handle",
+                         )
++                        if traced:
++                            T.call_extern(
++                                "roce_trace_stamp",
++                                trace_base,
++                                seq,
++                                w_doorbell,
++                                dtype="handle",
++                            )
+                 # 3. block 0 waits for every peer's payload-stripe flags, the other blocks for block 0
+-                T.call_extern(
+-                    "roce_wait_peers",
+-                    bx,
+-                    tx,
+-                    T.call_extern(
+-                        "roce_ptr",
+-                        region_base + T.cast(flag_off, T.int64),
+-                        dtype="handle",
+-                    ),
+-                    seq,
++                if bx == 0:
++                    if traced:
++                        T.call_extern(
++                            "roce_wait_peers",
++                            bx,
++                            tx,
++                            T.call_extern(
++                                "roce_ptr",
++                                region_base + T.cast(flag_off, T.int64),
++                                dtype="handle",
++                            ),
++                            seq,
++                            T.call_extern(
++                                "roce_ptr",
++                                region_base + T.cast(ctrl_off, T.int64),
++                                dtype="handle",
++                            ),
++                            T.address_of(counters[rung_index]),
++                            T.address_of(counters[arrival_index]),
++                            T.call_extern(
++                                "roce_trace_record_if",
++                                trace_base,
++                                seq,
++                                T.cast(bx == 0, T.int32),
++                                dtype="handle",
++                            ),
++                            dtype="handle",
++                        )
++                    else:
++                        T.call_extern(
++                            "roce_wait_peers",
++                            bx,
++                            tx,
++                            T.call_extern(
++                                "roce_ptr",
++                                region_base + T.cast(flag_off, T.int64),
++                                dtype="handle",
++                            ),
++                            seq,
++                            T.call_extern(
++                                "roce_ptr",
++                                region_base + T.cast(ctrl_off, T.int64),
++                                dtype="handle",
++                            ),
++                            T.address_of(counters[rung_index]),
++                            T.address_of(counters[arrival_index]),
++                            dtype="handle",
++                        )
++                else:
+                     T.call_extern(
+-                        "roce_ptr",
+-                        region_base + T.cast(ctrl_off, T.int64),
++                        "roce_wait_cta0",
++                        tx,
++                        seq,
++                        T.call_extern(
++                            "roce_ptr",
++                            region_base + T.cast(ctrl_off, T.int64),
++                            dtype="handle",
++                        ),
++                        T.address_of(counters[arrival_index]),
+                         dtype="handle",
+-                    ),
+-                    T.address_of(counters[rung_index]),
+-                    T.address_of(counters[arrival_index]),
+-                    dtype="handle",
+-                )
++                    )
+                 T.sync_threads()
+                 if bx == 0:
+                     if tx == 0:
+@@ -168,6 +236,16 @@ def _build(
+                             seq,
+                             dtype="handle",
+                         )
++                if traced:
++                    if bx == 0:
++                        if tx == 0:
++                            T.call_extern(
++                                "roce_trace_stamp",
++                                trace_base,
++                                seq,
++                                w_wait_done,
++                                dtype="handle",
++                            )
+                 # 4. reduce this rank's chunk (from inp) and the peers' chunks in fixed rank order
+                 for i in T.serial(count):
+                     pack = index + i * stride
+@@ -189,14 +267,24 @@ def _build(
+                 T.call_extern("roce_fence_sc_gpu", dtype="handle")
+                 T.sync_threads()
+                 if tx == 0:
+-                    T.call_extern(
++                    last = T.alloc_var(T.uint32)
++                    last = T.call_extern(
+                         "roce_tail",
+                         T.address_of(counters[tail_index]),
+                         T.cast(grid_x, T.uint32),
+                         T.address_of(counters[0]),
+                         seq,
+-                        dtype="handle",
++                        dtype=T.uint32,
+                     )
++                    if traced:
++                        if last != T.uint32(0):
++                            T.call_extern(
++                                "roce_trace_stamp",
++                                trace_base,
++                                seq,
++                                w_end,
++                                dtype="handle",
++                            )
+ 
+         return oneshot_reducescatter
+ 
+@@ -213,6 +301,7 @@ def _process_key(
+     hca_count,
+     device_index,
+     ring4=False,
++    trace=False,
+ ):
+     return (
+         str(dtype_name),
+@@ -224,6 +313,7 @@ def _process_key(
+         int(hca_count),
+         int(device_index),
+         bool(ring4),
++        bool(trace),
+     )
+ 
+ 
+@@ -243,6 +333,7 @@ def get_launcher(
+     hca_count: int,
+     device_index: int,
+     ring4: bool = False,
++    trace: bool = False,
+ ) -> Callable[[Launch], None]:
+     """Compile the launcher for the key once and return it."""
+     if dtype_name not in _DTYPE_PACK_ELEMS:
+@@ -253,6 +344,10 @@ def get_launcher(
+             "RoCE kernels need threads >= world_size * hca_count (one thread per stripe flag), "
+             f"got threads={threads} world_size={world_size} hca_count={lanes}"
+         )
++    if trace and int(world_size) * lanes > _trace.MAX_FLAG_WORDS:
++        raise ValueError(
++            f"the trace record holds {_trace.MAX_FLAG_WORDS} peer lanes, got {int(world_size) * lanes}"
++        )
+     process_key = _process_key(
+         dtype_name,
+         world_size,
+@@ -263,6 +358,7 @@ def get_launcher(
+         hca_count,
+         device_index,
+         ring4,
++        trace,
+     )
+     cache_key = process_key[:7] + process_key[8:]
+     raise_if_kernel_resolution_frozen(
+@@ -270,7 +366,15 @@ def get_launcher(
+     )
+     started = time.monotonic()
+     kernel = _build(
+-        dtype_name, world_size, rank, threads, slots, flag_stride, hca_count, ring4
++        dtype_name,
++        world_size,
++        rank,
++        threads,
++        slots,
++        flag_stride,
++        hca_count,
++        ring4,
++        bool(trace),
+     )()
+     logger.info(
+         "compiled tilelang oneshot.reducescatter %s in %.1f s",
+@@ -303,6 +407,7 @@ def get_launcher(
+             int(launch.rung_index),
+             int(launch.arrival_index),
+             int(launch.grid_x),
++            int(launch.trace_base),
+         )
+ 
+     _PREPARED_LAUNCHERS.add(process_key)
+diff --git a/sparknet/oneshot/_roce_proxy.c b/sparknet/oneshot/_roce_proxy.c
+index cd71825..25d8203 100644
+--- a/sparknet/oneshot/_roce_proxy.c
++++ b/sparknet/oneshot/_roce_proxy.c
+@@ -159,8 +159,8 @@ static void set_err(roce_ctx_t *c, const char *what, int e) {
+ int roce_abi_version(void) { return ROCE_ABI_VERSION; }
+ 
+ // Trace marks, by the index of the proxy word they fill in a record. The word after
+-// them holds the sequence the proxy marked: all-gathers share the doorbell but run an
+-// untraced kernel, so a record's proxy words can belong to a later op than its kernel words.
++// them holds the sequence the proxy marked, guarding against ring wraparound across
++// ``trace_records`` slots.
+ enum { TRACE_SEEN = 0, TRACE_POSTED = 1, TRACE_RELAYED = 2, TRACE_DRAINED = 3, TRACE_SEQ = 4 };
+ 
+ static inline void trace_mark(roce_ctx_t *c, uint32_t seq, int which) {
+diff --git a/sparknet/oneshot/runtime.py b/sparknet/oneshot/runtime.py
+index 1f13d4e..f478991 100644
+--- a/sparknet/oneshot/runtime.py
++++ b/sparknet/oneshot/runtime.py
+@@ -841,6 +841,7 @@ class RoceOneshotAllReduce:
+             self.stripe_count,
+             self.device.index,
+             self.topology == "ring4",
++            bool(self._trace_base),
+         )
+ 
+     def _reducescatter_launcher_key(self, dtype: torch.dtype) -> tuple[object, ...]:
+@@ -855,6 +856,7 @@ class RoceOneshotAllReduce:
+             self.stripe_count,
+             self.device.index,
+             self.topology == "ring4",
++            bool(self._trace_base),
+         )
+ 
+     def _counter_indices(self, blocks: int) -> tuple[int, int]:
+diff --git a/sparknet/oneshot/trace.py b/sparknet/oneshot/trace.py
+index 2e49e49..8ac786c 100644
+--- a/sparknet/oneshot/trace.py
++++ b/sparknet/oneshot/trace.py
+@@ -47,17 +47,34 @@ W_START = 1
+ W_DOORBELL = 2
+ W_WAIT_DONE = 3
+ W_END = 4
+-W_META = 5  # nbytes | grid blocks << 32
++W_META = 5  # nbytes | (grid blocks & 0xffff) << 32 | (op code & 0xffff) << 48
+ W_FLAGS = 6  # MAX_FLAG_WORDS words: peer * lanes + lane
+ MAX_FLAG_WORDS = 16
+ # Proxy words (CLOCK_MONOTONIC_RAW, ns), in the C proxy's TRACE_* order.
+ W_PROXY = W_FLAGS + MAX_FLAG_WORDS
+ PROXY_WORDS = ("seen", "posted", "relayed", "drained")
+-# The sequence the proxy marked. All-gathers share the doorbell but run an untraced kernel,
+-# so proxy words are used only when this matches the kernel's sequence (0: older traces).
++# The sequence the proxy marked, guarding against ring wraparound across RECORDS slots.
+ W_PROXY_SEQ = W_PROXY + len(PROXY_WORDS)
+ 
+ TOPOLOGY_CODES = {"direct": 0, "ring4": 1, "mesh4": 2}
++OP_CODES = {"allreduce": 0, "allgather": 1, "reducescatter": 2, "exchange": 3}
++OP_NAMES = {code: name for name, code in OP_CODES.items()}
++
++
++def record_nbytes(row) -> int:
++    """Payload size in bytes recorded in ``W_META``."""
++    return int(row[W_META]) & 0xFFFFFFFF
++
++
++def record_grid(row) -> int:
++    """Grid block count recorded in ``W_META``."""
++    return (int(row[W_META]) >> 32) & 0xFFFF
++
++
++def record_op(row) -> str:
++    """Collective operation name recorded in ``W_META`` (defaults to ``allreduce`` for 0)."""
++    code = (int(row[W_META]) >> 48) & 0xFFFF
++    return OP_NAMES.get(code, f"op_{code}")
+ 
+ 
+ def device_defines() -> dict[str, int]:
+@@ -216,7 +233,7 @@ def phases(trace: Trace) -> dict[str, dict | None]:
+     return result
+ 
+ 
+-def pair_clock(a: Trace, b: Trace) -> dict | None:
++def pair_clock(a: Trace, b: Trace, *, min_samples: int = 10) -> dict | None:
+     """Offset of b's GPU clock from a's and the one-way delays, for directly linked ranks.
+ 
+     For every op both traced: d_ab = (b saw a's flag) - (a posted), d_ba likewise. With
+@@ -242,13 +259,14 @@ def pair_clock(a: Trace, b: Trace) -> dict | None:
+     mid_ab = _median([s[0] for s in samples]) if samples else 0
+     mid_ba = _median([s[1] for s in samples]) if samples else 0
+     samples = [s for s in samples if abs(s[0] - mid_ab) < 1_000_000 and abs(s[1] - mid_ba) < 1_000_000]
+-    if len(samples) < 10:
++    if len(samples) < min_samples:
+         return None
+     cutoff = _percentile(sorted(d_ab + d_ba for d_ab, d_ba, _, _ in samples), 10)
+     offset = _median([(d_ab - d_ba) / 2 for d_ab, d_ba, _, _ in samples if d_ab + d_ba <= cutoff])  # b - a
+     return {
+         "ranks": [a.rank, b.rank],
+         "offset_us": round(offset / 1000, 2),
++        "offset_ns": round(offset, 1),
+         "one_way_a_to_b": _stats(d_ab - offset for d_ab, _, _, _ in samples),
+         "one_way_b_to_a": _stats(d_ba + offset for _, d_ba, _, _ in samples),
+         "doorbell_b_minus_a": _stats(door_b - door_a - offset for _, _, door_a, door_b in samples),
+@@ -256,10 +274,12 @@ def pair_clock(a: Trace, b: Trace) -> dict | None:
+     }
+ 
+ 
+-def select(t: Trace, *, min_seq: int = 0, max_seq: int | None = None, nbytes: int | None = None) -> Trace:
+-    """The records of a sequence range and, optionally, one payload size."""
++def select(t: Trace, *, min_seq: int = 0, max_seq: int | None = None, nbytes: int | None = None,
++           op: str | None = None) -> Trace:
++    """The records of a sequence range and, optionally, one payload size or collective op."""
+     rows = [r for r in t.records if r[W_SEQ] >= min_seq and (max_seq is None or r[W_SEQ] <= max_seq)
+-            and (nbytes is None or (r[W_META] & 0xFFFFFFFF) == nbytes)]
++            and (nbytes is None or record_nbytes(r) == nbytes)
++            and (op is None or record_op(r) == op)]
+     return Trace(t.world, t.rank, t.lanes, t.topology, t.clock_offset_ns, t.clock_halfwidth_ns, t.host, rows)
+ 
+ 
+@@ -267,15 +287,25 @@ def sizes(t: Trace, top: int = 8) -> dict[int, int]:
+     """Op counts of the most frequent payload sizes (bytes)."""
+     counts: dict[int, int] = {}
+     for r in t.records:
+-        size = r[W_META] & 0xFFFFFFFF
++        size = record_nbytes(r)
+         counts[size] = counts.get(size, 0) + 1
+     return dict(sorted(counts.items(), key=lambda item: -item[1])[:top])
+ 
+ 
++def op_counts(t: Trace) -> dict[str, int]:
++    """Record counts grouped by collective operation name."""
++    counts: dict[str, int] = {}
++    for r in t.records:
++        name = record_op(r)
++        counts[name] = counts.get(name, 0) + 1
++    return dict(sorted(counts.items(), key=lambda item: (OP_CODES.get(item[0], 99), item[0])))
++
++
+ def summarize(traces: list[Trace]) -> dict:
+     """Per-rank phases and, for every directly linked pair, clock offset and one-way delays."""
+     traces = sorted(traces, key=lambda t: t.rank)
+-    out = {"ranks": {t.rank: {"host": t.host, "ops": len(t.records), "sizes": sizes(t),
++    out = {"ranks": {t.rank: {"host": t.host, "ops": len(t.records), "ops_by_kind": op_counts(t),
++                              "sizes": sizes(t),
+                               "clock_halfwidth_us": round(t.clock_halfwidth_ns / 1000, 2),
+                               "phases": phases(t)} for t in traces}, "pairs": []}
+     for i, a in enumerate(traces):
+@@ -287,6 +317,291 @@ def summarize(traces: list[Trace]) -> dict:
+     return out
+ 
+ 
++def clock_offsets(traces: list[Trace]) -> dict[int, float]:
++    """GPU clock offset (ns, ``rank_clock - ref_rank_clock``) for each rank relative to the lowest rank."""
++    if not traces:
++        return {}
++    ordered = sorted(traces, key=lambda t: t.rank)
++    ref_rank = ordered[0].rank
++    offsets: dict[int, float] = {ref_rank: 0.0}
++    edges: dict[int, list[tuple[int, float]]] = {t.rank: [] for t in ordered}
++    for i, a in enumerate(ordered):
++        for b in ordered[i + 1:]:
++            if adjacent(a.world, a.rank, b.rank, a.topology):
++                pair = pair_clock(a, b, min_samples=1)
++                if pair is not None:
++                    delta_ns = float(pair.get("offset_ns", pair["offset_us"] * 1000.0))
++                    edges[a.rank].append((b.rank, delta_ns))
++                    edges[b.rank].append((a.rank, -delta_ns))
++    queue = [ref_rank]
++    while queue:
++        cur = queue.pop(0)
++        for nbr, delta_ns in edges.get(cur, ()):
++            if nbr not in offsets:
++                offsets[nbr] = offsets[cur] + delta_ns
++                queue.append(nbr)
++    for t in ordered:
++        offsets.setdefault(t.rank, 0.0)
++    return offsets
++
++
++def perfetto_events(
++    traces: list[Trace],
++    *,
++    align_clocks: bool = True,
++    base_pid: int = 1_000_000,
++) -> list[dict]:
++    """Chrome/Perfetto ``traceEvents`` on the GPU ``%globaltimer`` microsecond timeline.
++
++    When ``align_clocks`` is True and multiple ranks are supplied, each rank's GPU
++    and CPU proxy timestamps are shifted by :func:`clock_offsets` onto the lowest
++    rank's GPU ``%globaltimer``, matching TileLang IKET's timeline.
++    """
++    ordered = sorted(traces, key=lambda t: t.rank)
++    offsets = clock_offsets(ordered) if align_clocks else {t.rank: 0.0 for t in ordered}
++    by_rank = {t.rank: t for t in ordered}
++    rows_by_rank = {t.rank: t.by_seq() for t in ordered}
++    ref_rank = ordered[0].rank if ordered else 0
++    events: list[dict] = []
++
++    for t in ordered:
++        pid = base_pid + t.rank
++        adj = offsets.get(t.rank, 0.0)
++
++        def _us(ns: int | float) -> float:
++            return round((float(ns) - adj) / 1000.0, 3)
++
++        def _dur_us(end_ns: int | float, start_ns: int | float) -> float:
++            return round(max(0.0, float(end_ns) - float(start_ns)) / 1000.0, 3)
++
++        events.append({
++            "ph": "M",
++            "pid": pid,
++            "tid": 0,
++            "name": "process_name",
++            "args": {"name": f"sparknet rank {t.rank} ({t.host})"},
++        })
++        events.append({
++            "ph": "M",
++            "pid": pid,
++            "tid": 0,
++            "name": "thread_name",
++            "args": {"name": "GPU collective (CTA 0)"},
++        })
++        events.append({
++            "ph": "M",
++            "pid": pid,
++            "tid": 1,
++            "name": "thread_name",
++            "args": {"name": "CPU RoCE proxy"},
++        })
++        for peer in range(t.world):
++            if peer == t.rank:
++                continue
++            for lane in range(t.lanes):
++                events.append({
++                    "ph": "M",
++                    "pid": pid,
++                    "tid": 10 + peer * t.lanes + lane,
++                    "name": "thread_name",
++                    "args": {"name": f"RDMA flag peer {peer} lane {lane}"},
++                })
++
++        for row in t.records:
++            seq = int(row[W_SEQ])
++            op = record_op(row)
++            nbytes = record_nbytes(row)
++            grid = record_grid(row)
++            start, doorbell, wait_done, end = (
++                int(row[W_START]),
++                int(row[W_DOORBELL]),
++                int(row[W_WAIT_DONE]),
++                int(row[W_END]),
++            )
++            base_args: dict[str, object] = {
++                "seq": seq,
++                "op": op,
++                "nbytes": nbytes,
++                "grid": grid,
++                "rank": t.rank,
++            }
++            if t.rank != ref_rank and ref_rank in rows_by_rank:
++                ref_row = rows_by_rank[ref_rank].get(seq)
++                if ref_row is not None and int(ref_row[W_DOORBELL]) > 0 and doorbell > 0:
++                    ref_adj = offsets.get(ref_rank, 0.0)
++                    skew_ns = (doorbell - adj) - (int(ref_row[W_DOORBELL]) - ref_adj)
++                    base_args["doorbell_skew_us"] = round(skew_ns / 1000.0, 3)
++
++            events.append({
++                "ph": "X",
++                "pid": pid,
++                "tid": 0,
++                "name": op,
++                "cat": "collective",
++                "ts": _us(start),
++                "dur": _dur_us(end, start),
++                "args": dict(base_args),
++            })
++            if doorbell >= start > 0:
++                events.append({
++                    "ph": "X",
++                    "pid": pid,
++                    "tid": 0,
++                    "name": "staging",
++                    "cat": "gpu_phase",
++                    "ts": _us(start),
++                    "dur": _dur_us(doorbell, start),
++                    "args": {"seq": seq, "op": op},
++                })
++            if wait_done >= doorbell > 0:
++                events.append({
++                    "ph": "X",
++                    "pid": pid,
++                    "tid": 0,
++                    "name": "wait.flags",
++                    "cat": "gpu_phase",
++                    "ts": _us(doorbell),
++                    "dur": _dur_us(wait_done, doorbell),
++                    "args": {"seq": seq, "op": op},
++                })
++            if end >= wait_done > 0:
++                events.append({
++                    "ph": "X",
++                    "pid": pid,
++                    "tid": 0,
++                    "name": "reduce",
++                    "cat": "gpu_phase",
++                    "ts": _us(wait_done),
++                    "dur": _dur_us(end, wait_done),
++                    "args": {"seq": seq, "op": op},
++                })
++
++            seen = _proxy(row, t, "seen")
++            posted = _proxy(row, t, "posted")
++            relayed = _proxy(row, t, "relayed")
++            drained = _proxy(row, t, "drained")
++            if seen > 0 and doorbell > 0 and seen >= doorbell:
++                events.append({
++                    "ph": "X",
++                    "pid": pid,
++                    "tid": 1,
++                    "name": "proxy.wake",
++                    "cat": "proxy",
++                    "ts": _us(doorbell),
++                    "dur": _dur_us(seen, doorbell),
++                    "args": {"seq": seq, "op": op},
++                })
++            if posted > 0 and seen > 0 and posted >= seen:
++                events.append({
++                    "ph": "X",
++                    "pid": pid,
++                    "tid": 1,
++                    "name": "proxy.post",
++                    "cat": "proxy",
++                    "ts": _us(seen),
++                    "dur": _dur_us(posted, seen),
++                    "args": {"seq": seq, "op": op},
++                })
++            if relayed > 0 and posted > 0 and relayed >= posted:
++                events.append({
++                    "ph": "X",
++                    "pid": pid,
++                    "tid": 1,
++                    "name": "proxy.relay",
++                    "cat": "proxy",
++                    "ts": _us(posted),
++                    "dur": _dur_us(relayed, posted),
++                    "args": {"seq": seq, "op": op},
++                })
++            prev_proxy = relayed if relayed > 0 else (posted if posted > 0 else seen)
++            if drained > 0 and prev_proxy > 0 and drained >= prev_proxy:
++                events.append({
++                    "ph": "X",
++                    "pid": pid,
++                    "tid": 1,
++                    "name": "proxy.drain",
++                    "cat": "proxy",
++                    "ts": _us(prev_proxy),
++                    "dur": _dur_us(drained, prev_proxy),
++                    "args": {"seq": seq, "op": op},
++                })
++
++            for peer in range(t.world):
++                if peer == t.rank:
++                    continue
++                route = "direct" if adjacent(t.world, t.rank, peer, t.topology) else "relayed"
++                peer_row = rows_by_rank.get(peer, {}).get(seq)
++                peer_trace = by_rank.get(peer)
++                peer_adj = offsets.get(peer, 0.0)
++                for lane in range(t.lanes):
++                    flag_ns = int(row[W_FLAGS + peer * t.lanes + lane])
++                    if flag_ns <= 0 or doorbell <= 0 or flag_ns < doorbell:
++                        continue
++                    flag_args: dict[str, object] = {
++                        "seq": seq,
++                        "op": op,
++                        "peer": peer,
++                        "lane": lane,
++                        "route": route,
++                    }
++                    if peer_row is not None and peer_trace is not None:
++                        peer_door = int(peer_row[W_DOORBELL])
++                        if peer_door > 0:
++                            skew_ns = (doorbell - adj) - (peer_door - peer_adj)
++                            flag_args["doorbell_skew_us"] = round(skew_ns / 1000.0, 3)
++                        peer_post = _proxy(peer_row, peer_trace, "posted")
++                        if peer_post > 0:
++                            wire_ns = (flag_ns - adj) - (peer_post - peer_adj)
++                            flag_args["one_way_wire_us"] = round(wire_ns / 1000.0, 3)
++                    events.append({
++                        "ph": "X",
++                        "pid": pid,
++                        "tid": 10 + peer * t.lanes + lane,
++                        "name": f"flag.peer{peer}.lane{lane}",
++                        "cat": "rdma_flag",
++                        "ts": _us(doorbell),
++                        "dur": _dur_us(flag_ns, doorbell),
++                        "args": flag_args,
++                    })
++
++    return events
++
++
++def export_perfetto(
++    traces: list[Trace],
++    output: str,
++    *,
++    align_clocks: bool = True,
++    base_pid: int = 1_000_000,
++    iket_trace: str | None = None,
++    extra_events: list[dict] | None = None,
++) -> dict:
++    """Write a Chrome/Perfetto JSON trace combining ``traces`` and optional IKET events."""
++    merged: list[dict] = []
++    if iket_trace is not None:
++        with open(iket_trace, "r", encoding="utf-8") as handle:
++            payload = json.load(handle)
++        if isinstance(payload, dict):
++            merged.extend(payload.get("traceEvents", ()))
++        elif isinstance(payload, list):
++            merged.extend(payload)
++    if extra_events:
++        merged.extend(extra_events)
++    roce_events = perfetto_events(traces, align_clocks=align_clocks, base_pid=base_pid)
++    merged.extend(roce_events)
++    with open(output, "w", encoding="utf-8") as handle:
++        json.dump({"traceEvents": merged}, handle, separators=(",", ":"))
++    return {
++        "output": output,
++        "roce_events": len(roce_events),
++        "total_events": len(merged),
++        "ranks": [t.rank for t in sorted(traces, key=lambda t: t.rank)],
++        "clock_offsets_us": {
++            r: round(ns / 1000.0, 3) for r, ns in clock_offsets(traces).items()
++        } if align_clocks else {},
++    }
++
++
+ def main(argv: list[str] | None = None) -> int:
+     import argparse
+ 
+@@ -295,6 +610,9 @@ def main(argv: list[str] | None = None) -> int:
+     parser.add_argument("--min-seq", type=int, default=0)
+     parser.add_argument("--max-seq", type=int)
+     parser.add_argument("--nbytes", type=int)
++    parser.add_argument("--op", choices=tuple(OP_CODES))
++    parser.add_argument("--perfetto", metavar="FILE", help="write Chrome/Perfetto trace JSON to FILE")
++    parser.add_argument("--iket-trace", metavar="FILE", help="merge existing IKET Chrome trace JSON into --perfetto")
+     parser.add_argument("--last-seq", action="store_true", help="print each file's newest sequence and exit")
+     args = parser.parse_args(sys.argv[1:] if argv is None else argv)
+     traces = [read(path) for path in args.files]
+@@ -302,7 +620,9 @@ def main(argv: list[str] | None = None) -> int:
+         print(json.dumps({path: max((r[W_SEQ] for r in t.records), default=0)
+                           for path, t in zip(args.files, traces, strict=True)}))
+         return 0
+-    traces = [select(t, min_seq=args.min_seq, max_seq=args.max_seq, nbytes=args.nbytes) for t in traces]
++    traces = [select(t, min_seq=args.min_seq, max_seq=args.max_seq, nbytes=args.nbytes, op=args.op) for t in traces]
++    if args.perfetto:
++        export_perfetto(traces, args.perfetto, iket_trace=args.iket_trace)
+     print(json.dumps(summarize(traces), indent=1))
+     return 0
+ 
+diff --git a/tests/gpu/test_oneshot_gpu.py b/tests/gpu/test_oneshot_gpu.py
+index 69f1961..c487ecf 100644
+--- a/tests/gpu/test_oneshot_gpu.py
++++ b/tests/gpu/test_oneshot_gpu.py
+@@ -755,4 +755,36 @@ def test_sliced_all_gather_exceeding_slot_capacity(runtime):
+         assert torch.equal(out, expected)
+ 
+ 
++def test_roce_trace_records_all_four_collectives(runtime):
++    """When SPARKNET_ROCE_TRACE=1 is enabled, all four collective families write complete trace records."""
++    from sparknet.oneshot import trace as roce_trace
++
++    if not runtime._trace_path:
++        pytest.skip("requires SPARKNET_ROCE_TRACE=1")
++    world = dist.get_world_size()
++    rank = dist.get_rank()
++    dev = runtime.device
++    t_ar = torch.ones(16384, dtype=torch.bfloat16, device=dev) * (rank + 1)
++    t_ag = torch.ones(64, 256, dtype=torch.bfloat16, device=dev) * (rank + 1)
++    t_rs = torch.ones(world * 32, 256, dtype=torch.bfloat16, device=dev) * (rank + 1)
++    t_ex = torch.ones(world, 32, 256, dtype=torch.bfloat16, device=dev) * (rank + 1)
++    runtime.all_reduce(t_ar)
++    runtime.all_gather(t_ag, dim=0)
++    runtime.reduce_scatter(t_rs, dim=0)
++    runtime.exchange(t_ex, copy_self=True)
++    torch.cuda.synchronize()
++    dist.barrier()
++    loaded = roce_trace.read(runtime._trace_path)
++    counts = roce_trace.op_counts(loaded)
++    for op_name in ("allreduce", "allgather", "reducescatter", "exchange"):
++        assert counts.get(op_name, 0) >= 1, (rank, counts)
++        picked = roce_trace.select(loaded, op=op_name)
++        last = picked.records[-1]
++        assert last[roce_trace.W_START] > 0
++        assert last[roce_trace.W_DOORBELL] >= last[roce_trace.W_START]
++        assert last[roce_trace.W_WAIT_DONE] >= last[roce_trace.W_DOORBELL]
++        assert last[roce_trace.W_END] >= last[roce_trace.W_WAIT_DONE]
++        for peer in range(world):
++            if peer != rank:
++                assert roce_trace.peer_arrival(last, loaded, peer) > 0
+ 
+diff --git a/tests/test_oneshot_cpu.py b/tests/test_oneshot_cpu.py
+index cdc85a9..4168ceb 100644
+--- a/tests/test_oneshot_cpu.py
++++ b/tests/test_oneshot_cpu.py
+@@ -329,6 +329,7 @@ class LauncherGeometryTest(unittest.TestCase):
+         for name in ("_launcher_key", "_gather_launcher_key", "_reducescatter_launcher_key"):
+             fn = next(n for n in cls.body if isinstance(n, ast.FunctionDef) and n.name == name)
+             self.assertIn("self.topology == 'ring4'", ast.unparse(fn))
++            self.assertIn("bool(self._trace_base)", ast.unparse(fn))
+         prepare = next(n for n in cls.body if isinstance(n, ast.FunctionDef) and n.name == "prepare")
+         self.assertIn("is_current_stream_capturing", ast.unparse(prepare))
+         self.assertFalse(any(isinstance(n, ast.FunctionDef) and n.name.startswith("_run_prepared") for n in cls.body))
+diff --git a/tests/test_trace.py b/tests/test_trace.py
+index 4400afd..e67170c 100644
+--- a/tests/test_trace.py
++++ b/tests/test_trace.py
+@@ -80,9 +80,16 @@ class TraceFormatTest(unittest.TestCase):
+         self.assertIn("roce_trace_stamp", (ROOT / "_oneshot_tilelang.py").read_text())
+ 
+     def test_generated_kernels_trace_only_when_traced(self):
+-        """In the TileLang all-reduce every trace call sits under an ``if traced:`` block."""
+-        for module_name in ("_oneshot_tilelang.py",):
+-            lines = (ROOT / module_name).read_text().splitlines()
++        """In all four TileLang collectives every trace call sits under an ``if traced:`` block."""
++        expected_op = {
++            "_oneshot_tilelang.py": "allreduce",
++            "_allgather_tilelang.py": "allgather",
++            "_reducescatter_tilelang.py": "reducescatter",
++            "_exchange_tilelang.py": "exchange",
++        }
++        for module_name, op_name in expected_op.items():
++            text = (ROOT / module_name).read_text()
++            lines = text.splitlines()
+             guarded: set[int] = set()
+             for i, line in enumerate(lines):
+                 if line.strip() == "if traced:":
+@@ -92,8 +99,12 @@ class TraceFormatTest(unittest.TestCase):
+                         guarded.add(j)
+                         j += 1
+             calls = [i for i, line in enumerate(lines) if '"roce_trace_' in line]
+-            self.assertTrue(calls, module_name)
++            self.assertEqual(len(calls), 5, f"{module_name}: expected 5 roce_trace_* calls")
+             self.assertTrue(all(i in guarded for i in calls), f"{module_name}: a trace call outside 'if traced:'")
++            self.assertIn(f'_trace.OP_CODES["{op_name}"]', text, f"{module_name}: missing op_code {op_name}")
++            self.assertIn("T.uint32(op_code)", text, f"{module_name}: missing T.uint32(op_code)")
++            self.assertIn('"roce_wait_peers"', text, f"{module_name}: missing roce_wait_peers")
++            self.assertIn('"roce_wait_cta0"', text, f"{module_name}: missing roce_wait_cta0")
+ 
+     def test_device_header_uses_only_the_trace_layout(self):
+         spec = importlib.util.spec_from_file_location("sparknet_oneshot_device", ROOT / "_device.py")
+@@ -173,6 +184,75 @@ class TraceAnalysisTest(unittest.TestCase):
+         self.assertFalse(trace.adjacent(4, 0, 2, "ring4"))
+         self.assertTrue(trace.adjacent(3, 0, 2, "direct"))
+ 
++    def test_op_metadata_encoding_and_filtering(self) -> None:
++        ops = ["allreduce", "allgather", "reducescatter", "exchange"]
++        rows = []
++        for idx, name in enumerate(ops, start=1):
++            r = row(idx, start=10, doorbell=20, wait_done=30, end=40, flags={1: 25}, cpu={"posted": 22})
++            r[trace.W_META] = 16384 | (8 << 32) | (trace.OP_CODES[name] << 48)
++            rows.append(r)
++        t = trace.Trace(2, 0, 1, "direct", 0, 0, "h", rows)
++        self.assertEqual(trace.op_counts(t), {name: 1 for name in ops})
++        for idx, name in enumerate(ops, start=1):
++            picked = trace.select(t, op=name)
++            self.assertEqual([r[trace.W_SEQ] for r in picked.records], [idx])
++            self.assertEqual(trace.record_op(picked.records[0]), name)
++            self.assertEqual(trace.record_grid(picked.records[0]), 8)
++            self.assertEqual(trace.record_nbytes(picked.records[0]), 16384)
++        summary = trace.summarize([t])
++        self.assertEqual(summary["ranks"][0]["ops_by_kind"], {name: 1 for name in ops})
++
++    def test_perfetto_export_aligns_clocks_and_merges_iket(self) -> None:
++        b_ahead, delay = 5_000, 3_000  # b's GPU clock is +5 us ahead; 3 us wire delay
++        ops = ["allreduce", "allgather", "reducescatter", "exchange"]
++        rows_a, rows_b = [], []
++        for seq in range(1, 13):
++            op_code = trace.OP_CODES[ops[(seq - 1) % len(ops)]]
++            t0 = 100_000 * seq
++            door_a, door_b = t0 + 1_000, t0 + 1_500  # b's doorbell is 0.5 us after a's
++            seen_a, seen_b = door_a + 400, door_b + 400
++            post_a, post_b = door_a + 1_000, door_b + 1_000
++            flag_on_b = post_a + delay
++            flag_on_a = post_b + delay
++            ra = row(seq, start=t0, doorbell=door_a, wait_done=flag_on_a + 500, end=flag_on_a + 2_000,
++                     flags={1: flag_on_a}, cpu={"seen": seen_a, "posted": post_a, "drained": post_a + 800})
++            rb = row(seq, start=t0 + b_ahead, doorbell=door_b + b_ahead,
++                     wait_done=flag_on_b + 500 + b_ahead, end=flag_on_b + 2_000 + b_ahead,
++                     flags={0: flag_on_b + b_ahead},
++                     cpu={"seen": seen_b + b_ahead, "posted": post_b + b_ahead, "drained": post_b + 800 + b_ahead})
++            ra[trace.W_META] = 65536 | (4 << 32) | (op_code << 48)
++            rb[trace.W_META] = 65536 | (4 << 32) | (op_code << 48)
++            rows_a.append(ra)
++            rows_b.append(rb)
++        a = trace.Trace(2, 0, 1, "direct", 0, 0, "sp5", rows_a)
++        b = trace.Trace(2, 1, 1, "direct", 0, 0, "sp6", rows_b)
++        offsets = trace.clock_offsets([a, b])
++        self.assertEqual(offsets[0], 0.0)
++        self.assertAlmostEqual(offsets[1], 5_000.0, delta=10.0)
++        with tempfile.TemporaryDirectory() as directory:
++            iket_path = os.path.join(directory, "iket.json")
++            out_path = os.path.join(directory, "merged.json")
++            with open(iket_path, "w", encoding="utf-8") as handle:
++                handle.write('{"traceEvents":[{"ph":"B","pid":1,"tid":0,"ts":100.0,"name":"wait.flags"},'
++                             '{"ph":"E","pid":1,"tid":0,"ts":105.0}]}')
++            receipt = trace.export_perfetto([a, b], out_path, iket_trace=iket_path)
++            self.assertEqual(receipt["ranks"], [0, 1])
++            self.assertGreater(receipt["roce_events"], 40)
++            self.assertEqual(receipt["total_events"], receipt["roce_events"] + 2)
++            with open(out_path, "r", encoding="utf-8") as handle:
++                import json
++                payload = json.load(handle)
++        events = payload["traceEvents"]
++        names = {e.get("name") for e in events}
++        for op in ops:
++            self.assertIn(op, names)
++        for phase_name in ("staging", "wait.flags", "reduce", "proxy.wake", "proxy.post", "proxy.drain"):
++            self.assertIn(phase_name, names)
++        flag_events = [e for e in events if e.get("cat") == "rdma_flag" and e.get("pid") == 1_000_001]
++        self.assertEqual(len(flag_events), 12)
++        self.assertAlmostEqual(flag_events[0]["args"]["doorbell_skew_us"], 0.5, delta=0.05)
++        self.assertAlmostEqual(flag_events[0]["args"]["one_way_wire_us"], 3.0, delta=0.05)
++
+ 
+ if __name__ == "__main__":
+     unittest.main()
+-- 
+2.54.0 (Apple Git-157)
+

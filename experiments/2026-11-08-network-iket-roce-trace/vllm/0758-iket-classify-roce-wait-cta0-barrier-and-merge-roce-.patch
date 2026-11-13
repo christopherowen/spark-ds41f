@@ -1,0 +1,276 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Christopher Owen <christopher@owen.org.uk>
+Date: Sun, 8 Nov 2026 12:30:00 +0000
+Subject: [PATCH] [Profiling] IKET: classify roce_wait_cta0 barrier and merge
+ RoCE traces
+
+Classify roce_wait_cta0 and roce_wait_device_eq as wait.barrier ahead of the
+general roce_wait_* pattern so CTA-0 RDMA peer flag polling (wait.flags) is
+separated from non-zero CTA local barrier waiting (wait.barrier) in both fine
+and phase granularities. Add roce_trace_events and merge_roce_traces helpers
+to export sparknet SPKTRACE records onto the shared %globaltimer Perfetto
+timeline.
+
+Upstream-Base: 19f2c20ed4d64ae22bd009ceacadd85e2a81e354
+Rationale: Multi-CTA sparknet collectives previously emitted wait.flags across
+all CTAs because CTA-0 RDMA flag polling and non-zero CTA barrier spins shared
+roce_wait_peers, and sparknet ROCE_TRACE files were disconnected from IKET's
+Chrome/Perfetto timeline.
+Quality-Implications: Diagnostic instrumentation and trace export only; no
+change when VLLM_DS41_IKET is unset.
+Tests: pytest tests/kernels/test_deepseek_v41_tilelang_iket.py
+Upstream-Status: Local DeepSeek V4.1 TileLang profiling patch.
+---
+diff --git a/tests/kernels/test_deepseek_v41_tilelang_iket.py b/tests/kernels/test_deepseek_v41_tilelang_iket.py
+index 09bc595..b0bc73e 100644
+--- a/tests/kernels/test_deepseek_v41_tilelang_iket.py
++++ b/tests/kernels/test_deepseek_v41_tilelang_iket.py
+@@ -657,3 +657,189 @@ def test_vision_and_multi_warp_tma_producers_synchronized_natively():
+         mg_producer,
+     )
+     assert len(waits) == mg_producer.count(".wait(") >= 2, mg_src
++
++
++_ONESHOT_SPLIT = """\
++extern "C" __global__ void __launch_bounds__(256, 8) oneshot_allgather(int* __restrict__ inp, int* __restrict__ out, int* __restrict__ counters, int64_t region_base, int shard_packs, int nbytes, int row_packs, int dst_stride_packs, int recv_off, int flag_off, int send_off, int ctrl_off, int slot_bytes, int stage_index, int tail_index, int rung_index, int arrival_index, int grid_x, int64_t trace_base) {
++  uint32_t epoch = roce_ld_relaxed_gpu_u32((&(counters[0])));
++  uint32_t seq = (epoch + (uint32_t)1);
++  if (((int)blockIdx.x) == 0) {
++    if (((int)threadIdx.x) == 0) {
++      roce_trace_begin(trace_base, seq, ((uint32_t)nbytes), ((uint32_t)grid_x), (uint32_t)1);
++    }
++  }
++  for (int i = 0; i < count; ++i) {
++    roce_stage_gather_pack((&(inp[0])), roce_ptr(region_base), i, row_packs, (&(out[0])), dst_stride_packs);
++  }
++  __syncthreads();
++  if (((int)threadIdx.x) == 0) {
++    uint32_t rang = roce_doorbell((&(counters[stage_index])), ((uint32_t)grid_x), roce_ptr(region_base), ((uint32_t)nbytes), seq);
++    if (rang != (uint32_t)0) {
++      roce_st_release_gpu_u32((&(counters[rung_index])), seq);
++      roce_trace_stamp(trace_base, seq, 2);
++    }
++  }
++  if (((int)blockIdx.x) == 0) {
++    roce_wait_peers(((int)blockIdx.x), ((int)threadIdx.x), roce_ptr(region_base), seq, roce_ptr(region_base), (&(counters[rung_index])), (&(counters[arrival_index])), roce_trace_record_if(trace_base, seq, (int)(((int)blockIdx.x) == 0)));
++  } else {
++    roce_wait_cta0(((int)threadIdx.x), seq, roce_ptr(region_base), (&(counters[arrival_index])));
++  }
++  __syncthreads();
++  if (((int)blockIdx.x) == 0) {
++    if (((int)threadIdx.x) == 0) {
++      roce_st_release_gpu_u32((&(counters[arrival_index])), seq);
++    }
++  }
++  if (((int)blockIdx.x) == 0) {
++    if (((int)threadIdx.x) == 0) {
++      roce_trace_stamp(trace_base, seq, 3);
++    }
++  }
++  for (int j = 0; j < peer_count; ++j) {
++    roce_gather_pack(roce_ptr(region_base), ((int64_t)slot_bytes), seq, (&(out[0])), j, ((int64_t)shard_packs), ((int64_t)row_packs), ((int64_t)dst_stride_packs));
++  }
++  roce_fence_sc_gpu();
++  __syncthreads();
++  if (((int)threadIdx.x) == 0) {
++    uint32_t last = roce_tail((&(counters[tail_index])), ((uint32_t)grid_x), (&(counters[0])), seq);
++    if (last != (uint32_t)0) {
++      roce_trace_stamp(trace_base, seq, 4);
++    }
++  }
++}
++"""
++
++
++def test_oneshot_collectives_separate_cta0_flag_wait_and_nonzero_cta_barrier():
++    for granularity in ("fine", "phase"):
++        annotated, sites = iket.annotate(
++            _ONESHOT_SPLIT, _token, granularity=granularity
++        )
++        names = [s["range"] for s in sites]
++        assert "wait.flags" in names, names
++        assert "wait.barrier" in names, names
++        flags_site = next(s for s in sites if s["range"] == "wait.flags")
++        barrier_site = next(s for s in sites if s["range"] == "wait.barrier")
++        assert "roce_wait_peers" in flags_site["statement"]
++        assert "roce_wait_cta0" in barrier_site["statement"]
++        assert flags_site["first_line"] != barrier_site["first_line"]
++        assert "if (((int)blockIdx.x) == 0)" in annotated
++        assert "else" in annotated
++
++
++def test_merge_roce_traces_aligns_clocks_and_exports_perfetto(tmp_path):
++    from sparknet.oneshot import trace as roce_trace
++
++    def _row(seq, op_name, start, doorbell, wait_done, end, flags, cpu):
++        words = [0] * roce_trace.RECORD_WORDS
++        words[roce_trace.W_SEQ] = seq
++        words[roce_trace.W_START] = start
++        words[roce_trace.W_DOORBELL] = doorbell
++        words[roce_trace.W_WAIT_DONE] = wait_done
++        words[roce_trace.W_END] = end
++        words[roce_trace.W_META] = (
++            32768 | (4 << 32) | (roce_trace.OP_CODES[op_name] << 48)
++        )
++        for idx, val in flags.items():
++            words[roce_trace.W_FLAGS + idx] = val
++        for name, val in cpu.items():
++            words[roce_trace.W_PROXY + roce_trace.PROXY_WORDS.index(name)] = val
++        words[roce_trace.W_PROXY_SEQ] = seq
++        return words
++
++    ops = ("allreduce", "allgather", "reducescatter", "exchange")
++    rows_0, rows_1 = [], []
++    b_ahead, wire = 4_000, 2_500
++    for seq in range(1, 13):
++        op_name = ops[(seq - 1) % len(ops)]
++        t0 = 100_000 * seq
++        d0, d1 = t0 + 1_000, t0 + 1_400
++        p0, p1 = d0 + 800, d1 + 800
++        f0, f1 = p1 + wire, p0 + wire
++        rows_0.append(
++            _row(
++                seq,
++                op_name,
++                t0,
++                d0,
++                f0 + 400,
++                f0 + 1_800,
++                {1: f0},
++                {"seen": d0 + 300, "posted": p0, "drained": p0 + 600},
++            )
++        )
++        rows_1.append(
++            _row(
++                seq,
++                op_name,
++                t0 + b_ahead,
++                d1 + b_ahead,
++                f1 + 400 + b_ahead,
++                f1 + 1_800 + b_ahead,
++                {0: f1 + b_ahead},
++                {
++                    "seen": d1 + 300 + b_ahead,
++                    "posted": p1 + b_ahead,
++                    "drained": p1 + 600 + b_ahead,
++                },
++            )
++        )
++    t0_trace = roce_trace.Trace(2, 0, 1, "direct", 0, 0, "sp5", rows_0)
++    t1_trace = roce_trace.Trace(2, 1, 1, "direct", 0, 0, "sp6", rows_1)
++    iket_file = tmp_path / "iket.json"
++    out_file = tmp_path / "merged.json"
++    iket_file.write_text(
++        '{"traceEvents":[{"ph":"B","pid":1,"tid":0,"ts":101.0,"name":"wait.flags"},'
++        '{"ph":"E","pid":1,"tid":0,"ts":104.3}]}\n'
++    )
++    events = iket.roce_trace_events([t0_trace, t1_trace])
++    assert any(e.get("name") == "allgather" for e in events)
++    assert any(e.get("name") == "reducescatter" for e in events)
++    assert any(e.get("name") == "exchange" for e in events)
++    receipt = iket.merge_roce_traces(iket_file, [t0_trace, t1_trace], out_file)
++    assert receipt["ranks"] == [0, 1]
++    assert receipt["total_events"] == len(events) + 2
++    merged = json.loads(out_file.read_text())["traceEvents"]
++    r1_flags = [
++        e for e in merged if e.get("cat") == "rdma_flag" and e.get("pid") == 1_000_001
++    ]
++    assert len(r1_flags) == 12
++    assert abs(r1_flags[0]["args"]["doorbell_skew_us"] - 0.4) < 0.05
++    assert abs(r1_flags[0]["args"]["one_way_wire_us"] - 2.5) < 0.05
++
++
++@GPU
++def test_sparknet_all_four_collectives_compile_with_iket_and_roce_trace():
++    from sparknet.oneshot import (
++        _allgather_tilelang,
++        _exchange_tilelang,
++        _oneshot_tilelang,
++        _reducescatter_tilelang,
++    )
++
++    builders = [
++        ("allreduce", _oneshot_tilelang._build, ("bfloat16", 4, 0, 256, 2, 128, 2, False)),
++        ("allgather", _allgather_tilelang._build, (4, 0, 256, 2, 128, 2, False)),
++        ("reducescatter", _reducescatter_tilelang._build, ("bfloat16", 4, 0, 256, 2, 128, 2, False)),
++        ("exchange", _exchange_tilelang._build, (4, 0, 256, 2, 128, 2, False)),
++    ]
++    for name, build_fn, args in builders:
++        for traced in (False, True):
++            kernel = build_fn(*args, traced=traced)()
++            src = kernel.get_kernel_source()
++            body = src.split('extern "C" __global__', 1)[1]
++            if traced:
++                assert "#define ROCE_TRACE 1" in src, name
++                assert "roce_trace_begin(" in body, name
++                assert "roce_trace_stamp(" in body, name
++            else:
++                assert "#define ROCE_TRACE 0" in src, name
++                assert "roce_trace_begin(" not in body, name
++                assert "roce_trace_stamp(" not in body, name
++            for granularity in ("fine", "phase"):
++                _, sites = iket.annotate(src, _token, granularity=granularity)
++                site_ranges = [s["range"] for s in sites]
++                assert "wait.flags" in site_ranges, (name, traced, granularity, site_ranges)
++                assert "wait.barrier" in site_ranges, (name, traced, granularity, site_ranges)
++                assert "store.stage" in site_ranges, (name, traced, granularity, site_ranges)
++                assert "signal.proxy" in site_ranges, (name, traced, granularity, site_ranges)
+diff --git a/vllm/models/deepseek_v4_1/tilelang/iket.py b/vllm/models/deepseek_v4_1/tilelang/iket.py
+index 4c9454e..ae24d31 100644
+--- a/vllm/models/deepseek_v4_1/tilelang/iket.py
++++ b/vllm/models/deepseek_v4_1/tilelang/iket.py
+@@ -104,6 +104,7 @@ _PATTERNS = [
+                           r"mbarrier\.\w+_wait"]),
+     ("wait", "sync", [r"\b__syncthreads\s*\(", r"\btl::__sync_thread_partial\s*\(",
+                       r"\bbar\.sync\b", r"\bbarrier\.sync\b", r"\.sync\s*\(\s*\)"]),
++    ("wait", "barrier", [r"\broce_wait_cta0\s*\(", r"\broce_wait_device_eq\s*\("]),
+     ("wait", "flags", [r"\broce_wait_\w+\s*\("]),
+     ("wait", "fence", [r"\broce_fence_\w+\s*\(", r"\b__threadfence\w*\s*\(",
+                        r"\bfence\.(sc|acq_rel)\b"]),
+@@ -918,3 +919,46 @@ def _postproc(code: str, target) -> str:
+         (_cache_sources / f"{stem}.cu").write_text(instrumented)
+         (_cache_sources / f"{stem}.json").write_text(manifest_text)
+     return instrumented
++
++
++def roce_trace_events(
++    paths: list[str | Path] | tuple[str | Path, ...],
++    *,
++    align_clocks: bool = True,
++    base_pid: int = 1_000_000,
++) -> list[dict]:
++    """Convert ``sparknet`` ``SPKTRACE`` files into Chrome/Perfetto ``traceEvents``
++    on the GPU ``%globaltimer`` microsecond timeline."""
++    from sparknet.oneshot import trace as roce_trace
++
++    traces = [
++        item if hasattr(item, "records") else roce_trace.read(str(item))
++        for item in paths
++    ]
++    return roce_trace.perfetto_events(
++        traces, align_clocks=align_clocks, base_pid=base_pid
++    )
++
++
++def merge_roce_traces(
++    iket_trace: str | Path,
++    roce_paths: list[str | Path] | tuple[str | Path, ...],
++    output: str | Path,
++    *,
++    align_clocks: bool = True,
++    base_pid: int = 1_000_000,
++) -> dict:
++    """Merge an IKET Chrome/Perfetto trace JSON with ``sparknet`` ``SPKTRACE`` files."""
++    from sparknet.oneshot import trace as roce_trace
++
++    traces = [
++        item if hasattr(item, "records") else roce_trace.read(str(item))
++        for item in roce_paths
++    ]
++    return roce_trace.export_perfetto(
++        traces,
++        str(output),
++        align_clocks=align_clocks,
++        base_pid=base_pid,
++        iket_trace=str(iket_trace),
++    )
