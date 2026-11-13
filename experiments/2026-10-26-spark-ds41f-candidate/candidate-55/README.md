@@ -141,10 +141,11 @@ elsewhere.
   ([the window sweep](../../2026-11-13-prefetch-window-sweep/README.md)): 17 to 32 rows 1.7% to 2.7% faster at both
   TP4 testbeds, the grid 0.43% and 0.62% faster, outputs candidate-54's. The sweep found no better WO, FFN or NEXT
   size at any other row band.
-- **Open, for the fifth build's screen:** at `tp4-ring` 256K prefill is about 1% lower on CUDA 13.5 kernels, and 12x72
-  and 16x96 read 0.7% to 1.0% slower with the band on two boots.
-- **Not set elsewhere:** `tp3-switched`'s sweep picks `17-32=12`, whose confirmation is not read yet; the triangle and
-  TP5 to TP8 have no measurement.
+- **The fifth build's screen** (below, under Status): 256K prefill is 1.03% lower than candidate-54's at `tp4-ring`,
+  beyond the margin; 12x72 is level with the recipe without the band (+0.17%); 16x96 reads 1.07% slower than it again
+  and is level with candidate-54 (-0.02%).
+- **Not set elsewhere:** `tp3-switched`'s sweep picked `17-32=12` on one boot and two boots did not confirm it (grid
+  -0.06%), so TP3 has no band; the triangle and TP5 to TP8 have no measurement.
 - `tp4-noband.json`, `tp4-switched-noband.json` and their `-dev` files are the recipe without the band. The arms
   measured before it entered (grid-attribution, rows24-attribution, the kernel cache, row-band and sweep experiments)
   extend those, so they still mean what they measured.
@@ -288,6 +289,24 @@ both `ModuleNotFoundError: No module named 'b12x'`. They test DeepSeek V4's B12X
 (`vllm/models/deepseek_v4/nvidia/b12x.py`, not on DS4.1's path) and import `b12x.attention` directly. #1096's own
 without-B12X run did not select this file. Both are now deselected with that reason, and the file's other tests still
 run. The deselection leaves the vLLM tree unchanged.
+
+**Fifth build** (image `c8c22dc2`, sp8, 5,672 s): **3 failed**, 10,292 passed, 357 skipped
+([receipts/release-tests-c8c22dc2](receipts/release-tests-c8c22dc2)). All three are the vision aligner's fused GELU
+against DeepSeek's reference (`F.gelu`), in `tests/kernels/test_deepseek_v41_tilelang_vision.py`:
+`test_gelu_epilogue_is_the_reference[144]` (3 of 36,864 values) and `test_gelu_epilogue_is_the_reference_everywhere[gemm]`
+and `[gemv]` (7 of the BF16 inputs a projection can produce, the same seven in both kernels).
+
+- **Cause: the toolkit (#974), not the fifth build's patches.** The kernel calls CUDA's `erff`, and the image's torch is
+  `2.13.0+cu130`, whose `erff` is CUDA 13.0's. CUDA 13.5's differs from it by one FP32 step at these arguments, and the
+  seven inputs (-3.140625, -4.03125, -4.28125, -4.5625, -5.0, -5.25, -5.34375) are those where that step moves the BF16
+  rounding of `(0.5 * x) * (1 + erff(x * M_SQRT1_2))`. The largest change is one BF16 step at 0.0026; the others are
+  below 1.2e-4.
+- **Builds one to four passed on kernels an earlier toolkit compiled.** The bundle's kernel cache
+  (`/c/tilelang-release-tests`) was filled on sp8 on 2026-11-10, and its key did not name the compiler. There, the third
+  build's image gives 0 differing inputs with that cache and the same 7 with an empty one. TileLang `0014` is what made
+  the fifth build compile its own.
+- **Effect:** image inputs. The text gates are unaffected (candidate-54's hashes at all three testbeds on these
+  kernels). Not fixed in this build.
 
 ## Status
 
@@ -433,3 +452,40 @@ pass every check, steering changes all 8 prompts, and both give the same replies
 - **Third build:** its images and results are of tree `e8c20f54` and stay as its record.
 - **Fourth build:** it replaces both images and runs every gate, check and screen again. Its specs' runs are named
   `<run>-b4`.
+
+### Fifth build: gates identical, the grid ahead at TP4, prefill 1% behind, three release tests fail
+
+Image `spark-ds41f:candidate-55`, ID `c8c22dc2`, the same on dgx1..dgx4, sp1..sp4 and sp5..sp7 (2026-11-13). Every job
+ran at `f821d9f4d`. Each node's first boot compiled its kernel set (about 22 minutes), with the earlier toolkit's
+entries still in the cache: TileLang `0014` acting. Receipts: [receipts/fifth-build](receipts/fifth-build).
+
+| | `tp4-ring` | `tp4-switched` | `tp3-switched` |
+| --- | --- | --- | --- |
+| Gate | 2 of 2 boots, 18d61961/d6568649 (text 0a2dacdd/12fd8257) | 2 of 2, the same | 4 of 4, 5c22ce41/bce6092e (text 26a739a9/12cfee9b) |
+| Grid against candidate-54's recorded screen | **2.22% faster** (±0.14%, margin 0.35%) | **4.14% faster** (±0.17%, margin 0.29%) | screen running |
+| c16 paired decode | +0.36%, the same (margin 0.51%) | **+1.39%, better** (margin 0.47%) | |
+| Prefill 32,768 | -0.15%, the same | -0.88%, the same | |
+| Prefill 262,144 | **-1.03%, worse** (±0.22%, margin 0.69%; 8,803 and 8,723 tok/s) | -0.84%, the same (margin 1.07%; 8,651 and 8,705 tok/s) | |
+| c1 decisions, 4 boots | agree on 59 requests; 82.49 to 82.83 tok/s output | agree on 59 requests; 82.52 to 82.73 tok/s | |
+| Warm time to ready | 115 and 118 s | 132 and 133 s | |
+
+- **The grid** is the fourth build's with its own kernels and the band: at `tp4-ring` -2.22% here against -1.96% for
+  that pair mounted over the fourth build, and -1.55% recorded on the earlier toolkit's kernels.
+- **The 24- and 32-row shapes** are 1.4% to 1.9% faster than candidate-54's at `tp4-ring` (24 rows) and level at
+  16x32 (+0.33%); they were 1.3% to 1.9% slower.
+- **Forwards of 32 rows and more are 0.18 to 0.34 ms slower than candidate-54's at `tp4-ring`** (16x32, the three
+  48-row shapes, 12x72, 16x96), which the drafter and the rest of the step give back (-0.18% to +0.85% a step). Not
+  attributed; the prefill loss on these kernels is not attributed either.
+- **Release tests:** three fail, above.
+- **Not done:** `tp3-switched`'s screen; the c1 decisions against candidate-54's; TP5 to TP8.
+- **Correction:** sp8's `spark-ds41f:candidate-55` was the third build until the fifth replaced it, so the single-GPU
+  checks of 2026-11-13 on sp8 that name the fourth build ran on the third (the row-band overlay's smoke run among
+  them). The testbed runs are unaffected.
+
+Against `spark-ds41f-1107`, composed from candidate-54's recorded screens against it:
+
+| | `tp4-ring` | `tp4-switched` |
+| --- | ---: | ---: |
+| Grid | 7.05% faster | 8.20% faster |
+| c16 paired decode | +1.71% | +2.54% |
+| Prefill 262,144 | +6.24% | +6.66% |
