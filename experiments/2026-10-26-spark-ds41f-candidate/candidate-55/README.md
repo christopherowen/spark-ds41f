@@ -29,7 +29,10 @@ against candidate-54's recorded runs, not release-qualified.
   replaced by [glp27-tp4.json](glp27-tp4.json), which extends this candidate's `tp4.json`.
 - **#985 is not carried.** It switches the default vector to GLP-27 in `config/cluster.json`, which `spark-ds41f-1107`'s
   image cannot read. Every measured arm here keeps GLP-39, and GLP-27 runs on a qualification arm only. The switch
-  belongs in the promotion commit of a release whose image reads Spec v3.
+  belongs in the promotion commit of a release whose image reads Spec v3. **Owner, 2026-11-13: "Yes, at
+  promotion"**: if candidate-55 is promoted, its promotion commit makes GLP-27 the default vector (#985's change),
+  qualified at all three testbeds ([receipts/glp](receipts/glp/README.md)). Until then `config/cluster.json` keeps
+  GLP-39.
 - **#1134 is carried in part:** its vLLM and sparknet patches only, at head `6757c7a1` (owner, 2026-11-12: "Yes,
   rebuild").
   - **This head's `0800`** replaces the one of `37a7f0ac`, which replaced the one first carried (heads `2d0c6c0b` and
