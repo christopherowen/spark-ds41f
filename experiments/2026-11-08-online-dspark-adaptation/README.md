@@ -138,6 +138,16 @@ The expected hashes are candidate-54's own at TP4 (its `tp4-ring` and `tp4-switc
 ranks' digests are equal at every compared update; then the comparison of acceptance length per turn, coding and
 held-out, and c1 decode tok/s, on against off, with both boots of each.
 
+**Smoke boot first.** [smoke-tp3-switched.json](smoke-tp3-switched.json) booted
+[tp3-switched-on-smoke.json](tp3-switched-on-smoke.json) (adaptation on, digest every 64 updates) once at
+`tp3-switched` (sp5..sp7), with the workload at shorter lengths and one c8 pass, only to see it serve: every extra
+exited 0, the three ranks' digests were equal at all 21 logged points (to 1,280 updates), max W1 row drift 0.0025.
+The lab's overlay receipt for a `{checkout}` mount lists only the profile, with no hashes, so the files were checked by
+hand in the running container: the six files' hashes there equal [overlay/](overlay)'s, and the engine logged the
+adaptation's start and digests ([receipts/smoke-tp3-switched/](receipts/smoke-tp3-switched), with
+`overlay-check-sp5.txt`). Its numbers are not compared with anything. In the TP4 run, every rank of both on boots logged
+the digests, which only the overlay's code writes.
+
 ## Results
 
 Queue entry `20261113T092058-run-tp4-switched.json`, 2026-11-13 10:02–10:38Z, on `tp4-switched` (sp1..sp4), lab
