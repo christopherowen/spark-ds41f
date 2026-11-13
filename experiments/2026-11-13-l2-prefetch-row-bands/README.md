@@ -65,7 +65,7 @@ The engine grid step alone ([candidate-48/grid-suite.json](../2026-10-26-spark-d
 bin/spark candidate queue tp4-ring experiments/2026-11-13-l2-prefetch-row-bands/grid-tp4.json experiments/2026-11-13-l2-prefetch-row-bands/gate-tp4.json --apply
 bin/spark candidate queue tp4-switched experiments/2026-11-13-l2-prefetch-row-bands/grid-tp4-switched.json experiments/2026-11-13-l2-prefetch-row-bands/gate-tp4-switched.json --apply
 bin/spark candidate verdicts tp4-ring l2-prefetch-row-bands-grid-tp4-r2
-bin/spark candidate gate tp4-ring l2-prefetch-row-bands-gate-tp4 --expect 18d61961/d6568649
+bin/spark candidate gate tp4-ring l2-prefetch-row-bands-gate-tp4-r2 --expect 18d61961/d6568649
 ```
 
 ## Checks before the runs
@@ -80,8 +80,10 @@ bin/spark candidate gate tp4-ring l2-prefetch-row-bands-gate-tp4 --expect 18d619
 **First run void (2026-11-13 07:59Z to 08:30Z).** The profiles named the overlay under `container.extra_mounts`, which
 no command reads, so both grid jobs (`l2-prefetch-row-bands-grid-tp4`, `…-grid-tp4-switched`) measured candidate-55
 six times: the "band" arm's 24-row shapes were within 0.1% of `candidate-55` at both testbeds. The profiles now use
-`container.mounts`, and the grid runs again as `…-grid-tp4-r2` and `…-grid-tp4-switched-r2`. The gate jobs were still
-queued when the profiles were fixed and run with the overlay mounted.
+`container.mounts`, and the grid runs again as `…-grid-tp4-r2` and `…-grid-tp4-switched-r2`. Both gate jobs
+(`l2-prefetch-row-bands-gate-tp4`, `…-gate-tp4-switched`) started at `37630b335`, before the fix, so they gated
+candidate-55 itself (both pass with candidate-54's hashes, which says nothing about the band); they run again as
+`…-gate-tp4-r2` and `…-gate-tp4-switched-r2`.
 
 On one GPU of sp8 the overlay was mounted with `docker -v` and the band acts: with `17-32=10` the forward is 2.051 and
 2.061 ms at 8x24 against 2.018 and 2.025 ms unset, and within 1% of unset at 8x16 and 16x48. (One GPU has no all-reduce for the
