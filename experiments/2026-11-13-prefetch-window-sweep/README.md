@@ -56,8 +56,10 @@ same kernel cache, two boots at each testbed, against the two `own-ref` boots of
 1. **Grid:** the geometric mean faster than the reference beyond the margin (0.30%: two boots against two, 0.15% a boot).
 2. **No band worse:** each band's group of shapes the same or faster within the reference's own spread.
 3. **Outputs:** the temperature-0 gate on both boots gives candidate-54's hashes for the shape.
-4. **Serving, TP4:** in the `screen` suite, single-stream and c16 decode not slower than the recorded candidate-55 screen
-   with the caps, beyond the tool's margin.
+4. **Serving, `tp4-ring`:** in the `screen` suite, single-stream and c16 decode not slower than the recorded candidate-55
+   screen with the caps, beyond the tool's margin. (Narrowed before any result, 2026-11-13 11:35Z: a lab job runs a suite
+   or the gate's workloads on a boot, not both, so the screen's two boots are run at `tp4-ring`, where the targets are
+   set; `tp4-switched` and `tp3-switched` confirm on the grid suite and the gate. Their screens run on the fifth build.)
 
 If mark 1 or 2 fails, the recipe falls back to the bands that individually held, and that is recorded.
 
