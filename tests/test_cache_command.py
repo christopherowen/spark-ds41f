@@ -272,7 +272,7 @@ class ScriptOnDiskTest(unittest.TestCase):
         self.bin = self.root / "bin"
         self.bin.mkdir()
         self.write_command("docker", "#!/bin/sh\nexit 0\n")
-        self.write_command("sudo", f"#!/bin/sh\necho \"$@\" >> '{self.root}/sudo-calls'\nexit 1\n")
+        self.write_command("sudo", f"#!/bin/sh\nprintf '%s\\n' \"$*\" >> '{self.root}/sudo-calls'\nexit 1\n")
         self.cache = self.root / "mount" / "a" / "b"
         for relative in ("v1/linux-aarch64/kernels/k1/kernel.so", "v1/linux-aarch64/kernels/k2/kernel.so",
                          "v1/cuda-binaries/one.bin", ".hidden", "-rf", "name with space"):
