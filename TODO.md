@@ -393,7 +393,11 @@ Don't repeat these without a new reason:
   (`experiments/2026-11-06-verification-budget-hardware`, regressed throughput
   vs `0.030`); minimum-match-8 CopyDrafter policy (dropped at source review);
   C39/C41 CopyDrafter preparation-overlap variations
-  (`experiments/2026-11-04-copy-overlap-rework`).
+  (`experiments/2026-11-04-copy-overlap-rework`); online verification-driven
+  DSpark adaptation, per-position calibration plus W1 and confidence-head
+  updates (`experiments/2026-11-08-online-dspark-adaptation`, #1002: c1 decode
+  −3.8% coding and −5.5% held-out at `tp4-switched`; shorter `0504` budgets and
+  ~0.8 ms a step).
 - **Decode kernels:** 1-launch atomic last-CTA `mHC project_and_finalize_streams`
   for `M <= 16` (`experiments/2026-11-06-mhc-project-finalize`, #946: 12–34%
   slower than 2-launch PDL due to atomic/fence serialization and register

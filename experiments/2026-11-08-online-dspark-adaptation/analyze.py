@@ -97,6 +97,27 @@ def main() -> None:
     row("coding c1 decode tok/s", lambda d: (d["coding"] or {}).get("tps_mean"), 2)
     row("held-out c1 decode tok/s", lambda d: (d["heldout"] or {}).get("tps_mean"), 2)
 
+    def pooled(d, name: str, key: str) -> float | None:
+        rows = [r for r in d["rows"] if r["set"] == name and r["draft_steps"]]
+        steps = sum(r["draft_steps"] for r in rows)
+        if not steps:
+            return None
+        accepted = sum(r["accepted_per_draft"] * r["draft_steps"] for r in rows)
+        verified = sum(r["verified_per_draft"] * r["draft_steps"] for r in rows)
+        decode_s = sum((r["tokens"] - 1) / r["tps"] for r in rows if r["tps"])
+        return {"steps": steps, "verified": verified / steps,
+                "accepted_share": accepted / verified if verified else None,
+                "ms_per_step": 1000 * decode_s / steps}[key]
+
+    print("\n## Draft steps (pooled over requests)\n")
+    print("| | " + " | ".join(args.labels) + " | on mean | off mean | on vs off |")
+    print("| --- | " + " | ".join("---:" for _ in args.labels) + " | ---: | ---: | ---: |")
+    for name, label in (("coding", "coding"), ("heldout", "held-out")):
+        row(f"{label} draft steps", lambda d, n=name: pooled(d, n, "steps"), 0)
+        row(f"{label} verified drafts per step", lambda d, n=name: pooled(d, n, "verified"))
+        row(f"{label} accepted / verified", lambda d, n=name: pooled(d, n, "accepted_share"))
+        row(f"{label} decode ms per step", lambda d, n=name: pooled(d, n, "ms_per_step"))
+
     print("\n## Text, gates and rank state\n")
     print("| Arm | workload text | gate (log-probs) ref / long | gate (text) ref / long | identical | ranks' digests |")
     print("| --- | --- | --- | --- | --- | --- |")
@@ -113,6 +134,29 @@ def main() -> None:
         print(f"| {label} | `{text}` | `{str(det.get('reference_sha256'))[:8]}` / "
               f"`{str(det.get('long_sha256'))[:8]}` | `{str(gre.get('reference_sha256'))[:8]}` / "
               f"`{str(gre.get('long_sha256'))[:8]}` | {identical} | {digest} |")
+
+    def rank0_states(label: str) -> dict:
+        states = {}
+        for record in lines(root / f"digests-{label}.jsonl"):
+            for entry in record.get("lines", []):
+                if entry["rank"] == 0:
+                    states[entry["update"]] = (entry["state"], entry["drift"])
+        return states
+
+    first, second = rank0_states(on), rank0_states(on2)
+    if first and second:
+        shared = sorted(set(first) & set(second))
+        differ = [u for u in shared if first[u] != second[u]]
+        print(f"\n## {on} against {on2} (rank 0's state at each logged update count)\n")
+        if differ:
+            last_equal = max((u for u in shared if u < differ[0]), default=None)
+            print(f"equal through update {last_equal}; first differs at {differ[0]}; "
+                  f"{len(differ)} of {len(shared)} logged counts differ")
+        else:
+            print(f"equal at all {len(shared)} logged update counts")
+        for u in (shared[0], differ[0] if differ else shared[-1], shared[-1]):
+            print(f"- update {u}: {first[u][0]} (max row drift {first[u][1]}) / "
+                  f"{second[u][0]} (max row drift {second[u][1]})")
     if args.json:
         Path(args.json).write_text(json.dumps(
             {label: {k: v for k, v in d.items() if k != "rows"} | {"rows": d["rows"]}

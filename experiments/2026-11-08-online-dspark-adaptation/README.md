@@ -140,4 +140,104 @@ held-out, and c1 decode tok/s, on against off, with both boots of each.
 
 ## Results
 
-Pending: the run is queued on `tp4-switched`.
+Queue entry `20261113T092058-run-tp4-switched.json`, 2026-11-13 10:02–10:38Z, on `tp4-switched` (sp1..sp4), lab
+checkout `19ff11ab2` (main), image `spark-ds41f:candidate-54` with the overlay. Boots in the order on, off, on, off;
+every boot warm (no kernel compiled), ready in 126–130 s in both arms; every extra exited 0. Receipts:
+[receipts/run-tp4-switched/](receipts/run-tp4-switched) (lab table, window log, every arm's workload, gate and
+digest output). The tables below are [analyze.py](analyze.py)'s, also in
+[receipts/run-tp4-switched/analysis.md](receipts/run-tp4-switched/analysis.md), with the per-request numbers in
+[results-tp4-switched.json](results-tp4-switched.json):
+
+```bash
+python3 experiments/2026-11-08-online-dspark-adaptation/analyze.py \
+  experiments/2026-11-08-online-dspark-adaptation/receipts/run-tp4-switched online-dspark-adaptation-tp4-switched \
+  --json experiments/2026-11-08-online-dspark-adaptation/results-tp4-switched.json
+```
+
+**Acceptance length per turn** (coding, pooled over the four conversations; acceptance length = 1 + accepted tokens
+per draft step):
+
+| Turn | adapt-on | adapt-on-again | adapt-off | adapt-off-again | on vs off |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| 1 | 4.403 | 4.403 | 4.540 | 4.540 | −3.01% |
+| 2 | 4.651 | 4.651 | 4.742 | 4.742 | −1.92% |
+| 3 | 5.786 | 5.786 | 5.815 | 5.815 | −0.51% |
+| 4 | 5.746 | 5.746 | 5.704 | 5.704 | +0.75% |
+| 5 | 5.023 | 5.023 | 5.141 | 5.141 | −2.29% |
+| 6 | 6.287 | 6.287 | 6.448 | 6.448 | −2.49% |
+
+**Totals:**
+
+| | adapt-on | adapt-on-again | adapt-off | adapt-off-again | on vs off |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| coding acceptance length | 5.231 | 5.231 | 5.319 | 5.319 | −1.66% |
+| held-out acceptance length | 2.219 | 2.219 | 2.311 | 2.311 | −4.01% |
+| coding c1 decode tok/s | 152.13 | 152.01 | 157.98 | 158.31 | −3.84% |
+| held-out c1 decode tok/s | 80.51 | 80.44 | 85.16 | 85.22 | −5.53% |
+
+Acceptance is the same to the last digit on both boots of an arm (the workload is one request at a time at
+temperature 0, so each boot sees the same traffic in the same order); decode rate moves at most 0.21% between boots
+of an arm, against an on−off gap of 3.8–5.5%.
+
+**Where it goes** (pooled over each set's requests; decode time per step is each request's tokens after the first over
+its decode rate):
+
+| | adapt-on | adapt-on-again | adapt-off | adapt-off-again | on vs off |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| coding draft steps | 1769 | 1769 | 1741 | 1741 | +1.61% |
+| coding verified drafts per step | 5.179 | 5.179 | 5.387 | 5.387 | −3.85% |
+| coding accepted / verified | 0.817 | 0.817 | 0.802 | 0.802 | +1.88% |
+| coding decode ms per step | 35.28 | 35.32 | 34.47 | 34.44 | +2.47% |
+| held-out draft steps | 1819 | 1819 | 1766 | 1766 | +3.00% |
+| held-out verified drafts per step | 2.224 | 2.224 | 2.672 | 2.672 | −16.76% |
+| held-out accepted / verified | 0.548 | 0.548 | 0.491 | 0.491 | +11.65% |
+| held-out decode ms per step | 28.29 | 28.32 | 27.49 | 27.45 | +3.04% |
+
+**Text, gates and rank state:**
+
+| Arm | workload text | gate (log-probs) ref / long | gate (text) ref / long | ranks' digests |
+| --- | --- | --- | --- | --- |
+| adapt-on | `9df935a06bc6` | `18d61961` / `d6568649` | `0a2dacdd` / `12fd8257` | 4 ranks equal at all 46 logged counts (0..11,520) |
+| adapt-on-again | `9df935a06bc6` | `18d61961` / `d6568649` | `0a2dacdd` / `12fd8257` | 4 ranks equal at all 46 logged counts (0..11,520) |
+| adapt-off | `9df935a06bc6` | `18d61961` / `d6568649` | `0a2dacdd` / `12fd8257` | none logged (off) |
+| adapt-off-again | `9df935a06bc6` | `18d61961` / `d6568649` | `0a2dacdd` / `12fd8257` | none logged (off) |
+
+`bin/spark candidate gate` with candidate-54's hashes: **pass** on all eight gate runs (four boots, with and without
+log-probabilities), every scenario `identical` with 0 token and 0 log-probability differences. The gates ran after
+the workload, so on the adapted state. The workload's 40 replies hash the same on all four boots.
+
+**Adapted state between boots.** The two on boots' rank-0 digests are equal through update 4,352, which covers the
+one-request workload (about 3,600 verification steps), and differ from update 4,608 on (28 of 46 logged counts), in
+the gates, which run up to 15 requests at once (`mixed15`). Within a boot all four ranks still agree at every count. The adapted
+state is a function of the order in which concurrent requests share steps, so two servers given the same requests can
+end with different drafters (output stays the same; only acceptance can differ).
+
+**W1 movement.** The largest W1 row displacement, relative to the loaded row's norm, is 0.0049 after the first 256
+updates, 0.0049 at the end of the workload and 0.024 after the gates (11,520 updates), far inside the 1.0 bound.
+
+**Memory.** KV 10.5 GiB in both arms (fixed by the profile); every boot started from 115.6–116.5 GiB `MemAvailable`
+on each node; no memory guard warned. The adapter adds the loaded W1 copy (63 MiB a rank) and its step buffers.
+
+## Conclusion
+
+Unfavourable: **adaptation on is slower than off at c1 on DS4.1**, on the coding conversations it was meant to help
+(−3.8% decode, −1.7% acceptance length) and more on the held-out prompts after them (−5.5%, −4.0%), on both boots
+of each arm. It does not improve with exposure: acceptance is below off on five of six turns, and turn 6 (the most
+adapted) is −2.5%.
+
+- The loss in acceptance comes from verification length, not from worse drafts. With adaptation on, `0504`'s
+  per-row budgets verify fewer drafts per step (−3.9% coding, −16.8% held-out); a larger share of those is accepted
+  (+1.9%, +11.7%), but not enough to make up for the drafts no longer tried. This run changes the calibration and
+  the confidence head together, so it does not say which of the two lowered the budgets. W1 hardly moved (at most
+  2.4% of a row norm, 0.5% during the workload), so the Markov update is an unlikely cause; the confidence path
+  (calibration and head) is what sets the budgets.
+- The adaptation's own work costs about 0.8 ms per step (+2.5% coding, +3.0% held-out step time), although the on arm
+  verifies fewer tokens per step: on every verification step the calibrator and the graded step (support reads, one
+  all-reduce, the W1 and head updates). It was not profiled further.
+- Correctness holds: the four ranks' adapted state is bit-identical within each boot at TP4, the determinism gates
+  equal candidate-54's on every boot of both arms (also after 11,520 updates), and the off arm, with the overlay
+  mounted and the variables unset, gives candidate-54's gate hashes: off, the code changes no output.
+
+Not adopted. The code stays behind its variables (off by default) in this experiment's patch; nothing is added to
+the deployment's patch series. A calibration-only arm (`VLLM_DSPARK_ONLINE_CALIBRATION=1` against off) would say
+whether the per-position calibrator alone shortens `0504`'s budgets; it was not part of this run.
