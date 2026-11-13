@@ -1,0 +1,25 @@
+{
+  "notes": "candidate-55 at tp4-switched with overlay/ (the WO and COMP L2 prefetch windows sized by row band) and VLLM_DS41_L2_PREFETCH_WO_BANDS=17-32=10: 10 MB for forwards of 17 to 32 rows, the recipe's 15 MB elsewhere; unpromoted experiment",
+  "extends": {
+    "config": "experiments/2026-10-26-spark-ds41f-candidate/candidate-55/tp4-switched.json"
+  },
+  "set": {
+    "environment": {
+      "VLLM_DS41_L2_PREFETCH_WO_BANDS": "17-32=10"
+    },
+    "container": {
+      "extra_mounts": [
+        {
+          "source": "{repo}/experiments/2026-11-13-l2-prefetch-row-bands/overlay/vllm/models/deepseek_v4_1/l2_prefetch.py",
+          "target": "/opt/spark-ds41f/candidate/vllm/vllm/models/deepseek_v4_1/l2_prefetch.py",
+          "read_only": true
+        },
+        {
+          "source": "{repo}/experiments/2026-11-13-l2-prefetch-row-bands/overlay/vllm/models/deepseek_v4_1/nvidia/model.py",
+          "target": "/opt/spark-ds41f/candidate/vllm/vllm/models/deepseek_v4_1/nvidia/model.py",
+          "read_only": true
+        }
+      ]
+    }
+  }
+}
