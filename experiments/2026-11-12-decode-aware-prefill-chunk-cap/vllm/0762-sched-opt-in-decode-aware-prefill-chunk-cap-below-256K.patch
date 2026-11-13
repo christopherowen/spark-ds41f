@@ -1,0 +1,207 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: m-naoki-m <194503836+m-naoki-m@users.noreply.github.com>
+Date: Thu, 12 Nov 2026 13:00:00 +0900
+Subject: [PATCH] sched: opt-in decode-aware prefill chunk cap below 256K
+
+SPARK_DS41F_PREFILL_MIX_CHUNK=<n> caps the prefill chunk at n tokens below
+256K context, only while decode requests are runnable and --prefill-yield
+short is on. It extends _context_aware_chunk_threshold, which already steps
+the chunk down at >= 256K (0751), to the context range below it.
+
+Unset (the default), solo prefills and prefills without prefill yield keep
+the full long_prefill_token_threshold, so default scheduling is unchanged.
+The >= 256K tiers (4,096 and 2,048) are unchanged. Only positive multiples
+of the 2,048-token grid are accepted; any other value is ignored with a
+warning. A cap at or above long_prefill_token_threshold changes nothing.
+
+Rationale: on TP4 one 16,288-token chunk step stalls the running decodes
+for 1.9 s at 64K and 2.3 s near 256K. Capping at 8,192 brought the max
+stall to 1.02-1.05 s and 1.26-1.27 s, at the cost of +11-13% TTFT for the
+long prompt that shares the steps with decodes.
+Quality: scheduling-only change; it moves chunk boundaries only when the
+cap is set and decodes are runnable (as 0751 already does at >= 256K).
+Tests: pytest tests/v1/core/test_prefill_mix_chunk.py
+tests/v1/core/test_aligned_prefill_chunks.py tests/v1/core/test_prefill_yield.py
+(69 passed, CPU container on the 1107 image).
+Upstream status: local V1 scheduler policy, opt-in.
+---
+ tests/v1/core/test_prefill_mix_chunk.py | 86 +++++++++++++++++++++++++
+ vllm/v1/core/sched/scheduler.py         | 42 ++++++++++--
+ 2 files changed, 124 insertions(+), 4 deletions(-)
+ create mode 100644 tests/v1/core/test_prefill_mix_chunk.py
+
+diff --git a/tests/v1/core/test_prefill_mix_chunk.py b/tests/v1/core/test_prefill_mix_chunk.py
+new file mode 100644
+index 000000000..684848f2d
+--- /dev/null
++++ b/tests/v1/core/test_prefill_mix_chunk.py
+@@ -0,0 +1,86 @@
++# SPARK_DS41F_PREFILL_MIX_CHUNK caps the prefill chunk below 256K only while decodes
++# are runnable with prefill yield; unset keeps the default chunks exactly.
++from types import SimpleNamespace
++
++import pytest
++
++from vllm.v1.core.sched import scheduler as scheduler_module
++
++Scheduler = scheduler_module.Scheduler
++THRESHOLD = 16288
++
++
++def threshold_at(computed, decodes, *, mix, prefill_yield=True):
++    owner = SimpleNamespace(
++        scheduler_config=SimpleNamespace(long_prefill_token_threshold=THRESHOLD),
++        prefill_yield=prefill_yield,
++    )
++    old = Scheduler._MIX_CHUNK_TIER
++    Scheduler._MIX_CHUNK_TIER = mix
++    try:
++        return Scheduler._context_aware_chunk_threshold(owner, computed, decodes)
++    finally:
++        Scheduler._MIX_CHUNK_TIER = old
++
++
++@pytest.mark.parametrize("computed", [0, 16288, 65536, 262143, 262144, 400000, 524288, 900000])
++@pytest.mark.parametrize("decodes", [0, 3])
++@pytest.mark.parametrize("prefill_yield", [True, False])
++def test_unset_keeps_the_release(computed, decodes, prefill_yield):
++    owner = SimpleNamespace(
++        scheduler_config=SimpleNamespace(long_prefill_token_threshold=THRESHOLD),
++        prefill_yield=prefill_yield,
++    )
++    expected = THRESHOLD
++    if prefill_yield and decodes > 0 and computed >= 262144:
++        expected = 2048 if computed >= 524288 else 4096
++    assert threshold_at(computed, decodes, mix=0, prefill_yield=prefill_yield) == expected
++    assert Scheduler._MIX_CHUNK_TIER == 0
++    assert Scheduler._context_aware_chunk_threshold(owner, computed, decodes) == expected
++
++
++@pytest.mark.parametrize("mix", [8192, 4096])
++def test_mix_caps_below_256k_beside_decodes(mix):
++    for computed in (0, 8192, 65536, 262143):
++        assert threshold_at(computed, 3, mix=mix) == mix
++
++
++@pytest.mark.parametrize("mix", [8192, 4096])
++def test_solo_prefill_and_no_yield_keep_full_chunks(mix):
++    assert threshold_at(65536, 0, mix=mix) == THRESHOLD
++    assert threshold_at(65536, 3, mix=mix, prefill_yield=False) == THRESHOLD
++
++
++@pytest.mark.parametrize("mix", [8192, 4096])
++def test_deep_context_keeps_the_release_tiers(mix):
++    assert threshold_at(262144, 3, mix=mix) == 4096
++    assert threshold_at(524288, 3, mix=mix) == 2048
++
++
++def test_a_cap_at_or_above_the_threshold_changes_nothing():
++    assert threshold_at(65536, 3, mix=16384) == THRESHOLD
++    assert threshold_at(65536, 3, mix=32768) == THRESHOLD
++
++
++@pytest.mark.parametrize("value,expected", [
++    (None, 0), ("", 0), ("8192", 8192), ("4096", 4096), ("2048", 2048),
++    ("1024", 0), ("5000", 0), ("-4096", 0), ("abc", 0),
++])
++def test_the_variable_parser(value, expected):
++    assert scheduler_module._prefill_mix_chunk_tier(value) == expected
++
++
++def test_aligned_chunks_end_on_the_mix_grid():
++    owner = SimpleNamespace(
++        scheduler_config=SimpleNamespace(long_prefill_token_threshold=THRESHOLD),
++        prefill_yield=True,
++    )
++    old = Scheduler._MIX_CHUNK_TIER
++    Scheduler._MIX_CHUNK_TIER = 8192
++    try:
++        assert Scheduler._aligned_prefill_chunk(owner, 0, 69418, 3) == 8192
++        assert Scheduler._aligned_prefill_chunk(owner, 8192, 61226, 3) == 8192
++        assert Scheduler._aligned_prefill_chunk(owner, 65536, 3882, 3) == 3882
++        assert Scheduler._aligned_prefill_chunk(owner, 0, 69418, 0) == THRESHOLD
++    finally:
++        Scheduler._MIX_CHUNK_TIER = old
+diff --git a/vllm/v1/core/sched/scheduler.py b/vllm/v1/core/sched/scheduler.py
+index b61ec528d..08fd499b3 100644
+--- a/vllm/v1/core/sched/scheduler.py
++++ b/vllm/v1/core/sched/scheduler.py
+@@ -2,6 +2,7 @@
+ # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+ import itertools
+ import math
++import os
+ import time
+ from collections import defaultdict, deque
+ from collections.abc import Iterable
+@@ -168,6 +169,11 @@ class Scheduler(SchedulerInterface):
+     _DEEP_CONTEXT_CHUNK_GRID: int = 2048
+     _DEEP_CONTEXT_CHUNK_TIER: int = 4096
+     _ULTRA_DEEP_CONTEXT_CHUNK_TIER: int = 2048
++    # Opt-in: below 256K, with runnable decodes and prefill yield, cap the chunk
++    # at SPARK_DS41F_PREFILL_MIX_CHUNK tokens (a multiple of the 2,048 grid).
++    # Unset or invalid (0) keeps the full long_prefill_token_threshold, and solo
++    # prefills never change.
++    _MIX_CHUNK_TIER: int = 0
+     _PREFILL_DECODE_INTERLEAVE_STEPS: int = 2
+     _PREFILL_DECODE_STALL_THRESHOLD_S: float = 1.0
+     _PREFILL_STEP_FIXED_S: float = 0.1517
+@@ -1015,9 +1021,13 @@ class Scheduler(SchedulerInterface):
+     ) -> int:
+         """Return the prefill chunk threshold at ``num_computed_tokens``.
+ 
+-        Below 256K context (``num_computed_tokens < 262144``) or when no decode
+-        requests are runnable, returns ``long_prefill_token_threshold`` unchanged
+-        so moderate contexts incur zero extra chunk splits. At deep contexts
++        When no decode requests are runnable, returns
++        ``long_prefill_token_threshold`` unchanged. Below 256K context
++        (``num_computed_tokens < 262144``) it is also unchanged, so moderate
++        contexts incur zero extra chunk splits, unless the opt-in
++        ``SPARK_DS41F_PREFILL_MIX_CHUNK`` cap is set: then, with runnable decodes
++        and ``prefill_yield == \"short\"``, the chunk is capped at that value to
++        bound the decode stall of one chunk step. At deep contexts
+         (``>= 256K``) with runnable decodes and ``prefill_yield == \"short\"``,
+         steps down onto the 2,048-token grid (``4,096`` at ``256K..512K``,
+         ``2,048`` at ``>= 512K``) to bound single-step attention stall.
+@@ -1027,9 +1037,11 @@ class Scheduler(SchedulerInterface):
+             threshold <= Scheduler._DEEP_CONTEXT_CHUNK_GRID
+             or not getattr(self, "prefill_yield", False)
+             or num_runnable_decodes <= 0
+-            or num_computed_tokens < Scheduler._DEEP_CONTEXT_THRESHOLD_TOKENS
+         ):
+             return threshold
++        if num_computed_tokens < Scheduler._DEEP_CONTEXT_THRESHOLD_TOKENS:
++            mix = Scheduler._MIX_CHUNK_TIER
++            return min(threshold, mix) if 0 < mix < threshold else threshold
+         if num_computed_tokens >= Scheduler._ULTRA_DEEP_CONTEXT_THRESHOLD_TOKENS:
+             return min(threshold, Scheduler._ULTRA_DEEP_CONTEXT_CHUNK_TIER)
+         return min(threshold, Scheduler._DEEP_CONTEXT_CHUNK_TIER)
+@@ -5277,3 +5289,25 @@ class Scheduler(SchedulerInterface):
+         self.failed_recving_kv_req_ids |= async_failed_req_ids
+         # Return sync affected IDs to skip in update_from_output
+         return sync_failed_req_ids
++
++
++def _prefill_mix_chunk_tier(value: str | None) -> int:
++    """SPARK_DS41F_PREFILL_MIX_CHUNK as a chunk cap: a positive multiple of the
++    2,048 grid, else 0 (the default behaviour)."""
++    try:
++        tier = int(value) if value else 0
++    except ValueError:
++        return 0
++    grid = Scheduler._DEEP_CONTEXT_CHUNK_GRID
++    return tier if tier >= grid and tier % grid == 0 else 0
++
++
++_PREFILL_MIX_CHUNK_ENV = os.environ.get("SPARK_DS41F_PREFILL_MIX_CHUNK")
++Scheduler._MIX_CHUNK_TIER = _prefill_mix_chunk_tier(_PREFILL_MIX_CHUNK_ENV)
++if Scheduler._MIX_CHUNK_TIER:
++    logger.info("prefill chunk capped at %d tokens below 256K while decodes run "
++                "(SPARK_DS41F_PREFILL_MIX_CHUNK)", Scheduler._MIX_CHUNK_TIER)
++elif _PREFILL_MIX_CHUNK_ENV:
++    logger.warning("SPARK_DS41F_PREFILL_MIX_CHUNK=%r ignored: it must be a multiple "
++                   "of %d; prefill chunks keep the default size",
++                   _PREFILL_MIX_CHUNK_ENV, Scheduler._DEEP_CONTEXT_CHUNK_GRID)
+-- 
+2.54.0 (Apple Git-157)
+

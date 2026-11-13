@@ -1,0 +1,187 @@
+{
+ "note": "Measured 2026-11-09 on 4x DGX Spark TP4 (tp4-switched shape, 200GbE RoCE switch, stock 4 KiB pages), spark-ds41f-1107 frozen recipe, official DeepSeek V4.1 Flash-1017 weights, 1M context. 'default' = the 1107 image with the measured scheduler and SPARK_DS41F_PREFILL_MIX_CHUNK unset (the 1107 scheduling); 'cap8192' = the same image with SPARK_DS41F_PREFILL_MIX_CHUNK=8192. Decode stall = the largest inter-token gap of three concurrent ~2K streaming requests while one long prompt prefills.",
+ "arms": {
+  "default": {
+   "L5": {
+    "rounds": [
+     {
+      "long_prompt_tokens": 69418,
+      "long_ttft_s": 9.087,
+      "stream_max_gap_s": 1.894
+     },
+     {
+      "long_prompt_tokens": 69418,
+      "long_ttft_s": 9.079,
+      "stream_max_gap_s": 1.905
+     },
+     {
+      "long_prompt_tokens": 69418,
+      "long_ttft_s": 9.082,
+      "stream_max_gap_s": 1.902
+     }
+    ],
+    "long_ttft_mean_s": 9.083,
+    "max_stall_range_s": [
+     1.894,
+     1.905
+    ]
+   },
+   "L5X": {
+    "rounds": [
+     {
+      "long_prompt_tokens": 277879,
+      "long_ttft_s": 38.333,
+      "stream_max_gap_s": 2.268
+     },
+     {
+      "long_prompt_tokens": 277878,
+      "long_ttft_s": 38.877,
+      "stream_max_gap_s": 2.249
+     }
+    ],
+    "long_ttft_mean_s": 38.605,
+    "max_stall_range_s": [
+     2.249,
+     2.268
+    ]
+   },
+   "C16_output_tps": {
+    "mean": 245.7,
+    "ci95_pct": 1.37,
+    "batches": [
+     245.27,
+     245.33,
+     244.73,
+     251.7,
+     241.9,
+     245.37,
+     248.2,
+     235.8,
+     252.27,
+     246.47
+    ]
+   },
+   "isolated_32k_prefill_tps": {
+    "per_boot_run_mean_of_3": [
+     8438.0,
+     8437.5,
+     8440.3,
+     8421.8,
+     8438.5
+    ],
+    "mean": 8435.2
+   }
+  },
+  "cap8192": {
+   "L5": {
+    "rounds": [
+     {
+      "long_prompt_tokens": 69418,
+      "long_ttft_s": 10.067,
+      "stream_max_gap_s": 1.02
+     },
+     {
+      "long_prompt_tokens": 69418,
+      "long_ttft_s": 10.143,
+      "stream_max_gap_s": 1.043
+     },
+     {
+      "long_prompt_tokens": 69418,
+      "long_ttft_s": 10.131,
+      "stream_max_gap_s": 1.047
+     }
+    ],
+    "long_ttft_mean_s": 10.114,
+    "max_stall_range_s": [
+     1.02,
+     1.047
+    ]
+   },
+   "L5X": {
+    "rounds": [
+     {
+      "long_prompt_tokens": 277878,
+      "long_ttft_s": 43.726,
+      "stream_max_gap_s": 1.266
+     },
+     {
+      "long_prompt_tokens": 277878,
+      "long_ttft_s": 43.823,
+      "stream_max_gap_s": 1.258
+     }
+    ],
+    "long_ttft_mean_s": 43.775,
+    "max_stall_range_s": [
+     1.258,
+     1.266
+    ]
+   },
+   "C16_output_tps": {
+    "mean": 244.7,
+    "ci95_pct": 1.36,
+    "batches": [
+     243.2,
+     241.3,
+     238.97,
+     251.13,
+     245.23,
+     245.47,
+     247.73,
+     237.47,
+     251.37,
+     245.17
+    ]
+   },
+   "isolated_32k_prefill_tps": {
+    "per_boot_run_mean_of_3": [
+     8257.6,
+     8324.6,
+     8442.7,
+     8403.8,
+     8278.9
+    ],
+    "mean": 8341.5
+   }
+  }
+ },
+ "summary": {
+  "max_stall_64k_s": [
+   [
+    1.894,
+    1.905
+   ],
+   [
+    1.02,
+    1.047
+   ]
+  ],
+  "max_stall_256k_s": [
+   [
+    2.249,
+    2.268
+   ],
+   [
+    1.258,
+    1.266
+   ]
+  ],
+  "long_ttft_64k_s": [
+   9.083,
+   10.114,
+   11.4
+  ],
+  "long_ttft_256k_s": [
+   38.605,
+   43.775,
+   13.4
+  ],
+  "isolated_32k_prefill_tps": [
+   8435.2,
+   8341.5
+  ],
+  "C16_output_tps": [
+   245.7,
+   244.7
+  ]
+ }
+}
