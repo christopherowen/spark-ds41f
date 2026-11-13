@@ -16,6 +16,7 @@ against candidate-54's recorded runs, not release-qualified.
 | #982 | sparknet: PDL chaining of the four one-shot collectives (Part A) | sparknet `0003` (re-placed in #989's stage loop); vLLM `0803` (its PDL-chain test entry) |
 | #974 | CUDA 13.5.37 toolchain (nvcc/ptxas, cudart) and cuBLASLt 13.10.0.20 | `sources.cuda_toolkit` in this lock (hash-locked debs) |
 | Kernel cache key (owner, 2026-11-13) | TileLang's kernel cache key names the CUDA device compiler and its version, so a node whose cache an earlier toolkit filled compiles this build's kernels instead of loading the old ones | TileLang `0014` ([tilelang/series](tilelang/series): `spark-ds41f-1107`'s thirteen patches, then `0014`) |
+| Row-band WO window (owner, 2026-11-13: fifth build "with both patches") | `VLLM_DS41_L2_PREFETCH_WO_BANDS` sizes the WO prefetch window, and COMP's, by the forward's row count; unset, nothing changes. No recipe sets it yet | vLLM `0806` ([the experiment](../../2026-11-13-l2-prefetch-row-bands/README.md)) |
 | #738 | GLP's reader takes Spec v3 (`hc_fold_pre_engram`) beside Spec v1; a Spec v3 vector folds the stream mean and projects each covered layer's attention write. A Spec v1 vector (GLP-39) steers as before | vLLM `0805` (rebased on candidate-55, [receipts/glp-rebase](receipts/glp-rebase/README.md)) |
 
 ## Selection
@@ -66,7 +67,10 @@ against candidate-54's recorded runs, not release-qualified.
 - vLLM ([vllm/series](vllm/series)): candidate-54's 672 patches by relative path, then `0800`, `0801` (#1134's files,
   unchanged), `0802` (#1096 rebased, [receipts/b12x-rebase](receipts/b12x-rebase/README.md)), `0803` (#982's test
   entry), `0804` (#1145's file, unchanged) and `0805` (#738 rebased, [receipts/glp-rebase](receipts/glp-rebase/README.md)).
-  678 patches, `patch_head` `d6d4319e`, `expected_tree` `8aaae3df`, `patchset_sha256` `6fdf03dc`.
+  678 patches, `patch_head` `d6d4319e`, `expected_tree` `8aaae3df`, `patchset_sha256` `6fdf03dc`, through the fourth
+  build. The fifth build adds `0806` (the row-band WO window): 679 patches, `patch_head` `1878808a`, `expected_tree`
+  `7d05b12b`, `patchset_sha256` `ece15474`, recorded by `bin/spark build prepare --only vllm --lock` on sp8 for both
+  locks. `7d05b12b` is the tree the row-band experiment measured as an overlay.
 - sparknet ([sparknet/series](sparknet/series)) on `1fd6a1fb`: `0001` (#1134), `0002` (#989), `0003` (#982 Part A,
   [receipts/sparknet-stack](receipts/sparknet-stack/README.md)). `patch_head` `1fdf8dc7`, `expected_tree` `e06f6a06`,
   `patchset_sha256` `60bb1942`.
@@ -171,6 +175,10 @@ kernel's source is candidate-54's, candidate-55 loads the binary an earlier buil
   14 patches, `patchset_sha256` `c0a8825c`), recorded by `bin/spark build prepare --only tilelang --lock` on sp8 for
   both locks, and every profile's `tilelang.tree` label follows. The fourth build's image has the earlier tree, so
   these profiles need the **fifth build**, whose first boot on each node compiles its whole kernel set.
+- **Fifth build** (owner, 2026-11-13: "go", with both patches): TileLang `0014` and vLLM `0806`, built on sp8 from
+  [image-sp8.json](image-sp8.json). `0806` is inert until a recipe sets `VLLM_DS41_L2_PREFETCH_WO_BANDS`; no profile
+  here sets it. The `no974` control shares the vLLM and TileLang series, so its lock and labels follow; its image is
+  not rebuilt and stays the fourth build's record.
 
 ### The collective limit, at `tp4-ring` only
 
