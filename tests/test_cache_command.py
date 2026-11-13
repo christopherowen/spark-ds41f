@@ -193,19 +193,21 @@ class ScriptTest(unittest.TestCase):
     def directory(self, host: str) -> dict:
         return {"name": "tilelang", "variables": ["TILELANG_CACHE_DIR"], "container": "/cache/a/b", "host": host}
 
-    def test_the_clear_script_deletes_only_relative_to_the_directory_it_entered(self) -> None:
+    def test_the_clear_script_deletes_only_below_the_resolved_and_checked_directory(self) -> None:
         script = spark.cache_clear_script(cluster(), self.directory(f"{HOST_JIT}/tilelang"))
         lines = script.splitlines()
         self.assertEqual(lines[:3], ["set -u", f"dir={HOST_JIT}/tilelang", "root=/h/r/cache"])
-        enter = lines.index('cd -- "$dir" || exit 4')
+        guard = next(i for i, line in enumerate(lines) if line.startswith('case "$real" in "$root"/*/*) ;;'))
+        self.assertIn("exit 4", lines[guard])
         deletes = [index for index, line in enumerate(lines) if "-delete" in line]
         self.assertEqual(len(deletes), 2)
         for index in deletes:
-            self.assertGreater(index, enter)
-            self.assertIn("find . -mindepth 1 -delete", lines[index])
+            self.assertGreater(index, guard)
+            self.assertIn('find "$real" -mindepth 1 -delete', lines[index])
         self.assertNotIn("rm ", script)
         self.assertNotIn("$dir/", script)
-        self.assertLess(next(i for i, line in enumerate(lines) if "docker ps" in line), enter)
+        self.assertNotIn("$real/", script)
+        self.assertLess(next(i for i, line in enumerate(lines) if "docker ps" in line), guard)
 
     def test_every_path_is_quoted(self) -> None:
         odd = "/h/r/cache/a/it's $(reboot); b"
@@ -219,8 +221,11 @@ class ScriptTest(unittest.TestCase):
         status = spark.cache_survey_script(cluster(), directories, containers=False)
         plan = spark.cache_survey_script(cluster(), directories, containers=True)
         for script in (status, plan):
-            for word in ("-delete", "rm ", "sudo", "mkdir", "mv ", "tee"):
+            for word in ("-delete", "rm ", "mkdir", "mv ", "tee"):
                 self.assertNotIn(word, script)
+            # sudo only reads, and only a directory the SSH user cannot enter
+            self.assertEqual(script.count("sudo"), 1)
+            self.assertIn("else sudo -n sh -c 'cd -- \"$1\" && find . -type f", script)
         self.assertNotIn("docker", status)
         self.assertIn("docker ps --filter 'name=^c$'", plan)
         self.assertEqual(plan.count("linux-*/kernels"), 1)
@@ -318,7 +323,9 @@ class ScriptOnDiskTest(unittest.TestCase):
         self.assertTrue(self.cache.is_dir())
         self.assertEqual(list(self.cache.iterdir()), [])
         self.assert_untouched()
-        self.assertFalse((self.root / "sudo-calls").exists())
+        # sudo is asked only whether anything remains, never to delete
+        calls = (self.root / "sudo-calls").read_text().splitlines() if (self.root / "sudo-calls").exists() else []
+        self.assertFalse([call for call in calls if "-delete" in call], calls)
 
     def test_an_absent_directory_is_left_absent(self) -> None:
         result = self.clear("/cache/a/none")
@@ -360,13 +367,19 @@ class ScriptOnDiskTest(unittest.TestCase):
         self.addCleanup(lambda: locked.exists() and locked.chmod(0o755))
         refused = self.clear("/cache/a/b")
         self.assertEqual(refused.returncode, 5)
-        self.assertEqual((self.root / "sudo-calls").read_text(), "-n find . -mindepth 1 -delete\n")
+        real = self.cache.resolve()
+        self.assertEqual((self.root / "sudo-calls").read_text().splitlines()[0], f"-n find {real} -mindepth 1 -delete")
         self.assertTrue((locked / "one.bin").exists())
-        self.write_command("sudo", "#!/bin/sh\nshift\nchmod -R u+w .\nexec \"$@\"\n")
+        self.write_command("sudo", f"#!/bin/sh\nshift\nchmod -R u+w '{real}'\nexec \"$@\"\n")
         result = self.clear("/cache/a/b")
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertEqual(list(self.cache.iterdir()), [])
         self.assert_untouched()
+
+    def test_a_directory_closed_to_the_user_is_reported_unreadable_without_sudo(self) -> None:
+        found = spark.parse_cache_survey("cache\t0\tpresent\tunreadable\n", 1)
+        self.assertEqual(found["caches"], [{"present": True, "unreadable": True, "entries": []}])
+        self.assertEqual(spark.cache_text(found["caches"][0]), "present, closed to the SSH user and sudo -n")
 
     def test_the_survey_reports_each_directory_and_tilelangs_entries(self) -> None:
         profile = self.profile(TILELANG_CACHE_DIR="/cache/a/b", TRITON_CACHE_DIR="/cache/a/none",

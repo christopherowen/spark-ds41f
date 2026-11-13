@@ -1329,7 +1329,12 @@ def cache_survey_script(cluster: dict, directories: list[dict], *, containers: b
     """One read-only remote script: each directory's presence, files, bytes and oldest and
     newest file time, TileLang's kernel and binary entries, and (for a clear) the running
     serving containers."""
-    lines = [f"summary() {{ (cd -- \"$1\" && {CACHE_SUMMARY}); }}"]
+    # The container writes the caches as root, and some (nv-compute) are closed to everyone
+    # else: such a directory is read through `sudo -n`, and reported unreadable without it.
+    as_root = shlex.quote(f'cd -- "$1" && {CACHE_SUMMARY}')
+    lines = ["summary() { if [ -r \"$1\" ] && [ -x \"$1\" ]; then "
+             f"(cd -- \"$1\" && {CACHE_SUMMARY}); else "
+             f"sudo -n sh -c {as_root} sh \"$1\" 2>/dev/null || printf unreadable; fi; }}"]
     if containers:
         lines.append(f"names=$({serving_containers_command(cluster)} 2>&1); status=$?")
         lines.append("printf 'containers\\t%s\\t%s\\n' \"$status\" \"$(printf '%s' \"$names\" | tr '\\n' ' ')\"")
@@ -1361,6 +1366,8 @@ def parse_cache_survey(text: str, count: int) -> dict:
                     found["docker_error"] = fields[2].strip() or f"docker ps exited {fields[1]}"
             elif fields[0] == "cache" and fields[2] == "absent":
                 caches[int(fields[1])] = {"present": False, "entries": []}
+            elif fields[0] == "cache" and fields[3:] == ["unreadable"]:
+                caches[int(fields[1])] = {"present": True, "unreadable": True, "entries": []}
             elif fields[0] == "cache":
                 files, size, oldest, newest = (int(value) for value in fields[3:7])
                 caches[int(fields[1])] = {"present": True, "files": files, "bytes": size,
@@ -1406,6 +1413,8 @@ def cache_size_text(size: int) -> str:
 def cache_text(cache: dict) -> str:
     if not cache["present"]:
         return "absent"
+    if cache.get("unreadable"):
+        return "present, closed to the SSH user and sudo -n"
     if not cache["files"]:
         return "present, no files"
     oldest, newest = (time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(cache[key])) for key in ("oldest", "newest"))
@@ -1446,11 +1455,12 @@ def cache_clear_script(cluster: dict, directory: dict) -> str:
     """Empty one cache directory on a node and keep the directory itself: the engine expects
     it, and it may be a mount point.
 
-    The script deletes only relative to the directory it has entered, and only when that
-    directory resolves at least two levels inside the cache mount's own directory, so no
-    empty variable, missing directory or symbolic link can point it anywhere else. It
-    refuses while a serving container runs on the node. The container writes the caches as
-    root, so what the SSH user cannot remove goes through `sudo -n`."""
+    The script deletes only below the directory's resolved path, and only when that path
+    lies at least two levels inside the cache mount's own directory, so no empty variable,
+    missing directory or symbolic link can point it anywhere else. It refuses while a
+    serving container runs on the node. The container writes the caches as root, and
+    closes some to everyone else: what the SSH user cannot enter or remove goes through
+    `sudo -n`."""
     return "\n".join([
         "set -u",
         f"dir={shlex.quote(directory['host'])}",
@@ -1460,14 +1470,18 @@ def cache_clear_script(cluster: dict, directory: dict) -> str:
         "[ -z \"$running\" ] || { echo \"a serving container is running: $running\" >&2; exit 3; }",
         "[ -e \"$dir\" ] || { echo absent; exit 0; }",
         "root=$(cd -- \"$root\" && pwd -P) || exit 4",
-        "cd -- \"$dir\" || exit 4",
-        "case \"$(pwd -P)\" in \"$root\"/*/*) ;; "
-        "*) echo \"$dir resolves to $(pwd -P), not a cache directory of $root\" >&2; exit 4 ;; esac",
-        f"summary=$({CACHE_SUMMARY})",
-        "find . -mindepth 1 -delete 2>/dev/null",
-        "if [ -n \"$(find . -mindepth 1 -print -quit)\" ]; then sudo -n find . -mindepth 1 -delete || "
+        "if [ -r \"$dir\" ] && [ -x \"$dir\" ]; then as_root=; else as_root='sudo -n'; fi",
+        "real=$($as_root sh -c 'cd -- \"$1\" && pwd -P' sh \"$dir\") || "
+        "{ echo \"cannot enter $dir\" >&2; exit 4; }",
+        "case \"$real\" in \"$root\"/*/*) ;; "
+        "*) echo \"$dir resolves to $real, not a cache directory of $root\" >&2; exit 4 ;; esac",
+        f"summary=$($as_root sh -c {shlex.quote(f'cd -- "$1" && {CACHE_SUMMARY}')} sh \"$real\")",
+        "$as_root find \"$real\" -mindepth 1 -delete 2>/dev/null",
+        "if [ -n \"$($as_root find \"$real\" -mindepth 1 -print -quit 2>/dev/null)\" ]; then "
+        "sudo -n find \"$real\" -mindepth 1 -delete || "
         "{ echo 'sudo -n could not remove the files the SSH user cannot' >&2; exit 5; }; fi",
-        "[ -z \"$(find . -mindepth 1 -print -quit)\" ] || { echo 'files remain' >&2; exit 5; }",
+        "[ -z \"$(sudo -n find \"$real\" -mindepth 1 -print -quit 2>/dev/null || "
+        "find \"$real\" -mindepth 1 -print -quit)\" ] || { echo 'files remain' >&2; exit 5; }",
         "printf 'removed\\t%s\\n' \"$summary\"",
     ]) + "\n"
 
