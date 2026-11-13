@@ -78,6 +78,50 @@ bin/spark candidate queue tp4-ring experiments/2026-11-13-kernel-cache-toolchain
 bin/spark candidate gate tp4-switched kernel-cache-toolchain-gate-tp4-switched --expect 18d61961/d6568649
 ```
 
-## Results
+## Results: the same outputs, the same speed at tp4-switched, 0.7% slower on the grid at tp4-ring
 
-Not run yet.
+Jobs at `tp4-switched` 2026-11-13 08:52Z to 09:41Z and at `tp4-ring` 08:50Z to 09:51Z, deployment `85822940`
+([receipts](../2026-10-26-spark-ds41f-candidate/candidate-55/receipts/kernel-cache)). All 12 boots reached ready and
+no memory guard fired.
+
+**1. Outputs are candidate-54's.** On kernels candidate-55 compiled itself, every gate run is identical on both
+boots at both testbeds, with hashes 18d61961/d6568649 (text 0a2dacdd/12fd8257). #974's compiler changes no
+temperature-0 output at TP4; until now that had been shown only for its runtime libraries.
+
+| Testbed | Boots | Runs identical | c16 / c8 / c4 distinct streams, tok/s |
+| --- | --- | --- | --- |
+| `tp4-switched` | 2 | 8 of 8 | 269.93, 269.46 / 199.23, 199.08 / 154.87, 155.38 |
+| `tp4-ring` | 2 | 8 of 8 | 271.31, 272.50 / 202.20, 203.28 / 156.56, 155.00 |
+
+**2. Speed, the engine grid against `candidate-55` on the usual cache** (the mean of both boots of each; negative is
+faster):
+
+| Testbed | 1x2 | 1x3 | 1x3, long contexts | 6 to 16 rows | 24 rows | 32 rows and more | Grid (the tool) |
+| --- | --- | --- | --- | --- | --- | --- | --- |
+| `tp4-switched` | -0.2% | +0.9% | +0.4% | +0.2% | -0.7% | -0.1% | -0.02%, margin 0.33%: the same |
+| `tp4-ring` | +1.0% | +1.5% | +0.9% | +0.5% | -0.1% | +0.6% | **+0.68%, margin 0.34%: worse** |
+
+- **At `tp4-ring` candidate-55's own kernels are slower** on the grid: 1.0% to 1.5% at 1x2 and 1x3 and 1.1% at 48
+  rows. Against candidate-54's recorded screen, candidate-55 with the recipe was 1.55% faster on the old kernels, so
+  it stays ahead on its own, by about 0.9% (cross-session).
+- **The 24- and 32-row shapes do not move** with the compiler (-0.1% and +0.6% at `tp4-ring`).
+- **With the default windows the same change was a gain** (5.9% and 10.8% at 1x2 and 1x3, the accidental arms at
+  `tp4-switched`); with the caps that is gone. The compiler's effect depends on the prefetch windows, like every
+  other change to the forward's timing.
+- c16, c1 and prefill were not measured on the candidate's own kernels: the screens and c1 checks are the fifth
+  build's to take.
+
+**3. Boot.** The first boot on the empty cache at `tp4-ring` was ready in 1,086 s and wrote 4,149 cache files a
+node; the boots after it took 114 to 121 s, as on the usual cache (116 s).
+
+## The patch, end to end on one GPU
+
+sp8, the candidate-55 image on a copy of the cache candidate-54's image filled (524 kernels), dummy weights:
+
+| Boot | Kernel entries before | After | Wall |
+| --- | --- | --- | --- |
+| As built | 524 | 524 | 91 s: it loads candidate-54's kernels |
+| With the patched `kernel_cache.py` mounted | 524 | 1,021 | 1,015 s: it compiles its own |
+| The same again | 1,021 | 1,021 | 92 s: it reuses them |
+
+([run6.sh](../2026-10-26-spark-ds41f-candidate/candidate-55/receipts/kernel-cache/sp8/run6.sh) and its log.)

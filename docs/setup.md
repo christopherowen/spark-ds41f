@@ -647,6 +647,20 @@ profile the engine was started from (the plan names it). It stops the exact
 containers and their memory guards and keeps the containers for inspection. It
 refuses a profile that covers only some of the running engine's nodes.
 
+The JIT caches outlive the image that filled them. Inspect them on every node,
+and empty them once the engine is stopped:
+
+```sh
+bin/spark --cluster-config <profile> cache status
+bin/spark --cluster-config <profile> cache clear --apply
+```
+
+`cache clear` acts on the directories the profile's environment names under the
+`/cache` mount and keeps the directories themselves. It refuses unless every
+node of the profile can be reached and none runs a serving container. Without
+`--apply` it prints the plan; `--only tilelang` (or `nv-compute`, `triton`,
+`vllm`) clears one cache. The next start compiles the kernels again.
+
 ## 8. Verify
 
 From the head node, against the running, otherwise idle service:
