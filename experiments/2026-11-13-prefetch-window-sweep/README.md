@@ -67,6 +67,16 @@ Added 2026-11-13 12:52Z, before `tp4-switched`'s confirmation ran: its sweep pic
 because its two reference boots happen to agree to 0.13% there. That band is kept only if its shapes (12x72, 16x96) are
 faster than both reference boots on both confirmation boots; otherwise the recipe is `17-32=10` alone, as at `tp4-ring`.
 
+### Added after the ring's confirmation screen (2026-11-13 12:55Z)
+
+- The `screen` suite has no single-stream step, so mark 4's single-stream half runs as its own job:
+  [confirm-c1-tp4.json](confirm-c1-tp4.json), two boots of the composed recipe with candidate-55's c1 workload
+  (`c1-decisions-caps-tp4.json`), against its recorded 86.07 to 86.33 tok/s over four boots.
+- The composed recipe's screen has 256K prefill 1.13% slower than candidate-54's recorded screen (8,761 and 8,748
+  tok/s), where candidate-55 with the caps on the earlier kernels had 8,854 and 8,847. The row band cannot act on a
+  prefill forward, so [screen-own-kernels-tp4.json](screen-own-kernels-tp4.json) runs the same screen on the own
+  kernels without the overlay, two boots, to say whether the kernels are the cause.
+
 ## Commands
 
 ```bash
