@@ -181,6 +181,39 @@ index date (the `Date` of the repository's `InRelease`) in the header. `apt-get 
 --print-uris` prints the same URLs and sizes with SHA-512. A new toolkit version also
 needs its own Dockerfile stages and `CUDA_TOOLKIT_STAGES` entry.
 
+## Torch
+
+The base image's torch (2.13.0+cu130) stays unless a lock lists `sources.torch` beside its
+CUDA toolkit; a lock without it builds exactly as before, with no torch stage and no
+`torch-wheels` context.
+
+```json
+"torch": {
+  "kind": "wheel",
+  "upstream": "https://download.pytorch.org/whl/nightly/cu135",
+  "version": "2.16.0.dev20261113+cu135",
+  "lockfile": "requirements/torch-2-16-cu135-aarch64.txt",
+  "role": "torch compiled for the lock's CUDA 13.5 toolkit"
+}
+```
+
+- `requirements/torch-2-16-cu135-aarch64.txt` lists every wheel the stage installs, one
+  `filename size sha256:<hex> url` line each: torch, the 16 packages pip resolves for it,
+  and torchvision, torchaudio, torchcodec and triton. `bin/spark build prepare` (or
+  `--only torch`) downloads each from its URL and verifies it.
+- `version` must be one the Dockerfile has stages for (`TORCH_STAGES` in
+  `spark_ds41f/build.py`), and the lock's `cuda_toolkit` must be the toolkit that torch was
+  compiled for.
+- `cuda-13-5-torch-2-16` installs the set over the CUDA 13.5 stage with no index and no
+  dependency resolution, and becomes `CUDA_STAGE`: vLLM's extensions, NCCL, TileLang and
+  sparknet are all built against this torch.
+- torch binds NCCL's symbols when `libtorch_cuda.so` loads, so the lock's NCCL must be the
+  release torch was compiled against (2.32.3 here). The build passes the tag's
+  `NCCL_VERSION_CODE`, and `runtime-core-cuda-13-5-torch-2-16` checks that torch reports
+  that release, loads the patched library and no other, and that torchvision runs.
+- The image carries `local.spark-ds41f.torch.version`, which `build image` compares with
+  the lock.
+
 ## Locks without B12X
 
 `runtime-core` holds everything but B12X (the vLLM tree and its two rebuilt

@@ -2,7 +2,10 @@
 
 from __future__ import annotations
 
+import contextlib
 import copy
+import hashlib
+import io
 import json
 import sys
 import tempfile
@@ -424,12 +427,140 @@ class CudaToolkitTest(unittest.TestCase):
         self.assertTrue(stages["runtime"].startswith("${RUNTIME_CORE_STAGE} AS runtime"))
         self.assertEqual([name for name, code in stages.items() if "cuda-toolkit-debs" in code], ["cuda-13-5"])
         self.assertEqual([name for name, code in stages.items() if "spark-wire-cuda-13-5" in code],
-                         ["cuda-13-5", "runtime-core-cuda-13-5"])
+                         ["cuda-13-5", "cuda-13-5-torch-2-16", "runtime-core-cuda-13-5"])
         self.assertEqual([name for name, code in stages.items() if "13.5" in code],
-                         ["cuda-13-5", "runtime-core-cuda-13-5"])
+                         ["cuda-13-5", "runtime-core-cuda-13-5", "runtime-core-cuda-13-5-torch-2-16"])
         self.assertNotIn("apt-get", stages["cuda-13-5"])
         self.assertIn("dpkg -i /tmp/cuda-toolkit-debs/*.deb", stages["cuda-13-5"])
         self.assertIn('LABEL local.spark-ds41f.cuda.version="13.5.37"', stages["runtime-core-cuda-13-5"])
+
+    def test_only_the_torch_stages_install_or_label_it(self) -> None:
+        text = (ROOT / "docker/Dockerfile").read_text()
+        stages = {}
+        for block in text.split("\nFROM ")[1:]:
+            header = block.splitlines()[0]
+            code = "\n".join(line for line in block.splitlines() if not line.lstrip().startswith("#"))
+            stages[header.split(" AS ")[-1] if " AS " in header else "final"] = code
+        for version, (toolkit, install, check) in spark.TORCH_STAGES.items():
+            self.assertTrue(stages[install].startswith(f"{spark.CUDA_TOOLKIT_STAGES[toolkit][0]} AS {install}"))
+            self.assertTrue(stages[check].startswith(f"{spark.CUDA_TOOLKIT_STAGES[toolkit][1]} AS {check}"))
+            self.assertIn("pip install --no-cache-dir --no-index --no-deps --force-reinstall", stages[install])
+            self.assertIn(f'LABEL local.spark-ds41f.torch.version="{version}"', stages[check])
+        self.assertEqual([name for name, code in stages.items() if "torch-wheels" in code],
+                         [install for _, install, _ in spark.TORCH_STAGES.values()])
+        self.assertEqual([name for name, code in stages.items() if "torch.version" in code],
+                         [check for _, _, check in spark.TORCH_STAGES.values()])
+        # The NCCL release is the lock's: the base image's unless the build passes another.
+        self.assertIn("\nARG NCCL_VERSION_CODE=23007\n", stages["runtime-core"])
+        self.assertEqual(spark.nccl_version_code({"nccl": {"tracking_ref": "refs/tags/v2.30.7-1"}}), 23007)
+        self.assertEqual(spark.nccl_version_code({"nccl": {"tracking_ref": "refs/tags/v2.32.3-1"}}), 23203)
+        self.assertEqual(spark.nccl_version_code({"nccl": {"tracking_ref": "refs/heads/main"}}), 23007)
+
+
+TORCH_SOURCE = {
+    "kind": "wheel",
+    "upstream": "https://download.pytorch.org/whl/nightly/cu135",
+    "version": "2.16.0.dev20261113+cu135",
+    "lockfile": "requirements/torch-2-16-cu135-aarch64.txt",
+    "role": "torch compiled for the lock's CUDA 13.5 toolkit",
+}
+
+
+class TorchWheelsTest(unittest.TestCase):
+    """A lock that lists sources.torch beside its CUDA toolkit installs that torch from
+    hash-verified wheels in the toolkit's stage; every other lock builds as before."""
+
+    def with_torch(self, lock: dict, toolkit: bool = True, **changes) -> dict:
+        lock = copy.deepcopy(lock)
+        if toolkit:
+            lock["sources"]["cuda_toolkit"] = dict(CUDA_TOOLKIT_SOURCE)
+        lock["sources"]["torch"] = {**TORCH_SOURCE, **changes}
+        return lock
+
+    def test_inputs_stages_and_context_follow_the_lock(self) -> None:
+        lock = spark.read_json("upstreams.lock.json")
+        del lock["sources"]["b12x"]
+        toolkit_only = self.with_torch(lock)
+        del toolkit_only["sources"]["torch"]
+        plain = spark.build_inputs(toolkit_only)
+        inputs = spark.build_inputs(self.with_torch(lock))
+        self.assertEqual({k: v for k, v in inputs.items() if k != "torch"}, plain)
+        self.assertNotEqual(spark.build_directory(inputs).name, spark.build_directory(plain).name)
+        self.assertEqual(spark.cuda_stages(inputs), ("cuda-13-5-torch-2-16", "runtime-core-cuda-13-5-torch-2-16"))
+        self.assertEqual(spark.tilelang_base_stage(inputs), "runtime-core-cuda-13-5-torch-2-16")
+        self.assertEqual(spark.build_contexts(inputs), (*spark.build_contexts(plain), "torch-wheels"))
+        wheels = inputs["torch"]["wheels"]
+        self.assertEqual(len(wheels), 22)
+        torch = wheels["torch-2.16.0.dev20261113+cu135-cp312-cp312-manylinux_2_28_aarch64.whl"]
+        self.assertEqual(torch["size"], 590730494)
+        self.assertTrue(torch["url"].startswith("https://download.pytorch.org/whl/nightly/cu135/torch-2.16.0"))
+        self.assertIn("nvidia_nccl_cu13-2.32.3-py3-none-manylinux_2_27_aarch64.whl", wheels)
+
+    def test_candidate_55_lists_it_with_the_nccl_release_it_needs(self) -> None:
+        lock = spark.read_json("experiments/2026-10-26-spark-ds41f-candidate/candidate-55/upstreams.lock.json")
+        self.assertEqual(spark.torch_problems(lock["sources"]), [])
+        inputs = spark.build_inputs(lock)
+        self.assertEqual(inputs["torch"]["version"], "2.16.0.dev20261113+cu135")
+        self.assertEqual(spark.nccl_version_code(inputs), 23203)
+        for released in ("upstreams.lock.json",
+                         "experiments/2026-10-26-spark-ds41f-candidate/candidate-54/upstreams.lock.json"):
+            self.assertNotIn("torch", spark.build_inputs(spark.read_json(released)))
+
+    def test_malformed_torch_sources_and_lockfiles_are_refused(self) -> None:
+        lock = spark.read_json("upstreams.lock.json")
+        self.assertEqual(spark.torch_problems(lock["sources"]), [])
+        self.assertEqual(spark.torch_problems(self.with_torch(lock)["sources"]), [])
+        self.assertEqual(spark.torch_problems(self.with_torch(lock, toolkit=False)["sources"]),
+                         ["torch: 2.16.0.dev20261113+cu135 is compiled for CUDA 13.5.37, "
+                          "but the lock's cuda_toolkit is None"])
+        for changes, problem in (
+            ({"kind": "deb"}, "torch: kind must be wheel"),
+            ({"upstream": "http://download.pytorch.org"}, "torch: upstream must be the https:// index"),
+            ({"version": "2.13.0+cu130"}, "torch: no Dockerfile stage installs torch '2.13.0+cu130'"),
+            ({"lockfile": "requirements/absent.txt"}, "torch: missing wheel lock requirements/absent.txt"),
+        ):
+            with self.subTest(changes=changes):
+                problems = spark.torch_problems(self.with_torch(lock, **changes)["sources"])
+                self.assertTrue(any(found.startswith(problem) for found in problems), problems)
+        good = (ROOT / TORCH_SOURCE["lockfile"]).read_text(encoding="utf-8")
+        first = next(line for line in good.splitlines() if line and not line.startswith("#"))
+        for text, problem in (
+            ("# nothing\n", "it lists no wheel"),
+            (first.replace("sha256:", "sha1:") + "\n", "line 1 is not"),
+            (first + "\n" + first + "\n", "is listed twice"),
+            ("\n".join(line for line in good.splitlines() if not line.startswith("torch-")) + "\n",
+             "must list torch at 2.16.0.dev20261113+cu135"),
+        ):
+            with self.subTest(problem=problem), tempfile.TemporaryDirectory(dir=ROOT / "requirements") as directory:
+                path = Path(directory) / "torch.txt"
+                path.write_text(text, encoding="utf-8")
+                relative = str(path.relative_to(ROOT))
+                problems = spark.torch_problems(self.with_torch(lock, lockfile=relative)["sources"])
+                self.assertTrue(any(problem in found for found in problems), problems)
+
+    def test_prepare_keeps_verified_wheels_and_refuses_a_changed_one(self) -> None:
+        payload = b"wheel"
+        record = {"size": len(payload), "sha256": hashlib.sha256(payload).hexdigest(), "url": "https://w.invalid/a.whl"}
+        inputs = {"torch": {"version": "2.16.0.dev20261113+cu135", "wheels": {"a-1-py3-none-any.whl": record}}}
+        with tempfile.TemporaryDirectory() as temporary:
+            directory = Path(temporary)
+
+            def fetch(url, destination, wheel, **kwargs):
+                self.assertEqual((url, kwargs), (record["url"], {"context": "torch-wheels"}))
+                destination.write_bytes(payload)
+
+            with mock.patch.object(spark, "download_cuda_deb", side_effect=fetch) as download, \
+                    contextlib.redirect_stdout(io.StringIO()):
+                spark.prepare_torch(directory, inputs)
+                spark.prepare_torch(directory, inputs)
+            self.assertEqual(download.call_count, 1)
+            context = directory / "context/torch-wheels"
+            self.assertEqual(spark.torch_wheel_problems(context, inputs), [])
+            (context / "a-1-py3-none-any.whl").write_bytes(b"other")
+            (context / "b-1-py3-none-any.whl").write_bytes(b"extra")
+            self.assertEqual(spark.torch_wheel_problems(context, inputs),
+                             ["torch-wheels: a-1-py3-none-any.whl differs from the lock size or hash",
+                              "torch-wheels: unlocked file b-1-py3-none-any.whl"])
 
 
 class BuildResourcePolicyTest(unittest.TestCase):
