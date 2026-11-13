@@ -27,10 +27,15 @@ finds which change causes it and what removes it.
 4. **With the caps, candidate-55 is faster than candidate-54 with the same caps** by 1.7% on the grid: 3% to 4% at
    1x2 and 1x3, 3% at 6 to 16 rows, 0.7% at 32 rows and more. At 24 rows it is 0.8% slower, at the edge of the
    interval.
-5. **Not causes:** #989 (`no989` is 0.65% slower than candidate-55), the RoCE proxy and thread pinning
-   (`noaffinity`, +0.42%) and the stream priorities (`streamprio`, +0.34%) are all within or beyond the repeat boot
-   (+0.26%) in the wrong direction. Hypotheses 2 and 3 below, as written for 24 rows and more, are not supported:
-   the moved trigger and the priorities leave those rows unchanged.
+5. **Not causes:** the unpinned RoCE proxy (`no989`, 0.65% slower than candidate-55) and the stream priorities
+   (`streamprio`, +0.34%) are within or beyond the repeat boot (+0.26%) in the wrong direction. Hypotheses 2 and 3
+   below, as written for 24 rows and more, are not supported: the moved trigger and the priorities leave those rows
+   unchanged.
+   - **Corrected 2026-11-13:** two arms did not isolate what their names say. `no989` sets
+     `SPARKNET_ROCE_PROXY_CPU=none`, which unpins the proxy (sparknet `0001`, #1134); #989's kernels stay.
+     `noaffinity` sets `VLLM_SPARK_THREAD_AFFINITY=0`, which the image does not read (the core partition's switch is
+     `VLLM_ROCE_CPU_AFFINITY`), so it is a third boot of candidate-55 (+0.42%). #989's kernels and #1134's core
+     partition are isolated in [rows24-attribution](../rows24-attribution/README.md).
 
 6. **`tp4-ring` agrees.** There the caps make candidate-55's grid 2.51% faster (margin 0.34%, two boots each): 1x2
    rows 16.2 to 13.5 ms and 1x3 rows 14.8 to 14.0 ms, against candidate-54's recorded 14.5 ms for both.
@@ -55,7 +60,8 @@ not taken: it gains nothing measurable once the windows are capped.
 3. **24 rows and more, equal-priority stream inversion under CUDA 13.5 (`streamprio`):** the L2 side stream at
    priority -2, the main stream at -1, the aux stream at 0. **Not supported:** no shape changes.
 4. **Combined (`all3`):** the caps, the moved trigger and the priorities. The same as the caps alone.
-5. **Controls (`no989`, `noaffinity`, repeat boots):** no effect, as above.
+5. **Controls (`no989`, `noaffinity`, repeat boots):** no effect, and two of them not the controls intended; see
+   the correction above.
 
 ## Arms
 
@@ -69,8 +75,8 @@ kernels compile into their own `TILELANG_CACHE_DIR`.
 | `no982` | [no982/overlay](no982/overlay): the four collectives without `0003`'s `pdl_sync` and `pdl_trigger` |
 | `streamprio` | [streamprio/overlay](streamprio/overlay): stream priorities in `gpu_worker.py` and `l2_prefetch.py` |
 | `all3` | [all3/overlay](all3/overlay): `l2cap`, `pdlpostwait` and `streamprio` together |
-| `no989` | `SPARKNET_ROCE_PROXY_CPU=none` |
-| `noaffinity` | `VLLM_SPARK_THREAD_AFFINITY=0` |
+| `no989` | `SPARKNET_ROCE_PROXY_CPU=none`: the RoCE proxy unpinned, not #989's kernels |
+| `noaffinity` | `VLLM_SPARK_THREAD_AFFINITY=0`: read by nothing in the image, so candidate-55 unchanged |
 | `l2cap-pdlpostwait` (confirmation) | `l2cap` and `pdlpostwait` together |
 | `candidate-54-l2cap` (confirmation) | candidate-54 with the same caps: do the caps act on candidate-55's changes or on any build? |
 
