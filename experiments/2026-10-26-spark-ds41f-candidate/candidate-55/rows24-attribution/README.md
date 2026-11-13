@@ -10,6 +10,12 @@ with the 15/12/12 MB windows it is 1.5% to 1.9% slower. With the WO window at 10
 by row band is the fix; at one size for every row count, 10 MB costs 1.9% at 1x2 and the grid comes out the same, so
 the recipe is unchanged.
 
+**Added 2026-11-13, from the overlay arms run again with their files mounted:** the change that moved these rows is
+#982 (the collectives' programmatic-dependent-launch trigger ahead of the wait). Without it the 24- and 32-row shapes
+are 1.8% to 3.1% faster, and 1 to 16 rows are 1.1% to 4.5% slower, so the grid is 0.7% slower: #982 stays, and the row-band
+window recovers the 24- and 32-row shapes beside it
+([the row-band experiment](../../../2026-11-13-l2-prefetch-row-bands/README.md)). #1134's loader changes nothing on the grid.
+
 **Corrected 2026-11-13: the three overlay arms mounted nothing.** `candidate-55-no1134-loader`,
 `candidate-55-no989-no982` and `candidate-55-no982` named their files under `container.extra_mounts`, which no command
 reads, so they booted the image unchanged. #1134's loader, #989 and #982 are therefore **not** ruled out by the
@@ -222,6 +228,40 @@ at 16x32, where with the windows on it is 4.6% and 4.2% slower. At 16x48 and 12x
 with the prefetch off: a second, smaller loss in the kernels' own time at wide rows, which `tp4-ring` shows at
 72 and 96 rows (0.9% and 0.7%, in the table above). That one is not attributed.
 
+## The overlay arms, mounted (2026-11-13 10:13Z to 10:45Z)
+
+Job `20261113T085031-attribute-rows24-overlays-r2-tp4.json`, run `candidate-55-attribute-rows24-overlays-r2-tp4`,
+deployment `c3f202a30`; four arms, two boots each, all eight ready and no memory guard fired. The live container of the
+first `candidate-55-no982` boot was inspected on dgx1 and mounts the four sparknet files of the overlay.
+
+Step time against `candidate-55` in the same job, the mean of both boots of each (negative is faster; `candidate-55`'s own
+two boots differ by up to 1.9% at one shape, 1x2):
+
+| Arm | 1x2 | 1x3 @4K | 1x3 @64K to @1016K | 6 to 16 rows | 24 rows | 16x32 | 48 to 96 rows | Grid (the tool, each boot) |
+| --- | --- | --- | --- | --- | --- | --- | --- | --- |
+| `candidate-55-no982` | +3.1% | +4.5% | +3.5% | +2.0% | **-2.6%** | **-2.5%** | -0.7% to +0.9% | +0.71%, +0.73%: worse |
+| `candidate-55-no989-no982` | +4.7% | +3.9% | +3.6% | +2.3% | **-2.1%** | **-2.5%** | -0.8% to +0.1% | +0.98%, +0.65%: worse |
+| `candidate-55-no1134-loader` | +0.7% | +0.4% | +0.6% | -0.4% | +0.1% | -0.0% | -0.6% to +0.1% | +0.02%, -0.35% |
+
+The four 24-row shapes without #982: 4x24 -1.8%, 8x24 -2.4%, 8x24 at 64K -2.9%, 8x24 at 256K -3.1%.
+
+- **#982 is the change that moved the 24- and 32-row shapes.** Without it the target's forward is 0.42 to 0.65 ms
+  faster at those shapes, and 0.19 to 0.65 ms slower at every shape of 1 to 16 rows; the drafter moves by at most
+  0.06 ms. Against candidate-54 with the same caps candidate-55 was 1.5% to 1.9% and 1.3% slower there, so removing
+  #982 more than returns them.
+- **#982 stays.** It is worth 1.1% to 4.5% a step at 1 to 16 rows, the rows a single stream and small batches use, and
+  the grid is 0.7% slower without it, beyond the margin on both boots.
+- **It is the same loss the WO window showed.** Either a 10 MB WO window or the wait ahead of the trigger takes about
+  2.5% off these shapes; the row-band window does it and keeps #982's gain below 17 rows. No arm ran both, so whether
+  they add is not measured.
+- **#989 is not told apart from #982** on the grid: the arm without both differs from the arm without #982 by less
+  than `candidate-55`'s own boots do.
+- **The compiler of the collective kernels is not the variable.** The `no982` arm's kernels were compiled on its
+  first boot (35 files a node, by CUDA 13.5); the `no989-no982` arm compiled none, because its sources are
+  candidate-54's and their kernels were in the cache. Both show the same pattern.
+- **#1134's loader changes nothing on the grid**, and its arm reached ready in 115.4 s and 115.5 s against
+  `candidate-55`'s 116.6 s and 112.0 s. This replaces the void arm of the first overlays job.
+
 ## Why the WO window, and why these rows
 
 - **Where it fills.** WO is issued after the query up-projection and fills while the sparse-MLA preparation kernels
@@ -230,8 +270,9 @@ with the prefetch off: a second, smaller loss in the kernels' own time at wide r
 - **Why 24 and 32 rows.** Decode tiles come in heights 16, 32 and wider (`DECODE_TILE_ROWS` in `tilelang/gemm.py`,
   `_WO_A_TILES` in `tilelang/wo.py`), so 24 and 32 rows are both the 32-row tier: one band, 17 to 32 rows. 20 and 28
   rows are not in the grid and were not measured.
-- **Why candidate-55.** Not established by an arm: no single change moves these rows. Its forward is faster at every
-  band below 24 rows, so each window has less time before its consumer.
+- **Why candidate-55.** #982: with the trigger ahead of the wait the forward is faster at every band below 24 rows
+  and slower in this one (the overlay arms above), so each window has less time before its consumer. That the window's
+  fill is what the earlier launch runs into is the reading of the two results together, not a measurement of its own.
 
 ## Where this leaves it
 
@@ -241,5 +282,7 @@ with the prefetch off: a second, smaller loss in the kernels' own time at wide r
   rows a single stream uses, and the grid is the same. candidate-55's TP4 recipe stays at 15/12/12 MB.
 - **The fix is a window sized by row band.** The prefetcher's `issue()` already receives the row count and each
   captured graph bakes the plan its row count selects, so a WO budget for 17 to 32 rows is a Python change with no
-  kernel to compile. It is a change of its own, for a later candidate, with its own measurement.
+  kernel to compile. It is a change of its own, for a later candidate, with its own measurement. Measured since: at both TP4
+  testbeds the 24-row shapes are 2.2% to 2.7% faster and 16x32 1.7% to 2.1%, nothing else moves, and the grid is 0.45% and
+  0.52% faster ([results](../../../2026-11-13-l2-prefetch-row-bands/README.md#results)).
 - **Still open:** the 0.7% to 0.9% at 72 and 96 rows with the prefetch off, and the 4 s of startup.
