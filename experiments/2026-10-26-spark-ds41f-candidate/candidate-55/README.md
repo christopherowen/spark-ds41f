@@ -137,7 +137,8 @@ The code defaults are 20/16/20 MB. TP5 to TP8 are not measured and keep the defa
 - **Why:** the grid regression at TP4 is in the 1-request rows: 1x2 rows are 9% slower than candidate-54 and 1x3
   rows 8% slower at `tp4-switched`, while the prefetch windows are at their defaults
   ([grid-attribution](grid-attribution/README.md)). **Corrected 2026-11-13:** this read "#982's `T.pdl_trigger()`
-  before `roce_wait_peers` causes it". The arms behind that mounted nothing; no run tests #982's trigger.
+  before `roce_wait_peers` causes it". The arms behind that mounted nothing. Run with its files mounted at `tp4-ring`
+  ([rows24-attribution](rows24-attribution/README.md)), #982 is a gain of 3.1% at 1x2 and 2.8% to 4.5% at 1x3 under the caps, not the cause.
 - **Measured** at `tp4-switched` on the fourth build, the grid step alone, two boots an arm in one session: the caps
   make the grid 4.66% faster than candidate-55 as built (1x2 rows 18%, 1x3 rows 13%), and 1.7% faster than
   candidate-54 with the same caps. sparknet `0003` is unchanged. **Corrected 2026-11-13:** the arm read here as
@@ -229,6 +230,10 @@ reached ready, and every mark is met.
   prefetch off candidate-55 is faster than candidate-54 at those shapes, and a 10 MB WO window makes them 2.6% faster
   at the cost of 1.9% at 1x2, so the recipe is unchanged; a WO window sized by row band is the fix, for a later
   candidate.
+  The change that moved those shapes is #982: without it they are 1.8% to 3.1% faster and 1 to 16 rows 1.1% to 4.5%
+  slower, the grid 0.7% slower, so #982 stays. The row-band window, measured as an overlay at both TP4 testbeds, makes the
+  24-row shapes 2.2% to 2.7% faster and 16x32 1.7% to 2.1% with nothing else moved
+  ([the experiment](../../2026-11-13-l2-prefetch-row-bands/README.md)); its output gate is still to run, and it is not in this image.
 - **Still open:** the engine's startup is about 4 s longer than candidate-54's at `tp4-ring`, as the third build
   recorded; nothing here changes it.
 

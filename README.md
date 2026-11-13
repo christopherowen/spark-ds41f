@@ -877,6 +877,8 @@ bin/spark render dgx1
 bin/spark --cluster-config config/cluster.json cluster sync
 bin/spark --cluster-config config/cluster.json cluster start --replace
 bin/spark --cluster-config config/cluster.json cluster stop
+bin/spark cache status
+bin/spark --cluster-config config/cluster.json cache clear
 bin/spark bench
 bin/spark upstream list
 bin/spark upstream prepare vllm
@@ -890,8 +892,19 @@ scripts/host-recovery check
 scripts/host-recovery apply
 ```
 
-`doctor`, `status`, `render`, and every cluster command without `--apply` are
-read-only. `bench` only sends API requests; see [Benchmarking](#benchmarking).
+`doctor`, `status`, `render`, `cache status`, and every cluster command and
+`cache clear` without `--apply` are read-only. `bench` only sends API requests;
+see [Benchmarking](#benchmarking).
+
+`cache status` shows, for every node of the profile, each JIT cache directory
+the profile's environment names under the `/cache` mount (`TILELANG_CACHE_DIR`,
+`CUDA_CACHE_PATH`, `TRITON_CACHE_DIR`, `VLLM_CACHE_ROOT`): its size, file count
+and oldest and newest file. `cache clear` empties those directories on every
+node and keeps the directories themselves; `--only tilelang nv-compute triton
+vllm` selects among them. It is a plan unless `--apply`, which needs
+`--cluster-config` named and refuses while a serving container runs on any node
+or a node cannot be reached. The start after a clear compiles the kernels
+again, as a first start does.
 
 `doctor --live` also compares the nodes' running kernel, base page size, driver
 and memory policy, and verifies the staged 64 KiB kernel against

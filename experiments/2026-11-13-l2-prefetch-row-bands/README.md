@@ -65,7 +65,7 @@ The engine grid step alone ([candidate-48/grid-suite.json](../2026-10-26-spark-d
 bin/spark candidate queue tp4-ring experiments/2026-11-13-l2-prefetch-row-bands/grid-tp4.json experiments/2026-11-13-l2-prefetch-row-bands/gate-tp4.json --apply
 bin/spark candidate queue tp4-switched experiments/2026-11-13-l2-prefetch-row-bands/grid-tp4-switched.json experiments/2026-11-13-l2-prefetch-row-bands/gate-tp4-switched.json --apply
 bin/spark candidate verdicts tp4-ring l2-prefetch-row-bands-grid-tp4-r2
-bin/spark candidate gate tp4-ring l2-prefetch-row-bands-gate-tp4 --expect 18d61961/d6568649
+bin/spark candidate gate tp4-ring l2-prefetch-row-bands-gate-tp4-r2 --expect 18d61961/d6568649
 ```
 
 ## Checks before the runs
@@ -80,9 +80,68 @@ bin/spark candidate gate tp4-ring l2-prefetch-row-bands-gate-tp4 --expect 18d619
 **First run void (2026-11-13 07:59Z to 08:30Z).** The profiles named the overlay under `container.extra_mounts`, which
 no command reads, so both grid jobs (`l2-prefetch-row-bands-grid-tp4`, `…-grid-tp4-switched`) measured candidate-55
 six times: the "band" arm's 24-row shapes were within 0.1% of `candidate-55` at both testbeds. The profiles now use
-`container.mounts`, and the grid runs again as `…-grid-tp4-r2` and `…-grid-tp4-switched-r2`. The gate jobs were still
-queued when the profiles were fixed and run with the overlay mounted.
+`container.mounts`, and the grid runs again as `…-grid-tp4-r2` and `…-grid-tp4-switched-r2`. Both gate jobs
+(`l2-prefetch-row-bands-gate-tp4`, `…-gate-tp4-switched`) started at `37630b335`, before the fix, so they gated
+candidate-55 itself (both pass with candidate-54's hashes, which says nothing about the band); they run again as
+`…-gate-tp4-r2` and `…-gate-tp4-switched-r2`.
 
 On one GPU of sp8 the overlay was mounted with `docker -v` and the band acts: with `17-32=10` the forward is 2.051 and
 2.061 ms at 8x24 against 2.018 and 2.025 ms unset, and within 1% of unset at 8x16 and 16x48. (One GPU has no all-reduce for the
 fill to hide behind, so the sign there says nothing about TP4.)
+
+### The grid with the overlay mounted (2026-11-13 09:37Z to 10:13Z)
+
+Runs `l2-prefetch-row-bands-grid-tp4-r2` (`tp4-ring`, commit `50748ee6b`) and `l2-prefetch-row-bands-grid-tp4-switched-r2`
+(`tp4-switched`, commit `19ff11ab2`), three arms, two boots each, every boot warm. The live container of a band boot was
+inspected at each testbed's first run: it mounts the two overlay files and carries `VLLM_DS41_L2_PREFETCH_WO_BANDS=17-32=10`.
+
+Step time, mean of both boots of the arm against the mean of both boots of `candidate-55` in the same job; negative is
+faster. Forward is the target's forward alone.
+
+| shape | `tp4-ring` step | forward (ms) | `tp4-switched` step | forward (ms) |
+| --- | ---: | ---: | ---: | ---: |
+| 4x24 @4K | -2.72% | -0.551 | -2.31% | -0.456 |
+| 8x24 @4K | -2.90% | -0.575 | -2.13% | -0.462 |
+| 8x24 @64K | -2.71% | -0.543 | -1.87% | -0.391 |
+| 8x24 @256K | -2.49% | -0.544 | -2.61% | -0.518 |
+| 16x32 @4K | -1.70% | -0.385 | -2.10% | -0.474 |
+| 1x2 | -0.38% | -0.047 | +0.23% | +0.037 |
+| 1x3 @4K, @64K, @256K, @1016K | -0.75%, +0.11%, +1.08%, -0.83% | | +0.67%, -0.11%, -0.20%, +0.28% | |
+| 6 to 16 rows | +0.10% | | +0.19% | |
+| 16x48 @4K, 8x48 @4K, 16x48 @64K | -0.16%, +0.29%, +0.07% | | -0.10%, +0.02%, -0.31% | |
+| 12x72 | -0.17% | -0.060 | +0.09% | +0.066 |
+| 16x96 | +0.10% | +0.073 | +0.10% | +0.046 |
+| **grid, geometric mean (20)** | **-0.45%** ±0.15%, margin 0.40%: better | | **-0.52%** ±0.17%, margin 0.34%: better | |
+
+The grid rows are the lab's verdicts (`bin/spark candidate verdicts`), the mean over both boots of each arm.
+
+Against the marks:
+
+1. **The band: met at both testbeds.** The four 24-row shapes are 2.70% faster as a group at `tp4-ring` and 2.23% at
+   `tp4-switched`; 16x32 is 1.70% and 2.10% faster. All of it is the target's forward (0.39 to 0.58 ms a step).
+2. **Outside the band: met.** The largest change at a shape outside the band is 1.07% (1x3 @256K, slower) at `tp4-ring`,
+   where `candidate-55`'s own two boots differ by up to 2.35% at one shape, and 0.67% at `tp4-switched`, where they differ
+   by up to 0.88%. 1x2, 1x3, 48, 72 and 96 rows are inside that spread at both.
+3. **The grid: met.** Faster beyond the margin at both testbeds. At `tp4-ring` the two band boots differ by 0.61% and the
+   first measured the same as `candidate-55`'s first (+0.01%), so the margin is beaten narrowly there (0.45% against 0.40%).
+4. **The drafter: met.** Its time moves by at most 0.032 ms at a shape at `tp4-ring` and 0.053 ms at `tp4-switched`;
+   `candidate-55`'s own boots differ by up to 0.079 and 0.064 ms.
+5. **The control: met.** `candidate-55-overlay-unset` is +0.08% on the grid at `tp4-ring` and -0.06% at `tp4-switched`, and
+   its 24-row shapes are within 0.3% of `candidate-55`.
+6. **Outputs: met.** With the overlay mounted (the live container of a gate boot was inspected at each testbed), runs
+   `l2-prefetch-row-bands-gate-tp4-r2` (10:45Z to 11:11Z) and `l2-prefetch-row-bands-gate-tp4-switched-r2` (10:39Z to
+   11:06Z), both at `b5448d985`: both boots at each testbed give 18d61961/d6568649 on the log-probability run and
+   0a2dacdd/12fd8257 on the text runs, candidate-54's TP4 hashes, and `bin/spark candidate gate` passes.
+
+`tp4-switched` gains as much as the ring, though its 24-row shapes were only 0.8% behind candidate-54 with both builds
+capped: the 15 MB WO window is too large for the 32-row tier at both fabrics, not only where it showed as a loss.
+
+## Conclusion
+
+All six marks are met at `tp4-ring` and `tp4-switched`. The WO window at 10 MB for forwards of 17 to 32 rows recovers the
+24- and 32-row shapes (about 2.5% a step), moves nothing else, and leaves the outputs candidate-54's. The patch is ready
+to enter a candidate's vLLM series with `VLLM_DS41_L2_PREFETCH_WO_BANDS=17-32=10` in the TP4 recipe; here it was only
+mounted over the fourth build. Not measured: 20 and 28 rows, which are in the band and not in the grid; other bands or
+budgets; TP3 and TP5 to TP8; the serving benchmark, which no mark here covers.
+
+Receipts: [candidate-55/receipts/l2-prefetch-row-bands](../2026-10-26-spark-ds41f-candidate/candidate-55/receipts/l2-prefetch-row-bands).

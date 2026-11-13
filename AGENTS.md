@@ -75,6 +75,9 @@ node at that exact commit. `cluster sync` also copies the profile's image from t
 head to every node that lacks it. A `cluster start` plan runs the full preflight; when
 a node differs from the head, it ends with the `cluster sync --apply` that repairs it.
 Do not bypass the coordinated start with a one-rank launch script.
+Use `bin/spark cache status` and `cache clear` to inspect and clear the nodes' JIT caches,
+not ad-hoc SSH: `clear` is a plan unless `--apply`, which needs the engine stopped and
+`--cluster-config` named.
 
 ## Shared cluster windows
 
