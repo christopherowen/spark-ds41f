@@ -1,0 +1,1871 @@
+From b50db871d78cd2b580e4d327e02dc8fbb3276889 Mon Sep 17 00:00:00 2001
+From: Christopher Owen <3221756+christopherowen@users.noreply.github.com>
+Date: Tue, 10 Nov 2026 06:29:21 +0000
+Subject: [PATCH] perf(spec_decode): shard-local sampled verification and
+ resampling
+
+Upstream-Base: 19f2c20ed4d6be5dc5eb7323efccba6ad0eb422f
+Rationale: Any stream with temperature > 0 in a decode batch previously forced GPUModelRunner.sample off the shard-local verification path onto a full-vocabulary logits all-gather (129,280 BF16 columns = 258.6 KB/row, or 18.18 MB across TP4 ranks at 16 streams). Add local_stats_shard_kernel, verify_shard_kernel, resample_shard_kernel, resample_shard_pair_kernel, and insert_shard_resampled_kernel so block verification and Gumbel resampling run directly on each rank's vocabulary shard and exchange only 16-byte block statistics and 16-byte per-request resampled pairs across TP ranks (a 970x payload reduction on TP4 and 874x on TP3).
+Quality: Exact 0-ULP bit-identical resampled token draws and greedy verification; block verification log-sum-exp reduces over per-shard 8,192-column blocks (within 1 ULP of unsharded reduction).
+Tests: pytest tests/v1/worker/gpu/test_greedy_verification.py tests/v1/worker/test_gpu_verified_logprob_token_ids.py tests/v1/worker/test_dead_rows.py
+Upstream-Status: spark-ds41f local patch
+---
+ .../v1/worker/gpu/test_greedy_verification.py |  176 +++
+ vllm/v1/worker/gpu/model_runner.py            |  289 ++++
+ .../gpu/spec_decode/greedy_verification.py    |  121 ++
+ .../gpu/spec_decode/tilelang_rejection.py     | 1177 ++++++++++++++++-
+ 4 files changed, 1762 insertions(+), 1 deletion(-)
+
+diff --git a/tests/v1/worker/gpu/test_greedy_verification.py b/tests/v1/worker/gpu/test_greedy_verification.py
+index 443b59006..e708624f5 100644
+--- a/tests/v1/worker/gpu/test_greedy_verification.py
++++ b/tests/v1/worker/gpu/test_greedy_verification.py
+@@ -284,3 +284,179 @@ def test_aligned_step_warmups_omit_unaligned_runs():
+         ("bfloat16", "bfloat16", True),
+         ("float32", None, False),
+     }
++
++
++
++@pytest.mark.parametrize("tp_size", [1, 3, 4])
++@pytest.mark.parametrize("apply_temperature", [False, True])
++def test_shard_local_sampled_verification_matches_full_vocab(
++    tp_size: int, apply_temperature: bool
++):
++    from vllm.v1.worker.gpu.spec_decode.tilelang_rejection import (
++        STATS_BLOCK,
++        RESAMPLE_BLOCK,
++        compute_local_stats_shard,
++        insert_shard_resampled_kernel,
++        resample_shard,
++        resample_shard_pair_kernel,
++        verify_and_resample,
++        verify_shard,
++        _kernel,
++        _DTYPES,
++    )
++    from vllm.v1.worker.gpu.spec_decode.tilelang_resampled import insert_resampled
++
++    torch.manual_seed(42 + tp_size)
++    vocab_size = 129280
++    num_speculative_steps = 5
++    cu = torch.tensor([0, 6, 7, 13, 19], dtype=torch.int32, device=DEVICE)
++    num_reqs = cu.shape[0] - 1
++    num_logits = int(cu[-1].item())
++    logits = torch.randn(num_logits, vocab_size, dtype=torch.bfloat16, device=DEVICE)
++    drafts = torch.randint(0, vocab_size, (num_logits,), dtype=torch.int32, device=DEVICE)
++    # Force first 2 drafts of req 0 and req 3 to match argmax/high probability
++    top_ids = logits.argmax(dim=-1).to(torch.int32)
++    drafts[1] = top_ids[0]
++    drafts[2] = top_ids[1]
++    drafts[14] = top_ids[13]
++    logits[13, drafts[14]] = 20.0
++
++    pos = torch.arange(num_logits, dtype=torch.int64, device=DEVICE)
++    idx_mapping = torch.arange(num_reqs, dtype=torch.int32, device=DEVICE)
++    expanded_idx_mapping = torch.tensor(
++        [0] * 6 + [1] * 1 + [2] * 6 + [3] * 6, dtype=torch.int32, device=DEVICE
++    )
++    expanded_local_pos = torch.tensor(
++        [0, 1, 2, 3, 4, 5, 0, 0, 1, 2, 3, 4, 5, 0, 1, 2, 3, 4, 5],
++        dtype=torch.int32,
++        device=DEVICE,
++    )
++    temperature = torch.tensor(
++        [0.0, 1.0, 0.7 if apply_temperature else 1.0, 1.0],
++        dtype=torch.float32,
++        device=DEVICE,
++    )
++    seed = torch.tensor([101, 202, 303, 404], dtype=torch.int64, device=DEVICE)
++
++    ref_sampled, ref_num_sampled, ref_argmax, ref_max = verify_and_resample(
++        logits,
++        drafts,
++        cu,
++        pos,
++        idx_mapping,
++        expanded_idx_mapping,
++        expanded_local_pos,
++        temperature,
++        seed,
++        num_speculative_steps,
++        apply_temperature=apply_temperature,
++    )
++    insert_resampled(
++        ref_sampled,
++        ref_num_sampled,
++        ref_argmax,
++        ref_max,
++        cu,
++        expanded_idx_mapping,
++        temperature,
++    )
++
++    # Partition across tp_size shards (with 64-element padded stride on TP3)
++    base_shard = -(-vocab_size // tp_size)
++    padded_stride = ((base_shard + 63) // 64) * 64
++    local_blocks = -(-padded_stride // STATS_BLOCK)
++    resample_blocks = -(-padded_stride // RESAMPLE_BLOCK)
++
++    rank_stats = []
++    rank_shards = []
++    rank_starts = []
++    for r in range(tp_size):
++        start = r * base_shard
++        end = min(vocab_size, (r + 1) * base_shard)
++        org_len = end - start
++        buf = torch.zeros(num_logits, padded_stride, dtype=torch.bfloat16, device=DEVICE)
++        buf[:, :org_len].copy_(logits[:, start:end])
++        shard_view = buf[:, :org_len]
++        rank_shards.append(shard_view)
++        rank_starts.append(start)
++        st = torch.empty(num_logits, 4 * local_blocks, dtype=torch.float32, device=DEVICE)
++        compute_local_stats_shard(
++            st,
++            shard_view,
++            drafts,
++            expanded_idx_mapping,
++            expanded_local_pos,
++            temperature,
++            num_speculative_steps,
++            start,
++            apply_temperature=apply_temperature,
++        )
++        rank_stats.append(st)
++
++    gathered_stats = torch.cat(rank_stats, dim=-1)
++    sampled = torch.empty_like(ref_sampled)
++    num_sampled = torch.empty_like(ref_num_sampled)
++    target_lse = torch.empty(num_reqs, dtype=torch.float32, device=DEVICE)
++    draft_lse = torch.empty(num_reqs, dtype=torch.float32, device=DEVICE)
++    cum_log_p = torch.empty(num_logits, dtype=torch.float32, device=DEVICE)
++    verify_shard(
++        sampled,
++        num_sampled,
++        target_lse,
++        draft_lse,
++        cum_log_p,
++        gathered_stats,
++        drafts,
++        cu,
++        idx_mapping,
++        temperature,
++        seed,
++        pos,
++        num_speculative_steps,
++        vocab_size,
++    )
++
++    pair_fn = _kernel(resample_shard_pair_kernel, resample_blocks)
++    rank_pairs = []
++    for r in range(tp_size):
++        loc_argmax = torch.empty(num_reqs, resample_blocks, dtype=torch.int64, device=DEVICE)
++        loc_max = torch.empty(num_reqs, resample_blocks, dtype=torch.float32, device=DEVICE)
++        resample_shard(
++            loc_argmax,
++            loc_max,
++            rank_shards[r],
++            num_sampled,
++            cu,
++            expanded_idx_mapping,
++            drafts,
++            temperature,
++            seed,
++            pos,
++            rank_starts[r],
++            apply_temperature=apply_temperature,
++        )
++        lp = torch.empty(num_reqs, 4, dtype=torch.float32, device=DEVICE)
++        pair_fn(lp, loc_argmax, loc_max)
++        rank_pairs.append(lp)
++
++    gathered_pairs = torch.cat(rank_pairs, dim=-1)
++    insert_fn = _kernel(
++        insert_shard_resampled_kernel,
++        tp_size,
++        _DTYPES[expanded_idx_mapping.dtype],
++        False,
++    )
++    insert_fn(
++        sampled,
++        num_sampled,
++        gathered_pairs,
++        cu,
++        expanded_idx_mapping,
++        temperature,
++        num_sampled,
++    )
++
++    assert torch.equal(num_sampled, ref_num_sampled)
++    for req in range(num_reqs):
++        n = int(num_sampled[req].item())
++        assert torch.equal(sampled[req, :n], ref_sampled[req, :n])
+diff --git a/vllm/v1/worker/gpu/model_runner.py b/vllm/v1/worker/gpu/model_runner.py
+index 173432af0..8658f2281 100644
+--- a/vllm/v1/worker/gpu/model_runner.py
++++ b/vllm/v1/worker/gpu/model_runner.py
+@@ -212,6 +212,9 @@ from vllm.v1.worker.gpu.spec_decode.eagle.eagle3_utils import (
+ from vllm.v1.worker.gpu.spec_decode.greedy_verification import (
+     greedy_rejection_sample,
+     register_greedy_verification_warmups,
++    register_sampled_verification_warmups,
++    sample_tokens_from_shards,
++    sampled_rejection_sample_from_shards,
+     vocab_parallel_pairs,
+     vocab_parallel_pairs_from_head,
+ )
+@@ -1270,6 +1273,49 @@ class GPUModelRunner(LoRAModelRunnerMixin):
+                     dummy_input_batch.cu_num_logits,
+                     steps,
+                 )
++        if self._sampled_verification_available():
++            assert self.rejection_sampler is not None
++            head = self._language_model().lm_head
++            shard = head.shard_indices
++            tp_size = get_tensor_model_parallel_world_size()
++            local_logits = self.model.compute_logits_local(hidden_states)
++            dummy_input_batch.ensure_expanded_idx_mapping(self.input_buffers)
++            draft_sampled, pos = logits_rows(dummy_input_batch)
++            for steps in dict.fromkeys(
++                (self.num_draft_steps, self.rejection_sampler.num_speculative_steps)
++                if self.num_draft_steps > 0
++                else (self.rejection_sampler.num_speculative_steps,)
++            ):
++                sampled_rejection_sample_from_shards(
++                    local_logits,
++                    draft_sampled,
++                    dummy_input_batch.cu_num_logits,
++                    pos,
++                    dummy_input_batch.idx_mapping,
++                    dummy_input_batch.expanded_idx_mapping,
++                    dummy_input_batch.expanded_local_pos,
++                    self.sampler.sampling_states.temperature.gpu,
++                    self.sampler.sampling_states.seeds.gpu,
++                    self.rejection_sampler.num_speculative_steps,
++                    shard.num_org_elements,
++                    shard.org_vocab_start_index,
++                    self.vocab_size,
++                    tp_size,
++                    kernel_steps=steps,
++                    apply_temperature=True,
++                )
++            sample_tokens_from_shards(
++                local_logits,
++                dummy_input_batch.cu_num_logits,
++                pos,
++                dummy_input_batch.expanded_idx_mapping,
++                self.sampler.sampling_states.temperature.gpu,
++                self.sampler.sampling_states.seeds.gpu,
++                shard.num_org_elements,
++                shard.org_vocab_start_index,
++                tp_size,
++                apply_temperature=True,
++            )
+ 
+     @torch.inference_mode()
+     def _dummy_pooler_run(self, hidden_states: torch.Tensor) -> None:
+@@ -2129,6 +2175,24 @@ class GPUModelRunner(LoRAModelRunnerMixin):
+                 assert output.num_rejected is not None
+                 return output, output.num_sampled, output.num_rejected
+             input_batch.ensure_expanded_idx_mapping(self.input_buffers)
++            if getattr(self, "_verifies_from_shards", lambda ib, go, sf: False)(
++                input_batch, grammar_output, sink_flags
++            ):
++                output = self._verify_from_shards(sample_hidden_states, input_batch)
++                if sink_flags is not None:
++                    self._apply_sink(output, input_batch, sink_flags)
++                assert output.num_sampled is not None
++                assert output.num_rejected is not None
++                return output, output.num_sampled, output.num_rejected
++            if getattr(self, "_samples_from_shards", lambda ib, go, sf: False)(
++                input_batch, grammar_output, sink_flags
++            ):
++                output = self._sample_from_shards(sample_hidden_states, input_batch)
++                if sink_flags is not None:
++                    self._apply_sink(output, input_batch, sink_flags)
++                assert output.num_sampled is not None
++                assert output.num_rejected is not None
++                return output, output.num_sampled, output.num_rejected
+             logits = self.model.compute_logits(sample_hidden_states)
+ 
+         if grammar_output is not None:
+@@ -2229,6 +2293,25 @@ class GPUModelRunner(LoRAModelRunnerMixin):
+             )
+         return self._greedy_verification
+ 
++    _sampled_verification: bool | None = None
++
++    def _sampled_verification_available(self) -> bool:
++        if self._sampled_verification is None:
++            self._sampled_verification = bool(
++                self._greedy_verification_available()
++                and os.environ.get("VLLM_SAMPLED_VERIFICATION", "1") == "1"
++                and self.rejection_sampler is not None
++                and self.rejection_sampler.use_block_verification
++                and getattr(self.speculator, "draft_logits", None) is None
++                and self.sampler is not None
++                and not getattr(self.sampler, "use_fp64_gumbel", False)
++            )
++            logger.info(
++                "Sampled verification from vocabulary shards: %s",
++                "on" if self._sampled_verification else "off",
++            )
++        return self._sampled_verification
++
+     def declare_step_kernels(self) -> None:
+         """Declare the kernels that input preparation, sampling, greedy
+         verification and the drafter launch: for the runner's buffers, the loaded
+@@ -2460,6 +2543,25 @@ class GPUModelRunner(LoRAModelRunnerMixin):
+                     )
+                 ),
+             )
++        if self.rejection_sampler is not None and self._sampled_verification_available():
++            assert head is not None and processor is not None
++            register_sampled_verification_warmups(
++                logits_dtype=processor.head_dtype,
++                shard_vocab_size=head.num_embeddings_per_partition,
++                tp_size=get_tensor_model_parallel_world_size(),
++                num_speculative_steps=self.rejection_sampler.num_speculative_steps,
++                step_widths=tuple(
++                    dict.fromkeys(
++                        (
++                            num_draft_steps,
++                            self.rejection_sampler.num_speculative_steps,
++                        )
++                        if num_draft_steps > 0
++                        else (self.rejection_sampler.num_speculative_steps,)
++                    )
++                ),
++                dead_rows=dead_rows_enabled(self.speculative_config),
++            )
+         if isinstance(self.speculator, DFlashSpeculator):
+             self.speculator.register_warmups(
+                 self._draft_block_table_layouts(kv_cache_groups, kernel_block_sizes)
+@@ -2672,6 +2774,193 @@ class GPUModelRunner(LoRAModelRunnerMixin):
+             )
+         return output
+ 
++    def _batch_verifies_from_shards(
++        self,
++        idx_mapping_np: np.ndarray,
++        num_reqs: int,
++        num_draft_tokens: int,
++        has_structured_output: bool,
++        has_sink_rejection: bool = False,
++    ) -> bool:
++        if (
++            has_structured_output
++            or has_sink_rejection
++            or num_reqs == 0
++            or num_draft_tokens == 0
++            or not self._sampled_verification_available()
++        ):
++            return False
++        assert self.sampler is not None
++        return bool(
++            not self.sampler.any_non_temperature_logits_processing(idx_mapping_np)
++            and self.sampler.get_logprobs_dims(idx_mapping_np) is None
++        )
++
++    def _verifies_from_shards(
++        self,
++        input_batch: InputBatch,
++        grammar_output: GrammarOutput | None,
++        sink_flags: torch.Tensor | None = None,
++    ) -> bool:
++        """A speculative verification step with temperature >= 0 that needs no
++        non-temperature logits processing, logprobs, or sink rejection."""
++        has_sink_rejection = (
++            sink_flags is not None
++            and self.sink is not None
++            and self.sink.rejection
++        )
++        return self._batch_verifies_from_shards(
++            input_batch.idx_mapping_np,
++            input_batch.num_reqs,
++            input_batch.num_draft_tokens,
++            grammar_output is not None,
++            has_sink_rejection,
++        )
++
++    def _verify_from_shards(
++        self,
++        sample_hidden_states: torch.Tensor,
++        input_batch: InputBatch,
++    ) -> SamplerOutput:
++        """Shard-local block verification and resampling without all-gathering
++        the full vocabulary logits across tensor-parallel ranks."""
++        assert self.rejection_sampler is not None and self.sampler is not None
++        head = self._language_model().lm_head
++        shard = head.shard_indices
++        tp_size = get_tensor_model_parallel_world_size()
++        draft_sampled, pos = logits_rows(input_batch)
++        local_logits = self.model.compute_logits_local(sample_hidden_states)
++        kernel_steps = None
++        drafts_per_req = input_batch.num_draft_tokens_per_req
++        step_draft_steps = min(
++            getattr(
++                self,
++                "_step_draft_steps",
++                self.rejection_sampler.num_draft_steps,
++            ),
++            self.rejection_sampler.num_speculative_steps,
++        )
++        if step_draft_steps < self.rejection_sampler.num_speculative_steps and (
++            drafts_per_req is None
++            or min(int(drafts_per_req.max(initial=0)), input_batch.num_draft_tokens)
++            <= step_draft_steps
++        ):
++            kernel_steps = step_draft_steps
++        apply_temperature = bool(
++            np.any(self.sampler.needs_logits_processing[input_batch.idx_mapping_np])
++        )
++        dead_row_cut = getattr(self, "_dead_row_cut", None)
++        sampled, num_sampled = sampled_rejection_sample_from_shards(
++            local_logits=local_logits,
++            draft_sampled=draft_sampled,
++            cu_num_logits=input_batch.cu_num_logits,
++            pos=pos,
++            idx_mapping=input_batch.idx_mapping,
++            expanded_idx_mapping=input_batch.expanded_idx_mapping,
++            expanded_local_pos=input_batch.expanded_local_pos,
++            temperature=self.sampler.sampling_states.temperature.gpu,
++            seed=self.sampler.sampling_states.seeds.gpu,
++            num_speculative_steps=self.rejection_sampler.num_speculative_steps,
++            vocab=shard.num_org_elements,
++            vocab_start=shard.org_vocab_start_index,
++            vocab_size=self.vocab_size,
++            tp_size=tp_size,
++            dead_row_cut=dead_row_cut,
++            kernel_steps=kernel_steps,
++            apply_temperature=apply_temperature,
++        )
++        num_sampled, num_rejected = get_num_sampled_and_rejected(
++            num_sampled,
++            input_batch.seq_lens,
++            input_batch.cu_num_logits,
++            input_batch.idx_mapping,
++            self.sampler.req_states.prefill_len.gpu,
++            dead_row_cut=dead_row_cut,
++        )
++        return SamplerOutput(
++            sampled_token_ids=sampled,
++            logprobs_tensors=None,
++            num_nans=None,
++            num_sampled=num_sampled,
++            num_rejected=num_rejected,
++        )
++
++    def _samples_from_shards(
++        self,
++        input_batch: InputBatch,
++        grammar_output: GrammarOutput | None,
++        sink_flags: torch.Tensor | None = None,
++    ) -> bool:
++        """A 1-token-per-request step (e.g. prefill bonus token or non-draft
++        step) with at least one sampled stream and no non-temperature logits
++        processing or logprobs."""
++        has_sink_rejection = (
++            sink_flags is not None
++            and self.sink is not None
++            and self.sink.rejection
++        )
++        if (
++            grammar_output is not None
++            or has_sink_rejection
++            or input_batch.num_reqs == 0
++            or input_batch.num_draft_tokens != 0
++            or not self._sampled_verification_available()
++        ):
++            return False
++        assert self.sampler is not None
++        idx_mapping_np = input_batch.idx_mapping_np
++        states = self.sampler.sampling_states
++        return bool(
++            np.any(states.temperature.np[idx_mapping_np] != 0.0)
++            and not self.sampler.any_non_temperature_logits_processing(idx_mapping_np)
++            and self.sampler.get_logprobs_dims(idx_mapping_np) is None
++        )
++
++    def _sample_from_shards(
++        self,
++        sample_hidden_states: torch.Tensor,
++        input_batch: InputBatch,
++    ) -> SamplerOutput:
++        """Shard-local Gumbel/greedy token sampling for 1-token-per-request
++        steps without all-gathering the full vocabulary logits."""
++        assert self.sampler is not None
++        head = self._language_model().lm_head
++        shard = head.shard_indices
++        tp_size = get_tensor_model_parallel_world_size()
++        _, pos = logits_rows(input_batch)
++        local_logits = self.model.compute_logits_local(sample_hidden_states)
++        apply_temperature = bool(
++            np.any(self.sampler.needs_logits_processing[input_batch.idx_mapping_np])
++        )
++        sampled = sample_tokens_from_shards(
++            local_logits=local_logits,
++            cu_num_logits=input_batch.cu_num_logits,
++            pos=pos,
++            expanded_idx_mapping=input_batch.expanded_idx_mapping,
++            temperature=self.sampler.sampling_states.temperature.gpu,
++            seed=self.sampler.sampling_states.seeds.gpu,
++            vocab=shard.num_org_elements,
++            vocab_start=shard.org_vocab_start_index,
++            tp_size=tp_size,
++            apply_temperature=apply_temperature,
++        )
++        num_sampled, num_rejected = get_num_sampled_and_rejected(
++            torch.ones(
++                input_batch.num_reqs, dtype=torch.int32, device=sampled.device
++            ),
++            input_batch.seq_lens,
++            input_batch.cu_num_logits,
++            input_batch.idx_mapping,
++            self.sampler.req_states.prefill_len.gpu,
++        )
++        return SamplerOutput(
++            sampled_token_ids=sampled,
++            logprobs_tensors=None,
++            num_nans=None,
++            num_sampled=num_sampled,
++            num_rejected=num_rejected,
++        )
++
+     def _init_sink(self, config: SinkConfig, custom_sampler: bool) -> None:
+         """Builds the sink detector's sampling state, after the samplers, and
+         refuses the configurations it does not handle."""
+diff --git a/vllm/v1/worker/gpu/spec_decode/greedy_verification.py b/vllm/v1/worker/gpu/spec_decode/greedy_verification.py
+index f55ca0ed7..de97fa8ca 100644
+--- a/vllm/v1/worker/gpu/spec_decode/greedy_verification.py
++++ b/vllm/v1/worker/gpu/spec_decode/greedy_verification.py
+@@ -159,6 +159,127 @@ def greedy_rejection_sample(
+     )
+ 
+ 
++def sampled_rejection_sample_from_shards(
++    local_logits: torch.Tensor,
++    draft_sampled: torch.Tensor,
++    cu_num_logits: torch.Tensor,
++    pos: torch.Tensor,
++    idx_mapping: torch.Tensor,
++    expanded_idx_mapping: torch.Tensor,
++    expanded_local_pos: torch.Tensor,
++    temperature: torch.Tensor,
++    seed: torch.Tensor,
++    num_speculative_steps: int,
++    vocab: int,
++    vocab_start: int,
++    vocab_size: int,
++    tp_size: int,
++    dead_row_cut: torch.Tensor | None = None,
++    kernel_steps: int | None = None,
++    apply_temperature: bool = False,
++) -> tuple[torch.Tensor, torch.Tensor]:
++    """Shard-local block verification and resampling for batches containing
++    sampled (``temperature > 0``) requests without gathering full-vocabulary
++    logits across tensor-parallel ranks."""
++    from vllm.v1.worker.gpu.spec_decode.tilelang_rejection import (
++        verify_and_resample_from_shards,
++    )
++
++    shard_logits = local_logits[:, :vocab]
++    all_gather_fn = (
++        (lambda t: tensor_model_parallel_all_gather(t, dim=-1))
++        if tp_size > 1
++        else None
++    )
++    return verify_and_resample_from_shards(
++        target_logits=shard_logits,
++        draft_sampled=draft_sampled,
++        cu_num_logits=cu_num_logits,
++        pos=pos,
++        idx_mapping=idx_mapping,
++        expanded_idx_mapping=expanded_idx_mapping,
++        expanded_local_pos=expanded_local_pos,
++        temperature=temperature,
++        seed=seed,
++        num_speculative_steps=num_speculative_steps,
++        vocab_start=vocab_start,
++        vocab_size=vocab_size,
++        tp_size=tp_size,
++        all_gather_fn=all_gather_fn,
++        dead_row_cut=dead_row_cut,
++        kernel_steps=kernel_steps,
++        apply_temperature=apply_temperature,
++    )
++
++
++def sample_tokens_from_shards(
++    local_logits: torch.Tensor,
++    cu_num_logits: torch.Tensor,
++    pos: torch.Tensor,
++    expanded_idx_mapping: torch.Tensor,
++    temperature: torch.Tensor,
++    seed: torch.Tensor,
++    vocab: int,
++    vocab_start: int,
++    tp_size: int,
++    apply_temperature: bool = True,
++) -> torch.Tensor:
++    """Shard-local Gumbel/greedy token sampling for 1-token-per-request steps
++    without gathering full-vocabulary logits across tensor-parallel ranks."""
++    from vllm.v1.worker.gpu.spec_decode.tilelang_rejection import (
++        resample_from_shards,
++    )
++
++    shard_logits = local_logits[:, :vocab]
++    num_logits = shard_logits.shape[0]
++    dummy_drafts = torch.full(
++        (max(num_logits, 1),), -1, dtype=torch.int32, device=local_logits.device
++    )
++    all_gather_fn = (
++        (lambda t: tensor_model_parallel_all_gather(t, dim=-1))
++        if tp_size > 1
++        else None
++    )
++    sampled, _ = resample_from_shards(
++        target_logits=shard_logits,
++        draft_sampled=dummy_drafts,
++        cu_num_logits=cu_num_logits,
++        pos=pos,
++        expanded_idx_mapping=expanded_idx_mapping,
++        temperature=temperature,
++        seed=seed,
++        vocab_start=vocab_start,
++        tp_size=tp_size,
++        all_gather_fn=all_gather_fn,
++        apply_temperature=apply_temperature,
++    )
++    return sampled
++
++
++def register_sampled_verification_warmups(
++    *,
++    logits_dtype: torch.dtype,
++    shard_vocab_size: int,
++    tp_size: int,
++    num_speculative_steps: int,
++    step_widths: tuple[int, ...] = (),
++    dead_rows: bool = False,
++) -> None:
++    """Declare the shard-local sampled verification and resampling kernels."""
++    from vllm.v1.worker.gpu.spec_decode.tilelang_rejection import (
++        register_shard_block_verification,
++    )
++
++    register_shard_block_verification(
++        logits_dtypes=(logits_dtype,),
++        shard_vocab_size=shard_vocab_size,
++        tp_size=tp_size,
++        num_speculative_steps=num_speculative_steps,
++        step_widths=step_widths,
++        dead_rows=dead_rows,
++    )
++
++
+ _TRITON_REFS = frozenset(("_greedy_rejection_kernel",))
+ 
+ 
+diff --git a/vllm/v1/worker/gpu/spec_decode/tilelang_rejection.py b/vllm/v1/worker/gpu/spec_decode/tilelang_rejection.py
+index ff5017a33..a13ce1768 100644
+--- a/vllm/v1/worker/gpu/spec_decode/tilelang_rejection.py
++++ b/vllm/v1/worker/gpu/spec_decode/tilelang_rejection.py
+@@ -66,7 +66,7 @@ Every comparison NaN decides is made in the header: TVM's simplifier rewrites
+ 
+ # No `from __future__ import annotations`: TileLang reads the prim_func
+ # annotations eagerly, and the symbolic shapes must resolve.
+-from collections.abc import Sequence
++from collections.abc import Callable, Sequence
+ 
+ import torch
+ 
+@@ -815,6 +815,11 @@ def verify_kernel(
+ def _padded_blocks(vocab_size: int) -> int:
+     """Triton's PADDED_VOCAB_NUM_BLOCKS for ``vocab_size`` columns."""
+     blocks = -(-vocab_size // STATS_BLOCK)
++    return _padded_blocks_count(blocks)
++
++
++def _padded_blocks_count(blocks: int) -> int:
++    """Next power of two at or above ``blocks`` (at least 1)."""
+     return 1 << max(blocks - 1, 0).bit_length()
+ 
+ 
+@@ -1299,3 +1304,1173 @@ def register_block_verification(
+     declare(
+         lambda: rejection_calls(logits_dtypes, vocab_size, num_speculative_steps, cuts)
+     )
++
++
++
++# --- Shard-local verification and resampling ----------------------------------
++
++
++@tilelang.jit(pass_configs=_PASS)
++def local_stats_shard_kernel(
++    logits_dtype: str,
++    drafts_dtype: str,
++    idx_dtype: str,
++    step_dtype: str,
++    run: int,
++):
++    """Per-rank vocabulary-block statistics for shard-local verification.
++
++    Packs 4 FP32 values per 8192-column block into ``local_stats`` of shape
++    ``[rows, 4 * blocks]`` (16 bytes per block, 16-byte aligned row width for
++    one-shot ``all_gather(..., dim=-1)``):
++    - Greedy row (``temp == 0``): ``[block_max, 0, float32(global_argmax), 0]``
++    - Sampled row (``temp != 0``): ``[block_max, block_sumexp, owns_draft, draft_logit]``
++      where ``owns_draft`` and ``draft_logit`` are populated in ``blk == 0`` when
++      ``drafts[t + 1]`` falls in ``[vocab_start, vocab_start + vocab)``.
++    """
++    rows, vocab, blocks = T.dynamic("rows, vocab, blocks")
++    drafts_len, idx_len, step_len, temp_len = T.dynamic(
++        "drafts_len, idx_len, step_len, temp_len"
++    )
++    logits_stride, stats_stride = T.dynamic("logits_stride, stats_stride", "int64")
++
++    @T.prim_func
++    def local_stats_shard(
++        local_stats: T.StridedTensor(
++            (rows, 4 * blocks), (stats_stride, 1), T.float32
++        ),
++        logits: T.StridedTensor((rows, vocab), (logits_stride, 1), logits_dtype),
++        drafts: T.Tensor((drafts_len,), drafts_dtype),
++        expanded_idx_mapping: T.Tensor((idx_len,), idx_dtype),
++        expanded_local_pos: T.Tensor((step_len,), step_dtype),
++        temperature: T.Tensor((temp_len,), T.float32),
++        num_speculative_steps: T.int32,
++        apply_temperature: T.int32,
++        vocab_start: T.int32,
++    ):
++        with T.Kernel(rows, blocks, threads=_THREADS) as (t, blk):
++            T.import_source(_HEADER)
++            tx = T.get_thread_binding()
++            raw = T.alloc_local((_STATS_PER_THREAD,), logits_dtype)
++            values = T.alloc_local((_STATS_PER_THREAD,), T.float32)
++            best = T.alloc_local((1,), T.float32)
++            best_index = T.alloc_local((1,), T.int32)
++            other = T.alloc_local((1,), T.float32)
++            other_index = T.alloc_local((1,), T.int32)
++            total = T.alloc_local((1,), T.float32)
++            ties = T.alloc_local((1,), T.float32)
++            partial = T.alloc_shared((_WARPS,), T.float32)
++            partial_index = T.alloc_shared((_WARPS,), T.int32)
++            partial_sum = T.alloc_shared((_WARPS,), T.float32)
++            partial_ties = T.alloc_shared((_WARPS,), T.float32)
++            maximum = T.alloc_shared((1,), T.float32)
++            if run > 1:
++                T.assume(logits_stride % 16 == 0)
++
++            if T.cast(expanded_local_pos[t], T.int64) < T.cast(
++                num_speculative_steps, T.int64
++            ):
++                state = T.alloc_var(
++                    T.int64, init=T.cast(expanded_idx_mapping[t], T.int64)
++                )
++                for r in T.unroll(_STATS_PER_THREAD // run):
++                    col0 = blk * STATS_BLOCK + r * (_THREADS * run) + run * tx
++                    _load_run_at(logits, raw, r * run, t, col0, vocab, run)
++                temp = T.alloc_var(T.float32, init=temperature[state])
++                for j in T.unroll(_STATS_PER_THREAD):
++                    values[j] = T.if_then_else(
++                        blk * STATS_BLOCK + _element(j, tx, run) < vocab,
++                        T.cast(raw[j], T.float32),
++                        -T.infinity(T.float32),
++                    )
++                best[0] = values[0]
++                for j in T.unroll(1, _STATS_PER_THREAD):
++                    best[0] = T.call_extern("float32", "vllm_max", best[0], values[j])
++                if temp == T.float32(0):
++                    best[0] = values[0]
++                    best_index[0] = _element(0, tx, run)
++                    for j in T.unroll(1, _STATS_PER_THREAD):
++                        _keep_or_take(
++                            best, best_index, values[j], _element(j, tx, run)
++                        )
++                    _block_argmax(
++                        best,
++                        best_index,
++                        other,
++                        other_index,
++                        partial,
++                        partial_index,
++                        tx,
++                    )
++                    if tx == 0:
++                        local_stats[t, blk * 4 + 0] = best[0]
++                        local_stats[t, blk * 4 + 1] = T.float32(0)
++                        local_stats[t, blk * 4 + 2] = T.cast(
++                            vocab_start + blk * STATS_BLOCK + best_index[0],
++                            T.float32,
++                        )
++                        local_stats[t, blk * 4 + 3] = T.float32(0)
++                else:
++                    if (apply_temperature != 0) & (temp != T.float32(1)):
++                        for j in T.unroll(_STATS_PER_THREAD):
++                            if blk * STATS_BLOCK + _element(j, tx, run) < vocab:
++                                values[j] = T.call_extern(
++                                    "float32", "vllm_div_full", values[j], temp
++                                )
++                        best[0] = values[0]
++                        for j in T.unroll(1, _STATS_PER_THREAD):
++                            best[0] = T.call_extern(
++                                "float32", "vllm_max", best[0], values[j]
++                            )
++                    _block_reduce(best, partial, tx, "vllm_max")
++                    if tx == 0:
++                        maximum[0] = best[0]
++                    T.sync_threads()
++                    best[0] = maximum[0]
++                    total[0] = T.call_extern(
++                        "float32", "vllm_other_exp", values[0], best[0]
++                    )
++                    ties[0] = T.call_extern("float32", "vllm_tie", values[0], best[0])
++                    for j in T.unroll(1, _STATS_PER_THREAD):
++                        total[0] = T.call_extern(
++                            "float32",
++                            "vllm_add",
++                            total[0],
++                            T.call_extern(
++                                "float32", "vllm_other_exp", values[j], best[0]
++                            ),
++                        )
++                        ties[0] = T.call_extern(
++                            "float32",
++                            "vllm_add",
++                            ties[0],
++                            T.call_extern("float32", "vllm_tie", values[j], best[0]),
++                        )
++                    _block_reduce(total, partial_sum, tx, "vllm_add")
++                    _block_reduce(ties, partial_ties, tx, "vllm_add")
++                    if tx == 0:
++                        local_stats[t, blk * 4 + 0] = best[0]
++                        local_stats[t, blk * 4 + 1] = T.call_extern(
++                            "float32",
++                            "vllm_live_sum",
++                            best[0],
++                            T.call_extern(
++                                "float32",
++                                "vllm_others",
++                                total[0],
++                                ties[0],
++                                best[0],
++                            ),
++                        )
++                        if blk == 0:
++                            draft_tok = T.alloc_var(
++                                T.int64,
++                                init=T.cast(
++                                    drafts[T.min(t + 1, drafts_len - 1)], T.int64
++                                ),
++                            )
++                            draft_col = T.alloc_var(
++                                T.int64,
++                                init=draft_tok - T.cast(vocab_start, T.int64),
++                            )
++                            owns_draft = (draft_col >= T.int64(0)) & (
++                                draft_col < T.cast(vocab, T.int64)
++                            )
++                            d_val = T.alloc_var(
++                                T.float32,
++                                init=T.if_then_else(
++                                    owns_draft,
++                                    T.cast(
++                                        logits[
++                                            t,
++                                            T.min(
++                                                T.max(
++                                                    T.cast(draft_col, T.int32), 0
++                                                ),
++                                                vocab - 1,
++                                            ),
++                                        ],
++                                        T.float32,
++                                    ),
++                                    T.float32(0),
++                                ),
++                            )
++                            if (apply_temperature != 0) & (temp != T.float32(1)):
++                                d_val = T.call_extern(
++                                    "float32", "vllm_div_full", d_val, temp
++                                )
++                            local_stats[t, 2] = T.if_then_else(
++                                owns_draft, T.float32(1), T.float32(0)
++                            )
++                            local_stats[t, 3] = T.if_then_else(
++                                owns_draft, d_val, T.float32(0)
++                            )
++                        else:
++                            local_stats[t, blk * 4 + 2] = T.float32(0)
++                            local_stats[t, blk * 4 + 3] = T.float32(0)
++
++    return local_stats_shard
++
++
++def local_stats_shard_key(
++    logits_dtype: torch.dtype,
++    drafts_dtype: torch.dtype,
++    idx_dtype: torch.dtype,
++    step_dtype: torch.dtype,
++    run: int = 1,
++) -> tuple:
++    return (
++        _DTYPES[logits_dtype],
++        _DTYPES[drafts_dtype],
++        _DTYPES[idx_dtype],
++        _DTYPES[step_dtype],
++        run,
++    )
++
++
++def compute_local_stats_shard(
++    local_stats: torch.Tensor,  # [num_logits, 4 * local_blocks]
++    logits: torch.Tensor,  # [num_logits, shard_vocab_size]
++    draft_sampled: torch.Tensor,  # [num_logits]
++    expanded_idx_mapping: torch.Tensor,  # [num_logits]
++    expanded_local_pos: torch.Tensor,  # [num_logits]
++    temperature: torch.Tensor,  # [max_num_reqs]
++    num_speculative_steps: int,
++    vocab_start: int,
++    apply_temperature: bool = False,
++) -> None:
++    if logits.shape[0] == 0:
++        return
++    kernel = _kernel(
++        local_stats_shard_kernel,
++        *local_stats_shard_key(
++            logits.dtype,
++            draft_sampled.dtype,
++            expanded_idx_mapping.dtype,
++            expanded_local_pos.dtype,
++            _triton_run(logits),
++        ),
++    )
++    kernel(
++        local_stats,
++        logits,
++        draft_sampled.contiguous(),
++        expanded_idx_mapping.contiguous(),
++        expanded_local_pos.contiguous(),
++        temperature,
++        num_speculative_steps,
++        int(apply_temperature),
++        int(vocab_start),
++    )
++
++
++@tilelang.jit(pass_configs=_PASS)
++def verify_shard_kernel(
++    drafts_dtype: str,
++    idx_dtype: str,
++    pos_dtype: str,
++    lanes: int,
++    width: int,
++    cut: bool = False,
++):
++    """Block verification from all-gathered per-rank vocabulary-block statistics."""
++    steps = width - 1
++    if not 1 <= lanes <= _MAX_LANES:
++        raise ValueError(f"{lanes} vocabulary blocks: a row's blocks take one warp")
++    threads = max(32, -(-max(steps, 1) * lanes // 32) * 32)
++    if threads > 1024:
++        raise ValueError(f"{steps} draft steps of {lanes} blocks exceed a block")
++    groups = threads // lanes
++    reqs, num_logits, blocks = T.dynamic("reqs, num_logits, blocks")
++    drafts_len, idx_len, temp_len, seed_len, pos_len, cut_len = T.dynamic(
++        "drafts_len, idx_len, temp_len, seed_len, pos_len, cut_len"
++    )
++    sampled_stride, stats_stride = T.dynamic("sampled_stride, stats_stride", "int64")
++
++    @T.prim_func
++    def verify_shard(
++        sampled: T.StridedTensor((reqs, width), (sampled_stride, 1), T.int64),
++        num_sampled: T.Tensor((reqs,), T.int32),
++        target_lse: T.Tensor((reqs,), T.float32),
++        draft_lse: T.Tensor((reqs,), T.float32),
++        cumulative: T.Tensor((num_logits,), T.float32),
++        gathered_stats: T.StridedTensor(
++            (num_logits, 4 * blocks), (stats_stride, 1), T.float32
++        ),
++        drafts: T.Tensor((drafts_len,), drafts_dtype),
++        cu_num_logits: T.Tensor((reqs + 1,), T.int32),
++        idx_mapping: T.Tensor((idx_len,), idx_dtype),
++        temperature: T.Tensor((temp_len,), T.float32),
++        seeds: T.Tensor((seed_len,), T.int64),
++        pos: T.Tensor((pos_len,), pos_dtype),
++        dead_row_cut: T.Tensor((cut_len,), T.int32),
++        vocab: T.int32,
++    ):
++        with T.Kernel(reqs, threads=threads) as req:
++            T.import_source(_HEADER)
++            tx = T.get_thread_binding()
++            step = tx // lanes
++            block = tx % lanes
++            row_max = T.alloc_local((1,), T.float32)
++            first = T.alloc_local((1,), T.int32)
++            total = T.alloc_local((1,), T.float32)
++            best = T.alloc_local((1,), T.float32)
++            best_index = T.alloc_local((1,), T.int32)
++            other = T.alloc_local((1,), T.float32)
++            other_index = T.alloc_local((1,), T.int32)
++            has_draft = T.alloc_local((1,), T.int32)
++            draft_logit = T.alloc_local((1,), T.float32)
++            lse_s = T.alloc_shared((groups,), T.float32)
++            log_prob_s = T.alloc_shared((groups,), T.float32)
++            uniform_s = T.alloc_shared((groups,), T.float32)
++            draft_s = T.alloc_shared((groups,), T.int64)
++            target_s = T.alloc_shared((groups,), T.int64)
++            cumulative_s = T.alloc_shared((groups,), T.float32)
++            threshold_s = T.alloc_shared((groups,), T.float32)
++
++            start = T.alloc_var(T.int32, init=cu_num_logits[req])
++            end = T.alloc_var(T.int32, init=cu_num_logits[req + 1])
++            state = T.alloc_var(T.int64, init=T.cast(idx_mapping[req], T.int64))
++            num_drafts = end - start - 1
++            live = step < num_drafts
++            row = T.alloc_var(T.int32, init=start + T.min(step, num_drafts))
++            draft = T.alloc_var(
++                T.int64,
++                init=T.cast(drafts[start + T.min(step + 1, num_drafts)], T.int64),
++            )
++            b_clamped = T.min(block, blocks - 1)
++            maximum = T.alloc_var(
++                T.float32, init=gathered_stats[row, b_clamped * 4 + 0]
++            )
++            sumexp = T.alloc_var(
++                T.float32, init=gathered_stats[row, b_clamped * 4 + 1]
++            )
++            position = T.alloc_var(pos_dtype, init=pos[row])
++            temp = T.alloc_var(T.float32, init=temperature[state])
++            seed = T.alloc_var(T.int64, init=seeds[state])
++            in_row = live & (block < blocks)
++            maximum = T.if_then_else(in_row, maximum, -T.infinity(T.float32))
++            sumexp = T.if_then_else(in_row, sumexp, T.float32(0))
++            draft = T.if_then_else(
++                _live_draft(live, step, dead_row_cut, req, cut), draft, T.int64(-1)
++            )
++            has_draft[0] = T.if_then_else(
++                in_row
++                & (gathered_stats[row, b_clamped * 4 + 2] != T.float32(0)),
++                1,
++                0,
++            )
++            draft_logit[0] = T.if_then_else(
++                has_draft[0] != 0,
++                gathered_stats[row, b_clamped * 4 + 3],
++                T.float32(0),
++            )
++            for distance in _distances(lanes):
++                other_has = T.shfl_xor(has_draft[0], distance)
++                other_logit = T.shfl_xor(draft_logit[0], distance)
++                draft_logit[0] = T.if_then_else(
++                    has_draft[0] != 0, draft_logit[0], other_logit
++                )
++                has_draft[0] = has_draft[0] | other_has
++            logit = T.alloc_var(T.float32, init=draft_logit[0])
++
++            row_max[0] = maximum
++            for distance in _distances(lanes):
++                row_max[0] = T.call_extern(
++                    "float32", "vllm_max", row_max[0], T.shfl_xor(row_max[0], distance)
++                )
++            first[0] = T.if_then_else(
++                T.call_extern("int32", "vllm_is_max", maximum, row_max[0]) != 0,
++                block,
++                lanes,
++            )
++            for distance in _distances(lanes):
++                first[0] = T.min(first[0], T.shfl_xor(first[0], distance))
++            total[0] = T.if_then_else(
++                block == first[0],
++                sumexp,
++                T.call_extern(
++                    "float32",
++                    "vllm_mul",
++                    T.call_extern("float32", "vllm_exp_from", maximum, row_max[0]),
++                    T.call_extern("float32", "vllm_add", T.float32(1), sumexp),
++                ),
++            )
++            for distance in _distances(lanes):
++                total[0] = T.call_extern(
++                    "float32", "vllm_add", total[0], T.shfl_xor(total[0], distance)
++                )
++            softplus = T.alloc_var(
++                T.float32,
++                init=T.call_extern(
++                    "float32",
++                    "vllm_softplus",
++                    T.call_extern(
++                        "float32", "vllm_row_others", total[0], row_max[0], vocab
++                    ),
++                ),
++            )
++
++            best[0] = T.if_then_else(T.isnan(maximum), -T.infinity(T.float32), maximum)
++            best_index[0] = block
++            for distance in _distances(lanes):
++                _exchange(best, best_index, other, other_index, distance)
++            target = T.alloc_var(
++                T.int64,
++                init=T.cast(
++                    gathered_stats[row, T.min(best_index[0], blocks - 1) * 4 + 2],
++                    T.int64,
++                ),
++            )
++
++            word = _randint_at(
++                seed ^ T.shift_left(T.cast(step, T.int64), T.int64(32)),
++                position,
++                pos_dtype,
++                False,
++            )
++            if block == 0:
++                lse_s[step] = T.call_extern("float32", "vllm_add", row_max[0], softplus)
++                log_prob_s[step] = T.call_extern(
++                    "float32",
++                    "vllm_sub",
++                    T.call_extern("float32", "vllm_shifted", logit, row_max[0]),
++                    softplus,
++                )
++                uniform_s[step] = T.call_extern("float32", "vllm_uniform", word)
++                draft_s[step] = draft
++                target_s[step] = target
++            T.sync_threads()
++
++            if block == 0:  # noqa: SIM102
++                if step < steps:
++                    log_p = T.alloc_var(T.float32, init=T.float32(0))
++                    for k in tuple(range(steps)):
++                        if k <= step:
++                            log_p = T.if_then_else(
++                                draft_s[k] >= 0,
++                                T.call_extern(
++                                    "float32", "vllm_log_ratio", log_p, log_prob_s[k]
++                                ),
++                                log_p,
++                            )
++                    cumulative_s[step] = log_p
++                    after = T.alloc_var(T.int32, init=T.min(step + 1, steps - 1))
++                    threshold_s[step] = T.if_then_else(
++                        (step + 1 < steps) & (draft_s[after] >= 0),
++                        T.call_extern(
++                            "float32", "vllm_block_threshold", log_p, log_prob_s[after]
++                        ),
++                        T.call_extern("float32", "vllm_exp", log_p),
++                    )
++            T.sync_threads()
++
++            if tx == 0:
++                greedy = T.alloc_var(
++                    T.int32, init=T.cast(temp == T.float32(0), T.int32)
++                )
++                accepted = T.alloc_var(T.int64, init=T.int64(0))
++                verifying = T.alloc_var(T.int32, init=1)
++                for i in tuple(range(steps)):
++                    if i < num_drafts:
++                        drafted = T.alloc_var(T.int64, init=draft_s[i])
++                        valid = T.cast(drafted >= 0, T.int32)
++                        token = T.max(drafted, T.int64(0))
++                        if greedy == 0:
++                            cumulative[start + i] = cumulative_s[i]
++                            verifying = verifying & valid
++                        if verifying != 0:
++                            if greedy != 0:
++                                hit = T.alloc_var(
++                                    T.int32,
++                                    init=T.cast(target_s[i] == token, T.int32) & valid,
++                                )
++                                sampled[req, i] = T.if_then_else(
++                                    hit != 0, token, target_s[i]
++                                )
++                                accepted = accepted + T.cast(hit, T.int64)
++                                verifying = hit
++                            else:
++                                accepted = T.if_then_else(
++                                    T.call_extern(
++                                        "int32",
++                                        "vllm_at_most",
++                                        uniform_s[i],
++                                        threshold_s[i],
++                                    )
++                                    != 0,
++                                    T.int64(i + 1),
++                                    accepted,
++                                )
++                                sampled[req, i] = token
++                num_sampled[req] = T.cast(accepted, T.int32)
++                target_lse[req] = T.if_then_else(
++                    (greedy == 0) & (accepted < T.cast(num_drafts, T.int64)),
++                    lse_s[T.min(accepted, T.int64(groups - 1))],
++                    T.float32(0),
++                )
++                draft_lse[req] = T.float32(0)
++
++    return verify_shard
++
++
++def verify_shard_key(
++    drafts_dtype: torch.dtype,
++    idx_dtype: torch.dtype,
++    pos_dtype: torch.dtype,
++    total_blocks: int,
++    num_speculative_steps: int,
++    cut: bool = False,
++) -> tuple:
++    return (
++        _DTYPES[drafts_dtype],
++        _DTYPES[idx_dtype],
++        _DTYPES[pos_dtype],
++        _padded_blocks_count(total_blocks),
++        num_speculative_steps + 1,
++        cut,
++    )
++
++
++def verify_shard(
++    sampled: torch.Tensor,
++    num_sampled: torch.Tensor,
++    target_rejected_logsumexp: torch.Tensor,
++    draft_rejected_logsumexp: torch.Tensor,
++    cumulative_log_p: torch.Tensor,
++    gathered_stats: torch.Tensor,
++    draft_sampled: torch.Tensor,
++    cu_num_logits: torch.Tensor,
++    idx_mapping: torch.Tensor,
++    temperature: torch.Tensor,
++    seed: torch.Tensor,
++    pos: torch.Tensor,
++    num_speculative_steps: int,
++    vocab_size: int,
++    dead_row_cut: torch.Tensor | None = None,
++) -> None:
++    if num_sampled.shape[0] == 0:
++        return
++    total_blocks = gathered_stats.shape[1] // 4
++    kernel = _kernel(
++        verify_shard_kernel,
++        *verify_shard_key(
++            draft_sampled.dtype,
++            idx_mapping.dtype,
++            pos.dtype,
++            total_blocks,
++            num_speculative_steps,
++            dead_row_cut is not None,
++        ),
++    )
++    kernel(
++        sampled,
++        num_sampled,
++        target_rejected_logsumexp,
++        draft_rejected_logsumexp,
++        cumulative_log_p,
++        gathered_stats,
++        draft_sampled.contiguous(),
++        cu_num_logits,
++        idx_mapping.contiguous(),
++        temperature,
++        seed,
++        pos.contiguous(),
++        num_sampled if dead_row_cut is None else dead_row_cut,
++        int(vocab_size),
++    )
++
++
++@tilelang.jit(pass_configs=_PASS)
++def resample_shard_kernel(
++    logits_dtype: str,
++    idx_dtype: str,
++    drafts_dtype: str,
++    pos_dtype: str,
++    run: int,
++    cut: bool = False,
++):
++    """Shard-local ``resample_kernel`` with global Philox offsets and token indices."""
++    reqs, num_logits, vocab, blocks = T.dynamic("reqs, num_logits, vocab, blocks")
++    idx_len, drafts_len, temp_len, seed_len, pos_len, cut_len = T.dynamic(
++        "idx_len, drafts_len, temp_len, seed_len, pos_len, cut_len"
++    )
++    logits_stride, argmax_stride, max_stride = T.dynamic(
++        "logits_stride, argmax_stride, max_stride", "int64"
++    )
++
++    @T.macro
++    def passes(logits, raw, score, best, best_index, row, rejected, word_seed, temp,
++               apply_temperature, vocab_start, blk, tx, noisy):  # fmt: skip
++        for r in T.unroll(_PASSES // run):
++            col0 = blk * RESAMPLE_BLOCK + r * (_THREADS * run) + run * tx
++            _load_run(logits, raw, row, col0, vocab, run)
++            for k in T.unroll(run):
++                local = r * (_THREADS * run) + run * tx + k
++                index = col0 + k
++                global_index = vocab_start + index
++                if noisy:
++                    word = T.alloc_var(
++                        T.uint32,
++                        init=T.call_extern(
++                            "uint32", "vllm_randint32", word_seed[0], global_index
++                        ),
++                    )
++                score[0] = -T.infinity(T.float32)
++                if index < vocab:
++                    score[0] = T.cast(raw[k], T.float32)
++                    if noisy:
++                        if (apply_temperature != 0) & (temp != T.float32(1)):
++                            score[0] = T.call_extern(
++                                "float32", "vllm_div_full", score[0], temp
++                            )
++                    score[0] = T.if_then_else(
++                        T.cast(global_index, T.int64) == rejected[0],
++                        -T.infinity(T.float32),
++                        score[0],
++                    )
++                    if noisy:
++                        score[0] = T.call_extern(
++                            "float32", "vllm_gumbel_score", score[0], word
++                        )
++                if r * run + k == 0:
++                    best[0] = score[0]
++                    best_index[0] = local
++                else:
++                    _keep_or_take(best, best_index, score[0], local)
++
++    @T.prim_func
++    def resample_shard(
++        local_argmax: T.StridedTensor((reqs, blocks), (argmax_stride, 1), T.int64),
++        local_max: T.StridedTensor((reqs, blocks), (max_stride, 1), T.float32),
++        logits: T.StridedTensor((num_logits, vocab), (logits_stride, 1), logits_dtype),
++        num_sampled: T.Tensor((reqs,), T.int32),
++        cu_num_logits: T.Tensor((reqs + 1,), T.int32),
++        expanded_idx_mapping: T.Tensor((idx_len,), idx_dtype),
++        drafts: T.Tensor((drafts_len,), drafts_dtype),
++        temperature: T.Tensor((temp_len,), T.float32),
++        seeds: T.Tensor((seed_len,), T.int64),
++        pos: T.Tensor((pos_len,), pos_dtype),
++        dead_row_cut: T.Tensor((cut_len,), T.int32),
++        apply_temperature: T.int32,
++        vocab_start: T.int32,
++    ):
++        with T.Kernel(reqs, blocks, threads=_THREADS) as (req, blk):
++            T.import_source(_HEADER)
++            tx = T.get_thread_binding()
++            raw = T.alloc_local((run,), logits_dtype)
++            score = T.alloc_local((1,), T.float32)
++            best = T.alloc_local((1,), T.float32)
++            best_index = T.alloc_local((1,), T.int32)
++            other = T.alloc_local((1,), T.float32)
++            other_index = T.alloc_local((1,), T.int32)
++            rejected = T.alloc_local((1,), T.int64)
++            word_seed = T.alloc_local((1,), T.uint32)
++            partial = T.alloc_shared((_WARPS,), T.float32)
++            partial_index = T.alloc_shared((_WARPS,), T.int32)
++            if run > 1:
++                T.assume(logits_stride % 16 == 0)
++
++            end = T.alloc_var(T.int32, init=cu_num_logits[req + 1])
++            row = T.alloc_var(
++                T.int64,
++                init=T.cast(cu_num_logits[req], T.int64)
++                + T.cast(num_sampled[req], T.int64),
++            )
++            state = T.alloc_var(
++                T.int64, init=T.cast(expanded_idx_mapping[row], T.int64)
++            )
++            temp = T.alloc_var(T.float32, init=temperature[state])
++            bonus = row == T.cast(end - 1, T.int64)
++            if (temp != T.float32(0)) | bonus:
++                draft = T.alloc_var(
++                    T.int64,
++                    init=T.cast(
++                        drafts[T.min(row + 1, T.cast(end - 1, T.int64))], T.int64
++                    ),
++                )
++                rejected[0] = T.if_then_else(
++                    _ends_block(
++                        bonus | (draft < 0), num_sampled[req], dead_row_cut, req, cut
++                    ),
++                    T.int64(-1),
++                    draft,
++                )
++                seed = T.alloc_var(
++                    T.int64,
++                    init=T.if_then_else(
++                        state >= 0, seeds[T.max(state, T.int64(0))], T.int64(0)
++                    ),
++                )
++                word_seed[0] = _randint_at(seed, pos[row], pos_dtype, False)
++                if T.if_then_else(state >= 0, temp, T.float32(0)) != T.float32(0):
++                    passes(logits, raw, score, best, best_index, row, rejected,
++                           word_seed, temp, apply_temperature, vocab_start, blk, tx, True)  # fmt: skip
++                else:
++                    passes(logits, raw, score, best, best_index, row, rejected,
++                           word_seed, temp, apply_temperature, vocab_start, blk, tx, False)  # fmt: skip
++                _block_argmax(
++                    best, best_index, other, other_index, partial, partial_index, tx
++                )
++                if tx == 0:
++                    local_argmax[req, blk] = T.cast(
++                        vocab_start + blk * RESAMPLE_BLOCK + best_index[0], T.int64
++                    )
++                    local_max[req, blk] = best[0]
++
++    return resample_shard
++
++
++def resample_shard(
++    resampled_local_argmax: torch.Tensor,
++    resampled_local_max: torch.Tensor,
++    target_logits: torch.Tensor,
++    num_sampled: torch.Tensor,
++    cu_num_logits: torch.Tensor,
++    expanded_idx_mapping: torch.Tensor,
++    draft_sampled: torch.Tensor,
++    temperature: torch.Tensor,
++    seed: torch.Tensor,
++    pos: torch.Tensor,
++    vocab_start: int,
++    dead_row_cut: torch.Tensor | None = None,
++    apply_temperature: bool = False,
++) -> None:
++    if num_sampled.shape[0] == 0:
++        return
++    kernel = _kernel(
++        resample_shard_kernel,
++        *resample_key(
++            target_logits.dtype,
++            expanded_idx_mapping.dtype,
++            draft_sampled.dtype,
++            pos.dtype,
++            _triton_run(target_logits),
++            dead_row_cut is not None,
++        ),
++    )
++    kernel(
++        resampled_local_argmax,
++        resampled_local_max,
++        target_logits,
++        num_sampled,
++        cu_num_logits,
++        expanded_idx_mapping.contiguous(),
++        draft_sampled.contiguous(),
++        temperature,
++        seed,
++        pos.contiguous(),
++        num_sampled if dead_row_cut is None else dead_row_cut,
++        int(apply_temperature),
++        int(vocab_start),
++    )
++
++
++@tilelang.jit(pass_configs=_PASS)
++def resample_shard_pair_kernel(blocks: int):
++    """Reduce each request's ``blocks`` shard winners to one 16-byte pair row
++    ``[best_max, float32(best_id), 0, 0]``."""
++    requests = T.dynamic("requests")
++    id_stride, value_stride, pair_stride = T.dynamic(
++        "id_stride, value_stride, pair_stride", "int64"
++    )
++    padded = 1 << max(blocks - 1, 0).bit_length()
++    per = max(1, (blocks + 31) // 32)
++
++    @T.prim_func
++    def resample_shard_pair(
++        local_pairs: T.StridedTensor((requests, 4), (pair_stride, 1), T.float32),
++        local_ids: T.StridedTensor((requests, blocks), (id_stride, 1), T.int64),
++        local_max: T.StridedTensor((requests, blocks), (value_stride, 1), T.float32),
++    ):
++        with T.Kernel(requests, threads=32) as row:
++            thread = T.get_thread_binding()
++            values = T.alloc_local((per,), T.float32)
++            ids = T.alloc_local((per,), T.int64)
++            for k in T.unroll(per):
++                i = T.min(k * 32 + thread, blocks - 1)
++                values[k] = local_max[row, i]
++                ids[k] = local_ids[row, i]
++            best = T.alloc_local((1,), T.float32)
++            best_index = T.alloc_local((1,), T.int32)
++            best_id = T.alloc_local((1,), T.int64)
++            best[0] = -T.infinity(T.float32)
++            best_index[0] = padded
++            best_id[0] = T.int64(0)
++            for k in T.unroll(per):
++                idx = k * 32 + thread
++                valid = idx < blocks
++                val = T.if_then_else(
++                    T.isnan(values[k]), -T.infinity(T.float32), values[k]
++                )
++                take = valid & (
++                    (val > best[0]) | ((val == best[0]) & (idx < best_index[0]))
++                )
++                best_id[0] = T.if_then_else(take, ids[k], best_id[0])
++                best_index[0] = T.if_then_else(take, idx, best_index[0])
++                best[0] = T.if_then_else(take, val, best[0])
++            for distance in (16, 8, 4, 2, 1):
++                other_val = T.shfl_xor(best[0], distance)
++                other_idx = T.shfl_xor(best_index[0], distance)
++                other_id = T.shfl_xor(best_id[0], distance)
++                take = (other_val > best[0]) | (
++                    (other_val == best[0]) & (other_idx < best_index[0])
++                )
++                best_id[0] = T.if_then_else(take, other_id, best_id[0])
++                best_index[0] = T.if_then_else(take, other_idx, best_index[0])
++                best[0] = T.if_then_else(take, other_val, best[0])
++            if thread == 0:
++                local_pairs[row, 0] = best[0]
++                local_pairs[row, 1] = T.cast(best_id[0], T.float32)
++                local_pairs[row, 2] = T.float32(0)
++                local_pairs[row, 3] = T.float32(0)
++
++    return resample_shard_pair
++
++
++@tilelang.jit(pass_configs=_PASS)
++def insert_shard_resampled_kernel(
++    tp_size: int,
++    index_dtype: str,
++    limited: bool = False,
++):
++    """Select the winning resampled or bonus token across ``tp_size`` gathered rank
++    pairs and commit each request's count."""
++    requests, width = T.dynamic("requests, width")
++    mapping_len, state_len, cut_len = T.dynamic("mapping_len, state_len, cut_len")
++    sampled_stride, pair_stride = T.dynamic("sampled_stride, pair_stride", "int64")
++
++    @T.prim_func
++    def insert_shard_resampled(
++        sampled: T.StridedTensor((requests, width), (sampled_stride, 1), T.int64),
++        counts: T.Tensor((requests,), T.int32),
++        gathered_pairs: T.StridedTensor(
++            (requests, 4 * tp_size), (pair_stride, 1), T.float32
++        ),
++        cu: T.Tensor((requests + 1,), T.int32),
++        mapping: T.Tensor((mapping_len,), index_dtype),
++        temperature: T.Tensor((state_len,), T.float32),
++        dead_row_cut: T.Tensor((cut_len,), T.int32),
++    ):
++        with T.Kernel(requests, threads=1) as row:
++            count = T.alloc_var(T.int32, init=counts[row])
++            if limited:
++                counts[row] = T.min(count + 1, dead_row_cut[row] + 1)
++            else:
++                counts[row] = count + 1
++            position = cu[row] + count
++            state = mapping[position]
++            if (
++                T.cast(temperature[state] != 0, T.int32)
++                | T.cast(position == cu[row + 1] - 1, T.int32)
++            ) != 0:
++                best = T.alloc_var(T.float32, init=-T.infinity(T.float32))
++                winner = T.alloc_var(T.int64, init=T.int64(0))
++                for r in T.unroll(tp_size):
++                    raw_val = gathered_pairs[row, r * 4]
++                    value = T.if_then_else(
++                        T.isnan(raw_val), -T.infinity(T.float32), raw_val
++                    )
++                    tok = T.cast(gathered_pairs[row, r * 4 + 1], T.int64)
++                    if (r == 0) | (value > best):
++                        best = value
++                        winner = tok
++                sampled[row, count] = winner
++
++    return insert_shard_resampled
++
++
++def verify_and_resample_from_shards(
++    target_logits: torch.Tensor,
++    draft_sampled: torch.Tensor,
++    cu_num_logits: torch.Tensor,
++    pos: torch.Tensor,
++    idx_mapping: torch.Tensor,
++    expanded_idx_mapping: torch.Tensor,
++    expanded_local_pos: torch.Tensor,
++    temperature: torch.Tensor,
++    seed: torch.Tensor,
++    num_speculative_steps: int,
++    vocab_start: int,
++    vocab_size: int,
++    tp_size: int,
++    all_gather_fn: Callable[[torch.Tensor], torch.Tensor] | None = None,
++    dead_row_cut: torch.Tensor | None = None,
++    kernel_steps: int | None = None,
++    apply_temperature: bool = False,
++    local_stats: torch.Tensor | None = None,
++    resampled_local_argmax: torch.Tensor | None = None,
++    resampled_local_max: torch.Tensor | None = None,
++    local_pairs: torch.Tensor | None = None,
++    sampled: torch.Tensor | None = None,
++    num_sampled: torch.Tensor | None = None,
++) -> tuple[torch.Tensor, torch.Tensor]:
++    """Shard-local block verification and resampling without all-gathering
++    the full vocabulary logits across tensor-parallel ranks."""
++    num_reqs = cu_num_logits.shape[0] - 1
++    num_logits, shard_vocab = target_logits.shape
++    steps = num_speculative_steps if kernel_steps is None else kernel_steps
++    assert steps <= num_speculative_steps
++
++    local_blocks = -(-max(shard_vocab, target_logits.stride(0)) // STATS_BLOCK)
++    if local_stats is None:
++        local_stats = target_logits.new_empty(
++            num_logits, 4 * local_blocks, dtype=torch.float32
++        )
++    compute_local_stats_shard(
++        local_stats,
++        target_logits,
++        draft_sampled,
++        expanded_idx_mapping,
++        expanded_local_pos,
++        temperature,
++        steps,
++        vocab_start,
++        apply_temperature,
++    )
++
++    if tp_size > 1 and all_gather_fn is not None:
++        gathered_stats = all_gather_fn(local_stats)
++    else:
++        gathered_stats = local_stats
++
++    cumulative_log_p = target_logits.new_empty(num_logits, dtype=torch.float32)
++    if sampled is None:
++        sampled = draft_sampled.new_empty(
++            num_reqs, num_speculative_steps + 1, dtype=torch.int64
++        )
++    if num_sampled is None:
++        num_sampled = sampled.new_empty(num_reqs, dtype=torch.int32)
++    target_rejected_logsumexp = target_logits.new_empty(num_reqs, dtype=torch.float32)
++    draft_rejected_logsumexp = target_logits.new_empty(num_reqs, dtype=torch.float32)
++    verify_shard(
++        sampled[:, : steps + 1],
++        num_sampled,
++        target_rejected_logsumexp,
++        draft_rejected_logsumexp,
++        cumulative_log_p,
++        gathered_stats,
++        draft_sampled,
++        cu_num_logits,
++        idx_mapping,
++        temperature,
++        seed,
++        pos,
++        steps,
++        vocab_size,
++        dead_row_cut,
++    )
++
++    resample_blocks = -(-max(shard_vocab, target_logits.stride(0)) // RESAMPLE_BLOCK)
++    if resampled_local_argmax is None:
++        resampled_local_argmax = target_logits.new_empty(
++            num_reqs, resample_blocks, dtype=torch.int64
++        )
++    if resampled_local_max is None:
++        resampled_local_max = target_logits.new_empty(
++            num_reqs, resample_blocks, dtype=torch.float32
++        )
++    resample_shard(
++        resampled_local_argmax,
++        resampled_local_max,
++        target_logits,
++        num_sampled,
++        cu_num_logits,
++        expanded_idx_mapping,
++        draft_sampled,
++        temperature,
++        seed,
++        pos,
++        vocab_start,
++        dead_row_cut,
++        apply_temperature,
++    )
++
++    if local_pairs is None:
++        local_pairs = target_logits.new_empty(num_reqs, 4, dtype=torch.float32)
++    if num_reqs > 0:
++        pair_fn = _kernel(resample_shard_pair_kernel, resample_blocks)
++        pair_fn(local_pairs, resampled_local_argmax, resampled_local_max)
++
++    if tp_size > 1 and all_gather_fn is not None:
++        gathered_pairs = all_gather_fn(local_pairs)
++    else:
++        gathered_pairs = local_pairs
++
++    if num_reqs > 0:
++        insert_fn = _kernel(
++            insert_shard_resampled_kernel,
++            int(tp_size),
++            _DTYPES[expanded_idx_mapping.dtype],
++            dead_row_cut is not None,
++        )
++        insert_fn(
++            sampled,
++            num_sampled,
++            gathered_pairs,
++            cu_num_logits,
++            expanded_idx_mapping.contiguous(),
++            temperature,
++            num_sampled if dead_row_cut is None else dead_row_cut,
++        )
++    return sampled, num_sampled
++
++
++def resample_from_shards(
++    target_logits: torch.Tensor,
++    draft_sampled: torch.Tensor,
++    cu_num_logits: torch.Tensor,
++    pos: torch.Tensor,
++    expanded_idx_mapping: torch.Tensor,
++    temperature: torch.Tensor,
++    seed: torch.Tensor,
++    vocab_start: int,
++    tp_size: int,
++    all_gather_fn: Callable[[torch.Tensor], torch.Tensor] | None = None,
++    dead_row_cut: torch.Tensor | None = None,
++    apply_temperature: bool = False,
++    resampled_local_argmax: torch.Tensor | None = None,
++    resampled_local_max: torch.Tensor | None = None,
++    local_pairs: torch.Tensor | None = None,
++    sampled: torch.Tensor | None = None,
++    num_sampled: torch.Tensor | None = None,
++) -> tuple[torch.Tensor, torch.Tensor]:
++    """Shard-local Gumbel/greedy sampling for 1-token-per-request steps."""
++    num_reqs = cu_num_logits.shape[0] - 1
++    _, shard_vocab = target_logits.shape
++    if sampled is None:
++        sampled = draft_sampled.new_empty(num_reqs, 1, dtype=torch.int64)
++    if num_sampled is None:
++        num_sampled = sampled.new_zeros(num_reqs, dtype=torch.int32)
++    else:
++        num_sampled.zero_()
++
++    resample_blocks = -(-max(shard_vocab, target_logits.stride(0)) // RESAMPLE_BLOCK)
++    if resampled_local_argmax is None:
++        resampled_local_argmax = target_logits.new_empty(
++            num_reqs, resample_blocks, dtype=torch.int64
++        )
++    if resampled_local_max is None:
++        resampled_local_max = target_logits.new_empty(
++            num_reqs, resample_blocks, dtype=torch.float32
++        )
++    resample_shard(
++        resampled_local_argmax,
++        resampled_local_max,
++        target_logits,
++        num_sampled,
++        cu_num_logits,
++        expanded_idx_mapping,
++        draft_sampled,
++        temperature,
++        seed,
++        pos,
++        vocab_start,
++        dead_row_cut,
++        apply_temperature,
++    )
++
++    if local_pairs is None:
++        local_pairs = target_logits.new_empty(num_reqs, 4, dtype=torch.float32)
++    if num_reqs > 0:
++        pair_fn = _kernel(resample_shard_pair_kernel, resample_blocks)
++        pair_fn(local_pairs, resampled_local_argmax, resampled_local_max)
++
++    if tp_size > 1 and all_gather_fn is not None:
++        gathered_pairs = all_gather_fn(local_pairs)
++    else:
++        gathered_pairs = local_pairs
++
++    if num_reqs > 0:
++        insert_fn = _kernel(
++            insert_shard_resampled_kernel,
++            int(tp_size),
++            _DTYPES[expanded_idx_mapping.dtype],
++            dead_row_cut is not None,
++        )
++        insert_fn(
++            sampled,
++            num_sampled,
++            gathered_pairs,
++            cu_num_logits,
++            expanded_idx_mapping.contiguous(),
++            temperature,
++            num_sampled if dead_row_cut is None else dead_row_cut,
++        )
++    return sampled, num_sampled
++
++
++def shard_rejection_calls(
++    logits_dtypes: Sequence[torch.dtype],
++    shard_vocab_size: int,
++    tp_size: int,
++    step_widths: Sequence[int],
++    cuts: Sequence[bool] = (False,),
++) -> list:
++    local_blocks = -(-shard_vocab_size // STATS_BLOCK)
++    total_blocks = tp_size * local_blocks
++    resample_blocks = -(-shard_vocab_size // RESAMPLE_BLOCK)
++    calls = [
++        _call(resample_shard_pair_kernel, resample_blocks),
++    ]
++    for cut in cuts:
++        calls += [
++            _call(
++                insert_shard_resampled_kernel,
++                int(tp_size),
++                _DTYPES[idx_dtype],
++                cut,
++            )
++            for idx_dtype in (torch.int32, torch.int64)
++        ]
++        for steps in dict.fromkeys(step_widths):
++            calls.append(
++                _call(
++                    verify_shard_kernel,
++                    *verify_shard_key(
++                        torch.int32,
++                        RUNNER_IDX_DTYPE,
++                        torch.int64,
++                        total_blocks,
++                        steps,
++                        cut,
++                    ),
++                )
++            )
++    for dtype in dict.fromkeys(logits_dtypes):
++        for run in _runs(dtype):
++            calls.append(
++                _call(
++                    local_stats_shard_kernel,
++                    *local_stats_shard_key(
++                        dtype, torch.int32, RUNNER_IDX_DTYPE, torch.int32, run
++                    ),
++                )
++            )
++            calls += [
++                _call(
++                    resample_shard_kernel,
++                    *resample_key(
++                        dtype, RUNNER_IDX_DTYPE, torch.int32, torch.int64, run, cut
++                    ),
++                )
++                for cut in cuts
++            ]
++    return calls
++
++
++def register_shard_block_verification(
++    logits_dtypes: Sequence[torch.dtype],
++    shard_vocab_size: int,
++    tp_size: int,
++    num_speculative_steps: int,
++    step_widths: Sequence[int] = (),
++    dead_rows: bool = False,
++) -> None:
++    cuts = (False, True) if dead_rows else (False,)
++    widths = tuple(dict.fromkeys(step_widths or (num_speculative_steps,)))
++    declare(
++        lambda: shard_rejection_calls(
++            logits_dtypes, shard_vocab_size, tp_size, widths, cuts
++        )
++    )
+-- 
+2.43.0
+
