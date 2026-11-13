@@ -1,0 +1,1226 @@
+{
+ "pr": 986,
+ "round": 1,
+ "candidate": "candidate-47",
+ "verdict": "no-defensible-correction",
+ "summary": "In serving, #986 changes the draft budget only at c16, and by little: verified rows -0.87% (44.61 -> 44.22 a step, boot spread 0.06-0.08), tokens -0.44%, wasted rows -2.3%, coverage at positions 1-4 down 0.002-0.007. At c8 and c1 it picks the same rows (c1 identical by construction: one request, at most 6 rows, every #986 term is zero). The regimes its screen priced are absent from the release suite (contexts <= 285 tokens; c1 <= 6 rows; c8 <= 48 rows) or rare (c16: about 8.5% of steps above 64 rows in a replay that reproduces the served change). Where it fires, the predicted saving was the screen's own latency model (a non-monotone TP1 dense table on zero tensors plus a hand-set 440 us/row MoE term above 64 rows), not a cost the tp4-ring engine grid shows: the grid has no context cost from 4K to 1M and prices 64 -> 96 rows at about what 1107's 0.55 slope already charges. A replay of the real 1107 and #986 modules over steps fitted to the served counters predicts |change| <= 0.16% at c16, <= 0.01% at c8 and 0 at c1 for #986 and for a knee re-calibrated to the grid, under every step-time model tried; the A/A floors are 0.43/0.39/0.35%. No correction of #986's terms can be confirmed in serving, and the context band, the one part serving would hit (production's 64-100K agent prompts), prices a cost that does not exist on tp4-ring.",
+ "what_986_changes_in_serving": {
+  "c16": {
+   "no986": {
+    "rows": 44.6051,
+    "tokens": 34.2919,
+    "yield": 0.7688,
+    "wasted": 10.3133
+   },
+   "with986": {
+    "rows": 44.2186,
+    "tokens": 34.1422,
+    "yield": 0.7721,
+    "wasted": 10.0764
+   },
+   "change_pct": {
+    "tokens": -0.44,
+    "rows": -0.87,
+    "yield": 0.43,
+    "wasted": -2.3,
+    "steps_per_s": 0.8
+   },
+   "coverage_by_position_no986": [
+    1.0,
+    0.5869,
+    0.2844,
+    0.1469,
+    0.0809
+   ],
+   "coverage_change_by_position": [
+    0.0,
+    -0.0067,
+    -0.0032,
+    -0.0016,
+    -0.0019
+   ],
+   "survival_by_position_no986": [
+    0.7199,
+    0.3602,
+    0.1678,
+    0.0868,
+    0.0483
+   ],
+   "survival_change_by_position": [
+    0.0032,
+    -0.0021,
+    -0.0008,
+    0.0,
+    -0.0001
+   ],
+   "boot_spread_rows": [
+    0.059,
+    0.076
+   ]
+  },
+  "c8": {
+   "no986": {
+    "rows": 25.8116,
+    "tokens": 18.0382,
+    "yield": 0.6988,
+    "wasted": 7.7734
+   },
+   "with986": {
+    "rows": 25.8419,
+    "tokens": 18.0681,
+    "yield": 0.6992,
+    "wasted": 7.7738
+   },
+   "change_pct": {
+    "tokens": 0.17,
+    "rows": 0.12,
+    "yield": 0.05,
+    "wasted": 0.0,
+    "steps_per_s": 0.22
+   },
+   "coverage_by_position_no986": [
+    1.0,
+    0.7106,
+    0.3793,
+    0.1944,
+    0.1037
+   ],
+   "coverage_change_by_position": [
+    0.0,
+    0.0025,
+    0.0013,
+    -0.0006,
+    -0.0021
+   ],
+   "survival_by_position_no986": [
+    0.6791,
+    0.3669,
+    0.178,
+    0.0927,
+    0.0512
+   ],
+   "survival_change_by_position": [
+    0.0005,
+    0.0011,
+    0.001,
+    -0.0001,
+    -0.0006
+   ],
+   "boot_spread_rows": [
+    0.012,
+    0.01
+   ]
+  },
+  "c1": {
+   "no986": {
+    "rows": 3.7384,
+    "tokens": 2.3802,
+    "yield": 0.6367,
+    "wasted": 1.3583
+   },
+   "with986": {
+    "rows": 3.7481,
+    "tokens": 2.3823,
+    "yield": 0.6356,
+    "wasted": 1.3658
+   },
+   "change_pct": {
+    "tokens": 0.09,
+    "rows": 0.26,
+    "yield": -0.17,
+    "wasted": 0.56,
+    "steps_per_s": 0.1
+   },
+   "coverage_by_position_no986": [
+    1.0,
+    0.8616,
+    0.4975,
+    0.2519,
+    0.1283
+   ],
+   "coverage_change_by_position": [
+    0.0,
+    0.0019,
+    0.0032,
+    0.0026,
+    0.0012
+   ],
+   "survival_by_position_no986": [
+    0.6654,
+    0.383,
+    0.1851,
+    0.0949,
+    0.0526
+   ],
+   "survival_change_by_position": [
+    0.0001,
+    0.0005,
+    0.0005,
+    0.0005,
+    0.0004
+   ],
+   "boot_spread_rows": [
+    0.004,
+    0.004
+   ]
+  },
+  "poisson": {
+   "no986": {
+    "rows": 18.7747,
+    "tokens": 13.1373,
+    "yield": 0.6997,
+    "wasted": 5.6374
+   },
+   "with986": {
+    "rows": 18.5503,
+    "tokens": 13.0141,
+    "yield": 0.7016,
+    "wasted": 5.5362
+   },
+   "change_pct": {
+    "tokens": -0.94,
+    "rows": -1.2,
+    "yield": 0.26,
+    "wasted": -1.8,
+    "steps_per_s": 0.85
+   },
+   "coverage_by_position_no986": [
+    1.0,
+    0.7176,
+    0.3919,
+    0.2032,
+    0.1036
+   ],
+   "coverage_change_by_position": [
+    0.0,
+    -0.0011,
+    -0.0069,
+    -0.0038,
+    -0.0006
+   ],
+   "survival_by_position_no986": [
+    0.6883,
+    0.3729,
+    0.1828,
+    0.0954,
+    0.0513
+   ],
+   "survival_change_by_position": [
+    0.0005,
+    -0.0009,
+    -0.0007,
+    -0.0009,
+    -0.0004
+   ],
+   "boot_spread_rows": [
+    0.025,
+    0.101
+   ]
+  },
+  "paired_decode_from_candidate_47_README": {
+   "c16": "+0.38% (margin 0.64%)",
+   "c8": "+0.20% (0.53%)",
+   "c1": "+0.24% (0.34%)"
+  },
+  "note_c1": "the c1 budget is identical by construction, so c1's +0.24% paired (and the first pair's +0.18% 'better') is boot noise"
+ },
+ "why_the_modeled_gains_do_not_appear": {
+  "regime_absent": {
+   "context_band": "release prompts are 15-29 tokens with 256 output tokens (contexts <= 285); CONTEXT_ROW_COST_KNEE is 8,192, so the c8 32K-128K (+5.0-5.2%) and heterogeneous 2K+128K (+7.0%) regimes never occur",
+   "c1_plateau": "the +1.1% c1 regime needs > 16 rows from one request (copy-draft bursts); served c1 verifies at most 6 rows (5 drafts; coverage at positions >= 5 is <= 0.0006)",
+   "c8": "c8 holds at most 48 rows, so the 64-row knee and second-wave step cannot fire; only the 0.25/0.75-row offsets at 16/32 rows apply (replay: budget differs on 5.7% of steps, rows -0.01%)",
+   "c16_second_wave": "the screen set all 16 requests to conditional confidences [0.90, 0.90, 0.90, 0.62, 0.50] (every step 80 rows); served c16 conditional acceptance is 0.72, 0.50, 0.47, 0.52, 0.55 and rows average 44.6; the replay puts 8.5-8.7% of 1107's c16 steps above 64 rows"
+  },
+  "prediction_wrong": {
+   "c16_80_to_64_rows_saving_by_term_ms": {
+    "dense_us": 2.569,
+    "mla_us": 1.131,
+    "idx_us": 0.295,
+    "moe_drafter_us": 7.04
+   },
+   "c16_share_by_term": {
+    "dense_us": 0.233,
+    "mla_us": 0.102,
+    "idx_us": 0.027,
+    "moe_drafter_us": 0.638
+   },
+   "c8_32k_40_to_32_rows_saving_by_term_ms": {
+    "dense_us": 2.346,
+    "mla_us": 0.545,
+    "idx_us": 0.33,
+    "moe_drafter_us": 1.68
+   },
+   "c8_128k_40_to_32_rows_saving_by_term_ms": {
+    "dense_us": 2.346,
+    "mla_us": 0.545,
+    "idx_us": 0.806,
+    "moe_drafter_us": 1.68
+   },
+   "same_trim_by_context_in_its_own_latency_model": {
+    "tokens_40_rows": 24.187508479999998,
+    "tokens_32_rows": 21.922688,
+    "2048": {
+     "ms_40": 35.003,
+     "ms_32": 30.409,
+     "tok_per_s_change_pct_trim_to_32": 4.33
+    },
+    "32768": {
+     "ms_40": 36.448,
+     "ms_32": 31.546,
+     "tok_per_s_change_pct_trim_to_32": 4.72
+    },
+    "131072": {
+     "ms_40": 38.921,
+     "ms_32": 33.543,
+     "tok_per_s_change_pct_trim_to_32": 5.17
+    }
+   },
+   "reading": "the context-dependent indexer term is 7-15% of the modeled c8 saving; the rest is context-independent (dense table R=32 -> 40 and the MoE term), and the screen's own latency model rewards the same 40 -> 32 trim by +4.3% at 2K, where #986's cost model keeps 40 rows. The context band was a trigger, not a priced cost.",
+   "pr986_dense_table_non_monotone_us": [
+    "R=1: 2184 us > R=16: 1482 us",
+    "R=17: 2681 us > R=32: 1933 us",
+    "R=40: 4279 us > R=64: 2857 us",
+    "R=80: 5425 us > R=96: 4848 us"
+   ],
+   "tp4_grid_context_effect_ms": {
+    "1x3": [
+     [
+      4096,
+      15.956
+     ],
+     [
+      65536,
+      15.938
+     ],
+     [
+      262144,
+      15.85
+     ],
+     [
+      1040384,
+      15.657
+     ]
+    ],
+    "8x24": [
+     [
+      4096,
+      21.488
+     ],
+     [
+      65536,
+      21.514
+     ],
+     [
+      262144,
+      21.436
+     ]
+    ],
+    "16x48": [
+     [
+      4096,
+      27.868
+     ],
+     [
+      65536,
+      27.867
+     ]
+    ]
+   },
+   "tp4_grid_fit_ms": {
+    "a_ms": 15.059,
+    "per_request_ms": 0.034,
+    "per_row_le16_ms": 0.241,
+    "per_row_17_64_ms": 0.27,
+    "jump_above_64_ms": 3.301,
+    "per_row_above_64_ms": 0.136
+   },
+   "tp4_grid_fit_rmse_ms": 0.322,
+   "tp4_grid_in_1107_cost_units": {
+    "unit_ms": 14.049,
+    "jump_rows": 6.714,
+    "above_64_scale": 0.277
+   },
+   "pricing_64_to_96_rows_in_row_units": {
+    "tp4_grid": 15.6,
+    "1107": 17.6,
+    "986": 34.0
+   },
+   "tile_steps": "no step of the TP1 table's size (+1.2 ms at 16 -> 17, +2.3 ms at 32 -> 40) shows in the grid: the 4x24, 8x24, 8x48 and 16x48 shapes sit +0.33, +0.15, +0.17 and -0.23 ms from one fit with a 0.27 ms/row slope from 17 to 64 rows (every 4K shape but 2x12 within 0.33 ms)"
+  },
+  "same_rows": "c1 identical; c8 differs on 5.7% of steps by about a row; c16 differs on 33% of steps, almost all from the 64-row knee and second-wave step (tile offsets alone: -0.03% rows)"
+ },
+ "replay": {
+  "method": "real 1107 and #986 adaptive_verification.py (get_num_tokens) over 20,000 steps per concurrency, two seeds; per-request calibrated confidences from a two-component logit-normal fitted to candidate-47-no986's served coverage and survival by position and tokens a step (c16 fit loss 2-4e-5, tokens 34.29-34.35 vs 34.29); decoding requests from TTFT/e2e; a 21-token prefill on the served prompt-token share of steps; a numpy copy of 1107's rule matches the module on 100% of steps",
+  "validation_c16": {
+   "served_rows_pct": -0.87,
+   "served_tokens_pct": -0.44,
+   "replay_rows_pct": [
+    -1.0,
+    -1.01
+   ],
+   "replay_tokens_pct": [
+    -0.5,
+    -0.5
+   ]
+  },
+  "step_time_models": {
+   "A": "tp4-ring engine grid fit (same image, four boots) + a constant served overhead (c16 97.9 ms, c8 66.0 ms, c1 13.1 ms)",
+   "B": "served per-batch regression of step time on tokens and wasted rows (10 x 30 s batches x 4 boots a loop)",
+   "M": "w A + (1 - w) B, w set so that row cost 0.020 vs 0.035 reproduces experiments/2026-10-18-dspark-linear-budget (c16 +0.79%, sampled c8 -0.28%, c1 +0.21%), bracketed +-0.5%"
+  },
+  "986": {
+   "c16": [
+    {
+     "seed": 0,
+     "rows_pct": -1.0,
+     "tokens_pct": -0.5,
+     "steps_budget_differs": 0.328,
+     "steps_above_64_rows": 0.0,
+     "throughput_pct": {
+      "A_grid_plus_constant": -0.13,
+      "B_served_batch_regression": 0.07,
+      "M_calibrated_to_2026-10-18_row_cost_ab": {
+       "central": -0.04,
+       "minus_0.5": -0.01,
+       "plus_0.5": -0.07
+      }
+     }
+    },
+    {
+     "seed": 1,
+     "rows_pct": -1.01,
+     "tokens_pct": -0.5,
+     "steps_budget_differs": 0.328,
+     "steps_above_64_rows": 0.0,
+     "throughput_pct": {
+      "A_grid_plus_constant": -0.14,
+      "B_served_batch_regression": 0.07,
+      "M_calibrated_to_2026-10-18_row_cost_ab": {
+       "central": -0.05,
+       "minus_0.5": -0.01,
+       "plus_0.5": -0.08
+      }
+     }
+    }
+   ],
+   "c8": [
+    {
+     "seed": 0,
+     "rows_pct": -0.01,
+     "tokens_pct": -0.02,
+     "steps_budget_differs": 0.058,
+     "steps_above_64_rows": 0.0,
+     "throughput_pct": {
+      "A_grid_plus_constant": 0.01,
+      "B_served_batch_regression": -0.01,
+      "M_calibrated_to_2026-10-18_row_cost_ab": {
+       "central": -0.01,
+       "minus_0.5": -0.01,
+       "plus_0.5": -0.0
+      }
+     }
+    },
+    {
+     "seed": 1,
+     "rows_pct": -0.0,
+     "tokens_pct": -0.02,
+     "steps_budget_differs": 0.057,
+     "steps_above_64_rows": 0.0,
+     "throughput_pct": {
+      "A_grid_plus_constant": 0.01,
+      "B_served_batch_regression": -0.01,
+      "M_calibrated_to_2026-10-18_row_cost_ab": {
+       "central": -0.01,
+       "minus_0.5": -0.01,
+       "plus_0.5": -0.0
+      }
+     }
+    }
+   ],
+   "c1": [
+    {
+     "seed": 0,
+     "rows_pct": 0.0,
+     "tokens_pct": 0.0,
+     "steps_budget_differs": 0.0,
+     "steps_above_64_rows": 0.0,
+     "throughput_pct": {
+      "A_grid_plus_constant": 0.0,
+      "B_served_batch_regression": 0.0,
+      "M_calibrated_to_2026-10-18_row_cost_ab": {
+       "central": 0.0,
+       "minus_0.5": 0.0,
+       "plus_0.5": 0.0
+      }
+     }
+    },
+    {
+     "seed": 1,
+     "rows_pct": 0.0,
+     "tokens_pct": 0.0,
+     "steps_budget_differs": 0.0,
+     "steps_above_64_rows": 0.0,
+     "throughput_pct": {
+      "A_grid_plus_constant": 0.0,
+      "B_served_batch_regression": 0.0,
+      "M_calibrated_to_2026-10-18_row_cost_ab": {
+       "central": 0.0,
+       "minus_0.5": 0.0,
+       "plus_0.5": 0.0
+      }
+     }
+    }
+   ],
+   "c1-ctx32k": [
+    {
+     "seed": 0,
+     "rows_pct": -2.55,
+     "tokens_pct": -0.33,
+     "steps_budget_differs": 0.082,
+     "steps_above_64_rows": 0.0,
+     "throughput_pct": {
+      "A_grid_plus_constant": -0.24,
+      "B_served_batch_regression": 0.36,
+      "M_calibrated_to_2026-10-18_row_cost_ab": {
+       "central": -0.16,
+       "minus_0.5": 0.01,
+       "plus_0.5": -0.24
+      }
+     }
+    },
+    {
+     "seed": 1,
+     "rows_pct": -2.55,
+     "tokens_pct": -0.33,
+     "steps_budget_differs": 0.084,
+     "steps_above_64_rows": 0.0,
+     "throughput_pct": {
+      "A_grid_plus_constant": -0.25,
+      "B_served_batch_regression": 0.36,
+      "M_calibrated_to_2026-10-18_row_cost_ab": {
+       "central": -0.16,
+       "minus_0.5": 0.0,
+       "plus_0.5": -0.25
+      }
+     }
+    }
+   ],
+   "c1-ctx64k": [
+    {
+     "seed": 0,
+     "rows_pct": -3.71,
+     "tokens_pct": -0.49,
+     "steps_budget_differs": 0.115,
+     "steps_above_64_rows": 0.0,
+     "throughput_pct": {
+      "A_grid_plus_constant": -0.37,
+      "B_served_batch_regression": 0.5,
+      "M_calibrated_to_2026-10-18_row_cost_ab": {
+       "central": -0.25,
+       "minus_0.5": -0.0,
+       "plus_0.5": -0.37
+      }
+     }
+    },
+    {
+     "seed": 1,
+     "rows_pct": -3.79,
+     "tokens_pct": -0.51,
+     "steps_budget_differs": 0.122,
+     "steps_above_64_rows": 0.0,
+     "throughput_pct": {
+      "A_grid_plus_constant": -0.39,
+      "B_served_batch_regression": 0.51,
+      "M_calibrated_to_2026-10-18_row_cost_ab": {
+       "central": -0.26,
+       "minus_0.5": -0.01,
+       "plus_0.5": -0.39
+      }
+     }
+    }
+   ],
+   "c1-ctx128k": [
+    {
+     "seed": 0,
+     "rows_pct": -5.87,
+     "tokens_pct": -0.84,
+     "steps_budget_differs": 0.174,
+     "steps_above_64_rows": 0.0,
+     "throughput_pct": {
+      "A_grid_plus_constant": -0.65,
+      "B_served_batch_regression": 0.75,
+      "M_calibrated_to_2026-10-18_row_cost_ab": {
+       "central": -0.46,
+       "minus_0.5": -0.06,
+       "plus_0.5": -0.65
+      }
+     }
+    },
+    {
+     "seed": 1,
+     "rows_pct": -5.93,
+     "tokens_pct": -0.86,
+     "steps_budget_differs": 0.182,
+     "steps_above_64_rows": 0.0,
+     "throughput_pct": {
+      "A_grid_plus_constant": -0.66,
+      "B_served_batch_regression": 0.76,
+      "M_calibrated_to_2026-10-18_row_cost_ab": {
+       "central": -0.47,
+       "minus_0.5": -0.07,
+       "plus_0.5": -0.66
+      }
+     }
+    }
+   ]
+  },
+  "986_terms_at_c16": {
+   "64_row_knee_and_wave_only": [
+    {
+     "seed": 0,
+     "rows_pct": -0.91,
+     "tokens_pct": -0.45,
+     "steps_budget_differs": 0.085,
+     "steps_above_64_rows": 0.0,
+     "throughput_pct": {
+      "A_grid_plus_constant": -0.15,
+      "B_served_batch_regression": 0.06,
+      "M_calibrated_to_2026-10-18_row_cost_ab": {
+       "central": -0.05,
+       "minus_0.5": -0.02,
+       "plus_0.5": -0.09
+      }
+     }
+    },
+    {
+     "seed": 1,
+     "rows_pct": -0.94,
+     "tokens_pct": -0.47,
+     "steps_budget_differs": 0.087,
+     "steps_above_64_rows": 0.0,
+     "throughput_pct": {
+      "A_grid_plus_constant": -0.15,
+      "B_served_batch_regression": 0.07,
+      "M_calibrated_to_2026-10-18_row_cost_ab": {
+       "central": -0.06,
+       "minus_0.5": -0.02,
+       "plus_0.5": -0.09
+      }
+     }
+    }
+   ],
+   "tile_steps_only": [
+    {
+     "seed": 0,
+     "rows_pct": -0.05,
+     "tokens_pct": -0.03,
+     "steps_budget_differs": 0.259,
+     "steps_above_64_rows": 0.0866,
+     "throughput_pct": {
+      "A_grid_plus_constant": 0.02,
+      "B_served_batch_regression": 0.0,
+      "M_calibrated_to_2026-10-18_row_cost_ab": {
+       "central": 0.01,
+       "minus_0.5": 0.01,
+       "plus_0.5": 0.02
+      }
+     }
+    },
+    {
+     "seed": 1,
+     "rows_pct": -0.03,
+     "tokens_pct": -0.02,
+     "steps_budget_differs": 0.258,
+     "steps_above_64_rows": 0.0883,
+     "throughput_pct": {
+      "A_grid_plus_constant": 0.03,
+      "B_served_batch_regression": -0.0,
+      "M_calibrated_to_2026-10-18_row_cost_ab": {
+       "central": 0.02,
+       "minus_0.5": 0.01,
+       "plus_0.5": 0.02
+      }
+     }
+    }
+   ]
+  },
+  "corrected_knee_from_tp4_grid": {
+   "c16": [
+    {
+     "seed": 0,
+     "rows_pct": -0.7,
+     "tokens_pct": -0.35,
+     "steps_budget_differs": 0.085,
+     "steps_above_64_rows": 0.0044,
+     "throughput_pct": {
+      "A_grid_plus_constant": -0.07,
+      "B_served_batch_regression": 0.05,
+      "M_calibrated_to_2026-10-18_row_cost_ab": {
+       "central": -0.02,
+       "minus_0.5": 0.0,
+       "plus_0.5": -0.03
+      }
+     }
+    },
+    {
+     "seed": 1,
+     "rows_pct": -0.72,
+     "tokens_pct": -0.35,
+     "steps_budget_differs": 0.087,
+     "steps_above_64_rows": 0.0048,
+     "throughput_pct": {
+      "A_grid_plus_constant": -0.07,
+      "B_served_batch_regression": 0.05,
+      "M_calibrated_to_2026-10-18_row_cost_ab": {
+       "central": -0.02,
+       "minus_0.5": 0.0,
+       "plus_0.5": -0.03
+      }
+     }
+    }
+   ],
+   "c8": [
+    {
+     "seed": 0,
+     "rows_pct": 0.0,
+     "tokens_pct": 0.0,
+     "steps_budget_differs": 0.0,
+     "steps_above_64_rows": 0.0,
+     "throughput_pct": {
+      "A_grid_plus_constant": 0.0,
+      "B_served_batch_regression": 0.0,
+      "M_calibrated_to_2026-10-18_row_cost_ab": {
+       "central": 0.0,
+       "minus_0.5": 0.0,
+       "plus_0.5": 0.0
+      }
+     }
+    },
+    {
+     "seed": 1,
+     "rows_pct": 0.0,
+     "tokens_pct": 0.0,
+     "steps_budget_differs": 0.0,
+     "steps_above_64_rows": 0.0,
+     "throughput_pct": {
+      "A_grid_plus_constant": 0.0,
+      "B_served_batch_regression": 0.0,
+      "M_calibrated_to_2026-10-18_row_cost_ab": {
+       "central": 0.0,
+       "minus_0.5": 0.0,
+       "plus_0.5": 0.0
+      }
+     }
+    }
+   ],
+   "c1": [
+    {
+     "seed": 0,
+     "rows_pct": 0.0,
+     "tokens_pct": 0.0,
+     "steps_budget_differs": 0.0,
+     "steps_above_64_rows": 0.0,
+     "throughput_pct": {
+      "A_grid_plus_constant": 0.0,
+      "B_served_batch_regression": 0.0,
+      "M_calibrated_to_2026-10-18_row_cost_ab": {
+       "central": 0.0,
+       "minus_0.5": 0.0,
+       "plus_0.5": 0.0
+      }
+     }
+    },
+    {
+     "seed": 1,
+     "rows_pct": 0.0,
+     "tokens_pct": 0.0,
+     "steps_budget_differs": 0.0,
+     "steps_above_64_rows": 0.0,
+     "throughput_pct": {
+      "A_grid_plus_constant": 0.0,
+      "B_served_batch_regression": 0.0,
+      "M_calibrated_to_2026-10-18_row_cost_ab": {
+       "central": 0.0,
+       "minus_0.5": 0.0,
+       "plus_0.5": 0.0
+      }
+     }
+    }
+   ]
+  },
+  "row_cost_0.020_check": {
+   "c16": [
+    {
+     "seed": 0,
+     "rows_pct": 8.62,
+     "tokens_pct": 3.13,
+     "steps_budget_differs": 0.989,
+     "steps_above_64_rows": 0.1107,
+     "throughput_pct": {
+      "A_grid_plus_constant": 2.23,
+      "B_served_batch_regression": -1.01,
+      "M_calibrated_to_2026-10-18_row_cost_ab": {
+       "central": 0.79,
+       "minus_0.5": 0.29,
+       "plus_0.5": 1.29
+      }
+     }
+    },
+    {
+     "seed": 1,
+     "rows_pct": 8.64,
+     "tokens_pct": 3.14,
+     "steps_budget_differs": 0.989,
+     "steps_above_64_rows": 0.1116,
+     "throughput_pct": {
+      "A_grid_plus_constant": 2.24,
+      "B_served_batch_regression": -1.02,
+      "M_calibrated_to_2026-10-18_row_cost_ab": {
+       "central": 0.79,
+       "minus_0.5": 0.29,
+       "plus_0.5": 1.29
+      }
+     }
+    }
+   ],
+   "c8": [
+    {
+     "seed": 0,
+     "rows_pct": 9.25,
+     "tokens_pct": 2.25,
+     "steps_budget_differs": 0.926,
+     "steps_above_64_rows": 0.0,
+     "throughput_pct": {
+      "A_grid_plus_constant": 1.42,
+      "B_served_batch_regression": -0.3,
+      "M_calibrated_to_2026-10-18_row_cost_ab": {
+       "central": -0.28,
+       "minus_0.5": -0.3,
+       "plus_0.5": 0.22
+      }
+     }
+    },
+    {
+     "seed": 1,
+     "rows_pct": 9.71,
+     "tokens_pct": 2.35,
+     "steps_budget_differs": 0.928,
+     "steps_above_64_rows": 0.0,
+     "throughput_pct": {
+      "A_grid_plus_constant": 1.49,
+      "B_served_batch_regression": -0.31,
+      "M_calibrated_to_2026-10-18_row_cost_ab": {
+       "central": -0.28,
+       "minus_0.5": -0.31,
+       "plus_0.5": 0.22
+      }
+     }
+    }
+   ],
+   "c1": [
+    {
+     "seed": 0,
+     "rows_pct": 7.52,
+     "tokens_pct": 0.69,
+     "steps_budget_differs": 0.215,
+     "steps_above_64_rows": 0.0,
+     "throughput_pct": {
+      "A_grid_plus_constant": 0.45,
+      "B_served_batch_regression": -1.27,
+      "M_calibrated_to_2026-10-18_row_cost_ab": {
+       "central": 0.21,
+       "minus_0.5": -0.29,
+       "plus_0.5": 0.45
+      }
+     }
+    },
+    {
+     "seed": 1,
+     "rows_pct": 7.71,
+     "tokens_pct": 0.71,
+     "steps_budget_differs": 0.226,
+     "steps_above_64_rows": 0.0,
+     "throughput_pct": {
+      "A_grid_plus_constant": 0.46,
+      "B_served_batch_regression": -1.31,
+      "M_calibrated_to_2026-10-18_row_cost_ab": {
+       "central": 0.21,
+       "minus_0.5": -0.29,
+       "plus_0.5": 0.46
+      }
+     }
+    }
+   ]
+  },
+  "oracle_upper_bounds": {
+   "c16": {
+    "A": [
+     {
+      "seed": 0,
+      "rows_pct": 33.42,
+      "tokens_pct": 7.78,
+      "steps_budget_differs": 1.0,
+      "steps_above_64_rows": 0.1174,
+      "throughput_pct": {
+       "A_grid_plus_constant": 5.19,
+       "B_served_batch_regression": -5.08,
+       "M_calibrated_to_2026-10-18_row_cost_ab": {
+        "central": 0.46,
+        "minus_0.5": -1.12,
+        "plus_0.5": 2.07
+       }
+      }
+     },
+     {
+      "seed": 1,
+      "rows_pct": 33.67,
+      "tokens_pct": 7.84,
+      "steps_budget_differs": 1.0,
+      "steps_above_64_rows": 0.1188,
+      "throughput_pct": {
+       "A_grid_plus_constant": 5.23,
+       "B_served_batch_regression": -5.12,
+       "M_calibrated_to_2026-10-18_row_cost_ab": {
+        "central": 0.44,
+        "minus_0.5": -1.14,
+        "plus_0.5": 2.06
+       }
+      }
+     }
+    ],
+    "B": [
+     {
+      "seed": 0,
+      "rows_pct": -18.77,
+      "tokens_pct": -10.32,
+      "steps_budget_differs": 1.0,
+      "steps_above_64_rows": 0.007,
+      "throughput_pct": {
+       "A_grid_plus_constant": -8.44,
+       "B_served_batch_regression": 1.07,
+       "M_calibrated_to_2026-10-18_row_cost_ab": {
+        "central": -4.53,
+        "minus_0.5": -3.06,
+        "plus_0.5": -5.94
+       }
+      }
+     },
+     {
+      "seed": 1,
+      "rows_pct": -18.99,
+      "tokens_pct": -10.44,
+      "steps_budget_differs": 1.0,
+      "steps_above_64_rows": 0.0072,
+      "throughput_pct": {
+       "A_grid_plus_constant": -8.55,
+       "B_served_batch_regression": 1.08,
+       "M_calibrated_to_2026-10-18_row_cost_ab": {
+        "central": -4.58,
+        "minus_0.5": -3.09,
+        "plus_0.5": -6.0
+       }
+      }
+     }
+    ],
+    "M": [
+     {
+      "seed": 0,
+      "rows_pct": 15.58,
+      "tokens_pct": 4.9,
+      "steps_budget_differs": 0.986,
+      "steps_above_64_rows": 0.0683,
+      "throughput_pct": {
+       "A_grid_plus_constant": 4.12,
+       "B_served_batch_regression": -2.05,
+       "M_calibrated_to_2026-10-18_row_cost_ab": {
+        "central": 1.34,
+        "minus_0.5": 0.39,
+        "plus_0.5": 2.3
+       }
+      }
+     },
+     {
+      "seed": 1,
+      "rows_pct": 15.62,
+      "tokens_pct": 4.92,
+      "steps_budget_differs": 0.987,
+      "steps_above_64_rows": 0.0693,
+      "throughput_pct": {
+       "A_grid_plus_constant": 4.13,
+       "B_served_batch_regression": -2.06,
+       "M_calibrated_to_2026-10-18_row_cost_ab": {
+        "central": 1.34,
+        "minus_0.5": 0.39,
+        "plus_0.5": 2.3
+       }
+      }
+     }
+    ]
+   },
+   "c8": {
+    "A": [
+     {
+      "seed": 0,
+      "rows_pct": 29.26,
+      "tokens_pct": 4.86,
+      "steps_budget_differs": 0.999,
+      "steps_above_64_rows": 0.0,
+      "throughput_pct": {
+       "A_grid_plus_constant": 2.94,
+       "B_served_batch_regression": -1.83,
+       "M_calibrated_to_2026-10-18_row_cost_ab": {
+        "central": -1.78,
+        "minus_0.5": -1.83,
+        "plus_0.5": -0.42
+       }
+      }
+     },
+     {
+      "seed": 1,
+      "rows_pct": 31.28,
+      "tokens_pct": 5.15,
+      "steps_budget_differs": 0.999,
+      "steps_above_64_rows": 0.0,
+      "throughput_pct": {
+       "A_grid_plus_constant": 3.08,
+       "B_served_batch_regression": -1.95,
+       "M_calibrated_to_2026-10-18_row_cost_ab": {
+        "central": -1.85,
+        "minus_0.5": -1.95,
+        "plus_0.5": -0.49
+       }
+      }
+     }
+    ],
+    "B": [
+     {
+      "seed": 0,
+      "rows_pct": -3.01,
+      "tokens_pct": -0.84,
+      "steps_budget_differs": 0.572,
+      "steps_above_64_rows": 0.0,
+      "throughput_pct": {
+       "A_grid_plus_constant": -0.61,
+       "B_served_batch_regression": 0.05,
+       "M_calibrated_to_2026-10-18_row_cost_ab": {
+        "central": 0.05,
+        "minus_0.5": 0.05,
+        "plus_0.5": -0.15
+       }
+      }
+     },
+     {
+      "seed": 1,
+      "rows_pct": -3.17,
+      "tokens_pct": -0.88,
+      "steps_budget_differs": 0.569,
+      "steps_above_64_rows": 0.0,
+      "throughput_pct": {
+       "A_grid_plus_constant": -0.64,
+       "B_served_batch_regression": 0.06,
+       "M_calibrated_to_2026-10-18_row_cost_ab": {
+        "central": 0.04,
+        "minus_0.5": 0.06,
+        "plus_0.5": -0.15
+       }
+      }
+     }
+    ],
+    "M": [
+     {
+      "seed": 0,
+      "rows_pct": -2.5,
+      "tokens_pct": -0.68,
+      "steps_budget_differs": 0.55,
+      "steps_above_64_rows": 0.0,
+      "throughput_pct": {
+       "A_grid_plus_constant": -0.45,
+       "B_served_batch_regression": 0.05,
+       "M_calibrated_to_2026-10-18_row_cost_ab": {
+        "central": 0.05,
+        "minus_0.5": 0.05,
+        "plus_0.5": -0.1
+       }
+      }
+     },
+     {
+      "seed": 1,
+      "rows_pct": -2.21,
+      "tokens_pct": -0.58,
+      "steps_budget_differs": 0.536,
+      "steps_above_64_rows": 0.0,
+      "throughput_pct": {
+       "A_grid_plus_constant": -0.33,
+       "B_served_batch_regression": 0.05,
+       "M_calibrated_to_2026-10-18_row_cost_ab": {
+        "central": 0.05,
+        "minus_0.5": 0.05,
+        "plus_0.5": -0.06
+       }
+      }
+     }
+    ]
+   },
+   "c1": {
+    "A": [
+     {
+      "seed": 0,
+      "rows_pct": 18.44,
+      "tokens_pct": 1.19,
+      "steps_budget_differs": 0.442,
+      "steps_above_64_rows": 0.0,
+      "throughput_pct": {
+       "A_grid_plus_constant": 0.67,
+       "B_served_batch_regression": -3.49,
+       "M_calibrated_to_2026-10-18_row_cost_ab": {
+        "central": 0.08,
+        "minus_0.5": -1.14,
+        "plus_0.5": 0.67
+       }
+      }
+     },
+     {
+      "seed": 1,
+      "rows_pct": 19.66,
+      "tokens_pct": 1.25,
+      "steps_budget_differs": 0.475,
+      "steps_above_64_rows": 0.0,
+      "throughput_pct": {
+       "A_grid_plus_constant": 0.71,
+       "B_served_batch_regression": -3.75,
+       "M_calibrated_to_2026-10-18_row_cost_ab": {
+        "central": 0.06,
+        "minus_0.5": -1.21,
+        "plus_0.5": 0.71
+       }
+      }
+     }
+    ],
+    "B": [
+     {
+      "seed": 0,
+      "rows_pct": -14.4,
+      "tokens_pct": -2.68,
+      "steps_budget_differs": 0.362,
+      "steps_above_64_rows": 0.0,
+      "throughput_pct": {
+       "A_grid_plus_constant": -2.22,
+       "B_served_batch_regression": 1.28,
+       "M_calibrated_to_2026-10-18_row_cost_ab": {
+        "central": -1.76,
+        "minus_0.5": -0.76,
+        "plus_0.5": -2.22
+       }
+      }
+     },
+     {
+      "seed": 1,
+      "rows_pct": -14.61,
+      "tokens_pct": -2.75,
+      "steps_budget_differs": 0.378,
+      "steps_above_64_rows": 0.0,
+      "throughput_pct": {
+       "A_grid_plus_constant": -2.28,
+       "B_served_batch_regression": 1.29,
+       "M_calibrated_to_2026-10-18_row_cost_ab": {
+        "central": -1.8,
+        "minus_0.5": -0.81,
+        "plus_0.5": -2.28
+       }
+      }
+     }
+    ],
+    "M": [
+     {
+      "seed": 0,
+      "rows_pct": 8.81,
+      "tokens_pct": 0.78,
+      "steps_budget_differs": 0.241,
+      "steps_above_64_rows": 0.0,
+      "throughput_pct": {
+       "A_grid_plus_constant": 0.53,
+       "B_served_batch_regression": -1.52,
+       "M_calibrated_to_2026-10-18_row_cost_ab": {
+        "central": 0.25,
+        "minus_0.5": -0.35,
+        "plus_0.5": 0.53
+       }
+      }
+     },
+     {
+      "seed": 1,
+      "rows_pct": 9.05,
+      "tokens_pct": 0.8,
+      "steps_budget_differs": 0.258,
+      "steps_above_64_rows": 0.0,
+      "throughput_pct": {
+       "A_grid_plus_constant": 0.56,
+       "B_served_batch_regression": -1.57,
+       "M_calibrated_to_2026-10-18_row_cost_ab": {
+        "central": 0.25,
+        "minus_0.5": -0.34,
+        "plus_0.5": 0.56
+       }
+      }
+     }
+    ]
+   }
+  },
+  "reading": "Every re-pricing of #986's terms, including the knee re-calibrated to the grid (jump 6.7 rows, 0.28x slope above 64), predicts |change| <= 0.16% at c16, <= 0.01% at c8 and 0 at c1. The budget optimum itself cannot be signed from this evidence: oracle A drafts 33% more rows at c16 (+5.2% under A, -5.1% under B), oracle B 19% fewer (+1.1% under B, -8.4% under A); under M the c16 optimum drafts more (+0.4 to +2.3% depending on w), the direction TODO.md lists as tried and not adopted (lowering the row cost). That is the recipe constant, a separate variable, not a correction of #986."
+ },
+ "serving_step_vs_grid": {
+  "served_step_ms": {
+   "c16": 126.63,
+   "c8": 88.53,
+   "c1": 29.09
+  },
+  "grid_step_at_served_rows_ms": {
+   "c16": "~28 (16x48)",
+   "c8": "~22 (8x24 to 8x48)",
+   "c1": "~16 (1x3 to 1x6)"
+  },
+  "per_batch_regression": {
+   "c16": {
+    "intercept": 17.706,
+    "ms_per_token": 2.971,
+    "ms_per_token_se": 0.211,
+    "ms_per_wasted_row": 0.713,
+    "ms_per_wasted_row_se": 0.435,
+    "n_batches": 40
+   },
+   "c8": {
+    "intercept": 26.713,
+    "ms_per_token": 3.228,
+    "ms_per_token_se": 0.229,
+    "ms_per_wasted_row": 0.457,
+    "ms_per_wasted_row_se": 0.525,
+    "n_batches": 40
+   },
+   "c1": {
+    "intercept": 19.592,
+    "ms_per_token": 2.856,
+    "ms_per_token_se": 0.069,
+    "ms_per_wasted_row": 1.982,
+    "ms_per_wasted_row_se": 0.168,
+    "n_batches": 40
+   }
+  },
+  "reading": "served steps are 1.8x (c1) to 4.5x (c16) the grid's; across 30 s batches c16 output tok/s stays within about 1% while tokens a step vary +-4%, so step time moves with tokens a step (about 3 ms a token). The grid's dummy steps route identical tokens (servebench/engine.py); real text spreads rows over many more experts. Draft-budget changes move tokens a step and step time together, as the 2026-10-18 row-cost A/B found (+7-12% tokens a step, -7-11% steps/s, same tok/s)."
+ },
+ "correction": null,
+ "patch": null,
+ "serving_measurement_to_run": {
+  "required": "none: drop #986 from this release (its own mark cannot be met by any re-pricing of its terms; predicted changes are below the A/A floor)",
+  "optional_if_the_context_band_is_proposed_again": "servebench closed loop, c1 and c2, --context 65536 (and 131072), 300 s windows, two boots each, candidate-47 against candidate-47-no986 on the same image; replay predicts -0.26% (M; A -0.39%, B +0.51%) at 64K and -0.47% (M; A -0.66%, B +0.76%) at 128K at c1, i.e. at or below the 0.35% floor"
+ },
+ "host": {
+  "dgx1": "read-only file copies; no GPU work",
+  "sp3": "spark-0011, CPU-only replay in spark-ds41f:1107 (sha256:3f32a962ce04b7c8d85337cd427a8946b8b6bcaadd97cc8d8a8cd14e8d68a6ce), --gpus all only so vLLM imports resolve; flock /tmp/spark-lab-gpu.lock, docker ps empty and no hold file checked inside the lock"
+ },
+ "inputs": {
+  "patch_0762_sha256": "e5ff525055fd02feae330e423c9882542b22d8ef56fd202b7d5e5ef5859884c4",
+  "pr_head": "c00819eeb06b22493277c241ba4414a7d6415cba",
+  "adaptive_verification_1107_sha256": "4560e7fefd05b3914c95b0fa574b2a4bd0cce8b05558d7772e8b3bede5bc4801",
+  "adaptive_verification_986_sha256": "bf802343732a90e69b0d313a60bcb853b1385c4700227d9d5a895f7c7fb86a56"
+ }
+}

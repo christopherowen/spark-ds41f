@@ -1,0 +1,111 @@
+# candidate-51 own marks, PR #963 (0782, pack12 loads / SWAR / per-column exceptions), on sp8
+# (spark-0016, NVIDIA GB10). Shared setup (tree, image, arms, method): ../common/setup.txt.
+# Script: ../common/h/h963.py (ours): the timing half of the PR's screen_pack12_kernels.py
+# (experiments/2026-11-08-pack12-unconditional-loads-swar at e5db47f1) on the image's own kernels,
+# plus graph replay, CUPTI kernel time (back-to-back and isolated), the certified screen and the
+# split-K compressor GEMM; helpers in ../common/h/omlib.py (h963.py's first line of work is a
+# >= 250 ms GPU warm-up). The PR's own script cannot run unchanged on a tree that carries its
+# change (its candidate half text-patches gemm.py and overwrites vocab.py from a /tmp copy).
+# Batch script (../common/bin/pr-963.sh):
+#   for spec in "base 1" "c51 1" "c51 2" "base 2"; do set -- $spec
+#     $OM 963 pack12-$1-boot$2 $1 -- python3 /h/h963.py /out/json/pack12-$1-boot$2.json
+#   done
+#   for k in 1 2; do
+#     $OM 963 pytest-c51-boot$k c51 -e PYTHONPATH=/opt/spark-ds41f/candidate/vllm:/h -- pytest -p tblib_stub -v \
+#       tests/kernels/quantization/test_deepseek_v41_tilelang_vocab.py \
+#       tests/kernels/quantization/test_deepseek_v41_tilelang_linear.py \
+#       tests/kernels/test_deepseek_v41_tilelang_embedding.py tests/kernels/test_deepseek_v41_tilelang_pdl.py
+#   done
+# Analysis (laptop, JSON only): python3 ../common/analyze/a963.py raw/json analysis.json > analysis.txt
+#
+# Each run as executed (bin/om.sh log; start_utc is after the lock was taken, issued_utc before):
+### pack12-base-boot1
+host: spark-0016 (sp8)
+arm: base
+image: sha256:8c1ea1f62f62c3e2adc03b645c091a5499cf7163101aca32875c894b96f155db (spark-ds41f:candidate-50) + candidate-50 no1009/overlay (4 files, ro; files-base.txt)
+issued_utc: 2026-11-09T18:17:33Z
+start_utc: 2026-11-09T18:18:07Z
+loadavg_before: 1.40 1.63 1.61
+docker_ps_before: none
+hold_file: absent
+command: flock /tmp/spark-lab-gpu.lock docker run --rm --name c51om-963-pack12-base-boot1 --gpus all --ipc=host -e HF_HUB_OFFLINE=1 -e PYTHONPATH=/opt/spark-ds41f/candidate/vllm -e TILELANG_CACHE_DIR=/root/.tilelang/cache -v /home/chris/spark-lab/agents/candidate-51-own-marks/c/tl-base:/root/.tilelang -v /home/chris/spark-lab/agents/candidate-51-own-marks/out/pr-963:/out -v /home/chris/spark-lab/agents/candidate-51-own-marks/h:/h:ro -v /home/chris/spark-lab/agents/candidate-51-own-marks/src:/src:ro -w /opt/spark-ds41f/candidate/vllm -v /home/chris/spark-lab/agents/candidate-51-own-marks/ovl/base/vllm/models/deepseek_v4_1/attention.py:/opt/spark-ds41f/candidate/vllm/vllm/models/deepseek_v4_1/attention.py:ro -v /home/chris/spark-lab/agents/candidate-51-own-marks/ovl/base/vllm/models/deepseek_v4_1/sp_prefill.py:/opt/spark-ds41f/candidate/vllm/vllm/models/deepseek_v4_1/sp_prefill.py:ro -v /home/chris/spark-lab/agents/candidate-51-own-marks/ovl/base/vllm/models/deepseek_v4_1/tilelang/cache_writer.py:/opt/spark-ds41f/candidate/vllm/vllm/models/deepseek_v4_1/tilelang/cache_writer.py:ro -v /home/chris/spark-lab/agents/candidate-51-own-marks/ovl/base/vllm/models/deepseek_v4_1/tilelang/front.py:/opt/spark-ds41f/candidate/vllm/vllm/models/deepseek_v4_1/tilelang/front.py:ro --entrypoint python3 sha256:8c1ea1f62f62c3e2adc03b645c091a5499cf7163101aca32875c894b96f155db /h/h963.py /out/json/pack12-base-boot1.json 
+end_utc: 2026-11-09T18:29:15Z
+loadavg_after: 1.93 1.53 1.53
+exit_code: 0
+output: pack12-base-boot1.txt
+
+### pack12-c51-boot1
+host: spark-0016 (sp8)
+arm: c51
+image: sha256:8c1ea1f62f62c3e2adc03b645c091a5499cf7163101aca32875c894b96f155db (spark-ds41f:candidate-50) + candidate-51 tree cc1115c5 files (15 files, ro; files-c51.txt)
+issued_utc: 2026-11-09T18:29:15Z
+start_utc: 2026-11-09T18:29:29Z
+loadavg_before: 1.80 1.52 1.53
+docker_ps_before: none
+hold_file: absent
+command: flock /tmp/spark-lab-gpu.lock docker run --rm --name c51om-963-pack12-c51-boot1 --gpus all --ipc=host -e HF_HUB_OFFLINE=1 -e PYTHONPATH=/opt/spark-ds41f/candidate/vllm -e TILELANG_CACHE_DIR=/root/.tilelang/cache -v /home/chris/spark-lab/agents/candidate-51-own-marks/c/tl-c51:/root/.tilelang -v /home/chris/spark-lab/agents/candidate-51-own-marks/out/pr-963:/out -v /home/chris/spark-lab/agents/candidate-51-own-marks/h:/h:ro -v /home/chris/spark-lab/agents/candidate-51-own-marks/src:/src:ro -w /opt/spark-ds41f/candidate/vllm -v /home/chris/spark-lab/agents/candidate-51-own-marks/ovl/c51/tests/kernels/deepseek_v41_pdl_sources.py:/opt/spark-ds41f/candidate/vllm/tests/kernels/deepseek_v41_pdl_sources.py:ro -v /home/chris/spark-lab/agents/candidate-51-own-marks/ovl/c51/tests/kernels/quantization/test_deepseek_v41_tilelang_linear.py:/opt/spark-ds41f/candidate/vllm/tests/kernels/quantization/test_deepseek_v41_tilelang_linear.py:ro -v /home/chris/spark-lab/agents/candidate-51-own-marks/ovl/c51/tests/kernels/quantization/test_deepseek_v41_tilelang_vocab.py:/opt/spark-ds41f/candidate/vllm/tests/kernels/quantization/test_deepseek_v41_tilelang_vocab.py:ro -v /home/chris/spark-lab/agents/candidate-51-own-marks/ovl/c51/tests/kernels/test_deepseek_v41_tilelang_front.py:/opt/spark-ds41f/candidate/vllm/tests/kernels/test_deepseek_v41_tilelang_front.py:ro -v /home/chris/spark-lab/agents/candidate-51-own-marks/ovl/c51/tests/models/test_deepseek_v4_1_attention.py:/opt/spark-ds41f/candidate/vllm/tests/models/test_deepseek_v4_1_attention.py:ro -v /home/chris/spark-lab/agents/candidate-51-own-marks/ovl/c51/tests/models/test_glm5next_tilelang_l2_prefetch.py:/opt/spark-ds41f/candidate/vllm/tests/models/test_glm5next_tilelang_l2_prefetch.py:ro -v /home/chris/spark-lab/agents/candidate-51-own-marks/ovl/c51/vllm/models/deepseek_v4_1/attention.py:/opt/spark-ds41f/candidate/vllm/vllm/models/deepseek_v4_1/attention.py:ro -v /home/chris/spark-lab/agents/candidate-51-own-marks/ovl/c51/vllm/models/deepseek_v4_1/sp_prefill.py:/opt/spark-ds41f/candidate/vllm/vllm/models/deepseek_v4_1/sp_prefill.py:ro -v /home/chris/spark-lab/agents/candidate-51-own-marks/ovl/c51/vllm/models/deepseek_v4_1/tilelang/cache_writer.py:/opt/spark-ds41f/candidate/vllm/vllm/models/deepseek_v4_1/tilelang/cache_writer.py:ro -v /home/chris/spark-lab/agents/candidate-51-own-marks/ovl/c51/vllm/models/deepseek_v4_1/tilelang/front.py:/opt/spark-ds41f/candidate/vllm/vllm/models/deepseek_v4_1/tilelang/front.py:ro -v /home/chris/spark-lab/agents/candidate-51-own-marks/ovl/c51/vllm/models/deepseek_v4_1/tilelang/gemm.py:/opt/spark-ds41f/candidate/vllm/vllm/models/deepseek_v4_1/tilelang/gemm.py:ro -v /home/chris/spark-lab/agents/candidate-51-own-marks/ovl/c51/vllm/models/deepseek_v4_1/tilelang/vocab.py:/opt/spark-ds41f/candidate/vllm/vllm/models/deepseek_v4_1/tilelang/vocab.py:ro -v /home/chris/spark-lab/agents/candidate-51-own-marks/ovl/c51/vllm/models/deepseek_v4_1/tilelang/wo.py:/opt/spark-ds41f/candidate/vllm/vllm/models/deepseek_v4_1/tilelang/wo.py:ro -v /home/chris/spark-lab/agents/candidate-51-own-marks/ovl/c51/vllm/models/glm5next/nvidia/l2_prefetch.py:/opt/spark-ds41f/candidate/vllm/vllm/models/glm5next/nvidia/l2_prefetch.py:ro -v /home/chris/spark-lab/agents/candidate-51-own-marks/ovl/c51/vllm/models/glm5next/nvidia/tilelang/l2_prefetch.py:/opt/spark-ds41f/candidate/vllm/vllm/models/glm5next/nvidia/tilelang/l2_prefetch.py:ro --entrypoint python3 sha256:8c1ea1f62f62c3e2adc03b645c091a5499cf7163101aca32875c894b96f155db /h/h963.py /out/json/pack12-c51-boot1.json 
+end_utc: 2026-11-09T18:34:52Z
+loadavg_after: 2.50 1.88 1.66
+exit_code: 0
+output: pack12-c51-boot1.txt
+
+### pack12-c51-boot2
+host: spark-0016 (sp8)
+arm: c51
+image: sha256:8c1ea1f62f62c3e2adc03b645c091a5499cf7163101aca32875c894b96f155db (spark-ds41f:candidate-50) + candidate-51 tree cc1115c5 files (15 files, ro; files-c51.txt)
+issued_utc: 2026-11-09T18:34:52Z
+start_utc: 2026-11-09T18:35:02Z
+loadavg_before: 2.27 1.85 1.66
+docker_ps_before: none
+hold_file: absent
+command: flock /tmp/spark-lab-gpu.lock docker run --rm --name c51om-963-pack12-c51-boot2 --gpus all --ipc=host -e HF_HUB_OFFLINE=1 -e PYTHONPATH=/opt/spark-ds41f/candidate/vllm -e TILELANG_CACHE_DIR=/root/.tilelang/cache -v /home/chris/spark-lab/agents/candidate-51-own-marks/c/tl-c51:/root/.tilelang -v /home/chris/spark-lab/agents/candidate-51-own-marks/out/pr-963:/out -v /home/chris/spark-lab/agents/candidate-51-own-marks/h:/h:ro -v /home/chris/spark-lab/agents/candidate-51-own-marks/src:/src:ro -w /opt/spark-ds41f/candidate/vllm -v /home/chris/spark-lab/agents/candidate-51-own-marks/ovl/c51/tests/kernels/deepseek_v41_pdl_sources.py:/opt/spark-ds41f/candidate/vllm/tests/kernels/deepseek_v41_pdl_sources.py:ro -v /home/chris/spark-lab/agents/candidate-51-own-marks/ovl/c51/tests/kernels/quantization/test_deepseek_v41_tilelang_linear.py:/opt/spark-ds41f/candidate/vllm/tests/kernels/quantization/test_deepseek_v41_tilelang_linear.py:ro -v /home/chris/spark-lab/agents/candidate-51-own-marks/ovl/c51/tests/kernels/quantization/test_deepseek_v41_tilelang_vocab.py:/opt/spark-ds41f/candidate/vllm/tests/kernels/quantization/test_deepseek_v41_tilelang_vocab.py:ro -v /home/chris/spark-lab/agents/candidate-51-own-marks/ovl/c51/tests/kernels/test_deepseek_v41_tilelang_front.py:/opt/spark-ds41f/candidate/vllm/tests/kernels/test_deepseek_v41_tilelang_front.py:ro -v /home/chris/spark-lab/agents/candidate-51-own-marks/ovl/c51/tests/models/test_deepseek_v4_1_attention.py:/opt/spark-ds41f/candidate/vllm/tests/models/test_deepseek_v4_1_attention.py:ro -v /home/chris/spark-lab/agents/candidate-51-own-marks/ovl/c51/tests/models/test_glm5next_tilelang_l2_prefetch.py:/opt/spark-ds41f/candidate/vllm/tests/models/test_glm5next_tilelang_l2_prefetch.py:ro -v /home/chris/spark-lab/agents/candidate-51-own-marks/ovl/c51/vllm/models/deepseek_v4_1/attention.py:/opt/spark-ds41f/candidate/vllm/vllm/models/deepseek_v4_1/attention.py:ro -v /home/chris/spark-lab/agents/candidate-51-own-marks/ovl/c51/vllm/models/deepseek_v4_1/sp_prefill.py:/opt/spark-ds41f/candidate/vllm/vllm/models/deepseek_v4_1/sp_prefill.py:ro -v /home/chris/spark-lab/agents/candidate-51-own-marks/ovl/c51/vllm/models/deepseek_v4_1/tilelang/cache_writer.py:/opt/spark-ds41f/candidate/vllm/vllm/models/deepseek_v4_1/tilelang/cache_writer.py:ro -v /home/chris/spark-lab/agents/candidate-51-own-marks/ovl/c51/vllm/models/deepseek_v4_1/tilelang/front.py:/opt/spark-ds41f/candidate/vllm/vllm/models/deepseek_v4_1/tilelang/front.py:ro -v /home/chris/spark-lab/agents/candidate-51-own-marks/ovl/c51/vllm/models/deepseek_v4_1/tilelang/gemm.py:/opt/spark-ds41f/candidate/vllm/vllm/models/deepseek_v4_1/tilelang/gemm.py:ro -v /home/chris/spark-lab/agents/candidate-51-own-marks/ovl/c51/vllm/models/deepseek_v4_1/tilelang/vocab.py:/opt/spark-ds41f/candidate/vllm/vllm/models/deepseek_v4_1/tilelang/vocab.py:ro -v /home/chris/spark-lab/agents/candidate-51-own-marks/ovl/c51/vllm/models/deepseek_v4_1/tilelang/wo.py:/opt/spark-ds41f/candidate/vllm/vllm/models/deepseek_v4_1/tilelang/wo.py:ro -v /home/chris/spark-lab/agents/candidate-51-own-marks/ovl/c51/vllm/models/glm5next/nvidia/l2_prefetch.py:/opt/spark-ds41f/candidate/vllm/vllm/models/glm5next/nvidia/l2_prefetch.py:ro -v /home/chris/spark-lab/agents/candidate-51-own-marks/ovl/c51/vllm/models/glm5next/nvidia/tilelang/l2_prefetch.py:/opt/spark-ds41f/candidate/vllm/vllm/models/glm5next/nvidia/tilelang/l2_prefetch.py:ro --entrypoint python3 sha256:8c1ea1f62f62c3e2adc03b645c091a5499cf7163101aca32875c894b96f155db /h/h963.py /out/json/pack12-c51-boot2.json 
+end_utc: 2026-11-09T18:38:41Z
+loadavg_after: 1.32 1.66 1.62
+exit_code: 0
+output: pack12-c51-boot2.txt
+
+### pack12-base-boot2
+host: spark-0016 (sp8)
+arm: base
+image: sha256:8c1ea1f62f62c3e2adc03b645c091a5499cf7163101aca32875c894b96f155db (spark-ds41f:candidate-50) + candidate-50 no1009/overlay (4 files, ro; files-base.txt)
+issued_utc: 2026-11-09T18:38:41Z
+start_utc: 2026-11-09T18:38:51Z
+loadavg_before: 1.43 1.67 1.63
+docker_ps_before: none
+hold_file: absent
+command: flock /tmp/spark-lab-gpu.lock docker run --rm --name c51om-963-pack12-base-boot2 --gpus all --ipc=host -e HF_HUB_OFFLINE=1 -e PYTHONPATH=/opt/spark-ds41f/candidate/vllm -e TILELANG_CACHE_DIR=/root/.tilelang/cache -v /home/chris/spark-lab/agents/candidate-51-own-marks/c/tl-base:/root/.tilelang -v /home/chris/spark-lab/agents/candidate-51-own-marks/out/pr-963:/out -v /home/chris/spark-lab/agents/candidate-51-own-marks/h:/h:ro -v /home/chris/spark-lab/agents/candidate-51-own-marks/src:/src:ro -w /opt/spark-ds41f/candidate/vllm -v /home/chris/spark-lab/agents/candidate-51-own-marks/ovl/base/vllm/models/deepseek_v4_1/attention.py:/opt/spark-ds41f/candidate/vllm/vllm/models/deepseek_v4_1/attention.py:ro -v /home/chris/spark-lab/agents/candidate-51-own-marks/ovl/base/vllm/models/deepseek_v4_1/sp_prefill.py:/opt/spark-ds41f/candidate/vllm/vllm/models/deepseek_v4_1/sp_prefill.py:ro -v /home/chris/spark-lab/agents/candidate-51-own-marks/ovl/base/vllm/models/deepseek_v4_1/tilelang/cache_writer.py:/opt/spark-ds41f/candidate/vllm/vllm/models/deepseek_v4_1/tilelang/cache_writer.py:ro -v /home/chris/spark-lab/agents/candidate-51-own-marks/ovl/base/vllm/models/deepseek_v4_1/tilelang/front.py:/opt/spark-ds41f/candidate/vllm/vllm/models/deepseek_v4_1/tilelang/front.py:ro --entrypoint python3 sha256:8c1ea1f62f62c3e2adc03b645c091a5499cf7163101aca32875c894b96f155db /h/h963.py /out/json/pack12-base-boot2.json 
+end_utc: 2026-11-09T18:48:13Z
+loadavg_after: 1.27 1.35 1.49
+exit_code: 0
+output: pack12-base-boot2.txt
+
+### pytest-c51-boot1
+host: spark-0016 (sp8)
+arm: c51
+image: sha256:8c1ea1f62f62c3e2adc03b645c091a5499cf7163101aca32875c894b96f155db (spark-ds41f:candidate-50) + candidate-51 tree cc1115c5 files (15 files, ro; files-c51.txt)
+issued_utc: 2026-11-09T18:48:13Z
+start_utc: 2026-11-09T18:48:23Z
+loadavg_before: 1.22 1.33 1.49
+docker_ps_before: none
+hold_file: absent
+command: flock /tmp/spark-lab-gpu.lock docker run --rm --name c51om-963-pytest-c51-boot1 --gpus all --ipc=host -e HF_HUB_OFFLINE=1 -e PYTHONPATH=/opt/spark-ds41f/candidate/vllm -e TILELANG_CACHE_DIR=/root/.tilelang/cache -v /home/chris/spark-lab/agents/candidate-51-own-marks/c/tl-c51:/root/.tilelang -v /home/chris/spark-lab/agents/candidate-51-own-marks/out/pr-963:/out -v /home/chris/spark-lab/agents/candidate-51-own-marks/h:/h:ro -v /home/chris/spark-lab/agents/candidate-51-own-marks/src:/src:ro -w /opt/spark-ds41f/candidate/vllm -v /home/chris/spark-lab/agents/candidate-51-own-marks/ovl/c51/tests/kernels/deepseek_v41_pdl_sources.py:/opt/spark-ds41f/candidate/vllm/tests/kernels/deepseek_v41_pdl_sources.py:ro -v /home/chris/spark-lab/agents/candidate-51-own-marks/ovl/c51/tests/kernels/quantization/test_deepseek_v41_tilelang_linear.py:/opt/spark-ds41f/candidate/vllm/tests/kernels/quantization/test_deepseek_v41_tilelang_linear.py:ro -v /home/chris/spark-lab/agents/candidate-51-own-marks/ovl/c51/tests/kernels/quantization/test_deepseek_v41_tilelang_vocab.py:/opt/spark-ds41f/candidate/vllm/tests/kernels/quantization/test_deepseek_v41_tilelang_vocab.py:ro -v /home/chris/spark-lab/agents/candidate-51-own-marks/ovl/c51/tests/kernels/test_deepseek_v41_tilelang_front.py:/opt/spark-ds41f/candidate/vllm/tests/kernels/test_deepseek_v41_tilelang_front.py:ro -v /home/chris/spark-lab/agents/candidate-51-own-marks/ovl/c51/tests/models/test_deepseek_v4_1_attention.py:/opt/spark-ds41f/candidate/vllm/tests/models/test_deepseek_v4_1_attention.py:ro -v /home/chris/spark-lab/agents/candidate-51-own-marks/ovl/c51/tests/models/test_glm5next_tilelang_l2_prefetch.py:/opt/spark-ds41f/candidate/vllm/tests/models/test_glm5next_tilelang_l2_prefetch.py:ro -v /home/chris/spark-lab/agents/candidate-51-own-marks/ovl/c51/vllm/models/deepseek_v4_1/attention.py:/opt/spark-ds41f/candidate/vllm/vllm/models/deepseek_v4_1/attention.py:ro -v /home/chris/spark-lab/agents/candidate-51-own-marks/ovl/c51/vllm/models/deepseek_v4_1/sp_prefill.py:/opt/spark-ds41f/candidate/vllm/vllm/models/deepseek_v4_1/sp_prefill.py:ro -v /home/chris/spark-lab/agents/candidate-51-own-marks/ovl/c51/vllm/models/deepseek_v4_1/tilelang/cache_writer.py:/opt/spark-ds41f/candidate/vllm/vllm/models/deepseek_v4_1/tilelang/cache_writer.py:ro -v /home/chris/spark-lab/agents/candidate-51-own-marks/ovl/c51/vllm/models/deepseek_v4_1/tilelang/front.py:/opt/spark-ds41f/candidate/vllm/vllm/models/deepseek_v4_1/tilelang/front.py:ro -v /home/chris/spark-lab/agents/candidate-51-own-marks/ovl/c51/vllm/models/deepseek_v4_1/tilelang/gemm.py:/opt/spark-ds41f/candidate/vllm/vllm/models/deepseek_v4_1/tilelang/gemm.py:ro -v /home/chris/spark-lab/agents/candidate-51-own-marks/ovl/c51/vllm/models/deepseek_v4_1/tilelang/vocab.py:/opt/spark-ds41f/candidate/vllm/vllm/models/deepseek_v4_1/tilelang/vocab.py:ro -v /home/chris/spark-lab/agents/candidate-51-own-marks/ovl/c51/vllm/models/deepseek_v4_1/tilelang/wo.py:/opt/spark-ds41f/candidate/vllm/vllm/models/deepseek_v4_1/tilelang/wo.py:ro -v /home/chris/spark-lab/agents/candidate-51-own-marks/ovl/c51/vllm/models/glm5next/nvidia/l2_prefetch.py:/opt/spark-ds41f/candidate/vllm/vllm/models/glm5next/nvidia/l2_prefetch.py:ro -v /home/chris/spark-lab/agents/candidate-51-own-marks/ovl/c51/vllm/models/glm5next/nvidia/tilelang/l2_prefetch.py:/opt/spark-ds41f/candidate/vllm/vllm/models/glm5next/nvidia/tilelang/l2_prefetch.py:ro -e PYTHONPATH=/opt/spark-ds41f/candidate/vllm:/h --entrypoint pytest sha256:8c1ea1f62f62c3e2adc03b645c091a5499cf7163101aca32875c894b96f155db -p tblib_stub -v tests/kernels/quantization/test_deepseek_v41_tilelang_vocab.py tests/kernels/quantization/test_deepseek_v41_tilelang_linear.py tests/kernels/test_deepseek_v41_tilelang_embedding.py tests/kernels/test_deepseek_v41_tilelang_pdl.py 
+end_utc: 2026-11-09T18:59:41Z
+loadavg_after: 1.70 1.78 1.69
+exit_code: 0
+output: pytest-c51-boot1.txt
+
+### pytest-c51-boot2
+host: spark-0016 (sp8)
+arm: c51
+image: sha256:8c1ea1f62f62c3e2adc03b645c091a5499cf7163101aca32875c894b96f155db (spark-ds41f:candidate-50) + candidate-51 tree cc1115c5 files (15 files, ro; files-c51.txt)
+issued_utc: 2026-11-09T18:59:41Z
+start_utc: 2026-11-09T19:00:01Z
+loadavg_before: 1.56 1.74 1.68
+docker_ps_before: none
+hold_file: absent
+command: flock /tmp/spark-lab-gpu.lock docker run --rm --name c51om-963-pytest-c51-boot2 --gpus all --ipc=host -e HF_HUB_OFFLINE=1 -e PYTHONPATH=/opt/spark-ds41f/candidate/vllm -e TILELANG_CACHE_DIR=/root/.tilelang/cache -v /home/chris/spark-lab/agents/candidate-51-own-marks/c/tl-c51:/root/.tilelang -v /home/chris/spark-lab/agents/candidate-51-own-marks/out/pr-963:/out -v /home/chris/spark-lab/agents/candidate-51-own-marks/h:/h:ro -v /home/chris/spark-lab/agents/candidate-51-own-marks/src:/src:ro -w /opt/spark-ds41f/candidate/vllm -v /home/chris/spark-lab/agents/candidate-51-own-marks/ovl/c51/tests/kernels/deepseek_v41_pdl_sources.py:/opt/spark-ds41f/candidate/vllm/tests/kernels/deepseek_v41_pdl_sources.py:ro -v /home/chris/spark-lab/agents/candidate-51-own-marks/ovl/c51/tests/kernels/quantization/test_deepseek_v41_tilelang_linear.py:/opt/spark-ds41f/candidate/vllm/tests/kernels/quantization/test_deepseek_v41_tilelang_linear.py:ro -v /home/chris/spark-lab/agents/candidate-51-own-marks/ovl/c51/tests/kernels/quantization/test_deepseek_v41_tilelang_vocab.py:/opt/spark-ds41f/candidate/vllm/tests/kernels/quantization/test_deepseek_v41_tilelang_vocab.py:ro -v /home/chris/spark-lab/agents/candidate-51-own-marks/ovl/c51/tests/kernels/test_deepseek_v41_tilelang_front.py:/opt/spark-ds41f/candidate/vllm/tests/kernels/test_deepseek_v41_tilelang_front.py:ro -v /home/chris/spark-lab/agents/candidate-51-own-marks/ovl/c51/tests/models/test_deepseek_v4_1_attention.py:/opt/spark-ds41f/candidate/vllm/tests/models/test_deepseek_v4_1_attention.py:ro -v /home/chris/spark-lab/agents/candidate-51-own-marks/ovl/c51/tests/models/test_glm5next_tilelang_l2_prefetch.py:/opt/spark-ds41f/candidate/vllm/tests/models/test_glm5next_tilelang_l2_prefetch.py:ro -v /home/chris/spark-lab/agents/candidate-51-own-marks/ovl/c51/vllm/models/deepseek_v4_1/attention.py:/opt/spark-ds41f/candidate/vllm/vllm/models/deepseek_v4_1/attention.py:ro -v /home/chris/spark-lab/agents/candidate-51-own-marks/ovl/c51/vllm/models/deepseek_v4_1/sp_prefill.py:/opt/spark-ds41f/candidate/vllm/vllm/models/deepseek_v4_1/sp_prefill.py:ro -v /home/chris/spark-lab/agents/candidate-51-own-marks/ovl/c51/vllm/models/deepseek_v4_1/tilelang/cache_writer.py:/opt/spark-ds41f/candidate/vllm/vllm/models/deepseek_v4_1/tilelang/cache_writer.py:ro -v /home/chris/spark-lab/agents/candidate-51-own-marks/ovl/c51/vllm/models/deepseek_v4_1/tilelang/front.py:/opt/spark-ds41f/candidate/vllm/vllm/models/deepseek_v4_1/tilelang/front.py:ro -v /home/chris/spark-lab/agents/candidate-51-own-marks/ovl/c51/vllm/models/deepseek_v4_1/tilelang/gemm.py:/opt/spark-ds41f/candidate/vllm/vllm/models/deepseek_v4_1/tilelang/gemm.py:ro -v /home/chris/spark-lab/agents/candidate-51-own-marks/ovl/c51/vllm/models/deepseek_v4_1/tilelang/vocab.py:/opt/spark-ds41f/candidate/vllm/vllm/models/deepseek_v4_1/tilelang/vocab.py:ro -v /home/chris/spark-lab/agents/candidate-51-own-marks/ovl/c51/vllm/models/deepseek_v4_1/tilelang/wo.py:/opt/spark-ds41f/candidate/vllm/vllm/models/deepseek_v4_1/tilelang/wo.py:ro -v /home/chris/spark-lab/agents/candidate-51-own-marks/ovl/c51/vllm/models/glm5next/nvidia/l2_prefetch.py:/opt/spark-ds41f/candidate/vllm/vllm/models/glm5next/nvidia/l2_prefetch.py:ro -v /home/chris/spark-lab/agents/candidate-51-own-marks/ovl/c51/vllm/models/glm5next/nvidia/tilelang/l2_prefetch.py:/opt/spark-ds41f/candidate/vllm/vllm/models/glm5next/nvidia/tilelang/l2_prefetch.py:ro -e PYTHONPATH=/opt/spark-ds41f/candidate/vllm:/h --entrypoint pytest sha256:8c1ea1f62f62c3e2adc03b645c091a5499cf7163101aca32875c894b96f155db -p tblib_stub -v tests/kernels/quantization/test_deepseek_v41_tilelang_vocab.py tests/kernels/quantization/test_deepseek_v41_tilelang_linear.py tests/kernels/test_deepseek_v41_tilelang_embedding.py tests/kernels/test_deepseek_v41_tilelang_pdl.py 
+end_utc: 2026-11-09T19:01:41Z
+loadavg_after: 1.34 1.62 1.63
+exit_code: 0
+output: pytest-c51-boot2.txt
+

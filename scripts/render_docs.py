@@ -16,19 +16,23 @@ and renders:
 1. Deterministic markdown status & benchmark tables between
    ``<!-- BEGIN GENERATED: <id> -->`` and ``<!-- END GENERATED: <id> -->`` markers in
    ``README.md``, ``docs/current-state.md``, and ``TODO.md``.
-2. The self-contained interactive GitHub Pages dashboard at ``docs/index.html``
+2. The GitHub Pages site at ``docs/index.html``: the page in ``site/index.html``
+   with the manifest data embedded
    (plus ``docs/.nojekyll``, and ``<site-dir>/index.html`` + ``<site-dir>/data.json``
-   when ``--site-dir`` is given).
+   + the ``docs/logo.png`` favicon and the ``docs/og.png`` link-preview image when
+   ``--site-dir`` is given; ``scripts/render-og`` renders that image from the page).
 """
 
 from __future__ import annotations
 
 import argparse
 import difflib
+import hashlib
 import html
 import json
 import math
 import re
+import shutil
 import sys
 from pathlib import Path
 from typing import Any
@@ -39,7 +43,12 @@ sys.path.insert(0, str(ROOT / "scripts"))
 
 import kv_capacity  # noqa: E402
 import recipe  # noqa: E402
+from servebench import prompts as sb_prompts  # noqa: E402
 from servebench import stats as sb_stats  # noqa: E402
+
+SITE_TEMPLATE = ROOT / "site/index.html"
+SITE_DATA_MARKER = "__MANIFEST_DATA__"
+SITE_VERSION_MARKER = "__SITE_VERSION__"
 
 MARKER_RE = re.compile(
     r"(<!-- BEGIN GENERATED: ([a-z0-9_-]+) -->)\n.*?(<!-- END GENERATED: \2 -->)",
@@ -80,6 +89,61 @@ def _count_series_patches(series_rel_path: str | None) -> int | None:
     )
 
 
+# servebench's default prompt set crosses sixteen task styles with topics. Two styles ask for
+# code and one for a JSON object, which is neither prose nor code; the other thirteen ask for prose.
+_CODE_STYLES = ("Python function", "SQL schema")
+_STRUCTURED_STYLES = ("JSON object",)
+
+
+def _prompt_styles() -> tuple[str, dict[str, str]]:
+    """The default prompt set's digest, and each prompt id's style (prose, code or structured)."""
+    prompts = sb_prompts.default_prompts()
+    styles = {}
+    for prompt in prompts:
+        text = prompt["text"]
+        if any(marker in text for marker in _CODE_STYLES):
+            styles[prompt["id"]] = "code"
+        elif any(marker in text for marker in _STRUCTURED_STYLES):
+            styles[prompt["id"]] = "structured"
+        else:
+            styles[prompt["id"]] = "prose"
+    return sb_prompts.digest(prompts), styles
+
+
+def _tps_by_style(data: dict[str, Any]) -> dict[str, Any] | None:
+    """One stream's output tokens per second on prose and on code prompts, from a run's request table.
+
+    Each style's rate is its requests' output tokens over their time from send to end, for the
+    error-free requests that lie inside the measurement window: the same accounting as the run's
+    ``output_tps``, which is their mix. None unless the run used the default prompt set unchanged
+    and has at least five requests of each style."""
+    table = data.get("request_table") or {}
+    window = table.get("window")
+    digest, styles = _prompt_styles()
+    workload = data.get("workload", {})
+    if not table.get("rows") or not window or workload.get("prompts_sha256") != digest:
+        return None
+    at = {name: i for i, name in enumerate(table["columns"])}
+    totals: dict[str, list[float]] = {}
+    for row in table["rows"]:
+        sent, end, tokens = row[at["sent"]], row[at["end"]], row[at["completion_tokens"]]
+        style = styles.get(row[at["prompt"]])
+        if row[at["error"]] or style is None or sent is None or end is None or not tokens:
+            continue
+        if sent < window[0] or end > window[1] or end <= sent:
+            continue
+        total = totals.setdefault(style, [0.0, 0.0, 0])
+        total[0] += tokens
+        total[1] += end - sent
+        total[2] += 1
+    if any(totals.get(style, [0, 0, 0])[2] < 5 for style in ("prose", "code")):
+        return None
+    return {
+        style: {"tps": round(totals[style][0] / totals[style][1], 1), "requests": totals[style][2]}
+        for style in ("prose", "code")
+    }
+
+
 def _parse_run_step(path: Path) -> dict[str, Any] | None:
     if not path.is_file():
         return None
@@ -94,6 +158,7 @@ def _parse_run_step(path: Path) -> dict[str, Any] | None:
     slo = latency.get("slo", {})
     return {
         "concurrency": data.get("workload", {}).get("concurrency"),
+        "tps_by_style": _tps_by_style(data),
         "mode": data.get("workload", {}).get("mode", "closed"),
         "rate": data.get("workload", {}).get("rate"),
         "output_tps": round(out_tps.get("mean", 0.0), 2) if out_tps else None,
@@ -842,1039 +907,15 @@ def render_site_html(data: dict[str, Any]) -> str:
         "suites": data["suites"],
         "timeline": data["timeline"],
     }
-    embedded_json = json.dumps(payload, indent=2, sort_keys=True)
-    title = f"spark-ds41f — {data['promoted_short']} Manifest & Benchmark Observatory"
-
-    return f"""<!DOCTYPE html>
-<html lang="en" data-theme="dark">
-<head>
-  <meta charset="utf-8">
-  <meta name="viewport" content="width=device-width, initial-scale=1">
-  <title>{html.escape(title)}</title>
-  <style>
-    :root {{
-      --bg: #0b0f17;
-      --bg-elev: #111827;
-      --bg-card: #161f30;
-      --bg-hover: #1e293b;
-      --text: #f1f5f9;
-      --text-muted: #94a3b8;
-      --border: #263248;
-      --accent: #10b981;
-      --accent-soft: rgba(16, 185, 129, 0.14);
-      --cyan: #06b6d4;
-      --cyan-soft: rgba(6, 182, 212, 0.14);
-      --amber: #f59e0b;
-      --amber-soft: rgba(245, 158, 11, 0.14);
-      --indigo: #818cf8;
-      --rose: #f43f5e;
-      --mono: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", monospace;
-      --sans: -apple-system, BlinkMacSystemFont, "Segoe UI", Inter, Roboto, Helvetica, Arial, sans-serif;
-    }}
-    html[data-theme="light"] {{
-      --bg: #f8fafc;
-      --bg-elev: #ffffff;
-      --bg-card: #ffffff;
-      --bg-hover: #f1f5f9;
-      --text: #0f172a;
-      --text-muted: #475569;
-      --border: #e2e8f0;
-      --accent: #059669;
-      --accent-soft: rgba(5, 150, 105, 0.10);
-      --cyan: #0891b2;
-      --cyan-soft: rgba(8, 145, 178, 0.10);
-      --amber: #d97706;
-      --amber-soft: rgba(217, 119, 6, 0.10);
-      --indigo: #4f46e5;
-      --rose: #e11d48;
-    }}
-    * {{ box-sizing: border-box; }}
-    body {{
-      margin: 0;
-      background: var(--bg);
-      color: var(--text);
-      font-family: var(--sans);
-      line-height: 1.5;
-      font-variant-numeric: tabular-nums;
-    }}
-    a {{ color: var(--cyan); text-decoration: none; }}
-    a:hover {{ text-decoration: underline; }}
-    .container {{
-      max-width: 1320px;
-      margin: 0 auto;
-      padding: 24px 20px 72px;
-    }}
-    header.hero {{
-      background: linear-gradient(135deg, var(--bg-elev) 0%, var(--bg-card) 100%);
-      border: 1px solid var(--border);
-      border-radius: 14px;
-      padding: 24px 28px;
-      margin-bottom: 24px;
-      position: relative;
-    }}
-    .hero-top {{
-      display: flex;
-      flex-wrap: wrap;
-      justify-content: space-between;
-      align-items: flex-start;
-      gap: 16px;
-    }}
-    .badge-row {{
-      display: flex;
-      flex-wrap: wrap;
-      gap: 8px;
-      margin-bottom: 10px;
-    }}
-    .badge {{
-      display: inline-flex;
-      align-items: center;
-      gap: 6px;
-      padding: 4px 10px;
-      border-radius: 999px;
-      font-size: 12px;
-      font-weight: 600;
-      font-family: var(--mono);
-      border: 1px solid var(--border);
-      background: var(--bg);
-    }}
-    .badge.live {{
-      background: var(--accent-soft);
-      color: var(--accent);
-      border-color: var(--accent);
-    }}
-    .badge.cyan {{
-      background: var(--cyan-soft);
-      color: var(--cyan);
-      border-color: var(--cyan);
-    }}
-    .badge.amber {{
-      background: var(--amber-soft);
-      color: var(--amber);
-      border-color: var(--amber);
-    }}
-    h1 {{
-      margin: 0 0 6px;
-      font-size: 28px;
-      letter-spacing: -0.02em;
-    }}
-    .subtitle {{
-      margin: 0;
-      color: var(--text-muted);
-      font-size: 14.5px;
-      max-width: 880px;
-    }}
-    .hero-actions {{
-      display: flex;
-      gap: 10px;
-      align-items: center;
-    }}
-    button.btn, select.select, input.search {{
-      background: var(--bg);
-      color: var(--text);
-      border: 1px solid var(--border);
-      border-radius: 8px;
-      padding: 7px 12px;
-      font-size: 13px;
-      font-family: var(--sans);
-      cursor: pointer;
-    }}
-    button.btn:hover, select.select:hover {{
-      border-color: var(--cyan);
-    }}
-    button.btn.active {{
-      background: var(--cyan-soft);
-      color: var(--cyan);
-      border-color: var(--cyan);
-      font-weight: 600;
-    }}
-    .kpi-grid {{
-      display: grid;
-      grid-template-columns: repeat(auto-fit, minmax(195px, 1fr));
-      gap: 12px;
-      margin-top: 20px;
-    }}
-    .kpi-card {{
-      background: var(--bg);
-      border: 1px solid var(--border);
-      border-radius: 10px;
-      padding: 14px 16px;
-    }}
-    .kpi-label {{
-      font-size: 11.5px;
-      text-transform: uppercase;
-      letter-spacing: 0.05em;
-      color: var(--text-muted);
-      margin-bottom: 4px;
-    }}
-    .kpi-value {{
-      font-size: 23px;
-      font-weight: 700;
-      font-family: var(--mono);
-      color: var(--text);
-    }}
-    .kpi-delta {{
-      font-size: 12px;
-      font-family: var(--mono);
-      color: var(--accent);
-      margin-top: 3px;
-    }}
-    nav.tabs {{
-      display: flex;
-      flex-wrap: wrap;
-      gap: 8px;
-      margin-bottom: 20px;
-      border-bottom: 1px solid var(--border);
-      padding-bottom: 12px;
-    }}
-    .section {{
-      background: var(--bg-card);
-      border: 1px solid var(--border);
-      border-radius: 12px;
-      padding: 22px 24px;
-      margin-bottom: 22px;
-    }}
-    .section-header {{
-      display: flex;
-      flex-wrap: wrap;
-      justify-content: space-between;
-      align-items: center;
-      gap: 12px;
-      margin-bottom: 16px;
-    }}
-    .section h2 {{
-      margin: 0;
-      font-size: 19px;
-      letter-spacing: -0.01em;
-    }}
-    .section p.desc {{
-      margin: 4px 0 0;
-      color: var(--text-muted);
-      font-size: 13.5px;
-    }}
-    .controls {{
-      display: flex;
-      flex-wrap: wrap;
-      gap: 10px;
-      align-items: center;
-    }}
-    .chart-grid {{
-      display: grid;
-      grid-template-columns: repeat(auto-fit, minmax(520px, 1fr));
-      gap: 18px;
-      margin-bottom: 18px;
-    }}
-    @media (max-width: 640px) {{
-      .chart-grid {{ grid-template-columns: 1fr; }}
-    }}
-    .chart-box {{
-      background: var(--bg);
-      border: 1px solid var(--border);
-      border-radius: 10px;
-      padding: 16px;
-    }}
-    .chart-title {{
-      font-size: 13.5px;
-      font-weight: 600;
-      margin: 0 0 10px;
-      display: flex;
-      justify-content: space-between;
-      align-items: center;
-    }}
-    .chart-title span.sub {{
-      font-weight: 400;
-      font-size: 12px;
-      color: var(--text-muted);
-      font-family: var(--mono);
-    }}
-    .table-wrap {{
-      overflow-x: auto;
-      border: 1px solid var(--border);
-      border-radius: 10px;
-      background: var(--bg);
-    }}
-    table {{
-      width: 100%;
-      border-collapse: collapse;
-      font-size: 13px;
-    }}
-    th, td {{
-      padding: 9px 12px;
-      border-bottom: 1px solid var(--border);
-      text-align: left;
-    }}
-    th {{
-      background: var(--bg-elev);
-      color: var(--text-muted);
-      font-weight: 600;
-      font-size: 11.5px;
-      text-transform: uppercase;
-      letter-spacing: 0.04em;
-    }}
-    td.num, th.num {{
-      text-align: right;
-      font-family: var(--mono);
-    }}
-    tr:last-child td {{ border-bottom: none; }}
-    tr:hover td {{ background: var(--bg-hover); }}
-    code {{
-      font-family: var(--mono);
-      font-size: 12px;
-      background: var(--bg-elev);
-      padding: 2px 6px;
-      border-radius: 4px;
-      border: 1px solid var(--border);
-    }}
-    .verdict-better {{
-      color: var(--accent);
-      font-weight: 600;
-      font-family: var(--mono);
-    }}
-    .verdict-same {{
-      color: var(--text-muted);
-      font-family: var(--mono);
-    }}
-    .verdict-worse {{
-      color: var(--rose);
-      font-weight: 600;
-      font-family: var(--mono);
-    }}
-    .shape-cards {{
-      display: grid;
-      grid-template-columns: repeat(auto-fit, minmax(340px, 1fr));
-      gap: 16px;
-      margin-bottom: 16px;
-    }}
-    .shape-card {{
-      background: var(--bg);
-      border: 1px solid var(--border);
-      border-radius: 10px;
-      padding: 18px;
-    }}
-    .shape-card.default {{
-      border-color: var(--accent);
-    }}
-    .kv-bar {{
-      height: 10px;
-      border-radius: 999px;
-      background: var(--bg-elev);
-      overflow: hidden;
-      margin: 10px 0;
-      border: 1px solid var(--border);
-    }}
-    .kv-bar-fill {{
-      height: 100%;
-      background: linear-gradient(90deg, var(--accent), var(--cyan));
-    }}
-    .timeline-list {{
-      display: flex;
-      flex-direction: column;
-      gap: 12px;
-    }}
-    .timeline-item {{
-      background: var(--bg);
-      border: 1px solid var(--border);
-      border-radius: 10px;
-      padding: 14px 18px;
-    }}
-    .timeline-item.promoted {{
-      border-color: var(--accent);
-    }}
-    .timeline-head {{
-      display: flex;
-      flex-wrap: wrap;
-      justify-content: space-between;
-      align-items: center;
-      gap: 8px;
-      margin-bottom: 6px;
-    }}
-    .cap-tags {{
-      display: flex;
-      flex-wrap: wrap;
-      gap: 6px;
-      margin-top: 12px;
-    }}
-    .cap-tag {{
-      font-family: var(--mono);
-      font-size: 11px;
-      padding: 3px 8px;
-      border-radius: 6px;
-      background: var(--bg);
-      border: 1px solid var(--border);
-      color: var(--text-muted);
-    }}
-    footer {{
-      text-align: center;
-      color: var(--text-muted);
-      font-size: 12.5px;
-      margin-top: 36px;
-    }}
-  </style>
-</head>
-<body>
-  <div class="container">
-    <header class="hero">
-      <div class="hero-top">
-        <div>
-          <div class="badge-row" id="hero-badges"></div>
-          <h1 id="hero-title">spark-ds41f</h1>
-          <p class="subtitle" id="hero-subtitle"></p>
-        </div>
-        <div class="hero-actions">
-          <a class="btn" href="https://github.com/christopherowen/spark-ds41f" target="_blank" rel="noopener">GitHub Repo</a>
-          <button class="btn" id="theme-toggle" type="button">Light / Dark</button>
-        </div>
-      </div>
-      <div class="kpi-grid" id="hero-kpis"></div>
-    </header>
-
-    <section class="section" id="sec-performance">
-      <div class="section-header">
-        <div>
-          <h2>Release-over-Release Performance Observatory</h2>
-          <p class="desc">Driven directly from <code>manifests/suites/*/</code> across all recorded servebench release, single-stream, and sampled runs.</p>
-        </div>
-        <div class="controls">
-          <label style="font-size:12.5px;color:var(--text-muted)">Topology:</label>
-          <select class="select" id="topo-select">
-            <option value="TP4">TP4 Ring (4× DGX Spark)</option>
-            <option value="TP3">TP3 Triangle (3× DGX Spark)</option>
-          </select>
-          <label style="font-size:12.5px;color:var(--text-muted)">Base:</label>
-          <select class="select" id="base-suite-select"></select>
-          <label style="font-size:12.5px;color:var(--text-muted)">Candidate:</label>
-          <select class="select" id="cand-suite-select"></select>
-        </div>
-      </div>
-
-      <div class="chart-grid">
-        <div class="chart-box">
-          <div class="chart-title">
-            <span>Source-Text Prefill Throughput (32K → 1M)</span>
-            <span class="sub">tok/s (higher is better)</span>
-          </div>
-          <div id="chart-prefill"></div>
-        </div>
-        <div class="chart-box">
-          <div class="chart-title">
-            <span>Decode Throughput across Releases</span>
-            <span class="sub">output tok/s (higher is better)</span>
-          </div>
-          <div id="chart-decode"></div>
-        </div>
-      </div>
-
-      <div class="chart-grid">
-        <div class="chart-box">
-          <div class="chart-title">
-            <span>Engine Decode Step-Time Grid (Base vs Candidate)</span>
-            <span class="sub">trimmed mean ms / step (lower is better)</span>
-          </div>
-          <div id="chart-grid"></div>
-        </div>
-        <div class="chart-box">
-          <div class="chart-title">
-            <span>DSpark Speculative Survival &amp; Prefill Yield</span>
-            <span class="sub">draft positions k=0..4 &amp; 131K stall probes</span>
-          </div>
-          <div id="chart-spec-stall"></div>
-        </div>
-      </div>
-
-      <div class="table-wrap">
-        <table id="suite-compare-table">
-          <thead>
-            <tr>
-              <th>Workload / Metric</th>
-              <th class="num" id="th-base">Base</th>
-              <th class="num" id="th-cand">Candidate</th>
-              <th class="num">Delta</th>
-              <th>Notes</th>
-            </tr>
-          </thead>
-          <tbody id="suite-compare-tbody"></tbody>
-        </table>
-      </div>
-    </section>
-
-    <section class="section" id="sec-shapes">
-      <div class="section-header">
-        <div>
-          <h2>Cluster Shapes &amp; KV Pool Sizing</h2>
-          <p class="desc">Resolved from <code>config/cluster.json</code> via <code>scripts/recipe.py</code> and <code>scripts/kv_capacity.py</code> (227,840-byte pool blocks).</p>
-        </div>
-      </div>
-      <div class="shape-cards" id="shape-cards"></div>
-      <div class="table-wrap">
-        <table>
-          <thead>
-            <tr>
-              <th>Shape</th>
-              <th>Ranks &amp; Transport</th>
-              <th>Kernel / Pages</th>
-              <th class="num">Context Limit</th>
-              <th class="num">Max Seqs</th>
-              <th class="num">Batch Tokens</th>
-              <th class="num">KV Pool / Rank</th>
-              <th class="num">Min Free RAM (Head / Workers)</th>
-              <th class="num">5 GiB Guard Headroom</th>
-              <th class="num">Pool Blocks</th>
-              <th class="num">Full Contexts Held</th>
-              <th class="num">vLLM 0491 Startup Line</th>
-              <th>Qualified Suite</th>
-            </tr>
-          </thead>
-          <tbody id="shapes-tbody"></tbody>
-        </table>
-      </div>
-    </section>
-
-    <section class="section" id="sec-upstreams">
-      <div class="section-header">
-        <div>
-          <h2>Pinned Upstreams, Patch Stacks &amp; Active Runtime Choices</h2>
-          <p class="desc">Synchronized from <code>upstreams.lock.json</code>, <code>manifests/baselines/{html.escape(data['promoted_baseline'])}.json</code>, and <code>manifests/sources/</code>.</p>
-        </div>
-        <div class="controls">
-          <input class="search" id="choice-search" type="search" placeholder="Filter runtime choices or capabilities...">
-        </div>
-      </div>
-      <div class="table-wrap" style="margin-bottom:18px">
-        <table>
-          <thead>
-            <tr>
-              <th>Component</th>
-              <th>Version / Ref</th>
-              <th class="num">Pinned Revision</th>
-              <th class="num">Patch Series</th>
-              <th class="num">Verified Tree</th>
-              <th>Role</th>
-            </tr>
-          </thead>
-          <tbody id="upstreams-tbody"></tbody>
-        </table>
-      </div>
-      <div class="table-wrap">
-        <table>
-          <thead>
-            <tr>
-              <th style="width:220px">Runtime Choice</th>
-              <th>Active Specification in <code>{html.escape(data['promoted_short'])}</code></th>
-            </tr>
-          </thead>
-          <tbody id="choices-tbody"></tbody>
-        </table>
-      </div>
-      <div class="cap-tags" id="cap-tags"></div>
-    </section>
-
-    <section class="section" id="sec-timeline">
-      <div class="section-header">
-        <div>
-          <h2>Baseline Manifest History (35 Releases)</h2>
-          <p class="desc">Complete immutable promotion history from <code>manifests/baselines/*.json</code>.</p>
-        </div>
-        <div class="controls">
-          <input class="search" id="timeline-search" type="search" placeholder="Search releases (e.g. 1030, r6x, engram, glp)...">
-        </div>
-      </div>
-      <div class="timeline-list" id="timeline-list"></div>
-    </section>
-
-    <footer>
-      Generated deterministically from repository manifests by <code>scripts/render_docs.py</code> &bull; Verified in CI by <code>tests/test_releases.py</code>
-    </footer>
-  </div>
-
-  <script id="manifest-data" type="application/json">
-{embedded_json}
-  </script>
-  <script>
-    (function () {{
-      const DATA = JSON.parse(document.getElementById("manifest-data").textContent);
-
-      // Theme toggle
-      const htmlEl = document.documentElement;
-      document.getElementById("theme-toggle").addEventListener("click", () => {{
-        htmlEl.setAttribute("data-theme", htmlEl.getAttribute("data-theme") === "dark" ? "light" : "dark");
-      }});
-
-      function esc(str) {{
-        if (str === null || str === undefined) return "";
-        return String(str)
-          .replace(/&/g, "&amp;")
-          .replace(/</g, "&lt;")
-          .replace(/>/g, "&gt;")
-          .replace(/"/g, "&quot;");
-      }}
-
-      // Render Hero
-      const tp4Shape = DATA.shapes.find(s => s.name === "tp4-ring") || DATA.shapes[0];
-      const tp3Shape = DATA.shapes.find(s => s.name === "tp3-triangle") || DATA.shapes[1];
-      const tp4Suite = DATA.suites.find(s => s.path === tp4Shape.benchmark_reference);
-      const tp3Suite = DATA.suites.find(s => s.path === tp3Shape.benchmark_reference);
-
-      document.getElementById("hero-badges").innerHTML = [
-        `<span class="badge live">● PRODUCTION: ${{esc(DATA.promoted_short)}}</span>`,
-        `<span class="badge cyan">Image: ${{esc(DATA.image_tag)}} (${{esc(DATA.image_id.slice(0, 19))}})</span>`,
-        `<span class="badge cyan">Model: ${{esc(DATA.model_repo)}} (${{esc(DATA.model_revision)}})</span>`,
-        `<span class="badge amber">GLP Dual-Serve: ${{esc(DATA.served_models[1])}}</span>`,
-        `<span class="badge">Backend: TileLang-only + sparknet 0.5.0</span>`
-      ].join("");
-
-      document.getElementById("hero-title").textContent =
-        `spark-ds41f — ${{DATA.promoted_short}} Manifest & Performance Observatory`;
-      document.getElementById("hero-subtitle").textContent =
-        `Reproducible Docker/vLLM deployment for DeepSeek-V4.1-Flash-1017 at 1,048,576 context on switchless 4-node ring (TP4) and 3-node triangle (TP3) DGX Spark fabrics. Driven directly from config/cluster.json, upstreams.lock.json, and manifests/.`;
-
-      const p32_4 = (tp4Suite.prefill.find(p => p.size === 32768) || {{}}).tps || 0;
-      const p131_4 = (tp4Suite.prefill.find(p => p.size === 131072) || {{}}).tps || 0;
-      const p1m_4 = (tp4Suite.prefill.find(p => p.size === 1000000) || {{}}).tps || 0;
-      const stall3 = (tp4Suite.stalls["stall-3"] || {{}}).probe_ttft_p50_s;
-
-      const kpis = [
-        {{
-          label: "TP4 Decode (16 Streams)",
-          value: `${{tp4Suite.runs.c16.output_tps.toFixed(1)}} tok/s`,
-          delta: `+2.40% vs 1025 (paired +2.05%)`
-        }},
-        {{
-          label: "TP4 Single-Stream (c1)",
-          value: `${{tp4Suite.runs.c1.output_tps.toFixed(1)}} tok/s`,
-          delta: `78.3 paired (+3.61%) · TTFT 0.121s`
-        }},
-        {{
-          label: "TP4 Prefill (131K / 1M)",
-          value: `${{Math.round(p131_4).toLocaleString()}} / ${{Math.round(p1m_4).toLocaleString()}}`,
-          delta: `tok/s (+8.8% at 131K, +12.2% at 1M)`
-        }},
-        {{
-          label: "TP4 Decode Grid (20 Shapes)",
-          value: `${{tp4Suite.grid.geomean_ms.toFixed(2)}} ms`,
-          delta: `-4.62% ±0.15% step geomean vs 1025`
-        }},
-        {{
-          label: "Prefill Yield Short TTFT",
-          value: `${{stall3 ? stall3.toFixed(2) + " s" : "—"}}`,
-          delta: `3.7× sooner beside 131K prefill (was 12.36s)`
-        }},
-        {{
-          label: "KV Pool Capacity (TP4 / TP3)",
-          value: `${{tp4Shape.kv_capacity.vllm_capacity_contexts.toFixed(2)}}× / ${{tp3Shape.kv_capacity.contexts.toFixed(2)}}×`,
-          delta: `11 full 1M contexts on TP4 · 5 on TP3`
-        }}
-      ];
-      document.getElementById("hero-kpis").innerHTML = kpis.map(k => `
-        <div class="kpi-card">
-          <div class="kpi-label">${{esc(k.label)}}</div>
-          <div class="kpi-value">${{esc(k.value)}}</div>
-          <div class="kpi-delta">${{esc(k.delta)}}</div>
-        </div>
-      `).join("");
-
-      // Performance Observatory Controls
-      const topoSelect = document.getElementById("topo-select");
-      const baseSelect = document.getElementById("base-suite-select");
-      const candSelect = document.getElementById("cand-suite-select");
-
-      function populateSuiteSelectors() {{
-        const topo = topoSelect.value;
-        const matching = DATA.suites.filter(s => s.topology === topo);
-        baseSelect.innerHTML = matching.map((s, idx) =>
-          `<option value="${{esc(s.id)}}">${{esc(s.release)}} (${{esc(s.date)}})</option>`
-        ).join("");
-        candSelect.innerHTML = matching.map((s, idx) =>
-          `<option value="${{esc(s.id)}}">${{esc(s.release)}} (${{esc(s.date)}})</option>`
-        ).join("");
-        if (matching.length >= 2) {{
-          baseSelect.selectedIndex = matching.length - 2;
-          candSelect.selectedIndex = matching.length - 1;
-        }} else if (matching.length === 1) {{
-          baseSelect.selectedIndex = 0;
-          candSelect.selectedIndex = 0;
-        }}
-        renderChartsAndTable();
-      }}
-
-      function pctDelta(baseVal, candVal, lowerBetter = false) {{
-        if (!baseVal || !candVal) return null;
-        const pct = ((candVal - baseVal) / baseVal) * 100;
-        const good = lowerBetter ? pct < -0.3 : pct > 0.3;
-        const bad = lowerBetter ? pct > 0.3 : pct < -0.3;
-        const cls = good ? "verdict-better" : (bad ? "verdict-worse" : "verdict-same");
-        const sign = pct > 0 ? "+" : "";
-        return `<span class="${{cls}}">${{sign}}${{pct.toFixed(2)}}%</span>`;
-      }}
-
-      function renderPrefillSvg(suites, baseSuite, candSuite) {{
-        const w = 520, h = 230, padL = 52, padR = 18, padT = 18, padB = 34;
-        const sizes = [32768, 131072, 262144, 524288, 1000000];
-        const sizeLabels = ["32K", "131K", "262K", "500K/524K", "1M"];
-        const allVals = [];
-        suites.forEach(s => s.prefill.forEach(p => allVals.push(p.tps)));
-        const maxV = Math.max(8000, ...allVals) * 1.05;
-        const minV = Math.max(0, Math.min(3000, ...allVals) * 0.9);
-
-        const xFor = i => padL + (i / (sizes.length - 1)) * (w - padL - padR);
-        const yFor = v => padT + (1 - (v - minV) / (maxV - minV)) * (h - padT - padB);
-
-        let gridLines = "";
-        for (let g = 3500; g <= 7500; g += 1000) {{
-          if (g < minV || g > maxV) continue;
-          const y = yFor(g);
-          gridLines += `<line x1="${{padL}}" y1="${{y}}" x2="${{w - padR}}" y2="${{y}}" stroke="var(--border)" stroke-dasharray="3,3"/>`;
-          gridLines += `<text x="${{padL - 6}}" y="${{y + 4}}" text-anchor="end" fill="var(--text-muted)" font-size="10.5" font-family="var(--mono)">${{(g/1000).toFixed(1)}}k</text>`;
-        }}
-        sizeLabels.forEach((lbl, i) => {{
-          const x = xFor(i);
-          gridLines += `<text x="${{x}}" y="${{h - 10}}" text-anchor="middle" fill="var(--text-muted)" font-size="11" font-family="var(--mono)">${{lbl}}</text>`;
-        }});
-
-        const palette = ["#64748b", "#94a3b8", "#818cf8", "#f59e0b", "#06b6d4", "#10b981"];
-        let paths = "";
-        suites.forEach((s, idx) => {{
-          const isCand = s.id === candSuite.id;
-          const isBase = s.id === baseSuite.id;
-          const color = isCand ? "var(--accent)" : (isBase ? "var(--cyan)" : palette[idx % palette.length]);
-          const opacity = (isCand || isBase) ? 1.0 : 0.40;
-          const width = isCand ? 3.0 : (isBase ? 2.4 : 1.4);
-          const pts = [];
-          sizes.forEach((sz, i) => {{
-            const row = s.prefill.find(p => p.size === sz || (sz === 524288 && p.size === 500000));
-            if (row) pts.push({{ x: xFor(i), y: yFor(row.tps), tps: row.tps }});
-          }});
-          if (pts.length > 1) {{
-            const d = pts.map((p, i) => `${{i === 0 ? "M" : "L"}}${{p.x.toFixed(1)}},${{p.y.toFixed(1)}}`).join(" ");
-            paths += `<path d="${{d}}" fill="none" stroke="${{color}}" stroke-width="${{width}}" opacity="${{opacity}}"/>`;
-            pts.forEach(p => {{
-              paths += `<circle cx="${{p.x.toFixed(1)}}" cy="${{p.y.toFixed(1)}}" r="${{isCand ? 4 : 3}}" fill="${{color}}" opacity="${{opacity}}"><title>${{esc(s.release)}}: ${{Math.round(p.tps).toLocaleString()}} tok/s</title></circle>`;
-            }});
-          }}
-        }});
-
-        return `<svg viewBox="0 0 ${{w}} ${{h}}" width="100%" height="230">${{gridLines}}${{paths}}</svg>`;
-      }}
-
-      function renderDecodeSvg(suites, baseSuite, candSuite) {{
-        const w = 520, h = 230, padL = 46, padR = 18, padT = 20, padB = 42;
-        const maxV = 280;
-        const yFor = v => padT + (1 - v / maxV) * (h - padT - padB);
-        let svg = "";
-        for (let g = 50; g <= 250; g += 50) {{
-          const y = yFor(g);
-          svg += `<line x1="${{padL}}" y1="${{y}}" x2="${{w - padR}}" y2="${{y}}" stroke="var(--border)" stroke-dasharray="3,3"/>`;
-          svg += `<text x="${{padL - 6}}" y="${{y + 4}}" text-anchor="end" fill="var(--text-muted)" font-size="10.5" font-family="var(--mono)">${{g}}</text>`;
-        }}
-        const n = suites.length;
-        const slotW = (w - padL - padR) / Math.max(n, 1);
-        suites.forEach((s, i) => {{
-          const cx = padL + slotW * (i + 0.5);
-          const hiKey = s.runs.c16 ? "c16" : "c8";
-          const midKey = s.runs.c16 ? "c8" : "c4";
-          const hiVal = (s.runs[hiKey] || {{}}).output_tps || 0;
-          const midVal = (s.runs[midKey] || {{}}).output_tps || 0;
-          const c1Val = (s.runs.c1 || {{}}).output_tps || 0;
-          const bw = Math.min(14, slotW * 0.24);
-
-          if (hiVal) {{
-            const y = yFor(hiVal);
-            svg += `<rect x="${{cx - bw * 1.5}}" y="${{y}}" width="${{bw}}" height="${{h - padB - y}}" rx="2" fill="var(--accent)"><title>${{esc(s.release)}} ${{hiKey}}: ${{hiVal}} tok/s</title></rect>`;
-          }}
-          if (midVal) {{
-            const y = yFor(midVal);
-            svg += `<rect x="${{cx - bw * 0.4}}" y="${{y}}" width="${{bw}}" height="${{h - padB - y}}" rx="2" fill="var(--cyan)"><title>${{esc(s.release)}} ${{midKey}}: ${{midVal}} tok/s</title></rect>`;
-          }}
-          if (c1Val) {{
-            const y = yFor(c1Val);
-            svg += `<rect x="${{cx + bw * 0.7}}" y="${{y}}" width="${{bw}}" height="${{h - padB - y}}" rx="2" fill="var(--amber)"><title>${{esc(s.release)}} c1: ${{c1Val}} tok/s</title></rect>`;
-          }}
-          svg += `<text x="${{cx}}" y="${{h - 16}}" text-anchor="middle" fill="var(--text-muted)" font-size="10.5" font-family="var(--mono)">${{esc(s.release.replace("spark-ds41f-", ""))}}</text>`;
-        }});
-        return `<svg viewBox="0 0 ${{w}} ${{h}}" width="100%" height="230">${{svg}}</svg>`;
-      }}
-
-      function renderGridSvg(baseSuite, candSuite) {{
-        if (!candSuite.grid || !candSuite.grid.shapes.length) return "<p class='desc'>No engine grid in suite.</p>";
-        const shapes = candSuite.grid.shapes;
-        const baseMap = {{}};
-        if (baseSuite.grid) baseSuite.grid.shapes.forEach(r => {{ baseMap[r.label] = r.step_ms; }});
-        const w = 520, rowH = 19, padL = 165, padR = 72, padT = 8;
-        const h = padT + shapes.length * rowH + 10;
-        const maxMs = Math.max(55, ...shapes.map(s => s.step_ms));
-
-        let svg = "";
-        shapes.forEach((s, idx) => {{
-          const y = padT + idx * rowH;
-          const bMs = baseMap[s.label];
-          const cMs = s.step_ms;
-          const cw = (cMs / maxMs) * (w - padL - padR);
-          const bw = bMs ? (bMs / maxMs) * (w - padL - padR) : 0;
-          const delta = bMs ? (((cMs - bMs) / bMs) * 100).toFixed(1) + "%" : "";
-          const shortLbl = s.label.replace("decode ", "").replace(" rows ", " ");
-          svg += `<text x="${{padL - 8}}" y="${{y + 13}}" text-anchor="end" fill="var(--text-muted)" font-size="10.5" font-family="var(--mono)">${{esc(shortLbl)}}</text>`;
-          if (bw > 0) {{
-            svg += `<rect x="${{padL}}" y="${{y + 3}}" width="${{bw.toFixed(1)}}" height="5" rx="2" fill="var(--cyan)" opacity="0.55"><title>Base: ${{bMs.toFixed(2)}} ms</title></rect>`;
-          }}
-          svg += `<rect x="${{padL}}" y="${{y + 9}}" width="${{cw.toFixed(1)}}" height="6" rx="2" fill="var(--accent)"><title>Candidate: ${{cMs.toFixed(2)}} ms</title></rect>`;
-          svg += `<text x="${{w - 6}}" y="${{y + 13}}" text-anchor="end" fill="var(--text)" font-size="10.5" font-family="var(--mono)">${{cMs.toFixed(1)}}ms ${{delta}}</text>`;
-        }});
-        return `<div style="max-height:230px;overflow-y:auto"><svg viewBox="0 0 ${{w}} ${{h}}" width="100%" height="${{h}}">${{svg}}</svg></div>`;
-      }}
-
-      function renderSpecStallBox(baseSuite, candSuite) {{
-        const hiKey = candSuite.runs.c16 ? "c16" : "c8";
-        const run = candSuite.runs[hiKey] || {{}};
-        const surv = run.survival || [];
-        const cov = run.coverage || [];
-        let htmlOut = `<div style="font-size:12.5px;margin-bottom:10px"><strong>DSpark Draft Survival / Coverage (${{esc(candSuite.release)}} ${{hiKey}}):</strong></div>`;
-        htmlOut += `<div style="display:grid;grid-template-columns:repeat(5,1fr);gap:6px;margin-bottom:14px">`;
-        for (let k = 0; k < 5; k++) {{
-          const sVal = surv[k] !== undefined ? (surv[k] * 100).toFixed(1) + "%" : "—";
-          const cVal = cov[k] !== undefined ? (cov[k] * 100).toFixed(1) + "%" : "—";
-          htmlOut += `<div style="background:var(--bg-elev);border:1px solid var(--border);border-radius:6px;padding:6px 8px;text-align:center">
-            <div style="font-size:10.5px;color:var(--text-muted);font-family:var(--mono)">Draft k=${{k}}</div>
-            <div style="font-size:13.5px;font-weight:700;color:var(--accent);font-family:var(--mono)">${{sVal}}</div>
-            <div style="font-size:10.5px;color:var(--text-muted);font-family:var(--mono)">cov ${{cVal}}</div>
-          </div>`;
-        }}
-        htmlOut += `</div>`;
-
-        const st3 = candSuite.stalls["stall-3"];
-        const st11 = candSuite.stalls["stall-11"];
-        const st15 = candSuite.stalls["stall-15"];
-        if (st3 || st15) {{
-          htmlOut += `<div style="font-size:12.5px;margin-bottom:6px"><strong>131K Prefill Yield &amp; Mixed-Traffic Stalls (${{esc(candSuite.release)}}):</strong></div>`;
-          htmlOut += `<div style="display:grid;grid-template-columns:repeat(3,1fr);gap:8px">`;
-          if (st3) {{
-            htmlOut += `<div style="background:var(--bg-elev);border:1px solid var(--border);border-radius:6px;padding:8px">
-              <div style="font-size:10.5px;color:var(--text-muted)">3 Streams + 131K</div>
-              <div style="font-size:14px;font-weight:700;font-family:var(--mono);color:var(--accent)">TTFT ${{st3.probe_ttft_p50_s.toFixed(2)}}s</div>
-              <div style="font-size:11px;color:var(--text-muted);font-family:var(--mono)">${{Math.round(st3.prefill_tps).toLocaleString()}} tok/s prefill</div>
-            </div>`;
-          }}
-          if (st11) {{
-            htmlOut += `<div style="background:var(--bg-elev);border:1px solid var(--border);border-radius:6px;padding:8px">
-              <div style="font-size:10.5px;color:var(--text-muted)">11 Streams + 131K</div>
-              <div style="font-size:14px;font-weight:700;font-family:var(--mono);color:var(--accent)">TTFT ${{st11.probe_ttft_p50_s.toFixed(2)}}s</div>
-              <div style="font-size:11px;color:var(--text-muted);font-family:var(--mono)">${{Math.round(st11.prefill_tps).toLocaleString()}} tok/s prefill</div>
-            </div>`;
-          }}
-          if (st15) {{
-            htmlOut += `<div style="background:var(--bg-elev);border:1px solid var(--border);border-radius:6px;padding:8px">
-              <div style="font-size:10.5px;color:var(--text-muted)">15 Streams + 131K</div>
-              <div style="font-size:14px;font-weight:700;font-family:var(--mono);color:var(--cyan)">${{Math.round(st15.prefill_tps).toLocaleString()}} tok/s</div>
-              <div style="font-size:11px;color:var(--text-muted);font-family:var(--mono)">step p90 ${{st15.during_p90_s.toFixed(2)}}s</div>
-            </div>`;
-          }}
-          htmlOut += `</div>`;
-        }} else {{
-          htmlOut += `<div style="font-size:12px;color:var(--text-muted)">Select <code>spark-ds41f-1030</code> on TP4 to inspect <code>stall-3</code>, <code>stall-11</code>, and <code>stall-15</code> prefill-yield probes.</div>`;
-        }}
-        return htmlOut;
-      }}
-
-      function renderChartsAndTable() {{
-        const topo = topoSelect.value;
-        const suites = DATA.suites.filter(s => s.topology === topo);
-        const baseSuite = suites.find(s => s.id === baseSelect.value) || suites[0];
-        const candSuite = suites.find(s => s.id === candSelect.value) || suites[suites.length - 1];
-
-        document.getElementById("chart-prefill").innerHTML = renderPrefillSvg(suites, baseSuite, candSuite);
-        document.getElementById("chart-decode").innerHTML = renderDecodeSvg(suites, baseSuite, candSuite);
-        document.getElementById("chart-grid").innerHTML = renderGridSvg(baseSuite, candSuite);
-        document.getElementById("chart-spec-stall").innerHTML = renderSpecStallBox(baseSuite, candSuite);
-
-        document.getElementById("th-base").textContent = `${{baseSuite.release}} (${{baseSuite.topology}})`;
-        document.getElementById("th-cand").textContent = `${{candSuite.release}} (${{candSuite.topology}})`;
-
-        const rows = [];
-        if (baseSuite.grid && candSuite.grid) {{
-          rows.push({{
-            name: `Decode step time geometric mean (${{candSuite.grid.shape_count}} shapes)`,
-            b: `${{baseSuite.grid.geomean_ms.toFixed(2)}} ms`,
-            c: `${{candSuite.grid.geomean_ms.toFixed(2)}} ms`,
-            d: pctDelta(baseSuite.grid.geomean_ms, candSuite.grid.geomean_ms, true),
-            note: "Dev-mode collective_rpc fixed-shape verification grid"
-          }});
-        }}
-        [["c16", "Decode, 16 streams (output tok/s)"],
-         ["c8", "Decode, 8 streams (output tok/s)"],
-         ["c4", "Decode, 4 streams (output tok/s)"],
-         ["c1", "Single-stream c1 (output tok/s)"],
-         ["poisson", "Poisson arrivals (output tok/s)"]].forEach(([k, label]) => {{
-          const br = baseSuite.runs[k], cr = candSuite.runs[k];
-          if (br || cr) {{
-            rows.push({{
-              name: label,
-              b: br ? `${{br.output_tps.toFixed(1)}}` : "—",
-              c: cr ? `${{cr.output_tps.toFixed(1)}}` : "—",
-              d: (br && cr) ? pctDelta(br.output_tps, cr.output_tps, false) : "—",
-              note: cr && cr.ttft_p50_s ? `TTFT p50 ${{cr.ttft_p50_s.toFixed(3)}}s · TPOT p50 ${{cr.tpot_p50_ms.toFixed(1)}}ms` : ""
-            }});
-          }}
-        }});
-        [["c16", "Sampled decode, 16 streams (temp=1.0 tok/s)"],
-         ["c8", "Sampled decode, 8 streams (temp=1.0 tok/s)"],
-         ["c1", "Sampled decode, 1 stream (temp=1.0 tok/s)"]].forEach(([k, label]) => {{
-          const br = (baseSuite.sampled || {{}})[k], cr = (candSuite.sampled || {{}})[k];
-          if (br || cr) {{
-            rows.push({{
-              name: label,
-              b: br ? `${{br.output_tps.toFixed(1)}}` : "—",
-              c: cr ? `${{cr.output_tps.toFixed(1)}}` : "—",
-              d: (br && cr) ? pctDelta(br.output_tps, cr.output_tps, false) : "—",
-              note: "Seeded temperature 1.0, top_p 1.0"
-            }});
-          }}
-        }});
-        [32768, 131072, 262144, 524288, 500000, 1000000].forEach(sz => {{
-          const bp = baseSuite.prefill.find(p => p.size === sz);
-          const cp = candSuite.prefill.find(p => p.size === sz);
-          if (bp || cp) {{
-            const lbl = sz === 1000000 ? "1M" : `${{Math.round(sz / 1024)}}K`;
-            rows.push({{
-              name: `Source-text prefill, ${{lbl}} (tok/s)`,
-              b: bp ? Math.round(bp.tps).toLocaleString() : "—",
-              c: cp ? Math.round(cp.tps).toLocaleString() : "—",
-              d: (bp && cp) ? pctDelta(bp.tps, cp.tps, false) : "—",
-              note: "3 uncached Python stdlib prompts"
-            }});
-          }}
-        }});
-
-        document.getElementById("suite-compare-tbody").innerHTML = rows.map(r => `
-          <tr>
-            <td><strong>${{esc(r.name)}}</strong></td>
-            <td class="num">${{esc(r.b)}}</td>
-            <td class="num">${{esc(r.c)}}</td>
-            <td class="num">${{r.d || "—"}}</td>
-            <td style="color:var(--text-muted);font-size:12px">${{esc(r.note)}}</td>
-          </tr>
-        `).join("");
-      }}
-
-      topoSelect.addEventListener("change", populateSuiteSelectors);
-      baseSelect.addEventListener("change", renderChartsAndTable);
-      candSelect.addEventListener("change", renderChartsAndTable);
-      populateSuiteSelectors();
-
-      // Render Shapes & KV Capacity
-      const maxBlocks = Math.max(...DATA.shapes.map(s => s.kv_capacity.pool_blocks));
-      document.getElementById("shape-cards").innerHTML = DATA.shapes.map(s => {{
-        const kv = s.kv_capacity;
-        const pct = Math.round((kv.pool_blocks / maxBlocks) * 100);
-        return `
-          <div class="shape-card ${{s.default ? 'default' : ''}}">
-            <div style="display:flex;justify-content:space-between;align-items:center">
-              <strong style="font-size:16px;font-family:var(--mono)">${{esc(s.name)}}</strong>
-              ${{s.default ? '<span class="badge live">Default Shape</span>' : `<span class="badge">${{esc(s.page_size_label)}} pages</span>`}}
-            </div>
-            <div style="font-size:12.5px;color:var(--text-muted);margin-top:4px">
-              ${{s.nodes}}× DGX Spark &bull; Transport <code>${{esc(s.transport)}}</code> &bull; Kernel <code>${{esc(s.kernel_release)}}</code>
-            </div>
-            <div class="kv-bar"><div class="kv-bar-fill" style="width:${{pct}}%"></div></div>
-            <div style="display:grid;grid-template-columns:1fr 1fr;gap:8px;font-size:12.5px">
-              <div>KV Pool / Rank: <strong>${{esc(s.kv_cache_gib)}}</strong> (${{kv.pool_blocks.toLocaleString()}} blocks)</div>
-              <div>Context Limit: <strong>${{s.max_model_len.toLocaleString()}}</strong> tok</div>
-              <div>Full Contexts Held: <strong>${{kv.full_contexts}} (${{kv.contexts.toFixed(2)}}×)</strong></div>
-              <div>All ${{s.max_num_seqs}} Seqs Fit: <strong>${{kv.every_sequence_tokens.toLocaleString()}}</strong> tok</div>
-              <div>Batch Budget: <strong>${{s.max_num_batched_tokens.toLocaleString()}}</strong> tok</div>
-              <div>CUDA Graphs: <strong>1–${{s.max_cudagraph_capture_size}}</strong> rows</div>
-              <div>Min Free RAM (Head / Workers): <strong>${{s.memory ? `${{s.memory.head_min_available_gib.toFixed(2)}} / ${{s.memory.worker_min_available_gib.toFixed(2)}} GiB` : "—"}}</strong></div>
-              <div>5 GiB Guard Headroom: <strong>${{s.memory ? `+${{s.memory.headroom_above_startup_guard_gib.toFixed(2)}} GiB` : "—"}}</strong></div>
-            </div>
-          </div>
-        `;
-      }}).join("");
-
-      document.getElementById("shapes-tbody").innerHTML = DATA.shapes.map(s => {{
-        const kv = s.kv_capacity;
-        const mem = s.memory;
-        const freeCell = mem ? `${{mem.head_min_available_gib.toFixed(2)}} / ${{mem.worker_min_available_gib.toFixed(2)}} GiB` : "—";
-        const headroomCell = mem ? `+${{mem.headroom_above_startup_guard_gib.toFixed(2)}} GiB` : "—";
-        return `
-          <tr>
-            <td><code>${{esc(s.name)}}</code>${{s.default ? ' <span class="badge live">default</span>' : ''}}</td>
-            <td>TP${{s.nodes}} <code>${{esc(s.transport)}}</code></td>
-            <td><code>${{esc(s.kernel_release)}}</code> (${{esc(s.page_size_label)}})</td>
-            <td class="num">${{s.max_model_len.toLocaleString()}}</td>
-            <td class="num">${{s.max_num_seqs}}</td>
-            <td class="num">${{s.max_num_batched_tokens.toLocaleString()}}</td>
-            <td class="num">${{esc(s.kv_cache_gib)}}</td>
-            <td class="num">${{esc(freeCell)}}</td>
-            <td class="num">${{esc(headroomCell)}}</td>
-            <td class="num">${{kv.pool_blocks.toLocaleString()}}</td>
-            <td class="num"><strong>${{kv.full_contexts}}</strong> (${{kv.contexts.toFixed(2)}}×)</td>
-            <td class="num">${{kv.vllm_capacity_tokens.toLocaleString()}} (${{kv.vllm_capacity_contexts.toFixed(2)}}×)</td>
-            <td>${{s.qualified_release ? `<code>${{esc(s.qualified_release)}}</code>` : '<span style="color:var(--text-muted)">unqualified</span>'}}</td>
-          </tr>
-        `;
-      }}).join("");
-
-      // Render Upstreams & Runtime Choices
-      document.getElementById("upstreams-tbody").innerHTML = DATA.upstreams.map(u => `
-        <tr>
-          <td><strong><code>${{esc(u.name)}}</code></strong></td>
-          <td>${{esc(u.version || u.kind)}}</td>
-          <td class="num"><code>${{esc((u.revision || "—").slice(0, 12))}}</code></td>
-          <td class="num">${{u.patch_count !== null ? `<strong>${{u.patch_count}}</strong> patches` : "—"}}</td>
-          <td class="num">${{u.tree ? `<code>${{esc(u.tree.slice(0, 10))}}</code>` : "—"}}</td>
-          <td style="font-size:12px;color:var(--text-muted)">${{esc(u.role)}}</td>
-        </tr>
-      `).join("");
-
-      const choiceEntries = Object.entries(DATA.runtime_choices);
-      function renderChoices(filterText) {{
-        const q = (filterText || "").toLowerCase();
-        const filtered = choiceEntries.filter(([k, v]) =>
-          k.toLowerCase().includes(q) || JSON.stringify(v).toLowerCase().includes(q)
-        );
-        document.getElementById("choices-tbody").innerHTML = filtered.map(([k, v]) => `
-          <tr>
-            <td><code>${{esc(k)}}</code></td>
-            <td style="font-size:12.5px">${{esc(typeof v === "object" ? JSON.stringify(v) : v)}}</td>
-          </tr>
-        `).join("");
-
-        const caps = DATA.capabilities.filter(c => c.toLowerCase().includes(q));
-        document.getElementById("cap-tags").innerHTML = caps.map(c =>
-          `<span class="cap-tag">${{esc(c)}}</span>`
-        ).join("");
-      }}
-      renderChoices("");
-      document.getElementById("choice-search").addEventListener("input", e => renderChoices(e.target.value));
-
-      // Render Timeline
-      function renderTimeline(filterText) {{
-        const q = (filterText || "").toLowerCase();
-        const items = DATA.timeline.filter(t =>
-          t.stem.toLowerCase().includes(q) ||
-          (t.change_from_previous || "").toLowerCase().includes(q) ||
-          (t.evidence_summary || "").toLowerCase().includes(q)
-        );
-        document.getElementById("timeline-list").innerHTML = items.map(t => `
-          <div class="timeline-item ${{t.is_promoted ? 'promoted' : ''}}">
-            <div class="timeline-head">
-              <div>
-                <strong style="font-size:15px;font-family:var(--mono)">${{esc(t.short_name)}}</strong>
-                <span style="color:var(--text-muted);font-size:12.5px;margin-left:8px">${{esc(t.stem)}}</span>
-                ${{t.is_promoted ? '<span class="badge live" style="margin-left:8px">Active Production</span>' : ''}}
-              </div>
-              <div style="font-family:var(--mono);font-size:12px;color:var(--text-muted)">
-                Shape: <code>${{esc(t.shape)}}</code> &bull; Image: <code>${{esc(t.image_tag || "—")}}</code> ${{t.vllm_tree ? `&bull; vLLM tree <code>${{esc(t.vllm_tree)}}</code>` : ''}}
-              </div>
-            </div>
-            ${{t.change_from_previous ? `<div style="font-size:13px;margin-bottom:6px"><strong>Changes:</strong> ${{esc(t.change_from_previous)}}</div>` : ''}}
-            ${{t.evidence_summary ? `<div style="font-size:12.5px;color:var(--text-muted)"><strong>Qualification:</strong> ${{esc(t.evidence_summary)}}</div>` : ''}}
-          </div>
-        `).join("");
-      }}
-      renderTimeline("");
-      document.getElementById("timeline-search").addEventListener("input", e => renderTimeline(e.target.value));
-    }})();
-  </script>
-</body>
-</html>
-"""
+    # "</" never appears inside the JSON, so no manifest string can end the <script> element early.
+    embedded_json = json.dumps(payload, indent=2, sort_keys=True).replace("</", "<\\/")
+    template = SITE_TEMPLATE.read_text()
+    if template.count(SITE_DATA_MARKER) != 1:
+        raise ValueError(f"{SITE_TEMPLATE.relative_to(ROOT)} must contain {SITE_DATA_MARKER} exactly once")
+    # The link-preview image's URL carries a digest of the page, so a crawler that cached the
+    # previous image fetches the new one whenever the page or its numbers change.
+    version = hashlib.sha256((template + embedded_json).encode()).hexdigest()[:10]
+    return template.replace(SITE_VERSION_MARKER, version).replace(SITE_DATA_MARKER, embedded_json)
 
 
 def render_targets(data: dict[str, Any]) -> dict[Path, str]:
@@ -1970,6 +1011,9 @@ def main(argv: list[str] | None = None) -> int:
         out_dir.mkdir(parents=True, exist_ok=True)
         (out_dir / "index.html").write_text(targets[ROOT / "docs/index.html"])
         (out_dir / ".nojekyll").write_text("")
+        shutil.copyfile(ROOT / "docs/logo.png", out_dir / "logo.png")
+        # The committed link-preview image; the Pages workflow replaces it with a fresh render.
+        shutil.copyfile(ROOT / "docs/og.png", out_dir / "og.png")
         payload = {
             k: v for k, v in data.items() if k != "suites_by_path"
         }

@@ -1,0 +1,66 @@
+INFO 11-09 15:37:02 [__init__.py:119] Registered model loader `<class 'b12x.integration.vllm.loader.B12xModelLoader'>` with load format `b12x`
+WARNING 11-09 15:37:02 [envs.py:2719] Unknown vLLM environment variable detected: VLLM_NATIVE_CACHE_DIR
+INFO 11-09 15:37:02 [config.py:852] Detected quantization_config.scale_fmt=ue8m0; enabling UE8M0 for DeepGEMM.
+INFO 11-09 15:37:12 [model.py:693] Resolved architecture: DeepseekV41ForCausalLM
+INFO 11-09 15:37:12 [model.py:716] Defaulting to tokenizer_mode='deepseek_v41' for DeepseekV41ForCausalLM
+INFO 11-09 15:37:12 [model.py:2066] Using max model len 1048576
+WARNING 11-09 15:37:12 [model.py:997] Model does not support mm_device_do_normalize, forcing mm_device_do_normalize = False.
+INFO 11-09 15:37:12 [scheduler.py:436] Chunked prefill is enabled with max_num_batched_tokens=16384.
+INFO 11-09 15:37:12 [vllm.py:1521] Resolved Engram configuration: EngramConfig(cpu_offload=True, embedding_across_dp=False, dp_shared_memory=False, table_memory='device', projection_tp=False, disk_resident_scales=False)
+INFO 11-09 15:37:12 [vllm.py:953] Auto-enabling VLLM_USE_BREAKABLE_CUDAGRAPH=1. Set VLLM_USE_BREAKABLE_CUDAGRAPH=0 to opt out.
+INFO 11-09 15:37:12 [kernel.py:435] Final IR op priority after setting platform defaults: IrOpPriorityConfig(rms_norm=['vllm_c', 'native'], fused_add_rms_norm=['vllm_c', 'native'], gelu_and_mul_sparse=['triton', 'native'])
+INFO 11-09 15:37:12 [compilation.py:336] Enabled custom fusions: norm_quant, act_quant
+INFO 11-09 15:37:12 [parallel_state.py:1953] world_size=1 rank=0 local_rank=0 distributed_init_method=tcp://127.0.0.1:29531 backend=nccl
+INFO 11-09 15:37:12 [parallel_state.py:2393] rank 0 in world size 1 is assigned as DP rank 0, PP rank 0, PCP rank 0, TP rank 0, ETP rank 0, EP rank 0, EPLB rank N/A
+built in 19.7s; heads/rank 16, groups [('SlidingWindowMLASpec', 128, 67584, ['model.layers.20.attn.swa_cache', 'model.layers.24.attn.swa_cache']), ('MLAAttentionSpec', 256, 73728, ['model.layers.20.attn']), ('MLAAttentionSpec', 256, 17408, ['model.layers.20.attn.indexer.k_cache'])]
+2026-11-09 15:37:18  [TileLang:tilelang.jit.kernel:INFO] (kernel.py:137): TileLang begins to compile kernel `apply_write` with `out_idx=None`
+2026-11-09 15:37:19  [TileLang:tilelang.jit.kernel:INFO] (kernel.py:145): TileLang completes to compile kernel `apply_write`
+2026-11-09 15:37:19  [TileLang:tilelang.jit.kernel:INFO] (kernel.py:137): TileLang begins to compile kernel `compute_slot_mappings` with `out_idx=None`
+2026-11-09 15:37:20  [TileLang:tilelang.jit.kernel:INFO] (kernel.py:145): TileLang completes to compile kernel `compute_slot_mappings`
+2026-11-09 15:37:20  [TileLang:tilelang.jit.kernel:INFO] (kernel.py:137): TileLang begins to compile kernel `gather_block_tables` with `out_idx=None`
+2026-11-09 15:37:21  [TileLang:tilelang.jit.kernel:INFO] (kernel.py:145): TileLang completes to compile kernel `gather_block_tables`
+[rank0]: Traceback (most recent call last):
+[rank0]:   File "/shim/attn_harness.py", line 428, in <module>
+[rank0]:     main()
+[rank0]:   File "/shim/attn_harness.py", line 397, in main
+[rank0]:     res = run_step(vc, mods, groups, args.world, q, c, seed=zlib.crc32(name.encode()) % 100003)
+[rank0]:           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+[rank0]:   File "/shim/attn_harness.py", line 307, in run_step
+[rank0]:     out20 = mods[20].forward(positions, h20)
+[rank0]:             ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+[rank0]:   File "/opt/spark-ds41f/candidate/vllm/vllm/models/deepseek_v4_1/attention.py", line 1262, in forward
+[rank0]:     return self._forward(positions, hidden_states)
+[rank0]:            ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+[rank0]:   File "/opt/spark-ds41f/candidate/vllm/vllm/models/deepseek_v4_1/attention.py", line 1508, in _forward
+[rank0]:     self._prepare_global_kv(positions, hidden_states)
+[rank0]:   File "/opt/spark-ds41f/candidate/vllm/vllm/compilation/breakable_cudagraph.py", line 102, in wrapper
+[rank0]:     return fn(*args, **kwargs)
+[rank0]:            ^^^^^^^^^^^^^^^^^^^
+[rank0]:   File "/opt/spark-ds41f/candidate/vllm/vllm/models/deepseek_v4_1/attention.py", line 1024, in _prepare_global_kv
+[rank0]:     latent, slots = self.compressor(
+[rank0]:                     ^^^^^^^^^^^^^^^^
+[rank0]:   File "/usr/local/lib/python3.12/dist-packages/torch/nn/modules/module.py", line 1778, in _wrapped_call_impl
+[rank0]:     return self._call_impl(*args, **kwargs)
+[rank0]:            ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+[rank0]:   File "/usr/local/lib/python3.12/dist-packages/torch/nn/modules/module.py", line 1789, in _call_impl
+[rank0]:     return forward_call(*args, **kwargs)
+[rank0]:            ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+[rank0]:   File "/opt/spark-ds41f/candidate/vllm/vllm/models/deepseek_v4_1/compressor.py", line 520, in forward
+[rank0]:     self._forward_tilelang(
+[rank0]:   File "/opt/spark-ds41f/candidate/vllm/vllm/models/deepseek_v4_1/compressor.py", line 464, in _forward_tilelang
+[rank0]:     tl.compress(
+[rank0]:   File "/opt/spark-ds41f/candidate/vllm/vllm/models/deepseek_v4_1/tilelang/compress.py", line 494, in compress
+[rank0]:     compress_kernel(
+[rank0]:   File "/usr/local/lib/python3.12/dist-packages/tilelang/jit/kernel.py", line 228, in __call__
+[rank0]:     return self.torch_function(*args, **kwds)
+[rank0]:            ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+[rank0]:   File "/usr/local/lib/python3.12/dist-packages/tilelang/jit/adapter/tvm_ffi.py", line 348, in func
+[rank0]:     executable(*tensor_list)
+[rank0]:   File "/usr/local/lib/python3.12/dist-packages/tvm_ffi/module.py", line 299, in __call__
+[rank0]:     return self.main(*args)
+[rank0]:            ^^^^^^^^^^^^^^^^
+[rank0]:   File "python/tvm_ffi/cython/function.pxi", line 968, in tvm_ffi.core.Function.__call__
+[rank0]:   File "<unknown>", line 0, in __tvm_ffi_main
+[rank0]:   File "<unknown>", line 0, in __tvm_ffi_compress
+[rank0]: RuntimeError: kernel compress input gates dtype mismatch, expected float32
+[rank0]:[W1109 15:37:23.951737901 ProcessGroupNCCL.cpp:1624] Warning: WARNING: destroy_process_group() was not called before program exit, which can leak resources. For more info, please see https://pytorch.org/docs/stable/distributed.html#shutdown (function operator())

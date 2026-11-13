@@ -447,5 +447,96 @@ class UnqualifiedShapeTest(unittest.TestCase):
         self.assertEqual(self.start(archived), "preflight reached")
 
 
+class BuddyDefragmentationBeforeLaunchTest(unittest.TestCase):
+    def test_defragment_buddy_memory_runs_drop_caches_and_compact_on_every_node(self) -> None:
+        seen = []
+
+        def fake_ssh(_nodes, node, *argv):
+            seen.append((node["name"], argv))
+            return subprocess.CompletedProcess(argv, 0, stdout="", stderr="")
+
+        with mock.patch.object(spark, "run_ssh", side_effect=fake_ssh):
+            spark.defragment_buddy_memory(NODES3, NODES3["nodes"])
+
+        self.assertEqual(sorted(name for name, _ in seen), ["dgx1", "dgx2", "dgx3"])
+        for _, argv in seen:
+            self.assertEqual(
+                argv,
+                (
+                    "sudo",
+                    "-n",
+                    "sh",
+                    "-c",
+                    "sync; echo 3 > /proc/sys/vm/drop_caches; echo 1 > /proc/sys/vm/compact_memory",
+                ),
+            )
+
+    def test_a_refused_node_warns_and_does_not_stop_the_others(self) -> None:
+        def fake_ssh(_nodes, node, *argv):
+            code = 1 if node["name"] == "dgx2" else 0
+            return subprocess.CompletedProcess(argv, code, stdout="", stderr="sudo: a password is required")
+
+        err = io.StringIO()
+        with mock.patch.object(spark, "run_ssh", side_effect=fake_ssh), contextlib.redirect_stderr(err):
+            spark.defragment_buddy_memory(NODES3, NODES3["nodes"])
+        self.assertEqual(
+            err.getvalue(),
+            "WARN: dgx2: buddy memory defragmentation skipped (sudo: a password is required)\n",
+        )
+
+    def start(self, cluster: dict) -> tuple[list, str]:
+        events = []
+
+        def fake_ssh(_nodes, node, *argv):
+            if argv[:2] == ("docker", "run"):
+                events.append(("launch", node["name"]))
+            return subprocess.CompletedProcess(argv, 0, stdout="cid\n", stderr="")
+
+        args = argparse.Namespace(
+            apply=True,
+            cluster_config="config/cluster.json",
+            replace=False,
+            remove=False,
+            parallel=False,
+            change_shape=False,
+            verbose=False,
+            unqualified_shape=False,
+        )
+        out = io.StringIO()
+        with (
+            mock.patch.object(spark, "configuration", return_value=(cluster, NODES3, {})),
+            mock.patch.object(spark, "expected_command", return_value=TP3),
+            mock.patch.object(spark, "live_engine", return_value=None),
+            mock.patch.object(spark, "start_findings", return_value=[]),
+            mock.patch.object(spark, "stop_memguard"),
+            mock.patch.object(spark, "memguard_is_active", side_effect=lambda _c, _n, _nd: bool(events)),
+            mock.patch.object(spark, "start_memguard", side_effect=lambda _c, _n, nd, *a, **kw: events.append(("memguard", nd["name"]))),
+            mock.patch.object(spark, "defragment_buddy_memory", side_effect=lambda _n, order: events.append(("defrag", [x["name"] for x in order]))),
+            mock.patch.object(spark, "launch_command", return_value=["docker", "run", "-d", "img"]),
+            mock.patch.object(spark, "wait_for_api"),
+            mock.patch.object(spark, "start_memguards"),
+            mock.patch.object(spark, "run_ssh", side_effect=fake_ssh),
+            contextlib.redirect_stdout(out),
+        ):
+            code = spark.command_cluster_start(args)
+        self.assertEqual(code, 0)
+        return events, out.getvalue()
+
+    def test_cluster_start_defragments_after_stop_and_before_launch(self) -> None:
+        for cluster in (CLUSTER, {**CLUSTER, "host": {"defragment_before_start": True}}):
+            with self.subTest(host=cluster.get("host")):
+                events, out = self.start(cluster)
+                self.assertEqual(events[0][0], "defrag")
+                self.assertEqual(sorted(events[0][1]), ["dgx1", "dgx2", "dgx3"])
+                self.assertEqual([kind for kind, _ in events].count("defrag"), 1)
+                self.assertIn("every node: drop clean caches and compact memory", out)
+
+    def test_a_profile_can_turn_the_defragmentation_off(self) -> None:
+        events, out = self.start({**CLUSTER, "host": {"defragment_before_start": False}})
+        self.assertNotIn("defrag", [kind for kind, _ in events])
+        self.assertIn("launch", [kind for kind, _ in events])
+        self.assertIn("no defragmentation before launch (host.defragment_before_start is false)", out)
+
+
 if __name__ == "__main__":
     unittest.main()

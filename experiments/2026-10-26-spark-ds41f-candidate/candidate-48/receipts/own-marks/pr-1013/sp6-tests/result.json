@@ -1,0 +1,331 @@
+{
+ "pr": 1013,
+ "pr_head": "aeba4fc4ac4063eb0736e4267191a7c27e5584c8",
+ "check": "PR #1013's own test list (experiment README step 1), which includes tests/v1/structured_output/test_structured_output_manager.py, on candidate-48 code, two container runs",
+ "host": "sp6 (spark-0014, NVIDIA GB10); docker ps empty and ~/spark-hold.json absent before each run",
+ "code": "spark-ds41f:1107 (sha256:3f32a962ce04b7c8d85337cd427a8946b8b6bcaadd97cc8d8a8cd14e8d68a6ce) with the 55 files touched by candidate-48's 0762..0771 (applied in order to the image's /opt/spark-ds41f/candidate/vllm, all clean) bind-mounted read-only",
+ "hf_cache": "sp6 ~/.cache/huggingface read-only, HF_HUB_OFFLINE=1; contains only deepseek-ai/DeepSeek-V4.1-Flash-1017 and two msuiche DeepSeek-V4.1-Flash-1017 variants",
+ "readme_command_fixes": [
+  "README mounts /tmp/hf-test-cache as the HF cache; it no longer exists on sp6. Used sp6's ~/.cache/huggingface as instructed",
+  "README copies 13 files from /tmp/work-lil-vllm-prs/.work/upstreams/vllm (gone; held only the PR's 0762/0763). Replaced by read-only bind mounts of candidate-48's 55 touched files",
+  "README loads -p tblib_stub from PYTHONPATH=/tmp, but nothing provides tblib_stub.py in the container and the image has no tblib. Mounted scripts/release_tests at /opt/release_tests",
+  "Added -rfEs and --junitxml (reporting only). Test file list unchanged"
+ ],
+ "runs": {
+  "run1": {
+   "output": "pytest-sp6-run1.txt.gz",
+   "summary": "51 failed, 101 passed, 14 warnings, 44 errors in 45.15s",
+   "exit_code": 1,
+   "sha256_raw": "f187949725236fd5a4da362919dd8897f30d5b09d2fae7c9e753e64bad2fb070"
+  },
+  "run2": {
+   "output": "pytest-sp6-run2.txt.gz",
+   "summary": "51 failed, 101 passed, 14 warnings, 44 errors in 44.91s",
+   "exit_code": 1,
+   "sha256_raw": "81e48b2e5febd3c07f14c5b4c5ec8f45f8b12cba547c6cfbbcae62a6fdedf7cb"
+  }
+ },
+ "counts": {
+  "run1": {
+   "passed": 101,
+   "failed": 51,
+   "errors": 44,
+   "skipped": 0
+  },
+  "run2": {
+   "passed": 101,
+   "failed": 51,
+   "errors": 44,
+   "skipped": 0
+  },
+  "pr_claim": "196 passed per boot"
+ },
+ "per_file_both_runs": {
+  "tests/v1/core/test_prefill_qos_lanes.py": {
+   "passed": 10,
+   "failed": 1
+  },
+  "tests/v1/core/test_aligned_prefill_lanes.py": {
+   "passed": 3
+  },
+  "tests/v1/core/test_prefill_yield.py": {
+   "passed": 13
+  },
+  "tests/v1/core/test_aligned_prefill_chunks.py": {
+   "passed": 7
+  },
+  "tests/v1/core/test_prefill_compute_share_scheduler.py": {
+   "passed": 68,
+   "failed": 9
+  },
+  "tests/v1/spec_decode/test_mtp_structured_output.py": {
+   "failed": 36
+  },
+  "tests/v1/core/test_prefill_lane_livelock.py": {
+   "failed": 5
+  },
+  "tests/v1/structured_output/test_structured_output_manager.py": {
+   "error": 44
+  }
+ },
+ "test_structured_output_manager_py": {
+  "collected": 44,
+  "passed": 0,
+  "errors": 44,
+  "cause": "module fixture AutoTokenizer.from_pretrained('gpt2') finds no gpt2 config.json in the offline cache, so every test errors at setup; none of the file's assertions ran"
+ },
+ "failure_causes": {
+  "gpt2": {
+   "count": 80,
+   "files": [
+    "tests/v1/structured_output/test_structured_output_manager.py (44 errors at setup)",
+    "tests/v1/spec_decode/test_mtp_structured_output.py (36 failed)"
+   ],
+   "first_missing_file": "config.json (repo gpt2), then its tokenizer files (tokenizer_config.json, vocab.json, merges.txt, tokenizer.json)"
+  },
+  "Qwen/Qwen3-0.6B": {
+   "count": 10,
+   "files": [
+    "tests/v1/core/test_prefill_qos_lanes.py::test_size_classes_cli_contract",
+    "tests/v1/core/test_prefill_compute_share_scheduler.py (9 CLI-contract tests)"
+   ],
+   "detail": "EngineArgs.from_cli_args -> __post_init__ resolves the default model Qwen/Qwen3-0.6B; no cached snapshot"
+  },
+  "facebook/opt-125m": {
+   "count": 5,
+   "files": [
+    "tests/v1/core/test_prefill_lane_livelock.py (all 5)"
+   ],
+   "detail": "tests/v1/core/utils.create_scheduler's default model; ModelConfig: Invalid repository ID or local directory specified"
+  },
+  "other": {
+   "count": 0
+  }
+ },
+ "also_needed_once_gpt2_present": "test_structured_output_manager.py and test_mtp_structured_output.py build ModelConfig(tokenizer='gpt2') with the default model Qwen/Qwen3-0.6B (vllm/config/model.py), so they would also need Qwen/Qwen3-0.6B's config; not observed because the gpt2 fixture fails first (from code reading)",
+ "failing_test_ids": {
+  "Qwen/Qwen3-0.6B": {
+   "failed": [
+    "tests/v1/core/test_prefill_compute_share_scheduler.py::test_prefill_compute_half_life_cli_contract[0.2-0.2]",
+    "tests/v1/core/test_prefill_compute_share_scheduler.py::test_prefill_compute_half_life_cli_contract[5-5.0]",
+    "tests/v1/core/test_prefill_compute_share_scheduler.py::test_prefill_compute_half_life_cli_contract[responsive-responsive]",
+    "tests/v1/core/test_prefill_compute_share_scheduler.py::test_prefill_compute_half_life_cli_contract[smooth-smooth]",
+    "tests/v1/core/test_prefill_compute_share_scheduler.py::test_prefill_compute_share_cli_accepts_auto",
+    "tests/v1/core/test_prefill_compute_share_scheduler.py::test_prefill_compute_share_cli_contract",
+    "tests/v1/core/test_prefill_compute_share_scheduler.py::test_prefill_compute_token_cap_cli_contract",
+    "tests/v1/core/test_prefill_compute_share_scheduler.py::test_prefill_interleave_cli_accepts_numeric_parallel_prefills",
+    "tests/v1/core/test_prefill_compute_share_scheduler.py::test_prefill_interleave_cli_contract",
+    "tests/v1/core/test_prefill_qos_lanes.py::test_size_classes_cli_contract"
+   ],
+   "error": []
+  },
+  "facebook/opt-125m": {
+   "failed": [
+    "tests/v1/core/test_prefill_lane_livelock.py::test_async_admission_failure_releases_lane_for_other_candidates",
+    "tests/v1/core/test_prefill_lane_livelock.py::test_busy_connector_guards_preemption_and_aging_recovers",
+    "tests/v1/core/test_prefill_lane_livelock.py::test_lane_share_below_align_quantum_cannot_starve_chunk",
+    "tests/v1/core/test_prefill_lane_livelock.py::test_never_admissible_cohort_cannot_starve_runnable_chunk_forever",
+    "tests/v1/core/test_prefill_lane_livelock.py::test_preempted_after_scheduled_cohort_cannot_starve_runnable_chunks"
+   ],
+   "error": []
+  },
+  "gpt2": {
+   "failed": [
+    "tests/v1/spec_decode/test_mtp_structured_output.py::test_bitmask_engine_reasoner_ends_midwindow_with_padding[guidance]",
+    "tests/v1/spec_decode/test_mtp_structured_output.py::test_bitmask_engine_reasoner_ends_midwindow_with_padding[xgrammar]",
+    "tests/v1/spec_decode/test_mtp_structured_output.py::test_gpu_sampler_rejects_drafts_after_grammar_termination[0.0-0-{\"a\":\"b\"}-ending0-0]",
+    "tests/v1/spec_decode/test_mtp_structured_output.py::test_gpu_sampler_rejects_drafts_after_grammar_termination[0.0-0-{\"a\":\"b\"}-ending0-1]",
+    "tests/v1/spec_decode/test_mtp_structured_output.py::test_gpu_sampler_rejects_drafts_after_grammar_termination[0.0-0-{\"a\":\"b\"}-ending0-2]",
+    "tests/v1/spec_decode/test_mtp_structured_output.py::test_gpu_sampler_rejects_drafts_after_grammar_termination[0.0-0-{\"a\":\"b\"}-ending0-3]",
+    "tests/v1/spec_decode/test_mtp_structured_output.py::test_gpu_sampler_rejects_drafts_after_grammar_termination[0.0-1-{\"a\":\"b\"}-ending1-0]",
+    "tests/v1/spec_decode/test_mtp_structured_output.py::test_gpu_sampler_rejects_drafts_after_grammar_termination[0.0-1-{\"a\":\"b\"}-ending1-1]",
+    "tests/v1/spec_decode/test_mtp_structured_output.py::test_gpu_sampler_rejects_drafts_after_grammar_termination[0.0-1-{\"a\":\"b\"}-ending1-2]",
+    "tests/v1/spec_decode/test_mtp_structured_output.py::test_gpu_sampler_rejects_drafts_after_grammar_termination[0.0-1-{\"a\":\"b\"}-ending1-3]",
+    "tests/v1/spec_decode/test_mtp_structured_output.py::test_gpu_sampler_rejects_drafts_after_grammar_termination[0.0-2-{\"a\":\"b\"-ending2-0]",
+    "tests/v1/spec_decode/test_mtp_structured_output.py::test_gpu_sampler_rejects_drafts_after_grammar_termination[0.0-2-{\"a\":\"b\"-ending2-1]",
+    "tests/v1/spec_decode/test_mtp_structured_output.py::test_gpu_sampler_rejects_drafts_after_grammar_termination[0.0-2-{\"a\":\"b\"-ending2-2]",
+    "tests/v1/spec_decode/test_mtp_structured_output.py::test_gpu_sampler_rejects_drafts_after_grammar_termination[0.0-2-{\"a\":\"b\"-ending2-3]",
+    "tests/v1/spec_decode/test_mtp_structured_output.py::test_gpu_sampler_rejects_drafts_after_grammar_termination[0.0-3-{\"a\":-ending3-0]",
+    "tests/v1/spec_decode/test_mtp_structured_output.py::test_gpu_sampler_rejects_drafts_after_grammar_termination[0.0-3-{\"a\":-ending3-1]",
+    "tests/v1/spec_decode/test_mtp_structured_output.py::test_gpu_sampler_rejects_drafts_after_grammar_termination[0.0-3-{\"a\":-ending3-2]",
+    "tests/v1/spec_decode/test_mtp_structured_output.py::test_gpu_sampler_rejects_drafts_after_grammar_termination[0.0-3-{\"a\":-ending3-3]",
+    "tests/v1/spec_decode/test_mtp_structured_output.py::test_gpu_sampler_rejects_drafts_after_grammar_termination[1.0-0-{\"a\":\"b\"}-ending0-0]",
+    "tests/v1/spec_decode/test_mtp_structured_output.py::test_gpu_sampler_rejects_drafts_after_grammar_termination[1.0-0-{\"a\":\"b\"}-ending0-1]",
+    "tests/v1/spec_decode/test_mtp_structured_output.py::test_gpu_sampler_rejects_drafts_after_grammar_termination[1.0-0-{\"a\":\"b\"}-ending0-2]",
+    "tests/v1/spec_decode/test_mtp_structured_output.py::test_gpu_sampler_rejects_drafts_after_grammar_termination[1.0-0-{\"a\":\"b\"}-ending0-3]",
+    "tests/v1/spec_decode/test_mtp_structured_output.py::test_gpu_sampler_rejects_drafts_after_grammar_termination[1.0-1-{\"a\":\"b\"}-ending1-0]",
+    "tests/v1/spec_decode/test_mtp_structured_output.py::test_gpu_sampler_rejects_drafts_after_grammar_termination[1.0-1-{\"a\":\"b\"}-ending1-1]",
+    "tests/v1/spec_decode/test_mtp_structured_output.py::test_gpu_sampler_rejects_drafts_after_grammar_termination[1.0-1-{\"a\":\"b\"}-ending1-2]",
+    "tests/v1/spec_decode/test_mtp_structured_output.py::test_gpu_sampler_rejects_drafts_after_grammar_termination[1.0-1-{\"a\":\"b\"}-ending1-3]",
+    "tests/v1/spec_decode/test_mtp_structured_output.py::test_gpu_sampler_rejects_drafts_after_grammar_termination[1.0-2-{\"a\":\"b\"-ending2-0]",
+    "tests/v1/spec_decode/test_mtp_structured_output.py::test_gpu_sampler_rejects_drafts_after_grammar_termination[1.0-2-{\"a\":\"b\"-ending2-1]",
+    "tests/v1/spec_decode/test_mtp_structured_output.py::test_gpu_sampler_rejects_drafts_after_grammar_termination[1.0-2-{\"a\":\"b\"-ending2-2]",
+    "tests/v1/spec_decode/test_mtp_structured_output.py::test_gpu_sampler_rejects_drafts_after_grammar_termination[1.0-2-{\"a\":\"b\"-ending2-3]",
+    "tests/v1/spec_decode/test_mtp_structured_output.py::test_gpu_sampler_rejects_drafts_after_grammar_termination[1.0-3-{\"a\":-ending3-0]",
+    "tests/v1/spec_decode/test_mtp_structured_output.py::test_gpu_sampler_rejects_drafts_after_grammar_termination[1.0-3-{\"a\":-ending3-1]",
+    "tests/v1/spec_decode/test_mtp_structured_output.py::test_gpu_sampler_rejects_drafts_after_grammar_termination[1.0-3-{\"a\":-ending3-2]",
+    "tests/v1/spec_decode/test_mtp_structured_output.py::test_gpu_sampler_rejects_drafts_after_grammar_termination[1.0-3-{\"a\":-ending3-3]",
+    "tests/v1/spec_decode/test_mtp_structured_output.py::test_xgrammar_accept_tokens_stops_at_termination",
+    "tests/v1/spec_decode/test_mtp_structured_output.py::test_xgrammar_validate_tokens_stops_at_termination"
+   ],
+   "error": [
+    "tests/v1/structured_output/test_structured_output_manager.py::test_completions_request_Without_reasoning_kwargs_constrains_from_first_token[empty-guidance]",
+    "tests/v1/structured_output/test_structured_output_manager.py::test_completions_request_Without_reasoning_kwargs_constrains_from_first_token[empty-xgrammar]",
+    "tests/v1/structured_output/test_structured_output_manager.py::test_completions_request_Without_reasoning_kwargs_constrains_from_first_token[none-guidance]",
+    "tests/v1/structured_output/test_structured_output_manager.py::test_completions_request_Without_reasoning_kwargs_constrains_from_first_token[none-xgrammar]",
+    "tests/v1/structured_output/test_structured_output_manager.py::test_initial_constraint_activation[enable_in_reasoning-guidance]",
+    "tests/v1/structured_output/test_structured_output_manager.py::test_initial_constraint_activation[enable_in_reasoning-xgrammar]",
+    "tests/v1/structured_output/test_structured_output_manager.py::test_initial_constraint_activation[inferred-guidance]",
+    "tests/v1/structured_output/test_structured_output_manager.py::test_initial_constraint_activation[inferred-xgrammar]",
+    "tests/v1/structured_output/test_structured_output_manager.py::test_initial_constraint_activation[no_reasoner-guidance]",
+    "tests/v1/structured_output/test_structured_output_manager.py::test_initial_constraint_activation[no_reasoner-xgrammar]",
+    "tests/v1/structured_output/test_structured_output_manager.py::test_initial_constraint_activation[reasoning_ended-guidance]",
+    "tests/v1/structured_output/test_structured_output_manager.py::test_initial_constraint_activation[reasoning_ended-xgrammar]",
+    "tests/v1/structured_output/test_structured_output_manager.py::test_real_flow[active_all_valid-guidance]",
+    "tests/v1/structured_output/test_structured_output_manager.py::test_real_flow[active_all_valid-xgrammar]",
+    "tests/v1/structured_output/test_structured_output_manager.py::test_real_flow[active_first_token_invalid-guidance]",
+    "tests/v1/structured_output/test_structured_output_manager.py::test_real_flow[active_first_token_invalid-xgrammar]",
+    "tests/v1/structured_output/test_structured_output_manager.py::test_real_flow[active_first_token_terminates-guidance]",
+    "tests/v1/structured_output/test_structured_output_manager.py::test_real_flow[active_first_token_terminates-xgrammar]",
+    "tests/v1/structured_output/test_structured_output_manager.py::test_real_flow[active_later_token_invalid-guidance]",
+    "tests/v1/structured_output/test_structured_output_manager.py::test_real_flow[active_later_token_invalid-xgrammar]",
+    "tests/v1/structured_output/test_structured_output_manager.py::test_real_flow[active_later_token_terminates-guidance]",
+    "tests/v1/structured_output/test_structured_output_manager.py::test_real_flow[active_later_token_terminates-xgrammar]",
+    "tests/v1/structured_output/test_structured_output_manager.py::test_real_flow[becomes_active_first_token_invalid-guidance]",
+    "tests/v1/structured_output/test_structured_output_manager.py::test_real_flow[becomes_active_first_token_invalid-xgrammar]",
+    "tests/v1/structured_output/test_structured_output_manager.py::test_real_flow[becomes_active_later_token_invalid-guidance]",
+    "tests/v1/structured_output/test_structured_output_manager.py::test_real_flow[becomes_active_later_token_invalid-xgrammar]",
+    "tests/v1/structured_output/test_structured_output_manager.py::test_real_flow[becomes_active_on_first_token-guidance]",
+    "tests/v1/structured_output/test_structured_output_manager.py::test_real_flow[becomes_active_on_first_token-xgrammar]",
+    "tests/v1/structured_output/test_structured_output_manager.py::test_real_flow[becomes_active_on_last_token-guidance]",
+    "tests/v1/structured_output/test_structured_output_manager.py::test_real_flow[becomes_active_on_last_token-xgrammar]",
+    "tests/v1/structured_output/test_structured_output_manager.py::test_real_flow[becomes_active_on_middle_token-guidance]",
+    "tests/v1/structured_output/test_structured_output_manager.py::test_real_flow[becomes_active_on_middle_token-xgrammar]",
+    "tests/v1/structured_output/test_structured_output_manager.py::test_real_flow[becomes_active_terminates-guidance]",
+    "tests/v1/structured_output/test_structured_output_manager.py::test_real_flow[becomes_active_terminates-xgrammar]",
+    "tests/v1/structured_output/test_structured_output_manager.py::test_real_flow[inactive-guidance]",
+    "tests/v1/structured_output/test_structured_output_manager.py::test_real_flow[inactive-xgrammar]",
+    "tests/v1/structured_output/test_structured_output_manager.py::test_trim_spec_tokens_with_grammar[raw_drafts0-3-guidance]",
+    "tests/v1/structured_output/test_structured_output_manager.py::test_trim_spec_tokens_with_grammar[raw_drafts0-3-xgrammar]",
+    "tests/v1/structured_output/test_structured_output_manager.py::test_trim_spec_tokens_with_grammar[raw_drafts1-3-guidance]",
+    "tests/v1/structured_output/test_structured_output_manager.py::test_trim_spec_tokens_with_grammar[raw_drafts1-3-xgrammar]",
+    "tests/v1/structured_output/test_structured_output_manager.py::test_trim_spec_tokens_with_grammar[raw_drafts2-3-guidance]",
+    "tests/v1/structured_output/test_structured_output_manager.py::test_trim_spec_tokens_with_grammar[raw_drafts2-3-xgrammar]",
+    "tests/v1/structured_output/test_structured_output_manager.py::test_trim_spec_tokens_with_grammar[raw_drafts3-4-guidance]",
+    "tests/v1/structured_output/test_structured_output_manager.py::test_trim_spec_tokens_with_grammar[raw_drafts3-4-xgrammar]"
+   ]
+  }
+ },
+ "failing_test_ids_identical_across_runs": true,
+ "skipped_test_ids": [],
+ "passed_test_ids": [
+  "tests/v1/core/test_aligned_prefill_chunks.py::test_a_whole_chunk_must_fit_beside_the_decode_rows",
+  "tests/v1/core/test_aligned_prefill_chunks.py::test_chunks_end_at_multiples_of_the_threshold",
+  "tests/v1/core/test_aligned_prefill_chunks.py::test_deep_context_chunk_grid_steps_down_at_256k_and_512k_when_decodes_active",
+  "tests/v1/core/test_aligned_prefill_chunks.py::test_deep_context_chunk_grid_zero_extra_chunks_below_256k",
+  "tests/v1/core/test_aligned_prefill_chunks.py::test_deep_context_mixed_step_caps_total_prefill_tokens_to_active_tier",
+  "tests/v1/core/test_aligned_prefill_chunks.py::test_no_partial_chunk_when_the_budget_is_short",
+  "tests/v1/core/test_aligned_prefill_chunks.py::test_off_the_third_request_takes_what_is_left",
+  "tests/v1/core/test_aligned_prefill_lanes.py::test_shares_still_split_unaligned_chunks",
+  "tests/v1/core/test_aligned_prefill_lanes.py::test_two_lanes_prefill_two_long_prompts",
+  "tests/v1/core/test_aligned_prefill_lanes.py::test_two_lanes_rotate_whole_chunks",
+  "tests/v1/core/test_prefill_compute_share_scheduler.py::test_async_external_load_does_not_consume_service_credit",
+  "tests/v1/core/test_prefill_compute_share_scheduler.py::test_async_restore_does_not_consume_parallel_prefill_lane",
+  "tests/v1/core/test_prefill_compute_share_scheduler.py::test_async_scheduler_preserves_compute_class_selection",
+  "tests/v1/core/test_prefill_compute_share_scheduler.py::test_auto_compute_share_does_not_scan_or_time_uncontended_decode",
+  "tests/v1/core/test_prefill_compute_share_scheduler.py::test_auto_mode_receives_scheduler_cost_feedback",
+  "tests/v1/core/test_prefill_compute_share_scheduler.py::test_auto_parallel_prefills_ignore_token_geometry[128-256-64-4]",
+  "tests/v1/core/test_prefill_compute_share_scheduler.py::test_auto_parallel_prefills_ignore_token_geometry[4096-256-2-2]",
+  "tests/v1/core/test_prefill_compute_share_scheduler.py::test_auto_parallel_prefills_ignore_token_geometry[4096-256-64-4]",
+  "tests/v1/core/test_prefill_compute_share_scheduler.py::test_auto_parallel_prefills_ignore_token_geometry[4096-4096-64-4]",
+  "tests/v1/core/test_prefill_compute_share_scheduler.py::test_auto_parallel_prefills_ignore_token_geometry[512-256-64-4]",
+  "tests/v1/core/test_prefill_compute_share_scheduler.py::test_decode_aware_continues_when_no_prefill_needs_service",
+  "tests/v1/core/test_prefill_compute_share_scheduler.py::test_decode_aware_reserves_one_lane_for_nearest_decode",
+  "tests/v1/core/test_prefill_compute_share_scheduler.py::test_decode_aware_uses_round_robin_with_healthy_reservoir",
+  "tests/v1/core/test_prefill_compute_share_scheduler.py::test_decode_tie_then_prefill_and_work_conserving_fallback",
+  "tests/v1/core/test_prefill_compute_share_scheduler.py::test_decode_turn_falls_back_to_running_prefill",
+  "tests/v1/core/test_prefill_compute_share_scheduler.py::test_decode_turn_falls_back_when_decode_is_no_longer_runnable",
+  "tests/v1/core/test_prefill_compute_share_scheduler.py::test_default_path_skips_prefill_policy_scans",
+  "tests/v1/core/test_prefill_compute_share_scheduler.py::test_dflash_budget_covers_running_prefills_before_waiting_admission",
+  "tests/v1/core/test_prefill_compute_share_scheduler.py::test_disabled_scheduler_emits_no_compute_policy",
+  "tests/v1/core/test_prefill_compute_share_scheduler.py::test_explicit_parallel_prefills_ignore_storage_geometry",
+  "tests/v1/core/test_prefill_compute_share_scheduler.py::test_fairness_prefill_token_cap_applies_only_under_contention",
+  "tests/v1/core/test_prefill_compute_share_scheduler.py::test_full_apc_hit_is_decode_not_prefill",
+  "tests/v1/core/test_prefill_compute_share_scheduler.py::test_only_contended_compute_is_exported_and_stats_drain",
+  "tests/v1/core/test_prefill_compute_share_scheduler.py::test_parallel_prefill_preserves_solo_prefill_budget",
+  "tests/v1/core/test_prefill_compute_share_scheduler.py::test_parallel_prefill_redistributes_unused_short_share",
+  "tests/v1/core/test_prefill_compute_share_scheduler.py::test_parallel_prefill_splits_budget_across_four_requests",
+  "tests/v1/core/test_prefill_compute_share_scheduler.py::test_partial_external_hit_is_prefill_compute",
+  "tests/v1/core/test_prefill_compute_share_scheduler.py::test_pending_recurrent_import_releases_prefill_admission[1]",
+  "tests/v1/core/test_prefill_compute_share_scheduler.py::test_pending_recurrent_import_releases_prefill_admission[2]",
+  "tests/v1/core/test_prefill_compute_share_scheduler.py::test_prefill_compute_half_life_cli_rejects_invalid_values[-1]",
+  "tests/v1/core/test_prefill_compute_share_scheduler.py::test_prefill_compute_half_life_cli_rejects_invalid_values[0]",
+  "tests/v1/core/test_prefill_compute_share_scheduler.py::test_prefill_compute_half_life_cli_rejects_invalid_values[fast]",
+  "tests/v1/core/test_prefill_compute_share_scheduler.py::test_prefill_compute_half_life_cli_rejects_invalid_values[inf]",
+  "tests/v1/core/test_prefill_compute_share_scheduler.py::test_prefill_compute_half_life_cli_rejects_invalid_values[nan]",
+  "tests/v1/core/test_prefill_compute_share_scheduler.py::test_prefill_compute_half_life_rejects_invalid_values[-1.0]",
+  "tests/v1/core/test_prefill_compute_share_scheduler.py::test_prefill_compute_half_life_rejects_invalid_values[0.0]",
+  "tests/v1/core/test_prefill_compute_share_scheduler.py::test_prefill_compute_half_life_rejects_invalid_values[inf]",
+  "tests/v1/core/test_prefill_compute_share_scheduler.py::test_prefill_compute_half_life_rejects_invalid_values[nan]",
+  "tests/v1/core/test_prefill_compute_share_scheduler.py::test_prefill_compute_half_life_requires_auto[0.4]",
+  "tests/v1/core/test_prefill_compute_share_scheduler.py::test_prefill_compute_half_life_requires_auto[None]",
+  "tests/v1/core/test_prefill_compute_share_scheduler.py::test_prefill_compute_share_rejects_fixed_cadence",
+  "tests/v1/core/test_prefill_compute_share_scheduler.py::test_prefill_compute_share_rejects_invalid_values[-0.1]",
+  "tests/v1/core/test_prefill_compute_share_scheduler.py::test_prefill_compute_share_rejects_invalid_values[0.0]",
+  "tests/v1/core/test_prefill_compute_share_scheduler.py::test_prefill_compute_share_rejects_invalid_values[1.0]",
+  "tests/v1/core/test_prefill_compute_share_scheduler.py::test_prefill_compute_share_rejects_invalid_values[1.1]",
+  "tests/v1/core/test_prefill_compute_share_scheduler.py::test_prefill_compute_share_rejects_unknown_mode",
+  "tests/v1/core/test_prefill_compute_share_scheduler.py::test_prefill_compute_share_rejects_unsynchronized_dp",
+  "tests/v1/core/test_prefill_compute_share_scheduler.py::test_prefill_compute_token_cap_requires_compute_share",
+  "tests/v1/core/test_prefill_compute_share_scheduler.py::test_prefill_fairness_hot_switch_is_atomic",
+  "tests/v1/core/test_prefill_compute_share_scheduler.py::test_prefill_fcfs_and_capacity_bound_does_not_bypass_share",
+  "tests/v1/core/test_prefill_compute_share_scheduler.py::test_prefill_interleave_preserves_request_priority",
+  "tests/v1/core/test_prefill_compute_share_scheduler.py::test_prefill_interleave_rejects_invalid_config[kwargs0]",
+  "tests/v1/core/test_prefill_compute_share_scheduler.py::test_prefill_interleave_rejects_invalid_config[kwargs1]",
+  "tests/v1/core/test_prefill_compute_share_scheduler.py::test_prefill_interleave_rejects_invalid_config[kwargs2]",
+  "tests/v1/core/test_prefill_compute_share_scheduler.py::test_prefill_interleave_rejects_invalid_config[kwargs3]",
+  "tests/v1/core/test_prefill_compute_share_scheduler.py::test_prefill_interleave_rejects_invalid_config[kwargs4]",
+  "tests/v1/core/test_prefill_compute_share_scheduler.py::test_prefill_only_step_may_use_the_batched_token_budget[False]",
+  "tests/v1/core/test_prefill_compute_share_scheduler.py::test_prefill_only_step_may_use_the_batched_token_budget[True]",
+  "tests/v1/core/test_prefill_compute_share_scheduler.py::test_prefill_turn_falls_back_when_prefill_is_alignment_blocked",
+  "tests/v1/core/test_prefill_compute_share_scheduler.py::test_queued_prefills_leave_lanes_to_running_prefills[full-running-set]",
+  "tests/v1/core/test_prefill_compute_share_scheduler.py::test_queued_prefills_leave_lanes_to_running_prefills[paused-new]",
+  "tests/v1/core/test_prefill_compute_share_scheduler.py::test_round_robin_prioritizes_never_scheduled_prefills",
+  "tests/v1/core/test_prefill_compute_share_scheduler.py::test_round_robin_reaches_prefill_outside_first_batch",
+  "tests/v1/core/test_prefill_compute_share_scheduler.py::test_running_prefills_retain_fcfs_order",
+  "tests/v1/core/test_prefill_compute_share_scheduler.py::test_runtime_switch_is_live_and_preserves_inflight_accounting",
+  "tests/v1/core/test_prefill_compute_share_scheduler.py::test_separate_draft_input_budget_limits_prefill_fairness_turn[dflash-20-7]",
+  "tests/v1/core/test_prefill_compute_share_scheduler.py::test_separate_draft_input_budget_limits_prefill_fairness_turn[dspark-8-4]",
+  "tests/v1/core/test_prefill_compute_share_scheduler.py::test_speculative_decode_preserves_selected_prefill_quantum",
+  "tests/v1/core/test_prefill_qos_lanes.py::test_blocked_request_does_not_take_a_lane",
+  "tests/v1/core/test_prefill_qos_lanes.py::test_long_admission_reserves_in_flight_prefill_blocks[0-True]",
+  "tests/v1/core/test_prefill_qos_lanes.py::test_long_admission_reserves_in_flight_prefill_blocks[32-False]",
+  "tests/v1/core/test_prefill_qos_lanes.py::test_long_prefill_alone_keeps_the_full_budget",
+  "tests/v1/core/test_prefill_qos_lanes.py::test_long_prefill_keeps_a_lane_when_short_requests_arrive",
+  "tests/v1/core/test_prefill_qos_lanes.py::test_parked_long_is_admitted_once_long_work_drops_below_threshold",
+  "tests/v1/core/test_prefill_qos_lanes.py::test_second_long_admission_skips_over_without_blocking_short_work",
+  "tests/v1/core/test_prefill_qos_lanes.py::test_short_requests_finish_while_long_prefill_progresses",
+  "tests/v1/core/test_prefill_qos_lanes.py::test_size_classes_require_parallel_lanes",
+  "tests/v1/core/test_prefill_qos_lanes.py::test_without_size_classes_newcomers_take_every_lane",
+  "tests/v1/core/test_prefill_yield.py::test_a_long_prompt_at_the_head_does_not_hold_up_a_short_one",
+  "tests/v1/core/test_prefill_yield.py::test_a_long_prompt_stops_yielding_at_its_limit",
+  "tests/v1/core/test_prefill_yield.py::test_a_short_prompt_takes_the_step_and_the_chunks_keep_their_boundaries",
+  "tests/v1/core/test_prefill_yield.py::test_interleave_admits_waiting_short_prefill_during_decode_step",
+  "tests/v1/core/test_prefill_yield.py::test_interleave_does_not_pause_when_no_decodes_are_runnable",
+  "tests/v1/core/test_prefill_yield.py::test_interleave_gated_by_elapsed_stall_skips_fast_chunks_until_threshold",
+  "tests/v1/core/test_prefill_yield.py::test_interleave_k_graphed_decode_steps_between_full_prefill_chunks",
+  "tests/v1/core/test_prefill_yield.py::test_interleave_works_at_full_slot_occupancy_stall_15",
+  "tests/v1/core/test_prefill_yield.py::test_nothing_short_waiting_changes_nothing",
+  "tests/v1/core/test_prefill_yield.py::test_off_keeps_first_come_first_served",
+  "tests/v1/core/test_prefill_yield.py::test_shorts_keep_their_order",
+  "tests/v1/core/test_prefill_yield.py::test_the_held_first_token_step_carries_no_long_chunk",
+  "tests/v1/core/test_prefill_yield.py::test_yield_excludes_lanes_and_cadence"
+ ],
+ "verdict": "miss",
+ "reason": "The fix's own tests still did not run: sp6 has no gpt2, Qwen/Qwen3-0.6B or facebook/opt-125m in any Hugging Face cache (its cache holds only the DeepSeek-V4.1-Flash-1017 weights; /tmp/hf-test-cache, which the README mounts, is gone). All 44 tests in test_structured_output_manager.py errored at the gpt2 tokenizer fixture, and the PR's 196-passed claim is not reproduced (101 passed). All 95 failures and errors are missing offline resources (gpt2 80, Qwen/Qwen3-0.6B 10, facebook/opt-125m 5); none is a code failure, and the 101 tests that could run passed in both runs.",
+ "notes": [
+  "pytest-sp6-run*.txt are gzipped (4.9 MB each raw, mostly offline tracebacks); the two raw logs differ only in HF session ids, object addresses, log timestamps and durations, and their FAILED/ERROR lists are identical",
+  "passed_test_ids come from the junit XML (classname form); failing_test_ids from pytest's short summary",
+  "Same counts as the earlier sp8 check on the candidate-48 image (51 failed, 101 passed, 44 errors)"
+ ]
+}

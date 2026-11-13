@@ -1,0 +1,587 @@
+{
+ "pr": 960,
+ "pr_head": "6cfd0bd33413edb16cac1d07b3c2672cb95dbf60",
+ "patch": "0781-perf-cudagraph-target-full-replay-and-post-gate-fork.patch (SHA-256 95387b8e..., equal to the PR head's patch)",
+ "mark": "Its screen_cudagraph_wins.py on the image, 2 boots, ABBA against the base: per-step pre-launch metadata and CED staging on FULL decode steps lower beyond the interval (the PR: 438-451 us to 33-41 us from (1,1) to (16,64)), bit-exact; the engine grid and paired decode not worse. Its receipts predate its head commit (6cfd0bd3 dropped the post-gate MoE fork), so they must be re-run on the current patch",
+ "host": "sp8 (spark-0016, NVIDIA GB10, driver 580.178.04)",
+ "images": {
+  "base": "spark-ds41f:candidate-50 sha256:8c1ea1f62f62c3e2adc03b645c091a5499cf7163101aca32875c894b96f155db + no1009/overlay (4 files, ro)",
+  "candidate-53": "the same image + the 33 files differing from candidate-53's tree c0e25ff1 (ro); ../common/overlay-sha.txt"
+ },
+ "evidence": [
+  "The PR's screen_cudagraph_wins.py from its head, unmodified, run fresh on the candidate arm twice (script-c53-boot1/2.json). It is an in-process comparison (a hand-built eager baseline against the in-graph candidate path). On the base arm it cannot run: AttributeError 'CEDState' object has no attribute 'prepare_cudagraph_replay' (script-base-boot1.txt), recorded once.",
+  "Image A/B (harness ab960.py, ABBA base/c53/c53/base, same session): the same 23-group DeepseekV41B12xMetadataBuilder + CEDState workload and shapes as the script's section 1, each image on the path its own code takes on a FULL decode step: base = build_slot_mappings_by_layer + CEDState.stage + 23 builder.build() + replay; candidate = CEDState.stage_floors + replay of the graph holding CEDState.prepare_cudagraph_replay and the 23 builders' prepare_cudagraph_replay. Two timers: wall (host+device per step, 300 back-to-back steps, 7 windows after 100 warm-up steps; the script's method) and device time with the host hidden (a 1.17 ms sleep kernel queued first; every step's host enqueue, max 0.62 ms, finished before it ended). Digest of all metadata buffers after the step, compared across images.",
+  "The PR's tests on the candidate arm, twice: tests/v1/attention/test_b12x_v41_ced_metadata.py and tests/v1/cudagraph/test_cudagraph_manager.py with the release bundle's tblib_stub plugin."
+ ],
+ "measured": {
+  "pr_script_candidate_image_target_full_us": {
+   "boot1": {
+    "(1,1)": {
+     "baseline_us": 438.16,
+     "candidate_us": 30.75,
+     "bit_exact": true
+    },
+    "(1,6)": {
+     "baseline_us": 436.19,
+     "candidate_us": 31.89,
+     "bit_exact": true
+    },
+    "(2,12)": {
+     "baseline_us": 443.4,
+     "candidate_us": 34.31,
+     "bit_exact": true
+    },
+    "(3,18)": {
+     "baseline_us": 444.44,
+     "candidate_us": 33.18,
+     "bit_exact": true
+    },
+    "(4,16)": {
+     "baseline_us": 439.39,
+     "candidate_us": 35.03,
+     "bit_exact": true
+    },
+    "(4,24)": {
+     "baseline_us": 434.74,
+     "candidate_us": 35.7,
+     "bit_exact": true
+    },
+    "(8,32)": {
+     "baseline_us": 447.08,
+     "candidate_us": 39.32,
+     "bit_exact": true
+    },
+    "(8,48)": {
+     "baseline_us": 446.56,
+     "candidate_us": 36.91,
+     "bit_exact": true
+    },
+    "(16,64)": {
+     "baseline_us": 455.64,
+     "candidate_us": 39.83,
+     "bit_exact": true
+    }
+   },
+   "boot2": {
+    "(1,1)": {
+     "baseline_us": 436.61,
+     "candidate_us": 32.61,
+     "bit_exact": true
+    },
+    "(1,6)": {
+     "baseline_us": 430.8,
+     "candidate_us": 32.4,
+     "bit_exact": true
+    },
+    "(2,12)": {
+     "baseline_us": 431.44,
+     "candidate_us": 33.91,
+     "bit_exact": true
+    },
+    "(3,18)": {
+     "baseline_us": 429.48,
+     "candidate_us": 32.77,
+     "bit_exact": true
+    },
+    "(4,16)": {
+     "baseline_us": 430.85,
+     "candidate_us": 35.09,
+     "bit_exact": true
+    },
+    "(4,24)": {
+     "baseline_us": 433.72,
+     "candidate_us": 35.77,
+     "bit_exact": true
+    },
+    "(8,32)": {
+     "baseline_us": 444.5,
+     "candidate_us": 39.89,
+     "bit_exact": true
+    },
+    "(8,48)": {
+     "baseline_us": 443.4,
+     "candidate_us": 37.1,
+     "bit_exact": true
+    },
+    "(16,64)": {
+     "baseline_us": 446.46,
+     "candidate_us": 38.94,
+     "bit_exact": true
+    }
+   }
+  },
+  "pr_script_note": "Reproduces the PR's section 1 (438-456 us -> 31-40 us, bit_exact True on all 9 shapes, both boots). Its other sections are not this patch: the MoE post-gate fork section times hand-written stream schedules (the head dropped the fork from the patch; recorded bit_exact True, no claim taken); the DFlash padding_rows section times a Python loop that skips the launch (12.7-14.3 us -> 0.04 us); the lead-chunk section is the PR's dead end.",
+  "image_ab_full_decode_step": {
+   "(1,1)": {
+    "wall_us_base_boots": [
+     471.49,
+     475.39
+    ],
+    "wall_us_candidate_boots": [
+     30.86,
+     32.26
+    ],
+    "wall_delta_pct": -93.33,
+    "wall_welch95_us": [
+     -443.148,
+     -439.866
+    ],
+    "wall_verdict": "better",
+    "device_us_base_boots": [
+     73.41,
+     70.72
+    ],
+    "device_us_candidate_boots": [
+     32.61,
+     33.34
+    ],
+    "device_delta_pct": -54.24,
+    "device_verdict": "better",
+    "candidate_floors_change_every_step": {
+     "wall_us": [
+      39.26,
+      38.49
+     ],
+     "device_us": [
+      39.71,
+      43.3
+     ],
+     "verdict_vs_base": "better"
+    }
+   },
+   "(1,6)": {
+    "wall_us_base_boots": [
+     473.42,
+     476.42
+    ],
+    "wall_us_candidate_boots": [
+     31.06,
+     32.21
+    ],
+    "wall_delta_pct": -93.34,
+    "wall_welch95_us": [
+     -443.679,
+     -440.554
+    ],
+    "wall_verdict": "better",
+    "device_us_base_boots": [
+     73.18,
+     51.68
+    ],
+    "device_us_candidate_boots": [
+     32.61,
+     33.54
+    ],
+    "device_delta_pct": -47.02,
+    "device_verdict": "better",
+    "candidate_floors_change_every_step": {
+     "wall_us": [
+      36.99,
+      38.71
+     ],
+     "device_us": [
+      39.65,
+      39.81
+     ],
+     "verdict_vs_base": "better"
+    }
+   },
+   "(2,12)": {
+    "wall_us_base_boots": [
+     467.62,
+     477.12
+    ],
+    "wall_us_candidate_boots": [
+     34.28,
+     33.78
+    ],
+    "wall_delta_pct": -92.8,
+    "wall_welch95_us": [
+     -441.811,
+     -436.395
+    ],
+    "wall_verdict": "better",
+    "device_us_base_boots": [
+     78.5,
+     57.73
+    ],
+    "device_us_candidate_boots": [
+     35.74,
+     34.66
+    ],
+    "device_delta_pct": -48.32,
+    "device_verdict": "better",
+    "candidate_floors_change_every_step": {
+     "wall_us": [
+      39.77,
+      37.34
+     ],
+     "device_us": [
+      41.7,
+      46.94
+     ],
+     "verdict_vs_base": "better"
+    }
+   },
+   "(3,18)": {
+    "wall_us_base_boots": [
+     474.48,
+     476.57
+    ],
+    "wall_us_candidate_boots": [
+     33.22,
+     33.25
+    ],
+    "wall_delta_pct": -93.01,
+    "wall_welch95_us": [
+     -443.604,
+     -440.127
+    ],
+    "wall_verdict": "better",
+    "device_us_base_boots": [
+     76.45,
+     77.18
+    ],
+    "device_us_candidate_boots": [
+     35.26,
+     32.86
+    ],
+    "device_delta_pct": -55.66,
+    "device_verdict": "better",
+    "candidate_floors_change_every_step": {
+     "wall_us": [
+      39.34,
+      38.03
+     ],
+     "device_us": [
+      40.74,
+      40.22
+     ],
+     "verdict_vs_base": "better"
+    }
+   },
+   "(4,16)": {
+    "wall_us_base_boots": [
+     469.65,
+     479.15
+    ],
+    "wall_us_candidate_boots": [
+     35.84,
+     34.85
+    ],
+    "wall_delta_pct": -92.55,
+    "wall_welch95_us": [
+     -441.837,
+     -436.51
+    ],
+    "wall_verdict": "better",
+    "device_us_base_boots": [
+     58.85,
+     78.62
+    ],
+    "device_us_candidate_boots": [
+     37.31,
+     37.44
+    ],
+    "device_delta_pct": -45.62,
+    "device_verdict": "better",
+    "candidate_floors_change_every_step": {
+     "wall_us": [
+      41.13,
+      40.6
+     ],
+     "device_us": [
+      43.49,
+      43.71
+     ],
+     "verdict_vs_base": "better"
+    }
+   },
+   "(4,24)": {
+    "wall_us_base_boots": [
+     473.34,
+     480.88
+    ],
+    "wall_us_candidate_boots": [
+     34.84,
+     35.84
+    ],
+    "wall_delta_pct": -92.59,
+    "wall_welch95_us": [
+     -443.802,
+     -439.079
+    ],
+    "wall_verdict": "better",
+    "device_us_base_boots": [
+     78.88,
+     57.89
+    ],
+    "device_us_candidate_boots": [
+     37.38,
+     36.67
+    ],
+    "device_delta_pct": -45.86,
+    "device_verdict": "better",
+    "candidate_floors_change_every_step": {
+     "wall_us": [
+      41.31,
+      40.02
+     ],
+     "device_us": [
+      43.42,
+      43.58
+     ],
+     "verdict_vs_base": "better"
+    }
+   },
+   "(8,32)": {
+    "wall_us_base_boots": [
+     477.81,
+     480.99
+    ],
+    "wall_us_candidate_boots": [
+     39.8,
+     38.95
+    ],
+    "wall_delta_pct": -91.79,
+    "wall_welch95_us": [
+     -440.196,
+     -434.791
+    ],
+    "wall_verdict": "better",
+    "device_us_base_boots": [
+     80.64,
+     82.34
+    ],
+    "device_us_candidate_boots": [
+     41.7,
+     41.7
+    ],
+    "device_delta_pct": -48.83,
+    "device_verdict": "better",
+    "candidate_floors_change_every_step": {
+     "wall_us": [
+      48.53,
+      49.42
+     ],
+     "device_us": [
+      47.74,
+      47.78
+     ],
+     "verdict_vs_base": "better"
+    }
+   },
+   "(8,48)": {
+    "wall_us_base_boots": [
+     476.94,
+     481.96
+    ],
+    "wall_us_candidate_boots": [
+     36.91,
+     36.89
+    ],
+    "wall_delta_pct": -92.3,
+    "wall_welch95_us": [
+     -444.238,
+     -439.464
+    ],
+    "wall_verdict": "better",
+    "device_us_base_boots": [
+     78.56,
+     59.97
+    ],
+    "device_us_candidate_boots": [
+     38.24,
+     38.3
+    ],
+    "device_delta_pct": -44.75,
+    "device_verdict": "better",
+    "candidate_floors_change_every_step": {
+     "wall_us": [
+      42.19,
+      44.32
+     ],
+     "device_us": [
+      44.13,
+      44.58
+     ],
+     "verdict_vs_base": "better"
+    }
+   },
+   "(16,64)": {
+    "wall_us_base_boots": [
+     478.31,
+     484.22
+    ],
+    "wall_us_candidate_boots": [
+     39.72,
+     39.97
+    ],
+    "wall_delta_pct": -91.72,
+    "wall_welch95_us": [
+     -443.751,
+     -438.212
+    ],
+    "wall_verdict": "better",
+    "device_us_base_boots": [
+     60.83,
+     81.6
+    ],
+    "device_us_candidate_boots": [
+     39.14,
+     41.73
+    ],
+    "device_delta_pct": -43.22,
+    "device_verdict": "better",
+    "candidate_floors_change_every_step": {
+     "wall_us": [
+      48.08,
+      49.66
+     ],
+     "device_us": [
+      42.82,
+      47.01
+     ],
+     "verdict_vs_base": "better"
+    }
+   }
+  },
+  "image_ab_summary": "All 9 shapes: wall 467-484 us (base) -> 30.9-40.0 us (candidate), -91.7% to -93.3%, Welch 95% interval of the change about -435 to -444 us, verdict better; device time with the host hidden 51.7-82.3 us -> 32.6-41.7 us (-43% to -56%), better: the in-graph metadata does not add device time, it removes the eager launches' gaps. With floors changing every step (stage_floors then copies) the candidate is 37-50 us wall, 39.7-47.8 us device, still better on every shape.",
+  "bit_exact": "In the candidate image the graph path's metadata digest equals the eager path's on all 9 shapes, both boots; and it equals the base image's eager digest on all 9 shapes (all four boots give one digest per shape).",
+  "eager_path_cross_image": {
+   "cells": {
+    "(1,1)": {
+     "base": [
+      471.49,
+      475.39
+     ],
+     "candidate": [
+      474.57,
+      474.21
+     ],
+     "verdict": "same"
+    },
+    "(1,6)": {
+     "base": [
+      473.42,
+      476.42
+     ],
+     "candidate": [
+      476.25,
+      475.19
+     ],
+     "verdict": "same"
+    },
+    "(2,12)": {
+     "base": [
+      467.62,
+      477.12
+     ],
+     "candidate": [
+      476.81,
+      468.3
+     ],
+     "verdict": "same"
+    },
+    "(3,18)": {
+     "base": [
+      474.48,
+      476.57
+     ],
+     "candidate": [
+      477.81,
+      477.68
+     ],
+     "verdict": "worse"
+    },
+    "(4,16)": {
+     "base": [
+      469.65,
+      479.15
+     ],
+     "candidate": [
+      477.49,
+      477.81
+     ],
+     "verdict": "same"
+    },
+    "(4,24)": {
+     "base": [
+      473.34,
+      480.88
+     ],
+     "candidate": [
+      477.47,
+      475.65
+     ],
+     "verdict": "same"
+    },
+    "(8,32)": {
+     "base": [
+      477.81,
+      480.99
+     ],
+     "candidate": [
+      470.92,
+      479.67
+     ],
+     "verdict": "same"
+    },
+    "(8,48)": {
+     "base": [
+      476.94,
+      481.96
+     ],
+     "candidate": [
+      474.95,
+      480.49
+     ],
+     "verdict": "same"
+    },
+    "(16,64)": {
+     "base": [
+      478.31,
+      484.22
+     ],
+     "candidate": [
+      485.13,
+      484.35
+     ],
+     "verdict": "same"
+    }
+   },
+   "note": "The eager path (non-FULL steps), whose CEDState.stage the patch moved to a 4-slot pinned ring: 8 of 9 shapes same, 1 flagged (3,18) +0.6% (+2.2 us of 475 us); mean over shapes +0.1%. Not the path a FULL decode step takes."
+  },
+  "pytest_candidate": {
+   "boot1": "125 passed, 15 warnings in 71.37s",
+   "boot2": "125 passed, 15 warnings in 28.96s",
+   "note": "PR receipt: 161 passed (its own file list, run from /tmp/tests); the candidate's two files collect 125"
+  }
+ },
+ "parts": [
+  {
+   "part": "pre-launch metadata and CED staging on FULL decode steps lower beyond the interval",
+   "verdict": "pass",
+   "detail": "-91.7% to -93.3% wall and -43% to -56% device time on all 9 shapes, ABBA image A/B, beyond the two-boot interval; the PR's script reproduces 31-40 us on the candidate image"
+  },
+  {
+   "part": "bit-exact",
+   "verdict": "pass",
+   "detail": "metadata digests equal across paths and across images on all 9 shapes"
+  },
+  {
+   "part": "engine grid and paired decode not worse",
+   "verdict": "cannot-evaluate-on-sp8",
+   "detail": "multi-node: the coordinator's tp3-switched screen (screen-tp3 engine grid and the 8-stream closed loop)"
+  }
+ ],
+ "verdict": "pass",
+ "verdict_scope": "sp8-evaluable parts; the engine grid and paired decode are the tp3-switched screen's",
+ "reason": "On the path a FULL decode step takes, the candidate's per-step metadata/CED preparation drops from about 475 us to 31-40 us (host and device), and its device-side work is lower too, with byte-identical metadata against the base image; the PR's own script reproduces its numbers on the head commit. Its tests pass on both boots.",
+ "notes": [
+  "The PR's README still describes the MoE post-gate fork and a stage_cudagraph_replay hook; the head patch has neither (model_state.stage_full_cudagraph_attn, the ring-buffered CEDState.stage and stage_floors are what it adds). The fast path is gated on the speculator's uses_target_attn_metadata being False: DSparkSpeculator inherits False from DFlashSpeculator, so the recipe's DSpark takes it.",
+  "The PR's in-process baseline adds two hand-made pinned tensors on top of CEDState.stage's own two (eager_pr in ab960); the image A/B's base path leaves them out. They cost about 4-9 us; the change is the same either way.",
+  "script-c53-boot1 ran with the first warm.py (its warm-up was one GEMM including cuBLAS init); script-c53-boot2 and all A/B runs ran with the fixed one. The script is an in-process comparison with its own 30+10-step warm-ups; its two boots agree within 1-3%.",
+  "commands.txt start_utc is after the GPU lock was taken; issued_utc includes the wait on candidate-51/52 jobs."
+ ]
+}

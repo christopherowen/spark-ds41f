@@ -1,0 +1,136 @@
+From a04d0733e58d47187508c87b252273f08482505f Mon Sep 17 00:00:00 2001
+From: Christopher Owen <3221756+christopherowen@users.noreply.github.com>
+Date: Sun, 8 Nov 2026 16:45:00 +0100
+Subject: [PATCH] perf(dsv41): extend WO-B WIDE_DECODE to 128 rows and guard
+ high-concurrency decode cliffs
+
+Base: 320021e3c4dbb202d911ab70e2cd924c75420488 (spark-ds41f:1107 patch 0761).
+
+Rationale:
+1. At default max_num_seqs=16, CopyDrafter (K=5, V=16) widens max_decode_rows to 107 (16*6 + 11), capturing and replaying the 104-row and 112-row target FULL decode CUDA graphs (and up to 128 rows at max_num_seqs=21..32). At 97..128 rows, WO-A (_WO_A_TILES up to 128), fused_wqa_wkv ((3904, 5120) up to 128), shared_expert ((1024, 5120) up to 128), and vocab (ROW_TILES up to 128) all dispatch 128-row decode tiles, whereas WO-B ((5120, 3072) on TP3 ranks 0-1, (5120, 2048) on TP4 and TP3 rank 2, and (5120, 1024) on TP8) stopped at WIDE_DECODE {96: 96} and DECODE_FP8_CONFIGS {96}. Because TileLangWOProjection.tilelang_decode_rows is 128, WO-B fell back to DECODE_ROWS=64 (2x64 M-tiles x 40 N-tiles = 80 CTAs in 2 waves on 48 GB10 SMs, reading the 10-15 MiB weight matrix twice). Adding 128: dict(block_N=128, block_K=128, num_stages=2, threads=256) to DECODE_FP8_CONFIGS and 128: 128 to WIDE_DECODE launches 1x40 = 40 CTAs in a single wave on 48 SMs while staying on the unspecialized mxfp8_gemm_decode pipeline for padded decode workspaces, cutting WO-B latency by 13.8-16.9% on (5120, 3072), 13.3-18.0% on (5120, 2048), and 11.5-20.4% on (5120, 1024) across M=104..128.
+2. When max_num_seqs > 32 (e.g. max_num_seqs=48, max_decode_rows=299), sp_prefill.resolve_min_rows previously took max(max_cudagraph_capture_size, max_decode_rows) + 1 = 300 even when max_cudagraph_capture_size <= 204, opening a 205..299-row gap above SparkNet One-Shot RoCE AllReduce (2 MiB = 204 rows at 5120 BF16) that ran uncaptured on PyNCCL. Bound sp_min_rows by max(max_cudagraph_capture_size + 1, roce_rows) when roce_rows > 0, warn when max_cudagraph_capture_size exceeds roce_rows, and route all_reduce_rank_order through roce_comm.reduce_scatter + roce_comm.all_gather whenever both halves are eligible (up to 408 rows on tp3-triangle / tp4-switched).
+3. In dense_varlen_decode_shapes, bound full-depth per-request varlen decode captures (r, r*max_q) at _FULL_DEPTH_VARLEN_DECODE_MAX_REQS = 16 so max_num_seqs=32 and 48 reuse the 8-row/16-row padded FULL decode ladder for r > 16 instead of capturing 27-68 redundant full-depth target and DSpark context CUDA graphs (saving 138-142 MiB of graph pool memory at c32 and 346-422 MiB at c48).
+
+Quality:
+Bit-identical (torch.equal across all M in 64..192 and K in 1024, 2048, 3072) for mxfp8_gemm and TileLangWOProjection; zero change to captured graphs at max_num_seqs <= 16.
+
+Tests:
+- pytest tests/kernels/quantization/test_deepseek_v41_tilelang_linear.py tests/kernels/quantization/test_deepseek_v41_block_scale_words.py tests/models/test_deepseek_v4_1_sp_prefill.py tests/v1/cudagraph/test_cudagraph_manager.py (225 passed across 2 boots).
+
+Upstream status: spark-ds41f DeepSeek-V4.1 SM121 TileLang / SparkNet / V1 CUDA graph runtime patch.
+
+Split at selection for candidates 51-53: this patch keeps vllm/models/deepseek_v4_1/tilelang/gemm.py, vllm/models/deepseek_v4_1/tilelang/wo.py, tests/kernels/quantization/test_deepseek_v41_tilelang_linear.py of the PR's patch; every kept line is unchanged.
+---
+ .../test_deepseek_v41_tilelang_linear.py      | 44 +++++++++++++++++++
+ vllm/models/deepseek_v4_1/tilelang/gemm.py    |  9 ++--
+ vllm/models/deepseek_v4_1/tilelang/wo.py      |  2 +-
+ 3 files changed, 51 insertions(+), 4 deletions(-)
+
+diff --git a/tests/kernels/quantization/test_deepseek_v41_tilelang_linear.py b/tests/kernels/quantization/test_deepseek_v41_tilelang_linear.py
+index 07e9f9152..14f651a41 100644
+--- a/tests/kernels/quantization/test_deepseek_v41_tilelang_linear.py
++++ b/tests/kernels/quantization/test_deepseek_v41_tilelang_linear.py
+@@ -1002,3 +1002,47 @@ def test_hw_e2m1x2_codegen_in_gemm_and_indexer_quantizers():
+         src = nrq_kernel.get_kernel_source()
+         assert "cvt.rn.satfinite.e2m1x2.f32" in src
+         assert "dsv41_store_e2m1x8(" in src
++
++
++@pytest.mark.parametrize("k", [3072, 2048, 1024])
++def test_wo_b_wide_decode_128_rows_matches_prefill(default_vllm_config, k):
++    """WO-B shapes ((5120, 3072), (5120, 2048), (5120, 1024)) extend WIDE_DECODE
++    to 128 rows (128x128 decode tile) and match the prefill GEMM bit for bit
++    across 64..128 rows (including 104, 112, 120, 128 with poisoned padding)."""
++    from vllm.models.deepseek_v4_1.tilelang.gemm import WIDE_DECODE, decode_tile_rows
++
++    n = 5120
++    assert WIDE_DECODE[(n, k)] == {96: 96, 128: 128}
++    assert decode_tile_rows(96, WIDE_DECODE[(n, k)]) == 96
++    for rows in (97, 104, 112, 120, 128):
++        assert decode_tile_rows(rows, WIDE_DECODE[(n, k)]) == 128
++
++    weight, exps, _ = _block32_weight(n, k, 53 + k)
++    weight_sf = pack_scale_words(exps)
++    x = torch.randn((128, k), generator=_gen(59 + k), device=DEVICE).bfloat16()
++    xq, sf, _ = _mxfp8(x)
++    words = sf.contiguous().view(torch.uint32)
++
++    prefill_kernel = mxfp8_gemm(n, k, **fp8_prefill_config(n, k))
++    decode_96 = mxfp8_gemm_decode(n, k, **fp8_decode_config(n, k, 96), padded_rows=True)
++    decode_128 = mxfp8_gemm_decode(
++        n, k, **fp8_decode_config(n, k, 128), padded_rows=True
++    )
++    full_ref = torch.empty((128, n), dtype=torch.bfloat16, device=DEVICE)
++    prefill_kernel(xq, weight, words, weight_sf, full_ref)
++
++    for rows, kernel in (
++        (96, decode_96),
++        (104, decode_128),
++        (112, decode_128),
++        (120, decode_128),
++        (128, decode_128),
++    ):
++        xq_pad = xq.clone()
++        words_pad = words.clone()
++        if rows < 128:
++            xq_pad[rows:].view(torch.uint8).fill_(0x7F)
++            words_pad[rows:].fill_(0xFFFFFFFF)
++        out = torch.empty((rows, n), dtype=torch.bfloat16, device=DEVICE)
++        kernel(xq_pad, weight, words_pad, weight_sf, out)
++        assert torch.equal(out, full_ref[:rows]), f"k={k} rows={rows}"
+diff --git a/vllm/models/deepseek_v4_1/tilelang/gemm.py b/vllm/models/deepseek_v4_1/tilelang/gemm.py
+index 3f7b31860..31cf09fc6 100644
+--- a/vllm/models/deepseek_v4_1/tilelang/gemm.py
++++ b/vllm/models/deepseek_v4_1/tilelang/gemm.py
+@@ -2671,6 +2671,7 @@ DECODE_FP8_CONFIGS: dict[tuple[int, ...], dict[int, dict]] = {
+         32: dict(block_N=128, block_K=128, num_stages=3),
+         64: dict(block_N=128, block_K=128, num_stages=2),
+         96: dict(block_N=64, block_K=128, num_stages=2),
++        128: dict(block_N=128, block_K=128, num_stages=2, threads=256),
+     },
+     (5120, 2048): {
+         16: dict(block_N=128, block_K=128, num_stages=3),
+@@ -2679,12 +2680,14 @@ DECODE_FP8_CONFIGS: dict[tuple[int, ...], dict[int, dict]] = {
+         # default tile at 48-64 rows; a 96-row tile 0.91 of the prefill tile at 72-96.
+         64: dict(block_N=128, block_K=128, num_stages=2),
+         96: dict(block_N=64, block_K=128, num_stages=2),
++        128: dict(block_N=128, block_K=128, num_stages=2, threads=256),
+     },
+     (5120, 1024): {
+         16: dict(block_N=128, block_K=128, num_stages=3),
+         32: dict(block_N=128, block_K=128, num_stages=3),
+         64: dict(block_N=128, block_K=128, num_stages=2),
+         96: dict(block_N=64, block_K=128, num_stages=2),
++        128: dict(block_N=128, block_K=128, num_stages=2, threads=256),
+     },
+     # DSpark main projection (replicated and TP3..TP8 shards).
+     (6400, 6144): {
+@@ -2856,9 +2859,9 @@ WIDE_DECODE: dict[tuple[int, int], dict[int, int]] = {
+     (5120, 512): {96: 32, 128: 64},
+     (5120, 384): {96: 32, 128: 64},
+     (5120, 320): {96: 32, 128: 64},
+-    (5120, 3072): {96: 96},
+-    (5120, 2048): {96: 96},
+-    (5120, 1024): {96: 96},
++    (5120, 3072): {96: 96, 128: 128},
++    (5120, 2048): {96: 96, 128: 128},
++    (5120, 1024): {96: 96, 128: 128},
+ }
+ 
+ # BF16 projections whose split-K decode path serves rows past DECODE_ROWS, by
+diff --git a/vllm/models/deepseek_v4_1/tilelang/wo.py b/vllm/models/deepseek_v4_1/tilelang/wo.py
+index fb73cbff0..0c7e9aa8e 100644
+--- a/vllm/models/deepseek_v4_1/tilelang/wo.py
++++ b/vllm/models/deepseek_v4_1/tilelang/wo.py
+@@ -93,7 +93,7 @@ class _Weight:
+         no per-token cast to prepare."""
+         _declare_block32(self, self.groups, cast=False)
+         # Verification steps stay on decode tiles to 128 rows: one 96-row tile to 96
+-        # (WIDE_DECODE), two of 64 rows past it.
++        # and one 128-row tile for 97..128 rows (WIDE_DECODE).
+         self.tilelang_decode_rows = 128
+ 
+ 
+-- 
+2.43.0
+

@@ -370,6 +370,34 @@ fi
         for bad in (-1, 4.5, True, "4"):
             self.assertEqual(findings(bad), ["host.memguard_warn_gib must be a non-negative integer"], bad)
 
+    def test_doctor_validates_the_defragmentation_switch(self) -> None:
+        nodes = json.loads((ROOT / "config/nodes.example.json").read_text(encoding="utf-8"))
+        lock = spark.read_json("upstreams.lock.json")
+
+        def findings(value):
+            cluster = spark.read_cluster("config/cluster.json", "tp3-triangle")
+            if value is not None:
+                cluster["host"]["defragment_before_start"] = value
+            with mock.patch.object(spark, "tracked_secret_problems", return_value=[]):
+                return [f for f in spark.local_doctor(cluster, nodes, lock) if "defragment_before_start" in f]
+
+        for good in (None, True, False):
+            self.assertEqual(findings(good), [], good)
+        for bad in (0, 1, "false"):
+            self.assertEqual(findings(bad), ["host.defragment_before_start must be a boolean"], bad)
+
+    def test_doctor_refuses_a_container_key_nothing_reads(self) -> None:
+        nodes = json.loads((ROOT / "config/nodes.example.json").read_text(encoding="utf-8"))
+        lock = spark.read_json("upstreams.lock.json")
+        cluster = spark.read_cluster("config/cluster.json", "tp3-triangle")
+        with mock.patch.object(spark, "tracked_secret_problems", return_value=[]):
+            self.assertEqual([f for f in spark.local_doctor(cluster, nodes, lock) if f.startswith("container.")], [])
+            cluster["container"]["extra_mounts"] = [{"source": "a", "target": "/b", "read_only": True}]
+            findings = [f for f in spark.local_doctor(cluster, nodes, lock) if f.startswith("container.")]
+        self.assertEqual(len(findings), 1)
+        self.assertIn("container.extra_mounts is not a container setting", findings[0])
+        self.assertIn("container.mounts", findings[0])
+
     def test_start_wrapper_refuses_a_config_path(self) -> None:
         result = self._start("config/cluster.json", "startup", "prelaunch")
 

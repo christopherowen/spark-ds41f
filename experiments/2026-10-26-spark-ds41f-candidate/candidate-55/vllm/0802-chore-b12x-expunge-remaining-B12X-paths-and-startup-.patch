@@ -1,0 +1,3196 @@
+From bb71f454d339e2bc6bbceef5297093bb8a07a4ae Mon Sep 17 00:00:00 2001
+From: Christopher Owen <3221756+christopherowen@users.noreply.github.com>
+Date: Tue, 10 Nov 2026 09:58:21 +0000
+Subject: [PATCH] chore(b12x): expunge remaining B12X paths and startup rounds
+ from DS4.1
+
+Upstream base: 19f2c20ed4d64ae22bd009ceacadd85e2a81e354 (after 0801).
+
+Rebased from spark-ds41f-1107's series (after 0761) onto candidate-54 and
+#1134's 0800-0801, keeping their behaviour: sp_prefill.py keeps candidate-54's
+_tp_roce_comm() helper, which now prefers roce_ar_comm over b12x_ar_comm;
+candidate-54's decode-overlap helper in attention.py takes the renamed
+DeepseekV41Metadata; LogitsProcessor keeps prepare_b12x_vocab_projection as
+an alias of prepare_vocab_projection.
+
+Rationale:
+1. Move Mxfp4CsfMoEMethod out of vllm/models/deepseek_v4_1/mxfp4_csf.py to
+   vllm/model_executor/layers/quantization/mxfp4_csf_moe.py for Kimi-K3 and
+   DeepSeek-V4-Flash, and refuse DS4.1 CSF checkpoints.
+2. Remove the unused b12x model loader (vllm/model_executor/model_loader/b12x_loader.py)
+   and the b12x load format option.
+3. Rename DeepseekV41B12xMetadata, DeepseekV41B12xMetadataBuilder, and
+   DeepseekV41B12xBackend to DeepseekV41Metadata, DeepseekV41MetadataBuilder,
+   and DeepseekV41Backend ("DSV41"), CompressorBackend to "DSV41_COMPRESSOR",
+   and cache_dtype_str="b12x_dsv41" to "dsv41".
+4. Remove remaining B12X dependencies and lookup_plans from DS4.1 Engram
+   (vllm/models/deepseek_v4_1/common/engram.py) and its gate tests
+   (test_deepseek_v41_engram_rows.py, test_deepseek_v4_1_engram.py,
+   test_deepseek_v4_1_sp_prefill.py), and skip B12X-specific preparation tests
+   when b12x is not installed.
+5. Make _B12X_SUBMODULES in vllm/utils/b12x.py load submodules lazily on first
+   access rather than importing 26 b12x submodules at vllm.utils.b12x import time.
+6. Skip the 3 no-op begin_b12x_preparation RPC rounds and prepare_b12x_profile
+   PrefixStore exchanges during startup when b12x is not installed, while binding
+   lm_head to LogitsProcessor directly in tilelang.prepare.declare_modules.
+7. Add backend-neutral names on the TileLang/Sparknet path (prepare_vocab_projection,
+   _roce_health_check, _roce_guarded, and roce_ar_comm preference in sp_prefill.py)
+   with backward-compatible aliases.
+
+Quality implications: none; bit-identical TileLang/Sparknet execution path.
+
+Tests:
+- tests/kernels/test_deepseek_v41_engram_rows.py
+- tests/models/test_deepseek_v4_1_engram.py
+- tests/models/test_deepseek_v4_1_sp_prefill.py
+- tests/kernels/test_deepseek_v41_tilelang_metadata.py
+- tests/models/test_deepseek_v4_1_compressor.py
+- tests/v1/attention/test_b12x_v41_ced_metadata.py
+- tests/v1/core/test_contiguous_kv_packing.py
+- tests/v1/core/test_kv_cache_utils.py
+- tests/quantization/test_mxfp4_csf.py
+- tests/model_executor/test_b12x_warmup.py
+- tests/v1/executor/test_b12x_startup.py
+- tests/v1/executor/test_b12x_output.py
+- tests/v1/worker/test_b12x_roce_health.py
+
+Upstream status: local DS4.1 B12X expungement.
+---
+ docs/design/streaming_weight_loading.md       |   4 +
+ .../kernels/test_deepseek_v41_engram_rows.py  |  49 +-
+ .../test_deepseek_v41_tilelang_metadata.py    |   4 +-
+ .../model_loader/test_b12x_loader.py          | 598 ------------------
+ tests/model_executor/test_b12x_warmup.py      |   2 +
+ tests/models/test_deepseek_v4_1_compressor.py |   8 +-
+ tests/models/test_deepseek_v4_1_engram.py     | 213 +++----
+ ...test_deepseek_v4_1_prepared_projections.py |   7 +-
+ tests/models/test_deepseek_v4_1_sp_prefill.py |   6 +-
+ tests/quantization/test_mxfp4_csf.py          | 115 ++--
+ .../attention/test_b12x_v41_ced_metadata.py   |   8 +-
+ tests/v1/core/test_contiguous_kv_packing.py   |   4 +-
+ tests/v1/core/test_kv_cache_utils.py          |   8 +-
+ tests/v1/executor/test_b12x_output.py         | 123 +---
+ tests/v1/executor/test_b12x_startup.py        |  15 +
+ tests/v1/worker/test_prepare_kernels.py       |   7 +-
+ vllm/config/load.py                           |   6 +-
+ .../model_executor/layers/logits_processor.py |   6 +-
+ .../layers/quantization/kimi_mxfp4_csf.py     |   2 +-
+ .../layers/quantization/mxfp4_csf.py          |  11 +-
+ .../layers/quantization/mxfp4_csf_moe.py}     |  72 +--
+ vllm/model_executor/model_loader/__init__.py  |   5 -
+ .../model_loader/b12x_loader.py               | 316 ---------
+ .../model_loader/direct_loader.py             |   5 +-
+ vllm/model_executor/warmup/b12x_prepare.py    |  42 +-
+ vllm/models/deepseek_v4/mxfp4_csf.py          |   2 +-
+ vllm/models/deepseek_v4_1/attention.py        |  22 +-
+ vllm/models/deepseek_v4_1/ced.py              |   6 +-
+ vllm/models/deepseek_v4_1/common/engram.py    |  16 +-
+ vllm/models/deepseek_v4_1/compressor.py       |   6 +-
+ vllm/models/deepseek_v4_1/nvidia/dspark.py    |   2 +-
+ .../deepseek_v4_1/nvidia/model_state.py       |   4 +-
+ vllm/models/deepseek_v4_1/sp_prefill.py       |   4 +-
+ vllm/models/deepseek_v4_1/sparse_mla.py       |  14 +-
+ .../deepseek_v4_1/tilelang/attention.py       |   4 +-
+ .../deepseek_v4_1/tilelang/engram_rows.py     |  14 +-
+ vllm/models/deepseek_v4_1/tilelang/prepare.py |   7 +
+ vllm/models/deepseek_v4_1/tilelang/vision.py  |   7 +-
+ vllm/utils/b12x.py                            |  17 +-
+ vllm/v1/executor/abstract.py                  |  28 +-
+ vllm/v1/worker/gpu_worker.py                  |  24 +-
+ 41 files changed, 361 insertions(+), 1452 deletions(-)
+ delete mode 100644 tests/model_executor/model_loader/test_b12x_loader.py
+ rename vllm/{models/deepseek_v4_1/mxfp4_csf.py => model_executor/layers/quantization/mxfp4_csf_moe.py} (72%)
+ delete mode 100644 vllm/model_executor/model_loader/b12x_loader.py
+
+diff --git a/docs/design/streaming_weight_loading.md b/docs/design/streaming_weight_loading.md
+index 8fb55df61..1d85ccfe1 100644
+--- a/docs/design/streaming_weight_loading.md
++++ b/docs/design/streaming_weight_loading.md
+@@ -1,5 +1,9 @@
+ # Proposal: bounded streaming weight loading
+ 
++In this tree the `b12x` load format and its adapter are gone: `--load-format
++direct` (`vllm/model_executor/model_loader/direct_loader.py`) is the bounce-ring
++path below, ported into vLLM. The rest of this proposal is kept as written.
++
+ Status: the C99 O_DIRECT transport and b12x vLLM adapter load ordinary
+ PyTorch CUDA tensors. The loader owns bounded I/O buffers and retains destination
+ references until completion. Models use their normal allocation paths.
+diff --git a/tests/kernels/test_deepseek_v41_engram_rows.py b/tests/kernels/test_deepseek_v41_engram_rows.py
+index 4ba32fb35..0fa6d38d1 100644
+--- a/tests/kernels/test_deepseek_v41_engram_rows.py
++++ b/tests/kernels/test_deepseek_v41_engram_rows.py
+@@ -1,6 +1,7 @@
+ # SPDX-License-Identifier: Apache-2.0
+ # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+-"""The Engram disk reader and its TileLang wait and gather: the old path's bits, fresh
++"""The Engram disk reader and its TileLang wait and gather, and a resident table's
++gather: the lookup reference's bits (B12X's lookup, in torch), fresh
+ rows on every step, other ranks' slots (rows or hash columns) never read, tables read in staging order, rows
+ that arrive while the main thread holds the GIL, and failures that name themselves (a
+ short read, a reader failure that stops the GPU at once, and a GPU wait that times
+@@ -96,13 +97,9 @@ def _step(rows, ids, live, early=None):
+     return out, num_tokens
+ 
+ 
+-def _same(a, b):
+-    return torch.equal(a.view(torch.int16).cpu(), b.view(torch.int16).cpu())
+-
+-
+ @pytest.mark.parametrize("columns", [ALL_COLUMNS, TP3_RANK1])
+ @pytest.mark.parametrize("shard", [(0, TABLE_ROWS), (1000, 3000)])
+-def test_gather_matches_b12x_lookup_bits(shard, columns):
++def test_gather_matches_lookup_reference_bits(shard, columns):
+     codes, scales, paths = _write_table(_table_dir())
+     start, end = shard
+     rows = _rows(paths, start, end, columns=columns)
+@@ -117,20 +114,38 @@ def test_gather_matches_b12x_lookup_bits(shard, columns):
+     out, num_tokens = _step(rows, ids, 13)
+     torch.testing.assert_close(out.cpu(), _reference(codes, scales, ids, 13, start, end, columns),
+                                rtol=0, atol=0, equal_nan=True)
+-    if columns != ALL_COLUMNS:
+-        rows.close()
+-        return  # b12x's lookup shards by rows only
+-    # The old path: b12x's Triton lookup over the same mapped buffers, compact rows.
+-    from b12x.sequence.engram._kernels import _lookup
+-
+-    old = torch.empty_like(out)
+-    _lookup[(16, HEADS)](rows.rows_e4m3, rows.scales.device_view, ids, num_tokens, old, 16,
+-                         T=16, ROWS=TABLE_ROWS, START=start, END=end, COMPACT=True,
+-                         RESIDENT_SCALES=False)
+-    assert _same(out, old)
+     rows.close()
+ 
+ 
++@pytest.mark.parametrize("live", [0, 1, 13, 16, 17, -1])
++@pytest.mark.parametrize("shard", [(0, TABLE_ROWS), (1000, 3000), (3000, 5099)])
++def test_resident_table_gather_matches_lookup_reference_bits(shard, live):
++    """A resident table's gather: its rank's row shard (the last rank's padded past the
++    table), every column, zeros past the live count and for every token when the count
++    is outside [0, tokens]."""
++    from vllm.models.deepseek_v4_1.tilelang.engram_rows import engram_table_gather
++
++    codes, scales, _ = _write_table(_table_dir(), seed=9)
++    start, end = shard
++    last = min(end, TABLE_ROWS)  # the table's rows this shard holds end here
++    table = torch.full((end - start, 256), 0x7F, dtype=torch.uint8)
++    shard_scales = torch.full((end - start, 8), 0xFF, dtype=torch.uint8)
++    table[: last - start] = codes[start:last]
++    shard_scales[: last - start] = scales[start:last]
++    gen = torch.Generator().manual_seed(2)
++    ids = torch.randint(-1, TABLE_ROWS + 1200, (16, HEADS), generator=gen)
++    ids[0, :3] = torch.tensor([1, 2, 3])  # the scale edge cases
++    ids[1, :4] = torch.tensor([start - 1, start, last - 1, last])
++    ids = ids.cuda()
++    out = torch.full((16, HEADS * 256), 7, dtype=torch.bfloat16, device="cuda")
++    num_tokens = torch.tensor([live], dtype=torch.int32, device="cuda")
++    weights = table.cuda().view(torch.float8_e4m3fn)
++    engram_table_gather(ids, num_tokens, weights, shard_scales.cuda(), out, start, last)
++    live_rows = live if 0 <= live <= 16 else 0
++    expected = _reference(codes, scales, ids, live_rows, start, last)
++    torch.testing.assert_close(out.cpu(), expected, rtol=0, atol=0, equal_nan=True)
++
++
+ def test_every_step_gets_its_own_rows():
+     codes, scales, paths = _write_table(_table_dir(), seed=3)
+     rows = _rows(paths, 512, 3600)
+diff --git a/tests/kernels/test_deepseek_v41_tilelang_metadata.py b/tests/kernels/test_deepseek_v41_tilelang_metadata.py
+index 9222f3c17..4455666ec 100644
+--- a/tests/kernels/test_deepseek_v41_tilelang_metadata.py
++++ b/tests/kernels/test_deepseek_v41_tilelang_metadata.py
+@@ -358,10 +358,10 @@ def test_decode_metadata_wide_tables(main_width, read_width, main_page):
+ 
+ @torch.inference_mode()
+ def test_metadata_refresh_preserves_padded_graph_domain_and_addresses():
+-    from vllm.models.deepseek_v4_1.sparse_mla import DeepseekV41B12xMetadataBuilder
++    from vllm.models.deepseek_v4_1.sparse_mla import DeepseekV41MetadataBuilder
+ 
+     device = torch.device("cuda", torch.accelerator.current_device_index())
+-    builder = DeepseekV41B12xMetadataBuilder.__new__(DeepseekV41B12xMetadataBuilder)
++    builder = DeepseekV41MetadataBuilder.__new__(DeepseekV41MetadataBuilder)
+     builder.tokens, builder.requests = 4096, 4
+     builder.page, builder.ratio, builder.circular = 128, 1, False
+     builder.reorder_batch_threshold = 6
+diff --git a/tests/model_executor/model_loader/test_b12x_loader.py b/tests/model_executor/model_loader/test_b12x_loader.py
+deleted file mode 100644
+index 1a5091bdb..000000000
+--- a/tests/model_executor/model_loader/test_b12x_loader.py
++++ /dev/null
+@@ -1,598 +0,0 @@
+-# SPDX-License-Identifier: Apache-2.0
+-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+-
+-"""The adapter preserves vLLM's indexed source selection and owned inputs."""
+-
+-import json
+-from contextlib import contextmanager
+-from types import SimpleNamespace
+-
+-import pytest
+-import torch
+-from safetensors.torch import save_file
+-
+-pytest.importorskip("b12x")
+-
+-from b12x.loader._checkpoint import DirectWeightSession
+-from b12x.loader._progress import CheckpointDisplay
+-
+-from vllm.config.load import LoadConfig
+-from vllm.model_executor.model_loader.b12x_loader import B12xModelLoader
+-from vllm.model_executor.model_loader.default_loader import DefaultModelLoader
+-
+-
+-@pytest.mark.parametrize("register_plugin", [False, True])
+-def test_load_format_selects_native_b12x_with_or_without_plugin(
+-    monkeypatch, register_plugin
+-):
+-    from vllm.model_executor import model_loader
+-
+-    monkeypatch.delenv("VLLM_PLUGINS", raising=False)
+-    monkeypatch.setattr(
+-        model_loader,
+-        "_LOAD_FORMAT_TO_MODEL_LOADER",
+-        dict(model_loader._LOAD_FORMAT_TO_MODEL_LOADER),
+-    )
+-    model_loader._LOAD_FORMAT_TO_MODEL_LOADER.pop("b12x", None)
+-    if register_plugin:
+-        # FlashInfer's B12X ships without the standalone vLLM plugin package.
+-        plugin = pytest.importorskip("b12x.integration.vllm.loader")
+-        plugin.register_b12x_loader()
+-    config = LoadConfig(
+-        load_format="b12x", model_loader_extra_config={"read_mode": "bounce"}
+-    )
+-    loader = model_loader.get_model_loader(config)
+-    assert isinstance(loader, B12xModelLoader)
+-    assert loader.read_mode == "bounce"
+-    assert config.load_format == "b12x"
+-
+-
+-def test_direct_loader_reports_missing_host_hooks_when_selected(monkeypatch):
+-    from vllm.model_executor.model_loader import weight_utils
+-
+-    monkeypatch.delattr(weight_utils, "file_source_tensor", raising=False)
+-    with pytest.raises(
+-        RuntimeError, match="requires vLLM file-source hooks.*file_source_tensor"
+-    ):
+-        B12xModelLoader(LoadConfig(load_format="b12x"))
+-
+-
+-@pytest.mark.parametrize("read_mode", ["gds", "bounce"])
+-@pytest.mark.parametrize("expandable", [False, True])
+-@pytest.mark.parametrize("fail_loading", [False, True])
+-def test_shared_loading_preserves_allocator_settings(
+-    monkeypatch, read_mode, expandable, fail_loading
+-):
+-    import vllm.model_executor.model_loader.b12x_loader as adapter
+-    from vllm.distributed import parallel_state
+-
+-    original = f"max_split_size_mb:64,expandable_segments:{expandable}"
+-    settings = [original]
+-    monkeypatch.setattr(
+-        torch._C, "_accelerator_getAllocatorSettings", lambda: settings[0]
+-    )
+-    monkeypatch.setattr(
+-        torch._C,
+-        "_accelerator_setAllocatorSettings",
+-        lambda value: settings.__setitem__(0, value),
+-    )
+-    monkeypatch.setattr(
+-        parallel_state, "get_tp_group", lambda: SimpleNamespace(cpu_group=object())
+-    )
+-    monkeypatch.setattr(adapter, "SharedReadGroup", lambda *_: object())
+-
+-    @contextmanager
+-    def session(*args, **kwargs):
+-        yield SimpleNamespace(stats=lambda: {"payload_bytes": 0})
+-
+-    monkeypatch.setattr(adapter, "DirectWeightSession", session)
+-
+-    def load(loader, *args):
+-        expected = original.replace("True", "False") if read_mode == "gds" else original
+-        assert settings[0] == expected
+-        if fail_loading:
+-            raise RuntimeError("checkpoint read failed")
+-        loader.counter_before_loading_weights = 1.0
+-        loader.counter_after_loading_weights = 2.0
+-        return torch.nn.Module()
+-
+-    monkeypatch.setattr(DefaultModelLoader, "load_model", load)
+-    loader = B12xModelLoader(
+-        LoadConfig(
+-            load_format="b12x",
+-            model_loader_extra_config={"read_mode": read_mode},
+-        )
+-    )
+-    config = SimpleNamespace(device_config=SimpleNamespace(device="cuda:0"))
+-    model_config = SimpleNamespace(enable_cumem_allocator=False)
+-    try:
+-        if fail_loading:
+-            with pytest.raises(RuntimeError, match="checkpoint read failed"):
+-                loader.load_model(config, model_config)
+-        else:
+-            loader.load_model(config, model_config)
+-    finally:
+-        assert settings[0] == original
+-
+-
+-def test_shared_gds_rejects_cumem_before_allocating_weights():
+-    loader = B12xModelLoader(
+-        LoadConfig(load_format="b12x", model_loader_extra_config={"read_mode": "gds"})
+-    )
+-    config = SimpleNamespace(device_config=SimpleNamespace(device="cuda:0"))
+-    with pytest.raises(ValueError, match="does not support the CuMem allocator"):
+-        loader.load_model(config, SimpleNamespace(enable_cumem_allocator=True))
+-
+-
+-@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA IPC")
+-def test_shared_weight_allocations_export_with_expandable_segments_enabled():
+-    from vllm.model_executor.model_loader.b12x_loader import _ipc_weight_allocations
+-
+-    original = torch._C._accelerator_getAllocatorSettings()
+-    configured = "max_split_size_mb:64,expandable_segments:True"
+-    try:
+-        torch._C._accelerator_setAllocatorSettings(configured)
+-        with DirectWeightSession(read_mode="gds") as session:
+-            native = session._gds
+-            executor = native.owner_create(
+-                session.device,
+-                session.io_threads,
+-                *(program.function for program in session._copy_programs),
+-            )
+-            try:
+-                with _ipc_weight_allocations():
+-                    assert torch._C._accelerator_getAllocatorSettings() == (
+-                        "max_split_size_mb:64,expandable_segments:False"
+-                    )
+-                    weights = torch.empty(32 << 20, dtype=torch.uint8, device="cuda")
+-                assert torch._C._accelerator_getAllocatorSettings() == configured
+-                base, size, handle = native.owner_export(
+-                    executor, weights.data_ptr(), weights.nbytes
+-                )
+-                assert base <= weights.data_ptr()
+-                assert weights.data_ptr() + weights.nbytes <= base + size
+-                assert len(handle) == 64
+-            finally:
+-                native.owner_close(executor)
+-    finally:
+-        torch._C._accelerator_setAllocatorSettings(original)
+-
+-
+-@pytest.mark.parametrize("show_progress", [True, False])
+-@pytest.mark.parametrize("read_mode", ["auto", "bounce"])
+-def test_draft_iterator_uses_index_and_retained_tensors_keep_their_bytes(
+-    tmp_path, capsys, show_progress, read_mode
+-):
+-    """Draft loading must not open unrelated target shards or reuse buffers."""
+-    save_file({"mtp.weight": torch.arange(16)}, tmp_path / "draft.safetensors")
+-    save_file({"mtp.bias": torch.arange(4) + 100}, tmp_path / "bias.safetensors")
+-    (tmp_path / "target.safetensors").write_bytes(b"must not be opened")
+-    (tmp_path / "model.safetensors.index.json").write_text(
+-        json.dumps(
+-            {
+-                "weight_map": {
+-                    "mtp.weight": "draft.safetensors",
+-                    "mtp.bias": "bias.safetensors",
+-                    "model.weight": "target.safetensors",
+-                }
+-            }
+-        )
+-    )
+-    config = LoadConfig(
+-        load_format="b12x",
+-        use_tqdm_on_load=show_progress,
+-        model_loader_extra_config={"read_mode": read_mode},
+-    )
+-    loader = B12xModelLoader(config)
+-    source = DefaultModelLoader.Source(
+-        str(tmp_path), revision=None, prefix="draft.", weight_name_prefixes=("mtp.",)
+-    )
+-    with (
+-        DirectWeightSession(read_mode=loader.read_mode) as session,
+-        CheckpointDisplay(enabled=show_progress) as display,
+-    ):
+-        loader._session = session
+-        loader._progress = display
+-        retained = dict(loader._get_weights_iterator(source))
+-        assert set(retained) == {"draft.mtp.weight", "draft.mtp.bias"}
+-        values = {}
+-        for name, descriptor in retained.items():
+-            values[name] = torch.empty_like(descriptor, device="cuda")
+-            assert session(values[name], descriptor)
+-        loader._session = None
+-        loader._progress = None
+-    torch.testing.assert_close(values["draft.mtp.weight"].cpu(), torch.arange(16))
+-    torch.testing.assert_close(values["draft.mtp.bias"].cpu(), torch.arange(4) + 100)
+-    assert config.load_format == "b12x"
+-    assert config.model_loader_extra_config == {"read_mode": read_mode}
+-    progress = capsys.readouterr().err
+-    if show_progress:
+-        assert "b12x routing checkpoint shards" in progress
+-        assert "2/2 shards routed" in progress
+-        assert "0.00 GB selected on rank 0" in progress
+-        assert "it/s" not in progress
+-    else:
+-        assert "shards routed" not in progress
+-
+-
+-def test_gdn_convolution_shards_read_into_final_parameter_slices(tmp_path):
+-    from vllm.model_executor.layers.mamba.mamba_mixer2 import (
+-        mamba_v2_sharded_weight_loader,
+-    )
+-    from vllm.model_executor.weight_transfer import weight_transfer
+-
+-    path = tmp_path / "conv.safetensors"
+-    checkpoint = torch.arange(20, dtype=torch.float32).reshape(10, 2)
+-    save_file({"conv.weight": checkpoint}, path)
+-    loader = mamba_v2_sharded_weight_loader(
+-        [(8, 0, 0), (4, 2, 1)], tp_size=2, tp_rank=1
+-    )
+-    with (
+-        DirectWeightSession() as session,
+-        weight_transfer(session),
+-    ):
+-        source = dict(session.weights([path]))["conv.weight"]
+-        target = torch.full((6, 2), -1.0, device="cuda")
+-        loader(target, source)
+-    torch.testing.assert_close(target.cpu(), checkpoint[4:])
+-
+-
+-def test_hyperconnection_weights_load_without_allocator_hooks(tmp_path, monkeypatch):
+-    """Loading the norm must preserve separate workspace contents."""
+-    from vllm.model_executor.weight_transfer import copy_weight, weight_transfer
+-    from vllm.models.qwen4_exp.nvidia.hyperconnection import (
+-        GroupedGemmaRMSNorm,
+-        HyperConnectionConfig,
+-        HyperConnectionWorkspace,
+-    )
+-
+-    monkeypatch.setattr(
+-        "vllm.models.qwen4_exp.nvidia.hyperconnection.get_tensor_model_parallel_world_size",
+-        lambda: 1,
+-    )
+-    expected = torch.arange(128, dtype=torch.bfloat16)
+-    path = tmp_path / "norm.safetensors"
+-    save_file({"weight": expected}, path)
+-    with (
+-        DirectWeightSession() as session,
+-        weight_transfer(session),
+-        torch.device("cuda"),
+-    ):
+-        norm = GroupedGemmaRMSNorm(128, eps=1e-6, group_size=32, dtype=expected.dtype)
+-        workspace = HyperConnectionWorkspace(
+-            HyperConnectionConfig(
+-                hc_count=4,
+-                hidden_size=32,
+-                params_dtype=expected.dtype,
+-                hc_lowrank=16,
+-                rms_norm_eps=1e-6,
+-                hc_per_branch_norm=True,
+-            ),
+-            8,
+-        )
+-        source = dict(session.weights([path]))["weight"]
+-        copy_weight(norm.weight, source)
+-    torch.testing.assert_close(norm.weight.cpu(), expected)
+-    for buffer in workspace.buffers():
+-        buffer.fill_(7)
+-    torch.accelerator.synchronize()
+-    torch.testing.assert_close(norm.weight.cpu(), expected)
+-
+-
+-@pytest.mark.skipif(not torch.accelerator.is_available(), reason="requires CUDA")
+-@pytest.mark.parametrize(
+-    "tp_size,rank", [(1, 0), (2, 0), (2, 1), (3, 0), (3, 1), (3, 2)]
+-)
+-def test_dflash_sink_shards_preserve_file_sources(tmp_path, monkeypatch, tp_size, rank):
+-    """Route per-head sinks into final parameters, including padded TP tails."""
+-    from vllm.model_executor.models import qwen3_dflash as dflash
+-    from vllm.model_executor.weight_transfer import weight_transfer
+-
+-    monkeypatch.setattr(dflash, "get_tensor_model_parallel_world_size", lambda: tp_size)
+-    monkeypatch.setattr(dflash, "get_tensor_model_parallel_rank", lambda: rank)
+-    monkeypatch.setenv("VLLM_DFLASH_COMPACT_ROPE", "0")
+-    for name in (
+-        "QKVParallelLinear",
+-        "RowParallelLinear",
+-        "DFlashAttention",
+-        "RMSNorm",
+-        "get_rope",
+-    ):
+-        monkeypatch.setattr(dflash, name, lambda *args, **kwargs: torch.nn.Identity())
+-    heads = 8
+-    padded_heads = ((heads + tp_size - 1) // tp_size) * tp_size
+-    expected = torch.arange(heads, dtype=torch.float32) / 4
+-    name = "layers.0.self_attn.attention_sink_bias"
+-    path = tmp_path / "dflash-sinks.safetensors"
+-    save_file({name: expected}, path)
+-    model = dflash.DFlashQwen3Model.__new__(dflash.DFlashQwen3Model)
+-    torch.nn.Module.__init__(model)
+-    model.config = SimpleNamespace(num_attention_heads=padded_heads)
+-    model.layers = torch.nn.ModuleList([torch.nn.Module()])
+-    with (
+-        DirectWeightSession() as session,
+-        weight_transfer(session),
+-        torch.device("cuda"),
+-    ):
+-        model.layers[0].self_attn = dflash.DFlashQwen3Attention(
+-            hidden_size=padded_heads * 16,
+-            num_heads=padded_heads,
+-            num_kv_heads=1,
+-            head_dim=16,
+-            rope_parameters={},
+-            add_swa_attention_sink_bias=True,
+-        )
+-        assert model.load_weights(session.weights([path])) == {name}
+-    width = padded_heads // tp_size
+-    padded = torch.nn.functional.pad(expected, (0, padded_heads - heads))
+-    torch.testing.assert_close(
+-        model.layers[0].self_attn.attention_sink_bias.cpu(),
+-        padded[rank * width : (rank + 1) * width],
+-    )
+-
+-
+-@pytest.mark.parametrize("scale_first", [False, True])
+-@pytest.mark.parametrize("quantization", ["mxfp8", "block_fp8"])
+-def test_glm_attention_dequantization_reads_owned_checkpoint_inputs(
+-    tmp_path, scale_first, quantization
+-):
+-    """Numerical projection transforms must consume payloads, not meta views."""
+-    from vllm.model_executor.model_loader.weight_utils import default_weight_loader
+-    from vllm.model_executor.weight_transfer import weight_transfer
+-    from vllm.models.glm5next.nvidia.model import Glm5NextModel
+-
+-    prefix = "layers.3.self_attn"
+-    if quantization == "mxfp8":
+-        projection = target = "indexer.weights_proj"
+-        scale_name = "weight_scale"
+-        scale = torch.full((1, 1), 128, dtype=torch.uint8)
+-    else:
+-        projection, target = "q_a_proj", "fused_qkv_a_proj"
+-        scale_name = "weight_scale_inv"
+-        scale = torch.full((1, 1), 2.0, dtype=torch.float32)
+-    parameter_name = f"{prefix}.{target}.weight"
+-    weight = torch.arange(32).reshape(1, 32).to(torch.float8_e4m3fn)
+-    expected = weight.float() * 2
+-    path = tmp_path / "attention.safetensors"
+-    save_file(
+-        {
+-            f"{prefix}.{projection}.weight": weight,
+-            f"{prefix}.{projection}.{scale_name}": scale,
+-        },
+-        path,
+-    )
+-
+-    class Projection(torch.nn.Module):
+-        config = SimpleNamespace(
+-            is_moe=False, is_linear_attn=True, mla_nope=False, qk_rope_head_dim=0
+-        )
+-
+-        def named_parameters(self):
+-            return iter([(parameter_name, param)])
+-
+-    with (
+-        DirectWeightSession() as session,
+-        weight_transfer(session),
+-    ):
+-        param = torch.nn.Parameter(
+-            torch.empty((1, 32), dtype=torch.float32, device="cuda")
+-        )
+-        param.weight_loader = lambda p, value, shard_id=None: default_weight_loader(
+-            p, value
+-        )
+-        sources = sorted(
+-            session.weights([path]),
+-            key=lambda pair: pair[0].endswith(".weight") == scale_first,
+-        )
+-        loaded = Glm5NextModel.load_weights(Projection(), iter(sources))
+-        assert loaded == {parameter_name}
+-    torch.testing.assert_close(param.cpu(), expected)
+-
+-
+-@pytest.mark.parametrize("rank", [0, 1])
+-def test_kda_convolution_loads_each_tp_shard_into_fused_weights(tmp_path, rank):
+-    from vllm.model_executor.layers.mamba.gdn.kimi_gdn_linear_attn import (
+-        _make_fused_conv1d_weight_loader,
+-    )
+-    from vllm.model_executor.weight_transfer import weight_transfer
+-
+-    path = tmp_path / "kda.safetensors"
+-    weights = {
+-        name: (torch.arange(32).reshape(8, 1, 4) + i * 64).to(torch.bfloat16)
+-        for i, name in enumerate(("q", "k", "v"))
+-    }
+-    save_file(weights, path)
+-    with (
+-        DirectWeightSession() as session,
+-        weight_transfer(session),
+-    ):
+-        param = torch.empty((12, 1, 4), device="cuda")
+-        loader = _make_fused_conv1d_weight_loader([8, 8, 8], 2, rank)
+-        sources = dict(session.weights([path]))
+-        for i, name in enumerate(("q", "k", "v")):
+-            loader(param, sources[name], i)
+-    expected = torch.cat([weights[name][rank * 4 : (rank + 1) * 4] for name in weights])
+-    torch.testing.assert_close(param.cpu(), expected.float())
+-
+-
+-@pytest.mark.parametrize(
+-    "tp_size,rank", [(tp, rank) for tp in (2, 4) for rank in range(tp)]
+-)
+-def test_deepseek_sink_shards_are_flushed_before_derived_weights(
+-    tmp_path, monkeypatch, tp_size, rank
+-):
+-    """Padded sinks keep -inf and model post-load hooks consume completed reads."""
+-    from vllm.model_executor.weight_transfer import weight_transfer
+-    from vllm.models.deepseek_v4.nvidia import model as ds4
+-
+-    monkeypatch.setattr(ds4, "get_tensor_model_parallel_world_size", lambda: tp_size)
+-    monkeypatch.setattr(ds4, "get_tensor_model_parallel_rank", lambda: rank)
+-    expected = torch.arange(64, dtype=torch.float32) / 4
+-    path = tmp_path / "sinks.safetensors"
+-    name = "layers.0.attn.attn_sink"
+-    save_file({name: expected}, path)
+-
+-    class Model(torch.nn.Module):
+-        config = SimpleNamespace(num_attention_heads=64)
+-        quant_config = None
+-        use_sequence_parallel = False
+-
+-        def __init__(self):
+-            super().__init__()
+-            self.sink = torch.nn.Parameter(
+-                torch.full((64,), -torch.inf, device="cuda"),
+-                requires_grad=False,
+-            )
+-            self.derived = None
+-
+-        def named_parameters(self):
+-            return iter([(name, self.sink)])
+-
+-        def get_expert_mapping(self):
+-            return []
+-
+-        def finalize_mega_moe_weights(self):
+-            pass
+-
+-        def finalize_mhc_broadcast_weights(self):
+-            self.derived = self.sink[: 64 // tp_size] * 2
+-
+-        def process_b12x_weights_after_loading(self):
+-            pass
+-
+-    with (
+-        DirectWeightSession() as session,
+-        weight_transfer(session),
+-    ):
+-        model = Model()
+-        assert ds4.DeepseekV4Model.load_weights(model, session.weights([path])) == {
+-            name
+-        }
+-        ds4.DeepseekV4ForCausalLM.process_weights_after_loading(
+-            SimpleNamespace(model=model)
+-        )
+-    width = 64 // tp_size
+-    assert model.derived is not None
+-    torch.testing.assert_close(
+-        model.derived.cpu(), expected[rank * width : (rank + 1) * width] * 2
+-    )
+-    assert torch.isneginf(model.sink[width:]).all()
+-
+-
+-@pytest.mark.parametrize("scale_first", [False, True])
+-def test_dsa_indexer_dequantization_owns_inputs_across_checkpoint_shards(
+-    tmp_path, scale_first
+-):
+-    """Full GLM's fused WK projection reads real FP8 values before dequantizing."""
+-    from vllm.model_executor.model_loader.weight_utils import default_weight_loader
+-    from vllm.model_executor.models.deepseek_v2 import _try_load_fp8_indexer_wk
+-    from vllm.model_executor.weight_transfer import weight_transfer
+-
+-    prefix = "layers.0.self_attn.indexer"
+-    weight = (torch.arange(128 * 256).reshape(128, 256) % 64).to(torch.float8_e4m3fn)
+-    scale = torch.tensor([[0.5, 2.0]])
+-    paths = [tmp_path / "weight.safetensors", tmp_path / "scale.safetensors"]
+-    save_file({f"{prefix}.wk.weight": weight}, paths[0])
+-    save_file({f"{prefix}.wk.weight_scale_inv": scale}, paths[1])
+-    if scale_first:
+-        paths.reverse()
+-    with (
+-        DirectWeightSession() as session,
+-        weight_transfer(session),
+-    ):
+-        param = torch.nn.Parameter(
+-            torch.zeros((160, 256), device="cuda", dtype=torch.bfloat16),
+-            requires_grad=False,
+-        )
+-        param.weight_loader = lambda p, value, shard_id: default_weight_loader(
+-            p[:128], value
+-        )
+-        name = f"{prefix}.wk_weights_proj.weight"
+-        pending: dict[str, dict[str, torch.Tensor]] = {}
+-        loaded: set[str] = set()
+-        for source_name, source in session.weights(paths):
+-            assert _try_load_fp8_indexer_wk(
+-                source_name, source, pending, {name: param}, loaded, []
+-            )
+-        assert not pending
+-        assert loaded == {name}
+-    expected = (weight.float() * scale.repeat_interleave(128, dim=1)).bfloat16()
+-    torch.testing.assert_close(param[:128].cpu(), expected, rtol=0, atol=0)
+-    assert torch.count_nonzero(param[128:]) == 0
+-
+-
+-def test_dspark_markov_embedding_reads_checkpoint_into_weight_storage(
+-    tmp_path, monkeypatch
+-):
+-    """A plain nn.Embedding loads without allocation hooks."""
+-    from vllm import envs
+-    from vllm.model_executor.model_loader.weight_utils import default_weight_loader
+-    from vllm.model_executor.models.qwen3_dspark import DSparkMarkovHead
+-    from vllm.model_executor.weight_transfer import weight_transfer
+-
+-    monkeypatch.setattr(envs, "VLLM_MXFP8_LM_HEAD", False)
+-    expected = torch.arange(128 * 8, dtype=torch.float32).reshape(128, 8)
+-    path = tmp_path / "markov.safetensors"
+-    save_file({"markov_w1.weight": expected}, path)
+-    with (
+-        DirectWeightSession() as session,
+-        weight_transfer(session),
+-        torch.device("cuda"),
+-    ):
+-        head = DSparkMarkovHead(128, 128, 8, prefix="markov_head")
+-        source = dict(session.weights([path]))["markov_w1.weight"]
+-        default_weight_loader(head.markov_w1.weight, source)
+-        session.flush()
+-        result = head.embed(torch.tensor([0, 17, 127]))
+-    torch.testing.assert_close(result.cpu(), expected[[0, 17, 127]])
+-
+-
+-def test_glm_mtp_projection_loads_from_main_shard_without_sharing_runtime_buffers(
+-    tmp_path, monkeypatch
+-):
+-    """MTP's plain Linear loads without a target-model allocation scope."""
+-    from vllm.config import VllmConfig, set_current_vllm_config
+-    from vllm.model_executor.model_loader.weight_utils import default_weight_loader
+-    from vllm.model_executor.weight_transfer import weight_transfer
+-    from vllm.models.glm5next.nvidia import mtp
+-
+-    class Decoder(torch.nn.Module):
+-        def __init__(self, **kwargs):
+-            super().__init__()
+-            self.topk_indices_buffer = kwargs["topk_indices_buffer"]
+-            self.pool_topk_indices_buffer = kwargs["pool_topk_indices_buffer"]
+-
+-    monkeypatch.setattr(mtp, "Glm5NextDecoderLayer", Decoder)
+-    monkeypatch.setattr(mtp, "SharedHead", lambda **kwargs: torch.nn.Identity())
+-    config = SimpleNamespace(
+-        hidden_size=8, rms_norm_eps=1e-6, index_topk=16, index_kpool=4
+-    )
+-    vllm_config = SimpleNamespace(
+-        speculative_config=SimpleNamespace(
+-            draft_model_config=SimpleNamespace(hf_config=config)
+-        ),
+-        quant_config=None,
+-        scheduler_config=SimpleNamespace(max_num_batched_tokens=4),
+-    )
+-    name = "model.language_model.layers.45.eh_proj.weight"
+-    expected = torch.arange(128, dtype=torch.float32).reshape(8, 16)
+-    path = tmp_path / "model-00001-of-00001.safetensors"
+-    save_file(
+-        {name: expected, "model.language_model.layers.0.weight": torch.ones(8)}, path
+-    )
+-    with (
+-        set_current_vllm_config(VllmConfig()),
+-        DirectWeightSession() as session,
+-        weight_transfer(session),
+-        torch.device("cuda"),
+-    ):
+-        layer = mtp.Glm5NextMultiTokenPredictorLayer(vllm_config, "model.layers.45")
+-        source = dict(
+-            session.weights([path], prefixes=("model.language_model.layers.45.",))
+-        )
+-        assert set(source) == {name}
+-        default_weight_loader(layer.eh_proj.weight, source[name])
+-        session.flush()
+-        result = layer.eh_proj(torch.ones(1, 16))
+-    torch.testing.assert_close(layer.eh_proj.weight.cpu(), expected)
+-    torch.testing.assert_close(result.cpu(), expected.sum(dim=1).unsqueeze(0))
+diff --git a/tests/model_executor/test_b12x_warmup.py b/tests/model_executor/test_b12x_warmup.py
+index 7f8c83be3..c75fc95d8 100644
+--- a/tests/model_executor/test_b12x_warmup.py
++++ b/tests/model_executor/test_b12x_warmup.py
+@@ -642,6 +642,7 @@ def test_blockscaled_holder_declares_provided_workspace_under_the_cap(
+ def test_profile_prepares_collectives_and_releases_only_fresh_plans(
+     monkeypatch, fail
+ ) -> None:
++    pytest.importorskip("b12x")
+     from b12x.preparation import CollectiveRequirement
+ 
+     from vllm.distributed import parallel_state
+@@ -862,6 +863,7 @@ def test_provider_attachment_never_registers_a_child_module() -> None:
+ def test_declaration_dump_flattens_metadata_and_never_raises(
+     tmp_path, monkeypatch
+ ) -> None:
++    pytest.importorskip("b12x")
+     from b12x.preparation import FrozenMapping
+ 
+     path = tmp_path / "queries.jsonl"
+diff --git a/tests/models/test_deepseek_v4_1_compressor.py b/tests/models/test_deepseek_v4_1_compressor.py
+index 5fabb558c..c84b2ab06 100644
+--- a/tests/models/test_deepseek_v4_1_compressor.py
++++ b/tests/models/test_deepseek_v4_1_compressor.py
+@@ -95,7 +95,7 @@ def test_compressor_ring_writes_follow_the_worker_slot_mapping():
+         pytest.skip("DeepSeek-V4.1 metadata kernels require SM12x")
+ 
+     from vllm.models.deepseek_v4_1.compressor import CompressorStateCache
+-    from vllm.models.deepseek_v4_1.sparse_mla import DeepseekV41B12xMetadataBuilder
++    from vllm.models.deepseek_v4_1.sparse_mla import DeepseekV41MetadataBuilder
+     from vllm.v1.kv_cache_interface import MLAAttentionSpec
+     from vllm.v1.worker.gpu.block_table import BlockTables, slot_mapping_mode
+ 
+@@ -153,7 +153,7 @@ def test_compressor_ring_writes_follow_the_worker_slot_mapping():
+         max_query_len=8,
+         max_seq_len=48,
+     )
+-    builder = DeepseekV41B12xMetadataBuilder(ring, ["layer"], config, device)
++    builder = DeepseekV41MetadataBuilder(ring, ["layer"], config, device)
+     state = builder.build(0, cm)
+     torch.accelerator.synchronize()
+ 
+@@ -173,7 +173,7 @@ def compressor_runners(monkeypatch):
+     from vllm.model_executor.layers import linear
+     from vllm.models.deepseek_v4_1.compressor import DeepseekCompressor
+     from vllm.models.deepseek_v4_1.sparse_mla import (
+-        DeepseekV41B12xMetadataBuilder,
++        DeepseekV41MetadataBuilder,
+     )
+     from vllm.v1.kv_cache_interface import MLAAttentionSpec
+ 
+@@ -232,7 +232,7 @@ def compressor_runners(monkeypatch):
+                 tokens_per_state=2,
+             )
+             self.builders = [
+-                DeepseekV41B12xMetadataBuilder(spec, [name], config, device)
++                DeepseekV41MetadataBuilder(spec, [name], config, device)
+                 for spec in (main_spec, self.spec)
+             ]
+             self.graph = None
+diff --git a/tests/models/test_deepseek_v4_1_engram.py b/tests/models/test_deepseek_v4_1_engram.py
+index 694288812..65c8554ab 100644
+--- a/tests/models/test_deepseek_v4_1_engram.py
++++ b/tests/models/test_deepseek_v4_1_engram.py
+@@ -13,8 +13,6 @@ from types import SimpleNamespace
+ import numpy as np
+ import pytest
+ import torch
+-from b12x._lib.runtime_control import kernel_resolution_guard
+-from b12x.preparation import PreparationSession
+ from safetensors.torch import save_file
+ from torch import nn
+ 
+@@ -40,7 +38,6 @@ from vllm.models.deepseek_v4_1.nvidia.vl_model import (
+     DeepseekV41ForCausalLM,
+     _make_deepseek_v4_vl_weights_mapper,
+ )
+-from vllm.utils.b12x import B12xWorkload
+ from vllm.v1.worker.gpu.model_states.default import DefaultModelState
+ from vllm.v1.worker.workspace import collect_cuda_graph_capture_resources
+ 
+@@ -49,9 +46,22 @@ from vllm.v1.worker.workspace import collect_cuda_graph_capture_resources
+ HIDDEN = 1024
+ 
+ 
++@contextmanager
++def _frozen_kernels(reason):
++    """Refuse every TileLang kernel not yet compiled, as serving does after kernel
++    preparation (capture compiles nothing)."""
++    from tilelang.cache import freeze, thaw
++
++    freeze(reason)
++    try:
++        yield
++    finally:
++        thaw()
++
++
+ @pytest.fixture
+ def tiny_engram_checkpoint(tmp_path, dist_init):
+-    """Real target modules and native plans, omitting unrelated attention/MoE."""
++    """Real target modules, omitting unrelated attention/MoE."""
+     # Both global row counts leave two padded rows on the final TP4 shard.
+     geometry = native.build_geometry(base_table_size=19, compressed_vocab_size=32)
+     caps = tuple(
+@@ -97,13 +107,11 @@ def tiny_engram_checkpoint(tmp_path, dist_init):
+         weights.update(layer_weights)
+ 
+     def make_model(memory, *, tp_size=1, tp_rank=0):
+-        session = PreparationSession(device=torch.device("cuda"), autotune=False)
+         local_caps = tuple(
+             replace(cap, tp_size=tp_size, tp_rank=tp_rank) for cap in caps
+         )
+         layout = SimpleNamespace(
+             caps=local_caps,
+-            lookup_plans=(None,) * len(local_caps),
+             layer_ids=geometry.layer_ids,
+             geometry=geometry,
+             token_map=list(range(32)),
+@@ -156,7 +164,7 @@ def tiny_engram_checkpoint(tmp_path, dist_init):
+         root.hf_to_vllm_mapper = _make_deepseek_v4_vl_weights_mapper(
+             "fp4", "weight_scale_inv"
+         )
+-        return root, target, session
++        return root, target
+ 
+     return make_model, weights, paths
+ 
+@@ -181,26 +189,11 @@ def _load_checkpoint(root, directory, load_format="safetensors"):
+         return loaded
+ 
+ 
+-def _prepare_engram(session, target):
+-    workload = B12xWorkload(
+-        stage="state",
+-        token_counts=(8,),
+-        fixed_token_counts=(),
+-        output_dtype=torch.bfloat16,
+-        max_tokens=8,
+-        max_seqs=2,
+-        max_model_len=8,
+-    )
+-    # Only resident tables prepare a B12X lookup; the hash and gate are TileLang's.
+-    units = [
+-        unit
+-        for engram in _engrams(target)
+-        for unit in engram.get_b12x_preparation_units(engram, workload)
+-    ]
+-    requests = tuple(request for unit in units for request in unit.requests)
+-    result = session.prepare(requests, autotune=False)
+-    assert result is not None
+-    return result
++def _prepare_engram(target):
++    """Declare every table's TileLang row kernels (outside a runner they compile now):
++    a disk table's step kernel, a resident table's gather."""
++    for engram in _engrams(target):
++        engram.embed_tokens.declare_kernels()
+ 
+ 
+ @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+@@ -217,7 +210,7 @@ def test_engram_descriptor_loading_preserves_ordinary_weights(
+ ):
+     """Raw table entries never reach payload readers or placeholder parameters."""
+     make_model, weights, _ = tiny_engram_checkpoint
+-    root, target, session = make_model(table_memory)
++    root, target = make_model(table_memory)
+     real_open = weight_utils.safe_open
+ 
+     @contextmanager
+@@ -240,7 +233,7 @@ def test_engram_descriptor_loading_preserves_ordinary_weights(
+     monkeypatch.setattr(weight_utils, "safe_open", guarded_open)
+     monkeypatch.setattr(default_loader, f"{load_format}_weights_iterator", forbid_bulk)
+     _load_checkpoint(root, tmp_path, load_format)
+-    _prepare_engram(session, target)
++    _prepare_engram(target)
+     for layer_id, engram in zip(target.engram_layout.layer_ids, _engrams(target)):
+         for name in ("q_weight", "k_weight", "wkv.weight"):
+             actual = engram.get_parameter(name)
+@@ -256,7 +249,7 @@ def test_engram_descriptor_loading_preserves_ordinary_weights(
+             engram.stage_rows(4, torch.cuda.current_stream())
+             engram.embed_tokens.gather_rows(engram.staged_rows)
+         else:
+-            engram.embed_tokens.lookup_native(indices[:3], engram.staged_rows)
++            engram.embed_tokens.lookup(indices[:3], engram.staged_rows)
+         table = weights[f"layers.{layer_id}.engram.embed.weight"].float()
+         expected = table[:24] * torch.pow(2.0, torch.arange(-3, 5)).repeat_interleave(
+             32
+@@ -268,7 +261,6 @@ def test_engram_descriptor_loading_preserves_ordinary_weights(
+             atol=0,
+         )
+         assert torch.count_nonzero(engram.staged_rows[3:]) == 0
+-    session.close()
+ 
+ 
+ @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+@@ -281,9 +273,9 @@ def test_ram_engram_checkpoint_tp4_graph_reads_live_host_aliases(
+     from cuda.bindings import runtime as cudart
+ 
+     make_model, weights, paths = tiny_engram_checkpoint
+-    root, target, session = make_model("ram", tp_size=4, tp_rank=tp_rank)
++    root, target = make_model("ram", tp_size=4, tp_rank=tp_rank)
+     _load_checkpoint(root, tmp_path)
+-    _prepare_engram(session, target)
++    _prepare_engram(target)
+     embedding = _engrams(target)[0].embed_tokens
+     caps = embedding.caps
+     shard_rows = embedding.shard_rows
+@@ -362,18 +354,17 @@ def test_ram_engram_checkpoint_tp4_graph_reads_live_host_aliases(
+     stream.wait_stream(torch.cuda.current_stream())
+     graph = torch.cuda.CUDAGraph()
+     resources = []
+-    with kernel_resolution_guard("RAM Engram graph replay"):
++    with _frozen_kernels("RAM Engram graph replay"):
+         try:
+             with torch.cuda.stream(stream):
+-                embedding.lookup_native(ids, out)
++                embedding.lookup(ids, out)
+                 stream.synchronize()
+                 torch.testing.assert_close(out.cpu(), expected_output(), rtol=0, atol=0)
+                 with (
+                     collect_cuda_graph_capture_resources() as resources,
+-                    session.capture(),
+                     torch.cuda.graph(graph, stream=stream),
+                 ):
+-                    embedding.lookup_native(ids, out)
++                    embedding.lookup(ids, out)
+                 # No checkpoint file or model reference is needed after capture.
+                 # Only the graph resource collector may retain the mapped owners.
+                 del embedding, target, root
+@@ -404,7 +395,6 @@ def test_ram_engram_checkpoint_tp4_graph_reads_live_host_aliases(
+             stream.synchronize()
+             graph.reset()
+             resources.clear()
+-            session.close()
+ 
+ 
+ def _settled_reader_stats(model, timeout_s: float = 30.0) -> list[dict]:
+@@ -436,15 +426,15 @@ def test_disk_engram_preparation_refreshes_graph_and_rejects_stale_rows(
+         "EngramDiskRows",
+         functools.partial(engram_module.EngramDiskRows, cache_rows=0),
+     )
+-    root, target, session = make_model("disk")
+-    resident_root, resident, resident_session = make_model("device")
++    root, target = make_model("disk")
++    resident_root, resident = make_model("device")
+     _load_checkpoint(root, tmp_path)
+     with torch.no_grad():
+         resident_root.load_weights(weights.items())
+         for engram in (*_engrams(target), *_engrams(resident)):
+             engram.process_weights_after_loading()
+-    _prepare_engram(session, target)
+-    _prepare_engram(resident_session, resident)
++    _prepare_engram(target)
++    _prepare_engram(resident)
+ 
+     state = DeepseekV41ModelState.__new__(DeepseekV41ModelState)
+     state.steering, state.steered_requests = None, None
+@@ -580,8 +570,6 @@ def test_disk_engram_preparation_refreshes_graph_and_rejects_stale_rows(
+         with pytest.raises(RuntimeError, match="not prepared"):
+             consume()
+     torch.cuda.current_stream().wait_stream(stream)
+-    session.close()
+-    resident_session.close()
+ 
+ 
+ @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+@@ -595,15 +583,15 @@ def test_disk_engram_rows_the_host_hashed_equal_the_gpu_rows(
+     an image token in its history) and a decode-only step."""
+     monkeypatch.setattr(engram_module, "ENGRAM_CHECK_EARLY_IDS", True)
+     make_model, weights, paths = tiny_engram_checkpoint
+-    root, target, session = make_model("disk")
+-    resident_root, resident, resident_session = make_model("device")
++    root, target = make_model("disk")
++    resident_root, resident = make_model("device")
+     _load_checkpoint(root, tmp_path)
+     with torch.no_grad():
+         resident_root.load_weights(weights.items())
+         for engram in (*_engrams(target), *_engrams(resident)):
+             engram.process_weights_after_loading()
+-    _prepare_engram(session, target)
+-    _prepare_engram(resident_session, resident)
++    _prepare_engram(target)
++    _prepare_engram(resident)
+     for engram in _engrams(target):
+         assert engram.embed_tokens.disk_rows.check_early
+ 
+@@ -688,8 +676,6 @@ def test_disk_engram_rows_the_host_hashed_equal_the_gpu_rows(
+                 engram.prepare_embeddings(hashes[:, index])
+                 expected = engram(hidden, hashes[:, index], ids)
+                 torch.testing.assert_close(actual[index], expected, rtol=0, atol=0)
+-    session.close()
+-    resident_session.close()
+ 
+ 
+ def test_dspark_checkpoint_filter_does_not_read_target_engram(tmp_path, monkeypatch):
+@@ -823,7 +809,6 @@ def test_engram_graphs_gate_text_rows_and_pass_the_image_sentinel_rows(dist_init
+     )
+     layout = SimpleNamespace(
+         caps=(caps,),
+-        lookup_plans=(None,),
+         geometry=geometry,
+         table_memory="device",
+         projection_tp=False,
+@@ -842,20 +827,7 @@ def test_engram_graphs_gate_text_rows_and_pass_the_image_sentinel_rows(dist_init
+     module.embed_tokens.weight.fill_(2)
+     module.embed_tokens.weight_scale_inv.fill_(127)
+     module.process_weights_after_loading()
+-    workload = B12xWorkload(
+-        stage="weights",
+-        token_counts=(1, capacity),
+-        fixed_token_counts=(1,),
+-        output_dtype=torch.bfloat16,
+-        max_tokens=capacity,
+-        max_seqs=2,
+-        max_model_len=8,
+-    )
+-    requests = tuple(
+-        request
+-        for unit in module.get_b12x_preparation_units(module, workload)
+-        for request in unit.requests
+-    )
++    module.embed_tokens.declare_kernels()
+     ids = torch.arange(24, device=device).expand(capacity, -1).contiguous()
+     residual = torch.randn(
+         (capacity, streams, hidden),
+@@ -885,50 +857,43 @@ def test_engram_graphs_gate_text_rows_and_pass_the_image_sentinel_rows(dist_init
+             gate.masked_fill_(~token_mask[:, None], 0)
+         return (source + gate[..., None] * value[:, None]).bfloat16()
+ 
+-    with PreparationSession(
+-        device=device, autotune=False, compile_workers=2
+-    ) as session:
+-        session.prepare(requests)
+-        session.freeze()
+-        module.prepare_embeddings(ids)
+-        for rows in (1, capacity):
+-            for with_images in (False, True):
+-                token_mask = mask[:rows] if with_images else None
++    module.prepare_embeddings(ids)
++    for rows in (1, capacity):
++        for with_images in (False, True):
++            token_mask = mask[:rows] if with_images else None
++            fill_ids(with_images)
++            module(residual[:rows], ids[:rows], token_ids[:rows])
++            graph = torch.cuda.CUDAGraph()
++            try:
++                with _frozen_kernels("Engram graph capture"), torch.cuda.graph(graph):
++                    actual = module(residual[:rows], ids[:rows], token_ids[:rows])
++                pointer = actual.data_ptr()
++                allocated = torch.cuda.memory_allocated(device)
++                residual.mul_(-0.5)
++                module.staged_rows.mul_(0.75)
++                mask.logical_not_()
+                 fill_ids(with_images)
+-                module(residual[:rows], ids[:rows], token_ids[:rows])
+-                graph = torch.cuda.CUDAGraph()
+-                try:
+-                    with session.capture(), torch.cuda.graph(graph):
+-                        actual = module(residual[:rows], ids[:rows], token_ids[:rows])
+-                    pointer = actual.data_ptr()
+-                    allocated = torch.cuda.memory_allocated(device)
+-                    residual.mul_(-0.5)
+-                    module.staged_rows.mul_(0.75)
+-                    mask.logical_not_()
+-                    fill_ids(with_images)
+-                    actual.fill_(float("nan"))
+-                    graph.replay()
+-                    torch.cuda.synchronize(device)
+-                    assert torch.cuda.memory_allocated(device) == allocated
+-                    assert actual.data_ptr() == pointer
+-                    assert (
+-                        torch.isfinite(actual).all() and torch.count_nonzero(actual) > 0
+-                    )
++                actual.fill_(float("nan"))
++                graph.replay()
++                torch.cuda.synchronize(device)
++                assert torch.cuda.memory_allocated(device) == allocated
++                assert actual.data_ptr() == pointer
++                assert torch.isfinite(actual).all() and torch.count_nonzero(actual) > 0
++                torch.testing.assert_close(
++                    actual,
++                    reference(rows, token_mask),
++                    rtol=1e-2,
++                    atol=1e-2,
++                )
++                if token_mask is not None:
+                     torch.testing.assert_close(
+-                        actual,
+-                        reference(rows, token_mask),
+-                        rtol=1e-2,
+-                        atol=1e-2,
++                        actual[~token_mask],
++                        residual[:rows][~token_mask],
++                        rtol=0,
++                        atol=0,
+                     )
+-                    if token_mask is not None:
+-                        torch.testing.assert_close(
+-                            actual[~token_mask],
+-                            residual[:rows][~token_mask],
+-                            rtol=0,
+-                            atol=0,
+-                        )
+-                finally:
+-                    graph.reset()
++            finally:
++                graph.reset()
+ 
+ 
+ @pytest.mark.parametrize("num_layers", [1, 3])
+@@ -1030,7 +995,6 @@ def test_disk_engram_shares_staged_rows_and_skips_throwaway_hash_buffers(monkeyp
+     config = SimpleNamespace(hidden_size=64, hc_mult=4, rms_norm_eps=1e-3)
+     disk_layout = SimpleNamespace(
+         caps=(caps, caps_next),
+-        lookup_plans=(None, None),
+         geometry=geometry,
+         table_memory="disk",
+         projection_tp=False,
+@@ -1050,10 +1014,12 @@ def test_disk_engram_shares_staged_rows_and_skips_throwaway_hash_buffers(monkeyp
+ @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+ @pytest.mark.parametrize("tp_rank", [0, 3])
+ @torch.inference_mode()
+-def test_disk_rows_read_whole_table_sources(tmp_path, dist_init, tp_rank):
++def test_disk_rows_read_whole_table_sources(tmp_path, dist_init, monkeypatch, tp_rank):
+     """Each rank reads its shard (its hash columns) of the global tables from unaligned
+-    file offsets, and other ranks' columns gather as zeros; disk tables prepare no B12X
+-    lookup."""
++    file offsets, and other ranks' columns gather as zeros; a disk table declares only
++    its reader's step kernel, no resident gather."""
++    from vllm.models.deepseek_v4_1.tilelang import engram_rows, prepare
++
+     device = torch.device("cuda", torch.cuda.current_device())
+     capacity = 7
+     geometry = native.build_geometry(base_table_size=19, compressed_vocab_size=32)
+@@ -1069,7 +1035,6 @@ def test_disk_rows_read_whole_table_sources(tmp_path, dist_init, tp_rank):
+     )
+     layout = SimpleNamespace(
+         caps=(caps,),
+-        lookup_plans=(None,),
+         geometry=geometry,
+         table_memory="disk",
+         projection_tp=False,
+@@ -1096,17 +1061,15 @@ def test_disk_rows_read_whole_table_sources(tmp_path, dist_init, tp_rank):
+             stream.write(tensor.view(torch.uint8).numpy().tobytes())
+         embed._disk_sources.append((str(path), offset, scale))
+     embed.open_disk_rows()
+-    workload = B12xWorkload(
+-        stage="weights",
+-        token_counts=(1, capacity),
+-        fixed_token_counts=(1,),
+-        output_dtype=torch.bfloat16,
+-        max_tokens=capacity,
+-        max_seqs=2,
+-        max_model_len=8,
+-    )
+-    units = module.get_b12x_preparation_units(module, workload)
+-    assert all(unit.name != "EngramLookup" for unit in units)
++    declared = []
++    with monkeypatch.context() as patch:
++        patch.setattr(
++            prepare, "declare", lambda calls=None, **_: declared.extend(calls())
++        )
++        embed.declare_kernels()
++    assert [function for function, _, _ in declared] == [
++        engram_rows.engram_rows_step_kernel,
++    ]
+     ids = torch.arange(24, device=device) + embed.shard_start + 1
+     ids = ids.expand(capacity, -1).contiguous()
+     count = torch.tensor([capacity], device=device, dtype=torch.int32)
+@@ -1219,7 +1182,6 @@ def test_engram_forward_fuses_mhc_post_and_gate(dist_init):
+     )
+     layout = SimpleNamespace(
+         caps=(caps,),
+-        lookup_plans=(None,),
+         geometry=geometry,
+         table_memory="device",
+         projection_tp=False,
+@@ -1338,7 +1300,7 @@ def test_disk_rows_pack_and_read_rank_compacted_files(monkeypatch):
+     packed_dir = os.path.join(base_dir, f"packed-{os.getpid()}")
+     shutil.rmtree(packed_dir, ignore_errors=True)
+     monkeypatch.setattr(engram_mod, "ENGRAM_PACKED_DIR", packed_dir)
+-    embed = ParallelEngramEmbedding(None, caps, geometry, table_memory="disk")
++    embed = ParallelEngramEmbedding(caps, geometry, table_memory="disk")
+     embed._disk_sources = [(w_path, 0, False), (s_path, 0, True)]
+     embed.open_disk_rows()
+     try:
+@@ -1365,7 +1327,7 @@ def test_disk_rows_pack_and_read_rank_compacted_files(monkeypatch):
+         embed.close()
+ 
+     monkeypatch.setattr(engram_mod, "ENGRAM_PACKED_DIR", "")
+-    embed_2p = ParallelEngramEmbedding(None, caps, geometry, table_memory="disk")
++    embed_2p = ParallelEngramEmbedding(caps, geometry, table_memory="disk")
+     embed_2p._disk_sources = [(w_path, 0, False), (s_path, 0, True)]
+     embed_2p.open_disk_rows()
+     try:
+@@ -1408,7 +1370,6 @@ def test_engram_projection_tp_gathers_dim0_into_blocked_gate(
+     )
+     layout = SimpleNamespace(
+         caps=(caps,),
+-        lookup_plans=(None,),
+         geometry=geometry,
+         table_memory="device",
+         projection_tp=False,
+diff --git a/tests/models/test_deepseek_v4_1_prepared_projections.py b/tests/models/test_deepseek_v4_1_prepared_projections.py
+index 50fb1120b..5a2a7111b 100644
+--- a/tests/models/test_deepseek_v4_1_prepared_projections.py
++++ b/tests/models/test_deepseek_v4_1_prepared_projections.py
+@@ -7,6 +7,7 @@ import torch
+ 
+ 
+ def _device():
++    pytest.importorskip("b12x")
+     if not torch.cuda.is_available() or torch.cuda.get_device_capability()[0] != 12:
+         pytest.skip("native b12x integration requires SM12x")
+     return torch.device("cuda", torch.cuda.current_device())
+@@ -18,14 +19,13 @@ def test_weights_collection_prepares_shared_and_markov_logits_heads(
+     dist_init,
+     monkeypatch,
+ ):
++    device = _device()
+     from b12x.preparation import PreparationSession
+ 
+     from vllm.model_executor.layers.logits_processor import LogitsProcessor
+     from vllm.model_executor.layers.vocab_parallel_embedding import ParallelLMHead
+     from vllm.model_executor.warmup.b12x_prepare import _units_from_modules
+     from vllm.utils.b12x import B12xWorkload
+-
+-    device = _device()
+     monkeypatch.setattr(default_vllm_config.kernel_config, "linear_backend", "b12x")
+     torch.manual_seed(411)
+     target, draft = torch.nn.Module(), torch.nn.Module()
+@@ -110,6 +110,7 @@ def test_packed_shared_logits_head_is_exact_and_batch_invariant(
+     dist_init,
+     monkeypatch,
+ ):
++    device = _device()
+     from b12x.gemm import packed_bf16_vocab_projection as projection
+     from b12x.preparation import PreparationSession
+ 
+@@ -117,8 +118,6 @@ def test_packed_shared_logits_head_is_exact_and_batch_invariant(
+     from vllm.model_executor.layers.vocab_parallel_embedding import ParallelLMHead
+     from vllm.model_executor.warmup.b12x_prepare import _units_from_modules
+     from vllm.utils.b12x import B12xWorkload
+-
+-    device = _device()
+     monkeypatch.setattr(default_vllm_config.kernel_config, "linear_backend", "b12x")
+     torch.manual_seed(412)
+     target, draft = torch.nn.Module(), torch.nn.Module()
+diff --git a/tests/models/test_deepseek_v4_1_sp_prefill.py b/tests/models/test_deepseek_v4_1_sp_prefill.py
+index b6f2ad3d6..b38cb4dca 100644
+--- a/tests/models/test_deepseek_v4_1_sp_prefill.py
++++ b/tests/models/test_deepseek_v4_1_sp_prefill.py
+@@ -683,8 +683,7 @@ def test_tilelang_experts_defer_only_a_folded_combine(monkeypatch):
+ 
+ 
+ def test_engram_gates_only_the_real_local_rows(monkeypatch):
+-    # Engram's geometry and token map are b12x's; its gate is TileLang's.
+-    pytest.importorskip("b12x")
++    # The gate is TileLang's.
+     pytest.importorskip("tilelang")
+     from vllm.models.deepseek_v4_1.common import engram as engram_ops
+     from vllm.models.deepseek_v4_1.tilelang import columns
+@@ -923,7 +922,6 @@ class _Embedding:
+ @pytest.mark.parametrize("num_tokens", (9, 10, 11))
+ @pytest.mark.parametrize("use_embeds", (False, True))
+ def test_model_forward_matches_full_rows(monkeypatch, num_tokens, use_embeds):
+-    pytest.importorskip("b12x")
+     from vllm.models.deepseek_v4_1.nvidia import model as native
+ 
+     monkeypatch.setattr(
+@@ -1005,7 +1003,6 @@ def test_dspark_fused_greedy_enabled_at_every_tp_size(monkeypatch):
+ 
+ 
+ def test_model_forward_sp_sink_columns_with_rank_order_parts(monkeypatch):
+-    pytest.importorskip("b12x")
+     from vllm.models.deepseek_v4_1.nvidia import model as native
+     from vllm.models.deepseek_v4_1.tilelang.collectives import RankOrderParts
+ 
+@@ -1257,7 +1254,6 @@ def test_engram_sp_forward_bit_identical_blocked_and_replicated(
+     mode (``_PaddedColumnParallelLinear`` via ``project_exchange_rows``) and
+     replicated mode, with and without ``previous_output=RankOrderParts``, including
+     padded and wholly empty tail ranks and ``IMAGE_SENTINEL`` tokens."""
+-    pytest.importorskip("b12x")
+     from vllm.models.deepseek_v4_1.common import engram as engram_ops
+     from vllm.models.deepseek_v4_1.tilelang import columns
+     from vllm.models.deepseek_v4_1.tilelang import engram as tl_engram
+diff --git a/tests/quantization/test_mxfp4_csf.py b/tests/quantization/test_mxfp4_csf.py
+index 473b8eea1..d532fe9ed 100644
+--- a/tests/quantization/test_mxfp4_csf.py
++++ b/tests/quantization/test_mxfp4_csf.py
+@@ -18,14 +18,11 @@ from vllm.model_executor.layers.fused_moe.config import (
+     FusedMoEParallelConfig,
+     RoutingMethodType,
+ )
++from vllm.model_executor.layers.quantization.mxfp4_csf_moe import Mxfp4CsfMoEMethod
+ from vllm.model_executor.model_loader.mxfp4_csf_loader import Mxfp4CsfModelLoader
+ from vllm.model_executor.model_loader.mxfp4_csf_loader import (
+     _slice_scale_plane as slice_scale_plane,
+ )
+-from vllm.models.deepseek_v4_1.mxfp4_csf import (
+-    DeepseekV41Mxfp4CsfConfig,
+-    Mxfp4CsfMoEMethod,
+-)
+ 
+ from .csf_fixtures import decode_planes, matrix
+ 
+@@ -50,14 +47,13 @@ def moe():
+ 
+ @pytest.fixture
+ def owner():
+-    return DeepseekV41Mxfp4CsfConfig.from_config(
+-        {"format_version": 1, "checkpoint_root": "/csf"}
+-    )
++    from vllm.models.deepseek_v4.mxfp4_csf import DeepseekV4Mxfp4CsfConfig
+ 
++    return DeepseekV4Mxfp4CsfConfig.from_config(DS4_FLASH_SERVING)
+ 
+-def test_exact_config_keeps_native_dense_precision_and_empty_expert_handles(moe, owner):
+-    assert owner.is_scale_e8m0 and owner.weight_block_size == [32, 32]
+-    assert owner.is_checkpoint_fp8_serialized and owner.scale_scratch is None
++
++def test_csf_experts_have_empty_expert_handles(moe, owner):
++    assert owner.scale_scratch is None
+     method = Mxfp4CsfMoEMethod(moe, owner)
+     layer = torch.nn.Module()
+     layer.layer_name = "model.layers.17.ffn.experts"
+@@ -65,8 +61,6 @@ def test_exact_config_keeps_native_dense_precision_and_empty_expert_handles(moe,
+     assert not list(layer.named_parameters()) and not layer.state_dict()
+     assert method.layer_index == 17 and method.local_intermediate == 576
+     assert method.get_fused_moe_quant_config(layer).weight_quant_dtype == "mxfp4"
+-    with pytest.raises(ValueError, match="format_version"):
+-        DeepseekV41Mxfp4CsfConfig.from_config({})
+ 
+ 
+ def test_exact_config_and_loader_are_registered():
+@@ -83,12 +77,15 @@ def test_exact_config_and_loader_are_registered():
+ def test_csf_cpu_shard_reader_bounds_threads_and_restores_on_failure(
+     monkeypatch, moe, owner
+ ):
++    pytest.importorskip("b12x.moe")
++    from vllm.model_executor.layers.quantization import mxfp4_csf_moe
+     from vllm.model_executor.model_loader import mxfp4_csf_loader as checkpoint
+-    from vllm.models.deepseek_v4_1 import mxfp4_csf
+     from vllm.utils.torch_utils import set_default_torch_num_threads
+ 
+-    monkeypatch.setattr(mxfp4_csf, "get_tensor_model_parallel_world_size", lambda: 4)
+-    monkeypatch.setattr(mxfp4_csf, "get_tensor_model_parallel_rank", lambda: 0)
++    monkeypatch.setattr(
++        mxfp4_csf_moe, "get_tensor_model_parallel_world_size", lambda: 4
++    )
++    monkeypatch.setattr(mxfp4_csf_moe, "get_tensor_model_parallel_rank", lambda: 0)
+     method = Mxfp4CsfMoEMethod(moe, owner)
+     layer = torch.nn.Module()
+     layer.layer_name = "model.layers.17.ffn.experts"
+@@ -105,52 +102,6 @@ def test_csf_cpu_shard_reader_bounds_threads_and_restores_on_failure(
+         assert torch.get_num_threads() == 4
+ 
+ 
+-@pytest.mark.parametrize("mode", ["normal", "pipeline", "ubatching", "wrong_loader"])
+-@pytest.mark.parametrize("force_a16", [False, True])
+-def test_target_uses_csf_while_dense_and_draft_keep_native_methods(
+-    monkeypatch, moe, owner, mode, force_a16
+-):
+-    from vllm.model_executor.layers.fused_moe.routed_experts import RoutedExperts
+-    from vllm.models.deepseek_v4_1 import mxfp4_csf
+-
+-    monkeypatch.setattr(mxfp4_csf.envs, "VLLM_B12X_MOE_FP4_FORCE_A16", force_a16)
+-
+-    config = SimpleNamespace(
+-        model_config=SimpleNamespace(hf_config=SimpleNamespace(num_hidden_layers=40)),
+-        parallel_config=SimpleNamespace(
+-            pipeline_parallel_size=2 if mode == "pipeline" else 1,
+-            use_ubatching=mode == "ubatching",
+-        ),
+-        load_config=SimpleNamespace(
+-            load_format="safetensors" if mode == "wrong_loader" else "mxfp4_csf"
+-        ),
+-    )
+-    monkeypatch.setattr(mxfp4_csf, "get_current_vllm_config", lambda: config)
+-    native = object()
+-    monkeypatch.setattr(
+-        mxfp4_csf.DeepseekV41FP8Config,
+-        "get_quant_method",
+-        lambda *args, **kwargs: native,
+-    )
+-    layer = Mock(spec=RoutedExperts)
+-    layer.moe_config = moe
+-    if mode == "normal":
+-        method = owner.get_quant_method(layer, "model.layers.39.ffn.experts")
+-        assert isinstance(method, Mxfp4CsfMoEMethod)
+-        assert method.activation_mode == ("a16" if force_a16 else "a8")
+-        assert method.get_fused_moe_quant_config(layer).quant_dtype == (
+-            None if force_a16 else "mxfp8"
+-        )
+-    elif mode == "wrong_loader":
+-        with pytest.raises(ValueError, match="load-format"):
+-            owner.get_quant_method(layer, "model.layers.39.ffn.experts")
+-    else:
+-        with pytest.raises(NotImplementedError, match="PP1 without ubatching"):
+-            owner.get_quant_method(layer, "model.layers.39.ffn.experts")
+-    assert owner.get_quant_method(layer, "model.layers.40.ffn.experts") is native
+-    assert owner.get_quant_method(torch.nn.Module(), "model.layers.0.attn") is native
+-
+-
+ @pytest.mark.parametrize(
+     "field,value", [("dp_size", 2), ("use_ep", True), ("enable_eplb", True)]
+ )
+@@ -164,7 +115,7 @@ def test_exact_experts_reject_non_tp_execution(moe, owner, field, value):
+ def test_prepared_native_experts_validate_source_shape_and_swiglu_limit(
+     monkeypatch, moe, owner, activation_mode
+ ):
+-    from b12x.moe import fused_moe
++    fused_moe = pytest.importorskip("b12x.moe.fused_moe")
+ 
+     from vllm.model_executor.layers.fused_moe import b12x
+ 
+@@ -340,9 +291,8 @@ def test_kimi_loader_skips_compressed_experts_with_nested_text_config(
+     assert torch.equal(result[dense], tensors[dense])
+ 
+ 
+-@pytest.mark.parametrize("family", ["kimi_k3", "deepseek_v41"])
+ def test_mxfp4_csf_selects_retained_precision_and_rejects_other_configs(
+-    monkeypatch, moe, family
++    monkeypatch, moe
+ ):
+     from vllm.model_executor.layers.fused_moe.routed_experts import RoutedExperts
+     from vllm.model_executor.layers.linear import LinearBase, UnquantizedLinearMethod
+@@ -352,9 +302,10 @@ def test_mxfp4_csf_selects_retained_precision_and_rejects_other_configs(
+     )
+     from vllm.model_executor.layers.quantization.mxfp4_csf import Mxfp4CsfConfig
+     from vllm.model_executor.model_loader import mxfp4_csf_loader as checkpoint
+-    from vllm.models.deepseek_v4_1 import mxfp4_csf
+ 
+-    monkeypatch.setattr(checkpoint, "checkpoint_contract", lambda _: {"family": family})
++    monkeypatch.setattr(
++        checkpoint, "checkpoint_contract", lambda _: {"family": "kimi_k3"}
++    )
+     owner = get_quantization_config("mxfp4_csf").from_config(
+         {"format_version": 1, "checkpoint_root": "/compressed-scales"}
+     )
+@@ -363,23 +314,17 @@ def test_mxfp4_csf_selects_retained_precision_and_rejects_other_configs(
+         parallel_config=SimpleNamespace(pipeline_parallel_size=1, use_ubatching=False),
+         load_config=SimpleNamespace(load_format="mxfp4_csf"),
+     )
+-    for module in (kimi_mxfp4_csf, mxfp4_csf):
+-        monkeypatch.setattr(module, "get_current_vllm_config", lambda: config)
++    monkeypatch.setattr(kimi_mxfp4_csf, "get_current_vllm_config", lambda: config)
+     layer = Mock(spec=RoutedExperts)
+     layer.moe_config = moe
+     assert owner.get_name() == "mxfp4_csf"
+     assert isinstance(
+         owner.get_quant_method(layer, "model.layers.3.mlp.experts"), Mxfp4CsfMoEMethod
+     )
+-    if family == "deepseek_v41":
+-        assert owner.is_checkpoint_fp8_serialized
+-        assert owner.weight_block_size == [32, 32] and owner.is_scale_e8m0
+-        assert isinstance(owner, DeepseekV41Mxfp4CsfConfig)
+-    else:
+-        assert isinstance(
+-            owner.get_quant_method(Mock(spec=LinearBase), "model.layers.0.q_proj"),
+-            UnquantizedLinearMethod,
+-        )
++    assert isinstance(
++        owner.get_quant_method(Mock(spec=LinearBase), "model.layers.0.q_proj"),
++        UnquantizedLinearMethod,
++    )
+     assert (
+         Mxfp4CsfConfig.override_quantization_method(
+             {"quant_method": "mxfp4_csf"}, "mxfp4_csf"
+@@ -529,6 +474,7 @@ def test_rejects_unaligned_rows_and_bad_padding():
+ @pytest.mark.parametrize("tp_size,rank", [(2, 0), (2, 1), (3, 0), (3, 1), (3, 2)])
+ def test_tensor_sources_preserve_projection_order_and_tp_bytes(tp_size, rank):
+     """An arbitrary geometry loads without any model identity or checkpoint path."""
++    pytest.importorskip("b12x.moe")
+     from vllm.model_executor.model_loader.mxfp4_csf_loader import (
+         _load_mxfp4_csf_weights as load_mxfp4_csf_weights,
+     )
+@@ -598,6 +544,7 @@ def test_tensor_sources_preserve_projection_order_and_tp_bytes(tp_size, rank):
+ 
+ @pytest.mark.parametrize("count", [0, 2])
+ def test_expert_inventory_must_match_declared_count(count):
++    pytest.importorskip("b12x.moe")
+     from vllm.model_executor.model_loader.mxfp4_csf_loader import (
+         _load_mxfp4_csf_weights as load_mxfp4_csf_weights,
+     )
+@@ -793,6 +740,20 @@ def test_reader_admits_tp3_for_deepseek_v41_only(
+         )
+ 
+ 
++def test_mxfp4_csf_refuses_deepseek_v41_checkpoints(monkeypatch):
++    # DeepSeek-V4.1 runs TileLang kernels only; the CSF experts are B12X's.
++    from vllm.model_executor.layers.quantization import get_quantization_config
++    from vllm.model_executor.model_loader import mxfp4_csf_loader as checkpoint
++
++    monkeypatch.setattr(
++        checkpoint, "checkpoint_contract", lambda _: {"family": "deepseek_v41"}
++    )
++    with pytest.raises(ValueError, match="TileLang"):
++        get_quantization_config("mxfp4_csf").from_config(
++            {"format_version": 1, "checkpoint_root": "/compressed-scales"}
++        )
++
++
+ def test_mxfp4_csf_dispatches_ds4_flash_with_source_dense_config(monkeypatch):
+     from vllm.model_executor.layers.quantization import get_quantization_config
+     from vllm.model_executor.layers.quantization.mxfp4_csf import Mxfp4CsfConfig
+diff --git a/tests/v1/attention/test_b12x_v41_ced_metadata.py b/tests/v1/attention/test_b12x_v41_ced_metadata.py
+index f1add511f..bf5f1b706 100644
+--- a/tests/v1/attention/test_b12x_v41_ced_metadata.py
++++ b/tests/v1/attention/test_b12x_v41_ced_metadata.py
+@@ -18,7 +18,7 @@ from vllm.models.deepseek_v4_1.ced import (
+     replay_rows,
+     scatter_rows,
+ )
+-from vllm.models.deepseek_v4_1.sparse_mla import DeepseekV41B12xMetadata
++from vllm.models.deepseek_v4_1.sparse_mla import DeepseekV41Metadata
+ 
+ cuda = pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
+ 
+@@ -34,7 +34,7 @@ def test_draft_metadata_graph_matches_eager_after_slot_reuse(
+ 
+     import tilelang.cache
+ 
+-    from vllm.models.deepseek_v4_1.sparse_mla import DeepseekV41B12xMetadataBuilder
++    from vllm.models.deepseek_v4_1.sparse_mla import DeepseekV41MetadataBuilder
+     from vllm.models.deepseek_v4_1.tilelang import metadata, prepare
+ 
+     cache_module = importlib.import_module(tilelang.cache.freeze.__module__)
+@@ -60,7 +60,7 @@ def test_draft_metadata_graph_matches_eager_after_slot_reuse(
+     )
+ 
+     def builder():
+-        obj = DeepseekV41B12xMetadataBuilder.__new__(DeepseekV41B12xMetadataBuilder)
++        obj = DeepseekV41MetadataBuilder.__new__(DeepseekV41MetadataBuilder)
+         obj.page, obj.ratio, obj.circular = 128, ratio, circular
+         for name, shape, dtype in zip(names, shapes, dtypes):
+             setattr(obj, name, torch.full((shape,), -101, dtype=dtype, device="cuda"))
+@@ -348,7 +348,7 @@ def test_mixed_metadata_keeps_context_bounds_and_padding():
+     positions = torch.cat(
+         (torch.tensor([899], device="cuda"), torch.arange(4096, 8192, device="cuda"))
+     )
+-    metadata = DeepseekV41B12xMetadata(
++    metadata = DeepseekV41Metadata(
+         4097,
+         2,
+         4096,
+diff --git a/tests/v1/core/test_contiguous_kv_packing.py b/tests/v1/core/test_contiguous_kv_packing.py
+index 331192fd5..9a557f6dc 100644
+--- a/tests/v1/core/test_contiguous_kv_packing.py
++++ b/tests/v1/core/test_contiguous_kv_packing.py
+@@ -723,7 +723,7 @@ def test_v41_mixed_cache_pages_preserve_request_partial_states(monkeypatch):
+         CompressorBackend,
+         CompressorStateCache,
+     )
+-    from vllm.models.deepseek_v4_1.sparse_mla import DeepseekV41B12xBackend
++    from vllm.models.deepseek_v4_1.sparse_mla import DeepseekV41Backend
+     from vllm.v1.attention.backends.utils import (
+         get_supported_kv_cache_layouts,
+         resolve_kv_cache_layout,
+@@ -779,7 +779,7 @@ def test_v41_mixed_cache_pages_preserve_request_partial_states(monkeypatch):
+         ),
+     }
+     supported = get_supported_kv_cache_layouts(
+-        [DeepseekV41B12xBackend, CompressorBackend]
++        [DeepseekV41Backend, CompressorBackend]
+     )
+     # Profiling resolves the backend preference before the full specs arrive.
+     layout = resolve_kv_cache_layout(vllm_config, [[item.name for item in supported]])
+diff --git a/tests/v1/core/test_kv_cache_utils.py b/tests/v1/core/test_kv_cache_utils.py
+index ffb2e8b76..18e82203b 100644
+--- a/tests/v1/core/test_kv_cache_utils.py
++++ b/tests/v1/core/test_kv_cache_utils.py
+@@ -1940,7 +1940,7 @@ def _ds41_cache_groups() -> list[KVCacheGroupSpec]:
+             state_content_bytes=content,
+             dtype=torch.uint8,
+             tokens_per_state=ratio,
+-            cache_dtype_str="b12x_dsv41",
++            cache_dtype_str="dsv41",
+         )
+ 
+     full: dict[str, KVCacheSpec] = {}
+@@ -1953,7 +1953,7 @@ def _ds41_cache_groups() -> list[KVCacheGroupSpec]:
+         head_size=512,
+         state_content_bytes=528,
+         dtype=torch.uint8,
+-        cache_dtype_str="b12x_dsv41",
++        cache_dtype_str="dsv41",
+         sliding_window=128,
+     )
+     ring = CircularBufferSpec(
+@@ -5613,7 +5613,7 @@ def _ds41_layer_specs() -> dict[str, KVCacheSpec]:
+             state_content_bytes=content,
+             dtype=torch.uint8,
+             tokens_per_state=ratio,
+-            cache_dtype_str="b12x_dsv41",
++            cache_dtype_str="dsv41",
+         )
+ 
+     specs: dict[str, KVCacheSpec] = {}
+@@ -5629,7 +5629,7 @@ def _ds41_layer_specs() -> dict[str, KVCacheSpec]:
+             head_size=512,
+             state_content_bytes=528,
+             dtype=torch.uint8,
+-            cache_dtype_str="b12x_dsv41",
++            cache_dtype_str="dsv41",
+             sliding_window=128,
+             extra_retained_tokens=int(draft),
+             prefix_cache_enabled=not bounded,
+diff --git a/tests/v1/executor/test_b12x_output.py b/tests/v1/executor/test_b12x_output.py
+index eaadf844b..cc6e71e72 100644
+--- a/tests/v1/executor/test_b12x_output.py
++++ b/tests/v1/executor/test_b12x_output.py
+@@ -211,6 +211,7 @@ def _terminal_text(data, rows, columns):
+ 
+ @pytest.mark.parametrize("columns", [84, 133])
+ def test_executor_serializes_bound_handlers_native_writes_and_child_output(columns):
++    pytest.importorskip("b12x")
+     master, slave = os.openpty()
+     rows = 36
+     termios.tcsetwinsize(slave, (rows, columns))
+@@ -263,128 +264,6 @@ def test_executor_serializes_bound_handlers_native_writes_and_child_output(colum
+         os.close(master)
+ 
+ 
+-def _loading_with_native_output():
+-    import logging
+-    import time
+-    from types import SimpleNamespace
+-    from unittest.mock import patch
+-
+-    from vllm.config.load import LoadConfig
+-    from vllm.model_executor.model_loader.b12x_loader import B12xModelLoader
+-    from vllm.model_executor.model_loader.default_loader import DefaultModelLoader
+-    from vllm.utils.system_utils import decorate_logs
+-
+-    decorate_logs("Worker_TP0")
+-    handler = logging.StreamHandler(sys.stderr)
+-    summary = dict(
+-        ranks=4,
+-        payload_bytes=305_750_000_000,
+-        shared_physical_bytes=299_595_000_000,
+-        physical_bytes=299_640_000_000,
+-        shared_transfer_seconds=0.1,
+-    )
+-    group = SimpleNamespace(
+-        epoch=1,
+-        progress=None,
+-        summary=summary,
+-        start=lambda session: None,
+-        _gather=lambda value: None,
+-    )
+-    session = SimpleNamespace(
+-        shared_read_group=group, progress=None, flush=lambda: None, stats=lambda **_: {}
+-    )
+-    loader = B12xModelLoader(LoadConfig(load_format="b12x"))
+-    loader._session = session
+-
+-    def route(self, model, config):
+-        self.counter_before_loading_weights = time.perf_counter()
+-        self._progress.source(48)
+-        for index in range(48):
+-            self._progress.advance((index + 1) * 1_592_447_916)
+-        for phase in ("prepare", "plan", "execute", "unmap"):
+-            group.progress(phase)
+-            self._progress._live.refresh()
+-            time.sleep(0.04)
+-        handler.emit(
+-            logging.LogRecord(
+-                "loader", logging.INFO, "", 0, "loading-bound-handler", (), None
+-            )
+-        )
+-        os.write(2, b"loading-native-write\n")
+-        subprocess.run(
+-            [
+-                sys.executable,
+-                "-c",
+-                'import os; os.write(1, b"loading-child-output\\n")',
+-            ],
+-            check=True,
+-        )
+-        self.counter_after_loading_weights = time.perf_counter()
+-        self._log_loading_time()
+-
+-    with patch.object(DefaultModelLoader, "load_weights", route):
+-        loader.load_weights(None, None)
+-    print("loading-returned")
+-
+-
+-@pytest.mark.parametrize("columns", [84, 133])
+-def test_weight_loading_keeps_one_complete_panel_with_native_logs(columns, tmp_path):
+-    master, slave = os.openpty()
+-    rows = 36
+-    termios.tcsetwinsize(slave, (rows, columns))
+-    os.set_blocking(master, False)
+-    env = dict(os.environ, TERM="xterm-256color", PYTHONDONTWRITEBYTECODE="1")
+-    for key in ("COLUMNS", "LINES"):
+-        env.pop(key, None)
+-    output = bytearray()
+-    try:
+-        process = subprocess.Popen(
+-            [sys.executable, str(Path(__file__).resolve()), "--loading-replay"],
+-            stdin=slave,
+-            stdout=slave,
+-            stderr=slave,
+-            env=env,
+-        )
+-        while process.poll() is None:
+-            if select.select([master], [], [], 0.1)[0]:
+-                output.extend(os.read(master, 65536))
+-        while select.select([master], [], [], 0)[0]:
+-            output.extend(os.read(master, 65536))
+-        (tmp_path / "terminal.ansi").write_bytes(output)
+-        assert process.returncode == 0, output.decode(errors="replace")
+-        screen = _terminal_text(bytes(output), rows, columns)
+-        (tmp_path / "screen.txt").write_text(screen)
+-        assert screen.count("b12x / weight loading") == 1, screen
+-        assert screen.index("Loading weights") > screen.index("└"), screen
+-        assert "0 / 0 shards" not in output.decode(errors="replace")
+-        for message in (
+-            "loading-bound-handler",
+-            "loading-native-write",
+-            "loading-child-output",
+-            "loading-returned",
+-        ):
+-            assert screen.count(message) == 1, screen
+-        top = next(
+-            i for i, line in enumerate(screen.splitlines()) if line.startswith("┌")
+-        )
+-        bottom = next(
+-            i for i, line in enumerate(screen.splitlines()) if line.startswith("└")
+-        )
+-        panel = screen.splitlines()[top : bottom + 1]
+-        assert len(panel) >= 8, screen
+-        assert all(
+-            line.startswith("│") and line.endswith("│") for line in panel[1:-1]
+-        ), screen
+-    finally:
+-        if "process" in locals() and process.poll() is None:
+-            process.terminate()
+-            process.wait(timeout=5)
+-        os.close(slave)
+-        os.close(master)
+-
+-
+ if __name__ == "__main__":
+     if "--startup-replay" in sys.argv:
+         _startup_with_native_output()
+-    elif "--loading-replay" in sys.argv:
+-        _loading_with_native_output()
+diff --git a/tests/v1/executor/test_b12x_startup.py b/tests/v1/executor/test_b12x_startup.py
+index 493f6339e..334ae88ed 100644
+--- a/tests/v1/executor/test_b12x_startup.py
++++ b/tests/v1/executor/test_b12x_startup.py
+@@ -191,6 +191,7 @@ def test_tuning_authorization_selects_once_across_disjoint_rank_shards() -> None
+ def test_progress_aggregates_work_totals_and_preserves_rank_local_batch_counts() -> (
+     None
+ ):
++    pytest.importorskip("b12x")
+     from b12x.preparation import PreparationProgress
+ 
+     outcomes = [
+@@ -238,6 +239,7 @@ def test_progress_aggregates_work_totals_and_preserves_rank_local_batch_counts()
+ 
+ 
+ def test_progress_does_not_finish_until_every_rank_finishes() -> None:
++    pytest.importorskip("b12x")
+     from b12x.preparation import PreparationProgress
+ 
+     ready = PreparationProgress(False, False, (), True, phase="ready")
+@@ -253,6 +255,7 @@ def test_progress_does_not_finish_until_every_rank_finishes() -> None:
+ 
+ 
+ def test_progress_does_not_sum_replicated_fixed_candidate_count() -> None:
++    pytest.importorskip("b12x")
+     from b12x.preparation import PreparationProgress
+ 
+     fixed = PreparationProgress(
+@@ -382,6 +385,7 @@ def test_abort_closes_active_job_once() -> None:
+ 
+ @pytest.mark.parametrize("variant", ("batched", "varlen"))
+ def test_attention_tuning_rendezvous_ignores_rank_local_device_ordinal(variant):
++    pytest.importorskip("b12x")
+     import torch
+     from b12x.attention import varlen
+     from b12x.preparation.session import PreparationJob
+@@ -474,6 +478,8 @@ def _finish(coordinator):
+ 
+ 
+ def _tuning_progress(rank, *, keys=("a", "b"), ranks=(0, 1)):
++    # Every test that tunes builds B12X's requirements: without B12X it skips.
++    pytest.importorskip("b12x")
+     from b12x.preparation import TuningRequirement
+ 
+     return SimpleNamespace(
+@@ -554,6 +560,7 @@ def test_winner_artifacts_arrive_before_installation_without_retuning(
+ ):
+     from dataclasses import replace
+ 
++    pytest.importorskip("b12x")
+     from b12x.preparation.artifacts import CuTeArtifactCache
+ 
+     from vllm.v1.worker import b12x_artifacts
+@@ -617,6 +624,7 @@ def test_winner_artifacts_arrive_before_installation_without_retuning(
+ 
+ @pytest.mark.parametrize("failure", ("missing", "corrupt", "stalled"))
+ def test_winner_transfer_failure_leaves_a_local_compile_miss(tmp_path, failure):
++    pytest.importorskip("b12x")
+     from b12x.preparation.artifacts import CuTeArtifactCache
+ 
+     from vllm.v1.worker.b12x_artifacts import WinnerArtifactExchange
+@@ -650,6 +658,7 @@ def test_transferred_pair_is_verified_before_publication(tmp_path):
+     import fcntl
+     import shutil
+ 
++    pytest.importorskip("b12x")
+     from b12x.preparation.artifacts import CuTeArtifactCache
+ 
+     sender = CuTeArtifactCache(tmp_path / "sender")
+@@ -673,6 +682,7 @@ def test_transferred_pair_is_verified_before_publication(tmp_path):
+ 
+ @pytest.mark.parametrize("all_rejected", (False, True))
+ def test_rejected_shards_finish_with_a_peer_winner_or_an_explicit_error(all_rejected):
++    pytest.importorskip("b12x")
+     from b12x.preparation import TuningRequirement
+ 
+     progress = [_tuning_progress(rank, keys=("query",)) for rank in (0, 1)]
+@@ -710,6 +720,7 @@ def test_rejected_shards_finish_with_a_peer_winner_or_an_explicit_error(all_reje
+ 
+ @pytest.mark.parametrize("cancel", (False, True))
+ def test_tuning_caches_exchange_before_races_with_empty_world_rank(cancel):
++    pytest.importorskip("b12x")
+     from b12x.preparation import PreparationProgress, TuningCacheRequirement
+ 
+     caches = tuple(
+@@ -736,6 +747,7 @@ def test_tuning_caches_exchange_before_races_with_empty_world_rank(cancel):
+ 
+ 
+ def test_missing_cache_participant_fails_all_ranks_without_hanging():
++    pytest.importorskip("b12x")
+     from b12x.preparation import PreparationProgress, TuningCacheRequirement
+ 
+     cache = TuningCacheRequirement((0, 1), {}, {})
+@@ -845,6 +857,7 @@ def test_executor_runs_worker_on_calling_thread_and_cancels_without_step_rpcs():
+ def test_candidate_progress_waits_for_every_expected_rank_to_finish_planning():
+     from dataclasses import replace
+ 
++    pytest.importorskip("b12x")
+     from b12x.preparation import PreparationProgress
+ 
+     known = PreparationProgress(
+@@ -870,6 +883,7 @@ def test_candidate_progress_waits_for_every_expected_rank_to_finish_planning():
+ 
+ @pytest.mark.parametrize("measured", [(3900, 3725, 3725, 3725), (11901,) * 4])
+ def test_four_rank_candidate_fraction_uses_the_same_scope_for_both_counts(measured):
++    pytest.importorskip("b12x")
+     from b12x.preparation import PreparationProgress
+ 
+     outcomes = [
+@@ -948,6 +962,7 @@ def test_cancel_drains_pending_winners_then_orders_collective_warmup():
+ def test_heuristic_warmup_is_local_on_each_rank(tmp_path, monkeypatch):
+     from dataclasses import dataclass
+ 
++    pytest.importorskip("b12x")
+     from b12x.preparation import (
+         CollectiveRequirement,
+         DetectedDevice,
+diff --git a/tests/v1/worker/test_prepare_kernels.py b/tests/v1/worker/test_prepare_kernels.py
+index 8e77d19d2..d6a0f7e5d 100644
+--- a/tests/v1/worker/test_prepare_kernels.py
++++ b/tests/v1/worker/test_prepare_kernels.py
+@@ -388,11 +388,14 @@ def test_tilelang_backend_decouples_b12x_and_declares_pooling_and_sampling_holdo
+     import sys
+     import torch
+ 
+-    import vllm.models.deepseek_v4_1.mxfp4_csf as mxfp4_csf
++    import importlib.util
++
++    import vllm.models.deepseek_v4_1.quant_config as quant_config
+     import vllm.models.deepseek_v4_1.sp_prefill as sp_prefill
+     from vllm.model_executor.layers import logits_processor as lp_mod
+ 
+-    assert "B12xExperts" not in mxfp4_csf.__dict__
++    assert importlib.util.find_spec("vllm.models.deepseek_v4_1.mxfp4_csf") is None
++    assert "B12xExperts" not in quant_config.__dict__
+ 
+     cfg = SimpleNamespace(
+         model_config=SimpleNamespace(head_dtype=None),
+diff --git a/vllm/config/load.py b/vllm/config/load.py
+index 2e3db8acc..f64dd7d37 100644
+--- a/vllm/config/load.py
++++ b/vllm/config/load.py
+@@ -35,14 +35,12 @@ class LoadConfig:
+       back to the pytorch bin format if safetensors format is not available.
+     - "pt" will load the weights in the pytorch bin format.
+     - "safetensors" will load the weights in the safetensors format.
+-    - "b12x" will load safetensors weights directly into CUDA tensors using
+-      the b12x checkpoint loader provided by `flashinfer-python[b12x]`.
+     - "direct" will read safetensors weights with O_DIRECT through a
+       registered host ring straight into CUDA tensors, without the page cache.
+       It needs a GPU that reads pageable memory through the host page tables,
+       such as GB10.
+-    - "mxfp4_csf" reads losslessly compressed Kimi/DS4.1/DS4-Flash
+-      MXFP4 expert scales and retains file-backed loading for Engram tables.
++    - "mxfp4_csf" reads losslessly compressed Kimi/DS4-Flash MXFP4 expert
++      scales and retains file-backed loading for Engram tables.
+     - "instanttensor" will load the Safetensors weights on CUDA devices using
+       InstantTensor, which enables distributed loading with pipelined prefetching
+       and fast direct I/O.
+diff --git a/vllm/model_executor/layers/logits_processor.py b/vllm/model_executor/layers/logits_processor.py
+index 469d831e1..ee8a38de7 100644
+--- a/vllm/model_executor/layers/logits_processor.py
++++ b/vllm/model_executor/layers/logits_processor.py
+@@ -155,9 +155,9 @@ class LogitsProcessor(PluggableLayer):
+             and self._b12x_packed_vocab_projection.is_supported()
+         )
+         if lm_head is not None:
+-            self.prepare_b12x_vocab_projection(lm_head)
++            self.prepare_vocab_projection(lm_head)
+ 
+-    def prepare_b12x_vocab_projection(
++    def prepare_vocab_projection(
+         self,
+         lm_head: torch.nn.Module,
+     ) -> None:
+@@ -202,6 +202,8 @@ class LogitsProcessor(PluggableLayer):
+         object.__setattr__(lm_head, "_b12x_vocab_projection_owner", self)
+         set_b12x_preparation_provider(self, self)
+ 
++    prepare_b12x_vocab_projection = prepare_vocab_projection
++
+     def declare_kernels(self) -> None:
+         """Declare the TileLang projections of the BF16 heads registered here."""
+         if not self._tilelang_vocab_heads:
+diff --git a/vllm/model_executor/layers/quantization/kimi_mxfp4_csf.py b/vllm/model_executor/layers/quantization/kimi_mxfp4_csf.py
+index f9ffbe7db..6428f8fc9 100644
+--- a/vllm/model_executor/layers/quantization/kimi_mxfp4_csf.py
++++ b/vllm/model_executor/layers/quantization/kimi_mxfp4_csf.py
+@@ -7,7 +7,7 @@ import torch
+ from vllm.config import get_current_vllm_config
+ from vllm.model_executor.layers.fused_moe.routed_experts import RoutedExperts
+ from vllm.model_executor.layers.quantization.mxfp4 import Mxfp4Config
+-from vllm.models.deepseek_v4_1.mxfp4_csf import Mxfp4CsfMoEMethod
++from vllm.model_executor.layers.quantization.mxfp4_csf_moe import Mxfp4CsfMoEMethod
+ 
+ 
+ class KimiMxfp4CsfConfig(Mxfp4Config):
+diff --git a/vllm/model_executor/layers/quantization/mxfp4_csf.py b/vllm/model_executor/layers/quantization/mxfp4_csf.py
+index de0306934..380d5c74c 100644
+--- a/vllm/model_executor/layers/quantization/mxfp4_csf.py
++++ b/vllm/model_executor/layers/quantization/mxfp4_csf.py
+@@ -2,13 +2,11 @@
+ # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+ """MXFP4 lossless scale compression with model-specific retained precision."""
+ 
+-from vllm.models.deepseek_v4_1.mxfp4_csf import DeepseekV41Mxfp4CsfConfig
+-
+ from .kimi_mxfp4_csf import KimiMxfp4CsfConfig
+ 
+ 
+ class Mxfp4CsfConfig(KimiMxfp4CsfConfig):
+-    """Select Kimi, DeepSeek-V4.1 or DeepSeek-V4 dense precision by family."""
++    """Select Kimi or DeepSeek-V4 dense precision by family."""
+ 
+     @classmethod
+     def get_name(cls):
+@@ -31,7 +29,12 @@ class Mxfp4CsfConfig(KimiMxfp4CsfConfig):
+             raise ValueError("MXFP4-CSF requires format_version=1 and checkpoint_root")
+         family = checkpoint_contract(config["checkpoint_root"])["family"]
+         if family == "deepseek_v41":
+-            return DeepseekV41Mxfp4CsfConfig.from_config(config)
++            # The CSF experts run B12X's fused MoE; DeepSeek-V4.1 runs TileLang's
++            # kernels only.
++            raise ValueError(
++                "MXFP4-CSF DeepSeek-V4.1 checkpoints are not served: DeepSeek-V4.1 "
++                "runs TileLang kernels only; serve the native checkpoint"
++            )
+         if family == "deepseek_v4_flash":
+             # Deferred: the DeepSeek-V4 package imports its platform model.
+             from vllm.models.deepseek_v4.mxfp4_csf import DeepseekV4Mxfp4CsfConfig
+diff --git a/vllm/models/deepseek_v4_1/mxfp4_csf.py b/vllm/model_executor/layers/quantization/mxfp4_csf_moe.py
+similarity index 72%
+rename from vllm/models/deepseek_v4_1/mxfp4_csf.py
+rename to vllm/model_executor/layers/quantization/mxfp4_csf_moe.py
+index 96b50b973..e3ebdd368 100644
+--- a/vllm/models/deepseek_v4_1/mxfp4_csf.py
++++ b/vllm/model_executor/layers/quantization/mxfp4_csf_moe.py
+@@ -1,12 +1,12 @@
+ # SPDX-License-Identifier: Apache-2.0
+ # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+-"""Losslessly compressed DS4.1 routed experts with native dense tensors."""
++"""Routed experts with losslessly compressed MXFP4 scales (MXFP4-CSF), on B12X's
++prepared fused MoE. The Kimi-K3 and DeepSeek-V4-Flash MXFP4-CSF configurations
++select it for their target models' routed experts."""
+ 
+ import regex as re
+ import torch
+ 
+-import vllm.envs as envs
+-from vllm.config import get_current_vllm_config
+ from vllm.distributed import (
+     get_tensor_model_parallel_rank,
+     get_tensor_model_parallel_world_size,
+@@ -24,77 +24,11 @@ from vllm.model_executor.layers.fused_moe.fused_moe_method_base import (
+ from vllm.model_executor.layers.fused_moe.prepare_finalize.no_dp_ep import (
+     MoEPrepareAndFinalizeNoDPEPModular,
+ )
+-from vllm.model_executor.layers.fused_moe.routed_experts import RoutedExperts
+ from vllm.utils.torch_utils import set_default_torch_num_threads
+ 
+-from .quant_config import DeepseekV41FP8Config
+-
+ logger = init_logger(__name__)
+ 
+ 
+-class DeepseekV41Mxfp4CsfConfig(DeepseekV41FP8Config):
+-    """MXFP4-CSF main experts; unchanged native dense, shared and draft weights."""
+-
+-    checkpoint_root: str
+-    scale_scratch: tuple[torch.Tensor, ...] | None
+-
+-    @classmethod
+-    def get_name(cls):
+-        return "mxfp4_csf"
+-
+-    @classmethod
+-    def get_min_capability(cls):
+-        return 120
+-
+-    @classmethod
+-    def override_quantization_method(cls, hf_quant_cfg, user_quant, hf_config=None):
+-        if (
+-            user_quant in (None, cls.get_name())
+-            and hf_quant_cfg is not None
+-            and hf_quant_cfg.get("quant_method") == cls.get_name()
+-            and getattr(hf_config, "model_type", None)
+-            in ("deepseek_v41", "deepseek_v41_text")
+-        ):
+-            return cls.get_name()
+-        return None
+-
+-    @classmethod
+-    def from_config(cls, config):
+-        if config.get("format_version") != 1 or not config.get("checkpoint_root"):
+-            raise ValueError("MXFP4-CSF requires format_version=1 and checkpoint_root")
+-        result = cls(
+-            is_checkpoint_fp8_serialized=True,
+-            activation_scheme="dynamic",
+-            weight_block_size=[32, 32],
+-        )
+-        result.checkpoint_root = config["checkpoint_root"]
+-        result.scale_scratch = None
+-        return result
+-
+-    def get_quant_method(self, layer, prefix):
+-        if isinstance(layer, RoutedExperts):
+-            match = re.search(r"(?:^|\.)layers\.(\d+)\.", prefix)
+-            if match is None:
+-                raise ValueError("DS4.1 routed experts require a numbered layer")
+-            config = get_current_vllm_config()
+-            if int(match.group(1)) < config.model_config.hf_config.num_hidden_layers:
+-                if (
+-                    config.parallel_config.pipeline_parallel_size != 1
+-                    or config.parallel_config.use_ubatching
+-                ):
+-                    raise NotImplementedError(
+-                        "MXFP4-CSF shared scale scratch requires PP1 without ubatching"
+-                    )
+-                if config.load_config.load_format not in ("mxfp4_csf",):
+-                    raise ValueError("MXFP4-CSF requires --load-format mxfp4_csf ")
+-                return Mxfp4CsfMoEMethod(
+-                    layer.moe_config,
+-                    self,
+-                    activation_mode="a16" if envs.VLLM_B12X_MOE_FP4_FORCE_A16 else "a8",
+-                )
+-        return super().get_quant_method(layer, prefix)
+-
+-
+ class Mxfp4CsfMoEMethod(FusedMoEMethodBase):
+     """Expand scales for routed experts into serialized, model-owned scratch."""
+ 
+diff --git a/vllm/model_executor/model_loader/__init__.py b/vllm/model_executor/model_loader/__init__.py
+index 3fd6d5102..245d0757c 100644
+--- a/vllm/model_executor/model_loader/__init__.py
++++ b/vllm/model_executor/model_loader/__init__.py
+@@ -34,7 +34,6 @@ logger = init_logger(__name__)
+ # if a new load format is added here
+ LoadFormats = Literal[
+     "auto",
+-    "b12x",
+     "direct",
+     "hf",
+     "dummy",
+@@ -129,10 +128,6 @@ def register_model_loader(load_format: str):
+ def get_model_loader(load_config: LoadConfig) -> BaseModelLoader:
+     """Get a model loader based on the load format."""
+     load_format = load_config.load_format
+-    if load_format == "b12x" and load_format not in _LOAD_FORMAT_TO_MODEL_LOADER:
+-        from vllm.model_executor.model_loader.b12x_loader import B12xModelLoader
+-
+-        _LOAD_FORMAT_TO_MODEL_LOADER[load_format] = B12xModelLoader
+     if load_format not in _LOAD_FORMAT_TO_MODEL_LOADER:
+         raise ValueError(f"Load format `{load_format}` is not supported")
+     return _LOAD_FORMAT_TO_MODEL_LOADER[load_format](load_config)
+diff --git a/vllm/model_executor/model_loader/b12x_loader.py b/vllm/model_executor/model_loader/b12x_loader.py
+deleted file mode 100644
+index b3413bc4d..000000000
+--- a/vllm/model_executor/model_loader/b12x_loader.py
++++ /dev/null
+@@ -1,316 +0,0 @@
+-# SPDX-License-Identifier: Apache-2.0
+-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+-
+-"""Checkpoint loading into ordinary PyTorch CUDA allocations."""
+-
+-from __future__ import annotations
+-
+-import dataclasses
+-import heapq
+-import json
+-import math
+-import sys
+-import time
+-from collections.abc import Iterator
+-from contextlib import ExitStack, contextmanager, nullcontext
+-from pathlib import Path
+-
+-import regex as re
+-import torch
+-from b12x.loader import capabilities
+-from b12x.loader._checkpoint import DirectWeightSession
+-from b12x.loader._progress import CheckpointDisplay
+-from b12x.loader._shared_checkpoint import SharedReadGroup
+-
+-from vllm.logger import init_logger
+-from vllm.model_executor.model_loader import weight_utils
+-from vllm.model_executor.model_loader.default_loader import DefaultModelLoader
+-from vllm.model_executor.model_loader.weight_utils import enable_tqdm
+-
+-logger = init_logger("vllm.model_executor.model_loader.b12x")
+-
+-
+-@contextmanager
+-def _ipc_weight_allocations() -> Iterator[None]:
+-    """Use IPC-exportable weight storage and restore the runtime allocator policy."""
+-    original = torch._C._accelerator_getAllocatorSettings()
+-    configured = re.sub(r"(\bexpandable_segments\s*:\s*)True\b", r"\1False", original)
+-    if configured == original:
+-        yield
+-        return
+-    torch._C._accelerator_setAllocatorSettings(configured)
+-    try:
+-        yield
+-    finally:
+-        torch._C._accelerator_setAllocatorSettings(original)
+-
+-
+-class B12xModelLoader(DefaultModelLoader):
+-    """Route checkpoint views through an asynchronous read ring or GDS."""
+-
+-    def __init__(self, load_config):
+-        missing = [
+-            name
+-            for name in ("file_source_tensor", "safetensors_file_sources")
+-            if not hasattr(weight_utils, name)
+-        ]
+-        if missing:
+-            raise RuntimeError(
+-                "b12x checkpoint loader requires vLLM file-source hooks: "
+-                + ", ".join(missing)
+-            )
+-        options = dict(load_config.model_loader_extra_config)
+-        self.io_threads = options.pop("io_threads", 8)
+-        self.read_mode = options.pop("read_mode", "auto")
+-        if self.read_mode not in ("auto", "bounce", "gds"):
+-            raise ValueError("read_mode must be auto, bounce or gds")
+-        if options.get("enable_multithread_load"):
+-            raise ValueError("b12x currently uses synchronous checkpoint routing")
+-        if load_config.safetensors_load_strategy not in (None, "lazy"):
+-            raise ValueError(
+-                "b12x O_DIRECT input does not use safetensors read strategies"
+-            )
+-        super().__init__(
+-            dataclasses.replace(
+-                load_config,
+-                load_format="safetensors",
+-                model_loader_extra_config=options,
+-            )
+-        )
+-        self._session = None
+-        self._progress = None
+-
+-    def load_model(self, vllm_config, model_config, prefix=""):
+-        from vllm.model_executor.weight_transfer import weight_transfer
+-
+-        device = torch.device(
+-            self.load_config.device or vllm_config.device_config.device
+-        )
+-        if device.type != "cuda":
+-            raise ValueError("the b12x loader requires a CUDA device")
+-        index = (
+-            torch.accelerator.current_device_index()
+-            if device.index is None
+-            else device.index
+-        )
+-        shared_read_group = None
+-        read_mode = self.read_mode
+-        if read_mode == "auto":
+-            read_mode = "bounce" if capabilities(index)["host_page_tables"] else "gds"
+-        if read_mode == "gds":
+-            if model_config.enable_cumem_allocator:
+-                raise ValueError(
+-                    "b12x shared GDS loading requires CUDA IPC-exportable weight "
+-                    "allocations and does not support the CuMem allocator or sleep mode"
+-                )
+-            from vllm.distributed.parallel_state import get_tp_group
+-
+-            shared_read_group = SharedReadGroup(get_tp_group().cpu_group, index)
+-        with (
+-            _ipc_weight_allocations()
+-            if shared_read_group is not None
+-            else nullcontext(),
+-            DirectWeightSession(
+-                index,
+-                io_threads=self.io_threads,
+-                shared_read_group=shared_read_group,
+-                read_mode=read_mode,
+-            ) as session,
+-            weight_transfer(session),
+-        ):
+-            self._session = session
+-            try:
+-                model = super().load_model(vllm_config, model_config, prefix)
+-                io_stats = session.stats()
+-            finally:
+-                self._session = None
+-        model._b12x_loader_storage = {
+-            "parameter_bytes": sum(p.nbytes for p in model.parameters()),
+-            "io": io_stats,
+-        }
+-        logger.debug("b12x O_DIRECT I/O counters: %s", io_stats)
+-        load_seconds = (
+-            self.counter_after_loading_weights - self.counter_before_loading_weights
+-        )
+-        payload_gb = io_stats["payload_bytes"] / 1e9
+-        logger.debug(
+-            "b12x effective weight loading: %.2f GB in %.2f s = %.2f GB/s "
+-            "(selected checkpoint payload, per rank)",
+-            payload_gb,
+-            load_seconds,
+-            payload_gb / load_seconds,
+-        )
+-        return model
+-
+-    def load_weights(self, model, model_config):
+-        from vllm.utils.system_utils import undecorated_log_stream
+-        from vllm.v1.executor._b12x_output import PreparationOutput
+-
+-        session = self._session
+-        group = session.shared_read_group if session is not None else None
+-        if group is not None:
+-            group.start(session)
+-            # Construction-time rank output must precede the live panel.
+-            group._gather(None)
+-        progress = CheckpointDisplay(
+-            enabled=enable_tqdm(self.load_config.use_tqdm_on_load),
+-            stream=undecorated_log_stream(sys.stderr),
+-        )
+-        with ExitStack() as stack:
+-            output = stack.enter_context(
+-                PreparationOutput(
+-                    progress.write_output,
+-                    enabled=progress._enabled and progress._stream.isatty(),
+-                )
+-            )
+-            if output.stream is not None:
+-                progress._stream = output.stream
+-            stack.enter_context(progress)
+-            stack.callback(output.stop)
+-            self._progress = progress
+-            if session is not None:
+-                session.progress = progress.phase
+-            if group is not None:
+-                group.progress = progress.phase
+-            try:
+-                super().load_weights(model, model_config)
+-            finally:
+-                self._progress = None
+-                if session is not None:
+-                    session.progress = None
+-                if group is not None:
+-                    group.progress = None
+-
+-    def _log_loading_time(self):
+-        session, progress = self._session, self._progress
+-        if session is not None and progress is not None:
+-            group = session.shared_read_group
+-            if group is not None and not group.epoch:
+-                raise RuntimeError(
+-                    "device checkpoint loading requires vLLM's "
+-                    "finish_weight_transfers routing hook"
+-                )
+-            session.flush()
+-            stats = session.stats(flush=False)
+-            summary = (
+-                dict(group.summary)
+-                if group is not None
+-                else dict(
+-                    ranks=1,
+-                    payload_bytes=stats["payload_bytes"],
+-                    physical_bytes=stats["physical_bytes"],
+-                )
+-            )
+-            summary["load_seconds"] = (
+-                self.counter_after_loading_weights - self.counter_before_loading_weights
+-            )
+-            progress.complete(summary)
+-            progress.stop()
+-        super()._log_loading_time()
+-
+-    @staticmethod
+-    def _needs_values(entry):
+-        return math.prod(entry.shape) == 1 or entry.name.rsplit(".", 1)[-1] in {
+-            "layer_multipliers",
+-            "ngram_heads_offsets",
+-            "ngram_heads_vocab_sizes",
+-        }
+-
+-    def _file_backed_weights_iterator(self, files, source, index_path):
+-        from vllm.model_executor.model_loader.ep_weight_filter import should_skip_weight
+-
+-        session = self._session
+-        if session is None:
+-            raise RuntimeError("b12x requires an active initial-load session")
+-        weight_map = None
+-        if index_path.is_file():
+-            weight_map = json.loads(index_path.read_text())["weight_map"]
+-        indexed_paths = {}
+-        for path in files:
+-            sources = weight_utils.safetensors_file_sources(path)
+-            file_names = {name for name in sources if source.file_weight_filter(name)}
+-            resolved_path = Path(path).resolve()
+-            selected = []
+-            for name in sorted(sources):
+-                if source.weight_name_prefixes and not name.startswith(
+-                    source.weight_name_prefixes
+-                ):
+-                    continue
+-                if weight_map is not None:
+-                    indexed_file = weight_map.get(name)
+-                    if indexed_file is None:
+-                        continue
+-                    if indexed_file not in indexed_paths:
+-                        indexed_paths[indexed_file] = (
+-                            index_path.parent / indexed_file
+-                        ).resolve()
+-                    if indexed_paths[indexed_file] != resolved_path:
+-                        continue
+-                if not should_skip_weight(name, self.local_expert_ids):
+-                    selected.append(name)
+-            file_backed = (
+-                (source.prefix + name, weight_utils.file_source_tensor(sources[name]))
+-                for name in selected
+-                if name in file_names
+-            )
+-            # File-backed entries never enter the checkpoint direct reader, even
+-            # for mixed files or before metadata-value reads and routing.
+-            ordinary = (
+-                session.weights(
+-                    [path],
+-                    prefixes=source.weight_name_prefixes,
+-                    prefix=source.prefix,
+-                    index_path=index_path,
+-                    needs_values=self._needs_values,
+-                    skip=lambda name, file_names=file_names: (
+-                        name in file_names
+-                        or should_skip_weight(name, self.local_expert_ids)
+-                    ),
+-                )
+-                if any(name not in file_names for name in selected)
+-                else ()
+-            )
+-            yield from heapq.merge(file_backed, ordinary, key=lambda item: item[0])
+-
+-    def _get_weights_iterator(self, source):
+-        from vllm.model_executor.model_loader.ep_weight_filter import should_skip_weight
+-
+-        session = self._session
+-        if session is None:
+-            raise RuntimeError("b12x requires an active initial-load session")
+-        folder, files, _ = self._prepare_weights(
+-            source.model_or_path,
+-            source.subfolder,
+-            source.revision,
+-            False,
+-            source.allow_patterns_overrides,
+-            source.weight_name_prefixes,
+-        )
+-        if self.counter_before_loading_weights == 0.0:
+-            self.counter_before_loading_weights = time.perf_counter()
+-        if self._progress is not None:
+-            self._progress.source(len(files))
+-
+-        def progress_files():
+-            for path in files:
+-                if self._progress is not None:
+-                    self._progress.file(Path(path).name)
+-                yield path
+-                if self._progress is not None:
+-                    self._progress.advance(session.payload_bytes)
+-
+-        if source.file_weight_filter is not None:
+-            yield from self._file_backed_weights_iterator(
+-                progress_files(),
+-                source,
+-                Path(folder) / "model.safetensors.index.json",
+-            )
+-            return
+-        yield from session.weights(
+-            progress_files(),
+-            prefixes=source.weight_name_prefixes,
+-            prefix=source.prefix,
+-            index_path=Path(folder) / "model.safetensors.index.json",
+-            needs_values=self._needs_values,
+-            skip=lambda name: should_skip_weight(name, self.local_expert_ids),
+-        )
+diff --git a/vllm/model_executor/model_loader/direct_loader.py b/vllm/model_executor/model_loader/direct_loader.py
+index f7cb50712..ca8e5f9df 100644
+--- a/vllm/model_executor/model_loader/direct_loader.py
++++ b/vllm/model_executor/model_loader/direct_loader.py
+@@ -34,8 +34,9 @@ loader refuses others, since it has no GPU-direct-storage path. The native helpe
+ once the weights are loaded.
+ 
+ Ported from local-inference-lab/b12x b12x/integration/vllm/loader.py at 236ddff04a5f
+-(Apache-2.0) and vLLM's copy of it (``b12x_loader.py``). Changed: no GDS transport,
+-shared read group, IPC-exportable allocations or progress panel.
++(Apache-2.0) and vLLM's former copy of it (``b12x_loader.py``, the ``b12x`` load
++format). Changed: no GDS transport, shared read group, IPC-exportable allocations or
++progress panel.
+ """
+ 
+ import dataclasses
+diff --git a/vllm/model_executor/warmup/b12x_prepare.py b/vllm/model_executor/warmup/b12x_prepare.py
+index 60a7f97b2..723c3433c 100644
+--- a/vllm/model_executor/warmup/b12x_prepare.py
++++ b/vllm/model_executor/warmup/b12x_prepare.py
+@@ -255,7 +255,9 @@ def _units_from_modules(
+         if workload.stage == "weights":
+             head = getattr(module, "lm_head", None)
+             processor = getattr(module, "logits_processor", None)
+-            bind_head = getattr(processor, "prepare_b12x_vocab_projection", None)
++            bind_head = getattr(
++                processor, "prepare_vocab_projection", None
++            ) or getattr(processor, "prepare_b12x_vocab_projection", None)
+             if head is not None and callable(bind_head):
+                 bind_head(head)
+         provider = getattr(module, "b12x_preparation_provider", None)
+@@ -546,18 +548,23 @@ def begin_b12x_preparation(worker: Worker, *, stage: str):
+     from vllm.v1.worker.b12x_startup import B12xPreparationCoordinator
+     from vllm.v1.worker.workspace import current_workspace_manager
+ 
+-    batches = []
+-    units: list[B12xPreparationUnit] = []
+-    if b12x_native_supported(worker):
+-        workload = b12x_workload(worker, stage="state" if stage == "bind" else stage)
+-        units = collect_b12x_units(worker, workload)
+-        batches = b12x_batches(
+-            units,
+-            autotune=(
+-                bool(worker.vllm_config.kernel_config.enable_b12x_autotune)
+-                and os.environ.get("B12X_AUTOTUNE", "1") != "0"
+-            ),
++    if not b12x_native_supported(worker):
++        return B12xPreparationCoordinator(
++            None,
++            [],
++            global_rank=int(worker.rank),
++            world_group=None,
++            process_local_only=True,
+         )
++    workload = b12x_workload(worker, stage="state" if stage == "bind" else stage)
++    units = collect_b12x_units(worker, workload)
++    batches = b12x_batches(
++        units,
++        autotune=(
++            bool(worker.vllm_config.kernel_config.enable_b12x_autotune)
++            and os.environ.get("B12X_AUTOTUNE", "1") != "0"
++        ),
++    )
+     session = get_b12x_session(worker) if batches else None
+     if getattr(worker, "_b12x_tuning_cache", False):
+         worker._b12x_tuning_batch = B12xPreparedBatch(
+@@ -670,16 +677,15 @@ def release_b12x_tuning_cache(worker: Worker) -> None:
+ 
+ def prepare_b12x_profile(worker: Worker, *, stage: str) -> B12xPreparedBatch:
+     """Prime profiling-pool plans with defaults in complete-world control rounds."""
++    if not b12x_native_supported(worker):
++        return B12xPreparedBatch(None, ())
+     from vllm.distributed.parallel_state import get_world_group
+     from vllm.v1.worker.b12x_startup import B12xPreparationCoordinator
+     from vllm.v1.worker.workspace import current_workspace_manager
+ 
+-    requests: tuple[PreparationRequest, ...] = ()
+-    units: list[B12xPreparationUnit] = []
+-    if b12x_native_supported(worker):
+-        workload = b12x_workload(worker, stage=stage)
+-        units = collect_b12x_units(worker, workload)
+-        requests = tuple(request for unit in units for request in unit.requests)
++    workload = b12x_workload(worker, stage=stage)
++    units = collect_b12x_units(worker, workload)
++    requests = tuple(request for unit in units for request in unit.requests)
+     session = get_b12x_session(worker) if requests else None
+     fresh = tuple(request.plan for request in requests if request.plan.prepared is None)
+     batch = B12xPreparedBatch(session, fresh)
+diff --git a/vllm/models/deepseek_v4/mxfp4_csf.py b/vllm/models/deepseek_v4/mxfp4_csf.py
+index d1f121df8..ab88c5917 100644
+--- a/vllm/models/deepseek_v4/mxfp4_csf.py
++++ b/vllm/models/deepseek_v4/mxfp4_csf.py
+@@ -15,7 +15,7 @@ import torch
+ import vllm.envs as envs
+ from vllm.config import get_current_vllm_config, get_current_vllm_config_or_none
+ from vllm.model_executor.layers.fused_moe.routed_experts import RoutedExperts
+-from vllm.models.deepseek_v4_1.mxfp4_csf import Mxfp4CsfMoEMethod
++from vllm.model_executor.layers.quantization.mxfp4_csf_moe import Mxfp4CsfMoEMethod
+ from vllm.models.deepseek_v41.quant_config import DeepseekV4FP8Config
+ 
+ 
+diff --git a/vllm/models/deepseek_v4_1/attention.py b/vllm/models/deepseek_v4_1/attention.py
+index f05021dd6..36879f1b4 100644
+--- a/vllm/models/deepseek_v4_1/attention.py
++++ b/vllm/models/deepseek_v4_1/attention.py
+@@ -40,8 +40,8 @@ from vllm.models.deepseek_v4_1.compressor import DeepseekCompressor
+ from vllm.models.deepseek_v4_1.quant_config import Block32FP8LinearMethod
+ from vllm.models.deepseek_v4_1.sparse_mla import (
+     SLOT_DTYPE,
+-    DeepseekV41B12xBackend,
+-    DeepseekV41B12xMetadata,
++    DeepseekV41Backend,
++    DeepseekV41Metadata,
+     tilelang_builder_kernels,
+ )
+ from vllm.models.deepseek_v4_1.tilelang import prepare
+@@ -117,7 +117,7 @@ class _Cache(nn.Module, AttentionLayerBase):
+             ),
+             dtype=torch.uint8,
+             tokens_per_state=self.ratio,
+-            cache_dtype_str="b12x_dsv41",
++            cache_dtype_str="dsv41",
+             alignment=None,
+             uses_only_written_slots=True,
+         )
+@@ -137,7 +137,7 @@ class _Cache(nn.Module, AttentionLayerBase):
+         return MLAAttentionSpec(**common)
+ 
+     def get_attn_backend(self):
+-        return DeepseekV41B12xBackend
++        return DeepseekV41Backend
+ 
+     def forward(self):
+         raise RuntimeError("V4.1 caches are consumed by their owning attention layer")
+@@ -431,7 +431,7 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase):
+     ``_quantize_index_query``, ``_write_index_keys``, ``_index_chunk`` and
+     ``_attend``."""
+ 
+-    backend_cls = DeepseekV41B12xBackend
++    backend_cls = DeepseekV41Backend
+     # Index scores need bounded row scratch; attention handles the whole batch.
+     INDEX_CHUNK = 256
+     DECODE_CHUNK = 64
+@@ -651,7 +651,7 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase):
+             state_content_bytes=288,
+             dtype=torch.uint8,
+             tokens_per_state=self.compress_ratio,
+-            cache_dtype_str="b12x_dsv41",
++            cache_dtype_str="dsv41",
+             alignment=None,
+             uses_only_written_slots=True,
+         )
+@@ -1072,7 +1072,7 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase):
+             key = project_bf16_partials(indexer.wk, latent)
+         else:
+             key = indexer.wk(latent)
+-        index_meta = cast(DeepseekV41B12xMetadata, metadata[indexer.k_cache.prefix])
++        index_meta = cast(DeepseekV41Metadata, metadata[indexer.k_cache.prefix])
+         self._write_index_keys(key, index_meta.slot_mapping[:rows], positions=positions)
+         if not fuse_kv_write:
+             self._write_v41_cache(
+@@ -1152,9 +1152,9 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase):
+         hidden_states: torch.Tensor | None,
+         index_weights: torch.Tensor | None,
+         rows: int,
+-        metadata: dict[str, DeepseekV41B12xMetadata],
+-        swa: DeepseekV41B12xMetadata,
+-        original_swa: DeepseekV41B12xMetadata,
++        metadata: dict[str, DeepseekV41Metadata],
++        swa: DeepseekV41Metadata,
++        original_swa: DeepseekV41Metadata,
+         q_cast,
+     ):
+         stream = aux_stream()
+@@ -1476,7 +1476,7 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase):
+             del q_cast
+         self._issue_wo_prefetch(rows, after="q-b")
+         metadata = cast(
+-            dict[str, DeepseekV41B12xMetadata] | None,
++            dict[str, DeepseekV41Metadata] | None,
+             get_forward_context().attn_metadata,
+         )
+         if not isinstance(metadata, dict):
+diff --git a/vllm/models/deepseek_v4_1/ced.py b/vllm/models/deepseek_v4_1/ced.py
+index 902865482..05150ac97 100644
+--- a/vllm/models/deepseek_v4_1/ced.py
++++ b/vllm/models/deepseek_v4_1/ced.py
+@@ -15,7 +15,7 @@ from .tilelang import columns, prepare
+ 
+ if TYPE_CHECKING:
+     from .sp_prefill import SPRows
+-    from .sparse_mla import DeepseekV41B12xMetadata
++    from .sparse_mla import DeepseekV41Metadata
+ 
+ CED_WINDOW = 128
+ # The kept-row limit of a request that keeps every row (prompt logprobs, capture).
+@@ -370,8 +370,8 @@ class CEDState:
+         return None if self.plan is None else self.indices[: self.plan.num_tokens]
+ 
+     def decoder_metadata(
+-        self, metadata: DeepseekV41B12xMetadata
+-    ) -> DeepseekV41B12xMetadata:
++        self, metadata: DeepseekV41Metadata
++    ) -> DeepseekV41Metadata:
+         plan = self.plan
+         assert plan is not None
+         indices = self.indices[: plan.num_tokens]
+diff --git a/vllm/models/deepseek_v4_1/common/engram.py b/vllm/models/deepseek_v4_1/common/engram.py
+index 0ec6fbb99..f686e4631 100644
+--- a/vllm/models/deepseek_v4_1/common/engram.py
++++ b/vllm/models/deepseek_v4_1/common/engram.py
+@@ -41,9 +41,8 @@ class _PaddedColumnParallelLinear(ColumnParallelLinear):
+     The output is padded to a multiple of tp_size x 32 rows so every rank owns
+     whole block-FP8 scale blocks. The last rank's missing checkpoint rows are
+     zero-filled through the loader's existing ``allow_tp_padding`` path (a
+-    narrowed copy the B12X checkpoint loader supports), so the padded rows
+-    compute exactly zero, and the gathered output is sliced back to the
+-    logical width.
++    narrowed copy the direct loader supports), so the padded rows compute
++    exactly zero, and the gathered output is sliced back to the logical width.
+     """
+ 
+     def __init__(self, input_size, output_size, **kwargs):
+@@ -282,8 +281,6 @@ class EngramLayout:
+             )
+             for layer in self.layer_ids
+         )
+-        # Both disk and resident tables gather/lookup with TileLang kernels.
+-        self.lookup_plans = (None,) * len(self.caps)
+ 
+     @classmethod
+     def from_config(cls, config):
+@@ -512,9 +509,8 @@ def interleaved_sp_rows(local: torch.Tensor, sp_rows) -> torch.Tensor:
+ 
+ 
+ class ParallelEngramEmbedding(nn.Module):
+-    def __init__(self, plan, caps, geometry, table_memory="device"):
++    def __init__(self, caps, geometry, table_memory="device"):
+         super().__init__()
+-        self.plan = plan
+         self.caps = caps
+         self.geometry = geometry
+         self.layer_index = geometry.layer_ids.index(caps.layer_id)
+@@ -925,10 +921,9 @@ class Engram(nn.Module):
+         self.dim = config.hidden_size
+         self.hc_mult = config.hc_mult
+         self.eps = config.rms_norm_eps
+-        plan = layout.lookup_plans[layer_hash_index]
+         caps = layout.caps[layer_hash_index]
+         self.embed_tokens = ParallelEngramEmbedding(
+-            plan, caps, layout.geometry, layout.table_memory
++            caps, layout.geometry, layout.table_memory
+         )
+         self._disk_prepared = False
+         self._disk_prepared_tokens = 0
+@@ -999,9 +994,6 @@ class Engram(nn.Module):
+             persistent=False,
+         )
+ 
+-    def get_b12x_preparation_units(self, layer=None, workload=None):
+-        return ()
+-
+     def declare_kernels(self) -> None:
+         """Declare the TileLang gate (both standalone and fused with ``mhc.post``):
+         on packed rows always, and on the column blocks of a column-parallel
+diff --git a/vllm/models/deepseek_v4_1/compressor.py b/vllm/models/deepseek_v4_1/compressor.py
+index 999fe061a..fba362616 100644
+--- a/vllm/models/deepseek_v4_1/compressor.py
++++ b/vllm/models/deepseek_v4_1/compressor.py
+@@ -11,7 +11,7 @@ from vllm.distributed.communication_op import tensor_model_parallel_all_gather
+ from vllm.model_executor.layers import linear as linear_layers
+ from vllm.model_executor.layers.attention_layer_base import AttentionLayerBase
+ from vllm.model_executor.layers.linear import MergedColumnParallelLinear
+-from vllm.models.deepseek_v4_1.sparse_mla import SLOT_DTYPE, DeepseekV41B12xBackend
++from vllm.models.deepseek_v4_1.sparse_mla import SLOT_DTYPE, DeepseekV41Backend
+ from vllm.v1.attention.backend import MultipleOf
+ from vllm.v1.kv_cache_interface import CircularBufferSpec
+ 
+@@ -144,10 +144,10 @@ _SHARED_BUFFERS: WeakValueDictionary[
+ ] = WeakValueDictionary()
+ 
+ 
+-class CompressorBackend(DeepseekV41B12xBackend):
++class CompressorBackend(DeepseekV41Backend):
+     @staticmethod
+     def get_name():
+-        return "B12X_DSV41_COMPRESSOR"
++        return "DSV41_COMPRESSOR"
+ 
+     @staticmethod
+     def get_supported_kernel_block_sizes():
+diff --git a/vllm/models/deepseek_v4_1/nvidia/dspark.py b/vllm/models/deepseek_v4_1/nvidia/dspark.py
+index 7ac9d3e93..cc87613b3 100644
+--- a/vllm/models/deepseek_v4_1/nvidia/dspark.py
++++ b/vllm/models/deepseek_v4_1/nvidia/dspark.py
+@@ -982,7 +982,7 @@ class DSparkDeepseekV4ForCausalLM(nn.Module):
+         return loaded_params
+ 
+     def process_weights_after_loading(self) -> None:
+-        self.logits_processor.prepare_b12x_vocab_projection(
++        self.logits_processor.prepare_vocab_projection(
+             self.model.markov_head.markov_w2
+         )
+         for layer in self.model.layers:
+diff --git a/vllm/models/deepseek_v4_1/nvidia/model_state.py b/vllm/models/deepseek_v4_1/nvidia/model_state.py
+index deed5ce80..44efc8795 100644
+--- a/vllm/models/deepseek_v4_1/nvidia/model_state.py
++++ b/vllm/models/deepseek_v4_1/nvidia/model_state.py
+@@ -16,7 +16,7 @@ from vllm.models.deepseek_v4_1.ced import (
+     ced_decoder_start,
+     replay_rows,
+ )
+-from vllm.models.deepseek_v4_1.sparse_mla import DeepseekV41B12xMetadata
++from vllm.models.deepseek_v4_1.sparse_mla import DeepseekV41Metadata
+ from vllm.models.deepseek_v4_1.tilelang import ced as ced_kernels
+ from vllm.v1.core.sched.output import NewRequestData
+ from vllm.v1.kv_cache_interface import KVCacheConfig
+@@ -350,7 +350,7 @@ class DeepseekV41ModelState(DefaultModelState):
+                 routing_mask = ced_kernels.routing_mask(indices, input_batch.is_padding)
+             seen: set[int] = set()
+             for value in metadata.values():
+-                if isinstance(value, DeepseekV41B12xMetadata) and id(value) not in seen:
++                if isinstance(value, DeepseekV41Metadata) and id(value) not in seen:
+                     seen.add(id(value))
+                     value.swa_replay_start = state.replay_start
+                     if state.plan is not None:
+diff --git a/vllm/models/deepseek_v4_1/sp_prefill.py b/vllm/models/deepseek_v4_1/sp_prefill.py
+index 4b6557d7c..d4daeb67f 100644
+--- a/vllm/models/deepseek_v4_1/sp_prefill.py
++++ b/vllm/models/deepseek_v4_1/sp_prefill.py
+@@ -654,7 +654,9 @@ def _tp_roce_comm():
+         dev_comm = get_tp_group().device_communicator
+     except Exception:
+         return None
+-    roce_comm = getattr(dev_comm, "b12x_ar_comm", None)
++    roce_comm = getattr(dev_comm, "roce_ar_comm", None) or getattr(
++        dev_comm, "b12x_ar_comm", None
++    )
+     if roce_comm is None or getattr(roce_comm, "disabled", False):
+         return None
+     return roce_comm
+diff --git a/vllm/models/deepseek_v4_1/sparse_mla.py b/vllm/models/deepseek_v4_1/sparse_mla.py
+index a01247b64..309718fc2 100644
+--- a/vllm/models/deepseek_v4_1/sparse_mla.py
++++ b/vllm/models/deepseek_v4_1/sparse_mla.py
+@@ -20,7 +20,7 @@ from vllm.v1.kv_cache_interface import CircularBufferSpec, KVCacheLayout
+ 
+ 
+ @dataclass
+-class DeepseekV41B12xMetadata:
++class DeepseekV41Metadata:
+     num_actual_tokens: int
+     num_reqs: int
+     max_query_len: int
+@@ -35,7 +35,7 @@ class DeepseekV41B12xMetadata:
+     cache_lengths: torch.Tensor
+     is_decode: bool
+     max_seq_len: int
+-    decoder: "DeepseekV41B12xMetadata | None" = None
++    decoder: "DeepseekV41Metadata | None" = None
+     swa_replay_start: torch.Tensor | None = None
+     # Rows the CED decoder's MoE routes (False for padding), in its compact layout.
+     routing_mask: torch.Tensor | None = None
+@@ -71,7 +71,7 @@ def tilelang_builder_kernels(kv_cache_spec, max_requests: int) -> list:
+ SLOT_DTYPE = torch.int64
+ 
+ 
+-class DeepseekV41B12xMetadataBuilder(AttentionMetadataBuilder):
++class DeepseekV41MetadataBuilder(AttentionMetadataBuilder):
+     _cudagraph_support: ClassVar[AttentionCGSupport] = AttentionCGSupport.ALWAYS
+ 
+     def __init__(self, kv_cache_spec, layer_names, vllm_config, device):
+@@ -169,7 +169,7 @@ class DeepseekV41B12xMetadataBuilder(AttentionMetadataBuilder):
+             )[2]
+         else:
+             decode_tokens = 0
+-        return DeepseekV41B12xMetadata(
++        return DeepseekV41Metadata(
+             cm.num_actual_tokens,
+             cm.num_reqs,
+             cm.max_query_len,
+@@ -188,7 +188,7 @@ class DeepseekV41B12xMetadataBuilder(AttentionMetadataBuilder):
+         )
+ 
+ 
+-class DeepseekV41B12xBackend(AttentionBackend):
++class DeepseekV41Backend(AttentionBackend):
+     supported_dtypes = [torch.bfloat16]
+     supported_kv_cache_dtypes = ["auto", "fp8", "fp8_ds_mla"]
+ 
+@@ -199,11 +199,11 @@ class DeepseekV41B12xBackend(AttentionBackend):
+ 
+     @staticmethod
+     def get_name():
+-        return "B12X"
++        return "DSV41"
+ 
+     @staticmethod
+     def get_builder_cls():
+-        return DeepseekV41B12xMetadataBuilder
++        return DeepseekV41MetadataBuilder
+ 
+     @staticmethod
+     def get_supported_kernel_block_sizes():
+diff --git a/vllm/models/deepseek_v4_1/tilelang/attention.py b/vllm/models/deepseek_v4_1/tilelang/attention.py
+index ddc4426cf..db645f3af 100644
+--- a/vllm/models/deepseek_v4_1/tilelang/attention.py
++++ b/vllm/models/deepseek_v4_1/tilelang/attention.py
+@@ -19,7 +19,7 @@ from types import SimpleNamespace
+ import torch
+ 
+ from vllm.models.deepseek_v4_1.attention import DeepseekV4Attention
+-from vllm.models.deepseek_v4_1.sparse_mla import SLOT_DTYPE, DeepseekV41B12xBackend
++from vllm.models.deepseek_v4_1.sparse_mla import SLOT_DTYPE, DeepseekV41Backend
+ from vllm.v1.worker.workspace import (
+     current_workspace_manager,
+     retain_cuda_graph_capture_resource,
+@@ -47,7 +47,7 @@ def _lsa_enabled() -> bool:
+     return os.environ.get("VLLM_DS41_LSA") == "1"
+ 
+ 
+-class DeepseekV41TileLangBackend(DeepseekV41B12xBackend):
++class DeepseekV41TileLangBackend(DeepseekV41Backend):
+     """The V4.1 cache layout and metadata builder, under the TileLang name."""
+ 
+     @staticmethod
+diff --git a/vllm/models/deepseek_v4_1/tilelang/engram_rows.py b/vllm/models/deepseek_v4_1/tilelang/engram_rows.py
+index 88a9dacd6..2441ba0fd 100644
+--- a/vllm/models/deepseek_v4_1/tilelang/engram_rows.py
++++ b/vllm/models/deepseek_v4_1/tilelang/engram_rows.py
+@@ -521,7 +521,14 @@ def engram_resident_lookup_kernel(
+             tx = T.get_thread_binding()
+             head = first + column * step
+             row = ids[t, head]
+-            owned = (t < num_tokens[0]) & (row >= shard_start) & (row < shard_end)
++            n_tok = num_tokens[0]
++            owned = (
++                (n_tok >= 0)
++                & (n_tok <= tokens)
++                & (t < n_tok)
++                & (row >= shard_start)
++                & (row < shard_end)
++            )
+             if owned:
+                 local_row = row - T.int64(shard_start)
+                 exponent = T.cast(scales[local_row, tx * vec // 32], T.uint32)
+@@ -586,3 +593,8 @@ def engram_resident_lookup(
+             weight.shape[0], shard_start, shard_end, columns, *extra
+         )
+         kernel(ids[:tokens], num_tokens, weight, scales.view(torch.uint8), out)
++
++
++engram_table_gather_kernel = engram_resident_lookup_kernel
++table_gather_calls = resident_lookup_calls
++engram_table_gather = engram_resident_lookup
+diff --git a/vllm/models/deepseek_v4_1/tilelang/prepare.py b/vllm/models/deepseek_v4_1/tilelang/prepare.py
+index 5dee71059..d2c1f40f1 100644
+--- a/vllm/models/deepseek_v4_1/tilelang/prepare.py
++++ b/vllm/models/deepseek_v4_1/tilelang/prepare.py
+@@ -162,6 +162,13 @@ def declare_modules(*models: Any) -> None:
+                 continue
+             seen.add(id(module))
+             modules.append(module)
++            head = getattr(module, "lm_head", None)
++            processor = getattr(module, "logits_processor", None)
++            bind_head = getattr(
++                processor, "prepare_vocab_projection", None
++            ) or getattr(processor, "prepare_b12x_vocab_projection", None)
++            if head is not None and callable(bind_head):
++                bind_head(head)
+             method = getattr(module, "quant_method", None)
+             declare_layer = getattr(method, "declare_layer_kernels", None)
+             if declare_layer is not None:
+diff --git a/vllm/models/deepseek_v4_1/tilelang/vision.py b/vllm/models/deepseek_v4_1/tilelang/vision.py
+index d6aa77dc2..bcabe0c74 100644
+--- a/vllm/models/deepseek_v4_1/tilelang/vision.py
++++ b/vllm/models/deepseek_v4_1/tilelang/vision.py
+@@ -5,9 +5,10 @@
+ One image is evaluated per call; every kernel takes the image's live rows as a
+ dynamic dimension, so a capacity-sized workspace serves any grid and one compiled
+ kernel serves every image size. The arithmetic of each elementwise and row-wise
+-operation is B12X's (``b12x.norm.vision`` and ``b12x.norm.hyperconnection``), with
+-each rounding written out (``T.fma``, ``T.fmul``, ``T.ieee_*``) so the compiler
+-cannot contract or reorder it:
++operation is that of the B12X kernels this port replaced (``b12x.norm.vision`` and
++``b12x.norm.hyperconnection``, which are no longer installed), with each rounding
++written out (``T.fma``, ``T.fmul``, ``T.ieee_*``) so the compiler cannot contract or
++reorder it:
+ 
+ - ``pad_columns``: rows of ``width`` BF16 values copied into ``padded``-wide rows
+   whose tail is zero (the patch embedding's 588 columns become 640, whole K tiles,
+diff --git a/vllm/utils/b12x.py b/vllm/utils/b12x.py
+index bcb7fa27d..4fcd9514f 100644
+--- a/vllm/utils/b12x.py
++++ b/vllm/utils/b12x.py
+@@ -292,6 +292,7 @@ def build_moe_prefill_metadata(
+ 
+ 
+ _HAS_B12X = importlib.util.find_spec("b12x") is not None
++_UNLOADED = object()
+ 
+ 
+ def _import_submodule(module_name: str) -> ModuleType | None:
+@@ -303,8 +304,8 @@ def _import_submodule(module_name: str) -> ModuleType | None:
+         return None
+ 
+ 
+-_B12X_SUBMODULES = {
+-    module_name: _import_submodule(module_name)
++_B12X_SUBMODULES: dict[str, Any] = {
++    module_name: (_UNLOADED if _HAS_B12X else None)
+     for module_name in (
+         "b12x.attention.paged",
+         "b12x.attention.paged_decode",
+@@ -341,8 +342,18 @@ def has_b12x() -> bool:
+     return _HAS_B12X
+ 
+ 
++@torch.compiler.disable
++def _load_submodule(module_name: str) -> ModuleType | None:
++    module = _import_submodule(module_name)
++    _B12X_SUBMODULES[module_name] = module
++    return module
++
++
+ def _get_submodule(module_name: str) -> ModuleType | None:
+-    return _B12X_SUBMODULES.get(module_name)
++    entry = _B12X_SUBMODULES.get(module_name)
++    if entry is _UNLOADED:
++        return _load_submodule(module_name)
++    return entry
+ 
+ 
+ def get_b12x_blockscaled() -> ModuleType | None:
+diff --git a/vllm/v1/executor/abstract.py b/vllm/v1/executor/abstract.py
+index a1f1a97e6..31cce0cde 100644
+--- a/vllm/v1/executor/abstract.py
++++ b/vllm/v1/executor/abstract.py
+@@ -179,11 +179,19 @@ class Executor(ABC):
+ 
+     def compile_or_warm_up_model(self) -> None:
+         """Compile/warm up the model and capture cudagraphs on workers."""
+-        self._run_b12x_preparation(
+-            stage="bind"
+-            if getattr(self, "_b12x_state_tuned_before_allocation", False)
+-            else "state"
+-        )
++        from vllm.platforms import current_platform
++        from vllm.utils.b12x import has_b12x
++
++        if (
++            has_b12x()
++            and current_platform.is_cuda()
++            and current_platform.is_device_capability_family(120)
++        ):
++            self._run_b12x_preparation(
++                stage="bind"
++                if getattr(self, "_b12x_state_tuned_before_allocation", False)
++                else "state"
++            )
+         compilation_times: list[CompilationTimes] = self.collective_rpc(
+             "compile_or_warm_up_model"
+         )
+@@ -398,7 +406,15 @@ class Executor(ABC):
+         pass
+ 
+     def determine_available_memory(self) -> list[int]:  # in bytes
+-        self._run_b12x_preparation(stage="weights")
++        from vllm.platforms import current_platform
++        from vllm.utils.b12x import has_b12x
++
++        if (
++            has_b12x()
++            and current_platform.is_cuda()
++            and current_platform.is_device_capability_family(120)
++        ):
++            self._run_b12x_preparation(stage="weights")
+         return self.collective_rpc("determine_available_memory")
+ 
+     def get_kv_cache_specs(self) -> list[dict[str, KVCacheSpec]]:
+diff --git a/vllm/v1/worker/gpu_worker.py b/vllm/v1/worker/gpu_worker.py
+index bb3245136..5e7a2fcd0 100644
+--- a/vllm/v1/worker/gpu_worker.py
++++ b/vllm/v1/worker/gpu_worker.py
+@@ -636,9 +636,11 @@ class Worker(WorkerBase):
+             raise RuntimeError("b12x preparation is already active")
+         with set_current_vllm_config(self.vllm_config):
+             coordinator = begin_b12x_preparation(self, stage=stage)
+-        self._b12x_startup_coordinator = coordinator
+-        self._b12x_stage = stage
+-        return coordinator.status()
++        outcome = coordinator.status()
++        if not outcome["done"]:
++            self._b12x_startup_coordinator = coordinator
++            self._b12x_stage = stage
++        return outcome
+ 
+     def _prepare_b12x_profile_state(self) -> None:
+         """Prepare pool-dependent plans against the profiling pool, untimed."""
+@@ -1433,7 +1435,7 @@ class Worker(WorkerBase):
+     ) -> ModelRunnerOutput | AsyncModelRunnerOutput:
+         with _collective_cause(self._roce_failure):
+             output = self.model_runner.sample_tokens(grammar_output)
+-        return self._b12x_roce_guarded(output)
++        return self._roce_guarded(output)
+ 
+     def _roce_failure(self) -> str | None:
+         """The TP communicator's one-shot collective failure report, or None."""
+@@ -1546,17 +1548,21 @@ class Worker(WorkerBase):
+         if waited >= 1.0:
+             logger.info("Waited %.1f s for every rank before %s.", waited, phase)
+ 
+-    def _b12x_roce_health_check(self) -> Callable[[], None] | None:
++    def _roce_health_check(self) -> Callable[[], None] | None:
+         """The RoCEnante health check of the TP communicator, if one is active.
+ 
+         Returns:
+             The check callable, or None when RoCEnante is not in use.
+         """
+         communicator = get_tp_group().device_communicator
+-        comm = getattr(communicator, "b12x_ar_comm", None)
++        comm = getattr(communicator, "roce_ar_comm", None) or getattr(
++            communicator, "b12x_ar_comm", None
++        )
+         return getattr(comm, "check_health", None)
+ 
+-    def _b12x_roce_guarded(self, output):
++    _b12x_roce_health_check = _roce_health_check
++
++    def _roce_guarded(self, output):
+         """Fail-stop RoCEnante check once the step's output is on the host.
+ 
+         A RoCEnante wait that timed out records itself and freezes the runtime.
+@@ -1586,6 +1592,8 @@ class Worker(WorkerBase):
+         check()
+         return output
+ 
++    _b12x_roce_guarded = _roce_guarded
++
+     @torch.inference_mode()
+     @with_gpu_sync_check
+     def execute_model(
+@@ -1664,7 +1672,7 @@ class Worker(WorkerBase):
+             if isinstance(
+                 output, ModelRunnerOutput | AsyncModelRunnerOutput | NoneType
+             ):
+-                return self._b12x_roce_guarded(output)
++                return self._roce_guarded(output)
+ 
+         assert isinstance(output, IntermediateTensors)
+         parallel_config = self.vllm_config.parallel_config
+-- 
+2.43.0
+

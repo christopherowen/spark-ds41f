@@ -223,10 +223,53 @@ def format_accounting(by_label: dict) -> str:
 
 HEADLINE = ("decode geometric mean", "decode tok/s, paired", "output tok/s", "prefill ")
 PAIRED = "decode tok/s, paired"
+GEOMEAN = "decode geometric mean"
+
+
+def floor_metric(metric: str) -> bool:
+    """Rows a recorded A/A floor judges: a run step's paired decode row and an engine grid
+    step's geometric mean. Every other headline row keeps the run's own repeat."""
+    return metric == PAIRED or metric.startswith(GEOMEAN)
+
+
+def _step_rows(comparison: dict | None, step: str) -> dict:
+    """A comparison's rows of one step by metric, or nothing when the step is absent or skipped."""
+    steps = (comparison or {}).get("steps", {})
+    if step not in steps or "skipped" in steps[step]:
+        return {}
+    return {row["metric"]: row for row in steps[step][1].get("rows", [])}
+
+
+def _usable(row: dict | None) -> bool:
+    if row is None or row.get("ci95_pct") is None:
+        return False
+    return row["metric"] != PAIRED or row.get("low_pct") is not None
+
+
+def _sides(row: dict) -> tuple[float, float]:
+    """The interval's width below and above the change (a paired row's sides differ)."""
+    low, high = row.get("low_pct"), row.get("high_pct")
+    below = row["change_pct"] - low if low is not None else row["ci95_pct"]
+    above = high - row["change_pct"] if high is not None else row["ci95_pct"]
+    return below, above
+
+
+def boot_term(candidate_bound: float, reference_bound: float | None, candidate_boots: int,
+              reference_boots: int) -> float:
+    """The boot noise left in a change averaged over ``candidate_boots`` boots of the
+    candidate and ``reference_boots`` of the reference, from bounds on one boot against
+    another (each the larger of a recorded A/A floor and an observed repeat): a pair's
+    difference carries two boots, so each side contributes bound^2 / (2 x its boots). With
+    one bound for both sides this is bound x sqrt((1/b + 1/r) / 2): bound for one boot of
+    each, x0.866 for two candidate boots, x0.707 for two of each."""
+    reference_bound = candidate_bound if reference_bound is None else reference_bound
+    return math.sqrt(candidate_bound ** 2 / (2 * candidate_boots) + reference_bound ** 2 / (2 * reference_boots))
 
 
 def with_floor(reference_to_candidate: dict, repeat: dict, *, floors: dict | None = None,
-               reference_to_repeat: dict | None = None) -> list[dict]:
+               reference_to_repeat: dict | None = None, reference_repeat: dict | None = None,
+               reference_again_to_candidate: dict | None = None,
+               reference_again_to_repeat: dict | None = None) -> list[dict]:
     """Headline rows of a reference -> candidate suite comparison, judged against the run's
     own repeat (candidate -> candidate again on another boot). A boot carries a few tenths
     of a percent of its own that no within-run interval sees (2026-10-14: the same build
@@ -235,13 +278,20 @@ def with_floor(reference_to_candidate: dict, repeat: dict, *, floors: dict | Non
 
     A paired row's interval is a few hundredths of a percent, so the boot is nearly all of
     its uncertainty, and one repeat is a single draw of it: judged against that alone, a
-    build would differ from itself about half the time. ``floors`` gives such rows a
-    recorded A/A bound by step id: the 95% bound of one boot against another (in %) over
-    past repeats. The run's own repeat widens it when larger. With ``reference_to_repeat``
-    the change is the mean over both candidate boots, whose boot term is smaller by
-    sqrt(3/4). The margin is the interval and the boot term in quadrature."""
+    build would differ from itself about half the time. ``floors`` gives such rows (and an
+    engine grid step's geometric mean) a recorded A/A bound by step id: the 95% bound of
+    one boot against another (in %) over past repeats. The run's own repeat widens it when
+    larger. With ``reference_to_repeat`` the change is the mean over both candidate boots,
+    whose boot term is smaller by sqrt(3/4). The margin is the interval and the boot term
+    in quadrature.
+
+    With the reference's own repeat (``reference_repeat``: reference -> reference again,
+    and the reference's second boot against both candidate boots), every headline row is
+    the mean over all four pairings, and the boot term counts both boots on each side
+    (``boot_term``): x0.707 of one pair's. Floored rows bound each side by the larger of the
+    floor and that side's repeat; other rows by the repeats themselves, added to the
+    interval as before. Without it, rows are judged as they always were."""
     floors = floors or {}
-    second = (reference_to_repeat or {}).get("steps", {})
     rows = []
     for step, outcome in reference_to_candidate["steps"].items():
         if "skipped" in outcome or step not in repeat["steps"] or "skipped" in repeat["steps"][step]:
@@ -249,36 +299,60 @@ def with_floor(reference_to_candidate: dict, repeat: dict, *, floors: dict | Non
         schema, result = outcome
         if "rows" not in result:
             continue
-        again = {row["metric"]: row for row in repeat["steps"][step][1].get("rows", [])}
-        other = ({row["metric"]: row for row in second[step][1].get("rows", [])}
-                 if step in second and "skipped" not in second[step] else {})
+        again = _step_rows(repeat, step)
+        second = _step_rows(reference_to_repeat, step)
+        own = _step_rows(reference_repeat, step)
+        third = _step_rows(reference_again_to_candidate, step)
+        fourth = _step_rows(reference_again_to_repeat, step)
         window = next((r for r in result["rows"] if r["metric"] == "output tok/s"), None)
         # The paired row is the step's verdict row; the window row follows it.
         for row in sorted(result["rows"], key=lambda r: r["metric"] != PAIRED):
-            if not row["metric"].startswith(HEADLINE) or row["metric"] not in again or row["ci95_pct"] is None:
+            metric = row["metric"]
+            if not metric.startswith(HEADLINE) or metric not in again or row["ci95_pct"] is None:
                 continue
-            if row["metric"] == PAIRED and step not in floors:
+            floored = floor_metric(metric) and step in floors
+            if metric == PAIRED and not floored:
                 continue  # its interval alone would miscall; only a recorded floor judges it
-            repeat_pct = again[row["metric"]]["change_pct"]
+            repeat_pct = again[metric]["change_pct"]
+            reference_repeat_pct = own[metric]["change_pct"] if metric in own else None
+            # Pairings (reference boot, candidate boot): the first always; the candidate's
+            # second boot for floored rows or whenever the reference's second boot is used.
+            pairings = [(1, 1, row)]
+            if reference_repeat_pct is not None and _usable(third.get(metric)):
+                pairings.append((2, 1, third[metric]))
+            if (floored or len(pairings) > 1) and _usable(second.get(metric)):
+                pairings.append((1, 2, second[metric]))
+                if len(pairings) == 3 and _usable(fourth.get(metric)):
+                    pairings.append((2, 2, fourth[metric]))
+            if not _usable(row):
+                continue
+            reference_boots = len({r for r, _, _ in pairings})
+            candidate_boots = len({c for _, c, _ in pairings})
+            used = [p for _, _, p in pairings]
             # Grid rows are step times; every other row says which way is better.
-            higher_is_better = row.get("higher_is_better", not row["metric"].startswith("decode geometric"))
-            out = {"step": step, "metric": row["metric"], "change_pct": row["change_pct"],
-                   "ci95_pct": row["ci95_pct"], "repeat_pct": repeat_pct, "boots": 1, "floor_pct": None}
-            if row["metric"] == PAIRED and step in floors:
-                boots = [row] + ([other[PAIRED]] if PAIRED in other and other[PAIRED]["low_pct"] is not None else [])
-                out["boots"] = len(boots)
-                out["change_pct"] = sum(b["change_pct"] for b in boots) / len(boots)
+            higher_is_better = row.get("higher_is_better", not metric.startswith(GEOMEAN))
+            change = sum(p["change_pct"] for p in used) / len(used)
+            out = {"step": step, "metric": metric, "change_pct": change, "ci95_pct": row["ci95_pct"],
+                   "repeat_pct": repeat_pct, "boots": candidate_boots, "reference_boots": reference_boots,
+                   "reference_repeat_pct": reference_repeat_pct if reference_boots == 2 else None,
+                   "floor_pct": None}
+            if floored:
                 # The interval's side toward no change decides; each side keeps its own width.
-                below = max(b["change_pct"] - b["low_pct"] for b in boots)
-                above = max(b["high_pct"] - b["change_pct"] for b in boots)
-                out["ci95_pct"] = below if out["change_pct"] >= 0 else above
-                aa = max(floors[step], abs(repeat_pct))
-                out["floor_pct"] = aa * math.sqrt((1 + 1 / out["boots"]) / 2)
+                below = max(_sides(p)[0] for p in used)
+                above = max(_sides(p)[1] for p in used)
+                out["ci95_pct"] = below if change >= 0 else above
+                out["recorded_floor_pct"] = floors[step]
+                candidate_bound = max(floors[step], abs(repeat_pct))
+                reference_bound = (max(floors[step], abs(reference_repeat_pct)) if reference_boots == 2 else None)
+                out["floor_pct"] = boot_term(candidate_bound, reference_bound, candidate_boots, reference_boots)
                 out["margin_pct"] = math.hypot(out["ci95_pct"], out["floor_pct"])
-                if window is not None:
+                if window is not None and metric == PAIRED:
                     out["window"] = {"change_pct": window["change_pct"], "ci95_pct": window["ci95_pct"]}
             else:
-                out["margin_pct"] = row["ci95_pct"] + abs(repeat_pct)
+                out["ci95_pct"] = max(p["ci95_pct"] for p in used)
+                reference_bound = abs(reference_repeat_pct) if reference_boots == 2 else None
+                out["boot_pct"] = boot_term(abs(repeat_pct), reference_bound, candidate_boots, reference_boots)
+                out["margin_pct"] = out["ci95_pct"] + out["boot_pct"]
             if abs(out["change_pct"]) <= out["margin_pct"]:
                 out["verdict"] = "same"
             else:
@@ -287,19 +361,38 @@ def with_floor(reference_to_candidate: dict, repeat: dict, *, floors: dict | Non
     return rows
 
 
-def format_floor(rows: list[dict], reference: str, candidate: str, repeat: str) -> str:
-    lines = [f"verdicts: {reference} -> {candidate}, against the run's own repeat ({candidate} -> {repeat})",
-             f"{'metric':36s} {'change':>8s} {'±95%':>7s} {'repeat':>8s} {'floor':>7s} {'margin':>7s}  verdict"]
+def _boots_note(row: dict) -> str:
+    if row.get("reference_boots", 1) == 2:
+        return "both boots of each"
+    return "both candidate boots" if row["boots"] == 2 else ""
+
+
+def format_floor(rows: list[dict], reference: str, candidate: str, repeat: str,
+                 reference_repeat: str | None = None, floors_note: str | None = None) -> str:
+    averaged = reference_repeat is not None and any(row.get("reference_boots", 1) == 2 for row in rows)
+    head = f"verdicts: {reference} -> {candidate}, against the run's own repeat ({candidate} -> {repeat})"
+    if averaged:
+        head += (f" and the reference's ({reference_repeat}); each change is the mean over both boots of each "
+                 f"({candidate}, {repeat}; {reference}, {reference_repeat})")
+    lines = [head, f"{'metric':36s} {'change':>8s} {'±95%':>7s} {'repeat':>8s} {'floor':>7s} {'margin':>7s}  verdict"]
     for row in rows:
         floor = f"{row['floor_pct']:6.2f}%" if row["floor_pct"] is not None else f"{'-':>7s}"
         line = (f"{row['step'] + ': ' + row['metric']:36s} {row['change_pct']:+7.2f}% {row['ci95_pct']:6.2f}% "
                 f"{row['repeat_pct']:+7.2f}% {floor} {row['margin_pct']:6.2f}%  {row['verdict']}")
+        notes = [_boots_note(row)] if _boots_note(row) else []
+        if row.get("reference_repeat_pct") is not None:
+            notes[-1] += f", reference repeat {row['reference_repeat_pct']:+.2f}%"
         if row["floor_pct"] is not None:
-            line += f" ({'both candidate boots; ' if row['boots'] == 2 else ''}"
-            line += (f"window tok/s {row['window']['change_pct']:+.2f}% ±{row['window']['ci95_pct']:.2f}%)"
-                     if row.get("window") else "recorded A/A floor)")
+            notes.append(f"window tok/s {row['window']['change_pct']:+.2f}% ±{row['window']['ci95_pct']:.2f}%"
+                         if row.get("window") else "recorded A/A floor")
+        if notes:
+            line += f" ({'; '.join(notes)})"
         lines.append(line)
+    if floors_note:
+        lines.append(floors_note)
     if any(row["floor_pct"] is not None for row in rows):
-        lines.append("paired rows: margin = ±95% (over requests) and floor (the recorded A/A bound, or the "
-                     "repeat when larger, for the boots averaged) in quadrature; other rows: ±95% + |repeat|")
+        lines.append("paired rows: margin = ±95% (over requests) and floor in quadrature, where floor is the boot "
+                     "term of the boots averaged, each boot bounded by the recorded A/A bound or its repeat when "
+                     "larger (the grid's geometric mean likewise when it has a recorded floor); other rows: "
+                     "±95% + |repeat|" + (", over the boots averaged" if averaged else ""))
     return "\n".join(lines)

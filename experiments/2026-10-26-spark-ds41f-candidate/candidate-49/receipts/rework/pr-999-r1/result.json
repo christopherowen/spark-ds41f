@@ -1,0 +1,705 @@
+{
+ "pr": 999,
+ "round": 1,
+ "pr_head": "5f50df40e090c95cc96a445c27c1b1f624a6e7f6",
+ "verdict": "corrected-meets-mark",
+ "verdict_scope": "sp8-evaluable parts of the mark; long prefill (a tp3-switched cluster suite metric) is cannot-evaluate-on-sp8, as in own-marks",
+ "mark": "#999: its indexer top-k bench shows a gain beyond the interval, stays bit-exact, and long prefill is not worse; a corrected #999 must stay bit-exact, keep its gains, and be no slower than 1107 beyond the interval on any shape serving uses",
+ "host": "sp8 (spark-0016, NVIDIA GB10)",
+ "images": {
+  "candidate-49": "sha256:9f51f2e2c5ab728e96490d794bff7b83a147d6d3d61333c5b60b2cff662049cd",
+  "1107": "sha256:3f32a962ce04b7c8d85337cd427a8946b8b6bcaadd97cc8d8a8cd14e8d68a6ce"
+ },
+ "reachability": {
+  "cell": "standalone IndexerTopK(1048576, 512, 1) at N=524288, M=1 (bench key raw_1m_k512_g1): 1107 38.92/39.17 us, candidate-49 40.51/40.59 us (own-marks receipts)",
+  "finding": "Not served. No layer of any configured shape builds or declares a non-gather IndexerTopK(1048576, 512, 1), at any context or row count, decode or prefill. In 1107 this selector was Layer 20's full-width select; #999 itself replaced it there with the gather_scores select over the 2,048 published blocks, which at the same cell runs 23.70/23.71 us (receipts) against 1107's 40.48/37.12.",
+  "code_citations": [
+   "model config (DeepSeek-V4.1-Flash-1017 text_config): index_source_layer_ids [2, 8, 14, 20, 24, 28, 32, 36]; compress_ratios 2 for layers 2..19, 1 for 20..39, 0 for the drafter layers 40..42; candidate_source_layer_id 20; index_topk 512",
+   "releases/spark-ds41f-1107/cluster.json (extended by candidate-49/tp3-switched.json): --block-size 256; max_model_len 1048576 for tp4-ring and tp3-triangle (tp3..tp8-switched extend them), 262144 for tp3-triangle-4k; VLLM_DS41_LSA is not set anywhere",
+   "vllm/models/deepseek_v4_1/attention.py:488-501: capacity = max_num_batched_tokens; _main_page = block_size // compress_ratio; _main_width = ceil(max_model_len / block_size); _index_page, _index_width = _main_page, _main_width, so a layer's index width is _index_width * _index_page = max_model_len / compress_ratio: 524288 for layers 2/8/14 and 1048576 for 20..39 at 1M (131072 / 262144 at 262144); :503 is_index_source; :514 candidate_source_layer",
+   "vllm/models/deepseek_v4_1/tilelang/attention.py:162-187 (_plan_args): layers after the source (24, 28, 32, 36) plan width CANDIDATE_BLOCKS*CANDIDATE_BLOCK = 16384 with candidates=True; layer 20 plans its full width with candidate_blocks=True; layers 2/8/14 their full width plainly, plus prefill_short (attention.py:731-740: layers below the source, rows min(1024, capacity), width 16384); decode and prefill share one plan",
+   "vllm/models/deepseek_v4_1/tilelang/attention.py:46-47, 78-84, 99-106: without VLLM_DS41_LSA=1 _shortlist_options is None and _index_plan builds IndexerV41Plan for every mode; :304-316 native_index stays empty; :412-413 _index_chunk runs plans.index[mode]",
+   "vllm/models/deepseek_v4_1/attention.py:1494-1534: decode rows always take the 'decode' plan when LSA is off; 'prefill_short' only in extend mode when the batch's max_seq_len gives score_width <= 16384",
+   "vllm/models/deepseek_v4_1/tilelang/indexer.py:1955-1960 (_gather_from_blocks) and :1977-1985: IndexerV41Plan(1048576, 256, candidate_blocks=True) builds select = IndexerTopK(1048576, 512, 1, gather_scores=True), a single 16,384-entry kernel (routes :1817-1828), and select_blocks = IndexerTopK(1048576, 2048, 8); :2091-2101 run() returns after the gather select, so the full-width select of :2102 is reached only by plans without candidate_blocks",
+   "vllm/models/deepseek_v4_1/tilelang/prepare.py:9-14: after preparation the kernel cache is frozen and a call that was not declared raises KernelNotPreparedError, so the declared calls are exactly what serving can launch"
+  ],
+  "executed_evidence": "scripts/served_topk_configs.py ran the image's own DeepseekV4Attention._attention_geometry, DeepseekV41TileLangAttention._plan_args and tilelang.attention._index_calls for every indexed layer of each shape (raw/served-topk-configs.txt, json/served-topk-configs.json): the slow selector's three kernels (indexer_topk_segment_v41(1048576, 512, 1, False, False), indexer_topk_merge_v41(1048576, 512, 1, 64, 16384, 32, False) and (1048576, 512, 1, 2, 524288, 32, False)) are declared by no layer in any shape; with VLLM_DS41_LSA=1 (not served) also none (json/served-topk-configs-lsa1.json)",
+  "served_topk_configurations": [
+   {
+    "width": 16384,
+    "topk": 512,
+    "group": 1,
+    "candidates": false,
+    "gather_scores": false,
+    "route": {
+     "segments": 1,
+     "merge_levels": []
+    },
+    "used_by": [
+     "tp3-triangle (tp3-switched) L14 prefill_short rows<=1024",
+     "tp3-triangle (tp3-switched) L2 prefill_short rows<=1024",
+     "tp3-triangle (tp3-switched) L8 prefill_short rows<=1024",
+     "tp3-triangle-4k L14 prefill_short rows<=1024",
+     "tp3-triangle-4k L2 prefill_short rows<=1024",
+     "tp3-triangle-4k L8 prefill_short rows<=1024",
+     "tp4-ring (tp4..tp8-switched) L14 prefill_short rows<=1024",
+     "tp4-ring (tp4..tp8-switched) L2 prefill_short rows<=1024",
+     "tp4-ring (tp4..tp8-switched) L8 prefill_short rows<=1024"
+    ]
+   },
+   {
+    "width": 16384,
+    "topk": 512,
+    "group": 1,
+    "candidates": true,
+    "gather_scores": false,
+    "route": {
+     "segments": 1,
+     "merge_levels": []
+    },
+    "used_by": [
+     "tp3-triangle (tp3-switched) L24 decode rows<=64",
+     "tp3-triangle (tp3-switched) L24 prefill rows<=256",
+     "tp3-triangle (tp3-switched) L28 decode rows<=64",
+     "tp3-triangle (tp3-switched) L28 prefill rows<=256",
+     "tp3-triangle (tp3-switched) L32 decode rows<=64",
+     "tp3-triangle (tp3-switched) L32 prefill rows<=256",
+     "tp3-triangle (tp3-switched) L36 decode rows<=64",
+     "tp3-triangle (tp3-switched) L36 prefill rows<=256",
+     "tp3-triangle-4k L24 decode rows<=64",
+     "tp3-triangle-4k L24 prefill rows<=256",
+     "tp3-triangle-4k L28 decode rows<=64",
+     "tp3-triangle-4k L28 prefill rows<=256",
+     "tp3-triangle-4k L32 decode rows<=64",
+     "tp3-triangle-4k L32 prefill rows<=256",
+     "tp3-triangle-4k L36 decode rows<=64",
+     "tp3-triangle-4k L36 prefill rows<=256",
+     "tp4-ring (tp4..tp8-switched) L24 decode rows<=64",
+     "tp4-ring (tp4..tp8-switched) L24 prefill rows<=256",
+     "tp4-ring (tp4..tp8-switched) L28 decode rows<=64",
+     "tp4-ring (tp4..tp8-switched) L28 prefill rows<=256",
+     "tp4-ring (tp4..tp8-switched) L32 decode rows<=64",
+     "tp4-ring (tp4..tp8-switched) L32 prefill rows<=256",
+     "tp4-ring (tp4..tp8-switched) L36 decode rows<=64",
+     "tp4-ring (tp4..tp8-switched) L36 prefill rows<=256"
+    ]
+   },
+   {
+    "width": 131072,
+    "topk": 512,
+    "group": 1,
+    "candidates": false,
+    "gather_scores": false,
+    "route": {
+     "segments": 8,
+     "merge_levels": [
+      [
+       8,
+       1
+      ]
+     ]
+    },
+    "used_by": [
+     "tp3-triangle-4k L14 decode rows<=64",
+     "tp3-triangle-4k L14 prefill rows<=256",
+     "tp3-triangle-4k L2 decode rows<=64",
+     "tp3-triangle-4k L2 prefill rows<=256",
+     "tp3-triangle-4k L8 decode rows<=64",
+     "tp3-triangle-4k L8 prefill rows<=256"
+    ]
+   },
+   {
+    "width": 262144,
+    "topk": 512,
+    "group": 1,
+    "candidates": false,
+    "gather_scores": true,
+    "route": {
+     "segments": 1,
+     "merge_levels": []
+    },
+    "used_by": [
+     "tp3-triangle-4k L20 decode rows<=64",
+     "tp3-triangle-4k L20 prefill rows<=256"
+    ]
+   },
+   {
+    "width": 262144,
+    "topk": 2048,
+    "group": 8,
+    "candidates": false,
+    "gather_scores": false,
+    "route": {
+     "segments": 2,
+     "merge_levels": [
+      [
+       2,
+       1
+      ]
+     ]
+    },
+    "used_by": [
+     "tp3-triangle-4k L20 decode rows<=64",
+     "tp3-triangle-4k L20 prefill rows<=256"
+    ]
+   },
+   {
+    "width": 524288,
+    "topk": 512,
+    "group": 1,
+    "candidates": false,
+    "gather_scores": false,
+    "route": {
+     "segments": 32,
+     "merge_levels": [
+      [
+       32,
+       1
+      ]
+     ]
+    },
+    "used_by": [
+     "tp3-triangle (tp3-switched) L14 decode rows<=64",
+     "tp3-triangle (tp3-switched) L14 prefill rows<=256",
+     "tp3-triangle (tp3-switched) L2 decode rows<=64",
+     "tp3-triangle (tp3-switched) L2 prefill rows<=256",
+     "tp3-triangle (tp3-switched) L8 decode rows<=64",
+     "tp3-triangle (tp3-switched) L8 prefill rows<=256",
+     "tp4-ring (tp4..tp8-switched) L14 decode rows<=64",
+     "tp4-ring (tp4..tp8-switched) L14 prefill rows<=256",
+     "tp4-ring (tp4..tp8-switched) L2 decode rows<=64",
+     "tp4-ring (tp4..tp8-switched) L2 prefill rows<=256",
+     "tp4-ring (tp4..tp8-switched) L8 decode rows<=64",
+     "tp4-ring (tp4..tp8-switched) L8 prefill rows<=256"
+    ]
+   },
+   {
+    "width": 1048576,
+    "topk": 512,
+    "group": 1,
+    "candidates": false,
+    "gather_scores": true,
+    "route": {
+     "segments": 1,
+     "merge_levels": []
+    },
+    "used_by": [
+     "tp3-triangle (tp3-switched) L20 decode rows<=64",
+     "tp3-triangle (tp3-switched) L20 prefill rows<=256",
+     "tp4-ring (tp4..tp8-switched) L20 decode rows<=64",
+     "tp4-ring (tp4..tp8-switched) L20 prefill rows<=256"
+    ]
+   },
+   {
+    "width": 1048576,
+    "topk": 2048,
+    "group": 8,
+    "candidates": false,
+    "gather_scores": false,
+    "route": {
+     "segments": 8,
+     "merge_levels": [
+      [
+       8,
+       1
+      ]
+     ]
+    },
+    "used_by": [
+     "tp3-triangle (tp3-switched) L20 decode rows<=64",
+     "tp3-triangle (tp3-switched) L20 prefill rows<=256",
+     "tp4-ring (tp4..tp8-switched) L20 decode rows<=64",
+     "tp4-ring (tp4..tp8-switched) L20 prefill rows<=256"
+    ]
+   }
+  ],
+  "rows_per_call": "decode chunks of <= 64 rows (DECODE_CHUNK, M=1 occurs), prefill chunks of <= 256 (INDEX_CHUNK), prefill_short chunks of <= 1024; extents up to the plan width",
+  "why_the_cell_was_no_gain": "At N=524288 the 1M-wide route still makes three launches (64 segments -> 2 -> 1, against 1107's 256 -> 16 -> 1), and at M=1 the chain is launch-bound: kernels timed alone, candidate-49 18.14 + 15.48 + 12.57 us against 1107 16.70 + 13.61 + 12.93 us (raw/bench-served-gaps-boot2.txt, breakdown, after the foreign container had exited); its first merge holds the one fully live 32-list group (16,384 keys) in a single CTA where 1107 spreads 8 CTAs of 8,192 keys. A fresh object of the same selector measured 36.53 us (candidate-49) against 39.41 (1107) in that run."
+ },
+ "served_regression_found": {
+  "shape": "IndexerTopK(16384, 512, 1): the prefill_short plan of the dense layers 2, 8 and 14 (every shape), rows <= 1024, used whenever a prefill batch's max_seq_len gives score_width <= 16384 (prompts up to 32K tokens); not timed by #999's bench grid",
+  "candidate49_vs_1107": "42 of 116 short-extent sweep cells slower beyond the interval (two warmed boots, json/r1w-short-sweep-boot*.json): 520..4,096-entry extents with 256..1,024 rows, 29 of the 30 sampled causal 1,024-row chunks below position 8,192 (the other within the interval; all 32 chunks at positions 8,192..32,767 are gains), and the reindex selector at 4,096 candidates x 256 rows",
+  "examples_us": {
+   "uniform N=4096 M=1024": {
+    "1107": [
+     79.22,
+     81.09
+    ],
+    "arm": [
+     95.11,
+     95.65
+    ],
+    "speedup_of_means": 0.84
+   },
+   "uniform N=2048 M=1024": {
+    "1107": [
+     77.5,
+     79.0
+    ],
+    "arm": [
+     84.08,
+     84.04
+    ],
+    "speedup_of_means": 0.931
+   },
+   "causal chunk positions 7168..8191": {
+    "1107": [
+     79.16,
+     81.02
+    ],
+    "arm": [
+     97.41,
+     97.43
+    ],
+    "speedup_of_means": 0.822
+   },
+   "causal chunk positions 3072..4095": {
+    "1107": [
+     77.14,
+     79.02
+    ],
+    "arm": [
+     89.19,
+     92.52
+    ],
+    "speedup_of_means": 0.859
+   },
+   "reindex 4096 candidates M=256": {
+    "1107": [
+     26.65,
+     26.51
+    ],
+    "arm": [
+     29.42,
+     29.03
+    ],
+    "speedup_of_means": 0.909
+   }
+  },
+  "cause": "The one-pass 16,384-entry kernel keeps the compile-time compaction ownership per = 32 for a partly filled row: with n live keys only n/32 threads work, each reading 32 keys twice in series (a 2,048-entry row leaves 448 of 512 threads idle), where 1107's 4,096-entry segment reads 8 per thread; and its 32 KiB key array holds 2 CTAs/SM against 1107's 3 (512 threads, about 23 KiB), so at many rows the longer per-CTA compaction is exposed"
+ },
+ "change": {
+  "summary": "In _select_macros' compact (used by every segment and merge kernel): with an active count n, each thread owns ceil(n / 512) consecutive keys instead of per, so a partial segment or merge group is spread over all threads; and one block scan of packed (ties << 16 | above) counts replaces the two scans, using that the ties kept before a thread equal min(ties needed, ties before it). The packed scan is compiled only where per * threads < 32768. Segment sizes, routes, merge fan-in and gather paths are unchanged.",
+  "exactness_argument": "Ownership stays contiguous and in thread order, so selected positions are written in ascending entry order with ties at the threshold taken lowest-first, as before; min(need, ties before) is the running sum of the per-thread tie quotas max(min(need - ties_before, ties), 0) that the second scan computed",
+  "test_added": "tests/kernels/attention/test_deepseek_v41_tilelang.py::test_topk_partial_extent_compaction: tie-heavy rows at 513..16,383-entry extents (16384-wide dense and candidate one-pass selectors) and 2..32 live merge lists (524288-wide), against the reference selection",
+  "files": [
+   "vllm/models/deepseek_v4_1/tilelang/indexer.py",
+   "tests/kernels/attention/test_deepseek_v41_tilelang.py"
+  ],
+  "diff_vs_candidate49": [
+   "corrected-indexer-vs-candidate49.diff",
+   "corrected-test-vs-candidate49.diff"
+  ],
+  "how_chosen": "Two variants were timed against 1107 and candidate-49 on the losing regime (raw/diag-variants-run1.txt, clean): ownership spread alone (scripts/variants/indexer_dynper.diff) left N=4096 x 1024 rows at 76.99 us against 1107's 79.03 (a tie); with the single packed scan (indexer_dynper1scan.diff, the change submitted) 68.78"
+ },
+ "patch": {
+  "file": "0762-perf-dsv41-widen-long-context-indexer-top-k-segments.patch",
+  "sha256": "82dd996ae49515ccc478e4b1de21200d7bf7b3e151689f8d01f5742b57db8240",
+  "author": "Christopher Owen <christopherowen@users.noreply.github.com>, Sun, 8 Nov 2026 19:22:06 +0000 (kept)",
+  "message": "the original message plus rationale item 4, a Quality sentence and two Tests lines (0762-r1-vs-candidate49.patchdiff)",
+  "applies": "git am of this 0762 then candidate-49's 0763..0767 on a fresh 1107 subset tree (vllm/models/deepseek_v4_1, tests/models, tests/kernels from spark-ds41f:1107): clean, and the resulting tree equals the tested stack; its indexer.py and test file are byte-identical to the files bind-mounted in every measured run",
+  "diff_check": "git diff --check clean (0762 alone and the whole stack)"
+ },
+ "measured": {
+  "pytest_corrected": {
+   "command": "PR README step 1 on the candidate-49 image with the corrected indexer.py and test file mounted",
+   "boot1": "142 passed, 1 skipped, 1 xfailed in 334.50s; indexer reads: scored 4 cases",
+   "boot2": "142 passed, 1 skipped, 1 xfailed in 337.90s; indexer reads: scored 4 cases",
+   "note": "candidate-49 as built ran 139 passed; the 3 added are the new test's cases"
+  },
+  "bit_exactness": {
+   "bench_2boot_verify_exactness": "PASS on all 7 corrected PR-bench runs (r1-bench2boot-boot1..5, r1w-bench2boot-boot1..2)",
+   "every_timed_cell": "torch.equal to 1107 in every cell of the gap bench, the sweep and the paired candidate-49 check, warmed and unwarmed (all_exact true)"
+  },
+  "pr_bench_warmed": {
+   "boots": [
+    "r1w-bench2boot-boot1.json",
+    "r1w-bench2boot-boot2.json"
+   ],
+   "vs_receipts_1107": {
+    "cells": 210,
+    "gain_beyond_interval": 210,
+    "worse_beyond_interval": 0,
+    "worse_cells": [],
+    "neither_cells": []
+   },
+   "vs_inrun_1107": {
+    "cells": 210,
+    "gain_beyond_interval": 210,
+    "worse_beyond_interval": 0,
+    "worse_cells": [],
+    "neither_cells": []
+   },
+   "slow_cell": {
+    "base_boots": [
+     38.92,
+     39.17
+    ],
+    "cand_boots": [
+     35.79,
+     35.37
+    ],
+    "speedup_of_means": 1.097,
+    "gain_beyond_interval": true,
+    "worse_beyond_interval": false
+   },
+   "headline_us_receipts_1107_to_corrected": {
+    "reindex_16k M=1": {
+     "1107": [
+      24.21,
+      24.01
+     ],
+     "corrected": [
+      13.72,
+      13.67
+     ],
+     "speedup_of_means": 1.76
+    },
+    "reindex_16k M=1024": {
+     "1107": [
+      343.35,
+      343.12
+     ],
+     "corrected": [
+      240.59,
+      239.6
+     ],
+     "speedup_of_means": 1.43
+    },
+    "src_1m_total N=1048576 M=16": {
+     "1107": [
+      547.63,
+      551.63
+     ],
+     "corrected": [
+      212.98,
+      195.61
+     ],
+     "speedup_of_means": 2.69
+    },
+    "src_1m_total N=1048576 M=256": {
+     "1107": [
+      9070.66,
+      9116.48
+     ],
+     "corrected": [
+      2801.52,
+      2809.51
+     ],
+     "speedup_of_means": 3.241
+    },
+    "src_1m_total N=1048576 M=1024": {
+     "1107": [
+      36275.53,
+      35961.33
+     ],
+     "corrected": [
+      10956.02,
+      10898.92
+     ],
+     "speedup_of_means": 3.305
+    },
+    "dense_524k_k512 N=524288 M=256": {
+     "1107": [
+      2634.63,
+      2633.2
+     ],
+     "corrected": [
+      1573.79,
+      1579.42
+     ],
+     "speedup_of_means": 1.671
+    },
+    "dense_524k_k512 N=524288 M=1024": {
+     "1107": [
+      10407.02,
+      10373.96
+     ],
+     "corrected": [
+      6135.7,
+      6157.92
+     ],
+     "speedup_of_means": 1.69
+    },
+    "raw_1m_k2048_g1 N=1048576 M=256": {
+     "1107": [
+      15689.15,
+      15603.19
+     ],
+     "corrected": [
+      4623.31,
+      4597.18
+     ],
+     "speedup_of_means": 3.394
+    }
+   }
+  },
+  "pr_bench_unwarmed": {
+   "boots": [
+    "r1-bench2boot-boot2.json",
+    "r1-bench2boot-boot3.json",
+    "r1-bench2boot-boot4.json",
+    "r1-bench2boot-boot5.json"
+   ],
+   "vs_receipts_1107": {
+    "cells": 210,
+    "gain_beyond_interval": 205,
+    "worse_beyond_interval": 0,
+    "worse_cells": [],
+    "neither_cells": [
+     "reindex_16k M=1",
+     "reindex_16k M=16",
+     "reindex_16k M=32",
+     "reindex_16k M=6",
+     "reindex_16k M=64"
+    ]
+   },
+   "slow_cell": {
+    "base_boots": [
+     38.92,
+     39.17
+    ],
+    "cand_boots": [
+     38.07,
+     35.21,
+     35.67,
+     35.37
+    ],
+    "speedup_of_means": 1.082,
+    "gain_beyond_interval": true,
+    "worse_beyond_interval": false
+   },
+   "boot_controls": {
+    "r1-bench2boot-boot1.json": {
+     "worst_1107_over_receipt_min": 6.037,
+     "cell": "reindex_16k M=6",
+     "ok": false
+    },
+    "r1-bench2boot-boot2.json": {
+     "worst_1107_over_receipt_min": 5.601,
+     "cell": "reindex_16k M=16",
+     "ok": false
+    },
+    "r1-bench2boot-boot3.json": {
+     "worst_1107_over_receipt_min": 1.209,
+     "cell": "src_1m_select_k512 N=1048576 M=1",
+     "ok": true
+    },
+    "r1-bench2boot-boot4.json": {
+     "worst_1107_over_receipt_min": 5.698,
+     "cell": "reindex_16k M=1",
+     "ok": false
+    },
+    "r1-bench2boot-boot5.json": {
+     "worst_1107_over_receipt_min": 1.195,
+     "cell": "src_1m_select_blocks_k2048_g8 N=524288 M=16",
+     "ok": true
+    }
+   },
+   "note": "PR bench as is; boot1 not scored (a foreign GPU container ran during it). All four other boots scored jointly: the 5 'neither' cells are reindex M<=64, where boot2's first-timed section ran during the GPU clock ramp (its 1107 arm 129-141 us against 24); boots 3 and 5, the ones whose 1107 arm stays within 2x of the receipts, give 210 of 210 gains beyond the interval"
+  },
+  "served_gaps_warmed": {
+   "boots": [
+    "r1w-served-gaps-boot1.json",
+    "r1w-served-gaps-boot2.json"
+   ],
+   "all_exact": true,
+   "corrected_vs_1107": {
+    "cells": 148,
+    "gain_beyond_interval": 148,
+    "worse_beyond_interval": 0,
+    "worse_cells": [],
+    "neither_cells": []
+   },
+   "covers": "prefill_short 16384 at N 2048/8192/16384 x M 1..1024; reindex at 2048/8192 candidates; dense 524288 and source 1M at N 4096..32768; tp3-triangle-4k's dense 131072 and source 262144 (blocks + gather); per-kernel breakdown of the slow cell"
+  },
+  "short_sweep_warmed": {
+   "boots": [
+    "r1w-short-sweep-boot1.json",
+    "r1w-short-sweep-boot2.json"
+   ],
+   "all_exact": true,
+   "corrected_vs_1107": {
+    "cells": 116,
+    "gain_beyond_interval": 116,
+    "worse_beyond_interval": 0,
+    "worse_cells": [],
+    "neither_cells": []
+   },
+   "candidate49_vs_1107": {
+    "cells": 116,
+    "gain_beyond_interval": 73,
+    "worse_beyond_interval": 42,
+    "worse_cells": [
+     "prefill_short_16k_k512 N=1024,M=1024",
+     "prefill_short_16k_k512 N=1024,M=512",
+     "prefill_short_16k_k512 N=2048,M=1024",
+     "prefill_short_16k_k512 N=2048,M=512",
+     "prefill_short_16k_k512 N=3072,M=1024",
+     "prefill_short_16k_k512 N=3072,M=256",
+     "prefill_short_16k_k512 N=3072,M=512",
+     "prefill_short_16k_k512 N=4096,M=1024",
+     "prefill_short_16k_k512 N=4096,M=256",
+     "prefill_short_16k_k512 N=4096,M=512",
+     "prefill_short_16k_k512 N=520,M=1024",
+     "prefill_short_16k_k512 N=520,M=512",
+     "prefill_short_causal_chunk P=16384,start=0,M=1024",
+     "prefill_short_causal_chunk P=16384,start=1024,M=1024",
+     "prefill_short_causal_chunk P=16384,start=2048,M=1024",
+     "prefill_short_causal_chunk P=16384,start=3072,M=1024",
+     "prefill_short_causal_chunk P=16384,start=4096,M=1024",
+     "prefill_short_causal_chunk P=16384,start=5120,M=1024",
+     "prefill_short_causal_chunk P=16384,start=6144,M=1024",
+     "prefill_short_causal_chunk P=16384,start=7168,M=1024",
+     "prefill_short_causal_chunk P=2048,start=0,M=1024",
+     "prefill_short_causal_chunk P=2048,start=1024,M=1024",
+     "prefill_short_causal_chunk P=32768,start=1024,M=1024",
+     "prefill_short_causal_chunk P=32768,start=2048,M=1024",
+     "prefill_short_causal_chunk P=32768,start=3072,M=1024",
+     "prefill_short_causal_chunk P=32768,start=4096,M=1024",
+     "prefill_short_causal_chunk P=32768,start=5120,M=1024",
+     "prefill_short_causal_chunk P=32768,start=6144,M=1024",
+     "prefill_short_causal_chunk P=32768,start=7168,M=1024",
+     "prefill_short_causal_chunk P=4096,start=0,M=1024",
+     "prefill_short_causal_chunk P=4096,start=1024,M=1024",
+     "prefill_short_causal_chunk P=4096,start=2048,M=1024",
+     "prefill_short_causal_chunk P=4096,start=3072,M=1024",
+     "prefill_short_causal_chunk P=8192,start=0,M=1024",
+     "prefill_short_causal_chunk P=8192,start=1024,M=1024",
+     "prefill_short_causal_chunk P=8192,start=2048,M=1024",
+     "prefill_short_causal_chunk P=8192,start=3072,M=1024",
+     "prefill_short_causal_chunk P=8192,start=4096,M=1024",
+     "prefill_short_causal_chunk P=8192,start=5120,M=1024",
+     "prefill_short_causal_chunk P=8192,start=6144,M=1024",
+     "prefill_short_causal_chunk P=8192,start=7168,M=1024",
+     "reindex_16k_partial N=4096,M=256"
+    ]
+   },
+   "examples_us_corrected": {
+    "uniform N=4096 M=1024": {
+     "1107": [
+      79.22,
+      81.09
+     ],
+     "arm": [
+      71.92,
+      68.8
+     ],
+     "speedup_of_means": 1.139
+    },
+    "uniform N=2048 M=1024": {
+     "1107": [
+      77.5,
+      79.0
+     ],
+     "arm": [
+      54.42,
+      54.45
+     ],
+     "speedup_of_means": 1.437
+    },
+    "causal chunk positions 7168..8191": {
+     "1107": [
+      79.16,
+      81.02
+     ],
+     "arm": [
+      68.74,
+      68.98
+     ],
+     "speedup_of_means": 1.163
+    },
+    "uniform N=16384 M=1024": {
+     "1107": [
+      347.41,
+      332.33
+     ],
+     "arm": [
+      203.6,
+      203.78
+     ],
+     "speedup_of_means": 1.669
+    }
+   }
+  },
+  "corrected_vs_candidate49_same_process": {
+   "boots": [
+    "r1w-pair-c49-boot1.json",
+    "r1w-pair-c49-boot2.json"
+   ],
+   "cells": "33 full-extent served cells: Layer 20 select_blocks and gather select at N 262144/1048576 x M 1..256, dense 524288 at N 131072/524288, reindex 16384 at M 1..1024",
+   "summary": {
+    "cells": 33,
+    "gain_beyond_interval": 15,
+    "worse_beyond_interval": 2,
+    "worse_cells": [
+     "reindex_16k N=16384,M=1",
+     "src_1m_select_k512 N=1048576,M=16"
+    ],
+    "neither_cells": [
+     "dense_524k_k512 N=131072,M=64",
+     "dense_524k_k512 N=524288,M=1",
+     "dense_524k_k512 N=524288,M=16",
+     "reindex_16k N=16384,M=16",
+     "reindex_16k N=16384,M=256",
+     "reindex_16k N=16384,M=64",
+     "src_1m_select_blocks_k2048_g8 N=1048576,M=1",
+     "src_1m_select_blocks_k2048_g8 N=1048576,M=16",
+     "src_1m_select_blocks_k2048_g8 N=1048576,M=64",
+     "src_1m_select_blocks_k2048_g8 N=262144,M=1",
+     "src_1m_select_k512 N=1048576,M=1",
+     "src_1m_select_k512 N=1048576,M=32",
+     "src_1m_select_k512 N=1048576,M=64",
+     "src_1m_select_k512 N=262144,M=16",
+     "src_1m_select_k512 N=262144,M=32",
+     "src_1m_select_k512 N=262144,M=64"
+    ]
+   },
+   "both_vs_1107": {
+    "corrected": 33,
+    "candidate49": 33,
+    "of": 33
+   },
+   "slower_cells_us": {
+    "reindex_16k N=16384,M=1": {
+     "1107": [
+      13.76,
+      13.78
+     ],
+     "arm": [
+      13.9,
+      14.02
+     ],
+     "speedup_of_means": 0.986
+    },
+    "src_1m_select_k512 N=1048576,M=16": {
+     "1107": [
+      23.71,
+      23.72
+     ],
+     "arm": [
+      23.77,
+      23.76
+     ],
+     "speedup_of_means": 0.998
+    }
+   },
+   "note": "arm column = corrected, 1107 column = candidate-49 here; the two slower cells are 1.4% (0.2 us) and 0.2% (0.05 us)"
+  },
+  "interval": "two boots per arm, each arm a 10%-trimmed mean of 25 timed calls after 8 warmups (bench_2boot.bench_us); gain: slower corrected boot faster than the faster 1107 boot; worse: faster corrected boot slower than the slower 1107 boot. PR-bench cells compare with the receipts' 1107 boots (not re-measured) and with the same process's 1107 arm; the other benches have no receipts, so only the same process's 1107 arm (1107's indexer.py with own-marks' _e2m1_code shim)"
+ },
+ "measurement_conditions": {
+  "foreign_gpu_jobs": "Unlocked spark-ds41f:1107 pytest containers (started from an ssh session without /tmp/spark-lab-gpu.lock, every few minutes) overlapped bench-served-gaps-boot1/2 (candidate-49 as built), diag-short-sweep-dynper, r1-bench2boot-boot1 and r1-served-gaps-boot1, and both pytest boots (correctness only). Those timing runs are kept in raw/ and json/ and not scored. Later runs used quiet2.sh, which waits for no container and reports any GPU container that shared the run: every scored run reports none.",
+  "gpu_clock_ramp": "The GB10 SM clock idles near 208 MHz. A section timed right after kernel construction starts while the clock ramps, and the arm timed first (1107) absorbs it: 1107 reindex M=1 read 130-141 us instead of 24 in r1-bench2boot-boot2/4 and in the unwarmed gap and sweep runs. warm_wrap.py runs >= 100 ms of bf16 matmul before every timed arm of every bench, all arms alike, and changes nothing else; warmed, the in-process 1107 arm matches the receipts' 1107 (ratio median 1.012, range 0.916..1.132 over 210 cells). Unwarmed results are kept as supplementary (r1-analysis.json)."
+ },
+ "reason": "The reported cell is not on any serving path: serving never builds the standalone 1M-wide k=512 selector (Layer 20 uses #999's gather select, the other layers 524288- or 16384-wide plans), and the correction makes that cell a gain as well (35.79/35.37 us against 38.92/39.17). But enumerating every served shape found a served shape #999's grid does not time: the dense layers' 16,384-entry short-prefill selector, where candidate-49 was slower than 1107 beyond the interval in 42 of 116 cells (up to 22%; 29 of 30 sampled 1,024-row chunks below position 8,192). Spreading compaction over every thread and computing the tie quota with one packed scan fixes it: on two clean warmed boots the corrected #999 is faster than 1107 beyond the interval in 210 of 210 PR-bench cells, 148 of 148 served-gap cells and 116 of 116 sweep cells, bit-exact everywhere, and in the same process it is equal to or faster than candidate-49 on the full-extent served selectors except two cells slower by 0.2 us and 0.05 us.",
+ "files": {
+  "commands": "commands.txt (re-paired blocks), commands-raw.txt",
+  "raw_outputs": "raw/",
+  "json": "json/",
+  "analysis": "r1-analysis.json (scripts/analyze_r1.py)",
+  "scripts": "scripts/",
+  "hashes": "sha256.txt",
+  "stack": "stack-log.txt"
+ }
+}

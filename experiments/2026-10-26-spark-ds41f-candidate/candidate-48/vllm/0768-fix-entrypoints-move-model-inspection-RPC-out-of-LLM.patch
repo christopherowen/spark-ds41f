@@ -1,0 +1,110 @@
+From a152dc8a75a1005d9d241bbf3ade37672eb359df Mon Sep 17 00:00:00 2001
+From: Christopher Owen <3221756+christopherowen@users.noreply.github.com>
+Date: Sun, 8 Nov 2026 22:45:00 +0000
+Subject: [PATCH] fix(entrypoints): move model inspection RPC out of
+ LLM.__repr__
+
+Base: 1107 vLLM patch head 2756478b60b90700b9918b457aeb38657da637b5.
+
+Rationale:
+Backport canonical vllm-project/vllm commit 0915f490c415d4359f981408c873717e559839d0 (#65866). LLM.__repr__() previously called self.llm_engine.collective_rpc("get_model_inspection") synchronously across all workers, so any debugger inspection, traceback formatting, or logging of an LLM instance triggered a blocking distributed RPC. Move the worker RPC into an explicit cached LLM.get_model_inspection() method and make LLM.__repr__() return a local summary string.
+
+Quality:
+Bit- and instruction-identical serving behavior; eliminates unintended synchronous collective_rpc calls when formatting LLM instances.
+
+Tests:
+- pytest tests/v1/worker/test_gpu_worker.py -k test_llm_repr_does_not_call_collective_rpc
+
+Upstream status: cherry-picked from vllm-project/vllm commit 0915f490c415d4359f981408c873717e559839d0 (#65866).
+---
+ docs/serving/offline_inference.md  |  4 ++++
+ tests/v1/worker/test_gpu_worker.py | 21 +++++++++++++++++++++
+ vllm/entrypoints/llm.py            | 23 ++++++++++-------------
+ 3 files changed, 35 insertions(+), 13 deletions(-)
+
+diff --git a/docs/serving/offline_inference.md b/docs/serving/offline_inference.md
+index 9a71612f2..eecf1b017 100644
+--- a/docs/serving/offline_inference.md
++++ b/docs/serving/offline_inference.md
+@@ -73,6 +73,10 @@ For further details on Weight Transfer, please refer to [this page](../training/
+ - `LLM.collective_rpc` - Executes a method or callable collectively across all workers.
+ - `LLM.apply_model` - Applies a function directly to the model inside each worker.
+ 
++## Model Inspection APIs
++
++- `LLM.get_model_inspection` - Returns a hierarchical view of the model, querying workers on the first call and caching the result.
++
+ ## API Reference
+ 
+ [Offline Inference](../api/README.md#offline-inference)
+diff --git a/tests/v1/worker/test_gpu_worker.py b/tests/v1/worker/test_gpu_worker.py
+index 7ce517539..c2d3ba4ba 100644
+--- a/tests/v1/worker/test_gpu_worker.py
++++ b/tests/v1/worker/test_gpu_worker.py
+@@ -979,3 +979,24 @@ def test_compile_or_warm_up_logs_startup_memory_breakdown(monkeypatch):
+     assert "cudagraph=2.0 GiB" in breakdown_logs[0]
+     assert "non_torch_cuda=4.0 GiB" in breakdown_logs[0]
+     assert "free_memory=6.0 GiB" in breakdown_logs[0]
++
++
++
++def test_llm_repr_does_not_call_collective_rpc():
++    """LLM.__repr__ returns a local summary; get_model_inspection queries workers once."""
++    from vllm.entrypoints.llm import LLM
++
++    calls = []
++    llm = LLM.__new__(LLM)
++    llm._cached_model_inspection = None
++    llm.model_config = SimpleNamespace(model="deepseek-ai/DeepSeek-V4.1-Flash")
++    llm.llm_engine = SimpleNamespace(
++        collective_rpc=lambda method: calls.append(method) or ["ModelTree()"]
++    )
++
++    assert repr(llm) == "LLM(model='deepseek-ai/DeepSeek-V4.1-Flash')"
++    assert calls == []
++
++    assert llm.get_model_inspection() == "ModelTree()"
++    assert llm.get_model_inspection() == "ModelTree()"
++    assert calls == ["get_model_inspection"]
+diff --git a/vllm/entrypoints/llm.py b/vllm/entrypoints/llm.py
+index e3d0b2f1e..e8db71e2e 100644
+--- a/vllm/entrypoints/llm.py
++++ b/vllm/entrypoints/llm.py
+@@ -376,8 +376,7 @@ class LLM(BeamSearchOfflineMixin, PoolingOfflineMixin, OfflineInferenceMixin):
+ 
+         PoolingOfflineMixin.__init__(self)
+ 
+-        # Cache for __repr__ to avoid repeated collective_rpc calls
+-        self._cached_repr: str | None = None
++        self._cached_model_inspection: str | None = None
+ 
+     @classmethod
+     def from_engine_args(cls, engine_args: EngineArgs) -> "LLM":
+@@ -906,15 +905,13 @@ class LLM(BeamSearchOfflineMixin, PoolingOfflineMixin, OfflineInferenceMixin):
+         """Return the latest committed weight version."""
+         return self.llm_engine.get_weight_version()
+ 
+-    def __repr__(self) -> str:
+-        """Return a transformers-style hierarchical view of the model."""
+-        # Cache the result to avoid repeated collective_rpc calls
+-        if self._cached_repr is None:
++    def get_model_inspection(self) -> str:
++        """Return a cached transformers-style hierarchical view of the model."""
++        if self._cached_model_inspection is None:
+             results = self.llm_engine.collective_rpc("get_model_inspection")
+-            # In distributed settings, we get results from all workers
+-            # Just return the first one (they should all be the same)
+-            if results:
+-                self._cached_repr = results[0]
+-            else:
+-                self._cached_repr = f"LLM(model={self.model_config.model!r})"
+-        return self._cached_repr
++            self._cached_model_inspection = results[0] if results else repr(self)
++        return self._cached_model_inspection
++
++    def __repr__(self) -> str:
++        """Return a local model summary without querying workers."""
++        return f"LLM(model={self.model_config.model!r})"
+-- 
+2.43.0
+

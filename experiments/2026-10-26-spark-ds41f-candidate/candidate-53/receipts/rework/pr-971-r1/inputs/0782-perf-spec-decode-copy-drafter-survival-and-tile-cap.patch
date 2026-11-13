@@ -1,0 +1,336 @@
+From 589a1fb30b1e9c7d9bde06c0d0bf2b3901476c9e Mon Sep 17 00:00:00 2001
+From: Christopher Owen <3221756+christopherowen@users.noreply.github.com>
+Date: Sun, 8 Nov 2026 12:45:00 +0000
+Subject: [PATCH] perf(spec_decode): use cumulative survival in copy_apply and
+ cap single-req copy tile spill
+
+Base: 1107 vLLM patch head 320021e3c4dbb202d911ab70e2cd924c75420488 (tree ed1bdb7a7684da33d403a055521ac0c4dd7ca670).
+
+Rationale:
+1. copy_apply_kernel previously gated CopyDrafter replacement against the sum of raw conditional DSpark probabilities (sum_{j=0}^{block-1} dspark_confidences[r, j]) rather than cumulative survival yield (sum_{j=0}^{block-1} prod_{i=0}^j dspark_confidences[r, i]). Because a 5-draft DSpark block with conditional confidences [0.70, 0.65, 0.60, 0.55, 0.50] has raw sum 3.00 but cumulative survival 1.6532, short 2- and 3-token copy continuations (expected yield 1.90 and 2.85 at 0.95 confidence) were rejected in favor of lower-yield DSpark proposals. Accumulating dspark_survival *= dspark_confidences[r, j] aligns copy_apply with AdaptiveVerificationManager.get_num_tokens.
+2. AdaptiveVerificationManager._step_cost applied the high-concurrency coalescing discount (HIGH_ROW_COST_SCALE = 0.55 above HIGH_ROW_COST_KNEE = 16 rows) even when num_sampling_requests == 1. At row_cost = 0.035, a single-request 16-draft copy proposal at the 0.95 initial prior crossed 16 verification rows into 17 rows (24-row CUDA graph, 2 Tensor Core MMA waves of 16 rows). Applying SINGLE_REQ_TILE_SPILL_SCALE = 2.0 above 16 rows when num_sampling_requests <= 1 (and setting scheduled_drafts[0] = draft_budget directly in reallocate_drafts when num_reqs == 1) caps initial 0.95-prior single-request copy proposals at 15 drafts (16 rows = 1 MMA tile in the 16-row CUDA graph), while admitting all 16 drafts once online copy accuracy reaches >= 0.97 or when multiple requests share the batch (c2+).
+3. On wide copy-draft steps (step_steps > num_draft_steps) after a rejected or shrunk copy proposal, trailing -1 placeholder slots have confidence 0.0. Returning DeadRows with floor _ZERO_CONFIDENCE_LOG_TAU = -1e30 from dead_row_args when step_steps > num_draft_steps (and declaring dead_rows=True in GPUModelRunner.declare_step_kernels when copy_drafter is enabled) marks zero-confidence placeholder rows as padding inside combine_sampled_and_draft_tokens even when SPARK_DS41F_DSPARK_DEAD_ROWS_TAU == 0, so routed MoE (VLLM_MOE_SKIP_PADDING=1) skips them across all 58 MoE layers and get_verified_draft_counts clamps verified counts to live rows.
+
+Quality:
+Bit-identical target and drafter arithmetic; temperature-0 greedy verification remains invariant to draft source and dead-row padding masks.
+
+Tests:
+- pytest tests/v1/spec_decode/test_copy_drafts.py tests/v1/core/test_copy_drafts_scheduler.py tests/v1/spec_decode/test_adaptive_verification.py tests/v1/worker/test_prepare_kernels.py (108 passed, 1 skipped across 2 boots on GB10).
+
+Upstream status: local speculative-decoding optimization for CopyDrafter and AdaptiveVerificationManager.
+---
+ .../spec_decode/test_adaptive_verification.py | 47 ++++++++++++++++++
+ tests/v1/spec_decode/test_copy_drafts.py      | 44 ++++++++++++++---
+ tests/v1/worker/test_prepare_kernels.py       |  3 ++
+ vllm/v1/worker/gpu/model_runner.py            |  6 ++-
+ .../gpu/spec_decode/adaptive_verification.py  | 49 ++++++++++++++++---
+ .../worker/gpu/spec_decode/tilelang_copy.py   |  7 ++-
+ 6 files changed, 138 insertions(+), 18 deletions(-)
+
+diff --git a/tests/v1/spec_decode/test_adaptive_verification.py b/tests/v1/spec_decode/test_adaptive_verification.py
+index c0a63d326..a7a6f05ee 100644
+--- a/tests/v1/spec_decode/test_adaptive_verification.py
++++ b/tests/v1/spec_decode/test_adaptive_verification.py
+@@ -1137,3 +1137,50 @@ def test_sampler_hands_configured_seed_to_sampling_states():
+ 
+     assert first_unseeded_seed(7) == first_unseeded_seed(7)
+     assert first_unseeded_seed(7) != first_unseeded_seed(8)
++
++
++def test_single_request_tile_spill_caps_16th_copy_draft_at_16_rows_and_masks_shrunk_tail() -> None:
++    # Single-request (c1) initial copy proposal at 0.95 confidence across 16 drafts:
++    # capping at 15 drafts (16 rows = 1 MMA tile) beats spilling 1 row into a 2nd MMA tile.
++    mgr_c1 = make_manager(np.full((1, 16), 0.95, dtype=np.float32), row_cost=0.035)
++    mgr_c1.req_states.req_id_to_index = {"r0": 0}
++    mgr_c1.num_draft_steps = 5
++    mgr_c1.dead_rows_tau = 0.0
++    total_c1 = mgr_c1.get_num_tokens({"r0": 17}, {"r0": list(range(16))})
++    assert mgr_c1._batch_budget[2] == 15
++    assert total_c1 == 16
++
++    # Once online copy accuracy reaches >= 0.97 on a sustained streak, or when 2 requests
++    # share the batch, all 16 copy drafts per request are admitted.
++    mgr_c1_hi = make_manager(np.full((1, 16), 0.97, dtype=np.float32), row_cost=0.035)
++    mgr_c1_hi.req_states.req_id_to_index = {"r0": 0}
++    mgr_c1_hi.num_draft_steps = 5
++    mgr_c1_hi.dead_rows_tau = 0.0
++    total_c1_hi = mgr_c1_hi.get_num_tokens({"r0": 17}, {"r0": list(range(16))})
++    assert mgr_c1_hi._batch_budget[2] == 16
++    assert total_c1_hi == 17
++
++    mgr_c2 = make_manager(np.full((2, 16), 0.95, dtype=np.float32), row_cost=0.035)
++    mgr_c2.req_states.req_id_to_index = {"r0": 0, "r1": 1}
++    mgr_c2.num_draft_steps = 5
++    mgr_c2.dead_rows_tau = 0.0
++    total_c2 = mgr_c2.get_num_tokens(
++        {"r0": 17, "r1": 17},
++        {"r0": list(range(16)), "r1": list(range(16))},
++    )
++    assert mgr_c2._batch_budget[2] == 32
++    assert total_c2 == 34
++
++    # On wide copy steps (step_steps=16 > num_draft_steps=5), dead_row_args returns a
++    # sentinel log_tau=-1e30 even when dead_rows_tau is 0.0 so -1 placeholder rows
++    # (confidence 0.0 -> log(0) = -inf < -1e30) are masked as padding.
++    mgr_c1._confidence_probs = torch.ones((1, 16), dtype=torch.float32)
++    mgr_c1._dead_row_cut = torch.zeros(1, dtype=torch.int32)
++    mgr_c1._has_admitted_drafts = True
++    is_padding = torch.zeros(17, dtype=torch.bool)
++    mgr_c1.step_steps = 5
++    assert mgr_c1.dead_row_args(is_padding, 1) is None
++    mgr_c1.step_steps = 16
++    dead = mgr_c1.dead_row_args(is_padding, 1)
++    assert dead is not None
++    assert dead.log_tau == pytest.approx(-1e30, rel=1e-5)
+diff --git a/tests/v1/spec_decode/test_copy_drafts.py b/tests/v1/spec_decode/test_copy_drafts.py
+index 24ccd43cb..3c9c70cce 100644
+--- a/tests/v1/spec_decode/test_copy_drafts.py
++++ b/tests/v1/spec_decode/test_copy_drafts.py
+@@ -346,7 +346,7 @@ def test_copy_alloc_and_apply_follow_the_reference_over_a_copy():
+             num_sampled,
+             verified,
+             cut,
+-            dspark_yield=float(dspark[1][0].sum()),
++            dspark_yield=float(np.cumprod(dspark[1][0].cpu().numpy(), dtype=np.float32).sum()),
+         )
+         assert int(alloc[0]) == ref_alloc
+         assert int(int_state[slot, 0]) == ref.doublings
+@@ -1439,15 +1439,16 @@ def test_copy_apply_gates_replacement_by_expected_yield_against_dspark():
+     assert float(floats[slot].abs().sum()) == 0.0
+ 
+     # 2. Low-estimate full continuation (offered=8, estimate=19/80=0.2375 ->
+-    # yield=1.90) yields to DSpark when dspark_yield=2.0, and wins at tie=1.90.
++    # yield=1.90) yields to DSpark when cumulative survival dspark_yield=1.9312,
++    # and wins at exact cumulative survival tie=1.90.
+     total_len[slot] = 300
+     history[slot, :300] = 7
+     sources = _run_match(history, total_len, idx)
+     ints, floats = _state()
+     floats[slot] = torch.tensor([0.0, 60.0], device=DEVICE)
+-    dspark_2_0 = (
++    dspark_above = (
+         torch.tensor([[201, 202, 203, 204, 205]], dtype=torch.int64, device=DEVICE),
+-        torch.tensor([[0.6, 0.5, 0.4, 0.3, 0.2]], dtype=torch.float32, device=DEVICE),
++        torch.tensor([[0.8, 0.7, 0.6, 0.5, 0.4]], dtype=torch.float32, device=DEVICE),
+     )
+     drafts, conf, planned, alloc, _ = _propose(
+         history,
+@@ -1459,17 +1460,17 @@ def test_copy_apply_gates_replacement_by_expected_yield_against_dspark():
+         zero,
+         zero,
+         zero,
+-        dspark=dspark_2_0,
++        dspark=dspark_above,
+     )
+     assert int(alloc[0]) == LOOKAHEAD
+     assert int(ints[slot, 0]) == 0
+     assert int(ints[slot, 1]) == 0
+     assert drafts[0, :BLOCK].tolist() == [201, 202, 203, 204, 205]
+ 
+-    # At exact tie (dspark_yield = 5 * 0.38 = 1.90 == 8 * 0.2375), copy wins.
++    # At exact cumulative survival tie (0.95 + 0.95*1.0 = 1.90 == 8 * 0.2375), copy wins.
+     dspark_tie = (
+-        dspark_2_0[0],
+-        torch.full((1, BLOCK), 0.38, dtype=torch.float32, device=DEVICE),
++        dspark_above[0],
++        torch.tensor([[0.95, 1.0, 0.0, 0.0, 0.0]], dtype=torch.float32, device=DEVICE),
+     )
+     drafts, conf, planned, _, _ = _propose(
+         history,
+@@ -1487,6 +1488,33 @@ def test_copy_apply_gates_replacement_by_expected_yield_against_dspark():
+     assert drafts[0, :INITIAL].tolist() == [7] * INITIAL
+     assert drafts[0, INITIAL:].tolist() == [-1] * (LOOKAHEAD - INITIAL)
+ 
++    # 3. Short 2-token copy continuation (available=2, offered=2, estimate=0.95
++    # -> copy_yield=1.90) beats DSpark [0.6, 0.5, 0.4, 0.3, 0.2] whose raw sum is
++    # 2.00 > 1.90 but whose true cumulative survival is 1.0632 < 1.90.
++    total_len[slot] = 258
++    sources = _run_match(history, total_len, idx)
++    ints, floats = _state()
++    dspark_raw2 = (
++        dspark_above[0],
++        torch.tensor([[0.6, 0.5, 0.4, 0.3, 0.2]], dtype=torch.float32, device=DEVICE),
++    )
++    drafts, conf, planned, alloc, _ = _propose(
++        history,
++        total_len,
++        idx,
++        sources,
++        ints,
++        floats,
++        zero,
++        zero,
++        zero,
++        dspark=dspark_raw2,
++    )
++    assert int(alloc[0]) == BLOCK
++    assert int(ints[slot, 1]) == 2
++    assert drafts[0, :2].tolist() == [7, 7]
++    assert drafts[0, 2:].tolist() == [-1] * (LOOKAHEAD - 2)
++
+ 
+ def test_copy_match_boilerplate_anchor_pruning_is_bit_identical():
+     """Contexts with thousands of repeated 16-, 32-, 64-, and 128-token
+diff --git a/tests/v1/worker/test_prepare_kernels.py b/tests/v1/worker/test_prepare_kernels.py
+index 8e77d19d2..5d8ce611d 100644
+--- a/tests/v1/worker/test_prepare_kernels.py
++++ b/tests/v1/worker/test_prepare_kernels.py
+@@ -280,6 +280,9 @@ def test_dead_row_caps_are_declared_before_the_manager_exists(monkeypatch):
+         )
+         runner_module.GPUModelRunner.declare_step_kernels(runner)
+         assert declared.pop()["dead_rows"] is enabled
++    runner.copy_drafter = SimpleNamespace(register_warmups=lambda: None)
++    runner_module.GPUModelRunner.declare_step_kernels(runner)
++    assert declared.pop()["dead_rows"] is True
+     assert not declared
+ 
+ 
+diff --git a/vllm/v1/worker/gpu/model_runner.py b/vllm/v1/worker/gpu/model_runner.py
+index 047236153..73ba6766b 100644
+--- a/vllm/v1/worker/gpu/model_runner.py
++++ b/vllm/v1/worker/gpu/model_runner.py
+@@ -2268,7 +2268,11 @@ class GPUModelRunner(LoRAModelRunnerMixin):
+         # The manager is built with the KV cache, after preparation; the
+         # speculator's flag is what decides it exists.
+         adaptive = bool(getattr(self.speculator, "enable_adaptive_verification", False))
+-        dead_rows = adaptive and dead_rows_enabled() and self.batch_sharder is None
++        dead_rows = (
++            adaptive
++            and (dead_rows_enabled() or self.copy_drafter is not None)
++            and self.batch_sharder is None
++        )
+         samples = self.is_last_pp_rank and not self.is_pooling_model
+         if not samples:
+             # A stage before the last commits what the last stage sampled.
+diff --git a/vllm/v1/worker/gpu/spec_decode/adaptive_verification.py b/vllm/v1/worker/gpu/spec_decode/adaptive_verification.py
+index 3f49b6cbc..d547910f1 100644
+--- a/vllm/v1/worker/gpu/spec_decode/adaptive_verification.py
++++ b/vllm/v1/worker/gpu/spec_decode/adaptive_verification.py
+@@ -55,6 +55,8 @@ EXPLORE_AFTER_IDLE_STEPS = 32
+ # and dense weight tiles at a reduced marginal cost.
+ HIGH_ROW_COST_KNEE = 16
+ HIGH_ROW_COST_SCALE = 0.55
++SINGLE_REQ_TILE_SPILL_SCALE = 2.0
++_ZERO_CONFIDENCE_LOG_TAU = -1e30
+ 
+ 
+ def resolve_adaptive_cudagraph_mode(
+@@ -115,6 +117,7 @@ class AdaptiveVerificationManager:
+         self.row_cost = row_cost
+         self.high_row_cost_knee = HIGH_ROW_COST_KNEE
+         self.high_row_cost_scale = HIGH_ROW_COST_SCALE
++        self.single_req_tile_spill_scale = SINGLE_REQ_TILE_SPILL_SCALE
+         self.tp_invariant_confidence = tp_invariant_confidence
+         self.calibrated_confidence = calibrated_confidence
+         self.dead_rows_tau = _DEAD_ROWS_TAU
+@@ -285,10 +288,28 @@ class AdaptiveVerificationManager:
+             write_slot.copy_to_cpu()
+             self._copy_events[write_idx].record()
+ 
+-    def _step_cost(self, rows: np.ndarray) -> np.ndarray:
+-        """Relative verification step cost with a 16-row Tensor Core MMA tile knee."""
++    def _step_cost(
++        self, rows: np.ndarray, *, num_sampling_requests: int = 1
++    ) -> np.ndarray:
++        """Relative verification step cost with a 16-row Tensor Core MMA tile knee.
++
++        Across concurrent decode requests (``num_sampling_requests > 1``), rows
++        above ``HIGH_ROW_COST_KNEE`` (16) share already-launched expert and
++        dense weight tiles at a discounted marginal cost (``high_row_cost_scale``).
++        For a single decode request (``num_sampling_requests <= 1``), crossing
++        16 rows spills 1 row into a second 16-row Tensor Core MMA wave and the
++        24-row CUDA graph, facing a higher marginal cost unless sustained copy
++        acceptance justifies the second wave.
++        """
+         knee = getattr(self, "high_row_cost_knee", HIGH_ROW_COST_KNEE)
+-        scale = getattr(self, "high_row_cost_scale", HIGH_ROW_COST_SCALE)
++        if num_sampling_requests <= 1:
++            scale = getattr(
++                self,
++                "single_req_tile_spill_scale",
++                SINGLE_REQ_TILE_SPILL_SCALE,
++            )
++        else:
++            scale = getattr(self, "high_row_cost_scale", HIGH_ROW_COST_SCALE)
+         if knee > 0 and scale != 1.0:
+             effective_rows = np.minimum(rows, knee) + scale * np.maximum(
+                 rows - knee, 0
+@@ -390,7 +411,9 @@ class AdaptiveVerificationManager:
+             ([num_sampling_requests], num_sampling_requests + np.cumsum(scores))
+         )
+         rows = int(num_non_draft_tokens.sum()) + np.arange(len(scores) + 1)
+-        utilities = expected_tokens / self._step_cost(rows)
++        utilities = expected_tokens / self._step_cost(
++            rows, num_sampling_requests=int(num_sampling_requests)
++        )
+         draft_budget = int(np.argmax(utilities))
+         # The confidences come from an estimator that learns only from admitted
+         # drafts, so a long run of empty budgets would leave it without the
+@@ -464,16 +487,26 @@ class AdaptiveVerificationManager:
+         """Arguments for the fused dead-row marking, or None when disabled.
+ 
+         The confidences are the current drafts', broadcast from rank 0, so
+-        every rank marks the same rows.
++        every rank marks the same rows. On wide copy-draft steps
++        (``step_steps > num_draft_steps``), trailing ``-1`` placeholder rows
++        from a shrunk proposal carry ``confidence == 0`` (``log(0) = -inf``),
++        so a finite floor ``_ZERO_CONFIDENCE_LOG_TAU`` masks them as padding
++        even when ``dead_rows_tau`` is 0.
+         """
++        if not getattr(self, "_has_admitted_drafts", True):
++            return None
+         tau = self.effective_dead_rows_tau()
+-        if tau <= 0 or not getattr(self, "_has_admitted_drafts", True):
++        has_copy_tail = getattr(self, "step_steps", 0) > getattr(
++            self, "num_draft_steps", self.num_speculative_steps
++        )
++        if tau <= 0 and not has_copy_tail:
+             return None
++        log_tau = float(np.log(tau)) if tau > 0 else _ZERO_CONFIDENCE_LOG_TAU
+         return DeadRows(
+             self._confidence_probs,
+             is_padding,
+             self._dead_row_cut[:num_reqs],
+-            float(np.log(tau)),
++            log_tau,
+         )
+ 
+     def get_verified_draft_counts(
+@@ -520,6 +553,8 @@ class AdaptiveVerificationManager:
+         self._has_admitted_drafts = draft_budget > 0
+         capacities = self._batch_draft_capacity[:num_reqs]
+         if draft_budget:
++            if num_reqs == 1:
++                scheduled_drafts[0] = draft_budget
+             async_tensor_h2d(scheduled_drafts, out=capacities)
+             if draft_budget < int(scheduled_drafts.sum()):
+                 tilelang_inputs.assign_draft_budget(
+diff --git a/vllm/v1/worker/gpu/spec_decode/tilelang_copy.py b/vllm/v1/worker/gpu/spec_decode/tilelang_copy.py
+index 32eab0055..03dadce8b 100644
+--- a/vllm/v1/worker/gpu/spec_decode/tilelang_copy.py
++++ b/vllm/v1/worker/gpu/spec_decode/tilelang_copy.py
+@@ -41,7 +41,8 @@ candidate is omitted unless it cannot improve the result.
+   drafts, at least DSpark's block).
+ - ``copy_apply``: a warp a request, once DSpark has drafted: the proposal of
+   ``copy_alloc``'s choice when its expected yield (``offered * estimate``) is at
+-  least DSpark's expected yield (``sum(dspark_confidences[r, :block])``), each
++  least DSpark's cumulative survival yield
++  (``sum_j prod_{m<=j} dspark_confidences[r, m]``), each
+   copied token at the estimate as its confidence and as its planned confidence up
+   to the next proposal's drafts; otherwise DSpark's drafts and confidences, with
+   the slot's pending copy state cleared so the next step does not judge DSpark's
+@@ -363,8 +364,10 @@ def copy_apply_kernel(lookahead: int, block: int, idx_dtype: str):
+             after = T.alloc_var(T.int32, init=chosen[r, 2])
+             estimate = T.alloc_var(T.float32, init=estimates[r])
+             dspark_yield = T.alloc_var(T.float32, init=T.float32(0))
++            dspark_survival = T.alloc_var(T.float32, init=T.float32(1))
+             for j in T.unroll(block):
+-                dspark_yield += dspark_confidences[r, j]
++                dspark_survival *= dspark_confidences[r, j]
++                dspark_yield += dspark_survival
+             use_copy = T.alloc_var(T.int32, init=0)
+             if start >= 0 and T.cast(offered, T.float32) * estimate >= dspark_yield:
+                 use_copy = 1
+-- 
+2.43.0
+

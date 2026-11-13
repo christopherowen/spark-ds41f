@@ -1,0 +1,448 @@
+{
+  "pr": 996,
+  "round": 1,
+  "pr_head": "86d4a427f46c6fed959d7d9074723fb9d4dc9db4",
+  "verdict": "corrected-meets-mark",
+  "host": "sp8 (spark-0016, NVIDIA GB10)",
+  "images": {
+    "candidate-49": "sha256:9f51f2e2c5ab728e96490d794bff7b83a147d6d3d61333c5b60b2cff662049cd",
+    "1107": "sha256:3f32a962ce04b7c8d85337cd427a8946b8b6bcaadd97cc8d8a8cd14e8d68a6ce"
+  },
+  "corrected_stack": "spark-ds41f:1107 with the 15 files of 0762..0766 plus the corrected 0767 bind-mounted read-only (all .py; no build). Before the correction the mounted files were byte-identical to candidate-49's image (15 of 15).",
+  "patch": {
+    "file": "0767-perf-dsv41-cache-SP-local-routing-masks-and-skip-SP-.patch",
+    "sha256": "c760258b871a6d1de7637ecb1db7abfb7063681366f91f769df038f39d8a0581",
+    "author": "Christopher Owen <christopherowen@users.noreply.github.com>, Sun, 8 Nov 2026 18:50:51 +0000 (kept)",
+    "applies_on": "candidate-49 0762..0766 (git am, tree equal to the tested one) and bare 1107 (git apply --check)",
+    "files": [
+      "vllm/models/deepseek_v4_1/tilelang/router.py",
+      "tests/kernels/moe/test_deepseek_v41_tilelang_router.py"
+    ],
+    "diff_check": "clean"
+  },
+  "root_cause": "The first revision validated its _local_mask cache entries with mask._version (cache[key] = (mask, mask._version, local), router.py:203). The vLLM worker runs every forward under torch.inference_mode, the startup profile_run included; the routed mask _routing_masks computes there (torch.empty_like in _masks) is an inference tensor, which tracks no version counter, so reading _version raised RuntimeError on the first SP route_local of the profile run, on every rank (sp5 TP0, sp6 TP1, sp7 TP2, both starts). The PR's tests and bench ran outside inference mode. A second defect in the same change: with no ForwardContext the cache and the image mask fell back to sp_rows, a frozen dataclass, so assigning raised FrozenInstanceError (not reached in serving, which always has a context; reached by any caller outside a forward).",
+  "change": "Cache entries live only on the forward's ForwardContext (the passed context or the current one) and are keyed by (id(mask), num_tokens, world_size, rank, rows, pad); the entry holds the mask, and a hit requires entry[0] is mask. No version counter is read. Outside a forward nothing is cached, and _routing_masks keeps the image mask on the context only, as 1107 does. The pad=True polarity fix in _partials_mask and the slicing are unchanged.",
+  "why_not_stale": [
+    "Lifetime: the runner creates a new ForwardContext for every forward (set_forward_context -> create_forward_context), so no entry outlives its forward; the runner's persistent is_padding and input_ids buffers keep their storage across steps but each forward starts with an empty cache.",
+    "Identity: the entry holds the mask tensor, so its id cannot be reused by another tensor while the entry lives; entry[0] is mask is checked.",
+    "Contents: within a forward, is_padding and input_ids are filled before the forward runs (input preparation, DeadRows included) and not written during it. 1107 already relies on this: it keeps routed = ~is_padding and the image mask on ForwardContext keyed by tensor identity alone. routed and image are new tensors each forward (torch.empty_like) that nothing writes after their kernel.",
+    "Layout: num_tokens, world_size, rank, rows and pad are in the key, so another layout in the same forward (CED compact rows, a drafter) gets its own entry.",
+    "Tested: test_gate_router_route_local_masks_last_one_forward refills persistent padding and id buffers in place across three forwards under inference mode and checks each forward routes with its own masks."
+  ],
+  "measured": {
+    "failing_reproduction": {
+      "new_tests_on_candidate-49_as_built": "6 failed: 5 RuntimeError 'Inference tensors do not track version counter' (route_local:1232 -> _compute_routing:1266 -> :877 -> _routing_masks:266 -> _local_mask:203, the boot's stack; and _partials_mask:285 -> :203), 1 FrozenInstanceError (outside a forward) (newtests-candidate49-fails.txt)",
+      "own-marks_infer_cases_on_candidate-49": "5 of 5 raised RuntimeError (infer-candidate49.txt)"
+    },
+    "passing": {
+      "new_tests_on_corrected": "6 passed (newtests-corrected-boot1.txt)",
+      "own-marks_infer_cases_on_corrected": "5 of 5 ok on both boots; real-row hashes equal to the recorded 1107 inference-mode boots in 5 of 5 cases",
+      "pytest_sp_prefill_and_router": {
+        "boot1": "271 passed, 14 warnings in 48.34s",
+        "boot2": "271 passed, 14 warnings in 48.03s",
+        "note": "265 of candidate-49's run plus the 6 new tests"
+      }
+    },
+    "bit_exactness": {
+      "inference_mode_every_rank": [
+        {
+          "boot": 1,
+          "reads_version": false,
+          "all_layers_equal_1107": true,
+          "cells": 42,
+          "layers_compared": 1680,
+          "layers_equal": 1680,
+          "gathered_equal_full_rows": "12 of 12",
+          "is_padding_is_inference": true,
+          "padded_ids_all_minus1": true
+        },
+        {
+          "boot": 2,
+          "reads_version": false,
+          "all_layers_equal_1107": true,
+          "cells": 42,
+          "layers_compared": 1680,
+          "layers_equal": 1680,
+          "gathered_equal_full_rows": "12 of 12",
+          "is_padding_is_inference": true,
+          "padded_ids_all_minus1": true
+        }
+      ],
+      "explanation": "TP 3 and 4, T = 1024, 2048, 4096, 6144, 8192, 16384, every rank, 2 forwards x 20 layers each under torch.inference_mode with a padding mask: torch.equal (ids, weights as int32) against 1107's uncached _local_mask in every layer; gathered real rows torch.equal to full-row routing in every (TP, T)",
+      "no_grad_bench_hashes": "28 of 28 (TP, T, rank) cells hash as the recorded 1107 boots"
+    },
+    "route_local_bench_no_grad_vs_recorded_boots": {
+      "tp3_tail_rank": {
+        "TP3_T1024_rank2": {
+          "cached_call_us": {
+            "1107_recorded": [
+              57.136,
+              60.224
+            ],
+            "candidate-49_recorded": [
+              47.52,
+              47.104
+            ],
+            "corrected": [
+              44.864,
+              45.472
+            ],
+            "speedup_vs_1107": 1.299,
+            "vs_1107": "faster"
+          },
+          "pass_us_per_layer": {
+            "1107_recorded": [
+              52.959,
+              53.906
+            ],
+            "candidate-49_recorded": [
+              37.055,
+              37.131
+            ],
+            "corrected": [
+              36.35,
+              36.913
+            ],
+            "speedup_vs_1107": 1.459,
+            "vs_1107": "faster"
+          }
+        },
+        "TP3_T2048_rank2": {
+          "cached_call_us": {
+            "1107_recorded": [
+              87.968,
+              91.328
+            ],
+            "candidate-49_recorded": [
+              80.976,
+              80.832
+            ],
+            "corrected": [
+              78.848,
+              79.648
+            ],
+            "speedup_vs_1107": 1.131,
+            "vs_1107": "faster"
+          },
+          "pass_us_per_layer": {
+            "1107_recorded": [
+              78.538,
+              83.602
+            ],
+            "candidate-49_recorded": [
+              69.973,
+              70.276
+            ],
+            "corrected": [
+              68.954,
+              69.308
+            ],
+            "speedup_vs_1107": 1.173,
+            "vs_1107": "faster"
+          }
+        },
+        "TP3_T4096_rank2": {
+          "cached_call_us": {
+            "1107_recorded": [
+              125.761,
+              123.504
+            ],
+            "candidate-49_recorded": [
+              117.056,
+              115.904
+            ],
+            "corrected": [
+              117.024,
+              115.153
+            ],
+            "speedup_vs_1107": 1.074,
+            "vs_1107": "faster"
+          },
+          "pass_us_per_layer": {
+            "1107_recorded": [
+              114.688,
+              112.601
+            ],
+            "candidate-49_recorded": [
+              106.432,
+              105.494
+            ],
+            "corrected": [
+              107.225,
+              104.751
+            ],
+            "speedup_vs_1107": 1.072,
+            "vs_1107": "faster"
+          }
+        },
+        "TP3_T8192_rank2": {
+          "cached_call_us": {
+            "1107_recorded": [
+              231.041,
+              230.624
+            ],
+            "candidate-49_recorded": [
+              228.785,
+              226.048
+            ],
+            "corrected": [
+              231.808,
+              220.865
+            ],
+            "speedup_vs_1107": 1.02,
+            "vs_1107": "within"
+          },
+          "pass_us_per_layer": {
+            "1107_recorded": [
+              220.497,
+              221.465
+            ],
+            "candidate-49_recorded": [
+              218.652,
+              215.601
+            ],
+            "corrected": [
+              222.157,
+              209.576
+            ],
+            "speedup_vs_1107": 1.024,
+            "vs_1107": "within"
+          }
+        },
+        "TP3_T16384_rank2": {
+          "cached_call_us": {
+            "1107_recorded": [
+              442.05,
+              440.016
+            ],
+            "candidate-49_recorded": [
+              431.202,
+              430.8
+            ],
+            "corrected": [
+              430.881,
+              436.898
+            ],
+            "speedup_vs_1107": 1.016,
+            "vs_1107": "faster"
+          },
+          "pass_us_per_layer": {
+            "1107_recorded": [
+              433.231,
+              430.897
+            ],
+            "candidate-49_recorded": [
+              420.942,
+              421.231
+            ],
+            "corrected": [
+              422.121,
+              427.913
+            ],
+            "speedup_vs_1107": 1.017,
+            "vs_1107": "faster"
+          }
+        }
+      },
+      "summary": {
+        "tail_cells_cached_faster_beyond_interval": "4 of 5",
+        "tail_cells_cached_vs_candidate49": {
+          "faster": 2,
+          "within": 3,
+          "slower": 0
+        },
+        "non_tail_cells_cached_vs_1107": {
+          "faster": 6,
+          "within": 11,
+          "slower": 6
+        },
+        "tail_cells_pass_faster_beyond_interval": "4 of 5",
+        "tail_cells_pass_vs_candidate49": {
+          "faster": 2,
+          "within": 2,
+          "slower": 1
+        },
+        "non_tail_cells_pass_vs_1107": {
+          "faster": 3,
+          "within": 14,
+          "slower": 6
+        },
+        "real_rows_hashes_equal_1107": "28 of 28"
+      }
+    },
+    "route_local_inference_mode_in_process_ab": {
+      "what": "exact_996.py ibench: the same calls under torch.inference_mode, this image's _local_mask against 1107's (body verbatim, swapped in), interleaved per step in one process, two boots; supplementary, no recorded 1107 inference-mode bench exists",
+      "tp3_tail_rank": {
+        "TP3_T1024_rank2": {
+          "cached_call_us": {
+            "1107_mask_logic": [
+              53.936,
+              53.952
+            ],
+            "corrected": [
+              44.624,
+              44.896
+            ],
+            "vs_1107": "faster"
+          },
+          "pass_us_per_layer": {
+            "1107_mask_logic": [
+              47.953,
+              47.483
+            ],
+            "corrected": [
+              36.105,
+              36.384
+            ],
+            "vs_1107": "faster"
+          }
+        },
+        "TP3_T2048_rank2": {
+          "cached_call_us": {
+            "1107_mask_logic": [
+              88.72,
+              88.656
+            ],
+            "corrected": [
+              79.168,
+              79.281
+            ],
+            "vs_1107": "faster"
+          },
+          "pass_us_per_layer": {
+            "1107_mask_logic": [
+              78.439,
+              78.45
+            ],
+            "corrected": [
+              69.139,
+              69.201
+            ],
+            "vs_1107": "faster"
+          }
+        },
+        "TP3_T4096_rank2": {
+          "cached_call_us": {
+            "1107_mask_logic": [
+              124.704,
+              124.656
+            ],
+            "corrected": [
+              116.481,
+              115.568
+            ],
+            "vs_1107": "faster"
+          },
+          "pass_us_per_layer": {
+            "1107_mask_logic": [
+              115.069,
+              115.17
+            ],
+            "corrected": [
+              106.324,
+              105.596
+            ],
+            "vs_1107": "faster"
+          }
+        },
+        "TP3_T8192_rank2": {
+          "cached_call_us": {
+            "1107_mask_logic": [
+              239.313,
+              235.137
+            ],
+            "corrected": [
+              231.025,
+              226.833
+            ],
+            "vs_1107": "faster"
+          },
+          "pass_us_per_layer": {
+            "1107_mask_logic": [
+              230.506,
+              226.948
+            ],
+            "corrected": [
+              221.928,
+              219.354
+            ],
+            "vs_1107": "faster"
+          }
+        },
+        "TP3_T16384_rank2": {
+          "cached_call_us": {
+            "1107_mask_logic": [
+              443.809,
+              441.057
+            ],
+            "corrected": [
+              434.818,
+              432.818
+            ],
+            "vs_1107": "faster"
+          },
+          "pass_us_per_layer": {
+            "1107_mask_logic": [
+              436.145,
+              433.613
+            ],
+            "corrected": [
+              428.459,
+              423.879
+            ],
+            "vs_1107": "faster"
+          }
+        }
+      },
+      "summary": {
+        "ibench_tail_cached_faster_beyond_interval": "5 of 5",
+        "ibench_non_tail_cached_vs_1107": {
+          "faster": 0,
+          "within": 22,
+          "slower": 1
+        },
+        "ibench_tail_pass_faster_beyond_interval": "5 of 5",
+        "ibench_non_tail_pass_vs_1107": {
+          "faster": 2,
+          "within": 20,
+          "slower": 1
+        }
+      }
+    },
+    "tp4": "every TP4 cell of the grid (T = 768..16384, multiples of 4) has real_rows == local_rows: no TP4 tail rank, as the own mark found",
+    "interval": "two container boots per arm; a gain is beyond the interval when the slower corrected boot beats the faster 1107 boot (the own mark's rule). The 1107 and candidate-49 arms are the recorded own-mark boots on sp8, not re-measured."
+  },
+  "parts": [
+    {
+      "part": "runs under torch.inference_mode on the route_local path that failed the boot: a test reproduces the failure, then passes",
+      "verdict": "pass",
+      "detail": "6 new tests fail on candidate-49 as built (5 RuntimeError at router.py:203, the boot stack; 1 FrozenInstanceError) and pass on the corrected stack; the own-marks inference-mode cases go from 5 of 5 raised to 5 of 5 ok"
+    },
+    {
+      "part": "#996's own tests and the SP prefill and router tests",
+      "verdict": "pass",
+      "detail": "271 passed on both boots"
+    },
+    {
+      "part": "bit-exact (torch.equal, T = 1024..16384, TP3 and TP4)",
+      "verdict": "pass",
+      "detail": "1680 of 1680 layers per boot, every rank, under inference mode; 28 of 28 no_grad cells hash as 1107"
+    },
+    {
+      "part": "route_local gain on two boots",
+      "verdict": "pass, with one cell within the interval",
+      "detail": "TP3 tail rank per-call: T=1024 1.30x, 2048 1.13x, 4096 1.07x, 16384 1.016x faster beyond the recorded 1107 interval; T=8192 1.02x within it (boot1 231.8 us vs 1107 231.0/230.6, boot2 220.9), the cell where the original gained only 1.015x. No tail cell is worse, and none is slower than the original #996 on per-call timing. Under inference mode, in process, 5 of 5 tail cells are faster beyond the interval on both boots (1.02x..1.21x per call)."
+    }
+  ],
+  "reason": "The boot failure is the cache's mask._version read on inference tensors. Keying the cache on the forward's own ForwardContext and the mask's identity, with no version read, is valid under torch.inference_mode and cannot serve another forward's masks; it keeps the PR's bit-exactness and its TP3 tail-rank route_local gain (4 of 5 cells beyond the recorded interval, T=8192 within and not worse; 5 of 5 under inference mode in process). The fallback to caching on the frozen SPRows is removed.",
+  "caveats": [
+    "T=8192 (TP3 tail) is within the recorded interval on the no_grad bench; this is reported, not re-run.",
+    "Non-tail ranks: per-call 6 faster, 11 within, 6 slower than the recorded 1107 boots (slower by 0.3-4 us, <= 1.9%), the cache lookup where local_slice is already a view; the original's own mark showed the same pattern (4 slower). Under inference mode in process: 22 within, 1 slower. Skipping the cache when the slice is a view would remove this; not done, to keep the rework to the defect.",
+    "The harness uses a stand-in ForwardContext and plain scratch, as the PR's tests do; it does not run the SP gather collective or a real engine boot. A cluster boot of the corrected stack (tp3-switched) remains to be done in a candidate window."
+  ],
+  "harness": {
+    "bench_996_route_local.py": "own-marks harness, unchanged, sha256 968eed5d2c63e5c0407dc2f1660211d5bcb0e978cadc2f219c1d1b48882c150a",
+    "exact_996.py": "harness/exact_996.py",
+    "analyze_996.py": "harness/analyze_996.py (writes json/analysis.json)"
+  }
+}

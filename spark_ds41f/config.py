@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import argparse
 import ast
+import base64
 import concurrent.futures
 import fcntl
 import functools
@@ -16,6 +17,7 @@ import shlex
 import shutil
 import signal
 import socket
+import struct
 import subprocess
 import sys
 import sysconfig
@@ -475,8 +477,107 @@ def glp_problems(cluster: dict) -> list[str]:
     return problems
 
 
+# The profile image's own GLP reader (vllm/models/deepseek_v4_1/glp.py: "Check a GLP file
+# against this runtime's reader without serving"), run against the file mounted where the
+# engine reads it. The engine reads the file while it builds the model, so a vector its
+# reader refuses stops the whole engine, the stock model name with it. The reader needs no
+# GPU and no network; its --num-layers and --hidden-size defaults are DS4.1-Flash's (40
+# layers of 5120, the checkpoint's text_config). The timeout runs in the container, so a
+# stuck reader ends its own container.
+GLP_READER = ["python3", "-m", "vllm.models.deepseek_v4_1.glp", cluster_recipe.GLP_TARGET]
+GLP_READER_TIMEOUT = "120s"
+# A GGUF file's metadata precedes its tensors; a GLP file's fits in its first 64 KiB.
+GLP_HEADER_BYTES = 65536
+_GGUF_SCALARS = {0: "<B", 1: "<b", 2: "<H", 3: "<h", 4: "<I", 5: "<i", 6: "<f", 7: "<?",
+                 10: "<Q", 11: "<q", 12: "<d"}
+_GGUF_STRING, _GGUF_ARRAY = 8, 9
+
+
+def glp_reader_command(cluster: dict, path: str) -> list[str]:
+    """The ``docker run`` of the profile image's GLP reader on the host file ``path``: never
+    pulled, without GPU or network."""
+    return ["docker", "run", "--rm", "--pull=never", "--network=none",
+            "--entrypoint=/usr/bin/timeout",
+            "--volume", f"{path}:{cluster_recipe.GLP_TARGET}:ro",
+            cluster["container"]["image"],
+            "--signal=TERM", "--kill-after=10s", GLP_READER_TIMEOUT, *GLP_READER]
+
+
+def gguf_metadata(data: bytes) -> dict[str, object]:
+    """The metadata of a GGUF file's leading bytes (version 2 or 3), as far as they reach."""
+    if data[:4] != b"GGUF":
+        raise ValueError("not a GGUF file")
+    offset = 16  # magic, version and tensor count
+
+    def take(fmt: str):
+        nonlocal offset
+        (value,) = struct.unpack_from(fmt, data, offset)
+        offset += struct.calcsize(fmt)
+        return value
+
+    def value(kind: int):
+        nonlocal offset
+        if kind == _GGUF_STRING:
+            size = take("<Q")
+            if offset + size > len(data):
+                raise struct.error("truncated string")
+            offset += size
+            return data[offset - size:offset].decode("utf-8", "replace")
+        if kind == _GGUF_ARRAY:
+            item, count = take("<I"), take("<Q")
+            return [value(item) for _ in range(count)]
+        return take(_GGUF_SCALARS[kind])
+
+    metadata: dict[str, object] = {}
+    try:
+        for _ in range(take("<Q")):
+            key = value(_GGUF_STRING)
+            metadata[key] = value(take("<I"))
+    except (struct.error, KeyError):
+        pass
+    return metadata
+
+
+def glp_file_fields(nodes: dict, node: dict, path: str) -> str:
+    """The file's ``glp.spec_version`` and ``glp.hook_point``, as a refusal names them."""
+    result = run_ssh(nodes, node, "sh", "-c",
+                     f"head -c {GLP_HEADER_BYTES} {shlex.quote(path)} | base64 -w0")
+    try:
+        metadata = gguf_metadata(base64.b64decode(result.stdout.strip(), validate=True))
+    except ValueError:
+        return "its GGUF metadata is unreadable"
+    return ", ".join(f"{key} {metadata[key]!r}" if key in metadata else f"no {key}"
+                     for key in ("glp.spec_version", "glp.hook_point"))
+
+
+def glp_reader_problems(cluster: dict, nodes: dict, node: dict, path: str) -> list[str]:
+    """The profile image's GLP reader on the node's file. An image the node lacks, or a
+    Docker the node's user cannot reach, is left to the image checks that follow."""
+    image = cluster["container"]["image"]
+    result = run_ssh(nodes, node, *glp_reader_command(cluster, path))
+    if result.returncode == 0:
+        return []
+    detail = result.stderr.strip() or result.stdout.strip()
+    lines = detail.splitlines() or [f"exit status {result.returncode}"]
+    # Docker's and SSH's own errors lead with their reason; the reader's traceback ends with it.
+    first, last = lines[0], lines[-1]
+    if (result.returncode == 125 and "no such image" in detail.lower()) or "docker.sock" in detail:
+        return []
+    if result.returncode == 255:
+        return [f"{node['name']}: cannot check the GLP steering file with {image}'s reader: {first}"]
+    if result.returncode in (125, 126, 127):
+        return [f"{node['name']}: cannot run {image}'s GLP reader: {first}"]
+    if result.returncode == 124:
+        return [f"{node['name']}: {image}'s GLP reader did not finish within {GLP_READER_TIMEOUT}"]
+    return [f"{node['name']}: {image} cannot read the GLP steering file {path} "
+            f"({glp_file_fields(nodes, node, path)}): {last}; the engine reads the file while it "
+            "builds the model, so it would not start, the stock model name included: pin a "
+            "vector this image reads, or an image that reads this one"]
+
+
 def node_glp_problems(cluster: dict, nodes: dict, node: dict) -> list[str]:
-    """The ``glp`` file on one node: present at its pinned revision, with the block's sha256."""
+    """The ``glp`` file on one node: present at its pinned revision, with the block's sha256,
+    and, on the head, one the profile image's own GLP reader accepts."""
     source = cluster_recipe.glp_file(cluster)
     if source is None:
         return []
@@ -491,7 +592,8 @@ def node_glp_problems(cluster: dict, nodes: dict, node: dict) -> list[str]:
     if digest != cluster["glp"]["sha256"]:
         return [f"{node['name']}: GLP steering file {path} has sha256 {digest}, not glp.sha256 "
                 f"{cluster['glp']['sha256']}; remove it and {fix}"]
-    return []
+    # Every rank holds the same image and file, so the head's reader speaks for all.
+    return glp_reader_problems(cluster, nodes, node, path) if node.get("head") else []
 
 
 def repository_revision(revision: str = "HEAD") -> str:

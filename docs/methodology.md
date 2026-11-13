@@ -35,8 +35,8 @@ and no material regression. A performance enhancement must show a relevant,
 repeatable gain beyond both candidate and saved-reference repeat margins. Do not
 reclassify an unsuccessful enhancement as cleanup after seeing its results.
 
-Report every completed round to the owner with the compatible saved 1030 and
-C36 records, previous candidate and current candidate. Show signed over/under
+Report every completed round to the owner with the recorded runs of the release
+the candidate is built on, the previous candidate and the current candidate. Show signed over/under
 and explicit better, worse or no-proven-change verdicts. Keep both candidate
 boots, all reference/candidate boot pairings and their separate repeat margins;
 identify a missing reference repeat instead of inventing one. Never remeasure a
@@ -48,12 +48,19 @@ cache/preemptions/KV where recorded, memory/swap, startup and thermals. Retain
 adverse rows and missing-data limits. A component gain or higher mean against an
 old release does not establish an incremental serving gain from the new patch.
 
-A patch that misses its stated mark gets one delegated focused review/rework.
-Make at most one justified corrected candidate with explicit source identity
-and fresh qualification. If it still misses, highlight the problem and drop it.
-A review that finds no defensible correction does not justify another image
-merely to use the allowance. Preserve rejected sources, images, measurements
+A patch that misses its stated mark goes to a sub-agent for one focused rework,
+with the miss, the receipts and the mark. A second rework is allowed when the first
+shows promise: a partial gain, or an identified cause with a defensible correction. A
+patch that still misses is dropped from the release (owner, 2026-11-09). A reworked
+patch re-enters the next candidate with explicit source identity and fresh
+qualification. A review that finds no defensible correction does not justify another
+image merely to use the allowance. Preserve rejected sources, images, measurements
 and original failures. An unimplemented proposal is not a measured failure.
+
+Every patch that passes is included in all later candidates (owner, 2026-11-09). The
+next candidate's base is the release plus every patch that has passed so far, and new
+patches are judged against that base. [release-benchmark.md](release-benchmark.md#candidates)
+gives a round's steps.
 
 ## Minimum benchmark matrix
 
@@ -111,7 +118,14 @@ our 0.100 s (#503), and a change that speeds up plain decode would raise it.
 Every target-hardware startup must be fail-closed. Pre-arm the configured
 startup memory guard before each container launch, verify it remains active
 through API readiness, and reject the run on any driver allocation failure or
-guard stop. Do not repeat a coordinated launch after management-path loss until
+guard stop.
+
+Before any rank launches, `cluster start` drops clean caches and compacts memory
+on every node (`sudo -n sh -c 'sync; echo 3 > /proc/sys/vm/drop_caches; echo 1 >
+/proc/sys/vm/compact_memory'`). Cached file pages scattered through 2 MiB
+pageblocks otherwise keep weight loading from finding whole 2 MiB blocks. This is
+`host.defragment_before_start`: true by default, and a profile sets it false to
+skip. A node that refuses `sudo -n` prints a warning and starts without it. Do not repeat a coordinated launch after management-path loss until
 the failure is isolated with bounded tests and the owner explicitly authorizes
 new hardware work.
 
@@ -134,7 +148,18 @@ A promotion commit must:
    (every step's output except the model step's generated text, plus the release
    table), named by that shape's `benchmark_reference`. `bin/spark bench --suite`
    compares with it. Releases before r6l recorded a `bin/spark bench` report as
-   `manifests/benchmarks/<baseline>[-<shape>].json` instead;
+   `manifests/benchmarks/<baseline>[-<shape>].json` instead. This is done for EVERY shape
+   the release is qualified on, with the companion runs beside it and the repeat boot.
+
+   **Keep every qualification record in the repository** (owner, 2026-11-09). That means
+   the suite runs and the other records: the quality evals, AgentX, the gate, startup
+   memory, collective probes and telemetry, under the release's candidate folder
+   `receipts/`. Later candidates compare against them, and the next release notes report
+   against them. A record left only on a node (`~/spark-lab`, `results/private`) can't be
+   found, so the release ends up measured again. 1107's switched records were left on the
+   nodes and recovered on 2026-11-09 (`experiments/2026-10-26-spark-ds41f-candidate/1107/receipts/`).
+   Files too large to commit stay on the nodes, listed in the receipts with their host,
+   path, size and SHA-256;
 8. pass the release tests on the promoted image ([testing](testing.md)):
    `scripts/release_tests.py check` reports no unclassified, ambiguous or missing file
    for the release's patch series, and the gate bundle exits 0;

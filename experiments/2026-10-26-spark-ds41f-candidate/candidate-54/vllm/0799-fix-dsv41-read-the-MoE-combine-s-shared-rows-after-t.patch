@@ -1,0 +1,80 @@
+From 1e66d87262bc53bea9d4821724288288bf5b5795 Mon Sep 17 00:00:00 2001
+From: Christopher Owen <christopherowen@users.noreply.github.com>
+Date: Wed, 11 Nov 2026 06:52:04 +0000
+Subject: [PATCH] fix(dsv41): read the MoE combine's shared rows after the PDL
+ wait
+
+Base: 4e8133ff10a1 (candidate-54 patch 0791)
+Rationale: moe_combine_v41 loaded the shared expert's output (Shared) before
+  pdl.chain(), that is before griddepcontrol.wait. The shared expert runs on
+  the aux stream, and the combine joins it with an event wait just before its
+  launch. The combine is launched with programmatic stream serialization, so
+  in a captured graph its dependency on the aux stream's last kernel can be a
+  programmatic edge, which orders only what follows the wait. A load before
+  the wait could then read shared rows that the shared expert had not yet
+  stored, and that layer's MoE output would differ on that rank. The wait now
+  comes before the shared load. The RoutePos and Weights loads stay before
+  it: their writers ran several kernels earlier on the main stream and have
+  completed by the time the kernel before the combine passes its own wait.
+Quality: no arithmetic change; the combine's output is the same bits whenever
+  the shared rows were complete before the load.
+Tests: pytest tests/kernels/moe/test_deepseek_v41_tilelang_moe.py (140
+  passed on GB10). test_routed_moe_pdl_preloads_before_wait now asserts
+  that the combine reads Shared after the wait and before the routes' rows;
+  RoutePos and Weights stay before it.
+Upstream status: spark-ds41f local patch; corrects 1107 patch 0756.
+---
+ tests/kernels/moe/test_deepseek_v41_tilelang_moe.py | 8 +++++---
+ vllm/models/deepseek_v4_1/tilelang/moe.py           | 7 ++++---
+ 2 files changed, 9 insertions(+), 6 deletions(-)
+
+diff --git a/tests/kernels/moe/test_deepseek_v41_tilelang_moe.py b/tests/kernels/moe/test_deepseek_v41_tilelang_moe.py
+index e1ecb975e..afc08d3a9 100644
+--- a/tests/kernels/moe/test_deepseek_v41_tilelang_moe.py
++++ b/tests/kernels/moe/test_deepseek_v41_tilelang_moe.py
+@@ -891,7 +891,9 @@ def test_routed_moe_pdl_preloads_before_wait():
+     moe_dispatch clears warp_count in shared memory before waiting on TopkIdx;
+     early-trigger decode down GEMMs preload TileExpert, Order,
+     SFBase, and Narrow before waiting on moe_swiglu_cast; and moe_combine
+-    preloads RoutePos, Weights, and Shared before waiting on the down GEMM."""
++    preloads RoutePos and Weights before waiting on the down GEMM, and reads
++    Shared, which the shared expert writes on the aux stream, only after the
++    wait and ahead of the routes' rows."""
+     from vllm.models.deepseek_v4_1.tilelang.moe import (
+         moe_combine_v41,
+         moe_dispatch_v41,
+@@ -930,8 +932,8 @@ def test_routed_moe_pdl_preloads_before_wait():
+     wait_pos = comb_src.index("cudaGridDependencySynchronize()")
+     assert comb_src.index("RoutePos[") < wait_pos
+     assert comb_src.index("Weights[") < wait_pos
+-    assert comb_src.index("*(uint4*)(Shared + ") < wait_pos
+-    assert wait_pos < comb_src.index("*(uint4*)(Y + ")
++    shared_pos = comb_src.index("*(uint4*)(Shared + ")
++    assert wait_pos < shared_pos < comb_src.index("*(uint4*)(Y + ")
+ 
+ 
+ def test_grouped_fp8_fp4_gemm_unswizzled_tma_evict_first():
+diff --git a/vllm/models/deepseek_v4_1/tilelang/moe.py b/vllm/models/deepseek_v4_1/tilelang/moe.py
+index a59fe7572..74699fda6 100644
+--- a/vllm/models/deepseek_v4_1/tilelang/moe.py
++++ b/vllm/models/deepseek_v4_1/tilelang/moe.py
+@@ -396,12 +396,13 @@ def moe_combine_v41(
+                 pos[k] = RoutePos[row, k]
+                 if weighted:
+                     w[k] = Weights[row, k]
++            pdl.chain()
+             if shared:
+-                # Requested before the wait and the routes' loads, added after their
+-                # sum: the same arithmetic, with the shared row's latency hidden.
++                # Requested after the wait, which orders it after the shared
++                # expert's stores on the aux stream, and before the routes' loads;
++                # added after their sum: the shared row's latency stays hidden.
+                 for d in T.Parallel(block_D):
+                     sv[d] = Shared[row, bd * block_D + d]
+-            pdl.chain()
+             for k in T.unroll(topk):
+                 if pos[k] >= 0:
+                     for d in T.Parallel(block_D):
+-- 
+2.43.0
+

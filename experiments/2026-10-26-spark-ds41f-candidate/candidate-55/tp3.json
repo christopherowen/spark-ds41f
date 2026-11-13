@@ -1,0 +1,29 @@
+{
+  "notes": "candidate-55 at tp3-triangle: frozen candidate-54 plus #1134 (vLLM 0800, 0801; sparknet 0001), #1096 (B12X removed, 0802), #989 and #982 (sparknet 0002, 0003; vLLM 0803) and #974 (the CUDA 13.5.37 toolchain), with TP3's L2 prefetch windows capped at 15/12/12 MB (WO/FFN/NEXT; defaults 20/16/20); unpromoted candidate",
+  "extends": {
+    "config": "releases/spark-ds41f-1107/cluster.json",
+    "shape": "tp3-triangle"
+  },
+  "set": {
+    "container": {
+      "image": "spark-ds41f:candidate-55",
+      "expected_labels": {
+        "local.spark-ds41f.vllm.tree": "8aaae3df479bcc22087912064ec41d2dec548c12",
+        "local.spark-ds41f.tilelang.tree": "e2b001828fd4e38e6a2eee61f818d5083cb1335f",
+        "local.spark-ds41f.sparknet.tree": "e06f6a0675cb66638231d2c68948a2b315b69b07"
+      }
+    },
+    "upstreams_config": "experiments/2026-10-26-spark-ds41f-candidate/candidate-55/upstreams.lock.json",
+    "environment": {
+      "VLLM_DS41_L2_PREFETCH_WO_MB": "15",
+      "VLLM_DS41_L2_PREFETCH_FFN_MB": "12",
+      "VLLM_DS41_L2_PREFETCH_NEXT_MB": "12"
+    },
+    "host": {
+      "defragment_before_start": true
+    }
+  },
+  "unset": [
+    "container.expected_labels.local.spark-ds41f.b12x.tree"
+  ]
+}

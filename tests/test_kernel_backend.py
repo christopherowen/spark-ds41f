@@ -350,6 +350,20 @@ class KernelBackendTest(unittest.TestCase):
                         # A missing label is named as an image built now carries it.
                         self.assertTrue(any(f".{name}.tree" in e for e in self.errors(cluster, lock)))
 
+    def test_lock_without_b12x_requires_omitting_b12x_tree_label(self):
+        cluster, lock, manifest, _ = self.ready()
+        labels = cluster["container"]["expected_labels"]
+        label = source_labels.key(labels, "b12x.tree")
+        labels.setdefault(label, manifest["b12x"]["expected_tree"])
+        self.assertEqual(kernel_backend.source_problems(cluster, lock, manifest), [])
+        lock["sources"].pop("b12x")
+        manifest.pop("b12x")
+        problems = kernel_backend.source_problems(cluster, lock, manifest)
+        self.assertEqual(len(problems), 1)
+        self.assertIn(label, problems[0])
+        labels.pop(label)
+        self.assertEqual(kernel_backend.source_problems(cluster, lock, manifest), [])
+
     def test_lock_without_tilelang_sources_fails(self):
         cluster, _, _, _ = self.ready()
         errors = kernel_backend.source_problems(cluster, self.lock, spark.read_json(self.lock["source_manifest"]))
@@ -536,7 +550,7 @@ class KernelBackendTest(unittest.TestCase):
 @functools.lru_cache(maxsize=1)
 def _experiment_configs_and_locks() -> tuple[tuple[str, dict], ...]:
     """Experiment JSON dictionaries that could be cluster profiles or upstream locks."""
-    skipped_dirs = {"results", "bundles", "release-tests", "__pycache__"}
+    skipped_dirs = {"results", "receipts", "bundles", "release-tests", "__pycache__"}
     items: list[tuple[str, dict]] = []
     for dirpath, dirnames, filenames in os.walk(ROOT / "experiments"):
         dirnames[:] = sorted(d for d in dirnames if d not in skipped_dirs)

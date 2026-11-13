@@ -1,0 +1,253 @@
+{
+ "pr": 998,
+ "pr_head": "e89ab5f9a31b47128fc8dba420673c48458d8834",
+ "patch": "0785-perf-worker-compact-packed-vocab-tables-and-expand-d.patch (SHA-256 cbb39349..., equal to the PR head's patch)",
+ "mark": "Its bench_carveout_expansion.py on the image, 2 boots (the PR commits no receipts: run it fresh): regular UMA saved per rank (the PR: 1,263 MiB at TP3), the moved DSpark MoE layers not slower (the PR: 8.5-12.3% faster), torch.equal; the startup floor higher. It acts only where SPARK_DS41F_DISPLAY_CARVEOUT_WEIGHTS=1, the TP3 shapes",
+ "host": "sp8 (spark-0016, NVIDIA GB10, driver 580.178.04)",
+ "status": "stopped after two runs on the coordinator's instruction (2026-11-09, during the round): candidate-53's release tests fail on dgx2 because of #998 (test_deepseek_v41_tilelang_vocab.py segfaults; test_deepseek_v41_expert_scale_codes.py fails on a _Plan stub without max_rows; both pass with #998's three files reverted to candidate-50's). A separate rework agent owns #998 (~/spark-lab/agents/candidate-53-rework-998/ on sp8). The second candidate boot, the image A/B (harness ab998.py, written, never run) and the PR's tests were not run.",
+ "evidence": [
+  "The PR's bench_carveout_expansion.py from its head, unmodified, mounted as /tmp/run_carveout_bench.py as its README runs it, with --device /dev/dri/card0 and PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True (warm.py first): base arm once, candidate arm once. It compares a hand-built base layout with the candidate's carve-out layout in-process, and regular against carve-out placement of the same tensors for each kernel."
+ ],
+ "measured": {
+  "base_arm": "AttributeError: module 'vllm.v1.worker.display_carveout' has no attribute 'total_bytes' (the base lacks the patch's API), as expected; recorded once",
+  "candidate_boot1": {
+   "tp3": {
+    "savings": {
+     "additional_carveout_buffers_mib": 1040,
+     "additional_carveout_weight_mib": 1263.125,
+     "uma_mem_available_saved_mib": 1461.6,
+     "uma_cuda_free_saved_mib": 1462.15,
+     "cuda_allocated_saved_mib": 1263.454,
+     "cuda_reserved_saved_mib": 1240.0,
+     "cuda_peak_reserved_saved_mib": 1500.0
+    },
+    "baseline_layout": {
+     "carveout_buffers_mib": [
+      432,
+      432
+     ],
+     "carveout_total_mib": 864,
+     "carveout_weight_mib": 631.875,
+     "uma_mem_available_used_mib": 2612.71,
+     "uma_cuda_free_used_mib": 2613.29,
+     "cuda_allocated_mib": 2260.305,
+     "cuda_reserved_mib": 2328.0,
+     "cuda_peak_reserved_mib": 3048.0
+    },
+    "candidate_layout": {
+     "carveout_buffers_mib": [
+      320,
+      320,
+      64,
+      480,
+      240,
+      480
+     ],
+     "carveout_total_mib": 1904,
+     "carveout_weight_mib": 1895.0,
+     "uma_mem_available_used_mib": 1151.12,
+     "uma_cuda_free_used_mib": 1151.13,
+     "cuda_allocated_mib": 996.851,
+     "cuda_reserved_mib": 1088.0,
+     "cuda_peak_reserved_mib": 1548.0
+    },
+    "kernels_regular_vs_carveout_us": {
+     "markov_anchor_embed_reqs_1": {
+      "regular_us": 9.86,
+      "carveout_us": 10.02,
+      "ratio": 1.0162,
+      "bit_identical": true
+     },
+     "markov_anchor_embed_reqs_3": {
+      "regular_us": 9.76,
+      "carveout_us": 9.95,
+      "ratio": 1.0195,
+      "bit_identical": true
+     },
+     "markov_anchor_embed_reqs_8": {
+      "regular_us": 9.6,
+      "carveout_us": 9.89,
+      "ratio": 1.0302,
+      "bit_identical": true
+     },
+     "dspark_moe_M_5": {
+      "regular_us": 380.16,
+      "carveout_us": 345.31,
+      "ratio": 0.9083,
+      "bit_identical": true
+     },
+     "dspark_moe_M_15": {
+      "regular_us": 1111.3,
+      "carveout_us": 1031.46,
+      "ratio": 0.9282,
+      "bit_identical": true
+     },
+     "dspark_moe_M_40": {
+      "regular_us": 2956.32,
+      "carveout_us": 2837.57,
+      "ratio": 0.9598,
+      "bit_identical": true
+     },
+     "vocab_embedding_packed_M_1": {
+      "regular_us": 10.78,
+      "carveout_us": 10.75,
+      "ratio": 0.9972,
+      "bit_identical": true
+     },
+     "vocab_embedding_packed_M_5": {
+      "regular_us": 10.91,
+      "carveout_us": 10.66,
+      "ratio": 0.9771,
+      "bit_identical": true
+     },
+     "vocab_embedding_packed_M_40": {
+      "regular_us": 13.41,
+      "carveout_us": 10.72,
+      "ratio": 0.7994,
+      "bit_identical": true
+     },
+     "vocab_embedding_packed_M_4096": {
+      "regular_us": 247.9,
+      "carveout_us": 248.99,
+      "ratio": 1.0044,
+      "bit_identical": true
+     }
+    }
+   },
+   "tp4": {
+    "savings": {
+     "additional_carveout_buffers_mib": 1328,
+     "additional_carveout_weight_mib": 1463.125,
+     "uma_mem_available_saved_mib": 1498.55,
+     "uma_cuda_free_saved_mib": 1498.54,
+     "cuda_allocated_saved_mib": 1463.617,
+     "cuda_reserved_saved_mib": 1500.0,
+     "cuda_peak_reserved_saved_mib": 1120.0
+    },
+    "baseline_layout": {
+     "carveout_buffers_mib": [
+      320,
+      320
+     ],
+     "carveout_total_mib": 640,
+     "carveout_weight_mib": 473.438,
+     "uma_mem_available_used_mib": 1843.88,
+     "uma_cuda_free_used_mib": 1843.89,
+     "cuda_allocated_mib": 1712.662,
+     "cuda_reserved_mib": 1808.0,
+     "cuda_peak_reserved_mib": 2308.0
+    },
+    "candidate_layout": {
+     "carveout_buffers_mib": [
+      240,
+      240,
+      64,
+      368,
+      160,
+      368,
+      160,
+      368
+     ],
+     "carveout_total_mib": 1968,
+     "carveout_weight_mib": 1936.562,
+     "uma_mem_available_used_mib": 345.33,
+     "uma_cuda_free_used_mib": 345.36,
+     "cuda_allocated_mib": 249.045,
+     "cuda_reserved_mib": 308.0,
+     "cuda_peak_reserved_mib": 1188.0
+    },
+    "kernels_regular_vs_carveout_us": {
+     "markov_anchor_embed_reqs_1": {
+      "regular_us": 9.92,
+      "carveout_us": 10.08,
+      "ratio": 1.0161,
+      "bit_identical": true
+     },
+     "markov_anchor_embed_reqs_3": {
+      "regular_us": 9.63,
+      "carveout_us": 9.82,
+      "ratio": 1.0197,
+      "bit_identical": true
+     },
+     "markov_anchor_embed_reqs_8": {
+      "regular_us": 9.57,
+      "carveout_us": 9.76,
+      "ratio": 1.0199,
+      "bit_identical": true
+     },
+     "dspark_moe_M_5": {
+      "regular_us": 280.8,
+      "carveout_us": 254.27,
+      "ratio": 0.9055,
+      "bit_identical": true
+     },
+     "dspark_moe_M_15": {
+      "regular_us": 820.45,
+      "carveout_us": 743.68,
+      "ratio": 0.9064,
+      "bit_identical": true
+     },
+     "dspark_moe_M_40": {
+      "regular_us": 2363.42,
+      "carveout_us": 2104.51,
+      "ratio": 0.8905,
+      "bit_identical": true
+     },
+     "vocab_embedding_packed_M_1": {
+      "regular_us": 10.85,
+      "carveout_us": 10.82,
+      "ratio": 0.9972,
+      "bit_identical": true
+     },
+     "vocab_embedding_packed_M_5": {
+      "regular_us": 10.75,
+      "carveout_us": 10.72,
+      "ratio": 0.9972,
+      "bit_identical": true
+     },
+     "vocab_embedding_packed_M_40": {
+      "regular_us": 10.62,
+      "carveout_us": 10.34,
+      "ratio": 0.9736,
+      "bit_identical": true
+     },
+     "vocab_embedding_packed_M_4096": {
+      "regular_us": 239.68,
+      "carveout_us": 239.81,
+      "ratio": 1.0005,
+      "bit_identical": true
+     }
+    }
+   }
+  },
+  "candidate_boot1_summary": "TP3: carve-out [432, 432] -> [320, 320, 64, 480, 240, 480] MiB (1,904 MiB; sp8's scanout heap held all of it), +1,263.1 MiB of weights in the carve-out, CUDA allocated -1,263.5 MiB (PR 1,263.5), MemAvailable used -1,461.6 MiB (PR -1,669); DSpark MoE in the carve-out 0.908/0.928/0.960x at M 5/15/40 (PR 0.881/0.881/0.915); markov_anchor_embed 1.016-1.030x (slower, 0.16-0.29 us); vocab_embedding_packed 0.80-1.00x; every output torch.equal. One boot only."
+ },
+ "parts": [
+  {
+   "part": "regular UMA saved per rank at TP3",
+   "verdict": "reproduced on one boot",
+   "detail": "1,263.5 MiB allocated, 1,461.6 MiB MemAvailable"
+  },
+  {
+   "part": "moved DSpark MoE layers not slower; torch.equal",
+   "verdict": "reproduced on one boot",
+   "detail": "4.0-9.2% faster at TP3, bit-identical; markov_anchor_embed in the carve-out is 1.6-3.0% slower on this boot"
+  },
+  {
+   "part": "second boot, image A/B, the PR's tests",
+   "verdict": "not run",
+   "detail": "stopped on the coordinator's instruction"
+  },
+  {
+   "part": "startup floor higher",
+   "verdict": "cannot-evaluate-on-sp8",
+   "detail": "the tp3-switched screen's startup record"
+  }
+ ],
+ "verdict": "miss",
+ "verdict_scope": "the round's verdict, set by the coordinator: the release tests fail with #998 in the candidate; its own mark is incomplete (one candidate boot)",
+ "reason": "#998 breaks two release tests (a segfault in test_deepseek_v41_tilelang_vocab.py and test_deepseek_v41_expert_scale_codes.py's _Plan stub without max_rows), which pass with its files reverted; that is a miss for this round regardless of its bench. The one candidate boot run before the stop reproduces its TP3 memory saving and its DSpark MoE speedup, bit-identical, with markov_anchor_embed slightly slower in the carve-out. The rework decides.",
+ "notes": [
+  "The rework's own mark should include the image A/B prepared here (../common/harness/ab998.py: each image's own layout at TP3, kernels on that placement, cross-image digests) and a second boot."
+ ]
+}

@@ -1,0 +1,70 @@
+{
+  "pr": 993,
+  "pr_head": "a3067d857fdaeda7e6d45d6938277078eb389804",
+  "mark": "Its indexer score bench: gain beyond the interval; bit-exactness shown on the image (the PR does not state it)",
+  "host": "sp8 (spark-0016, NVIDIA GB10)",
+  "images": {
+    "candidate-49": "sha256:9f51f2e2c5ab728e96490d794bff7b83a147d6d3d61333c5b60b2cff662049cd",
+    "1107": "sha256:3f32a962ce04b7c8d85337cd427a8946b8b6bcaadd97cc8d8a8cd14e8d68a6ce"
+  },
+  "evidence": "README section 4 pytest (test_deepseek_v41_tilelang.py, test_deepseek_v4_1_lsa.py) on the candidate image, two boots. The PR ships no bench script, only its P5/P4 receipt JSONs, so its score claim is measured with our harness bench_993_score.py: indexer_score_v41 of 1107's indexer.py (baseline; the _e2m1_code shim as for #999) against the image's own, in one process, alternating per iteration, warm and cold-L2 (a 96 MiB write before each cold call), rows 6 and 1, L = 4K..1M, dense page 128 (dense layers) and page 256 (Layer 20) plus candidate mode; and a bitwise comparison of the whole Scores buffer both kernels write on identical inputs (21 cases, including lengths that are not tile multiples and masked candidate blocks). The same harness on the 1107 image (both arms 1107 code) gives the A/A floor. Supplementary: the README's compute-sanitizer initcheck test, which the image cannot run on its own",
+  "measured": {
+    "pytest_candidate-49": {
+      "boot1": "68 passed, 1 skipped, 1 xfailed in 280.60s",
+      "boot2": "68 passed, 1 skipped, 1 xfailed in 281.43s",
+      "skipped": "test_indexer_reads_only_visible_rows: compute-sanitizer not found in the image (run separately below)",
+      "includes": "test_indexer_score_vectorizes_kpool_loads_and_coschedules_dense_rows PASSED on both boots"
+    },
+    "sanitizer_initcheck": {
+      "boot1": "test_indexer_reads_only_visible_rows PASSED (1 passed, 61 deselected in 37.46s)",
+      "boot2": "PASSED (1 passed, 61 deselected in 37.37s)",
+      "how": "host CUDA 13.0 compute-sanitizer 2025.3.1 mounted read-only, COMPUTE_SANITIZER set; initcheck with --error-exitcode 1 over the dense and candidate score kernels"
+    },
+    "kernel_sanity": "on both boots the candidate's dense and candidate-mode score kernels carry the __tl_load_k_shared_* vector loader and the baseline's do not; the baseline's kernel source hash on the candidate image (dense f2e7f30df3a94300) equals the 1107 image's own",
+    "bit_exactness": "21 of 21 cases bitwise equal (Scores viewed as int16, whole [rows, width] buffer) on both boots, and the candidate's score hashes are identical across boots",
+    "score_us_1107_boots_to_candidate49_boots": {
+      "dense_p128_rows6_L262144_cold": "498.528/487.104 -> 237.28/237.248 (2.077x; PR 13.0.88: 481.3 -> 240.0)",
+      "dense_p128_rows6_L262144_warm": "423.296/411.328 -> 229.76/230.816 (1.812x; PR 480.7 -> 239.3)",
+      "dense_p128_rows6_L65536_cold": "126.688/126.656 -> 69.344/69.344 (1.827x; PR 125.0 -> 67.6)",
+      "dense_p128_rows6_L4096_cold": "18.144/18.4 -> 16.064/16.16 (1.134x; PR 18.3 -> 16.4)",
+      "dense_p256_rows6_L1048576_cold": "2609.856/2570.976 -> 908.96/908.928 (2.850x; not in the PR's grid)",
+      "dense_p128_rows1_L262144_cold": "162.496/153.344 -> 132.8/125.632 (1.222x; PR 128.0 -> 124.1)",
+      "dense_p128_rows1_L262144_warm": "89.6/87.648 -> 60.928/60.896 (1.455x; PR 106.7 -> 72.9)",
+      "candidates_w4096_rows6_cold": "30.4/30.4 -> 26.304/26.304 (1.156x; PR 42.9 -> 30.7)",
+      "candidates_w16384_rows6_cold": "72.32/72.384 -> 55.968/55.968 (1.293x)"
+    },
+    "cells": "44 (22 shapes x warm/cold): 42 faster beyond the two-boot interval, 2 within it (rows=1, L=4096, warm and cold), 0 slower",
+    "speedup_ranges": {
+      "rows6_dense": "1.134x-2.850x",
+      "rows1_dense_L>=16K": "1.160x-1.455x",
+      "candidate_mode": "1.156x-1.501x"
+    },
+    "aa_floor_1107_image": "base/cand ratio 0.968-1.103 over all 44 cells and both boots (all but six within 0.99-1.01); exactness 21/21 on both A/A boots",
+    "interval": "two candidate-image boots per arm, each a median of 60 (L <= 256K) or 30 interleaved calls; a gain is beyond the interval when the slower candidate boot beats the faster baseline boot"
+  },
+  "parts": [
+    {
+      "part": "indexer score bench: gain beyond the interval",
+      "verdict": "pass",
+      "detail": "42 of 44 cells faster beyond the interval, none slower; the rows=6 dense gains match the PR's P5 rf_ca numbers within a few percent, and the A/A floor on 1107 is within about 1% in almost every cell"
+    },
+    {
+      "part": "bit-exactness shown on the image",
+      "verdict": "pass",
+      "detail": "Scores bitwise equal to 1107's kernel in all 21 cases on both boots (dense p128/p256, rows 1/6/16, tail lengths, candidate mode with masked blocks)"
+    },
+    {
+      "part": "reads only visible rows (README section 4, compute-sanitizer initcheck)",
+      "verdict": "pass",
+      "detail": "the vectorized 16-byte KPool loads read no key or scale past a row's visible positions on the integrated image, both boots"
+    }
+  ],
+  "verdict": "pass",
+  "reason": "The vectorized KPool loads and row co-scheduling make indexer_score_v41 1.13x-2.85x faster at rows=6 and up to 1.46x at rows=1 on the integrated image, beyond the two-boot interval, while writing bit-identical scores to 1107's kernel. The measurement is our harness, since the PR committed no bench script; the P4 MoE scale-code study in its README changes no code and was not re-run.",
+  "notes": [
+    "commands.txt start_utc is when the command was issued and includes any wait on /tmp/spark-lab-gpu.lock",
+    "The PR's attn_total (l2_prefetch + indexer + sparse_mla + WO) block timings need its unpublished harness and were not reproduced; only the score kernel is measured here",
+    "analysis.json is derived from json/ by a_other.py",
+    "The scored pytest skipped test_indexer_reads_only_visible_rows because the image ships no compute-sanitizer; it was run separately (pr-993-sanitizer.sh)"
+  ]
+}

@@ -1,0 +1,1848 @@
+"""One-shot RoCE all-reduce and all-gather runtime for multi-node tensor parallelism.
+
+Vendored from local-inference-lab/b12x ``b12x/comm/roce/roce_oneshot.py`` at the
+hardware-qualified switchless tree (see docs/provenance.md) and decoupled from
+the b12x preparation framework: ``prepare`` compiles the launchers in process.
+b12x calls this module RoCEnante; the mechanism is the one-shot collective.
+
+Designed for DGX Spark clusters, whose integrated GPU can read pinned host
+memory in place and whose ConnectX-7 can RDMA-write into the same memory.
+Each rank owns one pinned region (see ``_roce_proxy.c``); every all-reduce is
+one kernel launch that stages the input, rings the proxy thread, waits for
+every peer's RDMA-written payload, and reduces in fixed rank order.
+
+Runtime constraints:
+
+* one all-reduce in flight per runtime (single channel, one stream);
+* all-reduce messages up to ``max_size`` bytes and all-gather shards up to
+  ``max_gather_bytes``, both multiples of 16 bytes;
+* every rank of the exchange group must construct the runtime collectively;
+* every peer payload is striped across the HCAs routed to that peer, with a
+  completion flag per stripe so the GPU consumes the slot only after every
+  route lane delivered;
+* each HCA's source GID is the one IPv4 RoCE v2 entry of its port's GID table
+  in that HCA's subnet (``SPARKNET_ROCE_SUBNETS``), found at setup wherever the
+  kernel filed it; no GID slot is configured.
+"""
+
+from __future__ import annotations
+
+import contextlib
+import ipaddress
+import json
+import logging
+import os
+import re
+import threading
+from contextlib import contextmanager
+from pathlib import Path
+from typing import Any, Callable, Mapping, Optional, Sequence
+
+import torch
+import torch.distributed as dist
+from torch.distributed import ProcessGroup
+
+from ..topology.gids import ANY_IPV4, ipv4_roce_v2, read_gid_table
+from . import trace as _trace
+from ._kernels import (
+    PACK_BYTES,
+    Launch,
+    exchange_launcher,
+    gather_launcher,
+    kernel_setting_problems,
+    reduce_launcher,
+    reducescatter_launcher,
+)
+from ._proxy import Layout, Proxy, load as _load_proxy_library
+
+logger = logging.getLogger(__name__)
+
+# Bumped when the adapter-visible surface (constructor keywords, methods, their
+# semantics) changes incompatibly; integrations pin the value they were built for.
+# 3: no gid_index keyword or default_gid_index(); GIDs are found by subnet.
+API_VERSION = 3
+SUPPORTED_DTYPES = (torch.float16, torch.bfloat16, torch.float32)
+SUPPORTED_WORLD_SIZES = tuple(range(2, 17))
+DEFAULT_MAX_SIZE = 2 * 1024 * 1024
+DEFAULT_MAX_GATHER_BYTES = 16 * 1024 * 1024
+DEFAULT_THREADS = 512
+DEFAULT_BLOCKS = 64
+# Polls of a peer flag before the kernel gives up (each poll is a system-scope
+# load of host memory, roughly a microsecond): about 20 s.
+# A collective wait that sees no peer for this long stops the GPU. It is the
+# failure-detection latency: it must exceed the longest legitimate rank skew
+# (milliseconds in tensor-parallel decode). Ranks that compile for different
+# times meet on the host before collectives instead of lengthening it.
+DEFAULT_TIMEOUT_MS = 10_000
+# The control record holds the timeout in microseconds as an int32 word.
+MAX_TIMEOUT_MS = (2**31 - 1) // 1000
+# Control-record words (int32) beside the doorbell's: the timeout the host
+# sets, and the time a timed-out wait had waited (both microseconds).
+CTRL_TIMEOUT_WORD = 7
+CTRL_WAITED_WORD = 8
+# Replaced settings, refused with the reason instead of being ignored.
+REMOVED_SETTINGS = {
+    "SPARKNET_ROCE_SPIN_LIMIT": "it counted polls; sparknet 0.4.0 times waits in "
+    "milliseconds: set SPARKNET_ROCE_TIMEOUT_MS instead",
+    "SPARKNET_ROCE_GID_INDEX": "a fixed slot stops matching when a link flaps under live RDMA; sparknet 0.5.0 "
+    "finds each HCA's IPv4 RoCE v2 GID in its SPARKNET_ROCE_SUBNETS network: unset it",
+}
+MAX_LOCAL_HCAS = 4
+MAX_STRIPES = 2
+_SLOT_ALIGNMENT = 4096
+_DTYPE_NAMES = {
+    torch.float16: "float16",
+    torch.bfloat16: "bfloat16",
+    torch.float32: "float32",
+}
+
+
+_DEVICE_NAME = re.compile(r"[A-Za-z0-9_.-]+")
+
+
+def _hca_names(name: str) -> tuple[str, ...]:
+    """The device names in ``name``: a comma-separated list of exact RDMA device names, at most two.
+
+    NCCL's selection syntax (a prefix, ``=``, ``^`` or ``:port``) is refused rather
+    than read differently: each library reads its own variable.
+    """
+    raw = os.getenv(name)
+    if not raw:
+        return ()
+    items = tuple(item.strip() for item in raw.split(","))
+    bad = [item for item in items if not _DEVICE_NAME.fullmatch(item)]
+    if bad:
+        raise ValueError(f"{name} takes exact RDMA device names separated by commas, not NCCL's '=', '^' or "
+                         f"':port' syntax; got {raw!r}")
+    if len(items) > MAX_STRIPES or len(set(items)) != len(items):
+        raise ValueError(f"{name} names one or two distinct devices, got {raw!r}")
+    return items
+
+
+def _env_int(*names: str, default: int) -> int:
+    """First integer-valued environment variable among ``names``, else ``default``."""
+    for name in names:
+        raw = os.getenv(name)
+        if raw:
+            return int(raw)
+    return default
+
+
+def _env_str(*names: str, default: str) -> str:
+    """First non-empty environment variable among ``names``, else ``default``."""
+    for name in names:
+        raw = os.getenv(name)
+        if raw:
+            return raw
+    return default
+
+
+# Each setting has one ``SPARKNET_ROCE_*`` name; the renderer writes NCCL's
+# beside it from the same node map. Neither library is given a GID slot: NCCL
+# scans its GID table by NCCL_IB_ADDR_FAMILY and NCCL_IB_ROCE_VERSION_NUM, the
+# proxy by subnet.
+ENV_HCA = "SPARKNET_ROCE_HCA"
+ENV_SUBNETS = ("SPARKNET_ROCE_SUBNETS",)
+ENV_PEER_HCAS = ("SPARKNET_ROCE_PEER_HCAS",)
+ENV_TIMEOUT_MS = ("SPARKNET_ROCE_TIMEOUT_MS",)
+ENV_TOPOLOGY = ("SPARKNET_ROCE_TOPOLOGY",)
+ENV_DISPATCH = ("SPARKNET_ROCE_ALLREDUCE_DISPATCH_MAX_BYTES",)
+TOPOLOGIES = ("direct", "ring4", "mesh4")
+
+
+def _removed_setting_problems(environ: Mapping[str, str]) -> list[str]:
+    """One message per replaced setting still present in ``environ``."""
+
+    return [f"{name} is no longer read: {reason}" for name, reason in REMOVED_SETTINGS.items() if environ.get(name)]
+
+
+def _checked_timeout_ms(value: int) -> int:
+    """A wait timeout in milliseconds, within what the control record holds."""
+
+    value = int(value)
+    if not 1 <= value <= MAX_TIMEOUT_MS:
+        raise ValueError(f"the RoCE wait timeout must be 1 to {MAX_TIMEOUT_MS} ms, got {value}")
+    return value
+
+
+def discover_hcas() -> tuple[str, ...]:
+    """Return the RDMA devices to use, at most two.
+
+    ``SPARKNET_ROCE_HCA`` selects explicitly; otherwise every active device whose
+    port has an IPv4 RoCE v2 GID is used. ``NCCL_IB_HCA`` is NCCL's and is not read.
+    """
+
+    explicit = _hca_names(ENV_HCA)
+    if explicit:
+        return explicit
+    found = []
+    root = Path("/sys/class/infiniband")
+    for dev in sorted(root.glob("*")):
+        port = dev / "ports" / "1"
+        try:
+            if "ACTIVE" not in (port / "state").read_text():
+                continue
+        except OSError:
+            continue
+        if ipv4_roce_v2(read_gid_table(port)):
+            found.append(dev.name)
+    return tuple(found[:2])
+
+
+def _subnets_from_env() -> Optional[dict[str, ipaddress.IPv4Network]]:
+    """Parse ``SPARKNET_ROCE_SUBNETS``: each local HCA's IPv4 subnet, the cable's.
+
+    A JSON object such as ``{"rocep1s0f0": "10.12.1.0/24"}``, rendered from the
+    node map's ``roce_subnets``.
+    """
+
+    name = ENV_SUBNETS[0]
+    raw = os.getenv(name)
+    if not raw:
+        return None
+    try:
+        value = json.loads(raw)
+    except json.JSONDecodeError as exc:
+        raise ValueError(f"{name} must be a JSON object") from exc
+    if not isinstance(value, dict):
+        raise ValueError(f"{name} must be a JSON object")
+    subnets = {}
+    for hca, subnet in value.items():
+        try:
+            if not isinstance(subnet, str):
+                raise TypeError(subnet)
+            subnets[hca] = ipaddress.IPv4Network(subnet)
+        except (TypeError, ValueError) as exc:
+            raise ValueError(f"{name}[{hca!r}] must be an IPv4 network such as 10.12.1.0/24, got {subnet!r}") from exc
+    return subnets
+
+
+def _gid_networks(
+    hca_names: Sequence[str], subnets: Optional[Mapping[str, ipaddress.IPv4Network]]
+) -> tuple[ipaddress.IPv4Network, ...]:
+    """The network each opened HCA's source GID must lie in, in ``hca_names`` order.
+
+    With ``SPARKNET_ROCE_SUBNETS`` every opened HCA needs an entry; without it
+    any IPv4 address qualifies, as for NCCL without ``NCCL_IB_ADDR_RANGE``.
+    Either way the proxy takes the single IPv4 RoCE v2 GID that qualifies and
+    fails naming the device when there is none or more than one.
+    """
+
+    if subnets is None:
+        return tuple(ipaddress.IPv4Network(ANY_IPV4) for _ in hca_names)
+    missing = [name for name in hca_names if name not in subnets]
+    if missing:
+        raise ValueError(f"{ENV_SUBNETS[0]} names no subnet for {', '.join(missing)}")
+    return tuple(subnets[name] for name in hca_names)
+
+
+def _peer_hca_names_from_env() -> Optional[dict[int, tuple[str, ...]]]:
+    """Parse the optional rank-to-local-HCA map used by non-clique fabrics.
+
+    ``SPARKNET_ROCE_PEER_HCAS`` is a JSON object whose keys are peer ranks and
+    whose values are the local HCAs that reach that peer, in stripe-lane order.
+    The local rank is omitted. JSON keeps interface names unambiguous and lets
+    launchers pass the value through without inventing a delimiter syntax.
+    """
+
+    name = next((n for n in ENV_PEER_HCAS if os.getenv(n)), None)
+    if name is None:
+        return None
+    raw = os.environ[name]
+    try:
+        value = json.loads(raw)
+    except json.JSONDecodeError as exc:
+        raise ValueError(f"{name} must be a JSON object") from exc
+    if not isinstance(value, dict):
+        raise ValueError(f"{name} must be a JSON object")
+    routes: dict[int, tuple[str, ...]] = {}
+    for peer, names in value.items():
+        try:
+            peer_rank = int(peer)
+        except (TypeError, ValueError) as exc:
+            raise ValueError(
+                f"{name} rank {peer!r} is not an integer"
+            ) from exc
+        if not isinstance(names, list) or not all(
+            isinstance(name, str) and name for name in names
+        ):
+            raise ValueError(
+                f"{name}[{peer!r}] must be a non-empty string list"
+            )
+        routes[peer_rank] = tuple(names)
+    return routes
+
+
+def _resolve_hca_topology(
+    *,
+    world_size: int,
+    rank: int,
+    hca_names: Optional[Sequence[str]],
+    peer_hca_names: Optional[Mapping[int, Sequence[str]]],
+    topology: str = "direct",
+) -> tuple[tuple[str, ...], tuple[tuple[str, ...], ...], int]:
+    """Return opened HCAs, per-peer local routes, and the stripe count.
+
+    Without a peer map this preserves the clique behavior: the same one or two
+    HCAs reach every peer. A peer map may use up to four local HCA functions,
+    while every edge still carries one or two stripes. Direct mode names all
+    non-self peers (including mesh4 NIC-forwarded peers); ring4 names only the two neighbours in physical rank order.
+    All edges use the same stripe count so GPU launch geometry remains fixed.
+    """
+
+    if topology not in ("direct", "ring4", "mesh4") or (topology != "direct" and world_size != 4):
+        raise ValueError("RoCE topology must be direct, or ring4/mesh4 with four ranks")
+    explicit_routes = peer_hca_names
+    if explicit_routes is None:
+        explicit_routes = _peer_hca_names_from_env()
+    if explicit_routes is None:
+        if topology != "direct":
+            raise ValueError("ring4/mesh4 requires explicit HCA routes in cable order")
+        names = tuple(hca_names) if hca_names else discover_hcas()
+        names = names[:MAX_STRIPES]
+        if not names:
+            raise RuntimeError("no active RDMA device found for the RoCE all-reduce")
+        routes = tuple(() if peer == rank else names for peer in range(world_size))
+        return names, routes, len(names)
+
+    normalized: dict[int, tuple[str, ...]] = {
+        int(peer): tuple(names) for peer, names in explicit_routes.items()
+    }
+    expected_peers = ({(rank - 1) % world_size, (rank + 1) % world_size}
+                      if topology == "ring4" else set(range(world_size)) - {rank})
+    if set(normalized) != expected_peers:
+        missing = sorted(expected_peers - set(normalized))
+        extra = sorted(set(normalized) - expected_peers)
+        raise ValueError(
+            "peer_hca_names must name every non-self rank (direct) or both neighbours (ring4); "
+            f"missing={missing}, extra={extra}"
+        )
+    widths = {len(route) for route in normalized.values()}
+    four_path = (topology == "mesh4" and len(normalized.get((rank + 2) % 4, ())) == 4)
+    if four_path:
+        if any(len(route) != (4 if peer == (rank + 2) % 4 else 2)
+               for peer, route in normalized.items()):
+            raise ValueError("four-path mesh requires two neighbor and four opposite paths")
+    elif len(widths) != 1 or not widths or not 1 <= next(iter(widths)) <= MAX_STRIPES:
+        raise ValueError(
+            f"every peer HCA route must use the same 1..{MAX_STRIPES} stripe count"
+        )
+    for peer, route in normalized.items():
+        if len(set(route)) != len(route) or any(not name for name in route):
+            raise ValueError(
+                f"peer {peer} HCA route contains an empty or duplicate name"
+            )
+
+    routed_names = tuple(
+        dict.fromkeys(name for peer in sorted(normalized) for name in normalized[peer])
+    )
+    names = tuple(hca_names) if hca_names else routed_names
+    if len(set(names)) != len(names) or not 1 <= len(names) <= MAX_LOCAL_HCAS:
+        raise ValueError(
+            f"the one-shot runtime requires 1..{MAX_LOCAL_HCAS} unique local HCA names"
+        )
+    unknown = sorted(set(routed_names) - set(names))
+    if unknown:
+        raise ValueError(f"peer HCA routes use unopened devices: {unknown}")
+    routes = tuple(
+        normalized.get(peer, ()) for peer in range(world_size)
+    )
+    return names, routes, 4 if four_path else next(iter(widths))
+
+
+def is_supported(device: torch.device | int | str | None = None) -> bool:
+    """True on an integrated GPU with at least one active RDMA device.
+
+    The kernel reads pinned host memory in place, which needs an integrated
+    (unified-memory) GPU such as the DGX Spark GB10.
+    """
+
+    if not torch.cuda.is_available():
+        return False
+    index = (
+        torch.cuda.current_device() if device is None else torch.device(device).index
+    )
+    props = torch.cuda.get_device_properties(index if index is not None else 0)
+    if not getattr(props, "is_integrated", False):
+        return False
+    return len(discover_hcas()) > 0
+
+
+def _normalize_device(device: torch.device | int | str) -> torch.device:
+    """Coerce an int, string, or device into a CUDA ``torch.device`` with an index."""
+    if isinstance(device, int):
+        device = torch.device("cuda", device)
+    elif not isinstance(device, torch.device):
+        device = torch.device(device)
+    if device.type != "cuda":
+        raise ValueError("RoCE all-reduce requires a CUDA device")
+    if device.index is None:
+        device = torch.device("cuda", torch.cuda.current_device())
+    return device
+
+
+def _capture_id(stream: torch.cuda.Stream) -> int:
+    """CUDA's id of the capture ``stream`` is in, 0 when it is not capturing.
+
+    Two captures are distinct even on the same stream, and one capture can be
+    joined by several streams; the id identifies the capture itself.
+    """
+
+    from cuda.bindings import runtime as cudart
+
+    info = cudart.cudaStreamGetCaptureInfo(stream.cuda_stream)
+    if info[0] != cudart.cudaError_t.cudaSuccess:
+        return 0
+    if info[1] != cudart.cudaStreamCaptureStatus.cudaStreamCaptureStatusActive:
+        return 0
+    return int(info[2])
+
+
+def _align_up(value: int, alignment: int) -> int:
+    """Round ``value`` up to a multiple of ``alignment``."""
+    return (int(value) + alignment - 1) // alignment * alignment
+
+
+def _grid_blocks(size_packs: int, threads: int, max_blocks: int) -> int:
+    """Choose a power-of-two grid with one 16-byte pack per thread, up to ``max_blocks``.
+
+    The data phase reads the peers' slots from pinned host memory, and beside
+    the model's L2 prefetch every round trip there waits out the DRAM queue
+    (about 6 us on the GB10, 2026-10-20). A thread's packs are serial round
+    trips, so the grid spreads the message one pack to a thread (64 blocks of
+    512 threads hold 512 KiB); two packs a thread on at most 8 blocks cost
+    10 us instead of 6.5 at 60 KiB and 35 instead of 10 at 480 KiB.
+    """
+    packs_per_block = int(threads)
+    required = max(1, (int(size_packs) + packs_per_block - 1) // packs_per_block)
+    return min(1 << (required - 1).bit_length(), int(max_blocks))
+
+
+def _exchange(local: object, group: ProcessGroup) -> list[object]:
+    """All-gather one picklable object from every rank of ``group``."""
+    gathered: list[object] = [None] * dist.get_world_size(group=group)
+    dist.all_gather_object(gathered, local, group=group)
+    return gathered
+
+
+class RoceOneshotAllReduce:
+    """One-shot RDMA all-reduce over the DGX Spark 200 GbE fabric."""
+
+    algorithm = "oneshot"
+
+    def __init__(
+        self,
+        *,
+        exchange_group: ProcessGroup,
+        device: torch.device | int | str,
+        max_size: int = DEFAULT_MAX_SIZE,
+        max_gather_bytes: int = DEFAULT_MAX_GATHER_BYTES,
+        hca_names: Optional[Sequence[str]] = None,
+        peer_hca_names: Optional[Mapping[int, Sequence[str]]] = None,
+        threads: int = DEFAULT_THREADS,
+        blocks: int = DEFAULT_BLOCKS,
+        topology: Optional[str] = None,
+        transport: Optional[Callable[..., Any]] = None,
+    ) -> None:
+        """Allocate the pinned region, build and connect the transport, and start it.
+
+        ``topology`` selects ``direct`` (every peer cabled), ``ring4`` (four
+        nodes in a cable loop, opposite ranks relayed by the neighbours' hosts)
+        or ``mesh4`` (opposite ranks reached through NIC forwarding set up
+        outside this library); it defaults to ``SPARKNET_ROCE_TOPOLOGY``.
+        ``transport`` is the factory that owns the RDMA side of the protocol
+        and defaults to the host proxy (``sparknet.transport.HostProxyTransport``).
+        """
+        self.device = _normalize_device(device)
+        self.rank = dist.get_rank(group=exchange_group)
+        self.world_size = dist.get_world_size(group=exchange_group)
+        self._group = exchange_group
+        self._closed = False
+        self._lock = threading.Lock()
+        self._proxy: Optional[Any] = None
+        self._launchers: dict[torch.dtype, Callable[..., None]] = {}
+        self._reducescatter_launchers: dict[torch.dtype, Callable[..., None]] = {}
+        self._gather_launcher: Optional[Callable[..., None]] = None
+        self._exchange_launcher: Optional[Callable[..., None]] = None
+        self._gather_buffers: Optional[tuple[torch.Tensor, torch.Tensor]] = None
+        self._align_buffers: Optional[tuple[torch.Tensor, torch.Tensor]] = None
+        self._stream_event = torch.cuda.Event()
+        self._last_stream: Optional[torch.cuda.Stream] = None
+        self._capture_stream: Optional[torch.cuda.Stream] = None
+        self._capture_id = 0
+        if self.world_size not in SUPPORTED_WORLD_SIZES:
+            raise ValueError(
+                f"unsupported RoCE all-reduce world size {self.world_size}; "
+                f"supported sizes are {SUPPORTED_WORLD_SIZES}"
+            )
+        if int(max_size) < PACK_BYTES:
+            raise ValueError("max_size must hold at least one 16-byte pack")
+        if int(threads) % 32 != 0 or int(threads) < 32 or int(threads) > 1024:
+            raise ValueError("threads must be a multiple of 32 between 32 and 1024")
+        if int(blocks) < 1 or int(blocks) & (int(blocks) - 1) != 0:
+            # The kernels find the last arriving block with a modulo of a
+            # free-running 32-bit counter, which survives the counter wrap only
+            # for a power-of-two block count.
+            raise ValueError("blocks must be a positive power of two")
+        properties = torch.cuda.get_device_properties(self.device)
+        resident = properties.multi_processor_count * (properties.max_threads_per_multi_processor // int(threads))
+        if int(blocks) > resident:
+            # Blocks that wait for the peers keep their SMs while the doorbell
+            # waits for every block to stage, so the whole grid must fit at once.
+            raise ValueError(f"blocks must fit on the device at once: {int(blocks)} blocks of {int(threads)} "
+                             f"threads, room for {resident}")
+        self.max_size = int(max_size)
+        self.dispatch_max_bytes = self.max_size
+        self.max_gather_bytes = int(max_gather_bytes)
+        self._threads = int(threads)
+        self._blocks = int(blocks)
+        self._counter_classes = self._blocks.bit_length()
+        env_check = (
+            {k: v for k, v in os.environ.items() if k != "SPARKNET_ROCE_GID_INDEX"}
+            if "SPARKNET_ROCE_GID_INDEX" in os.environ and "SPARKNET_ROCE_SUBNETS" not in os.environ
+            else os.environ
+        )
+        removed = _removed_setting_problems(env_check) + kernel_setting_problems(os.environ)
+        if removed:
+            raise ValueError("; ".join(removed))
+        self.timeout_ms = _checked_timeout_ms(_env_int(*ENV_TIMEOUT_MS, default=DEFAULT_TIMEOUT_MS))
+        self.topology = topology or _env_str(*ENV_TOPOLOGY, default="direct")
+        if self.topology not in TOPOLOGIES:
+            raise ValueError(f"unknown RoCE topology {self.topology!r}; choose one of {TOPOLOGIES}")
+        self._transport_factory = transport if transport is not None else Proxy
+        # Optional per-op timing trace (sparknet.oneshot.trace): a separately compiled
+        # kernel and a shared file the proxy thread also writes. Off unless asked for.
+        self._trace_path: Optional[str] = None
+        self._trace_map: Any = None
+        self._trace_anchor: Any = None
+        self._trace_base = 0
+        self.hca_names, self.peer_hca_names, self.stripe_count = _resolve_hca_topology(
+            world_size=self.world_size,
+            rank=self.rank,
+            hca_names=hca_names,
+            peer_hca_names=peer_hca_names,
+            topology=self.topology,
+        )
+        hca_indices = {name: index for index, name in enumerate(self.hca_names)}
+        self._peer_hca_indices = tuple(
+            tuple(hca_indices[name] for name in route) for route in self.peer_hca_names
+        )
+
+        slot_bytes = _align_up(
+            max(self.max_size, self.max_gather_bytes), _SLOT_ALIGNMENT
+        )
+        self._layout = Layout(self.world_size, slot_bytes)
+        self._slot_bytes = slot_bytes
+
+        with torch.cuda.device(self.device):
+            # Pinned, zero-initialised: flags and the control record start at 0
+            # and the first sequence number is 1.
+            self._region = torch.zeros(
+                self._layout.total_bytes, dtype=torch.uint8, pin_memory=True
+            )
+            # The epoch is global. Stage and tail arrivals are separate
+            # for every power-of-two grid size because their free-running
+            # counters use the launch grid as their modulus. The last two
+            # words hand the sequence from one block to the others: the
+            # doorbell has rung, and block 0 has seen every peer's flags.
+            self._counters = torch.zeros(
+                3 + 2 * self._counter_classes,
+                dtype=torch.int32,
+                device=self.device,
+            )
+        host_ptr = self._region.data_ptr()
+        device_ptr = self._device_pointer(host_ptr)
+        if device_ptr != host_ptr:
+            raise RuntimeError(
+                "RoCE all-reduce needs host pointers that are directly device "
+                "accessible (integrated GPU with unified addressing)"
+            )
+        if _trace.enabled():
+            self._open_trace()
+        self._recv_base = host_ptr + self._layout.recv_off
+        self._flag_base = host_ptr + self._layout.flag_off
+        self._send_base = host_ptr + self._layout.send_off
+        self._ctrl_base = host_ptr + self._layout.ctrl_off
+        # ctrl record: seq, nbytes, error seq, missing peer, nbytes per slot
+        # (the proxy uses these when it has to catch up), the missing HCA,
+        # the wait timeout (host-written) and the time a timed-out wait waited.
+        self._ctrl_words = self._region[
+            self._layout.ctrl_off : self._layout.ctrl_off + 4 * (CTRL_WAITED_WORD + 1)
+        ].view(torch.int32)
+        self._error_word = self._ctrl_words[2:3]
+        # numpy view of the control words: reading it costs nanoseconds, so the
+        # health check before and after every launch stays off the profile.
+        self._ctrl_np = self._ctrl_words.numpy()
+        self._ctrl_np[CTRL_TIMEOUT_WORD] = 1000 * self.timeout_ms
+        self._epoch_address = self._counters.data_ptr()
+
+        error: Optional[str] = None
+        # Each HCA's GID subnet, and the GID-table slot the proxy's scan found its source GID in.
+        self.gid_networks: tuple[ipaddress.IPv4Network, ...] = ()
+        self.gid_indices: tuple[int, ...] = ()
+        try:
+            # Inside the collective report: a node's own subnet map can be wrong.
+            self.gid_networks = _gid_networks(self.hca_names, _subnets_from_env())
+            # Dispatch is independent of registered capacity. vLLM also uses
+            # max_size for its sequence-parallel execution threshold.
+            self.dispatch_max_bytes = _env_int(*ENV_DISPATCH, default=self.max_size)
+            if not (PACK_BYTES <= self.dispatch_max_bytes <= self.max_size) or self.dispatch_max_bytes % PACK_BYTES:
+                raise ValueError("RoCE dispatch limit must be 16-byte aligned and within registered capacity")
+            self._proxy = self._transport_factory(
+                world_size=self.world_size,
+                rank=self.rank,
+                hca_names=self.hca_names,
+                peer_hca_indices=self._peer_hca_indices,
+                stripe_count=self.stripe_count,
+                gid_networks=self.gid_networks,
+                region_ptr=host_ptr,
+                region_bytes=self._layout.total_bytes,
+                slot_bytes=slot_bytes,
+                topology=self.topology,
+            )
+            self.gid_indices = tuple(self._proxy.gid_indices)
+            if self._trace_path is not None and hasattr(self._proxy, "trace_open"):
+                self._proxy.trace_open(self._trace_path, _trace.HEADER_BYTES, _trace.RECORDS,
+                                       _trace.RECORD_BYTES, _trace.W_PROXY)
+            blob = self._proxy.local_blob()
+        except Exception as exc:  # noqa: BLE001 - reported collectively below
+            error = str(exc)
+            blob = b""
+        # Every rank publishes the configuration the protocol depends on; the
+        # ranks must agree exactly, and all of them see the same verdict.
+        config = {
+            "api_version": API_VERSION,
+            "topology": self.topology,
+            "proxy_abi": _load_proxy_library().roce_abi_version()
+            if error is None
+            else None,
+            "world_size": self.world_size,
+            "hca_count": self.stripe_count,
+            "open_hca_count": len(self.hca_names),
+            "peer_stripes": tuple(len(route) for route in self.peer_hca_names),
+            "traffic_class": self._proxy.traffic_class if error is None else None,
+            "slot_bytes": slot_bytes,
+            "slots": self._layout.slots,
+            "flag_stride": self._layout.flag_stride,
+            "max_size": self.max_size,
+            "dispatch_max_bytes": self.dispatch_max_bytes,
+            "max_gather_bytes": self.max_gather_bytes,
+            "timeout_ms": self.timeout_ms,
+            "threads": self._threads,
+            "blocks": self._blocks,
+        }
+        statuses = _exchange((error, blob, config), exchange_group)
+        failures = [
+            f"rank {i}: {s[0]}" for i, s in enumerate(statuses) if s[0] is not None
+        ]
+        if not failures:
+            reference = statuses[0][2]
+            rank_local_keys = {"open_hca_count", "peer_stripes"}
+            for i, s in enumerate(statuses):
+                differing = {
+                    k: (reference[k], s[2].get(k))
+                    for k in reference
+                    if k not in rank_local_keys and s[2].get(k) != reference[k]
+                }
+                if differing:
+                    failures.append(
+                        f"rank {i} configuration differs from rank 0: {differing}"
+                    )
+            for i, s in enumerate(statuses):
+                peer_stripes = tuple(s[2].get("peer_stripes", ()))
+                expected = tuple(
+                    0 if peer == i or (self.topology == "ring4" and peer == (i + 2) % 4)
+                    else 2 if reference["hca_count"] == 4 and peer != (i + 2) % 4
+                    else reference["hca_count"]
+                    for peer in range(self.world_size)
+                )
+                if peer_stripes != expected:
+                    failures.append(
+                        f"rank {i} peer stripe routes differ from the collective: "
+                        f"expected {expected}, got {peer_stripes}"
+                    )
+        if failures:
+            self.close()
+            raise RuntimeError("RoCE all-reduce setup failed: " + "; ".join(failures))
+        try:
+            self._proxy.connect([s[1] for s in statuses])
+            self._proxy.start()
+        except Exception as exc:  # noqa: BLE001
+            error = str(exc)
+        verdicts = _exchange(error, exchange_group)
+        failures = [f"rank {i}: {v}" for i, v in enumerate(verdicts) if v is not None]
+        if failures:
+            self.close()
+            raise RuntimeError("RoCE all-reduce connect failed: " + "; ".join(failures))
+        if self.rank == 0:
+            logger.info(
+                "one-shot collectives ready: world=%d hcas=%s stripes=%d gids=%s max_size=%d traffic_class=%d",
+                self.world_size,
+                ",".join(self.hca_names),
+                self.stripe_count,
+                ",".join(f"{name}:{index}" for name, index in zip(self.hca_names, self.gid_indices, strict=True)),
+                self.max_size,
+                self._proxy.traffic_class,
+            )
+
+    def _open_trace(self) -> None:
+        """Create, pin and head this runtime's trace file in /dev/shm (see ``sparknet.oneshot.trace``)."""
+        import ctypes
+        import mmap
+        import time as _time
+        import uuid
+
+        from cuda.bindings import runtime as cudart
+
+        from ._trace_clock import calibrate
+
+        path = f"/dev/shm/sparknet-trace-r{self.rank}-p{os.getpid()}-{uuid.uuid4().hex[:8]}.bin"
+        size = _trace.file_bytes()
+        fd = os.open(path, os.O_RDWR | os.O_CREAT | os.O_EXCL, 0o644)
+        try:
+            os.ftruncate(fd, size)
+            mapping = mmap.mmap(fd, size)
+        finally:
+            os.close(fd)
+        anchor = ctypes.c_char.from_buffer(mapping)
+        address = ctypes.addressof(anchor)
+        (err,) = cudart.cudaHostRegister(address, size, cudart.cudaHostRegisterPortable)
+        if err != cudart.cudaError_t.cudaSuccess:
+            raise RuntimeError(f"cudaHostRegister of the trace file failed: {err}")
+        if self._device_pointer(address) != address:
+            raise RuntimeError("the trace file is not directly device accessible")
+        offset, halfwidth = calibrate(self.device)
+        lanes = self.stripe_count * (2 if self.topology == "ring4" else 1)
+        mapping[: _trace.HEADER_BYTES] = _trace.pack_header(
+            world=self.world_size, rank=self.rank, lanes=lanes, topology=self.topology,
+            clock_offset_ns=offset, clock_halfwidth_ns=halfwidth, created_ns=_time.time_ns())
+        self._trace_path, self._trace_map, self._trace_anchor, self._trace_base = path, mapping, anchor, address
+        logger.info("one-shot trace %s (clock offset %d ns +- %d ns)", path, offset, halfwidth)
+
+    @staticmethod
+    def _device_pointer(host_ptr: int) -> int:
+        """Device address of pinned host memory (``cudaHostGetDevicePointer``)."""
+        from cuda.bindings import runtime as cudart
+
+        err, ptr = cudart.cudaHostGetDevicePointer(host_ptr, 0)
+        if err != cudart.cudaError_t.cudaSuccess:
+            raise RuntimeError(f"cudaHostGetDevicePointer failed: {err}")
+        return int(ptr)
+
+    @classmethod
+    def from_exchange_group(
+        cls,
+        *,
+        exchange_group: ProcessGroup,
+        device: torch.device | int | str,
+        max_size: int = DEFAULT_MAX_SIZE,
+        eager_buffer_bytes: Optional[int] = None,
+        max_gather_bytes: int = DEFAULT_MAX_GATHER_BYTES,
+        threads: int = DEFAULT_THREADS,
+        blocks: int = DEFAULT_BLOCKS,
+        **_ignored: Any,
+    ) -> "RoceOneshotAllReduce":
+        """Mirror ``comm.pcie.AllReduce.from_exchange_group``; PCIe-only knobs are ignored.
+
+        ``threads`` and ``blocks`` are the launch geometry (part of the
+        configuration every rank must agree on); the probe exposes them for
+        sweeps. ``kernels`` chose a kernel family before 0.4.0 and is refused.
+        """
+        if "kernels" in _ignored:
+            raise TypeError("the kernels keyword was removed in sparknet 0.4.0: one kernel family (TileLang) remains")
+
+        capacity = max(int(max_size), int(eager_buffer_bytes or 0))
+        return cls(
+            exchange_group=exchange_group,
+            device=device,
+            max_size=capacity,
+            max_gather_bytes=max_gather_bytes,
+            threads=threads,
+            blocks=blocks,
+        )
+
+    @classmethod
+    def from_process_group(
+        cls,
+        *,
+        process_group: ProcessGroup,
+        device: torch.device | int | str,
+        max_size: int = DEFAULT_MAX_SIZE,
+        max_input_bytes: Optional[int] = None,
+        **_ignored: Any,
+    ) -> "RoceOneshotAllReduce":
+        """Build a runtime from a process group used for both rank identity and the setup exchange."""
+        capacity = max(int(max_size), int(max_input_bytes or 0))
+        return cls(exchange_group=process_group, device=device, max_size=capacity)
+
+    # -- policy -----------------------------------------------------------------
+
+    @property
+    def supports_all_peer_auxiliary(self) -> bool:
+        """False: peer auxiliary inputs (fused residual paths) are not implemented."""
+        return False
+
+    def should_allreduce(self, inp: torch.Tensor) -> bool:
+        """Select this backend below the jointly validated dispatch ceiling."""
+        return self._accepts_allreduce(inp, self.dispatch_max_bytes)
+
+    def _accepts_allreduce(self, inp: torch.Tensor, limit: int) -> bool:
+        """Eligible: contiguous CUDA tensor of a supported dtype, 16-byte total size within ``limit``.
+
+        The decision depends only on dtype, shape, contiguity and size, which
+        tensor-parallel ranks share, never on the pointer value; a closed runtime
+        raises rather than declining, so no rank can silently fall back alone.
+        """
+
+        if self._closed or self._proxy is None:
+            raise RuntimeError("RoCE runtime is closed")
+        if inp.dtype not in SUPPORTED_DTYPES or not inp.is_cuda:
+            return False
+        if inp.device != self.device or not inp.is_contiguous():
+            return False
+        nbytes = inp.numel() * inp.element_size()
+        return 0 < nbytes <= limit and nbytes % PACK_BYTES == 0
+
+    # -- channels / streams (single channel runtime) ---------------------------
+
+    def prepare_channels(self, channel_ids: Sequence[str]) -> None:
+        """No-op: the runtime has a single channel."""
+        return None
+
+    def for_stream(self, stream: object = None, *, channel_id: Optional[str] = None):
+        """Return this runtime; the collectives take ``stream`` per call."""
+        return self
+
+    # -- compilation ------------------------------------------------------------
+
+    def _launcher_key(self, dtype: torch.dtype) -> tuple[object, ...]:
+        """Cache key of the all-reduce launcher for ``dtype``."""
+        return (
+            _DTYPE_NAMES[dtype],
+            self.world_size,
+            self.rank,
+            self._threads,
+            self._layout.slots,
+            self._layout.flag_stride,
+            self.stripe_count,
+            self.device.index,
+            self.topology == "ring4",
+            bool(self._trace_base),
+        )
+
+    def _gather_launcher_key(self) -> tuple[object, ...]:
+        """Cache key of the all-gather and exchange launchers."""
+        return (
+            self.world_size,
+            self.rank,
+            self._threads,
+            self._layout.slots,
+            self._layout.flag_stride,
+            self.stripe_count,
+            self.device.index,
+            self.topology == "ring4",
+        )
+
+    def _reducescatter_launcher_key(self, dtype: torch.dtype) -> tuple[object, ...]:
+        """Cache key of the reduce-scatter launcher for ``dtype``."""
+        return (
+            _DTYPE_NAMES[dtype],
+            self.world_size,
+            self.rank,
+            self._threads,
+            self._layout.slots,
+            self._layout.flag_stride,
+            self.stripe_count,
+            self.device.index,
+            self.topology == "ring4",
+        )
+
+    def _counter_indices(self, blocks: int) -> tuple[int, int]:
+        """Stage and tail counter indices (words of ``_counters``) for one power-of-two grid size."""
+        counter_class = int(blocks).bit_length() - 1
+        return 1 + counter_class, 1 + self._counter_classes + counter_class
+
+    @staticmethod
+    def _words(tensor: torch.Tensor) -> torch.Tensor:
+        """A flat ``int32`` view of a contiguous, 16-byte-aligned tensor's bytes."""
+        return tensor.reshape(-1).view(torch.int32)
+
+    def _span_words(self, tensor: torch.Tensor, peer_stride_elems: int, chunk_elems: int) -> torch.Tensor:
+        """A flat ``int32`` view spanning ``world_size`` peer blocks separated by ``peer_stride_elems``."""
+        if tensor.is_contiguous() and int(peer_stride_elems) == int(chunk_elems):
+            return tensor.reshape(-1).view(torch.int32)
+        span_elems = (self.world_size - 1) * int(peer_stride_elems) + int(chunk_elems)
+        return torch.as_strided(tensor, (span_elems,), (1,)).view(torch.int32)
+
+    def _launch(
+        self,
+        src: torch.Tensor,
+        dst: torch.Tensor,
+        nbytes: int,
+        *,
+        row_packs: int = 0,
+        src_peer_packs: int = 0,
+        dst_peer_packs: int = 0,
+        total_src_packs: int = 0,
+        valid_out_packs: int = -1,
+        copy_self: int = 0,
+        raw_words: bool = False,
+    ) -> Launch:
+        """The family-neutral description of one collective launch."""
+        grid_blocks = _grid_blocks(nbytes // PACK_BYTES, self._threads, self._blocks)
+        stage_index, tail_index = self._counter_indices(grid_blocks)
+        inp_words = src if raw_words else self._words(src)
+        out_words = dst if raw_words else self._words(dst)
+        return Launch(
+            input=inp_words, output=out_words, size_packs=nbytes // PACK_BYTES, nbytes=nbytes,
+            region=self._region, recv_off=self._layout.recv_off, flag_off=self._layout.flag_off,
+            send_off=self._layout.send_off, ctrl_off=self._layout.ctrl_off, slot_bytes=self._slot_bytes,
+            counters=self._counters, stage_index=stage_index, tail_index=tail_index,
+            rung_index=1 + 2 * self._counter_classes, arrival_index=2 + 2 * self._counter_classes,
+            grid_x=grid_blocks, row_packs=row_packs, trace_base=self._trace_base,
+            src_peer_packs=src_peer_packs, dst_peer_packs=dst_peer_packs,
+            total_src_packs=total_src_packs, valid_out_packs=valid_out_packs, copy_self=copy_self,
+        )
+
+    def prepare(
+        self,
+        dtypes: Sequence[torch.dtype] = (torch.bfloat16,),
+        *,
+        padded_gather: bool = False,
+    ) -> None:
+        """Compile the launchers for ``dtypes`` and allocate scratch ahead of capture.
+
+        Always allocates the two ``max_size`` alignment buffers.  The padded
+        all-gather scratch (``max_gather_bytes`` plus ``world_size`` times that)
+        is allocated only with ``padded_gather=True`` or on first eager use, so
+        a workload whose shards have 16-byte rows never pays for it.
+        Compilation and allocation are refused inside a capture.
+        """
+
+        if torch.cuda.is_current_stream_capturing():
+            raise RuntimeError("RoCE runtime preparation is refused inside a CUDA graph capture")
+        with torch.cuda.device(self.device):
+            for dtype in dtypes:
+                self._reduce_launcher(dtype, capturing=False)
+                self._reducescatter_launcher(dtype, capturing=False)
+            self._resolve_gather_launcher(capturing=False)
+            self._resolve_exchange_launcher(capturing=False)
+            self._aligned_scratch(0, self._region[:PACK_BYTES])
+            if padded_gather:
+                self._gather_scratch(PACK_BYTES)
+
+    def _reduce_launcher(self, dtype: torch.dtype, capturing: bool) -> Callable[..., None]:
+        """The compiled all-reduce launcher for ``dtype``; compiled on first eager use only."""
+        launcher = self._launchers.get(dtype)
+        if launcher is None:
+            if capturing:
+                raise RuntimeError(
+                    "RoCE all-reduce dtype was not prepared before CUDA graph capture; call prepare()"
+                )
+            if dtype not in SUPPORTED_DTYPES:
+                raise ValueError(f"unsupported RoCE all-reduce dtype {dtype}")
+            launcher = reduce_launcher(*self._launcher_key(dtype))
+            self._launchers[dtype] = launcher
+        return launcher
+
+    def _reducescatter_launcher(self, dtype: torch.dtype, capturing: bool) -> Callable[..., None]:
+        """The compiled reduce-scatter launcher for ``dtype``; compiled on first eager use only."""
+        launcher = self._reducescatter_launchers.get(dtype)
+        if launcher is None:
+            if capturing:
+                raise RuntimeError(
+                    "RoCE reduce-scatter dtype was not prepared before CUDA graph capture; call prepare()"
+                )
+            if dtype not in SUPPORTED_DTYPES:
+                raise ValueError(f"unsupported RoCE reduce-scatter dtype {dtype}")
+            launcher = reducescatter_launcher(*self._reducescatter_launcher_key(dtype))
+            self._reducescatter_launchers[dtype] = launcher
+        return launcher
+
+    def _resolve_gather_launcher(self, capturing: bool) -> Callable[..., None]:
+        """The compiled all-gather launcher; compiled on first eager use only."""
+        if self._gather_launcher is None:
+            if capturing:
+                raise RuntimeError(
+                    "RoCE all-gather launcher was not prepared before CUDA graph capture; call prepare()"
+                )
+            self._gather_launcher = gather_launcher(*self._gather_launcher_key())
+        return self._gather_launcher
+
+    def _resolve_exchange_launcher(self, capturing: bool) -> Callable[..., None]:
+        """The compiled all-to-all exchange launcher; compiled on first eager use only."""
+        if self._exchange_launcher is None:
+            if capturing:
+                raise RuntimeError(
+                    "RoCE exchange launcher was not prepared before CUDA graph capture; call prepare()"
+                )
+            self._exchange_launcher = exchange_launcher(*self._gather_launcher_key())
+        return self._exchange_launcher
+
+
+    # -- execution ----------------------------------------------------------------
+
+    def all_reduce(
+        self,
+        inp: torch.Tensor,
+        *,
+        out: Optional[torch.Tensor] = None,
+        stream: object = None,
+        channel_id: Optional[str] = None,
+        peer_input_ptrs: Optional[Sequence[int]] = None,
+    ) -> torch.Tensor:
+        """Sum ``inp`` across ranks into ``out`` (allocated like ``inp`` when omitted).
+
+        The runtime executes any input within its registered capacity; the
+        dispatch policy (``should_allreduce``) is the caller's decision and is
+        rank-invariant.  A pointer that is not 16-byte aligned is staged through
+        runtime scratch instead of being rejected.  A poisoned runtime raises
+        before anything is launched: a failed collective is fatal, never a
+        fallback.  Launches on different streams are ordered with an event;
+        under CUDA graph capture every collective must be captured on one stream
+        and its launcher must have been prepared.
+        """
+        del channel_id, peer_input_ptrs
+        with self._lock:
+            self.check_health()
+            if not self._accepts_allreduce(inp, self.max_size):
+                raise ValueError(
+                    "input is not eligible for the RoCE one-shot all-reduce"
+                )
+            if out is not None and (
+                out.shape != inp.shape
+                or out.dtype != inp.dtype
+                or out.device != inp.device
+                or not out.is_contiguous()
+            ):
+                raise ValueError(
+                    "out must be a contiguous tensor on the input's device matching the input"
+                )
+            nbytes = inp.numel() * inp.element_size()
+            context = (
+                torch.cuda.stream(stream) if stream is not None else _nullcontext()
+            )
+            with torch.cuda.device(self.device), context:
+                # Capture state belongs to the target stream, so query it here.
+                capturing = torch.cuda.is_current_stream_capturing()
+                launcher = self._reduce_launcher(inp.dtype, capturing)
+                if out is None:
+                    out = torch.empty_like(inp)
+                src = inp
+                if inp.data_ptr() % PACK_BYTES != 0:
+                    src = self._aligned_scratch(0, inp)
+                    src.copy_(inp)
+                dst = (
+                    out
+                    if out.data_ptr() % PACK_BYTES == 0
+                    else self._aligned_scratch(1, out)
+                )
+                self._order_stream(capturing)
+                launcher(self._launch(src, dst, nbytes))
+                if dst is not out:
+                    out.copy_(dst)
+                self._mark_stream(capturing)
+        if not capturing:
+            self.check_health()
+        return out
+
+    def _aligned_scratch(self, which: int, like: torch.Tensor) -> torch.Tensor:
+        """16-byte-aligned device scratch shaped like ``like`` (input 0, output 1).
+
+        Allocated by ``prepare`` (two ``max_size`` buffers); a first use under
+        CUDA graph capture is refused.
+        """
+
+        if self._align_buffers is None:
+            if torch.cuda.is_current_stream_capturing():
+                raise RuntimeError(
+                    "RoCE all-reduce alignment scratch must be allocated before CUDA graph "
+                    "capture; call prepare() first"
+                )
+            self._align_buffers = (
+                torch.empty(self.max_size, dtype=torch.uint8, device=self.device),
+                torch.empty(self.max_size, dtype=torch.uint8, device=self.device),
+            )
+        nbytes = like.numel() * like.element_size()
+        return self._align_buffers[which][:nbytes].view(like.dtype).view(like.shape)
+
+    def _order_stream(self, capturing: bool) -> None:
+        """Make the current stream wait for the previous collective's stream.
+
+        The runtime has one epoch, one doorbell and two transport slots, so
+        collectives must execute in launch order even across streams.  Under
+        capture no event is used: every collective must be on the capture
+        stream, which keeps the graph's own ordering; captures are told apart
+        by CUDA's capture id, so consecutive captures may use different streams.
+        """
+
+        current = torch.cuda.current_stream(self.device)
+        if capturing:
+            capture_id = _capture_id(current)
+            if capture_id != self._capture_id:
+                self._capture_id = capture_id
+                self._capture_stream = current
+            elif current != self._capture_stream:
+                raise RuntimeError(
+                    "RoCE collectives must all be captured on one stream"
+                )
+            return
+        if self._last_stream is not None and current != self._last_stream:
+            current.wait_event(self._stream_event)
+
+    def _mark_stream(self, capturing: bool) -> None:
+        """Record the ordering event on the current stream after a launch."""
+
+        if capturing:
+            return
+        current = torch.cuda.current_stream(self.device)
+        self._stream_event.record(current)
+        self._last_stream = current
+
+    def set_timeout_ms(self, timeout_ms: int) -> None:
+        """Set how long a collective wait may see no peer before it stops the GPU.
+
+        Kernels read the value when a wait passes its first clock check, so it
+        applies to captured CUDA graphs too. Every rank should set the same
+        value at the same point.
+        """
+
+        self.timeout_ms = _checked_timeout_ms(timeout_ms)
+        self._ctrl_np[CTRL_TIMEOUT_WORD] = 1000 * self.timeout_ms
+
+    def failure(self) -> Optional[str]:
+        """The runtime's failure report, or None while it is healthy.
+
+        A collective wait that timed out wrote its record (the rank it waited
+        for, that rank's HCA lane, the sequence and the time waited) and stopped
+        the GPU; the record is in pinned host memory, so it can still be read
+        once CUDA reports the stopped kernel. It comes first: a relay proxy that
+        failed at the same time stopped because of it.
+        """
+
+        parts = []
+        failed_seq = int(self._ctrl_np[2])
+        if failed_seq != 0:
+            waited_s = int(self._ctrl_np[CTRL_WAITED_WORD]) / 1e6
+            parts.append(
+                f"RoCE collective on rank {self.rank} saw nothing from rank "
+                f"{int(self._ctrl_np[3])}, HCA {int(self._ctrl_np[6])}, for {waited_s:.3f} s "
+                f"(timeout {self.timeout_ms / 1000:g} s) at sequence {failed_seq}; "
+                "the GPU was stopped there"
+            )
+        if self._proxy is not None and self._proxy.failed():
+            parts.append(f"RoCE proxy failed: {self._proxy.error()}")
+        return "; ".join(parts) if parts else None
+
+    def check_health(self) -> None:
+        """Raise the failure report if a wait timed out or the proxy failed.
+
+        Cheap (host memory reads); call it after graph replays, which cannot
+        check inline, and after a CUDA error to learn whether a collective
+        stopped the GPU.
+        """
+
+        report = self.failure()
+        if report is not None:
+            raise RuntimeError(report)
+
+    @property
+    def poisoned(self) -> bool:
+        """True once a collective failed (a wait timed out or the proxy failed);
+        the runtime cannot be reused."""
+
+        return self.failure() is not None
+
+    # -- all-gather ---------------------------------------------------------------
+
+    @staticmethod
+    def _normalize_dim(inp: torch.Tensor, dim: int) -> int:
+        """Map a negative ``dim`` to its positive index."""
+        if dim < 0:
+            dim += inp.dim()
+        return dim
+
+    def should_all_gather(
+        self, inp: torch.Tensor, dim: int = -1, *, sliced: bool = False
+    ) -> bool:
+        """Eligible: contiguous CUDA tensor of any dtype, concat along dim 0 or the last dim.
+
+        16-byte-aligned rows take the direct-layout kernel; anything else goes
+        through a padded contiguous gather plus a torch reshape, so shape never
+        forces a fallback to another backend.  With ``sliced=True`` (eager
+        prefill only), 16-byte-aligned shards larger than ``max_gather_bytes``
+        are pipelined in row slices across the ping-pong slots.
+        """
+
+        if self._closed or self._proxy is None:
+            raise RuntimeError("RoCE runtime is closed")
+        if not inp.is_cuda or inp.dim() == 0:
+            return False
+        if inp.device != self.device or not inp.is_contiguous():
+            return False
+        if inp.is_complex() or inp.is_sparse or inp.dtype == torch.bool:
+            return False
+        dim = self._normalize_dim(inp, dim)
+        if dim not in (0, inp.dim() - 1):
+            return False
+        nbytes = inp.numel() * inp.element_size()
+        if nbytes <= 0:
+            return False
+        if nbytes <= self.max_gather_bytes:
+            return True
+        if not sliced or torch.cuda.is_current_stream_capturing():
+            return False
+        if nbytes % PACK_BYTES != 0:
+            return False
+        row_bytes = (
+            (inp.numel() // inp.shape[0]) * inp.element_size()
+            if dim == 0
+            else inp.shape[-1] * inp.element_size()
+        )
+        return (
+            0 < row_bytes <= self._slot_bytes
+            and row_bytes % PACK_BYTES == 0
+        )
+
+    def _direct_gather_layout(self, inp: torch.Tensor, dim: int) -> bool:
+        """True when ``inp`` can be gathered straight into the concatenated layout (16-byte rows and pointer)."""
+        nbytes = inp.numel() * inp.element_size()
+        if nbytes % PACK_BYTES != 0 or inp.data_ptr() % PACK_BYTES != 0:
+            return False
+        return dim == 0 or (inp.shape[-1] * inp.element_size()) % PACK_BYTES == 0
+
+    def all_gather(
+        self,
+        inp: torch.Tensor,
+        *,
+        dim: int = -1,
+        out: Optional[torch.Tensor] = None,
+        stream: object = None,
+        sliced: bool = False,
+    ) -> torch.Tensor:
+        """Concatenate every rank's ``inp`` along ``dim`` (0 or the last dim).
+
+        With 16-byte-aligned rows the kernel writes the concatenated layout
+        directly (no reshape or copy afterwards).  Otherwise the shards are
+        gathered contiguously with 16-byte padding and finished with a torch
+        reshape, which still keeps the collective on RDMA.
+        """
+        with self._lock:
+            self.check_health()
+            if not self.should_all_gather(inp, dim, sliced=sliced):
+                raise ValueError("input is not eligible for the RoCE all-gather")
+            dim = self._normalize_dim(inp, dim)
+            shape = list(inp.shape)
+            shape[dim] *= self.world_size
+            if out is not None and (
+                list(out.shape) != shape
+                or out.dtype != inp.dtype
+                or out.device != inp.device
+                or not out.is_contiguous()
+            ):
+                raise ValueError(
+                    "out must be a contiguous tensor on the input's device of the gathered shape"
+                )
+            context = (
+                torch.cuda.stream(stream) if stream is not None else _nullcontext()
+            )
+            with torch.cuda.device(self.device), context:
+                capturing = torch.cuda.is_current_stream_capturing()
+                nbytes = inp.numel() * inp.element_size()
+                if nbytes > self.max_gather_bytes:
+                    if out is None:
+                        out = torch.empty(shape, dtype=inp.dtype, device=inp.device)
+                    launcher = self._resolve_gather_launcher(capturing)
+                    self._order_stream(capturing)
+                    if dim == 0:
+                        local_rows = inp.shape[0]
+                        row_bytes = nbytes // local_rows
+                        max_rows = self._slot_bytes // row_bytes
+                        full_shard_packs = nbytes // PACK_BYTES
+                        for lo in range(0, local_rows, max_rows):
+                            hi = min(local_rows, lo + max_rows)
+                            slice_bytes = (hi - lo) * row_bytes
+                            slice_packs = slice_bytes // PACK_BYTES
+                            out_slice = out[
+                                lo : (self.world_size - 1) * local_rows + hi
+                            ]
+                            self._launch_gather(
+                                launcher,
+                                inp[lo:hi],
+                                out_slice,
+                                slice_bytes,
+                                slice_packs,
+                                dst_peer_packs=full_shard_packs,
+                            )
+                    else:
+                        width = inp.shape[-1]
+                        rows = inp.numel() // width
+                        row_bytes = width * inp.element_size()
+                        row_packs = row_bytes // PACK_BYTES
+                        max_rows = self._slot_bytes // row_bytes
+                        inp_2d = inp.view(rows, width)
+                        out_2d = out.view(rows, self.world_size * width)
+                        for lo in range(0, rows, max_rows):
+                            hi = min(rows, lo + max_rows)
+                            slice_bytes = (hi - lo) * row_bytes
+                            self._launch_gather(
+                                launcher,
+                                inp_2d[lo:hi],
+                                out_2d[lo:hi],
+                                slice_bytes,
+                                row_packs,
+                            )
+                    self._mark_stream(capturing)
+                    return out
+                # Both paths stage the shard contiguously and only the reader is
+                # strided, so ranks may take different paths for one collective.
+                direct = self._direct_gather_layout(inp, dim) and (
+                    out is None or out.data_ptr() % PACK_BYTES == 0
+                )
+                if direct:
+                    if out is None:
+                        out = torch.empty(shape, dtype=inp.dtype, device=inp.device)
+                    row_packs = (
+                        nbytes // PACK_BYTES
+                        if dim == 0
+                        else (inp.shape[-1] * inp.element_size()) // PACK_BYTES
+                    )
+                    self._order_stream(capturing)
+                    self._launch_gather(
+                        self._resolve_gather_launcher(capturing), inp, out, nbytes, row_packs,
+                    )
+                    self._mark_stream(capturing)
+                    return out
+                # Padded path: pad each shard to a whole number of packs, gather
+                # contiguously into fixed scratch, then let torch produce the
+                # requested layout.
+                padded = _align_up(nbytes, PACK_BYTES)
+                staged, gathered = self._gather_scratch(padded)
+                staged[:nbytes].copy_(inp.reshape(-1).view(torch.uint8))
+                self._order_stream(capturing)
+                self._launch_gather(
+                    self._resolve_gather_launcher(capturing), staged, gathered, padded, padded // PACK_BYTES,
+                )
+                self._mark_stream(capturing)
+                stacked = (
+                    gathered.view(self.world_size, padded)[:, :nbytes]
+                    .reshape(-1)
+                    .view(inp.dtype)
+                    .reshape(self.world_size, *inp.shape)
+                )
+                result = stacked.movedim(0, dim).reshape(shape)
+                if out is None:
+                    return result.contiguous()
+                out.copy_(result)
+                return out
+
+    def _gather_scratch(self, padded: int) -> tuple[torch.Tensor, torch.Tensor]:
+        """Fixed device scratch for the padded all-gather path, allocated once.
+
+        ``prepare(padded_gather=True)`` or the first eager padded gather
+        allocates it; a first use under CUDA graph capture is refused so a
+        captured graph never owns the scratch.
+        """
+
+        if self._gather_buffers is None:
+            if torch.cuda.is_current_stream_capturing():
+                raise RuntimeError(
+                    "RoCE all-gather scratch must be allocated before CUDA graph capture; "
+                    "call prepare(padded_gather=True) first"
+                )
+            capacity = _align_up(self.max_gather_bytes, PACK_BYTES)
+            self._gather_buffers = (
+                torch.empty(capacity, dtype=torch.uint8, device=self.device),
+                torch.empty(
+                    self.world_size * capacity, dtype=torch.uint8, device=self.device
+                ),
+            )
+        staged, gathered = self._gather_buffers
+        return staged[:padded], gathered[: self.world_size * padded]
+
+    def _launch_gather(
+        self,
+        launcher,
+        source: torch.Tensor,
+        destination: torch.Tensor,
+        nbytes: int,
+        row_packs: int,
+        *,
+        dst_peer_packs: int = 0,
+    ) -> None:
+        """Launch an already prepared all-gather kernel."""
+        # Same size-aware geometry as the all-reduce: a small shard (top-k
+        # values and ids, MTP logits) launches a few blocks instead of the
+        # full grid, and each power-of-two grid has its own arrival counters
+        # so gathers and reductions of any size may interleave in one graph.
+        launcher(
+            self._launch(
+                source,
+                destination,
+                nbytes,
+                row_packs=row_packs,
+                dst_peer_packs=dst_peer_packs,
+            )
+        )
+        if not torch.cuda.is_current_stream_capturing():
+            self.check_health()
+
+    # -- reduce-scatter & exchange ------------------------------------------------
+
+    def should_reduce_scatter(self, inp: torch.Tensor, dim: int = 0) -> bool:
+        """Eligible: contiguous CUDA tensor of a supported dtype divisible along ``dim`` by ``world_size``."""
+        if self._closed or self._proxy is None:
+            raise RuntimeError("RoCE runtime is closed")
+        if inp.dtype not in SUPPORTED_DTYPES or not inp.is_cuda or inp.dim() == 0:
+            return False
+        if inp.device != self.device or not inp.is_contiguous():
+            return False
+        dim = self._normalize_dim(inp, dim)
+        if dim != 0 or inp.shape[0] % self.world_size != 0:
+            return False
+        nbytes = inp.numel() * inp.element_size()
+        chunk_bytes = nbytes // self.world_size
+        if chunk_bytes <= 0 or chunk_bytes % PACK_BYTES != 0:
+            return False
+        if nbytes <= self._slot_bytes:
+            return True
+        if torch.cuda.is_current_stream_capturing():
+            return False
+        local_rows = inp.shape[0] // self.world_size
+        row_bytes = chunk_bytes // local_rows
+        return (
+            row_bytes % PACK_BYTES == 0
+            and 0 < self.world_size * row_bytes <= self._slot_bytes
+        )
+
+    def reduce_scatter(
+        self,
+        inp: torch.Tensor,
+        *,
+        dim: int = 0,
+        out: Optional[torch.Tensor] = None,
+        stream: object = None,
+    ) -> torch.Tensor:
+        """Reduce-scatter ``inp`` along ``dim`` (0) in fixed rank order with float32 accumulation."""
+        with self._lock:
+            self.check_health()
+            if not self.should_reduce_scatter(inp, dim):
+                raise ValueError("input is not eligible for the RoCE reduce-scatter")
+            dim = self._normalize_dim(inp, dim)
+            local_rows = inp.shape[0] // self.world_size
+            out_shape = (local_rows, *inp.shape[1:])
+            if out is not None and (
+                tuple(out.shape) != out_shape
+                or out.dtype != inp.dtype
+                or out.device != inp.device
+                or not out.is_contiguous()
+            ):
+                raise ValueError(
+                    "out must be a contiguous tensor on the input's device of the scattered shape"
+                )
+            nbytes = inp.numel() * inp.element_size()
+            chunk_bytes = nbytes // self.world_size
+            context = (
+                torch.cuda.stream(stream) if stream is not None else _nullcontext()
+            )
+            with torch.cuda.device(self.device), context:
+                capturing = torch.cuda.is_current_stream_capturing()
+                launcher = self._reducescatter_launcher(inp.dtype, capturing)
+                if out is None:
+                    out = torch.empty(out_shape, dtype=inp.dtype, device=inp.device)
+                if nbytes <= self._slot_bytes:
+                    src = inp
+                    if inp.data_ptr() % PACK_BYTES != 0:
+                        src = self._aligned_scratch(0, inp)
+                        src.copy_(inp)
+                    dst = (
+                        out
+                        if out.data_ptr() % PACK_BYTES == 0
+                        else self._aligned_scratch(1, out)
+                    )
+                    self._order_stream(capturing)
+                    launcher(self._launch(src, dst, chunk_bytes))
+                    if dst is not out:
+                        out.copy_(dst)
+                    self._mark_stream(capturing)
+                else:
+                    row_bytes = chunk_bytes // local_rows
+                    max_rows = self._slot_bytes // (self.world_size * row_bytes)
+                    full_chunk_packs = chunk_bytes // PACK_BYTES
+                    self._order_stream(capturing)
+                    for lo in range(0, local_rows, max_rows):
+                        hi = min(local_rows, lo + max_rows)
+                        slice_chunk_bytes = (hi - lo) * row_bytes
+                        inp_slice = inp[
+                            lo : (self.world_size - 1) * local_rows + hi
+                        ]
+                        launcher(
+                            self._launch(
+                                inp_slice,
+                                out[lo:hi],
+                                slice_chunk_bytes,
+                                src_peer_packs=full_chunk_packs,
+                            )
+                        )
+                        if not capturing:
+                            self.check_health()
+                    self._mark_stream(capturing)
+        if not capturing:
+            self.check_health()
+        return out
+
+    def should_exchange(
+        self, chunks: torch.Tensor, parts: Optional[torch.Tensor] = None
+    ) -> bool:
+        """Eligible: ``(world_size, local_rows, ...)`` CUDA tensors with 16-byte-aligned peer slices."""
+        if self._closed or self._proxy is None:
+            raise RuntimeError("RoCE runtime is closed")
+        if not chunks.is_cuda or chunks.device != self.device or chunks.dim() < 2:
+            return False
+        if chunks.is_complex() or chunks.is_sparse or chunks.dtype == torch.bool:
+            return False
+        if chunks.shape[0] != self.world_size or not chunks[0].is_contiguous():
+            return False
+        elem_size = chunks.element_size()
+        chunk_bytes = chunks[0].numel() * elem_size
+        if chunk_bytes == 0:
+            return True
+        src_stride_bytes = int(chunks.stride(0)) * elem_size
+        if (
+            chunk_bytes % PACK_BYTES != 0
+            or src_stride_bytes % PACK_BYTES != 0
+            or chunks.data_ptr() % PACK_BYTES != 0
+        ):
+            return False
+        if parts is not None:
+            if (
+                not parts.is_cuda
+                or parts.device != self.device
+                or parts.shape != chunks.shape
+                or parts.dtype != chunks.dtype
+                or not parts[0].is_contiguous()
+            ):
+                return False
+            dst_stride_bytes = int(parts.stride(0)) * elem_size
+            if dst_stride_bytes % PACK_BYTES != 0 or parts.data_ptr() % PACK_BYTES != 0:
+                return False
+        if self.world_size * chunk_bytes <= self._slot_bytes:
+            return True
+        if torch.cuda.is_current_stream_capturing():
+            return False
+        local_rows = chunks.shape[1]
+        row_bytes = chunk_bytes // local_rows
+        return (
+            row_bytes % PACK_BYTES == 0
+            and 0 < self.world_size * row_bytes <= self._slot_bytes
+        )
+
+    def exchange(
+        self,
+        chunks: torch.Tensor,
+        parts: Optional[torch.Tensor] = None,
+        *,
+        out: Optional[torch.Tensor] = None,
+        copy_self: bool = False,
+        stream: object = None,
+    ) -> torch.Tensor:
+        """Send ``chunks[p]`` to peer ``p`` and receive peer ``p``'s chunk into ``parts[p]``."""
+        if parts is None and out is not None:
+            parts = out
+        with self._lock:
+            self.check_health()
+            if not self.should_exchange(chunks, parts):
+                raise ValueError("input is not eligible for the RoCE exchange")
+            if parts is None:
+                parts = torch.empty(
+                    chunks.shape, dtype=chunks.dtype, device=chunks.device
+                )
+            elem_size = chunks.element_size()
+            chunk_bytes = chunks[0].numel() * elem_size
+            if chunk_bytes == 0:
+                return parts
+            src_peer_packs = (int(chunks.stride(0)) * elem_size) // PACK_BYTES
+            dst_peer_packs = (int(parts.stride(0)) * elem_size) // PACK_BYTES
+            context = (
+                torch.cuda.stream(stream) if stream is not None else _nullcontext()
+            )
+            with torch.cuda.device(self.device), context:
+                capturing = torch.cuda.is_current_stream_capturing()
+                launcher = self._resolve_exchange_launcher(capturing)
+                self._order_stream(capturing)
+                if self.world_size * chunk_bytes <= self._slot_bytes:
+                    src_words = self._span_words(
+                        chunks, int(chunks.stride(0)), chunks[0].numel()
+                    )
+                    dst_words = self._span_words(
+                        parts, int(parts.stride(0)), parts[0].numel()
+                    )
+                    launcher(
+                        self._launch(
+                            src_words,
+                            dst_words,
+                            chunk_bytes,
+                            src_peer_packs=src_peer_packs,
+                            dst_peer_packs=dst_peer_packs,
+                            copy_self=int(copy_self),
+                            raw_words=True,
+                        )
+                    )
+                else:
+                    local_rows = chunks.shape[1]
+                    row_bytes = chunk_bytes // local_rows
+                    max_rows = self._slot_bytes // (self.world_size * row_bytes)
+                    for lo in range(0, local_rows, max_rows):
+                        hi = min(local_rows, lo + max_rows)
+                        c_slice = chunks[:, lo:hi]
+                        p_slice = parts[:, lo:hi]
+                        slice_chunk_bytes = (hi - lo) * row_bytes
+                        src_words = self._span_words(
+                            c_slice, int(c_slice.stride(0)), c_slice[0].numel()
+                        )
+                        dst_words = self._span_words(
+                            p_slice, int(p_slice.stride(0)), p_slice[0].numel()
+                        )
+                        launcher(
+                            self._launch(
+                                src_words,
+                                dst_words,
+                                slice_chunk_bytes,
+                                src_peer_packs=src_peer_packs,
+                                dst_peer_packs=dst_peer_packs,
+                                copy_self=int(copy_self),
+                                raw_words=True,
+                            )
+                        )
+                        if not capturing:
+                            self.check_health()
+                self._mark_stream(capturing)
+        if not capturing:
+            self.check_health()
+        return parts
+
+    def should_all_to_all_rows(self, inp: torch.Tensor, rows: int) -> bool:
+        """Eligible: contiguous CUDA tensor with 16-byte rows and ``0 < inp.shape[0] <= world_size * rows``."""
+        if self._closed or self._proxy is None:
+            raise RuntimeError("RoCE runtime is closed")
+        if not inp.is_cuda or inp.device != self.device or inp.dim() < 1 or not inp.is_contiguous():
+            return False
+        if inp.is_complex() or inp.is_sparse or inp.dtype == torch.bool:
+            return False
+        total = int(inp.shape[0])
+        rows = int(rows)
+        if rows <= 0 or total <= 0 or total > self.world_size * rows:
+            return False
+        if inp.data_ptr() % PACK_BYTES != 0:
+            return False
+        row_bytes = (inp.numel() // total) * inp.element_size()
+        if row_bytes <= 0 or row_bytes % PACK_BYTES != 0:
+            return False
+        if self.world_size * rows * row_bytes <= self._slot_bytes:
+            return True
+        if torch.cuda.is_current_stream_capturing():
+            return False
+        return self.world_size * row_bytes <= self._slot_bytes
+
+    def all_to_all_rows(
+        self,
+        inp: torch.Tensor,
+        rows: int,
+        *,
+        out: Optional[torch.Tensor] = None,
+        stream: object = None,
+    ) -> torch.Tensor:
+        """Exchange ``rows``-row blocks of ``inp`` into ``(world_size, rows, *inp.shape[1:])``."""
+        with self._lock:
+            self.check_health()
+            if not self.should_all_to_all_rows(inp, rows):
+                raise ValueError("input is not eligible for the RoCE all_to_all_rows")
+            rows = int(rows)
+            total = int(inp.shape[0])
+            out_shape = (self.world_size, rows, *inp.shape[1:])
+            if out is not None and (
+                tuple(out.shape) != out_shape
+                or out.dtype != inp.dtype
+                or out.device != inp.device
+                or not out.is_contiguous()
+                or out.data_ptr() % PACK_BYTES != 0
+            ):
+                raise ValueError(
+                    "out must be a 16-byte-aligned contiguous tensor on the input's device of shape (world_size, rows, ...)"
+                )
+            row_bytes = (inp.numel() // total) * inp.element_size()
+            row_packs = row_bytes // PACK_BYTES
+            full_chunk_packs = rows * row_packs
+            chunk_bytes = rows * row_bytes
+            context = (
+                torch.cuda.stream(stream) if stream is not None else _nullcontext()
+            )
+            with torch.cuda.device(self.device), context:
+                capturing = torch.cuda.is_current_stream_capturing()
+                launcher = self._resolve_exchange_launcher(capturing)
+                if out is None:
+                    out = inp.new_empty(out_shape)
+                self._order_stream(capturing)
+                if self.world_size * chunk_bytes <= self._slot_bytes:
+                    own_rows = max(0, min(rows, total - self.rank * rows))
+                    launcher(
+                        self._launch(
+                            inp,
+                            out,
+                            chunk_bytes,
+                            src_peer_packs=full_chunk_packs,
+                            dst_peer_packs=full_chunk_packs,
+                            total_src_packs=total * row_packs,
+                            valid_out_packs=own_rows * row_packs,
+                            copy_self=1,
+                        )
+                    )
+                else:
+                    max_rows = self._slot_bytes // (self.world_size * row_bytes)
+                    for lo in range(0, rows, max_rows):
+                        hi = min(rows, lo + max_rows)
+                        slice_rows = hi - lo
+                        slice_chunk_bytes = slice_rows * row_bytes
+                        inp_slice = inp[lo:] if lo < total else inp[:1]
+                        total_src_packs = max(0, total - lo) * row_packs
+                        own_slice_rows = max(
+                            0, min(slice_rows, total - (self.rank * rows + lo))
+                        )
+                        out_slice = out[:, lo:hi]
+                        dst_words = self._span_words(
+                            out_slice, int(out_slice.stride(0)), out_slice[0].numel()
+                        )
+                        launcher(
+                            self._launch(
+                                self._words(inp_slice),
+                                dst_words,
+                                slice_chunk_bytes,
+                                src_peer_packs=full_chunk_packs,
+                                dst_peer_packs=full_chunk_packs,
+                                total_src_packs=total_src_packs,
+                                valid_out_packs=own_slice_rows * row_packs,
+                                copy_self=1,
+                                raw_words=True,
+                            )
+                        )
+                        if not capturing:
+                            self.check_health()
+                self._mark_stream(capturing)
+        if not capturing:
+            self.check_health()
+        return out
+
+    @contextmanager
+    def capture(self, stream: object = None, *, channel_id: Optional[str] = None):
+        """Context manager for CUDA graph capture; the launchers must already be prepared.
+
+        The cross-stream ordering event is dropped for the capture: an event
+        recorded outside a capture must not be waited on inside one, and
+        ``torch.cuda.graph`` has already synchronized the device before the
+        capture began.  Inside, every collective must use one stream.
+        """
+
+        self._last_stream = None
+        self._capture_stream = None
+        self._capture_id = 0
+        try:
+            yield self
+        finally:
+            self._capture_stream = None
+            self._capture_id = 0
+            self._last_stream = None
+
+    # -- diagnostics / lifecycle --------------------------------------------------
+
+    def stats(self) -> dict[str, Any]:
+        """Runtime, control-record, and proxy counters for diagnostics."""
+        info: dict[str, Any] = {
+            "world_size": self.world_size,
+            "rank": self.rank,
+            "topology": self.topology,
+            "hcas": list(self.hca_names),
+            # Where each HCA's source GID was found, and the subnet it was found in.
+            "gid_indices": dict(zip(self.hca_names, self.gid_indices, strict=True)),
+            "gid_subnets": {name: str(network) for name, network in zip(self.hca_names, self.gid_networks, strict=True)},
+            "peer_hca_routes": {
+                str(peer): list(route)
+                for peer, route in enumerate(self.peer_hca_names)
+                if peer != self.rank
+            },
+            "stripe_count": self.stripe_count,
+            "max_size": self.max_size,
+            "dispatch_max_bytes": self.dispatch_max_bytes,
+            "max_gather_bytes": self.max_gather_bytes,
+            "slot_bytes": self._slot_bytes,
+            "epoch": int(self._counters[0].item()),
+            "error_seq": int(self._error_word.item()),
+            "error_peer": int(self._ctrl_words[3].item()),
+            "error_hca": int(self._ctrl_words[6].item()),
+            "ctrl_seq": int(self._ctrl_words[0].item()),
+            "error_waited_us": int(self._ctrl_words[CTRL_WAITED_WORD].item()),
+            "timeout_ms": self.timeout_ms,
+            "stripe_hcas": list(range(self.stripe_count)),
+            "threads": self._threads,
+            "blocks": self._blocks,
+        }
+        if self._proxy is not None:
+            info.update(self._proxy.stats())
+        return info
+
+    def close(self) -> None:
+        """Stop the proxy and release the transport.
+
+        Waits for the device first so no in-flight kernel still reads the
+        pinned region or rings the doorbell after the proxy is gone.  Peers
+        that write to this rank afterwards see a remote-access completion
+        error and raise on their side, which is the intended shutdown signal.
+        """
+
+        with self._lock:
+            if self._closed:
+                return
+            self._closed = True
+            with contextlib.suppress(Exception):
+                torch.cuda.synchronize(self.device)
+            if self._proxy is not None:
+                self._proxy.close()
+                self._proxy = None
+            if self._trace_map is not None:
+                # The file stays in /dev/shm for collection; only the mapping goes.
+                from cuda.bindings import runtime as cudart
+
+                with contextlib.suppress(Exception):
+                    cudart.cudaHostUnregister(self._trace_base)
+                self._trace_anchor = None
+                with contextlib.suppress(Exception):
+                    self._trace_map.close()
+                self._trace_map = None
+
+    def __del__(self) -> None:  # pragma: no cover - defensive teardown
+        """Release the transport if ``close`` was never called."""
+        with contextlib.suppress(Exception):
+            self.close()
+
+
+class _nullcontext:
+    def __enter__(self):
+        """No-op context entry."""
+        return None
+
+    def __exit__(self, *exc):
+        """No-op context exit."""
+        return False
+
+
+__all__ = [
+    "API_VERSION",
+    "DEFAULT_MAX_GATHER_BYTES",
+    "DEFAULT_MAX_SIZE",
+    "SUPPORTED_DTYPES",
+    "SUPPORTED_WORLD_SIZES",
+    "TOPOLOGIES",
+    "RoceOneshotAllReduce",
+    "discover_hcas",
+    "_resolve_hca_topology",
+    "is_supported",
+]

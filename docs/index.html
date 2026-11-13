@@ -3,540 +3,793 @@
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
-  <title>spark-ds41f — spark-ds41f-1107 Manifest &amp; Benchmark Observatory</title>
+  <title>switchless* · DeepSeek V4.1 Flash on DGX Spark</title>
+  <meta name="description" content="DeepSeek V4.1 Flash on three to eight DGX Sparks: native weights, a million tokens of context, correctness first, then speed. No switch required.">
+  <meta property="og:title" content="switchless* · DeepSeek V4.1 Flash on DGX Spark">
+  <meta property="og:description" content="Native weights, a million tokens of context, correctness first, then speed. No switch required.*">
+  <meta property="og:type" content="website">
+  <meta property="og:url" content="https://switchle.ss/">
+  <meta property="og:site_name" content="switchless">
+  <meta property="og:image" content="https://switchle.ss/og.png?v=b1f72442c0">
+  <meta property="og:image:type" content="image/png">
+  <meta property="og:image:width" content="2400">
+  <meta property="og:image:height" content="1260">
+  <meta property="og:image:alt" content="DeepSeek V4.1 Flash on DGX Sparks. No switch required. Four Sparks cabled in a ring, with the current release's context, sessions and decode speed.">
+  <meta name="twitter:card" content="summary_large_image">
+  <meta name="twitter:title" content="switchless* · DeepSeek V4.1 Flash on DGX Spark">
+  <meta name="twitter:description" content="Native weights, a million tokens of context, correctness first, then speed. No switch required.*">
+  <meta name="twitter:image" content="https://switchle.ss/og.png?v=b1f72442c0">
+  <meta name="theme-color" content="#0f0d0b">
+  <link rel="icon" type="image/png" href="logo.png">
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link href="https://fonts.googleapis.com/css2?family=Fraunces:ital,opsz,wght@0,9..144,300..600;1,9..144,300..600&family=Geist:wght@400;500;600&family=Geist+Mono:wght@400;500&display=swap" rel="stylesheet">
+  <script>
+    (function () {
+      var t = null;
+      try { t = localStorage.getItem("switchless-theme"); } catch (e) {}
+      if (t !== "light" && t !== "dark") {
+        t = window.matchMedia && window.matchMedia("(prefers-color-scheme: light)").matches ? "light" : "dark";
+      }
+      // ?card shows only the 1200x630 link-preview card; scripts/render-og photographs it on each deploy.
+      if (/[?&]card\b/.test(location.search)) { t = "dark"; document.documentElement.className = "og-mode"; }
+      document.documentElement.setAttribute("data-theme", t);
+    })();
+  </script>
   <style>
     :root {
-      --bg: #0b0f17;
-      --bg-elev: #111827;
-      --bg-card: #161f30;
-      --bg-hover: #1e293b;
-      --text: #f1f5f9;
-      --text-muted: #94a3b8;
-      --border: #263248;
-      --accent: #10b981;
-      --accent-soft: rgba(16, 185, 129, 0.14);
-      --cyan: #06b6d4;
-      --cyan-soft: rgba(6, 182, 212, 0.14);
-      --amber: #f59e0b;
-      --amber-soft: rgba(245, 158, 11, 0.14);
-      --indigo: #818cf8;
-      --rose: #f43f5e;
-      --mono: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", monospace;
-      --sans: -apple-system, BlinkMacSystemFont, "Segoe UI", Inter, Roboto, Helvetica, Arial, sans-serif;
+      --bg: #0f0d0b;
+      --bg-2: #14110e;
+      --panel: #1a1612;
+      --panel-2: #211c17;
+      --line: rgba(236, 218, 184, 0.13);
+      --line-2: rgba(236, 218, 184, 0.24);
+      --ink: #f4ede1;
+      --ink-2: #bdb1a0;
+      --ink-3: #857b6c;
+      --accent: #e3c690;
+      --accent-ink: #1a1408;
+      --copper: #c98f58;
+      --glow: rgba(227, 198, 144, 0.16);
+      --good: #9bcf9c;
+      --bad: #e58f7c;
+      --s1: #b5852f;
+      --s2: #3f9fd0;
+      --s3: #d2668a;
+      --serif: "Fraunces", "Iowan Old Style", "Palatino Linotype", Georgia, serif;
+      --sans: "Geist", -apple-system, BlinkMacSystemFont, "Segoe UI", Helvetica, Arial, sans-serif;
+      --mono: "Geist Mono", ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+      --wrap: 1160px;
+      --gut: 28px;
     }
     html[data-theme="light"] {
-      --bg: #f8fafc;
-      --bg-elev: #ffffff;
-      --bg-card: #ffffff;
-      --bg-hover: #f1f5f9;
-      --text: #0f172a;
-      --text-muted: #475569;
-      --border: #e2e8f0;
-      --accent: #059669;
-      --accent-soft: rgba(5, 150, 105, 0.10);
-      --cyan: #0891b2;
-      --cyan-soft: rgba(8, 145, 178, 0.10);
-      --amber: #d97706;
-      --amber-soft: rgba(217, 119, 6, 0.10);
-      --indigo: #4f46e5;
-      --rose: #e11d48;
+      --bg: #f6f1e7;
+      --bg-2: #f0e9db;
+      --panel: #fdf9f0;
+      --panel-2: #f8f2e5;
+      --line: rgba(70, 50, 20, 0.15);
+      --line-2: rgba(70, 50, 20, 0.28);
+      --ink: #1d1813;
+      --ink-2: #594f43;
+      --ink-3: #8b8071;
+      --accent: #94631f;
+      --accent-ink: #fdf9f0;
+      --copper: #b06f33;
+      --glow: rgba(176, 111, 51, 0.13);
+      --good: #2f7d43;
+      --bad: #b5432c;
+      --s1: #a8701a;
+      --s2: #1f7fb0;
+      --s3: #b34a66;
     }
     * { box-sizing: border-box; }
+    [hidden] { display: none !important; }
+    html { scroll-behavior: smooth; scroll-padding-top: 84px; }
     body {
       margin: 0;
       background: var(--bg);
-      color: var(--text);
+      color: var(--ink);
       font-family: var(--sans);
-      line-height: 1.5;
-      font-variant-numeric: tabular-nums;
+      font-size: 16px;
+      line-height: 1.6;
+      -webkit-font-smoothing: antialiased;
+      text-rendering: optimizeLegibility;
+      overflow-x: hidden;
     }
-    a { color: var(--cyan); text-decoration: none; }
-    a:hover { text-decoration: underline; }
-    .container {
-      max-width: 1320px;
-      margin: 0 auto;
-      padding: 24px 20px 72px;
+    a { color: inherit; text-decoration-color: var(--line-2); text-underline-offset: 3px; }
+    a:hover { text-decoration-color: var(--accent); }
+    code, .mono { font-family: var(--mono); font-size: 0.86em; }
+    em { font-style: italic; }
+    .wrap { max-width: var(--wrap); margin: 0 auto; padding: 0 var(--gut); }
+    .ast { color: var(--accent); font-style: normal; }
+    :focus-visible { outline: 2px solid var(--accent); outline-offset: 3px; border-radius: 4px; }
+
+    /* ---------- nav ---------- */
+    .nav {
+      position: sticky; top: 0; z-index: 50;
+      background: color-mix(in srgb, var(--bg) 82%, transparent);
+      backdrop-filter: blur(14px); -webkit-backdrop-filter: blur(14px);
+      border-bottom: 1px solid var(--line);
     }
-    header.hero {
-      background: linear-gradient(135deg, var(--bg-elev) 0%, var(--bg-card) 100%);
-      border: 1px solid var(--border);
-      border-radius: 14px;
-      padding: 24px 28px;
-      margin-bottom: 24px;
-      position: relative;
+    .nav-in { display: flex; align-items: center; gap: 22px; height: 64px; }
+    .brand { display: flex; align-items: center; gap: 10px; text-decoration: none; margin-right: auto; }
+    .brand img { width: 30px; height: 30px; }
+    html[data-theme="dark"] .heart { filter: invert(1) sepia(0.35) saturate(1.6) hue-rotate(-12deg) brightness(0.96); }
+    .wordmark { font-family: var(--serif); font-size: 23px; font-weight: 400; letter-spacing: -0.01em; }
+    .wordmark .ast { font-size: 0.9em; margin-left: 1px; }
+    .nav-links { display: flex; align-items: center; gap: 22px; font-size: 14px; color: var(--ink-2); }
+    .nav-links a { text-decoration: none; }
+    .nav-links a:hover { color: var(--ink); }
+    .btn {
+      display: inline-flex; align-items: center; gap: 8px;
+      font: 500 14.5px/1 var(--sans); text-decoration: none;
+      padding: 12px 18px; border-radius: 999px;
+      border: 1px solid var(--line-2); color: var(--ink); background: transparent; cursor: pointer;
+      transition: background 0.2s, border-color 0.2s, transform 0.2s;
     }
-    .hero-top {
-      display: flex;
-      flex-wrap: wrap;
-      justify-content: space-between;
-      align-items: flex-start;
-      gap: 16px;
+    .btn:hover { border-color: var(--accent); transform: translateY(-1px); }
+    .btn.primary { background: var(--accent); color: var(--accent-ink); border-color: var(--accent); }
+    .btn.primary:hover { background: color-mix(in srgb, var(--accent) 88%, var(--ink)); }
+    .btn.small { padding: 8px 13px; font-size: 13px; }
+    .icon-btn {
+      width: 36px; height: 36px; border-radius: 999px; border: 1px solid var(--line-2);
+      background: transparent; color: var(--ink-2); cursor: pointer; display: grid; place-items: center;
     }
-    .badge-row {
-      display: flex;
-      flex-wrap: wrap;
-      gap: 8px;
-      margin-bottom: 10px;
+    .icon-btn:hover { color: var(--ink); border-color: var(--accent); }
+    html[data-theme="dark"] .sun, html[data-theme="light"] .moon { display: none; }
+
+    /* ---------- hero ---------- */
+    .hero { position: relative; padding: 72px 0 40px; }
+    .hero::before {
+      content: ""; position: absolute; inset: -64px 0 0 0; pointer-events: none;
+      background:
+        radial-gradient(720px 520px at 78% 34%, var(--glow), transparent 68%),
+        radial-gradient(520px 380px at 6% 0%, color-mix(in srgb, var(--copper) 9%, transparent), transparent 70%);
     }
-    .badge {
-      display: inline-flex;
-      align-items: center;
-      gap: 6px;
-      padding: 4px 10px;
-      border-radius: 999px;
-      font-size: 12px;
-      font-weight: 600;
-      font-family: var(--mono);
-      border: 1px solid var(--border);
-      background: var(--bg);
+    .hero-wires { position: absolute; inset: 0; width: 100%; height: 100%; pointer-events: none; opacity: 0.5; }
+    .hero-wires path { fill: none; stroke: var(--accent); stroke-width: 1; opacity: 0.35; }
+    .hero-grid { position: relative; display: grid; grid-template-columns: minmax(0, 1.06fr) minmax(0, 0.94fr); gap: 48px; align-items: center; }
+    .eyebrow {
+      font: 500 12px/1.4 var(--mono); letter-spacing: 0.14em; text-transform: uppercase; color: var(--ink-3);
+      display: flex; flex-wrap: wrap; align-items: center; gap: 10px;
     }
-    .badge.live {
-      background: var(--accent-soft);
-      color: var(--accent);
-      border-color: var(--accent);
-    }
-    .badge.cyan {
-      background: var(--cyan-soft);
-      color: var(--cyan);
-      border-color: var(--cyan);
-    }
-    .badge.amber {
-      background: var(--amber-soft);
-      color: var(--amber);
-      border-color: var(--amber);
-    }
+    .eyebrow .dot { width: 7px; height: 7px; border-radius: 50%; background: var(--accent); box-shadow: 0 0 0 4px var(--glow); }
     h1 {
-      margin: 0 0 6px;
-      font-size: 28px;
-      letter-spacing: -0.02em;
+      font-family: var(--serif); font-weight: 300; font-optical-sizing: auto;
+      font-size: clamp(40px, 5.3vw, 66px); line-height: 1.04; letter-spacing: -0.025em;
+      margin: 22px 0 24px;
     }
-    .subtitle {
-      margin: 0;
-      color: var(--text-muted);
-      font-size: 14.5px;
-      max-width: 880px;
+    h1 em { color: var(--accent); font-weight: 300; }
+    .lede { font-size: 18.5px; line-height: 1.6; color: var(--ink-2); max-width: 34em; margin: 0 0 30px; }
+    .lede strong { color: var(--ink); font-weight: 500; }
+    .cta { display: flex; flex-wrap: wrap; gap: 12px; }
+    .footnote {
+      margin-top: 26px; font: 400 13px/1.5 var(--mono); color: var(--ink-3);
+      background: none; border: 0; padding: 0; cursor: pointer; text-align: left;
     }
-    .hero-actions {
-      display: flex;
-      gap: 10px;
-      align-items: center;
+    .footnote:hover { color: var(--ink-2); }
+
+    .fabric {
+      position: relative; border: 1px solid var(--line); border-radius: 22px;
+      background: linear-gradient(180deg, color-mix(in srgb, var(--panel) 86%, transparent), color-mix(in srgb, var(--bg-2) 86%, transparent));
+      padding: 18px 18px 16px;
     }
-    button.btn, select.select, input.search {
-      background: var(--bg);
-      color: var(--text);
-      border: 1px solid var(--border);
-      border-radius: 8px;
-      padding: 7px 12px;
-      font-size: 13px;
-      font-family: var(--sans);
-      cursor: pointer;
+    .fabric-top { display: flex; justify-content: space-between; align-items: center; gap: 10px; flex-wrap: wrap; }
+    .seg { display: inline-flex; border: 1px solid var(--line-2); border-radius: 999px; padding: 3px; }
+    .seg button, .chips button {
+      font: 500 12.5px/1 var(--mono); color: var(--ink-2); background: transparent; border: 0; cursor: pointer;
+      padding: 8px 12px; border-radius: 999px; transition: background 0.2s, color 0.2s;
     }
-    button.btn:hover, select.select:hover {
-      border-color: var(--cyan);
+    .seg button[aria-pressed="true"], .chips button[aria-pressed="true"] { background: var(--accent); color: var(--accent-ink); }
+    .chips { display: inline-flex; gap: 2px; align-items: center; }
+    .chips span { font: 400 11px var(--mono); color: var(--ink-3); letter-spacing: 0.1em; text-transform: uppercase; margin-right: 6px; }
+    .chips button { padding: 8px 6px; min-width: 28px; }
+    .seg button[aria-pressed="true"] .ast { color: inherit; }
+    #fabric-svg { display: block; width: 100%; height: auto; max-height: 400px; margin: 4px auto 0; }
+    .cable { fill: none; stroke: var(--accent); stroke-width: 2; stroke-linecap: round; stroke-dasharray: 600; stroke-dashoffset: 600; animation: draw 0.9s ease forwards; }
+    .cable-glow { fill: none; stroke: var(--accent); stroke-width: 9; opacity: 0.09; stroke-linecap: round; }
+    .pulse { fill: var(--ink); opacity: 0.9; }
+    .node polygon { stroke: var(--accent); stroke-width: 1.1; stroke-linejoin: round; }
+    .node .lid { fill: color-mix(in srgb, var(--accent) 46%, var(--panel-2)); }
+    .node .flank { fill: color-mix(in srgb, var(--accent) 24%, var(--panel-2)); }
+    .node .face { fill: color-mix(in srgb, var(--accent) 12%, var(--panel-2)); }
+    .node .foam { fill: url(#foam); stroke: none; }
+    .node .grip { fill: color-mix(in srgb, var(--accent) 40%, var(--panel-2)); stroke-width: 0.9; }
+    .node .shade { fill: #000; stroke: none; opacity: 0.28; }
+    html[data-theme="light"] .node .shade { opacity: 0.1; }
+    .node text { font-family: var(--mono); font-weight: 500; fill: var(--ink); text-anchor: middle; }
+    #foam circle { fill: var(--accent); }
+    .node { animation: pop 0.5s ease backwards; }
+    .hub-ghost { fill: none; stroke: var(--ink-3); stroke-width: 1.2; stroke-dasharray: 3 5; }
+    .hub-label { font: 400 11.5px var(--mono); fill: var(--ink-3); text-anchor: middle; letter-spacing: 0.06em; }
+    .hub rect { fill: var(--accent); }
+    .hub text { font: 500 11.5px var(--mono); fill: var(--accent-ink); text-anchor: middle; letter-spacing: 0.06em; }
+    @keyframes draw { to { stroke-dashoffset: 0; } }
+    @keyframes pop { from { opacity: 0; transform: scale(0.8); } }
+    .fabric-cap { display: flex; justify-content: space-between; align-items: baseline; gap: 12px; flex-wrap: wrap; border-top: 1px solid var(--line); padding-top: 13px; margin-top: 6px; }
+    .fabric-cap .name { font: 500 14px var(--mono); color: var(--ink); }
+    .fabric-cap .how { font-size: 13.5px; color: var(--ink-2); }
+
+    /* ---------- live strip ---------- */
+    .live { position: relative; padding: 18px 0 76px; }
+    .live-box { border: 1px solid var(--line); border-radius: 22px; background: var(--panel); overflow: hidden; }
+    .live-head {
+      display: flex; justify-content: space-between; align-items: center; gap: 12px; flex-wrap: wrap;
+      padding: 13px 22px; border-bottom: 1px solid var(--line);
+      font: 400 12px/1.4 var(--mono); color: var(--ink-3); letter-spacing: 0.04em;
     }
-    button.btn.active {
-      background: var(--cyan-soft);
-      color: var(--cyan);
-      border-color: var(--cyan);
-      font-weight: 600;
+    .live-head b { color: var(--ink-2); font-weight: 500; }
+    .live-head .beat { display: inline-flex; align-items: center; gap: 8px; text-transform: uppercase; letter-spacing: 0.14em; }
+    .beat i { width: 7px; height: 7px; border-radius: 50%; background: var(--good); animation: beat 2.2s ease-in-out infinite; }
+    @keyframes beat { 50% { opacity: 0.3; } }
+    .tiles { display: grid; grid-template-columns: repeat(3, 1fr); gap: 1px; background: var(--line); }
+    .tiles + .tiles { border-top: 1px solid var(--line); grid-template-columns: repeat(4, 1fr); }
+    .tiles.five { grid-template-columns: repeat(5, 1fr); }
+    .tiles.five .tile .v { font-size: clamp(28px, 3.1vw, 42px); }
+    .tile { padding: 22px 22px 20px; min-width: 0; background: var(--panel); }
+    .tile .k { font: 500 11px/1.3 var(--mono); letter-spacing: 0.14em; text-transform: uppercase; color: var(--ink-3); }
+    .tile .v { font-family: var(--serif); font-weight: 300; font-size: clamp(30px, 3.5vw, 46px); line-height: 1.1; letter-spacing: -0.02em; margin: 8px 0 4px; white-space: nowrap; }
+    .tile .v small { font: 400 14px var(--mono); color: var(--ink-3); letter-spacing: 0; margin-left: 5px; }
+    .tile .d { font-size: 13.5px; color: var(--ink-2); line-height: 1.45; }
+    .tiles.build .tile .v { color: var(--accent); }
+    .live-none { padding: 26px 22px; color: var(--ink-2); font-size: 14.5px; border-top: 1px solid var(--line); }
+
+    /* ---------- chapters ---------- */
+    section.ch { padding: 84px 0; border-top: 1px solid var(--line); position: relative; }
+    .ch-head { display: grid; grid-template-columns: 170px minmax(0, 1fr); gap: 28px; margin-bottom: 44px; }
+    .ch-no { font: 500 12px/1.5 var(--mono); letter-spacing: 0.14em; text-transform: uppercase; color: var(--ink-3); padding-top: 14px; }
+    .ch-no b { color: var(--accent); font-weight: 500; }
+    h2 { font-family: var(--serif); font-weight: 300; font-size: clamp(32px, 4.1vw, 52px); line-height: 1.06; letter-spacing: -0.02em; margin: 0 0 18px; max-width: 16em; }
+    h2 em { color: var(--accent); }
+    .ch-head p { font-size: 17.5px; color: var(--ink-2); max-width: 40em; margin: 0; }
+    .ch-head p strong, .ch-body strong { color: var(--ink); font-weight: 500; }
+    .ch-body { margin-left: 198px; }
+
+    .facts { display: grid; grid-template-columns: repeat(3, 1fr); gap: 0; border-top: 1px solid var(--line); }
+    .fact { padding: 24px 26px 6px 0; }
+    .fact + .fact { padding-left: 26px; border-left: 1px solid var(--line); }
+    .fact h3 { font: 500 16.5px/1.35 var(--sans); margin: 0 0 8px; }
+    .fact p { font-size: 14.8px; color: var(--ink-2); margin: 0; }
+
+    .gates { list-style: none; margin: 0; padding: 0; border-top: 1px solid var(--line); counter-reset: g; }
+    .gates li { display: grid; grid-template-columns: 54px minmax(0, 0.8fr) minmax(0, 1.5fr); gap: 20px; padding: 19px 0; border-bottom: 1px solid var(--line); align-items: baseline; counter-increment: g; }
+    .gates li::before { content: counter(g, decimal-leading-zero); font: 400 12px var(--mono); color: var(--ink-3); }
+    .gates h3 { font: 400 21px/1.25 var(--serif); margin: 0; letter-spacing: -0.01em; }
+    .gates p { margin: 0; font-size: 14.8px; color: var(--ink-2); }
+
+    .cards { display: grid; grid-template-columns: repeat(3, 1fr); gap: 16px; }
+    .card { border: 1px solid var(--line); border-radius: 18px; background: var(--panel); padding: 22px 22px 20px; display: flex; flex-direction: column; transition: border-color 0.25s, transform 0.25s; }
+    .card:hover { border-color: var(--line-2); transform: translateY(-2px); }
+    .card .tag { align-self: flex-start; font: 500 10.5px/1 var(--mono); letter-spacing: 0.12em; text-transform: uppercase; color: var(--ink-3); border: 1px solid var(--line-2); border-radius: 999px; padding: 5px 9px; }
+    .card .tag.lab { color: var(--accent); border-color: var(--accent); }
+    .card h3 { font: 400 27px/1.15 var(--serif); letter-spacing: -0.015em; margin: 16px 0 3px; }
+    .card .aka { font: 400 12px/1.4 var(--mono); color: var(--ink-3); min-height: 17px; }
+    .card p { font-size: 14.6px; color: var(--ink-2); margin: 12px 0 18px; }
+    .card .gain { margin-top: auto; padding-top: 14px; border-top: 1px solid var(--line); font-size: 13.2px; color: var(--ink-2); display: flex; align-items: baseline; gap: 10px; }
+    .card .gain b { font: 300 26px/1 var(--serif); color: var(--accent); letter-spacing: -0.02em; white-space: nowrap; }
+
+    .more { margin-top: 30px; border-top: 1px solid var(--line); display: grid; grid-template-columns: repeat(2, 1fr); column-gap: 40px; }
+    .more div { padding: 15px 0; border-bottom: 1px solid var(--line); font-size: 14.6px; color: var(--ink-2); }
+    .more b { color: var(--ink); font-weight: 500; }
+
+    /* ---------- weightless ---------- */
+    .wl { border: 1px solid var(--line); border-radius: 22px; overflow: hidden; display: grid; grid-template-columns: minmax(0, 1fr) minmax(0, 1fr); background: var(--panel); }
+    .wl-copy { padding: 34px 34px 32px; }
+    .wl-copy h3 { font: 300 32px/1.12 var(--serif); letter-spacing: -0.02em; margin: 0 0 14px; }
+    .wl-copy h3 em { color: var(--accent); }
+    .wl-copy p { color: var(--ink-2); font-size: 15.5px; margin: 0 0 14px; }
+    .wl-code { background: var(--bg-2); border-left: 1px solid var(--line); padding: 30px 30px; display: flex; flex-direction: column; justify-content: center; gap: 16px; min-width: 0; }
+    .req { border: 1px solid var(--line); border-radius: 14px; padding: 15px 17px; background: var(--panel); min-width: 0; }
+    .req .lab { font: 500 10.5px var(--mono); letter-spacing: 0.14em; text-transform: uppercase; color: var(--ink-3); margin-bottom: 8px; }
+    .req pre { margin: 0; font: 400 13px/1.6 var(--mono); color: var(--ink-2); white-space: pre-wrap; word-break: break-word; }
+    .req pre b { color: var(--accent); font-weight: 500; }
+
+    /* ---------- numbers ---------- */
+    .toolbar { display: flex; flex-wrap: wrap; align-items: center; gap: 12px 18px; margin-bottom: 20px; }
+    .toolbar label { font: 400 12px var(--mono); color: var(--ink-3); letter-spacing: 0.08em; text-transform: uppercase; display: inline-flex; align-items: center; gap: 8px; }
+    select {
+      font: 500 13px var(--mono); color: var(--ink); background: var(--panel); border: 1px solid var(--line-2);
+      border-radius: 999px; padding: 8px 30px 8px 13px; appearance: none; -webkit-appearance: none; cursor: pointer;
+      background-image: linear-gradient(45deg, transparent 50%, var(--ink-3) 50%), linear-gradient(135deg, var(--ink-3) 50%, transparent 50%);
+      background-position: calc(100% - 16px) 50%, calc(100% - 11px) 50%; background-size: 5px 5px; background-repeat: no-repeat;
     }
-    .kpi-grid {
-      display: grid;
-      grid-template-columns: repeat(auto-fit, minmax(195px, 1fr));
-      gap: 12px;
-      margin-top: 20px;
+    .charts { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 16px; }
+    .chart { border: 1px solid var(--line); border-radius: 18px; background: var(--panel); padding: 20px 20px 12px; position: relative; min-width: 0; }
+    .chart h3 { font: 500 15.5px/1.3 var(--sans); margin: 0; }
+    .chart .sub { font-size: 13px; color: var(--ink-3); margin: 2px 0 10px; }
+    .legend { display: flex; flex-wrap: wrap; gap: 6px 16px; font-size: 12.5px; color: var(--ink-2); margin-bottom: 4px; }
+    .legend i { display: inline-block; width: 14px; height: 2px; border-radius: 2px; vertical-align: middle; margin-right: 7px; }
+    .chart svg { display: block; width: 100%; height: auto; overflow: visible; }
+    .chart svg text { font-family: var(--mono); font-size: 12px; fill: var(--ink-3); }
+    .chart svg .dl { fill: var(--ink-2); font-size: 12px; }
+    .gridline { stroke: var(--line); stroke-width: 1; }
+    .tip {
+      position: absolute; pointer-events: none; z-index: 5; min-width: 150px;
+      background: var(--bg); border: 1px solid var(--line-2); border-radius: 10px; padding: 9px 11px;
+      font-size: 12.5px; color: var(--ink-2); box-shadow: 0 10px 30px rgba(0,0,0,0.25); opacity: 0; transition: opacity 0.12s;
     }
-    .kpi-card {
-      background: var(--bg);
-      border: 1px solid var(--border);
-      border-radius: 10px;
-      padding: 14px 16px;
+    .tip.on { opacity: 1; }
+    .tip .t { font: 500 11.5px var(--mono); color: var(--ink); margin-bottom: 5px; }
+    .tip .r { display: flex; justify-content: space-between; gap: 14px; white-space: nowrap; }
+    .tip .r i { display: inline-block; width: 10px; height: 2px; vertical-align: middle; margin-right: 6px; }
+    .tip .r b { color: var(--ink); font: 500 12px var(--mono); }
+
+    .tablewrap { overflow-x: auto; border: 1px solid var(--line); border-radius: 18px; background: var(--panel); margin-top: 16px; }
+    table { width: 100%; border-collapse: collapse; font-size: 14px; }
+    th { font: 500 11px/1.3 var(--mono); letter-spacing: 0.1em; text-transform: uppercase; color: var(--ink-3); text-align: left; padding: 13px 16px; border-bottom: 1px solid var(--line); white-space: nowrap; }
+    td { padding: 11px 16px; border-bottom: 1px solid var(--line); color: var(--ink-2); vertical-align: middle; }
+    tr:last-child td { border-bottom: 0; }
+    td.n, th.n { text-align: right; font-family: var(--mono); font-size: 13px; white-space: nowrap; font-variant-numeric: tabular-nums; }
+    td.lead { color: var(--ink); }
+    td.nw { white-space: nowrap; }
+    td code { color: var(--ink); }
+    .up { color: var(--good); } .down { color: var(--bad); } .flat { color: var(--ink-3); }
+    .pill { font: 500 10.5px/1 var(--mono); letter-spacing: 0.1em; text-transform: uppercase; border: 1px solid var(--accent); color: var(--accent); padding: 4px 8px; border-radius: 999px; margin-left: 8px; white-space: nowrap; }
+    .glyph { width: 30px; height: 30px; display: block; }
+    .glyph line, .glyph path { stroke: var(--accent); stroke-width: 1.3; fill: none; }
+    .glyph circle { fill: var(--ink-2); }
+    .note { font-size: 13px; color: var(--ink-3); margin-top: 12px; }
+
+    /* ---------- releases ---------- */
+    .rel { border-top: 1px solid var(--line); }
+    .rel details { border-bottom: 1px solid var(--line); }
+    .rel summary { list-style: none; cursor: pointer; display: grid; grid-template-columns: 112px minmax(0, 250px) minmax(0, 1fr) 20px; gap: 18px; padding: 16px 0; align-items: baseline; }
+    .rel summary::-webkit-details-marker { display: none; }
+    .rel .date { font: 400 12.5px var(--mono); color: var(--ink-3); }
+    .rel .nm { font: 400 21px/1.2 var(--serif); letter-spacing: -0.01em; }
+    .rel .gist { font-size: 14px; color: var(--ink-2); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+    .rel .chev { color: var(--ink-3); transition: transform 0.2s; font-family: var(--mono); }
+    .rel details[open] .chev { transform: rotate(45deg); color: var(--accent); }
+    .rel details[open] .gist { visibility: hidden; }
+    .rel .full { padding: 0 38px 20px 130px; font-size: 14.3px; color: var(--ink-2); }
+    .rel .full p { margin: 0 0 10px; }
+    .rel .full .meta { font: 400 12px var(--mono); color: var(--ink-3); }
+
+    /* ---------- fine print ---------- */
+    .fine details { border: 1px solid var(--line); border-radius: 16px; background: var(--panel); margin-bottom: 12px; overflow: hidden; }
+    .fine summary { cursor: pointer; padding: 16px 20px; font-weight: 500; font-size: 15.5px; list-style: none; display: flex; justify-content: space-between; align-items: center; gap: 12px; }
+    .fine summary::-webkit-details-marker { display: none; }
+    .fine summary span { font: 400 12px var(--mono); color: var(--ink-3); }
+    .fine .in { border-top: 1px solid var(--line); padding: 4px 0 0; }
+    .fine .tablewrap { border: 0; border-radius: 0; margin: 0; background: transparent; }
+    .fine td { font-size: 13.3px; }
+    .search { margin: 14px 20px; width: min(420px, calc(100% - 40px)); font: 400 14px var(--sans); color: var(--ink); background: var(--bg-2); border: 1px solid var(--line-2); border-radius: 999px; padding: 10px 16px; }
+    .tags { display: flex; flex-wrap: wrap; gap: 6px; padding: 16px 20px 20px; }
+    .tags span { font: 400 11.5px var(--mono); color: var(--ink-2); border: 1px solid var(--line); border-radius: 999px; padding: 4px 9px; }
+
+    /* ---------- start + footer ---------- */
+    .start { display: grid; grid-template-columns: minmax(0, 1fr) minmax(0, 1.1fr); gap: 40px; align-items: center; }
+    .term { border: 1px solid var(--line); border-radius: 18px; background: var(--bg-2); overflow: hidden; }
+    .term-bar { display: flex; gap: 6px; padding: 12px 14px; border-bottom: 1px solid var(--line); }
+    .term-bar i { width: 9px; height: 9px; border-radius: 50%; background: var(--line-2); }
+    .term pre { margin: 0; padding: 18px 20px 20px; font: 400 13px/1.75 var(--mono); color: var(--ink-2); overflow-x: auto; }
+    .term pre .c { color: var(--ink-3); } .term pre b { color: var(--accent); font-weight: 500; }
+    footer { border-top: 1px solid var(--line); padding: 54px 0 60px; }
+    .foot { display: grid; grid-template-columns: minmax(0, 1.3fr) repeat(2, minmax(0, 0.6fr)); gap: 40px; }
+    .foot .big { font: 300 clamp(26px, 3.3vw, 40px)/1.12 var(--serif); letter-spacing: -0.02em; margin: 14px 0 0; }
+    .foot h4 { font: 500 11px var(--mono); letter-spacing: 0.14em; text-transform: uppercase; color: var(--ink-3); margin: 6px 0 12px; }
+    .foot ul { list-style: none; padding: 0; margin: 0; font-size: 14.5px; color: var(--ink-2); display: grid; gap: 8px; }
+    .foot ul a { text-decoration: none; } .foot ul a:hover { color: var(--ink); }
+    .colophon { margin-top: 44px; padding-top: 20px; border-top: 1px solid var(--line); font: 400 12px/1.6 var(--mono); color: var(--ink-3); display: flex; flex-wrap: wrap; justify-content: space-between; gap: 10px; }
+
+    /* ---------- link-preview card (?card) ---------- */
+    .og { display: none; }
+    html.og-mode, html.og-mode body { width: 1200px; height: 630px; overflow: hidden; }
+    html.og-mode body > :not(.og) { display: none !important; }
+    html.og-mode .cable { animation: none; stroke-dashoffset: 0; }
+    html.og-mode .node { animation: none; }
+    html.og-mode .og {
+      /* The last row stays free of anything that matters: X lays the page title over the
+         bottom-left of a card image, and on a phone that label reaches most of the way across. */
+      display: grid; grid-template-columns: 700px minmax(0, 1fr); grid-template-rows: auto minmax(0, 1fr) auto 124px;
+      width: 1200px; height: 630px; padding: 38px 56px 0;
+      background:
+        radial-gradient(640px 480px at 81% 46%, var(--glow), transparent 70%),
+        radial-gradient(560px 400px at 0% 0%, color-mix(in srgb, var(--copper) 13%, transparent), transparent 70%),
+        var(--bg);
     }
-    .kpi-label {
-      font-size: 11.5px;
-      text-transform: uppercase;
-      letter-spacing: 0.05em;
-      color: var(--text-muted);
-      margin-bottom: 4px;
+    .og-brand { grid-column: 1 / -1; display: flex; align-items: center; gap: 14px; }
+    .og-brand img { width: 46px; height: 46px; }
+    .og-brand .wordmark { font-size: 36px; }
+    .og-brand .og-rel { margin-left: auto; font: 500 17px/1 var(--mono); letter-spacing: 0.14em; text-transform: uppercase; color: var(--ink-3); }
+    .og-h { align-self: center; font: 300 63px/1.05 var(--serif); letter-spacing: -0.025em; white-space: nowrap; }
+    .og-h em { color: var(--accent); }
+    .og-r { display: flex; flex-direction: column; align-items: center; justify-content: center; gap: 2px; padding-bottom: 16px; }
+    #og-svg { width: 316px; height: 287px; }
+    .og-r .fn { font: 400 18px/1 var(--mono); color: var(--ink-2); }
+    .og-stats { grid-column: 1 / -1; display: flex; align-items: flex-end; gap: 40px; border-top: 1px solid var(--line-2); padding-top: 18px; white-space: nowrap; }
+    .og-stats b { display: block; font: 300 48px/1 var(--serif); letter-spacing: -0.02em; margin-bottom: 8px; }
+    .og-stats .gold b { color: var(--accent); }
+    .og-stats b i { font-style: normal; color: var(--ink-3); }
+    .og-base { grid-column: 1 / -1; display: flex; align-items: center; justify-content: flex-end; font: 400 17px/1 var(--mono); letter-spacing: 0.06em; color: var(--ink-3); }
+    .og-stats span { font: 500 15px/1 var(--mono); letter-spacing: 0.1em; text-transform: uppercase; color: var(--ink-2); }
+
+    .reveal { opacity: 0; transform: translateY(14px); transition: opacity 0.7s ease, transform 0.7s ease; }
+    .reveal.in { opacity: 1; transform: none; }
+
+    @media (max-width: 980px) {
+      :root { --gut: 20px; }
+      .hero { padding-top: 44px; }
+      .hero-grid, .wl, .start { grid-template-columns: minmax(0, 1fr); }
+      .wl-code { border-left: 0; border-top: 1px solid var(--line); }
+      .ch-head { grid-template-columns: minmax(0, 1fr); gap: 6px; }
+      .ch-no { padding-top: 0; }
+      .ch-body { margin-left: 0; }
+      .cards, .charts { grid-template-columns: minmax(0, 1fr); }
+      .facts { grid-template-columns: minmax(0, 1fr); }
+      .fact + .fact { padding-left: 0; border-left: 0; border-top: 1px solid var(--line); }
+      .fact { padding: 20px 0; }
+      .gates li { grid-template-columns: 34px minmax(0, 1fr); }
+      .gates li p { grid-column: 2; }
+      .more { grid-template-columns: minmax(0, 1fr); }
+      .tiles, .tiles + .tiles, .tiles.five { grid-template-columns: repeat(2, 1fr); }
+      .tiles .tile:last-child:nth-child(odd) { grid-column: 1 / -1; }
+      .nav-links .hide-m { display: none; }
+      .rel summary { grid-template-columns: 92px minmax(0, 1fr) 20px; }
+      .rel .gist { display: none; }
+      .rel .full { padding-left: 0; padding-right: 0; }
+      .foot { grid-template-columns: minmax(0, 1fr); gap: 28px; }
+      section.ch { padding: 60px 0; }
     }
-    .kpi-value {
-      font-size: 23px;
-      font-weight: 700;
-      font-family: var(--mono);
-      color: var(--text);
+    @media (max-width: 520px) {
+      :root { --gut: 16px; }
+      .nav-links { gap: 12px; }
+      .tile { padding: 18px 16px; }
+      .wl-copy, .wl-code { padding: 24px 20px; }
+      .fabric-top { justify-content: center; }
     }
-    .kpi-delta {
-      font-size: 12px;
-      font-family: var(--mono);
-      color: var(--accent);
-      margin-top: 3px;
-    }
-    nav.tabs {
-      display: flex;
-      flex-wrap: wrap;
-      gap: 8px;
-      margin-bottom: 20px;
-      border-bottom: 1px solid var(--border);
-      padding-bottom: 12px;
-    }
-    .section {
-      background: var(--bg-card);
-      border: 1px solid var(--border);
-      border-radius: 12px;
-      padding: 22px 24px;
-      margin-bottom: 22px;
-    }
-    .section-header {
-      display: flex;
-      flex-wrap: wrap;
-      justify-content: space-between;
-      align-items: center;
-      gap: 12px;
-      margin-bottom: 16px;
-    }
-    .section h2 {
-      margin: 0;
-      font-size: 19px;
-      letter-spacing: -0.01em;
-    }
-    .section p.desc {
-      margin: 4px 0 0;
-      color: var(--text-muted);
-      font-size: 13.5px;
-    }
-    .controls {
-      display: flex;
-      flex-wrap: wrap;
-      gap: 10px;
-      align-items: center;
-    }
-    .chart-grid {
-      display: grid;
-      grid-template-columns: repeat(auto-fit, minmax(520px, 1fr));
-      gap: 18px;
-      margin-bottom: 18px;
-    }
-    @media (max-width: 640px) {
-      .chart-grid { grid-template-columns: 1fr; }
-    }
-    .chart-box {
-      background: var(--bg);
-      border: 1px solid var(--border);
-      border-radius: 10px;
-      padding: 16px;
-    }
-    .chart-title {
-      font-size: 13.5px;
-      font-weight: 600;
-      margin: 0 0 10px;
-      display: flex;
-      justify-content: space-between;
-      align-items: center;
-    }
-    .chart-title span.sub {
-      font-weight: 400;
-      font-size: 12px;
-      color: var(--text-muted);
-      font-family: var(--mono);
-    }
-    .table-wrap {
-      overflow-x: auto;
-      border: 1px solid var(--border);
-      border-radius: 10px;
-      background: var(--bg);
-    }
-    table {
-      width: 100%;
-      border-collapse: collapse;
-      font-size: 13px;
-    }
-    th, td {
-      padding: 9px 12px;
-      border-bottom: 1px solid var(--border);
-      text-align: left;
-    }
-    th {
-      background: var(--bg-elev);
-      color: var(--text-muted);
-      font-weight: 600;
-      font-size: 11.5px;
-      text-transform: uppercase;
-      letter-spacing: 0.04em;
-    }
-    td.num, th.num {
-      text-align: right;
-      font-family: var(--mono);
-    }
-    tr:last-child td { border-bottom: none; }
-    tr:hover td { background: var(--bg-hover); }
-    code {
-      font-family: var(--mono);
-      font-size: 12px;
-      background: var(--bg-elev);
-      padding: 2px 6px;
-      border-radius: 4px;
-      border: 1px solid var(--border);
-    }
-    .verdict-better {
-      color: var(--accent);
-      font-weight: 600;
-      font-family: var(--mono);
-    }
-    .verdict-same {
-      color: var(--text-muted);
-      font-family: var(--mono);
-    }
-    .verdict-worse {
-      color: var(--rose);
-      font-weight: 600;
-      font-family: var(--mono);
-    }
-    .shape-cards {
-      display: grid;
-      grid-template-columns: repeat(auto-fit, minmax(340px, 1fr));
-      gap: 16px;
-      margin-bottom: 16px;
-    }
-    .shape-card {
-      background: var(--bg);
-      border: 1px solid var(--border);
-      border-radius: 10px;
-      padding: 18px;
-    }
-    .shape-card.default {
-      border-color: var(--accent);
-    }
-    .kv-bar {
-      height: 10px;
-      border-radius: 999px;
-      background: var(--bg-elev);
-      overflow: hidden;
-      margin: 10px 0;
-      border: 1px solid var(--border);
-    }
-    .kv-bar-fill {
-      height: 100%;
-      background: linear-gradient(90deg, var(--accent), var(--cyan));
-    }
-    .timeline-list {
-      display: flex;
-      flex-direction: column;
-      gap: 12px;
-    }
-    .timeline-item {
-      background: var(--bg);
-      border: 1px solid var(--border);
-      border-radius: 10px;
-      padding: 14px 18px;
-    }
-    .timeline-item.promoted {
-      border-color: var(--accent);
-    }
-    .timeline-head {
-      display: flex;
-      flex-wrap: wrap;
-      justify-content: space-between;
-      align-items: center;
-      gap: 8px;
-      margin-bottom: 6px;
-    }
-    .cap-tags {
-      display: flex;
-      flex-wrap: wrap;
-      gap: 6px;
-      margin-top: 12px;
-    }
-    .cap-tag {
-      font-family: var(--mono);
-      font-size: 11px;
-      padding: 3px 8px;
-      border-radius: 6px;
-      background: var(--bg);
-      border: 1px solid var(--border);
-      color: var(--text-muted);
-    }
-    footer {
-      text-align: center;
-      color: var(--text-muted);
-      font-size: 12.5px;
-      margin-top: 36px;
+    @media (prefers-reduced-motion: reduce) {
+      html { scroll-behavior: auto; }
+      .cable { animation: none; stroke-dashoffset: 0; }
+      .node, .beat i { animation: none; }
+      .reveal { opacity: 1; transform: none; transition: none; }
     }
   </style>
 </head>
 <body>
-  <div class="container">
-    <header class="hero">
-      <div class="hero-top">
-        <div>
-          <div class="badge-row" id="hero-badges"></div>
-          <h1 id="hero-title">spark-ds41f</h1>
-          <p class="subtitle" id="hero-subtitle"></p>
-        </div>
-        <div class="hero-actions">
-          <a class="btn" href="https://github.com/christopherowen/spark-ds41f" target="_blank" rel="noopener">GitHub Repo</a>
-          <button class="btn" id="theme-toggle" type="button">Light / Dark</button>
-        </div>
-      </div>
-      <div class="kpi-grid" id="hero-kpis"></div>
-    </header>
-
-    <section class="section" id="sec-performance">
-      <div class="section-header">
-        <div>
-          <h2>Release-over-Release Performance Observatory</h2>
-          <p class="desc">Driven directly from <code>manifests/suites/*/</code> across all recorded servebench release, single-stream, and sampled runs.</p>
-        </div>
-        <div class="controls">
-          <label style="font-size:12.5px;color:var(--text-muted)">Topology:</label>
-          <select class="select" id="topo-select">
-            <option value="TP4">TP4 Ring (4× DGX Spark)</option>
-            <option value="TP3">TP3 Triangle (3× DGX Spark)</option>
-          </select>
-          <label style="font-size:12.5px;color:var(--text-muted)">Base:</label>
-          <select class="select" id="base-suite-select"></select>
-          <label style="font-size:12.5px;color:var(--text-muted)">Candidate:</label>
-          <select class="select" id="cand-suite-select"></select>
-        </div>
-      </div>
-
-      <div class="chart-grid">
-        <div class="chart-box">
-          <div class="chart-title">
-            <span>Source-Text Prefill Throughput (32K → 1M)</span>
-            <span class="sub">tok/s (higher is better)</span>
-          </div>
-          <div id="chart-prefill"></div>
-        </div>
-        <div class="chart-box">
-          <div class="chart-title">
-            <span>Decode Throughput across Releases</span>
-            <span class="sub">output tok/s (higher is better)</span>
-          </div>
-          <div id="chart-decode"></div>
-        </div>
-      </div>
-
-      <div class="chart-grid">
-        <div class="chart-box">
-          <div class="chart-title">
-            <span>Engine Decode Step-Time Grid (Base vs Candidate)</span>
-            <span class="sub">trimmed mean ms / step (lower is better)</span>
-          </div>
-          <div id="chart-grid"></div>
-        </div>
-        <div class="chart-box">
-          <div class="chart-title">
-            <span>DSpark Speculative Survival &amp; Prefill Yield</span>
-            <span class="sub">draft positions k=0..4 &amp; 131K stall probes</span>
-          </div>
-          <div id="chart-spec-stall"></div>
-        </div>
-      </div>
-
-      <div class="table-wrap">
-        <table id="suite-compare-table">
-          <thead>
-            <tr>
-              <th>Workload / Metric</th>
-              <th class="num" id="th-base">Base</th>
-              <th class="num" id="th-cand">Candidate</th>
-              <th class="num">Delta</th>
-              <th>Notes</th>
-            </tr>
-          </thead>
-          <tbody id="suite-compare-tbody"></tbody>
-        </table>
-      </div>
-    </section>
-
-    <section class="section" id="sec-shapes">
-      <div class="section-header">
-        <div>
-          <h2>Cluster Shapes &amp; KV Pool Sizing</h2>
-          <p class="desc">Resolved from <code>config/cluster.json</code> via <code>scripts/recipe.py</code> and <code>scripts/kv_capacity.py</code> (227,840-byte pool blocks).</p>
-        </div>
-      </div>
-      <div class="shape-cards" id="shape-cards"></div>
-      <div class="table-wrap">
-        <table>
-          <thead>
-            <tr>
-              <th>Shape</th>
-              <th>Ranks &amp; Transport</th>
-              <th>Kernel / Pages</th>
-              <th class="num">Context Limit</th>
-              <th class="num">Max Seqs</th>
-              <th class="num">Batch Tokens</th>
-              <th class="num">KV Pool / Rank</th>
-              <th class="num">Min Free RAM (Head / Workers)</th>
-              <th class="num">5 GiB Guard Headroom</th>
-              <th class="num">Pool Blocks</th>
-              <th class="num">Full Contexts Held</th>
-              <th class="num">vLLM 0491 Startup Line</th>
-              <th>Qualified Suite</th>
-            </tr>
-          </thead>
-          <tbody id="shapes-tbody"></tbody>
-        </table>
-      </div>
-    </section>
-
-    <section class="section" id="sec-upstreams">
-      <div class="section-header">
-        <div>
-          <h2>Pinned Upstreams, Patch Stacks &amp; Active Runtime Choices</h2>
-          <p class="desc">Synchronized from <code>upstreams.lock.json</code>, <code>manifests/baselines/2026-11-07-spark-ds41f-1107.json</code>, and <code>manifests/sources/</code>.</p>
-        </div>
-        <div class="controls">
-          <input class="search" id="choice-search" type="search" placeholder="Filter runtime choices or capabilities...">
-        </div>
-      </div>
-      <div class="table-wrap" style="margin-bottom:18px">
-        <table>
-          <thead>
-            <tr>
-              <th>Component</th>
-              <th>Version / Ref</th>
-              <th class="num">Pinned Revision</th>
-              <th class="num">Patch Series</th>
-              <th class="num">Verified Tree</th>
-              <th>Role</th>
-            </tr>
-          </thead>
-          <tbody id="upstreams-tbody"></tbody>
-        </table>
-      </div>
-      <div class="table-wrap">
-        <table>
-          <thead>
-            <tr>
-              <th style="width:220px">Runtime Choice</th>
-              <th>Active Specification in <code>spark-ds41f-1107</code></th>
-            </tr>
-          </thead>
-          <tbody id="choices-tbody"></tbody>
-        </table>
-      </div>
-      <div class="cap-tags" id="cap-tags"></div>
-    </section>
-
-    <section class="section" id="sec-timeline">
-      <div class="section-header">
-        <div>
-          <h2>Baseline Manifest History (35 Releases)</h2>
-          <p class="desc">Complete immutable promotion history from <code>manifests/baselines/*.json</code>.</p>
-        </div>
-        <div class="controls">
-          <input class="search" id="timeline-search" type="search" placeholder="Search releases (e.g. 1030, r6x, engram, glp)...">
-        </div>
-      </div>
-      <div class="timeline-list" id="timeline-list"></div>
-    </section>
-
-    <footer>
-      Generated deterministically from repository manifests by <code>scripts/render_docs.py</code> &bull; Verified in CI by <code>tests/test_releases.py</code>
-    </footer>
+  <div class="og" aria-hidden="true">
+    <div class="og-brand">
+      <img class="heart" src="logo.png" alt="" width="46" height="46">
+      <span class="wordmark">switchless<span class="ast">*</span></span>
+      <span class="og-rel" id="og-rel"></span>
+    </div>
+    <div class="og-h">DeepSeek V4.1 Flash<br>on DGX Sparks.<br><em>No switch required.</em><span class="ast">*</span></div>
+    <div class="og-r"><svg id="og-svg" viewBox="0 0 440 400"></svg><span class="fn"><span class="ast">*</span> we do support switches</span></div>
+    <div class="og-stats">
+      <div class="gold"><b id="og-ctx"></b><span>token context</span></div>
+      <div class="gold"><b id="og-seq"></b><span>sessions at once</span></div>
+      <div><b id="og-c1"></b><span id="og-c1-k">tok/s, 1 stream</span></div>
+      <div><b id="og-cn"></b><span id="og-cn-k">tok/s, 16 streams</span></div>
+      <div id="og-pf-box"><b id="og-pf"></b><span>tok/s prefill</span></div>
+    </div>
+    <div class="og-base">switchle.ss</div>
   </div>
+  <header class="nav">
+    <div class="wrap nav-in">
+      <a class="brand" href="#top" aria-label="switchless, home">
+        <img class="heart" src="logo.png" alt="" width="30" height="30">
+        <span class="wordmark">switchless<span class="ast">*</span></span>
+      </a>
+      <nav class="nav-links" aria-label="Sections">
+        <a class="hide-m" href="#story">Story</a>
+        <a class="hide-m" href="#speed">Speed</a>
+        <a class="hide-m" href="#numbers">Numbers</a>
+        <a class="hide-m" href="#shapes">Shapes</a>
+        <a class="hide-m" href="https://weightle.ss" rel="noopener">weightle.ss&nbsp;↗</a>
+        <a class="btn small" href="https://github.com/christopherowen/spark-ds41f" rel="noopener">GitHub&nbsp;↗</a>
+        <button class="icon-btn" id="theme" type="button" aria-label="Switch between light and dark">
+          <svg class="sun" width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round"><circle cx="12" cy="12" r="4"/><path d="M12 2v2M12 20v2M2 12h2M20 12h2M4.9 4.9l1.4 1.4M17.7 17.7l1.4 1.4M4.9 19.1l1.4-1.4M17.7 6.3l1.4-1.4"/></svg>
+          <svg class="moon" width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M20 14.5A8.5 8.5 0 0 1 9.5 4a8.5 8.5 0 1 0 10.5 10.5z"/></svg>
+        </button>
+      </nav>
+    </div>
+  </header>
+
+  <main id="top">
+    <!-- ================= hero ================= -->
+    <section class="hero">
+      <svg class="hero-wires" viewBox="0 0 1440 700" preserveAspectRatio="none" aria-hidden="true">
+        <path d="M-20 520 C 300 420, 520 640, 860 470 S 1300 250, 1470 330"/>
+        <path d="M-20 120 C 260 220, 600 40, 900 150 S 1280 420, 1470 180"/>
+      </svg>
+      <div class="wrap hero-grid">
+        <div>
+          <div class="eyebrow"><span class="dot"></span><span>DeepSeek V4.1 Flash</span><span>·</span><span>DGX Spark</span><span>·</span><span id="eyebrow-release">current release</span></div>
+          <h1>A frontier model<br>on your own Sparks.<br><em>switch optional</em></h1>
+          <p class="lede"><strong>spark-ds41f</strong> serves DeepSeek V4.1 Flash across DGX Sparks cabled straight to one another: <strong>native weights</strong>, a <strong>million tokens of context</strong>, sixteen sessions at once. Correct first, then fast, and every number on this page is read from a committed benchmark.</p>
+          <div class="cta">
+            <a class="btn primary" href="https://github.com/christopherowen/spark-ds41f#quick-start" rel="noopener">Get the recipe <span aria-hidden="true">→</span></a>
+            <a class="btn" href="#numbers">See the numbers <span aria-hidden="true">↓</span></a>
+          </div>
+          <button class="footnote" id="fn" type="button"><span class="ast">*</span> We do support switches. <span id="fn-range">Three to eight Sparks</span>, same recipe.</button>
+        </div>
+
+        <div class="fabric" aria-label="Cluster fabric explorer">
+          <div class="fabric-top">
+            <div class="seg" role="group" aria-label="Fabric">
+              <button type="button" data-fabric="switchless" aria-pressed="true">switchless</button>
+              <button type="button" data-fabric="switched" aria-pressed="false">switched<span class="ast">*</span></button>
+            </div>
+            <div class="chips" role="group" aria-label="Number of Sparks" id="node-chips"></div>
+          </div>
+          <svg id="fabric-svg" viewBox="0 0 440 400" role="img" aria-labelledby="fabric-name"></svg>
+          <div class="fabric-cap">
+            <span class="name" id="fabric-name">tp4-ring</span>
+            <span class="how" id="fabric-how"></span>
+          </div>
+        </div>
+      </div>
+    </section>
+
+    <!-- ================= live strip ================= -->
+    <section class="live" aria-label="Key figures for the selected shape">
+      <div class="wrap">
+        <div class="live-box">
+          <div class="live-head">
+            <span class="beat"><i></i>Live from the manifests</span>
+            <span id="live-src"></span>
+          </div>
+          <div class="tiles build">
+            <div class="tile"><div class="k">Context</div><div class="v" id="t-ctx">–</div><div class="d" id="t-ctx-d">tokens in one request</div></div>
+            <div class="tile"><div class="k">Sessions</div><div class="v" id="t-seq">–</div><div class="d" id="t-seq-d">at once</div></div>
+            <div class="tile"><div class="k">Prompt cache</div><div class="v" id="t-kv">–</div><div class="d" id="t-kv-d">held in the KV pool</div></div>
+          </div>
+          <div class="tiles" id="perf-tiles">
+            <div class="tile"><div class="k" id="t-c1-k">One stream</div><div class="v"><span id="t-c1">–</span><small>tok/s</small></div><div class="d" id="t-c1-d">decode, one conversation</div></div>
+            <div class="tile" id="t-code-tile"><div class="k">One stream, code</div><div class="v"><span id="t-code">–</span><small>tok/s</small></div><div class="d">decode, Python and SQL prompts</div></div>
+            <div class="tile"><div class="k" id="t-cn-k">Sixteen streams</div><div class="v"><span id="t-cn">–</span><small>tok/s</small></div><div class="d">decode, combined output</div></div>
+            <div class="tile"><div class="k">Prefill</div><div class="v"><span id="t-pf">–</span><small>tok/s</small></div><div class="d" id="t-pf-d">reading a 131K-token prompt</div></div>
+            <div class="tile"><div class="k">First token, busy</div><div class="v"><span id="t-st">–</span><small>s</small></div><div class="d" id="t-st-d">short request beside a 131K prefill</div></div>
+          </div>
+          <div class="live-none" id="perf-none" hidden></div>
+        </div>
+      </div>
+    </section>
+
+    <!-- ================= 01 native weights ================= -->
+    <section class="ch" id="story">
+      <div class="wrap">
+        <div class="ch-head reveal">
+          <div class="ch-no"><b>01</b> · Native weights</div>
+          <div>
+            <h2>The model DeepSeek <em>shipped.</em></h2>
+            <p>Most ways of fitting a big model on small machines start by changing the model. This one starts by leaving it alone. The checkpoint is DeepSeek's, at its published precision, with its own tokenizer; the work goes into the engine around it.</p>
+          </div>
+        </div>
+        <div class="ch-body reveal">
+          <div class="facts">
+            <div class="fact"><h3>Nothing re-quantized</h3><p>The published FP8, FP4 and BF16 weights load directly from the checkpoint. No distillation, no community re-quant, no "close enough" build. <span id="model-line"></span></p></div>
+            <div class="fact"><h3>Split, never altered</h3><p>Tensor parallelism shards every layer across three to eight Sparks. The cables carry the partial sums; the arithmetic follows DeepSeek's reference.</p></div>
+            <div class="fact"><h3>The whole feature set</h3><p>Full 1M-token context, vision, tool calls, reasoning effort, DeepSeek's own speculative drafter, and an OpenAI-compatible API that also speaks DeepSeek's dialect.</p></div>
+          </div>
+        </div>
+      </div>
+    </section>
+
+    <!-- ================= 02 correctness ================= -->
+    <section class="ch" id="correct">
+      <div class="wrap">
+        <div class="ch-head reveal">
+          <div class="ch-no"><b>02</b> · Correct first</div>
+          <div>
+            <h2>Fast and wrong <em>is just wrong.</em></h2>
+            <p>A speed-up is only a speed-up if the answers did not move. Every change is measured as an experiment, the unfavourable runs are kept, and nothing is promoted until it passes the same gate as the release before it.</p>
+          </div>
+        </div>
+        <div class="ch-body reveal">
+          <ol class="gates" id="gates"></ol>
+        </div>
+      </div>
+    </section>
+
+    <!-- ================= 03 speed ================= -->
+    <section class="ch" id="speed">
+      <div class="wrap">
+        <div class="ch-head reveal">
+          <div class="ch-no"><b>03</b> · Then fast</div>
+          <div>
+            <h2>Then make it <em>quick.</em></h2>
+            <p>With the answers pinned down, speed becomes an engineering problem you can grind on. These are the changes that moved the numbers most, each one landed as a measured experiment against the release before it.</p>
+          </div>
+        </div>
+        <div class="ch-body reveal">
+          <div class="cards" id="gainers"></div>
+          <div class="more" id="more"></div>
+        </div>
+      </div>
+    </section>
+
+    <!-- ================= 04 weightless ================= -->
+    <section class="ch" id="weightless">
+      <div class="wrap">
+        <div class="ch-head reveal">
+          <div class="ch-no"><b>04</b> · weightle.ss</div>
+          <div>
+            <h2>Steering built in, <em>weights untouched.</em></h2>
+            <p>Native weights does not mean one fixed personality. The server speaks <a href="https://weightle.ss" rel="noopener">weightless</a>: a small GLP vector steers the model per request, beside the stock model, on the same engine.</p>
+          </div>
+        </div>
+        <div class="ch-body reveal">
+          <div class="wl">
+            <div class="wl-copy">
+              <h3>One server, two names, <em>zero copies.</em></h3>
+              <p>Ask for the stock name and you get DeepSeek's model, bit for bit. Ask for the weightless name and the same loaded weights are steered by msuiche's published GLP vector for that request only. Nothing is merged, nothing is duplicated in memory, and turning it off is a matter of using the other name.</p>
+              <p id="glp-line"></p>
+              <a class="btn" href="https://weightle.ss" rel="noopener">Read about weightless at weightle.ss&nbsp;↗</a>
+            </div>
+            <div class="wl-code">
+              <div class="req"><div class="lab">Stock</div><pre>{ "model": "<b id="m-stock">deepseek-v4.1-flash</b>",
+  "messages": [ … ] }</pre></div>
+              <div class="req"><div class="lab">Steered, same server</div><pre>{ "model": "<b id="m-glp">deepseek-v4.1-flash-weightless</b>",
+  "messages": [ … ] }</pre></div>
+            </div>
+          </div>
+        </div>
+      </div>
+    </section>
+
+    <!-- ================= 05 numbers ================= -->
+    <section class="ch" id="numbers">
+      <div class="wrap">
+        <div class="ch-head reveal">
+          <div class="ch-no"><b>05</b> · Numbers</div>
+          <div>
+            <h2>Every release, <em>on the record.</em></h2>
+            <p>These charts are drawn from the benchmark suites committed beside each release. A release's numbers never change after it ships, so the history below is the history.</p>
+          </div>
+        </div>
+        <div class="ch-body reveal">
+          <div class="toolbar">
+            <label>Fabric <select id="lane"></select></label>
+            <label>Compare <select id="base"></select></label>
+            <label>with <select id="cand"></select></label>
+          </div>
+          <div class="charts">
+            <div class="chart" id="chart-decode"></div>
+            <div class="chart" id="chart-prefill"></div>
+          </div>
+          <div class="tablewrap">
+            <table>
+              <thead><tr><th>Workload</th><th class="n" id="th-base">Base</th><th class="n" id="th-cand">Candidate</th><th class="n">Change</th><th>Detail</th></tr></thead>
+              <tbody id="compare"></tbody>
+            </table>
+          </div>
+          <p class="note">Change compares the two recorded suites as published. A promotion is decided on paired runs with confidence intervals, recorded in each release's notes.</p>
+        </div>
+      </div>
+    </section>
+
+    <!-- ================= 06 shapes ================= -->
+    <section class="ch" id="shapes">
+      <div class="wrap">
+        <div class="ch-head reveal">
+          <div class="ch-no"><b>06</b> · Shapes</div>
+          <div>
+            <h2>One recipe, <em>every way to cable it.</em></h2>
+            <p>Three Sparks make a triangle and four make a ring, with nothing between them but cable. If you would rather use a switch<span class="ast">*</span>, the same image serves three to eight. A shape starts only after a release benchmark has qualified it on real hardware.</p>
+          </div>
+        </div>
+        <div class="ch-body reveal">
+          <div class="tablewrap">
+            <table>
+              <thead><tr><th></th><th>Shape</th><th>Fabric</th><th class="n">Context</th><th class="n">Sessions</th><th class="n">Prompt cache</th><th class="n">Free RAM, head</th><th>Qualified</th></tr></thead>
+              <tbody id="shape-rows"></tbody>
+            </table>
+          </div>
+          <p class="note"><span class="ast">*</span> Still no switch required.</p>
+        </div>
+      </div>
+    </section>
+
+    <!-- ================= 07 releases ================= -->
+    <section class="ch" id="releases">
+      <div class="wrap">
+        <div class="ch-head reveal">
+          <div class="ch-no"><b>07</b> · Releases</div>
+          <div>
+            <h2>A release is <em>a dated promise.</em></h2>
+            <p>Each one is named for the day it was promoted and frozen as an immutable baseline: the image digest, every pinned source, every patch, and the benchmark that qualified it.</p>
+          </div>
+        </div>
+        <div class="ch-body reveal">
+          <div class="rel" id="rel"></div>
+          <p class="note"><button class="btn small" id="rel-more" type="button">Show earlier releases</button></p>
+        </div>
+      </div>
+    </section>
+
+    <!-- ================= 08 fine print ================= -->
+    <section class="ch fine" id="fine-print">
+      <div class="wrap">
+        <div class="ch-head reveal">
+          <div class="ch-no"><b>08</b> · The fine print<span class="ast">*</span></div>
+          <div>
+            <h2>Everything pinned, <em>nothing hidden.</em></h2>
+            <p>The exact sources, patch counts and runtime choices behind the current release, read straight from the lock file and the baseline manifest.</p>
+          </div>
+        </div>
+        <div class="ch-body reveal">
+          <details>
+            <summary>Pinned upstreams and patch stacks <span id="up-count"></span></summary>
+            <div class="in"><div class="tablewrap"><table>
+              <thead><tr><th>Component</th><th>Version</th><th class="n">Revision</th><th class="n">Patches</th><th>Role</th></tr></thead>
+              <tbody id="upstreams"></tbody>
+            </table></div></div>
+          </details>
+          <details>
+            <summary>Runtime choices <span id="choice-count"></span></summary>
+            <div class="in">
+              <input class="search" id="choice-q" type="search" placeholder="Filter, e.g. prefill, engram, nccl" aria-label="Filter runtime choices">
+              <div class="tablewrap"><table><tbody id="choices"></tbody></table></div>
+            </div>
+          </details>
+          <details>
+            <summary>Engine capabilities <span id="cap-count"></span></summary>
+            <div class="in"><div class="tags" id="caps"></div></div>
+          </details>
+        </div>
+      </div>
+    </section>
+
+    <!-- ================= start ================= -->
+    <section class="ch" id="start">
+      <div class="wrap start reveal">
+        <div>
+          <div class="ch-no" style="padding:0 0 14px"><b>09</b> · Start</div>
+          <h2>Cable it. Check it. <em>Start it.</em></h2>
+          <p style="color:var(--ink-2);font-size:17px;max-width:30em">You need three or more DGX Sparks and the cables between them. The tools print a plan before they touch anything, and refuse to start a cluster whose cabling, kernel or image does not match the recipe.</p>
+          <div class="cta" style="margin-top:24px">
+            <a class="btn primary" href="https://github.com/christopherowen/spark-ds41f#quick-start" rel="noopener">Quick start on GitHub <span aria-hidden="true">→</span></a>
+            <a class="btn" href="https://github.com/christopherowen/spark-ds41f/blob/main/docs/setup.md" rel="noopener">Full setup guide</a>
+          </div>
+        </div>
+        <div class="term" aria-label="Example commands">
+          <div class="term-bar"><i></i><i></i><i></i></div>
+<pre><span class="c"># name your cabling once</span>
+bin/spark site shape <b>tp4-ring</b> --apply
+
+<span class="c"># reports only; prints each fix as a command</span>
+bin/spark doctor
+
+<span class="c"># a plan until you say --apply</span>
+bin/spark --cluster-config config/cluster.json \
+  cluster start --apply</pre>
+        </div>
+      </div>
+    </section>
+  </main>
+
+  <footer>
+    <div class="wrap">
+      <div class="foot">
+        <div>
+          <a class="brand" href="#top"><img class="heart" src="logo.png" alt="" width="30" height="30"><span class="wordmark">switchless<span class="ast">*</span></span></a>
+          <p class="big"><span class="ast">*</span> We do support switches.<br><em style="color:var(--ink-3)">We just never needed one.</em></p>
+        </div>
+        <div>
+          <h4>Project</h4>
+          <ul>
+            <li><a href="https://github.com/christopherowen/spark-ds41f" rel="noopener">spark-ds41f on GitHub ↗</a></li>
+            <li><a href="https://github.com/christopherowen/spark-ds41f/blob/main/docs/setup.md" rel="noopener">Setup guide ↗</a></li>
+            <li><a href="https://github.com/christopherowen/spark-ds41f/blob/main/docs/fundamentals.md" rel="noopener">How the model works ↗</a></li>
+            <li><a href="https://github.com/christopherowen/spark-ds41f/blob/main/docs/methodology.md" rel="noopener">How we measure ↗</a></li>
+          </ul>
+        </div>
+        <div>
+          <h4>Family</h4>
+          <ul>
+            <li><a href="https://weightle.ss" rel="noopener">weightle.ss ↗</a></li>
+            <li><a href="https://github.com/christopherowen/dgx-spark-networking" rel="noopener">sparknet ↗</a></li>
+            <li><a href="https://github.com/christopherowen/dgx-spark-memory-saver" rel="noopener">memory saver ↗</a></li>
+          </ul>
+        </div>
+      </div>
+      <div class="colophon">
+        <span id="colophon"></span>
+        <span>Rendered from repository manifests by scripts/render_docs.py and verified in CI.</span>
+      </div>
+    </div>
+  </footer>
 
   <script id="manifest-data" type="application/json">
 {
@@ -1568,6 +1821,7 @@
           "survival": [],
           "tpot_p50_ms": 35.37,
           "tpot_p99_ms": 45.42,
+          "tps_by_style": null,
           "ttft_p50_s": 0.264,
           "ttft_p99_s": 0.336
         },
@@ -1588,6 +1842,7 @@
           "survival": [],
           "tpot_p50_ms": 56.38,
           "tpot_p99_ms": 73.36,
+          "tps_by_style": null,
           "ttft_p50_s": 0.384,
           "ttft_p99_s": 0.469
         },
@@ -1608,6 +1863,7 @@
           "survival": [],
           "tpot_p50_ms": 45.32,
           "tpot_p99_ms": 68.45,
+          "tps_by_style": null,
           "ttft_p50_s": 0.32,
           "ttft_p99_s": 14.458
         }
@@ -1899,6 +2155,7 @@
           "survival": [],
           "tpot_p50_ms": 69.7,
           "tpot_p99_ms": 93.54,
+          "tps_by_style": null,
           "ttft_p50_s": 0.443,
           "ttft_p99_s": 0.517
         },
@@ -1919,6 +2176,7 @@
           "survival": [],
           "tpot_p50_ms": 43.57,
           "tpot_p99_ms": 58.54,
+          "tps_by_style": null,
           "ttft_p50_s": 0.296,
           "ttft_p99_s": 0.392
         }
@@ -2164,6 +2422,7 @@
           "survival": [],
           "tpot_p50_ms": 35.03,
           "tpot_p99_ms": 44.73,
+          "tps_by_style": null,
           "ttft_p50_s": 0.265,
           "ttft_p99_s": 0.338
         },
@@ -2184,6 +2443,7 @@
           "survival": [],
           "tpot_p50_ms": 54.14,
           "tpot_p99_ms": 69.74,
+          "tps_by_style": null,
           "ttft_p50_s": 0.375,
           "ttft_p99_s": 0.474
         },
@@ -2204,6 +2464,7 @@
           "survival": [],
           "tpot_p50_ms": 42.36,
           "tpot_p99_ms": 66.15,
+          "tps_by_style": null,
           "ttft_p50_s": 0.308,
           "ttft_p99_s": 13.15
         }
@@ -2449,6 +2710,7 @@
           "survival": [],
           "tpot_p50_ms": 35.64,
           "tpot_p99_ms": 44.85,
+          "tps_by_style": null,
           "ttft_p50_s": 0.264,
           "ttft_p99_s": 0.326
         },
@@ -2469,6 +2731,7 @@
           "survival": [],
           "tpot_p50_ms": 54.19,
           "tpot_p99_ms": 73.82,
+          "tps_by_style": null,
           "ttft_p50_s": 0.37,
           "ttft_p99_s": 0.443
         },
@@ -2489,6 +2752,7 @@
           "survival": [],
           "tpot_p50_ms": 42.51,
           "tpot_p99_ms": 68.94,
+          "tps_by_style": null,
           "ttft_p50_s": 0.303,
           "ttft_p99_s": 12.738
         }
@@ -2723,6 +2987,7 @@
           "survival": [],
           "tpot_p50_ms": 14.08,
           "tpot_p99_ms": 17.16,
+          "tps_by_style": null,
           "ttft_p50_s": 0.103,
           "ttft_p99_s": 0.139
         },
@@ -2743,6 +3008,7 @@
           "survival": [],
           "tpot_p50_ms": 65.72,
           "tpot_p99_ms": 86.19,
+          "tps_by_style": null,
           "ttft_p50_s": 0.406,
           "ttft_p99_s": 0.498
         },
@@ -2763,6 +3029,7 @@
           "survival": [],
           "tpot_p50_ms": 42.9,
           "tpot_p99_ms": 56.17,
+          "tps_by_style": null,
           "ttft_p50_s": 0.28,
           "ttft_p99_s": 0.362
         },
@@ -2783,6 +3050,7 @@
           "survival": [],
           "tpot_p50_ms": 40.98,
           "tpot_p99_ms": 76.31,
+          "tps_by_style": null,
           "ttft_p50_s": 0.259,
           "ttft_p99_s": 7.723
         }
@@ -2971,6 +3239,7 @@
           "survival": [],
           "tpot_p50_ms": 16.73,
           "tpot_p99_ms": 20.38,
+          "tps_by_style": null,
           "ttft_p50_s": 0.125,
           "ttft_p99_s": 0.148
         },
@@ -2991,6 +3260,7 @@
           "survival": [],
           "tpot_p50_ms": 34.08,
           "tpot_p99_ms": 43.29,
+          "tps_by_style": null,
           "ttft_p50_s": 0.254,
           "ttft_p99_s": 0.32
         },
@@ -3011,6 +3281,7 @@
           "survival": [],
           "tpot_p50_ms": 52.04,
           "tpot_p99_ms": 69.63,
+          "tps_by_style": null,
           "ttft_p50_s": 0.359,
           "ttft_p99_s": 0.441
         },
@@ -3031,6 +3302,7 @@
           "survival": [],
           "tpot_p50_ms": 40.21,
           "tpot_p99_ms": 65.11,
+          "tps_by_style": null,
           "ttft_p50_s": 0.296,
           "ttft_p99_s": 10.817
         }
@@ -3053,6 +3325,7 @@
           "survival": [],
           "tpot_p50_ms": 17.29,
           "tpot_p99_ms": 20.66,
+          "tps_by_style": null,
           "ttft_p50_s": 0.124,
           "ttft_p99_s": 0.15
         },
@@ -3073,6 +3346,7 @@
           "survival": [],
           "tpot_p50_ms": 53.64,
           "tpot_p99_ms": 69.35,
+          "tps_by_style": null,
           "ttft_p50_s": 14.198,
           "ttft_p99_s": 16.88
         },
@@ -3093,6 +3367,7 @@
           "survival": [],
           "tpot_p50_ms": 53.47,
           "tpot_p99_ms": 70.79,
+          "tps_by_style": null,
           "ttft_p50_s": 0.358,
           "ttft_p99_s": 0.452
         }
@@ -3383,6 +3658,7 @@
           "survival": [],
           "tpot_p50_ms": 13.41,
           "tpot_p99_ms": 16.44,
+          "tps_by_style": null,
           "ttft_p50_s": 0.098,
           "ttft_p99_s": 0.124
         },
@@ -3403,6 +3679,7 @@
           "survival": [],
           "tpot_p50_ms": 63.95,
           "tpot_p99_ms": 83.78,
+          "tps_by_style": null,
           "ttft_p50_s": 0.4,
           "ttft_p99_s": 0.488
         },
@@ -3423,6 +3700,7 @@
           "survival": [],
           "tpot_p50_ms": 40.92,
           "tpot_p99_ms": 55.29,
+          "tps_by_style": null,
           "ttft_p50_s": 0.29,
           "ttft_p99_s": 0.349
         },
@@ -3443,6 +3721,7 @@
           "survival": [],
           "tpot_p50_ms": 38.25,
           "tpot_p99_ms": 73.31,
+          "tps_by_style": null,
           "ttft_p50_s": 0.25,
           "ttft_p99_s": 6.716
         }
@@ -3465,6 +3744,7 @@
           "survival": [],
           "tpot_p50_ms": 14.04,
           "tpot_p99_ms": 16.84,
+          "tps_by_style": null,
           "ttft_p50_s": 0.1,
           "ttft_p99_s": 0.123
         },
@@ -3485,6 +3765,7 @@
           "survival": [],
           "tpot_p50_ms": 65.95,
           "tpot_p99_ms": 84.85,
+          "tps_by_style": null,
           "ttft_p50_s": 0.399,
           "ttft_p99_s": 0.48
         },
@@ -3505,6 +3786,7 @@
           "survival": [],
           "tpot_p50_ms": 41.61,
           "tpot_p99_ms": 55.02,
+          "tps_by_style": null,
           "ttft_p50_s": 0.289,
           "ttft_p99_s": 0.344
         }
@@ -3751,6 +4033,7 @@
           "survival": [],
           "tpot_p50_ms": 16.65,
           "tpot_p99_ms": 20.36,
+          "tps_by_style": null,
           "ttft_p50_s": 0.159,
           "ttft_p99_s": 0.19
         },
@@ -3771,6 +4054,7 @@
           "survival": [],
           "tpot_p50_ms": 51.74,
           "tpot_p99_ms": 67.98,
+          "tps_by_style": null,
           "ttft_p50_s": 0.368,
           "ttft_p99_s": 0.441
         }
@@ -3987,6 +4271,7 @@
           "survival": [],
           "tpot_p50_ms": 13.34,
           "tpot_p99_ms": 16.56,
+          "tps_by_style": null,
           "ttft_p50_s": 0.129,
           "ttft_p99_s": 0.157
         },
@@ -4007,6 +4292,7 @@
           "survival": [],
           "tpot_p50_ms": 62.38,
           "tpot_p99_ms": 82.14,
+          "tps_by_style": null,
           "ttft_p50_s": 0.4,
           "ttft_p99_s": 0.493
         }
@@ -4231,6 +4517,7 @@
           "survival": [],
           "tpot_p50_ms": 16.42,
           "tpot_p99_ms": 19.91,
+          "tps_by_style": null,
           "ttft_p50_s": 0.156,
           "ttft_p99_s": 0.196
         },
@@ -4251,6 +4538,7 @@
           "survival": [],
           "tpot_p50_ms": 33.85,
           "tpot_p99_ms": 43.35,
+          "tps_by_style": null,
           "ttft_p50_s": 0.266,
           "ttft_p99_s": 0.319
         },
@@ -4271,6 +4559,7 @@
           "survival": [],
           "tpot_p50_ms": 50.93,
           "tpot_p99_ms": 68.71,
+          "tps_by_style": null,
           "ttft_p50_s": 0.366,
           "ttft_p99_s": 0.44
         },
@@ -4291,6 +4580,7 @@
           "survival": [],
           "tpot_p50_ms": 37.92,
           "tpot_p99_ms": 63.26,
+          "tps_by_style": null,
           "ttft_p50_s": 0.315,
           "ttft_p99_s": 10.233
         }
@@ -4313,6 +4603,7 @@
           "survival": [],
           "tpot_p50_ms": 16.52,
           "tpot_p99_ms": 20.44,
+          "tps_by_style": null,
           "ttft_p50_s": 0.154,
           "ttft_p99_s": 0.19
         },
@@ -4333,6 +4624,7 @@
           "survival": [],
           "tpot_p50_ms": 51.91,
           "tpot_p99_ms": 66.16,
+          "tps_by_style": null,
           "ttft_p50_s": 13.917,
           "ttft_p99_s": 16.756
         },
@@ -4353,6 +4645,7 @@
           "survival": [],
           "tpot_p50_ms": 52.54,
           "tpot_p99_ms": 68.36,
+          "tps_by_style": null,
           "ttft_p50_s": 0.371,
           "ttft_p99_s": 0.441
         }
@@ -4586,6 +4879,7 @@
           "survival": [],
           "tpot_p50_ms": 13.02,
           "tpot_p99_ms": 16.15,
+          "tps_by_style": null,
           "ttft_p50_s": 0.128,
           "ttft_p99_s": 0.155
         },
@@ -4606,6 +4900,7 @@
           "survival": [],
           "tpot_p50_ms": 63.08,
           "tpot_p99_ms": 84.12,
+          "tps_by_style": null,
           "ttft_p50_s": 0.407,
           "ttft_p99_s": 0.488
         },
@@ -4626,6 +4921,7 @@
           "survival": [],
           "tpot_p50_ms": 40.4,
           "tpot_p99_ms": 54.89,
+          "tps_by_style": null,
           "ttft_p50_s": 0.297,
           "ttft_p99_s": 0.369
         },
@@ -4646,6 +4942,7 @@
           "survival": [],
           "tpot_p50_ms": 36.88,
           "tpot_p99_ms": 72.82,
+          "tps_by_style": null,
           "ttft_p50_s": 0.28,
           "ttft_p99_s": 6.288
         }
@@ -4668,6 +4965,7 @@
           "survival": [],
           "tpot_p50_ms": 13.62,
           "tpot_p99_ms": 16.52,
+          "tps_by_style": null,
           "ttft_p50_s": 0.13,
           "ttft_p99_s": 0.15
         },
@@ -4688,6 +4986,7 @@
           "survival": [],
           "tpot_p50_ms": 65.17,
           "tpot_p99_ms": 83.12,
+          "tps_by_style": null,
           "ttft_p50_s": 0.404,
           "ttft_p99_s": 0.475
         },
@@ -4708,6 +5007,7 @@
           "survival": [],
           "tpot_p50_ms": 41.5,
           "tpot_p99_ms": 55.71,
+          "tps_by_style": null,
           "ttft_p50_s": 0.296,
           "ttft_p99_s": 0.372
         }
@@ -4984,6 +5284,16 @@
           ],
           "tpot_p50_ms": 15.85,
           "tpot_p99_ms": 19.15,
+          "tps_by_style": {
+            "code": {
+              "requests": 13,
+              "tps": 84.4
+            },
+            "prose": {
+              "requests": 54,
+              "tps": 58.6
+            }
+          },
           "ttft_p50_s": 0.152,
           "ttft_p99_s": 0.188
         },
@@ -5016,6 +5326,16 @@
           ],
           "tpot_p50_ms": 32.9,
           "tpot_p99_ms": 42.33,
+          "tps_by_style": {
+            "code": {
+              "requests": 19,
+              "tps": 44.7
+            },
+            "prose": {
+              "requests": 108,
+              "tps": 28.4
+            }
+          },
           "ttft_p50_s": 0.26,
           "ttft_p99_s": 0.311
         },
@@ -5048,6 +5368,16 @@
           ],
           "tpot_p50_ms": 49.68,
           "tpot_p99_ms": 68.14,
+          "tps_by_style": {
+            "code": {
+              "requests": 23,
+              "tps": 30.8
+            },
+            "prose": {
+              "requests": 144,
+              "tps": 18.6
+            }
+          },
           "ttft_p50_s": 0.359,
           "ttft_p99_s": 0.466
         },
@@ -5080,6 +5410,16 @@
           ],
           "tpot_p50_ms": 36.22,
           "tpot_p99_ms": 62.67,
+          "tps_by_style": {
+            "code": {
+              "requests": 19,
+              "tps": 35.7
+            },
+            "prose": {
+              "requests": 103,
+              "tps": 20.6
+            }
+          },
           "ttft_p50_s": 0.312,
           "ttft_p99_s": 9.258
         }
@@ -5114,6 +5454,16 @@
           ],
           "tpot_p50_ms": 15.92,
           "tpot_p99_ms": 19.69,
+          "tps_by_style": {
+            "code": {
+              "requests": 13,
+              "tps": 79.7
+            },
+            "prose": {
+              "requests": 53,
+              "tps": 57.7
+            }
+          },
           "ttft_p50_s": 0.147,
           "ttft_p99_s": 0.187
         },
@@ -5146,6 +5496,16 @@
           ],
           "tpot_p50_ms": 52.06,
           "tpot_p99_ms": 67.48,
+          "tps_by_style": {
+            "code": {
+              "requests": 18,
+              "tps": 11.6
+            },
+            "prose": {
+              "requests": 136,
+              "tps": 9.4
+            }
+          },
           "ttft_p50_s": 13.76,
           "ttft_p99_s": 16.555
         },
@@ -5178,6 +5538,16 @@
           ],
           "tpot_p50_ms": 51.57,
           "tpot_p99_ms": 67.29,
+          "tps_by_style": {
+            "code": {
+              "requests": 22,
+              "tps": 27.4
+            },
+            "prose": {
+              "requests": 139,
+              "tps": 18.2
+            }
+          },
           "ttft_p50_s": 0.362,
           "ttft_p99_s": 0.477
         }
@@ -5539,6 +5909,16 @@
           ],
           "tpot_p50_ms": 12.56,
           "tpot_p99_ms": 15.49,
+          "tps_by_style": {
+            "code": {
+              "requests": 13,
+              "tps": 106.0
+            },
+            "prose": {
+              "requests": 70,
+              "tps": 73.6
+            }
+          },
           "ttft_p50_s": 0.121,
           "ttft_p99_s": 0.151
         },
@@ -5571,6 +5951,16 @@
           ],
           "tpot_p50_ms": 61.75,
           "tpot_p99_ms": 80.95,
+          "tps_by_style": {
+            "code": {
+              "requests": 35,
+              "tps": 25.8
+            },
+            "prose": {
+              "requests": 233,
+              "tps": 15.1
+            }
+          },
           "ttft_p50_s": 0.396,
           "ttft_p99_s": 0.471
         },
@@ -5603,6 +5993,16 @@
           ],
           "tpot_p50_ms": 40.01,
           "tpot_p99_ms": 53.26,
+          "tps_by_style": {
+            "code": {
+              "requests": 26,
+              "tps": 38.4
+            },
+            "prose": {
+              "requests": 185,
+              "tps": 23.4
+            }
+          },
           "ttft_p50_s": 0.286,
           "ttft_p99_s": 0.347
         },
@@ -5635,6 +6035,16 @@
           ],
           "tpot_p50_ms": 34.69,
           "tpot_p99_ms": 70.52,
+          "tps_by_style": {
+            "code": {
+              "requests": 25,
+              "tps": 40.1
+            },
+            "prose": {
+              "requests": 168,
+              "tps": 23.3
+            }
+          },
           "ttft_p50_s": 0.267,
           "ttft_p99_s": 6.106
         }
@@ -5669,6 +6079,16 @@
           ],
           "tpot_p50_ms": 13.03,
           "tpot_p99_ms": 15.97,
+          "tps_by_style": {
+            "code": {
+              "requests": 13,
+              "tps": 98.1
+            },
+            "prose": {
+              "requests": 68,
+              "tps": 71.5
+            }
+          },
           "ttft_p50_s": 0.12,
           "ttft_p99_s": 0.144
         },
@@ -5701,6 +6121,16 @@
           ],
           "tpot_p50_ms": 64.04,
           "tpot_p99_ms": 82.16,
+          "tps_by_style": {
+            "code": {
+              "requests": 34,
+              "tps": 24.0
+            },
+            "prose": {
+              "requests": 228,
+              "tps": 14.9
+            }
+          },
           "ttft_p50_s": 0.395,
           "ttft_p99_s": 0.461
         },
@@ -5733,6 +6163,16 @@
           ],
           "tpot_p50_ms": 40.6,
           "tpot_p99_ms": 51.93,
+          "tps_by_style": {
+            "code": {
+              "requests": 26,
+              "tps": 36.1
+            },
+            "prose": {
+              "requests": 182,
+              "tps": 23.0
+            }
+          },
           "ttft_p50_s": 0.288,
           "ttft_p99_s": 0.374
         }
@@ -6061,6 +6501,16 @@
           ],
           "tpot_p50_ms": 15.27,
           "tpot_p99_ms": 18.83,
+          "tps_by_style": {
+            "code": {
+              "requests": 13,
+              "tps": 86.8
+            },
+            "prose": {
+              "requests": 57,
+              "tps": 60.3
+            }
+          },
           "ttft_p50_s": 0.15,
           "ttft_p99_s": 0.181
         },
@@ -6093,6 +6543,16 @@
           ],
           "tpot_p50_ms": 32.47,
           "tpot_p99_ms": 40.56,
+          "tps_by_style": {
+            "code": {
+              "requests": 20,
+              "tps": 44.6
+            },
+            "prose": {
+              "requests": 108,
+              "tps": 29.1
+            }
+          },
           "ttft_p50_s": 0.268,
           "ttft_p99_s": 0.325
         },
@@ -6125,6 +6585,16 @@
           ],
           "tpot_p50_ms": 49.03,
           "tpot_p99_ms": 66.5,
+          "tps_by_style": {
+            "code": {
+              "requests": 23,
+              "tps": 30.3
+            },
+            "prose": {
+              "requests": 146,
+              "tps": 18.9
+            }
+          },
           "ttft_p50_s": 0.378,
           "ttft_p99_s": 0.469
         },
@@ -6157,6 +6627,16 @@
           ],
           "tpot_p50_ms": 34.16,
           "tpot_p99_ms": 60.55,
+          "tps_by_style": {
+            "code": {
+              "requests": 19,
+              "tps": 36.1
+            },
+            "prose": {
+              "requests": 103,
+              "tps": 21.3
+            }
+          },
           "ttft_p50_s": 0.307,
           "ttft_p99_s": 9.012
         }
@@ -6191,6 +6671,16 @@
           ],
           "tpot_p50_ms": 15.78,
           "tpot_p99_ms": 18.45,
+          "tps_by_style": {
+            "code": {
+              "requests": 13,
+              "tps": 81.3
+            },
+            "prose": {
+              "requests": 55,
+              "tps": 59.8
+            }
+          },
           "ttft_p50_s": 0.145,
           "ttft_p99_s": 0.178
         },
@@ -6223,6 +6713,16 @@
           ],
           "tpot_p50_ms": 50.54,
           "tpot_p99_ms": 66.36,
+          "tps_by_style": {
+            "code": {
+              "requests": 18,
+              "tps": 11.9
+            },
+            "prose": {
+              "requests": 139,
+              "tps": 9.5
+            }
+          },
           "ttft_p50_s": 13.528,
           "ttft_p99_s": 16.365
         },
@@ -6255,6 +6755,16 @@
           ],
           "tpot_p50_ms": 50.13,
           "tpot_p99_ms": 66.56,
+          "tps_by_style": {
+            "code": {
+              "requests": 22,
+              "tps": 28.9
+            },
+            "prose": {
+              "requests": 144,
+              "tps": 18.6
+            }
+          },
           "ttft_p50_s": 0.377,
           "ttft_p99_s": 0.468
         }
@@ -6388,6 +6898,475 @@
           "verdict": "same"
         }
       ]
+    },
+    {
+      "date": "",
+      "grid": {
+        "geomean_ms": 21.187,
+        "shape_count": 15,
+        "shapes": [
+          {
+            "ci95_pct": 0.67,
+            "context_len": 4096,
+            "label": "decode 1x2 rows @4K",
+            "num_reqs": 1,
+            "num_tokens": 2,
+            "step_ms": 18.737
+          },
+          {
+            "ci95_pct": 0.54,
+            "context_len": 4096,
+            "label": "decode 4x8 rows @4K",
+            "num_reqs": 4,
+            "num_tokens": 8,
+            "step_ms": 20.648
+          },
+          {
+            "ci95_pct": 0.37,
+            "context_len": 4096,
+            "label": "decode 8x16 rows @4K",
+            "num_reqs": 8,
+            "num_tokens": 16,
+            "step_ms": 21.668
+          },
+          {
+            "ci95_pct": 0.62,
+            "context_len": 4096,
+            "label": "decode 1x3 rows @4K",
+            "num_reqs": 1,
+            "num_tokens": 3,
+            "step_ms": 18.849
+          },
+          {
+            "ci95_pct": 0.44,
+            "context_len": 4096,
+            "label": "decode 4x12 rows @4K",
+            "num_reqs": 4,
+            "num_tokens": 12,
+            "step_ms": 21.078
+          },
+          {
+            "ci95_pct": 0.51,
+            "context_len": 4096,
+            "label": "decode 8x24 rows @4K",
+            "num_reqs": 8,
+            "num_tokens": 24,
+            "step_ms": 23.196
+          },
+          {
+            "ci95_pct": 0.68,
+            "context_len": 4096,
+            "label": "decode 1x6 rows @4K",
+            "num_reqs": 1,
+            "num_tokens": 6,
+            "step_ms": 19.598
+          },
+          {
+            "ci95_pct": 0.57,
+            "context_len": 4096,
+            "label": "decode 2x12 rows @4K",
+            "num_reqs": 2,
+            "num_tokens": 12,
+            "step_ms": 20.489
+          },
+          {
+            "ci95_pct": 0.51,
+            "context_len": 4096,
+            "label": "decode 4x24 rows @4K",
+            "num_reqs": 4,
+            "num_tokens": 24,
+            "step_ms": 23.29
+          },
+          {
+            "ci95_pct": 0.36,
+            "context_len": 4096,
+            "label": "decode 8x48 rows @4K",
+            "num_reqs": 8,
+            "num_tokens": 48,
+            "step_ms": 28.808
+          },
+          {
+            "ci95_pct": 0.52,
+            "context_len": 65536,
+            "label": "decode 1x3 rows @64K",
+            "num_reqs": 1,
+            "num_tokens": 3,
+            "step_ms": 19.253
+          },
+          {
+            "ci95_pct": 0.46,
+            "context_len": 65536,
+            "label": "decode 8x24 rows @64K",
+            "num_reqs": 8,
+            "num_tokens": 24,
+            "step_ms": 23.175
+          },
+          {
+            "ci95_pct": 0.41,
+            "context_len": 262144,
+            "label": "decode 1x3 rows @256K",
+            "num_reqs": 1,
+            "num_tokens": 3,
+            "step_ms": 19.091
+          },
+          {
+            "ci95_pct": 0.45,
+            "context_len": 262144,
+            "label": "decode 8x24 rows @256K",
+            "num_reqs": 8,
+            "num_tokens": 24,
+            "step_ms": 23.13
+          },
+          {
+            "ci95_pct": 0.54,
+            "context_len": 1040384,
+            "label": "decode 1x3 rows @1016K",
+            "num_reqs": 1,
+            "num_tokens": 3,
+            "step_ms": 18.968
+          }
+        ]
+      },
+      "id": "2026-11-07-spark-ds41f-1107-tp3-switched",
+      "image": "spark-ds41f:1107",
+      "path": "manifests/suites/2026-11-07-spark-ds41f-1107-tp3-switched",
+      "prefill": [],
+      "release": "2026-11-07-spark-ds41f-1107-tp3-switched",
+      "runs": {
+        "c1": {
+          "accepted_per_draft": 1.372,
+          "concurrency": 1,
+          "coverage": [
+            1.0,
+            0.863,
+            0.487,
+            0.259,
+            0.129
+          ],
+          "goodput_rps": null,
+          "mode": "closed",
+          "output_tokens_per_step": 2.371,
+          "output_tps": 62.35,
+          "output_tps_ci95_pct": 3.93,
+          "per_user_tps_p50": 62.53,
+          "rate": 1.0,
+          "scheduled_tokens_per_step": 2.56,
+          "slo_attainment_pct": null,
+          "steps_per_s": 26.33,
+          "survival": [
+            0.657,
+            0.38,
+            0.181,
+            0.099,
+            0.055
+          ],
+          "tpot_p50_ms": 15.99,
+          "tpot_p99_ms": 19.6,
+          "tps_by_style": {
+            "code": {
+              "requests": 13,
+              "tps": 84.7
+            },
+            "prose": {
+              "requests": 54,
+              "tps": 58.4
+            }
+          },
+          "ttft_p50_s": 0.152,
+          "ttft_p99_s": 0.187
+        },
+        "c4": {
+          "accepted_per_draft": 1.386,
+          "concurrency": 4,
+          "coverage": [
+            1.0,
+            0.731,
+            0.413,
+            0.2,
+            0.102
+          ],
+          "goodput_rps": null,
+          "mode": "closed",
+          "output_tokens_per_step": 9.084,
+          "output_tps": 121.43,
+          "output_tps_ci95_pct": 1.59,
+          "per_user_tps_p50": 30.34,
+          "rate": 1.0,
+          "scheduled_tokens_per_step": 9.81,
+          "slo_attainment_pct": null,
+          "steps_per_s": 13.39,
+          "survival": [
+            0.678,
+            0.375,
+            0.187,
+            0.093,
+            0.052
+          ],
+          "tpot_p50_ms": 32.95,
+          "tpot_p99_ms": 42.14,
+          "tps_by_style": {
+            "code": {
+              "requests": 19,
+              "tps": 43.4
+            },
+            "prose": {
+              "requests": 109,
+              "tps": 28.5
+            }
+          },
+          "ttft_p50_s": 0.27,
+          "ttft_p99_s": 0.339
+        },
+        "c8": {
+          "accepted_per_draft": 1.376,
+          "concurrency": 8,
+          "coverage": [
+            1.0,
+            0.71,
+            0.396,
+            0.194,
+            0.105
+          ],
+          "goodput_rps": null,
+          "mode": "closed",
+          "output_tokens_per_step": 18.129,
+          "output_tps": 157.29,
+          "output_tps_ci95_pct": 0.84,
+          "per_user_tps_p50": 19.87,
+          "rate": 1.0,
+          "scheduled_tokens_per_step": 19.57,
+          "slo_attainment_pct": null,
+          "steps_per_s": 8.69,
+          "survival": [
+            0.675,
+            0.367,
+            0.187,
+            0.093,
+            0.053
+          ],
+          "tpot_p50_ms": 50.32,
+          "tpot_p99_ms": 67.83,
+          "tps_by_style": {
+            "code": {
+              "requests": 23,
+              "tps": 29.7
+            },
+            "prose": {
+              "requests": 143,
+              "tps": 18.5
+            }
+          },
+          "ttft_p50_s": 0.384,
+          "ttft_p99_s": 0.484
+        },
+        "poisson": {
+          "accepted_per_draft": 1.394,
+          "concurrency": 8,
+          "coverage": [
+            1.0,
+            0.767,
+            0.445,
+            0.217,
+            0.109
+          ],
+          "goodput_rps": 0.337,
+          "mode": "poisson",
+          "output_tokens_per_step": 9.776,
+          "output_tps": 118.96,
+          "output_tps_ci95_pct": 17.08,
+          "per_user_tps_p50": 27.74,
+          "rate": 0.42,
+          "scheduled_tokens_per_step": 10.54,
+          "slo_attainment_pct": 73.2,
+          "steps_per_s": 13.81,
+          "survival": [
+            0.675,
+            0.381,
+            0.191,
+            0.096,
+            0.051
+          ],
+          "tpot_p50_ms": 35.94,
+          "tpot_p99_ms": 61.4,
+          "tps_by_style": {
+            "code": {
+              "requests": 19,
+              "tps": 34.4
+            },
+            "prose": {
+              "requests": 103,
+              "tps": 20.3
+            }
+          },
+          "ttft_p50_s": 0.327,
+          "ttft_p99_s": 9.765
+        }
+      },
+      "sampled": {
+        "c1": {
+          "accepted_per_draft": 1.334,
+          "concurrency": 1,
+          "coverage": [
+            1.0,
+            0.851,
+            0.48,
+            0.251,
+            0.117
+          ],
+          "goodput_rps": null,
+          "mode": "closed",
+          "output_tokens_per_step": 2.327,
+          "output_tps": 61.29,
+          "output_tps_ci95_pct": 4.75,
+          "per_user_tps_p50": 61.3,
+          "rate": 1.0,
+          "scheduled_tokens_per_step": 2.51,
+          "slo_attainment_pct": null,
+          "steps_per_s": 26.4,
+          "survival": [
+            0.644,
+            0.373,
+            0.18,
+            0.093,
+            0.045
+          ],
+          "tpot_p50_ms": 15.95,
+          "tpot_p99_ms": 19.68,
+          "tps_by_style": {
+            "code": {
+              "requests": 13,
+              "tps": 79.3
+            },
+            "prose": {
+              "requests": 53,
+              "tps": 57.8
+            }
+          },
+          "ttft_p50_s": 0.154,
+          "ttft_p99_s": 0.184
+        },
+        "c16": {
+          "accepted_per_draft": 1.311,
+          "concurrency": 16,
+          "coverage": [
+            1.0,
+            0.696,
+            0.369,
+            0.188,
+            0.092
+          ],
+          "goodput_rps": null,
+          "mode": "closed",
+          "output_tokens_per_step": 17.626,
+          "output_tps": 154.45,
+          "output_tps_ci95_pct": 0.81,
+          "per_user_tps_p50": 19.52,
+          "rate": 1.0,
+          "scheduled_tokens_per_step": 19.02,
+          "slo_attainment_pct": null,
+          "steps_per_s": 8.77,
+          "survival": [
+            0.661,
+            0.35,
+            0.17,
+            0.087,
+            0.043
+          ],
+          "tpot_p50_ms": 51.12,
+          "tpot_p99_ms": 65.92,
+          "tps_by_style": {
+            "code": {
+              "requests": 18,
+              "tps": 11.3
+            },
+            "prose": {
+              "requests": 135,
+              "tps": 9.4
+            }
+          },
+          "ttft_p50_s": 13.738,
+          "ttft_p99_s": 16.393
+        },
+        "c8": {
+          "accepted_per_draft": 1.311,
+          "concurrency": 8,
+          "coverage": [
+            1.0,
+            0.692,
+            0.368,
+            0.188,
+            0.092
+          ],
+          "goodput_rps": null,
+          "mode": "closed",
+          "output_tokens_per_step": 17.608,
+          "output_tps": 154.37,
+          "output_tps_ci95_pct": 1.15,
+          "per_user_tps_p50": 19.59,
+          "rate": 1.0,
+          "scheduled_tokens_per_step": 19.0,
+          "slo_attainment_pct": null,
+          "steps_per_s": 8.77,
+          "survival": [
+            0.66,
+            0.349,
+            0.17,
+            0.087,
+            0.045
+          ],
+          "tpot_p50_ms": 51.04,
+          "tpot_p99_ms": 67.32,
+          "tps_by_style": {
+            "code": {
+              "requests": 22,
+              "tps": 28.1
+            },
+            "prose": {
+              "requests": 140,
+              "tps": 18.2
+            }
+          },
+          "ttft_p50_s": 0.38,
+          "ttft_p99_s": 0.446
+        }
+      },
+      "stalls": {
+        "stall-3": {
+          "during_mean_s": 0.395,
+          "during_p90_s": 1.047,
+          "during_p99_s": 1.081,
+          "prefill_tps": 4663.1,
+          "probe_ttft_max_s": 1.475,
+          "probe_ttft_p50_s": 1.144,
+          "size": 131072,
+          "streams": 3
+        },
+        "stall-6": {
+          "during_mean_s": 0.413,
+          "during_p90_s": 1.058,
+          "during_p99_s": 1.113,
+          "prefill_tps": 4328.7,
+          "probe_ttft_max_s": 1.786,
+          "probe_ttft_p50_s": 1.346,
+          "size": 131072,
+          "streams": 6
+        },
+        "stall-7": {
+          "during_mean_s": 0.433,
+          "during_p90_s": 1.072,
+          "during_p99_s": 1.114,
+          "prefill_tps": 4632.7,
+          "probe_ttft_max_s": 0.0,
+          "probe_ttft_p50_s": 0.0,
+          "size": 131072,
+          "streams": 7
+        }
+      },
+      "started_utc": "2026-11-07T09:01:21+00:00",
+      "suite_version": 3,
+      "topology": "TP3",
+      "transport": "oneshot-switched",
+      "verdicts": []
     },
     {
       "date": "2026-11-07",
@@ -6623,6 +7602,16 @@
           ],
           "tpot_p50_ms": 11.92,
           "tpot_p99_ms": 14.71,
+          "tps_by_style": {
+            "code": {
+              "requests": 14,
+              "tps": 113.6
+            },
+            "prose": {
+              "requests": 74,
+              "tps": 77.8
+            }
+          },
           "ttft_p50_s": 0.116,
           "ttft_p99_s": 0.142
         },
@@ -6655,6 +7644,16 @@
           ],
           "tpot_p50_ms": 57.82,
           "tpot_p99_ms": 77.76,
+          "tps_by_style": {
+            "code": {
+              "requests": 39,
+              "tps": 27.0
+            },
+            "prose": {
+              "requests": 247,
+              "tps": 16.0
+            }
+          },
           "ttft_p50_s": 0.404,
           "ttft_p99_s": 0.476
         },
@@ -6687,6 +7686,16 @@
           ],
           "tpot_p50_ms": 37.73,
           "tpot_p99_ms": 52.44,
+          "tps_by_style": {
+            "code": {
+              "requests": 27,
+              "tps": 39.6
+            },
+            "prose": {
+              "requests": 193,
+              "tps": 24.5
+            }
+          },
           "ttft_p50_s": 0.293,
           "ttft_p99_s": 0.346
         },
@@ -6719,6 +7728,16 @@
           ],
           "tpot_p50_ms": 31.1,
           "tpot_p99_ms": 66.78,
+          "tps_by_style": {
+            "code": {
+              "requests": 25,
+              "tps": 43.9
+            },
+            "prose": {
+              "requests": 168,
+              "tps": 26.2
+            }
+          },
           "ttft_p50_s": 0.256,
           "ttft_p99_s": 4.631
         }
@@ -6753,6 +7772,16 @@
           ],
           "tpot_p50_ms": 12.5,
           "tpot_p99_ms": 15.22,
+          "tps_by_style": {
+            "code": {
+              "requests": 13,
+              "tps": 103.6
+            },
+            "prose": {
+              "requests": 72,
+              "tps": 75.9
+            }
+          },
           "ttft_p50_s": 0.112,
           "ttft_p99_s": 0.141
         },
@@ -6785,6 +7814,16 @@
           ],
           "tpot_p50_ms": 59.0,
           "tpot_p99_ms": 76.28,
+          "tps_by_style": {
+            "code": {
+              "requests": 37,
+              "tps": 25.4
+            },
+            "prose": {
+              "requests": 243,
+              "tps": 15.8
+            }
+          },
           "ttft_p50_s": 0.401,
           "ttft_p99_s": 0.466
         },
@@ -6817,6 +7856,16 @@
           ],
           "tpot_p50_ms": 38.85,
           "tpot_p99_ms": 51.15,
+          "tps_by_style": {
+            "code": {
+              "requests": 27,
+              "tps": 37.5
+            },
+            "prose": {
+              "requests": 189,
+              "tps": 24.2
+            }
+          },
           "ttft_p50_s": 0.291,
           "ttft_p99_s": 0.343
         }
@@ -6950,6 +7999,1086 @@
           "verdict": "better"
         }
       ]
+    },
+    {
+      "date": "",
+      "grid": {
+        "geomean_ms": 21.141,
+        "shape_count": 20,
+        "shapes": [
+          {
+            "ci95_pct": 0.69,
+            "context_len": 4096,
+            "label": "decode 1x2 rows @4K",
+            "num_reqs": 1,
+            "num_tokens": 2,
+            "step_ms": 15.669
+          },
+          {
+            "ci95_pct": 0.66,
+            "context_len": 4096,
+            "label": "decode 4x8 rows @4K",
+            "num_reqs": 4,
+            "num_tokens": 8,
+            "step_ms": 17.486
+          },
+          {
+            "ci95_pct": 0.55,
+            "context_len": 4096,
+            "label": "decode 8x16 rows @4K",
+            "num_reqs": 8,
+            "num_tokens": 16,
+            "step_ms": 19.765
+          },
+          {
+            "ci95_pct": 0.59,
+            "context_len": 4096,
+            "label": "decode 16x32 rows @4K",
+            "num_reqs": 16,
+            "num_tokens": 32,
+            "step_ms": 23.766
+          },
+          {
+            "ci95_pct": 0.72,
+            "context_len": 4096,
+            "label": "decode 1x3 rows @4K",
+            "num_reqs": 1,
+            "num_tokens": 3,
+            "step_ms": 16.105
+          },
+          {
+            "ci95_pct": 0.59,
+            "context_len": 4096,
+            "label": "decode 4x12 rows @4K",
+            "num_reqs": 4,
+            "num_tokens": 12,
+            "step_ms": 18.434
+          },
+          {
+            "ci95_pct": 0.51,
+            "context_len": 4096,
+            "label": "decode 8x24 rows @4K",
+            "num_reqs": 8,
+            "num_tokens": 24,
+            "step_ms": 21.61
+          },
+          {
+            "ci95_pct": 0.54,
+            "context_len": 4096,
+            "label": "decode 16x48 rows @4K",
+            "num_reqs": 16,
+            "num_tokens": 48,
+            "step_ms": 27.724
+          },
+          {
+            "ci95_pct": 0.71,
+            "context_len": 4096,
+            "label": "decode 1x6 rows @4K",
+            "num_reqs": 1,
+            "num_tokens": 6,
+            "step_ms": 16.669
+          },
+          {
+            "ci95_pct": 0.71,
+            "context_len": 4096,
+            "label": "decode 2x12 rows @4K",
+            "num_reqs": 2,
+            "num_tokens": 12,
+            "step_ms": 17.428
+          },
+          {
+            "ci95_pct": 0.44,
+            "context_len": 4096,
+            "label": "decode 4x24 rows @4K",
+            "num_reqs": 4,
+            "num_tokens": 24,
+            "step_ms": 21.407
+          },
+          {
+            "ci95_pct": 0.48,
+            "context_len": 4096,
+            "label": "decode 8x48 rows @4K",
+            "num_reqs": 8,
+            "num_tokens": 48,
+            "step_ms": 27.597
+          },
+          {
+            "ci95_pct": 0.43,
+            "context_len": 4096,
+            "label": "decode 12x72 rows @4K",
+            "num_reqs": 12,
+            "num_tokens": 72,
+            "step_ms": 36.648
+          },
+          {
+            "ci95_pct": 0.37,
+            "context_len": 4096,
+            "label": "decode 16x96 rows @4K",
+            "num_reqs": 16,
+            "num_tokens": 96,
+            "step_ms": 40.342
+          },
+          {
+            "ci95_pct": 0.8,
+            "context_len": 65536,
+            "label": "decode 1x3 rows @64K",
+            "num_reqs": 1,
+            "num_tokens": 3,
+            "step_ms": 16.46
+          },
+          {
+            "ci95_pct": 0.5,
+            "context_len": 65536,
+            "label": "decode 8x24 rows @64K",
+            "num_reqs": 8,
+            "num_tokens": 24,
+            "step_ms": 21.534
+          },
+          {
+            "ci95_pct": 0.37,
+            "context_len": 65536,
+            "label": "decode 16x48 rows @64K",
+            "num_reqs": 16,
+            "num_tokens": 48,
+            "step_ms": 27.486
+          },
+          {
+            "ci95_pct": 0.73,
+            "context_len": 262144,
+            "label": "decode 1x3 rows @256K",
+            "num_reqs": 1,
+            "num_tokens": 3,
+            "step_ms": 16.202
+          },
+          {
+            "ci95_pct": 0.61,
+            "context_len": 262144,
+            "label": "decode 8x24 rows @256K",
+            "num_reqs": 8,
+            "num_tokens": 24,
+            "step_ms": 21.572
+          },
+          {
+            "ci95_pct": 0.8,
+            "context_len": 1040384,
+            "label": "decode 1x3 rows @1016K",
+            "num_reqs": 1,
+            "num_tokens": 3,
+            "step_ms": 16.083
+          }
+        ]
+      },
+      "id": "2026-11-07-spark-ds41f-1107-tp4-switched",
+      "image": "spark-ds41f:1107",
+      "path": "manifests/suites/2026-11-07-spark-ds41f-1107-tp4-switched",
+      "prefill": [
+        {
+          "ci95_pct": 1.7,
+          "prompt_tokens": 32761,
+          "size": 32768,
+          "tps": 8471.5
+        },
+        {
+          "ci95_pct": 0.9,
+          "prompt_tokens": 131900,
+          "size": 131072,
+          "tps": 8612.6
+        },
+        {
+          "ci95_pct": 1.11,
+          "prompt_tokens": 262554,
+          "size": 262144,
+          "tps": 8209.2
+        },
+        {
+          "ci95_pct": 0.52,
+          "prompt_tokens": 522774,
+          "size": 524288,
+          "tps": 7417.0
+        },
+        {
+          "ci95_pct": 0.79,
+          "prompt_tokens": 994697,
+          "size": 1000000,
+          "tps": 5965.5
+        }
+      ],
+      "release": "2026-11-07-spark-ds41f-1107-tp4-switched",
+      "runs": {
+        "c1": {
+          "accepted_per_draft": 1.367,
+          "concurrency": 1,
+          "coverage": [
+            1.0,
+            0.859,
+            0.487,
+            0.246,
+            0.126
+          ],
+          "goodput_rps": null,
+          "mode": "closed",
+          "output_tokens_per_step": 2.365,
+          "output_tps": 79.81,
+          "output_tps_ci95_pct": 3.84,
+          "per_user_tps_p50": 80.94,
+          "rate": 1.0,
+          "scheduled_tokens_per_step": 2.55,
+          "slo_attainment_pct": null,
+          "steps_per_s": 33.78,
+          "survival": [
+            0.662,
+            0.378,
+            0.181,
+            0.092,
+            0.052
+          ],
+          "tpot_p50_ms": 12.35,
+          "tpot_p99_ms": 15.18,
+          "tps_by_style": {
+            "code": {
+              "requests": 13,
+              "tps": 110.5
+            },
+            "prose": {
+              "requests": 72,
+              "tps": 75.5
+            }
+          },
+          "ttft_p50_s": 0.118,
+          "ttft_p99_s": 0.146
+        },
+        "c16": {
+          "accepted_per_draft": 1.383,
+          "concurrency": 16,
+          "coverage": [
+            1.0,
+            0.595,
+            0.282,
+            0.144,
+            0.081
+          ],
+          "goodput_rps": null,
+          "mode": "closed",
+          "output_tokens_per_step": 34.301,
+          "output_tps": 262.47,
+          "output_tps_ci95_pct": 0.74,
+          "per_user_tps_p50": 16.47,
+          "rate": 1.0,
+          "scheduled_tokens_per_step": 37.04,
+          "slo_attainment_pct": null,
+          "steps_per_s": 7.66,
+          "survival": [
+            0.718,
+            0.362,
+            0.167,
+            0.087,
+            0.049
+          ],
+          "tpot_p50_ms": 60.7,
+          "tpot_p99_ms": 82.49,
+          "tps_by_style": {
+            "code": {
+              "requests": 35,
+              "tps": 26.1
+            },
+            "prose": {
+              "requests": 236,
+              "tps": 15.4
+            }
+          },
+          "ttft_p50_s": 0.423,
+          "ttft_p99_s": 0.504
+        },
+        "c8": {
+          "accepted_per_draft": 1.374,
+          "concurrency": 8,
+          "coverage": [
+            1.0,
+            0.715,
+            0.381,
+            0.198,
+            0.102
+          ],
+          "goodput_rps": null,
+          "mode": "closed",
+          "output_tokens_per_step": 18.1,
+          "output_tps": 199.52,
+          "output_tps_ci95_pct": 1.08,
+          "per_user_tps_p50": 25.3,
+          "rate": 1.0,
+          "scheduled_tokens_per_step": 19.55,
+          "slo_attainment_pct": null,
+          "steps_per_s": 11.03,
+          "survival": [
+            0.68,
+            0.371,
+            0.179,
+            0.094,
+            0.051
+          ],
+          "tpot_p50_ms": 39.46,
+          "tpot_p99_ms": 54.12,
+          "tps_by_style": {
+            "code": {
+              "requests": 27,
+              "tps": 37.9
+            },
+            "prose": {
+              "requests": 186,
+              "tps": 23.6
+            }
+          },
+          "ttft_p50_s": 0.306,
+          "ttft_p99_s": 0.395
+        },
+        "poisson": {
+          "accepted_per_draft": 1.388,
+          "concurrency": 8,
+          "coverage": [
+            1.0,
+            0.714,
+            0.391,
+            0.201,
+            0.106
+          ],
+          "goodput_rps": 0.653,
+          "mode": "poisson",
+          "output_tokens_per_step": 13.929,
+          "output_tps": 180.16,
+          "output_tps_ci95_pct": 14.24,
+          "per_user_tps_p50": 29.14,
+          "rate": 0.7,
+          "scheduled_tokens_per_step": 15.04,
+          "slo_attainment_pct": 92.5,
+          "steps_per_s": 14.57,
+          "survival": [
+            0.685,
+            0.371,
+            0.182,
+            0.096,
+            0.053
+          ],
+          "tpot_p50_ms": 34.03,
+          "tpot_p99_ms": 70.69,
+          "tps_by_style": {
+            "code": {
+              "requests": 24,
+              "tps": 40.3
+            },
+            "prose": {
+              "requests": 168,
+              "tps": 24.0
+            }
+          },
+          "ttft_p50_s": 0.277,
+          "ttft_p99_s": 6.013
+        }
+      },
+      "sampled": {
+        "c1": {
+          "accepted_per_draft": 1.317,
+          "concurrency": 1,
+          "coverage": [
+            1.0,
+            0.863,
+            0.481,
+            0.225,
+            0.103
+          ],
+          "goodput_rps": null,
+          "mode": "closed",
+          "output_tokens_per_step": 2.312,
+          "output_tps": 78.32,
+          "output_tps_ci95_pct": 2.9,
+          "per_user_tps_p50": 78.8,
+          "rate": 1.0,
+          "scheduled_tokens_per_step": 2.5,
+          "slo_attainment_pct": null,
+          "steps_per_s": 33.92,
+          "survival": [
+            0.655,
+            0.369,
+            0.171,
+            0.082,
+            0.04
+          ],
+          "tpot_p50_ms": 12.66,
+          "tpot_p99_ms": 15.5,
+          "tps_by_style": {
+            "code": {
+              "requests": 13,
+              "tps": 101.4
+            },
+            "prose": {
+              "requests": 70,
+              "tps": 74.5
+            }
+          },
+          "ttft_p50_s": 0.115,
+          "ttft_p99_s": 0.146
+        },
+        "c16": {
+          "accepted_per_draft": 1.319,
+          "concurrency": 16,
+          "coverage": [
+            1.0,
+            0.566,
+            0.272,
+            0.132,
+            0.07
+          ],
+          "goodput_rps": null,
+          "mode": "closed",
+          "output_tokens_per_step": 33.177,
+          "output_tps": 257.59,
+          "output_tps_ci95_pct": 0.64,
+          "per_user_tps_p50": 16.26,
+          "rate": 1.0,
+          "scheduled_tokens_per_step": 35.86,
+          "slo_attainment_pct": null,
+          "steps_per_s": 7.77,
+          "survival": [
+            0.704,
+            0.342,
+            0.157,
+            0.076,
+            0.041
+          ],
+          "tpot_p50_ms": 61.52,
+          "tpot_p99_ms": 81.08,
+          "tps_by_style": {
+            "code": {
+              "requests": 35,
+              "tps": 24.3
+            },
+            "prose": {
+              "requests": 235,
+              "tps": 15.2
+            }
+          },
+          "ttft_p50_s": 0.416,
+          "ttft_p99_s": 0.489
+        },
+        "c8": {
+          "accepted_per_draft": 1.309,
+          "concurrency": 8,
+          "coverage": [
+            1.0,
+            0.703,
+            0.367,
+            0.183,
+            0.094
+          ],
+          "goodput_rps": null,
+          "mode": "closed",
+          "output_tokens_per_step": 17.608,
+          "output_tps": 195.32,
+          "output_tps_ci95_pct": 0.92,
+          "per_user_tps_p50": 24.76,
+          "rate": 1.0,
+          "scheduled_tokens_per_step": 19.03,
+          "slo_attainment_pct": null,
+          "steps_per_s": 11.1,
+          "survival": [
+            0.662,
+            0.353,
+            0.166,
+            0.084,
+            0.044
+          ],
+          "tpot_p50_ms": 40.39,
+          "tpot_p99_ms": 53.25,
+          "tps_by_style": {
+            "code": {
+              "requests": 26,
+              "tps": 35.1
+            },
+            "prose": {
+              "requests": 182,
+              "tps": 23.2
+            }
+          },
+          "ttft_p50_s": 0.3,
+          "ttft_p99_s": 0.383
+        }
+      },
+      "stalls": {
+        "stall-11": {
+          "during_mean_s": 0.666,
+          "during_p90_s": 2.023,
+          "during_p99_s": 2.107,
+          "prefill_tps": 6367.0,
+          "probe_ttft_max_s": 2.281,
+          "probe_ttft_p50_s": 1.482,
+          "size": 131072,
+          "streams": 11
+        },
+        "stall-15": {
+          "during_mean_s": 0.747,
+          "during_p90_s": 2.069,
+          "during_p99_s": 2.133,
+          "prefill_tps": 6808.8,
+          "probe_ttft_max_s": 0.0,
+          "probe_ttft_p50_s": 0.0,
+          "size": 131072,
+          "streams": 15
+        },
+        "stall-3": {
+          "during_mean_s": 0.616,
+          "during_p90_s": 2.002,
+          "during_p99_s": 2.219,
+          "prefill_tps": 6659.4,
+          "probe_ttft_max_s": 2.051,
+          "probe_ttft_p50_s": 1.07,
+          "size": 131072,
+          "streams": 3
+        }
+      },
+      "started_utc": "2026-11-07T09:04:40+00:00",
+      "suite_version": 3,
+      "topology": "TP4",
+      "transport": "oneshot-switched",
+      "verdicts": []
+    },
+    {
+      "date": "",
+      "grid": {
+        "geomean_ms": 19.539,
+        "shape_count": 20,
+        "shapes": [
+          {
+            "ci95_pct": 0.85,
+            "context_len": 4096,
+            "label": "decode 1x2 rows @4K",
+            "num_reqs": 1,
+            "num_tokens": 2,
+            "step_ms": 11.595
+          },
+          {
+            "ci95_pct": 0.76,
+            "context_len": 4096,
+            "label": "decode 4x8 rows @4K",
+            "num_reqs": 4,
+            "num_tokens": 8,
+            "step_ms": 14.059
+          },
+          {
+            "ci95_pct": 0.54,
+            "context_len": 4096,
+            "label": "decode 8x16 rows @4K",
+            "num_reqs": 8,
+            "num_tokens": 16,
+            "step_ms": 18.233
+          },
+          {
+            "ci95_pct": 0.5,
+            "context_len": 4096,
+            "label": "decode 16x32 rows @4K",
+            "num_reqs": 16,
+            "num_tokens": 32,
+            "step_ms": 25.18
+          },
+          {
+            "ci95_pct": 0.92,
+            "context_len": 4096,
+            "label": "decode 1x3 rows @4K",
+            "num_reqs": 1,
+            "num_tokens": 3,
+            "step_ms": 11.845
+          },
+          {
+            "ci95_pct": 0.63,
+            "context_len": 4096,
+            "label": "decode 4x12 rows @4K",
+            "num_reqs": 4,
+            "num_tokens": 12,
+            "step_ms": 15.982
+          },
+          {
+            "ci95_pct": 0.53,
+            "context_len": 4096,
+            "label": "decode 8x24 rows @4K",
+            "num_reqs": 8,
+            "num_tokens": 24,
+            "step_ms": 21.527
+          },
+          {
+            "ci95_pct": 0.39,
+            "context_len": 4096,
+            "label": "decode 16x48 rows @4K",
+            "num_reqs": 16,
+            "num_tokens": 48,
+            "step_ms": 31.451
+          },
+          {
+            "ci95_pct": 0.72,
+            "context_len": 4096,
+            "label": "decode 1x6 rows @4K",
+            "num_reqs": 1,
+            "num_tokens": 6,
+            "step_ms": 12.404
+          },
+          {
+            "ci95_pct": 0.71,
+            "context_len": 4096,
+            "label": "decode 2x12 rows @4K",
+            "num_reqs": 2,
+            "num_tokens": 12,
+            "step_ms": 14.436
+          },
+          {
+            "ci95_pct": 0.67,
+            "context_len": 4096,
+            "label": "decode 4x24 rows @4K",
+            "num_reqs": 4,
+            "num_tokens": 24,
+            "step_ms": 21.81
+          },
+          {
+            "ci95_pct": 0.46,
+            "context_len": 4096,
+            "label": "decode 8x48 rows @4K",
+            "num_reqs": 8,
+            "num_tokens": 48,
+            "step_ms": 31.719
+          },
+          {
+            "ci95_pct": 0.25,
+            "context_len": 4096,
+            "label": "decode 12x72 rows @4K",
+            "num_reqs": 12,
+            "num_tokens": 72,
+            "step_ms": 43.471
+          },
+          {
+            "ci95_pct": 0.26,
+            "context_len": 4096,
+            "label": "decode 16x96 rows @4K",
+            "num_reqs": 16,
+            "num_tokens": 96,
+            "step_ms": 50.825
+          },
+          {
+            "ci95_pct": 0.86,
+            "context_len": 65536,
+            "label": "decode 1x3 rows @64K",
+            "num_reqs": 1,
+            "num_tokens": 3,
+            "step_ms": 12.007
+          },
+          {
+            "ci95_pct": 0.59,
+            "context_len": 65536,
+            "label": "decode 8x24 rows @64K",
+            "num_reqs": 8,
+            "num_tokens": 24,
+            "step_ms": 21.581
+          },
+          {
+            "ci95_pct": 0.35,
+            "context_len": 65536,
+            "label": "decode 16x48 rows @64K",
+            "num_reqs": 16,
+            "num_tokens": 48,
+            "step_ms": 31.55
+          },
+          {
+            "ci95_pct": 0.88,
+            "context_len": 262144,
+            "label": "decode 1x3 rows @256K",
+            "num_reqs": 1,
+            "num_tokens": 3,
+            "step_ms": 11.878
+          },
+          {
+            "ci95_pct": 0.58,
+            "context_len": 262144,
+            "label": "decode 8x24 rows @256K",
+            "num_reqs": 8,
+            "num_tokens": 24,
+            "step_ms": 21.582
+          },
+          {
+            "ci95_pct": 0.98,
+            "context_len": 1040384,
+            "label": "decode 1x3 rows @1016K",
+            "num_reqs": 1,
+            "num_tokens": 3,
+            "step_ms": 11.954
+          }
+        ]
+      },
+      "id": "2026-11-07-spark-ds41f-1107-tp8-switched",
+      "image": null,
+      "path": "manifests/suites/2026-11-07-spark-ds41f-1107-tp8-switched",
+      "prefill": [
+        {
+          "ci95_pct": 0.97,
+          "prompt_tokens": 32761,
+          "size": 32768,
+          "tps": 11176.3
+        },
+        {
+          "ci95_pct": 0.26,
+          "prompt_tokens": 131900,
+          "size": 131072,
+          "tps": 11369.3
+        },
+        {
+          "ci95_pct": 0.06,
+          "prompt_tokens": 262554,
+          "size": 262144,
+          "tps": 11044.5
+        },
+        {
+          "ci95_pct": 0.27,
+          "prompt_tokens": 522774,
+          "size": 524288,
+          "tps": 10267.2
+        },
+        {
+          "ci95_pct": 0.44,
+          "prompt_tokens": 994697,
+          "size": 1000000,
+          "tps": 8750.5
+        }
+      ],
+      "release": "2026-11-07-spark-ds41f-1107-tp8-switched",
+      "runs": {
+        "c1": {
+          "accepted_per_draft": 1.365,
+          "concurrency": 1,
+          "coverage": [
+            1.0,
+            0.875,
+            0.534,
+            0.248,
+            0.119
+          ],
+          "goodput_rps": null,
+          "mode": "closed",
+          "output_tokens_per_step": 2.361,
+          "output_tps": 115.47,
+          "output_tps_ci95_pct": 1.96,
+          "per_user_tps_p50": 114.72,
+          "rate": 1.0,
+          "scheduled_tokens_per_step": 2.55,
+          "slo_attainment_pct": null,
+          "steps_per_s": 48.93,
+          "survival": [
+            0.655,
+            0.38,
+            0.192,
+            0.091,
+            0.046
+          ],
+          "tpot_p50_ms": 8.72,
+          "tpot_p99_ms": 10.62,
+          "tps_by_style": {
+            "code": {
+              "requests": 18,
+              "tps": 156.3
+            },
+            "prose": {
+              "requests": 106,
+              "tps": 109.7
+            }
+          },
+          "ttft_p50_s": 0.084,
+          "ttft_p99_s": 0.098
+        },
+        "c16": {
+          "accepted_per_draft": 1.387,
+          "concurrency": 16,
+          "coverage": [
+            1.0,
+            0.59,
+            0.295,
+            0.151,
+            0.081
+          ],
+          "goodput_rps": null,
+          "mode": "closed",
+          "output_tokens_per_step": 34.471,
+          "output_tps": 370.58,
+          "output_tps_ci95_pct": 0.73,
+          "per_user_tps_p50": 23.31,
+          "rate": 1.0,
+          "scheduled_tokens_per_step": 37.22,
+          "slo_attainment_pct": null,
+          "steps_per_s": 10.75,
+          "survival": [
+            0.717,
+            0.361,
+            0.173,
+            0.089,
+            0.048
+          ],
+          "tpot_p50_ms": 42.82,
+          "tpot_p99_ms": 57.9,
+          "tps_by_style": {
+            "code": {
+              "requests": 51,
+              "tps": 37.1
+            },
+            "prose": {
+              "requests": 340,
+              "tps": 21.8
+            }
+          },
+          "ttft_p50_s": 0.301,
+          "ttft_p99_s": 0.359
+        },
+        "c8": {
+          "accepted_per_draft": 1.373,
+          "concurrency": 8,
+          "coverage": [
+            1.0,
+            0.711,
+            0.393,
+            0.203,
+            0.108
+          ],
+          "goodput_rps": null,
+          "mode": "closed",
+          "output_tokens_per_step": 18.1,
+          "output_tps": 289.84,
+          "output_tps_ci95_pct": 0.61,
+          "per_user_tps_p50": 36.65,
+          "rate": 1.0,
+          "scheduled_tokens_per_step": 19.54,
+          "slo_attainment_pct": null,
+          "steps_per_s": 16.02,
+          "survival": [
+            0.674,
+            0.366,
+            0.185,
+            0.096,
+            0.052
+          ],
+          "tpot_p50_ms": 27.28,
+          "tpot_p99_ms": 36.61,
+          "tps_by_style": {
+            "code": {
+              "requests": 40,
+              "tps": 55.1
+            },
+            "prose": {
+              "requests": 269,
+              "tps": 34.2
+            }
+          },
+          "ttft_p50_s": 0.209,
+          "ttft_p99_s": 0.261
+        },
+        "poisson": {
+          "accepted_per_draft": 1.386,
+          "concurrency": 8,
+          "coverage": [
+            1.0,
+            0.776,
+            0.437,
+            0.226,
+            0.112
+          ],
+          "goodput_rps": 0.707,
+          "mode": "poisson",
+          "output_tokens_per_step": 6.528,
+          "output_tps": 179.63,
+          "output_tps_ci95_pct": 16.14,
+          "per_user_tps_p50": 63.87,
+          "rate": 0.7,
+          "scheduled_tokens_per_step": 7.04,
+          "slo_attainment_pct": 100.0,
+          "steps_per_s": 29.15,
+          "survival": [
+            0.671,
+            0.376,
+            0.189,
+            0.099,
+            0.051
+          ],
+          "tpot_p50_ms": 15.54,
+          "tpot_p99_ms": 37.92,
+          "tps_by_style": {
+            "code": {
+              "requests": 25,
+              "tps": 82.2
+            },
+            "prose": {
+              "requests": 170,
+              "tps": 53.1
+            }
+          },
+          "ttft_p50_s": 0.139,
+          "ttft_p99_s": 0.267
+        }
+      },
+      "sampled": {
+        "c1": {
+          "accepted_per_draft": 1.286,
+          "concurrency": 1,
+          "coverage": [
+            1.0,
+            0.861,
+            0.488,
+            0.215,
+            0.101
+          ],
+          "goodput_rps": null,
+          "mode": "closed",
+          "output_tokens_per_step": 2.285,
+          "output_tps": 112.73,
+          "output_tps_ci95_pct": 1.42,
+          "per_user_tps_p50": 114.72,
+          "rate": 1.0,
+          "scheduled_tokens_per_step": 2.47,
+          "slo_attainment_pct": null,
+          "steps_per_s": 49.36,
+          "survival": [
+            0.643,
+            0.359,
+            0.173,
+            0.075,
+            0.037
+          ],
+          "tpot_p50_ms": 8.71,
+          "tpot_p99_ms": 10.7,
+          "tps_by_style": {
+            "code": {
+              "requests": 18,
+              "tps": 146.6
+            },
+            "prose": {
+              "requests": 103,
+              "tps": 107.3
+            }
+          },
+          "ttft_p50_s": 0.083,
+          "ttft_p99_s": 0.102
+        },
+        "c16": {
+          "accepted_per_draft": 1.322,
+          "concurrency": 16,
+          "coverage": [
+            1.0,
+            0.57,
+            0.269,
+            0.136,
+            0.072
+          ],
+          "goodput_rps": null,
+          "mode": "closed",
+          "output_tokens_per_step": 33.542,
+          "output_tps": 363.38,
+          "output_tps_ci95_pct": 0.69,
+          "per_user_tps_p50": 22.69,
+          "rate": 1.0,
+          "scheduled_tokens_per_step": 36.23,
+          "slo_attainment_pct": null,
+          "steps_per_s": 10.84,
+          "survival": [
+            0.705,
+            0.343,
+            0.155,
+            0.078,
+            0.041
+          ],
+          "tpot_p50_ms": 44.07,
+          "tpot_p99_ms": 57.66,
+          "tps_by_style": {
+            "code": {
+              "requests": 48,
+              "tps": 34.2
+            },
+            "prose": {
+              "requests": 338,
+              "tps": 21.5
+            }
+          },
+          "ttft_p50_s": 0.301,
+          "ttft_p99_s": 0.374
+        },
+        "c8": {
+          "accepted_per_draft": 1.319,
+          "concurrency": 8,
+          "coverage": [
+            1.0,
+            0.703,
+            0.375,
+            0.186,
+            0.093
+          ],
+          "goodput_rps": null,
+          "mode": "closed",
+          "output_tokens_per_step": 17.717,
+          "output_tps": 286.58,
+          "output_tps_ci95_pct": 0.58,
+          "per_user_tps_p50": 36.35,
+          "rate": 1.0,
+          "scheduled_tokens_per_step": 19.12,
+          "slo_attainment_pct": null,
+          "steps_per_s": 16.18,
+          "survival": [
+            0.665,
+            0.354,
+            0.172,
+            0.085,
+            0.043
+          ],
+          "tpot_p50_ms": 27.51,
+          "tpot_p99_ms": 35.56,
+          "tps_by_style": {
+            "code": {
+              "requests": 40,
+              "tps": 52.2
+            },
+            "prose": {
+              "requests": 265,
+              "tps": 33.9
+            }
+          },
+          "ttft_p50_s": 0.209,
+          "ttft_p99_s": 0.261
+        }
+      },
+      "stalls": {
+        "stall-11": {
+          "during_mean_s": 0.49,
+          "during_p90_s": 1.479,
+          "during_p99_s": 1.52,
+          "prefill_tps": 8624.4,
+          "probe_ttft_max_s": 1.604,
+          "probe_ttft_p50_s": 0.977,
+          "size": 131072,
+          "streams": 11
+        },
+        "stall-15": {
+          "during_mean_s": 0.541,
+          "during_p90_s": 1.487,
+          "during_p99_s": 1.532,
+          "prefill_tps": 9266.8,
+          "probe_ttft_max_s": 0.0,
+          "probe_ttft_p50_s": 0.0,
+          "size": 131072,
+          "streams": 15
+        },
+        "stall-3": {
+          "during_mean_s": 0.451,
+          "during_p90_s": 1.452,
+          "during_p99_s": 1.486,
+          "prefill_tps": 9441.9,
+          "probe_ttft_max_s": 1.632,
+          "probe_ttft_p50_s": 0.642,
+          "size": 131072,
+          "streams": 3
+        }
+      },
+      "started_utc": "2026-11-07T15:12:28+00:00",
+      "suite_version": 3,
+      "topology": "TP3",
+      "transport": null,
+      "verdicts": []
     }
   ],
   "timeline": [
@@ -7867,488 +9996,523 @@
 }
   </script>
   <script>
-    (function () {
-      const DATA = JSON.parse(document.getElementById("manifest-data").textContent);
+  (function () {
+    "use strict";
+    const DATA = JSON.parse(document.getElementById("manifest-data").textContent);
+    const REPO = "https://github.com/christopherowen/spark-ds41f";
+    const $ = (s, r) => (r || document).querySelector(s);
+    const esc = v => v === null || v === undefined ? "" : String(v)
+      .replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;").replace(/"/g, "&quot;");
+    const int = n => Math.round(n).toLocaleString("en-US");
+    const CARD = document.documentElement.classList.contains("og-mode");
+    const still = CARD || (window.matchMedia && window.matchMedia("(prefers-reduced-motion: reduce)").matches);
+    const WORDS = ["zero", "one", "two", "three", "four", "five", "six", "seven", "eight", "nine", "ten",
+      "eleven", "twelve", "thirteen", "fourteen", "fifteen", "sixteen"];
+    const word = n => WORDS[n] || String(n);
+    const cap = s => s.charAt(0).toUpperCase() + s.slice(1);
+    const shortRel = r => String(r).replace(/^\d{4}-\d{2}-\d{2}-/, "").replace(/^spark-ds41f-/, "").replace(/-tp\d.*$/, "");
 
-      // Theme toggle
-      const htmlEl = document.documentElement;
-      document.getElementById("theme-toggle").addEventListener("click", () => {
-        htmlEl.setAttribute("data-theme", htmlEl.getAttribute("data-theme") === "dark" ? "light" : "dark");
+    /* ---------- copy that is not in a manifest ---------- */
+    const GATES = [
+      ["Reference arithmetic", "DeepSeek's reference implementation, followed term for term: FP32 logits, an exact FP32 mHC projection, MoE partial sums rounded once."],
+      ["Batch invariance", "At temperature 0, your answer does not depend on who else happens to be in the batch."],
+      ["A determinism gate", "Repeated runs must agree to the token and the logprob, and match the release before. Release 1107 went 20 for 20, bit-identical, on five cluster shapes."],
+      ["NaNs stay NaNs", "Kernels keep a NaN instead of clamping it into something plausible. Ten kernel families carry non-finite contract tests."],
+      ["A fabric that fails loudly", "A collective that times out stops, and names the peer and the lane. There is no quiet fallback path to hide a bad cable."],
+      ["Quality, every promotion", "Release 1107: 648 release tests passed, RULER 26 of 26 from 4K to 256K, HumanEval+ 164 of 164, and a one-hour agent run with zero errors."],
+      ["The losing runs are kept", "More than 280 experiments live in the repository, each with its commands, its runs and its verdict, including the ones that lost."]
+    ];
+    const GAINERS = [
+      { tag: "On by default", name: "DSpark", aka: "the model's own drafter",
+        body: "Three extra layers draft up to five tokens ahead, and the full model checks them all in a single pass. Every accepted draft is a token you did not wait a step for.",
+        gain: "2.27", gainNote: "tokens accepted per decode step" },
+      { tag: "On by default", name: "CopyDrafter", aka: "drafts from what is already on the page",
+        body: "Agents and editors repeat their context constantly. CopyDrafter proposes the continuation straight from text already seen; ordinary prose is untouched and the bits stay identical.",
+        gain: "3.2×", gainNote: "tokens per step when the output copies its context" },
+      { tag: "On by default", name: "CED row skip", aka: "prefill that skips what nobody reads",
+        body: "In a long prompt only the final chunk needs the decoder's rows. Skipping them in every earlier chunk left each determinism digest exactly as it was.",
+        gain: "+11%", gainNote: "prefill, 32K to 500K prompts on three Sparks" },
+      { tag: "On by default", name: "Prefill yield", aka: "short requests do not queue behind long ones",
+        body: "A million-token prompt takes a while to read. A short question arriving in the middle takes the next step instead of waiting for the end.",
+        gain: "12 s → 1 s", gainNote: "first token beside a 131K prefill, across three releases" },
+      { tag: "On by default", name: "TileLang, end to end", aka: "one kernel family for the Spark's GPU",
+        body: "Attention, MoE, mHC, the vision tower and the vocabulary head are all TileLang kernels written for this chip, prepared once at boot and frozen before any distributed work begins.",
+        gain: "11 s", gainNote: "to prepare all 247 kernels on each Spark" },
+      { tag: "In the lab", lab: true, name: "LSA", aka: "latent sparse attention",
+        body: "Shortlist the KV blocks worth scoring from cheap block summaries, then score only those exactly. It ships switched off until a long-context quality evaluation says otherwise.",
+        gain: "3.2×", gainNote: "on the summary kernel; no serving claim yet" }
+    ];
+    const MORE = [
+      ["Any split from three to eight.", "The model has 64 experts and 4 attention heads, which do not divide by five or seven. Padded shards and cyclic head replication make every count work."],
+      ["One-shot RoCE collectives.", "sparknet moves each tensor-parallel reduction in a single RDMA exchange, timed on the GPU clock."],
+      ["Late admission.", "A new request joins at decoder layer 30 instead of the next step: first token 26 to 30% sooner under load."],
+      ["Expert scale codes.", "Routed-expert scales stored as 4-bit, then 2-bit codes freed about 2.1 GiB per Spark, which is what bought a million tokens on three."],
+      ["Weights in the display carve-out.", "On three Sparks, about 840 MiB of weights per machine live in memory reserved for a screen nobody plugged in."],
+      ["Cold boots that do not stall.", "Every kernel compiles before the ranks meet, so one empty cache cannot hang a cluster at startup."]
+    ];
+
+    /* ---------- theme ---------- */
+    $("#theme").addEventListener("click", () => {
+      const next = document.documentElement.getAttribute("data-theme") === "dark" ? "light" : "dark";
+      document.documentElement.setAttribute("data-theme", next);
+      try { localStorage.setItem("switchless-theme", next); } catch (e) {}
+    });
+
+    /* ---------- shapes and suites ---------- */
+    const fabricOf = s => /switched/.test(s.transport || s.name || "") ? "switched" : "switchless";
+    const SHAPES = DATA.shapes.map(s => Object.assign({ fabric: fabricOf(s) }, s));
+    const suiteFor = s => DATA.suites.find(x => x.path === s.benchmark_reference)
+      || DATA.suites.find(x => x.id === DATA.promoted_baseline + "-" + s.name) || null;
+    // One diagram entry per (fabric, node count): the first shape listed wins, so the 4 KiB variant stays in the table only.
+    const DIAGRAM = {};
+    SHAPES.forEach(s => { const k = s.fabric + s.nodes; if (!DIAGRAM[k]) DIAGRAM[k] = s; });
+    const counts = f => SHAPES.filter(s => s.fabric === f).map(s => s.nodes).filter((n, i, a) => a.indexOf(n) === i).sort((a, b) => a - b);
+    const HOW = {
+      "oneshot-ring4": "each Spark cabled to its two neighbours",
+      "oneshot-direct": "every Spark cabled to both of the others",
+      "oneshot-switched": "one cable each, into a switch"
+    };
+
+    function geometry(fabric, n, cx, cy, R) {
+      const off = fabric === "switched" || n % 2 ? -90 : -90 - 180 / n;
+      const pts = [];
+      for (let i = 0; i < n; i++) {
+        const a = (off + i * 360 / n) * Math.PI / 180;
+        pts.push([+(cx + R * Math.cos(a)).toFixed(1), +(cy + R * Math.sin(a)).toFixed(1)]);
+      }
+      let edges;
+      if (fabric === "switched") edges = pts.map(p => `M${p[0]},${p[1]} L${cx},${cy}`);
+      else if (n === 3) edges = pts.map((p, i) => `M${p[0]},${p[1]} L${pts[(i + 1) % n][0]},${pts[(i + 1) % n][1]}`);
+      else edges = pts.map((p, i) => `M${p[0]},${p[1]} A${R},${R} 0 0 1 ${pts[(i + 1) % n][0]},${pts[(i + 1) % n][1]}`);
+      return { pts, edges };
+    }
+
+    function glyph(fabric, n) {
+      const g = geometry(fabric, n, 15, 15, 11);
+      return `<svg class="glyph" viewBox="0 0 30 30" aria-hidden="true">${g.edges.map(d => `<path d="${d}"/>`).join("")}` +
+        g.pts.map(p => `<circle cx="${p[0]}" cy="${p[1]}" r="2.4"/>`).join("") + `</svg>`;
+    }
+
+    const state = { fabric: "switchless", nodes: 4 };
+    (function () {
+      const d = SHAPES.find(s => s.name === DATA.default_shape) || SHAPES[0];
+      state.fabric = d.fabric; state.nodes = d.nodes;
+    })();
+
+    function drawFabric() {
+      const { fabric, nodes: n } = state;
+      const cx = 220, cy = 200, R = n > 6 ? 150 : 142;
+      const g = geometry(fabric, n, cx, cy, R);
+      let out = "";
+      out += `<circle cx="${cx}" cy="${cy}" r="${R}" fill="none" stroke="var(--line)" stroke-dasharray="1 7"/>`;
+      g.edges.forEach((d, i) => {
+        out += `<path class="cable-glow" d="${d}"/><path class="cable" d="${d}" style="animation-delay:${i * 70}ms"/>`;
+      });
+      if (!still) {
+        g.edges.forEach((d, i) => {
+          const dur = (fabric === "switched" ? 1.5 : 2.3) + (i % 3) * 0.17;
+          out += `<circle class="pulse" r="2.6"><animateMotion dur="${dur}s" begin="-${(i * 0.31).toFixed(2)}s" repeatCount="indefinite" path="${d}"/></circle>`;
+          out += `<circle class="pulse" r="2.6"><animateMotion dur="${dur}s" begin="-${(i * 0.31 + dur / 2).toFixed(2)}s" repeatCount="indefinite" path="${d}" keyPoints="1;0" keyTimes="0;1" calcMode="linear"/></circle>`;
+        });
+      }
+      if (fabric === "switched") {
+        out += `<g class="hub"><rect x="${cx - 37}" y="${cy - 17}" width="74" height="34" rx="17"/><text x="${cx}" y="${cy + 4}">switch*</text></g>`;
+      } else {
+        out += `<circle class="hub-ghost" cx="${cx}" cy="${cy}" r="34"/><text class="hub-label" x="${cx}" y="${cy + 4}">no switch</text>`;
+      }
+      // A Spark, drawn as its own low slab: plain lid and flank, a foam front with a grip at each end.
+      const k = n <= 4 ? 1.6 : n <= 6 ? 1.34 : 1.08;
+      g.pts.forEach((p, i) => {
+        const at = (x, y) => `${(p[0] + x * k).toFixed(1)},${(p[1] + y * k).toFixed(1)}`;
+        const poly = (cls, pts) => `<polygon class="${cls}" points="${pts.map(q => at(q[0], q[1])).join(" ")}"/>`;
+        // The front face runs from its near corner (0, 7.5) to the right corner (26, -5.5) and is 11 tall.
+        const face = (u0, u1, v0, v1) => [[26 * u0, 7.5 - 13 * u0 + 11 * v0], [26 * u1, 7.5 - 13 * u1 + 11 * v0],
+          [26 * u1, 7.5 - 13 * u1 + 11 * v1], [26 * u0, 7.5 - 13 * u0 + 11 * v1]];
+        out += `<g class="node" style="transform-origin:${p[0]}px ${p[1]}px;animation-delay:${i * 60}ms">` +
+          poly("shade", [[0, -3], [29, 11.5], [0, 26], [-29, 11.5]]) +
+          poly("flank", [[-26, -5.5], [0, 7.5], [0, 18.5], [-26, 5.5]]) +
+          poly("face", face(0, 1, 0, 1)) +
+          poly("foam", face(0.25, 0.75, 0.1, 0.9)) +
+          poly("grip", face(0.07, 0.2, 0.2, 0.8)) +
+          poly("grip", face(0.8, 0.93, 0.2, 0.8)) +
+          poly("lid", [[0, -18.5], [26, -5.5], [0, 7.5], [-26, -5.5]]) +
+          `<text x="${p[0]}" y="${(p[1] - 2.2 * k).toFixed(1)}" font-size="${(8.4 * k).toFixed(1)}">${i + 1}</text></g>`;
+      });
+      out = `<defs><pattern id="foam" width="2.6" height="2.6" patternUnits="userSpaceOnUse" patternTransform="matrix(1 -0.5 0 1 0 0)">` +
+        `<circle cx="0.7" cy="0.7" r="0.42"/><circle cx="2" cy="1.9" r="0.36"/></pattern></defs>` + out;
+      // Only one SVG is drawn: a pattern defined inside a hidden SVG is not reliably available to a visible one.
+      $(CARD ? "#og-svg" : "#fabric-svg").innerHTML = out;
+    }
+
+    function tween(el, to, fmt) {
+      const from = parseFloat(el.dataset.v || "0");
+      el.dataset.v = to;
+      if (still || !isFinite(from) || from === to) { el.textContent = fmt(to); return; }
+      const t0 = performance.now(), dur = 520;
+      (function step(t) {
+        const k = Math.min(1, (t - t0) / dur), e = 1 - Math.pow(1 - k, 3);
+        el.textContent = fmt(from + (to - from) * e);
+        if (k < 1) requestAnimationFrame(step);
+      })(t0);
+    }
+
+    const CODE_TILE = $("#t-code-tile");
+
+    function selectShape() {
+      const list = counts(state.fabric);
+      if (list.indexOf(state.nodes) < 0) state.nodes = state.fabric === "switched" && list.indexOf(6) >= 0 ? 6 : list[list.length - 1];
+      const s = DIAGRAM[state.fabric + state.nodes];
+      document.querySelectorAll(".seg button").forEach(b => b.setAttribute("aria-pressed", String(b.dataset.fabric === state.fabric)));
+      $("#node-chips").innerHTML = `<span>Sparks</span>` + list.map(n =>
+        `<button type="button" data-n="${n}" aria-pressed="${n === state.nodes}">${n}</button>`).join("");
+      drawFabric();
+      $("#fabric-name").textContent = s.name;
+      $("#fabric-how").textContent = `${cap(word(s.nodes))} Sparks, ${HOW[s.transport] || s.transport}`;
+
+      const kv = s.kv_capacity;
+      tween($("#t-ctx"), s.max_model_len, int);
+      $("#t-ctx-d").textContent = "tokens in a single request";
+      tween($("#t-seq"), s.max_num_seqs, int);
+      $("#t-seq-d").textContent = `at once, ${int(kv.every_sequence_tokens)} tokens each with every seat full`;
+      tween($("#t-kv"), kv.vllm_capacity_tokens / 1e6, v => v.toFixed(1) + "M");
+      $("#t-kv-d").textContent = `tokens of KV kept warm: ${word(kv.full_contexts)} full contexts`;
+
+      const suite = suiteFor(s);
+      const tiles = $("#perf-tiles"), none = $("#perf-none");
+      if (!suite || !suite.runs || !suite.runs.c1) {
+        tiles.hidden = true; none.hidden = false;
+        none.innerHTML = s.qualified_release
+          ? `<code>${esc(s.name)}</code> is qualified by the release benchmark on ${word(s.nodes)} Sparks. A full serving suite is recorded for ${esc(suiteShapes())}; pick one of those to see its throughput.`
+          : `<code>${esc(s.name)}</code> has no release benchmark yet, so it shows no throughput.`;
+        $("#live-src").innerHTML = `<b>${esc(s.name)}</b> · ${esc(DATA.promoted_short)}`;
+      } else {
+        tiles.hidden = false; none.hidden = true;
+        const top = suite.runs.c16 ? 16 : 8, run = suite.runs["c" + top];
+        // A run whose request table names each prompt splits one stream into prose and code.
+        const one = suite.runs.c1, split = one.tps_by_style;
+        const firstToken = one.ttft_p50_s ? `; first token in ${one.ttft_p50_s.toFixed(2)} s` : "";
+        if (split && !CODE_TILE.isConnected) tiles.insertBefore(CODE_TILE, tiles.children[1]);
+        if (!split) CODE_TILE.remove();
+        tiles.classList.toggle("five", !!split);
+        $("#t-c1-k").textContent = split ? "One stream, prose" : "One stream";
+        tween($("#t-c1"), split ? split.prose.tps : one.output_tps, v => v.toFixed(1));
+        $("#t-c1-d").textContent = (split ? "decode, prose prompts" : "decode, one conversation") + firstToken;
+        if (split) tween($("#t-code", CODE_TILE), split.code.tps, v => v.toFixed(1));
+        $("#t-cn-k").textContent = `${cap(word(top))} streams`;
+        tween($("#t-cn"), run.output_tps, v => v.toFixed(1));
+        const pf = (suite.prefill || []).find(p => p.size === 131072) || (suite.prefill || [])[0];
+        const pfTile = $("#t-pf").closest(".tile");
+        pfTile.style.visibility = pf ? "" : "hidden";
+        if (pf) {
+          tween($("#t-pf"), pf.tps, int);
+          $("#t-pf-d").textContent = `reading a ${Math.round(pf.size / 1000)}K-token prompt`;
+        }
+        const st = (suite.stalls || {})["stall-3"];
+        const stTile = $("#t-st").closest(".tile");
+        stTile.style.visibility = st && st.probe_ttft_p50_s ? "" : "hidden";
+        if (st && st.probe_ttft_p50_s) tween($("#t-st"), st.probe_ttft_p50_s, v => v.toFixed(2));
+        $("#live-src").innerHTML = `<b>${esc(s.name)}</b> · ${esc(DATA.promoted_short)} · <a href="${REPO}/tree/main/${esc(suite.path)}" rel="noopener">${esc(suite.path)}</a>`;
+      }
+    }
+    function suiteShapes() {
+      return SHAPES.filter(s => { const x = suiteFor(s); return x && x.runs && x.runs.c1; }).map(s => s.name).join(", ");
+    }
+
+    document.querySelectorAll(".seg button").forEach(b => b.addEventListener("click", () => { state.fabric = b.dataset.fabric; selectShape(); }));
+    $("#node-chips").addEventListener("click", e => {
+      const b = e.target.closest("button"); if (!b) return;
+      state.nodes = +b.dataset.n; selectShape();
+    });
+    function plugIn(e) {
+      if (e) e.preventDefault();
+      state.fabric = state.fabric === "switched" ? "switchless" : "switched";
+      if (state.fabric === "switched") state.nodes = 6;
+      selectShape();
+      const box = $(".fabric").getBoundingClientRect();
+      if (box.top < 70 || box.bottom > window.innerHeight) $(".fabric").scrollIntoView({ behavior: still ? "auto" : "smooth", block: "center" });
+    }
+    $("#fn").addEventListener("click", plugIn);
+
+    /* ---------- static header bits ---------- */
+    $("#eyebrow-release").textContent = "release " + shortRel(DATA.promoted_short);
+    (function () {
+      const sw = counts("switched");
+      if (sw.length) $("#fn-range").textContent = `${cap(word(sw[0]))} to ${word(sw[sw.length - 1])} Sparks`;
+      $("#model-line").innerHTML = `Served: <code>${esc(DATA.model_repo)}</code> at <code>${esc(DATA.model_revision)}</code>.`;
+      $("#m-stock").textContent = DATA.served_models[0];
+      $("#m-glp").textContent = DATA.served_models[1];
+      if (DATA.glp && DATA.glp.repo) {
+        $("#glp-line").innerHTML = `Vector: <a href="https://huggingface.co/${esc(DATA.glp.repo)}" rel="noopener"><code>${esc(DATA.glp.repo.split("/")[0])}</code>'s GLP for this checkpoint</a>, pinned by revision and checksum like every other input.`;
+      }
+      $("#colophon").textContent = `${DATA.promoted_short} · image ${DATA.image_id.slice(0, 19)} · built ${String(DATA.built_utc || "").slice(0, 10)}`;
+    })();
+
+    /* ---------- story lists ---------- */
+    $("#gates").innerHTML = GATES.map(g => `<li><h3>${g[0]}</h3><p>${g[1]}</p></li>`).join("");
+    $("#gainers").innerHTML = GAINERS.map(c => `
+      <article class="card">
+        <span class="tag ${c.lab ? "lab" : ""}">${esc(c.tag)}</span>
+        <h3>${esc(c.name)}</h3>
+        <div class="aka">${esc(c.aka || "")}</div>
+        <p>${c.body}</p>
+        <div class="gain"><b>${esc(c.gain)}</b><span>${c.gainNote}</span></div>
+      </article>`).join("");
+    $("#more").innerHTML = MORE.map(m => `<div><b>${m[0]}</b> ${m[1]}</div>`).join("");
+
+    /* ---------- charts ---------- */
+    function niceTicks(lo, hi, count) {
+      const span = hi - lo || 1, raw = span / count, mag = Math.pow(10, Math.floor(Math.log10(raw)));
+      const step = [1, 2, 2.5, 5, 10].map(m => m * mag).find(s => s >= raw) || raw;
+      const a = Math.floor(lo / step) * step, b = Math.ceil(hi / step) * step, t = [];
+      for (let v = a; v <= b + step / 2; v += step) t.push(+v.toFixed(6));
+      return t;
+    }
+    const kfmt = v => v >= 1000 ? (v / 1000).toFixed(v % 1000 ? 1 : 0) + "k" : String(v);
+
+    // series: [{name, color, width, values: [number|null], label: bool}]
+    function lineChart(host, o) {
+      const W = 500, H = 300, L = 42, R = 86, T = 12, B = 32;
+      const vals = [];
+      o.series.forEach(s => s.values.forEach(v => { if (v != null) vals.push(v); }));
+      if (!vals.length) { host.innerHTML = `<h3>${esc(o.title)}</h3><p class="sub">No recorded runs for this fabric.</p>`; return; }
+      const min = Math.min.apply(null, vals), max = Math.max.apply(null, vals), pad = (max - min) * 0.12 || max * 0.1;
+      const ticks = niceTicks(Math.max(0, min - pad), max + pad, 4);
+      const y0 = ticks[0], y1 = ticks[ticks.length - 1];
+      const n = o.x.length;
+      const X = i => n === 1 ? L + (W - L - R) / 2 : L + i * (W - L - R) / (n - 1);
+      const Y = v => T + (1 - (v - y0) / (y1 - y0)) * (H - T - B);
+      let svg = "";
+      ticks.forEach(t => {
+        svg += `<line class="gridline" x1="${L}" x2="${W - R}" y1="${Y(t)}" y2="${Y(t)}"/><text x="${L - 8}" y="${Y(t) + 4}" text-anchor="end">${kfmt(t)}</text>`;
+      });
+      const every = n > 8 ? 2 : 1;
+      o.x.forEach((lb, i) => {
+        if (i % every && i !== n - 1) return;
+        svg += `<text x="${X(i)}" y="${H - 8}" text-anchor="middle">${esc(lb)}</text>`;
+      });
+      const ends = [];
+      o.series.forEach(s => {
+        const pts = s.values.map((v, i) => v == null ? null : [X(i), Y(v)]).filter(Boolean);
+        if (!pts.length) return;
+        svg += `<path d="${pts.map((p, i) => (i ? "L" : "M") + p[0].toFixed(1) + "," + p[1].toFixed(1)).join(" ")}" fill="none" stroke="${s.color}" stroke-width="${s.width || 2}" stroke-linejoin="round" stroke-linecap="round" opacity="${s.opacity || 1}"/>`;
+        if (s.label) {
+          if (pts.length === 1 || s.dots) pts.forEach(p => { svg += `<circle cx="${p[0]}" cy="${p[1]}" r="4" fill="${s.color}" stroke="var(--panel)" stroke-width="2"/>`; });
+          const last = pts[pts.length - 1];
+          svg += `<circle cx="${last[0]}" cy="${last[1]}" r="4.5" fill="${s.color}" stroke="var(--panel)" stroke-width="2"/>`;
+          ends.push({ y: last[1], x: last[0], text: s.endLabel || s.name });
+        }
+      });
+      ends.sort((a, b) => a.y - b.y);
+      for (let i = 1; i < ends.length; i++) if (ends[i].y - ends[i - 1].y < 14) ends[i].y = ends[i - 1].y + 14;
+      ends.forEach(e => { svg += `<text class="dl" x="${e.x + 10}" y="${e.y + 4}">${esc(e.text)}</text>`; });
+      svg += `<line id="x" y1="${T}" y2="${H - B}" x1="0" x2="0" stroke="var(--line-2)" visibility="hidden"/>`;
+      svg += `<rect x="${L - 10}" y="${T}" width="${W - L - R + 20}" height="${H - T - B}" fill="transparent" id="hit"/>`;
+      const legend = o.series.filter(s => s.legend !== false).map(s => `<span><i style="background:${s.color};opacity:${s.opacity || 1}"></i>${esc(s.name)}</span>`).join("");
+      host.innerHTML = `<h3>${esc(o.title)}</h3><p class="sub">${esc(o.sub)}</p><div class="legend">${legend}</div>` +
+        `<svg viewBox="0 0 ${W} ${H}" role="img" aria-label="${esc(o.title)}">${svg}</svg><div class="tip"></div>`;
+      const tip = $(".tip", host), hit = $("#hit", host), rule = $("#x", host), el = $("svg", host);
+      const move = ev => {
+        const r = el.getBoundingClientRect(), px = (ev.clientX - r.left) / r.width * W;
+        let i = n === 1 ? 0 : Math.round((px - L) / ((W - L - R) / (n - 1)));
+        i = Math.max(0, Math.min(n - 1, i));
+        rule.setAttribute("x1", X(i)); rule.setAttribute("x2", X(i)); rule.setAttribute("visibility", "visible");
+        const rows = o.series.filter(s => s.values[i] != null && s.tip !== false)
+          .map(s => `<div class="r"><span><i style="background:${s.color}"></i>${esc(s.name)}</span><b>${o.fmt(s.values[i])}</b></div>`).join("");
+        tip.innerHTML = `<div class="t">${esc(o.xTip ? o.xTip[i] : o.x[i])}</div>${rows}`;
+        const hr = host.getBoundingClientRect(), tx = X(i) / W * r.width + (r.left - hr.left);
+        tip.style.left = Math.min(hr.width - 170, tx + 14) + "px";
+        tip.style.top = (r.top - hr.top + 8) + "px";
+        tip.classList.add("on");
+      };
+      hit.addEventListener("pointermove", move);
+      hit.addEventListener("pointerdown", move);
+      hit.addEventListener("pointerleave", () => { tip.classList.remove("on"); rule.setAttribute("visibility", "hidden"); });
+    }
+
+    /* ---------- numbers section ---------- */
+    const laneOf = s => {
+      const m = /tp(\d+)/.exec(s.id) || [];
+      const sw = /switched/.test(s.id + " " + (s.transport || ""));
+      return { n: +m[1] || 0, sw, key: `tp${m[1]}${sw ? "-switched" : ""}` };
+    };
+    const LANES = {};
+    DATA.suites.forEach(s => { const l = laneOf(s); s._lane = l; (LANES[l.key] = LANES[l.key] || []).push(s); });
+    const laneNames = { "tp4": "Four Sparks, ring", "tp3": "Three Sparks, triangle" };
+    const laneLabel = k => laneNames[k] || `${cap(word(+k.replace(/\D/g, "")))} Sparks, switched`;
+    const laneKeys = Object.keys(LANES).sort((a, b) => (LANES[b].length - LANES[a].length) || a.localeCompare(b));
+    const laneSel = $("#lane"), baseSel = $("#base"), candSel = $("#cand");
+    laneSel.innerHTML = laneKeys.map(k => `<option value="${k}">${esc(laneLabel(k))}</option>`).join("");
+    const defaultLane = (suiteFor(SHAPES.find(s => s.name === DATA.default_shape) || SHAPES[0]) || {})._lane;
+    if (defaultLane && LANES[defaultLane.key]) laneSel.value = defaultLane.key;
+
+    function fillReleases() {
+      const list = LANES[laneSel.value];
+      const opts = list.map(s => `<option value="${esc(s.id)}">${esc(shortRel(s.release))} · ${esc(s.date)}</option>`).join("");
+      baseSel.innerHTML = opts; candSel.innerHTML = opts;
+      baseSel.selectedIndex = Math.max(0, list.length - 2); candSel.selectedIndex = list.length - 1;
+      drawNumbers();
+    }
+    function delta(b, c, lowerBetter) {
+      if (!b || !c) return "–";
+      const p = (c - b) / b * 100, good = lowerBetter ? p < -0.3 : p > 0.3, bad = lowerBetter ? p > 0.3 : p < -0.3;
+      return `<span class="${good ? "up" : bad ? "down" : "flat"}">${p > 0 ? "+" : ""}${p.toFixed(1)}%</span>`;
+    }
+    function drawNumbers() {
+      const list = LANES[laneSel.value];
+      const base = list.find(s => s.id === baseSel.value) || list[0];
+      const cand = list.find(s => s.id === candSel.value) || list[list.length - 1];
+      const top = list.some(s => s.runs.c16) ? 16 : 8, mid = top / 2;
+      const col = k => list.map(s => s.runs[k] ? s.runs[k].output_tps : null);
+      lineChart($("#chart-decode"), {
+        title: "Decode throughput by release",
+        sub: "Output tokens per second, higher is better",
+        x: list.map(s => shortRel(s.release)), xTip: list.map(s => `${shortRel(s.release)} · ${s.date}`),
+        fmt: v => v.toFixed(1) + " tok/s",
+        series: [
+          { name: `${top} streams`, color: "var(--s3)", values: col("c" + top), label: true },
+          { name: `${mid} streams`, color: "var(--s2)", values: col("c" + mid), label: true },
+          { name: "1 stream", color: "var(--s1)", values: col("c1"), label: true }
+        ]
+      });
+      const sizes = [32768, 131072, 262144, 524288, 1000000];
+      const at = (s, z) => { const p = (s.prefill || []).find(q => q.size === z || (z === 524288 && q.size === 500000)); return p ? p.tps : null; };
+      const others = list.filter(s => s !== cand && s !== base && (s.prefill || []).length);
+      const ser = others.map((s, i) => ({ name: i ? shortRel(s.release) : "Earlier releases", color: "var(--ink-3)", width: 1.2, opacity: 0.45, values: sizes.map(z => at(s, z)), legend: i === 0, tip: false }));
+      if (base !== cand) ser.push({ name: shortRel(base.release), color: "var(--s2)", values: sizes.map(z => at(base, z)), label: true });
+      ser.push({ name: shortRel(cand.release), color: "var(--s1)", width: 2.4, values: sizes.map(z => at(cand, z)), label: true, dots: true });
+      lineChart($("#chart-prefill"), {
+        title: "Prefill throughput by prompt size",
+        sub: "Prompt tokens read per second, higher is better",
+        x: ["32K", "131K", "262K", "524K", "1M"], xTip: ["32K-token prompt", "131K-token prompt", "262K-token prompt", "524K-token prompt", "1M-token prompt"],
+        fmt: v => int(v) + " tok/s", series: ser
       });
 
-      function esc(str) {
-        if (str === null || str === undefined) return "";
-        return String(str)
-          .replace(/&/g, "&amp;")
-          .replace(/</g, "&lt;")
-          .replace(/>/g, "&gt;")
-          .replace(/"/g, "&quot;");
-      }
+      $("#th-base").textContent = shortRel(base.release);
+      $("#th-cand").textContent = shortRel(cand.release);
+      const rows = [];
+      const push = (name, b, c, f, lower, note) => { if (b == null && c == null) return; rows.push([name, b == null ? "–" : f(b), c == null ? "–" : f(c), delta(b, c, lower), note || ""]); };
+      const f1 = v => v.toFixed(1), f2 = v => v.toFixed(2);
+      ["c16", "c8", "c4", "c1"].forEach(k => {
+        const b = base.runs[k], c = cand.runs[k]; if (!b && !c) return;
+        const nstr = +k.slice(1), r = c || b;
+        push(`Decode, ${nstr === 1 ? "one stream" : word(nstr) + " streams"} (tok/s)`, b && b.output_tps, c && c.output_tps, f1, false,
+          r.ttft_p50_s ? `first token ${r.ttft_p50_s.toFixed(2)} s · ${r.tpot_p50_ms.toFixed(1)} ms per token` : "");
+        if (nstr !== 1) return;
+        const bs = b && b.tps_by_style, cs = c && c.tps_by_style, any = cs || bs;
+        if (!any) return;
+        [["prose", "prose prompts"], ["code", "Python and SQL prompts"]].forEach(([style, what]) =>
+          push(`Decode, one stream, ${style} (tok/s)`, bs && bs[style].tps, cs && cs[style].tps, f1, false,
+            `${any[style].requests} ${what} in the run`));
+      });
+      const bp = base.runs.poisson, cp = cand.runs.poisson;
+      if (bp || cp) push("Decode, random arrivals (tok/s)", bp && bp.output_tps, cp && cp.output_tps, f1, false, `Poisson, ${(cp || bp).rate} requests/s`);
+      ["c16", "c8", "c1"].forEach(k => {
+        const b = (base.sampled || {})[k], c = (cand.sampled || {})[k]; if (!b && !c) return;
+        push(`Sampled decode, ${word(+k.slice(1))} stream${k === "c1" ? "" : "s"} (tok/s)`, b && b.output_tps, c && c.output_tps, f1, false, "temperature 1.0, seeded");
+      });
+      sizes.forEach((z, i) => push(`Prefill, ${["32K", "131K", "262K", "524K", "1M"][i]} prompt (tok/s)`, at(base, z), at(cand, z), int, false, "uncached source text"));
+      Object.keys(cand.stalls || {}).sort((a, b) => cand.stalls[a].streams - cand.stalls[b].streams).forEach(k => {
+        const c = cand.stalls[k], b = (base.stalls || {})[k];
+        if (!c.probe_ttft_p50_s) return;
+        push(`First token beside a 131K prefill, ${c.streams} streams (s)`, b && b.probe_ttft_p50_s, c.probe_ttft_p50_s, f2, true, "short request arriving mid-prefill");
+      });
+      if (base.grid || cand.grid) push(`Decode step, geometric mean of ${(cand.grid || base.grid).shape_count} shapes (ms)`, base.grid && base.grid.geomean_ms, cand.grid && cand.grid.geomean_ms, f2, true, "fixed-shape engine grid");
+      $("#compare").innerHTML = rows.map(r => `<tr><td class="lead">${esc(r[0])}</td><td class="n">${r[1]}</td><td class="n">${r[2]}</td><td class="n">${r[3]}</td><td>${esc(r[4])}</td></tr>`).join("");
+    }
+    laneSel.addEventListener("change", fillReleases);
+    baseSel.addEventListener("change", drawNumbers);
+    candSel.addEventListener("change", drawNumbers);
 
-      // Render Hero
-      const tp4Shape = DATA.shapes.find(s => s.name === "tp4-ring") || DATA.shapes[0];
-      const tp3Shape = DATA.shapes.find(s => s.name === "tp3-triangle") || DATA.shapes[1];
-      const tp4Suite = DATA.suites.find(s => s.path === tp4Shape.benchmark_reference);
-      const tp3Suite = DATA.suites.find(s => s.path === tp3Shape.benchmark_reference);
+    /* ---------- shapes table ---------- */
+    $("#shape-rows").innerHTML = SHAPES.map(s => {
+      const kv = s.kv_capacity, m = s.memory;
+      return `<tr>
+        <td>${glyph(s.fabric, s.nodes)}</td>
+        <td class="lead nw"><code>${esc(s.name)}</code>${s.default ? '<span class="pill">default</span>' : ""}</td>
+        <td class="nw">${cap(word(s.nodes))} Sparks, ${s.fabric === "switched" ? "switched" : s.nodes === 3 ? "triangle" : "ring"}${s.page_size_bytes < 65536 ? " · stock 4 KiB kernel" : ""}</td>
+        <td class="n">${int(s.max_model_len)}</td>
+        <td class="n">${s.max_num_seqs}</td>
+        <td class="n">${kv.full_contexts} full contexts</td>
+        <td class="n">${m ? m.head_min_available_gib.toFixed(1) + " GiB" : "–"}</td>
+        <td>${s.qualified_release ? esc(shortRel(s.qualified_release)) : '<span class="flat">not yet</span>'}</td>
+      </tr>`;
+    }).join("");
 
-      document.getElementById("hero-badges").innerHTML = [
-        `<span class="badge live">● PRODUCTION: ${esc(DATA.promoted_short)}</span>`,
-        `<span class="badge cyan">Image: ${esc(DATA.image_tag)} (${esc(DATA.image_id.slice(0, 19))})</span>`,
-        `<span class="badge cyan">Model: ${esc(DATA.model_repo)} (${esc(DATA.model_revision)})</span>`,
-        `<span class="badge amber">GLP Dual-Serve: ${esc(DATA.served_models[1])}</span>`,
-        `<span class="badge">Backend: TileLang-only + sparknet 0.5.0</span>`
-      ].join("");
-
-      document.getElementById("hero-title").textContent =
-        `spark-ds41f — ${DATA.promoted_short} Manifest & Performance Observatory`;
-      document.getElementById("hero-subtitle").textContent =
-        `Reproducible Docker/vLLM deployment for DeepSeek-V4.1-Flash-1017 at 1,048,576 context on switchless 4-node ring (TP4) and 3-node triangle (TP3) DGX Spark fabrics. Driven directly from config/cluster.json, upstreams.lock.json, and manifests/.`;
-
-      const p32_4 = (tp4Suite.prefill.find(p => p.size === 32768) || {}).tps || 0;
-      const p131_4 = (tp4Suite.prefill.find(p => p.size === 131072) || {}).tps || 0;
-      const p1m_4 = (tp4Suite.prefill.find(p => p.size === 1000000) || {}).tps || 0;
-      const stall3 = (tp4Suite.stalls["stall-3"] || {}).probe_ttft_p50_s;
-
-      const kpis = [
-        {
-          label: "TP4 Decode (16 Streams)",
-          value: `${tp4Suite.runs.c16.output_tps.toFixed(1)} tok/s`,
-          delta: `+2.40% vs 1025 (paired +2.05%)`
-        },
-        {
-          label: "TP4 Single-Stream (c1)",
-          value: `${tp4Suite.runs.c1.output_tps.toFixed(1)} tok/s`,
-          delta: `78.3 paired (+3.61%) · TTFT 0.121s`
-        },
-        {
-          label: "TP4 Prefill (131K / 1M)",
-          value: `${Math.round(p131_4).toLocaleString()} / ${Math.round(p1m_4).toLocaleString()}`,
-          delta: `tok/s (+8.8% at 131K, +12.2% at 1M)`
-        },
-        {
-          label: "TP4 Decode Grid (20 Shapes)",
-          value: `${tp4Suite.grid.geomean_ms.toFixed(2)} ms`,
-          delta: `-4.62% ±0.15% step geomean vs 1025`
-        },
-        {
-          label: "Prefill Yield Short TTFT",
-          value: `${stall3 ? stall3.toFixed(2) + " s" : "—"}`,
-          delta: `3.7× sooner beside 131K prefill (was 12.36s)`
-        },
-        {
-          label: "KV Pool Capacity (TP4 / TP3)",
-          value: `${tp4Shape.kv_capacity.vllm_capacity_contexts.toFixed(2)}× / ${tp3Shape.kv_capacity.contexts.toFixed(2)}×`,
-          delta: `11 full 1M contexts on TP4 · 5 on TP3`
-        }
-      ];
-      document.getElementById("hero-kpis").innerHTML = kpis.map(k => `
-        <div class="kpi-card">
-          <div class="kpi-label">${esc(k.label)}</div>
-          <div class="kpi-value">${esc(k.value)}</div>
-          <div class="kpi-delta">${esc(k.delta)}</div>
-        </div>
-      `).join("");
-
-      // Performance Observatory Controls
-      const topoSelect = document.getElementById("topo-select");
-      const baseSelect = document.getElementById("base-suite-select");
-      const candSelect = document.getElementById("cand-suite-select");
-
-      function populateSuiteSelectors() {
-        const topo = topoSelect.value;
-        const matching = DATA.suites.filter(s => s.topology === topo);
-        baseSelect.innerHTML = matching.map((s, idx) =>
-          `<option value="${esc(s.id)}">${esc(s.release)} (${esc(s.date)})</option>`
-        ).join("");
-        candSelect.innerHTML = matching.map((s, idx) =>
-          `<option value="${esc(s.id)}">${esc(s.release)} (${esc(s.date)})</option>`
-        ).join("");
-        if (matching.length >= 2) {
-          baseSelect.selectedIndex = matching.length - 2;
-          candSelect.selectedIndex = matching.length - 1;
-        } else if (matching.length === 1) {
-          baseSelect.selectedIndex = 0;
-          candSelect.selectedIndex = 0;
-        }
-        renderChartsAndTable();
-      }
-
-      function pctDelta(baseVal, candVal, lowerBetter = false) {
-        if (!baseVal || !candVal) return null;
-        const pct = ((candVal - baseVal) / baseVal) * 100;
-        const good = lowerBetter ? pct < -0.3 : pct > 0.3;
-        const bad = lowerBetter ? pct > 0.3 : pct < -0.3;
-        const cls = good ? "verdict-better" : (bad ? "verdict-worse" : "verdict-same");
-        const sign = pct > 0 ? "+" : "";
-        return `<span class="${cls}">${sign}${pct.toFixed(2)}%</span>`;
-      }
-
-      function renderPrefillSvg(suites, baseSuite, candSuite) {
-        const w = 520, h = 230, padL = 52, padR = 18, padT = 18, padB = 34;
-        const sizes = [32768, 131072, 262144, 524288, 1000000];
-        const sizeLabels = ["32K", "131K", "262K", "500K/524K", "1M"];
-        const allVals = [];
-        suites.forEach(s => s.prefill.forEach(p => allVals.push(p.tps)));
-        const maxV = Math.max(8000, ...allVals) * 1.05;
-        const minV = Math.max(0, Math.min(3000, ...allVals) * 0.9);
-
-        const xFor = i => padL + (i / (sizes.length - 1)) * (w - padL - padR);
-        const yFor = v => padT + (1 - (v - minV) / (maxV - minV)) * (h - padT - padB);
-
-        let gridLines = "";
-        for (let g = 3500; g <= 7500; g += 1000) {
-          if (g < minV || g > maxV) continue;
-          const y = yFor(g);
-          gridLines += `<line x1="${padL}" y1="${y}" x2="${w - padR}" y2="${y}" stroke="var(--border)" stroke-dasharray="3,3"/>`;
-          gridLines += `<text x="${padL - 6}" y="${y + 4}" text-anchor="end" fill="var(--text-muted)" font-size="10.5" font-family="var(--mono)">${(g/1000).toFixed(1)}k</text>`;
-        }
-        sizeLabels.forEach((lbl, i) => {
-          const x = xFor(i);
-          gridLines += `<text x="${x}" y="${h - 10}" text-anchor="middle" fill="var(--text-muted)" font-size="11" font-family="var(--mono)">${lbl}</text>`;
-        });
-
-        const palette = ["#64748b", "#94a3b8", "#818cf8", "#f59e0b", "#06b6d4", "#10b981"];
-        let paths = "";
-        suites.forEach((s, idx) => {
-          const isCand = s.id === candSuite.id;
-          const isBase = s.id === baseSuite.id;
-          const color = isCand ? "var(--accent)" : (isBase ? "var(--cyan)" : palette[idx % palette.length]);
-          const opacity = (isCand || isBase) ? 1.0 : 0.40;
-          const width = isCand ? 3.0 : (isBase ? 2.4 : 1.4);
-          const pts = [];
-          sizes.forEach((sz, i) => {
-            const row = s.prefill.find(p => p.size === sz || (sz === 524288 && p.size === 500000));
-            if (row) pts.push({ x: xFor(i), y: yFor(row.tps), tps: row.tps });
-          });
-          if (pts.length > 1) {
-            const d = pts.map((p, i) => `${i === 0 ? "M" : "L"}${p.x.toFixed(1)},${p.y.toFixed(1)}`).join(" ");
-            paths += `<path d="${d}" fill="none" stroke="${color}" stroke-width="${width}" opacity="${opacity}"/>`;
-            pts.forEach(p => {
-              paths += `<circle cx="${p.x.toFixed(1)}" cy="${p.y.toFixed(1)}" r="${isCand ? 4 : 3}" fill="${color}" opacity="${opacity}"><title>${esc(s.release)}: ${Math.round(p.tps).toLocaleString()} tok/s</title></circle>`;
-            });
-          }
-        });
-
-        return `<svg viewBox="0 0 ${w} ${h}" width="100%" height="230">${gridLines}${paths}</svg>`;
-      }
-
-      function renderDecodeSvg(suites, baseSuite, candSuite) {
-        const w = 520, h = 230, padL = 46, padR = 18, padT = 20, padB = 42;
-        const maxV = 280;
-        const yFor = v => padT + (1 - v / maxV) * (h - padT - padB);
-        let svg = "";
-        for (let g = 50; g <= 250; g += 50) {
-          const y = yFor(g);
-          svg += `<line x1="${padL}" y1="${y}" x2="${w - padR}" y2="${y}" stroke="var(--border)" stroke-dasharray="3,3"/>`;
-          svg += `<text x="${padL - 6}" y="${y + 4}" text-anchor="end" fill="var(--text-muted)" font-size="10.5" font-family="var(--mono)">${g}</text>`;
-        }
-        const n = suites.length;
-        const slotW = (w - padL - padR) / Math.max(n, 1);
-        suites.forEach((s, i) => {
-          const cx = padL + slotW * (i + 0.5);
-          const hiKey = s.runs.c16 ? "c16" : "c8";
-          const midKey = s.runs.c16 ? "c8" : "c4";
-          const hiVal = (s.runs[hiKey] || {}).output_tps || 0;
-          const midVal = (s.runs[midKey] || {}).output_tps || 0;
-          const c1Val = (s.runs.c1 || {}).output_tps || 0;
-          const bw = Math.min(14, slotW * 0.24);
-
-          if (hiVal) {
-            const y = yFor(hiVal);
-            svg += `<rect x="${cx - bw * 1.5}" y="${y}" width="${bw}" height="${h - padB - y}" rx="2" fill="var(--accent)"><title>${esc(s.release)} ${hiKey}: ${hiVal} tok/s</title></rect>`;
-          }
-          if (midVal) {
-            const y = yFor(midVal);
-            svg += `<rect x="${cx - bw * 0.4}" y="${y}" width="${bw}" height="${h - padB - y}" rx="2" fill="var(--cyan)"><title>${esc(s.release)} ${midKey}: ${midVal} tok/s</title></rect>`;
-          }
-          if (c1Val) {
-            const y = yFor(c1Val);
-            svg += `<rect x="${cx + bw * 0.7}" y="${y}" width="${bw}" height="${h - padB - y}" rx="2" fill="var(--amber)"><title>${esc(s.release)} c1: ${c1Val} tok/s</title></rect>`;
-          }
-          svg += `<text x="${cx}" y="${h - 16}" text-anchor="middle" fill="var(--text-muted)" font-size="10.5" font-family="var(--mono)">${esc(s.release.replace("spark-ds41f-", ""))}</text>`;
-        });
-        return `<svg viewBox="0 0 ${w} ${h}" width="100%" height="230">${svg}</svg>`;
-      }
-
-      function renderGridSvg(baseSuite, candSuite) {
-        if (!candSuite.grid || !candSuite.grid.shapes.length) return "<p class='desc'>No engine grid in suite.</p>";
-        const shapes = candSuite.grid.shapes;
-        const baseMap = {};
-        if (baseSuite.grid) baseSuite.grid.shapes.forEach(r => { baseMap[r.label] = r.step_ms; });
-        const w = 520, rowH = 19, padL = 165, padR = 72, padT = 8;
-        const h = padT + shapes.length * rowH + 10;
-        const maxMs = Math.max(55, ...shapes.map(s => s.step_ms));
-
-        let svg = "";
-        shapes.forEach((s, idx) => {
-          const y = padT + idx * rowH;
-          const bMs = baseMap[s.label];
-          const cMs = s.step_ms;
-          const cw = (cMs / maxMs) * (w - padL - padR);
-          const bw = bMs ? (bMs / maxMs) * (w - padL - padR) : 0;
-          const delta = bMs ? (((cMs - bMs) / bMs) * 100).toFixed(1) + "%" : "";
-          const shortLbl = s.label.replace("decode ", "").replace(" rows ", " ");
-          svg += `<text x="${padL - 8}" y="${y + 13}" text-anchor="end" fill="var(--text-muted)" font-size="10.5" font-family="var(--mono)">${esc(shortLbl)}</text>`;
-          if (bw > 0) {
-            svg += `<rect x="${padL}" y="${y + 3}" width="${bw.toFixed(1)}" height="5" rx="2" fill="var(--cyan)" opacity="0.55"><title>Base: ${bMs.toFixed(2)} ms</title></rect>`;
-          }
-          svg += `<rect x="${padL}" y="${y + 9}" width="${cw.toFixed(1)}" height="6" rx="2" fill="var(--accent)"><title>Candidate: ${cMs.toFixed(2)} ms</title></rect>`;
-          svg += `<text x="${w - 6}" y="${y + 13}" text-anchor="end" fill="var(--text)" font-size="10.5" font-family="var(--mono)">${cMs.toFixed(1)}ms ${delta}</text>`;
-        });
-        return `<div style="max-height:230px;overflow-y:auto"><svg viewBox="0 0 ${w} ${h}" width="100%" height="${h}">${svg}</svg></div>`;
-      }
-
-      function renderSpecStallBox(baseSuite, candSuite) {
-        const hiKey = candSuite.runs.c16 ? "c16" : "c8";
-        const run = candSuite.runs[hiKey] || {};
-        const surv = run.survival || [];
-        const cov = run.coverage || [];
-        let htmlOut = `<div style="font-size:12.5px;margin-bottom:10px"><strong>DSpark Draft Survival / Coverage (${esc(candSuite.release)} ${hiKey}):</strong></div>`;
-        htmlOut += `<div style="display:grid;grid-template-columns:repeat(5,1fr);gap:6px;margin-bottom:14px">`;
-        for (let k = 0; k < 5; k++) {
-          const sVal = surv[k] !== undefined ? (surv[k] * 100).toFixed(1) + "%" : "—";
-          const cVal = cov[k] !== undefined ? (cov[k] * 100).toFixed(1) + "%" : "—";
-          htmlOut += `<div style="background:var(--bg-elev);border:1px solid var(--border);border-radius:6px;padding:6px 8px;text-align:center">
-            <div style="font-size:10.5px;color:var(--text-muted);font-family:var(--mono)">Draft k=${k}</div>
-            <div style="font-size:13.5px;font-weight:700;color:var(--accent);font-family:var(--mono)">${sVal}</div>
-            <div style="font-size:10.5px;color:var(--text-muted);font-family:var(--mono)">cov ${cVal}</div>
-          </div>`;
-        }
-        htmlOut += `</div>`;
-
-        const st3 = candSuite.stalls["stall-3"];
-        const st11 = candSuite.stalls["stall-11"];
-        const st15 = candSuite.stalls["stall-15"];
-        if (st3 || st15) {
-          htmlOut += `<div style="font-size:12.5px;margin-bottom:6px"><strong>131K Prefill Yield &amp; Mixed-Traffic Stalls (${esc(candSuite.release)}):</strong></div>`;
-          htmlOut += `<div style="display:grid;grid-template-columns:repeat(3,1fr);gap:8px">`;
-          if (st3) {
-            htmlOut += `<div style="background:var(--bg-elev);border:1px solid var(--border);border-radius:6px;padding:8px">
-              <div style="font-size:10.5px;color:var(--text-muted)">3 Streams + 131K</div>
-              <div style="font-size:14px;font-weight:700;font-family:var(--mono);color:var(--accent)">TTFT ${st3.probe_ttft_p50_s.toFixed(2)}s</div>
-              <div style="font-size:11px;color:var(--text-muted);font-family:var(--mono)">${Math.round(st3.prefill_tps).toLocaleString()} tok/s prefill</div>
-            </div>`;
-          }
-          if (st11) {
-            htmlOut += `<div style="background:var(--bg-elev);border:1px solid var(--border);border-radius:6px;padding:8px">
-              <div style="font-size:10.5px;color:var(--text-muted)">11 Streams + 131K</div>
-              <div style="font-size:14px;font-weight:700;font-family:var(--mono);color:var(--accent)">TTFT ${st11.probe_ttft_p50_s.toFixed(2)}s</div>
-              <div style="font-size:11px;color:var(--text-muted);font-family:var(--mono)">${Math.round(st11.prefill_tps).toLocaleString()} tok/s prefill</div>
-            </div>`;
-          }
-          if (st15) {
-            htmlOut += `<div style="background:var(--bg-elev);border:1px solid var(--border);border-radius:6px;padding:8px">
-              <div style="font-size:10.5px;color:var(--text-muted)">15 Streams + 131K</div>
-              <div style="font-size:14px;font-weight:700;font-family:var(--mono);color:var(--cyan)">${Math.round(st15.prefill_tps).toLocaleString()} tok/s</div>
-              <div style="font-size:11px;color:var(--text-muted);font-family:var(--mono)">step p90 ${st15.during_p90_s.toFixed(2)}s</div>
-            </div>`;
-          }
-          htmlOut += `</div>`;
-        } else {
-          htmlOut += `<div style="font-size:12px;color:var(--text-muted)">Select <code>spark-ds41f-1030</code> on TP4 to inspect <code>stall-3</code>, <code>stall-11</code>, and <code>stall-15</code> prefill-yield probes.</div>`;
-        }
-        return htmlOut;
-      }
-
-      function renderChartsAndTable() {
-        const topo = topoSelect.value;
-        const suites = DATA.suites.filter(s => s.topology === topo);
-        const baseSuite = suites.find(s => s.id === baseSelect.value) || suites[0];
-        const candSuite = suites.find(s => s.id === candSelect.value) || suites[suites.length - 1];
-
-        document.getElementById("chart-prefill").innerHTML = renderPrefillSvg(suites, baseSuite, candSuite);
-        document.getElementById("chart-decode").innerHTML = renderDecodeSvg(suites, baseSuite, candSuite);
-        document.getElementById("chart-grid").innerHTML = renderGridSvg(baseSuite, candSuite);
-        document.getElementById("chart-spec-stall").innerHTML = renderSpecStallBox(baseSuite, candSuite);
-
-        document.getElementById("th-base").textContent = `${baseSuite.release} (${baseSuite.topology})`;
-        document.getElementById("th-cand").textContent = `${candSuite.release} (${candSuite.topology})`;
-
-        const rows = [];
-        if (baseSuite.grid && candSuite.grid) {
-          rows.push({
-            name: `Decode step time geometric mean (${candSuite.grid.shape_count} shapes)`,
-            b: `${baseSuite.grid.geomean_ms.toFixed(2)} ms`,
-            c: `${candSuite.grid.geomean_ms.toFixed(2)} ms`,
-            d: pctDelta(baseSuite.grid.geomean_ms, candSuite.grid.geomean_ms, true),
-            note: "Dev-mode collective_rpc fixed-shape verification grid"
-          });
-        }
-        [["c16", "Decode, 16 streams (output tok/s)"],
-         ["c8", "Decode, 8 streams (output tok/s)"],
-         ["c4", "Decode, 4 streams (output tok/s)"],
-         ["c1", "Single-stream c1 (output tok/s)"],
-         ["poisson", "Poisson arrivals (output tok/s)"]].forEach(([k, label]) => {
-          const br = baseSuite.runs[k], cr = candSuite.runs[k];
-          if (br || cr) {
-            rows.push({
-              name: label,
-              b: br ? `${br.output_tps.toFixed(1)}` : "—",
-              c: cr ? `${cr.output_tps.toFixed(1)}` : "—",
-              d: (br && cr) ? pctDelta(br.output_tps, cr.output_tps, false) : "—",
-              note: cr && cr.ttft_p50_s ? `TTFT p50 ${cr.ttft_p50_s.toFixed(3)}s · TPOT p50 ${cr.tpot_p50_ms.toFixed(1)}ms` : ""
-            });
-          }
-        });
-        [["c16", "Sampled decode, 16 streams (temp=1.0 tok/s)"],
-         ["c8", "Sampled decode, 8 streams (temp=1.0 tok/s)"],
-         ["c1", "Sampled decode, 1 stream (temp=1.0 tok/s)"]].forEach(([k, label]) => {
-          const br = (baseSuite.sampled || {})[k], cr = (candSuite.sampled || {})[k];
-          if (br || cr) {
-            rows.push({
-              name: label,
-              b: br ? `${br.output_tps.toFixed(1)}` : "—",
-              c: cr ? `${cr.output_tps.toFixed(1)}` : "—",
-              d: (br && cr) ? pctDelta(br.output_tps, cr.output_tps, false) : "—",
-              note: "Seeded temperature 1.0, top_p 1.0"
-            });
-          }
-        });
-        [32768, 131072, 262144, 524288, 500000, 1000000].forEach(sz => {
-          const bp = baseSuite.prefill.find(p => p.size === sz);
-          const cp = candSuite.prefill.find(p => p.size === sz);
-          if (bp || cp) {
-            const lbl = sz === 1000000 ? "1M" : `${Math.round(sz / 1024)}K`;
-            rows.push({
-              name: `Source-text prefill, ${lbl} (tok/s)`,
-              b: bp ? Math.round(bp.tps).toLocaleString() : "—",
-              c: cp ? Math.round(cp.tps).toLocaleString() : "—",
-              d: (bp && cp) ? pctDelta(bp.tps, cp.tps, false) : "—",
-              note: "3 uncached Python stdlib prompts"
-            });
-          }
-        });
-
-        document.getElementById("suite-compare-tbody").innerHTML = rows.map(r => `
-          <tr>
-            <td><strong>${esc(r.name)}</strong></td>
-            <td class="num">${esc(r.b)}</td>
-            <td class="num">${esc(r.c)}</td>
-            <td class="num">${r.d || "—"}</td>
-            <td style="color:var(--text-muted);font-size:12px">${esc(r.note)}</td>
-          </tr>
-        `).join("");
-      }
-
-      topoSelect.addEventListener("change", populateSuiteSelectors);
-      baseSelect.addEventListener("change", renderChartsAndTable);
-      candSelect.addEventListener("change", renderChartsAndTable);
-      populateSuiteSelectors();
-
-      // Render Shapes & KV Capacity
-      const maxBlocks = Math.max(...DATA.shapes.map(s => s.kv_capacity.pool_blocks));
-      document.getElementById("shape-cards").innerHTML = DATA.shapes.map(s => {
-        const kv = s.kv_capacity;
-        const pct = Math.round((kv.pool_blocks / maxBlocks) * 100);
-        return `
-          <div class="shape-card ${s.default ? 'default' : ''}">
-            <div style="display:flex;justify-content:space-between;align-items:center">
-              <strong style="font-size:16px;font-family:var(--mono)">${esc(s.name)}</strong>
-              ${s.default ? '<span class="badge live">Default Shape</span>' : `<span class="badge">${esc(s.page_size_label)} pages</span>`}
-            </div>
-            <div style="font-size:12.5px;color:var(--text-muted);margin-top:4px">
-              ${s.nodes}× DGX Spark &bull; Transport <code>${esc(s.transport)}</code> &bull; Kernel <code>${esc(s.kernel_release)}</code>
-            </div>
-            <div class="kv-bar"><div class="kv-bar-fill" style="width:${pct}%"></div></div>
-            <div style="display:grid;grid-template-columns:1fr 1fr;gap:8px;font-size:12.5px">
-              <div>KV Pool / Rank: <strong>${esc(s.kv_cache_gib)}</strong> (${kv.pool_blocks.toLocaleString()} blocks)</div>
-              <div>Context Limit: <strong>${s.max_model_len.toLocaleString()}</strong> tok</div>
-              <div>Full Contexts Held: <strong>${kv.full_contexts} (${kv.contexts.toFixed(2)}×)</strong></div>
-              <div>All ${s.max_num_seqs} Seqs Fit: <strong>${kv.every_sequence_tokens.toLocaleString()}</strong> tok</div>
-              <div>Batch Budget: <strong>${s.max_num_batched_tokens.toLocaleString()}</strong> tok</div>
-              <div>CUDA Graphs: <strong>1–${s.max_cudagraph_capture_size}</strong> rows</div>
-              <div>Min Free RAM (Head / Workers): <strong>${s.memory ? `${s.memory.head_min_available_gib.toFixed(2)} / ${s.memory.worker_min_available_gib.toFixed(2)} GiB` : "—"}</strong></div>
-              <div>5 GiB Guard Headroom: <strong>${s.memory ? `+${s.memory.headroom_above_startup_guard_gib.toFixed(2)} GiB` : "—"}</strong></div>
-            </div>
+    /* ---------- releases ---------- */
+    const firstSentence = t => { const s = String(t || ""); const m = /^(.{40,220}?[.;:])\s/.exec(s); return m ? m[1] : s.slice(0, 200); };
+    function drawReleases(all) {
+      const list = all ? DATA.timeline : DATA.timeline.slice(0, 5);
+      $("#rel").innerHTML = list.map(t => `
+        <details>
+          <summary>
+            <span class="date">${esc(t.date)}</span>
+            <span class="nm">${esc(t.short_name)}${t.is_promoted ? '<span class="pill">serving</span>' : ""}</span>
+            <span class="gist">${esc(firstSentence(t.change_from_previous))}</span>
+            <span class="chev">+</span>
+          </summary>
+          <div class="full">
+            ${t.change_from_previous ? `<p>${esc(t.change_from_previous)}</p>` : ""}
+            ${t.evidence_summary ? `<p><strong>Qualified by:</strong> ${esc(t.evidence_summary)}</p>` : ""}
+            <p class="meta">${esc(t.shape)} · ${esc(t.image_tag || "")}${t.image_id ? " · " + esc(t.image_id) : ""} · <a href="${REPO}/blob/main/manifests/baselines/${esc(t.stem)}.json" rel="noopener">baseline manifest ↗</a></p>
           </div>
-        `;
-      }).join("");
+        </details>`).join("");
+      $("#rel-more").hidden = all || DATA.timeline.length <= 5;
+    }
+    $("#rel-more").addEventListener("click", () => drawReleases(true));
 
-      document.getElementById("shapes-tbody").innerHTML = DATA.shapes.map(s => {
-        const kv = s.kv_capacity;
-        const mem = s.memory;
-        const freeCell = mem ? `${mem.head_min_available_gib.toFixed(2)} / ${mem.worker_min_available_gib.toFixed(2)} GiB` : "—";
-        const headroomCell = mem ? `+${mem.headroom_above_startup_guard_gib.toFixed(2)} GiB` : "—";
-        return `
-          <tr>
-            <td><code>${esc(s.name)}</code>${s.default ? ' <span class="badge live">default</span>' : ''}</td>
-            <td>TP${s.nodes} <code>${esc(s.transport)}</code></td>
-            <td><code>${esc(s.kernel_release)}</code> (${esc(s.page_size_label)})</td>
-            <td class="num">${s.max_model_len.toLocaleString()}</td>
-            <td class="num">${s.max_num_seqs}</td>
-            <td class="num">${s.max_num_batched_tokens.toLocaleString()}</td>
-            <td class="num">${esc(s.kv_cache_gib)}</td>
-            <td class="num">${esc(freeCell)}</td>
-            <td class="num">${esc(headroomCell)}</td>
-            <td class="num">${kv.pool_blocks.toLocaleString()}</td>
-            <td class="num"><strong>${kv.full_contexts}</strong> (${kv.contexts.toFixed(2)}×)</td>
-            <td class="num">${kv.vllm_capacity_tokens.toLocaleString()} (${kv.vllm_capacity_contexts.toFixed(2)}×)</td>
-            <td>${s.qualified_release ? `<code>${esc(s.qualified_release)}</code>` : '<span style="color:var(--text-muted)">unqualified</span>'}</td>
-          </tr>
-        `;
-      }).join("");
+    /* ---------- fine print ---------- */
+    $("#upstreams").innerHTML = DATA.upstreams.map(u => `<tr>
+      <td class="lead"><code>${esc(u.name)}</code></td><td>${esc(u.version || u.kind || "")}</td>
+      <td class="n">${esc((u.revision || "–").slice(0, 12))}</td>
+      <td class="n">${u.patch_count != null ? u.patch_count : "–"}</td><td>${esc(u.role)}</td></tr>`).join("");
+    const patches = DATA.upstreams.reduce((a, u) => a + (u.patch_count || 0), 0);
+    $("#up-count").textContent = `${DATA.upstreams.length} sources · ${int(patches)} patches`;
+    const choices = Object.entries(DATA.runtime_choices || {});
+    $("#choice-count").textContent = `${choices.length} recorded`;
+    function drawChoices(q) {
+      q = (q || "").toLowerCase();
+      $("#choices").innerHTML = choices.filter(e => (e[0] + " " + JSON.stringify(e[1])).toLowerCase().indexOf(q) >= 0)
+        .map(e => `<tr><td class="lead" style="white-space:nowrap"><code>${esc(e[0].trim())}</code></td><td>${esc(typeof e[1] === "object" ? JSON.stringify(e[1]) : e[1])}</td></tr>`).join("");
+    }
+    $("#choice-q").addEventListener("input", e => drawChoices(e.target.value));
+    $("#cap-count").textContent = `${(DATA.capabilities || []).length} declared`;
+    $("#caps").innerHTML = (DATA.capabilities || []).map(c => `<span>${esc(c)}</span>`).join("");
 
-      // Render Upstreams & Runtime Choices
-      document.getElementById("upstreams-tbody").innerHTML = DATA.upstreams.map(u => `
-        <tr>
-          <td><strong><code>${esc(u.name)}</code></strong></td>
-          <td>${esc(u.version || u.kind)}</td>
-          <td class="num"><code>${esc((u.revision || "—").slice(0, 12))}</code></td>
-          <td class="num">${u.patch_count !== null ? `<strong>${u.patch_count}</strong> patches` : "—"}</td>
-          <td class="num">${u.tree ? `<code>${esc(u.tree.slice(0, 10))}</code>` : "—"}</td>
-          <td style="font-size:12px;color:var(--text-muted)">${esc(u.role)}</td>
-        </tr>
-      `).join("");
-
-      const choiceEntries = Object.entries(DATA.runtime_choices);
-      function renderChoices(filterText) {
-        const q = (filterText || "").toLowerCase();
-        const filtered = choiceEntries.filter(([k, v]) =>
-          k.toLowerCase().includes(q) || JSON.stringify(v).toLowerCase().includes(q)
-        );
-        document.getElementById("choices-tbody").innerHTML = filtered.map(([k, v]) => `
-          <tr>
-            <td><code>${esc(k)}</code></td>
-            <td style="font-size:12.5px">${esc(typeof v === "object" ? JSON.stringify(v) : v)}</td>
-          </tr>
-        `).join("");
-
-        const caps = DATA.capabilities.filter(c => c.toLowerCase().includes(q));
-        document.getElementById("cap-tags").innerHTML = caps.map(c =>
-          `<span class="cap-tag">${esc(c)}</span>`
-        ).join("");
+    /* ---------- link-preview card ---------- */
+    if (CARD) {
+      const s = SHAPES.find(x => x.name === DATA.default_shape) || SHAPES[0], suite = suiteFor(s);
+      const top = suite && suite.runs.c16 ? 16 : 8, run = suite && suite.runs["c" + top];
+      $("#og-rel").textContent = `release ${shortRel(DATA.promoted_short)} · ${s.nodes} Sparks, ${s.fabric === "switched" ? "switched" : s.nodes === 3 ? "triangle" : "ring"}`;
+      $("#og-ctx").textContent = s.max_model_len >= 1e6 ? Math.floor(s.max_model_len / 1e6) + "M" : Math.round(s.max_model_len / 1024) + "K";
+      $("#og-seq").textContent = s.max_num_seqs;
+      // One stream splits into prose and code when the run's request table allows it; sixteen streams
+      // share every engine step, so their total stays one figure for the mix.
+      const one = suite && suite.runs.c1, split = one && one.tps_by_style;
+      if (split) {
+        $("#og-c1").innerHTML = `${split.prose.tps.toFixed(1)}<i> / </i>${split.code.tps.toFixed(1)}`;
+        $("#og-c1-k").textContent = "tok/s prose / code, 1 stream";
+      } else {
+        $("#og-c1").textContent = one ? one.output_tps.toFixed(1) : "–";
       }
-      renderChoices("");
-      document.getElementById("choice-search").addEventListener("input", e => renderChoices(e.target.value));
+      $("#og-cn").textContent = run ? run.output_tps.toFixed(1) : "–";
+      $("#og-cn-k").textContent = `tok/s, ${top} streams`;
+      const pf = suite && (suite.prefill || []).find(q => q.size === 131072);
+      $("#og-pf-box").hidden = !pf;
+      if (pf) $("#og-pf").textContent = int(pf.tps);
+    }
 
-      // Render Timeline
-      function renderTimeline(filterText) {
-        const q = (filterText || "").toLowerCase();
-        const items = DATA.timeline.filter(t =>
-          t.stem.toLowerCase().includes(q) ||
-          (t.change_from_previous || "").toLowerCase().includes(q) ||
-          (t.evidence_summary || "").toLowerCase().includes(q)
-        );
-        document.getElementById("timeline-list").innerHTML = items.map(t => `
-          <div class="timeline-item ${t.is_promoted ? 'promoted' : ''}">
-            <div class="timeline-head">
-              <div>
-                <strong style="font-size:15px;font-family:var(--mono)">${esc(t.short_name)}</strong>
-                <span style="color:var(--text-muted);font-size:12.5px;margin-left:8px">${esc(t.stem)}</span>
-                ${t.is_promoted ? '<span class="badge live" style="margin-left:8px">Active Production</span>' : ''}
-              </div>
-              <div style="font-family:var(--mono);font-size:12px;color:var(--text-muted)">
-                Shape: <code>${esc(t.shape)}</code> &bull; Image: <code>${esc(t.image_tag || "—")}</code> ${t.vllm_tree ? `&bull; vLLM tree <code>${esc(t.vllm_tree)}</code>` : ''}
-              </div>
-            </div>
-            ${t.change_from_previous ? `<div style="font-size:13px;margin-bottom:6px"><strong>Changes:</strong> ${esc(t.change_from_previous)}</div>` : ''}
-            ${t.evidence_summary ? `<div style="font-size:12.5px;color:var(--text-muted)"><strong>Qualification:</strong> ${esc(t.evidence_summary)}</div>` : ''}
-          </div>
-        `).join("");
-      }
-      renderTimeline("");
-      document.getElementById("timeline-search").addEventListener("input", e => renderTimeline(e.target.value));
-    })();
+    /* ---------- go ---------- */
+    selectShape();
+    fillReleases();
+    drawReleases(false);
+    drawChoices("");
+    if ("IntersectionObserver" in window && !still) {
+      const io = new IntersectionObserver(es => es.forEach(e => { if (e.isIntersecting) { e.target.classList.add("in"); io.unobserve(e.target); } }), { rootMargin: "0px 0px -8% 0px" });
+      document.querySelectorAll(".reveal").forEach(n => io.observe(n));
+    } else {
+      document.querySelectorAll(".reveal").forEach(n => n.classList.add("in"));
+    }
+  })();
   </script>
 </body>
 </html>

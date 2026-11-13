@@ -1,0 +1,26 @@
+1c1
+< # usage: python3 /h/h987.py OUT.json
+---
+> # usage: python3 /h/h987b.py OUT.json
+2a3,7
+> # h987b: h987.py's cells again (same seeds), for a second ABBA pair of boots, with two
+> # additions: CUPTI kernel time with a synchronize after each call (kernel_isolated_us;
+> # h987's back-to-back kernel time also counts a PDL kernel's early-launch wait), and
+> # WO-A alone, so the end-to-end cells can be decomposed.
+> #
+25c30
+<     eager_us, env_info, gpu_warmup, graph_cold_us, graph_hot_us, h, kernel_us,
+---
+>     eager_us, env_info, gpu_warmup, graph_cold_us, graph_hot_us, h, kernel_isolated_us, kernel_us,
+52a58
+>         "kernel_isolated_us": kernel_isolated_us(fn),
+128a135,137
+>                     fa = lambda qb=qb, xq2=xq2, sf2=sf2, parts=parts, M=M: wo.a(  # noqa: E731
+>                         qb, xq2[:M], sf2[:M], parts[0] if parts else None)
+>                     cell["woa"] = timings(fa)
+135c144,146
+<                           f"| prefill hot {cell['prefill']['graph_hot']['median_us']}", flush=True)
+---
+>                           f"| prefill hot {cell['prefill']['graph_hot']['median_us']} | woa hot {cell['woa']['graph_hot']['median_us']} "
+>                           f"| kiso wob {cell['wob']['kernel_isolated_us']} e2e {cell['e2e']['kernel_isolated_us']} "
+>                           f"woa {cell['woa']['kernel_isolated_us']}", flush=True)

@@ -1,0 +1,692 @@
+{
+ "round": "candidates 51, 52 and 53 (PR validation, steps 1-8 of docs/release-benchmark.md)",
+ "date": "2026-11-09",
+ "base": {
+  "description": "candidate-50's vLLM series without #1009 (0778-perf-dsv41-sp-prefill-local-attention-front.patch): spark-ds41f-1107 (0001..0761) plus 0762..0777, 0779, 0780",
+  "how": "sp8 copy of candidate-50's prepared tree (HEAD ba7400d9b, tree d5778ab5, the expected_tree of candidate-50/upstreams.lock.json), then git revert 0a231de28 (0778)",
+  "vllm_revision": "19f2c20ed4d64ae22bd009ceacadd85e2a81e354",
+  "candidate_50_patch_head": "ba7400d9b6715ea1be6fa98b1d9ccedf5fcb65f9",
+  "candidate_50_tree": "d5778ab56647a20d94710ecb94cfd9a4de27bee9",
+  "base_commit": "0bffb886ec85fb57a9971bd144c2a7b780658617",
+  "base_tree": "14c5a2dc924541ce4eda44d5b39d811be15f2363",
+  "check": "the four files 0778 touches outside tests equal candidate-50/no1009/overlay byte for byte (SHA-256)",
+  "tilelang": "2123e412 plus 1107/tilelang/series (13 patches): tree e2b001828fd4, the 1107 label",
+  "sparknet": "1fd6a1fb (no series): tree 8cc28a5cd3e6, the 1107 label",
+  "where": "sp8, ~/spark-lab/agents/round-51-53-select"
+ },
+ "candidates": {
+  "51": {
+   "testbed": "tp4-ring",
+   "nodes": "dgx1..dgx4",
+   "shape": "tp4-ring",
+   "theme": "bit-identical TP4 decode kernels (gemm/vocab tiles at 97..128 rows, L2 prefetch pacing)",
+   "order": [
+    961,
+    963,
+    987,
+    1001
+   ],
+   "prs": [
+    {
+     "pr": 961,
+     "title": "perf(dsv41): 64 KiB chunked, %globaltimer-paced side-stream L2 prefetch",
+     "pr_head": "9362f944201a45fc0d74424ac0d73c5fc17cdf78",
+     "source_patch": "experiments/2026-11-08-l2-prefetch-pacing/vllm/0762-perf-dsv41-64k-chunked-globaltimer-paced-l2-prefetch.patch",
+     "source_sha256": "4209b337da381bd98cb5c70c87b68d9cad7e8e9f5bc1b940fe850e6e0be3af67",
+     "method": "git am",
+     "proposed_patch": "experiments/2026-11-08-l2-prefetch-pacing/vllm/0762-perf-dsv41-64k-chunked-globaltimer-paced-l2-prefetch.patch",
+     "proposed_sha256": "4209b337da381bd98cb5c70c87b68d9cad7e8e9f5bc1b940fe850e6e0be3af67",
+     "kind": "perf",
+     "category": "K1",
+     "own_mark": "Its bench_l2_prefetch_ab.py (16 MiB cold prefetch, then the consumer read) on the candidate image on sp8, 2 boots, ABBA against the base image, with the recipe's VLLM_L2_PREFETCH_GRID=2: the consumer read is faster beyond the interval and the L2 hit share higher; its pytest passes. No decode cell of the engine grid worse",
+     "declared_output_change": "none",
+     "placement": "every shape prefetches; with the gemm/vocab tile PRs it makes 51 a bit-identical TP4 decode batch on production's shape, so 51's determinism gate stays a pure identity check"
+    },
+    {
+     "pr": 963,
+     "title": "perf(dsv41): unconditional pack12 plane loads, byte-perm vocab SWAR, and per-column exception lookup",
+     "pr_head": "e5db47f172cfef9bbe77d4af8b061f6fc683969a",
+     "source_patch": "experiments/2026-11-08-pack12-unconditional-loads-swar/vllm/0762-perf-dsv41-unconditional-pack12-plane-loads-and-swar.patch",
+     "source_sha256": "b0c54984ac70edec43e643202e82e663becfb5f5df7318d6f0d06559a500972f",
+     "method": "git am",
+     "proposed_patch": "experiments/2026-11-08-pack12-unconditional-loads-swar/vllm/0762-perf-dsv41-unconditional-pack12-plane-loads-and-swar.patch",
+     "proposed_sha256": "b0c54984ac70edec43e643202e82e663becfb5f5df7318d6f0d06559a500972f",
+     "kind": "perf",
+     "category": "K1",
+     "own_mark": "Its screen_pack12_kernels.py on the image, 2 boots, ABBA against the base image, by kernel time and CUDA-graph replay: packed BF16 GEMM (compressor_up, M=1..256) and packed vocab projection/greedy partials faster beyond the interval, 0 ULP, including through #997's certified screen (in the base)",
+     "declared_output_change": "none",
+     "placement": "shares tilelang/gemm.py with #987 and tilelang/vocab.py with #1001, so the three share a candidate; its large-M gains are TP4's 16-stream rows"
+    },
+    {
+     "pr": 987,
+     "title": "perf(dsv41): extend WO-B WIDE_DECODE to 128 rows and guard high-concurrency decode cliffs",
+     "pr_head": "9be94ed5310ceb4f77ecae29985a40c569878c32",
+     "source_patch": "experiments/2026-11-08-wide-decode-wo-b-and-high-concurrency/vllm/0762-perf-dsv41-extend-WO-B-WIDE_DECODE-to-128-rows-and-g.patch",
+     "source_sha256": "14b6d9c420f9bbcce203b35c5ce2121057b9cdcd06bf3f70a6463a474546ff77",
+     "method": "split",
+     "proposed_patch": "rebases/51-03-perf-dsv41-extend-WO-B-WIDE_DECODE-to-128-rows-and-g.patch",
+     "proposed_sha256": "7a29c933563e085076c8d9548b4e84e03b3c0df41c53f409158e4d588fa609a5",
+     "kind": "perf",
+     "category": "K1",
+     "own_mark": "WO-B part only. Its WO-B bench (mxfp8_gemm and TileLangWOProjection at M=104..128, K=3072/2048/1024) on the image, 2 boots, ABBA: faster beyond the interval at M=97..128, torch.equal against the prefill GEMM; the engine grid's 16-stream cell not worse. It acts only at TP4 (rows past 96 need 16 streams with copy widening: 107 rows at max_num_seqs 16; TP3's 8 streams reach 59)",
+     "declared_output_change": "none",
+     "placement": "acts only at TP4 (97..128 rows); measured on sp4"
+    },
+    {
+     "pr": 1001,
+     "title": "perf(dsv41): match 128-row vocab head tile pipeline stages on GB10",
+     "pr_head": "03e2d903daf9ea197b430e24b75e64b0eda7e737",
+     "source_patch": "experiments/2026-11-08-vocab-head-128tile-greedy/vllm/0762-Match-128-row-vocab-head-tile-pipeline-stages.patch",
+     "source_sha256": "7fb087e80cab9b5f53ba87b5269abcc0591895ab69d004e619dee839ad082c61",
+     "method": "context-only rebase",
+     "proposed_patch": "rebases/51-04-Match-128-row-vocab-head-tile-pipeline-stages.patch",
+     "proposed_sha256": "c905a4930474122ee70a4f2e5d0af8b1d8398922fd78f1ad4dcb16e38fca885c",
+     "kind": "perf",
+     "category": "K1",
+     "own_mark": "Its bench_vocab_2boot.py (captured CUDA graphs) on the image, 2 boots, ABBA: projection and greedy epilogue at M=97..128 (the 128-row tile) faster beyond the interval, bit-identical logits and (max, index) pairs, M<=96 not worse. TP4 only (as #987)",
+     "declared_output_change": "none",
+     "placement": "acts only at TP4 (97..128 rows); shares vocab.py with #963"
+    }
+   ],
+   "stack_tree": "987ba05899600da36d3c11b065c5be7967256224",
+   "stack_head_on_sp8": "b50ee1bbcf0cd6ac9d139398d3a4907208c3a0ae"
+  },
+  "52": {
+   "testbed": "tp4-switched",
+   "nodes": "sp1..sp4 (head sp1)",
+   "shape": "tp4-switched",
+   "theme": "the routed-MoE rounding fix, the Engram reader and the max_tokens verify-row cap",
+   "order": [
+    1030,
+    968,
+    969
+   ],
+   "prs": [
+    {
+     "pr": 1030,
+     "title": "fix(dsv41): align moe_swiglu_cast with DeepSeek Expert.forward BF16 rounding",
+     "pr_head": "a7edd33143aa47944d3b44fb41ebea261dbf89d3",
+     "source_patch": "experiments/2026-11-09-deepseek-reference-alignment/vllm/0762-fix-dsv41-align-moe_swiglu_cast-with-DeepSeek-Expert.patch",
+     "source_sha256": "6ed9d54fac0e2fcce315d91c33b16b0991c11bb7cf5eba376c08b323c5f4f695",
+     "method": "git am",
+     "proposed_patch": "experiments/2026-11-09-deepseek-reference-alignment/vllm/0762-fix-dsv41-align-moe_swiglu_cast-with-DeepSeek-Expert.patch",
+     "proposed_sha256": "6ed9d54fac0e2fcce315d91c33b16b0991c11bb7cf5eba376c08b323c5f4f695",
+     "kind": "fix",
+     "category": "F",
+     "own_mark": "Its bench_reference_alignment.py on the image, 2 boots: routed moe_swiglu_cast FP8 bytes and UE8M0 scales identical to DeepSeek's Expert.forward reference (0 diffs at TP4 inter=576 and TP3 inter=768), and the end-to-end MoE closer to the reference than 1107's; kernel time not worse beyond the interval at the decode, mid and prefill tiers. It is a precision change: the determinism gate fails by construction, so the gate checks #968 and #969 on tp4-switched-no1030.json (1107's moe.py mounted; no other patch here touches it), speed is judged on distinct prompts, and its correctness evidence is the reference alignment plus release qualification's quality evals",
+     "declared_output_change": "temperature-0 text changes on every shape: routed MoE activations are rounded to BF16 before MXFP8 quantization, as in DeepSeek's reference",
+     "placement": "the only fix and the only output change: kept apart from 51's bit-identical batch; TP4 is where its mid tier gains (1.25x); its no1030 overlay is possible because no other patch in 52 touches moe.py"
+    },
+    {
+     "pr": 968,
+     "title": "perf(spec_decode): clamp scheduled decode verify rows to remaining max_tokens",
+     "pr_head": "1445e800b172bc069239ca16e8bec82945fa5a12",
+     "source_patch": "experiments/2026-11-08-remaining-token-draft-cap/vllm/0762-perf-spec-decode-remaining-token-draft-cap.patch",
+     "source_sha256": "9a8501356dc1e168d09019033f43c5b56062b3f13f65c51e51717d8a378a35a0",
+     "method": "git am",
+     "proposed_patch": "experiments/2026-11-08-remaining-token-draft-cap/vllm/0762-perf-spec-decode-remaining-token-draft-cap.patch",
+     "proposed_sha256": "9a8501356dc1e168d09019033f43c5b56062b3f13f65c51e51717d8a378a35a0",
+     "kind": "perf",
+     "category": "P",
+     "own_mark": "Its screen_remaining_token_cap.py on the image, 2 boots: verify rows past a request's remaining max_tokens are not scheduled (functional), outputs bit-exact; paired decode not worse; the tail steps of bounded requests at 16 streams lighter",
+     "declared_output_change": "none",
+     "placement": "scheduler.py only; touches no other candidate's file"
+    },
+    {
+     "pr": 969,
+     "title": "perf(dsv41): direct-insert packed Engram cache rows and align split cache arrays",
+     "pr_head": "aad967cbe89737777db07876ad89eea66383eca3",
+     "source_patch": "experiments/2026-11-08-engram-cache-direct-insert/vllm/0762-perf-dsv41-direct-insert-packed-engram-cache-and-ali.patch",
+     "source_sha256": "a802a30479229c792a9066642968246e41350fff6c3825091000529a004c6ba4",
+     "method": "git am",
+     "proposed_patch": "experiments/2026-11-08-engram-cache-direct-insert/vllm/0762-perf-dsv41-direct-insert-packed-engram-cache-and-ali.patch",
+     "proposed_sha256": "a802a30479229c792a9066642968246e41350fff6c3825091000529a004c6ba4",
+     "kind": "perf",
+     "category": "H",
+     "own_mark": "Its Engram row-cache bench (run_cache_and_packed_benchmark) on the image, 2 boots, ABBA against the base image in the same session (the last triage parked it for comparing with a recorded number): cold-miss and Zipfian lookups faster beyond the interval; the engram-row tests pass; rows identical",
+     "declared_output_change": "none",
+     "placement": "Engram reader (engram_on_disk at every shape); touches no other candidate's file"
+    }
+   ],
+   "stack_tree": "1116740c08aa1cf2cdeaa5b1fcf08dc93410ba56",
+   "stack_head_on_sp8": "8a2165812ad875fa8c3b08be4245649e8ea2d8ae"
+  },
+  "53": {
+   "testbed": "tp3-switched",
+   "nodes": "sp5..sp7 (head sp5)",
+   "shape": "tp3-switched",
+   "theme": "every PR that edits model_runner.py (one candidate must hold them all), with the TP3-only display carve-out and the copy-drafter pair",
+   "order": [
+    960,
+    971,
+    977,
+    984,
+    998
+   ],
+   "prs": [
+    {
+     "pr": 960,
+     "title": "Target FULL CUDA graph metadata/CED replay and MoE post-gate fork",
+     "pr_head": "6cfd0bd33413edb16cac1d07b3c2672cb95dbf60",
+     "source_patch": "experiments/2026-11-08-cudagraph-decode-optimizations/vllm/0762-perf-cudagraph-target-full-replay-and-post-gate-fork.patch",
+     "source_sha256": "95387b8e53e255d665bd3b0a6c1daae7614459acb16f31df6930ad3469354d7a",
+     "method": "git am",
+     "proposed_patch": "experiments/2026-11-08-cudagraph-decode-optimizations/vllm/0762-perf-cudagraph-target-full-replay-and-post-gate-fork.patch",
+     "proposed_sha256": "95387b8e53e255d665bd3b0a6c1daae7614459acb16f31df6930ad3469354d7a",
+     "kind": "perf",
+     "category": "K1",
+     "own_mark": "Its screen_cudagraph_wins.py on the image, 2 boots, ABBA against the base: per-step pre-launch metadata and CED staging on FULL decode steps lower beyond the interval (the PR: 438-451 us to 33-41 us from (1,1) to (16,64)), bit-exact; the engine grid and paired decode not worse. Its receipts predate its head commit (6cfd0bd3 dropped the post-gate MoE fork), so they must be re-run on the current patch",
+     "declared_output_change": "none",
+     "placement": "edits model_runner.py, which #971, #984 and #998 edit too: candidates overlap at most in test files, so all four share one candidate, and #998 acts only at TP3"
+    },
+    {
+     "pr": 971,
+     "title": "perf(spec-decode): cumulative survival in copy_apply, single-req 16-row tile cap, and wide-step dead-row mask",
+     "pr_head": "9ef22e1fcdf4c83d782d863dafbd51278362b6d5",
+     "source_patch": "experiments/2026-11-08-copy-drafter-survival-and-tile-cap/vllm/0762-perf-spec-decode-copy-drafter-survival-and-tile-cap.patch",
+     "source_sha256": "085ab2f9a4917535a31775068c071eb426a61dbdc5a348d376f3ac4483624d0f",
+     "method": "context-only rebase",
+     "proposed_patch": "rebases/53-02-perf-spec-decode-copy-drafter-survival-and-tile-cap.patch",
+     "proposed_sha256": "f56bd1a2841eafb80d4b59be9e89b564fd9c157e280b01214f4d4d4fd77f4b1b",
+     "kind": "perf (policy)",
+     "category": "P",
+     "own_mark": "Its screen_copy_drafter_smooth.py 58-layer step screen on the image, 2 boots: the single-stream initial copy step and the post-reject shrunk step faster beyond the interval at TP3; paired decode at 1 stream better and at 8 streams not worse; temperature-0 text unchanged",
+     "declared_output_change": "drafting and verification rows (copy continuation yield, single-request 16-row cap, wide-step padding mask); temperature-0 text must not change; sampled realizations may change",
+     "placement": "edits model_runner.py (see #960); its step screen was measured at TP3; the most promising of the conflicting policy PRs (#953, #971, #1003, #1002, #995) for a TP3 testbed"
+    },
+    {
+     "pr": 977,
+     "title": "perf(spec_decode): bound CopyDrafter long-context history scan in copy_match",
+     "pr_head": "4e0244deb7d53736b2caa0cc176755e2fbcf2008",
+     "source_patch": "experiments/2026-11-08-copy-drafter-long-context-scan/vllm/0762-perf-spec-decode-copy-drafter-long-context-scan.patch",
+     "source_sha256": "6ebb45904f7478addddbc58a1d6c36d66369322eea0e1bdcdc384cd1429c597f",
+     "method": "git am",
+     "proposed_patch": "experiments/2026-11-08-copy-drafter-long-context-scan/vllm/0762-perf-spec-decode-copy-drafter-long-context-scan.patch",
+     "proposed_sha256": "6ebb45904f7478addddbc58a1d6c36d66369322eea0e1bdcdc384cd1429c597f",
+     "kind": "perf (policy)",
+     "category": "P",
+     "own_mark": "Its bench_copy_match_long_context.py on the image, 2 boots: copy_match at 64K..1M faster beyond the interval, unchanged at <=32K (still a dense scan); copy drafts identical at <=32K",
+     "declared_output_change": "copy drafts at contexts past 32K (the bounded scan can miss a far match); temperature-0 text must not change; sampled realizations may change",
+     "placement": "shares tilelang_copy.py with #971 (they apply together), so it joins 53 or waits; it conflicts with no policy PR here"
+    },
+    {
+     "pr": 984,
+     "title": "perf(worker): reclaim UMA host heap and CUDA allocator slack across lifecycle",
+     "pr_head": "737aec88ed621f27376f500fa73002ce8718dc1c",
+     "source_patch": "experiments/2026-11-08-uma-allocator-hygiene/vllm/0762-perf-worker-reclaim-uma-heap-and-allocator-slack-acr.patch",
+     "source_sha256": "b82e1eecdb74042f067c4862a92dd2cf21cf844fbfa1729ca496f9a29e023e47",
+     "method": "git am",
+     "proposed_patch": "experiments/2026-11-08-uma-allocator-hygiene/vllm/0762-perf-worker-reclaim-uma-heap-and-allocator-slack-acr.patch",
+     "proposed_sha256": "b82e1eecdb74042f067c4862a92dd2cf21cf844fbfa1729ca496f9a29e023e47",
+     "kind": "perf (memory)",
+     "category": "H",
+     "own_mark": "Its bench_uma_allocator_hygiene.py on the image, 2 boots, and the screen's startup record: each rank's lowest MemAvailable at startup higher than the base's beyond the interval, time to ready not worse, no JIT after readiness; short-request TTFT during a long prefill not worse (its post-prefill cache flush runs on the serving path); KV capacity unchanged (the recipe fixes --kv-cache-memory-bytes)",
+     "declared_output_change": "none",
+     "placement": "edits model_runner.py, cudagraph_utils.py with #960; TP3's tighter memory shows its startup-floor gain best"
+    },
+    {
+     "pr": 998,
+     "title": "perf(worker): compact packed vocab tables and expand display carve-out weights",
+     "pr_head": "e89ab5f9a31b47128fc8dba420673c48458d8834",
+     "source_patch": "experiments/2026-11-08-display-carveout-weight-expansion/vllm/0762-perf-worker-compact-packed-vocab-tables-and-expand-d.patch",
+     "source_sha256": "cbb393495e7a1ce58df0aa1fdeb00c05a514ccfd1aefb918e90a83508efc809f",
+     "method": "git am",
+     "proposed_patch": "experiments/2026-11-08-display-carveout-weight-expansion/vllm/0762-perf-worker-compact-packed-vocab-tables-and-expand-d.patch",
+     "proposed_sha256": "cbb393495e7a1ce58df0aa1fdeb00c05a514ccfd1aefb918e90a83508efc809f",
+     "kind": "perf (memory)",
+     "category": "H",
+     "own_mark": "Its bench_carveout_expansion.py on the image, 2 boots (the PR commits no receipts: run it fresh): regular UMA saved per rank (the PR: 1,263 MiB at TP3), the moved DSpark MoE layers not slower (the PR: 8.5-12.3% faster), torch.equal; the startup floor higher. It acts only where SPARK_DS41F_DISPLAY_CARVEOUT_WEIGHTS=1, the TP3 shapes",
+     "declared_output_change": "none",
+     "placement": "TP3-only (SPARK_DS41F_DISPLAY_CARVEOUT_WEIGHTS=1 on tp3-triangle and tp3-switched, 0 on tp4-ring and tp4-switched)"
+    }
+   ],
+   "stack_tree": "c0e25ff14f7cbf760973002447e50ba507b987f9",
+   "stack_head_on_sp8": "a80be9325ca360a2ccf877015bbfbf0f4f46ae43"
+  }
+ },
+ "union": {
+  "applies": true,
+  "tree": "af72def980817fcf993e156ce1078f528b0788ef",
+  "note": "all three stacks on one tree in the order 51, 52, 53; the three candidates touch no common file, test files included"
+ },
+ "rules_checked": [
+  "no conflicting pair inside a candidate (pairwise-conflicts.json)",
+  "the candidates share no file at all (the rule allows test files)",
+  "one spec-decode policy PR of each conflicting group per candidate: #971 in 53; #968 (52) and #977 (53) conflict with no policy PR they share a candidate with",
+  "only patches that act on DeepSeek V4.1 Flash on GB10 (left_out)"
+ ],
+ "left_out": [
+  {
+   "pr": 987,
+   "patch": "0762-perf-dsv41-extend-WO-B-WIDE_DECODE-to-128-rows-and-g.patch",
+   "part": "vllm/models/deepseek_v4_1/sp_prefill.py and tests/models/test_deepseek_v4_1_sp_prefill.py (resolve_min_rows)",
+   "reason": "does nothing on this deployment: at max_num_seqs <= 16 the SP floor stays at the 205-row RoCE limit; it acts only past 32 streams",
+   "disposition": "left out at selection (file-level split)"
+  },
+  {
+   "pr": 987,
+   "patch": "same",
+   "part": "vllm/v1/worker/gpu/cudagraph_utils.py and its test in tests/v1/cudagraph/test_cudagraph_manager.py (_FULL_DEPTH_VARLEN_DECODE_MAX_REQS = 16)",
+   "reason": "does nothing on this deployment: the PR states zero change to captured graphs at max_num_seqs <= 16, and the recipe serves 16 (TP4) and 8 (TP3)",
+   "disposition": "left out at selection (file-level split)"
+  },
+  {
+   "pr": 987,
+   "patch": "same",
+   "part": "vllm/models/deepseek_v4_1/tilelang/collectives.py and vllm/distributed/device_communicators/cuda_communicator.py (all_reduce_rank_order through RoCE reduce-scatter + all-gather)",
+   "reason": "not inert: it moves CED decoder steps of 205..408 rows from the PyNCCL rank-order path to RoCE, a second causal variable unrelated to the WO-B mark",
+   "disposition": "split out; re-submit as its own experiment (prefill collectives, tp4-switched or tp3)"
+  },
+  {
+   "pr": 988,
+   "patch": "0762-perf-spec-decode-sampler-dead-row-skip-and-sparse-topk.patch",
+   "part": "sparse top-k Markov sampling: topk_* kernels in tilelang_sampling.py, _sample_sequential_topk in dspark/speculator.py, apply_markov_bias_topk in nvidia/dspark.py, apply_bias_topk in qwen3_dspark.py's DSparkMarkovHead, tests/v1/spec_decode/test_dspark_topk.py",
+   "reason": "does nothing on this deployment: it runs only when dspark_draft_topk is set, and neither the recipe nor the 1017 checkpoint's config sets it (drafts are greedy); Qwen3DSparkForCausalLM.apply_markov_bias_topk is another model",
+   "disposition": "PR queued: hunk-level split needed before it can join"
+  },
+  {
+   "pr": 995,
+   "patch": "0762-perf-spec-decode-copy-drafter-guards-and-wide-ramp.patch",
+   "part": "SPARK_DS41F_COPY_MAX_DRAFTS (vllm/config/speculative.py), greedy_rejection_kernel widths above 32 (tilelang_sampling.py), benchmark --lookahead, test_wide_lookahead_31_and_63_greedy_verification_and_ramp",
+   "reason": "does nothing on this deployment: the 31/63-draft ramp is opt-in; the recipe keeps max_drafts at 16 (17 rows), where the kernel keeps its one-pass code",
+   "disposition": "PR queued: hunk-level split needed"
+  },
+  {
+   "pr": 1006,
+   "patch": "0762-perf-dsv41-vectorize-postload-add-artifact-cache-and.patch",
+   "part": "vllm/models/deepseek_v4_1/tilelang/postload_cache.py and its hooks (artifact cache)",
+   "reason": "does nothing on this deployment: it reads or writes only when VLLM_POSTLOAD_CACHE_DIR or SPARK_DS41F_POSTLOAD_CACHE_DIR is set; the recipe sets neither",
+   "disposition": "PR queued: hunk-level split into its variables needed"
+  },
+  {
+   "pr": 1006,
+   "patch": "same",
+   "part": "vllm/models/deepseek_v41/nvidia/vl_model.py",
+   "reason": "does nothing on GB10: vllm/models/deepseek_v41 routes capability family 120 to vllm/models/deepseek_v4_1; this file is the other-NVIDIA path",
+   "disposition": "PR queued (file-level)"
+  },
+  {
+   "pr": 983,
+   "patch": "0762-perf-dsv41-engram-clock-pro-prefill-shield-and-pinned-scales.patch",
+   "part": "pin_scales (rows.py and the two-plane reader path)",
+   "reason": "does nothing on this deployment: opt-in SPARK_DS41F_ENGRAM_PIN_SCALES for two-plane tables; production reads packed rows",
+   "disposition": "PR parked"
+  },
+  {
+   "pr": 957,
+   "patch": "0762-perf-dsv41-tp3-decode-compressor-mla-and-spec-fusions.patch",
+   "part": "part 3, fused post-step verification bookkeeping (acceptance_estimator.py, speculator.py, model_runner.py)",
+   "reason": "superseded: the base's #965 and #980 already fuse the dead-row cut and copy state into _accumulate_kernel; these hunks conflict with them",
+   "disposition": "PR queued for rework"
+  },
+  {
+   "pr": 954,
+   "patch": "whole PR",
+   "part": "",
+   "reason": "does nothing on this deployment (opt-in LSA)",
+   "disposition": "parked"
+  },
+  {
+   "pr": 1014,
+   "patch": "whole PR",
+   "part": "",
+   "reason": "does nothing on this deployment (opt-in LSA)",
+   "disposition": "parked"
+  },
+  {
+   "pr": 981,
+   "patch": "whole PR",
+   "part": "",
+   "reason": "does nothing on this deployment (TP=2 is not served)",
+   "disposition": "parked"
+  },
+  {
+   "pr": 1004,
+   "patch": "whole PR",
+   "part": "",
+   "reason": "does nothing on this deployment (the draft layers have no indexer)",
+   "disposition": "parked"
+  }
+ ],
+ "not_inert_notes": [
+  "#960's vllm/v1/worker/gpu/spec_decode/dflash/speculator.py hunk acts: DSparkSpeculator subclasses DFlashSpeculator and inherits propose() and uses_target_attn_metadata",
+  "#998's and #988's vllm/model_executor/models/qwen3_dspark.py: DSparkMarkovHead and DSparkConfidenceHead there are DeepSeek V4.1's DSpark heads (vllm/models/deepseek_v4_1/nvidia/dspark.py imports them); #998's markov_w1 change acts, #988's top-k additions do not",
+  "#961's vllm/models/glm5next/nvidia/l2_prefetch.py and tilelang/l2_prefetch.py: DeepSeek V4.1's prefetch (vllm/models/deepseek_v4_1/l2_prefetch.py) imports both; the CuTe DSL kernel class does nothing under VLLM_L2_PREFETCH_KERNELS=tilelang and the _GRID default change (4 to 1 on sm_121) does nothing because the recipe sets VLLM_L2_PREFETCH_GRID=2, but the file holds the shared constants, so it is carried whole",
+  "#1003's _sample_sequential_topk halt does nothing (dspark_draft_topk unset); the PR is queued anyway",
+  "#971's wide-step padding mask relies on VLLM_MOE_SKIP_PADDING, which defaults to 1",
+  "CopyDrafter is always on in the recipe (DSpark, greedy drafts, adaptive verification), so #968, #971, #977 and #995 act"
+ ],
+ "queued": [
+  {
+   "pr": 1003,
+   "category": "P",
+   "why": "conflicts with #971 (adaptive_verification.py and its test), #953, #988 and #1002; edits model_runner.py, which 53 holds",
+   "next": "a TP4 candidate next round, on the base with #971's verdict (rebase there); its c1 +6% is modelled (identical numbers on both boots)",
+   "rebase": "context-only (test append) on today's base"
+  },
+  {
+   "pr": 953,
+   "category": "P",
+   "why": "conflicts with #971, #1003 and #1002; its mark is the TP6..TP8 switched prose c16 regression, and no testbed this round runs TP6..TP8; edits adaptive_verification.py, which 53 holds",
+   "next": "a round with tp6..tp8-switched (sp1..sp8)",
+   "rebase": "context-only (test append) on today's base"
+  },
+  {
+   "pr": 995,
+   "category": "F/P",
+   "why": "its negative-slot guard (copy_alloc_kernel and copy_apply_kernel index total_len/int_state/float_state/history with slot < 0) is a fix; its 31/63 ramp does nothing here; conflicts with #971 and #977 in tilelang_copy.py",
+   "next": "rework: split the guard (F, first next round, rebased onto #971/#977 if they pass), the cap decay and anchor pruning (P), and leave out the ramp",
+   "rebase": "applies alone on today's base; hunk-level split needed"
+  },
+  {
+   "pr": 988,
+   "category": "P",
+   "why": "the sparse top-k half does nothing here; conflicts with #1003 (dspark/speculator.py); edits qwen3_dspark.py, which 53's #998 edits",
+   "next": "rework: keep the dead-row verification sampler skip (acts at temperature > 0; the recipe's default temperature is 1.0)",
+   "rebase": "applies alone; hunk-level split needed"
+  },
+  {
+   "pr": 957,
+   "category": "K1/P",
+   "why": "five variables; part 3 is superseded by the base's #965/#980 and its hunks conflict with them (model_runner.py, acceptance_estimator.py, speculator.py, test_adaptive_verification.py); edits model_runner.py and compressor.py",
+   "next": "rework into: replicated BF16 compressor at TP<=4; sparse-MLA branchless stage 2; DSpark confidence-calibration fusion with the (4, 24) dummy-run fix; TP3 adaptive constants (P). The TP3 parts to tp3-switched",
+   "rebase": "code conflict with the base"
+  },
+  {
+   "pr": 956,
+   "category": "K2",
+   "why": "code conflict with the base's #1012 in attention.py (the decode-overlap branch); edits ced.py and nvidia/model_state.py, which 53's #960 edits",
+   "next": "rebase onto the next base (with #960's verdict); tp4-switched, where its served prefill screen was taken",
+   "rebase": "code conflict with the base"
+  },
+  {
+   "pr": 978,
+   "category": "H",
+   "why": "code conflict with the base's #972 in vllm/v1/engine/async_llm.py (abort shielding); edits scheduler.py, which 52's #968 edits",
+   "next": "rebase onto #972; then a candidate with #968's verdict",
+   "rebase": "code conflict with the base"
+  },
+  {
+   "pr": 1006,
+   "category": "H",
+   "why": "five variables in one patch; the artifact cache does nothing by default; conflicts with #998 (packed_bf16.py, embedding.py) and #981; overlaps #963 (vocab.py, gemm.py) and #1030 (moe.py)",
+   "next": "rework into its variables, leaving out the cache and deepseek_v41/nvidia/vl_model.py",
+   "rebase": "applies alone; split needed"
+  },
+  {
+   "pr": 1008,
+   "category": "H",
+   "why": "needs a sparknet patch series in the lock (1107 pins sparknet with none); conflicts with #984 in gpu_worker.py; overlaps #969 in engram_rows/_reader.c",
+   "next": "a round where #984 and #969 have verdicts; its sparknet patch applies on 1fd6a1fb",
+   "rebase": "applies alone (vLLM and sparknet)"
+  },
+  {
+   "pr": 967,
+   "category": "K1",
+   "why": "a compiler-wide TileLang pass change (needs a TileLang series entry and a TileLang rebuild; every kernel recompiles)",
+   "next": "the #974/#1015 toolchain track; its TileLang patch applies on 1107's TileLang tree",
+   "rebase": "context-only (test append) for its vLLM patch"
+  }
+ ],
+ "rebase_needed": [
+  {
+   "pr": 949,
+   "kind": "code conflict with the base",
+   "files": [
+    "vllm/parser/deepseek_v41.py",
+    "vllm/parser/engine/parser_engine.py",
+    "vllm/parser/engine/parser_engine_config.py",
+    "vllm/parser/parser_manager.py"
+   ]
+  },
+  {
+   "pr": 953,
+   "kind": "context-only rebase (test append at the same spot as a base patch)",
+   "files": [
+    "tests/v1/spec_decode/test_adaptive_verification.py"
+   ]
+  },
+  {
+   "pr": 954,
+   "kind": "context-only rebase (test append at the same spot as a base patch)",
+   "files": []
+  },
+  {
+   "pr": 956,
+   "kind": "code conflict with the base",
+   "files": [
+    "vllm/models/deepseek_v4_1/attention.py"
+   ]
+  },
+  {
+   "pr": 957,
+   "kind": "code conflict with the base",
+   "files": [
+    "tests/v1/spec_decode/test_adaptive_verification.py",
+    "vllm/v1/worker/gpu/model_runner.py",
+    "vllm/v1/worker/gpu/spec_decode/acceptance_estimator.py",
+    "vllm/v1/worker/gpu/spec_decode/speculator.py"
+   ]
+  },
+  {
+   "pr": 967,
+   "kind": "context-only rebase (test append at the same spot as a base patch)",
+   "files": [
+    "tests/kernels/attention/test_deepseek_v41_tilelang.py"
+   ]
+  },
+  {
+   "pr": 971,
+   "kind": "context-only rebase (test append at the same spot as a base patch)",
+   "files": [
+    "tests/v1/spec_decode/test_adaptive_verification.py"
+   ]
+  },
+  {
+   "pr": 978,
+   "kind": "code conflict with the base",
+   "files": [
+    "vllm/v1/engine/async_llm.py"
+   ]
+  },
+  {
+   "pr": 987,
+   "kind": "context-only rebase (test append at the same spot as a base patch)",
+   "files": [
+    "tests/kernels/quantization/test_deepseek_v41_tilelang_linear.py"
+   ]
+  },
+  {
+   "pr": 994,
+   "kind": "code conflict with the base",
+   "files": [
+    "tests/kernels/attention/test_deepseek_v41_tilelang.py",
+    "vllm/models/deepseek_v4_1/tilelang/sparse_mla.py"
+   ]
+  },
+  {
+   "pr": 1001,
+   "kind": "context-only rebase (test append at the same spot as a base patch)",
+   "files": [
+    "tests/kernels/quantization/test_deepseek_v41_tilelang_vocab.py"
+   ]
+  },
+  {
+   "pr": 1003,
+   "kind": "context-only rebase (test append at the same spot as a base patch)",
+   "files": [
+    "tests/v1/spec_decode/test_adaptive_verification.py"
+   ]
+  },
+  {
+   "pr": 1004,
+   "kind": "code conflict with the base",
+   "files": [
+    "vllm/models/deepseek_v4_1/attention.py"
+   ]
+  }
+ ],
+ "housekeeping": [
+  {
+   "pr": 938,
+   "what": "docs: pool reservations, disk hygiene, inspiration watchlist",
+   "action": "owner: adds a second coordination file beside spark-hold.json and edits AGENTS.md; unchanged since the last triage"
+  },
+  {
+   "pr": 949,
+   "what": "DSML provenance proposal on the 1030 base (external)",
+   "action": "close as superseded by #955, which the base carries (0768); its patch conflicts with 0768 in vllm/parser/deepseek_v41.py, parser_engine.py, parser_engine_config.py and parser_manager.py"
+  },
+  {
+   "pr": 958,
+   "what": "TP3 6-channel NCCL profile and topology check",
+   "action": "review the scripts/topology.py change, then merge after the unit suite on a dgx node"
+  },
+  {
+   "pr": 959,
+   "what": "build: Git auto-GC off, batched git am in build checkouts",
+   "action": "merge after the unit suite on a dgx node (spark_ds41f/build.py)"
+  },
+  {
+   "pr": 970,
+   "what": "docs: 1107 is production",
+   "action": "merge; reconcile with the owner's uncommitted README.md and docs/current-state.md edits on the laptop checkout first (both files are modified there)"
+  },
+  {
+   "pr": 974,
+   "what": "CUDA 13.5.37 toolchain",
+   "action": "owner: its own track; it changes every kernel, so settle it before a kernel batch is measured; #994 (PTX 9.2), #1015 and #967 belong to the same track"
+  },
+  {
+   "pr": 975,
+   "what": "sequential quality stop rules (external)",
+   "action": "owner: wire it into methodology or hold"
+  },
+  {
+   "pr": 976,
+   "what": "restore #877 LSA evidence, 25.9 MB (with the clustered-indexer capture patches)",
+   "action": "owner: repository size call; the capture patches are study instrumentation, not candidate material"
+  },
+  {
+   "pr": 985,
+   "what": "GLP-27 spec-v3 default",
+   "action": "owner: changes the steered name's behaviour and records it in runtime-defaults; needs a quality eval"
+  },
+  {
+   "pr": 1000,
+   "what": "second-site check of 1107 (external)",
+   "action": "merge as evidence"
+  },
+  {
+   "pr": 1007,
+   "what": "TODO: two measured dead ends",
+   "action": "merge"
+  },
+  {
+   "pr": 1017,
+   "what": "second-site opt-in LSA on 1107 (external, README only; new since the last triage)",
+   "action": "merge as evidence. It reports VLLM_DS41_LSA=1 at +37-43% 1M prefill with its quality probes unchanged; whether to open an LSA-by-default experiment (with quality evals) is an owner call. Not candidate material: the recipe leaves LSA off"
+  }
+ ],
+ "park": [
+  {
+   "pr": 954,
+   "what": "LSA FP8 group32 summaries",
+   "action": "does nothing on this deployment: VLLM_DS41_LSA is opt-in and the recipe leaves it unset; conflicts with #1014; needs a context-only test rebase on the base"
+  },
+  {
+   "pr": 962,
+   "what": "sparknet IKET/ROCE_TRACE",
+   "action": "tooling; applies on vLLM and sparknet; conflicts with #982 and #989 in sparknet"
+  },
+  {
+   "pr": 981,
+   "what": "TP=2 NVMe expert slot cache",
+   "action": "does nothing on this deployment: TP=2 is not a served shape (a new topology needs qualification); conflicts with #1006 in moe.py"
+  },
+  {
+   "pr": 982,
+   "what": "sparknet PDL chain study",
+   "action": "external repository study; its sparknet patch and its vLLM test patch apply; conflicts with #962 and #989"
+  },
+  {
+   "pr": 983,
+   "what": "Engram 2-bit Clock prefill shield, pinned scales",
+   "action": "evidence is a synthetic access pattern; its pinned-scales part does nothing here (opt-in SPARK_DS41F_ENGRAM_PIN_SCALES, two-plane tables; production reads packed rows); conflicts with #969 in _row_plan.h"
+  },
+  {
+   "pr": 989,
+   "what": "sparknet pipelined collectives study",
+   "action": "external repository study; applies on sparknet 1fd6a1fb; conflicts with #962 and #982"
+  },
+  {
+   "pr": 992,
+   "what": "producer MXFP8 bf16x2 casts",
+   "action": "writes root patches/vllm (0045 and the root series), not an experiment on the release series; noisy evidence. Restage it on the release series with a same-session A/B. Applies as a top patch; touches tilelang/gemm.py"
+  },
+  {
+   "pr": 994,
+   "what": "sparse MLA bf16x2 dequant",
+   "action": "needs CUDA 13.5 (PTX 9.2): the #974 track; writes root patches/; its vLLM patch conflicts with the base's #964 in sparse_mla.py and its test file"
+  },
+  {
+   "pr": 1002,
+   "what": "online DSpark adaptation",
+   "action": "modelled gains only; session memory crosses requests; conflicts with #953, #971, #1003"
+  },
+  {
+   "pr": 1004,
+   "what": "DSpark top-k selection reuse",
+   "action": "does nothing on this deployment: DeepSeek V4.1 Flash's draft layers have no indexer; also conflicts with the base's #1012 in attention.py"
+  },
+  {
+   "pr": 1014,
+   "what": "LSA block8 midrange blend",
+   "action": "does nothing on this deployment (opt-in LSA); conflicts with #954"
+  },
+  {
+   "pr": 1015,
+   "what": "TileLang upstream audit",
+   "action": "pair it with the #974 toolchain track; its six TileLang patches apply on 1107's TileLang tree"
+  }
+ ],
+ "decided_not_in_pool": {
+  "passed_in_base": [
+   966,
+   997,
+   965,
+   1012,
+   1016,
+   964,
+   955,
+   980,
+   1013,
+   972,
+   1011,
+   973,
+   999,
+   993,
+   991,
+   979,
+   996
+  ],
+  "in_rework": [
+   1009
+  ],
+  "dropped": [
+   986,
+   1005,
+   1010
+  ],
+  "process": [
+   1038,
+   1040
+  ]
+ },
+ "attribution_notes": [
+  "51: #961's two l2_prefetch files are touched by no other patch, so a tp4-no961 overlay control is possible; #963, #987 and #1001 share gemm.py/vocab.py, so none of them has one",
+  "52: #1030 (moe.py), #968 (scheduler.py) and #969 (engram_rows/_reader.c and _row_plan.h, compiled at runtime by _native.py) each touch files no other patch in 52 touches, so all three have overlay controls; the determinism gate for #968/#969 runs on the no1030 control",
+  "53: #960, #971, #984 and #998 all edit model_runner.py and #977 shares tilelang_copy.py with #971, so no PR in 53 has a pure-Python overlay control; attribution there needs per-PR image variants. #984 and #998 both move the startup floor: their own benches separate them"
+ ],
+ "for_assembly": "Patch files, in order, are the PR heads' patches (method git am) or rebases/<candidate>-<file> (context-only rebase or split). The coordinator writes vllm/series, selection.json (with left_out carried over) and the configurations."
+}

@@ -1,0 +1,560 @@
+From 45fc01386724c3e53ec4633da395ddc77be5293a Mon Sep 17 00:00:00 2001
+From: Christopher Owen <christopherowen@users.noreply.github.com>
+Date: Sun, 8 Nov 2026 14:30:00 +0100
+Subject: [PATCH] perf(spec_decode): bound CopyDrafter long-context history
+ scan in copy_match
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Base: 1107 vLLM patch head 320021e3c4dbb202d911ab70e2cd924c75420488.
+
+Rationale:
+In CopyDrafter (`vllm/v1/worker/gpu/spec_decode/tilelang_copy.py`), `copy_match_kernel` previously scanned the full request history from `full_last` down to `min_match` on every decode step unless a 256-token match (`best[count - 1] >= 0`) was found. Because `token_ids_cpu` is backed by host-pinned UVA memory (`4 MB` per request at `1M` context), steps without a 256-token match — including ordinary prose generation and steps with 8-, 16-, or 32-token recent matches — swept the entire 512K–1M history across the GB10 C2C coherency fabric (`73–125 us` at `c1` and `362–465 us` at `c16` at `1M` context). In addition:
+1. `evaluate_end` passed a multi-load boolean conjunction directly to an `if` statement whose body had multiple statements, causing TVM's `FlattenBuffer` pass to duplicate the global-memory anchor condition 8–11 times in generated CUDA C.
+2. The midpoint probe checked `key[max(need_len // 2, 1) - 1]` (inside a `need_len // 2` boilerplate suffix) without checking `key[1]`, allowing repeated boilerplate phrases to enter the run-walk loop.
+3. The suffix walk executed up to 255 serialized dependent scalar loads per candidate.
+
+Update `copy_match_kernel` with four targeted improvements:
+1. Bounded two-tier long-context scan (`_DENSE_SCAN_LIMIT = 32768`, `_RECENT_WINDOW = 16384`, `_PREFIX_WINDOW = 16384`): contexts up to `32K` tokens are scanned densely in full; longer contexts densely scan the newest `16K` tokens (conversational and scratchpad repeats), probe the first quarter (`[16384, length // 4 + 1024]`) at a 256-token stride using one coalesced 32-token tile per 256 positions against `key[32 * m]` (`m in 0..7`) to detect 256-token long-horizon matches with 8x fewer cache-line reads, and densely scan the initial `16K` prefix (system prompts, schemas, and document headers).
+2. Single-evaluation four-point anchor filter (`key[0]`, `key[1]`, `key[need_len // 2]`, and `key[need_len - 1]`) materialized into a local scalar `matched[0]` before branching so TVM emits the global loads once per tile element.
+3. 8-wide unpredicated parallel run walk (`count_run`) that issues 8 in-bounds comparisons in parallel per iteration before a short `< 8` scalar tail.
+4. Per-warp `__any_sync` reduction across phases without CTA-wide barrier stalls inside the scan loops.
+
+Quality:
+Exact match semantics for all contexts `<= 32K` tokens, all matches within the newest `16K` tokens or initial `16K` prefix at any context length, and all `256`-token matches in the first quarter of long contexts; speculative draft proposals remain verified losslessly by the target model.
+
+Tests:
+- pytest tests/v1/spec_decode/test_copy_drafts.py (45 passed across two GPU boots).
+- benchmarks/kernels/benchmark_copy_drafts.py --gate --cases copy (passes all latency gates across two GPU boots).
+
+Upstream status: local candidate, not yet submitted.
+---
+ tests/v1/spec_decode/test_copy_drafts.py      |  42 ++
+ .../worker/gpu/spec_decode/tilelang_copy.py   | 394 +++++++++++++++---
+ 2 files changed, 371 insertions(+), 65 deletions(-)
+
+diff --git a/tests/v1/spec_decode/test_copy_drafts.py b/tests/v1/spec_decode/test_copy_drafts.py
+index 24ccd43cb..7b4cc512a 100644
+--- a/tests/v1/spec_decode/test_copy_drafts.py
++++ b/tests/v1/spec_decode/test_copy_drafts.py
+@@ -1518,3 +1518,45 @@ def test_copy_match_boilerplate_anchor_pruning_is_bit_identical():
+     sources = _run_match(history, total_len, idx)
+     for row, S in enumerate(streams):
+         assert _best(sources[row], length) == ref_source(S, length)
++
++
++
++def test_copy_match_long_context_two_tier_scan():
++    """Above 32K tokens, copy_match finds recent-window matches, initial-prefix
++    matches, and sparse first-quarter 256-token matches exactly."""
++    rng = np.random.default_rng(20261108)
++    length = 131072
++    history = _history(3, length + 64)
++    total_len = torch.full((3,), length, dtype=torch.int32, device=DEVICE)
++    tail = rng.integers(10, VOCAB, MAX_LEVEL, dtype=np.int32)
++    streams = []
++
++    # Row 0: 32-token match in the recent 16K window (at length - 1200) and
++    # 16-token match in the 16K prefix (at 4000); longer 32-token match wins.
++    S0 = rng.integers(10, VOCAB, length, dtype=np.int32)
++    S0[4000 - 16 : 4000] = tail[MAX_LEVEL - 16 :]
++    S0[length - 1200 - 32 : length - 1200] = tail[MAX_LEVEL - 32 :]
++    S0[length - MAX_LEVEL :] = tail
++    streams.append(S0)
++
++    # Row 1: 16-token match in the initial 16K prefix (at 6000) with no recent match.
++    S1 = rng.integers(10, VOCAB, length, dtype=np.int32)
++    S1[6000 - 16 : 6000] = tail[MAX_LEVEL - 16 :]
++    S1[length - MAX_LEVEL :] = tail
++    streams.append(S1)
++
++    # Row 2: 256-token match in the first quarter outside the 16K prefix (at 24000)
++    # and a shorter 32-token match in the recent window; 256-token match wins.
++    S2 = rng.integers(10, VOCAB, length, dtype=np.int32)
++    S2[24000 - MAX_LEVEL : 24000] = tail
++    S2[length - 800 - 32 : length - 800] = tail[MAX_LEVEL - 32 :]
++    S2[length - MAX_LEVEL :] = tail
++    streams.append(S2)
++
++    for row, S in enumerate(streams):
++        history[row, :length] = torch.from_numpy(S).to(DEVICE)
++
++    idx = torch.arange(3, dtype=torch.int64, device=DEVICE)
++    sources = _run_match(history, total_len, idx)
++    for row, S in enumerate(streams):
++        assert _best(sources[row], length) == ref_source(S, length)
+diff --git a/vllm/v1/worker/gpu/spec_decode/tilelang_copy.py b/vllm/v1/worker/gpu/spec_decode/tilelang_copy.py
+index 32eab0055..0b30a5536 100644
+--- a/vllm/v1/worker/gpu/spec_decode/tilelang_copy.py
++++ b/vllm/v1/worker/gpu/spec_decode/tilelang_copy.py
+@@ -18,12 +18,12 @@ The scan visits full continuations in 32-element aligned tiles latest first,
+ then short ones in block 0. Because tiles visit decreasing priorities within each
+ warp, a warp reduces its matched levels across all 32 lanes whenever any lane
+ matches a new level and raises its required match length ``need_len`` to the
+-next unmatched level, probing the anchor tokens at ``need_len`` and
+-``need_len // 2`` before walking a candidate suffix. Each warp stops its
+-full-continuation scan after any lane matches the longest level: that hit also
+-matches every shorter level, and every unvisited end of the warp has lower
+-priority. Other warps keep their own exact search. No history window or
+-candidate is omitted unless it cannot improve the result.
++next unmatched level, probing a four-point anchor filter (``key[0]``, ``key[1]``,
++``key[need_len // 2]``, and ``key[need_len - 1]``) before walking a candidate
++suffix in 8-token parallel steps. Short contexts (``<= 32K``) are scanned in full;
++longer contexts use a bounded two-tier scan over the most recent ``16K`` tokens,
++a sparse ``256``-stride phase-aligned anchor scan across the first quarter for
++256-token matches, and a dense scan of the initial ``16K`` prefix.
+ 
+ - ``copy_alloc``: a warp a request, before the drafter's proposal is needed.
+   First the copy state of the request's last proposal is updated from this
+@@ -92,50 +92,120 @@ def num_levels(min_match: int) -> int:
+     return len(CopyDraftsConfig(min_match=min_match).levels())
+ 
+ 
++# Contexts up to _DENSE_SCAN_LIMIT are scanned in full; longer contexts scan
++# the newest _RECENT_WINDOW tokens densely, probe the first quarter at 256-token
++# stride for 256-token matches, and scan the initial _PREFIX_WINDOW tokens densely.
++_DENSE_SCAN_LIMIT = 32768
++_RECENT_WINDOW = 16384
++_PREFIX_WINDOW = 16384
++
++
+ @tilelang.jit(pass_configs=_PASS)
+ def copy_match_kernel(min_match: int, lookahead: int, idx_dtype: str):
+     """See the module docstring: each block's best continuation priority per level."""
+     assert 1 <= lookahead <= _MATCH_THREADS
+     levels = CopyDraftsConfig(min_match=min_match).levels()
+     count = len(levels)
++    second_offset = 2 if min_match >= 2 else 1
+     num_reqs = T.dynamic("num_reqs")
+     history_rows, history_cols, history_stride = T.dynamic(
+         "history_rows, history_cols, history_stride"
+     )
+     total_rows = T.dynamic("total_rows")
+     span = CHUNKS * _MATCH_THREADS  # window ends a pass of the grid covers
++    sparse_span = span * 8  # window ends a sparse 256-match pass covers
++
++    @T.macro
++    def count_run(slot, history, key, e, run, stepping, ok):
++        run[0] = 0
++        stepping[0] = 1
++        while run[0] + 8 <= MAX_LEVEL and run[0] + 8 <= e and stepping[0] != 0:
++            ok[0] = (
++                T.if_then_else(history[slot, e - 1 - run[0]] == key[run[0]], 1, 0)
++                & T.if_then_else(
++                    history[slot, e - 2 - run[0]] == key[run[0] + 1], 1, 0
++                )
++                & T.if_then_else(
++                    history[slot, e - 3 - run[0]] == key[run[0] + 2], 1, 0
++                )
++                & T.if_then_else(
++                    history[slot, e - 4 - run[0]] == key[run[0] + 3], 1, 0
++                )
++                & T.if_then_else(
++                    history[slot, e - 5 - run[0]] == key[run[0] + 4], 1, 0
++                )
++                & T.if_then_else(
++                    history[slot, e - 6 - run[0]] == key[run[0] + 5], 1, 0
++                )
++                & T.if_then_else(
++                    history[slot, e - 7 - run[0]] == key[run[0] + 6], 1, 0
++                )
++                & T.if_then_else(
++                    history[slot, e - 8 - run[0]] == key[run[0] + 7], 1, 0
++                )
++            )
++            if ok[0] != 0:
++                run[0] = run[0] + 8
++            else:
++                stepping[0] = 0
++        while (
++            run[0] < MAX_LEVEL
++            and run[0] < e
++            and history[slot, e - 1 - run[0]] == key[run[0]]
++        ):
++            run[0] = run[0] + 1
+ 
+     @T.macro
+     def evaluate_end(
+-        slot, history, key, k0, e, priority, need_len, best, hit
++        slot,
++        history,
++        key,
++        k0,
++        k1,
++        e,
++        priority,
++        need_len,
++        half_idx,
++        k_half,
++        k_need,
++        matched,
++        run,
++        stepping,
++        ok,
++        best,
++        hit,
+     ):
++        matched[0] = 0
+         if (
+-            e >= need_len
++            e >= need_len[0]
+             and history[slot, e - 1] == k0
+-            and history[slot, e - need_len] == key[need_len - 1]
+-            and history[slot, e - T.max(need_len // 2, 1)]
+-            == key[T.max(need_len // 2, 1) - 1]
++            and history[slot, e - second_offset] == k1
++            and history[slot, e - 1 - half_idx[0]] == k_half[0]
++            and history[slot, e - need_len[0]] == k_need[0]
+         ):
+-            run = T.alloc_var(T.int32, init=1)
+-            # The shortest level first: most ends fail on its first
+-            # token. A token is loaded only while the run reaches it.
+-            for j in T.unroll(1, min_match):
+-                if run == j:  # noqa: SIM102
+-                    if history[slot, e - 1 - j] == key[j]:
+-                        run = j + 1
+-            # A longer level only past a full match of the one before.
+-            for i in tuple(range(1, count)):
+-                if run == levels[i - 1]:
+-                    for j in T.serial(levels[i - 1], levels[i]):
+-                        if run == j and j < e:  # noqa: SIM102
+-                            if history[slot, e - 1 - j] == key[j]:
+-                                run = j + 1
+-            if run >= need_len:
++            matched[0] = 1
++        if matched[0] != 0:
++            count_run(slot, history, key, e, run, stepping, ok)
++            if run[0] >= need_len[0]:
+                 hit[0] = 1
+                 for i in tuple(range(count)):
+-                    if run >= levels[i]:
++                    if run[0] >= levels[i]:
+                         best[i] = T.max(best[i], priority)
+ 
++    @T.macro
++    def sync_warp_state(key, best, need_len, half_idx, k_half, k_need, searching):
++        for i in tuple(range(count)):
++            for distance in (16, 8, 4, 2, 1):
++                best[i] = T.max(best[i], T.shfl_xor(best[i], distance))
++        for i in tuple(range(count - 1)):
++            if best[i] >= 0:
++                need_len[0] = levels[i + 1]
++        half_idx[0] = T.min(T.max(need_len[0] // 2, 1), MAX_LEVEL - 1)
++        k_half[0] = key[half_idx[0]]
++        k_need[0] = key[need_len[0] - 1]
++        if best[count - 1] >= 0:
++            searching[0] = 0
++
+     @T.prim_func
+     def copy_match(
+         idx_mapping: T.Tensor((num_reqs,), idx_dtype),
+@@ -151,13 +221,26 @@ def copy_match_kernel(min_match: int, lookahead: int, idx_dtype: str):
+             partial = T.alloc_shared((_MATCH_WARPS, count), T.int32)
+             best = T.alloc_local((count,), T.int32)
+             hit = T.alloc_local((1,), T.int32)
++            matched = T.alloc_local((1,), T.int32)
++            need_len = T.alloc_local((1,), T.int32)
++            half_idx = T.alloc_local((1,), T.int32)
++            k_half = T.alloc_local((1,), T.int32)
++            k_need = T.alloc_local((1,), T.int32)
++            run = T.alloc_local((1,), T.int32)
++            stepping = T.alloc_local((1,), T.int32)
++            ok = T.alloc_local((1,), T.int32)
++            searching = T.alloc_local((1,), T.int32)
++            e_cand = T.alloc_local((1,), T.int32)
+             slot = T.alloc_var(T.int64, init=T.cast(idx_mapping[r], T.int64))
+             length = T.alloc_var(T.int32, init=0)
+             if slot >= 0:
+                 length = total_len[slot]
+-            full_last = length - lookahead
+-            top_aligned = T.if_then_else(
+-                full_last >= min_match, ((full_last + 31) // 32) * 32, 0
++            full_last = T.alloc_var(T.int32, init=length - lookahead)
++            top_aligned = T.alloc_var(
++                T.int32,
++                init=T.if_then_else(
++                    full_last >= min_match, ((full_last + 31) // 32) * 32, 0
++                ),
+             )
+             if length <= min_match or (
+                 c > 0 and top_aligned - c * _MATCH_THREADS < min_match
+@@ -175,49 +258,222 @@ def copy_match_kernel(min_match: int, lookahead: int, idx_dtype: str):
+                     best[i] = -1
+                 T.sync_threads()
+                 k0 = T.alloc_var(T.int32, init=key[0])
+-                need_len = T.alloc_var(T.int32, init=min_match)
++                k1 = T.alloc_var(T.int32, init=key[second_offset - 1])
++                k_last = T.alloc_var(T.int32, init=key[MAX_LEVEL - 1])
++                need_len[0] = min_match
++                half_idx[0] = T.min(T.max(min_match // 2, 1), MAX_LEVEL - 1)
++                k_half[0] = key[half_idx[0]]
++                k_need[0] = key[min_match - 1]
+                 # Stage 1: full continuations (e in [min_match, full_last]) in
+                 # 32-element aligned warp tiles from highest priority down.
+                 warp_tile = T.alloc_var(
+                     T.int32,
+                     init=top_aligned - (c + 1) * _MATCH_THREADS + (tx // 32) * 32,
+                 )
+-                searching = T.alloc_var(T.int32, init=1)
+-                while warp_tile + 32 >= min_match and searching != 0:
+-                    hit[0] = 0
+-                    e = warp_tile + tx % 32 + 1
+-                    if min_match <= e and e <= full_last:
+-                        evaluate_end(
+-                            slot,
+-                            history,
+-                            key,
+-                            k0,
+-                            e,
+-                            e + lookahead,
+-                            need_len,
+-                            best,
+-                            hit,
+-                        )
+-                    if (
+-                        T.call_extern(
+-                            "int32",
+-                            "__any_sync",
+-                            T.uint32(0xFFFFFFFF),
+-                            hit[0] != 0,
+-                        )
+-                        != 0
++                searching[0] = 1
++                if top_aligned <= _DENSE_SCAN_LIMIT:
++                    while warp_tile + 32 >= min_match and searching[0] != 0:
++                        hit[0] = 0
++                        e = warp_tile + tx % 32 + 1
++                        if min_match <= e and e <= full_last:
++                            evaluate_end(
++                                slot,
++                                history,
++                                key,
++                                k0,
++                                k1,
++                                e,
++                                e + lookahead,
++                                need_len,
++                                half_idx,
++                                k_half,
++                                k_need,
++                                matched,
++                                run,
++                                stepping,
++                                ok,
++                                best,
++                                hit,
++                            )
++                        if (
++                            T.call_extern(
++                                "int32",
++                                "__any_sync",
++                                T.uint32(0xFFFFFFFF),
++                                hit[0] != 0,
++                            )
++                            != 0
++                        ):
++                            sync_warp_state(
++                                key,
++                                best,
++                                need_len,
++                                half_idx,
++                                k_half,
++                                k_need,
++                                searching,
++                            )
++                        warp_tile -= span
++                else:
++                    recent_floor = T.alloc_var(
++                        T.int32, init=top_aligned - _RECENT_WINDOW
++                    )
++                    while warp_tile >= recent_floor and searching[0] != 0:
++                        hit[0] = 0
++                        e = warp_tile + tx % 32 + 1
++                        if min_match <= e and e <= full_last:
++                            evaluate_end(
++                                slot,
++                                history,
++                                key,
++                                k0,
++                                k1,
++                                e,
++                                e + lookahead,
++                                need_len,
++                                half_idx,
++                                k_half,
++                                k_need,
++                                matched,
++                                run,
++                                stepping,
++                                ok,
++                                best,
++                                hit,
++                            )
++                        if (
++                            T.call_extern(
++                                "int32",
++                                "__any_sync",
++                                T.uint32(0xFFFFFFFF),
++                                hit[0] != 0,
++                            )
++                            != 0
++                        ):
++                            sync_warp_state(
++                                key,
++                                best,
++                                need_len,
++                                half_idx,
++                                k_half,
++                                k_need,
++                                searching,
++                            )
++                        warp_tile -= span
++
++                    quarter_top = T.alloc_var(
++                        T.int32,
++                        init=T.min(
++                            recent_floor,
++                            ((length // 4 + 1024 + 255) // 256) * 256,
++                        ),
++                    )
++                    sparse_base = T.alloc_var(
++                        T.int32,
++                        init=(quarter_top // 256) * 256
++                        - (c + 1) * _MATCH_WARPS * 256
++                        + (tx // 32) * 256,
++                    )
++                    tok = T.alloc_var(T.int32, init=-1)
++                    while (
++                        sparse_base + 256 >= _PREFIX_WINDOW and searching[0] != 0
+                     ):
+-                        for i in tuple(range(count)):
+-                            for distance in (16, 8, 4, 2, 1):
+-                                best[i] = T.max(best[i], T.shfl_xor(best[i], distance))
+-                        for i in tuple(range(count - 1)):
+-                            if best[i] >= 0:
+-                                need_len = levels[i + 1]
+-                        if best[count - 1] >= 0:
+-                            searching = 0
+-                    warp_tile -= span
++                        hit[0] = 0
++                        e_cand[0] = 0
++                        if sparse_base >= 0 and sparse_base + (tx % 32) < full_last:
++                            tok = history[slot, sparse_base + (tx % 32)]
++                            for m in tuple(range(8)):
++                                if tok == key[32 * m]:
++                                    e_try = sparse_base + 32 * m + (tx % 32) + 1
++                                    if (
++                                        MAX_LEVEL <= e_try
++                                        and e_try <= recent_floor
++                                        and history[slot, e_try - 1] == k0
++                                        and history[slot, e_try - second_offset] == k1
++                                        and history[slot, e_try - MAX_LEVEL]
++                                        == k_last
++                                    ):
++                                        e_cand[0] = e_try
++                        if e_cand[0] > 0:
++                            count_run(
++                                slot, history, key, e_cand[0], run, stepping, ok
++                            )
++                            if run[0] >= MAX_LEVEL:
++                                hit[0] = 1
++                                for i in tuple(range(count)):
++                                    best[i] = T.max(
++                                        best[i], e_cand[0] + lookahead
++                                    )
++                        if (
++                            T.call_extern(
++                                "int32",
++                                "__any_sync",
++                                T.uint32(0xFFFFFFFF),
++                                hit[0] != 0,
++                            )
++                            != 0
++                        ):
++                            sync_warp_state(
++                                key,
++                                best,
++                                need_len,
++                                half_idx,
++                                k_half,
++                                k_need,
++                                searching,
++                            )
++                        sparse_base -= sparse_span
++
++                    warp_tile = (
++                        _PREFIX_WINDOW
++                        - (c + 1) * _MATCH_THREADS
++                        + (tx // 32) * 32
++                    )
++                    while warp_tile + 32 >= min_match and searching[0] != 0:
++                        hit[0] = 0
++                        e = warp_tile + tx % 32 + 1
++                        if min_match <= e and e <= full_last:
++                            evaluate_end(
++                                slot,
++                                history,
++                                key,
++                                k0,
++                                k1,
++                                e,
++                                e + lookahead,
++                                need_len,
++                                half_idx,
++                                k_half,
++                                k_need,
++                                matched,
++                                run,
++                                stepping,
++                                ok,
++                                best,
++                                hit,
++                            )
++                        if (
++                            T.call_extern(
++                                "int32",
++                                "__any_sync",
++                                T.uint32(0xFFFFFFFF),
++                                hit[0] != 0,
++                            )
++                            != 0
++                        ):
++                            sync_warp_state(
++                                key,
++                                best,
++                                need_len,
++                                half_idx,
++                                k_half,
++                                k_need,
++                                searching,
++                            )
++                        warp_tile -= span
++
+                 # Stage 2: short continuations (at most lookahead - 1 ends) in block 0.
+-                if c == 0 and searching != 0:
++                if c == 0 and searching[0] != 0:
+                     e_short = T.max(min_match, full_last + 1) + tx
+                     if e_short < length:
+                         evaluate_end(
+@@ -225,9 +481,17 @@ def copy_match_kernel(min_match: int, lookahead: int, idx_dtype: str):
+                             history,
+                             key,
+                             k0,
++                            k1,
+                             e_short,
+                             length - e_short,
+                             need_len,
++                            half_idx,
++                            k_half,
++                            k_need,
++                            matched,
++                            run,
++                            stepping,
++                            ok,
+                             best,
+                             hit,
+                         )
+-- 
+2.43.0
+

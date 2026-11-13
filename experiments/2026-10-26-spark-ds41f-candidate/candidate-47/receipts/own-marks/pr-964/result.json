@@ -1,0 +1,1269 @@
+{
+ "pr": 964,
+ "pr_head": "d6d69b92afb9054cda51b5d2d0d55f3b7161787c",
+ "patch": "0769-perf-dsv41-sparse-mla-stage1-kv-gather-and-barrier-opt.patch",
+ "mark": "Its sparse-MLA stage-1 bench: gain beyond the interval, bit-exact",
+ "host": "sp1 (spark-0009, NVIDIA GB10, driver 580.178.04)",
+ "images": {
+  "1107": "sha256:3f32a962ce04b7c8d85337cd427a8946b8b6bcaadd97cc8d8a8cd14e8d68a6ce",
+  "candidate-47": "the same image with the 26 candidate-47 files bind-mounted read-only; ../common/overlay-sha.txt"
+ },
+ "evidence": "One session on sp1, ABBA: the PR's bench_sparse_mla_pipeline.py on both images (bench-*.json; CUDA-graph replay of 10 back-to-back plan.run per graph, 25 windows, arms run one after another), then our h964.py: the image's SparseMlaV41Plan and the bench's embedded stage-1 kernel on the bench's workload with seeded inputs, graph replay interleaved window by window (25 windows), output hashes compared across images and arms.",
+ "readme_command_defects": [
+  "The README gives no command for its benchmark; we ran the script's own argparse interface (--output, --boot)",
+  "The bench labels the image's kernel 'base_1107' and compares it with its own embedded copy of the candidate (make_candidate_sparse_mla). On the candidate image that arm is the shipped 0769 kernel, so running the bench there compares candidate with candidate; the image-level comparison is the base arm across images",
+  "The embedded copy is not the shipped code: it computes h0 outside the segment-active branch and renames the record-segment local, and runs 0.4..1.2 us faster than the shipped kernel at decode M=12..24 (bit-identical output). The PR's decode deltas at those M are partly the copy's"
+ ],
+ "measured": {
+  "harness_graph_replay_image_kernel_cross_image": {
+   "TP3_h24/med_ctx_128_512": {
+    "1": {
+     "route": "split",
+     "1107_b1_b2_us": [
+      "10.996 \u00b1 0.071",
+      "10.931 \u00b1 0.116"
+     ],
+     "c47_b1_b2_us": [
+      "10.470 \u00b1 0.096",
+      "10.440 \u00b1 0.132"
+     ],
+     "delta_us": -0.508,
+     "delta_pct": -4.6,
+     "outcome_boot_range": "gain",
+     "outcome_ci95": "gain",
+     "in_image_bench_s1_minus_shipped_on_c47_b1_b2_us": [
+      0.009,
+      -0.02
+     ],
+     "verbatim_bench_base_arm_1107_b1_b2_vs_c47_b1_b2_us": [
+      [
+       11.019,
+       11.167
+      ],
+      [
+       10.59,
+       10.46
+      ]
+     ],
+     "bits_identical_across_images_and_arms": true
+    },
+    "2": {
+     "route": "split",
+     "1107_b1_b2_us": [
+      "11.320 \u00b1 0.203",
+      "11.113 \u00b1 0.053"
+     ],
+     "c47_b1_b2_us": [
+      "10.947 \u00b1 0.289",
+      "10.592 \u00b1 0.131"
+     ],
+     "delta_us": -0.447,
+     "delta_pct": -4.0,
+     "outcome_boot_range": "gain",
+     "outcome_ci95": "within",
+     "in_image_bench_s1_minus_shipped_on_c47_b1_b2_us": [
+      -0.217,
+      -0.066
+     ],
+     "verbatim_bench_base_arm_1107_b1_b2_vs_c47_b1_b2_us": [
+      [
+       11.208,
+       11.282
+      ],
+      [
+       10.587,
+       10.706
+      ]
+     ],
+     "bits_identical_across_images_and_arms": true
+    },
+    "4": {
+     "route": "split",
+     "1107_b1_b2_us": [
+      "12.056 \u00b1 0.252",
+      "12.050 \u00b1 0.171"
+     ],
+     "c47_b1_b2_us": [
+      "11.519 \u00b1 0.244",
+      "11.423 \u00b1 0.133"
+     ],
+     "delta_us": -0.582,
+     "delta_pct": -4.8,
+     "outcome_boot_range": "gain",
+     "outcome_ci95": "gain",
+     "in_image_bench_s1_minus_shipped_on_c47_b1_b2_us": [
+      -0.029,
+      0.103
+     ],
+     "verbatim_bench_base_arm_1107_b1_b2_vs_c47_b1_b2_us": [
+      [
+       12.091,
+       11.987
+      ],
+      [
+       11.452,
+       11.477
+      ]
+     ],
+     "bits_identical_across_images_and_arms": true
+    },
+    "6": {
+     "route": "decode",
+     "1107_b1_b2_us": [
+      "15.394 \u00b1 0.194",
+      "15.396 \u00b1 0.092"
+     ],
+     "c47_b1_b2_us": [
+      "14.659 \u00b1 0.272",
+      "14.686 \u00b1 0.114"
+     ],
+     "delta_us": -0.723,
+     "delta_pct": -4.7,
+     "outcome_boot_range": "gain",
+     "outcome_ci95": "gain",
+     "in_image_bench_s1_minus_shipped_on_c47_b1_b2_us": [
+      -0.35,
+      -0.256
+     ],
+     "verbatim_bench_base_arm_1107_b1_b2_vs_c47_b1_b2_us": [
+      [
+       15.272,
+       15.126
+      ],
+      [
+       14.592,
+       14.435
+      ]
+     ],
+     "bits_identical_across_images_and_arms": true
+    },
+    "8": {
+     "route": "decode",
+     "1107_b1_b2_us": [
+      "16.021 \u00b1 0.192",
+      "15.797 \u00b1 0.113"
+     ],
+     "c47_b1_b2_us": [
+      "15.206 \u00b1 0.123",
+      "15.312 \u00b1 0.146"
+     ],
+     "delta_us": -0.65,
+     "delta_pct": -4.1,
+     "outcome_boot_range": "gain",
+     "outcome_ci95": "gain",
+     "in_image_bench_s1_minus_shipped_on_c47_b1_b2_us": [
+      -0.335,
+      -0.372
+     ],
+     "verbatim_bench_base_arm_1107_b1_b2_vs_c47_b1_b2_us": [
+      [
+       15.859,
+       15.94
+      ],
+      [
+       15.411,
+       15.318
+      ]
+     ],
+     "bits_identical_across_images_and_arms": true
+    },
+    "12": {
+     "route": "decode",
+     "1107_b1_b2_us": [
+      "27.600 \u00b1 0.082",
+      "27.546 \u00b1 0.120"
+     ],
+     "c47_b1_b2_us": [
+      "26.773 \u00b1 0.097",
+      "26.768 \u00b1 0.068"
+     ],
+     "delta_us": -0.803,
+     "delta_pct": -2.9,
+     "outcome_boot_range": "gain",
+     "outcome_ci95": "gain",
+     "in_image_bench_s1_minus_shipped_on_c47_b1_b2_us": [
+      -0.488,
+      -0.375
+     ],
+     "verbatim_bench_base_arm_1107_b1_b2_vs_c47_b1_b2_us": [
+      [
+       27.335,
+       27.313
+      ],
+      [
+       26.426,
+       26.646
+      ]
+     ],
+     "bits_identical_across_images_and_arms": true
+    },
+    "16": {
+     "route": "decode",
+     "1107_b1_b2_us": [
+      "29.066 \u00b1 0.168",
+      "29.686 \u00b1 0.663"
+     ],
+     "c47_b1_b2_us": [
+      "27.796 \u00b1 0.250",
+      "27.984 \u00b1 0.366"
+     ],
+     "delta_us": -1.486,
+     "delta_pct": -5.1,
+     "outcome_boot_range": "gain",
+     "outcome_ci95": "gain",
+     "in_image_bench_s1_minus_shipped_on_c47_b1_b2_us": [
+      -0.11,
+      -0.425
+     ],
+     "verbatim_bench_base_arm_1107_b1_b2_vs_c47_b1_b2_us": [
+      [
+       28.752,
+       28.902
+      ],
+      [
+       27.382,
+       27.531
+      ]
+     ],
+     "bits_identical_across_images_and_arms": true
+    },
+    "24": {
+     "route": "decode",
+     "1107_b1_b2_us": [
+      "42.246 \u00b1 0.536",
+      "41.611 \u00b1 0.388"
+     ],
+     "c47_b1_b2_us": [
+      "40.318 \u00b1 0.566",
+      "40.361 \u00b1 0.420"
+     ],
+     "delta_us": -1.589,
+     "delta_pct": -3.8,
+     "outcome_boot_range": "gain",
+     "outcome_ci95": "gain",
+     "in_image_bench_s1_minus_shipped_on_c47_b1_b2_us": [
+      -0.696,
+      -0.048
+     ],
+     "verbatim_bench_base_arm_1107_b1_b2_vs_c47_b1_b2_us": [
+      [
+       41.293,
+       41.241
+      ],
+      [
+       41.709,
+       39.594
+      ]
+     ],
+     "bits_identical_across_images_and_arms": true
+    },
+    "32": {
+     "route": "extend",
+     "1107_b1_b2_us": [
+      "48.216 \u00b1 0.159",
+      "47.709 \u00b1 0.009"
+     ],
+     "c47_b1_b2_us": [
+      "47.498 \u00b1 0.032",
+      "47.556 \u00b1 0.055"
+     ],
+     "delta_us": -0.436,
+     "delta_pct": -0.9,
+     "outcome_boot_range": "gain",
+     "outcome_ci95": "gain",
+     "in_image_bench_s1_minus_shipped_on_c47_b1_b2_us": [
+      0.219,
+      0.233
+     ],
+     "verbatim_bench_base_arm_1107_b1_b2_vs_c47_b1_b2_us": [
+      [
+       48.046,
+       47.983
+      ],
+      [
+       47.741,
+       47.753
+      ]
+     ],
+     "bits_identical_across_images_and_arms": true
+    },
+    "48": {
+     "route": "extend",
+     "1107_b1_b2_us": [
+      "49.359 \u00b1 0.487",
+      "49.030 \u00b1 0.382"
+     ],
+     "c47_b1_b2_us": [
+      "48.452 \u00b1 0.290",
+      "48.582 \u00b1 0.389"
+     ],
+     "delta_us": -0.678,
+     "delta_pct": -1.4,
+     "outcome_boot_range": "gain",
+     "outcome_ci95": "within",
+     "in_image_bench_s1_minus_shipped_on_c47_b1_b2_us": [
+      0.573,
+      -0.002
+     ],
+     "verbatim_bench_base_arm_1107_b1_b2_vs_c47_b1_b2_us": [
+      [
+       48.756,
+       48.702
+      ],
+      [
+       48.444,
+       48.478
+      ]
+     ],
+     "bits_identical_across_images_and_arms": true
+    }
+   },
+   "TP3_h24/short_ctx_128_64": {
+    "1": {
+     "route": "split",
+     "1107_b1_b2_us": [
+      "11.239 \u00b1 0.238",
+      "11.067 \u00b1 0.115"
+     ],
+     "c47_b1_b2_us": [
+      "10.586 \u00b1 0.112",
+      "10.669 \u00b1 0.255"
+     ],
+     "delta_us": -0.525,
+     "delta_pct": -4.7,
+     "outcome_boot_range": "gain",
+     "outcome_ci95": "gain",
+     "in_image_bench_s1_minus_shipped_on_c47_b1_b2_us": [
+      0.012,
+      -0.206
+     ],
+     "verbatim_bench_base_arm_1107_b1_b2_vs_c47_b1_b2_us": [
+      [
+       10.991,
+       11.096
+      ],
+      [
+       10.517,
+       10.467
+      ]
+     ],
+     "bits_identical_across_images_and_arms": true
+    },
+    "2": {
+     "route": "split",
+     "1107_b1_b2_us": [
+      "11.197 \u00b1 0.075",
+      "11.249 \u00b1 0.111"
+     ],
+     "c47_b1_b2_us": [
+      "10.721 \u00b1 0.056",
+      "10.708 \u00b1 0.012"
+     ],
+     "delta_us": -0.508,
+     "delta_pct": -4.5,
+     "outcome_boot_range": "gain",
+     "outcome_ci95": "gain",
+     "in_image_bench_s1_minus_shipped_on_c47_b1_b2_us": [
+      0.18,
+      -0.012
+     ],
+     "verbatim_bench_base_arm_1107_b1_b2_vs_c47_b1_b2_us": [
+      [
+       11.283,
+       11.146
+      ],
+      [
+       10.746,
+       10.891
+      ]
+     ],
+     "bits_identical_across_images_and_arms": true
+    },
+    "4": {
+     "route": "split",
+     "1107_b1_b2_us": [
+      "11.795 \u00b1 0.038",
+      "11.912 \u00b1 0.175"
+     ],
+     "c47_b1_b2_us": [
+      "11.421 \u00b1 0.211",
+      "11.409 \u00b1 0.210"
+     ],
+     "delta_us": -0.439,
+     "delta_pct": -3.7,
+     "outcome_boot_range": "gain",
+     "outcome_ci95": "gain",
+     "in_image_bench_s1_minus_shipped_on_c47_b1_b2_us": [
+      -0.118,
+      -0.069
+     ],
+     "verbatim_bench_base_arm_1107_b1_b2_vs_c47_b1_b2_us": [
+      [
+       11.806,
+       11.842
+      ],
+      [
+       11.23,
+       11.229
+      ]
+     ],
+     "bits_identical_across_images_and_arms": true
+    },
+    "6": {
+     "route": "decode",
+     "1107_b1_b2_us": [
+      "13.940 \u00b1 0.122",
+      "13.976 \u00b1 0.168"
+     ],
+     "c47_b1_b2_us": [
+      "13.510 \u00b1 0.160",
+      "13.442 \u00b1 0.073"
+     ],
+     "delta_us": -0.482,
+     "delta_pct": -3.5,
+     "outcome_boot_range": "gain",
+     "outcome_ci95": "gain",
+     "in_image_bench_s1_minus_shipped_on_c47_b1_b2_us": [
+      -0.148,
+      -0.055
+     ],
+     "verbatim_bench_base_arm_1107_b1_b2_vs_c47_b1_b2_us": [
+      [
+       13.846,
+       13.995
+      ],
+      [
+       13.478,
+       13.564
+      ]
+     ],
+     "bits_identical_across_images_and_arms": true
+    },
+    "8": {
+     "route": "decode",
+     "1107_b1_b2_us": [
+      "14.058 \u00b1 0.016",
+      "14.199 \u00b1 0.125"
+     ],
+     "c47_b1_b2_us": [
+      "13.652 \u00b1 0.016",
+      "13.726 \u00b1 0.139"
+     ],
+     "delta_us": -0.439,
+     "delta_pct": -3.1,
+     "outcome_boot_range": "gain",
+     "outcome_ci95": "gain",
+     "in_image_bench_s1_minus_shipped_on_c47_b1_b2_us": [
+      -0.162,
+      -0.148
+     ],
+     "verbatim_bench_base_arm_1107_b1_b2_vs_c47_b1_b2_us": [
+      [
+       13.847,
+       13.97
+      ],
+      [
+       13.619,
+       13.624
+      ]
+     ],
+     "bits_identical_across_images_and_arms": true
+    },
+    "12": {
+     "route": "decode",
+     "1107_b1_b2_us": [
+      "14.938 \u00b1 0.129",
+      "14.929 \u00b1 0.149"
+     ],
+     "c47_b1_b2_us": [
+      "14.461 \u00b1 0.132",
+      "14.415 \u00b1 0.117"
+     ],
+     "delta_us": -0.496,
+     "delta_pct": -3.3,
+     "outcome_boot_range": "gain",
+     "outcome_ci95": "gain",
+     "in_image_bench_s1_minus_shipped_on_c47_b1_b2_us": [
+      -0.369,
+      -0.2
+     ],
+     "verbatim_bench_base_arm_1107_b1_b2_vs_c47_b1_b2_us": [
+      [
+       14.781,
+       14.874
+      ],
+      [
+       14.35,
+       14.333
+      ]
+     ],
+     "bits_identical_across_images_and_arms": true
+    },
+    "16": {
+     "route": "decode",
+     "1107_b1_b2_us": [
+      "15.431 \u00b1 0.175",
+      "15.285 \u00b1 0.118"
+     ],
+     "c47_b1_b2_us": [
+      "14.759 \u00b1 0.131",
+      "14.872 \u00b1 0.107"
+     ],
+     "delta_us": -0.542,
+     "delta_pct": -3.5,
+     "outcome_boot_range": "gain",
+     "outcome_ci95": "gain",
+     "in_image_bench_s1_minus_shipped_on_c47_b1_b2_us": [
+      -0.109,
+      -0.28
+     ],
+     "verbatim_bench_base_arm_1107_b1_b2_vs_c47_b1_b2_us": [
+      [
+       15.353,
+       15.4
+      ],
+      [
+       14.75,
+       14.774
+      ]
+     ],
+     "bits_identical_across_images_and_arms": true
+    },
+    "24": {
+     "route": "decode",
+     "1107_b1_b2_us": [
+      "17.309 \u00b1 0.203",
+      "17.411 \u00b1 0.120"
+     ],
+     "c47_b1_b2_us": [
+      "16.879 \u00b1 0.078",
+      "17.164 \u00b1 0.137"
+     ],
+     "delta_us": -0.338,
+     "delta_pct": -1.9,
+     "outcome_boot_range": "gain",
+     "outcome_ci95": "within",
+     "in_image_bench_s1_minus_shipped_on_c47_b1_b2_us": [
+      -0.997,
+      -0.92
+     ],
+     "verbatim_bench_base_arm_1107_b1_b2_vs_c47_b1_b2_us": [
+      [
+       17.079,
+       17.37
+      ],
+      [
+       17.052,
+       17.134
+      ]
+     ],
+     "bits_identical_across_images_and_arms": true
+    },
+    "32": {
+     "route": "extend",
+     "1107_b1_b2_us": [
+      "47.973 \u00b1 0.012",
+      "47.687 \u00b1 0.154"
+     ],
+     "c47_b1_b2_us": [
+      "22.925 \u00b1 0.058",
+      "22.855 \u00b1 0.111"
+     ],
+     "delta_us": -24.94,
+     "delta_pct": -52.1,
+     "outcome_boot_range": "gain",
+     "outcome_ci95": "gain",
+     "in_image_bench_s1_minus_shipped_on_c47_b1_b2_us": [
+      0.036,
+      -0.013
+     ],
+     "verbatim_bench_base_arm_1107_b1_b2_vs_c47_b1_b2_us": [
+      [
+       47.681,
+       47.638
+      ],
+      [
+       22.92,
+       22.778
+      ]
+     ],
+     "bits_identical_across_images_and_arms": true
+    },
+    "48": {
+     "route": "extend",
+     "1107_b1_b2_us": [
+      "48.610 \u00b1 0.158",
+      "48.418 \u00b1 0.250"
+     ],
+     "c47_b1_b2_us": [
+      "23.363 \u00b1 0.164",
+      "23.427 \u00b1 0.240"
+     ],
+     "delta_us": -25.119,
+     "delta_pct": -51.8,
+     "outcome_boot_range": "gain",
+     "outcome_ci95": "gain",
+     "in_image_bench_s1_minus_shipped_on_c47_b1_b2_us": [
+      0.027,
+      -0.066
+     ],
+     "verbatim_bench_base_arm_1107_b1_b2_vs_c47_b1_b2_us": [
+      [
+       48.349,
+       48.426
+      ],
+      [
+       23.396,
+       23.266
+      ]
+     ],
+     "bits_identical_across_images_and_arms": true
+    }
+   },
+   "TP4_h16/med_ctx_128_512": {
+    "1": {
+     "route": "split",
+     "1107_b1_b2_us": [
+      "10.905 \u00b1 0.010",
+      "10.861 \u00b1 0.014"
+     ],
+     "c47_b1_b2_us": [
+      "10.456 \u00b1 0.105",
+      "10.432 \u00b1 0.121"
+     ],
+     "delta_us": -0.439,
+     "delta_pct": -4.0,
+     "outcome_boot_range": "gain",
+     "outcome_ci95": "gain",
+     "in_image_bench_s1_minus_shipped_on_c47_b1_b2_us": [
+      -0.068,
+      -0.012
+     ],
+     "verbatim_bench_base_arm_1107_b1_b2_vs_c47_b1_b2_us": [
+      [
+       10.658,
+       10.771
+      ],
+      [
+       10.453,
+       10.372
+      ]
+     ],
+     "bits_identical_across_images_and_arms": true
+    },
+    "2": {
+     "route": "split",
+     "1107_b1_b2_us": [
+      "11.075 \u00b1 0.114",
+      "11.067 \u00b1 0.186"
+     ],
+     "c47_b1_b2_us": [
+      "10.644 \u00b1 0.078",
+      "10.639 \u00b1 0.149"
+     ],
+     "delta_us": -0.429,
+     "delta_pct": -3.9,
+     "outcome_boot_range": "gain",
+     "outcome_ci95": "gain",
+     "in_image_bench_s1_minus_shipped_on_c47_b1_b2_us": [
+      -0.068,
+      -0.05
+     ],
+     "verbatim_bench_base_arm_1107_b1_b2_vs_c47_b1_b2_us": [
+      [
+       10.92,
+       11.086
+      ],
+      [
+       10.707,
+       10.528
+      ]
+     ],
+     "bits_identical_across_images_and_arms": true
+    },
+    "4": {
+     "route": "split",
+     "1107_b1_b2_us": [
+      "12.034 \u00b1 0.330",
+      "11.485 \u00b1 0.147"
+     ],
+     "c47_b1_b2_us": [
+      "11.163 \u00b1 0.180",
+      "11.005 \u00b1 0.146"
+     ],
+     "delta_us": -0.676,
+     "delta_pct": -5.7,
+     "outcome_boot_range": "gain",
+     "outcome_ci95": "within",
+     "in_image_bench_s1_minus_shipped_on_c47_b1_b2_us": [
+      -0.147,
+      -0.018
+     ],
+     "verbatim_bench_base_arm_1107_b1_b2_vs_c47_b1_b2_us": [
+      [
+       11.343,
+       11.407
+      ],
+      [
+       10.853,
+       10.886
+      ]
+     ],
+     "bits_identical_across_images_and_arms": true
+    },
+    "6": {
+     "route": "split",
+     "1107_b1_b2_us": [
+      "11.881 \u00b1 0.160",
+      "11.855 \u00b1 0.078"
+     ],
+     "c47_b1_b2_us": [
+      "11.351 \u00b1 0.167",
+      "11.207 \u00b1 0.088"
+     ],
+     "delta_us": -0.589,
+     "delta_pct": -5.0,
+     "outcome_boot_range": "gain",
+     "outcome_ci95": "gain",
+     "in_image_bench_s1_minus_shipped_on_c47_b1_b2_us": [
+      0.045,
+      0.111
+     ],
+     "verbatim_bench_base_arm_1107_b1_b2_vs_c47_b1_b2_us": [
+      [
+       11.999,
+       11.899
+      ],
+      [
+       11.416,
+       11.372
+      ]
+     ],
+     "bits_identical_across_images_and_arms": true
+    },
+    "8": {
+     "route": "split",
+     "1107_b1_b2_us": [
+      "12.700 \u00b1 0.215",
+      "12.647 \u00b1 0.132"
+     ],
+     "c47_b1_b2_us": [
+      "12.089 \u00b1 0.164",
+      "11.938 \u00b1 0.087"
+     ],
+     "delta_us": -0.66,
+     "delta_pct": -5.2,
+     "outcome_boot_range": "gain",
+     "outcome_ci95": "gain",
+     "in_image_bench_s1_minus_shipped_on_c47_b1_b2_us": [
+      -0.062,
+      0.22
+     ],
+     "verbatim_bench_base_arm_1107_b1_b2_vs_c47_b1_b2_us": [
+      [
+       12.394,
+       12.689
+      ],
+      [
+       11.991,
+       12.017
+      ]
+     ],
+     "bits_identical_across_images_and_arms": true
+    },
+    "12": {
+     "route": "decode",
+     "1107_b1_b2_us": [
+      "23.295 \u00b1 0.138",
+      "23.443 \u00b1 0.145"
+     ],
+     "c47_b1_b2_us": [
+      "22.350 \u00b1 0.076",
+      "22.428 \u00b1 0.192"
+     ],
+     "delta_us": -0.98,
+     "delta_pct": -4.2,
+     "outcome_boot_range": "gain",
+     "outcome_ci95": "gain",
+     "in_image_bench_s1_minus_shipped_on_c47_b1_b2_us": [
+      -0.478,
+      -0.614
+     ],
+     "verbatim_bench_base_arm_1107_b1_b2_vs_c47_b1_b2_us": [
+      [
+       23.463,
+       23.37
+      ],
+      [
+       22.528,
+       22.333
+      ]
+     ],
+     "bits_identical_across_images_and_arms": true
+    },
+    "16": {
+     "route": "decode",
+     "1107_b1_b2_us": [
+      "24.522 \u00b1 0.290",
+      "24.718 \u00b1 0.324"
+     ],
+     "c47_b1_b2_us": [
+      "23.477 \u00b1 0.184",
+      "23.458 \u00b1 0.245"
+     ],
+     "delta_us": -1.152,
+     "delta_pct": -4.7,
+     "outcome_boot_range": "gain",
+     "outcome_ci95": "gain",
+     "in_image_bench_s1_minus_shipped_on_c47_b1_b2_us": [
+      -0.418,
+      -0.538
+     ],
+     "verbatim_bench_base_arm_1107_b1_b2_vs_c47_b1_b2_us": [
+      [
+       24.485,
+       24.443
+      ],
+      [
+       23.377,
+       23.497
+      ]
+     ],
+     "bits_identical_across_images_and_arms": true
+    },
+    "24": {
+     "route": "decode",
+     "1107_b1_b2_us": [
+      "34.945 \u00b1 0.114",
+      "35.179 \u00b1 0.242"
+     ],
+     "c47_b1_b2_us": [
+      "33.288 \u00b1 0.027",
+      "33.456 \u00b1 0.283"
+     ],
+     "delta_us": -1.69,
+     "delta_pct": -4.8,
+     "outcome_boot_range": "gain",
+     "outcome_ci95": "gain",
+     "in_image_bench_s1_minus_shipped_on_c47_b1_b2_us": [
+      -0.49,
+      -0.856
+     ],
+     "verbatim_bench_base_arm_1107_b1_b2_vs_c47_b1_b2_us": [
+      [
+       34.639,
+       34.853
+      ],
+      [
+       33.21,
+       33.424
+      ]
+     ],
+     "bits_identical_across_images_and_arms": true
+    },
+    "32": {
+     "route": "extend",
+     "1107_b1_b2_us": [
+      "41.469 \u00b1 0.072",
+      "41.613 \u00b1 0.327"
+     ],
+     "c47_b1_b2_us": [
+      "41.894 \u00b1 0.586",
+      "41.456 \u00b1 0.131"
+     ],
+     "delta_us": 0.134,
+     "delta_pct": 0.3,
+     "outcome_boot_range": "within",
+     "outcome_ci95": "within",
+     "in_image_bench_s1_minus_shipped_on_c47_b1_b2_us": [
+      0.092,
+      0.027
+     ],
+     "verbatim_bench_base_arm_1107_b1_b2_vs_c47_b1_b2_us": [
+      [
+       41.856,
+       41.439
+      ],
+      [
+       42.696,
+       41.539
+      ]
+     ],
+     "bits_identical_across_images_and_arms": true
+    },
+    "48": {
+     "route": "extend",
+     "1107_b1_b2_us": [
+      "42.461 \u00b1 0.288",
+      "42.065 \u00b1 0.268"
+     ],
+     "c47_b1_b2_us": [
+      "42.272 \u00b1 0.379",
+      "41.946 \u00b1 0.149"
+     ],
+     "delta_us": -0.154,
+     "delta_pct": -0.4,
+     "outcome_boot_range": "within",
+     "outcome_ci95": "within",
+     "in_image_bench_s1_minus_shipped_on_c47_b1_b2_us": [
+      -0.03,
+      0.236
+     ],
+     "verbatim_bench_base_arm_1107_b1_b2_vs_c47_b1_b2_us": [
+      [
+       42.263,
+       42.564
+      ],
+      [
+       42.059,
+       42.172
+      ]
+     ],
+     "bits_identical_across_images_and_arms": true
+    }
+   },
+   "TP4_h16/short_ctx_128_64": {
+    "1": {
+     "route": "split",
+     "1107_b1_b2_us": [
+      "11.098 \u00b1 0.203",
+      "11.041 \u00b1 0.184"
+     ],
+     "c47_b1_b2_us": [
+      "10.425 \u00b1 0.124",
+      "10.599 \u00b1 0.145"
+     ],
+     "delta_us": -0.558,
+     "delta_pct": -5.0,
+     "outcome_boot_range": "gain",
+     "outcome_ci95": "gain",
+     "in_image_bench_s1_minus_shipped_on_c47_b1_b2_us": [
+      -0.004,
+      0.017
+     ],
+     "verbatim_bench_base_arm_1107_b1_b2_vs_c47_b1_b2_us": [
+      [
+       11.149,
+       10.891
+      ],
+      [
+       10.447,
+       10.546
+      ]
+     ],
+     "bits_identical_across_images_and_arms": true
+    },
+    "2": {
+     "route": "split",
+     "1107_b1_b2_us": [
+      "11.103 \u00b1 0.167",
+      "11.116 \u00b1 0.196"
+     ],
+     "c47_b1_b2_us": [
+      "10.624 \u00b1 0.192",
+      "10.644 \u00b1 0.094"
+     ],
+     "delta_us": -0.475,
+     "delta_pct": -4.3,
+     "outcome_boot_range": "gain",
+     "outcome_ci95": "gain",
+     "in_image_bench_s1_minus_shipped_on_c47_b1_b2_us": [
+      -0.097,
+      0.077
+     ],
+     "verbatim_bench_base_arm_1107_b1_b2_vs_c47_b1_b2_us": [
+      [
+       10.943,
+       10.965
+      ],
+      [
+       10.574,
+       10.727
+      ]
+     ],
+     "bits_identical_across_images_and_arms": true
+    },
+    "4": {
+     "route": "split",
+     "1107_b1_b2_us": [
+      "11.277 \u00b1 0.011",
+      "11.281 \u00b1 0.006"
+     ],
+     "c47_b1_b2_us": [
+      "10.913 \u00b1 0.106",
+      "10.950 \u00b1 0.014"
+     ],
+     "delta_us": -0.348,
+     "delta_pct": -3.1,
+     "outcome_boot_range": "gain",
+     "outcome_ci95": "gain",
+     "in_image_bench_s1_minus_shipped_on_c47_b1_b2_us": [
+      0.082,
+      0.005
+     ],
+     "verbatim_bench_base_arm_1107_b1_b2_vs_c47_b1_b2_us": [
+      [
+       11.258,
+       11.211
+      ],
+      [
+       10.827,
+       10.801
+      ]
+     ],
+     "bits_identical_across_images_and_arms": true
+    },
+    "6": {
+     "route": "split",
+     "1107_b1_b2_us": [
+      "11.820 \u00b1 0.172",
+      "11.743 \u00b1 0.137"
+     ],
+     "c47_b1_b2_us": [
+      "11.298 \u00b1 0.157",
+      "11.272 \u00b1 0.160"
+     ],
+     "delta_us": -0.497,
+     "delta_pct": -4.2,
+     "outcome_boot_range": "gain",
+     "outcome_ci95": "gain",
+     "in_image_bench_s1_minus_shipped_on_c47_b1_b2_us": [
+      -0.136,
+      -0.002
+     ],
+     "verbatim_bench_base_arm_1107_b1_b2_vs_c47_b1_b2_us": [
+      [
+       11.771,
+       11.551
+      ],
+      [
+       11.287,
+       11.109
+      ]
+     ],
+     "bits_identical_across_images_and_arms": true
+    },
+    "8": {
+     "route": "split",
+     "1107_b1_b2_us": [
+      "12.338 \u00b1 0.109",
+      "12.514 \u00b1 0.165"
+     ],
+     "c47_b1_b2_us": [
+      "12.073 \u00b1 0.195",
+      "11.953 \u00b1 0.152"
+     ],
+     "delta_us": -0.413,
+     "delta_pct": -3.3,
+     "outcome_boot_range": "gain",
+     "outcome_ci95": "within",
+     "in_image_bench_s1_minus_shipped_on_c47_b1_b2_us": [
+      -0.179,
+      -0.08
+     ],
+     "verbatim_bench_base_arm_1107_b1_b2_vs_c47_b1_b2_us": [
+      [
+       12.218,
+       12.281
+      ],
+      [
+       11.849,
+       11.937
+      ]
+     ],
+     "bits_identical_across_images_and_arms": true
+    },
+    "12": {
+     "route": "decode",
+     "1107_b1_b2_us": [
+      "12.727 \u00b1 0.181",
+      "12.646 \u00b1 0.061"
+     ],
+     "c47_b1_b2_us": [
+      "12.266 \u00b1 0.089",
+      "12.323 \u00b1 0.110"
+     ],
+     "delta_us": -0.392,
+     "delta_pct": -3.1,
+     "outcome_boot_range": "gain",
+     "outcome_ci95": "gain",
+     "in_image_bench_s1_minus_shipped_on_c47_b1_b2_us": [
+      -0.368,
+      -0.437
+     ],
+     "verbatim_bench_base_arm_1107_b1_b2_vs_c47_b1_b2_us": [
+      [
+       12.76,
+       12.852
+      ],
+      [
+       12.328,
+       12.277
+      ]
+     ],
+     "bits_identical_across_images_and_arms": true
+    },
+    "16": {
+     "route": "decode",
+     "1107_b1_b2_us": [
+      "13.142 \u00b1 0.010",
+      "13.041 \u00b1 0.015"
+     ],
+     "c47_b1_b2_us": [
+      "12.627 \u00b1 0.021",
+      "12.727 \u00b1 0.100"
+     ],
+     "delta_us": -0.415,
+     "delta_pct": -3.2,
+     "outcome_boot_range": "gain",
+     "outcome_ci95": "gain",
+     "in_image_bench_s1_minus_shipped_on_c47_b1_b2_us": [
+      -0.406,
+      -0.413
+     ],
+     "verbatim_bench_base_arm_1107_b1_b2_vs_c47_b1_b2_us": [
+      [
+       12.98,
+       13.07
+      ],
+      [
+       12.519,
+       12.469
+      ]
+     ],
+     "bits_identical_across_images_and_arms": true
+    },
+    "24": {
+     "route": "decode",
+     "1107_b1_b2_us": [
+      "14.827 \u00b1 0.135",
+      "14.643 \u00b1 0.131"
+     ],
+     "c47_b1_b2_us": [
+      "14.613 \u00b1 0.255",
+      "15.009 \u00b1 0.401"
+     ],
+     "delta_us": 0.076,
+     "delta_pct": 0.5,
+     "outcome_boot_range": "within",
+     "outcome_ci95": "within",
+     "in_image_bench_s1_minus_shipped_on_c47_b1_b2_us": [
+      -1.162,
+      -0.986
+     ],
+     "verbatim_bench_base_arm_1107_b1_b2_vs_c47_b1_b2_us": [
+      [
+       14.618,
+       14.825
+      ],
+      [
+       14.413,
+       14.63
+      ]
+     ],
+     "bits_identical_across_images_and_arms": true
+    },
+    "32": {
+     "route": "extend",
+     "1107_b1_b2_us": [
+      "41.302 \u00b1 0.145",
+      "41.214 \u00b1 0.088"
+     ],
+     "c47_b1_b2_us": [
+      "19.411 \u00b1 0.008",
+      "19.506 \u00b1 0.187"
+     ],
+     "delta_us": -21.799,
+     "delta_pct": -52.8,
+     "outcome_boot_range": "gain",
+     "outcome_ci95": "gain",
+     "in_image_bench_s1_minus_shipped_on_c47_b1_b2_us": [
+      0.054,
+      0.021
+     ],
+     "verbatim_bench_base_arm_1107_b1_b2_vs_c47_b1_b2_us": [
+      [
+       40.819,
+       41.391
+      ],
+      [
+       19.363,
+       19.416
+      ]
+     ],
+     "bits_identical_across_images_and_arms": true
+    },
+    "48": {
+     "route": "extend",
+     "1107_b1_b2_us": [
+      "41.872 \u00b1 0.233",
+      "41.785 \u00b1 0.240"
+     ],
+     "c47_b1_b2_us": [
+      "19.927 \u00b1 0.187",
+      "19.834 \u00b1 0.145"
+     ],
+     "delta_us": -21.948,
+     "delta_pct": -52.5,
+     "outcome_boot_range": "gain",
+     "outcome_ci95": "gain",
+     "in_image_bench_s1_minus_shipped_on_c47_b1_b2_us": [
+      0.089,
+      0.21
+     ],
+     "verbatim_bench_base_arm_1107_b1_b2_vs_c47_b1_b2_us": [
+      [
+       41.345,
+       41.859
+      ],
+      [
+       19.708,
+       19.963
+      ]
+     ],
+     "bits_identical_across_images_and_arms": true
+    }
+   }
+  },
+  "tally_40_points": {
+   "gain_range": 37,
+   "gain_ci": 32,
+   "within": 3,
+   "worse": 0,
+   "n": 40
+  },
+  "points_without_a_gain_beyond_the_boot_range": [
+   "TP4_h16 med_ctx_128_512 M=32 (extend): +0.13 us, range within",
+   "TP4_h16 med_ctx_128_512 M=48 (extend): -0.15 us, range within",
+   "TP4_h16 short_ctx_128_64 M=24 (decode): +0.08 us, range within"
+  ],
+  "interval": "per-boot mean \u00b1 95% CI over 25 windows; outcome_boot_range: both candidate boots faster/slower than both 1107 boots; outcome_ci95: CIs also clear"
+ },
+ "bit_exact": {
+  "all_outputs_identical_across_images_and_arms_all_points": true,
+  "own_bench_all_bit_exact": {
+   "1107-boot1": true,
+   "c47-boot1": true,
+   "c47-boot2": true,
+   "1107-boot2": true
+  }
+ },
+ "verdict": "pass",
+ "reason": "By CUDA-graph replay of the shipped kernel against 1107 in one session, 37 of the bench's 40 points gain beyond the two-boot range (32 also beyond the 95% CIs), none is slower, and every output is bit-identical across images and arms: split and decode -0.34..-1.69 us (-1.9..-5.7%), short-context extend -21.8 / -25.1 us (-52%). The three points without a gain are TP4 medium-context extend M=32/48 (the PR claims about 0 there too) and TP4 short-context decode M=24 (+0.08 us). The PR's larger decode gains at M=12..24 (up to -2.2 us for its stage-1 arm) came from its embedded copy, which is 0.4..1.2 us faster there than the code it ships.",
+ "notes": [
+  "commands.txt holds every run's command, host state and UTC times",
+  "summary.txt is ../common/analyze/a964.py and ah964.py's digest"
+ ],
+ "parts": [
+  {
+   "part": "gain beyond the interval",
+   "verdict": "pass",
+   "detail": "37/40 points, 0 slower (measured.tally_40_points, points_without_a_gain_beyond_the_boot_range)"
+  },
+  {
+   "part": "bit-exact",
+   "verdict": "pass",
+   "detail": "seeded outputs identical across the 1107 and candidate images and the bench's copy at all 40 points, both boots; the bench's own torch.equal checks True on all four runs"
+  }
+ ]
+}

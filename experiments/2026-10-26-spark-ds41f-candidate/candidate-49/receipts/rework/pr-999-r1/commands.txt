@@ -1,0 +1,342 @@
+# Commands run on sp8 (spark-0016, NVIDIA GB10) for PR #999 rework round 1, one block per run, in start order.
+# Working directory: /home/chris/spark-lab/agents/candidate-49-rework-999 (B below). Every GPU command ran under
+# flock /tmp/spark-lab-gpu.lock after checking ~/spark-hold.json (absent throughout), through run.sh, which records
+# host, image ID, UTC start/end, load, docker ps and exit code; outputs are raw/<label>.txt, JSON in json/.
+# start_utc is when the command was issued and includes any wait on the lock. run.sh appends its header at start and
+# its footer at exit, so runs that waited on the lock interleaved in the raw log (commands-raw.txt); this file re-pairs
+# each footer with its run by the output file it names (scripts/pair_commands.py).
+#
+# Images: C = sha256:9f51f2e2c5ab728e96490d794bff7b83a147d6d3d61333c5b60b2cff662049cd (spark-ds41f:candidate-49);
+#         1107 = sha256:3f32a962ce04b7c8d85337cd427a8946b8b6bcaadd97cc8d8a8cd14e8d68a6ce (spark-ds41f:1107), used only
+#         as the source of the 1107 subset tree (docker create + docker cp, no GPU).
+# No builds. The corrected indexer.py (and, for pytest, its test file) is bind-mounted read-only over the candidate-49
+# image at /opt/spark-ds41f/candidate/vllm/...; each run prints the sha256 of the mounted file
+# (indexer.py f9cc9adc..., test file 937d1152...; candidate-49 as built: 74c775e4... / 59f8096c...).
+# The 1107 arm of every bench is 1107's indexer.py with own-marks' _e2m1_code shim (src/indexer_baseline_1107.py,
+# sha256 4d5bd2ac..., identical to candidate-49-own-marks/shim/indexer_baseline_1107.py), loaded in the same process.
+#
+# Run groups (labels):
+#   served-topk-configs, served-topk-configs-lsa1  enumeration of the IndexerTopK configurations the image declares
+#   bench-served-gaps-boot1/2                       candidate-49 as built (unmounted), gap bench; both overlapped
+#                                                   unlocked spark-ds41f:1107 containers on sp8 (not scored)
+#   diag-short-sweep-dynper, diag-variants-run1     diagnostics of variants (diag-short-sweep overlapped a foreign
+#                                                   container; diag-variants-run1 clean)
+#   r1-pytest-boot1/2                               corrected: PR README step 1 (pytest + reads check)
+#   r1-bench2boot-boot1..5                          corrected: PR bench as is (boot1 overlapped a foreign container)
+#   r1-served-gaps-boot1..3, r1-short-sweep-boot1/2 corrected, unwarmed (start-of-section GPU clock ramp, see result)
+#   r1w-*                                           corrected, through warm_wrap.py (scored runs)
+# quiet.sh / quiet2.sh wait for no running container before starting and print the foreign containers seen during
+# the run (quiet2.sh also whether they requested a GPU).
+
+### served-topk-configs
+host: spark-0016 (sp8)
+image: sha256:9f51f2e2c5ab728e96490d794bff7b83a147d6d3d61333c5b60b2cff662049cd (spark-ds41f:candidate-49)
+start_utc: 2026-11-09T07:43:00Z
+loadavg_before: 3.73 2.60 2.41
+docker_ps_before: 9f51f2e2c5ab rw991-diag-gemm-2;spark-ds41f:1107 ecstatic_ardinghelli;
+command: flock /tmp/spark-lab-gpu.lock docker run --rm --gpus all --ipc=host --name c49rw999-enum --entrypoint '' -w /opt/spark-ds41f/candidate/vllm -v /home/chris/spark-lab/agents/candidate-49-rework-999/src/served_topk_configs.py:/tmp/served_topk_configs.py:ro -v /home/chris/.cache/huggingface/hub/models--deepseek-ai--DeepSeek-V4.1-Flash-1017/blobs/09917a9139b22d5bf8be52132787f435147b1020:/tmp/hf_config.json:ro -v /home/chris/spark-lab/agents/candidate-49-rework-999/out/json:/out sha256:9f51f2e2c5ab728e96490d794bff7b83a147d6d3d61333c5b60b2cff662049cd bash -lc python3\ /tmp/served_topk_configs.py\ /tmp/hf_config.json\ /out/served-topk-configs.json
+end_utc: 2026-11-09T07:44:20Z
+loadavg_after: 4.67 3.04 2.57
+exit_code: 0
+output: served-topk-configs.txt
+
+### served-topk-configs-lsa1
+host: spark-0016 (sp8)
+image: sha256:9f51f2e2c5ab728e96490d794bff7b83a147d6d3d61333c5b60b2cff662049cd (spark-ds41f:candidate-49)
+start_utc: 2026-11-09T07:44:20Z
+loadavg_before: 4.67 3.04 2.57
+docker_ps_before: spark-ds41f:1107 ecstatic_ardinghelli;
+command: flock /tmp/spark-lab-gpu.lock docker run --rm --gpus all --ipc=host --name c49rw999-enum-lsa --entrypoint '' -e VLLM_DS41_LSA=1 -w /opt/spark-ds41f/candidate/vllm -v /home/chris/spark-lab/agents/candidate-49-rework-999/src/served_topk_configs.py:/tmp/served_topk_configs.py:ro -v /home/chris/.cache/huggingface/hub/models--deepseek-ai--DeepSeek-V4.1-Flash-1017/blobs/09917a9139b22d5bf8be52132787f435147b1020:/tmp/hf_config.json:ro -v /home/chris/spark-lab/agents/candidate-49-rework-999/out/json:/out sha256:9f51f2e2c5ab728e96490d794bff7b83a147d6d3d61333c5b60b2cff662049cd bash -lc python3\ /tmp/served_topk_configs.py\ /tmp/hf_config.json\ /out/served-topk-configs-lsa1.json
+end_utc: 2026-11-09T07:44:29Z
+loadavg_after: 4.48 3.05 2.58
+exit_code: 0
+output: served-topk-configs-lsa1.txt
+
+### bench-served-gaps-boot1
+host: spark-0016 (sp8)
+image: sha256:9f51f2e2c5ab728e96490d794bff7b83a147d6d3d61333c5b60b2cff662049cd (spark-ds41f:candidate-49)
+start_utc: 2026-11-09T07:44:29Z
+loadavg_before: 4.48 3.05 2.58
+docker_ps_before: spark-ds41f:1107 ecstatic_ardinghelli;
+command: flock /tmp/spark-lab-gpu.lock docker run --rm --gpus all --ipc=host --name c49rw999-gaps-b1 --entrypoint '' -w /opt/spark-ds41f/candidate/vllm -v /home/chris/spark-lab/agents/candidate-49-rework-999/src/bench_2boot.py:/tmp/bench_2boot.py:ro -v /home/chris/spark-lab/agents/candidate-49-rework-999/src/bench_served_gaps.py:/tmp/bench_served_gaps.py:ro -v /home/chris/spark-lab/agents/candidate-49-rework-999/src/indexer_baseline_1107.py:/tmp_host/indexer_baseline.py:ro -v /home/chris/spark-lab/agents/candidate-49-rework-999/out/json:/out sha256:9f51f2e2c5ab728e96490d794bff7b83a147d6d3d61333c5b60b2cff662049cd bash -lc python3\ /tmp/bench_served_gaps.py\ /out/bench-served-gaps-boot1.json
+end_utc: 2026-11-09T07:46:06Z
+loadavg_after: 3.57 3.11 2.65
+exit_code: 0
+output: bench-served-gaps-boot1.txt
+
+### bench-served-gaps-boot2
+host: spark-0016 (sp8)
+image: sha256:9f51f2e2c5ab728e96490d794bff7b83a147d6d3d61333c5b60b2cff662049cd (spark-ds41f:candidate-49)
+start_utc: 2026-11-09T07:46:06Z
+loadavg_before: 3.57 3.11 2.65
+docker_ps_before: spark-ds41f:1107 ecstatic_ardinghelli;
+command: flock /tmp/spark-lab-gpu.lock docker run --rm --gpus all --ipc=host --name c49rw999-gaps-b2 --entrypoint '' -w /opt/spark-ds41f/candidate/vllm -v /home/chris/spark-lab/agents/candidate-49-rework-999/src/bench_2boot.py:/tmp/bench_2boot.py:ro -v /home/chris/spark-lab/agents/candidate-49-rework-999/src/bench_served_gaps.py:/tmp/bench_served_gaps.py:ro -v /home/chris/spark-lab/agents/candidate-49-rework-999/src/indexer_baseline_1107.py:/tmp_host/indexer_baseline.py:ro -v /home/chris/spark-lab/agents/candidate-49-rework-999/out/json:/out sha256:9f51f2e2c5ab728e96490d794bff7b83a147d6d3d61333c5b60b2cff662049cd bash -lc python3\ /tmp/bench_served_gaps.py\ /out/bench-served-gaps-boot2.json
+end_utc: 2026-11-09T07:48:35Z
+loadavg_after: 2.97 3.08 2.72
+exit_code: 0
+output: bench-served-gaps-boot2.txt
+
+### diag-short-sweep-dynper
+host: spark-0016 (sp8)
+image: sha256:9f51f2e2c5ab728e96490d794bff7b83a147d6d3d61333c5b60b2cff662049cd (spark-ds41f:candidate-49)
+start_utc: 2026-11-09T07:49:19Z
+loadavg_before: 2.49 2.94 2.69
+docker_ps_before: 9f51f2e2c5ab rw991-diag-graph-asis;
+command: flock /tmp/spark-lab-gpu.lock /home/chris/spark-lab/agents/candidate-49-rework-999/quiet.sh c49rw999-diag-sweep docker run --rm --gpus all --ipc=host --name c49rw999-diag-sweep --entrypoint '' -w /opt/spark-ds41f/candidate/vllm -v /home/chris/spark-lab/agents/candidate-49-rework-999/src/bench_2boot.py:/tmp/bench_2boot.py:ro -v /home/chris/spark-lab/agents/candidate-49-rework-999/src/bench_short_sweep.py:/tmp/bench_short_sweep.py:ro -v /home/chris/spark-lab/agents/candidate-49-rework-999/src/indexer_baseline_1107.py:/tmp_host/indexer_baseline.py:ro -v /home/chris/spark-lab/agents/candidate-49-rework-999/src/variants:/tmp_host/variants:ro -v /home/chris/spark-lab/agents/candidate-49-rework-999/out/json:/out sha256:9f51f2e2c5ab728e96490d794bff7b83a147d6d3d61333c5b60b2cff662049cd bash -lc python3\ /tmp/bench_short_sweep.py\ /out/diag-short-sweep-dynper.json\ dynper=/tmp_host/variants/indexer_dynper.py
+end_utc: 2026-11-09T07:50:33Z
+loadavg_after: 2.32 2.80 2.66
+exit_code: 0
+output: diag-short-sweep-dynper.txt
+
+### diag-variants-run1
+host: spark-0016 (sp8)
+image: sha256:9f51f2e2c5ab728e96490d794bff7b83a147d6d3d61333c5b60b2cff662049cd (spark-ds41f:candidate-49)
+start_utc: 2026-11-09T07:53:18Z
+loadavg_before: 2.49 2.66 2.62
+docker_ps_before: none
+command: flock /tmp/spark-lab-gpu.lock /home/chris/spark-lab/agents/candidate-49-rework-999/quiet.sh c49rw999-diag-var docker run --rm --gpus all --ipc=host --name c49rw999-diag-var --entrypoint '' -w /opt/spark-ds41f/candidate/vllm -v /home/chris/spark-lab/agents/candidate-49-rework-999/src/bench_2boot.py:/tmp/bench_2boot.py:ro -v /home/chris/spark-lab/agents/candidate-49-rework-999/src/bench_variants.py:/tmp/bench_variants.py:ro -v /home/chris/spark-lab/agents/candidate-49-rework-999/src/indexer_baseline_1107.py:/tmp_host/indexer_baseline.py:ro -v /home/chris/spark-lab/agents/candidate-49-rework-999/src/variants:/tmp_host/variants:ro -v /home/chris/spark-lab/agents/candidate-49-rework-999/out/json:/out sha256:9f51f2e2c5ab728e96490d794bff7b83a147d6d3d61333c5b60b2cff662049cd bash -lc python3\ /tmp/bench_variants.py\ /out/diag-variants-run1.json\ dynper=/tmp_host/variants/indexer_dynper.py\ dynper1scan=/tmp_host/variants/indexer_dynper1scan.py
+end_utc: 2026-11-09T07:54:08Z
+loadavg_after: 2.29 2.57 2.59
+exit_code: 0
+output: diag-variants-run1.txt
+
+### r1-pytest-boot1
+host: spark-0016 (sp8)
+image: sha256:9f51f2e2c5ab728e96490d794bff7b83a147d6d3d61333c5b60b2cff662049cd (spark-ds41f:candidate-49)
+start_utc: 2026-11-09T07:58:02Z
+loadavg_before: 3.12 2.52 2.53
+docker_ps_before: spark-ds41f:1107 unruffled_chatelet;9f51f2e2c5ab rw991-pyt-b1;
+command: flock /tmp/spark-lab-gpu.lock /home/chris/spark-lab/agents/candidate-49-rework-999/quiet.sh c49rw999-r1-pyt-b1 docker run --rm --gpus all --ipc=host --name c49rw999-r1-pyt-b1 --entrypoint '' -w /opt/spark-ds41f/candidate/vllm -v /home/chris/spark-lab/agents/candidate-49-rework-999/corrected/indexer.py:/opt/spark-ds41f/candidate/vllm/vllm/models/deepseek_v4_1/tilelang/indexer.py:ro -v /home/chris/spark-lab/agents/candidate-49-rework-999/corrected/test_deepseek_v41_tilelang.py:/opt/spark-ds41f/candidate/vllm/tests/kernels/attention/test_deepseek_v41_tilelang.py:ro sha256:9f51f2e2c5ab728e96490d794bff7b83a147d6d3d61333c5b60b2cff662049cd bash -lc sha256sum\ /opt/spark-ds41f/candidate/vllm/vllm/models/deepseek_v4_1/tilelang/indexer.py\ /opt/spark-ds41f/candidate/vllm/tests/kernels/attention/test_deepseek_v41_tilelang.py\;\ pytest\ --noconftest\ -q\ tests/kernels/attention/test_deepseek_v41_tilelang.py\ tests/models/test_deepseek_v4_1_lsa.py\ tests/models/test_deepseek_v4_1_attention.py\;\ a=\$\?\;\ python3\ tests/kernels/attention/deepseek_v41_indexer_reads.py\;\ b=\$\?\;\ echo\ pytest_rc=\$a\ reads_rc=\$b\;\ exit\ \$\(\(a\|b\)\)
+end_utc: 2026-11-09T08:05:26Z
+loadavg_after: 3.42 3.59 3.05
+exit_code: 0
+output: r1-pytest-boot1.txt
+
+### r1-bench2boot-boot1
+host: spark-0016 (sp8)
+image: sha256:9f51f2e2c5ab728e96490d794bff7b83a147d6d3d61333c5b60b2cff662049cd (spark-ds41f:candidate-49)
+start_utc: 2026-11-09T08:05:26Z
+loadavg_before: 3.42 3.59 3.05
+docker_ps_before: none
+command: flock /tmp/spark-lab-gpu.lock /home/chris/spark-lab/agents/candidate-49-rework-999/quiet.sh c49rw999-r1-bench-b1 docker run --rm --gpus all --ipc=host --name c49rw999-r1-bench-b1 --entrypoint '' -w /opt/spark-ds41f/candidate/vllm -v /home/chris/spark-lab/agents/candidate-49-rework-999/corrected/indexer.py:/opt/spark-ds41f/candidate/vllm/vllm/models/deepseek_v4_1/tilelang/indexer.py:ro -v /home/chris/spark-lab/agents/candidate-49-rework-999/src/bench_2boot.py:/tmp/bench_2boot.py:ro -v /home/chris/spark-lab/agents/candidate-49-rework-999/src/indexer_baseline_1107.py:/tmp_host/indexer_baseline.py:ro -v /home/chris/spark-lab/agents/candidate-49-rework-999/out/json:/out sha256:9f51f2e2c5ab728e96490d794bff7b83a147d6d3d61333c5b60b2cff662049cd bash -lc sha256sum\ /opt/spark-ds41f/candidate/vllm/vllm/models/deepseek_v4_1/tilelang/indexer.py\;\ python3\ /tmp/bench_2boot.py\ /out/r1-bench2boot-boot1.json
+end_utc: 2026-11-09T08:09:10Z
+loadavg_after: 2.46 3.03 2.94
+exit_code: 0
+output: r1-bench2boot-boot1.txt
+
+### r1-served-gaps-boot1
+host: spark-0016 (sp8)
+image: sha256:9f51f2e2c5ab728e96490d794bff7b83a147d6d3d61333c5b60b2cff662049cd (spark-ds41f:candidate-49)
+start_utc: 2026-11-09T08:09:10Z
+loadavg_before: 2.46 3.03 2.94
+docker_ps_before: none
+command: flock /tmp/spark-lab-gpu.lock /home/chris/spark-lab/agents/candidate-49-rework-999/quiet.sh c49rw999-r1-gaps-b1 docker run --rm --gpus all --ipc=host --name c49rw999-r1-gaps-b1 --entrypoint '' -w /opt/spark-ds41f/candidate/vllm -v /home/chris/spark-lab/agents/candidate-49-rework-999/corrected/indexer.py:/opt/spark-ds41f/candidate/vllm/vllm/models/deepseek_v4_1/tilelang/indexer.py:ro -v /home/chris/spark-lab/agents/candidate-49-rework-999/src/bench_2boot.py:/tmp/bench_2boot.py:ro -v /home/chris/spark-lab/agents/candidate-49-rework-999/src/indexer_baseline_1107.py:/tmp_host/indexer_baseline.py:ro -v /home/chris/spark-lab/agents/candidate-49-rework-999/src/bench_served_gaps.py:/tmp/bench_served_gaps.py:ro -v /home/chris/spark-lab/agents/candidate-49-rework-999/out/json:/out sha256:9f51f2e2c5ab728e96490d794bff7b83a147d6d3d61333c5b60b2cff662049cd bash -lc sha256sum\ /opt/spark-ds41f/candidate/vllm/vllm/models/deepseek_v4_1/tilelang/indexer.py\;\ python3\ /tmp/bench_served_gaps.py\ /out/r1-served-gaps-boot1.json
+end_utc: 2026-11-09T08:11:58Z
+loadavg_after: 2.48 2.88 2.90
+exit_code: 0
+output: r1-served-gaps-boot1.txt
+
+### r1-short-sweep-boot1
+host: spark-0016 (sp8)
+image: sha256:9f51f2e2c5ab728e96490d794bff7b83a147d6d3d61333c5b60b2cff662049cd (spark-ds41f:candidate-49)
+start_utc: 2026-11-09T08:11:58Z
+loadavg_before: 2.48 2.88 2.90
+docker_ps_before: none
+command: flock /tmp/spark-lab-gpu.lock /home/chris/spark-lab/agents/candidate-49-rework-999/quiet.sh c49rw999-r1-sweep-b1 docker run --rm --gpus all --ipc=host --name c49rw999-r1-sweep-b1 --entrypoint '' -w /opt/spark-ds41f/candidate/vllm -v /home/chris/spark-lab/agents/candidate-49-rework-999/corrected/indexer.py:/opt/spark-ds41f/candidate/vllm/vllm/models/deepseek_v4_1/tilelang/indexer.py:ro -v /home/chris/spark-lab/agents/candidate-49-rework-999/src/bench_2boot.py:/tmp/bench_2boot.py:ro -v /home/chris/spark-lab/agents/candidate-49-rework-999/src/indexer_baseline_1107.py:/tmp_host/indexer_baseline.py:ro -v /home/chris/spark-lab/agents/candidate-49-rework-999/src/bench_short_sweep.py:/tmp/bench_short_sweep.py:ro -v /home/chris/spark-lab/agents/candidate-49-rework-999/c49-orig/indexer.py:/tmp_host/c49/indexer.py:ro -v /home/chris/spark-lab/agents/candidate-49-rework-999/out/json:/out sha256:9f51f2e2c5ab728e96490d794bff7b83a147d6d3d61333c5b60b2cff662049cd bash -lc sha256sum\ /opt/spark-ds41f/candidate/vllm/vllm/models/deepseek_v4_1/tilelang/indexer.py\ /tmp_host/c49/indexer.py\;\ python3\ /tmp/bench_short_sweep.py\ /out/r1-short-sweep-boot1.json\ c49=/tmp_host/c49/indexer.py
+end_utc: 2026-11-09T08:13:30Z
+loadavg_after: 2.27 2.71 2.83
+exit_code: 0
+output: r1-short-sweep-boot1.txt
+
+### r1-pytest-boot2
+host: spark-0016 (sp8)
+image: sha256:9f51f2e2c5ab728e96490d794bff7b83a147d6d3d61333c5b60b2cff662049cd (spark-ds41f:candidate-49)
+start_utc: 2026-11-09T08:13:30Z
+loadavg_before: 2.27 2.71 2.83
+docker_ps_before: none
+command: flock /tmp/spark-lab-gpu.lock /home/chris/spark-lab/agents/candidate-49-rework-999/quiet.sh c49rw999-r1-pyt-b2 docker run --rm --gpus all --ipc=host --name c49rw999-r1-pyt-b2 --entrypoint '' -w /opt/spark-ds41f/candidate/vllm -v /home/chris/spark-lab/agents/candidate-49-rework-999/corrected/indexer.py:/opt/spark-ds41f/candidate/vllm/vllm/models/deepseek_v4_1/tilelang/indexer.py:ro -v /home/chris/spark-lab/agents/candidate-49-rework-999/corrected/test_deepseek_v41_tilelang.py:/opt/spark-ds41f/candidate/vllm/tests/kernels/attention/test_deepseek_v41_tilelang.py:ro sha256:9f51f2e2c5ab728e96490d794bff7b83a147d6d3d61333c5b60b2cff662049cd bash -lc sha256sum\ /opt/spark-ds41f/candidate/vllm/vllm/models/deepseek_v4_1/tilelang/indexer.py\ /opt/spark-ds41f/candidate/vllm/tests/kernels/attention/test_deepseek_v41_tilelang.py\;\ pytest\ --noconftest\ -q\ tests/kernels/attention/test_deepseek_v41_tilelang.py\ tests/models/test_deepseek_v4_1_lsa.py\ tests/models/test_deepseek_v4_1_attention.py\;\ a=\$\?\;\ python3\ tests/kernels/attention/deepseek_v41_indexer_reads.py\;\ b=\$\?\;\ echo\ pytest_rc=\$a\ reads_rc=\$b\;\ exit\ \$\(\(a\|b\)\)
+end_utc: 2026-11-09T08:22:00Z
+loadavg_after: 5.58 4.44 3.53
+exit_code: 0
+output: r1-pytest-boot2.txt
+
+### r1-bench2boot-boot3
+host: spark-0016 (sp8)
+image: sha256:9f51f2e2c5ab728e96490d794bff7b83a147d6d3d61333c5b60b2cff662049cd (spark-ds41f:candidate-49)
+start_utc: 2026-11-09T08:20:43Z
+loadavg_before: 5.58 3.94 3.29
+docker_ps_before: spark-ds41f:1107 elated_keller;9f51f2e2c5ab c49rw999-r1-pyt-b2;
+command: flock /tmp/spark-lab-gpu.lock /home/chris/spark-lab/agents/candidate-49-rework-999/quiet2.sh c49rw999-r1-bench2boot-boot3 docker run --rm --gpus all --ipc=host --name c49rw999-r1-bench2boot-boot3 --entrypoint '' -w /opt/spark-ds41f/candidate/vllm -v /home/chris/spark-lab/agents/candidate-49-rework-999/corrected/indexer.py:/opt/spark-ds41f/candidate/vllm/vllm/models/deepseek_v4_1/tilelang/indexer.py:ro -v /home/chris/spark-lab/agents/candidate-49-rework-999/src/bench_2boot.py:/tmp/bench_2boot.py:ro -v /home/chris/spark-lab/agents/candidate-49-rework-999/src/indexer_baseline_1107.py:/tmp_host/indexer_baseline.py:ro -v /home/chris/spark-lab/agents/candidate-49-rework-999/out/json:/out sha256:9f51f2e2c5ab728e96490d794bff7b83a147d6d3d61333c5b60b2cff662049cd bash -lc sha256sum\ /opt/spark-ds41f/candidate/vllm/vllm/models/deepseek_v4_1/tilelang/indexer.py\;\ python3\ /tmp/bench_2boot.py\ /out/r1-bench2boot-boot3.json
+end_utc: 2026-11-09T08:25:41Z
+loadavg_after: 2.38 3.60 3.41
+exit_code: 0
+output: r1-bench2boot-boot3.txt
+
+### r1-bench2boot-boot2
+host: spark-0016 (sp8)
+image: sha256:9f51f2e2c5ab728e96490d794bff7b83a147d6d3d61333c5b60b2cff662049cd (spark-ds41f:candidate-49)
+start_utc: 2026-11-09T08:22:01Z
+loadavg_before: 5.58 4.44 3.53
+docker_ps_before: spark-ds41f:1107 silly_spence;
+command: flock /tmp/spark-lab-gpu.lock /home/chris/spark-lab/agents/candidate-49-rework-999/quiet.sh c49rw999-r1-bench-b2 docker run --rm --gpus all --ipc=host --name c49rw999-r1-bench-b2 --entrypoint '' -w /opt/spark-ds41f/candidate/vllm -v /home/chris/spark-lab/agents/candidate-49-rework-999/corrected/indexer.py:/opt/spark-ds41f/candidate/vllm/vllm/models/deepseek_v4_1/tilelang/indexer.py:ro -v /home/chris/spark-lab/agents/candidate-49-rework-999/src/bench_2boot.py:/tmp/bench_2boot.py:ro -v /home/chris/spark-lab/agents/candidate-49-rework-999/src/indexer_baseline_1107.py:/tmp_host/indexer_baseline.py:ro -v /home/chris/spark-lab/agents/candidate-49-rework-999/out/json:/out sha256:9f51f2e2c5ab728e96490d794bff7b83a147d6d3d61333c5b60b2cff662049cd bash -lc sha256sum\ /opt/spark-ds41f/candidate/vllm/vllm/models/deepseek_v4_1/tilelang/indexer.py\;\ python3\ /tmp/bench_2boot.py\ /out/r1-bench2boot-boot2.json
+end_utc: 2026-11-09T08:27:42Z
+loadavg_after: 2.16 3.12 3.25
+exit_code: 0
+output: r1-bench2boot-boot2.txt
+
+### r1-served-gaps-boot3
+host: spark-0016 (sp8)
+image: sha256:9f51f2e2c5ab728e96490d794bff7b83a147d6d3d61333c5b60b2cff662049cd (spark-ds41f:candidate-49)
+start_utc: 2026-11-09T08:25:41Z
+loadavg_before: 2.38 3.60 3.41
+docker_ps_before: none
+command: flock /tmp/spark-lab-gpu.lock /home/chris/spark-lab/agents/candidate-49-rework-999/quiet2.sh c49rw999-r1-served-gaps-boot3 docker run --rm --gpus all --ipc=host --name c49rw999-r1-served-gaps-boot3 --entrypoint '' -w /opt/spark-ds41f/candidate/vllm -v /home/chris/spark-lab/agents/candidate-49-rework-999/corrected/indexer.py:/opt/spark-ds41f/candidate/vllm/vllm/models/deepseek_v4_1/tilelang/indexer.py:ro -v /home/chris/spark-lab/agents/candidate-49-rework-999/src/bench_2boot.py:/tmp/bench_2boot.py:ro -v /home/chris/spark-lab/agents/candidate-49-rework-999/src/indexer_baseline_1107.py:/tmp_host/indexer_baseline.py:ro -v /home/chris/spark-lab/agents/candidate-49-rework-999/src/bench_served_gaps.py:/tmp/bench_served_gaps.py:ro -v /home/chris/spark-lab/agents/candidate-49-rework-999/out/json:/out sha256:9f51f2e2c5ab728e96490d794bff7b83a147d6d3d61333c5b60b2cff662049cd bash -lc sha256sum\ /opt/spark-ds41f/candidate/vllm/vllm/models/deepseek_v4_1/tilelang/indexer.py\;\ python3\ /tmp/bench_served_gaps.py\ /out/r1-served-gaps-boot3.json
+end_utc: 2026-11-09T08:30:33Z
+loadavg_after: 2.79 2.96 3.16
+exit_code: 0
+output: r1-served-gaps-boot3.txt
+
+### r1-served-gaps-boot2
+host: spark-0016 (sp8)
+image: sha256:9f51f2e2c5ab728e96490d794bff7b83a147d6d3d61333c5b60b2cff662049cd (spark-ds41f:candidate-49)
+start_utc: 2026-11-09T08:27:42Z
+loadavg_before: 2.16 3.12 3.25
+docker_ps_before: none
+command: flock /tmp/spark-lab-gpu.lock /home/chris/spark-lab/agents/candidate-49-rework-999/quiet.sh c49rw999-r1-gaps-b2 docker run --rm --gpus all --ipc=host --name c49rw999-r1-gaps-b2 --entrypoint '' -w /opt/spark-ds41f/candidate/vllm -v /home/chris/spark-lab/agents/candidate-49-rework-999/corrected/indexer.py:/opt/spark-ds41f/candidate/vllm/vllm/models/deepseek_v4_1/tilelang/indexer.py:ro -v /home/chris/spark-lab/agents/candidate-49-rework-999/src/bench_2boot.py:/tmp/bench_2boot.py:ro -v /home/chris/spark-lab/agents/candidate-49-rework-999/src/indexer_baseline_1107.py:/tmp_host/indexer_baseline.py:ro -v /home/chris/spark-lab/agents/candidate-49-rework-999/src/bench_served_gaps.py:/tmp/bench_served_gaps.py:ro -v /home/chris/spark-lab/agents/candidate-49-rework-999/out/json:/out sha256:9f51f2e2c5ab728e96490d794bff7b83a147d6d3d61333c5b60b2cff662049cd bash -lc sha256sum\ /opt/spark-ds41f/candidate/vllm/vllm/models/deepseek_v4_1/tilelang/indexer.py\;\ python3\ /tmp/bench_served_gaps.py\ /out/r1-served-gaps-boot2.json
+end_utc: 2026-11-09T08:32:09Z
+loadavg_after: 3.08 3.01 3.16
+exit_code: 0
+output: r1-served-gaps-boot2.txt
+
+### r1-short-sweep-boot2
+host: spark-0016 (sp8)
+image: sha256:9f51f2e2c5ab728e96490d794bff7b83a147d6d3d61333c5b60b2cff662049cd (spark-ds41f:candidate-49)
+start_utc: 2026-11-09T08:32:09Z
+loadavg_before: 3.08 3.01 3.16
+docker_ps_before: none
+command: flock /tmp/spark-lab-gpu.lock /home/chris/spark-lab/agents/candidate-49-rework-999/quiet.sh c49rw999-r1-sweep-b2 docker run --rm --gpus all --ipc=host --name c49rw999-r1-sweep-b2 --entrypoint '' -w /opt/spark-ds41f/candidate/vllm -v /home/chris/spark-lab/agents/candidate-49-rework-999/corrected/indexer.py:/opt/spark-ds41f/candidate/vllm/vllm/models/deepseek_v4_1/tilelang/indexer.py:ro -v /home/chris/spark-lab/agents/candidate-49-rework-999/src/bench_2boot.py:/tmp/bench_2boot.py:ro -v /home/chris/spark-lab/agents/candidate-49-rework-999/src/indexer_baseline_1107.py:/tmp_host/indexer_baseline.py:ro -v /home/chris/spark-lab/agents/candidate-49-rework-999/src/bench_short_sweep.py:/tmp/bench_short_sweep.py:ro -v /home/chris/spark-lab/agents/candidate-49-rework-999/c49-orig/indexer.py:/tmp_host/c49/indexer.py:ro -v /home/chris/spark-lab/agents/candidate-49-rework-999/out/json:/out sha256:9f51f2e2c5ab728e96490d794bff7b83a147d6d3d61333c5b60b2cff662049cd bash -lc sha256sum\ /opt/spark-ds41f/candidate/vllm/vllm/models/deepseek_v4_1/tilelang/indexer.py\ /tmp_host/c49/indexer.py\;\ python3\ /tmp/bench_short_sweep.py\ /out/r1-short-sweep-boot2.json\ c49=/tmp_host/c49/indexer.py
+end_utc: 2026-11-09T08:33:37Z
+loadavg_after: 3.17 3.05 3.16
+exit_code: 0
+output: r1-short-sweep-boot2.txt
+
+### r1-bench2boot-boot4
+host: spark-0016 (sp8)
+image: sha256:9f51f2e2c5ab728e96490d794bff7b83a147d6d3d61333c5b60b2cff662049cd (spark-ds41f:candidate-49)
+start_utc: 2026-11-09T08:35:51Z
+loadavg_before: 3.97 3.38 3.26
+docker_ps_before: 3f32a962ce04 c49rw996r2-ibench-b2;
+command: flock /tmp/spark-lab-gpu.lock /home/chris/spark-lab/agents/candidate-49-rework-999/quiet2.sh c49rw999-r1-bench2boot-boot4 docker run --rm --gpus all --ipc=host --name c49rw999-r1-bench2boot-boot4 --entrypoint '' -w /opt/spark-ds41f/candidate/vllm -v /home/chris/spark-lab/agents/candidate-49-rework-999/corrected/indexer.py:/opt/spark-ds41f/candidate/vllm/vllm/models/deepseek_v4_1/tilelang/indexer.py:ro -v /home/chris/spark-lab/agents/candidate-49-rework-999/src/bench_2boot.py:/tmp/bench_2boot.py:ro -v /home/chris/spark-lab/agents/candidate-49-rework-999/src/indexer_baseline_1107.py:/tmp_host/indexer_baseline.py:ro -v /home/chris/spark-lab/agents/candidate-49-rework-999/out/json:/out sha256:9f51f2e2c5ab728e96490d794bff7b83a147d6d3d61333c5b60b2cff662049cd bash -lc sha256sum\ /opt/spark-ds41f/candidate/vllm/vllm/models/deepseek_v4_1/tilelang/indexer.py\;\ python3\ /tmp/bench_2boot.py\ /out/r1-bench2boot-boot4.json
+end_utc: 2026-11-09T08:38:04Z
+loadavg_after: 3.27 3.33 3.26
+exit_code: 0
+output: r1-bench2boot-boot4.txt
+
+### r1-bench2boot-boot5
+host: spark-0016 (sp8)
+image: sha256:9f51f2e2c5ab728e96490d794bff7b83a147d6d3d61333c5b60b2cff662049cd (spark-ds41f:candidate-49)
+start_utc: 2026-11-09T08:38:04Z
+loadavg_before: 3.27 3.33 3.26
+docker_ps_before: none
+command: flock /tmp/spark-lab-gpu.lock /home/chris/spark-lab/agents/candidate-49-rework-999/quiet2.sh c49rw999-r1-bench2boot-boot5 docker run --rm --gpus all --ipc=host --name c49rw999-r1-bench2boot-boot5 --entrypoint '' -w /opt/spark-ds41f/candidate/vllm -v /home/chris/spark-lab/agents/candidate-49-rework-999/corrected/indexer.py:/opt/spark-ds41f/candidate/vllm/vllm/models/deepseek_v4_1/tilelang/indexer.py:ro -v /home/chris/spark-lab/agents/candidate-49-rework-999/src/bench_2boot.py:/tmp/bench_2boot.py:ro -v /home/chris/spark-lab/agents/candidate-49-rework-999/src/indexer_baseline_1107.py:/tmp_host/indexer_baseline.py:ro -v /home/chris/spark-lab/agents/candidate-49-rework-999/out/json:/out sha256:9f51f2e2c5ab728e96490d794bff7b83a147d6d3d61333c5b60b2cff662049cd bash -lc sha256sum\ /opt/spark-ds41f/candidate/vllm/vllm/models/deepseek_v4_1/tilelang/indexer.py\;\ python3\ /tmp/bench_2boot.py\ /out/r1-bench2boot-boot5.json
+end_utc: 2026-11-09T08:41:10Z
+loadavg_after: 3.10 3.22 3.23
+exit_code: 0
+output: r1-bench2boot-boot5.txt
+
+### r1w-bench2boot-boot1
+host: spark-0016 (sp8)
+image: sha256:9f51f2e2c5ab728e96490d794bff7b83a147d6d3d61333c5b60b2cff662049cd (spark-ds41f:candidate-49)
+start_utc: 2026-11-09T08:44:40Z
+loadavg_before: 2.13 2.66 3.00
+docker_ps_before: none
+command: flock /tmp/spark-lab-gpu.lock /home/chris/spark-lab/agents/candidate-49-rework-999/quiet2.sh c49rw999-r1w-bench2boot-boot1 docker run --rm --gpus all --ipc=host --name c49rw999-r1w-bench2boot-boot1 --entrypoint '' -w /opt/spark-ds41f/candidate/vllm -v /home/chris/spark-lab/agents/candidate-49-rework-999/corrected/indexer.py:/opt/spark-ds41f/candidate/vllm/vllm/models/deepseek_v4_1/tilelang/indexer.py:ro -v /home/chris/spark-lab/agents/candidate-49-rework-999/src/bench_2boot.py:/tmp/bench_2boot.py:ro -v /home/chris/spark-lab/agents/candidate-49-rework-999/src/indexer_baseline_1107.py:/tmp_host/indexer_baseline.py:ro -v /home/chris/spark-lab/agents/candidate-49-rework-999/src/warm_wrap.py:/tmp/warm_wrap.py:ro -v /home/chris/spark-lab/agents/candidate-49-rework-999/out/json:/out sha256:9f51f2e2c5ab728e96490d794bff7b83a147d6d3d61333c5b60b2cff662049cd bash -lc sha256sum\ /opt/spark-ds41f/candidate/vllm/vllm/models/deepseek_v4_1/tilelang/indexer.py\;\ python3\ /tmp/warm_wrap.py\ /tmp/bench_2boot.py\ /out/r1w-bench2boot-boot1.json
+end_utc: 2026-11-09T08:47:23Z
+loadavg_after: 2.97 2.83 3.00
+exit_code: 0
+output: r1w-bench2boot-boot1.txt
+
+### r1w-served-gaps-boot1
+host: spark-0016 (sp8)
+image: sha256:9f51f2e2c5ab728e96490d794bff7b83a147d6d3d61333c5b60b2cff662049cd (spark-ds41f:candidate-49)
+start_utc: 2026-11-09T08:47:23Z
+loadavg_before: 2.97 2.83 3.00
+docker_ps_before: none
+command: flock /tmp/spark-lab-gpu.lock /home/chris/spark-lab/agents/candidate-49-rework-999/quiet2.sh c49rw999-r1w-served-gaps-boot1 docker run --rm --gpus all --ipc=host --name c49rw999-r1w-served-gaps-boot1 --entrypoint '' -w /opt/spark-ds41f/candidate/vllm -v /home/chris/spark-lab/agents/candidate-49-rework-999/corrected/indexer.py:/opt/spark-ds41f/candidate/vllm/vllm/models/deepseek_v4_1/tilelang/indexer.py:ro -v /home/chris/spark-lab/agents/candidate-49-rework-999/src/bench_2boot.py:/tmp/bench_2boot.py:ro -v /home/chris/spark-lab/agents/candidate-49-rework-999/src/indexer_baseline_1107.py:/tmp_host/indexer_baseline.py:ro -v /home/chris/spark-lab/agents/candidate-49-rework-999/src/warm_wrap.py:/tmp/warm_wrap.py:ro -v /home/chris/spark-lab/agents/candidate-49-rework-999/src/bench_served_gaps.py:/tmp/bench_served_gaps.py:ro -v /home/chris/spark-lab/agents/candidate-49-rework-999/out/json:/out sha256:9f51f2e2c5ab728e96490d794bff7b83a147d6d3d61333c5b60b2cff662049cd bash -lc sha256sum\ /opt/spark-ds41f/candidate/vllm/vllm/models/deepseek_v4_1/tilelang/indexer.py\;\ python3\ /tmp/warm_wrap.py\ /tmp/bench_served_gaps.py\ /out/r1w-served-gaps-boot1.json
+end_utc: 2026-11-09T08:49:25Z
+loadavg_after: 3.10 2.95 3.01
+exit_code: 0
+output: r1w-served-gaps-boot1.txt
+
+### r1w-short-sweep-boot1
+host: spark-0016 (sp8)
+image: sha256:9f51f2e2c5ab728e96490d794bff7b83a147d6d3d61333c5b60b2cff662049cd (spark-ds41f:candidate-49)
+start_utc: 2026-11-09T08:49:25Z
+loadavg_before: 3.10 2.95 3.01
+docker_ps_before: none
+command: flock /tmp/spark-lab-gpu.lock /home/chris/spark-lab/agents/candidate-49-rework-999/quiet2.sh c49rw999-r1w-short-sweep-boot1 docker run --rm --gpus all --ipc=host --name c49rw999-r1w-short-sweep-boot1 --entrypoint '' -w /opt/spark-ds41f/candidate/vllm -v /home/chris/spark-lab/agents/candidate-49-rework-999/corrected/indexer.py:/opt/spark-ds41f/candidate/vllm/vllm/models/deepseek_v4_1/tilelang/indexer.py:ro -v /home/chris/spark-lab/agents/candidate-49-rework-999/src/bench_2boot.py:/tmp/bench_2boot.py:ro -v /home/chris/spark-lab/agents/candidate-49-rework-999/src/indexer_baseline_1107.py:/tmp_host/indexer_baseline.py:ro -v /home/chris/spark-lab/agents/candidate-49-rework-999/src/warm_wrap.py:/tmp/warm_wrap.py:ro -v /home/chris/spark-lab/agents/candidate-49-rework-999/src/bench_short_sweep.py:/tmp/bench_short_sweep.py:ro -v /home/chris/spark-lab/agents/candidate-49-rework-999/c49-orig/indexer.py:/tmp_host/c49/indexer.py:ro -v /home/chris/spark-lab/agents/candidate-49-rework-999/out/json:/out sha256:9f51f2e2c5ab728e96490d794bff7b83a147d6d3d61333c5b60b2cff662049cd bash -lc sha256sum\ /opt/spark-ds41f/candidate/vllm/vllm/models/deepseek_v4_1/tilelang/indexer.py\ /tmp_host/c49/indexer.py\;\ python3\ /tmp/warm_wrap.py\ /tmp/bench_short_sweep.py\ /out/r1w-short-sweep-boot1.json\ c49=/tmp_host/c49/indexer.py
+end_utc: 2026-11-09T08:50:42Z
+loadavg_after: 3.23 3.02 3.03
+exit_code: 0
+output: r1w-short-sweep-boot1.txt
+
+### r1w-bench2boot-boot2
+host: spark-0016 (sp8)
+image: sha256:9f51f2e2c5ab728e96490d794bff7b83a147d6d3d61333c5b60b2cff662049cd (spark-ds41f:candidate-49)
+start_utc: 2026-11-09T08:50:43Z
+loadavg_before: 3.23 3.02 3.03
+docker_ps_before: none
+command: flock /tmp/spark-lab-gpu.lock /home/chris/spark-lab/agents/candidate-49-rework-999/quiet2.sh c49rw999-r1w-bench2boot-boot2 docker run --rm --gpus all --ipc=host --name c49rw999-r1w-bench2boot-boot2 --entrypoint '' -w /opt/spark-ds41f/candidate/vllm -v /home/chris/spark-lab/agents/candidate-49-rework-999/corrected/indexer.py:/opt/spark-ds41f/candidate/vllm/vllm/models/deepseek_v4_1/tilelang/indexer.py:ro -v /home/chris/spark-lab/agents/candidate-49-rework-999/src/bench_2boot.py:/tmp/bench_2boot.py:ro -v /home/chris/spark-lab/agents/candidate-49-rework-999/src/indexer_baseline_1107.py:/tmp_host/indexer_baseline.py:ro -v /home/chris/spark-lab/agents/candidate-49-rework-999/src/warm_wrap.py:/tmp/warm_wrap.py:ro -v /home/chris/spark-lab/agents/candidate-49-rework-999/out/json:/out sha256:9f51f2e2c5ab728e96490d794bff7b83a147d6d3d61333c5b60b2cff662049cd bash -lc sha256sum\ /opt/spark-ds41f/candidate/vllm/vllm/models/deepseek_v4_1/tilelang/indexer.py\;\ python3\ /tmp/warm_wrap.py\ /tmp/bench_2boot.py\ /out/r1w-bench2boot-boot2.json
+end_utc: 2026-11-09T08:53:25Z
+loadavg_after: 3.17 3.06 3.04
+exit_code: 0
+output: r1w-bench2boot-boot2.txt
+
+### r1w-served-gaps-boot2
+host: spark-0016 (sp8)
+image: sha256:9f51f2e2c5ab728e96490d794bff7b83a147d6d3d61333c5b60b2cff662049cd (spark-ds41f:candidate-49)
+start_utc: 2026-11-09T08:53:25Z
+loadavg_before: 3.17 3.06 3.04
+docker_ps_before: none
+command: flock /tmp/spark-lab-gpu.lock /home/chris/spark-lab/agents/candidate-49-rework-999/quiet2.sh c49rw999-r1w-served-gaps-boot2 docker run --rm --gpus all --ipc=host --name c49rw999-r1w-served-gaps-boot2 --entrypoint '' -w /opt/spark-ds41f/candidate/vllm -v /home/chris/spark-lab/agents/candidate-49-rework-999/corrected/indexer.py:/opt/spark-ds41f/candidate/vllm/vllm/models/deepseek_v4_1/tilelang/indexer.py:ro -v /home/chris/spark-lab/agents/candidate-49-rework-999/src/bench_2boot.py:/tmp/bench_2boot.py:ro -v /home/chris/spark-lab/agents/candidate-49-rework-999/src/indexer_baseline_1107.py:/tmp_host/indexer_baseline.py:ro -v /home/chris/spark-lab/agents/candidate-49-rework-999/src/warm_wrap.py:/tmp/warm_wrap.py:ro -v /home/chris/spark-lab/agents/candidate-49-rework-999/src/bench_served_gaps.py:/tmp/bench_served_gaps.py:ro -v /home/chris/spark-lab/agents/candidate-49-rework-999/out/json:/out sha256:9f51f2e2c5ab728e96490d794bff7b83a147d6d3d61333c5b60b2cff662049cd bash -lc sha256sum\ /opt/spark-ds41f/candidate/vllm/vllm/models/deepseek_v4_1/tilelang/indexer.py\;\ python3\ /tmp/warm_wrap.py\ /tmp/bench_served_gaps.py\ /out/r1w-served-gaps-boot2.json
+end_utc: 2026-11-09T08:55:28Z
+loadavg_after: 2.60 2.93 2.99
+exit_code: 0
+output: r1w-served-gaps-boot2.txt
+
+### r1w-short-sweep-boot2
+host: spark-0016 (sp8)
+image: sha256:9f51f2e2c5ab728e96490d794bff7b83a147d6d3d61333c5b60b2cff662049cd (spark-ds41f:candidate-49)
+start_utc: 2026-11-09T08:55:28Z
+loadavg_before: 2.60 2.93 2.99
+docker_ps_before: none
+command: flock /tmp/spark-lab-gpu.lock /home/chris/spark-lab/agents/candidate-49-rework-999/quiet2.sh c49rw999-r1w-short-sweep-boot2 docker run --rm --gpus all --ipc=host --name c49rw999-r1w-short-sweep-boot2 --entrypoint '' -w /opt/spark-ds41f/candidate/vllm -v /home/chris/spark-lab/agents/candidate-49-rework-999/corrected/indexer.py:/opt/spark-ds41f/candidate/vllm/vllm/models/deepseek_v4_1/tilelang/indexer.py:ro -v /home/chris/spark-lab/agents/candidate-49-rework-999/src/bench_2boot.py:/tmp/bench_2boot.py:ro -v /home/chris/spark-lab/agents/candidate-49-rework-999/src/indexer_baseline_1107.py:/tmp_host/indexer_baseline.py:ro -v /home/chris/spark-lab/agents/candidate-49-rework-999/src/warm_wrap.py:/tmp/warm_wrap.py:ro -v /home/chris/spark-lab/agents/candidate-49-rework-999/src/bench_short_sweep.py:/tmp/bench_short_sweep.py:ro -v /home/chris/spark-lab/agents/candidate-49-rework-999/c49-orig/indexer.py:/tmp_host/c49/indexer.py:ro -v /home/chris/spark-lab/agents/candidate-49-rework-999/out/json:/out sha256:9f51f2e2c5ab728e96490d794bff7b83a147d6d3d61333c5b60b2cff662049cd bash -lc sha256sum\ /opt/spark-ds41f/candidate/vllm/vllm/models/deepseek_v4_1/tilelang/indexer.py\ /tmp_host/c49/indexer.py\;\ python3\ /tmp/warm_wrap.py\ /tmp/bench_short_sweep.py\ /out/r1w-short-sweep-boot2.json\ c49=/tmp_host/c49/indexer.py
+end_utc: 2026-11-09T08:56:45Z
+loadavg_after: 2.20 2.73 2.91
+exit_code: 0
+output: r1w-short-sweep-boot2.txt
+
+### r1w-pair-c49-boot1
+host: spark-0016 (sp8)
+image: sha256:9f51f2e2c5ab728e96490d794bff7b83a147d6d3d61333c5b60b2cff662049cd (spark-ds41f:candidate-49)
+start_utc: 2026-11-09T08:58:57Z
+loadavg_before: 1.73 2.31 2.72
+docker_ps_before: none
+command: flock /tmp/spark-lab-gpu.lock /home/chris/spark-lab/agents/candidate-49-rework-999/quiet2.sh c49rw999-r1w-pair-c49-boot1 docker run --rm --gpus all --ipc=host --name c49rw999-r1w-pair-c49-boot1 --entrypoint '' -w /opt/spark-ds41f/candidate/vllm -v /home/chris/spark-lab/agents/candidate-49-rework-999/corrected/indexer.py:/opt/spark-ds41f/candidate/vllm/vllm/models/deepseek_v4_1/tilelang/indexer.py:ro -v /home/chris/spark-lab/agents/candidate-49-rework-999/src/bench_2boot.py:/tmp/bench_2boot.py:ro -v /home/chris/spark-lab/agents/candidate-49-rework-999/src/indexer_baseline_1107.py:/tmp_host/indexer_baseline.py:ro -v /home/chris/spark-lab/agents/candidate-49-rework-999/src/warm_wrap.py:/tmp/warm_wrap.py:ro -v /home/chris/spark-lab/agents/candidate-49-rework-999/src/bench_pair_c49.py:/tmp/bench_pair_c49.py:ro -v /home/chris/spark-lab/agents/candidate-49-rework-999/c49-orig/indexer.py:/tmp_host/c49/indexer.py:ro -v /home/chris/spark-lab/agents/candidate-49-rework-999/out/json:/out sha256:9f51f2e2c5ab728e96490d794bff7b83a147d6d3d61333c5b60b2cff662049cd bash -lc sha256sum\ /opt/spark-ds41f/candidate/vllm/vllm/models/deepseek_v4_1/tilelang/indexer.py\ /tmp_host/c49/indexer.py\;\ python3\ /tmp/warm_wrap.py\ /tmp/bench_pair_c49.py\ /out/r1w-pair-c49-boot1.json\ c49=/tmp_host/c49/indexer.py
+end_utc: 2026-11-09T09:00:13Z
+loadavg_after: 2.01 2.26 2.68
+exit_code: 0
+output: r1w-pair-c49-boot1.txt
+
+### r1w-pair-c49-boot2
+host: spark-0016 (sp8)
+image: sha256:9f51f2e2c5ab728e96490d794bff7b83a147d6d3d61333c5b60b2cff662049cd (spark-ds41f:candidate-49)
+start_utc: 2026-11-09T09:00:13Z
+loadavg_before: 2.01 2.26 2.68
+docker_ps_before: none
+command: flock /tmp/spark-lab-gpu.lock /home/chris/spark-lab/agents/candidate-49-rework-999/quiet2.sh c49rw999-r1w-pair-c49-boot2 docker run --rm --gpus all --ipc=host --name c49rw999-r1w-pair-c49-boot2 --entrypoint '' -w /opt/spark-ds41f/candidate/vllm -v /home/chris/spark-lab/agents/candidate-49-rework-999/corrected/indexer.py:/opt/spark-ds41f/candidate/vllm/vllm/models/deepseek_v4_1/tilelang/indexer.py:ro -v /home/chris/spark-lab/agents/candidate-49-rework-999/src/bench_2boot.py:/tmp/bench_2boot.py:ro -v /home/chris/spark-lab/agents/candidate-49-rework-999/src/indexer_baseline_1107.py:/tmp_host/indexer_baseline.py:ro -v /home/chris/spark-lab/agents/candidate-49-rework-999/src/warm_wrap.py:/tmp/warm_wrap.py:ro -v /home/chris/spark-lab/agents/candidate-49-rework-999/src/bench_pair_c49.py:/tmp/bench_pair_c49.py:ro -v /home/chris/spark-lab/agents/candidate-49-rework-999/c49-orig/indexer.py:/tmp_host/c49/indexer.py:ro -v /home/chris/spark-lab/agents/candidate-49-rework-999/out/json:/out sha256:9f51f2e2c5ab728e96490d794bff7b83a147d6d3d61333c5b60b2cff662049cd bash -lc sha256sum\ /opt/spark-ds41f/candidate/vllm/vllm/models/deepseek_v4_1/tilelang/indexer.py\ /tmp_host/c49/indexer.py\;\ python3\ /tmp/warm_wrap.py\ /tmp/bench_pair_c49.py\ /out/r1w-pair-c49-boot2.json\ c49=/tmp_host/c49/indexer.py
+end_utc: 2026-11-09T09:01:31Z
+loadavg_after: 2.51 2.34 2.67
+exit_code: 0
+output: r1w-pair-c49-boot2.txt
+

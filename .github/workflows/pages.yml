@@ -12,9 +12,13 @@ on:
       - 'upstreams.lock.json'
       - 'manifests/**'
       - 'scripts/render_docs.py'
+      - 'scripts/render-og'
+      - 'site/**'
       - 'scripts/recipe.py'
       - 'scripts/kv_capacity.py'
       - 'docs/index.html'
+      - 'docs/logo.png'
+      - 'docs/og.png'
       - '.github/workflows/pages.yml'
   workflow_dispatch:
 
@@ -41,6 +45,10 @@ jobs:
         run: |
           python3 scripts/render_docs.py --check
           python3 scripts/render_docs.py --site-dir _site
+      - name: Render the link-preview image from the page
+        # _site already holds the committed docs/og.png; a failed render keeps it.
+        continue-on-error: true
+        run: scripts/render-og _site/index.html _site/og.png
       - name: Upload Pages artifact
         uses: actions/upload-pages-artifact@v3
         with:

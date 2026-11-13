@@ -1,0 +1,386 @@
+{
+ "pr": 968,
+ "pr_head": "1445e800b172bc069239ca16e8bec82945fa5a12",
+ "patch": "0782-perf-spec-decode-remaining-token-draft-cap.patch (sha256 9a8501356dc1, equal to the PR head's 0762)",
+ "kind": "perf",
+ "mark": "Its screen_remaining_token_cap.py on the image, 2 boots: verify rows past a request's remaining max_tokens are not scheduled (functional), outputs bit-exact; paired decode not worse; the tail steps of bounded requests at 16 streams lighter. Run on both images ABBA: the functional rows must show the cap on the candidate only.",
+ "host": "sp8 (spark-0016, NVIDIA GB10, driver 580.178.04, kernel 7.0.0-1024-nvidia)",
+ "images": {
+  "base": "spark-ds41f:candidate-50 sha256:8c1ea1f62f62c3e2adc03b645c091a5499cf7163101aca32875c894b96f155db + candidate-50/no1009/overlay (4 files, ro)",
+  "c52": "the same image + candidate-52's 13 differing files (ro), scheduler.py included; ../common/overlay-sha.txt"
+ },
+ "session": "sp8, 2026-11-09T18:02:44Z..18:06:44Z, one hold of /tmp/spark-lab-gpu.lock: the PR screen ABBA, h968 ABBA, then the tests on c52 twice",
+ "evidence": [
+  "the PR's screen_remaining_token_cap.py, 4 boots ABBA (raw/screen-*.txt): in each image it builds a 'clamped' scheduler and an 'unclamped' one (enable_adaptive_verification=False) and counts scheduled verify rows at a bounded request's tail; drives the sink_draft_zero sweep (20 configurations, adaptive off vs on) for bit-exactness and row totals; and two patch-independent rows (a hand-fed AdaptiveVerificationManager budget and a synthetic 61-layer GEMM step cost)",
+  "our h968.py, 4 boots ABBA (raw/h968-*.json): the same sweep, keeping every configuration's emitted tokens, sink metrics and per-step rows so the arms can be compared token for token",
+  "the PR's pytest selection on c52, 2 boots"
+ ],
+ "bit_exact": true,
+ "bit_exact_detail": "Emitted tokens and sink metrics of all 40 runs (20 configurations x adaptive off/on) are identical across all four boots of both arms (digest 2df4ce782d536600 on base-boot1, c52-boot1, c52-boot2, base-boot2) and between adaptive off and on within each arm; the PR screen's all_bit_exact is true on every boot.",
+ "measured": {
+  "functional_rows": {
+   "single_stream_copy_tail_rem_2": {
+    "base-boot1": {
+     "unclamped_rows": 17,
+     "clamped_rows": 17,
+     "wasted_rows_saved": 0
+    },
+    "c52-boot1": {
+     "unclamped_rows": 17,
+     "clamped_rows": 2,
+     "wasted_rows_saved": 15
+    },
+    "c52-boot2": {
+     "unclamped_rows": 17,
+     "clamped_rows": 2,
+     "wasted_rows_saved": 15
+    },
+    "base-boot2": {
+     "unclamped_rows": 17,
+     "clamped_rows": 17,
+     "wasted_rows_saved": 0
+    }
+   },
+   "single_stream_copy_tail_rem_3": {
+    "base-boot1": {
+     "unclamped_rows": 17,
+     "clamped_rows": 17,
+     "wasted_rows_saved": 0
+    },
+    "c52-boot1": {
+     "unclamped_rows": 17,
+     "clamped_rows": 3,
+     "wasted_rows_saved": 14
+    },
+    "c52-boot2": {
+     "unclamped_rows": 17,
+     "clamped_rows": 3,
+     "wasted_rows_saved": 14
+    },
+    "base-boot2": {
+     "unclamped_rows": 17,
+     "clamped_rows": 17,
+     "wasted_rows_saved": 0
+    }
+   },
+   "single_stream_copy_tail_rem_4": {
+    "base-boot1": {
+     "unclamped_rows": 17,
+     "clamped_rows": 17,
+     "wasted_rows_saved": 0
+    },
+    "c52-boot1": {
+     "unclamped_rows": 17,
+     "clamped_rows": 4,
+     "wasted_rows_saved": 13
+    },
+    "c52-boot2": {
+     "unclamped_rows": 17,
+     "clamped_rows": 4,
+     "wasted_rows_saved": 13
+    },
+    "base-boot2": {
+     "unclamped_rows": 17,
+     "clamped_rows": 17,
+     "wasted_rows_saved": 0
+    }
+   },
+   "single_stream_copy_tail_rem_8": {
+    "base-boot1": {
+     "unclamped_rows": 17,
+     "clamped_rows": 17,
+     "wasted_rows_saved": 0
+    },
+    "c52-boot1": {
+     "unclamped_rows": 17,
+     "clamped_rows": 8,
+     "wasted_rows_saved": 9
+    },
+    "c52-boot2": {
+     "unclamped_rows": 17,
+     "clamped_rows": 8,
+     "wasted_rows_saved": 9
+    },
+    "base-boot2": {
+     "unclamped_rows": 17,
+     "clamped_rows": 17,
+     "wasted_rows_saved": 0
+    }
+   },
+   "single_stream_copy_tail_rem_12": {
+    "base-boot1": {
+     "unclamped_rows": 17,
+     "clamped_rows": 17,
+     "wasted_rows_saved": 0
+    },
+    "c52-boot1": {
+     "unclamped_rows": 17,
+     "clamped_rows": 12,
+     "wasted_rows_saved": 5
+    },
+    "c52-boot2": {
+     "unclamped_rows": 17,
+     "clamped_rows": 12,
+     "wasted_rows_saved": 5
+    },
+    "base-boot2": {
+     "unclamped_rows": 17,
+     "clamped_rows": 17,
+     "wasted_rows_saved": 0
+    }
+   },
+   "multi_stream_copy_envelope_reclaim_c4": {
+    "base-boot1": {
+     "clamped_r0_drafts": 16,
+     "clamped_r1_drafts": 5,
+     "active_copy_drafts_gained": 0
+    },
+    "c52-boot1": {
+     "clamped_r0_drafts": 1,
+     "clamped_r1_drafts": 16,
+     "active_copy_drafts_gained": 11
+    },
+    "c52-boot2": {
+     "clamped_r0_drafts": 1,
+     "clamped_r1_drafts": 16,
+     "active_copy_drafts_gained": 11
+    },
+    "base-boot2": {
+     "clamped_r0_drafts": 16,
+     "clamped_r1_drafts": 5,
+     "active_copy_drafts_gained": 0
+    }
+   },
+   "sink_draft_zero_bit_exact_sweep": {
+    "base-boot1": {
+     "all_bit_exact": true,
+     "total_rows_unclamped": 730,
+     "total_rows_clamped": 730,
+     "total_rows_saved": 0
+    },
+    "c52-boot1": {
+     "all_bit_exact": true,
+     "total_rows_unclamped": 730,
+     "total_rows_clamped": 671,
+     "total_rows_saved": 59
+    },
+    "c52-boot2": {
+     "all_bit_exact": true,
+     "total_rows_unclamped": 730,
+     "total_rows_clamped": 671,
+     "total_rows_saved": 59
+    },
+    "base-boot2": {
+     "all_bit_exact": true,
+     "total_rows_unclamped": 730,
+     "total_rows_clamped": 730,
+     "total_rows_saved": 0
+    }
+   }
+  },
+  "h968": {
+   "base-boot1": {
+    "scheduler_py_sha256": "fbcfc4115ae3",
+    "scheduler_has_max_decode_new_tokens": false,
+    "emitted_and_metrics_digest": "2df4ce782d536600",
+    "total_rows_adaptive_off": 730,
+    "total_rows_adaptive_on": 730
+   },
+   "c52-boot1": {
+    "scheduler_py_sha256": "cddbebed5c3e",
+    "scheduler_has_max_decode_new_tokens": true,
+    "emitted_and_metrics_digest": "2df4ce782d536600",
+    "total_rows_adaptive_off": 730,
+    "total_rows_adaptive_on": 671
+   },
+   "c52-boot2": {
+    "scheduler_py_sha256": "cddbebed5c3e",
+    "scheduler_has_max_decode_new_tokens": true,
+    "emitted_and_metrics_digest": "2df4ce782d536600",
+    "total_rows_adaptive_off": 730,
+    "total_rows_adaptive_on": 671
+   },
+   "base-boot2": {
+    "scheduler_py_sha256": "fbcfc4115ae3",
+    "scheduler_has_max_decode_new_tokens": false,
+    "emitted_and_metrics_digest": "2df4ce782d536600",
+    "total_rows_adaptive_off": 730,
+    "total_rows_adaptive_on": 730
+   }
+  },
+  "patch_independent_rows": {
+   "gpu_adaptive_budget_c8_tail_reclaim": "identical on all four boots of both arms (48 -> 40 rows, 8 -> 0 wasted drafts): the screen feeds hand-made clamped and unclamped draft maps to AdaptiveVerificationManager, so the row does not exercise the patch",
+   "gb10_61layer_step_cost_ms": {
+    "gb10_61layer_c1_copy_tail_m17_vs_m2_tp3": {
+     "base-boot1": {
+      "unclamped_rows": 17,
+      "clamped_rows": 2,
+      "unclamped_ms": 211.178,
+      "clamped_ms": 80.902
+     },
+     "c52-boot1": {
+      "unclamped_rows": 17,
+      "clamped_rows": 2,
+      "unclamped_ms": 213.472,
+      "clamped_ms": 80.769
+     },
+     "c52-boot2": {
+      "unclamped_rows": 17,
+      "clamped_rows": 2,
+      "unclamped_ms": 210.602,
+      "clamped_ms": 83.712
+     },
+     "base-boot2": {
+      "unclamped_rows": 17,
+      "clamped_rows": 2,
+      "unclamped_ms": 210.176,
+      "clamped_ms": 81.009
+     }
+    },
+    "gb10_61layer_c1_dspark_tail_m6_vs_m2_tp3": {
+     "base-boot1": {
+      "unclamped_rows": 6,
+      "clamped_rows": 2,
+      "unclamped_ms": 144.865,
+      "clamped_ms": 80.591
+     },
+     "c52-boot1": {
+      "unclamped_rows": 6,
+      "clamped_rows": 2,
+      "unclamped_ms": 145.121,
+      "clamped_ms": 80.69
+     },
+     "c52-boot2": {
+      "unclamped_rows": 6,
+      "clamped_rows": 2,
+      "unclamped_ms": 144.34,
+      "clamped_ms": 80.638
+     },
+     "base-boot2": {
+      "unclamped_rows": 6,
+      "clamped_rows": 2,
+      "unclamped_ms": 147.855,
+      "clamped_ms": 81.265
+     }
+    },
+    "gb10_61layer_c8_batch_tail_m48_vs_m36_tp3": {
+     "base-boot1": {
+      "unclamped_rows": 48,
+      "clamped_rows": 36,
+      "unclamped_ms": 558.657,
+      "clamped_ms": 442.235
+     },
+     "c52-boot1": {
+      "unclamped_rows": 48,
+      "clamped_rows": 36,
+      "unclamped_ms": 564.122,
+      "clamped_ms": 443.233
+     },
+     "c52-boot2": {
+      "unclamped_rows": 48,
+      "clamped_rows": 36,
+      "unclamped_ms": 569.8,
+      "clamped_ms": 448.057
+     },
+     "base-boot2": {
+      "unclamped_rows": 48,
+      "clamped_rows": 36,
+      "unclamped_ms": 564.272,
+      "clamped_ms": 437.113
+     }
+    },
+    "gb10_61layer_c1_copy_tail_m17_vs_m2_tp4": {
+     "base-boot1": {
+      "unclamped_rows": 17,
+      "clamped_rows": 2,
+      "unclamped_ms": 150.09,
+      "clamped_ms": 68.747
+     },
+     "c52-boot1": {
+      "unclamped_rows": 17,
+      "clamped_rows": 2,
+      "unclamped_ms": 151.811,
+      "clamped_ms": 65.873
+     },
+     "c52-boot2": {
+      "unclamped_rows": 17,
+      "clamped_rows": 2,
+      "unclamped_ms": 151.549,
+      "clamped_ms": 65.875
+     },
+     "base-boot2": {
+      "unclamped_rows": 17,
+      "clamped_rows": 2,
+      "unclamped_ms": 150.968,
+      "clamped_ms": 66.014
+     }
+    },
+    "gb10_61layer_c1_dspark_tail_m6_vs_m2_tp4": {
+     "base-boot1": {
+      "unclamped_rows": 6,
+      "clamped_rows": 2,
+      "unclamped_ms": 113.061,
+      "clamped_ms": 65.74
+     },
+     "c52-boot1": {
+      "unclamped_rows": 6,
+      "clamped_rows": 2,
+      "unclamped_ms": 112.898,
+      "clamped_ms": 65.661
+     },
+     "c52-boot2": {
+      "unclamped_rows": 6,
+      "clamped_rows": 2,
+      "unclamped_ms": 113.485,
+      "clamped_ms": 65.62
+     },
+     "base-boot2": {
+      "unclamped_rows": 6,
+      "clamped_rows": 2,
+      "unclamped_ms": 111.978,
+      "clamped_ms": 65.969
+     }
+    },
+    "gb10_61layer_c8_batch_tail_m48_vs_m36_tp4": {
+     "base-boot1": {
+      "unclamped_rows": 48,
+      "clamped_rows": 36,
+      "unclamped_ms": 415.152,
+      "clamped_ms": 327.43
+     },
+     "c52-boot1": {
+      "unclamped_rows": 48,
+      "clamped_rows": 36,
+      "unclamped_ms": 422.97,
+      "clamped_ms": 335.524
+     },
+     "c52-boot2": {
+      "unclamped_rows": 48,
+      "clamped_rows": 36,
+      "unclamped_ms": 421.608,
+      "clamped_ms": 332.515
+     },
+     "base-boot2": {
+      "unclamped_rows": 48,
+      "clamped_rows": 36,
+      "unclamped_ms": 420.898,
+      "clamped_ms": 331.904
+     }
+    }
+   },
+   "note": "synthetic per-rank GEMM + expert-gather loops at M rows (eager), the same code in both images; they model what a removed row costs, they do not measure the patch. Equal across arms within boot noise."
+  },
+  "pytest_c52": {
+   "boot1": "143 passed, 1 skipped in 26.67s",
+   "boot2": "143 passed, 1 skipped"
+  }
+ },
+ "verdict": "pass",
+ "verdict_scope": "the sp8 own mark: functional cap, bit-exactness and the PR's tests. 'Paired decode not worse' and 'the tail steps of bounded requests at 16 streams lighter' are serving metrics of the tp4-switched screen (closed loop), not of this bench; they are not judged here.",
+ "reason": "The cap acts on the candidate only: at a copy-widened single-stream tail the candidate schedules 2/3/4/8/12 verify rows for 2/3/4/8/12 remaining tokens where the base schedules 17 (15/14/13/9/5 rows saved), the finishing c4 stream gives its copy envelope to the active one (r1 5 -> 16 drafts, +11; base +0), and the sink_draft_zero sweep schedules 671 rows instead of 730 (59 saved; base 730 = 730). The outputs are bit-exact: every configuration's emitted tokens and sink metrics are identical across all four boots of both arms. Its own metric (rows scheduled past max_tokens) is deterministic, so the improvement has no interval to overlap, and no cell of its bench is slower: the bench's timing rows are synthetic and patch-independent and equal across arms. The 143 tests pass on both boots.",
+ "notes": [
+  "As committed, the cap (Scheduler._max_decode_new_tokens) is gated on enable_adaptive_verification only (the PR README also names copy drafts); the PR screen's 'unclamped' scheduler is the same image's scheduler with enable_adaptive_verification=False, which is why it shows 17 rows on both arms. The served recipe (releases/spark-ds41f-1107/cluster.json) sets enable_adaptive_verification true, so serving takes the capped path.",
+  "Test count 143 passed + 1 skipped, against the PR's 136 + 1 on 1107: candidate-50's base carries more tests in these four files.",
+  "The screen's step-cost rows are eager timings of stand-in GEMMs (61 x 5 iterations), not the model; their 2.2-2.6x 'speedups' are a cost model of fewer rows, identical in both images."
+ ]
+}

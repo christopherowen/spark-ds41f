@@ -1,0 +1,955 @@
+{
+ "base": {
+  "description": "candidate-50's vLLM series without #1009 (0778-perf-dsv41-sp-prefill-local-attention-front.patch): spark-ds41f-1107 (0001..0761) plus 0762..0777, 0779, 0780",
+  "how": "sp8 copy of candidate-50's prepared tree (HEAD ba7400d9b, tree d5778ab5, the expected_tree of candidate-50/upstreams.lock.json), then git revert 0a231de28 (0778)",
+  "vllm_revision": "19f2c20ed4d64ae22bd009ceacadd85e2a81e354",
+  "candidate_50_patch_head": "ba7400d9b6715ea1be6fa98b1d9ccedf5fcb65f9",
+  "candidate_50_tree": "d5778ab56647a20d94710ecb94cfd9a4de27bee9",
+  "base_commit": "0bffb886ec85fb57a9971bd144c2a7b780658617",
+  "base_tree": "14c5a2dc924541ce4eda44d5b39d811be15f2363",
+  "check": "the four files 0778 touches outside tests equal candidate-50/no1009/overlay byte for byte (SHA-256)",
+  "tilelang": "2123e412 plus 1107/tilelang/series (13 patches): tree e2b001828fd4, the 1107 label",
+  "sparknet": "1fd6a1fb (no series): tree 8cc28a5cd3e6, the 1107 label",
+  "where": "sp8, ~/spark-lab/agents/round-51-53-select"
+ },
+ "method": "each PR's vLLM patches alone on the base (git apply --index; on failure git apply -3 to tell a context-only test append from a code conflict). Context-only rebases resolve each test-file conflict as the base's tests, then the PR's, and are verified to add and remove exactly the PR's lines. Then, for every pair of the resulting patch sets that touch a common file: A applied, B checked with git apply --check, both orders. TileLang and sparknet patches on 1107's pinned trees the same way",
+ "applies_alone": {
+  "949": {
+   "status": "code conflict with the base",
+   "patches": [
+    "0001-deepseek-v41-dsml-token-provenance.patch"
+   ],
+   "plain_apply_failed": [
+    "tests/parser/engine/test_deepseek_v41_dsml_provenance.py",
+    "tests/parser/engine/test_token_id_scanner.py",
+    "vllm/parser/deepseek_v41.py",
+    "vllm/parser/engine/incremental_lexer.py",
+    "vllm/parser/engine/parser_engine.py",
+    "vllm/parser/engine/parser_engine_config.py",
+    "vllm/parser/engine/streaming_parser_engine.py",
+    "vllm/parser/engine/token_id_scanner.py",
+    "vllm/parser/parser_manager.py"
+   ],
+   "three_way": "conflict",
+   "three_way_conflicts": [
+    "vllm/parser/deepseek_v41.py",
+    "vllm/parser/engine/parser_engine.py",
+    "vllm/parser/engine/parser_engine_config.py",
+    "vllm/parser/parser_manager.py"
+   ]
+  },
+  "953": {
+   "status": "context-only rebase (test append at the same spot as a base patch)",
+   "patches": [
+    "0762-perf-spec-decode-cohort-atomic-budget-and-burst-coalesce.patch"
+   ],
+   "plain_apply_failed": [
+    "tests/v1/spec_decode/test_adaptive_verification.py"
+   ],
+   "three_way": "conflict",
+   "three_way_conflicts": [
+    "tests/v1/spec_decode/test_adaptive_verification.py"
+   ],
+   "rebase": {
+    "result": "context-only",
+    "resolved_test_files": [
+     "tests/v1/spec_decode/test_adaptive_verification.py"
+    ],
+    "sha256": "1eaef10dac9964d2e3443c2742760a241f9687bad8b7fb61168426012055baab"
+   }
+  },
+  "954": {
+   "status": "context-only rebase (test append at the same spot as a base patch)",
+   "patches": [
+    "0762-perf-dsv41-lsa-group32-dominance-fp8-summary.patch"
+   ],
+   "plain_apply_failed": [
+    "tests/models/test_deepseek_v4_1_lsa.py"
+   ],
+   "three_way": "clean",
+   "three_way_conflicts": [],
+   "rebase": {
+    "result": "context-only",
+    "resolved_test_files": [],
+    "sha256": "a9c6d95105dc0268dbf32bb7de55996d6d69ff9cd33b933e03e63428dc8debd6"
+   }
+  },
+  "956": {
+   "status": "code conflict with the base",
+   "patches": [
+    "0762-perf-dsv41-sp-ratio2-compressor-and-ced-encoder-only-chunks.patch"
+   ],
+   "plain_apply_failed": [
+    "vllm/models/deepseek_v4_1/attention.py"
+   ],
+   "three_way": "conflict",
+   "three_way_conflicts": [
+    "vllm/models/deepseek_v4_1/attention.py"
+   ]
+  },
+  "957": {
+   "status": "code conflict with the base",
+   "patches": [
+    "0762-perf-dsv41-tp3-decode-compressor-mla-and-spec-fusions.patch"
+   ],
+   "plain_apply_failed": [
+    "tests/v1/spec_decode/test_adaptive_verification.py",
+    "vllm/v1/worker/gpu/model_runner.py",
+    "vllm/v1/worker/gpu/spec_decode/acceptance_estimator.py",
+    "vllm/v1/worker/gpu/spec_decode/speculator.py"
+   ],
+   "three_way": "conflict",
+   "three_way_conflicts": [
+    "tests/v1/spec_decode/test_adaptive_verification.py",
+    "vllm/v1/worker/gpu/model_runner.py",
+    "vllm/v1/worker/gpu/spec_decode/acceptance_estimator.py",
+    "vllm/v1/worker/gpu/spec_decode/speculator.py"
+   ]
+  },
+  "960": {
+   "status": "applies",
+   "patches": [
+    "0762-perf-cudagraph-target-full-replay-and-post-gate-fork.patch"
+   ],
+   "plain_apply_failed": [],
+   "three_way": null,
+   "three_way_conflicts": []
+  },
+  "961": {
+   "status": "applies",
+   "patches": [
+    "0762-perf-dsv41-64k-chunked-globaltimer-paced-l2-prefetch.patch"
+   ],
+   "plain_apply_failed": [],
+   "three_way": null,
+   "three_way_conflicts": []
+  },
+  "962": {
+   "status": "applies",
+   "patches": [
+    "0758-iket-classify-roce-wait-cta0-barrier-and-merge-roce-.patch"
+   ],
+   "plain_apply_failed": [],
+   "three_way": null,
+   "three_way_conflicts": []
+  },
+  "963": {
+   "status": "applies",
+   "patches": [
+    "0762-perf-dsv41-unconditional-pack12-plane-loads-and-swar.patch"
+   ],
+   "plain_apply_failed": [],
+   "three_way": null,
+   "three_way_conflicts": []
+  },
+  "967": {
+   "status": "context-only rebase (test append at the same spot as a base patch)",
+   "patches": [
+    "0762-perf-dsv41-tilelang-vectorize-reinterpret-and-merge-readstate-ifs.patch"
+   ],
+   "plain_apply_failed": [
+    "tests/kernels/attention/test_deepseek_v41_tilelang.py"
+   ],
+   "three_way": "conflict",
+   "three_way_conflicts": [
+    "tests/kernels/attention/test_deepseek_v41_tilelang.py"
+   ],
+   "rebase": {
+    "result": "context-only",
+    "resolved_test_files": [
+     "tests/kernels/attention/test_deepseek_v41_tilelang.py"
+    ],
+    "sha256": "07b45cd0fde774c882ce2b7d14ab12423a4e9cbf1efae77702e08f354a27478d"
+   }
+  },
+  "968": {
+   "status": "applies",
+   "patches": [
+    "0762-perf-spec-decode-remaining-token-draft-cap.patch"
+   ],
+   "plain_apply_failed": [],
+   "three_way": null,
+   "three_way_conflicts": []
+  },
+  "969": {
+   "status": "applies",
+   "patches": [
+    "0762-perf-dsv41-direct-insert-packed-engram-cache-and-ali.patch"
+   ],
+   "plain_apply_failed": [],
+   "three_way": null,
+   "three_way_conflicts": []
+  },
+  "971": {
+   "status": "context-only rebase (test append at the same spot as a base patch)",
+   "patches": [
+    "0762-perf-spec-decode-copy-drafter-survival-and-tile-cap.patch"
+   ],
+   "plain_apply_failed": [
+    "tests/v1/spec_decode/test_adaptive_verification.py"
+   ],
+   "three_way": "conflict",
+   "three_way_conflicts": [
+    "tests/v1/spec_decode/test_adaptive_verification.py"
+   ],
+   "rebase": {
+    "result": "context-only",
+    "resolved_test_files": [
+     "tests/v1/spec_decode/test_adaptive_verification.py"
+    ],
+    "sha256": "5a966d2b8da7ed400b13dadd83870861838384027c89206231af9cb348cecc7c"
+   }
+  },
+  "977": {
+   "status": "applies",
+   "patches": [
+    "0762-perf-spec-decode-copy-drafter-long-context-scan.patch"
+   ],
+   "plain_apply_failed": [],
+   "three_way": null,
+   "three_way_conflicts": []
+  },
+  "978": {
+   "status": "code conflict with the base",
+   "patches": [
+    "0762-perf-multimodal-prefix-cache-fastpath-under-mm-proce.patch"
+   ],
+   "plain_apply_failed": [
+    "vllm/v1/engine/async_llm.py"
+   ],
+   "three_way": "conflict",
+   "three_way_conflicts": [
+    "vllm/v1/engine/async_llm.py"
+   ]
+  },
+  "981": {
+   "status": "applies",
+   "patches": [
+    "0762-feat-dsv41-add-zero-copy-io_uring-routed-MoE-expert-.patch"
+   ],
+   "plain_apply_failed": [],
+   "three_way": null,
+   "three_way_conflicts": []
+  },
+  "983": {
+   "status": "applies",
+   "patches": [
+    "0762-perf-dsv41-engram-clock-pro-prefill-shield-and-pinned-scales.patch"
+   ],
+   "plain_apply_failed": [],
+   "three_way": null,
+   "three_way_conflicts": []
+  },
+  "984": {
+   "status": "applies",
+   "patches": [
+    "0762-perf-worker-reclaim-uma-heap-and-allocator-slack-acr.patch"
+   ],
+   "plain_apply_failed": [],
+   "three_way": null,
+   "three_way_conflicts": []
+  },
+  "987": {
+   "status": "context-only rebase (test append at the same spot as a base patch)",
+   "patches": [
+    "0762-perf-dsv41-extend-WO-B-WIDE_DECODE-to-128-rows-and-g.patch"
+   ],
+   "plain_apply_failed": [
+    "tests/kernels/quantization/test_deepseek_v41_tilelang_linear.py"
+   ],
+   "three_way": "conflict",
+   "three_way_conflicts": [
+    "tests/kernels/quantization/test_deepseek_v41_tilelang_linear.py"
+   ],
+   "rebase": {
+    "result": "context-only",
+    "resolved_test_files": [
+     "tests/kernels/quantization/test_deepseek_v41_tilelang_linear.py"
+    ],
+    "sha256": "4b36c5bf03087e85f8938fe486ae7f6717583ab10fdba68d002e84156b358cc3"
+   }
+  },
+  "988": {
+   "status": "applies",
+   "patches": [
+    "0762-perf-spec-decode-sampler-dead-row-skip-and-sparse-topk.patch"
+   ],
+   "plain_apply_failed": [],
+   "three_way": null,
+   "three_way_conflicts": []
+  },
+  "992": {
+   "status": "applies",
+   "patches": [
+    "0045-tilelang-producer-mxfp8-bf16x2-cast.patch"
+   ],
+   "plain_apply_failed": [],
+   "three_way": null,
+   "three_way_conflicts": []
+  },
+  "994": {
+   "status": "code conflict with the base",
+   "patches": [
+    "0762-perf-dsv41-sparse-mla-bf16x2-dequant.patch"
+   ],
+   "plain_apply_failed": [
+    "tests/kernels/attention/test_deepseek_v41_tilelang.py",
+    "vllm/models/deepseek_v4_1/tilelang/sparse_mla.py"
+   ],
+   "three_way": "conflict",
+   "three_way_conflicts": [
+    "tests/kernels/attention/test_deepseek_v41_tilelang.py",
+    "vllm/models/deepseek_v4_1/tilelang/sparse_mla.py"
+   ]
+  },
+  "995": {
+   "status": "applies",
+   "patches": [
+    "0762-perf-spec-decode-copy-drafter-guards-and-wide-ramp.patch"
+   ],
+   "plain_apply_failed": [],
+   "three_way": null,
+   "three_way_conflicts": []
+  },
+  "998": {
+   "status": "applies",
+   "patches": [
+    "0762-perf-worker-compact-packed-vocab-tables-and-expand-d.patch"
+   ],
+   "plain_apply_failed": [],
+   "three_way": null,
+   "three_way_conflicts": []
+  },
+  "1001": {
+   "status": "context-only rebase (test append at the same spot as a base patch)",
+   "patches": [
+    "0762-Match-128-row-vocab-head-tile-pipeline-stages.patch"
+   ],
+   "plain_apply_failed": [
+    "tests/kernels/quantization/test_deepseek_v41_tilelang_vocab.py",
+    "vllm/models/deepseek_v4_1/tilelang/vocab.py"
+   ],
+   "three_way": "conflict",
+   "three_way_conflicts": [
+    "tests/kernels/quantization/test_deepseek_v41_tilelang_vocab.py"
+   ],
+   "rebase": {
+    "result": "context-only",
+    "resolved_test_files": [
+     "tests/kernels/quantization/test_deepseek_v41_tilelang_vocab.py"
+    ],
+    "sha256": "0c361b13fa0e036318be68c2359b5e9665a7fe8983a8449fdd607f48d212b138"
+   }
+  },
+  "1002": {
+   "status": "applies",
+   "patches": [
+    "0762-feat-dspark-online-verification-adaptation.patch"
+   ],
+   "plain_apply_failed": [],
+   "three_way": null,
+   "three_way_conflicts": []
+  },
+  "1003": {
+   "status": "context-only rebase (test append at the same spot as a base patch)",
+   "patches": [
+    "0762-perf-spec-decode-dspark-sunk-cost-and-early-halt.patch"
+   ],
+   "plain_apply_failed": [
+    "tests/v1/spec_decode/test_adaptive_verification.py",
+    "vllm/v1/worker/gpu/spec_decode/acceptance_estimator.py"
+   ],
+   "three_way": "conflict",
+   "three_way_conflicts": [
+    "tests/v1/spec_decode/test_adaptive_verification.py"
+   ],
+   "rebase": {
+    "result": "context-only",
+    "resolved_test_files": [
+     "tests/v1/spec_decode/test_adaptive_verification.py"
+    ],
+    "sha256": "f2f5eef539f2e0f4754525afd67a90401101139949ea4208eaa048a76cb8f255"
+   }
+  },
+  "1004": {
+   "status": "code conflict with the base",
+   "patches": [
+    "0762-perf-dsv41-dspark-target-and-anchor-topk-selection-reuse.patch"
+   ],
+   "plain_apply_failed": [
+    "vllm/models/deepseek_v4_1/attention.py"
+   ],
+   "three_way": "conflict",
+   "three_way_conflicts": [
+    "vllm/models/deepseek_v4_1/attention.py"
+   ]
+  },
+  "1006": {
+   "status": "applies",
+   "patches": [
+    "0762-perf-dsv41-vectorize-postload-add-artifact-cache-and.patch"
+   ],
+   "plain_apply_failed": [],
+   "three_way": null,
+   "three_way_conflicts": []
+  },
+  "1008": {
+   "status": "applies",
+   "patches": [
+    "0762-perf-worker-roce-proxy-and-rank0-fast-core-affinity.patch"
+   ],
+   "plain_apply_failed": [],
+   "three_way": null,
+   "three_way_conflicts": []
+  },
+  "1014": {
+   "status": "applies",
+   "patches": [
+    "0762-perf-dsv41-blend-LSA-block8-mean-with-channel-midran.patch"
+   ],
+   "plain_apply_failed": [],
+   "three_way": null,
+   "three_way_conflicts": []
+  },
+  "1030": {
+   "status": "applies",
+   "patches": [
+    "0762-fix-dsv41-align-moe_swiglu_cast-with-DeepSeek-Expert.patch"
+   ],
+   "plain_apply_failed": [],
+   "three_way": null,
+   "three_way_conflicts": []
+  }
+ },
+ "not_paired": [
+  "949",
+  "956",
+  "957",
+  "978",
+  "994",
+  "1004"
+ ],
+ "sets_paired": [
+  "953",
+  "954",
+  "960",
+  "961",
+  "962",
+  "963",
+  "967",
+  "968",
+  "969",
+  "971",
+  "977",
+  "981",
+  "983",
+  "984",
+  "987",
+  "987-wob",
+  "988",
+  "992",
+  "995",
+  "998",
+  "1001",
+  "1002",
+  "1003",
+  "1006",
+  "1008",
+  "1014",
+  "1030"
+ ],
+ "overlapping_pairs": 47,
+ "conflicting_pairs": [
+  {
+   "a": "953",
+   "b": "971",
+   "files": [
+    "tests/v1/spec_decode/test_adaptive_verification.py",
+    "vllm/v1/worker/gpu/spec_decode/adaptive_verification.py"
+   ],
+   "971_after_953": [
+    "tests/v1/spec_decode/test_adaptive_verification.py",
+    "vllm/v1/worker/gpu/spec_decode/adaptive_verification.py"
+   ],
+   "953_after_971": [
+    "tests/v1/spec_decode/test_adaptive_verification.py",
+    "vllm/v1/worker/gpu/spec_decode/adaptive_verification.py"
+   ]
+  },
+  {
+   "a": "953",
+   "b": "1002",
+   "files": [
+    "vllm/v1/worker/gpu/spec_decode/adaptive_verification.py"
+   ],
+   "1002_after_953": [
+    "vllm/v1/worker/gpu/spec_decode/adaptive_verification.py"
+   ],
+   "953_after_1002": [
+    "vllm/v1/worker/gpu/spec_decode/adaptive_verification.py"
+   ]
+  },
+  {
+   "a": "953",
+   "b": "1003",
+   "files": [
+    "tests/v1/spec_decode/test_adaptive_verification.py",
+    "vllm/v1/worker/gpu/spec_decode/adaptive_verification.py"
+   ],
+   "1003_after_953": [
+    "tests/v1/spec_decode/test_adaptive_verification.py",
+    "vllm/v1/worker/gpu/spec_decode/adaptive_verification.py"
+   ],
+   "953_after_1003": [
+    "tests/v1/spec_decode/test_adaptive_verification.py",
+    "vllm/v1/worker/gpu/spec_decode/adaptive_verification.py"
+   ]
+  },
+  {
+   "a": "954",
+   "b": "1014",
+   "files": [
+    "tests/models/test_deepseek_v4_1_lsa.py",
+    "vllm/models/deepseek_v4_1/tilelang/block_shortlist.py"
+   ],
+   "1014_after_954": [
+    "tests/models/test_deepseek_v4_1_lsa.py",
+    "vllm/models/deepseek_v4_1/tilelang/block_shortlist.py"
+   ],
+   "954_after_1014": [
+    "tests/models/test_deepseek_v4_1_lsa.py",
+    "vllm/models/deepseek_v4_1/tilelang/block_shortlist.py"
+   ]
+  },
+  {
+   "a": "960",
+   "b": "987",
+   "files": [
+    "tests/v1/cudagraph/test_cudagraph_manager.py"
+   ],
+   "987_after_960": [
+    "tests/v1/cudagraph/test_cudagraph_manager.py"
+   ],
+   "960_after_987": [
+    "tests/v1/cudagraph/test_cudagraph_manager.py"
+   ]
+  },
+  {
+   "a": "969",
+   "b": "983",
+   "files": [
+    "tests/kernels/test_deepseek_v41_engram_rows.py",
+    "vllm/models/deepseek_v4_1/engram_rows/_row_plan.h"
+   ],
+   "983_after_969": [
+    "tests/kernels/test_deepseek_v41_engram_rows.py",
+    "vllm/models/deepseek_v4_1/engram_rows/_row_plan.h"
+   ],
+   "969_after_983": [
+    "tests/kernels/test_deepseek_v41_engram_rows.py",
+    "vllm/models/deepseek_v4_1/engram_rows/_row_plan.h"
+   ]
+  },
+  {
+   "a": "971",
+   "b": "995",
+   "files": [
+    "vllm/v1/worker/gpu/spec_decode/tilelang_copy.py"
+   ],
+   "995_after_971": [
+    "vllm/v1/worker/gpu/spec_decode/tilelang_copy.py"
+   ],
+   "971_after_995": [
+    "vllm/v1/worker/gpu/spec_decode/tilelang_copy.py"
+   ]
+  },
+  {
+   "a": "971",
+   "b": "1002",
+   "files": [
+    "vllm/v1/worker/gpu/spec_decode/adaptive_verification.py"
+   ],
+   "1002_after_971": [
+    "vllm/v1/worker/gpu/spec_decode/adaptive_verification.py"
+   ],
+   "971_after_1002": [
+    "vllm/v1/worker/gpu/spec_decode/adaptive_verification.py"
+   ]
+  },
+  {
+   "a": "971",
+   "b": "1003",
+   "files": [
+    "tests/v1/spec_decode/test_adaptive_verification.py",
+    "vllm/v1/worker/gpu/spec_decode/adaptive_verification.py"
+   ],
+   "1003_after_971": [
+    "tests/v1/spec_decode/test_adaptive_verification.py",
+    "vllm/v1/worker/gpu/spec_decode/adaptive_verification.py"
+   ],
+   "971_after_1003": [
+    "tests/v1/spec_decode/test_adaptive_verification.py",
+    "vllm/v1/worker/gpu/spec_decode/adaptive_verification.py"
+   ]
+  },
+  {
+   "a": "977",
+   "b": "995",
+   "files": [
+    "tests/v1/spec_decode/test_copy_drafts.py",
+    "vllm/v1/worker/gpu/spec_decode/tilelang_copy.py"
+   ],
+   "995_after_977": [
+    "vllm/v1/worker/gpu/spec_decode/tilelang_copy.py"
+   ],
+   "977_after_995": [
+    "tests/v1/spec_decode/test_copy_drafts.py",
+    "vllm/v1/worker/gpu/spec_decode/tilelang_copy.py"
+   ]
+  },
+  {
+   "a": "981",
+   "b": "1006",
+   "files": [
+    "vllm/models/deepseek_v4_1/tilelang/moe.py"
+   ],
+   "1006_after_981": [
+    "vllm/models/deepseek_v4_1/tilelang/moe.py"
+   ],
+   "981_after_1006": [
+    "vllm/models/deepseek_v4_1/tilelang/moe.py"
+   ]
+  },
+  {
+   "a": "984",
+   "b": "1008",
+   "files": [
+    "vllm/v1/worker/gpu_worker.py"
+   ],
+   "1008_after_984": [
+    "vllm/v1/worker/gpu_worker.py"
+   ],
+   "984_after_1008": [
+    "vllm/v1/worker/gpu_worker.py"
+   ]
+  },
+  {
+   "a": "988",
+   "b": "1003",
+   "files": [
+    "vllm/v1/worker/gpu/spec_decode/dspark/speculator.py"
+   ],
+   "1003_after_988": [
+    "vllm/v1/worker/gpu/spec_decode/dspark/speculator.py"
+   ],
+   "988_after_1003": [
+    "vllm/v1/worker/gpu/spec_decode/dspark/speculator.py"
+   ]
+  },
+  {
+   "a": "998",
+   "b": "1006",
+   "files": [
+    "vllm/model_executor/layers/quantization/online/packed_bf16.py",
+    "vllm/models/deepseek_v4_1/tilelang/embedding.py"
+   ],
+   "1006_after_998": [
+    "vllm/model_executor/layers/quantization/online/packed_bf16.py",
+    "vllm/models/deepseek_v4_1/tilelang/embedding.py"
+   ],
+   "998_after_1006": [
+    "vllm/model_executor/layers/quantization/online/packed_bf16.py",
+    "vllm/models/deepseek_v4_1/tilelang/embedding.py"
+   ]
+  },
+  {
+   "a": "1002",
+   "b": "1003",
+   "files": [
+    "vllm/v1/worker/gpu/spec_decode/acceptance_estimator.py",
+    "vllm/v1/worker/gpu/spec_decode/adaptive_verification.py",
+    "vllm/v1/worker/gpu/spec_decode/dspark/speculator.py"
+   ],
+   "1003_after_1002": [
+    "vllm/v1/worker/gpu/spec_decode/acceptance_estimator.py",
+    "vllm/v1/worker/gpu/spec_decode/adaptive_verification.py",
+    "vllm/v1/worker/gpu/spec_decode/dspark/speculator.py"
+   ],
+   "1002_after_1003": [
+    "vllm/v1/worker/gpu/spec_decode/acceptance_estimator.py",
+    "vllm/v1/worker/gpu/spec_decode/adaptive_verification.py",
+    "vllm/v1/worker/gpu/spec_decode/dspark/speculator.py"
+   ]
+  }
+ ],
+ "clean_overlapping_pairs": [
+  {
+   "a": "953",
+   "b": "1008",
+   "common": [
+    "vllm/v1/engine/core.py"
+   ]
+  },
+  {
+   "a": "954",
+   "b": "1006",
+   "common": [
+    "vllm/models/deepseek_v4_1/attention.py"
+   ]
+  },
+  {
+   "a": "960",
+   "b": "971",
+   "common": [
+    "vllm/v1/worker/gpu/model_runner.py"
+   ]
+  },
+  {
+   "a": "960",
+   "b": "984",
+   "common": [
+    "vllm/v1/worker/gpu/cudagraph_utils.py",
+    "vllm/v1/worker/gpu/model_runner.py"
+   ]
+  },
+  {
+   "a": "960",
+   "b": "998",
+   "common": [
+    "vllm/v1/worker/gpu/model_runner.py"
+   ]
+  },
+  {
+   "a": "960",
+   "b": "1003",
+   "common": [
+    "vllm/v1/worker/gpu/model_runner.py"
+   ]
+  },
+  {
+   "a": "963",
+   "b": "987",
+   "common": [
+    "vllm/models/deepseek_v4_1/tilelang/gemm.py"
+   ]
+  },
+  {
+   "a": "963",
+   "b": "987-wob",
+   "common": [
+    "vllm/models/deepseek_v4_1/tilelang/gemm.py"
+   ]
+  },
+  {
+   "a": "963",
+   "b": "992",
+   "common": [
+    "vllm/models/deepseek_v4_1/tilelang/gemm.py"
+   ]
+  },
+  {
+   "a": "963",
+   "b": "1001",
+   "common": [
+    "vllm/models/deepseek_v4_1/tilelang/vocab.py"
+   ]
+  },
+  {
+   "a": "963",
+   "b": "1006",
+   "common": [
+    "vllm/models/deepseek_v4_1/tilelang/gemm.py",
+    "vllm/models/deepseek_v4_1/tilelang/vocab.py"
+   ]
+  },
+  {
+   "a": "969",
+   "b": "1008",
+   "common": [
+    "vllm/models/deepseek_v4_1/engram_rows/_reader.c"
+   ]
+  },
+  {
+   "a": "971",
+   "b": "977",
+   "common": [
+    "tests/v1/spec_decode/test_copy_drafts.py",
+    "vllm/v1/worker/gpu/spec_decode/tilelang_copy.py"
+   ]
+  },
+  {
+   "a": "971",
+   "b": "984",
+   "common": [
+    "vllm/v1/worker/gpu/model_runner.py"
+   ]
+  },
+  {
+   "a": "971",
+   "b": "998",
+   "common": [
+    "vllm/v1/worker/gpu/model_runner.py"
+   ]
+  },
+  {
+   "a": "981",
+   "b": "998",
+   "common": [
+    "vllm/model_executor/layers/fused_moe/tilelang.py"
+   ]
+  },
+  {
+   "a": "981",
+   "b": "1030",
+   "common": [
+    "vllm/models/deepseek_v4_1/tilelang/moe.py"
+   ]
+  },
+  {
+   "a": "983",
+   "b": "1008",
+   "common": [
+    "vllm/models/deepseek_v4_1/engram_rows/_reader.c"
+   ]
+  },
+  {
+   "a": "984",
+   "b": "987",
+   "common": [
+    "vllm/v1/worker/gpu/cudagraph_utils.py"
+   ]
+  },
+  {
+   "a": "984",
+   "b": "998",
+   "common": [
+    "vllm/v1/worker/gpu/model_runner.py"
+   ]
+  },
+  {
+   "a": "984",
+   "b": "1003",
+   "common": [
+    "vllm/v1/worker/gpu/model_runner.py"
+   ]
+  },
+  {
+   "a": "987",
+   "b": "992",
+   "common": [
+    "vllm/models/deepseek_v4_1/tilelang/gemm.py"
+   ]
+  },
+  {
+   "a": "987",
+   "b": "1006",
+   "common": [
+    "vllm/models/deepseek_v4_1/tilelang/gemm.py"
+   ]
+  },
+  {
+   "a": "987-wob",
+   "b": "992",
+   "common": [
+    "vllm/models/deepseek_v4_1/tilelang/gemm.py"
+   ]
+  },
+  {
+   "a": "987-wob",
+   "b": "1006",
+   "common": [
+    "vllm/models/deepseek_v4_1/tilelang/gemm.py"
+   ]
+  },
+  {
+   "a": "988",
+   "b": "995",
+   "common": [
+    "vllm/v1/worker/gpu/sample/tilelang_sampling.py"
+   ]
+  },
+  {
+   "a": "988",
+   "b": "998",
+   "common": [
+    "vllm/model_executor/models/qwen3_dspark.py"
+   ]
+  },
+  {
+   "a": "988",
+   "b": "1002",
+   "common": [
+    "vllm/models/deepseek_v4_1/nvidia/dspark.py",
+    "vllm/v1/worker/gpu/spec_decode/dspark/speculator.py"
+   ]
+  },
+  {
+   "a": "992",
+   "b": "1006",
+   "common": [
+    "vllm/models/deepseek_v4_1/tilelang/gemm.py"
+   ]
+  },
+  {
+   "a": "998",
+   "b": "1003",
+   "common": [
+    "vllm/v1/worker/gpu/model_runner.py"
+   ]
+  },
+  {
+   "a": "1001",
+   "b": "1006",
+   "common": [
+    "vllm/models/deepseek_v4_1/tilelang/vocab.py"
+   ]
+  },
+  {
+   "a": "1006",
+   "b": "1030",
+   "common": [
+    "vllm/models/deepseek_v4_1/tilelang/moe.py"
+   ]
+  }
+ ],
+ "note": "987-wob is #987's WO-B part (a file-level split); its pair with #987 itself is not counted. #960 conflicts with the whole #987 only in tests/v1/cudagraph/test_cudagraph_manager.py, which 987-wob leaves out",
+ "tilelang_and_sparknet": {
+  "alone": [
+   "tilelang 1107 tip 3b0c78142cd09d5addc69c2e523b6071fe012aab tree e2b001828fd4e38e6a2eee61f818d5083cb1335f",
+   "sparknet tip 1fd6a1fbd8dc4884057046d1ebd93d585c9e4bcf tree 8cc28a5cd3e683c1f114ed843453e3ce34f323e0",
+   "#967 tilelang: OK v/967/tilelang/0014-transform-vectorize-reinterpret-and-merge-readstate-ifs.patch",
+   "#994 tilelang: OK v/994/tilelang/0005-cuda-fp4-ptx92-cvt-bf16x2-e2m1x2.patch",
+   "#994 tilelang: OK v/994/tilelang/0014-cuda-fp4-ptx92-cvt-bf16x2-e2m1x2.patch",
+   "#1015 tilelang: OK v/1015/tilelang/0014-CUDA-Support-round-to-nearest-even-TF32-casts.patch",
+   "#1015 tilelang: OK v/1015/tilelang/0015-Transform-Preserve-vector-widths-for-scalar-conditio.patch",
+   "#1015 tilelang: OK v/1015/tilelang/0016-CUDA-Add-explicit-host-mapped-buffer-annotations.patch",
+   "#1015 tilelang: OK v/1015/tilelang/0017-CUDA-Support-names-for-individual-kernel-launches.patch",
+   "#1015 tilelang: OK v/1015/tilelang/0018-Layout-Run-the-atomics-and-read-modify-writes-of-a-r.patch",
+   "#1015 tilelang: OK v/1015/tilelang/0019-WarpSpecialize-Guard-prelude-placement-outer-if-part.patch",
+   "#962 sparknet: OK v/962/sparknet/0001-oneshot-trace-all-collectives-split-cta-wait-and-exp.patch",
+   "#982 sparknet: FAIL v/982/sparknet/0762-sparknet-pdl-sources.patch :: No such file ",
+   "#982 sparknet: OK v/982/sparknet/sparknet-pdl-direct-stage.patch",
+   "#989 sparknet: OK v/989/sparknet/0001-oneshot-add-single-kernel-multi-stage-pipelined-RoCE.patch",
+   "#1008 sparknet: OK v/1008/sparknet/0001-perf-oneshot-pin-RoCE-proxy-thread-to-dedicated-fast.patch"
+  ],
+  "pairs": [
+   "tilelang 1015 after 967: clean",
+   "tilelang 967 after 1015: clean",
+   "tilelang 1015 after 994: clean",
+   "tilelang 994 after 1015: clean",
+   "tilelang 994 after 967: clean",
+   "sparknet 982 after 962: CONFLICT patch failed: sparknet/oneshot/_allgather_tilelang.py patch failed: sparknet/oneshot/_exchange_tilelang.py patch failed: sparknet/oneshot/_oneshot_tilelang.py patch failed: sparknet/oneshot/_reducescatter_tilelang.py patch failed: tests/gpu/test_oneshot_gpu.py ",
+   "sparknet 989 after 962: CONFLICT patch failed: sparknet/oneshot/_allgather_tilelang.py patch failed: sparknet/oneshot/_exchange_tilelang.py patch failed: sparknet/oneshot/_reducescatter_tilelang.py ",
+   "sparknet 1008 after 962: clean",
+   "sparknet 962 after 982: CONFLICT patch failed: sparknet/oneshot/_allgather_tilelang.py patch failed: sparknet/oneshot/_exchange_tilelang.py patch failed: sparknet/oneshot/_oneshot_tilelang.py patch failed: sparknet/oneshot/_reducescatter_tilelang.py patch failed: tests/gpu/test_oneshot_gpu.py ",
+   "sparknet 989 after 982: CONFLICT patch failed: sparknet/oneshot/_allgather_tilelang.py patch failed: sparknet/oneshot/_exchange_tilelang.py patch failed: sparknet/oneshot/_reducescatter_tilelang.py patch failed: sparknet/oneshot/runtime.py ",
+   "sparknet 1008 after 982: clean",
+   "sparknet 962 after 989: CONFLICT patch failed: sparknet/oneshot/_allgather_tilelang.py patch failed: sparknet/oneshot/_exchange_tilelang.py patch failed: sparknet/oneshot/_reducescatter_tilelang.py ",
+   "sparknet 982 after 989: CONFLICT patch failed: sparknet/oneshot/_allgather_tilelang.py patch failed: sparknet/oneshot/_exchange_tilelang.py patch failed: sparknet/oneshot/_reducescatter_tilelang.py patch failed: sparknet/oneshot/runtime.py ",
+   "sparknet 1008 after 989: clean",
+   "sparknet 962 after 1008: clean",
+   "sparknet 982 after 1008: clean",
+   "sparknet 989 after 1008: clean"
+  ]
+ }
+}

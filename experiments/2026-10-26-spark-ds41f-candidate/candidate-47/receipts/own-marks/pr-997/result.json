@@ -1,0 +1,1132 @@
+{
+ "pr": 997,
+ "pr_head": "32151eb3cfed689d78c2a51c077cf69c2dca5e8d",
+ "patch": "0764-perf-dsv41-certified-two-pass-lm-head-vocab-screen.patch",
+ "mark": "Its lm_head pair bench on the candidate image: gain at M=1..48, 0 mismatches; KV capacity falls by no more than its +158..211 MiB per rank",
+ "host": "sp1 (spark-0009, NVIDIA GB10, driver 580.178.04)",
+ "images": {
+  "1107": "sha256:3f32a962ce04b7c8d85337cd427a8946b8b6bcaadd97cc8d8a8cd14e8d68a6ce",
+  "candidate-47": "the same image with the 26 candidate-47 files bind-mounted read-only; ../common/overlay-sha.txt"
+ },
+ "evidence": "One session on sp1, ABBA per configuration: the PR's bench_two_boots.py as its README runs it (--privileged, the real DeepSeek-V4.1-Flash-1017 head.weight blob, SPARK_DS41F_DISPLAY_CARVEOUT_WEIGHTS=1 then 0; 'baseline' on 1107, 'candidate' on the candidate image), then our h997.py with the carve-out on (the promoted configuration): the bench's make_layer, the layer's footprint, 32 bit-exactness batches per shape (random and near-tie rows) against the image's full logits and hashed for cross-image comparison, and project_head_greedy_pairs timed eagerly (20 back-to-back calls) and by replaying a 20-call CUDA graph, interleaved over 30 windows.",
+ "readme_command_defects": [
+  "None that block the run. The bench checks bit-exactness on boot 1 only (boot 2 checks 0 rows) by design; our harness checks every run",
+  "The workload is random rows x/sqrt(5120) and near-tie blends, not real final hidden states; the active-column count (12..655 here) depends on the logit margins of real inputs"
+ ],
+ "measured": {
+  "own_bench_verbatim": {
+   "carveout1": {
+    "tp4-ring": {
+     "latency_us": {
+      "1": {
+       "1107_b1_b2": [
+        979.33,
+        1005.67
+       ],
+       "c47_b1_b2": [
+        684.47,
+        698.18
+       ],
+       "delta_us": -301.17,
+       "worst_c47_minus_best_1107": -281.15
+      },
+      "2": {
+       "1107_b1_b2": [
+        979.34,
+        989.84
+       ],
+       "c47_b1_b2": [
+        692.28,
+        696.99
+       ],
+       "delta_us": -289.96,
+       "worst_c47_minus_best_1107": -282.35
+      },
+      "4": {
+       "1107_b1_b2": [
+        980.49,
+        986.93
+       ],
+       "c47_b1_b2": [
+        700.55,
+        697.41
+       ],
+       "delta_us": -284.73,
+       "worst_c47_minus_best_1107": -279.94
+      },
+      "6": {
+       "1107_b1_b2": [
+        987.1,
+        985.37
+       ],
+       "c47_b1_b2": [
+        701.22,
+        703.69
+       ],
+       "delta_us": -283.78,
+       "worst_c47_minus_best_1107": -281.68
+      },
+      "8": {
+       "1107_b1_b2": [
+        983.32,
+        986.69
+       ],
+       "c47_b1_b2": [
+        697.43,
+        695.55
+       ],
+       "delta_us": -288.52,
+       "worst_c47_minus_best_1107": -285.89
+      },
+      "16": {
+       "1107_b1_b2": [
+        984.84,
+        991.63
+       ],
+       "c47_b1_b2": [
+        704.24,
+        709.77
+       ],
+       "delta_us": -281.23,
+       "worst_c47_minus_best_1107": -275.07
+      },
+      "32": {
+       "1107_b1_b2": [
+        1000.29,
+        989.11
+       ],
+       "c47_b1_b2": [
+        740.8,
+        742.82
+       ],
+       "delta_us": -252.89,
+       "worst_c47_minus_best_1107": -246.29
+      },
+      "48": {
+       "1107_b1_b2": [
+        1075.42,
+        1087.07
+       ],
+       "c47_b1_b2": [
+        826.73,
+        833.02
+       ],
+       "delta_us": -251.37,
+       "worst_c47_minus_best_1107": -242.4
+      }
+     },
+     "mismatches": {
+      "1107-boot1": [
+       0,
+       1875
+      ],
+      "c47-boot1": [
+       0,
+       1875
+      ],
+      "c47-boot2": [
+       0,
+       0
+      ],
+      "1107-boot2": [
+       0,
+       0
+      ]
+     },
+     "active_cols_c47": {
+      "1": 16,
+      "2": 19,
+      "4": 44,
+      "6": 97,
+      "8": 68,
+      "16": 232,
+      "32": 530,
+      "48": 592
+     }
+    },
+    "tp3-triangle": {
+     "latency_us": {
+      "1": {
+       "1107_b1_b2": [
+        1307.74,
+        1315.89
+       ],
+       "c47_b1_b2": [
+        903.86,
+        908.4
+       ],
+       "delta_us": -405.69,
+       "worst_c47_minus_best_1107": -399.34
+      },
+      "2": {
+       "1107_b1_b2": [
+        1308.13,
+        1313.32
+       ],
+       "c47_b1_b2": [
+        908.44,
+        912.51
+       ],
+       "delta_us": -400.25,
+       "worst_c47_minus_best_1107": -395.62
+      },
+      "4": {
+       "1107_b1_b2": [
+        1323.08,
+        1309.72
+       ],
+       "c47_b1_b2": [
+        912.19,
+        915.4
+       ],
+       "delta_us": -402.61,
+       "worst_c47_minus_best_1107": -394.32
+      },
+      "6": {
+       "1107_b1_b2": [
+        1314.49,
+        1307.64
+       ],
+       "c47_b1_b2": [
+        912.68,
+        910.9
+       ],
+       "delta_us": -399.28,
+       "worst_c47_minus_best_1107": -394.96
+      },
+      "8": {
+       "1107_b1_b2": [
+        1344.99,
+        1310.61
+       ],
+       "c47_b1_b2": [
+        917.33,
+        937.66
+       ],
+       "delta_us": -400.3,
+       "worst_c47_minus_best_1107": -372.95
+      },
+      "16": {
+       "1107_b1_b2": [
+        1338.84,
+        1312.45
+       ],
+       "c47_b1_b2": [
+        928.54,
+        955.48
+       ],
+       "delta_us": -383.63,
+       "worst_c47_minus_best_1107": -356.97
+      },
+      "32": {
+       "1107_b1_b2": [
+        1306.59,
+        1310.7
+       ],
+       "c47_b1_b2": [
+        974.81,
+        976.61
+       ],
+       "delta_us": -332.93,
+       "worst_c47_minus_best_1107": -329.98
+      },
+      "48": {
+       "1107_b1_b2": [
+        1432.51,
+        1426.09
+       ],
+       "c47_b1_b2": [
+        1092.22,
+        1088.13
+       ],
+       "delta_us": -339.12,
+       "worst_c47_minus_best_1107": -333.87
+      }
+     },
+     "mismatches": {
+      "1107-boot1": [
+       0,
+       1875
+      ],
+      "c47-boot1": [
+       0,
+       1875
+      ],
+      "c47-boot2": [
+       0,
+       0
+      ],
+      "1107-boot2": [
+       0,
+       0
+      ]
+     },
+     "active_cols_c47": {
+      "1": 12,
+      "2": 23,
+      "4": 57,
+      "6": 102,
+      "8": 88,
+      "16": 272,
+      "32": 601,
+      "48": 655
+     }
+    }
+   },
+   "carveout0": {
+    "tp4-ring": {
+     "latency_us": {
+      "1": {
+       "1107_b1_b2": [
+        1092.45,
+        1103.38
+       ],
+       "c47_b1_b2": [
+        754.1,
+        756.13
+       ],
+       "delta_us": -342.8,
+       "worst_c47_minus_best_1107": -336.32
+      },
+      "2": {
+       "1107_b1_b2": [
+        1088.81,
+        1145.05
+       ],
+       "c47_b1_b2": [
+        761.91,
+        764.95
+       ],
+       "delta_us": -353.5,
+       "worst_c47_minus_best_1107": -323.86
+      },
+      "4": {
+       "1107_b1_b2": [
+        1087.14,
+        1092.07
+       ],
+       "c47_b1_b2": [
+        768.53,
+        767.78
+       ],
+       "delta_us": -321.45,
+       "worst_c47_minus_best_1107": -318.61
+      },
+      "6": {
+       "1107_b1_b2": [
+        1088.65,
+        1091.57
+       ],
+       "c47_b1_b2": [
+        773.4,
+        772.47
+       ],
+       "delta_us": -317.18,
+       "worst_c47_minus_best_1107": -315.25
+      },
+      "8": {
+       "1107_b1_b2": [
+        1090.29,
+        1092.36
+       ],
+       "c47_b1_b2": [
+        777.89,
+        784.03
+       ],
+       "delta_us": -310.36,
+       "worst_c47_minus_best_1107": -306.26
+      },
+      "16": {
+       "1107_b1_b2": [
+        1093.52,
+        1098.25
+       ],
+       "c47_b1_b2": [
+        799.12,
+        801.14
+       ],
+       "delta_us": -295.75,
+       "worst_c47_minus_best_1107": -292.38
+      },
+      "32": {
+       "1107_b1_b2": [
+        1101.01,
+        1101.36
+       ],
+       "c47_b1_b2": [
+        838.12,
+        838.9
+       ],
+       "delta_us": -262.67,
+       "worst_c47_minus_best_1107": -262.11
+      },
+      "48": {
+       "1107_b1_b2": [
+        1213.91,
+        1216.12
+       ],
+       "c47_b1_b2": [
+        937.55,
+        933.45
+       ],
+       "delta_us": -279.51,
+       "worst_c47_minus_best_1107": -276.36
+      }
+     },
+     "mismatches": {
+      "1107-boot1": [
+       0,
+       1875
+      ],
+      "c47-boot1": [
+       0,
+       1875
+      ],
+      "c47-boot2": [
+       0,
+       0
+      ],
+      "1107-boot2": [
+       0,
+       0
+      ]
+     },
+     "active_cols_c47": {
+      "1": 16,
+      "2": 19,
+      "4": 44,
+      "6": 97,
+      "8": 68,
+      "16": 232,
+      "32": 530,
+      "48": 592
+     }
+    },
+    "tp3-triangle": {
+     "latency_us": {
+      "1": {
+       "1107_b1_b2": [
+        1447.02,
+        1446.24
+       ],
+       "c47_b1_b2": [
+        993.69,
+        1001.82
+       ],
+       "delta_us": -448.88,
+       "worst_c47_minus_best_1107": -444.42
+      },
+      "2": {
+       "1107_b1_b2": [
+        1443.77,
+        1442.63
+       ],
+       "c47_b1_b2": [
+        1004.36,
+        1001.0
+       ],
+       "delta_us": -440.52,
+       "worst_c47_minus_best_1107": -438.27
+      },
+      "4": {
+       "1107_b1_b2": [
+        1444.88,
+        1443.38
+       ],
+       "c47_b1_b2": [
+        1018.19,
+        1013.29
+       ],
+       "delta_us": -428.39,
+       "worst_c47_minus_best_1107": -425.19
+      },
+      "6": {
+       "1107_b1_b2": [
+        1444.81,
+        1439.58
+       ],
+       "c47_b1_b2": [
+        1068.02,
+        1018.58
+       ],
+       "delta_us": -398.89,
+       "worst_c47_minus_best_1107": -371.56
+      },
+      "8": {
+       "1107_b1_b2": [
+        1451.9,
+        1443.22
+       ],
+       "c47_b1_b2": [
+        1029.03,
+        1021.14
+       ],
+       "delta_us": -422.47,
+       "worst_c47_minus_best_1107": -414.19
+      },
+      "16": {
+       "1107_b1_b2": [
+        1505.69,
+        1447.49
+       ],
+       "c47_b1_b2": [
+        1051.79,
+        1042.62
+       ],
+       "delta_us": -429.39,
+       "worst_c47_minus_best_1107": -395.7
+      },
+      "32": {
+       "1107_b1_b2": [
+        1470.82,
+        1452.17
+       ],
+       "c47_b1_b2": [
+        1102.75,
+        1099.64
+       ],
+       "delta_us": -360.3,
+       "worst_c47_minus_best_1107": -349.42
+      },
+      "48": {
+       "1107_b1_b2": [
+        1591.2,
+        1593.84
+       ],
+       "c47_b1_b2": [
+        1224.83,
+        1267.35
+       ],
+       "delta_us": -346.43,
+       "worst_c47_minus_best_1107": -323.85
+      }
+     },
+     "mismatches": {
+      "1107-boot1": [
+       0,
+       1875
+      ],
+      "c47-boot1": [
+       0,
+       1875
+      ],
+      "c47-boot2": [
+       0,
+       0
+      ],
+      "1107-boot2": [
+       0,
+       0
+      ]
+     },
+     "active_cols_c47": {
+      "1": 12,
+      "2": 23,
+      "4": 57,
+      "6": 102,
+      "8": 88,
+      "16": 272,
+      "32": 601,
+      "48": 655
+     }
+    }
+   }
+  },
+  "harness_carveout1": {
+   "tp4-ring": {
+    "1": {
+     "graph_us": {
+      "1107_b1_b2": [
+       "985.44 \u00b1 4.47",
+       "999.41 \u00b1 6.95"
+      ],
+      "c47_b1_b2": [
+       "685.93 \u00b1 3.57",
+       "684.48 \u00b1 3.20"
+      ],
+      "delta_us": -307.22,
+      "speedup": 1.448,
+      "beyond_interval": true
+     },
+     "eager_us": {
+      "1107_b1_b2": [
+       "988.08 \u00b1 4.62",
+       "1002.38 \u00b1 7.52"
+      ],
+      "c47_b1_b2": [
+       "688.01 \u00b1 3.45",
+       "688.71 \u00b1 3.95"
+      ],
+      "delta_us": -306.87,
+      "speedup": 1.446,
+      "beyond_interval": true
+     },
+     "active_cols_c47": 16
+    },
+    "2": {
+     "graph_us": {
+      "1107_b1_b2": [
+       "979.93 \u00b1 1.45",
+       "981.04 \u00b1 1.92"
+      ],
+      "c47_b1_b2": [
+       "703.54 \u00b1 8.66",
+       "690.15 \u00b1 2.16"
+      ],
+      "delta_us": -283.64,
+      "speedup": 1.407,
+      "beyond_interval": true
+     },
+     "eager_us": {
+      "1107_b1_b2": [
+       "983.90 \u00b1 2.86",
+       "984.23 \u00b1 2.29"
+      ],
+      "c47_b1_b2": [
+       "705.85 \u00b1 8.98",
+       "691.49 \u00b1 0.22"
+      ],
+      "delta_us": -285.39,
+      "speedup": 1.408,
+      "beyond_interval": true
+     },
+     "active_cols_c47": 19
+    },
+    "4": {
+     "graph_us": {
+      "1107_b1_b2": [
+       "979.75 \u00b1 2.21",
+       "980.40 \u00b1 2.13"
+      ],
+      "c47_b1_b2": [
+       "694.19 \u00b1 2.32",
+       "692.89 \u00b1 0.37"
+      ],
+      "delta_us": -286.54,
+      "speedup": 1.413,
+      "beyond_interval": true
+     },
+     "eager_us": {
+      "1107_b1_b2": [
+       "982.04 \u00b1 1.94",
+       "983.30 \u00b1 2.16"
+      ],
+      "c47_b1_b2": [
+       "695.28 \u00b1 0.21",
+       "697.52 \u00b1 3.56"
+      ],
+      "delta_us": -286.27,
+      "speedup": 1.411,
+      "beyond_interval": true
+     },
+     "active_cols_c47": 44
+    },
+    "6": {
+     "graph_us": {
+      "1107_b1_b2": [
+       "984.60 \u00b1 7.29",
+       "979.39 \u00b1 2.04"
+      ],
+      "c47_b1_b2": [
+       "696.66 \u00b1 2.53",
+       "704.70 \u00b1 8.90"
+      ],
+      "delta_us": -281.31,
+      "speedup": 1.401,
+      "beyond_interval": true
+     },
+     "eager_us": {
+      "1107_b1_b2": [
+       "985.59 \u00b1 5.25",
+       "981.14 \u00b1 0.36"
+      ],
+      "c47_b1_b2": [
+       "698.10 \u00b1 2.08",
+       "703.79 \u00b1 7.35"
+      ],
+      "delta_us": -282.42,
+      "speedup": 1.403,
+      "beyond_interval": true
+     },
+     "active_cols_c47": 97
+    },
+    "8": {
+     "graph_us": {
+      "1107_b1_b2": [
+       "988.06 \u00b1 6.79",
+       "986.25 \u00b1 7.50"
+      ],
+      "c47_b1_b2": [
+       "694.30 \u00b1 0.42",
+       "698.87 \u00b1 3.70"
+      ],
+      "delta_us": -290.57,
+      "speedup": 1.417,
+      "beyond_interval": true
+     },
+     "eager_us": {
+      "1107_b1_b2": [
+       "988.12 \u00b1 6.90",
+       "987.68 \u00b1 7.23"
+      ],
+      "c47_b1_b2": [
+       "697.55 \u00b1 2.54",
+       "704.83 \u00b1 5.16"
+      ],
+      "delta_us": -286.71,
+      "speedup": 1.409,
+      "beyond_interval": true
+     },
+     "active_cols_c47": 68
+    },
+    "16": {
+     "graph_us": {
+      "1107_b1_b2": [
+       "983.18 \u00b1 3.26",
+       "986.55 \u00b1 5.76"
+      ],
+      "c47_b1_b2": [
+       "702.91 \u00b1 2.28",
+       "702.63 \u00b1 2.23"
+      ],
+      "delta_us": -282.09,
+      "speedup": 1.401,
+      "beyond_interval": true
+     },
+     "eager_us": {
+      "1107_b1_b2": [
+       "983.89 \u00b1 2.31",
+       "990.18 \u00b1 6.22"
+      ],
+      "c47_b1_b2": [
+       "705.19 \u00b1 2.74",
+       "704.84 \u00b1 2.54"
+      ],
+      "delta_us": -282.02,
+      "speedup": 1.4,
+      "beyond_interval": true
+     },
+     "active_cols_c47": 232
+    },
+    "32": {
+     "graph_us": {
+      "1107_b1_b2": [
+       "975.08 \u00b1 4.92",
+       "983.21 \u00b1 5.05"
+      ],
+      "c47_b1_b2": [
+       "733.42 \u00b1 11.53",
+       "733.87 \u00b1 4.11"
+      ],
+      "delta_us": -245.5,
+      "speedup": 1.335,
+      "beyond_interval": true
+     },
+     "eager_us": {
+      "1107_b1_b2": [
+       "977.79 \u00b1 5.30",
+       "984.60 \u00b1 3.97"
+      ],
+      "c47_b1_b2": [
+       "736.04 \u00b1 10.30",
+       "735.03 \u00b1 3.44"
+      ],
+      "delta_us": -245.66,
+      "speedup": 1.334,
+      "beyond_interval": true
+     },
+     "active_cols_c47": 530
+    },
+    "48": {
+     "graph_us": {
+      "1107_b1_b2": [
+       "1078.33 \u00b1 10.67",
+       "1072.97 \u00b1 3.77"
+      ],
+      "c47_b1_b2": [
+       "818.75 \u00b1 7.19",
+       "816.46 \u00b1 2.44"
+      ],
+      "delta_us": -258.04,
+      "speedup": 1.316,
+      "beyond_interval": true
+     },
+     "eager_us": {
+      "1107_b1_b2": [
+       "1074.79 \u00b1 3.87",
+       "1074.41 \u00b1 3.37"
+      ],
+      "c47_b1_b2": [
+       "825.28 \u00b1 5.60",
+       "820.11 \u00b1 3.52"
+      ],
+      "delta_us": -251.91,
+      "speedup": 1.306,
+      "beyond_interval": true
+     },
+     "active_cols_c47": 592
+    }
+   },
+   "tp3-triangle": {
+    "1": {
+     "graph_us": {
+      "1107_b1_b2": [
+       "1305.72 \u00b1 1.28",
+       "1318.68 \u00b1 10.25"
+      ],
+      "c47_b1_b2": [
+       "895.47 \u00b1 0.21",
+       "909.46 \u00b1 8.97"
+      ],
+      "delta_us": -409.74,
+      "speedup": 1.454,
+      "beyond_interval": true
+     },
+     "eager_us": {
+      "1107_b1_b2": [
+       "1308.21 \u00b1 1.70",
+       "1319.19 \u00b1 9.86"
+      ],
+      "c47_b1_b2": [
+       "898.33 \u00b1 0.49",
+       "910.99 \u00b1 9.48"
+      ],
+      "delta_us": -409.04,
+      "speedup": 1.452,
+      "beyond_interval": true
+     },
+     "active_cols_c47": 12
+    },
+    "2": {
+     "graph_us": {
+      "1107_b1_b2": [
+       "1302.62 \u00b1 0.30",
+       "1304.36 \u00b1 1.09"
+      ],
+      "c47_b1_b2": [
+       "904.43 \u00b1 0.57",
+       "905.60 \u00b1 0.64"
+      ],
+      "delta_us": -398.47,
+      "speedup": 1.44,
+      "beyond_interval": true
+     },
+     "eager_us": {
+      "1107_b1_b2": [
+       "1304.53 \u00b1 0.32",
+       "1307.05 \u00b1 0.84"
+      ],
+      "c47_b1_b2": [
+       "907.83 \u00b1 1.80",
+       "909.00 \u00b1 1.03"
+      ],
+      "delta_us": -397.38,
+      "speedup": 1.437,
+      "beyond_interval": true
+     },
+     "active_cols_c47": 23
+    },
+    "4": {
+     "graph_us": {
+      "1107_b1_b2": [
+       "1319.28 \u00b1 10.46",
+       "1303.24 \u00b1 0.52"
+      ],
+      "c47_b1_b2": [
+       "920.63 \u00b1 8.58",
+       "910.35 \u00b1 2.75"
+      ],
+      "delta_us": -395.77,
+      "speedup": 1.432,
+      "beyond_interval": true
+     },
+     "eager_us": {
+      "1107_b1_b2": [
+       "1322.69 \u00b1 9.68",
+       "1305.40 \u00b1 0.39"
+      ],
+      "c47_b1_b2": [
+       "926.08 \u00b1 10.01",
+       "912.14 \u00b1 2.57"
+      ],
+      "delta_us": -394.94,
+      "speedup": 1.43,
+      "beyond_interval": true
+     },
+     "active_cols_c47": 57
+    },
+    "6": {
+     "graph_us": {
+      "1107_b1_b2": [
+       "1304.08 \u00b1 2.94",
+       "1321.08 \u00b1 10.23"
+      ],
+      "c47_b1_b2": [
+       "910.67 \u00b1 1.08",
+       "909.49 \u00b1 0.49"
+      ],
+      "delta_us": -402.5,
+      "speedup": 1.442,
+      "beyond_interval": true
+     },
+     "eager_us": {
+      "1107_b1_b2": [
+       "1306.66 \u00b1 2.51",
+       "1323.08 \u00b1 10.38"
+      ],
+      "c47_b1_b2": [
+       "914.53 \u00b1 2.41",
+       "911.72 \u00b1 0.24"
+      ],
+      "delta_us": -401.75,
+      "speedup": 1.44,
+      "beyond_interval": true
+     },
+     "active_cols_c47": 102
+    },
+    "8": {
+     "graph_us": {
+      "1107_b1_b2": [
+       "1303.37 \u00b1 2.40",
+       "1304.97 \u00b1 3.05"
+      ],
+      "c47_b1_b2": [
+       "910.52 \u00b1 1.28",
+       "921.18 \u00b1 8.28"
+      ],
+      "delta_us": -388.32,
+      "speedup": 1.424,
+      "beyond_interval": true
+     },
+     "eager_us": {
+      "1107_b1_b2": [
+       "1305.68 \u00b1 2.37",
+       "1306.55 \u00b1 2.03"
+      ],
+      "c47_b1_b2": [
+       "913.13 \u00b1 1.21",
+       "923.95 \u00b1 8.56"
+      ],
+      "delta_us": -387.58,
+      "speedup": 1.422,
+      "beyond_interval": true
+     },
+     "active_cols_c47": 88
+    },
+    "16": {
+     "graph_us": {
+      "1107_b1_b2": [
+       "1310.59 \u00b1 9.05",
+       "1306.01 \u00b1 2.54"
+      ],
+      "c47_b1_b2": [
+       "925.03 \u00b1 1.26",
+       "923.49 \u00b1 3.91"
+      ],
+      "delta_us": -384.04,
+      "speedup": 1.416,
+      "beyond_interval": true
+     },
+     "eager_us": {
+      "1107_b1_b2": [
+       "1313.50 \u00b1 9.51",
+       "1308.65 \u00b1 0.94"
+      ],
+      "c47_b1_b2": [
+       "929.27 \u00b1 2.85",
+       "929.33 \u00b1 6.99"
+      ],
+      "delta_us": -381.78,
+      "speedup": 1.411,
+      "beyond_interval": true
+     },
+     "active_cols_c47": 272
+    },
+    "32": {
+     "graph_us": {
+      "1107_b1_b2": [
+       "1293.75 \u00b1 6.79",
+       "1315.50 \u00b1 23.00"
+      ],
+      "c47_b1_b2": [
+       "963.70 \u00b1 4.37",
+       "951.00 \u00b1 2.06"
+      ],
+      "delta_us": -347.27,
+      "speedup": 1.363,
+      "beyond_interval": true
+     },
+     "eager_us": {
+      "1107_b1_b2": [
+       "1300.58 \u00b1 15.76",
+       "1313.37 \u00b1 12.51"
+      ],
+      "c47_b1_b2": [
+       "965.86 \u00b1 4.66",
+       "958.48 \u00b1 5.18"
+      ],
+      "delta_us": -344.8,
+      "speedup": 1.358,
+      "beyond_interval": true
+     },
+     "active_cols_c47": 601
+    },
+    "48": {
+     "graph_us": {
+      "1107_b1_b2": [
+       "1420.48 \u00b1 5.19",
+       "1417.67 \u00b1 2.86"
+      ],
+      "c47_b1_b2": [
+       "1091.35 \u00b1 11.47",
+       "1071.40 \u00b1 4.62"
+      ],
+      "delta_us": -337.7,
+      "speedup": 1.312,
+      "beyond_interval": true
+     },
+     "eager_us": {
+      "1107_b1_b2": [
+       "1420.71 \u00b1 4.09",
+       "1420.01 \u00b1 2.03"
+      ],
+      "c47_b1_b2": [
+       "1096.46 \u00b1 16.67",
+       "1073.70 \u00b1 4.46"
+      ],
+      "delta_us": -335.28,
+      "speedup": 1.309,
+      "beyond_interval": true
+     },
+     "active_cols_c47": 655
+    }
+   }
+  },
+  "interval": "verbatim: one number per boot, so the interval is the two boots' range ('worst_c47_minus_best_1107' < 0 means no overlap). Harness: per-boot mean \u00b1 95% CI over 30 windows; 'beyond_interval' means the worse candidate boot's upper bound is below the better 1107 boot's lower bound",
+  "memory_per_layer_carveout1": {
+   "tp4-ring": {
+    "1107-boot1": {
+     "layer_cuda_allocated_MiB": 0.32,
+     "layer_carveout_MiB": 320.0,
+     "memavailable_drop_MiB": 39.4,
+     "layer_tensors_MiB": {
+      "weight": 236.72
+     }
+    },
+    "c47-boot1": {
+     "layer_cuda_allocated_MiB": 0.69,
+     "layer_carveout_MiB": 400.0,
+     "memavailable_drop_MiB": 400.4,
+     "layer_tensors_MiB": {
+      "_carveout_screen_wq": 157.81,
+      "_tilelang_vocab_screen": 158.18,
+      "weight": 236.72
+     }
+    },
+    "c47-boot2": {
+     "layer_cuda_allocated_MiB": 0.69,
+     "layer_carveout_MiB": 400.0,
+     "memavailable_drop_MiB": 450.0,
+     "layer_tensors_MiB": {
+      "_carveout_screen_wq": 157.81,
+      "_tilelang_vocab_screen": 158.18,
+      "weight": 236.72
+     }
+    },
+    "1107-boot2": {
+     "layer_cuda_allocated_MiB": 0.32,
+     "layer_carveout_MiB": 320.0,
+     "memavailable_drop_MiB": 21.4,
+     "layer_tensors_MiB": {
+      "weight": 236.72
+     }
+    }
+   },
+   "tp3-triangle": {
+    "1107-boot1": {
+     "layer_cuda_allocated_MiB": 0.43,
+     "layer_carveout_MiB": 432.0,
+     "memavailable_drop_MiB": 12.4,
+     "layer_tensors_MiB": {
+      "weight": 315.94
+     }
+    },
+    "c47-boot1": {
+     "layer_cuda_allocated_MiB": 0.92,
+     "layer_carveout_MiB": 528.0,
+     "memavailable_drop_MiB": -8.1,
+     "layer_tensors_MiB": {
+      "_carveout_screen_wq": 210.62,
+      "_tilelang_vocab_screen": 211.12,
+      "weight": 315.94
+     }
+    },
+    "c47-boot2": {
+     "layer_cuda_allocated_MiB": 0.92,
+     "layer_carveout_MiB": 528.0,
+     "memavailable_drop_MiB": 15.6,
+     "layer_tensors_MiB": {
+      "_carveout_screen_wq": 210.62,
+      "_tilelang_vocab_screen": 211.12,
+      "weight": 315.94
+     }
+    },
+    "1107-boot2": {
+     "layer_cuda_allocated_MiB": 0.43,
+     "layer_carveout_MiB": 432.0,
+     "memavailable_drop_MiB": 12.1,
+     "layer_tensors_MiB": {
+      "weight": 315.94
+     }
+    }
+   }
+  },
+  "memory_reading": "tp4-ring: the carve-out grows from 320 to 400 MiB (+80 MiB; 1107 already allocated a BF16-shaped 2 B/elem buffer and packed 1.5 B/elem into it, the candidate allocates 2.5 B/elem and puts W_q in the tail) and the CUDA allocator grows by 0.37 MiB (row metadata). tp3-triangle: 432 -> 528 MiB (+96 MiB) and +0.49 MiB. W_q itself is 157.8 / 210.6 MiB, inside the carve-out. MemAvailable moved by 400..450 MiB on the candidate's tp4 layer and by 12..39 MiB elsewhere, including the candidate's tp3 layer, so it does not track the carve-out; we do not read it as device footprint. KV capacity itself needs a serving boot and is not measured on sp1"
+ },
+ "bit_exact": {
+  "tp4-ring": {
+   "pair_hashes_equal_across_images_32_batches": true,
+   "mismatched_batches_vs_full_logits": {
+    "1107-boot1": 0,
+    "c47-boot1": 0,
+    "c47-boot2": 0,
+    "1107-boot2": 0
+   },
+   "rows_checked_per_run": 468
+  },
+  "tp3-triangle": {
+   "pair_hashes_equal_across_images_32_batches": true,
+   "mismatched_batches_vs_full_logits": {
+    "1107-boot1": 0,
+    "c47-boot1": 0,
+    "c47-boot2": 0,
+    "1107-boot2": 0
+   },
+   "rows_checked_per_run": 468
+  }
+ },
+ "parts": [
+  {
+   "part": "gain at M=1..48",
+   "verdict": "pass",
+   "detail": "every M and both shapes, eager and graph replay, beyond the interval: graph replay tp4-ring 992 -> 685 us at M=1 (1.45x), 1076 -> 818 us at M=48; tp3-triangle 1312 -> 902 us at M=1 (1.45x), 1419 -> 1081 us at M=48. The verbatim bench agrees with carve-out on and off"
+  },
+  {
+   "part": "0 mismatches",
+   "verdict": "pass",
+   "detail": "0 mismatched batches in every run (harness: 32 batches, 468 rows per shape per run; bench: 1875 rows on boot 1), and the candidate's pairs hash equal to 1107's for all 64 batches"
+  },
+  {
+   "part": "KV capacity falls by no more than +158..211 MiB per rank",
+   "verdict": "cannot-evaluate-on-sp1",
+   "detail": "KV capacity needs a serving boot. The layer's footprint grows by +80 MiB (tp4) / +96 MiB (tp3) of carve-out and < 1 MiB of CUDA allocator, inside the declared bound"
+  }
+ ],
+ "verdict": "pass",
+ "verdict_scope": "speed and bit-exactness parts; the KV-capacity part is for the serving runs (the measured footprint is within its bound)",
+ "reason": "On the integrated stack the certified two-pass screen is 1.31..1.45x faster than 1107's single pass at every M=1..48 on both shards by CUDA-graph replay (and eagerly), far beyond the interval, with 0 mismatches against the full logits and pair outputs bit-identical to 1107's.",
+ "notes": [
+  "commands.txt holds every run's command, host state and UTC times",
+  "summary.txt is ../common/analyze/a997.py and ah997.py's digest"
+ ]
+}

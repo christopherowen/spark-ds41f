@@ -141,12 +141,28 @@ def gate(repo: str, head: str, out: str, config_path: str = str(CONFIG)) -> int:
     return 0
 
 
+PLUGINS = ("release_test_runner.py", "tblib_stub.py", "offline_skip.py", "deepseek_models.py")
+RECIPE = HERE.parent / "config/cluster.json"
+
+
+def served_model(recipe: str = str(RECIPE)) -> tuple[list[list[str]], str]:
+    """The recipe's served checkpoint as bundle mounts (``~`` for ``{home}``, which the lab
+    expands on the node) and its path in the container, as serving mounts it."""
+    sys.path.insert(0, str(HERE))
+    import recipe as recipe_module  # noqa: E402  (scripts/recipe.py)
+    mounts, path = recipe_module.model_mounts(json.loads(Path(recipe).read_text()))
+    return [[source.replace("{home}", "~"), destination] for source, destination, _ in mounts], path
+
+
 def bundle(manifest: str, image: str, bundle_dir: str, label: str) -> None:
     target = Path(bundle_dir)
     target.mkdir(parents=True, exist_ok=True)
     shutil.copyfile(manifest, target / "manifest.json")
-    for name in ("release_test_runner.py", "tblib_stub.py", "offline_skip.py"):
+    for name in PLUGINS:
         shutil.copyfile(HERE / "release_tests" / name, target / name)
+    # deepseek_models.py: upstream tests' stand-in hub models resolve to the served
+    # checkpoint's config and tokenizer, mounted read-only as serving mounts it.
+    model_mounts, model_path = served_model()
     candidate = {
         "description": f"Release tests ({label}): the manifest's vLLM test files in the image, "
                        "chunked with timeouts; per-test outcomes under /c/release-tests.",
@@ -158,7 +174,8 @@ def bundle(manifest: str, image: str, bundle_dir: str, label: str) -> None:
                 # Disk Engram rows and the direct loader's checkpoints need O_DIRECT on
                 # a real filesystem (the image's overlay refuses it).
                 "ENGRAM_ROWS_TEST_DIR": "/c/engram-rows-test",
-                "DIRECT_IO_TEST_DIR": "/c/direct-io-test"},
+                "DIRECT_IO_TEST_DIR": "/c/direct-io-test",
+                "DS41F_SNAPSHOT": model_path},
         # Under the image's own source root (scripts/lab.py, image_source_root).
         "workdir": "vllm",
         # The disk Engram reader and the direct loader use io_uring, which Docker's
@@ -166,8 +183,7 @@ def bundle(manifest: str, image: str, bundle_dir: str, label: str) -> None:
         "io_uring": True,
         "argv": ["/b/release_test_runner.py", "/b/manifest.json", f"/c/release-tests/{label}"],
         "verdict": "exit",
-        "mounts": [[name, f"/b/{name}"] for name in
-                   ("manifest.json", "release_test_runner.py", "tblib_stub.py", "offline_skip.py")],
+        "mounts": [[name, f"/b/{name}"] for name in ("manifest.json", *PLUGINS)] + model_mounts,
     }
     (target / "candidate.json").write_text(json.dumps(candidate, indent=2) + "\n")
     print(f"bundle {target}: {len(json.loads(Path(manifest).read_text())['files'])} files")

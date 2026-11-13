@@ -24,6 +24,9 @@ the open levers, measured dead ends, and the lean screening routine.
   `bin/spark bench` run. It is immutable too; a new promotion adds its own.
   A profile of another topology names its own run in `benchmark_reference`
   (`manifests/benchmarks/<baseline>-tp4.json` for the `tp4-ring` shape).
+- `manifests/frozen/candidate-<N>.json` records a frozen candidate: a verified merged base published as
+  the GitHub pre-release `candidate-<N>` (docs/release-benchmark.md, "Frozen candidates").
+  It is immutable, and so are its tag and its candidate folder; a later freeze adds its own.
 - `experiments/` is the only place for unpromoted tuning.
 - `docs/inspiration.md` is a research watchlist, never a source or deployment
   authority. It names each source, what to review it for, and the adoption
@@ -42,6 +45,9 @@ differences into this repository.
 Use neutral task names for branches, commits, pull requests and documentation.
 Do not add agent or tool attribution, including branch prefixes or commit trailers.
 Preserve required third-party license notices.
+
+Candidate rounds (several candidates at once, PR selection, marks, rework and
+carrying winners forward) follow `docs/release-benchmark.md` (Candidates).
 
 Create `experiments/YYYY-MM-DD-short-name/` for performance work. Record the base
 commit, one intended variable, exact commands, workload identity, all runs, errors,

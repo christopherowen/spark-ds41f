@@ -1,0 +1,73 @@
+# TP3 engine-grid attribution for candidate-54 (patch_head 4e8133ff, tree 5f021d9a), 2026-11-10.
+# W = sp8:~/spark-lab/agents/tp3-grid-attribution   S = this scratchpad folder (tp3-grid-attribution/)
+# Nothing here pushes, commits, builds an image, or touches a cluster, a window or a deployment checkout.
+
+## 0. Sources (laptop, read-only)
+git fetch origin                                  # remote-tracking ref only; working tree untouched
+git archive origin/main | tar -x -C <scratch>/main  # main dc31a31866: candidate-54 README, receipts, suspects' patches
+
+## 1. Receipts: where the 2.87% sits (laptop, JSON only)
+python3 raw/gridcmp.py <grid.json> ...             # -> raw/grid-split-from-receipts.txt
+#   tp3: 1107 x2, candidate-50-no1009 x2, candidate-53-no960-no998 x2, candidate-54 (receipts/references/*/grid.json)
+#   tp4-ring: candidate-50-no1009, candidate-51 x2, candidate-54 x2; tp4-switched: candidate-50-no1009, candidate-52 x2, candidate-54 x2
+
+## 2. L2 prefetch plan sizes at TP3 and TP4 (read-only greps of lab boot logs)
+ssh sp5 "grep -a 'l2_prefetch\]' ~/projects/spark-ds41f/results/private/lab/candidate-54-screen-tp3-switched/boot-candidate-54.engine-sp{5,6,7}.log"
+#   (these lines are the restored 1107 service's, 01:42-01:44Z; see raw/boot-logs/README.txt)
+ssh sp1 "grep -a 'l2_prefetch\]' ~/projects/spark-ds41f/results/private/lab/candidate-54-screen-tp4-switched/boot-candidate-54-again.engine-sp1.log"
+# Both nodes were inside windows (hold files present); only these greps ran there. The image copy from sp5 was
+# NOT made: sp5's window was running candidate-57's tp3-switched gate, and a 10.5 GB docker save would load
+# that node during a timed job. sp8 instead uses spark-ds41f:candidate-50 with candidate-54's files mounted.
+
+## 3. Trees on sp8 (CPU)
+git clone ~/spark-lab/agents/round-55-57-select/c54-vllm $W/c54     # prepared candidate-54 tree: HEAD 4e8133ff, tree 5f021d9a (checked)
+$W/tools/make_trees.sh                                              # raw/harness/make_trees.sh: git worktree + git revert per arm
+#   arms (raw/sp8-setup/trees.txt): no961 no963 no987 no1001 no1030 no968 no969 no960 no998, noC51 (0781-0784),
+#   noC52 (0785-0787), noAll (all nine), no963-no1030 (0785 then 0782). Every revert applied cleanly.
+docker run --rm --entrypoint python3 -v $W/tools:/tools:ro spark-ds41f:candidate-50 /tools/blobs.py /opt/spark-ds41f/candidate/vllm > $W/out/image-c50-blobs.txt
+#   (CPU only, no --gpus) git blob hashes of the image's vllm/ and tests/; the image has no git.
+git -C $W/c54 ls-tree -r HEAD -- vllm tests > c54-blobs.txt
+#   image vs candidate-54: 36 files differ (22 non-test), none missing: raw/sp8-setup/c54-vs-image-c50.txt
+python3 $W/tools/overlay_sets.py no961 ... noAll; python3 $W/tools/overlay_sets.py no963-no1030
+#   out/ovl-<arm>.txt: non-test files the arm differs from the image in (what an sp8 boot mounts)
+#   out/rev-<arm>.txt: non-test files the arm differs from candidate-54 in (what a testbed overlay holds)
+python3 $W/tools/expect.py c54 no961 ... noAll no963-no1030
+#   out/expect-<arm>.json: the 22 files' blobs in the arm; every sp8 boot checks mounted and unmounted files against it
+
+## 4. Testbed overlays and profiles (laptop file copies; S/experiments/.../candidate-54/)
+ssh sp8 "cd $W/trees/<arm> && tar cf - \$(cat ../../out/rev-<arm>.txt)" | (cd S/experiments/2026-10-26-spark-ds41f-candidate/candidate-54/<arm>/overlay && tar xf -)
+#   arms: no961 no963 no987 no1001 no1030 no960 no998 noC51 no963-no1030; each file's git hash-object equals the
+#   reverted tree's blob (checked)
+python3 make_profiles.py S                          # tp3-switched-<arm>.json and -dev.json, as candidate-53's no960-no998
+# grid-tp3-suite.json: screen-tp3's grid step alone (replays 100, settle 1, max_requests 8). candidate-48's
+# grid-suite.json has no max_requests, so at TP3 (max_num_seqs 8) its 12- and 16-request shapes would not run.
+# attribute-tp3-grid-tp3-switched.json: 6 boots, candidate-54, no961, no998, no960, no963-no1030, candidate-54-again.
+
+## 5. sp8 GPU measurements: NOT RUN
+# The GPU lock has been self-deadlocked since 03:10:50Z (raw/gpu-lock-deadlock.txt):
+#   build-56-57.sh line 15 runs `flock /tmp/spark-lab-gpu.lock python3 scripts/lab.py kernel-local ...`, and
+#   kernel-local takes the same lock itself (spark_ds41f/lab.py:2391-2392, new open + LOCK_EX). /proc/locks: the
+#   outer flock (pid 3957638) holds it, its child lab.py (3957639) waits on it in locks_lock_inode_wait.
+# One boot was queued (04:16:52Z, tools/run.sh c54 1 30) and never started; I cancelled it at 04:25:25Z (my own
+# waiter, pids 455671/455740) along with my wait loops. No other process was touched.
+#
+# Ready to run once the lock is free (one boot per flock hold, hold-file checked before and inside the hold):
+nohup $W/tools/queue.sh > $W/out/runs/queue.out 2>&1 &
+#   smoke: c54 boot 1; then ABBA: noAll no961 no998 no960 no963-no1030, reversed, c54 boot 2 (12 boots).
+#   Each boot: run2.sh <arm> <boot> 30 -> docker run --gpus all spark-ds41f:candidate-50 + the arm's files (ro),
+#   /h/tp3_grid.py: TP3 rank shapes (24 heads, 3 WO groups, MoE intermediate 768, head shard 43,136 rows),
+#   12 target layers + 3 draft layers, TP3 capture ladder 1..48, max_num_seqs 8, 5 drafts, carve-out on
+#   (SPARK_DS41F_DISPLAY_CARVEOUT_WEIGHTS=1, /dev/dri/card0 bound as the recipe does), a 30 us spin after the FFN
+#   and NEXT window issues standing in for the TP3 all-reduces, engine_grid on the screen's ten 4K cells, 60 replays.
+#   Output: out/runs/<arm>-ar30-boot<N>.json (+ .txt), out/runs/commands.log (issued/start/end UTC, loadavg, hold).
+# Explanation variants for the arm that recovers (each one hold):
+EXTRA_ENV="VLLM_DS41_L2_PREFETCH=0" TAG=-pfoff $W/tools/run2.sh c54 3 30      # and the same on no961: delta with the prefetch off
+EXTRA_ENV="VLLM_DS41_L2_PREFETCH_WO_MB=18.9 VLLM_DS41_L2_PREFETCH_FFN_MB=14.8 VLLM_DS41_L2_PREFETCH_NEXT_MB=14.8" TAG=-tp4budget $W/tools/run2.sh c54 3 30
+$W/tools/run2.sh c54 3 0 ; $W/tools/run2.sh no961 3 0                          # all-reduce stand-in off: window-length sensitivity
+NSYS=1 TAG=-nsys $W/tools/run2.sh c54 4 30 --shapes 1x3 --replays 10           # Nsight Systems node trace: side-stream fill vs main stream, the model-end join
+NSYS=1 TAG=-nsys $W/tools/run2.sh no961 4 30 --shapes 1x3 --replays 10
+CARVEOUT=0 TAG=-nocarve $W/tools/run2.sh no998 3 30                            # if #998 is the one: the carve-out's part
+
+## 6. Testbed (sp5..sp7, a tp3-switched window; not run here)
+# python3 scripts/lab.py ... experiments/2026-10-26-spark-ds41f-candidate/candidate-54/attribute-tp3-grid-tp3-switched.json
+# 6 boots, grid step only, startup memory on every arm. Read each no<PR> arm against candidate-54 and candidate-54-again.

@@ -61,6 +61,10 @@ def fan_control_enabled(cluster: dict) -> bool:
     return cluster.get("host", {}).get("fan_control", True) is not False
 
 
+# Every key of the container section that a command reads.
+CONTAINER_KEYS = frozenset(("name", "image", "expected_labels", "docker_run_args", "mounts"))
+
+
 def local_doctor(cluster: dict, nodes: dict, upstreams: dict) -> list[str]:
     problems: list[str] = topology.problems(cluster, nodes)
     problems.extend(kernel_backend.problems(cluster))
@@ -70,6 +74,13 @@ def local_doctor(cluster: dict, nodes: dict, upstreams: dict) -> list[str]:
     problems.extend(benchmark_reference_problems(cluster, nodes))
     if cluster.get("promoted_baseline") != upstreams.get("generated_from_baseline"):
         problems.append("cluster and upstream locks name different baselines")
+    # A key no command reads is a setting that silently does nothing: an arm that names
+    # its overlay under container.extra_mounts boots the image unchanged.
+    for key in sorted(set(cluster.get("container", {})) - CONTAINER_KEYS):
+        problems.append(
+            f"container.{key} is not a container setting (known: {', '.join(sorted(CONTAINER_KEYS))}); "
+            "files are mounted through container.mounts, as [source, target, mode]"
+        )
     host = cluster.get("host", {})
     for key in (
         "memguard_gib",
@@ -86,6 +97,8 @@ def local_doctor(cluster: dict, nodes: dict, upstreams: dict) -> list[str]:
         problems.append("host.memguard_warn_gib must exceed host.memguard_gib")
     if not isinstance(host.get("fan_control", True), bool):
         problems.append("host.fan_control must be a boolean")
+    if not isinstance(host.get("defragment_before_start", True), bool):
+        problems.append("host.defragment_before_start must be a boolean")
     for key in ("memguard_interval_seconds", "startup_memguard_interval_seconds"):
         value = host.get(key)
         if (
@@ -113,7 +126,7 @@ def local_doctor(cluster: dict, nodes: dict, upstreams: dict) -> list[str]:
     for name, source in upstreams["sources"].items():
         if not source.get("upstream"):
             problems.append(f"{name}: canonical upstream is not recorded")
-        if source["kind"] == "git":
+        if source.get("kind") == "git":
             if len(source["revision"]) != 40:
                 problems.append(f"{name}: revision is not a full commit SHA")
             if not source.get("tracking_ref"):
@@ -132,6 +145,7 @@ def local_doctor(cluster: dict, nodes: dict, upstreams: dict) -> list[str]:
         lockfile = source.get("lockfile")
         if lockfile and not (ROOT / lockfile).is_file():
             problems.append(f"{name}: missing dependency lock {lockfile}")
+    problems.extend(cuda_toolkit_problems(upstreams["sources"]))
     watchlist_path = ROOT / "docs/inspiration.md"
     watchlist = (
         watchlist_path.read_text(encoding="utf-8") if watchlist_path.is_file() else ""

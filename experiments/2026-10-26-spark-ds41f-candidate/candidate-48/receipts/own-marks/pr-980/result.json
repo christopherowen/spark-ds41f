@@ -1,0 +1,60 @@
+{
+  "pr": 980,
+  "pr_head": "11b169b0dd07de9aa45ad6b9ab9f0f58156fb822",
+  "mark": "Its 1,000-step TP lockstep screen shows 0 rank mismatches on the image; the sampled suite completes",
+  "host": "sp8 (spark-0016, NVIDIA GB10)",
+  "images": {
+    "candidate-48": "sha256:d6ffd842978849651e756ebd39e9bf2da7ddb03e746113013533029878485a24"
+  },
+  "evidence": "README 3.1 pytest suite (6 files) on the candidate image, two boots; README 3.2 screen_zero_broadcast_sync.py --worker at TP3 and TP4, adapted to sp8's single GB10 (see adaptations), two boots in the PR orchestrator's order (boot1 TP3 then TP4, boot2 TP4 then TP3)",
+  "adaptations": [
+    "The PR's orchestrator ssh-es to sp5..sp8 and takes their locks, so it was not run; only its --worker entry point was run, on sp8 alone, with the worker's own docker flags and NCCL/Gloo env",
+    "world_size=1 is not possible: sparknet's RoCE all-reduce rejects world size 1 (screen-tp1-smoke-*.txt)",
+    "Two ranks in two containers on one GPU: NCCL 2.30.7 refuses ('Multiple Ranks are using the same GPU/Partition. Set NCCL_MULTI_RANK_GPU_ENABLE=1', screen-tp2-one-gpu-rank*.txt). With NCCL_MULTI_RANK_GPU_ENABLE=1 and one container per rank, init fails with 'invalid device context' (screen-candidate48-boot*-tp*-onegpu-rank*.txt)",
+    "Accepted layout: every rank a separate process in ONE container, NCCL_MULTI_RANK_GPU_ENABLE=1 (pr-980-onecontainer-tp34.sh). Each rank still has its own process-global np.random state, which is what the screen's control arm desyncs, so the mismatch counts are meaningful. Its latency records are not comparable to the PR's multi-node ones (the RoCE one-shot arm loops back through the NIC at 4.5-9.2 ms per call)"
+  ],
+  "measured": {
+    "pytest_3.1_candidate-48": {"boot1": "188 passed, 1 skipped in 112.53s", "boot2": "188 passed, 1 skipped in 113.23s"},
+    "screen_determinism_1000_steps": {
+      "boot1_TP3": {
+        "control_unseeded_global_rng": {"seeds_equal": false, "draft": 1000, "conf": 1000, "budget": 263, "sampled": 1000, "estimator": 901, "max_conf_abs_diff": 0.29860765, "max_slope_abs_diff": 0.50481915, "max_intercept_abs_diff": 1.1976037},
+        "candidate_greedy": "seeds_equal true, 0 mismatches in all 7 histories, max diffs 0.0",
+        "candidate_sampled_unseeded": "seeds_equal true, 0 mismatches in all 7 histories, max diffs 0.0",
+        "candidate_dflash_estimator": "seeds_equal true, 0 mismatches in all 7 histories, max diffs 0.0"
+      },
+      "boot1_TP4": {
+        "control_unseeded_global_rng": {"seeds_equal": false, "draft": 1000, "conf": 1000, "budget": 239, "sampled": 1000, "estimator": 901, "max_conf_abs_diff": 0.51592845, "max_slope_abs_diff": 0.36450931, "max_intercept_abs_diff": 2.01140976},
+        "candidate_greedy": "0 mismatches", "candidate_sampled_unseeded": "0 mismatches", "candidate_dflash_estimator": "0 mismatches"
+      },
+      "boot2_TP4": {
+        "control_unseeded_global_rng": {"seeds_equal": false, "draft": 1000, "conf": 1000, "budget": 239, "sampled": 1000, "estimator": 901, "max_conf_abs_diff": 0.51592845},
+        "candidate_greedy": "0 mismatches", "candidate_sampled_unseeded": "0 mismatches", "candidate_dflash_estimator": "0 mismatches"
+      },
+      "boot2_TP3": {
+        "control_unseeded_global_rng": {"seeds_equal": false, "draft": 1000, "conf": 1000, "budget": 263, "sampled": 1000, "estimator": 901, "max_conf_abs_diff": 0.29860765},
+        "candidate_greedy": "0 mismatches", "candidate_sampled_unseeded": "0 mismatches", "candidate_dflash_estimator": "0 mismatches"
+      },
+      "broadcast_calls_all_modes": 0,
+      "refits_completed_all_modes": 10,
+      "equal_to_pr_receipts": "control and candidate determinism records equal the PR's screen-zero-broadcast-sync-boot1/2.jsonl values (263/1000 and 239/1000 budget mismatches; 0.29860765 / 0.51592845 max confidence diff)"
+    },
+    "screen_TP2_one_container_diagnostic": "not the PR's world size. control 274/1000 budget mismatches, candidate_greedy 0 mismatches, then candidate_sampled_unseeded aborts with 'CUDA error: an illegal memory access' inside rejection_sample (Triton, rejection_sampler_utils.py:1504) in both tries (screen-diag-tp2-one-container*.txt)",
+    "latency_records_one_gpu_not_comparable": {
+      "record_confidences_zero_broadcast_median_us": {"boot1_TP3_128B": 5.568, "boot1_TP4_128B": 5.536, "boot2_TP4_128B": 9.344, "boot2_TP3_128B": 5.696},
+      "record_confidences_nccl_broadcast_median_us": {"boot1_TP3_128B": 9.632, "boot1_TP4_128B": 9.632, "boot2_TP4_128B": 14.72, "boot2_TP3_128B": 9.888},
+      "estimator_predict_from_stats_vs_scratch_median_us": {"boot1_TP3": [3.392, 9.44], "boot1_TP4": [3.04, 9.12], "boot2_TP4": [4.544, 9.408], "boot2_TP3": [2.944, 9.056]}
+    },
+    "interval": "mismatch counts are identical across both boots at each TP size"
+  },
+  "parts": [
+    {"part": "1,000-step TP lockstep screen shows 0 rank mismatches on the image", "verdict": "pass", "detail": "TP3 and TP4, both boots: all three candidate modes 0/1000 mismatches in draft, confidence, budget, capacities, dead-cut, sampled and estimator histories, while the control arm reproduces the PR's divergence exactly. Run with all ranks on one GB10 (adapted layout), not across sp5..sp8"},
+    {"part": "the sampled suite completes", "verdict": "cannot-evaluate-on-sp8", "detail": "the sampled suite is a live tp4-switched serving benchmark"}
+  ],
+  "verdict": "pass",
+  "verdict_scope": "sp8-evaluable part only, on an adapted single-GPU rank layout; the sampled suite is cannot-evaluate-on-sp8",
+  "reason": "On the integrated image the screen's three candidate modes show 0 cross-rank mismatches over 1,000 steps at TP3 and TP4 in both boots, and the control arm reproduces the PR's recorded divergence value for value, so the lockstep seeding and zero-broadcast confidence path hold. Caveats: the ranks shared one GPU (NCCL_MULTI_RANK_GPU_ENABLE=1, one container), not the PR's multi-node layout; and at TP2, a world size the PR did not claim, the candidate_sampled_unseeded mode hit an illegal memory access in rejection_sample twice. That TP2 crash may be an artifact of the shared-GPU layout or of the screen's TP2 shapes (vocab 8192), but it is unexplained and worth a look before trusting temperature > 0 at TP2.",
+  "notes": [
+    "commands.txt start_utc is when the command was issued and includes any wait on /tmp/spark-lab-gpu.lock",
+    "The screen was not run on the 1107 image: its control arm is the PR's built-in model of 1107's seeding, and the PR compared against that arm, not against the 1107 image"
+  ]
+}

@@ -1,0 +1,394 @@
+{
+ "pr": 963,
+ "round": 1,
+ "pr_head": "e5db47f172cfef9bbe77d4af8b061f6fc683969a",
+ "patch": "0782-perf-dsv41-unconditional-pack12-plane-loads-and-swar.patch (round 1; file name kept for candidate-51's series)",
+ "author": "Christopher Owen <3221756+christopherowen@users.noreply.github.com> (the PR's), author date Sun, 8 Nov 2026 12:00:00 +0000 kept",
+ "mark": "The own mark's, unchanged: its screen_pack12_kernels.py timing half on the image (h963.py, here h963r1.py), 2 boots, ABBA against the base image, by kernel time and CUDA-graph replay: packed BF16 GEMM (compressor_up, M=1..256) and packed vocab projection and greedy partials faster beyond the interval, 0 ULP, including through #997's certified screen (in the base); and, per the rework brief, no cell slower than the base on a shape serving uses (TP4 and TP3, decode M up to 128).",
+ "change": {
+  "kept": [
+   "vocab.py: vllm_vocab_apply_row_exceptions / _clocal (per-fragment-column exception accumulation) in packed_vocab_projection, packed_vocab_greedy_partials and packed_vocab_markov_greedy_partials, unchanged",
+   "gemm.py: vllm_packed_bf16_load_row_bounds and pdl.chain() in _packed_bf16_gemm and packed_bf16_gemm_two, now only on grids of _PACKED_WIDE_TILES = 32 column tiles or more",
+   "tests/kernels/deepseek_v41_pdl_sources.py: gemm_packed_bf16_partials, gemm_packed_bf16_splitk and unpack_packed_bf16 (already chained in the base) in CHAIN"
+  ],
+  "restored_to_base": [
+   "vocab.py vllm_vocab_decode_vec16 (the byte-level SWAR rewrite dropped): the certified screen's vocab_row_thresholds and vocab_packed_refine_partials call it, so the screen's kernels are the base's again (byte-identical SASS, out/pr-common/sass-*.txt)",
+   "gemm.py vllm_packed_bf16_filter_exc (early return when there are no exceptions): serving's split-K compressor GEMM and the prefill unpack use it, so those kernels are the base's again (byte-identical SASS)",
+   "packed_bf16_gemm / _two on narrow grids (512x10240: 8 tiles, 128x5120: 2 tiles): the base's bounds search and plain launch (byte-identical SASS for all 6 narrow kernels)"
+  ],
+  "removed_from_CHAIN": "gemm_packed_bf16 and gemm_packed_bf16_two (a narrow grid does not wait; a wide one still waits before naming a pointer, which the plugin checks for every kernel that waits)",
+  "added_test": "tests/kernels/quantization/test_deepseek_v41_tilelang_linear.py::test_packed_bf16_gemm_wide_and_narrow_grids_exact (4 cases: packed_bf16_gemm 4096 and 512 rows, packed_bf16_gemm_two 2x1024 and 2x256 rows, K 1280, with exceptions): the kernel source waits and loads row bounds exactly on wide grids, and the outputs equal bf16_gemm / bf16_gemm_two bit for bit at 1, 16, 64 and 130 rows",
+  "diff_vs_first_version": "git diff --stat first..r1: 4 files, +143/-47 (gemm.py 92, vocab.py 50, test_deepseek_v41_tilelang_linear.py +46, deepseek_v41_pdl_sources.py -2); corrected 0782 against its parent: 4 files, +248/-90 (the first version: 3 files, +171/-109)"
+ },
+ "host": "sp8 (spark-0016, NVIDIA GB10)",
+ "arms": {
+  "base": "spark-ds41f:candidate-50 sha256:8c1ea1f62f62c3e2adc03b645c091a5499cf7163101aca32875c894b96f155db + candidate-50 no1009/overlay (4 files, ro): tree 14c5a2dc (the own-mark run's base arm)",
+  "c51r1": "the same image + the 15 files where the corrected candidate-51 tree differs from the image's (ro): tree 35cd2a0e87a6 = 0781, 0782 #963-r1, 0783 #987, 0784 #1001-r1 on the base; verified file by file (7,831 match)"
+ },
+ "diagnosis": {
+  "method": "d963.py on the own-mark run's c51 arm: each variant compiled from its own copy of the module (h/var, built by h/mkvar.py from the base file and #963's), the variants of a cell timed v1..vn, vn..v1 in one process by CUDA-graph replay (20 calls a graph) and isolated CUPTI kernel time; the TileLang cache key includes the imported header text, so variants never share a kernel",
+  "packed_bf16_gemm (2 boots; ratios base/variant by graph replay, adiag-gemm.txt)": {
+   "rb (row-bounds load only)": "512x10240 0.949-0.974 and 128x5120 0.963-0.977 (slower at all 16 cells, by isolated kernel time too); 5120x512 1.010-1.061 and 4096x1280 1.011-1.040 (faster at all 16)",
+   "pdl (pdl.chain() only)": "512x10240 0.961-0.997 (6 slower, 2 same) and 128x5120 0.993-0.997 (7 slower, 1 same); 5120x512 1.000-1.026 and 4096x1280 0.999-1.024 (9 faster, 7 same)",
+   "963 (both)": "512x10240 0.926-0.978, 128x5120 0.967-0.982 (all slower); 5120x512 1.013-1.101, 4096x1280 1.014-1.068 (all faster)",
+   "reading": "the row-bounds load is what loses on the narrow grids, where a few CTAs (8 and 2 column tiles of 64) each run a long K loop; the bounds search it removes is redundant (its result is the row's end) but evidently not free to remove there. pdl.chain() is a small loss there too. Both gain on the wide grids."
+  },
+  "vllm_vocab_decode_vec16 in the projection and greedy partials (1 boot, TP4 32320x5120, adiag-vocab.txt)": {
+   "variants": "base / 963 / exc (#963's exceptions, base decode) / dec (base exceptions, #963's decode)",
+   "stressed (the PR's weights: every 300th element 1e-6, 576,659 exceptions)": "963 2.41-3.77x and exc 2.41-3.78x over base; 963/exc within 0.5% (exc 0.3-0.5% slower at M=1 and 16 only); dec 0.996-1.005x of base",
+   "natural (#1001's bench weights: a random head's own 24,787 exceptions)": "963 1.003-1.244x and exc 1.002-1.245x; dec 0.997-1.013x",
+   "reading": "the decode rewrite does not move these kernels; the per-column exceptions carry the whole gain"
+  },
+  "certified screen (base vs #963 decode, the only #963 change on that path; 2 boots, TP4, FP32 head)": {
+   "summary": "In one process the #963-decode layer is built second, a placement that reads 0.3-1.1% faster on identical kernels at M<=64 here; with that bias the screen reads 0.7-0.9% slower at M=104-107 and same at 112-120 at the PR's 0.35% density, and same at natural density: consistent with the own mark's cross-image loss (0.6-2.6% at TP4 M=97..120), too small against the placement effect (up to 7%) to attribute further in process. Round 1 removes the question: the screen's kernels are the base's (identical SASS).",
+   "cells (adiag-screen.txt)": [
+    "boots: 2",
+    "screen|stressed|M=1                        eq=True base=   753.72(1.000) ki=825.7/823.0  963=   750.68(1.004=) ki=825.5/815.8",
+    "screen|stressed|M=16                       eq=True base=   796.19(1.000) ki=888.1/885.1  963=   793.51(1.003=) ki=877.2/883.4",
+    "screen|stressed|M=64                       eq=True base=   978.96(1.000) ki=1175.0/1232.5  963=   973.78(1.005=) ki=1275.6/1195.7",
+    "screen|stressed|M=96                       eq=True base=  1288.24(1.000) ki=1616.3/1607.5  963=  1268.32(1.016+) ki=1671.8/1557.5",
+    "screen|stressed|M=97                       eq=True base=  1306.35(1.000) ki=1636.4/1628.8  963=  1295.03(1.009+) ki=1671.5/1673.0",
+    "screen|stressed|M=104                      eq=True base=  1364.30(1.000) ki=1696.7/1814.4  963=  1376.41(0.991=) ki=1818.7/1822.9",
+    "screen|stressed|M=107                      eq=True base=  1391.39(1.000) ki=1739.4/1744.8  963=  1401.37(0.993-) ki=1775.3/1810.2",
+    "screen|stressed|M=112                      eq=True base=  1447.39(1.000) ki=1820.7/1905.8  963=  1451.65(0.997=) ki=1834.7/1905.3",
+    "screen|stressed|M=120                      eq=True base=  1504.21(1.000) ki=2045.8/1879.4  963=  1510.53(0.996=) ki=1979.4/1894.2",
+    "screen|stressed|M=128                      eq=True base=  1587.12(1.000) ki=2002.5/2025.1  963=  1578.67(1.005=) ki=1997.7/2080.1",
+    "screen|natural|M=1                         eq=True base=   750.63(1.000) ki=814.5/815.4  963=   743.32(1.010=) ki=799.7/867.3",
+    "screen|natural|M=16                        eq=True base=   784.12(1.000) ki=864.7/866.4  963=   775.92(1.011=) ki=845.9/860.8",
+    "screen|natural|M=64                        eq=True base=   939.93(1.000) ki=1098.7/1106.0  963=   929.44(1.011=) ki=1075.5/1103.9",
+    "screen|natural|M=96                        eq=True base=  1234.62(1.000) ki=1483.5/1464.4  963=  1231.69(1.002=) ki=1459.2/1542.2",
+    "screen|natural|M=97                        eq=True base=  1238.45(1.000) ki=1466.8/1472.1  963=  1236.53(1.002=) ki=1457.4/1463.8",
+    "screen|natural|M=104                       eq=True base=  1276.61(1.000) ki=1517.4/1517.2  963=  1276.02(1.000=) ki=1498.1/1503.5",
+    "screen|natural|M=107                       eq=True base=  1304.90(1.000) ki=1552.3/1554.2  963=  1305.23(1.000=) ki=1600.7/1641.0",
+    "screen|natural|M=112                       eq=True base=  1353.59(1.000) ki=1747.7/1620.7  963=  1355.48(0.999=) ki=1740.6/1724.4",
+    "screen|natural|M=120                       eq=True base=  1399.06(1.000) ki=1718.3/1666.9  963=  1400.39(0.999=) ki=1758.7/1797.2",
+    "screen|natural|M=128                       eq=True base=  1470.46(1.000) ki=1778.3/1844.3  963=  1453.75(1.011+) ki=1791.9/1846.4"
+   ]
+  }
+ },
+ "measured": {
+  "A_packed_bf16_gemm_graph_us_base_boots_to_c51r1_boots": {
+   "compressor_up_5120x512 (the mark)": {
+    "M=1": "7.27/7.27 -> 6.65/6.64 (1.094x, faster)",
+    "M=6": "7.60/7.64 -> 7.07/7.09 (1.076x, faster)",
+    "M=16": "7.77/7.76 -> 7.19/7.25 (1.075x, faster)",
+    "M=32": "13.16/13.23 -> 12.12/12.16 (1.087x, faster)",
+    "M=64": "17.12/17.01 -> 15.97/15.69 (1.078x, faster)",
+    "M=128": "31.34/31.11 -> 30.76/30.30 (1.023x, faster)",
+    "M=256": "55.31/55.61 -> 52.72/52.98 (1.049x, faster)",
+    "M=512": "104.20/105.10 -> 101.50/102.43 (1.026x, faster)"
+   },
+   "indexer_wq_b_4096x1280": {
+    "M=1": "14.87/14.40 -> 13.47/13.49 (1.086x, faster)",
+    "M=6": "14.77/14.55 -> 13.64/13.68 (1.073x, faster)",
+    "M=16": "14.92/14.80 -> 13.94/13.91 (1.067x, faster)",
+    "M=32": "25.48/25.75 -> 24.99/24.65 (1.032x, faster)",
+    "M=64": "33.07/33.21 -> 31.69/31.74 (1.045x, faster)",
+    "M=128": "50.03/50.55 -> 48.02/48.10 (1.046x, faster)",
+    "M=256": "95.67/96.76 -> 94.40/95.15 (1.015x, faster)",
+    "M=512": "176.72/178.52 -> 173.52/175.28 (1.018x, faster)"
+   },
+   "compressor_down_512x10240 (narrow: base code)": {
+    "M=1": "83.38/83.68 -> 83.22/84.02 (0.999x, same)",
+    "M=6": "84.27/83.96 -> 83.47/87.14 (0.986x, same)",
+    "M=16": "84.40/84.06 -> 83.48/84.42 (1.003x, same)",
+    "M=32": "94.01/94.43 -> 93.74/94.84 (0.999x, same)",
+    "M=64": "120.05/120.10 -> 119.16/120.16 (1.003x, same)",
+    "M=128": "120.92/120.46 -> 120.53/120.61 (1.001x, same)",
+    "M=256": "122.54/124.04 -> 122.70/122.70 (1.005x, same)",
+    "M=512": "244.71/246.87 -> 245.06/245.15 (1.003x, same)"
+   },
+   "indexer_wk_128x5120 (narrow: base code)": {
+    "M=1": "41.51/41.80 -> 42.10/41.77 (0.993x, same)",
+    "M=6": "41.48/41.75 -> 41.41/41.77 (1.001x, same)",
+    "M=16": "41.58/41.82 -> 41.57/41.77 (1.001x, same)",
+    "M=32": "46.79/47.14 -> 46.70/47.15 (1.001x, same)",
+    "M=64": "59.65/60.18 -> 60.34/59.98 (0.996x, same)",
+    "M=128": "59.60/60.08 -> 59.77/60.00 (0.999x, same)",
+    "M=256": "60.03/60.09 -> 59.61/60.03 (1.004x, same)",
+    "M=512": "60.24/60.24 -> 60.20/60.27 (1.000x, same)"
+   },
+   "counts (graph)": {
+    "compressor_down_512x10240": {
+     "same": 8
+    },
+    "compressor_up_5120x512": {
+     "faster": 8
+    },
+    "indexer_wq_b_4096x1280": {
+     "faster": 8
+    },
+    "indexer_wk_128x5120": {
+     "same": 8
+    }
+   },
+   "kernel_isolated counts": {
+    "compressor_down_512x10240": {
+     "slower": 1,
+     "same": 6,
+     "faster": 1
+    },
+    "compressor_up_5120x512": {
+     "faster": 5,
+     "same": 3
+    },
+    "indexer_wq_b_4096x1280": {
+     "same": 1,
+     "faster": 7
+    },
+    "indexer_wk_128x5120": {
+     "same": 7,
+     "slower": 1
+    }
+   },
+   "identical-code notes": "512x10240 and 128x5120 compile the base's kernel (byte-identical SASS in both arms): their single non-same kernel_isolated and eager readings (512x10240 M=1 kiso 0.906x from one 94.68 us sample; 128x5120 M=512 kiso 0.999x; eager 512x10240 M=256 0.985x, 128x5120 M=6 0.989x) are the interval rule's noise on identical machine code"
+  },
+  "B_packed_vocab_projection_graph_us (stressed 0.35% exceptions)": {
+   "counts own config": {
+    "faster": 26
+   },
+   "counts same TILE_CONFIGS[128] s4a2 / s2 (#963-r1 alone)": [
+    {
+     "faster": 10
+    },
+    {
+     "faster": 10
+    }
+   ],
+   "TP4": {
+    "M=1": "2650.86/2643.06 -> 1080.81/1079.84 (2.450x, faster)",
+    "M=16": "3426.33/3456.18 -> 1113.26/1116.49 (3.087x, faster)",
+    "M=64": "5105.91/5126.88 -> 1589.73/1566.88 (3.242x, faster)",
+    "M=96": "8554.97/8629.31 -> 2223.26/2271.85 (3.823x, faster)",
+    "M=107": "8677.04/8760.98 -> 2496.28/2507.23 (3.485x, faster)",
+    "M=128": "9212.81/9160.39 -> 3038.42/3053.90 (3.016x, faster)",
+    "M=2048": "162574.92/155824.15 -> 48206.60/48429.48 (3.295x, faster)"
+   },
+   "TP3": {
+    "M=1": "3423.63/3458.55 -> 1418.61/1404.30 (2.438x, faster)",
+    "M=16": "4517.90/4554.03 -> 1445.97/1439.96 (3.144x, faster)",
+    "M=64": "6738.10/6794.72 -> 2058.39/2092.92 (3.260x, faster)",
+    "M=96": "11386.63/11468.57 -> 2966.72/3015.62 (3.820x, faster)",
+    "M=107": "11524.13/11600.83 -> 3306.19/3356.61 (3.471x, faster)",
+    "M=128": "12144.85/12238.99 -> 4078.03/4141.90 (2.966x, faster)",
+    "M=2048": "196883.06/194266.87 -> 70131.38/70599.10 (2.779x, faster)"
+   },
+   "TP4 same config s2 at the 128-row tile": {
+    "M=96": "8401.65/8470.36 -> 2223.26/2271.85 (3.753x, faster)",
+    "M=107": "8517.02/8576.68 -> 2496.28/2507.23 (3.416x, faster)",
+    "M=128": "8983.72/8923.01 -> 3038.42/3053.90 (2.939x, faster)"
+   }
+  },
+  "C_packed_vocab_greedy_partials_plus_finish_graph_us": {
+   "counts own config": {
+    "faster": 22
+   },
+   "counts same config s4a2 / s2": [
+    {
+     "faster": 6
+    },
+    {
+     "faster": 6
+    }
+   ],
+   "TP4": {
+    "M=1": "2618.52/2602.42 -> 1084.79/1084.49 (2.407x, faster)",
+    "M=16": "3380.44/3403.81 -> 1110.60/1113.40 (3.050x, faster)",
+    "M=64": "5047.47/5068.60 -> 1592.04/1569.90 (3.199x, faster)",
+    "M=107": "8645.02/8718.95 -> 2502.14/2518.47 (3.459x, faster)",
+    "M=128": "9182.31/9118.14 -> 3036.31/3044.15 (3.010x, faster)"
+   }
+  },
+  "D_certified_greedy_screen_graph_us (project_head_greedy_pairs, FP32 head, stressed weights)": {
+   "same screen-config set on both arms (#963-r1 alone: byte-identical SASS for every screen kernel)": {
+    "s4a2 (the base's SCREEN_TILE_CONFIGS; the own mark compared at this set)": {
+     "counts": {
+      "faster": 3,
+      "slower": 4,
+      "same": 21
+     },
+     "TP4 M=97..128": {
+      "M=97": "1296.69/1316.64 -> 1296.47/1320.23 (0.999x, same)",
+      "M=104": "1358.25/1358.02 -> 1363.66/1367.99 (0.994x, slower)",
+      "M=107": "1382.64/1394.08 -> 1381.44/1399.78 (0.998x, same)",
+      "M=112": "1417.99/1435.81 -> 1421.24/1442.53 (0.997x, same)",
+      "M=120": "1497.71/1491.68 -> 1482.54/1491.64 (1.005x, faster)",
+      "M=128": "1564.38/1587.14 -> 1580.80/1572.06 (1.000x, same)"
+     },
+     "TP3 M=97..128": {
+      "M=97": "1690.63/1693.27 -> 1689.89/1696.10 (0.999x, same)",
+      "M=104": "1768.62/1777.00 -> 1775.84/1783.03 (0.996x, same)",
+      "M=107": "1783.22/1804.62 -> 1813.16/1798.30 (0.993x, same)",
+      "M=112": "1846.88/1848.27 -> 1850.24/1835.62 (1.003x, same)",
+      "M=120": "1926.36/1955.40 -> 1931.93/1931.36 (1.005x, same)",
+      "M=128": "2053.01/2047.70 -> 2030.88/2020.82 (1.012x, faster)"
+     }
+    },
+    "r1 (#1001-r1's SCREEN_TILE_CONFIGS[128] num_stages 2)": {
+     "counts": {
+      "same": 22,
+      "faster": 5,
+      "slower": 1
+     },
+     "TP4 M=97..128": {
+      "M=97": "1202.08/1205.37 -> 1198.93/1205.59 (1.001x, same)",
+      "M=104": "1219.21/1228.03 -> 1225.41/1232.42 (0.996x, same)",
+      "M=107": "1238.39/1239.47 -> 1235.81/1248.69 (0.997x, same)",
+      "M=112": "1250.07/1267.08 -> 1254.03/1272.22 (0.996x, same)",
+      "M=120": "1288.68/1306.56 -> 1302.14/1321.07 (0.989x, same)",
+      "M=128": "1414.79/1387.47 -> 1410.32/1410.68 (0.993x, same)"
+     },
+     "TP3 M=97..128": {
+      "M=97": "1547.49/1544.23 -> 1552.84/1543.26 (0.999x, same)",
+      "M=104": "1584.74/1576.48 -> 1574.34/1571.23 (1.005x, faster)",
+      "M=107": "1586.31/1600.17 -> 1590.27/1610.08 (0.996x, same)",
+      "M=112": "1605.03/1603.12 -> 1604.98/1599.15 (1.001x, same)",
+      "M=120": "1684.66/1656.28 -> 1742.69/1774.69 (0.950x, slower)",
+      "M=128": "1730.36/1722.70 -> 1717.77/1773.58 (0.989x, same)"
+     }
+    }
+   },
+   "own vs own (each arm's serving config: #963-r1 with #1001-r1)": {
+    "counts": {
+     "faster": 28
+    },
+    "TP4 M=97..128": {
+     "M=97": "1296.69/1316.64 -> 1198.93/1205.59 (1.087x, faster)",
+     "M=104": "1358.25/1358.02 -> 1225.41/1232.42 (1.105x, faster)",
+     "M=107": "1382.64/1394.08 -> 1235.81/1248.69 (1.118x, faster)",
+     "M=112": "1417.99/1435.81 -> 1254.03/1272.22 (1.130x, faster)",
+     "M=120": "1497.71/1491.68 -> 1302.14/1321.07 (1.140x, faster)",
+     "M=128": "1564.38/1587.14 -> 1410.32/1410.68 (1.117x, faster)"
+    }
+   },
+   "the own mark's miss, revisited": "TP4 M=97..120 was 0.974-0.994x slower (base decode vs #963's); at the same set now: M=97 0.999x same, 104 0.994x slower, 107 0.998x same, 112 0.997x same, 120 1.005x faster, 128 same, on identical SASS"
+  },
+  "E_split_k_compressor_decode_graph_us (TileLangSplitLinearMethod: byte-identical SASS in both arms)": {
+   "counts": {
+    "same": 16,
+    "faster": 4
+   },
+   "1024x5120 x2 FP32": {
+    "M=1": "14.99/15.10 -> 15.68/15.01 (0.980x, same)",
+    "M=6": "15.61/15.56 -> 15.61/15.50 (1.002x, same)",
+    "M=16": "16.89/16.85 -> 16.78/16.79 (1.005x, faster)",
+    "M=24": "16.43/16.45 -> 16.44/16.37 (1.002x, same)",
+    "M=32": "17.07/17.24 -> 16.99/17.09 (1.007x, same)",
+    "M=48": "26.83/26.78 -> 26.89/26.66 (1.001x, same)",
+    "M=64": "28.06/28.14 -> 28.14/28.13 (0.999x, same)",
+    "M=96": "48.41/48.88 -> 48.36/48.39 (1.006x, faster)",
+    "M=107": "49.16/49.86 -> 49.39/49.74 (0.999x, same)",
+    "M=128": "51.13/51.66 -> 51.34/51.58 (0.999x, same)"
+   },
+   "512x5120 BF16": {
+    "M=1": "9.26/9.38 -> 9.35/9.35 (0.997x, same)",
+    "M=6": "9.61/9.66 -> 9.64/9.60 (1.002x, same)",
+    "M=16": "10.17/10.23 -> 10.17/10.17 (1.003x, same)",
+    "M=24": "13.00/13.08 -> 12.98/13.10 (1.000x, same)",
+    "M=32": "13.59/13.77 -> 13.75/13.71 (0.996x, same)",
+    "M=48": "15.74/15.94 -> 15.79/16.03 (0.996x, same)",
+    "M=64": "17.19/17.40 -> 17.12/17.29 (1.005x, same)",
+    "M=96": "28.14/28.28 -> 28.12/28.25 (1.001x, same)",
+    "M=107": "28.96/29.05 -> 28.84/28.90 (1.005x, faster)",
+    "M=128": "30.50/30.54 -> 30.40/30.49 (1.002x, faster)"
+   }
+  },
+  "A/A rerun of D and E (identical SASS; ABBA, 2 boots per arm, aa-DE-*)": {
+   "counts": {
+    "D_screen_same_set_s4a2": {
+     "slower": 11,
+     "same": 16,
+     "faster": 1
+    },
+    "D_screen_same_set_r1": {
+     "same": 19,
+     "faster": 8,
+     "slower": 1
+    },
+    "E_splitk": {
+     "same": 14,
+     "slower": 4,
+     "faster": 2
+    }
+   },
+   "the cells that read slower in the main run": {
+    "D s4a2 TP4 M=6, 17, 24, 104": {
+     "6": "768.35/771.15 -> 773.97/772.85 (0.995x, slower)",
+     "17": "803.60/802.14 -> 808.17/804.74 (0.996x, slower)",
+     "24": "819.10/817.28 -> 824.60/820.05 (0.995x, slower)",
+     "104": "1355.17/1356.18 -> 1355.21/1352.76 (1.001x, same)"
+    },
+    "D r1 TP3 M=120": "1695.65/1796.84 -> 1682.54/1660.71 (1.045x, faster)"
+   }
+  }
+ },
+ "tests": {
+  "files": "tests/kernels/quantization/test_deepseek_v41_tilelang_vocab.py, tests/kernels/quantization/test_deepseek_v41_tilelang_linear.py, tests/kernels/test_deepseek_v41_tilelang_embedding.py, tests/kernels/test_deepseek_v41_tilelang_pdl.py (the PR's four), with -p tblib_stub and -p tests.kernels.deepseek_v41_pdl_sources",
+  "smoke (new and changed config tests, before the bench)": "6 passed, 14 warnings in 26.96s",
+  "boot1": "287 passed, 14 warnings in 728.34s (0:12:08)",
+  "boot2": "287 passed, 14 warnings in 93.46s (0:01:33)",
+  "pdl_sources_plugin": [
+   [
+    "PDL sources: 500 kernels launched, 286 with PDL, 0 violations"
+   ],
+   [
+    "PDL sources: 490 kernels launched, 280 with PDL, 0 violations"
+   ]
+  ]
+ },
+ "bit_exact": true,
+ "bit_exact_detail": "Every output hash (GEMM outputs, projection logits, greedy (max, index) pairs, certified-screen pairs, split-K outputs) is equal across all four ABBA runs of both arms in every cell, across both TILE_CONFIGS[128] variants and both screen-config sets, and in the A/A rerun; every diagnosis variant (gemm base/pdl/rb/963, vocab base/963/exc/dec) gives the same bits: 0 ULP.",
+ "slot_effect_note": "In one process, two layers with identical kernels can differ by up to 7% in graph replay (h963r1 section D: the second-built layer 3-5% faster at TP4 M<=64 on both arms; d963 sab: monotone with the build order at TP3 M=1). Every #963-r1 comparison here is therefore cross-arm at the same layer slot (same set, same config), and the in-process diagnosis of the screen decode is left inconclusive.",
+ "verdict": "corrected-meets-mark",
+ "reason": "The corrected 0782 keeps #963's gains where they hold and is the base's machine code wherever #963 lost on a path serving uses. Gains, by CUDA-graph replay, beyond the interval, 0 ULP: packed BF16 GEMM 5120x512 (compressor_up, the mark) faster at all 8 M (1.023-1.094x, e.g. M=1 7.27/7.27 -> 6.65/6.64 us) and 4096x1280 at all 8 (1.015-1.086x); packed vocab projection faster in all 26 cells (2.44-3.82x at the PR's 0.35% exception density; at the same TILE_CONFIGS[128] on both arms 20/20), greedy partials in all 22 (2.40-3.80x; same config 12/12). Restored: the certified screen's kernels (vllm_vocab_decode_vec16 is the base's: byte-identical SASS for every screen, refine, threshold, x-norm, compact and finish kernel in both arms), serving's split-K compressor GEMM and the prefill unpack (vllm_packed_bf16_filter_exc is the base's: identical SASS), and packed_bf16_gemm on the narrow 512x10240 and 128x5120 grids (the base's search and launch: identical SASS), which read same at all 16 M (0.986-1.005x) where the first version was 2-7.4% slower. The own mark's screen miss (TP4 M=97..120 0.974-0.994x) is gone: at the same screen set the screen reads same or faster at 97, 107, 112, 120, 128 and 0.994x at 104. The few slower readings on identical SASS (screen s4a2 set TP4 M=6, 17, 24, 104 by 0.2-0.6%; r1 set TP3 M=120 0.950x) are the interval rule's noise: an A/A rerun of the screen and split-K sections (ABBA, 2 boots per arm, same SASS) gives 16 such slower readings in 76 cells (0.2-4.4%), TP4 s4a2 M=6, 17 and 24 among them again (0.4-0.5%: the arms' placement, not their code), while TP3 r1 M=120 reads 1.045x faster there and TP4 r1 M=120 0.956x slower. The PR's own diagnosis that the decode rewrite cuts unpack ALU did not show as time: within 0.5% in the projection and greedy partials at both densities, so it is dropped.",
+ "analysis": {
+  "what_serving_runs": {
+   "packed_vocab_projection (project_head)": "logits processor (sampled requests, log-probabilities) and DSpark's Markov W2 projection: gains kept",
+   "packed_vocab_markov_greedy_partials": "the DSpark Markov head's greedy pairs: the same per-column exception change (kept); not separately timed",
+   "packed_vocab_greedy_partials": "not serving's greedy path on this base (#997's certified screen replaced it); timed as the PR's metric",
+   "certified screen (x_norm, screen, row_thresholds, compact, refine, finish)": "serving's greedy verification: now the base's kernels",
+   "packed_bf16_gemm / packed_bf16_gemm_two": "no serving caller (imported by linear.py, never called): the PR's microbench shapes",
+   "packed_bf16_gemm_splitk / packed_bf16_unpack": "serving's compressor decode and prefill unpack: now the base's kernels"
+  },
+  "why_gate_not_drop": "packed_bf16_gemm has no serving caller, so dropping its change would also be correct; the brief asks to keep the gains where they hold, and the mark names compressor_up. The gate (_PACKED_WIDE_TILES = 32 column tiles of the launch grid) sits between the measured narrow (8, 2) and wide (64, 80) grids, so all four measured shapes keep their better variant; shapes between 8 and 64 tiles are unmeasured.",
+  "pdl_chain_registry": "gemm_packed_bf16 and gemm_packed_bf16_two leave deepseek_v41_pdl_sources.CHAIN because a narrow grid no longer waits; a wide one still waits first, which the plugin checks for every kernel that waits (0 violations in both test runs)"
+ },
+ "notes": [
+  "Measured on spark-ds41f:candidate-50 with the corrected candidate-51 tree mounted (15 files, verified file by file); the c51r1 arm also carries #1001-r1 (TILE_CONFIGS[128] and SCREEN_TILE_CONFIGS[128] num_stages 2), so #963-r1 alone is the same-config (B, C) and same-set (D) comparison.",
+  "h963r1.py = the own-mark run's h963.py with section D run for both screen-config sets on each arm and M 17, 24 added (diff: common/h/h963r1.diff); h963aa.py = h963r1.py restricted by H963_SECTIONS (the A/A rerun).",
+  "Diagnosis boots: gemm 2, vocab 1 (vocab boot 2 dropped to measure the corrected tree first), screen 2. d963.py gained its sab section after the gemm, vocab and sconf runs; those sections are unchanged.",
+  "The stack-repo commit the c51r1 arm was built from (f9a11e3fc, WIP messages) has the same tree as the final commits (e96074f90): only the commit messages changed.",
+  "start_utc in commands.txt is after the GPU lock was taken; other agents' jobs (c53 rework) ran between runs.",
+  "common/h/regs.sh is an abandoned helper (its shared-memory and register greps matched nothing); screenregs.py and sass.py replaced it."
+ ],
+ "patch_sha256": "9140ad19e43ff39c088baa2ee7ef20d7e0b4e281d0888d9a42854362580eb1e4",
+ "apply_check": {
+  "order": "candidate-51's series with the corrected patches: candidate-50's 0762..0777, 0779, 0780 on 1107's patch head, then 0781 (#961), 0782 (#963-r1), 0783 (#987, unchanged), 0784 (#1001-r1)",
+  "how": "the own-mark run's stack.sh in a fresh --shared clone (W/verify-apply): git apply --check --verbose, then git am --committer-date-is-author-date, as bin/spark build prepare applies them",
+  "result": [
+   "OK    0783-perf-dsv41-extend-WO-B-WIDE_DECODE-to-128-rows-and-g.patch sha256=7a29c933563e085076c8d9548b4e84e03b3c0df41c53f409158e4d588fa609a5  commit=28c8a04585e1b84e6497fcb0a53e891f99d72f78 tree=808d2f09cf78b6aca58d20f20e4c8cffdc9d429d files=3",
+   "      git apply: Hunk #1 succeeded at 1048 (offset 46 lines).",
+   "      git apply: Hunk #1 succeeded at 2717 (offset 46 lines).",
+   "      git apply: Hunk #2 succeeded at 2726 (offset 46 lines).",
+   "      git apply: Hunk #3 succeeded at 2905 (offset 46 lines).",
+   "OK    0784-Match-128-row-vocab-head-tile-pipeline-stages.patch sha256=0ad547d388f9daeda2c93c98a9dae978b843a2a637155e39cd26ec01f9a5e2e8  commit=a1ef9b6c55c15650934a3534622f7dc5e3b1b810 tree=35cd2a0e87a6b7a0c61c6c81dbe875ac1e7da005 files=2",
+   "head a1ef9b6c55c15650934a3534622f7dc5e3b1b810 tree 35cd2a0e87a6b7a0c61c6c81dbe875ac1e7da005 patches_after_base 4 patches_after_1107 22",
+   "git diff --check 19f2c20ed4d6..HEAD: clean"
+  ],
+  "tree": "35cd2a0e87a6b7a0c61c6c81dbe875ac1e7da005, the tree measured as the c51r1 arm; git diff --check 19f2c20ed4d6..HEAD clean"
+ },
+ "overlay": {
+  "files": {
+   "vllm/models/deepseek_v4_1/tilelang/gemm.py": "44cc9f431dfee315bc897a53089397b547f6a389b008e17efed227308e6c334a",
+   "vllm/models/deepseek_v4_1/tilelang/vocab.py": "75ec700072fef6b24479e1e0c1902a56ce2461be783298eaa69870749bae948c"
+  },
+  "state": "each file as the corrected candidate-51 tree (35cd2a0e87a6, after 0781, 0782 #963-r1, 0783 #987, 0784 #1001-r1) holds it, the bytes the c51r1 arm mounted (equal SHA-256): gemm.py includes #987's WIDE_DECODE/DECODE_FP8_CONFIGS entries, vocab.py #1001-r1's tile configs. The arm mounted 15 files in all (common/files-c51r1.txt); test files are in the patches."
+ },
+ "receipts": {
+  "bench": "raw/pack12-*.txt, raw/json/pack12-*.json; analysis.json / analysis.txt (a963r1.py)",
+  "aa": "raw/aa-DE-*.txt, raw/json/aa-DE-*.json; analysis-aa.json / analysis-aa.txt (aaa.py)",
+  "diagnosis": "raw/diag/d963-{gemm,vocab,screen}-boot*.{txt,json}; raw/diag/adiag-*.txt",
+  "sass": "common/verify/sass-{base,c51r1}.txt (common/h/sass.py)",
+  "tests": "raw/pytest-c51r1-boot{1,2}.txt; common/verify/smoke-new-tests-c51r1.txt"
+ }
+}

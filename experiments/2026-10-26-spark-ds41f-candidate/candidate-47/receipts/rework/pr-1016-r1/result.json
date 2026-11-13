@@ -1,0 +1,2637 @@
+{
+ "pr": 1016,
+ "round": 1,
+ "verdict": "corrected-meets-mark",
+ "mark": "#1016's chained Q-B bench against 1107's actual configuration (tile-contiguous weights, threads=64 at (4096, 1280) block_M=64), CUDA-graph replay: gain where it claims, slower than 1107 in no M cell in any L2 state the bench measures (warm, cold, NEXT), bit-exact",
+ "patch": "0768-perf-dsv41-align-qb-and-indexer-qb-tile-contiguous-decode.patch",
+ "patch_sha256": "a2e890cb07352a5321b8976becd2bcd0e7623dd4d04860792c52dbfdd109da53",
+ "patch_applies": "in place of candidate-47's 0768 on the 1107 tree: 0762..0767, this 0768, 0769 all pass git apply --check and apply (setup_r1.sh, setup-r1.log); it changes only gemm.py and test_deepseek_v41_tilelang_linear.py, which no other patch touches",
+ "change": "1107's DECODE_FP8_CONFIGS plus one row change from #1016: the 64-row Q-B tiles of (12288, 1280) and (8192, 1280) go from block_N=64 (8192: num_stages=3) to block_N=128, block_K=128, num_stages=2. Everything else stays 1107's: the 16- and 32-row tiles, (4096, 1280) with threads=64 at block_M=64, and TILE_CONTIGUOUS_FP8 (no 16384/6144/2048 entries). The test asserts the 64-row tile of N >= 8192 is 128 x 128.",
+ "claim": "TP3/TP4/TP5 Q-B decode at 33..64 rows with the weights warm in L2. On the chained bench pair: TP4 -3.1 us paired (consistent in all four processes, x-img -2.9 us) and TP3 -5.1 us paired (three of four processes; x-img -7.7 us, beyond TP3's 5.2 us warm A/A floor). With the indexer kernel as the model builds it: TP4 -3.0 us (beyond the interval) and TP3 -3.9 us (within the across-process interval). Cold and NEXT: no change within the interval. M = 1..24: the same kernels as 1107.",
+ "outcome_tally": {
+  "same-kernels": 93,
+  "gain": 2,
+  "gain (x-img boot range; one process paired off)": 2,
+  "within": 8,
+  "slower": 0
+ },
+ "host": "sp4 (spark-0012), NVIDIA GB10, driver 580.178.04; docker ps empty and ~/spark-hold.json absent before every run (recorded inside /tmp/spark-lab-gpu.lock in commands.txt)",
+ "image": "spark-ds41f:1107 = sha256:3f32a962ce04b7c8d85337cd427a8946b8b6bcaadd97cc8d8a8cd14e8d68a6ce",
+ "arms": {
+  "no1016": "the image + candidate-47's 26 files with 0762..0767 and 0769 (no #1016), read-only; gemm.py is 1107's (546dbbcc1812)",
+  "r1": "the image + the same 26 files with 0762..0767, this 0768, 0769; gemm.py 3a7ecb3a49f6"
+ },
+ "method": "One session on sp4. The ABBA order is no1016 boot1, r1 boot1, r1 boot2, no1016 boot2 (each a fresh container; h1016r1.py MODE=mark), followed by the pytest suite on r1 for two boots. A screening run (MODE=screen, no1016 overlay) came before the ABBA and chose the change. Each process times several config tables on the same weights, interleaved window by window in alternating order: 1107's real table, #1016 as submitted, r1, 1107 plus only the threads=64 drop, and the image's fp8_decode_config. Identical kernels are timed once per window. Each (pair, M) block takes 40 windows by CUDA-graph replay: warm (20 back-to-back pairs in one graph), cold (48 MiB flush, then one replay) and NEXT (flush, the NEXT-window L2 prefetch of the pair's weights and scales, join, then one replay). Before each block the GPU runs 100 ms or more of that block's own graph. Pairs: mark_tp4/mark_tp3 are the own-mark pair (h1016's), whose indexer kernel is built from the (4096, 1280) decode tiles as the PR bench builds it. prod_tp4/prod_tp3 are the same Q-B with the indexer kernel built exactly as linear.py builds decode_rope_mxfp4. qb_tp8 is the TP8 Q-B plain decode, the model's only other user of the (4096, 1280) tiles. The PDL LayerChain (production builders, Q-B 8192) runs at c1/c8/c8x6.",
+ "outcome_rule": "same-kernels where r1 compiles 1107's kernels. Otherwise, gain or slower when the paired r1-1107 delta pooled over the four processes lies beyond the larger of its within-process CI95 and its across-process CI95 (t, 3 df), and the cross-image delta has the same sign. 'gain (x-img boot range; one process paired off)' when the within-process CI and separated cross-image boot ranges agree but one process does not. Otherwise within.",
+ "cells": {
+  "mark_tp4": {
+   "1": {
+    "r1_same_kernels_as_1107": true,
+    "bits_equal_across_images": true,
+    "all_arms_torch_equal_in_process": true,
+    "warm": {
+     "outcome": "same-kernels",
+     "x_img_us": {
+      "no1016_b1_b2": [
+       "21.30\u00b10.27",
+       "21.68\u00b10.33"
+      ],
+      "r1_b1_b2": [
+       "22.08\u00b10.53",
+       "22.96\u00b10.85"
+      ],
+      "delta": 1.03,
+      "ci95": 0.54,
+      "boot_range": "slower"
+     },
+     "paired_r1_minus_1107_us": "same-kernels",
+     "paired_original_1016_minus_1107_us": {
+      "pooled": -2.21,
+      "ci95_within": 0.36,
+      "ci95_across_processes": 0.57
+     }
+    },
+    "cold": {
+     "outcome": "same-kernels",
+     "x_img_us": {
+      "no1016_b1_b2": [
+       "108.18\u00b11.29",
+       "106.14\u00b10.30"
+      ],
+      "r1_b1_b2": [
+       "108.04\u00b12.04",
+       "106.88\u00b13.26"
+      ],
+      "delta": 0.3,
+      "ci95": 2.03,
+      "boot_range": "within"
+     },
+     "paired_r1_minus_1107_us": "same-kernels",
+     "paired_original_1016_minus_1107_us": {
+      "pooled": 0.37,
+      "ci95_within": 1.53,
+      "ci95_across_processes": 2.84
+     }
+    },
+    "next": {
+     "outcome": "same-kernels",
+     "x_img_us": {
+      "no1016_b1_b2": [
+       "108.53\u00b11.77",
+       "105.99\u00b10.31"
+      ],
+      "r1_b1_b2": [
+       "107.30\u00b11.35",
+       "104.54\u00b10.74"
+      ],
+      "delta": -1.33,
+      "ci95": 1.18,
+      "boot_range": "within"
+     },
+     "paired_r1_minus_1107_us": "same-kernels",
+     "paired_original_1016_minus_1107_us": {
+      "pooled": 1.24,
+      "ci95_within": 1.0,
+      "ci95_across_processes": 0.63
+     }
+    }
+   },
+   "2": {
+    "r1_same_kernels_as_1107": true,
+    "bits_equal_across_images": true,
+    "all_arms_torch_equal_in_process": true,
+    "warm": {
+     "outcome": "same-kernels",
+     "x_img_us": {
+      "no1016_b1_b2": [
+       "22.35\u00b10.48",
+       "22.93\u00b10.49"
+      ],
+      "r1_b1_b2": [
+       "23.62\u00b10.79",
+       "23.05\u00b10.70"
+      ],
+      "delta": 0.7,
+      "ci95": 0.63,
+      "boot_range": "slower"
+     },
+     "paired_r1_minus_1107_us": "same-kernels",
+     "paired_original_1016_minus_1107_us": {
+      "pooled": -2.41,
+      "ci95_within": 0.41,
+      "ci95_across_processes": 0.44
+     }
+    },
+    "cold": {
+     "outcome": "same-kernels",
+     "x_img_us": {
+      "no1016_b1_b2": [
+       "109.32\u00b12.58",
+       "106.30\u00b10.38"
+      ],
+      "r1_b1_b2": [
+       "108.43\u00b11.92",
+       "103.99\u00b10.44"
+      ],
+      "delta": -1.6,
+      "ci95": 1.63,
+      "boot_range": "within"
+     },
+     "paired_r1_minus_1107_us": "same-kernels",
+     "paired_original_1016_minus_1107_us": {
+      "pooled": 0.14,
+      "ci95_within": 0.94,
+      "ci95_across_processes": 1.02
+     }
+    },
+    "next": {
+     "outcome": "same-kernels",
+     "x_img_us": {
+      "no1016_b1_b2": [
+       "109.12\u00b12.24",
+       "106.28\u00b10.40"
+      ],
+      "r1_b1_b2": [
+       "109.16\u00b12.17",
+       "104.45\u00b10.70"
+      ],
+      "delta": -0.9,
+      "ci95": 1.61,
+      "boot_range": "within"
+     },
+     "paired_r1_minus_1107_us": "same-kernels",
+     "paired_original_1016_minus_1107_us": {
+      "pooled": 0.1,
+      "ci95_within": 1.16,
+      "ci95_across_processes": 2.22
+     }
+    }
+   },
+   "3": {
+    "r1_same_kernels_as_1107": true,
+    "bits_equal_across_images": true,
+    "all_arms_torch_equal_in_process": true,
+    "warm": {
+     "outcome": "same-kernels",
+     "x_img_us": {
+      "no1016_b1_b2": [
+       "21.43\u00b10.35",
+       "22.27\u00b10.59"
+      ],
+      "r1_b1_b2": [
+       "22.06\u00b10.44",
+       "22.37\u00b10.65"
+      ],
+      "delta": 0.37,
+      "ci95": 0.52,
+      "boot_range": "within"
+     },
+     "paired_r1_minus_1107_us": "same-kernels",
+     "paired_original_1016_minus_1107_us": {
+      "pooled": -1.86,
+      "ci95_within": 0.41,
+      "ci95_across_processes": 0.41
+     }
+    },
+    "cold": {
+     "outcome": "same-kernels",
+     "x_img_us": {
+      "no1016_b1_b2": [
+       "107.40\u00b10.51",
+       "107.64\u00b11.76"
+      ],
+      "r1_b1_b2": [
+       "107.93\u00b11.08",
+       "104.57\u00b10.28"
+      ],
+      "delta": -1.27,
+      "ci95": 1.07,
+      "boot_range": "within"
+     },
+     "paired_r1_minus_1107_us": "same-kernels",
+     "paired_original_1016_minus_1107_us": {
+      "pooled": 1.19,
+      "ci95_within": 1.06,
+      "ci95_across_processes": 0.78
+     }
+    },
+    "next": {
+     "outcome": "same-kernels",
+     "x_img_us": {
+      "no1016_b1_b2": [
+       "108.96\u00b11.83",
+       "107.65\u00b11.93"
+      ],
+      "r1_b1_b2": [
+       "108.97\u00b12.04",
+       "104.72\u00b10.56"
+      ],
+      "delta": -1.45,
+      "ci95": 1.7,
+      "boot_range": "within"
+     },
+     "paired_r1_minus_1107_us": "same-kernels",
+     "paired_original_1016_minus_1107_us": {
+      "pooled": 0.6,
+      "ci95_within": 1.13,
+      "ci95_across_processes": 1.83
+     }
+    }
+   },
+   "6": {
+    "r1_same_kernels_as_1107": true,
+    "bits_equal_across_images": true,
+    "all_arms_torch_equal_in_process": true,
+    "warm": {
+     "outcome": "same-kernels",
+     "x_img_us": {
+      "no1016_b1_b2": [
+       "20.81\u00b10.31",
+       "21.43\u00b10.42"
+      ],
+      "r1_b1_b2": [
+       "21.93\u00b10.71",
+       "21.71\u00b10.43"
+      ],
+      "delta": 0.7,
+      "ci95": 0.49,
+      "boot_range": "slower"
+     },
+     "paired_r1_minus_1107_us": "same-kernels",
+     "paired_original_1016_minus_1107_us": {
+      "pooled": -0.87,
+      "ci95_within": 0.4,
+      "ci95_across_processes": 0.71
+     }
+    },
+    "cold": {
+     "outcome": "same-kernels",
+     "x_img_us": {
+      "no1016_b1_b2": [
+       "108.11\u00b10.33",
+       "108.48\u00b13.00"
+      ],
+      "r1_b1_b2": [
+       "107.97\u00b10.85",
+       "107.27\u00b13.02"
+      ],
+      "delta": -0.68,
+      "ci95": 2.18,
+      "boot_range": "gain"
+     },
+     "paired_r1_minus_1107_us": "same-kernels",
+     "paired_original_1016_minus_1107_us": {
+      "pooled": -0.0,
+      "ci95_within": 1.21,
+      "ci95_across_processes": 1.82
+     }
+    },
+    "next": {
+     "outcome": "same-kernels",
+     "x_img_us": {
+      "no1016_b1_b2": [
+       "108.33\u00b10.71",
+       "107.68\u00b11.15"
+      ],
+      "r1_b1_b2": [
+       "108.31\u00b11.09",
+       "106.08\u00b11.07"
+      ],
+      "delta": -0.82,
+      "ci95": 1.02,
+      "boot_range": "within"
+     },
+     "paired_r1_minus_1107_us": "same-kernels",
+     "paired_original_1016_minus_1107_us": {
+      "pooled": 0.82,
+      "ci95_within": 1.01,
+      "ci95_across_processes": 1.53
+     }
+    }
+   },
+   "12": {
+    "r1_same_kernels_as_1107": true,
+    "bits_equal_across_images": true,
+    "all_arms_torch_equal_in_process": true,
+    "warm": {
+     "outcome": "same-kernels",
+     "x_img_us": {
+      "no1016_b1_b2": [
+       "19.16\u00b10.92",
+       "18.94\u00b10.60"
+      ],
+      "r1_b1_b2": [
+       "18.90\u00b10.52",
+       "19.32\u00b10.82"
+      ],
+      "delta": 0.06,
+      "ci95": 0.73,
+      "boot_range": "within"
+     },
+     "paired_r1_minus_1107_us": "same-kernels",
+     "paired_original_1016_minus_1107_us": {
+      "pooled": 0.38,
+      "ci95_within": 0.48,
+      "ci95_across_processes": 0.78
+     }
+    },
+    "cold": {
+     "outcome": "same-kernels",
+     "x_img_us": {
+      "no1016_b1_b2": [
+       "108.98\u00b11.11",
+       "108.08\u00b10.92"
+      ],
+      "r1_b1_b2": [
+       "109.09\u00b11.51",
+       "107.65\u00b12.03"
+      ],
+      "delta": -0.16,
+      "ci95": 1.46,
+      "boot_range": "within"
+     },
+     "paired_r1_minus_1107_us": "same-kernels",
+     "paired_original_1016_minus_1107_us": {
+      "pooled": 2.93,
+      "ci95_within": 1.39,
+      "ci95_across_processes": 2.03
+     }
+    },
+    "next": {
+     "outcome": "same-kernels",
+     "x_img_us": {
+      "no1016_b1_b2": [
+       "108.59\u00b10.50",
+       "107.57\u00b10.62"
+      ],
+      "r1_b1_b2": [
+       "109.21\u00b11.00",
+       "109.04\u00b12.81"
+      ],
+      "delta": 1.04,
+      "ci95": 1.54,
+      "boot_range": "slower"
+     },
+     "paired_r1_minus_1107_us": "same-kernels",
+     "paired_original_1016_minus_1107_us": {
+      "pooled": 1.7,
+      "ci95_within": 1.08,
+      "ci95_across_processes": 3.12
+     }
+    }
+   },
+   "24": {
+    "r1_same_kernels_as_1107": true,
+    "bits_equal_across_images": true,
+    "all_arms_torch_equal_in_process": true,
+    "warm": {
+     "outcome": "same-kernels",
+     "x_img_us": {
+      "no1016_b1_b2": [
+       "24.65\u00b10.23",
+       "25.67\u00b10.66"
+      ],
+      "r1_b1_b2": [
+       "24.92\u00b10.47",
+       "25.20\u00b10.42"
+      ],
+      "delta": -0.09,
+      "ci95": 0.47,
+      "boot_range": "within"
+     },
+     "paired_r1_minus_1107_us": "same-kernels",
+     "paired_original_1016_minus_1107_us": {
+      "pooled": -0.48,
+      "ci95_within": 0.31,
+      "ci95_across_processes": 0.82
+     }
+    },
+    "cold": {
+     "outcome": "same-kernels",
+     "x_img_us": {
+      "no1016_b1_b2": [
+       "117.51\u00b12.48",
+       "118.94\u00b13.97"
+      ],
+      "r1_b1_b2": [
+       "117.94\u00b13.06",
+       "114.81\u00b13.43"
+      ],
+      "delta": -1.85,
+      "ci95": 3.28,
+      "boot_range": "within"
+     },
+     "paired_r1_minus_1107_us": "same-kernels",
+     "paired_original_1016_minus_1107_us": {
+      "pooled": -1.93,
+      "ci95_within": 1.52,
+      "ci95_across_processes": 2.47
+     }
+    },
+    "next": {
+     "outcome": "same-kernels",
+     "x_img_us": {
+      "no1016_b1_b2": [
+       "118.63\u00b12.89",
+       "116.13\u00b12.12"
+      ],
+      "r1_b1_b2": [
+       "115.58\u00b11.14",
+       "113.47\u00b10.56"
+      ],
+      "delta": -2.85,
+      "ci95": 1.9,
+      "boot_range": "gain"
+     },
+     "paired_r1_minus_1107_us": "same-kernels",
+     "paired_original_1016_minus_1107_us": {
+      "pooled": 0.25,
+      "ci95_within": 1.79,
+      "ci95_across_processes": 3.3
+     }
+    }
+   },
+   "48": {
+    "r1_same_kernels_as_1107": false,
+    "bits_equal_across_images": true,
+    "all_arms_torch_equal_in_process": true,
+    "warm": {
+     "outcome": "gain",
+     "x_img_us": {
+      "no1016_b1_b2": [
+       "45.25\u00b10.41",
+       "45.64\u00b10.41"
+      ],
+      "r1_b1_b2": [
+       "42.33\u00b10.42",
+       "42.78\u00b10.69"
+      ],
+      "delta": -2.89,
+      "ci95": 0.5,
+      "boot_range": "gain"
+     },
+     "paired_r1_minus_1107_us": {
+      "per_process": [
+       "-3.07\u00b10.42",
+       "-2.75\u00b10.68",
+       "-3.44\u00b10.54",
+       "-3.32\u00b10.69"
+      ],
+      "pooled": -3.14,
+      "ci95_within": 0.3,
+      "ci95_across_processes": 0.49
+     },
+     "paired_original_1016_minus_1107_us": {
+      "pooled": -7.47,
+      "ci95_within": 0.26,
+      "ci95_across_processes": 0.69
+     }
+    },
+    "cold": {
+     "outcome": "within",
+     "x_img_us": {
+      "no1016_b1_b2": [
+       "128.53\u00b15.30",
+       "124.92\u00b11.62"
+      ],
+      "r1_b1_b2": [
+       "124.72\u00b10.42",
+       "122.28\u00b10.37"
+      ],
+      "delta": -3.22,
+      "ci95": 2.79,
+      "boot_range": "gain"
+     },
+     "paired_r1_minus_1107_us": {
+      "per_process": [
+       "-2.97\u00b15.37",
+       "+4.02\u00b16.50",
+       "-0.37\u00b10.56",
+       "-3.88\u00b14.83"
+      ],
+      "pooled": -0.8,
+      "ci95_within": 2.43,
+      "ci95_across_processes": 5.64
+     },
+     "paired_original_1016_minus_1107_us": {
+      "pooled": -8.07,
+      "ci95_within": 1.59,
+      "ci95_across_processes": 2.75
+     }
+    },
+    "next": {
+     "outcome": "within",
+     "x_img_us": {
+      "no1016_b1_b2": [
+       "128.56\u00b14.09",
+       "124.45\u00b10.63"
+      ],
+      "r1_b1_b2": [
+       "125.11\u00b11.00",
+       "122.30\u00b10.38"
+      ],
+      "delta": -2.8,
+      "ci95": 2.14,
+      "boot_range": "within"
+     },
+     "paired_r1_minus_1107_us": {
+      "per_process": [
+       "-2.61\u00b14.30",
+       "+0.94\u00b11.81",
+       "-0.15\u00b11.17",
+       "-1.52\u00b10.53"
+      ],
+      "pooled": -0.84,
+      "ci95_within": 1.21,
+      "ci95_across_processes": 2.47
+     },
+     "paired_original_1016_minus_1107_us": {
+      "pooled": -7.96,
+      "ci95_within": 1.22,
+      "ci95_across_processes": 1.87
+     }
+    }
+   }
+  },
+  "mark_tp3": {
+   "1": {
+    "r1_same_kernels_as_1107": true,
+    "bits_equal_across_images": true,
+    "all_arms_torch_equal_in_process": true,
+    "warm": {
+     "outcome": "same-kernels",
+     "x_img_us": {
+      "no1016_b1_b2": [
+       "28.61\u00b10.88",
+       "31.22\u00b10.57"
+      ],
+      "r1_b1_b2": [
+       "27.43\u00b10.67",
+       "28.35\u00b10.74"
+      ],
+      "delta": -2.03,
+      "ci95": 0.72,
+      "boot_range": "gain"
+     },
+     "paired_r1_minus_1107_us": "same-kernels",
+     "paired_original_1016_minus_1107_us": {
+      "pooled": -1.96,
+      "ci95_within": 0.43,
+      "ci95_across_processes": 0.99
+     }
+    },
+    "cold": {
+     "outcome": "same-kernels",
+     "x_img_us": {
+      "no1016_b1_b2": [
+       "139.67\u00b11.80",
+       "139.81\u00b13.32"
+      ],
+      "r1_b1_b2": [
+       "137.99\u00b10.54",
+       "139.16\u00b10.56"
+      ],
+      "delta": -1.16,
+      "ci95": 1.93,
+      "boot_range": "gain"
+     },
+     "paired_r1_minus_1107_us": "same-kernels",
+     "paired_original_1016_minus_1107_us": {
+      "pooled": 0.37,
+      "ci95_within": 1.29,
+      "ci95_across_processes": 1.99
+     }
+    },
+    "next": {
+     "outcome": "same-kernels",
+     "x_img_us": {
+      "no1016_b1_b2": [
+       "139.80\u00b12.06",
+       "140.00\u00b12.85"
+      ],
+      "r1_b1_b2": [
+       "137.50\u00b10.28",
+       "140.35\u00b11.87"
+      ],
+      "delta": -0.97,
+      "ci95": 2.0,
+      "boot_range": "within"
+     },
+     "paired_r1_minus_1107_us": "same-kernels",
+     "paired_original_1016_minus_1107_us": {
+      "pooled": -0.01,
+      "ci95_within": 1.31,
+      "ci95_across_processes": 1.38
+     }
+    }
+   },
+   "2": {
+    "r1_same_kernels_as_1107": true,
+    "bits_equal_across_images": true,
+    "all_arms_torch_equal_in_process": true,
+    "warm": {
+     "outcome": "same-kernels",
+     "x_img_us": {
+      "no1016_b1_b2": [
+       "29.48\u00b10.93",
+       "32.72\u00b11.14"
+      ],
+      "r1_b1_b2": [
+       "28.70\u00b10.57",
+       "29.52\u00b10.88"
+      ],
+      "delta": -1.99,
+      "ci95": 0.9,
+      "boot_range": "within"
+     },
+     "paired_r1_minus_1107_us": "same-kernels",
+     "paired_original_1016_minus_1107_us": {
+      "pooled": -3.02,
+      "ci95_within": 0.51,
+      "ci95_across_processes": 0.45
+     }
+    },
+    "cold": {
+     "outcome": "same-kernels",
+     "x_img_us": {
+      "no1016_b1_b2": [
+       "140.44\u00b12.38",
+       "140.39\u00b12.37"
+      ],
+      "r1_b1_b2": [
+       "139.67\u00b12.89",
+       "140.85\u00b11.72"
+      ],
+      "delta": -0.16,
+      "ci95": 2.38,
+      "boot_range": "within"
+     },
+     "paired_r1_minus_1107_us": "same-kernels",
+     "paired_original_1016_minus_1107_us": {
+      "pooled": -1.75,
+      "ci95_within": 1.11,
+      "ci95_across_processes": 1.2
+     }
+    },
+    "next": {
+     "outcome": "same-kernels",
+     "x_img_us": {
+      "no1016_b1_b2": [
+       "139.86\u00b11.59",
+       "138.75\u00b11.08"
+      ],
+      "r1_b1_b2": [
+       "139.65\u00b11.75",
+       "139.86\u00b10.88"
+      ],
+      "delta": 0.45,
+      "ci95": 1.37,
+      "boot_range": "within"
+     },
+     "paired_r1_minus_1107_us": "same-kernels",
+     "paired_original_1016_minus_1107_us": {
+      "pooled": -0.17,
+      "ci95_within": 1.09,
+      "ci95_across_processes": 0.27
+     }
+    }
+   },
+   "3": {
+    "r1_same_kernels_as_1107": true,
+    "bits_equal_across_images": true,
+    "all_arms_torch_equal_in_process": true,
+    "warm": {
+     "outcome": "same-kernels",
+     "x_img_us": {
+      "no1016_b1_b2": [
+       "28.21\u00b10.98",
+       "34.59\u00b10.88"
+      ],
+      "r1_b1_b2": [
+       "27.53\u00b10.59",
+       "28.72\u00b11.10"
+      ],
+      "delta": -3.28,
+      "ci95": 0.91,
+      "boot_range": "within"
+     },
+     "paired_r1_minus_1107_us": "same-kernels",
+     "paired_original_1016_minus_1107_us": {
+      "pooled": -2.75,
+      "ci95_within": 0.55,
+      "ci95_across_processes": 2.67
+     }
+    },
+    "cold": {
+     "outcome": "same-kernels",
+     "x_img_us": {
+      "no1016_b1_b2": [
+       "139.90\u00b11.27",
+       "138.05\u00b10.47"
+      ],
+      "r1_b1_b2": [
+       "141.73\u00b12.53",
+       "141.50\u00b12.46"
+      ],
+      "delta": 2.64,
+      "ci95": 1.89,
+      "boot_range": "slower"
+     },
+     "paired_r1_minus_1107_us": "same-kernels",
+     "paired_original_1016_minus_1107_us": {
+      "pooled": -0.62,
+      "ci95_within": 1.21,
+      "ci95_across_processes": 1.5
+     }
+    },
+    "next": {
+     "outcome": "same-kernels",
+     "x_img_us": {
+      "no1016_b1_b2": [
+       "140.53\u00b12.43",
+       "137.87\u00b10.36"
+      ],
+      "r1_b1_b2": [
+       "140.53\u00b11.98",
+       "140.29\u00b11.42"
+      ],
+      "delta": 1.21,
+      "ci95": 1.73,
+      "boot_range": "within"
+     },
+     "paired_r1_minus_1107_us": "same-kernels",
+     "paired_original_1016_minus_1107_us": {
+      "pooled": -0.52,
+      "ci95_within": 0.98,
+      "ci95_across_processes": 1.12
+     }
+    }
+   },
+   "6": {
+    "r1_same_kernels_as_1107": true,
+    "bits_equal_across_images": true,
+    "all_arms_torch_equal_in_process": true,
+    "warm": {
+     "outcome": "same-kernels",
+     "x_img_us": {
+      "no1016_b1_b2": [
+       "27.57\u00b10.98",
+       "31.80\u00b10.92"
+      ],
+      "r1_b1_b2": [
+       "27.51\u00b10.99",
+       "27.17\u00b10.92"
+      ],
+      "delta": -2.35,
+      "ci95": 0.95,
+      "boot_range": "gain"
+     },
+     "paired_r1_minus_1107_us": "same-kernels",
+     "paired_original_1016_minus_1107_us": {
+      "pooled": -1.1,
+      "ci95_within": 0.62,
+      "ci95_across_processes": 0.63
+     }
+    },
+    "cold": {
+     "outcome": "same-kernels",
+     "x_img_us": {
+      "no1016_b1_b2": [
+       "138.66\u00b10.37",
+       "139.35\u00b11.70"
+      ],
+      "r1_b1_b2": [
+       "138.82\u00b10.35",
+       "139.37\u00b10.32"
+      ],
+      "delta": 0.09,
+      "ci95": 0.9,
+      "boot_range": "within"
+     },
+     "paired_r1_minus_1107_us": "same-kernels",
+     "paired_original_1016_minus_1107_us": {
+      "pooled": 1.84,
+      "ci95_within": 0.99,
+      "ci95_across_processes": 1.65
+     }
+    },
+    "next": {
+     "outcome": "same-kernels",
+     "x_img_us": {
+      "no1016_b1_b2": [
+       "138.66\u00b10.43",
+       "138.58\u00b10.92"
+      ],
+      "r1_b1_b2": [
+       "139.09\u00b10.72",
+       "139.89\u00b10.66"
+      ],
+      "delta": 0.87,
+      "ci95": 0.7,
+      "boot_range": "slower"
+     },
+     "paired_r1_minus_1107_us": "same-kernels",
+     "paired_original_1016_minus_1107_us": {
+      "pooled": 2.25,
+      "ci95_within": 1.0,
+      "ci95_across_processes": 1.8
+     }
+    }
+   },
+   "12": {
+    "r1_same_kernels_as_1107": true,
+    "bits_equal_across_images": true,
+    "all_arms_torch_equal_in_process": true,
+    "warm": {
+     "outcome": "same-kernels",
+     "x_img_us": {
+      "no1016_b1_b2": [
+       "25.47\u00b11.05",
+       "31.54\u00b10.59"
+      ],
+      "r1_b1_b2": [
+       "27.51\u00b11.17",
+       "25.41\u00b11.41"
+      ],
+      "delta": -2.05,
+      "ci95": 1.09,
+      "boot_range": "within"
+     },
+     "paired_r1_minus_1107_us": "same-kernels",
+     "paired_original_1016_minus_1107_us": {
+      "pooled": -0.17,
+      "ci95_within": 0.6,
+      "ci95_across_processes": 2.68
+     }
+    },
+    "cold": {
+     "outcome": "same-kernels",
+     "x_img_us": {
+      "no1016_b1_b2": [
+       "147.80\u00b14.75",
+       "142.78\u00b13.69"
+      ],
+      "r1_b1_b2": [
+       "140.20\u00b11.13",
+       "140.72\u00b10.42"
+      ],
+      "delta": -4.83,
+      "ci95": 3.07,
+      "boot_range": "gain"
+     },
+     "paired_r1_minus_1107_us": "same-kernels",
+     "paired_original_1016_minus_1107_us": {
+      "pooled": 0.87,
+      "ci95_within": 1.65,
+      "ci95_across_processes": 3.64
+     }
+    },
+    "next": {
+     "outcome": "same-kernels",
+     "x_img_us": {
+      "no1016_b1_b2": [
+       "143.28\u00b11.95",
+       "139.77\u00b10.96"
+      ],
+      "r1_b1_b2": [
+       "141.53\u00b12.77",
+       "142.03\u00b11.86"
+      ],
+      "delta": 0.25,
+      "ci95": 1.99,
+      "boot_range": "within"
+     },
+     "paired_r1_minus_1107_us": "same-kernels",
+     "paired_original_1016_minus_1107_us": {
+      "pooled": 2.04,
+      "ci95_within": 1.16,
+      "ci95_across_processes": 2.05
+     }
+    }
+   },
+   "24": {
+    "r1_same_kernels_as_1107": true,
+    "bits_equal_across_images": true,
+    "all_arms_torch_equal_in_process": true,
+    "warm": {
+     "outcome": "same-kernels",
+     "x_img_us": {
+      "no1016_b1_b2": [
+       "33.08\u00b10.64",
+       "41.89\u00b10.86"
+      ],
+      "r1_b1_b2": [
+       "32.45\u00b10.87",
+       "32.10\u00b10.47"
+      ],
+      "delta": -5.21,
+      "ci95": 0.73,
+      "boot_range": "gain"
+     },
+     "paired_r1_minus_1107_us": "same-kernels",
+     "paired_original_1016_minus_1107_us": {
+      "pooled": 0.07,
+      "ci95_within": 0.4,
+      "ci95_across_processes": 2.9
+     }
+    },
+    "cold": {
+     "outcome": "same-kernels",
+     "x_img_us": {
+      "no1016_b1_b2": [
+       "149.69\u00b12.92",
+       "148.80\u00b11.79"
+      ],
+      "r1_b1_b2": [
+       "151.18\u00b13.25",
+       "151.62\u00b13.79"
+      ],
+      "delta": 2.15,
+      "ci95": 3.03,
+      "boot_range": "slower"
+     },
+     "paired_r1_minus_1107_us": "same-kernels",
+     "paired_original_1016_minus_1107_us": {
+      "pooled": -1.34,
+      "ci95_within": 1.72,
+      "ci95_across_processes": 2.43
+     }
+    },
+    "next": {
+     "outcome": "same-kernels",
+     "x_img_us": {
+      "no1016_b1_b2": [
+       "147.67\u00b11.07",
+       "150.94\u00b13.26"
+      ],
+      "r1_b1_b2": [
+       "150.32\u00b12.25",
+       "148.39\u00b10.81"
+      ],
+      "delta": 0.05,
+      "ci95": 2.09,
+      "boot_range": "within"
+     },
+     "paired_r1_minus_1107_us": "same-kernels",
+     "paired_original_1016_minus_1107_us": {
+      "pooled": -0.1,
+      "ci95_within": 1.35,
+      "ci95_across_processes": 2.86
+     }
+    }
+   },
+   "48": {
+    "r1_same_kernels_as_1107": false,
+    "bits_equal_across_images": true,
+    "all_arms_torch_equal_in_process": true,
+    "warm": {
+     "outcome": "gain (x-img boot range; one process paired off)",
+     "x_img_us": {
+      "no1016_b1_b2": [
+       "57.14\u00b10.89",
+       "57.21\u00b10.81"
+      ],
+      "r1_b1_b2": [
+       "50.26\u00b10.87",
+       "48.68\u00b10.20"
+      ],
+      "delta": -7.7,
+      "ci95": 0.75,
+      "boot_range": "gain"
+     },
+     "paired_r1_minus_1107_us": {
+      "per_process": [
+       "-6.21\u00b10.90",
+       "+2.02\u00b11.06",
+       "-7.53\u00b10.87",
+       "-8.84\u00b10.78"
+      ],
+      "pooled": -5.14,
+      "ci95_within": 0.45,
+      "ci95_across_processes": 7.78
+     },
+     "paired_original_1016_minus_1107_us": {
+      "pooled": -9.31,
+      "ci95_within": 0.41,
+      "ci95_across_processes": 4.54
+     }
+    },
+    "cold": {
+     "outcome": "within",
+     "x_img_us": {
+      "no1016_b1_b2": [
+       "157.81\u00b13.08",
+       "158.61\u00b12.72"
+      ],
+      "r1_b1_b2": [
+       "158.39\u00b13.32",
+       "157.16\u00b10.34"
+      ],
+      "delta": -0.44,
+      "ci95": 2.65,
+      "boot_range": "within"
+     },
+     "paired_r1_minus_1107_us": {
+      "per_process": [
+       "-1.21\u00b12.98",
+       "+1.77\u00b14.73",
+       "+3.00\u00b13.33",
+       "-0.66\u00b10.51"
+      ],
+      "pooled": 0.73,
+      "ci95_within": 1.63,
+      "ci95_across_processes": 3.17
+     },
+     "paired_original_1016_minus_1107_us": {
+      "pooled": -7.08,
+      "ci95_within": 1.51,
+      "ci95_across_processes": 2.26
+     }
+    },
+    "next": {
+     "outcome": "within",
+     "x_img_us": {
+      "no1016_b1_b2": [
+       "157.68\u00b12.60",
+       "157.74\u00b12.23"
+      ],
+      "r1_b1_b2": [
+       "157.59\u00b11.66",
+       "157.30\u00b10.23"
+      ],
+      "delta": -0.27,
+      "ci95": 1.91,
+      "boot_range": "gain"
+     },
+     "paired_r1_minus_1107_us": {
+      "per_process": [
+       "-0.68\u00b13.02",
+       "-0.72\u00b12.92",
+       "+0.70\u00b12.69",
+       "+0.39\u00b10.46"
+      ],
+      "pooled": -0.08,
+      "ci95_within": 1.25,
+      "ci95_across_processes": 1.16
+     },
+     "paired_original_1016_minus_1107_us": {
+      "pooled": -7.03,
+      "ci95_within": 1.03,
+      "ci95_across_processes": 1.39
+     }
+    }
+   }
+  },
+  "prod_tp4": {
+   "1": {
+    "r1_same_kernels_as_1107": true,
+    "bits_equal_across_images": true,
+    "all_arms_torch_equal_in_process": true,
+    "warm": {
+     "outcome": "same-kernels",
+     "x_img_us": {
+      "no1016_b1_b2": [
+       "19.39\u00b10.32",
+       "20.67\u00b10.74"
+      ],
+      "r1_b1_b2": [
+       "20.62\u00b11.04",
+       "21.15\u00b11.02"
+      ],
+      "delta": 0.86,
+      "ci95": 0.83,
+      "boot_range": "within"
+     },
+     "paired_r1_minus_1107_us": "same-kernels",
+     "paired_original_1016_minus_1107_us": "same-kernels"
+    },
+    "cold": {
+     "outcome": "same-kernels",
+     "x_img_us": {
+      "no1016_b1_b2": [
+       "108.99\u00b11.63",
+       "107.64\u00b12.53"
+      ],
+      "r1_b1_b2": [
+       "108.05\u00b12.34",
+       "105.21\u00b11.60"
+      ],
+      "delta": -1.68,
+      "ci95": 2.07,
+      "boot_range": "within"
+     },
+     "paired_r1_minus_1107_us": "same-kernels",
+     "paired_original_1016_minus_1107_us": "same-kernels"
+    },
+    "next": {
+     "outcome": "same-kernels",
+     "x_img_us": {
+      "no1016_b1_b2": [
+       "108.89\u00b11.66",
+       "108.11\u00b13.35"
+      ],
+      "r1_b1_b2": [
+       "107.69\u00b11.31",
+       "107.12\u00b12.63"
+      ],
+      "delta": -1.09,
+      "ci95": 2.38,
+      "boot_range": "gain"
+     },
+     "paired_r1_minus_1107_us": "same-kernels",
+     "paired_original_1016_minus_1107_us": "same-kernels"
+    }
+   },
+   "2": {
+    "r1_same_kernels_as_1107": true,
+    "bits_equal_across_images": true,
+    "all_arms_torch_equal_in_process": true,
+    "warm": {
+     "outcome": "same-kernels",
+     "x_img_us": {
+      "no1016_b1_b2": [
+       "19.68\u00b10.39",
+       "21.14\u00b10.93"
+      ],
+      "r1_b1_b2": [
+       "20.55\u00b10.88",
+       "21.35\u00b10.91"
+      ],
+      "delta": 0.53,
+      "ci95": 0.81,
+      "boot_range": "within"
+     },
+     "paired_r1_minus_1107_us": "same-kernels",
+     "paired_original_1016_minus_1107_us": "same-kernels"
+    },
+    "cold": {
+     "outcome": "same-kernels",
+     "x_img_us": {
+      "no1016_b1_b2": [
+       "109.76\u00b13.54",
+       "106.63\u00b10.66"
+      ],
+      "r1_b1_b2": [
+       "108.20\u00b11.67",
+       "105.03\u00b11.04"
+      ],
+      "delta": -1.58,
+      "ci95": 2.05,
+      "boot_range": "within"
+     },
+     "paired_r1_minus_1107_us": "same-kernels",
+     "paired_original_1016_minus_1107_us": "same-kernels"
+    },
+    "next": {
+     "outcome": "same-kernels",
+     "x_img_us": {
+      "no1016_b1_b2": [
+       "108.71\u00b11.70",
+       "108.50\u00b12.96"
+      ],
+      "r1_b1_b2": [
+       "107.74\u00b11.23",
+       "107.48\u00b13.33"
+      ],
+      "delta": -0.99,
+      "ci95": 2.46,
+      "boot_range": "gain"
+     },
+     "paired_r1_minus_1107_us": "same-kernels",
+     "paired_original_1016_minus_1107_us": "same-kernels"
+    }
+   },
+   "3": {
+    "r1_same_kernels_as_1107": true,
+    "bits_equal_across_images": true,
+    "all_arms_torch_equal_in_process": true,
+    "warm": {
+     "outcome": "same-kernels",
+     "x_img_us": {
+      "no1016_b1_b2": [
+       "19.50\u00b10.40",
+       "21.26\u00b11.08"
+      ],
+      "r1_b1_b2": [
+       "20.40\u00b10.92",
+       "21.21\u00b11.09"
+      ],
+      "delta": 0.42,
+      "ci95": 0.92,
+      "boot_range": "within"
+     },
+     "paired_r1_minus_1107_us": "same-kernels",
+     "paired_original_1016_minus_1107_us": "same-kernels"
+    },
+    "cold": {
+     "outcome": "same-kernels",
+     "x_img_us": {
+      "no1016_b1_b2": [
+       "109.25\u00b12.14",
+       "107.26\u00b10.98"
+      ],
+      "r1_b1_b2": [
+       "108.04\u00b11.24",
+       "106.60\u00b11.73"
+      ],
+      "delta": -0.93,
+      "ci95": 1.59,
+      "boot_range": "within"
+     },
+     "paired_r1_minus_1107_us": "same-kernels",
+     "paired_original_1016_minus_1107_us": "same-kernels"
+    },
+    "next": {
+     "outcome": "same-kernels",
+     "x_img_us": {
+      "no1016_b1_b2": [
+       "107.83\u00b10.91",
+       "108.50\u00b12.07"
+      ],
+      "r1_b1_b2": [
+       "108.34\u00b11.34",
+       "105.49\u00b11.74"
+      ],
+      "delta": -1.26,
+      "ci95": 1.57,
+      "boot_range": "within"
+     },
+     "paired_r1_minus_1107_us": "same-kernels",
+     "paired_original_1016_minus_1107_us": "same-kernels"
+    }
+   },
+   "6": {
+    "r1_same_kernels_as_1107": true,
+    "bits_equal_across_images": true,
+    "all_arms_torch_equal_in_process": true,
+    "warm": {
+     "outcome": "same-kernels",
+     "x_img_us": {
+      "no1016_b1_b2": [
+       "19.71\u00b10.35",
+       "20.94\u00b10.82"
+      ],
+      "r1_b1_b2": [
+       "20.83\u00b10.86",
+       "21.77\u00b11.02"
+      ],
+      "delta": 0.98,
+      "ci95": 0.8,
+      "boot_range": "within"
+     },
+     "paired_r1_minus_1107_us": "same-kernels",
+     "paired_original_1016_minus_1107_us": "same-kernels"
+    },
+    "cold": {
+     "outcome": "same-kernels",
+     "x_img_us": {
+      "no1016_b1_b2": [
+       "109.62\u00b13.45",
+       "108.89\u00b12.99"
+      ],
+      "r1_b1_b2": [
+       "108.17\u00b11.26",
+       "106.96\u00b11.87"
+      ],
+      "delta": -1.69,
+      "ci95": 2.54,
+      "boot_range": "gain"
+     },
+     "paired_r1_minus_1107_us": "same-kernels",
+     "paired_original_1016_minus_1107_us": "same-kernels"
+    },
+    "next": {
+     "outcome": "same-kernels",
+     "x_img_us": {
+      "no1016_b1_b2": [
+       "109.23\u00b12.14",
+       "107.52\u00b11.64"
+      ],
+      "r1_b1_b2": [
+       "109.73\u00b12.35",
+       "106.98\u00b12.34"
+      ],
+      "delta": -0.02,
+      "ci95": 2.14,
+      "boot_range": "within"
+     },
+     "paired_r1_minus_1107_us": "same-kernels",
+     "paired_original_1016_minus_1107_us": "same-kernels"
+    }
+   },
+   "12": {
+    "r1_same_kernels_as_1107": true,
+    "bits_equal_across_images": true,
+    "all_arms_torch_equal_in_process": true,
+    "warm": {
+     "outcome": "same-kernels",
+     "x_img_us": {
+      "no1016_b1_b2": [
+       "18.90\u00b10.46",
+       "20.59\u00b11.20"
+      ],
+      "r1_b1_b2": [
+       "20.24\u00b10.85",
+       "20.11\u00b10.80"
+      ],
+      "delta": 0.43,
+      "ci95": 0.87,
+      "boot_range": "within"
+     },
+     "paired_r1_minus_1107_us": "same-kernels",
+     "paired_original_1016_minus_1107_us": "same-kernels"
+    },
+    "cold": {
+     "outcome": "same-kernels",
+     "x_img_us": {
+      "no1016_b1_b2": [
+       "110.43\u00b11.96",
+       "111.46\u00b14.20"
+      ],
+      "r1_b1_b2": [
+       "109.26\u00b11.03",
+       "110.34\u00b14.21"
+      ],
+      "delta": -1.15,
+      "ci95": 3.17,
+      "boot_range": "gain"
+     },
+     "paired_r1_minus_1107_us": "same-kernels",
+     "paired_original_1016_minus_1107_us": "same-kernels"
+    },
+    "next": {
+     "outcome": "same-kernels",
+     "x_img_us": {
+      "no1016_b1_b2": [
+       "110.75\u00b11.74",
+       "111.08\u00b11.89"
+      ],
+      "r1_b1_b2": [
+       "109.17\u00b11.32",
+       "108.74\u00b12.64"
+      ],
+      "delta": -1.96,
+      "ci95": 1.96,
+      "boot_range": "gain"
+     },
+     "paired_r1_minus_1107_us": "same-kernels",
+     "paired_original_1016_minus_1107_us": "same-kernels"
+    }
+   },
+   "24": {
+    "r1_same_kernels_as_1107": true,
+    "bits_equal_across_images": true,
+    "all_arms_torch_equal_in_process": true,
+    "warm": {
+     "outcome": "same-kernels",
+     "x_img_us": {
+      "no1016_b1_b2": [
+       "23.55\u00b10.38",
+       "24.67\u00b10.65"
+      ],
+      "r1_b1_b2": [
+       "23.50\u00b10.35",
+       "24.53\u00b10.65"
+      ],
+      "delta": -0.09,
+      "ci95": 0.53,
+      "boot_range": "within"
+     },
+     "paired_r1_minus_1107_us": "same-kernels",
+     "paired_original_1016_minus_1107_us": {
+      "pooled": -0.55,
+      "ci95_within": 0.36,
+      "ci95_across_processes": 0.73
+     }
+    },
+    "cold": {
+     "outcome": "same-kernels",
+     "x_img_us": {
+      "no1016_b1_b2": [
+       "114.97\u00b12.02",
+       "112.62\u00b11.13"
+      ],
+      "r1_b1_b2": [
+       "111.75\u00b11.94",
+       "110.73\u00b10.68"
+      ],
+      "delta": -2.55,
+      "ci95": 1.55,
+      "boot_range": "gain"
+     },
+     "paired_r1_minus_1107_us": "same-kernels",
+     "paired_original_1016_minus_1107_us": {
+      "pooled": 0.41,
+      "ci95_within": 1.51,
+      "ci95_across_processes": 1.03
+     }
+    },
+    "next": {
+     "outcome": "same-kernels",
+     "x_img_us": {
+      "no1016_b1_b2": [
+       "115.41\u00b12.97",
+       "113.05\u00b11.60"
+      ],
+      "r1_b1_b2": [
+       "111.48\u00b10.72",
+       "111.37\u00b11.78"
+      ],
+      "delta": -2.81,
+      "ci95": 1.94,
+      "boot_range": "gain"
+     },
+     "paired_r1_minus_1107_us": "same-kernels",
+     "paired_original_1016_minus_1107_us": {
+      "pooled": 0.25,
+      "ci95_within": 1.54,
+      "ci95_across_processes": 1.21
+     }
+    }
+   },
+   "48": {
+    "r1_same_kernels_as_1107": false,
+    "bits_equal_across_images": true,
+    "all_arms_torch_equal_in_process": true,
+    "warm": {
+     "outcome": "gain",
+     "x_img_us": {
+      "no1016_b1_b2": [
+       "36.38\u00b10.84",
+       "36.72\u00b10.59"
+      ],
+      "r1_b1_b2": [
+       "33.45\u00b10.66",
+       "34.36\u00b10.86"
+      ],
+      "delta": -2.64,
+      "ci95": 0.75,
+      "boot_range": "gain"
+     },
+     "paired_r1_minus_1107_us": {
+      "per_process": [
+       "-2.79\u00b10.93",
+       "-2.79\u00b10.94",
+       "-3.62\u00b11.12",
+       "-2.75\u00b10.86"
+      ],
+      "pooled": -2.99,
+      "ci95_within": 0.48,
+      "ci95_across_processes": 0.67
+     },
+     "paired_original_1016_minus_1107_us": {
+      "pooled": -2.99,
+      "ci95_within": 0.48,
+      "ci95_across_processes": 0.67
+     }
+    },
+    "cold": {
+     "outcome": "gain (x-img boot range; one process paired off)",
+     "x_img_us": {
+      "no1016_b1_b2": [
+       "117.42\u00b12.92",
+       "117.19\u00b14.04"
+      ],
+      "r1_b1_b2": [
+       "112.56\u00b10.29",
+       "112.28\u00b11.45"
+      ],
+      "delta": -4.88,
+      "ci95": 2.6,
+      "boot_range": "gain"
+     },
+     "paired_r1_minus_1107_us": {
+      "per_process": [
+       "-3.16\u00b12.85",
+       "-4.60\u00b14.03",
+       "-0.83\u00b11.42",
+       "+0.80\u00b11.47"
+      ],
+      "pooled": -1.95,
+      "ci95_within": 1.34,
+      "ci95_across_processes": 3.82
+     },
+     "paired_original_1016_minus_1107_us": {
+      "pooled": -1.95,
+      "ci95_within": 1.34,
+      "ci95_across_processes": 3.82
+     }
+    },
+    "next": {
+     "outcome": "within",
+     "x_img_us": {
+      "no1016_b1_b2": [
+       "117.47\u00b13.58",
+       "114.32\u00b11.01"
+      ],
+      "r1_b1_b2": [
+       "113.50\u00b11.89",
+       "113.93\u00b13.58"
+      ],
+      "delta": -2.18,
+      "ci95": 2.75,
+      "boot_range": "gain"
+     },
+     "paired_r1_minus_1107_us": {
+      "per_process": [
+       "-2.95\u00b13.81",
+       "-0.72\u00b11.81",
+       "-0.65\u00b13.06",
+       "+1.42\u00b14.62"
+      ],
+      "pooled": -0.72,
+      "ci95_within": 1.74,
+      "ci95_across_processes": 2.84
+     },
+     "paired_original_1016_minus_1107_us": {
+      "pooled": -0.72,
+      "ci95_within": 1.74,
+      "ci95_across_processes": 2.84
+     }
+    }
+   }
+  },
+  "prod_tp3": {
+   "1": {
+    "r1_same_kernels_as_1107": true,
+    "bits_equal_across_images": true,
+    "all_arms_torch_equal_in_process": true,
+    "warm": {
+     "outcome": "same-kernels",
+     "x_img_us": {
+      "no1016_b1_b2": [
+       "26.01\u00b10.88",
+       "29.48\u00b10.56"
+      ],
+      "r1_b1_b2": [
+       "25.41\u00b10.80",
+       "27.57\u00b11.15"
+      ],
+      "delta": -1.26,
+      "ci95": 0.87,
+      "boot_range": "within"
+     },
+     "paired_r1_minus_1107_us": "same-kernels",
+     "paired_original_1016_minus_1107_us": "same-kernels"
+    },
+    "cold": {
+     "outcome": "same-kernels",
+     "x_img_us": {
+      "no1016_b1_b2": [
+       "139.26\u00b11.59",
+       "139.37\u00b11.98"
+      ],
+      "r1_b1_b2": [
+       "137.75\u00b10.35",
+       "139.16\u00b10.45"
+      ],
+      "delta": -0.86,
+      "ci95": 1.3,
+      "boot_range": "gain"
+     },
+     "paired_r1_minus_1107_us": "same-kernels",
+     "paired_original_1016_minus_1107_us": "same-kernels"
+    },
+    "next": {
+     "outcome": "same-kernels",
+     "x_img_us": {
+      "no1016_b1_b2": [
+       "140.61\u00b12.69",
+       "137.98\u00b10.73"
+      ],
+      "r1_b1_b2": [
+       "138.76\u00b11.08",
+       "141.16\u00b13.04"
+      ],
+      "delta": 0.67,
+      "ci95": 2.13,
+      "boot_range": "within"
+     },
+     "paired_r1_minus_1107_us": "same-kernels",
+     "paired_original_1016_minus_1107_us": "same-kernels"
+    }
+   },
+   "2": {
+    "r1_same_kernels_as_1107": true,
+    "bits_equal_across_images": true,
+    "all_arms_torch_equal_in_process": true,
+    "warm": {
+     "outcome": "same-kernels",
+     "x_img_us": {
+      "no1016_b1_b2": [
+       "25.80\u00b10.68",
+       "29.52\u00b10.48"
+      ],
+      "r1_b1_b2": [
+       "25.38\u00b10.79",
+       "27.42\u00b11.27"
+      ],
+      "delta": -1.26,
+      "ci95": 0.86,
+      "boot_range": "within"
+     },
+     "paired_r1_minus_1107_us": "same-kernels",
+     "paired_original_1016_minus_1107_us": "same-kernels"
+    },
+    "cold": {
+     "outcome": "same-kernels",
+     "x_img_us": {
+      "no1016_b1_b2": [
+       "138.64\u00b10.48",
+       "139.53\u00b12.30"
+      ],
+      "r1_b1_b2": [
+       "138.53\u00b10.82",
+       "139.59\u00b10.52"
+      ],
+      "delta": -0.03,
+      "ci95": 1.27,
+      "boot_range": "within"
+     },
+     "paired_r1_minus_1107_us": "same-kernels",
+     "paired_original_1016_minus_1107_us": "same-kernels"
+    },
+    "next": {
+     "outcome": "same-kernels",
+     "x_img_us": {
+      "no1016_b1_b2": [
+       "139.53\u00b11.76",
+       "139.30\u00b12.06"
+      ],
+      "r1_b1_b2": [
+       "138.96\u00b11.29",
+       "139.43\u00b10.56"
+      ],
+      "delta": -0.22,
+      "ci95": 1.53,
+      "boot_range": "within"
+     },
+     "paired_r1_minus_1107_us": "same-kernels",
+     "paired_original_1016_minus_1107_us": "same-kernels"
+    }
+   },
+   "3": {
+    "r1_same_kernels_as_1107": true,
+    "bits_equal_across_images": true,
+    "all_arms_torch_equal_in_process": true,
+    "warm": {
+     "outcome": "same-kernels",
+     "x_img_us": {
+      "no1016_b1_b2": [
+       "26.96\u00b11.12",
+       "32.32\u00b11.21"
+      ],
+      "r1_b1_b2": [
+       "25.48\u00b10.82",
+       "25.66\u00b10.61"
+      ],
+      "delta": -4.07,
+      "ci95": 0.97,
+      "boot_range": "gain"
+     },
+     "paired_r1_minus_1107_us": "same-kernels",
+     "paired_original_1016_minus_1107_us": "same-kernels"
+    },
+    "cold": {
+     "outcome": "same-kernels",
+     "x_img_us": {
+      "no1016_b1_b2": [
+       "139.81\u00b11.31",
+       "140.32\u00b12.43"
+      ],
+      "r1_b1_b2": [
+       "140.07\u00b11.65",
+       "139.91\u00b11.45"
+      ],
+      "delta": -0.08,
+      "ci95": 1.76,
+      "boot_range": "within"
+     },
+     "paired_r1_minus_1107_us": "same-kernels",
+     "paired_original_1016_minus_1107_us": "same-kernels"
+    },
+    "next": {
+     "outcome": "same-kernels",
+     "x_img_us": {
+      "no1016_b1_b2": [
+       "139.56\u00b11.40",
+       "140.22\u00b11.96"
+      ],
+      "r1_b1_b2": [
+       "142.90\u00b13.87",
+       "139.53\u00b10.82"
+      ],
+      "delta": 1.33,
+      "ci95": 2.31,
+      "boot_range": "within"
+     },
+     "paired_r1_minus_1107_us": "same-kernels",
+     "paired_original_1016_minus_1107_us": "same-kernels"
+    }
+   },
+   "6": {
+    "r1_same_kernels_as_1107": true,
+    "bits_equal_across_images": true,
+    "all_arms_torch_equal_in_process": true,
+    "warm": {
+     "outcome": "same-kernels",
+     "x_img_us": {
+      "no1016_b1_b2": [
+       "25.76\u00b11.09",
+       "31.89\u00b10.68"
+      ],
+      "r1_b1_b2": [
+       "25.45\u00b10.83",
+       "26.87\u00b11.09"
+      ],
+      "delta": -2.67,
+      "ci95": 0.94,
+      "boot_range": "within"
+     },
+     "paired_r1_minus_1107_us": "same-kernels",
+     "paired_original_1016_minus_1107_us": "same-kernels"
+    },
+    "cold": {
+     "outcome": "same-kernels",
+     "x_img_us": {
+      "no1016_b1_b2": [
+       "140.07\u00b11.40",
+       "140.76\u00b12.33"
+      ],
+      "r1_b1_b2": [
+       "140.49\u00b11.96",
+       "141.34\u00b12.91"
+      ],
+      "delta": 0.5,
+      "ci95": 2.22,
+      "boot_range": "within"
+     },
+     "paired_r1_minus_1107_us": "same-kernels",
+     "paired_original_1016_minus_1107_us": "same-kernels"
+    },
+    "next": {
+     "outcome": "same-kernels",
+     "x_img_us": {
+      "no1016_b1_b2": [
+       "139.78\u00b11.02",
+       "142.66\u00b14.27"
+      ],
+      "r1_b1_b2": [
+       "140.98\u00b12.84",
+       "143.04\u00b12.84"
+      ],
+      "delta": 0.79,
+      "ci95": 2.97,
+      "boot_range": "within"
+     },
+     "paired_r1_minus_1107_us": "same-kernels",
+     "paired_original_1016_minus_1107_us": "same-kernels"
+    }
+   },
+   "12": {
+    "r1_same_kernels_as_1107": true,
+    "bits_equal_across_images": true,
+    "all_arms_torch_equal_in_process": true,
+    "warm": {
+     "outcome": "same-kernels",
+     "x_img_us": {
+      "no1016_b1_b2": [
+       "24.88\u00b11.21",
+       "31.52\u00b10.98"
+      ],
+      "r1_b1_b2": [
+       "25.20\u00b11.11",
+       "25.87\u00b11.28"
+      ],
+      "delta": -2.67,
+      "ci95": 1.15,
+      "boot_range": "within"
+     },
+     "paired_r1_minus_1107_us": "same-kernels",
+     "paired_original_1016_minus_1107_us": "same-kernels"
+    },
+    "cold": {
+     "outcome": "same-kernels",
+     "x_img_us": {
+      "no1016_b1_b2": [
+       "143.43\u00b13.98",
+       "143.77\u00b14.53"
+      ],
+      "r1_b1_b2": [
+       "140.18\u00b10.74",
+       "144.35\u00b13.43"
+      ],
+      "delta": -1.33,
+      "ci95": 3.49,
+      "boot_range": "within"
+     },
+     "paired_r1_minus_1107_us": "same-kernels",
+     "paired_original_1016_minus_1107_us": "same-kernels"
+    },
+    "next": {
+     "outcome": "same-kernels",
+     "x_img_us": {
+      "no1016_b1_b2": [
+       "142.77\u00b13.08",
+       "142.02\u00b12.73"
+      ],
+      "r1_b1_b2": [
+       "144.21\u00b14.30",
+       "142.88\u00b11.88"
+      ],
+      "delta": 1.15,
+      "ci95": 3.12,
+      "boot_range": "slower"
+     },
+     "paired_r1_minus_1107_us": "same-kernels",
+     "paired_original_1016_minus_1107_us": "same-kernels"
+    }
+   },
+   "24": {
+    "r1_same_kernels_as_1107": true,
+    "bits_equal_across_images": true,
+    "all_arms_torch_equal_in_process": true,
+    "warm": {
+     "outcome": "same-kernels",
+     "x_img_us": {
+      "no1016_b1_b2": [
+       "32.55\u00b10.92",
+       "35.57\u00b10.92"
+      ],
+      "r1_b1_b2": [
+       "31.41\u00b11.04",
+       "31.49\u00b10.87"
+      ],
+      "delta": -2.61,
+      "ci95": 0.94,
+      "boot_range": "gain"
+     },
+     "paired_r1_minus_1107_us": "same-kernels",
+     "paired_original_1016_minus_1107_us": {
+      "pooled": 0.19,
+      "ci95_within": 0.62,
+      "ci95_across_processes": 6.46
+     }
+    },
+    "cold": {
+     "outcome": "same-kernels",
+     "x_img_us": {
+      "no1016_b1_b2": [
+       "144.38\u00b12.01",
+       "144.92\u00b13.69"
+      ],
+      "r1_b1_b2": [
+       "142.87\u00b10.73",
+       "146.29\u00b12.32"
+      ],
+      "delta": -0.07,
+      "ci95": 2.43,
+      "boot_range": "within"
+     },
+     "paired_r1_minus_1107_us": "same-kernels",
+     "paired_original_1016_minus_1107_us": {
+      "pooled": -0.48,
+      "ci95_within": 1.61,
+      "ci95_across_processes": 1.55
+     }
+    },
+    "next": {
+     "outcome": "same-kernels",
+     "x_img_us": {
+      "no1016_b1_b2": [
+       "143.07\u00b11.04",
+       "142.51\u00b10.67"
+      ],
+      "r1_b1_b2": [
+       "144.59\u00b12.31",
+       "144.01\u00b10.58"
+      ],
+      "delta": 1.51,
+      "ci95": 1.34,
+      "boot_range": "slower"
+     },
+     "paired_r1_minus_1107_us": "same-kernels",
+     "paired_original_1016_minus_1107_us": {
+      "pooled": 2.03,
+      "ci95_within": 1.67,
+      "ci95_across_processes": 4.05
+     }
+    }
+   },
+   "48": {
+    "r1_same_kernels_as_1107": false,
+    "bits_equal_across_images": true,
+    "all_arms_torch_equal_in_process": true,
+    "warm": {
+     "outcome": "within",
+     "x_img_us": {
+      "no1016_b1_b2": [
+       "47.77\u00b11.14",
+       "47.50\u00b10.78"
+      ],
+      "r1_b1_b2": [
+       "47.55\u00b11.23",
+       "41.49\u00b11.02"
+      ],
+      "delta": -3.11,
+      "ci95": 1.06,
+      "boot_range": "within"
+     },
+     "paired_r1_minus_1107_us": {
+      "per_process": [
+       "-5.04\u00b11.62",
+       "-4.24\u00b10.76",
+       "+0.23\u00b11.49",
+       "-6.41\u00b11.63"
+      ],
+      "pooled": -3.86,
+      "ci95_within": 0.71,
+      "ci95_across_processes": 4.57
+     },
+     "paired_original_1016_minus_1107_us": {
+      "pooled": -3.86,
+      "ci95_within": 0.71,
+      "ci95_across_processes": 4.57
+     }
+    },
+    "cold": {
+     "outcome": "within",
+     "x_img_us": {
+      "no1016_b1_b2": [
+       "146.48\u00b13.25",
+       "143.47\u00b10.39"
+      ],
+      "r1_b1_b2": [
+       "145.18\u00b11.80",
+       "145.63\u00b12.21"
+      ],
+      "delta": 0.43,
+      "ci95": 2.17,
+      "boot_range": "within"
+     },
+     "paired_r1_minus_1107_us": {
+      "per_process": [
+       "-2.65\u00b13.49",
+       "+1.01\u00b13.19",
+       "+1.07\u00b13.43",
+       "-0.14\u00b13.17"
+      ],
+      "pooled": -0.17,
+      "ci95_within": 1.66,
+      "ci95_across_processes": 2.77
+     },
+     "paired_original_1016_minus_1107_us": {
+      "pooled": -0.17,
+      "ci95_within": 1.66,
+      "ci95_across_processes": 2.77
+     }
+    },
+    "next": {
+     "outcome": "within",
+     "x_img_us": {
+      "no1016_b1_b2": [
+       "145.28\u00b13.51",
+       "144.24\u00b11.79"
+      ],
+      "r1_b1_b2": [
+       "144.91\u00b11.39",
+       "146.18\u00b12.92"
+      ],
+      "delta": 0.78,
+      "ci95": 2.55,
+      "boot_range": "within"
+     },
+     "paired_r1_minus_1107_us": {
+      "per_process": [
+       "-1.47\u00b13.70",
+       "-1.48\u00b11.84",
+       "+0.38\u00b12.42",
+       "+1.03\u00b13.15"
+      ],
+      "pooled": -0.39,
+      "ci95_within": 1.43,
+      "ci95_across_processes": 2.05
+     },
+     "paired_original_1016_minus_1107_us": {
+      "pooled": -0.39,
+      "ci95_within": 1.43,
+      "ci95_across_processes": 2.05
+     }
+    }
+   }
+  },
+  "qb_tp8": {
+   "1": {
+    "r1_same_kernels_as_1107": true,
+    "bits_equal_across_images": true,
+    "all_arms_torch_equal_in_process": true,
+    "warm": {
+     "outcome": "same-kernels",
+     "x_img_us": {
+      "no1016_b1_b2": [
+       "8.71\u00b10.19",
+       "8.73\u00b10.22"
+      ],
+      "r1_b1_b2": [
+       "8.79\u00b10.19",
+       "8.70\u00b10.14"
+      ],
+      "delta": 0.02,
+      "ci95": 0.19,
+      "boot_range": "within"
+     },
+     "paired_r1_minus_1107_us": "same-kernels",
+     "paired_original_1016_minus_1107_us": {
+      "pooled": -1.73,
+      "ci95_within": 0.12,
+      "ci95_across_processes": 0.27
+     }
+    },
+    "cold": {
+     "outcome": "same-kernels",
+     "x_img_us": {
+      "no1016_b1_b2": [
+       "35.05\u00b10.31",
+       "36.50\u00b11.71"
+      ],
+      "r1_b1_b2": [
+       "34.93\u00b10.52",
+       "35.12\u00b10.93"
+      ],
+      "delta": -0.75,
+      "ci95": 1.02,
+      "boot_range": "within"
+     },
+     "paired_r1_minus_1107_us": "same-kernels",
+     "paired_original_1016_minus_1107_us": {
+      "pooled": -0.23,
+      "ci95_within": 0.6,
+      "ci95_across_processes": 0.44
+     }
+    },
+    "next": {
+     "outcome": "same-kernels",
+     "x_img_us": {
+      "no1016_b1_b2": [
+       "35.45\u00b10.99",
+       "36.47\u00b11.63"
+      ],
+      "r1_b1_b2": [
+       "34.96\u00b10.57",
+       "35.91\u00b11.92"
+      ],
+      "delta": -0.53,
+      "ci95": 1.38,
+      "boot_range": "within"
+     },
+     "paired_r1_minus_1107_us": "same-kernels",
+     "paired_original_1016_minus_1107_us": {
+      "pooled": -0.19,
+      "ci95_within": 0.86,
+      "ci95_across_processes": 2.18
+     }
+    }
+   },
+   "2": {
+    "r1_same_kernels_as_1107": true,
+    "bits_equal_across_images": true,
+    "all_arms_torch_equal_in_process": true,
+    "warm": {
+     "outcome": "same-kernels",
+     "x_img_us": {
+      "no1016_b1_b2": [
+       "8.66\u00b10.14",
+       "8.74\u00b10.20"
+      ],
+      "r1_b1_b2": [
+       "8.58\u00b10.14",
+       "8.52\u00b10.08"
+      ],
+      "delta": -0.15,
+      "ci95": 0.15,
+      "boot_range": "gain"
+     },
+     "paired_r1_minus_1107_us": "same-kernels",
+     "paired_original_1016_minus_1107_us": {
+      "pooled": -1.79,
+      "ci95_within": 0.1,
+      "ci95_across_processes": 0.24
+     }
+    },
+    "cold": {
+     "outcome": "same-kernels",
+     "x_img_us": {
+      "no1016_b1_b2": [
+       "34.67\u00b10.26",
+       "35.35\u00b10.67"
+      ],
+      "r1_b1_b2": [
+       "34.40\u00b10.19",
+       "34.06\u00b10.18"
+      ],
+      "delta": -0.78,
+      "ci95": 0.38,
+      "boot_range": "gain"
+     },
+     "paired_r1_minus_1107_us": "same-kernels",
+     "paired_original_1016_minus_1107_us": {
+      "pooled": 0.64,
+      "ci95_within": 0.88,
+      "ci95_across_processes": 0.92
+     }
+    },
+    "next": {
+     "outcome": "same-kernels",
+     "x_img_us": {
+      "no1016_b1_b2": [
+       "35.50\u00b11.05",
+       "35.22\u00b10.39"
+      ],
+      "r1_b1_b2": [
+       "34.78\u00b10.51",
+       "35.40\u00b11.08"
+      ],
+      "delta": -0.27,
+      "ci95": 0.82,
+      "boot_range": "within"
+     },
+     "paired_r1_minus_1107_us": "same-kernels",
+     "paired_original_1016_minus_1107_us": {
+      "pooled": -0.35,
+      "ci95_within": 0.48,
+      "ci95_across_processes": 1.14
+     }
+    }
+   },
+   "3": {
+    "r1_same_kernels_as_1107": true,
+    "bits_equal_across_images": true,
+    "all_arms_torch_equal_in_process": true,
+    "warm": {
+     "outcome": "same-kernels",
+     "x_img_us": {
+      "no1016_b1_b2": [
+       "8.63\u00b10.24",
+       "8.62\u00b10.19"
+      ],
+      "r1_b1_b2": [
+       "8.47\u00b10.15",
+       "8.52\u00b10.11"
+      ],
+      "delta": -0.14,
+      "ci95": 0.18,
+      "boot_range": "gain"
+     },
+     "paired_r1_minus_1107_us": "same-kernels",
+     "paired_original_1016_minus_1107_us": {
+      "pooled": -1.68,
+      "ci95_within": 0.1,
+      "ci95_across_processes": 0.2
+     }
+    },
+    "cold": {
+     "outcome": "same-kernels",
+     "x_img_us": {
+      "no1016_b1_b2": [
+       "34.81\u00b10.67",
+       "35.42\u00b10.65"
+      ],
+      "r1_b1_b2": [
+       "35.63\u00b11.45",
+       "34.39\u00b10.30"
+      ],
+      "delta": -0.1,
+      "ci95": 0.87,
+      "boot_range": "within"
+     },
+     "paired_r1_minus_1107_us": "same-kernels",
+     "paired_original_1016_minus_1107_us": {
+      "pooled": 0.19,
+      "ci95_within": 0.7,
+      "ci95_across_processes": 1.51
+     }
+    },
+    "next": {
+     "outcome": "same-kernels",
+     "x_img_us": {
+      "no1016_b1_b2": [
+       "34.48\u00b10.25",
+       "37.34\u00b12.33"
+      ],
+      "r1_b1_b2": [
+       "34.81\u00b10.48",
+       "34.24\u00b10.26"
+      ],
+      "delta": -1.38,
+      "ci95": 1.2,
+      "boot_range": "within"
+     },
+     "paired_r1_minus_1107_us": "same-kernels",
+     "paired_original_1016_minus_1107_us": {
+      "pooled": -0.42,
+      "ci95_within": 0.67,
+      "ci95_across_processes": 2.24
+     }
+    }
+   },
+   "6": {
+    "r1_same_kernels_as_1107": true,
+    "bits_equal_across_images": true,
+    "all_arms_torch_equal_in_process": true,
+    "warm": {
+     "outcome": "same-kernels",
+     "x_img_us": {
+      "no1016_b1_b2": [
+       "7.52\u00b10.12",
+       "7.48\u00b10.11"
+      ],
+      "r1_b1_b2": [
+       "7.66\u00b10.21",
+       "7.61\u00b10.17"
+      ],
+      "delta": 0.13,
+      "ci95": 0.16,
+      "boot_range": "slower"
+     },
+     "paired_r1_minus_1107_us": "same-kernels",
+     "paired_original_1016_minus_1107_us": {
+      "pooled": -1.04,
+      "ci95_within": 0.09,
+      "ci95_across_processes": 0.16
+     }
+    },
+    "cold": {
+     "outcome": "same-kernels",
+     "x_img_us": {
+      "no1016_b1_b2": [
+       "36.84\u00b12.97",
+       "36.11\u00b11.13"
+      ],
+      "r1_b1_b2": [
+       "35.66\u00b11.21",
+       "34.37\u00b10.35"
+      ],
+      "delta": -1.46,
+      "ci95": 1.71,
+      "boot_range": "gain"
+     },
+     "paired_r1_minus_1107_us": "same-kernels",
+     "paired_original_1016_minus_1107_us": {
+      "pooled": -0.5,
+      "ci95_within": 1.04,
+      "ci95_across_processes": 2.05
+     }
+    },
+    "next": {
+     "outcome": "same-kernels",
+     "x_img_us": {
+      "no1016_b1_b2": [
+       "34.35\u00b10.21",
+       "35.23\u00b10.20"
+      ],
+      "r1_b1_b2": [
+       "34.54\u00b10.35",
+       "34.27\u00b10.42"
+      ],
+      "delta": -0.38,
+      "ci95": 0.31,
+      "boot_range": "within"
+     },
+     "paired_r1_minus_1107_us": "same-kernels",
+     "paired_original_1016_minus_1107_us": {
+      "pooled": 0.77,
+      "ci95_within": 0.73,
+      "ci95_across_processes": 1.04
+     }
+    }
+   },
+   "12": {
+    "r1_same_kernels_as_1107": true,
+    "bits_equal_across_images": true,
+    "all_arms_torch_equal_in_process": true,
+    "warm": {
+     "outcome": "same-kernels",
+     "x_img_us": {
+      "no1016_b1_b2": [
+       "5.36\u00b10.15",
+       "5.60\u00b10.22"
+      ],
+      "r1_b1_b2": [
+       "5.69\u00b10.28",
+       "5.45\u00b10.15"
+      ],
+      "delta": 0.09,
+      "ci95": 0.21,
+      "boot_range": "within"
+     },
+     "paired_r1_minus_1107_us": "same-kernels",
+     "paired_original_1016_minus_1107_us": {
+      "pooled": 0.44,
+      "ci95_within": 0.12,
+      "ci95_across_processes": 0.38
+     }
+    },
+    "cold": {
+     "outcome": "same-kernels",
+     "x_img_us": {
+      "no1016_b1_b2": [
+       "35.49\u00b10.96",
+       "35.91\u00b11.04"
+      ],
+      "r1_b1_b2": [
+       "36.20\u00b12.01",
+       "35.34\u00b12.06"
+      ],
+      "delta": 0.07,
+      "ci95": 1.6,
+      "boot_range": "within"
+     },
+     "paired_r1_minus_1107_us": "same-kernels",
+     "paired_original_1016_minus_1107_us": {
+      "pooled": 0.07,
+      "ci95_within": 0.92,
+      "ci95_across_processes": 2.06
+     }
+    },
+    "next": {
+     "outcome": "same-kernels",
+     "x_img_us": {
+      "no1016_b1_b2": [
+       "36.00\u00b11.03",
+       "36.07\u00b11.04"
+      ],
+      "r1_b1_b2": [
+       "37.15\u00b13.27",
+       "36.17\u00b12.47"
+      ],
+      "delta": 0.62,
+      "ci95": 2.17,
+      "boot_range": "slower"
+     },
+     "paired_r1_minus_1107_us": "same-kernels",
+     "paired_original_1016_minus_1107_us": {
+      "pooled": 0.44,
+      "ci95_within": 1.68,
+      "ci95_across_processes": 1.73
+     }
+    }
+   },
+   "24": {
+    "r1_same_kernels_as_1107": true,
+    "bits_equal_across_images": true,
+    "all_arms_torch_equal_in_process": true,
+    "warm": {
+     "outcome": "same-kernels",
+     "x_img_us": {
+      "no1016_b1_b2": [
+       "7.63\u00b10.28",
+       "7.34\u00b10.22"
+      ],
+      "r1_b1_b2": [
+       "7.23\u00b10.20",
+       "7.36\u00b10.18"
+      ],
+      "delta": -0.19,
+      "ci95": 0.22,
+      "boot_range": "within"
+     },
+     "paired_r1_minus_1107_us": "same-kernels",
+     "paired_original_1016_minus_1107_us": "same-kernels"
+    },
+    "cold": {
+     "outcome": "same-kernels",
+     "x_img_us": {
+      "no1016_b1_b2": [
+       "36.13\u00b11.01",
+       "36.08\u00b10.69"
+      ],
+      "r1_b1_b2": [
+       "35.12\u00b10.39",
+       "35.95\u00b12.47"
+      ],
+      "delta": -0.57,
+      "ci95": 1.39,
+      "boot_range": "gain"
+     },
+     "paired_r1_minus_1107_us": "same-kernels",
+     "paired_original_1016_minus_1107_us": "same-kernels"
+    },
+    "next": {
+     "outcome": "same-kernels",
+     "x_img_us": {
+      "no1016_b1_b2": [
+       "37.26\u00b11.39",
+       "36.10\u00b10.28"
+      ],
+      "r1_b1_b2": [
+       "35.22\u00b10.51",
+       "35.27\u00b10.44"
+      ],
+      "delta": -1.43,
+      "ci95": 0.78,
+      "boot_range": "gain"
+     },
+     "paired_r1_minus_1107_us": "same-kernels",
+     "paired_original_1016_minus_1107_us": "same-kernels"
+    }
+   },
+   "48": {
+    "r1_same_kernels_as_1107": true,
+    "bits_equal_across_images": true,
+    "all_arms_torch_equal_in_process": true,
+    "warm": {
+     "outcome": "same-kernels",
+     "x_img_us": {
+      "no1016_b1_b2": [
+       "14.47\u00b10.39",
+       "14.03\u00b10.18"
+      ],
+      "r1_b1_b2": [
+       "13.98\u00b10.27",
+       "13.70\u00b10.09"
+      ],
+      "delta": -0.41,
+      "ci95": 0.26,
+      "boot_range": "gain"
+     },
+     "paired_r1_minus_1107_us": "same-kernels",
+     "paired_original_1016_minus_1107_us": {
+      "pooled": 0.23,
+      "ci95_within": 0.17,
+      "ci95_across_processes": 0.79
+     }
+    },
+    "cold": {
+     "outcome": "same-kernels",
+     "x_img_us": {
+      "no1016_b1_b2": [
+       "36.32\u00b10.79",
+       "36.78\u00b10.57"
+      ],
+      "r1_b1_b2": [
+       "36.96\u00b11.76",
+       "36.35\u00b11.01"
+      ],
+      "delta": 0.11,
+      "ci95": 1.12,
+      "boot_range": "within"
+     },
+     "paired_r1_minus_1107_us": "same-kernels",
+     "paired_original_1016_minus_1107_us": {
+      "pooled": 1.2,
+      "ci95_within": 0.86,
+      "ci95_across_processes": 1.57
+     }
+    },
+    "next": {
+     "outcome": "same-kernels",
+     "x_img_us": {
+      "no1016_b1_b2": [
+       "36.79\u00b11.23",
+       "37.54\u00b11.41"
+      ],
+      "r1_b1_b2": [
+       "36.35\u00b11.11",
+       "36.27\u00b11.03"
+      ],
+      "delta": -0.85,
+      "ci95": 1.21,
+      "boot_range": "gain"
+     },
+     "paired_r1_minus_1107_us": "same-kernels",
+     "paired_original_1016_minus_1107_us": {
+      "pooled": 1.45,
+      "ci95_within": 1.28,
+      "ci95_across_processes": 1.46
+     }
+    }
+   }
+  }
+ },
+ "aa_floor_x_img_us": {
+  "tp4/graph_warm": 1.03,
+  "tp4/graph_cold": 2.55,
+  "tp4/graph_next": 2.85,
+  "tp3/graph_warm": 5.21,
+  "tp3/graph_cold": 4.83,
+  "tp3/graph_next": 1.51,
+  "tp8/graph_warm": 0.41,
+  "tp8/graph_cold": 1.46,
+  "tp8/graph_next": 1.43
+ },
+ "aa_note": "At M = 1..24, r1's kernels are 1107's, so their cross-image deltas are an A/A floor between processes. That floor is up to 1.0 us warm at TP4 and up to 5.2 us warm / 4.8 us cold at TP3. TP3's chained warm working set (about 20 MiB) nearly fills L2, so its warm time depends on each process's allocation. Several same-kernels cells read 'slower' or 'gain' on the boot range and are noise.",
+ "layer_chain_x_img_us": {
+  "c1_M6": {
+   "graph_warm_us": {
+    "no1016_b1_b2": [
+     "955.55\u00b16.30",
+     "945.99\u00b15.23"
+    ],
+    "r1_b1_b2": [
+     "976.76\u00b113.14",
+     "951.20\u00b15.32"
+    ],
+    "x_img_delta_us": 13.21,
+    "x_img_ci95": 8.19
+   },
+   "graph_cold_us": {
+    "no1016_b1_b2": [
+     "996.78\u00b112.28",
+     "983.79\u00b11.92"
+    ],
+    "r1_b1_b2": [
+     "1006.43\u00b112.77",
+     "991.74\u00b112.87"
+    ],
+    "x_img_delta_us": 8.8,
+    "x_img_ci95": 10.99
+   },
+   "digests_equal_across_images": true
+  },
+  "c8_M24": {
+   "graph_warm_us": {
+    "no1016_b1_b2": [
+     "2701.13\u00b18.01",
+     "2741.85\u00b133.25"
+    ],
+    "r1_b1_b2": [
+     "2698.32\u00b18.47",
+     "2697.56\u00b17.07"
+    ],
+    "x_img_delta_us": -23.55,
+    "x_img_ci95": 17.97
+   },
+   "graph_cold_us": {
+    "no1016_b1_b2": [
+     "2727.67\u00b110.44",
+     "2764.03\u00b125.47"
+    ],
+    "r1_b1_b2": [
+     "2721.79\u00b12.29",
+     "2736.72\u00b114.37"
+    ],
+    "x_img_delta_us": -16.6,
+    "x_img_ci95": 15.57
+   },
+   "digests_equal_across_images": true
+  },
+  "c8x6_M48": {
+   "graph_warm_us": {
+    "no1016_b1_b2": [
+     "4407.03\u00b140.13",
+     "4368.65\u00b13.03"
+    ],
+    "r1_b1_b2": [
+     "4403.93\u00b141.15",
+     "4399.45\u00b142.43"
+    ],
+    "x_img_delta_us": 13.85,
+    "x_img_ci95": 35.76
+   },
+   "graph_cold_us": {
+    "no1016_b1_b2": [
+     "4438.90\u00b159.47",
+     "4405.98\u00b117.50"
+    ],
+    "r1_b1_b2": [
+     "4422.17\u00b139.18",
+     "4427.49\u00b139.83"
+    ],
+    "x_img_delta_us": 2.39,
+    "x_img_ci95": 41.72
+   },
+   "digests_equal_across_images": true
+  }
+ },
+ "layer_chain_note": "Within the interval. c1 and c8 run the same kernels in both images, so their +13 / -24 us deltas are the chain's cross-process A/A spread. c8x6 (the only changed rows) is +14 +/- 36 us warm and +2 +/- 42 us cold. Digests are equal across images.",
+ "bit_exact": {
+  "outputs_equal_across_images_every_pair_and_M": true,
+  "all_arms_torch_equal_in_process_every_pair_and_M": true,
+  "layer_chain_digests_equal_across_images": true,
+  "pytest": [
+   "pytest-r1-boot1: 187 passed, 14 warnings (0 failed)",
+   "pytest-r1-boot2: 187 passed, 14 warnings (0 failed)"
+  ]
+ },
+ "m12_cause": "The bench (and h1016) builds the indexer's fused RoPE + MXFP4 kernel from fp8_decode_config(4096, 1280, block_M), whose threads default is 128. The epilogue covers the block_M x block_N tile in serial passes of 2 * threads / block_N rows: one thread per column pair, 16-lane shuffles for amax, predicated on m < M. Each pass carries dependent loads (Positions[m], then that row's CosSin) and the Q/S stores. #1016 raised block_N at block_M=16 from 64 to 128, which halves the rows per pass from 4 to 2. Live passes go from ceil(M/4) to ceil(M/2): equal at M = 1..2, 2 vs 1 at M = 3, 3 vs 2 at M = 6, 6 vs 3 at M = 12, 8 vs 4 at M = 16. The halved grid (32 CTAs instead of 64) saves about 1.3 us warm at M = 1, but every extra pass costs latency, so M = 12 comes out slower in every L2 state. The screen's diag isolates this on the indexer kernel alone at block_M=16, warm/cold medians in us: bN64/t128 6.59/36.94, bN128/t128 7.94/38.86, bN128/t256 (4 rows per pass again) 6.79/37.70. At M = 16 the gap is +1.7 warm and +3.4 cold. The model's own indexer kernel (bN128/t256/2 stages, never read from DECODE_FP8_CONFIGS) does not change with #1016. On the TP8 Q-B plain kernel, which has no serial epilogue, the 16-row block_N=128 tile has a smaller crossover: -1.7 us at M = 1, +0.4 us warm at M = 12 in every process. Its mechanism was not isolated.",
+ "findings": [
+  "In the model, DECODE_FP8_CONFIGS[(4096, 1280)] reaches TP8's Q-B only. The indexer Q-B decode kernel (linear.py, decode_rope_mxfp4) is built with the kernel defaults (block_M 16, block_N 128, block_K 128, 2 stages, 256 threads) at every M, in 1107 and with #1016 alike. The chained bench's indexer half, built from the (4096, 1280) decode tiles, is therefore not what serving runs. In this harness the model's pair is faster than the bench's 1107 pair (TP4 M=48: 36.4 vs 45.3 us warm).",
+  "#1016's M=48 gain in cold and NEXT L2 came almost entirely from dropping threads=64 on (4096, 1280) at block_M=64. On the bench's indexer kernel that is -4.1 warm / -8.1 cold / -7.8 NEXT us (TP4, pooled), but the model never runs that kernel. On the model's consumer, TP8 Q-B, the same drop gains nothing: +0.23 warm, +1.20 cold, +1.45 NEXT us pooled over four processes (+0.20 / +0.54 / +0.37 in the screen). It is slower in four of five processes in warm and cold.",
+  "The Q-B half of the M=48 change (block_N=128 at block_M=64 for 8192 and 12288) is the real gain. With the weights warm in L2 it is consistent at TP4 (four processes -2.75..-3.44 us on the bench pair, -2.75..-3.62 on the model's pair). At TP3 three of four processes show -6.2..-8.8 us, one shows +2.0, and the cross-image boots read 57.1/57.2 vs 50.3/48.7 us. Cold and NEXT are within the interval.",
+  "#1016's 32-row Q-B tiles gained nothing at M=24 beyond the across-process interval in any state. Single processes put the TP3 pair 4.4 us (screen) and 6.3 us (model's pair) slower with the weights in L2.",
+  "#1016's 16-row (4096, 1280) block_N=128 tile: in the bench, -1.9..-2.4 us warm at M=1..3 but +2.9 cold / +1.7 NEXT at M=12 (TP4, pooled). In the model it touches only TP8's Q-B: -1.7 us warm at M=1..3, +0.44 +/- 0.12 us warm at M=12, cold within.",
+  "NEXT matches cold in this harness (and in h1016): flush, prefetch and join before a single replay leave the pair as slow as a plain flush. The state is measured as the bench defines it."
+ ],
+ "dropped_from_original": [
+  "(4096, 1280) block_M=64 threads=64 drop: unstated in #1016. It helps only the bench's indexer kernel, which the model never builds from this table, and it is no faster (slower in 4 of 5 processes) on TP8 Q-B",
+  "(4096, 1280) block_M=16 block_N 64->128: slower at M=12 in the bench (epilogue passes) and on TP8 Q-B",
+  "(12288|8192, 1280) block_M=32 block_N 64->128: no gain at M=24; TP3 up to +4..6 us in single processes",
+  "(16384|6144|2048, 1280) TILE_CONTIGUOUS_FP8 and DECODE_FP8_CONFIGS entries: TP2/TP6/TP7, outside the chained bench. TP6/TP7's trimmed rank unpacks and repacks Q-B, so they need their own change and bench"
+ ],
+ "caveats": [
+  "The gain is small and confined to M = 33..64 rows with Q-B warm in L2. In cold and NEXT-prefetched L2, closer to serving, r1 is neutral within the interval.",
+  "TP3 warm is allocation-sensitive (one process of four disagrees); TP4 is consistent.",
+  "One host (sp4). No serving run; the next candidate's qualification decides end to end."
+ ],
+ "reason": "Bit-exact everywhere: outputs hash-equal across images for every pair and M, every arm torch.equal in process, LayerChain digests equal, and pytest passes on both boots. At M = 1..24 r1 compiles 1107's kernels in every pair, so it cannot be slower there. At M = 48, the only changed cell, it gains beyond the interval with the weights warm in L2: TP4 -3.14 +/- 0.30 us paired (x-img -2.89, boot ranges separate) and TP3 -5.14 us paired (x-img -7.70, boot ranges separate; one process of four +2.0). It is within the interval cold and NEXT on both shapes and both indexer builds, and the model's TP8 Q-B is unchanged. No M cell in any L2 state is slower than 1107. The correction drops everything in #1016 that gained nothing, was slower, or fell outside the bench."
+}

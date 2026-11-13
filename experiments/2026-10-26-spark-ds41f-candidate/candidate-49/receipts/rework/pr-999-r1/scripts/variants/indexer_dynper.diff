@@ -1,0 +1,48 @@
+--- c49-orig/indexer.py	2026-11-09 07:57:36.175304929 +0000
++++ src/variants/indexer_dynper.py	2026-11-09 07:48:51.453944978 +0000
+@@ -1158,8 +1158,9 @@
+         """Write the selected indices and keys to sel_idx/sel_key in index order.
+ 
+         Ties at the threshold keep the lowest indices. Each thread owns
+-        keys[tx * per : (tx + 1) * per]. Leaves the selected count in
+-        scan[threads - 1].
++        keys[tx * own : (tx + 1) * own], where ``own`` is ``per``, or with an
++        active count ``n`` the ``ceil(n / threads)`` that spreads keys[0:n]
++        over every thread. Leaves the selected count in scan[threads - 1].
+         """
+         key = T.alloc_var(T.int32)
+         n_gt = T.alloc_var(T.int32)
+@@ -1173,10 +1174,11 @@
+         need = params[1]
+         n_gt = 0
+         n_eq = 0
+-        if n is None or tx * per < n:
+-            for v in T.serial(per):
+-                if n is None or tx * per + v < n:
+-                    key = T.cast(keys[_swizzle_key_idx(tx * per + v, swizzle)], T.int32)
++        own = per if n is None else T.ceildiv(n, threads)
++        if n is None or tx * own < n:
++            for v in T.serial(own):
++                if n is None or tx * own + v < n:
++                    key = T.cast(keys[_swizzle_key_idx(tx * own + v, swizzle)], T.int32)
+                     if key > thr:
+                         n_gt += 1
+                     elif key == thr:
+@@ -1192,13 +1194,13 @@
+         out_pos = scan[tx] - n_gt - sel_eq
+         taken = 0
+         if (n_gt > 0) | (sel_eq > 0):
+-            for v in T.serial(per):
+-                if n is None or tx * per + v < n:
+-                    key = T.cast(keys[_swizzle_key_idx(tx * per + v, swizzle)], T.int32)
++            for v in T.serial(own):
++                if n is None or tx * own + v < n:
++                    key = T.cast(keys[_swizzle_key_idx(tx * own + v, swizzle)], T.int32)
+                     if (key > thr) | ((key == thr) & (taken < sel_eq)):
+                         if key == thr:
+                             taken += 1
+-                        sel_idx[out_pos] = tx * per + v
++                        sel_idx[out_pos] = tx * own + v
+                         sel_key[out_pos] = T.cast(key, sel_key.dtype)
+                         out_pos += 1
+         T.sync_threads()

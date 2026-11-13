@@ -1,0 +1,865 @@
+From b15b07de21202825dbf2fbf4211a19c1bc8ab197 Mon Sep 17 00:00:00 2001
+From: Christopher Owen <3221756+christopherowen@users.noreply.github.com>
+Date: Sun, 8 Nov 2026 23:10:00 +0100
+Subject: [PATCH] perf(dsv41): overlap decode KV/indexer-key writes with
+ query/index-query on aux_stream
+
+Base: 1107 vLLM patch head 2756478b60b90700b9918b457aeb38657da637b5.
+
+Rationale:
+1. In DeepSeek-V4.1 decode on GB10 (48 SMs), the pre-indexer_score region after wq_b and compressor._project_local consists of small kernels (1 to 24 CTAs at M=1..48) separated by serial stream dependencies:
+   - KV+Index source layers (Layers 2, 8, 14 with ratio=2; Layer 20 with ratio=1): compressor._finish_project (gather_columns_into) -> gather_partial_state -> compress(write_kv=True) -> _issue_wo_prefetch(after="compressor") -> project_bf16_partials(indexer.wk) -> _write_index_keys -> tl_metadata.pages, followed serially by _index_query (indexer.wq_b + indexer.weights_proj), _rope(q), _index_chunk (indexer_score + indexer_topk), and _shared_decode_metadata (tl_metadata.decode_metadata).
+   - Index-only reindex layers (Layers 24, 28, 32, 36 with ratio=1, compressor=None): _rope(q) -> indexer.wq_b -> indexer.weights_proj before _index_chunk.
+2. Factor DeepseekCompressor._project(hidden_states) in vllm/models/deepseek_v4_1/compressor.py into _project_local(hidden_states) (project_parts + tensor_model_parallel_all_gather) and _finish_project(gathered, rows) (gather_columns_into) so tensor-parallel all_gather remains on the primary stream before forking aux_stream().
+3. Carve two disjoint preallocated workspace slices (main_scratch, aux_scratch) inside _build_tilelang_plans via _decode_overlap_workspace_specs(DECODE_CHUNK) and schedule independent decode work across main_stream and aux_stream():
+   - On KV+Index source layers: Phase 1 overlaps _index_query (indexer.wq_b + indexer.weights_proj) on aux_stream with compressor._finish_project + compressor._forward_tilelang + _issue_wo_prefetch(after="compressor") + indexer.wk + _write_index_keys + tl_metadata.pages on main_stream. Phase 2 overlaps _rope(q) + _shared_decode_metadata on aux_stream with _index_chunk (indexer_score + indexer_topk) on main_stream before joining for _attend (sparse_mla).
+   - On Index-only reindex layers: overlaps _rope(q) + indexer.weights_proj on aux_stream with project_block32_rope_mxfp4_decode(indexer.wq_b) on main_stream before joining for forward_mqa.
+   - All cross-stream tensor lifetimes are recorded via record_stream so captured CUDA graphs and eager decode preserve allocator safety.
+
+Quality:
+Bit-identical (torch.equal, 0 uint16 diffs, max_abs_diff == 0.0) across all TP4 and TP3 shapes (M = 1..48) and all three indexed layer families, both in eager mode and inside captured CUDA graphs.
+
+Tests:
+- pytest tests/models/test_deepseek_v4_1_attention.py tests/models/test_deepseek_v4_1_compressor.py tests/models/test_deepseek_v4_1_compressor_prepare.py tests/models/test_deepseek_v4_1_l2_schedule.py tests/kernels/test_deepseek_v41_tilelang_pdl.py (127 passed across 2 boots).
+
+Upstream status: local DeepSeek V4.1 TileLang decode dual-stream attention/compressor/indexer overlap for GB10.
+---
+ tests/models/test_deepseek_v4_1_attention.py  | 276 +++++++++++++++
+ vllm/models/deepseek_v4_1/attention.py        | 318 ++++++++++++++++--
+ vllm/models/deepseek_v4_1/compressor.py       |  20 +-
+ .../deepseek_v4_1/tilelang/attention.py       |   2 +
+ 4 files changed, 578 insertions(+), 38 deletions(-)
+
+diff --git a/tests/models/test_deepseek_v4_1_attention.py b/tests/models/test_deepseek_v4_1_attention.py
+index e25f715cb7..1e4258e067 100644
+--- a/tests/models/test_deepseek_v4_1_attention.py
++++ b/tests/models/test_deepseek_v4_1_attention.py
+@@ -123,6 +123,8 @@ def test_context_kv_write_uses_the_tilelang_writer(monkeypatch):
+ 
+ 
+ def test_global_preparation_populates_caches_before_forward():
++    import contextlib
++
+     from vllm.models.deepseek_v4_1 import attention
+ 
+     device = "cuda" if torch.cuda.is_available() else "cpu"
+@@ -168,6 +170,8 @@ def test_front_is_one_kernel_across_row_counts(monkeypatch):
+     one launch across decode and prefill row counts, at the SWA slots and page size,
+     and Q-B gets its cast; memory profiling (no cache pages) and breakable graphs run
+     the separate kernels."""
++    import contextlib
++
+     from vllm.models.deepseek_v4_1 import attention
+     from vllm.models.deepseek_v4_1.tilelang import front
+ 
+@@ -305,6 +309,8 @@ def test_index_query_fuses_wqb_rope_mxfp4_decode(monkeypatch):
+ 
+ 
+ def test_prepare_global_kv_fuses_index_key_and_latent_writes(monkeypatch):
++    import contextlib
++
+     from vllm.models.deepseek_v4_1 import attention
+     from vllm.models.deepseek_v4_1.tilelang import attention as tl_attention
+     from vllm.models.deepseek_v4_1.tilelang import cache_writer
+@@ -436,6 +442,8 @@ def test_attention_forward_releases_intermediates_before_o_proj(monkeypatch):
+ def test_forward_mqa_shares_index_pages_without_mixed_step_clobber(monkeypatch):
+     """Single-chunk index page tables are shared across layers sharing ``im``,
+     and mixed decode+prefill steps never clobber the cached decode slice."""
++    import contextlib
++
+     from vllm.models.deepseek_v4_1 import attention
+     from vllm.models.deepseek_v4_1.tilelang import metadata as tl_metadata
+ 
+@@ -543,6 +551,8 @@ def test_prepare_global_kv_fuses_compressor_indexed_kv_and_wk_partials(monkeypat
+     ``_prepare_global_kv`` fuses the ``indexed`` KV write into ``compressor(...)``
+     and passes 3D split-K partials from ``project_bf16_partials`` to
+     ``_write_index_keys`` without launching ``_write_v41_cache``."""
++    import contextlib
++
+     from vllm.models.deepseek_v4_1 import attention
+     from vllm.models.deepseek_v4_1.compressor import DeepseekCompressor
+     from vllm.models.deepseek_v4_1.tilelang import attention as tl_attention
+@@ -854,6 +864,8 @@ def test_tp3_rank2_trims_zero_padded_output_group(monkeypatch):
+     0 and 1 keep all 3 real groups (24 heads)."""
+     from torch import nn
+ 
++    import contextlib
++
+     from vllm.models.deepseek_v4_1 import attention
+     from vllm.models.deepseek_v4_1.tilelang import wo
+ 
+@@ -1079,6 +1091,8 @@ def test_sp_wo_rank_groups_and_declaration_binds_peer_shards(monkeypatch, world_
+     leave CED decoder / draft layers on their single local shard."""
+     from torch import nn
+ 
++    import contextlib
++
+     from vllm.models.deepseek_v4_1 import attention
+     from vllm.models.deepseek_v4_1.tilelang import prepare
+     from vllm.models.deepseek_v4_1.tilelang import wo as tl_wo
+@@ -1624,3 +1638,265 @@ def test_sp_wo_local_exchange_matches_native_tilelang_kernels_on_sm12x(monkeypat
+             actual_sum = collectives.RankOrderParts(parts).sum()
+             expected_sum = collectives.RankOrderParts(expected).sum()
+             assert torch.equal(actual_sum.view(torch.int16), expected_sum.view(torch.int16))
++
++
++def test_decode_two_stream_overlap_schedules_disjoint_workspaces(monkeypatch):
++    """On decode steps, ``_forward`` forks ``aux_stream`` with disjoint workspace
++    slices: KV+Index source layers overlap ``_index_query`` with the post-gather
++    compressor + index-key write chain and overlap ``_rope(q)`` + decode metadata
++    with ``_index_chunk``; index-only reindex layers overlap ``_rope(q)`` +
++    ``indexer.weights_proj`` with ``indexer.wq_b``."""
++    import contextlib
++
++    from vllm.models.deepseek_v4_1 import attention
++    from vllm.models.deepseek_v4_1.compressor import DeepseekCompressor
++    from vllm.models.deepseek_v4_1.tilelang.linear import MXFP8Rows
++    from vllm.v1.worker import workspace as ws_mod
++
++    events = []
++    ws_buf = torch.zeros(65536, dtype=torch.uint8)
++
++    class _FakeStream:
++        def __init__(self, name):
++            self.name = name
++
++        def wait_stream(self, other):
++            events.append(("wait_stream", self.name, getattr(other, "name", "main")))
++
++    main_s = _FakeStream("main")
++    aux_s = _FakeStream("aux")
++    active_stream = [main_s]
++
++    @contextlib.contextmanager
++    def fake_stream_ctx(s):
++        prev = active_stream[0]
++        active_stream[0] = s
++        try:
++            yield
++        finally:
++            active_stream[0] = prev
++
++    class _FakeWM:
++        def get_simultaneous(self, *specs):
++            out, off = [], 0
++            for shape, dtype in specs:
++                n = dtype.itemsize
++                for d in shape:
++                    n *= d
++                out.append(ws_buf[off : off + n].view(dtype).view(shape))
++                off += (n + 255) // 256 * 256
++            return tuple(out)
++
++    monkeypatch.setattr(attention, "aux_stream", lambda: aux_s)
++    monkeypatch.setattr(attention, "current_workspace_manager", lambda: _FakeWM())
++    monkeypatch.setattr(attention, "retain_cuda_graph_capture_resource", lambda _: None)
++    monkeypatch.setattr(torch.cuda, "current_stream", lambda *_: active_stream[0])
++    monkeypatch.setattr(torch.cuda, "stream", fake_stream_ctx)
++    monkeypatch.setattr(torch.cuda, "is_current_stream_capturing", lambda: False)
++    monkeypatch.setattr(torch.Tensor, "record_stream", lambda self, s: None)
++
++    module = _tilelang_layer(layer_id=2)
++    module._ready = True
++    module.is_draft = False
++    module.index_source_layer_id = 2
++    module._context = {module.prefix: module}
++    module._draft_replays = False
++    module._l2pf_wo = None
++    module._l2pf_comp = None
++    module._owner = lambda: module
++    module.q_lora_rank = 16
++    module.n_local_heads = 2
++    module.compress_ratio = 2
++    module._main_page = 64
++    module._index_page = 64
++    module._index_width = 16
++    module.DECODE_CHUNK = 64
++    module.INDEX_CHUNK = 64
++    module.candidate_source_layer = 20
++    module._attention_geometry()
++    module._short_index_shape = None
++    module.topk_indices_buffer = torch.zeros(64, 512, dtype=torch.int32)
++    module._index_pages = torch.zeros(64, 16, dtype=torch.int32)
++    module._active = torch.tensor([1024], dtype=torch.int32)
++    module.kv_cache = torch.zeros(4, 64 * 288, dtype=torch.uint8)
++    module.swa_cache_layer = SimpleNamespace(
++        prefix="swa", block_size=64, kv_cache=torch.zeros(4, 64 * 528, dtype=torch.uint8)
++    )
++    module.rotary_emb = SimpleNamespace(
++        cos_sin_cache=SimpleNamespace(is_cuda=True, shape=(4096, 64))
++    )
++
++    comp = DeepseekCompressor.__new__(DeepseekCompressor)
++    torch.nn.Module.__init__(comp)
++    comp.compress_ratio = 2
++    comp._values = torch.zeros(64, 512)
++    comp._latent = torch.zeros(64, 512, dtype=torch.bfloat16)
++    comp._slots = torch.arange(64, dtype=torch.int64)
++    comp.state_cache = SimpleNamespace(prefix="state")
++    monkeypatch.setattr(
++        DeepseekCompressor,
++        "_project_local",
++        lambda self, h: (events.append(("project_local", active_stream[0].name)), "gathered")[1],
++    )
++    monkeypatch.setattr(
++        DeepseekCompressor,
++        "_finish_project",
++        lambda self, g, r: events.append(
++            ("finish_project", active_stream[0].name, g, ws_mod.current_preallocated_workspace().data_ptr())
++        ),
++    )
++    monkeypatch.setattr(
++        DeepseekCompressor,
++        "_forward_tilelang",
++        lambda self, r, m, s, **kw: events.append(
++            ("forward_tilelang", active_stream[0].name, kw["kv_cache"] is module.kv_cache)
++        ),
++    )
++    module.compressor = comp
++
++    def fake_wqb(qr):
++        events.append(("indexer.wq_b", active_stream[0].name, ws_mod.current_preallocated_workspace().data_ptr()))
++        return torch.zeros(qr.shape[0], 4 * 128, dtype=torch.bfloat16)
++
++    fake_wqb.quant_method = SimpleNamespace(get_workspace_size=lambda lyr, n: 1024)
++
++    def fake_hw(h):
++        events.append(("indexer.weights_proj", active_stream[0].name, ws_mod.current_preallocated_workspace().data_ptr()))
++        return torch.ones(h.shape[0], 4, dtype=torch.bfloat16)
++
++    fake_hw.quant_method = SimpleNamespace(get_workspace_size=lambda lyr, n: 2048)
++
++    def fake_wk(lat):
++        events.append(("indexer.wk", active_stream[0].name, ws_mod.current_preallocated_workspace().data_ptr()))
++        return torch.zeros(lat.shape[0], 128, dtype=torch.bfloat16)
++
++    fake_wk.quant_method = SimpleNamespace(get_workspace_size=lambda lyr, n: 1536)
++
++    module.indexer = SimpleNamespace(
++        heads=4,
++        wq_b=fake_wqb,
++        weights_proj=fake_hw,
++        wk=fake_wk,
++        k_norm=SimpleNamespace(weight=torch.ones(128), variance_epsilon=1e-6),
++        k_cache=SimpleNamespace(prefix="idx", kv_cache=torch.zeros(4, 64 * 132, dtype=torch.uint8)),
++    )
++    cls = type(module)
++    monkeypatch.setattr(
++        cls,
++        "_quantize_index_query",
++        lambda self, mode, iq, d, s, positions=None: None,
++    )
++    monkeypatch.setattr(
++        cls,
++        "_write_index_keys",
++        lambda self, k, slots, positions=None: events.append(("write_index_keys", active_stream[0].name)),
++    )
++    monkeypatch.setattr(
++        cls,
++        "_rope",
++        lambda self, x, pos, role: (events.append(("rope", role, active_stream[0].name)), x)[1],
++    )
++    monkeypatch.setattr(
++        cls,
++        "_write_decode_metadata",
++        lambda self, bufs, swa, main, rows: events.append(("decode_metadata", active_stream[0].name)),
++    )
++    monkeypatch.setattr(
++        cls,
++        "_check_attention_rows",
++        lambda self, mode, rows: None,
++    )
++    monkeypatch.setattr(
++        cls,
++        "_attention_scratch_specs",
++        lambda self, mode, rows: (((256,), torch.uint8),),
++    )
++    monkeypatch.setattr(
++        cls,
++        "_index_chunk",
++        lambda self, mode, rows, **kw: events.append(("index_chunk", active_stream[0].name)),
++    )
++    monkeypatch.setattr(
++        cls,
++        "_attend",
++        lambda self, mode, q, output, **kw: (events.append(("attend", active_stream[0].name)), output.zero_()),
++    )
++    from vllm.models.deepseek_v4_1.tilelang import metadata as tl_metadata
++
++    monkeypatch.setattr(
++        tl_metadata,
++        "pages",
++        lambda *a, **k: events.append(("pages", active_stream[0].name)),
++    )
++
++    q_cast = MXFP8Rows(
++        torch.zeros(4, 16, dtype=torch.bfloat16),
++        torch.zeros(64, 16, dtype=torch.uint8),
++        torch.zeros(64, 4, dtype=torch.uint8),
++    )
++    module.fused_wqa_wkv = lambda h: (torch.zeros(4, 528, dtype=torch.bfloat16), None)
++    module._front = lambda qr_kv, pos: (
++        q_cast.rows,
++        torch.zeros(4, 512, dtype=torch.bfloat16),
++        q_cast,
++    )
++    module.wq_b = lambda qr: torch.zeros(4, 2 * 512, dtype=torch.bfloat16)
++    module._o_proj = lambda out, sp_rows=None: out.view(4, -1)
++
++    swa_meta = SimpleNamespace(
++        is_decode=True,
++        slot_mapping=torch.arange(4, dtype=torch.int64),
++        req_id_per_token=torch.arange(4, dtype=torch.int32),
++        cache_lengths=torch.full((4,), 64, dtype=torch.int32),
++        block_table=torch.ones((4, 16), dtype=torch.int32),
++        positions=torch.arange(4, dtype=torch.int64),
++        query_start_loc=torch.arange(5, dtype=torch.int32),
++        request_positions=torch.zeros(4, dtype=torch.int64),
++    )
++    ctx = SimpleNamespace(
++        attn_metadata={
++            "swa": swa_meta,
++            module.prefix: swa_meta,
++            "state": swa_meta,
++            "idx": swa_meta,
++        }
++    )
++    monkeypatch.setattr(attention, "get_forward_context", lambda: ctx)
++
++    module._forward(torch.arange(4, dtype=torch.int64), torch.zeros(4, 32, dtype=torch.bfloat16))
++
++    # project_local runs on main before forking aux; _index_query runs on aux while
++    # finish_project + forward_tilelang + wk + write_index_keys run on main with a
++    # disjoint workspace pointer; then rope(q) + decode_metadata run on aux while
++    # index_chunk runs on main.
++    aux_ptrs = {e[2] for e in events if e[0] in ("indexer.wq_b", "indexer.weights_proj")}
++    main_ptrs = {e[2] for e in events if e[0] == "indexer.wk"}
++    assert len(aux_ptrs) == 1 and len(main_ptrs) == 1
++    assert aux_ptrs != main_ptrs
++    names = [(e[0], e[1]) if e[0] != "rope" else (e[0], e[1], e[2]) for e in events]
++    assert ("project_local", "main") in names
++    assert ("indexer.wq_b", "aux") in names
++    assert ("indexer.weights_proj", "aux") in names
++    assert ("forward_tilelang", "main") in names
++    assert ("indexer.wk", "main") in names
++    assert ("write_index_keys", "main") in names
++    assert ("pages", "main") in names
++    assert ("rope", "q", "aux") in names
++    assert ("decode_metadata", "aux") in names
++    assert ("index_chunk", "main") in names
++    assert ("attend", "main") in names
++
++    # Index-only reindex layer (compressor is None): rope(q) + weights_proj on aux
++    # overlap with wq_b on main with disjoint workspaces, joining before forward_mqa.
++    events.clear()
++    module.compressor = None
++    module._forward(torch.arange(4, dtype=torch.int64), torch.zeros(4, 32, dtype=torch.bfloat16))
++    wqb_ptrs = {e[2] for e in events if e[0] == "indexer.wq_b"}
++    hw_ptrs = {e[2] for e in events if e[0] == "indexer.weights_proj"}
++    assert len(wqb_ptrs) == 1 and len(hw_ptrs) == 1 and wqb_ptrs != hw_ptrs
++    names_reidx = [(e[0], e[1]) if e[0] != "rope" else (e[0], e[1], e[2]) for e in events]
++    assert ("rope", "q", "aux") in names_reidx
++    assert ("indexer.weights_proj", "aux") in names_reidx
++    assert ("indexer.wq_b", "main") in names_reidx
++    assert ("index_chunk", "main") in names_reidx
++    assert ("attend", "main") in names_reidx
+diff --git a/vllm/models/deepseek_v4_1/attention.py b/vllm/models/deepseek_v4_1/attention.py
+index cf600a6752..7060a1fefe 100644
+--- a/vllm/models/deepseek_v4_1/attention.py
++++ b/vllm/models/deepseek_v4_1/attention.py
+@@ -49,10 +49,12 @@ from vllm.models.deepseek_v4_1.tilelang.gemm import DECODE_ROWS
+ from vllm.models.deepseek_v4_1.tilelang.indexer import CANDIDATE_BLOCKS
+ from vllm.models.deepseek_v41.common.rope import build_deepseek_v4_rope
+ from vllm.utils.math_utils import cdiv
++from vllm.utils.torch_utils import aux_stream
+ from vllm.v1.kv_cache_interface import MLAAttentionSpec, SlidingWindowMLASpec
+ from vllm.v1.worker.workspace import (
+     current_workspace_manager,
+     retain_cuda_graph_capture_resource,
++    use_preallocated_workspace,
+ )
+ 
+ logger = init_logger(__name__)
+@@ -892,6 +894,8 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase):
+                 setattr(self, name, torch.empty(shape, dtype=dtype, device=device))
+         if self.indexer is not None:
+             self._active.fill_(self._index_width * self._index_page)
++        if torch.device(device).type == "cuda":
++            aux_stream()
+         self._ready = True
+ 
+     def _rope(self, x, positions, role: str):
+@@ -1016,13 +1020,7 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase):
+             if self.compressor.state_cache is not None
+             else None
+         )
+-        fuse_kv_write = (
+-            type(self.compressor) is DeepseekCompressor
+-            and "_write_v41_cache" not in self.__dict__
+-            and self.kv_cache.ndim == 2
+-            and self.kv_cache.dtype == torch.uint8
+-            and self.kv_cache.shape[1] >= self._main_page * 288
+-        )
++        fuse_kv_write = DeepseekV4Attention._fuse_compressor_kv_write(self)
+         if fuse_kv_write:
+             latent, slots = self.compressor(
+                 hidden_states,
+@@ -1036,6 +1034,30 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase):
+             )
+         else:
+             latent, slots = self.compressor(hidden_states, main, state, **sp_kwargs)
++        DeepseekV4Attention._write_compressed_index_keys(
++            self, positions, rows, metadata, latent, slots, fuse_kv_write
++        )
++
++    def _fuse_compressor_kv_write(self) -> bool:
++        return (
++            type(self.compressor) is DeepseekCompressor
++            and "_write_v41_cache" not in self.__dict__
++            and self.kv_cache.ndim == 2
++            and self.kv_cache.dtype == torch.uint8
++            and self.kv_cache.shape[1] >= self._main_page * 288
++        )
++
++    def _write_compressed_index_keys(
++        self,
++        positions,
++        rows: int,
++        metadata,
++        latent: torch.Tensor,
++        slots: torch.Tensor,
++        fuse_kv_write: bool,
++    ) -> None:
++        indexer = self.indexer
++        assert indexer is not None
+         self._issue_wo_prefetch(rows, after="compressor")
+         # Index K consumes the ordinary-normalized PRE-RoPE latent; norm, RoPE
+         # and the paged MXFP4 write run in one kernel. At decode sizes, wk's
+@@ -1063,6 +1085,178 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase):
+                 positions=positions,
+             )
+ 
++    @staticmethod
++    def _layer_workspace_bytes(layer: nn.Module | None, rows: int) -> int:
++        method = getattr(layer, "quant_method", None)
++        fn = getattr(method, "get_workspace_size", None)
++        return int(fn(layer, rows)) if callable(fn) else 0
++
++    def _decode_overlap_workspace_specs(self, rows: int):
++        if self.indexer is None:
++            return ()
++        main_bytes = (
++            self._layer_workspace_bytes(self.indexer.wk, rows)
++            if self.compressor is not None
++            else self._layer_workspace_bytes(self.indexer.wq_b, rows)
++        )
++        aux_bytes = max(
++            self._layer_workspace_bytes(self.indexer.weights_proj, rows),
++            self._layer_workspace_bytes(self.indexer.wq_b, rows)
++            if self.compressor is not None
++            else 0,
++        )
++        return (
++            ((max(256, main_bytes),), torch.uint8),
++            ((max(256, aux_bytes),), torch.uint8),
++        )
++
++    def _can_overlap_decode(
++        self, swa, sp_rows, front_wrote_kv: bool, rows: int
++    ) -> bool:
++        if (
++            not getattr(swa, "is_decode", False)
++            or sp_rows is not None
++            or not front_wrote_kv
++            or self.indexer is None
++            or rows == 0
++            or rows > self.DECODE_CHUNK
++            or is_breakable_cudagraph_enabled()
++            or not self.rotary_emb.cos_sin_cache.is_cuda
++        ):
++            return False
++        if any(
++            name in self.__dict__
++            for name in (
++                "_prepare_global_kv",
++                "_index_query",
++                "forward_mqa",
++                "_rope",
++                "_write_v41_cache",
++                "_write_index_keys",
++                "_quantize_index_query",
++            )
++        ):
++            return False
++        if self.compressor is not None and (
++            type(self.compressor) is not DeepseekCompressor
++            or "_forward_tilelang" in self.compressor.__dict__
++            or "_project" in self.compressor.__dict__
++        ):
++            return False
++        return aux_stream() is not None
++
++    def _forward_decode_overlapped(
++        self,
++        q: torch.Tensor,
++        qr: torch.Tensor,
++        positions: torch.Tensor,
++        hidden_states: torch.Tensor | None,
++        index_weights: torch.Tensor | None,
++        rows: int,
++        metadata: dict[str, DeepseekV41B12xMetadata],
++        swa: DeepseekV41B12xMetadata,
++        original_swa: DeepseekV41B12xMetadata,
++        q_cast,
++    ):
++        stream = aux_stream()
++        assert stream is not None and self.indexer is not None
++        main_stream = torch.cuda.current_stream(q.device)
++        main_scratch, aux_scratch = current_workspace_manager().get_simultaneous(
++            *self._decode_overlap_workspace_specs(rows)
++        )
++        retain_cuda_graph_capture_resource(main_scratch)
++        for tensor in (
++            qr,
++            hidden_states,
++            index_weights,
++            getattr(q_cast, "values", None),
++            getattr(q_cast, "scales", None),
++        ):
++            if isinstance(tensor, torch.Tensor):
++                tensor.record_stream(stream)
++        if (
++            self.compressor is not None
++            and swa is original_swa
++            and hidden_states is not None
++        ):
++            if self.compressor._values is None:
++                raise RuntimeError(
++                    "compressor kernels must be bound before forwarding"
++                )
++            gathered = self.compressor._project_local(hidden_states)
++            stream.wait_stream(main_stream)
++            with (
++                torch.cuda.stream(stream),
++                use_preallocated_workspace(aux_scratch),
++            ):
++                query = self._index_query(
++                    qr,
++                    positions,
++                    hidden_states,
++                    index_weights,
++                    0,
++                    rows,
++                    swa,
++                    q_cast,
++                )
++            for tensor in query:
++                tensor.record_stream(main_stream)
++            main = metadata[self._owner().prefix]
++            state = (
++                metadata[self.compressor.state_cache.prefix]
++                if self.compressor.state_cache is not None
++                else None
++            )
++            fuse_kv_write = DeepseekV4Attention._fuse_compressor_kv_write(self)
++            with use_preallocated_workspace(main_scratch):
++                self.compressor._finish_project(gathered, rows)
++                self.compressor._forward_tilelang(
++                    rows,
++                    main,
++                    state,
++                    kv_cache=self.kv_cache if fuse_kv_write else None,
++                    token_positions=positions if fuse_kv_write else None,
++                    cos_sin=self.rotary_emb.cos_sin_cache if fuse_kv_write else None,
++                    kv_page_size=self._main_page if fuse_kv_write else None,
++                )
++                latent = self.compressor._latent[:rows]
++                slots = self.compressor._slots[:rows]
++                self._write_compressed_index_keys(
++                    positions, rows, metadata, latent, slots, fuse_kv_write
++                )
++            del q_cast
++            self._pending_decode_aux = stream
++            return (*query, None, None)
++
++        q.record_stream(stream)
++        stream.wait_stream(main_stream)
++        with (
++            torch.cuda.stream(stream),
++            use_preallocated_workspace(aux_scratch),
++        ):
++            if self.n_local_heads > 0:
++                self._rope(q, positions, "q")
++            weights = (
++                index_weights[:rows]
++                if index_weights is not None
++                else self.indexer.weights_proj(hidden_states)[:rows]
++            )
++        weights.record_stream(main_stream)
++        with use_preallocated_workspace(main_scratch):
++            iq_data, iq_scale, _ = self._index_query(
++                qr,
++                positions,
++                hidden_states,
++                weights,
++                0,
++                rows,
++                swa,
++                q_cast,
++            )
++        del q_cast
++        main_stream.wait_stream(stream)
++        return (iq_data, iq_scale, weights, None, None)
++
+     def forward(self, positions, hidden_states, llama_4_scaling=None):
+         if hidden_states.shape[0] == 0:
+             return torch.empty_like(hidden_states)
+@@ -1214,14 +1408,14 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase):
+         if self.indexer is None:
+             del q_cast
+         self._issue_wo_prefetch(rows, after="q-b")
+-        if self.n_local_heads > 0:
+-            q = self._rope(q, positions, "q")
+         metadata = cast(
+             dict[str, DeepseekV41B12xMetadata] | None,
+             get_forward_context().attn_metadata,
+         )
+         if not isinstance(metadata, dict):
+             # Memory profiling has no cache pages; serving does not use this branch.
++            if self.n_local_heads > 0:
++                q = self._rope(q, positions, "q")
+             q_cast = None
+             del qr, kv, hidden_states, index_weights, q_cast
+             output = torch.zeros_like(q)
+@@ -1229,46 +1423,71 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase):
+         else:
+             original_swa = metadata[self.swa_cache_layer.prefix]
+             swa = self._query_metadata(original_swa)
++            overlap_decode = self._can_overlap_decode(
++                swa, sp_rows, front_wrote_kv, rows
++            )
++            if not overlap_decode and self.n_local_heads > 0:
++                q = self._rope(q, positions, "q")
+             if not front_wrote_kv:  # the front's kernel wrote the record
+                 self._cache_context_kv(kv, positions)
+-            if swa is original_swa and hidden_states is not None:
+-                self._prepare_global_kv(positions, hidden_states)
+-            index_query = None
+-            if self.indexer is not None:
+-                # Sequence-parallel prefill: the indexer is replicated, so each
+-                # rank scores and selects only its own rows, and forward_mqa
+-                # gathers the selected positions. Every row is independent.
+-                split = sp_rows if sp_rows is not None and not swa.is_decode else None
+-                first = split.start if split is not None else 0
+-                last = first + split.real_rows if split is not None else rows
+-                query = self._index_query(
++            if overlap_decode:
++                index_query = self._forward_decode_overlapped(
++                    q,
+                     qr,
+                     positions,
+                     hidden_states,
+                     index_weights,
+-                    first,
+-                    last,
++                    rows,
++                    metadata,
+                     swa,
++                    original_swa,
+                     q_cast,
+                 )
+-                reference = None
+-                if split is not None and _INDEX_SPLIT_CHECK:
+-                    reference = self._index_query(
++                del q_cast, qr, hidden_states, index_weights
++                output = torch.empty_like(q)
++                self.forward_mqa(q, kv, positions, output, index_query=index_query)
++                del q, kv, index_query
++            else:
++                if swa is original_swa and hidden_states is not None:
++                    self._prepare_global_kv(positions, hidden_states)
++                index_query = None
++                if self.indexer is not None:
++                    # Sequence-parallel prefill: the indexer is replicated, so each
++                    # rank scores and selects only its own rows, and forward_mqa
++                    # gathers the selected positions. Every row is independent.
++                    split = (
++                        sp_rows if sp_rows is not None and not swa.is_decode else None
++                    )
++                    first = split.start if split is not None else 0
++                    last = first + split.real_rows if split is not None else rows
++                    query = self._index_query(
+                         qr,
+                         positions,
+                         hidden_states,
+                         index_weights,
+-                        0,
+-                        rows,
++                        first,
++                        last,
+                         swa,
+                         q_cast,
+                     )
+-                del q_cast
+-                index_query = (*query, split, reference)
+-            del qr, hidden_states, index_weights
+-            output = torch.empty_like(q)
+-            self.forward_mqa(q, kv, positions, output, index_query=index_query)
+-            del q, kv, index_query
++                    reference = None
++                    if split is not None and _INDEX_SPLIT_CHECK:
++                        reference = self._index_query(
++                            qr,
++                            positions,
++                            hidden_states,
++                            index_weights,
++                            0,
++                            rows,
++                            swa,
++                            q_cast,
++                        )
++                    del q_cast
++                    index_query = (*query, split, reference)
++                del qr, hidden_states, index_weights
++                output = torch.empty_like(q)
++                self.forward_mqa(q, kv, positions, output, index_query=index_query)
++                del q, kv, index_query
+         return self._o_proj(output, sp_rows=sp_rows)
+ 
+     def _issue_wo_prefetch(self, rows, *, after):
+@@ -1414,6 +1633,7 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase):
+ 
+     @eager_break_during_capture
+     def forward_mqa(self, q, kv, positions, output, *, index_query=None):
++        pending_aux = self.__dict__.pop("_pending_decode_aux", None)
+         metadata = get_forward_context().attn_metadata
+         swa = self._query_metadata(metadata[self.swa_cache_layer.prefix])
+         mode = "decode" if swa.is_decode else "extend"
+@@ -1557,6 +1777,33 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase):
+                             candidate_indices=source._candidates[row:row_end],
+                             candidate_lengths=source._candidate_lens[row:row_end],
+                         )
++                    if pending_aux is not None:
++                        main_stream = torch.cuda.current_stream(q.device)
++                        main_stream.wait_stream(pending_aux)
++                        main_meta = (
++                            self._query_metadata(
++                                metadata[self._owner().prefix]
++                            )
++                            if self.compress_ratio
++                            else None
++                        )
++                        decode_specs = self._attention_workspace_specs["decode"]
++                        q.record_stream(pending_aux)
++                        with torch.cuda.stream(pending_aux):
++                            if self.n_local_heads > 0:
++                                self._rope(q, positions, "q")
++                            if self.n_local_heads > 0 and not decode_rows:
++                                meta_bufs = self._shared_decode_metadata(
++                                    swa,
++                                    main_meta,
++                                    rows,
++                                    decode_specs,
++                                    q.device,
++                                )
++                            else:
++                                meta_bufs = ()
++                        for buf in meta_bufs:
++                            buf.record_stream(main_stream)
+                     self._index_chunk(
+                         index_mode,
+                         count,
+@@ -1572,6 +1819,9 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase):
+ 
+             if split is None:
+                 select(query, 0, self.topk_indices_buffer)
++                if pending_aux is not None:
++                    torch.cuda.current_stream(q.device).wait_stream(pending_aux)
++                    pending_aux = None
+             else:
+                 real = split.real_rows
+                 local = slice(split.start, split.start + real)
+@@ -1610,6 +1860,8 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase):
+                     )
+                 self.topk_indices_buffer[:rows].copy_(split.gather(selected))
+ 
++        if pending_aux is not None:
++            torch.cuda.current_stream(q.device).wait_stream(pending_aux)
+         if getattr(self, "n_local_heads", 1) == 0:
+             return
+         main = (
+diff --git a/vllm/models/deepseek_v4_1/compressor.py b/vllm/models/deepseek_v4_1/compressor.py
+index 65831409b5..999fe061a7 100644
+--- a/vllm/models/deepseek_v4_1/compressor.py
++++ b/vllm/models/deepseek_v4_1/compressor.py
+@@ -286,7 +286,7 @@ class DeepseekCompressor(nn.Module):
+         self._pending_tags = shared.pending_tags
+         self._local_ids = shared.local_ids
+ 
+-    def _project(self, hidden_states):
++    def _project_local(self, hidden_states):
+         from vllm.models.deepseek_v4_1.tilelang.linear import project_parts
+ 
+         rows = hidden_states.shape[0]
+@@ -298,7 +298,7 @@ class DeepseekCompressor(nn.Module):
+                 (self._values, self._gates)[: self.compress_ratio],
+                 rows,
+             )
+-            return
++            return None
+         part_cols = _compressor_part_cols(tp_size)
+         local = self._local_shards[: self.compress_ratio * rows].view(
+             self.compress_ratio, rows, part_cols
+@@ -309,16 +309,26 @@ class DeepseekCompressor(nn.Module):
+             tuple(local),
+             rows,
+         )
+-        from vllm.models.deepseek_v4_1.tilelang.gather import gather_columns_into
+-
+-        gathered = tensor_model_parallel_all_gather(
++        return tensor_model_parallel_all_gather(
+             local.view(self.compress_ratio * rows, part_cols), dim=0
+         )
++
++    def _finish_project(self, gathered, rows: int) -> None:
++        if gathered is None:
++            return
++        from vllm.models.deepseek_v4_1.tilelang.gather import gather_columns_into
++
++        tp_size = int(getattr(getattr(self, "fused_wkv_wgate", None), "tp_size", 1))
+         outputs = (self._values[:rows],)
+         if self.compress_ratio == 2:
+             outputs += (self._gates[:rows],)
+         gather_columns_into(gathered, outputs, tp_size)
+ 
++    def _project(self, hidden_states):
++        self._finish_project(
++            self._project_local(hidden_states), hidden_states.shape[0]
++        )
++
+     def _tilelang_calls(self) -> list:
+         """The TileLang compression kernels ``_forward_tilelang`` launches, as
+         ``prepare.call``s, for the step metadata's ``max_num_seqs`` requests."""
+diff --git a/vllm/models/deepseek_v4_1/tilelang/attention.py b/vllm/models/deepseek_v4_1/tilelang/attention.py
+index bc87e341bc..ddc4426cfc 100644
+--- a/vllm/models/deepseek_v4_1/tilelang/attention.py
++++ b/vllm/models/deepseek_v4_1/tilelang/attention.py
+@@ -326,6 +326,7 @@ class DeepseekV41TileLangAttention(DeepseekV4Attention):
+                 (*metadata_specs, *mla.scratch_specs(split_rows))
+                 for metadata_specs in self._attention_workspace_specs.values()
+             )
++        overlap_specs = self._decode_overlap_workspace_specs(self.DECODE_CHUNK)
+         self._scratch_reservations = (
+             *(plan.scratch_specs(chunks[mode]) for mode, plan in index.items()),
+             *(
+@@ -334,6 +335,7 @@ class DeepseekV41TileLangAttention(DeepseekV4Attention):
+                 else ()
+             ),
+             *(plan.scratch_specs(chunks[mode]) for mode, plan in native_index.items()),
++            *((overlap_specs,) if overlap_specs else ()),
+             *mla_reservations,
+         )
+         return SimpleNamespace(
+-- 
+2.43.0
+

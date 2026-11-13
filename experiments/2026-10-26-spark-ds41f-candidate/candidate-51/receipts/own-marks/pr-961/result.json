@@ -1,0 +1,68 @@
+{
+ "pr": 961,
+ "pr_head": "9362f944201a45fc0d74424ac0d73c5fc17cdf78",
+ "patch": "0781-perf-dsv41-64k-chunked-globaltimer-paced-l2-prefetch.patch",
+ "mark": "Its bench_l2_prefetch_ab.py (16 MiB cold prefetch, then the consumer read) on the image, 2 boots, ABBA against the base image, with the recipe's VLLM_L2_PREFETCH_GRID=2: the consumer read faster beyond the interval and the L2 hit share higher; its pytest passes; no decode cell of the engine grid worse",
+ "host": "sp8 (spark-0016, NVIDIA GB10)",
+ "arms": {
+  "base": "spark-ds41f:candidate-50 sha256:8c1ea1f62f62c3e2adc03b645c091a5499cf7163101aca32875c894b96f155db + candidate-50 no1009/overlay (4 files, ro): tree 14c5a2dc (candidate-50 without #1009)",
+  "c51": "the same image + the 15 files where candidate-51's tree differs (ro): tree 987ba058 (cc1115c5), verified file by file"
+ },
+ "evidence": "The PR's bench at 9362f944, unchanged, behind a >= 250 ms GPU warm-up, ABBA in one session (base boot1, c51 boot1, c51 boot2, base boot2), env VLLM_L2_PREFETCH_GRID=2 and VLLM_L2_PREFETCH_KERNELS=tilelang (the recipe's). The image A/B compares each arm's own TileLang prefetch kernel (the bench's cand_tl_64k_p200ns arm: base = 4 KiB grid-2, c51 = paced 64 KiB). The bench's in-process comparison (embedded 1107 orig_tp4_g2_4k against the image's kernel) is kept beside it. The decode chain is 4-layer CUDA-graph replay (35 replays a boot), the serving path; the standalone probe is eager event timing of one prefetch then one consumer read. Then the PR's four test files on c51, two boots.",
+ "measured": {
+  "standalone_16mib_consumer_read_us_median_base_boots_to_c51_boots": {
+   "image_ab_tilelang (serving kernel)": "73.73/71.39 -> 69.47/67.33 (1.061x, faster beyond the interval)",
+   "image_ab_cute": "72.42/71.36 -> 69.47/67.30 (1.051x, faster)",
+   "in_process_c51 orig_tp4_g2_4k -> cand_tl": "76.80/69.44 -> 69.47/67.33 (1.069x, same: boot ranges touch, 69.44 vs 69.47)",
+   "control off (cold read, same code both arms)": "126.21/107.42 -> 108.86/107.42 (same)",
+   "prefetch launch to join (pf), image_ab": "110.37/72.38 -> 128.22/87.97 us (same by the interval; the paced kernel spans longer by design)",
+   "prefetch + read serialized (tot), image_ab": "184.86/143.90 -> 197.82/155.36 us (same)"
+  },
+  "l2_hit_share_pct": {
+   "per_run_reference (as the bench computes it)": "base 63.6/41.8 -> c51 45.0/51.2: not comparable across boots, because each run's own cold-read and hot-read references moved (off read 126.2 us in base boot1 against 107-109 us elsewhere; hot read 43.7/21.2/21.3/29.2 us)",
+   "pooled_reference (median off 108.14 us, median hot 25.23 us over the 4 runs)": "base 41.5/44.3 -> c51 46.6/49.2 (higher in both c51 boots than in both base boots)",
+   "in_process_c51 orig_tp4_g2_4k -> cand_tl (same run, same reference)": "36.6 -> 45.0 (boot1), 48.5 -> 51.2 (boot2)"
+  },
+  "decode_chain_graph_replay_us_per_layer_image_ab": {
+   "pure_wait": {
+    "M=1": "484.53/482.76 -> 469.80/466.89 (1.033x, faster)",
+    "M=2": "588.06/586.74 -> 570.87/571.87 (1.028x, faster)",
+    "M=4": "797.93/796.28 -> 777.14/777.62 (1.025x, faster)",
+    "M=6": "1010.38/1009.14 -> 984.35/986.52 (1.025x, faster)",
+    "M=8": "1216.90/1216.94 -> 1194.26/1196.24 (1.018x, faster)",
+    "M=16": "1957.92/1961.36 -> 1942.47/1940.62 (1.009x, faster)",
+    "M=24": "2631.58/2655.32 -> 2619.78/2623.33 (1.008x, faster)",
+    "M=32": "3238.26/3264.83 -> 3242.95/3243.98 (1.002x, same)"
+   },
+   "mem_active": {
+    "M=1": "519.24/524.22 -> 467.79/477.14 (1.104x, faster)",
+    "M=2": "650.02/640.94 -> 594.67/609.34 (1.072x, faster)",
+    "M=4": "870.06/878.10 -> 840.06/843.90 (1.038x, faster)",
+    "M=6": "1089.81/1097.07 -> 1064.16/1077.45 (1.021x, faster)",
+    "M=8": "1311.00/1312.78 -> 1289.48/1296.54 (1.015x, faster)",
+    "M=16": "2056.90/2061.68 -> 2044.25/2051.82 (1.005x, faster)",
+    "M=24": "2732.69/2749.78 -> 2741.41/2735.34 (1.001x, same)",
+    "M=32": "3345.14/3376.08 -> 3367.42/3376.45 (0.997x, same)"
+   },
+   "counts": "pure_wait 7 faster, 1 same; mem_active 6 faster, 2 same; 0 slower. The in-process c51 comparison (orig_tp4_g2_4k -> cand_tl): pure_wait 8/8 faster, mem_active 6 faster, 2 same. Control 'off' (no prefetch, same code both arms): 14 same, 2 slower by 0.2-0.5% (pure_wait M=16, mem_active M=2), the A/A noise of this interval rule"
+  },
+  "pytest_c51": {
+   "boot1": "34 passed, 1 skipped, 14 warnings in 10.78s",
+   "boot2": "34 passed, 1 skipped, 14 warnings in 10.65s",
+   "files": "tests/models/kimi_k3/test_l2_prefetch.py, tests/models/test_deepseek_v4_1_l2_schedule.py, tests/models/test_glm5next_l2_prefetch_persist.py, tests/models/test_glm5next_tilelang_l2_prefetch.py (the PR's receipts: 34 passed, 1 skipped)"
+  },
+  "engine_grid": "not measured here: the engine-grid decode cells come from the screen at tp4-ring (screen-tp4.json), not from sp8"
+ },
+ "bit_exact": true,
+ "bit_exact_detail": "The bench asserts, at every M and mode, that the 4-layer chain's output digests of all five arms (off, the two embedded 1107 grids, the image's TileLang and CuTe kernels) are equal; all four runs completed (no assertion), so the prefetch changes no output on either image. Cache hints only.",
+ "verdict": "pass",
+ "reason": "On the integrated stack the paced 64 KiB prefetch makes the 16 MiB consumer read faster beyond the two-boot interval (73.7/71.4 -> 69.5/67.3 us, 1.061x, TileLang serving kernel), with a higher L2 hit share against a common reference (41.5/44.3% -> 46.6/49.2%; the bench's per-run share is not comparable across boots because its cold/hot references moved). In the PR's own decode-chain CUDA-graph replays every cell is faster (13 of 16, 0.5-10.4%) or the same (M=32 pure_wait, M=24 and 32 mem_active); none is slower. Outputs are bit-identical across all arms, and the PR's tests pass on both boots. The mark's engine-grid condition is the screen's to judge.",
+ "notes": [
+  "Measured on spark-ds41f:candidate-50 with candidate-51's tree mounted (the candidate-51 image was not used); the trees are verified file by file (../common/verify).",
+  "The base arm's cand_* labels are the bench's names; on that arm they run the base's own 4 KiB grid-2 kernel (the image's l2_prefetch with VLLM_L2_PREFETCH_GRID=2), which is why base cand_tl and orig_tp4_g2_4k read alike (73.73 vs 72.54, 71.39 vs 71.36 us).",
+  "The paced kernel's launch-to-join span is longer (pf 128.2/88.0 vs 110.4/72.4 us) and prefetch+read serialized is not better (same); in serving the prefetch overlaps attention and the all-reduces, which the decode chain models.",
+  "At M=24/32 under mem_active the prefetch costs slightly more than it saves on both images (c51 cand_tl vs off 0.996-0.998x; base likewise); not a regression against the base.",
+  "TP3's grid-4 case (orig_tp3_g4_4k) is recorded in the JSONs but not judged: this candidate serves tp4-ring, and the recipe's grid there is 2.",
+  "start_utc in commands.txt is after the GPU lock was taken; other agents' jobs ran between runs."
+ ]
+}

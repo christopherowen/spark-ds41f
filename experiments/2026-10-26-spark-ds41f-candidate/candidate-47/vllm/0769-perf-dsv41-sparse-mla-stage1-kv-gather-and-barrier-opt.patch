@@ -1,0 +1,442 @@
+From a0de45b3a178e3ef681835da9a3766a1198dd728 Mon Sep 17 00:00:00 2001
+From: Christopher Owen <3221756+christopherowen@users.noreply.github.com>
+Date: Sun, 8 Nov 2026 12:30:00 +0100
+Subject: [PATCH] perf(dsv41): sparse MLA stage-1 KV gather and staging barrier
+ opt
+
+Upstream base: 19f2c20ed4d64ae22bd009ceacadd85e2a81e354 (Local Inference Lab integration/karmic-kraken-beta, patch 0761 head 320021e3c4db)
+
+Rationale:
+1. In Sparse MLA Stage 1 (decode_body), slot resolution ran a 4-iteration serial loop (for c in T.serial(G)) calling gather_swa(..., BI=32) or gather_idx(..., BI=32), which executed on a single warp (32 threads) while the remaining 3 or 7 warps waited at __syncthreads(), serializing 4 waves of dependent IdxIndices -> IdxPageTable loads. When swa_blocks % G == 0, each segment is purely SWA or purely indexed; gathering all G * BI = 128 slots in one parallel call across 4 warps issues all 128 page-table lookups in a single parallel wave.
+2. Staging 288-byte indexed KV records (18 x 16B segments) into a [32, 528] shared buffer required non-power-of-two (/ 9) * 528 + (% 18) * 16 shared-memory offset arithmetic on every cp.async and dequant_idx load. Rounding SWA staging rows up to a multiple of 6 (swa_rows = 36, 36 * 528 = 66 * 288 = 19,008 B) and viewing the same shared buffer as [66, 288] collapses indexed cp.async destination offsets to linear 16-byte thread indices ((k * threads + tx) * 16).
+3. In decode_body, reading copy_slot[k] = slots[...] after dequant_chunk + T.sync_threads() caused TileLang's ThreadSync pass to insert an extra __syncthreads() before issuing cp.async for chunk + 1. Splitting stage_chunk into load_copy_slots and issue_stage_chunk and preloading copy_slot for chunk + 1 before ptx_wait_group(0) eliminates that barrier.
+4. In chunk_update, re-reading slots[base + i] >= 0 from dynamic shared memory after T.reduce_max wrote to shared workspace emitted 4 shared-memory loads and an extra __syncthreads() per chunk. Checking acc_s[h, i] != -T.infinity(accum_dtype) in registers eliminates both the shared-memory loads and the barrier (reducing decode_body barriers from 10 to 8 per chunk) while preserving NaN propagation for selected keys.
+5. In extend_body, bounding the outer segment loop by active_segs = (swa_blocks // G) + min(cdiv(max(IdxLengths[row], 0), G * BI), segments - (swa_blocks // G)) skips trailing inactive indexed segments on short contexts (-52% latency at idx_len=64) with zero inner-loop branch overhead at full context.
+
+Quality implications:
+- Bit-identical (torch.equal) outputs across split, decode, and extend routes for all head counts (TP=3 24 heads, TP=4 16 heads, TP=1 64 heads), SWA-only and indexed layers, and ragged context lengths.
+
+Tests:
+- pytest -p tests.kernels.deepseek_v41_pdl_sources tests/kernels/attention/test_deepseek_v41_tilelang.py -k 'sparse_mla or wo_input'
+
+Upstream status: local DeepSeek-V4.1 SM121 TileLang attention kernel optimization.
+---
+ .../attention/test_deepseek_v41_tilelang.py   |  18 ++
+ .../deepseek_v4_1/tilelang/sparse_mla.py      | 246 ++++++++++++++----
+ 2 files changed, 207 insertions(+), 57 deletions(-)
+
+diff --git a/tests/kernels/attention/test_deepseek_v41_tilelang.py b/tests/kernels/attention/test_deepseek_v41_tilelang.py
+index 849113154..4ed60c263 100644
+--- a/tests/kernels/attention/test_deepseek_v41_tilelang.py
++++ b/tests/kernels/attention/test_deepseek_v41_tilelang.py
+@@ -1286,3 +1286,21 @@ def test_sparse_mla_plan_routes_right_sizes_head_block_and_decode_waves(monkeypa
+     assert swa24.segments == 1
+     assert swa24.split_max_rows == 24
+     assert swa24.decode_max_rows == 144
++
++
++@pytest.mark.parametrize("heads", [16, 24])
++def test_sparse_mla_short_indexed_segments_match_across_routes(heads, rows=6):
++    """Ragged indexed lengths spanning 0..300 exercise 1..4 active segments per row
++    in extend (active_segs), decode (skip_inactive=True), and split
++    (skip_inactive=False); all three routes must match bit for bit."""
++    case = _mla_case(512, heads, rows)
++    case["idx_len"] = torch.tensor(
++        [0, 17, 64, 128, 129, 300][:rows], dtype=torch.int32, device=DEVICE
++    )
++    outs = _mla_run(case)
++    ref = _mla_ref(case)
++    torch.testing.assert_close(
++        outs["extend"].float(), ref.float(), rtol=0.13, atol=2e-2
++    )
++    for kernel, out in outs.items():
++        assert torch.equal(out, outs["extend"]), f"{kernel} differs from extend"
+diff --git a/vllm/models/deepseek_v4_1/tilelang/sparse_mla.py b/vllm/models/deepseek_v4_1/tilelang/sparse_mla.py
+index da22b50ab..97d01798e 100644
+--- a/vllm/models/deepseek_v4_1/tilelang/sparse_mla.py
++++ b/vllm/models/deepseek_v4_1/tilelang/sparse_mla.py
+@@ -195,11 +195,15 @@ def sparse_mla_fwd_v41(
+     # extend resolves every slot of its row up front; decode only its segment's.
+     slot_count = chunks * BI if schedule == "extend" else G * BI
+     copies = tilelang.cdiv(BI * SWA_RECORD_BYTES // 16, threads)
++    # Round SWA staging rows up to a multiple of 6 so the same buffer views
++    # cleanly as [idx_rows, 288] for exact-stride indexed cp.async staging.
++    swa_rows = tilelang.cdiv(BI, 6) * 6
++    idx_rows = swa_rows * SWA_RECORD_BYTES // IDX_RECORD_BYTES
+     # Q, the dequantized KV block and P in BF16, the raw record staging rows,
+     # the slots, and reduction scratch.
+     smem_bytes = (
+         2 * (block_H * D + BI * D + block_H * BI)
+-        + BI * SWA_RECORD_BYTES
++        + swa_rows * SWA_RECORD_BYTES
+         + 4 * slot_count
+         + 2048
+     )
+@@ -235,14 +239,31 @@ def sparse_mla_fwd_v41(
+             )
+ 
+     @T.macro
+-    def stage_records(Records, record_bytes, page_size, slots, base, staged, copy_slot):
+-        # cp.async each record into its staging row, 16 bytes per copy; masked
+-        # entries are zero-filled, so they dequantize to zero. Reading the slots
+-        # first keeps shared-memory reads out of the issue loop.
++    def load_copy_slots(chunk, slots, base, copy_slot):
++        # Preload copy_slot from shared slots before waiting on the previous
++        # cp.async group so shared-memory slot reads do not force an extra
++        # barrier before issuing the next chunk's cp.async copies.
++        is_swa = True if not idx_blocks else chunk < swa_blocks
++        tx = T.get_thread_binding()
++        if is_swa:
++            swa_segs = SWA_RECORD_BYTES // 16
++            for k in T.unroll(tilelang.cdiv(BI * swa_segs, threads)):
++                copy_slot[k] = slots[
++                    base + T.min((k * threads + tx) // swa_segs, BI - 1)
++                ]
++        else:
++            idx_segs = IDX_RECORD_BYTES // 16
++            for k in T.unroll(tilelang.cdiv(BI * idx_segs, threads)):
++                copy_slot[k] = slots[
++                    base + T.min((k * threads + tx) // idx_segs, BI - 1)
++                ]
++
++    @T.macro
++    def issue_stage_records(Records, record_bytes, page_size, staged, copy_slot):
++        # cp.async each record into its exact-stride staging row, 16 bytes per
++        # copy; masked entries are zero-filled, so they dequantize to zero.
+         segments = record_bytes // 16
+         tx = T.get_thread_binding()
+-        for k in T.unroll(tilelang.cdiv(BI * segments, threads)):
+-            copy_slot[k] = slots[base + T.min((k * threads + tx) // segments, BI - 1)]
+         for k in T.unroll(tilelang.cdiv(BI * segments, threads)):
+             e = k * threads + tx
+             if e < BI * segments:
+@@ -263,57 +284,78 @@ def sparse_mla_fwd_v41(
+         T.ptx_commit_group()
+ 
+     @T.macro
+-    def stage_chunk(SwaRecords, IdxRecords, chunk, slots, base, staged, copy_slot):
++    def issue_stage_chunk(
++        SwaRecords, IdxRecords, chunk, staged_swa, staged_idx, copy_slot
++    ):
+         # SWA-only layers compile without the indexed branch.
+         is_swa = True if not idx_blocks else chunk < swa_blocks
+         if is_swa:
+-            stage_records(
++            issue_stage_records(
+                 SwaRecords,
+                 SWA_RECORD_BYTES,
+                 swa_page_size,
+-                slots,
+-                base,
+-                staged,
++                staged_swa,
+                 copy_slot,
+             )
+         else:
+-            stage_records(
++            issue_stage_records(
+                 IdxRecords,
+                 IDX_RECORD_BYTES,
+                 idx_page_size,
+-                slots,
+-                base,
+-                staged,
++                staged_idx,
+                 copy_slot,
+             )
+ 
+     @T.macro
+-    def dequant_swa(staged, staged_fp8, KV_shared):
++    def stage_chunk(
++        SwaRecords,
++        IdxRecords,
++        chunk,
++        slots,
++        base,
++        staged_swa,
++        staged_idx,
++        copy_slot,
++    ):
++        load_copy_slots(chunk, slots, base, copy_slot)
++        issue_stage_chunk(
++            SwaRecords, IdxRecords, chunk, staged_swa, staged_idx, copy_slot
++        )
++
++    @T.macro
++    def dequant_swa(staged_swa, staged_swa_fp8, KV_shared):
+         for i, d in T.Parallel(BI, D):
+             # UE8M0 scale 2^(e - 127), built from the exponent bits.
+             scale = T.reinterpret(
+-                T.shift_left(T.cast(staged[i, D + d // SWA_GROUP], T.uint32), 23),
++                T.shift_left(T.cast(staged_swa[i, D + d // SWA_GROUP], T.uint32), 23),
+                 accum_dtype,
+             )
+             KV_shared[i, d] = T.cast(
+-                T.cast(staged_fp8[i, d], accum_dtype) * scale, dtype
++                T.cast(staged_swa_fp8[i, d], accum_dtype) * scale, dtype
+             )
+ 
+     @T.macro
+-    def dequant_idx(staged_fp8, staged_fp4, KV_shared):
++    def dequant_idx(staged_idx_fp8, staged_idx_fp4, KV_shared):
+         for i, d in T.Parallel(BI, D):
+-            scale = T.cast(staged_fp8[i, D // 2 + d // IDX_GROUP], accum_dtype)
++            scale = T.cast(staged_idx_fp8[i, D // 2 + d // IDX_GROUP], accum_dtype)
+             KV_shared[i, d] = T.cast(
+-                T.cast(staged_fp4[i, d], accum_dtype) * scale, dtype
++                T.cast(staged_idx_fp4[i, d], accum_dtype) * scale, dtype
+             )
+ 
+     @T.macro
+-    def dequant_chunk(chunk, staged, staged_fp8, staged_fp4, KV_shared):
++    def dequant_chunk(
++        chunk,
++        staged_swa,
++        staged_swa_fp8,
++        staged_idx_fp8,
++        staged_idx_fp4,
++        KV_shared,
++    ):
+         is_swa = True if not idx_blocks else chunk < swa_blocks
+         if is_swa:
+-            dequant_swa(staged, staged_fp8, KV_shared)
++            dequant_swa(staged_swa, staged_swa_fp8, KV_shared)
+         else:
+-            dequant_idx(staged_fp8, staged_fp4, KV_shared)
++            dequant_idx(staged_idx_fp8, staged_idx_fp4, KV_shared)
+ 
+     @T.macro
+     def load_q(Q, row, h0, Q_shared):
+@@ -365,7 +407,9 @@ def sparse_mla_fwd_v41(
+             )
+         for h, i in T.Parallel(block_H, BI):
+             acc_s[h, i] = T.if_then_else(
+-                slots[base + i] >= 0, T.exp2(acc_s[h, i] - m_g[h]), 0
++                acc_s[h, i] != -T.infinity(accum_dtype),
++                T.exp2(acc_s[h, i] - m_g[h]),
++                0,
+             )
+         T.reduce_sum(acc_s, row_sum, dim=1)
+         for h in T.Parallel(block_H):
+@@ -423,10 +467,17 @@ def sparse_mla_fwd_v41(
+             KV_shared = T.alloc_shared([BI, D], dtype)
+             P_shared = T.alloc_shared([block_H, BI], dtype)
+             cs_shared = T.alloc_shared([ROPE_DIM], accum_dtype)
+-            # Raw records, one 528-byte row per entry; indexed records use 288 bytes.
+-            staged = T.alloc_shared([BI, SWA_RECORD_BYTES], T.uint8)
+-            staged_fp8 = T.view(staged, dtype=T.float8_e4m3fn)
+-            staged_fp4 = T.view(staged, [BI, SWA_RECORD_BYTES * 2], T.float4_e2m1fn)
++            # Raw records: SWA uses 528-byte rows; indexed views the same buffer
++            # as 288-byte rows so cp.async writes use linear 16-byte offsets.
++            staged_swa = T.alloc_shared([swa_rows, SWA_RECORD_BYTES], T.uint8)
++            staged_swa_fp8 = T.view(staged_swa, dtype=T.float8_e4m3fn)
++            staged_idx = T.view(staged_swa, [idx_rows, IDX_RECORD_BYTES], T.uint8)
++            staged_idx_fp8 = T.view(
++                staged_swa, [idx_rows, IDX_RECORD_BYTES], T.float8_e4m3fn
++            )
++            staged_idx_fp4 = T.view(
++                staged_swa, [idx_rows, IDX_RECORD_BYTES * 2], T.float4_e2m1fn
++            )
+             slots = T.alloc_shared([slot_count], T.int32)
+             copy_slot = T.alloc_local([copies], T.int32)
+             acc_s = T.alloc_fragment([block_H, BI], accum_dtype)
+@@ -470,29 +521,57 @@ def sparse_mla_fwd_v41(
+                         swa_blocks * BI,
+                     )
+                 T.sync_threads()
+-                stage_chunk(SwaRecords, IdxRecords, 0, slots, 0, staged, copy_slot)
++                stage_chunk(
++                    SwaRecords,
++                    IdxRecords,
++                    0,
++                    slots,
++                    0,
++                    staged_swa,
++                    staged_idx,
++                    copy_slot,
++                )
+                 load_q(Q, row, h0, Q_shared)
+                 T.fill(acc_o, 0)
+                 T.fill(L, 1)
+ 
+-                for seg in T.serial(segments):
++                active_segs = T.alloc_var(T.int32)
++                active_end = T.alloc_var(T.int32)
++                if idx_blocks and skip_inactive and swa_blocks % G == 0:
++                    active_segs = (swa_blocks // G) + T.min(
++                        tilelang.cdiv(T.max(IdxLengths[row], 0), G * BI),
++                        segments - (swa_blocks // G),
++                    )
++                    active_end = T.min(active_segs * G, chunks)
++                else:
++                    active_segs = segments
++                    active_end = chunks
++                for seg in T.serial(active_segs):
+                     clear_segment(acc_g, m_g, l_g)
+                     for c in T.serial(G):
+                         chunk = seg * G + c
+                         if chunk < chunks:
+                             T.ptx_wait_group(0)
+                             T.sync_threads()
+-                            dequant_chunk(chunk, staged, staged_fp8, staged_fp4, KV_shared)
++                            dequant_chunk(
++                                chunk,
++                                staged_swa,
++                                staged_swa_fp8,
++                                staged_idx_fp8,
++                                staged_idx_fp4,
++                                KV_shared,
++                            )
+                             T.sync_threads()
+                             # The next chunk's records load while this chunk computes.
+-                            if chunk + 1 < chunks:
++                            if chunk + 1 < active_end:
+                                 stage_chunk(
+                                     SwaRecords,
+                                     IdxRecords,
+                                     chunk + 1,
+                                     slots,
+                                     (chunk + 1) * BI,
+-                                    staged,
++                                    staged_swa,
++                                    staged_idx,
+                                     copy_slot,
+                                 )
+                             chunk_update(
+@@ -557,9 +636,15 @@ def sparse_mla_fwd_v41(
+             Q_shared = T.alloc_shared([block_H, D], dtype)
+             KV_shared = T.alloc_shared([BI, D], dtype)
+             P_shared = T.alloc_shared([block_H, BI], dtype)
+-            staged = T.alloc_shared([BI, SWA_RECORD_BYTES], T.uint8)
+-            staged_fp8 = T.view(staged, dtype=T.float8_e4m3fn)
+-            staged_fp4 = T.view(staged, [BI, SWA_RECORD_BYTES * 2], T.float4_e2m1fn)
++            staged_swa = T.alloc_shared([swa_rows, SWA_RECORD_BYTES], T.uint8)
++            staged_swa_fp8 = T.view(staged_swa, dtype=T.float8_e4m3fn)
++            staged_idx = T.view(staged_swa, [idx_rows, IDX_RECORD_BYTES], T.uint8)
++            staged_idx_fp8 = T.view(
++                staged_swa, [idx_rows, IDX_RECORD_BYTES], T.float8_e4m3fn
++            )
++            staged_idx_fp4 = T.view(
++                staged_swa, [idx_rows, IDX_RECORD_BYTES * 2], T.float4_e2m1fn
++            )
+             slots = T.alloc_shared([slot_count], T.int32)
+             copy_slot = T.alloc_local([copies], T.int32)
+             acc_s = T.alloc_fragment([block_H, BI], accum_dtype)
+@@ -571,48 +656,95 @@ def sparse_mla_fwd_v41(
+             row_sum = T.alloc_fragment([block_H], accum_dtype)
+ 
+             if not skip_inactive or seg_active(seg, SwaLengths, IdxLengths, row):
+-                for c in T.serial(G):
+-                    chunk = seg * G + c
+-                    if not idx_blocks:
+-                        if chunk < swa_blocks:
+-                            gather_swa(
+-                                SwaIndices, SwaLengths, row, chunk * BI, BI, slots, c * BI
+-                            )
+-                    elif chunk < swa_blocks:
++                if not idx_blocks:
++                    gather_swa(
++                        SwaIndices, SwaLengths, row, seg * G * BI, G * BI, slots, 0
++                    )
++                elif swa_blocks % G == 0:
++                    if seg * G < swa_blocks:
+                         gather_swa(
+-                            SwaIndices, SwaLengths, row, chunk * BI, BI, slots, c * BI
++                            SwaIndices,
++                            SwaLengths,
++                            row,
++                            seg * G * BI,
++                            G * BI,
++                            slots,
++                            0,
+                         )
+-                    elif chunk < chunks:
++                    else:
+                         gather_idx(
+                             IdxIndices,
+                             IdxLengths,
+                             IdxPageTable,
+                             row,
+-                            (chunk - swa_blocks) * BI,
+-                            BI,
++                            (seg * G - swa_blocks) * BI,
++                            G * BI,
+                             slots,
+-                            c * BI,
++                            0,
+                         )
++                else:
++                    for c in T.serial(G):
++                        chunk = seg * G + c
++                        if chunk < swa_blocks:
++                            gather_swa(
++                                SwaIndices,
++                                SwaLengths,
++                                row,
++                                chunk * BI,
++                                BI,
++                                slots,
++                                c * BI,
++                            )
++                        elif chunk < chunks:
++                            gather_idx(
++                                IdxIndices,
++                                IdxLengths,
++                                IdxPageTable,
++                                row,
++                                (chunk - swa_blocks) * BI,
++                                BI,
++                                slots,
++                                c * BI,
++                            )
+                 T.sync_threads()
+-                stage_chunk(SwaRecords, IdxRecords, seg * G, slots, 0, staged, copy_slot)
++                stage_chunk(
++                    SwaRecords,
++                    IdxRecords,
++                    seg * G,
++                    slots,
++                    0,
++                    staged_swa,
++                    staged_idx,
++                    copy_slot,
++                )
+                 h0 = hb * block_H
+                 load_q(Q, row, h0, Q_shared)
+                 clear_segment(acc_g, m_g, l_g)
+                 for c in T.serial(G):
+                     chunk = seg * G + c
+                     if chunk < chunks:
++                        if (c + 1 < G) & (chunk + 1 < chunks):
++                            load_copy_slots(
++                                chunk + 1, slots, (c + 1) * BI, copy_slot
++                            )
+                         T.ptx_wait_group(0)
+                         T.sync_threads()
+-                        dequant_chunk(chunk, staged, staged_fp8, staged_fp4, KV_shared)
++                        dequant_chunk(
++                            chunk,
++                            staged_swa,
++                            staged_swa_fp8,
++                            staged_idx_fp8,
++                            staged_idx_fp4,
++                            KV_shared,
++                        )
+                         T.sync_threads()
+                         if (c + 1 < G) & (chunk + 1 < chunks):
+-                            stage_chunk(
++                            issue_stage_chunk(
+                                 SwaRecords,
+                                 IdxRecords,
+                                 chunk + 1,
+-                                slots,
+-                                (c + 1) * BI,
+-                                staged,
++                                staged_swa,
++                                staged_idx,
+                                 copy_slot,
+                             )
+                         chunk_update(
+-- 
+2.43.0
+

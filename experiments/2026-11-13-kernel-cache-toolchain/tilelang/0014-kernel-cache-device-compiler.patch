@@ -1,0 +1,177 @@
+From 444b0447a201e24982099abfd10f67fd8b6104df Mon Sep 17 00:00:00 2001
+From: Christopher Owen <3221756+christopherowen@users.noreply.github.com>
+Date: Fri, 13 Nov 2026 09:54:40 +0100
+Subject: [PATCH] Key the kernel cache by the CUDA device compiler
+
+Upstream base: tile-ai/tilelang@2123e412ce2217b324c50c4ec967213906456ac5
+with the thirteen local patches of spark-ds41f-1107 applied (head 92a1d3a0,
+tree e2b001828fd4).
+
+Rationale: a cached kernel holds the device binary its compiler produced,
+but KernelCache._generate_key names only the kernel (its IR, arguments,
+target, backend, pass configuration, flags) and the TileLang build. The
+CUDA binary cache below it does key on "nvcc version=X.Y.Z", but it is only
+asked when the kernel cache misses. A host whose cache an older CUDA
+toolkit filled therefore keeps loading that toolkit's binaries after the
+toolkit is replaced, and a clean host compiles different ones: the same
+build runs different device code depending on what booted there before.
+In spark-ds41f, candidate-55 (CUDA 13.5.37) ran kernels that CUDA 13.0.88
+builds had compiled in every gate and screen; on sp1, 8 of 1,245 kernel
+entries were newer than its first build.
+
+The key now carries the device compiler for CUDA targets, as the string the
+CUDA binary cache already uses (the compiler selected by tl.cuda_compiler
+and its version). Other targets keep their keys. A compiler whose version
+cannot be read is stamped "unknown", which matches neither a known
+compiler's entries nor those written before this change.
+
+Quality: no kernel, pass or generated source changes. Every CUDA kernel
+cache key changes once, so the first boot of a build that carries this
+patch compiles its whole kernel set on each host (about 24 minutes at TP4
+on GB10 for DeepSeek V4.1); entries under the old keys are never read again
+and can be removed. From then on a toolkit change recompiles instead of
+reusing.
+
+Tests: testing/python/cache/test_tilelang_kernel_cache_device_compiler.py
+(the stamp, other targets unchanged, the key following the compiler's
+version and choice, an unreadable compiler): 5 passed in the candidate-55
+image on a GB10. The cache integration tests in testing/python/cache were
+not run: the image has no testing tree.
+
+Upstream status: local correction; a candidate for tile-ai/tilelang.
+---
+ ...t_tilelang_kernel_cache_device_compiler.py | 67 +++++++++++++++++++
+ tilelang/cache/kernel_cache.py                | 36 ++++++++++
+ 2 files changed, 103 insertions(+)
+ create mode 100644 testing/python/cache/test_tilelang_kernel_cache_device_compiler.py
+
+diff --git a/testing/python/cache/test_tilelang_kernel_cache_device_compiler.py b/testing/python/cache/test_tilelang_kernel_cache_device_compiler.py
+new file mode 100644
+index 00000000..61a76a8a
+--- /dev/null
++++ b/testing/python/cache/test_tilelang_kernel_cache_device_compiler.py
+@@ -0,0 +1,67 @@
++"""The kernel cache key names the compiler of a CUDA kernel's device binary."""
++
++import pytest
++
++from tilelang.cache.kernel_cache import KernelCache
++from tvm.target import Target
++from tilelang.contrib import nvcc, nvrtc
++from tilelang.transform.pass_config import PassConfigKey
++
++
++class _Func:
++    def script(self, show_meta=True):
++        return "@T.prim_func\ndef main(): pass\n"
++
++
++def _key(target="cuda", pass_configs=None):
++    return KernelCache()._generate_key(_Func(), [0], execution_backend="tvm_ffi", args=(), target=target, pass_configs=pass_configs)
++
++
++@pytest.fixture
++def toolkit(monkeypatch):
++    versions = {"nvcc": (13, 0, 88), "nvrtc": (13, 0)}
++    monkeypatch.setattr(nvcc, "get_nvcc_version", lambda: versions["nvcc"])
++    monkeypatch.setattr(nvrtc, "get_nvrtc_version", lambda: versions["nvrtc"])
++    return versions
++
++
++def test_stamp_is_the_cuda_binary_cache_compiler_string(toolkit):
++    assert KernelCache._device_compiler_stamp("cuda", None) == "nvcc version=13.0.88"
++    assert KernelCache._device_compiler_stamp("cuda -arch=sm_121", {}) == "nvcc version=13.0.88"
++    assert KernelCache._device_compiler_stamp(Target("cuda"), None) == "nvcc version=13.0.88"
++    nvrtc_config = {PassConfigKey.TL_CUDA_COMPILER: "nvrtc"}
++    assert KernelCache._device_compiler_stamp("cuda", nvrtc_config) == "nvrtc version=13.0"
++    assert KernelCache._device_compiler_stamp("cuda", {"tl.cuda_compiler": "nvrtc"}) == "nvrtc version=13.0"
++
++
++def test_other_targets_carry_no_stamp_and_keep_their_keys(toolkit):
++    for target in ("llvm", "c", "hip", "metal"):
++        assert KernelCache._device_compiler_stamp(target, None) is None
++    before = _key(target="llvm")
++    toolkit["nvcc"] = (13, 5, 37)
++    assert _key(target="llvm") == before
++
++
++def test_key_follows_the_compiler_version(toolkit):
++    old = _key()
++    assert _key() == old
++    toolkit["nvcc"] = (13, 5, 37)
++    new = _key()
++    assert new != old
++    toolkit["nvcc"] = (13, 0, 88)
++    assert _key() == old
++
++
++def test_key_follows_the_compiler_choice(toolkit):
++    assert _key() != _key(pass_configs={PassConfigKey.TL_CUDA_COMPILER: "nvrtc"})
++
++
++def test_unreadable_compiler_matches_no_known_one(toolkit, monkeypatch):
++    known = _key()
++
++    def missing():
++        raise RuntimeError("nvcc not found")
++
++    monkeypatch.setattr(nvcc, "get_nvcc_version", missing)
++    assert KernelCache._device_compiler_stamp("cuda", None) == "nvcc version=unknown"
++    assert _key() != known
+diff --git a/tilelang/cache/kernel_cache.py b/tilelang/cache/kernel_cache.py
+index 547252f8..d3194797 100644
+--- a/tilelang/cache/kernel_cache.py
++++ b/tilelang/cache/kernel_cache.py
+@@ -190,6 +190,39 @@ class KernelCache:
+             base["torch"] = torch.__version__
+         return base
+ 
++    @staticmethod
++    def _device_compiler_stamp(target: str | Target, pass_configs: dict | None) -> str | None:
++        """Name the compiler that builds a CUDA kernel's device binary, with its version.
++
++        A cached kernel holds the device binary its compiler produced. Without the
++        compiler in the key, a host whose cache an older CUDA toolkit filled keeps
++        loading that toolkit's binaries after the toolkit is replaced: the kernel
++        cache hits first, and the CUDA binary cache, whose key does name the
++        compiler, is never asked. The stamp is the string that cache uses.
++
++        Returns None for targets other than CUDA. A compiler whose version cannot
++        be read is stamped "unknown", which matches neither the entries of a known
++        compiler nor those written before the key held one.
++        """
++        kind = target.kind.name if isinstance(target, Target) else str(target).split(" ", 1)[0]
++        if kind != "cuda":
++            return None
++        from tilelang.transform.pass_config import PassConfigKey
++
++        compiler = str((pass_configs or {}).get(PassConfigKey.TL_CUDA_COMPILER, "nvcc"))
++        try:
++            if compiler == "nvrtc":
++                from tilelang.contrib import nvrtc
++
++                version = nvrtc.get_nvrtc_version()
++            else:
++                from tilelang.contrib import nvcc
++
++                version = nvcc.get_nvcc_version()
++        except Exception:  # noqa: BLE001 - an unreadable compiler must not match a known one
++            return f"{compiler} version=unknown"
++        return f"{compiler} version={'.'.join(map(str, version))}"
++
+     @staticmethod
+     def _sanitize_path_component(component: str) -> str:
+         sanitized = "".join(ch if ch.isalnum() or ch in "._-" else "_" for ch in component)
+@@ -319,6 +352,9 @@ class KernelCache:
+             "compile_flags": compile_flags,
+             **self._get_base_key(),
+         }
++        device_compiler = self._device_compiler_stamp(target, pass_configs)
++        if device_compiler is not None:
++            key_data["device_compiler"] = device_compiler
+         # Sort keys to ensure consistency
+         key_string = json.dumps(key_data, sort_keys=True)
+         # Use SHA256 to generate hash key
+-- 
+2.43.0
+

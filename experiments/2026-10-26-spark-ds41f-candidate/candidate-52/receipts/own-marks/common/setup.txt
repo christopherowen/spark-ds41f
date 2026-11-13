@@ -1,0 +1,68 @@
+# Candidate-52 own marks (release-benchmark step 7): shared setup. Host sp8 (spark-0016), NVIDIA GB10,
+# driver 580.178.04, kernel 7.0.0-1024-nvidia, one GPU shared with other agents through
+# /tmp/spark-lab-gpu.lock. Work dir on sp8: B = ~/spark-lab/agents/candidate-52-own-marks.
+# No push, commit, PR, image build, cluster or window operation; nothing on another host's GPU.
+#
+# Pre-checks 2026-11-09T17:08Z: ~/spark-hold.json and ~/spark-request.json absent, docker ps empty.
+# om.sh repeats both checks inside the lock for every run (hold file, and no container running `vllm serve`),
+# and records loadavg and docker ps; commands.log in each pr-<N>/ holds one block per run.
+#
+# 0. Sources: B/src/repo = git clone --reference ~/projects/spark-ds41f of christopherowen/spark-ds41f,
+#    detached at origin/main 83e594528e (candidate-52's folder). PR heads (git fetch origin pull/<N>/head):
+#      #1030 a7edd33143aa47944d3b44fb41ebea261dbf89d3  #968 1445e800b172bc069239ca16e8bec82945fa5a12
+#      #969  aad967cbe89737777db07876ad89eea66383eca3  (all equal to candidate-52's README table)
+#    Each PR's experiment patch equals candidate-52's copy: same SHA-256 and git patch-id --stable
+#      #1030 6ed9d54fac0e / 35a0ff7ae5e1 (0781)  #968 9a8501356dc1 / 2abc21f17ec0 (0782)
+#      #969  a802a3047922 / 6874d5cb1f53 (0783)
+# 1. Candidate-52's tree (build_tree.sh, out/build-tree.log): a --shared clone of
+#    ~/spark-lab/agents/round-51-53-select/base-vllm detached at the vLLM pin 19f2c20ed4d6, then all 662 active
+#    entries of candidate-52/vllm/series applied with git am --committer-date-is-author-date, committer
+#    Christopher Owen (as spark_ds41f/build.py). Result: patch_head 51a16b66d087 and tree 1116740c08aa, both
+#    equal to candidate-52's lock; git diff --check clean.
+# 2. Image: spark-ds41f:candidate-50 = sha256:8c1ea1f62f62c3e2adc03b645c091a5499cf7163101aca32875c894b96f155db
+#    (created 2026-11-09T13:48:01Z, labels vllm.patch-head ba7400d9b671, vllm.tree d5778ab56647), entrypoint
+#    ["vllm","serve"], so every run passes --entrypoint. verify_image_tree.sh (verify-image-tree.txt): the
+#    image's /opt/spark-ds41f/candidate/vllm equals candidate-50's git tree ba7400d9 in all 7,831 tracked
+#    paths (0 differ); no __pycache__ for any of the 13 candidate paths; prebuilt Engram reader
+#    /opt/spark-ds41f/native/engram_rows/9cd64e5b59d4835304b24ff4/.
+# 3. Arms (om.sh):
+#    base = the image + candidate-50's no1009/overlay (4 files: deepseek_v4_1/attention.py, sp_prefill.py,
+#           tilelang/cache_writer.py, tilelang/front.py) read-only, as candidate-50/tp4-no1009.json mounts them;
+#    c52  = the image + every file of candidate-52's tree that differs from the image's: 13 files
+#           (changed-files.txt; all modifications, none added or deleted): the 4 no1009 files (byte-equal to
+#           the no1009 overlay), 0778's two test files, and the three PRs' files (moe.py + its test;
+#           scheduler.py + test_copy_drafts_scheduler.py; _reader.c + _row_plan.h + test_deepseek_v41_engram_rows.py).
+#    overlay-sha.txt: per file, SHA-256 prefixes of candidate-50, the no1009 overlay and candidate-52.
+#    Each arm has its own TileLang cache dir (B/c/tl-<arm> at /root/.tilelang, TILELANG_CACHE_DIR set).
+# 4. What runs in each arm (raw/verify-*.txt by verify_overlay.v1.py, raw/verify2-*.txt by verify_overlay2.py,
+#    which also counts closure names, so base's cert_e shows): the container sees the mounted SHA-256s; the code
+#    objects Python loads for moe.py and scheduler.py are the mounted files' (x_bf16 and _max_decode_new_tokens on
+#    c52 only; cert_e on base only).
+#    #969 changes C sources (_reader.c, _row_plan.h). An overlay represents them: _native.py builds the reader
+#    on first use, keyed by a digest of the *.c/*.h files, and uses the image's prebuilt only when that digest
+#    matches. On c52 the digest is 304875ed85c2..., no prebuilt matches, and the reader is built at runtime by
+#    the image's cc with _native.py's flags into /root/.cache/vllm/engram_rows/ (extension b5df645b4d9aec3c).
+#    The same runtime build of candidate-50's sources (base arm with VLLM_NATIVE_CACHE_DIR pointed at an empty
+#    dir, verify-base-runtime-build.txt) produces aa59fde670e4d070, byte-identical to the image's prebuilt, so
+#    the runtime build is what a built candidate-52 image would ship. No PR here is beyond an overlay.
+# 5. Order (queue.sh, run by run_all.sh): each section ran inside ONE hold of /tmp/spark-lab-gpu.lock
+#    (OM_LOCK_HELD=1 flock ... bash queue.sh <section>), so a PR's runs are back to back with no other agent's
+#    job between them; the lock was released between sections. A first launch (17:36Z) took the lock per run;
+#    it completed verify2-base, then waited behind other agents' jobs and was stopped while waiting (no run
+#    started or partially recorded); run_all.sh relaunched at 17:43Z and skipped verify2-base (om.sh refuses to
+#    overwrite an existing output). queue.log is run_all.sh's log. Per PR, queue A = the PR's own bench as its README gives it, ABBA in one session:
+#    base boot1, c52 boot1, c52 boot2, base boot2 (a boot is a fresh container); queue B = our harness, same
+#    order; queue C = the PR's tests on c52, two boots. Sections: 1030 17:52:15Z..17:58:29Z, 968
+#    18:02:44Z..18:06:44Z, 969 18:07:14Z..18:10:17Z; docker ps was empty at the start of every run.
+# 6. Harness smoke runs before the queue (smoke/; smoke.sh): h1030.py twice on spark-ds41f:candidate-49 (debug only;
+#    the second run's output overwrote the first's,
+#    not evidence; it found that the PR bench's live mask admits rows past psum[-1], see pr-1030/result.json),
+#    h968.py, rows969.py and run969.py (1 rep) on the c52 arm. Kept as run. Three debug scripts for the
+#    harness's torch cross-check (smoke/dbg.py) ran on candidate-49 under the lock; one 4-element torch check
+#    (smoke/dbg2.py, about a second, 17:2xZ) ran WITHOUT the lock by mistake; no measurement was running in it.
+# 7. Analysis: analyze/a<N>.py read the raw outputs; each pr-<N>/summary.txt and summary.json is its output.
+# 8. Cleanup 2026-11-09T18:2xZ on sp8: vllm-c52 (143 MB), vllm-c50img (763 MB), src (the clone and PR exports,
+#    491 MB), the TileLang caches c/ (root-owned, removed through a non-GPU container of the same image) and the
+#    bench/test directories under nvme/ deleted. About 3.3 MB of scripts, overlay files (ovl/) and outputs (out/)
+#    remain in B. The PR bench scripts used are copied into pr-1030/pr-bench-scripts and pr-968/pr-bench-scripts
+#    (SHA-256 269facad39da, 5135501a1ec9, as exported from the PR heads).

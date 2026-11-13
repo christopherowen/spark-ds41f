@@ -1,0 +1,193 @@
+........................................................................ [ 10%]
+........................................................................ [ 21%]
+...F.................................................................... [ 31%]
+........................................................................ [ 42%]
+........................................................................ [ 52%]
+........................................................................ [ 63%]
+........................................................................ [ 73%]
+..............s......................................................... [ 84%]
+........................................................................ [ 94%]
+......F............................                                      [100%]
+=================================== FAILURES ===================================
+________________________ test_apply_fused_staged_writes ________________________
+
+    def test_apply_fused_staged_writes():
+        """``FusedStagedWriter``: int32 writes of several tables through int64
+        pointers, each to its group's table and stride."""
+        gen = _gen(11)
+        tables = _block_tables(gen)
+        for t in tables.block_tables:
+            _stage(t, gen, 9, long=True)
+        group_ids, indices, starts, contents, cu_lens = [], [], [], [], []
+        for g, t in enumerate(tables.block_tables):
+            group_ids += [g] * len(t._staged_write_indices)
+            indices += t._staged_write_indices
+            starts += t._staged_write_starts
+            base = len(contents)
+            contents += t._staged_write_contents
+            cu_lens += [base + c for c in t._staged_write_cu_lens]
+        ref = [t.gpu.clone() for t in tables.block_tables]
+    
+        def device(values):
+            return torch.tensor(values, dtype=torch.int32, device=DEVICE)
+    
+        _apply_write_kernel[(len(indices),)](
+            _ptrs(ref),
+            tables.block_table_strides,
+            device(indices),
+            device(starts),
+            device(contents),
+            device(cu_lens),
+            device(group_ids),
+            BLOCK_SIZE=1024,
+            MULTI_GROUP=True,
+        )
+        tables.apply_staged_writes()
+        torch.accelerator.synchronize()
+        for r, t in zip(ref, tables.block_tables):
+>           assert torch.equal(r, t.gpu)
+E           AssertionError: assert False
+E            +  where False = <built-in method equal of type object at 0xea3eefbfd638>(tensor([[ 222822, 1030440,  476601,  ...,  153139,  606038,  549324],\n        [ 328200,   45213,  170440,  ...,  21415...177],\n        [ 211935,  682396, 1048506,  ...,  309867,  919620,  891422]],\n       device='cuda:0', dtype=torch.int32), tensor([[ 222822, 1030440,  476601,  ...,  153139,  606038,  549324],\n        [ 328200,   45213,  170440,  ...,  21415...177],\n        [ 211935,  682396, 1048506,  ...,  309867,  919620,  891422]],\n       device='cuda:0', dtype=torch.int32))
+E            +    where <built-in method equal of type object at 0xea3eefbfd638> = torch.equal
+E            +    and   tensor([[ 222822, 1030440,  476601,  ...,  153139,  606038,  549324],\n        [ 328200,   45213,  170440,  ...,  21415...177],\n        [ 211935,  682396, 1048506,  ...,  309867,  919620,  891422]],\n       device='cuda:0', dtype=torch.int32) = <vllm.v1.worker.gpu.buffer_utils.StagedWriteTensor object at 0xea3e21ddaf00>.gpu
+
+tests/v1/worker/test_gpu_tilelang_inputs.py:354: AssertionError
+___________________ test_declared_calls_cover_the_call_sites ___________________
+
+monkeypatch = <_pytest.monkeypatch.MonkeyPatch object at 0xea3c1b53ed80>
+
+    def test_declared_calls_cover_the_call_sites(monkeypatch):
+        """Every kernel the runner's call sites launch, with the runner's buffers and
+        dtypes, is a call its declarations list (after the kernel cache freezes, an
+        undeclared one raises KernelNotPreparedError)."""
+        from vllm.v1.worker.gpu import input_batch
+    
+        launched = set()
+        original = tli._kernel
+    
+        def record(factory, *key):
+            launched.add((id(factory), key))
+            return original(factory, *key)
+    
+        monkeypatch.setattr(tli, "_kernel", record)
+        gen = _gen(0)
+    
+        # Block tables and their staged writes (several groups: the fused writer).
+        tables = _block_tables(gen)
+        for t in tables.block_tables:
+            _stage(t, gen, 2, long=False)
+        tables.apply_staged_writes()
+        idx = _idx(4, gen)
+        starts = _starts([1 + DRAFTS] * 4)
+        positions = torch.arange(MAX_TOKENS, device=DEVICE, dtype=torch.int64)
+        tables.gather_block_tables(idx, 8)
+        tables.compute_slot_mappings(idx, starts, positions, MAX_TOKENS)
+        for dtype in (torch.int32, torch.int64, torch.float32):
+            tensor = StagedWriteTensor((MAX_REQS, 8), dtype, DEVICE)
+            _stage(tensor, gen, 2, long=False)
+            tensor.apply_write()
+    
+        # The step's inputs, as the runner prepares and commits a decode step.
+        history = _history(gen, 256)
+        computed = _randint(0, 100, (MAX_REQS,), gen)
+        next_tokens = torch.zeros((1, MAX_REQS), dtype=torch.int32, device=DEVICE)
+        ids = torch.zeros(MAX_TOKENS, dtype=torch.int32, device=DEVICE)
+        input_batch.prepare_prefill_inputs(
+            ids, next_tokens, idx, starts, history, computed + 50, computed
+        )
+        seq_lens = torch.zeros(MAX_REQS, dtype=torch.int32, device=DEVICE)
+        input_batch.prepare_pos_seq_lens(idx, starts, computed, positions, seq_lens)
+        last = torch.zeros((MAX_REQS, 1), dtype=torch.int64, device=DEVICE)
+        drafts = torch.zeros((MAX_REQS, DRAFTS), dtype=torch.int64, device=DEVICE)
+        cu = starts.clone()
+        padding = torch.zeros(MAX_TOKENS, dtype=torch.bool, device=DEVICE)
+        dead = input_batch.DeadRows(
+            torch.ones(MAX_REQS, DRAFTS, device=DEVICE),
+            padding,
+            torch.zeros(4, dtype=torch.int32, device=DEVICE),
+            math.log(0.2),
+        )
+        for dead_rows in (None, dead):
+            input_batch.combine_sampled_and_draft_tokens(
+                ids, idx, last, starts, seq_lens[:4], computed, drafts, cu,
+                4 * (1 + DRAFTS), 1, dead_rows,
+            )  # fmt: skip
+        input_batch.expand_idx_mapping(idx, 4 * (1 + DRAFTS), cu, 1 + DRAFTS)
+        bins = torch.zeros((MAX_REQS, 64), dtype=torch.int32, device=DEVICE)
+        total = _randint(0, 100, (MAX_REQS,), gen)
+        for width in (1, 1 + DRAFTS):
+            input_batch.post_update(
+                idx, computed, last, bins,
+                torch.zeros((4, width), dtype=torch.int64, device=DEVICE),
+                torch.ones(4, dtype=torch.int32, device=DEVICE),
+                torch.zeros(4, dtype=torch.int32, device=DEVICE),
+                starts, history, total,
+            )  # fmt: skip
+    
+        # KV block zeroing.
+        storage = torch.ones(64, dtype=torch.int32, device=DEVICE)
+        zeroer = KVBlockZeroer.__new__(KVBlockZeroer)
+        zeroer.device = DEVICE
+        zeroer._meta = (
+            torch.tensor([storage.data_ptr()], dtype=torch.uint64, device=DEVICE),
+            torch.tensor([16], device=DEVICE),
+            torch.tensor([16], device=DEVICE),
+            1,
+            16,
+            1,
+        )
+        zeroer.zero_block_ids([1])
+    
+        # DFlash drafting.
+        batch, inputs, outputs, max_tokens = _dflash_case(4, gen, False, 1)
+        buffers = SimpleNamespace(
+            input_ids=outputs.input_ids,
+            positions=outputs.positions,
+            query_start_loc=outputs.query_start_loc,
+            seq_lens=outputs.seq_lens,
+        )
+        dflash.prepare_dflash_inputs(
+            buffers, outputs.query_slots, outputs.context_positions,
+            outputs.context_slots, outputs.sample_indices, outputs.sample_pos,
+            outputs.sample_map, outputs.temperature, outputs.seeds, batch,
+            inputs.num_sampled, inputs.num_rejected, inputs.last_sampled,
+            inputs.next_prefill_tokens, inputs.temperature, inputs.seeds,
+            inputs.block_table, 16, 0, 1, 1, 123, 1 + DRAFTS, DRAFTS, MAX_REQS,
+            max_tokens, 1 << 20, False,
+        )  # fmt: skip
+        torch.accelerator.synchronize()
+    
+        declared = (
+            tli.block_table_calls(cp_size=1, cp_interleave=1)
+            + tli.staged_write_calls()
+            + tli.zero_kv_blocks_calls()
+            + tli.input_batch_calls(
+                num_lookahead=1,
+                num_speculative_steps=DRAFTS,
+                num_new_sampled_tokens=1,
+                dead_rows=True,
+                sampled_widths=(1, 1 + DRAFTS),
+                commits=((True, True, False),),
+            )
+            + tli.dflash_calls(False, [(1, 1)])
+        )
+        declared_keys = {(id(function), args) for function, args, kwargs in declared}
+        assert all(not kwargs for _, _, kwargs in declared)
+>       assert launched == declared_keys
+E       AssertionError: assert {(25755258434...int64')), ...} == {(25755258434...int64')), ...}
+E         
+E         Extra items in the right set:
+E         (257552689075392, ('int32', True))
+E         Use -v to get more diff
+
+tests/v1/worker/test_gpu_tilelang_inputs.py:1444: AssertionError
+=============================== warnings summary ===============================
+../../../../usr/local/lib/python3.12/dist-packages/torch/jit/_script.py:365: 14 warnings
+  /usr/local/lib/python3.12/dist-packages/torch/jit/_script.py:365: DeprecationWarning: `torch.jit.script_method` is deprecated. Please switch to `torch.compile` or `torch.export`.
+    warnings.warn(
+
+-- Docs: https://docs.pytest.org/en/stable/how-to/capture-warnings.html
+=========================== short test summary info ============================
+FAILED tests/v1/worker/test_gpu_tilelang_inputs.py::test_apply_fused_staged_writes
+FAILED tests/v1/worker/test_gpu_tilelang_inputs.py::test_declared_calls_cover_the_call_sites
+2 failed, 680 passed, 1 skipped, 14 warnings in 193.29s (0:03:13)

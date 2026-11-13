@@ -1,0 +1,163 @@
+# candidate-52 stack log
+#
+# On sp8 (~/spark-lab/agents/candidates-51-53): stack-vllm is a --shared clone of the selection's base-vllm
+# (~/spark-lab/agents/round-51-53-select/base-vllm), detached at 1107's patch head 2756478b60b9 (tree ed1bdb7a7684).
+# candidate-50's 0762..0777, 0779 and 0780 (0778, #1009, left out), then this candidate's 0781.., each checked with
+# git apply --check --verbose (hunk offsets are listed) and applied with git am --committer-date-is-author-date,
+# committer Christopher Owen <3221756+christopherowen@users.noreply.github.com>, as bin/spark build prepare does.
+# Run as: bash tools/stack.sh $PWD $PWD/exp 52 $PWD/logs/stack-52.log (exp/: copies of candidate-50/vllm and candidate-52/vllm).
+# Script: see the end.
+
+## 1. The base: 1107's patch head, then candidate-50's 0762..0777, 0779, 0780 (0778, #1009, left out)
+
+base-1107 patch_head 2756478b60b90700b9918b457aeb38657da637b5 tree ed1bdb7a7684da33d403a055521ac0c4dd7ca670
+OK    0762-perf-dsv41-evict-first-l2-policy-on-routed-moe-tma-weights.patch sha256=9c87a2cde0c3725abf2eeaeb75d7c3da588781ebd64fbf1e2ef87145063087c2  commit=eb8367abcb1f64b8aea176d2bd516b7c24c88d3e tree=e10b5f644a8fc58f38d26a8bf71109fdd184204d files=2
+OK    0763-perf-dsv41-certified-two-pass-lm-head-vocab-screen.patch sha256=9dd029645123a6d781b8b266a7f5631e07fce46420da30f185a50f57dc15975f  commit=2ab2b10322a3cec35a6459315e42604c9fd5e26c tree=c4c1334009ded56386e91bfad538d4d2c816f78f files=4
+OK    0764-perf-worker-eliminate-decode-step-h2d-and-aten-overhead.patch sha256=3cc90fd7cbd7e4bbc6d70195c4f520b9f2779181b7d7b694c873ced472652155  commit=2c74b76baf9efb6a8940be0b479912af5f5110a0 tree=66b55adf073bcda7b59ce71d72acc8dc17e9bcd7 files=7
+OK    0765-perf-dsv41-overlap-decode-kv-index-writes-with-query.patch sha256=b93f0b8231ce4c0c34058094747f0338958e0a41a3c657e2dd2128b7460870ec  commit=7378235432185029eae5f41844dbf397aee9f0fb tree=b966a5aabd6486dc66de230609d3bcdd957e2ec5 files=6
+OK    0766-perf-dsv41-align-qb-and-indexer-qb-tile-contiguous-decode.patch sha256=a2e890cb07352a5321b8976becd2bcd0e7623dd4d04860792c52dbfdd109da53  commit=693f5a34f8e8d289b914c8e4907fa8987e216b4a tree=1bb01637f364abf92eca37c67e977254ee55b55e files=2
+OK    0767-perf-dsv41-sparse-mla-stage1-kv-gather-and-barrier-opt.patch sha256=a94953a2256e034b253062b2939fb722edda5e0f04c468cc58777d4593a5805d  commit=2d6d365cac0026e3fa1e29fe2cbd750fa18cab67 tree=144aa07d60a2f3c6a2c9b08675cb07fde1ca1fdc files=2
+OK    0768-deepseek-v41-dsml-token-provenance.patch sha256=4faecf86602d5af78f0fb7b6ce8231079e1045ec07d2ef4499c4039cd4e48165  commit=224fd77f8ee17d368c106142f36275b5f4e01a7c tree=1384a958839bc302725667dddec60da99391bfde files=13
+OK    0769-perf-spec-decode-elide-tp-confidence-broadcast-and-lock-sampling-seeds.patch sha256=8909cac3a7164a33fc31a3094b6c13e8f81e491884a1772b7dccf8d7978cb46f  commit=d928d3bc9ee4403e0664c55bdbba9c297c76dac4 tree=e5b6c992daf014b52abde2e56b79710133dba759 files=7
+      git apply: Hunk #1 succeeded at 406 (offset 18 lines).
+      git apply: Hunk #2 succeeded at 493 (offset 18 lines).
+      git apply: Hunk #3 succeeded at 589 (offset 33 lines).
+      git apply: Hunk #4 succeeded at 653 (offset 33 lines).
+      git apply: Hunk #5 succeeded at 672 (offset 33 lines).
+OK    0770-fix-structured-output-enforce-completions-grammar-un.patch sha256=62f0c10104df81e76870339de74f391956f21c70869acfc4db1c755a0aef4475  commit=f4cf51df5c31f349ca847fd9688017000e52d283 tree=4ed2b51913d2f224a52bcee0717262d17b768a54 files=3
+OK    0771-feat-serve-sse-keepalive-heartbeat-and-abort-cleanup.patch sha256=6376f864f55999f720f5352c1d38ecb5fb9ef01b1efdcaa0e6826f203ec041b7  commit=55a961f43fc5ef65bcd535ee932e4f7830112839 tree=aa8d84b1f3c8822bdd728d7b521b2bc90230b845 files=8
+OK    0772-fix-entrypoints-move-model-inspection-RPC-out-of-LLM.patch sha256=b6d59741bef111b035759235ab8044e2c3b64ae95a870ca500a9323b3b325b4d  commit=9a412d911d11d953d0167e30de2c92cc2a6842bc tree=4f8be4f71018ba914d3b9cedf533b8ffafdf9dab files=3
+OK    0773-fix-attention-keep-FA-sliding-window-active-under-ba.patch sha256=bde52b4ac23f14410ac142b2bb7e6b132b0728c3ab4b68b4dc73726e2fa3459c  commit=4e7f40f19704c7aa8739575145002f8a89a079dd tree=0b4acc88eb9993a79886c3dc5eacb0503fdb484c files=2
+OK    0774-perf-dsv41-fast-path-multi-turn-chat-rendering-and-s.patch sha256=5ab215e451714e0d821f9c6656da53372cb941f54669d448100bfce78a4f08f2  commit=65309d02a3d6926565ea7e04aed54a831ea6e5a4 tree=e4481e62237a0b5a6ab82e1d639cf6a28f5514c3 files=4
+OK    0775-perf-dsv41-widen-long-context-indexer-top-k-segments.patch sha256=82dd996ae49515ccc478e4b1de21200d7bf7b3e151689f8d01f5742b57db8240  commit=7ded0c6ca0d131fe5f68dfb6340531a1ae25b8a2 tree=e801ccc78a4ff3ec67c46d32b74ca33d0718b2cb files=2
+OK    0776-perf-dsv41-vectorize-indexer-KPool-loads-and-co-sche.patch sha256=fa8d0000e8cd1df8d5524190e9821e40321bf53895ebef26e8d9295dee75def6  commit=d6afe84ac5f2744b274a435e1c08cbd030d54894 tree=d841fab2460a6ff556abeeeb737c18450aced72d files=2
+OK    0777-perf-dsv41-hw-e2m1x2-indexer-and-gemm-mxfp4-quantize.patch sha256=20bbb06587981c992e805a3aa56b4a15f2e208f1fc9a0ea4d9d1849ab3fd992f  commit=668bc8056e15aafc6a3b3de37e7aff32c66cd339 tree=2e343ae0c2ce9ad74a17bead938092541ddbd70e files=4
+      git apply: Hunk #2 succeeded at 964 (offset 2 lines).
+OK    0779-perf-dsv41-pipeline-the-sliced-SP-Engram-row-exchang.patch sha256=bc4c5e7a196eb6312e07044d80648575f3f8ea80d077030ebea99892b45152f0  commit=2c0bd531a6be032cc55a3f7a066df1c4389cde7f tree=18ff626477cab9c5cf43a6f69eaed0ff4fbe6fe4 files=3
+      git apply: Hunk #1 succeeded at 326 (offset -2 lines).
+      git apply: Hunk #2 succeeded at 548 (offset -2 lines).
+      git apply: Hunk #3 succeeded at 570 (offset -2 lines).
+      git apply: Hunk #4 succeeded at 646 (offset -2 lines).
+      git apply: Hunk #5 succeeded at 670 (offset -2 lines).
+OK    0780-perf-dsv41-cache-SP-local-routing-masks-and-skip-SP-.patch sha256=389b737f694f0e4ef13308d68a8f555c5e935f89dcbce1f6c294d3a40d02b775  commit=0bc043e856a8bcb229faf0e13bb34de63319722f tree=14c5a2dc924541ce4eda44d5b39d811be15f2363 files=2
+base head 0bc043e856a8bcb229faf0e13bb34de63319722f tree 14c5a2dc924541ce4eda44d5b39d811be15f2363 patches_after_1107 18
+base tree equals the selection's base (candidate-50's prepared tree with 0778 reverted, commit 0bffb886, tree 14c5a2dc)
+
+## 2. candidate-52: its patches 0781.. in series order
+
+OK    0781-fix-dsv41-align-moe_swiglu_cast-with-DeepSeek-Expert.patch sha256=6ed9d54fac0e2fcce315d91c33b16b0991c11bb7cf5eba376c08b323c5f4f695  commit=b647520394c6da7c9bcfc44b477701670320c190 tree=b8d16d9649de676dfb0e5fcb4a1ef3434b17a729 files=2
+      git apply: Hunk #1 succeeded at 1180 (offset 8 lines).
+      git apply: Hunk #2 succeeded at 1213 (offset 8 lines).
+      git apply: Hunk #3 succeeded at 1234 (offset 8 lines).
+      git apply: Hunk #4 succeeded at 1271 (offset 8 lines).
+OK    0782-perf-spec-decode-remaining-token-draft-cap.patch sha256=9a8501356dc1e168d09019033f43c5b56062b3f13f65c51e51717d8a378a35a0  commit=948c7a68b1805eb565f0ca51ae31ce44ff944764 tree=7432d70e1fdc680b5890d7803c27722bcf96f22d files=2
+OK    0783-perf-dsv41-direct-insert-packed-engram-cache-and-ali.patch sha256=a802a30479229c792a9066642968246e41350fff6c3825091000529a004c6ba4  commit=51a16b66d087686e79496163263311b25d848127 tree=1116740c08aa1cf2cdeaa5b1fcf08dc93410ba56 files=3
+head 51a16b66d087686e79496163263311b25d848127 tree 1116740c08aa1cf2cdeaa5b1fcf08dc93410ba56 patches_after_base 3 patches_after_1107 21
+git diff --check 19f2c20ed4d6..HEAD: clean
+
+## 3. The no1030 overlay (sp8, stack-vllm)
+
+0781 (#1030) is commit b647520394c6 on the candidate-52 stack. After the base, it is the only patch that touches
+vllm/models/deepseek_v4_1/tilelang/moe.py:
+  git log --format="%h %s" base-c50-no1009..candidate-52 -- vllm/models/deepseek_v4_1/tilelang/moe.py
+  b64752039 fix(dsv41): align moe_swiglu_cast with DeepSeek Expert.forward BF16 rounding
+The overlay is candidate-52's file with 0781 reverted:
+  git checkout --detach candidate-52 && git revert --no-commit b647520394c6
+  git show :vllm/models/deepseek_v4_1/tilelang/moe.py > no1030/overlay/vllm/models/deepseek_v4_1/tilelang/moe.py
+  git revert --abort
+sha256 e786ff6c31edb083cf3ec5cfa2d55d58fdcf12e66e8e50590de5d8ed7a312afe  overlay moe.py
+sha256 e786ff6c31edb083cf3ec5cfa2d55d58fdcf12e66e8e50590de5d8ed7a312afe  base-c50-no1009:vllm/models/deepseek_v4_1/tilelang/moe.py (the same file)
+sha256 375f505fb692e1e8a6012d28cc56ac3c607493e3ba63d88db8bd7c89fced6446  candidate-52:vllm/models/deepseek_v4_1/tilelang/moe.py
+0781 applies to the overlay (from no1030/overlay):
+  git apply --check --verbose --include=vllm/models/deepseek_v4_1/tilelang/moe.py 0781-fix-dsv41-align-moe_swiglu_cast-with-DeepSeek-Expert.patch
+  Skipped patch 'tests/kernels/moe/test_deepseek_v41_tilelang_moe.py'.
+  Checking patch vllm/models/deepseek_v4_1/tilelang/moe.py...
+  Hunk #1 succeeded at 1180 (offset 8 lines).
+  Hunk #2 succeeded at 1213 (offset 8 lines).
+  Hunk #3 succeeded at 1234 (offset 8 lines).
+  Hunk #4 succeeded at 1271 (offset 8 lines).
+  (clean)
+
+## 4. bin/spark --cluster-config experiments/2026-10-26-spark-ds41f-candidate/candidate-52/image-dgx4.json build prepare --only vllm --lock (dgx4)
+
+vllm: prepared 51a16b66d087 (tree 1116740c08aa) in .work/build/vllm-19f2c20ed4d6-b12x-236ddff04a5f-6c7d7473
+patch_count 662, patch_head 51a16b66d087686e79496163263311b25d848127, expected_tree 1116740c08aa1cf2cdeaa5b1fcf08dc93410ba56,
+patchset_sha256 5ef941291e0cac8a9c7a196cc31a14d46b1902522d58684dfd910d819bc4d7ba: the same head and tree as section 2.
+(git am warns of a new blank line at EOF in one of 1107's 0001..0761: sp8's stack from 1107's head shows no warning. git diff --check of the result is clean.)
+
+## Scripts as run
+
+### stack.sh
+#!/usr/bin/env bash
+# Candidates 51-53 stack on sp8: 1107's patch head, then candidate-50's patches without 0778
+# (the base), then each candidate's 0781.. in series order. Every patch is checked with
+# git apply --check --verbose (hunk offsets are listed) and applied with git am, as
+# bin/spark build prepare applies it (committer Christopher Owen, committer date = author date).
+#
+# usage: stack.sh WORK EXP N LOG
+#   WORK: directory holding stack-vllm (a --shared clone of the selection's base-vllm)
+#   EXP:  a copy of experiments/2026-10-26-spark-ds41f-candidate with candidate-50/vllm and candidate-N/vllm
+set -u
+WORK=$1; EXP=$2; N=$3; LOG=$4
+REPO=$WORK/stack-vllm
+BASE_1107=2756478b60b90700b9918b457aeb38657da637b5
+VLLM_PIN=19f2c20ed4d64ae22bd009ceacadd85e2a81e354
+SELECTION_BASE_TREE=14c5a2dc924541ce4eda44d5b39d811be15f2363
+AM=(git -c user.name="Christopher Owen" -c user.email=3221756+christopherowen@users.noreply.github.com am --quiet --committer-date-is-author-date)
+SERIES=$EXP/candidate-$N/vllm/series
+
+apply_one() {  # $1: series entry (relative to candidate-N/vllm)
+  local p=$1 f sha out rc am files
+  f=$(cd "$EXP/candidate-$N/vllm" && realpath "$p")
+  sha=$(sha256sum "$f" | cut -c1-64)
+  out=$(git apply --check --verbose "$f" 2>&1); rc=$?
+  if [ $rc -ne 0 ]; then
+    echo "FAIL  $(basename "$p") sha256=$sha  git apply --check rc=$rc" >> "$LOG"; echo "$out" | sed "s/^/      /" >> "$LOG"; return 1
+  fi
+  am=$("${AM[@]}" "$f" 2>&1); rc=$?
+  if [ $rc -ne 0 ]; then
+    echo "FAIL  $(basename "$p") sha256=$sha  git am rc=$rc" >> "$LOG"; echo "$am" | sed "s/^/      /" >> "$LOG"; git am --abort; return 1
+  fi
+  files=$(git diff --name-only HEAD~1 HEAD | wc -l)
+  echo "OK    $(basename "$p") sha256=$sha  commit=$(git rev-parse HEAD) tree=$(git rev-parse HEAD^{tree}) files=$files" >> "$LOG"
+  echo "$out" | grep -E "offset|fuzz" | sed "s/^/      git apply: /" >> "$LOG"
+  [ -n "$am" ] && echo "$am" | sed "s/^/      git am: /" >> "$LOG"
+  return 0
+}
+
+cd "$REPO" || exit 1
+git am --abort >/dev/null 2>&1
+git checkout -q --detach "$BASE_1107" || exit 1
+git clean -qfdx
+{
+echo "## 1. The base: 1107's patch head, then candidate-50's 0762..0777, 0779, 0780 (0778, #1009, left out)"
+echo
+echo "base-1107 patch_head $(git rev-parse HEAD) tree $(git rev-parse HEAD^{tree})"
+} >> "$LOG"
+grep -v '^#' "$SERIES" | grep '^\.\./\.\./candidate-50/vllm/' | while read -r p; do
+  apply_one "$p" || exit 1
+done || exit 1
+base_head=$(git rev-parse HEAD); base_tree=$(git rev-parse HEAD^{tree})
+echo "base head $base_head tree $base_tree patches_after_1107 $(git rev-list --count $BASE_1107..HEAD)" >> "$LOG"
+if [ "$base_tree" = "$SELECTION_BASE_TREE" ]; then
+  echo "base tree equals the selection's base (candidate-50's prepared tree with 0778 reverted, commit 0bffb886, tree 14c5a2dc)" >> "$LOG"
+else
+  echo "base tree DIFFERS from the selection's base tree $SELECTION_BASE_TREE" >> "$LOG"; exit 1
+fi
+{
+echo
+echo "## 2. candidate-$N: its patches 0781.. in series order"
+echo
+} >> "$LOG"
+grep -v '^#' "$SERIES" | grep -v '^\.\./' | while read -r p; do
+  apply_one "$p" || exit 1
+done || exit 1
+echo "head $(git rev-parse HEAD) tree $(git rev-parse HEAD^{tree}) patches_after_base $(git rev-list --count $base_head..HEAD) patches_after_1107 $(git rev-list --count $BASE_1107..HEAD)" >> "$LOG"
+if git diff --check "$VLLM_PIN" HEAD >/dev/null; then
+  echo "git diff --check ${VLLM_PIN:0:12}..HEAD: clean" >> "$LOG"
+else
+  echo "git diff --check ${VLLM_PIN:0:12}..HEAD: PROBLEMS" >> "$LOG"
+fi
+git branch -f "candidate-$N" HEAD >/dev/null
+git branch -f "base-c50-no1009" "$base_head" >/dev/null
+exit 0

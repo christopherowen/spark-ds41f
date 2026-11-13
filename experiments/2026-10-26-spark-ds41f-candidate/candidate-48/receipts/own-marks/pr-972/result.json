@@ -1,0 +1,49 @@
+{
+  "pr": 972,
+  "pr_head": "3827857dc3dd9dbea8d793dfb76f36048a11f914",
+  "mark": "A live client disconnect aborts the engine request (its 32/32 test); keep-alive frames every 15 s; servebench's streams parse",
+  "host": "sp8 (spark-0016, NVIDIA GB10)",
+  "images": {
+    "candidate-48": "sha256:d6ffd842978849651e756ebd39e9bf2da7ddb03e746113013533029878485a24",
+    "1107": "sha256:3f32a962ce04b7c8d85337cd427a8946b8b6bcaadd97cc8d8a8cd14e8d68a6ce"
+  },
+  "evidence": "README section 3: pytest --noconftest on test_api_cancellation.py, test_request_submission_cleanup.py, test_utility_call_cleanup.py, then bench_sse_keepalive.py (both in CPU containers, no --gpus); patched-file copy-in dropped because the candidate image carries 0767. The bench was also run on 1107, where its candidate_new arm exercises 1107's with_sse_keep_alive. Supplementary (ours): check_972_default_cadence.py resolves the default interval and times frames over a 46 s stall",
+  "measured": {
+    "pytest_candidate-48": {"boot1": "71 passed in 4.50s", "boot2": "71 passed in 4.48s"},
+    "disconnect_abort_32_trials": {
+      "candidate-48_boot1": {"candidate_new": "32/32", "baseline_old": "0/32", "leaked_load_metrics": 0},
+      "candidate-48_boot2": {"candidate_new": "32/32", "baseline_old": "0/32", "leaked_load_metrics": 0},
+      "1107_boot1": {"candidate_new_arm_on_1107_code": "0/32", "baseline_old": "0/32"},
+      "1107_boot2": {"candidate_new_arm_on_1107_code": "0/32", "baseline_old": "0/32"}
+    },
+    "prefill_heartbeat_20ms_interval": {
+      "candidate-48_boot1": {"frames": 3, "intervals_ms": [20.221, 20.435, 20.888], "ttft_ms": 72.432, "handoff_overhead_us": 32.38},
+      "candidate-48_boot2": {"frames": 3, "intervals_ms": [20.222, 20.132, 20.122], "ttft_ms": 71.59, "handoff_overhead_us": 13.76}
+    },
+    "default_cadence_supplementary": {
+      "candidate-48_boot1": {"resolved_default_interval_s": 15.0, "frame_times_s": [15.016, 30.032, 45.047], "first_data_s": 46.001},
+      "candidate-48_boot2": {"resolved_default_interval_s": 15.0, "frame_times_s": [15.016, 30.031, 45.047], "first_data_s": 46.002},
+      "1107_boot1": {"has_get_sse_keep_alive_interval": false, "note": "1107 has no default interval: keep-alive is off unless --sse-keep-alive-interval is passed"}
+    },
+    "wrapper_cost_us_per_chunk_candidate_new_15s": {
+      "micro_c1": {"candidate-48": [0.5116, 0.5109], "1107": [4.3114, 4.2966]},
+      "micro_c16": {"candidate-48": [0.4975, 0.4979], "1107": [3.3471, 3.3216]},
+      "asgi_c1": {"candidate-48": [1.5805, 1.5603], "1107": [5.0114, 4.9731]},
+      "asgi_c16": {"candidate-48": [1.309, 1.2964], "1107": [3.9449, 3.8888]},
+      "note": "boot1, boot2; the PR's claimed candidate values are 0.5068/0.5082, 0.4942/0.4971, 1.5530/1.5509, 1.2868/1.2860"
+    },
+    "interval": "abort and cadence counts are identical across boots; wrapper cost varies by at most 0.04 us/chunk between boots on the candidate"
+  },
+  "parts": [
+    {"part": "client disconnect aborts the engine request (its 32/32 test)", "verdict": "pass", "detail": "32/32 completed aborts and 0 leaked load metrics on both candidate-48 boots; the same arm on 1107's code gives 0/32 on both boots. The live disconnect against a serving engine is cannot-evaluate-on-sp8"},
+    {"part": "keep-alive frames every 15 s", "verdict": "pass", "detail": "default resolves to 15.0 s on the image and frames arrive at 15.016 / 30.03 / 45.05 s during a 46 s stall on both boots (supplementary check, ours); the PR's 20 ms cadence bench gives 3 frames at about 20.1-20.9 ms. Not checked through a live server"},
+    {"part": "servebench's streams parse", "verdict": "cannot-evaluate-on-sp8", "detail": "needs servebench against a live server; the pytest suite's OpenAI SDK SSE parser compatibility test passes (part of the 71)"}
+  ],
+  "verdict": "pass",
+  "verdict_scope": "sp8-evaluable parts only; the live disconnect and servebench parts are cannot-evaluate-on-sp8",
+  "reason": "The PR's tests pass 71/71 on both boots, its 32-trial disconnect test completes 32/32 aborts on the candidate image and 0/32 on 1107's code, and the image's default keep-alive cadence is 15 s. The bench's candidate_new arm wraps a fake generator whose cleanup is itself shielded; that stands in for the patched AsyncLLM.abort, so the 32/32 is an ASGI-level result, not an engine-level one.",
+  "notes": [
+    "commands.txt start_utc is when the command was issued and includes any wait on /tmp/spark-lab-gpu.lock",
+    "The 1107 arm of the supplementary check stops at resolution because 1107 has no get_sse_keep_alive_interval"
+  ]
+}

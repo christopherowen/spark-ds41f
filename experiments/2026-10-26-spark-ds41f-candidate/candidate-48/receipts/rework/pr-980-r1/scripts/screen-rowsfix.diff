@@ -1,0 +1,22 @@
+--- screen_zero_broadcast_sync.py	2026-11-09 08:50:06.647787338 +0000
++++ screen_zero_broadcast_sync_rowsfix.py	2026-11-09 09:40:04.896188481 +0000
+@@ -535,10 +535,18 @@
+                 proc_logits = tilelang_topk_topp.apply_top_k_top_p(
+                     target_logits, top_k_t, top_p_t
+                 )
++                # rejection_sample reads draft_sampled as [num_logits], each
++                # request's drafts at its rows 1..num_steps (the worker passes
++                # input_ids[logits_indices]); draft_tokens.view(-1) is only
++                # num_reqs * num_steps long.
++                draft_rows = torch.zeros(
++                    (num_reqs, 1 + num_steps), dtype=draft_tokens.dtype, device=device
++                )
++                draft_rows[:, 1:] = draft_tokens
+                 sampled_tokens, num_sampled = rejection_sample(
+                     proc_logits,
+                     draft_logits,
+-                    draft_tokens.view(-1),
++                    draft_rows.view(-1),
+                     cu_num_logits,
+                     pos_verify,
+                     idx_mapping,

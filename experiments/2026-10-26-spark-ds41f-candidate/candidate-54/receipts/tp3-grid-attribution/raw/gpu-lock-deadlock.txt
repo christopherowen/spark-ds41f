@@ -1,0 +1,28 @@
+# sp8 2026-11-10T04:26:48Z
+## /proc/locks entries for /tmp/spark-lab-gpu.lock (inode 131092)
+10: FLOCK  ADVISORY  WRITE 3957638 103:02:131092 0 EOF
+10: -> FLOCK  ADVISORY  WRITE 3957639 103:02:131092 0 EOF
+## holder and waiter
+3957638 3728912    01:15:57 S    flock /tmp/spark-lab-gpu.lock python3 scripts/lab.py kernel-local experiments/2026-10-26-spark-ds41f-candidate/candidate-56/bundles/release-tests --out /home/chris/spark-lab/results/candi
+3957639 3957638    01:15:57 S    python3 scripts/lab.py kernel-local experiments/2026-10-26-spark-ds41f-candidate/candidate-56/bundles/release-tests --out /home/chris/spark-lab/results/candidates-55-57/release-tests-56-s
+wchan 3957639: locks_lock_inode_wait
+fds 3957639:
+0 -> /dev/null
+1 -> /home/chris/spark-lab/results/candidates-55-57/build-56-57.log
+2 -> /home/chris/spark-lab/results/candidates-55-57/build-56-57.log
+3 -> /tmp/spark-lab-gpu.lock
+4 -> /tmp/spark-lab-gpu.lock
+## ~/spark-lab/agents/candidates-55-57/build-56-57.sh line 15
+  if flock /tmp/spark-lab-gpu.lock python3 scripts/lab.py kernel-local $E/candidate-$n/bundles/release-tests --out ~/spark-lab/results/candidates-55-57/release-tests-$n-sp8; then say "KERNEL-DONE $n"; else say "KERNEL-FAILED $n"; fi
+## its log tail
+2026-11-10T03:10:50Z IMAGE-DONE 57 sha256:ba512cb2662b290a6c0a6055ce6a0040052935f38ea8b43595d69e68ad652209
+2026-11-10T03:10:50Z KERNEL 56
+## GPU containers now
+serene_dewdney spark-ds41f:1107 Up 8 minutes
+## spark_ds41f/lab.py (main dc31a318), kernel-local, lines 2391-2392
+    with open("/tmp/spark-lab-gpu.lock", "w") as lock:
+        fcntl.flock(lock, fcntl.LOCK_EX)
+## reading
+flock(1) holds the lock on its own open file description; lab.py kernel-local, its child, opens the file
+again and blocks in flock(LOCK_EX) on a second description: a self-deadlock since 03:10:50Z (KERNEL 56).
+Nothing has run under the lock since; KERNEL 57 (line 15 again) would deadlock the same way.

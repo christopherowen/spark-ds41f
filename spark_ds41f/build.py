@@ -8,6 +8,7 @@ import concurrent.futures
 import fcntl
 import functools
 import hashlib
+import http.client
 import json
 import os
 import random
@@ -201,6 +202,18 @@ INDEPENDENT_BUILD_PROJECTS = ("sparknet",)
 SPARKNET_CAPABILITY = "tilelang-sparknet-collectives"
 BUILD_PARTS = ("vllm", "nccl", "cutlass", "wheels")
 BUILD_CONTEXTS = ("vllm-source", "nccl-source", "cutlass-source", "cutlass-dsl-wheels", "vllm-deletions")
+# A lock may list sources.cuda_toolkit: Debian packages of a newer CUDA toolkit for the
+# base image's Ubuntu, each locked by file, size and SHA-256. Each supported version
+# names the Dockerfile stage that installs it (CUDA_STAGE, which the builder stages and
+# runtime-core start from) and the stage that re-wires and checks it on runtime-core
+# (RUNTIME_CORE_STAGE). A lock without it builds on the base image's CUDA 13.0.2 with
+# neither argument nor the cuda-toolkit-debs context.
+CUDA_TOOLKIT_STAGES = {"13.5.37": ("cuda-13-5", "runtime-core-cuda-13-5")}
+CUDA_TOOLKIT_CONTEXT = "cuda-toolkit-debs"
+CUDA_TOOLKIT_LINE = re.compile(
+    r"^(?P<package>[a-z0-9][a-z0-9+.-]+)=(?P<version>[0-9A-Za-z.+~:-]+)\s+"
+    r"(?P<filename>\S+)\s+(?P<size>[0-9]+)\s+sha256:(?P<sha256>[0-9a-f]{64})$"
+)
 # The projects a lock may list or leave out, each with a <name>-source context.
 LISTED_BUILD_PROJECTS = (*LEGACY_BUILD_PROJECTS, *OPTIONAL_BUILD_PROJECTS, *INDEPENDENT_BUILD_PROJECTS)
 # git am with a fixed committer and committer date reproduces the recorded
@@ -237,16 +250,25 @@ print("GPU import smoke passed")
 # collectives with the kernel-family switch.
 B12X_ROCE_IMPORT = "import vllm.distributed.device_communicators.b12x_roce_all_reduce  # noqa: F401\n"
 B12X_MLA_IMPORT = "import vllm.v1.attention.backends.mla.b12x_mla_sparse  # noqa: F401\n"
-# An image whose lock does not list B12X: the package must be absent, and the DS4.1
-# modules that used it (Engram, the packed head's packer) import without it.
+# An image whose lock does not list B12X: the package must be absent, and every DS4.1
+# module imports without it and loads no B12X module. (It named one module,
+# tilelang.vocab_pack, which no B12X-free series has: candidate-55's #1096 moves the
+# packed head off B12X in place.)
 WITHOUT_B12X_SMOKE = """\
+import importlib
 import importlib.util
+import pkgutil
+import sys
 
 assert importlib.util.find_spec("b12x") is None, "B12X is installed"
-import vllm.models.deepseek_v4_1.common.engram  # noqa: F401
-import vllm.models.deepseek_v4_1.tilelang.vocab_pack  # noqa: F401
+import vllm.models.deepseek_v4_1 as dsv41
 
-print("B12X is not installed; the DS4.1 modules import without it")
+names = sorted(info.name for info in pkgutil.walk_packages(dsv41.__path__, dsv41.__name__ + "."))
+for name in names:
+    importlib.import_module(name)
+loaded = sorted(name for name in sys.modules if name == "b12x" or name.startswith("b12x."))
+assert not loaded, loaded
+print(f"B12X is not installed; the {len(names)} DS4.1 modules import without it")
 """
 
 
@@ -256,7 +278,77 @@ def build_projects(sources: dict) -> tuple[str, ...]:
 
 
 def build_contexts(inputs: dict) -> tuple[str, ...]:
-    return BUILD_CONTEXTS + tuple(f"{name}-source" for name in LISTED_BUILD_PROJECTS if name in inputs)
+    contexts = BUILD_CONTEXTS + tuple(f"{name}-source" for name in LISTED_BUILD_PROJECTS if name in inputs)
+    return contexts + ((CUDA_TOOLKIT_CONTEXT,) if "cuda_toolkit" in inputs else ())
+
+
+def cuda_toolkit_debs(lockfile: str) -> dict[str, dict]:
+    """The Debian packages a CUDA toolkit lockfile lists, by file name (ValueError when malformed):
+    one ``package=version filename size sha256:<hex>`` line each, the file named as apt names it."""
+    debs: dict[str, dict] = {}
+    packages: set[str] = set()
+    for number, raw_line in enumerate((ROOT / lockfile).read_text(encoding="utf-8").splitlines(), 1):
+        line = raw_line.strip()
+        if not line or line.startswith("#"):
+            continue
+        match = CUDA_TOOLKIT_LINE.match(line)
+        if match is None:
+            raise ValueError(f"line {number} is not 'package=version filename size sha256:<hex>'")
+        package, version, filename = match["package"], match["version"], match["filename"]
+        stem = f"{package}_{version.split(':', 1)[-1]}_"
+        if filename not in (f"{stem}arm64.deb", f"{stem}all.deb"):
+            raise ValueError(f"line {number}: {filename} is not {stem}<arm64|all>.deb")
+        if package in packages or filename in debs:
+            raise ValueError(f"line {number}: {package} is listed twice")
+        if int(match["size"]) <= 0:
+            raise ValueError(f"line {number}: {filename} has no size")
+        packages.add(package)
+        debs[filename] = {"package": package, "version": version,
+                          "size": int(match["size"]), "sha256": match["sha256"]}
+    if not debs:
+        raise ValueError("it lists no package")
+    return debs
+
+
+def cuda_toolkit_problems(sources: dict) -> list[str]:
+    """Problems with a lock's optional sources.cuda_toolkit; none when the lock omits it."""
+    source = sources.get("cuda_toolkit")
+    if source is None:
+        return []
+    if not isinstance(source, dict):
+        return ["cuda_toolkit: the source must be an object"]
+    problems = []
+    if source.get("kind") != "deb":
+        problems.append("cuda_toolkit: kind must be deb")
+    upstream = source.get("upstream")
+    if not isinstance(upstream, str) or not upstream.startswith("https://"):
+        problems.append("cuda_toolkit: upstream must be the https:// apt repository the packages come from")
+    version = source.get("version")
+    if version not in CUDA_TOOLKIT_STAGES:
+        problems.append(f"cuda_toolkit: no Dockerfile stage installs CUDA {version!r} "
+                        f"(supported: {', '.join(CUDA_TOOLKIT_STAGES)})")
+    lockfile = source.get("lockfile")
+    if not isinstance(lockfile, str) or not lockfile or not (ROOT / lockfile).is_file():
+        problems.append(f"cuda_toolkit: missing package lock {lockfile}")
+        return problems
+    try:
+        debs = cuda_toolkit_debs(lockfile)
+    except ValueError as error:
+        problems.append(f"cuda_toolkit: {lockfile}: {error}")
+        return problems
+    if version in CUDA_TOOLKIT_STAGES:
+        nvcc = "cuda-nvcc-" + "-".join(version.split(".")[:2])
+        versions = [deb["version"] for deb in debs.values() if deb["package"] == nvcc]
+        if not versions or not versions[0].startswith(f"{version}-"):
+            problems.append(f"cuda_toolkit: {lockfile} must list {nvcc} at {version}")
+    return problems
+
+
+def cuda_stages(inputs: dict) -> tuple[str, str] | None:
+    """The stages a lock's CUDA toolkit selects (CUDA_STAGE, RUNTIME_CORE_STAGE); None keeps
+    the base image's CUDA and both Dockerfile defaults."""
+    toolkit = inputs.get("cuda_toolkit")
+    return None if toolkit is None else CUDA_TOOLKIT_STAGES[toolkit["version"]]
 
 
 def runtime_stage(inputs: dict) -> str | None:
@@ -284,8 +376,12 @@ def final_stage(cluster: dict, stage: str | None) -> str | None:
 
 
 def tilelang_base_stage(inputs: dict) -> str:
-    """The Dockerfile stage the TileLang runtime builds on: B12X's while the lock lists it."""
-    return "runtime" if "b12x" in inputs else "runtime-core"
+    """The Dockerfile stage the TileLang runtime builds on: B12X's while the lock lists it,
+    else runtime-core (re-wired for the lock's CUDA toolkit when it lists one)."""
+    if "b12x" in inputs:
+        return "runtime"
+    stages = cuda_stages(inputs)
+    return "runtime-core" if stages is None else stages[1]
 
 
 def missing_patches(source: dict) -> list[str]:
@@ -728,6 +824,18 @@ def build_inputs(upstreams: dict, parts: list[str] | None = None) -> dict:
             inputs[name]["submodules"] = record["submodules"]
     if sources["vllm"].get("canonical_base"):
         inputs["vllm"]["canonical_upstream"] = sources["vllm"]["canonical_base"]["upstream"]
+    # Only a lock that lists a CUDA toolkit records one, so every other lock keeps its
+    # inputs and its build directory.
+    toolkit_problems = cuda_toolkit_problems(sources)
+    if toolkit_problems:
+        raise SystemExit("; ".join(toolkit_problems))
+    if "cuda_toolkit" in sources:
+        toolkit = sources["cuda_toolkit"]
+        inputs["cuda_toolkit"] = {
+            "upstream": toolkit["upstream"].rstrip("/"),
+            "version": toolkit["version"],
+            "debs": cuda_toolkit_debs(toolkit["lockfile"]),
+        }
     return inputs
 
 
@@ -894,6 +1002,82 @@ def prepare_wheels(directory: Path, upstreams: dict) -> None:
     print("cutlass-dsl wheels: downloaded and verified")
 
 
+def cuda_deb_verified(path: Path, record: dict) -> bool:
+    return (path.is_file() and not path.is_symlink() and path.stat().st_size == record["size"]
+            and sha256(path) == record["sha256"])
+
+
+def cuda_deb_problems(deb_dir: Path, inputs: dict) -> list[str]:
+    """Missing, unlocked and changed files in a CUDA toolkit context."""
+    if not deb_dir.is_dir():
+        return [f"{CUDA_TOOLKIT_CONTEXT}: missing"]
+    expected = inputs["cuda_toolkit"]["debs"]
+    problems = []
+    for path in sorted(deb_dir.iterdir()):
+        record = expected.get(path.name)
+        if record is None:
+            problems.append(f"{CUDA_TOOLKIT_CONTEXT}: unlocked file {path.name}")
+        elif not cuda_deb_verified(path, record):
+            problems.append(f"{CUDA_TOOLKIT_CONTEXT}: {path.name} differs from the lock size or hash")
+    for filename in sorted(set(expected) - {path.name for path in deb_dir.iterdir()}):
+        problems.append(f"{CUDA_TOOLKIT_CONTEXT}: missing {filename}")
+    return problems
+
+
+def download_cuda_deb(url: str, destination: Path, record: dict, attempts: int = 3) -> None:
+    """Stream ``url`` to ``destination``, which must then hold the locked size and SHA-256.
+    A failed or short transfer is retried; a file that differs from the lock is not."""
+    for attempt in range(1, attempts + 1):
+        digest, written = hashlib.sha256(), 0
+        try:
+            with urllib.request.urlopen(url, timeout=120) as response, destination.open("wb") as handle:
+                for chunk in iter(lambda: response.read(1024 * 1024), b""):
+                    written += len(chunk)
+                    if written > record["size"]:
+                        break
+                    digest.update(chunk)
+                    handle.write(chunk)
+            if written < record["size"]:
+                raise OSError(f"the transfer ended after {written} of {record['size']} bytes")
+        except (OSError, http.client.HTTPException) as error:
+            destination.unlink(missing_ok=True)
+            if attempt == attempts:
+                raise SystemExit(f"{CUDA_TOOLKIT_CONTEXT}: cannot download {url}: {error}") from error
+            print(f"{CUDA_TOOLKIT_CONTEXT}: {destination.name}: {error}; retrying", flush=True)
+            continue
+        if written != record["size"] or digest.hexdigest() != record["sha256"]:
+            destination.unlink(missing_ok=True)
+            raise SystemExit(f"{CUDA_TOOLKIT_CONTEXT}: {url} differs from the lock size or hash")
+        return
+
+
+def prepare_cuda_toolkit(directory: Path, inputs: dict) -> None:
+    """The lock's CUDA toolkit packages in context/cuda-toolkit-debs: verified files are kept,
+    the rest downloaded from the lock's repository and verified."""
+    destination = directory / "context" / CUDA_TOOLKIT_CONTEXT
+    toolkit = inputs["cuda_toolkit"]
+    verified = {filename for filename, record in toolkit["debs"].items()
+                if cuda_deb_verified(destination / filename, record)}
+    if verified == set(toolkit["debs"]) and {p.name for p in destination.iterdir()} == verified:
+        print(f"cuda-toolkit debs: reusing {len(verified)} verified packages")
+        return
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    temporary = Path(tempfile.mkdtemp(prefix=".cuda-toolkit.", dir=destination.parent))
+    try:
+        for filename, record in sorted(toolkit["debs"].items()):
+            if filename in verified:
+                os.link(destination / filename, temporary / filename)
+            else:
+                print(f"cuda-toolkit debs: downloading {filename} ({record['size'] / 1e6:.1f} MB)", flush=True)
+                download_cuda_deb(f"{toolkit['upstream']}/{filename}", temporary / filename, record)
+        replace_directory(temporary, destination)
+    except BaseException:
+        shutil.rmtree(temporary, ignore_errors=True)
+        raise
+    print(f"cuda-toolkit debs: {len(toolkit['debs']) - len(verified)} downloaded, "
+          f"{len(verified)} reused, all verified against the lock")
+
+
 def export_source(source: Path, destination: Path) -> None:
     """Copy a checkout without Git metadata or bytecode, replacing atomically."""
     temporary = destination.with_name(f".{destination.name}.export")
@@ -953,6 +1137,8 @@ def build_problems(directory: Path, inputs: dict) -> list[str]:
     if sorted(record.get("contexts", {})) != sorted(build_contexts(inputs)):
         problems.append("inputs.json does not record every build context")
     problems.extend(wheel_problems(directory / "context/cutlass-dsl-wheels"))
+    if "cuda_toolkit" in inputs:
+        problems.extend(cuda_deb_problems(directory / "context" / CUDA_TOOLKIT_CONTEXT, inputs))
     if not (directory / "context/cutlass-source/include/cutlass/cutlass.h").is_file():
         problems.append("cutlass-source: include/cutlass/cutlass.h is missing")
     return problems
@@ -962,7 +1148,7 @@ def command_build_prepare(args: argparse.Namespace) -> int:
     cluster, _, upstreams = configuration(args)
     parts = args.only.split(",") if args.only else None
     if parts:
-        optional = LISTED_BUILD_PROJECTS
+        optional = (*LISTED_BUILD_PROJECTS, "cuda_toolkit")
         unknown = sorted(set(parts) - set(BUILD_PARTS) - set(optional))
         if unknown:
             raise SystemExit(f"unknown build parts: {', '.join(unknown)}")
@@ -981,7 +1167,8 @@ def command_build_prepare(args: argparse.Namespace) -> int:
                 print(f"WARN: {problem}")
             return 1
     directory = build_directory(inputs)
-    parts = parts or [*BUILD_PARTS, *build_projects(inputs)]
+    toolkit_part = ("cuda_toolkit",) if "cuda_toolkit" in inputs else ()
+    parts = parts or [*BUILD_PARTS, *build_projects(inputs), *toolkit_part]
     if not args.only and not build_problems(directory, inputs):
         print(f"build inputs ready: {directory.relative_to(ROOT)}")
         return 0
@@ -995,6 +1182,8 @@ def command_build_prepare(args: argparse.Namespace) -> int:
         prepare_cutlass(directory, inputs["cutlass"])
     if "wheels" in parts:
         prepare_wheels(directory, upstreams)
+    if "cuda_toolkit" in parts:
+        prepare_cuda_toolkit(directory, inputs)
     if args.only:
         print("partial preparation; run bin/spark build prepare for the complete inputs")
         return 0
@@ -1219,6 +1408,9 @@ def command_build_image(args: argparse.Namespace) -> int:
             })
             if "version" in record:
                 build_args[f"{prefix}_VERSION"] = record["version"]
+        toolkit_stages = cuda_stages(inputs)
+        if toolkit_stages is not None:
+            build_args.update(CUDA_STAGE=toolkit_stages[0], RUNTIME_CORE_STAGE=toolkit_stages[1])
         stage = final_stage(cluster, runtime_stage(inputs))
         if stage is not None:
             build_args.update(RUNTIME_STAGE=stage, TILELANG_COMPILE_JOBS=str(jobs),
@@ -1260,6 +1452,9 @@ def command_build_image(args: argparse.Namespace) -> int:
         label = source_labels.get(image["labels"], f"{name}.tree")
         if label != inputs[name]["expected_tree"]:
             raise SystemExit(f"{tag}: label {source_labels.key(image['labels'], f'{name}.tree')} is {label!r}")
+    toolkit_label = source_labels.get(image["labels"], "cuda.version")
+    if toolkit_label != inputs.get("cuda_toolkit", {}).get("version"):
+        raise SystemExit(f"{tag}: label {source_labels.PREFIX}cuda.version is {toolkit_label!r}")
     print(f"built {tag} {image['id']} in {elapsed:.0f}s; lowest MemAvailable {minimum:.1f} GiB", flush=True)
     smoke_cpus = min(max_jobs, 2) if max_jobs is not None else None
     if smoke_cpus is None:

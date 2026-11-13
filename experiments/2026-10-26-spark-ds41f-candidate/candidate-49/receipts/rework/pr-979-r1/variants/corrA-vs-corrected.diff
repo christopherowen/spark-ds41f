@@ -1,0 +1,277 @@
+diff --git a/tests/models/test_deepseek_v4_1_sp_prefill.py b/tests/models/test_deepseek_v4_1_sp_prefill.py
+index b79d944..b6f2ad3 100644
+--- a/tests/models/test_deepseek_v4_1_sp_prefill.py
++++ b/tests/models/test_deepseek_v4_1_sp_prefill.py
+@@ -1984,104 +1984,67 @@ def test_tilelang_linear_apply_shards_single_cast_and_bit_exact(
+     )
+ 
+ 
+-def test_gather_many_routes_roce_and_packs_small_tensors(monkeypatch):
+-    """On sparknet's ``ring4`` topology, when ``b12x_ar_comm`` accepts all tensors in
+-    ``gather_many``, large tensors are gathered directly into the destination buffer
+-    while small trailing tensors (``<= 512`` B/row, such as MXFP8 scales and top-k
+-    routes) are packed into one ``uint8`` all-gather, reducing 4 collectives to 2.
+-    On ``direct``, without a one-shot runtime, or when any tensor exceeds
+-    ``should_all_gather``, ``gather_many`` uses grouped ``pynccl_comm``."""
++def test_gather_many_keeps_grouped_pynccl_beside_roce(monkeypatch):
++    """With ``b12x_ar_comm`` active and accepting every tensor, ``gather_many``
++    still gathers them in one grouped ``pynccl_comm`` collective: the one-shot
++    all-gather is not faster for these gathers."""
+     layout = sp_prefill.SPRows(10, 3, 2)  # padded=12, local=4, real=2
+     vals = torch.arange(4 * 1024, dtype=torch.uint8).reshape(4, 1024)
+     scales = torch.arange(4 * 32, dtype=torch.uint8).reshape(4, 32)
+     weights = torch.arange(4 * 6, dtype=torch.float32).reshape(4, 6)
+     ids = torch.arange(4 * 6, dtype=torch.int32).reshape(4, 6)
++    calls = []
+ 
+-    roce_calls = []
+-    pynccl_calls = []
+-
+-    class _FakeRuntime:
+-        def __init__(self, topology: str):
+-            self.topology = topology
+-
+-        def all_gather(self, inp, dim=0, out=None):
+-            assert dim == 0 and out is not None
+-            roce_calls.append(("runtime_ag", tuple(inp.shape), inp.dtype))
+-            out.copy_(inp.repeat(3, *([1] * (inp.ndim - 1))))
+-            return out
+-
+-    class _FakeRoce:
++    class _Roce:
+         disabled = False
+-
+-        def __init__(self, max_bytes: int, topology: str | None = "ring4"):
+-            self.max_bytes = max_bytes
+-            self._runtime = _FakeRuntime(topology) if topology else None
++        _runtime = SimpleNamespace(topology="ring4")
+ 
+         def should_all_gather(self, inp, dim=0):
+-            assert dim == 0
+-            return inp.numel() * inp.element_size() <= self.max_bytes
++            return True
+ 
+-    class _FakePyNccl:
++        def all_gather(self, inp, dim=0):
++            raise AssertionError("gather_many took the one-shot all-gather")
++
++    class _PyNccl:
+         disabled = False
+ 
+         def group_start(self):
+-            pynccl_calls.append("group_start")
++            calls.append("group_start")
+ 
+         def all_gather(self, full, local):
+-            pynccl_calls.append(("pynccl_ag", tuple(full.shape), tuple(local.shape)))
++            calls.append(("all_gather", tuple(full.shape), tuple(local.shape)))
+             full.copy_(local.repeat(3, *([1] * (local.ndim - 1))))
+ 
+         def group_end(self):
+-            pynccl_calls.append("group_end")
+-
+-    def route(roce: _FakeRoce) -> None:
+-        roce_calls.clear()
+-        pynccl_calls.clear()
+-        monkeypatch.setattr(
+-            sp_prefill,
+-            "get_tp_group",
+-            lambda: SimpleNamespace(
+-                device_communicator=SimpleNamespace(
+-                    b12x_ar_comm=roce, pynccl_comm=_FakePyNccl()
+-                )
+-            ),
+-        )
++            calls.append("group_end")
+ 
+     monkeypatch.setattr(sp_prefill, "model_parallel_is_initialized", lambda: True)
+-    route(_FakeRoce(max_bytes=16384))
++    monkeypatch.setattr(
++        sp_prefill,
++        "get_tp_group",
++        lambda: SimpleNamespace(
++            device_communicator=SimpleNamespace(
++                b12x_ar_comm=_Roce(), pynccl_comm=_PyNccl()
++            )
++        ),
++    )
+     out_v, out_s, out_w, out_i = layout.gather_many(
+         vals, scales, weights, ids, padded_rows=(64, 64)
+     )
+-    # 1 direct call for vals (1024 B/row > 512) + 1 packed call for
+-    # (scales, weights, ids) (32 + 24 + 24 = 80 B/row)
+-    assert roce_calls == [
+-        ("runtime_ag", (4, 1024), torch.uint8),
+-        ("runtime_ag", (4, 80), torch.uint8),
++    assert calls == [
++        "group_start",
++        ("all_gather", (12, 1024), (4, 1024)),
++        ("all_gather", (12, 32), (4, 32)),
++        ("all_gather", (12, 6), (4, 6)),
++        ("all_gather", (12, 6), (4, 6)),
++        "group_end",
+     ]
+-    assert pynccl_calls == []
+-    assert out_v.shape == (64, 1024)
+-    assert out_s.shape == (64, 32)
+-    assert out_w.shape == (10, 6) and out_w.dtype == torch.float32
+-    assert out_i.shape == (10, 6) and out_i.dtype == torch.int32
++    assert out_v.shape == (64, 1024) and out_s.shape == (64, 32)
+     torch.testing.assert_close(out_v[:12], vals.repeat(3, 1), rtol=0, atol=0)
+     torch.testing.assert_close(out_s[:12], scales.repeat(3, 1), rtol=0, atol=0)
+     torch.testing.assert_close(out_w, weights.repeat(3, 1)[:10], rtol=0, atol=0)
+     torch.testing.assert_close(out_i, ids.repeat(3, 1)[:10], rtol=0, atol=0)
+ 
+-    # On direct, without a runtime, or when vals exceeds max_bytes: grouped PyNCCL.
+-    for roce in (
+-        _FakeRoce(max_bytes=16384, topology="direct"),
+-        _FakeRoce(max_bytes=16384, topology=None),
+-        _FakeRoce(max_bytes=1024),
+-    ):
+-        route(roce)
+-        got = layout.gather_many(vals, scales, weights, ids, padded_rows=(64, 64))
+-        assert roce_calls == []
+-        assert pynccl_calls[0] == "group_start" and pynccl_calls[-1] == "group_end"
+-        assert len(pynccl_calls) == 6
+-        for a, b in zip(got, (out_v[:12], out_s[:12], out_w, out_i)):
+-            torch.testing.assert_close(a[: b.shape[0]], b, rtol=0, atol=0)
+-
+ 
+ def test_project_exchange_rows_roce_and_pynccl_coexistence(monkeypatch):
+     """When ``b12x_ar_comm`` is present alongside ``pynccl_comm``:
+diff --git a/vllm/models/deepseek_v4_1/sp_prefill.py b/vllm/models/deepseek_v4_1/sp_prefill.py
+index 3cc6a37..4b6557d 100644
+--- a/vllm/models/deepseek_v4_1/sp_prefill.py
++++ b/vllm/models/deepseek_v4_1/sp_prefill.py
+@@ -222,9 +222,7 @@ class SPRows:
+         self, *tensors: torch.Tensor, padded_rows: tuple[int, ...] = ()
+     ) -> tuple[torch.Tensor, ...]:
+         """All-gather several L-row tensors into their first T rows (or ``padded_rows``
+-        when given for a tensor) via one-shot RoCE (packing small trailing tensors)
+-        on the topologies of ``ROCE_GATHER_TOPOLOGIES``, else in one grouped PyNCCL
+-        collective when available."""
++        when given for a tensor) in one grouped PyNCCL collective when available."""
+         inputs = []
+         for x in tensors:
+             x = materialize(x)
+@@ -233,71 +231,13 @@ class SPRows:
+                     f"SP gather expects {self.local_rows} rows, got {x.shape}"
+                 )
+             inputs.append(x)
+-        if not inputs:
+-            return ()
+         limits = padded_rows + (self.num_tokens,) * (len(inputs) - len(padded_rows))
+-        is_init = model_parallel_is_initialized()
+-        roce_comm = _tp_roce_comm() if is_init else None
+-        if (
+-            roce_comm is not None
+-            and _roce_gathers(roce_comm)
+-            and all(_roce_should_all_gather(roce_comm, x) for x in inputs)
+-        ):
+-            outs: list[torch.Tensor | None] = [None] * len(inputs)
+-            small_idxs = [
+-                i
+-                for i, x in enumerate(inputs)
+-                if self.local_rows > 0
+-                and 0 < (x.numel() // self.local_rows) * x.element_size() <= 512
+-            ]
+-            packed_views = None
+-            packed_in = None
+-            if len(small_idxs) >= 2:
+-                views = [
+-                    inputs[i].contiguous().view(self.local_rows, -1).view(torch.uint8)
+-                    for i in small_idxs
+-                ]
+-                candidate_in = torch.cat(views, dim=1)
+-                if _roce_should_all_gather(roce_comm, candidate_in):
+-                    packed_views = views
+-                    packed_in = candidate_in
+-            packed_set = set(small_idxs) if packed_in is not None else set()
+-            for i, (x, rows) in enumerate(zip(inputs, limits)):
+-                if i not in packed_set:
+-                    outs[i] = _roce_all_gather_one(
+-                        roce_comm, x, self.padded_rows, rows
+-                    )
+-            if packed_in is not None and packed_views is not None:
+-                packed_out = _roce_all_gather_one(
+-                    roce_comm, packed_in, self.padded_rows, self.padded_rows
+-                )
+-                offset = 0
+-                for i, view in zip(small_idxs, packed_views):
+-                    width = view.shape[1]
+-                    x = inputs[i]
+-                    rows = limits[i]
+-                    col = packed_out[:, offset : offset + width]
+-                    offset += width
+-                    if rows > self.padded_rows:
+-                        buf = torch.empty(
+-                            (rows, *x.shape[1:]), dtype=x.dtype, device=x.device
+-                        )
+-                        buf[: self.padded_rows].copy_(
+-                            col.contiguous()
+-                            .view(x.dtype)
+-                            .view(self.padded_rows, *x.shape[1:])
+-                        )
+-                        outs[i] = buf
+-                    else:
+-                        outs[i] = (
+-                            col[:rows]
+-                            .contiguous()
+-                            .view(x.dtype)
+-                            .view(rows, *x.shape[1:])
+-                        )
+-            return tuple(outs)  # type: ignore[return-value]
+-        comm = _tp_pynccl_comm() if is_init else None
+-        if comm is None:
++        comm = (
++            getattr(get_tp_group().device_communicator, "pynccl_comm", None)
++            if model_parallel_is_initialized()
++            else None
++        )
++        if comm is None or comm.disabled:
+             outs = []
+             for x, rows in zip(inputs, limits):
+                 gathered = tensor_model_parallel_all_gather(x, dim=0)
+@@ -732,42 +672,6 @@ def _tp_pynccl_comm():
+     return comm
+ 
+ 
+-# Sparknet topologies on which ``SPRows.gather_many`` takes the one-shot RoCE
+-# all-gather. On ``direct`` (every peer one hop away: the three-node triangle and
+-# the switched shapes) one grouped PyNCCL all-gather was faster at every size the
+-# one-shot cap admits, so gather_many keeps it there.
+-ROCE_GATHER_TOPOLOGIES = ("ring4",)
+-
+-
+-def _roce_gathers(roce_comm) -> bool:
+-    """Whether ``gather_many`` routes through ``roce_comm``'s one-shot all-gather."""
+-    runtime = getattr(roce_comm, "_runtime", None)
+-    return (
+-        runtime is not None
+-        and getattr(runtime, "topology", None) in ROCE_GATHER_TOPOLOGIES
+-    )
+-
+-
+-def _roce_should_all_gather(roce_comm, x: torch.Tensor) -> bool:
+-    should_ag = getattr(roce_comm, "should_all_gather", None)
+-    if should_ag is None:
+-        return False
+-    try:
+-        return bool(should_ag(x, 0))
+-    except TypeError:
+-        return bool(should_ag(x))
+-
+-
+-def _roce_all_gather_one(
+-    roce_comm, inp: torch.Tensor, padded_rows: int, rows: int
+-) -> torch.Tensor:
+-    inp = inp.contiguous()
+-    alloc_rows = max(padded_rows, rows)
+-    out = torch.empty((alloc_rows, *inp.shape[1:]), dtype=inp.dtype, device=inp.device)
+-    roce_comm._runtime.all_gather(inp, dim=0, out=out[:padded_rows])
+-    return out[:rows]
+-
+-
+ def _roce_should_exchange(
+     roce_comm, send: torch.Tensor, recv: torch.Tensor
+ ) -> bool:
