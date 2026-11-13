@@ -906,6 +906,22 @@ class TelemetryTest(unittest.TestCase):
             self.assertTrue(ran)
             self.assertTrue((Path(directory) / "results/y/out.jsonl.telemetry.json").exists())
 
+    def test_telemetry_pins_samplers_to_cluster0_efficiency_cores(self) -> None:
+        self.assertIn("os.sched_setaffinity", lab.THREAD_SAMPLER)
+        with tempfile.TemporaryDirectory() as directory:
+            process = mock.Mock()
+            process.communicate.return_value = (self.LINES, "")
+            with mock.patch.object(lab, "ROOT", Path(directory)), \
+                    mock.patch.object(lab, "GPU_CLOCKS_MARKER", Path(directory) / "none.json"), \
+                    mock.patch.object(lab, "nodes_config", return_value={"ssh_user": "u", "nodes": [{"name": "n1"}]}), \
+                    mock.patch.object(lab.spark, "ssh_options", return_value=[]), \
+                    mock.patch.object(lab.subprocess, "Popen", return_value=process) as popen:
+                with lab.Telemetry("results/x/out.jsonl"):
+                    pass
+            smi_cmd = popen.call_args_list[0].args[0][-1]
+            self.assertIn("taskset -c", smi_cmd)
+            self.assertIn("nvidia-smi", smi_cmd)
+
 
 class GpuClocksTest(unittest.TestCase):
     """A lock applies to every node or to none, and restoring production resets it."""

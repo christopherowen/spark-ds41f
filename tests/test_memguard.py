@@ -413,6 +413,86 @@ fi
         self.assertEqual(interval, str(cluster["host"]["memguard_interval_seconds"]))
         self.assertEqual((mode, warn), ("running", "0"))  # no warn line unless the host sets one
 
+    def test_start_wrapper_confines_guard_to_smallest_l3_efficiency_cores(self) -> None:
+        sysfs = self.root / "sysfs_gb10"
+        for cpu in range(20):
+            is_fast = (5 <= cpu <= 9) or (15 <= cpu <= 19)
+            cdir = sysfs / f"cpu{cpu}"
+            (cdir / "cpufreq").mkdir(parents=True)
+            (cdir / "cpufreq" / "cpuinfo_max_freq").write_text(
+                "3900000\n" if is_fast else "2808000\n", encoding="utf-8"
+            )
+            idx3 = cdir / "cache" / "index3"
+            idx3.mkdir(parents=True)
+            (idx3 / "size").write_text("8192K\n" if cpu < 10 else "16384K\n", encoding="utf-8")
+            (idx3 / "shared_cpu_list").write_text("0-9\n" if cpu < 10 else "10-19\n", encoding="utf-8")
+
+        cluster = spark.read_cluster("experiments/2026-10-14-r6m/r6m-release.json")
+        with mock.patch.dict(os.environ, {"MEMGUARD_SYSFS_CPU_ROOT": str(sysfs)}):
+            result = self._start(*spark.memguard_settings(cluster, "startup", "prelaunch"))
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("--property=AllowedCPUs=0,1,2,3,4", self.actions.read_text(encoding="utf-8"))
+
+    def test_steady_loop_caches_container_pid_and_reads_meminfo_without_docker_or_awk_per_sample(
+        self,
+    ) -> None:
+        proc_dir = self.root / "fake_proc"
+        (proc_dir / "4242").mkdir(parents=True)
+        meminfo = self.root / "fake_meminfo"
+        meminfo.write_text(
+            "MemTotal:       134217728 kB\nMemFree:         50000000 kB\nMemAvailable:    16777216 kB\n",
+            encoding="utf-8",
+        )
+        # Override docker and awk so they record every invocation and fail if awk is called.
+        self._write_command(
+            "docker",
+            """#!/usr/bin/env bash
+set -eu
+case "$1" in
+  inspect)
+    printf 'inspect\\n' >>"$FAKE_ACTIONS"
+    state=$(cat "$FAKE_STATE")
+    if [[ "$state" == true ]]; then
+      printf 'true 4242\\n'
+    else
+      printf 'false 0\\n'
+    fi
+    ;;
+  *) exit 2 ;;
+esac
+""",
+        )
+        self._write_command(
+            "awk",
+            """#!/usr/bin/env bash
+printf 'awk_called\\n' >>"$FAKE_ACTIONS"
+exit 1
+""",
+        )
+        self._write_command(
+            "sleep",
+            f"""#!/usr/bin/env bash
+set -eu
+counter="$FAKE_STATE.sleeps"
+pauses=$(cat "$counter" 2>/dev/null || printf '0')
+pauses=$((pauses + 1))
+printf '%s\\n' "$pauses" >"$counter"
+if ((pauses >= 4)); then
+  rmdir "{proc_dir / '4242'}" 2>/dev/null || true
+  printf 'false\\n' >"$FAKE_STATE"
+fi
+""",
+        )
+        with mock.patch.dict(
+            os.environ,
+            {"MEMGUARD_PROC_ROOT": str(proc_dir), "MEMGUARD_MEMINFO_PATH": str(meminfo)},
+        ):
+            result = self._run(state="true", available_gib=16, wait_seconds=0, phase="steady")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        actions = self.actions.read_text(encoding="utf-8").splitlines()
+        # 1 initial inspect to discover PID 4242 + 1 final inspect after /proc/4242 vanished across 4 samples (not 5); zero awk calls!
+        self.assertEqual(actions, ["inspect", "inspect"])
+
 
 if __name__ == "__main__":
     unittest.main()

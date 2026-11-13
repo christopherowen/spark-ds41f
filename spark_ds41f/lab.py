@@ -705,6 +705,7 @@ def cpu_list(text):
             cpus += range(int(low), int(high or low) + 1)
     return cpus
 clusters = []
+cluster_kib = []
 for cpu in sorted(caps):
     try:
         group = cpu_list(open(f"/sys/devices/system/cpu/cpu{cpu}/cache/index3/shared_cpu_list").read())
@@ -712,6 +713,28 @@ for cpu in sorted(caps):
         continue
     if group not in clusters:
         clusters.append(group)
+        try:
+            raw = open(f"/sys/devices/system/cpu/cpu{cpu}/cache/index3/size").read().strip().upper()
+            kib = int(raw[:-1]) * (1024 if raw.endswith("M") else 1) if raw[-1:] in ("K", "M") else int(raw)
+        except Exception:
+            kib = 1 << 30
+        cluster_kib.append(kib)
+if caps and min(caps.values()) < max(caps.values()) and hasattr(os, "sched_setaffinity"):
+    eff = {c for c, v in caps.items() if v <= middle}
+    target_eff = None
+    if clusters:
+        for _, grp in sorted(zip(cluster_kib, clusters), key=lambda x: (x[0], x[1][0])):
+            cand = [c for c in grp if c in eff]
+            if cand:
+                target_eff = cand
+                break
+    if not target_eff and eff:
+        target_eff = sorted(eff)
+    if target_eff:
+        try:
+            os.sched_setaffinity(0, set(target_eff))
+        except OSError:
+            pass
 tick = os.sysconf("SC_CLK_TCK")
 end = time.time() + float(sys.argv[2])
 try:
@@ -817,8 +840,24 @@ class Telemetry:
         try:
             nodes = nodes_config()
             container = container_name(self.config)
-            command = shlex.join(["timeout", "21600", "nvidia-smi", "--query-gpu=timestamp," + ",".join(TELEMETRY_FIELDS),
-                                  "--format=csv,noheader,nounits", "-lms", "1000"])
+            smi = shlex.join(["timeout", "21600", "nvidia-smi", "--query-gpu=timestamp," + ",".join(TELEMETRY_FIELDS),
+                              "--format=csv,noheader,nounits", "-lms", "1000"])
+            # Confine nvidia-smi polling to Cluster 0 efficiency cores (0-4 on GB10) when
+            # heterogeneous efficiency cores exist, keeping Cluster 1's 16 MiB L3 clean.
+            pin_prefix = (
+                "cpus=$(python3 -c 'import os; r=\"/sys/devices/system/cpu\"; "
+                "cs=[int(n[3:]) for n in os.listdir(r) if n[3:].isdigit()] if os.path.isdir(r) else []; "
+                "caps={c:int(open(f\"{r}/cpu{c}/cpu_capacity\").read()) for c in cs if os.path.exists(f\"{r}/cpu{c}/cpu_capacity\")}; "
+                "mid=(min(caps.values())+max(caps.values()))//2 if caps and min(caps.values())<max(caps.values()) else -1; "
+                "eff=sorted(c for c,v in caps.items() if v<=mid); "
+                "g0=open(f\"{r}/cpu{eff[0]}/cache/index3/shared_cpu_list\").read().strip() if eff and os.path.exists(f\"{r}/cpu{eff[0]}/cache/index3/shared_cpu_list\") else \"\"; "
+                "lo,_,hi=g0.partition(\"-\"); gset=set(range(int(lo),int(hi or lo)+1)) if lo.isdigit() else set(eff); "
+                "sel=[c for c in eff if c in gset] or eff; "
+                "print(\",\".join(map(str,sel)))' 2>/dev/null || true); "
+                "if [ -n \"$cpus\" ] && command -v taskset >/dev/null 2>&1; then exec taskset -c \"$cpus\" "
+                f"{smi}; else exec {smi}; fi"
+            )
+            command = pin_prefix
             for node in nodes["nodes"]:
                 self.processes[node["name"]] = subprocess.Popen(
                     ["ssh", *spark.ssh_options(), spark.ssh_target(nodes, node), command],

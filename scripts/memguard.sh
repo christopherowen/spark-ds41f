@@ -40,6 +40,25 @@ ready=false
 warned=false
 previous_kib=
 previous_at=
+cached_pid=
+proc_root=${MEMGUARD_PROC_ROOT:-/proc}
+meminfo_path=${MEMGUARD_MEMINFO_PATH:-/proc/meminfo}
+
+# Read MemAvailable directly via bash builtins when a real meminfo file is present so
+# steady-state samples fork no awk subprocess; fall back to awk when unreadable/absent
+# (including host-independent unit tests on macOS).
+read_available_kib() {
+  local key val _
+  if [[ -r "$meminfo_path" ]]; then
+    while read -r key val _; do
+      if [[ "$key" == "MemAvailable:" && "$val" =~ ^[0-9]+$ ]]; then
+        printf '%s\n' "$val"
+        return 0
+      fi
+    done <"$meminfo_path"
+  fi
+  awk '$1 == "MemAvailable:" { print $2 }' "$meminfo_path" 2>/dev/null || true
+}
 
 # After a kill, what `docker rm -f` would otherwise destroy: the breach's meminfo, the
 # largest host processes, the container's state and its log. Never delays the kill.
@@ -66,9 +85,19 @@ save_evidence() {
 
 while true; do
   inspectable=true
-  if ! running=$(docker inspect --format '{{.State.Running}}' "$CONTAINER_NAME" 2>/dev/null); then
-    inspectable=false
-    running=
+  running=
+  if [[ -n "$cached_pid" && -d "$proc_root/$cached_pid" ]]; then
+    running=true
+  else
+    cached_pid=
+    if ! inspect_out=$(docker inspect --format '{{.State.Running}} {{.State.Pid}}' "$CONTAINER_NAME" 2>/dev/null); then
+      inspectable=false
+    else
+      read -r running maybe_pid <<<"$inspect_out"
+      if [[ "$running" == "true" && "${maybe_pid:-}" =~ ^[1-9][0-9]*$ && -d "$proc_root/$maybe_pid" ]]; then
+        cached_pid=$maybe_pid
+      fi
+    fi
   fi
   if [[ "$inspectable" == "false" && "$observed_running" == "true" ]]; then
     logger -t spark-memguard \
@@ -86,7 +115,7 @@ while true; do
     exit 1
   fi
 
-  available_kib=$(awk '$1 == "MemAvailable:" { print $2 }' /proc/meminfo)
+  available_kib=$(read_available_kib)
   if [[ -z "$available_kib" ]]; then
     logger -t spark-memguard \
       "cannot read MemAvailable during $MEMGUARD_PHASE; failing closed"
