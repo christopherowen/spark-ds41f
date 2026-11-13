@@ -1,0 +1,277 @@
+From 53e5fc708db6b9d7bcb62054da67667f825e1617 Mon Sep 17 00:00:00 2001
+From: Christopher Owen <3221756+christopherowen@users.noreply.github.com>
+Date: Fri, 13 Nov 2026 08:54:29 +0100
+Subject: [PATCH] perf(dsv41): size the WO and COMP L2 prefetch windows by row
+ band
+
+Upstream base: local-inference-lab/vllm 19f2c20ed4d64ae22bd009ceacadd85e2a81e354
+with candidate-55's series applied through 0805.
+
+Rationale:
+The WO window (this layer's WO-A and WO-B weights; COMP in an owner layer takes
+the same budget) fills while the sparse-MLA preparation kernels run. What the
+fill costs those kernels grows with the rows; what it saves the projections
+does not. One budget for every row count is therefore wrong somewhere: at TP4
+on four GB10s with 15/12/12 MB, candidate-55 is 1.5-1.9% slower than
+candidate-54 at the four 24-row grid shapes and 1.3% at 16x32, and not slower
+with the prefetch off. With WO at 10 MB those shapes are 2.4-2.7% and 1.5%
+faster, 1x2 rows 1.9% slower and 48-72 rows 0.5-1.6% slower
+(spark-ds41f experiments/2026-10-26-spark-ds41f-candidate/candidate-55/
+rows24-attribution). 24 and 32 rows are the 32-row decode tile tier.
+
+VLLM_DS41_L2_PREFETCH_WO_BANDS names budgets by row count
+("17-32=10": megabytes for forwards of 17 to 32 rows). build_l2_prefetch makes
+one plan per band beside the default, and issue() launches the plan the
+forward's row count selects. Under capture that choice is made once per graph,
+so each captured row count replays its own plan; nothing is decided at replay.
+Unset, make_wo_plan returns make_plan's plan itself and nothing changes. A
+malformed value stops the worker at import.
+
+Quality implications:
+None. The windows are cache hints (createpolicy and bulk L2 prefetch only);
+no kernel, launch order or arithmetic changes.
+
+Tests:
+- tests/models/test_deepseek_v4_1_l2_schedule.py: the parser, the plan without
+  bands, the plan a row count selects, and issue() launching it (17 passed in
+  the candidate-55 image on a GB10, pytest --noconftest).
+- Mounted over candidate-55's fourth build with "17-32=10" at tp4-ring and
+  tp4-switched, two boots each: the four 24-row grid shapes 2.70% and 2.23%
+  faster, 16x32 1.70% and 2.10%, no other shape or the drafter moved, the grid
+  0.45% and 0.52% faster, and the temperature-0 gate identical with
+  candidate-54's hashes (spark-ds41f
+  experiments/2026-11-13-l2-prefetch-row-bands).
+
+Upstream status: local spark-ds41f patch, carried from candidate-55's fifth
+build; not submitted upstream. Inert unless VLLM_DS41_L2_PREFETCH_WO_BANDS is
+set.
+---
+ .../models/test_deepseek_v4_1_l2_schedule.py  | 68 ++++++++++++++
+ vllm/models/deepseek_v4_1/l2_prefetch.py      | 88 ++++++++++++++++++-
+ vllm/models/deepseek_v4_1/nvidia/model.py     |  4 +-
+ 3 files changed, 157 insertions(+), 3 deletions(-)
+
+diff --git a/tests/models/test_deepseek_v4_1_l2_schedule.py b/tests/models/test_deepseek_v4_1_l2_schedule.py
+index b11d3cf8f..5bf93f9ec 100644
+--- a/tests/models/test_deepseek_v4_1_l2_schedule.py
++++ b/tests/models/test_deepseek_v4_1_l2_schedule.py
+@@ -246,3 +246,71 @@ def test_decode_shared_experts_launch_after_router_gate():
+     x48 = torch.zeros(48, 16)
+     MoERunner._apply_quant_method(runner, x48, x48, x48)
+     assert events == ["shared_async", "gate", "topk", "routed", "shared_wait"]
++
++
++def test_row_bands_parse_in_row_order():
++    assert l2_prefetch.parse_row_bands(None) == ()
++    assert l2_prefetch.parse_row_bands(" ") == ()
++    assert l2_prefetch.parse_row_bands("65-96=12.5, 17-32=10,48=0") == (
++        (17, 32, 10_000_000),
++        (48, 48, 0),
++        (65, 96, 12_500_000),
++    )
++
++
++@pytest.mark.parametrize(
++    "raw", ["17-32", "17-32=ten", "32-17=10", "0-8=10", "17-32=-1", "17-32=10,32-48=12"]
++)
++def test_row_bands_reject_malformed_and_overlapping(raw):
++    with pytest.raises(ValueError):
++        l2_prefetch.parse_row_bands(raw)
++
++
++def test_wo_plan_without_bands_is_the_plain_plan(segments, monkeypatch):
++    monkeypatch.setattr(l2_prefetch, "WO_BANDS", ())
++    assert l2_prefetch.make_wo_plan(["wo_a", "wo_b"], None) == ("wo_a", "wo_b")
++    assert l2_prefetch.make_wo_plan([], None) is None
++
++
++def test_wo_and_comp_windows_take_the_band_of_the_rows(monkeypatch):
++    budgets = []
++
++    def make_plan(segs, budget, device):
++        budgets.append(budget)
++        return (tuple(segs), budget)
++
++    monkeypatch.setattr(l2_prefetch, "make_plan", make_plan)
++    monkeypatch.setattr(l2_prefetch, "BUDGET_WO", 15_000_000)
++    monkeypatch.setattr(l2_prefetch, "WO_BANDS", ((17, 32, 10_000_000),))
++    plans = l2_prefetch.make_wo_plan(["wo_a", "wo_b"], None)
++    assert isinstance(plans, l2_prefetch.RowBandPlans)
++    assert budgets == [15_000_000, 10_000_000]
++    for rows, budget in ((1, 15_000_000), (16, 15_000_000), (17, 10_000_000),
++                         (24, 10_000_000), (32, 10_000_000), (33, 15_000_000),
++                         (96, 15_000_000)):
++        assert plans.select(rows) == (("wo_a", "wo_b"), budget), rows
++
++
++def test_issue_launches_the_selected_band(monkeypatch):
++    launched = []
++    prefetcher = SimpleNamespace(issue=lambda plan, rows: launched.append((plan, rows)))
++    monkeypatch.setattr(l2_prefetch, "ENABLED", True)
++    monkeypatch.setattr(
++        l2_prefetch._l2pf.L2Prefetcher,
++        "get",
++        classmethod(lambda cls, device: prefetcher),
++    )
++    wide = SimpleNamespace(segs=SimpleNamespace(device="cuda"), name="default")
++    narrow = SimpleNamespace(segs=SimpleNamespace(device="cuda"), name="band")
++    plans = l2_prefetch.RowBandPlans(wide, [(17, 32, narrow)])
++    for rows in (2, 24, 48):
++        l2_prefetch.issue(plans, rows)
++    assert [(plan.name, rows) for plan, rows in launched] == [
++        ("default", 2),
++        ("band", 24),
++        ("default", 48),
++    ]
++    # A band whose budget holds nothing prefetches nothing at its rows.
++    launched.clear()
++    l2_prefetch.issue(l2_prefetch.RowBandPlans(wide, [(17, 32, None)]), 24)
++    assert launched == []
+diff --git a/vllm/models/deepseek_v4_1/l2_prefetch.py b/vllm/models/deepseek_v4_1/l2_prefetch.py
+index cc9722de5..ffd4d6dce 100644
+--- a/vllm/models/deepseek_v4_1/l2_prefetch.py
++++ b/vllm/models/deepseek_v4_1/l2_prefetch.py
+@@ -41,9 +41,19 @@ points made them 1.6% faster at one stream, 0.7% at eight and 0.3% at sixteen,
+ spin kernels standing in for the attention core and all-reduces
+ (experiments/2026-10-26-l2-prefetch-schedule in spark-ds41f).
+ 
++A window can take a different budget in a band of row counts. WO (and COMP, which
++takes WO's budget) fills while the sparse-MLA preparation kernels run, and what the
++fill costs them grows with the rows while what it saves the projections does not: at
++TP4 on four GB10s, 24 and 32 rows (the 32-row decode tile tier) were 2.4-2.7% and
++1.5% faster with 10 MB than with 15 MB, and 1x2 rows 1.9% slower
++(experiments/2026-11-13-l2-prefetch-row-bands in spark-ds41f). The forward issues the
++plan its row count selects, so a captured graph holds its own row count's plan.
++
+ Environment:
+   VLLM_DS41_L2_PREFETCH=0/1           default on for SM121 (GB10)
+   VLLM_DS41_L2_PREFETCH_{WO,FFN,NEXT}_MB   per-window fill budgets
++  VLLM_DS41_L2_PREFETCH_WO_BANDS      WO and COMP budgets by row count, as
++                                      first-last=megabytes[,...]: "17-32=10"
+ """
+ 
+ from __future__ import annotations
+@@ -75,6 +85,63 @@ BUDGET_FFN = _l2pf._mb("VLLM_DS41_L2_PREFETCH_FFN_MB", "16")
+ BUDGET_NEXT = _l2pf._mb("VLLM_DS41_L2_PREFETCH_NEXT_MB", "20")
+ 
+ 
++def parse_row_bands(raw: str | None) -> tuple[tuple[int, int, int], ...]:
++    """``"17-32=10,65-96=12.5"`` as ``(first row count, last, budget in bytes)``
++    bands, in row order. A band may name one row count (``"24=10"``); megabytes are
++    decimal, as the window budgets are. Bands may not overlap."""
++    bands = []
++    for item in (raw or "").split(","):
++        item = item.strip()
++        if not item:
++            continue
++        try:
++            rows, megabytes = item.split("=")
++            first, _, last = rows.partition("-")
++            band = (int(first), int(last or first), int(float(megabytes) * 1e6))
++        except ValueError:
++            raise ValueError(
++                f"L2 prefetch row band {item!r}: expected first-last=megabytes"
++            ) from None
++        if not 1 <= band[0] <= band[1] or band[2] < 0:
++            raise ValueError(
++                f"L2 prefetch row band {item!r}: rows or budget out of range"
++            )
++        bands.append(band)
++    bands.sort()
++    for (_, last, _), (first, _, _) in zip(bands, bands[1:]):
++        if first <= last:
++            raise ValueError(f"L2 prefetch row bands overlap at {first} rows: {raw!r}")
++    return tuple(bands)
++
++
++# A malformed value stops the worker at import: a band that silently did not apply
++# would look like a budget that does nothing.
++WO_BANDS = parse_row_bands(os.getenv("VLLM_DS41_L2_PREFETCH_WO_BANDS"))
++
++
++class RowBandPlans:
++    """One window's plans by the forward's row count: ``default`` outside every band."""
++
++    __slots__ = ("default", "bands")
++
++    def __init__(self, default, bands):
++        self.default = default
++        self.bands = tuple(bands)
++
++    def select(self, rows: int):
++        for first, last, plan in self.bands:
++            if first <= rows <= last:
++                return plan
++        return self.default
++
++    def describe(self) -> str:
++        text = self.default.describe() if self.default is not None else "-"
++        for first, last, plan in self.bands:
++            size = f"{plan.total_bytes / 1e6:.1f} MB" if plan is not None else "-"
++            text += f" [{first}-{last} rows: {size}]"
++        return text
++
++
+ def linear_segments(name: str, linear: torch.nn.Module | None) -> list[Segment]:
+     """Bytes read by a V4.1 linear at decode: its weight (or TP decode shard), and
+     its scale words."""
+@@ -119,6 +186,22 @@ def make_plan(segments: list[Segment], budget: int, device: torch.device):
+     return plan
+ 
+ 
++def make_wo_plan(segments: list[Segment], device: torch.device):
++    """The WO or COMP window's plan: ``BUDGET_WO``, and each row band's budget where
++    ``VLLM_DS41_L2_PREFETCH_WO_BANDS`` names one. Without bands this is ``make_plan``'s
++    plan itself."""
++    default = make_plan(segments, BUDGET_WO, device)
++    if not WO_BANDS:
++        return default
++    return RowBandPlans(
++        default,
++        [
++            (first, last, make_plan(segments, budget, device))
++            for first, last, budget in WO_BANDS
++        ],
++    )
++
++
+ def warmup() -> bool:
+     return ENABLED and _l2pf._get_launcher() is not None
+ 
+@@ -136,7 +219,10 @@ def kernel_calls() -> list:
+     ]
+ 
+ 
+-def issue(plan: _l2pf.L2PrefetchPlan | None, num_tokens: int) -> None:
++def issue(plan: _l2pf.L2PrefetchPlan | RowBandPlans | None, num_tokens: int) -> None:
++    if isinstance(plan, RowBandPlans):
++        # Chosen as the window is issued: under capture, once for the graph's rows.
++        plan = plan.select(num_tokens)
+     if ENABLED and plan is not None and plan.segs is not None:
+         _l2pf.L2Prefetcher.get(plan.segs.device).issue(plan, num_tokens)
+ 
+diff --git a/vllm/models/deepseek_v4_1/nvidia/model.py b/vllm/models/deepseek_v4_1/nvidia/model.py
+index 86c47b404..ed27cac41 100644
+--- a/vllm/models/deepseek_v4_1/nvidia/model.py
++++ b/vllm/models/deepseek_v4_1/nvidia/model.py
+@@ -252,7 +252,7 @@ class DeepseekV4DecoderLayer(nn.Module):
+         attn, device = self.attn, self.hc_attn_fn.device
+         # The WO projection names the bytes it reads.
+         wo = attn._wo_projection_weights.l2_segments()
+-        attn._l2pf_wo = l2_prefetch.make_plan(wo, l2_prefetch.BUDGET_WO, device)
++        attn._l2pf_wo = l2_prefetch.make_wo_plan(wo, device)
+         ffn = l2_prefetch.param_segments(
+             "mhc", self, ("hc_ffn_fn", "hc_ffn_scale", "hc_ffn_base")
+         )
+@@ -268,7 +268,7 @@ class DeepseekV4DecoderLayer(nn.Module):
+             comp = l2_prefetch.linear_segments(
+                 "compressor", attn.compressor.fused_wkv_wgate
+             )
+-            attn._l2pf_comp = l2_prefetch.make_plan(comp, l2_prefetch.BUDGET_WO, device)
++            attn._l2pf_comp = l2_prefetch.make_wo_plan(comp, device)
+         plan_next = None
+         if nxt is not None:
+             segments = l2_prefetch.param_segments(
+-- 
+2.43.0
+
