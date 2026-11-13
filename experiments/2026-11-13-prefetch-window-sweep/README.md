@@ -222,12 +222,20 @@ live container inspected.
   The recipe is `17-32=10`, as at `tp4-ring`. That exact recipe on the own kernels has no gate of its own at
   `tp4-switched`; the fifth build's gate is it.
 
-### `tp3-switched`: `17-32=12`, confirmation running
+### Confirmation at `tp3-switched`: `17-32=12` is not confirmed
 
-Queued 16:15Z (`confirm-grid-tp3-switched`, `confirm-gate-tp3-switched`). Results to follow here.
+Job `confirm-grid-tp3-switched` (16:15Z to 16:23Z), two boots, against the sweep's two reference boots.
 
-## Conclusion so far
+1. **Grid: not met.** 20.624 and 20.663 ms against 20.651 and 20.662: 0.06% faster, inside the 0.30% margin.
+2. The four 24-row shapes are 0.08%, 0.48%, 0.65% and 1.15% faster, where the two reference boots differ by 0.26% to
+   0.54% on the same shapes; the sweep's one boot had the band 1.18% faster.
 
+`tp3-switched` keeps its recipe with no band. The gate job that was queued with it ran on a recipe that is not
+adopted; its result is in the receipts and changes nothing.
+
+## Conclusion
+
+- `tp3-switched`: no change. Its windows hold and its one-boot band did not survive two boots.
 - The TP4 recipe is unchanged by the sweep: WO 15, FFN 12, NEXT 12 MB and `VLLM_DS41_L2_PREFETCH_WO_BANDS=17-32=10`,
   now measured on the kernels the build compiles. The windows have no more to give at TP4.
 - A one-boot pick under about 0.5% does not survive two boots (`65-96=12`); the 2% ones do.
