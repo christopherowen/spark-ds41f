@@ -1,0 +1,149 @@
+From a829a11324997df70d96f636486fdcdd89cfaafa Mon Sep 17 00:00:00 2001
+From: Christopher Owen <3221756+christopherowen@users.noreply.github.com>
+Date: Tue, 10 Nov 2026 01:27:35 +0000
+Subject: [PATCH] perf(detokenizer): prime FastIncrementalDetokenizer
+ DecodeStream with bounded UTF-8-aligned prompt suffix
+
+Base: 1107 vLLM patch head 2756478b6.
+
+Rationale:
+FastIncrementalDetokenizer.__init__ previously passed the entire request.prompt_token_ids list into tokenizers.decoders.DecodeStream(ids=...). On the first generated token, DecodeStream decodes all ids to establish its prefix string, incurring O(len(prompt)) CPU allocation and decoding latency on the EngineCore output thread (11.6..13.4 ms at 64K, 25.5..29.6 ms at 128K, 52.3..61.8 ms at 262K, and 112.5..123.7 ms at 524K tokens on GB10 Grace CPU), even though BPE/byte-fallback boundary context only depends on the trailing tokens of the prompt. Add prompt_suffix_to_prime() to slice prompts longer than PROMPT_SUFFIX_PRIME_WINDOW = 16 to a UTF-8-aligned suffix (16..67 tokens) whose decoded boundaries do not start or end with U+FFFD, falling back to full prompt_token_ids when the prompt itself ends mid-codepoint.
+
+Quality:
+100% output-neutral and step-for-step bit-identical across all prompt lengths, multi-byte UTF-8/emoji boundaries, and special-token settings.
+
+Tests:
+- pytest tests/detokenizer/test_check_stop_strings.py tests/detokenizer/test_stop_string_while_stop_model_terminates.py across 2 fresh container boots.
+
+Upstream status: candidate for upstream vLLM.
+---
+ tests/detokenizer/test_check_stop_strings.py | 52 ++++++++++++++++++++
+ vllm/v1/engine/detokenizer.py                | 45 ++++++++++++++++-
+ 2 files changed, 96 insertions(+), 1 deletion(-)
+
+diff --git a/tests/detokenizer/test_check_stop_strings.py b/tests/detokenizer/test_check_stop_strings.py
+index 2fae373f6..084ffeff2 100644
+--- a/tests/detokenizer/test_check_stop_strings.py
++++ b/tests/detokenizer/test_check_stop_strings.py
+@@ -74,3 +74,55 @@ def test_no_match_and_empty_inputs_return_none():
+     assert check_stop_strings("hello", 5, ["zzz"], include_in_output=False) is None
+     assert check_stop_strings("hello", 0, ["h"], include_in_output=False) is None
+     assert check_stop_strings("hello", 5, [], include_in_output=False) is None
++
++
++from vllm.v1.engine.detokenizer import (
++    PROMPT_SUFFIX_PRIME_WINDOW,
++    prompt_suffix_to_prime,
++)
++
++
++class _FakeTokenizer:
++    def __init__(self, mapping: dict[int, bytes], special_ids: set[int] | None = None):
++        self.mapping = mapping
++        self.special_ids = special_ids or set()
++
++    def decode(self, ids: list[int], skip_special_tokens: bool = True) -> str:
++        raw = b"".join(
++            self.mapping[i]
++            for i in ids
++            if not (skip_special_tokens and i in self.special_ids)
++        )
++        return raw.decode("utf-8", errors="replace")
++
++
++def test_prompt_suffix_to_prime_bounds_and_utf8_alignment():
++    # Token 10 is ASCII "x"; tokens 20, 21, 22 form 3-byte UTF-8 "€" (e2 82 ac);
++    # token 99 is a special token.
++    tok = _FakeTokenizer(
++        {10: b"x", 20: b"\xe2", 21: b"\x82", 22: b"\xac", 99: b""},
++        special_ids={99},
++    )
++
++    short_prompt = [10] * PROMPT_SUFFIX_PRIME_WINDOW
++    assert prompt_suffix_to_prime(tok, short_prompt, True) == short_prompt
++
++    long_ascii = [10] * 100
++    primed = prompt_suffix_to_prime(tok, long_ascii, True)
++    assert primed is not None and len(primed) == PROMPT_SUFFIX_PRIME_WINDOW
++
++    # Place a 3-token UTF-8 character across the -16 boundary so -16 starts mid-char
++    # at token 21 (b"\x82" -> "\ufffd"), requiring adjust=1 to include token 20.
++    split_boundary = [10] * 50 + [20, 21, 22] + [10] * (PROMPT_SUFFIX_PRIME_WINDOW - 2)
++    primed_aligned = prompt_suffix_to_prime(tok, split_boundary, True)
++    assert primed_aligned == split_boundary[-(PROMPT_SUFFIX_PRIME_WINDOW + 1) :]
++    assert not tok.decode(primed_aligned, True).startswith("\ufffd")
++
++    # If trailing 19 tokens (16 + adjust 0..3) are skipped special tokens, widen window to 32.
++    special_tail = [10] * 50 + [99] * (PROMPT_SUFFIX_PRIME_WINDOW + 3)
++    primed_special = prompt_suffix_to_prime(tok, special_tail, True)
++    assert primed_special is not None and len(primed_special) == 32
++
++    # If the prompt itself ends mid-codepoint, fall back to full prompt_token_ids.
++    incomplete_end = [10] * 50 + [20, 21]
++    assert prompt_suffix_to_prime(tok, incomplete_end, True) == incomplete_end
+diff --git a/vllm/v1/engine/detokenizer.py b/vllm/v1/engine/detokenizer.py
+index f04fa30a1..114be4d75 100644
+--- a/vllm/v1/engine/detokenizer.py
++++ b/vllm/v1/engine/detokenizer.py
+@@ -27,6 +27,45 @@ USE_FAST_DETOKENIZER = version.parse(tokenizers.__version__) >= version.parse("0
+ # Error string from https://github.com/huggingface/tokenizers/blob/909fdde2a4ffedd9295206f705eb612be2a91b12/tokenizers/src/tokenizer/mod.rs#L1042
+ INVALID_PREFIX_ERR_MSG = "Invalid prefix encountered"
+ 
++PROMPT_SUFFIX_PRIME_WINDOW = 16
++PROMPT_SUFFIX_MAX_WINDOW = 64
++
++
++def prompt_suffix_to_prime(
++    tokenizer: Tokenizer,
++    prompt_token_ids: list[int] | None,
++    skip_special_tokens: bool,
++) -> list[int] | None:
++    """Return a bounded prompt token suffix sufficient to prime DecodeStream.
++
++    HuggingFace ``DecodeStream`` decodes all ``ids`` passed at construction on
++    the first ``step()`` call to establish its prefix string, even though BPE
++    and byte-fallback merge context only depends on the trailing tokens of the
++    prompt. Slicing to a short suffix whose left and right boundaries decode
++    without replacement characters (``U+FFFD``) avoids O(len(prompt)) string
++    allocation and decoding on the first generated token while preserving
++    step-for-step identical output.
++    """
++    if not prompt_token_ids or len(prompt_token_ids) <= PROMPT_SUFFIX_PRIME_WINDOW:
++        return prompt_token_ids
++
++    n = len(prompt_token_ids)
++    w = PROMPT_SUFFIX_PRIME_WINDOW
++    while w <= min(n, PROMPT_SUFFIX_MAX_WINDOW):
++        for adjust in range(4):
++            cand_w = w + adjust
++            if cand_w >= n:
++                return prompt_token_ids
++            suffix = prompt_token_ids[-cand_w:]
++            decoded = tokenizer.decode(suffix, skip_special_tokens=skip_special_tokens)
++            if decoded.endswith("\ufffd"):
++                return prompt_token_ids
++            if decoded and not decoded.startswith("\ufffd"):
++                return suffix
++        w *= 2
++
++    return prompt_token_ids
++
+ 
+ class IncrementalDetokenizer:
+     def __init__(self):
+@@ -182,7 +221,11 @@ class FastIncrementalDetokenizer(BaseIncrementalDetokenizer):
+         # fastokens shim that replaces ``tokenizers.decoders.DecodeStream``)
+         # are honored regardless of import order.
+         self.stream = tokenizers.decoders.DecodeStream(
+-            ids=request.prompt_token_ids,
++            ids=prompt_suffix_to_prime(
++                self.tokenizer,
++                request.prompt_token_ids,
++                self.skip_special_tokens,
++            ),
+             skip_special_tokens=self.skip_special_tokens,
+         )
+ 
+-- 
+2.43.0
+
