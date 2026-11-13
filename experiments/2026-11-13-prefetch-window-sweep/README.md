@@ -63,6 +63,10 @@ same kernel cache, two boots at each testbed, against the two `own-ref` boots of
 
 If mark 1 or 2 fails, the recipe falls back to the bands that individually held, and that is recorded.
 
+Added 2026-11-13 12:52Z, before `tp4-switched`'s confirmation ran: its sweep picks `65-96=12` on one boot's 0.38%,
+because its two reference boots happen to agree to 0.13% there. That band is kept only if its shapes (12x72, 16x96) are
+faster than both reference boots on both confirmation boots; otherwise the recipe is `17-32=10` alone, as at `tp4-ring`.
+
 ## Commands
 
 ```bash
