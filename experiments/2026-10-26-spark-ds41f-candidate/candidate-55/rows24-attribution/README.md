@@ -10,6 +10,15 @@ with the 15/12/12 MB windows it is 1.5% to 1.9% slower. With the WO window at 10
 by row band is the fix; at one size for every row count, 10 MB costs 1.9% at 1x2 and the grid comes out the same, so
 the recipe is unchanged.
 
+**Corrected 2026-11-13: the three overlay arms mounted nothing.** `candidate-55-no1134-loader`,
+`candidate-55-no989-no982` and `candidate-55-no982` named their files under `container.extra_mounts`, which no command
+reads, so they booted the image unchanged. #1134's loader, #989 and #982 are therefore **not** ruled out by the
+overlays job below; its three arms are six more boots of `candidate-55`. The profiles are fixed and the arms run again as
+[attribute-rows24-overlays-r2-tp4.json](attribute-rows24-overlays-r2-tp4.json). The arms that are environment
+settings or another build stand: the core partition, #974's control image, the defragmentation, the prefetch off, the
+three windows and candidate-54's. So does the conclusion, which rests on those. The single-GPU loader arm on sp8 was
+mounted with `docker -v` and stands.
+
 ## What is being explained
 
 With the recipe, candidate-55's screen at `tp4-ring` has the grid 1.55% faster than candidate-54's recorded screen,

@@ -4,6 +4,23 @@ candidate-55's screens are slower than candidate-54 on the engine grid at both T
 `tp4-ring`, 1.11% at `tp4-switched`; fourth build 1.01% at `tp4-switched`) and faster at `tp3-switched`. This folder
 finds which change causes it and what removes it.
 
+**Corrected 2026-11-13: the overlay arms mounted nothing.** Their profiles named their files under
+`container.extra_mounts`, a key no command reads (the key is `container.mounts`), so `pdlpostwait`, `no982`,
+`streamprio`, `all3` and the confirmation run's `pdlpostwait` and `l2cap-pdlpostwait` booted the image unchanged.
+The profiles are fixed now, and `bin/spark doctor` refuses the key; every run recorded below predates the fix.
+
+- **What `pdlpostwait` and `no982` measured** is their other setting: `TILELANG_CACHE_DIR` on a new, empty directory,
+  so the image compiled every kernel itself. TileLang's cache key does not hold the compiler's version, and the
+  nodes' usual cache was filled by CUDA 13.0.2 builds (on sp1, 56 of 8,699 files are newer than candidate-55's first
+  build), so in every other arm candidate-55 ran kernels compiled before #974. The 1x2 and 1x3 gain of those two
+  arms (5.9% and 10.8% on the fourth build) is that of candidate-55's own CUDA 13.5 kernels at the default windows.
+  [2026-11-13-kernel-cache-toolchain](../../../2026-11-13-kernel-cache-toolchain/README.md) measures it directly.
+- **Withdrawn:** that #982's trigger position causes the 1-request loss, that moving it recovers 1x3, and that the
+  moved trigger gains nothing under the caps. No run here tests #982 or the trigger. Conclusion 2, the second half
+  of conclusion 3, and the verdicts on hypotheses 2, 3 and 4 below are struck by this note.
+- **What stands:** the arms that are environment settings or another build: the caps (`l2cap`), candidate-54 with the
+  caps, the repeat boots, and with them conclusions 1, 4 and 6 and the recipe.
+
 - **Attribution run:** base commit `aa31800e5`, third build (`spark-ds41f:candidate-55`, `ad905a6d`, vLLM tree
   `e8c20f54`), against `spark-ds41f:candidate-54` (`d502217e`).
 - **Confirmation run:** base commit `6c3e98b56`, fourth build (vLLM tree `8aaae3df`; the sparknet tree is the same,
