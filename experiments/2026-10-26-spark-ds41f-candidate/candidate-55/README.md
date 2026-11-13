@@ -470,7 +470,7 @@ entries still in the cache: TileLang `0014` acting. Receipts: [receipts/fifth-bu
 | | `tp4-ring` | `tp4-switched` | `tp3-switched` |
 | --- | --- | --- | --- |
 | Gate | 2 of 2 boots, 18d61961/d6568649 (text 0a2dacdd/12fd8257) | 2 of 2, the same | 4 of 4, 5c22ce41/bce6092e (text 26a739a9/12cfee9b) |
-| Grid against candidate-54's recorded screen | **2.22% faster** (±0.14%, margin 0.35%) | **4.14% faster** (±0.17%, margin 0.29%) | screen running |
+| Grid against candidate-54's recorded screen | **2.22% faster** (±0.14%, margin 0.35%) | **4.14% faster** (±0.17%, margin 0.29%) | **2.90% faster** (±0.13%, margin 0.56%; 15 shapes) |
 | c16 paired decode | +0.36%, the same (margin 0.51%) | **+1.39%, better** (margin 0.47%) | |
 | Prefill 32,768 | -0.15%, the same | -0.88%, the same | |
 | Prefill 262,144 | **-1.03%, worse** (±0.22%, margin 0.69%; 8,803 and 8,723 tok/s) | -0.84%, the same (margin 1.07%; 8,651 and 8,705 tok/s) | |
@@ -485,7 +485,12 @@ entries still in the cache: TileLang `0014` acting. Receipts: [receipts/fifth-bu
   48-row shapes, 12x72, 16x96), which the drafter and the rest of the step give back (-0.18% to +0.85% a step). Not
   attributed; the prefill loss on these kernels is not attributed either.
 - **Release tests:** three fail, above.
-- **Not done:** `tp3-switched`'s screen; the c1 decisions against candidate-54's; TP5 to TP8.
+- **`tp3-switched`'s screen** (two boots, against candidate-54's recorded screen): c8 paired decode +0.64%, better
+  (margin 0.34%); single-stream paired decode +1.50%, better (margin 0.29%; 64.05 and 64.04 tok/s); the sampled c16, c8
+  and c1 the same (+0.61%, +0.60%, +1.22%); prefill of 131,072 tokens under decode **2.31% slower at 3 streams**
+  (±1.07%, margin 1.11%: worse), the same at 6 and 7 (-1.44%, -1.75%). Prefill is lower on this toolkit's kernels at
+  all three testbeds; not attributed.
+- **Not done:** the c1 decisions against candidate-54's; TP5 to TP8.
 - **Correction:** sp8's `spark-ds41f:candidate-55` was the third build until the fifth replaced it, so the single-GPU
   checks of 2026-11-13 on sp8 that name the fourth build ran on the third (the row-band overlay's smoke run among
   them). The testbed runs are unaffected.
@@ -510,3 +515,23 @@ specs' runs are named `<run>-b6`. Marks, declared before the build:
    boots, within the margin. No text path changes, so a difference would be a finding about the build, not the patch.
 
 Not run again: the c1 decision checks and `tp3-switched`'s screen, which stand as the fifth build's.
+
+**Verified, 2026-11-13.** Image `spark-ds41f:candidate-55`, ID `0728619c`, vLLM tree `e630ad15`, the same on dgx1..dgx4,
+sp1..sp4 and sp5..sp7; every job ran at `c4341e032`. The fifth build's image is kept as `spark-ds41f:candidate-55-b5`
+on every node. Receipts: [receipts/sixth-build](receipts/sixth-build),
+[receipts/release-tests-0728619c](receipts/release-tests-0728619c).
+
+1. **Release tests: met.** 10,295 passed, 357 skipped, none failed (sp8, 2,954 s); the three GELU tests pass on kernels
+   CUDA 13.5 compiled.
+2. **Outputs: met.** 2 of 2 boots at `tp4-ring` and `tp4-switched` give 18d61961/d6568649 (text 0a2dacdd/12fd8257),
+   4 of 4 at `tp3-switched` give 5c22ce41/bce6092e (text 26a739a9/12cfee9b).
+3. **Serving: met.** Against candidate-54's recorded screens, beside the fifth build's:
+
+| | `tp4-ring`, sixth | fifth | `tp4-switched`, sixth | fifth |
+| --- | ---: | ---: | ---: | ---: |
+| Grid | -2.10% (margin 0.30%) | -2.22% | -3.96% (margin 0.29%) | -4.14% |
+| c16 paired decode | +0.45% | +0.36% | +1.48% | +1.39% |
+| Prefill 32,768 | +0.17% | -0.15% | -0.15% | -0.88% |
+| Prefill 262,144 | -1.02% (8,773 and 8,755 tok/s; worse) | -1.03% | -0.39% (8,697 and 8,739 tok/s; the same) | -0.84% |
+
+Open, carried from the fifth build: 256K prefill at `tp4-ring` is 1% behind candidate-54 beyond the margin.
