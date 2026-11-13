@@ -1,0 +1,23 @@
+# GLP-27 fold-site steering layer on the pinned 1022 image.
+#
+# Applies scripts/hotfix-dsv41-fold-steering.py to the image's vllm tree
+# (/opt/spark3/candidate/vllm) — fail-closed anchors, py_compile checked.
+# This replaces the r6v residual-stream GLP hotfix (image tag -glp): the
+# GLP-27 vector is calibrated for the hc_fold_pre_engram site (GLP
+# spec_version 3), which the residual-stream hook cannot express on this
+# tree. Steering is armed at serve time from the environment:
+#   WEIGHTLESS_STEER_PATH=/vectors/dsv41-perlayer-dirs-ffn.pt
+#   WEIGHTLESS_STEER_ALPHA=3.5
+# (see config/cluster.json). Build context: scripts/ (the repository-root
+# .dockerignore is `*`; the canonical build uses named contexts, so build
+# from the scripts directory instead):
+#
+#   docker build -f docker/Dockerfile.glp27 \
+#     -t vllm-ds41f-kkref:19f2c20ed4d6-1022-glp27 scripts
+
+ARG BASE_IMAGE=vllm-ds41f-kkref:19f2c20ed4d6-1022-4
+FROM ${BASE_IMAGE}
+
+COPY hotfix-dsv41-fold-steering.py /tmp/hotfix-dsv41-fold-steering.py
+RUN python3 /tmp/hotfix-dsv41-fold-steering.py \
+    && rm /tmp/hotfix-dsv41-fold-steering.py
