@@ -16,7 +16,7 @@ against candidate-54's recorded runs, not release-qualified.
 | #982 | sparknet: PDL chaining of the four one-shot collectives (Part A) | sparknet `0003` (re-placed in #989's stage loop); vLLM `0803` (its PDL-chain test entry) |
 | #974 | CUDA 13.5.37 toolchain (nvcc/ptxas, cudart) and cuBLASLt 13.10.0.20 | `sources.cuda_toolkit` in this lock (hash-locked debs) |
 | Kernel cache key (owner, 2026-11-13) | TileLang's kernel cache key names the CUDA device compiler and its version, so a node whose cache an earlier toolkit filled compiles this build's kernels instead of loading the old ones | TileLang `0014` ([tilelang/series](tilelang/series): `spark-ds41f-1107`'s thirteen patches, then `0014`) |
-| Row-band WO window (owner, 2026-11-13: fifth build "with both patches") | `VLLM_DS41_L2_PREFETCH_WO_BANDS` sizes the WO prefetch window, and COMP's, by the forward's row count; unset, nothing changes. No recipe sets it yet | vLLM `0806` ([the experiment](../../2026-11-13-l2-prefetch-row-bands/README.md)) |
+| Row-band WO window (owner, 2026-11-13: fifth build "with both patches") | `VLLM_DS41_L2_PREFETCH_WO_BANDS` sizes the WO prefetch window, and COMP's, by the forward's row count; unset, nothing changes. The TP4 recipe sets `17-32=10` | vLLM `0806` ([the experiment](../../2026-11-13-l2-prefetch-row-bands/README.md)) |
 | #738 | GLP's reader takes Spec v3 (`hc_fold_pre_engram`) beside Spec v1; a Spec v3 vector folds the stream mean and projects each covered layer's attention write. A Spec v1 vector (GLP-39) steers as before | vLLM `0805` (rebased on candidate-55, [receipts/glp-rebase](receipts/glp-rebase/README.md)) |
 
 ## Selection
@@ -131,6 +131,24 @@ unchanged. The control can: it must give candidate-54's TP4 hashes `18d61961`/`d
   which counts as part of #1134.
 
 ## TP4's recipe: L2 prefetch caps, and the ring's collective limit
+
+**The row band, added with the fifth build (2026-11-13).** `tp4.json` and `tp4-switched.json` set
+`VLLM_DS41_L2_PREFETCH_WO_BANDS=17-32=10`: the WO window (and COMP's) at 10 MB for forwards of 17 to 32 rows, 15 MB
+elsewhere.
+
+- **Why:** the 24- and 32-row grid shapes; see [the row-band experiment](../../2026-11-13-l2-prefetch-row-bands/README.md).
+- **Measured** on the fourth build with the patch mounted and the kernel cache its own compiler filled, two boots each
+  ([the window sweep](../../2026-11-13-prefetch-window-sweep/README.md)): 17 to 32 rows 1.7% to 2.7% faster at both
+  TP4 testbeds, the grid 0.43% and 0.62% faster, outputs candidate-54's. The sweep found no better WO, FFN or NEXT
+  size at any other row band.
+- **Open, for the fifth build's screen:** at `tp4-ring` 256K prefill is about 1% lower on CUDA 13.5 kernels, and 12x72
+  and 16x96 read 0.7% to 1.0% slower with the band on two boots.
+- **Not set elsewhere:** `tp3-switched`'s sweep picks `17-32=12`, whose confirmation is not read yet; the triangle and
+  TP5 to TP8 have no measurement.
+- `tp4-noband.json`, `tp4-switched-noband.json` and their `-dev` files are the recipe without the band. The arms
+  measured before it entered (grid-attribution, rows24-attribution, the kernel cache, row-band and sweep experiments)
+  extend those, so they still mean what they measured.
+- The fifth build's verification specs are `gate-b5-*.json`, `screen-b5-*.json` and `c1-decisions-b5-*.json`.
 
 **Added 2026-11-12, after the fourth build's screens.** Two recipe variables answer the two regressions the screens
 found at TP4. Neither changes the image or the locks.
