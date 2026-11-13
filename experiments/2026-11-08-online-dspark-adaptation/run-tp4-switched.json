@@ -1,0 +1,82 @@
+{
+ "experiment": "experiments/2026-11-08-online-dspark-adaptation",
+ "run": "online-dspark-adaptation-tp4-switched",
+ "jobs": [
+  {
+   "kind": "sync"
+  },
+  {
+   "kind": "measure",
+   "bench": false,
+   "bracket": false,
+   "arms": [
+    {
+     "config": "experiments/2026-11-08-online-dspark-adaptation/tp4-switched-on.json",
+     "label": "adapt-on"
+    },
+    {
+     "config": "experiments/2026-11-08-online-dspark-adaptation/tp4-switched-off.json",
+     "label": "adapt-off"
+    },
+    {
+     "config": "experiments/2026-11-08-online-dspark-adaptation/tp4-switched-on.json",
+     "label": "adapt-on-again"
+    },
+    {
+     "config": "experiments/2026-11-08-online-dspark-adaptation/tp4-switched-off.json",
+     "label": "adapt-off-again"
+    }
+   ],
+   "extras": [
+    [
+     "online_adaptation_workload.py",
+     [
+      "--turn-tokens",
+      "384",
+      "--heldout-tokens",
+      "256"
+     ],
+     "workload"
+    ],
+    [
+     "experiments/2026-11-10-tp4-ring-determinism/token_determinism_record.py",
+     [
+      "--tokens",
+      "192",
+      "--long-lines",
+      "700",
+      "--wide",
+      "--record",
+      "results/private/determinism/{run}/record-determinism-{label}.json"
+     ],
+     "determinism"
+    ],
+    [
+     "experiments/2026-11-10-tp4-ring-determinism/token_determinism_record.py",
+     [
+      "--tokens",
+      "192",
+      "--long-lines",
+      "700",
+      "--wide",
+      "--no-logprobs",
+      "--record",
+      "results/private/determinism/{run}/record-greedy-{label}.json"
+     ],
+     "greedy"
+    ],
+    [
+     "collect_adaptation_digests.py",
+     [
+      "--nodes",
+      "localhost",
+      "sp2",
+      "sp3",
+      "sp4"
+     ],
+     "digests"
+    ]
+   ]
+  }
+ ]
+}
