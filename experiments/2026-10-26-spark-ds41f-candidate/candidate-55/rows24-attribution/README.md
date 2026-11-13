@@ -3,6 +3,13 @@
 Base commit: `cf71810d9`. Image: `spark-ds41f:candidate-55`, fourth build (vLLM tree `8aaae3df`, sparknet tree
 `e06f6a06`), with the TP4 recipe (L2 prefetch windows at 15/12/12 MB, collectives above the 2 MiB slot on PyNCCL).
 
+**Conclusion (2026-11-13):** the loss is the L2 prefetch's WO window, not a kernel or a setting of any one PR. With
+the prefetch off on both builds candidate-55 is 1.5% to 2.2% faster than candidate-54 at the 24-row shapes, where
+with the 15/12/12 MB windows it is 1.5% to 1.9% slower. With the WO window at 10 MB candidate-55's 24-row shapes are
+2.4% to 2.7% faster and candidate-54's do not move. 24 and 32 rows are the 32-row decode tile tier. A WO window sized
+by row band is the fix; at one size for every row count, 10 MB costs 1.9% at 1x2 and the grid comes out the same, so
+the recipe is unchanged.
+
 ## What is being explained
 
 With the recipe, candidate-55's screen at `tp4-ring` has the grid 1.55% faster than candidate-54's recorded screen,
@@ -149,14 +156,81 @@ One GPU, dummy weights at a TP4 rank's shapes, the caps, 60 replays, the third b
   without B12X (the preparation stages and the disposable KV pool before the real allocation). Neither names a row
   count.
 
+## The prefetch: off on both builds, and each window smaller
+
+Jobs `20261113T063736-attribute-rows24-prefetch-tp4.json` (06:37Z to 07:26Z, deployment `68254cbd`) and
+`20261113T072659-attribute-rows24-wo-control-tp4.json` (07:27Z to 07:43Z). All 16 boots reached ready and no memory
+guard fired ([receipts](../receipts/rows24-attribution/tp4-ring)).
+
+Arms: both builds with `VLLM_DS41_L2_PREFETCH=0`; candidate-55 with one window smaller at a time (WO 10 MB of 15, FFN
+8 MB of 12, NEXT 8 MB of 12); and both builds with the windows at 10/12/12 MB. The COMP window of the four layers
+that own a compressor takes WO's budget, so the WO arm shrinks it too.
+
+**With the prefetch off candidate-55 is not slower at 24 and 32 rows** (`candidate-55-l2off` against
+`candidate-54-l2off`, the mean of both boots of each):
+
+| Shapes | Step | Forward |
+| --- | --- | --- |
+| 1x2; 1x3 | 1.5% faster; 3.0% faster | -0.11 ms; -0.37 ms |
+| 8x16 | 1.7% faster | -0.20 ms |
+| 4x24, 8x24, 8x24 at 64K, 8x24 at 256K | **2.2%, 1.5%, 1.9%, 2.0% faster** | -0.14 to -0.29 ms |
+| 16x32 | **1.3% faster** | -0.11 ms |
+| 16x48, 8x48 | 1.1% faster | -0.09 to -0.12 ms |
+| 12x72; 16x96 | 0.9% slower; 0.7% slower | +0.40 ms; +0.49 ms |
+
+So the kernels' own time is not slower at these rows. With the windows on, the prefetch takes 2.4 ms off
+candidate-54's 24-row step and 1.8 ms off candidate-55's.
+
+**Each window, against `candidate-55` with 15/12/12 MB** (the mean of both boots of each; negative is faster):
+
+| Arm | 24 rows | 16x32 | 48 rows | 12x72 | 1x2 | 1x3 | 6 to 16 rows | Grid (the tool, each boot) |
+| --- | --- | --- | --- | --- | --- | --- | --- | --- |
+| `candidate-55-l2-wo10` | **-2.6%** | **-1.5%** | +1.1% | +1.0% | +1.9% | +1.6% | +1.2% | -0.09%, +0.28% |
+| `candidate-55-l2-ffn8` | -0.4% | -0.3% | -0.2% | +0.3% | +0.6% | -0.1% | -0.1% | -0.04%, -0.46% |
+| `candidate-55-l2-next8` | +1.5% | +1.7% | +1.3% | -0.0% | +1.7% | +1.7% | +0.1% | +1.14%, +0.84% |
+| `candidate-55-l2off` | +8.4% | +7.2% | +6.9% | +4.6% | +21.1% | +19.7% | +15.2% | +12.52%, +12.12% |
+
+- **The WO window is the one.** At 10 MB the four 24-row shapes are 2.4% to 2.7% faster and 16x32 1.5%, more than the
+  loss. Every other band is 0.5% to 2% slower, and the grid is the same.
+- **FFN at 8 MB changes nothing; NEXT at 8 MB is worse** at every band but 6 to 16 rows and 72 to 96.
+- **The prefetch is worth 4.5% to 21% of the step** at `tp4-ring`, most at one request.
+- `candidate-55`'s two boots in this job differ by 0.69% on the grid, more than in the other jobs (0.1% to 0.2%).
+
+**The 15 MB WO window costs candidate-55, not candidate-54** (both builds at 10/12/12 MB, two boots each):
+
+| Shapes | candidate-54, 10 MB against 15 MB | candidate-55, 10 MB against 15 MB | candidate-55 against candidate-54, both at 10 MB |
+| --- | --- | --- | --- |
+| The four 24-row shapes | +0.2% (21.12 against 21.08 ms) | -2.6% | **1.4% faster** (0.7% to 2.2%) |
+| 16x32 | +0.5% | -1.5% | +0.2%, the same |
+| Grid | +0.8% | +0.1% | 1.9% faster (the tool: 1.97%, margin 0.38%) |
+
+candidate-54's 15 MB figures are its `candidate-54-l2cap` boots of the settings job, 90 minutes earlier in the same
+window.
+
+**One GPU agrees for 24 and 32 rows.** On sp8 with the prefetch off (two boots each,
+[receipts](../receipts/rows24-attribution/sp8-single-gpu)), candidate-55's forward is 0.9% slower at 8x24 and 1.5%
+at 16x32, where with the windows on it is 4.6% and 4.2% slower. At 16x48 and 12x72 it stays 2.8% and 2.5% slower
+with the prefetch off: a second, smaller loss in the kernels' own time at wide rows, which `tp4-ring` shows at
+72 and 96 rows (0.9% and 0.7%, in the table above). That one is not attributed.
+
+## Why the WO window, and why these rows
+
+- **Where it fills.** WO is issued after the query up-projection and fills while the sparse-MLA preparation kernels
+  run; `l2_prefetch.py`'s own description says the fill slows those kernels, and that a window still filling delays
+  the one queued behind it.
+- **Why 24 and 32 rows.** Decode tiles come in heights 16, 32 and wider (`DECODE_TILE_ROWS` in `tilelang/gemm.py`,
+  `_WO_A_TILES` in `tilelang/wo.py`), so 24 and 32 rows are both the 32-row tier: one band, 17 to 32 rows. 20 and 28
+  rows are not in the grid and were not measured.
+- **Why candidate-55.** Not established by an arm: no single change moves these rows. Its forward is faster at every
+  band below 24 rows, so each window has less time before its consumer.
+
 ## Where this leaves it
 
-The loss is not one PR's kernel or setting among those with an arm, the dispatch is identical, and it sits in the
-forward from 24 rows up. The remaining explanation is the one the caps already pointed at: candidate-55's forward is
-faster, and the paced L2 prefetch windows now overlap its wide MoE and projection reads. The caps cut this loss from
-1.3% to 3.3% (the fourth build's screen without them) to 0.7% to 2.4%.
-
-**Next run** ([attribute-rows24-prefetch-tp4.json](attribute-rows24-prefetch-tp4.json)): both builds with the prefetch
-off (`VLLM_DS41_L2_PREFETCH=0`), and candidate-55 with each window smaller in turn (WO 10 MB, FFN 8 MB, NEXT 8 MB).
-If candidate-55 is not slower than candidate-54 at 24 rows with the prefetch off, the loss is the prefetch's phase; if
-it still is, it is in the kernels' own time and points at #1096, which then needs a control build with B12X.
+- **Attributed:** the 24- and 32-row loss is the WO prefetch window at 15 MB in the 32-row tile tier. candidate-55's
+  kernels are not slower there.
+- **Not a recipe change.** One WO size for every row count trades the 24-row shapes (-2.6%) against 1x2 (+1.9%), the
+  rows a single stream uses, and the grid is the same. candidate-55's TP4 recipe stays at 15/12/12 MB.
+- **The fix is a window sized by row band.** The prefetcher's `issue()` already receives the row count and each
+  captured graph bakes the plan its row count selects, so a WO budget for 17 to 32 rows is a Python change with no
+  kernel to compile. It is a change of its own, for a later candidate, with its own measurement.
+- **Still open:** the 0.7% to 0.9% at 72 and 96 rows with the prefetch off, and the 4 s of startup.

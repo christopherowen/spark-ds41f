@@ -199,8 +199,12 @@ reached ready, and every mark is met.
 - **A single stream gains little from the caps:** c1 decode is 0.16% (`tp4-ring`, inside the interval) and 0.35%
   (`tp4-switched`) faster than the fourth build without them. The 1x2 and 1x3 grid rows the caps repair are replayed
   back to back in the grid.
-- **Still open at `tp4-ring`:** four shapes of 24 and 32 rows are 1% to 2% slower than candidate-54's on both boots
-  (1.3% to 3.3% without the caps). Not attributed; c16 is not slower.
+- **At `tp4-ring`, four shapes of 24 and 32 rows are 1% to 2% slower than candidate-54's on both boots** (1.3% to 3.3%
+  without the caps); c16 is not slower. **Attributed 2026-11-13** ([rows24-attribution](rows24-attribution/README.md)):
+  it is the WO prefetch window at 15 MB in the 32-row decode tile tier, not a kernel or one PR's setting. With the
+  prefetch off candidate-55 is faster than candidate-54 at those shapes, and a 10 MB WO window makes them 2.6% faster
+  at the cost of 1.9% at 1x2, so the recipe is unchanged; a WO window sized by row band is the fix, for a later
+  candidate.
 - **Still open:** the engine's startup is about 4 s longer than candidate-54's at `tp4-ring`, as the third build
   recorded; nothing here changes it.
 
