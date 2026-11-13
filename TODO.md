@@ -249,20 +249,16 @@ Open levers:
 
 ## Prefill and first token
 
-In `1107`, per-layer SP WO local MXFP8 exchange (`0737`), sequence-parallel
-Engram prefill column exchange and sliced projection (`0738`), TP3 6-channel
-NCCL Ring and sparse-MLA `block_H=16` (`2` CTAs/head, `0740`), unconditional
-`M=64` MoE `prefill_swizzle_panel=2` (`0736`), retained CED encoder endpoints
-(`0727`), CED local boundary reduction (`0742`), and SP context-KV projection
-(`0743`) are all active.
+In `1107`, per-layer SP MoE pre-gather MXFP8 cast, local routing, and cached
+tail-rank routing masks (`0573`, `0720`, `0762`,
+`experiments/2026-11-08-sp-prefill-moe-mxfp8-gather`), per-layer SP WO local
+MXFP8 exchange (`0737`), sequence-parallel Engram prefill column exchange and
+sliced projection (`0738`), TP3 6-channel NCCL Ring and sparse-MLA `block_H=16`
+(`2` CTAs/head, `0740`), unconditional `M=64` MoE `prefill_swizzle_panel=2`
+(`0736`), retained CED encoder endpoints (`0727`), CED local boundary reduction
+(`0742`), and SP context-KV projection (`0743`) are all active.
 
 Open levers:
-- **Sequence-parallel MoE input (`experiments/2026-10-14-sp-moe-gather`).** Each
-  encoder layer all-gathers BF16 rows, then casts them to MXFP8 twice (shared
-  and routed experts) and routes them on all $T$ rows on every rank (~4.4 ms a
-  layer at an 8,096-row chunk). Routing and casting each rank's own shard before
-  all-gathering MXFP8 rows with their scales and routes preserves exact bits
-  with a ~3–3.9% prefill ceiling.
 - **First request after a restart** is ~0.37 s slower to its first token than
   subsequent requests. Screen `CUDA_MODULE_LOADING=EAGER` (checking boot time
   impact) and sample the first request with `py-spy dump --nonblocking`.
