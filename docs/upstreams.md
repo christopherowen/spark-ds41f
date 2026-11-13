@@ -58,6 +58,7 @@ Inference Lab integration branch is the serving source.
 | `cutlass` | `NVIDIA/cutlass` | not created yet | SM121 stable-extension headers at `v4.7.1` |
 | `cutlass_dsl` | NVIDIA packages on PyPI | not applicable | SHA-256-locked ARM64 CuTe DSL wheel set |
 | `cuda_toolkit` | NVIDIA's Ubuntu 24.04 SBSA CUDA apt repository | not applicable | optional, listed only by a lock that builds on it: SHA-256-locked CUDA 13.5 toolchain and math-library packages over the base image's CUDA 13.0.2 ([docker/README.md](../docker/README.md#cuda-toolkit)) |
+| `torch` | PyTorch's wheel index (`download.pytorch.org/whl/nightly/cu135`) | not applicable | optional, listed only by a lock that also lists the CUDA toolkit it was compiled for: SHA-256-locked wheels of torch, the packages it requires, and torchvision, torchaudio, torchcodec and triton (`requirements/torch-2-16-cu135-aarch64.txt`) |
 | `model` | `deepseek-ai/DeepSeek-V4.1-Flash` | not applicable | unchanged native model weights and tokenizer |
 
 The URL and full immutable revision in `upstreams.lock.json`, not a directory

@@ -77,6 +77,25 @@ RUN --mount=type=bind,from=cuda-toolkit-debs,target=/tmp/cuda-toolkit-debs \
     chmod 0755 /usr/local/sbin/spark-wire-cuda-13-5; \
     /usr/local/sbin/spark-wire-cuda-13-5
 
+# torch 2.16.0.dev20261113+cu135 over the CUDA 13.5 stage, from the lock's wheels
+# (requirements/torch-2-16-cu135-aarch64.txt, verified by `bin/spark build prepare`):
+# torch, every package it requires at the version it requires, and the torchvision,
+# torchaudio and torchcodec builds of its date. pip installs exactly that set, with no
+# index and no dependency resolution, so a wheel the set lacks fails the import below.
+# The set's NCCL is the stock release torch was compiled against; runtime-core replaces
+# it with the patched build of the lock's NCCL, which must be that release. The set's
+# CUDA libraries are this toolkit's own versions, and nvidia/cu13 is wired to
+# /usr/local/cuda-13.5 again so one copy is what torch, nvcc and cuda.pathfinder resolve.
+# Every builder stage starts here, so each native extension is built against this torch.
+FROM cuda-13-5 AS cuda-13-5-torch-2-16
+
+RUN --mount=type=bind,from=torch-wheels,target=/tmp/torch-wheels \
+    set -eux; \
+    python3 -m pip install --no-cache-dir --no-index --no-deps --force-reinstall \
+      /tmp/torch-wheels/*.whl; \
+    /usr/local/sbin/spark-wire-cuda-13-5; \
+    python3 -c 'import torch, torchaudio, torchvision; assert torch.__version__ == "2.16.0.dev20261113+cu135", torch.__version__'
+
 FROM ${CUDA_STAGE} AS vllm-native-builder
 
 USER root
@@ -216,6 +235,9 @@ ARG NCCL_REVISION=unrecorded
 ARG NCCL_PATCH_HEAD=unrecorded
 ARG NCCL_TREE=unrecorded
 ARG DEPLOYMENT_COMMIT=uncommitted
+# NCCL_VERSION_CODE of the lock's NCCL tag; `bin/spark build image` passes it when the
+# lock tracks another release than the base image's 2.30.7.
+ARG NCCL_VERSION_CODE=23007
 
 LABEL org.opencontainers.image.source="https://github.com/christopherowen/spark-ds41f" \
       org.opencontainers.image.revision="${DEPLOYMENT_COMMIT}" \
@@ -311,6 +333,7 @@ RUN LIBRARY_PATH=/usr/local/cuda/lib64/stubs python3 - <<'PY'
 import ctypes
 import hashlib
 import importlib.metadata as metadata
+import os
 import subprocess
 
 assert metadata.version("nvidia-cutlass-dsl") == "4.7.1"
@@ -324,7 +347,7 @@ from vllm.models.deepseek_v4_1.engram_rows import _native as engram_native
 nccl = "/usr/local/lib/python3.12/dist-packages/nvidia/nccl/lib/libnccl.so.2"
 version = ctypes.c_int()
 assert ctypes.CDLL(nccl).ncclGetVersion(ctypes.byref(version)) == 0
-assert version.value == 23007, version.value
+assert version.value == int(os.environ["NCCL_VERSION_CODE"]), version.value
 with open(nccl, "rb") as handle:
     built = open("/opt/spark-ds41f/nccl/libnccl.so.2.sha256").read().strip()
     assert hashlib.sha256(handle.read()).hexdigest() == built, "NCCL is not the patched build"
@@ -376,6 +399,38 @@ rt_ver = ctypes.c_int()
 assert cudart.cudaRuntimeGetVersion(ctypes.byref(rt_ver)) == 0
 assert rt_ver.value == 13050, rt_ver.value
 print("CUDA 13.5 build checks passed")
+PY
+
+# A build with the lock's torch (RUNTIME_CORE_STAGE=runtime-core-cuda-13-5-torch-2-16):
+# the installed torch is the lock's, compiled for this toolkit and for the NCCL release
+# the patched library is, and it loads that library (libtorch_cuda.so binds NCCL's
+# symbols when it loads, so the import fails on a release that lacks one).
+FROM runtime-core-cuda-13-5 AS runtime-core-cuda-13-5-torch-2-16
+
+ARG NCCL_VERSION_CODE=23007
+LABEL local.spark-ds41f.torch.version="2.16.0.dev20261113+cu135"
+
+RUN python3 - <<'PY'
+import ctypes
+import os
+
+import torch
+import torchaudio  # noqa: F401
+import torchvision
+
+assert torch.__version__ == "2.16.0.dev20261113+cu135", torch.__version__
+assert torch.version.cuda == "13.5", torch.version.cuda
+compiled = torch.cuda.nccl.version()
+code = int(os.environ["NCCL_VERSION_CODE"])
+assert tuple(compiled[:3]) == (code // 10000, code // 100 % 100, code % 100), (compiled, code)
+nccl = "/usr/local/lib/python3.12/dist-packages/nvidia/nccl/lib/libnccl.so.2"
+loaded = [line.split()[-1] for line in open("/proc/self/maps") if "libnccl.so" in line]
+assert loaded and set(loaded) == {nccl}, loaded
+version = ctypes.c_int()
+assert ctypes.CDLL(nccl).ncclGetVersion(ctypes.byref(version)) == 0 and version.value == code, version.value
+boxes = torch.tensor([[0.0, 0.0, 1.0, 1.0], [0.0, 0.0, 1.0, 1.0]])
+assert torchvision.ops.nms(boxes, torch.tensor([1.0, 0.5]), 0.5).tolist() == [0]
+print("torch build checks passed")
 PY
 
 # B12X, while the lock lists it (spark-ds41f-1025 and earlier): its tree on
