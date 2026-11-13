@@ -15,6 +15,7 @@ against candidate-54's recorded runs, not release-qualified.
 | #989 | sparknet: one persistent multi-stage kernel per collective, 8 thread blocks, no single-slot cap, so SP prefill collectives up to 16 MiB stay on sparknet | sparknet `0002` |
 | #982 | sparknet: PDL chaining of the four one-shot collectives (Part A) | sparknet `0003` (re-placed in #989's stage loop); vLLM `0803` (its PDL-chain test entry) |
 | #974 | CUDA 13.5.37 toolchain (nvcc/ptxas, cudart) and cuBLASLt 13.10.0.20 | `sources.cuda_toolkit` in this lock (hash-locked debs) |
+| Kernel cache key (owner, 2026-11-13) | TileLang's kernel cache key names the CUDA device compiler and its version, so a node whose cache an earlier toolkit filled compiles this build's kernels instead of loading the old ones | TileLang `0014` ([tilelang/series](tilelang/series): `spark-ds41f-1107`'s thirteen patches, then `0014`) |
 | #738 | GLP's reader takes Spec v3 (`hc_fold_pre_engram`) beside Spec v1; a Spec v3 vector folds the stream mean and projects each covered layer's attention write. A Spec v1 vector (GLP-39) steers as before | vLLM `0805` (rebased on candidate-55, [receipts/glp-rebase](receipts/glp-rebase/README.md)) |
 
 ## Selection
@@ -150,8 +151,9 @@ The code defaults are 20/16/20 MB. TP5 to TP8 are not measured and keep the defa
 
 ### Found 2026-11-13: candidate-55 has been running kernels compiled before #974
 
-TileLang's compiled-kernel cache is keyed by the kernel's source, target and options, not by the compiler's version
-(`tilelang/cache/cuda_binary_cache.py`). The nodes' caches were filled by CUDA 13.0.2 builds: on dgx1, 84 of the 7,033
+TileLang's kernel cache (`tilelang/cache/kernel_cache.py`) is keyed by the kernel and the TileLang build, not by the
+compiler that built its device binary; the CUDA binary cache below it is keyed by `nvcc`'s version too, but is asked
+only on a miss. The nodes' caches were filled by CUDA 13.0.2 builds: on dgx1, 84 of the 7,033
 files in the cache directory candidate-55 uses are newer than its first build, and on sp1 56 of 8,699. So wherever a
 kernel's source is candidate-54's, candidate-55 loads the binary an earlier build compiled, and #974's `nvcc` and
 `ptxas` compile only the kernels whose source changed. Every gate, check and screen above was taken that way.
@@ -163,6 +165,11 @@ kernel's source is candidate-54's, candidate-55 loads the binary an earlier buil
   its compiler did not build; they hold for its runtime libraries only.
 - [2026-11-13-kernel-cache-toolchain](../../2026-11-13-kernel-cache-toolchain/README.md) measures candidate-55 on its
   own kernels, gate first.
+- **Fixed in the series** (owner, 2026-11-13: "make the compiler version part of the cache key"): TileLang `0014`
+  adds the device compiler to the kernel cache key. TileLang's tree becomes `741806c7` (`patch_head` `444b0447`,
+  14 patches, `patchset_sha256` `c0a8825c`), recorded by `bin/spark build prepare --only tilelang --lock` on sp8 for
+  both locks, and every profile's `tilelang.tree` label follows. The fourth build's image has the earlier tree, so
+  these profiles need the **fifth build**, whose first boot on each node compiles its whole kernel set.
 
 ### The collective limit, at `tp4-ring` only
 
