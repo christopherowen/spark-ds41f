@@ -1,0 +1,398 @@
+From 5071a4ccd71f236246ac434afc5c300e080cf042 Mon Sep 17 00:00:00 2001
+From: Christopher Owen <chris@owen.org>
+Date: Tue, 10 Nov 2026 05:08:05 +0000
+Subject: [PATCH] perf(deepseek_v4_1): add 48-row decode projection tile tier
+ for 33..48 verify rows
+
+---
+ .../test_deepseek_v41_tilelang_linear.py      | 25 +++++++++-
+ vllm/models/deepseek_v4_1/tilelang/gemm.py    | 50 +++++++++++++++++--
+ vllm/models/deepseek_v4_1/tilelang/linear.py  | 16 ++++--
+ 3 files changed, 81 insertions(+), 10 deletions(-)
+
+diff --git a/tests/kernels/quantization/test_deepseek_v41_tilelang_linear.py b/tests/kernels/quantization/test_deepseek_v41_tilelang_linear.py
+index b5c16fbb2..5d6298501 100644
+--- a/tests/kernels/quantization/test_deepseek_v41_tilelang_linear.py
++++ b/tests/kernels/quantization/test_deepseek_v41_tilelang_linear.py
+@@ -41,7 +41,7 @@ from vllm.models.deepseek_v4_1.tilelang.gemm import (  # noqa: E402
+ from vllm.models.deepseek_v4_1.tilelang.norm import TileLangRMSNorm  # noqa: E402
+ 
+ DEVICE = "cuda"
+-ROWS = (1, 7, 16, 17, 32, 33, 64, 65, 200)
++ROWS = (1, 7, 16, 17, 32, 33, 42, 48, 49, 64, 65, 200)
+ 
+ 
+ def _gen(seed):
+@@ -953,3 +953,26 @@ def test_mxfp8_gemm_rope_mxfp4_decode_matches_reference(default_vllm_config):
+                 )
+             assert torch.equal(q_out, q_ref), f"q mismatch at rows={rows}"
+             assert torch.equal(s_out, s_ref), f"s mismatch at rows={rows}"
++
++
++def test_decode_48row_tile_selection_and_bit_identity():
++    """Rows 33..48 dispatch to the 48-row decode tile across FP8 decode GEMMs,
++    split-K FP8 partials, and BF16 split-K partials while matching the 64-row
++    tile bit for bit."""
++    from vllm.models.deepseek_v4_1.tilelang.gemm import (
++        decode_tile_rows,
++        split_bucket,
++        split_row_tile,
++    )
++    from vllm.models.deepseek_v4_1.tilelang.linear import PARTIAL_ROW_TILES
++
++    assert DECODE_TILE_ROWS == (16, 32, 48, 64)
++    assert PARTIAL_ROW_TILES == (16, 32, 48, 64)
++    for rows in (33, 36, 42, 48):
++        assert decode_tile_rows(rows) == 48
++        assert split_bucket(rows) == 48
++        assert split_row_tile(rows) == 48
++    for rows in (49, 64):
++        assert decode_tile_rows(rows) == 64
++        assert split_bucket(rows) == 64
++        assert split_row_tile(rows) == 64
+diff --git a/vllm/models/deepseek_v4_1/tilelang/gemm.py b/vllm/models/deepseek_v4_1/tilelang/gemm.py
+index c2443adcb..e38571bb9 100644
+--- a/vllm/models/deepseek_v4_1/tilelang/gemm.py
++++ b/vllm/models/deepseek_v4_1/tilelang/gemm.py
+@@ -2478,8 +2478,9 @@ def bf16_shards(N: int, K: int, block_N: int = 64, block_K: int = 64) -> int:
+ 
+ 
+ # Decode tile heights: rows up to DECODE_ROWS run on the shortest that holds
+-# them (one stream's verified rows fit 16; 32 rows hold four streams').
+-DECODE_TILE_ROWS = (16, 32, DECODE_ROWS)
++# them (one stream's verified rows fit 16; 32 rows hold five streams';
++# 48 rows hold six to eight streams' without padding up to 64).
++DECODE_TILE_ROWS = (16, 32, 48, DECODE_ROWS)
+ 
+ # Decode tiles of the block-32 FP8 projections by (N, K) and tile height, from
+ # the kernel-lab sweep on GB10 at the TP4 serving shapes: whole calls with the
+@@ -2502,27 +2503,32 @@ DECODE_FP8_CONFIGS: dict[tuple[int, ...], dict[int, dict]] = {
+     (12288, 1280): {
+         16: dict(block_N=128, block_K=128, num_stages=3),
+         32: dict(block_N=64, block_K=128, num_stages=3),
++        48: dict(block_N=64, block_K=128, num_stages=3),
+         64: dict(block_N=64, block_K=128, num_stages=2),
+     },
+     (8192, 1280): {
+         16: dict(block_N=128, block_K=128, num_stages=3),
+         32: dict(block_N=64, block_K=128, num_stages=3),
++        48: dict(block_N=64, block_K=128, num_stages=3),
+         64: dict(block_N=64, block_K=128, num_stages=3),
+     },
+     (4096, 1280): {
+         16: dict(block_N=64, block_K=128, num_stages=3),
+         32: dict(block_N=128, block_K=128, num_stages=3),
++        48: dict(block_N=64, block_K=128, num_stages=2),
+         64: dict(block_N=64, block_K=128, num_stages=2, threads=64),
+     },
+     (1792, 5120): {
+         16: dict(block_N=64, block_K=256, num_stages=2),
+         32: dict(block_N=64, block_K=256, num_stages=3),
++        48: dict(block_N=64, block_K=256, num_stages=3),
+         64: dict(block_N=64, block_K=256, num_stages=2),
+     },
+     # Shared expert gate/up (TP3, TP4, TP5, TP6/TP7, TP8).
+     (1536, 5120): {
+         16: dict(block_N=32, block_K=256, num_stages=3),
+         32: dict(block_N=32, block_K=256, num_stages=3),
++        48: dict(block_N=64, block_K=128, num_stages=2),
+         64: dict(block_N=64, block_K=128, num_stages=2),
+     },
+     # TP3..TP8 column-sharded target fused Q-A/KV:
+@@ -2532,78 +2538,93 @@ DECODE_FP8_CONFIGS: dict[tuple[int, ...], dict[int, dict]] = {
+     (224, 5120): {
+         16: dict(block_N=32, block_K=256, num_stages=4),
+         32: dict(block_N=32, block_K=256, num_stages=4),
++        48: dict(block_N=32, block_K=256, num_stages=4),
+         64: dict(block_N=32, block_K=256, num_stages=4),
+     },
+     (256, 5120): {
+         16: dict(block_N=32, block_K=256, num_stages=4),
+         32: dict(block_N=32, block_K=256, num_stages=4),
++        48: dict(block_N=32, block_K=256, num_stages=4),
+         64: dict(block_N=32, block_K=256, num_stages=4),
+     },
+     (320, 5120): {
+         16: dict(block_N=32, block_K=256, num_stages=4),
+         32: dict(block_N=32, block_K=256, num_stages=4),
++        48: dict(block_N=32, block_K=256, num_stages=4),
+         64: dict(block_N=32, block_K=256, num_stages=4),
+     },
+     (384, 5120): {
+         16: dict(block_N=32, block_K=256, num_stages=4),
+         32: dict(block_N=32, block_K=256, num_stages=4),
++        48: dict(block_N=32, block_K=256, num_stages=4),
+         64: dict(block_N=32, block_K=256, num_stages=4),
+     },
+     (448, 5120): {
+         16: dict(block_N=32, block_K=256, num_stages=4),
+         32: dict(block_N=32, block_K=256, num_stages=4),
++        48: dict(block_N=32, block_K=256, num_stages=4),
+         64: dict(block_N=32, block_K=256, num_stages=4),
+     },
+     (608, 5120): {
+         16: dict(block_N=32, block_K=256, num_stages=4),
+         32: dict(block_N=32, block_K=256, num_stages=4),
++        48: dict(block_N=32, block_K=256, num_stages=4),
+         64: dict(block_N=32, block_K=256, num_stages=4),
+     },
+     # TP4 shared expert: gate/up and down.
+     (1152, 5120): {
+         16: dict(block_N=32, block_K=256, num_stages=3),
+         32: dict(block_N=32, block_K=256, num_stages=3),
++        48: dict(block_N=64, block_K=256, num_stages=2),
+         64: dict(block_N=64, block_K=256, num_stages=2),
+     },
+     (1024, 5120): {
+         16: dict(block_N=32, block_K=256, num_stages=3),
+         32: dict(block_N=32, block_K=256, num_stages=3),
++        48: dict(block_N=32, block_K=256, num_stages=3),
+         64: dict(block_N=64, block_K=256, num_stages=2),
+     },
+     (768, 5120): {
+         16: dict(block_N=32, block_K=256, num_stages=3),
+         32: dict(block_N=32, block_K=256, num_stages=3),
++        48: dict(block_N=32, block_K=256, num_stages=3),
+         64: dict(block_N=32, block_K=256, num_stages=2),
+     },
+     (640, 5120): {
+         16: dict(block_N=32, block_K=256, num_stages=3),
+         32: dict(block_N=32, block_K=256, num_stages=3),
++        48: dict(block_N=32, block_K=256, num_stages=3),
+         64: dict(block_N=32, block_K=256, num_stages=2),
+     },
+     # Shared expert down (TP3, TP4, TP5, TP6/TP7, TP8).
+     (5120, 768): {
+         16: dict(block_N=128, block_K=64, num_stages=2, threads=64),
+         32: dict(block_N=128, block_K=64, num_stages=2),
++        48: dict(block_N=128, block_K=64, num_stages=2),
+         64: dict(block_N=64, block_K=64, num_stages=2),
+     },
+     (5120, 576): {
+         16: dict(block_N=128, block_K=64, num_stages=2, threads=64),
+         32: dict(block_N=128, block_K=64, num_stages=2),
++        48: dict(block_N=128, block_K=64, num_stages=2),
+         64: dict(block_N=64, block_K=64, num_stages=2),
+     },
+     (5120, 512): {
+         16: dict(block_N=128, block_K=64, num_stages=2, threads=64),
+         32: dict(block_N=128, block_K=64, num_stages=2),
++        48: dict(block_N=128, block_K=64, num_stages=2),
+         64: dict(block_N=64, block_K=64, num_stages=2),
+     },
+     (5120, 384): {
+         16: dict(block_N=128, block_K=64, num_stages=2, threads=64),
+         32: dict(block_N=128, block_K=64, num_stages=2),
++        48: dict(block_N=64, block_K=64, num_stages=2),
+         64: dict(block_N=64, block_K=64, num_stages=2),
+     },
+     (5120, 320): {
+         16: dict(block_N=128, block_K=64, num_stages=2, threads=64),
+         32: dict(block_N=128, block_K=64, num_stages=2),
++        48: dict(block_N=64, block_K=64, num_stages=2),
+         64: dict(block_N=64, block_K=64, num_stages=2),
+     },
+     # Attention output: grouped WO-A (TP3 3 groups, TP4..7 2 groups, TP8 1 group)
+@@ -2611,27 +2632,32 @@ DECODE_FP8_CONFIGS: dict[tuple[int, ...], dict[int, dict]] = {
+     (1024, 4096, 3): {
+         16: dict(block_N=64, block_K=128, num_stages=4),
+         32: dict(block_N=64, block_K=128, num_stages=4),
++        48: dict(block_N=64, block_K=128, num_stages=4),
+         64: dict(block_N=64, block_K=128, num_stages=2),
+     },
+     (1024, 4096, 2): {
+         16: dict(block_N=64, block_K=128, num_stages=4),
+         32: dict(block_N=64, block_K=128, num_stages=4),
++        48: dict(block_N=64, block_K=128, num_stages=4),
+         64: dict(block_N=64, block_K=256, num_stages=2),
+     },
+     (1024, 4096): {
+         16: dict(block_N=32, block_K=128, num_stages=4),
+         32: dict(block_N=32, block_K=128, num_stages=4),
++        48: dict(block_N=32, block_K=128, num_stages=4),
+         64: dict(block_N=32, block_K=256, num_stages=2),
+     },
+     (5120, 3072): {
+         16: dict(block_N=128, block_K=128, num_stages=3),
+         32: dict(block_N=128, block_K=128, num_stages=3),
++        48: dict(block_N=128, block_K=128, num_stages=2),
+         64: dict(block_N=128, block_K=128, num_stages=2),
+         96: dict(block_N=64, block_K=128, num_stages=2),
+     },
+     (5120, 2048): {
+         16: dict(block_N=128, block_K=128, num_stages=3),
+         32: dict(block_N=128, block_K=128, num_stages=3),
++        48: dict(block_N=128, block_K=128, num_stages=3),
+         # 2026-10-13 sweep (experiments/2026-10-13-tilelang-fp8-cast): 0.87 of the
+         # default tile at 48-64 rows; a 96-row tile 0.91 of the prefill tile at 72-96.
+         64: dict(block_N=128, block_K=128, num_stages=2),
+@@ -2640,6 +2666,7 @@ DECODE_FP8_CONFIGS: dict[tuple[int, ...], dict[int, dict]] = {
+     (5120, 1024): {
+         16: dict(block_N=128, block_K=128, num_stages=3),
+         32: dict(block_N=128, block_K=128, num_stages=3),
++        48: dict(block_N=128, block_K=128, num_stages=2),
+         64: dict(block_N=128, block_K=128, num_stages=2),
+         96: dict(block_N=64, block_K=128, num_stages=2),
+     },
+@@ -2647,36 +2674,43 @@ DECODE_FP8_CONFIGS: dict[tuple[int, ...], dict[int, dict]] = {
+     (6400, 6144): {
+         16: dict(block_N=32, block_K=256, num_stages=4, threads=64),
+         32: dict(block_N=32, block_K=256, num_stages=4, threads=64),
++        48: dict(block_N=32, block_K=256, num_stages=4),
+         64: dict(block_N=64, block_K=256, num_stages=2),
+     },
+     (1728, 15360): {
+         16: dict(block_N=32, block_K=256, num_stages=3, threads=128),
+         32: dict(block_N=64, block_K=256, num_stages=3, threads=128),
++        48: dict(block_N=64, block_K=256, num_stages=3, threads=128),
+         64: dict(block_N=64, block_K=256, num_stages=3, threads=128),
+     },
+     (1280, 15360): {
+         16: dict(block_N=32, block_K=256, num_stages=3, threads=128),
+         32: dict(block_N=64, block_K=256, num_stages=3, threads=128),
++        48: dict(block_N=64, block_K=256, num_stages=3, threads=128),
+         64: dict(block_N=32, block_K=256, num_stages=3, threads=128),
+     },
+     (1024, 15360): {
+         16: dict(block_N=32, block_K=256, num_stages=3, threads=128),
+         32: dict(block_N=32, block_K=256, num_stages=3, threads=128),
++        48: dict(block_N=32, block_K=256, num_stages=3, threads=128),
+         64: dict(block_N=32, block_K=256, num_stages=3, threads=128),
+     },
+     (896, 15360): {
+         16: dict(block_N=32, block_K=256, num_stages=3, threads=128),
+         32: dict(block_N=32, block_K=256, num_stages=4, threads=128),
++        48: dict(block_N=32, block_K=256, num_stages=4, threads=128),
+         64: dict(block_N=32, block_K=256, num_stages=3, threads=128),
+     },
+     (768, 15360): {
+         16: dict(block_N=32, block_K=256, num_stages=3, threads=128),
+         32: dict(block_N=32, block_K=256, num_stages=3, threads=128),
++        48: dict(block_N=32, block_K=256, num_stages=3, threads=128),
+         64: dict(block_N=32, block_K=256, num_stages=3, threads=128),
+     },
+     (640, 15360): {
+         16: dict(block_N=32, block_K=256, num_stages=3, threads=128),
+         32: dict(block_N=32, block_K=256, num_stages=3, threads=128),
++        48: dict(block_N=32, block_K=256, num_stages=3, threads=128),
+         64: dict(block_N=32, block_K=256, num_stages=3, threads=128),
+     },
+ }
+@@ -2697,6 +2731,7 @@ SPLIT_FP8: dict[tuple[int, int], dict] = {
+         decode={
+             16: dict(block_N=32, block_K=256, num_stages=3, threads=128),
+             32: dict(block_N=32, block_K=256, num_stages=2, threads=128),
++            48: dict(block_N=32, block_K=256, num_stages=2, threads=128),
+             64: dict(block_N=32, block_K=128, num_stages=3, threads=128),
+             128: dict(block_N=64, block_K=128, num_stages=2, threads=128),
+         },
+@@ -2717,6 +2752,7 @@ SPLIT_BF16: dict[tuple[int, int], dict] = {
+         decode={
+             16: dict(block_N=64, num_stages=4, threads=128),
+             32: dict(block_N=64, num_stages=2, threads=256),
++            48: dict(block_N=64, num_stages=2, threads=256),
+             64: dict(block_N=64, num_stages=3, threads=256),
+         },
+     ),
+@@ -2726,6 +2762,7 @@ SPLIT_BF16: dict[tuple[int, int], dict] = {
+         decode={
+             16: dict(block_N=32, num_stages=3, threads=128),
+             32: dict(block_N=32, num_stages=3, threads=128),
++            48: dict(block_N=32, num_stages=3, threads=128),
+             64: dict(block_N=32, num_stages=2, threads=256),
+         },
+     ),
+@@ -2735,6 +2772,7 @@ SPLIT_BF16: dict[tuple[int, int], dict] = {
+         decode={
+             16: dict(block_N=32, num_stages=3, threads=128),
+             32: dict(block_N=32, num_stages=3, threads=128),
++            48: dict(block_N=32, num_stages=3, threads=128),
+             64: dict(block_N=32, num_stages=2, threads=256),
+         },
+     ),
+@@ -2744,6 +2782,7 @@ SPLIT_BF16: dict[tuple[int, int], dict] = {
+         decode={
+             16: dict(block_N=32, num_stages=3, threads=128),
+             32: dict(block_N=32, num_stages=3, threads=128),
++            48: dict(block_N=32, num_stages=3, threads=128),
+             64: dict(block_N=32, num_stages=2, threads=256),
+         },
+     ),
+@@ -2753,6 +2792,7 @@ SPLIT_BF16: dict[tuple[int, int], dict] = {
+         decode={
+             16: dict(block_N=32, num_stages=3, threads=128),
+             32: dict(block_N=32, num_stages=3, threads=128),
++            48: dict(block_N=32, num_stages=3, threads=128),
+             64: dict(block_N=32, num_stages=2, threads=256),
+         },
+     ),
+@@ -2762,6 +2802,7 @@ SPLIT_BF16: dict[tuple[int, int], dict] = {
+         decode={
+             16: dict(block_N=32, num_stages=3, threads=128),
+             32: dict(block_N=32, num_stages=3, threads=128),
++            48: dict(block_N=32, num_stages=3, threads=128),
+             64: dict(block_N=32, num_stages=2, threads=256),
+         },
+     ),
+@@ -2771,6 +2812,7 @@ SPLIT_BF16: dict[tuple[int, int], dict] = {
+         decode={
+             16: dict(block_N=32, num_stages=3, threads=128),
+             32: dict(block_N=32, num_stages=3, threads=128),
++            48: dict(block_N=32, num_stages=3, threads=128),
+             64: dict(block_N=32, num_stages=2, threads=256),
+         },
+     ),
+@@ -2778,9 +2820,9 @@ SPLIT_BF16: dict[tuple[int, int], dict] = {
+ 
+ 
+ def split_bucket(rows: int) -> int:
+-    """Decode bucket of a split-K call: 16, 32 or 64 rows (one tile that tall), or
++    """Decode bucket of a split-K call: 16, 32, 48 or 64 rows (one tile that tall), or
+     128 (rows 65-128 in 64-row tiles)."""
+-    return next(height for height in (16, 32, 64, 128) if rows <= height)
++    return next(height for height in (16, 32, 48, 64, 128) if rows <= height)
+ 
+ 
+ def split_row_tile(rows: int) -> int:
+diff --git a/vllm/models/deepseek_v4_1/tilelang/linear.py b/vllm/models/deepseek_v4_1/tilelang/linear.py
+index 0b14d7bba..662999bbd 100644
+--- a/vllm/models/deepseek_v4_1/tilelang/linear.py
++++ b/vllm/models/deepseek_v4_1/tilelang/linear.py
+@@ -215,7 +215,7 @@ def provided_mxfp8(x: torch.Tensor) -> MXFP8Rows:
+ # Row tiles of the split-K partials kernel. A 64-row tile computes one decode
+ # row in twice the time of a 16-row tile; every height gives the same
+ # partials bit for bit, so each row count takes the smallest tile that fits.
+-PARTIAL_ROW_TILES = (16, 32, 64)
++PARTIAL_ROW_TILES = (16, 32, 48, 64)
+ 
+ 
+ def partials_kernel(layer: nn.Module, rows: int):
+@@ -762,15 +762,21 @@ def _declare_block32(layer, groups: int = 1, cast: bool = True) -> None:
+         layer.tilelang_split_rows = split["rows"]
+     layer.tilelang_mxfp8_input = getattr(layer, "tilelang_mxfp8_input", False)
+     if layer.tilelang_mxfp8_input:
+-        heights = (
+-            {min(bucket, 64) for bucket in split["decode"]}
++        single_heights = (
++            {min(bucket, 64) for bucket in split["decode"] if bucket <= DECODE_ROWS}
+             if split
+-            else {*DECODE_TILE_ROWS, *layer.tilelang_wide.values()}
++            else set(DECODE_TILE_ROWS)
++        )
++        multi_heights = (
++            {min(bucket, 64) for bucket in split["decode"] if bucket > DECODE_ROWS}
++            if split
++            else set(layer.tilelang_wide.values())
+         )
+         if (
+             groups != 1
+             or (split and split["rows"] > MXFP8_DECODE_ROWS)
+-            or any(DECODE_ROWS % height for height in heights)
++            or any(height <= 0 or height > DECODE_ROWS for height in single_heights)
++            or any(DECODE_ROWS % height for height in multi_heights)
+         ):
+             # A producer pads to whole DECODE_ROWS tiles (mxfp8_rows) for one GEMM.
+             raise ValueError(
+-- 
+2.43.0
+
