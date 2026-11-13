@@ -154,6 +154,25 @@ def parser() -> argparse.ArgumentParser:
         "--parallel", action="store_true", help="stop the nodes concurrently instead of in turn"
     )
     cluster_stop.set_defaults(func=command_cluster_stop)
+    cache = commands.add_parser(
+        "cache", help="inspect or clear the JIT caches the profile names on every node"
+    )
+    cache_commands = cache.add_subparsers(dest="cache_command", required=True)
+    cache_status = cache_commands.add_parser(
+        "status", help="show each node's JIT cache directories: size, files, oldest and newest file"
+    )
+    cache_status.set_defaults(func=command_cache_status)
+    cache_clear = cache_commands.add_parser(
+        "clear", help="empty the JIT cache directories on every node; the engine must be stopped"
+    )
+    cache_clear.add_argument(
+        "--only", nargs="+", action="extend", choices=tuple(JIT_CACHES), metavar="NAME",
+        help="clear only these caches (default: all): " + ", ".join(JIT_CACHES),
+    )
+    cache_clear.add_argument(
+        "--apply", action="store_true", help="perform the planned clear"
+    )
+    cache_clear.set_defaults(func=command_cache_clear)
     render = commands.add_parser("render", help="render, but do not execute, one rank launch")
     render.add_argument("node", help="node name from the selected profile's node map")
     render.set_defaults(func=command_render)

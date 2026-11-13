@@ -24,7 +24,7 @@ import threading
 import time
 import urllib.request
 import uuid
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 from typing import NamedTuple
 
 
@@ -1228,6 +1228,316 @@ def command_cluster_stop(args: argparse.Namespace) -> int:
             outcomes = list(pool.map(stop_node, nodes["nodes"]))
     else:
         outcomes = [stop_node(node) for node in nodes["nodes"]]
+    failed = False
+    for messages, errors in outcomes:
+        for message in messages:
+            print(message)
+        for error in errors:
+            print(f"ERROR: {error}", file=sys.stderr)
+            failed = True
+    return int(failed)
+
+
+# The nodes' long-lived JIT caches: the directories the profile's environment names under
+# the container's cache mount. They outlive the image that filled them, so `cache status`
+# shows what each node holds and `cache clear` empties them on every node.
+CACHE_MOUNT = "/cache"
+JIT_CACHES = {
+    "tilelang": ("TILELANG_CACHE_DIR",),
+    "nv-compute": ("CUDA_CACHE_PATH",),
+    "triton": ("TRITON_CACHE_DIR",),
+    "vllm": ("VLLM_CACHE_ROOT", "VLLM_CACHE_DIR"),
+}
+# Shown by `cache status` only: it holds the caches above and whatever else the engine
+# keeps beside them, so `cache clear` never takes it whole.
+JIT_CACHE_PARENT = {"xdg": ("XDG_CACHE_HOME",)}
+# The files below the current directory as "files, bytes, oldest, newest" (modification
+# times in epoch seconds), tab-separated: one line of size and time a file, summed by awk.
+CACHE_SUMMARY_AWK = (
+    "{ files += 1; bytes += $1; if (files == 1 || $2 < oldest) oldest = $2; "
+    "if (files == 1 || $2 > newest) newest = $2 } "
+    'END { printf "%d\\t%.0f\\t%.0f\\t%.0f", files, bytes, oldest, newest }'
+)
+CACHE_SUMMARY = f"find . -type f -printf '%s %T@\\n' 2>/dev/null | awk {shlex.quote(CACHE_SUMMARY_AWK)}"
+
+
+def cache_mount_source(cluster: dict) -> str:
+    """The node directory the profile mounts at the container's cache mount."""
+    sources = [str(source) for source, target, _ in cluster["container"]["mounts"]
+               if str(target).rstrip("/") == CACHE_MOUNT]
+    if len(sources) != 1:
+        raise ValueError(f"the profile mounts {len(sources)} directories at {CACHE_MOUNT}, not one")
+    source = PurePosixPath(host_path(cluster, sources[0]))
+    if not source.is_absolute() or ".." in source.parts or len(source.parts) < 2:
+        raise ValueError(f"the {CACHE_MOUNT} mount's source {str(source)!r} is not a directory of the node")
+    return str(source)
+
+
+def cache_host_directory(cluster: dict, container_path: str) -> str:
+    """The node directory behind a container path strictly inside the cache mount.
+
+    Every path `cache clear` empties passes through here. The path must be absolute, name
+    no `..`, and lie at least two directories below the mount: never the mount itself, nor
+    a directory right under it, which other state shares. No other mount may cover it,
+    because its files would then live elsewhere. Anything else raises ValueError."""
+    path = PurePosixPath(container_path)
+    if not path.is_absolute() or ".." in path.parts:
+        raise ValueError(f"{container_path!r} is not an absolute path without '..'")
+    try:
+        below = path.relative_to(CACHE_MOUNT)
+    except ValueError:
+        raise ValueError(f"{container_path!r} is not under the {CACHE_MOUNT} mount") from None
+    if len(below.parts) < 2:
+        raise ValueError(f"{container_path!r} is not at least two directories below the {CACHE_MOUNT} mount")
+    for _, target, _ in cluster["container"]["mounts"]:
+        other = PurePosixPath(str(target))
+        if other != PurePosixPath(CACHE_MOUNT) and (other == path or other in path.parents):
+            raise ValueError(f"{container_path!r} is under another mount, {target}")
+    return str(PurePosixPath(cache_mount_source(cluster)) / below)
+
+
+def profile_caches(cluster: dict, caches: dict[str, tuple[str, ...]]) -> tuple[list[dict], list[str], list[str]]:
+    """The node directories of the named caches, as the profile's environment sets them:
+    the directories, a note for each cache the profile does not set, and each value the
+    path guard refuses."""
+    environment = cluster.get("environment", {})
+    directories, unset, refused = [], [], []
+    for name, variables in caches.items():
+        values: dict[str, list[str]] = {}
+        for variable in variables:
+            if environment.get(variable):
+                values.setdefault(str(environment[variable]), []).append(variable)
+        if not values:
+            unset.append(f"{name}: the profile sets no {' or '.join(variables)}; skipped")
+        for value, named in values.items():
+            try:
+                host = cache_host_directory(cluster, value)
+            except ValueError as error:
+                refused.append(f"{name}: {', '.join(named)}={value}: {error}")
+                continue
+            directories.append({"name": name, "variables": named, "container": value, "host": host})
+    return directories, unset, refused
+
+
+def serving_containers_command(cluster: dict) -> str:
+    """List a node's running serving containers, each with the profile it was started from."""
+    return shlex.join(["docker", "ps", *serving_filters(cluster), "--format",
+                       f'{{{{.Names}}}}={{{{.Label "{PROFILE_LABEL}"}}}}'])
+
+
+def cache_survey_script(cluster: dict, directories: list[dict], *, containers: bool) -> str:
+    """One read-only remote script: each directory's presence, files, bytes and oldest and
+    newest file time, TileLang's kernel and binary entries, and (for a clear) the running
+    serving containers."""
+    lines = [f"summary() {{ (cd -- \"$1\" && {CACHE_SUMMARY}); }}"]
+    if containers:
+        lines.append(f"names=$({serving_containers_command(cluster)} 2>&1); status=$?")
+        lines.append("printf 'containers\\t%s\\t%s\\n' \"$status\" \"$(printf '%s' \"$names\" | tr '\\n' ' ')\"")
+    for index, directory in enumerate(directories):
+        lines.append(f"d={shlex.quote(directory['host'])}")
+        lines.append(f"if [ -d \"$d\" ]; then printf 'cache\\t{index}\\tpresent\\t%s\\n' \"$(summary \"$d\")\"; "
+                     f"else printf 'cache\\t{index}\\tabsent\\n'; fi")
+        if directory["name"] == "tilelang":
+            lines.append(
+                'for sub in "$d"/*/linux-*/kernels "$d"/*/cuda-binaries; do [ -d "$sub" ] || continue; '
+                f"printf 'entries\\t{index}\\t%s\\t%s\\n' \"${{sub#\"$d\"/}}\" "
+                '"$(find "$sub" -mindepth 1 -maxdepth 1 | wc -l)"; done')
+    return "\n".join(lines) + "\n"
+
+
+def parse_cache_survey(text: str, count: int) -> dict:
+    """A survey's output: `caches` (one record per directory, in order), and `running`
+    ((container, profile) pairs) or `docker_error` when the script listed containers."""
+    caches: list[dict | None] = [None] * count
+    found: dict = {"caches": caches, "running": None, "docker_error": None}
+    for line in text.splitlines():
+        fields = line.split("\t")
+        try:
+            if fields[0] == "containers":
+                if fields[1] == "0":
+                    found["running"] = [(name, profile or None) for name, _, profile in
+                                        (item.partition("=") for item in fields[2].split())]
+                else:
+                    found["docker_error"] = fields[2].strip() or f"docker ps exited {fields[1]}"
+            elif fields[0] == "cache" and fields[2] == "absent":
+                caches[int(fields[1])] = {"present": False, "entries": []}
+            elif fields[0] == "cache":
+                files, size, oldest, newest = (int(value) for value in fields[3:7])
+                caches[int(fields[1])] = {"present": True, "files": files, "bytes": size,
+                                          "oldest": oldest, "newest": newest, "entries": []}
+            elif fields[0] == "entries":
+                caches[int(fields[1])]["entries"].append((fields[2], int(fields[3])))
+        except (IndexError, ValueError, TypeError) as error:
+            raise ValueError(f"unreadable line {line!r}") from error
+    if None in caches:
+        raise ValueError("the node did not report every cache directory")
+    return found
+
+
+def survey_caches(cluster: dict, nodes: dict, directories: list[dict], *,
+                  containers: bool) -> list[tuple[dict | None, str | None]]:
+    """Every node's survey, the nodes concurrently and in node order: one remote call a
+    node, and (None, why) for a node that cannot be reached or read."""
+    script = cache_survey_script(cluster, directories, containers=containers)
+
+    def one(node: dict) -> tuple[dict | None, str | None]:
+        result = remote_shell(nodes, node, script)
+        if result.returncode == 255:
+            return None, f"unreachable: {result.stderr.strip() or 'SSH failed'}"
+        if result.returncode:
+            detail = result.stderr.strip() or result.stdout.strip() or f"exit {result.returncode}"
+            return None, f"cannot inspect the caches: {detail}"
+        try:
+            return parse_cache_survey(result.stdout, len(directories)), None
+        except ValueError as error:
+            return None, f"cannot inspect the caches: {error}"
+
+    with concurrent.futures.ThreadPoolExecutor(max_workers=len(nodes["nodes"])) as pool:
+        return list(pool.map(one, nodes["nodes"]))
+
+
+def cache_size_text(size: int) -> str:
+    for unit, scale in (("GiB", 2**30), ("MiB", 2**20), ("KiB", 2**10)):
+        if size >= scale:
+            return f"{size / scale:.1f} {unit}"
+    return f"{size} B"
+
+
+def cache_text(cache: dict) -> str:
+    if not cache["present"]:
+        return "absent"
+    if not cache["files"]:
+        return "present, no files"
+    oldest, newest = (time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(cache[key])) for key in ("oldest", "newest"))
+    return (f"{cache_size_text(cache['bytes'])} in {cache['files']:,} files, "
+            f"modified {oldest} to {newest}")
+
+
+def command_cache_status(args: argparse.Namespace) -> int:
+    cluster, nodes, _ = configuration(args)
+    _, config_relative = cluster_config_path(args)
+    directories, unset, refused = profile_caches(cluster, {**JIT_CACHES, **JIT_CACHE_PARENT})
+    print(f"profile: {config_relative} on {', '.join(node['name'] for node in nodes['nodes'])}")
+    for directory in directories:
+        parent = " (shown only; cache clear does not empty it)" if directory["name"] in JIT_CACHE_PARENT else ""
+        print(f"{directory['name']}: {', '.join(directory['variables'])}={directory['container']}{parent}")
+    for note in unset:
+        print(note)
+    for problem in refused:
+        print(f"ERROR: {problem}", file=sys.stderr)
+    failed = bool(refused)
+    if not directories:
+        return int(failed)
+    surveys = survey_caches(cluster, nodes, directories, containers=False)
+    for node, (found, problem) in zip(nodes["nodes"], surveys):
+        if problem:
+            print(f"ERROR: {node['name']}: {problem}", file=sys.stderr)
+            failed = True
+            continue
+        print(f"{node['name']}:")
+        for directory, cache in zip(directories, found["caches"]):
+            print(f"  {directory['name']}: {directory['host']}: {cache_text(cache)}")
+            for relative, count in cache["entries"]:
+                print(f"    {relative}: {count:,} entries")
+    return int(failed)
+
+
+def cache_clear_script(cluster: dict, directory: dict) -> str:
+    """Empty one cache directory on a node and keep the directory itself: the engine expects
+    it, and it may be a mount point.
+
+    The script deletes only relative to the directory it has entered, and only when that
+    directory resolves at least two levels inside the cache mount's own directory, so no
+    empty variable, missing directory or symbolic link can point it anywhere else. It
+    refuses while a serving container runs on the node. The container writes the caches as
+    root, so what the SSH user cannot remove goes through `sudo -n`."""
+    return "\n".join([
+        "set -u",
+        f"dir={shlex.quote(directory['host'])}",
+        f"root={shlex.quote(cache_mount_source(cluster))}",
+        f"running=$({serving_containers_command(cluster)}) || "
+        "{ echo 'cannot list the running containers' >&2; exit 3; }",
+        "[ -z \"$running\" ] || { echo \"a serving container is running: $running\" >&2; exit 3; }",
+        "[ -e \"$dir\" ] || { echo absent; exit 0; }",
+        "root=$(cd -- \"$root\" && pwd -P) || exit 4",
+        "cd -- \"$dir\" || exit 4",
+        "case \"$(pwd -P)\" in \"$root\"/*/*) ;; "
+        "*) echo \"$dir resolves to $(pwd -P), not a cache directory of $root\" >&2; exit 4 ;; esac",
+        f"summary=$({CACHE_SUMMARY})",
+        "find . -mindepth 1 -delete 2>/dev/null",
+        "if [ -n \"$(find . -mindepth 1 -print -quit)\" ]; then sudo -n find . -mindepth 1 -delete || "
+        "{ echo 'sudo -n could not remove the files the SSH user cannot' >&2; exit 5; }; fi",
+        "[ -z \"$(find . -mindepth 1 -print -quit)\" ] || { echo 'files remain' >&2; exit 5; }",
+        "printf 'removed\\t%s\\n' \"$summary\"",
+    ]) + "\n"
+
+
+def command_cache_clear(args: argparse.Namespace) -> int:
+    require_named_profile(args)
+    cluster, nodes, _ = configuration(args)
+    _, config_relative = cluster_config_path(args)
+    selected = list(dict.fromkeys(getattr(args, "only", None) or JIT_CACHES))
+    directories, unset, refused = profile_caches(cluster, {name: JIT_CACHES[name] for name in selected})
+    print(f"profile: {config_relative} on {', '.join(node['name'] for node in nodes['nodes'])}")
+    for note in unset:
+        print(note)
+    if refused:
+        for problem in refused:
+            print(f"ERROR: {problem}", file=sys.stderr)
+        return 1
+    if not directories:
+        print("nothing to clear: the profile names none of the selected caches")
+        return 0
+
+    # A clear covers every configured node or none, so every node is read before any is changed.
+    surveys = survey_caches(cluster, nodes, directories, containers=True)
+    refusals: list[str] = []
+    engines: dict[tuple[str, str | None], list[str]] = {}
+    for node, (found, problem) in zip(nodes["nodes"], surveys):
+        if problem:
+            refusals.append(f"{node['name']}: {problem}; a clear covers every configured node or none")
+            continue
+        for directory, cache in zip(directories, found["caches"]):
+            print(f"{node['name']}: empty {directory['host']} ({directory['name']}: {cache_text(cache)})")
+        if found["running"] is None:
+            detail = docker_error_detail(node["name"], found["docker_error"] or "no container listing")
+            refusals.append(f"{node['name']}: cannot tell whether an engine is running: {detail}")
+        for engine in found["running"] or []:
+            engines.setdefault(engine, []).append(node["name"])
+    for (container, profile), where in engines.items():
+        refusals.append(
+            f"{container} is running on {', '.join(where)}, and a running engine has frozen its kernel set "
+            f"against these caches; cluster stop comes first: {stop_own_profile({'profile': profile})}")
+    if not args.apply:
+        for refusal in refusals:
+            print(f"--apply would refuse: {refusal}")
+        print("plan only; pass --apply to clear the caches")
+        return 0
+    if refusals:
+        for refusal in refusals:
+            print(f"ERROR: {refusal}", file=sys.stderr)
+        print("nothing was cleared on any node", file=sys.stderr)
+        return 1
+
+    def clear_node(node: dict) -> tuple[list[str], list[str]]:
+        """Empty one node's directories; return (messages, errors)."""
+        messages, errors = [], []
+        for directory in directories:
+            where = f"{node['name']}: {directory['host']} ({directory['name']})"
+            result = remote_shell(nodes, node, cache_clear_script(cluster, directory))
+            removed = re.search(r"^removed\t(\d+)\t(\d+)\t", result.stdout, re.MULTILINE)
+            if result.returncode == 0 and removed:
+                files, size = int(removed.group(1)), int(removed.group(2))
+                messages.append(f"{where}: removed {files:,} files, {cache_size_text(size)}")
+            elif result.returncode == 0 and "absent" in result.stdout.split():
+                messages.append(f"{where}: absent, nothing to remove")
+            else:
+                detail = result.stderr.strip() or result.stdout.strip() or f"exit {result.returncode}"
+                errors.append(f"{where}: not cleared: {detail}")
+        return messages, errors
+
+    with concurrent.futures.ThreadPoolExecutor(max_workers=len(nodes["nodes"])) as pool:
+        outcomes = list(pool.map(clear_node, nodes["nodes"]))
     failed = False
     for messages, errors in outcomes:
         for message in messages:
