@@ -500,8 +500,15 @@ class TorchWheelsTest(unittest.TestCase):
         lock = spark.read_json("experiments/2026-10-26-spark-ds41f-candidate/candidate-55/upstreams.lock.json")
         self.assertEqual(spark.torch_problems(lock["sources"]), [])
         inputs = spark.build_inputs(lock)
-        self.assertEqual(inputs["torch"]["version"], "2.16.0.dev20261113+cu135")
-        self.assertEqual(spark.nccl_version_code(inputs), 23203)
+        self.assertNotIn("torch", inputs)
+        self.assertEqual(spark.nccl_version_code(inputs), 23007)
+        self.assertEqual(spark.cuda_stages(inputs), ("cuda-13-5", "runtime-core-cuda-13-5"))
+        with_torch = self.with_torch(lock)
+        with_torch["sources"]["nccl"]["tracking_ref"] = "refs/tags/v2.32.3-1"
+        self.assertEqual(spark.torch_problems(with_torch["sources"]), [])
+        torch_inputs = spark.build_inputs(with_torch)
+        self.assertEqual(torch_inputs["torch"]["version"], "2.16.0.dev20261113+cu135")
+        self.assertEqual(spark.nccl_version_code(torch_inputs), 23203)
         for released in ("upstreams.lock.json",
                          "experiments/2026-10-26-spark-ds41f-candidate/candidate-54/upstreams.lock.json"):
             self.assertNotIn("torch", spark.build_inputs(spark.read_json(released)))
