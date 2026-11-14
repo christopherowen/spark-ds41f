@@ -39,5 +39,5 @@ Both `tp2-direct-dev.json` and `tp2-switched-dev.json` finalize:
 - `--max-num-seqs 4` (`concurrency = 4`)
 - `--kv-cache-memory-bytes 6442450944` (`6.00 GiB`)
 - `--prefix-cache-retention-interval 8192`
-- `enable_adaptive_verification = true` (`adaptive_verification_row_cost = 0.035`)
+- `enable_adaptive_verification = false` (target runs eager under `PIECEWISE` for per-step `io_uring` slot paging)
 - `VLLM_MAX_IMAGE_PIXELS=16777216` in `overlay/vllm/vllm/envs.py` (mounted read-only)
