@@ -757,6 +757,122 @@ if triton is not None:
                 tl.store(slots_dst_ptr + idx, -1)
 
     @triton.jit
+    def _load_w2_row(
+        tok,
+        w2_ptr,
+        w2_stride_r,
+        w2_exc_ptr,
+        w2_offsets_ptr,
+        W2_PACKED: tl.constexpr,
+        W2_EXP_BASE: tl.constexpr,
+        W2_SHARDED: tl.constexpr,
+        w2_org_start,
+        w2_org_end,
+        w2_added_start,
+        w2_added_end,
+        w2_added_base,
+        offs_r,
+        mask_r,
+        rank: tl.constexpr,
+        BLOCK_R: tl.constexpr,
+    ):
+        if W2_SHARDED:
+            w2_in_org = (tok >= w2_org_start) & (tok < w2_org_end)
+            w2_in_added = (tok >= w2_added_start) & (tok < w2_added_end)
+            w2_owned = w2_in_org | w2_in_added
+            w2_local_id = tl.where(
+                w2_in_org,
+                tok - w2_org_start,
+                tl.where(w2_in_added, (tok - w2_added_start) + w2_added_base, 0),
+            )
+        else:
+            w2_owned = True
+            w2_local_id = tok
+        w2_row = tl.zeros([BLOCK_R], dtype=tl.float32)
+        if w2_owned:
+            if W2_PACKED:
+                w2_exc_start = tl.load(w2_offsets_ptr + w2_local_id)
+                w2_exc_end = tl.load(w2_offsets_ptr + w2_local_id + 1)
+                lb = tl.load(
+                    w2_ptr + w2_local_id * w2_stride_r + offs_r,
+                    mask=mask_r,
+                    other=0,
+                ).to(tl.uint32)
+                c_off = rank + ((offs_r >> 7) << 6) + (offs_r & 63)
+                cb = tl.load(
+                    w2_ptr + w2_local_id * w2_stride_r + c_off,
+                    mask=mask_r,
+                    other=0,
+                ).to(tl.uint32)
+                nib = (cb >> (((offs_r >> 6) & 1) * 4)) & 0xF
+                exp_bits = tl.where(
+                    nib == 0, 0, (nib + (W2_EXP_BASE - 1)) << 7
+                )
+                u16 = ((lb & 0x80) << 8) | (lb & 0x7F) | exp_bits
+                exc_idx = w2_exc_start
+                while exc_idx < w2_exc_end:
+                    entry = tl.load(w2_exc_ptr + exc_idx).to(tl.uint32)
+                    col = entry >> 16
+                    u16 = tl.where(offs_r == col, entry & 0xFFFF, u16)
+                    exc_idx += 1
+                w2_row = (u16 << 16).to(tl.float32, bitcast=True)
+            else:
+                w2_row = tl.load(
+                    w2_ptr + w2_local_id * w2_stride_r + offs_r,
+                    mask=mask_r,
+                    other=0.0,
+                ).to(tl.float32)
+        return w2_row
+
+    @triton.jit
+    def _decode_w2_range_kernel(
+        start_tok,
+        n_toks,
+        w2_ptr,
+        w2_stride_r,
+        w2_exc_ptr,
+        w2_offsets_ptr,
+        out_ptr,
+        out_stride_r,
+        W2_PACKED: tl.constexpr,
+        W2_EXP_BASE: tl.constexpr,
+        W2_SHARDED: tl.constexpr,
+        w2_org_start,
+        w2_org_end,
+        w2_added_start,
+        w2_added_end,
+        w2_added_base,
+        rank: tl.constexpr,
+        BLOCK_R: tl.constexpr,
+    ):
+        idx = tl.program_id(0)
+        if idx >= n_toks:
+            return
+        offs_r = tl.arange(0, BLOCK_R)
+        mask_r = offs_r < rank
+        tok = start_tok + idx.to(tl.int64)
+        row = _load_w2_row(
+            tok,
+            w2_ptr,
+            w2_stride_r,
+            w2_exc_ptr,
+            w2_offsets_ptr,
+            W2_PACKED,
+            W2_EXP_BASE,
+            W2_SHARDED,
+            w2_org_start,
+            w2_org_end,
+            w2_added_start,
+            w2_added_end,
+            w2_added_base,
+            offs_r,
+            mask_r,
+            rank,
+            BLOCK_R,
+        )
+        tl.store(out_ptr + idx * out_stride_r + offs_r, row, mask=mask_r)
+
+    @triton.jit
     def _prepare_and_pack_miss_kernel(
         idx_mapping_ptr,
         captured_slots_ptr,
@@ -781,6 +897,8 @@ if triton is not None:
         lm_offsets_ptr,
         w2_ptr,
         w2_stride_r,
+        w2_exc_ptr,
+        w2_offsets_ptr,
         miss_mask_ptr,
         cond_ids_ptr,
         packed_ptr,
@@ -805,6 +923,8 @@ if triton is not None:
         lm_added_start,
         lm_added_end,
         lm_added_base,
+        W2_PACKED: tl.constexpr,
+        W2_EXP_BASE: tl.constexpr,
         W2_SHARDED: tl.constexpr,
         w2_org_start,
         w2_org_end,
@@ -1016,24 +1136,25 @@ if triton is not None:
 
         tl.store(packed_ptr + idx * packed_stride_r + 0, acc_dot)
 
-        if W2_SHARDED:
-            w2_in_org = (tok >= w2_org_start) & (tok < w2_org_end)
-            w2_in_added = (tok >= w2_added_start) & (tok < w2_added_end)
-            if not (w2_in_org | w2_in_added):
-                tl.store(
-                    packed_ptr + idx * packed_stride_r + 1 + offs_r,
-                    zero_r,
-                    mask=mask_r,
-                )
-                return
-            w2_local_id = tl.where(
-                w2_in_org, tok - w2_org_start, (tok - w2_added_start) + w2_added_base
-            )
-        else:
-            w2_local_id = tok
-        w2_row = tl.load(
-            w2_ptr + w2_local_id * w2_stride_r + offs_r, mask=mask_r, other=0.0
-        ).to(tl.float32)
+        w2_row = _load_w2_row(
+            tok,
+            w2_ptr,
+            w2_stride_r,
+            w2_exc_ptr,
+            w2_offsets_ptr,
+            W2_PACKED,
+            W2_EXP_BASE,
+            W2_SHARDED,
+            w2_org_start,
+            w2_org_end,
+            w2_added_start,
+            w2_added_end,
+            w2_added_base,
+            offs_r,
+            mask_r,
+            rank,
+            BLOCK_R,
+        )
         tl.store(packed_ptr + idx * packed_stride_r + 1 + offs_r, w2_row, mask=mask_r)
 
     @triton.jit
@@ -1044,8 +1165,11 @@ if triton is not None:
         packed_stride_r,
         w1_ptr,
         w1_stride_r,
+        w1_fp32_ptr,
+        w1_fp32_stride_r,
         w1_anchor_ptr,
         anchor_stride_r,
+        w2_mean_hat_ptr,
         num_reqs,
         logits_scale,
         soft_cap,
@@ -1058,6 +1182,9 @@ if triton is not None:
         max_row_drift,
         HAS_SOFT_CAP: tl.constexpr,
         HAS_ANCHOR: tl.constexpr,
+        USE_RESIDUAL_ORTH: tl.constexpr,
+        HAS_MU_HAT: tl.constexpr,
+        HAS_FP32_MASTER: tl.constexpr,
         rank: tl.constexpr,
         BLOCK_R: tl.constexpr,
     ):
@@ -1078,9 +1205,23 @@ if triton is not None:
 
         offs_r = tl.arange(0, BLOCK_R)
         m_r = offs_r < rank
-        cur = tl.load(w1_ptr + cid * w1_stride_r + offs_r, mask=m_r, other=0)
-        u = cur.to(tl.float32)
-        acc = cur.to(tl.float64)
+        zero_r = tl.zeros([BLOCK_R], dtype=tl.float32)
+        cur_bf = tl.load(w1_ptr + cid * w1_stride_r + offs_r, mask=m_r, other=0)
+        u = cur_bf.to(tl.float32)
+        if HAS_FP32_MASTER:
+            cur_fp = tl.load(
+                w1_fp32_ptr + cid * w1_fp32_stride_r + offs_r, mask=m_r, other=0.0
+            )
+            acc = cur_fp.to(tl.float64)
+        else:
+            acc = cur_bf.to(tl.float64)
+
+        if HAS_MU_HAT:
+            mu_hat = tl.load(w2_mean_hat_ptr + offs_r, mask=m_r, other=0.0).to(
+                tl.float32
+            )
+        else:
+            mu_hat = zero_r
 
         k = r
         while k < num_reqs:
@@ -1115,21 +1256,47 @@ if triton is not None:
                 q1 = e1 * inv_s
                 q2 = e2 * inv_s
 
-                s0 = tl.where(q0 > peak_prob, 0.5, tl.where(q0 < peak_prob, -0.5, 0.0))
-                s1 = tl.where(q1 > rem_prob, 0.5, tl.where(q1 < rem_prob, -0.5, 0.0))
-                s2 = tl.where(q2 > rem_prob, 0.5, tl.where(q2 < rem_prob, -0.5, 0.0))
-                es = q0 * s0 + q1 * s1 + q2 * s2
-                g0 = q0 * (s0 - es)
-                g1 = q1 * (s1 - es)
-                g2 = q2 * (s2 - es)
+                if USE_RESIDUAL_ORTH:
+                    g0 = tl.minimum(-0.02, q0 - peak_prob)
+                    if HAS_MU_HAT:
+                        w0r = w2_0 - tl.sum(w2_0 * mu_hat, axis=0) * mu_hat
+                        w1r = w2_1 - tl.sum(w2_1 * mu_hat, axis=0) * mu_hat
+                        w2r = w2_2 - tl.sum(w2_2 * mu_hat, axis=0) * mu_hat
+                    else:
+                        w0r = w2_0
+                        w1r = w2_1
+                        w2r = w2_2
+                    n1 = tl.sqrt(tl.sum(w1r * w1r, axis=0))
+                    u1 = tl.where(n1 > 1e-6, w1r / tl.maximum(n1, 1e-6), zero_r)
+                    w0o = w0r - tl.sum(w0r * u1, axis=0) * u1
+                    w2p = w2r - tl.sum(w2r * u1, axis=0) * u1
+                    n2 = tl.sqrt(tl.sum(w2p * w2p, axis=0))
+                    u2 = tl.where(n2 > 1e-4, w2p / tl.maximum(n2, 1e-4), zero_r)
+                    w0o = w0o - tl.sum(w0o * u2, axis=0) * u2
+                    w2_energy = tl.maximum(tl.sum(w0o * w0o, axis=0), 1e-3)
+                    grad_u = (g0 * w0o) / w2_energy
+                else:
+                    s0 = tl.where(
+                        q0 > peak_prob, 0.5, tl.where(q0 < peak_prob, -0.5, 0.0)
+                    )
+                    s1 = tl.where(
+                        q1 > rem_prob, 0.5, tl.where(q1 < rem_prob, -0.5, 0.0)
+                    )
+                    s2 = tl.where(
+                        q2 > rem_prob, 0.5, tl.where(q2 < rem_prob, -0.5, 0.0)
+                    )
+                    es = q0 * s0 + q1 * s1 + q2 * s2
+                    g0 = q0 * (s0 - es)
+                    g1 = q1 * (s1 - es)
+                    g2 = q2 * (s2 - es)
 
-                e_sum = (
-                    tl.sum(w2_0 * w2_0, axis=0)
-                    + tl.sum(w2_1 * w2_1, axis=0)
-                    + tl.sum(w2_2 * w2_2, axis=0)
-                )
-                w2_energy = tl.maximum(e_sum * (1.0 / 3.0), 1e-3)
-                grad_u = (g0 * w2_0 + g1 * w2_1 + g2 * w2_2) / w2_energy
+                    e_sum = (
+                        tl.sum(w2_0 * w2_0, axis=0)
+                        + tl.sum(w2_1 * w2_1, axis=0)
+                        + tl.sum(w2_2 * w2_2, axis=0)
+                    )
+                    w2_energy = tl.maximum(e_sum * (1.0 / 3.0), 1e-3)
+                    grad_u = (g0 * w2_0 + g1 * w2_1 + g2 * w2_2) / w2_energy
                 gu_norm = tl.maximum(tl.sqrt(tl.sum(grad_u * grad_u, axis=0)), 1e-8)
                 grad_u = grad_u * tl.minimum(1.0, max_grad_norm / gu_norm)
                 if weight_decay > 0.0:
@@ -1137,7 +1304,7 @@ if triton is not None:
                 acc += (-lr_markov_w1 * grad_u).to(tl.float64)
             k += 1
 
-        new_f = acc.to(cur.dtype).to(tl.float32)
+        new_f = acc.to(tl.float32)
         if HAS_ANCHOR:
             anc = tl.load(
                 w1_anchor_ptr + cid * anchor_stride_r + offs_r, mask=m_r, other=0.0
@@ -1150,7 +1317,13 @@ if triton is not None:
             limit = max_row_drift * anc_norm
             disp = disp * tl.minimum(1.0, limit / disp_norm)
             new_f = anc + disp
-        tl.store(w1_ptr + cid * w1_stride_r + offs_r, new_f.to(cur.dtype), mask=m_r)
+        if HAS_FP32_MASTER:
+            tl.store(
+                w1_fp32_ptr + cid * w1_fp32_stride_r + offs_r, new_f, mask=m_r
+            )
+        tl.store(
+            w1_ptr + cid * w1_stride_r + offs_r, new_f.to(cur_bf.dtype), mask=m_r
+        )
 
 class VocabRows:
     """This rank's partial rows of a vocabulary table for global token ids.
@@ -1305,7 +1478,12 @@ class OnlineDSparkHeadAdapter:
         calibrator: OnlineConfidenceCalibrator | None = None,
         max_row_drift: float = 0.0,
         anchor_decay: float = 0.0,
+        loss_mode: str = "e2e_tv",
+        target_peak_prob: float = 0.72,
+        w2_mean_hat: torch.Tensor | None = None,
     ) -> None:
+        if loss_mode not in ("e2e_tv", "residual_orth_ce"):
+            raise ValueError(f"Unsupported loss_mode: {loss_mode!r}")
         self.markov_w1 = markov_w1
         self.markov_w2 = markov_w2
         self.confidence_head = confidence_head
@@ -1336,8 +1514,18 @@ class OnlineDSparkHeadAdapter:
         self.calibrator = calibrator
         self.max_row_drift = float(max_row_drift)
         self.anchor_decay = float(anchor_decay)
+        self.loss_mode = str(loss_mode)
+        self.target_peak_prob = float(target_peak_prob)
+        self.w2_mean_hat: torch.Tensor | None = w2_mean_hat
         self.step_count: int = 0
         self.last_metrics: dict[str, float] = {}
+        # FP32 master copy prevents BF16 half-ULP rounding from dropping
+        # sub-ULP updates; ``w1_weight`` stays synced for CUDA graphs.
+        self.w1_fp32: torch.Tensor = (
+            self.w1_weight
+            if self.w1_weight.dtype == torch.float32
+            else self.w1_weight.detach().float().clone()
+        )
         # Loaded weights: the drift bound's anchor and what ``reset`` restores.
         self.w1_anchor: torch.Tensor | None = (
             self.w1_weight.detach().clone() if self.max_row_drift > 0.0 else None
@@ -1377,6 +1565,8 @@ class OnlineDSparkHeadAdapter:
         """Restore the loaded W1 and confidence head (W1 needs ``max_row_drift``)."""
         if self.w1_anchor is not None:
             self.w1_weight.copy_(self.w1_anchor)
+            if self.w1_fp32 is not self.w1_weight:
+                self.w1_fp32.copy_(self.w1_anchor.float())
         conf = self.conf_weight
         if conf is not None and self.conf_anchor is not None:
             conf.copy_(self.conf_anchor)
@@ -1491,21 +1681,43 @@ class OnlineDSparkHeadAdapter:
         return draft_candidate_logits, conf_logits, conf_probs
 
     @torch.no_grad()
-    def _bound_w1_rows(self, sorted_ids: torch.Tensor) -> None:
-        """Pull the touched W1 rows toward the loaded table and bound their
-        displacement (every duplicate writes the same value)."""
-        if self.w1_anchor is None or sorted_ids.numel() == 0:
+    def _bound_w1_rows(
+        self,
+        sorted_ids: torch.Tensor,
+        *,
+        active_mask: torch.Tensor | None = None,
+    ) -> None:
+        """Pull the touched W1 rows toward the loaded table, bound their
+        displacement in FP32, and flush to BF16 (every duplicate writes the
+        same value)."""
+        if sorted_ids.numel() == 0:
             return
         w1 = self.w1_weight
-        rows = w1[sorted_ids].float()
-        anchor = self.w1_anchor[sorted_ids].float()
-        disp = rows - anchor
-        if self.anchor_decay > 0.0:
-            disp = disp * (1.0 - self.anchor_decay)
-        limit = self.max_row_drift * anchor.norm(dim=-1, keepdim=True).clamp_min(1e-6)
-        norm = disp.norm(dim=-1, keepdim=True)
-        disp = disp * torch.clamp(limit / norm.clamp_min(1e-12), max=1.0)
-        w1.index_copy_(0, sorted_ids, (anchor + disp).to(dtype=w1.dtype))
+        master = self.w1_fp32
+        if self.w1_anchor is not None:
+            orig_rows = master[sorted_ids].float()
+            anchor = self.w1_anchor[sorted_ids].float()
+            disp = orig_rows - anchor
+            if self.anchor_decay > 0.0:
+                if active_mask is None:
+                    disp = disp * (1.0 - self.anchor_decay)
+                else:
+                    decay = torch.where(
+                        active_mask.unsqueeze(-1), 1.0 - self.anchor_decay, 1.0
+                    )
+                    disp = disp * decay
+            limit = self.max_row_drift * anchor.norm(dim=-1, keepdim=True).clamp_min(1e-6)
+            norm = disp.norm(dim=-1, keepdim=True)
+            disp = disp * torch.clamp(limit / norm.clamp_min(1e-12), max=1.0)
+            bounded = anchor + disp
+            rows = (
+                torch.where(active_mask.unsqueeze(-1), bounded, orig_rows)
+                if active_mask is not None
+                else bounded
+            )
+            master.index_copy_(0, sorted_ids, rows.to(dtype=master.dtype))
+        if master is not w1:
+            w1.index_copy_(0, sorted_ids, master[sorted_ids].to(dtype=w1.dtype))
 
     @torch.no_grad()
     def step_on_candidates(
@@ -1585,68 +1797,107 @@ class OnlineDSparkHeadAdapter:
             feat = torch.cat([hidden_f, m_for_forward], dim=-1)
             conf_logits = _rowwise_dot(feat, conf_w.float().view(-1))
 
-        loss_res = compute_e2e_tv_and_bce_loss(
-            draft_logits,
-            target_candidate_probs,
-            confidence_logits=conf_logits,
-            valid_mask=valid_mask,
-            bce_weight=self.bce_weight,
-        )
+        need_loss = return_metrics or want_conf or self.loss_mode == "e2e_tv"
+        loss_res: E2ETVAndBCEResult | None = None
+        if need_loss:
+            loss_res = compute_e2e_tv_and_bce_loss(
+                draft_logits,
+                target_candidate_probs,
+                confidence_logits=conf_logits,
+                valid_mask=valid_mask,
+                bce_weight=self.bce_weight,
+            )
 
-        # dL/dd_{b,i} = (1 / N) * sum_{j >= i} prod_{m <= j, m != i} alpha_{b,m}.
-        alpha = loss_res.token_overlap
         if valid_mask is not None:
             mask_b = valid_mask.bool()
-            mask_f = mask_b.to(dtype=alpha.dtype)
-            eff_alpha = torch.where(mask_b, alpha, torch.ones_like(alpha))
+            mask_f = mask_b.to(dtype=torch.float32)
             denom = mask_f.sum().clamp_min(1.0)
         else:
-            mask_f = torch.ones_like(alpha)
-            eff_alpha = alpha
+            mask_b = None
+            mask_f = torch.ones((bsz, steps), dtype=torch.float32, device=w1.device)
             denom = float(bsz * steps)
 
-        idx = torch.arange(steps, device=alpha.device)
-        cond_m = (idx.view(1, 1, -1) <= idx.view(1, -1, 1)) & (
-            idx.view(1, 1, -1) != idx.view(-1, 1, 1)
-        )
-        factors = torch.where(
-            cond_m.unsqueeze(0),
-            eff_alpha[:, None, None, :],
-            torch.ones((1, 1, 1, 1), dtype=alpha.dtype, device=alpha.device),
-        )
-        prod_ij = factors.prod(dim=-1)
-        upper_mask = (idx.view(-1, 1) <= idx.view(1, -1)).to(dtype=alpha.dtype)
-        omega = (prod_ij * upper_mask.unsqueeze(0) * mask_f.unsqueeze(1)).sum(
-            dim=-1
-        ) * mask_f
-
-        # dd_{b,i}/dq_{b,i}(v) = 0.5 * sign(q - p), through the softmax.
-        q_probs = F.softmax(draft_logits, dim=-1)
-        p_probs = target_candidate_probs.float().clamp_min(0.0)
-        sign_qp = 0.5 * torch.sign(q_probs - p_probs)
-        expected_sign = (q_probs * sign_qp).sum(dim=-1, keepdim=True)
-        d_dist_d_logit = q_probs * (sign_qp - expected_sign)
-
-        if self.precondition_by_row_norm:
-            eff_omega = torch.maximum(omega, 0.65 * mask_f)
-            step_grad_logits = eff_omega.unsqueeze(-1) * d_dist_d_logit
-            w2_row_energy = (
-                (w2_f * w2_f).sum(dim=-1).mean(dim=-1, keepdim=True).clamp_min(1e-3)
-            )
-            u_energy = (
-                (m_for_forward * m_for_forward)
-                .sum(dim=-1, keepdim=True)
-                .unsqueeze(-1)
-                .clamp_min(0.05)
-            )
-            grad_m = (step_grad_logits.unsqueeze(-1) * w2_f).sum(dim=2) / w2_row_energy
-            grad_w2 = (
-                step_grad_logits.unsqueeze(-1) * m_for_forward.unsqueeze(2)
-            ) / u_energy
+        if self.loss_mode == "residual_orth_ce" and self.precondition_by_row_norm and topk >= 2:
+            lmax = draft_logits.amax(dim=-1, keepdim=True)
+            exps = torch.exp(draft_logits - lmax)
+            q_probs = exps * (1.0 / exps.sum(dim=-1, keepdim=True))
+            g0 = torch.clamp(q_probs[..., 0] - self.target_peak_prob, max=-0.02)
+            w2_0 = w2_f[:, :, 0, :]
+            w2_1 = w2_f[:, :, 1, :]
+            if self.w2_mean_hat is not None:
+                mu_hat = self.w2_mean_hat.to(device=w2_f.device, dtype=torch.float32)
+                w0r = w2_0 - (w2_0 * mu_hat).sum(dim=-1, keepdim=True) * mu_hat
+                w1r = w2_1 - (w2_1 * mu_hat).sum(dim=-1, keepdim=True) * mu_hat
+                if topk >= 3:
+                    w2_2 = w2_f[:, :, 2, :]
+                    w2r = w2_2 - (w2_2 * mu_hat).sum(dim=-1, keepdim=True) * mu_hat
+                else:
+                    w2r = torch.zeros_like(w2_0)
+            else:
+                w0r = w2_0
+                w1r = w2_1
+                w2r = w2_f[:, :, 2, :] if topk >= 3 else torch.zeros_like(w2_0)
+            n1 = torch.sqrt((w1r * w1r).sum(dim=-1, keepdim=True))
+            u1 = torch.where(n1 > 1e-6, w1r / n1.clamp_min(1e-6), torch.zeros_like(w1r))
+            w0o = w0r - (w0r * u1).sum(dim=-1, keepdim=True) * u1
+            w2p = w2r - (w2r * u1).sum(dim=-1, keepdim=True) * u1
+            n2 = torch.sqrt((w2p * w2p).sum(dim=-1, keepdim=True))
+            u2 = torch.where(n2 > 1e-4, w2p / n2.clamp_min(1e-4), torch.zeros_like(w2p))
+            w0o = w0o - (w0o * u2).sum(dim=-1, keepdim=True) * u2
+            w2_energy = (w0o * w0o).sum(dim=-1, keepdim=True).clamp_min(1e-3)
+            grad_m = (g0.unsqueeze(-1) * w0o) / w2_energy
+            grad_w2 = torch.zeros_like(w2_f)
         else:
-            grad_logits = (omega / denom).unsqueeze(-1) * d_dist_d_logit
-            grad_m = (grad_logits.unsqueeze(-1) * w2_f).sum(dim=2)
-            grad_w2 = grad_logits.unsqueeze(-1) * m_for_forward.unsqueeze(2)
+            assert loss_res is not None
+            # dL/dd_{b,i} = (1 / N) * sum_{j >= i} prod_{m <= j, m != i} alpha_{b,m}.
+            alpha = loss_res.token_overlap
+            eff_alpha = (
+                torch.where(mask_b, alpha, torch.ones_like(alpha))
+                if mask_b is not None
+                else alpha
+            )
+            idx = torch.arange(steps, device=alpha.device)
+            cond_m = (idx.view(1, 1, -1) <= idx.view(1, -1, 1)) & (
+                idx.view(1, 1, -1) != idx.view(-1, 1, 1)
+            )
+            factors = torch.where(
+                cond_m.unsqueeze(0),
+                eff_alpha[:, None, None, :],
+                torch.ones((1, 1, 1, 1), dtype=alpha.dtype, device=alpha.device),
+            )
+            prod_ij = factors.prod(dim=-1)
+            upper_mask = (idx.view(-1, 1) <= idx.view(1, -1)).to(dtype=alpha.dtype)
+            omega = (prod_ij * upper_mask.unsqueeze(0) * mask_f.unsqueeze(1)).sum(
+                dim=-1
+            ) * mask_f
+
+            # dd_{b,i}/dq_{b,i}(v) = 0.5 * sign(q - p), through the softmax.
+            q_probs = F.softmax(draft_logits, dim=-1)
+            p_probs = target_candidate_probs.float().clamp_min(0.0)
+            sign_qp = 0.5 * torch.sign(q_probs - p_probs)
+            expected_sign = (q_probs * sign_qp).sum(dim=-1, keepdim=True)
+            d_dist_d_logit = q_probs * (sign_qp - expected_sign)
+
+            if self.precondition_by_row_norm:
+                eff_omega = torch.maximum(omega, 0.65 * mask_f)
+                step_grad_logits = eff_omega.unsqueeze(-1) * d_dist_d_logit
+                w2_row_energy = (
+                    (w2_f * w2_f).sum(dim=-1).mean(dim=-1, keepdim=True).clamp_min(1e-3)
+                )
+                u_energy = (
+                    (m_for_forward * m_for_forward)
+                    .sum(dim=-1, keepdim=True)
+                    .unsqueeze(-1)
+                    .clamp_min(0.05)
+                )
+                grad_m = (step_grad_logits.unsqueeze(-1) * w2_f).sum(dim=2) / w2_row_energy
+                grad_w2 = (
+                    step_grad_logits.unsqueeze(-1) * m_for_forward.unsqueeze(2)
+                ) / u_energy
+            else:
+                grad_logits = (omega / denom).unsqueeze(-1) * d_dist_d_logit
+                grad_m = (grad_logits.unsqueeze(-1) * w2_f).sum(dim=2)
+                grad_w2 = grad_logits.unsqueeze(-1) * m_for_forward.unsqueeze(2)
 
         # Only observed positions move anything.
         grad_m = grad_m * mask_f.unsqueeze(-1)
@@ -1658,8 +1909,15 @@ class OnlineDSparkHeadAdapter:
 
         flat_cond_ids = conditioning_token_ids.reshape(-1)
         flat_delta_u = (-self.lr_markov_w1 * grad_u).reshape(-1, grad_u.shape[-1])
-        sorted_ids = _deterministic_index_add_(w1, flat_cond_ids, flat_delta_u)
-        self._bound_w1_rows(sorted_ids)
+        sorted_ids = _deterministic_index_add_(self.w1_fp32, flat_cond_ids, flat_delta_u)
+        active_rows = None
+        if mask_b is not None:
+            mask_flat = mask_b.reshape(-1)
+            active_rows = (
+                (flat_cond_ids.to(torch.int64).unsqueeze(0) == sorted_ids.unsqueeze(1))
+                & mask_flat.unsqueeze(0)
+            ).any(dim=1)
+        self._bound_w1_rows(sorted_ids, active_mask=active_rows)
 
         proj_w = self.hidden_proj_weight
         if (
@@ -1702,8 +1960,9 @@ class OnlineDSparkHeadAdapter:
 
         # Confidence head: BCE gradient against the detached overlap.
         if conf_w is not None and conf_logits is not None and feat is not None:
+            assert loss_res is not None
             conf_probs_raw = torch.sigmoid(conf_logits)
-            detached_overlap = alpha.detach()
+            detached_overlap = loss_res.token_overlap.detach()
             grad_conf_logit = (
                 (conf_probs_raw - detached_overlap) * mask_f / denom
             ) * self.bce_weight
@@ -1818,7 +2077,7 @@ class OnlineDSparkHeadAdapter:
             [torch.Tensor], tuple[torch.Tensor, torch.Tensor]
         ]
         | None = None,
-        target_peak_prob: float = 0.92,
+        target_peak_prob: float | None = None,
         excluded_teacher_mass: float = 0.03,
         return_metrics: bool = True,
     ) -> dict[str, float]:
@@ -1855,10 +2114,15 @@ class OnlineDSparkHeadAdapter:
             base_candidate_logits = torch.zeros(
                 (bsz, steps, 3), dtype=torch.float32, device=device
             )
+        peak_prob = (
+            self.target_peak_prob
+            if target_peak_prob is None and self.loss_mode == "residual_orth_ce"
+            else (0.92 if target_peak_prob is None else target_peak_prob)
+        )
         target_probs = self.verified_target_probs(
             (bsz, steps),
             device,
-            target_peak_prob=target_peak_prob,
+            target_peak_prob=peak_prob,
             excluded_teacher_mass=excluded_teacher_mass,
         )
         return self.step_on_candidates(
@@ -1938,7 +2202,10 @@ class DSparkOnlineAdaptation:
         tp_rank: int = 0,
         norm_weight: torch.Tensor | None = None,
         norm_eps: float = 1e-6,
-        lr_markov_w1: float = 0.08,
+        lr_markov_w1: float = 0.50,
+        anchor_decay: float = 0.005,
+        target_peak_prob: float = 0.72,
+        loss_mode: str = "residual_orth_ce",
         lr_confidence: float = 0.0,
         bce_weight: float = 0.0,
         logger: Any = None,
@@ -1954,6 +2221,9 @@ class DSparkOnlineAdaptation:
             bce_weight=bce_weight,
             update_w2=update_w2,
             max_row_drift=max_row_drift,
+            anchor_decay=anchor_decay,
+            loss_mode=loss_mode,
+            target_peak_prob=target_peak_prob,
         )
         self.w2_rows = VocabRows(markov_w2)
         self.lm_rows = VocabRows(lm_head)
@@ -2023,8 +2293,96 @@ class DSparkOnlineAdaptation:
             self._w2_ab = (self._w2_oe - self._w2_os) + int(getattr(w2_s, "num_org_vocab_padding", 0))
         else:
             self._w2_os = self._w2_oe = self._w2_as = self._w2_ae = self._w2_ab = 0
+        self._w2_exp_base = int(self.w2_rows.table.packed_bf16_exponent_base) if self.w2_rows.packed else 0
+        self._w2_mean_hat: torch.Tensor | None = None
         self._armed = False
         self.updates = 0
+
+    def _ensure_w2_mean_hat(self) -> torch.Tensor:
+        """Compute the unit mean vector of Markov W2 across the full vocabulary
+        once, deterministically in fixed-point integer limbs across TP ranks."""
+        if self._w2_mean_hat is not None:
+            return self._w2_mean_hat
+        rank = int(self.heads.w1_weight.shape[1])
+        vocab_size = self.vocab_size
+        device = self.device
+        q_acc = torch.zeros(rank, dtype=torch.int64, device=device)
+        chunk = 16384
+        if triton is not None and device.type == "cuda":
+            w2_packed = self.w2_rows.packed
+            w2_w = self.w2_rows.weight
+            if w2_packed:
+                w2_exc = self.w2_rows.table.weight_exception_entries
+                w2_off = self.w2_rows.table.weight_row_offsets
+            else:
+                w2_exc = self._dummy_i32
+                w2_off = self._dummy_i32
+                if w2_w.ndim != 2:
+                    w2_w = w2_w.reshape(w2_w.shape[0], -1)
+            buf = torch.empty(
+                (min(chunk, vocab_size), rank), dtype=torch.float32, device=device
+            )
+            for start in range(0, vocab_size, chunk):
+                n = min(chunk, vocab_size - start)
+                _decode_w2_range_kernel[(n,)](
+                    start,
+                    n,
+                    w2_w,
+                    w2_w.stride(0),
+                    w2_exc,
+                    w2_off,
+                    buf,
+                    buf.stride(0),
+                    W2_PACKED=w2_packed,
+                    W2_EXP_BASE=self._w2_exp_base,
+                    W2_SHARDED=self._w2_sharded,
+                    w2_org_start=self._w2_os,
+                    w2_org_end=self._w2_oe,
+                    w2_added_start=self._w2_as,
+                    w2_added_end=self._w2_ae,
+                    w2_added_base=self._w2_ab,
+                    rank=rank,
+                    BLOCK_R=self._block_r,
+                )
+                q_acc.add_(
+                    torch.round(buf[:n].double() * 65536.0)
+                    .to(torch.int64)
+                    .sum(dim=0)
+                )
+        else:
+            for start in range(0, vocab_size, chunk):
+                end = min(start + chunk, vocab_size)
+                ids = torch.arange(start, end, dtype=torch.int64, device=device)
+                rows = self.w2_rows.local(ids).double()
+                q_acc.add_(torch.round(rows * 65536.0).to(torch.int64).sum(dim=0))
+
+        if self.all_reduce is not None:
+            # Three exact base-65536 limbs in an 8-row FP32 tensor so TP=1 and
+            # TP=N reconstruct identical int64 sums without collective precision loss.
+            q0 = torch.remainder(q_acc, 65536)
+            q_div1 = torch.div(q_acc - q0, 65536, rounding_mode="floor")
+            q1 = torch.remainder(q_div1, 65536)
+            q2 = torch.div(q_div1 - q1, 65536, rounding_mode="floor")
+            limbs = torch.zeros((8, rank), dtype=torch.float32, device=device)
+            limbs[0] = q0.to(torch.float32)
+            limbs[1] = q1.to(torch.float32)
+            limbs[2] = q2.to(torch.float32)
+            limbs = self.all_reduce(limbs)
+            q_acc = (
+                limbs[0].round().to(torch.int64)
+                + limbs[1].round().to(torch.int64) * 65536
+                + limbs[2].round().to(torch.int64) * (65536 * 65536)
+            )
+
+        mu = q_acc.double() / (65536.0 * float(max(1, vocab_size)))
+        norm = float(mu.norm().item())
+        if norm > 1e-8:
+            mu_hat = (mu / norm).to(torch.float32)
+        else:
+            mu_hat = torch.zeros(rank, dtype=torch.float32, device=device)
+        self._w2_mean_hat = mu_hat
+        self.heads.w2_mean_hat = mu_hat
+        return mu_hat
 
     # -- draft side (captured) ------------------------------------------------
 
@@ -2104,7 +2462,6 @@ class DSparkOnlineAdaptation:
             and self.device.type == "cuda"
             and num_reqs <= self.max_num_reqs
             and self.norm_weight is not None
-            and not self.w2_rows.packed
             and self.heads.hidden_to_markov_proj is None
             and self.heads.latent_noise_std == 0.0
             and not self.heads.update_w2
@@ -2144,7 +2501,16 @@ class DSparkOnlineAdaptation:
             if lm_w.ndim != 2:
                 lm_w = lm_w.reshape(lm_w.shape[0], -1)
 
+        w2_packed = self.w2_rows.packed
         w2_w = self.w2_rows.weight
+        if w2_packed:
+            w2_exc = self.w2_rows.table.weight_exception_entries
+            w2_off = self.w2_rows.table.weight_row_offsets
+        else:
+            w2_exc = self._dummy_i32
+            w2_off = self._dummy_i32
+            if w2_w.ndim != 2:
+                w2_w = w2_w.reshape(w2_w.shape[0], -1)
         rank = int(self.heads.w1_weight.shape[1])
         _prepare_and_pack_miss_kernel[(padded,)](
             idx_mapping,
@@ -2170,6 +2536,8 @@ class DSparkOnlineAdaptation:
             lm_off,
             w2_w,
             w2_w.stride(0),
+            w2_exc,
+            w2_off,
             miss_mask,
             cond_ids,
             packed,
@@ -2194,6 +2562,8 @@ class DSparkOnlineAdaptation:
             lm_added_start=self._lm_as,
             lm_added_end=self._lm_ae,
             lm_added_base=self._lm_ab,
+            W2_PACKED=w2_packed,
+            W2_EXP_BASE=self._w2_exp_base,
             W2_SHARDED=self._w2_sharded,
             w2_org_start=self._w2_os,
             w2_org_end=self._w2_oe,
@@ -2209,9 +2579,13 @@ class DSparkOnlineAdaptation:
             packed = self.all_reduce(packed)
 
         w1 = self.heads.w1_weight
+        w1_fp32 = self.heads.w1_fp32
         anchor = self.heads.w1_anchor
+        mu_hat = self.heads.w2_mean_hat
         has_cap = self.soft_cap is not None
         soft_cap_val = float(self.soft_cap) if has_cap else 1.0
+        use_res_orth = self.heads.loss_mode == "residual_orth_ce"
+        peak_prob = self.heads.target_peak_prob if use_res_orth else 0.92
         _miss_update_w1_kernel[(num_reqs,)](
             miss_mask,
             cond_ids,
@@ -2219,12 +2593,15 @@ class DSparkOnlineAdaptation:
             packed.stride(0),
             w1,
             w1.stride(0),
+            w1_fp32,
+            w1_fp32.stride(0),
             anchor if anchor is not None else w1,
             anchor.stride(0) if anchor is not None else w1.stride(0),
+            mu_hat if mu_hat is not None else w1_fp32,
             num_reqs,
             self.logits_scale,
             soft_cap_val,
-            0.92,
+            peak_prob,
             0.025,
             self.heads.max_grad_norm,
             self.heads.weight_decay,
@@ -2233,6 +2610,9 @@ class DSparkOnlineAdaptation:
             self.heads.max_row_drift,
             HAS_SOFT_CAP=has_cap,
             HAS_ANCHOR=anchor is not None,
+            USE_RESIDUAL_ORTH=use_res_orth,
+            HAS_MU_HAT=mu_hat is not None,
+            HAS_FP32_MASTER=w1_fp32 is not w1,
             rank=rank,
             BLOCK_R=self._block_r,
         )
@@ -2261,6 +2641,8 @@ class DSparkOnlineAdaptation:
         num_reqs = int(idx_mapping.shape[0])
         if num_reqs == 0:
             return
+        if self.heads.loss_mode == "residual_orth_ce" and self._w2_mean_hat is None:
+            self._ensure_w2_mean_hat()
         if self._can_use_triton_fast_path(num_reqs):
             self._observe_cuda_triton(
                 num_reqs,
