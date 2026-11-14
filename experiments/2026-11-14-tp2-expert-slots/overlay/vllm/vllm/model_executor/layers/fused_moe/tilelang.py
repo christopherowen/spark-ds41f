@@ -258,7 +258,7 @@ class TileLangExperts(mk.FusedMoEExpertsModular):
                     gate_weight=slot_cfg.get("gate_weight"),
                     hotlist_counts=slot_cfg.get("hotlist_counts"),
                     half_life_steps=float(slot_cfg.get("half_life_steps", 64.0)),
-                    prefill_protect_rows=int(slot_cfg.get("prefill_protect_rows", 16)),
+                    prefill_protect_rows=int(slot_cfg.get("prefill_protect_rows", 24)),
                     device=device,
                 )
             else:
@@ -286,7 +286,7 @@ class TileLangExperts(mk.FusedMoEExpertsModular):
                     gate_weight=slot_cfg.get("gate_weight"),
                     hotlist_counts=slot_cfg.get("hotlist_counts"),
                     half_life_steps=float(slot_cfg.get("half_life_steps", 64.0)),
-                    prefill_protect_rows=int(slot_cfg.get("prefill_protect_rows", 16)),
+                    prefill_protect_rows=int(slot_cfg.get("prefill_protect_rows", 24)),
                     device=w13.device,
                     checkpoint_key=str(slot_cfg.get("checkpoint_key", "")),
                     spot_check_seed=slot_cfg.get("spot_check_seed"),

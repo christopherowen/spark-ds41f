@@ -235,7 +235,7 @@ if TYPE_CHECKING:
     VLLM_DS41_EXPERT_DYNAMIC_SLOTS: int = 48
     VLLM_DS41_EXPERT_CACHE_DIR: str | None = None
     VLLM_DS41_EXPERT_HALF_LIFE: float = 64.0
-    VLLM_DS41_EXPERT_PREFILL_PROTECT_ROWS: int = 16
+    VLLM_DS41_EXPERT_PREFILL_PROTECT_ROWS: int = 24
     WEIGHTLESS_STEER_PATH: str | None = None
     WEIGHTLESS_STEER_MODEL: str | None = None
     VLLM_QWEN3_8_FLASH_NEXT_OVERLAP: bool = True
@@ -1960,7 +1960,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
         os.getenv("VLLM_DS41_EXPERT_HALF_LIFE", "64.0")
     ),
     "VLLM_DS41_EXPERT_PREFILL_PROTECT_ROWS": lambda: int(
-        os.getenv("VLLM_DS41_EXPERT_PREFILL_PROTECT_ROWS", "16")
+        os.getenv("VLLM_DS41_EXPERT_PREFILL_PROTECT_ROWS", "24")
     ),
     # DeepSeek V4.1 GLP steering (models/deepseek_v4_1/glp.py): the GLP file and
     # the served model name whose requests alone it steers (vllm/weightless.py),

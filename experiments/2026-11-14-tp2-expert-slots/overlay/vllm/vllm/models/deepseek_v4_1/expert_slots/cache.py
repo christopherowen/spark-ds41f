@@ -1201,7 +1201,7 @@ class RouterLookaheadPredictor:
         e_score_correction_bias: torch.Tensor | None = None,
         *,
         top_k: int = 6,
-        max_rows: int = 16,
+        max_rows: int = 24,
     ) -> None:
         self.gate_weight = gate_weight
         self.bias = e_score_correction_bias
@@ -1239,7 +1239,7 @@ class ExpertSlotCache:
         gate_weight: torch.Tensor | None = None,
         hotlist_counts: torch.Tensor | np.ndarray | Sequence[float] | None = None,
         half_life_steps: float = 64.0,
-        prefill_protect_rows: int = 16,
+        prefill_protect_rows: int = 24,
         device: torch.device | str | None = None,
         populate_on_init: bool = True,
         static_only_on_init: bool = False,
@@ -1801,6 +1801,14 @@ class ExpertSlotCache:
         rows = topk_ids_np.shape[0]
         if rows == 0:
             return []
+        uniq = np.unique(topk_ids_np)
+        if uniq.size > 0 and (uniq[0] < 0 or uniq[-1] >= self.num_experts):
+            uniq = uniq[(uniq >= 0) & (uniq < self.num_experts)]
+        if uniq.size == 0:
+            return [(0, rows, [])]
+        slots = self.lfu.expert_to_slot[uniq]
+        if int(np.count_nonzero((slots < 0) | (slots >= self.static_slots))) <= self.dynamic_slots:
+            return [(0, rows, uniq.tolist())]
         static_set = {
             int(self.lfu.slot_to_expert[s]) for s in range(self.static_slots)
         }
@@ -2180,7 +2188,7 @@ class ExpertDiskCache:
         gate_weight: torch.Tensor | None = None,
         hotlist_counts: torch.Tensor | np.ndarray | Sequence[float] | None = None,
         half_life_steps: float = 64.0,
-        prefill_protect_rows: int = 16,
+        prefill_protect_rows: int = 24,
         device: torch.device | str | None = None,
         checkpoint_key: str = "",
         spot_check_seed: int | None = None,
