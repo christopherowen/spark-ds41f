@@ -24,6 +24,7 @@ cold experts into layer L+1's dynamic slots before layer L's MoE GEMMs begin.
 from __future__ import annotations
 
 from collections.abc import Callable, Iterable, Sequence
+import ctypes
 from dataclasses import dataclass
 import errno
 import json
@@ -38,6 +39,7 @@ import shutil
 import struct
 import threading
 import time
+import weakref
 
 import numpy as np
 import torch
@@ -105,6 +107,75 @@ def as_cuda_zero_copy(
     return cuda_u8.view(host_tensor.dtype).view(host_tensor.shape)
 
 
+_CUDART_LOCK = threading.Lock()
+_CUDART_LIB: object | None = None
+_CUDART_PROBED = False
+
+
+def _get_cudart():
+    """Return a configured ``libcudart`` handle with ``cudaHostAlloc`` / ``cudaFreeHost``."""
+    global _CUDART_LIB, _CUDART_PROBED
+    if _CUDART_PROBED:
+        return _CUDART_LIB
+    with _CUDART_LOCK:
+        if _CUDART_PROBED:
+            return _CUDART_LIB
+        lib = None
+        for candidate in (
+            "libcudart.so",
+            "libcudart.so.13",
+            "libcudart.so.12",
+            "/usr/local/cuda/lib64/libcudart.so",
+        ):
+            try:
+                handle = ctypes.CDLL(candidate)
+                handle.cudaHostAlloc.argtypes = [
+                    ctypes.POINTER(ctypes.c_void_p),
+                    ctypes.c_size_t,
+                    ctypes.c_uint,
+                ]
+                handle.cudaHostAlloc.restype = ctypes.c_int
+                handle.cudaFreeHost.argtypes = [ctypes.c_void_p]
+                handle.cudaFreeHost.restype = ctypes.c_int
+                lib = handle
+                break
+            except (OSError, AttributeError):
+                continue
+        _CUDART_LIB = lib
+        _CUDART_PROBED = True
+        return lib
+
+
+class _CudaHostAllocation:
+    """Exact-size ``cudaHostAlloc`` buffer freed idempotently with ``cudaFreeHost``."""
+
+    def __init__(self, nbytes: int) -> None:
+        cudart = _get_cudart()
+        if cudart is None:
+            raise RuntimeError("libcudart is unavailable for cudaHostAlloc")
+        ptr = ctypes.c_void_p()
+        err = cudart.cudaHostAlloc(ctypes.byref(ptr), int(nbytes), 0)
+        if err != 0 or not ptr.value:
+            raise RuntimeError(
+                f"cudaHostAlloc({nbytes} bytes) failed with CUDA error {err}"
+            )
+        self._cudart = cudart
+        self._ptr: int = int(ptr.value)
+        self.nbytes = int(nbytes)
+
+    def free(self) -> None:
+        ptr = self._ptr
+        if ptr:
+            self._ptr = 0
+            try:
+                self._cudart.cudaFreeHost(ctypes.c_void_p(ptr))
+            except Exception:  # noqa: BLE001
+                pass
+
+    def __del__(self) -> None:
+        self.free()
+
+
 def alloc_pinned_aligned(
     shape: tuple[int, ...],
     dtype: torch.dtype = torch.uint8,
@@ -118,6 +189,28 @@ def alloc_pinned_aligned(
     for dim in shape:
         numel *= dim
     nbytes = numel * dtype.itemsize
+    cudart = _get_cudart() if torch.cuda.is_available() else None
+    if cudart is not None:
+        # Allocate exact-size pinned memory directly via cudaHostAlloc to bypass
+        # PyTorch CachingHostAllocator power-of-two size rounding.
+        target_device = torch.device("cuda" if device is None else device)
+        torch.cuda.init()
+        with torch.cuda.device(target_device):
+            alloc = _CudaHostAllocation(max(1, nbytes + align))
+        offset = (align - (alloc._ptr % align)) % align
+        aligned_nbytes = max(1, nbytes)
+        c_buf = (ctypes.c_uint8 * aligned_nbytes).from_address(alloc._ptr + offset)
+        np_arr = np.ctypeslib.as_array(c_buf)
+        raw = torch.from_numpy(np_arr)
+        raw_storage = raw.untyped_storage()
+        weakref.finalize(raw_storage, alloc.free)
+        host_u8 = raw[:nbytes]
+        host_tensor = host_u8.view(dtype).view(shape)
+        owner = (alloc, c_buf, np_arr, raw_storage)
+        cuda_tensor = as_cuda_zero_copy(host_tensor, device=target_device, owner=owner)
+        weakref.finalize(cuda_tensor.untyped_storage(), lambda _o=owner: None)
+        return host_tensor, cuda_tensor
+
     raw = torch.empty(nbytes + align, dtype=torch.uint8, pin_memory=True)
     ptr = raw.data_ptr()
     offset = (align - (ptr % align)) % align
@@ -1882,7 +1975,7 @@ class ExpertDiskCache:
                 threading.Event,
             ]
             | None
-        ] = queue.Queue(maxsize=2)
+        ] = queue.Queue(maxsize=1)
         self._lock = threading.Lock()
         self._thread: threading.Thread | None = None
         self._closed = False

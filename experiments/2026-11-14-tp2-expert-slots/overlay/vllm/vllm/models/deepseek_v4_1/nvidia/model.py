@@ -1672,6 +1672,17 @@ class DeepseekV41LLMForCausalLM(UpstreamDeepseekV41LLMForCausalLM):
         return hidden_states
 
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
+        if (
+            getattr(self.model, "_expert_disk_cache", None) is not None
+            and hasattr(self, "_direct_buddy_sponge")
+        ):
+            from vllm.model_executor.model_loader.direct_loader import (
+                release_weight_arena_sponge,
+            )
+
+            release_weight_arena_sponge(
+                self, torch.device("cuda", torch.cuda.current_device())
+            )
         loader = AutoWeightsLoader(self)
         # AutoWeightsLoader may revisit this child for another contiguous
         # prefix group. Finalize only in the root model's post-load hook.
