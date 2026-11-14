@@ -840,6 +840,7 @@ class GLPTest(unittest.TestCase):
     def test_glp27_spec_v3_overlay_arms_resolve(self):
         spark = load_spark()
         for arm in (
+            "config/cluster.json",
             "experiments/2026-10-31-glp-specv3-fold-steering/glp27-tp4.json",
             "experiments/2026-10-31-glp-specv3-fold-steering/glp27-tp3.json",
         ):
