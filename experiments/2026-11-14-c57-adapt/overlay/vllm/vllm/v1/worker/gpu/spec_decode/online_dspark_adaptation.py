@@ -114,9 +114,9 @@ def online_digest_interval() -> int:
 
 def online_max_row_drift() -> float:
     """Bound on a W1 row's displacement from its loaded value, as a fraction of
-    that row's norm (``VLLM_DSPARK_ONLINE_MAX_DRIFT``, default 1.0; 0 or less
+    that row's norm (``VLLM_DSPARK_ONLINE_MAX_DRIFT``, default 0.25; 0 or less
     turns the bound and the copy of the loaded table off)."""
-    return _env_float("VLLM_DSPARK_ONLINE_MAX_DRIFT", 1.0)
+    return _env_float("VLLM_DSPARK_ONLINE_MAX_DRIFT", 0.25)
 
 
 @dataclass
@@ -1257,7 +1257,8 @@ if triton is not None:
                 q2 = e2 * inv_s
 
                 if USE_RESIDUAL_ORTH:
-                    g0 = tl.minimum(-0.02, q0 - peak_prob)
+                    gap = l1 - l0
+                    near_miss = (gap > -0.25) & (gap <= 2.5)
                     if HAS_MU_HAT:
                         w0r = w2_0 - tl.sum(w2_0 * mu_hat, axis=0) * mu_hat
                         w1r = w2_1 - tl.sum(w2_1 * mu_hat, axis=0) * mu_hat
@@ -1266,15 +1267,17 @@ if triton is not None:
                         w0r = w2_0
                         w1r = w2_1
                         w2r = w2_2
-                    n1 = tl.sqrt(tl.sum(w1r * w1r, axis=0))
-                    u1 = tl.where(n1 > 1e-6, w1r / tl.maximum(n1, 1e-6), zero_r)
-                    w0o = w0r - tl.sum(w0r * u1, axis=0) * u1
-                    w2p = w2r - tl.sum(w2r * u1, axis=0) * u1
-                    n2 = tl.sqrt(tl.sum(w2p * w2p, axis=0))
-                    u2 = tl.where(n2 > 1e-4, w2p / tl.maximum(n2, 1e-4), zero_r)
-                    w0o = w0o - tl.sum(w0o * u2, axis=0) * u2
-                    w2_energy = tl.maximum(tl.sum(w0o * w0o, axis=0), 1e-3)
-                    grad_u = (g0 * w0o) / w2_energy
+                    dw = w0r - w1r
+                    n2 = tl.sqrt(tl.sum(w2r * w2r, axis=0))
+                    u2 = tl.where(n2 > 1e-4, w2r / tl.maximum(n2, 1e-4), zero_r)
+                    do = dw - tl.sum(dw * u2, axis=0) * u2
+                    do_energy = tl.maximum(tl.sum(do * do, axis=0), 1e-2)
+                    step_logit = tl.where(
+                        near_miss,
+                        tl.minimum(2.0, tl.maximum(0.25, gap + 0.35)),
+                        0.0,
+                    )
+                    grad_u = (-step_logit * do) / do_energy
                 else:
                     s0 = tl.where(
                         q0 > peak_prob, 0.5, tl.where(q0 < peak_prob, -0.5, 0.0)
@@ -1818,10 +1821,8 @@ class OnlineDSparkHeadAdapter:
             denom = float(bsz * steps)
 
         if self.loss_mode == "residual_orth_ce" and self.precondition_by_row_norm and topk >= 2:
-            lmax = draft_logits.amax(dim=-1, keepdim=True)
-            exps = torch.exp(draft_logits - lmax)
-            q_probs = exps * (1.0 / exps.sum(dim=-1, keepdim=True))
-            g0 = torch.clamp(q_probs[..., 0] - self.target_peak_prob, max=-0.02)
+            gap = draft_logits[..., 1] - draft_logits[..., 0]
+            near_miss = (gap > -0.25) & (gap <= 2.5)
             w2_0 = w2_f[:, :, 0, :]
             w2_1 = w2_f[:, :, 1, :]
             if self.w2_mean_hat is not None:
@@ -1837,15 +1838,17 @@ class OnlineDSparkHeadAdapter:
                 w0r = w2_0
                 w1r = w2_1
                 w2r = w2_f[:, :, 2, :] if topk >= 3 else torch.zeros_like(w2_0)
-            n1 = torch.sqrt((w1r * w1r).sum(dim=-1, keepdim=True))
-            u1 = torch.where(n1 > 1e-6, w1r / n1.clamp_min(1e-6), torch.zeros_like(w1r))
-            w0o = w0r - (w0r * u1).sum(dim=-1, keepdim=True) * u1
-            w2p = w2r - (w2r * u1).sum(dim=-1, keepdim=True) * u1
-            n2 = torch.sqrt((w2p * w2p).sum(dim=-1, keepdim=True))
-            u2 = torch.where(n2 > 1e-4, w2p / n2.clamp_min(1e-4), torch.zeros_like(w2p))
-            w0o = w0o - (w0o * u2).sum(dim=-1, keepdim=True) * u2
-            w2_energy = (w0o * w0o).sum(dim=-1, keepdim=True).clamp_min(1e-3)
-            grad_m = (g0.unsqueeze(-1) * w0o) / w2_energy
+            dw = w0r - w1r
+            n2 = torch.sqrt((w2r * w2r).sum(dim=-1, keepdim=True))
+            u2 = torch.where(n2 > 1e-4, w2r / n2.clamp_min(1e-4), torch.zeros_like(w2r))
+            do = dw - (dw * u2).sum(dim=-1, keepdim=True) * u2
+            do_energy = (do * do).sum(dim=-1, keepdim=True).clamp_min(1e-2)
+            step_logit = torch.where(
+                near_miss,
+                torch.clamp(gap + 0.35, min=0.25, max=2.0),
+                torch.zeros_like(gap),
+            )
+            grad_m = (-step_logit.unsqueeze(-1) * do) / do_energy
             grad_w2 = torch.zeros_like(w2_f)
         else:
             assert loss_res is not None
@@ -2197,13 +2200,13 @@ class DSparkOnlineAdaptation:
         soft_cap: float | None = None,
         all_reduce: Callable[[torch.Tensor], torch.Tensor] | None = None,
         update_w2: bool = False,
-        max_row_drift: float = 1.0,
+        max_row_drift: float = 0.25,
         digest_interval: int = 0,
         tp_rank: int = 0,
         norm_weight: torch.Tensor | None = None,
         norm_eps: float = 1e-6,
         lr_markov_w1: float = 0.50,
-        anchor_decay: float = 0.005,
+        anchor_decay: float = 0.02,
         target_peak_prob: float = 0.72,
         loss_mode: str = "residual_orth_ce",
         lr_confidence: float = 0.0,
