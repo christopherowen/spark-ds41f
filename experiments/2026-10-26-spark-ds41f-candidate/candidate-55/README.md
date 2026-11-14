@@ -730,3 +730,6 @@ Image `spark-ds41f:candidate-55`, ID `c7976f69` (`sp8`, `sp1..sp4`, `sp5..sp7`) 
    of the fifth/sixth build (`127.0`–`135.5 s`). `tp4-switched` warm boots took `135.5`–`143.5 s` (first boot
    `239.4 s`): `gate` boot 2 (`139.1 s`) and `c1-decisions` (`135.5`–`137.5 s`) were within `+5 s` of the sixth build
    (`133.3`–`134.4 s`), while `screen` boots (`139.9` and `143.5 s`) ran `+5.5 s` and `+9.1 s` longer.
+
+Build 9 receipts and screen references (`candidate-55-b9-*`) are recorded under
+[receipts/ninth-build/](receipts/ninth-build/) and [receipts/references/](receipts/references/).
