@@ -23,6 +23,12 @@ dc712a66f perf(dsv41): fuse DSpark confidence calibration and keep active num_re
   - `prefill 32,768 tok/s`: **`+2.84%` better** (`8,978.744 / 9,024.136 tok/s`, `±1.88%`, margin `2.16%`)
   - `prefill 262,144 tok/s`: **`+3.82%` better** (`9,147.307 / 9,116.495 tok/s`, `±0.49%`, margin `0.70%`)
   - `model` (128 prompts): `128/128` greedy identical (`KL = 0.000e+00`, perplexity `1.31888`)
+- **`tp3-switched` (`sp5..sp7`)**:
+  - `grid` decode geometric mean (15 shapes): **`-0.66%` better** (`±0.11%`, repeat `+0.20%`, margin `0.32%`)
+  - `c8` paired decode tok/s: **`+0.13%` same** (`±0.52%`, repeat `-0.13%`, margin `0.59%`; output `158.903 / 158.743 tok/s`, `+0.09% ±1.36%`)
+  - `prefill 32,768 tok/s`: **`+0.19%` repeat same** (`6,784.972 / 6,797.665 tok/s`, `±0.99%`)
+  - `prefill 262,144 tok/s`: **`-0.21%` repeat same** (`6,704.541 / 6,690.368 tok/s`, `±0.60%`)
+  - `model` (128 prompts): `128/128` greedy identical (`KL = 0.000e+00`, perplexity `1.31608`)
 
 ## Two-boot `gate` and 4-boot `c1-decisions`
 
@@ -32,3 +38,7 @@ dc712a66f perf(dsv41): fuse DSpark confidence calibration and keep active num_re
 - **`tp4-switched` (`sp1..sp4`)**:
   - `gate`: all 8 determinism/greedy runs `identical: true` (`0` token/logprob diffs across all 6 scenarios), matching `candidate-55` b9 hashes (`18d619615e...` / `d65686498e...`). Distinct streams: `c16` `269.72 / 268.37 tok/s`, `c8` `198.87 / 199.43 tok/s`, `c4` `154.51 / 154.49 tok/s`, `0` foreign requests.
   - `c1-decisions` (4 boots): `82.77 / 82.81 / 82.83 / 82.74 tok/s` (mean `82.79 tok/s`, `35.70 steps/s`, `0` failed).
+
+## Kernel release-tests (sp8)
+
+- **157 files (`chunk000`–`chunk015`, `2,861.4 s`)**: **`10,295 passed, 357 skipped, 0 failed`** (receipt: `experiments/2026-11-14-c57-stack/receipts/release-tests/verdict.json`).
