@@ -36,3 +36,9 @@ groups that never run a collective.
 
 `tp3-switched-classic-groups.json` sets `TORCH_DIST_USE_NCCL2=0` on the seventh build;
 `boot-b7-classic-groups-tp3-switched.json` boots it once.
+
+**With `TORCH_DIST_USE_NCCL2=0`** (one boot, sp5, rank 0): two `nccl-*` segments, `/dev/zero` mappings 432 MiB and 91
+threads, as on the sixth build; MemAvailable 6.49 GiB and 14.04 GiB outside torch's allocator. That recovers 0.90 of
+the 1.42 GiB. Of the 0.52 GiB left against the sixth build, 0.32 GiB is torch's allocator holding more than it has
+allocated (0.73 against 0.41 GiB) and 0.06 GiB the two pools' larger size in NCCL 2.32.3; the rest is not attributed.
+The setting is in candidate-55's shape profiles from here; it does nothing on a torch that lacks the variable.
