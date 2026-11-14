@@ -590,3 +590,36 @@ parent's resources; NCCL `0002` refuses that. It is the same default that cost `
 communicator. The ring's jobs run again with it as `…-b7-r2`. The ring's image was built on dgx4 from the same lock
 (the copy from sp8 did not complete), so its image ID is not sp8's.
 
+**Seventh build outcomes (2026-11-14; dead end, not promoted):**
+
+1. **Release tests: not met.** 172 failed, 10,123 passed (torch nightly bumped Triton from 3.7.1 to 3.9; all 172 failures compare TileLang sampling, top-k/top-p, and rejection kernels against vLLM's Triton kernels at signed zeros, infinities, NaN, and top-p threshold ties). In addition, the base image's prebuilt DeepGEMM extension fails to load with an undefined torch symbol, and no NIXL wheel is built for torch 2.16.
+2. **Every boot reaches ready: not met.** At `tp4-ring`, `-b7` failed in under a minute (`NCCL split failed: invalid usage`). At `tp3-switched`, `screen-b7` failed on boot 2 when `sp5` hit 4.968 GiB lowest `MemAvailable` and tripped the 5 GiB startup guard (5 of 6 boots reached ready across gate + screen). With `TORCH_DIST_USE_NCCL2=0` (`-b7-r2`), `tp3-switched` recovered the 8 extra NCCL communicators (0.90 of the +1.42 GiB head delta; [boot-memory](boot-memory/README.md)), leaving +0.52 GiB on the head (`5.866`–`6.075` GiB lowest boot `MemAvailable` on subsequent `-b7-r2` boots), and `screen-b7-r2` halted its `model` step at `sp5` (`MemAvailable 3.97 GiB` below the 4 GiB bench floor on boot 1).
+3. **Outputs: met.** At `tp4-ring` (`-b7-r2`, dgx4 image `03db3ec9`), 2 of 2 boots match candidate-54 (`18d61961`/`d6568649`, text `0a2dacdd`/`12fd8257`). At `tp4-switched` (`-b7`, sp8 image `71293710`), 2 of 2 boots match candidate-54 (`18d61961`/`d6568649`). At `tp3-switched` (`-b7`), 4 of 4 boots match candidate-54 (`5c22ce41`/`bce6092e`, text `26a739a9`/`12cfee9b`).
+4. **Serving: not met.** Against candidate-54's recorded screens:
+   - `tp4-ring` (`-b7-r2`): grid `-2.18%` (±0.14%, margin 0.30%, better), c16 paired decode `+0.38%` (±0.41%, same), Prefill 32,768 `+0.32%` (same), **Prefill 262,144 `-0.92%`** (8,755 and 8,790 tok/s, ±0.41%, repeat +0.40%, margin 0.62%, **worse**); c1 decisions agree across all 4 boots (59 of 59 requests, and 58 of 58 with candidate-54; `82.62`–`82.82` tok/s).
+   - `tp4-switched` (`-b7`): grid `-4.11%` (±0.18%, margin 0.35%, better), c16 paired decode `+1.58%` (±0.43%, better), Prefill 32,768 `-0.50%` (same), Prefill 262,144 `-0.30%` (8,700 and 8,750 tok/s, same); c1 decisions agree across all 4 boots (59 of 59 requests, and 57 of 57 with candidate-54; `82.26`–`82.61` tok/s).
+   - `tp3-switched` (`-b7-r2`, without the halted `model` step): `single-stream` c1 paired decode `+1.78%` / `+1.63%` (better); `sampled` c16 paired decode `+1.70%` / `+1.74%` (better), c8 `+0.07%` / `+1.03%` (same); `stall` against candidate-54: `stall-3` prefill 131,072 tok/s under decode `-2.09%` / `-1.96%` (**worse**, `4,768.9` and `4,775.3` vs `4,870.7` tok/s) and decode step p90 `+2.49%` / `+2.20%` (**worse**), `stall-6` p90 `+2.38%` / `+2.51%` (**worse**, boot 2 prefill `-1.86%`, **worse**), `stall-7` p90 `+2.46%` / `+2.82%` (**worse**).
+5. **Time to ready: met** where warm boots completed: `tp4-ring` `-b7-r2` `108.8`–`115.4` s (sixth build `115.5`–`116.5` s; first `-b7-r2` boot `103.8` s); `tp4-switched` `-b7` `131.9`–`139.0` s (sixth build `133.3`–`134.4` s); `tp3-switched` `-b7`/`-b7-r2` `123.8`–`129.4` s (fifth/sixth build `127.0`–`135.5` s).
+
+### Eighth build: sixth build's torch 2.13 and NCCL 2.30.7, vLLM `0808`, TP3 collective cap
+
+Reverts PyTorch (`2.13.0+cu130` base image) and NCCL (`2.30.7-1`, `eeacf1c6`) to the sixth build while keeping the CUDA
+`13.5.37` toolkit and patches, replaces vLLM `0808` with `0808-perf-dsv41-sink-indexer-candidate-score-reduction-un.patch`
+(`b210993fd700`, tree `7914f1f91e56`, sinking the 64-lane `s_frag` sum inside `if slot >= 0` in `_nsa_ScoreKernel` so
+`tp4-ring` 256K prefill recovers the CUDA 13.5 regression; `test_deepseek_v41_tilelang.py`: 65 passed, 1 skipped,
+1 xfailed in the sixth build's container), and sets `SPARKNET_ROCE_MAX_COLLECTIVE_BYTES=4194304` on TP3 configs
+(`tp3-switched.json`, `tp3.json`, `tp3-triangle-4k.json`, matching TP4's 4 MiB cap for `tp3-switched` `stall-3`
+prefill under decode). Specs' runs are named `<run>-b8`.
+
+Marks, declared before the build:
+
+1. **Release tests:** 0 failures (target 10,295 passed, 357 skipped).
+2. **Every boot reaches ready** at `tp4-ring`, `tp4-switched` and `tp3-switched`, with `sp5` lowest boot `MemAvailable`
+   restored to Builds 5 and 6 (~6.3–7.0 GiB).
+3. **Outputs:** `18d61961`/`d6568649` (text `0a2dacdd`/`12fd8257`) at `tp4-ring` and `tp4-switched`, and
+   `5c22ce41`/`bce6092e` (text `26a739a9`/`12cfee9b`) at `tp3-switched` on every boot.
+4. **Serving:** `tp4-ring` Prefill 262,144 and `tp3-switched` `stall-3` prefill under decode are not worse than
+   candidate-54 beyond the margin; grid, c16, single-stream and sampled gains are preserved; and `c1-decisions`
+   agrees on 4 of 4 boots at both TP4 testbeds and with candidate-54.
+5. **Time to ready** not longer than the sixth build's warm boots by more than 5 s.
+
