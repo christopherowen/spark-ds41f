@@ -579,3 +579,14 @@ Marks, declared before the testbed runs:
 4. **Serving:** at each testbed the screen's rows are not worse than the sixth build's two boots beyond the margin
    (the fifth build's at `tp3-switched`), and the c1 decisions agree on 4 of 4 boots at both TP4 testbeds.
 5. **Time to ready** not longer than the sixth build's warm boots by more than 5 s.
+
+**The seventh build did not boot at `tp4-ring`** (2026-11-14 04:27Z to 04:30Z; runs `candidate-55-gate-tp4-b7`,
+`…-screen-tp4-b7`, `…-c1-decisions-tp4-b7`, each failed in under a minute, deployment `2e46a5a8f`).
+`torch.distributed.new_group` raised `NCCL split failed: invalid usage`, NCCL's last error
+`SWITCHLESS_BIDIRECTIONAL needs 3 or 4 nodes, one rank per node, an even channel count >=2 and unshared resources`.
+torch 2.16's default process group makes each new group by splitting its parent's communicator, which shares the
+parent's resources; NCCL `0002` refuses that. It is the same default that cost `tp3-switched` its memory
+([boot-memory](boot-memory/README.md)), and `TORCH_DIST_USE_NCCL2=0` selects the classic group, which creates its own
+communicator. The ring's jobs run again with it as `…-b7-r2`. The ring's image was built on dgx4 from the same lock
+(the copy from sp8 did not complete), so its image ID is not sp8's.
+
