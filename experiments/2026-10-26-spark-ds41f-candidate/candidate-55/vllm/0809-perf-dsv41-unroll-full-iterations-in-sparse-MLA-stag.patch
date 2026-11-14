@@ -1,0 +1,126 @@
+From af368ff068b1199417526cfd932b9177f5df00bd Mon Sep 17 00:00:00 2001
+From: Christopher Owen <3221756+christopherowen@users.noreply.github.com>
+Date: Sat, 14 Nov 2026 10:13:21 +0000
+Subject: [PATCH 809/810] perf(dsv41): unroll full iterations in sparse MLA
+ staging copy
+
+Upstream base: local-inference-lab/vllm 19f2c20ed4d64ae22bd009ceacadd85e2a81e354
+with candidate-55's series applied through 0808.
+
+Rationale: In issue_stage_records, looping cdiv(BI * segments, threads) with
+per-iteration `if e < BI * segments:` leaves nvcc under CUDA 13.5 emitting
+per-iteration range branches across full iterations (~250-330 us regression at
+16,384 rows vs CUDA 13.0). Splitting into full_iters unpredicated iterations via
+issue_record_copy and a single tail step eliminates the inner-loop guard while
+preserving out-of-bounds tail safety when padding rows exist.
+
+Quality implications: None; outputs match the unpatched kernel and CUDA 13.0
+bit-identically (max_abs_diff=0) across idx_page_size=256 and 128 at 4,096 and
+16,384 rows.
+
+Tests: pytest -q -p tblib_stub tests/kernels/attention/test_deepseek_v41_tilelang.py
+(65 passed, 1 skipped, 1 xfailed in candidate-55-b8 container with sparse_mla.py
+mounted).
+
+Upstream status: local candidate-55 patch
+---
+ .../deepseek_v4_1/tilelang/sparse_mla.py      | 63 ++++++++++++++-----
+ 1 file changed, 47 insertions(+), 16 deletions(-)
+
+diff --git a/vllm/models/deepseek_v4_1/tilelang/sparse_mla.py b/vllm/models/deepseek_v4_1/tilelang/sparse_mla.py
+index 97d01798e..7aca6be4e 100644
+--- a/vllm/models/deepseek_v4_1/tilelang/sparse_mla.py
++++ b/vllm/models/deepseek_v4_1/tilelang/sparse_mla.py
+@@ -259,28 +259,57 @@ def sparse_mla_fwd_v41(
+                 ]
+ 
+     @T.macro
+-    def issue_stage_records(Records, record_bytes, page_size, staged, copy_slot):
++    def issue_record_copy(
++        Records, record_bytes, page_size, staged, segments, slot, e, valid
++    ):
++        """Issue one 16-byte cp.async record copy when valid is true."""
++        # Invalid slots zero-fill staged via cp.async src-size 0 semantics; tail
++        # out-of-range lanes target unused staging padding above row BI - 1.
++        T.ptx_cp_async(
++            T.access_ptr(staged[e // segments, e % segments * 16], "w", 16),
++            T.access_ptr(
++                Records[
++                    T.max(slot, 0) // page_size,
++                    T.max(slot, 0) % page_size * record_bytes
++                    + e % segments * 16,
++                ],
++                "r",
++                16,
++            ),
++            16,
++            valid,
++        )
++
++    @T.macro
++    def issue_stage_records(
++        Records, record_bytes, page_size, staged, alloc_rows, copy_slot
++    ):
+         # cp.async each record into its exact-stride staging row, 16 bytes per
+         # copy; masked entries are zero-filled, so they dequantize to zero.
+         segments = record_bytes // 16
++        total_elems = BI * segments
++        full_iters = total_elems // threads
+         tx = T.get_thread_binding()
+-        for k in T.unroll(tilelang.cdiv(BI * segments, threads)):
++        for k in T.unroll(full_iters):
++            e = k * threads + tx
++            issue_record_copy(
++                Records, record_bytes, page_size, staged, segments,
++                copy_slot[k], e, copy_slot[k] >= 0,
++            )
++        if total_elems % threads != 0:
++            k = full_iters
+             e = k * threads + tx
+-            if e < BI * segments:
+-                T.ptx_cp_async(
+-                    T.access_ptr(staged[e // segments, e % segments * 16], "w", 16),
+-                    T.access_ptr(
+-                        Records[
+-                            T.max(copy_slot[k], 0) // page_size,
+-                            T.max(copy_slot[k], 0) % page_size * record_bytes
+-                            + e % segments * 16,
+-                        ],
+-                        "r",
+-                        16,
+-                    ),
+-                    16,
+-                    copy_slot[k] >= 0,
++            if tilelang.cdiv(total_elems, threads) * threads <= alloc_rows * segments:
++                issue_record_copy(
++                    Records, record_bytes, page_size, staged, segments,
++                    copy_slot[k], e, (e < total_elems) & (copy_slot[k] >= 0),
+                 )
++            else:
++                if e < total_elems:
++                    issue_record_copy(
++                        Records, record_bytes, page_size, staged, segments,
++                        copy_slot[k], e, copy_slot[k] >= 0,
++                    )
+         T.ptx_commit_group()
+ 
+     @T.macro
+@@ -295,6 +324,7 @@ def sparse_mla_fwd_v41(
+                 SWA_RECORD_BYTES,
+                 swa_page_size,
+                 staged_swa,
++                swa_rows,
+                 copy_slot,
+             )
+         else:
+@@ -303,6 +333,7 @@ def sparse_mla_fwd_v41(
+                 IDX_RECORD_BYTES,
+                 idx_page_size,
+                 staged_idx,
++                idx_rows,
+                 copy_slot,
+             )
+ 
+-- 
+2.43.0
+
