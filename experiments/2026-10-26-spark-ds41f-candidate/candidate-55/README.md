@@ -679,3 +679,54 @@ Specs' runs are named `<run>-b9`. Marks, declared before the build:
    candidate-54 beyond the margin; grid, c16, single-stream and sampled gains hold; and `c1-decisions` agrees on
    4 of 4 boots at both TP4 testbeds and with candidate-54.
 5. **Time to ready** not longer than the sixth build's warm boots by more than 5 s.
+
+**Ninth build outcomes (2026-11-14):**
+
+Image `spark-ds41f:candidate-55`, ID `c7976f69` (`sp8`, `sp1..sp4`, `sp5..sp7`) and `a8fbd559` (`dgx1..dgx4`), `patch_head`
+`44db6a403230`, tree `49493238c2ff`. Release tests receipt: [receipts/release-tests-c7976f69](receipts/release-tests-c7976f69).
+
+1. **Release tests: met.** `10,295 passed, 357 skipped`, 0 failed on `sp8` (`3,060.8 s`; 157 files, `2,868 s` of tests).
+2. **Every boot reaches ready: met.** All 28 boots across `tp4-ring` (8: 2 gate, 2 screen, 4 c1-decisions),
+   `tp4-switched` (8: 2 gate, 2 screen, 4 c1-decisions), and `tp3-switched` (12: 4 gate, 8 screen) reached ready with
+   zero startup memory guard trips and `swap_growth_gib: 0.0` across all screen boots (`dgx1` lowest boot
+   `MemAvailable` `23.150–23.158 GiB`, benchmark `min_available_gib` `21.76` and `21.94 GiB`; `sp1` lowest boot
+   `MemAvailable` `20.755–20.761 GiB`, cluster min `20.493 GiB` on `sp2`, benchmark `min_available_gib` `19.35` and
+   `19.39 GiB` on `sp1`; `sp5` lowest boot `MemAvailable` `6.292–6.558 GiB` across all 8 screen boots, benchmark
+   `min_available_gib` `4.51–6.72 GiB`). During `screen-tp3` boot 1 (`candidate-55`), after completing `grid` and `c8`,
+   `sp6` halted thermally at `85 C` (`min_headroom_c: 4.0 C`, `fan_curve` service `absent`) on `prefill 32,768` repeat
+   1/3 (`6,530 tok/s`); boot 2 (`candidate-55-again`) and boots 3–8 (`single-stream`, `sampled`, `stall-tp3`) all
+   completed with `halted: null`.
+3. **Outputs: met.** `tp4-ring` (2 of 2 boots) and `tp4-switched` (2 of 2 boots) give `18d61961`/`d6568649` (text
+   `0a2dacdd`/`12fd8257`); `tp3-switched` (4 of 4 boots) gives `5c22ce41`/`bce6092e` (text `26a739a9`/`12cfee9b`), with
+   0 token or logprob diffs across all scenarios.
+4. **Serving: met.** Against candidate-54's recorded screens:
+   - `tp4-ring`: grid `-2.70%` (±0.13%, repeat `-0.28%`, floor `0.26%`, margin `0.29%`, **better**), c16 paired decode
+     `+0.50%` (±0.43%, repeat `+0.14%`, margin `0.51%`, **same**; `271.12` and `271.75` tok/s; c16 output `+0.58%`
+     ±0.78%, **same**), Prefill 32,768 `+1.74%` (±2.09%, repeat `+0.24%`, margin `2.26%`, **same**; `8,841.18` and
+     `8,862.57` tok/s), **Prefill 262,144 `+0.37%`** (±0.95%, repeat `+0.03%`, margin `1.01%`, **same**; `8,885.43` and
+     `8,887.68` tok/s — Build 8's `-0.96%` regression is resolved). `c1-decisions` agrees on 59 of 59 requests across
+     all 4 boots and 58 of 58 with candidate-54 (`82.67`–`83.01` tok/s).
+   - `tp4-switched`: grid `-3.99%` (±0.17%, repeat `-0.07%`, floor `0.23%`, margin `0.29%`, **better**), c16 paired
+     decode `+1.60%` (±0.34%, repeat `+0.32%`, margin `0.41%`, **better**; `268.82` and `269.82` tok/s; c16 output
+     `+1.77%` ±0.74%, **better**), Prefill 32,768 `+1.04%` (±1.64%, repeat `+0.25%`, margin `1.78%`, **same**;
+     `8,741.55` and `8,763.72` tok/s), Prefill 262,144 `+0.50%` (±0.71%, repeat `+0.24%`, margin `0.97%`, **same**;
+     `8,785.34` and `8,806.33` tok/s). `c1-decisions` agrees on 59 of 59 requests across all 4 boots and 57 of 57 with
+     candidate-54 (`82.55`–`82.63` tok/s).
+   - `tp3-switched`: grid (15 shapes) `-2.78%` (±0.12%, repeat `-0.38%`, floor `0.30%`, margin `0.33%`, **better**), c8
+     paired decode `+0.36%` (±0.36%, repeat `+0.02%`, margin `0.49%`, **same**; `158.65` and `158.71` tok/s; c8 output
+     `+0.54%` ±1.27%, **same**); boot 2 standalone `prefill` measured `6,568.41` tok/s (±1.45%) at `32,768` and
+     `6,481.75` tok/s (±0.66%) at `262,144`. `single-stream` c1 paired decode `+1.69%` (±0.15%, repeat `+0.03%`, margin
+     `0.29%`, **better**; `64.14` and `64.18` tok/s; c1 output `+1.57%` ±4.24%, **same**). `sampled`: c16 paired decode
+     `+0.90%` (±1.16%, **same**; `154.94` and `155.91` tok/s), c8 `+0.90%` (±1.81%, **same**; `155.96` and `156.36`
+     tok/s), c1 `+1.44%` (±1.22%, margin `1.24%`, **better**; `62.03` and `62.13` tok/s). `stall` prefill 131,072
+     tok/s under decode: `stall-3` `-0.35%` (±1.22%, repeat `-0.46%`, margin `1.45%`, **same**; `4,862.82` and `4,840.46`
+     tok/s; p90 `0.993`–`0.994` and `0.999`–`1.003` s), `stall-6` `-0.39%` (±2.04%, repeat `-0.17%`, margin `2.42%`,
+     **same**; `4,529.18` and `4,521.26` tok/s), `stall-7` `-0.25%` (±2.22%, repeat `-0.13%`, margin `2.30%`, **same**;
+     `4,860.48` and `4,854.29` tok/s).
+5. **Time to ready: partially met.** `tp4-ring` warm boots (`+0` kernel cache files) took `113.3`–`118.7 s` (`gate`
+   boot 2 `116.5 s`, `screen` `113.3` and `116.5 s`, `c1-decisions` `116.5`–`118.7 s`; first boot `194.8 s` compiled
+   196 kernel cache files), within `+5 s` of the sixth build (`115.5`–`116.5 s`). `tp3-switched` warm boots took
+   `130.6`–`139.2 s` (`gate` warm `130.6`–`136.1 s`, `screen` `131.4`–`139.2 s`; first boot `246.1 s`), within `+5 s`
+   of the fifth/sixth build (`127.0`–`135.5 s`). `tp4-switched` warm boots took `135.5`–`143.5 s` (first boot
+   `239.4 s`): `gate` boot 2 (`139.1 s`) and `c1-decisions` (`135.5`–`137.5 s`) were within `+5 s` of the sixth build
+   (`133.3`–`134.4 s`), while `screen` boots (`139.9` and `143.5 s`) ran `+5.5 s` and `+9.1 s` longer.
