@@ -622,4 +622,60 @@ Marks, declared before the build:
    candidate-54 beyond the margin; grid, c16, single-stream and sampled gains are preserved; and `c1-decisions`
    agrees on 4 of 4 boots at both TP4 testbeds and with candidate-54.
 5. **Time to ready** not longer than the sixth build's warm boots by more than 5 s.
+**Eighth build outcomes (2026-11-14; not promoted — open 256K prefill regression at `tp4-ring`):**
 
+Image `spark-ds41f:candidate-55`, ID `daa18fed` (`sp8`, `sp1..sp4`, `sp5..sp7`) and `6281652f` (`dgx1..dgx4`), `patch_head`
+`b210993fd700`, tree `7914f1f91e56`. Release tests receipt: [receipts/release-tests-daa18fed](receipts/release-tests-daa18fed).
+
+1. **Release tests: met.** `10,295 passed, 357 skipped`, 0 failed on `sp8` (`2,910.2 s`).
+2. **Every boot reaches ready: met.** All boots completed with `halted: null` and `swap_growth_gib: 0.0` across
+   `tp4-ring` (`dgx1` lowest boot `MemAvailable` `23.353–23.361 GiB` across screen boots), `tp4-switched` (`sp1`
+   `14.159–14.475 GiB`), and `tp3-switched` (8 of 8 screen boots completed; `sp5` lowest boot `MemAvailable` restored
+   to `6.274–6.535 GiB`).
+3. **Outputs: met.** `tp4-ring` (2 of 2) and `tp4-switched` (2 of 2) give `18d61961`/`d6568649` (text
+   `0a2dacdd`/`12fd8257`); `tp3-switched` (4 of 4) gives `5c22ce41`/`bce6092e` (text `26a739a9`/`12cfee9b`).
+4. **Serving: partially met.** Against candidate-54's recorded screens:
+   - `tp4-ring`: grid `-2.11%` (±0.14%, margin 0.30%, better), c16 paired decode `+0.39%` (±0.41%, margin 0.50%,
+     same; `270.88` and `271.51` tok/s), Prefill 32,768 `-0.40%` (same; `8,676` and `8,656` tok/s), **Prefill 262,144
+     `-0.96%`** (±0.70%, repeat `+0.07%`, margin `0.77%`, **worse**; `8,766` and `8,772` tok/s). `c1-decisions` agrees
+     on 59 of 59 requests across all 4 boots and 58 of 58 with candidate-54 (`82.41`–`82.92` tok/s).
+   - `tp4-switched`: grid `-3.78%` (±0.17%, margin 0.50%, better), c16 paired decode `+1.31%` (±0.40%, margin 0.47%,
+     better; `268.02` and `268.56` tok/s), Prefill 32,768 `-0.20%` (same; `8,639` and `8,652` tok/s), Prefill 262,144
+     `-0.43%` (same; `8,693` and `8,735` tok/s). `c1-decisions` agrees on 59 of 59 requests across all 4 boots and
+     57 of 57 with candidate-54 (`82.36`–`82.66` tok/s).
+   - `tp3-switched`: grid (15 shapes) `-2.92%` (±0.12%, margin 0.33%, better), c8 paired decode `+0.66%` (±0.48%,
+     margin 0.59%, better; `159.08` and `158.93` tok/s), `single-stream` c1 paired decode `+1.59%` (±0.14%, margin
+     0.29%, better; `64.06` and `64.09` tok/s), `sampled` c16 `+1.01%` (same), c8 `+0.43%` (same), c1 `+1.54%`
+     (better), `stall` prefill 131,072 tok/s under decode `stall-3` `-1.13%` (`4,833.4` and `4,794.2` tok/s, ±1.37%,
+     margin `1.78%`, **same**; p90 `0.9981` and `1.0086` s), `stall-6` `-0.41%` (**same**), `stall-7` `-0.69%`
+     (**same**).
+5. **Time to ready: met.** `tp4-ring` `115.3`–`115.4 s`; `tp4-switched` `132.1`–`132.1 s`; `tp3-switched` warm
+   non-cooled boots `123.8`–`132.7 s` (`184.2 s` on `again-stall` after 15 s cooling).
+
+### Ninth build: vLLM `0809` and `0810` for CUDA 13.5 prefill
+
+Keeps the eighth build's stack (`torch 2.13.0+cu130`, NCCL `2.30.7-1`, CUDA `13.5.37` toolkit, TP3 4 MiB collective
+cap) and adds two TileLang prefill fixes (`patch_head` `44db6a403230`, tree `49493238c2ff`, `683` patches total):
+
+- `0809-perf-dsv41-unroll-full-iterations-in-sparse-MLA-stag.patch` (`sparse_mla.py`): splits `issue_stage_records` into
+  unpredicated full iterations (`issue_record_copy`) plus a single tail check so `nvcc` under CUDA 13.5 drops the
+  per-iteration range branch (`test_deepseek_v41_tilelang.py`: `65 passed, 1 skipped, 1 xfailed` in `candidate-55-b8`;
+  standalone `sparse_mla` recovers ~`250`–`330 us` CUDA 13.5 loss at 16,384 rows to within `+0.19%`–`+0.32%` of CUDA
+  13.0, `max_abs_diff=0`).
+- `0810-perf-dsv41-unroll-MoE-blockscaled-K-loop-across-stag.patch` (`moe.py`): unrolls blockscaled MoE K loop across
+  `period = 2 * stages` (`k_step`) and passes `max_ko` so full-K TMA tiles elide `ko < k_full`
+  (`test_deepseek_v41_tilelang_moe.py`: `140 passed` in `candidate-55-b8`; `nvcc sm_121a` `0` stack, `0` spills, `191`
+  regs; standalone `w13` `E=384` `sorted_seq` `9,753.73 us` vs `10,508.13 us` CUDA 13.0 and `10,776.48 us` CUDA 13.5,
+  `E=128` `9,672.40 us` vs `10,451.71 us` CUDA 13.0 and `10,730.82 us` CUDA 13.5, `max_abs_diff=0`).
+
+Specs' runs are named `<run>-b9`. Marks, declared before the build:
+
+1. **Release tests:** 0 failures (target 10,295 passed, 357 skipped).
+2. **Every boot reaches ready** at `tp4-ring`, `tp4-switched` and `tp3-switched`, with `sp5` lowest boot `MemAvailable`
+   in Builds 5 and 6 (~`6.3`–`7.0 GiB`).
+3. **Outputs:** `18d61961`/`d6568649` (text `0a2dacdd`/`12fd8257`) at `tp4-ring` and `tp4-switched`, and
+   `5c22ce41`/`bce6092e` (text `26a739a9`/`12cfee9b`) at `tp3-switched` on every boot.
+4. **Serving:** `tp4-ring` Prefill 262,144 and `tp3-switched` `stall-3` prefill under decode are not worse than
+   candidate-54 beyond the margin; grid, c16, single-stream and sampled gains hold; and `c1-decisions` agrees on
+   4 of 4 boots at both TP4 testbeds and with candidate-54.
+5. **Time to ready** not longer than the sixth build's warm boots by more than 5 s.
