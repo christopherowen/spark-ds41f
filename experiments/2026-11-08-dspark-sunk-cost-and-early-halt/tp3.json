@@ -1,0 +1,31 @@
+{
+  "notes": "1107: C40 base plus TileLang runtime closure, serving contract, request/utility cleanup, HTTP disconnect and repeated cancellation, prefix endpoint retention, native-depth verification shapes, TileLang compiler 0001..0013 (multi-warp TMA producer rendezvous), CED local boundary/KV projection, opt-in VLLM_DS41_LSA shortlist indexing, DSpark online confidence calibration, CopyDrafter caller-stream and continuation/expected-yield pruning, TP2..TP8 cross-topology parity, selective 12-bit compressor pack12, indexer wq_b RoPE+MXFP4 epilogue fusion, multi-CTA disk Engram step and packed/cached rows, >=256K chunk step-down and >=1.0s stall decode interleave, Markov/PDL/prompt-ranks/mHC-boundary/routed-MoE-PDL polish, IKET runtime loop/phase profiler, row-parallel vision + multi-image packing + 16-image cap, and TP3 6-channel bidirectional 8 MiB NCCL Ring (vLLM 641 patches, patch head 6f7bb9efc8f9, tree 3ca9fb8092ac); unpromoted candidate",
+  "extends": {
+    "config": "releases/spark-ds41f-1030/cluster.json",
+    "shape": "tp3-triangle"
+  },
+  "set": {
+    "container": {
+      "image": "spark-ds41f:1107",
+      "expected_labels": {
+        "local.spark-ds41f.vllm.tree": "3ca9fb8092ac65eb796026cbec1269fe4573b0f0",
+        "local.spark-ds41f.tilelang.tree": "e2b001828fd4e38e6a2eee61f818d5083cb1335f",
+        "local.spark-ds41f.sparknet.tree": "8cc28a5cd3e683c1f114ed843453e3ce34f323e0"
+      }
+    },
+    "upstreams_config": "experiments/2026-11-08-dspark-sunk-cost-and-early-halt/upstreams.lock.json",
+    "environment": {
+      "NCCL_ALGO": "Ring",
+      "NCCL_MIN_NCHANNELS": "6",
+      "NCCL_MAX_NCHANNELS": "6",
+      "NCCL_BUFFSIZE": "8388608",
+      "NCCL_P2P_NET_CHUNKSIZE": "262144",
+      "NCCL_SWITCHLESS_BIDIRECTIONAL": "1",
+      "NCCL_MIN_TRAFFIC_PER_CHANNEL": "512",
+      "NCCL_THREAD_THRESHOLDS": "-2 -2 -2 1 1 1"
+    }
+  },
+  "serve_options": {
+    "--limit-mm-per-prompt": "{\"image\":16}"
+  }
+}
