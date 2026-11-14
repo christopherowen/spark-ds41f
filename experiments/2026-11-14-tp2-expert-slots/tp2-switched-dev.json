@@ -1,0 +1,67 @@
+{
+  "notes": "candidate-55 at tp2-switched using #981 zero-copy io_uring MoE expert slot offloading (VLLM_DS41_EXPERT_SLOTS=192, dynamic=48)",
+  "extends": {
+    "config": "experiments/2026-10-26-spark-ds41f-candidate/candidate-55/tp3-switched-dev.json"
+  },
+  "set": {
+    "nodes": 2,
+    "nodes_config": "config/nodes-switched2.local.json",
+    "environment": {
+      "VLLM_DS41_EXPERT_SLOTS": "192",
+      "VLLM_DS41_EXPERT_DYNAMIC_SLOTS": "48",
+      "VLLM_DS41_EXPERT_CACHE_DIR": "/cache/ds41_expert_slots"
+    },
+    "container": {
+      "mounts": [
+        [
+          "{checkout}/cache",
+          "/cache",
+          "rw"
+        ],
+        [
+          "{checkout}/experiments/2026-11-14-tp2-expert-slots/overlay/vllm/vllm/envs.py",
+          "/opt/spark-ds41f/candidate/vllm/vllm/envs.py",
+          "ro"
+        ],
+        [
+          "{checkout}/experiments/2026-11-14-tp2-expert-slots/overlay/vllm/vllm/model_executor/layers/fused_moe/tilelang.py",
+          "/opt/spark-ds41f/candidate/vllm/vllm/model_executor/layers/fused_moe/tilelang.py",
+          "ro"
+        ],
+        [
+          "{checkout}/experiments/2026-11-14-tp2-expert-slots/overlay/vllm/vllm/model_executor/layers/quantization/mxfp4.py",
+          "/opt/spark-ds41f/candidate/vllm/vllm/model_executor/layers/quantization/mxfp4.py",
+          "ro"
+        ],
+        [
+          "{checkout}/experiments/2026-11-14-tp2-expert-slots/overlay/vllm/vllm/models/deepseek_v4_1/nvidia/model.py",
+          "/opt/spark-ds41f/candidate/vllm/vllm/models/deepseek_v4_1/nvidia/model.py",
+          "ro"
+        ],
+        [
+          "{checkout}/experiments/2026-11-14-tp2-expert-slots/overlay/vllm/vllm/models/deepseek_v4_1/tilelang/moe.py",
+          "/opt/spark-ds41f/candidate/vllm/vllm/models/deepseek_v4_1/tilelang/moe.py",
+          "ro"
+        ],
+        [
+          "{checkout}/experiments/2026-11-14-tp2-expert-slots/overlay/vllm/vllm/models/deepseek_v4_1/expert_slots",
+          "/opt/spark-ds41f/candidate/vllm/vllm/models/deepseek_v4_1/expert_slots",
+          "ro"
+        ]
+      ]
+    }
+  },
+  "serve_options": {
+    "--tensor-parallel-size": "2",
+    "--nnodes": "2",
+    "--max-model-len": "262144",
+    "--max-num-seqs": "8",
+    "--max-num-batched-tokens": "4096",
+    "--kv-cache-memory-bytes": "2362232012",
+    "--max-cudagraph-capture-size": "48",
+    "--speculative-config": "{\"method\":\"dspark\",\"num_speculative_tokens\":5,\"draft_tensor_parallel_size\":2,\"attention_backend\":\"TILELANG\",\"draft_sample_method\":\"greedy\",\"rejection_sample_method\":\"block\",\"enable_adaptive_verification\":true,\"adaptive_verification_row_cost\":0.035}",
+    "--compilation-config": "{\"cudagraph_mode\":\"PIECEWISE\",\"custom_ops\":[\"all\"],\"cudagraph_capture_sizes\":[1,2,3,4,6,8,12,16,20,24,28,32,40,48]}",
+    "--prefix-cache-retention-interval": "512",
+    "--long-prefill-token-threshold": "4048"
+  }
+}
