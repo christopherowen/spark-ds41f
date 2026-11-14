@@ -38,6 +38,8 @@ dc712a66f perf(dsv41): fuse DSpark confidence calibration and keep active num_re
 - **`tp4-switched` (`sp1..sp4`)**:
   - `gate`: all 8 determinism/greedy runs `identical: true` (`0` token/logprob diffs across all 6 scenarios), matching `candidate-55` b9 hashes (`18d619615e...` / `d65686498e...`). Distinct streams: `c16` `269.72 / 268.37 tok/s`, `c8` `198.87 / 199.43 tok/s`, `c4` `154.51 / 154.49 tok/s`, `0` foreign requests.
   - `c1-decisions` (4 boots): `82.77 / 82.81 / 82.83 / 82.74 tok/s` (mean `82.79 tok/s`, `35.70 steps/s`, `0` failed).
+- **`tp3-switched` (`sp5..sp7`):**
+  - `gate`: all 8 determinism/greedy runs `identical: true` (`0` token/logprob diffs across all 6 scenarios), matching reference hashes (`5c22ce41c1...` / `26a739a99b...`). Distinct streams: `c8` `153.95 / 153.66 tok/s`, `c4` `117.78 / 117.78 tok/s`, `0` foreign requests.
 
 ## Kernel release-tests (sp8)
 

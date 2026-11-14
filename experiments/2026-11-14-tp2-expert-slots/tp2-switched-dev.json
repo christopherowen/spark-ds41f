@@ -1,5 +1,5 @@
 {
-  "notes": "candidate-55 at tp2-switched using #981 zero-copy io_uring MoE expert slot offloading (max_num_seqs=4, VLLM_DS41_EXPERT_SLOTS=228, dynamic=64, protect_rows=24)",
+  "notes": "candidate-55 at tp2-switched using #981 zero-copy io_uring MoE expert slot offloading (c4, slots=228/64, protect_rows=24, kv=6.00GiB, prefix_ret=8192, adaptive_verify=0.035, max_img=16MP)",
   "extends": {
     "config": "experiments/2026-10-26-spark-ds41f-candidate/candidate-55/tp3-switched-dev.json"
   },
@@ -10,7 +10,8 @@
       "VLLM_DS41_EXPERT_SLOTS": "228",
       "VLLM_DS41_EXPERT_DYNAMIC_SLOTS": "64",
       "VLLM_DS41_EXPERT_CACHE_DIR": "/cache/ds41_expert_slots",
-      "VLLM_DS41_EXPERT_PREFILL_PROTECT_ROWS": "24"
+      "VLLM_DS41_EXPERT_PREFILL_PROTECT_ROWS": "24",
+      "VLLM_MAX_IMAGE_PIXELS": "16777216"
     },
     "container": {
       "mounts": [
@@ -63,11 +64,13 @@
     "--max-model-len": "262144",
     "--max-num-seqs": "4",
     "--max-num-batched-tokens": "4096",
-    "--kv-cache-memory-bytes": "2362232012",
+    "--kv-cache-memory-bytes": "6442450944",
     "--max-cudagraph-capture-size": "24",
-    "--speculative-config": "{\"method\":\"dspark\",\"num_speculative_tokens\":5,\"draft_tensor_parallel_size\":2,\"attention_backend\":\"TILELANG\",\"draft_sample_method\":\"greedy\",\"rejection_sample_method\":\"block\",\"enable_adaptive_verification\":false}",
+    "--speculative-config": "{\"method\":\"dspark\",\"num_speculative_tokens\":5,\"draft_tensor_parallel_size\":2,\"attention_backend\":\"TILELANG\",\"draft_sample_method\":\"greedy\",\"rejection_sample_method\":\"block\",\"enable_adaptive_verification\":true,\"adaptive_verification_row_cost\":0.035}",
     "--compilation-config": "{\"cudagraph_mode\":\"PIECEWISE\",\"custom_ops\":[\"all\"],\"cudagraph_capture_sizes\":[1,2,3,4,6,8,12,16,20,24]}",
-    "--prefix-cache-retention-interval": "512",
-    "--long-prefill-token-threshold": "4072"
+    "--prefix-cache-retention-interval": "8192",
+    "--long-prefill-token-threshold": "4072",
+    "--mm-processor-cache-gb": "0",
+    "--limit-mm-per-prompt": "{\"image\":67}"
   }
 }
