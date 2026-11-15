@@ -217,16 +217,23 @@ collectives, and DSpark drafting.
    the compressor and scores only the `n_new` ($\le M$) newly written blocks,
    merging the `n_new` scores into the sorted `k` prefix keys in a lightweight
    merge kernel before MLA. First bound how much of the latency-bound bucket is
-   serial dependency rather than SM occupancy.
-6. **Two-phase sparse-MLA decode KV prefetch before `griddepcontrol.wait`.** In
-   decode sparse-MLA, the prior sliding-window KV rows (`pos < pos0`, i.e., all
-   but the current step's rows) and—on layers that reuse `topk` indices from an
-   earlier `candidate_source_layer`—all `ktop` compressed KV rows are already
-   committed in memory before the upstream `wq_b` / `wkv` / `topk` kernel
-   finishes. Issuing global-to-shared loads for those already-valid KV slots
-   before `griddepcontrol.wait` overlaps LPDDR5X KV fetch latency with the
-   upstream tail, waiting on `griddepcontrol.wait` only for the newly written
-   KV rows and `q`.
+   serial dependency rather than SM occupancy; if GB10's 48 SMs or 99 KiB per-CTA
+   shared memory serialize concurrent streams during tail waves, screen co-tuning
+   pipeline stages / dynamic SMEM on the overlapping kernel pair or carving out a
+   small CUDA Green Context SM partition for the latency-critical side stream.
+6. **Two-phase sparse-MLA decode KV and PDL prologue weight prefetch before
+   `griddepcontrol.wait`.** In decode sparse-MLA, the prior sliding-window KV
+   rows (`pos < pos0`, i.e., all but the current step's rows) and—on layers that
+   reuse `topk` indices from an earlier `candidate_source_layer`—all `ktop`
+   compressed KV rows are already committed in memory before the upstream
+   `wq_b` / `wkv` / `topk` kernel finishes. Issuing global-to-shared loads for
+   those already-valid KV slots before `griddepcontrol.wait` overlaps LPDDR5X KV
+   fetch latency with the upstream tail, waiting on `griddepcontrol.wait` only
+   for the newly written KV rows and `q`. Likewise, in PDL-chained decode
+   projections and GEMMs (`0739`, `0755`, `0756`, `WO-B`), ensure stage-0 weight
+   and scale tile loads issue before `griddepcontrol.wait` so LPDDR5X weight
+   reads overlap the producer's final wave before the consumer waits on the
+   activation tile.
 7. **Forward-fusing `mHC` stream finalize and MXFP8 quantization into consumer
    projections (plus fused `embed` + Layer-0 `project_streams`).** Unlike
    1-launch atomic `project_and_finalize_streams` (which regressed in `#946`),
@@ -329,12 +336,17 @@ NCCL Ring and sparse-MLA `block_H=16` (`2` CTAs/head, `0740`), unconditional
 (`0743`) are all active.
 
 Open levers:
-- **Sequence-parallel MoE input (`experiments/2026-10-14-sp-moe-gather`).** Each
-  encoder layer all-gathers BF16 rows, then casts them to MXFP8 twice (shared
-  and routed experts) and routes them on all $T$ rows on every rank (~4.4 ms a
-  layer at an 8,096-row chunk). Routing and casting each rank's own shard before
-  all-gathering MXFP8 rows with their scales and routes preserves exact bits
-  with a ~3–3.9% prefill ceiling.
+- **Sequence-parallel MoE input (`experiments/2026-10-14-sp-moe-gather`) and
+  rank-offset CTA remapping.** Each encoder layer all-gathers BF16 rows, then
+  casts them to MXFP8 twice (shared and routed experts) and routes them on all
+  $T$ rows on every rank (~4.4 ms a layer at an 8,096-row chunk). Routing and
+  casting each rank's own shard before all-gathering MXFP8 rows with their scales
+  and routes preserves exact bits with a ~3–3.9% prefill ceiling. When
+  overlapping a sequence-parallel all-gather with the consumer projection or
+  expert compute, remap consumer row-tile coordinates by rank offset
+  (`pid_m = (raw_pid_m + rank * tiles_per_rank) % total_tiles`) so every rank
+  starts computing on its already-local shard at $t = 0$ while peer shards
+  arrive over RoCE.
 - **First request after a restart** is ~0.37 s slower to its first token than
   subsequent requests. Screen `CUDA_MODULE_LOADING=EAGER` (checking boot time
   impact) and sample the first request with `py-spy dump --nonblocking`.
