@@ -419,6 +419,7 @@ def test_disk_engram_preparation_refreshes_graph_and_rejects_stale_rows(
 ):
     """Accepted GPU history, images, padding and failures cross the eager boundary."""
     monkeypatch.setattr(engram_module, "ENGRAM_PACKED_DIR", "")
+    monkeypatch.setattr(engram_module, "ENGRAM_ROW_CACHE_ROWS", 0)
     make_model, weights, paths = tiny_engram_checkpoint
     # The reader serves rows it has read before from its row cache (a checkpoint
     # is immutable while serving). Every step of this test reads the files, so
