@@ -83,6 +83,123 @@ def _needs_logits_for_acceptance(speculator: "DSparkSpeculator") -> bool:
     )
 
 
+def _resolve_active_spec_steps(
+    speculator: "DSparkSpeculator", num_speculative_tokens: int | None
+) -> int:
+    """Clamp dynamic speculative token count to ``[1, num_speculative_steps]``."""
+    n_spec = speculator.num_speculative_steps
+    if num_speculative_tokens is None:
+        return n_spec
+    return max(1, min(int(num_speculative_tokens), n_spec))
+
+
+def _select_sample_hidden(
+    speculator: "DSparkSpeculator",
+    head_hidden: torch.Tensor,
+    num_reqs: int,
+    active_steps: int,
+) -> tuple[torch.Tensor, torch.Tensor | None]:
+    """Return per-(req, active_step) hidden states before the base draft lm_head."""
+    n_spec = speculator.num_speculative_steps
+    num_sample = num_reqs * n_spec
+    sample_from_anchor = getattr(speculator, "sample_from_anchor", False)
+    if active_steps == n_spec:
+        sample_hidden = (
+            head_hidden[:num_sample]
+            if sample_from_anchor
+            else tilelang_inputs.gather_hidden_rows(
+                head_hidden, speculator.sample_indices[:num_sample]
+            )
+        )
+        return sample_hidden, None
+    if sample_from_anchor:
+        conf_sample_hidden = head_hidden[:num_sample]
+        sample_hidden = (
+            conf_sample_hidden.view(num_reqs, n_spec, -1)[:, :active_steps]
+            .reshape(num_reqs * active_steps, -1)
+            .contiguous()
+        )
+        return sample_hidden, conf_sample_hidden
+    active_indices = (
+        speculator.sample_indices[:num_sample]
+        .view(num_reqs, n_spec)[:, :active_steps]
+        .reshape(-1)
+        .contiguous()
+    )
+    return tilelang_inputs.gather_hidden_rows(head_hidden, active_indices), None
+
+
+def _compute_confidence_probs(
+    speculator: "DSparkSpeculator",
+    head_hidden: torch.Tensor,
+    sample_hidden: torch.Tensor,
+    conf_sample_hidden: torch.Tensor | None,
+    confidence_embeds: torch.Tensor | None,
+    confidence_markov_embeds: list[torch.Tensor],
+    num_reqs: int,
+    active_steps: int,
+) -> None:
+    """Evaluate and calibrate DSpark confidence probabilities over active draft steps."""
+    n_spec = speculator.num_speculative_steps
+    num_sample = num_reqs * n_spec
+    truncated = active_steps < n_spec
+    if confidence_embeds is not None:
+        conf_embeds = confidence_embeds.flatten(0, 1)
+    else:
+        stacked = torch.stack(confidence_markov_embeds, dim=1)
+        if not truncated:
+            conf_embeds = stacked.flatten(0, 1)
+        else:
+            padded = torch.zeros(
+                (num_reqs, n_spec, stacked.shape[-1]),
+                dtype=stacked.dtype,
+                device=stacked.device,
+            )
+            padded[:, :active_steps].copy_(stacked)
+            conf_embeds = padded.flatten(0, 1)
+
+    if not truncated:
+        conf_hidden = sample_hidden
+        conf_idx_mapping = speculator.sample_idx_mapping[:num_sample]
+    else:
+        conf_hidden = (
+            conf_sample_hidden
+            if conf_sample_hidden is not None
+            else tilelang_inputs.gather_hidden_rows(
+                head_hidden, speculator.sample_indices[:num_sample]
+            )
+        )
+        # Mask tail slots to -1 so calibration neither writes tail features nor predictions.
+        conf_idx_mapping = speculator.sample_idx_mapping[:num_sample].clone()
+        conf_idx_mapping.view(num_reqs, n_spec)[:, active_steps:].fill_(-1)
+
+    conf_out = speculator.draft_token_confidence_probs[:num_reqs].view(-1)
+    estimator = getattr(speculator, "acceptance_estimator", None)
+    if estimator is not None and hasattr(
+        speculator.model, "compute_and_calibrate_confidence"
+    ):
+        speculator.model.compute_and_calibrate_confidence(
+            conf_hidden,
+            conf_embeds,
+            conf_out,
+            estimator,
+            conf_idx_mapping,
+        )
+    else:
+        speculator.model.compute_confidence(
+            conf_hidden,
+            conf_embeds,
+            out=conf_out,
+        )
+        if estimator is not None:
+            estimator.calibrate_confidence_probs(
+                speculator.draft_token_confidence_probs[:num_reqs],
+                conf_idx_mapping,
+            )
+    if truncated:
+        speculator.draft_token_confidence_probs[:num_reqs, active_steps:].zero_()
+
+
 class DSparkSpeculator(DFlashSpeculator):
     _speculator_name = "DSpark"
 
@@ -193,6 +310,7 @@ class DSparkSpeculator(DFlashSpeculator):
         self._markov_conf_weight = torch.zeros(
             rank, dtype=torch.float32, device=device
         )
+        logger.info_once("DSpark pre-drafting Markov head truncation enabled")
 
     @property
     def attn_vllm_config(self) -> VllmConfig:
@@ -421,24 +539,26 @@ class DSparkSpeculator(DFlashSpeculator):
             return None
         return table
 
-    def _sample_sequential(self, num_reqs: int, head_hidden: torch.Tensor) -> None:
+    def _sample_sequential(
+        self,
+        num_reqs: int,
+        head_hidden: torch.Tensor,
+        num_speculative_tokens: int | None = None,
+    ) -> None:
         if self._draft_topk is not None:
-            self._sample_sequential_topk(num_reqs, head_hidden)
+            self._sample_sequential_topk(
+                num_reqs,
+                head_hidden,
+                num_speculative_tokens=num_speculative_tokens,
+            )
             return
 
         # Sequential Markov sampling over the backbone's output hidden states.
         n_spec = self.num_speculative_steps
+        active_steps = _resolve_active_spec_steps(self, num_speculative_tokens)
         num_sample = num_reqs * n_spec
-        # Per-(req, position) head hidden, ordered (req, step). When
-        # sample_from_anchor is True, each request's query block has exactly
-        # n_spec rows and head_hidden[:num_sample] is already contiguous in
-        # (req, step) order.
-        sample_hidden = (
-            head_hidden[:num_sample]
-            if getattr(self, "sample_from_anchor", False)
-            else tilelang_inputs.gather_hidden_rows(
-                head_hidden, self.sample_indices[:num_sample]
-            )
+        sample_hidden, conf_sample_hidden = _select_sample_hidden(
+            self, head_hidden, num_reqs, active_steps
         )
         # Draft-vocab logits; sampled ids are remapped to target vocab below.
         local_head = getattr(self.model, "supports_local_draft_argmax", lambda: False)()
@@ -454,11 +574,14 @@ class DSparkSpeculator(DFlashSpeculator):
         else:
             base_logits = self.model.compute_draft_logits(sample_hidden)
         vocab_size = base_logits.shape[-1]
-        base_logits = base_logits.view(num_reqs, n_spec, vocab_size)
+        base_logits = base_logits.view(num_reqs, active_steps, vocab_size)
 
         idx_map = self.sample_idx_mapping[:num_sample].view(num_reqs, n_spec)
         sample_pos = self.sample_pos[:num_sample].view(num_reqs, n_spec)
-        confidence_markov_embeds = []
+        if active_steps < n_spec:
+            idx_map = idx_map[:, :active_steps]
+            sample_pos = sample_pos[:, :active_steps]
+        confidence_markov_embeds: list[torch.Tensor] = []
 
         # Anchor (bonus) token per request = the input id at query offset 0,
         # read via the precomputed persistent index (fixed buffer for capture).
@@ -476,9 +599,10 @@ class DSparkSpeculator(DFlashSpeculator):
                 confidence_embeds[:, 0],
             )
         else:
+            confidence_embeds = None
             prev = self.input_buffers.input_ids[self._anchor_idx[:num_reqs]]
 
-        for i in range(n_spec):
+        for i in range(active_steps):
             # Sequential stage: Markov bias from the previously sampled token.
             if table is not None:
                 markov_embed = step_embed
@@ -525,7 +649,7 @@ class DSparkSpeculator(DFlashSpeculator):
                         top2=use_top2,
                     )
                 draft_sampled_i = self.draft_tokens[:num_reqs, i]
-                has_embed = table is not None and i + 1 < n_spec
+                has_embed = table is not None and i + 1 < active_steps
                 select_first_argmax(
                     tensor_model_parallel_all_gather(pairs, dim=-1),
                     draft_sampled_i,
@@ -573,36 +697,23 @@ class DSparkSpeculator(DFlashSpeculator):
             prev = draft_sampled_i
 
         if self.use_confidence_head:
-            conf_embeds = (
-                confidence_embeds.flatten(0, 1)
-                if table is not None
-                else torch.stack(confidence_markov_embeds, dim=1).flatten(0, 1)
+            _compute_confidence_probs(
+                self,
+                head_hidden,
+                sample_hidden,
+                conf_sample_hidden,
+                confidence_embeds if table is not None else None,
+                confidence_markov_embeds,
+                num_reqs,
+                active_steps,
             )
-            conf_out = self.draft_token_confidence_probs[:num_reqs].view(-1)
-            estimator = getattr(self, "acceptance_estimator", None)
-            if estimator is not None and hasattr(
-                self.model, "compute_and_calibrate_confidence"
-            ):
-                self.model.compute_and_calibrate_confidence(
-                    sample_hidden,
-                    conf_embeds,
-                    conf_out,
-                    estimator,
-                    self.sample_idx_mapping[:num_sample],
-                )
-            else:
-                self.model.compute_confidence(
-                    sample_hidden,
-                    conf_embeds,
-                    out=conf_out,
-                )
-                if estimator is not None:
-                    estimator.calibrate_confidence_probs(
-                        self.draft_token_confidence_probs[:num_reqs],
-                        self.sample_idx_mapping[:num_sample],
-                    )
 
-    def _sample_sequential_topk(self, num_reqs: int, head_hidden: torch.Tensor) -> None:
+    def _sample_sequential_topk(
+        self,
+        num_reqs: int,
+        head_hidden: torch.Tensor,
+        num_speculative_tokens: int | None = None,
+    ) -> None:
         """Apply the sequential Markov head only to top-k base-logit candidates.
 
         Candidate selection is done once for all draft positions. At each
@@ -612,16 +723,13 @@ class DSparkSpeculator(DFlashSpeculator):
         """
         assert self._draft_topk is not None
         n_spec = self.num_speculative_steps
+        active_steps = _resolve_active_spec_steps(self, num_speculative_tokens)
         num_sample = num_reqs * n_spec
-        sample_hidden = (
-            head_hidden[:num_sample]
-            if getattr(self, "sample_from_anchor", False)
-            else tilelang_inputs.gather_hidden_rows(
-                head_hidden, self.sample_indices[:num_sample]
-            )
+        sample_hidden, conf_sample_hidden = _select_sample_hidden(
+            self, head_hidden, num_reqs, active_steps
         )
         base_logits = self.model.compute_draft_logits(sample_hidden)
-        base_logits = base_logits.view(num_reqs, n_spec, -1)
+        base_logits = base_logits.view(num_reqs, active_steps, -1)
         base_values, draft_indices = base_logits.topk(self._draft_topk, dim=-1)
         # Reuse the dense backbone output as the normal sampler's input. Fill
         # once for all positions, then scatter only the corrected candidates
@@ -629,10 +737,13 @@ class DSparkSpeculator(DFlashSpeculator):
         base_logits.fill_(float("-inf"))
         idx_map = self.sample_idx_mapping[:num_sample].view(num_reqs, n_spec)
         sample_pos = self.sample_pos[:num_sample].view(num_reqs, n_spec)
-        confidence_markov_embeds = []
+        if active_steps < n_spec:
+            idx_map = idx_map[:, :active_steps]
+            sample_pos = sample_pos[:, :active_steps]
+        confidence_markov_embeds: list[torch.Tensor] = []
         prev = self.input_buffers.input_ids[self._anchor_idx[:num_reqs]]
 
-        for i in range(n_spec):
+        for i in range(active_steps):
             markov_embed = self.model.markov_embed(prev)
             if self.use_confidence_head:
                 confidence_markov_embeds.append(markov_embed)
@@ -649,30 +760,16 @@ class DSparkSpeculator(DFlashSpeculator):
             prev = draft_sampled_i
 
         if self.use_confidence_head:
-            conf_embeds = torch.stack(confidence_markov_embeds, dim=1).flatten(0, 1)
-            conf_out = self.draft_token_confidence_probs[:num_reqs].view(-1)
-            estimator = getattr(self, "acceptance_estimator", None)
-            if estimator is not None and hasattr(
-                self.model, "compute_and_calibrate_confidence"
-            ):
-                self.model.compute_and_calibrate_confidence(
-                    sample_hidden,
-                    conf_embeds,
-                    conf_out,
-                    estimator,
-                    self.sample_idx_mapping[:num_sample],
-                )
-            else:
-                self.model.compute_confidence(
-                    sample_hidden,
-                    conf_embeds,
-                    out=conf_out,
-                )
-                if estimator is not None:
-                    estimator.calibrate_confidence_probs(
-                        self.draft_token_confidence_probs[:num_reqs],
-                        self.sample_idx_mapping[:num_sample],
-                    )
+            _compute_confidence_probs(
+                self,
+                head_hidden,
+                sample_hidden,
+                conf_sample_hidden,
+                None,
+                confidence_markov_embeds,
+                num_reqs,
+                active_steps,
+            )
 
     def _generate_draft(
         self,
@@ -682,6 +779,7 @@ class DSparkSpeculator(DFlashSpeculator):
         slot_mappings: dict[str, torch.Tensor] | None,
         num_tokens_across_dp: torch.Tensor | None,
         cudagraph_runtime_mode: CUDAGraphMode = CUDAGraphMode.NONE,
+        num_speculative_tokens: int | None = None,
     ) -> None:
         # Full draft step (captured under CUDA graph): parallel backbone forward
         # then sequential Markov sampling over its hidden state outputs.
@@ -692,4 +790,8 @@ class DSparkSpeculator(DFlashSpeculator):
             num_tokens_across_dp,
             cudagraph_runtime_mode,
         )
-        self._sample_sequential(num_reqs, head_hidden)
+        self._sample_sequential(
+            num_reqs,
+            head_hidden,
+            num_speculative_tokens=num_speculative_tokens,
+        )

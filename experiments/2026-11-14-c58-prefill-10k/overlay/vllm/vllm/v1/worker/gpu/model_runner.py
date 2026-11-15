@@ -1266,6 +1266,46 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                     shard.org_vocab_start_index,
                     tp_size,
                 )
+                if (
+                    self.sink is not None
+                    and self.sink.rejection
+                    and hasattr(head, "packed_bf16_exponent_base")
+                    and self.sink.num_candidates <= 16
+                ):
+                    dummy_drafts = self.input_buffers.input_ids[:num_reqs]
+                    dummy_flags = torch.zeros(
+                        num_reqs, dtype=torch.int8, device=self.device
+                    )
+                    cut_cols = self.sink.cut_cols(
+                        dummy_flags,
+                        dummy_drafts,
+                        dummy_input_batch.cu_num_logits,
+                        num_reqs,
+                        shard.org_vocab_start_index,
+                        shard.num_org_elements,
+                    )
+                    pairs, dummy_topk = vocab_parallel_pairs_from_head(
+                        head,
+                        hidden_states,
+                        shard.num_org_elements,
+                        shard.org_vocab_start_index,
+                        tp_size,
+                        cut_cols=cut_cols,
+                        top_k=self.sink.num_candidates,
+                    )
+                    dummy_sampled, dummy_num_sampled = greedy_rejection_sample(
+                        pairs,
+                        dummy_drafts,
+                        dummy_input_batch.cu_num_logits,
+                        self.rejection_sampler.num_speculative_steps,
+                    )
+                    self.sink.alternates_of_greedy_top_candidates(
+                        dummy_topk,
+                        dummy_input_batch.cu_num_logits,
+                        dummy_num_sampled,
+                        dummy_sampled,
+                        tp_size,
+                    )
             for steps in dict.fromkeys(
                 (self.num_draft_steps, self.rejection_sampler.num_speculative_steps)
                 if self.num_draft_steps > 0
@@ -2617,14 +2657,45 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         drafts = logits_rows(input_batch)[0]
         rejection = self.sink is not None and self.sink.rejection
         local_logits: torch.Tensor | None = None
-        if not rejection and hasattr(head, "tilelang_vocab_greedy"):
-            pairs = vocab_parallel_pairs_from_head(
-                head,
-                sample_hidden_states,
-                shard.num_org_elements,
-                shard.org_vocab_start_index,
-                tp_size,
+        row_topk: torch.Tensor | None = None
+        if hasattr(head, "tilelang_vocab_greedy") and (
+            not rejection
+            or (
+                hasattr(head, "packed_bf16_exponent_base")
+                and self.sink.num_candidates <= 16
             )
+        ):
+            if rejection:
+                assert self.sink is not None and sink_flags is not None
+                logger.info_once(
+                    "Using certified W_q screened greedy verification under sink rejection (top_k=%d)",
+                    self.sink.num_candidates,
+                )
+                cut_cols = self.sink.cut_cols(
+                    sink_flags,
+                    drafts,
+                    input_batch.cu_num_logits,
+                    input_batch.num_reqs,
+                    shard.org_vocab_start_index,
+                    shard.num_org_elements,
+                )
+                pairs, row_topk = vocab_parallel_pairs_from_head(
+                    head,
+                    sample_hidden_states,
+                    shard.num_org_elements,
+                    shard.org_vocab_start_index,
+                    tp_size,
+                    cut_cols=cut_cols,
+                    top_k=self.sink.num_candidates,
+                )
+            else:
+                pairs = vocab_parallel_pairs_from_head(
+                    head,
+                    sample_hidden_states,
+                    shard.num_org_elements,
+                    shard.org_vocab_start_index,
+                    tp_size,
+                )
         else:
             local_logits = self.model.compute_logits_local(sample_hidden_states)
             if rejection:
@@ -2675,18 +2746,30 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             num_rejected=num_rejected,
         )
         if rejection:
-            assert self.sink is not None and local_logits is not None
-            output.sink_alternates = SinkAlternates(
-                self.sink.alternates_of_greedy_shards(
-                    local_logits,
-                    input_batch.cu_num_logits,
-                    num_sampled,
-                    sampled,
-                    shard.org_vocab_start_index,
-                    shard.num_org_elements,
-                    tp_size,
+            assert self.sink is not None
+            if row_topk is not None:
+                output.sink_alternates = SinkAlternates(
+                    self.sink.alternates_of_greedy_top_candidates(
+                        row_topk,
+                        input_batch.cu_num_logits,
+                        num_sampled,
+                        sampled,
+                        tp_size,
+                    )
                 )
-            )
+            else:
+                assert local_logits is not None
+                output.sink_alternates = SinkAlternates(
+                    self.sink.alternates_of_greedy_shards(
+                        local_logits,
+                        input_batch.cu_num_logits,
+                        num_sampled,
+                        sampled,
+                        shard.org_vocab_start_index,
+                        shard.num_org_elements,
+                        tp_size,
+                    )
+                )
         return output
 
     def _init_sink(self, config: SinkConfig, custom_sampler: bool) -> None:

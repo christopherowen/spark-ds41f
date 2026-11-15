@@ -925,6 +925,113 @@ def _block_best(best, best_index, take, partial, partial_index, tx, threads):
     T.sync_threads()
 
 
+
+@tilelang.jit(pass_configs=_PASS)
+def sink_cut_cols_kernel(drafts_dtype: str):
+    """Per-row local column masked to -inf by ``SinkSampler.cut``: the draft
+    of ``row + 1`` shifted by ``vocab_start`` when flagged and within this
+    shard (and ``row + 1`` does not start a request), else -1."""
+    num_logits, cu_len = T.dynamic("num_logits, cu_len")
+
+    @T.prim_func
+    def sink_cut_cols(
+        flags: T.Tensor((num_logits,), T.int8),
+        drafts: T.Tensor((num_logits,), drafts_dtype),
+        cu_num_logits: T.Tensor((cu_len,), T.int32),
+        cut_cols: T.Tensor((num_logits,), T.int32),
+        num_reqs: T.int32,
+        vocab_start: T.int64,
+        limit: T.int64,
+    ):
+        with T.Kernel(T.ceildiv(num_logits, _THREADS), threads=_THREADS) as bx:
+            row = bx * _THREADS + T.get_thread_binding()
+            if row < num_logits:
+                masked = T.alloc_var(T.int32, init=-1)
+                if row + 1 < num_logits:
+                    starts = T.alloc_var(T.int32, init=0)
+                    for b in T.serial(num_reqs):
+                        starts = starts | T.cast(cu_num_logits[b] == row + 1, T.int32)
+                    col = T.alloc_var(
+                        T.int64,
+                        init=T.cast(drafts[row + 1], T.int64) - vocab_start,
+                    )
+                    cut = (
+                        (flags[row + 1] != 0)
+                        & (starts == 0)
+                        & (col >= 0)
+                        & (col < limit)
+                    )
+                    masked = T.if_then_else(cut, T.cast(col, T.int32), -1)
+                cut_cols[row] = masked
+
+    return sink_cut_cols
+
+
+def sink_cut_cols(
+    flags: torch.Tensor,
+    drafts: torch.Tensor,
+    cu_num_logits: torch.Tensor,
+    num_reqs: int,
+    vocab_start: int,
+    limit: int,
+) -> torch.Tensor:
+    """Local column index cut per row (``-1`` where no cut applies)."""
+    num_logits = flags.shape[0]
+    cut_cols = torch.empty(num_logits, dtype=torch.int32, device=flags.device)
+    if num_logits:
+        _kernel(sink_cut_cols_kernel, _DTYPES[drafts.dtype])(
+            flags,
+            drafts,
+            cu_num_logits,
+            cut_cols,
+            num_reqs,
+            vocab_start,
+            limit,
+        )
+    return cut_cols
+
+
+@tilelang.jit(pass_configs=_PASS)
+def sink_select_top_rows_kernel(k: int):
+    """Select each request's bonus row from per-row ``row_topk[num_logits, 2*k]``
+    into ``packed[num_reqs, 2*k]`` for ``sink_merge``."""
+    num_logits, cu_len, num_reqs = T.dynamic("num_logits, cu_len, num_reqs")
+    width = 2 * k
+
+    @T.prim_func
+    def sink_select_top_rows(
+        row_topk: T.Tensor((num_logits, width), T.float32),
+        cu_num_logits: T.Tensor((cu_len,), T.int32),
+        num_sampled: T.Tensor((num_reqs,), T.int32),
+        packed: T.Tensor((num_reqs, width), T.float32),
+    ):
+        with T.Kernel(T.ceildiv(num_reqs * width, _THREADS), threads=_THREADS) as bx:
+            idx = bx * _THREADS + T.get_thread_binding()
+            if idx < num_reqs * width:
+                req = idx // width
+                j = idx % width
+                row = cu_num_logits[req] + T.max(num_sampled[req] - 1, 0)
+                packed[req, j] = row_topk[row, j]
+
+    return sink_select_top_rows
+
+
+def sink_select_top_rows(
+    row_topk: torch.Tensor,
+    cu_num_logits: torch.Tensor,
+    num_sampled: torch.Tensor,
+    k: int,
+) -> torch.Tensor:
+    """Packed candidates of each request's bonus row from ``row_topk``."""
+    num_reqs = num_sampled.shape[0]
+    packed = torch.empty((num_reqs, 2 * k), dtype=torch.float32, device=row_topk.device)
+    if num_reqs:
+        _kernel(sink_select_top_rows_kernel, k)(
+            row_topk, cu_num_logits, num_sampled, packed
+        )
+    return packed
+
+
 @tilelang.jit(pass_configs=_PASS)
 def sink_shard_top_kernel(logits_dtype: str, k: int):
     """The candidates of ``SinkSampler.alternates_of_greedy_shards`` on this rank, a
@@ -3707,6 +3814,10 @@ def sink_calls(
         calls += [
             _call(sink_shard_top_kernel, _DTYPES[dtype], num_alternates + 1)
             for dtype in shard_dtypes
+        ]
+        calls += [
+            _call(sink_cut_cols_kernel, "int32"),
+            _call(sink_select_top_rows_kernel, num_alternates + 1),
         ]
         calls += [
             _call(sink_merge_kernel, True, num_alternates + 1, num_alternates),
