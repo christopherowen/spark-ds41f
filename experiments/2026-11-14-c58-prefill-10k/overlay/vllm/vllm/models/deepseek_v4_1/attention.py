@@ -19,7 +19,6 @@ from vllm.distributed import (
     get_tensor_model_parallel_rank,
     get_tensor_model_parallel_world_size,
     get_tp_group,
-    model_parallel_is_initialized,
 )
 from vllm.forward_context import get_forward_context
 from vllm.logger import init_logger
@@ -1021,6 +1020,8 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase):
             if self.compressor.state_cache is not None
             else None
         )
+        if sp_prefill._ACTIVE_TIMER is not None:
+            self.compressor._timing_layer_id = self.layer_id
         fuse_kv_write = DeepseekV4Attention._fuse_compressor_kv_write(self)
         if fuse_kv_write:
             latent, slots = self.compressor(
@@ -1063,6 +1064,7 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase):
         # Index K consumes the ordinary-normalized PRE-RoPE latent; norm, RoPE
         # and the paged MXFP4 write run in one kernel. At decode sizes, wk's
         # split-K FP32 partials are reduced in registers inside _write_index_keys.
+        _ev_wk = sp_prefill.timing_begin()
         if (
             hasattr(indexer.wk, "tilelang_partials")
             and "_write_index_keys" not in self.__dict__
@@ -1076,6 +1078,7 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase):
             key = indexer.wk(latent)
         index_meta = cast(DeepseekV41Metadata, metadata[indexer.k_cache.prefix])
         self._write_index_keys(key, index_meta.slot_mapping[:rows], positions=positions)
+        sp_prefill.timing_end("idx_wk_write", _ev_wk, self.layer_id)
         if not fuse_kv_write:
             self._write_v41_cache(
                 latent,
@@ -1284,11 +1287,13 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase):
         )
         index_weights = None
         if self.indexer is not None:
+            _ev_wp = sp_prefill.timing_begin()
             index_weights = self.indexer.weights_proj(hidden_states)
             if _INDEX_SPLIT_CHECK or (swa is not None and swa.is_decode):
                 index_weights = sp_rows.gather(index_weights)
             else:
                 index_weights = index_weights[: sp_rows.real_rows]
+            sp_prefill.timing_end("attn_weights_proj", _ev_wp, self.layer_id)
         swa_cache = getattr(self.swa_cache_layer, "kv_cache", None)
         if not is_breakable_cudagraph_enabled() and swa is not None:
             if (
@@ -1319,6 +1324,7 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase):
                     device=qr_kv.device,
                 )
                 if real > 0:
+                    _ev_sf = sp_prefill.timing_begin()
                     sp_attention_front(
                         qr_kv[:real],
                         self.q_norm.weight,
@@ -1330,15 +1336,20 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase):
                         local_q_cast.scales[:real],
                         local_records[:real],
                     )
+                    sp_prefill.timing_end("attn_sp_front_kernel", _ev_sf, self.layer_id)
+                _ev_sg = sp_prefill.timing_begin()
                 q_cast, swa_records = sp_rows.gather_mxfp8(
                     local_q_cast, local_records
                 )
+                sp_prefill.timing_end("attn_sp_front_gather", _ev_sg, self.layer_id)
+                _ev_sw = sp_prefill.timing_begin()
                 write_swa_records(
                     swa_records,
                     swa_cache,
                     swa.slot_mapping[: sp_rows.num_tokens],
                     page_size=self.swa_cache_layer.block_size,
                 )
+                sp_prefill.timing_end("attn_write_swa", _ev_sw, self.layer_id)
                 return (q_cast.rows, None, q_cast), None, None, None, index_weights
         qr, kv = qr_kv.split((self.q_lora_rank, 512), dim=-1)
         qr, kv = self.q_norm(qr), self.kv_norm(kv)
@@ -1389,245 +1400,6 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase):
         )
         return qr, kv, q_cast
 
-    def _rope_into(self, target: torch.Tensor, positions, role: str) -> None:
-        rotated = self._rope(target, positions, role)
-        if rotated is not target:
-            target.copy_(rotated)
-
-    def _can_split_wq_b(self, sp_rows) -> bool:
-        if self.n_local_heads <= 0 or not hasattr(self.wq_b, "tilelang_prefill"):
-            return False
-        min_prefill_rows = max(
-            getattr(self.wq_b, "tilelang_decode_rows", 0),
-            getattr(self.wq_b, "tilelang_split_rows", 0)
-            if getattr(self.wq_b, "tilelang_shards", 1) > 1
-            else 0,
-        )
-        start = sp_rows.start
-        real = sp_rows.real_rows
-        tail = sp_rows.num_tokens - (start + real)
-        return (
-            real > min_prefill_rows
-            and (start == 0 or start > min_prefill_rows)
-            and (tail == 0 or tail > min_prefill_rows)
-        )
-
-    def _finish_async_compressor(
-        self, sp_rows, positions, rows: int, metadata, comp_gathered
-    ) -> None:
-        assert self.compressor is not None
-        main = metadata[self._owner().prefix]
-        state = (
-            metadata[self.compressor.state_cache.prefix]
-            if self.compressor.state_cache is not None
-            else None
-        )
-        fuse_kv_write = DeepseekV4Attention._fuse_compressor_kv_write(self)
-        gates = comp_gathered[1] if len(comp_gathered) > 1 else None
-        if fuse_kv_write:
-            latent, slots = self.compressor.finish_sp_forward(
-                sp_rows,
-                main,
-                state,
-                values=comp_gathered[0],
-                gates=gates,
-                kv_cache=self.kv_cache,
-                token_positions=positions,
-                cos_sin=self.rotary_emb.cos_sin_cache,
-                kv_page_size=self._main_page,
-            )
-        else:
-            latent, slots = self.compressor.finish_sp_forward(
-                sp_rows,
-                main,
-                state,
-                values=comp_gathered[0],
-                gates=gates,
-            )
-        DeepseekV4Attention._write_compressed_index_keys(
-            self, positions, rows, metadata, latent, slots, fuse_kv_write
-        )
-
-    def _forward_sp_replicated_async(
-        self,
-        sp_rows,
-        hidden_states,
-        local_hidden,
-        positions,
-        metadata,
-        original_swa,
-        swa,
-        swa_cache,
-    ):
-        from vllm.models.deepseek_v4_1.tilelang.cache_writer import (
-            RECORD_BYTES,
-            write_swa_records,
-        )
-        from vllm.models.deepseek_v4_1.tilelang.front import sp_attention_front
-        from vllm.models.deepseek_v4_1.tilelang.linear import empty_mxfp8
-
-        rows = sp_rows.num_tokens
-        local_rows = sp_rows.local_rows
-        start = sp_rows.start
-        real = sp_rows.real_rows
-        tail_start = start + real
-        tail = rows - tail_start
-
-        qr_kv, _ = self.fused_wqa_wkv(hidden_states)
-        index_weights = (
-            self.indexer.weights_proj(hidden_states)[:real]
-            if self.indexer is not None
-            else None
-        )
-        hidden_states = None
-
-        q_dtype, q_device = qr_kv.dtype, qr_kv.device
-        local_qr = torch.empty(
-            (local_rows, self.q_lora_rank), dtype=q_dtype, device=q_device
-        )
-        local_q_cast = empty_mxfp8(local_qr)
-        local_records = torch.empty(
-            (local_rows, RECORD_BYTES["swa"]), dtype=torch.uint8, device=q_device
-        )
-        if real > 0:
-            sp_attention_front(
-                qr_kv[:real],
-                self.q_norm.weight,
-                self.kv_norm.weight,
-                self.q_norm.variance_epsilon,
-                positions[start:tail_start],
-                self.rotary_emb.cos_sin_cache,
-                local_q_cast.values[:real],
-                local_q_cast.scales[:real],
-                local_records[:real],
-            )
-        del qr_kv
-
-        (q_cast, swa_records), wait_front = sp_rows.gather_mxfp8_async(
-            local_q_cast, local_records
-        )
-
-        # Overlap local-only projections on the main stream while the front
-        # all-gather executes on the PyNCCL side stream.
-        comp_local = None
-        if (
-            local_hidden is not None
-            and swa is original_swa
-            and self.indexer is not None
-            and hasattr(self.compressor, "can_project_sp_async")
-            and self.compressor.can_project_sp_async(sp_rows)
-        ):
-            comp_local = self.compressor.project_sp_local(local_hidden, sp_rows)
-            local_hidden = None
-
-        early_index_query = None
-        if (
-            self.indexer is not None
-            and hasattr(self.indexer.wq_b, "tilelang_prefill")
-            and real > getattr(self.indexer.wq_b, "tilelang_decode_rows", 0)
-        ):
-            early_index_query = self._index_query(
-                local_qr[:real],
-                positions[start:tail_start],
-                None,
-                index_weights,
-                0,
-                real,
-                swa,
-                local_q_cast,
-            )
-
-        can_split_wq_b = self._can_split_wq_b(sp_rows)
-        if can_split_wq_b:
-            q = torch.empty(
-                (rows, self.n_local_heads, 512), dtype=q_dtype, device=q_device
-            )
-            local_cast = kernels.slice_mxfp8(local_q_cast, 0, real)
-            with kernels.mxfp8_inputs(local_cast):
-                q[start:tail_start] = self.wq_b(local_qr[:real]).view(
-                    real, self.n_local_heads, 512
-                )
-            self._rope_into(q[start:tail_start], positions[start:tail_start], "q")
-            del local_cast
-
-        wait_front()
-        del local_qr, local_q_cast, local_records
-
-        comp_gathered = None
-        wait_comp = None
-        if comp_local is not None:
-            comp_gathered, wait_comp = sp_rows.gather_many_async(*comp_local)
-            del comp_local
-
-        write_swa_records(
-            swa_records,
-            swa_cache,
-            swa.slot_mapping[:rows],
-            page_size=self.swa_cache_layer.block_size,
-        )
-        del swa_records
-
-        if can_split_wq_b:
-            if start > 0:
-                head_cast = kernels.slice_mxfp8(q_cast, 0, start)
-                with kernels.mxfp8_inputs(head_cast):
-                    q[:start] = self.wq_b(q_cast.rows[:start]).view(
-                        start, self.n_local_heads, 512
-                    )
-                self._rope_into(q[:start], positions[:start], "q")
-                del head_cast
-            if tail > 0:
-                tail_cast = kernels.slice_mxfp8(q_cast, tail_start, rows)
-                with kernels.mxfp8_inputs(tail_cast):
-                    q[tail_start:] = self.wq_b(q_cast.rows[tail_start:]).view(
-                        tail, self.n_local_heads, 512
-                    )
-                self._rope_into(q[tail_start:], positions[tail_start:], "q")
-                del tail_cast
-        elif self.n_local_heads > 0:
-            with kernels.mxfp8_inputs(q_cast):
-                q = self.wq_b(q_cast.rows).view(rows, self.n_local_heads, 512)
-            q = self._rope(q, positions, "q")
-        else:
-            q = torch.empty((rows, 0, 512), dtype=q_dtype, device=q_device)
-
-        self._issue_wo_prefetch(rows, after="q-b")
-
-        if swa is original_swa:
-            if comp_gathered is not None:
-                assert wait_comp is not None
-                wait_comp()
-                self._finish_async_compressor(
-                    sp_rows, positions, rows, metadata, comp_gathered
-                )
-                del comp_gathered
-            elif local_hidden is not None:
-                self._prepare_global_kv(positions, local_hidden, sp_rows=sp_rows)
-        del local_hidden
-
-        index_query = None
-        if self.indexer is not None:
-            if early_index_query is not None:
-                query = early_index_query
-            else:
-                query = self._index_query(
-                    q_cast.rows,
-                    positions,
-                    None,
-                    index_weights,
-                    start,
-                    tail_start,
-                    swa,
-                    q_cast,
-                )
-            index_query = (*query, sp_rows, None)
-        del q_cast, index_weights
-
-        output = torch.empty_like(q)
-        self.forward_mqa(q, None, positions, output, index_query=index_query)
-        del q, index_query
-        return self._o_proj(output, sp_rows=sp_rows)
-
     def _forward(self, positions, hidden_states):
         if not self._ready:
             raise RuntimeError("V4.1 attention metadata is not prepared")
@@ -1655,42 +1427,9 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase):
                 # front (projection, q norm + MXFP8 cast, kv norm + RoPE + SWA record
                 # packing, local index weights) runs on this rank's rows; only the
                 # MXFP8 q cast and SWA records are gathered.
-                if (
-                    hasattr(sp_rows, "gather_mxfp8_async")
-                    and sp_rows.can_gather_async(hidden_states.device)
-                    and not is_breakable_cudagraph_enabled()
-                    and not _INDEX_SPLIT_CHECK
-                ):
-                    metadata = get_forward_context().attn_metadata
-                    original_swa = (
-                        metadata.get(self.swa_cache_layer.prefix)
-                        if isinstance(metadata, dict)
-                        else None
-                    )
-                    swa = (
-                        self._query_metadata(original_swa)
-                        if original_swa is not None
-                        else None
-                    )
-                    swa_cache = getattr(self.swa_cache_layer, "kv_cache", None)
-                    if (
-                        swa is not None
-                        and not getattr(swa, "is_decode", False)
-                        and swa_cache is not None
-                        and swa_cache.numel() > 0
-                        and getattr(swa, "slot_mapping", None) is not None
-                    ):
-                        return self._forward_sp_replicated_async(
-                            sp_rows,
-                            hidden_states,
-                            local_hidden,
-                            positions,
-                            metadata,
-                            original_swa,
-                            swa,
-                            swa_cache,
-                        )
+                _ev_wqa = sp_prefill.timing_begin()
                 qr_kv, _ = self.fused_wqa_wkv(hidden_states)
+                sp_prefill.timing_end("attn_wqa_wkv", _ev_wqa, self.layer_id)
                 front, qr, kv, q_cast, index_weights = self._sp_front(
                     sp_rows, hidden_states, qr_kv, positions
                 )
@@ -1756,8 +1495,10 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase):
             front = None
             front_wrote_kv = True
         if self.n_local_heads > 0:
+            _ev_wqb = sp_prefill.timing_begin()
             with kernels.mxfp8_inputs(q_cast):
                 q = self.wq_b(qr).view(rows, self.n_local_heads, 512)
+            sp_prefill.timing_end("attn_wq_b", _ev_wqb, self.layer_id)
         else:
             q = torch.empty((rows, 0, 512), dtype=qr.dtype, device=qr.device)
         if self.indexer is None:
@@ -1782,7 +1523,9 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase):
                 swa, sp_rows, front_wrote_kv, rows
             )
             if not overlap_decode and self.n_local_heads > 0:
+                _ev_qr = sp_prefill.timing_begin()
                 q = self._rope(q, positions, "q")
+                sp_prefill.timing_end("attn_q_rope", _ev_qr, self.layer_id)
             if not front_wrote_kv:  # the front's kernel wrote the record
                 self._cache_context_kv(kv, positions)
             if overlap_decode:
@@ -1804,42 +1547,26 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase):
                 del q, kv, index_query
             else:
                 if swa is original_swa:
+                    _ev_gkv = sp_prefill.timing_begin()
                     if hidden_states is not None:
                         self._prepare_global_kv(positions, hidden_states)
                     elif local_hidden is not None:
                         self._prepare_global_kv(
                             positions, local_hidden, sp_rows=sp_rows
                         )
+                    sp_prefill.timing_end("attn_global_kv", _ev_gkv, self.layer_id)
                 del local_hidden
                 index_query = None
                 if self.indexer is not None:
-                    # The indexer is replicated, so under sequence-parallel prefill
-                    # and multi-rank decode each rank scores and selects only its
-                    # own rows, and forward_mqa gathers the selected positions.
-                    # Every row is independent.
+                    # Sequence-parallel prefill: the indexer is replicated, so each
+                    # rank scores and selects only its own rows, and forward_mqa
+                    # gathers the selected positions. Every row is independent.
                     split = (
                         sp_rows if sp_rows is not None and not swa.is_decode else None
                     )
-                    if (
-                        split is None
-                        and swa.is_decode
-                        and not getattr(self, "is_draft", False)
-                        and os.environ.get("VLLM_DS41_DECODE_INDEX_SPLIT", "1") == "1"
-                    ):
-                        tp_size = (
-                            get_tensor_model_parallel_world_size()
-                            if model_parallel_is_initialized()
-                            else int(getattr(self, "tp_size", 1))
-                        )
-                        if tp_size > 1 and rows >= tp_size:
-                            tp_rank = (
-                                get_tensor_model_parallel_rank()
-                                if model_parallel_is_initialized()
-                                else int(getattr(self, "tp_rank", 0))
-                            )
-                            split = sp_prefill.SPRows(rows, tp_size, tp_rank)
                     first = split.start if split is not None else 0
                     last = first + split.real_rows if split is not None else rows
+                    _ev_iq = sp_prefill.timing_begin()
                     query = self._index_query(
                         qr,
                         positions,
@@ -1850,6 +1577,7 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase):
                         swa,
                         q_cast,
                     )
+                    sp_prefill.timing_end("attn_idx_query", _ev_iq, self.layer_id)
                     reference = None
                     if split is not None and _INDEX_SPLIT_CHECK:
                         reference = self._index_query(
@@ -1868,7 +1596,10 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase):
                 output = torch.empty_like(q)
                 self.forward_mqa(q, kv, positions, output, index_query=index_query)
                 del q, kv, index_query
-        return self._o_proj(output, sp_rows=sp_rows)
+        _ev_op = sp_prefill.timing_begin()
+        _out = self._o_proj(output, sp_rows=sp_rows)
+        sp_prefill.timing_end("attn_o_proj", _ev_op, self.layer_id)
+        return _out
 
     def _issue_wo_prefetch(self, rows, *, after):
         """Issue the WO window's L2 prefetch at its point in this layer's forward
@@ -1895,49 +1626,46 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase):
         """MXFP4 index queries and scaled head weights for rows [first, last)."""
         rows = last - first
         h = self.indexer.heads
+        qr_rows = qr if (first == 0 and last == qr.shape[0]) else qr[first:last]
+        cast_rows = (
+            kernels.cast_mxfp8(qr_rows)
+            if q_cast is None
+            else kernels.slice_mxfp8(q_cast, first, last)
+        )
         iq_data = torch.empty((rows, h, 64), dtype=torch.uint8, device=qr.device)
         iq_scale = torch.empty((rows, h, 4), dtype=torch.uint8, device=qr.device)
-        if rows > 0:
-            qr_rows = qr if (first == 0 and last == qr.shape[0]) else qr[first:last]
-            cast_rows = (
-                kernels.cast_mxfp8(qr_rows)
-                if q_cast is None
-                else kernels.slice_mxfp8(q_cast, first, last)
+        pos_rows = positions[first:last]
+        if (
+            rows <= getattr(self.indexer.wq_b, "tilelang_decode_rows", 0)
+            and hasattr(self.indexer.wq_b, "tilelang_decode_rope_mxfp4")
+            and "_quantize_index_query" not in self.__dict__
+        ):
+            from vllm.models.deepseek_v4_1.tilelang.linear import (
+                project_block32_rope_mxfp4_decode,
             )
-            pos_rows = positions[first:last]
-            if (
-                rows <= getattr(self.indexer.wq_b, "tilelang_decode_rows", 0)
-                and hasattr(self.indexer.wq_b, "tilelang_decode_rope_mxfp4")
-                and "_quantize_index_query" not in self.__dict__
-            ):
-                from vllm.models.deepseek_v4_1.tilelang.linear import (
-                    project_block32_rope_mxfp4_decode,
-                )
 
-                with kernels.mxfp8_inputs(cast_rows):
-                    project_block32_rope_mxfp4_decode(
-                        self.indexer.wq_b,
-                        qr_rows,
-                        pos_rows,
-                        self.rotary_emb.cos_sin_cache,
-                        iq_data,
-                        iq_scale,
-                    )
-                del cast_rows, q_cast
-            else:
-                with kernels.mxfp8_inputs(cast_rows):
-                    iq = self.indexer.wq_b(qr_rows).view(rows, h, 128)
-                del cast_rows, q_cast
-                self._quantize_index_query(
-                    "decode" if swa.is_decode else "prefill",
-                    iq,
+            with kernels.mxfp8_inputs(cast_rows):
+                project_block32_rope_mxfp4_decode(
+                    self.indexer.wq_b,
+                    qr_rows,
+                    pos_rows,
+                    self.rotary_emb.cos_sin_cache,
                     iq_data,
                     iq_scale,
-                    positions=pos_rows,
                 )
-                del iq
+            del cast_rows, q_cast
         else:
-            del q_cast
+            with kernels.mxfp8_inputs(cast_rows):
+                iq = self.indexer.wq_b(qr_rows).view(rows, h, 128)
+            del cast_rows, q_cast
+            self._quantize_index_query(
+                "decode" if swa.is_decode else "prefill",
+                iq,
+                iq_data,
+                iq_scale,
+                positions=pos_rows,
+            )
+            del iq
         # The BF16 head-weight projection runs on every row: its GEMV rounds
         # differently at another row count, which would move top-k selections.
         # The FP8 wq_b quantizes per row and does not depend on the row count.
@@ -2127,11 +1855,7 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase):
                     )
 
                     page_table = None
-                    cacheable = (
-                        index_rows <= chunk_rows
-                        and first + index_rows <= index_pages.shape[0]
-                        and reference is None
-                    )
+                    cacheable = split is None and index_rows <= chunk_rows
                     if cacheable:
                         key = (id(im), row, count, index_width, self._index_page)
                         shared = get_forward_context().__dict__.setdefault(
@@ -2209,7 +1933,9 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase):
                     )
 
             if split is None:
+                _ev_it = sp_prefill.timing_begin()
                 select(query, 0, self.topk_indices_buffer)
+                sp_prefill.timing_end("idx_score_topk", _ev_it, self.layer_id)
                 if pending_aux is not None:
                     torch.cuda.current_stream(q.device).wait_stream(pending_aux)
                     pending_aux = None
@@ -2244,12 +1970,16 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase):
                     if owns_candidates:
                         self._candidates[local].fill_(-2)
                         self._candidate_lens[local].fill_(-2)
+                _ev_it = sp_prefill.timing_begin()
                 select(query, split.start, selected)
+                sp_prefill.timing_end("idx_score_topk", _ev_it, self.layer_id)
                 if reference is not None:
                     self._check_index_split(
                         split, selected, expected, repeat, expected_candidates
                     )
+                _ev_ig = sp_prefill.timing_begin()
                 self.topk_indices_buffer[:rows].copy_(split.gather(selected))
+                sp_prefill.timing_end("idx_gather", _ev_ig, self.layer_id)
 
         if pending_aux is not None:
             torch.cuda.current_stream(q.device).wait_stream(pending_aux)
@@ -2310,6 +2040,7 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase):
             )
         # Keep the borrowed arena, not aliases of the transient query storage.
         retain_cuda_graph_capture_resource(arena)
+        _ev_mla = sp_prefill.timing_begin()
         self._attend(
             mode,
             q,
@@ -2320,6 +2051,7 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase):
             swa_lengths=swa_lengths[:rows],
             **kwargs,
         )
+        sp_prefill.timing_end("sparse_mla", _ev_mla, self.layer_id)
 
     def _shared_decode_metadata(self, swa, main, rows, specs, device):
         replay = self._replay_start(swa)

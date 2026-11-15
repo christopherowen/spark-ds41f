@@ -48,7 +48,7 @@ from vllm.v1.worker.gpu.cudagraph_utils import (
     dense_varlen_decode_shapes,
 )
 
-from .. import kernels, l2_prefetch
+from .. import kernels, l2_prefetch, sp_prefill
 from ..tilelang import columns, dspark_context, prepare
 from .model import (
     DeepseekV4DecoderLayer,
@@ -458,6 +458,15 @@ class DSparkDeepseekV4Model(nn.Module):
         ``None`` (or a ``None`` entry) runs the projection to reserve workspace
         but writes nothing (profiling).
         """
+        _dsp_timer = (
+            sp_prefill._PREFILL_TIMING_ENABLED
+            and main_x.shape[0] >= 4096
+            and get_tensor_model_parallel_rank() == 0
+            and not torch.cuda.is_current_stream_capturing()
+        )
+        if _dsp_timer:
+            _ev_dsp0 = torch.cuda.Event(enable_timing=True)
+            _ev_dsp0.record(torch.cuda.current_stream())
         cached_cast = getattr(self, "_context_main_cast", None)
         self._context_main_cast = None
         if (
@@ -490,6 +499,17 @@ class DSparkDeepseekV4Model(nn.Module):
                     _insert_context_kv(
                         attn, attn.kv_norm(kv_raw), context_positions, slot_mapping
                     )
+        if _dsp_timer:
+            _ev_dsp1 = torch.cuda.Event(enable_timing=True)
+            _ev_dsp1.record(torch.cuda.current_stream())
+            torch.cuda.synchronize()
+            import json as _json
+            with open("/tmp/prefill_timing.jsonl", "a", encoding="utf-8") as _f:
+                _f.write(_json.dumps({
+                    "kind": "dspark_context_kv",
+                    "num_tokens": int(main_x.shape[0]),
+                    "ms": round(float(_ev_dsp0.elapsed_time(_ev_dsp1)), 3),
+                }) + "\n")
 
     def forward(
         self,

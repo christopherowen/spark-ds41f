@@ -102,7 +102,7 @@ rank's block straight into its slot, the other ranks' first, and the exchange of
 each slice runs under the combine of this rank's block and of the next slice.
 """
 
-from collections.abc import Callable, Iterator
+from collections.abc import Iterator
 from contextlib import contextmanager
 from contextvars import ContextVar
 from dataclasses import dataclass
@@ -221,17 +221,11 @@ class SPRows:
             raise ValueError(f"SP gather expects {self.local_rows} rows, got {x.shape}")
         return tensor_model_parallel_all_gather(x, dim=0)[: self.num_tokens]
 
-    def can_gather_async(self, device: torch.device | None = None) -> bool:
-        """Whether ``gather_many_async`` can run a grouped PyNCCL gather on ``_side_stream``."""
-        if not model_parallel_is_initialized() or _tp_pynccl_comm() is None:
-            return False
-        if not torch.cuda.is_available() or torch.cuda.is_current_stream_capturing():
-            return False
-        return device is None or device.type == "cuda"
-
-    def _prepare_gather_many(
+    def gather_many(
         self, *tensors: torch.Tensor, padded_rows: tuple[int, ...] = ()
-    ) -> tuple[list[torch.Tensor], tuple[int, ...], object | None]:
+    ) -> tuple[torch.Tensor, ...]:
+        """All-gather several L-row tensors into their first T rows (or ``padded_rows``
+        when given for a tensor) in one grouped PyNCCL collective when available."""
         inputs = []
         for x in tensors:
             x = materialize(x)
@@ -246,51 +240,7 @@ class SPRows:
             if model_parallel_is_initialized()
             else None
         )
-        if comm is not None and getattr(comm, "disabled", False):
-            comm = None
-        return inputs, limits, comm
-
-    def _launch_pynccl_gather(
-        self,
-        inputs: list[torch.Tensor],
-        limits: tuple[int, ...],
-        comm,
-        *,
-        stream: torch.cuda.Stream | None = None,
-    ) -> tuple[torch.Tensor, ...]:
-        outs = []
-        pairs = []
-        for x, rows in zip(inputs, limits):
-            inp = x.contiguous()
-            alloc_rows = max(self.padded_rows, rows)
-            out = torch.empty(
-                (alloc_rows, *inp.shape[1:]), dtype=inp.dtype, device=inp.device
-            )
-            if stream is not None:
-                inp.record_stream(stream)
-                out.record_stream(stream)
-            outs.append(out[:rows])
-            pairs.append((out[: self.padded_rows], inp))
-        if stream is not None:
-            stream.wait_stream(torch.cuda.current_stream(inputs[0].device))
-        comm.group_start()
-        for dst, src in pairs:
-            if stream is None:
-                comm.all_gather(dst, src)
-            else:
-                comm.all_gather(dst, src, stream=stream)
-        comm.group_end()
-        return tuple(outs)
-
-    def gather_many(
-        self, *tensors: torch.Tensor, padded_rows: tuple[int, ...] = ()
-    ) -> tuple[torch.Tensor, ...]:
-        """All-gather several L-row tensors into their first T rows (or ``padded_rows``
-        when given for a tensor) in one grouped PyNCCL collective when available."""
-        inputs, limits, comm = self._prepare_gather_many(
-            *tensors, padded_rows=padded_rows
-        )
-        if comm is None:
+        if comm is None or comm.disabled:
             outs = []
             for x, rows in zip(inputs, limits):
                 gathered = tensor_model_parallel_all_gather(x, dim=0)
@@ -301,30 +251,21 @@ class SPRows:
                 else:
                     outs.append(gathered[:rows])
             return tuple(outs)
-        return self._launch_pynccl_gather(inputs, limits, comm)
-
-    def gather_many_async(
-        self, *tensors: torch.Tensor, padded_rows: tuple[int, ...] = ()
-    ) -> tuple[tuple[torch.Tensor, ...], Callable[[], None]]:
-        """Start a grouped PyNCCL all-gather on ``_side_stream`` and return ``(outs, wait_fn)``."""
-        inputs, limits, comm = self._prepare_gather_many(
-            *tensors, padded_rows=padded_rows
-        )
-        if not inputs or comm is None or not self.can_gather_async(inputs[0].device):
-            return self.gather_many(*tensors, padded_rows=padded_rows), (lambda: None)
-        device = inputs[0].device
-        main = torch.cuda.current_stream(device)
-        side = _side_stream(device)
-        outs = self._launch_pynccl_gather(inputs, limits, comm, stream=side)
-        waited = False
-
-        def wait() -> None:
-            nonlocal waited
-            if not waited:
-                waited = True
-                main.wait_stream(side)
-
-        return outs, wait
+        outs = []
+        pairs = []
+        for x, rows in zip(inputs, limits):
+            inp = x.contiguous()
+            alloc_rows = max(self.padded_rows, rows)
+            out = torch.empty(
+                (alloc_rows, *inp.shape[1:]), dtype=inp.dtype, device=inp.device
+            )
+            outs.append(out[:rows])
+            pairs.append((out[: self.padded_rows], inp))
+        comm.group_start()
+        for dst, src in pairs:
+            comm.all_gather(dst, src)
+        comm.group_end()
+        return tuple(outs)
 
     def gather_mxfp8(self, x_q, *extra: torch.Tensor):
         """All-gather this rank's L-row ``MXFP8Rows`` (and any ``extra`` L-row
@@ -350,29 +291,6 @@ class SPRows:
             device=x_q.rows.device,
         )
         return (MXFP8Rows(rows, values, scales), *rest)
-
-    def gather_mxfp8_async(self, x_q, *extra: torch.Tensor):
-        """Asynchronous ``gather_mxfp8`` returning ``((MXFP8Rows, *extra), wait_fn)``."""
-        from vllm.models.deepseek_v4_1.tilelang.linear import MXFP8Rows, mxfp8_rows
-
-        local = self.local_rows
-        if x_q.rows.shape[0] != local:
-            raise ValueError(
-                f"SP MXFP8 gather expects {local} rows, got {x_q.rows.shape}"
-            )
-        rows_q = mxfp8_rows(self.num_tokens)
-        (values, scales, *rest), wait = self.gather_many_async(
-            x_q.values[:local],
-            x_q.scales[:local],
-            *extra,
-            padded_rows=(rows_q, rows_q),
-        )
-        rows = torch.empty(
-            (self.num_tokens, *x_q.rows.shape[1:]),
-            dtype=x_q.rows.dtype,
-            device=x_q.rows.device,
-        )
-        return (MXFP8Rows(rows, values, scales), *rest), wait
 
     def reduce_scatter(self, padded: torch.Tensor) -> torch.Tensor:
         """Sum a zero-padded Tp-row buffer over the ranks into this rank's rows."""
@@ -809,3 +727,99 @@ def activate(rows: SPRows) -> Iterator[None]:
         yield
     finally:
         _ROWS.reset(token)
+
+
+import os as _os
+import json as _json
+
+_PREFILL_TIMING_ENABLED = _os.environ.get("VLLM_DS41_PREFILL_TIMING") == "1"
+
+
+class _PrefillTimer:
+    def __init__(self, num_tokens: int):
+        self.num_tokens = int(num_tokens)
+        self.pairs: list[tuple[str, int | None, torch.cuda.Event, torch.cuda.Event]] = []
+
+    def begin(self) -> torch.cuda.Event:
+        ev = torch.cuda.Event(enable_timing=True)
+        ev.record(torch.cuda.current_stream())
+        return ev
+
+    def end(self, bucket: str, start_ev: torch.cuda.Event | None, layer_id: int | None = None) -> None:
+        if start_ev is None:
+            return
+        end_ev = torch.cuda.Event(enable_timing=True)
+        end_ev.record(torch.cuda.current_stream())
+        self.pairs.append((bucket, layer_id, start_ev, end_ev))
+
+    def finish(self, encoder_only: bool, path: str = "/tmp/prefill_timing.jsonl") -> None:
+        torch.cuda.synchronize()
+        totals: dict[str, float] = {}
+        enc_totals: dict[str, float] = {}
+        dec_totals: dict[str, float] = {}
+        by_layer: dict[int, dict[str, float]] = {}
+        for bucket, layer_id, s_ev, e_ev in self.pairs:
+            ms = float(s_ev.elapsed_time(e_ev))
+            totals[bucket] = totals.get(bucket, 0.0) + ms
+            if layer_id is not None:
+                ld = by_layer.setdefault(layer_id, {})
+                ld[bucket] = ld.get(bucket, 0.0) + ms
+                target = enc_totals if layer_id < 20 else dec_totals
+                target[bucket] = target.get(bucket, 0.0) + ms
+        rec = {
+            "kind": "target_forward",
+            "num_tokens": self.num_tokens,
+            "encoder_only": bool(encoder_only),
+            "totals_ms": {k: round(v, 3) for k, v in totals.items()},
+            "enc_layers_0_19_ms": {k: round(v, 3) for k, v in enc_totals.items()},
+            "layers_20_plus_ms": {k: round(v, 3) for k, v in dec_totals.items()},
+            "sample_layers_ms": {
+                str(lid): {k: round(v, 3) for k, v in by_layer[lid].items()}
+                for lid in (0, 1, 2, 8, 14, 20, 21)
+                if lid in by_layer
+            },
+        }
+        with open(path, "a", encoding="utf-8") as f:
+            f.write(_json.dumps(rec) + "\n")
+
+
+_ACTIVE_TIMER: _PrefillTimer | None = None
+
+
+def start_prefill_timer(num_tokens: int) -> bool:
+    global _ACTIVE_TIMER
+    if (
+        not _PREFILL_TIMING_ENABLED
+        or num_tokens < 4096
+        or torch.cuda.is_current_stream_capturing()
+    ):
+        return False
+    _ACTIVE_TIMER = _PrefillTimer(num_tokens)
+    return True
+
+
+def clear_prefill_timer() -> None:
+    global _ACTIVE_TIMER
+    _ACTIVE_TIMER = None
+
+
+def timing_begin() -> torch.cuda.Event | None:
+    if not _PREFILL_TIMING_ENABLED or _ACTIVE_TIMER is None:
+        return None
+    return _ACTIVE_TIMER.begin()
+
+
+def timing_end(bucket: str, start_ev: torch.cuda.Event | None, layer_id: int | None = None) -> None:
+    if _ACTIVE_TIMER is None or start_ev is None:
+        return
+    _ACTIVE_TIMER.end(bucket, start_ev, layer_id=layer_id)
+
+
+def finish_prefill_timer(encoder_only: bool) -> None:
+    global _ACTIVE_TIMER
+    if _ACTIVE_TIMER is None:
+        return
+    try:
+        _ACTIVE_TIMER.finish(encoder_only)
+    finally:
+        _ACTIVE_TIMER = None
