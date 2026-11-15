@@ -194,31 +194,11 @@ collectives, and DSpark drafting.
    in isolation but trail by 3–5% per call in serving when reading row-major
    weights. Screen a tile-contiguous weight layout for the decode projections,
    kept bit-identical with prefill.
-4. **Vocabulary head (`128`-row token tile and greedy argmax epilogue).**
-   - **A 128-row token tile:** a head call with 65–128 rows on TP4 `c16` runs a
-     second 64-row tile that re-reads and unpacks the 248 MB shard from DRAM.
-     A 128-row tile fits in ~96 KB of shared memory with two activation stages
-     and four weight stages, keeping the same K accumulation order (~1% ceiling
-     at sixteen streams on TP4).
-   - **Greedy argmax in the head epilogue:** write each tile's `(max, index)`
-     pair instead of full FP32 logits when all active requests are greedy (~12 MB
-     less written and read per TP4 call).
-   - **Certified `W_q` screening under `self.sink.rejection = True`:** in
-     `vllm/v1/worker/gpu/model_runner.py` (`_verify_greedily`),
-     `vocab_parallel_pairs_from_head` (`project_head_greedy_pairs` with the
-     8-bit `W_q` Cauchy-Schwarz screening table in the display carve-out) is
-     guarded by `if not rejection and hasattr(head, "tilelang_vocab_greedy"):`.
-     Because `DeepseekV41ForCausalLM` enables `self.sink.rejection = True` by
-     default, `vocab_parallel_pairs_from_head` runs only in `_dummy_sampler_run`
-     warmup and never in serving, falling back to `compute_logits_local` (full
-     248 MB 12-bit `lm_head` unpack) plus three DRAM passes over FP32
-     `local_logits` (`sink.cut`, `vocab_parallel_pairs`, and
-     `sink.alternates_of_greedy_shards`). Fold the single-column `sink.cut`
-     mask (`drafts[r] - vocab_start` when `sink_flags[r + 1]` is set) into
-     `project_head_greedy_pairs`, and compute top-4 shard candidates only on
-     the `num_reqs` winning bonus rows inside the refine pass so screened
-     greedy verification runs unconditionally in serving with 100% bit-identical
-     tokens and sink alternates.
+4. **Vocabulary head (`128`-row token tile).** A head call with 65–128 rows on
+   TP4 `c16` runs a second 64-row tile that re-reads and unpacks the 248 MB
+   shard from DRAM. A 128-row tile fits in ~96 KB of shared memory with two
+   activation stages and four weight stages, keeping the same K accumulation
+   order (~1% ceiling at sixteen streams on TP4).
 5. **A second stream inside the decode graph.** Overlap the shared expert with
    routed MoE, and attention key/indexer-key writes with the query path, on a
    second CUDA stream captured into the graph. First bound how much of the
@@ -295,16 +275,11 @@ In `1107`, per-layer SP WO local MXFP8 exchange (`0737`), sequence-parallel
 Engram prefill column exchange and sliced projection (`0738`), TP3 6-channel
 NCCL Ring and sparse-MLA `block_H=16` (`2` CTAs/head, `0740`), unconditional
 `M=64` MoE `prefill_swizzle_panel=2` (`0736`), retained CED encoder endpoints
-(`0727`), CED local boundary reduction (`0742`), and SP context-KV projection
-(`0743`) are all active.
+(`0727`), CED local boundary reduction (`0742`), SP context-KV projection
+(`0743`), and sequence-parallel MoE input local routing/MXFP8 gather are all
+active.
 
 Open levers:
-- **Sequence-parallel MoE input (`experiments/2026-10-14-sp-moe-gather`).** Each
-  encoder layer all-gathers BF16 rows, then casts them to MXFP8 twice (shared
-  and routed experts) and routes them on all $T$ rows on every rank (~4.4 ms a
-  layer at an 8,096-row chunk). Routing and casting each rank's own shard before
-  all-gathering MXFP8 rows with their scales and routes preserves exact bits
-  with a ~3–3.9% prefill ceiling.
 - **First request after a restart** is ~0.37 s slower to its first token than
   subsequent requests. Screen `CUDA_MODULE_LOADING=EAGER` (checking boot time
   impact) and sample the first request with `py-spy dump --nonblocking`.
@@ -421,9 +396,7 @@ Remaining kernel-level investigations:
 - **No fallbacks** (owner, 2026-10-14): every collective or kernel dispatch path
   must either be the tested production path or raise with a traceback.
 - **No silent test-gated defaults:** best production paths must be active by
-  default without requiring environment opt-ins or disabling guards (such as an
-  empty `ENGRAM_PACKED_DIR` default or `not rejection` skipping screened greedy
-  verification in serving).
+  default without requiring environment opt-ins or disabling guards.
 - The one-read `fill_defaults` fix (`0019`) is still needed on PyTorch main.
 - The NCCL IB send-path fence patch should be dropped once upstream releases the
   fix.

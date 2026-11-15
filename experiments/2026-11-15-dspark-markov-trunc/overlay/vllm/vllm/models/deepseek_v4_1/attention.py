@@ -1312,6 +1312,27 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase):
                 dtype=torch.uint8,
                 device=qr_kv.device,
             )
+            default_gather = getattr(
+                sp_prefill.SPRows, "_DEFAULT_GATHER_MXFP8", sp_prefill.SPRows.gather_mxfp8
+            )
+            can_async = (
+                hasattr(sp_rows, "gather_mxfp8_async")
+                and getattr(sp_rows, "can_gather_async", lambda *_: False)(qr_kv.device)
+                and getattr(type(sp_rows), "gather_mxfp8", None) is default_gather
+                and "gather_mxfp8" not in getattr(sp_rows, "__dict__", {})
+            )
+            overlap_index = (
+                can_async
+                and self.indexer is not None
+                and not _INDEX_SPLIT_CHECK
+                and not swa.is_decode
+            )
+            if not overlap_index and self.indexer is not None:
+                index_weights = self.indexer.weights_proj(hidden_states)
+                if _INDEX_SPLIT_CHECK or swa.is_decode:
+                    index_weights = sp_rows.gather(index_weights)
+                else:
+                    index_weights = index_weights[:real]
             if real > 0:
                 sp_attention_front(
                     qr_kv[:real],
@@ -1326,7 +1347,8 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase):
                 )
             comp_locals: tuple[torch.Tensor, ...] = ()
             if (
-                self.compressor is not None
+                can_async
+                and self.compressor is not None
                 and type(self.compressor) is DeepseekCompressor
                 and getattr(self.compressor, "_sp_kernel", None) is not None
                 and self.compressor.compress_ratio in (1, 2)
@@ -1335,11 +1357,6 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase):
                 comp_locals = self.compressor.project_sp_local(
                     hidden_states, sp_rows
                 )
-            overlap_index = (
-                self.indexer is not None
-                and not _INDEX_SPLIT_CHECK
-                and not swa.is_decode
-            )
             pre_index_query = None
             if overlap_index:
                 (q_cast, swa_records, *comp_gathered), wait_front = (
@@ -1365,12 +1382,6 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase):
                 q_cast, swa_records, *comp_gathered = sp_rows.gather_mxfp8(
                     local_q_cast, local_records, *comp_locals
                 )
-                if self.indexer is not None:
-                    index_weights = self.indexer.weights_proj(hidden_states)
-                    if _INDEX_SPLIT_CHECK or swa.is_decode:
-                        index_weights = sp_rows.gather(index_weights)
-                    else:
-                        index_weights = index_weights[:real]
             if comp_gathered:
                 self.compressor._prefetched_sp_gathered = tuple(comp_gathered)
             write_swa_records(
@@ -1671,14 +1682,17 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase):
                     deferred_q = None
                     del qr, hidden_states, index_weights
                     output = torch.empty_like(q)
-                self.forward_mqa(
-                    q,
-                    kv,
-                    positions,
-                    output,
-                    index_query=index_query,
-                    deferred_q=deferred_q,
-                )
+                if deferred_q is not None:
+                    self.forward_mqa(
+                        q,
+                        kv,
+                        positions,
+                        output,
+                        index_query=index_query,
+                        deferred_q=deferred_q,
+                    )
+                else:
+                    self.forward_mqa(q, kv, positions, output, index_query=index_query)
                 del q, kv, index_query, deferred_q
         return self._o_proj(output, sp_rows=sp_rows)
 
@@ -2067,10 +2081,14 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase):
                         split, selected, expected, repeat, expected_candidates
                     )
                     self.topk_indices_buffer[:rows].copy_(split.gather(selected))
-                else:
+                elif hasattr(split, "gather_many_async") and getattr(
+                    split, "can_gather_async", lambda *_: False
+                )(device):
                     (gathered_selected,), wait_selected = split.gather_many_async(
                         selected
                     )
+                else:
+                    self.topk_indices_buffer[:rows].copy_(split.gather(selected))
 
         if pending_aux is not None:
             torch.cuda.current_stream(device).wait_stream(pending_aux)

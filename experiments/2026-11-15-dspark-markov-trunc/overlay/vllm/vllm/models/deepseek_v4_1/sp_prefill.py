@@ -369,6 +369,12 @@ class SPRows:
 
     def gather_mxfp8_async(self, x_q, *extra: torch.Tensor):
         """Asynchronous ``gather_mxfp8`` returning ``((MXFP8Rows, *extra), wait_fn)``."""
+        if (
+            type(self).gather_mxfp8 is not _DEFAULT_GATHER_MXFP8
+            or "gather_mxfp8" in self.__dict__
+            or not self.can_gather_async(x_q.rows.device)
+        ):
+            return self.gather_mxfp8(x_q, *extra), (lambda: None)
         from vllm.models.deepseek_v4_1.tilelang.linear import MXFP8Rows, mxfp8_rows
 
         local = self.local_rows
@@ -665,7 +671,12 @@ class SPRows:
         """Exchange multiple `(send, recv)` pairs in one collective group when possible."""
         if not pairs:
             return
-        if len(pairs) == 1 or type(self).exchange_into is not SPRows.exchange_into:
+        if (
+            len(pairs) == 1
+            or not model_parallel_is_initialized()
+            or type(self).exchange_into is not _DEFAULT_EXCHANGE_INTO
+            or "exchange_into" in self.__dict__
+        ):
             for send, recv in pairs:
                 self.exchange_into(send, recv)
             return
@@ -703,6 +714,12 @@ class SPRows:
                     collectives._send(comm, send[peer], peer)
                     collectives._recv(comm, recv[peer], peer)
         comm.group_end()
+
+
+_DEFAULT_GATHER_MXFP8 = SPRows.gather_mxfp8
+_DEFAULT_EXCHANGE_INTO = SPRows.exchange_into
+SPRows._DEFAULT_GATHER_MXFP8 = _DEFAULT_GATHER_MXFP8
+SPRows._DEFAULT_EXCHANGE_INTO = _DEFAULT_EXCHANGE_INTO
 
 
 # The attention's WO projection is reduce-scattered in two slices from this many

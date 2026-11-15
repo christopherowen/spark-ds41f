@@ -562,7 +562,10 @@ class DeepseekCompressor(nn.Module):
                 self._prefetched_sp_gathered = None
             else:
                 local_outs = self.project_sp_local(hidden_states, sp_rows)
-                prefetched = sp_rows.gather_many(*local_outs)
+                if len(local_outs) == 1 and not hasattr(sp_rows, "gather_many"):
+                    prefetched = (sp_rows.gather(local_outs[0]),)
+                else:
+                    prefetched = sp_rows.gather_many(*local_outs)
             if self.compress_ratio == 1:
                 (values,) = prefetched
                 fg_kwargs = {"values": values}

@@ -127,15 +127,30 @@ def sp_moe_inputs(
     if not callable(route_local):
         raise ValueError("DS4.1 SP MoE requires a router with route_local")
 
+    from . import sp_prefill
     from .tilelang.linear import provide_mxfp8
     from .tilelang.router import provide_routes
 
-    (gathered_q,), wait_xq = sp_rows.gather_mxfp8_async(x_q)
-    weights, ids = route_local(x, sp_rows, input_ids=input_ids)
-    # Enqueue route gather before waiting for x_q so all_gather(weights, ids)
-    # runs on _side_stream while shared_experts runs on the compute stream.
-    (weights, ids), wait_routes = sp_rows.gather_many_async(weights, ids)
-    wait_xq()
+    default_gather = getattr(
+        sp_prefill.SPRows, "_DEFAULT_GATHER_MXFP8", sp_prefill.SPRows.gather_mxfp8
+    )
+    can_async = (
+        hasattr(sp_rows, "gather_mxfp8_async")
+        and getattr(sp_rows, "can_gather_async", lambda *_: False)(x_q.rows.device)
+        and getattr(type(sp_rows), "gather_mxfp8", None) is default_gather
+        and "gather_mxfp8" not in getattr(sp_rows, "__dict__", {})
+    )
+    if can_async:
+        (gathered_q,), wait_xq = sp_rows.gather_mxfp8_async(x_q)
+        weights, ids = route_local(x, sp_rows, input_ids=input_ids)
+        # Enqueue route gather before waiting for x_q so all_gather(weights, ids)
+        # runs on _side_stream while shared_experts runs on the compute stream.
+        (weights, ids), wait_routes = sp_rows.gather_many_async(weights, ids)
+        wait_xq()
+    else:
+        weights, ids = route_local(x, sp_rows, input_ids=input_ids)
+        gathered_q, weights, ids = sp_rows.gather_mxfp8(x_q, weights, ids)
+        wait_routes = None
     with (
         provide_mxfp8(gathered_q),
         provide_routes(gathered_q.rows, weights, ids, wait=wait_routes),
