@@ -71,7 +71,7 @@ LATE_TRIGGER_ROWS = 16
 
 def _dispatch_macros(num_experts, threads):
     warps = threads // 32
-    steps = threads.bit_length() - 1
+    warp_steps = (warps - 1).bit_length()
     assert threads >= num_experts and threads & (threads - 1) == 0
 
     @T.macro
@@ -141,23 +141,37 @@ def _dispatch_macros(num_experts, threads):
     ):
         """From per-expert route counts: padded offsets, tile map and padding rows."""
         padded = T.alloc_var(T.int32)
-        carry = T.alloc_var(T.int32)
+        val = T.alloc_var(T.int32)
+        prior = T.alloc_var(T.int32)
+        w_val = T.alloc_var(T.int32)
+        warp_base = T.alloc_var(T.int32)
         offset = T.alloc_var(T.int32)
         used_tiles = T.alloc_var(T.int32)
+        lane = tx % 32
+        warp = tx // 32
         padded = T.if_then_else(
             tx < num_experts, T.ceildiv(count, block_M) * block_M, 0
         )
         # scan may share storage with buffers the caller read last.
         T.sync_threads()
-        scan[tx] = padded
+        val = padded
+        for s in T.unroll(5):
+            prior = T.shfl_up(val, 1 << s)
+            if lane >= (1 << s):
+                val += prior
+        if lane == 31:
+            scan[warp] = val
         T.sync_threads()
-        for s in T.serial(steps):
-            carry = T.if_then_else(tx >= (1 << s), scan[T.max(tx - (1 << s), 0)], 0)
-            T.sync_threads()
-            scan[tx] += carry
-            T.sync_threads()
-        offset = scan[tx] - padded
-        used_tiles = scan[threads - 1] // block_M
+        w_val = T.if_then_else(lane < warps, scan[T.min(lane, warps - 1)], 0)
+        for s in T.unroll(warp_steps):
+            prior = T.shfl_up(w_val, 1 << s)
+            if lane >= (1 << s):
+                w_val += prior
+        warp_base = T.if_then_else(
+            warp > 0, T.shfl_sync(w_val, T.max(warp - 1, 0)), 0
+        )
+        offset = warp_base + val - padded
+        used_tiles = T.shfl_sync(w_val, warps - 1) // block_M
         if tx < num_experts:
             ExpertCount[tx] = count
             ExpertOffset[tx] = offset
@@ -178,7 +192,10 @@ def _dispatch_macros(num_experts, threads):
 
 
 @tilelang.jit(
-    pass_configs={tilelang.PassConfigKey.TL_DISABLE_THREAD_STORAGE_SYNC: True}
+    pass_configs={
+        tilelang.PassConfigKey.TL_DISABLE_THREAD_STORAGE_SYNC: True,
+        tilelang.PassConfigKey.TL_DISABLE_SAFE_MEMORY_ACCESS: True,
+    }
 )
 def moe_dispatch_v41(
     num_experts: int,
@@ -356,6 +373,7 @@ def moe_dispatch_v41(
     pass_configs={
         tilelang.PassConfigKey.TL_DISABLE_WARP_SPECIALIZED: True,
         tilelang.PassConfigKey.TL_DISABLE_THREAD_STORAGE_SYNC: True,
+        tilelang.PassConfigKey.TL_DISABLE_SAFE_MEMORY_ACCESS: True,
     },
 )
 def moe_combine_v41(
@@ -694,7 +712,13 @@ __device__ __forceinline__ void __tl_fused_swiglu_epilogue(
 """
 
 
-@tilelang.jit(pass_configs={tilelang.PassConfigKey.TL_DISABLE_WARP_SPECIALIZED: True})
+@tilelang.jit(
+    pass_configs={
+        tilelang.PassConfigKey.TL_DISABLE_WARP_SPECIALIZED: True,
+        tilelang.PassConfigKey.TL_DISABLE_THREAD_STORAGE_SYNC: True,
+        tilelang.PassConfigKey.TL_DISABLE_SAFE_MEMORY_ACCESS: True,
+    },
+)
 def grouped_fp8_fp4_gemm(
     num_experts: int,
     N: int,
@@ -906,10 +930,8 @@ def grouped_fp8_fp4_gemm(
                         T.access_ptr(SFB[expert, bx * block_N + j, ko], "r", 1),
                         1,
                     )
-        T.ptx_commit_group()
         # The arrival waits for this thread's copies to land, so the wait on
-        # loaded[s] publishes every thread's codes to the expand, which reads
-        # rows other threads copied (ptx_wait_group covers only its own).
+        # loaded[s] publishes every thread's copies and codes across the CTA.
         cp_async_barrier_noinc(loaded[s])
 
     @T.macro
@@ -977,11 +999,6 @@ def grouped_fp8_fp4_gemm(
                         loaded, expert, bx, tx, nxt, nxt_s, Narrow_flag,
                         code_base, max_nxt,
                     )
-                else:
-                    T.ptx_commit_group()
-        else:
-            T.ptx_commit_group()
-        T.ptx_wait_group(stages - 1)
         T.barrier_wait(loaded[s], phase)
         if coded_scales:
             # Every thread expands its own rows: the stage's barrier waited for
@@ -1007,7 +1024,10 @@ def grouped_fp8_fp4_gemm(
                         expand_wide_sfb(
                             SFC_shared, SFB_shared, base_words[c], s, j
                         )
-        T.sync_threads()
+            if block_M == 16 and sfb_copies == 1:
+                T.sync_warp()
+            else:
+                T.sync_threads()
         if max_ko < k_full:
             mma_full_k_tile(
                 A_shared, B_shared, C_local, SFA_shared, SFB_shared, s
@@ -1052,7 +1072,7 @@ def grouped_fp8_fp4_gemm(
                 T.import_source(_FUSED_SWIGLU_EPILOGUE_HEADER)
             if swizzle_panel > 0:
                 T.use_swizzle(panel_size=swizzle_panel)
-            if gather or trigger_after_loop:
+            if gather:
                 if trigger_after_loop:
                     pdl.wait()
                 else:
@@ -1091,7 +1111,7 @@ def grouped_fp8_fp4_gemm(
             expert = TileExpert[t]
             if (gather or trigger_after_loop) and expert < 0:
                 T.thread_return()
-            if not gather and not trigger_after_loop:
+            if not gather:
                 if expert >= 0:
                     if tx < block_M:
                         route_reg = Order[t * block_M + tx]
@@ -1109,9 +1129,12 @@ def grouped_fp8_fp4_gemm(
                                 (code_base >> 1) * n_blocks
                                 + bx * (2 - Narrow_flag)
                             ) * k_blocks
-                pdl.chain()
-                if expert < 0:
-                    T.thread_return()
+                if trigger_after_loop:
+                    pdl.wait()
+                else:
+                    pdl.chain()
+                    if expert < 0:
+                        T.thread_return()
                 if tx < block_M:
                     rows_shared[tx] = T.if_then_else(
                         route_reg >= 0, t * block_M + tx, -1
@@ -1160,8 +1183,6 @@ def grouped_fp8_fp4_gemm(
                             loaded, expert, bx, tx, p, p, Narrow_flag,
                             code_base, p,
                         )
-                    else:
-                        T.ptx_commit_group()
 
                 # Unroll by 2 * stages so stage indices and barrier parity phases
                 # fold at compile time in both the serial body and tail.
@@ -1194,6 +1215,7 @@ def grouped_fp8_fp4_gemm(
                 if trigger_after_loop:
                     pdl.trigger()
                 if fuse_swiglu:
+                    T.sync_threads()
                     for i, j in T.Parallel(block_M, block_N):
                         if rows_shared[i] >= 0:
                             C_shared[i, j] = T.cast(C_local[i, j], T.bfloat16)
@@ -1449,6 +1471,7 @@ def tile_expert_weights(b_packed, block_N):
     pass_configs={
         tilelang.PassConfigKey.TL_DISABLE_WARP_SPECIALIZED: True,
         tilelang.PassConfigKey.TL_DISABLE_THREAD_STORAGE_SYNC: True,
+        tilelang.PassConfigKey.TL_DISABLE_SAFE_MEMORY_ACCESS: True,
     },
 )
 def moe_swiglu_cast(
@@ -1506,6 +1529,59 @@ def moe_swiglu_cast(
     tiles = T.dynamic("tiles")
     rows = tiles * block_M
 
+    @T.macro
+    def compute_row(
+        r,
+        base,
+        col,
+        tid,
+        weights,
+        xl,
+        xr,
+        xl_f,
+        xr_f,
+        x_bf16,
+        x,
+        stored,
+        amax,
+        Out,
+        OutSF,
+    ):
+        row = base + r
+        weight = T.alloc_var(T.float32, init=weights[r])
+        for j in T.vectorized(vec):
+            xl_f[j] = T.float32(xl[r, j])
+            xr_f[j] = T.float32(xr[r, j])
+        for j in T.unroll(vec):
+            val_l = T.alloc_var(T.float32, init=xl_f[j])
+            val_r = T.alloc_var(T.float32, init=xr_f[j])
+            if limit is not None:
+                val_l = T.Select(val_l > limit, limit, val_l)
+                val_r = T.Select(val_r > limit, limit, val_r)
+                val_r = T.Select(val_r < -limit, -limit, val_r)
+            val = T.alloc_var(
+                T.float32,
+                init=(val_l / (1.0 + T.exp(-val_l))) * val_r * weight,
+            )
+            x_bf16[j] = T.cast(val, in_dtype)
+            x[j] = T.cast(x_bf16[j], T.float32)
+        for j in T.vectorized(2):
+            amax[j] = 0
+        for j in T.unroll(vec):
+            amax[j % 2] = T.max(amax[j % 2], T.abs(x[j]))
+        amax[0] = T.max(amax[0], amax[1])
+        for j in T.unroll(reduce_rounds):
+            amax[0] = T.max(amax[0], T.shfl_xor(amax[0], 1 << j))
+        sf, sf_inv = get_sf_and_inv(amax[0], out_config)
+        if (tid % warp) % sf_lanes == 0:
+            OutSF[row, col // SF_BLOCK] = sf
+        for j in T.vectorized(vec):
+            x[j] *= sf_inv
+        for j in T.vectorized(vec):
+            stored[j] = T.cast(x[j], T.float8_e4m3fn)
+        for j in T.vectorized(vec):
+            Out[row, col + j] = stored[j]
+
     @T.prim_func
     def moe_swiglu_cast_kernel(
         H: T.Tensor((rows, 2 * intermediate), in_dtype),
@@ -1530,59 +1606,93 @@ def moe_swiglu_cast(
             x = T.alloc_local((vec,), T.float32)
             stored = T.alloc_local((vec,), T.float8_e4m3fn)
             amax = T.alloc_local((2,), T.float32)
-            weight = T.alloc_var(T.float32)
             base = t * block_M + slab * rows_per_cta
             expert = TileExpert[t]
+            # Routes within each tile are packed contiguously from row 0, so a negative
+            # order at row 0 (or row 1) implies all remaining rows in the slab are padding.
             if expert >= 0:
-                for r in T.unroll(rows_per_cta):
-                    orders[r] = Order[base + r]
-                for r in T.unroll(rows_per_cta):
-                    if orders[r] >= 0:
-                        weights[r] = Weights[base + r]
+                orders[0] = Order[base]
+                if orders[0] >= 0:
+                    weights[0] = Weights[base]
+                    if rows_per_cta > 1:
+                        orders[1] = Order[base + 1]
+                        if orders[1] >= 0:
+                            weights[1] = Weights[base + 1]
+                            for r in T.unroll(rows_per_cta - 2):
+                                orders[r + 2] = Order[base + r + 2]
+                                if orders[r + 2] >= 0:
+                                    weights[r + 2] = Weights[base + r + 2]
             pdl.chain()
-            if expert >= 0:
-                for r in T.unroll(rows_per_cta):
-                    if orders[r] >= 0:
-                        for j in T.vectorized(vec):
-                            xl[r, j] = H[base + r, slab_col + j]
-                        for j in T.vectorized(vec):
-                            xr[r, j] = H[base + r, up_col + j]
-                for r in T.unroll(rows_per_cta):
-                    row = base + r
-                    if orders[r] >= 0:
-                        weight = weights[r]
-                        for j in T.vectorized(vec):
-                            xl_f[j] = T.float32(xl[r, j])
-                            xr_f[j] = T.float32(xr[r, j])
-                        for j in T.unroll(vec):
-                            val_l = T.alloc_var(T.float32, init=xl_f[j])
-                            val_r = T.alloc_var(T.float32, init=xr_f[j])
-                            if limit is not None:
-                                val_l = T.Select(val_l > limit, limit, val_l)
-                                val_r = T.Select(val_r > limit, limit, val_r)
-                                val_r = T.Select(val_r < -limit, -limit, val_r)
-                            val = T.alloc_var(
-                                T.float32,
-                                init=(val_l / (1.0 + T.exp(-val_l))) * val_r * weight,
+            if expert >= 0 and orders[0] >= 0:
+                for j in T.vectorized(vec):
+                    xl[0, j] = H[base, slab_col + j]
+                for j in T.vectorized(vec):
+                    xr[0, j] = H[base, up_col + j]
+                if rows_per_cta > 1 and orders[1] >= 0:
+                    for j in T.vectorized(vec):
+                        xl[1, j] = H[base + 1, slab_col + j]
+                    for j in T.vectorized(vec):
+                        xr[1, j] = H[base + 1, up_col + j]
+                    for r in T.unroll(rows_per_cta - 2):
+                        if orders[r + 2] >= 0:
+                            for j in T.vectorized(vec):
+                                xl[r + 2, j] = H[base + r + 2, slab_col + j]
+                            for j in T.vectorized(vec):
+                                xr[r + 2, j] = H[base + r + 2, up_col + j]
+                compute_row(
+                    0,
+                    base,
+                    col,
+                    tid,
+                    weights,
+                    xl,
+                    xr,
+                    xl_f,
+                    xr_f,
+                    x_bf16,
+                    x,
+                    stored,
+                    amax,
+                    Out,
+                    OutSF,
+                )
+                if rows_per_cta > 1 and orders[1] >= 0:
+                    compute_row(
+                        1,
+                        base,
+                        col,
+                        tid,
+                        weights,
+                        xl,
+                        xr,
+                        xl_f,
+                        xr_f,
+                        x_bf16,
+                        x,
+                        stored,
+                        amax,
+                        Out,
+                        OutSF,
+                    )
+                    for r in T.unroll(rows_per_cta - 2):
+                        if orders[r + 2] >= 0:
+                            compute_row(
+                                r + 2,
+                                base,
+                                col,
+                                tid,
+                                weights,
+                                xl,
+                                xr,
+                                xl_f,
+                                xr_f,
+                                x_bf16,
+                                x,
+                                stored,
+                                amax,
+                                Out,
+                                OutSF,
                             )
-                            x_bf16[j] = T.cast(val, in_dtype)
-                            x[j] = T.cast(x_bf16[j], T.float32)
-                        for j in T.vectorized(2):
-                            amax[j] = 0
-                        for j in T.unroll(vec):
-                            amax[j % 2] = T.max(amax[j % 2], T.abs(x[j]))
-                        amax[0] = T.max(amax[0], amax[1])
-                        for j in T.unroll(reduce_rounds):
-                            amax[0] = T.max(amax[0], T.shfl_xor(amax[0], 1 << j))
-                        sf, sf_inv = get_sf_and_inv(amax[0], out_config)
-                        if (tid % warp) % sf_lanes == 0:
-                            OutSF[row, col // SF_BLOCK] = sf
-                        for j in T.vectorized(vec):
-                            x[j] *= sf_inv
-                        for j in T.vectorized(vec):
-                            stored[j] = T.cast(x[j], T.float8_e4m3fn)
-                        for j in T.vectorized(vec):
-                            Out[row, col + j] = stored[j]
 
     return moe_swiglu_cast_kernel
 

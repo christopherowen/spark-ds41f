@@ -85,3 +85,36 @@
 | `inter=768, rows=2048` | `11467.0` | `11470.9` | `+3.9 us` (`1.000x`) | `0` |
 | `inter=768, rows=4096` | `13489.0` | `13066.5` | **`-422.5 us` (`1.032x`)** | `0` |
 | `inter=768, rows=6144` | `16321.5` | `15951.3` | **`-370.1 us` (`1.023x`)** | `0` |
+
+### Step 2 Cluster Gate (`sp1`, `tp4-switched`, commit `336ba005a`)
+
+- Receipts archived in `receipts/step2/tp4-switched/`. Includes both the `indexer.py` `rows >= 64` decode fix and the fused `prefill_gate_up -> moe_swiglu_cast` kernel.
+- **`screen` (`20261115T230729-screen-tp4-switched`, 2 boots `c59`, `c59-again` vs `c58-final` recorded)**:
+  - `model` (`c59` -> `c59-again`): `128/128` greedy identical; `100.00%` identical distributions over `32,768` positions (`128` sequences), `KL mean 0.000e+00`, perplexity `1.31888 -> 1.31888`.
+  - `prefill` (`default-text`): `32,768`: `9224.952` / `9385.513` (`+1.40% ±5.80%`, `same`, repeat `+1.74%`, boot 2 `9385.513` `+2.28% ±1.01%` better); `262,144`: `9572.537` / `9627.823` (`+2.02% ±0.76%`, **`better`**, margin `1.11%`).
+  - `c16`: `output tok/s` `268.967` / `268.820` (`+0.13% ±0.87%`, `same` vs `c58-final` `268.720` / `268.343`); `decode tok/s, paired` `+0.09% ±0.46%` (`same`).
+  - `grid`: `decode geometric mean (20)` `+0.24% ±0.13%` (`margin 0.27%`, repeat `+0.07%`, **`same`** vs `c58-final`) — Step 1 `@4K` regression eliminated.
+- **`bench` (`20261115T230732-bench-prefill-tp4-switched`, `prefill` `--prefill-text source`, 2 boots `b1`, `b2`)**:
+  - `32,768`: `b1 = 9483.11` (`9449.52`..`9516.71`), `b2 = 9487.26` (`9444.32`..`9530.20`) (vs `c58-final` `9385.90` / `9423.59`, Step 1 `9472.72` / `9406.39`).
+  - `131,072`: `b1 = 9880.00` (`9847.28`..`9912.72`), `b2 = 9852.12` (`9830.05`..`9874.19`) (vs `c58-final` `9742.71` / `9779.57`, Step 1 `9848.14` / `9830.82`).
+  - `262,144`: `b1 = 9723.23` (`9681.61`..`9764.84`), `b2 = 9693.67` (`9685.57`..`9701.77`) (vs `c58-final` `9634.65` / `9627.49`, Step 1 `9706.88` / `9680.10`).
+  - Memory/thermals (`b1`/`b2`): `sp1` `min_available_gib` `17.25` / `17.21 GiB` (`swap_growth_gib = 0.0`); `max_gpu_c` up to `73.0 C` (`b1`) / `75.0 C` (`b2`), `thermal_slowdown_ms = 0.0`, `power_cap_ms = 0.0` across `sp1..sp4`.
+
+## Step 3 — PR `#1005` MoE Dispatch Scan, Sync, and SwiGLU Preload Optimization
+
+### Changes
+- Cherry-picked PR `#1005` onto `overlay/vllm/vllm/models/deepseek_v4_1/tilelang/moe.py` and `overlay/vllm/tests/kernels/moe/test_deepseek_v41_tilelang_moe.py`, while preserving `c58` BF16 SwiGLU intermediate rounding (`x_bf16[j] = T.cast(val, in_dtype); x[j] = T.cast(x_bf16[j], T.float32)`), Step 2's `slab_interleaved` layout and `fuse_swiglu` epilogue, explicit `T.sync_threads()` both before and after `C_shared` in `fuse_swiglu`, and `if (gather or trigger_after_loop) and expert < 0:` early return:
+  - Replaced `_dispatch_macros.layout()` 9-step shared-memory Hillis-Steele scan (25 `__syncthreads()` in fused `moe_dispatch_v41`) with two-level warp-shuffle prefix scan (7 `__syncthreads()`).
+  - Enabled `TL_DISABLE_SAFE_MEMORY_ACCESS` across `moe_dispatch_v41`, `moe_combine_v41`, `grouped_fp8_fp4_gemm`, and `moe_swiglu_cast`, plus `TL_DISABLE_THREAD_STORAGE_SYNC` on `grouped_fp8_fp4_gemm`.
+  - Removed redundant `T.ptx_commit_group()` / `T.ptx_wait_group(stages - 1)` in `grouped_fp8_fp4_gemm` (already synchronized by `loaded[s]`), switched `block_M == 16 and sfb_copies == 1` coded-scale expansion sync from `T.sync_threads()` to `T.sync_warp()`, and unified non-gather metadata preload before `pdl.wait()` / `pdl.chain()`.
+  - Added cascaded `orders[0]` / `orders[1]` / `Weights` preloading and early empty-slab exit in `moe_swiglu_cast` via `@T.macro def compute_row(...)`.
+
+### Verification & Microbenchmark (`sp8`, GB10 `sm_121a`, `spark-ds41f:candidate-55` + Step 3 overlay)
+
+- `pytest -q -p tblib_stub -p offline_skip -p tests.kernels.deepseek_v41_pdl_sources tests/kernels/moe/test_deepseek_v41_tilelang_moe.py tests/models/test_deepseek_v4_1_l2_schedule.py`: **`157 passed, 14 warnings in 197.27s`** (`PDL sources: 143 kernels launched, 135 with PDL, 0 violations`).
+- 25-iter interleaved eager `MoeExpertsV41Plan.run` A/B median (`Step 2` vs `Step 3`, `E=384, topk=6, H=5120`, `uint16_diffs=0`, `max_abs=0.000e+00` on all 16 shapes):
+  - `inter=576`: `rows=1` `120.9 -> 130.5 us` (`+9.5`), `rows=6` `650.9 -> 633.1 us` (`-17.8`), `rows=24` `2370.8 -> 2346.5 us` (`-24.3`), `rows=64` `4562.6 -> 4499.2 us` (`-63.4`), `rows=1024` `7961.6 -> 7853.2 us` (`-108.5`), `rows=2048` `8772.0 -> 8650.4 us` (`-121.6`), `rows=4096` `10365.0 -> 10320.0 us` (`-45.0`), `rows=6144` `12453.7 -> 12509.7 us` (`+56.0`).
+  - `inter=768`: `rows=1` `406.5 -> 410.8 us` (`+4.3`), `rows=6` `805.3 -> 808.7 us` (`+3.4`), `rows=24` `2889.7 -> 2900.9 us` (`+11.3`), `rows=64` `5715.3 -> 5740.5 us` (`+25.2`), `rows=1024` `10020.5 -> 10035.1 us` (`+14.6`), `rows=2048` `11130.0 -> 11215.9 us` (`+85.8`), `rows=4096` `13293.4 -> 13090.3 us` (`-203.1`), `rows=6144` `15938.5 -> 15749.7 us` (`-188.9`).
+- 30-iter interleaved CUDA-graph decode `MoeExpertsV41Plan.run` A/B median (`Step 2` vs `Step 3`, `uint16_diffs=0` on all 12 shapes):
+  - `inter=576`: `rows=1` `121.7 -> 100.5 us` (**`-21.2 us` / `1.211x`**), `rows=6` `612.1 -> 603.5 us` (`-8.6`), `rows=12` `1266.5 -> 1253.1 us` (`-13.5`), `rows=24` `2348.1 -> 2324.0 us` (`-24.1`), `rows=48` `3582.7 -> 3531.7 us` (`-51.0`), `rows=64` `4549.4 -> 4477.0 us` (`-72.4`).
+  - `inter=768`: `rows=1` `152.2 -> 140.4 us` (**`-11.8 us` / `1.084x`**), `rows=6` `773.0 -> 773.8 us` (`+0.8`), `rows=12` `1599.8 -> 1585.0 us` (`-14.8`), `rows=24` `2900.8 -> 2885.6 us` (`-15.2`), `rows=48` `4819.9 -> 4781.8 us` (`-38.1`), `rows=64` `5724.5 -> 5691.8 us` (`-32.7`).

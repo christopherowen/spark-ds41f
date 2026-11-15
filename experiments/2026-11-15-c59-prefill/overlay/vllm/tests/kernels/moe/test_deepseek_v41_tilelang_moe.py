@@ -912,25 +912,41 @@ def test_routed_moe_pdl_preloads_before_wait():
         wait_pos = d_src.index("cudaGridDependencySynchronize()")
         topk_pos = d_src.index("TopkIdx[")
         assert clear_pos < wait_pos < topk_pos
+        if part == "fused":
+            assert "__shfl_up_sync" in d_src
+            assert "__shfl_sync" in d_src
+            assert d_src.count("__syncthreads()") == 7
 
-    down_src = grouped_fp8_fp4_gemm(
-        384,
-        5120,
-        576,
-        6,
-        False,
-        16,
-        128,
-        num_stages=2,
-        coded_scales=True,
-        narrow_codes=True,
-        trigger_after_loop=False,
-    ).get_kernel_source()
-    wait_pos = down_src.index("cudaGridDependencySynchronize()")
-    assert down_src.index("TileExpert[") < wait_pos
-    assert down_src.index("Order[") < wait_pos
-    assert down_src.index("SFBase[") < wait_pos
-    assert down_src.index("Narrow[") < wait_pos
+    for late in (False, True):
+        down_src = grouped_fp8_fp4_gemm(
+            384,
+            5120,
+            576,
+            6,
+            False,
+            16,
+            128,
+            num_stages=2,
+            coded_scales=True,
+            narrow_codes=True,
+            trigger_after_loop=late,
+        ).get_kernel_source()
+        wait_pos = down_src.index("cudaGridDependencySynchronize()")
+        assert down_src.index("TileExpert[") < wait_pos
+        assert down_src.index("Order[") < wait_pos
+        assert down_src.index("SFBase[") < wait_pos
+        assert down_src.index("Narrow[") < wait_pos
+        assert "__syncwarp()" in down_src
+        assert "cp_async_gs(" not in down_src
+        assert "cp_async_wait<" not in down_src
+
+    swiglu_src = moe_swiglu_cast(768, 16, LIMIT).get_kernel_source()
+    wait_pos = swiglu_src.index("cudaGridDependencySynchronize()")
+    assert swiglu_src.index("TileExpert[") < wait_pos
+    assert swiglu_src.index("Order[") < wait_pos
+    assert swiglu_src.index("Weights[") < wait_pos
+    assert "if ((0 <= expert) && (0 <= orders[0]))" in swiglu_src[wait_pos:]
+    assert wait_pos < swiglu_src.index("*(uint4*)(H + ")
 
     comb_src = moe_combine_v41(
         5120, 6, shared=True, weighted=True, out_dtype=T.bfloat16
