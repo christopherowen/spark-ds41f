@@ -29,8 +29,6 @@ rows, and then projects each peer rank's WO-B shard on the ``L`` local rows into
 the rank-order FP32 sum identical to the full-row path.
 """
 
-import tilelang
-import tilelang.language as T
 import torch
 from torch import nn
 
@@ -43,10 +41,7 @@ from vllm.v1.worker.workspace import current_preallocated_workspace
 from .. import l2_prefetch
 from . import prepare
 from .gemm import (
-    SF_BLOCK,
-    SF_WORD_K,
     SPLIT_FP8,
-    block_scale_words,
     fp8_prefill_config,
     fp8w_bf16_gemm_cast,
     fp8w_bf16_gemm_partials,
@@ -195,152 +190,6 @@ class _GroupedBF16:
         self.reduce(partials, xq, sf)
 
 
-
-@tilelang.jit(
-    pass_configs={tilelang.PassConfigKey.TL_DISABLE_WARP_SPECIALIZED: True}
-)
-def _wo_peers_rank_sum(
-    N: int,
-    K: int,
-    world: int,
-    rank: int,
-    block_M: int = 64,
-    block_N: int = 128,
-    block_K: int = 128,
-    num_stages: int = 2,
-    threads: int = 128,
-    swizzle_panel: int = 8,
-):
-    """Project peer WO-B shards and accumulate in strict rank order with Out."""
-    assert K % block_K == 0 and N % 32 == 0 and N % block_N == 0
-    assert world in (3, 4) and 0 <= rank < world
-    M = T.dynamic("M")
-    M_local = T.dynamic("M_local")
-    in_dtype = T.float8_e4m3fn
-    accum_dtype = T.float32
-    sf_w = scale_words(K)
-    bw = block_scale_words(block_K)
-    k_blocks = K // block_K
-    num_peers = world - 1
-    peers = tuple(p for p in range(world) if p != rank)
-    p0_idx = peers[0]
-    p1_idx = peers[1]
-    p2_idx = peers[2] if world == 4 else 0
-
-    @T.prim_func
-    def wo_peers_rank_sum(
-        A_all: T.Tensor((world, M_local, K), in_dtype),
-        B_peers: T.Tensor((num_peers, N, K), in_dtype),
-        SFA_all: T.Tensor((world, M_local, sf_w), T.uint32),
-        SFB_peers: T.Tensor((num_peers, N // 32, sf_w), T.uint32),
-        Out: T.Tensor((M, N), T.bfloat16),
-    ):
-        with T.Kernel(
-            T.ceildiv(N, block_N), T.ceildiv(M, block_M), threads=threads
-        ) as (bx, by):
-            T.use_swizzle(panel_size=swizzle_panel)
-            A_shared = T.alloc_shared((block_M, block_K), in_dtype)
-            B_shared = T.alloc_shared((block_N, block_K), in_dtype)
-            SFA_shared = T.alloc_shared((block_M, bw), T.uint32)
-            SFB_shared = T.alloc_shared((block_N, bw), T.uint32)
-            C_local = T.alloc_fragment((block_M, block_N), accum_dtype)
-            P0 = T.alloc_fragment((block_M, block_N), T.bfloat16)
-            P1 = T.alloc_fragment((block_M, block_N), T.bfloat16)
-            Self = T.alloc_fragment((block_M, block_N), T.bfloat16)
-
-            for i, j in T.Parallel(block_M, block_N):
-                if by * block_M + i < M:
-                    Self[i, j] = Out[by * block_M + i, bx * block_N + j]
-                else:
-                    Self[i, j] = T.Cast(T.bfloat16, 0.0)
-
-            T.clear(C_local)
-            for ko in T.Pipelined(num_peers * k_blocks, num_stages=num_stages):
-                slot = ko // k_blocks
-                kb = ko % k_blocks
-                if world == 3:
-                    a_r = T.if_then_else(slot == 0, p0_idx, p1_idx)
-                else:
-                    a_r = T.if_then_else(
-                        slot == 0, p0_idx, T.if_then_else(slot == 1, p1_idx, p2_idx)
-                    )
-                T.copy(A_all[a_r, by * block_M, kb * block_K], A_shared)
-                T.copy(B_peers[slot, bx * block_N, kb * block_K], B_shared)
-                word0 = kb * block_K // SF_WORD_K
-                for i, w in T.Parallel(block_M, bw):
-                    SFA_shared[i, w] = SFA_all[
-                        a_r, T.min(by * block_M + i, M - 1), T.min(word0 + w, sf_w - 1)
-                    ]
-                for j, w in T.Parallel(block_N, bw):
-                    row = T.min(bx * block_N + j, N - 1)
-                    SFB_shared[j, w] = SFB_peers[
-                        slot, row // 32, T.min(word0 + w, sf_w - 1)
-                    ]
-                T.mma_gemm_blockscaled(
-                    A_shared,
-                    B_shared,
-                    C_local,
-                    SFA_shared,
-                    SFB_shared,
-                    transpose_B=True,
-                    k_start=kb * block_K % SF_WORD_K,
-                    sf_a_granularity_k=SF_BLOCK,
-                    sf_b_granularity_k=SF_BLOCK,
-                )
-                if ko + 1 == k_blocks:
-                    for i, j in T.Parallel(block_M, block_N):
-                        P0[i, j] = T.Cast(T.bfloat16, C_local[i, j])
-                    T.clear(C_local)
-                elif world == 4 and ko + 1 == 2 * k_blocks:
-                    for i, j in T.Parallel(block_M, block_N):
-                        P1[i, j] = T.Cast(T.bfloat16, C_local[i, j])
-                    T.clear(C_local)
-
-            for i, j in T.Parallel(block_M, block_N):
-                plast = T.Cast(T.bfloat16, C_local[i, j])
-                ps = Self[i, j]
-                p0 = P0[i, j]
-                if world == 3:
-                    if rank == 0:
-                        acc = (
-                            T.Cast(T.float32, ps) + T.Cast(T.float32, p0)
-                        ) + T.Cast(T.float32, plast)
-                    elif rank == 1:
-                        acc = (
-                            T.Cast(T.float32, p0) + T.Cast(T.float32, ps)
-                        ) + T.Cast(T.float32, plast)
-                    else:
-                        acc = (
-                            T.Cast(T.float32, p0) + T.Cast(T.float32, plast)
-                        ) + T.Cast(T.float32, ps)
-                else:
-                    p1 = P1[i, j]
-                    if rank == 0:
-                        acc = (
-                            (T.Cast(T.float32, ps) + T.Cast(T.float32, p0))
-                            + T.Cast(T.float32, p1)
-                        ) + T.Cast(T.float32, plast)
-                    elif rank == 1:
-                        acc = (
-                            (T.Cast(T.float32, p0) + T.Cast(T.float32, ps))
-                            + T.Cast(T.float32, p1)
-                        ) + T.Cast(T.float32, plast)
-                    elif rank == 2:
-                        acc = (
-                            (T.Cast(T.float32, p0) + T.Cast(T.float32, p1))
-                            + T.Cast(T.float32, ps)
-                        ) + T.Cast(T.float32, plast)
-                    else:
-                        acc = (
-                            (T.Cast(T.float32, p0) + T.Cast(T.float32, p1))
-                            + T.Cast(T.float32, plast)
-                        ) + T.Cast(T.float32, ps)
-                if by * block_M + i < M:
-                    Out[by * block_M + i, bx * block_N + j] = T.Cast(T.bfloat16, acc)
-
-    return wo_peers_rank_sum
-
-
 class TileLangWOProjection:
     """WO-A and WO-B of one attention layer (built after loading; its layer declares
     the kernels with ``declare_kernels``)."""
@@ -369,25 +218,10 @@ class TileLangWOProjection:
         )
         self.sp_rank_groups: tuple[int, ...] = ()
         self.sp_shards: tuple[_Weight | _PeerWeight, ...] | None = None
-        self.sp_peers_rank_sum = None
-        self.sp_peer_w: torch.Tensor | None = None
-        self.sp_peer_sf: torch.Tensor | None = None
 
     def enable_sp(self, rank_groups: tuple[int, ...]) -> None:
         """Record every TP rank's trimmed WO group count for SP local projection."""
         self.sp_rank_groups = tuple(int(g) for g in rank_groups)
-
-    def _fused_sp_cols(self) -> int | None:
-        if len(self.sp_rank_groups) not in (3, 4) or self.hidden % 128 != 0:
-            return None
-        unique = set(self.sp_rank_groups)
-        if len(unique) != 1:
-            return None
-        groups = next(iter(unique))
-        cols = groups * self.rank_width
-        if groups <= 0 or cols != self.a.columns or cols % 128 != 0:
-            return None
-        return cols
 
     def _sp_prefill_calls(self) -> dict[int, prepare.TileLangCall]:
         if not self.sp_rank_groups:
@@ -415,26 +249,13 @@ class TileLangWOProjection:
             return
         from . import collectives, columns
 
+        sp_calls = self._sp_prefill_calls()
         world = len(self.sp_rank_groups)
-        fused_cols = self._fused_sp_cols()
-        if fused_cols is not None:
-            fused_rank = get_tensor_model_parallel_rank()
-            fused_call = prepare.call(
-                _wo_peers_rank_sum, self.hidden, fused_cols, world, fused_rank
-            )
-            sp_calls: dict[int, prepare.TileLangCall] = {}
-            extra_calls = [
-                fused_call,
-                prepare.call(columns.zero_packs_kernel),
-            ]
-        else:
-            fused_call = None
-            sp_calls = self._sp_prefill_calls()
-            extra_calls = [
-                *sp_calls.values(),
-                prepare.call(columns.zero_packs_kernel),
-                prepare.call(collectives.rank_order_sum_kernel, world),
-            ]
+        extra_calls = [
+            *sp_calls.values(),
+            prepare.call(columns.zero_packs_kernel),
+            prepare.call(collectives.rank_order_sum_kernel, world),
+        ]
 
         def bind() -> None:
             # Decode and non-SP steps retain their original TP shard and kernels.
@@ -467,32 +288,10 @@ class TileLangWOProjection:
             gathered_sf = tensor_model_parallel_all_gather(padded_sf, dim=0).view(
                 world, self.hidden // 32, max_sf_words
             )
-            if fused_call is not None:
-                assert fused_cols is not None
-                sf_words = scale_words(fused_cols)
-                peers = [peer for peer in range(world) if peer != rank]
-                peer_w = torch.stack(
-                    [gathered_w[peer, :, :fused_cols] for peer in peers], dim=0
-                ).contiguous()
-                peer_sf = torch.stack(
-                    [gathered_sf[peer, :, :sf_words] for peer in peers], dim=0
-                ).contiguous()
-                self.sp_peer_w = peer_w
-                self.sp_peer_sf = peer_sf
-                self.sp_peers_rank_sum = prepare.launch(fused_call)
-                peer_slot = {peer: idx for idx, peer in enumerate(peers)}
-                shards: list[_Weight | _PeerWeight] = [
-                    self.b
-                    if peer == rank
-                    else _PeerWeight(peer_w[peer_slot[peer]], peer_sf[peer_slot[peer]], None)
-                    for peer in range(world)
-                ]
-                self.sp_shards = tuple(shards)
-                return
             prefill_by_cols = {
                 cols: prepare.launch(call) for cols, call in sp_calls.items()
             }
-            shards = []
+            shards: list[_Weight | _PeerWeight] = []
             for peer, peer_groups in enumerate(self.sp_rank_groups):
                 if peer == rank:
                     shards.append(self.b)
@@ -622,34 +421,6 @@ class TileLangWOProjection:
                 for peer in range(world)
             ]
 
-        if self.sp_peers_rank_sum is not None and device.type == "cuda":
-            assert (
-                self.sp_peer_w is not None
-                and self.sp_peer_sf is not None
-                and isinstance(xq_recv, torch.Tensor)
-                and isinstance(sf_recv, torch.Tensor)
-            )
-            out = torch.empty(
-                (local, self.hidden), dtype=torch.bfloat16, device=device
-            )
-            main = torch.cuda.current_stream(device)
-            side = sp_prefill._side_stream(device)
-            side.wait_stream(main)
-            with torch.cuda.stream(side):
-                sp_rows.exchange_many_into((xq_send, xq_recv), (sf_send, sf_recv))
-            self._project_sp_shard(rank, xq_send[rank], sf_send[rank], out, real, local)
-            main.wait_stream(side)
-            if real:
-                self.sp_peers_rank_sum(
-                    xq_recv,
-                    self.sp_peer_w,
-                    sf_recv.view(torch.uint32),
-                    self.sp_peer_sf,
-                    out[:real],
-                )
-            if then is not None:
-                then()
-            return out
         parts = torch.empty(
             (world, local, self.hidden), dtype=torch.bfloat16, device=device
         )
@@ -664,8 +435,7 @@ class TileLangWOProjection:
             )
             main.wait_stream(side)
         else:
-            sp_rows.exchange_into(xq_send, xq_recv)
-            sp_rows.exchange_into(sf_send, sf_recv)
+            sp_rows.exchange_many_into((xq_send, xq_recv), (sf_send, sf_recv))
             self._project_sp_shard(
                 rank, xq_send[rank], sf_send[rank], parts[rank], real, local
             )

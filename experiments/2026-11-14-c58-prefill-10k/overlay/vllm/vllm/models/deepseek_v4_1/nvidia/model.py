@@ -5,7 +5,6 @@ import typing
 from collections.abc import Callable, Iterable
 from itertools import islice
 
-import numpy as np
 import regex as re
 import torch
 import torch.nn as nn
@@ -58,6 +57,7 @@ from .. import kernels, l2_prefetch, sp_prefill
 from ..attention import DeepseekV4Attention
 from ..ced import ced_decoder_start, gather_rows, gather_sp_rows, scatter_rows
 from ..common.engram import Engram, EngramLayout, NgramHashState
+from ..engram_rows import host_hash
 from ..glp import glp_steering
 
 if typing.TYPE_CHECKING:
@@ -446,7 +446,7 @@ class DeepseekV4DecoderLayer(nn.Module):
             # SP: attention gathers every row and reduce-scatters its output.
             with sp_prefill.activate(sp_rows), kernels.mxfp8_inputs(x_q):
                 x = self.attn(positions, x, None)
-            if sp_rows.unreduced and x.ndim == 3:
+            if sp_rows.unreduced:
                 x = sp_prefill.unreduced_parts(x)
         del x_q
         if glp is not None:
@@ -635,14 +635,7 @@ class DeepseekV4Model(nn.Module, EagleModelMixin):
                 dtype=torch.float32,
             )
         self._ced_encoder_only: bool = False
-        self._last_engram_layer_idx: int | None = max(
-            (
-                idx
-                for idx in range(self.start_layer, self.end_layer)
-                if getattr(self.layers[idx], "engram", None) is not None
-            ),
-            default=None,
-        )
+        self._pending_engram_stage = None
         self._pending_engram_prefetch = None
         self._encoder_only_zeros: torch.Tensor | None = None
         self._max_num_batched_tokens = (
@@ -734,6 +727,7 @@ class DeepseekV4Model(nn.Module, EagleModelMixin):
             for layer in islice(self.layers, self.start_layer, self.end_layer)
             if getattr(layer, "engram", None) is not None
         )
+        self._pending_engram_stage = None
         if self.engram_hash is None:
             raise RuntimeError("Disk Engram requires initialized hash state")
         tokens = input_ids.shape[0]
@@ -746,30 +740,47 @@ class DeepseekV4Model(nn.Module, EagleModelMixin):
             self.prepared_engram_hashes[:tokens],
         )
         stream = torch.cuda.current_stream()
-        if early is None:
-            for engram in engrams:
-                engram.stage_rows(tokens, stream, None)
-        elif isinstance(early, np.ndarray):
+        if isinstance(early, tuple) and len(early) == 2 and len(engrams) == 2:
+            early_0, early_1_or_fn = early
+            early_has_unknown = bool((early_0 == host_hash.UNKNOWN).any())
+            if not early_has_unknown and (
+                engrams[0].layer_hash_index == 0 and engrams[1].layer_hash_index == 1
+            ):
+                engrams[0].stage_rows(tokens, stream, early_0)
+                if callable(early_1_or_fn):
+
+                    def _stage_remaining() -> None:
+                        engrams[1].stage_rows(
+                            tokens, torch.cuda.current_stream(), early_1_or_fn()
+                        )
+
+                    self._pending_engram_stage = _stage_remaining
+                    return
+                if not bool((early_1_or_fn == host_hash.UNKNOWN).any()):
+                    engrams[1].stage_rows(tokens, stream, early_1_or_fn)
+                    return
+            early_1 = early_1_or_fn() if callable(early_1_or_fn) else early_1_or_fn
+            by_layer = (early_0, early_1)
             for engram in engrams:
                 engram.stage_rows(
-                    tokens, stream, early[:, engram.layer_hash_index]
+                    tokens,
+                    stream,
+                    by_layer[engram.layer_hash_index],
                 )
-        else:
-            early_iter = iter(early)
-            prev_idx = -1
-            for engram in engrams:
-                target_idx = engram.layer_hash_index
-                early_layer = None
-                while prev_idx < target_idx:
-                    early_layer = next(early_iter)
-                    prev_idx += 1
-                engram.stage_rows(tokens, stream, early_layer)
+            return
+        for engram in engrams:
+            engram.stage_rows(
+                tokens,
+                stream,
+                None if early is None else early[:, engram.layer_hash_index],
+            )
 
     def prepare_dummy_engram(self, num_tokens):
         if torch.cuda.is_current_stream_capturing():
             raise RuntimeError(
                 "Disk Engram preparation must run outside compile/capture"
             )
+        self._pending_engram_stage = None
         self._pending_engram_prefetch = None
         self.prepared_engram_hashes.fill_(-1)
         for layer in islice(self.layers, self.start_layer, self.end_layer):
@@ -1021,13 +1032,15 @@ class DeepseekV4Model(nn.Module, EagleModelMixin):
                 steer_rows=steer_rows,
                 encoder_only=boundary_encoder_only,
             )
-            if (
-                idx == self._last_engram_layer_idx
-                and self._pending_engram_prefetch is not None
-            ):
-                prefetch_fn = self._pending_engram_prefetch
-                self._pending_engram_prefetch = None
-                prefetch_fn()
+            if getattr(layer, "engram", None) is not None:
+                if self._pending_engram_stage is not None:
+                    stage_fn = self._pending_engram_stage
+                    self._pending_engram_stage = None
+                    stage_fn()
+                if self._pending_engram_prefetch is not None:
+                    prefetch_fn = self._pending_engram_prefetch
+                    self._pending_engram_prefetch = None
+                    prefetch_fn()
             if boundary_indices is not None:
                 sp = None  # The boundary returns replicated compact decoder rows.
             if pending_aux_out is not None:
@@ -1063,6 +1076,7 @@ class DeepseekV4Model(nn.Module, EagleModelMixin):
                     )
                     self._encoder_only_zeros = zeros
                 out_hidden = zeros[:full_num_tokens]
+                self._pending_engram_stage = None
                 self._pending_engram_prefetch = None
                 if len(self.aux_hidden_state_layers) > 0:
                     return out_hidden, [
@@ -1134,6 +1148,7 @@ class DeepseekV4Model(nn.Module, EagleModelMixin):
                             aux_hidden_state, ced_indices, full_num_tokens
                         )
                     aux_hidden_states.append(aux_hidden_state)
+        self._pending_engram_stage = None
         self._pending_engram_prefetch = None
         l2_prefetch.join()
         last_rank = get_pp_group().is_last_rank
