@@ -1540,19 +1540,44 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase):
             qr, kv, q_cast = front
             front = None
             front_wrote_kv = True
-        if self.n_local_heads > 0:
-            with kernels.mxfp8_inputs(q_cast):
-                q = self.wq_b(qr).view(rows, self.n_local_heads, 512)
-        else:
-            q = torch.empty((rows, 0, 512), dtype=qr.dtype, device=qr.device)
-        if self.indexer is None:
-            del q_cast
-        self._issue_wo_prefetch(rows, after="q-b")
         metadata = cast(
             dict[str, DeepseekV41Metadata] | None,
             get_forward_context().attn_metadata,
         )
-        if not isinstance(metadata, dict):
+        original_swa = (
+            metadata[self.swa_cache_layer.prefix]
+            if isinstance(metadata, dict)
+            else None
+        )
+        swa = self._query_metadata(original_swa) if original_swa is not None else None
+        overlap_decode = (
+            self._can_overlap_decode(swa, sp_rows, front_wrote_kv, rows)
+            if swa is not None
+            else False
+        )
+        defer_q = (
+            swa is not None
+            and not overlap_decode
+            and self.n_local_heads > 0
+            and self.indexer is not None
+            and sp_rows is not None
+            and pre_index_query is not None
+            and not _INDEX_SPLIT_CHECK
+            and not swa.is_decode
+            and min(getattr(swa, "num_decode_tokens", 0), rows) == 0
+        )
+        if defer_q:
+            q = None
+        elif self.n_local_heads > 0:
+            with kernels.mxfp8_inputs(q_cast):
+                q = self.wq_b(qr).view(rows, self.n_local_heads, 512)
+        else:
+            q = torch.empty((rows, 0, 512), dtype=qr.dtype, device=qr.device)
+        if not defer_q:
+            if self.indexer is None:
+                del q_cast
+            self._issue_wo_prefetch(rows, after="q-b")
+        if swa is None:
             # Memory profiling has no cache pages; serving does not use this branch.
             if self.n_local_heads > 0:
                 q = self._rope(q, positions, "q")
@@ -1561,12 +1586,7 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase):
             output = torch.zeros_like(q)
             del q
         else:
-            original_swa = metadata[self.swa_cache_layer.prefix]
-            swa = self._query_metadata(original_swa)
-            overlap_decode = self._can_overlap_decode(
-                swa, sp_rows, front_wrote_kv, rows
-            )
-            if not overlap_decode and self.n_local_heads > 0:
+            if not overlap_decode and not defer_q and self.n_local_heads > 0:
                 q = self._rope(q, positions, "q")
             if not front_wrote_kv:  # the front's kernel wrote the record
                 self._cache_context_kv(kv, positions)
@@ -1636,12 +1656,30 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase):
                                 swa,
                                 q_cast,
                             )
-                    del q_cast
+                    if not defer_q:
+                        del q_cast
                     index_query = (*query, split, reference)
-                del qr, hidden_states, index_weights
-                output = torch.empty_like(q)
-                self.forward_mqa(q, kv, positions, output, index_query=index_query)
-                del q, kv, index_query
+                if defer_q:
+                    deferred_q = (qr, q_cast)
+                    output = torch.empty(
+                        (rows, self.n_local_heads, 512),
+                        dtype=qr.dtype,
+                        device=qr.device,
+                    )
+                    del qr, q_cast, hidden_states, index_weights
+                else:
+                    deferred_q = None
+                    del qr, hidden_states, index_weights
+                    output = torch.empty_like(q)
+                self.forward_mqa(
+                    q,
+                    kv,
+                    positions,
+                    output,
+                    index_query=index_query,
+                    deferred_q=deferred_q,
+                )
+                del q, kv, index_query, deferred_q
         return self._o_proj(output, sp_rows=sp_rows)
 
     def _issue_wo_prefetch(self, rows, *, after):
@@ -1790,13 +1828,25 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase):
         )
 
     @eager_break_during_capture
-    def forward_mqa(self, q, kv, positions, output, *, index_query=None):
+    def forward_mqa(
+        self,
+        q,
+        kv,
+        positions,
+        output,
+        *,
+        index_query=None,
+        deferred_q=None,
+    ):
         pending_aux = self.__dict__.pop("_pending_decode_aux", None)
         metadata = get_forward_context().attn_metadata
         swa = self._query_metadata(metadata[self.swa_cache_layer.prefix])
         mode = "decode" if swa.is_decode else "extend"
-        rows = q.shape[0]
+        rows = output.shape[0]
+        device = output.device
         self._check_attention_rows(mode, rows)
+        gathered_selected = None
+        wait_selected = None
         # A mixed step's decode requests, its leading rows (the batch is reordered
         # decode-first), keep the decode plan and the decode index mode: a row's
         # arithmetic must not depend on whether a prefill shares its step.
@@ -1978,13 +2028,13 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase):
             if split is None:
                 select(query, 0, self.topk_indices_buffer)
                 if pending_aux is not None:
-                    torch.cuda.current_stream(q.device).wait_stream(pending_aux)
+                    torch.cuda.current_stream(device).wait_stream(pending_aux)
                     pending_aux = None
             else:
                 real = split.real_rows
                 local = slice(split.start, split.start + real)
                 selected = torch.empty(
-                    (split.local_rows, 512), dtype=torch.int32, device=q.device
+                    (split.local_rows, 512), dtype=torch.int32, device=device
                 )
                 owns_candidates = self.layer_id == self.candidate_source_layer
                 expected = repeat = expected_candidates = None
@@ -2003,7 +2053,7 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase):
                         )
                     # A second full-row run measures the top-k's own spread.
                     repeat = torch.full(
-                        (rows, 512), -2, dtype=torch.int32, device=q.device
+                        (rows, 512), -2, dtype=torch.int32, device=device
                     )
                     select(reference, 0, repeat)
                     repeat = repeat[local]
@@ -2016,11 +2066,19 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase):
                     self._check_index_split(
                         split, selected, expected, repeat, expected_candidates
                     )
-                self.topk_indices_buffer[:rows].copy_(split.gather(selected))
+                    self.topk_indices_buffer[:rows].copy_(split.gather(selected))
+                else:
+                    (gathered_selected,), wait_selected = split.gather_many_async(
+                        selected
+                    )
 
         if pending_aux is not None:
-            torch.cuda.current_stream(q.device).wait_stream(pending_aux)
+            torch.cuda.current_stream(device).wait_stream(pending_aux)
         if getattr(self, "n_local_heads", 1) == 0:
+            if wait_selected is not None:
+                wait_selected()
+                self.topk_indices_buffer[:rows].copy_(gathered_selected)
+                del gathered_selected
             return
         main = (
             self._query_metadata(metadata[self._owner().prefix])
@@ -2033,10 +2091,30 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase):
             else self
         )
         if decode_rows:
+            if wait_selected is not None:
+                wait_selected()
+                self.topk_indices_buffer[:rows].copy_(gathered_selected)
+                del gathered_selected
+            if deferred_q is not None:
+                qr, q_cast = deferred_q
+                deferred_q = None
+                with kernels.mxfp8_inputs(q_cast):
+                    q = self.wq_b(qr).view(rows, self.n_local_heads, 512)
+                del qr, q_cast
+                self._issue_wo_prefetch(rows, after="q-b")
+                q = self._rope(q, positions, "q")
             self._attend_split(
                 q, output, positions, swa, main, owner, rows, decode_rows
             )
             return
+        if deferred_q is not None:
+            qr, q_cast = deferred_q
+            deferred_q = None
+            with kernels.mxfp8_inputs(q_cast):
+                q = self.wq_b(qr).view(rows, self.n_local_heads, 512)
+            del qr, q_cast
+            self._issue_wo_prefetch(rows, after="q-b")
+            q = self._rope(q, positions, "q")
         # Reuse the shared arena only after indexing completes. Keep full-batch
         # metadata beside, not overlapping, the native attention scratch.
         metadata_specs = self._attention_workspace_specs[mode]
@@ -2055,7 +2133,7 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase):
                 )
             )
             metadata_buffers = self._shared_decode_metadata(
-                swa, main, rows, shared_specs, q.device
+                swa, main, rows, shared_specs, device
             )
             arena = current_workspace_manager().get_simultaneous(*scratch_specs)
             scratch = list(arena)
@@ -2067,6 +2145,10 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase):
             self._write_decode_metadata(arena, swa, main, rows)
             metadata_buffers = arena[:metadata_count]
             scratch = arena[metadata_count:]
+        if wait_selected is not None:
+            wait_selected()
+            self.topk_indices_buffer[:rows].copy_(gathered_selected)
+            del gathered_selected
         swa_indices, swa_lengths, top_lengths = metadata_buffers[:3]
         kwargs = {}
         if main is not None:

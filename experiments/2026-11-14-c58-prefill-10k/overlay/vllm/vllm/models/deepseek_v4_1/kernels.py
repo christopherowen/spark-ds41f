@@ -133,10 +133,10 @@ def sp_moe_inputs(
     (gathered_q,), wait_xq = sp_rows.gather_mxfp8_async(x_q)
     weights, ids = route_local(x, sp_rows, input_ids=input_ids)
     wait_xq()
-    weights, ids = sp_rows.gather_many(weights, ids)
+    (weights, ids), wait_routes = sp_rows.gather_many_async(weights, ids)
     with (
         provide_mxfp8(gathered_q),
-        provide_routes(gathered_q.rows, weights, ids),
+        provide_routes(gathered_q.rows, weights, ids, wait=wait_routes),
     ):
         yield gathered_q.rows
 
