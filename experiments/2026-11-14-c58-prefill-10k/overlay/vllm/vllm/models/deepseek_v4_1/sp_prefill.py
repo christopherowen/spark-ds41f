@@ -102,7 +102,7 @@ rank's block straight into its slot, the other ranks' first, and the exchange of
 each slice runs under the combine of this rank's block and of the next slice.
 """
 
-from collections.abc import Iterator
+from collections.abc import Callable, Iterator
 from contextlib import contextmanager
 from contextvars import ContextVar
 from dataclasses import dataclass
@@ -221,11 +221,17 @@ class SPRows:
             raise ValueError(f"SP gather expects {self.local_rows} rows, got {x.shape}")
         return tensor_model_parallel_all_gather(x, dim=0)[: self.num_tokens]
 
-    def gather_many(
+    def can_gather_async(self, device: torch.device | None = None) -> bool:
+        """Whether ``gather_many_async`` can run a grouped PyNCCL gather on ``_side_stream``."""
+        if not model_parallel_is_initialized() or _tp_pynccl_comm() is None:
+            return False
+        if not torch.cuda.is_available() or torch.cuda.is_current_stream_capturing():
+            return False
+        return device is None or device.type == "cuda"
+
+    def _prepare_gather_many(
         self, *tensors: torch.Tensor, padded_rows: tuple[int, ...] = ()
-    ) -> tuple[torch.Tensor, ...]:
-        """All-gather several L-row tensors into their first T rows (or ``padded_rows``
-        when given for a tensor) in one grouped PyNCCL collective when available."""
+    ) -> tuple[list[torch.Tensor], tuple[int, ...], object | None]:
         inputs = []
         for x in tensors:
             x = materialize(x)
@@ -240,7 +246,51 @@ class SPRows:
             if model_parallel_is_initialized()
             else None
         )
-        if comm is None or comm.disabled:
+        if comm is not None and getattr(comm, "disabled", False):
+            comm = None
+        return inputs, limits, comm
+
+    def _launch_pynccl_gather(
+        self,
+        inputs: list[torch.Tensor],
+        limits: tuple[int, ...],
+        comm,
+        *,
+        stream: torch.cuda.Stream | None = None,
+    ) -> tuple[torch.Tensor, ...]:
+        outs = []
+        pairs = []
+        for x, rows in zip(inputs, limits):
+            inp = x.contiguous()
+            alloc_rows = max(self.padded_rows, rows)
+            out = torch.empty(
+                (alloc_rows, *inp.shape[1:]), dtype=inp.dtype, device=inp.device
+            )
+            if stream is not None:
+                inp.record_stream(stream)
+                out.record_stream(stream)
+            outs.append(out[:rows])
+            pairs.append((out[: self.padded_rows], inp))
+        if stream is not None:
+            stream.wait_stream(torch.cuda.current_stream(inputs[0].device))
+        comm.group_start()
+        for dst, src in pairs:
+            if stream is None:
+                comm.all_gather(dst, src)
+            else:
+                comm.all_gather(dst, src, stream=stream)
+        comm.group_end()
+        return tuple(outs)
+
+    def gather_many(
+        self, *tensors: torch.Tensor, padded_rows: tuple[int, ...] = ()
+    ) -> tuple[torch.Tensor, ...]:
+        """All-gather several L-row tensors into their first T rows (or ``padded_rows``
+        when given for a tensor) in one grouped PyNCCL collective when available."""
+        inputs, limits, comm = self._prepare_gather_many(
+            *tensors, padded_rows=padded_rows
+        )
+        if comm is None:
             outs = []
             for x, rows in zip(inputs, limits):
                 gathered = tensor_model_parallel_all_gather(x, dim=0)
@@ -251,21 +301,30 @@ class SPRows:
                 else:
                     outs.append(gathered[:rows])
             return tuple(outs)
-        outs = []
-        pairs = []
-        for x, rows in zip(inputs, limits):
-            inp = x.contiguous()
-            alloc_rows = max(self.padded_rows, rows)
-            out = torch.empty(
-                (alloc_rows, *inp.shape[1:]), dtype=inp.dtype, device=inp.device
-            )
-            outs.append(out[:rows])
-            pairs.append((out[: self.padded_rows], inp))
-        comm.group_start()
-        for dst, src in pairs:
-            comm.all_gather(dst, src)
-        comm.group_end()
-        return tuple(outs)
+        return self._launch_pynccl_gather(inputs, limits, comm)
+
+    def gather_many_async(
+        self, *tensors: torch.Tensor, padded_rows: tuple[int, ...] = ()
+    ) -> tuple[tuple[torch.Tensor, ...], Callable[[], None]]:
+        """Start a grouped PyNCCL all-gather on ``_side_stream`` and return ``(outs, wait_fn)``."""
+        inputs, limits, comm = self._prepare_gather_many(
+            *tensors, padded_rows=padded_rows
+        )
+        if not inputs or comm is None or not self.can_gather_async(inputs[0].device):
+            return self.gather_many(*tensors, padded_rows=padded_rows), (lambda: None)
+        device = inputs[0].device
+        main = torch.cuda.current_stream(device)
+        side = _side_stream(device)
+        outs = self._launch_pynccl_gather(inputs, limits, comm, stream=side)
+        waited = False
+
+        def wait() -> None:
+            nonlocal waited
+            if not waited:
+                waited = True
+                main.wait_stream(side)
+
+        return outs, wait
 
     def gather_mxfp8(self, x_q, *extra: torch.Tensor):
         """All-gather this rank's L-row ``MXFP8Rows`` (and any ``extra`` L-row
@@ -291,6 +350,29 @@ class SPRows:
             device=x_q.rows.device,
         )
         return (MXFP8Rows(rows, values, scales), *rest)
+
+    def gather_mxfp8_async(self, x_q, *extra: torch.Tensor):
+        """Asynchronous ``gather_mxfp8`` returning ``((MXFP8Rows, *extra), wait_fn)``."""
+        from vllm.models.deepseek_v4_1.tilelang.linear import MXFP8Rows, mxfp8_rows
+
+        local = self.local_rows
+        if x_q.rows.shape[0] != local:
+            raise ValueError(
+                f"SP MXFP8 gather expects {local} rows, got {x_q.rows.shape}"
+            )
+        rows_q = mxfp8_rows(self.num_tokens)
+        (values, scales, *rest), wait = self.gather_many_async(
+            x_q.values[:local],
+            x_q.scales[:local],
+            *extra,
+            padded_rows=(rows_q, rows_q),
+        )
+        rows = torch.empty(
+            (self.num_tokens, *x_q.rows.shape[1:]),
+            dtype=x_q.rows.dtype,
+            device=x_q.rows.device,
+        )
+        return (MXFP8Rows(rows, values, scales), *rest), wait
 
     def reduce_scatter(self, padded: torch.Tensor) -> torch.Tensor:
         """Sum a zero-padded Tp-row buffer over the ranks into this rank's rows."""
@@ -709,6 +791,38 @@ def plan_rows(
     if not 0 <= rank < world_size:
         raise ValueError(f"TP rank {rank} is outside world size {world_size}")
     return SPRows(num_tokens, world_size, rank, unreduced)
+
+
+
+
+@contextmanager
+def sp_moe_inputs(
+    sp_rows: SPRows,
+    x: torch.Tensor,
+    x_q,
+    ffn,
+    input_ids: torch.Tensor | None,
+):
+    """Overlap gathering producer MXFP8 rows on ``_side_stream`` with local routing."""
+    if x_q is None:
+        raise ValueError("DS4.1 SP MoE requires producer-provided MXFP8 rows")
+    router = getattr(getattr(ffn, "experts", None), "router", None)
+    route_local = getattr(router, "route_local", None)
+    if not callable(route_local):
+        raise ValueError("DS4.1 SP MoE requires a router with route_local")
+
+    from .tilelang.linear import provide_mxfp8
+    from .tilelang.router import provide_routes
+
+    (gathered_q,), wait_xq = sp_rows.gather_mxfp8_async(x_q)
+    weights, ids = route_local(x, sp_rows, input_ids=input_ids)
+    wait_xq()
+    weights, ids = sp_rows.gather_many(weights, ids)
+    with (
+        provide_mxfp8(gathered_q),
+        provide_routes(gathered_q.rows, weights, ids),
+    ):
+        yield gathered_q.rows
 
 
 _ROWS: ContextVar[SPRows | None] = ContextVar("ds41_prefill_sp_rows", default=None)

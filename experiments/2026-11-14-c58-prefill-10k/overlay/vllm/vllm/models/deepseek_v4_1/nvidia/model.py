@@ -492,7 +492,7 @@ class DeepseekV4DecoderLayer(nn.Module):
             _ev_smi = sp_prefill.timing_begin()
             with (
                 sp_prefill.activate(sp_rows),
-                kernels.sp_moe_inputs(
+                sp_prefill.sp_moe_inputs(
                     sp_rows, x, x_q, self.ffn, input_ids
                 ) as rows,
             ):
