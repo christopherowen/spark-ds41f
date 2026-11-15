@@ -1037,7 +1037,10 @@ class DeepseekV4Model(nn.Module, EagleModelMixin):
                     stage_fn = self._pending_engram_stage
                     self._pending_engram_stage = None
                     stage_fn()
-                if self._pending_engram_prefetch is not None:
+                elif (
+                    getattr(layer.engram, "layer_hash_index", 0) == 1
+                    and self._pending_engram_prefetch is not None
+                ):
                     prefetch_fn = self._pending_engram_prefetch
                     self._pending_engram_prefetch = None
                     prefetch_fn()
