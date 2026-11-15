@@ -1368,9 +1368,8 @@ def test_indexer_score_vectorizes_kpool_loads_and_coschedules_dense_rows():
     assert "__tl_load_k_shared_dense(" in dense_hdr
     assert "__tl_score_rows_dense_fast<4>(" in dense_body
     assert "((rows + 3) >> 2)" in dense_body
-    assert "__tl_score_rows_dense_fast<2>(" in dense_body
-    assert "((rows + 1) >> 1)" in dense_body
     assert "__tl_score_rows_dense_fast<1>(" in dense_body
+    assert "contrib_bf16" in dense_hdr
     assert "((sub * 64 + p_row) * 32" in dense_hdr
     assert "/ rows" in dense_body
     assert "% rows" in dense_body
@@ -1387,9 +1386,9 @@ def test_indexer_score_vectorizes_kpool_loads_and_coschedules_dense_rows():
     assert "__tl_score_rows_dense_fast<" not in cand_body
 
 
-@pytest.mark.parametrize("rows", [2, 6, 12, 65])
+@pytest.mark.parametrize("rows", [6, 64, 65])
 def test_indexer_dense_paired_row_tile_reuse(rows, context=2048, page_size=64):
-    """Dense score kernels bit-exactly match the reference across <2> decode batches,
+    """Dense score kernels bit-exactly match the reference across <1> decode batches,
     <4> prefill batches with an odd remainder row, and shared consecutive page tables."""
     inp = _index_inputs(rows, context, page_size, seed=100 + rows)
     for pair_base in range(0, rows - 1, 2):

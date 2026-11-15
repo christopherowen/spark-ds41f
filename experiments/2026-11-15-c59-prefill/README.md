@@ -42,4 +42,46 @@
 | `rows=1024, causal=1, span=1024` | `4711.5` | `4754.3` | `4490.5` | **`1.05x`** |
 | `rows=4096, causal=1, span=4096` | `19987.6` | `20145.0` | `18815.1` | **`1.06x`** (`-1.17 ms`) |
 
-*Pending Step 1 cluster screen & prefill bench (`tp4-switched` on `sp1`) before proceeding to Step 2.*
+### Step 1 Cluster Gate (`sp1`, `tp4-switched`, commit `967b99435`)
+
+- Receipts archived in `receipts/step1/tp4-switched/`.
+- **`screen` (`20261115T221417-screen-tp4-switched`, 2 boots `c59`, `c59-again` vs `c58-final` recorded)**:
+  - `model` (`c59` -> `c59-again` + recorded determinism): `128/128` greedy identical; `100.00%` identical distributions over `32,768` positions (`128` sequences), `KL mean 0.000e+00`, perplexity `1.31888 -> 1.31888`.
+  - `prefill` (`default-text`): `32,768`: `9320.125` / `9284.973` (`+1.37% ±1.86%`, `same`, margin `2.05%`); `262,144`: `9592.128` / `9605.529` (`+2.01% ±0.76%`, **`better`**, margin `0.98%`).
+  - `c16`: `output tok/s` `268.580` / `268.400` (`-0.02% ±0.91%`, `same` vs `c58-final` `268.720` / `268.343`); `decode tok/s, paired` `-0.06% ±0.31%` (`same`).
+  - `grid`: `decode geometric mean (20)` **`+0.34% ±0.14%` worse** (`+0.47%` / `+0.36%`), concentrated in `@4K` medium-batch shapes (`8x16 @4K` `+0.58%/+2.26%`, `8x24 @4K` `+1.53%/+1.14%`, `8x48 @4K` `+1.42%/+1.74%`).
+- **`bench` (`20261115T221457-bench-prefill-tp4-switched`, `prefill` `--prefill-text source`, 2 boots `b1`, `b2`)**:
+  - `32,768`: `b1 = 9472.7` (`9450.1`..`9495.3`), `b2 = 9406.4` (`9403.6`..`9409.2`) (vs `c58-final` `9385.9` / `9423.6`).
+  - `131,072`: `b1 = 9848.1` (`9793.3`..`9903.0`), `b2 = 9830.8` (`9777.2`..`9884.5`) (vs `c58-final` `9742.7` / `9779.6`).
+  - `262,144`: `b1 = 9706.9` (`9673.8`..`9739.9`), `b2 = 9680.1` (`9653.4`..`9706.8`) (vs `c58-final` `9634.7` / `9627.5`).
+  - Memory/thermals (`b1`/`b2`): `sp1` `min_available_gib` `16.97` / `16.93 GiB` (`swap_growth_gib = 0.0`); `max_gpu_c` up to `73.0 C` (`b1`) / `72.0 C` (`b2`), `thermal_slowdown_ms = 0.0`, `power_cap_ms = 0.0` across `sp1..sp4`.
+
+### Step 1 Decode Regression Fix (`indexer.py`)
+
+- **Root cause**: Routing `2 <= rows < 64` to `__tl_score_rows_dense_fast<2>` improved synthetic dense-only shapes (`span <= 6`) on `sp8`, but in real serving `@4K` decode it serialized cross-request queries, forced halted-thread CTAs on ragged KV spans, and doubled `contrib` SMEM from `8 KiB` to `16 KiB`, hurting `@4K` batch decode occupancy.
+- **Fix**:
+  - Restored `row_blocks = T.if_then_else(rows >= 64, T.ceildiv(rows, 4), rows)` and removed the `<2>` branch (`2 <= rows < 64` uses `<1>` again; `rows >= 64` keeps `<4>`).
+  - Kept `contrib` at `[block_P, heads]` (`8 KiB` float32 SMEM) and stored the `2`-row partial sums into `bfloat16_t* contrib_bf16` inside `__tl_score_rows_dense_fast` (`rows >= 64` only).
+- **Verification (`sp8`)**: `pytest -q -p tblib_stub -p offline_skip -p tests.kernels.deepseek_v41_pdl_sources tests/kernels/attention/test_deepseek_v41_tilelang.py -k "indexer"` -> `12 passed, 1 skipped, 57 deselected, 1 xfailed in 55.20s` (`PDL sources: 15 kernels launched, 15 with PDL, 0 violations`).
+
+## Step 2 — Fuse `prefill_gate_up` -> `moe_swiglu_cast` in `moe.py`
+
+### Changes
+- Added 64-col `(gate, up)` slab interleaving (`_interleave_gate_up_slabs`) for `prefill_gate_up` weights (`w13`) so adjacent 128-col output blocks hold `[gate_64, up_64]` pairs.
+- Fused SwiGLU (`w_row` scaling, BF16 cast rounding, warp-level `32`-col MXFP8 block-scale reduction) directly into `grouped_fp8_fp4_gemm(..., fuse_swiglu=True)` via `C_shared` (`T.bfloat16`) and C++ `__tl_fused_swiglu_epilogue<BLOCK_M, ROW_STEP, HAS_LIMIT>` with `if (rows_shared[ep_i] < 0) break;` early exit on padding rows, eliminating the prefill `h` buffer and separate `moe_swiglu_cast` kernel launch.
+- Updated `overlay/vllm/tests/kernels/moe/test_deepseek_v41_tilelang_moe.py` for slab-interleaved fused epilogue parity and prefill tests.
+
+### Verification & Microbenchmark (`sp8`, GB10 `sm_121a`, `spark-ds41f:candidate-55` + Step 2 overlay)
+
+- `pytest -q -p tblib_stub -p offline_skip -p tests.kernels.deepseek_v41_pdl_sources tests/kernels/moe/test_deepseek_v41_tilelang_moe.py`: **`140 passed, 14 warnings in 202.19s`** (`PDL sources: 143 kernels launched, 135 with PDL, 0 violations`).
+- `nvcc -cubin -arch=sm_121 -Xptxas=-v` on fused `moe_grouped_fp8_fp4_gemm` (`inter=576` and `768`): `Used 81 registers, used 1 barriers, 1024 bytes smem`, `0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads`.
+- 25-iteration interleaved `MoeExpertsV41Plan.run` A/B median vs `c58` (`E=384, topk=6, H=5120`, bit-exact `uint16_diffs=0`, `max_abs=0.000e+00` on all 6 shapes):
+
+| Shape | `c58` (`us`) | `c59` Step 2 (`us`) | Delta / Speedup | Bit diffs |
+|---|---:|---:|---:|---:|
+| `inter=576, rows=2048` | `9291.2` | `8908.5` | **`-382.7 us` (`1.043x`)** | `0` |
+| `inter=576, rows=4096` | `11130.7` | `10687.6` | **`-443.0 us` (`1.041x`)** | `0` |
+| `inter=576, rows=6144` | `13327.1` | `12637.0` | **`-690.1 us` (`1.055x`)** | `0` |
+| `inter=768, rows=2048` | `11467.0` | `11470.9` | `+3.9 us` (`1.000x`) | `0` |
+| `inter=768, rows=4096` | `13489.0` | `13066.5` | **`-422.5 us` (`1.032x`)** | `0` |
+| `inter=768, rows=6144` | `16321.5` | `15951.3` | **`-370.1 us` (`1.023x`)** | `0` |

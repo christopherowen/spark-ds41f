@@ -545,6 +545,9 @@ def test_tile_height_follows_routes_per_expert():
     assert drafter.tile_height(96) == drafter.tile_height(682) == 16
     assert drafter.tile_height(683) == drafter.tile_height(1365) == 32
     assert drafter.tile_height(1366) == 64
+    calls = plan.kernels()
+    assert "prefill_swiglu" not in calls
+    assert calls["prefill_gate_up"][2]["fuse_swiglu"] is True
     for rows, height in (
         (96, 16),
         (1023, 16),
@@ -553,11 +556,13 @@ def test_tile_height_follows_routes_per_expert():
         (2048, 64),
         (16384, 64),
     ):
-        layout_rows = (
-            plan.workspace_specs(rows, torch.int32)[-4][0][0]  # the gate/up output
-        )
+        specs = plan.workspace_specs(rows, torch.int32)
+        layout_rows = specs[-3][0][0]  # the MXFP8 down-input buffer (hq)
         tiles = min(rows * 6, -(-rows * 6 // height) + 384)
         assert layout_rows == tiles * height, (rows, layout_rows)
+        assert (((layout_rows, 2 * 768), torch.bfloat16) in specs) == (
+            height != 64
+        )
 
 
 @pytest.mark.parametrize("hidden, intermediate", [(512, 256), (384, 576), (384, 768)])

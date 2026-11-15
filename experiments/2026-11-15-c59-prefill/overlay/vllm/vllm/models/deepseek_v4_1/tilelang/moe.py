@@ -631,6 +631,68 @@ class MoeDispatchV41Plan:
 # boxes of exactly 128 K elements, from tensors whose K is a multiple of 128.
 FP4_TMA_K = 128
 
+_FUSED_SWIGLU_EPILOGUE_HEADER = r"""
+template <int BLOCK_M, int ROW_STEP, bool HAS_LIMIT>
+__device__ __forceinline__ void __tl_fused_swiglu_epilogue(
+    const bfloat16_t* __restrict__ C_shared,
+    const int* __restrict__ rows_shared,
+    const float* __restrict__ Weights,
+    fp8_e4_t* __restrict__ C,
+    unsigned char* __restrict__ C_sf,
+    int t,
+    int bx,
+    int inter,
+    int hsf_width,
+    float limit_f) {
+  const int tx = (int)threadIdx.x;
+  const int warp = tx >> 5;
+  const int lane = tx & 31;
+  const int w_off = warp >> 1;
+  const int g = warp & 1;
+  const int col64 = (g << 5) | lane;
+  const int64_t row_base = (int64_t)t * (int64_t)BLOCK_M;
+  const int64_t c_col = (int64_t)bx * 64 + col64;
+  const int64_t sf_col = (int64_t)bx * 2 + g;
+  #pragma unroll
+  for (int row_iter = 0; row_iter < BLOCK_M / ROW_STEP; ++row_iter) {
+    const int ep_i = row_iter * ROW_STEP + w_off;
+    if (rows_shared[ep_i] < 0) {
+      break;
+    }
+    const int64_t out_row = row_base + ep_i;
+    float val_l = (float)C_shared[ep_i * 128 + col64];
+    float val_r = (float)C_shared[ep_i * 128 + 64 + col64];
+    if constexpr (HAS_LIMIT) {
+      if (val_l > limit_f) {
+        val_l = limit_f;
+      }
+      if (val_r > limit_f) {
+        val_r = limit_f;
+      }
+      if (val_r < -limit_f) {
+        val_r = -limit_f;
+      }
+    }
+    const float act = (val_l / (1.0f + expf(-val_l))) * val_r * Weights[out_row];
+    const bfloat16_t x_bf16 = (bfloat16_t)act;
+    const float val = (float)x_bf16;
+    float amax = fabsf(val);
+    #pragma unroll
+    for (int shfl_s = 0; shfl_s < 5; ++shfl_s) {
+      amax = fmaxf(amax, __shfl_xor_sync(0xffffffffu, amax, 1 << shfl_s, 32));
+    }
+    const float sf = fmaxf(amax, 0x1.a36e2eb1c432dp-14f) * 0x1.24924ap-9f;
+    const unsigned int bits = __float_as_uint(sf);
+    const unsigned int biased_exp = ((bits - 1u) >> 23) + 1u;
+    if (lane == 0) {
+      C_sf[out_row * (int64_t)hsf_width + sf_col] = (unsigned char)biased_exp;
+    }
+    const float sf_inv = __uint_as_float((254u - biased_exp) << 23);
+    C[out_row * (int64_t)inter + c_col] = (fp8_e4_t)(val * sf_inv);
+  }
+}
+"""
+
 
 @tilelang.jit(pass_configs={tilelang.PassConfigKey.TL_DISABLE_WARP_SPECIALIZED: True})
 def grouped_fp8_fp4_gemm(
@@ -649,6 +711,8 @@ def grouped_fp8_fp4_gemm(
     trigger_after_loop: bool = False,
     swizzle_panel: int = 0,
     eviction_policy: str | None = None,
+    fuse_swiglu: bool = False,
+    swiglu_limit: float | None = None,
 ):
     """``C[r] = (A[row(r)] * SFA) @ (B[e] * SFB[e])^T``, ``e`` the expert of row ``r``.
 
@@ -696,6 +760,12 @@ def grouped_fp8_fp4_gemm(
     k_full = K // block_K
     assert tail in (0, 64) and k_full >= 1, "K must be a multiple of 64, at least 128"
     assert N % block_N == 0, "N must be a multiple of block_N"
+    if fuse_swiglu:
+        assert gather and trigger_after_loop and block_N == 128
+        assert coded_scales and narrow_codes
+        assert threads % 64 == 0 and block_M % (threads // 64) == 0
+    inter = N // 2
+    hsf_width = 4 * scale_words(inter)
     k_blocks = k_full + (tail > 0)
     tokens, tiles = T.dynamic("tokens, tiles")
     a_rows = tokens if gather else tiles * block_M
@@ -962,8 +1032,24 @@ def grouped_fp8_fp4_gemm(
                     )
 
     @T.macro
-    def body(A, SFA, B, BT, SFB, SFBase, Order, TileExpert, C, SFB8=None, Narrow=None):
+    def body(
+        A,
+        SFA,
+        B,
+        BT,
+        SFB,
+        SFBase,
+        Order,
+        TileExpert,
+        C,
+        SFB8=None,
+        Narrow=None,
+        C_sf=None,
+        Weights=None,
+    ):
         with T.Kernel(T.ceildiv(N, block_N), tiles, threads=threads) as (bx, t):
+            if fuse_swiglu:
+                T.import_source(_FUSED_SWIGLU_EPILOGUE_HEADER)
             if swizzle_panel > 0:
                 T.use_swizzle(panel_size=swizzle_panel)
             if gather or trigger_after_loop:
@@ -974,6 +1060,9 @@ def grouped_fp8_fp4_gemm(
             A_shared = T.alloc_shared((stages, block_M, block_K), T.float8_e4m3fn)
             B_shared = T.alloc_shared(
                 (stages, block_N, block_K), T.float4_e2m1_unpacked
+            )
+            C_shared = (
+                T.alloc_shared((block_M, block_N), T.bfloat16) if fuse_swiglu else None
             )
             SFA_shared = T.alloc_shared((stages, block_M, 1), T.uint32)
             SFB_shared = T.alloc_shared((stages, block_N, 1), T.uint32)
@@ -1104,10 +1193,35 @@ def grouped_fp8_fp4_gemm(
                     )
                 if trigger_after_loop:
                     pdl.trigger()
-                # Only real rows are stored; padding rows of the layout stay untouched.
-                for i, j in T.Parallel(block_M, block_N):
-                    if rows_shared[i] >= 0:
-                        C[t * block_M + i, bx * block_N + j] = C_local[i, j]
+                if fuse_swiglu:
+                    for i, j in T.Parallel(block_M, block_N):
+                        if rows_shared[i] >= 0:
+                            C_shared[i, j] = T.cast(C_local[i, j], T.bfloat16)
+                    T.sync_threads()
+                    row_step = threads // 64
+                    has_limit = "true" if swiglu_limit is not None else "false"
+                    limit_arg = T.float32(
+                        swiglu_limit if swiglu_limit is not None else 0.0
+                    )
+                    T.call_extern(
+                        "handle",
+                        f"__tl_fused_swiglu_epilogue<{block_M}, {row_step}, {has_limit}>",
+                        T.address_of(C_shared[0, 0]),
+                        T.address_of(rows_shared[0]),
+                        T.address_of(Weights[0]),
+                        T.address_of(C[0, 0]),
+                        T.address_of(C_sf[0, 0]),
+                        t,
+                        bx,
+                        inter,
+                        hsf_width,
+                        limit_arg,
+                    )
+                else:
+                    # Only real rows are stored; padding rows of the layout stay untouched.
+                    for i, j in T.Parallel(block_M, block_N):
+                        if rows_shared[i] >= 0:
+                            C[t * block_M + i, bx * block_N + j] = C_local[i, j]
 
 
     sfb_spec = (
@@ -1123,7 +1237,74 @@ def grouped_fp8_fp4_gemm(
     sfb8_spec = T.Tensor((code_rows, block_N), T.uint8)
     narrow_spec = T.Tensor((num_experts,), T.uint16)
 
-    if tail and coded_scales and narrow_codes:
+    if fuse_swiglu and tail:
+
+        @T.prim_func
+        def moe_grouped_fp8_fp4_gemm(
+            A: T.Tensor((a_rows, K), T.float8_e4m3fn),
+            SFA: T.Tensor((a_rows, sf_words), T.uint32),
+            B: T.Tensor(b_shape, T.float4_e2m1fn),
+            BT: T.Tensor(bt_shape, T.uint8),
+            SFB: sfb_spec,
+            SFB8: sfb8_spec,
+            Narrow: narrow_spec,
+            SFBase: base_spec,
+            Order: T.Tensor((tiles * block_M,), T.int32),
+            TileExpert: T.Tensor((tiles,), T.int32),
+            Weights: T.Tensor((tiles * block_M,), T.float32),
+            C: T.Tensor((tiles * block_M, inter), T.float8_e4m3fn),
+            C_sf: T.Tensor((tiles * block_M, hsf_width), T.uint8),
+        ):
+            body(
+                A,
+                SFA,
+                B,
+                BT,
+                SFB,
+                SFBase,
+                Order,
+                TileExpert,
+                C,
+                SFB8,
+                Narrow,
+                C_sf,
+                Weights,
+            )
+
+    elif fuse_swiglu:
+
+        @T.prim_func
+        def moe_grouped_fp8_fp4_gemm(
+            A: T.Tensor((a_rows, K), T.float8_e4m3fn),
+            SFA: T.Tensor((a_rows, sf_words), T.uint32),
+            B: T.Tensor(b_shape, T.float4_e2m1fn),
+            SFB: sfb_spec,
+            SFB8: sfb8_spec,
+            Narrow: narrow_spec,
+            SFBase: base_spec,
+            Order: T.Tensor((tiles * block_M,), T.int32),
+            TileExpert: T.Tensor((tiles,), T.int32),
+            Weights: T.Tensor((tiles * block_M,), T.float32),
+            C: T.Tensor((tiles * block_M, inter), T.float8_e4m3fn),
+            C_sf: T.Tensor((tiles * block_M, hsf_width), T.uint8),
+        ):
+            body(
+                A,
+                SFA,
+                B,
+                None,
+                SFB,
+                SFBase,
+                Order,
+                TileExpert,
+                C,
+                SFB8,
+                Narrow,
+                C_sf,
+                Weights,
+            )
+
+    elif tail and coded_scales and narrow_codes:
 
         @T.prim_func
         def moe_grouped_fp8_fp4_gemm(
@@ -1221,6 +1402,24 @@ def grouped_fp8_fp4_gemm(
     return moe_grouped_fp8_fp4_gemm
 
 
+def _interleave_gate_up_slabs(tensor: torch.Tensor, slab: int = 64) -> torch.Tensor:
+    """Interleave ``[E, 2 * I, ...]`` gate and up rows in ``slab``-row pairs.
+
+    Every ``2 * slab`` (``block_N = 128``) row block holds ``slab`` gate rows
+    followed by the matching ``slab`` up rows, so one prefill ``gate_up``
+    column tile computes both halves needed by SwiGLU.
+    """
+    experts, two_inter = tensor.shape[:2]
+    inter = two_inter // 2
+    rest = tensor.shape[2:]
+    return (
+        tensor.view(experts, 2, inter // slab, slab, *rest)
+        .transpose(1, 2)
+        .contiguous()
+        .view(experts, two_inter, *rest)
+    )
+
+
 def tile_expert_weights(b_packed, block_N):
     """Tile-major copy of ``[E, N, K / 2]`` packed E2M1 expert weights.
 
@@ -1252,7 +1451,13 @@ def tile_expert_weights(b_packed, block_N):
         tilelang.PassConfigKey.TL_DISABLE_THREAD_STORAGE_SYNC: True,
     },
 )
-def moe_swiglu_cast(intermediate, block_M, limit, rows_per_cta=None):
+def moe_swiglu_cast(
+    intermediate,
+    block_M,
+    limit,
+    rows_per_cta=None,
+    slab_interleaved: bool = False,
+):
     """The routed experts' SwiGLU, route weight and MXFP8 cast over the live tiles.
 
     ``H[L, 2I]`` (the gate/up GEMM's BF16 output, gate columns first) becomes
@@ -1286,6 +1491,8 @@ def moe_swiglu_cast(intermediate, block_M, limit, rows_per_cta=None):
     chunk = warp * vec
     assert intermediate % chunk == 0, "a warp's columns must tile the row"
     assert SF_BLOCK % vec == 0, "a scale block spans whole thread vectors"
+    if slab_interleaved:
+        assert intermediate % 64 == 0, "interleaved gate/up slabs require 64-col width"
     warps = intermediate // chunk  # one row's warps
     if rows_per_cta is None:
         # Fewer warps a row (TP3's 768 columns: 3) want fewer rows a CTA in flight
@@ -1311,6 +1518,8 @@ def moe_swiglu_cast(intermediate, block_M, limit, rows_per_cta=None):
         with T.Kernel(block_M // rows_per_cta, tiles, threads=threads) as (slab, t):
             tid = T.get_thread_binding()
             col = (tid // warp) * chunk + (tid % warp) * vec
+            slab_col = (col // 64) * 128 + (col % 64) if slab_interleaved else col
+            up_col = slab_col + 64 if slab_interleaved else intermediate + col
             orders = T.alloc_local((rows_per_cta,), T.int32)
             weights = T.alloc_local((rows_per_cta,), T.float32)
             xl = T.alloc_local((rows_per_cta, vec), in_dtype)
@@ -1335,9 +1544,9 @@ def moe_swiglu_cast(intermediate, block_M, limit, rows_per_cta=None):
                 for r in T.unroll(rows_per_cta):
                     if orders[r] >= 0:
                         for j in T.vectorized(vec):
-                            xl[r, j] = H[base + r, col + j]
+                            xl[r, j] = H[base + r, slab_col + j]
                         for j in T.vectorized(vec):
-                            xr[r, j] = H[base + r, intermediate + col + j]
+                            xr[r, j] = H[base + r, up_col + j]
                 for r in T.unroll(rows_per_cta):
                     row = base + r
                     if orders[r] >= 0:
@@ -1564,6 +1773,13 @@ class MoeExpertsV41Plan:
             or self.tile_height(self.max_rows) == self.prefill_block_M
         )
 
+    def _has_prefill_swiglu_fusion(self) -> bool:
+        return (
+            self._has_prefill_tiles()
+            and self.block_N == 128
+            and self.intermediate % 64 == 0
+        )
+
     def _dispatches(self) -> tuple[MoeDispatchV41Plan, ...]:
         out = list(self.decode_dispatch.values())
         if self._has_mid_tiles():
@@ -1601,6 +1817,7 @@ class MoeExpertsV41Plan:
                 ("prefill_", self.prefill_block_M, True, self.prefill_swizzle_panel)
             )
         kernels = {}
+        fuse_prefill = self._has_prefill_swiglu_fusion()
         for prefix, block_M, late, swizzle in tiers:
             down_stages = (
                 self.down_num_stages
@@ -1609,6 +1826,12 @@ class MoeExpertsV41Plan:
             )
             gemm_config = (
                 {**config, "swizzle_panel": swizzle} if swizzle else config
+            )
+            fused = fuse_prefill and prefix == "prefill_"
+            gate_up_config = (
+                {**gemm_config, "fuse_swiglu": True, "swiglu_limit": self.swiglu_limit}
+                if fused
+                else gemm_config
             )
             kernels[f"{prefix}gate_up"] = prepare.call(
                 grouped_fp8_fp4_gemm,
@@ -1619,7 +1842,7 @@ class MoeExpertsV41Plan:
                 True,
                 block_M,
                 num_stages=self.num_stages,
-                **gemm_config,
+                **gate_up_config,
                 trigger_after_loop=late,
             )
             kernels[f"{prefix}down"] = prepare.call(
@@ -1634,9 +1857,10 @@ class MoeExpertsV41Plan:
                 **gemm_config,
                 trigger_after_loop=late,
             )
-            if prefix != "late_":  # the SwiGLU is the same at either trigger
+            if prefix != "late_" and not fused:  # the SwiGLU is the same at either trigger
+                swiglu_kwargs = {"slab_interleaved": True} if fuse_prefill else {}
                 kernels[f"{prefix}swiglu"] = prepare.call(
-                    moe_swiglu_cast, inter, block_M, self.swiglu_limit
+                    moe_swiglu_cast, inter, block_M, self.swiglu_limit, **swiglu_kwargs
                 )
         return kernels
 
@@ -1671,7 +1895,8 @@ class MoeExpertsV41Plan:
         if height != self.decode_block_M:
             if height == self.block_M:
                 return self.mid_gate_up, self.mid_swiglu, self.mid_down
-            return self.prefill_gate_up, self.prefill_swiglu, self.prefill_down
+            swiglu = None if self._has_prefill_swiglu_fusion() else self.prefill_swiglu
+            return self.prefill_gate_up, swiglu, self.prefill_down
         if rows >= LATE_TRIGGER_ROWS:
             return self.late_gate_up, self.swiglu, self.late_down
         return self.gate_up, self.swiglu, self.down
@@ -1694,8 +1919,16 @@ class MoeExpertsV41Plan:
 
         prepare.declare(calls, bind=bind)
 
-    def prepare_weight(self, w, scale):
+    def prepare_weight(self, w, scale, *, gate_up: bool | None = None):
         """One GEMM's ``(tiles, tails, codes, codes_2bit, narrow, base)``."""
+        if gate_up is None:
+            gate_up = (
+                w.shape[1] == 2 * self.intermediate
+                and w.shape[2] * 2 == self.hidden
+            )
+        if gate_up and self._has_prefill_swiglu_fusion():
+            w = _interleave_gate_up_slabs(w)
+            scale = _interleave_gate_up_slabs(scale)
         packed = pack_expert_scale_codes(scale)
         narrow, base = packed.narrow, packed.base
         codes, codes_2bit = overlay_byte_codes(
@@ -1721,8 +1954,8 @@ class MoeExpertsV41Plan:
         ``codes_2bit``; a wide expert loads ``codes``.
         """
         return (
-            self.prepare_weight(w13, w13_scale),
-            self.prepare_weight(w2, w2_scale),
+            self.prepare_weight(w13, w13_scale, gate_up=True),
+            self.prepare_weight(w2, w2_scale, gate_up=False),
         )
 
     def workspace_specs(self, rows, idx_dtype=torch.int64):
@@ -1731,13 +1964,19 @@ class MoeExpertsV41Plan:
         dispatch = self._dispatch_for(rows, idx_dtype)
         layout_rows = dispatch.tiles(rows) * dispatch.block_M
         hidden, inter = self.hidden, self.intermediate
-        return (
-            *dispatch.workspace_specs(rows),
-            ((layout_rows, 2 * inter), torch.bfloat16),  # gate/up output
+        fused = (
+            self._has_prefill_swiglu_fusion()
+            and self.tile_height(rows) == self.prefill_block_M
+        )
+        specs = [*dispatch.workspace_specs(rows)]
+        if not fused:
+            specs.append(((layout_rows, 2 * inter), torch.bfloat16))  # gate/up output
+        specs.extend((
             ((layout_rows, inter), torch.float8_e4m3fn),  # down input, MXFP8
             ((layout_rows, 4 * scale_words(inter)), torch.uint8),
             ((layout_rows, hidden), torch.bfloat16),  # down output
-        )
+        ))
+        return tuple(specs)
 
     def run(
         self,
@@ -1776,14 +2015,29 @@ class MoeExpertsV41Plan:
             )
         buffers = carve(workspace, specs)
         count = len(dispatch.workspace_specs(rows))
-        h, hq, h_sf, y = buffers[count:]
         gate_up, down = weights
         layout = dispatch.dispatch(topk_ids, topk_weights, buffers[:count])
         order, tile_expert = layout["order"], layout["tile_expert"]
         # The gather reads the live rows only; padding rows past them are not read.
-        x_words, h_words = x.scales.view(torch.uint32), h_sf.view(torch.uint32)
-        gate_up_kernel(x.values, x_words, *_present(gate_up), order, tile_expert, h)
-        swiglu_kernel(h, hq, h_sf, order, layout["layout_weights"], tile_expert)
+        x_words = x.scales.view(torch.uint32)
+        if swiglu_kernel is None:
+            hq, h_sf, y = buffers[count:]
+            h_words = h_sf.view(torch.uint32)
+            gate_up_kernel(
+                x.values,
+                x_words,
+                *_present(gate_up),
+                order,
+                tile_expert,
+                layout["layout_weights"],
+                hq,
+                h_sf,
+            )
+        else:
+            h, hq, h_sf, y = buffers[count:]
+            h_words = h_sf.view(torch.uint32)
+            gate_up_kernel(x.values, x_words, *_present(gate_up), order, tile_expert, h)
+            swiglu_kernel(h, hq, h_sf, order, layout["layout_weights"], tile_expert)
         down_kernel(hq, h_words, *_present(down), order, tile_expert, y)
         if callable(shared):
             shared = shared()

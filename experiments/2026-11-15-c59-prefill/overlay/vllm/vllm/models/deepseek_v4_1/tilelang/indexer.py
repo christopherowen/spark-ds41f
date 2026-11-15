@@ -454,11 +454,11 @@ __device__ __forceinline__ void __tl_score_rows_dense_fast(
                         float2 __3 = tl::mul2(__4, w_reg[r][(i_4 & 3) >> 1]);
                         uint1 __2;
                         (reinterpret_cast<__nv_bfloat162*>(&__2))[0] = __float22bfloat162_rn(__3);
-                        float2 __1 = tl::__tl_cvt_bf16x2_to_f32x2((reinterpret_cast<__nv_bfloat162*>(&__2))[0]);
                         int p_row = (((tx & 63) >> 5) * 32) + ((i_4 >> 2) * 16) + ((i_4 & 1) * 8) + ((tx & 31) >> 2);
                         int h_col = ((tx >> 6) * 16) + (((i_4 & 3) >> 1) * 8) + ((tx & 3) * 2);
                         int swz_col = h_col ^ ((p_row & 15) << 1);
-                        *(float2*)(contrib + ((sub * 64 + p_row) * 32 + swz_col)) = __1;
+                        bfloat16_t* contrib_bf16 = reinterpret_cast<bfloat16_t*>(contrib);
+                        *(uint1*)(contrib_bf16 + ((sub * 64 + p_row) * 32 + swz_col)) = __2;
                     }
                 }
                 __syncthreads();
@@ -471,11 +471,11 @@ __device__ __forceinline__ void __tl_score_rows_dense_fast(
                 if (j < ext && j < width) {
                     asm volatile("" ::: "memory");
                     float s = 0.0f;
-                    const float* c_row = contrib + (sub * 64 + p) * 32;
+                    const bfloat16_t* c_row = reinterpret_cast<const bfloat16_t*>(contrib) + (sub * 64 + p) * 32;
                     int mask = (p & 15) << 1;
                     #pragma unroll
                     for (int h = 0; h < 32; ++h) {
-                        s += c_row[h ^ mask];
+                        s += (float)c_row[h ^ mask];
                     }
                     Scores[(int64_t)row * width + j] = (bfloat16_t)s;
                 }
@@ -994,11 +994,7 @@ def indexer_score_v41(
     )
     scale_word0 = page_size * D // 2 // 4
     if not candidates and fast_vec128:
-        row_blocks = T.if_then_else(
-            rows >= 64,
-            T.ceildiv(rows, 4),
-            T.if_then_else(rows >= 2, T.ceildiv(rows, 2), rows),
-        )
+        row_blocks = T.if_then_else(rows >= 64, T.ceildiv(rows, 4), rows)
 
         @T.prim_func
         def indexer_score(
@@ -1023,7 +1019,7 @@ def indexer_score_v41(
                 K_shared = T.alloc_shared([block_P, D], fp4)
                 SFK_shared = T.alloc_shared([block_P, 1], T.uint32)
                 Q_shared = T.alloc_shared([heads, D], fp4)
-                contrib = T.alloc_shared([2 * block_P, heads], T.float32)
+                contrib = T.alloc_shared([block_P, heads], T.float32)
                 if rows >= 64:
                     T.call_extern(
                         "handle",
@@ -1042,35 +1038,6 @@ def indexer_score_v41(
                         T.address_of(Q_shared[0, 0]),
                         T.address_of(contrib[0, 0]),
                         rb * 4,
-                        cta,
-                        ctas,
-                        rows,
-                        width,
-                        page_size,
-                        table_width,
-                        pool_pages,
-                        pool_stride,
-                        scale_stride,
-                        scale_word0,
-                    )
-                elif rows >= 2:
-                    T.call_extern(
-                        "handle",
-                        "__tl_score_rows_dense_fast<2>",
-                        T.address_of(Q[0, 0, 0]),
-                        T.address_of(QScale[0, 0]),
-                        T.address_of(Weights[0, 0]),
-                        T.address_of(KPool[0, 0]),
-                        T.address_of(KScale[0, 0]),
-                        T.address_of(PageTable[0, 0]),
-                        T.address_of(Lengths[0]),
-                        T.address_of(Active[0]),
-                        T.address_of(Scores[0, 0]),
-                        T.address_of(K_shared[0, 0]),
-                        T.address_of(SFK_shared[0, 0]),
-                        T.address_of(Q_shared[0, 0]),
-                        T.address_of(contrib[0, 0]),
-                        rb * 2,
                         cta,
                         ctas,
                         rows,
