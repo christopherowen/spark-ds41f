@@ -29,7 +29,7 @@ RENDERED = ("NCCL_IB_HCA", "SPARKNET_ROCE_GID_INDEX")
 FIXTURE = "tests/fixtures/cluster.json"
 RELEASE_1025 = "releases/spark-ds41f-1025/cluster.json"
 # Flags that change only what a response reports, added after the archived records.
-REPORTING_ARGS = ("--enable-prompt-tokens-details",)
+REPORTING_ARGS = ("--enable-prompt-tokens-details", "--enable-per-request-metrics")
 # The JIT monitor installs hooks and reports compiles; it computes nothing. spark-ds41f-1025
 # turns it off: under TileLang it has nothing left to report.
 MONITOR_ARGS = ("--jit-monitor-mode",)
@@ -398,12 +398,13 @@ class RecipeTest(unittest.TestCase):
 
     def test_every_shape_reports_prompt_cache_hits(self):
         """Prefix caching reuses cached blocks; --enable-prompt-tokens-details reports the reuse
-        in every response's usage.prompt_tokens_details (cached_tokens). They are separate
-        switches: without the second the cache works and the key is absent (#455)."""
+        in every response's usage.prompt_tokens_details (cached_tokens), and
+        --enable-per-request-metrics reports per-request timings in metrics."""
         for name in self.recipe["shapes"]:
             args = recipe.resolve(self.recipe, name)["serve_args"]
             self.assertEqual(args.count("--enable-prefix-caching"), 1, name)
             self.assertEqual(args.count("--enable-prompt-tokens-details"), 1, name)
+            self.assertEqual(args.count("--enable-per-request-metrics"), 1, name)
 
     def test_only_the_cabling_and_memory_differ_between_shapes(self):
         tp3, tp4 = (recipe.resolve(self.recipe, name) for name in ("tp3-triangle", "tp4-ring"))
