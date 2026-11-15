@@ -176,23 +176,24 @@ class HostEngramHash:
         image token or one outside the tokenizer map."""
         return self._compress_compact(raw).astype(np.int64, copy=False)
 
-    def _hash_positions_into(
-        self,
-        planes: np.ndarray,
-        first_row: int,
-        tokens: np.ndarray,
-        positions: np.ndarray,
-        columns: int = ALL_COLUMNS,
-        layer: int | None = None,
-    ) -> None:
+    def _values_u64(self, tokens: np.ndarray, positions: np.ndarray) -> np.ndarray:
         positions = np.asarray(positions, dtype=np.int64)
-        n = positions.shape[0]
         lags = positions[:, None] - self._lags  # [T, 4]
         raw = np.where(lags >= 0, tokens[np.maximum(lags, 0)], -1)
         sources = self._compress_compact(raw)
         # From the first missing source on, every lag takes the pad id.
         blocked = np.logical_or.accumulate(sources == -1, axis=1)
-        values_u64 = np.where(blocked, self.pad, sources).astype(np.uint64)
+        return np.where(blocked, self.pad, sources).astype(np.uint64)
+
+    def _hash_values_into(
+        self,
+        planes: np.ndarray,
+        first_row: int,
+        values_u64: np.ndarray,
+        columns: int = ALL_COLUMNS,
+        layer: int | None = None,
+    ) -> None:
+        n = values_u64.shape[0]
         if layer is None:
             layer_slice = slice(None)
             layer_count = self.layers
@@ -229,6 +230,23 @@ class HostEngramHash:
                 + offsets_sub[layer_slice]
             )
 
+    def _hash_positions_into(
+        self,
+        planes: np.ndarray,
+        first_row: int,
+        tokens: np.ndarray,
+        positions: np.ndarray,
+        columns: int = ALL_COLUMNS,
+        layer: int | None = None,
+    ) -> None:
+        self._hash_values_into(
+            planes,
+            first_row,
+            self._values_u64(tokens, positions),
+            columns=columns,
+            layer=layer,
+        )
+
     def hash_positions(
         self,
         tokens: np.ndarray,
@@ -253,45 +271,65 @@ class HostEngramHash:
         requests,
         *,
         columns: int = ALL_COLUMNS,
-        layer: int | None = None,
     ) -> np.ndarray:
-        """A step's row ids ``[num_tokens, layers, 24]`` (or ``[num_tokens, 24]``
-        when ``layer`` is given): ``requests`` yields, per request in the step's
-        token order, ``(first_row, rows, tokens, positions)``: the request's first
-        row and row count in the step, its token ids, and the positions of its
-        leading rows whose ids the host has (the rest of its rows are ``UNKNOWN``).
-        Rows past the last request's rows are padding, -1 as the GPU writes them.
-        Returned as a view over a layer-major ``[layers, num_tokens, 24]`` buffer so
-        each layer's slice ``[:, layer]`` is C-contiguous."""
+        """A step's row ids ``[num_tokens, layers, 24]``: ``requests`` yields, per
+        request in the step's token order, ``(first_row, rows, tokens, positions)``:
+        the request's first row and row count in the step, its token ids, and the
+        positions of its leading rows whose ids the host has (the rest of its rows are
+        ``UNKNOWN``). Rows past the last request's rows are padding, -1 as the GPU
+        writes them. Returned as a view over a layer-major ``[layers, num_tokens, 24]``
+        buffer so each layer's slice ``[:, layer]`` is C-contiguous."""
         columns = int(columns)
         if columns != ALL_COLUMNS:
             self._column_plan(columns)
-        if layer is not None:
-            layer_idx = int(layer)
-            if not 0 <= layer_idx < self.layers:
-                raise ValueError(f"Engram layer index {layer_idx} out of range [0, {self.layers})")
-            planes = np.full((1, num_tokens, HEADS), UNKNOWN, dtype=np.int64)
-            out = planes[0]
-        else:
-            layer_idx = None
-            planes = np.full((self.layers, num_tokens, HEADS), UNKNOWN, dtype=np.int64)
-            out = planes.transpose(1, 0, 2)
+        planes = np.full((self.layers, num_tokens, HEADS), UNKNOWN, dtype=np.int64)
+        out = planes.transpose(1, 0, 2)
         custom_hash = "hash_positions" in self.__dict__
         live = 0
         for first_row, rows, tokens, positions in requests:
             live = max(live, first_row + rows)
             if len(positions):
                 if custom_hash and columns == ALL_COLUMNS:
-                    hashed = self.hash_positions(tokens, positions)
-                    out[first_row : first_row + len(positions)] = (
-                        hashed[:, layer_idx] if layer_idx is not None else hashed
+                    out[first_row : first_row + len(positions)] = self.hash_positions(
+                        tokens, positions
                     )
                 else:
                     self._hash_positions_into(
-                        planes, first_row, tokens, positions, columns, layer=layer_idx
+                        planes, first_row, tokens, positions, columns
                     )
         planes[:, live:, :] = -1
         return out
+
+    def step_ids_iter(
+        self,
+        num_tokens: int,
+        requests,
+        *,
+        columns: int = ALL_COLUMNS,
+    ):
+        """Yield per-layer ``[num_tokens, 24]`` C-contiguous row IDs one layer at a time."""
+        columns = int(columns)
+        if columns != ALL_COLUMNS:
+            self._column_plan(columns)
+        if "hash_positions" in self.__dict__ and columns == ALL_COLUMNS:
+            hashed = self.step_ids(num_tokens, requests, columns=columns)
+            for layer_idx in range(self.layers):
+                yield hashed[:, layer_idx]
+            return
+        prepared: list[tuple[int, np.ndarray]] = []
+        live = 0
+        for first_row, rows, tokens, positions in requests:
+            live = max(live, first_row + rows)
+            if len(positions):
+                prepared.append((first_row, self._values_u64(tokens, positions)))
+        for layer_idx in range(self.layers):
+            plane = np.full((1, num_tokens, HEADS), UNKNOWN, dtype=np.int64)
+            for first_row, values_u64 in prepared:
+                self._hash_values_into(
+                    plane, first_row, values_u64, columns=columns, layer=layer_idx
+                )
+            plane[:, live:, :] = -1
+            yield plane[0]
 
 
 def placed_by_host(requests: list, drafts: np.ndarray | None) -> list:

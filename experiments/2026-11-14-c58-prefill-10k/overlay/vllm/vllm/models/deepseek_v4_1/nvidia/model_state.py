@@ -151,6 +151,7 @@ class DeepseekV41ModelState(DefaultModelState):
         self._prefill_tokens: dict[str, np.ndarray] = {}
         self._host_engram_hash = None
         self._prefetched_engram_ids: tuple[tuple[Any, ...], np.ndarray] | None = None
+        self._engram_prepared_batch: InputBatch | None = None
         # GLP steering of the requests made to the steered model name: each
         # request state's mark, and the steering whose rows a step marks from them.
         self.steering = next(
@@ -381,15 +382,18 @@ class DeepseekV41ModelState(DefaultModelState):
                         value.decoder.routing_mask = routing_mask
         return metadata
 
-    def prepare_inputs(
+    def prepare_engram_early(
         self, input_batch: InputBatch, req_states: RequestState
-    ) -> dict[str, torch.Tensor | None]:
+    ) -> None:
+        if self._engram_prepared_batch is input_batch:
+            return
+        self._engram_prepared_batch = input_batch
         window = self.lookback_token_ids
         if window is not None:
             from vllm.models.deepseek_v4_1.tilelang.lookback import gather_lookback
 
-            # Queue disk Engram reads before super().prepare_inputs so NVMe I/O
-            # overlaps host input prep and Layer 0.
+            # Queue disk Engram reads before prepare_attn / super().prepare_inputs
+            # so NVMe I/O overlaps attention metadata & host input prep.
             gather_lookback(
                 window,
                 input_batch.idx_mapping,
@@ -406,6 +410,13 @@ class DeepseekV41ModelState(DefaultModelState):
                 model._pending_engram_prefetch = self._make_engram_prefetch(
                     model, input_batch
                 )
+
+    def prepare_inputs(
+        self, input_batch: InputBatch, req_states: RequestState
+    ) -> dict[str, torch.Tensor | None]:
+        window = self.lookback_token_ids
+        self.prepare_engram_early(input_batch, req_states)
+        self._engram_prepared_batch = None
         model_inputs = super().prepare_inputs(input_batch, req_states)
         if self.ced_state is not None:
             if self._ced_batch is not input_batch:
@@ -498,6 +509,7 @@ class DeepseekV41ModelState(DefaultModelState):
         num_tokens = int(input_batch.input_ids.shape[0])
         cached = self._prefetched_engram_ids
         self._prefetched_engram_ids = None
+        self._engram_prepared_batch = None
         if cached is not None:
             cached_key, cached_ids = cached
             cur_reqs = []
@@ -522,19 +534,16 @@ class DeepseekV41ModelState(DefaultModelState):
                         break
                     cur_reqs.append((req_id, first, rows, start, stop))
             if match and tuple(cur_reqs) == cached_key[2]:
+                layers = cached_ids.shape[1]
                 if cached_ids.shape[0] < num_tokens:
-                    padded_planes = np.full(
-                        (cached_ids.shape[1], num_tokens, cached_ids.shape[2]),
+                    planes = np.full(
+                        (layers, num_tokens, cached_ids.shape[2]),
                         -1,
                         dtype=cached_ids.dtype,
                     )
-                    padded_planes[:, : cached_ids.shape[0], :] = cached_ids.transpose(
-                        1, 0, 2
-                    )
-                    cached_ids = padded_planes.transpose(1, 0, 2)
-                if cached_ids.shape[1] == 2:
-                    return (cached_ids[:, 0], cached_ids[:, 1])
-                return cached_ids
+                    planes[:, : cached_ids.shape[0], :] = cached_ids.transpose(1, 0, 2)
+                    return tuple(planes[i] for i in range(layers))
+                return tuple(cached_ids[:, i] for i in range(layers))
         requests = []
         for i, req_id in enumerate(input_batch.req_ids):
             first, rows = int(starts[i]), int(input_batch.num_scheduled_tokens[i])
@@ -549,24 +558,7 @@ class DeepseekV41ModelState(DefaultModelState):
         requests = placed_by_host(requests, drafts)
         if not any(len(positions) for *_, positions in requests):
             return None
-        if num_tokens > 1024 and self._host_engram_hash.layers == 2:
-            early_0 = self._host_engram_hash.step_ids(
-                num_tokens,
-                requests,
-                columns=columns,
-                layer=0,
-            )
-
-            def _stage_layer1():
-                return self._host_engram_hash.step_ids(
-                    num_tokens,
-                    requests,
-                    columns=columns,
-                    layer=1,
-                )
-
-            return (early_0, _stage_layer1)
-        return self._host_engram_hash.step_ids(
+        return self._host_engram_hash.step_ids_iter(
             num_tokens,
             requests,
             columns=columns,

@@ -645,6 +645,49 @@ class SPRows:
             return
         exchange_into(comm, send, recv, self.rank, self.world_size)
 
+    def exchange_many_into(self, *pairs) -> None:
+        """Exchange multiple `(send, recv)` pairs in one collective group when possible."""
+        if not pairs:
+            return
+        if len(pairs) == 1 or type(self).exchange_into is not SPRows.exchange_into:
+            for send, recv in pairs:
+                self.exchange_into(send, recv)
+            return
+        from vllm.models.deepseek_v4_1.tilelang import collectives
+
+        dev_comm = get_tp_group().device_communicator
+        comm = dev_comm.pynccl_comm
+        roce_comm = _tp_roce_comm()
+        nccl_pairs = []
+        for send, recv in pairs:
+            if (
+                isinstance(recv, torch.Tensor)
+                and roce_comm is not None
+                and _roce_should_exchange(roce_comm, send, recv)
+            ):
+                roce_comm.exchange_into(send, recv)
+            else:
+                nccl_pairs.append((send, recv))
+        if not nccl_pairs:
+            return
+        if (
+            len(nccl_pairs) == 1
+            or (self.world_size == 4 and collectives.ring4_relay())
+            or not hasattr(comm, "group_start")
+        ):
+            for send, recv in nccl_pairs:
+                collectives.exchange_into(
+                    comm, send, recv, self.rank, self.world_size
+                )
+            return
+        comm.group_start()
+        for send, recv in nccl_pairs:
+            for peer in range(self.world_size):
+                if peer != self.rank:
+                    collectives._send(comm, send[peer], peer)
+                    collectives._recv(comm, recv[peer], peer)
+        comm.group_end()
+
 
 # The attention's WO projection is reduce-scattered in two slices from this many
 # tokens, so half its reduce-scatter runs under the other half's projection.

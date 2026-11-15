@@ -3087,6 +3087,9 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                     boundary_aux_block_id=checkpoint.auxiliary_block_ids[0],
                 )
                 return None
+            prepare_engram = getattr(self.model_state, "prepare_engram_early", None)
+            if prepare_engram is not None:
+                prepare_engram(input_batch, self.req_states)
             block_tables, slot_mappings = self.prepare_attn(input_batch)
             # Mamba "align" pre-copy: migrate recurrent state across block
             # boundaries before the forward. Runs only on real batches, and

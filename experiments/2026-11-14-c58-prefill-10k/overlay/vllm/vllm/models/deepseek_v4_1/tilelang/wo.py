@@ -636,8 +636,7 @@ class TileLangWOProjection:
             side = sp_prefill._side_stream(device)
             side.wait_stream(main)
             with torch.cuda.stream(side):
-                sp_rows.exchange_into(xq_send, xq_recv)
-                sp_rows.exchange_into(sf_send, sf_recv)
+                sp_rows.exchange_many_into((xq_send, xq_recv), (sf_send, sf_recv))
             self._project_sp_shard(rank, xq_send[rank], sf_send[rank], out, real, local)
             main.wait_stream(side)
             if real:
@@ -659,8 +658,7 @@ class TileLangWOProjection:
             side = sp_prefill._side_stream(device)
             side.wait_stream(main)
             with torch.cuda.stream(side):
-                sp_rows.exchange_into(xq_send, xq_recv)
-                sp_rows.exchange_into(sf_send, sf_recv)
+                sp_rows.exchange_many_into((xq_send, xq_recv), (sf_send, sf_recv))
             self._project_sp_shard(
                 rank, xq_send[rank], sf_send[rank], parts[rank], real, local
             )
