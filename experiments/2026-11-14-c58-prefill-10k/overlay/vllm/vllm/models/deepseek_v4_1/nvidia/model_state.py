@@ -178,12 +178,68 @@ class DeepseekV41ModelState(DefaultModelState):
             self._ced_prefix_start.get(req_id, 0),
         )
 
+    def _ensure_host_engram_hash(self, model):
+        if self._host_engram_hash is None:
+            engram_hash = getattr(model, "engram_hash", None)
+            if engram_hash is None:
+                return None
+            from vllm.models.deepseek_v4_1.engram_rows.host_hash import HostEngramHash
+
+            layout = engram_hash.layout
+            geometry = layout.geometry
+            self._host_engram_hash = HostEngramHash(
+                layout.token_map,
+                geometry.multipliers,
+                geometry.primes,
+                geometry.offsets,
+            )
+        return self._host_engram_hash
+
+    def _prefetch_chunk0_engram(
+        self, tokens: np.ndarray, num_computed_tokens: int
+    ) -> None:
+        start = max(int(num_computed_tokens), 0)
+        remaining = len(tokens) - start
+        if remaining <= 0:
+            return
+        for model in self.disk_engram_models:
+            layout = getattr(model, "engram_layout", None)
+            if layout is None or not getattr(layout, "caps", None):
+                continue
+            host_hash = self._ensure_host_engram_hash(model)
+            if host_hash is None:
+                continue
+            engram_0 = next(
+                (
+                    layer.engram
+                    for layer in model.layers[model.start_layer : model.end_layer]
+                    if getattr(layer, "engram", None) is not None
+                    and getattr(layer.engram, "layer_hash_index", -1) == 0
+                    and getattr(layer.engram.embed_tokens, "disk_rows", None) is not None
+                ),
+                None,
+            )
+            if engram_0 is None:
+                continue
+            max_tokens = getattr(self, "max_num_tokens", layout.caps[0].max_tokens)
+            chunk_rows = min(remaining, layout.caps[0].max_tokens, max_tokens)
+            if chunk_rows <= 0:
+                continue
+            positions = np.arange(start, start + chunk_rows, dtype=np.int64)
+            ids_0 = host_hash.step_ids(
+                chunk_rows,
+                ((0, chunk_rows, tokens, positions),),
+                columns=self._engram_host_columns(model),
+                layer=0,
+            )
+            engram_0.embed_tokens.disk_rows.prefetch(ids_0)
+
     def add_request(self, req_index: int, new_req_data: NewRequestData) -> None:
         super().add_request(req_index, new_req_data)
         if self.disk_engram_models and new_req_data.prefill_token_ids is not None:
-            self._prefill_tokens[new_req_data.req_id] = np.asarray(
-                new_req_data.prefill_token_ids, dtype=np.int32
-            )
+            tokens = np.asarray(new_req_data.prefill_token_ids, dtype=np.int32)
+            self._prefill_tokens[new_req_data.req_id] = tokens
+            self._prefetch_chunk0_engram(tokens, new_req_data.num_computed_tokens)
         sampling = new_req_data.sampling_params
         if self.steered_requests is not None:
             steered = weightless.is_marked(sampling)
@@ -218,6 +274,9 @@ class DeepseekV41ModelState(DefaultModelState):
     def remove_request(self, req_id: str) -> None:
         super().remove_request(req_id)
         self._prefill_tokens.pop(req_id, None)
+        cached = getattr(self, "_prefetched_engram_ids", None)
+        if cached is not None and any(req[0] == req_id for req in cached[0][2]):
+            self._prefetched_engram_ids = None
         self._ced_prompt_logprobs.discard(req_id)
         self._ced_prefix_start.pop(req_id, None)
         self._ced_recovery_prompt_end.pop(req_id, None)
@@ -483,20 +542,12 @@ class DeepseekV41ModelState(DefaultModelState):
             placed_by_host,
         )
 
-        if self._host_engram_hash is None:
-            layout = model.engram_hash.layout
-            geometry = layout.geometry
-            self._host_engram_hash = HostEngramHash(
-                layout.token_map,
-                geometry.multipliers,
-                geometry.primes,
-                geometry.offsets,
-            )
+        host_hash = self._ensure_host_engram_hash(model)
         columns = self._engram_host_columns(model)
         starts = input_batch.query_start_loc_np
         drafts = input_batch.num_draft_tokens_per_req
         num_tokens = int(input_batch.input_ids.shape[0])
-        cached = self._prefetched_engram_ids
+        cached = getattr(self, "_prefetched_engram_ids", None)
         self._prefetched_engram_ids = None
         if cached is not None:
             cached_key, cached_ids = cached
@@ -522,6 +573,19 @@ class DeepseekV41ModelState(DefaultModelState):
                         break
                     cur_reqs.append((req_id, first, rows, start, stop))
             if match and tuple(cur_reqs) == cached_key[2]:
+                def _pad_plane(plane: np.ndarray, total_rows: int) -> np.ndarray:
+                    if plane.shape[0] >= total_rows:
+                        return plane
+                    out = np.full((total_rows, plane.shape[1]), -1, dtype=plane.dtype)
+                    out[: plane.shape[0]] = plane
+                    return out
+
+                if cached_ids.shape[1] == 2:
+                    early_0 = _pad_plane(cached_ids[:, 0], num_tokens)
+                    early_1 = cached_ids[:, 1]
+                    if num_tokens > 1024:
+                        return (early_0, lambda: _pad_plane(early_1, num_tokens))
+                    return (early_0, _pad_plane(early_1, num_tokens))
                 if cached_ids.shape[0] < num_tokens:
                     padded_planes = np.full(
                         (cached_ids.shape[1], num_tokens, cached_ids.shape[2]),
@@ -532,8 +596,6 @@ class DeepseekV41ModelState(DefaultModelState):
                         1, 0, 2
                     )
                     cached_ids = padded_planes.transpose(1, 0, 2)
-                if cached_ids.shape[1] == 2:
-                    return (cached_ids[:, 0], cached_ids[:, 1])
                 return cached_ids
         requests = []
         for i, req_id in enumerate(input_batch.req_ids):

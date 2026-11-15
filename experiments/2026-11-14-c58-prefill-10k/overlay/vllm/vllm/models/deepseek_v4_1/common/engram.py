@@ -181,7 +181,7 @@ ENGRAM_TIMELINE = os.environ.get("SPARK_DS41F_ENGRAM_TIMELINE", "0") == "1"
 ENGRAM_TIMELINE_DIR = os.environ.get(
     "SPARK_DS41F_ENGRAM_TIMELINE_DIR", "/cache/spark-ds41f/engram-timeline"
 )
-ENGRAM_PACKED_DIR = os.environ.get("SPARK_DS41F_ENGRAM_PACKED_DIR", "")
+ENGRAM_PACKED_DIR = os.environ.get("SPARK_DS41F_ENGRAM_PACKED_DIR", "/cache/spark-ds41f/engram-264-v1")
 ENGRAM_ROW_CACHE_ROWS: int = 262144
 _timeline_tables: list = []
 
