@@ -203,6 +203,22 @@ collectives, and DSpark drafting.
    - **Greedy argmax in the head epilogue:** write each tile's `(max, index)`
      pair instead of full FP32 logits when all active requests are greedy (~12 MB
      less written and read per TP4 call).
+   - **Certified `W_q` screening under `self.sink.rejection = True`:** in
+     `vllm/v1/worker/gpu/model_runner.py` (`_verify_greedily`),
+     `vocab_parallel_pairs_from_head` (`project_head_greedy_pairs` with the
+     8-bit `W_q` Cauchy-Schwarz screening table in the display carve-out) is
+     guarded by `if not rejection and hasattr(head, "tilelang_vocab_greedy"):`.
+     Because `DeepseekV41ForCausalLM` enables `self.sink.rejection = True` by
+     default, `vocab_parallel_pairs_from_head` runs only in `_dummy_sampler_run`
+     warmup and never in serving, falling back to `compute_logits_local` (full
+     248 MB 12-bit `lm_head` unpack) plus three DRAM passes over FP32
+     `local_logits` (`sink.cut`, `vocab_parallel_pairs`, and
+     `sink.alternates_of_greedy_shards`). Fold the single-column `sink.cut`
+     mask (`drafts[r] - vocab_start` when `sink_flags[r + 1]` is set) into
+     `project_head_greedy_pairs`, and compute top-4 shard candidates only on
+     the `num_reqs` winning bonus rows inside the refine pass so screened
+     greedy verification runs unconditionally in serving with 100% bit-identical
+     tokens and sink alternates.
 5. **A second stream inside the decode graph.** Overlap the shared expert with
    routed MoE, and attention key/indexer-key writes with the query path, on a
    second CUDA stream captured into the graph. First bound how much of the
@@ -214,6 +230,15 @@ collectives, and DSpark drafting.
    verification broadcasts rank 0's confidence snapshot every decode step
    through NCCL (`adaptive_verification.py`). Bound its share of the step from
    decode traces and screen `sparknet`'s one-shot broadcast path if material.
+8. **Mid-network (Layer 16/20) dead-row routed-MoE pruning at single stream
+   (`c1`).** At `c1`, no other requests in the batch amortize routed-expert
+   LPDDR5X reads (4.5 MiB per expert per rank across 40 routed layers), so
+   every rejected draft row surviving `SPARK_DS41F_DSPARK_DEAD_ROWS_TAU = 0.2`
+   before Layer 0 incurs unamortized routed-expert DRAM reads. Because target
+   layers are strictly causal and row-independent, pruning diverging tail draft
+   rows from routed MoE at mid-network (Layer 16/20) while masking pruned rows
+   as rejected in `rejection_sampler` cuts half of those wasted routed-expert
+   DRAM reads while keeping all accepted target tokens 100% bit-exact.
 
 ## Speculative decoding
 
@@ -242,6 +267,23 @@ Open levers:
 - **Drafter reuse of the target's token selection.** Check whether reusing the
   target model's indexer top-k selection from the anchor position in DSpark
   draft layers preserves acceptance while cutting drafter attention work.
+- **Extend certified `W_q` Cauchy-Schwarz screening to DSpark's
+  `project_head_markov_greedy_pairs`.** `tilelang_vocab_markov_greedy`
+  (`project_head_markov_greedy_pairs` in
+  `vllm/models/deepseek_v4_1/tilelang/vocab.py`) currently unpacks the full
+  248 MB 12-bit `lm_head` shard across DSpark's 5 draft rows every step
+  despite sharing the target `lm_head` and its 8-bit `W_q` table. Add the
+  per-column Markov bias upper bound (`||u_t||_2 ||b_v||_2`, or exact NVFP4
+  Markov dot product) to the Cauchy-Schwarz tile upper bound so DSpark refines
+  only the active `<2%` 12-bit columns with bit-identical greedy drafts.
+- **Tail-slot (`survival < DEAD_ROWS_TAU`) short-suffix `CopyDrafter` splice.**
+  Currently `CopyDrafter` (`0744..0745`) switches all-or-nothing per request
+  against DSpark's full 5-token chain, leaving trailing slots as dead rows
+  whenever DSpark's cumulative survival drops below `DEAD_ROWS_TAU = 0.2`
+  after draft position 1 or 2. Keep DSpark's high-confidence prefix tokens
+  (`0..k-1` where `survival >= tau`) and query `CopyDrafter` anchored on the
+  extended prefix ending at `d_{k-1}` to fill remaining tail slots `k..4` when
+  a short context match exists.
 - **Cross-request verify-row allocation at high concurrency.** Compare our
   per-slot survival budget (`assign_draft_budget`) plus per-step verify length
   against ranking candidate draft slots across the whole batch by marginal
@@ -378,6 +420,10 @@ Remaining kernel-level investigations:
 
 - **No fallbacks** (owner, 2026-10-14): every collective or kernel dispatch path
   must either be the tested production path or raise with a traceback.
+- **No silent test-gated defaults:** best production paths must be active by
+  default without requiring environment opt-ins or disabling guards (such as an
+  empty `ENGRAM_PACKED_DIR` default or `not rejection` skipping screened greedy
+  verification in serving).
 - The one-read `fill_defaults` fix (`0019`) is still needed on PyTorch main.
 - The NCCL IB send-path fence patch should be dropped once upstream releases the
   fix.
