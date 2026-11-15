@@ -435,6 +435,12 @@ class DeepseekCompressor(nn.Module):
                 # trailing TP column padding.
                 weight = unpack_bf16_layer(self.fused_wkv_wgate).detach()
                 tp_size = self.fused_wkv_wgate.tp_size
+                if tp_size > 1 and torch.distributed.is_initialized():
+                    from vllm.distributed import get_tp_group
+
+                    # Ranks arrive out of _prepare_kernels at different compilation
+                    # speeds; align on the host CPU group before the 10s RoCE gather.
+                    torch.distributed.barrier(group=get_tp_group().cpu_group)
                 if tp_size <= 1:
                     self._sp_weight = weight
                 elif self.compress_ratio == 1:
