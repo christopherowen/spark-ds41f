@@ -416,9 +416,21 @@ static bool read_early(reader_t *reader, step_t step, failure_t *failure, double
     /* Sequences run 1, 2, ... 0xFFFFFFFF, 1: the step before 1 is 0xFFFFFFFF (or none,
      * when the control block's 0 has reached it already). */
     uint32_t previous = step.sequence == 1 ? 0xFFFFFFFFu : step.sequence - 1;
-    if (reader->prefetched_count == step.count && reader->prefetched_early &&
+    bool early_match = false;
+    if (reader->prefetched_count > 0 && reader->prefetched_count <= step.count &&
+        reader->prefetched_early &&
         memcmp(reader->prefetched_early, step.early,
-               (size_t)step.count * sizeof(*step.early)) == 0) {
+               (size_t)reader->prefetched_count * sizeof(*step.early)) == 0) {
+        early_match = true;
+        for (uint32_t i = reader->prefetched_count; i < step.count; i++) {
+            if (step.early[i] != -1) {
+                early_match = false;
+                break;
+            }
+        }
+    }
+    if (early_match) {
+        uint32_t copy_count = reader->prefetched_count;
         reader->prefetched_count = 0;
         pthread_mutex_lock(&reader->mutex);
         reader->early_prefetched_steps++;
@@ -435,13 +447,14 @@ static bool read_early(reader_t *reader, step_t step, failure_t *failure, double
             *consumed_wait = (double)(now_ns() - wait_start) * 1e-9;
         }
         uint64_t copy_start = now_ns();
-        for (uint32_t i = 0; i < step.count; i++) {
+        for (uint32_t i = 0; i < copy_count; i++) {
             int64_t id = step.early[i];
             if (id == UNKNOWN_ID) continue;
             (*early_count)++;
             if (id < reader->plan.tp_start || id >= reader->plan.tp_end ||
                 !((reader->plan.columns >> (i % PLE_COLUMNS)) & 1u))
                 continue;
+            if (reader->plan.cache_sets) reader->plan.cache_hits++;
             memcpy(reader->weights + (size_t)i * 256u,
                    reader->early_weights + (size_t)i * 256u, 256u);
             memcpy(reader->scales + (size_t)i * 8u,

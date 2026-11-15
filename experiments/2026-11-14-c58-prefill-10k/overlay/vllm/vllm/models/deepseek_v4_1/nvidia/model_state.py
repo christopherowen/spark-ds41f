@@ -471,10 +471,11 @@ class DeepseekV41ModelState(DefaultModelState):
                 columns = next(iter(masks))
         return columns
 
-    def _early_engram_ids(self, model, input_batch: InputBatch) -> np.ndarray | None:
+    def _early_engram_ids(self, model, input_batch: InputBatch):
         """The step's Engram row IDs the host can hash now, ``[tokens, layers, 24]``
-        (``host_hash.UNKNOWN`` for rows of tokens the GPU samples, -1 for padding),
-        or None when the step has no prefill chunk to hash."""
+        or ``(early_0, early_1_or_fn)`` (``host_hash.UNKNOWN`` for rows of tokens the
+        GPU samples, -1 for padding), or None when the step has no prefill chunk to
+        hash."""
         if not input_batch.has_prefill:
             return None
         from vllm.models.deepseek_v4_1.engram_rows.host_hash import (
@@ -494,15 +495,13 @@ class DeepseekV41ModelState(DefaultModelState):
         columns = self._engram_host_columns(model)
         starts = input_batch.query_start_loc_np
         drafts = input_batch.num_draft_tokens_per_req
+        num_tokens = int(input_batch.input_ids.shape[0])
         cached = self._prefetched_engram_ids
         self._prefetched_engram_ids = None
         if cached is not None:
             cached_key, cached_ids = cached
             cur_reqs = []
-            match = (
-                columns == cached_key[0]
-                and int(input_batch.input_ids.shape[0]) == cached_key[1]
-            )
+            match = columns == cached_key[0] and num_tokens >= cached_key[1]
             if match:
                 for i, req_id in enumerate(input_batch.req_ids):
                     if not input_batch.is_prefilling_np[i] or (
@@ -523,6 +522,18 @@ class DeepseekV41ModelState(DefaultModelState):
                         break
                     cur_reqs.append((req_id, first, rows, start, stop))
             if match and tuple(cur_reqs) == cached_key[2]:
+                if cached_ids.shape[0] < num_tokens:
+                    padded_planes = np.full(
+                        (cached_ids.shape[1], num_tokens, cached_ids.shape[2]),
+                        -1,
+                        dtype=cached_ids.dtype,
+                    )
+                    padded_planes[:, : cached_ids.shape[0], :] = cached_ids.transpose(
+                        1, 0, 2
+                    )
+                    cached_ids = padded_planes.transpose(1, 0, 2)
+                if cached_ids.shape[1] == 2:
+                    return (cached_ids[:, 0], cached_ids[:, 1])
                 return cached_ids
         requests = []
         for i, req_id in enumerate(input_batch.req_ids):
@@ -538,8 +549,25 @@ class DeepseekV41ModelState(DefaultModelState):
         requests = placed_by_host(requests, drafts)
         if not any(len(positions) for *_, positions in requests):
             return None
+        if num_tokens > 1024 and self._host_engram_hash.layers == 2:
+            early_0 = self._host_engram_hash.step_ids(
+                num_tokens,
+                requests,
+                columns=columns,
+                layer=0,
+            )
+
+            def _stage_layer1():
+                return self._host_engram_hash.step_ids(
+                    num_tokens,
+                    requests,
+                    columns=columns,
+                    layer=1,
+                )
+
+            return (early_0, _stage_layer1)
         return self._host_engram_hash.step_ids(
-            input_batch.input_ids.shape[0],
+            num_tokens,
             requests,
             columns=columns,
         )
