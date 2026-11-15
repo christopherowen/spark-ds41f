@@ -659,6 +659,7 @@ class DeepseekV4Model(nn.Module, EagleModelMixin):
                 dtype=torch.float32,
             )
         self._ced_encoder_only: bool = False
+        self._pending_engram_prefetch = None
         self._encoder_only_zeros: torch.Tensor | None = None
         self._max_num_batched_tokens = (
             vllm_config.scheduler_config.max_num_batched_tokens
@@ -773,6 +774,7 @@ class DeepseekV4Model(nn.Module, EagleModelMixin):
             raise RuntimeError(
                 "Disk Engram preparation must run outside compile/capture"
             )
+        self._pending_engram_prefetch = None
         self.prepared_engram_hashes.fill_(-1)
         for layer in islice(self.layers, self.start_layer, self.end_layer):
             if getattr(layer, "engram", None) is not None:
@@ -1037,6 +1039,13 @@ class DeepseekV4Model(nn.Module, EagleModelMixin):
                 steer_rows=steer_rows,
                 encoder_only=boundary_encoder_only,
             )
+            if (
+                self._pending_engram_prefetch is not None
+                and getattr(layer, "engram", None) is not None
+            ):
+                prefetch_fn = self._pending_engram_prefetch
+                self._pending_engram_prefetch = None
+                prefetch_fn()
             if boundary_indices is not None:
                 sp = None  # The boundary returns replicated compact decoder rows.
             if pending_aux_out is not None:
@@ -1072,6 +1081,7 @@ class DeepseekV4Model(nn.Module, EagleModelMixin):
                     )
                     self._encoder_only_zeros = zeros
                 out_hidden = zeros[:full_num_tokens]
+                self._pending_engram_prefetch = None
                 if _timer_started:
                     sp_prefill.timing_end("layers_loop", _ev_loop)
                     sp_prefill.timing_end("total_model_forward", _ev_total)
@@ -1146,6 +1156,7 @@ class DeepseekV4Model(nn.Module, EagleModelMixin):
                             aux_hidden_state, ced_indices, full_num_tokens
                         )
                     aux_hidden_states.append(aux_hidden_state)
+        self._pending_engram_prefetch = None
         sp_prefill.timing_end("layers_loop", _ev_loop)
         _ev_tail = sp_prefill.timing_begin()
         l2_prefetch.join()

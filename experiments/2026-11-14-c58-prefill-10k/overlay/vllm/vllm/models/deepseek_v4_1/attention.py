@@ -1337,11 +1337,26 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase):
                         local_records[:real],
                     )
                     sp_prefill.timing_end("attn_sp_front_kernel", _ev_sf, self.layer_id)
+                comp_locals: tuple[torch.Tensor, ...] = ()
+                if (
+                    self.compressor is not None
+                    and type(self.compressor) is DeepseekCompressor
+                    and getattr(self.compressor, "_sp_kernel", None) is not None
+                    and self.compressor.compress_ratio in (1, 2)
+                ):
+                    if sp_prefill._ACTIVE_TIMER is not None:
+                        self.compressor._timing_layer_id = self.layer_id
+                    self.compressor._prefetched_sp_gathered = None
+                    comp_locals = self.compressor.project_sp_local(
+                        hidden_states, sp_rows
+                    )
                 _ev_sg = sp_prefill.timing_begin()
-                q_cast, swa_records = sp_rows.gather_mxfp8(
-                    local_q_cast, local_records
+                q_cast, swa_records, *comp_gathered = sp_rows.gather_mxfp8(
+                    local_q_cast, local_records, *comp_locals
                 )
                 sp_prefill.timing_end("attn_sp_front_gather", _ev_sg, self.layer_id)
+                if comp_gathered:
+                    self.compressor._prefetched_sp_gathered = tuple(comp_gathered)
                 _ev_sw = sp_prefill.timing_begin()
                 write_swa_records(
                     swa_records,
@@ -1555,6 +1570,10 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase):
                             positions, local_hidden, sp_rows=sp_rows
                         )
                     sp_prefill.timing_end("attn_global_kv", _ev_gkv, self.layer_id)
+                if self.compressor is not None and hasattr(
+                    self.compressor, "_prefetched_sp_gathered"
+                ):
+                    self.compressor._prefetched_sp_gathered = None
                 del local_hidden
                 index_query = None
                 if self.indexer is not None:

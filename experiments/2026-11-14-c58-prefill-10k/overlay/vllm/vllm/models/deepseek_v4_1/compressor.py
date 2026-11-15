@@ -255,6 +255,7 @@ class DeepseekCompressor(nn.Module):
         self._gates = self._pending_values = self._pending_gates = None
         self._pending_tags = self._local_ids = self._row_ids = None
         self._local_shards = None
+        self._prefetched_sp_gathered = None
 
     def _ensure_capacity_buffers(self, device, t, r) -> None:
         """Allocate the reusable serving storage for ``t`` tokens and ``r``
@@ -511,6 +512,34 @@ class DeepseekCompressor(nn.Module):
             state_slots=state_metadata.slot_mapping, page=page, **kv_kwargs,
         )  # fmt: skip
 
+    def project_sp_local(
+        self, hidden_states: torch.Tensor, sp_rows
+    ) -> tuple[torch.Tensor, ...]:
+        """Run only this rank's SP compressor projection so its outputs can share
+        an earlier all-gather collective before ``forward`` runs."""
+        if self._values is None:
+            raise RuntimeError("compressor kernels must be bound before forwarding")
+        if self.compress_ratio not in (1, 2) or self._sp_kernel is None:
+            raise RuntimeError(
+                "ratio-one/two SP projection must be bound before forwarding"
+            )
+        rows = hidden_states.shape[0]
+        if rows != sp_rows.local_rows:
+            raise ValueError("SP compressor input does not match local rows")
+        local = self._values[:rows]
+        lid = int(getattr(self, "_timing_layer_id", -1))
+        lid_arg = lid if lid >= 0 else None
+        ev = sp_prefill.timing_begin()
+        if self.compress_ratio == 1:
+            self._sp_kernel(hidden_states, self._sp_weight, local)
+            out: tuple[torch.Tensor, ...] = (local,)
+        else:
+            local_gates = self._gates[:rows]
+            self._sp_kernel(hidden_states, self._sp_weight, local, local_gates)
+            out = (local, local_gates)
+        sp_prefill.timing_end("comp_sp_kernel", ev, lid_arg)
+        return out
+
     def forward(
         self,
         hidden_states,
@@ -534,28 +563,38 @@ class DeepseekCompressor(nn.Module):
                 )
             if rows != sp_rows.local_rows:
                 raise ValueError("SP compressor input does not match local rows")
-            local = self._values[:rows]
-            # Always use the prefill GEMM, even for a short local slice: it keeps
-            # the global prefill's K reduction and needs no decode workspace.
-            lid = int(getattr(self, "_timing_layer_id", -1))
-            lid_arg = lid if lid >= 0 else None
-            if self.compress_ratio == 1:
-                ev = sp_prefill.timing_begin()
-                self._sp_kernel(hidden_states, self._sp_weight, local)
-                sp_prefill.timing_end("comp_sp_kernel", ev, lid_arg)
-                ev = sp_prefill.timing_begin()
-                values = sp_rows.gather(local)
-                sp_prefill.timing_end("comp_gather", ev, lid_arg)
-                fg_kwargs = {"values": values}
+            prefetched = getattr(self, "_prefetched_sp_gathered", None)
+            if prefetched is not None:
+                self._prefetched_sp_gathered = None
+                if self.compress_ratio == 1:
+                    (values,) = prefetched
+                    fg_kwargs = {"values": values}
+                else:
+                    values, gates = prefetched
+                    fg_kwargs = {"values": values, "gates": gates}
             else:
-                local_gates = self._gates[:rows]
-                ev = sp_prefill.timing_begin()
-                self._sp_kernel(hidden_states, self._sp_weight, local, local_gates)
-                sp_prefill.timing_end("comp_sp_kernel", ev, lid_arg)
-                ev = sp_prefill.timing_begin()
-                values, gates = sp_rows.gather_many(local, local_gates)
-                sp_prefill.timing_end("comp_gather", ev, lid_arg)
-                fg_kwargs = {"values": values, "gates": gates}
+                local = self._values[:rows]
+                # Always use the prefill GEMM, even for a short local slice: it keeps
+                # the global prefill's K reduction and needs no decode workspace.
+                lid = int(getattr(self, "_timing_layer_id", -1))
+                lid_arg = lid if lid >= 0 else None
+                if self.compress_ratio == 1:
+                    ev = sp_prefill.timing_begin()
+                    self._sp_kernel(hidden_states, self._sp_weight, local)
+                    sp_prefill.timing_end("comp_sp_kernel", ev, lid_arg)
+                    ev = sp_prefill.timing_begin()
+                    values = sp_rows.gather(local)
+                    sp_prefill.timing_end("comp_gather", ev, lid_arg)
+                    fg_kwargs = {"values": values}
+                else:
+                    local_gates = self._gates[:rows]
+                    ev = sp_prefill.timing_begin()
+                    self._sp_kernel(hidden_states, self._sp_weight, local, local_gates)
+                    sp_prefill.timing_end("comp_sp_kernel", ev, lid_arg)
+                    ev = sp_prefill.timing_begin()
+                    values, gates = sp_rows.gather_many(local, local_gates)
+                    sp_prefill.timing_end("comp_gather", ev, lid_arg)
+                    fg_kwargs = {"values": values, "gates": gates}
             rows = sp_rows.num_tokens
         else:
             self._project(hidden_states)

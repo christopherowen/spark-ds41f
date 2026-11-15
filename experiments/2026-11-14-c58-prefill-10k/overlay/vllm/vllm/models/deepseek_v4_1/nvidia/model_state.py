@@ -383,6 +383,28 @@ class DeepseekV41ModelState(DefaultModelState):
     def prepare_inputs(
         self, input_batch: InputBatch, req_states: RequestState
     ) -> dict[str, torch.Tensor | None]:
+        window = self.lookback_token_ids
+        if window is not None:
+            from vllm.models.deepseek_v4_1.tilelang.lookback import gather_lookback
+
+            # Queue disk Engram reads before super().prepare_inputs so NVMe I/O
+            # overlaps host input prep and Layer 0.
+            gather_lookback(
+                window,
+                input_batch.idx_mapping,
+                req_states.num_computed_tokens.gpu,
+                req_states.all_token_ids.gpu,
+            )
+            for model in self.disk_engram_models:
+                model.prepare_disk_engram(
+                    input_batch.input_ids,
+                    input_batch.query_start_loc,
+                    window,
+                    self._early_engram_ids(model, input_batch),
+                )
+                model._pending_engram_prefetch = self._make_engram_prefetch(
+                    model, input_batch
+                )
         model_inputs = super().prepare_inputs(input_batch, req_states)
         if self.ced_state is not None:
             if self._ced_batch is not input_batch:
@@ -423,27 +445,30 @@ class DeepseekV41ModelState(DefaultModelState):
                 if dirty_len > 0:
                     self.steering.rows[:dirty_len].zero_()
                     self._steering_rows_dirty_len = 0
-        window = self.lookback_token_ids
-        if window is None:
-            return model_inputs
-        from vllm.models.deepseek_v4_1.tilelang.lookback import gather_lookback
-
-        # Every row: the batch's requests' windows, then -1.
-        gather_lookback(
-            window,
-            input_batch.idx_mapping,
-            req_states.num_computed_tokens.gpu,
-            req_states.all_token_ids.gpu,
-        )
-        model_inputs["lookback_token_ids"] = window
-        for model in self.disk_engram_models:
-            model.prepare_disk_engram(
-                input_batch.input_ids,
-                input_batch.query_start_loc,
-                window,
-                self._early_engram_ids(model, input_batch),
-            )
+        if window is not None:
+            model_inputs["lookback_token_ids"] = window
         return model_inputs
+
+    def _engram_host_columns(self, model) -> int:
+        from vllm.models.deepseek_v4_1.common import engram as engram_module
+        from vllm.models.deepseek_v4_1.engram_rows.host_hash import ALL_COLUMNS
+
+        columns = ALL_COLUMNS
+        if not engram_module.ENGRAM_CHECK_EARLY_IDS:
+            masks = {
+                layer.engram.embed_tokens.column_mask
+                for layer in model.layers[model.start_layer : model.end_layer]
+                if getattr(layer, "engram", None) is not None
+            }
+            check_early = any(
+                layer.engram.embed_tokens.disk_rows is not None
+                and layer.engram.embed_tokens.disk_rows.check_early
+                for layer in model.layers[model.start_layer : model.end_layer]
+                if getattr(layer, "engram", None) is not None
+            )
+            if len(masks) == 1 and not check_early:
+                columns = next(iter(masks))
+        return columns
 
     def _early_engram_ids(self, model, input_batch: InputBatch) -> np.ndarray | None:
         """The step's Engram row IDs the host can hash now, ``[tokens, layers, 24]``
@@ -451,9 +476,7 @@ class DeepseekV41ModelState(DefaultModelState):
         or None when the step has no prefill chunk to hash."""
         if not input_batch.has_prefill:
             return None
-        from vllm.models.deepseek_v4_1.common import engram as engram_module
         from vllm.models.deepseek_v4_1.engram_rows.host_hash import (
-            ALL_COLUMNS,
             HostEngramHash,
             placed_by_host,
         )
@@ -482,24 +505,65 @@ class DeepseekV41ModelState(DefaultModelState):
         requests = placed_by_host(requests, input_batch.num_draft_tokens_per_req)
         if not any(len(positions) for *_, positions in requests):
             return None
-        columns = ALL_COLUMNS
-        if not engram_module.ENGRAM_CHECK_EARLY_IDS:
-            masks = {
-                layer.engram.embed_tokens.column_mask
-                for layer in model.layers[model.start_layer : model.end_layer]
-                if getattr(layer, "engram", None) is not None
-            }
-            check_early = any(
-                layer.engram.embed_tokens.disk_rows is not None
-                and layer.engram.embed_tokens.disk_rows.check_early
-                for layer in model.layers[model.start_layer : model.end_layer]
-                if getattr(layer, "engram", None) is not None
-            )
-            if len(masks) == 1 and not check_early:
-                columns = next(iter(masks))
         return self._host_engram_hash.step_ids(
-            input_batch.input_ids.shape[0], requests, columns=columns
+            input_batch.input_ids.shape[0],
+            requests,
+            columns=self._engram_host_columns(model),
         )
+
+    def _make_engram_prefetch(self, model, input_batch: InputBatch):
+        """Return a closure that warms the Engram user-space row cache for the
+        next prefill chunk while the current chunk finishes executing on GPU."""
+        if not input_batch.has_prefill or self._host_engram_hash is None:
+            return None
+        max_tokens = model.engram_layout.caps[0].max_tokens
+        next_requests = []
+        total_next_rows = 0
+        drafts = input_batch.num_draft_tokens_per_req
+        for i, req_id in enumerate(input_batch.req_ids):
+            if not input_batch.is_prefilling_np[i]:
+                continue
+            if drafts is not None and int(drafts[i]) != 0:
+                continue
+            tokens = self._prefill_tokens.get(req_id)
+            if tokens is None:
+                continue
+            rows = int(input_batch.num_scheduled_tokens[i])
+            next_start = int(input_batch.num_computed_prefill_tokens_np[i]) + rows
+            if next_start >= len(tokens):
+                continue
+            budget = max_tokens - total_next_rows
+            if budget <= 0:
+                break
+            next_rows = min(rows, len(tokens) - next_start, budget)
+            next_positions = np.arange(
+                next_start, next_start + next_rows, dtype=np.int64
+            )
+            next_requests.append((total_next_rows, next_rows, tokens, next_positions))
+            total_next_rows += next_rows
+        if not next_requests or total_next_rows <= 0:
+            return None
+        columns = self._engram_host_columns(model)
+        engram_layers = tuple(
+            layer.engram
+            for layer in model.layers[model.start_layer : model.end_layer]
+            if getattr(layer, "engram", None) is not None
+            and getattr(layer.engram.embed_tokens, "disk_rows", None) is not None
+        )
+        if not engram_layers:
+            return None
+        host_hash = self._host_engram_hash
+
+        def _prefetch() -> None:
+            next_ids = host_hash.step_ids(
+                total_next_rows, next_requests, columns=columns
+            )
+            for engram in engram_layers:
+                engram.embed_tokens.disk_rows.prefetch(
+                    next_ids[:, engram.layer_hash_index]
+                )
+
+        return _prefetch
 
     def prepare_dummy_inputs(self, num_reqs: int, num_tokens: int) -> dict[str, Any]:
         model_inputs = super().prepare_dummy_inputs(num_reqs, num_tokens)
