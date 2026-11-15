@@ -215,11 +215,20 @@ collectives, and DSpark drafting.
    on the main stream immediately after `wq_b` while the side stream finishes
    the compressor and scores only the `n_new` ($\le M$) newly written blocks,
    merging the `n_new` scores into the sorted `k` prefix keys in a lightweight
-   merge kernel before MLA. First bound how much of the latency-bound bucket is
-   serial dependency rather than SM occupancy; if GB10's 48 SMs or 99 KiB per-CTA
-   shared memory serialize concurrent streams during tail waves, screen co-tuning
-   pipeline stages / dynamic SMEM on the overlapping kernel pair or carving out a
-   small CUDA Green Context SM partition for the latency-critical side stream.
+   merge kernel before MLA. Pass `cudaGraphInstantiateFlagUseNodePriority`
+   (`0x08`) when instantiating multi-stream decode CUDA graphs so the hardware
+   CTA scheduler honors capturing-stream priorities (prioritizing the
+   latency-critical indexer / router-gate / compressor side stream over
+   shared-expert / main-stream MoE nodes; by default CUDA Graph instantiation
+   ignores stream priority without that flag), and gate two-stream branching and
+   small-batch decode fusions on active token count $M$ (e.g. `c1..c4` vs
+   `c8..c16`) so branches that win at low concurrency do not contend for GB10's
+   48 SMs once batch concurrency already saturates the device. First bound how
+   much of the latency-bound bucket is serial dependency rather than SM
+   occupancy; if GB10's 48 SMs or 99 KiB per-CTA shared memory serialize
+   concurrent streams during tail waves, screen co-tuning pipeline stages /
+   dynamic SMEM on the overlapping kernel pair or carving out a small CUDA Green
+   Context SM partition for the latency-critical side stream.
 6. **Two-phase sparse-MLA decode KV and PDL prologue weight prefetch before
    `griddepcontrol.wait`.** In decode sparse-MLA, the prior sliding-window KV
    rows (`pos < pos0`, i.e., all but the current step's rows) and—on layers that
@@ -258,8 +267,15 @@ collectives, and DSpark drafting.
    `0025` splits indexer rows across TP ranks only in SP prefill). Loading each
    shared prefix tile `K_shared [64, 128]` and `SFK_shared` once per request and
    scoring all $V$ verification rows of that request against it before advancing
-   `p0` cuts decode `KPool` traffic by $V\times$, and above ~64K context can pair
-   with a TP row split and one-shot `sparknet` RoCE gather of
+   `p0` cuts decode `KPool` traffic by $V\times$. Inside the fused multi-row
+   CTA, keep all $V$ verification rows' query slices (`q` across heads)
+   permanently in registers across the `KPool` key-block loop (avoiding repeated
+   shared-memory `LDS.128` reloads per key block and query row) and reduce
+   per-lane dot products across 4 indexer heads simultaneously with a 6-shuffle
+   butterfly scatter-reduce (`xor 16, 8` leaving one head per lane, then
+   `4, 2, 1`, preserving exact pairwise FP32 addition order for bit-identity)
+   instead of 20 shuffles per `(key_block, query_row)`. Above ~64K context this
+   can pair with a TP row split and one-shot `sparknet` RoCE gather of
    `topk_indices_buffer[:rows]` (`2 KiB` per row).
 10. **Same-request multi-row SWA KV reuse in decode `sparse_mla_fwd_v41`.** On
     SWA-only layers (`idx_width = 0`, `swa_width = 128`, `segments = 1`) and in
@@ -406,9 +422,18 @@ Open levers:
 - **First request after a restart** is ~0.37 s slower to its first token than
   subsequent requests. Screen `CUDA_MODULE_LOADING=EAGER` (checking boot time
   impact) and sample the first request with `py-spy dump --nonblocking`.
-- **Indexer selection at 200K–1M context.** Split long-context indexer time into
-  MXFP4 scoring vs top-k selection; if top-k selection is a measurable share at
-  500K–1M, screen a bounded radix top-k.
+- **Indexer scoring and selection at 200K–1M context.** Split long-context
+  indexer time into MXFP4 scoring vs top-$k$ selection; if top-$k$ selection is
+  a measurable share at 500K–1M, screen a bounded radix top-$k$. For the scoring
+  pass itself at deep context, screen a **certified two-pass block scorer**
+  (analogous to our `lm_head` Cauchy-Schwarz `W_q` screen): Pass 1 computes a
+  coarse score $S_1$ per block plus an outward-rounded (`__fadd_ru` /
+  `__fsub_rd`) Cauchy-Schwarz + MMA ULP error bound $\epsilon_b$ so the true
+  full-precision score obeys $S_{\text{exact}} \in [S_1 - \epsilon_b, S_1 + \epsilon_b]$;
+  using the $k$-th coarse score $T_1$ and $E = \max_b \epsilon_b$, Pass 2
+  re-scores in full precision only the narrow band of candidate blocks
+  straddling $[T_1 - E - \epsilon_b, T_1 + E + \epsilon_b]$ (including ties) for
+  bit-identical top-$k$ selection.
 - **NVMe interrupt coalescing stays off** on every node by the owner's decision
   (2026-10-02; prefill measured 0.7–1.6% slower with it on in
   `experiments/2026-10-02-nvme-coalescing`).
@@ -436,7 +461,12 @@ Open levers:
   eviction pressure (saturating the KV pool with unique prompts first so every
   prefill chunk evicts across the MLA, SWA, CED-anchor, and kpool-tail groups
   under `--prefix-cache-retention-interval`, checking both active-session hit
-  preservation and `dgx1` scheduler step time).
+  preservation and `dgx1` scheduler step time). For `/v1/messages` clients using
+  dynamic/deferred tool discovery (`defer_loading: true` with `tool_reference`
+  blocks inside `tool_result`), support injecting newly discovered tool schemas
+  inline at the `tool_result` turn rather than mutating the top-of-prompt
+  `tools` preamble so mid-session tool discovery does not invalidate the cached
+  64K–100K prefix.
 
 ## Boot
 
@@ -492,7 +522,17 @@ Open levers:
   [#949](https://github.com/christopherowen/spark-ds41f/pull/949)):** ensure
   quoted DSML markup inside normal reply text or tool-call string arguments is
   distinguished from genuine DSML structural tokens on top of `0643`'s streaming
-  string-argument extender.
+  string-argument extender, and handle stray quoted `</think>` tags in the
+  answer body when the model quotes `</think>` inside reasoning (closing the
+  thinking span early and emitting a second `</think>` before a tool call).
+- **Answer-only `repetition_penalty` scope (`output_bin_counts` without
+  `prompt_bin_counts`):** vLLM's `repetition_penalty` kernel currently penalizes
+  tokens appearing in `prompt_bin_counts` as well as `output_bin_counts` (unlike
+  `presence_penalty` and `frequency_penalty`), which penalizes identifiers,
+  numbers, and lines copied from the prompt during code edits and lowers
+  `CopyDrafter` / DSpark acceptance when callers pass `repetition_penalty > 1.0`.
+  Screen restricting `repetition_penalty` to generated output tokens (or a
+  bounded trailing answer window).
 - **Opt-in Latent Sparse Attention (`VLLM_DS41_LSA`, `0741` in `1107`):** ships
   disabled by default (`VLLM_DS41_LSA=0`) with full runtime plumbing and unit
   tests; any future enablement requires an independent long-context answer
