@@ -210,8 +210,8 @@ differs only in cabling, transport and memory sizing):
 - sink detection and draft-zero rejection for DeepSeek V4.1, on by default
   (`VLLM_SINK_REJECTION=0` turns it off, `0221`, `0223`, `0264`, `0266`);
 - DeepSeek API effort aliases, `thinking` switch, `response_format`, `tool_choice: none`,
-  assistant prefix (`0256-0257`, `0539-0540`), prompt-cache hit reporting
-  (`--enable-prompt-tokens-details`), and control-token spellings kept as plain text (`0227`);
+  assistant prefix (`0256-0257`, `0539-0540`), prompt-cache hit and per-request timing reporting
+  (`--enable-prompt-tokens-details`, `--enable-per-request-metrics`), and control-token spellings kept as plain text (`0227`);
 - 1,048,576-token per-request limit on both 64 KiB shapes:
   - `tp4-ring`: 16 admitted sequences, 16,384 batched tokens, and a 10.5 GiB-per-rank KV pool
     that holds 11 full 1M contexts at once (`11,554,122` tokens / `11.02x` on vLLM's startup line,

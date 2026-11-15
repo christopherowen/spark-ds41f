@@ -289,7 +289,7 @@ rollback.
 | CUDA graphs & warmup | `FULL_AND_PIECEWISE`, capture sizes 1-96 on `tp4-ring` (1-48 on `tp3-triangle`); all declared TileLang calls prepared and cache frozen before memory profiling (`--jit-monitor-mode off`) |
 | Engram projection & rows | sharded across ranks (`projection_tp`); one native reader thread reads both tables in layer order from interleaved whole hash columns; host hashes prefill tokens a step early except drafted-prefill requests, which the GPU hashes (vLLM 0145-0154, 0180, 0567) |
 | Memory guards | 5 GiB startup (0.25 s), 3 GiB steady (2 s), each killing on its first sample below; hosts set `vm.watermark_boost_factor=0` |
-| Prefix caching & API semantics | 256-token blocks (`--enable-prefix-caching`, `--enable-prompt-tokens-details`); thinking enabled by default, top-level `thinking` switch, effort aliases, `response_format`, `tool_choice: none`, assistant prefix, and generation defaults `temperature: 1.0, top_p: 1.0` |
+| Prefix caching & API semantics | 256-token blocks (`--enable-prefix-caching`, `--enable-prompt-tokens-details`, `--enable-per-request-metrics`); thinking enabled by default, top-level `thinking` switch, effort aliases, `response_format`, `tool_choice: none`, assistant prefix, and generation defaults `temperature: 1.0, top_p: 1.0` |
 <!-- END GENERATED: active-settings -->
 
 The historical release comparison of r6f against r6d is in the
