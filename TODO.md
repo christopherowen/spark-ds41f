@@ -295,33 +295,53 @@ graph retention (`0728`), fused single-rank Markov drafting (`0717`), and
 device-side `prepare_inputs` folding (`0754`) are all active.
 
 Open levers:
-- **Bounded or indexed CopyDrafter history match at 100K–1M contexts.** Even
-  with warp early-exit (`0744`), a decode step that does not hit a 256-token
-  match scans the full `[min_match, total_len)` history in UVA (`all_token_ids.gpu`)
-  on `output_copy_stream` (~0.36–0.47 ms/step at `c16`, 1M random tokens, and up
+- **Bounded or indexed CopyDrafter history match, forward-locality cursor, and
+  payoff-gated wide copy passes at 100K–1M contexts.** Even with warp
+  early-exit (`0744`), a decode step that does not hit a 256-token match scans
+  the full `[min_match, total_len)` history in UVA (`all_token_ids.gpu`) on
+  `output_copy_stream` (~0.36–0.47 ms/step at `c16`, 1M random tokens, and up
   to ~2 ms on repeated 16/32-token boilerplate matches), contending with DSpark
-  on `main_stream` for unified memory bandwidth. Maintain a lightweight
-  incremental per-slot rolling-hash index of 16-token suffix positions updated
-  only for newly committed tokens, or bound the scan to a recency + prefix
-  window so `copy_match` is $O(1)$ in context length.
+  on `main_stream` for unified memory bandwidth.
+  1. Maintain an incremental per-slot hash-chain index (`head[hash]`,
+     `prev[pos]` over 4- to 16-token windows) updated only for newly committed
+     tokens so `copy_match` is $O(1)$ in context length.
+  2. Track a per-request copy cursor (`last_src`): while output follows the
+     matched span, advance the cursor directly without re-searching; when the
+     output edits a few tokens and re-enters the source, prefer the nearest
+     candidate match at or after `last_src` (so long as its backward match is
+     at least `min(best_len, 8)`) so look-alike lines or JSONL records do not
+     jump to the wrong record.
+  3. After consecutive fully accepted 16-row copy passes, test widening single-
+     stream copy verification to 32/48/64 rows (`M=32/48/64` TileLang GEMM
+     tiles with identical K-reduction order), gated by wall-clock payoff back-
+     off (`confirmed_tokens / ms_wide >= 16 / ms_16`, doubling the required
+     full-pass streak up to 16 whenever a wide streak underperforms 16-row
+     passes).
 - **Draft depth by load or recent acceptance.** Five DSpark drafts pay off on
   high-acceptance code at one stream (`+14–18%`), whereas live agent traffic and
   8–16 stream prose accept fewer tokens per step. Screen load-aware
   (`num_speculative_tokens_per_batch_size`) or per-request acceptance-aware
   draft depth schedules on recorded agent traffic and the paired servebench
   suites.
-- **Block-wise prefix verification and two-level quad Gumbel-Max sampling for
-  `temp > 0`.** For sampled verification (`temp=1.0`), standard independent
-  token-by-token rejection immediately truncates at the first dip in
-  $p(x_t)/q(x_t)$. Screen cumulative prefix importance-ratio verification
-  ($w_i = \prod_{t \le i} p(x_t)/q(x_t)$, testing prefix acceptance
-  $h_i = w_i / (w_i + 1 - w_{i-1})$ with residual distribution
-  $\propto \max(w_i p - q, 0)$), which preserves the exact target distribution
-  while letting a strong subsequent draft token rescue a borderline earlier
-  draft. Pair with a two-level Gumbel-Max residual/target draw that sums target
-  and residual mass per 64-token vocabulary quad, selects the winning quad via
-  Gumbel-Max, and evaluates per-token Gumbel-Max only inside that single 64-token
-  quad.
+- **Coupled `(seed, pos, vocab_id)` Gumbel-Max sampling and block-wise prefix
+  verification for `temp > 0`.** When DSpark drafts greedily ($q(x_t) = 1$) and
+  `tilelang_rejection.py` verifies at `temp = 1.0`, exact rejection sampling
+  must reject even the target model's own argmax with probability $1 - p(x_t)$
+  on near-ties, and block verification ($w_i = \prod_{t \le i} p(x_t)/q(x_t)$)
+  cannot lift $p(x_t)/q(x_t) > 1$ for a one-hot draft. Screen two lossless remedies:
+  1. *Coupled Gumbel-Max draft and target sampling:* have both DSpark's Markov
+     head and `tilelang_rejection.py` draw deterministic per-`(seed, position,
+     vocab_id)` Gumbel noise $G(\text{seed}, \text{pos}, v) = -\ln(-\ln u)$ and
+     select $\arg\max_v (z_v / T + G(\text{seed}, \text{pos}, v))$. By the
+     Gumbel-Max trick this preserves the exact target `temp > 0` distribution
+     and makes multi-row verification bit-identical to 1-token-per-pass target
+     decoding while naturally accepting near-ties whenever DSpark and the
+     40-layer target assign similar relative logits.
+  2. *Non-degenerate draft probabilities with block verification and two-level
+     quad Gumbel-Max residual sampling:* pass DSpark's draft probabilities
+     $q(x_t) < 1$ into cumulative prefix importance-ratio verification
+     ($h_i = w_i / (w_i + 1 - w_{i-1})$), paired with a two-level Gumbel-Max
+     residual/target draw over 64-token vocabulary quads.
 - **Grouped 3-layer DSpark context-KV projection.** Concatenate
   `mtp.{0,1,2}.attn.wkv` so all three DSpark layers' context-KV projections and
   RoPE execute in a single grouped launch over the tapped hidden states from
@@ -346,6 +366,21 @@ Open levers:
   (`0..k-1` where `survival >= tau`) and query `CopyDrafter` anchored on the
   extended prefix ending at `d_{k-1}` to fill remaining tail slots `k..4` when
   a short context match exists.
+- **Fixed-width tree side-candidate leaves in low-confidence tail verify slots.**
+  When a request's linear DSpark chain drops below `DEAD_ROWS_TAU` after depth
+  $L < 5$ and `CopyDrafter` has no suffix match, instead of leaving the
+  remaining $5 - L$ slots as dead rows or extending a low-survival linear chain,
+  populate those tail slots with DSpark's 2nd/3rd candidate tokens as sibling
+  branches at the first low-confidence depth using the verify attention mask,
+  promoting the matching sibling leaf if the primary chain misses at that depth.
+- **Opt-in per-request near-tie acceptance threshold ([#1211](https://github.com/christopherowen/spark-ds41f/issues/1211)).**
+  Evaluate an opt-in per-request sampling parameter (e.g. `vllm_xargs`
+  `spec_near_tie_k` $\in [0, 1]$, default `0` = exact verification untouched and
+  bit-identical) in `tilelang_rejection.py` (`vllm_shifted(logit, row_max) >=
+  ln(k) -> log_prob = 0`), scoped to `thinking` requests and tested against
+  loop-containment gates ([#864](https://github.com/christopherowen/spark-ds41f/issues/864))
+  since collapsing near-ties toward greedy with thinking off increases
+  repetition-loop risk.
 - **Cross-request verify-row allocation at high concurrency.** Compare our
   per-slot survival budget (`assign_draft_budget`) plus per-step verify length
   against ranking candidate draft slots across the whole batch by marginal
@@ -447,7 +482,11 @@ Open levers:
   (`token_determinism.py --wide`). Run it on every candidate.
 - **Loop containment ([#864](https://github.com/christopherowen/spark-ds41f/issues/864)):**
   `1107` carries the v2 loop detector (`0679`/`0684`). Complete the long-context
-  83K max-effort canary soak on `1107` during release qualification.
+  83K max-effort canary soak on `1107` during release qualification, and verify
+  that loop detection and thinking-budget cuts evaluate every committed token
+  position across multi-token verify passes (`1..5` DSpark or `16..64`
+  CopyDrafter rows) and truncate at the exact first token index where the rule
+  holds so truncation is invariant to speculative verify width.
 - **DSML token provenance ([#876](https://github.com/christopherowen/spark-ds41f/issues/876),
   [#948](https://github.com/christopherowen/spark-ds41f/issues/948), PR
   [#949](https://github.com/christopherowen/spark-ds41f/pull/949)):** ensure
