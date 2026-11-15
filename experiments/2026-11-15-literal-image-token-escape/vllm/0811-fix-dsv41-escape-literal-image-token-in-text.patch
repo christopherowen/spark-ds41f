@@ -1,0 +1,131 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Jordi Posthumus <jordi.posthumus@gmail.com>
+Date: Sat, 15 Nov 2026 00:20:00 -0400
+Subject: [PATCH] fix(dsv41): escape the literal image token in text instead of 400
+
+Rebased for candidate-55's tree (the original, carried as 0762 on candidate-36,
+does not apply: candidate-55 rewrote _normalize_messages and the encoding module).
+
+Base: candidate-55 vLLM patch head (series through 0810).
+
+Rationale unchanged: the image token in the prompt comes only from image content
+blocks; its literal spelling typed into request text is ordinary text and the
+hosted DeepSeek API passes it through. Rejecting it 400'd replayed conversation
+history that clients cannot control (spark-ds41f issue #1031, PR #1047).
+
+---
+--- a/vllm/tokenizers/deepseek_v41.py
++++ b/vllm/tokenizers/deepseek_v41.py
+@@ -13,8 +13,9 @@
+ 
+ from .deepseek_v41_encoding import (
+     ASSISTANT_SP_TOKEN,
+     IMAGE_PLACEHOLDER,
++    IMAGE_PLACEHOLDER_TEXT,
+     REASONING_EFFORT_MAPPINGS,
+     USER_SP_TOKEN,
+     encode_messages,
+     eos_token,
+@@ -110,10 +111,10 @@
+     remain, which can only come from the template, and the text between them is
+     encoded without the added vocabulary, with the sentinels restored. This
+     matches DeepSeek's encoder, which encodes a typed spelling as plain text.
+ 
+-    The image placeholder is left alone: `_normalize_messages` already rejects it
+-    in text, and image parts render it.
++    The image placeholder is left alone: image parts render it, and
++    `_normalize_messages` escapes the typed spelling in text to ordinary text.
+     """
+ 
+     @staticmethod
+     def compile(spellings: list[str]) -> re.Pattern[str] | None:
+@@ -233,12 +234,36 @@
+ 
+     return encode
+ 
+ 
++def _escape_image_token_literal(value: Any) -> Any:
++    """Escape the image token's literal spelling in request text to plain text.
++
++    The image token in the prompt comes only from image content blocks. The
++    token's literal spelling typed into a message, text part, tool result,
++    reasoning or tool-call arguments is ordinary text: escape it to the
++    ordinary-text spelling, which is in no added-token vocabulary, so the
++    encoder cannot mistake it for an image reference. The hosted DeepSeek API
++    passes the spelling through as text; rejecting it instead 400'd replayed
++    conversation history that clients cannot control (spark-ds41f issue #1031).
++    """
++    if isinstance(value, str):
++        return value.replace(IMAGE_PLACEHOLDER, IMAGE_PLACEHOLDER_TEXT)
++    if isinstance(value, list):
++        return [_escape_image_token_literal(item) for item in value]
++    if isinstance(value, dict):
++        return {key: _escape_image_token_literal(item) for key, item in value.items()}
++    return value
++
++
+ def _normalize_messages(
+     messages: list[ChatCompletionMessageParam],
+ ) -> list[dict[str, Any]]:
+     result = [dict(message) for message in messages]
++    # The image token in the prompt comes only from image parts, which the
++    # flattening below renders as IMAGE_PLACEHOLDER. A literal spelling typed
++    # into request text is ordinary text: escape it first.
++    result = [_escape_image_token_literal(message) for message in result]
+     for message in result:
+         role = message.get("role")
+         if role not in (
+             "system",
+@@ -253,32 +278,14 @@
+             message["role"] = "system"
+         if "reasoning" in message:
+             message["reasoning_content"] = message["reasoning"]
+         content = message.get("content")
+-        # Image tokens come only from image parts, as the reference requires.
+-        if isinstance(content, str) and IMAGE_PLACEHOLDER in content:
+-            raise ValueError(
+-                f"Message content contains image special token '{IMAGE_PLACEHOLDER}'. "
+-                "Images should be provided as image content blocks."
+-            )
+-        reasoning = message.get("reasoning_content")
+-        if isinstance(reasoning, str) and IMAGE_PLACEHOLDER in reasoning:
+-            raise ValueError(
+-                f"reasoning_content contains image special token '{IMAGE_PLACEHOLDER}'"
+-            )
+         if isinstance(content, list):
+             parts = []
+             for block in content:
+                 part_type = block.get("type")
+                 if part_type in ("text", "input_text", "output_text"):
+-                    text = block.get("text", "")
+-                    if IMAGE_PLACEHOLDER in text:
+-                        raise ValueError(
+-                            "Text block contains image placeholder "
+-                            f"'{IMAGE_PLACEHOLDER}'. Images should be separate "
+-                            "content blocks."
+-                        )
+-                    parts.append(text)
++                    parts.append(block.get("text", ""))
+                 elif part_type in ("image_url", "input_image", "image_pil"):
+                     parts.append(IMAGE_PLACEHOLDER)
+                 else:
+                     raise ValueError(
+--- a/vllm/tokenizers/deepseek_v41_encoding.py
++++ b/vllm/tokenizers/deepseek_v41_encoding.py
+@@ -22,8 +22,13 @@
+ USER_SP_TOKEN = "<｜User｜>"
+ ASSISTANT_SP_TOKEN = "<｜Assistant｜>"
+ LATEST_REMINDER_SP_TOKEN = "<｜latest_reminder｜>"
+ IMAGE_PLACEHOLDER = "<｜deepseek_image｜>"
++# The ordinary-text spelling of the image token: it is in no added-token
++# vocabulary, so the encoder can only see it as plain text. deepseek_v41.py
++# escapes literal spellings in request text to it (see
++# _escape_image_token_literal).
++IMAGE_PLACEHOLDER_TEXT = "<|deepseek_image|>"
+ 
+ DS_TASK_SP_TOKENS = {
+     "action": "<｜action｜>",
+     "query": "<｜query｜>",
+
+-- 
+2.39.5
