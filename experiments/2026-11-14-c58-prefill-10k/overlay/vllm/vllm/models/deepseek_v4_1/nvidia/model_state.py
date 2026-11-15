@@ -150,6 +150,7 @@ class DeepseekV41ModelState(DefaultModelState):
         # the outputs it recomputes), for the host's hash of its prefill chunks.
         self._prefill_tokens: dict[str, np.ndarray] = {}
         self._host_engram_hash = None
+        self._prefetched_engram_ids: tuple[tuple[Any, ...], np.ndarray] | None = None
         # GLP steering of the requests made to the steered model name: each
         # request state's mark, and the steering whose rows a step marks from them.
         self.steering = next(
@@ -490,7 +491,39 @@ class DeepseekV41ModelState(DefaultModelState):
                 geometry.primes,
                 geometry.offsets,
             )
+        columns = self._engram_host_columns(model)
         starts = input_batch.query_start_loc_np
+        drafts = input_batch.num_draft_tokens_per_req
+        cached = self._prefetched_engram_ids
+        self._prefetched_engram_ids = None
+        if cached is not None:
+            cached_key, cached_ids = cached
+            cur_reqs = []
+            match = (
+                columns == cached_key[0]
+                and int(input_batch.input_ids.shape[0]) == cached_key[1]
+            )
+            if match:
+                for i, req_id in enumerate(input_batch.req_ids):
+                    if not input_batch.is_prefilling_np[i] or (
+                        drafts is not None and int(drafts[i]) != 0
+                    ):
+                        match = False
+                        break
+                    tokens = self._prefill_tokens.get(req_id)
+                    if tokens is None:
+                        match = False
+                        break
+                    first = int(starts[i])
+                    rows = int(input_batch.num_scheduled_tokens[i])
+                    start = int(input_batch.num_computed_prefill_tokens_np[i])
+                    stop = min(start + rows, len(tokens))
+                    if start >= stop:
+                        match = False
+                        break
+                    cur_reqs.append((req_id, first, rows, start, stop))
+            if match and tuple(cur_reqs) == cached_key[2]:
+                return cached_ids
         requests = []
         for i, req_id in enumerate(input_batch.req_ids):
             first, rows = int(starts[i]), int(input_batch.num_scheduled_tokens[i])
@@ -502,13 +535,13 @@ class DeepseekV41ModelState(DefaultModelState):
                     start, min(start + rows, len(tokens)), dtype=np.int64
                 )
             requests.append((first, rows, tokens, positions))
-        requests = placed_by_host(requests, input_batch.num_draft_tokens_per_req)
+        requests = placed_by_host(requests, drafts)
         if not any(len(positions) for *_, positions in requests):
             return None
         return self._host_engram_hash.step_ids(
             input_batch.input_ids.shape[0],
             requests,
-            columns=self._engram_host_columns(model),
+            columns=columns,
         )
 
     def _make_engram_prefetch(self, model, input_batch: InputBatch):
@@ -518,6 +551,7 @@ class DeepseekV41ModelState(DefaultModelState):
             return None
         max_tokens = model.engram_layout.caps[0].max_tokens
         next_requests = []
+        next_key_reqs = []
         total_next_rows = 0
         drafts = input_batch.num_draft_tokens_per_req
         for i, req_id in enumerate(input_batch.req_ids):
@@ -540,6 +574,9 @@ class DeepseekV41ModelState(DefaultModelState):
                 next_start, next_start + next_rows, dtype=np.int64
             )
             next_requests.append((total_next_rows, next_rows, tokens, next_positions))
+            next_key_reqs.append(
+                (req_id, total_next_rows, next_rows, next_start, next_start + next_rows)
+            )
             total_next_rows += next_rows
         if not next_requests or total_next_rows <= 0:
             return None
@@ -553,11 +590,13 @@ class DeepseekV41ModelState(DefaultModelState):
         if not engram_layers:
             return None
         host_hash = self._host_engram_hash
+        next_key = (columns, total_next_rows, tuple(next_key_reqs))
 
         def _prefetch() -> None:
             next_ids = host_hash.step_ids(
                 total_next_rows, next_requests, columns=columns
             )
+            self._prefetched_engram_ids = (next_key, next_ids)
             for engram in engram_layers:
                 engram.embed_tokens.disk_rows.prefetch(
                     next_ids[:, engram.layer_hash_index]
@@ -587,6 +626,7 @@ class DeepseekV41ModelState(DefaultModelState):
             # The captured graph reads this buffer; replays refill it in place.
             self.lookback_token_ids.fill_(-1)
             model_inputs["lookback_token_ids"] = self.lookback_token_ids
+        self._prefetched_engram_ids = None
         for model in self.disk_engram_models:
             model.prepare_dummy_engram(num_tokens)
         return model_inputs
