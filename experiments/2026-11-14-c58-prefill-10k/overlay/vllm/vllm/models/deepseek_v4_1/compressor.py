@@ -11,7 +11,6 @@ from vllm.distributed.communication_op import tensor_model_parallel_all_gather
 from vllm.model_executor.layers import linear as linear_layers
 from vllm.model_executor.layers.attention_layer_base import AttentionLayerBase
 from vllm.model_executor.layers.linear import MergedColumnParallelLinear
-from vllm.models.deepseek_v4_1 import sp_prefill
 from vllm.models.deepseek_v4_1.sparse_mla import SLOT_DTYPE, DeepseekV41Backend
 from vllm.v1.attention.backend import MultipleOf
 from vllm.v1.kv_cache_interface import CircularBufferSpec
@@ -527,18 +526,14 @@ class DeepseekCompressor(nn.Module):
         if rows != sp_rows.local_rows:
             raise ValueError("SP compressor input does not match local rows")
         local = self._values[:rows]
-        lid = int(getattr(self, "_timing_layer_id", -1))
-        lid_arg = lid if lid >= 0 else None
-        ev = sp_prefill.timing_begin()
+        # Always use the prefill GEMM, even for a short local slice: it keeps
+        # the global prefill's K reduction and needs no decode workspace.
         if self.compress_ratio == 1:
             self._sp_kernel(hidden_states, self._sp_weight, local)
-            out: tuple[torch.Tensor, ...] = (local,)
-        else:
-            local_gates = self._gates[:rows]
-            self._sp_kernel(hidden_states, self._sp_weight, local, local_gates)
-            out = (local, local_gates)
-        sp_prefill.timing_end("comp_sp_kernel", ev, lid_arg)
-        return out
+            return (local,)
+        local_gates = self._gates[:rows]
+        self._sp_kernel(hidden_states, self._sp_weight, local, local_gates)
+        return (local, local_gates)
 
     def forward(
         self,
@@ -555,53 +550,23 @@ class DeepseekCompressor(nn.Module):
         rows = hidden_states.shape[0]
         if self._values is None:
             raise RuntimeError("compressor kernels must be bound before forwarding")
-        values = gates = None
         if sp_rows is not None:
-            if self.compress_ratio not in (1, 2) or self._sp_kernel is None:
-                raise RuntimeError(
-                    "ratio-one/two SP projection must be bound before forwarding"
-                )
-            if rows != sp_rows.local_rows:
-                raise ValueError("SP compressor input does not match local rows")
             prefetched = getattr(self, "_prefetched_sp_gathered", None)
             if prefetched is not None:
                 self._prefetched_sp_gathered = None
-                if self.compress_ratio == 1:
-                    (values,) = prefetched
-                    fg_kwargs = {"values": values}
-                else:
-                    values, gates = prefetched
-                    fg_kwargs = {"values": values, "gates": gates}
             else:
-                local = self._values[:rows]
-                # Always use the prefill GEMM, even for a short local slice: it keeps
-                # the global prefill's K reduction and needs no decode workspace.
-                lid = int(getattr(self, "_timing_layer_id", -1))
-                lid_arg = lid if lid >= 0 else None
-                if self.compress_ratio == 1:
-                    ev = sp_prefill.timing_begin()
-                    self._sp_kernel(hidden_states, self._sp_weight, local)
-                    sp_prefill.timing_end("comp_sp_kernel", ev, lid_arg)
-                    ev = sp_prefill.timing_begin()
-                    values = sp_rows.gather(local)
-                    sp_prefill.timing_end("comp_gather", ev, lid_arg)
-                    fg_kwargs = {"values": values}
-                else:
-                    local_gates = self._gates[:rows]
-                    ev = sp_prefill.timing_begin()
-                    self._sp_kernel(hidden_states, self._sp_weight, local, local_gates)
-                    sp_prefill.timing_end("comp_sp_kernel", ev, lid_arg)
-                    ev = sp_prefill.timing_begin()
-                    values, gates = sp_rows.gather_many(local, local_gates)
-                    sp_prefill.timing_end("comp_gather", ev, lid_arg)
-                    fg_kwargs = {"values": values, "gates": gates}
+                local_outs = self.project_sp_local(hidden_states, sp_rows)
+                prefetched = sp_rows.gather_many(*local_outs)
+            if self.compress_ratio == 1:
+                (values,) = prefetched
+                fg_kwargs = {"values": values}
+            else:
+                values, gates = prefetched
+                fg_kwargs = {"values": values, "gates": gates}
             rows = sp_rows.num_tokens
         else:
             self._project(hidden_states)
             fg_kwargs = {"values": None}
-        lid_arg = int(getattr(self, "_timing_layer_id", -1))
-        lid_arg = lid_arg if lid_arg >= 0 else None
-        ev_tl = sp_prefill.timing_begin()
         self._forward_tilelang(
             rows,
             metadata,
@@ -612,5 +577,4 @@ class DeepseekCompressor(nn.Module):
             kv_page_size=kv_page_size,
             **fg_kwargs,
         )
-        sp_prefill.timing_end("comp_forward_tl", ev_tl, lid_arg)
         return self._latent[:rows], self._slots[:rows]

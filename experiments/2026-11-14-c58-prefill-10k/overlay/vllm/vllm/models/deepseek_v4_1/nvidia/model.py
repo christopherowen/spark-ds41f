@@ -379,20 +379,17 @@ class DeepseekV4DecoderLayer(nn.Module):
                     res_mix=res_mix,
                 )
                 previous_output = None
-            _ev_eng = sp_prefill.timing_begin()
             residual = self.engram(
                 residual,
                 engram_hashes[:, self.engram.layer_hash_index],
                 engram_mask,
                 **engram_kwargs,
             )
-            sp_prefill.timing_end("engram", _ev_eng, layer_idx)
         fn = self.hc_attn_fn_broadcast if residual.ndim == 2 else self.hc_attn_fn
         pre_kwargs = {}
         if aux_out is not None:
             pre_kwargs["aux_out"] = aux_out
         # x_q: x's MXFP8 cast for the sublayer's projections.
-        _ev_mhc_pre = sp_prefill.timing_begin()
         residual, post_mix, res_mix, x, attn_pre, x_q = self.mhc.pre(
             residual,
             fn,
@@ -405,42 +402,30 @@ class DeepseekV4DecoderLayer(nn.Module):
             previous_comb=res_mix if previous_output is not None else None,
             **pre_kwargs,
         )
-        sp_prefill.timing_end("mhc_pre", _ev_mhc_pre, layer_idx)
         del previous_output, pre_mix
         if ced_indices is not None:
             # Decoder global KV needs every encoder row, but decoder queries,
             # residual updates and experts only need the selected replay rows.
             del x_q
             if encoder_only:
-                _ev_ced_kv = sp_prefill.timing_begin()
                 self.attn.prepare_global_kv(positions, x, sp_rows=sp_rows)
-                sp_prefill.timing_end("ced_boundary_kv", _ev_ced_kv, layer_idx)
                 del x, residual, post_mix, res_mix, attn_pre
                 return None, None, None, None, None
             if sp_rows is not None:
                 # Global KV projects local rows and gathers its narrow latent.
                 # Decoder queries and residual updates only need replay rows.
-                _ev_ced_kv = sp_prefill.timing_begin()
                 self.attn.prepare_global_kv(positions, x, sp_rows=sp_rows)
-                sp_prefill.timing_end("ced_boundary_kv", _ev_ced_kv, layer_idx)
-                _ev_ced_g = sp_prefill.timing_begin()
                 x, residual, post_mix, res_mix, attn_pre = gather_sp_rows(
                     sp_rows, ced_indices, x, residual, post_mix, res_mix, attn_pre
                 )
-                sp_prefill.timing_end("ced_gather", _ev_ced_g, layer_idx)
                 sp_rows = None
             else:
-                _ev_ced_kv = sp_prefill.timing_begin()
                 self.attn.prepare_global_kv(positions, x)
-                sp_prefill.timing_end("ced_boundary_kv", _ev_ced_kv, layer_idx)
-                _ev_ced_g = sp_prefill.timing_begin()
                 x = gather_rows(x, ced_indices)
                 residual = gather_rows(residual, ced_indices)
                 post_mix = gather_rows(post_mix, ced_indices)
                 res_mix = gather_rows(res_mix, ced_indices)
                 attn_pre = gather_rows(attn_pre, ced_indices)
-            if sp_rows is None and "_ev_ced_g" in locals():
-                sp_prefill.timing_end("ced_gather", _ev_ced_g, layer_idx)
             x_q = self.mhc.cast_rows(x)
             positions = (
                 gather_rows(positions, ced_indices)
@@ -453,7 +438,6 @@ class DeepseekV4DecoderLayer(nn.Module):
                     if ced_input_ids is None
                     else ced_input_ids
                 )
-        _ev_attn = sp_prefill.timing_begin()
         if sp_rows is None:
             with kernels.mxfp8_inputs(x_q):
                 x = self.attn(positions, x, None)
@@ -463,11 +447,9 @@ class DeepseekV4DecoderLayer(nn.Module):
                 x = self.attn(positions, x, None)
             if sp_rows.unreduced:
                 x = sp_prefill.unreduced_parts(x)
-        sp_prefill.timing_end("attn_total", _ev_attn, layer_idx)
         del x_q
         if glp is not None:
             glp.steer_attn(layer_idx, x, steer_rows)
-        _ev_pp = sp_prefill.timing_begin()
         residual, post_mix, res_mix, x, ffn_pre, x_q = self.mhc.post_pre(
             x,
             residual,
@@ -479,26 +461,20 @@ class DeepseekV4DecoderLayer(nn.Module):
             self.ffn_norm.weight,
             attn_pre,
         )
-        sp_prefill.timing_end("mhc_post_pre", _ev_pp, layer_idx)
         del attn_pre
         if sp_rows is None:
-            _ev_ffn = sp_prefill.timing_begin()
             with kernels.mxfp8_inputs(x_q):
                 x = self.ffn(x, input_ids)
-            sp_prefill.timing_end("ffn", _ev_ffn, layer_idx)
             del x_q
         else:
             # SP: route local rows, gather MXFP8 + routes, and reduce-scatter.
-            _ev_smi = sp_prefill.timing_begin()
             with (
                 sp_prefill.activate(sp_rows),
-                sp_prefill.sp_moe_inputs(
+                kernels.sp_moe_inputs(
                     sp_rows, x, x_q, self.ffn, input_ids
                 ) as rows,
             ):
-                sp_prefill.timing_end("sp_moe_inputs", _ev_smi, layer_idx)
                 del x, x_q
-                _ev_ffn = sp_prefill.timing_begin()
                 x = self.ffn(
                     rows,
                     input_ids,
@@ -507,7 +483,6 @@ class DeepseekV4DecoderLayer(nn.Module):
             del rows
             if sp_rows.unreduced:
                 x = sp_prefill.unreduced_parts(x)
-            sp_prefill.timing_end("ffn", _ev_ffn, layer_idx)
         return x, residual, post_mix, res_mix, ffn_pre
 
 
@@ -850,18 +825,6 @@ class DeepseekV4Model(nn.Module, EagleModelMixin):
         lookback_token_ids: torch.Tensor | None = None,
         ced_indices: torch.Tensor | None = None,
     ) -> torch.Tensor | IntermediateTensors:
-        _timer_started = False
-        _ev_total = None
-        _ev_embed = None
-        _ev_loop = None
-        if (
-            sp_prefill._PREFILL_TIMING_ENABLED
-            and get_tensor_model_parallel_rank() == 0
-            and sp_prefill.start_prefill_timer(positions.shape[0])
-        ):
-            _timer_started = True
-            _ev_total = sp_prefill.timing_begin()
-            _ev_embed = sp_prefill.timing_begin()
         sp = None
         # With CED the encoder layers (before ced_decoder_start) still run on
         # every row; the boundary gathers global KV latents and compact carries.
@@ -978,8 +941,6 @@ class DeepseekV4Model(nn.Module, EagleModelMixin):
             and get_pp_group().is_last_rank
             and not torch.cuda.is_current_stream_capturing()
         )
-        sp_prefill.timing_end("embed_engram_hash", _ev_embed)
-        _ev_loop = sp_prefill.timing_begin()
         for idx, layer in enumerate(
             islice(self.layers, self.start_layer, self.end_layer),
             start=self.start_layer,
@@ -1082,10 +1043,6 @@ class DeepseekV4Model(nn.Module, EagleModelMixin):
                     self._encoder_only_zeros = zeros
                 out_hidden = zeros[:full_num_tokens]
                 self._pending_engram_prefetch = None
-                if _timer_started:
-                    sp_prefill.timing_end("layers_loop", _ev_loop)
-                    sp_prefill.timing_end("total_model_forward", _ev_total)
-                    sp_prefill.finish_prefill_timer(True)
                 if len(self.aux_hidden_state_layers) > 0:
                     return out_hidden, [
                         out_hidden for _ in self.aux_hidden_state_layers
@@ -1157,8 +1114,6 @@ class DeepseekV4Model(nn.Module, EagleModelMixin):
                         )
                     aux_hidden_states.append(aux_hidden_state)
         self._pending_engram_prefetch = None
-        sp_prefill.timing_end("layers_loop", _ev_loop)
-        _ev_tail = sp_prefill.timing_begin()
         l2_prefetch.join()
         last_rank = get_pp_group().is_last_rank
         rows_here = sp is None and not decoder_compacted
@@ -1262,10 +1217,6 @@ class DeepseekV4Model(nn.Module, EagleModelMixin):
             hidden_states = sp.gather(hidden_states)
         if decoder_compacted:
             hidden_states = scatter_rows(hidden_states, ced_indices, full_num_tokens)
-        if _timer_started:
-            sp_prefill.timing_end("final_tail", _ev_tail)
-            sp_prefill.timing_end("total_model_forward", _ev_total)
-            sp_prefill.finish_prefill_timer(False)
         if len(aux_hidden_states) > 0:
             return hidden_states, aux_hidden_states
         return hidden_states

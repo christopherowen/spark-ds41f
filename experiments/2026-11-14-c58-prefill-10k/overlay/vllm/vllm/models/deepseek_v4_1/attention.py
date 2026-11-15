@@ -1020,8 +1020,6 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase):
             if self.compressor.state_cache is not None
             else None
         )
-        if sp_prefill._ACTIVE_TIMER is not None:
-            self.compressor._timing_layer_id = self.layer_id
         fuse_kv_write = DeepseekV4Attention._fuse_compressor_kv_write(self)
         if fuse_kv_write:
             latent, slots = self.compressor(
@@ -1064,7 +1062,6 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase):
         # Index K consumes the ordinary-normalized PRE-RoPE latent; norm, RoPE
         # and the paged MXFP4 write run in one kernel. At decode sizes, wk's
         # split-K FP32 partials are reduced in registers inside _write_index_keys.
-        _ev_wk = sp_prefill.timing_begin()
         if (
             hasattr(indexer.wk, "tilelang_partials")
             and "_write_index_keys" not in self.__dict__
@@ -1078,7 +1075,6 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase):
             key = indexer.wk(latent)
         index_meta = cast(DeepseekV41Metadata, metadata[indexer.k_cache.prefix])
         self._write_index_keys(key, index_meta.slot_mapping[:rows], positions=positions)
-        sp_prefill.timing_end("idx_wk_write", _ev_wk, self.layer_id)
         if not fuse_kv_write:
             self._write_v41_cache(
                 latent,
@@ -1317,7 +1313,6 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase):
                 device=qr_kv.device,
             )
             if real > 0:
-                _ev_sf = sp_prefill.timing_begin()
                 sp_attention_front(
                     qr_kv[:real],
                     self.q_norm.weight,
@@ -1329,7 +1324,6 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase):
                     local_q_cast.scales[:real],
                     local_records[:real],
                 )
-                sp_prefill.timing_end("attn_sp_front_kernel", _ev_sf, self.layer_id)
             comp_locals: tuple[torch.Tensor, ...] = ()
             if (
                 self.compressor is not None
@@ -1337,8 +1331,6 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase):
                 and getattr(self.compressor, "_sp_kernel", None) is not None
                 and self.compressor.compress_ratio in (1, 2)
             ):
-                if sp_prefill._ACTIVE_TIMER is not None:
-                    self.compressor._timing_layer_id = self.layer_id
                 self.compressor._prefetched_sp_gathered = None
                 comp_locals = self.compressor.project_sp_local(
                     hidden_states, sp_rows
@@ -1349,18 +1341,14 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase):
                 and not swa.is_decode
             )
             pre_index_query = None
-            _ev_sg = sp_prefill.timing_begin()
             if overlap_index:
                 (q_cast, swa_records, *comp_gathered), wait_front = (
                     sp_rows.gather_mxfp8_async(
                         local_q_cast, local_records, *comp_locals
                     )
                 )
-                _ev_wp = sp_prefill.timing_begin()
                 index_weights = self.indexer.weights_proj(hidden_states)[:real]
-                sp_prefill.timing_end("attn_weights_proj", _ev_wp, self.layer_id)
                 if real > 0:
-                    _ev_iq = sp_prefill.timing_begin()
                     local_pos = positions[sp_rows.start : sp_rows.start + real]
                     pre_index_query = self._index_query(
                         local_qr,
@@ -1372,31 +1360,25 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase):
                         swa,
                         local_q_cast,
                     )
-                    sp_prefill.timing_end("attn_idx_query", _ev_iq, self.layer_id)
                 wait_front()
             else:
                 q_cast, swa_records, *comp_gathered = sp_rows.gather_mxfp8(
                     local_q_cast, local_records, *comp_locals
                 )
                 if self.indexer is not None:
-                    _ev_wp = sp_prefill.timing_begin()
                     index_weights = self.indexer.weights_proj(hidden_states)
                     if _INDEX_SPLIT_CHECK or swa.is_decode:
                         index_weights = sp_rows.gather(index_weights)
                     else:
                         index_weights = index_weights[:real]
-                    sp_prefill.timing_end("attn_weights_proj", _ev_wp, self.layer_id)
-            sp_prefill.timing_end("attn_sp_front_gather", _ev_sg, self.layer_id)
             if comp_gathered:
                 self.compressor._prefetched_sp_gathered = tuple(comp_gathered)
-            _ev_sw = sp_prefill.timing_begin()
             write_swa_records(
                 swa_records,
                 swa_cache,
                 swa.slot_mapping[: sp_rows.num_tokens],
                 page_size=self.swa_cache_layer.block_size,
             )
-            sp_prefill.timing_end("attn_write_swa", _ev_sw, self.layer_id)
             return (
                 (q_cast.rows, None, q_cast),
                 None,
@@ -1406,13 +1388,11 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase):
                 pre_index_query,
             )
         if self.indexer is not None:
-            _ev_wp = sp_prefill.timing_begin()
             index_weights = self.indexer.weights_proj(hidden_states)
             if _INDEX_SPLIT_CHECK or (swa is not None and swa.is_decode):
                 index_weights = sp_rows.gather(index_weights)
             else:
                 index_weights = index_weights[: sp_rows.real_rows]
-            sp_prefill.timing_end("attn_weights_proj", _ev_wp, self.layer_id)
         qr, kv = qr_kv.split((self.q_lora_rank, 512), dim=-1)
         qr, kv = self.q_norm(qr), self.kv_norm(kv)
         if self.n_local_heads > 0 or self.indexer is not None:
@@ -1490,9 +1470,7 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase):
                 # front (projection, q norm + MXFP8 cast, kv norm + RoPE + SWA record
                 # packing, local index weights) runs on this rank's rows; only the
                 # MXFP8 q cast and SWA records are gathered.
-                _ev_wqa = sp_prefill.timing_begin()
                 qr_kv, _ = self.fused_wqa_wkv(hidden_states)
-                sp_prefill.timing_end("attn_wqa_wkv", _ev_wqa, self.layer_id)
                 (
                     front,
                     qr,
@@ -1563,10 +1541,8 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase):
             front = None
             front_wrote_kv = True
         if self.n_local_heads > 0:
-            _ev_wqb = sp_prefill.timing_begin()
             with kernels.mxfp8_inputs(q_cast):
                 q = self.wq_b(qr).view(rows, self.n_local_heads, 512)
-            sp_prefill.timing_end("attn_wq_b", _ev_wqb, self.layer_id)
         else:
             q = torch.empty((rows, 0, 512), dtype=qr.dtype, device=qr.device)
         if self.indexer is None:
@@ -1591,9 +1567,7 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase):
                 swa, sp_rows, front_wrote_kv, rows
             )
             if not overlap_decode and self.n_local_heads > 0:
-                _ev_qr = sp_prefill.timing_begin()
                 q = self._rope(q, positions, "q")
-                sp_prefill.timing_end("attn_q_rope", _ev_qr, self.layer_id)
             if not front_wrote_kv:  # the front's kernel wrote the record
                 self._cache_context_kv(kv, positions)
             if overlap_decode:
@@ -1615,14 +1589,12 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase):
                 del q, kv, index_query
             else:
                 if swa is original_swa:
-                    _ev_gkv = sp_prefill.timing_begin()
                     if hidden_states is not None:
                         self._prepare_global_kv(positions, hidden_states)
                     elif local_hidden is not None:
                         self._prepare_global_kv(
                             positions, local_hidden, sp_rows=sp_rows
                         )
-                    sp_prefill.timing_end("attn_global_kv", _ev_gkv, self.layer_id)
                 if self.compressor is not None and hasattr(
                     self.compressor, "_prefetched_sp_gathered"
                 ):
@@ -1642,7 +1614,6 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase):
                     else:
                         first = split.start if split is not None else 0
                         last = first + split.real_rows if split is not None else rows
-                        _ev_iq = sp_prefill.timing_begin()
                         query = self._index_query(
                             qr,
                             positions,
@@ -1653,7 +1624,6 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase):
                             swa,
                             q_cast,
                         )
-                        sp_prefill.timing_end("attn_idx_query", _ev_iq, self.layer_id)
                         reference = None
                         if split is not None and _INDEX_SPLIT_CHECK:
                             reference = self._index_query(
@@ -1672,10 +1642,7 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase):
                 output = torch.empty_like(q)
                 self.forward_mqa(q, kv, positions, output, index_query=index_query)
                 del q, kv, index_query
-        _ev_op = sp_prefill.timing_begin()
-        _out = self._o_proj(output, sp_rows=sp_rows)
-        sp_prefill.timing_end("attn_o_proj", _ev_op, self.layer_id)
-        return _out
+        return self._o_proj(output, sp_rows=sp_rows)
 
     def _issue_wo_prefetch(self, rows, *, after):
         """Issue the WO window's L2 prefetch at its point in this layer's forward
@@ -2009,9 +1976,7 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase):
                     )
 
             if split is None:
-                _ev_it = sp_prefill.timing_begin()
                 select(query, 0, self.topk_indices_buffer)
-                sp_prefill.timing_end("idx_score_topk", _ev_it, self.layer_id)
                 if pending_aux is not None:
                     torch.cuda.current_stream(q.device).wait_stream(pending_aux)
                     pending_aux = None
@@ -2046,16 +2011,12 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase):
                     if owns_candidates:
                         self._candidates[local].fill_(-2)
                         self._candidate_lens[local].fill_(-2)
-                _ev_it = sp_prefill.timing_begin()
                 select(query, split.start, selected)
-                sp_prefill.timing_end("idx_score_topk", _ev_it, self.layer_id)
                 if reference is not None:
                     self._check_index_split(
                         split, selected, expected, repeat, expected_candidates
                     )
-                _ev_ig = sp_prefill.timing_begin()
                 self.topk_indices_buffer[:rows].copy_(split.gather(selected))
-                sp_prefill.timing_end("idx_gather", _ev_ig, self.layer_id)
 
         if pending_aux is not None:
             torch.cuda.current_stream(q.device).wait_stream(pending_aux)
@@ -2116,7 +2077,6 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase):
             )
         # Keep the borrowed arena, not aliases of the transient query storage.
         retain_cuda_graph_capture_resource(arena)
-        _ev_mla = sp_prefill.timing_begin()
         self._attend(
             mode,
             q,
@@ -2127,7 +2087,6 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase):
             swa_lengths=swa_lengths[:rows],
             **kwargs,
         )
-        sp_prefill.timing_end("sparse_mla", _ev_mla, self.layer_id)
 
     def _shared_decode_metadata(self, swa, main, rows, specs, device):
         replay = self._replay_start(swa)
