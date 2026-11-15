@@ -194,31 +194,97 @@ collectives, and DSpark drafting.
    in isolation but trail by 3–5% per call in serving when reading row-major
    weights. Screen a tile-contiguous weight layout for the decode projections,
    kept bit-identical with prefill.
-4. **Vocabulary head (`128`-row token tile).** A head call with 65–128 rows on
-   TP4 `c16` runs a second 64-row tile that re-reads and unpacks the 248 MB
-   shard from DRAM. A 128-row tile fits in ~96 KB of shared memory with two
-   activation stages and four weight stages, keeping the same K accumulation
-   order (~1% ceiling at sixteen streams on TP4).
-5. **A second stream inside the decode graph.** Overlap the shared expert with
-   routed MoE, and attention key/indexer-key writes with the query path, on a
-   second CUDA stream captured into the graph. First bound how much of the
-   latency-bound bucket is serial dependency rather than SM occupancy.
-6. **All-reduce arrival skew and RoCE proxy core affinity.** Rank 0 also runs
-   the API server, and `sparknet` proxy threads run without explicit CPU core
-   affinity on GB10's mixed core types; test pinning them to fast cores.
-7. **A RoCE one-shot broadcast for adaptive verification.** Adaptive
-   verification broadcasts rank 0's confidence snapshot every decode step
-   through NCCL (`adaptive_verification.py`). Bound its share of the step from
-   decode traces and screen `sparknet`'s one-shot broadcast path if material.
-8. **Mid-network (Layer 16/20) dead-row routed-MoE pruning at single stream
-   (`c1`).** At `c1`, no other requests in the batch amortize routed-expert
-   LPDDR5X reads (4.5 MiB per expert per rank across 40 routed layers), so
-   every rejected draft row surviving `SPARK_DS41F_DSPARK_DEAD_ROWS_TAU = 0.2`
-   before Layer 0 incurs unamortized routed-expert DRAM reads. Because target
-   layers are strictly causal and row-independent, pruning diverging tail draft
-   rows from routed MoE at mid-network (Layer 16/20) while masking pruned rows
-   as rejected in `rejection_sampler` cuts half of those wasted routed-expert
-   DRAM reads while keeping all accepted target tokens 100% bit-exact.
+4. **Vocabulary head (`128`-row token tile and per-tile epilogue summary).**
+   - **A 128-row token tile:** a head call with 65–128 rows on TP4 `c16` runs a
+     second 64-row tile that re-reads and unpacks the 248 MB shard from DRAM.
+     A 128-row tile fits in ~96 KB of shared memory with two activation stages
+     and four weight stages, keeping the same K accumulation order (~1% ceiling
+     at sixteen streams on TP4).
+   - **Sampled top-$k$/LSE summary in the head epilogue:** greedy argmax in the
+     head epilogue is active; emit a compact per-tile summary (top-$k$
+     values/indices plus tile max and log-sum-exp) so sampled (`temp=1.0`)
+     decode and verification also reduce compact tile summaries rather than
+     scanning full FP32 `[M, vocab_shard]` logits.
+5. **A second stream inside the decode graph (and incremental `old + new`
+   indexer split).** Overlap the shared expert with routed MoE, DSpark context-KV
+   preparation on tap layers (`1, 30, 60`) with that layer's MoE block, and
+   attention compressor / indexer-key writes with the query path on a second CUDA
+   stream captured into the graph via `cudaEventRecord` / `cudaStreamWaitEvent`.
+   On KV-source layers, decouple the compressor from the indexer critical path
+   by scoring the existing compressed prefix (`n_old`) and running radix top-$k$
+   on the main stream immediately after `wq_b` while the side stream finishes
+   the compressor and scores only the `n_new` ($\le M$) newly written blocks,
+   merging the `n_new` scores into the sorted `k` prefix keys in a lightweight
+   merge kernel before MLA. First bound how much of the latency-bound bucket is
+   serial dependency rather than SM occupancy; if GB10's 48 SMs or 99 KiB per-CTA
+   shared memory serialize concurrent streams during tail waves, screen co-tuning
+   pipeline stages / dynamic SMEM on the overlapping kernel pair or carving out a
+   small CUDA Green Context SM partition for the latency-critical side stream.
+6. **Two-phase sparse-MLA decode KV and PDL prologue weight prefetch before
+   `griddepcontrol.wait`.** In decode sparse-MLA, the prior sliding-window KV
+   rows (`pos < pos0`, i.e., all but the current step's rows) and—on layers that
+   reuse `topk` indices from an earlier `candidate_source_layer`—all `ktop`
+   compressed KV rows are already committed in memory before the upstream
+   `wq_b` / `wkv` / `topk` kernel finishes. Issuing global-to-shared loads for
+   those already-valid KV slots before `griddepcontrol.wait` overlaps LPDDR5X KV
+   fetch latency with the upstream tail, waiting on `griddepcontrol.wait` only
+   for the newly written KV rows and `q`. Likewise, in PDL-chained decode
+   projections and GEMMs (`0739`, `0755`, `0756`, `WO-B`), ensure stage-0 weight
+   and scale tile loads issue before `griddepcontrol.wait` so LPDDR5X weight
+   reads overlap the producer's final wave before the consumer waits on the
+   activation tile.
+7. **Forward-fusing `mHC` stream finalize and MXFP8 quantization into consumer
+   projections (plus fused `embed` + Layer-0 `project_streams`).** Unlike
+   1-launch atomic `project_and_finalize_streams` (which regressed in `#946`),
+   keep `project_streams` writing the unnormalized collapsed stream `C` and the
+   partial sums-of-squares `Q`, and have the consumer decode projections
+   (`fused_wqa_wkv` and MoE gate/shared-expert input) reduce the partial sums
+   `Q`, multiply by `rsqrt * gamma`, and quantize to MXFP8 inside their
+   prologue—removing the global BF16 normalized activation round-trip and
+   standalone MXFP8 cast launches. At model entry, also screen fusing token
+   embedding lookup, 4-stream broadcast, Engram `token_map` lookup, and Layer-0
+   `project_streams` into one launch.
+8. **Piggybacking KV-RoPE onto `wq_b` via extra tail CTAs.** `0748` and `0749`
+   fuse `wq_b + indexer.wq_b` with query RoPE and MXFP4 quantization; screen
+   appending tail CTAs to `wq_b`'s grid that branch to apply RoPE and cache
+   writes to `wkv`'s newly projected KV rows concurrently with `wq_b`,
+   eliminating 61 separate KV-RoPE launches per step.
+9. **Intra-request multi-row `KPool` reuse in decode `indexer_score_v41` (and
+   deep-context TP row split).** Under speculative verification, all $V$
+   verification rows of a request share the identical `PageTable` and `KPool`
+   prefix up to `pos0`, yet `indexer_score_v41` (`0029`) launches an independent
+   CTA per query row that streams the full 64K–1M `KPool` prefix from LPDDR5X $V$
+   times per rank (and $V \times \text{TP}$ times across the cluster, since
+   `0025` splits indexer rows across TP ranks only in SP prefill). Loading each
+   shared prefix tile `K_shared [64, 128]` and `SFK_shared` once per request and
+   scoring all $V$ verification rows of that request against it before advancing
+   `p0` cuts decode `KPool` traffic by $V\times$, and above ~64K context can pair
+   with a TP row split and one-shot `sparknet` RoCE gather of
+   `topk_indices_buffer[:rows]` (`2 KiB` per row).
+10. **Same-request multi-row SWA KV reuse in decode `sparse_mla_fwd_v41`.** On
+    SWA-only layers (`idx_width = 0`, `swa_width = 128`, `segments = 1`) and in
+    the SWA chunk of sparse-MLA layers (`0740`), each CTA currently handles a
+    single query row even though all $V$ verification rows of a request attend to
+    the identical 128-token SWA prefix (`pos < pos0`) from the single shared KV
+    head (`num_key_value_heads = 1`), differing only in their causal mask over
+    `[pos0, pos0 + V)`. Grouping a request's verification rows inside one CTA
+    amortizes the 576 B/token SWA KV loads from LPDDR5X across all $V$ rows.
+11. **All-reduce arrival skew and RoCE proxy core affinity.** Rank 0 also runs
+    the API server, and `sparknet` proxy threads run without explicit CPU core
+    affinity on GB10's mixed core types; test pinning them to fast cores.
+12. **A RoCE one-shot broadcast for adaptive verification.** Adaptive
+    verification broadcasts rank 0's confidence snapshot every decode step
+    through NCCL (`adaptive_verification.py`). Bound its share of the step from
+    decode traces and screen `sparknet`'s one-shot broadcast path if material.
+13. **Mid-network (Layer 16/20) dead-row routed-MoE pruning at single stream
+    (`c1`).** At `c1`, no other requests in the batch amortize routed-expert
+    LPDDR5X reads (4.5 MiB per expert per rank across 40 routed layers), so
+    every rejected draft row surviving `SPARK_DS41F_DSPARK_DEAD_ROWS_TAU = 0.2`
+    before Layer 0 incurs unamortized routed-expert DRAM reads. Because target
+    layers are strictly causal and row-independent, pruning diverging tail draft
+    rows from routed MoE at mid-network (Layer 16/20) while masking pruned rows
+    as rejected in `rejection_sampler` cuts half of those wasted routed-expert
+    DRAM reads while keeping all accepted target tokens 100% bit-exact.
 
 ## Speculative decoding
 
@@ -244,6 +310,22 @@ Open levers:
   (`num_speculative_tokens_per_batch_size`) or per-request acceptance-aware
   draft depth schedules on recorded agent traffic and the paired servebench
   suites.
+- **Block-wise prefix verification and two-level quad Gumbel-Max sampling for
+  `temp > 0`.** For sampled verification (`temp=1.0`), standard independent
+  token-by-token rejection immediately truncates at the first dip in
+  $p(x_t)/q(x_t)$. Screen cumulative prefix importance-ratio verification
+  ($w_i = \prod_{t \le i} p(x_t)/q(x_t)$, testing prefix acceptance
+  $h_i = w_i / (w_i + 1 - w_{i-1})$ with residual distribution
+  $\propto \max(w_i p - q, 0)$), which preserves the exact target distribution
+  while letting a strong subsequent draft token rescue a borderline earlier
+  draft. Pair with a two-level Gumbel-Max residual/target draw that sums target
+  and residual mass per 64-token vocabulary quad, selects the winning quad via
+  Gumbel-Max, and evaluates per-token Gumbel-Max only inside that single 64-token
+  quad.
+- **Grouped 3-layer DSpark context-KV projection.** Concatenate
+  `mtp.{0,1,2}.attn.wkv` so all three DSpark layers' context-KV projections and
+  RoPE execute in a single grouped launch over the tapped hidden states from
+  target layers `{1, 30, 60}` rather than three separate per-layer launches.
 - **Drafter reuse of the target's token selection.** Check whether reusing the
   target model's indexer top-k selection from the anchor position in DSpark
   draft layers preserves acceptance while cutting drafter attention work.
@@ -280,6 +362,12 @@ NCCL Ring and sparse-MLA `block_H=16` (`2` CTAs/head, `0740`), unconditional
 active.
 
 Open levers:
+- **Rank-offset CTA remapping for sequence-parallel all-gather overlap.** When
+  overlapping a sequence-parallel all-gather with the consumer projection or
+  expert compute, remap consumer row-tile coordinates by rank offset
+  (`pid_m = (raw_pid_m + rank * tiles_per_rank) % total_tiles`) so every rank
+  starts computing on its already-local shard at $t = 0$ while peer shards
+  arrive over RoCE.
 - **First request after a restart** is ~0.37 s slower to its first token than
   subsequent requests. Screen `CUDA_MODULE_LOADING=EAGER` (checking boot time
   impact) and sample the first request with `py-spy dump --nonblocking`.
@@ -289,10 +377,31 @@ Open levers:
 - **NVMe interrupt coalescing stays off** on every node by the owner's decision
   (2026-10-02; prefill measured 0.7–1.6% slower with it on in
   `experiments/2026-10-02-nvme-coalescing`).
+- **Piece-level prompt tokenizer cache and parallel encoding:** live agent
+  prompts are 64–100K tokens (~250–400 KB of system prompt and multi-turn tool
+  transcripts separated by special tokens) where 98–99% of the prefix repeats
+  across turns, yet the API server on `dgx1` re-tokenizes the full prompt text
+  on every request. Splitting prompts on added/special tokens (`<｜User｜>`,
+  `<｜Assistant｜>`, `</think>`, DSML delimiters), caching tokenized text spans
+  $\ge 256$ bytes in a bounded clock-evicted cache, and encoding uncached spans
+  $\ge 64\text{ KiB}$ in parallel across CPU threads reduces repeat-turn prompt
+  tokenization to $O(\text{new turn})$ on `dgx1`.
+- **Byte-equivalent BPE boundary alignment for prefix-cache hits:** when new
+  text is appended to a cached prefix without an intervening special token, a
+  BPE merge across the append boundary can alter the last 1–2 tokens of the
+  prefix, invalidating the trailing KV block hash and forcing a wider CED/SWA
+  re-prefill. Walking from the first differing token to check whether non-atomic
+  tokens on both sides spell the identical byte sequence up to a common token
+  boundary—and rewriting the incoming prompt's prefix to the cached token
+  spelling (shifting any subsequent multimodal spans accordingly)—preserves
+  prefix-cache hits across boundary merges.
 - **Prefix-cache retention:** agent prompts are 64–100K tokens and depend on
   98–99% prefix-cache hit rates ([#902](https://github.com/christopherowen/spark-ds41f/issues/902)).
-  Add a stress probe for retention around block boundaries and under eviction
-  pressure.
+  Add a stress probe for retention around block boundaries and under sustained
+  eviction pressure (saturating the KV pool with unique prompts first so every
+  prefill chunk evicts across the MLA, SWA, CED-anchor, and kpool-tail groups
+  under `--prefix-cache-retention-interval`, checking both active-session hit
+  preservation and `dgx1` scheduler step time).
 
 ## Boot
 
@@ -381,12 +490,20 @@ paths run on TileLang + `sparknet`; retiring the remaining `b12x` build input
 from `upstreams.lock.json` and `docker/Dockerfile` can follow after `1107`).
 
 Remaining kernel-level investigations:
-1. **`mHC: fn` in three bytes.** `project_streams` reads `fn` (`24 x 20,480`
-   FP32, 2 MB per sublayer) near memory bandwidth, and a TF32 MMA consumes only
-   the top 19 bits of each value. Storing the top 24 bits would cut that traffic
-   by 25% with bit-identical results if SM121's TF32 MMA truncates rather than
-   rounds its inputs; verify on hardware first.
-2. **TMA stage releases outside DS4.1's active kernel set**
+1. **`mHC: fn` in three bytes (vs. 2×BF16 `hi + lo` split).** `project_streams`
+   reads `fn` (`24 x 20,480` FP32, 2 MB per sublayer) near memory bandwidth at
+   decode row counts, and a TF32 MMA consumes only the top 19 bits of each
+   value. Storing the top 24 bits would cut that traffic by 25% with
+   bit-identical results if SM121's TF32 MMA truncates rather than rounds its
+   inputs (whereas splitting FP32 `fn` into `hi + lo` BF16 pairs for 2×BF16 MMA
+   keeps 4 bytes/element and only helps when compute-bound at large `M`); verify
+   on hardware first.
+2. **Pre-multiplied Engram `q_weight * k_weight`.** Because the Engram gate dot
+   product is $\sum_d (q_d h_d)(k_d k^{\text{eng}}_d) = \sum_d (q_d k_d) h_d k^{\text{eng}}_d$,
+   pre-multiplying `q_weight * k_weight` once at load time eliminates one
+   5,120-element FP32 vector read per stream in the fused `mhc.post` + Engram
+   post-gate kernel (`0755`).
+3. **TMA stage releases outside DS4.1's active kernel set**
    (`experiments/2026-09-30-proxy-fence-audit`): all serving kernels are fenced
    (and enforced in the compiler via `tilelang/0001..0013` in `1107`); keep the
    compiler barrier tests in the release gate whenever TileLang is refreshed.
