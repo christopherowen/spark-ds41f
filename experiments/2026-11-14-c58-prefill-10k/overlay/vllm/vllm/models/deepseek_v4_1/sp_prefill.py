@@ -257,6 +257,8 @@ class SPRows:
         comm,
         *,
         stream: torch.cuda.Stream | None = None,
+        ready_event: torch.cuda.Event | None = None,
+        done_event: torch.cuda.Event | None = None,
     ) -> tuple[torch.Tensor, ...]:
         outs = []
         pairs = []
@@ -272,7 +274,12 @@ class SPRows:
             outs.append(out[:rows])
             pairs.append((out[: self.padded_rows], inp))
         if stream is not None:
-            stream.wait_stream(torch.cuda.current_stream(inputs[0].device))
+            main = torch.cuda.current_stream(inputs[0].device)
+            if ready_event is not None:
+                ready_event.record(main)
+                stream.wait_event(ready_event)
+            else:
+                stream.wait_stream(main)
         comm.group_start()
         for dst, src in pairs:
             if stream is None:
@@ -280,6 +287,8 @@ class SPRows:
             else:
                 comm.all_gather(dst, src, stream=stream)
         comm.group_end()
+        if stream is not None and done_event is not None:
+            done_event.record(stream)
         return tuple(outs)
 
     def gather_many(
@@ -313,16 +322,23 @@ class SPRows:
         if not inputs or comm is None or not self.can_gather_async(inputs[0].device):
             return self.gather_many(*tensors, padded_rows=padded_rows), (lambda: None)
         device = inputs[0].device
-        main = torch.cuda.current_stream(device)
         side = _side_stream(device)
-        outs = self._launch_pynccl_gather(inputs, limits, comm, stream=side)
+        ready_ev, done_ev = _next_gather_events(device)
+        outs = self._launch_pynccl_gather(
+            inputs,
+            limits,
+            comm,
+            stream=side,
+            ready_event=ready_ev,
+            done_event=done_ev,
+        )
         waited = False
 
         def wait() -> None:
             nonlocal waited
             if not waited:
                 waited = True
-                main.wait_stream(side)
+                torch.cuda.current_stream(device).wait_event(done_ev)
 
         return outs, wait
 
@@ -774,6 +790,23 @@ def project_reduce_scatter_current(
 
 
 _SIDE_STREAMS: dict = {}
+_GATHER_EVENTS: dict = {}
+
+
+def _next_gather_events(
+    device: torch.device,
+) -> tuple[torch.cuda.Event, torch.cuda.Event]:
+    """Next per-collective (ready, done) CUDA event pair from a ring on ``device``."""
+    entry = _GATHER_EVENTS.get(device)
+    if entry is None:
+        with torch.cuda.device(device):
+            ring = [(torch.cuda.Event(), torch.cuda.Event()) for _ in range(16)]
+        idx = 0
+    else:
+        ring, idx = entry
+    pair = ring[idx]
+    _GATHER_EVENTS[device] = (ring, (idx + 1) % len(ring))
+    return pair
 
 
 def _tp_roce_comm():
