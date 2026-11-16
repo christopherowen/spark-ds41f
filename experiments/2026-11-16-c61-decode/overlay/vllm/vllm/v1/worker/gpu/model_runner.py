@@ -75,7 +75,12 @@ from vllm.multimodal.encoder_budget import (
 from vllm.sequence import IntermediateTensors
 from vllm.tasks import SupportedTask
 from vllm.utils.gc_utils import freeze_gc_for_cudagraph_capture
-from vllm.utils.mem_utils import DeviceMemoryProfiler, format_gib
+from vllm.utils.mem_utils import (
+    DeviceMemoryProfiler,
+    format_gib,
+    reclaim_uma_memory,
+    trim_host_heap,
+)
 from vllm.utils.torch_utils import STR_DTYPE_TO_TORCH_DTYPE, async_tensor_h2d
 from vllm.v1.core.boundary_checkpoint import NUM_BOUNDARY_CHECKPOINT_SLOTS
 from vllm.v1.core.sched.output import GrammarOutput, SchedulerOutput
@@ -464,6 +469,8 @@ class GPUModelRunner(LoRAModelRunnerMixin):
 
         # For transferring state from execute_model to subsequent sample_tokens call.
         self.execute_model_state: ExecuteModelState | None = None
+        self._pending_post_prefill_cache_flush: bool = False
+        self._last_batch_cg_mode: CUDAGraphMode = CUDAGraphMode.NONE
         # Late admission: the event each step records at VLLM_LATE_ADMISSION_LAYER.
         self.layer_progress: LayerProgress | None = None
 
@@ -1430,10 +1437,12 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         # transient peak instead of an unreachable sum of both passes.
         torch.accelerator.synchronize()
         del hidden_states, sample_hidden_states
+        reclaim_uma_memory(synchronize=False)
         self._profile_deepseek_v4_attention(prepare_profile_state)
         current_workspace_manager().reserve_by_lane()
         self.reset_encoder_cache()
         gc.collect()
+        trim_host_heap()
 
     @torch.inference_mode()
     def _profile_deepseek_v4_attention(
@@ -1562,6 +1571,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         start_time = time.perf_counter()
         with freeze_gc_for_cudagraph_capture():
             torch.accelerator.empty_cache()
+            trim_host_heap()
             start_free_gpu_memory = torch.accelerator.get_memory_info()[0]
 
             with self.maybe_setup_dummy_loras(self.lora_config):
@@ -1605,8 +1615,10 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                     self.cudagraph_manager.captured_token_counts(),
                 )
                 self.adaptive_verification.load_draft_budget_kernels()
+            gc.collect()
 
         torch.accelerator.empty_cache()
+        trim_host_heap()
         end_free_gpu_memory = torch.accelerator.get_memory_info()[0]
 
         if not profile_only:
@@ -3675,6 +3687,18 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             self.model_config, input_batch.num_tokens, ubatch_slices
         )
 
+        if not dummy_run:
+            self._last_batch_cg_mode = batch_desc.cg_mode
+            max_cg_tokens = (
+                getattr(self.compilation_config, "max_cudagraph_capture_size", None)
+                or 0
+            )
+            if batch_desc.cg_mode == CUDAGraphMode.NONE and (
+                input_batch.num_tokens_after_padding > max_cg_tokens
+                or bool(scheduler_output.scheduled_encoder_inputs)
+            ):
+                self._pending_post_prefill_cache_flush = True
+
         self.step_timing.record_batch(
             input_batch, batch_desc.cg_mode == CUDAGraphMode.FULL
         )
@@ -3801,9 +3825,17 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             # Non-last PP rank: return IntermediateTensors for sending.
             assert output_intermediate_tensors is not None
             assert self.pp_handler is not None
-            return self.pp_handler.relay_aux_hidden_states(
+            relayed = self.pp_handler.relay_aux_hidden_states(
                 model_inputs["intermediate_tensors"], output_intermediate_tensors
             )
+            if (
+                not dummy_run
+                and batch_desc.cg_mode == CUDAGraphMode.FULL
+                and getattr(self, "_pending_post_prefill_cache_flush", False)
+            ):
+                self._pending_post_prefill_cache_flush = False
+                reclaim_uma_memory(getattr(self, "device", None), synchronize=False)
+            return relayed
         if self.layer_progress is not None and not dummy_run:
             # The engine core decides the next step once this one reaches the layer.
             return self.layer_progress.reply()
@@ -4187,6 +4219,13 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         model_runner_output.kv_connector_output = kv_connector_output
         model_runner_output.ec_connector_output = ec_connector_output
 
+        if (
+            getattr(self, "_pending_post_prefill_cache_flush", False)
+            and getattr(self, "_last_batch_cg_mode", None) == CUDAGraphMode.FULL
+        ):
+            self._pending_post_prefill_cache_flush = False
+            reclaim_uma_memory(getattr(self, "device", None), synchronize=False)
+
         return async_output
 
     def take_draft_token_ids(self) -> DraftTokenIds | None:
@@ -4275,6 +4314,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
 
         gc.collect()
         torch.accelerator.empty_cache()
+        trim_host_heap()
         logger.debug("Cleaned up model weights, KV caches, and workspace")
 
     ########### EPLB methods start ###########
