@@ -1073,7 +1073,7 @@ def indexer_score_v41(
     )
     scale_word0 = page_size * D // 2 // 4
     if not candidates and fast_vec128:
-        row_blocks = T.if_then_else(rows >= 64, T.ceildiv(rows, 4), rows)
+        row_blocks = T.if_then_else(rows >= 64, T.ceildiv(rows, 4), T.ceildiv(rows, 2))
 
         @T.prim_func
         def indexer_score(
@@ -1131,7 +1131,7 @@ def indexer_score_v41(
                 else:
                     T.call_extern(
                         "handle",
-                        "__tl_score_rows_dense_fast<1>",
+                        "__tl_score_rows_dense_fast<2>",
                         T.address_of(Q[0, 0, 0]),
                         T.address_of(QScale[0, 0]),
                         T.address_of(Weights[0, 0]),
@@ -1145,7 +1145,7 @@ def indexer_score_v41(
                         T.address_of(SFK_shared[0, 0]),
                         T.address_of(Q_shared[0, 0]),
                         T.address_of(contrib[0, 0]),
-                        rb,
+                        rb * 2,
                         cta,
                         ctas,
                         rows,

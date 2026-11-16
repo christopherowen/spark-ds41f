@@ -169,36 +169,8 @@ class DSparkMarkovHead(nn.Module):
                 )
                 return logits
 
-            flat_index = index.reshape(-1)
-            packed_weight = self.markov_w2._nvfp4_weight_for_gather.index_select(
-                0, flat_index
-            )
-            weight_scale = self.markov_w2._nvfp4_weight_scale_for_gather.index_select(
-                0, flat_index
-            )
-            weight = dequantize_to_dtype(
-                packed_weight,
-                weight_scale,
-                self.markov_w2._nvfp4_weight_global_scale_for_gather,
-                dtype=markov_embed.dtype,
-                block_size=self.markov_w2._nvfp4_group_size_for_gather,
-                swizzle=False,
-            ).view(*index.shape, -1)
-        else:
-            weight = self.markov_w2.weight[index]
-            if weight.dtype != markov_embed.dtype:
-                raise RuntimeError(
-                    "Gathered Markov projection requires unquantized weights or "
-                    "retained ModelOpt W4A16 NVFP4 weights."
-                )
-        corrected = values.unsqueeze(-1).clone()
-        corrected.baddbmm_(
-            weight,
-            markov_embed.unsqueeze(-1),
-            beta=1.0,
-            alpha=scale,
-        )
-        return logits.scatter_(1, index, corrected.squeeze(-1))
+        corrected = self.apply_bias_topk(markov_embed, values, index, scale)
+        return logits.scatter_(1, index, corrected)
 
     def apply_bias_topk(
         self,

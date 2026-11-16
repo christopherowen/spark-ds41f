@@ -630,18 +630,17 @@ def verify_kernel(
                 T.int64,
                 init=T.cast(drafts[start + T.min(step + 1, num_drafts)], T.int64),
             )
-            maximum = T.alloc_var(
-                T.float32, init=local_max[row, T.min(block, blocks - 1)]
-            )
-            sumexp = T.alloc_var(
-                T.float32, init=local_sumexp[row, T.min(block, blocks - 1)]
-            )
             position = T.alloc_var(pos_dtype, init=pos[row])
             temp = T.alloc_var(T.float32, init=temperature[state])
             seed = T.alloc_var(T.int64, init=seeds[state])
             in_row = live & (block < blocks)
-            maximum = T.if_then_else(in_row, maximum, -T.infinity(T.float32))
-            sumexp = T.if_then_else(in_row, sumexp, T.float32(0))
+            b_clamped = T.min(block, blocks - 1)
+            maximum = T.alloc_var(T.float32, init=-T.infinity(T.float32))
+            sumexp = T.alloc_var(T.float32, init=T.float32(0))
+            if in_row:
+                maximum = local_max[row, b_clamped]
+                if temp != T.float32(0):
+                    sumexp = local_sumexp[row, b_clamped]
             # The cut's own row is live: it draws the truncated block's bonus (and a
             # greedy request's target argmax there).
             draft = T.if_then_else(
@@ -704,7 +703,9 @@ def verify_kernel(
             best_index[0] = block
             for distance in _distances(lanes):
                 _exchange(best, best_index, other, other_index, distance)
-            target = T.alloc_var(T.int64, init=local_argmax[row, best_index[0]])
+            target = T.alloc_var(T.int64, init=T.int64(0))
+            if live & (temp == T.float32(0)):
+                target = local_argmax[row, T.min(best_index[0], blocks - 1)]
 
             # The step's draw: tl_rand32 at spec_step_seed(seed, step).
             word = _randint_at(
@@ -1508,6 +1509,11 @@ def local_stats_shard_kernel(
                         else:
                             local_stats[t, blk * 4 + 2] = T.float32(0)
                             local_stats[t, blk * 4 + 3] = T.float32(0)
+            elif tx == 0:
+                local_stats[t, blk * 4 + 0] = -T.infinity(T.float32)
+                local_stats[t, blk * 4 + 1] = T.float32(0)
+                local_stats[t, blk * 4 + 2] = T.float32(0)
+                local_stats[t, blk * 4 + 3] = T.float32(0)
 
     return local_stats_shard
 
@@ -1639,31 +1645,23 @@ def verify_shard_kernel(
                 init=T.cast(drafts[start + T.min(step + 1, num_drafts)], T.int64),
             )
             b_clamped = T.min(block, blocks - 1)
-            maximum = T.alloc_var(
-                T.float32, init=gathered_stats[row, b_clamped * 4 + 0]
-            )
-            sumexp = T.alloc_var(
-                T.float32, init=gathered_stats[row, b_clamped * 4 + 1]
-            )
             position = T.alloc_var(pos_dtype, init=pos[row])
             temp = T.alloc_var(T.float32, init=temperature[state])
             seed = T.alloc_var(T.int64, init=seeds[state])
             in_row = live & (block < blocks)
-            maximum = T.if_then_else(in_row, maximum, -T.infinity(T.float32))
-            sumexp = T.if_then_else(in_row, sumexp, T.float32(0))
+            maximum = T.alloc_var(T.float32, init=-T.infinity(T.float32))
+            sumexp = T.alloc_var(T.float32, init=T.float32(0))
+            has_draft[0] = 0
+            draft_logit[0] = T.float32(0)
+            if in_row:
+                maximum = gathered_stats[row, b_clamped * 4 + 0]
+                if temp != T.float32(0):
+                    sumexp = gathered_stats[row, b_clamped * 4 + 1]
+                    if gathered_stats[row, b_clamped * 4 + 2] != T.float32(0):
+                        has_draft[0] = 1
+                        draft_logit[0] = gathered_stats[row, b_clamped * 4 + 3]
             draft = T.if_then_else(
                 _live_draft(live, step, dead_row_cut, req, cut), draft, T.int64(-1)
-            )
-            has_draft[0] = T.if_then_else(
-                in_row
-                & (gathered_stats[row, b_clamped * 4 + 2] != T.float32(0)),
-                1,
-                0,
-            )
-            draft_logit[0] = T.if_then_else(
-                has_draft[0] != 0,
-                gathered_stats[row, b_clamped * 4 + 3],
-                T.float32(0),
             )
             for distance in _distances(lanes):
                 other_has = T.shfl_xor(has_draft[0], distance)
@@ -1715,13 +1713,12 @@ def verify_shard_kernel(
             best_index[0] = block
             for distance in _distances(lanes):
                 _exchange(best, best_index, other, other_index, distance)
-            target = T.alloc_var(
-                T.int64,
-                init=T.cast(
+            target = T.alloc_var(T.int64, init=T.int64(0))
+            if live & (temp == T.float32(0)):
+                target = T.cast(
                     gathered_stats[row, T.min(best_index[0], blocks - 1) * 4 + 2],
                     T.int64,
-                ),
-            )
+                )
 
             word = _randint_at(
                 seed ^ T.shift_left(T.cast(step, T.int64), T.int64(32)),
@@ -2017,6 +2014,9 @@ def resample_shard_kernel(
                         vocab_start + blk * RESAMPLE_BLOCK + best_index[0], T.int64
                     )
                     local_max[req, blk] = best[0]
+            elif tx == 0:
+                local_argmax[req, blk] = T.int64(0)
+                local_max[req, blk] = -T.infinity(T.float32)
 
     return resample_shard
 
