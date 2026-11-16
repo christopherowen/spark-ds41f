@@ -5,7 +5,7 @@ import os
 import socket
 import time
 import warnings
-from collections.abc import AsyncGenerator, Iterable, Mapping
+from collections.abc import AsyncGenerator, Callable, Iterable, Mapping
 from copy import copy
 from typing import Any
 
