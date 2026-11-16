@@ -452,6 +452,23 @@ escape, `defer_loading: true` + `tool_reference` inline tool-schema resolution
 hardening (`sp_prefill.py`, `engram_rows/rows.py`).
 
 Open levers:
+- **Fuse the dense indexer's top-k into its score kernel** (long-context prefill).
+  - **The cost:** on candidate-60 the dense indexer (layers 2, 8 and 14) is nearly all of
+    cold prefill's long-context cost. Per prompt token it is 100.9 µs at 122K and 110.3 µs at
+    910K tokens on tp4-ring.
+  - **What it would remove:** each 256-row sub-chunk writes its BF16 score matrix
+    (256 × 455K at 910K, 233 MB) and the segment top-k reads it back. That read takes most of
+    selection's 1.2-1.3 ms per call. Scoring a 4-row group's 4,096-position segments into
+    shared memory and selecting each segment there would keep that traffic on chip.
+  - **Exactness:** every segmentation gives the same exact top 512, since the merges are exact
+    and use the same tie rule.
+  - **Expected gain:** about 0.7-0.9 ms per call at 910K, roughly +1.4% cold prefill at 1M
+    and +0.4% at 237K.
+  - **The work:** a new kernel combining the CUDA score path with the TileLang selection
+    macros (`threshold`, `compact`).
+  - **Already measured:** vectorized key loads (vLLM 0819) took only 0.5-2% off score and
+    select, because the read itself bounds it.
+  - Evidence: `experiments/2026-11-16-indexer-prefill-exact`.
 - **Rank-offset CTA remapping for sequence-parallel all-gather overlap.** `_sp_front` /
   `finish_front` (`defer_q`) already hides `q_all_gather` in attention; if new fused
   SP consumers are introduced later, remap consumer row-tile coordinates by rank offset

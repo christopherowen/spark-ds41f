@@ -1,0 +1,259 @@
+From 0971cd9debc2438e61df7167551d276a210776fd Mon Sep 17 00:00:00 2001
+From: Christopher Owen <3221756+christopherowen@users.noreply.github.com>
+Date: Mon, 16 Nov 2026 21:16:18 +0000
+Subject: [PATCH] perf(dsv41): bf16x2 epilogue and next-tile key prefetch in
+ the dense indexer score kernel
+
+Base: candidate-60 vLLM patch head f27a89d6a94470857bc70bce580e84b7efe2b696 (tree afcaac3594ac).
+
+Rationale:
+At long prefill the dense indexer of layers 2, 8 and 14 is almost all of the cost that grows
+with context: on candidate-60 at tp4-ring the time per prompt token rises from 100.9 us at
+122K tokens to 110.3 us at 910K, and a 256-row sub-chunk's score and top-512 account for
+9.2 of those 9.4 us, the score kernel for 80% of it. In __tl_score_rows_dense_fast:
+1. The epilogue computes bf16(max(bf16(dot), 0) * w) with __hmax2 and __hmul2 on bf16x2 pairs
+   instead of a round trip through float2 (cvt, fmaxf, fmul, cvt). The product of two BF16
+   values is exact in FP32, so the one bf16x2 rounding equals the float path's rounding of the
+   exact product; __hmax2 returns the non-NaN operand as fmaxf does.
+2. The head sum reads two heads per 32-bit shared-memory load: the swizzle mask is even, so
+   heads 2k and 2k + 1 stay adjacent, and they are added low then high, the same FP32 additions
+   in increasing head order.
+3. On the fast path (rows sharing row 0's pages), the next tile's key and scale reads are
+   issued as soon as the current tile is in registers and stored to shared memory at the next
+   iteration (__tl_fetch_k_dense / __tl_store_k_shared: the loader's addresses and predicates,
+   one tile ahead). Any other path ignores the prefetched words.
+
+Quality:
+Bit-identical: every score over every row's extent and every selected position, against the
+candidate-60 kernel at prefill depths of 122K, 237K, 470K and 910K-token prompts (256-row
+sub-chunks, ratio-2 cache) and at the decode shapes of benchmark_deepseek_v41_indexer_bound.py
+(6 and 96 rows, 4K to 1M keys). Score kernel 19-22% faster at prefill depths (about 209 against
+160 TFLOPS on GB10); no decode case slower. End to end at tp4-ring (same image, same prompts,
+2 boots each): cold prefill +0.5% at 122K, +1.2% at 237K, +1.0% at 470K and +2.1% at 910K
+tokens (9,064 -> 9,251 tok/s).
+
+Tests:
+- pytest tests/kernels/attention/test_deepseek_v41_tilelang.py -k "indexer or topk" (28 passed,
+  1 skipped, 1 xfailed: the non-finite query-scale contract, unchanged here).
+- pytest tests/kernels/test_deepseek_v41_tilelang_pdl.py (15 passed).
+
+Upstream status: local DeepSeek-V4.1 TileLang indexer optimization for SM120/SM121.
+---
+ vllm/models/deepseek_v4_1/tilelang/indexer.py | 128 ++++++++++++++----
+ 1 file changed, 105 insertions(+), 23 deletions(-)
+
+diff --git a/vllm/models/deepseek_v4_1/tilelang/indexer.py b/vllm/models/deepseek_v4_1/tilelang/indexer.py
+index 3d59dba69..d5a49438f 100644
+--- a/vllm/models/deepseek_v4_1/tilelang/indexer.py
++++ b/vllm/models/deepseek_v4_1/tilelang/indexer.py
+@@ -286,6 +286,60 @@ __device__ __forceinline__ void __tl_reduce_store_scores_candidates(
+         }
+     }
+ }
++// The dense loader's global reads into registers, for the next tile while this one computes, and
++// their store into shared memory: together exactly __tl_load_k_shared_dense.
++__device__ __forceinline__ void __tl_fetch_k_dense(
++    const void* __restrict__ KPool,
++    const uint* __restrict__ KScale,
++    const int* __restrict__ PageTable,
++    int row, int p0, int extent, int page_size, int table_width, int pool_pages,
++    int pool_stride, int scale_stride, int scale_word0,
++    uint4 (&v)[2], uint& s
++) {
++    int tx = threadIdx.x;
++    int logical_page = min(p0 / page_size, table_width - 1);
++    int raw_page = (table_width >= 1) ? PageTable[(int64_t)row * table_width + logical_page] : 0;
++    int page = min(max(raw_page, 0), pool_pages - 1);
++    int64_t page_byte_base = ((int64_t)page * pool_stride) >> 1;
++    #pragma unroll
++    for (int half = 0; half < 2; ++half) {
++        int p = half * 32 + (tx >> 2);
++        int c = tx & 3;
++        int pos = p0 + p;
++        uint4 val = make_uint4(0, 0, 0, 0);
++        if (pos < extent && page >= 0 && page < pool_pages) {
++            val = *reinterpret_cast<const uint4*>(
++                reinterpret_cast<const uint8_t*>(KPool) + page_byte_base + ((pos % page_size) * 64) + c * 16
++            );
++        }
++        v[half] = val;
++    }
++    s = 0;
++    if (tx < 64) {
++        int pos = p0 + tx;
++        if (pos < extent && page >= 0 && page < pool_pages) {
++            s = KScale[(int64_t)page * scale_stride + scale_word0 + (pos % page_size)];
++        }
++    }
++}
++
++__device__ __forceinline__ void __tl_store_k_shared(
++    void* __restrict__ K_shared, void* __restrict__ SFK_shared, const uint4 (&v)[2], uint s
++) {
++    int tx = threadIdx.x;
++    uint4* k_smem = reinterpret_cast<uint4*>(K_shared);
++    #pragma unroll
++    for (int half = 0; half < 2; ++half) {
++        int p = half * 32 + (tx >> 2);
++        int c = tx & 3;
++        k_smem[p * 4 + (c ^ ((p >> 1) & 3))] = v[half];
++    }
++    if (tx < 64) {
++        reinterpret_cast<uint*>(SFK_shared)[tx] = s;
++    }
++    __syncthreads();
++}
++
+ template <int R>
+ __device__ __forceinline__ void __tl_score_rows_dense_fast(
+     const fp4_e2_t* __restrict__ Q,
+@@ -336,6 +390,7 @@ __device__ __forceinline__ void __tl_score_rows_dense_fast(
+     fp4_e2_2_t B_reg[R][2][16];
+     uint32_t sfq_reg[R][2];
+     float2 w_reg[R][2];
++    __nv_bfloat162 w2_reg[R][2];
+ 
+     int smem_q_off = (((tx >> 2) * 64) + ((((((tx & 31) >> 4) + ((tx & 3) >> 1)) & 1) * 32)) + ((((((tx & 15) >> 3) + (tx & 1)) & 1) * 16)));
+     int ld_q_base = (((tx >> 6) * 1024) + (((tx & 31) >> 4) * 512) + ((tx & 7) * 64) + ((((((tx & 15) >> 3) + ((tx & 3) >> 1)) & 1) * 16)));
+@@ -362,12 +417,15 @@ __device__ __forceinline__ void __tl_score_rows_dense_fast(
+             for (int w_i = 0; w_i < 2; ++w_i) {
+                 int h0 = ((tx >> 6) * 16) + (w_i * 8) + ((tx & 3) * 2);
+                 w_reg[r][w_i] = make_float2((float)wptr[h0], (float)wptr[h0 + 1]);
++                w2_reg[r][w_i] = *reinterpret_cast<const __nv_bfloat162*>(wptr + h0);
+             }
+         } else {
+             sfq_reg[r][0] = 0;
+             sfq_reg[r][1] = 0;
+             w_reg[r][0] = make_float2(0.0f, 0.0f);
+             w_reg[r][1] = make_float2(0.0f, 0.0f);
++            w2_reg[r][0] = __float2bfloat162_rn(0.0f);
++            w2_reg[r][1] = __float2bfloat162_rn(0.0f);
+         }
+         __syncthreads();
+     }
+@@ -375,6 +433,9 @@ __device__ __forceinline__ void __tl_score_rows_dense_fast(
+     int num_iters = ((max(((max_ext + 63) >> 6) - cta, 0)) + ctas - 1) / ctas;
+     int sfk_base = (((tx & 63) >> 5) * 32) + ((tx & 1) * 8) + ((tx & 31) >> 2);
+ 
++    uint4 pre_v[2];
++    uint pre_s = 0;
++    int pre_p0 = -1;
+     for (int i = 0; i < num_iters; ++i) {
+         int p0 = (cta + i * ctas) * 64;
+         int lpage = min(p0 / page_size, table_width - 1);
+@@ -393,11 +454,15 @@ __device__ __forceinline__ void __tl_score_rows_dense_fast(
+         uint32_t sfk_reg[2];
+ 
+         if (same_k && (R > 1) && ((R & 1) == 0)) {
+-            __tl_load_k_shared_dense(
+-                KPool, KScale, PageTable, K_shared, SFK_shared,
+-                row0, p0, max_ext, page_size, table_width,
+-                pool_pages, pool_stride, scale_stride, scale_word0
+-            );
++            if (pre_p0 == p0) {
++                __tl_store_k_shared(K_shared, SFK_shared, pre_v, pre_s);
++            } else {
++                __tl_load_k_shared_dense(
++                    KPool, KScale, PageTable, K_shared, SFK_shared,
++                    row0, p0, max_ext, page_size, table_width,
++                    pool_pages, pool_stride, scale_stride, scale_word0
++                );
++            }
+             #pragma unroll
+             for (int ki = 0; ki < 2; ++ki) {
+                 #pragma unroll
+@@ -408,6 +473,17 @@ __device__ __forceinline__ void __tl_score_rows_dense_fast(
+             }
+             sfk_reg[0] = ((const uint*)SFK_shared)[sfk_base];
+             sfk_reg[1] = ((const uint*)SFK_shared)[sfk_base + 16];
++            // The next tile's reads go out now and land while this tile computes. A fast-path tile
++            // reads row0's pages, which every row of the group shares; any other path ignores them.
++            pre_p0 = -1;
++            if (i + 1 < num_iters) {
++                int p0n = (cta + (i + 1) * ctas) * 64;
++                __tl_fetch_k_dense(
++                    KPool, KScale, PageTable, row0, p0n, max_ext, page_size, table_width,
++                    pool_pages, pool_stride, scale_stride, scale_word0, pre_v, pre_s
++                );
++                pre_p0 = p0n;
++            }
+ 
+             #pragma unroll
+             for (int rp = 0; rp < R; rp += 2) {
+@@ -447,13 +523,11 @@ __device__ __forceinline__ void __tl_score_rows_dense_fast(
+                     #pragma unroll
+                     for (int i_4 = 0; i_4 < 8; ++i_4) {
+                         float2 v_ = *(float2*)(acc + (i_4 * 2));
+-                        uint1 __6;
+-                        (reinterpret_cast<__nv_bfloat162*>(&__6))[0] = __float22bfloat162_rn(v_);
+-                        float2 __5 = tl::__tl_cvt_bf16x2_to_f32x2((reinterpret_cast<__nv_bfloat162*>(&__6))[0]);
+-                        float2 __4 = tl::max2(__5, make_float2(0.0f, 0.0f));
+-                        float2 __3 = tl::mul2(__4, w_reg[r][(i_4 & 3) >> 1]);
++                        // bf16(max(bf16(dot), 0) * w): the product of two bf16 values is exact, so one
++                        // bf16x2 multiply rounds it as the float path's rounding of the float product does.
++                        __nv_bfloat162 __m = __hmax2(__float22bfloat162_rn(v_), __float2bfloat162_rn(0.0f));
+                         uint1 __2;
+-                        (reinterpret_cast<__nv_bfloat162*>(&__2))[0] = __float22bfloat162_rn(__3);
++                        (reinterpret_cast<__nv_bfloat162*>(&__2))[0] = __hmul2(__m, w2_reg[r][(i_4 & 3) >> 1]);
+                         int p_row = (((tx & 63) >> 5) * 32) + ((i_4 >> 2) * 16) + ((i_4 & 1) * 8) + ((tx & 31) >> 2);
+                         int h_col = ((tx >> 6) * 16) + (((i_4 & 3) >> 1) * 8) + ((tx & 3) * 2);
+                         int swz_col = h_col ^ ((p_row & 15) << 1);
+@@ -472,10 +546,16 @@ __device__ __forceinline__ void __tl_score_rows_dense_fast(
+                     asm volatile("" ::: "memory");
+                     float s = 0.0f;
+                     const bfloat16_t* c_row = reinterpret_cast<const bfloat16_t*>(contrib) + (sub * 64 + p) * 32;
+-                    int mask = (p & 15) << 1;
++                    // Heads 2k and 2k + 1 stay adjacent under the even swizzle: one 32-bit load
++                    // each, added in head order.
++                    const uint32_t* c_pair = reinterpret_cast<const uint32_t*>(c_row);
++                    int pmask = (p & 15);
+                     #pragma unroll
+-                    for (int h = 0; h < 32; ++h) {
+-                        s += (float)c_row[h ^ mask];
++                    for (int h2 = 0; h2 < 16; ++h2) {
++                        uint32_t two = c_pair[h2 ^ pmask];
++                        float2 f = tl::__tl_cvt_bf16x2_to_f32x2(*reinterpret_cast<__nv_bfloat162*>(&two));
++                        s += f.x;
++                        s += f.y;
+                     }
+                     Scores[(int64_t)row * width + j] = (bfloat16_t)s;
+                 }
+@@ -558,13 +638,11 @@ __device__ __forceinline__ void __tl_score_rows_dense_fast(
+                 #pragma unroll
+                 for (int i_4 = 0; i_4 < 8; ++i_4) {
+                     float2 v_ = *(float2*)(acc + (i_4 * 2));
+-                    uint1 __6;
+-                    (reinterpret_cast<__nv_bfloat162*>(&__6))[0] = __float22bfloat162_rn(v_);
+-                    float2 __5 = tl::__tl_cvt_bf16x2_to_f32x2((reinterpret_cast<__nv_bfloat162*>(&__6))[0]);
+-                    float2 __4 = tl::max2(__5, make_float2(0.0f, 0.0f));
+-                    float2 __3 = tl::mul2(__4, w_reg[r][(i_4 & 3) >> 1]);
++                    // bf16(max(bf16(dot), 0) * w): the product of two bf16 values is exact, so one
++                    // bf16x2 multiply rounds it as the float path's rounding of the float product does.
++                    __nv_bfloat162 __m = __hmax2(__float22bfloat162_rn(v_), __float2bfloat162_rn(0.0f));
+                     uint1 __2;
+-                    (reinterpret_cast<__nv_bfloat162*>(&__2))[0] = __float22bfloat162_rn(__3);
++                    (reinterpret_cast<__nv_bfloat162*>(&__2))[0] = __hmul2(__m, w2_reg[r][(i_4 & 3) >> 1]);
+                     int p_row = (((tx & 63) >> 5) * 32) + ((i_4 >> 2) * 16) + ((i_4 & 1) * 8) + ((tx & 31) >> 2);
+                     int h_col = ((tx >> 6) * 16) + (((i_4 & 3) >> 1) * 8) + ((tx & 3) * 2);
+                     int swz_col = h_col ^ ((p_row & 15) << 1);
+@@ -578,10 +656,14 @@ __device__ __forceinline__ void __tl_score_rows_dense_fast(
+                         asm volatile("" ::: "memory");
+                         float s = 0.0f;
+                         const bfloat16_t* c_row = reinterpret_cast<const bfloat16_t*>(contrib) + tx * 32;
+-                        int mask = (tx & 15) << 1;
++                        const uint32_t* c_pair = reinterpret_cast<const uint32_t*>(c_row);
++                        int pmask = (tx & 15);
+                         #pragma unroll
+-                        for (int h = 0; h < 32; ++h) {
+-                            s += (float)c_row[h ^ mask];
++                        for (int h2 = 0; h2 < 16; ++h2) {
++                            uint32_t two = c_pair[h2 ^ pmask];
++                            float2 f = tl::__tl_cvt_bf16x2_to_f32x2(*reinterpret_cast<__nv_bfloat162*>(&two));
++                            s += f.x;
++                            s += f.y;
+                         }
+                         Scores[(int64_t)row * width + j] = (bfloat16_t)s;
+                     }
+-- 
+2.43.0
+

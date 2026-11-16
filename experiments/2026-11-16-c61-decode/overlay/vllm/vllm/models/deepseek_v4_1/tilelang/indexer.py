@@ -523,9 +523,9 @@ __device__ __forceinline__ void __tl_score_rows_dense_fast(
                     #pragma unroll
                     for (int i_4 = 0; i_4 < 8; ++i_4) {
                         float2 v_ = *(float2*)(acc + (i_4 * 2));
-                        // bf16(max(bf16(dot), 0) * w): the product of two bf16 values is exact, so one
+                        // bf16(relu(bf16(dot)) * w), a NaN dot kept as DeepSeek's relu_ keeps it: the product of two bf16 values is exact, so one
                         // bf16x2 multiply rounds it as the float path's rounding of the float product does.
-                        __nv_bfloat162 __m = __hmax2(__float22bfloat162_rn(v_), __float2bfloat162_rn(0.0f));
+                        __nv_bfloat162 __m = __hmax2_nan(__float22bfloat162_rn(v_), __float2bfloat162_rn(0.0f));
                         uint1 __2;
                         (reinterpret_cast<__nv_bfloat162*>(&__2))[0] = __hmul2(__m, w2_reg[r][(i_4 & 3) >> 1]);
                         int p_row = (((tx & 63) >> 5) * 32) + ((i_4 >> 2) * 16) + ((i_4 & 1) * 8) + ((tx & 31) >> 2);
@@ -638,9 +638,9 @@ __device__ __forceinline__ void __tl_score_rows_dense_fast(
                 #pragma unroll
                 for (int i_4 = 0; i_4 < 8; ++i_4) {
                     float2 v_ = *(float2*)(acc + (i_4 * 2));
-                    // bf16(max(bf16(dot), 0) * w): the product of two bf16 values is exact, so one
+                    // bf16(relu(bf16(dot)) * w), a NaN dot kept as DeepSeek's relu_ keeps it: the product of two bf16 values is exact, so one
                     // bf16x2 multiply rounds it as the float path's rounding of the float product does.
-                    __nv_bfloat162 __m = __hmax2(__float22bfloat162_rn(v_), __float2bfloat162_rn(0.0f));
+                    __nv_bfloat162 __m = __hmax2_nan(__float22bfloat162_rn(v_), __float2bfloat162_rn(0.0f));
                     uint1 __2;
                     (reinterpret_cast<__nv_bfloat162*>(&__2))[0] = __hmul2(__m, w2_reg[r][(i_4 & 3) >> 1]);
                     int p_row = (((tx & 63) >> 5) * 32) + ((i_4 >> 2) * 16) + ((i_4 & 1) * 8) + ((tx & 31) >> 2);
@@ -709,6 +709,7 @@ __device__ __forceinline__ void __tl_score_row_candidates_fast(
     fp4_e2_2_t B_reg[2][16];
     uint32_t sfq_reg[2];
     float2 w_reg[2];
+    __nv_bfloat162 w2_reg[2];
 
     int smem_q_off = (((tx >> 2) * 64) + ((((((tx & 31) >> 4) + ((tx & 3) >> 1)) & 1) * 32)) + ((((((tx & 15) >> 3) + (tx & 1)) & 1) * 16)));
     int ld_q_base = (((tx >> 6) * 1024) + (((tx & 31) >> 4) * 512) + ((tx & 7) * 64) + ((((((tx & 15) >> 3) + ((tx & 3) >> 1)) & 1) * 16)));
@@ -729,6 +730,7 @@ __device__ __forceinline__ void __tl_score_row_candidates_fast(
     for (int w_i = 0; w_i < 2; ++w_i) {
         int h0 = ((tx >> 6) * 16) + (w_i * 8) + ((tx & 3) * 2);
         w_reg[w_i] = make_float2((float)wptr[h0], (float)wptr[h0 + 1]);
+        w2_reg[w_i] = *reinterpret_cast<const __nv_bfloat162*>(wptr + h0);
     }
 
     int num_iters = ((max(((extent + 63) >> 6) - cta, 0)) + ctas - 1) / ctas;
@@ -782,13 +784,10 @@ __device__ __forceinline__ void __tl_score_row_candidates_fast(
         #pragma unroll
         for (int i_4 = 0; i_4 < 8; ++i_4) {
             float2 v_ = *(float2*)(acc + (i_4 * 2));
-            uint1 __6;
-            (reinterpret_cast<__nv_bfloat162*>(&__6))[0] = __float22bfloat162_rn(v_);
-            float2 __5 = tl::__tl_cvt_bf16x2_to_f32x2((reinterpret_cast<__nv_bfloat162*>(&__6))[0]);
-            float2 __4 = tl::max2(__5, make_float2(0.0f, 0.0f));
-            float2 __3 = tl::mul2(__4, w_reg[(i_4 & 3) >> 1]);
+            // bf16(relu(bf16(dot)) * w), a NaN dot kept as DeepSeek's relu_ keeps it.
+            __nv_bfloat162 __m = __hmax2_nan(__float22bfloat162_rn(v_), __float2bfloat162_rn(0.0f));
             uint1 __2;
-            (reinterpret_cast<__nv_bfloat162*>(&__2))[0] = __float22bfloat162_rn(__3);
+            (reinterpret_cast<__nv_bfloat162*>(&__2))[0] = __hmul2(__m, w2_reg[(i_4 & 3) >> 1]);
             int p_row = (((tx & 63) >> 5) * 32) + ((i_4 >> 2) * 16) + ((i_4 & 1) * 8) + ((tx & 31) >> 2);
             int h_col = ((tx >> 6) * 16) + (((i_4 & 3) >> 1) * 8) + ((tx & 3) * 2);
             int swz_col = h_col ^ ((p_row & 15) << 1);
@@ -2050,6 +2049,39 @@ def _final_writer(threads, topk, group):
     return write_final, write_empty_final
 
 
+_KEY_LOAD_HEADER = r"""
+// Order-preserving uint16 keys of a dense segment's BF16 scores into the swizzled key buffer:
+// the same key in the same slot as the scalar loop, read eight scores per 16-byte load.
+template <int THREADS>
+__device__ __forceinline__ void __tl_load_keys16(
+    const bfloat16_t* __restrict__ row_scores,
+    uint16_t* __restrict__ keys,
+    int seg_start,
+    int n_active
+) {
+    int tx = threadIdx.x;
+    const uint16_t* src = reinterpret_cast<const uint16_t*>(row_scores) + seg_start;
+    int full = ((reinterpret_cast<uintptr_t>(src) & 15) == 0) ? (n_active & ~7) : 0;
+    for (int base = tx * 8; base < full; base += THREADS * 8) {
+        uint4 v = *reinterpret_cast<const uint4*>(src + base);
+        uint32_t w[4] = {v.x, v.y, v.z, v.w};
+        #pragma unroll
+        for (int k = 0; k < 8; ++k) {
+            uint32_t bits = (w[k >> 1] >> ((k & 1) * 16)) & 0xFFFFu;
+            uint32_t key = (bits >= 0x8000u) ? (bits ^ 0xFFFFu) : (bits | 0x8000u);
+            int idx = base + k;
+            keys[idx ^ ((idx >> 5) & 31)] = (uint16_t)key;
+        }
+    }
+    for (int j = full + tx; j < n_active; j += THREADS) {
+        uint32_t bits = src[j];
+        uint32_t key = (bits >= 0x8000u) ? (bits ^ 0xFFFFu) : (bits | 0x8000u);
+        keys[j ^ ((j >> 5) & 31)] = (uint16_t)key;
+    }
+}
+"""
+
+
 @tilelang.jit(
     pass_configs={tilelang.PassConfigKey.TL_DISABLE_THREAD_STORAGE_SYNC: True}
 )
@@ -2095,6 +2127,8 @@ def indexer_topk_segment_v41(
     segments = tilelang.cdiv(entries, segment)
     assert not final or segments == 1, "a final segment must cover the row"
     per = segment // threads
+    # Dense uint16 keys load eight scores a thread at a time (``__tl_load_keys16``).
+    vector_keys = group == 1 and not gather_scores and swizzle
     threshold, compact = _select_macros(threads, topk, swizzle)
     write_final, write_empty_final = _final_writer(threads, topk, group)
 
@@ -2106,38 +2140,48 @@ def indexer_topk_segment_v41(
         best = T.alloc_var(T.int32)
         n_entries = T.ceildiv(extent, group)
         n_active = T.min(segment, T.max(n_entries - seg * segment, 0))
-        for i in T.serial(T.ceildiv(n_active, threads)):
-            j = i * threads + tx
-            if j < n_active:
-                e = seg * segment + j
-                if gather_scores:
-                    blk = Gather[row, e // CANDIDATE_BLOCK]
-                    pos = blk * CANDIDATE_BLOCK + e % CANDIDATE_BLOCK
-                    keys[_swizzle_key_idx(j, swizzle)] = T.cast(
-                        T.if_then_else(
-                            blk >= 0,
-                            _key16(Scores[row, T.min(T.max(pos, 0), width - 1)]),
-                            0,
-                        ),
-                        key_dtype,
-                    )
-                elif group == 1:
-                    keys[_swizzle_key_idx(j, swizzle)] = T.cast(
-                        _key16(Scores[row, T.min(e, width - 1)]), key_dtype
-                    )
-                else:
-                    best = 0
-                    for o in T.serial(group):
-                        if e * group + o < extent:
-                            best = T.max(
-                                best,
-                                _key16(Scores[row, T.min(e * group + o, width - 1)]),
-                            )
-                    # The block holding the last visible position always survives.
-                    keys[_swizzle_key_idx(j, swizzle)] = T.cast(
-                        T.if_then_else(e == (extent - 1) // group, 0xFF80, best),
-                        key_dtype,
-                    )
+        if vector_keys:
+            T.call_extern(
+                "handle",
+                f"__tl_load_keys16<{threads}>",
+                T.address_of(Scores[row, 0]),
+                T.address_of(keys[0]),
+                seg * segment,
+                n_active,
+            )
+        else:
+            for i in T.serial(T.ceildiv(n_active, threads)):
+                j = i * threads + tx
+                if j < n_active:
+                    e = seg * segment + j
+                    if gather_scores:
+                        blk = Gather[row, e // CANDIDATE_BLOCK]
+                        pos = blk * CANDIDATE_BLOCK + e % CANDIDATE_BLOCK
+                        keys[_swizzle_key_idx(j, swizzle)] = T.cast(
+                            T.if_then_else(
+                                blk >= 0,
+                                _key16(Scores[row, T.min(T.max(pos, 0), width - 1)]),
+                                0,
+                            ),
+                            key_dtype,
+                        )
+                    elif group == 1:
+                        keys[_swizzle_key_idx(j, swizzle)] = T.cast(
+                            _key16(Scores[row, T.min(e, width - 1)]), key_dtype
+                        )
+                    else:
+                        best = 0
+                        for o in T.serial(group):
+                            if e * group + o < extent:
+                                best = T.max(
+                                    best,
+                                    _key16(Scores[row, T.min(e * group + o, width - 1)]),
+                                )
+                        # The block holding the last visible position always survives.
+                        keys[_swizzle_key_idx(j, swizzle)] = T.cast(
+                            T.if_then_else(e == (extent - 1) // group, 0xFF80, best),
+                            key_dtype,
+                        )
         T.sync_threads()
         threshold(keys, n_active, tx, hist, scan, params)
         compact(keys, per, tx, scan, params, sel_idx, sel_key, n_active, warp_sums=hist)
@@ -2155,6 +2199,8 @@ def indexer_topk_segment_v41(
         WorkEntries,
     ):
         with T.Kernel(segments, rows, threads=threads) as (seg, row):
+            if vector_keys:
+                T.import_source(_KEY_LOAD_HEADER)
             pdl.chain()
             tx = T.get_thread_binding()
             keys = T.alloc_shared([segment], key_dtype)
