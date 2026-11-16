@@ -1,6 +1,6 @@
 # c58-prefill-10k
 
-Targeted prefill optimizations on `tp4-switched-c58-dev.json` (`sp1..sp4`, 4-node switched RoCE TP4, context 1,048,576, `VLLM_DS41_LSA=0`, image `spark-ds41f:candidate-55`).
+Targeted prefill optimizations on `tp4-switched-dev.json` (`sp1..sp4`, 4-node switched RoCE TP4, context 1,048,576, `VLLM_DS41_LSA=0`, image `spark-ds41f:candidate-55`).
 
 ## Intended Variables & Sequence
 
@@ -12,9 +12,9 @@ Targeted prefill optimizations on `tp4-switched-c58-dev.json` (`sp1..sp4`, 4-nod
 
 Commands:
 ```bash
-bin/spark --cluster-config experiments/2026-11-14-c58-prefill-10k/tp4-switched-c58-dev.json \
+bin/spark --cluster-config experiments/2026-11-14-c58-prefill-10k/tp4-switched-dev.json \
   bench --compare none --suites quality --output <tmp>
-bin/spark --cluster-config experiments/2026-11-14-c58-prefill-10k/tp4-switched-c58-dev.json \
+bin/spark --cluster-config experiments/2026-11-14-c58-prefill-10k/tp4-switched-dev.json \
   bench --compare none --suites prefill --prefill-text source \
   --prefill-sizes 32768,131072,262144 --prefill-repeats 2 --output <receipt_dir>
 ```
@@ -40,7 +40,7 @@ bin/spark --cluster-config experiments/2026-11-14-c58-prefill-10k/tp4-switched-c
 ## Final Candidate-58 (`c58-final`) Qualification & Full Benchmarks
 
 - **Base stack (`1158a12c8` + release-test compatibility guards)**:
-  - Profiles: `tp4-c58-dev.json` (`dgx1..dgx4`), `tp4-switched-c58-dev.json` (`sp1..sp4`), `tp3-switched-c58-dev.json` (`sp5..sp7`), extending `experiments/2026-10-26-spark-ds41f-candidate/candidate-55/tp4-dev.json` (`image: spark-ds41f:candidate-55`; `sp8` digest `sha256:c7976f6964156b848cef83009a22d811bb9b74bf23f85ada7e85e814f064d528`, `dgx1` digest `sha256:a8fbd55997cc16b6eb6fa8ffb92be8b05ef739f5eb876e596eccf6b7ce7022db`) and mounting `experiments/2026-11-14-c58-prefill-10k/overlay/vllm/`.
+  - Profiles: `tp4.json` / `tp4-dev.json` (`dgx1..dgx4`), `tp4-switched.json` / `tp4-switched-dev.json` (`sp1..sp4`), `tp3-switched.json` / `tp3-switched-dev.json` (`sp5..sp7`) (and the remaining `<shape>.json` / `<shape>-dev.json` shape profiles), extending the matching `experiments/2026-10-26-spark-ds41f-candidate/candidate-55/<shape>.json` (`image: spark-ds41f:candidate-55`; `sp8` digest `sha256:c7976f6964156b848cef83009a22d811bb9b74bf23f85ada7e85e814f064d528`, `dgx1` digest `sha256:a8fbd55997cc16b6eb6fa8ffb92be8b05ef739f5eb876e596eccf6b7ce7022db`) and mounting `experiments/2026-11-14-c58-prefill-10k/overlay/vllm/`.
   - Combined optimization stack:
     1. **Cold-prefill lookahead & SP overlap (`c58-prefill-10k` Steps 1–3, `df1ec49fd..67815e5b7`)**: async SP front (`sp_attention_front` + compressor SP local projection + `gather_mxfp8_async` overlapped with `indexer.weights_proj`), SP MoE input local routing (`route_local`) + `gather_many_async(weights, ids)` overlapped with `wait_xq` and shared experts (`16`-pair `(ready_event, done_event)` ring in `sp_prefill.py` and `kernels.py`), unconditional `/cache/spark-ds41f/engram-264-v1` default + `EngramDiskRows` `queue_depth = 512`, Chunk-0 Layer-1 prefetch in `DeepseekV41ModelState.add_request`, and deferred Layer-14 next-chunk Engram prefetch/staging.
     2. **Arm 2 (`sink-wq-screen`, `8bfb3f0de` + `eecd0ea92`)**: certified 8-bit `W_q` Cauchy-Schwarz vocabulary-head screening (`project_head_greedy_pairs` with `sink.cut_cols` suppression and per-row `top_k=4` shard candidates for `sink.alternates_of_greedy_top4`) active under `self.sink.rejection = True`, plus CPU-group TP rank barrier before compressor startup all-gather.

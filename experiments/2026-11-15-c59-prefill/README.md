@@ -2,7 +2,7 @@
 
 - **Base commit**: `bca856d25` (`candidate-58`)
 - **Branch**: `c59-prefill`
-- **Cluster profiles**: `tp4-switched-c59-dev.json`, `tp3-switched-c59-dev.json`, `tp4-c59-dev.json`
+- **Cluster profiles**: `tp4-switched-dev.json`, `tp3-switched-dev.json`, `tp4-dev.json`
 - **Goal**: Stepwise prefill lift with zero prefill, decode, determinism, or quality regressions vs `candidate-58`.
 
 ## Step 1 — Targeted Host/Decompress PR Bundle + Dense Indexer Paired-Row Reduction
