@@ -1,4 +1,4 @@
-From 8267d044cb59635098303cf2b6764806c566a922 Mon Sep 17 00:00:00 2001
+From 113318b2b452ed6b621e65f6c34bb43fb4e83311 Mon Sep 17 00:00:00 2001
 From: Christopher Owen <3221756+christopherowen@users.noreply.github.com>
 Date: Mon, 16 Nov 2026 15:00:02 +0100
 Subject: [PATCH] perf(v1): optimize prefix retention, multimodal hashing, and
@@ -34,17 +34,17 @@ Upstream status: local candidate-60 patch
  vllm/v1/core/sched/output.py                  | 238 +++++-
  vllm/v1/core/sched/scheduler.py               |  50 +-
  vllm/v1/core/single_type_kv_cache_manager.py  | 201 ++++-
- vllm/v1/engine/async_llm.py                   | 123 ++-
- vllm/v1/engine/core.py                        |  82 +-
+ vllm/v1/engine/async_llm.py                   | 140 +++-
+ vllm/v1/engine/core.py                        |  85 +-
  vllm/v1/request.py                            |  33 +
- 15 files changed, 2677 insertions(+), 31 deletions(-)
+ 15 files changed, 2695 insertions(+), 33 deletions(-)
  create mode 100644 tests/multimodal/test_prefix_cache_fastpath.py
  create mode 100644 tests/v1/core/test_new_request_data_ipc.py
  create mode 100644 tests/v1/core/test_prefix_cache_retention_probe.py
 
 diff --git a/tests/multimodal/test_prefix_cache_fastpath.py b/tests/multimodal/test_prefix_cache_fastpath.py
 new file mode 100644
-index 000000000..81f3471a4
+index 0000000000..81f3471a46
 --- /dev/null
 +++ b/tests/multimodal/test_prefix_cache_fastpath.py
 @@ -0,0 +1,380 @@
@@ -430,7 +430,7 @@ index 000000000..81f3471a4
 +    assert hf_calls == 2
 diff --git a/tests/v1/core/test_new_request_data_ipc.py b/tests/v1/core/test_new_request_data_ipc.py
 new file mode 100644
-index 000000000..61c2df142
+index 0000000000..61c2df1424
 --- /dev/null
 +++ b/tests/v1/core/test_new_request_data_ipc.py
 @@ -0,0 +1,185 @@
@@ -621,7 +621,7 @@ index 000000000..61c2df142
 +    assert int(tensor.gpu[3, 0].cpu().item()) == 42
 diff --git a/tests/v1/core/test_prefix_cache_retention_probe.py b/tests/v1/core/test_prefix_cache_retention_probe.py
 new file mode 100644
-index 000000000..ae1900329
+index 0000000000..ae1900329b
 --- /dev/null
 +++ b/tests/v1/core/test_prefix_cache_retention_probe.py
 @@ -0,0 +1,744 @@
@@ -1370,7 +1370,7 @@ index 000000000..ae1900329
 +    scheduler.update_from_output(sched_out1, model_out1)
 +    assert req1.num_computed_tokens == 0
 diff --git a/vllm/multimodal/hasher.py b/vllm/multimodal/hasher.py
-index a432afdc9..09e806cb6 100644
+index a432afdc9b..09e806cb65 100644
 --- a/vllm/multimodal/hasher.py
 +++ b/vllm/multimodal/hasher.py
 @@ -38,7 +38,7 @@ def _get_hasher_factory(
@@ -1383,7 +1383,7 @@ index a432afdc9..09e806cb6 100644
          return hashlib.sha256
      elif algorithm == "sha512":
 diff --git a/vllm/multimodal/inputs.py b/vllm/multimodal/inputs.py
-index bd1fc169d..34a30a009 100644
+index bd1fc169d1..34a30a009a 100644
 --- a/vllm/multimodal/inputs.py
 +++ b/vllm/multimodal/inputs.py
 @@ -3,7 +3,7 @@
@@ -1504,7 +1504,7 @@ index bd1fc169d..34a30a009 100644
  
  
 diff --git a/vllm/multimodal/media/image.py b/vllm/multimodal/media/image.py
-index 5b05176f5..4af3fa41f 100644
+index 5b05176f5d..4af3fa41f0 100644
 --- a/vllm/multimodal/media/image.py
 +++ b/vllm/multimodal/media/image.py
 @@ -2,12 +2,16 @@
@@ -1708,7 +1708,7 @@ index 5b05176f5..4af3fa41f 100644
  
      def load_base64(self, media_type: str, data: str) -> MediaWithBytes[Image.Image]:
 diff --git a/vllm/multimodal/processing/processor.py b/vllm/multimodal/processing/processor.py
-index 3db820458..ed4ff014a 100644
+index 3db8204588..ed4ff014a5 100644
 --- a/vllm/multimodal/processing/processor.py
 +++ b/vllm/multimodal/processing/processor.py
 @@ -1,7 +1,8 @@
@@ -1928,7 +1928,7 @@ index 3db820458..ed4ff014a 100644
  
          with timing_ctx.record("get_mm_hashes"):
 diff --git a/vllm/v1/core/kv_cache_coordinator.py b/vllm/v1/core/kv_cache_coordinator.py
-index cded5e944..0459f1b81 100644
+index cded5e9448..0459f1b815 100644
 --- a/vllm/v1/core/kv_cache_coordinator.py
 +++ b/vllm/v1/core/kv_cache_coordinator.py
 @@ -428,7 +428,15 @@ class KVCacheCoordinator(ABC):
@@ -2179,7 +2179,7 @@ index cded5e944..0459f1b81 100644
      def get_num_common_prefix_blocks(self, running_request_id: str) -> list[int]:
          """
 diff --git a/vllm/v1/core/sched/async_scheduler.py b/vllm/v1/core/sched/async_scheduler.py
-index 048f5e385..5f83d8817 100644
+index 048f5e385c..5f83d8817b 100644
 --- a/vllm/v1/core/sched/async_scheduler.py
 +++ b/vllm/v1/core/sched/async_scheduler.py
 @@ -100,9 +100,13 @@ class AsyncScheduler(Scheduler):
@@ -2199,7 +2199,7 @@ index 048f5e385..5f83d8817 100644
          return new_token_ids, stopped
  
 diff --git a/vllm/v1/core/sched/output.py b/vllm/v1/core/sched/output.py
-index 63abeb97c..3c9be4054 100644
+index 63abeb97c4..3c9be4054b 100644
 --- a/vllm/v1/core/sched/output.py
 +++ b/vllm/v1/core/sched/output.py
 @@ -1,10 +1,14 @@
@@ -2485,7 +2485,7 @@ index 63abeb97c..3c9be4054 100644
      def prompt_len(self) -> int:
          if self.prompt_token_ids is not None:
 diff --git a/vllm/v1/core/sched/scheduler.py b/vllm/v1/core/sched/scheduler.py
-index d1015e71b..1a12eb2f0 100644
+index d1015e71b3..1a12eb2f0c 100644
 --- a/vllm/v1/core/sched/scheduler.py
 +++ b/vllm/v1/core/sched/scheduler.py
 @@ -2,6 +2,7 @@
@@ -2586,7 +2586,7 @@ index d1015e71b..1a12eb2f0 100644
  
      def _free_encoder_inputs(self, request: Request) -> None:
 diff --git a/vllm/v1/core/single_type_kv_cache_manager.py b/vllm/v1/core/single_type_kv_cache_manager.py
-index a1eb644a0..5cd53afcf 100644
+index a1eb644a0a..5cd53afcff 100644
 --- a/vllm/v1/core/single_type_kv_cache_manager.py
 +++ b/vllm/v1/core/single_type_kv_cache_manager.py
 @@ -1198,6 +1198,28 @@ class SlidingWindowManager(SingleTypeKVCacheManager):
@@ -2831,7 +2831,7 @@ index a1eb644a0..5cd53afcf 100644
          """
          NOTE(Chen): The prefix blocks are null blocks for sliding window layers.
 diff --git a/vllm/v1/engine/async_llm.py b/vllm/v1/engine/async_llm.py
-index 2efa75eee..a0c684cba 100644
+index 2efa75eee3..2d4278f2fe 100644
 --- a/vllm/v1/engine/async_llm.py
 +++ b/vllm/v1/engine/async_llm.py
 @@ -5,7 +5,7 @@ import os
@@ -2908,26 +2908,37 @@ index 2efa75eee..a0c684cba 100644
      async def _add_request(
          self,
          request: EngineCoreRequest,
-@@ -542,6 +593,13 @@ class AsyncLLM(EngineClient):
+@@ -542,6 +593,17 @@ class AsyncLLM(EngineClient):
          # Register locally before the first await so concurrent tasks see this request.
          self.output_processor.add_request(request, prompt, parent_req, index, queue)
  
++        renderer = getattr(self, "renderer", None)
++        vllm_config = getattr(self, "vllm_config", None)
++        cache_config = getattr(vllm_config, "cache_config", None)
 +        if (
-+            self.renderer.mm_processor_cache is None
-+            and self.vllm_config.cache_config.enable_prefix_caching
-+            and request.mm_features
++            renderer is not None
++            and getattr(renderer, "mm_processor_cache", None) is None
++            and getattr(cache_config, "enable_prefix_caching", False)
++            and getattr(request, "mm_features", None)
 +        ):
 +            await self._prepare_mm_features_for_prefix_cache(request)
 +
          # Add the EngineCoreRequest to EngineCore (separate process).
          await self.engine_core.add_request_async(request)
  
-@@ -823,8 +881,45 @@ class AsyncLLM(EngineClient):
-         renderer = self.renderer
+@@ -820,11 +882,51 @@ class AsyncLLM(EngineClient):
+         # a circular reference via self.
+         self._logger_ref = [self.logger_manager]
+         logger_ref = self._logger_ref
+-        renderer = self.renderer
++        renderer = getattr(self, "renderer", None)
          # P0 multi-modal sender ("shadow") cache; None for text-only models.
-         mm_processor_cache = renderer.mm_processor_cache
-+        pending_mm_retries = self._pending_mm_retries
-+        p1_cached_mm_identifiers = self._p1_cached_mm_identifiers
+-        mm_processor_cache = renderer.mm_processor_cache
++        mm_processor_cache = (
++            renderer.mm_processor_cache if renderer is not None else None
++        )
++        pending_mm_retries = getattr(self, "_pending_mm_retries", None)
++        p1_cached_mm_identifiers = getattr(self, "_p1_cached_mm_identifiers", None)
          chunk_size = envs.VLLM_V1_OUTPUT_PROC_CHUNK_SIZE
  
 +        async def _retry_mm_cache_miss(
@@ -2936,12 +2947,13 @@ index 2efa75eee..a0c684cba 100644
 +            missed_hashes: list[str],
 +        ) -> None:
 +            missed_set = set(missed_hashes)
-+            for h in missed_set:
-+                p1_cached_mm_identifiers.discard(h)
-+            if retry_req.mm_features:
-+                for f in retry_req.mm_features:
-+                    if f.identifier in missed_set or f.mm_hash in missed_set:
-+                        p1_cached_mm_identifiers.discard(f.identifier)
++            if p1_cached_mm_identifiers is not None:
++                for h in missed_set:
++                    p1_cached_mm_identifiers.discard(h)
++                if retry_req.mm_features:
++                    for f in retry_req.mm_features:
++                        if f.identifier in missed_set or f.mm_hash in missed_set:
++                            p1_cached_mm_identifiers.discard(f.identifier)
 +
 +            def _materialize_missed() -> None:
 +                if not retry_req.mm_features:
@@ -2959,7 +2971,7 @@ index 2efa75eee..a0c684cba 100644
 +
 +            loop = asyncio.get_running_loop()
 +            await loop.run_in_executor(renderer._mm_executor, _materialize_missed)
-+            if retry_req.mm_features:
++            if p1_cached_mm_identifiers is not None and retry_req.mm_features:
 +                for f in retry_req.mm_features:
 +                    if f.data is not None:
 +                        p1_cached_mm_identifiers.add(f.identifier)
@@ -2968,7 +2980,7 @@ index 2efa75eee..a0c684cba 100644
          async def output_handler():
              try:
                  while True:
-@@ -843,6 +938,26 @@ class AsyncLLM(EngineClient):
+@@ -843,6 +945,26 @@ class AsyncLLM(EngineClient):
                      for start in range(0, num_outputs, chunk_size):
                          end = start + chunk_size
                          outputs_slice = engine_core_outputs[start:end]
@@ -2995,45 +3007,51 @@ index 2efa75eee..a0c684cba 100644
                          # 2) Process EngineCoreOutputs.
                          processed_outputs = output_processor.process_outputs(
                              outputs_slice, outputs.timestamp, iteration_stats
-@@ -897,6 +1012,8 @@ class AsyncLLM(EngineClient):
+@@ -897,6 +1019,10 @@ class AsyncLLM(EngineClient):
              (request_id,) if isinstance(request_id, str) else as_list(request_id)
          )
          all_request_ids = self.output_processor.abort_requests(request_ids, internal)
-+        for req_id in all_request_ids:
-+            self._pending_mm_retries.pop(req_id, None)
++        pending_mm_retries = getattr(self, "_pending_mm_retries", None)
++        if pending_mm_retries is not None:
++            for req_id in all_request_ids:
++                pending_mm_retries.pop(req_id, None)
          # Starlette StreamingResponse cancels an AnyIO scope on client
          # disconnect. Once output_processor has removed local state, shield the
          # EngineCore abort notification so it cannot be dropped mid-await.
-@@ -1115,12 +1232,14 @@ class AsyncLLM(EngineClient):
+@@ -1115,12 +1241,16 @@ class AsyncLLM(EngineClient):
          # Join the background MM warmup first: the mm_processor_cache is not
          # safe for concurrent access with its apply/clear.
          self.renderer._join_mm_warmup()
-+        self._p1_cached_mm_identifiers.clear()
++        if (cached_mm := getattr(self, "_p1_cached_mm_identifiers", None)) is not None:
++            cached_mm.clear()
          await self.renderer.clear_mm_cache_async()
          await self.engine_core.reset_mm_cache_async()
  
      async def reset_prefix_cache(
          self, reset_running_requests: bool = False, reset_connector: bool = False
      ) -> bool:
-+        self._p1_cached_mm_identifiers.clear()
++        if (cached_mm := getattr(self, "_p1_cached_mm_identifiers", None)) is not None:
++            cached_mm.clear()
          return await self.engine_core.reset_prefix_cache_async(
              reset_running_requests, reset_connector
          )
-@@ -1132,10 +1251,12 @@ class AsyncLLM(EngineClient):
+@@ -1132,10 +1262,14 @@ class AsyncLLM(EngineClient):
          return await self.engine_core.set_prefill_fairness_async(config)
  
      async def reset_encoder_cache(self) -> None:
-+        self._p1_cached_mm_identifiers.clear()
++        if (cached_mm := getattr(self, "_p1_cached_mm_identifiers", None)) is not None:
++            cached_mm.clear()
          await self.engine_core.reset_encoder_cache_async()
  
      async def sleep(self, level: int = 1, mode: PauseMode = "abort") -> None:
          if level >= 1:
-+            self._p1_cached_mm_identifiers.clear()
++            if (cached_mm := getattr(self, "_p1_cached_mm_identifiers", None)) is not None:
++                cached_mm.clear()
              await self.renderer.clear_mm_cache_async()
          await self.engine_core.sleep_async(level, mode)
  
 diff --git a/vllm/v1/engine/core.py b/vllm/v1/engine/core.py
-index 78ee820ac..90434dbb6 100644
+index 78ee820aca..c0d50750a2 100644
 --- a/vllm/v1/engine/core.py
 +++ b/vllm/v1/engine/core.py
 @@ -477,6 +477,77 @@ class EngineCore:
@@ -3114,17 +3132,20 @@ index 78ee820ac..90434dbb6 100644
      def add_request(self, request: Request, request_wave: int = 0):
          """Add request to the scheduler.
  
-@@ -517,6 +588,9 @@ class EngineCore:
+@@ -517,6 +588,12 @@ class EngineCore:
                  "Disabling ECTransfer for this request."
              )
  
-+        if self.mm_receiver_cache is None and request.mm_features:
++        if (
++            getattr(self, "mm_receiver_cache", None) is None
++            and getattr(request, "mm_features", None)
++        ):
 +            self._verify_or_resolve_stripped_mm_features(request)
 +
          self.scheduler.add_request(request)
          if request.abort_immediately:
              # Immediately abort so the connector's request_finished hook runs
-@@ -1762,7 +1836,11 @@ class EngineCoreProc(EngineCore):
+@@ -1762,7 +1839,11 @@ class EngineCoreProc(EngineCore):
                  )
              if self._reject_add_in_shutdown(req):
                  return
@@ -3137,7 +3158,7 @@ index 78ee820ac..90434dbb6 100644
          elif request_type == EngineCoreRequestType.ABORT:
              self.abort_requests(request)
          elif request_type == EngineCoreRequestType.UTILITY:
-@@ -2080,7 +2158,7 @@ class EngineCoreProc(EngineCore):
+@@ -2080,7 +2161,7 @@ class EngineCoreProc(EngineCore):
                      reuse_buffers.append(buffer)
  
      def _handle_mm_cache_miss(
@@ -3147,7 +3168,7 @@ index 78ee820ac..90434dbb6 100644
          """Return a retryable response for a P0/P1 cache-drift miss.
  
 diff --git a/vllm/v1/request.py b/vllm/v1/request.py
-index 7dd1ddd79..48a2c843d 100644
+index 7dd1ddd797..48a2c843d4 100644
 --- a/vllm/v1/request.py
 +++ b/vllm/v1/request.py
 @@ -1,6 +1,7 @@
@@ -3208,6 +3229,3 @@ index 7dd1ddd79..48a2c843d 100644
      def append_output_token_ids(
          self,
          token_ids: int | list[int],
--- 
-2.43.0
-

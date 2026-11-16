@@ -1,4 +1,4 @@
-From d6292e5c513fd69896b7e97366c38220b847feab Mon Sep 17 00:00:00 2001
+From 3b8719cf1854e74df2e1a15be418faea66f7e140 Mon Sep 17 00:00:00 2001
 From: Christopher Owen <3221756+christopherowen@users.noreply.github.com>
 Date: Mon, 16 Nov 2026 15:00:06 +0100
 Subject: [PATCH] perf(dsv41): harden SP prefill stream lifetimes, fused
@@ -23,7 +23,7 @@ Upstream status: local candidate-60 patch
 ---
  vllm/models/deepseek_v41/__init__.py          |  33 +-
  vllm/models/deepseek_v41/nvidia/vl_model.py   |  19 +-
- vllm/models/deepseek_v4_1/attention.py        | 472 +++++++++++++-----
+ vllm/models/deepseek_v4_1/attention.py        | 480 +++++++++++++-----
  vllm/models/deepseek_v4_1/ced.py              |   2 +
  vllm/models/deepseek_v4_1/compressor.py       | 105 +++-
  vllm/models/deepseek_v4_1/kernels.py          |  19 +-
@@ -32,11 +32,11 @@ Upstream status: local candidate-60 patch
  vllm/models/deepseek_v4_1/nvidia/model.py     | 115 ++++-
  .../deepseek_v4_1/nvidia/model_state.py       | 325 ++++++++++--
  vllm/models/deepseek_v4_1/nvidia/vl_model.py  |  29 +-
- vllm/models/deepseek_v4_1/sp_prefill.py       | 398 +++++++++++----
- 12 files changed, 1244 insertions(+), 328 deletions(-)
+ vllm/models/deepseek_v4_1/sp_prefill.py       | 393 ++++++++++----
+ 12 files changed, 1246 insertions(+), 329 deletions(-)
 
 diff --git a/vllm/models/deepseek_v41/__init__.py b/vllm/models/deepseek_v41/__init__.py
-index 6ee561239..c92e9a1c4 100644
+index 6ee5612399..c92e9a1c47 100644
 --- a/vllm/models/deepseek_v41/__init__.py
 +++ b/vllm/models/deepseek_v41/__init__.py
 @@ -11,23 +11,30 @@ def __getattr__(name):
@@ -84,7 +84,7 @@ index 6ee561239..c92e9a1c4 100644
  
  __all__ = [
 diff --git a/vllm/models/deepseek_v41/nvidia/vl_model.py b/vllm/models/deepseek_v41/nvidia/vl_model.py
-index bfbcaa89a..da235d264 100644
+index bfbcaa89a1..da235d264b 100644
 --- a/vllm/models/deepseek_v41/nvidia/vl_model.py
 +++ b/vllm/models/deepseek_v41/nvidia/vl_model.py
 @@ -53,11 +53,16 @@ from ..common.mm_preprocess import (
@@ -128,7 +128,7 @@ index bfbcaa89a..da235d264 100644
              self.language_model = DeepseekV41LLMForCausalLM(
                  vllm_config=vllm_config,
 diff --git a/vllm/models/deepseek_v4_1/attention.py b/vllm/models/deepseek_v4_1/attention.py
-index 36879f1b4..1fc89627a 100644
+index 36879f1b4d..1245aafbbb 100644
 --- a/vllm/models/deepseek_v4_1/attention.py
 +++ b/vllm/models/deepseek_v4_1/attention.py
 @@ -872,9 +872,10 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase):
@@ -488,7 +488,7 @@ index 36879f1b4..1fc89627a 100644
                  index_query = None
                  if self.indexer is not None:
                      # Sequence-parallel prefill: the indexer is replicated, so each
-@@ -1525,36 +1654,64 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase):
+@@ -1525,36 +1654,60 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase):
                      split = (
                          sp_rows if sp_rows is not None and not swa.is_decode else None
                      )
@@ -547,18 +547,14 @@ index 36879f1b4..1fc89627a 100644
 -                del q, kv, index_query
 +                if defer_q:
 +                    deferred_q = (qr, q_cast)
-+                    output = torch.empty(
-+                        (rows, self.n_local_heads, 512),
-+                        dtype=qr.dtype,
-+                        device=qr.device,
-+                    )
++                    output = None
 +                    del qr, q_cast, hidden_states, index_weights
 +                else:
 +                    deferred_q = None
 +                    del qr, hidden_states, index_weights
 +                    output = torch.empty_like(q)
 +                if deferred_q is not None:
-+                    self.forward_mqa(
++                    output = self.forward_mqa(
 +                        q,
 +                        kv,
 +                        positions,
@@ -575,7 +571,7 @@ index 36879f1b4..1fc89627a 100644
          return self._o_proj(output, sp_rows=sp_rows)
  
      def _issue_wo_prefetch(self, rows, *, after):
-@@ -1703,13 +1860,26 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase):
+@@ -1703,13 +1856,31 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase):
          )
  
      @eager_break_during_capture
@@ -596,15 +592,20 @@ index 36879f1b4..1fc89627a 100644
          swa = self._query_metadata(metadata[self.swa_cache_layer.prefix])
          mode = "decode" if swa.is_decode else "extend"
 -        rows = q.shape[0]
-+        rows = output.shape[0]
-+        device = output.device
++        if output is not None:
++            rows = output.shape[0]
++            device = output.device
++        else:
++            assert deferred_q is not None
++            rows = deferred_q[0].shape[0]
++            device = deferred_q[0].device
          self._check_attention_rows(mode, rows)
 +        gathered_selected = None
 +        wait_selected = None
          # A mixed step's decode requests, its leading rows (the batch is reordered
          # decode-first), keep the decode plan and the decode index mode: a row's
          # arithmetic must not depend on whether a prefill shares its step.
-@@ -1811,7 +1981,7 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase):
+@@ -1811,7 +1982,7 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase):
                      )
  
                      page_table = None
@@ -613,7 +614,7 @@ index 36879f1b4..1fc89627a 100644
                      if cacheable:
                          key = (id(im), row, count, index_width, self._index_page)
                          shared = get_forward_context().__dict__.setdefault(
-@@ -1891,13 +2061,13 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase):
+@@ -1891,13 +2062,13 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase):
              if split is None:
                  select(query, 0, self.topk_indices_buffer)
                  if pending_aux is not None:
@@ -629,7 +630,7 @@ index 36879f1b4..1fc89627a 100644
                  )
                  owns_candidates = self.layer_id == self.candidate_source_layer
                  expected = repeat = expected_candidates = None
-@@ -1916,7 +2086,7 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase):
+@@ -1916,7 +2087,7 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase):
                          )
                      # A second full-row run measures the top-k's own spread.
                      repeat = torch.full(
@@ -638,7 +639,7 @@ index 36879f1b4..1fc89627a 100644
                      )
                      select(reference, 0, repeat)
                      repeat = repeat[local]
-@@ -1929,11 +2099,25 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase):
+@@ -1929,11 +2100,25 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase):
                      self._check_index_split(
                          split, selected, expected, repeat, expected_candidates
                      )
@@ -666,7 +667,7 @@ index 36879f1b4..1fc89627a 100644
              return
          main = (
              self._query_metadata(metadata[self._owner().prefix])
-@@ -1946,10 +2130,36 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase):
+@@ -1946,10 +2131,40 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase):
              else self
          )
          if decode_rows:
@@ -685,10 +686,13 @@ index 36879f1b4..1fc89627a 100644
 +                del qr, q_cast
 +                self._issue_wo_prefetch(rows, after="q-b")
 +                q = self._rope(q, positions, "q")
++            if output is None:
++                output = torch.empty_like(q)
              self._attend_split(
                  q, output, positions, swa, main, owner, rows, decode_rows
              )
-             return
+-            return
++            return output
 +        if finish_front is not None:
 +            finish_front()
 +            finish_front = None
@@ -700,10 +704,12 @@ index 36879f1b4..1fc89627a 100644
 +            del qr, q_cast
 +            self._issue_wo_prefetch(rows, after="q-b")
 +            q = self._rope(q, positions, "q")
++        if output is None:
++            output = torch.empty_like(q)
          # Reuse the shared arena only after indexing completes. Keep full-batch
          # metadata beside, not overlapping, the native attention scratch.
          metadata_specs = self._attention_workspace_specs[mode]
-@@ -1968,7 +2178,7 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase):
+@@ -1968,7 +2183,7 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase):
                  )
              )
              metadata_buffers = self._shared_decode_metadata(
@@ -712,7 +718,7 @@ index 36879f1b4..1fc89627a 100644
              )
              arena = current_workspace_manager().get_simultaneous(*scratch_specs)
              scratch = list(arena)
-@@ -1980,6 +2190,10 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase):
+@@ -1980,6 +2195,10 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase):
              self._write_decode_metadata(arena, swa, main, rows)
              metadata_buffers = arena[:metadata_count]
              scratch = arena[metadata_count:]
@@ -723,7 +729,15 @@ index 36879f1b4..1fc89627a 100644
          swa_indices, swa_lengths, top_lengths = metadata_buffers[:3]
          kwargs = {}
          if main is not None:
-@@ -2175,24 +2389,50 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase):
+@@ -2000,6 +2219,7 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase):
+             swa_lengths=swa_lengths[:rows],
+             **kwargs,
+         )
++        return output
+ 
+     def _shared_decode_metadata(self, swa, main, rows, specs, device):
+         replay = self._replay_start(swa)
+@@ -2175,24 +2395,50 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase):
          real_heads = real_groups * heads_per_group
          q_rows = real_heads * self.head_dim
          wo_rows = real_groups * self.o_lora_rank
@@ -786,7 +800,7 @@ index 36879f1b4..1fc89627a 100644
          self.attn_sink = nn.Parameter(
              self.attn_sink[:real_heads].contiguous(), requires_grad=False
 diff --git a/vllm/models/deepseek_v4_1/ced.py b/vllm/models/deepseek_v4_1/ced.py
-index 05150ac97..e67c55743 100644
+index 05150ac974..e67c55743c 100644
 --- a/vllm/models/deepseek_v4_1/ced.py
 +++ b/vllm/models/deepseek_v4_1/ced.py
 @@ -187,6 +187,7 @@ class CEDState:
@@ -806,7 +820,7 @@ index 05150ac97..e67c55743 100644
  
          prepare.declare(
 diff --git a/vllm/models/deepseek_v4_1/compressor.py b/vllm/models/deepseek_v4_1/compressor.py
-index fba362616..d4014dd83 100644
+index fba362616c..d4014dd835 100644
 --- a/vllm/models/deepseek_v4_1/compressor.py
 +++ b/vllm/models/deepseek_v4_1/compressor.py
 @@ -218,7 +218,7 @@ class DeepseekCompressor(nn.Module):
@@ -992,7 +1006,7 @@ index fba362616..d4014dd83 100644
          )
          return self._latent[:rows], self._slots[:rows]
 diff --git a/vllm/models/deepseek_v4_1/kernels.py b/vllm/models/deepseek_v4_1/kernels.py
-index 0b920e0a6..827ca82dd 100644
+index 0b920e0a67..827ca82dd4 100644
 --- a/vllm/models/deepseek_v4_1/kernels.py
 +++ b/vllm/models/deepseek_v4_1/kernels.py
 @@ -127,14 +127,27 @@ def sp_moe_inputs(
@@ -1027,7 +1041,7 @@ index 0b920e0a6..827ca82dd 100644
          yield gathered_q.rows
  
 diff --git a/vllm/models/deepseek_v4_1/l2_prefetch.py b/vllm/models/deepseek_v4_1/l2_prefetch.py
-index ffd4d6dce..4ab575014 100644
+index ffd4d6dce4..4ab5750146 100644
 --- a/vllm/models/deepseek_v4_1/l2_prefetch.py
 +++ b/vllm/models/deepseek_v4_1/l2_prefetch.py
 @@ -80,9 +80,9 @@ def _enabled() -> bool:
@@ -1044,7 +1058,7 @@ index ffd4d6dce..4ab575014 100644
  
  def parse_row_bands(raw: str | None) -> tuple[tuple[int, int, int], ...]:
 diff --git a/vllm/models/deepseek_v4_1/nvidia/dspark.py b/vllm/models/deepseek_v4_1/nvidia/dspark.py
-index cc87613b3..da1ee1a0a 100644
+index cc87613b30..da1ee1a0a9 100644
 --- a/vllm/models/deepseek_v4_1/nvidia/dspark.py
 +++ b/vllm/models/deepseek_v4_1/nvidia/dspark.py
 @@ -844,6 +844,43 @@ class DSparkDeepseekV4ForCausalLM(nn.Module):
@@ -1111,7 +1125,7 @@ index cc87613b3..da1ee1a0a 100644
              layer.attn.setup_wo_projection()
          self.model._context_kv_projections = [
 diff --git a/vllm/models/deepseek_v4_1/nvidia/model.py b/vllm/models/deepseek_v4_1/nvidia/model.py
-index ed27cac41..e72f38df9 100644
+index ed27cac411..e72f38df91 100644
 --- a/vllm/models/deepseek_v4_1/nvidia/model.py
 +++ b/vllm/models/deepseek_v4_1/nvidia/model.py
 @@ -57,6 +57,7 @@ from .. import kernels, l2_prefetch, sp_prefill
@@ -1345,7 +1359,7 @@ index ed27cac41..e72f38df9 100644
          last_rank = get_pp_group().is_last_rank
          rows_here = sp is None and not decoder_compacted
 diff --git a/vllm/models/deepseek_v4_1/nvidia/model_state.py b/vllm/models/deepseek_v4_1/nvidia/model_state.py
-index 44efc8795..cd05fe7d6 100644
+index 44efc87955..cd05fe7d63 100644
 --- a/vllm/models/deepseek_v4_1/nvidia/model_state.py
 +++ b/vllm/models/deepseek_v4_1/nvidia/model_state.py
 @@ -140,10 +140,17 @@ class DeepseekV41ModelState(DefaultModelState):
@@ -1761,7 +1775,7 @@ index 44efc8795..cd05fe7d6 100644
              model.prepare_dummy_engram(num_tokens)
          return model_inputs
 diff --git a/vllm/models/deepseek_v4_1/nvidia/vl_model.py b/vllm/models/deepseek_v4_1/nvidia/vl_model.py
-index 3b842f69c..b49619780 100644
+index 3b842f69cf..b496197801 100644
 --- a/vllm/models/deepseek_v4_1/nvidia/vl_model.py
 +++ b/vllm/models/deepseek_v4_1/nvidia/vl_model.py
 @@ -36,12 +36,20 @@ from vllm.models.deepseek_v41.nvidia.vl_model import (
@@ -1829,7 +1843,7 @@ index 3b842f69c..b49619780 100644
          key = (str(self.embed_dtype).removeprefix("torch."), (hidden,))
          prepare.declare(
 diff --git a/vllm/models/deepseek_v4_1/sp_prefill.py b/vllm/models/deepseek_v4_1/sp_prefill.py
-index d4daeb67f..c2c2e1ad2 100644
+index d4daeb67f1..b5fa1b7af7 100644
 --- a/vllm/models/deepseek_v4_1/sp_prefill.py
 +++ b/vllm/models/deepseek_v4_1/sp_prefill.py
 @@ -9,8 +9,9 @@ layer (mHC mixes, norms, the Engram gate, the residual carry) on every token.
@@ -1934,13 +1948,11 @@ index d4daeb67f..c2c2e1ad2 100644
          outs = []
          pairs = []
          for x, rows in zip(inputs, limits):
-@@ -256,14 +276,80 @@ class SPRows:
+@@ -256,14 +276,86 @@ class SPRows:
              out = torch.empty(
                  (alloc_rows, *inp.shape[1:]), dtype=inp.dtype, device=inp.device
              )
-+            if stream is not None:
-+                inp.record_stream(stream)
-+                out.record_stream(stream)
++
              outs.append(out[:rows])
              pairs.append((out[: self.padded_rows], inp))
 +        if stream is not None:
@@ -1992,6 +2004,7 @@ index d4daeb67f..c2c2e1ad2 100644
 +        )
 +        if not inputs or comm is None or not self.can_gather_async(inputs[0].device):
 +            return self.gather_many(*tensors, padded_rows=padded_rows), (lambda: None)
++        inputs = [x.contiguous() for x in inputs]
 +        device = inputs[0].device
 +        side = _side_stream(device)
 +        ready_ev, done_ev = _next_gather_events(device)
@@ -2003,20 +2016,27 @@ index d4daeb67f..c2c2e1ad2 100644
 +            ready_event=ready_ev,
 +            done_event=done_ev,
 +        )
++        # Keep both contiguous sources and outputs alive until main waits on done_ev
++        # so the caching allocator cannot recycle them on main mid-transfer.
++        held: tuple[list[torch.Tensor], tuple[torch.Tensor, ...]] | None = (
++            inputs,
++            outs,
++        )
 +        waited = False
 +
 +        def wait() -> None:
-+            nonlocal waited
++            nonlocal waited, held
 +            if not waited:
 +                waited = True
 +                torch.cuda.current_stream(device).wait_event(done_ev)
++                held = None
 +
 +        return outs, wait
 +
      def gather_mxfp8(self, x_q, *extra: torch.Tensor):
          """All-gather this rank's L-row ``MXFP8Rows`` (and any ``extra`` L-row
          tensors, such as local top-k routes) in one grouped collective, returning
-@@ -289,6 +375,31 @@ class SPRows:
+@@ -289,6 +381,31 @@ class SPRows:
          )
          return (MXFP8Rows(rows, values, scales), *rest)
  
@@ -2048,7 +2068,7 @@ index d4daeb67f..c2c2e1ad2 100644
      def reduce_scatter(self, padded: torch.Tensor) -> torch.Tensor:
          """Sum a zero-padded Tp-row buffer over the ranks into this rank's rows."""
          if padded.shape[0] != self.padded_rows:
-@@ -353,51 +464,56 @@ class SPRows:
+@@ -353,51 +470,53 @@ class SPRows:
          use_cuda_streams = device.type == "cuda" and torch.cuda.is_available()
          main = torch.cuda.current_stream(device) if use_cuda_streams else None
          side = _side_stream(device) if use_cuda_streams else None
@@ -2073,9 +2093,6 @@ index d4daeb67f..c2c2e1ad2 100644
 -                if use_cuda_streams:
 -                    side.wait_stream(main)
 -                    with torch.cuda.stream(side):
-+        if use_cuda_streams:
-+            _record_stream(send, side)
-+            _record_stream(out, side)
 +        try:
 +            for lo, hi in zip(bounds, bounds[1:]):
 +                slice_rows = hi - lo
@@ -2144,7 +2161,7 @@ index d4daeb67f..c2c2e1ad2 100644
          return out
  
      def empty_padded(
-@@ -466,29 +582,32 @@ class SPRows:
+@@ -466,29 +585,32 @@ class SPRows:
          bounds = [local * i // slices for i in range(slices + 1)]
          main = torch.cuda.current_stream(device)
          side = _side_stream(device)
@@ -2165,7 +2182,7 @@ index d4daeb67f..c2c2e1ad2 100644
 -            with torch.cuda.stream(side):
 -                reduced = tensor_model_parallel_reduce_scatter(
 -                    piece.view(world * (hi - lo), *row_shape), dim=0
-+        _record_stream(out, side)
++        pieces: list[torch.Tensor] = []
 +        try:
 +            for lo, hi in zip(bounds, bounds[1:]):
 +                if hi == lo:
@@ -2178,6 +2195,7 @@ index d4daeb67f..c2c2e1ad2 100644
 -        if then is not None:
 -            then()
 -        main.wait_stream(side)
++                pieces.append(piece)
 +                for owner in range(world):
 +                    start, stop = owner * local + lo, owner * local + hi
 +                    real = max(0, min(stop, tokens) - start)
@@ -2185,7 +2203,6 @@ index d4daeb67f..c2c2e1ad2 100644
 +                        project(start, start + real, piece[owner, :real])
 +                    if real < hi - lo:
 +                        piece[owner, real:].zero_()
-+                _record_stream(piece, side)
 +                side.wait_stream(main)
 +                with torch.cuda.stream(side):
 +                    reduced = tensor_model_parallel_reduce_scatter(
@@ -2199,7 +2216,7 @@ index d4daeb67f..c2c2e1ad2 100644
          return out
  
      def _project_exchange(
-@@ -528,20 +647,24 @@ class SPRows:
+@@ -528,20 +650,22 @@ class SPRows:
          bounds = [local * i // slices for i in range(slices + 1)]
          main = torch.cuda.current_stream(device)
          side = _side_stream(device)
@@ -2217,8 +2234,6 @@ index d4daeb67f..c2c2e1ad2 100644
 -            then()
 -        # send and parts are freed only after this wait, on this stream.
 -        main.wait_stream(side)
-+        _record_stream(send, side)
-+        _record_stream(parts, side)
 +        try:
 +            for lo, hi in zip(bounds, bounds[1:]):
 +                if hi == lo:
@@ -2238,7 +2253,7 @@ index d4daeb67f..c2c2e1ad2 100644
          return parts
  
      def exchange_into(self, send: torch.Tensor, recv) -> None:
-@@ -560,6 +683,60 @@ class SPRows:
+@@ -560,6 +684,60 @@ class SPRows:
              return
          exchange_into(comm, send, recv, self.rank, self.world_size)
  
@@ -2299,7 +2314,7 @@ index d4daeb67f..c2c2e1ad2 100644
  
  # The attention's WO projection is reduce-scattered in two slices from this many
  # tokens, so half its reduce-scatter runs under the other half's projection.
-@@ -646,6 +823,23 @@ def project_reduce_scatter_current(
+@@ -646,6 +824,23 @@ def project_reduce_scatter_current(
  
  
  _SIDE_STREAMS: dict = {}
@@ -2323,19 +2338,3 @@ index d4daeb67f..c2c2e1ad2 100644
  
  
  def _tp_roce_comm():
-@@ -693,6 +887,12 @@ def _side_stream(device: torch.device) -> torch.cuda.Stream:
-     return _SIDE_STREAMS[device]
- 
- 
-+def _record_stream(tensor: torch.Tensor, stream: object) -> None:
-+    """Guard record_stream for CPU or mocked-stream unit tests."""
-+    if tensor.is_cuda and isinstance(stream, torch.cuda.Stream):
-+        tensor.record_stream(stream)
-+
-+
- def plan_rows(
-     num_tokens: int,
-     min_rows: int,
--- 
-2.43.0
-

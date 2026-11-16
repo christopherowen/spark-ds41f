@@ -1,4 +1,4 @@
-From 23d54be0c9341f8492cbe0a8e1742f17f71ddb8d Mon Sep 17 00:00:00 2001
+From f97310348c58c52e2d35cc5bbba4384ccf661e75 Mon Sep 17 00:00:00 2001
 From: Christopher Owen <3221756+christopherowen@users.noreply.github.com>
 Date: Mon, 16 Nov 2026 15:00:05 +0100
 Subject: [PATCH] perf(dsv41): harden Disk Engram Clock-Pro reader and
@@ -34,7 +34,7 @@ Upstream status: local candidate-60 patch
  create mode 100644 tests/kernels/test_deepseek_v41_postload_startup.py
 
 diff --git a/tests/kernels/test_deepseek_v41_engram_rows.py b/tests/kernels/test_deepseek_v41_engram_rows.py
-index 0fa6d38d1..e2098f566 100644
+index 0fa6d38d12..e2098f5664 100644
 --- a/tests/kernels/test_deepseek_v41_engram_rows.py
 +++ b/tests/kernels/test_deepseek_v41_engram_rows.py
 @@ -27,7 +27,7 @@ from vllm.models.deepseek_v4_1.engram_rows import (
@@ -250,7 +250,7 @@ index 0fa6d38d1..e2098f566 100644
 +        assert rows._reader is None
 diff --git a/tests/kernels/test_deepseek_v41_postload_startup.py b/tests/kernels/test_deepseek_v41_postload_startup.py
 new file mode 100644
-index 000000000..488e82c65
+index 0000000000..488e82c658
 --- /dev/null
 +++ b/tests/kernels/test_deepseek_v41_postload_startup.py
 @@ -0,0 +1,193 @@
@@ -448,7 +448,7 @@ index 000000000..488e82c65
 +    )
 +    assert res.returncode == 0, res.stderr
 diff --git a/tests/models/test_deepseek_v4_1_engram.py b/tests/models/test_deepseek_v4_1_engram.py
-index 65c8554ab..348ed4241 100644
+index 65c8554ab1..348ed42417 100644
 --- a/tests/models/test_deepseek_v4_1_engram.py
 +++ b/tests/models/test_deepseek_v4_1_engram.py
 @@ -209,6 +209,7 @@ def test_engram_descriptor_loading_preserves_ordinary_weights(
@@ -573,7 +573,7 @@ index 65c8554ab..348ed4241 100644
 +    assert callable(early_1_fn)
 +    assert np.array_equal(early_1_fn(), cached_ids[:, 1])
 diff --git a/vllm/model_executor/model_loader/utils.py b/vllm/model_executor/model_loader/utils.py
-index 11e6be5cf..3f0623f12 100644
+index 11e6be5cf8..3f0623f12b 100644
 --- a/vllm/model_executor/model_loader/utils.py
 +++ b/vllm/model_executor/model_loader/utils.py
 @@ -106,6 +106,9 @@ def process_weights_after_loading(
@@ -618,7 +618,7 @@ index 11e6be5cf..3f0623f12 100644
              # TODO(lucas): see if there is a way to unify the signatures
              # of process_weights_after_loading
 diff --git a/vllm/models/deepseek_v4_1/common/engram.py b/vllm/models/deepseek_v4_1/common/engram.py
-index f686e4631..fa51ae297 100644
+index f686e46317..fa51ae2973 100644
 --- a/vllm/models/deepseek_v4_1/common/engram.py
 +++ b/vllm/models/deepseek_v4_1/common/engram.py
 @@ -181,11 +181,8 @@ ENGRAM_TIMELINE = os.environ.get("SPARK_DS41F_ENGRAM_TIMELINE", "0") == "1"
@@ -657,7 +657,7 @@ index f686e4631..fa51ae297 100644
          weight_path, weight_offset = next(
              (p, off) for p, off, s in self._disk_sources if not s
 diff --git a/vllm/models/deepseek_v4_1/engram_rows/_reader.c b/vllm/models/deepseek_v4_1/engram_rows/_reader.c
-index 21849ffaa..f8820b18e 100644
+index 21849ffaaa..f8820b18ed 100644
 --- a/vllm/models/deepseek_v4_1/engram_rows/_reader.c
 +++ b/vllm/models/deepseek_v4_1/engram_rows/_reader.c
 @@ -118,6 +118,8 @@ typedef struct {
@@ -783,7 +783,7 @@ index 21849ffaa..f8820b18e 100644
          return PyErr_NoMemory();
      }
 diff --git a/vllm/models/deepseek_v4_1/engram_rows/_row_plan.h b/vllm/models/deepseek_v4_1/engram_rows/_row_plan.h
-index a9d8531a3..cf9233e1c 100644
+index a9d8531a3d..cf9233e1c7 100644
 --- a/vllm/models/deepseek_v4_1/engram_rows/_row_plan.h
 +++ b/vllm/models/deepseek_v4_1/engram_rows/_row_plan.h
 @@ -16,6 +16,7 @@
@@ -1084,7 +1084,7 @@ index a9d8531a3..cf9233e1c 100644
      size_t cursor = 0;
      while (cursor < reader->fragment_count) {
 diff --git a/vllm/models/deepseek_v4_1/engram_rows/host_hash.py b/vllm/models/deepseek_v4_1/engram_rows/host_hash.py
-index 27b9a41a9..af47d1476 100644
+index 27b9a41a99..af47d14768 100644
 --- a/vllm/models/deepseek_v4_1/engram_rows/host_hash.py
 +++ b/vllm/models/deepseek_v4_1/engram_rows/host_hash.py
 @@ -183,6 +183,7 @@ class HostEngramHash:
@@ -1196,7 +1196,7 @@ index 27b9a41a9..af47d1476 100644
          planes[:, live:, :] = -1
          return out
 diff --git a/vllm/models/deepseek_v4_1/engram_rows/rows.py b/vllm/models/deepseek_v4_1/engram_rows/rows.py
-index 9e4c135fb..b1d41eccb 100644
+index 9e4c135fbc..b1d41eccb5 100644
 --- a/vllm/models/deepseek_v4_1/engram_rows/rows.py
 +++ b/vllm/models/deepseek_v4_1/engram_rows/rows.py
 @@ -19,6 +19,7 @@ the Python side is.
@@ -1315,6 +1315,3 @@ index 9e4c135fb..b1d41eccb 100644
          if getattr(self, "_ids_mlocked", False):
              munlock_memory(self.ids.data_ptr(), self.ids.nbytes)
              self._ids_mlocked = False
--- 
-2.43.0
-

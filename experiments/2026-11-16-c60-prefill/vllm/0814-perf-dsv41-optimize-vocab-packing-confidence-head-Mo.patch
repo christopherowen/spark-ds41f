@@ -1,4 +1,4 @@
-From 28ae0f438e070bd615e86591cfb70928879fb4c3 Mon Sep 17 00:00:00 2001
+From bc012de6a26afdcd1ad8f9eedb69c8962ba33694 Mon Sep 17 00:00:00 2001
 From: Christopher Owen <3221756+christopherowen@users.noreply.github.com>
 Date: Mon, 16 Nov 2026 15:00:04 +0100
 Subject: [PATCH] perf(dsv41): optimize vocab packing, confidence head, MoE,
@@ -51,7 +51,7 @@ Upstream status: local candidate-60 patch
  26 files changed, 2643 insertions(+), 500 deletions(-)
 
 diff --git a/tests/kernels/moe/test_deepseek_v41_tilelang_moe.py b/tests/kernels/moe/test_deepseek_v41_tilelang_moe.py
-index afc08d3a9..03c8a4d04 100644
+index afc08d3a94..03c8a4d045 100644
 --- a/tests/kernels/moe/test_deepseek_v41_tilelang_moe.py
 +++ b/tests/kernels/moe/test_deepseek_v41_tilelang_moe.py
 @@ -545,6 +545,9 @@ def test_tile_height_follows_routes_per_expert():
@@ -171,7 +171,7 @@ index afc08d3a9..03c8a4d04 100644
      comb_src = moe_combine_v41(
          5120, 6, shared=True, weighted=True, out_dtype=T.bfloat16
 diff --git a/tests/kernels/quantization/test_deepseek_v41_tilelang_vocab.py b/tests/kernels/quantization/test_deepseek_v41_tilelang_vocab.py
-index 0ee26baba..e7d44eca9 100644
+index 0ee26baba4..e7d44eca9d 100644
 --- a/tests/kernels/quantization/test_deepseek_v41_tilelang_vocab.py
 +++ b/tests/kernels/quantization/test_deepseek_v41_tilelang_vocab.py
 @@ -755,3 +755,197 @@ def test_screen_tile_config_128_uses_matched_two_stage_pipeline():
@@ -373,7 +373,7 @@ index 0ee26baba..e7d44eca9 100644
 +        assert torch.equal(g_sampled[req_idx, :n_tok], exp_sampled[req_idx, :n_tok])
 +    assert torch.equal(g_alts, exp_alts)
 diff --git a/tests/kernels/test_deepseek_v41_tilelang_confidence.py b/tests/kernels/test_deepseek_v41_tilelang_confidence.py
-index 05d1bec60..dfa05dc57 100644
+index 05d1bec608..dfa05dc575 100644
 --- a/tests/kernels/test_deepseek_v41_tilelang_confidence.py
 +++ b/tests/kernels/test_deepseek_v41_tilelang_confidence.py
 @@ -212,4 +212,7 @@ def test_declared_as_the_head_calls_it():
@@ -386,7 +386,7 @@ index 05d1bec60..dfa05dc57 100644
 +        (confidence.dspark_confidence_calibrate_kernel, (HIDDEN, RANK, 5), {}),
 +    ]
 diff --git a/tests/v1/worker/test_dspark_greedy_markov.py b/tests/v1/worker/test_dspark_greedy_markov.py
-index 9e611f053..8a15e85a6 100644
+index 9e611f0531..8a15e85a6e 100644
 --- a/tests/v1/worker/test_dspark_greedy_markov.py
 +++ b/tests/v1/worker/test_dspark_greedy_markov.py
 @@ -480,3 +480,274 @@ def test_vocab_parallel_markov_dispatch_and_warmups(tp_size, monkeypatch):
@@ -665,7 +665,7 @@ index 9e611f053..8a15e85a6 100644
 +    )
 +    assert recorded == [("dispatch", False), ("gen", 5)]
 diff --git a/vllm/models/deepseek_v4_1/tilelang/activation.py b/vllm/models/deepseek_v4_1/tilelang/activation.py
-index f2ab202af..ab4d1d8eb 100644
+index f2ab202af7..ab4d1d8ebc 100644
 --- a/vllm/models/deepseek_v4_1/tilelang/activation.py
 +++ b/vllm/models/deepseek_v4_1/tilelang/activation.py
 @@ -90,15 +90,12 @@ def swiglu_clamp_cast_kernel(n: int, limit: float, threads: int = 128):
@@ -698,7 +698,7 @@ index f2ab202af..ab4d1d8eb 100644
      return activation_swiglu_clamp_cast
  
 diff --git a/vllm/models/deepseek_v4_1/tilelang/confidence.py b/vllm/models/deepseek_v4_1/tilelang/confidence.py
-index da2e03edb..573b476f1 100644
+index da2e03edb7..573b476f14 100644
 --- a/vllm/models/deepseek_v4_1/tilelang/confidence.py
 +++ b/vllm/models/deepseek_v4_1/tilelang/confidence.py
 @@ -123,17 +123,134 @@ def dspark_confidence_kernel(hidden: int, rank: int, threads: int = 128):
@@ -947,7 +947,7 @@ index da2e03edb..573b476f1 100644
      "dspark_confidence_kernel",
  ]
 diff --git a/vllm/models/deepseek_v4_1/tilelang/gemm.py b/vllm/models/deepseek_v4_1/tilelang/gemm.py
-index 00389eb2d..ea0d8bc8d 100644
+index 00389eb2de..ea0d8bc8d2 100644
 --- a/vllm/models/deepseek_v4_1/tilelang/gemm.py
 +++ b/vllm/models/deepseek_v4_1/tilelang/gemm.py
 @@ -50,6 +50,17 @@ def pack_weight_tiles(
@@ -1086,7 +1086,7 @@ index 00389eb2d..ea0d8bc8d 100644
          Q[row, col + v] = quantized[v]
  
 diff --git a/vllm/models/deepseek_v4_1/tilelang/moe.py b/vllm/models/deepseek_v4_1/tilelang/moe.py
-index 8c6b059e1..476278a89 100644
+index 8c6b059e1b..476278a892 100644
 --- a/vllm/models/deepseek_v4_1/tilelang/moe.py
 +++ b/vllm/models/deepseek_v4_1/tilelang/moe.py
 @@ -56,6 +56,7 @@ from .gemm import (
@@ -1979,7 +1979,7 @@ index 8c6b059e1..476278a89 100644
          if callable(shared):
              shared = shared()
 diff --git a/vllm/models/deepseek_v4_1/tilelang/router.py b/vllm/models/deepseek_v4_1/tilelang/router.py
-index 908606af1..b1d4cf860 100644
+index 908606af1c..b1d4cf860c 100644
 --- a/vllm/models/deepseek_v4_1/tilelang/router.py
 +++ b/vllm/models/deepseek_v4_1/tilelang/router.py
 @@ -1079,6 +1079,7 @@ class RoutedRows(NamedTuple):
@@ -2030,7 +2030,7 @@ index 908606af1..b1d4cf860 100644
      return None
  
 diff --git a/vllm/models/deepseek_v4_1/tilelang/scale_codes.py b/vllm/models/deepseek_v4_1/tilelang/scale_codes.py
-index 5d6c9b0cc..6e814594d 100644
+index 5d6c9b0ccb..6e814594d0 100644
 --- a/vllm/models/deepseek_v4_1/tilelang/scale_codes.py
 +++ b/vllm/models/deepseek_v4_1/tilelang/scale_codes.py
 @@ -13,6 +13,7 @@ from typing import NamedTuple
@@ -2190,7 +2190,7 @@ index 5d6c9b0cc..6e814594d 100644
 +    flat_bytes = compact_bytes.view(-1, block_N)
 +    return flat_bytes.view(torch.uint16), flat_bytes, offsets, base
 diff --git a/vllm/models/deepseek_v4_1/tilelang/vocab.py b/vllm/models/deepseek_v4_1/tilelang/vocab.py
-index 9814aa19f..840927396 100644
+index 9814aa19fa..8409273963 100644
 --- a/vllm/models/deepseek_v4_1/tilelang/vocab.py
 +++ b/vllm/models/deepseek_v4_1/tilelang/vocab.py
 @@ -42,6 +42,10 @@ HALF = GROUP // 2  # one code byte holds a column of each half
@@ -3214,7 +3214,7 @@ index 9814aa19f..840927396 100644
  
  
 diff --git a/vllm/v1/worker/gpu/buffer_utils.py b/vllm/v1/worker/gpu/buffer_utils.py
-index e0209af9a..281470476 100644
+index e0209af9aa..2814704763 100644
 --- a/vllm/v1/worker/gpu/buffer_utils.py
 +++ b/vllm/v1/worker/gpu/buffer_utils.py
 @@ -163,9 +163,15 @@ class StagedWriteTensor:
@@ -3322,7 +3322,7 @@ index e0209af9a..281470476 100644
              indices.extend(t._staged_write_indices)
              starts.extend(t._staged_write_starts)
 diff --git a/vllm/v1/worker/gpu/input_batch.py b/vllm/v1/worker/gpu/input_batch.py
-index b2d271713..d85cc7a09 100644
+index b2d2717137..d85cc7a094 100644
 --- a/vllm/v1/worker/gpu/input_batch.py
 +++ b/vllm/v1/worker/gpu/input_batch.py
 @@ -205,8 +205,14 @@ class InputBatch:
@@ -3406,7 +3406,7 @@ index b2d271713..d85cc7a09 100644
      input_batch.positions.copy_(torch.from_numpy(local_pos + context_len))
  
 diff --git a/vllm/v1/worker/gpu/model_runner.py b/vllm/v1/worker/gpu/model_runner.py
-index 1e0603d65..059a06e7e 100644
+index 1e0603d65b..059a06e7ed 100644
 --- a/vllm/v1/worker/gpu/model_runner.py
 +++ b/vllm/v1/worker/gpu/model_runner.py
 @@ -1266,6 +1266,46 @@ class GPUModelRunner(LoRAModelRunnerMixin):
@@ -3592,7 +3592,7 @@ index 1e0603d65..059a06e7e 100644
              if self.pcp_manager is not None:
                  input_batch = self.pcp_manager.prepare_inputs_to_capture(input_batch)
 diff --git a/vllm/v1/worker/gpu/sample/sampler.py b/vllm/v1/worker/gpu/sample/sampler.py
-index 6ffcce85f..2ab76349d 100644
+index 6ffcce85f6..2ab76349d2 100644
 --- a/vllm/v1/worker/gpu/sample/sampler.py
 +++ b/vllm/v1/worker/gpu/sample/sampler.py
 @@ -346,6 +346,8 @@ class Sampler:
@@ -3655,7 +3655,7 @@ index 6ffcce85f..2ab76349d 100644
          return self.sampling_states.apply_top_k_top_p(
              logits, expanded_idx_mapping, idx_mapping_np
 diff --git a/vllm/v1/worker/gpu/sample/sink.py b/vllm/v1/worker/gpu/sample/sink.py
-index 0db00b021..eb75e7480 100644
+index 0db00b0214..eb75e74803 100644
 --- a/vllm/v1/worker/gpu/sample/sink.py
 +++ b/vllm/v1/worker/gpu/sample/sink.py
 @@ -194,6 +194,29 @@ class SinkSampler:
@@ -3725,7 +3725,7 @@ index 0db00b021..eb75e7480 100644
          self,
          logits: torch.Tensor,
 diff --git a/vllm/v1/worker/gpu/sample/tilelang_auxiliary.py b/vllm/v1/worker/gpu/sample/tilelang_auxiliary.py
-index c02526cbe..8b6675a45 100644
+index c02526cbe9..8b6675a452 100644
 --- a/vllm/v1/worker/gpu/sample/tilelang_auxiliary.py
 +++ b/vllm/v1/worker/gpu/sample/tilelang_auxiliary.py
 @@ -92,7 +92,7 @@ def bad_words_kernel(
@@ -3738,7 +3738,7 @@ index c02526cbe..8b6675a45 100644
                  end = offsets[req[0], word + 1]
                  prefix = end - start - 1
 diff --git a/vllm/v1/worker/gpu/sample/tilelang_bias.py b/vllm/v1/worker/gpu/sample/tilelang_bias.py
-index 48b55a538..354309835 100644
+index 48b55a5383..3543098354 100644
 --- a/vllm/v1/worker/gpu/sample/tilelang_bias.py
 +++ b/vllm/v1/worker/gpu/sample/tilelang_bias.py
 @@ -162,13 +162,27 @@ def bias_kernel(
@@ -3775,7 +3775,7 @@ index 48b55a538..354309835 100644
              allowed_ids = T.alloc_local((per,), "int32")
              values = T.alloc_local((per,), "float32")
 diff --git a/vllm/v1/worker/gpu/sample/tilelang_controls.py b/vllm/v1/worker/gpu/sample/tilelang_controls.py
-index 31f0fa7e8..da2a30b55 100644
+index 31f0fa7e86..da2a30b555 100644
 --- a/vllm/v1/worker/gpu/sample/tilelang_controls.py
 +++ b/vllm/v1/worker/gpu/sample/tilelang_controls.py
 @@ -175,7 +175,12 @@ def min_p_kernel(
@@ -3813,7 +3813,7 @@ index 31f0fa7e8..da2a30b55 100644
                  for col in T.Parallel(block):
                      index = blk * block + col
 diff --git a/vllm/v1/worker/gpu/sample/tilelang_sampling.py b/vllm/v1/worker/gpu/sample/tilelang_sampling.py
-index 05dbc6718..531a30de5 100644
+index 05dbc6718f..531a30de57 100644
 --- a/vllm/v1/worker/gpu/sample/tilelang_sampling.py
 +++ b/vllm/v1/worker/gpu/sample/tilelang_sampling.py
 @@ -925,6 +925,113 @@ def _block_best(best, best_index, take, partial, partial_index, tx, threads):
@@ -4070,7 +4070,7 @@ index 05dbc6718..531a30de5 100644
              _call(sink_merge_kernel, True, num_alternates + 1, num_alternates),
              _call(sink_merge_kernel, False, 0, num_alternates),
 diff --git a/vllm/v1/worker/gpu/sample/tilelang_thinking.py b/vllm/v1/worker/gpu/sample/tilelang_thinking.py
-index 106b079cc..7b7adab8c 100644
+index 106b079cc1..7b7adab8ca 100644
 --- a/vllm/v1/worker/gpu/sample/tilelang_thinking.py
 +++ b/vllm/v1/worker/gpu/sample/tilelang_thinking.py
 @@ -190,15 +190,16 @@ def thinking_kernel(
@@ -4093,7 +4093,7 @@ index 106b079cc..7b7adab8c 100644
                  last_end[0] = cached_end[req]
                  for pos in T.serial(
 diff --git a/vllm/v1/worker/gpu/spec_decode/dflash/speculator.py b/vllm/v1/worker/gpu/spec_decode/dflash/speculator.py
-index 5f025021b..ecdd54851 100644
+index 5f025021b0..ecdd54851b 100644
 --- a/vllm/v1/worker/gpu/spec_decode/dflash/speculator.py
 +++ b/vllm/v1/worker/gpu/spec_decode/dflash/speculator.py
 @@ -542,6 +542,7 @@ class DFlashSpeculator(DraftModelSpeculator):
@@ -4135,7 +4135,7 @@ index 5f025021b..ecdd54851 100644
  
          return self.draft_tokens[:num_reqs]
 diff --git a/vllm/v1/worker/gpu/spec_decode/dspark/speculator.py b/vllm/v1/worker/gpu/spec_decode/dspark/speculator.py
-index 710d549be..0a03b9d4a 100644
+index 710d549be2..0a03b9d4a4 100644
 --- a/vllm/v1/worker/gpu/spec_decode/dspark/speculator.py
 +++ b/vllm/v1/worker/gpu/spec_decode/dspark/speculator.py
 @@ -83,6 +83,123 @@ def _needs_logits_for_acceptance(speculator: "DSparkSpeculator") -> bool:
@@ -4473,7 +4473,7 @@ index 710d549be..0a03b9d4a 100644
 +            num_speculative_tokens=num_speculative_tokens,
 +        )
 diff --git a/vllm/v1/worker/gpu/spec_decode/greedy_verification.py b/vllm/v1/worker/gpu/spec_decode/greedy_verification.py
-index f55ca0ed7..99fc25981 100644
+index f55ca0ed77..99fc259818 100644
 --- a/vllm/v1/worker/gpu/spec_decode/greedy_verification.py
 +++ b/vllm/v1/worker/gpu/spec_decode/greedy_verification.py
 @@ -88,23 +88,36 @@ def vocab_parallel_pairs_from_head(
@@ -4517,7 +4517,7 @@ index f55ca0ed7..99fc25981 100644
  
  
 diff --git a/vllm/v1/worker/gpu/spec_decode/rejection_sampler.py b/vllm/v1/worker/gpu/spec_decode/rejection_sampler.py
-index 463022c3a..553cbd9fa 100644
+index 463022c3aa..553cbd9fa3 100644
 --- a/vllm/v1/worker/gpu/spec_decode/rejection_sampler.py
 +++ b/vllm/v1/worker/gpu/spec_decode/rejection_sampler.py
 @@ -167,6 +167,8 @@ class RejectionSampler:
@@ -4555,7 +4555,7 @@ index 463022c3a..553cbd9fa 100644
          cut = None
          if sink is not None:
 diff --git a/vllm/v1/worker/gpu/tilelang_inputs.py b/vllm/v1/worker/gpu/tilelang_inputs.py
-index 436c94e57..4d20a0f3c 100644
+index 436c94e576..4d20a0f3c5 100644
 --- a/vllm/v1/worker/gpu/tilelang_inputs.py
 +++ b/vllm/v1/worker/gpu/tilelang_inputs.py
 @@ -814,6 +814,107 @@ def flatten_sampled_calls() -> list:
@@ -4666,6 +4666,3 @@ index 436c94e57..4d20a0f3c 100644
  # --- Per-request row scatters ---------------------------------------------------
  
  _SCATTER_THREADS = 128
--- 
-2.43.0
-

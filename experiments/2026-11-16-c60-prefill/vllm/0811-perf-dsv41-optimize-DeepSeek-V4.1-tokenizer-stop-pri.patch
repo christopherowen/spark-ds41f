@@ -1,4 +1,4 @@
-From 4fb08255a5dca486a5bc39e88b40c44a8b9ffa02 Mon Sep 17 00:00:00 2001
+From 1994354457984e2d74e2529e71429bcf9a12cce8 Mon Sep 17 00:00:00 2001
 From: Christopher Owen <3221756+christopherowen@users.noreply.github.com>
 Date: Mon, 16 Nov 2026 15:00:01 +0100
 Subject: [PATCH] perf(dsv41): optimize DeepSeek V4.1 tokenizer, stop priming,
@@ -35,7 +35,7 @@ Upstream status: local candidate-60 patch
  9 files changed, 973 insertions(+), 129 deletions(-)
 
 diff --git a/tests/detokenizer/test_check_stop_strings.py b/tests/detokenizer/test_check_stop_strings.py
-index 2fae373f6..084ffeff2 100644
+index 2fae373f60..084ffeff2e 100644
 --- a/tests/detokenizer/test_check_stop_strings.py
 +++ b/tests/detokenizer/test_check_stop_strings.py
 @@ -74,3 +74,55 @@ def test_no_match_and_empty_inputs_return_none():
@@ -95,7 +95,7 @@ index 2fae373f6..084ffeff2 100644
 +    incomplete_end = [10] * 50 + [20, 21]
 +    assert prompt_suffix_to_prime(tok, incomplete_end, True) == incomplete_end
 diff --git a/tests/entrypoints/anthropic/test_anthropic_messages_conversion.py b/tests/entrypoints/anthropic/test_anthropic_messages_conversion.py
-index ef12d9144..630ac427d 100644
+index ef12d91449..630ac427d9 100644
 --- a/tests/entrypoints/anthropic/test_anthropic_messages_conversion.py
 +++ b/tests/entrypoints/anthropic/test_anthropic_messages_conversion.py
 @@ -1830,3 +1830,84 @@ class TestClientErrorResponses:
@@ -184,7 +184,7 @@ index ef12d9144..630ac427d 100644
 +        assert '"name": "db_query"' in rest
 +        assert "Matched:" in rest
 diff --git a/tests/tokenizers_/test_deepseek_v41.py b/tests/tokenizers_/test_deepseek_v41.py
-index bf63aadd5..70c9d5e4d 100644
+index bf63aadd5f..70c9d5e4df 100644
 --- a/tests/tokenizers_/test_deepseek_v41.py
 +++ b/tests/tokenizers_/test_deepseek_v41.py
 @@ -13,6 +13,7 @@ from vllm.entrypoints.openai.chat_completion.protocol import ChatCompletionReque
@@ -506,7 +506,7 @@ index bf63aadd5..70c9d5e4d 100644
 +    )
 +    assert "ok" in rendered
 diff --git a/vllm/entrypoints/anthropic/serving.py b/vllm/entrypoints/anthropic/serving.py
-index ab25d537c..ddf45d04a 100644
+index ab25d537c0..ddf45d04a5 100644
 --- a/vllm/entrypoints/anthropic/serving.py
 +++ b/vllm/entrypoints/anthropic/serving.py
 @@ -509,11 +509,21 @@ class AnthropicServingMessages(OpenAIServingChat):
@@ -549,7 +549,7 @@ index ab25d537c..ddf45d04a 100644
      def _build_base_request(
          cls,
 diff --git a/vllm/renderers/base.py b/vllm/renderers/base.py
-index 4aca17fa4..2f7eedf9c 100644
+index 4aca17fa43..2f7eedf9c4 100644
 --- a/vllm/renderers/base.py
 +++ b/vllm/renderers/base.py
 @@ -225,6 +225,8 @@ class BaseRenderer(ABC, Generic[_T]):
@@ -570,7 +570,7 @@ index 4aca17fa4..2f7eedf9c 100644
      def _warmup_mm_processor(
          self,
 diff --git a/vllm/tokenizers/deepseek_v41.py b/vllm/tokenizers/deepseek_v41.py
-index 36aadd045..cbe30163a 100644
+index 36aadd045b..cbe30163aa 100644
 --- a/vllm/tokenizers/deepseek_v41.py
 +++ b/vllm/tokenizers/deepseek_v41.py
 @@ -4,16 +4,19 @@
@@ -1212,7 +1212,7 @@ index 36aadd045..cbe30163a 100644
              return len(self.encode(""))
  
 diff --git a/vllm/tokenizers/deepseek_v41_encoding.py b/vllm/tokenizers/deepseek_v41_encoding.py
-index 1f39bf47a..a5ea571db 100644
+index 1f39bf47ae..a5ea571db6 100644
 --- a/vllm/tokenizers/deepseek_v41_encoding.py
 +++ b/vllm/tokenizers/deepseek_v41_encoding.py
 @@ -23,6 +23,11 @@ USER_SP_TOKEN = "<｜User｜>"
@@ -1350,7 +1350,7 @@ index 1f39bf47a..a5ea571db 100644
          )
  
 diff --git a/vllm/tokenizers/registry.py b/vllm/tokenizers/registry.py
-index 46446ecd6..016476533 100644
+index 46446ecd6d..0164765339 100644
 --- a/vllm/tokenizers/registry.py
 +++ b/vllm/tokenizers/registry.py
 @@ -282,10 +282,19 @@ def get_tokenizer(
@@ -1378,7 +1378,7 @@ index 46446ecd6..016476533 100644
  
      tokenizer = tokenizer_cls_.from_pretrained(tokenizer_name, *args, **kwargs)
 diff --git a/vllm/v1/engine/detokenizer.py b/vllm/v1/engine/detokenizer.py
-index f04fa30a1..114be4d75 100644
+index f04fa30a18..114be4d752 100644
 --- a/vllm/v1/engine/detokenizer.py
 +++ b/vllm/v1/engine/detokenizer.py
 @@ -27,6 +27,45 @@ USE_FAST_DETOKENIZER = version.parse(tokenizers.__version__) >= version.parse("0
@@ -1440,6 +1440,3 @@ index f04fa30a1..114be4d75 100644
              skip_special_tokens=self.skip_special_tokens,
          )
  
--- 
-2.43.0
-
