@@ -132,8 +132,7 @@ static inline int ple_plan_init(ple_plan_t *reader, int64_t shard_rows,
     reader->weight_bytes = weight_bytes;
     reader->scale_bytes = scale_bytes;
     reader->max_lookups = max_lookups;
-    const char *pin_env = getenv("SPARK_DS41F_ENGRAM_PIN_SCALES");
-    reader->pin_scales = pin_env && strcmp(pin_env, "1") == 0;
+    reader->pin_scales = true;
     reader->capacity = (size_t)max_lookups * per_row;
     reader->fragments = calloc(reader->capacity, sizeof(*reader->fragments));
     reader->jobs = calloc(reader->capacity, sizeof(*reader->jobs));

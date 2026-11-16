@@ -124,6 +124,7 @@ class SwitchedTopologyTest(unittest.TestCase):
         self.assertEqual(topology.problems(cluster, nodes), [])
 
     def test_switched_maps_accept_three_to_eight_nodes_and_reject_outside_bounds(self):
+        self.assertEqual(topology.problems(*fixture(count=2)), [])
         for count in (3, 4, 5, 6, 7, 8):
             with self.subTest(count=count):
                 cluster, nodes = fixture(count=count)
@@ -138,7 +139,7 @@ class SwitchedTopologyTest(unittest.TestCase):
                     self.assertEqual(env['NCCL_CUMEM_ENABLE'], '0')
                     self.assertEqual(env['NCCL_MAX_NCHANNELS'], '8')
                     self.assertEqual(env['SPARKNET_ROCE_ALLGATHER_MAX_BYTES'], '4194304')
-        for bad_count in (2, 9):
+        for bad_count in (1, 9):
             with self.subTest(bad_count=bad_count):
                 cluster, nodes = fixture(count=bad_count)
                 self.assertTrue(topology.problems(cluster, nodes))

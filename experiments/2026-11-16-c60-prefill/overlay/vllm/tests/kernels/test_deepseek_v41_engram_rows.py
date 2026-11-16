@@ -1037,7 +1037,7 @@ def test_pack_engram_columns_and_compacted_column_map_match_two_plane_reader(
     )
     assert os.path.getsize(packed_path) == packed_table_bytes(int(owned_rows.sum()))
 
-    two_plane = _rows(paths, tokens=32, columns=col_mask)
+    two_plane = _rows(paths, tokens=32, columns=col_mask, pin_scales=False)
     packed_rows = EngramDiskRows(
         device="cuda",
         table_rows=TABLE_ROWS,
@@ -1376,7 +1376,7 @@ def test_row_cache_clock_pro_prefill_shield_preserves_decode_working_set():
 
 
 def test_two_plane_pinned_scales_halves_read_calls_and_matches_reference():
-    """Opt-in scale plane pinning in two-plane mode matches unpinned two-plane and
+    """Default-on scale plane pinning in two-plane mode matches unpinned two-plane and
     packed outputs bit-for-bit while eliminating scale.bin O_DIRECT read calls."""
     codes, scales, paths = _write_table(_table_dir(), seed=113)
     unpinned = EngramDiskRows(
@@ -1397,8 +1397,8 @@ def test_two_plane_pinned_scales_halves_read_calls_and_matches_reference():
         max_lookups=16 * HEADS,
         columns=TP3_RANK1,
         cache_rows=1024,
-        pin_scales=True,
     )
+    assert pinned.pin_scales is True
     for r in (unpinned, pinned):
         r.add_source(paths[0], WEIGHT_OFFSET, scale=False)
         r.add_source(paths[1], SCALE_OFFSET, scale=True)
@@ -1440,3 +1440,32 @@ def test_two_plane_pinned_scales_halves_read_calls_and_matches_reference():
     finally:
         unpinned.close()
         pinned.close()
+
+
+def test_engram_disk_rows_stage_bounds_and_idempotent_close():
+    import pytest
+
+    rows = EngramDiskRows(
+        device="cuda",
+        table_rows=TABLE_ROWS,
+        shard_start=0,
+        shard_end=TABLE_ROWS,
+        max_lookups=16,
+        columns=TP3_RANK1,
+        cache_rows=0,
+    )
+    stream = torch.cuda.current_stream()
+    try:
+        good_ids = torch.zeros(16, dtype=torch.int64, device="cuda")
+        short_ids = torch.zeros(4, dtype=torch.int64, device="cuda")
+        with pytest.raises(ValueError, match="exceeds max_lookups"):
+            rows.stage(stream, good_ids, 17)
+        with pytest.raises(ValueError, match="exceeds max_lookups"):
+            rows.stage(stream, good_ids, -1)
+        with pytest.raises(ValueError, match="Engram device IDs"):
+            rows.stage(stream, short_ids, 8)
+    finally:
+        rows.close()
+        rows.close()
+        assert rows._closed is True
+        assert rows._reader is None

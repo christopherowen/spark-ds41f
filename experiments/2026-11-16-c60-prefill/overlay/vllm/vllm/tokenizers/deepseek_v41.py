@@ -16,6 +16,7 @@ from vllm.entrypoints.chat_utils import ChatCompletionMessageParam
 from .deepseek_v41_encoding import (
     ASSISTANT_SP_TOKEN,
     IMAGE_PLACEHOLDER,
+    IMAGE_PLACEHOLDER_TEXT,
     REASONING_EFFORT_MAPPINGS,
     USER_SP_TOKEN,
     encode_messages,
@@ -232,8 +233,8 @@ class _ControlSpellings:
     encoded without the added vocabulary, with the sentinels restored. This
     matches DeepSeek's encoder, which encodes a typed spelling as plain text.
 
-    The image placeholder is left alone: `_normalize_messages` already rejects it
-    in text, and image parts render it.
+    The image placeholder is left alone: image parts render it, and
+    `_normalize_messages` escapes the typed spelling in text to ordinary text.
     """
 
     @staticmethod
@@ -355,10 +356,39 @@ def _plain_text_encoder(tokenizer: Any) -> Callable[[list[str]], list[list[int]]
     return encode
 
 
+def _escape_image_token_literal(value: Any, key: str | None = None) -> Any:
+    """Escape the image token's literal spelling in request text to plain text.
+
+    The image token in the prompt comes only from image content blocks. The
+    token's literal spelling typed into a message, text part, tool result,
+    reasoning or tool-call arguments is ordinary text: escape it to the
+    ordinary-text spelling, which is in no added-token vocabulary, so the
+    encoder cannot mistake it for an image reference (spark-ds41f issue #1031).
+    """
+    if isinstance(value, str):
+        if key == "arguments" and IMAGE_PLACEHOLDER not in value and "\\" in value:
+            decoded = _decode_arguments(value)
+            if isinstance(decoded, dict):
+                return _escape_image_token_literal(decoded)
+        return value.replace(IMAGE_PLACEHOLDER, IMAGE_PLACEHOLDER_TEXT)
+    if isinstance(value, Mapping):
+        return {
+            k: item
+            if k in _PROTOCOL_KEYS
+            else _escape_image_token_literal(item, k)
+            for k, item in value.items()
+        }
+    if isinstance(value, (list, tuple)):
+        return type(value)(_escape_image_token_literal(item) for item in value)
+    return value
+
+
 def _normalize_messages(
     messages: list[ChatCompletionMessageParam],
 ) -> list[dict[str, Any]]:
     result = [dict(message) for message in messages]
+    if any(IMAGE_PLACEHOLDER in text for text in _strings(result)):
+        result = [_escape_image_token_literal(message) for message in result]
     for message in result:
         role = message.get("role")
         if role not in (
@@ -375,38 +405,58 @@ def _normalize_messages(
         if "reasoning" in message:
             message["reasoning_content"] = message["reasoning"]
         content = message.get("content")
-        # Image tokens come only from image parts, as the reference requires.
-        if isinstance(content, str) and IMAGE_PLACEHOLDER in content:
-            raise ValueError(
-                f"Message content contains image special token '{IMAGE_PLACEHOLDER}'. "
-                "Images should be provided as image content blocks."
-            )
-        reasoning = message.get("reasoning_content")
-        if isinstance(reasoning, str) and IMAGE_PLACEHOLDER in reasoning:
-            raise ValueError(
-                f"reasoning_content contains image special token '{IMAGE_PLACEHOLDER}'"
-            )
         if isinstance(content, list):
-            parts = []
-            for block in content:
-                part_type = block.get("type")
-                if part_type in ("text", "input_text", "output_text"):
-                    text = block.get("text", "")
-                    if IMAGE_PLACEHOLDER in text:
+            has_tool_ref = role == "tool" and any(
+                isinstance(block, Mapping) and block.get("type") == "tool_reference"
+                for block in content
+            )
+            if has_tool_ref:
+                structured_parts: list[dict[str, Any]] = []
+                for block in content:
+                    if not isinstance(block, Mapping):
                         raise ValueError(
-                            "Text block contains image placeholder "
-                            f"'{IMAGE_PLACEHOLDER}'. Images should be separate "
-                            "content blocks."
+                            "DeepSeek V4.1 supports text and image content only; "
+                            f"got {type(block).__name__!r}"
                         )
-                    parts.append(text)
-                elif part_type in ("image_url", "input_image", "image_pil"):
-                    parts.append(IMAGE_PLACEHOLDER)
-                else:
-                    raise ValueError(
-                        "DeepSeek V4.1 supports text and image content only; "
-                        f"got {part_type!r}"
-                    )
-            message["content"] = "\n\n".join(parts)
+                    part_type = block.get("type")
+                    if part_type in ("text", "input_text", "output_text"):
+                        structured_parts.append(
+                            {"type": "text", "text": block.get("text") or ""}
+                        )
+                    elif part_type in ("image_url", "input_image", "image_pil"):
+                        structured_parts.append(
+                            {"type": "text", "text": IMAGE_PLACEHOLDER}
+                        )
+                    elif part_type == "tool_reference":
+                        ref_name = block.get("name") or block.get("tool_name") or ""
+                        structured_parts.append(
+                            {"type": "tool_reference", "name": str(ref_name)}
+                        )
+                    else:
+                        raise ValueError(
+                            "DeepSeek V4.1 supports text and image content only; "
+                            f"got {part_type!r}"
+                        )
+                message["content"] = structured_parts
+            else:
+                parts = []
+                for block in content:
+                    if not isinstance(block, Mapping):
+                        raise ValueError(
+                            "DeepSeek V4.1 supports text and image content only; "
+                            f"got {type(block).__name__!r}"
+                        )
+                    part_type = block.get("type")
+                    if part_type in ("text", "input_text", "output_text"):
+                        parts.append(block.get("text") or "")
+                    elif part_type in ("image_url", "input_image", "image_pil"):
+                        parts.append(IMAGE_PLACEHOLDER)
+                    else:
+                        raise ValueError(
+                            "DeepSeek V4.1 supports text and image content only; "
+                            f"got {part_type!r}"
+                        )
+                message["content"] = "\n\n".join(parts)
     return result
 
 

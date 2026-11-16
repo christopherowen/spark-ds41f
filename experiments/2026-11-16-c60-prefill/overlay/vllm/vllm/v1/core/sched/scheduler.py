@@ -169,11 +169,6 @@ class Scheduler(SchedulerInterface):
     _DEEP_CONTEXT_CHUNK_GRID: int = 2048
     _DEEP_CONTEXT_CHUNK_TIER: int = 4096
     _ULTRA_DEEP_CONTEXT_CHUNK_TIER: int = 2048
-    # Opt-in: below 256K, with runnable decodes and prefill yield, cap the chunk
-    # at SPARK_DS41F_PREFILL_MIX_CHUNK tokens (a multiple of the 2,048 grid).
-    # Unset or invalid (0) keeps the full long_prefill_token_threshold, and solo
-    # prefills never change.
-    _MIX_CHUNK_TIER: int = 0
     _PREFILL_DECODE_INTERLEAVE_STEPS: int = 2
     _PREFILL_DECODE_STALL_THRESHOLD_S: float = 1.0
     _PREFILL_STEP_FIXED_S: float = 0.1517
@@ -1031,10 +1026,7 @@ class Scheduler(SchedulerInterface):
         When no decode requests are runnable, returns
         ``long_prefill_token_threshold`` unchanged. Below 256K context
         (``num_computed_tokens < 262144``) it is also unchanged, so moderate
-        contexts incur zero extra chunk splits, unless the opt-in
-        ``SPARK_DS41F_PREFILL_MIX_CHUNK`` cap is set: then, with runnable decodes
-        and ``prefill_yield == \"short\"``, the chunk is capped at that value to
-        bound the decode stall of one chunk step. At deep contexts
+        contexts incur zero extra chunk splits. At deep contexts
         (``>= 256K``) with runnable decodes and ``prefill_yield == \"short\"``,
         steps down onto the 2,048-token grid (``4,096`` at ``256K..512K``,
         ``2,048`` at ``>= 512K``) to bound single-step attention stall.
@@ -1047,8 +1039,7 @@ class Scheduler(SchedulerInterface):
         ):
             return threshold
         if num_computed_tokens < Scheduler._DEEP_CONTEXT_THRESHOLD_TOKENS:
-            mix = Scheduler._MIX_CHUNK_TIER
-            return min(threshold, mix) if 0 < mix < threshold else threshold
+            return threshold
         if num_computed_tokens >= Scheduler._ULTRA_DEEP_CONTEXT_THRESHOLD_TOKENS:
             return min(threshold, Scheduler._ULTRA_DEEP_CONTEXT_CHUNK_TIER)
         return min(threshold, Scheduler._DEEP_CONTEXT_CHUNK_TIER)
@@ -5372,25 +5363,3 @@ class Scheduler(SchedulerInterface):
         self.failed_recving_kv_req_ids |= async_failed_req_ids
         # Return sync affected IDs to skip in update_from_output
         return sync_failed_req_ids
-
-
-def _prefill_mix_chunk_tier(value: str | None) -> int:
-    """SPARK_DS41F_PREFILL_MIX_CHUNK as a chunk cap: a positive multiple of the
-    2,048 grid, else 0 (the default behaviour)."""
-    try:
-        tier = int(value) if value else 0
-    except ValueError:
-        return 0
-    grid = Scheduler._DEEP_CONTEXT_CHUNK_GRID
-    return tier if tier >= grid and tier % grid == 0 else 0
-
-
-_PREFILL_MIX_CHUNK_ENV = os.environ.get("SPARK_DS41F_PREFILL_MIX_CHUNK")
-Scheduler._MIX_CHUNK_TIER = _prefill_mix_chunk_tier(_PREFILL_MIX_CHUNK_ENV)
-if Scheduler._MIX_CHUNK_TIER:
-    logger.info("prefill chunk capped at %d tokens below 256K while decodes run "
-                "(SPARK_DS41F_PREFILL_MIX_CHUNK)", Scheduler._MIX_CHUNK_TIER)
-elif _PREFILL_MIX_CHUNK_ENV:
-    logger.warning("SPARK_DS41F_PREFILL_MIX_CHUNK=%r ignored: it must be a multiple "
-                   "of %d; prefill chunks keep the default size",
-                   _PREFILL_MIX_CHUNK_ENV, Scheduler._DEEP_CONTEXT_CHUNK_GRID)

@@ -205,7 +205,7 @@ class EngramDiskRows:
                  rows_timeout_s: float = 10.0, delay_s: float = 0.0,
                  check_early: bool = False, timeline: bool = False,
                  cache_rows: int = DEFAULT_CACHE_ROWS,
-                 pin_scales: bool | None = None):
+                 pin_scales: bool = True):
         self.native = load()
         self.device = _indexed(device)
         self.shard_start, self.shard_end = int(shard_start), int(shard_end)
@@ -216,29 +216,32 @@ class EngramDiskRows:
         self.check_early = bool(check_early)
         self.timeline_enabled = bool(timeline)
         self.cache_rows = int(cache_rows)
-        self.pin_scales = (
-            os.environ.get("SPARK_DS41F_ENGRAM_PIN_SCALES") == "1"
-            if pin_scales is None
-            else bool(pin_scales)
-        )
+        self.pin_scales = bool(pin_scales)
+        self._reader = None
+        self._ids_mlocked = False
+        self._closed = False
         self._allocations = []
-        self.ids = torch.empty(self.max_lookups, dtype=torch.int64, pin_memory=True)
-        self._ids_mlocked = mlock_memory(self.ids.data_ptr(), self.ids.nbytes)
-        self.weights = self._mapped((self.max_lookups, ROW_BYTES), torch.uint8, True)
-        self.scales = self._mapped((self.max_lookups, SCALE_BYTES), torch.uint8, True)
-        self.control = self._mapped((self.native.CTRL_WORDS,), torch.int32, False)
-        self.control.host.zero_()
-        self._control = self.control.host.numpy().view(np.uint32)
-        self._control[self.native.CTRL_TIMEOUT_US] = int(rows_timeout_s * 1e6)
-        self.rows_e4m3 = self.weights.device_view.view(torch.float8_e4m3fn)
-        self._reader = self.native.reader(
-            table_rows, self.shard_start, self.shard_end, self.columns, self.max_lookups, queue_depth,
-            self.ids.data_ptr(), self.weights.pointer, self.scales.pointer, self.control.pointer,
-            float(ids_timeout_s), float(delay_s), self.check_early,
-            self.timeline_enabled, self.cache_rows, int(self.pin_scales),
-        )
-        self._ids_seq_device = self.control.device_view.data_ptr() + 4 * self.native.CTRL_IDS_SEQ
-        self._sequence = 0
+        try:
+            self.ids = torch.empty(self.max_lookups, dtype=torch.int64, pin_memory=True)
+            self._ids_mlocked = mlock_memory(self.ids.data_ptr(), self.ids.nbytes)
+            self.weights = self._mapped((self.max_lookups, ROW_BYTES), torch.uint8, True)
+            self.scales = self._mapped((self.max_lookups, SCALE_BYTES), torch.uint8, True)
+            self.control = self._mapped((self.native.CTRL_WORDS,), torch.int32, False)
+            self.control.host.zero_()
+            self._control = self.control.host.numpy().view(np.uint32)
+            self._control[self.native.CTRL_TIMEOUT_US] = int(rows_timeout_s * 1e6)
+            self.rows_e4m3 = self.weights.device_view.view(torch.float8_e4m3fn)
+            self._reader = self.native.reader(
+                table_rows, self.shard_start, self.shard_end, self.columns, self.max_lookups, queue_depth,
+                self.ids.data_ptr(), self.weights.pointer, self.scales.pointer, self.control.pointer,
+                float(ids_timeout_s), float(delay_s), self.check_early,
+                self.timeline_enabled, self.cache_rows, int(self.pin_scales),
+            )
+            self._ids_seq_device = self.control.device_view.data_ptr() + 4 * self.native.CTRL_IDS_SEQ
+            self._sequence = 0
+        except Exception:
+            self.close()
+            raise
 
     def _mapped(self, shape, dtype, write_combined: bool) -> MappedHostAllocation:
         allocation = MappedHostAllocation(shape, dtype, self.device, write_combined=write_combined)
@@ -288,6 +291,11 @@ class EngramDiskRows:
         None) the IDs the host hashed, ``host_hash.UNKNOWN`` where only the GPU knows
         one. Returns at once; the forward's ``gather`` waits for the rows."""
         self.raise_if_failed()
+        count = int(count)
+        if count < 0 or count > self.max_lookups:
+            raise ValueError(
+                f"Engram lookup count {count} exceeds max_lookups {self.max_lookups}"
+            )
         from cuda.bindings import driver
 
         has_unknown = True
@@ -304,10 +312,15 @@ class EngramDiskRows:
                     f"Engram early IDs: {early.shape[0]} for a step of {count} lookups"
                 )
             has_unknown = bool(self.native.has_unknown(early))
+        ids_flat = ids.view(-1)
+        if (has_unknown or self.check_early) and ids_flat.numel() < count:
+            raise ValueError(
+                f"Engram device IDs: {ids_flat.numel()} for a step of {count} lookups"
+            )
         self._sequence = (self._sequence + 1) & 0xFFFFFFFF or 1
         if has_unknown or self.check_early:
             with torch.cuda.stream(stream):
-                self.ids[:count].copy_(ids.view(-1)[:count], non_blocking=True)
+                self.ids[:count].copy_(ids_flat[:count], non_blocking=True)
         _check(driver.cuStreamWriteValue32(stream.cuda_stream, self._ids_seq_device, self._sequence, 0),
                "cuStreamWriteValue32")
         self.native.submit(
@@ -376,8 +389,12 @@ class EngramDiskRows:
 
     def close(self) -> None:
         """Stop the reader, then free the buffers; the GPU must be done with them."""
+        if getattr(self, "_closed", False):
+            return
+        self._closed = True
         self._reader = None
-        torch.cuda.synchronize(self.device)
+        if torch.cuda.is_initialized():
+            torch.cuda.synchronize(self.device)
         if getattr(self, "_ids_mlocked", False):
             munlock_memory(self.ids.data_ptr(), self.ids.nbytes)
             self._ids_mlocked = False

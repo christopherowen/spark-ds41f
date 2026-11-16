@@ -131,15 +131,9 @@ def sp_moe_inputs(
     from .tilelang.linear import provide_mxfp8
     from .tilelang.router import provide_routes
 
-    default_gather = getattr(
-        sp_prefill.SPRows, "_DEFAULT_GATHER_MXFP8", sp_prefill.SPRows.gather_mxfp8
-    )
-    can_async = (
-        hasattr(sp_rows, "gather_mxfp8_async")
-        and getattr(sp_rows, "can_gather_async", lambda *_: False)(x_q.rows.device)
-        and getattr(type(sp_rows), "gather_mxfp8", None) is default_gather
-        and "gather_mxfp8" not in getattr(sp_rows, "__dict__", {})
-    )
+    can_async = hasattr(
+        sp_rows, "can_gather_mxfp8_async"
+    ) and sp_rows.can_gather_mxfp8_async(x_q.rows.device)
     if can_async:
         (gathered_q,), wait_xq = sp_rows.gather_mxfp8_async(x_q)
         weights, ids = route_local(x, sp_rows, input_ids=input_ids)

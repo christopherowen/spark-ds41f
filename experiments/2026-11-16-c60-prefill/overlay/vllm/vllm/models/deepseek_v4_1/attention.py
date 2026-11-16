@@ -1312,16 +1312,9 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase):
                 dtype=torch.uint8,
                 device=qr_kv.device,
             )
-            default_gather = getattr(
-                sp_prefill.SPRows, "_DEFAULT_GATHER_MXFP8", sp_prefill.SPRows.gather_mxfp8
-            )
-            can_async = (
-                hasattr(sp_rows, "gather_mxfp8_async")
-                and hasattr(sp_rows, "gather_many_async")
-                and getattr(sp_rows, "can_gather_async", lambda *_: False)(qr_kv.device)
-                and getattr(type(sp_rows), "gather_mxfp8", None) is default_gather
-                and "gather_mxfp8" not in getattr(sp_rows, "__dict__", {})
-            )
+            can_async = hasattr(
+                sp_rows, "can_gather_mxfp8_async"
+            ) and sp_rows.can_gather_mxfp8_async(qr_kv.device)
             overlap_index = (
                 can_async
                 and self.indexer is not None

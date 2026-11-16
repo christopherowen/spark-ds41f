@@ -229,6 +229,14 @@ class SPRows:
             return False
         return device is None or device.type == "cuda"
 
+    def can_gather_mxfp8_async(self, device: torch.device | None = None) -> bool:
+        """Whether ``gather_mxfp8_async`` can run asynchronously without bypassing monkeypatches."""
+        return (
+            type(self).gather_mxfp8 is _DEFAULT_GATHER_MXFP8
+            and "gather_mxfp8" not in self.__dict__
+            and self.can_gather_async(device)
+        )
+
     def _prepare_gather_many(
         self, *tensors: torch.Tensor, padded_rows: tuple[int, ...] = ()
     ) -> tuple[list[torch.Tensor], tuple[int, ...], object | None]:
@@ -369,11 +377,7 @@ class SPRows:
 
     def gather_mxfp8_async(self, x_q, *extra: torch.Tensor):
         """Asynchronous ``gather_mxfp8`` returning ``((MXFP8Rows, *extra), wait_fn)``."""
-        if (
-            type(self).gather_mxfp8 is not _DEFAULT_GATHER_MXFP8
-            or "gather_mxfp8" in self.__dict__
-            or not self.can_gather_async(x_q.rows.device)
-        ):
+        if not self.can_gather_mxfp8_async(x_q.rows.device):
             return self.gather_mxfp8(x_q, *extra), (lambda: None)
         from vllm.models.deepseek_v4_1.tilelang.linear import MXFP8Rows, mxfp8_rows
 
@@ -460,51 +464,56 @@ class SPRows:
         use_cuda_streams = device.type == "cuda" and torch.cuda.is_available()
         main = torch.cuda.current_stream(device) if use_cuda_streams else None
         side = _side_stream(device) if use_cuda_streams else None
-        for lo, hi in zip(bounds, bounds[1:]):
-            slice_rows = hi - lo
-            if slice_rows == 0:
-                continue
-            send_slice = send[world * lo : world * hi].view(
-                world, slice_rows, *row_shape
-            )
-            slice_total = 0
-            for owner in range(world):
-                real = max(0, min(hi, tokens - owner * local) - lo)
-                slice_total += real
-                if owner != self.rank and real:
-                    start = owner * local + lo
-                    project(start, start + real, send_slice[owner, :real])
-            if slice_total:
-                flat_send = send_slice.view(world * slice_rows, *row_shape)[
-                    :slice_total
-                ]
-                if use_cuda_streams:
-                    side.wait_stream(main)
-                    with torch.cuda.stream(side):
+        if use_cuda_streams:
+            _record_stream(send, side)
+            _record_stream(out, side)
+        try:
+            for lo, hi in zip(bounds, bounds[1:]):
+                slice_rows = hi - lo
+                if slice_rows == 0:
+                    continue
+                send_slice = send[world * lo : world * hi].view(
+                    world, slice_rows, *row_shape
+                )
+                slice_total = 0
+                for owner in range(world):
+                    real = max(0, min(hi, tokens - owner * local) - lo)
+                    slice_total += real
+                    if owner != self.rank and real:
+                        start = owner * local + lo
+                        project(start, start + real, send_slice[owner, :real])
+                if slice_total:
+                    flat_send = send_slice.view(world * slice_rows, *row_shape)[
+                        :slice_total
+                    ]
+                    if use_cuda_streams:
+                        side.wait_stream(main)
+                        with torch.cuda.stream(side):
+                            comm.all_to_all_rows(
+                                out[:, lo:hi],
+                                flat_send,
+                                slice_rows,
+                                stream=side,
+                                copy_self=False,
+                            )
+                    else:
                         comm.all_to_all_rows(
                             out[:, lo:hi],
                             flat_send,
                             slice_rows,
-                            stream=side,
+                            stream=None,
                             copy_self=False,
                         )
-                else:
-                    comm.all_to_all_rows(
-                        out[:, lo:hi],
-                        flat_send,
-                        slice_rows,
-                        stream=None,
-                        copy_self=False,
-                    )
-            real_me = max(0, min(hi, tokens - self.rank * local) - lo)
-            if real_me:
-                start = self.rank * local + lo
-                project(start, start + real_me, out[self.rank, lo : lo + real_me])
-        if then is not None:
-            then()
-        if use_cuda_streams:
-            # send and out are freed only after this wait, on this stream.
-            main.wait_stream(side)
+                real_me = max(0, min(hi, tokens - self.rank * local) - lo)
+                if real_me:
+                    start = self.rank * local + lo
+                    project(start, start + real_me, out[self.rank, lo : lo + real_me])
+            if then is not None:
+                then()
+        finally:
+            if use_cuda_streams:
+                # send and out are freed only after this wait, on this stream.
+                main.wait_stream(side)
         return out
 
     def empty_padded(
@@ -573,29 +582,32 @@ class SPRows:
         bounds = [local * i // slices for i in range(slices + 1)]
         main = torch.cuda.current_stream(device)
         side = _side_stream(device)
-        for lo, hi in zip(bounds, bounds[1:]):
-            if hi == lo:
-                continue
-            piece = torch.empty(
-                (world, hi - lo, *row_shape), dtype=dtype, device=device
-            )
-            for owner in range(world):
-                start, stop = owner * local + lo, owner * local + hi
-                real = max(0, min(stop, tokens) - start)
-                if real:
-                    project(start, start + real, piece[owner, :real])
-                if real < hi - lo:
-                    piece[owner, real:].zero_()
-            side.wait_stream(main)
-            with torch.cuda.stream(side):
-                reduced = tensor_model_parallel_reduce_scatter(
-                    piece.view(world * (hi - lo), *row_shape), dim=0
+        _record_stream(out, side)
+        try:
+            for lo, hi in zip(bounds, bounds[1:]):
+                if hi == lo:
+                    continue
+                piece = torch.empty(
+                    (world, hi - lo, *row_shape), dtype=dtype, device=device
                 )
-                out[lo:hi].copy_(reduced)
-            piece.record_stream(side)
-        if then is not None:
-            then()
-        main.wait_stream(side)
+                for owner in range(world):
+                    start, stop = owner * local + lo, owner * local + hi
+                    real = max(0, min(stop, tokens) - start)
+                    if real:
+                        project(start, start + real, piece[owner, :real])
+                    if real < hi - lo:
+                        piece[owner, real:].zero_()
+                _record_stream(piece, side)
+                side.wait_stream(main)
+                with torch.cuda.stream(side):
+                    reduced = tensor_model_parallel_reduce_scatter(
+                        piece.view(world * (hi - lo), *row_shape), dim=0
+                    )
+                    out[lo:hi].copy_(reduced)
+            if then is not None:
+                then()
+        finally:
+            main.wait_stream(side)
         return out
 
     def _project_exchange(
@@ -635,20 +647,24 @@ class SPRows:
         bounds = [local * i // slices for i in range(slices + 1)]
         main = torch.cuda.current_stream(device)
         side = _side_stream(device)
-        for lo, hi in zip(bounds, bounds[1:]):
-            if hi == lo:
-                continue
-            for owner in range(world):
-                if owner != self.rank:
-                    write(owner, lo, hi)
-            side.wait_stream(main)
-            with torch.cuda.stream(side):
-                self.exchange_into(send[:, lo:hi], parts[:, lo:hi])
-            write(self.rank, lo, hi)
-        if then is not None:
-            then()
-        # send and parts are freed only after this wait, on this stream.
-        main.wait_stream(side)
+        _record_stream(send, side)
+        _record_stream(parts, side)
+        try:
+            for lo, hi in zip(bounds, bounds[1:]):
+                if hi == lo:
+                    continue
+                for owner in range(world):
+                    if owner != self.rank:
+                        write(owner, lo, hi)
+                side.wait_stream(main)
+                with torch.cuda.stream(side):
+                    self.exchange_into(send[:, lo:hi], parts[:, lo:hi])
+                write(self.rank, lo, hi)
+            if then is not None:
+                then()
+        finally:
+            # send and parts are freed only after this wait, on this stream.
+            main.wait_stream(side)
         return parts
 
     def exchange_into(self, send: torch.Tensor, recv) -> None:
@@ -869,6 +885,12 @@ def _side_stream(device: torch.device) -> torch.cuda.Stream:
     if device not in _SIDE_STREAMS:
         _SIDE_STREAMS[device] = torch.cuda.Stream(device)
     return _SIDE_STREAMS[device]
+
+
+def _record_stream(tensor: torch.Tensor, stream: object) -> None:
+    """Guard record_stream for CPU or mocked-stream unit tests."""
+    if tensor.is_cuda and isinstance(stream, torch.cuda.Stream):
+        tensor.record_stream(stream)
 
 
 def plan_rows(

@@ -326,6 +326,7 @@ def test_scheduler_spec_decode_caches_boundary_crossed_on_stopping_step(
     async_scheduling: bool,
     num_spec: int,
     prompt_offset_from_boundary: int,
+    monkeypatch: pytest.MonkeyPatch,
 ):
     """Regression test for Bug 3: when a running request with speculative
     decoding (1..5 draft tokens + 1 bonus token = 2..6 tokens/step) crosses a
@@ -335,10 +336,12 @@ def test_scheduler_spec_decode_caches_boundary_crossed_on_stopping_step(
     _free_request so the newly completed full block is hashed and cached for
     subsequent requests.
     """
+    monkeypatch.setenv("VLLM_SINK_REJECTION", "0")
     block_size = 16
     scheduler = create_scheduler(
         enable_prefix_caching=True,
         block_size=block_size,
+        long_prefill_token_threshold=4096,
         num_speculative_tokens=num_spec,
         speculative_method="ngram_gpu" if async_scheduling else "ngram",
         async_scheduling=async_scheduling,
@@ -709,6 +712,7 @@ def test_async_scheduler_stale_output_after_preemption_does_not_cache():
     scheduler = create_scheduler(
         enable_prefix_caching=True,
         block_size=block_size,
+        long_prefill_token_threshold=4096,
         async_scheduling=True,
     )
     req1 = create_requests(

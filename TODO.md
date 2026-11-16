@@ -9,7 +9,7 @@ owner.
 ## Recent candidate decisions
 
 - **Candidate `60`** ([`experiments/2026-11-16-c60-prefill`](experiments/2026-11-16-c60-prefill/README.md)) builds on `candidate-59` (via `#1218` / `#1219`) in three gated steps across switched TP4 (`sp1..sp4`) and switched TP3 (`sp5..sp7`):
-  - Integrated PR `#992` `bf16x2` producer casts, `indexer.py` `bfloat162` SMEM + warp-shuffle `block_scan` top-$k$, `attention.py` SP prefill compressor/front async overlap + deferred `finish_front` + `cacheable = index_rows <= chunk_rows`, PR `#983` Clock-Pro 2-bit Engram prefill shield + `SPARK_DS41F_ENGRAM_PIN_SCALES`, PR `#1010` hybrid KV retention/eviction, PR `#978` multimodal prefix-cache fastpath, PR `#1150` opt-in `SPARK_DS41F_PREFILL_MIX_CHUNK`, PR `#1006` uncached GPU post-load vectorizations / pressure-gated `release_device_memory_under_pressure` / lazy imports / first-prefill `_warm_model_runtime` warmup (dropping `postload_cache` after measuring slower reload than uncached GPU vectorization on GB10), and piece-level parallel prompt tokenizer caching in `vllm/tokenizers/deepseek_v41.py`.
+  - Integrated PR `#992` `bf16x2` producer casts, `indexer.py` `bfloat162` SMEM + warp-shuffle `block_scan` top-$k$, `attention.py` SP prefill compressor/front async overlap + deferred `finish_front` + `cacheable = index_rows <= chunk_rows`, PR `#983` Clock-Pro 2-bit Engram prefill shield + `SPARK_DS41F_ENGRAM_PIN_SCALES`, PR `#1010` hybrid KV retention/eviction, PR `#978` multimodal prefix-cache fastpath, PR `#1006` uncached GPU post-load vectorizations / pressure-gated `release_device_memory_under_pressure` / lazy imports / first-prefill `_warm_model_runtime` warmup (dropping `postload_cache` after measuring slower reload than uncached GPU vectorization on GB10), piece-level parallel prompt tokenizer caching (`vllm/tokenizers/deepseek_v41.py`), PR `#1212` (rebased `#1047`) literal image-token escape, `defer_loading: true` + `tool_reference` inline tool-schema resolution (`serving.py`, `deepseek_v41.py`, `deepseek_v41_encoding.py`), and stream/lifecycle/parser hardening (`sp_prefill.py`, `engram_rows/rows.py`, `deepseek_v41.py`, `deepseek_v41_encoding.py`; evaluated and removed opt-in `SPARK_DS41F_PREFILL_MIX_CHUNK` from PR `#1150` during optionality cleanup).
   - Qualified with zero regressions on `tp4-switched` (`model`: `128/128` greedy / `100.00%` identical, `KL mean 0.000e+00`, `8/8` gate determinism/greedy `0` diffs; `grid` `-0.07% ±0.13%` `same`; `c16` `+0.17%` / `+0.15%` `same`; `c1-decisions` `82.91 tok/s`; `prefill 262K` `default-text` **`+2.10% ±0.64%` (`better`, `9,833.2 tok/s`)**, `+4.50%` over `c58-final`; `source` prefill `32K/131K/262K` `9,521 / 9,924 / 9,830 tok/s`, with Step 1 hitting `10,000.1 tok/s` mean at `131K`; `bench` `quality` `5/5` pass) and `tp3-switched` (`model`: `100.00%` identical, `8/8` gate `0` diffs, `grid` `-0.03% ±0.12%` `same`, `c8` `-0.25%` / `-0.23%` `same`, `sp5` startup `min_available_gib` `5.90–5.97 GiB`; `tp4-ring` remained held and untested).
 - **Candidate `59`** ([`experiments/2026-11-15-c59-prefill`](experiments/2026-11-15-c59-prefill/README.md)) builds on `candidate-58` in three gated steps across switched TP4 (`sp1..sp4`) and switched TP3 (`sp5..sp7`):
   - Integrated bounded UTF-8 suffix detokenizer priming (`detokenizer.py`), zero-copy `int32` `PickleBuffer` `NewRequestData` admission IPC (`output.py`, `request.py`, `buffer_utils.py`), `bf16x2` / `cvt.rn.bf16x2.e2m1x2` dequant (`sparse_mla.py`), dense `indexer_score_v41` `rows >= 64` `R=4` BF16 dual-row SMEM reduction (`indexer.py`), fused `prefill_gate_up -> moe_swiglu_cast` with 64-col `(gate, up)` slab interleaving (`moe.py`), and PR `#1005` MoE warp-shuffle dispatch scan, sync/PDL tightening, and cascaded `moe_swiglu_cast` preloads (keeping `c58` BF16 SwiGLU intermediate rounding).
@@ -443,55 +443,28 @@ and `candidate-60` added PR `#992` `bf16x2` producer casts, `bfloat162` SMEM +
 warp-shuffle `block_scan` top-$k$ (`indexer.py`), SP compressor/front async overlap +
 deferred `finish_front` (`attention.py`), PR `#983` Clock-Pro 2-bit Engram prefill
 shield + pinned two-plane scales (`SPARK_DS41F_ENGRAM_PIN_SCALES`), PR `#1010`
-hybrid KV retention/eviction, PR `#978` multimodal prefix-cache fastpath, PR `#1150`
-opt-in `SPARK_DS41F_PREFILL_MIX_CHUNK`, PR `#1006` uncached GPU post-load
-vectorizations + first-prefill `_warm_model_runtime` warmup, and piece-level parallel
-prompt tokenizer caching (`_BoundedPieceCache` + cut-after-`\n` `encode_batch` in
-`vllm/tokenizers/deepseek_v41.py`).
+hybrid KV retention/eviction, PR `#978` multimodal prefix-cache fastpath, PR `#1006`
+uncached GPU post-load vectorizations + first-prefill `_warm_model_runtime` warmup,
+piece-level parallel prompt tokenizer caching (`_BoundedPieceCache` + cut-after-`\n`
+`encode_batch` in `vllm/tokenizers/deepseek_v41.py`), PR `#1212` literal image-token
+escape, `defer_loading: true` + `tool_reference` inline tool-schema resolution
+(`serving.py`, `deepseek_v41.py`, `deepseek_v41_encoding.py`), and stream/lifecycle
+hardening (`sp_prefill.py`, `engram_rows/rows.py`).
 
 Open levers:
-- **Rank-offset CTA remapping for sequence-parallel all-gather overlap.** When
-  overlapping a sequence-parallel all-gather with the consumer projection or
-  expert compute, remap consumer row-tile coordinates by rank offset
+- **Rank-offset CTA remapping for sequence-parallel all-gather overlap.** `_sp_front` /
+  `finish_front` (`defer_q`) already hides `q_all_gather` in attention; if new fused
+  SP consumers are introduced later, remap consumer row-tile coordinates by rank offset
   (`pid_m = (raw_pid_m + rank * tiles_per_rank) % total_tiles`) so every rank
-  starts computing on its already-local shard at $t = 0$ while peer shards
-  arrive over RoCE.
-- **First request after a restart** residual gap after `c60`'s `_warm_model_runtime`
-  pre-warming (originally ~0.37 s slower to its first token than subsequent
-  requests). Screen `CUDA_MODULE_LOADING=EAGER` (checking boot time impact) and
-  sample any remaining request-1 stalls with `py-spy dump --nonblocking`.
-- **Indexer scoring and selection at 200K–1M context.** Split long-context
-  indexer time into MXFP4 scoring vs top-$k$ selection; if top-$k$ selection is
-  a measurable share at 500K–1M, screen a bounded radix top-$k$. For the scoring
-  pass itself at deep context, screen a **certified two-pass block scorer**
-  (analogous to our `lm_head` Cauchy-Schwarz `W_q` screen): Pass 1 computes a
-  coarse score $S_1$ per block plus an outward-rounded (`__fadd_ru` /
-  `__fsub_rd`) Cauchy-Schwarz + MMA ULP error bound $\epsilon_b$ so the true
-  full-precision score obeys $S_{\text{exact}} \in [S_1 - \epsilon_b, S_1 + \epsilon_b]$;
-  using the $k$-th coarse score $T_1$ and $E = \max_b \epsilon_b$, Pass 2
-  re-scores in full precision only the narrow band of candidate blocks
-  straddling $[T_1 - E - \epsilon_b, T_1 + E + \epsilon_b]$ (including ties) for
-  bit-identical top-$k$ selection.
+  starts computing on its local shard at $t = 0$ while peer shards arrive over RoCE.
 - **NVMe interrupt coalescing stays off** on every node by the owner's decision
   (2026-10-02; prefill measured 0.7–1.6% slower with it on in
   `experiments/2026-10-02-nvme-coalescing`).
-- **Byte-equivalent BPE boundary alignment for prefix-cache hits:** when new
-  text is appended to a cached prefix without an intervening special token, a
-  BPE merge across the append boundary can alter the last 1–2 tokens of the
-  prefix, invalidating the trailing KV block hash and forcing a wider CED/SWA
-  re-prefill. Walking from the first differing token to check whether non-atomic
-  tokens on both sides spell the identical byte sequence up to a common token
-  boundary—and rewriting the incoming prompt's prefix to the cached token
-  spelling (shifting any subsequent multimodal spans accordingly)—preserves
-  prefix-cache hits across boundary merges.
-- **Live prefix-cache retention and inline tool-schema injection:** [#902](https://github.com/christopherowen/spark-ds41f/issues/902)
-  hybrid retention/eviction and its offline stress probe (`test_prefix_cache_retention_probe.py`)
-  shipped in `candidate-60`; validate live 64–100K multi-turn retention on
-  production agent traffic. For `/v1/messages` clients using dynamic/deferred
-  tool discovery (`defer_loading: true` with `tool_reference` blocks inside
-  `tool_result`), support injecting newly discovered tool schemas inline at
-  the `tool_result` turn rather than mutating the top-of-prompt `tools` preamble
-  so mid-session tool discovery does not invalidate the cached 64K–100K prefix.
+- **Live validation of prefix-cache retention and `defer_loading` tool schemas:**
+  [#902](https://github.com/christopherowen/spark-ds41f/issues/902) hybrid retention/eviction
+  (`test_prefix_cache_retention_probe.py`) and inline `tool_reference` schema injection
+  (`defer_loading: true`) shipped in `candidate-60`; confirm live 64–100K prefix-cache
+  retention on production agent traffic.
 
 ## Boot
 
@@ -698,7 +671,18 @@ Don't repeat these without a new reason:
   `candidate-60` Step 3 (reload from `/cache` was slower on GB10 unified memory
   than PR `#1006`'s uncached vectorized GPU `pack_bf16_weight` and
   `encode_expert_scale_codes` kernels, so `postload_cache` was removed before
-  qualification, `experiments/2026-11-16-c60-prefill`).
+  qualification, `experiments/2026-11-16-c60-prefill`); opt-in
+  `SPARK_DS41F_PREFILL_MIX_CHUNK` (PR `#1150`, removed during `c60` optionality
+  cleanup); `wq_b` prefill split (`1.132 ms` single vs `1.134 ms` `4096+12288`
+  at `M=16384` BF16 on `sp8`); head-subset Cauchy-Schwarz indexer scoring (`sp8`
+  `IndexerV41Plan` `rows=4096`, `page_size=256`, `topk=512` measured `score`
+  `30.18/58.20/113.70/277.43 ms` and `select_blocks` `4.62/9.87/19.83/39.32 ms`
+  [`gather_select` `1.68..1.71 ms`] across `131K/262K/524K/1M`, only encoder layers
+  `[2, 8, 14]` run full-chunk dense scoring, and `weights_proj + wq_b` head
+  importance is spread evenly at `0.341..0.363` top-8/32 and `0.613..0.621`
+  top-16/32); runtime BPE boundary token rewrite (mutating prefix tokens changes
+  deterministic sampling/logprobs; `_BoundedPieceCache` retained instead); and
+  global `CUDA_MODULE_LOADING=EAGER` (boot/headroom cost vs `_warm_model_runtime`).
 - **Collectives:** NCCL for decode all-reduces (75–86 µs against one-shot RoCE's
   13–19 µs, `experiments/2026-10-03-collective-policy`); 8 or 16 NCCL channels
   on TP4 serving prefill (0.7–1.2% over four, intervals spanning zero);

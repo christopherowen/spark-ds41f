@@ -13,6 +13,7 @@ from vllm.entrypoints.openai.chat_completion.protocol import ChatCompletionReque
 from vllm.tokenizers.deepseek_v41 import get_deepseek_v41_tokenizer
 from vllm.tokenizers.deepseek_v41_encoding import (
     IMAGE_PLACEHOLDER,
+    IMAGE_PLACEHOLDER_TEXT,
     encode_messages,
     order_tool_results,
 )
@@ -299,30 +300,160 @@ def test_reminder_does_not_enable_arbitrary_message_roles():
 
 
 @pytest.mark.parametrize("role", ["user", "tool", "assistant"])
-def test_image_token_in_text_is_a_request_error(role):
-    """Image tokens come only from image parts, in string content, text parts and
-    reasoning alike (DeepSeek's reference rejects them before merging)."""
-    message = {"role": role, "content": f"hi {IMAGE_PLACEHOLDER}"}
+def test_image_token_in_text_is_escaped_text(role):
+    """The literal image-token spelling is ordinary text in string content, for
+    every role: it is escaped to the ordinary-text spelling, not rejected
+    (the hosted DeepSeek API passes it through; spark-ds41f issue #1031)."""
     if role == "tool":
-        message["tool_call_id"] = "c1"
-    with pytest.raises(ValueError, match="image special token"):
-        render([message])
-    with pytest.raises(ValueError, match="image placeholder"):
-        render(
-            [{"role": "user", "content": [{"type": "text", "text": IMAGE_PLACEHOLDER}]}]
-        )
-    with pytest.raises(ValueError, match="reasoning_content contains image"):
-        render(
+        messages = [
+            {"role": "user", "content": "q"},
+            {"role": "assistant", "tool_calls": [_call("c1")]},
+            {
+                "role": "tool",
+                "tool_call_id": "c1",
+                "content": f"hi {IMAGE_PLACEHOLDER}",
+            },
+        ]
+    elif role == "assistant":
+        messages = [
+            {"role": "user", "content": "q"},
+            {"role": "assistant", "content": f"hi {IMAGE_PLACEHOLDER}"},
+        ]
+    else:
+        messages = [{"role": "user", "content": f"hi {IMAGE_PLACEHOLDER}"}]
+    prompt = render(messages)
+    assert IMAGE_PLACEHOLDER not in prompt
+    assert IMAGE_PLACEHOLDER_TEXT in prompt
+
+
+def test_image_token_in_text_parts_and_reasoning_is_escaped_text():
+    """Text parts, tool-call arguments and the current turn's reasoning escape
+    the spelling too, while image parts still render the placeholder."""
+    prompt = render(
+        [
+            {
+                "role": "user",
+                "content": [
+                    {"type": "text", "text": f"see {IMAGE_PLACEHOLDER}"},
+                    {"type": "image_url", "image_url": {"url": "h.png"}},
+                ],
+            }
+        ]
+    )
+    assert f"see {IMAGE_PLACEHOLDER_TEXT}\n\n{IMAGE_PLACEHOLDER}" in prompt
+    assert prompt.count(IMAGE_PLACEHOLDER) == 1
+
+    # Default json.dumps escapes non-ASCII U+FF5C as \uff5c in arguments.
+    for arguments in (
+        json.dumps({"path": f"/tmp/{IMAGE_PLACEHOLDER}"}),
+        json.dumps({"path": f"/tmp/{IMAGE_PLACEHOLDER}"}, ensure_ascii=False),
+    ):
+        prompt = render(
             [
                 {"role": "user", "content": "q"},
                 {
                     "role": "assistant",
-                    "content": "a",
-                    "reasoning_content": IMAGE_PLACEHOLDER,
+                    "tool_calls": [
+                        {
+                            "id": "c1",
+                            "type": "function",
+                            "function": {
+                                "name": "open",
+                                "arguments": arguments,
+                            },
+                        }
+                    ],
                 },
-                {"role": "user", "content": "q2"},
+                {"role": "tool", "tool_call_id": "c1", "content": "value"},
             ]
         )
+        assert IMAGE_PLACEHOLDER not in prompt
+        assert IMAGE_PLACEHOLDER_TEXT in prompt
+
+    prompt = render(
+        [
+            {"role": "user", "content": "q1"},
+            {
+                "role": "assistant",
+                "reasoning_content": f"r {IMAGE_PLACEHOLDER}",
+                "tool_calls": [
+                    {
+                        "id": "c1",
+                        "type": "function",
+                        "function": {"name": "lookup", "arguments": "{}"},
+                    }
+                ],
+            },
+            {"role": "tool", "tool_call_id": "c1", "content": "value"},
+        ]
+    )
+    assert f"r {IMAGE_PLACEHOLDER_TEXT}" in prompt
+
+
+def test_defer_loading_and_inline_tool_reference_preserve_system_prefix():
+    """Deferred tools stay out of the top-of-prompt preamble so discovering them
+    later via tool_reference inside tool_result never invalidates the prefix."""
+    search_tool = {
+        "type": "function",
+        "function": {
+            "name": "tool_search",
+            "description": "Search deferred tools",
+            "parameters": {"type": "object", "properties": {"q": {"type": "string"}}},
+        },
+    }
+    db_tool = {
+        "type": "function",
+        "defer_loading": True,
+        "function": {
+            "name": "db_query",
+            "description": "Run a SQL query",
+            "parameters": {"type": "object", "properties": {"sql": {"type": "string"}}},
+        },
+    }
+    tools = [search_tool, db_tool]
+    t1_msgs = [
+        {"role": "system", "content": "Helpful assistant."},
+        {"role": "user", "content": "Query orders."},
+    ]
+    t2_msgs = t1_msgs + [
+        {
+            "role": "assistant",
+            "content": "",
+            "tool_calls": [
+                {
+                    "id": "call_s1",
+                    "type": "function",
+                    "function": {"name": "tool_search", "arguments": '{"q": "sql"}'},
+                }
+            ],
+        },
+        {
+            "role": "tool",
+            "tool_call_id": "call_s1",
+            "content": [
+                {"type": "text", "text": "Discovered matching tools:"},
+                {"type": "tool_reference", "tool_name": "db_query"},
+            ],
+        },
+    ]
+
+    p1 = render(t1_msgs, tools=tools, thinking=False)
+    p2 = render(t2_msgs, tools=tools, thinking=False)
+    assert "tool_search" in p1
+    assert "db_query" not in p1
+    assert "defer_loading" not in p1
+    assert p2.startswith(p1.removesuffix("<｜Assistant｜></think>"))
+    assert "Discovered matching tools:" in p2
+    assert "<tool_schema>" in p2
+    assert '"name": "db_query"' in p2
+    assert '"sql"' in p2
+    assert "defer_loading" not in p2
+
+    # Tokenizing the two-turn prompt matches fresh full-string tokenization.
+    tok = byte_level_tokenizer()
+    assert tok.apply_chat_template(t2_msgs, tools=tools, tokenize=True, thinking=False) == (
+        tok.encode(p2, add_special_tokens=False)
+    )
 
 
 def _call(name):
@@ -1275,3 +1406,53 @@ def test_parallel_newline_chunks_and_direct_encode_call_exactness():
             tokenizer, prompt_next, add_special_tokens=True, return_length=True
         )
     )
+
+
+def test_none_text_in_content_blocks_and_tool_references():
+    from vllm.tokenizers.deepseek_v41 import _normalize_messages
+    from vllm.tokenizers.deepseek_v41_encoding import encode_messages
+
+    normalized = _normalize_messages([
+        {
+            "role": "user",
+            "content": [
+                {"type": "text", "text": None},
+                {"type": "text", "text": "hello"},
+            ],
+        },
+        {
+            "role": "tool",
+            "tool_call_id": "c1",
+            "content": [
+                {"type": "text", "text": None},
+                {"type": "tool_reference", "name": "search_docs"},
+            ],
+        },
+    ])
+    assert normalized[0]["content"] == "\n\nhello"
+    assert normalized[1]["content"] == [
+        {"type": "text", "text": ""},
+        {"type": "tool_reference", "name": "search_docs"},
+    ]
+
+    rendered = encode_messages(
+        [
+            {
+                "role": "user",
+                "content": "",
+                "content_blocks": [
+                    {"type": "text", "text": None},
+                    {
+                        "type": "tool_result",
+                        "call_id": "c1",
+                        "content": [
+                            {"type": "text", "text": None},
+                            {"type": "text", "text": "ok"},
+                        ],
+                    },
+                ],
+            }
+        ],
+        thinking_mode="chat",
+    )
+    assert "ok" in rendered

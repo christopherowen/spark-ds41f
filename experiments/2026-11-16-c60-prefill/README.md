@@ -43,7 +43,7 @@
 1. **PR `#983`**: Clock-Pro 2-bit Engram prefill shield and pinned two-plane scales (`SPARK_DS41F_ENGRAM_PIN_SCALES`) ported onto `c59`'s SoA reader (`overlay/vllm/vllm/models/deepseek_v4_1/engram_rows/{_reader.c,_row_plan.h,rows.py}`, `tests/kernels/test_deepseek_v41_engram_rows.py`).
 2. **PR `#1010`**: hybrid KV retention and eviction (`overlay/vllm/vllm/v1/core/{kv_cache_coordinator.py,single_type_kv_cache_manager.py,sched/scheduler.py,sched/async_scheduler.py}`, `tests/v1/core/test_prefix_cache_retention_probe.py`).
 3. **PR `#978`**: multimodal prefix-cache fastpath (`overlay/vllm/vllm/multimodal/{hasher.py,inputs.py,media/image.py,processing/processor.py}`, `renderers/base.py`, `v1/engine/{async_llm.py,core.py}`, `tests/multimodal/test_prefix_cache_fastpath.py`).
-4. **PR `#1150`**: opt-in `SPARK_DS41F_PREFILL_MIX_CHUNK` cap (`scheduler.py`, `tests/v1/core/test_prefill_mix_chunk.py`).
+4. **PR `#1150` (evaluated, dropped in cleanup)**: `SPARK_DS41F_PREFILL_MIX_CHUNK` was tested during Step 2 and later removed (`scheduler.py`, `tests/v1/core/test_prefill_mix_chunk.py`) during optionality cleanup rather than promoted as a default-off knob.
 
 ### Failed Boot Record & Verification (`sp8`, `sp1`)
 - **Initial boot failure (`20261116T094817-screen-tp4-switched`, `receipts/step2/tp4-switched/failed-start-20261116T095150Z.txt`)**: Commit `d63784647` omitted `Callable` from `from collections.abc import ...` in `async_llm.py`, raising `NameError: name 'Callable' is not defined` at engine startup; resolved in `783ab927b`.
@@ -129,3 +129,33 @@ Note: `tp4-ring` (`dgx1..dgx4`) remained held by `tp2-direct-slots` and was not 
 
 - `candidate-60` passed every Step 1, Step 2, and final qualification gate on both `tp4-switched` (`sp1..sp4`) and `tp3-switched` (`sp5..sp7`), catching and fixing the Step 2 `async_llm.py` `Callable` import omission and dropping `postload_cache` where direct GPU vectorization ran faster on GB10.
 - Cumulative `c60` prefill throughput reached **`9,833.18 tok/s`** (`+2.10% ±0.64%` **`better`** over `c59`; `+4.50%` / `+423.0 tok/s` over `c58-final`) at `262K` `default-text` prose and **`9,924.43 / 9,830.20 tok/s`** at `131K / 262K` `source` prefill (after hitting **`10,000.10 tok/s`** mean at `131K` `source` in Step 1) with **zero decode, determinism, or quality regressions**.
+
+## Post-Qualification Phase 1 Additions, Lever Measurements & Hardening
+
+### Phase 1 PRs, Tool Discovery, and Config Cleanliness
+- Incorporated **PR `#1212`** (rebased `#1047`, literal image-token escaping in `vllm/tokenizers/deepseek_v41.py`) and verified **PR `#1013` Part 1** (`StructuredOutputManager._get_constraint_start` and `DeepseekV41ModelState.prepare_attn` `ubatch_idx=0`) is already present in `spark-ds41f:candidate-55`.
+- Implemented inline deferred tool-schema discovery (`defer_loading: true` + `tool_reference` inside `tool_result` in `vllm/entrypoints/anthropic/serving.py`, `vllm/tokenizers/deepseek_v41.py`, `vllm/tokenizers/deepseek_v41_encoding.py`, tested in `test_anthropic_messages_conversion.py` and `test_deepseek_v41.py`) so mid-session tool discovery preserves top-of-prompt KV prefixes.
+- Removed default-off `SPARK_DS41F_PREFILL_MIX_CHUNK` (`scheduler.py`), simplified `can_gather_mxfp8_async` (`attention.py`, `kernels.py`), preserved `TP2` (`scripts/topology.py`, `tests/test_topology.py`, `tests/test_switched_topology.py`) and all 9 switched/triangle profiles (`tp3`, `tp3-switched`, `tp3-triangle-4k`, `tp4`, `tp4-switched..tp8-switched`), and kept one shape-independent default in `l2_prefetch.py` with shape overrides in config.
+
+### Prefill Lever Screenings (`sp8`, GB10)
+- **Indexer two-pass / head-subset CS (`IndexerV41Plan`, `rows=4096`, `page_size=256`, `topk=512`)**:
+  - `131K`: `score = 30.18 ms` (145.7 TFLOPs), `select_blocks = 4.62 ms`, `gather_select = 1.68 ms`, `plain_select = 6.06 ms`.
+  - `262K`: `score = 58.20 ms`, `select_blocks = 9.87 ms`, `gather_select = 1.68 ms`, `plain_select = 12.51 ms`.
+  - `524K`: `score = 113.70 ms` (154.7 TFLOPs), `select_blocks = 19.83 ms`, `gather_select = 1.68 ms`, `plain_select = 25.04 ms`.
+  - `1M`: `score = 277.43 ms`, `select_blocks = 39.32 ms`, `gather_select = 1.71 ms`, `plain_select = 49.86 ms`.
+  - Only encoder layers `[2, 8, 14]` execute full-chunk dense scoring; checkpoint inspection (`weights_proj + wq_b`) showed uniform head importance (`0.341..0.363` top-8/32, `0.613..0.621` top-16/32), so head-subset bounds cannot skip significant compute -> skipped.
+- **`wq_b` split proxy (`M=16384` BF16)**: `1.132 ms` single vs `1.134 ms` `4096 + 12288` -> skipped; SP `defer_q` (`_sp_front`/`finish_front`) and `_warm_model_runtime` already cover front overlap and warmup without global `CUDA_MODULE_LOADING=EAGER`.
+- **BPE boundary alignment**: skipped runtime prefix-token rewriting because mutating prefix spelling shifts deterministic logprobs/sampling; retained `_BoundedPieceCache`.
+
+### Code Hardening & Quality / Sanitizer Verification (`sp8` & host)
+- Hardened `sp_prefill.py` (`_record_stream` guard + `try..finally: main.wait_stream(side)` across `project_exchange_rows`, `project_reduce_scatter`, `_project_exchange`), `engram_rows/rows.py` (`__init__` cleanup on failure, `0 <= count <= max_lookups` & `ids_flat.numel() >= count` bounds in `stage()`, idempotent `close()` with `torch.cuda.is_initialized()`), `deepseek_v41.py` / `deepseek_v41_encoding.py` (`Mapping` check + `None` text guards), and fixed `test_deepseek_v41_engram_rows.py:1040` (`pin_scales=False`) and `test_prefix_cache_retention_probe.py` (`long_prefill_token_threshold=4096`, `VLLM_SINK_REJECTION=0`).
+- **vLLM pytest suites on `sp8`**:
+  - 6-file overlay suite: **579 passed, 8 deselected** (`@pytest.mark.asyncio` per `config/release-tests.json`).
+  - 12-file IKET / PDL / confidence / startup / vocab / MoE / attention / stop-strings / fastpath / IPC / retention / DSpark suite: **1,851 passed, 7 skipped, 1 xfailed** (on all non-retention files) + **1,464 passed, 0 skipped, 0 failed** in `test_prefix_cache_retention_probe.py` (`1,415` non-scheduler + `49` scheduler cases under `-p deepseek_models`); **1,942+ passed** across tokenizer + SP prefill + Step 4 regression tests (`2/2` new tests passed).
+- **NVIDIA `compute-sanitizer` on `sp8`** (mounting `/usr/local/cuda-13.0/compute-sanitizer`):
+  - `test_indexer_reads_only_visible_rows` (`initcheck` + `PYTORCH_NO_CUDA_MEMORY_CACHING=1`): **1 passed, 0 errors**.
+  - `memcheck`: **11/11 kernel tests passed, 0 errors**.
+  - `synccheck`: **11/11 kernel tests passed, 0 errors**.
+  - `initcheck` (all 11 kernel tests): **11 passed**; 18 `initcheck` errors reported on `test_moe_experts[idx_dtype0-1-384-576]` (`moe_grouped_fp8_fp4_gemm_kernel+0x28f0`), verified as reading unused bytes `18..19` of the `uint32`-aligned `h_sf` workspace row (`sf_width = 20` vs `18` written scale bytes at `intermediate=576`, ignored by 64-col tail MMA `ki = 0, 1`).
+  - `racecheck`: **0 errors** across indexer, top-$k$, sparse MLA, attention front, `moe_swiglu_cast`, and Engram; flagged `cp.async.mbarrier.arrive.noinc` in `moe_grouped_fp8_fp4_gemm_kernel` (verified `block_M=16` `T.sync_warp()` accesses only warp-local `SFB_shared[w*32..w*32+31]`).
+- **Host C Sanitizers (`ASan` + `UBSan`) on `sp8`**: compiled `engram_rows/_reader.c` via `CC="gcc -fsanitize=address,undefined -fno-omit-frame-pointer"` into `VLLM_NATIVE_CACHE_DIR` and ran targeted `test_deepseek_v41_engram_rows.py` suite (Clock-Pro shield, `pin_scales=True/False`, packed columns, bounds/close) under `libasan.so` + `libubsan.so`: **14 passed, 0 errors**.
