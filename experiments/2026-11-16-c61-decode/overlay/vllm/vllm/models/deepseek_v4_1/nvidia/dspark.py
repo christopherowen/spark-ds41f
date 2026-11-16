@@ -82,6 +82,20 @@ def _context_kv_projection(attn: nn.Module):
     return projection
 
 
+def _grouped_context_kv_projection(projections: list):
+    """Combine homogeneous CUDA context-KV projections into one stacked GEMM."""
+    from ..tilelang.linear import TileLangBlock32Rows, TileLangGroupedBlock32Rows
+
+    if len(projections) < 2 or not all(
+        type(p) is TileLangBlock32Rows and p.weight.is_cuda for p in projections
+    ):
+        return None
+    shapes = {p.weight.shape for p in projections}
+    if len(shapes) != 1:
+        return None
+    return TileLangGroupedBlock32Rows(projections)
+
+
 def _context_capture_sizes(vllm_config: VllmConfig, limit: int) -> list[int]:
     """The context graphs' row counts: the target's decode graph sizes up to ``limit``.
 
@@ -276,6 +290,7 @@ class DSparkDeepseekV4Model(nn.Module):
             )
         prepare.declare(lambda: calls)
         self._context_kv_projections: list = []
+        self._grouped_context_kv_projection = None
 
         self.num_dspark_layers = (
             getattr(config, "n_mtp_layers", None)
@@ -386,8 +401,12 @@ class DSparkDeepseekV4Model(nn.Module):
         """
         from ..tilelang.linear import _warm_casts
 
-        for projection in self._context_kv_projections:
-            projection.declare_kernels()
+        grouped = getattr(self, "_grouped_context_kv_projection", None)
+        if grouped is not None:
+            grouped.declare_kernels()
+        else:
+            for projection in self._context_kv_projections:
+                projection.declare_kernels()
         if self._context_kv_projections:
             if hasattr(self.main_norm, "with_cast"):
                 self.main_norm.with_cast = True
@@ -470,26 +489,29 @@ class DSparkDeepseekV4Model(nn.Module):
             main_cast = kernels.cast_mxfp8(main_x)
         else:
             main_cast = None
+        grouped = getattr(self, "_grouped_context_kv_projection", None)
         with kernels.mxfp8_inputs(main_cast):
-            for i, layer in enumerate(self.layers):
-                slot_mapping = (
-                    context_slot_mappings
-                    if context_slot_mappings is None
-                    or isinstance(context_slot_mappings, torch.Tensor)
-                    else context_slot_mappings[i]
+            kv_raws = (
+                grouped(main_x)
+                if grouped is not None
+                else [proj(main_x) for proj in self._context_kv_projections]
+            )
+        for i, (layer, kv_raw) in enumerate(zip(self.layers, kv_raws)):
+            slot_mapping = (
+                context_slot_mappings
+                if context_slot_mappings is None
+                or isinstance(context_slot_mappings, torch.Tensor)
+                else context_slot_mappings[i]
+            )
+            if slot_mapping is None:
+                continue
+            attn = layer.attn
+            if hasattr(attn, "insert_raw_context_kv"):
+                attn.insert_raw_context_kv(kv_raw, context_positions, slot_mapping)
+            else:
+                _insert_context_kv(
+                    attn, attn.kv_norm(kv_raw), context_positions, slot_mapping
                 )
-                attn = layer.attn
-                kv_raw = self._context_kv_projections[i](main_x)
-                if slot_mapping is None:
-                    continue
-                if hasattr(attn, "insert_raw_context_kv"):
-                    attn.insert_raw_context_kv(
-                        kv_raw, context_positions, slot_mapping
-                    )
-                else:
-                    _insert_context_kv(
-                        attn, attn.kv_norm(kv_raw), context_positions, slot_mapping
-                    )
 
     def forward(
         self,
@@ -1090,6 +1112,9 @@ class DSparkDeepseekV4ForCausalLM(nn.Module):
         self.model._context_kv_projections = [
             _context_kv_projection(layer.attn) for layer in self.model.layers
         ]
+        self.model._grouped_context_kv_projection = _grouped_context_kv_projection(
+            self.model._context_kv_projections
+        )
         first_layer = self.model.layers[0]
         broadcast = (
             first_layer.hc_attn_fn.detach()

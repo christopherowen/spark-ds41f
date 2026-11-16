@@ -212,6 +212,9 @@ from vllm.v1.worker.gpu.spec_decode.eagle.eagle3_utils import (
 from vllm.v1.worker.gpu.spec_decode.greedy_verification import (
     greedy_rejection_sample,
     register_greedy_verification_warmups,
+    register_sampled_verification_warmups,
+    sample_tokens_from_shards,
+    sampled_rejection_sample_from_shards,
     vocab_parallel_pairs,
     vocab_parallel_pairs_from_head,
 )
@@ -837,19 +840,12 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                 self.speculator, "tp_invariant_confidence", False
             ),
             calibrated_confidence=lambda: (
-                (
-                    getattr(
-                        getattr(self.speculator, "acceptance_estimator", None),
-                        "is_calibrated",
-                        False,
-                    )
-                    or getattr(
-                        getattr(self.speculator, "acceptance_estimator", None),
-                        "_refits",
-                        0,
-                    )
-                    > 0
+                getattr(
+                    getattr(self.speculator, "acceptance_estimator", None),
+                    "_refits",
+                    0,
                 )
+                > 0
                 and getattr(self.speculator, "use_confidence_head", False)
             ),
         )
@@ -1324,6 +1320,49 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                     dummy_input_batch.cu_num_logits,
                     steps,
                 )
+        if self._sampled_verification_available():
+            assert self.rejection_sampler is not None
+            head = self._language_model().lm_head
+            shard = head.shard_indices
+            tp_size = get_tensor_model_parallel_world_size()
+            local_logits = self.model.compute_logits_local(hidden_states)
+            dummy_input_batch.ensure_expanded_idx_mapping(self.input_buffers)
+            draft_sampled, pos = logits_rows(dummy_input_batch)
+            for steps in dict.fromkeys(
+                (self.num_draft_steps, self.rejection_sampler.num_speculative_steps)
+                if self.num_draft_steps > 0
+                else (self.rejection_sampler.num_speculative_steps,)
+            ):
+                sampled_rejection_sample_from_shards(
+                    local_logits,
+                    draft_sampled,
+                    dummy_input_batch.cu_num_logits,
+                    pos,
+                    dummy_input_batch.idx_mapping,
+                    dummy_input_batch.expanded_idx_mapping,
+                    dummy_input_batch.expanded_local_pos,
+                    self.sampler.sampling_states.temperature.gpu,
+                    self.sampler.sampling_states.seeds.gpu,
+                    self.rejection_sampler.num_speculative_steps,
+                    shard.num_org_elements,
+                    shard.org_vocab_start_index,
+                    self.vocab_size,
+                    tp_size,
+                    kernel_steps=steps,
+                    apply_temperature=True,
+                )
+            sample_tokens_from_shards(
+                local_logits,
+                dummy_input_batch.cu_num_logits,
+                pos,
+                dummy_input_batch.expanded_idx_mapping,
+                self.sampler.sampling_states.temperature.gpu,
+                self.sampler.sampling_states.seeds.gpu,
+                shard.num_org_elements,
+                shard.org_vocab_start_index,
+                tp_size,
+                apply_temperature=True,
+            )
 
     @torch.inference_mode()
     def _dummy_pooler_run(self, hidden_states: torch.Tensor) -> None:
@@ -2193,6 +2232,24 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                 assert output.num_rejected is not None
                 return output, output.num_sampled, output.num_rejected
             input_batch.ensure_expanded_idx_mapping(self.input_buffers)
+            if getattr(self, "_verifies_from_shards", lambda ib, go, sf: False)(
+                input_batch, grammar_output, sink_flags
+            ):
+                output = self._verify_from_shards(sample_hidden_states, input_batch)
+                if sink_flags is not None:
+                    self._apply_sink(output, input_batch, sink_flags)
+                assert output.num_sampled is not None
+                assert output.num_rejected is not None
+                return output, output.num_sampled, output.num_rejected
+            if getattr(self, "_samples_from_shards", lambda ib, go, sf: False)(
+                input_batch, grammar_output, sink_flags
+            ):
+                output = self._sample_from_shards(sample_hidden_states, input_batch)
+                if sink_flags is not None:
+                    self._apply_sink(output, input_batch, sink_flags)
+                assert output.num_sampled is not None
+                assert output.num_rejected is not None
+                return output, output.num_sampled, output.num_rejected
             logits = self.model.compute_logits(sample_hidden_states)
 
         if grammar_output is not None:
@@ -2292,6 +2349,25 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                 "on" if self._greedy_verification else "off",
             )
         return self._greedy_verification
+
+    _sampled_verification: bool | None = None
+
+    def _sampled_verification_available(self) -> bool:
+        if self._sampled_verification is None:
+            self._sampled_verification = bool(
+                self._greedy_verification_available()
+                and os.environ.get("VLLM_SAMPLED_VERIFICATION", "1") == "1"
+                and self.rejection_sampler is not None
+                and self.rejection_sampler.use_block_verification
+                and getattr(self.speculator, "draft_logits", None) is None
+                and self.sampler is not None
+                and not getattr(self.sampler, "use_fp64_gumbel", False)
+            )
+            logger.info(
+                "Sampled verification from vocabulary shards: %s",
+                "on" if self._sampled_verification else "off",
+            )
+        return self._sampled_verification
 
     def declare_step_kernels(self) -> None:
         """Declare the kernels that input preparation, sampling, greedy
@@ -2523,6 +2599,25 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                         else (self.rejection_sampler.num_speculative_steps,)
                     )
                 ),
+            )
+        if self.rejection_sampler is not None and self._sampled_verification_available():
+            assert head is not None and processor is not None
+            register_sampled_verification_warmups(
+                logits_dtype=processor.head_dtype,
+                shard_vocab_size=head.num_embeddings_per_partition,
+                tp_size=get_tensor_model_parallel_world_size(),
+                num_speculative_steps=self.rejection_sampler.num_speculative_steps,
+                step_widths=tuple(
+                    dict.fromkeys(
+                        (
+                            num_draft_steps,
+                            self.rejection_sampler.num_speculative_steps,
+                        )
+                        if num_draft_steps > 0
+                        else (self.rejection_sampler.num_speculative_steps,)
+                    )
+                ),
+                dead_rows=dead_rows,
             )
         if isinstance(self.speculator, DFlashSpeculator):
             self.speculator.register_warmups(
@@ -2778,6 +2873,193 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                     )
                 )
         return output
+
+    def _batch_verifies_from_shards(
+        self,
+        idx_mapping_np: np.ndarray,
+        num_reqs: int,
+        num_draft_tokens: int,
+        has_structured_output: bool,
+        has_sink_rejection: bool = False,
+    ) -> bool:
+        if (
+            has_structured_output
+            or has_sink_rejection
+            or num_reqs == 0
+            or num_draft_tokens == 0
+            or not self._sampled_verification_available()
+        ):
+            return False
+        assert self.sampler is not None
+        return bool(
+            not self.sampler.any_non_temperature_logits_processing(idx_mapping_np)
+            and self.sampler.get_logprobs_dims(idx_mapping_np) is None
+        )
+
+    def _verifies_from_shards(
+        self,
+        input_batch: InputBatch,
+        grammar_output: GrammarOutput | None,
+        sink_flags: torch.Tensor | None = None,
+    ) -> bool:
+        """A speculative verification step with temperature >= 0 that needs no
+        non-temperature logits processing, logprobs, or sink rejection."""
+        has_sink_rejection = (
+            sink_flags is not None
+            and self.sink is not None
+            and self.sink.rejection
+        )
+        return self._batch_verifies_from_shards(
+            input_batch.idx_mapping_np,
+            input_batch.num_reqs,
+            input_batch.num_draft_tokens,
+            grammar_output is not None,
+            has_sink_rejection,
+        )
+
+    def _verify_from_shards(
+        self,
+        sample_hidden_states: torch.Tensor,
+        input_batch: InputBatch,
+    ) -> SamplerOutput:
+        """Shard-local block verification and resampling without all-gathering
+        the full vocabulary logits across tensor-parallel ranks."""
+        assert self.rejection_sampler is not None and self.sampler is not None
+        head = self._language_model().lm_head
+        shard = head.shard_indices
+        tp_size = get_tensor_model_parallel_world_size()
+        draft_sampled, pos = logits_rows(input_batch)
+        local_logits = self.model.compute_logits_local(sample_hidden_states)
+        kernel_steps = None
+        drafts_per_req = input_batch.num_draft_tokens_per_req
+        step_draft_steps = min(
+            getattr(
+                self,
+                "_step_draft_steps",
+                self.rejection_sampler.num_draft_steps,
+            ),
+            self.rejection_sampler.num_speculative_steps,
+        )
+        if step_draft_steps < self.rejection_sampler.num_speculative_steps and (
+            drafts_per_req is None
+            or min(int(drafts_per_req.max(initial=0)), input_batch.num_draft_tokens)
+            <= step_draft_steps
+        ):
+            kernel_steps = step_draft_steps
+        apply_temperature = bool(
+            np.any(self.sampler.needs_logits_processing[input_batch.idx_mapping_np])
+        )
+        dead_row_cut = getattr(self, "_dead_row_cut", None)
+        sampled, num_sampled = sampled_rejection_sample_from_shards(
+            local_logits=local_logits,
+            draft_sampled=draft_sampled,
+            cu_num_logits=input_batch.cu_num_logits,
+            pos=pos,
+            idx_mapping=input_batch.idx_mapping,
+            expanded_idx_mapping=input_batch.expanded_idx_mapping,
+            expanded_local_pos=input_batch.expanded_local_pos,
+            temperature=self.sampler.sampling_states.temperature.gpu,
+            seed=self.sampler.sampling_states.seeds.gpu,
+            num_speculative_steps=self.rejection_sampler.num_speculative_steps,
+            vocab=shard.num_org_elements,
+            vocab_start=shard.org_vocab_start_index,
+            vocab_size=self.vocab_size,
+            tp_size=tp_size,
+            dead_row_cut=dead_row_cut,
+            kernel_steps=kernel_steps,
+            apply_temperature=apply_temperature,
+        )
+        num_sampled, num_rejected = get_num_sampled_and_rejected(
+            num_sampled,
+            input_batch.seq_lens,
+            input_batch.cu_num_logits,
+            input_batch.idx_mapping,
+            self.sampler.req_states.prefill_len.gpu,
+            dead_row_cut=dead_row_cut,
+        )
+        return SamplerOutput(
+            sampled_token_ids=sampled,
+            logprobs_tensors=None,
+            num_nans=None,
+            num_sampled=num_sampled,
+            num_rejected=num_rejected,
+        )
+
+    def _samples_from_shards(
+        self,
+        input_batch: InputBatch,
+        grammar_output: GrammarOutput | None,
+        sink_flags: torch.Tensor | None = None,
+    ) -> bool:
+        """A 1-token-per-request step (e.g. prefill bonus token or non-draft
+        step) with at least one sampled stream and no non-temperature logits
+        processing or logprobs."""
+        has_sink_rejection = (
+            sink_flags is not None
+            and self.sink is not None
+            and self.sink.rejection
+        )
+        if (
+            grammar_output is not None
+            or has_sink_rejection
+            or input_batch.num_reqs == 0
+            or input_batch.num_draft_tokens != 0
+            or not self._sampled_verification_available()
+        ):
+            return False
+        assert self.sampler is not None
+        idx_mapping_np = input_batch.idx_mapping_np
+        states = self.sampler.sampling_states
+        return bool(
+            np.any(states.temperature.np[idx_mapping_np] != 0.0)
+            and not self.sampler.any_non_temperature_logits_processing(idx_mapping_np)
+            and self.sampler.get_logprobs_dims(idx_mapping_np) is None
+        )
+
+    def _sample_from_shards(
+        self,
+        sample_hidden_states: torch.Tensor,
+        input_batch: InputBatch,
+    ) -> SamplerOutput:
+        """Shard-local Gumbel/greedy token sampling for 1-token-per-request
+        steps without all-gathering the full vocabulary logits."""
+        assert self.sampler is not None
+        head = self._language_model().lm_head
+        shard = head.shard_indices
+        tp_size = get_tensor_model_parallel_world_size()
+        _, pos = logits_rows(input_batch)
+        local_logits = self.model.compute_logits_local(sample_hidden_states)
+        apply_temperature = bool(
+            np.any(self.sampler.needs_logits_processing[input_batch.idx_mapping_np])
+        )
+        sampled = sample_tokens_from_shards(
+            local_logits=local_logits,
+            cu_num_logits=input_batch.cu_num_logits,
+            pos=pos,
+            expanded_idx_mapping=input_batch.expanded_idx_mapping,
+            temperature=self.sampler.sampling_states.temperature.gpu,
+            seed=self.sampler.sampling_states.seeds.gpu,
+            vocab=shard.num_org_elements,
+            vocab_start=shard.org_vocab_start_index,
+            tp_size=tp_size,
+            apply_temperature=apply_temperature,
+        )
+        num_sampled, num_rejected = get_num_sampled_and_rejected(
+            torch.ones(
+                input_batch.num_reqs, dtype=torch.int32, device=sampled.device
+            ),
+            input_batch.seq_lens,
+            input_batch.cu_num_logits,
+            input_batch.idx_mapping,
+            self.sampler.req_states.prefill_len.gpu,
+        )
+        return SamplerOutput(
+            sampled_token_ids=sampled,
+            logprobs_tensors=None,
+            num_nans=None,
+            num_sampled=num_sampled,
+            num_rejected=num_rejected,
+        )
 
     def _init_sink(self, config: SinkConfig, custom_sampler: bool) -> None:
         """Builds the sink detector's sampling state, after the samplers, and
