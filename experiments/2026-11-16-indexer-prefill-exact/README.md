@@ -148,11 +148,16 @@ same token for token as candidate-60's ring sweep.
   show no change outside that spread: +2.8% at 512, −1.4% at 2K, +0.7% at 32K.
 - **Prediction:** +1.8% at 1M; measured +2.1%.
 
-**Gate** (receipts: [receipts/tp4-ring/determinism/](receipts/tp4-ring/determinism/)). Each of
-the four checks makes 81 calls. Every call of boot 1 is identical, tokens and log-probabilities,
-to a call with the same prompt in candidate-58's final ring records: 324 of 324.
-
-Boot 2 was still running when this record was written. Its comparison is added when it completes.
+**Gate** (receipts: [receipts/tp4-ring/determinism/exact-ring-tp4/](receipts/tp4-ring/determinism/exact-ring-tp4/),
+table: [receipts/tp4-ring/lab/exact-ring-tp4-table.txt](receipts/tp4-ring/lab/exact-ring-tp4-table.txt)).
+- **Against candidate-58:** each boot makes 81 calls in each of the four checks. Every one of
+  the 648 calls, over both boots, is identical (tokens and log-probabilities) to a call with the
+  same prompt in candidate-58's final ring records.
+- **Within each boot:** the determinism check reports `identical: true`, with 0 token and 0
+  log-probability differences.
+- **Distinct-prompt decode:** 271.83 / 273.62 tok/s at 16 streams, 202.66 / 202.80 at 8 and
+  156.59 / 157.39 at 4. Candidate-58's ring gate recorded 273.89, 203.39 and 157.98. The
+  indexer change targets prefill, and decode is unchanged within noise.
 
 ## NaN-keeping ReLU (0818)
 
@@ -241,7 +246,7 @@ Cold prefill at long context gets faster with unchanged output.
 
 - **0817:** scoring is 19-22% faster at prefill depths. End to end at tp4-ring, the gain is
   +1.0-1.2% at 237K-470K and +2.1% at 910K tokens (9,064 → 9,251 tok/s). Outputs are identical:
-  324 of 324 gate calls on boot 1 match candidate-58's records, and the kernel benches are
+  648 of 648 gate calls over two boots match candidate-58's records, and the kernel benches are
   bit-identical at every shape.
 - **0818:** the indexer keeps a NaN as DeepSeek's reference does, at no cost and with finite
   outputs unchanged. It closes the last open item of the kernel-contracts work.
