@@ -521,8 +521,29 @@ Open levers:
   MLP / 5,184 aligner on TP3).
 - **Display reserve:** in use for the embedding and output head (842.5 MiB per
   rank of the 2,032 MiB firmware carve-out; `dgx3` keeps its 8 MiB console
-  framebuffer). About 1.2 GiB remains free for read-once-per-step data
-  (`experiments/2026-09-29-display-carveout-kv`).
+  framebuffer). About 1.2 GiB remains free on TP3 (and ~2.0 GiB on TP4) for
+  read-once-per-step data (`experiments/2026-09-29-display-carveout-kv`).
+  - **GPU-L2-cached RM scanout carve-out (`NV01_MEMORY_SYSTEM` with
+    `ISO_YES | GPU_CACHEABLE_YES`) and CUDA VMM contiguous stitching:**
+    `vllm/v1/worker/display_carveout.py` (`0021`/`0030`/`0804`) currently
+    allocates via `/dev/dri/card0` (`DRM_IOCTL_MODE_CREATE_DUMB` +
+    `cuImportExternalMemory`), which inherits `nvidia-drm`'s
+    `GPU_CACHEABLE_DEFAULT -> GPU_CACHEABLE_NO` (`mem.c`) and therefore suffers
+    7 GB/s random 576-byte reads (vs. 221 GB/s in `cudaMalloc`) and 2.3×
+    slower large-$M$ GEMMs (`experiments/2026-09-29-display-carveout-kv`). Screen
+    allocating directly through `/dev/nvidiactl` (`NV_ESC_RM_ALLOC`
+    `NV01_MEMORY_SYSTEM` with `NVOS32_ATTR2_ISO_YES |
+    NVOS32_ATTR2_GPU_CACHEABLE_YES` and 2 MiB huge pages, exported via
+    `NV0000_CTRL_CMD_OS_UNIX_EXPORT_OBJECT_TO_FD` and imported via
+    `cuMemImportFromShareableHandle` + `cuMemAddressReserve` + `cuMemMap`):
+    first run `reserve_bw.cu` and `gemm_place.py` on `sp8` to verify whether
+    `GPU_CACHEABLE_YES` restores full L2 cache reuse (~221 GB/s random reads,
+    1.0× large-$M$ GEMM); if confirmed, use the remaining ~1.2 GiB/rank on TP3
+    (and ~2.0 GiB/rank on TP4) to hold `lm_head` `W_q` screening /
+    `vision_model` / resident `Engram` tables or VMM-stitch (`cuMemMap`) the
+    carve-out onto the KV cache to reclaim 1.2–2.0 GiB of host `MemAvailable`
+    per node while avoiding `/dev/dri/card0` DRM master contention and
+    `cuImportExternalMemory` `cuda-compat` pointer quirks (`0804`).
 - **Uneven head split instead of TP3 padding.** TP3 pads DS4.1's 64 heads and 8
   output groups to 72 and 9 with zero weights (24 heads in 3 groups per rank).
   `experiments/2026-10-03-tp3-tp4-comparison/padding.md` documents all TP3
