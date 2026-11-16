@@ -544,6 +544,26 @@ Open levers:
     carve-out onto the KV cache to reclaim 1.2–2.0 GiB of host `MemAvailable`
     per node while avoiding `/dev/dri/card0` DRM master contention and
     `cuImportExternalMemory` `cuda-compat` pointer quirks (`0804`).
+  - **DMA-BUF VMM range export (`CU_MEM_RANGE_HANDLE_TYPE_DMA_BUF_FD`) and Arm64 Write-Combining / mixed-mapping barrier discipline:**
+    (1) when exporting `cuMemCreate` VMM ranges for CPU `mmap` access or
+    ConnectX-7 RDMA registration (`ibv_reg_dmabuf_mr`), use
+    `cuMemGetHandleForAddressRange(..., CU_MEM_RANGE_HANDLE_TYPE_DMA_BUF_FD, 0)` +
+    `mmap(..., MAP_SHARED, dma_buf_fd, page_offset)` (CUDA 13.3+, no external
+    kernel module required; yields a coherent cached mapping on GB10 unless
+    `CU_MEM_RANGE_FLAG_DMA_BUF_MAPPING_TYPE_PCIE` is set); (2) whenever the CPU
+    copies to or from a Write-Combining (`pgprot_writecombine` / `Normal-NC`)
+    or `Device-nGnRE` mapping on GB10's Armv9.2-A cores (such as the current DRM
+    dumb-buffer scanout carve-out in `display_carveout.py` or ConnectX-7
+    BlueFlame/MMIO doorbells in `sparknet`), avoid `glibc` `memcpy` (which can
+    emit unaligned accesses or partial-line WC flushes) and instead align the
+    device pointer with power-of-two `WRITE_ONCE`/`READ_ONCE` steps followed by
+    64-byte `FEAT_LS64` (`__arm_st64b`/`__arm_ld64b` when
+    `AT_HWCAP3 & HWCAP3_LS64` is set) or 4×-unrolled `vst1q_u8_x4`/`vld1q_u8_x4`
+    NEON bursts and `dmb st`; (3) whenever a code path mixes Write-Combining
+    (`Normal-NC`) and cached (`Normal-WB`) mappings to the same buffer or across
+    payload + completion flags, `dmb st` only orders store-before-store—enforce
+    a full `dmb sy` on the CPU paired with `cuda::thread_scope_system` (`.sys`
+    acquire/release) on the GPU.
 - **Uneven head split instead of TP3 padding.** TP3 pads DS4.1's 64 heads and 8
   output groups to 72 and 9 with zero weights (24 heads in 3 groups per rank).
   `experiments/2026-10-03-tp3-tp4-comparison/padding.md` documents all TP3
