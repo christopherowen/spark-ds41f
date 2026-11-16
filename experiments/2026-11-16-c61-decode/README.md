@@ -137,5 +137,32 @@ Every open decode item in `TODO.md`, open GitHub PR, and unmerged local decode b
     2. **Determinism hash shift (`Rank 7` `ef64f9f42`)**: 2-split TF32 in `mhc.py` shifted `reference_sha256` from `0a2dacdd...` (`c60-base`) to `81a029f1...` (`hc_*_fn` weights use low 8 bits). Reverted `mhc.py` (`99fa40533`).
     3. **Indexer `<2>` decode split (`Rank 6` `a9b2c07fa`)**: Reverted `indexer.py` + `attention.py` (`49ffbed7a`) because `<2>` included `2 <= rows < 64` (avoiding `+0.34% @4K` risk).
 - **Batch 2 Follow-up (`c61-r3-screen-tp4`) Prepared**:
-  - **PR `#986` (`274e85635`)**: Calibrated `adaptive_verification.py` (`SATURATED_ROW_COST_KNEE=64`, `COALESCED_ROW_COST_SCALE=0.28`, `COALESCED_MIN_REQS=10`, `SECOND_WAVE_STEP_ROWS=6.714`, `CONTEXT_ROW_COST_KNEE=262144`, `SINGLE_REQ_TILE_STEP_ROWS=1.0`, preserving `num_sampling_requests <= 1` for copy-spill tests). Verified: `test_adaptive_verification.py` -> `51 passed, 1 skipped` (`11.55s`).
-  - **PR `#984` (`ca879889a`)**: Applied UMA allocator hygiene (`reclaim_uma_memory` / `trim_host_heap`, `freeze_gc_heap` ordering). Verified (`sp8` container `spark-ds41f:candidate-60` with `vllm_test_utils` on `PYTHONPATH`): `241 passed, 1 deselected, 14 warnings` (`63.48s`).
+  - **Rank 16 Part B (`PR #986`, `274e85635`)**: Calibrated `adaptive_verification.py` (`SATURATED_ROW_COST_KNEE=64`, `COALESCED_ROW_COST_SCALE=0.28`, `COALESCED_MIN_REQS=10`, `SECOND_WAVE_STEP_ROWS=6.714`, `CONTEXT_ROW_COST_KNEE=262144`, `SINGLE_REQ_TILE_STEP_ROWS=1.0`, preserving `num_sampling_requests <= 1` for copy-spill tests). Verified: `test_adaptive_verification.py` -> `51 passed, 1 skipped` (`11.55s`).
+  - **Rank 17 (`PR #984`, `ca879889a`)**: Applied UMA allocator hygiene (`reclaim_uma_memory` / `trim_host_heap`, `freeze_gc_heap` ordering). Verified (`sp8` container `spark-ds41f:candidate-60` with `vllm_test_utils` on `PYTHONPATH`): `241 passed, 1 deselected, 14 warnings` (`63.48s`).
+  - **Rank 6 (`indexer-prefill-exact` `pipe`, `00f2fd101`)**: Applied `experiments/2026-11-16-indexer-prefill-exact/overlay/vllm/models/deepseek_v4_1/tilelang/indexer.py` (pipelined `__tl_fetch_k_dense`, `bf16x2` epilogue, 32-bit paired head sum; avoids `<2>` short-decode row-pair assumptions). Verified on `sp8`: `test_deepseek_v41_tilelang.py -k "indexer or topk"` -> `28 passed, 1 skipped, 41 deselected, 1 xfailed` (`40.90s`); `test_deepseek_v41_tilelang_pdl.py` -> `15 passed` (`29.08s`).
+  - **Rank 15 Part 2 (`PR #988` part 2) + Rank 16 Part C (`PR #953`) (`c4094a105`)**:
+    - Sparse top-k Markov bias and sampling (`apply_markov_bias_topk` in `qwen3_dspark.py` and `nvidia/dspark.py`, `topk_greedy_sample` / `topk_gumbel_sample` / `topk_drafting_calls` in `tilelang_sampling.py`, `_can_sample_sparse_topk` and `_sample_sequential_topk` preserving `active_steps` truncation in `dspark/speculator.py`).
+    - Cohort-atomic verification budgeting + phase-locking catch-up merged with `#986` `_step_cost` in `adaptive_verification.py`, plus `_coalesce_idle_burst` (`idle_wakeup_first_poll_s = 0.0003`, `idle_wakeup_burst_poll_s = 0.0015`) in `v1/engine/core.py`.
+    - Verified on `sp8`: `171 passed, 1 skipped` (`test_adaptive_verification.py`, `test_late_admission_sink.py`, `test_worker/test_late_admission.py`, `test_dspark_topk.py`, `test_dspark_v41_gathered_markov.py`, `test_dead_rows.py`, `test_dspark_greedy_markov.py`) and `test_late_admission.py` -> `7 passed` (`7.05s`).
+  - **Ranks 8, 9, 11, 12, 18–20 Evaluation Summary**:
+    - **Ranks 8, 9, 12**: `c60` already includes `s3` MoE, `mhc_finalize + cast_block_mxfp8` (producer `bf16x2` MXFP8 casts), `attention_front` KV-RoPE, 2-stream `_forward_decode_overlapped`, `pdl.chain()` + async `issue_stage_chunk` in `sparse_mla`, `sink-wq-screen`, and `dspark-markov-trunc`.
+    - **Rank 11**: `SparknetOneShotAllReduce` exposes no external producer `send_buf` API.
+    - **Ranks 18–20**: Already opt-in (`compress_ratios=[0,0,0]`, `spec_near_tie_k`, `TP=2`/`TP=3`, `LSA`, `IKET`, `PR #1002`), negative on DS4.1 (`PR #1002`, `2026-11-15-decode-prefix-reuse` regressed prefill `-0.73%..-1.88%`), or multi-stream gateway only (`PR #1141`).
+  - **Isolated Non-MoE `M=1..6` CUDA-Graph Profiler on `sp8` (`µs/call` -> `×40 layers ms`)**:
+
+    | Kernel | `M=1` | `M=3` | `M=4` | `M=6` | `40L` range |
+    | --- | --- | --- | --- | --- | --- |
+    | `mhc.pre` | `10.32 µs` | `11.04 µs` | `11.11 µs` | `10.88 µs` | `0.41–0.44 ms` |
+    | `mhc.post_pre` | `10.89 µs` | `11.25 µs` | `12.27 µs` | `11.35 µs` | `0.44–0.49 ms` |
+    | `wqa_wkv(448)` | `8.21 µs` | `8.16 µs` | `9.35 µs` | `7.12 µs` | `0.28–0.37 ms` |
+    | `front(1280+512)` | `4.10 µs` | `4.09 µs` | `5.84 µs` | `4.10 µs` | `0.16–0.23 ms` |
+    | `wq_b(8192)` | `13.67 µs` | `14.96 µs` | `14.76 µs` | `14.32 µs` | `0.55–0.60 ms` |
+    | `rope_(16,512)` | `4.26 µs` | `2.71 µs` | `2.68 µs` | `2.68 µs` | `0.11–0.17 ms` |
+    | `sparse_mla(512)` | `12.24 µs` | `12.30 µs` | `12.29 µs` | `12.30 µs` | `0.49 ms` |
+    | `sparse_mla(swa)` | `10.25 µs` | `10.56 µs` | `11.00 µs` | `10.74 µs` | `0.41–0.44 ms` |
+    | `wo_proj` | `22.62 µs` | `22.62 µs` | `22.55 µs` | `22.53 µs` | `0.90 ms` (warm) |
+    | `shared_experts` | `20.79 µs` | `20.50 µs` | `19.89 µs` | `20.94 µs` | `0.80–0.84 ms` (warm) |
+    | `idx.dense16K` | `17.13 µs` | `20.92 µs` | `22.96 µs` | `27.40 µs` | — |
+    | `idx.dense64K` | `26.26 µs` | `41.81 µs` | `51.70 µs` | `62.63 µs` | — |
+
+    Physical byte floor (`5,708 MB/step` at `c1` across 39 routed MoE layers + dense projections/heads/drafter) is `21.41 ms` at `266.6 GB/s`.

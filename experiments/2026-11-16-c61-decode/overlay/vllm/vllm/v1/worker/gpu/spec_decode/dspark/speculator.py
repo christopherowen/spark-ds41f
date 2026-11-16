@@ -399,7 +399,7 @@ class DSparkSpeculator(DFlashSpeculator):
         sample_pos: torch.Tensor,
         step: int,
     ) -> torch.Tensor:
-        if not self.use_confidence_head:
+        if not getattr(self, "use_confidence_head", False):
             self._maybe_predict_acceptance(logits, idx_map, self._step_cols[step])
         if self.draft_logits is None:
             draft_ids = logits.argmax(dim=-1)
@@ -459,6 +459,37 @@ class DSparkSpeculator(DFlashSpeculator):
         super().register_warmups(block_table_layouts)
         local_head = getattr(self.model, "supports_local_draft_argmax", lambda: False)()
         if self._draft_topk is not None:
+            if not getattr(self, "sample_from_anchor", False):
+                tilelang_inputs.declare(
+                    lambda: tilelang_inputs.gather_hidden_rows_calls(
+                        self.hidden_states.dtype, self.hidden_states.shape[1]
+                    )
+                )
+            if self._can_sample_sparse_topk():
+                from vllm.v1.worker.gpu.sample import tilelang_sampling
+
+                processor = getattr(self.model, "logits_processor", None)
+                logits_dtype = (
+                    processor.head_dtype
+                    if processor is not None and hasattr(processor, "head_dtype")
+                    else self.dtype
+                )
+                cache_dtype = (
+                    self.draft_logits.dtype if self.draft_logits is not None else None
+                )
+                col_dtype = (
+                    self._step_cols.dtype if self.draft_logits is not None else None
+                )
+                topk = int(self._draft_topk)
+                tilelang_sampling.declare(
+                    lambda: tilelang_sampling.topk_drafting_calls(
+                        logits_dtype,
+                        cache_dtype,
+                        col_dtype,
+                        False,
+                        topk,
+                    )
+                )
             return
         if not self._vocab_parallel_greedy(local_head):
             processor = getattr(self.model, "logits_processor", None)
@@ -730,6 +761,33 @@ class DSparkSpeculator(DFlashSpeculator):
                 active_steps,
             )
 
+    def _can_sample_sparse_topk(self) -> bool:
+        """Whether top-k sequential Markov sampling can operate directly on the
+        compact ``[num_reqs, k]`` candidate tensors without filling or
+        scattering into the full-vocabulary ``[num_reqs, n_spec, vocab_size]``
+        buffer."""
+        w2 = getattr(
+            getattr(getattr(self.model, "model", None), "markov_head", None),
+            "markov_w2",
+            None,
+        )
+        uses_fused_nvfp4_scatter = bool(
+            w2 is not None
+            and getattr(w2, "_retain_weight_for_gather", False)
+            and getattr(w2, "is_w4a16_nvfp4", False)
+        )
+        return (
+            hasattr(self.model, "apply_markov_bias_topk")
+            and not uses_fused_nvfp4_scatter
+            and not _needs_logits_for_acceptance(self)
+            and getattr(self, "_d2t_scatter_index", None) is None
+            and getattr(self, "draft_watermarker", None) is None
+            and not (
+                self.draft_logits is not None
+                and getattr(self, "use_fp64_gumbel", False)
+            )
+        )
+
     def _sample_sequential_topk(
         self,
         num_reqs: int,
@@ -738,10 +796,12 @@ class DSparkSpeculator(DFlashSpeculator):
     ) -> None:
         """Apply the sequential Markov head only to top-k base-logit candidates.
 
-        Candidate selection is done once for all draft positions. At each
-        sequential step, the selected logits are corrected in place and every
-        other entry is set to ``-inf``. The normal dense sampling and rejection
-        paths then consume that truncated distribution unchanged.
+        Candidate selection is done once for all draft positions. When
+        ``_can_sample_sparse_topk`` holds, each sequential step adds the Markov
+        bias on the compact ``[num_reqs, k]`` slice and samples directly over
+        the ``k`` candidates (keying Gumbel draws and tie-breaking by
+        ``draft_indices``), avoiding the full-vocabulary ``-inf`` fill,
+        per-step scatter, and full-vocabulary sampler scan.
         """
         assert self._draft_topk is not None
         n_spec = self.num_speculative_steps
@@ -751,12 +811,9 @@ class DSparkSpeculator(DFlashSpeculator):
             self, head_hidden, num_reqs, active_steps
         )
         base_logits = self.model.compute_draft_logits(sample_hidden)
-        base_logits = base_logits.view(num_reqs, active_steps, -1)
+        vocab_size = base_logits.shape[-1]
+        base_logits = base_logits.view(num_reqs, active_steps, vocab_size)
         base_values, draft_indices = base_logits.topk(self._draft_topk, dim=-1)
-        # Reuse the dense backbone output as the normal sampler's input. Fill
-        # once for all positions, then scatter only the corrected candidates
-        # during the sequential loop.
-        base_logits.fill_(float("-inf"))
         idx_map = self.sample_idx_mapping[:num_sample].view(num_reqs, n_spec)
         sample_pos = self.sample_pos[:num_sample].view(num_reqs, n_spec)
         if active_steps < n_spec:
@@ -765,21 +822,80 @@ class DSparkSpeculator(DFlashSpeculator):
         confidence_markov_embeds: list[torch.Tensor] = []
         prev = self.input_buffers.input_ids[self._anchor_idx[:num_reqs]]
 
-        for i in range(active_steps):
-            markov_embed = self.model.markov_embed(prev)
-            if self.use_confidence_head:
-                confidence_markov_embeds.append(markov_embed)
-            logits_i = self.model.apply_markov_bias_gathered(
-                markov_embed,
-                base_logits[:, i],
-                base_values[:, i],
-                draft_indices[:, i],
-            )
-            draft_sampled_i = self._sample_logits(
-                logits_i, idx_map[:, i], sample_pos[:, i], i
-            )
-            self.draft_tokens[:num_reqs, i] = draft_sampled_i
-            prev = draft_sampled_i
+        if self._can_sample_sparse_topk():
+            from vllm.v1.worker.gpu.sample import tilelang_sampling
+
+            if self.draft_logits is not None:
+                cached_idx = getattr(self, "_cached_topk_indices", None)
+                expected_shape = (
+                    self.draft_logits.shape[0],
+                    self.draft_logits.shape[1],
+                    int(self._draft_topk),
+                )
+                if cached_idx is None or cached_idx.shape != expected_shape:
+                    self.draft_logits.fill_(float("-inf"))
+                    cached_idx = torch.zeros(
+                        expected_shape,
+                        dtype=torch.int64,
+                        device=self.draft_logits.device,
+                    )
+                    self._cached_topk_indices = cached_idx
+            else:
+                cached_idx = None
+
+            for i in range(active_steps):
+                markov_embed = self.model.markov_embed(prev)
+                if self.use_confidence_head:
+                    confidence_markov_embeds.append(markov_embed)
+                cand_logits_i = self.model.apply_markov_bias_topk(
+                    markov_embed,
+                    base_values[:, i],
+                    draft_indices[:, i],
+                )
+                if self.draft_logits is None:
+                    draft_ids = tilelang_sampling.topk_greedy_sample(
+                        cand_logits_i,
+                        draft_indices[:, i],
+                        vocab_size,
+                    )
+                    draft_sampled_i = self.model.map_draft_to_target(draft_ids)
+                else:
+                    draft_sampled_i = tilelang_sampling.topk_gumbel_sample(
+                        cand_logits_i,
+                        draft_indices[:, i],
+                        idx_map[:, i],
+                        self.temperature,
+                        self.seeds,
+                        sample_pos[:, i] - 1,
+                        True,
+                        vocab_size,
+                        is_drafting=True,
+                        logits_cache=self.draft_logits,
+                        logits_cache_col=self._step_cols[i],
+                        cached_indices=cached_idx,
+                    )
+                self.draft_tokens[:num_reqs, i] = draft_sampled_i
+                prev = draft_sampled_i
+        else:
+            # Reuse the dense backbone output as the normal sampler's input. Fill
+            # once for all positions, then scatter only the corrected candidates
+            # during the sequential loop.
+            base_logits.fill_(float("-inf"))
+            for i in range(active_steps):
+                markov_embed = self.model.markov_embed(prev)
+                if self.use_confidence_head:
+                    confidence_markov_embeds.append(markov_embed)
+                logits_i = self.model.apply_markov_bias_gathered(
+                    markov_embed,
+                    base_logits[:, i],
+                    base_values[:, i],
+                    draft_indices[:, i],
+                )
+                draft_sampled_i = self._sample_logits(
+                    logits_i, idx_map[:, i], sample_pos[:, i], i
+                )
+                self.draft_tokens[:num_reqs, i] = draft_sampled_i
+                prev = draft_sampled_i
 
         if self.use_confidence_head:
             _compute_confidence_probs(

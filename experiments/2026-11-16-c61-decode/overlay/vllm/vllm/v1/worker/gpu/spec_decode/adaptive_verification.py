@@ -77,6 +77,7 @@ SATURATED_ROW_COST_SCALE = 0.28
 MMA_TILE_STEP_ROWS = 0.0
 SINGLE_REQ_TILE_STEP_ROWS = 1.0
 SECOND_WAVE_STEP_ROWS = 6.714
+COHORT_CONFIDENCE_TOL = 0.025
 
 # Context-length marginal row-cost scaling: on tp4-ring, Sparse-MLA (top-k=2048)
 # and the TP-sharded 8-layer Indexer keep step time flat through 262,144 tokens
@@ -166,6 +167,9 @@ class AdaptiveVerificationManager:
         self._batch_context_scale = 1.0
         self.tp_invariant_confidence = tp_invariant_confidence
         self.calibrated_confidence = calibrated_confidence
+        self.cohort_confidence_tol = COHORT_CONFIDENCE_TOL
+        self._capacities_cpu_override: dict[str, int] | None = None
+        self._cohort_locked = False
         self.dead_rows_tau = _DEAD_ROWS_TAU
         self._has_admitted_drafts = False
         self._dead_row_cut = torch.empty(
@@ -552,8 +556,29 @@ class AdaptiveVerificationManager:
         )
         stale_confidences = self._stale_confidences[self._stale_idx].np[
             slots, :step_steps
-        ]
-        survival_probability = np.cumprod(stale_confidences.astype(np.float64), axis=1)
+        ].astype(np.float64, copy=True)
+        computed_np = self.req_states.num_computed_tokens_np[slots]
+        prefill_np = self.req_states.prefill_len.np[slots]
+        tol = float(getattr(self, "cohort_confidence_tol", COHORT_CONFIDENCE_TOL))
+        cohorts: dict[tuple[int, int, int], list[int]] = {}
+        if num_reqs >= 2 and step_steps > 0 and tol > 0:
+            groups: dict[tuple[int, int, int], list[int]] = {}
+            for i in range(num_reqs):
+                if sampling_mask[i] and eligible_drafts[i] > 0:
+                    key = (
+                        int(computed_np[i]),
+                        int(prefill_np[i]),
+                        int(eligible_drafts[i]),
+                    )
+                    groups.setdefault(key, []).append(i)
+            for key, idxs in groups.items():
+                if len(idxs) >= 2:
+                    group_conf = stale_confidences[idxs]
+                    if float(np.ptp(group_conf, axis=0).max(initial=0.0)) <= tol:
+                        cohorts[key] = idxs
+                        stale_confidences[idxs] = group_conf.mean(axis=0, keepdims=True)
+
+        survival_probability = np.cumprod(stale_confidences, axis=1)
         steps = np.arange(step_steps)
         valid = steps[None, :] < eligible_drafts[:, None]
         if float(getattr(self, "dead_rows_tau", 0.0)) > 0.0:
@@ -572,8 +597,7 @@ class AdaptiveVerificationManager:
             int(eligible_drafts.sum()),
             max(0, self._max_total_logits - num_reqs * self.num_bonus_tokens),
         )
-        computed_tokens = self.req_states.num_computed_tokens_np[slots]
-        token_spread = float(np.ptp(computed_tokens)) if num_reqs > 1 else 0.0
+        token_spread = float(np.ptp(computed_np)) if num_reqs > 1 else 0.0
         if (
             token_spread > 0.0
             and getattr(self, "context_row_cost_knee", CONTEXT_ROW_COST_KNEE) > 0
@@ -582,7 +606,7 @@ class AdaptiveVerificationManager:
                 getattr(self, "context_source_slope", CONTEXT_SOURCE_SLOPE)
             )
             het_scales = 1.0 + het_slope * (
-                np.maximum(computed_tokens - float(np.min(computed_tokens)), 0.0)
+                np.maximum(computed_np - float(np.min(computed_np)), 0.0)
                 / 65536.0
             )
             req_context_scales = np.maximum(req_context_scales, het_scales)
@@ -594,16 +618,6 @@ class AdaptiveVerificationManager:
             and valid_scores.size > 0
             and float(np.ptp(req_context_scales)) > 1e-6
         )
-        if heterogeneous_context:
-            priorities = valid_scores - self.row_cost * np.maximum(
-                valid_scales - 1.0, 0.0
-            )
-            order = np.lexsort((-valid_scores, -priorities))[:max_draft_budget]
-        else:
-            order = np.argsort(valid_scores, kind="stable")[::-1][:max_draft_budget]
-        scores = valid_scores[order]
-        ordered_scales = valid_scales[order]
-        ordered_req_idx = valid_req_idx[order]
         num_non_draft_tokens_per_req = {
             req_id: int(num_tokens)
             for req_id, num_tokens in zip(req_ids, num_non_draft_tokens, strict=True)
@@ -611,20 +625,126 @@ class AdaptiveVerificationManager:
         base_context_excess = float(
             np.dot(num_non_draft_tokens, np.maximum(req_context_scales - 1.0, 0.0))
         )
-        context_excess_rows = base_context_excess + np.concatenate(
-            ([0.0], np.cumsum(np.maximum(ordered_scales - 1.0, 0.0)))
-        )
-        expected_tokens = np.concatenate(
-            ([num_sampling_requests], num_sampling_requests + np.cumsum(scores))
-        )
-        rows = int(num_non_draft_tokens.sum()) + np.arange(len(scores) + 1)
-        utilities = expected_tokens / self._step_cost(
-            rows,
-            context_excess_rows=context_excess_rows,
-            num_reqs=num_reqs,
-            num_sampling_requests=int(num_sampling_requests),
-        )
-        draft_budget = int(np.argmax(utilities))
+        capacities_cpu: np.ndarray | None = None
+        if cohorts and getattr(self, "_confidence_buffer", torch.empty(1)).shape[0] <= 1:
+            in_cohort = np.zeros(num_reqs, dtype=bool)
+            units: list[tuple[float, list[int]]] = []
+            for idxs in cohorts.values():
+                in_cohort[idxs] = True
+                rep = idxs[0]
+                for d in range(int(eligible_drafts[rep])):
+                    if valid[rep, d]:
+                        units.append((float(survival_probability[rep, d]), idxs))
+                    else:
+                        break
+            for i in range(num_reqs):
+                if not in_cohort[i]:
+                    for d in range(int(eligible_drafts[i])):
+                        if valid[i, d]:
+                            units.append((float(survival_probability[i, d]), [i]))
+                        else:
+                            break
+            units.sort(key=lambda u: u[0], reverse=True)
+            capacities_cpu = np.zeros(num_reqs, dtype=np.int32)
+            base_rows = int(num_non_draft_tokens.sum())
+            best_util = float(num_sampling_requests) / float(
+                self._step_cost(
+                    np.array([base_rows], dtype=np.float64),
+                    context_excess_rows=base_context_excess,
+                    num_reqs=num_reqs,
+                    num_sampling_requests=int(num_sampling_requests),
+                )[0]
+            )
+            running_rows = base_rows
+            running_excess = base_context_excess
+            running_tok = float(num_sampling_requests)
+            admitted_rows = 0
+            best_units = 0
+            for idx_u, (surv, idxs) in enumerate(units, start=1):
+                if admitted_rows + len(idxs) > max_draft_budget:
+                    continue
+                admitted_rows += len(idxs)
+                running_rows += len(idxs)
+                running_excess += float(
+                    np.sum(np.maximum(req_context_scales[idxs] - 1.0, 0.0))
+                )
+                running_tok += surv * len(idxs)
+                cand_util = running_tok / float(
+                    self._step_cost(
+                        np.array([running_rows], dtype=np.float64),
+                        context_excess_rows=running_excess,
+                        num_reqs=num_reqs,
+                        num_sampling_requests=int(num_sampling_requests),
+                    )[0]
+                )
+                if cand_util > best_util:
+                    best_util = cand_util
+                    best_units = idx_u
+            used_rows = 0
+            for surv, idxs in units[:best_units]:
+                if used_rows + len(idxs) <= max_draft_budget:
+                    used_rows += len(idxs)
+                    capacities_cpu[idxs] += 1
+
+            # Phase-locking catch-up: if a minority lead subset is ahead by
+            # 1..step_steps+1 tokens from the main cohort, hold it to 1 token
+            # and cap the main cohort so both merge onto the same position.
+            if cohorts:
+                largest_key = max(cohorts, key=lambda k: len(cohorts[k]))
+                largest_idxs = cohorts[largest_key]
+                pos_b = largest_key[0]
+                prefill_b = largest_key[1]
+                k_b = int(capacities_cpu[largest_idxs[0]])
+                if k_b > 0:
+                    lead_idxs: list[int] = []
+                    min_gap: int | None = None
+                    for i in range(num_reqs):
+                        if (
+                            sampling_mask[i]
+                            and int(prefill_np[i]) == prefill_b
+                            and int(computed_np[i]) > pos_b
+                        ):
+                            gap = int(computed_np[i]) - pos_b
+                            if 1 <= gap <= step_steps + 1:
+                                lead_idxs.append(i)
+                                if min_gap is None or gap < min_gap:
+                                    min_gap = gap
+                    if (
+                        lead_idxs
+                        and len(lead_idxs) < len(largest_idxs)
+                        and min_gap is not None
+                    ):
+                        capacities_cpu[lead_idxs] = 0
+                        capacities_cpu[largest_idxs] = min(k_b, min_gap)
+            draft_budget = int(capacities_cpu.sum())
+            ordered_req_idx = np.empty(0, dtype=np.intp)
+        else:
+            if heterogeneous_context:
+                priorities = valid_scores - self.row_cost * np.maximum(
+                    valid_scales - 1.0, 0.0
+                )
+                order = np.lexsort((-valid_scores, -priorities))[:max_draft_budget]
+            else:
+                order = np.argsort(valid_scores, kind="stable")[::-1][
+                    :max_draft_budget
+                ]
+            scores = valid_scores[order]
+            ordered_scales = valid_scales[order]
+            ordered_req_idx = valid_req_idx[order]
+            context_excess_rows = base_context_excess + np.concatenate(
+                ([0.0], np.cumsum(np.maximum(ordered_scales - 1.0, 0.0)))
+            )
+            expected_tokens = np.concatenate(
+                ([num_sampling_requests], num_sampling_requests + np.cumsum(scores))
+            )
+            rows = int(num_non_draft_tokens.sum()) + np.arange(len(scores) + 1)
+            utilities = expected_tokens / self._step_cost(
+                rows,
+                context_excess_rows=context_excess_rows,
+                num_reqs=num_reqs,
+                num_sampling_requests=int(num_sampling_requests),
+            )
+            draft_budget = int(np.argmax(utilities))
         # The confidences come from an estimator that learns only from admitted
         # drafts, so a long run of empty budgets would leave it without the
         # evidence to ever admit one again. Periodically verify one draft per
@@ -634,6 +754,9 @@ class AdaptiveVerificationManager:
             idle += 1
             if idle >= EXPLORE_AFTER_IDLE_STEPS:
                 draft_budget = min(num_reqs, max_draft_budget)
+                if capacities_cpu is not None:
+                    capacities_cpu[:] = 0
+                    capacities_cpu[:draft_budget] = 1
                 idle = 0
         else:
             idle = 0
@@ -663,6 +786,12 @@ class AdaptiveVerificationManager:
             num_reqs,
             self.row_cost,
         )
+        self._capacities_cpu_override = (
+            {req_id: int(c) for req_id, c in zip(req_ids, capacities_cpu, strict=True)}
+            if capacities_cpu is not None
+            else None
+        )
+        self._cohort_locked = capacities_cpu is not None
         self._batch_budget = (
             num_drafts_per_req,
             num_non_draft_tokens_per_req,
@@ -716,6 +845,8 @@ class AdaptiveVerificationManager:
         The confidences are the current drafts', broadcast from rank 0, so
         every rank marks the same rows.
         """
+        if getattr(self, "_cohort_locked", False):
+            return None
         tau = self.effective_dead_rows_tau()
         if tau <= 0 or not getattr(self, "_has_admitted_drafts", True):
             return None
@@ -744,6 +875,8 @@ class AdaptiveVerificationManager:
         batch_budget, self._batch_budget = self._batch_budget, None
         assert batch_budget is not None
         num_drafts_per_req, num_non_draft_tokens_per_req, draft_budget = batch_budget
+        override = getattr(self, "_capacities_cpu_override", None)
+        self._capacities_cpu_override = None
         num_reqs = idx_mapping.shape[0]
         scheduled_drafts = np.fromiter(
             (num_drafts_per_req[req_id] for req_id in req_ids),
@@ -770,17 +903,25 @@ class AdaptiveVerificationManager:
         self._has_admitted_drafts = draft_budget > 0
         capacities = self._batch_draft_capacity[:num_reqs]
         if draft_budget:
-            if num_reqs == 1:
-                scheduled_drafts[0] = draft_budget
-            async_tensor_h2d(scheduled_drafts, out=capacities)
-            if draft_budget < int(scheduled_drafts.sum()):
-                tilelang_inputs.assign_draft_budget(
-                    self._confidence_probs[:, :step_steps],
-                    idx_mapping,
-                    capacities,
-                    draft_budget,
-                    step_steps,
+            if override is not None:
+                cohort_caps = np.fromiter(
+                    (override[req_id] for req_id in req_ids),
+                    dtype=np.int32,
+                    count=num_reqs,
                 )
+                async_tensor_h2d(cohort_caps, out=capacities)
+            else:
+                if num_reqs == 1:
+                    scheduled_drafts[0] = draft_budget
+                async_tensor_h2d(scheduled_drafts, out=capacities)
+                if draft_budget < int(scheduled_drafts.sum()):
+                    tilelang_inputs.assign_draft_budget(
+                        self._confidence_probs[:, :step_steps],
+                        idx_mapping,
+                        capacities,
+                        draft_budget,
+                        step_steps,
+                    )
 
         num_non_draft_tokens_gpu = self._num_non_draft_tokens[:num_reqs]
         async_tensor_h2d(num_non_draft_tokens, out=num_non_draft_tokens_gpu)

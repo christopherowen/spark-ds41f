@@ -3772,6 +3772,412 @@ def drafting_calls(
     ]
 
 
+
+
+# --- Sparse top-k draft sampling ----------------------------------------------
+
+
+@tilelang.jit(pass_configs=_PASS)
+def topk_greedy_sample_kernel(
+    logits_dtype: str,
+    index_dtype: str = "int64",
+    threads: int = _THREADS,
+    per_thread: int = 2,
+):
+    """Sparse-support greedy argmax over topk candidate logits and their
+    vocabulary indices cand_indices. Tie-breaking follows _first_argmax
+    on global vocabulary indices (lowest vocabulary index wins ties; NaN beats
+    finite values). When topk < vocab, column 0 of the implicit -inf
+    background is seeded so an all--inf candidate set still selects token 0
+    just as logits.fill_(-inf) + scatter_ + argmax(-1) does."""
+    tokens, topk = T.dynamic("tokens, topk")
+    logits_stride, idx_stride = T.dynamic("logits_stride, idx_stride", "int64")
+    warps = threads // 32
+
+    @T.prim_func
+    def topk_greedy_sample(
+        cand_logits: T.StridedTensor((tokens, topk), (logits_stride, 1), logits_dtype),
+        cand_indices: T.StridedTensor((tokens, topk), (idx_stride, 1), index_dtype),
+        sampled: T.Tensor((tokens,), T.int64),
+        vocab: T.int32,
+    ):
+        with T.Kernel(tokens, threads=threads) as t:
+            T.import_source(_HEADER)
+            tx = T.get_thread_binding()
+            best = T.alloc_local((1,), T.float32)
+            best_index = T.alloc_local((1,), T.int32)
+            other = T.alloc_local((1,), T.float32)
+            other_index = T.alloc_local((1,), T.int32)
+            partial = T.alloc_shared((warps,), T.float32)
+            partial_index = T.alloc_shared((warps,), T.int32)
+
+            best[0] = -T.infinity(T.float32)
+            best_index[0] = T.if_then_else(
+                (tx == 0) & (topk < vocab), T.int32(0), T.int32(_INT32_MAX)
+            )
+            for r in T.unroll(per_thread):
+                c = r * threads + tx
+                if c < topk:
+                    val = T.cast(cand_logits[t, c], T.float32)
+                    idx = T.cast(cand_indices[t, c], T.int32)
+                    _first_keep_or_take(best, best_index, val, idx)
+
+            _first_exchange(best, best_index, other, other_index, 16)
+            _first_exchange(best, best_index, other, other_index, 8)
+            _first_exchange(best, best_index, other, other_index, 4)
+            _first_exchange(best, best_index, other, other_index, 2)
+            _first_exchange(best, best_index, other, other_index, 1)
+            if tx % 32 == 0:
+                partial[tx // 32] = best[0]
+                partial_index[tx // 32] = best_index[0]
+            T.sync_threads()
+            if tx < warps:
+                best[0] = partial[tx]
+                best_index[0] = partial_index[tx]
+            _first_exchange(best, best_index, other, other_index, 2)
+            _first_exchange(best, best_index, other, other_index, 1)
+            if tx == 0:
+                sampled[t] = T.cast(best_index[0], T.int64)
+
+    return topk_greedy_sample
+
+
+def topk_greedy_sample_key(
+    logits_dtype: torch.dtype,
+    index_dtype: torch.dtype = torch.int64,
+    topk: int = 128,
+) -> tuple:
+    per_thread = max(-(-topk // _THREADS), 1)
+    return (_DTYPES[logits_dtype], _DTYPES[index_dtype], _THREADS, per_thread)
+
+
+def topk_greedy_sample(
+    cand_logits: torch.Tensor,
+    cand_indices: torch.Tensor,
+    vocab_size: int,
+) -> torch.Tensor:
+    """Sparse-support argmax(dim=-1) over (cand_logits, cand_indices)."""
+    num_tokens, topk = cand_logits.shape
+    sampled = torch.empty(num_tokens, dtype=torch.int64, device=cand_logits.device)
+    if num_tokens == 0:
+        return sampled
+    if cand_logits.stride(-1) != 1:
+        cand_logits = cand_logits.contiguous()
+    if cand_indices.stride(-1) != 1:
+        cand_indices = cand_indices.contiguous()
+    key = topk_greedy_sample_key(cand_logits.dtype, cand_indices.dtype, topk)
+    _kernel(topk_greedy_sample_kernel, *key)(
+        cand_logits, cand_indices, sampled, int(vocab_size)
+    )
+    return sampled
+
+
+@tilelang.jit(pass_configs=_PASS)
+def topk_gumbel_sample_kernel(
+    logits_dtype: str,
+    idx_dtype: str,
+    apply_temperature: bool,
+    is_drafting: bool,
+    cache_dtype: str | None,
+    col_dtype: str | None,
+    per_token_col: bool,
+    per_thread: int = 2,
+    pos_dtype: str = "int64",
+    cand_idx_dtype: str = "int64",
+):
+    """Sparse-support Gumbel-max sampling over topk candidates (cand_logits,
+    cand_indices). Each candidate's Philox word is drawn at its global vocabulary
+    index index = cand_indices[t, c] using vllm_randint32(word_seed[0], index)
+    so the random stream and tie-breaking match full-vocabulary gumbel_sample on a
+    -inf-masked vocabulary tensor bit for bit. When cache_dtype is given, the
+    previous step's topk cached indices cached_indices[req, col, :] are first
+    cleared to -inf in cache before writing the new topk candidate scores
+    and updating cached_indices."""
+    tokens, topk = T.dynamic("tokens, topk")
+    idx_len, pos_len, seed_len, temp_len = T.dynamic(
+        "idx_len, pos_len, seed_len, temp_len"
+    )
+    logits_stride, cand_idx_stride = T.dynamic(
+        "logits_stride, cand_idx_stride", "int64"
+    )
+    cached = cache_dtype is not None
+    cache_reqs, cache_cols, cache_vocab, num_cols = T.dynamic(
+        "cache_reqs, cache_cols, cache_vocab, num_cols"
+    )
+    cache_stride_0, cache_stride_1 = T.dynamic(
+        "cache_stride_0, cache_stride_1", "int64"
+    )
+    cached_idx_stride_0, cached_idx_stride_1 = T.dynamic(
+        "cached_idx_stride_0, cached_idx_stride_1", "int64"
+    )
+    if not cached:
+        cache_dtype, col_dtype = "float32", "int64"
+
+    @T.prim_func
+    def topk_gumbel_sample(
+        sampled: T.Tensor((tokens,), T.int64),
+        cand_logits: T.StridedTensor((tokens, topk), (logits_stride, 1), logits_dtype),
+        cand_indices: T.StridedTensor((tokens, topk), (cand_idx_stride, 1), cand_idx_dtype),
+        idx_mapping: T.Tensor((idx_len,), idx_dtype),
+        seeds: T.Tensor((seed_len,), T.int64),
+        pos: T.Tensor((pos_len,), pos_dtype),
+        temperature: T.Tensor((temp_len,), T.float32),
+        cache: T.StridedTensor(
+            (cache_reqs, cache_cols, cache_vocab),
+            (cache_stride_0, cache_stride_1, 1),
+            cache_dtype,
+        ),
+        cache_col: T.Tensor((num_cols,), col_dtype),
+        cached_indices: T.StridedTensor(
+            (cache_reqs, cache_cols, topk),
+            (cached_idx_stride_0, cached_idx_stride_1, 1),
+            cand_idx_dtype,
+        ),
+        vocab: T.int32,
+    ):
+        with T.Kernel(tokens, threads=_THREADS) as t:
+            T.import_source(_HEADER)
+            tx = T.get_thread_binding()
+            req = T.alloc_local((1,), T.int64)
+            temp = T.alloc_local((1,), T.float32)
+            seed = T.alloc_local((1,), T.int64)
+            col = T.alloc_local((1,), T.int64)
+            word_seed = T.alloc_local((1,), T.uint32)
+            score = T.alloc_local((1,), T.float32)
+            best = T.alloc_local((1,), T.float32)
+            best_index = T.alloc_local((1,), T.int32)
+            other = T.alloc_local((1,), T.float32)
+            other_index = T.alloc_local((1,), T.int32)
+            partial = T.alloc_shared((_WARPS,), T.float32)
+            partial_index = T.alloc_shared((_WARPS,), T.int32)
+
+            req[0] = T.cast(idx_mapping[t], T.int64)
+            temp[0] = T.float32(0)
+            seed[0] = T.int64(0)
+            if req[0] >= 0:
+                temp[0] = temperature[req[0]]
+                seed[0] = seeds[req[0]]
+            if cached:
+                if per_token_col:
+                    col[0] = T.cast(cache_col[t], T.int64)
+                else:
+                    col[0] = T.cast(cache_col[0], T.int64)
+                seed[0] = seed[0] ^ T.shift_left(col[0], T.int64(32))
+                if req[0] >= 0:
+                    for r in T.unroll(per_thread):
+                        c = r * _THREADS + tx
+                        if c < topk:
+                            old_idx = T.cast(cached_indices[req[0], col[0], c], T.int32)
+                            if (old_idx >= 0) & (old_idx < vocab):
+                                cache[req[0], col[0], old_idx] = T.cast(
+                                    -T.infinity(T.float32), cache_dtype
+                                )
+                T.sync_threads()
+            word_seed[0] = _randint_at(seed[0], pos[t], pos_dtype, is_drafting)
+
+            best[0] = -T.infinity(T.float32)
+            best_index[0] = T.if_then_else(
+                (tx == 0) & (topk < vocab), T.int32(0), T.int32(_INT32_MAX)
+            )
+            if temp[0] != T.float32(0):
+                for r in T.unroll(per_thread):
+                    c = r * _THREADS + tx
+                    if c < topk:
+                        index = T.cast(cand_indices[t, c], T.int32)
+                        word = T.alloc_var(
+                            T.uint32,
+                            init=T.call_extern(
+                                "uint32", "vllm_randint32", word_seed[0], index
+                            ),
+                        )
+                        score[0] = T.cast(cand_logits[t, c], T.float32)
+                        if cached:
+                            if req[0] >= 0:
+                                cache[req[0], col[0], index] = T.cast(
+                                    score[0], cache_dtype
+                                )
+                                cached_indices[req[0], col[0], c] = T.cast(
+                                    index, cand_idx_dtype
+                                )
+                        if apply_temperature:
+                            score[0] = T.call_extern(
+                                "float32", "vllm_div_full", score[0], temp[0]
+                            )
+                        score[0] = T.call_extern(
+                            "float32", "vllm_gumbel_score", score[0], word
+                        )
+                        _first_keep_or_take(best, best_index, score[0], index)
+            else:
+                for r in T.unroll(per_thread):
+                    c = r * _THREADS + tx
+                    if c < topk:
+                        index = T.cast(cand_indices[t, c], T.int32)
+                        score[0] = T.cast(cand_logits[t, c], T.float32)
+                        if cached:
+                            if req[0] >= 0:
+                                cache[req[0], col[0], index] = T.cast(
+                                    score[0], cache_dtype
+                                )
+                                cached_indices[req[0], col[0], c] = T.cast(
+                                    index, cand_idx_dtype
+                                )
+                        _first_keep_or_take(best, best_index, score[0], index)
+
+            _first_exchange(best, best_index, other, other_index, 16)
+            _first_exchange(best, best_index, other, other_index, 8)
+            _first_exchange(best, best_index, other, other_index, 4)
+            _first_exchange(best, best_index, other, other_index, 2)
+            _first_exchange(best, best_index, other, other_index, 1)
+            if tx % 32 == 0:
+                partial[tx // 32] = best[0]
+                partial_index[tx // 32] = best_index[0]
+            T.sync_threads()
+            if tx < _WARPS:
+                best[0] = partial[tx]
+                best_index[0] = partial_index[tx]
+            _first_exchange(best, best_index, other, other_index, 2)
+            _first_exchange(best, best_index, other, other_index, 1)
+            if tx == 0:
+                sampled[t] = T.cast(best_index[0], T.int64)
+
+    return topk_gumbel_sample
+
+
+def topk_gumbel_sample_key(
+    logits_dtype: torch.dtype,
+    idx_dtype: torch.dtype,
+    apply_temperature: bool,
+    is_drafting: bool,
+    cache_dtype: torch.dtype | None = None,
+    col_dtype: torch.dtype | None = None,
+    per_token_col: bool = False,
+    topk: int = 128,
+    pos_dtype: torch.dtype = torch.int64,
+    cand_idx_dtype: torch.dtype = torch.int64,
+) -> tuple:
+    per_thread = max(-(-topk // _THREADS), 1)
+    return (
+        _DTYPES[logits_dtype],
+        _DTYPES[idx_dtype],
+        apply_temperature,
+        is_drafting,
+        None if cache_dtype is None else _DTYPES[cache_dtype],
+        None if cache_dtype is None or col_dtype is None else _DTYPES[col_dtype],
+        bool(cache_dtype is not None and per_token_col),
+        per_thread,
+        _DTYPES[pos_dtype],
+        _DTYPES[cand_idx_dtype],
+    )
+
+
+def topk_gumbel_sample(
+    cand_logits: torch.Tensor,
+    cand_indices: torch.Tensor,
+    idx_mapping: torch.Tensor,
+    temperature: torch.Tensor,
+    seeds: torch.Tensor,
+    pos: torch.Tensor,
+    apply_temperature: bool,
+    vocab_size: int,
+    *,
+    is_drafting: bool = False,
+    logits_cache: torch.Tensor | None = None,
+    logits_cache_col: torch.Tensor | None = None,
+    cached_indices: torch.Tensor | None = None,
+) -> torch.Tensor:
+    """Sparse-support gumbel_sample over (cand_logits, cand_indices)."""
+    num_tokens, topk = cand_logits.shape
+    sampled = torch.empty(num_tokens, dtype=torch.int64, device=cand_logits.device)
+    if num_tokens == 0:
+        return sampled
+    if cand_logits.stride(-1) != 1:
+        cand_logits = cand_logits.contiguous()
+    if cand_indices.stride(-1) != 1:
+        cand_indices = cand_indices.contiguous()
+    idx_mapping = idx_mapping.contiguous()
+    pos = pos.contiguous()
+    if logits_cache is None:
+        cache = torch.empty((1, 1, 1), dtype=torch.float32, device=cand_logits.device)
+        col = torch.empty((1,), dtype=torch.int64, device=cand_logits.device)
+        cached_idx = torch.empty(
+            (1, 1, topk), dtype=cand_indices.dtype, device=cand_logits.device
+        )
+        cache_dtype = None
+        col_dtype = None
+        per_token_col = False
+    else:
+        assert logits_cache_col is not None
+        assert cached_indices is not None
+        if logits_cache.stride(-1) != 1:
+            raise ValueError("logits_cache must be contiguous along the vocabulary")
+        cache = logits_cache
+        col = logits_cache_col.contiguous().view(-1)
+        cached_idx = cached_indices
+        cache_dtype = cache.dtype
+        col_dtype = col.dtype
+        per_token_col = col.numel() > 1
+
+    key = topk_gumbel_sample_key(
+        cand_logits.dtype,
+        idx_mapping.dtype,
+        apply_temperature,
+        is_drafting,
+        cache_dtype,
+        col_dtype,
+        per_token_col,
+        topk,
+        pos.dtype,
+        cand_indices.dtype,
+    )
+    _kernel(topk_gumbel_sample_kernel, *key)(
+        sampled,
+        cand_logits,
+        cand_indices,
+        idx_mapping,
+        seeds,
+        pos,
+        temperature,
+        cache,
+        col,
+        cached_idx,
+        int(vocab_size),
+    )
+    return sampled
+
+
+def topk_drafting_calls(
+    logits_dtype: torch.dtype,
+    cache_dtype: torch.dtype | None,
+    col_dtype: torch.dtype | None,
+    per_token_col: bool,
+    topk: int,
+    cand_idx_dtype: torch.dtype = torch.int64,
+) -> list:
+    """Sparse top-k draft sampling calls (greedy and Gumbel-max)."""
+    calls = [
+        _call(
+            topk_greedy_sample_kernel,
+            *topk_greedy_sample_key(logits_dtype, cand_idx_dtype, topk),
+        ),
+        _call(
+            topk_gumbel_sample_kernel,
+            *topk_gumbel_sample_key(
+                logits_dtype,
+                RUNNER_IDX_DTYPE,
+                True,
+                True,
+                cache_dtype,
+                col_dtype,
+                per_token_col,
+                topk,
+                torch.int64,
+                cand_idx_dtype,
+            ),
+        ),
+    ]
+    return _unique(calls)
+
+
 def _unique(calls: list) -> list:
     """``calls`` without repeats (a call's keyword arguments are unhashable)."""
     seen: set = set()

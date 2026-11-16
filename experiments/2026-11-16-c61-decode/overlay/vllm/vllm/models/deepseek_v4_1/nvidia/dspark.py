@@ -862,21 +862,14 @@ class DSparkDeepseekV4ForCausalLM(nn.Module):
             top2=top2,
         )
 
-    def apply_markov_bias_gathered(
+    def apply_markov_bias_topk(
         self,
         markov_embed: torch.Tensor,
-        logits: torch.Tensor,
         values: torch.Tensor,
         index: torch.Tensor,
     ) -> torch.Tensor:
-        """Add the Markov bias to the top-k base-logit candidates only.
-
-        Reads k rows of the replicated ``markov_w2`` per request instead of
-        the whole vocabulary projection at every draft position. ``logits``
-        is the caller's ``-inf``-filled buffer; the corrected candidates are
-        scattered into it. The target still verifies every draft, so this
-        can change acceptance but not the output.
-        """
+        """Return ``values + markov_bias`` ([num_reqs, k]) on the top-k candidates
+        without scattering into a full-vocabulary buffer."""
         w2 = self.model.markov_head.markov_w2
         if hasattr(w2, "packed_bf16_exponent_base"):
             from ..tilelang.embedding import vocab_embedding_packed
@@ -910,7 +903,25 @@ class DSparkDeepseekV4ForCausalLM(nn.Module):
         bias = bias.squeeze(-1).to(values.dtype)
         if self.logits_processor.scale != 1.0:
             bias = bias * self.logits_processor.scale
-        return logits.scatter_(1, index, (values + bias).to(logits.dtype))
+        return values + bias
+
+    def apply_markov_bias_gathered(
+        self,
+        markov_embed: torch.Tensor,
+        logits: torch.Tensor,
+        values: torch.Tensor,
+        index: torch.Tensor,
+    ) -> torch.Tensor:
+        """Add the Markov bias to the top-k base-logit candidates only.
+
+        Reads k rows of the replicated ``markov_w2`` per request instead of
+        the whole vocabulary projection at every draft position. ``logits``
+        is the caller's ``-inf``-filled buffer; the corrected candidates are
+        scattered into it. The target still verifies every draft, so this
+        can change acceptance but not the output.
+        """
+        cand = self.apply_markov_bias_topk(markov_embed, values, index)
+        return logits.scatter_(1, index, cand.to(logits.dtype))
 
     def compute_confidence(
         self,
