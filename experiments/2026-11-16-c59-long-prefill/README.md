@@ -110,4 +110,29 @@ Spec: [bench-prefill-short-tp4-switched.json](bench-prefill-short-tp4-switched.j
 bin/spark candidate queue tp4-switched experiments/2026-11-16-c59-long-prefill/bench-prefill-short-tp4-switched.json --apply
 ```
 
-Runs: pending.
+### Short-prompt runs
+
+Queue entry `20261116T190116-bench-prefill-short-tp4-switched` ran on sp1..sp4 from 19:01Z to
+19:07Z on 2026-11-16, at deployment commit `7db478260`. Both boots exited 0.
+
+| Size label | Actual tokens | b1 tok/s (TTFT) | b2 tok/s (TTFT) | Mean tok/s | Mean TTFT |
+|---|---|---|---|---|---|
+| 512 | 464 | 1,815.7 (0.247 s) | 1,806.1 (0.248 s) | 1,810.9 | 0.248 s |
+| 1,024 | 1,041 | 3,155.7 (0.319 s) | 3,179.5 (0.316 s) | 3,167.6 | 0.318 s |
+| 2,048 | 1,882 | 4,815.9 (0.415 s) | 4,791.9 (0.417 s) | 4,803.9 | 0.416 s |
+| 4,096 | 4,572 | 6,958.4 (0.620 s) | 6,922.7 (0.623 s) | 6,940.6 | 0.622 s |
+| 8,192 | 7,644 | 8,127.3 (0.956 s) | 8,198.6 (0.948 s) | 8,163.0 | 0.952 s |
+| 16,384 | 14,900 | 9,279.1 (1.608 s) | 9,244.8 (1.614 s) | 9,262.0 | 1.611 s |
+| 32,768 | 28,805 | 9,598.9 (3.011 s) | 9,617.0 (3.005 s) | 9,608.0 | 3.008 s |
+
+- **Anchor:** the 32K anchor reads 0.6% above candidate-59's recorded 9,548.5 tok/s at 28,907
+  tokens.
+- **Memory:** the lowest `MemAvailable` was 17.89-17.9 GiB on sp1 and 20.35-20.47 GiB on
+  sp2..sp4, with no swap growth.
+- **Thermals:** the GPU peaked at 52 °C.
+
+Receipts: [receipts/tp4-switched-short/](receipts/tp4-switched-short/).
+
+Below about 4K tokens, time to first token sets the rate. A 464-token prompt answers in 0.25 s,
+and up to 4K each extra 1K tokens adds only about 0.09 s. Assuming a straight line through
+these points, the fixed per-request cost is roughly 0.2 s.
