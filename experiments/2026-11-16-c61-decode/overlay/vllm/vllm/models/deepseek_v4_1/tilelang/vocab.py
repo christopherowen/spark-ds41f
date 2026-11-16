@@ -3515,16 +3515,29 @@ def build_screen_weights(
         full_amax = w_full_f.abs().amax(dim=1).clamp(min=1e-12)
         extreme_mask = (full_amax > 8.0 * in_amax) | ~torch.isfinite(full_amax)
         use_amax = torch.where(extreme_mask, in_amax, full_amax)
-        r_scale = use_amax / (127.0 / 128.0)
+        base_scale = use_amax / (127.0 / 128.0)
         w_target = torch.where(extreme_mask.unsqueeze(1), w_in_f, w_full_f)
-        scaled = (w_target / r_scale.unsqueeze(1)) * 128.0
         sign = (w_target < 0).to(torch.uint8)
-        u7 = torch.clamp(torch.round(scaled.abs()), 0, 127).to(torch.uint8)
-        W_q[start:end] = (sign << 7) | u7
-        q_signed = torch.where(sign == 1, -u7.float(), u7.float())
-        W_hat = (q_signed / 128.0).bfloat16().float() * r_scale.unsqueeze(1)
-        R = w_full_f - W_hat
-        r_v = torch.linalg.vector_norm(R, dim=1)
+        abs_target = w_target.abs()
+
+        def _eval_alpha(alpha: float) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+            cand_scale = base_scale * alpha
+            scaled = (abs_target / cand_scale.unsqueeze(1)) * 128.0
+            u7 = torch.clamp(torch.round(scaled), 0, 127).to(torch.uint8)
+            q_signed = torch.where(sign == 1, -u7.float(), u7.float())
+            w_hat = (q_signed / 128.0).bfloat16().float() * cand_scale.unsqueeze(1)
+            cand_r_v = torch.linalg.vector_norm(w_full_f - w_hat, dim=1)
+            return cand_scale, u7, cand_r_v
+
+        r_scale, best_u7, r_v = _eval_alpha(1.0)
+        for alpha in (0.93, 0.86, 0.80, 0.74, 0.68, 0.62, 0.55):
+            cand_scale, u7, cand_r_v = _eval_alpha(alpha)
+            better = cand_r_v < r_v
+            if better.any():
+                r_scale = torch.where(better, cand_scale, r_scale)
+                best_u7 = torch.where(better.unsqueeze(1), u7, best_u7)
+                r_v = torch.where(better, cand_r_v, r_v)
+        W_q[start:end] = (sign << 7) | best_u7
         w_norm = torch.linalg.vector_norm(w_full_f, dim=1)
         r_bound = r_v * 1.0005 + w_norm * 5e-4 + 1e-7
         r_bound = torch.where(

@@ -847,12 +847,19 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                 self.speculator, "tp_invariant_confidence", False
             ),
             calibrated_confidence=lambda: (
-                getattr(
-                    getattr(self.speculator, "acceptance_estimator", None),
-                    "_refits",
-                    0,
+                (
+                    getattr(
+                        getattr(self.speculator, "acceptance_estimator", None),
+                        "is_calibrated",
+                        False,
+                    )
+                    or getattr(
+                        getattr(self.speculator, "acceptance_estimator", None),
+                        "_refits",
+                        0,
+                    )
+                    > 0
                 )
-                > 0
                 and getattr(self.speculator, "use_confidence_head", False)
             ),
         )

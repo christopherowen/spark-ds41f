@@ -320,7 +320,7 @@ graph retention (`0728`), fused single-rank Markov drafting (`0717`), and
 device-side `prepare_inputs` folding (`0754`) are all active.
 
 Open levers:
-- **Single-stream (`c1`) cold-L2 routed-MoE marginal row cost and `DEAD_ROWS_TAU` break-even calibration.** On `sp8` across 16 distinct layer weights (`>2 GiB`, cold L2 matching real serving), 39-layer `MoeExpertsV41Plan` at `M_pad=6` scales with `live_rows = 1..6` (`6 -> 12 -> 18 -> 24 -> 29 -> 34` unique experts/layer) as `4.66 -> 8.76 (+4.10) -> 13.08 (+4.32) -> 17.02 (+3.94) -> 20.57 (+3.55) -> 24.08 (+3.51) ms`. Because `c1` (`num_reqs = 1`) has no cross-request expert sharing, each additional live draft row costs `~3.9–4.3 ms/step` (`~20%` of base step time, vs `adaptive_verification_row_cost = 0.035`), putting `prose-c1` (`~0.082 tok/ms`) marginal survival break-even at `s >= 0.33` (whereas at `c16`, `~38` rows share already-active experts and marginal row cost is `~0.5 ms`). Screen single-request `row_cost` / `effective_dead_rows_tau(num_reqs=1)` calibration paired with `PR #1003` warm-started `OnlineAcceptanceEstimator` intercepts (`_WARM_CONFIDENCE_HEAD_INTERCEPTS`).
+- **Single-stream (`c1`) cold-L2 routed-MoE marginal row cost and `DEAD_ROWS_TAU` break-even calibration.** On `sp8` across distinct layer weights (`>2 GiB`, cold L2 matching real serving), 39-layer `MoeExpertsV41Plan` at `M_pad=6` scales with `live_rows = 1..6` (`6 -> 12 -> 18 -> 24 -> 29 -> 34` unique experts/layer) as `4.66 -> 8.76 (+4.10) -> 13.08 (+4.32) -> 17.02 (+3.94) -> 20.57 (+3.55) -> 24.08 (+3.51) ms` (`s3/2` beats `s2/2` across warmed `live=3, 4, 16, 38, 64` at `159.1 vs 160.8`, `192.7 vs 194.6`, `622.8 vs 623.9`, `1423.5 vs 1427.4`, `2369.4 vs 2377.9 us`). Live `dgx1` `c61-r5` `prose-c1` telemetry (`4,701` steady decode steps) shows `36.3%` commit 1 token (`med 25.30 ms`), `30.0%` commit 2 (`25.60 ms`), `21.1%` commit 3 (`26.70 ms`), `8.1%` commit 4 (`28.70 ms`), `3.2%` commit 5 (`30.90 ms`), `1.2%` commit 6 (`33.50 ms`). Implemented in `c61-r6` (`SINGLE_REQ_CALIBRATED_ROW_COST_SCALE = 2.5` -> `tau_c1 = 0.1386` for `num_reqs == 1` calibrated DSpark rows while keeping `c2..c16` at `0.06335`, paired with `_WARM_CONFIDENCE_HEAD_INTERCEPTS` + halted-zero preservation in `acceptance_estimator.py`; `PR #1002` `VLLM_DSPARK_ONLINE_ADAPT=1` measured only `+0.03%` on held-out `c1` (`87.11 -> 87.14`) and `+0.10%` on coding (`160.91 -> 161.07`) in `c57-adapt` and remains opt-in). Screen `c61-r6` on `dgx1..dgx4` and sweep higher single-request scales if `pos 2` marginal yield stays unprofitable.
 - **Bounded or indexed CopyDrafter history match, forward-locality cursor, and
   payoff-gated wide copy passes at 100K–1M contexts.** Even with warp
   early-exit (`0744`), a decode step that does not hit a 256-token match scans
@@ -375,28 +375,7 @@ Open levers:
 - **Drafter reuse of the target's token selection.** Check whether reusing the
   target model's indexer top-k selection from the anchor position in DSpark
   draft layers preserves acceptance while cutting drafter attention work.
-- **Extend certified `W_q` Cauchy-Schwarz screening to DSpark's
-  `project_head_markov_greedy_pairs`.** `tilelang_vocab_markov_greedy`
-  (`project_head_markov_greedy_pairs` in
-  `vllm/models/deepseek_v4_1/tilelang/vocab.py`) currently unpacks the full
-  248 MB 12-bit `lm_head` shard across DSpark's 5 draft rows every step
-  despite sharing the target `lm_head` and its 8-bit `W_q` table. Add the
-  per-column Markov bias upper bound (`||u_t||_2 ||b_v||_2`, or exact NVFP4
-  Markov dot product) to the Cauchy-Schwarz tile upper bound so DSpark refines
-  only the active `<2%` 12-bit columns with bit-identical greedy drafts.
-- **Per-row $\ell_2$-optimal scale search and finite outlier bounds in
-  `build_screen_weights`.** Currently `build_screen_weights()`
-  (`vllm/models/deepseek_v4_1/tilelang/vocab.py`) quantizes each `lm_head` row
-  into the 8-bit `W_q` screening table using naive `amax` scaling and assigns
-  `row_bound = inf` whenever `full_amax > 8 * in_amax`, leaving dense
-  coordinates coarser near zero and preventing tiles containing `extreme_mask`
-  rows from ever being pruned. Because the Cauchy-Schwarz upper bound holds for
-  any per-row scale $s_i > 0$, search a small scale grid
-  $s_i = \alpha \cdot \text{amax}_i$ at load time to minimize
-  $\|w_i - \widehat{W}_i(s_i)\|_2$ (`row_bound[i]`) and compute finite residual
-  norms on `extreme_mask` rows instead of `inf`, tightening tile pruning for
-  both target greedy verification and the planned DSpark `W_q` Markov screen
-  with zero runtime kernel changes and bit-identical outputs.
+- **Certified `W_q` Cauchy-Schwarz screening for DSpark (`project_head_screened_markov_greedy_pairs`) and $\ell_2$-optimal `build_screen_weights`.** Commit `0f2eb0a85` (`fuses_screened_markov_greedy`, active in `c61-r5`+) screens single-request DSpark Markov drafting via 8-bit `W_q` (`cudagraph screened` `639.7 µs` vs `cudagraph dense` `678.6 µs` on `sp8`, `N=32320, K=2560, R=256, steps=5`), and `c61-r6` adds load-time per-row $\ell_2$-optimal `alpha` grid search `(1.0, 0.93, ..., 0.55)` in `build_screen_weights()` (`86 passed, 6 skipped`; tightens heavy-tailed `row_bound` while matching `alpha=1.0` on Gaussian weights). Check whether `extreme_mask` (`w_in_f`) rows still emit conservative `row_bound` on real `lm_head` checkpoints and whether widening the alpha grid or finite outlier bounds further trims `active_count`.
 - **Load-time scale-code search for online NVFP4 draft projections.** If
   revisiting `Nvfp4OnlineLinearMethod` / `prepare_nvfp4_head` (`0647`) for
   DSpark draft or Markov projections (where target verification keeps outputs

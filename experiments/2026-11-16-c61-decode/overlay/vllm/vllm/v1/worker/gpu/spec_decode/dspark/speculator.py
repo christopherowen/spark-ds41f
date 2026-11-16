@@ -381,7 +381,7 @@ class DSparkSpeculator(DFlashSpeculator):
     def load_model(self, target_model: torch.nn.Module) -> None:
         super().load_model(target_model)
         if self.use_confidence_head and self.acceptance_estimator is not None:
-            self.acceptance_estimator.reset_for_confidence_head()
+            self.acceptance_estimator.reset_for_confidence_head(warm_start=True)
 
     @property
     def tp_invariant_confidence(self) -> bool:
