@@ -1,0 +1,179 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+"""The DeepSeek V4.1 kernel family: TileLang.
+
+One family runs the whole model, drafter included; ``DeepseekV41ForCausalLMConfig``
+checks that explicit attention, linear and MoE backends name it. Model code asks
+this module for the implementation of each component instead of naming it.
+"""
+
+import contextlib
+
+import torch
+from torch import nn
+
+
+def linear_method():
+    """Method for an unquantized (BF16) projection."""
+    from .tilelang.linear import TileLangLinearMethod
+
+    return TileLangLinearMethod()
+
+
+def block_fp8_linear_method(quant_config):
+    """Method for a checkpoint block-32 FP8 projection."""
+    from .tilelang.linear import TileLangFP8LinearMethod
+
+    return TileLangFP8LinearMethod(quant_config)
+
+
+def embedding_method():
+    from .tilelang.embedding import TileLangEmbeddingMethod
+
+    return TileLangEmbeddingMethod()
+
+
+def moe_output_dtype() -> torch.dtype:
+    """The routed experts' output. FP32 keeps the routes' combined sum unrounded,
+    so the rank's partial (shared expert added in FP32) rounds once before the
+    cross-rank sum, as DeepSeek's row-parallel linears round theirs."""
+    return torch.float32
+
+
+def shared_expert_activation(
+    act_fn: nn.Module, width: int, *, mxfp8_output: bool = False
+) -> nn.Module:
+    """The shared expert's clamped SwiGLU on ``width``-wide gate and up halves,
+    at the reference's FP32 product (one BF16 rounding) where vLLM's rounds
+    ``silu(gate)`` first."""
+    from vllm.model_executor.layers.activation import SiluAndMulWithClamp
+
+    if isinstance(act_fn, SiluAndMulWithClamp):
+        from .tilelang.activation import SiluAndMulClampFP32
+
+        return SiluAndMulClampFP32(
+            act_fn.swiglu_limit, width, mxfp8_output=mxfp8_output
+        )
+    return act_fn
+
+
+def moe_router_class():
+    """Router class for the MoE layers."""
+    from .tilelang.router import TileLangGateRouter
+
+    return TileLangGateRouter
+
+
+def mhc(config) -> nn.Module:
+    """A decoder layer's lagged mHC: pre, post_pre, post and collapse."""
+    from .tilelang.mhc import TileKernelsMHC
+
+    return TileKernelsMHC(config)
+
+
+def cast_mxfp8(rows: torch.Tensor):
+    """The MXFP8 cast of rows regrouped after their producer (``linear.MXFP8Rows``),
+    for projections that read their input's cast."""
+    from .tilelang.linear import cast_mxfp8
+
+    return cast_mxfp8(rows)
+
+
+def slice_mxfp8(rows, first: int, last: int):
+    """Rows ``[first, last)`` of ``rows`` (``linear.MXFP8Rows``) for a split consumer."""
+    if rows is None:
+        return None
+    from .tilelang.linear import slice_mxfp8
+
+    return slice_mxfp8(rows, first, last)
+
+
+def mxfp8_inputs(rows) -> contextlib.AbstractContextManager:
+    """Hand a sublayer's projections their input's MXFP8 cast (``linear.MXFP8Rows``,
+    from the mHC entry or ``cast_mxfp8``) for the calls inside; nothing for None
+    (the model tests' mHC stand-ins return no cast)."""
+    if rows is None:
+        return contextlib.nullcontext()
+    from .tilelang.linear import provide_mxfp8
+
+    return provide_mxfp8(rows)
+
+
+def try_provided_mxfp8(rows: torch.Tensor):
+    """The handed-over MXFP8 cast of ``rows`` if active, else None."""
+    from .tilelang.linear import try_provided_mxfp8
+
+    return try_provided_mxfp8(rows)
+
+
+@contextlib.contextmanager
+def sp_moe_inputs(
+    sp_rows,
+    x: torch.Tensor,
+    x_q,
+    ffn: nn.Module,
+    input_ids: torch.Tensor | None,
+):
+    """Route local rows and gather their producer's MXFP8 cast with the routes.
+
+    The mHC entry supplies the cast and the TileLang MoE router supplies
+    ``route_local``. Missing either is an invalid serving contract, rather than
+    a request to gather BF16 rows or route the whole gathered batch again.
+    """
+    if x_q is None:
+        raise ValueError("DS4.1 SP MoE requires producer-provided MXFP8 rows")
+    router = getattr(getattr(ffn, "experts", None), "router", None)
+    route_local = getattr(router, "route_local", None)
+    if not callable(route_local):
+        raise ValueError("DS4.1 SP MoE requires a router with route_local")
+
+    from . import sp_prefill
+    from .tilelang.linear import provide_mxfp8
+    from .tilelang.router import provide_routes
+
+    default_gather = getattr(
+        sp_prefill.SPRows, "_DEFAULT_GATHER_MXFP8", sp_prefill.SPRows.gather_mxfp8
+    )
+    can_async = (
+        hasattr(sp_rows, "gather_mxfp8_async")
+        and getattr(sp_rows, "can_gather_async", lambda *_: False)(x_q.rows.device)
+        and getattr(type(sp_rows), "gather_mxfp8", None) is default_gather
+        and "gather_mxfp8" not in getattr(sp_rows, "__dict__", {})
+    )
+    if can_async:
+        (gathered_q,), wait_xq = sp_rows.gather_mxfp8_async(x_q)
+        weights, ids = route_local(x, sp_rows, input_ids=input_ids)
+        # Enqueue route gather before waiting for x_q so all_gather(weights, ids)
+        # runs on _side_stream while shared_experts runs on the compute stream.
+        (weights, ids), wait_routes = sp_rows.gather_many_async(weights, ids)
+        wait_xq()
+    else:
+        weights, ids = route_local(x, sp_rows, input_ids=input_ids)
+        gathered_q, weights, ids = sp_rows.gather_mxfp8(x_q, weights, ids)
+        wait_routes = None
+    with (
+        provide_mxfp8(gathered_q),
+        provide_routes(gathered_q.rows, weights, ids, wait=wait_routes),
+    ):
+        yield gathered_q.rows
+
+
+
+def rms_norm(hidden_size: int, eps: float = 1e-6) -> nn.Module:
+    from .tilelang.norm import TileLangRMSNorm
+
+    return TileLangRMSNorm(hidden_size, eps)
+
+
+def is_native_linear_method(method) -> bool:
+    from .tilelang.linear import TileLangFP8LinearMethod, TileLangLinearMethod
+
+    return isinstance(method, (TileLangFP8LinearMethod, TileLangLinearMethod))
+
+
+def dspark_confidence_head(hidden_size: int, markov_rank: int, prefix: str):
+    """DSpark's acceptance-confidence head over the drafter's head hidden and the
+    Markov embedding of the token before each draft."""
+    from .tilelang.confidence import TileLangConfidenceHead
+
+    return TileLangConfidenceHead(hidden_size, markov_rank, prefix=prefix)
