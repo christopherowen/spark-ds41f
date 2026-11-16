@@ -47,8 +47,52 @@ text, so it is a rough expectation, not a reference.
 
 ## Runs
 
-Pending.
+Queue entry `20261116T182404-bench-prefill-long-tp4-switched` ran on sp1..sp4 from 18:24Z to
+18:42Z on 2026-11-16, at deployment commit `ac768604d`, from the pinned profile above. Both
+boots exited 0, and every sample completed.
+
+The first entry, `20261116T164422`, was queued at 16:44Z behind candidate-60's screen. Its
+pending file was removed from sp1's queue at 17:08:28Z by something other than the queue runner,
+so it never ran. It was re-queued at 18:24Z.
+
+| Size label | Actual tokens | b1 tok/s (TTFT) | b2 tok/s (TTFT) | Mean tok/s | µs per token |
+|---|---|---|---|---|---|
+| 262,144 | 237,746 | 9,708.3 (24.59 s) | 9,664.8 (24.70 s) | 9,686.6 | 103.2 |
+| 524,288 | 471,725 | 9,402.2 (50.35 s) | 9,394.1 (50.40 s) | 9,398.2 | 106.4 |
+| 1,000,000 | 916,234 | 8,754.9 (104.56 s) | 8,740.0 (104.74 s) | 8,747.5 | 114.3 |
+
+The two boots differ by 0.45% at 262K, 0.09% at 524K and 0.17% at 1M.
+
+- **Anchor:** candidate-59's recorded 262K was 9,757.3 tok/s at 240,637 tokens. Today's 262K is
+  0.72% below it. The size list seeds the prompts in order, so today's 262K prompt is a
+  different 237,746-token text.
+- **Memory:** the lowest `MemAvailable` was 16.67 / 16.59 GiB on sp1 and 19.63-19.80 GiB on
+  sp2..sp4, with no swap growth.
+- **Thermals:** the GPU peaked at 78-82 °C, 8-13 °C below its limit, with 0 ms of thermal
+  slowdown and power at most 75.2 W.
+- **Conditions:** the bench reported the spaceport kernel warnings (4 KiB pages, no memory-saver
+  module) that every switched run on these nodes reports.
+
+Receipts: [receipts/tp4-switched/](receipts/tp4-switched/) has both `bench.json` files, their
+telemetry and the window log.
 
 ## Conclusion
 
-Pending.
+Candidate-59 does not hold 10K at 1M, but it comes much closer than predicted.
+
+- **At 1M:** it reads 916,234 tokens at 8,747 tok/s (104.6 s), 90.3% of its 262K rate.
+  Extending the 524K-1M slope to a full 1,000,000 tokens gives about 8,630 tok/s.
+- **Against 1107:** spark-ds41f-1107 on `tp4-ring` kept 72.8% (6,012 against 8,261 tok/s).
+  spark-ds41f-1030 on this testbed kept 78.1% (5,471.8 against 7,009.5 tok/s, in
+  `experiments/2026-10-26-spark-ds41f-candidate/1107/receipts/switched-sp1/tp4/servebench/release/1030/`).
+
+The prediction of 6,700-6,900 tok/s was wrong. It assumed 1107's position cost: about 45 µs per
+token from 262K to 1M. Candidate-59 adds about 11 µs per token from 238K to 916K.
+
+The cause is not attributed:
+- no candidate between 1107 and candidate-59 was measured above 262K;
+- the 1107 and 1030 records come from servebench's default text, not `bin/spark bench` source
+  text.
+
+So this is not a matched gain over a release. A matched figure needs a release reference
+measured with this bench and text at 1M on this testbed.
