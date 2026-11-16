@@ -8,6 +8,9 @@ owner.
 
 ## Recent candidate decisions
 
+- **Candidate `61` (in progress)** ([`experiments/2026-11-16-c61-decode`](experiments/2026-11-16-c61-decode/README.md)) stacks on `candidate-60` with decode and infrastructure improvements verified through `c61-r5-screen-tp4` on `tp4-ring` (`dgx1..dgx4`):
+  - Integrated certified 2-pass `W_q` Markov vocab screening + per-row $\ell_2$ scale search (`Rank 2`), BF16 compressor replication up to `TP<=4` (`Rank 5`), `PR #1225` (`0817..0819`) + `pipe` + `<2>` dense `indexer_score_v41` + gated `_decode_index_split` (`Rank 6`), grouped 3-layer DSpark `context_kv` + strided `front.py` (`Rank 10`), `PR #995` CopyDrafter guards/gentle ramp (`Rank 13`), fixed `PR #1072` `shm_broadcast.py` 2 ms post-wakeup spin anchor (`Rank 14`: eliminated 5s stalls, `ttft_p99 = 0.133s`), `PR #1081` shard-local sampled verification + `PR #988` sparse top-k Markov (`Rank 15`), `PR #1078` 48-row decode projection tile (`Rank 16A`), `PR #984` UMA allocator hygiene (`Rank 17`), `tilelang_rejection.py` `initcheck` uninitialized-read guard (`705 passed, 0 errors`), `qwen3_dspark.py` `apply_bias_topk` deduplication, and `PR #1222`/`#1223` lab fixes (`124 passed` in `test_lab.py` + `test_source_locks.py`).
+  - Screened at `c61-r5` (`c1 = 83.01 ± 5.58% tok/s` [`prose 81.51 dec`, `code 115.03 dec`]; `c16 = 271.62 ± 1.22% tok/s`; `0` diffs across all 6 greedy determinism scenarios and 81 calls vs `c60-base`).
 - **Candidate `60`** ([`experiments/2026-11-16-c60-prefill`](experiments/2026-11-16-c60-prefill/README.md)) builds on `candidate-59` (via `#1218` / `#1219`) in three gated steps across switched TP4 (`sp1..sp4`) and switched TP3 (`sp5..sp7`):
   - Integrated PR `#992` `bf16x2` producer casts, `indexer.py` `bfloat162` SMEM + warp-shuffle `block_scan` top-$k$, `attention.py` SP prefill compressor/front async overlap + deferred `finish_front` + `cacheable = index_rows <= chunk_rows`, PR `#983` Clock-Pro 2-bit Engram prefill shield + `SPARK_DS41F_ENGRAM_PIN_SCALES`, PR `#1010` hybrid KV retention/eviction, PR `#978` multimodal prefix-cache fastpath, PR `#1006` uncached GPU post-load vectorizations / pressure-gated `release_device_memory_under_pressure` / lazy imports / first-prefill `_warm_model_runtime` warmup (dropping `postload_cache` after measuring slower reload than uncached GPU vectorization on GB10), piece-level parallel prompt tokenizer caching (`vllm/tokenizers/deepseek_v41.py`), PR `#1212` (rebased `#1047`) literal image-token escape, `defer_loading: true` + `tool_reference` inline tool-schema resolution (`serving.py`, `deepseek_v41.py`, `deepseek_v41_encoding.py`), and stream/lifecycle/parser hardening (`sp_prefill.py`, `engram_rows/rows.py`, `deepseek_v41.py`, `deepseek_v41_encoding.py`; evaluated and removed opt-in `SPARK_DS41F_PREFILL_MIX_CHUNK` from PR `#1150` during optionality cleanup).
   - Qualified with zero regressions on `tp4-switched` (`model`: `128/128` greedy / `100.00%` identical, `KL mean 0.000e+00`, `8/8` gate determinism/greedy `0` diffs; `grid` `-0.07% ±0.13%` `same`; `c16` `+0.17%` / `+0.15%` `same`; `c1-decisions` `82.91 tok/s`; `prefill 262K` `default-text` **`+2.10% ±0.64%` (`better`, `9,833.2 tok/s`)**, `+4.50%` over `c58-final`; `source` prefill `32K/131K/262K` `9,521 / 9,924 / 9,830 tok/s`, with Step 1 hitting `10,000.1 tok/s` mean at `131K`; `bench` `quality` `5/5` pass) and `tp3-switched` (`model`: `100.00%` identical, `8/8` gate `0` diffs, `grid` `-0.03% ±0.12%` `same`, `c8` `-0.25%` / `-0.23%` `same`, `sp5` startup `min_available_gib` `5.90–5.97 GiB`; `tp4-ring` remained held and untested).
@@ -317,6 +320,7 @@ graph retention (`0728`), fused single-rank Markov drafting (`0717`), and
 device-side `prepare_inputs` folding (`0754`) are all active.
 
 Open levers:
+- **Single-stream (`c1`) cold-L2 routed-MoE marginal row cost and `DEAD_ROWS_TAU` break-even calibration.** On `sp8` across 16 distinct layer weights (`>2 GiB`, cold L2 matching real serving), 39-layer `MoeExpertsV41Plan` at `M_pad=6` scales with `live_rows = 1..6` (`6 -> 12 -> 18 -> 24 -> 29 -> 34` unique experts/layer) as `4.66 -> 8.76 (+4.10) -> 13.08 (+4.32) -> 17.02 (+3.94) -> 20.57 (+3.55) -> 24.08 (+3.51) ms`. Because `c1` (`num_reqs = 1`) has no cross-request expert sharing, each additional live draft row costs `~3.9–4.3 ms/step` (`~20%` of base step time, vs `adaptive_verification_row_cost = 0.035`), putting `prose-c1` (`~0.082 tok/ms`) marginal survival break-even at `s >= 0.33` (whereas at `c16`, `~38` rows share already-active experts and marginal row cost is `~0.5 ms`). Screen single-request `row_cost` / `effective_dead_rows_tau(num_reqs=1)` calibration paired with `PR #1003` warm-started `OnlineAcceptanceEstimator` intercepts (`_WARM_CONFIDENCE_HEAD_INTERCEPTS`).
 - **Bounded or indexed CopyDrafter history match, forward-locality cursor, and
   payoff-gated wide copy passes at 100K–1M contexts.** Even with warp
   early-exit (`0744`), a decode step that does not hit a 256-token match scans
@@ -625,23 +629,10 @@ paths run on TileLang + `sparknet`; retiring the remaining `b12x` build input
 from `upstreams.lock.json` and `docker/Dockerfile` can follow after `1107`).
 
 Remaining kernel-level investigations:
-1. **`mHC: fn` in three bytes (vs. 2×BF16 `hi + lo` split).** `project_streams`
-   reads `fn` (`24 x 20,480` FP32, 2 MB per sublayer) near memory bandwidth at
-   decode row counts, and a TF32 MMA consumes only the top 19 bits of each
-   value. Storing the top 24 bits would cut that traffic by 25% with
-   bit-identical results if SM121's TF32 MMA truncates rather than rounds its
-   inputs (whereas splitting FP32 `fn` into `hi + lo` BF16 pairs for 2×BF16 MMA
-   keeps 4 bytes/element and only helps when compute-bound at large `M`); verify
-   on hardware first.
-2. **Pre-multiplied Engram `q_weight * k_weight`.** Because the Engram gate dot
-   product is $\sum_d (q_d h_d)(k_d k^{\text{eng}}_d) = \sum_d (q_d k_d) h_d k^{\text{eng}}_d$,
-   pre-multiplying `q_weight * k_weight` once at load time eliminates one
-   5,120-element FP32 vector read per stream in the fused `mhc.post` + Engram
-   post-gate kernel (`0755`).
-3. **TMA stage releases outside DS4.1's active kernel set**
-   (`experiments/2026-09-30-proxy-fence-audit`): all serving kernels are fenced
-   (and enforced in the compiler via `tilelang/0001..0013` in `1107`); keep the
-   compiler barrier tests in the release gate whenever TileLang is refreshed.
+- **TMA stage releases outside DS4.1's active kernel set**
+  (`experiments/2026-09-30-proxy-fence-audit`): all serving kernels are fenced
+  (and enforced in the compiler via `tilelang/0001..0013` in `1107`); keep the
+  compiler barrier tests in the release gate whenever TileLang is refreshed.
 
 ## Upstream and hygiene
 
@@ -664,7 +655,11 @@ Don't repeat these without a new reason:
   (`experiments/2026-11-06-verification-budget-hardware`, regressed throughput
   vs `0.030`); minimum-match-8 CopyDrafter policy (dropped at source review);
   C39/C41 CopyDrafter preparation-overlap variations
-  (`experiments/2026-11-04-copy-overlap-rework`).
+  (`experiments/2026-11-04-copy-overlap-rework`); lowering `effective_dead_rows_tau`
+  ~3.7× at `c1` (`PR #1003` sunk-cost rule, `c61-r1-2`: pushed low-survival tail
+  rows into 384-expert MoE, adding `+1.78 ms/step` and regressing `c1` `-3.25%`);
+  cohort-atomic budgeting + `COALESCED_ROW_COST_SCALE=0.28` (`PR #953`/`#986`,
+  `c61-r3`: pushed `c16` `sched/step` to `40.05` and regressed `c16` `-3.3 tok/s`).
 - **Decode kernels:** 1-launch atomic last-CTA `mHC project_and_finalize_streams`
   for `M <= 16` (`experiments/2026-11-06-mhc-project-finalize`, #946: 12–34%
   slower than 2-launch PDL due to atomic/fence serialization and register
@@ -674,7 +669,25 @@ Don't repeat these without a new reason:
   retention windows on GB10 (#928, no gain / regression on unified memory);
   incremental GPU block-table metadata gathers (#932, negligible step impact vs
   state complexity); `0714`/`0716` score-ID host transfer and `0718` TP1-only
-  embedding ID prep (#913, #914: unmeasured / TP1-only).
+  embedding ID prep (#913, #914: unmeasured / TP1-only); 24-bit (top-3-byte)
+  `mHC: fn` weights (`experiments/2026-11-08-mhc-fn24-and-green-ctx-audit`:
+  superseded by `0092`'s 3x-TF32 exact FP32 split; `99.61%` of checkpoint
+  `hc_*_fn` weights have non-zero low 8 bits so 24-bit storage is not bit-exact,
+  and unpacking `uint16+uint8` regresses L2-hot `project_streams` latency by
+  `+2.4–6.1%` across `M=1..64`); 2-split IEEE RN TF32 in `mhc.py` (`c61-r2`:
+  shifted `reference_sha256` from `0a2dacdd...` to `81a029f1...`); CUDA Green
+  Context (`CUgreenCtx`, `2/46` SM split) isolation for side-stream L2 prefetch
+  (`experiments/2026-11-08-mhc-fn24-and-green-ctx-audit`: `+1.71 µs/fork`
+  cross-context event wait inside `CUDAGraph` replay vs `+0.155 µs/fork` on a
+  same-context stream, regressing per-layer decode latency by `+5.3` to
+  `+8.1 µs/layer` [`+1.4–3.5%`] against `VLLM_L2_PREFETCH_GRID=2`); Decode #10
+  multi-row SWA KV sharing in `sparse_mla.py` (`sp8`: `rows=1..6` adds only
+  `+0.14..0.21 µs/layer` because L2 already serves shared SWA KV); Decode #6 global
+  reads before `T.pdl_sync()` (`PDL CHAIN` contract forbids pre-sync global reads);
+  Decode #8 `q` RoPE piggyback (`0.59 µs/layer` on `aux_stream`, KV-RoPE already
+  fused in `attention_front`); and Decode #13 mid-network Layer 16/20 routed-MoE
+  pruning (DS4.1 safetensors carry no intermediate Layer 16/20 LM head/probe
+  weights).
 - **Prefill:** M32 MoE tile (+1%); fused M32 MoE (no gain, less headroom);
   `NCCL_PROTO=Simple` (no gain); `--max-parallel-prefills 8` (four-64K mean TTFT
   41 → 67 s); sequence parallelism below 205 tokens (+12 ms TTFT on short
