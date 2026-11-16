@@ -8,6 +8,9 @@ owner.
 
 ## Recent candidate decisions
 
+- **Candidate `60`** ([`experiments/2026-11-16-c60-prefill`](experiments/2026-11-16-c60-prefill/README.md)) builds on `candidate-59` (via `#1218` / `#1219`) in three gated steps across switched TP4 (`sp1..sp4`) and switched TP3 (`sp5..sp7`):
+  - Integrated PR `#992` `bf16x2` producer casts, `indexer.py` `bfloat162` SMEM + warp-shuffle `block_scan` top-$k$, `attention.py` SP prefill compressor/front async overlap + deferred `finish_front` + `cacheable = index_rows <= chunk_rows`, PR `#983` Clock-Pro 2-bit Engram prefill shield + `SPARK_DS41F_ENGRAM_PIN_SCALES`, PR `#1010` hybrid KV retention/eviction, PR `#978` multimodal prefix-cache fastpath, PR `#1150` opt-in `SPARK_DS41F_PREFILL_MIX_CHUNK`, PR `#1006` uncached GPU post-load vectorizations / pressure-gated `release_device_memory_under_pressure` / lazy imports / first-prefill `_warm_model_runtime` warmup (dropping `postload_cache` after measuring slower reload than uncached GPU vectorization on GB10), and piece-level parallel prompt tokenizer caching in `vllm/tokenizers/deepseek_v41.py`.
+  - Qualified with zero regressions on `tp4-switched` (`model`: `128/128` greedy / `100.00%` identical, `KL mean 0.000e+00`, `8/8` gate determinism/greedy `0` diffs; `grid` `-0.07% ±0.13%` `same`; `c16` `+0.17%` / `+0.15%` `same`; `c1-decisions` `82.91 tok/s`; `prefill 262K` `default-text` **`+2.10% ±0.64%` (`better`, `9,833.2 tok/s`)**, `+4.50%` over `c58-final`; `source` prefill `32K/131K/262K` `9,521 / 9,924 / 9,830 tok/s`, with Step 1 hitting `10,000.1 tok/s` mean at `131K`; `bench` `quality` `5/5` pass) and `tp3-switched` (`model`: `100.00%` identical, `8/8` gate `0` diffs, `grid` `-0.03% ±0.12%` `same`, `c8` `-0.25%` / `-0.23%` `same`, `sp5` startup `min_available_gib` `5.90–5.97 GiB`; `tp4-ring` remained held and untested).
 - **Candidate `59`** ([`experiments/2026-11-15-c59-prefill`](experiments/2026-11-15-c59-prefill/README.md)) builds on `candidate-58` in three gated steps across switched TP4 (`sp1..sp4`) and switched TP3 (`sp5..sp7`):
   - Integrated bounded UTF-8 suffix detokenizer priming (`detokenizer.py`), zero-copy `int32` `PickleBuffer` `NewRequestData` admission IPC (`output.py`, `request.py`, `buffer_utils.py`), `bf16x2` / `cvt.rn.bf16x2.e2m1x2` dequant (`sparse_mla.py`), dense `indexer_score_v41` `rows >= 64` `R=4` BF16 dual-row SMEM reduction (`indexer.py`), fused `prefill_gate_up -> moe_swiglu_cast` with 64-col `(gate, up)` slab interleaving (`moe.py`), and PR `#1005` MoE warp-shuffle dispatch scan, sync/PDL tightening, and cascaded `moe_swiglu_cast` preloads (keeping `c58` BF16 SwiGLU intermediate rounding).
   - Qualified with zero regressions on `tp4-switched` (`model`: `128/128` greedy / `100.00%` identical, `KL mean 0.000e+00`, `8/8` gate determinism/greedy `0` diffs; `grid` `+0.24%` `same`; `c16` `+0.11%`/`+0.13%` `same`; `c1-decisions` `82.94 tok/s`; `prefill 262K` `default-text` `+2.35%` `better`; `source` prefill `32K/131K/262K` `9,548 / 9,886 / 9,757 tok/s`, `+1.28–1.53%` over `c58-final`) and `tp3-switched` (`model`: `100.00%` identical, `8/8` gate `0` diffs, `grid` `+0.02%` `same`, `c8` `+0.12%`/`+0.14%` `same`; `tp4-ring` remained held and untested).
@@ -433,7 +436,18 @@ NCCL Ring and sparse-MLA `block_H=16` (`2` CTAs/head, `0740`), unconditional
 `M=64` MoE `prefill_swizzle_panel=2` (`0736`), retained CED encoder endpoints
 (`0727`), CED local boundary reduction (`0742`), SP context-KV projection
 (`0743`), and sequence-parallel MoE input local routing/MXFP8 gather are all
-active.
+active; `candidate-59` added `bf16x2`/`cvt.rn.bf16x2.e2m1x2` dequant (`sparse_mla.py`),
+dense `indexer_score_v41` `rows >= 64` `R=4` BF16 SMEM reduction, fused
+`prefill_gate_up -> moe_swiglu_cast`, and PR `#1005` MoE warp-shuffle dispatch scan;
+and `candidate-60` added PR `#992` `bf16x2` producer casts, `bfloat162` SMEM +
+warp-shuffle `block_scan` top-$k$ (`indexer.py`), SP compressor/front async overlap +
+deferred `finish_front` (`attention.py`), PR `#983` Clock-Pro 2-bit Engram prefill
+shield + pinned two-plane scales (`SPARK_DS41F_ENGRAM_PIN_SCALES`), PR `#1010`
+hybrid KV retention/eviction, PR `#978` multimodal prefix-cache fastpath, PR `#1150`
+opt-in `SPARK_DS41F_PREFILL_MIX_CHUNK`, PR `#1006` uncached GPU post-load
+vectorizations + first-prefill `_warm_model_runtime` warmup, and piece-level parallel
+prompt tokenizer caching (`_BoundedPieceCache` + cut-after-`\n` `encode_batch` in
+`vllm/tokenizers/deepseek_v41.py`).
 
 Open levers:
 - **Rank-offset CTA remapping for sequence-parallel all-gather overlap.** When
@@ -442,9 +456,10 @@ Open levers:
   (`pid_m = (raw_pid_m + rank * tiles_per_rank) % total_tiles`) so every rank
   starts computing on its already-local shard at $t = 0$ while peer shards
   arrive over RoCE.
-- **First request after a restart** is ~0.37 s slower to its first token than
-  subsequent requests. Screen `CUDA_MODULE_LOADING=EAGER` (checking boot time
-  impact) and sample the first request with `py-spy dump --nonblocking`.
+- **First request after a restart** residual gap after `c60`'s `_warm_model_runtime`
+  pre-warming (originally ~0.37 s slower to its first token than subsequent
+  requests). Screen `CUDA_MODULE_LOADING=EAGER` (checking boot time impact) and
+  sample any remaining request-1 stalls with `py-spy dump --nonblocking`.
 - **Indexer scoring and selection at 200K–1M context.** Split long-context
   indexer time into MXFP4 scoring vs top-$k$ selection; if top-$k$ selection is
   a measurable share at 500K–1M, screen a bounded radix top-$k$. For the scoring
@@ -460,15 +475,6 @@ Open levers:
 - **NVMe interrupt coalescing stays off** on every node by the owner's decision
   (2026-10-02; prefill measured 0.7–1.6% slower with it on in
   `experiments/2026-10-02-nvme-coalescing`).
-- **Piece-level prompt tokenizer cache and parallel encoding:** live agent
-  prompts are 64–100K tokens (~250–400 KB of system prompt and multi-turn tool
-  transcripts separated by special tokens) where 98–99% of the prefix repeats
-  across turns, yet the API server on `dgx1` re-tokenizes the full prompt text
-  on every request. Splitting prompts on added/special tokens (`<｜User｜>`,
-  `<｜Assistant｜>`, `</think>`, DSML delimiters), caching tokenized text spans
-  $\ge 256$ bytes in a bounded clock-evicted cache, and encoding uncached spans
-  $\ge 64\text{ KiB}$ in parallel across CPU threads reduces repeat-turn prompt
-  tokenization to $O(\text{new turn})$ on `dgx1`.
 - **Byte-equivalent BPE boundary alignment for prefix-cache hits:** when new
   text is appended to a cached prefix without an intervening special token, a
   BPE merge across the append boundary can alter the last 1–2 tokens of the
@@ -478,18 +484,14 @@ Open levers:
   boundary—and rewriting the incoming prompt's prefix to the cached token
   spelling (shifting any subsequent multimodal spans accordingly)—preserves
   prefix-cache hits across boundary merges.
-- **Prefix-cache retention:** agent prompts are 64–100K tokens and depend on
-  98–99% prefix-cache hit rates ([#902](https://github.com/christopherowen/spark-ds41f/issues/902)).
-  Add a stress probe for retention around block boundaries and under sustained
-  eviction pressure (saturating the KV pool with unique prompts first so every
-  prefill chunk evicts across the MLA, SWA, CED-anchor, and kpool-tail groups
-  under `--prefix-cache-retention-interval`, checking both active-session hit
-  preservation and `dgx1` scheduler step time). For `/v1/messages` clients using
-  dynamic/deferred tool discovery (`defer_loading: true` with `tool_reference`
-  blocks inside `tool_result`), support injecting newly discovered tool schemas
-  inline at the `tool_result` turn rather than mutating the top-of-prompt
-  `tools` preamble so mid-session tool discovery does not invalidate the cached
-  64K–100K prefix.
+- **Live prefix-cache retention and inline tool-schema injection:** [#902](https://github.com/christopherowen/spark-ds41f/issues/902)
+  hybrid retention/eviction and its offline stress probe (`test_prefix_cache_retention_probe.py`)
+  shipped in `candidate-60`; validate live 64–100K multi-turn retention on
+  production agent traffic. For `/v1/messages` clients using dynamic/deferred
+  tool discovery (`defer_loading: true` with `tool_reference` blocks inside
+  `tool_result`), support injecting newly discovered tool schemas inline at
+  the `tool_result` turn rather than mutating the top-of-prompt `tools` preamble
+  so mid-session tool discovery does not invalidate the cached 64K–100K prefix.
 
 ## Boot
 
@@ -691,7 +693,12 @@ Don't repeat these without a new reason:
   `12` regressed); dense `indexer_score_v41` `<2>` (`2 <= rows < 64`) with
   `16 KiB` `contrib` SMEM (`+0.34%` `@4K` decode regression vs `<1>` + `8 KiB`
   `contrib` kept for `rows < 64`) and `<8>` (`rows >= 128`, `B_reg[8]` register
-  spill slowed `rows=1/64/4096`, `experiments/2026-11-15-c59-prefill`).
+  spill slowed `rows=1/64/4096`, `experiments/2026-11-15-c59-prefill`); on-disk
+  `postload_cache` serialization of packed BF16 weights and expert scale codes in
+  `candidate-60` Step 3 (reload from `/cache` was slower on GB10 unified memory
+  than PR `#1006`'s uncached vectorized GPU `pack_bf16_weight` and
+  `encode_expert_scale_codes` kernels, so `postload_cache` was removed before
+  qualification, `experiments/2026-11-16-c60-prefill`).
 - **Collectives:** NCCL for decode all-reduces (75–86 µs against one-shot RoCE's
   13–19 µs, `experiments/2026-10-03-collective-policy`); 8 or 16 NCCL channels
   on TP4 serving prefill (0.7–1.2% over four, intervals spanning zero);
