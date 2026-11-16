@@ -11,9 +11,13 @@ key for every prompt row, then select an exact top 512.
     `sp_prefill.py`; `tilelang/indexer.py` is identical.
   - The baseline is that file, SHA-256 `3825602187077775…` (`bundles/*/indexer_baseline.py`).
 - **Base commit**: `8b8c2c3f0`.
-- **One variable**: the dense score kernel's code, `__tl_score_rows_dense_fast` in
-  `tilelang/indexer.py`. Each variant must reproduce the baseline bit for bit: every score
-  over every row's extent, and every selected position.
+- **Variables, one per patch**, each measured against the one before it:
+  - 0817: the dense score kernel's code (`__tl_score_rows_dense_fast`).
+  - 0818: the score ReLU's NaN handling.
+  - 0819: the top-k segment kernel's key load.
+
+  On finite inputs each must reproduce its baseline bit for bit: every score over every row's
+  extent, and every selected position.
 - **Constraint**: reference arithmetic stays as it is. That means MXFP4 queries and keys, the
   BF16 dot, `bf16(max(dot, 0) * w)`, the FP32 head sum in increasing head order, and the exact
   top 512.
@@ -122,19 +126,133 @@ runs two jobs:
 bin/spark candidate queue tp4-ring experiments/2026-11-16-indexer-prefill-exact/ring-tp4.json --apply
 ```
 
-Runs: pending.
+### End-to-end runs
+
+Queue entry `20261116T204637-ring-tp4` ran on dgx1..dgx4 from 20:46Z on 2026-11-16 at
+deployment commit `724ef3fbe`, from `spark-ds41f:candidate-60` with the overlay.
+`overlays-exact-ring-tp4.txt` records the overlay's SHA-256, and `docker inspect` on dgx1 and
+dgx3 showed the mount.
+
+**Sweep** (receipts: [receipts/tp4-ring/bench/](receipts/tp4-ring/bench/)). The prompts are the
+same token for token as candidate-60's ring sweep.
+
+| Size label | Tokens | candidate-60 b1 / b2 | 0817 b1 / b2 | Mean change |
+|---|---|---|---|---|
+| 131,072 | 121,796 | 9,901.5 / 9,927.9 | 9,974.4 / 9,960.6 | +0.53% |
+| 262,144 | 236,689 | 9,803.7 / 9,813.5 | 9,888.9 / 9,965.8 | +1.21% |
+| 524,288 | 469,970 | 9,553.1 / 9,583.3 | 9,657.8 / 9,677.7 | +1.04% |
+| 1,000,000 | 910,469 | 9,055.3 / 9,071.9 | 9,261.7 / 9,240.3 | +2.07% |
+
+- **Above 32K:** the two boots of each build agree within 0.8%.
+- **Below 32K:** time to first token dominates and the boots differ by up to 3.6%. Those sizes
+  show no change outside that spread: +2.8% at 512, −1.4% at 2K, +0.7% at 32K.
+- **Prediction:** +1.8% at 1M; measured +2.1%.
+
+**Gate** (receipts: [receipts/tp4-ring/determinism/](receipts/tp4-ring/determinism/)). Each of
+the four checks makes 81 calls. Every call of boot 1 is identical, tokens and log-probabilities,
+to a call with the same prompt in candidate-58's final ring records: 324 of 324.
+
+Boot 2 was still running when this record was written. Its comparison is added when it completes.
+
+## NaN-keeping ReLU (0818)
+
+DeepSeek's indexer takes `relu_` of each head's dot product, which keeps a NaN. Our kernels'
+`max(dot, 0)` drops it, which is the strict xfail `test_indexer_nonfinite_query_scale` from
+`experiments/2026-10-14-kernel-contracts`. That experiment fixed the shared and routed SwiGLU
+clamps and the Engram gate; it left the indexer out because the NaN-keeping forms TileLang
+generated cost 3.4-4.6% of prefill. With the bf16x2 epilogue, the ReLU is one `__hmax2_nan`
+(`max.NaN.bf16x2`).
+
+- **Kernels:** both epilogues of the dense kernel use it. The reindex candidate kernel takes the
+  same bf16x2 epilogue with it, in place of its float round trip.
+- **Finite inputs, against 0817** (`receipts/sp8/nan-1`, `nan-candidates-1`): scores and
+  selections are bit-identical at 237K and 910K, and the dense decode shapes are bit-identical
+  with none of 10 slower. The candidate kernel at decode shapes is bit-identical: 11.6 vs 12.1 µs
+  at 6 rows, 294 vs 299 µs at 96.
+- **Prefill score time:** 1,248 vs 1,248 µs at 237K and 4,525 vs 4,556 µs at 910K. No cost.
+- **Non-finite inputs:** `test_indexer_nonfinite_query_scale` passes with its xfail removed.
+  `test_indexer_candidates_nonfinite_query_scale` is new and checks the same contract on the
+  candidate kernel: NaN at every live candidate, `-inf` in a masked block, other rows unchanged.
+  `-k "indexer or topk"`: 29 passed and 1 skipped; the new test run on its own: 1 passed.
+
+## Faster selection (0819)
+
+The segment kernel turns each 16,384-entry segment's BF16 scores into order-preserving `uint16`
+keys in a swizzled shared buffer, one 2-byte load per thread per step. `__tl_load_keys16` reads
+eight scores per 16-byte load and writes the same keys to the same slots. A misaligned row or
+the tail falls back to scalar loads, and gathered or grouped selections keep the scalar loop.
+
+Measured against 0817 (`receipts/sp8/selvec-2`; `selvec-1` failed to import because a header was
+inserted below a decorator, and is kept):
+
+| Context | Select | Score + select |
+|---|---|---|
+| 122K | 184 vs 197 µs (−7%) | −1.7% |
+| 237K | 330 vs 379 µs (−13%) | −2.0% |
+| 470K | 637 vs 720 µs (−11%) | −0.9% |
+| 910K | 1,269 vs 1,283 µs (−1%; −7% by minimum) | −0.5% |
+
+- **Exactness:** selections and scores are bit-identical, and the top-k route, extent and
+  compaction tests pass.
+- **Why the gain is small:** selection is bound by reading the score matrix from DRAM (233 MB
+  per call at 910K), not by load instructions.
+- **Predicted serving share:** under 0.1% of cold prefill. It is recorded as a micro gain.
+
+## All three together (`receipts/sp8/final-1`)
+
+Against candidate-60's kernel, on finite inputs:
+
+| Context | Score + select |
+|---|---|
+| 122K | 866 vs 1,040 µs (−17%) |
+| 237K | 1,620 vs 1,958 µs (−17%) |
+| 470K | 3,114 vs 3,800 µs (−18%) |
+| 910K | 5,977 vs 7,341 µs (−19%) |
+
+- **Bits:** bit-identical at every depth. The dense decode shapes are bit-identical with none of
+  10 slower, and the candidate kernel is bit-identical.
+- **Tests:** `-k "indexer or topk"` 29 passed and 1 skipped, the candidate NaN test passed, and
+  the PDL tests passed (15).
+
+## Patches
+
+[vllm/series](vllm/series) is candidate-60's series (689 patches, head `f27a89d6a944`) followed by:
+
+| Patch | Change |
+|---|---|
+| [0817](vllm/0817-perf-dsv41-bf16x2-epilogue-and-next-tile-key-prefetc.patch) | bf16x2 epilogue, paired head-sum loads and next-tile key prefetch in the dense score kernel |
+| [0818](vllm/0818-fix-dsv41-keep-a-NaN-through-the-indexer-score-ReLU-.patch) | NaN-keeping score ReLU in the dense and candidate kernels; the non-finite test un-xfailed, and a candidate-kernel contract test |
+| [0819](vllm/0819-perf-dsv41-load-dense-top-k-segment-keys-eight-BF16-.patch) | dense top-k segment keys loaded eight scores per 16-byte read |
+
+- **Lock:** `bin/spark --cluster-config experiments/2026-11-16-indexer-prefill-exact/tp4.json
+  build prepare --only vllm --lock` (sp8) applies the series and recorded patch head
+  `3eb4081e4457`, tree `b16a066d4252`. That is [source.json](source.json),
+  [upstreams.lock.json](upstreams.lock.json) and the `tp4`, `tp4-switched` and `tp3-switched`
+  profiles.
+- **Tree check:** the prepared tree's `indexer.py` (`34608dfb…`) and test file (`e4562069…`)
+  are the files measured in `final-1`.
+- **No image yet:** `spark-ds41f:candidate-60-indexer-exact` is not built.
+- **Two `tp4` profiles:** [tp4-dev.json](tp4-dev.json) is the end-to-end arm (0817 as an
+  overlay on candidate-60's image); `tp4.json` is the image profile for the series.
 
 ## Conclusion
 
-Pending the end-to-end runs.
+Cold prefill at long context gets faster with unchanged output.
 
-## Noted, not changed
+- **0817:** scoring is 19-22% faster at prefill depths. End to end at tp4-ring, the gain is
+  +1.0-1.2% at 237K-470K and +2.1% at 910K tokens (9,064 → 9,251 tok/s). Outputs are identical:
+  324 of 324 gate calls on boot 1 match candidate-58's records, and the kernel benches are
+  bit-identical at every shape.
+- **0818:** the indexer keeps a NaN as DeepSeek's reference does, at no cost and with finite
+  outputs unchanged. It closes the last open item of the kernel-contracts work.
+- **0819:** a micro gain, under 0.1% of serving.
 
-- **Keeping NaN through the ReLU:** the bf16x2 form makes a vectorizable NaN-keeping ReLU
-  possible (`max.NaN.bf16x2`). That is the form the strict xfail above waits for to match
-  DeepSeek's `relu_`. It changes outputs for non-finite inputs, so it is a separate change.
-- **Fusing selection into scoring:** at 910K, writing the 256 × 455K BF16 score matrix and
-  reading it back for selection moves about 0.47 GB per call, roughly 1.9 ms of the 5.9 ms
-  score-and-select. Selecting each 4,096-entry segment inside the score kernel would keep that
-  traffic on chip, with the same segments and tie rule. It is a larger change, measured
-  separately.
+## Not done
+
+- **Fusing selection into scoring** (TODO.md). At 910K, writing the 256 × 455K BF16 score
+  matrix and reading it back moves about 0.47 GB per call. The selection's read alone takes most
+  of its 1.2-1.3 ms. Scoring a 4-row group's 4,096-position segments into shared memory and
+  selecting each there would keep that traffic on chip. Every segmentation gives the same exact
+  top 512, since the merges are exact and use the same tie rule. Expected gain: about 0.7-0.9
+  ms per call at 910K, roughly +1.4% at 1M and +0.4% at 237K. It needs a new kernel combining
+  the CUDA score path with the TileLang selection macros.
