@@ -42,6 +42,10 @@ HALF = GROUP // 2  # one code byte holds a column of each half
 WINDOW = 15  # exponents encoded per tensor (codes 1..15; code 0 is exponent 0)
 VEC = 16  # columns of each half one thread decodes at a time
 _PACK_BLOCK_ROWS = 1_024
+# From row 3 * _PACK_BLOCK_ROWS onward, row r's 1.5*K-byte output end is at or
+# before row (r - _PACK_BLOCK_ROWS)'s 2*K-byte input start, so packing directly
+# into the in-place output view cannot overlap unread input rows.
+_PACK_SAFE_DIRECT_ROW = 3 * _PACK_BLOCK_ROWS
 # Token tiles: one decode row in a 16-row tile reads the weights once, like 64;
 # 65-128 verification rows read the packed weight shard once in a 128-row tile.
 ROW_TILES = (16, 32, 64, 128)
@@ -340,13 +344,16 @@ def _check_pack_weight(weight: torch.Tensor) -> None:
 
 
 def pack_bf16_weight(
-    weight: torch.Tensor, *, in_place: bool = False
+    weight: torch.Tensor,
+    *,
+    in_place: bool = False,
 ) -> PackedBf16Weight:
     """Pack ``weight`` into exact 12-bit storage using TileLang; raise if any value
     would not round-trip.
 
     ``in_place=True`` writes the packed rows into the first three quarters of
-    ``weight``'s own storage using a 1,024-row staging buffer.
+    ``weight``'s own storage, staging only the first 3,072 rows where input and
+    output byte ranges overlap and writing the remaining rows directly.
     """
     _check_pack_weight(weight)
     out_features, in_features = map(int, weight.shape)
@@ -374,13 +381,14 @@ def pack_bf16_weight(
             .view(-1)[: out_features * width]
             .view(out_features, width)
         )
+        staged_limit = min(out_features, _PACK_SAFE_DIRECT_ROW)
         staging = torch.empty(
-            (min(_PACK_BLOCK_ROWS, out_features), width),
+            (min(_PACK_BLOCK_ROWS, staged_limit), width),
             dtype=torch.uint8,
             device=device,
         )
-        for start in range(0, out_features, _PACK_BLOCK_ROWS):
-            count = min(_PACK_BLOCK_ROWS, out_features - start)
+        for start in range(0, staged_limit, _PACK_BLOCK_ROWS):
+            count = min(_PACK_BLOCK_ROWS, staged_limit - start)
             pack_kernel(
                 bits,
                 staging[:count],
@@ -393,6 +401,22 @@ def pack_bf16_weight(
             )
             values[start : start + count].copy_(staging[:count])
         del staging
+        start = staged_limit
+        while start < out_features:
+            # Output bytes [1.5*K*start, 1.5*K*end) are strictly below unread input
+            # bytes [2*K*start, 2*K*out_features) iff 3*end <= 4*start.
+            end = min(out_features, (4 * start) // 3)
+            pack_kernel(
+                bits,
+                values[start:end],
+                row_offsets,
+                rows,
+                entries,
+                mismatches,
+                base,
+                start,
+            )
+            start = end
     else:
         values = torch.empty((out_features, width), dtype=torch.uint8, device=device)
         pack_kernel(

@@ -833,6 +833,14 @@ class DeepseekV4Model(nn.Module, EagleModelMixin):
             if self._sink_columns is not None
             else []
         )
+        def _warm_model_runtime() -> None:
+            if l2_prefetch.ENABLED and not self._l2pf_ready:
+                self._build_l2_prefetch()
+            if self.prefill_sp_min_rows and torch.cuda.is_available():
+                first_param = next(self.parameters(), None)
+                if first_param is not None and first_param.is_cuda:
+                    sp_prefill._side_stream(first_param.device)
+
         prepare.declare(
             lambda: [
                 *collectives.rank_order_sum_calls(),
@@ -841,7 +849,8 @@ class DeepseekV4Model(nn.Module, EagleModelMixin):
                 prepare.call(columns.zero_packs_kernel),
                 *l2_prefetch.kernel_calls(),
                 *collapse,
-            ]
+            ],
+            warm=_warm_model_runtime,
         )
 
     def _build_l2_prefetch(self) -> None:

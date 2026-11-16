@@ -2396,24 +2396,50 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase):
         real_heads = real_groups * heads_per_group
         q_rows = real_heads * self.head_dim
         wo_rows = real_groups * self.o_lora_rank
-        from vllm.models.deepseek_v4_1.tilelang.gemm import unpack_weight_tiles
+        from vllm.models.deepseek_v4_1.tilelang.gemm import (
+            TILE_CONTIGUOUS_FP8,
+            TILE_WEIGHT_K,
+            TILE_WEIGHT_N,
+            pack_scale_words,
+            unpack_weight_tiles,
+        )
         from vllm.models.deepseek_v4_1.tilelang.linear import _block32_scale_words
 
-        if getattr(self.wq_b, "tilelang_weight_packed", False):
-            w_q = unpack_weight_tiles(
-                self.wq_b.tilelang_weight, *self.wq_b.weight.shape
-            )
-            self.wq_b.tilelang_weight_packed = False
-        else:
-            w_q = self.wq_b.weight
-        self.wq_b.weight = nn.Parameter(w_q[:q_rows].contiguous(), requires_grad=False)
+        k_q = int(self.wq_b.weight.shape[1])
         self.wq_b.weight_scale_inv = nn.Parameter(
             self.wq_b.weight_scale_inv[: q_rows // 32].contiguous(),
             requires_grad=False,
         )
         self.wq_b.output_size_per_partition = q_rows
-        if hasattr(self.wq_b, "tilelang_weight_sf"):
-            _block32_scale_words(self.wq_b)
+        if (
+            getattr(self.wq_b, "tilelang_weight_packed", False)
+            and q_rows % TILE_WEIGHT_N == 0
+            and (q_rows, k_q) in TILE_CONTIGUOUS_FP8
+        ):
+            packed_q = self.wq_b.tilelang_weight[
+                : q_rows * (k_q // TILE_WEIGHT_K)
+            ].contiguous()
+            self.wq_b.weight = nn.Parameter(
+                packed_q.view(q_rows, k_q), requires_grad=False
+            )
+            self.wq_b.tilelang_weight = packed_q
+            if hasattr(self.wq_b, "tilelang_weight_sf"):
+                self.wq_b.tilelang_weight_sf = pack_scale_words(
+                    self.wq_b.weight_scale_inv
+                )
+        else:
+            if getattr(self.wq_b, "tilelang_weight_packed", False):
+                w_q = unpack_weight_tiles(
+                    self.wq_b.tilelang_weight, *self.wq_b.weight.shape
+                )
+                self.wq_b.tilelang_weight_packed = False
+            else:
+                w_q = self.wq_b.weight
+            self.wq_b.weight = nn.Parameter(
+                w_q[:q_rows].contiguous(), requires_grad=False
+            )
+            if hasattr(self.wq_b, "tilelang_weight_sf"):
+                _block32_scale_words(self.wq_b)
 
         self.attn_sink = nn.Parameter(
             self.attn_sink[:real_heads].contiguous(), requires_grad=False

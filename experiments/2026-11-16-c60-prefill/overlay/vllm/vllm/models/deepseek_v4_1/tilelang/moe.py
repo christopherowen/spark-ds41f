@@ -56,6 +56,7 @@ from .gemm import (
 )
 from .linear import MXFP8Rows, _calls, _launch
 from .scale_codes import (
+    encode_expert_scale_codes,
     narrow_code_offsets,
     overlay_byte_codes,
     pack_expert_scale_codes,
@@ -1455,12 +1456,23 @@ def tile_expert_weights(b_packed, block_N):
     k_full, tail = divmod(2 * half_k, FP4_TMA_K)
     b = b_packed.view(E, N // block_N, block_N, half_k)
     full = b[..., : k_full * FP4_TMA_K // 2]
-    tiles = (
-        full.reshape(E, N // block_N, block_N, k_full, FP4_TMA_K // 2)
-        .permute(0, 1, 3, 2, 4)
-        .reshape(-1, block_N, FP4_TMA_K // 2)
-        .contiguous()
-    )
+    slab_bytes = FP4_TMA_K // 2
+    if slab_bytes % 8 == 0 and full.is_contiguous():
+        tiles = (
+            full.view(torch.int64)
+            .reshape(E, N // block_N, block_N, k_full, slab_bytes // 8)
+            .permute(0, 1, 3, 2, 4)
+            .contiguous()
+            .view(b_packed.dtype)
+            .reshape(-1, block_N, slab_bytes)
+        )
+    else:
+        tiles = (
+            full.reshape(E, N // block_N, block_N, k_full, slab_bytes)
+            .permute(0, 1, 3, 2, 4)
+            .reshape(-1, block_N, slab_bytes)
+            .contiguous()
+        )
     if not tail:
         return tiles, None
     tails = b[..., k_full * FP4_TMA_K // 2 :].reshape(-1, block_N, tail // 2)
@@ -2029,8 +2041,16 @@ class MoeExpertsV41Plan:
 
         prepare.declare(calls, bind=bind)
 
-    def prepare_weight(self, w, scale, *, gate_up: bool | None = None):
-        """One GEMM's ``(tiles, tails, codes, codes_2bit, narrow, base)``."""
+    def prepare_weight(
+        self,
+        w,
+        scale,
+        *,
+        gate_up: bool | None = None,
+    ):
+        """One GEMM's ``(tiles, tails, codes, codes_2bit, narrow, base)``
+        in ``overlay_byte_codes(tile_codes(...), tile_byte_codes(...), narrow)``
+        and ``narrow_code_offsets(narrow)`` layout."""
         if gate_up is None:
             gate_up = (
                 w.shape[1] == 2 * self.intermediate
@@ -2039,16 +2059,11 @@ class MoeExpertsV41Plan:
         if gate_up and self._has_prefill_swiglu_fusion():
             w = _interleave_gate_up_slabs(w)
             scale = _interleave_gate_up_slabs(scale)
-        packed = pack_expert_scale_codes(scale)
-        narrow, base = packed.narrow, packed.base
-        codes, codes_2bit = overlay_byte_codes(
-            tile_codes(packed.codes, self.block_N),
-            tile_byte_codes(packed.codes_2bit, self.block_N),
-            narrow,
+        codes, codes_2bit, narrow_offsets, base = encode_expert_scale_codes(
+            scale, self.block_N
         )
-        del packed
         tiles, tails = tile_expert_weights(w.view(torch.int8), self.block_N)
-        return tiles, tails, codes, codes_2bit, narrow_code_offsets(narrow), base
+        return tiles, tails, codes, codes_2bit, narrow_offsets, base
 
     def prepare_weights(self, w13, w13_scale, w2, w2_scale):
         """Per GEMM ``(tiles, tails, codes, codes_2bit, narrow, base)``.

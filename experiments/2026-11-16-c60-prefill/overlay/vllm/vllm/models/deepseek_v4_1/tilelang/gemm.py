@@ -50,6 +50,17 @@ def pack_weight_tiles(
         raise ValueError(
             f"weight shape {(n, k)} must be divisible by tile {(tile_n, tile_k)}"
         )
+    tile_bytes = tile_k * weight.element_size()
+    if tile_bytes % 8 == 0 and weight.is_contiguous():
+        words = tile_bytes // 8
+        return (
+            weight.view(torch.int64)
+            .reshape(n // tile_n, tile_n, k // tile_k, words)
+            .permute(0, 2, 1, 3)
+            .contiguous()
+            .view(weight.dtype)
+            .view(n * (k // tile_k), tile_k)
+        )
     return (
         weight.reshape(n // tile_n, tile_n, k // tile_k, tile_k)
         .permute(0, 2, 1, 3)
@@ -66,6 +77,17 @@ def unpack_weight_tiles(
     tile_k: int = TILE_WEIGHT_K,
 ) -> torch.Tensor:
     """Inverse of ``pack_weight_tiles``: restore row-major ``[N, K]`` FP8 weight."""
+    tile_bytes = tile_k * packed.element_size()
+    if tile_bytes % 8 == 0 and packed.is_contiguous():
+        words = tile_bytes // 8
+        return (
+            packed.view(torch.int64)
+            .reshape(n // tile_n, k // tile_k, tile_n, words)
+            .permute(0, 2, 1, 3)
+            .contiguous()
+            .view(packed.dtype)
+            .view(n, k)
+        )
     return (
         packed.reshape(n // tile_n, k // tile_k, tile_n, tile_k)
         .permute(0, 2, 1, 3)
