@@ -96,3 +96,18 @@ The cause is not attributed:
 
 So this is not a matched gain over a release. A matched figure needs a release reference
 measured with this bench and text at 1M on this testbed.
+
+## Short prompts
+
+The second run completes the curve below 32K, with the same profile, bench, text and repeats.
+The only change is the size list: 512, 1K, 2K, 4K, 8K and 16K, plus 32K as an anchor to
+candidate-59's recorded 32K (9,548.5 tok/s at 28,907 tokens). At these sizes, time to first
+token is mostly fixed per-request cost, so read the TTFT column first.
+
+Spec: [bench-prefill-short-tp4-switched.json](bench-prefill-short-tp4-switched.json).
+
+```sh
+bin/spark candidate queue tp4-switched experiments/2026-11-16-c59-long-prefill/bench-prefill-short-tp4-switched.json --apply
+```
+
+Runs: pending.
