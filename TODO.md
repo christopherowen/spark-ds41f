@@ -377,6 +377,26 @@ Open levers:
   per-column Markov bias upper bound (`||u_t||_2 ||b_v||_2`, or exact NVFP4
   Markov dot product) to the Cauchy-Schwarz tile upper bound so DSpark refines
   only the active `<2%` 12-bit columns with bit-identical greedy drafts.
+- **Per-row $\ell_2$-optimal scale search and finite outlier bounds in
+  `build_screen_weights`.** Currently `build_screen_weights()`
+  (`vllm/models/deepseek_v4_1/tilelang/vocab.py`) quantizes each `lm_head` row
+  into the 8-bit `W_q` screening table using naive `amax` scaling and assigns
+  `row_bound = inf` whenever `full_amax > 8 * in_amax`, leaving dense
+  coordinates coarser near zero and preventing tiles containing `extreme_mask`
+  rows from ever being pruned. Because the Cauchy-Schwarz upper bound holds for
+  any per-row scale $s_i > 0$, search a small scale grid
+  $s_i = \alpha \cdot \text{amax}_i$ at load time to minimize
+  $\|w_i - \widehat{W}_i(s_i)\|_2$ (`row_bound[i]`) and compute finite residual
+  norms on `extreme_mask` rows instead of `inf`, tightening tile pruning for
+  both target greedy verification and the planned DSpark `W_q` Markov screen
+  with zero runtime kernel changes and bit-identical outputs.
+- **Load-time scale-code search for online NVFP4 draft projections.** If
+  revisiting `Nvfp4OnlineLinearMethod` / `prepare_nvfp4_head` (`0647`) for
+  DSpark draft or Markov projections (where target verification keeps outputs
+  exact), replace naive `amax` scaling (`scaled_fp4_quant`) with load-time search
+  over legal E4M3 block-scale codes around the default code under a
+  Hessian-weighted layer reconstruction loss and blockwise error compensation,
+  improving draft acceptance with zero search overhead on the serving path.
 - **Tail-slot (`survival < DEAD_ROWS_TAU`) short-suffix `CopyDrafter` splice.**
   Currently `CopyDrafter` (`0744..0745`) switches all-or-nothing per request
   against DSpark's full 5-token chain, leaving trailing slots as dead rows
