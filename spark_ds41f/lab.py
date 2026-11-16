@@ -170,7 +170,9 @@ def parse_time(text: str) -> float:
 
 
 def write_json_atomic(path: Path, data: dict) -> None:
-    temporary = path.with_name(path.name + ".tmp")
+    # One temporary per concurrent writer: a runner's foreground beat() and its background
+    # heartbeat can write the hold at the same moment.
+    temporary = path.with_name(f"{path.name}.{os.getpid()}.{threading.get_ident()}.tmp")
     temporary.write_text(json.dumps(data, indent=2) + "\n", encoding="utf-8")
     os.replace(temporary, path)
 

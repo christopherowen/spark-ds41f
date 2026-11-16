@@ -10,10 +10,12 @@ import importlib.machinery
 import importlib.util
 import json
 import math
+import os
 import statistics
 import subprocess
 import sys
 import tempfile
+import threading
 import time
 import unittest
 from pathlib import Path
@@ -225,6 +227,35 @@ class HeadUrlTest(unittest.TestCase):
                 self.assertRaisesRegex(RuntimeError, "no head URL for experiments/x/bad.json"):
             lab.step_argv(step)
         self.assertEqual(lab.step_argv({"argv": ["t.py", "a"]}), ["t.py", "a"])
+
+
+class AtomicJsonTest(unittest.TestCase):
+    def test_two_writers_meeting_at_the_rename_both_succeed(self) -> None:
+        # Both writers finish their temporary before either renames, the interleaving that made
+        # a shared temporary lose one write and fail the other's os.replace.
+        real_replace, barrier, errors = os.replace, threading.Barrier(2, timeout=10), []
+
+        def replace(source, destination):
+            barrier.wait()
+            return real_replace(source, destination)
+
+        with tempfile.TemporaryDirectory() as directory, mock.patch.object(lab.os, "replace", replace):
+            path = Path(directory) / "spark-hold.json"
+
+            def writer(n: int) -> None:
+                try:
+                    lab.write_json_atomic(path, {"writer": n})
+                except BaseException as error:  # noqa: BLE001 - collected for the assertion
+                    errors.append(error)
+
+            threads = [threading.Thread(target=writer, args=(n,)) for n in range(2)]
+            for thread in threads:
+                thread.start()
+            for thread in threads:
+                thread.join()
+            self.assertEqual(errors, [])
+            self.assertIn(json.loads(path.read_text(encoding="utf-8"))["writer"], (0, 1))
+            self.assertEqual([p.name for p in Path(directory).iterdir()], ["spark-hold.json"])
 
 
 class BootTimeTest(unittest.TestCase):
