@@ -1,0 +1,178 @@
+From 2ea81f284e79d5cddb8a801b4538b1ea3d662e83 Mon Sep 17 00:00:00 2001
+From: Christopher Owen <3221756+christopherowen@users.noreply.github.com>
+Date: Mon, 16 Nov 2026 21:16:18 +0000
+Subject: [PATCH] perf(dsv41): load dense top-k segment keys eight BF16 scores
+ at a time
+
+Base: the previous patch (keep a NaN through the indexer score ReLU).
+
+Rationale:
+The top-k segment kernel (indexer_topk_segment_v41) built each 16,384-entry segment's
+order-preserving uint16 keys with one 2-byte global load per thread per step. For dense rows
+with uint16 keys, __tl_load_keys16 reads eight scores per 16-byte load and writes each key to
+the same swizzled slot (idx ^ ((idx >> 5) & 31)) as the scalar loop; a misaligned row or the
+tail past the last whole group of eight falls back to scalar loads. Gathered and grouped
+selections keep the scalar loop.
+
+Quality:
+Bit-identical selections (and scores) to the previous patch at prefill depths of 122K, 237K,
+470K and 910K-token prompts. Selection 7-13% faster at 122K-470K and 1% (median; 7% by the
+minimum) at 910K, where the score matrix's read from DRAM bounds it; score and selection
+together 0.5-2% faster. Predicted serving share: under 0.1% of cold prefill; recorded as a
+micro gain.
+
+Tests:
+- pytest tests/kernels/attention/test_deepseek_v41_tilelang.py -k "indexer or topk" (the top-k
+  route, extent and compaction tests among them).
+
+Upstream status: local DeepSeek-V4.1 TileLang indexer optimization for SM120/SM121.
+---
+ vllm/models/deepseek_v4_1/tilelang/indexer.py | 111 +++++++++++++-----
+ 1 file changed, 79 insertions(+), 32 deletions(-)
+
+diff --git a/vllm/models/deepseek_v4_1/tilelang/indexer.py b/vllm/models/deepseek_v4_1/tilelang/indexer.py
+index 3223309b2..a7ef043f9 100644
+--- a/vllm/models/deepseek_v4_1/tilelang/indexer.py
++++ b/vllm/models/deepseek_v4_1/tilelang/indexer.py
+@@ -2049,6 +2049,39 @@ def _final_writer(threads, topk, group):
+     return write_final, write_empty_final
+ 
+ 
++_KEY_LOAD_HEADER = r"""
++// Order-preserving uint16 keys of a dense segment's BF16 scores into the swizzled key buffer:
++// the same key in the same slot as the scalar loop, read eight scores per 16-byte load.
++template <int THREADS>
++__device__ __forceinline__ void __tl_load_keys16(
++    const bfloat16_t* __restrict__ row_scores,
++    uint16_t* __restrict__ keys,
++    int seg_start,
++    int n_active
++) {
++    int tx = threadIdx.x;
++    const uint16_t* src = reinterpret_cast<const uint16_t*>(row_scores) + seg_start;
++    int full = ((reinterpret_cast<uintptr_t>(src) & 15) == 0) ? (n_active & ~7) : 0;
++    for (int base = tx * 8; base < full; base += THREADS * 8) {
++        uint4 v = *reinterpret_cast<const uint4*>(src + base);
++        uint32_t w[4] = {v.x, v.y, v.z, v.w};
++        #pragma unroll
++        for (int k = 0; k < 8; ++k) {
++            uint32_t bits = (w[k >> 1] >> ((k & 1) * 16)) & 0xFFFFu;
++            uint32_t key = (bits >= 0x8000u) ? (bits ^ 0xFFFFu) : (bits | 0x8000u);
++            int idx = base + k;
++            keys[idx ^ ((idx >> 5) & 31)] = (uint16_t)key;
++        }
++    }
++    for (int j = full + tx; j < n_active; j += THREADS) {
++        uint32_t bits = src[j];
++        uint32_t key = (bits >= 0x8000u) ? (bits ^ 0xFFFFu) : (bits | 0x8000u);
++        keys[j ^ ((j >> 5) & 31)] = (uint16_t)key;
++    }
++}
++"""
++
++
+ @tilelang.jit(
+     pass_configs={tilelang.PassConfigKey.TL_DISABLE_THREAD_STORAGE_SYNC: True}
+ )
+@@ -2094,6 +2127,8 @@ def indexer_topk_segment_v41(
+     segments = tilelang.cdiv(entries, segment)
+     assert not final or segments == 1, "a final segment must cover the row"
+     per = segment // threads
++    # Dense uint16 keys load eight scores a thread at a time (``__tl_load_keys16``).
++    vector_keys = group == 1 and not gather_scores and swizzle
+     threshold, compact = _select_macros(threads, topk, swizzle)
+     write_final, write_empty_final = _final_writer(threads, topk, group)
+ 
+@@ -2105,38 +2140,48 @@ def indexer_topk_segment_v41(
+         best = T.alloc_var(T.int32)
+         n_entries = T.ceildiv(extent, group)
+         n_active = T.min(segment, T.max(n_entries - seg * segment, 0))
+-        for i in T.serial(T.ceildiv(n_active, threads)):
+-            j = i * threads + tx
+-            if j < n_active:
+-                e = seg * segment + j
+-                if gather_scores:
+-                    blk = Gather[row, e // CANDIDATE_BLOCK]
+-                    pos = blk * CANDIDATE_BLOCK + e % CANDIDATE_BLOCK
+-                    keys[_swizzle_key_idx(j, swizzle)] = T.cast(
+-                        T.if_then_else(
+-                            blk >= 0,
+-                            _key16(Scores[row, T.min(T.max(pos, 0), width - 1)]),
+-                            0,
+-                        ),
+-                        key_dtype,
+-                    )
+-                elif group == 1:
+-                    keys[_swizzle_key_idx(j, swizzle)] = T.cast(
+-                        _key16(Scores[row, T.min(e, width - 1)]), key_dtype
+-                    )
+-                else:
+-                    best = 0
+-                    for o in T.serial(group):
+-                        if e * group + o < extent:
+-                            best = T.max(
+-                                best,
+-                                _key16(Scores[row, T.min(e * group + o, width - 1)]),
+-                            )
+-                    # The block holding the last visible position always survives.
+-                    keys[_swizzle_key_idx(j, swizzle)] = T.cast(
+-                        T.if_then_else(e == (extent - 1) // group, 0xFF80, best),
+-                        key_dtype,
+-                    )
++        if vector_keys:
++            T.call_extern(
++                "handle",
++                f"__tl_load_keys16<{threads}>",
++                T.address_of(Scores[row, 0]),
++                T.address_of(keys[0]),
++                seg * segment,
++                n_active,
++            )
++        else:
++            for i in T.serial(T.ceildiv(n_active, threads)):
++                j = i * threads + tx
++                if j < n_active:
++                    e = seg * segment + j
++                    if gather_scores:
++                        blk = Gather[row, e // CANDIDATE_BLOCK]
++                        pos = blk * CANDIDATE_BLOCK + e % CANDIDATE_BLOCK
++                        keys[_swizzle_key_idx(j, swizzle)] = T.cast(
++                            T.if_then_else(
++                                blk >= 0,
++                                _key16(Scores[row, T.min(T.max(pos, 0), width - 1)]),
++                                0,
++                            ),
++                            key_dtype,
++                        )
++                    elif group == 1:
++                        keys[_swizzle_key_idx(j, swizzle)] = T.cast(
++                            _key16(Scores[row, T.min(e, width - 1)]), key_dtype
++                        )
++                    else:
++                        best = 0
++                        for o in T.serial(group):
++                            if e * group + o < extent:
++                                best = T.max(
++                                    best,
++                                    _key16(Scores[row, T.min(e * group + o, width - 1)]),
++                                )
++                        # The block holding the last visible position always survives.
++                        keys[_swizzle_key_idx(j, swizzle)] = T.cast(
++                            T.if_then_else(e == (extent - 1) // group, 0xFF80, best),
++                            key_dtype,
++                        )
+         T.sync_threads()
+         threshold(keys, n_active, tx, hist, scan, params)
+         compact(keys, per, tx, scan, params, sel_idx, sel_key, n_active, warp_sums=hist)
+@@ -2154,6 +2199,8 @@ def indexer_topk_segment_v41(
+         WorkEntries,
+     ):
+         with T.Kernel(segments, rows, threads=threads) as (seg, row):
++            if vector_keys:
++                T.import_source(_KEY_LOAD_HEADER)
+             pdl.chain()
+             tx = T.get_thread_binding()
+             keys = T.alloc_shared([segment], key_dtype)
+-- 
+2.43.0
+

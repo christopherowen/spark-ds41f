@@ -1,0 +1,173 @@
+From fd4244bf1eee3d3a7d213fe3063272d6c20539ef Mon Sep 17 00:00:00 2001
+From: Christopher Owen <3221756+christopherowen@users.noreply.github.com>
+Date: Mon, 16 Nov 2026 21:16:18 +0000
+Subject: [PATCH] fix(dsv41): keep a NaN through the indexer score ReLU, as
+ DeepSeek's relu_ does
+
+Base: the previous patch (bf16x2 epilogue and next-tile key prefetch in the dense indexer
+score kernel).
+
+Rationale:
+DeepSeek's indexer takes relu_ of each head's dot product, which keeps a NaN. The score kernels
+computed max(dot, 0), which drops it: a head whose index query has an infinite scale (UE8M0
+0xFF, its dot NaN) contributed zero instead of turning the row's scores NaN.
+test_indexer_nonfinite_query_scale has recorded this as a strict xfail since
+experiments/2026-10-14-kernel-contracts, where the NaN-keeping forms TileLang could vectorize
+cost 3.4-4.6% of prefill. With the bf16x2 epilogue, the ReLU is one __hmax2_nan
+(max.NaN.bf16x2) at the same instruction count:
+1. __tl_score_rows_dense_fast (both epilogues) uses __hmax2_nan.
+2. __tl_score_row_candidates_fast (the reindex layers) takes the same bf16x2 epilogue, with
+   __hmax2_nan, in place of its float2 round trip.
+
+Quality:
+Finite inputs keep their bits: scores and selections bit-identical to the previous patch at
+prefill depths of 237K and 910K-token prompts, at the decode shapes of
+benchmark_deepseek_v41_indexer_bound.py, and for the reindex candidate kernel at 6 and 96 rows
+over a 1M-token context, with no measurable cost (candidate kernel 11.6 against 12.1 us at 6
+rows, 294 against 299 us at 96). Only rows with a non-finite index query change: their scores
+are NaN at every live position, as the reference's.
+
+Tests:
+- test_indexer_nonfinite_query_scale passes; its strict xfail is removed.
+- test_indexer_candidates_nonfinite_query_scale (new): the same contract for the candidate
+  kernel, a masked block still scoring -inf and the other rows keeping their bits.
+- pytest tests/kernels/attention/test_deepseek_v41_tilelang.py -k "indexer or topk" without the
+  xfail (29 passed, 1 skipped), and the candidate-kernel contract run on its own (1 passed).
+
+Upstream status: local DeepSeek-V4.1 TileLang indexer fix for SM120/SM121.
+---
+ .../attention/test_deepseek_v41_tilelang.py   | 49 ++++++++++++++++---
+ vllm/models/deepseek_v4_1/tilelang/indexer.py | 19 ++++---
+ 2 files changed, 50 insertions(+), 18 deletions(-)
+
+diff --git a/tests/kernels/attention/test_deepseek_v41_tilelang.py b/tests/kernels/attention/test_deepseek_v41_tilelang.py
+index 25126ea81..719ec51f7 100644
+--- a/tests/kernels/attention/test_deepseek_v41_tilelang.py
++++ b/tests/kernels/attention/test_deepseek_v41_tilelang.py
+@@ -449,14 +449,6 @@ def test_indexer_dense(context, page_size=64, rows=4):
+     assert torch.equal(out, expected)
+ 
+ 
+-@pytest.mark.xfail(
+-    strict=True,
+-    raises=AssertionError,
+-    reason="the indexer's score ReLU is max(dot, 0), which drops a NaN; the NaN-keeping "
+-    "forms tried so far either serialize the per-head loop (isnan, a 32-bit bit test) or "
+-    "are folded away by TileLang's simplifier (dot != dot), so the fix waits for a "
+-    "vectorizable NaN-keeping max (spark-ds41f experiments/2026-10-14-kernel-contracts)",
+-)
+ def test_indexer_nonfinite_query_scale(page_size=64, rows=4, context=4096):
+     """An infinite index query quantizes to the UE8M0 scale ``0xFF``, which makes its
+     head's dot NaN. DeepSeek's indexer takes ``relu_`` of the score and keeps the
+@@ -538,6 +530,47 @@ def test_indexer_candidates(page_size=64, rows=4, context=8192):
+     assert bool((out[rows - 1] == -1).all())
+ 
+ 
++def test_indexer_candidates_nonfinite_query_scale(page_size=64, rows=4, context=8192):
++    """The reindex (candidate) score kernel keeps a NaN head as DeepSeek's ``relu_``
++    does: a row whose index query has an infinite scale scores NaN at every unmasked
++    candidate, a masked block still scores ``-inf``, and every other row keeps its bits."""
++    inp = _index_inputs(rows, context, page_size)
++    width = CANDIDATE_BLOCKS * CANDIDATE_BLOCK
++    gen = _gen(7)
++    candidates = torch.full((rows, CANDIDATE_BLOCKS), -1, dtype=torch.int32, device=DEVICE)
++    candidate_lengths = torch.zeros(rows, dtype=torch.int32, device=DEVICE)
++    for r in range(rows):
++        visible = int(inp["lengths"][r]) - 3
++        last = (visible - 1) // CANDIDATE_BLOCK
++        n = int(torch.randint(64, last + 1, (1,), generator=gen, device=DEVICE))
++        chosen = torch.randperm(last, generator=gen, device=DEVICE)[: n - 1]
++        ids = torch.cat([chosen.sort().values, torch.tensor([last], device=DEVICE)])
++        candidates[r, :n] = ids.to(torch.int32)
++        candidate_lengths[r] = (n - 1) * CANDIDATE_BLOCK + visible - last * CANDIDATE_BLOCK
++    candidates[1, 2] = -1  # a masked block in the NaN row keeps -inf
++    plan = IndexerV41Plan(width, page_size, candidates=True)
++    names = ("q_packed", "q_scales", "weights", "pool", "page_table", "lengths", "active")
++    _, scores = plan.run(*(inp[k] for k in names), candidates, candidate_lengths)
++    clean = scores.clone()
++    r, h = 1, 3
++    inp["q_scales"][r, h, 0] = 0xFF
++    inp["q_packed"][r, h, 0] = 0  # a zero code: 0 x inf is NaN in any order
++    inp["q_values"] = _decode_mxfp4(inp["q_packed"], inp["q_scales"])
++    _, scores = plan.run(*(inp[k] for k in names), candidates, candidate_lengths)
++    extent = candidate_lengths.clamp(0, width).tolist()
++    positions = _expanded(candidates, candidate_lengths)
++    ref = _ref_scores(inp, page_size, extent, lambda i: positions[i, : extent[i]])
++    masked = slice(2 * CANDIDATE_BLOCK, 3 * CANDIDATE_BLOCK)
++    assert bool(torch.isneginf(scores[r, masked]).all())
++    live = torch.ones(extent[r], dtype=torch.bool, device=DEVICE)
++    live[masked] = False
++    assert bool(ref[r][live].isnan().all())
++    assert_same_nonfinite(scores[r, : extent[r]][live], ref[r][live], f"row {r}: ")
++    for i in range(rows):
++        if i != r:
++            assert torch.equal(scores[i, : extent[i]], clean[i, : extent[i]]), i
++
++
+ def _compute_sanitizer() -> str | None:
+     path = os.environ.get("COMPUTE_SANITIZER") or shutil.which("compute-sanitizer")
+     if path is None and os.path.exists("/usr/local/cuda/bin/compute-sanitizer"):
+diff --git a/vllm/models/deepseek_v4_1/tilelang/indexer.py b/vllm/models/deepseek_v4_1/tilelang/indexer.py
+index d5a49438f..3223309b2 100644
+--- a/vllm/models/deepseek_v4_1/tilelang/indexer.py
++++ b/vllm/models/deepseek_v4_1/tilelang/indexer.py
+@@ -523,9 +523,9 @@ __device__ __forceinline__ void __tl_score_rows_dense_fast(
+                     #pragma unroll
+                     for (int i_4 = 0; i_4 < 8; ++i_4) {
+                         float2 v_ = *(float2*)(acc + (i_4 * 2));
+-                        // bf16(max(bf16(dot), 0) * w): the product of two bf16 values is exact, so one
++                        // bf16(relu(bf16(dot)) * w), a NaN dot kept as DeepSeek's relu_ keeps it: the product of two bf16 values is exact, so one
+                         // bf16x2 multiply rounds it as the float path's rounding of the float product does.
+-                        __nv_bfloat162 __m = __hmax2(__float22bfloat162_rn(v_), __float2bfloat162_rn(0.0f));
++                        __nv_bfloat162 __m = __hmax2_nan(__float22bfloat162_rn(v_), __float2bfloat162_rn(0.0f));
+                         uint1 __2;
+                         (reinterpret_cast<__nv_bfloat162*>(&__2))[0] = __hmul2(__m, w2_reg[r][(i_4 & 3) >> 1]);
+                         int p_row = (((tx & 63) >> 5) * 32) + ((i_4 >> 2) * 16) + ((i_4 & 1) * 8) + ((tx & 31) >> 2);
+@@ -638,9 +638,9 @@ __device__ __forceinline__ void __tl_score_rows_dense_fast(
+                 #pragma unroll
+                 for (int i_4 = 0; i_4 < 8; ++i_4) {
+                     float2 v_ = *(float2*)(acc + (i_4 * 2));
+-                    // bf16(max(bf16(dot), 0) * w): the product of two bf16 values is exact, so one
++                    // bf16(relu(bf16(dot)) * w), a NaN dot kept as DeepSeek's relu_ keeps it: the product of two bf16 values is exact, so one
+                     // bf16x2 multiply rounds it as the float path's rounding of the float product does.
+-                    __nv_bfloat162 __m = __hmax2(__float22bfloat162_rn(v_), __float2bfloat162_rn(0.0f));
++                    __nv_bfloat162 __m = __hmax2_nan(__float22bfloat162_rn(v_), __float2bfloat162_rn(0.0f));
+                     uint1 __2;
+                     (reinterpret_cast<__nv_bfloat162*>(&__2))[0] = __hmul2(__m, w2_reg[r][(i_4 & 3) >> 1]);
+                     int p_row = (((tx & 63) >> 5) * 32) + ((i_4 >> 2) * 16) + ((i_4 & 1) * 8) + ((tx & 31) >> 2);
+@@ -709,6 +709,7 @@ __device__ __forceinline__ void __tl_score_row_candidates_fast(
+     fp4_e2_2_t B_reg[2][16];
+     uint32_t sfq_reg[2];
+     float2 w_reg[2];
++    __nv_bfloat162 w2_reg[2];
+ 
+     int smem_q_off = (((tx >> 2) * 64) + ((((((tx & 31) >> 4) + ((tx & 3) >> 1)) & 1) * 32)) + ((((((tx & 15) >> 3) + (tx & 1)) & 1) * 16)));
+     int ld_q_base = (((tx >> 6) * 1024) + (((tx & 31) >> 4) * 512) + ((tx & 7) * 64) + ((((((tx & 15) >> 3) + ((tx & 3) >> 1)) & 1) * 16)));
+@@ -729,6 +730,7 @@ __device__ __forceinline__ void __tl_score_row_candidates_fast(
+     for (int w_i = 0; w_i < 2; ++w_i) {
+         int h0 = ((tx >> 6) * 16) + (w_i * 8) + ((tx & 3) * 2);
+         w_reg[w_i] = make_float2((float)wptr[h0], (float)wptr[h0 + 1]);
++        w2_reg[w_i] = *reinterpret_cast<const __nv_bfloat162*>(wptr + h0);
+     }
+ 
+     int num_iters = ((max(((extent + 63) >> 6) - cta, 0)) + ctas - 1) / ctas;
+@@ -782,13 +784,10 @@ __device__ __forceinline__ void __tl_score_row_candidates_fast(
+         #pragma unroll
+         for (int i_4 = 0; i_4 < 8; ++i_4) {
+             float2 v_ = *(float2*)(acc + (i_4 * 2));
+-            uint1 __6;
+-            (reinterpret_cast<__nv_bfloat162*>(&__6))[0] = __float22bfloat162_rn(v_);
+-            float2 __5 = tl::__tl_cvt_bf16x2_to_f32x2((reinterpret_cast<__nv_bfloat162*>(&__6))[0]);
+-            float2 __4 = tl::max2(__5, make_float2(0.0f, 0.0f));
+-            float2 __3 = tl::mul2(__4, w_reg[(i_4 & 3) >> 1]);
++            // bf16(relu(bf16(dot)) * w), a NaN dot kept as DeepSeek's relu_ keeps it.
++            __nv_bfloat162 __m = __hmax2_nan(__float22bfloat162_rn(v_), __float2bfloat162_rn(0.0f));
+             uint1 __2;
+-            (reinterpret_cast<__nv_bfloat162*>(&__2))[0] = __float22bfloat162_rn(__3);
++            (reinterpret_cast<__nv_bfloat162*>(&__2))[0] = __hmul2(__m, w2_reg[(i_4 & 3) >> 1]);
+             int p_row = (((tx & 63) >> 5) * 32) + ((i_4 >> 2) * 16) + ((i_4 & 1) * 8) + ((tx & 31) >> 2);
+             int h_col = ((tx >> 6) * 16) + (((i_4 & 3) >> 1) * 8) + ((tx & 3) * 2);
+             int swz_col = h_col ^ ((p_row & 15) << 1);
+-- 
+2.43.0
+
