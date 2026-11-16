@@ -8,6 +8,9 @@ owner.
 
 ## Recent candidate decisions
 
+- **Candidate `59`** ([`experiments/2026-11-15-c59-prefill`](experiments/2026-11-15-c59-prefill/README.md)) builds on `candidate-58` in three gated steps across switched TP4 (`sp1..sp4`) and switched TP3 (`sp5..sp7`):
+  - Integrated bounded UTF-8 suffix detokenizer priming (`detokenizer.py`), zero-copy `int32` `PickleBuffer` `NewRequestData` admission IPC (`output.py`, `request.py`, `buffer_utils.py`), `bf16x2` / `cvt.rn.bf16x2.e2m1x2` dequant (`sparse_mla.py`), dense `indexer_score_v41` `rows >= 64` `R=4` BF16 dual-row SMEM reduction (`indexer.py`), fused `prefill_gate_up -> moe_swiglu_cast` with 64-col `(gate, up)` slab interleaving (`moe.py`), and PR `#1005` MoE warp-shuffle dispatch scan, sync/PDL tightening, and cascaded `moe_swiglu_cast` preloads (keeping `c58` BF16 SwiGLU intermediate rounding).
+  - Qualified with zero regressions on `tp4-switched` (`model`: `128/128` greedy / `100.00%` identical, `KL mean 0.000e+00`, `8/8` gate determinism/greedy `0` diffs; `grid` `+0.24%` `same`; `c16` `+0.11%`/`+0.13%` `same`; `c1-decisions` `82.94 tok/s`; `prefill 262K` `default-text` `+2.35%` `better`; `source` prefill `32K/131K/262K` `9,548 / 9,886 / 9,757 tok/s`, `+1.28–1.53%` over `c58-final`) and `tp3-switched` (`model`: `100.00%` identical, `8/8` gate `0` diffs, `grid` `+0.02%` `same`, `c8` `+0.12%`/`+0.14%` `same`; `tp4-ring` remained held and untested).
 - **Candidate `1107`** ([`experiments/2026-10-26-spark-ds41f-candidate/1107`](experiments/2026-10-26-spark-ds41f-candidate/1107/README.md), PR [#937](https://github.com/christopherowen/spark-ds41f/pull/937)) consolidates the C45 TileLang compiler (`tilelang/0001..0013` with explicit wrapper-cache and disk-streamed IKET controls), full TileLang runtime closure (`0690..0713`, `0717`, `0752..0754`), CopyDrafter continuation priority, warp early-exit pruning and expected-yield gating against DSpark (`0744..0745`), native-depth CUDA graph retention under copy verification (`0728`), online confidence calibration (`0746`), per-layer SP WO local MXFP8 exchange (`0737`), SP Engram prefill column exchange (`0738`), TP3 6-channel NCCL Ring and sparse-MLA `block_H=16` occupancy (`0740`), 2-launch mHC PDL (`0739` + `0755`), selective pack12 KV compressor (`0749`), fused indexer `wq_b` RoPE + scale (`0748`), packed 264-byte Engram reader with multi-CTA step, hot-row cache and negative `col_delta` guard (`0750`), deep-context scheduler interleave (`0751`), tensor-parallel vision tower (`0758`), and native `TP2..TP8` cross-topology parity (`0747`). Ready for consolidated image build and full servebench qualification on `tp4-ring` and `tp3-triangle`.
 - C39 delivered default CopyDrafter behavior, but its optional preparation-overlap
   performance claim showed no proven serving-throughput gain against either
@@ -624,7 +627,10 @@ Don't repeat these without a new reason:
   41 → 67 s); sequence parallelism below 205 tokens (+12 ms TTFT on short
   prompts); `8` or `12` NCCL Ring channels on TP3 SP prefill
   (`experiments/2026-11-06-nccl-sp-channels`, `6` channels won while `8` and
-  `12` regressed).
+  `12` regressed); dense `indexer_score_v41` `<2>` (`2 <= rows < 64`) with
+  `16 KiB` `contrib` SMEM (`+0.34%` `@4K` decode regression vs `<1>` + `8 KiB`
+  `contrib` kept for `rows < 64`) and `<8>` (`rows >= 128`, `B_reg[8]` register
+  spill slowed `rows=1/64/4096`, `experiments/2026-11-15-c59-prefill`).
 - **Collectives:** NCCL for decode all-reduces (75–86 µs against one-shot RoCE's
   13–19 µs, `experiments/2026-10-03-collective-policy`); 8 or 16 NCCL channels
   on TP4 serving prefill (0.7–1.2% over four, intervals spanning zero);

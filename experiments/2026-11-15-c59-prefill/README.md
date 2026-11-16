@@ -118,3 +118,69 @@
 - 30-iter interleaved CUDA-graph decode `MoeExpertsV41Plan.run` A/B median (`Step 2` vs `Step 3`, `uint16_diffs=0` on all 12 shapes):
   - `inter=576`: `rows=1` `121.7 -> 100.5 us` (**`-21.2 us` / `1.211x`**), `rows=6` `612.1 -> 603.5 us` (`-8.6`), `rows=12` `1266.5 -> 1253.1 us` (`-13.5`), `rows=24` `2348.1 -> 2324.0 us` (`-24.1`), `rows=48` `3582.7 -> 3531.7 us` (`-51.0`), `rows=64` `4549.4 -> 4477.0 us` (`-72.4`).
   - `inter=768`: `rows=1` `152.2 -> 140.4 us` (**`-11.8 us` / `1.084x`**), `rows=6` `773.0 -> 773.8 us` (`+0.8`), `rows=12` `1599.8 -> 1585.0 us` (`-14.8`), `rows=24` `2900.8 -> 2885.6 us` (`-15.2`), `rows=48` `4819.9 -> 4781.8 us` (`-38.1`), `rows=64` `5724.5 -> 5691.8 us` (`-32.7`).
+
+### Step 3 Cluster Gate (`sp1`, `tp4-switched`, commit `bd1cbb42c`)
+
+- Receipts archived in `receipts/step3/tp4-switched/` (kept as the final `c59` overlay).
+- **`screen` (`20261115T235044-screen-tp4-switched`, 2 boots `c59`, `c59-again` vs `c58-final` recorded)**:
+  - `model` (`c59` -> `c59-again`): `128/128` greedy identical; `100.00%` identical distributions over `32,768` positions (`128` sequences), `KL mean 0.000e+00`, perplexity `1.31888 -> 1.31888 (+0.000%)`.
+  - `prefill` (`default-text`): `32,768`: `9371.860` / `9272.091` (`+1.58% ±5.08%`, `same`, boot 1 `+2.13% ±1.47%` better); `262,144`: `9618.698` / `9643.252` (**`+2.35% ±0.87%`, `better`**, margin `1.12%`).
+  - `c16`: `output tok/s` `268.777` / `268.877` (`+0.11% ±0.87%`, `same` vs `c58-final` `268.720` / `268.343`); `decode tok/s, paired` `+0.13% ±0.26%` (`same`).
+  - `grid`: `decode geometric mean (20)` `+0.24% ±0.13%` (`margin 0.27%`, repeat `-0.18%`, **`same`** vs `c58-final`).
+- **`bench` (`20261115T235047-bench-prefill-tp4-switched`, `prefill` `--prefill-text source`, 2 boots `b1`, `b2`)**:
+  - `32,768`: `b1 = 9536.87` (`9511.70`..`9562.04`), `b2 = 9560.04` (`9513.55`..`9606.53`) (mean `9548.46`, **`+1.53%` / `+143.7 tok/s`** vs `c58-final` `9404.74`).
+  - `131,072`: `b1 = 9864.99` (`9852.01`..`9877.96`), `b2 = 9907.35` (`9863.33`..`9951.38`) (mean `9886.17`, **`+1.28%` / `+125.0 tok/s`** vs `c58-final` `9761.14`).
+  - `262,144`: `b1 = 9754.08` (`9717.88`..`9790.27`), `b2 = 9760.49` (`9730.02`..`9790.95`) (mean `9757.29`, **`+1.31%` / `+126.2 tok/s`** vs `c58-final` `9631.07`).
+  - Memory/thermals (`b1`/`b2`): `sp1` `min_available_gib` `17.26` / `17.09 GiB` (`swap_growth_gib = 0.0`); `max_gpu_c` up to `76.0 C` (`b1`) / `74.0 C` (`b2`), `thermal_slowdown_ms = 0.0`, `power_cap_ms = 0.0` across `sp1..sp4`.
+
+## Final Qualification (`candidate-59`, overlay commit `bd1cbb42c`)
+
+Full switched qualification ran on `sp1..sp4` (`tp4-switched`) and `sp5..sp7` (`tp3-switched`), with receipts archived under `receipts/final/` (excluding `model.json*`). Note: `tp4-ring` (`dgx1..dgx4`) was held throughout by `tp2-direct-slots` and was not touched.
+
+### `tp4-switched` (`sp1..sp4`, `receipts/final/tp4-switched/`)
+
+- **`screen-tp4-switched`** (2 boots, `receipts/final/tp4-switched/lab/c59-screen-tp4-switched-table.txt` vs recorded `c58-final`):
+  - `model` (`c59 -> c59-again`): `128/128` greedy identical; `100.00%` identical distributions over `32,768` positions (`128` sequences), `KL mean 0.000e+00`, perplexity `1.31888 -> 1.31888 (+0.000%)`.
+  - `grid` (20 shapes, trimmed geomean): `19.0103 / 18.9752 ms` (mean `18.9928 ms`, `+0.24% ±0.13%`, `margin 0.27%`, repeat `-0.18%`, **`same`** vs `c58-final` `18.9336 / 18.9620 ms`).
+  - `c16`: `output tok/s` `268.777 / 268.877` (`+0.11% ±0.87%`, **`same`** vs `c58-final` `268.720 / 268.343`); `decode tok/s, paired` `+0.13% ±0.26%` (**`same`**).
+  - `prefill` (`default-text`): `32,768` `9,371.86 / 9,272.09` (`+1.58% ±5.08%`, `same`, boot 1 `+2.13% ±1.47%` better); `262,144` `9,618.70 / 9,643.25` (**`+2.35% ±0.87%`, `better`**, margin `1.12%`).
+- **`gate-tp4-switched`** (2 boots, `receipts/final/tp4-switched/lab/c59-gate-tp4-switched-table.txt`):
+  - All 8 determinism and greedy checks (`determinism`, `greedy`, `determinism2`, `greedy2` across Boot 1 & Boot 2): `identical: true`, `token_diffs: 0`, `logprob_diffs: 0`, matching `c58-final` SHA-256 hashes (`18d61961...` / `d6568649...` / `0a2dacdd...` / `12fd8257...`).
+  - Distinct-prompt throughput (`foreign_requests = 0`): `c16-distinct` `271.20 / 270.45` (**`270.83 tok/s`** vs `c58-final` `269.79`), `c8-distinct` `200.48 / 198.56` (**`199.52 tok/s`** vs `c58-final` `200.09`), `c4-distinct` `154.70 / 156.39` (**`155.55 tok/s`** vs `c58-final` `155.44`).
+- **`c1-decisions-tp4-switched`** (4 boots, `receipts/final/tp4-switched/lab/c59-c1-decisions-tp4-switched-table.txt`):
+  - `82.93 / 83.00 / 82.89 / 82.93` -> mean **`82.94 tok/s`** (`35.76 steps/s`, `2.328 tok/step`, `0` failed, `0` foreign requests; vs `c58-final` `82.83 tok/s`).
+- **`bench` 2-boot `source` prefill** (`c59-prefill-b1` / `b2`):
+  - `32,768`: `9,536.87 / 9,560.04` (**`9,548.45 tok/s`**, TTFT `3.046 / 3.039s`, **`+1.53%`** vs `c58-final` `9,404.74`).
+  - `131,072`: `9,864.99 / 9,907.35` (**`9,886.17 tok/s`**, TTFT `11.690 / 11.641s`, **`+1.28%`** vs `c58-final` `9,761.14`, peak sample `9,951.38 tok/s`).
+  - `262,144`: `9,754.08 / 9,760.49` (**`9,757.28 tok/s`**, TTFT `24.593 / 24.577s`, **`+1.31%`** vs `c58-final` `9,631.07`).
+- **`bench` 2-boot `quality,decode`** (`c59-b1` / `b2`, `5/5` quality pass both boots; `concurrency = [1, 2, 4, 8, 16]`):
+
+| Case | Boot 1 mean (`tok/s`) | Boot 2 mean (`tok/s`) | 2-Boot Mean (`tok/s`) | 2-Boot Window (`tok/s`) | 2-Boot `step_ms` | vs `c58-final` |
+|---|---|---|---|---|---|---|
+| `prose-c1` | `79.43` | `79.11` | `79.27` | `83.54` | `26.75 ms` | `+0.15%` |
+| `prose-c2` | `120.27` | `119.63` | `119.95` | `128.08` | `34.35 ms` | `-0.13%` |
+| `prose-c4` | `265.04` | `253.86` | `259.45` | `281.03` | `30.11 ms` | `-1.92%` |
+| `prose-c8` | `441.00` | `416.53` | `428.77` | `462.80` | `37.01 ms` | `+3.61%` |
+| `prose-c16` | `601.11` | `602.45` | `601.78` | `643.01` | `51.25 ms` | `-2.96%` |
+| `code-c1` | `98.71` | `97.95` | `98.33` | `105.35` | `29.40 ms` | `+0.24%` |
+| `code-c2` | `162.34` | `169.66` | `166.00` | `182.12` | `32.66 ms` | `+3.00%` |
+| `code-c4` | `286.34` | `290.17` | `288.26` | `315.31` | `38.62 ms` | `+7.23%` |
+| `code-c8` | `472.89` | `489.79` | `481.34` | `528.78` | `45.17 ms` | `+4.32%` |
+| `code-c16` | `815.46` | `763.57` | `789.51` | `869.56` | `51.64 ms` | `+0.27%` |
+
+- **Memory & thermal (`tp4-switched`)**: startup min `MemAvailable` `sp1 13.44 / 14.05`, `sp2..sp4 19.60–21.43 GiB`; decode min `MemAvailable` `sp1 21.50–21.59`, `sp2..sp4 23.98–24.06 GiB`; prefill min `MemAvailable` `sp1 17.09–17.26`, `sp2..sp4 19.42–19.90 GiB`; `swap_growth_gib = 0.0`, `thermal_slowdown_ms = 0.0`, `power_cap_ms = 0.0`.
+
+### `tp3-switched` (`sp5..sp7`, `receipts/final/tp3-switched/`)
+
+- **`screen-tp3-switched`** (2 boots, `receipts/final/tp3-switched/lab/c59-screen-tp3-switched-table.txt` vs recorded `c58-final`):
+  - `model` (`c59 -> c59-again`): `128/128` greedy identical; `100.00%` identical distributions over `32,768` positions (`128` sequences), `KL mean 0.000e+00`, perplexity `1.31608 -> 1.31608 (+0.000%)`.
+  - `grid` (15 shapes, trimmed geomean): `20.5208 / 20.4447 ms` (mean `20.4827 ms`, `+0.02% ±0.11%`, `margin 0.32%`, repeat `-0.37%`, **`same`** vs `c58-final` `20.4409 / 20.5151 ms`).
+  - `c8`: `output tok/s` `158.950 / 159.077` (`+0.12% ±1.42%`, **`same`** vs `c58-final` `158.977 / 158.663`); `decode tok/s, paired` `+0.14% ±0.51%` (**`same`**).
+- **`gate-tp3-switched`** (2 boots, `receipts/final/tp3-switched/lab/c59-gate-tp3-switched-table.txt`):
+  - All 8 determinism and greedy checks (`identical: true`, `token_diffs: 0`, `logprob_diffs: 0`), matching `c58-final` SHA-256 hashes (`5c22ce41...` / `bce6092e...` / `26a739a9...` / `12cfee9b...`).
+  - Distinct-prompt throughput (`foreign_requests = 0`): `c8-distinct` `155.52 / 154.90` (**`155.21 tok/s`** vs `c58-final` `155.38`), `c4-distinct` `119.48 / 118.77` (**`119.13 tok/s`** vs `c58-final` `118.95`).
+- **Startup memory (`tp3-switched` screen)**: `sp5 5.672 / 5.673`, `sp6..sp7 7.601–7.679 GiB` (above the `5 GiB` startup guard).
+
+## Conclusion
+
+- Every stage of `candidate-59` was gated on `sp8` and `sp1`: Step 1's dense `<2>` indexer path caught a `@4K` decode regression (`+0.34%` worse), which Step 2 removed (`rows >= 64` keeps `<4>` BF16 dual-row SMEM reduction while `<64` uses `<1>`), and Steps 2 + 3 (`prefill_gate_up -> moe_swiglu_cast` fusion with 64-col slab interleaving + PR `#1005` MoE warp-shuffle dispatch scan, sync/PDL, and SwiGLU preload) delivered cumulative prefill gains (`+1.28%..+1.53%` on `source` prefill up to `9,886 tok/s` mean / `9,951 tok/s` peak at `131K`, `+2.35%` `better` at `262K` `default-text`, plus higher free `sp1` memory during prefill) with **zero decode, determinism, or quality regressions** across both `tp4-switched` and `tp3-switched`.
