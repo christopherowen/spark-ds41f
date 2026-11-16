@@ -557,8 +557,10 @@ static void serve(reader_t *reader, step_t step) {
     if (step.is_prefetch) {
         reader->prefetched_count = 0;
         if (step.early && reader->plan.cache_sets && reader->prefetched_early) {
+            reader->plan.is_prefetch = true;
             failure = read_rows_into(reader, (const char *)step.early, step.count,
                                      reader->early_weights, reader->early_scales, true);
+            reader->plan.is_prefetch = false;
             if (!failure.message[0] && !reader->poisoned) {
                 ple_cache_commit(&reader->plan);
                 memcpy(reader->prefetched_early, step.early,
@@ -841,9 +843,10 @@ static PyObject *py_reader(PyObject *self, PyObject *args) {
     double ids_timeout, delay;
     int check_early, timeline;
     long long cache_rows = PLE_DEFAULT_CACHE_ROWS;
-    if (!PyArg_ParseTuple(args, "LLLILiKKKKddpp|L", &table_rows, &shard_start, &shard_end, &columns, &max_lookups,
+    int pin_scales = -1;
+    if (!PyArg_ParseTuple(args, "LLLILiKKKKddpp|Li", &table_rows, &shard_start, &shard_end, &columns, &max_lookups,
                           &depth, &ids, &weights, &scales, &control, &ids_timeout, &delay, &check_early,
-                          &timeline, &cache_rows))
+                          &timeline, &cache_rows, &pin_scales))
         return NULL;
     if (table_rows <= 0 || shard_start < 0 || shard_end < shard_start || shard_end > table_rows ||
         !columns || (columns & ~PLE_ALL_COLUMNS) || cache_rows < 0 ||
@@ -861,6 +864,7 @@ static PyObject *py_reader(PyObject *self, PyObject *args) {
         return error == ENOMEM ? PyErr_NoMemory()
                                : PyErr_Format(PyExc_ValueError, "Engram row plan: %s", strerror(error));
     }
+    if (pin_scales >= 0) reader->plan.pin_scales = pin_scales != 0;
     reader->ids = (const char *)(uintptr_t)ids;
     reader->weights = (char *)(uintptr_t)weights;
     reader->scales = (char *)(uintptr_t)scales;

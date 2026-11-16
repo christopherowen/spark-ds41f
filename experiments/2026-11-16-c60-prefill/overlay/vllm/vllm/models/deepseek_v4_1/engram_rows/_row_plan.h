@@ -16,6 +16,7 @@
 #define PLE_PACKED_ROW_BYTES 264u
 #define PLE_PACKED_ROWS_PER_PAGE 15u
 #define PLE_CACHE_WAYS 4u
+#define PLE_CACHE_MAX_USAGE 3u
 #define PLE_DEFAULT_CACHE_ROWS 65536
 #define PLE_CACHE_MAX_TOKENS 64u
 #define PLE_CACHE_MAX_LOOKUPS (PLE_CACHE_MAX_TOKENS * PLE_COLUMNS)
@@ -34,6 +35,7 @@ typedef struct {
     int64_t offset;
     size_t file;
     bool scale;
+    char *pinned_scales;
 } ple_source_t;
 
 typedef struct {
@@ -56,7 +58,7 @@ typedef struct {
 typedef struct {
     int64_t shard_rows, padded_rows, tp_start, tp_end;
     uint32_t columns;
-    bool packed, has_col_map, has_staged_misses;
+    bool packed, has_col_map, has_staged_misses, pin_scales, is_prefetch, miss_is_prefill;
     int64_t col_start[PLE_COLUMNS], col_end[PLE_COLUMNS], col_delta[PLE_COLUMNS];
     size_t weight_bytes, scale_bytes, max_lookups, capacity;
     ple_fragment_t *fragments;
@@ -70,6 +72,7 @@ typedef struct {
     uint64_t unique_blocks, coalesced_reads, submit_calls;
     double execution_seconds, planning_seconds;
     int64_t (*cache_tags)[PLE_CACHE_WAYS];
+    uint8_t (*cache_usage)[PLE_CACHE_WAYS];
     uint8_t *cache_clocks;
     char *cache_weights, *cache_scales;
     size_t cache_sets, cache_set_mask;
@@ -90,11 +93,13 @@ static inline int ple_source_compare(const void *left, const void *right) {
 
 static inline void ple_plan_release(ple_plan_t *reader) {
     for (size_t i = 0; i < reader->file_count; i++) close(reader->files[i].fd);
+    for (size_t i = 0; i < reader->source_count; i++) free(reader->sources[i].pinned_scales);
     free(reader->files);
     free(reader->sources);
     free(reader->fragments);
     free(reader->jobs);
     free(reader->cache_tags);
+    free(reader->cache_usage);
     free(reader->cache_clocks);
     free(reader->cache_weights);
     free(reader->cache_scales);
@@ -127,6 +132,8 @@ static inline int ple_plan_init(ple_plan_t *reader, int64_t shard_rows,
     reader->weight_bytes = weight_bytes;
     reader->scale_bytes = scale_bytes;
     reader->max_lookups = max_lookups;
+    const char *pin_env = getenv("SPARK_DS41F_ENGRAM_PIN_SCALES");
+    reader->pin_scales = pin_env && strcmp(pin_env, "1") == 0;
     reader->capacity = (size_t)max_lookups * per_row;
     reader->fragments = calloc(reader->capacity, sizeof(*reader->fragments));
     reader->jobs = calloc(reader->capacity, sizeof(*reader->jobs));
@@ -158,12 +165,13 @@ static inline int ple_plan_init(ple_plan_t *reader, int64_t shard_rows,
         reader->cache_weights = weights_ptr;
         reader->miss_weights = miss_w_ptr;
         reader->cache_clocks = calloc(sets, sizeof(*reader->cache_clocks));
+        reader->cache_usage = calloc(sets, sizeof(*reader->cache_usage));
         reader->cache_scales = malloc(total_ways * 8u);
         reader->miss_lookups = malloc(miss_cap * sizeof(*reader->miss_lookups));
         reader->miss_ids = malloc(miss_cap * sizeof(*reader->miss_ids));
         reader->miss_scales = malloc(miss_cap * 8u);
-        if (!reader->cache_clocks || !reader->cache_scales || !reader->miss_lookups ||
-            !reader->miss_ids || !reader->miss_scales)
+        if (!reader->cache_clocks || !reader->cache_usage || !reader->cache_scales ||
+            !reader->miss_lookups || !reader->miss_ids || !reader->miss_scales)
             return ENOMEM;
         memset(reader->cache_tags, 0xFF, sets * sizeof(*reader->cache_tags));
         memset(reader->cache_weights, 0, total_ways * 256u);
@@ -239,8 +247,50 @@ static inline int ple_add_source_rows(ple_plan_t *reader, int64_t shard, const c
                 } else if (reader->files[file].bytes != status.st_size) {
                     snprintf(failure.message, sizeof(failure.message), "PLE source file size changed during registration");
                 }
+                char *pinned_scales = NULL;
+                if (!failure.message[0] && scale && !reader->packed && reader->pin_scales && span_bytes > 0) {
+                    pinned_scales = malloc((size_t)span_bytes);
+                    if (!pinned_scales) {
+                        snprintf(failure.message, sizeof(failure.message),
+                                 "could not allocate pinned PLE scale plane");
+                    } else {
+                        int pin_fd = open(path, O_RDONLY | O_CLOEXEC);
+                        if (pin_fd < 0) {
+                            system_error(&failure, "open pinned PLE scale source");
+                        } else {
+                            size_t done = 0;
+                            while (done < (size_t)span_bytes) {
+                                ssize_t n = pread(pin_fd, pinned_scales + done,
+                                                  (size_t)span_bytes - done,
+                                                  (off_t)(offset + (int64_t)done));
+                                if (n < 0) {
+                                    if (errno == EINTR) continue;
+                                    system_error(&failure, "read pinned PLE scale source");
+                                    break;
+                                }
+                                if (n == 0) {
+                                    snprintf(failure.message, sizeof(failure.message),
+                                             "short read while pinning PLE scale source");
+                                    break;
+                                }
+                                done += (size_t)n;
+                            }
+                            const char *drop_env = getenv("SPARK_DS41F_ENGRAM_DROP_PAGE_CACHE");
+                            if (!drop_env || strcmp(drop_env, "0") != 0) {
+                                (void)posix_fadvise(pin_fd, (off_t)offset, (off_t)span_bytes,
+                                                    POSIX_FADV_DONTNEED);
+                            }
+                            close(pin_fd);
+                        }
+                        if (failure.message[0]) {
+                            free(pinned_scales);
+                            pinned_scales = NULL;
+                        }
+                    }
+                }
                 if (!failure.message[0]) {
-                    reader->sources[reader->source_count++] = (ple_source_t){shard, offset, file, scale != 0};
+                    reader->sources[reader->source_count++] =
+                        (ple_source_t){shard, offset, file, scale != 0, pinned_scales};
                     qsort(reader->sources, reader->source_count, sizeof(*sources), ple_source_compare);
                     const char *drop_env = getenv("SPARK_DS41F_ENGRAM_DROP_PAGE_CACHE");
                     if (!drop_env || strcmp(drop_env, "0") != 0) {
@@ -412,16 +462,68 @@ static inline void ple_scatter_packed_fragment(const ple_fragment_t *fragment, c
 }
 
 static inline void ple_cache_insert(ple_plan_t *reader, int64_t id,
-        const char *weight_src, const char *scale_src) {
+        const char *weight_src, const char *scale_src, bool is_prefill) {
     size_t set_idx = ple_cache_set_index(id, reader->cache_set_mask);
     int64_t *tags = reader->cache_tags[set_idx];
+    uint8_t *usage = reader->cache_usage[set_idx];
     for (unsigned w = 0; w < PLE_CACHE_WAYS; w++) {
-        if (tags[w] == id) return;
+        if (tags[w] == id) {
+            if (usage[w] < PLE_CACHE_MAX_USAGE) usage[w]++;
+            return;
+        }
     }
-    unsigned w = reader->cache_clocks[set_idx] & (PLE_CACHE_WAYS - 1);
-    reader->cache_clocks[set_idx] = (uint8_t)((w + 1) & (PLE_CACHE_WAYS - 1));
-    tags[w] = id;
-    size_t way_idx = set_idx * PLE_CACHE_WAYS + (size_t)w;
+    unsigned start = reader->cache_clocks[set_idx] & (PLE_CACHE_WAYS - 1);
+    for (unsigned step = 0; step < PLE_CACHE_WAYS; step++) {
+        unsigned w = (start + step) & (PLE_CACHE_WAYS - 1);
+        if (tags[w] < 0) {
+            reader->cache_clocks[set_idx] = (uint8_t)((w + 1) & (PLE_CACHE_WAYS - 1));
+            tags[w] = id;
+            usage[w] = is_prefill ? 0u : 1u;
+            size_t way_idx = set_idx * PLE_CACHE_WAYS + (size_t)w;
+            memcpy(reader->cache_weights + way_idx * 256u, weight_src, 256u);
+            memcpy(reader->cache_scales + way_idx * 8u, scale_src, 8u);
+            reader->cache_populated++;
+            return;
+        }
+    }
+    for (unsigned step = 0; step < PLE_CACHE_WAYS; step++) {
+        unsigned w = (start + step) & (PLE_CACHE_WAYS - 1);
+        if (usage[w] == 0u) {
+            reader->cache_clocks[set_idx] = (uint8_t)((w + 1) & (PLE_CACHE_WAYS - 1));
+            tags[w] = id;
+            usage[w] = is_prefill ? 0u : 1u;
+            size_t way_idx = set_idx * PLE_CACHE_WAYS + (size_t)w;
+            memcpy(reader->cache_weights + way_idx * 256u, weight_src, 256u);
+            memcpy(reader->cache_scales + way_idx * 8u, scale_src, 8u);
+            reader->cache_populated++;
+            return;
+        }
+    }
+    if (is_prefill) {
+        for (unsigned step = 0; step < PLE_CACHE_WAYS; step++) {
+            unsigned w = (start + step) & (PLE_CACHE_WAYS - 1);
+            if (usage[w] == 1u) {
+                reader->cache_clocks[set_idx] = (uint8_t)((w + 1) & (PLE_CACHE_WAYS - 1));
+                tags[w] = id;
+                usage[w] = 0u;
+                size_t way_idx = set_idx * PLE_CACHE_WAYS + (size_t)w;
+                memcpy(reader->cache_weights + way_idx * 256u, weight_src, 256u);
+                memcpy(reader->cache_scales + way_idx * 8u, scale_src, 8u);
+                reader->cache_populated++;
+                return;
+            }
+        }
+        return;
+    }
+    unsigned victim = start;
+    for (;;) {
+        if (--usage[victim] == 0u) break;
+        victim = (victim + 1) & (PLE_CACHE_WAYS - 1);
+    }
+    reader->cache_clocks[set_idx] = (uint8_t)((victim + 1) & (PLE_CACHE_WAYS - 1));
+    tags[victim] = id;
+    usage[victim] = 1u;
+    size_t way_idx = set_idx * PLE_CACHE_WAYS + (size_t)victim;
     memcpy(reader->cache_weights + way_idx * 256u, weight_src, 256u);
     memcpy(reader->cache_scales + way_idx * 8u, scale_src, 8u);
     reader->cache_populated++;
@@ -462,13 +564,15 @@ static inline void ple_cache_commit(ple_plan_t *reader) {
     if (!reader->miss_count) return;
     const char *w_base = reader->miss_src_weights;
     const char *s_base = reader->miss_src_scales;
+    bool is_prefill = reader->miss_is_prefill;
     if (w_base) {
         for (size_t k = 0; k < reader->miss_count; k++) {
             uint32_t lookup = reader->miss_lookups[k];
             int64_t id = reader->miss_ids[k];
             ple_cache_insert(reader, id,
                              w_base + (size_t)lookup * 256u,
-                             s_base + (size_t)lookup * 8u);
+                             s_base + (size_t)lookup * 8u,
+                             is_prefill);
         }
     } else {
         for (size_t j = 0; j < reader->job_count; j++) {
@@ -480,7 +584,8 @@ static inline void ple_cache_commit(ple_plan_t *reader) {
                 if (id >= 0) {
                     ple_cache_insert(reader, id,
                                      reader->miss_weights + k * 256u,
-                                     reader->miss_scales + k * 8u);
+                                     reader->miss_scales + k * 8u,
+                                     is_prefill);
                 }
             }
         }
@@ -505,10 +610,13 @@ static inline bool ple_plan(ple_plan_t *reader, const char *ids, size_t count,
     bool fast_shard0 = reader->source_count >= (size_t)planes &&
                        reader->sources[0].shard == 0 && !reader->sources[0].scale &&
                        (planes == 1 || (reader->sources[1].shard == 0 && reader->sources[1].scale));
+    size_t live_col_lookups = 0;
     for (size_t i = 0; i < count; i++) {
         int64_t id;
         memcpy(&id, ids + i * sizeof(id), sizeof(id));
         unsigned col = (unsigned)(i % PLE_COLUMNS);
+        if (id >= 0 && ((reader->columns >> col) & 1u))
+            live_col_lookups++;
         /* Another rank's row (or a dead lookup): its slot is not read; the gather writes
          * zeros for it without loading the slot. */
         if (id < reader->tp_start || id >= reader->tp_end ||
@@ -538,6 +646,8 @@ static inline bool ple_plan(ple_plan_t *reader, const char *ids, size_t count,
                     }
                 }
                 if (hit_way >= 0) {
+                    uint8_t *usage = reader->cache_usage[set_idx];
+                    if (usage[hit_way] < PLE_CACHE_MAX_USAGE) usage[hit_way]++;
                     size_t way_idx = set_idx * PLE_CACHE_WAYS + (size_t)hit_way;
                     memcpy(dst_weights + i * 256u, reader->cache_weights + way_idx * 256u, 256u);
                     memcpy(dst_scales + i * 8u, reader->cache_scales + way_idx * 8u, 8u);
@@ -578,6 +688,14 @@ static inline bool ple_plan(ple_plan_t *reader, const char *ids, size_t count,
                 rel_row = phys_id % reader->shard_rows;
             }
             size_t bytes = plane ? reader->scale_bytes : reader->weight_bytes;
+            if (plane && source->pinned_scales) {
+                const char *scale_src = source->pinned_scales + (size_t)rel_row * bytes;
+                memcpy(dst_scales + i * bytes, scale_src, bytes);
+                if (fill_cache && frag_miss != PLE_NO_MISS && !dst_is_cached) {
+                    memcpy(reader->miss_scales + (size_t)frag_miss * 8u, scale_src, bytes);
+                }
+                continue;
+            }
             uint16_t in_row = 0;
             int64_t offset = reader->packed
                 ? source->offset + (rel_row / (int64_t)PLE_PACKED_ROWS_PER_PAGE) * (int64_t)PLE_BLOCK +
@@ -595,6 +713,10 @@ static inline bool ple_plan(ple_plan_t *reader, const char *ids, size_t count,
             }
         }
     }
+    size_t max_decode_owned =
+        (size_t)PLE_CACHE_MAX_TOKENS * (size_t)__builtin_popcount(reader->columns);
+    reader->miss_is_prefill =
+        !reader->is_prefetch && (live_col_lookups > max_decode_owned);
     ple_sort(reader);
     size_t cursor = 0;
     while (cursor < reader->fragment_count) {

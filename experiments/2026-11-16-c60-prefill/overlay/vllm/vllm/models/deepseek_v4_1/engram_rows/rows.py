@@ -19,6 +19,7 @@ the Python side is.
 """
 
 import math
+import os
 import sys
 from contextlib import suppress
 
@@ -203,7 +204,8 @@ class EngramDiskRows:
                  ids_timeout_s: float = 20.0,
                  rows_timeout_s: float = 10.0, delay_s: float = 0.0,
                  check_early: bool = False, timeline: bool = False,
-                 cache_rows: int = DEFAULT_CACHE_ROWS):
+                 cache_rows: int = DEFAULT_CACHE_ROWS,
+                 pin_scales: bool | None = None):
         self.native = load()
         self.device = _indexed(device)
         self.shard_start, self.shard_end = int(shard_start), int(shard_end)
@@ -214,6 +216,11 @@ class EngramDiskRows:
         self.check_early = bool(check_early)
         self.timeline_enabled = bool(timeline)
         self.cache_rows = int(cache_rows)
+        self.pin_scales = (
+            os.environ.get("SPARK_DS41F_ENGRAM_PIN_SCALES") == "1"
+            if pin_scales is None
+            else bool(pin_scales)
+        )
         self._allocations = []
         self.ids = torch.empty(self.max_lookups, dtype=torch.int64, pin_memory=True)
         self._ids_mlocked = mlock_memory(self.ids.data_ptr(), self.ids.nbytes)
@@ -228,7 +235,7 @@ class EngramDiskRows:
             table_rows, self.shard_start, self.shard_end, self.columns, self.max_lookups, queue_depth,
             self.ids.data_ptr(), self.weights.pointer, self.scales.pointer, self.control.pointer,
             float(ids_timeout_s), float(delay_s), self.check_early,
-            self.timeline_enabled, self.cache_rows,
+            self.timeline_enabled, self.cache_rows, int(self.pin_scales),
         )
         self._ids_seq_device = self.control.device_view.data_ptr() + 4 * self.native.CTRL_IDS_SEQ
         self._sequence = 0

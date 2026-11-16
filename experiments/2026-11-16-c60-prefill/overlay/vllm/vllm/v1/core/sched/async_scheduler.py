@@ -1,0 +1,119 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+
+from vllm.logger import init_logger
+from vllm.v1.core.sched.output import SchedulerOutput
+from vllm.v1.core.sched.scheduler import Scheduler
+from vllm.v1.outputs import LogprobsLists
+from vllm.v1.request import Request, RequestStatus
+
+logger = init_logger(__name__)
+
+
+class AsyncScheduler(Scheduler):
+    def __init__(self, *args, **kwargs) -> None:
+        super().__init__(*args, **kwargs)
+        # reusable read-only placeholder list for speculative decoding.
+        self._spec_token_placeholders: list[int] = [-1] * (
+            self.num_spec_tokens + self.sink_rejection
+        )
+        self.pp_size = self.parallel_config.pipeline_parallel_size
+
+    def _update_after_schedule(self, scheduler_output: SchedulerOutput) -> None:
+        super()._update_after_schedule(scheduler_output)
+        spec_decode_tokens = scheduler_output.scheduled_spec_decode_tokens
+        # Use the latest num of scheduled draft tokens in next step as placeholder.
+        # Sink rejection: draft zero leads them (the token this step samples).
+        self._spec_token_placeholders = [-1] * (
+            scheduler_output.resolve_num_spec_tokens_to_schedule(self.num_spec_tokens)
+            + self.sink_rejection
+        )
+        for req_id in scheduler_output.num_scheduled_tokens:
+            request = self.requests[req_id]
+            if request.is_prefill_chunk:
+                continue
+
+            # The request will generate num_sampled_tokens_per_step new tokens
+            # plus num_spec_tokens in this scheduling step. Diffusion has no AR
+            # bonus token (num_sampled_tokens_per_step == 0) — only the canvas
+            # (spec) tokens.
+            cur_num_spec_tokens = len(spec_decode_tokens.get(req_id, ()))
+            scheduler_output.pending_structured_output_tokens |= (
+                request.use_structured_output
+                and (
+                    request.num_output_placeholders > 0
+                    or self._needs_draft_backfill(cur_num_spec_tokens)
+                )
+            )
+            if self.sink_rejection:
+                # Only the spec tokens can be committed by this step (draft
+                # zero and the drafter's); the token it samples is held back
+                # and becomes the next step's draft zero.
+                request.num_output_placeholders += cur_num_spec_tokens
+            else:
+                request.num_output_placeholders += (
+                    self.num_sampled_tokens_per_step + cur_num_spec_tokens
+                )
+            # Add placeholders for the new draft/spec tokens.
+            # We will update the actual spec token ids in the worker process.
+            request.spec_token_ids = self._spec_token_placeholders
+
+            if self.use_v2_model_runner:
+                # Set the next step index in which this request is eligible to be
+                # scheduled for decode (for PP microbatching).
+                request.next_decode_eligible_step = self.current_step + self.pp_size
+
+    def _needs_draft_backfill(self, num_scheduled_spec_tokens: int) -> bool:
+        """Whether a structured-output request's drafts must be handed back
+        before its grammar bitmask is built.
+
+        This scheduler only holds -1 placeholders for the drafts; the V2 model
+        runner verifies its own copy. A request that skipped the previous step
+        (a prefill turn, an isolated saved-logits step) has no output in
+        flight, but its placeholders still need the back-fill that deferred
+        sampling performs, or its bitmask rows past the first draft would
+        allow every token.
+        """
+        return (
+            num_scheduled_spec_tokens > 0
+            and self.use_v2_model_runner
+            and self.num_sampled_tokens_per_step > 0
+        )
+
+    def _update_request_with_output(
+        self,
+        request: Request,
+        new_token_ids: list[int],
+        is_stale: bool = False,
+        count_placeholders: bool = True,
+    ) -> tuple[list[int], bool]:
+        status_before_update = request.status
+        new_token_ids, stopped = super()._update_request_with_output(
+            request, new_token_ids
+        )
+
+        # Placeholders were zeroed at preemption; a stale delivery must not
+        # decrement them (it would underflow). A held-back sampled token that
+        # ends the request had no placeholder (sink rejection).
+        if not is_stale and count_placeholders:
+            request.num_output_placeholders -= len(new_token_ids)
+            assert request.num_output_placeholders >= 0
+
+        # Cache the new tokens. Preempted requests should be skipped.
+        if status_before_update == RequestStatus.RUNNING and not is_stale:
+            self.kv_cache_manager.cache_blocks(
+                request,
+                min(
+                    request.num_computed_tokens - request.num_output_placeholders,
+                    request.num_tokens,
+                ),
+            )
+        return new_token_ids, stopped
+
+    def _hold_sink_provisional(
+        self, request: Request, token_id: int, logprobs: LogprobsLists | None
+    ) -> None:
+        # The next step is already scheduled with draft zero as a placeholder;
+        # only the value is recorded (for its logprobs and the grammar).
+        request.sink_provisional = token_id
+        request.sink_provisional_logprobs = logprobs
