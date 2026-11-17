@@ -705,3 +705,12 @@ one sync at the end), and the cost has a shape: within ±0.15 ms up to 16 rows, 
 72, +1.13 ms at 96). The step's all-reduces grow the same way (96 rows is a 1.4 MB message, which sparknet's
 one-shot RoCE all-reduce carries with its CPU proxy), so the step's own collectives are the first suspect; a
 per-kernel profile of the grid with and without the communicator would show it.
+
+**Kernel profile** ([comm-profile-tp4-switched.json](comm-profile-tp4-switched.json)): one boot each of the
+learner off ([tp4-switched-offstep-off-prof.json](tp4-switched-offstep-off-prof.json)) and the communicator
+alone ([tp4-switched-offstep-comm-prof.json](tp4-switched-offstep-comm-prof.json)), each with the torch
+profiler on every rank. [profile_decode.py](profile_decode.py) times the grid's 16×96, 16×48 and 1×3 rows
+at 4K (the communicator alone cost +1.13 ms, +0.55 ms and nothing there), then profiles each shape in its
+own window; [summarize_kernels.py](summarize_kernels.py) and [analyze_costs.py](analyze_costs.py) are the
+indexer-decode and cluster-program experiments' copies. If the step's collectives' kernels carry the
+difference, the learner has to stay out of NCCL; if every kernel slows, the cause is on the GPU's side.
