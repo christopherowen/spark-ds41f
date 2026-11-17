@@ -100,20 +100,7 @@ exactly six tokens at 81% of them, and at 206 of those 539 DSpark's own five dra
 right: that step was the copy, held to five drafts by the rows laid out two steps earlier. The
 first step past it committed 17 tokens at 48% of the runs and 9 at 21%.
 
-## Conclusion (so far)
-
-- **A shorter minimum match loses.** Short matches are rare in a turn's own output (2.9% of
-  steps between 4 and 15 tokens), a copy from one runs 2.5 to 5.3 tokens of its first 8, and the
-  DSpark steps it would replace are already better than average (3.7 to 4.9 tokens against 2.7).
-  Eight verified rows for that is a loss at every row cost.
-- **The start of a copy run is worth at most 0.4%.** A run loses about 11 of 16 draft slots at
-  its first step and 8 at a fifth of its second steps: under 530 steps of 124,989 if every run
-  were long enough to use them, before the cost of the rows.
-- **The gate is not a lever.** With its estimate at 0.95 it takes every match of 16 or more.
-- **Open: sources outside the scan, and copyable text where DSpark misses.** Both need the
-  prompt. The observe run below dumps it.
-
-## Observe run with the request tokens
+### Observe run with the request tokens (tp4-switched)
 
 [observe-tp4-switched.json](observe-tp4-switched.json) on tp4-switched (sp1..sp4): AgentX at 8
 sessions for 30 minutes on [tp4-switched-observe-tokens.json](tp4-switched-observe-tokens.json),
@@ -132,6 +119,66 @@ with `ModuleNotFoundError: ... dspark.turn_learning_shadow`. The turn-learning e
 speculator now imports its shadow module in every mode, and its observe profile, which this
 arm extends, predates that and does not mount it. The arm now mounts it too. No request was
 served and nothing was dumped.
+
+Second attempt: queue entry `20261117T204553` at `bb33a560d`, sp1..sp4, boot `20261117T204820`
+ready in 135.9 s, 20:46 to 21:24 UTC ([receipts/observe-run.txt](receipts/observe-run.txt)).
+AgentX: valid, 323 requests, 0 errors, 153.8 output tok/s, cache hit 97.6% of 97.9% ideal. 445
+turns dumped (2.7 GB, left in `cache/copy-reach` on sp1); every step's anchor token is the token
+row's at its position.
+
+### The same replay on whole histories
+
+379 turns with two or more steps, 49,589 steps, 2.84 tokens a step, 2.9% of steps copied; the
+median history is 89,007 tokens ([receipts/replay-with-tokens.json](receipts/replay-with-tokens.json)).
+
+Longest match anywhere in the request's prompt and output at a step's anchor:
+
+| Match | Steps | Served as a copy of 7+ | The step committed | First copied token right | Right of the first 8 | A copy of 8 beats the step |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| none of 4 or more | 86.6% | 0% | 2.27 | | | |
+| 4 to 5 | 3.7% | 0.2% | 3.42 | 0.641 | 2.64 | 32% |
+| 6 to 7 | 1.6% | 0.4% | 4.10 | 0.793 | 3.78 | 43% |
+| 8 to 11 | 2.2% | 0.5% | 4.35 | 0.849 | 4.40 | 49% |
+| 12 to 15 | 1.2% | 1.6% | 4.67 | 0.872 | 5.21 | 61% |
+| 16 or more, in serving's scan | 4.3% | 66% | 11.93 | 0.950 | 6.79 | |
+| 16 or more, outside serving's scan | 0.4% | 0% | 4.53 | 0.927 | 5.86 (9.76 of 16) | 71% |
+
+No step with a match outside the scan was served as a copy, and two thirds of those inside it
+were (the rest are a run's first step, held to five drafts, and copies that ran six tokens or
+fewer): the replay's scan is serving's.
+
+Simulated, against the replay's own floor (`min_match` 16 with serving's scan, which reads
+−0.34% [−0.45, −0.24] against the steps as dumped at `rho` 0.11: copies of six tokens or fewer
+that the dump cannot tell from DSpark steps, added again), %:
+
+| Rule | Copy steps added | `rho` 0.09 | 0.11 | 0.23 | 0.5 |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| 16, the whole history scanned | +0.3% of steps | +0.06 | +0.04 | −0.05 | −0.15 |
+| 12 | +1.2% | −0.05 | −0.12 | −0.42 | −0.77 |
+| 8 | +2.7% | −0.40 | −0.53 | −1.16 | −1.89 |
+| 6 | +4.0% | −0.82 | −1.03 | −1.97 | −3.05 |
+| 4 | +6.9% | −2.21 | −2.57 | −4.14 | −5.93 |
+| 6, first offer 4 | +2.6% | −0.14 | −0.12 | −0.06 | +0.02 |
+| 4, first offer 4 | +4.9% | −0.69 | −0.71 | −0.78 | −0.86 |
+
+(`8, first offer 4` reads +0.02 to +0.34, but its smaller first offer also applies to the
+floor's own added copies, so it is not a gain of the rule.)
+
+## Conclusion
+
+- **There is no throughput in the copies the drafter does not take.** With the prompts in the
+  history, every change of the rule is inside ±0.1% or a loss.
+- **The scan misses little.** A 16-token match outside the newest and the first 16K tokens is
+  there at 0.4% of steps. Scanning the whole history gains +0.04% at the measured row cost.
+- **A shorter minimum match loses, more so with the prompt.** Matches of 4 to 15 tokens are at
+  8.7% of steps in an 89K-token history, a copy from one runs 2.6 to 5.2 tokens of its first 8,
+  and the DSpark steps it would replace commit 3.4 to 4.7. Sixteen is about where a copy starts
+  to pay.
+- **The start of a copy run is worth at most 0.4%** (the first proposal is held to five drafts
+  by the rows laid out two steps earlier), before the cost of the rows.
+- **The gate is not a lever.** With its estimate at 0.95 it takes every match of 16 or more.
+- **Where the steps are:** 86.6% of steps have no 4-token match anywhere in the request and
+  commit 2.27 tokens. That text is new, and only the drafter's own accuracy moves it.
 
 ## Limits
 
