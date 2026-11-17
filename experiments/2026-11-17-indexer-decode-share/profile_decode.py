@@ -2,6 +2,7 @@
 """One stream's decode steps at increasing context depth, timed and then profiled.
 
 usage: profile_decode.py BASE_URL [--depths 4096,262144,1000000] [--tokens 192] [--replays 30] [--settle 30]
+                         [--no-profile] [--repeats 2]
 
 A profiler-enabled arm with VLLM_SERVER_DEV_MODE=1 must be serving. For each depth, in order:
 
@@ -19,6 +20,9 @@ A profiler-enabled arm with VLLM_SERVER_DEV_MODE=1 must be serving. For each dep
 
 One JSON line per phase. Every profiler window writes one trace per rank; the windows'
 order is the traces' order.
+
+With --no-profile (a server without --profiler-config) the profiled phases are left out
+and phase 2 runs --repeats times, so the result is timing alone.
 """
 import json
 import sys
@@ -42,6 +46,8 @@ DEPTHS = [int(value) for value in option("--depths", "4096,262144,1000000").spli
 TOKENS = int(option("--tokens", "192"))
 REPLAYS = int(option("--replays", "30"))
 SETTLE = float(option("--settle", "30"))
+PROFILE = "--no-profile" not in sys.argv
+REPEATS = int(option("--repeats", "2")) if not PROFILE else 1
 QUESTION = "Explain the document above in detail, file by file and function by function."
 
 
@@ -132,40 +138,44 @@ for index, depth in enumerate(DEPTHS):
          ttft_s=round(filled["first"] - filled["sent"], 3) if filled["first"] else None)
 
     marks = {}
-    timed = stream(dict(body, max_tokens=LEAD + TOKENS), at_lead=lambda: marks.update(before=counters()))
-    emit(phase="real", depth=depth, usage=timed["usage"], chunks=timed["chunks"],
-         ttft_s=round(timed["first"] - timed["sent"], 3),
-         lead_completion_tokens=timed["lead_completion_tokens"], **span(timed, marks["before"], counters()))
+    for repeat in range(REPEATS):
+        timed = stream(dict(body, max_tokens=LEAD + TOKENS), at_lead=lambda: marks.update(before=counters()))
+        emit(phase="real", depth=depth, repeat=repeat, usage=timed["usage"], chunks=timed["chunks"],
+             ttft_s=round(timed["first"] - timed["sent"], 3),
+             lead_completion_tokens=timed["lead_completion_tokens"], **span(timed, marks["before"], counters()))
 
     def start_profile():
         post("/start_profile")
         marks["profiled"] = counters()
 
-    began = time.time()
-    try:
-        profiled = stream(dict(body, max_tokens=LEAD + TOKENS), at_lead=start_profile)
-        after = counters()
-    finally:
-        post("/stop_profile")
-    emit(phase="real-profiled", depth=depth, window=2 * index, usage=profiled["usage"], chunks=profiled["chunks"],
-         request_sent=round(began, 3), profile_started=round(profiled["lead"], 3), stream_ended=round(profiled["end"], 3),
-         lead_completion_tokens=profiled["lead_completion_tokens"], **span(profiled, marks["profiled"], after))
-    settle()
+    if PROFILE:
+        began = time.time()
+        try:
+            profiled = stream(dict(body, max_tokens=LEAD + TOKENS), at_lead=start_profile)
+            after = counters()
+        finally:
+            post("/stop_profile")
+        emit(phase="real-profiled", depth=depth, window=2 * index, usage=profiled["usage"], chunks=profiled["chunks"],
+             request_sent=round(began, 3), profile_started=round(profiled["lead"], 3),
+             stream_ended=round(profiled["end"], 3), lead_completion_tokens=profiled["lead_completion_tokens"],
+             **span(profiled, marks["profiled"], after))
+        settle()
 
     context = min(depth, LIMIT - 8192) if LIMIT else depth
     context = context // 4096 * 4096 or context  # whole 4K multiples, as the release grid's depths are
     shapes = [{"kind": "decode", "num_reqs": 1, "num_tokens": rows, "context_len": context} for rows in (3, 6)]
     emit(phase="grid", depth=depth, context_len=context,
          grid=engine.summarize(engine.run(BASE, shapes, replays=REPLAYS, warmup=2)))
-    post("/start_profile")
-    began = time.time()
-    try:
-        result = engine.summarize(engine.run(BASE, shapes, replays=REPLAYS, warmup=2))
-    finally:
-        ended = time.time()
-        post("/stop_profile")
-    emit(phase="grid-profiled", depth=depth, context_len=context, window=2 * index + 1, replays=REPLAYS, warmup=2,
-         start=round(began, 3), end=round(ended, 3), grid=result)
-    settle()
+    if PROFILE:
+        post("/start_profile")
+        began = time.time()
+        try:
+            result = engine.summarize(engine.run(BASE, shapes, replays=REPLAYS, warmup=2))
+        finally:
+            ended = time.time()
+            post("/stop_profile")
+        emit(phase="grid-profiled", depth=depth, context_len=context, window=2 * index + 1, replays=REPLAYS,
+             warmup=2, start=round(began, 3), end=round(ended, 3), grid=result)
+        settle()
 
-emit(phase="done", windows=2 * len(DEPTHS))
+emit(phase="done", windows=2 * len(DEPTHS) if PROFILE else 0)

@@ -5,7 +5,8 @@ in-graph capture of the step's block maxima (unfused parts, the fused first
 position's tiles, undrafted positions, padding rows, wrap-around), and the end of
 turn across simulated ranks (each rank's candidates and W2 rows, the exchanged
 summaries, both tables' teacher-forced score, the drafts' check, the gradient
-summed over ranks, the per-row AdaGrad step).
+summed over ranks, the per-row AdaGrad step), read from the stage the step fills
+(each kept entry's labels and ring entry, against ``labels_kernel`` and the ring).
 
 The end-of-turn data is dyadic (W1, W2 and the step's values are small multiples
 of powers of two), so every dot product and BF16 rounding is exact whatever the
@@ -286,6 +287,24 @@ def _reference(d, lr):
     return counts, losses, torch.stack(grads), trains, prevs, master, accum
 
 
+def _stage(d, first, stage_len):
+    """The call's entries at stage rows ``first + e``, as ``shadow_stage_kernel``
+    leaves them: shared labels, inputs, meta and drafts; each rank's maxima."""
+    ranks = d["ranks"]
+    labels = torch.full((stage_len, N_SPEC), -2, dtype=torch.int32)
+    ids = torch.zeros((stage_len, N_SPEC + 1), dtype=torch.int32)
+    meta = torch.full((stage_len, tl._META), -1, dtype=torch.int64)
+    drafts = torch.full((stage_len, N_SPEC), -1, dtype=torch.int32)
+    values = torch.full((ranks, stage_len, N_SPEC, PARTS), -math.inf)
+    index = torch.full((ranks, stage_len, N_SPEC, PARTS), -1, dtype=torch.int32)
+    for e, (f, k) in enumerate(d["entries"]):
+        slot, s = d["finished"][f], first + e
+        labels[s], ids[s] = d["labels"][f, k], d["ids"][f, k]
+        meta[s], drafts[s] = d["meta"][slot, k], d["drafts"][slot, k]
+        values[:, s], index[:, s] = d["values"][:, slot, k], d["index"][:, slot, k]
+    return labels, ids, meta, drafts, values, index
+
+
 @pytest.mark.parametrize("ranks", [4, 3])
 def test_end_of_turn_matches_reference_across_ranks(ranks):
     lr = 0.3
@@ -294,33 +313,30 @@ def test_end_of_turn_matches_reference_across_ranks(ranks):
     entries = d["entries"]
     count = len(entries)
     rows = count * N_SPEC
-    entry_f = to(torch.tensor([f for f, _ in entries], dtype=torch.int64))
-    entry_k = to(torch.tensor([k for _, k in entries], dtype=torch.int64))
-    finished = to(torch.tensor(d["finished"], dtype=torch.int64))
-    labels, ids = to(d["labels"]), to(d["ids"])
-    meta, drafts = to(d["meta"]), to(d["drafts"])
+    first = 3  # the call's rows sit inside a larger stage
+    labels, ids, meta, drafts, st_values, st_index = (
+        to(t) for t in _stage(d, first, count + 5)
+    )
     table, w2 = to(d["table"]), to(d["w2"])
     master = to(d["master"].clone())
     accum = torch.zeros(d["vocab"], dtype=torch.float32, device=DEV)
     summaries, zs, decs = [], [], []
     local = tl._kernel(sh.shadow_local_kernel, N_SPEC, PARTS, DIM)
     for r in range(ranks):
-        values = to(d["values"][r].contiguous())
-        index = to(d["index"][r].contiguous())
-        cand = torch.stack(
-            [d["index"][r, d["finished"][f], k] for f, k in entries]
-        ).reshape(-1)
+        values = st_values[r].contiguous()
+        index = st_index[r].contiguous()
+        cand = index[first : first + count].reshape(-1).cpu()
         dec = torch.where(
             (cand >= 0)[:, None], d["w2"][cand.clamp_min(0)], torch.zeros((), dtype=torch.bfloat16)
         )
         dec = to(dec.contiguous())
         z = torch.empty((count, N_SPEC, PARTS), dtype=torch.float32, device=DEV)
         summary = torch.empty((count, N_SPEC, sh._LOCAL), dtype=torch.float32, device=DEV)
-        local(entry_f, entry_k, finished, labels, ids, values, index, meta, drafts, dec, master, table, z, summary)
+        local(labels, ids, values, index, meta, drafts, dec, master, table, z, summary, first)
         summaries.append(summary.view(rows, sh._LOCAL))
         zs.append(z)
         decs.append((dec, index))
-    gathered = torch.cat(summaries, dim=1).contiguous()  # the all-gather's layout
+    gathered = torch.stack(summaries).contiguous()  # the all-gather's rank-major layout
     combine = tl._kernel(sh.shadow_combine_kernel, N_SPEC, PARTS, DIM, ranks)
     grad_sum = torch.zeros((rows, DIM), dtype=torch.float32, device=DEV)
     for r in range(ranks):
@@ -330,19 +346,22 @@ def test_end_of_turn_matches_reference_across_ranks(ranks):
         prev = torch.empty(rows, dtype=torch.int32, device=DEV)
         counts = torch.empty((count, sh._COUNTS), dtype=torch.int32, device=DEV)
         loss = torch.empty(count, dtype=torch.float32, device=DEV)
-        combine(entry_f, entry_k, finished, labels, ids, index, meta, drafts, dec, zs[r],
-                gathered, grad, train, prev, counts, loss)
+        combine(labels, ids, index, meta, drafts, dec, zs[r], gathered, grad, train, prev,
+                counts, loss, first)
         grad_sum += grad  # the all-reduce, in rank order
         if r == 0:
-            first = (train.clone(), prev.clone(), counts.clone(), loss.clone())
+            first_rank = (train.clone(), prev.clone(), counts.clone(), loss.clone())
         else:  # every rank derives the same score and inputs
-            assert torch.equal(train, first[0]) and torch.equal(prev, first[1])
-            assert torch.equal(counts, first[2])
-    train, prev, counts, loss = first
-    tl._kernel(sh.shadow_update_kernel, DIM)(train, prev, grad_sum, master, accum, lr)
-    call = torch.zeros(sh._COUNTS + 1, dtype=torch.float64, device=DEV)
+            assert torch.equal(train, first_rank[0]) and torch.equal(prev, first_rank[1])
+            assert torch.equal(counts, first_rank[2])
+    train, prev, counts, loss = first_rank
+    tl._kernel(sh.shadow_update_kernel, DIM, sh._update_words(rows))(
+        train, prev, grad_sum, master, accum, lr
+    )
+    call = torch.full((sh._COUNTS + 1,), 7.0, dtype=torch.float64, device=DEV)
     boot = torch.full((sh._COUNTS + 1,), 5.0, dtype=torch.float64, device=DEV)
-    tl._kernel(sh.shadow_totals_kernel)(counts, loss, call, boot)
+    totals = tl._kernel(sh.shadow_totals_kernel)
+    totals(counts, loss, call, boot, 1)  # a call's first chunk replaces the call's totals
     torch.cuda.synchronize()
 
     ref_counts, ref_loss, ref_grads, ref_train, ref_prev, ref_master, ref_accum = _reference(d, lr)
@@ -353,9 +372,15 @@ def test_end_of_turn_matches_reference_across_ranks(ranks):
     torch.testing.assert_close(grad_sum.cpu(), ref_grads, rtol=1e-4, atol=1e-5)
     torch.testing.assert_close(accum.cpu(), ref_accum, rtol=1e-4, atol=1e-6)
     torch.testing.assert_close(master.cpu(), ref_master, rtol=1e-5, atol=1e-6)
-    totals = torch.tensor(ref_counts).sum(dim=0).double().tolist() + [sum(ref_loss)]
-    torch.testing.assert_close(call.cpu(), torch.tensor(totals, dtype=torch.float64), rtol=1e-6, atol=1e-5)
-    torch.testing.assert_close(boot.cpu(), torch.tensor(totals, dtype=torch.float64) + 5.0, rtol=1e-6, atol=1e-5)
+    ref_totals = torch.tensor(
+        torch.tensor(ref_counts).sum(dim=0).double().tolist() + [sum(ref_loss)], dtype=torch.float64
+    )
+    torch.testing.assert_close(call.cpu(), ref_totals, rtol=1e-6, atol=1e-5)
+    torch.testing.assert_close(boot.cpu(), ref_totals + 5.0, rtol=1e-6, atol=1e-5)
+    totals(counts, loss, call, boot, 0)  # a later chunk adds
+    torch.cuda.synchronize()
+    torch.testing.assert_close(call.cpu(), 2 * ref_totals, rtol=1e-6, atol=1e-5)
+    torch.testing.assert_close(boot.cpu(), 2 * ref_totals + 5.0, rtol=1e-6, atol=1e-5)
     # The data exercises what it is meant to.
     totals_by_name = sh.ShadowStats.as_dict(torch.tensor(ref_counts).sum(dim=0).tolist())
     assert totals_by_name["trained"] > 0 and totals_by_name["draft_mismatches"] == 1
@@ -363,9 +388,69 @@ def test_end_of_turn_matches_reference_across_ranks(ranks):
     assert totals_by_name["tf_loaded"] > 0 and totals_by_name["tf_loaded"] != totals_by_name["tf_learned"]
 
 
-def test_update_sums_each_row_once_in_position_order():
+def test_stage_matches_labels_kernel_and_ring():
+    """The stage holds each kept entry's labels and inputs as ``labels_kernel``
+    gives them, and a copy of its ring entry, at ``first + e`` in turn order."""
+    g = torch.Generator().manual_seed(7)
+    slots, cap, max_len, vocab = 6, 8, 64, 500
+    tokens = torch.randint(0, vocab, (slots, max_len), generator=g, dtype=torch.int32)
+    total_len = torch.randint(20, max_len, (slots,), generator=g, dtype=torch.int32)
+    ring_values = torch.randn((slots, cap, N_SPEC, PARTS), generator=g)
+    ring_index = torch.randint(-1, vocab, (slots, cap, N_SPEC, PARTS), generator=g, dtype=torch.int32)
+    ring_drafts = torch.randint(-1, vocab, (slots, cap, N_SPEC), generator=g, dtype=torch.int32)
+    ring_meta = torch.zeros((slots, cap, tl._META), dtype=torch.int64)
+    ring_count = torch.tensor([8, 3, 11, 5, 0, 7], dtype=torch.int64)  # 11: wrapped
+    for s in range(slots):
+        for k in range(cap):
+            pos = int(torch.randint(0, int(total_len[s]), (1,), generator=g))
+            ring_meta[s, k] = torch.tensor([pos, int(torch.randint(1, N_SPEC + 1, (1,), generator=g)), int(tokens[s, pos])])
+    ring_meta[0, 2, 2] += 1  # drafted from another token: not held
+    ring_meta[1, 1, 0] = int(total_len[1]) + 2  # anchored past the turn
+    ring_meta[2, 4, 0] = int(total_len[2]) - 2  # the turn ends inside the block
+    ring_meta[2, 4, 2] = int(tokens[2, int(total_len[2]) - 2])
+    finished = [2, 0, 1, 5]
+    kept = [8, 6, 4, 0]  # slot 1: one more than the ring holds
+    entries = [(f, k) for f, c in enumerate(kept) for k in range(c)]
+    count, first = len(entries), 5
+    stage_len = count + 9
+    to = lambda t: t.to(DEV)  # noqa: E731
+    fin = to(torch.tensor(finished, dtype=torch.int64))
+    dev = [to(t) for t in (tokens, total_len, ring_values, ring_index, ring_meta, ring_drafts, ring_count)]
+    labels = torch.empty((len(finished), cap, N_SPEC), dtype=torch.int32, device=DEV)
+    ids = torch.empty((len(finished), cap, N_SPEC + 1), dtype=torch.int32, device=DEV)
+    tl._kernel(tl.labels_kernel, N_SPEC)(fin, dev[0], dev[1], dev[4], dev[6], labels, ids)
+    st_values = torch.zeros((stage_len, N_SPEC, PARTS), dtype=torch.float32, device=DEV)
+    st_index = torch.zeros((stage_len, N_SPEC, PARTS), dtype=torch.int32, device=DEV)
+    st_meta = torch.zeros((stage_len, tl._META), dtype=torch.int64, device=DEV)
+    st_drafts = torch.zeros((stage_len, N_SPEC), dtype=torch.int32, device=DEV)
+    st_labels = torch.full((stage_len, N_SPEC), 99, dtype=torch.int32, device=DEV)
+    st_ids = torch.full((stage_len, N_SPEC + 1), 99, dtype=torch.int32, device=DEV)
+    entry_f = to(torch.tensor([f for f, _ in entries], dtype=torch.int64))
+    entry_k = to(torch.tensor([k for _, k in entries], dtype=torch.int64))
+    tl._kernel(sh.shadow_stage_kernel, N_SPEC, PARTS)(
+        entry_f, entry_k, fin, dev[0], dev[1], dev[2], dev[3], dev[4], dev[5], dev[6],
+        st_values, st_index, st_meta, st_drafts, st_labels, st_ids, first,
+    )
+    torch.cuda.synchronize()
+    labels, ids = labels.cpu(), ids.cpu()
+    for e, (f, k) in enumerate(entries):
+        s, slot = first + e, finished[f]
+        assert torch.equal(st_labels[s].cpu(), labels[f, k])
+        assert torch.equal(st_ids[s].cpu(), ids[f, k])
+        assert torch.equal(st_values[s].cpu(), ring_values[slot, k])
+        assert torch.equal(st_index[s].cpu(), ring_index[slot, k])
+        assert torch.equal(st_meta[s].cpu(), ring_meta[slot, k])
+        assert torch.equal(st_drafts[s].cpu(), ring_drafts[slot, k])
+    # Rows outside the call are untouched.
+    assert (st_labels[:first] == 99).all() and (st_labels[first + count :] == 99).all()
+    # The cases the data is meant to hold.
+    staged = st_labels[first : first + count].cpu()
+    assert (staged[:, 0] == -2).any() and (staged == -1).any() and (staged >= 0).any()
+
+
+@pytest.mark.parametrize("positions, vocab", [(40, 12), (700, 40), (1280, 300)])
+def test_update_sums_each_row_once_in_position_order(positions, vocab):
     torch.manual_seed(3)
-    positions, vocab = 40, 12
     train = (torch.rand(positions) < 0.7).int()
     prev = torch.randint(0, vocab, (positions,), dtype=torch.int32)
     grad = (torch.randint(-8, 9, (positions, DIM)) / 16).float()
@@ -383,7 +468,7 @@ def test_update_sums_each_row_once_in_position_order():
         ref_master[p] -= 0.1 / (math.sqrt(float(ref_accum[p])) + 1e-6) * g
     assert len(done) < int(train.sum())  # rows repeat
     dev = [t.to(DEV) for t in (train, prev, grad, master, accum)]
-    tl._kernel(sh.shadow_update_kernel, DIM)(*dev, 0.1)
+    tl._kernel(sh.shadow_update_kernel, DIM, sh._update_words(positions))(*dev, 0.1)
     torch.cuda.synchronize()
     torch.testing.assert_close(dev[4].cpu(), ref_accum, rtol=1e-6, atol=1e-6)
     torch.testing.assert_close(dev[3].cpu(), ref_master, rtol=1e-6, atol=1e-6)

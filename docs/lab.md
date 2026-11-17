@@ -324,7 +324,10 @@ Set `"remove_stopped": true` on a job to remove them as well (`cluster stop --re
 
 A `profile` job can replace a workload's default arguments, for example
 `"workload_args": {"prefill": ["--tokens", "131072"]}` for a cold 128K profile.
-Other workloads retain their defaults.
+Other workloads retain their defaults. A profiler arm is its base profile with
+`--profiler-config` appended to `serve_args`; the qualified-profile check
+(`bin/spark doctor`) leaves that argument and its value out of its comparison, and any
+other difference is still drift.
 
 Every arm must use the production profile's node map. `boot` refuses any other
 node set before launch, because a window cannot recable the fabric.
