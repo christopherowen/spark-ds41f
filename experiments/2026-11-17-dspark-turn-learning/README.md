@@ -139,3 +139,46 @@ again, so their gain is learning text that repeats; the 16 distinct held-out pro
 (3.9 of 5 accepted) and barely move; the coding conversations kept only 32 DSpark blocks in 24 turns
 (most of their steps were copy-drafted). At step 0.1 the most-updated W1 rows moved 5.2 times their own
 norm, so a drift cap is needed. The AgentX hour is the test.
+
+### AgentX hour (same entry, fresh boot, 8 sessions, 3,600 s)
+
+The run is valid (815 requests, 0 errors; TTFT p50 0.69 s / p90 1.93 s; 171.2 output tok/s; prefix cache
+96.8% of 97.0% ideal; [receipts/observe-agentx](receipts/observe-agentx)). It is not a speed comparison:
+the end of each turn also copied its rows to the host. 931 turns were written to disk.
+
+Turn lines ([receipts/observe-agentx/turn-learning-lines.log](receipts/observe-agentx/turn-learning-lines.log)):
+935 turns replayed, 847 with labels, 124,510 held entries, 619,495 labeled positions; end of turn median
+16.7 ms (p90 32.2 ms, max 36.0 ms; median 131 kept draft steps). Unlike the smoke boot, 66 labeled turns
+reported replay mismatches (980 of 627,528 drafted positions, 0.16%), and `draft_accepted` differed from
+`forced_accepted_active` by 63 positions in total. The dumped entries of those turns show the cause: a few
+entries a turn whose anchor lies hundreds to thousands of positions before their neighbours (turn 126:
+−2,171; 123: −545; 127: −1,039), draft steps over another context than the turn's (one path that drafts
+outside decoding is `boundary_checkpoint.replay_draft`, which proposes for a restored prefix). Their rows
+do not belong to the committed tokens at their anchors. The capture now also keeps the anchor token the
+step drafted from, and the labels kernel holds an entry only when that token is the one the turn committed
+there (−2 otherwise, counted as `unheld`); the kernel tests cover it (6 passed on sp8). The study below ran
+on these dumps as they are: the foreign entries are 0.16% of positions.
+
+### Offline study on the AgentX turns
+
+843 turns with labels, 125,268 blocks, 623,290 labeled positions, 1.72 accepted a block under the loaded
+W1; single-GPU replay agreement 98.4%; the committed token is among the step's block maxima at 72.1% of
+positions ([receipts/study-agentx/output.jsonl](receipts/study-agentx/output.jsonl)). Each turn is scored
+before it is learned; gain in teacher-forced accepted tokens against the loaded W1:
+
+| Rule | Step 0.01 | Step 0.03 | Step 0.1 |
+| --- | ---: | ---: | ---: |
+| full vocabulary | +1.38% [+1.08, +1.69] | −0.65% | −15.69% |
+| block maxima (no label logit) | +0.77% [+0.55, +1.00] | −0.10% | −9.48% |
+| shard maxima + label | −0.32% | −2.78% | −17.66% |
+| live4 (to the first miss, live competitors + label) | −2.68% | −7.07% | −18.78% |
+
+Brackets: 95% turn-level bootstrap intervals. By quarter of the run (about 210 turns each), the two
+positive rules grow: full +0.89 / +1.16 / +1.42 / +1.83%, block maxima +0.46 / +0.58 / +0.62 / +1.21%;
+live4 at 0.01 falls −0.10 / −1.90 / −3.74 / −4.46%. Large steps lose from the first quarter and keep losing
+(the most-updated rows move 1.5 to 7 times their norm at 0.1).
+
+Reading: on distinct agent sessions the shared W1 table (one row a previous token, used in every context)
+learns only with small steps, slowly, and still improving after an hour; what the smoke boot showed was
+repeated prompts. The rules that need the least serving work behave differently: block maxima (which the
+draft step already computes) is positive, live4 is negative.

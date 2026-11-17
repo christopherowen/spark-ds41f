@@ -99,7 +99,7 @@ def block_candidates(z: torch.Tensor, shards: int = 4, block: int = 2048) -> tor
 
 
 def ce_step(base, ids, labels, master, w2, lr, method="full", shards=4, chunk=256, live_w1=None,
-            train_mask=None):
+            train_mask=None, accum=None):
     """One SGD step of the turn's cross-entropy into W1's rows: over the full
     vocabulary (``full``), or over each vocabulary shard's maximum and the committed
     token (``shard4``, the candidates serving's shard pairs already hold)."""
@@ -172,7 +172,17 @@ def ce_step(base, ids, labels, master, w2, lr, method="full", shards=4, chunk=25
         coef = logp.exp()
         coef[:, -1] -= 1.0
         grad_rows[s : s + chunk] = torch.einsum("rc,rcd->rd", coef, w2.float()[cands])
-    master.index_add_(0, prev_all[idx], grad_rows, alpha=-lr)
+    if accum is None:
+        master.index_add_(0, prev_all[idx], grad_rows, alpha=-lr)
+        return loss_sum / idx.numel()
+    # AdaGrad a row: the turn's summed gradient of each row, scaled by the root of
+    # that row's running sum of squared gradient norms (frequent rows step less).
+    rows_g = torch.zeros_like(master)
+    rows_g.index_add_(0, prev_all[idx], grad_rows)
+    touched = rows_g.abs().sum(dim=1) > 0
+    accum[touched] += rows_g[touched].pow(2).sum(dim=1)
+    scale = lr / (accum[touched].sqrt() + 1e-6)
+    master[touched] -= scale[:, None] * rows_g[touched]
     return loss_sum / idx.numel()
 
 
@@ -193,16 +203,20 @@ def main() -> None:
     ap.add_argument("--snapshot", required=True)
     ap.add_argument("--lrs", default="0.003,0.01,0.03,0.1,0.3")
     ap.add_argument("--methods", default="full,shard4,block,live4")
+    ap.add_argument("--opt", default="sgd", choices=("sgd", "adagrad"))
     ap.add_argument("--max-drift", type=float, default=0.0,
                     help="cap each row's displacement at this fraction of its loaded norm (0: none)")
     ap.add_argument("--limit", type=int, default=0)
+    ap.add_argument("--pattern", default="*.pt", help="turn files to read, in name order")
     args = ap.parse_args()
     device = "cuda"
     t, eps = load_tensors(args.snapshot, device)
     w1_loaded, w2 = t["w1"], t["w2"]
     lrs = [(m, float(x)) for m in args.methods.split(",") if m for x in args.lrs.split(",") if x]
     masters = {key: w1_loaded.float().clone() for key in lrs}
-    files = sorted(glob.glob(os.path.join(args.turns, "*.pt")))
+    accums = {key: (torch.zeros(w1_loaded.shape[0], device=device) if args.opt == "adagrad" else None)
+              for key in lrs}
+    files = sorted(glob.glob(os.path.join(args.turns, args.pattern)))
     if args.limit:
         files = files[: args.limit]
     print(json.dumps({
@@ -264,7 +278,8 @@ def main() -> None:
             for key in lrs:
                 name = f"{key[0]}:{key[1]}"
                 row["loss " + name] = round(ce_step(base, ids, labels, masters[key], w2, key[1], method=key[0], live_w1=w1_loaded,
-                                                      train_mask=prefix_mask if key[0] == "live4" else None), 4)
+                                                      train_mask=prefix_mask if key[0] == "live4" else None,
+                                                      accum=accums[key]), 4)
                 cap_drift(masters[key], w1_loaded.float(), args.max_drift)
                 drift = (masters[key] - w1_loaded.float()).norm(dim=1) / w1_loaded.float().norm(dim=1).clamp_min(1e-6)
                 row["drift " + name] = round(float(drift.max()), 4)

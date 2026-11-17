@@ -1,0 +1,38 @@
+{
+  "description": "Offline test-then-train study on the AgentX hour's 931 turns (observe stage, 8 sessions): step sizes 0.01/0.03/0.1 of the full, shard-maxima, live-prefix and block-maxima rules, each row's drift capped at its loaded norm.",
+  "image": "spark-ds41f:candidate-60",
+  "verdict": "status",
+  "env": {
+    "PYTHONPATH": "/b:/opt/spark-ds41f/candidate/vllm"
+  },
+  "workdir": "vllm",
+  "mounts": [
+    [
+      "experiments/2026-11-17-dspark-turn-learning/bundles/study/study_turns.py",
+      "/b/study_turns.py"
+    ],
+    [
+      "~/spark-lab/agents/dspark-turn-learning/turns",
+      "/turns"
+    ],
+    [
+      "~/.cache/huggingface/hub",
+      "/hub"
+    ]
+  ],
+  "argv": [
+    "/b/study_turns.py",
+    "--turns",
+    "/turns",
+    "--pattern",
+    "20261117T020420-*.pt",
+    "--snapshot",
+    "/hub/models--deepseek-ai--DeepSeek-V4.1-Flash-1017/snapshots/1bae0e1088993b9b82de08f59de5be5a34e42170",
+    "--lrs",
+    "0.01,0.03,0.1",
+    "--methods",
+    "full,shard4,live4,block",
+    "--max-drift",
+    "1.0"
+  ]
+}

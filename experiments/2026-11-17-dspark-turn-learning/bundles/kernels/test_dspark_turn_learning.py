@@ -20,19 +20,21 @@ def _ring(slots: int, cap: int, n_spec: int = N_SPEC, hidden: int = HIDDEN):
     return {
         "hidden": rows,
         "words": rows.view(torch.int64),
-        "meta": torch.full((slots, cap, 2), -1, dtype=torch.int64, device=DEV),
+        "meta": torch.full((slots, cap, 3), -1, dtype=torch.int64, device=DEV),
         "drafts": torch.zeros((slots, cap, n_spec), dtype=torch.int32, device=DEV),
         "count": torch.zeros(slots, dtype=torch.int64, device=DEV),
     }
 
 
-def _capture(ring, hidden, sample_map, sample_pos, drafts, active):
+def _capture(ring, hidden, sample_map, sample_pos, drafts, active, input_ids, anchor_idx):
     words = hidden.shape[1] // 4
     tl._kernel(tl.capture_kernel, N_SPEC, words)(
         hidden.view(torch.int64),
         sample_map,
         sample_pos,
         drafts,
+        input_ids,
+        anchor_idx,
         ring["words"],
         ring["meta"],
         ring["drafts"],
@@ -62,12 +64,18 @@ def test_capture_keeps_rows_wraps_and_skips_padding():
             0, 129280, (max_reqs, N_SPEC), dtype=torch.int64, device=DEV
         )
         active = 5 if step % 2 == 0 else 3
+        # The draft step's anchor of row r is input_ids[anchor_idx[r]] (r * N_SPEC).
+        anchor_idx = torch.arange(max_reqs, dtype=torch.int64, device=DEV) * N_SPEC
+        input_ids = torch.randint(0, 129280, (max_reqs * N_SPEC,), dtype=torch.int32, device=DEV)
         for r, slot in enumerate(layout):
             anchor = 100 * step + 10 * r + 7
             for i in range(N_SPEC):
                 sample_map[r * N_SPEC + i] = slot
                 sample_pos[r * N_SPEC + i] = anchor + 1 + i
-        _capture(ring, hidden[: num_reqs * N_SPEC], sample_map, sample_pos, drafts, active)
+        _capture(
+            ring, hidden[: num_reqs * N_SPEC], sample_map, sample_pos, drafts, active,
+            input_ids, anchor_idx,
+        )
         for r, slot in enumerate(layout):
             if slot < 0:
                 continue
@@ -75,6 +83,7 @@ def test_capture_keeps_rows_wraps_and_skips_padding():
             ref_hidden[slot, entry] = hidden[r * N_SPEC : (r + 1) * N_SPEC]
             ref_meta[slot, entry, 0] = 100 * step + 10 * r + 7
             ref_meta[slot, entry, 1] = active
+            ref_meta[slot, entry, 2] = int(input_ids[r * N_SPEC])
             ref_drafts[slot, entry] = drafts[r].to(torch.int32)
             ref_count[slot] += 1
     torch.cuda.synchronize()
@@ -92,7 +101,11 @@ def _labels_reference(finished, tokens, total_len, meta, count, cap):
         total = int(total_len[slot])
         for k in range(cap):
             pos = int(meta[slot, k, 0])
-            kept = k < kept_entries and 0 <= pos < total
+            kept = (
+                k < kept_entries
+                and 0 <= pos < total
+                and int(tokens[slot, pos]) == int(meta[slot, k, 2])
+            )
             if not kept:
                 labels[f, k] = -2
                 continue
@@ -111,8 +124,13 @@ def test_labels_read_committed_tokens_and_mask_the_rest():
     wide = torch.randint(0, 129280, (slots, max_len + 9), dtype=torch.int32, device=DEV)
     tokens = wide[:, :max_len]  # a strided view, as the request state's rows
     total_len = torch.tensor([40, 20, 64, 10], dtype=torch.int32, device=DEV)
-    meta = torch.randint(-1, max_len, (slots, cap, 2), dtype=torch.int64, device=DEV)
+    meta = torch.randint(-1, max_len, (slots, cap, 3), dtype=torch.int64, device=DEV)
     meta[2, 0, 0] = 61  # the turn ends inside this block
+    # Each entry drafted from the committed anchor token, except one drafted from
+    # another context, which the labels must not hold.
+    rows = torch.arange(slots, device=DEV)[:, None].expand(slots, cap)
+    meta[:, :, 2] = tokens[rows, meta[:, :, 0].clamp(0, max_len - 1)].to(torch.int64)
+    meta[1, 1, 2] += 1
     count = torch.tensor([0, 3, 8, 6], dtype=torch.int64, device=DEV)  # slot 2 wrapped
     finished_slots = [2, 1, 3, 0]
     finished = torch.tensor(finished_slots, dtype=torch.int64, device=DEV)
@@ -172,6 +190,7 @@ def _stats_reference(labels, drafts, meta, replay, forced, start):
         acc[5] += mismatches
         acc[6] += active
         acc[7] += 1
+        acc[8] += 0 if held else 1
     return acc
 
 
@@ -185,7 +204,7 @@ def test_stats_count_accepted_prefixes_and_replay_mismatches(first):
     labels[4, :] = -1
     labels[6, :] = -2  # an entry the ring does not hold: its stale replay is not counted
     drafts = torch.randint(0, vocab, (rows, N_SPEC), dtype=torch.int32)
-    meta = torch.zeros((rows, 2), dtype=torch.int64)
+    meta = torch.zeros((rows, 3), dtype=torch.int64)
     meta[:, 1] = torch.tensor([5, 3, 5, 1, 5, 2, 4])
     replay = torch.zeros((pred_rows, N_SPEC), dtype=torch.int64)
     replay[:rows] = drafts.to(torch.int64)
@@ -194,8 +213,8 @@ def test_stats_count_accepted_prefixes_and_replay_mismatches(first):
     replay[6, 0] += 1  # in an entry the ring does not hold: not counted
     forced = torch.randint(0, vocab, (pred_rows, N_SPEC), dtype=torch.int64)
     forced[0] = labels[0].to(torch.int64)  # a fully accepted block
-    out = torch.tensor([11, 22, 33, 44, 55, 66, 77, 88], dtype=torch.int64)
-    start = [0] * 8 if first else out.tolist()
+    out = torch.tensor([11, 22, 33, 44, 55, 66, 77, 88, 99], dtype=torch.int64)
+    start = [0] * 9 if first else out.tolist()
     expected = _stats_reference(labels, drafts, meta, replay, forced, start)
     dev = [t.to(DEV) for t in (labels, drafts, meta, replay, forced, out)]
     tl._kernel(tl.stats_kernel, N_SPEC)(*dev, first)

@@ -426,6 +426,8 @@ class DSparkSpeculator(DFlashSpeculator):
             model=self.model,
             table=table,
             draft_tokens=self.draft_tokens,
+            input_ids=self.input_buffers.input_ids,
+            anchor_idx=self._anchor_idx,
             sample_idx_mapping=self.sample_idx_mapping,
             sample_pos=self.sample_pos,
             partial_values=self._greedy_partial_values,

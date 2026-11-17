@@ -1,0 +1,38 @@
+{
+  "description": "Offline test-then-train study on the AgentX hour's turns: the full and block-maxima rules with a per-row AdaGrad step (0.1/0.3/1.0 of a first update's norm).",
+  "image": "spark-ds41f:candidate-60",
+  "verdict": "status",
+  "env": {
+    "PYTHONPATH": "/b:/opt/spark-ds41f/candidate/vllm"
+  },
+  "workdir": "vllm",
+  "mounts": [
+    [
+      "experiments/2026-11-17-dspark-turn-learning/bundles/study/study_turns.py",
+      "/b/study_turns.py"
+    ],
+    [
+      "~/spark-lab/agents/dspark-turn-learning/turns",
+      "/turns"
+    ],
+    [
+      "~/.cache/huggingface/hub",
+      "/hub"
+    ]
+  ],
+  "argv": [
+    "/b/study_turns.py",
+    "--turns",
+    "/turns",
+    "--pattern",
+    "20261117T020420-*.pt",
+    "--snapshot",
+    "/hub/models--deepseek-ai--DeepSeek-V4.1-Flash-1017/snapshots/1bae0e1088993b9b82de08f59de5be5a34e42170",
+    "--methods",
+    "full,block",
+    "--lrs",
+    "0.1,0.3,1.0",
+    "--opt",
+    "adagrad"
+  ]
+}
