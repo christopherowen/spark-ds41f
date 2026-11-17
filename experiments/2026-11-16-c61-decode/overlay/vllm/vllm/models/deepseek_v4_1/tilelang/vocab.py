@@ -3240,6 +3240,7 @@ def refine_vocab_greedy_partials(
     out_dtype: T.dtype = T.bfloat16,
     *,
     has_bias: bool = False,
+    grid_x: int = 0,
 ):
     steps = K // (GROUP * step_groups)
     STEP = GROUP * step_groups
@@ -3249,6 +3250,7 @@ def refine_vocab_greedy_partials(
     slices = HALF // VEC
     items = block_N * step_groups * slices
     num_tiles = (N + block_N - 1) // block_N
+    launch_x = min(grid_x, num_tiles) if grid_x > 0 else num_tiles
     warps_n = (threads // 32) // (1 if block_M == 16 else 2)
     M = T.dynamic("M")
     E = T.dynamic("E")
@@ -3256,8 +3258,8 @@ def refine_vocab_greedy_partials(
     @T.macro
     def _body(A, W, exception_entries, row_offsets, active_cols, active_count, cut_cols, refined_vals, partial_vals, partial_idxs, bias_buf=None):
         with T.Kernel(
-            T.ceildiv(N, block_N), T.ceildiv(M, block_M), threads=threads
-        ) as (bx, by):
+            launch_x, T.ceildiv(M, block_M), threads=threads
+        ) as (bx_grid, by):
             pdl.chain()
             T.import_source(_GREEDY_HEADER)
             A_shared = T.alloc_shared((block_M, STEP), T.bfloat16)
@@ -3273,232 +3275,239 @@ def refine_vocab_greedy_partials(
             out_b = T.alloc_local((VEC,), T.bfloat16)
             tx = T.get_thread_binding()
             num_active = T.alloc_var(T.int32, init=T.max(active_count[0], 1))
-            if bx * block_N < num_active:
-                for j_init in T.serial(T.ceildiv(block_N, threads)):
-                    j_idx = j_init * threads + tx
-                    if j_idx < block_N:
-                        slot = T.min(bx * block_N + j_idx, num_active - 1)
-                        cols_shared[j_idx] = T.if_then_else(
-                            active_count[0] > 0, active_cols[slot], 0
-                        )
-                T.clear(C_local)
-                if steps % 2 == 0 and items == 2 * threads:
-                    low_a0_e = T.alloc_local((VEC,), T.uint8)
-                    low_b0_e = T.alloc_local((VEC,), T.uint8)
-                    codes0_e = T.alloc_local((VEC,), T.uint8)
-                    low_a1_e = T.alloc_local((VEC,), T.uint8)
-                    low_b1_e = T.alloc_local((VEC,), T.uint8)
-                    codes1_e = T.alloc_local((VEC,), T.uint8)
-                    low_a0_o = T.alloc_local((VEC,), T.uint8)
-                    low_b0_o = T.alloc_local((VEC,), T.uint8)
-                    codes0_o = T.alloc_local((VEC,), T.uint8)
-                    low_a1_o = T.alloc_local((VEC,), T.uint8)
-                    low_b1_o = T.alloc_local((VEC,), T.uint8)
-                    codes1_o = T.alloc_local((VEC,), T.uint8)
-                    T.sync_threads()
-                    it0 = tx
-                    j0 = it0 // (step_groups * slices)
-                    g0 = it0 // slices % step_groups
-                    c0 = it0 % slices * VEC
-                    r0 = cols_shared[j0]
-                    it1 = threads + tx
-                    j1 = it1 // (step_groups * slices)
-                    g1 = it1 // slices % step_groups
-                    c1 = it1 % slices * VEC
-                    r1 = cols_shared[j1]
-                    for v in T.vectorized(VEC):
-                        low_a0_e[v] = W[r0, g0 * GROUP + c0 + v]
-                    for v in T.vectorized(VEC):
-                        low_b0_e[v] = W[r0, g0 * GROUP + HALF + c0 + v]
-                    for v in T.vectorized(VEC):
-                        codes0_e[v] = W[r0, K + g0 * HALF + c0 + v]
-                    for v in T.vectorized(VEC):
-                        low_a1_e[v] = W[r1, g1 * GROUP + c1 + v]
-                    for v in T.vectorized(VEC):
-                        low_b1_e[v] = W[r1, g1 * GROUP + HALF + c1 + v]
-                    for v in T.vectorized(VEC):
-                        codes1_e[v] = W[r1, K + g1 * HALF + c1 + v]
-                    for s2 in T.serial(steps // 2):
-                        s_e = s2 * 2
-                        s_o = s_e + 1
-                        T.copy(A[by * block_M, s_e * STEP], A_shared)
-                        ns_o = s_o * STEP
-                        nsk_o = K + s_o * (STEP // 2)
+            active_tiles = T.ceildiv(num_active, block_N)
+            rem_tiles = T.max(active_tiles - bx_grid, 0)
+            iters = T.ceildiv(rem_tiles, launch_x) if grid_x > 0 else 1
+            for tile_it in T.serial(iters):
+                bx = bx_grid + tile_it * launch_x if grid_x > 0 else bx_grid
+                if grid_x > 0 or bx * block_N < num_active:
+                    for j_init in T.serial(T.ceildiv(block_N, threads)):
+                        j_idx = j_init * threads + tx
+                        if j_idx < block_N:
+                            slot = T.min(bx * block_N + j_idx, num_active - 1)
+                            cols_shared[j_idx] = T.if_then_else(
+                                active_count[0] > 0, active_cols[slot], 0
+                            )
+                    T.clear(C_local)
+                    if steps % 2 == 0 and items == 2 * threads:
+                        low_a0_e = T.alloc_local((VEC,), T.uint8)
+                        low_b0_e = T.alloc_local((VEC,), T.uint8)
+                        codes0_e = T.alloc_local((VEC,), T.uint8)
+                        low_a1_e = T.alloc_local((VEC,), T.uint8)
+                        low_b1_e = T.alloc_local((VEC,), T.uint8)
+                        codes1_e = T.alloc_local((VEC,), T.uint8)
+                        low_a0_o = T.alloc_local((VEC,), T.uint8)
+                        low_b0_o = T.alloc_local((VEC,), T.uint8)
+                        codes0_o = T.alloc_local((VEC,), T.uint8)
+                        low_a1_o = T.alloc_local((VEC,), T.uint8)
+                        low_b1_o = T.alloc_local((VEC,), T.uint8)
+                        codes1_o = T.alloc_local((VEC,), T.uint8)
+                        T.sync_threads()
+                        it0 = tx
+                        j0 = it0 // (step_groups * slices)
+                        g0 = it0 // slices % step_groups
+                        c0 = it0 % slices * VEC
+                        r0 = cols_shared[j0]
+                        it1 = threads + tx
+                        j1 = it1 // (step_groups * slices)
+                        g1 = it1 // slices % step_groups
+                        c1 = it1 % slices * VEC
+                        r1 = cols_shared[j1]
                         for v in T.vectorized(VEC):
-                            low_a0_o[v] = W[r0, ns_o + g0 * GROUP + c0 + v]
+                            low_a0_e[v] = W[r0, g0 * GROUP + c0 + v]
                         for v in T.vectorized(VEC):
-                            low_b0_o[v] = W[r0, ns_o + g0 * GROUP + HALF + c0 + v]
+                            low_b0_e[v] = W[r0, g0 * GROUP + HALF + c0 + v]
                         for v in T.vectorized(VEC):
-                            codes0_o[v] = W[r0, nsk_o + g0 * HALF + c0 + v]
+                            codes0_e[v] = W[r0, K + g0 * HALF + c0 + v]
                         for v in T.vectorized(VEC):
-                            low_a1_o[v] = W[r1, ns_o + g1 * GROUP + c1 + v]
+                            low_a1_e[v] = W[r1, g1 * GROUP + c1 + v]
                         for v in T.vectorized(VEC):
-                            low_b1_o[v] = W[r1, ns_o + g1 * GROUP + HALF + c1 + v]
+                            low_b1_e[v] = W[r1, g1 * GROUP + HALF + c1 + v]
                         for v in T.vectorized(VEC):
-                            codes1_o[v] = W[r1, nsk_o + g1 * HALF + c1 + v]
+                            codes1_e[v] = W[r1, K + g1 * HALF + c1 + v]
+                        for s2 in T.serial(steps // 2):
+                            s_e = s2 * 2
+                            s_o = s_e + 1
+                            T.copy(A[by * block_M, s_e * STEP], A_shared)
+                            ns_o = s_o * STEP
+                            nsk_o = K + s_o * (STEP // 2)
+                            for v in T.vectorized(VEC):
+                                low_a0_o[v] = W[r0, ns_o + g0 * GROUP + c0 + v]
+                            for v in T.vectorized(VEC):
+                                low_b0_o[v] = W[r0, ns_o + g0 * GROUP + HALF + c0 + v]
+                            for v in T.vectorized(VEC):
+                                codes0_o[v] = W[r0, nsk_o + g0 * HALF + c0 + v]
+                            for v in T.vectorized(VEC):
+                                low_a1_o[v] = W[r1, ns_o + g1 * GROUP + c1 + v]
+                            for v in T.vectorized(VEC):
+                                low_b1_o[v] = W[r1, ns_o + g1 * GROUP + HALF + c1 + v]
+                            for v in T.vectorized(VEC):
+                                codes1_o[v] = W[r1, nsk_o + g1 * HALF + c1 + v]
+                            T.call_extern(
+                                "handle",
+                                f"vllm_vocab_decode_vec16<{base_minus_one}>",
+                                T.address_of(low_a0_e[0]),
+                                T.address_of(low_b0_e[0]),
+                                T.address_of(codes0_e[0]),
+                                T.address_of(out_a[0]),
+                                T.address_of(out_b[0]),
+                            )
+                            for v in T.vectorized(VEC):
+                                B_shared[j0, g0 * GROUP + c0 + v] = out_a[v]
+                            for v in T.vectorized(VEC):
+                                B_shared[j0, g0 * GROUP + HALF + c0 + v] = out_b[v]
+                            T.call_extern(
+                                "handle",
+                                f"vllm_vocab_decode_vec16<{base_minus_one}>",
+                                T.address_of(low_a1_e[0]),
+                                T.address_of(low_b1_e[0]),
+                                T.address_of(codes1_e[0]),
+                                T.address_of(out_a[0]),
+                                T.address_of(out_b[0]),
+                            )
+                            for v in T.vectorized(VEC):
+                                B_shared[j1, g1 * GROUP + c1 + v] = out_a[v]
+                            for v in T.vectorized(VEC):
+                                B_shared[j1, g1 * GROUP + HALF + c1 + v] = out_b[v]
+                            T.sync_threads()
+                            T.gemm(A_shared, B_shared, C_local, transpose_B=True)
+                            T.sync_threads()
+                            T.copy(A[by * block_M, s_o * STEP], A_shared)
+                            if s_o + 1 < steps:
+                                ns_e = (s_o + 1) * STEP
+                                nsk_e = K + (s_o + 1) * (STEP // 2)
+                                for v in T.vectorized(VEC):
+                                    low_a0_e[v] = W[r0, ns_e + g0 * GROUP + c0 + v]
+                                for v in T.vectorized(VEC):
+                                    low_b0_e[v] = W[r0, ns_e + g0 * GROUP + HALF + c0 + v]
+                                for v in T.vectorized(VEC):
+                                    codes0_e[v] = W[r0, nsk_e + g0 * HALF + c0 + v]
+                                for v in T.vectorized(VEC):
+                                    low_a1_e[v] = W[r1, ns_e + g1 * GROUP + c1 + v]
+                                for v in T.vectorized(VEC):
+                                    low_b1_e[v] = W[r1, ns_e + g1 * GROUP + HALF + c1 + v]
+                                for v in T.vectorized(VEC):
+                                    codes1_e[v] = W[r1, nsk_e + g1 * HALF + c1 + v]
+                            T.call_extern(
+                                "handle",
+                                f"vllm_vocab_decode_vec16<{base_minus_one}>",
+                                T.address_of(low_a0_o[0]),
+                                T.address_of(low_b0_o[0]),
+                                T.address_of(codes0_o[0]),
+                                T.address_of(out_a[0]),
+                                T.address_of(out_b[0]),
+                            )
+                            for v in T.vectorized(VEC):
+                                B_shared[j0, g0 * GROUP + c0 + v] = out_a[v]
+                            for v in T.vectorized(VEC):
+                                B_shared[j0, g0 * GROUP + HALF + c0 + v] = out_b[v]
+                            T.call_extern(
+                                "handle",
+                                f"vllm_vocab_decode_vec16<{base_minus_one}>",
+                                T.address_of(low_a1_o[0]),
+                                T.address_of(low_b1_o[0]),
+                                T.address_of(codes1_o[0]),
+                                T.address_of(out_a[0]),
+                                T.address_of(out_b[0]),
+                            )
+                            for v in T.vectorized(VEC):
+                                B_shared[j1, g1 * GROUP + c1 + v] = out_a[v]
+                            for v in T.vectorized(VEC):
+                                B_shared[j1, g1 * GROUP + HALF + c1 + v] = out_b[v]
+                            T.sync_threads()
+                            T.gemm(A_shared, B_shared, C_local, transpose_B=True)
+                            T.sync_threads()
+                    else:
+                        for s in T.serial(steps):
+                            T.copy(A[by * block_M, s * STEP], A_shared)
+                            for step in T.serial(T.ceildiv(items, threads)):
+                                item = step * threads + tx
+                                if items % threads == 0 or item < items:
+                                    j = item // (step_groups * slices)
+                                    g = item // slices % step_groups
+                                    c = item % slices * VEC
+                                    w_row = cols_shared[j]
+                                    for v in T.vectorized(VEC):
+                                        low_a[v] = W[w_row, s * STEP + g * GROUP + c + v]
+                                    for v in T.vectorized(VEC):
+                                        low_b[v] = W[w_row, s * STEP + g * GROUP + HALF + c + v]
+                                    for v in T.vectorized(VEC):
+                                        codes[v] = W[
+                                            w_row, K + s * (STEP // 2) + g * HALF + c + v
+                                        ]
+                                    T.call_extern(
+                                        "handle",
+                                        f"vllm_vocab_decode_vec16<{base_minus_one}>",
+                                        T.address_of(low_a[0]),
+                                        T.address_of(low_b[0]),
+                                        T.address_of(codes[0]),
+                                        T.address_of(out_a[0]),
+                                        T.address_of(out_b[0]),
+                                    )
+                                    for v in T.vectorized(VEC):
+                                        B_shared[j, g * GROUP + c + v] = out_a[v]
+                                    for v in T.vectorized(VEC):
+                                        B_shared[j, g * GROUP + HALF + c + v] = out_b[v]
+                            T.gemm(A_shared, B_shared, C_local, transpose_B=True)
+                    if has_bias:
                         T.call_extern(
                             "handle",
-                            f"vllm_vocab_decode_vec16<{base_minus_one}>",
-                            T.address_of(low_a0_e[0]),
-                            T.address_of(low_b0_e[0]),
-                            T.address_of(codes0_e[0]),
-                            T.address_of(out_a[0]),
-                            T.address_of(out_b[0]),
+                            "vllm_vocab_markov_refine_tile_argmax_clocal",
+                            block_M,
+                            block_N,
+                            threads,
+                            K,
+                            out_bf16,
+                            T.address_of(A[0, 0]),
+                            T.address_of(exception_entries[0]),
+                            T.address_of(row_offsets[0]),
+                            T.address_of(cols_shared[0]),
+                            T.address_of(cut_cols[0]),
+                            T.address_of(smem_v[0]),
+                            T.address_of(smem_i[0]),
+                            T.address_of(refined_vals[0, 0]),
+                            T.address_of(partial_vals[0, 0]),
+                            T.address_of(partial_idxs[0, 0]),
+                            by,
+                            bx,
+                            M,
+                            N,
+                            num_active,
+                            num_tiles,
+                            E,
+                            tx,
+                            T.address_of(bias_buf[0, 0]),
                         )
-                        for v in T.vectorized(VEC):
-                            B_shared[j0, g0 * GROUP + c0 + v] = out_a[v]
-                        for v in T.vectorized(VEC):
-                            B_shared[j0, g0 * GROUP + HALF + c0 + v] = out_b[v]
+                    else:
                         T.call_extern(
                             "handle",
-                            f"vllm_vocab_decode_vec16<{base_minus_one}>",
-                            T.address_of(low_a1_e[0]),
-                            T.address_of(low_b1_e[0]),
-                            T.address_of(codes1_e[0]),
-                            T.address_of(out_a[0]),
-                            T.address_of(out_b[0]),
+                            "vllm_vocab_refine_tile_argmax_clocal",
+                            block_M,
+                            block_N,
+                            threads,
+                            K,
+                            out_bf16,
+                            T.address_of(A[0, 0]),
+                            T.address_of(exception_entries[0]),
+                            T.address_of(row_offsets[0]),
+                            T.address_of(cols_shared[0]),
+                            T.address_of(cut_cols[0]),
+                            T.address_of(smem_v[0]),
+                            T.address_of(smem_i[0]),
+                            T.address_of(refined_vals[0, 0]),
+                            T.address_of(partial_vals[0, 0]),
+                            T.address_of(partial_idxs[0, 0]),
+                            by,
+                            bx,
+                            M,
+                            N,
+                            num_active,
+                            num_tiles,
+                            E,
+                            tx,
                         )
-                        for v in T.vectorized(VEC):
-                            B_shared[j1, g1 * GROUP + c1 + v] = out_a[v]
-                        for v in T.vectorized(VEC):
-                            B_shared[j1, g1 * GROUP + HALF + c1 + v] = out_b[v]
+                    if grid_x > 0:
                         T.sync_threads()
-                        T.gemm(A_shared, B_shared, C_local, transpose_B=True)
-                        T.sync_threads()
-                        T.copy(A[by * block_M, s_o * STEP], A_shared)
-                        if s_o + 1 < steps:
-                            ns_e = (s_o + 1) * STEP
-                            nsk_e = K + (s_o + 1) * (STEP // 2)
-                            for v in T.vectorized(VEC):
-                                low_a0_e[v] = W[r0, ns_e + g0 * GROUP + c0 + v]
-                            for v in T.vectorized(VEC):
-                                low_b0_e[v] = W[r0, ns_e + g0 * GROUP + HALF + c0 + v]
-                            for v in T.vectorized(VEC):
-                                codes0_e[v] = W[r0, nsk_e + g0 * HALF + c0 + v]
-                            for v in T.vectorized(VEC):
-                                low_a1_e[v] = W[r1, ns_e + g1 * GROUP + c1 + v]
-                            for v in T.vectorized(VEC):
-                                low_b1_e[v] = W[r1, ns_e + g1 * GROUP + HALF + c1 + v]
-                            for v in T.vectorized(VEC):
-                                codes1_e[v] = W[r1, nsk_e + g1 * HALF + c1 + v]
-                        T.call_extern(
-                            "handle",
-                            f"vllm_vocab_decode_vec16<{base_minus_one}>",
-                            T.address_of(low_a0_o[0]),
-                            T.address_of(low_b0_o[0]),
-                            T.address_of(codes0_o[0]),
-                            T.address_of(out_a[0]),
-                            T.address_of(out_b[0]),
-                        )
-                        for v in T.vectorized(VEC):
-                            B_shared[j0, g0 * GROUP + c0 + v] = out_a[v]
-                        for v in T.vectorized(VEC):
-                            B_shared[j0, g0 * GROUP + HALF + c0 + v] = out_b[v]
-                        T.call_extern(
-                            "handle",
-                            f"vllm_vocab_decode_vec16<{base_minus_one}>",
-                            T.address_of(low_a1_o[0]),
-                            T.address_of(low_b1_o[0]),
-                            T.address_of(codes1_o[0]),
-                            T.address_of(out_a[0]),
-                            T.address_of(out_b[0]),
-                        )
-                        for v in T.vectorized(VEC):
-                            B_shared[j1, g1 * GROUP + c1 + v] = out_a[v]
-                        for v in T.vectorized(VEC):
-                            B_shared[j1, g1 * GROUP + HALF + c1 + v] = out_b[v]
-                        T.sync_threads()
-                        T.gemm(A_shared, B_shared, C_local, transpose_B=True)
-                        T.sync_threads()
-                else:
-                    for s in T.serial(steps):
-                        T.copy(A[by * block_M, s * STEP], A_shared)
-                        for step in T.serial(T.ceildiv(items, threads)):
-                            item = step * threads + tx
-                            if items % threads == 0 or item < items:
-                                j = item // (step_groups * slices)
-                                g = item // slices % step_groups
-                                c = item % slices * VEC
-                                w_row = cols_shared[j]
-                                for v in T.vectorized(VEC):
-                                    low_a[v] = W[w_row, s * STEP + g * GROUP + c + v]
-                                for v in T.vectorized(VEC):
-                                    low_b[v] = W[w_row, s * STEP + g * GROUP + HALF + c + v]
-                                for v in T.vectorized(VEC):
-                                    codes[v] = W[
-                                        w_row, K + s * (STEP // 2) + g * HALF + c + v
-                                    ]
-                                T.call_extern(
-                                    "handle",
-                                    f"vllm_vocab_decode_vec16<{base_minus_one}>",
-                                    T.address_of(low_a[0]),
-                                    T.address_of(low_b[0]),
-                                    T.address_of(codes[0]),
-                                    T.address_of(out_a[0]),
-                                    T.address_of(out_b[0]),
-                                )
-                                for v in T.vectorized(VEC):
-                                    B_shared[j, g * GROUP + c + v] = out_a[v]
-                                for v in T.vectorized(VEC):
-                                    B_shared[j, g * GROUP + HALF + c + v] = out_b[v]
-                        T.gemm(A_shared, B_shared, C_local, transpose_B=True)
-                if has_bias:
-                    T.call_extern(
-                        "handle",
-                        "vllm_vocab_markov_refine_tile_argmax_clocal",
-                        block_M,
-                        block_N,
-                        threads,
-                        K,
-                        out_bf16,
-                        T.address_of(A[0, 0]),
-                        T.address_of(exception_entries[0]),
-                        T.address_of(row_offsets[0]),
-                        T.address_of(cols_shared[0]),
-                        T.address_of(cut_cols[0]),
-                        T.address_of(smem_v[0]),
-                        T.address_of(smem_i[0]),
-                        T.address_of(refined_vals[0, 0]),
-                        T.address_of(partial_vals[0, 0]),
-                        T.address_of(partial_idxs[0, 0]),
-                        by,
-                        bx,
-                        M,
-                        N,
-                        num_active,
-                        num_tiles,
-                        E,
-                        tx,
-                        T.address_of(bias_buf[0, 0]),
-                    )
-                else:
-                    T.call_extern(
-                        "handle",
-                        "vllm_vocab_refine_tile_argmax_clocal",
-                        block_M,
-                        block_N,
-                        threads,
-                        K,
-                        out_bf16,
-                        T.address_of(A[0, 0]),
-                        T.address_of(exception_entries[0]),
-                        T.address_of(row_offsets[0]),
-                        T.address_of(cols_shared[0]),
-                        T.address_of(cut_cols[0]),
-                        T.address_of(smem_v[0]),
-                        T.address_of(smem_i[0]),
-                        T.address_of(refined_vals[0, 0]),
-                        T.address_of(partial_vals[0, 0]),
-                        T.address_of(partial_idxs[0, 0]),
-                        by,
-                        bx,
-                        M,
-                        N,
-                        num_active,
-                        num_tiles,
-                        E,
-                        tx,
-                    )
 
     if has_bias:
         @T.prim_func
@@ -3802,6 +3811,7 @@ def _packed_head_greedy_kernels(layer: nn.Module, out_dtype: torch.dtype) -> dic
     for block_M in _head_row_tiles(layer):
         config = screen_tile_config(block_M, k)
         r_bn, r_th, r_sg = _refine_tile_config(n, k, block_M, config)
+        r_grid_x = 40 if (r_bn == 8 and n >= 1024) else 0
         r_nt = (n + r_bn - 1) // r_bn
         screens[block_M] = prepare.call(
             screen_vocab_greedy_partials,
@@ -3821,6 +3831,7 @@ def _packed_head_greedy_kernels(layer: nn.Module, out_dtype: torch.dtype) -> dic
             threads=r_th,
             step_groups=r_sg,
             out_dtype=_OUT[out_dtype],
+            grid_x=r_grid_x,
         )
         if r_nt not in finishes:
             finishes[r_nt] = prepare.call(
@@ -4111,6 +4122,7 @@ def prepare_packed_head(
         n, k = int(layer.weight.shape[0]), layer.packed_bf16_in_features
         cfg16 = screen_tile_config(16, k)
         r_bn16, r_th16, r_sg16 = _refine_tile_config(n, k, 16, cfg16)
+        r_grid_x16 = 40 if (r_bn16 == 8 and n >= 1024) else 0
         r_nt16 = (n + r_bn16 - 1) // r_bn16
         m_thresh_call = prepare.call(
             row_thresholds_kernel,
@@ -4132,6 +4144,7 @@ def prepare_packed_head(
             step_groups=r_sg16,
             out_dtype=_OUT[out_dtype],
             has_bias=True,
+            grid_x=r_grid_x16,
         )
         m_finish_top2_call = prepare.call(
             finish_active_vocab_greedy_pairs,

@@ -30,6 +30,7 @@ from vllm.models.deepseek_v4_1.tilelang.vocab import (  # noqa: E402
     project_head_greedy_pairs,
     project_head_markov_greedy_pairs,
     project_head_screened_markov_greedy_pairs,
+    refine_vocab_greedy_partials,
     screen_head_base,
     row_tile,
     tile_config,
@@ -1060,3 +1061,78 @@ def test_screened_markov_greedy_pairs_match_dense_and_replay(
         assert torch.equal(
             out_buf[:, 2:4].view(torch.int32), actual_steps[4][:, 2:4].view(torch.int32)
         )
+
+
+@pytest.mark.parametrize("has_bias", [False, True])
+@pytest.mark.parametrize("active_cnt", [0, 13, 320, 400, 1024])
+def test_refine_vocab_greedy_partials_grid_x_persistent_waves(has_bias, active_cnt):
+    """Verify persistent grid_x=40 matches full-grid grid_x=0 across single- and
+    multi-wave active counts (active_cnt > 40 * block_N = 320), including 0."""
+    n, k = 1024, 512
+    rows = 6
+    block_m, block_n, threads, step_groups = 16, 8, 32, 2
+    num_tiles = (n + block_n - 1) // block_n
+    weight = _head(n, k, seed=913)
+    weight[100] = weight[5]
+    packed = packed_format.pack(weight.clone())
+    x = (torch.randn(rows, k, device=DEVICE) * 0.5).bfloat16()
+    bias = (torch.randn(rows, n, device=DEVICE) * 0.25).float()
+    cut_cols = torch.full((rows,), -1, dtype=torch.int32, device=DEVICE)
+    cut_cols[2] = 100
+    perm = torch.randperm(n, dtype=torch.int32, device=DEVICE)
+    active_cols = perm.clone()
+    active_count = torch.tensor([active_cnt], dtype=torch.int32, device=DEVICE)
+
+    ref_kernel = refine_vocab_greedy_partials(
+        n,
+        k,
+        packed.exponent_base,
+        block_M=block_m,
+        block_N=block_n,
+        threads=threads,
+        step_groups=step_groups,
+        out_dtype=torch.float32,
+        has_bias=has_bias,
+        grid_x=0,
+    )
+    pers_kernel = refine_vocab_greedy_partials(
+        n,
+        k,
+        packed.exponent_base,
+        block_M=block_m,
+        block_N=block_n,
+        threads=threads,
+        step_groups=step_groups,
+        out_dtype=torch.float32,
+        has_bias=has_bias,
+        grid_x=40,
+    )
+
+    def _run(kernel):
+        refined = torch.full((rows, n), -123.0, dtype=torch.float32, device=DEVICE)
+        pvals = torch.full((rows, num_tiles), -123.0, dtype=torch.float32, device=DEVICE)
+        pidxs = torch.full((rows, num_tiles), -7, dtype=torch.int32, device=DEVICE)
+        args = [
+            x,
+            packed.values,
+            packed.exception_entries,
+            packed.row_offsets,
+            active_cols,
+            active_count,
+            cut_cols,
+        ]
+        if has_bias:
+            args.append(bias)
+        args.extend([refined, pvals, pidxs])
+        kernel(*args)
+        return refined, pvals, pidxs
+
+    ref_r, ref_pv, ref_pi = _run(ref_kernel)
+    act_r, act_pv, act_pi = _run(pers_kernel)
+    check_tiles = max(1, (max(active_cnt, 1) + block_n - 1) // block_n)
+    if active_cnt > 0:
+        assert torch.equal(act_r[:, :active_cnt], ref_r[:, :active_cnt])
+    else:
+        assert torch.equal(act_r[:, :1], ref_r[:, :1])
+    assert torch.equal(act_pv[:, :check_tiles], ref_pv[:, :check_tiles])
+    assert torch.equal(act_pi[:, :check_tiles], ref_pi[:, :check_tiles])
