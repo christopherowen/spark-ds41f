@@ -542,10 +542,11 @@ boot's own):
   connected at load, over the same RoCE NIC as sparknet's step collectives), its CUDA stream and the
   11.4 MiB stage. GPU clocks, temperatures and the busy threads (sparknet's proxy, the engine core, the
   worker) read the same in all four boots.
-- **c16, where the learner runs (about a finished request a second), shows no cost.** Output tok/s
-  +0.07%; the lab's paired decode tok/s: off against off-step −0.20%, margin 0.42%, where the grid's
-  change at c16's rows (about 44 a step, between 16×32 and 16×48) would be +0.8% or more. So whatever
-  slows the grid's dummy forward does not slow c16's served steps the same way.
+- **c16 shows no cost, but it cannot rule out the grid's.** Output tok/s +0.07%; the lab's paired decode
+  tok/s: off against off-step −0.20%, margin 0.42%. Its steps take about 127 ms (7.9 steps/s), against
+  23–27 ms for its decode rows on the grid (16×32 to 16×48): most of a c16 step is prefill, so a 1% slower
+  decode forward is diluted to a few tenths of a percent there. (An earlier version of this note read c16
+  as showing that served steps escape the grid's cost; it does not.)
 - The learner in the screen boots: 517 and 527 calls; the step's stream median 0.018 ms a call (p90
   0.022 ms); the learner's 0.36 ms (p90 0.46 ms); no stage waits; copies agreed at all four checks; 0 draft
   mismatches in 497,332. The first call of the first boot took 126 ms on the step and 505 ms off it during
@@ -618,9 +619,10 @@ fixes. The gain needs exact replays (observe and the offline study) or drafts re
 
 Off the step, the end of turn holds the step 0.02 ms a call at the median (0.20 ms at p90 under AgentX,
 against 0.48 and 2.86 ms on the step), its outputs are candidate-60's, and c16 shows no cost. The grid
-does: its target forward is 1.2% slower with the learner present and idle, in both boots, and the
-attribution job puts that on the learner's own NCCL communicator (+0.91% alone). The exchange is what has
-to change: the step's existing communicator, a communicator off the RDMA path, or the CPU group.
+does: its target forward is 1.2% slower with the learner present and idle, in both boots, and c16 is
+too prefill-heavy to rule that out for served decode. The learner's own communicator alone costs +0.91%;
+moving the exchange to the step's communicator leaves +0.58% and to a Socket one +1.28%, so the cost follows
+something both share, possibly the memory held from load, rather than the exchange's path.
 
 ### The learner's exchange
 
@@ -651,3 +653,27 @@ its first run.
 [exchange-tp4-switched.json](exchange-tp4-switched.json): the model and grid steps, six boots alternating
 the learner off, `step` and `socket`. A fix passes here if the grid reads the learner-off boots' speed; c16
 and AgentX then measure what its exchanges cost the step.
+
+Queue entry `20261117T173718-exchange-tp4-switched`, commit `29490fd83`; receipts
+[exchange](receipts/exchange) (the six boots' grids, startup memory and telemetry, the lab's verdicts,
+[grid-split.txt](receipts/exchange/grid-split.txt), each learner boot's log lines). Every learner boot
+logged its exchange and ran its model step's 155 to 163 learner calls with no error.
+
+| Grid against the learner off (geometric mean, 20 shapes) | Whole step | Target forward | Boot to boot |
+| --- | ---: | ---: | ---: |
+| `step` (no communicator made) | +0.58% (+0.79, +0.40) | +0.68% | −0.39% |
+| `socket` (its own, TCP) | +1.28% | +1.54% | +0.07% |
+| learner off, repeat | +0.03% | +0.05% | |
+
+**Neither removes the cost.** The Socket communicator, with no RDMA queue pairs or registrations, costs as
+much as the RoCE one (+1.28% against +0.91% alone and +1.04% with the learner in the attribution job), so
+it is not the network path. With no communicator made, `step` still costs +0.58%, its boots apart by 0.39%.
+Socket is also slow for the learner: its end of turn took 5.3 ms a call at the median (8.6 ms p90) on its
+stream, against 0.35 ms for `step`.
+
+What the four costs follow, roughly, is the memory each version holds from load (the boots' available memory
+after startup, against the learner off): `step` about 0.15 GiB (+0.58%), the communicator alone about 0.2 GiB
+(+0.91%), `socket` about 0.3 GiB (+1.28%), off-step about 0.35 GiB (+1.04%); on-step shadow, about 0.15 GiB,
+read about +0.2% beyond the day's drift. The nodes start without the memory-saver module the doctor expects
+(every boot warns of it), so memory taken at load could change where later allocations (the KV cache, the
+graphs' pool) land. Untested: the learner off with the same amounts merely allocated at load would tell.
