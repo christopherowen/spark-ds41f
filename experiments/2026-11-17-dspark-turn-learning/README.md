@@ -743,7 +743,7 @@ boot logged its communicator.
   and the GPU arbitrates between queues, so a shift can change which kernel gets free SMs first. The arms'
   extra streams at load follow their costs: memory alone 0 (nothing), `step` 2 (the learner's capture and
   learn streams, +0.58%), the communicator alone 3 (+0.91%), off-step and `socket` 4 (+1.04%, +1.28%).
-  This is the working explanation, not yet tested.
+  This was the working explanation; the streams-alone job below rules it out.
 
 **Streams alone** ([streams-tp4-switched.json](streams-tp4-switched.json); the model and grid steps, six boots
 alternating): the learner off; the learner off with three bare CUDA streams made at load where the
@@ -754,3 +754,22 @@ overlay-comm's speculator with `VLLM_DSPARK_TURN_LEARNING_EXTRA_STREAMS`. If thr
 communicator did and the communicator padded to 32 costs nothing, the cost is the step's streams' order on
 the hardware queues, and the learner can keep its own communicator if what it makes at load is padded or
 made after the step's streams.
+
+Queue entry `20261117T195856-streams-tp4-switched`, commit `365d4231e`; receipts [streams](receipts/streams)
+(grids, startup memory, telemetry, verdicts, [grid-split.txt](receipts/streams/grid-split.txt), each arm's
+log lines: the stream boots logged three bare streams, the padded boots the communicator and 29 streams).
+
+| Grid against the learner off (geometric mean, 20 shapes) | Whole step | Target forward | Boot to boot |
+| --- | ---: | ---: | ---: |
+| three bare streams at load | +0.07% | +0.08% | −0.13% |
+| the communicator alone, padded to 32 streams | +1.23% | +1.48% | −0.12% |
+| learner off, repeat | +0.02% | +0.06% | |
+
+**Not the streams.** Three bare streams cost nothing, and the communicator costs as much padded to 32 streams
+as alone (+1.23% here, +0.91% in the attribution job): the cost is the NCCL communicator itself, on RoCE or on
+Socket, while it sits idle. The learner over the step's existing communicator (+0.58%, no communicator made)
+is the one cost without one; its exchanges add connections to that communicator during the model step. What
+an idle communicator holds is threads (its proxy's, the network's) and, once exercised, connections; the
+step's critical path lengthens after its collectives, whose completion sparknet's CPU proxy drives. Next to
+separate: the communicator made, exercised and destroyed (threads and connections gone); and made with its
+threads confined to the cores sparknet's proxy and the worker do not use.
