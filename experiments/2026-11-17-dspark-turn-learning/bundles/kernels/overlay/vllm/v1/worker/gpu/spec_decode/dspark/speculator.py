@@ -34,6 +34,7 @@ from vllm.distributed import (
     get_tensor_model_parallel_rank,
     get_tensor_model_parallel_world_size,
     tensor_model_parallel_all_gather,
+    tensor_model_parallel_all_reduce,
 )
 from vllm.logger import init_logger
 from vllm.v1.worker.gpu import tilelang_inputs
@@ -71,6 +72,10 @@ from vllm.v1.worker.gpu.spec_decode.dspark.turn_learning import (
     turn_learning_capacity,
     turn_learning_dump_dir,
     turn_learning_mode,
+)
+from vllm.v1.worker.gpu.spec_decode.dspark.turn_learning_shadow import (
+    DSparkShadowLearner,
+    turn_learning_lr,
 )
 from vllm.v1.worker.gpu.spec_decode.dspark.utils import load_dspark_model
 
@@ -319,8 +324,9 @@ class DSparkSpeculator(DFlashSpeculator):
         )
         logger.info_once("DSpark pre-drafting Markov head truncation enabled")
         # VLLM_DSPARK_TURN_LEARNING: end-of-turn replay of each request's drafts
-        # (turn_learning.py); None when off.
-        self.turn_learner: DSparkTurnLearner | None = None
+        # (turn_learning.py, observe) or a shadow copy of Markov W1 trained on
+        # each finished turn (turn_learning_shadow.py); None when off.
+        self.turn_learner: DSparkTurnLearner | DSparkShadowLearner | None = None
 
     @property
     def attn_vllm_config(self) -> VllmConfig:
@@ -398,7 +404,8 @@ class DSparkSpeculator(DFlashSpeculator):
         """Attach ``VLLM_DSPARK_TURN_LEARNING``'s learner, before the draft
         kernels are declared and the draft graphs captured. It replays the
         vocabulary-parallel greedy draft step and refuses any other."""
-        if turn_learning_mode() == "off":
+        mode = turn_learning_mode()
+        if mode == "off":
             return
         local_head = getattr(self.model, "supports_local_draft_argmax", lambda: False)()
         table = self._markov_table()
@@ -422,6 +429,27 @@ class DSparkSpeculator(DFlashSpeculator):
                 "draft step only; this one lacks " + ", ".join(problems)
             )
         assert table is not None
+        if mode == "shadow":
+            self.turn_learner = DSparkShadowLearner(
+                model=self.model,
+                table=table,
+                markov_w2=self.model.model.markov_head.markov_w2,
+                draft_tokens=self.draft_tokens,
+                input_ids=self.input_buffers.input_ids,
+                anchor_idx=self._anchor_idx,
+                sample_idx_mapping=self.sample_idx_mapping,
+                sample_pos=self.sample_pos,
+                all_gather=lambda t: tensor_model_parallel_all_gather(t, dim=-1),
+                all_reduce=tensor_model_parallel_all_reduce,
+                max_num_reqs=self.max_num_reqs,
+                num_speculative_steps=self.num_speculative_steps,
+                tp_size=tp_size,
+                tp_rank=get_tensor_model_parallel_rank(),
+                device=self.device,
+                capacity=turn_learning_capacity(),
+                lr=turn_learning_lr(),
+            )
+            return
         self.turn_learner = DSparkTurnLearner(
             model=self.model,
             table=table,
@@ -677,6 +705,12 @@ class DSparkSpeculator(DFlashSpeculator):
             confidence_embeds = None
             prev = self.input_buffers.input_ids[self._anchor_idx[:num_reqs]]
 
+        shadow = (
+            self.turn_learner
+            if isinstance(self.turn_learner, DSparkShadowLearner) and vocab_parallel
+            else None
+        )
+        shadow_fused: tuple[int, int] | None = None
         for i in range(active_steps):
             # Sequential stage: Markov bias from the previously sampled token.
             if table is not None:
@@ -709,20 +743,35 @@ class DSparkSpeculator(DFlashSpeculator):
                 ):
                     # The Markov projection adds the base logits and reduces
                     # this rank's shard: no bias tensor.
-                    self.model.markov_greedy_pairs_local(
-                        markov_embed, base_logits[:, i], pairs, top2=use_top2
-                    )
+                    if shadow is not None and i == 0:
+                        # The same kernels, the tiles' maxima kept for the learner.
+                        shadow_fused = shadow.fused_pairs(
+                            markov_embed, base_logits[:, i], pairs
+                        )
+                    else:
+                        self.model.markov_greedy_pairs_local(
+                            markov_embed, base_logits[:, i], pairs, top2=use_top2
+                        )
                 else:
                     bias = self.model.markov_bias_local(markov_embed)
+                    partial_values, partial_indices = (
+                        shadow.partials(i)
+                        if shadow is not None
+                        else (self._greedy_partial_values, self._greedy_partial_indices)
+                    )
                     greedy_markov_shard_pair(
                         base_logits[:, i, :shard_vocab],
                         bias[:, :shard_vocab],
                         vocab_start,
                         pairs,
-                        self._greedy_partial_values,
-                        self._greedy_partial_indices,
+                        partial_values,
+                        partial_indices,
                         top2=use_top2,
                     )
+                if shadow is not None and i + 1 == active_steps:
+                    # Every position's maxima are written: keep them on the side
+                    # stream while this position's pairs are exchanged.
+                    shadow.capture(num_reqs, active_steps, shadow_fused)
                 draft_sampled_i = self.draft_tokens[:num_reqs, i]
                 has_embed = table is not None and i + 1 < active_steps
                 select_first_argmax(
@@ -782,10 +831,12 @@ class DSparkSpeculator(DFlashSpeculator):
                 num_reqs,
                 active_steps,
             )
-        if self.turn_learner is not None:
+        if isinstance(self.turn_learner, DSparkTurnLearner):
             # Keep the step's head rows, anchor position and drafts in each
             # request's ring (inside the draft graph).
             self.turn_learner.capture(num_reqs, head_hidden, active_steps)
+        elif shadow is not None:
+            shadow.join()
 
     def _sample_sequential_topk(
         self,

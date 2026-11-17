@@ -1,0 +1,38 @@
+{
+  "description": "Offline test-then-train study on the AgentX hour's turns: the serving rule and the full rule, per-row AdaGrad 0.1 and 0.3, scored exactly (FP32 and BF16 sums), by the seen-window proxy and by the teacher-forced proxy over every drafted position (both tables by one rule, serving's rounding).",
+  "image": "spark-ds41f:candidate-60",
+  "verdict": "status",
+  "env": {
+    "PYTHONPATH": "/b:/opt/spark-ds41f/candidate/vllm"
+  },
+  "workdir": "vllm",
+  "mounts": [
+    [
+      "experiments/2026-11-17-dspark-turn-learning/bundles/study/study_turns.py",
+      "/b/study_turns.py"
+    ],
+    [
+      "~/spark-lab/agents/dspark-turn-learning/turns",
+      "/turns"
+    ],
+    [
+      "~/.cache/huggingface/hub",
+      "/hub"
+    ]
+  ],
+  "argv": [
+    "/b/study_turns.py",
+    "--turns",
+    "/turns",
+    "--pattern",
+    "20261117T020420-*.pt",
+    "--snapshot",
+    "/hub/models--deepseek-ai--DeepSeek-V4.1-Flash-1017/snapshots/1bae0e1088993b9b82de08f59de5be5a34e42170",
+    "--methods",
+    "blockseen,full",
+    "--lrs",
+    "0.1,0.3",
+    "--opt",
+    "adagrad"
+  ]
+}

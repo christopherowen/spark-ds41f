@@ -33,8 +33,9 @@ turn (one request):
    to disk. No draft and no weight changes. Proves the replay in serving and collects real turns.
 2. **Offline study** on the dumped turns (sp8, the checkpoint's own heads): the update rule, its step size,
    and the prequential learning curve, i.e. how much traffic before the adapted W1 beats the loaded one.
-3. **Shadow**: the update in TileLang at the end of each turn on a shadow W1, scored against the live one
-   on each new turn; drafts unchanged.
+3. **Shadow** (`VLLM_DSPARK_TURN_LEARNING=shadow`, [below](#shadow)): the update in TileLang at the end of
+   each turn on an FP32 copy of W1 the draft step does not read, from the block maxima the step already
+   computes; drafts and outputs unchanged. It measures the learner's own cost in serving.
 4. **On**: the shadow table promoted to drafting while it wins over a window, and reset when it loses.
 
 ## Kernels
@@ -201,14 +202,125 @@ Follow-up runs on the same turns ([receipts/study-agentx-cap](receipts/study-age
 | block maxima | SGD 0.01 | +0.77% [+0.56, +1.00] | +0.46 / +0.58 / +0.63 / +1.22% |
 | block maxima | AdaGrad 1.0 | −0.40% [−0.77, −0.03] | −1.26 / −0.84 / −0.30 / +0.49% |
 
+## Shadow
+
+[turn_learning_shadow.py](overlay/vllm/v1/worker/gpu/spec_decode/dspark/turn_learning_shadow.py), mounted
+beside observe's files ([tp4-switched-shadow.json](tp4-switched-shadow.json): capacity 512 draft steps a
+request, AdaGrad step 0.3). The learner keeps an FP32 copy of Markov W1 and trains it on every finished
+turn; the draft step keeps reading the loaded W1, so no draft and no output changes.
+
+It keeps only what the update reads. At every draft position the greedy step already reduces each rank's
+vocabulary shard into 2048-column blocks (or, for the first position at three requests or more, the
+fused projection reduces it into 64-column tiles). The learner points those reductions at its own
+per-position scratch (the shared scratch is overwritten from one position to the next), which costs
+nothing. One kernel, forked onto a side stream after the last position's partials and joined at the end
+of the draft step, copies each request's 16 block maxima a position (value and global token), its anchor
+and its drafts into the request's ring while the last position's pairs are exchanged. No head row is
+kept and no logit is recomputed: 640 bytes a draft step a rank, against observe's 51 KB.
+
+At the end of a turn (every rank, the same step, sorted order, before the slot is reused):
+
+| Kernel | What |
+| --- | --- |
+| `labels_kernel` | observe's: the committed token at each kept position; entries drafted over another context excluded |
+| `vocab_embedding_packed` (candidate-60's) | the candidates' W2 rows, decoded from this rank's packed shard |
+| `shadow_local_kernel` | a block an entry: each candidate's teacher-forced logit under the loaded table and under the copy (the step's value with the step input's bias replaced by the committed input's, biases and sum rounded to BF16 as the step rounds them), and a 10-value summary a position |
+| all-gather | the summaries: 10 floats a position a rank |
+| `shadow_combine_kernel` | a block an entry, alike on every rank: the step's drafts, checked against the ring's; each table's teacher-forced run over the maxima; at the positions up to each block's first miss whose committed token is a candidate, this rank's share of the cross-entropy gradient into the input's W1 row |
+| all-reduce | the gradient: 256 floats a position |
+| `shadow_update_kernel` | a block a position: each W1 row's summed gradient (position order), its AdaGrad accumulator and step on the copy |
+| `shadow_totals_kernel` | the call's and the boot's counters |
+
+Rank 0 logs a line a finish (`ShadowStats`: `held`, `seen`, `trained`, `accepted`, `tf_loaded`,
+`tf_learned`, `fixed`, `broken`, `checked`, `draft_mismatches`, the loss and the end-of-turn time);
+every 256 finishes the ranks compare a sum of their copies. `draft_mismatches` must stay 0: the captured
+maxima must give the step's drafts. Memory a rank: the copy (126 MiB) and its accumulators (0.5 MiB), the
+rings (640 bytes × 512 draft steps a request), 10 MiB of decoded W2 rows for 256 entries.
+
+### The rule and the score serving can compute (offline, the AgentX turns)
+
+Before building it, the serving rule (`blockseen`: the block-maxima rule on the positions up to each
+block's first miss, where the step's input was the committed token, so its maxima are teacher forcing's)
+and two scores computable from the captured maxima alone were run through the offline study
+([bundles/study](bundles/study), AdaGrad, 843 turns):
+
+| Learner | Exact (FP32 sums) [95% CI] | Exact (BF16 sums, as serving) | By quarter (exact) | Seen-window score | Maxima teacher-forced score |
+| --- | ---: | ---: | --- | ---: | ---: |
+| `blockseen` 0.1 | +0.70% [+0.54, +0.86] | +0.76% | +0.24 / +0.66 / +0.75 / +1.01% | −0.33% | +0.23% |
+| `blockseen` 0.3 | +0.94% [+0.73, +1.17] | +0.92% | +0.37 / +0.73 / +1.01 / +1.45% | −0.88% | +0.03% |
+| full 0.1 | +1.16% [+0.97, +1.35] | +1.21% | +0.83 / +0.93 / +1.15 / +1.59% | −0.45% | +0.16% |
+| full 0.3 | +1.52% [+1.27, +1.79] | +1.56% | +1.14 / +1.27 / +1.74 / +1.84% | −1.04% | −0.02% |
+
+Receipts: [study-agentx-seen](receipts/study-agentx-seen) (also `block` and step 1.0, and the seen-window
+score in its first form, the learned change added in FP32 to the BF16 sums: −0.36 / −0.88 / −2.51% for
+`blockseen`), [study-agentx-seen-rounded](receipts/study-agentx-seen-rounded),
+[study-agentx-tfproxy](receipts/study-agentx-tfproxy).
+
+- **The rule holds.** Training only where the step's maxima are teacher forcing's loses nothing against
+  the block rule on every position (+0.94% against +0.96%), and the gain survives serving's BF16 rounding
+  (+0.92%).
+- **The scores do not.** The seen-window score (the copy's run over the positions up to the first miss)
+  is negative for every learner; the teacher-forced score over every drafted position, both tables by one
+  rule, reads about zero where the exact gain is +0.9 to +1.6%, and ranks the steps the wrong way. Where
+  the draft missed, the committed token is often in the draft's own 2048-column block, so it is not a
+  candidate: the maxima show what the copy breaks but miss most of what it fixes. Serving cannot measure
+  the gain from what the update needs; shadow logs the maxima-limited score only as a health signal.
+
+### Capture cost (graph microbenchmark, sp8)
+
+[bundles/capture-bench-shadow](bundles/capture-bench-shadow): CUDA graphs of a tail stand-in for the last
+position's exchange, with the capture forked onto a side stream, inline, or absent; median of 5
+interleaved rounds after a clock warmup ([receipts/capture-bench-shadow-3](receipts/capture-bench-shadow-3)).
+
+| Requests | Capture alone (graph) | Inline adds | Forked adds, spin tail (SMs free) | Forked adds, copy tail (all SMs busy) |
+| ---: | ---: | ---: | ---: | ---: |
+| 1 | 4.10 µs | +2.06 µs | +0.04 µs | +1.23 µs |
+| 4 | 4.24 µs | +2.05 µs | +0.07 µs | +1.78 µs |
+| 16 | 4.10 µs | +2.15 µs | +0.22 µs | +1.38 µs |
+
+Forked over a tail that leaves the SMs free, as a collective waiting on the network does, the capture
+costs a few hundredths of a microsecond; over a tail that fills every SM it costs about as much as
+inline. The first version reduced the fused position's 32 tiles a part serially in one thread (capture
+alone 5.8 to 6.6 µs, [capture-bench-shadow-1](receipts/capture-bench-shadow-1), copy tail only);
+[capture-bench-shadow-2](receipts/capture-bench-shadow-2) is the warp-parallel version without warmup.
+The real tail is the network all-gather; the screen below measures the step itself.
+
+### Kernel tests
+
+[bundles/kernels](bundles/kernels) now also runs
+[test_dspark_turn_learning_shadow.py](bundles/kernels/test_dspark_turn_learning_shadow.py): the capture
+(parts, the fused position's tiles, undrafted positions, padding rows, wrap-around), the end of turn across
+4 and 3 simulated ranks against a Python reference (dyadic data, so the rounded logits match to the bit:
+counters, gradient summed over ranks, AdaGrad step), the update's row deduplication. 11 passed
+([receipts/kernels-6](receipts/kernels-6); the module's log text and docstring changed afterwards).
+
+### Shadow screen (`tp4-switched`)
+
+[shadow-tp4-switched.json](shadow-tp4-switched.json):
+
+1. the screen suite, two boots, against candidate-60's recorded screen
+   (`experiments/2026-11-16-c60-prefill/receipts/final/tp4-switched/suites/c60-screen-tp4-switched/c60`):
+   the engine grid's step times, c16 throughput and prefill, the model check between the two boots;
+2. one boot: the determinism and greedy gates, which must equal candidate-60's hashes;
+3. a fresh boot: AgentX at 8 sessions for three hours (the learner's end-of-turn time, the replica
+   check, the loss over time).
+
+```bash
+bin/spark candidate queue tp4-switched experiments/2026-11-17-dspark-turn-learning/shadow-tp4-switched.json --apply
+```
+
+Pending.
+
 ## Where it stands
 
 After an hour of AgentX traffic, end-of-turn W1 learning raises teacher-forced accepted tokens by about
-1.5% with the full-vocabulary rule and about 1% with the block-maxima rule, the one whose serving work
-fits a microsecond budget (it reads only the maxima the draft step already computes). Both are still
-rising at the end of the hour (last quarter +1.8% and +1.5%). Teacher-forced acceptance is an upper bound
-of what verification realizes; no serving speed has been measured. Learning resets at every restart
-unless the learned rows are saved.
+1.5% with the full-vocabulary rule and about 0.9% with the rule serving can run from the block maxima it
+already computes (exact, and under serving's BF16 rounding), both still rising at the end of the hour.
+Teacher-forced acceptance is an upper bound of what verification realizes; no serving speed has been
+measured with learned drafts.
 
-Not built: the serving-side update (shadow, then on). What an hour cannot show is where the gain levels
-off; a longer collection in observe mode, studied the same way, would.
+Shadow mode is built and tested: a capture that costs a few hundredths of a microsecond a step when
+forked over a tail that leaves the SMs free, and an end-of-turn score and update in TileLang. What it
+cannot do is measure the gain: the block maxima show what a learned table breaks and miss most of what it
+fixes. The gain needs exact replays (observe and the offline study) or drafts read from the learned table
+(on). Learning resets at every restart unless the learned rows are saved.
