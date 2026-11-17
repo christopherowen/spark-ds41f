@@ -15,6 +15,13 @@ against candidate-54's recorded runs, not release-qualified.
 | #989 | sparknet: one persistent multi-stage kernel per collective, 8 thread blocks, no single-slot cap, so SP prefill collectives up to 16 MiB stay on sparknet | sparknet `0002` |
 | #982 | sparknet: PDL chaining of the four one-shot collectives (Part A) | sparknet `0003` (re-placed in #989's stage loop); vLLM `0803` (its PDL-chain test entry) |
 | #974 | CUDA 13.5.37 toolchain (nvcc/ptxas, cudart) and cuBLASLt 13.10.0.20 | `sources.cuda_toolkit` in this lock (hash-locked debs) |
+| Kernel cache key (owner, 2026-11-13) | TileLang's kernel cache key names the CUDA device compiler and its version, so a node whose cache an earlier toolkit filled compiles this build's kernels instead of loading the old ones | TileLang `0014` ([tilelang/series](tilelang/series): `spark-ds41f-1107`'s thirteen patches, then `0014`) |
+| Row-band WO window (owner, 2026-11-13: fifth build "with both patches") | `VLLM_DS41_L2_PREFETCH_WO_BANDS` sizes the WO prefetch window, and COMP's, by the forward's row count; unset, nothing changes. The TP4 recipe sets `17-32=10` | vLLM `0806` ([the experiment](../../2026-11-13-l2-prefetch-row-bands/README.md)) |
+| Vision GELU table (2026-11-13, the fifth build's release tests) | The aligner's fused GELU reads torch's own `F.gelu` of each BF16 value from a table instead of calling the compiling toolkit's `erff`, so it is DeepSeek's reference under CUDA 13.5 as under 13.0 | vLLM `0807` |
+| Torch for the toolkit (owner, 2026-11-13: "we should update pytorch to match our cuda build", "use tonight's nightly", "just add it to candidate-55") | torch `2.16.0.dev20261113+cu135` over the base image's `2.13.0+cu130`, from 22 hash-locked wheels; every native extension is built against it. PyTorch has no stable cu135 build, and no cu135 torchvision, torchaudio or torchcodec: those are the cu134 nightlies of its date | `sources.torch` in this lock ([requirements/torch-2-16-cu135-aarch64.txt](../../../requirements/torch-2-16-cu135-aarch64.txt)) |
+| NCCL 2.32.3 (required by that torch) | Its `libtorch_cuda.so` binds nine NCCL symbols 2.30.7 lacks, so the four NCCL patches are rebased onto `v2.32.3-1` | [nccl/series](nccl/series) |
+| Classic NCCL process groups (2026-11-14, [boot-memory](boot-memory/README.md)) | `TORCH_DIST_USE_NCCL2=0` in every shape's environment: torch 2.16's default process group creates an NCCL communicator for each of vLLM's groups at construction, about 1.3 GiB a rank at `tp3-switched`; the classic one creates it on first use, as torch 2.13 did. Inert on a torch without the variable | recipe |
+| Split canonicalization (required from torch 2.15) | Upstream vLLM #57299: torch 2.15 regenerates split outputs as slices, which stopped two fusion passes from matching | vLLM `0808` |
 | #738 | GLP's reader takes Spec v3 (`hc_fold_pre_engram`) beside Spec v1; a Spec v3 vector folds the stream mean and projects each covered layer's attention write. A Spec v1 vector (GLP-39) steers as before | vLLM `0805` (rebased on candidate-55, [receipts/glp-rebase](receipts/glp-rebase/README.md)) |
 
 ## Selection
@@ -29,7 +36,10 @@ against candidate-54's recorded runs, not release-qualified.
   replaced by [glp27-tp4.json](glp27-tp4.json), which extends this candidate's `tp4.json`.
 - **#985 is not carried.** It switches the default vector to GLP-27 in `config/cluster.json`, which `spark-ds41f-1107`'s
   image cannot read. Every measured arm here keeps GLP-39, and GLP-27 runs on a qualification arm only. The switch
-  belongs in the promotion commit of a release whose image reads Spec v3.
+  belongs in the promotion commit of a release whose image reads Spec v3. **Owner, 2026-11-13: "Yes, at
+  promotion"**: if candidate-55 is promoted, its promotion commit makes GLP-27 the default vector (#985's change),
+  qualified at all three testbeds ([receipts/glp](receipts/glp/README.md)). Until then `config/cluster.json` keeps
+  GLP-39.
 - **#1134 is carried in part:** its vLLM and sparknet patches only, at head `6757c7a1` (owner, 2026-11-12: "Yes,
   rebuild").
   - **This head's `0800`** replaces the one of `37a7f0ac`, which replaced the one first carried (heads `2d0c6c0b` and
@@ -65,7 +75,20 @@ against candidate-54's recorded runs, not release-qualified.
 - vLLM ([vllm/series](vllm/series)): candidate-54's 672 patches by relative path, then `0800`, `0801` (#1134's files,
   unchanged), `0802` (#1096 rebased, [receipts/b12x-rebase](receipts/b12x-rebase/README.md)), `0803` (#982's test
   entry), `0804` (#1145's file, unchanged) and `0805` (#738 rebased, [receipts/glp-rebase](receipts/glp-rebase/README.md)).
-  678 patches, `patch_head` `d6d4319e`, `expected_tree` `8aaae3df`, `patchset_sha256` `6fdf03dc`.
+  678 patches, `patch_head` `d6d4319e`, `expected_tree` `8aaae3df`, `patchset_sha256` `6fdf03dc`, through the fourth
+  build. The fifth build adds `0806` (the row-band WO window): 679 patches, `patch_head` `1878808a`, `expected_tree`
+  `7d05b12b`, `patchset_sha256` `ece15474`, recorded by `bin/spark build prepare --only vllm --lock` on sp8 for both
+  locks. `7d05b12b` is the tree the row-band experiment measured as an overlay. The sixth build adds `0807` (the
+  vision GELU table): 680 patches, `patch_head` `0f55693e`, `expected_tree` `e630ad15`, `patchset_sha256` `7ce17bdf`,
+  recorded the same way. The seventh build adds `0808` (upstream #57299): 681 patches, `patch_head` `5a190b19`,
+  `expected_tree` `3782bf90`.
+- NCCL ([nccl/series](nccl/series)) on `v2.32.3-1` (`12df1a11`), from the seventh build: `0001` and `0002` applied
+  unchanged, `0003` with one conflict in a log line, `0004` ported by hand to `src/tuning/tuning_general.cc`, where
+  2.31 moved the sizing. `patch_head` `d39a5a7b`, `expected_tree` `f6e56acc`. The rebuilt library exports the 60 NCCL
+  symbols torch needs. Builds one to six, and the `no974` control, are on `v2.30.7-1` with the 2026-10-03 series.
+- torch `2.16.0.dev20261113+cu135` from the seventh build (`sources.torch`); its CUDA libraries are the toolkit's
+  versions (13.5.37, cuBLAS 13.10.0.20). Not carried: upstream #58189 (this torch has the fix), and a
+  `tokenspeed-mla` bump (nothing on DS4.1's path imports it; it conflicts with Triton 3.9 only when loaded).
 - sparknet ([sparknet/series](sparknet/series)) on `1fd6a1fb`: `0001` (#1134), `0002` (#989), `0003` (#982 Part A,
   [receipts/sparknet-stack](receipts/sparknet-stack/README.md)). `patch_head` `1fdf8dc7`, `expected_tree` `e06f6a06`,
   `patchset_sha256` `60bb1942`.
@@ -96,7 +119,7 @@ unchanged. The control can: it must give candidate-54's TP4 hashes `18d61961`/`d
 | #1096 | Its release-test selection passes; no B12X module is imported at startup | Inert: the control's gate gives candidate-54's hashes; time to ready not worse (three startup RPC rounds skipped) |
 | #989 | Its `bench_pipelined_collectives.py` on sp1..sp4 (TP4) and sp1..sp3 (TP3): collectives of 4-16 MiB faster than PyNCCL beyond the interval, outputs bit-exact | Prefill at 32K and 256K not worse at `tp4-ring` and `tp4-switched` |
 | #982 | Its `bench_pdl_direct_stage.py` chains on sp1..sp4, Part A only: chain time at M=1..32 faster beyond the interval; the PDL-chain source test passes | The gate on 12 boots at `tp4-ring` and the c1 decision check: every boot identical. #982 makes more graph edges programmatic, the class of hazard `0799` fixed |
-| #738 (declared 2026-11-12, before the fourth build) | Its suite passes in the release tests: the GLP kernel and model tests, `glp_steer_write`'s PDL-chain entry, the weightless, CED and SP-prefill model tests. The image's reader accepts GLP-39 and GLP-27 on the head (#1149's GLP reader check in `cluster start`'s preflight, at the boots of `tp4.json` and `glp27-tp4.json`) | **Spec v1 unchanged:** GLP-39's steered replies ([glp39-steered-tp4.json](glp39-steered-tp4.json), `dual_probe.py`) identical in token IDs and log probabilities to the third build's on both boots: steered `739b8abc`, stock `9872053e` ([dual_replies.py](dual_replies.py)). **Stock unchanged:** every gate gives candidate-54's hashes with GLP-39 configured, and [qualify-glp27-tp4.json](qualify-glp27-tp4.json)'s gate runs give them with GLP-27 configured. **GLP-27 qualified at `tp4-ring`:** every `dual_probe.py` check passes on both boots; its steered speed and AdvBench rates are recorded, not gated |
+| #738 (declared 2026-11-12, before the fourth build) | Its suite passes in the release tests: the GLP kernel and model tests, `glp_steer_write`'s PDL-chain entry, the weightless, CED and SP-prefill model tests. The image's reader accepts GLP-39 and GLP-27 on the head (#1149's GLP reader check in `cluster start`'s preflight, at the boots of `tp4.json` and `glp27-tp4.json`) | **Spec v1 unchanged:** GLP-39's steered replies ([glp39-steered-tp4.json](glp39-steered-tp4.json), `dual_probe.py`) identical in token IDs and log probabilities to the third build's on both boots: steered `739b8abc`, stock `9872053e` ([dual_replies.py](dual_replies.py)). **Stock unchanged:** every gate gives candidate-54's hashes with GLP-39 configured, and [qualify-glp27-tp4.json](qualify-glp27-tp4.json)'s gate runs give them with GLP-27 configured. **GLP-27 qualified at `tp4-ring`:** every `dual_probe.py` check passes on both boots; its steered speed and AdvBench rates are recorded, not gated. **GLP-27 qualified at `tp4-switched` and `tp3-switched`** (2026-11-13): the same, on both boots of each; the stock name keeps each shape's hashes, and both TP4 testbeds give the same steered replies ([receipts/glp](receipts/glp/README.md)) |
 | #1145 (declared 2026-11-12, before the third build) | Its test (`test_external_dmabuf_carveout_loads_and_rejects_out_of_bounds`) passes where `/dev/dri/card0` exists, and the release tests pass | Every `tp3-switched` boot loads its weights (no `batch destination exceeds CUDA device allocation`); inert at `tp4-ring`, where the carve-out is off: the gate gives candidate-54's hashes |
 
 ## Verification
@@ -113,14 +136,35 @@ unchanged. The control can: it must give candidate-54's TP4 hashes `18d61961`/`d
   qualification on 2 boots at `tp4-ring` ([qualify-glp27-tp4.json](qualify-glp27-tp4.json)): the temperature-0 gate
   on the stock name, [dual_probe.py](../../2026-10-28-glp-dual-serving/dual_probe.py) `--speed`, 16 distinct streams
   and [advbench.py](../../2026-10-28-glp-dual-serving/advbench.py), as GLP-39 was qualified for `glp-3`
-  ([2026-10-28-glp-dual-serving](../../2026-10-28-glp-dual-serving/README.md)). GLP-27 at TP3 is not qualified.
-  `advbench.py` prints every reply; its output stays on dgx1 under `results/private`, and the receipts keep only each
-  boot's summary line (the rates per name).
+  ([2026-10-28-glp-dual-serving](../../2026-10-28-glp-dual-serving/README.md)). Added 2026-11-13: the same
+  qualification at `tp4-switched` and `tp3-switched` ([qualify-glp27-tp4-switched.json](qualify-glp27-tp4-switched.json),
+  [qualify-glp27-tp3-switched.json](qualify-glp27-tp3-switched.json)); every GLP run's results are in
+  [receipts/glp](receipts/glp/README.md). `advbench.py` prints every reply; its output stays on the testbed's head
+  under `results/private`, and the receipts keep only each boot's summary line (the rates per name).
 - **Pre-launch defragmentation:** candidate-55's and the control's boots defragment before launch, but candidate-54's
   recorded references were taken without it. A difference against those references includes the defragmentation,
   which counts as part of #1134.
 
 ## TP4's recipe: L2 prefetch caps, and the ring's collective limit
+
+**The row band, added with the fifth build (2026-11-13).** `tp4.json` and `tp4-switched.json` set
+`VLLM_DS41_L2_PREFETCH_WO_BANDS=17-32=10`: the WO window (and COMP's) at 10 MB for forwards of 17 to 32 rows, 15 MB
+elsewhere.
+
+- **Why:** the 24- and 32-row grid shapes; see [the row-band experiment](../../2026-11-13-l2-prefetch-row-bands/README.md).
+- **Measured** on the fourth build with the patch mounted and the kernel cache its own compiler filled, two boots each
+  ([the window sweep](../../2026-11-13-prefetch-window-sweep/README.md)): 17 to 32 rows 1.7% to 2.7% faster at both
+  TP4 testbeds, the grid 0.43% and 0.62% faster, outputs candidate-54's. The sweep found no better WO, FFN or NEXT
+  size at any other row band.
+- **The fifth build's screen** (below, under Status): 256K prefill is 1.03% lower than candidate-54's at `tp4-ring`,
+  beyond the margin; 12x72 is level with the recipe without the band (+0.17%); 16x96 reads 1.07% slower than it again
+  and is level with candidate-54 (-0.02%).
+- **Not set elsewhere:** `tp3-switched`'s sweep picked `17-32=12` on one boot and two boots did not confirm it (grid
+  -0.06%), so TP3 has no band; the triangle and TP5 to TP8 have no measurement.
+- `tp4-noband.json`, `tp4-switched-noband.json` and their `-dev` files are the recipe without the band. The arms
+  measured before it entered (grid-attribution, rows24-attribution, the kernel cache, row-band and sweep experiments)
+  extend those, so they still mean what they measured.
+- The fifth build's verification specs are `gate-b5-*.json`, `screen-b5-*.json` and `c1-decisions-b5-*.json`.
 
 **Added 2026-11-12, after the fourth build's screens.** Two recipe variables answer the two regressions the screens
 found at TP4. Neither changes the image or the locks.
@@ -136,7 +180,8 @@ The code defaults are 20/16/20 MB. TP5 to TP8 are not measured and keep the defa
 - **Why:** the grid regression at TP4 is in the 1-request rows: 1x2 rows are 9% slower than candidate-54 and 1x3
   rows 8% slower at `tp4-switched`, while the prefetch windows are at their defaults
   ([grid-attribution](grid-attribution/README.md)). **Corrected 2026-11-13:** this read "#982's `T.pdl_trigger()`
-  before `roce_wait_peers` causes it". The arms behind that mounted nothing; no run tests #982's trigger.
+  before `roce_wait_peers` causes it". The arms behind that mounted nothing. Run with its files mounted at `tp4-ring`
+  ([rows24-attribution](rows24-attribution/README.md)), #982 is a gain of 3.1% at 1x2 and 2.8% to 4.5% at 1x3 under the caps, not the cause.
 - **Measured** at `tp4-switched` on the fourth build, the grid step alone, two boots an arm in one session: the caps
   make the grid 4.66% faster than candidate-55 as built (1x2 rows 18%, 1x3 rows 13%), and 1.7% faster than
   candidate-54 with the same caps. sparknet `0003` is unchanged. **Corrected 2026-11-13:** the arm read here as
@@ -150,8 +195,9 @@ The code defaults are 20/16/20 MB. TP5 to TP8 are not measured and keep the defa
 
 ### Found 2026-11-13: candidate-55 has been running kernels compiled before #974
 
-TileLang's compiled-kernel cache is keyed by the kernel's source, target and options, not by the compiler's version
-(`tilelang/cache/cuda_binary_cache.py`). The nodes' caches were filled by CUDA 13.0.2 builds: on dgx1, 84 of the 7,033
+TileLang's kernel cache (`tilelang/cache/kernel_cache.py`) is keyed by the kernel and the TileLang build, not by the
+compiler that built its device binary; the CUDA binary cache below it is keyed by `nvcc`'s version too, but is asked
+only on a miss. The nodes' caches were filled by CUDA 13.0.2 builds: on dgx1, 84 of the 7,033
 files in the cache directory candidate-55 uses are newer than its first build, and on sp1 56 of 8,699. So wherever a
 kernel's source is candidate-54's, candidate-55 loads the binary an earlier build compiled, and #974's `nvcc` and
 `ptxas` compile only the kernels whose source changed. Every gate, check and screen above was taken that way.
@@ -163,6 +209,15 @@ kernel's source is candidate-54's, candidate-55 loads the binary an earlier buil
   its compiler did not build; they hold for its runtime libraries only.
 - [2026-11-13-kernel-cache-toolchain](../../2026-11-13-kernel-cache-toolchain/README.md) measures candidate-55 on its
   own kernels, gate first.
+- **Fixed in the series** (owner, 2026-11-13: "make the compiler version part of the cache key"): TileLang `0014`
+  adds the device compiler to the kernel cache key. TileLang's tree becomes `741806c7` (`patch_head` `444b0447`,
+  14 patches, `patchset_sha256` `c0a8825c`), recorded by `bin/spark build prepare --only tilelang --lock` on sp8 for
+  both locks, and every profile's `tilelang.tree` label follows. The fourth build's image has the earlier tree, so
+  these profiles need the **fifth build**, whose first boot on each node compiles its whole kernel set.
+- **Fifth build** (owner, 2026-11-13: "go", with both patches): TileLang `0014` and vLLM `0806`, built on sp8 from
+  [image-sp8.json](image-sp8.json). `0806` is inert until a recipe sets `VLLM_DS41_L2_PREFETCH_WO_BANDS`; no profile
+  here sets it. The `no974` control shares the vLLM and TileLang series, so its lock and labels follow; its image is
+  not rebuilt and stays the fourth build's record.
 
 ### The collective limit, at `tp4-ring` only
 
@@ -222,6 +277,10 @@ reached ready, and every mark is met.
   prefetch off candidate-55 is faster than candidate-54 at those shapes, and a 10 MB WO window makes them 2.6% faster
   at the cost of 1.9% at 1x2, so the recipe is unchanged; a WO window sized by row band is the fix, for a later
   candidate.
+  The change that moved those shapes is #982: without it they are 1.8% to 3.1% faster and 1 to 16 rows 1.1% to 4.5%
+  slower, the grid 0.7% slower, so #982 stays. The row-band window, measured as an overlay at both TP4 testbeds, makes the
+  24-row shapes 2.2% to 2.7% faster and 16x32 1.7% to 2.1% with nothing else moved
+  ([the experiment](../../2026-11-13-l2-prefetch-row-bands/README.md)); its output gate is still to run, and it is not in this image.
 - **Still open:** the engine's startup is about 4 s longer than candidate-54's at `tp4-ring`, as the third build
   recorded; nothing here changes it.
 
@@ -245,6 +304,29 @@ both `ModuleNotFoundError: No module named 'b12x'`. They test DeepSeek V4's B12X
 (`vllm/models/deepseek_v4/nvidia/b12x.py`, not on DS4.1's path) and import `b12x.attention` directly. #1096's own
 without-B12X run did not select this file. Both are now deselected with that reason, and the file's other tests still
 run. The deselection leaves the vLLM tree unchanged.
+
+**Fifth build** (image `c8c22dc2`, sp8, 5,672 s): **3 failed**, 10,292 passed, 357 skipped
+([receipts/release-tests-c8c22dc2](receipts/release-tests-c8c22dc2)). All three are the vision aligner's fused GELU
+against DeepSeek's reference (`F.gelu`), in `tests/kernels/test_deepseek_v41_tilelang_vision.py`:
+`test_gelu_epilogue_is_the_reference[144]` (3 of 36,864 values) and `test_gelu_epilogue_is_the_reference_everywhere[gemm]`
+and `[gemv]` (7 of the BF16 inputs a projection can produce, the same seven in both kernels).
+
+- **Cause: the toolkit (#974), not the fifth build's patches.** The kernel calls CUDA's `erff`, and the image's torch is
+  `2.13.0+cu130`, whose `erff` is CUDA 13.0's. CUDA 13.5's differs from it by one FP32 step at these arguments, and the
+  seven inputs (-3.140625, -4.03125, -4.28125, -4.5625, -5.0, -5.25, -5.34375) are those where that step moves the BF16
+  rounding of `(0.5 * x) * (1 + erff(x * M_SQRT1_2))`. The largest change is one BF16 step at 0.0026; the others are
+  below 1.2e-4.
+- **Builds one to four passed on kernels an earlier toolkit compiled.** The bundle's kernel cache
+  (`/c/tilelang-release-tests`) was filled on sp8 on 2026-11-10, and its key did not name the compiler. There, the third
+  build's image gives 0 differing inputs with that cache and the same 7 with an empty one. TileLang `0014` is what made
+  the fifth build compile its own.
+- **Effect:** image inputs. The text gates are unaffected (candidate-54's hashes at all three testbeds on these
+  kernels). Not fixed in this build.
+- **Fix: vLLM `0807`, for the sixth build.** `gelu_table` is `F.gelu` of each of the 65,536 BF16 values, built by
+  torch on the device; the GEMM's and the GEMV's GELU epilogues take it as an operand and read the entry at the
+  rounded biased value's bits. The epilogue is then torch's result under any toolkit. Mounted over the fifth build on
+  sp8 with an empty kernel cache: the vision file's 108 tests pass, and the first projection with its epilogue takes
+  the same time with either epilogue (404 to 408 us at 4 and 8 rows, 790 to 801 us at 144, 1,948 to 1,964 us at 576).
 
 ## Status
 
@@ -385,7 +467,269 @@ pass every check, steering changes all 8 prompts, and both give the same replies
   every profile's `vllm.tree` label follows.
 - **GLP-27:** [glp27-tp4.json](glp27-tp4.json) adds it, with [qualify-glp27-tp4.json](qualify-glp27-tp4.json) and
   #738's marks declared above. The file is in the Hugging Face cache on dgx1..dgx4 at revision `4d570926`, with
-  sha256 `24e97d41`. AdvBench's data is on dgx1.
+  sha256 `24e97d41`, and on sp1..sp7 at the same revision and sha256. AdvBench's data is on dgx1, and on sp1 and sp5
+  (copied from dgx1 on 2026-11-13, sha256 `7cafb159`).
 - **Third build:** its images and results are of tree `e8c20f54` and stay as its record.
 - **Fourth build:** it replaces both images and runs every gate, check and screen again. Its specs' runs are named
   `<run>-b4`.
+
+### Fifth build: gates identical, the grid ahead at TP4, prefill 1% behind, three release tests fail
+
+Image `spark-ds41f:candidate-55`, ID `c8c22dc2`, the same on dgx1..dgx4, sp1..sp4 and sp5..sp7 (2026-11-13). Every job
+ran at `f821d9f4d`. Each node's first boot compiled its kernel set (about 22 minutes), with the earlier toolkit's
+entries still in the cache: TileLang `0014` acting. Receipts: [receipts/fifth-build](receipts/fifth-build).
+
+| | `tp4-ring` | `tp4-switched` | `tp3-switched` |
+| --- | --- | --- | --- |
+| Gate | 2 of 2 boots, 18d61961/d6568649 (text 0a2dacdd/12fd8257) | 2 of 2, the same | 4 of 4, 5c22ce41/bce6092e (text 26a739a9/12cfee9b) |
+| Grid against candidate-54's recorded screen | **2.22% faster** (±0.14%, margin 0.35%) | **4.14% faster** (±0.17%, margin 0.29%) | **2.90% faster** (±0.13%, margin 0.56%; 15 shapes) |
+| c16 paired decode | +0.36%, the same (margin 0.51%) | **+1.39%, better** (margin 0.47%) | |
+| Prefill 32,768 | -0.15%, the same | -0.88%, the same | |
+| Prefill 262,144 | **-1.03%, worse** (±0.22%, margin 0.69%; 8,803 and 8,723 tok/s) | -0.84%, the same (margin 1.07%; 8,651 and 8,705 tok/s) | |
+| c1 decisions, 4 boots | agree on 59 requests; 82.49 to 82.83 tok/s output | agree on 59 requests; 82.52 to 82.73 tok/s | |
+| Warm time to ready | 115 and 118 s | 132 and 133 s | |
+
+- **The grid** is the fourth build's with its own kernels and the band: at `tp4-ring` -2.22% here against -1.96% for
+  that pair mounted over the fourth build, and -1.55% recorded on the earlier toolkit's kernels.
+- **The 24- and 32-row shapes** are 1.4% to 1.9% faster than candidate-54's at `tp4-ring` (24 rows) and level at
+  16x32 (+0.33%); they were 1.3% to 1.9% slower.
+- **Forwards of 32 rows and more are 0.18 to 0.34 ms slower than candidate-54's at `tp4-ring`** (16x32, the three
+  48-row shapes, 12x72, 16x96), which the drafter and the rest of the step give back (-0.18% to +0.85% a step). Not
+  attributed; the prefill loss on these kernels is not attributed either.
+- **Release tests:** three fail, above.
+- **`tp3-switched`'s screen** (two boots, against candidate-54's recorded screen): c8 paired decode +0.64%, better
+  (margin 0.34%); single-stream paired decode +1.50%, better (margin 0.29%; 64.05 and 64.04 tok/s); the sampled c16, c8
+  and c1 the same (+0.61%, +0.60%, +1.22%); prefill of 131,072 tokens under decode **2.31% slower at 3 streams**
+  (±1.07%, margin 1.11%: worse), the same at 6 and 7 (-1.44%, -1.75%). Prefill is lower on this toolkit's kernels at
+  all three testbeds; not attributed.
+- **Not done:** the c1 decisions against candidate-54's; TP5 to TP8.
+- **Correction:** sp8's `spark-ds41f:candidate-55` was the third build until the fifth replaced it, so the single-GPU
+  checks of 2026-11-13 on sp8 that name the fourth build ran on the third (the row-band overlay's smoke run among
+  them). The testbed runs are unaffected.
+
+Against `spark-ds41f-1107`, composed from candidate-54's recorded screens against it:
+
+| | `tp4-ring` | `tp4-switched` |
+| --- | ---: | ---: |
+| Grid | 7.05% faster | 8.20% faster |
+| c16 paired decode | +1.71% | +2.54% |
+| Prefill 262,144 | +6.24% | +6.66% |
+
+### Sixth build: the fifth with vLLM `0807`
+
+The sixth build's tree differs from the fifth's in three files: the vision kernels, the aligner and their test. Its
+specs' runs are named `<run>-b6`. Marks, declared before the build:
+
+1. **Release tests:** none fails on the sixth build's image, with the kernel cache CUDA 13.5 filled.
+2. **Outputs:** the gate gives candidate-54's hashes on every boot at `tp4-ring`, `tp4-switched` (18d61961/d6568649)
+   and `tp3-switched` (5c22ce41/bce6092e).
+3. **Serving:** at each TP4 testbed the screen's grid, c16 and prefill rows are the same as the fifth build's two
+   boots, within the margin. No text path changes, so a difference would be a finding about the build, not the patch.
+
+Not run again: the c1 decision checks and `tp3-switched`'s screen, which stand as the fifth build's.
+
+**Verified, 2026-11-13.** Image `spark-ds41f:candidate-55`, ID `0728619c`, vLLM tree `e630ad15`, the same on dgx1..dgx4,
+sp1..sp4 and sp5..sp7; every job ran at `c4341e032`. The fifth build's image is kept as `spark-ds41f:candidate-55-b5`
+on every node. Receipts: [receipts/sixth-build](receipts/sixth-build),
+[receipts/release-tests-0728619c](receipts/release-tests-0728619c).
+
+1. **Release tests: met.** 10,295 passed, 357 skipped, none failed (sp8, 2,954 s); the three GELU tests pass on kernels
+   CUDA 13.5 compiled.
+2. **Outputs: met.** 2 of 2 boots at `tp4-ring` and `tp4-switched` give 18d61961/d6568649 (text 0a2dacdd/12fd8257),
+   4 of 4 at `tp3-switched` give 5c22ce41/bce6092e (text 26a739a9/12cfee9b).
+3. **Serving: met.** Against candidate-54's recorded screens, beside the fifth build's:
+
+| | `tp4-ring`, sixth | fifth | `tp4-switched`, sixth | fifth |
+| --- | ---: | ---: | ---: | ---: |
+| Grid | -2.10% (margin 0.30%) | -2.22% | -3.96% (margin 0.29%) | -4.14% |
+| c16 paired decode | +0.45% | +0.36% | +1.48% | +1.39% |
+| Prefill 32,768 | +0.17% | -0.15% | -0.15% | -0.88% |
+| Prefill 262,144 | -1.02% (8,773 and 8,755 tok/s; worse) | -1.03% | -0.39% (8,697 and 8,739 tok/s; the same) | -0.84% |
+
+Open, carried from the fifth build: 256K prefill at `tp4-ring` is 1% behind candidate-54 beyond the margin.
+
+### Seventh build: torch for the toolkit, NCCL 2.32.3, vLLM `0808`
+
+Three variables that cannot be separated: this torch does not load without NCCL 2.32.3, and vLLM's fusion passes
+need `0808` on it. The `no974` control cannot take them (no CUDA 13.5 toolkit) and stays the sixth build's. Specs'
+runs are named `<run>-b7`. Built on sp8 as `spark-ds41f:candidate-55-b7`, image ID `71293710`; the sixth build keeps
+`spark-ds41f:candidate-55` until this one is distributed.
+
+Before the testbeds, on sp8 (2026-11-13):
+
+- The image build's checks pass: torch is the lock's, reports CUDA 13.5 and NCCL 2.32.3, and loads the patched
+  library and no other; the GPU, TileLang and sparknet smokes pass and the 66 DS4.1 modules import.
+- torch's compiled architectures stop at `sm_120`, which GB10 (12.1) runs: a BF16 matmul and a CUDA graph capture
+  and replay work.
+- **torch's own GELU moved with the toolkit.** At the seven inputs of the fifth build's failures, this torch's
+  `erff` is CUDA 13.5's and its `F.gelu` gives the values the 13.5-compiled kernel gave before `0807`. The kernel
+  reads torch's table, so it differs from torch at 0 inputs on either torch. Image inputs therefore differ from
+  candidate-54's at those inputs on this build, with the reference.
+- vLLM `0808`'s tests on torch 2.13: 15 passed, 33 skipped (they need a model the node does not hold).
+- NCCL 2.32.3 with the rebased patches has run no collective yet.
+
+Marks, declared before the testbed runs:
+
+1. **Release tests:** none fails on the seventh build's image.
+2. **Every boot reaches ready** at `tp4-ring`, `tp4-switched` and `tp3-switched` (NCCL's ring and channel patches on
+   a reworked tuner).
+3. **Outputs:** every boot of a testbed gives the same hashes. The text hashes are candidate-54's
+   (0a2dacdd/12fd8257 at TP4, 26a739a9/12cfee9b at TP3). The log-probability hashes are candidate-54's too, or the
+   difference is shown to be torch's own arithmetic on the logits, not a kernel's.
+4. **Serving:** at each testbed the screen's rows are not worse than the sixth build's two boots beyond the margin
+   (the fifth build's at `tp3-switched`), and the c1 decisions agree on 4 of 4 boots at both TP4 testbeds.
+5. **Time to ready** not longer than the sixth build's warm boots by more than 5 s.
+
+**The seventh build did not boot at `tp4-ring`** (2026-11-14 04:27Z to 04:30Z; runs `candidate-55-gate-tp4-b7`,
+`…-screen-tp4-b7`, `…-c1-decisions-tp4-b7`, each failed in under a minute, deployment `2e46a5a8f`).
+`torch.distributed.new_group` raised `NCCL split failed: invalid usage`, NCCL's last error
+`SWITCHLESS_BIDIRECTIONAL needs 3 or 4 nodes, one rank per node, an even channel count >=2 and unshared resources`.
+torch 2.16's default process group makes each new group by splitting its parent's communicator, which shares the
+parent's resources; NCCL `0002` refuses that. It is the same default that cost `tp3-switched` its memory
+([boot-memory](boot-memory/README.md)), and `TORCH_DIST_USE_NCCL2=0` selects the classic group, which creates its own
+communicator. The ring's jobs run again with it as `…-b7-r2`. The ring's image was built on dgx4 from the same lock
+(the copy from sp8 did not complete), so its image ID is not sp8's.
+
+**Seventh build outcomes (2026-11-14; dead end, not promoted):**
+
+1. **Release tests: not met.** 172 failed, 10,123 passed (torch nightly bumped Triton from 3.7.1 to 3.9; all 172 failures compare TileLang sampling, top-k/top-p, and rejection kernels against vLLM's Triton kernels at signed zeros, infinities, NaN, and top-p threshold ties). In addition, the base image's prebuilt DeepGEMM extension fails to load with an undefined torch symbol, and no NIXL wheel is built for torch 2.16.
+2. **Every boot reaches ready: not met.** At `tp4-ring`, `-b7` failed in under a minute (`NCCL split failed: invalid usage`). At `tp3-switched`, `screen-b7` failed on boot 2 when `sp5` hit 4.968 GiB lowest `MemAvailable` and tripped the 5 GiB startup guard (5 of 6 boots reached ready across gate + screen). With `TORCH_DIST_USE_NCCL2=0` (`-b7-r2`), `tp3-switched` recovered the 8 extra NCCL communicators (0.90 of the +1.42 GiB head delta; [boot-memory](boot-memory/README.md)), leaving +0.52 GiB on the head (`5.866`–`6.075` GiB lowest boot `MemAvailable` on subsequent `-b7-r2` boots), and `screen-b7-r2` halted its `model` step at `sp5` (`MemAvailable 3.97 GiB` below the 4 GiB bench floor on boot 1).
+3. **Outputs: met.** At `tp4-ring` (`-b7-r2`, dgx4 image `03db3ec9`), 2 of 2 boots match candidate-54 (`18d61961`/`d6568649`, text `0a2dacdd`/`12fd8257`). At `tp4-switched` (`-b7`, sp8 image `71293710`), 2 of 2 boots match candidate-54 (`18d61961`/`d6568649`). At `tp3-switched` (`-b7`), 4 of 4 boots match candidate-54 (`5c22ce41`/`bce6092e`, text `26a739a9`/`12cfee9b`).
+4. **Serving: not met.** Against candidate-54's recorded screens:
+   - `tp4-ring` (`-b7-r2`): grid `-2.18%` (±0.14%, margin 0.30%, better), c16 paired decode `+0.38%` (±0.41%, same), Prefill 32,768 `+0.32%` (same), **Prefill 262,144 `-0.92%`** (8,755 and 8,790 tok/s, ±0.41%, repeat +0.40%, margin 0.62%, **worse**); c1 decisions agree across all 4 boots (59 of 59 requests, and 58 of 58 with candidate-54; `82.62`–`82.82` tok/s).
+   - `tp4-switched` (`-b7`): grid `-4.11%` (±0.18%, margin 0.35%, better), c16 paired decode `+1.58%` (±0.43%, better), Prefill 32,768 `-0.50%` (same), Prefill 262,144 `-0.30%` (8,700 and 8,750 tok/s, same); c1 decisions agree across all 4 boots (59 of 59 requests, and 57 of 57 with candidate-54; `82.26`–`82.61` tok/s).
+   - `tp3-switched` (`-b7-r2`, without the halted `model` step): `single-stream` c1 paired decode `+1.78%` / `+1.63%` (better); `sampled` c16 paired decode `+1.70%` / `+1.74%` (better), c8 `+0.07%` / `+1.03%` (same); `stall` against candidate-54: `stall-3` prefill 131,072 tok/s under decode `-2.09%` / `-1.96%` (**worse**, `4,768.9` and `4,775.3` vs `4,870.7` tok/s) and decode step p90 `+2.49%` / `+2.20%` (**worse**), `stall-6` p90 `+2.38%` / `+2.51%` (**worse**, boot 2 prefill `-1.86%`, **worse**), `stall-7` p90 `+2.46%` / `+2.82%` (**worse**).
+5. **Time to ready: met** where warm boots completed: `tp4-ring` `-b7-r2` `108.8`–`115.4` s (sixth build `115.5`–`116.5` s; first `-b7-r2` boot `103.8` s); `tp4-switched` `-b7` `131.9`–`139.0` s (sixth build `133.3`–`134.4` s); `tp3-switched` `-b7`/`-b7-r2` `123.8`–`129.4` s (fifth/sixth build `127.0`–`135.5` s).
+
+### Eighth build: sixth build's torch 2.13 and NCCL 2.30.7, vLLM `0808`, TP3 collective cap
+
+Reverts PyTorch (`2.13.0+cu130` base image) and NCCL (`2.30.7-1`, `eeacf1c6`) to the sixth build while keeping the CUDA
+`13.5.37` toolkit and patches, replaces vLLM `0808` with `0808-perf-dsv41-sink-indexer-candidate-score-reduction-un.patch`
+(`b210993fd700`, tree `7914f1f91e56`, sinking the 64-lane `s_frag` sum inside `if slot >= 0` in `_nsa_ScoreKernel` so
+`tp4-ring` 256K prefill recovers the CUDA 13.5 regression; `test_deepseek_v41_tilelang.py`: 65 passed, 1 skipped,
+1 xfailed in the sixth build's container), and sets `SPARKNET_ROCE_MAX_COLLECTIVE_BYTES=4194304` on TP3 configs
+(`tp3-switched.json`, `tp3.json`, `tp3-triangle-4k.json`, matching TP4's 4 MiB cap for `tp3-switched` `stall-3`
+prefill under decode). Specs' runs are named `<run>-b8`.
+
+Marks, declared before the build:
+
+1. **Release tests:** 0 failures (target 10,295 passed, 357 skipped).
+2. **Every boot reaches ready** at `tp4-ring`, `tp4-switched` and `tp3-switched`, with `sp5` lowest boot `MemAvailable`
+   restored to Builds 5 and 6 (~6.3–7.0 GiB).
+3. **Outputs:** `18d61961`/`d6568649` (text `0a2dacdd`/`12fd8257`) at `tp4-ring` and `tp4-switched`, and
+   `5c22ce41`/`bce6092e` (text `26a739a9`/`12cfee9b`) at `tp3-switched` on every boot.
+4. **Serving:** `tp4-ring` Prefill 262,144 and `tp3-switched` `stall-3` prefill under decode are not worse than
+   candidate-54 beyond the margin; grid, c16, single-stream and sampled gains are preserved; and `c1-decisions`
+   agrees on 4 of 4 boots at both TP4 testbeds and with candidate-54.
+5. **Time to ready** not longer than the sixth build's warm boots by more than 5 s.
+**Eighth build outcomes (2026-11-14; not promoted — open 256K prefill regression at `tp4-ring`):**
+
+Image `spark-ds41f:candidate-55`, ID `daa18fed` (`sp8`, `sp1..sp4`, `sp5..sp7`) and `6281652f` (`dgx1..dgx4`), `patch_head`
+`b210993fd700`, tree `7914f1f91e56`. Release tests receipt: [receipts/release-tests-daa18fed](receipts/release-tests-daa18fed).
+
+1. **Release tests: met.** `10,295 passed, 357 skipped`, 0 failed on `sp8` (`2,910.2 s`).
+2. **Every boot reaches ready: met.** All boots completed with `halted: null` and `swap_growth_gib: 0.0` across
+   `tp4-ring` (`dgx1` lowest boot `MemAvailable` `23.353–23.361 GiB` across screen boots), `tp4-switched` (`sp1`
+   `14.159–14.475 GiB`), and `tp3-switched` (8 of 8 screen boots completed; `sp5` lowest boot `MemAvailable` restored
+   to `6.274–6.535 GiB`).
+3. **Outputs: met.** `tp4-ring` (2 of 2) and `tp4-switched` (2 of 2) give `18d61961`/`d6568649` (text
+   `0a2dacdd`/`12fd8257`); `tp3-switched` (4 of 4) gives `5c22ce41`/`bce6092e` (text `26a739a9`/`12cfee9b`).
+4. **Serving: partially met.** Against candidate-54's recorded screens:
+   - `tp4-ring`: grid `-2.11%` (±0.14%, margin 0.30%, better), c16 paired decode `+0.39%` (±0.41%, margin 0.50%,
+     same; `270.88` and `271.51` tok/s), Prefill 32,768 `-0.40%` (same; `8,676` and `8,656` tok/s), **Prefill 262,144
+     `-0.96%`** (±0.70%, repeat `+0.07%`, margin `0.77%`, **worse**; `8,766` and `8,772` tok/s). `c1-decisions` agrees
+     on 59 of 59 requests across all 4 boots and 58 of 58 with candidate-54 (`82.41`–`82.92` tok/s).
+   - `tp4-switched`: grid `-3.78%` (±0.17%, margin 0.50%, better), c16 paired decode `+1.31%` (±0.40%, margin 0.47%,
+     better; `268.02` and `268.56` tok/s), Prefill 32,768 `-0.20%` (same; `8,639` and `8,652` tok/s), Prefill 262,144
+     `-0.43%` (same; `8,693` and `8,735` tok/s). `c1-decisions` agrees on 59 of 59 requests across all 4 boots and
+     57 of 57 with candidate-54 (`82.36`–`82.66` tok/s).
+   - `tp3-switched`: grid (15 shapes) `-2.92%` (±0.12%, margin 0.33%, better), c8 paired decode `+0.66%` (±0.48%,
+     margin 0.59%, better; `159.08` and `158.93` tok/s), `single-stream` c1 paired decode `+1.59%` (±0.14%, margin
+     0.29%, better; `64.06` and `64.09` tok/s), `sampled` c16 `+1.01%` (same), c8 `+0.43%` (same), c1 `+1.54%`
+     (better), `stall` prefill 131,072 tok/s under decode `stall-3` `-1.13%` (`4,833.4` and `4,794.2` tok/s, ±1.37%,
+     margin `1.78%`, **same**; p90 `0.9981` and `1.0086` s), `stall-6` `-0.41%` (**same**), `stall-7` `-0.69%`
+     (**same**).
+5. **Time to ready: met.** `tp4-ring` `115.3`–`115.4 s`; `tp4-switched` `132.1`–`132.1 s`; `tp3-switched` warm
+   non-cooled boots `123.8`–`132.7 s` (`184.2 s` on `again-stall` after 15 s cooling).
+
+### Ninth build: vLLM `0809` and `0810` for CUDA 13.5 prefill
+
+Keeps the eighth build's stack (`torch 2.13.0+cu130`, NCCL `2.30.7-1`, CUDA `13.5.37` toolkit, TP3 4 MiB collective
+cap) and adds two TileLang prefill fixes (`patch_head` `44db6a403230`, tree `49493238c2ff`, `683` patches total):
+
+- `0809-perf-dsv41-unroll-full-iterations-in-sparse-MLA-stag.patch` (`sparse_mla.py`): splits `issue_stage_records` into
+  unpredicated full iterations (`issue_record_copy`) plus a single tail check so `nvcc` under CUDA 13.5 drops the
+  per-iteration range branch (`test_deepseek_v41_tilelang.py`: `65 passed, 1 skipped, 1 xfailed` in `candidate-55-b8`;
+  standalone `sparse_mla` recovers ~`250`–`330 us` CUDA 13.5 loss at 16,384 rows to within `+0.19%`–`+0.32%` of CUDA
+  13.0, `max_abs_diff=0`).
+- `0810-perf-dsv41-unroll-MoE-blockscaled-K-loop-across-stag.patch` (`moe.py`): unrolls blockscaled MoE K loop across
+  `period = 2 * stages` (`k_step`) and passes `max_ko` so full-K TMA tiles elide `ko < k_full`
+  (`test_deepseek_v41_tilelang_moe.py`: `140 passed` in `candidate-55-b8`; `nvcc sm_121a` `0` stack, `0` spills, `191`
+  regs; standalone `w13` `E=384` `sorted_seq` `9,753.73 us` vs `10,508.13 us` CUDA 13.0 and `10,776.48 us` CUDA 13.5,
+  `E=128` `9,672.40 us` vs `10,451.71 us` CUDA 13.0 and `10,730.82 us` CUDA 13.5, `max_abs_diff=0`).
+
+Specs' runs are named `<run>-b9`. Marks, declared before the build:
+
+1. **Release tests:** 0 failures (target 10,295 passed, 357 skipped).
+2. **Every boot reaches ready** at `tp4-ring`, `tp4-switched` and `tp3-switched`, with `sp5` lowest boot `MemAvailable`
+   in Builds 5 and 6 (~`6.3`–`7.0 GiB`).
+3. **Outputs:** `18d61961`/`d6568649` (text `0a2dacdd`/`12fd8257`) at `tp4-ring` and `tp4-switched`, and
+   `5c22ce41`/`bce6092e` (text `26a739a9`/`12cfee9b`) at `tp3-switched` on every boot.
+4. **Serving:** `tp4-ring` Prefill 262,144 and `tp3-switched` `stall-3` prefill under decode are not worse than
+   candidate-54 beyond the margin; grid, c16, single-stream and sampled gains hold; and `c1-decisions` agrees on
+   4 of 4 boots at both TP4 testbeds and with candidate-54.
+5. **Time to ready** not longer than the sixth build's warm boots by more than 5 s.
+
+**Ninth build outcomes (2026-11-14):**
+
+Image `spark-ds41f:candidate-55`, ID `c7976f69` (`sp8`, `sp1..sp4`, `sp5..sp7`) and `a8fbd559` (`dgx1..dgx4`), `patch_head`
+`44db6a403230`, tree `49493238c2ff`. Release tests receipt: [receipts/release-tests-c7976f69](receipts/release-tests-c7976f69).
+
+1. **Release tests: met.** `10,295 passed, 357 skipped`, 0 failed on `sp8` (`3,060.8 s`; 157 files, `2,868 s` of tests).
+2. **Every boot reaches ready: met.** All 28 boots across `tp4-ring` (8: 2 gate, 2 screen, 4 c1-decisions),
+   `tp4-switched` (8: 2 gate, 2 screen, 4 c1-decisions), and `tp3-switched` (12: 4 gate, 8 screen) reached ready with
+   zero startup memory guard trips and `swap_growth_gib: 0.0` across all screen boots (`dgx1` lowest boot
+   `MemAvailable` `23.150–23.158 GiB`, benchmark `min_available_gib` `21.76` and `21.94 GiB`; `sp1` lowest boot
+   `MemAvailable` `20.755–20.761 GiB`, cluster min `20.493 GiB` on `sp2`, benchmark `min_available_gib` `19.35` and
+   `19.39 GiB` on `sp1`; `sp5` lowest boot `MemAvailable` `6.292–6.558 GiB` across all 8 screen boots, benchmark
+   `min_available_gib` `4.51–6.72 GiB`). During `screen-tp3` boot 1 (`candidate-55`), after completing `grid` and `c8`,
+   `sp6` halted thermally at `85 C` (`min_headroom_c: 4.0 C`, `fan_curve` service `absent`) on `prefill 32,768` repeat
+   1/3 (`6,530 tok/s`); boot 2 (`candidate-55-again`) and boots 3–8 (`single-stream`, `sampled`, `stall-tp3`) all
+   completed with `halted: null`.
+3. **Outputs: met.** `tp4-ring` (2 of 2 boots) and `tp4-switched` (2 of 2 boots) give `18d61961`/`d6568649` (text
+   `0a2dacdd`/`12fd8257`); `tp3-switched` (4 of 4 boots) gives `5c22ce41`/`bce6092e` (text `26a739a9`/`12cfee9b`), with
+   0 token or logprob diffs across all scenarios.
+4. **Serving: met.** Against candidate-54's recorded screens:
+   - `tp4-ring`: grid `-2.70%` (±0.13%, repeat `-0.28%`, floor `0.26%`, margin `0.29%`, **better**), c16 paired decode
+     `+0.50%` (±0.43%, repeat `+0.14%`, margin `0.51%`, **same**; `271.12` and `271.75` tok/s; c16 output `+0.58%`
+     ±0.78%, **same**), Prefill 32,768 `+1.74%` (±2.09%, repeat `+0.24%`, margin `2.26%`, **same**; `8,841.18` and
+     `8,862.57` tok/s), **Prefill 262,144 `+0.37%`** (±0.95%, repeat `+0.03%`, margin `1.01%`, **same**; `8,885.43` and
+     `8,887.68` tok/s — Build 8's `-0.96%` regression is resolved). `c1-decisions` agrees on 59 of 59 requests across
+     all 4 boots and 58 of 58 with candidate-54 (`82.67`–`83.01` tok/s).
+   - `tp4-switched`: grid `-3.99%` (±0.17%, repeat `-0.07%`, floor `0.23%`, margin `0.29%`, **better**), c16 paired
+     decode `+1.60%` (±0.34%, repeat `+0.32%`, margin `0.41%`, **better**; `268.82` and `269.82` tok/s; c16 output
+     `+1.77%` ±0.74%, **better**), Prefill 32,768 `+1.04%` (±1.64%, repeat `+0.25%`, margin `1.78%`, **same**;
+     `8,741.55` and `8,763.72` tok/s), Prefill 262,144 `+0.50%` (±0.71%, repeat `+0.24%`, margin `0.97%`, **same**;
+     `8,785.34` and `8,806.33` tok/s). `c1-decisions` agrees on 59 of 59 requests across all 4 boots and 57 of 57 with
+     candidate-54 (`82.55`–`82.63` tok/s).
+   - `tp3-switched`: grid (15 shapes) `-2.78%` (±0.12%, repeat `-0.38%`, floor `0.30%`, margin `0.33%`, **better**), c8
+     paired decode `+0.36%` (±0.36%, repeat `+0.02%`, margin `0.49%`, **same**; `158.65` and `158.71` tok/s; c8 output
+     `+0.54%` ±1.27%, **same**); boot 2 standalone `prefill` measured `6,568.41` tok/s (±1.45%) at `32,768` and
+     `6,481.75` tok/s (±0.66%) at `262,144`. `single-stream` c1 paired decode `+1.69%` (±0.15%, repeat `+0.03%`, margin
+     `0.29%`, **better**; `64.14` and `64.18` tok/s; c1 output `+1.57%` ±4.24%, **same**). `sampled`: c16 paired decode
+     `+0.90%` (±1.16%, **same**; `154.94` and `155.91` tok/s), c8 `+0.90%` (±1.81%, **same**; `155.96` and `156.36`
+     tok/s), c1 `+1.44%` (±1.22%, margin `1.24%`, **better**; `62.03` and `62.13` tok/s). `stall` prefill 131,072
+     tok/s under decode: `stall-3` `-0.35%` (±1.22%, repeat `-0.46%`, margin `1.45%`, **same**; `4,862.82` and `4,840.46`
+     tok/s; p90 `0.993`–`0.994` and `0.999`–`1.003` s), `stall-6` `-0.39%` (±2.04%, repeat `-0.17%`, margin `2.42%`,
+     **same**; `4,529.18` and `4,521.26` tok/s), `stall-7` `-0.25%` (±2.22%, repeat `-0.13%`, margin `2.30%`, **same**;
+     `4,860.48` and `4,854.29` tok/s).
+5. **Time to ready: partially met.** `tp4-ring` warm boots (`+0` kernel cache files) took `113.3`–`118.7 s` (`gate`
+   boot 2 `116.5 s`, `screen` `113.3` and `116.5 s`, `c1-decisions` `116.5`–`118.7 s`; first boot `194.8 s` compiled
+   196 kernel cache files), within `+5 s` of the sixth build (`115.5`–`116.5 s`). `tp3-switched` warm boots took
+   `130.6`–`139.2 s` (`gate` warm `130.6`–`136.1 s`, `screen` `131.4`–`139.2 s`; first boot `246.1 s`), within `+5 s`
+   of the fifth/sixth build (`127.0`–`135.5 s`). `tp4-switched` warm boots took `135.5`–`143.5 s` (first boot
+   `239.4 s`): `gate` boot 2 (`139.1 s`) and `c1-decisions` (`135.5`–`137.5 s`) were within `+5 s` of the sixth build
+   (`133.3`–`134.4 s`), while `screen` boots (`139.9` and `143.5 s`) ran `+5.5 s` and `+9.1 s` longer.
+
+Build 9 receipts and screen references (`candidate-55-b9-*`) are recorded under
+[receipts/ninth-build/](receipts/ninth-build/) and [receipts/references/](receipts/references/).

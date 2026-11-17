@@ -170,7 +170,9 @@ def parse_time(text: str) -> float:
 
 
 def write_json_atomic(path: Path, data: dict) -> None:
-    temporary = path.with_name(path.name + ".tmp")
+    # One temporary per concurrent writer: a runner's foreground beat() and its background
+    # heartbeat can write the hold at the same moment.
+    temporary = path.with_name(f"{path.name}.{os.getpid()}.{threading.get_ident()}.tmp")
     temporary.write_text(json.dumps(data, indent=2) + "\n", encoding="utf-8")
     os.replace(temporary, path)
 
@@ -183,9 +185,40 @@ def nodes_config() -> dict:
     return production_configuration()[1]
 
 
-def head_url() -> str:
-    head = next(node for node in nodes_config()["nodes"] if node["head"])
-    return f"http://{head['management_ip']}:8000"
+def serving_port(cluster: dict) -> str:
+    """The port a profile serves on: its last ``--port`` serving argument, in either form,
+    else vLLM's default."""
+    port, args = "8000", [str(arg) for arg in cluster.get("serve_args", [])]
+    for index, arg in enumerate(args):
+        if arg == "--port" and index + 1 < len(args):
+            port = args[index + 1]
+        elif arg.startswith("--port="):
+            port = arg.partition("=")[2]
+    return port
+
+
+def head_url(config: str | None = None) -> str:
+    """The head's serving URL under ``config`` (default: the production profile)."""
+    cluster, nodes, _ = (production_configuration() if config is None
+                         else spark.configuration(argparse.Namespace(cluster_config=config)))
+    head = next(node for node in nodes["nodes"] if node["head"])
+    return f"http://{head['management_ip']}:{serving_port(cluster)}"
+
+
+# A planned script's head URL: an arm may serve on another port than production (docs/lab.md),
+# and its configuration may only arrive with the run's sync, so the URL is resolved when the
+# step runs, from the step's "url_config".
+HEAD_URL = "{head_url}"
+
+
+def step_argv(step: dict) -> list[str]:
+    if HEAD_URL not in step["argv"]:
+        return step["argv"]
+    try:
+        url = head_url(step.get("url_config"))
+    except SystemExit as error:  # a failed step, so the window still closes
+        raise RuntimeError(f"no head URL for {step.get('url_config')}: {error}") from None
+    return [url if arg == HEAD_URL else arg for arg in step["argv"]]
 
 
 # ---------------------------------------------------------------- hold file and guards
@@ -1077,7 +1110,7 @@ def measure_steps(spec: dict, job: dict) -> list[dict]:
             # "{label}" and "{run}" in an argument become the arm's label and the run's name.
             extra = [str(a).replace("{label}", label).replace("{run}", run) for a in extra]
             step = {"kind": "script", "label": label, "telemetry": job.get("telemetry", True),
-                    "argv": [arm_config_path(experiment, script), head_url(), *extra],
+                    "argv": [arm_config_path(experiment, script), HEAD_URL, *extra], "url_config": config,
                     "out": f"{out}/{stem}-{label}.jsonl"}
             if stem in contracts:
                 step["evidence"] = contracts[stem]
@@ -1205,7 +1238,7 @@ def validate_steps(spec: dict, job: dict) -> list[dict]:
     tier = TIERS[job.get("tier", "full")]
     config = arm_config_path(experiment, job["config"])
     out = f"results/private/determinism/{job['name']}"
-    url = head_url()
+    url = HEAD_URL
     chunk = str(job.get("chunk", 4000))
     steps = [{"kind": "boot", "config": config, "label": job["name"]},
              {"kind": "fresh_inventory", "config": config},
@@ -1230,6 +1263,9 @@ def validate_steps(spec: dict, job: dict) -> list[dict]:
         steps.append({"kind": "script", "argv": restart, "out": f"{out}/scenario-runs-bootB.jsonl"})
     steps.append(stop_step(job))
     steps.append({"kind": "analyze", "out": out, "dirs": dirs, "config": config})
+    for step in steps:
+        if HEAD_URL in step.get("argv", []):
+            step["url_config"] = config
     return steps
 
 
@@ -1261,7 +1297,7 @@ def profile_steps(spec: dict, job: dict) -> list[dict]:
             script, defaults = PROFILE_WORKLOADS[workload]
             extra = job.get("workload_args", {}).get(workload, defaults)
             steps.append({"kind": "profile", "config": config, "label": arm["label"], "workload": workload,
-                          "argv": [f"{experiment}/{script}", head_url(), *extra],
+                          "argv": [f"{experiment}/{script}", HEAD_URL, *extra], "url_config": config,
                           "out": f"{out}/{arm['label']}"})
     steps.append(stop_step(job))
     steps.append({"kind": "costs", "experiment": experiment, "out": out, "workloads": workloads,
@@ -1603,7 +1639,7 @@ def run_script(step: dict) -> int:
     if declared and evidence_out.exists():
         raise FileExistsError(f"prior evidence exists: {evidence_out}")
     with out.open("x" if declared else "w") as handle:
-        code = subprocess.run([sys.executable, *step["argv"]], cwd=ROOT, stdout=handle,
+        code = subprocess.run([sys.executable, *step_argv(step)], cwd=ROOT, stdout=handle,
                               stderr=subprocess.STDOUT).returncode
     if not declared:
         return code
@@ -1690,7 +1726,7 @@ def profile_workload(step: dict) -> None:
     each(lambda node: in_container(node, f"mkdir -p {container_dir} && rm -rf {container_dir}/*.json.gz "
                                          f"{container_dir}/{workload}"))
     with (out / f"{workload}.json").open("w") as handle:
-        code = subprocess.run([sys.executable, *step["argv"]], cwd=ROOT, stdout=handle,
+        code = subprocess.run([sys.executable, *step_argv(step)], cwd=ROOT, stdout=handle,
                               stderr=subprocess.STDOUT).returncode
     log(f"profile {step['label']} {workload} exit {code}")
     if code:

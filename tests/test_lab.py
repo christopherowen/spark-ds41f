@@ -10,10 +10,12 @@ import importlib.machinery
 import importlib.util
 import json
 import math
+import os
 import statistics
 import subprocess
 import sys
 import tempfile
+import threading
 import time
 import unittest
 from pathlib import Path
@@ -179,6 +181,81 @@ class PlanTest(unittest.TestCase):
             (bundle / "candidate.json").write_text(json.dumps({"sync": []}))
             lab.run_kernel_bundles(step)
         self.assertIs(seen.get("fan_control"), False)
+
+
+class HeadUrlTest(unittest.TestCase):
+    NODES = {"nodes": [{"name": "dgx2", "head": False, "management_ip": "10.0.0.2"},
+                       {"name": "dgx1", "head": True, "management_ip": "10.0.0.1"}]}
+    PRODUCTION = {"serve_args": ["/models", "--host", "0.0.0.0", "--port", "8888", "--dtype", "bfloat16"]}
+    ARM = {"serve_args": ["/models", "--port", "8001"]}
+
+    @contextlib.contextmanager
+    def configurations(self, arm_error: str | None = None):
+        def configuration(args):
+            if arm_error:
+                raise SystemExit(arm_error)
+            return self.ARM, self.NODES, {}
+        with mock.patch.object(lab, "production_configuration", return_value=(self.PRODUCTION, self.NODES, {})), \
+                mock.patch.object(lab.spark, "configuration", side_effect=configuration):
+            yield
+
+    def test_production_and_an_arm_each_get_their_own_port(self) -> None:
+        with self.configurations():
+            self.assertEqual(lab.head_url(), "http://10.0.0.1:8888")
+            self.assertEqual(lab.head_url("experiments/x/ref.json"), "http://10.0.0.1:8001")
+
+    def test_port_forms_and_the_vllm_default(self) -> None:
+        for args, port in ((["--port=8002"], "8002"), (["--port", "8000", "--port", "8003"], "8003"),
+                           (["--port", 8004], "8004"), (["--host", "0.0.0.0"], "8000"), (["--port"], "8000")):
+            self.assertEqual(lab.serving_port({"serve_args": args}), port, args)
+        self.assertEqual(lab.serving_port({}), "8000")
+
+    def test_planned_scripts_resolve_the_arm_url_when_they_run(self) -> None:
+        spec = {"experiment": "experiments/x", "run": "r", "jobs": [{"kind": "measure", "bench": False,
+                "arms": [{"config": "ref.json", "label": "ref"}], "extras": [["probe.py", [], "probe"]]}]}
+        # Planning reads no arm configuration: the arm may arrive with the run's sync.
+        with mock.patch.object(lab.spark, "configuration", side_effect=AssertionError("resolved at plan time")):
+            script = next(s for s in lab.plan(spec) if s["kind"] == "script")
+        self.assertEqual(script["argv"][1], lab.HEAD_URL)
+        self.assertEqual(script["url_config"], "experiments/x/ref.json")
+        with self.configurations():
+            self.assertEqual(lab.step_argv(script), ["experiments/x/probe.py", "http://10.0.0.1:8001"])
+
+    def test_an_unresolvable_url_fails_the_step_instead_of_exiting(self) -> None:
+        step = {"kind": "script", "argv": ["p.py", lab.HEAD_URL], "url_config": "experiments/x/bad.json"}
+        with self.configurations("invalid JSON in experiments/x/bad.json"), \
+                self.assertRaisesRegex(RuntimeError, "no head URL for experiments/x/bad.json"):
+            lab.step_argv(step)
+        self.assertEqual(lab.step_argv({"argv": ["t.py", "a"]}), ["t.py", "a"])
+
+
+class AtomicJsonTest(unittest.TestCase):
+    def test_two_writers_meeting_at_the_rename_both_succeed(self) -> None:
+        # Both writers finish their temporary before either renames, the interleaving that made
+        # a shared temporary lose one write and fail the other's os.replace.
+        real_replace, barrier, errors = os.replace, threading.Barrier(2, timeout=10), []
+
+        def replace(source, destination):
+            barrier.wait()
+            return real_replace(source, destination)
+
+        with tempfile.TemporaryDirectory() as directory, mock.patch.object(lab.os, "replace", replace):
+            path = Path(directory) / "spark-hold.json"
+
+            def writer(n: int) -> None:
+                try:
+                    lab.write_json_atomic(path, {"writer": n})
+                except BaseException as error:  # noqa: BLE001 - collected for the assertion
+                    errors.append(error)
+
+            threads = [threading.Thread(target=writer, args=(n,)) for n in range(2)]
+            for thread in threads:
+                thread.start()
+            for thread in threads:
+                thread.join()
+            self.assertEqual(errors, [])
+            self.assertIn(json.loads(path.read_text(encoding="utf-8"))["writer"], (0, 1))
+            self.assertEqual([p.name for p in Path(directory).iterdir()], ["spark-hold.json"])
 
 
 class BootTimeTest(unittest.TestCase):

@@ -325,5 +325,25 @@ class TopologyTest(unittest.TestCase):
         self.assertEqual(env["VLLM_HOST_IP"], "192.168.100.2")
 
 
+    def test_two_node_switched_and_direct_topologies_are_valid(self):
+        switched = spark.read_cluster("config/cluster.json", "tp3-switched")
+        two_switched = spark.read_json("config/examples/nodes-switched.json")
+        two_switched["nodes"] = [copy.deepcopy(n) for n in two_switched["nodes"][:2]]
+        switched["distributed"]["master_addr"] = two_switched["nodes"][0]["management_ip"]
+        two_switched_cand = topology.candidate(switched, two_switched, "config/nodes.json")
+        self.assertEqual(topology.problems(two_switched_cand, two_switched), [])
+
+        two_direct = copy.deepcopy(self.four)
+        two_direct["nodes"] = [copy.deepcopy(n) for n in two_direct["nodes"][:2]]
+        for n in two_direct["nodes"]:
+            other = "1" if n["rank"] == 0 else "0"
+            kept_hcas = list(n["roce_peer_hcas"][other])
+            n["roce_peer_hcas"] = {other: kept_hcas}
+            n["roce_subnets"] = {h: n["roce_subnets"][h] for h in kept_hcas}
+        direct_base = copy.deepcopy(self.base)
+        direct_base["distributed"]["master_addr"] = two_direct["nodes"][0]["management_ip"]
+        two_direct_cand = topology.candidate(direct_base, two_direct, "config/nodes.json")
+        self.assertEqual(topology.problems(two_direct_cand, two_direct), [])
+
 if __name__ == "__main__":
     unittest.main()

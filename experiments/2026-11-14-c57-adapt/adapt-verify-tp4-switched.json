@@ -1,0 +1,60 @@
+{
+  "experiment": "experiments/2026-11-14-c57-adapt",
+  "run": "c57-adapt-verify-tp4-switched",
+  "jobs": [
+    {
+      "kind": "sync"
+    },
+    {
+      "kind": "measure",
+      "bench": false,
+      "bracket": false,
+      "arms": [
+        {
+          "config": "tp4-switched-c57-adapt-dev.json",
+          "label": "adapt-on"
+        },
+        {
+          "config": "tp4-switched-c57-adapt-dev.json",
+          "label": "adapt-on-again"
+        }
+      ],
+      "extras": [
+        [
+          "experiments/2026-11-14-c56-host-and-adapt/online_adaptation_workload.py",
+          [
+            "--turn-tokens",
+            "384",
+            "--heldout-tokens",
+            "256"
+          ],
+          "workload"
+        ],
+        [
+          "experiments/2026-11-10-tp4-ring-determinism/token_determinism_record.py",
+          [
+            "--tokens",
+            "192",
+            "--long-lines",
+            "700",
+            "--wide",
+            "--record",
+            "results/private/determinism/{run}/record-determinism-{label}.json"
+          ],
+          "determinism"
+        ],
+        [
+          "experiments/2026-11-14-c56-host-and-adapt/collect_adaptation_digests.py",
+          [
+            "--nodes",
+            "localhost",
+            "sp2",
+            "sp3",
+            "sp4"
+          ],
+          "digests"
+        ]
+      ]
+    }
+  ]
+}

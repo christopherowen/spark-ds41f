@@ -1,0 +1,2340 @@
+From 3b8719cf1854e74df2e1a15be418faea66f7e140 Mon Sep 17 00:00:00 2001
+From: Christopher Owen <3221756+christopherowen@users.noreply.github.com>
+Date: Mon, 16 Nov 2026 15:00:06 +0100
+Subject: [PATCH] perf(dsv41): harden SP prefill stream lifetimes, fused
+ attention, and L2 prefetch defaults
+
+Upstream base: local-inference-lab/vllm 19f2c20ed4d64ae22bd009ceacadd85e2a81e354
+with candidate-55's series applied through 0810.
+
+Rationale: Hardens async side-stream record_stream and exception-safe wait_stream
+fencing in sp_prefill.py, optimizes DeepSeek V4.1 attention, compressor, and
+model-state prefill/decode execution (gated mxfp8 async gather and shape-agnostic
+15/12/12 MB L2 prefetch defaults in l2_prefetch.py, preserving explicit config
+overrides).
+
+Quality implications: None; outputs and determinism match baseline across all
+cluster shapes.
+
+Tests: pytest -q -p deepseek_models tests/models/test_deepseek_v4_1_engram.py
+tests/kernels/attention/test_deepseek_v41_tilelang.py.
+
+Upstream status: local candidate-60 patch
+---
+ vllm/models/deepseek_v41/__init__.py          |  33 +-
+ vllm/models/deepseek_v41/nvidia/vl_model.py   |  19 +-
+ vllm/models/deepseek_v4_1/attention.py        | 480 +++++++++++++-----
+ vllm/models/deepseek_v4_1/ced.py              |   2 +
+ vllm/models/deepseek_v4_1/compressor.py       | 105 +++-
+ vllm/models/deepseek_v4_1/kernels.py          |  19 +-
+ vllm/models/deepseek_v4_1/l2_prefetch.py      |   6 +-
+ vllm/models/deepseek_v4_1/nvidia/dspark.py    |  49 +-
+ vllm/models/deepseek_v4_1/nvidia/model.py     | 115 ++++-
+ .../deepseek_v4_1/nvidia/model_state.py       | 325 ++++++++++--
+ vllm/models/deepseek_v4_1/nvidia/vl_model.py  |  29 +-
+ vllm/models/deepseek_v4_1/sp_prefill.py       | 393 ++++++++++----
+ 12 files changed, 1246 insertions(+), 329 deletions(-)
+
+diff --git a/vllm/models/deepseek_v41/__init__.py b/vllm/models/deepseek_v41/__init__.py
+index 6ee5612399..c92e9a1c47 100644
+--- a/vllm/models/deepseek_v41/__init__.py
++++ b/vllm/models/deepseek_v41/__init__.py
+@@ -11,23 +11,30 @@ def __getattr__(name):
+     if name not in ("DeepseekV41ForCausalLM", "DSparkDeepseekV4ForCausalLM"):
+         raise AttributeError(name)
+     if current_platform.is_rocm():
++        if name == "DeepseekV41ForCausalLM":
++            from .amd.vl_model import DeepseekV41ForCausalLM
++
++            return DeepseekV41ForCausalLM
+         from .amd.dspark import DSparkDeepseekV4ForCausalLM
+-        from .amd.vl_model import DeepseekV41ForCausalLM
+-    elif current_platform.is_cuda() and current_platform.is_device_capability_family(
++
++        return DSparkDeepseekV4ForCausalLM
++    if current_platform.is_cuda() and current_platform.is_device_capability_family(
+         120
+     ):
+-        from vllm.models.deepseek_v4_1 import (
+-            DeepseekV41ForCausalLM,
+-            DSparkDeepseekV4ForCausalLM,
+-        )
+-    else:
+-        from .nvidia.dspark import DSparkDeepseekV4ForCausalLM
++        if name == "DeepseekV41ForCausalLM":
++            from vllm.models.deepseek_v4_1 import DeepseekV41ForCausalLM
++
++            return DeepseekV41ForCausalLM
++        from vllm.models.deepseek_v4_1 import DSparkDeepseekV4ForCausalLM
++
++        return DSparkDeepseekV4ForCausalLM
++    if name == "DeepseekV41ForCausalLM":
+         from .nvidia.vl_model import DeepseekV41ForCausalLM
+-    return (
+-        DeepseekV41ForCausalLM
+-        if name == "DeepseekV41ForCausalLM"
+-        else DSparkDeepseekV4ForCausalLM
+-    )
++
++        return DeepseekV41ForCausalLM
++    from .nvidia.dspark import DSparkDeepseekV4ForCausalLM
++
++    return DSparkDeepseekV4ForCausalLM
+ 
+ 
+ __all__ = [
+diff --git a/vllm/models/deepseek_v41/nvidia/vl_model.py b/vllm/models/deepseek_v41/nvidia/vl_model.py
+index bfbcaa89a1..da235d264b 100644
+--- a/vllm/models/deepseek_v41/nvidia/vl_model.py
++++ b/vllm/models/deepseek_v41/nvidia/vl_model.py
+@@ -53,11 +53,16 @@ from ..common.mm_preprocess import (
+     DeepseekV4VLMultiModalProcessor,
+     DeepseekV4VLProcessingInfo,
+ )
+-from .model import (
+-    DeepseekV41LLMForCausalLM,
+-    _linear_scale_param_name,
+-    _make_deepseek_v4_weights_mapper,
+-)
++def __getattr__(name: str):
++    if name in (
++        "DeepseekV41LLMForCausalLM",
++        "_linear_scale_param_name",
++        "_make_deepseek_v4_weights_mapper",
++    ):
++        from . import model as _model
++
++        return getattr(_model, name)
++    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
+ 
+ 
+ class DeepseekV4VLImagePixelInputs(TensorSchema):
+@@ -85,6 +90,8 @@ def _make_deepseek_v4_vl_weights_mapper(
+     expert_dtype: str, linear_scale_name: str
+ ) -> WeightsMapper:
+     """Text-checkpoint mapping rules re-rooted under ``language_model.``."""
++    from .model import _make_deepseek_v4_weights_mapper
++
+     base = _make_deepseek_v4_weights_mapper(expert_dtype, linear_scale_name)
+     orig_to_new_prefix: dict[str, str | None] = {
+         "layers.": "language_model.model.layers.",
+@@ -161,6 +168,8 @@ class DeepseekV41ForCausalLM(nn.Module, SupportsMultiModal, SupportsPP, Supports
+             self.vision.to(dtype=model_config.dtype)
+             self.aligner.to(dtype=model_config.dtype)
+ 
++        from .model import DeepseekV41LLMForCausalLM, _linear_scale_param_name
++
+         with self._mark_language_model(vllm_config):
+             self.language_model = DeepseekV41LLMForCausalLM(
+                 vllm_config=vllm_config,
+diff --git a/vllm/models/deepseek_v4_1/attention.py b/vllm/models/deepseek_v4_1/attention.py
+index 36879f1b4d..1245aafbbb 100644
+--- a/vllm/models/deepseek_v4_1/attention.py
++++ b/vllm/models/deepseek_v4_1/attention.py
+@@ -872,9 +872,10 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase):
+                     ratio=self.compress_ratio,
+                 )
+             )
+-        else:
++        if self.compressor is None or getattr(self.compressor, "_sp_enabled", False):
+             # _sp_front: prefill SP's local q MXFP8 cast + SWA record front and the
+-            # gathered SWA record writer.
++            # gathered SWA record writer (a compressor layer's too when its
++            # compressor projects local rows).
+             calls.append(sp_front_call(self.q_norm.variance_epsilon))
+             calls.append(
+                 swa_records_call(self.swa_cache_layer.block_size, SLOT_DTYPE)
+@@ -1006,7 +1007,7 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase):
+             raise RuntimeError("V4.1 global KV source requires an indexer")
+         if sp_rows is not None and (
+             type(self.compressor) is not DeepseekCompressor
+-            or self.compressor.compress_ratio != 1
++            or self.compressor.compress_ratio not in (1, 2)
+         ):
+             hidden_states = sp_rows.gather(hidden_states)
+             sp_rows = None
+@@ -1281,63 +1282,138 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase):
+             else None
+         )
+         index_weights = None
+-        if self.indexer is not None:
+-            index_weights = self.indexer.weights_proj(hidden_states)
+-            if _INDEX_SPLIT_CHECK or (swa is not None and swa.is_decode):
+-                index_weights = sp_rows.gather(index_weights)
+-            else:
+-                index_weights = index_weights[: sp_rows.real_rows]
+         swa_cache = getattr(self.swa_cache_layer, "kv_cache", None)
+-        if not is_breakable_cudagraph_enabled() and swa is not None:
+-            if (
+-                swa_cache is not None
+-                and swa_cache.numel() > 0
+-                and getattr(swa, "slot_mapping", None) is not None
+-            ):
+-                from vllm.models.deepseek_v4_1.tilelang.cache_writer import (
+-                    RECORD_BYTES,
+-                    write_swa_records,
+-                )
+-                from vllm.models.deepseek_v4_1.tilelang.front import (
+-                    sp_attention_front,
++        if (
++            not is_breakable_cudagraph_enabled()
++            and swa is not None
++            and swa_cache is not None
++            and swa_cache.numel() > 0
++            and getattr(swa, "slot_mapping", None) is not None
++        ):
++            from vllm.models.deepseek_v4_1.tilelang.cache_writer import (
++                RECORD_BYTES,
++                write_swa_records,
++            )
++            from vllm.models.deepseek_v4_1.tilelang.front import (
++                sp_attention_front,
++            )
++            from vllm.models.deepseek_v4_1.tilelang.linear import empty_mxfp8
++
++            local_rows = sp_rows.local_rows
++            real = sp_rows.real_rows
++            local_qr = torch.empty(
++                (local_rows, self.q_lora_rank),
++                dtype=qr_kv.dtype,
++                device=qr_kv.device,
++            )
++            local_q_cast = empty_mxfp8(local_qr)
++            local_records = torch.empty(
++                (local_rows, RECORD_BYTES["swa"]),
++                dtype=torch.uint8,
++                device=qr_kv.device,
++            )
++            can_async = hasattr(
++                sp_rows, "can_gather_mxfp8_async"
++            ) and sp_rows.can_gather_mxfp8_async(qr_kv.device)
++            overlap_index = (
++                can_async
++                and self.indexer is not None
++                and not _INDEX_SPLIT_CHECK
++                and not swa.is_decode
++            )
++            comp_sp = (
++                can_async
++                and self.compressor is not None
++                and type(self.compressor) is DeepseekCompressor
++                and getattr(self.compressor, "_sp_kernel", None) is not None
++                and self.compressor.compress_ratio in (1, 2)
++            )
++            comp_locals: tuple[torch.Tensor, ...] = ()
++            comp_gathered: tuple[torch.Tensor, ...] = ()
++            wait_comp = None
++            if comp_sp:
++                self.compressor._prefetched_sp_gathered = None
++                comp_locals = self.compressor.project_sp_local(
++                    hidden_states, sp_rows
+                 )
+-                from vllm.models.deepseek_v4_1.tilelang.linear import empty_mxfp8
+-
+-                local_rows = sp_rows.local_rows
+-                real = sp_rows.real_rows
+-                local_qr = torch.empty(
+-                    (local_rows, self.q_lora_rank),
+-                    dtype=qr_kv.dtype,
+-                    device=qr_kv.device,
++                if overlap_index and comp_locals:
++                    comp_gathered, wait_comp = sp_rows.gather_many_async(*comp_locals)
++            if not overlap_index and self.indexer is not None:
++                index_weights = self.indexer.weights_proj(hidden_states)
++                if _INDEX_SPLIT_CHECK or swa.is_decode:
++                    index_weights = sp_rows.gather(index_weights)
++                else:
++                    index_weights = index_weights[:real]
++            if real > 0:
++                sp_attention_front(
++                    qr_kv[:real],
++                    self.q_norm.weight,
++                    self.kv_norm.weight,
++                    self.q_norm.variance_epsilon,
++                    positions[sp_rows.start : sp_rows.start + real],
++                    self.rotary_emb.cos_sin_cache,
++                    local_q_cast.values[:real],
++                    local_q_cast.scales[:real],
++                    local_records[:real],
+                 )
+-                local_q_cast = empty_mxfp8(local_qr)
+-                local_records = torch.empty(
+-                    (local_rows, RECORD_BYTES["swa"]),
+-                    dtype=torch.uint8,
+-                    device=qr_kv.device,
++            pre_index_query = None
++            finish_front = None
++            if overlap_index:
++                (q_cast, swa_records), wait_front = sp_rows.gather_mxfp8_async(
++                    local_q_cast, local_records
+                 )
++                index_weights = self.indexer.weights_proj(hidden_states)[:real]
+                 if real > 0:
+-                    sp_attention_front(
+-                        qr_kv[:real],
+-                        self.q_norm.weight,
+-                        self.kv_norm.weight,
+-                        self.q_norm.variance_epsilon,
+-                        positions[sp_rows.start : sp_rows.start + real],
+-                        self.rotary_emb.cos_sin_cache,
+-                        local_q_cast.values[:real],
+-                        local_q_cast.scales[:real],
+-                        local_records[:real],
++                    local_pos = positions[sp_rows.start : sp_rows.start + real]
++                    pre_index_query = self._index_query(
++                        local_qr,
++                        local_pos,
++                        hidden_states,
++                        index_weights,
++                        0,
++                        real,
++                        swa,
++                        local_q_cast,
+                     )
+-                q_cast, swa_records = sp_rows.gather_mxfp8(
+-                    local_q_cast, local_records
++                if wait_comp is not None:
++                    wait_comp()
++
++                def finish_front() -> None:
++                    wait_front()
++                    write_swa_records(
++                        swa_records,
++                        swa_cache,
++                        swa.slot_mapping[: sp_rows.num_tokens],
++                        page_size=self.swa_cache_layer.block_size,
++                    )
++            else:
++                q_cast, swa_records, *comp_gathered_list = sp_rows.gather_mxfp8(
++                    local_q_cast, local_records, *comp_locals
+                 )
++                comp_gathered = tuple(comp_gathered_list)
+                 write_swa_records(
+                     swa_records,
+                     swa_cache,
+                     swa.slot_mapping[: sp_rows.num_tokens],
+                     page_size=self.swa_cache_layer.block_size,
+                 )
+-                return (q_cast.rows, None, q_cast), None, None, None, index_weights
++            if comp_gathered:
++                self.compressor._prefetched_sp_gathered = comp_gathered
++            return (
++                (q_cast.rows, None, q_cast),
++                None,
++                None,
++                None,
++                index_weights,
++                pre_index_query,
++                finish_front,
++            )
++        if self.indexer is not None:
++            index_weights = self.indexer.weights_proj(hidden_states)
++            if _INDEX_SPLIT_CHECK or (swa is not None and swa.is_decode):
++                index_weights = sp_rows.gather(index_weights)
++            else:
++                index_weights = index_weights[: sp_rows.real_rows]
+         qr, kv = qr_kv.split((self.q_lora_rank, 512), dim=-1)
+         qr, kv = self.q_norm(qr), self.kv_norm(kv)
+         if self.n_local_heads > 0 or self.indexer is not None:
+@@ -1347,7 +1423,7 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase):
+         else:
+             qr, kv = sp_rows.gather_many(qr, kv)
+             q_cast = None
+-        return None, qr, kv, q_cast, index_weights
++        return None, qr, kv, q_cast, index_weights, None, None
+ 
+     def _front(self, qr_kv, positions, sp_rows=None):
+         """The front after the fused projection in one launch (``tilelang.front``):
+@@ -1392,20 +1468,40 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase):
+             raise RuntimeError("V4.1 attention metadata is not prepared")
+         sp_rows = sp_prefill.current()
+         index_weights = None
++        pre_index_query = None
++        finish_front = None
+         front = None
+         q_cast = None
+-        if sp_rows is not None and self.compressor is None:
++        local_hidden = None
++        if sp_rows is not None and (
++            self.compressor is None
++            or (
++                type(self.compressor) is DeepseekCompressor
++                and getattr(self.compressor, "_sp_kernel", None) is not None
++            )
++        ):
++            if self.compressor is not None:
++                # The compressor projects this rank's rows itself and gathers its
++                # values (and gates at ratio two): _prepare_global_kv below.
++                local_hidden = hidden_states
+             if getattr(self.fused_wqa_wkv, "tp_size", 1) == 1 or getattr(
+                 self.fused_wqa_wkv, "replicated_sp_prefill", False
+             ):
+-                # Sequence-parallel prefill without a compressor when fused_wqa_wkv
+-                # is replicated: the row-wise front (projection, q norm + MXFP8 cast,
+-                # kv norm + RoPE + SWA record packing, local index weights) runs on
+-                # this rank's rows; only the MXFP8 q cast and SWA records are gathered.
++                # Sequence-parallel prefill without a compressor, or with one that
++                # projects local rows, when fused_wqa_wkv is replicated: the row-wise
++                # front (projection, q norm + MXFP8 cast, kv norm + RoPE + SWA record
++                # packing, local index weights) runs on this rank's rows; only the
++                # MXFP8 q cast and SWA records are gathered.
+                 qr_kv, _ = self.fused_wqa_wkv(hidden_states)
+-                front, qr, kv, q_cast, index_weights = self._sp_front(
+-                    sp_rows, hidden_states, qr_kv, positions
+-                )
++                (
++                    front,
++                    qr,
++                    kv,
++                    q_cast,
++                    index_weights,
++                    pre_index_query,
++                    finish_front,
++                ) = self._sp_front(sp_rows, hidden_states, qr_kv, positions)
+                 del qr_kv
+                 hidden_states = None
+                 rows = sp_rows.num_tokens
+@@ -1467,33 +1563,56 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase):
+             qr, kv, q_cast = front
+             front = None
+             front_wrote_kv = True
+-        if self.n_local_heads > 0:
+-            with kernels.mxfp8_inputs(q_cast):
+-                q = self.wq_b(qr).view(rows, self.n_local_heads, 512)
+-        else:
+-            q = torch.empty((rows, 0, 512), dtype=qr.dtype, device=qr.device)
+-        if self.indexer is None:
+-            del q_cast
+-        self._issue_wo_prefetch(rows, after="q-b")
+         metadata = cast(
+             dict[str, DeepseekV41Metadata] | None,
+             get_forward_context().attn_metadata,
+         )
+-        if not isinstance(metadata, dict):
++        original_swa = (
++            metadata[self.swa_cache_layer.prefix]
++            if isinstance(metadata, dict)
++            else None
++        )
++        swa = self._query_metadata(original_swa) if original_swa is not None else None
++        overlap_decode = (
++            self._can_overlap_decode(swa, sp_rows, front_wrote_kv, rows)
++            if swa is not None
++            else False
++        )
++        defer_q = (
++            swa is not None
++            and not overlap_decode
++            and self.n_local_heads > 0
++            and self.indexer is not None
++            and sp_rows is not None
++            and pre_index_query is not None
++            and not _INDEX_SPLIT_CHECK
++            and not swa.is_decode
++            and min(getattr(swa, "num_decode_tokens", 0), rows) == 0
++        )
++        if not defer_q and finish_front is not None:
++            finish_front()
++            finish_front = None
++        if defer_q:
++            q = None
++        elif self.n_local_heads > 0:
++            with kernels.mxfp8_inputs(q_cast):
++                q = self.wq_b(qr).view(rows, self.n_local_heads, 512)
++        else:
++            q = torch.empty((rows, 0, 512), dtype=qr.dtype, device=qr.device)
++        if not defer_q:
++            if self.indexer is None:
++                del q_cast
++            self._issue_wo_prefetch(rows, after="q-b")
++        if swa is None:
+             # Memory profiling has no cache pages; serving does not use this branch.
+             if self.n_local_heads > 0:
+                 q = self._rope(q, positions, "q")
+             q_cast = None
+-            del qr, kv, hidden_states, index_weights, q_cast
++            del qr, kv, hidden_states, local_hidden, index_weights, q_cast
+             output = torch.zeros_like(q)
+             del q
+         else:
+-            original_swa = metadata[self.swa_cache_layer.prefix]
+-            swa = self._query_metadata(original_swa)
+-            overlap_decode = self._can_overlap_decode(
+-                swa, sp_rows, front_wrote_kv, rows
+-            )
+-            if not overlap_decode and self.n_local_heads > 0:
++            if not overlap_decode and not defer_q and self.n_local_heads > 0:
+                 q = self._rope(q, positions, "q")
+             if not front_wrote_kv:  # the front's kernel wrote the record
+                 self._cache_context_kv(kv, positions)
+@@ -1515,8 +1634,18 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase):
+                 self.forward_mqa(q, kv, positions, output, index_query=index_query)
+                 del q, kv, index_query
+             else:
+-                if swa is original_swa and hidden_states is not None:
+-                    self._prepare_global_kv(positions, hidden_states)
++                if swa is original_swa:
++                    if hidden_states is not None:
++                        self._prepare_global_kv(positions, hidden_states)
++                    elif local_hidden is not None:
++                        self._prepare_global_kv(
++                            positions, local_hidden, sp_rows=sp_rows
++                        )
++                if self.compressor is not None and hasattr(
++                    self.compressor, "_prefetched_sp_gathered"
++                ):
++                    self.compressor._prefetched_sp_gathered = None
++                del local_hidden
+                 index_query = None
+                 if self.indexer is not None:
+                     # Sequence-parallel prefill: the indexer is replicated, so each
+@@ -1525,36 +1654,60 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase):
+                     split = (
+                         sp_rows if sp_rows is not None and not swa.is_decode else None
+                     )
+-                    first = split.start if split is not None else 0
+-                    last = first + split.real_rows if split is not None else rows
+-                    query = self._index_query(
+-                        qr,
+-                        positions,
+-                        hidden_states,
+-                        index_weights,
+-                        first,
+-                        last,
+-                        swa,
+-                        q_cast,
+-                    )
+-                    reference = None
+-                    if split is not None and _INDEX_SPLIT_CHECK:
+-                        reference = self._index_query(
++                    if pre_index_query is not None and split is not None and not _INDEX_SPLIT_CHECK:
++                        query = pre_index_query
++                        reference = None
++                    else:
++                        first = split.start if split is not None else 0
++                        last = first + split.real_rows if split is not None else rows
++                        query = self._index_query(
+                             qr,
+                             positions,
+                             hidden_states,
+                             index_weights,
+-                            0,
+-                            rows,
++                            first,
++                            last,
+                             swa,
+                             q_cast,
+                         )
+-                    del q_cast
++                        reference = None
++                        if split is not None and _INDEX_SPLIT_CHECK:
++                            reference = self._index_query(
++                                qr,
++                                positions,
++                                hidden_states,
++                                index_weights,
++                                0,
++                                rows,
++                                swa,
++                                q_cast,
++                            )
++                    if not defer_q:
++                        del q_cast
+                     index_query = (*query, split, reference)
+-                del qr, hidden_states, index_weights
+-                output = torch.empty_like(q)
+-                self.forward_mqa(q, kv, positions, output, index_query=index_query)
+-                del q, kv, index_query
++                if defer_q:
++                    deferred_q = (qr, q_cast)
++                    output = None
++                    del qr, q_cast, hidden_states, index_weights
++                else:
++                    deferred_q = None
++                    del qr, hidden_states, index_weights
++                    output = torch.empty_like(q)
++                if deferred_q is not None:
++                    output = self.forward_mqa(
++                        q,
++                        kv,
++                        positions,
++                        output,
++                        index_query=index_query,
++                        deferred_q=deferred_q,
++                        finish_front=finish_front,
++                    )
++                else:
++                    if finish_front is not None:
++                        finish_front()
++                    self.forward_mqa(q, kv, positions, output, index_query=index_query)
++                del q, kv, index_query, deferred_q
+         return self._o_proj(output, sp_rows=sp_rows)
+ 
+     def _issue_wo_prefetch(self, rows, *, after):
+@@ -1703,13 +1856,31 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase):
+         )
+ 
+     @eager_break_during_capture
+-    def forward_mqa(self, q, kv, positions, output, *, index_query=None):
++    def forward_mqa(
++        self,
++        q,
++        kv,
++        positions,
++        output,
++        *,
++        index_query=None,
++        deferred_q=None,
++        finish_front=None,
++    ):
+         pending_aux = self.__dict__.pop("_pending_decode_aux", None)
+         metadata = get_forward_context().attn_metadata
+         swa = self._query_metadata(metadata[self.swa_cache_layer.prefix])
+         mode = "decode" if swa.is_decode else "extend"
+-        rows = q.shape[0]
++        if output is not None:
++            rows = output.shape[0]
++            device = output.device
++        else:
++            assert deferred_q is not None
++            rows = deferred_q[0].shape[0]
++            device = deferred_q[0].device
+         self._check_attention_rows(mode, rows)
++        gathered_selected = None
++        wait_selected = None
+         # A mixed step's decode requests, its leading rows (the batch is reordered
+         # decode-first), keep the decode plan and the decode index mode: a row's
+         # arithmetic must not depend on whether a prefill shares its step.
+@@ -1811,7 +1982,7 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase):
+                     )
+ 
+                     page_table = None
+-                    cacheable = split is None and index_rows <= chunk_rows
++                    cacheable = index_rows <= chunk_rows
+                     if cacheable:
+                         key = (id(im), row, count, index_width, self._index_page)
+                         shared = get_forward_context().__dict__.setdefault(
+@@ -1891,13 +2062,13 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase):
+             if split is None:
+                 select(query, 0, self.topk_indices_buffer)
+                 if pending_aux is not None:
+-                    torch.cuda.current_stream(q.device).wait_stream(pending_aux)
++                    torch.cuda.current_stream(device).wait_stream(pending_aux)
+                     pending_aux = None
+             else:
+                 real = split.real_rows
+                 local = slice(split.start, split.start + real)
+                 selected = torch.empty(
+-                    (split.local_rows, 512), dtype=torch.int32, device=q.device
++                    (split.local_rows, 512), dtype=torch.int32, device=device
+                 )
+                 owns_candidates = self.layer_id == self.candidate_source_layer
+                 expected = repeat = expected_candidates = None
+@@ -1916,7 +2087,7 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase):
+                         )
+                     # A second full-row run measures the top-k's own spread.
+                     repeat = torch.full(
+-                        (rows, 512), -2, dtype=torch.int32, device=q.device
++                        (rows, 512), -2, dtype=torch.int32, device=device
+                     )
+                     select(reference, 0, repeat)
+                     repeat = repeat[local]
+@@ -1929,11 +2100,25 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase):
+                     self._check_index_split(
+                         split, selected, expected, repeat, expected_candidates
+                     )
+-                self.topk_indices_buffer[:rows].copy_(split.gather(selected))
++                    self.topk_indices_buffer[:rows].copy_(split.gather(selected))
++                elif hasattr(split, "gather_many_async") and getattr(
++                    split, "can_gather_async", lambda *_: False
++                )(device):
++                    (gathered_selected,), wait_selected = split.gather_many_async(
++                        selected
++                    )
++                else:
++                    self.topk_indices_buffer[:rows].copy_(split.gather(selected))
+ 
+         if pending_aux is not None:
+-            torch.cuda.current_stream(q.device).wait_stream(pending_aux)
++            torch.cuda.current_stream(device).wait_stream(pending_aux)
+         if getattr(self, "n_local_heads", 1) == 0:
++            if wait_selected is not None:
++                wait_selected()
++                self.topk_indices_buffer[:rows].copy_(gathered_selected)
++                del gathered_selected
++            if finish_front is not None:
++                finish_front()
+             return
+         main = (
+             self._query_metadata(metadata[self._owner().prefix])
+@@ -1946,10 +2131,40 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase):
+             else self
+         )
+         if decode_rows:
++            if wait_selected is not None:
++                wait_selected()
++                self.topk_indices_buffer[:rows].copy_(gathered_selected)
++                del gathered_selected
++            if finish_front is not None:
++                finish_front()
++                finish_front = None
++            if deferred_q is not None:
++                qr, q_cast = deferred_q
++                deferred_q = None
++                with kernels.mxfp8_inputs(q_cast):
++                    q = self.wq_b(qr).view(rows, self.n_local_heads, 512)
++                del qr, q_cast
++                self._issue_wo_prefetch(rows, after="q-b")
++                q = self._rope(q, positions, "q")
++            if output is None:
++                output = torch.empty_like(q)
+             self._attend_split(
+                 q, output, positions, swa, main, owner, rows, decode_rows
+             )
+-            return
++            return output
++        if finish_front is not None:
++            finish_front()
++            finish_front = None
++        if deferred_q is not None:
++            qr, q_cast = deferred_q
++            deferred_q = None
++            with kernels.mxfp8_inputs(q_cast):
++                q = self.wq_b(qr).view(rows, self.n_local_heads, 512)
++            del qr, q_cast
++            self._issue_wo_prefetch(rows, after="q-b")
++            q = self._rope(q, positions, "q")
++        if output is None:
++            output = torch.empty_like(q)
+         # Reuse the shared arena only after indexing completes. Keep full-batch
+         # metadata beside, not overlapping, the native attention scratch.
+         metadata_specs = self._attention_workspace_specs[mode]
+@@ -1968,7 +2183,7 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase):
+                 )
+             )
+             metadata_buffers = self._shared_decode_metadata(
+-                swa, main, rows, shared_specs, q.device
++                swa, main, rows, shared_specs, device
+             )
+             arena = current_workspace_manager().get_simultaneous(*scratch_specs)
+             scratch = list(arena)
+@@ -1980,6 +2195,10 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase):
+             self._write_decode_metadata(arena, swa, main, rows)
+             metadata_buffers = arena[:metadata_count]
+             scratch = arena[metadata_count:]
++        if wait_selected is not None:
++            wait_selected()
++            self.topk_indices_buffer[:rows].copy_(gathered_selected)
++            del gathered_selected
+         swa_indices, swa_lengths, top_lengths = metadata_buffers[:3]
+         kwargs = {}
+         if main is not None:
+@@ -2000,6 +2219,7 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase):
+             swa_lengths=swa_lengths[:rows],
+             **kwargs,
+         )
++        return output
+ 
+     def _shared_decode_metadata(self, swa, main, rows, specs, device):
+         replay = self._replay_start(swa)
+@@ -2175,24 +2395,50 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase):
+         real_heads = real_groups * heads_per_group
+         q_rows = real_heads * self.head_dim
+         wo_rows = real_groups * self.o_lora_rank
+-        from vllm.models.deepseek_v4_1.tilelang.gemm import unpack_weight_tiles
++        from vllm.models.deepseek_v4_1.tilelang.gemm import (
++            TILE_CONTIGUOUS_FP8,
++            TILE_WEIGHT_K,
++            TILE_WEIGHT_N,
++            pack_scale_words,
++            unpack_weight_tiles,
++        )
+         from vllm.models.deepseek_v4_1.tilelang.linear import _block32_scale_words
+ 
+-        if getattr(self.wq_b, "tilelang_weight_packed", False):
+-            w_q = unpack_weight_tiles(
+-                self.wq_b.tilelang_weight, *self.wq_b.weight.shape
+-            )
+-            self.wq_b.tilelang_weight_packed = False
+-        else:
+-            w_q = self.wq_b.weight
+-        self.wq_b.weight = nn.Parameter(w_q[:q_rows].contiguous(), requires_grad=False)
++        k_q = int(self.wq_b.weight.shape[1])
+         self.wq_b.weight_scale_inv = nn.Parameter(
+             self.wq_b.weight_scale_inv[: q_rows // 32].contiguous(),
+             requires_grad=False,
+         )
+         self.wq_b.output_size_per_partition = q_rows
+-        if hasattr(self.wq_b, "tilelang_weight_sf"):
+-            _block32_scale_words(self.wq_b)
++        if (
++            getattr(self.wq_b, "tilelang_weight_packed", False)
++            and q_rows % TILE_WEIGHT_N == 0
++            and (q_rows, k_q) in TILE_CONTIGUOUS_FP8
++        ):
++            packed_q = self.wq_b.tilelang_weight[
++                : q_rows * (k_q // TILE_WEIGHT_K)
++            ].contiguous()
++            self.wq_b.weight = nn.Parameter(
++                packed_q.view(q_rows, k_q), requires_grad=False
++            )
++            self.wq_b.tilelang_weight = packed_q
++            if hasattr(self.wq_b, "tilelang_weight_sf"):
++                self.wq_b.tilelang_weight_sf = pack_scale_words(
++                    self.wq_b.weight_scale_inv
++                )
++        else:
++            if getattr(self.wq_b, "tilelang_weight_packed", False):
++                w_q = unpack_weight_tiles(
++                    self.wq_b.tilelang_weight, *self.wq_b.weight.shape
++                )
++                self.wq_b.tilelang_weight_packed = False
++            else:
++                w_q = self.wq_b.weight
++            self.wq_b.weight = nn.Parameter(
++                w_q[:q_rows].contiguous(), requires_grad=False
++            )
++            if hasattr(self.wq_b, "tilelang_weight_sf"):
++                _block32_scale_words(self.wq_b)
+ 
+         self.attn_sink = nn.Parameter(
+             self.attn_sink[:real_heads].contiguous(), requires_grad=False
+diff --git a/vllm/models/deepseek_v4_1/ced.py b/vllm/models/deepseek_v4_1/ced.py
+index 05150ac974..e67c55743c 100644
+--- a/vllm/models/deepseek_v4_1/ced.py
++++ b/vllm/models/deepseek_v4_1/ced.py
+@@ -187,6 +187,7 @@ class CEDState:
+         self.limits = torch.empty(max_requests, dtype=torch.int32, device=device)
+         self.floors = torch.empty_like(self.request_positions)
+         self.plan: CEDPlan | None = None
++        self.encoder_only: bool = False
+         pin = self.indices.device.type == "cuda"
+         self._limits_host_ring = tuple(
+             torch.empty(max_requests, dtype=torch.int32, device="cpu", pin_memory=pin)
+@@ -240,6 +241,7 @@ class CEDState:
+         def warm_metadata():
+             self.stage(starts, seq, [count], [False], [0])
+             self.plan = None
++            self.encoder_only = False
+             self.replay_start.zero_()
+ 
+         prepare.declare(
+diff --git a/vllm/models/deepseek_v4_1/compressor.py b/vllm/models/deepseek_v4_1/compressor.py
+index fba362616c..d4014dd835 100644
+--- a/vllm/models/deepseek_v4_1/compressor.py
++++ b/vllm/models/deepseek_v4_1/compressor.py
+@@ -218,7 +218,7 @@ class DeepseekCompressor(nn.Module):
+         hf = getattr(model_cfg, "hf_config", None) if model_cfg is not None else None
+         self._rope_dim = int(getattr(hf, "qk_rope_head_dim", 64))
+         tp_size = linear_layers.get_tensor_model_parallel_world_size()
+-        self._sp_enabled = compress_ratio == 1 and tp_size > 1
++        self._sp_enabled = compress_ratio in (1, 2) and tp_size > 1
+         self._sp_weight = self._sp_kernel = None
+         disable_tp = tp_size <= 1
+         self.fused_wkv_wgate = _PaddedSplitColumnParallelLinear(
+@@ -254,6 +254,7 @@ class DeepseekCompressor(nn.Module):
+         self._gates = self._pending_values = self._pending_gates = None
+         self._pending_tags = self._local_ids = self._row_ids = None
+         self._local_shards = None
++        self._prefetched_sp_gathered = None
+ 
+     def _ensure_capacity_buffers(self, device, t, r) -> None:
+         """Allocate the reusable serving storage for ``t`` tokens and ``r``
+@@ -385,11 +386,20 @@ class DeepseekCompressor(nn.Module):
+     def _sp_projection_call(self):
+         """Use the original TP shard's K reduction for the full row projection."""
+         from vllm.models.deepseek_v4_1.tilelang import prepare
+-        from vllm.models.deepseek_v4_1.tilelang.gemm import bf16_gemm
++        from vllm.models.deepseek_v4_1.tilelang.gemm import bf16_gemm, bf16_gemm_two
+         from vllm.models.deepseek_v4_1.tilelang.linear import _bf16_shape
+ 
+         layer = self.fused_wkv_wgate
+         split = layer.quant_method._split(layer)
++        if self.compress_ratio == 2:
++            return prepare.call(
++                bf16_gemm_two,
++                512,
++                _bf16_shape(layer)[1],
++                out_dtype="float32",
++                shards=split["shards"],
++                blocked=split["blocked"],
++            )
+         return prepare.call(
+             bf16_gemm,
+             512,
+@@ -420,14 +430,33 @@ class DeepseekCompressor(nn.Module):
+                 tl.placeholder(self.requests, device)
+             if sp_call is not None:
+                 # The decode projection retains its original TP weight and kernels.
+-                # SP prefill gathers the ratio-one weight once before memory profiling
+-                # (5 MiB at H=5120) and slices any trailing TP column padding.
++                # SP prefill gathers the weight once before memory profiling (5 MiB
++                # at ratio one, 10 MiB at ratio two, H=5120) and slices each part's
++                # trailing TP column padding.
+                 weight = unpack_bf16_layer(self.fused_wkv_wgate).detach()
+-                self._sp_weight = (
+-                    tensor_model_parallel_all_gather(weight, dim=0)[:512]
+-                    if self.fused_wkv_wgate.tp_size > 1
+-                    else weight
+-                )
++                tp_size = self.fused_wkv_wgate.tp_size
++                if tp_size > 1 and torch.distributed.is_initialized():
++                    from vllm.distributed import get_tp_group
++
++                    # Ranks arrive out of _prepare_kernels at different compilation
++                    # speeds; align on the host CPU group before the 10s RoCE gather.
++                    torch.distributed.barrier(group=get_tp_group().cpu_group)
++                if tp_size <= 1:
++                    self._sp_weight = weight
++                elif self.compress_ratio == 1:
++                    self._sp_weight = tensor_model_parallel_all_gather(weight, dim=0)[
++                        :512
++                    ]
++                else:
++                    part_cols = _compressor_part_cols(tp_size)
++                    gathered = tensor_model_parallel_all_gather(weight, dim=0)
++                    self._sp_weight = (
++                        gathered.view(tp_size, self.compress_ratio, part_cols, -1)
++                        .permute(1, 0, 2, 3)
++                        .reshape(self.compress_ratio, tp_size * part_cols, -1)[:, :512]
++                        .reshape(self.compress_ratio * 512, -1)
++                        .contiguous()
++                    )
+                 self._sp_kernel = prepare.launch(sp_call)
+ 
+         prepare.declare(
+@@ -446,12 +475,14 @@ class DeepseekCompressor(nn.Module):
+         cos_sin=None,
+         kv_page_size=None,
+         values=None,
++        gates=None,
+     ):
+         """The TileLang compression: at ratio 2 the requests' carries from the state
+         ring, then one launch over the step's rows that also saves the ring."""
+         from vllm.models.deepseek_v4_1.tilelang import compress as tl
+ 
+         values = self._values if values is None else values
++        gates = self._gates if gates is None else gates
+         kv_kwargs = {}
+         if kv_cache is not None and token_positions is not None and cos_sin is not None:
+             kv_kwargs = dict(
+@@ -478,7 +509,7 @@ class DeepseekCompressor(nn.Module):
+             self._local_ids, page=page,
+         )  # fmt: skip
+         tl.compress(
+-            rows, 2, self._values, self._gates, self.norm.weight,
++            rows, 2, values, gates, self.norm.weight,
+             metadata.query_start_loc, metadata.request_positions, self._local_ids,
+             metadata.slot_mapping, metadata.live_counts, self._latent, self._emitted,
+             self._slots, pending_values=self._pending_values,
+@@ -486,6 +517,30 @@ class DeepseekCompressor(nn.Module):
+             state_slots=state_metadata.slot_mapping, page=page, **kv_kwargs,
+         )  # fmt: skip
+ 
++    def project_sp_local(
++        self, hidden_states: torch.Tensor, sp_rows
++    ) -> tuple[torch.Tensor, ...]:
++        """Run only this rank's SP compressor projection so its outputs can share
++        an earlier all-gather collective before ``forward`` runs."""
++        if self._values is None:
++            raise RuntimeError("compressor kernels must be bound before forwarding")
++        if self.compress_ratio not in (1, 2) or self._sp_kernel is None:
++            raise RuntimeError(
++                "ratio-one/two SP projection must be bound before forwarding"
++            )
++        rows = hidden_states.shape[0]
++        if rows != sp_rows.local_rows:
++            raise ValueError("SP compressor input does not match local rows")
++        local = self._values[:rows]
++        # Always use the prefill GEMM, even for a short local slice: it keeps
++        # the global prefill's K reduction and needs no decode workspace.
++        if self.compress_ratio == 1:
++            self._sp_kernel(hidden_states, self._sp_weight, local)
++            return (local,)
++        local_gates = self._gates[:rows]
++        self._sp_kernel(hidden_states, self._sp_weight, local, local_gates)
++        return (local, local_gates)
++
+     def forward(
+         self,
+         hidden_states,
+@@ -501,22 +556,26 @@ class DeepseekCompressor(nn.Module):
+         rows = hidden_states.shape[0]
+         if self._values is None:
+             raise RuntimeError("compressor kernels must be bound before forwarding")
+-        values = None
+         if sp_rows is not None:
+-            if self.compress_ratio != 1 or self._sp_kernel is None:
+-                raise RuntimeError(
+-                    "ratio-one SP projection must be bound before forwarding"
+-                )
+-            if rows != sp_rows.local_rows:
+-                raise ValueError("SP compressor input does not match local rows")
+-            local = self._values[:rows]
+-            # Always use the prefill GEMM, even for a short local slice: it keeps
+-            # the global prefill's K reduction and needs no decode workspace.
+-            self._sp_kernel(hidden_states, self._sp_weight, local)
+-            values = sp_rows.gather(local)
++            prefetched = getattr(self, "_prefetched_sp_gathered", None)
++            if prefetched is not None:
++                self._prefetched_sp_gathered = None
++            else:
++                local_outs = self.project_sp_local(hidden_states, sp_rows)
++                if len(local_outs) == 1 and not hasattr(sp_rows, "gather_many"):
++                    prefetched = (sp_rows.gather(local_outs[0]),)
++                else:
++                    prefetched = sp_rows.gather_many(*local_outs)
++            if self.compress_ratio == 1:
++                (values,) = prefetched
++                fg_kwargs = {"values": values}
++            else:
++                values, gates = prefetched
++                fg_kwargs = {"values": values, "gates": gates}
+             rows = sp_rows.num_tokens
+         else:
+             self._project(hidden_states)
++            fg_kwargs = {"values": None}
+         self._forward_tilelang(
+             rows,
+             metadata,
+@@ -525,6 +584,6 @@ class DeepseekCompressor(nn.Module):
+             token_positions=token_positions,
+             cos_sin=cos_sin,
+             kv_page_size=kv_page_size,
+-            values=values,
++            **fg_kwargs,
+         )
+         return self._latent[:rows], self._slots[:rows]
+diff --git a/vllm/models/deepseek_v4_1/kernels.py b/vllm/models/deepseek_v4_1/kernels.py
+index 0b920e0a67..827ca82dd4 100644
+--- a/vllm/models/deepseek_v4_1/kernels.py
++++ b/vllm/models/deepseek_v4_1/kernels.py
+@@ -127,14 +127,27 @@ def sp_moe_inputs(
+     if not callable(route_local):
+         raise ValueError("DS4.1 SP MoE requires a router with route_local")
+ 
++    from . import sp_prefill
+     from .tilelang.linear import provide_mxfp8
+     from .tilelang.router import provide_routes
+ 
+-    weights, ids = route_local(x, sp_rows, input_ids=input_ids)
+-    gathered_q, weights, ids = sp_rows.gather_mxfp8(x_q, weights, ids)
++    can_async = hasattr(
++        sp_rows, "can_gather_mxfp8_async"
++    ) and sp_rows.can_gather_mxfp8_async(x_q.rows.device)
++    if can_async:
++        (gathered_q,), wait_xq = sp_rows.gather_mxfp8_async(x_q)
++        weights, ids = route_local(x, sp_rows, input_ids=input_ids)
++        # Enqueue route gather before waiting for x_q so all_gather(weights, ids)
++        # runs on _side_stream while shared_experts runs on the compute stream.
++        (weights, ids), wait_routes = sp_rows.gather_many_async(weights, ids)
++        wait_xq()
++    else:
++        weights, ids = route_local(x, sp_rows, input_ids=input_ids)
++        gathered_q, weights, ids = sp_rows.gather_mxfp8(x_q, weights, ids)
++        wait_routes = None
+     with (
+         provide_mxfp8(gathered_q),
+-        provide_routes(gathered_q.rows, weights, ids),
++        provide_routes(gathered_q.rows, weights, ids, wait=wait_routes),
+     ):
+         yield gathered_q.rows
+ 
+diff --git a/vllm/models/deepseek_v4_1/l2_prefetch.py b/vllm/models/deepseek_v4_1/l2_prefetch.py
+index ffd4d6dce4..4ab5750146 100644
+--- a/vllm/models/deepseek_v4_1/l2_prefetch.py
++++ b/vllm/models/deepseek_v4_1/l2_prefetch.py
+@@ -80,9 +80,9 @@ def _enabled() -> bool:
+ 
+ 
+ ENABLED = _enabled()
+-BUDGET_WO = _l2pf._mb("VLLM_DS41_L2_PREFETCH_WO_MB", "20")
+-BUDGET_FFN = _l2pf._mb("VLLM_DS41_L2_PREFETCH_FFN_MB", "16")
+-BUDGET_NEXT = _l2pf._mb("VLLM_DS41_L2_PREFETCH_NEXT_MB", "20")
++BUDGET_WO = _l2pf._mb("VLLM_DS41_L2_PREFETCH_WO_MB", "15")
++BUDGET_FFN = _l2pf._mb("VLLM_DS41_L2_PREFETCH_FFN_MB", "12")
++BUDGET_NEXT = _l2pf._mb("VLLM_DS41_L2_PREFETCH_NEXT_MB", "12")
+ 
+ 
+ def parse_row_bands(raw: str | None) -> tuple[tuple[int, int, int], ...]:
+diff --git a/vllm/models/deepseek_v4_1/nvidia/dspark.py b/vllm/models/deepseek_v4_1/nvidia/dspark.py
+index cc87613b30..da1ee1a0a9 100644
+--- a/vllm/models/deepseek_v4_1/nvidia/dspark.py
++++ b/vllm/models/deepseek_v4_1/nvidia/dspark.py
+@@ -844,6 +844,43 @@ class DSparkDeepseekV4ForCausalLM(nn.Module):
+         assert self.model.confidence_head is not None
+         return self.model.confidence_head.probability(head_hidden, markov_embed, out)
+ 
++    def compute_and_calibrate_confidence(
++        self,
++        head_hidden: torch.Tensor,
++        markov_embed: torch.Tensor,
++        out: torch.Tensor,
++        estimator: object,
++        idx_mapping: torch.Tensor,
++    ) -> torch.Tensor:
++        """Per-position acceptance probability calibrated online by ``estimator``."""
++        assert self.model.confidence_head is not None
++        head = self.model.confidence_head
++        if (
++            estimator is not None
++            and hasattr(head, "probability_and_calibrate")
++            and head_hidden.is_cuda
++            and idx_mapping.dtype == torch.int32
++            and idx_mapping.is_contiguous()
++            and idx_mapping.numel() == head_hidden.shape[0]
++        ):
++            return head.probability_and_calibrate(
++                head_hidden,
++                markov_embed,
++                out,
++                estimator.slope,
++                estimator.intercepts,
++                idx_mapping,
++                estimator.features,
++                estimator.predictions,
++            )
++        probs = self.compute_confidence(head_hidden, markov_embed, out=out)
++        if estimator is not None:
++            num_steps = estimator.num_speculative_steps
++            estimator.calibrate_confidence_probs(
++                probs.view(-1, num_steps), idx_mapping
++            )
++        return probs
++
+     # --- Weight loading ----------------------------------------------------
+ 
+     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
+@@ -982,9 +1019,15 @@ class DSparkDeepseekV4ForCausalLM(nn.Module):
+         return loaded_params
+ 
+     def process_weights_after_loading(self) -> None:
+-        self.logits_processor.prepare_vocab_projection(
+-            self.model.markov_head.markov_w2
+-        )
++        w2 = self.model.markov_head.markov_w2
++        self.logits_processor.prepare_vocab_projection(w2)
++        if hasattr(w2, "tilelang_vocab") and hasattr(w2, "weight"):
++            cap = int(getattr(w2, "tilelang_max_rows", 16) or 16)
++            n = int(w2.weight.shape[0])
++            dtype = getattr(w2, "tilelang_vocab_dtype", torch.bfloat16)
++            w2._tilelang_vocab_bias_scratch = torch.empty(
++                (cap, n), dtype=dtype, device=w2.weight.device
++            )
+         for layer in self.model.layers:
+             layer.attn.setup_wo_projection()
+         self.model._context_kv_projections = [
+diff --git a/vllm/models/deepseek_v4_1/nvidia/model.py b/vllm/models/deepseek_v4_1/nvidia/model.py
+index ed27cac411..e72f38df91 100644
+--- a/vllm/models/deepseek_v4_1/nvidia/model.py
++++ b/vllm/models/deepseek_v4_1/nvidia/model.py
+@@ -57,6 +57,7 @@ from .. import kernels, l2_prefetch, sp_prefill
+ from ..attention import DeepseekV4Attention
+ from ..ced import ced_decoder_start, gather_rows, gather_sp_rows, scatter_rows
+ from ..common.engram import Engram, EngramLayout, NgramHashState
++from ..engram_rows import host_hash
+ from ..glp import glp_steering
+ 
+ if typing.TYPE_CHECKING:
+@@ -340,6 +341,7 @@ class DeepseekV4DecoderLayer(nn.Module):
+         glp=None,
+         layer_idx: int = 0,
+         steer_rows: torch.Tensor | None = None,
++        encoder_only: bool = False,
+     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+         if isinstance(x, list):
+             # Pop the caller's carry list in place so nn.Module.__call__'s *args
+@@ -406,6 +408,10 @@ class DeepseekV4DecoderLayer(nn.Module):
+             # Decoder global KV needs every encoder row, but decoder queries,
+             # residual updates and experts only need the selected replay rows.
+             del x_q
++            if encoder_only:
++                self.attn.prepare_global_kv(positions, x, sp_rows=sp_rows)
++                del x, residual, post_mix, res_mix, attn_pre
++                return None, None, None, None, None
+             if sp_rows is not None:
+                 # Global KV projects local rows and gathers its narrow latent.
+                 # Decoder queries and residual updates only need replay rows.
+@@ -623,11 +629,18 @@ class DeepseekV4Model(nn.Module, EagleModelMixin):
+         self._sink_column = sink_config.column if sink_config is not None else -1
+         self._sink_columns: torch.Tensor | None = None
+         if get_pp_group().is_last_rank and sink_config is not None:
+-            self._sink_columns = torch.empty(
++            self._sink_columns = torch.zeros(
+                 vllm_config.scheduler_config.max_num_batched_tokens,
+                 self.hc_mult,
+                 dtype=torch.float32,
+             )
++        self._ced_encoder_only: bool = False
++        self._pending_engram_stage = None
++        self._pending_engram_prefetch = None
++        self._encoder_only_zeros: torch.Tensor | None = None
++        self._max_num_batched_tokens = (
++            vllm_config.scheduler_config.max_num_batched_tokens
++        )
+         # GLP steering (glp.py) when WEIGHTLESS_STEER_PATH and WEIGHTLESS_STEER_MODEL
+         # are set; None otherwise, which leaves the forward as it is.
+         self.glp = glp_steering(
+@@ -714,6 +727,7 @@ class DeepseekV4Model(nn.Module, EagleModelMixin):
+             for layer in islice(self.layers, self.start_layer, self.end_layer)
+             if getattr(layer, "engram", None) is not None
+         )
++        self._pending_engram_stage = None
+         if self.engram_hash is None:
+             raise RuntimeError("Disk Engram requires initialized hash state")
+         tokens = input_ids.shape[0]
+@@ -726,6 +740,34 @@ class DeepseekV4Model(nn.Module, EagleModelMixin):
+             self.prepared_engram_hashes[:tokens],
+         )
+         stream = torch.cuda.current_stream()
++        if isinstance(early, tuple) and len(early) == 2 and len(engrams) == 2:
++            early_0, early_1_or_fn = early
++            early_has_unknown = bool((early_0 == host_hash.UNKNOWN).any())
++            if not early_has_unknown and (
++                engrams[0].layer_hash_index == 0 and engrams[1].layer_hash_index == 1
++            ):
++                engrams[0].stage_rows(tokens, stream, early_0)
++                if callable(early_1_or_fn):
++
++                    def _stage_remaining() -> None:
++                        engrams[1].stage_rows(
++                            tokens, torch.cuda.current_stream(), early_1_or_fn()
++                        )
++
++                    self._pending_engram_stage = _stage_remaining
++                    return
++                if not bool((early_1_or_fn == host_hash.UNKNOWN).any()):
++                    engrams[1].stage_rows(tokens, stream, early_1_or_fn)
++                    return
++            early_1 = early_1_or_fn() if callable(early_1_or_fn) else early_1_or_fn
++            by_layer = (early_0, early_1)
++            for engram in engrams:
++                engram.stage_rows(
++                    tokens,
++                    stream,
++                    by_layer[engram.layer_hash_index],
++                )
++            return
+         for engram in engrams:
+             engram.stage_rows(
+                 tokens,
+@@ -738,6 +780,8 @@ class DeepseekV4Model(nn.Module, EagleModelMixin):
+             raise RuntimeError(
+                 "Disk Engram preparation must run outside compile/capture"
+             )
++        self._pending_engram_stage = None
++        self._pending_engram_prefetch = None
+         self.prepared_engram_hashes.fill_(-1)
+         for layer in islice(self.layers, self.start_layer, self.end_layer):
+             if getattr(layer, "engram", None) is not None:
+@@ -789,6 +833,14 @@ class DeepseekV4Model(nn.Module, EagleModelMixin):
+             if self._sink_columns is not None
+             else []
+         )
++        def _warm_model_runtime() -> None:
++            if l2_prefetch.ENABLED and not self._l2pf_ready:
++                self._build_l2_prefetch()
++            if self.prefill_sp_min_rows and torch.cuda.is_available():
++                first_param = next(self.parameters(), None)
++                if first_param is not None and first_param.is_cuda:
++                    sp_prefill._side_stream(first_param.device)
++
+         prepare.declare(
+             lambda: [
+                 *collectives.rank_order_sum_calls(),
+@@ -797,7 +849,8 @@ class DeepseekV4Model(nn.Module, EagleModelMixin):
+                 prepare.call(columns.zero_packs_kernel),
+                 *l2_prefetch.kernel_calls(),
+                 *collapse,
+-            ]
++            ],
++            warm=_warm_model_runtime,
+         )
+ 
+     def _build_l2_prefetch(self) -> None:
+@@ -924,14 +977,21 @@ class DeepseekV4Model(nn.Module, EagleModelMixin):
+         pending_aux_out: torch.Tensor | None = None
+         if l2_prefetch.ENABLED and not self._l2pf_ready:
+             self._build_l2_prefetch()
++        encoder_only = (
++            getattr(self, "_ced_encoder_only", False)
++            and get_pp_group().is_last_rank
++            and not torch.cuda.is_current_stream_capturing()
++        )
+         for idx, layer in enumerate(
+             islice(self.layers, self.start_layer, self.end_layer),
+             start=self.start_layer,
+         ):
+             boundary_indices = ced_indices if idx == self.ced_decoder_start else None
++            boundary_encoder_only = boundary_indices is not None and encoder_only
+             if (
+                 sp is not None
+                 and boundary_indices is not None
++                and not boundary_encoder_only
+                 and not layer.attn.ced_sp_saves_bytes(
+                     sp, boundary_indices.numel(), layer.hc_mult
+                 )
+@@ -945,12 +1005,14 @@ class DeepseekV4Model(nn.Module, EagleModelMixin):
+                 sp = None
+             ced_positions = (
+                 gather_rows(positions, boundary_indices)
+-                if boundary_indices is not None
++                if boundary_indices is not None and not boundary_encoder_only
+                 else None
+             )
+             ced_input_ids = (
+                 gather_rows(input_ids, boundary_indices)
+-                if boundary_indices is not None and input_ids is not None
++                if boundary_indices is not None
++                and not boundary_encoder_only
++                and input_ids is not None
+                 else None
+             )
+             if boundary_indices is not None and steer_rows is not None:
+@@ -977,7 +1039,20 @@ class DeepseekV4Model(nn.Module, EagleModelMixin):
+                 glp=self.glp,
+                 layer_idx=idx,
+                 steer_rows=steer_rows,
++                encoder_only=boundary_encoder_only,
+             )
++            if getattr(layer, "engram", None) is not None:
++                if self._pending_engram_stage is not None:
++                    stage_fn = self._pending_engram_stage
++                    self._pending_engram_stage = None
++                    stage_fn()
++                elif (
++                    getattr(layer.engram, "layer_hash_index", 0) == 1
++                    and self._pending_engram_prefetch is not None
++                ):
++                    prefetch_fn = self._pending_engram_prefetch
++                    self._pending_engram_prefetch = None
++                    prefetch_fn()
+             if boundary_indices is not None:
+                 sp = None  # The boundary returns replicated compact decoder rows.
+             if pending_aux_out is not None:
+@@ -990,6 +1065,36 @@ class DeepseekV4Model(nn.Module, EagleModelMixin):
+                         aux_hidden_state, ced_indices, full_num_tokens
+                     )
+                 aux_hidden_states.append(aux_hidden_state)
++            if boundary_encoder_only:
++                l2_prefetch.join()
++                if self._sink_columns is not None:
++                    from ..tilelang import columns as columns_mod
++
++                    columns_mod.zero_(self._sink_columns[:full_num_tokens])
++                zeros = getattr(self, "_encoder_only_zeros", None)
++                if (
++                    zeros is None
++                    or zeros.shape[0] < full_num_tokens
++                    or zeros.device != positions.device
++                ):
++                    cap = max(
++                        full_num_tokens,
++                        getattr(self, "_max_num_batched_tokens", full_num_tokens),
++                    )
++                    zeros = torch.zeros(
++                        (cap, self.config.hidden_size),
++                        dtype=layer.attn_norm.weight.dtype,
++                        device=positions.device,
++                    )
++                    self._encoder_only_zeros = zeros
++                out_hidden = zeros[:full_num_tokens]
++                self._pending_engram_stage = None
++                self._pending_engram_prefetch = None
++                if len(self.aux_hidden_state_layers) > 0:
++                    return out_hidden, [
++                        out_hidden for _ in self.aux_hidden_state_layers
++                    ]
++                return out_hidden
+             if boundary_indices is not None:
+                 assert ced_positions is not None
+                 positions = ced_positions
+@@ -1055,6 +1160,8 @@ class DeepseekV4Model(nn.Module, EagleModelMixin):
+                             aux_hidden_state, ced_indices, full_num_tokens
+                         )
+                     aux_hidden_states.append(aux_hidden_state)
++        self._pending_engram_stage = None
++        self._pending_engram_prefetch = None
+         l2_prefetch.join()
+         last_rank = get_pp_group().is_last_rank
+         rows_here = sp is None and not decoder_compacted
+diff --git a/vllm/models/deepseek_v4_1/nvidia/model_state.py b/vllm/models/deepseek_v4_1/nvidia/model_state.py
+index 44efc87955..cd05fe7d63 100644
+--- a/vllm/models/deepseek_v4_1/nvidia/model_state.py
++++ b/vllm/models/deepseek_v4_1/nvidia/model_state.py
+@@ -140,10 +140,17 @@ class DeepseekV41ModelState(DefaultModelState):
+             for module in model.modules()
+             if isinstance(module, DeepseekV4Model) and module.disk_engram
+         )
++        self.ced_models = tuple(
++            module
++            for module in model.modules()
++            if isinstance(module, DeepseekV4Model)
++            and module.ced_decoder_start is not None
++        )
+         # Disk Engram: each live request's prefill tokens (prompt, and on resumption
+         # the outputs it recomputes), for the host's hash of its prefill chunks.
+         self._prefill_tokens: dict[str, np.ndarray] = {}
+         self._host_engram_hash = None
++        self._prefetched_engram_ids: tuple[tuple[Any, ...], np.ndarray] | None = None
+         # GLP steering of the requests made to the steered model name: each
+         # request state's mark, and the steering whose rows a step marks from them.
+         self.steering = next(
+@@ -171,12 +178,68 @@ class DeepseekV41ModelState(DefaultModelState):
+             self._ced_prefix_start.get(req_id, 0),
+         )
+ 
++    def _ensure_host_engram_hash(self, model):
++        if self._host_engram_hash is None:
++            engram_hash = getattr(model, "engram_hash", None)
++            if engram_hash is None:
++                return None
++            from vllm.models.deepseek_v4_1.engram_rows.host_hash import HostEngramHash
++
++            layout = engram_hash.layout
++            geometry = layout.geometry
++            self._host_engram_hash = HostEngramHash(
++                layout.token_map,
++                geometry.multipliers,
++                geometry.primes,
++                geometry.offsets,
++            )
++        return self._host_engram_hash
++
++    def _prefetch_chunk0_engram(
++        self, tokens: np.ndarray, num_computed_tokens: int
++    ) -> None:
++        start = max(int(num_computed_tokens), 0)
++        remaining = len(tokens) - start
++        if remaining <= 0:
++            return
++        for model in self.disk_engram_models:
++            layout = getattr(model, "engram_layout", None)
++            if layout is None or not getattr(layout, "caps", None):
++                continue
++            host_hash = self._ensure_host_engram_hash(model)
++            if host_hash is None:
++                continue
++            engram_0 = next(
++                (
++                    layer.engram
++                    for layer in model.layers[model.start_layer : model.end_layer]
++                    if getattr(layer, "engram", None) is not None
++                    and getattr(layer.engram, "layer_hash_index", -1) == 0
++                    and getattr(layer.engram.embed_tokens, "disk_rows", None) is not None
++                ),
++                None,
++            )
++            if engram_0 is None:
++                continue
++            max_tokens = getattr(self, "max_num_tokens", layout.caps[0].max_tokens)
++            chunk_rows = min(remaining, layout.caps[0].max_tokens, max_tokens)
++            if chunk_rows <= 0:
++                continue
++            positions = np.arange(start, start + chunk_rows, dtype=np.int64)
++            ids_0 = host_hash.step_ids(
++                chunk_rows,
++                ((0, chunk_rows, tokens, positions),),
++                columns=self._engram_host_columns(model),
++                layer=0,
++            )
++            engram_0.embed_tokens.disk_rows.prefetch(ids_0)
++
+     def add_request(self, req_index: int, new_req_data: NewRequestData) -> None:
+         super().add_request(req_index, new_req_data)
+         if self.disk_engram_models and new_req_data.prefill_token_ids is not None:
+-            self._prefill_tokens[new_req_data.req_id] = np.asarray(
+-                new_req_data.prefill_token_ids, dtype=np.int32
+-            )
++            tokens = np.asarray(new_req_data.prefill_token_ids, dtype=np.int32)
++            self._prefill_tokens[new_req_data.req_id] = tokens
++            self._prefetch_chunk0_engram(tokens, new_req_data.num_computed_tokens)
+         sampling = new_req_data.sampling_params
+         if self.steered_requests is not None:
+             steered = weightless.is_marked(sampling)
+@@ -211,6 +274,9 @@ class DeepseekV41ModelState(DefaultModelState):
+     def remove_request(self, req_id: str) -> None:
+         super().remove_request(req_id)
+         self._prefill_tokens.pop(req_id, None)
++        cached = getattr(self, "_prefetched_engram_ids", None)
++        if cached is not None and any(req[0] == req_id for req in cached[0][2]):
++            self._prefetched_engram_ids = None
+         self._ced_prompt_logprobs.discard(req_id)
+         self._ced_prefix_start.pop(req_id, None)
+         self._ced_recovery_prompt_end.pop(req_id, None)
+@@ -291,6 +357,22 @@ class DeepseekV41ModelState(DefaultModelState):
+             floors,
+             limits,
+         )
++        encoder_only = (
++            not force_full
++            and nr > 0
++            and all(
++                not keep_full[i]
++                and int(input_batch.num_computed_prefill_tokens_np[i])
++                < int(input_batch.prefill_len_np[i])
++                and int(input_batch.num_computed_prefill_tokens_np[i])
++                + int(input_batch.num_scheduled_tokens[i])
++                <= floors[i]
++                for i in range(nr)
++            )
++        )
++        state.encoder_only = encoder_only
++        for m in getattr(self, "ced_models", ()):
++            m._ced_encoder_only = encoder_only
+         self._ced_batch = input_batch
+ 
+     def stage_full_cudagraph_attn(self, input_batch: InputBatch) -> None:
+@@ -361,6 +443,28 @@ class DeepseekV41ModelState(DefaultModelState):
+     def prepare_inputs(
+         self, input_batch: InputBatch, req_states: RequestState
+     ) -> dict[str, torch.Tensor | None]:
++        window = self.lookback_token_ids
++        if window is not None:
++            from vllm.models.deepseek_v4_1.tilelang.lookback import gather_lookback
++
++            # Queue disk Engram reads before super().prepare_inputs so NVMe I/O
++            # overlaps host input prep and Layer 0.
++            gather_lookback(
++                window,
++                input_batch.idx_mapping,
++                req_states.num_computed_tokens.gpu,
++                req_states.all_token_ids.gpu,
++            )
++            for model in self.disk_engram_models:
++                model.prepare_disk_engram(
++                    input_batch.input_ids,
++                    input_batch.query_start_loc,
++                    window,
++                    self._early_engram_ids(model, input_batch),
++                )
++                model._pending_engram_prefetch = self._make_engram_prefetch(
++                    model, input_batch
++                )
+         model_inputs = super().prepare_inputs(input_batch, req_states)
+         if self.ced_state is not None:
+             if self._ced_batch is not input_batch:
+@@ -401,51 +505,98 @@ class DeepseekV41ModelState(DefaultModelState):
+                 if dirty_len > 0:
+                     self.steering.rows[:dirty_len].zero_()
+                     self._steering_rows_dirty_len = 0
+-        window = self.lookback_token_ids
+-        if window is None:
+-            return model_inputs
+-        from vllm.models.deepseek_v4_1.tilelang.lookback import gather_lookback
+-
+-        # Every row: the batch's requests' windows, then -1.
+-        gather_lookback(
+-            window,
+-            input_batch.idx_mapping,
+-            req_states.num_computed_tokens.gpu,
+-            req_states.all_token_ids.gpu,
+-        )
+-        model_inputs["lookback_token_ids"] = window
+-        for model in self.disk_engram_models:
+-            model.prepare_disk_engram(
+-                input_batch.input_ids,
+-                input_batch.query_start_loc,
+-                window,
+-                self._early_engram_ids(model, input_batch),
+-            )
++        if window is not None:
++            model_inputs["lookback_token_ids"] = window
+         return model_inputs
+ 
+-    def _early_engram_ids(self, model, input_batch: InputBatch) -> np.ndarray | None:
++    def _engram_host_columns(self, model) -> int:
++        from vllm.models.deepseek_v4_1.common import engram as engram_module
++        from vllm.models.deepseek_v4_1.engram_rows.host_hash import ALL_COLUMNS
++
++        columns = ALL_COLUMNS
++        if not engram_module.ENGRAM_CHECK_EARLY_IDS:
++            masks = {
++                layer.engram.embed_tokens.column_mask
++                for layer in model.layers[model.start_layer : model.end_layer]
++                if getattr(layer, "engram", None) is not None
++            }
++            check_early = any(
++                layer.engram.embed_tokens.disk_rows is not None
++                and layer.engram.embed_tokens.disk_rows.check_early
++                for layer in model.layers[model.start_layer : model.end_layer]
++                if getattr(layer, "engram", None) is not None
++            )
++            if len(masks) == 1 and not check_early:
++                columns = next(iter(masks))
++        return columns
++
++    def _early_engram_ids(self, model, input_batch: InputBatch):
+         """The step's Engram row IDs the host can hash now, ``[tokens, layers, 24]``
+-        (``host_hash.UNKNOWN`` for rows of tokens the GPU samples, -1 for padding),
+-        or None when the step has no prefill chunk to hash."""
++        or ``(early_0, early_1_or_fn)`` (``host_hash.UNKNOWN`` for rows of tokens the
++        GPU samples, -1 for padding), or None when the step has no prefill chunk to
++        hash."""
+         if not input_batch.has_prefill:
+             return None
+-        from vllm.models.deepseek_v4_1.common import engram as engram_module
+         from vllm.models.deepseek_v4_1.engram_rows.host_hash import (
+-            ALL_COLUMNS,
+             HostEngramHash,
+             placed_by_host,
+         )
+ 
+-        if self._host_engram_hash is None:
+-            layout = model.engram_hash.layout
+-            geometry = layout.geometry
+-            self._host_engram_hash = HostEngramHash(
+-                layout.token_map,
+-                geometry.multipliers,
+-                geometry.primes,
+-                geometry.offsets,
+-            )
++        host_hash = self._ensure_host_engram_hash(model)
++        columns = self._engram_host_columns(model)
+         starts = input_batch.query_start_loc_np
++        drafts = input_batch.num_draft_tokens_per_req
++        num_tokens = int(input_batch.input_ids.shape[0])
++        cached = getattr(self, "_prefetched_engram_ids", None)
++        self._prefetched_engram_ids = None
++        if cached is not None:
++            cached_key, cached_ids = cached
++            cur_reqs = []
++            match = columns == cached_key[0] and num_tokens >= cached_key[1]
++            if match:
++                for i, req_id in enumerate(input_batch.req_ids):
++                    if not input_batch.is_prefilling_np[i] or (
++                        drafts is not None and int(drafts[i]) != 0
++                    ):
++                        match = False
++                        break
++                    tokens = self._prefill_tokens.get(req_id)
++                    if tokens is None:
++                        match = False
++                        break
++                    first = int(starts[i])
++                    rows = int(input_batch.num_scheduled_tokens[i])
++                    start = int(input_batch.num_computed_prefill_tokens_np[i])
++                    stop = min(start + rows, len(tokens))
++                    if start >= stop:
++                        match = False
++                        break
++                    cur_reqs.append((req_id, first, rows, start, stop))
++            if match and tuple(cur_reqs) == cached_key[2]:
++                def _pad_plane(plane: np.ndarray, total_rows: int) -> np.ndarray:
++                    if plane.shape[0] >= total_rows:
++                        return plane
++                    out = np.full((total_rows, plane.shape[1]), -1, dtype=plane.dtype)
++                    out[: plane.shape[0]] = plane
++                    return out
++
++                if cached_ids.shape[1] == 2:
++                    early_0 = _pad_plane(cached_ids[:, 0], num_tokens)
++                    early_1 = cached_ids[:, 1]
++                    if num_tokens > 1024:
++                        return (early_0, lambda: _pad_plane(early_1, num_tokens))
++                    return (early_0, _pad_plane(early_1, num_tokens))
++                if cached_ids.shape[0] < num_tokens:
++                    padded_planes = np.full(
++                        (cached_ids.shape[1], num_tokens, cached_ids.shape[2]),
++                        -1,
++                        dtype=cached_ids.dtype,
++                    )
++                    padded_planes[:, : cached_ids.shape[0], :] = cached_ids.transpose(
++                        1, 0, 2
++                    )
++                    cached_ids = padded_planes.transpose(1, 0, 2)
++                return cached_ids
+         requests = []
+         for i, req_id in enumerate(input_batch.req_ids):
+             first, rows = int(starts[i]), int(input_batch.num_scheduled_tokens[i])
+@@ -457,28 +608,92 @@ class DeepseekV41ModelState(DefaultModelState):
+                     start, min(start + rows, len(tokens)), dtype=np.int64
+                 )
+             requests.append((first, rows, tokens, positions))
+-        requests = placed_by_host(requests, input_batch.num_draft_tokens_per_req)
++        requests = placed_by_host(requests, drafts)
+         if not any(len(positions) for *_, positions in requests):
+             return None
+-        columns = ALL_COLUMNS
+-        if not engram_module.ENGRAM_CHECK_EARLY_IDS:
+-            masks = {
+-                layer.engram.embed_tokens.column_mask
+-                for layer in model.layers[model.start_layer : model.end_layer]
+-                if getattr(layer, "engram", None) is not None
+-            }
+-            check_early = any(
+-                layer.engram.embed_tokens.disk_rows is not None
+-                and layer.engram.embed_tokens.disk_rows.check_early
+-                for layer in model.layers[model.start_layer : model.end_layer]
+-                if getattr(layer, "engram", None) is not None
++        if num_tokens > 1024 and self._host_engram_hash.layers == 2:
++            early_0 = self._host_engram_hash.step_ids(
++                num_tokens,
++                requests,
++                columns=columns,
++                layer=0,
+             )
+-            if len(masks) == 1 and not check_early:
+-                columns = next(iter(masks))
++
++            def _stage_layer1():
++                return self._host_engram_hash.step_ids(
++                    num_tokens,
++                    requests,
++                    columns=columns,
++                    layer=1,
++                )
++
++            return (early_0, _stage_layer1)
+         return self._host_engram_hash.step_ids(
+-            input_batch.input_ids.shape[0], requests, columns=columns
++            num_tokens,
++            requests,
++            columns=columns,
+         )
+ 
++    def _make_engram_prefetch(self, model, input_batch: InputBatch):
++        """Return a closure that warms the Engram user-space row cache for the
++        next prefill chunk while the current chunk finishes executing on GPU."""
++        if not input_batch.has_prefill or self._host_engram_hash is None:
++            return None
++        max_tokens = model.engram_layout.caps[0].max_tokens
++        next_requests = []
++        next_key_reqs = []
++        total_next_rows = 0
++        drafts = input_batch.num_draft_tokens_per_req
++        for i, req_id in enumerate(input_batch.req_ids):
++            if not input_batch.is_prefilling_np[i]:
++                continue
++            if drafts is not None and int(drafts[i]) != 0:
++                continue
++            tokens = self._prefill_tokens.get(req_id)
++            if tokens is None:
++                continue
++            rows = int(input_batch.num_scheduled_tokens[i])
++            next_start = int(input_batch.num_computed_prefill_tokens_np[i]) + rows
++            if next_start >= len(tokens):
++                continue
++            budget = max_tokens - total_next_rows
++            if budget <= 0:
++                break
++            next_rows = min(rows, len(tokens) - next_start, budget)
++            next_positions = np.arange(
++                next_start, next_start + next_rows, dtype=np.int64
++            )
++            next_requests.append((total_next_rows, next_rows, tokens, next_positions))
++            next_key_reqs.append(
++                (req_id, total_next_rows, next_rows, next_start, next_start + next_rows)
++            )
++            total_next_rows += next_rows
++        if not next_requests or total_next_rows <= 0:
++            return None
++        columns = self._engram_host_columns(model)
++        engram_layers = tuple(
++            layer.engram
++            for layer in model.layers[model.start_layer : model.end_layer]
++            if getattr(layer, "engram", None) is not None
++            and getattr(layer.engram.embed_tokens, "disk_rows", None) is not None
++        )
++        if not engram_layers:
++            return None
++        host_hash = self._host_engram_hash
++        next_key = (columns, total_next_rows, tuple(next_key_reqs))
++
++        def _prefetch() -> None:
++            next_ids = host_hash.step_ids(
++                total_next_rows, next_requests, columns=columns
++            )
++            self._prefetched_engram_ids = (next_key, next_ids)
++            for engram in engram_layers:
++                engram.embed_tokens.disk_rows.prefetch(
++                    next_ids[:, engram.layer_hash_index]
++                )
++
++        return _prefetch
++
+     def prepare_dummy_inputs(self, num_reqs: int, num_tokens: int) -> dict[str, Any]:
+         model_inputs = super().prepare_dummy_inputs(num_reqs, num_tokens)
+         if self.ced_state is not None:
+@@ -486,6 +701,9 @@ class DeepseekV41ModelState(DefaultModelState):
+             # Capture their noncompact branch, regardless of dummy split;
+             # long real queries are forced off FULL graphs by the runner.
+             self.ced_state.plan = None
++            self.ced_state.encoder_only = False
++            for m in getattr(self, "ced_models", ()):
++                m._ced_encoder_only = False
+             self.ced_state.replay_start.zero_()
+             self._ced_batch = None
+             model_inputs["ced_indices"] = None
+@@ -498,6 +716,7 @@ class DeepseekV41ModelState(DefaultModelState):
+             # The captured graph reads this buffer; replays refill it in place.
+             self.lookback_token_ids.fill_(-1)
+             model_inputs["lookback_token_ids"] = self.lookback_token_ids
++        self._prefetched_engram_ids = None
+         for model in self.disk_engram_models:
+             model.prepare_dummy_engram(num_tokens)
+         return model_inputs
+diff --git a/vllm/models/deepseek_v4_1/nvidia/vl_model.py b/vllm/models/deepseek_v4_1/nvidia/vl_model.py
+index 3b842f69cf..b496197801 100644
+--- a/vllm/models/deepseek_v4_1/nvidia/vl_model.py
++++ b/vllm/models/deepseek_v4_1/nvidia/vl_model.py
+@@ -36,12 +36,20 @@ from vllm.models.deepseek_v41.nvidia.vl_model import (
+ from vllm.multimodal import MULTIMODAL_REGISTRY
+ from vllm.utils.torch_utils import async_tensor_h2d
+ 
+-from ..tilelang import ced as ced_kernels
+-from ..tilelang import prepare
+-from .model import (
+-    DeepseekV41LLMForCausalLM,
+-    _linear_scale_param_name,
+-)
++def __getattr__(name: str):
++    if name in ("DeepseekV41LLMForCausalLM", "_linear_scale_param_name"):
++        from . import model as _model
++
++        return getattr(_model, name)
++    if name == "ced_kernels":
++        from ..tilelang import ced as _ced
++
++        return _ced
++    if name == "prepare":
++        from ..tilelang import prepare as _prepare
++
++        return _prepare
++    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
+ 
+ 
+ def _vision_tower():
+@@ -114,6 +122,8 @@ class DeepseekV41ForCausalLM(UpstreamDeepseekV41ForCausalLM):
+                 torch.empty(config.hidden_size, dtype=torch.float32)
+             )
+ 
++        from .model import DeepseekV41LLMForCausalLM, _linear_scale_param_name
++
+         with self._mark_language_model(vllm_config):
+             self.language_model = DeepseekV41LLMForCausalLM(
+                 vllm_config=vllm_config,
+@@ -192,6 +202,8 @@ class DeepseekV41ForCausalLM(UpstreamDeepseekV41ForCausalLM):
+                 f"{image_embeds.shape[0]} aligner rows for {len(image_slots)} image "
+                 "slots"
+             )
++        from ..tilelang import ced as ced_kernels
++
+         device = image_embeds.device
+         span = image_embeds.new_empty(len(kinds), image_embeds.shape[-1])
+         ced_kernels.copy_rows(
+@@ -236,6 +248,8 @@ class DeepseekV41ForCausalLM(UpstreamDeepseekV41ForCausalLM):
+                 f"{sum(span.shape[0] for span in spans)} image embeddings for "
+                 f"{len(slots)} placeholders"
+             )
++        from ..tilelang import ced as ced_kernels
++
+         offset = 0
+         for span in spans:
+             if span.dim() != 2 or span.dtype != inputs_embeds.dtype:
+@@ -257,6 +271,9 @@ class DeepseekV41ForCausalLM(UpstreamDeepseekV41ForCausalLM):
+     def declare_kernels(self) -> None:
+         """Declare the image path's row copies: the span's delimiter gather and image
+         scatter, and the spans' scatter into the embeddings."""
++        from ..tilelang import ced as ced_kernels
++        from ..tilelang import prepare
++
+         hidden = self.config.hidden_size
+         key = (str(self.embed_dtype).removeprefix("torch."), (hidden,))
+         prepare.declare(
+diff --git a/vllm/models/deepseek_v4_1/sp_prefill.py b/vllm/models/deepseek_v4_1/sp_prefill.py
+index d4daeb67f1..b5fa1b7af7 100644
+--- a/vllm/models/deepseek_v4_1/sp_prefill.py
++++ b/vllm/models/deepseek_v4_1/sp_prefill.py
+@@ -9,8 +9,9 @@ layer (mHC mixes, norms, the Engram gate, the residual carry) on every token.
+ For a long prefill forward, SP turns the per-layer all-reduces into dim-0
+ reduce-scatters so that each rank owns 1/N of the rows for that work, and
+ all-gathers the rows back before the ops that need all of them. Weights stay
+-exactly as in ordinary TP, except that the CED boundary retains one full
+-ratio-one BF16 compressor weight for its local-row projection. The static
++exactly as in ordinary TP, except that each compressor layer (the CED
++boundary's ratio one, the encoder's ratio two) retains one full BF16
++compressor weight for its local-row projection. The static
+ ``_use_sequence_parallel`` construction flag stays off: this mode changes no
+ module.
+ 
+@@ -58,11 +59,13 @@ projection gather would cost at least as many bytes.
+   shards slice ``wkv`` and exchange the blocks all-to-all), attention
+   (``wq_b``, indexer, compressor, KV cache writes, sparse MLA, WO), and the
+   MoE routed and shared experts.
+-- In attention layers without a compressor, the row-wise front
+-  (``fused_wqa_wkv``, the q norm and MXFP8 cast, the kv norm, RoPE and SWA
+-  record packing, and the local index head weights) runs on local rows; only
+-  the MXFP8 q cast and 528-byte SWA records are gathered, and index head
+-  weights stay rank-local.
++- In attention layers without a compressor, and in the compressor layers
++  (ratio one and two), the row-wise front (``fused_wqa_wkv``, the q norm and
++  MXFP8 cast, the kv norm, RoPE and SWA record packing, and the local index
++  head weights) runs on local rows; only the MXFP8 q cast and 528-byte SWA
++  records are gathered, and index head weights stay rank-local. The
++  compressor projects the local rows too and gathers its 512-column values
++  (and, at ratio two, gates).
+ - In encoder attention layers, ``WO-A`` projects all ``T`` rows into its
+   native MXFP8 ``o_lora`` activations, exchanges those narrower rows across
+   ranks while projecting this rank's own ``WO-B`` shard on local rows, and
+@@ -99,7 +102,7 @@ rank's block straight into its slot, the other ranks' first, and the exchange of
+ each slice runs under the combine of this rank's block and of the next slice.
+ """
+ 
+-from collections.abc import Iterator
++from collections.abc import Callable, Iterator
+ from contextlib import contextmanager
+ from contextvars import ContextVar
+ from dataclasses import dataclass
+@@ -218,11 +221,25 @@ class SPRows:
+             raise ValueError(f"SP gather expects {self.local_rows} rows, got {x.shape}")
+         return tensor_model_parallel_all_gather(x, dim=0)[: self.num_tokens]
+ 
+-    def gather_many(
++    def can_gather_async(self, device: torch.device | None = None) -> bool:
++        """Whether ``gather_many_async`` can run a grouped PyNCCL gather on ``_side_stream``."""
++        if not model_parallel_is_initialized() or _tp_pynccl_comm() is None:
++            return False
++        if not torch.cuda.is_available() or torch.cuda.is_current_stream_capturing():
++            return False
++        return device is None or device.type == "cuda"
++
++    def can_gather_mxfp8_async(self, device: torch.device | None = None) -> bool:
++        """Whether ``gather_mxfp8_async`` can run asynchronously without bypassing monkeypatches."""
++        return (
++            type(self).gather_mxfp8 is _DEFAULT_GATHER_MXFP8
++            and "gather_mxfp8" not in self.__dict__
++            and self.can_gather_async(device)
++        )
++
++    def _prepare_gather_many(
+         self, *tensors: torch.Tensor, padded_rows: tuple[int, ...] = ()
+-    ) -> tuple[torch.Tensor, ...]:
+-        """All-gather several L-row tensors into their first T rows (or ``padded_rows``
+-        when given for a tensor) in one grouped PyNCCL collective when available."""
++    ) -> tuple[list[torch.Tensor], tuple[int, ...], object | None]:
+         inputs = []
+         for x in tensors:
+             x = materialize(x)
+@@ -237,17 +254,20 @@ class SPRows:
+             if model_parallel_is_initialized()
+             else None
+         )
+-        if comm is None or comm.disabled:
+-            outs = []
+-            for x, rows in zip(inputs, limits):
+-                gathered = tensor_model_parallel_all_gather(x, dim=0)
+-                if rows > gathered.shape[0]:
+-                    padded = x.new_empty((rows, *x.shape[1:]))
+-                    padded[: gathered.shape[0]].copy_(gathered)
+-                    outs.append(padded)
+-                else:
+-                    outs.append(gathered[:rows])
+-            return tuple(outs)
++        if comm is not None and getattr(comm, "disabled", False):
++            comm = None
++        return inputs, limits, comm
++
++    def _launch_pynccl_gather(
++        self,
++        inputs: list[torch.Tensor],
++        limits: tuple[int, ...],
++        comm,
++        *,
++        stream: torch.cuda.Stream | None = None,
++        ready_event: torch.cuda.Event | None = None,
++        done_event: torch.cuda.Event | None = None,
++    ) -> tuple[torch.Tensor, ...]:
+         outs = []
+         pairs = []
+         for x, rows in zip(inputs, limits):
+@@ -256,14 +276,86 @@ class SPRows:
+             out = torch.empty(
+                 (alloc_rows, *inp.shape[1:]), dtype=inp.dtype, device=inp.device
+             )
++
+             outs.append(out[:rows])
+             pairs.append((out[: self.padded_rows], inp))
++        if stream is not None:
++            main = torch.cuda.current_stream(inputs[0].device)
++            if ready_event is not None:
++                ready_event.record(main)
++                stream.wait_event(ready_event)
++            else:
++                stream.wait_stream(main)
+         comm.group_start()
+         for dst, src in pairs:
+-            comm.all_gather(dst, src)
++            if stream is None:
++                comm.all_gather(dst, src)
++            else:
++                comm.all_gather(dst, src, stream=stream)
+         comm.group_end()
++        if stream is not None and done_event is not None:
++            done_event.record(stream)
+         return tuple(outs)
+ 
++    def gather_many(
++        self, *tensors: torch.Tensor, padded_rows: tuple[int, ...] = ()
++    ) -> tuple[torch.Tensor, ...]:
++        """All-gather several L-row tensors into their first T rows (or ``padded_rows``
++        when given for a tensor) in one grouped PyNCCL collective when available."""
++        inputs, limits, comm = self._prepare_gather_many(
++            *tensors, padded_rows=padded_rows
++        )
++        if comm is None:
++            outs = []
++            for x, rows in zip(inputs, limits):
++                gathered = tensor_model_parallel_all_gather(x, dim=0)
++                if rows > gathered.shape[0]:
++                    padded = x.new_empty((rows, *x.shape[1:]))
++                    padded[: gathered.shape[0]].copy_(gathered)
++                    outs.append(padded)
++                else:
++                    outs.append(gathered[:rows])
++            return tuple(outs)
++        return self._launch_pynccl_gather(inputs, limits, comm)
++
++    def gather_many_async(
++        self, *tensors: torch.Tensor, padded_rows: tuple[int, ...] = ()
++    ) -> tuple[tuple[torch.Tensor, ...], Callable[[], None]]:
++        """Start a grouped PyNCCL all-gather on ``_side_stream`` and return ``(outs, wait_fn)``."""
++        inputs, limits, comm = self._prepare_gather_many(
++            *tensors, padded_rows=padded_rows
++        )
++        if not inputs or comm is None or not self.can_gather_async(inputs[0].device):
++            return self.gather_many(*tensors, padded_rows=padded_rows), (lambda: None)
++        inputs = [x.contiguous() for x in inputs]
++        device = inputs[0].device
++        side = _side_stream(device)
++        ready_ev, done_ev = _next_gather_events(device)
++        outs = self._launch_pynccl_gather(
++            inputs,
++            limits,
++            comm,
++            stream=side,
++            ready_event=ready_ev,
++            done_event=done_ev,
++        )
++        # Keep both contiguous sources and outputs alive until main waits on done_ev
++        # so the caching allocator cannot recycle them on main mid-transfer.
++        held: tuple[list[torch.Tensor], tuple[torch.Tensor, ...]] | None = (
++            inputs,
++            outs,
++        )
++        waited = False
++
++        def wait() -> None:
++            nonlocal waited, held
++            if not waited:
++                waited = True
++                torch.cuda.current_stream(device).wait_event(done_ev)
++                held = None
++
++        return outs, wait
++
+     def gather_mxfp8(self, x_q, *extra: torch.Tensor):
+         """All-gather this rank's L-row ``MXFP8Rows`` (and any ``extra`` L-row
+         tensors, such as local top-k routes) in one grouped collective, returning
+@@ -289,6 +381,31 @@ class SPRows:
+         )
+         return (MXFP8Rows(rows, values, scales), *rest)
+ 
++    def gather_mxfp8_async(self, x_q, *extra: torch.Tensor):
++        """Asynchronous ``gather_mxfp8`` returning ``((MXFP8Rows, *extra), wait_fn)``."""
++        if not self.can_gather_mxfp8_async(x_q.rows.device):
++            return self.gather_mxfp8(x_q, *extra), (lambda: None)
++        from vllm.models.deepseek_v4_1.tilelang.linear import MXFP8Rows, mxfp8_rows
++
++        local = self.local_rows
++        if x_q.rows.shape[0] != local:
++            raise ValueError(
++                f"SP MXFP8 gather expects {local} rows, got {x_q.rows.shape}"
++            )
++        rows_q = mxfp8_rows(self.num_tokens)
++        (values, scales, *rest), wait = self.gather_many_async(
++            x_q.values[:local],
++            x_q.scales[:local],
++            *extra,
++            padded_rows=(rows_q, rows_q),
++        )
++        rows = torch.empty(
++            (self.num_tokens, *x_q.rows.shape[1:]),
++            dtype=x_q.rows.dtype,
++            device=x_q.rows.device,
++        )
++        return (MXFP8Rows(rows, values, scales), *rest), wait
++
+     def reduce_scatter(self, padded: torch.Tensor) -> torch.Tensor:
+         """Sum a zero-padded Tp-row buffer over the ranks into this rank's rows."""
+         if padded.shape[0] != self.padded_rows:
+@@ -353,51 +470,53 @@ class SPRows:
+         use_cuda_streams = device.type == "cuda" and torch.cuda.is_available()
+         main = torch.cuda.current_stream(device) if use_cuda_streams else None
+         side = _side_stream(device) if use_cuda_streams else None
+-        for lo, hi in zip(bounds, bounds[1:]):
+-            slice_rows = hi - lo
+-            if slice_rows == 0:
+-                continue
+-            send_slice = send[world * lo : world * hi].view(
+-                world, slice_rows, *row_shape
+-            )
+-            slice_total = 0
+-            for owner in range(world):
+-                real = max(0, min(hi, tokens - owner * local) - lo)
+-                slice_total += real
+-                if owner != self.rank and real:
+-                    start = owner * local + lo
+-                    project(start, start + real, send_slice[owner, :real])
+-            if slice_total:
+-                flat_send = send_slice.view(world * slice_rows, *row_shape)[
+-                    :slice_total
+-                ]
+-                if use_cuda_streams:
+-                    side.wait_stream(main)
+-                    with torch.cuda.stream(side):
++        try:
++            for lo, hi in zip(bounds, bounds[1:]):
++                slice_rows = hi - lo
++                if slice_rows == 0:
++                    continue
++                send_slice = send[world * lo : world * hi].view(
++                    world, slice_rows, *row_shape
++                )
++                slice_total = 0
++                for owner in range(world):
++                    real = max(0, min(hi, tokens - owner * local) - lo)
++                    slice_total += real
++                    if owner != self.rank and real:
++                        start = owner * local + lo
++                        project(start, start + real, send_slice[owner, :real])
++                if slice_total:
++                    flat_send = send_slice.view(world * slice_rows, *row_shape)[
++                        :slice_total
++                    ]
++                    if use_cuda_streams:
++                        side.wait_stream(main)
++                        with torch.cuda.stream(side):
++                            comm.all_to_all_rows(
++                                out[:, lo:hi],
++                                flat_send,
++                                slice_rows,
++                                stream=side,
++                                copy_self=False,
++                            )
++                    else:
+                         comm.all_to_all_rows(
+                             out[:, lo:hi],
+                             flat_send,
+                             slice_rows,
+-                            stream=side,
++                            stream=None,
+                             copy_self=False,
+                         )
+-                else:
+-                    comm.all_to_all_rows(
+-                        out[:, lo:hi],
+-                        flat_send,
+-                        slice_rows,
+-                        stream=None,
+-                        copy_self=False,
+-                    )
+-            real_me = max(0, min(hi, tokens - self.rank * local) - lo)
+-            if real_me:
+-                start = self.rank * local + lo
+-                project(start, start + real_me, out[self.rank, lo : lo + real_me])
+-        if then is not None:
+-            then()
+-        if use_cuda_streams:
+-            # send and out are freed only after this wait, on this stream.
+-            main.wait_stream(side)
++                real_me = max(0, min(hi, tokens - self.rank * local) - lo)
++                if real_me:
++                    start = self.rank * local + lo
++                    project(start, start + real_me, out[self.rank, lo : lo + real_me])
++            if then is not None:
++                then()
++        finally:
++            if use_cuda_streams:
++                # send and out are freed only after this wait, on this stream.
++                main.wait_stream(side)
+         return out
+ 
+     def empty_padded(
+@@ -466,29 +585,32 @@ class SPRows:
+         bounds = [local * i // slices for i in range(slices + 1)]
+         main = torch.cuda.current_stream(device)
+         side = _side_stream(device)
+-        for lo, hi in zip(bounds, bounds[1:]):
+-            if hi == lo:
+-                continue
+-            piece = torch.empty(
+-                (world, hi - lo, *row_shape), dtype=dtype, device=device
+-            )
+-            for owner in range(world):
+-                start, stop = owner * local + lo, owner * local + hi
+-                real = max(0, min(stop, tokens) - start)
+-                if real:
+-                    project(start, start + real, piece[owner, :real])
+-                if real < hi - lo:
+-                    piece[owner, real:].zero_()
+-            side.wait_stream(main)
+-            with torch.cuda.stream(side):
+-                reduced = tensor_model_parallel_reduce_scatter(
+-                    piece.view(world * (hi - lo), *row_shape), dim=0
++        pieces: list[torch.Tensor] = []
++        try:
++            for lo, hi in zip(bounds, bounds[1:]):
++                if hi == lo:
++                    continue
++                piece = torch.empty(
++                    (world, hi - lo, *row_shape), dtype=dtype, device=device
+                 )
+-                out[lo:hi].copy_(reduced)
+-            piece.record_stream(side)
+-        if then is not None:
+-            then()
+-        main.wait_stream(side)
++                pieces.append(piece)
++                for owner in range(world):
++                    start, stop = owner * local + lo, owner * local + hi
++                    real = max(0, min(stop, tokens) - start)
++                    if real:
++                        project(start, start + real, piece[owner, :real])
++                    if real < hi - lo:
++                        piece[owner, real:].zero_()
++                side.wait_stream(main)
++                with torch.cuda.stream(side):
++                    reduced = tensor_model_parallel_reduce_scatter(
++                        piece.view(world * (hi - lo), *row_shape), dim=0
++                    )
++                    out[lo:hi].copy_(reduced)
++            if then is not None:
++                then()
++        finally:
++            main.wait_stream(side)
+         return out
+ 
+     def _project_exchange(
+@@ -528,20 +650,22 @@ class SPRows:
+         bounds = [local * i // slices for i in range(slices + 1)]
+         main = torch.cuda.current_stream(device)
+         side = _side_stream(device)
+-        for lo, hi in zip(bounds, bounds[1:]):
+-            if hi == lo:
+-                continue
+-            for owner in range(world):
+-                if owner != self.rank:
+-                    write(owner, lo, hi)
+-            side.wait_stream(main)
+-            with torch.cuda.stream(side):
+-                self.exchange_into(send[:, lo:hi], parts[:, lo:hi])
+-            write(self.rank, lo, hi)
+-        if then is not None:
+-            then()
+-        # send and parts are freed only after this wait, on this stream.
+-        main.wait_stream(side)
++        try:
++            for lo, hi in zip(bounds, bounds[1:]):
++                if hi == lo:
++                    continue
++                for owner in range(world):
++                    if owner != self.rank:
++                        write(owner, lo, hi)
++                side.wait_stream(main)
++                with torch.cuda.stream(side):
++                    self.exchange_into(send[:, lo:hi], parts[:, lo:hi])
++                write(self.rank, lo, hi)
++            if then is not None:
++                then()
++        finally:
++            # send and parts are freed only after this wait, on this stream.
++            main.wait_stream(side)
+         return parts
+ 
+     def exchange_into(self, send: torch.Tensor, recv) -> None:
+@@ -560,6 +684,60 @@ class SPRows:
+             return
+         exchange_into(comm, send, recv, self.rank, self.world_size)
+ 
++    def exchange_many_into(self, *pairs) -> None:
++        """Exchange multiple `(send, recv)` pairs in one collective group when possible."""
++        if not pairs:
++            return
++        if (
++            len(pairs) == 1
++            or not model_parallel_is_initialized()
++            or type(self).exchange_into is not _DEFAULT_EXCHANGE_INTO
++            or "exchange_into" in self.__dict__
++        ):
++            for send, recv in pairs:
++                self.exchange_into(send, recv)
++            return
++        from vllm.models.deepseek_v4_1.tilelang import collectives
++
++        dev_comm = get_tp_group().device_communicator
++        comm = dev_comm.pynccl_comm
++        roce_comm = _tp_roce_comm()
++        nccl_pairs = []
++        for send, recv in pairs:
++            if (
++                isinstance(recv, torch.Tensor)
++                and roce_comm is not None
++                and _roce_should_exchange(roce_comm, send, recv)
++            ):
++                roce_comm.exchange_into(send, recv)
++            else:
++                nccl_pairs.append((send, recv))
++        if not nccl_pairs:
++            return
++        if (
++            len(nccl_pairs) == 1
++            or (self.world_size == 4 and collectives.ring4_relay())
++            or not hasattr(comm, "group_start")
++        ):
++            for send, recv in nccl_pairs:
++                collectives.exchange_into(
++                    comm, send, recv, self.rank, self.world_size
++                )
++            return
++        comm.group_start()
++        for send, recv in nccl_pairs:
++            for peer in range(self.world_size):
++                if peer != self.rank:
++                    collectives._send(comm, send[peer], peer)
++                    collectives._recv(comm, recv[peer], peer)
++        comm.group_end()
++
++
++_DEFAULT_GATHER_MXFP8 = SPRows.gather_mxfp8
++_DEFAULT_EXCHANGE_INTO = SPRows.exchange_into
++SPRows._DEFAULT_GATHER_MXFP8 = _DEFAULT_GATHER_MXFP8
++SPRows._DEFAULT_EXCHANGE_INTO = _DEFAULT_EXCHANGE_INTO
++
+ 
+ # The attention's WO projection is reduce-scattered in two slices from this many
+ # tokens, so half its reduce-scatter runs under the other half's projection.
+@@ -646,6 +824,23 @@ def project_reduce_scatter_current(
+ 
+ 
+ _SIDE_STREAMS: dict = {}
++_GATHER_EVENTS: dict = {}
++
++
++def _next_gather_events(
++    device: torch.device,
++) -> tuple[torch.cuda.Event, torch.cuda.Event]:
++    """Next per-collective (ready, done) CUDA event pair from a ring on ``device``."""
++    entry = _GATHER_EVENTS.get(device)
++    if entry is None:
++        with torch.cuda.device(device):
++            ring = [(torch.cuda.Event(), torch.cuda.Event()) for _ in range(16)]
++        idx = 0
++    else:
++        ring, idx = entry
++    pair = ring[idx]
++    _GATHER_EVENTS[device] = (ring, (idx + 1) % len(ring))
++    return pair
+ 
+ 
+ def _tp_roce_comm():

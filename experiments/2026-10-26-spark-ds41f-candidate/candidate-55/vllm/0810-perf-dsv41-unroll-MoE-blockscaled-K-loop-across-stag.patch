@@ -1,0 +1,362 @@
+From 44db6a4032306a0188d0ce435c9764c7ae37e62e Mon Sep 17 00:00:00 2001
+From: Christopher Owen <3221756+christopherowen@users.noreply.github.com>
+Date: Sat, 14 Nov 2026 10:13:21 +0000
+Subject: [PATCH 810/810] perf(dsv41): unroll MoE blockscaled K loop across
+ stage parity
+
+Upstream base: local-inference-lab/vllm 19f2c20ed4d64ae22bd009ceacadd85e2a81e354
+with candidate-55's series applied through 0809.
+
+Rationale: Under CUDA 13.5 nvcc, keeping ko % stages, (ko // stages) % 2, and
+ko < k_full runtime-dependent inside T.serial(k_blocks) stalls pipeline
+unrolling and increases register/spill pressure in blockscaled MoE GEMMs.
+Unrolling K steps across period = 2 * stages via k_step resolves stage index and
+barrier parity at compile time, and passing max_ko elides the tail check and TMA
+branch across full-K blocks (0 bytes stack/spills, 191 registers on sm_121a;
+w13 E=384 sorted_seq 9.75 ms vs 10.51 ms CUDA 13.0 and 10.78 ms CUDA 13.5, E=128
+sorted_seq 9.67 ms vs 10.45 ms CUDA 13.0 and 10.73 ms CUDA 13.5).
+
+Quality implications: None; outputs are bit-identical (max_abs_diff=0) against
+both the unpatched kernel and CUDA 13.0 across w13 (E=384, E=128) and w2 (E=384).
+
+Tests: pytest -q -p tblib_stub tests/kernels/moe/test_deepseek_v41_tilelang_moe.py
+(140 passed in candidate-55-b8 container with moe.py mounted).
+
+Upstream status: local candidate-55 patch
+---
+ vllm/models/deepseek_v4_1/tilelang/moe.py | 296 ++++++++++++++--------
+ 1 file changed, 189 insertions(+), 107 deletions(-)
+
+diff --git a/vllm/models/deepseek_v4_1/tilelang/moe.py b/vllm/models/deepseek_v4_1/tilelang/moe.py
+index 74699fda6..8c6b059e1 100644
+--- a/vllm/models/deepseek_v4_1/tilelang/moe.py
++++ b/vllm/models/deepseek_v4_1/tilelang/moe.py
+@@ -724,35 +724,48 @@ def grouped_fp8_fp4_gemm(
+         coded_scales and block_N % 16 == 0 and code_chunks8 <= threads
+     )
+ 
++    @T.macro
++    def tma_weight_tile(B, B_shared, loaded, expert, bx, ko, s):
++        """Issue one full-K TMA weight tile load into stage s."""
++        tile = (expert * n_blocks + bx) * k_full + ko
++        T.tma_copy(
++            B[tile : tile + 1, 0:block_N, 0:block_K],
++            B_shared[s : s + 1, :, :],
++            barrier=loaded[s],
++            eviction_policy=eviction_policy,
++        )
++
+     @T.macro
+     def load(A, SFA, B, BT, SFB, A_shared, B_shared, SFA_shared, SFB_shared,
+              a_row, sfa_row, loaded, expert, bx, tx, ko, s, SFB8, SFC8,
+-             Narrow_flag=None, code_base=None):  # fmt: skip
++             Narrow_flag=None, code_base=None, max_ko=-1):  # fmt: skip
+         """Stage s <- K block ko: weights, gathered activation rows, scale words."""
+-        if ko < k_full:
+-            tile = (expert * n_blocks + bx) * k_full + ko
+-            T.tma_copy(
+-                B[tile : tile + 1, 0:block_N, 0:block_K],
+-                B_shared[s : s + 1, :, :],
+-                barrier=loaded[s],
+-                eviction_policy=eviction_policy,
+-            )
+-        # The tail exists at trace time (BT); its block is chosen on device.
+-        if BT is not None:  # noqa: SIM102
+-            if ko == k_full:
+-                for c in T.unroll(bt_copies):
+-                    e = c * threads + tx
+-                    if e < block_N * tail_groups:
+-                        n = e // tail_groups
+-                        g = e % tail_groups
+-                        T.ptx_cp_async(
+-                            T.access_ptr(B_shared[s, n, g * 16], "w", 8),
+-                            T.access_ptr(BT[expert * n_blocks + bx, n, g * 8], "r", 8),
+-                            8,
+-                        )
++        always_full = (max_ko >= 0) and (max_ko < k_full)
++        if always_full:
++            tma_weight_tile(B, B_shared, loaded, expert, bx, ko, s)
++        else:
++            if ko < k_full:
++                tma_weight_tile(B, B_shared, loaded, expert, bx, ko, s)
++            # The tail exists at trace time (BT); its block is chosen on device.
++            if BT is not None:  # noqa: SIM102
++                if ko == k_full:
++                    for c in T.unroll(bt_copies):
++                        e = c * threads + tx
++                        if e < block_N * tail_groups:
++                            n = e // tail_groups
++                            g = e % tail_groups
++                            T.ptx_cp_async(
++                                T.access_ptr(B_shared[s, n, g * 16], "w", 8),
++                                T.access_ptr(BT[expert * n_blocks + bx, n, g * 8], "r", 8),
++                                8,
++                            )
+         # Padding rows (row -1) are zero-filled without reading memory; the
+         # tail block copies only its own columns.
+-        columns = T.if_then_else(ko < k_full, row_segments, tail_groups)
++        columns = (
++            row_segments
++            if always_full
++            else T.if_then_else(ko < k_full, row_segments, tail_groups)
++        )
+         for c in T.unroll(a_copies):
+             e = c * threads + tx
+             if e < a_segments and e % row_segments < columns:
+@@ -829,6 +842,125 @@ def grouped_fp8_fp4_gemm(
+         # rows other threads copied (ptx_wait_group covers only its own).
+         cp_async_barrier_noinc(loaded[s])
+ 
++    @T.macro
++    def load_k_tile(A, SFA, B, BT, SFB, SFB8, SFC8, A_shared, B_shared,
++                    SFA_shared, SFB_shared, sf_dest, a_row, sfa_row, loaded,
++                    expert, bx, tx, ko, s, Narrow_flag, code_base, max_ko):  # fmt: skip
++        """Dispatch weight/activation/scale staging for full or narrow-code tiles."""
++        if narrow_codes:
++            load(A, SFA, B, BT, SFB, A_shared, B_shared, SFA_shared,
++                 sf_dest, a_row, sfa_row, loaded, expert, bx, tx, ko,
++                 s, SFB8, SFC8, Narrow_flag, code_base, max_ko)  # fmt: skip
++        else:
++            load(A, SFA, B, BT, SFB, A_shared, B_shared, SFA_shared,
++                 sf_dest, a_row, sfa_row, loaded, expert, bx, tx, ko,
++                 s, SFB, SFB_shared, max_ko=max_ko)  # fmt: skip
++
++    @T.macro
++    def expand_wide_sfb(SFC_shared, SFB_shared, base_word, s, j):
++        """Expand four packed 4-bit scale deltas into one uint32 scale word."""
++        code = T.cast(SFC_shared[s, j], T.uint32)
++        SFB_shared[s, j, 0] = (
++            (code & T.uint32(0xF))
++            | ((code >> 4) & T.uint32(0xF)) << 8
++            | ((code >> 8) & T.uint32(0xF)) << 16
++            | ((code >> 12) & T.uint32(0xF)) << 24
++        ) + base_word
++
++    @T.macro
++    def mma_full_k_tile(A_shared, B_shared, C_local, SFA_shared, SFB_shared, s):
++        """Accumulate one full block_K tile from stage s into C_local."""
++        T.mma_gemm_blockscaled(
++            A_shared[s, :, :],
++            B_shared[s, :, :],
++            C_local,
++            SFA_shared[s, :, :],
++            SFB_shared[s, :, :],
++            transpose_B=True,
++            k_start=0,
++            sf_a_granularity_k=SF_BLOCK,
++            sf_b_granularity_k=SF_BLOCK,
++        )
++
++    @T.macro
++    def k_step(A, SFA, B, BT, SFB, SFB8, SFC8, SFC_shared, A_shared, B_shared,
++               SFA_shared, SFB_shared, sf_dest, base_words, a_row, sfa_row,
++               loaded, expert, bx, tx, C_local, Narrow_flag, code_base,
++               ko, s, phase, nxt_s, do_load, max_ko):  # fmt: skip
++        """Execute one K-loop pipeline step with compile-time stage and phase."""
++        # The stage loaded next was last read by iteration ko - 1.
++        T.sync_threads()
++        nxt = ko + stages - 1
++        max_nxt = max_ko + stages - 1
++        if do_load:
++            if max_nxt < k_blocks:
++                load_k_tile(
++                    A, SFA, B, BT, SFB, SFB8, SFC8, A_shared, B_shared,
++                    SFA_shared, SFB_shared, sf_dest, a_row, sfa_row, loaded,
++                    expert, bx, tx, nxt, nxt_s, Narrow_flag, code_base, max_nxt,
++                )
++            else:
++                if nxt < k_blocks:
++                    load_k_tile(
++                        A, SFA, B, BT, SFB, SFB8, SFC8, A_shared, B_shared,
++                        SFA_shared, SFB_shared, sf_dest, a_row, sfa_row,
++                        loaded, expert, bx, tx, nxt, nxt_s, Narrow_flag,
++                        code_base, max_nxt,
++                    )
++                else:
++                    T.ptx_commit_group()
++        else:
++            T.ptx_commit_group()
++        T.ptx_wait_group(stages - 1)
++        T.barrier_wait(loaded[s], phase)
++        if coded_scales:
++            # Every thread expands its own rows: the stage's barrier waited for
++            # every thread's copies. A narrow expert's row is one byte of four
++            # 2-bit deltas; the expert is one per CTA, so the branch is uniform.
++            for c in T.unroll(sfb_copies):
++                j = c * threads + tx
++                if j < block_N:
++                    if narrow_codes:
++                        if Narrow_flag != 0:
++                            code8 = T.cast(SFC8[s, j], T.uint32)
++                            SFB_shared[s, j, 0] = (
++                                (code8 & T.uint32(0x3))
++                                | ((code8 >> 2) & T.uint32(0x3)) << 8
++                                | ((code8 >> 4) & T.uint32(0x3)) << 16
++                                | ((code8 >> 6) & T.uint32(0x3)) << 24
++                            ) + base_words[c]
++                        else:
++                            expand_wide_sfb(
++                                SFC_shared, SFB_shared, base_words[c], s, j
++                            )
++                    else:
++                        expand_wide_sfb(
++                            SFC_shared, SFB_shared, base_words[c], s, j
++                        )
++        T.sync_threads()
++        if max_ko < k_full:
++            mma_full_k_tile(
++                A_shared, B_shared, C_local, SFA_shared, SFB_shared, s
++            )
++        else:
++            if ko < k_full:
++                mma_full_k_tile(
++                    A_shared, B_shared, C_local, SFA_shared, SFB_shared, s
++                )
++            if BT is not None:  # noqa: SIM102
++                if ko == k_full:
++                    T.mma_gemm_blockscaled(
++                        A_shared[s, :, 0:tail],
++                        B_shared[s, :, 0:tail],
++                        C_local,
++                        SFA_shared[s, :, :],
++                        SFB_shared[s, :, :],
++                        transpose_B=True,
++                        k_start=0,
++                        sf_a_granularity_k=SF_BLOCK,
++                        sf_b_granularity_k=SF_BLOCK,
++                    )
++
+     @T.macro
+     def body(A, SFA, B, BT, SFB, SFBase, Order, TileExpert, C, SFB8=None, Narrow=None):
+         with T.Kernel(T.ceildiv(N, block_N), tiles, threads=threads) as (bx, t):
+@@ -933,93 +1065,43 @@ def grouped_fp8_fp4_gemm(
+                 T.clear(C_local)
+                 for p in T.unroll(stages - 1):
+                     if p < k_blocks:
+-                        if narrow_codes:
+-                            load(A, SFA, B, BT, SFB, A_shared, B_shared, SFA_shared,
+-                                 sf_dest, a_row, sfa_row, loaded, expert, bx, tx, p,
+-                                 p, SFB8, SFC8, Narrow_flag, code_base)  # fmt: skip
+-                        else:
+-                            load(A, SFA, B, BT, SFB, A_shared, B_shared, SFA_shared,
+-                                 sf_dest, a_row, sfa_row, loaded, expert, bx, tx, p,
+-                                 p, SFB, SFB_shared)  # fmt: skip
+-                    else:
+-                        T.ptx_commit_group()
+-                for ko in T.serial(k_blocks):
+-                    # The stage loaded next was last read by iteration ko - 1.
+-                    T.sync_threads()
+-                    nxt = ko + stages - 1
+-                    if nxt < k_blocks:
+-                        if narrow_codes:
+-                            load(A, SFA, B, BT, SFB, A_shared, B_shared, SFA_shared,
+-                                 sf_dest, a_row, sfa_row, loaded, expert, bx, tx, nxt,
+-                                 nxt % stages, SFB8, SFC8, Narrow_flag, code_base)  # fmt: skip
+-                        else:
+-                            load(A, SFA, B, BT, SFB, A_shared, B_shared, SFA_shared,
+-                                 sf_dest, a_row, sfa_row, loaded, expert, bx, tx, nxt,
+-                                 nxt % stages, SFB, SFB_shared)  # fmt: skip
++                        load_k_tile(
++                            A, SFA, B, BT, SFB, SFB8, SFC8, A_shared, B_shared,
++                            SFA_shared, SFB_shared, sf_dest, a_row, sfa_row,
++                            loaded, expert, bx, tx, p, p, Narrow_flag,
++                            code_base, p,
++                        )
+                     else:
+                         T.ptx_commit_group()
+-                    T.ptx_wait_group(stages - 1)
+-                    T.barrier_wait(loaded[ko % stages], (ko // stages) % 2)
+-                    s = ko % stages
+-                    if coded_scales:
+-                        # Every thread expands its own rows: the stage's barrier
+-                        # waited for every thread's copies. A narrow expert's row
+-                        # is one byte of four 2-bit deltas; the expert is one per
+-                        # CTA, so the branch is uniform.
+-                        for c in T.unroll(sfb_copies):
+-                            j = c * threads + tx
+-                            if j < block_N:
+-                                if narrow_codes:
+-                                    if Narrow_flag != 0:
+-                                        code8 = T.cast(SFC8[s, j], T.uint32)
+-                                        SFB_shared[s, j, 0] = (
+-                                            (code8 & T.uint32(0x3))
+-                                            | ((code8 >> 2) & T.uint32(0x3)) << 8
+-                                            | ((code8 >> 4) & T.uint32(0x3)) << 16
+-                                            | ((code8 >> 6) & T.uint32(0x3)) << 24
+-                                        ) + base_words[c]
+-                                    else:
+-                                        code = T.cast(SFC_shared[s, j], T.uint32)
+-                                        SFB_shared[s, j, 0] = (
+-                                            (code & T.uint32(0xF))
+-                                            | ((code >> 4) & T.uint32(0xF)) << 8
+-                                            | ((code >> 8) & T.uint32(0xF)) << 16
+-                                            | ((code >> 12) & T.uint32(0xF)) << 24
+-                                        ) + base_words[c]
+-                                else:
+-                                    code = T.cast(SFC_shared[s, j], T.uint32)
+-                                    SFB_shared[s, j, 0] = (
+-                                        (code & T.uint32(0xF))
+-                                        | ((code >> 4) & T.uint32(0xF)) << 8
+-                                        | ((code >> 8) & T.uint32(0xF)) << 16
+-                                        | ((code >> 12) & T.uint32(0xF)) << 24
+-                                    ) + base_words[c]
+-                    T.sync_threads()
+-                    if ko < k_full:
+-                        T.mma_gemm_blockscaled(
+-                            A_shared[s, :, :],
+-                            B_shared[s, :, :],
+-                            C_local,
+-                            SFA_shared[s, :, :],
+-                            SFB_shared[s, :, :],
+-                            transpose_B=True,
+-                            k_start=0,
+-                            sf_a_granularity_k=SF_BLOCK,
+-                            sf_b_granularity_k=SF_BLOCK,
+-                        )
+-                    if BT is not None:  # noqa: SIM102
+-                        if ko == k_full:
+-                            T.mma_gemm_blockscaled(
+-                                A_shared[s, :, 0:tail],
+-                                B_shared[s, :, 0:tail],
+-                                C_local,
+-                                SFA_shared[s, :, :],
+-                                SFB_shared[s, :, :],
+-                                transpose_B=True,
+-                                k_start=0,
+-                                sf_a_granularity_k=SF_BLOCK,
+-                                sf_b_granularity_k=SF_BLOCK,
++
++                # Unroll by 2 * stages so stage indices and barrier parity phases
++                # fold at compile time in both the serial body and tail.
++                period = 2 * stages
++                full_groups = k_blocks // period
++                rem = k_blocks % period
++                if full_groups > 0:
++                    for ko_outer in T.serial(full_groups):
++                        for ko_inner in T.unroll(period):
++                            ko = ko_outer * period + ko_inner
++                            max_ko = (full_groups - 1) * period + ko_inner
++                            k_step(
++                                A, SFA, B, BT, SFB, SFB8, SFC8, SFC_shared,
++                                A_shared, B_shared, SFA_shared, SFB_shared,
++                                sf_dest, base_words, a_row, sfa_row, loaded,
++                                expert, bx, tx, C_local, Narrow_flag, code_base,
++                                ko, ko_inner % stages, ko_inner // stages,
++                                (ko_inner + stages - 1) % stages, True, max_ko,
+                             )
++                for ko_inner in T.unroll(rem):
++                    ko = full_groups * period + ko_inner
++                    k_step(
++                        A, SFA, B, BT, SFB, SFB8, SFC8, SFC_shared, A_shared,
++                        B_shared, SFA_shared, SFB_shared, sf_dest, base_words,
++                        a_row, sfa_row, loaded, expert, bx, tx, C_local,
++                        Narrow_flag, code_base, ko, ko % stages,
++                        (ko // stages) % 2, (ko + stages - 1) % stages,
++                        ko + stages - 1 < k_blocks, ko,
++                    )
+                 if trigger_after_loop:
+                     pdl.trigger()
+                 # Only real rows are stored; padding rows of the layout stay untouched.
+-- 
+2.43.0
+

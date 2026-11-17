@@ -1,0 +1,329 @@
+From 0f55693e7a76903aef9c76a6564736cc7004a873 Mon Sep 17 00:00:00 2001
+From: Christopher Owen <3221756+christopherowen@users.noreply.github.com>
+Date: Fri, 13 Nov 2026 19:56:45 +0000
+Subject: [PATCH] fix(dsv41): read the vision GELU from torch's table, not the
+ toolkit's erff
+
+Upstream base: local-inference-lab/vllm 19f2c20ed4d64ae22bd009ceacadd85e2a81e354
+with candidate-55's series applied through 0806.
+
+Rationale:
+The aligner's fused GELU epilogue is DeepSeek's reference, F.gelu as torch
+evaluates it on BF16: (0.5 * x) * (1 + erff(x * M_SQRT1_2)) in FP32, rounded.
+The kernels called erff themselves, and the last bit of erff belongs to the
+toolkit that compiles the caller. candidate-55 compiles its kernels with CUDA
+13.5 beside torch 2.13.0+cu130, whose erff is CUDA 13.0's. The two differ by
+one FP32 step in the tail, 1 + erff cancels there, and seven BF16 inputs
+(-3.140625, -4.03125, -4.28125, -4.5625, -5.0, -5.25, -5.34375) round to the
+neighbouring BF16 value: test_gelu_epilogue_is_the_reference[144] and
+test_gelu_epilogue_is_the_reference_everywhere[gemm] and [gemv] fail. The
+kernel cache key did not name the compiler before TileLang 0014, so earlier
+builds loaded kernels CUDA 13.0 had compiled and passed.
+
+gelu_table(device) is F.gelu of each of the 65536 BF16 bit patterns, built by
+torch on the device. The GEMM's and the GEMV's GELU epilogues take it as an
+operand before the output and read the entry at the rounded biased value's
+bits. The epilogue is then torch's result for every input, NaN and the
+infinities included, under any toolkit and any torch. The aligner's workspace
+holds the table (128 KiB a rank), built where the workspace is, outside
+capture.
+
+Quality implications:
+Image inputs only. With kernels CUDA 13.5 compiles, the aligner's hidden
+values return to DeepSeek's reference at the seven inputs above (one BF16 step
+at 0.0026, the others below 1.2e-4); against kernels CUDA 13.0 compiled,
+nothing changes. No text path, kernel tile or accumulation changes.
+
+Tests:
+- tests/kernels/test_deepseek_v41_tilelang_vision.py, mounted over
+  candidate-55's fifth build (CUDA 13.5.37) on a GB10 with an empty kernel
+  cache: 108 passed; the three tests above fail without the change.
+- The first projection with its epilogue (N 5120, K 9216), 300 launches, two
+  runs each way: 404 to 408 us at 4 and 8 rows, 790 to 801 us at 144 rows and
+  1,948 to 1,964 us at 576 rows with either epilogue.
+
+Upstream status: local spark-ds41f patch, carried from candidate-55's sixth
+build; not submitted upstream.
+---
+ .../test_deepseek_v41_tilelang_vision.py      |  6 +-
+ .../deepseek_v4_1/nvidia/tilelang_vision.py   |  5 +-
+ vllm/models/deepseek_v4_1/tilelang/vision.py  | 90 +++++++++++++------
+ 3 files changed, 72 insertions(+), 29 deletions(-)
+
+diff --git a/tests/kernels/test_deepseek_v41_tilelang_vision.py b/tests/kernels/test_deepseek_v41_tilelang_vision.py
+index c9685b43a..5a7eb6b3f 100644
+--- a/tests/kernels/test_deepseek_v41_tilelang_vision.py
++++ b/tests/kernels/test_deepseek_v41_tilelang_vision.py
+@@ -717,7 +717,8 @@ def _aligner_w1(aligner, merged: torch.Tensor, gelu: bool) -> torch.Tensor:
+     else:
+         call = vision.linear_call(aligner.out_dim, k, bias=True, gelu=gelu)
+     out = torch.empty(rows, aligner.out_dim, dtype=torch.bfloat16, device=DEVICE)
+-    vision.resolve(call)(merged, aligner.w1.weight, aligner.w1.bias, out)
++    table = (vision.gelu_table(DEVICE),) if gelu else ()
++    vision.resolve(call)(merged, aligner.w1.weight, aligner.w1.bias, *table, out)
+     return out
+ 
+ 
+@@ -768,6 +769,7 @@ def _gelu_through_epilogue(aligner, table: torch.Tensor, gemv: bool) -> torch.Te
+         else vision.linear_call(n, k, bias=True, gelu=True)
+     )
+     kernel, bias = vision.resolve(call), torch.zeros(n, device=DEVICE).bfloat16()
++    reference = vision.gelu_table(DEVICE)
+     step = vision.GEMV_ROWS if gemv else table.shape[0]
+     outs = []
+     for start in range(0, table.shape[0], step):
+@@ -777,7 +779,7 @@ def _gelu_through_epilogue(aligner, table: torch.Tensor, gemv: bool) -> torch.Te
+         weight = torch.zeros(n, k, dtype=torch.bfloat16, device=DEVICE)
+         weight[:, : rows.shape[0]] = rows.T
+         out = torch.empty(rows.shape, dtype=torch.bfloat16, device=DEVICE)
+-        kernel(a, weight, bias, out)
++        kernel(a, weight, bias, reference, out)
+         outs.append(out)
+     return torch.cat(outs)
+ 
+diff --git a/vllm/models/deepseek_v4_1/nvidia/tilelang_vision.py b/vllm/models/deepseek_v4_1/nvidia/tilelang_vision.py
+index a858bad01..508c3156a 100644
+--- a/vllm/models/deepseek_v4_1/nvidia/tilelang_vision.py
++++ b/vllm/models/deepseek_v4_1/nvidia/tilelang_vision.py
+@@ -575,6 +575,7 @@ class _AlignerWorkspace:
+         self.hidden = torch.empty(
+             (rows, local_out_dim), dtype=torch.bfloat16, device=device
+         )
++        self.gelu = kernels.gelu_table(device)
+         self.local_out = (
+             torch.empty((rows, out_dim), dtype=torch.bfloat16, device=device)
+             if sharded
+@@ -724,13 +725,13 @@ class DeepseekV4Aligner(nn.Module):
+             assert ws.local_out is not None
+             local_out = ws.local_out[:rows]
+             if self.valid_out_dim > 0:
+-                project["w1"](merged, self.w1.weight, self.w1.bias, hidden)
++                project["w1"](merged, self.w1.weight, self.w1.bias, ws.gelu, hidden)
+                 project["w2"](hidden, self.w2.weight, self.w2.bias, local_out)
+             else:
+                 local_out.zero_()
+             _reduce_rows(local_out, out, self.tp_size)
+         else:
+-            project["w1"](merged, self.w1.weight, self.w1.bias, hidden)
++            project["w1"](merged, self.w1.weight, self.w1.bias, ws.gelu, hidden)
+             project["w2"](hidden, self.w2.weight, self.w2.bias, out)
+         slices: list[torch.Tensor] = []
+         offset = 0
+diff --git a/vllm/models/deepseek_v4_1/tilelang/vision.py b/vllm/models/deepseek_v4_1/tilelang/vision.py
+index bcabe0c74..9cc536a2f 100644
+--- a/vllm/models/deepseek_v4_1/tilelang/vision.py
++++ b/vllm/models/deepseek_v4_1/tilelang/vision.py
+@@ -39,9 +39,14 @@ reorder it:
+   kernels' (bias, bias and GELU, SwiGLU of a column's gate and up rows).
+ - GELU of a rounded BF16 value ``x`` is DeepSeek's reference, ``F.gelu`` as torch
+   evaluates it on BF16: ``(0.5 * x) * (1 + erff(x * M_SQRT1_2))`` in FP32, rounded
+-  to BF16. B12X evaluates the same formula with CuTe's ``erf``, whose last bits are
+-  not CUDA's ``erff``: 21 of 327680 aligner outputs differ from B12X's (DeepSeek's
+-  reference semantics over production's bits).
++  to BF16. The epilogue reads it from ``gelu_table``, torch's own result for each
++  of the 65536 BF16 values, and calls no ``erff`` of its own: the last bit of
++  ``erff`` belongs to the toolkit that compiles the caller, and GELU's
++  ``1 + erff`` cancels, so one FP32 step moves a BF16 rounding (a kernel compiled
++  with CUDA 13.5 beside a torch built with CUDA 13.0 differed at seven BF16
++  inputs between -3.14 and -5.35). B12X evaluates the formula with CuTe's ``erf``,
++  whose last bits are not CUDA's ``erff`` either: 21 of 327680 aligner outputs
++  differ from B12X's (DeepSeek's reference semantics over production's bits).
+ - ``rope_qkv``: B12X's 2-D split-half rotation of q and k, in place in the fused
+   projection's output (v stays where it is; attention reads all three there). Pair
+   ``j`` of a head (columns ``j`` and ``j + head_dim / 2``) rotates by
+@@ -83,6 +88,8 @@ the tower (``nvidia/tilelang_vision.py``) launches nothing else.
+ # annotations eagerly, and the symbolic shapes must resolve.
+ import tilelang
+ import tilelang.language as T
++import torch
++import torch.nn.functional as F
+ 
+ from vllm.models.deepseek_v4_1.tilelang import prepare
+ 
+@@ -112,7 +119,7 @@ LINEAR_TILE = dict(block_M=128, block_N=128, num_stages=2, threads=256)
+ SWIGLU_TILE = dict(block_M=128, block_N=64, num_stages=2, threads=256)
+ ATTENTION_TILE = dict(block_M=128, block_N=64, num_stages=2, threads=128)
+ 
+-_SQRT_HALF = 0.7071067811865476  # torch's M_SQRT1_2 for GELU, rounded to FP32
++GELU_TABLE_SIZE = 1 << 16  # one entry a BF16 value, at the value's bits
+ 
+ 
+ def padded_width(width: int) -> int:
+@@ -154,15 +161,18 @@ def pad_columns_kernel(width: int, padded: int, threads: int = 128):
+     return vision_pad_columns
+ 
+ 
+-def _gelu(value):
+-    """DeepSeek's reference GELU of a BF16 value, ``F.gelu`` as torch evaluates it
+-    on BF16: ``(0.5 * x) * (1 + erff(x * M_SQRT1_2))`` in FP32, rounded to BF16."""
+-    x = T.cast(value, T.float32)
+-    inner = T.erf(T.fmul(x, T.float32(_SQRT_HALF)))
+-    return T.cast(
+-        T.fmul(T.fmul(T.float32(0.5), x), T.ieee_add(T.float32(1), inner)),
+-        T.bfloat16,
+-    )
++def gelu_table(device) -> torch.Tensor:
++    """DeepSeek's reference GELU of every BF16 value: ``F.gelu`` as torch evaluates
++    it on ``device``, indexed by the value's 16 bits read as an unsigned integer
++    (NaN and the infinities included; the GELU epilogues' ``Gelu`` operand)."""
++    bits = torch.arange(GELU_TABLE_SIZE, dtype=torch.int32, device=device)
++    signed = torch.where(bits < 1 << 15, bits, bits - GELU_TABLE_SIZE)
++    return F.gelu(signed.to(torch.int16).view(torch.bfloat16))
++
++
++def _gelu(value, table):
++    """DeepSeek's reference GELU of a BF16 value: its entry of ``gelu_table``."""
++    return table[T.reinterpret(value, T.uint16)]
+ 
+ 
+ def _swiglu(gate, up):
+@@ -196,7 +206,8 @@ def linear_kernel(
+ ):
+     """``C[M, N] = bf16(A @ W^T (+ bias))`` for BF16 ``A[M, K]``, ``W[N, K]`` and
+     ``bias[N]``: each 64-wide K block summed from zero on the tensor cores, the
+-    blocks added in FP32 in K order; with ``gelu``, ``bf16(gelu(C))``."""
++    blocks added in FP32 in K order; with ``gelu``, ``bf16(gelu(C))``, read from
++    ``Gelu`` (``gelu_table``), an operand before ``C``."""
+     block_K = _K_ALIGN
+     if N % block_N or K % block_K:
+         raise ValueError(f"[{N}, {K}] is not whole {block_N} x {block_K} tiles")
+@@ -207,7 +218,7 @@ def linear_kernel(
+     M = T.dynamic("M")
+ 
+     @T.macro
+-    def body(A, W, Bias, C):
++    def body(A, W, Bias, Gelu, C):
+         with T.Kernel(N // block_N, T.ceildiv(M, block_M), threads=threads) as (
+             bx,
+             by,
+@@ -228,14 +239,26 @@ def linear_kernel(
+                 for i, j in T.Parallel(block_M, block_N):
+                     biased = _biased(acc[i, j], Bias[bx * block_N + j])
+                     if gelu:
+-                        out[i, j] = _gelu(biased)
++                        out[i, j] = _gelu(biased, Gelu)
+                     else:
+                         out[i, j] = biased
+                 T.copy(out, C[by * block_M, bx * block_N])
+             else:
+                 T.copy(acc, C[by * block_M, bx * block_N])
+ 
+-    if bias:
++    if gelu:
++
++        @T.prim_func
++        def vision_linear(
++            A: T.Tensor((M, K), T.bfloat16),
++            W: T.Tensor((N, K), T.bfloat16),
++            Bias: T.Tensor((N,), T.bfloat16),
++            Gelu: T.Tensor((GELU_TABLE_SIZE,), T.bfloat16),
++            C: T.Tensor((M, N), T.bfloat16),
++        ):
++            body(A, W, Bias, Gelu, C)
++
++    elif bias:
+ 
+         @T.prim_func
+         def vision_linear(
+@@ -244,7 +267,7 @@ def linear_kernel(
+             Bias: T.Tensor((N,), T.bfloat16),
+             C: T.Tensor((M, N), T.bfloat16),
+         ):
+-            body(A, W, Bias, C)
++            body(A, W, Bias, None, C)
+ 
+     else:
+ 
+@@ -254,7 +277,7 @@ def linear_kernel(
+             W: T.Tensor((N, K), T.bfloat16),
+             C: T.Tensor((M, N), T.bfloat16),
+         ):
+-            body(A, W, None, C)
++            body(A, W, None, None, C)
+ 
+     return vision_linear
+ 
+@@ -320,7 +343,8 @@ def swiglu_linear_kernel(
+ def gemv_kernel(N: int, K: int, epilogue: str, rows_per_tile: int = GEMV_ROWS):
+     """``C[M, :] = epilogue(A @ W^T)`` for BF16 ``A[M, K]`` and ``W[N, K]``, a few
+     rows, with B12X's SIMT projection arithmetic (module docstring). ``epilogue``:
+-    ``none``; ``bias`` (``Bias[N]``); ``gelu`` (the bias, then GELU); ``swiglu``
++    ``none``; ``bias`` (``Bias[N]``); ``gelu`` (the bias, then GELU read from
++    ``Gelu``, ``gelu_table``, an operand before ``C``); ``swiglu``
+     (``W`` stacks the gate's and the up's ``N / 2`` rows; ``C`` is ``N / 2`` wide)."""
+     if epilogue not in _EPILOGUES:
+         raise ValueError(f"unknown projection epilogue {epilogue!r}")
+@@ -337,7 +361,7 @@ def gemv_kernel(N: int, K: int, epilogue: str, rows_per_tile: int = GEMV_ROWS):
+     M = T.dynamic("M")
+ 
+     @T.macro
+-    def body(A, W, Bias, C):
++    def body(A, W, Bias, Gelu, C):
+         with T.Kernel(columns, T.ceildiv(M, rows_per_tile), threads=threads) as (
+             col,
+             tile,
+@@ -410,11 +434,25 @@ def gemv_kernel(N: int, K: int, epilogue: str, rows_per_tile: int = GEMV_ROWS):
+                             elif epilogue == "none":
+                                 C[first + r, col] = T.cast(acc[r], T.bfloat16)
+                             elif epilogue == "gelu":
+-                                C[first + r, col] = _gelu(_biased(acc[r], Bias[col]))
++                                C[first + r, col] = _gelu(
++                                    _biased(acc[r], Bias[col]), Gelu
++                                )
+                             else:
+                                 C[first + r, col] = _biased(acc[r], Bias[col])
+ 
+-    if epilogue in ("bias", "gelu"):
++    if epilogue == "gelu":
++
++        @T.prim_func
++        def vision_gemv(
++            A: T.Tensor((M, K), T.bfloat16),
++            W: T.Tensor((N, K), T.bfloat16),
++            Bias: T.Tensor((N,), T.bfloat16),
++            Gelu: T.Tensor((GELU_TABLE_SIZE,), T.bfloat16),
++            C: T.Tensor((M, columns), T.bfloat16),
++        ):
++            body(A, W, Bias, Gelu, C)
++
++    elif epilogue == "bias":
+ 
+         @T.prim_func
+         def vision_gemv(
+@@ -423,7 +461,7 @@ def gemv_kernel(N: int, K: int, epilogue: str, rows_per_tile: int = GEMV_ROWS):
+             Bias: T.Tensor((N,), T.bfloat16),
+             C: T.Tensor((M, columns), T.bfloat16),
+         ):
+-            body(A, W, Bias, C)
++            body(A, W, Bias, None, C)
+ 
+     else:
+ 
+@@ -433,7 +471,7 @@ def gemv_kernel(N: int, K: int, epilogue: str, rows_per_tile: int = GEMV_ROWS):
+             W: T.Tensor((N, K), T.bfloat16),
+             C: T.Tensor((M, columns), T.bfloat16),
+         ):
+-            body(A, W, None, C)
++            body(A, W, None, None, C)
+ 
+     return vision_gemv
+ 
+@@ -793,6 +831,7 @@ def resolve(call: prepare.TileLangCall):
+ __all__ = [
+     "ATTENTION_TILE",
+     "EPS",
++    "GELU_TABLE_SIZE",
+     "GEMV_ROWS",
+     "LINEAR_TILE",
+     "SWIGLU_TILE",
+@@ -801,6 +840,7 @@ __all__ = [
+     "attention_kernel",
+     "gemv_call",
+     "gemv_kernel",
++    "gelu_table",
+     "linear_call",
+     "linear_kernel",
+     "merge_call",
+-- 
+2.43.0
+

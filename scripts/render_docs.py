@@ -793,7 +793,7 @@ def render_current_state_active_settings(data: dict[str, Any]) -> str:
         ),
         (
             "Prefix caching & API semantics",
-            "256-token blocks (`--enable-prefix-caching`, `--enable-prompt-tokens-details`); thinking enabled by default, top-level `thinking` switch, effort aliases, `response_format`, `tool_choice: none`, assistant prefix, and generation defaults `temperature: 1.0, top_p: 1.0`",
+            "256-token blocks (`--enable-prefix-caching`, `--enable-prompt-tokens-details`, `--enable-per-request-metrics`); thinking enabled by default, top-level `thinking` switch, effort aliases, `response_format`, `tool_choice: none`, assistant prefix, and generation defaults `temperature: 1.0, top_p: 1.0`",
         ),
     ]
 

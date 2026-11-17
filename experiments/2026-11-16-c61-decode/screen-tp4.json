@@ -1,0 +1,86 @@
+{
+  "experiment": "experiments/2026-11-16-c61-decode",
+  "run": "c61-r7-screen-tp4",
+  "jobs": [
+    {
+      "kind": "sync"
+    },
+    {
+      "kind": "measure",
+      "bench": false,
+      "bracket": false,
+      "telemetry": true,
+      "arms": [
+        {
+          "config": "experiments/2026-11-16-c61-decode/tp4-dev.json",
+          "label": "c61-r7"
+        }
+      ],
+      "extras": [
+        [
+          "scripts/servebench_run.py",
+          [
+            "--mode",
+            "closed",
+            "--concurrency",
+            "1",
+            "--warmup",
+            "30",
+            "--duration",
+            "150",
+            "--max-tokens",
+            "256",
+            "--seed",
+            "0",
+            "--extra-body",
+            "{\"chat_template_kwargs\":{\"thinking\":false}}",
+            "--label",
+            "{label}",
+            "--output",
+            "results/private/c61-screens/{run}/{label}/c1.json",
+            "--save-requests"
+          ],
+          "c1"
+        ],
+        [
+          "scripts/servebench_run.py",
+          [
+            "--mode",
+            "closed",
+            "--concurrency",
+            "16",
+            "--warmup",
+            "30",
+            "--duration",
+            "90",
+            "--max-tokens",
+            "256",
+            "--seed",
+            "0",
+            "--extra-body",
+            "{\"chat_template_kwargs\":{\"thinking\":false}}",
+            "--label",
+            "{label}",
+            "--output",
+            "results/private/c61-screens/{run}/{label}/c16.json"
+          ],
+          "c16"
+        ],
+        [
+          "experiments/2026-11-10-tp4-ring-determinism/token_determinism_record.py",
+          [
+            "--tokens",
+            "192",
+            "--long-lines",
+            "700",
+            "--wide",
+            "--no-logprobs",
+            "--record",
+            "results/private/determinism/{run}/record-greedy-{label}.json"
+          ],
+          "greedy"
+        ]
+      ]
+    }
+  ]
+}

@@ -62,6 +62,209 @@ def fan_control_enabled(cluster: dict) -> bool:
 
 
 # Every key of the container section that a command reads.
+_SHAPE_TO_PROFILE_STEM = {"tp4-ring": "tp4", "tp3-triangle": "tp3"}
+_L2_PREFETCH_TARGET = "/opt/spark-ds41f/candidate/vllm/vllm/models/deepseek_v4_1/l2_prefetch.py"
+_L2_PREFETCH_DEFAULT_MB = (
+    ("VLLM_DS41_L2_PREFETCH_WO_MB", "15"),
+    ("VLLM_DS41_L2_PREFETCH_FFN_MB", "12"),
+    ("VLLM_DS41_L2_PREFETCH_NEXT_MB", "12"),
+)
+_ROCE_MAX_COLLECTIVE_BY_SHAPE = {
+    "tp4-ring": "2097152",
+    "tp3-triangle": "4194304",
+    "tp3-switched": "4194304",
+    "tp3-triangle-4k": "4194304",
+}
+_RENDERED_ENV_KEYS = frozenset((
+    "GLOO_SOCKET_IFNAME",
+    "NCCL_SOCKET_IFNAME",
+    "UCX_NET_DEVICES",
+    "SPARKNET_ROCE_IFACES",
+    "VLLM_HOST_IP",
+)) | frozenset(cluster_recipe.SWITCHED_DIRECT_ENV)
+_REPORTING_SERVE_ARGS = frozenset(("--enable-prompt-tokens-details", "--enable-per-request-metrics"))
+_L2_PREFETCH_DEFAULT_RE = {
+    key: re.compile(rf'_mb\("{re.escape(key)}",\s*"(\d+)"\)')
+    for key, _ in _L2_PREFETCH_DEFAULT_MB
+}
+
+
+def _series_patch_names(upstreams: dict, source_name: str) -> set[str]:
+    source = upstreams.get("sources", {}).get(source_name, {})
+    rel = source.get("patch_series") if isinstance(source, dict) else None
+    if not isinstance(rel, str) or not rel:
+        return set()
+    series_path = ROOT / rel
+    if not series_path.is_file():
+        return set()
+    return {Path(entry).name for entry in read_series(series_path)}
+
+
+def _overlay_has_sane_l2_defaults(cluster: dict) -> bool:
+    for mount in cluster.get("container", {}).get("mounts", []):
+        if not isinstance(mount, (list, tuple)) or len(mount) < 2:
+            continue
+        if mount[1] != _L2_PREFETCH_TARGET:
+            continue
+        src = str(mount[0])
+        path = ROOT / src[len("{checkout}/"):] if src.startswith("{checkout}/") else Path(src)
+        if not path.is_file():
+            return False
+        text = path.read_text(encoding="utf-8")
+        return all(
+            (match := _L2_PREFETCH_DEFAULT_RE[key].search(text)) is not None
+            and match.group(1) == expected
+            for key, expected in _L2_PREFETCH_DEFAULT_MB
+        )
+    return False
+
+
+def _expected_wo_band(shape: str | None) -> str | None:
+    if not isinstance(shape, str) or not shape:
+        return None
+    if shape.startswith("tp3"):
+        return "17-32=12"
+    if re.match(r"^tp[4-8](?:-|$)", shape):
+        return "17-32=10"
+    return None
+
+
+def _cluster_shape(cluster: dict) -> str | None:
+    shape = cluster.get("shape")
+    if isinstance(shape, str) and shape:
+        return shape
+    tp_raw = topology.argument(cluster, "--tensor-parallel-size")
+    if not tp_raw or not str(tp_raw).isdigit():
+        return None
+    tp = int(tp_raw)
+    fabric = cluster.get("fabric", {})
+    transport = fabric.get("transport") if isinstance(fabric, dict) else None
+    topo = fabric.get("topology") if isinstance(fabric, dict) else None
+    if topo == "switched" or (isinstance(transport, str) and transport.endswith("-switched")):
+        return f"tp{tp}-switched"
+    if tp == 4 and transport in ("oneshot-ring4", "nccl-ring"):
+        return "tp4-ring"
+    if tp == 3 and transport in ("oneshot-direct", "nccl-direct"):
+        max_len = topology.argument(cluster, "--max-model-len")
+        return "tp3-triangle-4k" if str(max_len) == "262144" else "tp3-triangle"
+    return None
+
+
+def _qualified_reference(cluster: dict, shape: str, stem: str) -> dict | None:
+    upstreams_cfg = cluster.get("upstreams_config")
+    if isinstance(upstreams_cfg, str) and upstreams_cfg:
+        ref_rel = Path(upstreams_cfg).parent / f"{stem}.json"
+        if (ROOT / ref_rel).is_file():
+            return read_cluster(str(ref_rel))
+        return None
+    prod = read_json(DEFAULT_CLUSTER_CONFIG)
+    if (
+        shape in prod.get("shapes", {})
+        and cluster.get("promoted_baseline") == prod.get("promoted_baseline")
+        and cluster.get("container", {}).get("image") == prod.get("container", {}).get("image")
+    ):
+        return cluster_recipe.resolve(prod, shape)
+    return None
+
+
+def _comparable_serve_args(args: list) -> list[str]:
+    out: list[str] = []
+    skip_next = False
+    for item in args:
+        if skip_next:
+            skip_next = False
+            continue
+        if item == "--port":
+            skip_next = True
+            continue
+        if item in _REPORTING_SERVE_ARGS:
+            continue
+        out.append(str(item))
+    return out
+
+
+def qualified_recipe_problems(cluster: dict, nodes: dict, upstreams: dict) -> list[str]:
+    """Warn when a cluster configuration drifts from its stack's qualified settings."""
+    if len(nodes.get("nodes", [])) <= 1:
+        return []
+
+    warnings: list[str] = []
+    shape_str = _cluster_shape(cluster)
+    stem = _SHAPE_TO_PROFILE_STEM.get(shape_str, shape_str) if shape_str else None
+    env = cluster.get("environment", {})
+    checked_keys: set[str] = set()
+
+    vllm_patches = _series_patch_names(upstreams, "vllm")
+    sparknet_patches = _series_patch_names(upstreams, "sparknet")
+    has_l2pf = any(name.startswith("0781-") for name in vllm_patches)
+    has_wo_bands = any(name.startswith("0806-") for name in vllm_patches)
+    has_roce_cutoff = any(name.startswith("0002-") for name in sparknet_patches)
+    l2pf_enabled = str(env.get("VLLM_DS41_L2_PREFETCH", "1")) != "0"
+
+    if has_l2pf and l2pf_enabled:
+        overlay_sane = _overlay_has_sane_l2_defaults(cluster)
+        for key, expected in _L2_PREFETCH_DEFAULT_MB:
+            checked_keys.add(key)
+            if key not in env:
+                if not overlay_sane:
+                    warnings.append(Warn(
+                        f"{key} is unset without a 15/12/12 l2_prefetch.py overlay; "
+                        f"expected qualified {expected!r}"
+                    ))
+            elif str(env[key]) != expected:
+                warnings.append(Warn(
+                    f"{key}={str(env[key])!r}, expected qualified {expected!r}"
+                ))
+
+    if has_wo_bands and l2pf_enabled:
+        expected_band = _expected_wo_band(shape_str)
+        if expected_band is not None:
+            checked_keys.add("VLLM_DS41_L2_PREFETCH_WO_BANDS")
+            actual_band = env.get("VLLM_DS41_L2_PREFETCH_WO_BANDS")
+            if actual_band != expected_band:
+                warnings.append(Warn(
+                    f"VLLM_DS41_L2_PREFETCH_WO_BANDS={actual_band!r}, "
+                    f"expected qualified {expected_band!r} for {shape_str}"
+                ))
+
+    if has_roce_cutoff and shape_str in _ROCE_MAX_COLLECTIVE_BY_SHAPE:
+        checked_keys.add("SPARKNET_ROCE_MAX_COLLECTIVE_BYTES")
+        expected_cutoff = _ROCE_MAX_COLLECTIVE_BY_SHAPE[shape_str]
+        actual_cutoff = env.get("SPARKNET_ROCE_MAX_COLLECTIVE_BYTES")
+        if actual_cutoff != expected_cutoff:
+            warnings.append(Warn(
+                f"SPARKNET_ROCE_MAX_COLLECTIVE_BYTES={actual_cutoff!r}, "
+                f"expected qualified {expected_cutoff!r} for {shape_str}"
+            ))
+
+    if shape_str and stem:
+        ref = _qualified_reference(cluster, shape_str, stem)
+        if ref is not None:
+            ignored = _RENDERED_ENV_KEYS | checked_keys
+            actual_env = {
+                str(k): str(v)
+                for k, v in env.items()
+                if k not in ignored and not (k == "VLLM_SERVER_DEV_MODE" and str(v) == "1")
+            }
+            ref_env = {
+                str(k): str(v)
+                for k, v in ref.get("environment", {}).items()
+                if k not in ignored and not (k == "VLLM_SERVER_DEV_MODE" and str(v) == "1")
+            }
+            for key in sorted(set(actual_env) | set(ref_env)):
+                if actual_env.get(key) != ref_env.get(key):
+                    warnings.append(Warn(
+                        f"qualified config drift for {shape_str}: environment[{key!r}]="
+                        f"{actual_env.get(key)!r}, expected {ref_env.get(key)!r}"
+                    ))
+            if _comparable_serve_args(cluster.get("serve_args", [])) != _comparable_serve_args(ref.get("serve_args", [])):
+                warnings.append(Warn(
+                    f"qualified config drift for {shape_str}: serve_args differ from qualified profile"
+                ))
+
+    return warnings
+
+
 CONTAINER_KEYS = frozenset(("name", "image", "expected_labels", "docker_run_args", "mounts"))
 
 
@@ -71,6 +274,7 @@ def local_doctor(cluster: dict, nodes: dict, upstreams: dict) -> list[str]:
     capture_errors, capture_warnings = cluster_recipe.capture_problems(cluster)
     problems.extend(capture_errors)
     problems.extend(Warn(warning) for warning in capture_warnings)
+    problems.extend(qualified_recipe_problems(cluster, nodes, upstreams))
     problems.extend(benchmark_reference_problems(cluster, nodes))
     if cluster.get("promoted_baseline") != upstreams.get("generated_from_baseline"):
         problems.append("cluster and upstream locks name different baselines")
@@ -146,6 +350,7 @@ def local_doctor(cluster: dict, nodes: dict, upstreams: dict) -> list[str]:
         if lockfile and not (ROOT / lockfile).is_file():
             problems.append(f"{name}: missing dependency lock {lockfile}")
     problems.extend(cuda_toolkit_problems(upstreams["sources"]))
+    problems.extend(torch_problems(upstreams["sources"]))
     watchlist_path = ROOT / "docs/inspiration.md"
     watchlist = (
         watchlist_path.read_text(encoding="utf-8") if watchlist_path.is_file() else ""

@@ -128,9 +128,20 @@ Against the marks:
    `candidate-55`'s own boots differ by up to 0.079 and 0.064 ms.
 5. **The control: met.** `candidate-55-overlay-unset` is +0.08% on the grid at `tp4-ring` and -0.06% at `tp4-switched`, and
    its 24-row shapes are within 0.3% of `candidate-55`.
-6. **Outputs: not measured yet.** See the note on the first gate jobs above.
+6. **Outputs: met.** With the overlay mounted (the live container of a gate boot was inspected at each testbed), runs
+   `l2-prefetch-row-bands-gate-tp4-r2` (10:45Z to 11:11Z) and `l2-prefetch-row-bands-gate-tp4-switched-r2` (10:39Z to
+   11:06Z), both at `b5448d985`: both boots at each testbed give 18d61961/d6568649 on the log-probability run and
+   0a2dacdd/12fd8257 on the text runs, candidate-54's TP4 hashes, and `bin/spark candidate gate` passes.
 
 `tp4-switched` gains as much as the ring, though its 24-row shapes were only 0.8% behind candidate-54 with both builds
 capped: the 15 MB WO window is too large for the 32-row tier at both fabrics, not only where it showed as a loss.
+
+## Conclusion
+
+All six marks are met at `tp4-ring` and `tp4-switched`. The WO window at 10 MB for forwards of 17 to 32 rows recovers the
+24- and 32-row shapes (about 2.5% a step), moves nothing else, and leaves the outputs candidate-54's. The patch is ready
+to enter a candidate's vLLM series with `VLLM_DS41_L2_PREFETCH_WO_BANDS=17-32=10` in the TP4 recipe; here it was only
+mounted over the fourth build. Not measured: 20 and 28 rows, which are in the band and not in the grid; other bands or
+budgets; TP3 and TP5 to TP8; the serving benchmark, which no mark here covers.
 
 Receipts: [candidate-55/receipts/l2-prefetch-row-bands](../2026-10-26-spark-ds41f-candidate/candidate-55/receipts/l2-prefetch-row-bands).

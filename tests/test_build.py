@@ -2,7 +2,10 @@
 
 from __future__ import annotations
 
+import contextlib
 import copy
+import hashlib
+import io
 import json
 import sys
 import tempfile
@@ -424,12 +427,147 @@ class CudaToolkitTest(unittest.TestCase):
         self.assertTrue(stages["runtime"].startswith("${RUNTIME_CORE_STAGE} AS runtime"))
         self.assertEqual([name for name, code in stages.items() if "cuda-toolkit-debs" in code], ["cuda-13-5"])
         self.assertEqual([name for name, code in stages.items() if "spark-wire-cuda-13-5" in code],
-                         ["cuda-13-5", "runtime-core-cuda-13-5"])
+                         ["cuda-13-5", "cuda-13-5-torch-2-16", "runtime-core-cuda-13-5"])
         self.assertEqual([name for name, code in stages.items() if "13.5" in code],
-                         ["cuda-13-5", "runtime-core-cuda-13-5"])
+                         ["cuda-13-5", "runtime-core-cuda-13-5", "runtime-core-cuda-13-5-torch-2-16"])
         self.assertNotIn("apt-get", stages["cuda-13-5"])
         self.assertIn("dpkg -i /tmp/cuda-toolkit-debs/*.deb", stages["cuda-13-5"])
         self.assertIn('LABEL local.spark-ds41f.cuda.version="13.5.37"', stages["runtime-core-cuda-13-5"])
+
+    def test_only_the_torch_stages_install_or_label_it(self) -> None:
+        text = (ROOT / "docker/Dockerfile").read_text()
+        stages = {}
+        for block in text.split("\nFROM ")[1:]:
+            header = block.splitlines()[0]
+            code = "\n".join(line for line in block.splitlines() if not line.lstrip().startswith("#"))
+            stages[header.split(" AS ")[-1] if " AS " in header else "final"] = code
+        for version, (toolkit, install, check) in spark.TORCH_STAGES.items():
+            self.assertTrue(stages[install].startswith(f"{spark.CUDA_TOOLKIT_STAGES[toolkit][0]} AS {install}"))
+            self.assertTrue(stages[check].startswith(f"{spark.CUDA_TOOLKIT_STAGES[toolkit][1]} AS {check}"))
+            self.assertIn("pip install --no-cache-dir --no-index --no-deps --force-reinstall", stages[install])
+            self.assertIn(f'LABEL local.spark-ds41f.torch.version="{version}"', stages[check])
+        self.assertEqual([name for name, code in stages.items() if "torch-wheels" in code],
+                         [install for _, install, _ in spark.TORCH_STAGES.values()])
+        self.assertEqual([name for name, code in stages.items() if "torch.version" in code],
+                         [check for _, _, check in spark.TORCH_STAGES.values()])
+        # The NCCL release is the lock's: the base image's unless the build passes another.
+        self.assertIn("\nARG NCCL_VERSION_CODE=23007\n", stages["runtime-core"])
+        self.assertEqual(spark.nccl_version_code({"nccl": {"tracking_ref": "refs/tags/v2.30.7-1"}}), 23007)
+        self.assertEqual(spark.nccl_version_code({"nccl": {"tracking_ref": "refs/tags/v2.32.3-1"}}), 23203)
+        self.assertEqual(spark.nccl_version_code({"nccl": {"tracking_ref": "refs/heads/main"}}), 23007)
+
+
+TORCH_SOURCE = {
+    "kind": "wheel",
+    "upstream": "https://download.pytorch.org/whl/nightly/cu135",
+    "version": "2.16.0.dev20261113+cu135",
+    "lockfile": "requirements/torch-2-16-cu135-aarch64.txt",
+    "role": "torch compiled for the lock's CUDA 13.5 toolkit",
+}
+
+
+class TorchWheelsTest(unittest.TestCase):
+    """A lock that lists sources.torch beside its CUDA toolkit installs that torch from
+    hash-verified wheels in the toolkit's stage; every other lock builds as before."""
+
+    def with_torch(self, lock: dict, toolkit: bool = True, **changes) -> dict:
+        lock = copy.deepcopy(lock)
+        if toolkit:
+            lock["sources"]["cuda_toolkit"] = dict(CUDA_TOOLKIT_SOURCE)
+        lock["sources"]["torch"] = {**TORCH_SOURCE, **changes}
+        return lock
+
+    def test_inputs_stages_and_context_follow_the_lock(self) -> None:
+        lock = spark.read_json("upstreams.lock.json")
+        del lock["sources"]["b12x"]
+        toolkit_only = self.with_torch(lock)
+        del toolkit_only["sources"]["torch"]
+        plain = spark.build_inputs(toolkit_only)
+        inputs = spark.build_inputs(self.with_torch(lock))
+        self.assertEqual({k: v for k, v in inputs.items() if k != "torch"}, plain)
+        self.assertNotEqual(spark.build_directory(inputs).name, spark.build_directory(plain).name)
+        self.assertEqual(spark.cuda_stages(inputs), ("cuda-13-5-torch-2-16", "runtime-core-cuda-13-5-torch-2-16"))
+        self.assertEqual(spark.tilelang_base_stage(inputs), "runtime-core-cuda-13-5-torch-2-16")
+        self.assertEqual(spark.build_contexts(inputs), (*spark.build_contexts(plain), "torch-wheels"))
+        wheels = inputs["torch"]["wheels"]
+        self.assertEqual(len(wheels), 22)
+        torch = wheels["torch-2.16.0.dev20261113+cu135-cp312-cp312-manylinux_2_28_aarch64.whl"]
+        self.assertEqual(torch["size"], 590730494)
+        self.assertTrue(torch["url"].startswith("https://download.pytorch.org/whl/nightly/cu135/torch-2.16.0"))
+        self.assertIn("nvidia_nccl_cu13-2.32.3-py3-none-manylinux_2_27_aarch64.whl", wheels)
+
+    def test_candidate_55_lists_it_with_the_nccl_release_it_needs(self) -> None:
+        lock = spark.read_json("experiments/2026-10-26-spark-ds41f-candidate/candidate-55/upstreams.lock.json")
+        self.assertEqual(spark.torch_problems(lock["sources"]), [])
+        inputs = spark.build_inputs(lock)
+        self.assertNotIn("torch", inputs)
+        self.assertEqual(spark.nccl_version_code(inputs), 23007)
+        self.assertEqual(spark.cuda_stages(inputs), ("cuda-13-5", "runtime-core-cuda-13-5"))
+        with_torch = self.with_torch(lock)
+        with_torch["sources"]["nccl"]["tracking_ref"] = "refs/tags/v2.32.3-1"
+        self.assertEqual(spark.torch_problems(with_torch["sources"]), [])
+        torch_inputs = spark.build_inputs(with_torch)
+        self.assertEqual(torch_inputs["torch"]["version"], "2.16.0.dev20261113+cu135")
+        self.assertEqual(spark.nccl_version_code(torch_inputs), 23203)
+        for released in ("upstreams.lock.json",
+                         "experiments/2026-10-26-spark-ds41f-candidate/candidate-54/upstreams.lock.json"):
+            self.assertNotIn("torch", spark.build_inputs(spark.read_json(released)))
+
+    def test_malformed_torch_sources_and_lockfiles_are_refused(self) -> None:
+        lock = spark.read_json("upstreams.lock.json")
+        self.assertEqual(spark.torch_problems(lock["sources"]), [])
+        self.assertEqual(spark.torch_problems(self.with_torch(lock)["sources"]), [])
+        self.assertEqual(spark.torch_problems(self.with_torch(lock, toolkit=False)["sources"]),
+                         ["torch: 2.16.0.dev20261113+cu135 is compiled for CUDA 13.5.37, "
+                          "but the lock's cuda_toolkit is None"])
+        for changes, problem in (
+            ({"kind": "deb"}, "torch: kind must be wheel"),
+            ({"upstream": "http://download.pytorch.org"}, "torch: upstream must be the https:// index"),
+            ({"version": "2.13.0+cu130"}, "torch: no Dockerfile stage installs torch '2.13.0+cu130'"),
+            ({"lockfile": "requirements/absent.txt"}, "torch: missing wheel lock requirements/absent.txt"),
+        ):
+            with self.subTest(changes=changes):
+                problems = spark.torch_problems(self.with_torch(lock, **changes)["sources"])
+                self.assertTrue(any(found.startswith(problem) for found in problems), problems)
+        good = (ROOT / TORCH_SOURCE["lockfile"]).read_text(encoding="utf-8")
+        first = next(line for line in good.splitlines() if line and not line.startswith("#"))
+        for text, problem in (
+            ("# nothing\n", "it lists no wheel"),
+            (first.replace("sha256:", "sha1:") + "\n", "line 1 is not"),
+            (first + "\n" + first + "\n", "is listed twice"),
+            ("\n".join(line for line in good.splitlines() if not line.startswith("torch-")) + "\n",
+             "must list torch at 2.16.0.dev20261113+cu135"),
+        ):
+            with self.subTest(problem=problem), tempfile.TemporaryDirectory(dir=ROOT / "requirements") as directory:
+                path = Path(directory) / "torch.txt"
+                path.write_text(text, encoding="utf-8")
+                relative = str(path.relative_to(ROOT))
+                problems = spark.torch_problems(self.with_torch(lock, lockfile=relative)["sources"])
+                self.assertTrue(any(problem in found for found in problems), problems)
+
+    def test_prepare_keeps_verified_wheels_and_refuses_a_changed_one(self) -> None:
+        payload = b"wheel"
+        record = {"size": len(payload), "sha256": hashlib.sha256(payload).hexdigest(), "url": "https://w.invalid/a.whl"}
+        inputs = {"torch": {"version": "2.16.0.dev20261113+cu135", "wheels": {"a-1-py3-none-any.whl": record}}}
+        with tempfile.TemporaryDirectory() as temporary:
+            directory = Path(temporary)
+
+            def fetch(url, destination, wheel, **kwargs):
+                self.assertEqual((url, kwargs), (record["url"], {"context": "torch-wheels"}))
+                destination.write_bytes(payload)
+
+            with mock.patch.object(spark, "download_cuda_deb", side_effect=fetch) as download, \
+                    contextlib.redirect_stdout(io.StringIO()):
+                spark.prepare_torch(directory, inputs)
+                spark.prepare_torch(directory, inputs)
+            self.assertEqual(download.call_count, 1)
+            context = directory / "context/torch-wheels"
+            self.assertEqual(spark.torch_wheel_problems(context, inputs), [])
+            (context / "a-1-py3-none-any.whl").write_bytes(b"other")
+            (context / "b-1-py3-none-any.whl").write_bytes(b"extra")
+            self.assertEqual(spark.torch_wheel_problems(context, inputs),
+                             ["torch-wheels: a-1-py3-none-any.whl differs from the lock size or hash",
+                              "torch-wheels: unlocked file b-1-py3-none-any.whl"])
 
 
 class BuildResourcePolicyTest(unittest.TestCase):
@@ -606,6 +744,125 @@ class BuildEvidenceTest(unittest.TestCase):
         self.assertIn(self.new[:8], refreshed["notes"])
         self.assertEqual(unrelated.read_bytes(), before)
         self.assertNotIn(unrelated.relative_to(self.root).as_posix(), updated)
+
+
+class DisposableGitRepoTest(unittest.TestCase):
+    def test_init_disposable_git_repo_disables_auto_gc_and_maintenance(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            repo = Path(temporary)
+            spark.init_disposable_git_repo(repo)
+            self.assertEqual(spark.git_output(repo, "config", "--get", "gc.auto"), "0")
+            self.assertEqual(spark.git_output(repo, "config", "--get", "maintenance.auto"), "false")
+
+    def test_prepare_project_and_cutlass_disable_auto_gc_and_batch_git_am(self) -> None:
+        import contextlib
+        import io
+        import subprocess
+
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            upstream = root / "upstream"
+            upstream.mkdir()
+            subprocess.run(["git", "init", "--quiet"], cwd=upstream, check=True)
+            subprocess.run(["git", "config", "user.name", "Test Author"], cwd=upstream, check=True)
+            subprocess.run(["git", "config", "user.email", "author@example.com"], cwd=upstream, check=True)
+            (upstream / "file.txt").write_text("base\n", encoding="utf-8")
+            subprocess.run(["git", "add", "file.txt"], cwd=upstream, check=True)
+            subprocess.run(["git", "commit", "--quiet", "-m", "base"], cwd=upstream, check=True)
+            base_revision = spark.git_output(upstream, "rev-parse", "HEAD")
+
+            (upstream / "file.txt").write_text("base\nfirst\n", encoding="utf-8")
+            subprocess.run(["git", "commit", "--quiet", "-am", "first patch"], cwd=upstream, check=True)
+            (upstream / "file.txt").write_text("base\nfirst\nsecond\n", encoding="utf-8")
+            subprocess.run(["git", "commit", "--quiet", "-am", "second patch"], cwd=upstream, check=True)
+
+            patches_dir = root / "patches" / "demo"
+            patches_dir.mkdir(parents=True)
+            subprocess.run(["git", "format-patch", "--quiet", "-o", str(patches_dir), base_revision], cwd=upstream, check=True)
+            patch_names = [p.name for p in sorted(patches_dir.glob("*.patch"))]
+            (patches_dir / "series").write_text("\n".join(patch_names) + "\n", encoding="utf-8")
+
+            # Compute expected patch_head and expected_tree via sequential git am
+            reference = root / "reference"
+            reference.mkdir()
+            spark.init_disposable_git_repo(reference)
+            subprocess.run(["git", "fetch", "--quiet", str(upstream), base_revision], cwd=reference, check=True)
+            subprocess.run(["git", "switch", "--quiet", "--create", "spark/build", "FETCH_HEAD"], cwd=reference, check=True)
+            for name in patch_names:
+                subprocess.run([
+                    "git", "-c", f"user.name={spark.PATCH_COMMITTER[0]}",
+                    "-c", f"user.email={spark.PATCH_COMMITTER[1]}",
+                    "am", "--quiet", "--committer-date-is-author-date",
+                    str(patches_dir / name),
+                ], cwd=reference, check=True)
+            expected_head = spark.git_output(reference, "rev-parse", "HEAD")
+            expected_tree = spark.git_output(reference, "rev-parse", "HEAD^{tree}")
+
+            build_dir = root / "build"
+            record = {
+                "upstream": str(upstream),
+                "revision": base_revision,
+                "patch_series": "patches/demo/series",
+                "patch_head": expected_head,
+                "expected_tree": expected_tree,
+            }
+            commands: list[list[str]] = []
+            real_checked = spark.checked
+
+            def spy_checked(command: list[str], cwd: Path | None = None) -> None:
+                commands.append(list(command))
+                real_checked(command, cwd=cwd)
+
+            with mock.patch.object(spark, "ROOT", root), \
+                    mock.patch.object(spark, "checked", side_effect=spy_checked), \
+                    contextlib.redirect_stdout(io.StringIO()):
+                spark.prepare_project(build_dir, "demo", record)
+                spark.prepare_cutlass(build_dir, {"upstream": str(upstream), "revision": base_revision, "release_tag": "v0"})
+
+            am_commands = [cmd for cmd in commands if "am" in cmd]
+            self.assertEqual(len(am_commands), 1)
+            self.assertIn("gc.auto=0", am_commands[0])
+            self.assertIn("maintenance.auto=false", am_commands[0])
+            self.assertEqual(am_commands[0][-2:], [str(patches_dir / n) for n in patch_names])
+
+            for prepared in (build_dir / "src" / "demo", build_dir / "src" / "cutlass"):
+                self.assertEqual(spark.git_output(prepared, "config", "--get", "gc.auto"), "0")
+                self.assertEqual(spark.git_output(prepared, "config", "--get", "maintenance.auto"), "false")
+
+            # Verify lock_build_identifiers also uses init_disposable_git_repo and a single batched git am
+            commands.clear()
+            (root / "cluster.json").write_text(json.dumps({"upstreams_config": "upstreams.lock.json"}), encoding="utf-8")
+            (root / "source.json").write_text(json.dumps({"vllm": {}}), encoding="utf-8")
+            upstreams_doc = {
+                "source_manifest": "source.json",
+                "sources": {
+                    "vllm": {
+                        "upstream": str(upstream),
+                        "revision": base_revision,
+                        "patch_series": "patches/demo/series",
+                    },
+                    "nccl": {"upstream": str(upstream), "revision": base_revision},
+                },
+            }
+            (root / "upstreams.lock.json").write_text(json.dumps(upstreams_doc), encoding="utf-8")
+            import argparse
+            with mock.patch.object(spark, "ROOT", root), \
+                    mock.patch.object(spark, "BUILD_ROOT", root / ".work/build"), \
+                    mock.patch.object(spark, "checked", side_effect=spy_checked), \
+                    contextlib.redirect_stdout(io.StringIO()):
+                spark.lock_build_identifiers(
+                    argparse.Namespace(cluster_config="cluster.json"),
+                    upstreams_doc,
+                    parts=["vllm"],
+                )
+            lock_am_commands = [cmd for cmd in commands if "am" in cmd]
+            self.assertEqual(len(lock_am_commands), 1)
+            self.assertIn("gc.auto=0", lock_am_commands[0])
+            self.assertIn("maintenance.auto=false", lock_am_commands[0])
+            self.assertEqual(lock_am_commands[0][-2:], [str(patches_dir / n) for n in patch_names])
+            locked_manifest = json.loads((root / "source.json").read_text(encoding="utf-8"))
+            self.assertEqual(locked_manifest["vllm"]["patch_head"], expected_head)
+            self.assertEqual(locked_manifest["vllm"]["expected_tree"], expected_tree)
 
 
 class PackageStructureTest(unittest.TestCase):

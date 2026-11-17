@@ -1,0 +1,234 @@
+verdicts: c59 (recorded) -> c60, against the run's own repeat (c60 -> c60-again) and the reference's (c59-again (recorded)); each change is the mean over both boots of each (c60, c60-again; c59 (recorded), c59-again (recorded))
+metric                                 change    ±95%   repeat   floor  margin  verdict
+grid: decode geometric mean (20)       -0.07%   0.13%   -0.08%   0.23%   0.27%  same (both boots of each, reference repeat -0.18%; recorded A/A floor)
+c16: decode tok/s, paired              +0.15%   0.35%   -0.31%   0.24%   0.42%  same (both boots of each, reference repeat +0.16%; window tok/s +0.33% ±0.80%)
+c16: output tok/s                      +0.17%   0.80%   -0.29%       -   0.95%  same (both boots of each, reference repeat +0.04%)
+prefill: prefill 32,768 tok/s          +1.22%   4.69%   +0.49%       -   5.28%  same (both boots of each, reference repeat -1.06%)
+prefill: prefill 262,144 tok/s         +2.10%   0.64%   +0.31%       -   0.84%  better (both boots of each, reference repeat +0.26%)
+floors (tp4-switched, screen): grid 0.33% (7 pairs); c16 0.34% (7 pairs); same-build pairs of 2026-11-09 to 2026-11-10, servebench_suite_table.FLOORS
+paired rows: margin = ±95% (over requests) and floor in quadrature, where floor is the boot term of the boots averaged, each boot bounded by the recorded A/A bound or its repeat when larger (the grid's geometric mean likewise when it has a recorded floor); other rows: ±95% + |repeat|, over the boots averaged
+
+rows a step (window means; survival = accepted at k a draft, coverage = verified at k a draft)
+step     arm                       tokens requests   rows  yield  wasted  by position (survival/coverage)
+c16      c60                       34.170    14.41  44.45  0.769   10.28  0:0.717/1.000 1:0.355/0.577 2:0.169/0.287 3:0.082/0.140 4:0.048/0.080 5:0.000/0.000 6:0.000/0.000 7:0.000/0.000 8:0.000/0.000 9:0.000/0.000 10:0.000/0.000 11:0.000/0.000 12:0.000/0.000 13:0.000/0.000 14:0.000/0.000 15:0.000/0.000 [cond/yield 0:0.717/0.717 1:0.495/0.616 2:0.475/0.588 3:0.487/0.587 4:0.581/0.596]
+c16      c59 (recorded)            34.157    14.40  44.56  0.766   10.41  0:0.716/1.000 1:0.356/0.580 2:0.168/0.288 3:0.085/0.146 4:0.047/0.080 5:0.000/0.000 6:0.000/0.000 7:0.000/0.000 8:0.000/0.000 9:0.000/0.000 10:0.000/0.000 11:0.000/0.000 12:0.000/0.000 13:0.000/0.000 14:0.000/0.000 15:0.000/0.000 [cond/yield 0:0.716/0.716 1:0.498/0.614 2:0.472/0.584 3:0.505/0.582 4:0.553/0.588]
+c16      c60-again                 34.117    14.40  44.39  0.769   10.27  0:0.717/1.000 1:0.354/0.574 2:0.168/0.285 3:0.084/0.143 4:0.048/0.081 5:0.000/0.000 6:0.000/0.000 7:0.000/0.000 8:0.000/0.000 9:0.000/0.000 10:0.000/0.000 11:0.000/0.000 12:0.000/0.000 13:0.000/0.000 14:0.000/0.000 15:0.000/0.000 [cond/yield 0:0.717/0.717 1:0.493/0.615 2:0.475/0.589 3:0.499/0.586 4:0.572/0.593]
+c16      c59-again (recorded)      34.235    14.43  44.62  0.767   10.39  0:0.716/1.000 1:0.357/0.581 2:0.167/0.285 3:0.085/0.146 4:0.047/0.079 5:0.000/0.000 6:0.000/0.000 7:0.000/0.000 8:0.000/0.000 9:0.000/0.000 10:0.000/0.000 11:0.000/0.000 12:0.000/0.000 13:0.000/0.000 14:0.000/0.000 15:0.000/0.000 [cond/yield 0:0.716/0.716 1:0.499/0.615 2:0.467/0.586 3:0.507/0.580 4:0.555/0.592]
+
+######## c59 (recorded) -> c60
+suite screen (4ff5d0a4ad09): c59 -> c60
+
+== model
+skipped: not kept: /home/chris/projects/spark-ds41f/experiments/2026-11-15-c59-prefill/receipts/final/tp4-switched/suites/c59-screen-tp4-switched/c59/model.json.gz
+
+== grid
+metric                              c59          c60   change    ±95%  verdict
+decode 1x2 rows @4K              13.370       13.314   -0.42%   0.51%  same
+decode 4x8 rows @4K              15.350       15.300   -0.33%   0.28%  better
+decode 8x16 rows @4K             17.310       17.327   +0.09%   0.65%  same
+decode 16x32 rows @4K            22.653       22.464   -0.83%   1.19%  same
+decode 1x3 rows @4K              13.645       13.649   +0.03%   0.65%  same
+decode 4x12 rows @4K             16.140       16.256   +0.72%   0.88%  same
+decode 8x24 rows @4K             19.473       19.662   +0.97%   0.92%  worse
+decode 16x48 rows @4K            26.549       26.610   +0.23%   1.02%  same
+decode 1x6 rows @4K              15.000       14.982   -0.12%   1.56%  same
+decode 2x12 rows @4K             16.382       16.408   +0.16%   1.47%  same
+decode 4x24 rows @4K             18.996       18.886   -0.58%   0.57%  better
+decode 8x48 rows @4K             25.563       25.474   -0.35%   0.95%  same
+decode 12x72 rows @4K            34.242       34.108   -0.39%   0.77%  same
+decode 16x96 rows @4K            38.859       38.825   -0.09%   0.86%  same
+decode 1x3 rows @64K             13.896       13.834   -0.45%   1.30%  same
+decode 8x24 rows @64K            19.460       19.391   -0.35%   0.52%  same
+decode 16x48 rows @64K           26.441       26.420   -0.08%   1.03%  same
+decode 1x3 rows @256K            13.605       13.757   +1.12%   0.79%  worse
+decode 8x24 rows @256K           19.288       19.272   -0.09%   0.12%  same
+decode 1x3 rows @1016K           13.922       13.687   -1.69%   1.17%  better
+decode geometric mean (20)                             -0.12%   0.13%  same
+intervals hold for all 20 shapes at once (95%, Bonferroni); slow outliers (median + 5 MAD) dropped first: 389
+
+== c16
+metric                          c59          c60   change    ±95%  verdict
+output tok/s                268.777      269.673   +0.33%   0.80%  same
+decode tok/s, paired         16.906       16.854   +0.36%   0.30%  better
+engine steps/s                7.873        7.897   +0.30%   2.46%  same
+output tokens/step           34.157       34.170   +0.04%   2.41%  same
+accepted/draft                1.372        1.371   -0.08%   5.02%  same
+TTFT p50 s                    0.410        0.410   +0.02%          same (no interval)
+TTFT p99 s                    0.487        0.489   +0.33%          same (no interval)
+TTFT, paired                  0.410        0.410   -0.33%   0.97%  same
+TPOT p50 ms                  58.685       58.708   +0.04%          same (no interval)
+TPOT p99 ms                  78.990       78.990   +0.00%          same (no interval)
+per-user tok/s p50           17.027       16.971   -0.33%          same (no interval)
+paired: 316 requests in both windows, each the same prompt on both builds; 53 streamed in as many chunks on both
+speculative log-tps: total +0.33% (1+tau -0.04%, steps/s +0.30%, reqs/step +0.08%; rows/step -0.26%, row yield +0.30%)
+
+== prefill
+metric                          c59          c60   change    ±95%  verdict
+prefill 32,768 tok/s       9371.860     9412.369   +0.43%   1.48%  same
+prefill 262,144 tok/s      9618.698     9817.787   +2.07%   0.64%  better
+
+######## c59 (recorded) -> c60-again
+suite screen (4ff5d0a4ad09): c59 -> c60-again
+
+== model
+skipped: not kept: /home/chris/projects/spark-ds41f/experiments/2026-11-15-c59-prefill/receipts/final/tp4-switched/suites/c59-screen-tp4-switched/c59/model.json.gz
+
+== grid
+metric                              c59    c60-again   change    ±95%  verdict
+decode 1x2 rows @4K              13.370       13.350   -0.16%   0.57%  same
+decode 4x8 rows @4K              15.350       15.231   -0.78%   0.27%  better
+decode 8x16 rows @4K             17.310       17.208   -0.59%   0.58%  better
+decode 16x32 rows @4K            22.653       22.507   -0.64%   1.22%  same
+decode 1x3 rows @4K              13.645       13.565   -0.59%   0.54%  better
+decode 4x12 rows @4K             16.140       16.214   +0.46%   0.91%  same
+decode 8x24 rows @4K             19.473       19.479   +0.03%   0.69%  same
+decode 16x48 rows @4K            26.549       26.569   +0.08%   0.92%  same
+decode 1x6 rows @4K              15.000       14.992   -0.06%   1.61%  same
+decode 2x12 rows @4K             16.382       16.309   -0.44%   1.44%  same
+decode 4x24 rows @4K             18.996       18.806   -1.00%   0.52%  better
+decode 8x48 rows @4K             25.563       25.384   -0.70%   0.84%  same
+decode 12x72 rows @4K            34.242       34.226   -0.05%   0.78%  same
+decode 16x96 rows @4K            38.859       38.871   +0.03%   0.77%  same
+decode 1x3 rows @64K             13.896       14.037   +1.02%   1.62%  same
+decode 8x24 rows @64K            19.460       19.472   +0.06%   0.62%  same
+decode 16x48 rows @64K           26.441       26.501   +0.23%   1.01%  same
+decode 1x3 rows @256K            13.605       13.653   +0.35%   0.67%  same
+decode 8x24 rows @256K           19.288       19.281   -0.04%   0.24%  same
+decode 1x3 rows @1016K           13.922       13.751   -1.23%   1.26%  same
+decode geometric mean (20)                             -0.20%   0.13%  better
+intervals hold for all 20 shapes at once (95%, Bonferroni); slow outliers (median + 5 MAD) dropped first: 409
+
+== c16
+metric                          c59    c60-again   change    ±95%  verdict
+output tok/s                268.777      268.893   +0.04%   0.76%  same
+decode tok/s, paired         16.906       16.836   +0.09%   0.26%  same
+engine steps/s                7.873        7.887   +0.17%   2.50%  same
+output tokens/step           34.157       34.117   -0.12%   2.53%  same
+accepted/draft                1.372        1.370   -0.13%   5.02%  same
+TTFT p50 s                    0.410        0.411   +0.28%          same (no interval)
+TTFT p99 s                    0.487        0.475   -2.45%          same (no interval)
+TTFT, paired                  0.410        0.411   -0.35%   1.03%  same
+TPOT p50 ms                  58.685       58.685   +0.00%          same (no interval)
+TPOT p99 ms                  78.990       79.025   +0.04%          same (no interval)
+per-user tok/s p50           17.027       17.040   +0.08%          same (no interval)
+paired: 316 requests in both windows, each the same prompt on both builds; 70 streamed in as many chunks on both
+speculative log-tps: total +0.05% (1+tau -0.08%, steps/s +0.17%, reqs/step -0.04%; rows/step -0.40%, row yield +0.28%)
+
+== prefill
+metric                          c59    c60-again   change    ±95%  verdict
+prefill 32,768 tok/s       9371.860     9458.519   +0.92%   1.49%  same
+prefill 262,144 tok/s      9618.698     9848.572   +2.39%   0.48%  better
+
+######## c60 -> c60-again
+suite screen (4ff5d0a4ad09): c60 -> c60-again
+
+== model
+model behaviour: c60 -> c60-again
+  greedy responses identical: 128/128
+  acceptance_length           2.301 ->    2.301  +0.00%
+  verified_per_draft          2.030 ->    2.030  +0.00%
+  accepted_per_verified       0.641 ->    0.641  +0.00%
+  acceptance by draft position: 0: 0.711->0.711, 1: 0.588->0.588, 2: 0.555->0.555, 3: 0.552->0.552, 4: 0.559->0.559, 5: 0.000->0.000, 6: 0.000->0.000, 7: 0.000->0.000, 8: 0.000->0.000, 9: 0.000->0.000, 10: 0.000->0.000, 11: 0.000->0.000
+  teacher-forced over 32768 positions in 128 sequences
+    identical distributions 100.00%, top-1 agreement 100.000%
+    KL mean 0.000e+00 (±0.0e+00 over sequences), p99 0.000e+00, max 0.000e+00 nats
+    given-token log-probability change mean +0.00e+00, mean |change| 0.00e+00, max 0.00e+00
+    perplexity 1.31888 -> 1.31888 (+0.000%)
+
+== grid
+metric                              c60    c60-again   change    ±95%  verdict
+decode 1x2 rows @4K              13.314       13.350   +0.27%   0.61%  same
+decode 4x8 rows @4K              15.300       15.231   -0.45%   0.23%  better
+decode 8x16 rows @4K             17.327       17.208   -0.68%   0.61%  better
+decode 16x32 rows @4K            22.464       22.507   +0.19%   0.98%  same
+decode 1x3 rows @4K              13.649       13.565   -0.62%   0.60%  better
+decode 4x12 rows @4K             16.256       16.214   -0.26%   1.04%  same
+decode 8x24 rows @4K             19.662       19.479   -0.93%   0.92%  better
+decode 16x48 rows @4K            26.610       26.569   -0.16%   1.01%  same
+decode 1x6 rows @4K              14.982       14.992   +0.07%   1.52%  same
+decode 2x12 rows @4K             16.408       16.309   -0.60%   1.47%  same
+decode 4x24 rows @4K             18.886       18.806   -0.43%   0.39%  better
+decode 8x48 rows @4K             25.474       25.384   -0.35%   0.86%  same
+decode 12x72 rows @4K            34.108       34.226   +0.35%   0.71%  same
+decode 16x96 rows @4K            38.825       38.871   +0.12%   0.86%  same
+decode 1x3 rows @64K             13.834       14.037   +1.47%   1.63%  same
+decode 8x24 rows @64K            19.391       19.472   +0.42%   0.59%  same
+decode 16x48 rows @64K           26.420       26.501   +0.31%   1.06%  same
+decode 1x3 rows @256K            13.757       13.653   -0.76%   0.93%  same
+decode 8x24 rows @256K           19.272       19.281   +0.05%   0.24%  same
+decode 1x3 rows @1016K           13.687       13.751   +0.46%   0.95%  same
+decode geometric mean (20)                             -0.08%   0.13%  same
+intervals hold for all 20 shapes at once (95%, Bonferroni); slow outliers (median + 5 MAD) dropped first: 392
+
+== c16
+metric                          c60    c60-again   change    ±95%  verdict
+output tok/s                269.673      268.893   -0.29%   0.74%  same
+decode tok/s, paired         16.854       16.836   -0.31%   0.32%  same
+engine steps/s                7.897        7.887   -0.13%   2.50%  same
+output tokens/step           34.170       34.117   -0.15%   2.51%  same
+accepted/draft                1.371        1.370   -0.05%   5.18%  same
+TTFT p50 s                    0.410        0.411   +0.26%          same (no interval)
+TTFT p99 s                    0.489        0.475   -2.77%          same (no interval)
+TTFT, paired                  0.410        0.411   +0.01%   0.84%  same
+TPOT p50 ms                  58.708       58.685   -0.04%          same (no interval)
+TPOT p99 ms                  78.990       79.025   +0.04%          same (no interval)
+per-user tok/s p50           16.971       17.040   +0.41%          same (no interval)
+paired: 316 requests in both windows, each the same prompt on both builds; 32 streamed in as many chunks on both
+speculative log-tps: total -0.28% (1+tau -0.03%, steps/s -0.13%, reqs/step -0.12%; rows/step -0.13%, row yield -0.02%)
+
+== prefill
+metric                          c60    c60-again   change    ±95%  verdict
+prefill 32,768 tok/s       9412.369     9458.519   +0.49%   1.30%  same
+prefill 262,144 tok/s      9817.787     9848.572   +0.31%   0.54%  same
+
+######## c59 (recorded) -> c59-again (recorded)
+suite screen (4ff5d0a4ad09): c59 -> c59-again
+
+== model
+skipped: not kept: /home/chris/projects/spark-ds41f/experiments/2026-11-15-c59-prefill/receipts/final/tp4-switched/suites/c59-screen-tp4-switched/c59/model.json.gz, /home/chris/projects/spark-ds41f/experiments/2026-11-15-c59-prefill/receipts/final/tp4-switched/suites/c59-screen-tp4-switched/c59-again/model.json.gz
+
+== grid
+metric                              c59    c59-again   change    ±95%  verdict
+decode 1x2 rows @4K              13.370       13.377   +0.05%   0.58%  same
+decode 4x8 rows @4K              15.350       15.286   -0.42%   0.26%  better
+decode 8x16 rows @4K             17.310       17.449   +0.80%   0.82%  same
+decode 16x32 rows @4K            22.653       22.538   -0.50%   1.16%  same
+decode 1x3 rows @4K              13.645       13.657   +0.09%   0.61%  same
+decode 4x12 rows @4K             16.140       16.089   -0.32%   0.72%  same
+decode 8x24 rows @4K             19.473       19.529   +0.29%   0.70%  same
+decode 16x48 rows @4K            26.549       26.485   -0.24%   0.85%  same
+decode 1x6 rows @4K              15.000       14.837   -1.09%   1.44%  same
+decode 2x12 rows @4K             16.382       16.388   +0.04%   1.57%  same
+decode 4x24 rows @4K             18.996       18.901   -0.50%   0.63%  same
+decode 8x48 rows @4K             25.563       25.452   -0.43%   0.95%  same
+decode 12x72 rows @4K            34.242       34.225   -0.05%   0.83%  same
+decode 16x96 rows @4K            38.859       38.829   -0.08%   0.75%  same
+decode 1x3 rows @64K             13.896       13.937   +0.29%   1.38%  same
+decode 8x24 rows @64K            19.460       19.274   -0.95%   0.43%  better
+decode 16x48 rows @64K           26.441       26.327   -0.43%   0.92%  same
+decode 1x3 rows @256K            13.605       13.695   +0.66%   0.66%  same
+decode 8x24 rows @256K           19.288       19.315   +0.14%   0.33%  same
+decode 1x3 rows @1016K           13.922       13.780   -1.03%   1.25%  same
+decode geometric mean (20)                             -0.18%   0.13%  better
+intervals hold for all 20 shapes at once (95%, Bonferroni); slow outliers (median + 5 MAD) dropped first: 383
+
+== c16
+metric                          c59    c59-again   change    ±95%  verdict
+output tok/s                268.777      268.877   +0.04%   0.78%  same
+decode tok/s, paired         16.866       16.867   +0.16%   0.35%  same
+engine steps/s                7.873        7.860   -0.17%   2.57%  same
+output tokens/step           34.157       34.235   +0.23%   2.69%  same
+accepted/draft                1.372        1.372   -0.00%   5.03%  same
+TTFT p50 s                    0.410        0.412   +0.51%          same (no interval)
+TTFT p99 s                    0.487        0.471   -3.29%          better (no interval)
+TTFT, paired                  0.410        0.412   -0.05%   0.88%  same
+TPOT p50 ms                  58.685       58.791   +0.18%          same (no interval)
+TPOT p99 ms                  78.990       78.987   -0.00%          same (no interval)
+per-user tok/s p50           17.027       16.867   -0.94%          same (no interval)
+paired: 315 requests in both windows, each the same prompt on both builds; 50 streamed in as many chunks on both
+speculative log-tps: total +0.06% (1+tau -0.00%, steps/s -0.17%, reqs/step +0.23%; rows/step +0.13%, row yield +0.10%)
+
+== prefill
+metric                          c59    c59-again   change    ±95%  verdict
+prefill 32,768 tok/s       9371.860     9272.091   -1.06%   4.51%  same
+prefill 262,144 tok/s      9618.698     9643.252   +0.26%   0.22%  better

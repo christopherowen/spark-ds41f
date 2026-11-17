@@ -1,0 +1,19 @@
+Step 2 initial boot failure record (2026-11-16T09:51:50Z)
+Commit: d63784647f1814bf05e382807e853e3b5ac2d11b
+Queue job: 20261116T094817-screen-tp4-switched.json
+Preserved logs (untracked / git-ignored): experiments/2026-11-16-c60-prefill/receipts/step2/tp4-switched/failed-starts/20261116T095150Z-spark-ds41f/
+
+Root cause:
+  File "/opt/spark-ds41f/candidate/vllm/vllm/v1/engine/async_llm.py", line 890, in _run_output_handler
+    materializers: dict[str, Callable[[], Any]],
+                             ^^^^^^^^
+  NameError: name 'Callable' is not defined.
+
+During Step 2 conflict resolution on PR #978 in vllm/v1/engine/async_llm.py,
+`Callable` was omitted from `from collections.abc import ...`.
+
+Resolution:
+  Commit 783ab927b (rebased onto 1ed6de867) restored `Callable` to line 8 of
+  `overlay/vllm/vllm/v1/engine/async_llm.py`. Verified `AsyncLLM._run_output_handler`
+  imports cleanly in `spark-ds41f:1107` and re-queued as
+  `20261116T100535-screen-tp4-switched.json` on `sp1`.

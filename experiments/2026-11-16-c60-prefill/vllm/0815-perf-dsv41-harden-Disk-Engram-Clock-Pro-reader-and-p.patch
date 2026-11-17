@@ -1,0 +1,1317 @@
+From f97310348c58c52e2d35cc5bbba4384ccf661e75 Mon Sep 17 00:00:00 2001
+From: Christopher Owen <3221756+christopherowen@users.noreply.github.com>
+Date: Mon, 16 Nov 2026 15:00:05 +0100
+Subject: [PATCH] perf(dsv41): harden Disk Engram Clock-Pro reader and
+ parallelize weight packing
+
+Upstream base: local-inference-lab/vllm 19f2c20ed4d64ae22bd009ceacadd85e2a81e354
+with candidate-55's series applied through 0810.
+
+Rationale: Adds Clock-Pro cache shielding and asynchronous stage bounds in the
+native Disk Engram reader, hardens partial-init cleanup and idempotent close in
+rows.py, speeds up post-load weight packing/warmup across worker ranks, and keeps
+DeepseekV41ForCausalLM resolution lazy until instantiation.
+
+Quality implications: None; bit-exact Engram lookups and bounds safety are
+verified under host ASan + UBSan and kernel unit tests.
+
+Tests: pytest -q -p deepseek_models tests/kernels/test_deepseek_v41_engram_rows.py
+tests/kernels/test_deepseek_v41_postload_startup.py
+tests/models/test_deepseek_v4_1_engram.py (with ASan+UBSan pass on _reader.c).
+
+Upstream status: local candidate-60 patch
+---
+ .../kernels/test_deepseek_v41_engram_rows.py  | 193 +++++++++++++++++-
+ .../test_deepseek_v41_postload_startup.py     | 193 ++++++++++++++++++
+ tests/models/test_deepseek_v4_1_engram.py     |  82 ++++++++
+ vllm/model_executor/model_loader/utils.py     |  16 +-
+ vllm/models/deepseek_v4_1/common/engram.py    |  14 +-
+ .../deepseek_v4_1/engram_rows/_reader.c       |  68 +++++-
+ .../deepseek_v4_1/engram_rows/_row_plan.h     | 161 ++++++++++++---
+ .../deepseek_v4_1/engram_rows/host_hash.py    |  59 ++++--
+ vllm/models/deepseek_v4_1/engram_rows/rows.py |  66 ++++--
+ 9 files changed, 769 insertions(+), 83 deletions(-)
+ create mode 100644 tests/kernels/test_deepseek_v41_postload_startup.py
+
+diff --git a/tests/kernels/test_deepseek_v41_engram_rows.py b/tests/kernels/test_deepseek_v41_engram_rows.py
+index 0fa6d38d12..e2098f5664 100644
+--- a/tests/kernels/test_deepseek_v41_engram_rows.py
++++ b/tests/kernels/test_deepseek_v41_engram_rows.py
+@@ -27,7 +27,7 @@ from vllm.models.deepseek_v4_1.engram_rows import (
+     pack_engram_columns,
+     packed_table_bytes,
+ )
+-from vllm.models.deepseek_v4_1.engram_rows.rows import ROW_BYTES
++from vllm.models.deepseek_v4_1.engram_rows.rows import ROW_BYTES, SCALE_BYTES
+ 
+ pytestmark = pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+ 
+@@ -1037,7 +1037,7 @@ def test_pack_engram_columns_and_compacted_column_map_match_two_plane_reader(
+     )
+     assert os.path.getsize(packed_path) == packed_table_bytes(int(owned_rows.sum()))
+ 
+-    two_plane = _rows(paths, tokens=32, columns=col_mask)
++    two_plane = _rows(paths, tokens=32, columns=col_mask, pin_scales=False)
+     packed_rows = EngramDiskRows(
+         device="cuda",
+         table_rows=TABLE_ROWS,
+@@ -1280,3 +1280,192 @@ def test_packed_row_cache_direct_insert_and_duplicate_miss_dedup(offset: int):
+         assert s_after_hit["cache_hits"] - s_after_miss["cache_hits"] == 32 * 8
+     finally:
+         rows.close()
++
++
++def test_row_cache_clock_pro_prefill_shield_preserves_decode_working_set():
++    """2-bit Clock + prefill probationary insertion preserves hot multi-hit decode
++    rows across a multi-chunk prefill flood (>30x cache capacity) while graduating
++    repeated prompt n-grams."""
++    big_rows = 4096
++    rng = np.random.default_rng(109)
++    root = _table_dir()
++    codes = rng.integers(0, 256, size=(big_rows, ROW_BYTES), dtype=np.uint8)
++    codes[codes == 0x7F] = 1
++    codes[codes == 0xFF] = 1
++    scales = rng.integers(120, 134, size=(big_rows, SCALE_BYTES), dtype=np.uint8)
++    w_path = os.path.join(root, "big_weights.bin")
++    s_path = os.path.join(root, "big_scales.bin")
++    with open(w_path, "wb") as f:
++        f.write(codes.tobytes())
++    with open(s_path, "wb") as f:
++        f.write(scales.tobytes())
++
++    rows = EngramDiskRows(
++        device="cuda",
++        table_rows=big_rows,
++        shard_start=0,
++        shard_end=big_rows,
++        max_lookups=128 * HEADS,
++        columns=TP3_RANK1,
++        cache_rows=256,
++    )
++    rows.add_source(w_path, 0, scale=False)
++    rows.add_source(s_path, 0, scale=True)
++
++    def wait_idle():
++        torch.cuda.synchronize()
++        deadline = time.monotonic() + 5.0
++        while rows.stats()["queued"] and time.monotonic() < deadline:
++            time.sleep(0.001)
++
++    try:
++        # Build a 16-token decode step (16 * 8 = 128 distinct owned rows in 0..127).
++        decode_ids = torch.zeros((16, HEADS), dtype=torch.int64)
++        owned_cols = [c for c in range(HEADS) if (TP3_RANK1 >> c) & 1]
++        for t in range(16):
++            for idx, c in enumerate(owned_cols):
++                decode_ids[t, c] = t * 8 + idx
++        decode_gpu = decode_ids.cuda()
++        expected_decode = _reference(
++            torch.from_numpy(codes), torch.from_numpy(scales),
++            decode_ids, 16, 0, big_rows, TP3_RANK1,
++        )
++
++        # Warm decode working set twice so all 128 decode rows reach usage >= 2.
++        out_w1, _ = _step(rows, decode_gpu, 16, early=decode_ids.numpy())
++        torch.testing.assert_close(out_w1.cpu(), expected_decode, rtol=0, atol=0)
++        wait_idle()
++        out_w2, _ = _step(rows, decode_gpu, 16, early=decode_ids.numpy())
++        torch.testing.assert_close(out_w2.cpu(), expected_decode, rtol=0, atol=0)
++        wait_idle()
++        s_after_warm = rows.stats()
++        assert s_after_warm["cache_hits"] == 128
++
++        # Stream 8 prefill chunks of 128 tokens (8 * 1024 = 8192 owned lookups = 32x
++        # the 256-row cache capacity) using one-time row IDs in [256, 4096), plus 8
++        # recurring prompt header rows in [192, 200) on token 0 of every chunk.
++        cursor = 256
++        for _chunk in range(8):
++            pf_ids = torch.zeros((128, HEADS), dtype=torch.int64)
++            for idx, c in enumerate(owned_cols):
++                pf_ids[0, c] = 192 + idx
++            for t in range(1, 128):
++                for idx, c in enumerate(owned_cols):
++                    pf_ids[t, c] = cursor
++                    cursor = 256 + ((cursor - 256 + 1) % (big_rows - 256))
++            pf_gpu = pf_ids.cuda()
++            out_pf, _ = _step(rows, pf_gpu, 128, early=pf_ids.numpy())
++            expected_pf = _reference(
++                torch.from_numpy(codes), torch.from_numpy(scales),
++                pf_ids, 128, 0, big_rows, TP3_RANK1,
++            )
++            torch.testing.assert_close(out_pf.cpu(), expected_pf, rtol=0, atol=0)
++            wait_idle()
++
++        # Verify all 128 hot decode working-set rows survived the 32x prefill flood
++        # with zero disk read calls.
++        s_before_decode = rows.stats()
++        out_post, _ = _step(rows, decode_gpu, 16, early=decode_ids.numpy())
++        torch.testing.assert_close(out_post.cpu(), expected_decode, rtol=0, atol=0)
++        wait_idle()
++        s_after_decode = rows.stats()
++        assert s_after_decode["cache_hits"] - s_before_decode["cache_hits"] == 128
++        assert s_after_decode["read_calls"] == s_before_decode["read_calls"]
++    finally:
++        rows.close()
++
++
++def test_two_plane_pinned_scales_halves_read_calls_and_matches_reference():
++    """Default-on scale plane pinning in two-plane mode matches unpinned two-plane and
++    packed outputs bit-for-bit while eliminating scale.bin O_DIRECT read calls."""
++    codes, scales, paths = _write_table(_table_dir(), seed=113)
++    unpinned = EngramDiskRows(
++        device="cuda",
++        table_rows=TABLE_ROWS,
++        shard_start=0,
++        shard_end=TABLE_ROWS,
++        max_lookups=16 * HEADS,
++        columns=TP3_RANK1,
++        cache_rows=1024,
++        pin_scales=False,
++    )
++    pinned = EngramDiskRows(
++        device="cuda",
++        table_rows=TABLE_ROWS,
++        shard_start=0,
++        shard_end=TABLE_ROWS,
++        max_lookups=16 * HEADS,
++        columns=TP3_RANK1,
++        cache_rows=1024,
++    )
++    assert pinned.pin_scales is True
++    for r in (unpinned, pinned):
++        r.add_source(paths[0], WEIGHT_OFFSET, scale=False)
++        r.add_source(paths[1], SCALE_OFFSET, scale=True)
++
++    def wait_reader(r):
++        torch.cuda.synchronize()
++        deadline = time.monotonic() + 5.0
++        while r.stats()["queued"] and time.monotonic() < deadline:
++            time.sleep(0.001)
++
++    try:
++        gen = torch.Generator().manual_seed(127)
++        ids = torch.randint(0, TABLE_ROWS, (16, HEADS), generator=gen, dtype=torch.int64)
++        ids_gpu = ids.cuda()
++        expected = _reference(codes, scales, ids, 16, 0, TABLE_ROWS, TP3_RANK1)
++
++        out_u1, _ = _step(unpinned, ids_gpu, 16, early=ids.numpy())
++        out_p1, _ = _step(pinned, ids_gpu, 16, early=ids.numpy())
++        wait_reader(unpinned)
++        wait_reader(pinned)
++        torch.testing.assert_close(out_u1.cpu(), expected, rtol=0, atol=0)
++        torch.testing.assert_close(out_p1.cpu(), expected, rtol=0, atol=0)
++        assert torch.equal(out_u1.view(torch.uint16), out_p1.view(torch.uint16))
++
++        su1 = unpinned.stats()
++        sp1 = pinned.stats()
++        assert sp1["read_calls"] > 0
++        assert sp1["read_calls"] < su1["read_calls"]
++        assert sp1["read_bytes"] < su1["read_bytes"]
++        assert sp1["unique_blocks"] < su1["unique_blocks"]
++
++        # Second identical step hits 100% in the row cache with 0 additional read calls.
++        out_p2, _ = _step(pinned, ids_gpu, 16, early=ids.numpy())
++        wait_reader(pinned)
++        torch.testing.assert_close(out_p2.cpu(), expected, rtol=0, atol=0)
++        sp2 = pinned.stats()
++        assert sp2["read_calls"] == sp1["read_calls"]
++        assert sp2["cache_hits"] - sp1["cache_hits"] == 16 * 8
++    finally:
++        unpinned.close()
++        pinned.close()
++
++
++def test_engram_disk_rows_stage_bounds_and_idempotent_close():
++    import pytest
++
++    rows = EngramDiskRows(
++        device="cuda",
++        table_rows=TABLE_ROWS,
++        shard_start=0,
++        shard_end=TABLE_ROWS,
++        max_lookups=16,
++        columns=TP3_RANK1,
++        cache_rows=0,
++    )
++    stream = torch.cuda.current_stream()
++    try:
++        good_ids = torch.zeros(16, dtype=torch.int64, device="cuda")
++        short_ids = torch.zeros(4, dtype=torch.int64, device="cuda")
++        with pytest.raises(ValueError, match="exceeds max_lookups"):
++            rows.stage(stream, good_ids, 17)
++        with pytest.raises(ValueError, match="exceeds max_lookups"):
++            rows.stage(stream, good_ids, -1)
++        with pytest.raises(ValueError, match="Engram device IDs"):
++            rows.stage(stream, short_ids, 8)
++    finally:
++        rows.close()
++        rows.close()
++        assert rows._closed is True
++        assert rows._reader is None
+diff --git a/tests/kernels/test_deepseek_v41_postload_startup.py b/tests/kernels/test_deepseek_v41_postload_startup.py
+new file mode 100644
+index 0000000000..488e82c658
+--- /dev/null
++++ b/tests/kernels/test_deepseek_v41_postload_startup.py
+@@ -0,0 +1,193 @@
++# SPDX-License-Identifier: Apache-2.0
++# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
++"""Tests for DeepSeek-V4.1 post-load weight preparation, on-disk cache, and startup optimizations."""
++
++from __future__ import annotations
++
++from pathlib import Path
++import subprocess
++import sys
++
++import pytest
++import torch
++
++from vllm.models.deepseek_v4_1.tilelang.gemm import (
++    TILE_WEIGHT_K,
++    TILE_WEIGHT_N,
++    pack_weight_tiles,
++    unpack_weight_tiles,
++)
++from vllm.models.deepseek_v4_1.tilelang.scale_codes import (
++    _pack_crumbs,
++    _pack_nibbles,
++    encode_expert_scale_codes,
++    narrow_code_offsets,
++    overlay_byte_codes,
++    pack_expert_scale_codes,
++    tile_byte_codes,
++)
++
++
++def _legacy_encode_expert_scale_codes(
++    exponents: torch.Tensor, block_N: int = 128
++) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
++    packed = pack_expert_scale_codes(exponents)
++    e, n, words = packed.codes.shape
++    tiled_4bit = (
++        packed.codes.view(torch.int16)
++        .view(e, n // block_N, block_N, words)
++        .permute(0, 1, 3, 2)
++        .reshape(-1, block_N)
++        .contiguous()
++        .view(torch.uint16)
++    )
++    tiled_2bit = tile_byte_codes(packed.codes_2bit, block_N)
++    codes, codes_2bit = overlay_byte_codes(tiled_4bit, tiled_2bit, packed.narrow)
++    return codes, codes_2bit, narrow_code_offsets(packed.narrow), packed.base
++
++
++def test_swar_pack_crumbs_and_nibbles_exhaustive():
++    vals4 = torch.arange(4, dtype=torch.uint8)
++    grid4 = torch.cartesian_prod(vals4, vals4, vals4, vals4).contiguous()
++    ref_crumbs = (
++        grid4[:, 0] | (grid4[:, 1] << 2) | (grid4[:, 2] << 4) | (grid4[:, 3] << 6)
++    ).to(torch.uint8)
++    assert torch.equal(_pack_crumbs(grid4), ref_crumbs)
++
++    vals16 = torch.arange(16, dtype=torch.uint8)
++    grid16 = torch.cartesian_prod(vals16, vals16, vals16, vals16).contiguous()
++    lo = (grid16[:, 0] | (grid16[:, 1] << 4)).to(torch.int16)
++    hi = (grid16[:, 2] | (grid16[:, 3] << 4)).to(torch.int16)
++    ref_nibbles = (lo | (hi << 8)).view(torch.uint16)
++    assert torch.equal(_pack_nibbles(grid16), ref_nibbles)
++
++
++@pytest.mark.parametrize("mode", ["all_narrow", "mixed", "all_wide", "zero_padded"])
++def test_encode_expert_scale_codes_matches_legacy(mode: str):
++    torch.manual_seed(42)
++    device = "cuda" if torch.cuda.is_available() else "cpu"
++    e, n, k_scales = 32, 256, 56
++    base = torch.randint(115, 128, (e, n, 1), dtype=torch.uint8, device=device)
++    if mode == "all_narrow":
++        deltas = torch.randint(0, 4, (e, n, k_scales), dtype=torch.uint8, device=device)
++        scales = base + deltas
++    elif mode == "all_wide":
++        deltas = torch.randint(0, 12, (e, n, k_scales), dtype=torch.uint8, device=device)
++        deltas[:, 0, 0] = 9
++        scales = base + deltas
++    elif mode == "mixed":
++        deltas = torch.randint(0, 4, (e, n, k_scales), dtype=torch.uint8, device=device)
++        deltas[::3, 0, 0] = 11
++        scales = base + deltas
++    else:
++        deltas = torch.randint(0, 4, (e, n, k_scales), dtype=torch.uint8, device=device)
++        deltas[5, 0, 0] = 8
++        scales = base + deltas
++        scales[:, :, -8:] = 0
++
++    ref_codes, ref_2bit, ref_narrow, ref_base = _legacy_encode_expert_scale_codes(
++        scales, 128
++    )
++    codes, codes_2bit, narrow, out_base = encode_expert_scale_codes(scales, 128)
++    assert torch.equal(codes, ref_codes)
++    assert torch.equal(codes_2bit, ref_2bit)
++    assert torch.equal(narrow, ref_narrow)
++    assert torch.equal(out_base, ref_base)
++
++
++def test_pack_weight_tiles_and_direct_prefix_slice():
++    torch.manual_seed(7)
++    device = "cuda" if torch.cuda.is_available() else "cpu"
++    n, q_rows, k = 1024, 640, 512
++    raw = torch.randint(0, 256, (n, k), dtype=torch.uint8, device=device).view(
++        torch.float8_e4m3fn
++    )
++    packed = pack_weight_tiles(raw)
++    ref_packed = (
++        raw.reshape(n // TILE_WEIGHT_N, TILE_WEIGHT_N, k // TILE_WEIGHT_K, TILE_WEIGHT_K)
++        .permute(0, 2, 1, 3)
++        .contiguous()
++        .view(n * (k // TILE_WEIGHT_K), TILE_WEIGHT_K)
++    )
++    assert torch.equal(packed.view(torch.uint8), ref_packed.view(torch.uint8))
++    unpacked = unpack_weight_tiles(packed, n, k)
++    assert torch.equal(unpacked.view(torch.uint8), raw.view(torch.uint8))
++
++    # Direct packed slice for trimmed group rows (TP3 rank 2 wq_b optimization)
++    direct_slice = packed[: q_rows * (k // TILE_WEIGHT_K)].contiguous()
++    repacked_slice = pack_weight_tiles(unpacked[:q_rows].contiguous())
++    assert torch.equal(direct_slice.view(torch.uint8), repacked_slice.view(torch.uint8))
++
++
++@pytest.mark.skipif(not torch.cuda.is_available(), reason="Requires CUDA for TileLang")
++def test_pack_bf16_weight_in_place_direct_rows_and_tile_expert_weights():
++    from vllm.models.deepseek_v4_1.tilelang.moe import FP4_TMA_K, tile_expert_weights
++    from vllm.models.deepseek_v4_1.tilelang.vocab import (
++        pack_bf16_weight,
++        unpack_bf16_weight,
++    )
++
++    torch.manual_seed(19)
++    # > 3072 rows exercises the overlap-safe direct write tail in pack_bf16_weight(in_place=True).
++    w = torch.randn(4352, 256, device="cuda", dtype=torch.bfloat16)
++    w[0, 3] = 1e-38
++    w[1024, 17] = -1e-37
++    w[3072, 129] = 1e35
++    w[4351, 255] = -1e35
++
++    ref = pack_bf16_weight(w.clone(), in_place=False)
++    inp = pack_bf16_weight(w.clone(), in_place=True)
++    assert inp.exponent_base == ref.exponent_base
++    assert inp.exceptions == ref.exceptions
++    assert torch.equal(inp.values, ref.values)
++    assert torch.equal(inp.row_offsets, ref.row_offsets)
++    assert torch.equal(inp.exception_rows, ref.exception_rows)
++    assert torch.equal(inp.exception_entries, ref.exception_entries)
++    assert torch.equal(
++        unpack_bf16_weight(inp).view(torch.int16), w.view(torch.int16)
++    )
++
++    # tile_expert_weights with and without 64-column tail
++    for half_k in (256, 288):
++        b_packed = torch.randint(
++            -128, 127, (16, 256, half_k), dtype=torch.int8, device="cuda"
++        )
++        tiles, tails = tile_expert_weights(b_packed, 128)
++        k_full, tail = divmod(2 * half_k, FP4_TMA_K)
++        b_view = b_packed.view(16, 2, 128, half_k)
++        ref_tiles = (
++            b_view[..., : k_full * (FP4_TMA_K // 2)]
++            .reshape(16, 2, 128, k_full, FP4_TMA_K // 2)
++            .permute(0, 1, 3, 2, 4)
++            .reshape(-1, 128, FP4_TMA_K // 2)
++            .contiguous()
++        )
++        assert torch.equal(tiles, ref_tiles)
++        if tail:
++            ref_tails = (
++                b_view[..., k_full * (FP4_TMA_K // 2) :]
++                .reshape(-1, 128, tail // 2)
++                .contiguous()
++                .view(torch.uint8)
++            )
++            assert torch.equal(tails, ref_tails)
++        else:
++            assert tails is None
++
++
++def test_lazy_deepseek_v41_resolution_avoids_eager_dspark_and_model_import():
++    code = """
++import sys
++import vllm.models.deepseek_v41 as ds41
++cls = ds41.DeepseekV41ForCausalLM
++assert "vllm.models.deepseek_v4_1.nvidia.dspark" not in sys.modules
++assert "vllm.models.deepseek_v4_1.nvidia.model" not in sys.modules
++assert "vllm.models.deepseek_v41.nvidia.model" not in sys.modules
++"""
++    res = subprocess.run(
++        [sys.executable, "-c", code],
++        capture_output=True,
++        text=True,
++        check=False,
++    )
++    assert res.returncode == 0, res.stderr
+diff --git a/tests/models/test_deepseek_v4_1_engram.py b/tests/models/test_deepseek_v4_1_engram.py
+index 65c8554ab1..348ed42417 100644
+--- a/tests/models/test_deepseek_v4_1_engram.py
++++ b/tests/models/test_deepseek_v4_1_engram.py
+@@ -209,6 +209,7 @@ def test_engram_descriptor_loading_preserves_ordinary_weights(
+     table_memory,
+ ):
+     """Raw table entries never reach payload readers or placeholder parameters."""
++    monkeypatch.setattr(engram_module, "ENGRAM_PACKED_DIR", "")
+     make_model, weights, _ = tiny_engram_checkpoint
+     root, target = make_model(table_memory)
+     real_open = weight_utils.safe_open
+@@ -417,6 +418,8 @@ def test_disk_engram_preparation_refreshes_graph_and_rejects_stale_rows(
+     monkeypatch,
+ ):
+     """Accepted GPU history, images, padding and failures cross the eager boundary."""
++    monkeypatch.setattr(engram_module, "ENGRAM_PACKED_DIR", "")
++    monkeypatch.setattr(engram_module, "ENGRAM_ROW_CACHE_ROWS", 0)
+     make_model, weights, paths = tiny_engram_checkpoint
+     # The reader serves rows it has read before from its row cache (a checkpoint
+     # is immutable while serving). Every step of this test reads the files, so
+@@ -581,6 +584,7 @@ def test_disk_engram_rows_the_host_hashed_equal_the_gpu_rows(
+     debug check on, every early ID equals the GPU's, and the rows equal the resident
+     table's: a first chunk, a later chunk with history, a mixed step (decode first,
+     an image token in its history) and a decode-only step."""
++    monkeypatch.setattr(engram_module, "ENGRAM_PACKED_DIR", "")
+     monkeypatch.setattr(engram_module, "ENGRAM_CHECK_EARLY_IDS", True)
+     make_model, weights, paths = tiny_engram_checkpoint
+     root, target = make_model("disk")
+@@ -1018,6 +1022,7 @@ def test_disk_rows_read_whole_table_sources(tmp_path, dist_init, monkeypatch, tp
+     """Each rank reads its shard (its hash columns) of the global tables from unaligned
+     file offsets, and other ranks' columns gather as zeros; a disk table declares only
+     its reader's step kernel, no resident gather."""
++    monkeypatch.setattr(engram_module, "ENGRAM_PACKED_DIR", "")
+     from vllm.models.deepseek_v4_1.tilelang import engram_rows, prepare
+ 
+     device = torch.device("cuda", torch.cuda.current_device())
+@@ -1299,6 +1304,8 @@ def test_disk_rows_pack_and_read_rank_compacted_files(monkeypatch):
+     import shutil
+     packed_dir = os.path.join(base_dir, f"packed-{os.getpid()}")
+     shutil.rmtree(packed_dir, ignore_errors=True)
++    if "SPARK_DS41F_ENGRAM_PACKED_DIR" not in os.environ:
++        assert engram_mod.ENGRAM_PACKED_DIR == "/cache/spark-ds41f/engram-264-v1"
+     monkeypatch.setattr(engram_mod, "ENGRAM_PACKED_DIR", packed_dir)
+     embed = ParallelEngramEmbedding(caps, geometry, table_memory="disk")
+     embed._disk_sources = [(w_path, 0, False), (s_path, 0, True)]
+@@ -1465,3 +1472,78 @@ def test_engram_projection_tp_gathers_dim0_into_blocked_gate(
+     assert gather_dims == [0, 0]
+     assert torch.equal(actual_plain.view(torch.int16), expected_plain.view(torch.int16))
+     assert torch.equal(actual_fused.view(torch.int16), expected_fused.view(torch.int16))
++
++
++def test_disk_engram_prefetched_hit_defers_layer14_stage_and_chunk0_prefetches():
++    geometry = native.build_geometry(
++        layer_ids=(1, 14), base_table_size=19, compressed_vocab_size=32
++    )
++    prefetched = []
++
++    class DummyDiskRows:
++        check_early = False
++
++        def prefetch(self, ids):
++            prefetched.append(ids.copy())
++
++    dummy_model = SimpleNamespace(
++        start_layer=0,
++        end_layer=2,
++        layers=[
++            SimpleNamespace(
++                engram=SimpleNamespace(
++                    layer_hash_index=0,
++                    embed_tokens=SimpleNamespace(
++                        column_mask=0xFFFFFF, disk_rows=DummyDiskRows()
++                    ),
++                )
++            ),
++            SimpleNamespace(
++                engram=SimpleNamespace(
++                    layer_hash_index=1,
++                    embed_tokens=SimpleNamespace(
++                        column_mask=0xFFFFFF, disk_rows=DummyDiskRows()
++                    ),
++                )
++            ),
++        ],
++        engram_hash=SimpleNamespace(
++            layout=SimpleNamespace(
++                geometry=geometry,
++                token_map=np.arange(32, dtype=np.int32),
++            )
++        ),
++        engram_layout=SimpleNamespace(caps=(SimpleNamespace(max_tokens=2048),)),
++    )
++    state = DeepseekV41ModelState.__new__(DeepseekV41ModelState)
++    state.disk_engram_models = (dummy_model,)
++    state._prefill_tokens = {"r0": np.arange(2050, dtype=np.int32) % 32}
++    state._host_engram_hash = None
++    state._prefetched_engram_ids = None
++    state.max_num_tokens = 2048
++
++    state._prefetch_chunk0_engram(state._prefill_tokens["r0"], 0)
++    assert len(prefetched) == 1 and prefetched[0].shape == (2048, 24)
++
++    batch = SimpleNamespace(
++        has_prefill=True,
++        req_ids=["r0"],
++        is_prefilling_np=np.array([True]),
++        query_start_loc_np=np.array([0, 2048]),
++        num_scheduled_tokens=np.array([2048]),
++        num_computed_prefill_tokens_np=np.array([0]),
++        num_draft_tokens_per_req=None,
++        input_ids=SimpleNamespace(shape=(2048,)),
++    )
++    assert state._ensure_host_engram_hash(dummy_model) is not None
++    state._host_engram_hash.step_ids(
++        2048,
++        ((0, 2048, state._prefill_tokens["r0"], np.arange(2048, dtype=np.int64)),),
++    )
++    cached_ids = np.arange(2048 * 2 * 24, dtype=np.int64).reshape(2048, 2, 24)
++    key = (0xFFFFFF, 2048, (("r0", 0, 2048, 0, 2048),))
++    state._prefetched_engram_ids = (key, cached_ids)
++    early_0, early_1_fn = state._early_engram_ids(dummy_model, batch)
++    assert np.array_equal(early_0, cached_ids[:, 0])
++    assert callable(early_1_fn)
++    assert np.array_equal(early_1_fn(), cached_ids[:, 1])
+diff --git a/vllm/model_executor/model_loader/utils.py b/vllm/model_executor/model_loader/utils.py
+index 11e6be5cf8..3f0623f12b 100644
+--- a/vllm/model_executor/model_loader/utils.py
++++ b/vllm/model_executor/model_loader/utils.py
+@@ -106,6 +106,9 @@ def process_weights_after_loading(
+     # Reclaim memory when an explicit lm_head has been
+     # loaded, but it is identical to the input embeddings.
+     maybe_retie_word_embeddings(model, model_config)
++    track_cuda_reserved = (
++        target_device.type == "cuda" and torch.cuda.is_available()
++    )
+ 
+     for name, module in model.named_modules():
+         quant_method = getattr(module, "quant_method", None)
+@@ -130,6 +133,11 @@ def process_weights_after_loading(
+                 if quant_method.requires_device_loading
+                 else nullcontext()
+             )
++            reserved_before = (
++                torch.cuda.memory_reserved(target_device)
++                if track_cuda_reserved
++                else 0
++            )
+             with loading_context:
+                 quant_method.process_weights_after_loading(module)
+             # process_weights_after_loading may swap in freshly-created
+@@ -141,12 +149,16 @@ def process_weights_after_loading(
+                 module.update_param_tp_status()
+             # Repacking transients above can leave large amounts of memory in
+             # the caching allocator, which starves the OS on UMA devices.
+-            release_device_memory_under_pressure(target_device)
++            if (
++                not track_cuda_reserved
++                or torch.cuda.memory_reserved(target_device) > reserved_before
++            ):
++                release_device_memory_under_pressure(target_device)
+ 
+     # Initialize post-load attention weights for any attention layer and MM
+     # encoder. NOTE: Happens after other modules so we can easily decompress
+     # weights.
+-    for _, module in model.named_modules():
++    for name, module in model.named_modules():
+         if is_deferred_attention_layer(module):
+             # TODO(lucas): see if there is a way to unify the signatures
+             # of process_weights_after_loading
+diff --git a/vllm/models/deepseek_v4_1/common/engram.py b/vllm/models/deepseek_v4_1/common/engram.py
+index f686e46317..fa51ae2973 100644
+--- a/vllm/models/deepseek_v4_1/common/engram.py
++++ b/vllm/models/deepseek_v4_1/common/engram.py
+@@ -181,11 +181,8 @@ ENGRAM_TIMELINE = os.environ.get("SPARK_DS41F_ENGRAM_TIMELINE", "0") == "1"
+ ENGRAM_TIMELINE_DIR = os.environ.get(
+     "SPARK_DS41F_ENGRAM_TIMELINE_DIR", "/cache/spark-ds41f/engram-timeline"
+ )
+-ENGRAM_PACKED_DIR = os.environ.get("SPARK_DS41F_ENGRAM_PACKED_DIR", "")
+-_ENGRAM_ROW_CACHE_ENV = os.environ.get("SPARK_DS41F_ENGRAM_ROW_CACHE_ROWS")
+-ENGRAM_ROW_CACHE_ROWS: int | None = (
+-    int(_ENGRAM_ROW_CACHE_ENV) if _ENGRAM_ROW_CACHE_ENV is not None else None
+-)
++ENGRAM_PACKED_DIR = os.environ.get("SPARK_DS41F_ENGRAM_PACKED_DIR", "/cache/spark-ds41f/engram-264-v1")
++ENGRAM_ROW_CACHE_ROWS: int = 262144
+ _timeline_tables: list = []
+ 
+ 
+@@ -738,11 +735,6 @@ class ParallelEngramEmbedding(nn.Module):
+             raise ValueError(
+                 "Disk Engram needs the table's weight and scale planes, once each"
+             )
+-        cache_kw = (
+-            {"cache_rows": ENGRAM_ROW_CACHE_ROWS}
+-            if ENGRAM_ROW_CACHE_ROWS is not None
+-            else {}
+-        )
+         rows = EngramDiskRows(
+             device=self.caps.device,
+             table_rows=self.table_rows,
+@@ -751,7 +743,7 @@ class ParallelEngramEmbedding(nn.Module):
+             delay_s=ENGRAM_READ_DELAY_S,
+             check_early=ENGRAM_CHECK_EARLY_IDS,
+             timeline=ENGRAM_TIMELINE,
+-            **cache_kw,
++            cache_rows=ENGRAM_ROW_CACHE_ROWS,
+         )
+         weight_path, weight_offset = next(
+             (p, off) for p, off, s in self._disk_sources if not s
+diff --git a/vllm/models/deepseek_v4_1/engram_rows/_reader.c b/vllm/models/deepseek_v4_1/engram_rows/_reader.c
+index 21849ffaaa..f8820b18ed 100644
+--- a/vllm/models/deepseek_v4_1/engram_rows/_reader.c
++++ b/vllm/models/deepseek_v4_1/engram_rows/_reader.c
+@@ -118,6 +118,8 @@ typedef struct {
+     const char *ids;
+     char *weights, *scales;
+     char *early_weights, *early_scales;
++    int64_t *prefetched_early;
++    uint32_t prefetched_count;
+     char *active_weights, *active_scales;
+     uint32_t *control;
+     int64_t *late; /* the GPU's IDs of a step's lookups the host did not know, -1 elsewhere */
+@@ -414,6 +416,54 @@ static bool read_early(reader_t *reader, step_t step, failure_t *failure, double
+     /* Sequences run 1, 2, ... 0xFFFFFFFF, 1: the step before 1 is 0xFFFFFFFF (or none,
+      * when the control block's 0 has reached it already). */
+     uint32_t previous = step.sequence == 1 ? 0xFFFFFFFFu : step.sequence - 1;
++    bool early_match = false;
++    if (reader->prefetched_count > 0 && reader->prefetched_count <= step.count &&
++        reader->prefetched_early &&
++        memcmp(reader->prefetched_early, step.early,
++               (size_t)reader->prefetched_count * sizeof(*step.early)) == 0) {
++        early_match = true;
++        for (uint32_t i = reader->prefetched_count; i < step.count; i++) {
++            if (step.early[i] != -1) {
++                early_match = false;
++                break;
++            }
++        }
++    }
++    if (early_match) {
++        uint32_t copy_count = reader->prefetched_count;
++        reader->prefetched_count = 0;
++        pthread_mutex_lock(&reader->mutex);
++        reader->early_prefetched_steps++;
++        pthread_mutex_unlock(&reader->mutex);
++        if (reached(__atomic_load_n(&reader->control[CTRL_CONSUMED_SEQ], __ATOMIC_ACQUIRE), previous)) {
++            *consumed_wait = 0.0;
++        } else {
++            control_store(reader, CTRL_PHASE, PHASE_WAITING_CONSUMED);
++            uint64_t wait_start = now_ns();
++            if (!wait_for_gpu(reader, CTRL_CONSUMED_SEQ, previous, failure,
++                              "the GPU's gather of the rows of Engram step",
++                              "the GPU never gathered the previous step's rows"))
++                return false;
++            *consumed_wait = (double)(now_ns() - wait_start) * 1e-9;
++        }
++        uint64_t copy_start = now_ns();
++        for (uint32_t i = 0; i < copy_count; i++) {
++            int64_t id = step.early[i];
++            if (id == UNKNOWN_ID) continue;
++            (*early_count)++;
++            if (id < reader->plan.tp_start || id >= reader->plan.tp_end ||
++                !((reader->plan.columns >> (i % PLE_COLUMNS)) & 1u))
++                continue;
++            if (reader->plan.cache_sets) reader->plan.cache_hits++;
++            memcpy(reader->weights + (size_t)i * 256u,
++                   reader->early_weights + (size_t)i * 256u, 256u);
++            memcpy(reader->scales + (size_t)i * 8u,
++                   reader->early_scales + (size_t)i * 8u, 8u);
++        }
++        *early_read = (double)(now_ns() - copy_start) * 1e-9;
++        return true;
++    }
++    reader->prefetched_count = 0;
+     if (reached(__atomic_load_n(&reader->control[CTRL_CONSUMED_SEQ], __ATOMIC_ACQUIRE), previous)) {
+         *consumed_wait = 0.0;
+         uint64_t read_start = now_ns();
+@@ -505,11 +555,17 @@ static uint64_t drop_plan_page_cache(reader_t *reader) {
+ static void serve(reader_t *reader, step_t step) {
+     failure_t failure = {{0}};
+     if (step.is_prefetch) {
+-        if (step.early && reader->plan.cache_sets) {
++        reader->prefetched_count = 0;
++        if (step.early && reader->plan.cache_sets && reader->prefetched_early) {
++            reader->plan.is_prefetch = true;
+             failure = read_rows_into(reader, (const char *)step.early, step.count,
+                                      reader->early_weights, reader->early_scales, true);
++            reader->plan.is_prefetch = false;
+             if (!failure.message[0] && !reader->poisoned) {
+                 ple_cache_commit(&reader->plan);
++                memcpy(reader->prefetched_early, step.early,
++                       (size_t)step.count * sizeof(*step.early));
++                reader->prefetched_count = step.count;
+             }
+             (void)drop_plan_page_cache(reader);
+         }
+@@ -746,6 +802,7 @@ static void release(reader_t *reader) {
+     free(reader->late);
+     free(reader->early_weights);
+     free(reader->early_scales);
++    free(reader->prefetched_early);
+     free(reader->timeline);
+     free(reader->free_slots);
+     free(reader->registered_fds);
+@@ -786,9 +843,10 @@ static PyObject *py_reader(PyObject *self, PyObject *args) {
+     double ids_timeout, delay;
+     int check_early, timeline;
+     long long cache_rows = PLE_DEFAULT_CACHE_ROWS;
+-    if (!PyArg_ParseTuple(args, "LLLILiKKKKddpp|L", &table_rows, &shard_start, &shard_end, &columns, &max_lookups,
++    int pin_scales = -1;
++    if (!PyArg_ParseTuple(args, "LLLILiKKKKddpp|Li", &table_rows, &shard_start, &shard_end, &columns, &max_lookups,
+                           &depth, &ids, &weights, &scales, &control, &ids_timeout, &delay, &check_early,
+-                          &timeline, &cache_rows))
++                          &timeline, &cache_rows, &pin_scales))
+         return NULL;
+     if (table_rows <= 0 || shard_start < 0 || shard_end < shard_start || shard_end > table_rows ||
+         !columns || (columns & ~PLE_ALL_COLUMNS) || cache_rows < 0 ||
+@@ -806,6 +864,7 @@ static PyObject *py_reader(PyObject *self, PyObject *args) {
+         return error == ENOMEM ? PyErr_NoMemory()
+                                : PyErr_Format(PyExc_ValueError, "Engram row plan: %s", strerror(error));
+     }
++    if (pin_scales >= 0) reader->plan.pin_scales = pin_scales != 0;
+     reader->ids = (const char *)(uintptr_t)ids;
+     reader->weights = (char *)(uintptr_t)weights;
+     reader->scales = (char *)(uintptr_t)scales;
+@@ -822,7 +881,8 @@ static PyObject *py_reader(PyObject *self, PyObject *args) {
+     reader->late = malloc((size_t)max_lookups * sizeof(*reader->late));
+     reader->early_weights = malloc((size_t)max_lookups * 256);
+     reader->early_scales = malloc((size_t)max_lookups * 8);
+-    if (!reader->late || !reader->early_weights || !reader->early_scales) {
++    reader->prefetched_early = malloc((size_t)max_lookups * sizeof(*reader->prefetched_early));
++    if (!reader->late || !reader->early_weights || !reader->early_scales || !reader->prefetched_early) {
+         release(reader);
+         return PyErr_NoMemory();
+     }
+diff --git a/vllm/models/deepseek_v4_1/engram_rows/_row_plan.h b/vllm/models/deepseek_v4_1/engram_rows/_row_plan.h
+index a9d8531a3d..cf9233e1c7 100644
+--- a/vllm/models/deepseek_v4_1/engram_rows/_row_plan.h
++++ b/vllm/models/deepseek_v4_1/engram_rows/_row_plan.h
+@@ -16,6 +16,7 @@
+ #define PLE_PACKED_ROW_BYTES 264u
+ #define PLE_PACKED_ROWS_PER_PAGE 15u
+ #define PLE_CACHE_WAYS 4u
++#define PLE_CACHE_MAX_USAGE 3u
+ #define PLE_DEFAULT_CACHE_ROWS 65536
+ #define PLE_CACHE_MAX_TOKENS 64u
+ #define PLE_CACHE_MAX_LOOKUPS (PLE_CACHE_MAX_TOKENS * PLE_COLUMNS)
+@@ -34,6 +35,7 @@ typedef struct {
+     int64_t offset;
+     size_t file;
+     bool scale;
++    char *pinned_scales;
+ } ple_source_t;
+ 
+ typedef struct {
+@@ -56,7 +58,7 @@ typedef struct {
+ typedef struct {
+     int64_t shard_rows, padded_rows, tp_start, tp_end;
+     uint32_t columns;
+-    bool packed, has_col_map, has_staged_misses;
++    bool packed, has_col_map, has_staged_misses, pin_scales, is_prefetch, miss_is_prefill;
+     int64_t col_start[PLE_COLUMNS], col_end[PLE_COLUMNS], col_delta[PLE_COLUMNS];
+     size_t weight_bytes, scale_bytes, max_lookups, capacity;
+     ple_fragment_t *fragments;
+@@ -70,6 +72,7 @@ typedef struct {
+     uint64_t unique_blocks, coalesced_reads, submit_calls;
+     double execution_seconds, planning_seconds;
+     int64_t (*cache_tags)[PLE_CACHE_WAYS];
++    uint8_t (*cache_usage)[PLE_CACHE_WAYS];
+     uint8_t *cache_clocks;
+     char *cache_weights, *cache_scales;
+     size_t cache_sets, cache_set_mask;
+@@ -90,11 +93,13 @@ static inline int ple_source_compare(const void *left, const void *right) {
+ 
+ static inline void ple_plan_release(ple_plan_t *reader) {
+     for (size_t i = 0; i < reader->file_count; i++) close(reader->files[i].fd);
++    for (size_t i = 0; i < reader->source_count; i++) free(reader->sources[i].pinned_scales);
+     free(reader->files);
+     free(reader->sources);
+     free(reader->fragments);
+     free(reader->jobs);
+     free(reader->cache_tags);
++    free(reader->cache_usage);
+     free(reader->cache_clocks);
+     free(reader->cache_weights);
+     free(reader->cache_scales);
+@@ -127,6 +132,7 @@ static inline int ple_plan_init(ple_plan_t *reader, int64_t shard_rows,
+     reader->weight_bytes = weight_bytes;
+     reader->scale_bytes = scale_bytes;
+     reader->max_lookups = max_lookups;
++    reader->pin_scales = true;
+     reader->capacity = (size_t)max_lookups * per_row;
+     reader->fragments = calloc(reader->capacity, sizeof(*reader->fragments));
+     reader->jobs = calloc(reader->capacity, sizeof(*reader->jobs));
+@@ -158,12 +164,13 @@ static inline int ple_plan_init(ple_plan_t *reader, int64_t shard_rows,
+         reader->cache_weights = weights_ptr;
+         reader->miss_weights = miss_w_ptr;
+         reader->cache_clocks = calloc(sets, sizeof(*reader->cache_clocks));
++        reader->cache_usage = calloc(sets, sizeof(*reader->cache_usage));
+         reader->cache_scales = malloc(total_ways * 8u);
+         reader->miss_lookups = malloc(miss_cap * sizeof(*reader->miss_lookups));
+         reader->miss_ids = malloc(miss_cap * sizeof(*reader->miss_ids));
+         reader->miss_scales = malloc(miss_cap * 8u);
+-        if (!reader->cache_clocks || !reader->cache_scales || !reader->miss_lookups ||
+-            !reader->miss_ids || !reader->miss_scales)
++        if (!reader->cache_clocks || !reader->cache_usage || !reader->cache_scales ||
++            !reader->miss_lookups || !reader->miss_ids || !reader->miss_scales)
+             return ENOMEM;
+         memset(reader->cache_tags, 0xFF, sets * sizeof(*reader->cache_tags));
+         memset(reader->cache_weights, 0, total_ways * 256u);
+@@ -239,8 +246,50 @@ static inline int ple_add_source_rows(ple_plan_t *reader, int64_t shard, const c
+                 } else if (reader->files[file].bytes != status.st_size) {
+                     snprintf(failure.message, sizeof(failure.message), "PLE source file size changed during registration");
+                 }
++                char *pinned_scales = NULL;
++                if (!failure.message[0] && scale && !reader->packed && reader->pin_scales && span_bytes > 0) {
++                    pinned_scales = malloc((size_t)span_bytes);
++                    if (!pinned_scales) {
++                        snprintf(failure.message, sizeof(failure.message),
++                                 "could not allocate pinned PLE scale plane");
++                    } else {
++                        int pin_fd = open(path, O_RDONLY | O_CLOEXEC);
++                        if (pin_fd < 0) {
++                            system_error(&failure, "open pinned PLE scale source");
++                        } else {
++                            size_t done = 0;
++                            while (done < (size_t)span_bytes) {
++                                ssize_t n = pread(pin_fd, pinned_scales + done,
++                                                  (size_t)span_bytes - done,
++                                                  (off_t)(offset + (int64_t)done));
++                                if (n < 0) {
++                                    if (errno == EINTR) continue;
++                                    system_error(&failure, "read pinned PLE scale source");
++                                    break;
++                                }
++                                if (n == 0) {
++                                    snprintf(failure.message, sizeof(failure.message),
++                                             "short read while pinning PLE scale source");
++                                    break;
++                                }
++                                done += (size_t)n;
++                            }
++                            const char *drop_env = getenv("SPARK_DS41F_ENGRAM_DROP_PAGE_CACHE");
++                            if (!drop_env || strcmp(drop_env, "0") != 0) {
++                                (void)posix_fadvise(pin_fd, (off_t)offset, (off_t)span_bytes,
++                                                    POSIX_FADV_DONTNEED);
++                            }
++                            close(pin_fd);
++                        }
++                        if (failure.message[0]) {
++                            free(pinned_scales);
++                            pinned_scales = NULL;
++                        }
++                    }
++                }
+                 if (!failure.message[0]) {
+-                    reader->sources[reader->source_count++] = (ple_source_t){shard, offset, file, scale != 0};
++                    reader->sources[reader->source_count++] =
++                        (ple_source_t){shard, offset, file, scale != 0, pinned_scales};
+                     qsort(reader->sources, reader->source_count, sizeof(*sources), ple_source_compare);
+                     const char *drop_env = getenv("SPARK_DS41F_ENGRAM_DROP_PAGE_CACHE");
+                     if (!drop_env || strcmp(drop_env, "0") != 0) {
+@@ -412,16 +461,68 @@ static inline void ple_scatter_packed_fragment(const ple_fragment_t *fragment, c
+ }
+ 
+ static inline void ple_cache_insert(ple_plan_t *reader, int64_t id,
+-        const char *weight_src, const char *scale_src) {
++        const char *weight_src, const char *scale_src, bool is_prefill) {
+     size_t set_idx = ple_cache_set_index(id, reader->cache_set_mask);
+     int64_t *tags = reader->cache_tags[set_idx];
++    uint8_t *usage = reader->cache_usage[set_idx];
+     for (unsigned w = 0; w < PLE_CACHE_WAYS; w++) {
+-        if (tags[w] == id) return;
++        if (tags[w] == id) {
++            if (usage[w] < PLE_CACHE_MAX_USAGE) usage[w]++;
++            return;
++        }
+     }
+-    unsigned w = reader->cache_clocks[set_idx] & (PLE_CACHE_WAYS - 1);
+-    reader->cache_clocks[set_idx] = (uint8_t)((w + 1) & (PLE_CACHE_WAYS - 1));
+-    tags[w] = id;
+-    size_t way_idx = set_idx * PLE_CACHE_WAYS + (size_t)w;
++    unsigned start = reader->cache_clocks[set_idx] & (PLE_CACHE_WAYS - 1);
++    for (unsigned step = 0; step < PLE_CACHE_WAYS; step++) {
++        unsigned w = (start + step) & (PLE_CACHE_WAYS - 1);
++        if (tags[w] < 0) {
++            reader->cache_clocks[set_idx] = (uint8_t)((w + 1) & (PLE_CACHE_WAYS - 1));
++            tags[w] = id;
++            usage[w] = is_prefill ? 0u : 1u;
++            size_t way_idx = set_idx * PLE_CACHE_WAYS + (size_t)w;
++            memcpy(reader->cache_weights + way_idx * 256u, weight_src, 256u);
++            memcpy(reader->cache_scales + way_idx * 8u, scale_src, 8u);
++            reader->cache_populated++;
++            return;
++        }
++    }
++    for (unsigned step = 0; step < PLE_CACHE_WAYS; step++) {
++        unsigned w = (start + step) & (PLE_CACHE_WAYS - 1);
++        if (usage[w] == 0u) {
++            reader->cache_clocks[set_idx] = (uint8_t)((w + 1) & (PLE_CACHE_WAYS - 1));
++            tags[w] = id;
++            usage[w] = is_prefill ? 0u : 1u;
++            size_t way_idx = set_idx * PLE_CACHE_WAYS + (size_t)w;
++            memcpy(reader->cache_weights + way_idx * 256u, weight_src, 256u);
++            memcpy(reader->cache_scales + way_idx * 8u, scale_src, 8u);
++            reader->cache_populated++;
++            return;
++        }
++    }
++    if (is_prefill) {
++        for (unsigned step = 0; step < PLE_CACHE_WAYS; step++) {
++            unsigned w = (start + step) & (PLE_CACHE_WAYS - 1);
++            if (usage[w] == 1u) {
++                reader->cache_clocks[set_idx] = (uint8_t)((w + 1) & (PLE_CACHE_WAYS - 1));
++                tags[w] = id;
++                usage[w] = 0u;
++                size_t way_idx = set_idx * PLE_CACHE_WAYS + (size_t)w;
++                memcpy(reader->cache_weights + way_idx * 256u, weight_src, 256u);
++                memcpy(reader->cache_scales + way_idx * 8u, scale_src, 8u);
++                reader->cache_populated++;
++                return;
++            }
++        }
++        return;
++    }
++    unsigned victim = start;
++    for (;;) {
++        if (--usage[victim] == 0u) break;
++        victim = (victim + 1) & (PLE_CACHE_WAYS - 1);
++    }
++    reader->cache_clocks[set_idx] = (uint8_t)((victim + 1) & (PLE_CACHE_WAYS - 1));
++    tags[victim] = id;
++    usage[victim] = 1u;
++    size_t way_idx = set_idx * PLE_CACHE_WAYS + (size_t)victim;
+     memcpy(reader->cache_weights + way_idx * 256u, weight_src, 256u);
+     memcpy(reader->cache_scales + way_idx * 8u, scale_src, 8u);
+     reader->cache_populated++;
+@@ -449,18 +550,10 @@ static inline void ple_stash_job(ple_plan_t *reader, size_t index) {
+             uint32_t m = fragment->miss_idx;
+             if (m == PLE_NO_MISS) continue;
+             const char *src = buffer + (fragment->offset - job->offset);
+-            if (fragment->length == PLE_PACKED_ROW_BYTES) {
+-                int64_t id = reader->miss_ids[m];
+-                if (id >= 0) {
+-                    ple_cache_insert(reader, id, src, src + 256u);
+-                    reader->miss_ids[m] = -1;
+-                }
+-            } else {
+-                ple_scatter_packed_row_part(fragment->in_row, fragment->length, src,
+-                                            reader->miss_weights + (size_t)m * 256u,
+-                                            reader->miss_scales + (size_t)m * 8u);
+-                reader->has_staged_misses = true;
+-            }
++            ple_scatter_packed_row_part(fragment->in_row, fragment->length, src,
++                                        reader->miss_weights + (size_t)m * 256u,
++                                        reader->miss_scales + (size_t)m * 8u);
++            reader->has_staged_misses = true;
+         }
+     }
+     job->saved_buffer = NULL;
+@@ -470,13 +563,15 @@ static inline void ple_cache_commit(ple_plan_t *reader) {
+     if (!reader->miss_count) return;
+     const char *w_base = reader->miss_src_weights;
+     const char *s_base = reader->miss_src_scales;
++    bool is_prefill = reader->miss_is_prefill;
+     if (w_base) {
+         for (size_t k = 0; k < reader->miss_count; k++) {
+             uint32_t lookup = reader->miss_lookups[k];
+             int64_t id = reader->miss_ids[k];
+             ple_cache_insert(reader, id,
+                              w_base + (size_t)lookup * 256u,
+-                             s_base + (size_t)lookup * 8u);
++                             s_base + (size_t)lookup * 8u,
++                             is_prefill);
+         }
+     } else {
+         for (size_t j = 0; j < reader->job_count; j++) {
+@@ -488,7 +583,8 @@ static inline void ple_cache_commit(ple_plan_t *reader) {
+                 if (id >= 0) {
+                     ple_cache_insert(reader, id,
+                                      reader->miss_weights + k * 256u,
+-                                     reader->miss_scales + k * 8u);
++                                     reader->miss_scales + k * 8u,
++                                     is_prefill);
+                 }
+             }
+         }
+@@ -513,10 +609,13 @@ static inline bool ple_plan(ple_plan_t *reader, const char *ids, size_t count,
+     bool fast_shard0 = reader->source_count >= (size_t)planes &&
+                        reader->sources[0].shard == 0 && !reader->sources[0].scale &&
+                        (planes == 1 || (reader->sources[1].shard == 0 && reader->sources[1].scale));
++    size_t live_col_lookups = 0;
+     for (size_t i = 0; i < count; i++) {
+         int64_t id;
+         memcpy(&id, ids + i * sizeof(id), sizeof(id));
+         unsigned col = (unsigned)(i % PLE_COLUMNS);
++        if (id >= 0 && ((reader->columns >> col) & 1u))
++            live_col_lookups++;
+         /* Another rank's row (or a dead lookup): its slot is not read; the gather writes
+          * zeros for it without loading the slot. */
+         if (id < reader->tp_start || id >= reader->tp_end ||
+@@ -546,6 +645,8 @@ static inline bool ple_plan(ple_plan_t *reader, const char *ids, size_t count,
+                     }
+                 }
+                 if (hit_way >= 0) {
++                    uint8_t *usage = reader->cache_usage[set_idx];
++                    if (usage[hit_way] < PLE_CACHE_MAX_USAGE) usage[hit_way]++;
+                     size_t way_idx = set_idx * PLE_CACHE_WAYS + (size_t)hit_way;
+                     memcpy(dst_weights + i * 256u, reader->cache_weights + way_idx * 256u, 256u);
+                     memcpy(dst_scales + i * 8u, reader->cache_scales + way_idx * 8u, 8u);
+@@ -586,6 +687,14 @@ static inline bool ple_plan(ple_plan_t *reader, const char *ids, size_t count,
+                 rel_row = phys_id % reader->shard_rows;
+             }
+             size_t bytes = plane ? reader->scale_bytes : reader->weight_bytes;
++            if (plane && source->pinned_scales) {
++                const char *scale_src = source->pinned_scales + (size_t)rel_row * bytes;
++                memcpy(dst_scales + i * bytes, scale_src, bytes);
++                if (fill_cache && frag_miss != PLE_NO_MISS && !dst_is_cached) {
++                    memcpy(reader->miss_scales + (size_t)frag_miss * 8u, scale_src, bytes);
++                }
++                continue;
++            }
+             uint16_t in_row = 0;
+             int64_t offset = reader->packed
+                 ? source->offset + (rel_row / (int64_t)PLE_PACKED_ROWS_PER_PAGE) * (int64_t)PLE_BLOCK +
+@@ -603,6 +712,10 @@ static inline bool ple_plan(ple_plan_t *reader, const char *ids, size_t count,
+             }
+         }
+     }
++    size_t max_decode_owned =
++        (size_t)PLE_CACHE_MAX_TOKENS * (size_t)__builtin_popcount(reader->columns);
++    reader->miss_is_prefill =
++        !reader->is_prefetch && (live_col_lookups > max_decode_owned);
+     ple_sort(reader);
+     size_t cursor = 0;
+     while (cursor < reader->fragment_count) {
+diff --git a/vllm/models/deepseek_v4_1/engram_rows/host_hash.py b/vllm/models/deepseek_v4_1/engram_rows/host_hash.py
+index 27b9a41a99..af47d14768 100644
+--- a/vllm/models/deepseek_v4_1/engram_rows/host_hash.py
++++ b/vllm/models/deepseek_v4_1/engram_rows/host_hash.py
+@@ -183,6 +183,7 @@ class HostEngramHash:
+         tokens: np.ndarray,
+         positions: np.ndarray,
+         columns: int = ALL_COLUMNS,
++        layer: int | None = None,
+     ) -> None:
+         positions = np.asarray(positions, dtype=np.int64)
+         n = positions.shape[0]
+@@ -192,10 +193,17 @@ class HostEngramHash:
+         # From the first missing source on, every lag takes the pad id.
+         blocked = np.logical_or.accumulate(sources == -1, axis=1)
+         values_u64 = np.where(blocked, self.pad, sources).astype(np.uint64)
++        if layer is None:
++            layer_slice = slice(None)
++            layer_count = self.layers
++        else:
++            layer_idx = int(layer)
++            layer_slice = slice(layer_idx, layer_idx + 1)
++            layer_count = 1
+         # value * multiplier in wrapping int64, as the GPU computes it.
+-        products = (values_u64[None, :, :] * self._multipliers_u64).view(
+-            np.int64
+-        )  # [layers, T, 4]
++        products = (
++            values_u64[None, :, :] * self._multipliers_u64[layer_slice]
++        ).view(np.int64)  # [layer_count, T, 4]
+         mixed2 = products[..., 0] ^ products[..., 1]
+         mixed3 = mixed2 ^ products[..., 2]
+         mixed4 = mixed3 ^ products[..., 3]
+@@ -206,17 +214,19 @@ class HostEngramHash:
+         if columns == ALL_COLUMNS:
+             mixed_orders = np.stack((mixed2, mixed3, mixed4), axis=-1)[
+                 ..., None
+-            ]  # [layers, T, 3, 1]
++            ]  # [layer_count, T, 3, 1]
+             planes[:, first_row : first_row + n, :] = (
+-                np.remainder(mixed_orders, self._primes_3x8) + self._offsets_3x8
+-            ).reshape(self.layers, n, HEADS)
++                np.remainder(mixed_orders, self._primes_3x8[layer_slice])
++                + self._offsets_3x8[layer_slice]
++            ).reshape(layer_count, n, HEADS)
+         else:
+             cols, orders, primes_sub, offsets_sub = self._column_plan(columns)
+             mixed_orders = np.stack((mixed2, mixed3, mixed4), axis=-1)
+             mixed_sub = mixed_orders[:, :, orders]
+             planes[:, first_row : first_row + n, :] = -1
+             planes[:, first_row : first_row + n, cols] = (
+-                np.remainder(mixed_sub, primes_sub) + offsets_sub
++                np.remainder(mixed_sub, primes_sub[layer_slice])
++                + offsets_sub[layer_slice]
+             )
+ 
+     def hash_positions(
+@@ -243,31 +253,42 @@ class HostEngramHash:
+         requests,
+         *,
+         columns: int = ALL_COLUMNS,
++        layer: int | None = None,
+     ) -> np.ndarray:
+-        """A step's row ids ``[num_tokens, layers, 24]``: ``requests`` yields, per
+-        request in the step's token order, ``(first_row, rows, tokens, positions)``:
+-        the request's first row and row count in the step, its token ids, and the
+-        positions of its leading rows whose ids the host has (the rest of its rows are
+-        ``UNKNOWN``). Rows past the last request's rows are padding, -1 as the GPU
+-        writes them. Returned as a view over a layer-major ``[layers, num_tokens, 24]``
+-        buffer so each layer's slice ``[:, layer]`` is C-contiguous."""
++        """A step's row ids ``[num_tokens, layers, 24]`` (or ``[num_tokens, 24]``
++        when ``layer`` is given): ``requests`` yields, per request in the step's
++        token order, ``(first_row, rows, tokens, positions)``: the request's first
++        row and row count in the step, its token ids, and the positions of its
++        leading rows whose ids the host has (the rest of its rows are ``UNKNOWN``).
++        Rows past the last request's rows are padding, -1 as the GPU writes them.
++        Returned as a view over a layer-major ``[layers, num_tokens, 24]`` buffer so
++        each layer's slice ``[:, layer]`` is C-contiguous."""
+         columns = int(columns)
+         if columns != ALL_COLUMNS:
+             self._column_plan(columns)
+-        planes = np.full((self.layers, num_tokens, HEADS), UNKNOWN, dtype=np.int64)
+-        out = planes.transpose(1, 0, 2)
++        if layer is not None:
++            layer_idx = int(layer)
++            if not 0 <= layer_idx < self.layers:
++                raise ValueError(f"Engram layer index {layer_idx} out of range [0, {self.layers})")
++            planes = np.full((1, num_tokens, HEADS), UNKNOWN, dtype=np.int64)
++            out = planes[0]
++        else:
++            layer_idx = None
++            planes = np.full((self.layers, num_tokens, HEADS), UNKNOWN, dtype=np.int64)
++            out = planes.transpose(1, 0, 2)
+         custom_hash = "hash_positions" in self.__dict__
+         live = 0
+         for first_row, rows, tokens, positions in requests:
+             live = max(live, first_row + rows)
+             if len(positions):
+                 if custom_hash and columns == ALL_COLUMNS:
+-                    out[first_row : first_row + len(positions)] = self.hash_positions(
+-                        tokens, positions
++                    hashed = self.hash_positions(tokens, positions)
++                    out[first_row : first_row + len(positions)] = (
++                        hashed[:, layer_idx] if layer_idx is not None else hashed
+                     )
+                 else:
+                     self._hash_positions_into(
+-                        planes, first_row, tokens, positions, columns
++                        planes, first_row, tokens, positions, columns, layer=layer_idx
+                     )
+         planes[:, live:, :] = -1
+         return out
+diff --git a/vllm/models/deepseek_v4_1/engram_rows/rows.py b/vllm/models/deepseek_v4_1/engram_rows/rows.py
+index 9e4c135fbc..b1d41eccb5 100644
+--- a/vllm/models/deepseek_v4_1/engram_rows/rows.py
++++ b/vllm/models/deepseek_v4_1/engram_rows/rows.py
+@@ -19,6 +19,7 @@ the Python side is.
+ """
+ 
+ import math
++import os
+ import sys
+ from contextlib import suppress
+ 
+@@ -199,11 +200,12 @@ class EngramDiskRows:
+     """
+ 
+     def __init__(self, *, device, table_rows: int, shard_start: int, shard_end: int,
+-                 max_lookups: int, columns: int = ALL_COLUMNS, queue_depth: int = 128,
++                 max_lookups: int, columns: int = ALL_COLUMNS, queue_depth: int = 512,
+                  ids_timeout_s: float = 20.0,
+                  rows_timeout_s: float = 10.0, delay_s: float = 0.0,
+                  check_early: bool = False, timeline: bool = False,
+-                 cache_rows: int = DEFAULT_CACHE_ROWS):
++                 cache_rows: int = DEFAULT_CACHE_ROWS,
++                 pin_scales: bool = True):
+         self.native = load()
+         self.device = _indexed(device)
+         self.shard_start, self.shard_end = int(shard_start), int(shard_end)
+@@ -214,24 +216,32 @@ class EngramDiskRows:
+         self.check_early = bool(check_early)
+         self.timeline_enabled = bool(timeline)
+         self.cache_rows = int(cache_rows)
++        self.pin_scales = bool(pin_scales)
++        self._reader = None
++        self._ids_mlocked = False
++        self._closed = False
+         self._allocations = []
+-        self.ids = torch.empty(self.max_lookups, dtype=torch.int64, pin_memory=True)
+-        self._ids_mlocked = mlock_memory(self.ids.data_ptr(), self.ids.nbytes)
+-        self.weights = self._mapped((self.max_lookups, ROW_BYTES), torch.uint8, True)
+-        self.scales = self._mapped((self.max_lookups, SCALE_BYTES), torch.uint8, True)
+-        self.control = self._mapped((self.native.CTRL_WORDS,), torch.int32, False)
+-        self.control.host.zero_()
+-        self._control = self.control.host.numpy().view(np.uint32)
+-        self._control[self.native.CTRL_TIMEOUT_US] = int(rows_timeout_s * 1e6)
+-        self.rows_e4m3 = self.weights.device_view.view(torch.float8_e4m3fn)
+-        self._reader = self.native.reader(
+-            table_rows, self.shard_start, self.shard_end, self.columns, self.max_lookups, queue_depth,
+-            self.ids.data_ptr(), self.weights.pointer, self.scales.pointer, self.control.pointer,
+-            float(ids_timeout_s), float(delay_s), self.check_early,
+-            self.timeline_enabled, self.cache_rows,
+-        )
+-        self._ids_seq_device = self.control.device_view.data_ptr() + 4 * self.native.CTRL_IDS_SEQ
+-        self._sequence = 0
++        try:
++            self.ids = torch.empty(self.max_lookups, dtype=torch.int64, pin_memory=True)
++            self._ids_mlocked = mlock_memory(self.ids.data_ptr(), self.ids.nbytes)
++            self.weights = self._mapped((self.max_lookups, ROW_BYTES), torch.uint8, True)
++            self.scales = self._mapped((self.max_lookups, SCALE_BYTES), torch.uint8, True)
++            self.control = self._mapped((self.native.CTRL_WORDS,), torch.int32, False)
++            self.control.host.zero_()
++            self._control = self.control.host.numpy().view(np.uint32)
++            self._control[self.native.CTRL_TIMEOUT_US] = int(rows_timeout_s * 1e6)
++            self.rows_e4m3 = self.weights.device_view.view(torch.float8_e4m3fn)
++            self._reader = self.native.reader(
++                table_rows, self.shard_start, self.shard_end, self.columns, self.max_lookups, queue_depth,
++                self.ids.data_ptr(), self.weights.pointer, self.scales.pointer, self.control.pointer,
++                float(ids_timeout_s), float(delay_s), self.check_early,
++                self.timeline_enabled, self.cache_rows, int(self.pin_scales),
++            )
++            self._ids_seq_device = self.control.device_view.data_ptr() + 4 * self.native.CTRL_IDS_SEQ
++            self._sequence = 0
++        except Exception:
++            self.close()
++            raise
+ 
+     def _mapped(self, shape, dtype, write_combined: bool) -> MappedHostAllocation:
+         allocation = MappedHostAllocation(shape, dtype, self.device, write_combined=write_combined)
+@@ -281,6 +291,11 @@ class EngramDiskRows:
+         None) the IDs the host hashed, ``host_hash.UNKNOWN`` where only the GPU knows
+         one. Returns at once; the forward's ``gather`` waits for the rows."""
+         self.raise_if_failed()
++        count = int(count)
++        if count < 0 or count > self.max_lookups:
++            raise ValueError(
++                f"Engram lookup count {count} exceeds max_lookups {self.max_lookups}"
++            )
+         from cuda.bindings import driver
+ 
+         has_unknown = True
+@@ -297,10 +312,15 @@ class EngramDiskRows:
+                     f"Engram early IDs: {early.shape[0]} for a step of {count} lookups"
+                 )
+             has_unknown = bool(self.native.has_unknown(early))
++        ids_flat = ids.view(-1)
++        if (has_unknown or self.check_early) and ids_flat.numel() < count:
++            raise ValueError(
++                f"Engram device IDs: {ids_flat.numel()} for a step of {count} lookups"
++            )
+         self._sequence = (self._sequence + 1) & 0xFFFFFFFF or 1
+         if has_unknown or self.check_early:
+             with torch.cuda.stream(stream):
+-                self.ids[:count].copy_(ids.view(-1)[:count], non_blocking=True)
++                self.ids[:count].copy_(ids_flat[:count], non_blocking=True)
+         _check(driver.cuStreamWriteValue32(stream.cuda_stream, self._ids_seq_device, self._sequence, 0),
+                "cuStreamWriteValue32")
+         self.native.submit(
+@@ -369,8 +389,12 @@ class EngramDiskRows:
+ 
+     def close(self) -> None:
+         """Stop the reader, then free the buffers; the GPU must be done with them."""
++        if getattr(self, "_closed", False):
++            return
++        self._closed = True
+         self._reader = None
+-        torch.cuda.synchronize(self.device)
++        if torch.cuda.is_initialized():
++            torch.cuda.synchronize(self.device)
+         if getattr(self, "_ids_mlocked", False):
+             munlock_memory(self.ids.data_ptr(), self.ids.nbytes)
+             self._ids_mlocked = False

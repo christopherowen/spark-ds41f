@@ -1,0 +1,52 @@
+{
+ "name": "screen-tp2",
+ "version": 1,
+ "description": "Per-change screen for two nodes (4 streams, 256K context): model behaviour first, the engine grid up to four requests, four streams in a closed loop, real-text prefill at 32K and 256K.",
+ "steps": [
+  {
+   "id": "model",
+   "command": "model",
+   "args": {
+    "limit": 128,
+    "concurrency": 4,
+    "max_tokens": 256,
+    "top": 20
+   }
+  },
+  {
+   "id": "grid",
+   "command": "engine",
+   "args": {
+    "replays": 100,
+    "settle": 1,
+    "max_requests": 4
+   }
+  },
+  {
+   "id": "c4",
+   "command": "run",
+   "args": {
+    "mode": "closed",
+    "concurrency": 4,
+    "warmup": 60,
+    "duration": 300,
+    "extra_body": {
+     "chat_template_kwargs": {
+      "thinking": false
+     }
+    }
+   }
+  },
+  {
+   "id": "prefill",
+   "command": "prefill",
+   "args": {
+    "sizes": [
+     32768,
+     262144
+    ],
+    "repeats": 3
+   }
+  }
+ ]
+}

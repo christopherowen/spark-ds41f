@@ -1,0 +1,341 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+"""Copy drafts beside DSpark (``SpeculativeConfig.copy_drafts``), on wherever
+DSpark verifies greedy drafts adaptively.
+
+After DSpark drafts, each request whose context ends with text it has seen
+before (an exact suffix match of at least ``min_match`` tokens over its own
+prompt and output) takes its best continuation (see ``tilelang_copy``) in place
+of DSpark's drafts, up to its cap; every other request keeps DSpark's. The copy's
+confidences (the request's acceptance estimate at every draft) enter adaptive
+verification's budget beside DSpark's, which decides how many rows a step
+verifies; verification commits only the target's own tokens, so drafts change
+the speed, never the text.
+
+Everything is the request's own: the history is its row of the request state
+up to its length, and its copy state (cap, acceptance estimate, pending
+proposal) lives in its slot, reset when a request takes the slot. Nothing is
+read from or kept for any other request.
+
+The scheduler lays out a request's rows before the step that follows its
+proposal is verified (async scheduling): each proposal also reports
+``alloc``, the drafts of the proposal after it if this one is accepted in full,
+which the scheduler gives the request's step after next (within its decode-row
+envelope), and the planned confidences the budget reads at that step.
+
+A step's copy work reads only the committed history and the copy state, never
+DSpark's drafts. ``prepare_alloc`` runs the match, state's update, choice and
+allocation on the current model stream before DSpark. Its allocation is still
+delivered asynchronously on the output copy stream; ``propose`` writes the
+proposals after DSpark on the model stream.
+"""
+
+from typing import Any
+
+import torch
+
+from vllm.config.speculative import CopyDraftsConfig
+from vllm.utils.torch_utils import async_tensor_h2d
+from vllm.v1.utils import CpuGpuBuffer
+from vllm.v1.worker.gpu import tilelang_inputs
+from vllm.v1.worker.gpu.spec_decode import tilelang_copy
+from vllm.v1.worker.gpu.spec_decode.online_dspark_adaptation import (
+    SessionTokenMemory,
+    session_token_memory_capacity,
+)
+from vllm.v1.worker.gpu.states import RequestState
+
+
+class CopyDrafter:
+    def __init__(
+        self,
+        config: CopyDraftsConfig,
+        req_states: RequestState,
+        num_draft_steps: int,
+        device: torch.device,
+        *,
+        session_memory_capacity: int | None = None,
+    ):
+        self.config = config
+        self.req_states = req_states
+        self.min_match = config.min_match
+        self.initial = config.initial_drafts
+        # The verification lookahead: the request state's draft width.
+        self.lookahead = req_states.num_speculative_steps
+        assert self.lookahead == max(config.max_drafts, num_draft_steps)
+        self.num_draft_steps = num_draft_steps
+        max_reqs = req_states.max_num_reqs
+        levels = len(config.levels())
+        columns = tilelang_copy.STATE_COLUMNS
+        # Per slot: (cap doublings, drafts of the pending copy proposal) and
+        # (accepted, judged) drafts, decayed. All zero is a request's start.
+        self.int_state = torch.zeros(
+            (max_reqs, columns), dtype=torch.int32, device=device
+        )
+        self.float_state = torch.zeros(
+            (max_reqs, columns), dtype=torch.float32, device=device
+        )
+        # The step's proposal, in batch order.
+        self.sources = torch.full(
+            (max_reqs, tilelang_copy.CHUNKS, levels),
+            -1,
+            dtype=torch.int32,
+            device=device,
+        )
+        self.drafts = torch.zeros(
+            (max_reqs, self.lookahead), dtype=torch.int64, device=device
+        )
+        self.confidences = torch.zeros(
+            (max_reqs, self.lookahead), dtype=torch.float32, device=device
+        )
+        self.planned = torch.zeros_like(self.confidences)
+        # Ring of pre-allocated buffers and events for async output delivery of
+        # alloc without per-step tensor or event allocation.
+        self._ring_size = 3
+        self._ring_idx = 0
+        self._alloc_buffers = [
+            CpuGpuBuffer(max_reqs, dtype=torch.int32, device=device)
+            for _ in range(self._ring_size)
+        ]
+        self._ring_events = [
+            torch.cuda.Event(blocking=True) for _ in range(self._ring_size)
+        ]
+        self.alloc = self._alloc_buffers[0].gpu
+        # The step's choice per request (source, offered drafts, next drafts) and
+        # acceptance estimate, from prepare_alloc for propose, in batch order.
+        self.chosen = torch.zeros(
+            (max_reqs, tilelang_copy.CHOSEN_COLUMNS), dtype=torch.int32, device=device
+        )
+        self.estimates = torch.zeros(max_reqs, dtype=torch.float32, device=device)
+        # A step that verified no drafts: nothing to judge.
+        self._no_drafts = torch.zeros(max_reqs, dtype=torch.int32, device=device)
+        self._new_rows: list[int] = []
+        # VLLM_DSPARK_SESSION_MEMORY_TOKENS: a ring of each request's own
+        # verified tokens (per slot, cleared with the slot), consulted when the
+        # request's history has no copy match. Off unless set.
+        capacity = (
+            session_token_memory_capacity()
+            if session_memory_capacity is None
+            else session_memory_capacity
+        )
+        self.session_memory: SessionTokenMemory | None = (
+            SessionTokenMemory(
+                capacity,
+                max_slots=max_reqs,
+                min_match_len=self.min_match,
+                device=device,
+            )
+            if capacity > 0
+            else None
+        )
+
+    def register_warmups(self) -> None:
+        """Declare the copy kernels and the copy state's reset."""
+        tilelang_inputs.declare(
+            lambda: (
+                tilelang_copy.copy_calls(
+                    self.min_match, self.lookahead, self.num_draft_steps, self.initial
+                )
+                + tilelang_inputs.fill_rows_calls(torch.int64, torch.int32)
+                + tilelang_inputs.fill_rows_calls(torch.int64, torch.float32)
+            )
+        )
+
+    def add_request(self, req_idx: int) -> None:
+        self._new_rows.append(req_idx)
+
+    def apply_staged_writes(self) -> None:
+        """Reset the new requests' copy state: nothing of a slot's previous
+        request carries over."""
+        if self._new_rows:
+            rows = async_tensor_h2d(
+                self._new_rows, dtype=torch.int64, device=self.int_state.device
+            )
+            tilelang_inputs.fill_rows(rows, self.int_state, 0)
+            tilelang_inputs.fill_rows(rows, self.float_state, 0.0)
+            if self.session_memory is not None:
+                self.session_memory.reset_slots(rows)
+            self._new_rows.clear()
+
+    def prepare_alloc(
+        self,
+        idx_mapping: torch.Tensor,
+        num_sampled: torch.Tensor,
+        verified: torch.Tensor | None,
+        dead_row_cut: torch.Tensor | None,
+        *,
+        match_idx_mapping: torch.Tensor | None = None,
+    ) -> None:
+        """Match the batch's updated histories, update their copy state from this
+        step's verification, and write the step's choice and ``alloc[:num_reqs]``,
+        so the async output copy does not wait behind the drafter.
+
+        The work and the later ``propose`` run on the current model stream, so
+        the choice/state are ordered without a separate readiness event. The
+        allocation's asynchronous host copy is attached before DSpark runs.
+        """
+        self._ring_idx = (self._ring_idx + 1) % self._ring_size
+        self.alloc = self._alloc_buffers[self._ring_idx].gpu
+        num_reqs = idx_mapping.shape[0]
+        if verified is None:
+            verified = self._no_drafts[:num_reqs]
+        self._prepare(
+            idx_mapping, match_idx_mapping, num_sampled, verified, dead_row_cut
+        )
+        if self.session_memory is not None:
+            self.record_session_tokens(idx_mapping, num_sampled)
+
+    def record_session_tokens(
+        self, idx_mapping: torch.Tensor, num_sampled: torch.Tensor
+    ) -> None:
+        """Append each request's tokens committed this step (the last
+        ``num_sampled`` of its history) to its own session ring."""
+        assert self.session_memory is not None
+        slots = idx_mapping.to(torch.int64)
+        safe = slots.clamp_min(0)
+        width = self.lookahead + 1
+        count = num_sampled.to(torch.int64).clamp(0, width)
+        end = self.req_states.total_len.gpu[safe].to(torch.int64)
+        cols = torch.arange(width, dtype=torch.int64, device=slots.device)
+        history = self.req_states.all_token_ids.gpu
+        positions = ((end - count)[:, None] + cols[None, :]).clamp(
+            0, history.shape[1] - 1
+        )
+        tokens = history[safe[:, None], positions]
+        self.session_memory.record_verified_tokens(
+            torch.where(slots >= 0, slots, -1), tokens, count
+        )
+
+    def _prepare(
+        self,
+        idx_mapping: torch.Tensor,
+        match_idx_mapping: torch.Tensor | None,
+        num_sampled: torch.Tensor,
+        verified: torch.Tensor,
+        dead_row_cut: torch.Tensor | None,
+    ) -> None:
+        num_reqs = idx_mapping.shape[0]
+        total_len = self.req_states.total_len.gpu
+        sources = self.sources[:num_reqs]
+        tilelang_copy.copy_match(
+            idx_mapping if match_idx_mapping is None else match_idx_mapping,
+            self.req_states.all_token_ids.gpu,
+            total_len,
+            sources,
+            self.min_match,
+            self.lookahead,
+        )
+        tilelang_copy.copy_alloc(
+            idx_mapping,
+            total_len,
+            sources,
+            num_sampled,
+            verified,
+            verified if dead_row_cut is None else dead_row_cut,
+            self.int_state,
+            self.float_state,
+            self.chosen[:num_reqs],
+            self.estimates[:num_reqs],
+            self.alloc[:num_reqs],
+            self.min_match,
+            self.lookahead,
+            self.num_draft_steps,
+            self.initial,
+        )
+
+    def attach_async_output(
+        self,
+        async_output: Any,
+        num_reqs: int,
+        copy_stream: torch.cuda.Stream,
+        main_stream: torch.cuda.Stream,
+    ) -> None:
+        """Queue async D2H copy of this step's ``alloc`` using pre-allocated ring
+        buffers and events."""
+        idx = self._ring_idx
+        async_output.attach_copy_draft_alloc(
+            self._alloc_buffers[idx],
+            copy_stream,
+            main_stream,
+            num_reqs=num_reqs,
+            alloc_event=self._ring_events[idx],
+        )
+
+    def propose(
+        self,
+        idx_mapping: torch.Tensor,
+        dspark_drafts: torch.Tensor,
+        dspark_confidences: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """The batch's drafts, confidences and planned confidences
+        (``[num_reqs, lookahead]``), from this step's ``prepare_alloc``.
+
+        Args:
+            idx_mapping: The batch's request slots, as ``prepare_alloc``'s.
+            dspark_drafts: DSpark's drafts, ``[num_reqs, num_draft_steps]``.
+            dspark_confidences: Their confidences (``[>= num_reqs, steps]``).
+        """
+        num_reqs = idx_mapping.shape[0]
+        drafts = self.drafts[:num_reqs]
+        confidences = self.confidences[:num_reqs]
+        planned = self.planned[:num_reqs]
+        tilelang_copy.copy_apply(
+            idx_mapping,
+            self.req_states.all_token_ids.gpu,
+            self.chosen[:num_reqs],
+            self.estimates[:num_reqs],
+            self.int_state,
+            dspark_drafts[:num_reqs],
+            dspark_confidences[:num_reqs, : self.num_draft_steps],
+            drafts,
+            confidences,
+            planned,
+        )
+        if self.session_memory is not None:
+            self._propose_from_session_memory(
+                idx_mapping, dspark_confidences, drafts, confidences, planned
+            )
+        return drafts, confidences, planned
+
+    def _propose_from_session_memory(
+        self,
+        idx_mapping: torch.Tensor,
+        dspark_confidences: torch.Tensor,
+        drafts: torch.Tensor,
+        confidences: torch.Tensor,
+        planned: torch.Tensor,
+    ) -> None:
+        """Requests without a copy proposal take their own session ring's
+        continuation when its expected yield beats DSpark's (opt-in; it reads
+        the host, unlike the copy kernels)."""
+        assert self.session_memory is not None
+        num_reqs = idx_mapping.shape[0]
+        steps = self.num_draft_steps
+        slots = idx_mapping[:num_reqs].to(torch.int64)
+        no_copy = (slots >= 0) & (self.int_state[slots.clamp_min(0), 1] == 0)
+        if num_reqs == 0 or not bool(no_copy.any()):
+            return
+        seq_lens = self.req_states.total_len.gpu[slots.clamp_min(0)]
+        max_len = int(seq_lens.max().item())
+        if max_len < self.min_match:
+            return
+        ctx = self.req_states.all_token_ids.gpu[slots.clamp_min(0), :max_len]
+        mem_drafts, mem_match_len, mem_conf = (
+            self.session_memory.propose_suffix_continuation(
+                ctx, steps, slots=torch.where(no_copy, slots, -1), seq_lens=seq_lens
+            )
+        )
+        dspark_yield = torch.cumprod(
+            dspark_confidences[:num_reqs, :steps].float(), dim=-1
+        ).sum(dim=-1)
+        mem_yield = torch.cumprod(mem_conf.float(), dim=-1).sum(dim=-1)
+        use_mem = (
+            no_copy
+            & (mem_match_len >= self.min_match)
+            & (mem_yield >= dspark_yield)
+        )
+        drafts[:, :steps] = torch.where(use_mem[:, None], mem_drafts, drafts[:, :steps])
+        confidences[:, :steps] = torch.where(
+            use_mem[:, None], mem_conf, confidences[:, :steps]
+        )
+        planned[:, :steps] = torch.where(use_mem[:, None], mem_conf, planned[:, :steps])

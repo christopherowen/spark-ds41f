@@ -175,12 +175,13 @@ made to production between releases anyway is recorded in that release's manifes
 spark-ds41f-1025's 16 MP image limit and triangle budget are. Tests of how recipes resolve
 use `tests/fixtures/cluster.json`, not the production recipe, so a promotion leaves them alone.
 
-Owner-requested image admission defaults may be recorded after release in
-`manifests/runtime-defaults/`, with the baseline, reason, exact before/after
-serving-option values and qualification limits. `config/cluster.json` remains
-the runtime authority. These append-only records do not rewrite frozen release
-recipes, baselines or benchmark evidence, and do not qualify the new limit.
-The release-integrity check accepts only recorded image-admission changes.
+Owner-requested image admission defaults and response-reporting flags may be
+recorded after release in `manifests/runtime-defaults/`, with the baseline,
+reason, exact before/after serving-option values or added reporting flags and
+qualification limits. `config/cluster.json` remains the runtime authority.
+These append-only records do not rewrite frozen release recipes, baselines or
+benchmark evidence, and do not qualify the new limit. The release-integrity
+check accepts only recorded image-admission and reporting-flag changes.
 
 Rollback is a new coordinated deployment of the previous promoted commit. It is
 not an ad hoc reconstruction from shell history.

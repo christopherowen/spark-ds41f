@@ -1,0 +1,1442 @@
+From 1994354457984e2d74e2529e71429bcf9a12cce8 Mon Sep 17 00:00:00 2001
+From: Christopher Owen <3221756+christopherowen@users.noreply.github.com>
+Date: Mon, 16 Nov 2026 15:00:01 +0100
+Subject: [PATCH] perf(dsv41): optimize DeepSeek V4.1 tokenizer, stop priming,
+ and tool serving
+
+Upstream base: local-inference-lab/vllm 19f2c20ed4d64ae22bd009ceacadd85e2a81e354
+with candidate-55's series applied through 0810.
+
+Rationale: Speeds up DeepSeek V4.1 prompt encoding and tool rendering on long
+conversations, bounds FastIncrementalDetokenizer stop-string priming to the
+UTF-8-aligned prompt suffix window, escapes literal image tokens in user text,
+and preserves inline defer_loading and tool_reference discovery in Anthropic
+serving while guarding None text and Mapping content blocks.
+
+Quality implications: None; token equivalence across 64K-256K prompts, UTF-8
+suffix alignment, literal image token preservation, and Anthropic tool-reference
+conversion are verified by unit tests.
+
+Tests: pytest -q -p deepseek_models tests/tokenizers_/test_deepseek_v41.py
+tests/detokenizer/test_check_stop_strings.py
+tests/entrypoints/anthropic/test_anthropic_messages_conversion.py (sync tests).
+
+Upstream status: local candidate-60 patch
+---
+ tests/detokenizer/test_check_stop_strings.py  |  52 ++
+ .../test_anthropic_messages_conversion.py     |  81 +++
+ tests/tokenizers_/test_deepseek_v41.py        | 292 +++++++++-
+ vllm/entrypoints/anthropic/serving.py         |  21 +-
+ vllm/renderers/base.py                        |   3 +
+ vllm/tokenizers/deepseek_v41.py               | 513 ++++++++++++++----
+ vllm/tokenizers/deepseek_v41_encoding.py      |  78 ++-
+ vllm/tokenizers/registry.py                   |  17 +-
+ vllm/v1/engine/detokenizer.py                 |  45 +-
+ 9 files changed, 973 insertions(+), 129 deletions(-)
+
+diff --git a/tests/detokenizer/test_check_stop_strings.py b/tests/detokenizer/test_check_stop_strings.py
+index 2fae373f60..084ffeff2e 100644
+--- a/tests/detokenizer/test_check_stop_strings.py
++++ b/tests/detokenizer/test_check_stop_strings.py
+@@ -74,3 +74,55 @@ def test_no_match_and_empty_inputs_return_none():
+     assert check_stop_strings("hello", 5, ["zzz"], include_in_output=False) is None
+     assert check_stop_strings("hello", 0, ["h"], include_in_output=False) is None
+     assert check_stop_strings("hello", 5, [], include_in_output=False) is None
++
++
++from vllm.v1.engine.detokenizer import (
++    PROMPT_SUFFIX_PRIME_WINDOW,
++    prompt_suffix_to_prime,
++)
++
++
++class _FakeTokenizer:
++    def __init__(self, mapping: dict[int, bytes], special_ids: set[int] | None = None):
++        self.mapping = mapping
++        self.special_ids = special_ids or set()
++
++    def decode(self, ids: list[int], skip_special_tokens: bool = True) -> str:
++        raw = b"".join(
++            self.mapping[i]
++            for i in ids
++            if not (skip_special_tokens and i in self.special_ids)
++        )
++        return raw.decode("utf-8", errors="replace")
++
++
++def test_prompt_suffix_to_prime_bounds_and_utf8_alignment():
++    # Token 10 is ASCII "x"; tokens 20, 21, 22 form 3-byte UTF-8 "€" (e2 82 ac);
++    # token 99 is a special token.
++    tok = _FakeTokenizer(
++        {10: b"x", 20: b"\xe2", 21: b"\x82", 22: b"\xac", 99: b""},
++        special_ids={99},
++    )
++
++    short_prompt = [10] * PROMPT_SUFFIX_PRIME_WINDOW
++    assert prompt_suffix_to_prime(tok, short_prompt, True) == short_prompt
++
++    long_ascii = [10] * 100
++    primed = prompt_suffix_to_prime(tok, long_ascii, True)
++    assert primed is not None and len(primed) == PROMPT_SUFFIX_PRIME_WINDOW
++
++    # Place a 3-token UTF-8 character across the -16 boundary so -16 starts mid-char
++    # at token 21 (b"\x82" -> "\ufffd"), requiring adjust=1 to include token 20.
++    split_boundary = [10] * 50 + [20, 21, 22] + [10] * (PROMPT_SUFFIX_PRIME_WINDOW - 2)
++    primed_aligned = prompt_suffix_to_prime(tok, split_boundary, True)
++    assert primed_aligned == split_boundary[-(PROMPT_SUFFIX_PRIME_WINDOW + 1) :]
++    assert not tok.decode(primed_aligned, True).startswith("\ufffd")
++
++    # If trailing 19 tokens (16 + adjust 0..3) are skipped special tokens, widen window to 32.
++    special_tail = [10] * 50 + [99] * (PROMPT_SUFFIX_PRIME_WINDOW + 3)
++    primed_special = prompt_suffix_to_prime(tok, special_tail, True)
++    assert primed_special is not None and len(primed_special) == 32
++
++    # If the prompt itself ends mid-codepoint, fall back to full prompt_token_ids.
++    incomplete_end = [10] * 50 + [20, 21]
++    assert prompt_suffix_to_prime(tok, incomplete_end, True) == incomplete_end
+diff --git a/tests/entrypoints/anthropic/test_anthropic_messages_conversion.py b/tests/entrypoints/anthropic/test_anthropic_messages_conversion.py
+index ef12d91449..630ac427d9 100644
+--- a/tests/entrypoints/anthropic/test_anthropic_messages_conversion.py
++++ b/tests/entrypoints/anthropic/test_anthropic_messages_conversion.py
+@@ -1830,3 +1830,84 @@ class TestClientErrorResponses:
+ 
+         assert response.status_code == HTTPStatus.BAD_REQUEST
+         assert response.json()["error"]["type"] == "BadRequestError"
++
++
++class TestDeferredToolReference:
++    def test_tool_result_with_tool_reference_keeps_single_tool_message(self):
++        tools = [
++            {
++                "name": "tool_search",
++                "description": "Search deferred tools",
++                "input_schema": {
++                    "type": "object",
++                    "properties": {"q": {"type": "string"}},
++                },
++            },
++            {
++                "name": "db_query",
++                "description": "Execute SQL",
++                "input_schema": {
++                    "type": "object",
++                    "properties": {"sql": {"type": "string"}},
++                },
++                "defer_loading": True,
++            },
++        ]
++        request = _make_request(
++            [
++                {"role": "user", "content": "Query users table."},
++                {
++                    "role": "assistant",
++                    "content": [
++                        {
++                            "type": "tool_use",
++                            "id": "call_s1",
++                            "name": "tool_search",
++                            "input": {"q": "sql"},
++                        }
++                    ],
++                },
++                {
++                    "role": "user",
++                    "content": [
++                        {
++                            "type": "tool_result",
++                            "tool_use_id": "call_s1",
++                            "content": [
++                                {"type": "text", "text": "Matched:"},
++                                {"type": "tool_reference", "tool_name": "db_query"},
++                            ],
++                        }
++                    ],
++                },
++            ],
++            tools=tools,
++        )
++        converted = _convert(request)
++        tool_msgs = [m for m in converted.messages if m.get("role") == "tool"]
++        assert len(tool_msgs) == 1
++        assert tool_msgs[0]["tool_call_id"] == "call_s1"
++        assert tool_msgs[0]["content"] == [
++            {"type": "text", "text": "Matched:"},
++            {"type": "tool_reference", "name": "db_query"},
++        ]
++        assert converted.tools is not None
++        assert converted.tools[1].function.defer_loading is True
++
++        # Rendering through DeepSeek V4.1 keeps deferred tools out of system
++        # preamble and injects their schema inline inside <tool_result>.
++        from tests.tokenizers_.test_deepseek_v4 import FakeHfTokenizer
++        from vllm.tokenizers.deepseek_v41 import get_deepseek_v41_tokenizer
++
++        prompt = get_deepseek_v41_tokenizer(FakeHfTokenizer()).apply_chat_template(
++            converted.messages,
++            tools=[t.model_dump(exclude_none=True) for t in converted.tools],
++            tokenize=False,
++            thinking=False,
++        )
++        sys_section, _, rest = prompt.partition("<｜User｜>")
++        assert "tool_search" in sys_section
++        assert "db_query" not in sys_section
++        assert "<tool_schema>" in rest
++        assert '"name": "db_query"' in rest
++        assert "Matched:" in rest
+diff --git a/tests/tokenizers_/test_deepseek_v41.py b/tests/tokenizers_/test_deepseek_v41.py
+index bf63aadd5f..70c9d5e4df 100644
+--- a/tests/tokenizers_/test_deepseek_v41.py
++++ b/tests/tokenizers_/test_deepseek_v41.py
+@@ -13,6 +13,7 @@ from vllm.entrypoints.openai.chat_completion.protocol import ChatCompletionReque
+ from vllm.tokenizers.deepseek_v41 import get_deepseek_v41_tokenizer
+ from vllm.tokenizers.deepseek_v41_encoding import (
+     IMAGE_PLACEHOLDER,
++    IMAGE_PLACEHOLDER_TEXT,
+     encode_messages,
+     order_tool_results,
+ )
+@@ -299,30 +300,160 @@ def test_reminder_does_not_enable_arbitrary_message_roles():
+ 
+ 
+ @pytest.mark.parametrize("role", ["user", "tool", "assistant"])
+-def test_image_token_in_text_is_a_request_error(role):
+-    """Image tokens come only from image parts, in string content, text parts and
+-    reasoning alike (DeepSeek's reference rejects them before merging)."""
+-    message = {"role": role, "content": f"hi {IMAGE_PLACEHOLDER}"}
++def test_image_token_in_text_is_escaped_text(role):
++    """The literal image-token spelling is ordinary text in string content, for
++    every role: it is escaped to the ordinary-text spelling, not rejected
++    (the hosted DeepSeek API passes it through; spark-ds41f issue #1031)."""
+     if role == "tool":
+-        message["tool_call_id"] = "c1"
+-    with pytest.raises(ValueError, match="image special token"):
+-        render([message])
+-    with pytest.raises(ValueError, match="image placeholder"):
+-        render(
+-            [{"role": "user", "content": [{"type": "text", "text": IMAGE_PLACEHOLDER}]}]
+-        )
+-    with pytest.raises(ValueError, match="reasoning_content contains image"):
+-        render(
++        messages = [
++            {"role": "user", "content": "q"},
++            {"role": "assistant", "tool_calls": [_call("c1")]},
++            {
++                "role": "tool",
++                "tool_call_id": "c1",
++                "content": f"hi {IMAGE_PLACEHOLDER}",
++            },
++        ]
++    elif role == "assistant":
++        messages = [
++            {"role": "user", "content": "q"},
++            {"role": "assistant", "content": f"hi {IMAGE_PLACEHOLDER}"},
++        ]
++    else:
++        messages = [{"role": "user", "content": f"hi {IMAGE_PLACEHOLDER}"}]
++    prompt = render(messages)
++    assert IMAGE_PLACEHOLDER not in prompt
++    assert IMAGE_PLACEHOLDER_TEXT in prompt
++
++
++def test_image_token_in_text_parts_and_reasoning_is_escaped_text():
++    """Text parts, tool-call arguments and the current turn's reasoning escape
++    the spelling too, while image parts still render the placeholder."""
++    prompt = render(
++        [
++            {
++                "role": "user",
++                "content": [
++                    {"type": "text", "text": f"see {IMAGE_PLACEHOLDER}"},
++                    {"type": "image_url", "image_url": {"url": "h.png"}},
++                ],
++            }
++        ]
++    )
++    assert f"see {IMAGE_PLACEHOLDER_TEXT}\n\n{IMAGE_PLACEHOLDER}" in prompt
++    assert prompt.count(IMAGE_PLACEHOLDER) == 1
++
++    # Default json.dumps escapes non-ASCII U+FF5C as \uff5c in arguments.
++    for arguments in (
++        json.dumps({"path": f"/tmp/{IMAGE_PLACEHOLDER}"}),
++        json.dumps({"path": f"/tmp/{IMAGE_PLACEHOLDER}"}, ensure_ascii=False),
++    ):
++        prompt = render(
+             [
+                 {"role": "user", "content": "q"},
+                 {
+                     "role": "assistant",
+-                    "content": "a",
+-                    "reasoning_content": IMAGE_PLACEHOLDER,
++                    "tool_calls": [
++                        {
++                            "id": "c1",
++                            "type": "function",
++                            "function": {
++                                "name": "open",
++                                "arguments": arguments,
++                            },
++                        }
++                    ],
+                 },
+-                {"role": "user", "content": "q2"},
++                {"role": "tool", "tool_call_id": "c1", "content": "value"},
+             ]
+         )
++        assert IMAGE_PLACEHOLDER not in prompt
++        assert IMAGE_PLACEHOLDER_TEXT in prompt
++
++    prompt = render(
++        [
++            {"role": "user", "content": "q1"},
++            {
++                "role": "assistant",
++                "reasoning_content": f"r {IMAGE_PLACEHOLDER}",
++                "tool_calls": [
++                    {
++                        "id": "c1",
++                        "type": "function",
++                        "function": {"name": "lookup", "arguments": "{}"},
++                    }
++                ],
++            },
++            {"role": "tool", "tool_call_id": "c1", "content": "value"},
++        ]
++    )
++    assert f"r {IMAGE_PLACEHOLDER_TEXT}" in prompt
++
++
++def test_defer_loading_and_inline_tool_reference_preserve_system_prefix():
++    """Deferred tools stay out of the top-of-prompt preamble so discovering them
++    later via tool_reference inside tool_result never invalidates the prefix."""
++    search_tool = {
++        "type": "function",
++        "function": {
++            "name": "tool_search",
++            "description": "Search deferred tools",
++            "parameters": {"type": "object", "properties": {"q": {"type": "string"}}},
++        },
++    }
++    db_tool = {
++        "type": "function",
++        "defer_loading": True,
++        "function": {
++            "name": "db_query",
++            "description": "Run a SQL query",
++            "parameters": {"type": "object", "properties": {"sql": {"type": "string"}}},
++        },
++    }
++    tools = [search_tool, db_tool]
++    t1_msgs = [
++        {"role": "system", "content": "Helpful assistant."},
++        {"role": "user", "content": "Query orders."},
++    ]
++    t2_msgs = t1_msgs + [
++        {
++            "role": "assistant",
++            "content": "",
++            "tool_calls": [
++                {
++                    "id": "call_s1",
++                    "type": "function",
++                    "function": {"name": "tool_search", "arguments": '{"q": "sql"}'},
++                }
++            ],
++        },
++        {
++            "role": "tool",
++            "tool_call_id": "call_s1",
++            "content": [
++                {"type": "text", "text": "Discovered matching tools:"},
++                {"type": "tool_reference", "tool_name": "db_query"},
++            ],
++        },
++    ]
++
++    p1 = render(t1_msgs, tools=tools, thinking=False)
++    p2 = render(t2_msgs, tools=tools, thinking=False)
++    assert "tool_search" in p1
++    assert "db_query" not in p1
++    assert "defer_loading" not in p1
++    assert p2.startswith(p1.removesuffix("<｜Assistant｜></think>"))
++    assert "Discovered matching tools:" in p2
++    assert "<tool_schema>" in p2
++    assert '"name": "db_query"' in p2
++    assert '"sql"' in p2
++    assert "defer_loading" not in p2
++
++    # Tokenizing the two-turn prompt matches fresh full-string tokenization.
++    tok = byte_level_tokenizer()
++    assert tok.apply_chat_template(t2_msgs, tools=tools, tokenize=True, thinking=False) == (
++        tok.encode(p2, add_special_tokens=False)
++    )
+ 
+ 
+ def _call(name):
+@@ -1196,3 +1327,132 @@ def test_parse_chat_message_content_fastpath_string_and_none():
+             cfg_embeds,
+             content_format="string",
+         )
++
++
++def test_bounded_piece_cache_entry_and_byte_budget():
++    from vllm.tokenizers.deepseek_v41 import _BoundedPieceCache
++
++    cache = _BoundedPieceCache(max_entries=4, max_bytes=256)
++    assert isinstance(cache, dict)
++    cache["a" * 20] = (1, 2, 3)
++    cache["b" * 20] = (4, 5, 6)
++    cache.touch("a" * 20)
++    cache["c" * 20] = (7, 8, 9)
++    cache["d" * 20] = (10, 11, 12)
++    cache["e" * 20] = (13, 14, 15)
++    assert len(cache) <= 4
++    # "b"*20 was least recently touched and should be evicted before "a"*20.
++    assert ("a" * 20) in cache
++    assert ("b" * 20) not in cache
++
++    # An oversized entry is skipped instead of wiping warm entries or exceeding budget.
++    cache["giant" * 100] = tuple(range(500))
++    assert ("giant" * 100) not in cache
++    assert cache.total_bytes <= 256
++    cache.clear()
++    assert len(cache) == 0
++    assert cache.total_bytes == 0
++
++
++def test_parallel_newline_chunks_and_direct_encode_call_exactness():
++    from transformers import TokenizersBackend
++    from vllm.tokenizers.deepseek_v41 import _split_parallel_newline_chunks
++
++    tokenizer = byte_level_tokenizer()
++    tokenizer._segment_cache.clear()
++
++    # Create a large multi-line prompt >= 64 KiB spanning system, user, and assistant segments.
++    code_lines = [
++        f"def fn_{i}(x):\n    return x * {i} + {i % 7}\n"
++        for i in range(2000)
++    ]
++    big_doc = "".join(code_lines)
++    chunks = _split_parallel_newline_chunks(big_doc, target_chars=16384)
++    assert len(chunks) > 1
++    assert "".join(chunks) == big_doc
++    for prev_chunk, next_chunk in zip(chunks, chunks[1:]):
++        assert prev_chunk.endswith("\n") and not next_chunk[0].isspace()
++
++    msgs = [
++        {"role": "system", "content": "Be concise."},
++        {"role": "user", "content": big_doc},
++        {"role": "assistant", "content": "", "reasoning_content": "Done reasoning."},
++        {"role": "assistant", "content": "Final reply."},
++    ]
++    prompt = tokenizer.apply_chat_template(
++        msgs, tokenize=False, add_generation_prompt=False
++    )
++
++    ref_ids_no_bos = TokenizersBackend.encode(tokenizer, prompt, add_special_tokens=False)
++    fast_ids_no_bos = tokenizer.encode(prompt, add_special_tokens=False)
++    assert fast_ids_no_bos == ref_ids_no_bos
++
++    ref_ids_bos = TokenizersBackend.encode(tokenizer, prompt, add_special_tokens=True)
++    fast_ids_bos = tokenizer.encode(prompt, add_special_tokens=True)
++    assert fast_ids_bos == ref_ids_bos
++
++    ref_call = TokenizersBackend.__call__(tokenizer, prompt, add_special_tokens=False)
++    fast_call = tokenizer(prompt, add_special_tokens=False)
++    assert dict(fast_call) == dict(ref_call)
++    assert len(tokenizer._segment_cache) > 0
++
++    # Warm second call after appending a turn reuses cached segments and stays bit-exact.
++    prompt_next = prompt + "<｜User｜>Follow up question<｜end▁of▁sentence｜><｜Assistant｜>"
++    assert tokenizer.encode(prompt_next, add_special_tokens=False) == TokenizersBackend.encode(
++        tokenizer, prompt_next, add_special_tokens=False
++    )
++    assert dict(tokenizer(prompt_next, add_special_tokens=True, return_length=True)) == dict(
++        TokenizersBackend.__call__(
++            tokenizer, prompt_next, add_special_tokens=True, return_length=True
++        )
++    )
++
++
++def test_none_text_in_content_blocks_and_tool_references():
++    from vllm.tokenizers.deepseek_v41 import _normalize_messages
++    from vllm.tokenizers.deepseek_v41_encoding import encode_messages
++
++    normalized = _normalize_messages([
++        {
++            "role": "user",
++            "content": [
++                {"type": "text", "text": None},
++                {"type": "text", "text": "hello"},
++            ],
++        },
++        {
++            "role": "tool",
++            "tool_call_id": "c1",
++            "content": [
++                {"type": "text", "text": None},
++                {"type": "tool_reference", "name": "search_docs"},
++            ],
++        },
++    ])
++    assert normalized[0]["content"] == "\n\nhello"
++    assert normalized[1]["content"] == [
++        {"type": "text", "text": ""},
++        {"type": "tool_reference", "name": "search_docs"},
++    ]
++
++    rendered = encode_messages(
++        [
++            {
++                "role": "user",
++                "content": "",
++                "content_blocks": [
++                    {"type": "text", "text": None},
++                    {
++                        "type": "tool_result",
++                        "call_id": "c1",
++                        "content": [
++                            {"type": "text", "text": None},
++                            {"type": "text", "text": "ok"},
++                        ],
++                    },
++                ],
++            }
++        ],
++        thinking_mode="chat",
++    )
++    assert "ok" in rendered
+diff --git a/vllm/entrypoints/anthropic/serving.py b/vllm/entrypoints/anthropic/serving.py
+index ab25d537c0..ddf45d04a5 100644
+--- a/vllm/entrypoints/anthropic/serving.py
++++ b/vllm/entrypoints/anthropic/serving.py
+@@ -509,11 +509,21 @@ class AnthropicServingMessages(OpenAIServingChat):
+                         )
+             tool_text = "\n".join(text_parts)
+ 
++        if tool_reference and tool_text:
++            tool_content: str | list[dict[str, Any]] = [
++                {"type": "text", "text": tool_text},
++                *tool_reference,
++            ]
++        elif tool_reference:
++            tool_content = tool_reference
++        else:
++            tool_content = tool_text or ""
++
+         openai_messages.append(
+             {
+                 "role": "tool",
+                 "tool_call_id": block.tool_use_id or "",
+-                "content": tool_text or "",
++                "content": tool_content,  # type: ignore[dict-item]
+             }
+         )
+ 
+@@ -528,15 +538,6 @@ class AnthropicServingMessages(OpenAIServingChat):
+                 }
+             )
+ 
+-        if tool_reference:
+-            openai_messages.append(
+-                {
+-                    "role": "tool",
+-                    "tool_call_id": block.tool_use_id or "",
+-                    "content": tool_reference,  # type: ignore[dict-item]
+-                }
+-            )
+-
+     @classmethod
+     def _build_base_request(
+         cls,
+diff --git a/vllm/renderers/base.py b/vllm/renderers/base.py
+index 4aca17fa43..2f7eedf9c4 100644
+--- a/vllm/renderers/base.py
++++ b/vllm/renderers/base.py
+@@ -225,6 +225,8 @@ class BaseRenderer(ABC, Generic[_T]):
+         mm_processor_cache = self.mm_processor_cache
+         if mm_processor_cache is not None:
+             mm_processor_cache.clear_cache()
++        if self.mm_processor is not None:
++            self.mm_processor.clear_prefix_metadata_cache()
+ 
+         if self._mm_cache_stats is not None:
+             self._mm_cache_stats.reset = True
+@@ -239,6 +241,7 @@ class BaseRenderer(ABC, Generic[_T]):
+         processor_cache = processor.cache
+         if processor_cache is not None:
+             processor_cache.clear_cache()
++        processor.clear_prefix_metadata_cache()
+ 
+     def _warmup_mm_processor(
+         self,
+diff --git a/vllm/tokenizers/deepseek_v41.py b/vllm/tokenizers/deepseek_v41.py
+index 36aadd045b..cbe30163aa 100644
+--- a/vllm/tokenizers/deepseek_v41.py
++++ b/vllm/tokenizers/deepseek_v41.py
+@@ -4,16 +4,19 @@
+ import copy
+ import json
+ import re
++import threading
++from collections import OrderedDict
+ from collections.abc import Callable, Mapping
+ from typing import Any
+ 
+-from transformers import TokenizersBackend
++from transformers import BatchEncoding, TokenizersBackend
+ 
+ from vllm.entrypoints.chat_utils import ChatCompletionMessageParam
+ 
+ from .deepseek_v41_encoding import (
+     ASSISTANT_SP_TOKEN,
+     IMAGE_PLACEHOLDER,
++    IMAGE_PLACEHOLDER_TEXT,
+     REASONING_EFFORT_MAPPINGS,
+     USER_SP_TOKEN,
+     encode_messages,
+@@ -28,10 +31,88 @@ from .protocol import TokenizerLike
+ # Keys whose values are protocol identifiers, never rendered request text.
+ _PROTOCOL_KEYS = frozenset({"role", "type"})
+ 
+-# Bounded per-tokenizer segment cache capacity (message/turn chunks -> token IDs).
++# Bounded per-tokenizer piece cache (message/turn chunks -> token IDs).
+ _MAX_SEGMENT_CACHE = 8192
+-_SEGMENT_CACHES: dict[tuple[int, int], dict[str, tuple[int, ...]]] = {}
+-_PLAIN_CACHES: dict[tuple[int, int], dict[str, tuple[int, ...]]] = {}
++_MAX_CACHE_BYTES = 64 * 1024 * 1024
++_MIN_FAST_PATH_CHARS = 1024
++_PARALLEL_CHUNK_THRESHOLD = 65536
++_PARALLEL_CHUNK_TARGET = 16384
++
++
++class _BoundedPieceCache(OrderedDict):
++    """Thread-safe LRU cache bounded by entry count and estimated byte cost."""
++
++    def __init__(
++        self,
++        max_entries: int = _MAX_SEGMENT_CACHE,
++        max_bytes: int = _MAX_CACHE_BYTES,
++    ) -> None:
++        super().__init__()
++        self._max_entries = max_entries
++        self._max_bytes = max_bytes
++        self._total_bytes = 0
++        self._lock = threading.RLock()
++
++    @property
++    def total_bytes(self) -> int:
++        return self._total_bytes
++
++    @staticmethod
++    def _entry_bytes(key: str, value: tuple[int, ...]) -> int:
++        return len(key) * 2 + len(value) * 8
++
++    def touch(self, key: str) -> None:
++        with self._lock:
++            if key in self:
++                self.move_to_end(key)
++
++    def __setitem__(self, key: str, value: tuple[int, ...]) -> None:
++        entry_bytes = self._entry_bytes(key, value)
++        with self._lock:
++            old = super().pop(key, None)
++            if old is not None:
++                self._total_bytes -= self._entry_bytes(key, old)
++            if entry_bytes > self._max_bytes:
++                return
++            super().__setitem__(key, value)
++            self._total_bytes += entry_bytes
++            while (
++                len(self) > self._max_entries
++                or self._total_bytes > self._max_bytes
++            ):
++                evicted_k, evicted_v = super().popitem(last=False)
++                self._total_bytes -= self._entry_bytes(evicted_k, evicted_v)
++
++    def __delitem__(self, key: str) -> None:
++        with self._lock:
++            old = super().pop(key)
++            self._total_bytes -= self._entry_bytes(key, old)
++
++    def pop(self, key: str, *args: Any) -> Any:
++        with self._lock:
++            sentinel = object()
++            old = super().pop(key, sentinel)
++            if old is sentinel:
++                if args:
++                    return args[0]
++                raise KeyError(key)
++            self._total_bytes -= self._entry_bytes(key, old)
++            return old
++
++    def popitem(self, last: bool = True) -> tuple[str, tuple[int, ...]]:
++        with self._lock:
++            k, v = super().popitem(last=last)
++            self._total_bytes -= self._entry_bytes(k, v)
++            return k, v
++
++    def clear(self) -> None:
++        with self._lock:
++            super().clear()
++            self._total_bytes = 0
++
++
++_SEGMENT_CACHES: dict[tuple[int, int], _BoundedPieceCache] = {}
++_PLAIN_CACHES: dict[tuple[int, int], _BoundedPieceCache] = {}
+ 
+ 
+ def _compile_trie_regex(spellings: list[str]) -> re.Pattern[str] | None:
+@@ -68,13 +149,54 @@ def _compile_trie_regex(spellings: list[str]) -> re.Pattern[str] | None:
+     return re.compile(_render(root))
+ 
+ 
++def _split_after(chunk: str, delim: str) -> list[str]:
++    if not chunk or delim not in chunk:
++        return [chunk] if chunk else []
++    parts = chunk.split(delim)
++    out: list[str] = []
++    last = len(parts) - 1
++    for idx, part in enumerate(parts):
++        piece = part + delim if idx < last else part
++        if piece:
++            out.append(piece)
++    return out
++
++
++def _split_parallel_newline_chunks(
++    text: str, target_chars: int = _PARALLEL_CHUNK_TARGET
++) -> list[str]:
++    """Split large text just after BPE-invariant newlines for encode_batch.
++
++    In DeepSeek-V4.1's pre-tokenizer regex, punctuation and whitespace rules
++    consume trailing `[\\r\\n]*` / `[\\r\\n]+`. Cutting immediately after `\\n`
++    (`pos + 1`) when the next character is non-whitespace preserves exact token
++    boundaries across every regex branch.
++    """
++    n = len(text)
++    if n < _PARALLEL_CHUNK_THRESHOLD:
++        return [text]
++    chunks: list[str] = []
++    start = 0
++    while start + target_chars < n:
++        pos = text.find("\n", start + target_chars)
++        while pos != -1 and (pos + 1 >= n or text[pos + 1].isspace()):
++            pos = text.find("\n", pos + 1)
++        if pos == -1 or pos + 1 >= n:
++            break
++        chunks.append(text[start : pos + 1])
++        start = pos + 1
++    if start < n:
++        chunks.append(text[start:])
++    return chunks if chunks else [text]
++
++
+ def _split_prompt_segments(prompt: str) -> list[str]:
+     """Split a rendered V4.1 prompt along structural added-token boundaries.
+ 
+-    Every split point is immediately after `<｜end▁of▁sentence｜>` or immediately
+-    before `<｜User｜>` or `<｜Assistant｜>`, so the system header/tool catalog,
+-    each user/tool-result turn, and each assistant turn form cacheable segments
+-    whose concatenation equals `prompt`.
++    Splits immediately after `<｜end▁of▁sentence｜>` and `</think>`, and
++    immediately before `<｜User｜>` or `<｜Assistant｜>`, so headers, tool
++    catalogs, turns, reasoning prefixes, and responses form cacheable
++    segments whose concatenation equals `prompt`.
+     """
+     raw_turns = prompt.split(eos_token)
+     chunks: list[str] = []
+@@ -87,15 +209,15 @@ def _split_prompt_segments(prompt: str) -> list[str]:
+         if i == 0 and USER_SP_TOKEN in turn:
+             sys_part, sep, rest = turn.partition(USER_SP_TOKEN)
+             if sys_part:
+-                chunks.append(sys_part)
++                chunks.extend(_split_after(sys_part, thinking_end_token))
+             turn = sep + rest
+         if ASSISTANT_SP_TOKEN in turn:
+             u_part, sep, a_part = turn.partition(ASSISTANT_SP_TOKEN)
+             if u_part:
+-                chunks.append(u_part)
+-            chunks.append(sep + a_part)
++                chunks.extend(_split_after(u_part, thinking_end_token))
++            chunks.extend(_split_after(sep + a_part, thinking_end_token))
+         else:
+-            chunks.append(turn)
++            chunks.extend(_split_after(turn, thinking_end_token))
+     return chunks
+ 
+ 
+@@ -111,8 +233,8 @@ class _ControlSpellings:
+     encoded without the added vocabulary, with the sentinels restored. This
+     matches DeepSeek's encoder, which encodes a typed spelling as plain text.
+ 
+-    The image placeholder is left alone: `_normalize_messages` already rejects it
+-    in text, and image parts render it.
++    The image placeholder is left alone: image parts render it, and
++    `_normalize_messages` escapes the typed spelling in text to ordinary text.
+     """
+ 
+     @staticmethod
+@@ -234,10 +356,39 @@ def _plain_text_encoder(tokenizer: Any) -> Callable[[list[str]], list[list[int]]
+     return encode
+ 
+ 
++def _escape_image_token_literal(value: Any, key: str | None = None) -> Any:
++    """Escape the image token's literal spelling in request text to plain text.
++
++    The image token in the prompt comes only from image content blocks. The
++    token's literal spelling typed into a message, text part, tool result,
++    reasoning or tool-call arguments is ordinary text: escape it to the
++    ordinary-text spelling, which is in no added-token vocabulary, so the
++    encoder cannot mistake it for an image reference (spark-ds41f issue #1031).
++    """
++    if isinstance(value, str):
++        if key == "arguments" and IMAGE_PLACEHOLDER not in value and "\\" in value:
++            decoded = _decode_arguments(value)
++            if isinstance(decoded, dict):
++                return _escape_image_token_literal(decoded)
++        return value.replace(IMAGE_PLACEHOLDER, IMAGE_PLACEHOLDER_TEXT)
++    if isinstance(value, Mapping):
++        return {
++            k: item
++            if k in _PROTOCOL_KEYS
++            else _escape_image_token_literal(item, k)
++            for k, item in value.items()
++        }
++    if isinstance(value, (list, tuple)):
++        return type(value)(_escape_image_token_literal(item) for item in value)
++    return value
++
++
+ def _normalize_messages(
+     messages: list[ChatCompletionMessageParam],
+ ) -> list[dict[str, Any]]:
+     result = [dict(message) for message in messages]
++    if any(IMAGE_PLACEHOLDER in text for text in _strings(result)):
++        result = [_escape_image_token_literal(message) for message in result]
+     for message in result:
+         role = message.get("role")
+         if role not in (
+@@ -254,38 +405,58 @@ def _normalize_messages(
+         if "reasoning" in message:
+             message["reasoning_content"] = message["reasoning"]
+         content = message.get("content")
+-        # Image tokens come only from image parts, as the reference requires.
+-        if isinstance(content, str) and IMAGE_PLACEHOLDER in content:
+-            raise ValueError(
+-                f"Message content contains image special token '{IMAGE_PLACEHOLDER}'. "
+-                "Images should be provided as image content blocks."
+-            )
+-        reasoning = message.get("reasoning_content")
+-        if isinstance(reasoning, str) and IMAGE_PLACEHOLDER in reasoning:
+-            raise ValueError(
+-                f"reasoning_content contains image special token '{IMAGE_PLACEHOLDER}'"
+-            )
+         if isinstance(content, list):
+-            parts = []
+-            for block in content:
+-                part_type = block.get("type")
+-                if part_type in ("text", "input_text", "output_text"):
+-                    text = block.get("text", "")
+-                    if IMAGE_PLACEHOLDER in text:
++            has_tool_ref = role == "tool" and any(
++                isinstance(block, Mapping) and block.get("type") == "tool_reference"
++                for block in content
++            )
++            if has_tool_ref:
++                structured_parts: list[dict[str, Any]] = []
++                for block in content:
++                    if not isinstance(block, Mapping):
+                         raise ValueError(
+-                            "Text block contains image placeholder "
+-                            f"'{IMAGE_PLACEHOLDER}'. Images should be separate "
+-                            "content blocks."
++                            "DeepSeek V4.1 supports text and image content only; "
++                            f"got {type(block).__name__!r}"
+                         )
+-                    parts.append(text)
+-                elif part_type in ("image_url", "input_image", "image_pil"):
+-                    parts.append(IMAGE_PLACEHOLDER)
+-                else:
+-                    raise ValueError(
+-                        "DeepSeek V4.1 supports text and image content only; "
+-                        f"got {part_type!r}"
+-                    )
+-            message["content"] = "\n\n".join(parts)
++                    part_type = block.get("type")
++                    if part_type in ("text", "input_text", "output_text"):
++                        structured_parts.append(
++                            {"type": "text", "text": block.get("text") or ""}
++                        )
++                    elif part_type in ("image_url", "input_image", "image_pil"):
++                        structured_parts.append(
++                            {"type": "text", "text": IMAGE_PLACEHOLDER}
++                        )
++                    elif part_type == "tool_reference":
++                        ref_name = block.get("name") or block.get("tool_name") or ""
++                        structured_parts.append(
++                            {"type": "tool_reference", "name": str(ref_name)}
++                        )
++                    else:
++                        raise ValueError(
++                            "DeepSeek V4.1 supports text and image content only; "
++                            f"got {part_type!r}"
++                        )
++                message["content"] = structured_parts
++            else:
++                parts = []
++                for block in content:
++                    if not isinstance(block, Mapping):
++                        raise ValueError(
++                            "DeepSeek V4.1 supports text and image content only; "
++                            f"got {type(block).__name__!r}"
++                        )
++                    part_type = block.get("type")
++                    if part_type in ("text", "input_text", "output_text"):
++                        parts.append(block.get("text") or "")
++                    elif part_type in ("image_url", "input_image", "image_pil"):
++                        parts.append(IMAGE_PLACEHOLDER)
++                    else:
++                        raise ValueError(
++                            "DeepSeek V4.1 supports text and image content only; "
++                            f"got {part_type!r}"
++                        )
++                message["content"] = "\n\n".join(parts)
+     return result
+ 
+ 
+@@ -356,6 +527,66 @@ def _apply_generation_controls(
+     return prompt
+ 
+ 
++def _resolve_cached_pieces(
++    pieces: list[str],
++    cache: _BoundedPieceCache,
++    encode_batch: Callable[[list[str]], list[list[int]]],
++    encode_single: Callable[[str], list[int]] | None = None,
++) -> dict[str, tuple[int, ...]]:
++    """Resolve token IDs for unique string pieces using `cache` and parallel batching."""
++    resolved: dict[str, tuple[int, ...]] = {}
++    missing: list[str] = []
++    for piece in pieces:
++        if piece in resolved:
++            continue
++        cached = cache.get(piece)
++        if cached is not None:
++            cache.touch(piece)
++            resolved[piece] = cached
++        else:
++            resolved[piece] = ()
++            missing.append(piece)
++
++    if not missing:
++        return resolved
++
++    work_items: list[str] = []
++    spans: list[tuple[str, int, int]] = []
++    total_chars = 0
++    for piece in missing:
++        total_chars += len(piece)
++        subchunks = _split_parallel_newline_chunks(piece)
++        spans.append((piece, len(work_items), len(subchunks)))
++        work_items.extend(subchunks)
++
++    if (
++        encode_single is not None
++        and len(work_items) == 1
++        and total_chars < _PARALLEL_CHUNK_THRESHOLD
++    ):
++        work_ids = [encode_single(work_items[0])]
++    elif (
++        encode_single is not None
++        and len(work_items) <= 8
++        and total_chars < 4096
++    ):
++        work_ids = [encode_single(item) for item in work_items]
++    else:
++        work_ids = encode_batch(work_items)
++
++    for piece, start, count in spans:
++        if count == 1:
++            ids_tuple = tuple(work_ids[start])
++        else:
++            joined: list[int] = []
++            for sub in work_ids[start : start + count]:
++                joined.extend(sub)
++            ids_tuple = tuple(joined)
++        resolved[piece] = ids_tuple
++        cache[piece] = ids_tuple
++    return resolved
++
++
+ def get_deepseek_v41_tokenizer(tokenizer: HfTokenizer) -> HfTokenizer:
+     """Wrap an HF tokenizer with the V4.1 prompt encoder."""
+     wrapped = copy.copy(tokenizer)
+@@ -374,21 +605,58 @@ def get_deepseek_v41_tokenizer(tokenizer: HfTokenizer) -> HfTokenizer:
+         and eos_token in added_vocab
+         and USER_SP_TOKEN in added_vocab
+         and ASSISTANT_SP_TOKEN in added_vocab
++        and thinking_end_token in added_vocab
+         and not any("<" in s[1:] for s in added_vocab)
++        and not any("\n" in s or "\r" in s for s in added_vocab)
+         and not any(
+             s != d and s.startswith(d)
+             for s in added_vocab
+-            for d in (eos_token, USER_SP_TOKEN, ASSISTANT_SP_TOKEN)
++            for d in (
++                eos_token,
++                USER_SP_TOKEN,
++                ASSISTANT_SP_TOKEN,
++                thinking_end_token,
++            )
+         )
+     )
++    bos_prefix: tuple[int, ...] = ()
++    eos_suffix: tuple[int, ...] = ()
++    can_fast_special = False
++    if can_split_segments:
++        canary_plain = tuple(tokenizer.encode("canary check", add_special_tokens=False))
++        canary_spec = tuple(tokenizer.encode("canary check", add_special_tokens=True))
++        n_plain = len(canary_plain)
++        if n_plain > 0:
++            for start in range(len(canary_spec) - n_plain + 1):
++                if canary_spec[start : start + n_plain] == canary_plain:
++                    bos_prefix = canary_spec[:start]
++                    eos_suffix = canary_spec[start + n_plain :]
++                    can_fast_special = True
++                    break
++
+     cache_key = (int(getattr(tokenizer, "vocab_size", 0)), len(added_vocab))
+-    segment_cache = _SEGMENT_CACHES.setdefault(cache_key, {})
+-    plain_cache = _PLAIN_CACHES.setdefault(cache_key, {})
++    segment_cache = _SEGMENT_CACHES.setdefault(cache_key, _BoundedPieceCache())
++    plain_cache = _PLAIN_CACHES.setdefault(cache_key, _BoundedPieceCache())
++
++    def _seg_single(text: str) -> list[int]:
++        assert backend_tokenizer is not None
++        return backend_tokenizer.encode(text, add_special_tokens=False).ids
++
++    def _seg_batch(texts: list[str]) -> list[list[int]]:
++        assert backend_tokenizer is not None
++        return [
++            enc.ids
++            for enc in backend_tokenizer.encode_batch(
++                texts, add_special_tokens=False
++            )
++        ]
+ 
+     def encode_prompt_segments(tok_self: Any, prompt: str) -> list[int]:
+         assert backend_tokenizer is not None
+         if getattr(tok_self, "split_special_tokens", False):
+-            return tok_self.encode(prompt, add_special_tokens=False)
++            return TokenizersBackend.encode(
++                tok_self, prompt, add_special_tokens=False
++            )
+         if backend_tokenizer.truncation is not None:
+             backend_tokenizer.no_truncation()
+         if backend_tokenizer.padding is not None:
+@@ -400,34 +668,12 @@ def get_deepseek_v41_tokenizer(tokenizer: HfTokenizer) -> HfTokenizer:
+         if not chunks:
+             return []
+ 
+-        missing = [c for c in dict.fromkeys(chunks) if c not in segment_cache]
+-        if missing:
+-            total_missing_chars = sum(len(c) for c in missing)
+-            if len(missing) == 1 or (
+-                len(missing) <= 8 and total_missing_chars < 4096
+-            ):
+-                for chunk in missing:
+-                    enc = backend_tokenizer.encode(
+-                        chunk, add_special_tokens=False
+-                    )
+-                    segment_cache[chunk] = tuple(enc.ids)
+-            else:
+-                for chunk, enc in zip(
+-                    missing,
+-                    backend_tokenizer.encode_batch(
+-                        missing, add_special_tokens=False
+-                    ),
+-                ):
+-                    segment_cache[chunk] = tuple(enc.ids)
+-            while len(segment_cache) > _MAX_SEGMENT_CACHE:
+-                try:
+-                    segment_cache.pop(next(iter(segment_cache)))
+-                except (StopIteration, KeyError):
+-                    break
+-
++        resolved = _resolve_cached_pieces(
++            chunks, segment_cache, _seg_batch, _seg_single
++        )
+         ids: list[int] = []
+         for chunk in chunks:
+-            ids.extend(segment_cache[chunk])
++            ids.extend(resolved[chunk])
+         return ids
+ 
+     def encode_with_text_spellings(
+@@ -446,27 +692,14 @@ def get_deepseek_v41_tokenizer(tokenizer: HfTokenizer) -> HfTokenizer:
+             position = match.end()
+         if position < len(prompt):
+             pieces.append(controls.restore(prompt[position:]))
+-        missing = [
+-            piece
+-            for piece in dict.fromkeys(
+-                p for p in pieces if isinstance(p, str)
+-            )
+-            if piece not in plain_cache
+-        ]
+-        if missing:
+-            for text_piece, token_ids in zip(
+-                missing, plain_encoder[0](missing)
+-            ):
+-                plain_cache[text_piece] = tuple(token_ids)
+-            while len(plain_cache) > _MAX_SEGMENT_CACHE:
+-                try:
+-                    plain_cache.pop(next(iter(plain_cache)))
+-                except (StopIteration, KeyError):
+-                    break
++        text_pieces = [p for p in pieces if isinstance(p, str)]
++        resolved = _resolve_cached_pieces(
++            text_pieces, plain_cache, plain_encoder[0]
++        )
+         ids: list[int] = []
+         for piece in pieces:
+             if isinstance(piece, str):
+-                ids.extend(plain_cache[piece])
++                ids.extend(resolved[piece])
+             else:
+                 ids.append(piece)
+         return ids
+@@ -576,6 +809,104 @@ def get_deepseek_v41_tokenizer(tokenizer: HfTokenizer) -> HfTokenizer:
+             # display, and serving encodes through the branch above.
+             return controls.restore(prompt)
+ 
++        def _encode_fast_str(
++            self, text: str, add_special_tokens: bool
++        ) -> list[int] | None:
++            if (
++                not can_split_segments
++                or len(text) < _MIN_FAST_PATH_CHARS
++                or getattr(self, "split_special_tokens", False)
++                or (add_special_tokens and not can_fast_special)
++            ):
++                return None
++            ids = encode_prompt_segments(self, text)
++            if add_special_tokens and (bos_prefix or eos_suffix):
++                return [*bos_prefix, *ids, *eos_suffix]
++            return ids
++
++        _ENCODE_FAST_KEYS = frozenset(
++            {
++                "add_special_tokens",
++                "padding",
++                "truncation",
++                "max_length",
++                "text_pair",
++                "return_tensors",
++            }
++        )
++        _CALL_FAST_KEYS = frozenset(
++            {
++                "add_special_tokens",
++                "padding",
++                "truncation",
++                "max_length",
++                "return_token_type_ids",
++                "return_attention_mask",
++                "return_tensors",
++                "verbose",
++            }
++        )
++
++        def encode(self, text: Any, *args: Any, **kwargs: Any) -> Any:
++            if (
++                not args
++                and isinstance(text, str)
++                and self._ENCODE_FAST_KEYS.issuperset(kwargs)
++                and kwargs.get("text_pair") is None
++                and kwargs.get("padding", False) is False
++                and not kwargs.get("truncation")
++                and kwargs.get("max_length") is None
++                and kwargs.get("return_tensors") is None
++            ):
++                ids = self._encode_fast_str(
++                    text, kwargs.get("add_special_tokens", True)
++                )
++                if ids is not None:
++                    return ids
++            return super().encode(text, *args, **kwargs)
++
++        def __call__(self, *args: Any, **kwargs: Any) -> BatchEncoding:
++            if len(args) == 1 and "text" not in kwargs:
++                text = args[0]
++                key_ok = self._CALL_FAST_KEYS.issuperset(kwargs)
++            elif not args and "text" in kwargs:
++                text = kwargs["text"]
++                key_ok = (self._CALL_FAST_KEYS | {"text"}).issuperset(kwargs)
++            else:
++                text = None
++                key_ok = False
++            if (
++                key_ok
++                and isinstance(text, str)
++                and kwargs.get("padding", False) is False
++                and not kwargs.get("truncation")
++                and kwargs.get("max_length") is None
++                and kwargs.get("return_tensors") is None
++            ):
++                ids = self._encode_fast_str(
++                    text, kwargs.get("add_special_tokens", True)
++                )
++                if ids is not None:
++                    data: dict[str, Any] = {"input_ids": ids}
++                    input_names = getattr(
++                        self,
++                        "model_input_names",
++                        ("input_ids", "attention_mask"),
++                    )
++                    ret_type_ids = kwargs.get("return_token_type_ids")
++                    ret_attn_mask = kwargs.get("return_attention_mask")
++                    if ret_type_ids or (
++                        ret_type_ids is None and "token_type_ids" in input_names
++                    ):
++                        data["token_type_ids"] = [0] * len(ids)
++                    if ret_attn_mask or (
++                        ret_attn_mask is None
++                        and "attention_mask" in input_names
++                    ):
++                        data["attention_mask"] = [1] * len(ids)
++                    return BatchEncoding(data)
++            return super().__call__(*args, **kwargs)
++
+         def num_special_tokens_to_add(self) -> int:
+             return len(self.encode(""))
+ 
+diff --git a/vllm/tokenizers/deepseek_v41_encoding.py b/vllm/tokenizers/deepseek_v41_encoding.py
+index 1f39bf47ae..a5ea571db6 100644
+--- a/vllm/tokenizers/deepseek_v41_encoding.py
++++ b/vllm/tokenizers/deepseek_v41_encoding.py
+@@ -23,6 +23,11 @@ USER_SP_TOKEN = "<｜User｜>"
+ ASSISTANT_SP_TOKEN = "<｜Assistant｜>"
+ LATEST_REMINDER_SP_TOKEN = "<｜latest_reminder｜>"
+ IMAGE_PLACEHOLDER = "<｜deepseek_image｜>"
++# The ordinary-text spelling of the image token: it is in no added-token
++# vocabulary, so the encoder can only see it as plain text. deepseek_v41.py
++# escapes literal spellings in request text to it (see
++# _escape_image_token_literal).
++IMAGE_PLACEHOLDER_TEXT = "<|deepseek_image|>"
+ 
+ DS_TASK_SP_TOKENS = {
+     "action": "<｜action｜>",
+@@ -211,9 +216,42 @@ def insert_system_prompt_fields(
+     return conversation
+ 
+ 
++def _normalize_tool_entry(tool: Dict[str, Any]) -> tuple[Dict[str, Any], bool]:
++    """Normalize one tool schema and return ``(function_schema, deferred)``."""
++    if "function" in tool:
++        normalized = normalize_tool_namespace(tool)
++        fn = dict(normalized["function"])
++        deferred = bool(
++            fn.get("defer_loading")
++            if fn.get("defer_loading") is not None
++            else tool.get("defer_loading")
++        )
++    else:
++        fn = dict(tool)
++        deferred = bool(fn.get("defer_loading"))
++    fn.pop("defer_loading", None)
++    return fn, deferred
++
++
++def _collect_tools(
++    tools: List[Dict[str, Any]],
++) -> tuple[List[Dict[str, Any]], Dict[str, Dict[str, Any]]]:
++    """Split tools into ``(visible_for_preamble, catalog_by_name)``."""
++    visible: List[Dict[str, Any]] = []
++    catalog: Dict[str, Dict[str, Any]] = {}
++    for tool in tools:
++        schema, deferred = _normalize_tool_entry(tool)
++        name = schema.get("name")
++        if isinstance(name, str) and name:
++            catalog[name] = schema
++        if not deferred:
++            visible.append(schema)
++    return visible, catalog
++
++
+ def tools_from_openai_format(tools):
+-    """Extract function definitions with namespace-qualified identities."""
+-    return [normalize_tool_namespace(tool)["function"] for tool in tools]
++    """Extract non-deferred function definitions with namespace-qualified identities."""
++    return _collect_tools(tools)[0]
+ 
+ 
+ def tool_calls_from_openai_format(tool_calls):
+@@ -541,6 +579,7 @@ def render_message(
+     drop_thinking: bool = True,
+     reasoning_effort: Union[str, int, None] = None,
+     last_user_idx: Optional[int] = None,
++    tool_catalog: Optional[Dict[str, Dict[str, Any]]] = None,
+ ) -> str:
+     """
+     Render a single message at the given index into its V4.1 encoded string form.
+@@ -563,7 +602,11 @@ def render_message(
+     wo_eos = msg.get("wo_eos", False)
+ 
+     if tools:
+-        tools = tools_from_openai_format(tools)
++        tools, local_catalog = _collect_tools(tools)
++        if tool_catalog is None:
++            tool_catalog = local_catalog
++        elif local_catalog:
++            tool_catalog = {**local_catalog, **tool_catalog}
+     if tool_calls:
+         tool_calls = tool_calls_from_openai_format(tool_calls)
+ 
+@@ -602,16 +645,30 @@ def render_message(
+             for block in content_blocks:
+                 block_type = block.get("type")
+                 if block_type == "text":
+-                    parts.append(block.get("text", ""))
++                    parts.append(block.get("text") or "")
+                 elif block_type == "tool_result":
+                     tool_content = block.get("content", "")
+                     if isinstance(tool_content, list):
+                         text_parts = []
+                         for b in tool_content:
+-                            if b.get("type") == "text":
+-                                text_parts.append(b.get("text", ""))
++                            b_type = b.get("type")
++                            if b_type == "text":
++                                text_parts.append(b.get("text") or "")
++                            elif b_type == "tool_reference":
++                                ref_name = b.get("name") or b.get("tool_name") or ""
++                                schema = (
++                                    tool_catalog.get(ref_name)
++                                    if tool_catalog and ref_name
++                                    else None
++                                )
++                                if schema is not None:
++                                    text_parts.append(
++                                        f"<tool_schema>\n{to_json(schema)}\n</tool_schema>"
++                                    )
++                                elif ref_name:
++                                    text_parts.append(ref_name)
+                             else:
+-                                text_parts.append(f"[Unsupported {b.get('type')}]")
++                                text_parts.append(f"[Unsupported {b_type}]")
+                         tool_content = "\n\n".join(text_parts)
+                     parts.append(tool_output_template.format(content=tool_content))
+                 else:
+@@ -792,6 +849,12 @@ def encode_messages(
+         num_to_render = len(messages)
+         context_len = len(context)
+ 
++    tool_catalog: Dict[str, Dict[str, Any]] = {}
++    for m in full_messages:
++        if m.get("tools"):
++            _, msg_catalog = _collect_tools(m["tools"])
++            tool_catalog.update(msg_catalog)
++
+     for idx in range(num_to_render):
+         parts.append(
+             render_message(
+@@ -801,6 +864,7 @@ def encode_messages(
+                 drop_thinking=effective_drop_thinking,
+                 reasoning_effort=reasoning_effort,
+                 last_user_idx=last_user_idx,
++                tool_catalog=tool_catalog,
+             )
+         )
+ 
+diff --git a/vllm/tokenizers/registry.py b/vllm/tokenizers/registry.py
+index 46446ecd6d..0164765339 100644
+--- a/vllm/tokenizers/registry.py
++++ b/vllm/tokenizers/registry.py
+@@ -282,10 +282,19 @@ def get_tokenizer(
+         )
+         tokenizer_cls_ = TokenizersBackend
+ 
+-    if config is not None and tokenizer_cls_ is CachedHfTokenizer:
+-        # AutoTokenizer otherwise reloads config.json internally. Reuse the
+-        # config that get_config just loaded successfully so a concurrent Hub
+-        # cache refresh cannot invalidate the file between the two reads.
++    from transformers.tokenization_utils_tokenizers import TokenizersBackend
++
++    if config is not None and (
++        tokenizer_cls_ is CachedHfTokenizer
++        or (
++            isinstance(tokenizer_cls_, type)
++            and issubclass(tokenizer_cls_, TokenizersBackend)
++        )
++    ):
++        # AutoTokenizer and TokenizersBackend subclasses otherwise reload
++        # config.json internally. Reuse the config that get_config just loaded
++        # successfully so a concurrent Hub cache refresh cannot invalidate the
++        # file between the two reads.
+         kwargs.setdefault("config", config)
+ 
+     tokenizer = tokenizer_cls_.from_pretrained(tokenizer_name, *args, **kwargs)
+diff --git a/vllm/v1/engine/detokenizer.py b/vllm/v1/engine/detokenizer.py
+index f04fa30a18..114be4d752 100644
+--- a/vllm/v1/engine/detokenizer.py
++++ b/vllm/v1/engine/detokenizer.py
+@@ -27,6 +27,45 @@ USE_FAST_DETOKENIZER = version.parse(tokenizers.__version__) >= version.parse("0
+ # Error string from https://github.com/huggingface/tokenizers/blob/909fdde2a4ffedd9295206f705eb612be2a91b12/tokenizers/src/tokenizer/mod.rs#L1042
+ INVALID_PREFIX_ERR_MSG = "Invalid prefix encountered"
+ 
++PROMPT_SUFFIX_PRIME_WINDOW = 16
++PROMPT_SUFFIX_MAX_WINDOW = 64
++
++
++def prompt_suffix_to_prime(
++    tokenizer: Tokenizer,
++    prompt_token_ids: list[int] | None,
++    skip_special_tokens: bool,
++) -> list[int] | None:
++    """Return a bounded prompt token suffix sufficient to prime DecodeStream.
++
++    HuggingFace ``DecodeStream`` decodes all ``ids`` passed at construction on
++    the first ``step()`` call to establish its prefix string, even though BPE
++    and byte-fallback merge context only depends on the trailing tokens of the
++    prompt. Slicing to a short suffix whose left and right boundaries decode
++    without replacement characters (``U+FFFD``) avoids O(len(prompt)) string
++    allocation and decoding on the first generated token while preserving
++    step-for-step identical output.
++    """
++    if not prompt_token_ids or len(prompt_token_ids) <= PROMPT_SUFFIX_PRIME_WINDOW:
++        return prompt_token_ids
++
++    n = len(prompt_token_ids)
++    w = PROMPT_SUFFIX_PRIME_WINDOW
++    while w <= min(n, PROMPT_SUFFIX_MAX_WINDOW):
++        for adjust in range(4):
++            cand_w = w + adjust
++            if cand_w >= n:
++                return prompt_token_ids
++            suffix = prompt_token_ids[-cand_w:]
++            decoded = tokenizer.decode(suffix, skip_special_tokens=skip_special_tokens)
++            if decoded.endswith("\ufffd"):
++                return prompt_token_ids
++            if decoded and not decoded.startswith("\ufffd"):
++                return suffix
++        w *= 2
++
++    return prompt_token_ids
++
+ 
+ class IncrementalDetokenizer:
+     def __init__(self):
+@@ -182,7 +221,11 @@ class FastIncrementalDetokenizer(BaseIncrementalDetokenizer):
+         # fastokens shim that replaces ``tokenizers.decoders.DecodeStream``)
+         # are honored regardless of import order.
+         self.stream = tokenizers.decoders.DecodeStream(
+-            ids=request.prompt_token_ids,
++            ids=prompt_suffix_to_prime(
++                self.tokenizer,
++                request.prompt_token_ids,
++                self.skip_special_tokens,
++            ),
+             skip_special_tokens=self.skip_special_tokens,
+         )
+ 

@@ -1401,5 +1401,108 @@ class IdentifierAlignmentTest(unittest.TestCase):
         self.assertTrue(any("patch_count is 512" in p for p in lock_problems))
 
 
+class QualifiedRecipeProblemsTest(unittest.TestCase):
+    def _nodes(self, shape: str) -> dict:
+        example_by_shape = {
+            "tp4-ring": "config/examples/nodes-ring4.json",
+            "tp4-switched": "config/examples/nodes-switched.json",
+            "tp3-triangle": "config/nodes.example.json",
+            "tp3-triangle-4k": "config/nodes.example.json",
+            "tp3-switched": "config/examples/nodes-switched3.json",
+            "tp5-switched": "config/examples/nodes-switched5.json",
+            "tp6-switched": "config/examples/nodes-switched6.json",
+            "tp7-switched": "config/examples/nodes-switched7.json",
+            "tp8-switched": "config/examples/nodes-switched8.json",
+        }
+        return spark.read_json(example_by_shape[shape])
+
+    def test_canonical_production_and_candidate_profiles_pass_cleanly(self) -> None:
+        prod_lock = spark.read_json("upstreams.lock.json")
+        for shape in (
+            "tp4-ring", "tp4-switched", "tp3-triangle", "tp3-switched",
+            "tp3-triangle-4k", "tp5-switched", "tp6-switched", "tp7-switched", "tp8-switched",
+        ):
+            with self.subTest(config="production", shape=shape):
+                cluster = spark.read_cluster("config/cluster.json", shape)
+                self.assertEqual(spark.qualified_recipe_problems(cluster, self._nodes(shape), prod_lock), [])
+
+        c55_lock = spark.read_json("experiments/2026-10-26-spark-ds41f-candidate/candidate-55/upstreams.lock.json")
+        stem_to_shape = {"tp4": "tp4-ring", "tp3": "tp3-triangle"}
+        for base in (
+            "experiments/2026-10-26-spark-ds41f-candidate/candidate-55",
+            "experiments/2026-11-14-c58-prefill-10k",
+            "experiments/2026-11-15-c59-prefill",
+        ):
+            for stem in ("tp4", "tp4-switched", "tp3", "tp3-switched", "tp5-switched"):
+                with self.subTest(base=base, stem=stem):
+                    cluster = spark.read_cluster(f"{base}/{stem}.json")
+                    dev = spark.read_cluster(f"{base}/{stem}-dev.json")
+                    nodes = self._nodes(stem_to_shape.get(stem, stem))
+                    self.assertEqual(spark.qualified_recipe_problems(cluster, nodes, c55_lock), [])
+                    self.assertEqual(spark.qualified_recipe_problems(dev, nodes, c55_lock), [])
+                    if base != "experiments/2026-10-26-spark-ds41f-candidate/candidate-55":
+                        # Without site nodes-switched*.local.json, validate topology/recipe checks via example nodes.
+                        dev["distributed"]["master_addr"] = nodes["nodes"][0]["management_ip"]
+                        with unittest.mock.patch.object(spark, "tracked_secret_problems", return_value=[]):
+                            findings = spark.local_doctor(dev, nodes, c55_lock)
+                        self.assertEqual(findings, [])
+
+    def test_unset_or_wrong_l2_prefetch_budgets_warn_without_15_12_12_overlay(self) -> None:
+        import copy
+
+        c55_lock = spark.read_json("experiments/2026-10-26-spark-ds41f-candidate/candidate-55/upstreams.lock.json")
+        base_tp4 = spark.read_cluster("experiments/2026-10-26-spark-ds41f-candidate/candidate-55/tp4.json")
+        nodes = self._nodes("tp4-ring")
+
+        unset_tp4 = copy.deepcopy(base_tp4)
+        for key in ("VLLM_DS41_L2_PREFETCH_WO_MB", "VLLM_DS41_L2_PREFETCH_FFN_MB", "VLLM_DS41_L2_PREFETCH_NEXT_MB"):
+            unset_tp4["environment"].pop(key)
+        warnings = spark.qualified_recipe_problems(unset_tp4, nodes, c55_lock)
+        self.assertEqual(len(warnings), 3)
+        self.assertTrue(all(isinstance(w, spark.Warn) for w in warnings))
+        self.assertTrue(any("VLLM_DS41_L2_PREFETCH_WO_MB is unset" in w for w in warnings))
+
+        stale_tp4 = copy.deepcopy(base_tp4)
+        stale_tp4["environment"]["VLLM_DS41_L2_PREFETCH_WO_MB"] = "20"
+        stale_tp4["environment"]["VLLM_DS41_L2_PREFETCH_FFN_MB"] = "16"
+        stale_tp4["environment"]["VLLM_DS41_L2_PREFETCH_NEXT_MB"] = "20"
+        warnings = spark.qualified_recipe_problems(stale_tp4, nodes, c55_lock)
+        self.assertEqual(len(warnings), 3)
+        self.assertTrue(any("VLLM_DS41_L2_PREFETCH_WO_MB='20', expected qualified '15'" in w for w in warnings))
+
+        # C58/C59 mount l2_prefetch.py with 15/12/12 defaults, so unsetting the env vars is clean.
+        overlaid = spark.read_cluster("experiments/2026-11-14-c58-prefill-10k/tp4.json")
+        for key in ("VLLM_DS41_L2_PREFETCH_WO_MB", "VLLM_DS41_L2_PREFETCH_FFN_MB", "VLLM_DS41_L2_PREFETCH_NEXT_MB"):
+            overlaid["environment"].pop(key)
+        self.assertEqual(spark.qualified_recipe_problems(overlaid, nodes, c55_lock), [])
+
+    def test_missing_or_wrong_wo_bands_and_roce_cutoff_warn(self) -> None:
+        import copy
+
+        c55_lock = spark.read_json("experiments/2026-10-26-spark-ds41f-candidate/candidate-55/upstreams.lock.json")
+        noband = spark.read_cluster("experiments/2026-10-26-spark-ds41f-candidate/candidate-55/tp4-noband.json")
+        warnings = spark.qualified_recipe_problems(noband, self._nodes("tp4-ring"), c55_lock)
+        self.assertEqual(len(warnings), 1)
+        self.assertIn("VLLM_DS41_L2_PREFETCH_WO_BANDS=None, expected qualified '17-32=10'", warnings[0])
+
+        tp3 = spark.read_cluster("experiments/2026-10-26-spark-ds41f-candidate/candidate-55/tp3-switched.json")
+        wrong_tp3 = copy.deepcopy(tp3)
+        wrong_tp3["environment"]["VLLM_DS41_L2_PREFETCH_WO_BANDS"] = "17-32=10"
+        wrong_tp3["environment"].pop("SPARKNET_ROCE_MAX_COLLECTIVE_BYTES")
+        warnings = spark.qualified_recipe_problems(wrong_tp3, self._nodes("tp3-switched"), c55_lock)
+        self.assertEqual(len(warnings), 2)
+        self.assertTrue(any("WO_BANDS='17-32=10', expected qualified '17-32=12'" in w for w in warnings))
+        self.assertTrue(any("SPARKNET_ROCE_MAX_COLLECTIVE_BYTES=None, expected qualified '4194304'" in w for w in warnings))
+
+        tp4 = spark.read_cluster("experiments/2026-10-26-spark-ds41f-candidate/candidate-55/tp4.json")
+        wrong_tp4 = copy.deepcopy(tp4)
+        wrong_tp4["environment"]["SPARKNET_ROCE_MAX_COLLECTIVE_BYTES"] = "4194304"
+        wrong_tp4["serve_args"] = wrong_tp4["serve_args"] + ["--disable-log-requests"]
+        warnings = spark.qualified_recipe_problems(wrong_tp4, self._nodes("tp4-ring"), c55_lock)
+        self.assertEqual(len(warnings), 2)
+        self.assertTrue(any("SPARKNET_ROCE_MAX_COLLECTIVE_BYTES='4194304', expected qualified '2097152'" in w for w in warnings))
+        self.assertTrue(any("serve_args differ from qualified profile" in w for w in warnings))
+
+
 if __name__ == "__main__":
     unittest.main()
