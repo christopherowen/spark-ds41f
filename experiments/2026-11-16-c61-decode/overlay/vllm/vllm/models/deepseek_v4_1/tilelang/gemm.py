@@ -2657,8 +2657,9 @@ DECODE_TILE_ROWS = (16, 32, 48, DECODE_ROWS)
 # to B12X over the three is lowest. Every field only changes speed: each tile
 # accumulates K in the same order, so a row's bits do not depend on the tile
 # or on prefill.
-# Decode Q-B (8192 x 1280), indexer Q-B (4096 x 1280), and WO-B
-# (5120 x 3072/2048/1024) pack their [N, K] weights into
+# Decode Q-B (8192 x 1280), indexer Q-B (4096 x 1280), WO-B
+# (5120 x 3072/2048/1024), shared_up (1536..640 x 5120), and DSpark
+# main_proj TP4..TP8 shards (1280..640 x 15360) pack their [N, K] weights into
 # [N // 128, K // 128, 128, 128] tiles so each decode and prefill tile reads a
 # contiguous 128-wide slab per K step while keeping bit-identity with row-major [N, K].
 TILE_CONTIGUOUS_FP8: set[tuple[int, int]] = {
@@ -2673,6 +2674,11 @@ TILE_CONTIGUOUS_FP8: set[tuple[int, int]] = {
     (1024, 5120),
     (768, 5120),
     (640, 5120),
+    (1280, 15360),
+    (1024, 15360),
+    (896, 15360),
+    (768, 15360),
+    (640, 15360),
 }
 
 DECODE_FP8_CONFIGS: dict[tuple[int, ...], dict[int, dict]] = {
@@ -2866,9 +2872,9 @@ DECODE_FP8_CONFIGS: dict[tuple[int, ...], dict[int, dict]] = {
         64: dict(block_N=64, block_K=256, num_stages=3, threads=128),
     },
     (1280, 15360): {
-        16: dict(block_N=32, block_K=256, num_stages=3, threads=128),
+        16: dict(block_N=64, block_K=256, num_stages=3, threads=128),
         32: dict(block_N=64, block_K=256, num_stages=3, threads=128),
-        48: dict(block_N=64, block_K=256, num_stages=3, threads=128),
+        48: dict(block_N=32, block_K=256, num_stages=3, threads=128),
         64: dict(block_N=32, block_K=256, num_stages=3, threads=128),
     },
     (1024, 15360): {

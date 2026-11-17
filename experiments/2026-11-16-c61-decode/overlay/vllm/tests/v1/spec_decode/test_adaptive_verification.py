@@ -864,7 +864,7 @@ def test_dead_rows_tau_excludes_sub_tau_slots_from_host_budget():
 
 def test_calibrated_confidence_matches_dead_rows_tau_to_c1_survival():
     """With calibrated confidence_head survival, c1 prices cold-L2 single-request
-    MoE row cost (2.5x -> tau ~0.1386) on device DeadRows while admitting all <=5
+    MoE row cost (1.75x -> tau ~0.1035) on device DeadRows while admitting all <=5
     DSpark slots on the host to avoid p_k^2 intersection with 1-step-stale
     _stale_confidences, while c2+ and wide copy drafts keep host budgeting."""
     # Typical calibrated c1 conditional probs -> survival [0.677, 0.376, 0.149, 0.0686, 0.0438]
@@ -874,7 +874,7 @@ def test_calibrated_confidence_matches_dead_rows_tau_to_c1_survival():
     manager.dead_rows_tau = 0.20
     manager.calibrated_confidence = True
 
-    c1_row_cost = 0.035 * 2.5
+    c1_row_cost = 0.035 * 1.75
     c1_tau = 2.0 * c1_row_cost / (1.0 + 3.0 * c1_row_cost)
     assert np.isclose(manager.effective_dead_rows_tau(num_reqs=1), c1_tau)
     assert np.isclose(
@@ -883,7 +883,7 @@ def test_calibrated_confidence_matches_dead_rows_tau_to_c1_survival():
     )
     total = manager.get_num_tokens({"r0": 6}, {"r0": [1, 2, 3, 4, 5]})
     _, _, draft_budget = manager._batch_budget
-    # c1 DSpark admits all 5 slots on host; device DeadRows prunes at tau_c1=0.1386.
+    # c1 DSpark admits all 5 slots on host; device DeadRows prunes at tau_c1~0.1035.
     assert draft_budget == 5
     assert total == 6
 
