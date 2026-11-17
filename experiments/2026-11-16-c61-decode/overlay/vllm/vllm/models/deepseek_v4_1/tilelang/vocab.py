@@ -3513,15 +3513,18 @@ def build_screen_weights(
             bits[sub_rows, sub_cols] = sub_entries & 0xFFFF
         w_full_f = bits.to(torch.int16).view(torch.bfloat16).float()
         full_amax = w_full_f.abs().amax(dim=1).clamp(min=1e-12)
-        extreme_mask = (full_amax > 8.0 * in_amax) | ~torch.isfinite(full_amax)
+        finite_row = torch.isfinite(full_amax)
+        extreme_mask = (full_amax > 8.0 * in_amax) | ~finite_row
         use_amax = torch.where(extreme_mask, in_amax, full_amax)
         base_scale = use_amax / (127.0 / 128.0)
-        w_target = torch.where(extreme_mask.unsqueeze(1), w_in_f, w_full_f)
-        sign = (w_target < 0).to(torch.uint8)
-        abs_target = w_target.abs()
+        # Preserve sign and clamp finite extreme outliers rather than zeroing them.
+        w_finite = torch.where(torch.isfinite(w_full_f), w_full_f, w_in_f)
+        sign = (w_finite < 0).to(torch.uint8)
+        abs_target = w_finite.abs()
 
-        def _eval_alpha(alpha: float) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-            cand_scale = base_scale * alpha
+        def _eval_scale(
+            cand_scale: torch.Tensor,
+        ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
             scaled = (abs_target / cand_scale.unsqueeze(1)) * 128.0
             u7 = torch.clamp(torch.round(scaled), 0, 127).to(torch.uint8)
             q_signed = torch.where(sign == 1, -u7.float(), u7.float())
@@ -3529,14 +3532,38 @@ def build_screen_weights(
             cand_r_v = torch.linalg.vector_norm(w_full_f - w_hat, dim=1)
             return cand_scale, u7, cand_r_v
 
-        r_scale, best_u7, r_v = _eval_alpha(1.0)
-        for alpha in (0.93, 0.86, 0.80, 0.74, 0.68, 0.62, 0.55):
-            cand_scale, u7, cand_r_v = _eval_alpha(alpha)
+        r_scale, best_u7, r_v = _eval_scale(base_scale)
+        for alpha in (
+            0.96,
+            0.93,
+            0.89,
+            0.85,
+            0.80,
+            0.74,
+            0.68,
+            0.62,
+            0.55,
+            0.48,
+            0.40,
+            0.32,
+            0.25,
+        ):
+            cand_scale, u7, cand_r_v = _eval_scale(base_scale * alpha)
             better = cand_r_v < r_v
             if better.any():
                 r_scale = torch.where(better, cand_scale, r_scale)
                 best_u7 = torch.where(better.unsqueeze(1), u7, best_u7)
                 r_v = torch.where(better, cand_r_v, r_v)
+        extreme_finite = extreme_mask & finite_row
+        if extreme_finite.any():
+            full_base = torch.where(extreme_finite, full_amax, in_amax) / (127.0 / 128.0)
+            for f_alpha in (1.0, 0.75, 0.50, 0.30):
+                cand_scale, u7, cand_r_v = _eval_scale(full_base * f_alpha)
+                better = extreme_finite & (cand_r_v < r_v)
+                if better.any():
+                    r_scale = torch.where(better, cand_scale, r_scale)
+                    best_u7 = torch.where(better.unsqueeze(1), u7, best_u7)
+                    r_v = torch.where(better, cand_r_v, r_v)
         W_q[start:end] = (sign << 7) | best_u7
         w_norm = torch.linalg.vector_norm(w_full_f, dim=1)
         r_bound = r_v * 1.0005 + w_norm * 5e-4 + 1e-7

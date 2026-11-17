@@ -1124,8 +1124,6 @@ def grouped_fp8_fp4_gemm(
             route_reg = T.alloc_var(T.int32)
             expert = TileExpert[t]
             if expert < 0:
-                if not gather and not trigger_after_loop:
-                    pdl.trigger()
                 T.thread_return()
             if not gather:
                 if tx < block_M:
@@ -1167,19 +1165,11 @@ def grouped_fp8_fp4_gemm(
                             (code_base >> 1) * n_blocks
                             + bx * (2 - Narrow_flag)
                         ) * k_blocks
-            # Allocating the stage barriers in a child block after the TileExpert
-            # early return keeps empty CTAs free of barrier initialization, cluster
-            # barrier fences, and block synchronization, while the barrier-init
-            # sync publishes rows_shared to the active CTA in one barrier.
+            # Allocating the stage barriers after the TileExpert early return
+            # keeps empty CTAs free of barrier initialization and synchronization,
+            # while the barrier-init sync publishes rows_shared in one barrier.
             with T.sblock("gemm"):
                 loaded = T.alloc_barrier([threads] * stages)
-                # Each thread copies the same rows at every K block.
-                for c in T.unroll(a_copies):
-                    a_row[c] = rows_shared[
-                        T.min((c * threads + tx) // row_segments, block_M - 1)
-                    ]
-                for c in T.unroll(sfa_copies):
-                    sfa_row[c] = rows_shared[T.min(c * threads + tx, block_M - 1)]
                 sf_dest = SFC_shared if coded_scales else SFB_shared
 
                 T.clear(C_local)
@@ -1203,6 +1193,12 @@ def grouped_fp8_fp4_gemm(
                         pdl.wait()
                     else:
                         pdl.chain()
+                    for c in T.unroll(a_copies):
+                        a_row[c] = rows_shared[
+                            T.min((c * threads + tx) // row_segments, block_M - 1)
+                        ]
+                    for c in T.unroll(sfa_copies):
+                        sfa_row[c] = rows_shared[T.min(c * threads + tx, block_M - 1)]
                     for p in T.unroll(stages - 1):
                         if p < k_blocks:
                             load_act_tile(
@@ -1210,6 +1206,12 @@ def grouped_fp8_fp4_gemm(
                                 loaded, tx, p, p, p,
                             )
                 else:
+                    for c in T.unroll(a_copies):
+                        a_row[c] = rows_shared[
+                            T.min((c * threads + tx) // row_segments, block_M - 1)
+                        ]
+                    for c in T.unroll(sfa_copies):
+                        sfa_row[c] = rows_shared[T.min(c * threads + tx, block_M - 1)]
                     for p in T.unroll(stages - 1):
                         if p < k_blocks:
                             load_k_tile(

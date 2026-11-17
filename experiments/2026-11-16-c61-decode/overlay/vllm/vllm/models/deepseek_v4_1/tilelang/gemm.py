@@ -2668,6 +2668,11 @@ TILE_CONTIGUOUS_FP8: set[tuple[int, int]] = {
     (5120, 3072),
     (5120, 2048),
     (5120, 1024),
+    (1536, 5120),
+    (1152, 5120),
+    (1024, 5120),
+    (768, 5120),
+    (640, 5120),
 }
 
 DECODE_FP8_CONFIGS: dict[tuple[int, ...], dict[int, dict]] = {
