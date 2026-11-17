@@ -714,3 +714,33 @@ at 4K (the communicator alone cost +1.13 ms, +0.55 ms and nothing there), then p
 own window; [summarize_kernels.py](summarize_kernels.py) and [analyze_costs.py](analyze_costs.py) are the
 indexer-decode and cluster-program experiments' copies. If the step's collectives' kernels carry the
 difference, the learner has to stay out of NCCL; if every kernel slows, the cause is on the GPU's side.
+
+Queue entry `20261117T193358-comm-profile-tp4-switched`, commit `6df9d7611`; receipts
+[comm-profile](receipts/comm-profile) (each arm's grid times and per-rank kernel summaries, the lab's cost
+tables, the timeline scripts and [timeline-16x96-sp1.txt](receipts/comm-profile/timeline-16x96-sp1.txt); the
+traces stay under `results/private/determinism/turn-learning-comm-profile-tp4-switched/` on sp1). The comm
+boot logged its communicator.
+
+| Grid on these boots, step / forward (ms) | Learner off | Communicator alone | Change a step |
+| --- | ---: | ---: | ---: |
+| 16×96 @4K | 38.21 / 32.84 | 40.10 / 34.40 | +1.89 / +1.56 |
+| 16×48 @4K | 26.74 / 21.15 | 27.32 / 21.70 | +0.59 / +0.55 |
+| 1×3 @4K | 14.36 / 10.47 | 14.39 / 10.51 | +0.03 / +0.05 |
+
+- **No kernel got slower; the timeline got longer.** In the 16×96 window every rank's span grew by the same
+  49 ms (42 steps, +1.2 ms a step) while the same 73,752 launches took the same kernel time on sp1 (2,657 and
+  2,650 ms). The step's all-reduces (`oneshot_allreduce_kernel`) took no longer: 690 and 683 ms on sp1.
+- **The step's critical path lengthens after its collectives.** Aligning the step's stream kernel by kernel
+  (1,255 a step), the step grows 1,224 µs, mostly as `mhc_project_streams_kernel` (the kernel that follows
+  each all-reduce, launched early under programmatic dependent launch) ending later: +888 µs a step over its
+  86 runs, then `gemm_mxfp8_kernel` +203 µs and `glp_steer_kernel` +141 µs. The side streams' kernels (the L2
+  prefetch, MoE dispatch) run beside the step's stream as much as before (51.4% and 49.5% of stream 161's
+  time; 99.9% and 98.6% of stream 160's), so nothing serializes; the step's stream gets its SMs later.
+- **What changed between the boots is the streams' creation order.** Every side stream the step uses has an
+  id three higher in the comm boot (160, 161, 403, 404 against 163, 164, 406, 407): the communicator's two
+  NCCL streams and the side stream of its load-time exercise were created before them. CUDA multiplexes
+  streams onto `CUDA_DEVICE_MAX_CONNECTIONS` hardware queues (32 here, already the most) in creation order,
+  and the GPU arbitrates between queues, so a shift can change which kernel gets free SMs first. The arms'
+  extra streams at load follow their costs: memory alone 0 (nothing), `step` 2 (the learner's capture and
+  learn streams, +0.58%), the communicator alone 3 (+0.91%), off-step and `socket` 4 (+1.04%, +1.28%).
+  This is the working explanation, not yet tested.
