@@ -84,7 +84,21 @@ def accepted(preds: torch.Tensor, labels: torch.Tensor) -> torch.Tensor:
     return ok.int().cumprod(dim=1).sum(dim=1)
 
 
-def ce_step(base, ids, labels, master, w2, lr, method="full", shards=4, chunk=256):
+def block_candidates(z: torch.Tensor, shards: int = 4, block: int = 2048) -> torch.Tensor:
+    """Each 2048-wide block's argmax within each vocabulary shard ([R, blocks]): the
+    candidates the draft step's greedy partials already hold, at no extra compute."""
+    vocab = z.shape[1]
+    width = -(-vocab // shards)
+    out = []
+    for k in range(shards):
+        lo, hi = k * width, min((k + 1) * width, vocab)
+        for b in range(lo, hi, block):
+            e = min(b + block, hi)
+            out.append(z[:, b:e].argmax(-1) + b)
+    return torch.stack(out, dim=1)
+
+
+def ce_step(base, ids, labels, master, w2, lr, method="full", shards=4, chunk=256, live_w1=None):
     """One SGD step of the turn's cross-entropy into W1's rows: over the full
     vocabulary (``full``), or over each vocabulary shard's maximum and the committed
     token (``shard4``, the candidates serving's shard pairs already hold)."""
@@ -112,6 +126,21 @@ def ce_step(base, ids, labels, master, w2, lr, method="full", shards=4, chunk=25
             continue
         vocab = z.shape[1]
         width = -(-vocab // shards)
+        if method == "block":
+            # The live step's block maxima (loaded W1), and the label only when it is
+            # among them: serving keeps no head logit for any other token.
+            z_live = markov_logits(z_rows[sel], prev_all[sel], live_w1, w2)
+            maxima = block_candidates(z_live, shards)
+            present = (maxima == y[:, None]).any(dim=1)
+            zc = z.gather(1, maxima)
+            target = (maxima == y[:, None]).float().argmax(dim=1)
+            logp = torch.log_softmax(zc, dim=-1)
+            loss_sum += float(-(logp.gather(1, target[:, None]).squeeze(1) * present).sum())
+            coef = logp.exp()
+            coef[torch.arange(sel.numel(), device=coef.device), target] -= 1.0
+            coef = coef * present[:, None]
+            grad_rows[s : s + chunk] = torch.einsum("rc,rcd->rd", coef, w2.float()[maxima])
+            continue
         cands = torch.stack(
             [z[:, k * width : min((k + 1) * width, vocab)].argmax(-1) + k * width for k in range(shards)],
             dim=1,
@@ -134,7 +163,7 @@ def main() -> None:
     ap.add_argument("--turns", required=True)
     ap.add_argument("--snapshot", required=True)
     ap.add_argument("--lrs", default="0.003,0.01,0.03,0.1,0.3")
-    ap.add_argument("--methods", default="full,shard4")
+    ap.add_argument("--methods", default="full,shard4,block")
     ap.add_argument("--limit", type=int, default=0)
     args = ap.parse_args()
     device = "cuda"
@@ -170,10 +199,24 @@ def main() -> None:
             replay = chain(base, ids, w1_loaded, w2, teacher=False)
             pos = torch.arange(replay.shape[1], device=device)[None, :] < active[:, None]
             loaded_acc = accepted(chain(base, ids, w1_loaded, w2, teacher=True), labels)
+            # How much of the turn the compact candidates cover: the committed token among
+            # the live step's block maxima, at each labeled position.
+            n = labels.shape[1]
+            flat_y = labels.reshape(-1).long()
+            flat_prev = ids[:, :n].reshape(-1).long()
+            flat_base = base.reshape(-1, base.shape[-1])
+            lab = (flat_y >= 0).nonzero().squeeze(1)
+            covered = 0
+            for c0 in range(0, lab.numel(), 256):
+                sel = lab[c0 : c0 + 256]
+                z_live = markov_logits(flat_base[sel], flat_prev[sel], w1_loaded, w2)
+                covered += int((block_candidates(z_live) == flat_y[sel][:, None]).any(dim=1).sum())
             row = {"file": os.path.basename(path), "blocks": int(labels.shape[0]),
                    "labeled": int((labels >= 0).sum()),
                    "replay_equal": float(((replay == drafts) | ~pos).all(dim=1).float().mean()),
-                   "loaded": int(loaded_acc.sum())}
+                   "loaded": int(loaded_acc.sum()),
+                   "label_in_block_maxima": covered}
+            totals["covered"] = totals.get("covered", 0) + covered
             totals["replay_checked"] += int(pos.sum())
             totals["replay_equal"] += int(((replay == drafts) & pos).sum())
             for key in lrs:
@@ -184,7 +227,7 @@ def main() -> None:
                 totals["learned"][name] += int(acc.sum())
             for key in lrs:
                 name = f"{key[0]}:{key[1]}"
-                row["loss " + name] = round(ce_step(base, ids, labels, masters[key], w2, key[1], method=key[0]), 4)
+                row["loss " + name] = round(ce_step(base, ids, labels, masters[key], w2, key[1], method=key[0], live_w1=w1_loaded), 4)
                 drift = (masters[key] - w1_loaded.float()).norm(dim=1) / w1_loaded.float().norm(dim=1).clamp_min(1e-6)
                 row["drift " + name] = round(float(drift.max()), 4)
         totals["blocks"] += row["blocks"]
@@ -197,6 +240,7 @@ def main() -> None:
         print(json.dumps(row), flush=True)
     summary = dict(totals)
     summary["replay_agreement"] = totals["replay_equal"] / max(totals["replay_checked"], 1)
+    summary["label_in_block_maxima"] = totals.get("covered", 0) / max(totals["labeled"], 1)
     summary["gain_pct"] = {k: 100.0 * (v - totals["loaded"]) / max(totals["loaded"], 1)
                            for k, v in totals["learned"].items()}
     print(json.dumps({"summary": summary}), flush=True)
