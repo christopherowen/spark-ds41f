@@ -151,7 +151,7 @@ indexer 3.3, LM heads and screens 1.7, GLP steer 1.4.
 - **Everything else was cut by two thirds or more**: the prefetched GEMMs' excess 4.25 to 0.99
   ms, small kernels 0.96 to 0.57, launch gaps 0.70 to 0.13, attention 0.40 to 0.08.
 - **All of it gone is 101.7 tok/s** at today's tokens a step (+17.9%); the two unchanged items
-  alone, 93.7.
+  alone, 94.0.
 
 ### Limits of the trace
 
