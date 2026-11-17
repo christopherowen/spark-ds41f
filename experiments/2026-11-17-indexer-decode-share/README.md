@@ -29,31 +29,39 @@ Context depth, on one boot. Nothing else changes between the windows.
 
 ## Method
 
-A `profile` job boots [prof-tp4-switched.json](prof-tp4-switched.json):
-`../2026-11-16-c60-prefill/tp4-switched-dev.json` with the image tag above and
-`--profiler-config` appended (torch profiler on every rank, no Python stacks or shapes).
+Two jobs on the same image and testbed.
 
-[profile_decode.py](profile_decode.py) then runs, at each depth (size labels 4,096, 262,144
-and 1,000,000 of servebench's cold source-text document, seeds 0, 1, 2):
+**Timing** ([depth-tp4-switched.json](depth-tp4-switched.json)): a `measure` job, two boots
+of [dev-tp4-switched.json](dev-tp4-switched.json), which is
+`../2026-11-16-c60-prefill/tp4-switched-dev.json` with only the image tag changed.
+[profile_decode.py](profile_decode.py) `--no-profile` runs, at each depth (size labels
+4,096, 131,072, 262,144, 524,288 and 1,000,000 of servebench's cold source-text document,
+seeds 0..4):
 
 1. `fill`: the document with one output token, so its prefix is cached;
-2. `real`: the same request for 12 + 192 output tokens (temperature 0, thinking off,
-   `ignore_eos`), not profiled. The decode span starts 12 output chunks in; its steps are
-   the server's step counter over the span;
-3. `real-profiled`: the same request with the profiler started 12 chunks in and stopped at
-   the stream's end, so the window holds decode steps only;
-4. `grid`: the engine grid's fixed step for one request at 3 and 6 rows at that context,
-   30 replays, not profiled;
-5. `grid-profiled`: the same grid under the profiler.
+2. `real`, twice: the same request for 12 + 192 output tokens (temperature 0, thinking
+   off, `ignore_eos`). The decode span starts 12 output chunks in; its steps, output
+   tokens and verified draft rows are the server's counters over the span;
+3. `grid`: the engine grid's fixed step for one request at 3 and 6 rows at that context
+   (a 4,096 multiple), 50 replays.
 
-[summarize_kernels.py](summarize_kernels.py) sums GPU kernel time by kernel name for every
-window of every rank. The indexer's share of a step is its kernels' time per step over
-the unprofiled step time of the same phase.
+The growth of a step with depth bounds what the indexer's depth-dependent work costs.
+[tables_arms.py](tables_arms.py) prints the table.
+
+**Kernel attribution** ([profile-tp4-switched.json](profile-tp4-switched.json)): a `profile`
+job on [prof-tp4-switched.json](prof-tp4-switched.json), the same profile with
+`--profiler-config` appended (torch profiler on every rank, no Python stacks or shapes).
+The script without `--no-profile` adds a profiled repeat of phases 2 and 3 at 4,096,
+262,144 and 1,000,000, and [summarize_kernels.py](summarize_kernels.py) sums GPU kernel
+time by kernel name for every window of every rank.
 
 ```sh
+bin/spark candidate queue tp4-switched experiments/2026-11-17-indexer-decode-share/depth-tp4-switched.json --apply
 bin/spark candidate queue tp4-switched experiments/2026-11-17-indexer-decode-share/profile-tp4-switched.json --apply
 ```
 
 ## Runs
 
-None yet.
+| Run | Result | Note |
+| --- | --- | --- |
+| `profile-tp4-switched.json`, 2026-11-17 13:42Z | refused before queueing | The queue's dry run on sp1 at `d0a111fa2`: `qualified config drift for tp4-switched: serve_args differ from qualified profile`. The guard (`spark_ds41f/doctor.py`, `qualified_recipe_problems`) compares an arm's serving arguments with its stack's qualified profile, and a profiler arm differs by `--profiler-config`. Nothing booted; the checkouts of sp1..sp4 moved to `d0a111fa2`. |
