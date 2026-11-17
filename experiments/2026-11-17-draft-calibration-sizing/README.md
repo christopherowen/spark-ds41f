@@ -367,7 +367,11 @@ attribute; the call site now reads it with a default.
 ([tp4-margin-off.json](tp4-margin-off.json): candidate-61's dev arm with the new files mounted
 and the switch unset) and the margin arm ([tp4-margin.json](tp4-margin.json)) alternating, each
 with candidate-61's screen workloads (single stream 150 s, 16 streams 90 s, the greedy
-determinism record).
+determinism record). Both arms name this folder's copy of candidate-60's source lock
+([upstreams.lock.json](upstreams.lock.json), unchanged): the first queue attempt (at
+`9cf1545f1`) was refused before any boot, because the switch is not in candidate-60's qualified
+profile ("qualified config drift"), and a lock of the experiment's own is how an arm with a
+variable of its own is declared.
 
 ```sh
 bin/spark candidate queue tp4-ring experiments/2026-11-17-draft-calibration-sizing/screen-margin-tp4.json --apply
