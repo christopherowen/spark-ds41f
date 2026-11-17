@@ -55,7 +55,8 @@ _PASS = {
 }
 _CAPTURE_THREADS = 256
 _LABEL_THREADS = 128
-_STATS = 8  # see ``TurnStats``
+_STATS = 9  # see ``TurnStats``
+_META = 3  # anchor position, active drafts, the anchor token the step drafted from
 
 
 def turn_learning_mode() -> str:
@@ -85,13 +86,14 @@ def turn_learning_dump_dir() -> str | None:
 @tilelang.jit(pass_configs=_PASS)
 def capture_kernel(n_spec: int, words: int):
     """One block a draft row: the row's ``n_spec`` pre-norm head rows (as int64
-    words), its drafts and its anchor position into its request's ring at entry
-    ``count % capacity``, then ``count + 1``. A row whose sampling slot is -1
+    words), its drafts, its anchor position and the anchor token it drafted from
+    into its request's ring at entry ``count % capacity``, then ``count + 1``. A row whose sampling slot is -1
     (padding of the captured size) writes nothing. Each request has at most one
     row a step, so no two blocks touch one ring."""
     hidden_rows, map_len = T.dynamic("hidden_rows, map_len")
     draft_rows, draft_stride = T.dynamic("draft_rows, draft_stride")
     slots, cap = T.dynamic("slots, cap")
+    ids_len, anchor_len = T.dynamic("ids_len, anchor_len")
     span = n_spec * words
 
     @T.prim_func
@@ -100,8 +102,10 @@ def capture_kernel(n_spec: int, words: int):
         sample_map: T.Tensor((map_len,), T.int32),
         sample_pos: T.Tensor((map_len,), T.int64),
         drafts: T.StridedTensor((draft_rows, n_spec), (draft_stride, 1), T.int64),
+        input_ids: T.Tensor((ids_len,), T.int32),
+        anchor_idx: T.Tensor((anchor_len,), T.int64),
         ring_hidden: T.Tensor((slots, cap, n_spec, words), T.int64),
-        ring_meta: T.Tensor((slots, cap, 2), T.int64),
+        ring_meta: T.Tensor((slots, cap, _META), T.int64),
         ring_drafts: T.Tensor((slots, cap, n_spec), T.int32),
         ring_count: T.Tensor((slots,), T.int64),
         active: T.int32,
@@ -124,6 +128,7 @@ def capture_kernel(n_spec: int, words: int):
                 if tx == 0:
                     ring_meta[safe, entry, 0] = sample_pos[r * n_spec] - 1
                     ring_meta[safe, entry, 1] = T.cast(active, T.int64)
+                    ring_meta[safe, entry, 2] = T.cast(input_ids[anchor_idx[r]], T.int64)
             T.sync_threads()
             if (slot >= 0) & (tx == 0):
                 ring_count[safe] = count + 1
@@ -137,7 +142,8 @@ def labels_kernel(n_spec: int):
     committed tokens at the entry's ``n_spec`` predicted positions. ``labels`` is
     -1 where nothing was committed past the turn's end, and -2 at every position
     of an entry the ring does not hold (the host counted a draft step that wrote
-    no row, or the anchor lies outside the turn);
+    no row, the anchor lies outside the turn, or the step drafted from another
+    token than the turn committed there);
     ``ids`` (anchor, then the labels) holds 0 there, a valid row for the Markov
     lookups that teacher forcing makes."""
     finished_len, slots, cap = T.dynamic("finished_len, slots, cap")
@@ -152,7 +158,7 @@ def labels_kernel(n_spec: int):
             (token_rows, max_len), (token_stride, 1), T.int32
         ),
         total_len: T.Tensor((total_rows,), T.int32),
-        ring_meta: T.Tensor((slots, cap, 2), T.int64),
+        ring_meta: T.Tensor((slots, cap, _META), T.int64),
         ring_count: T.Tensor((slots,), T.int64),
         labels_out: T.Tensor((finished_len, cap, n_spec), T.int32),
         ids_out: T.Tensor((finished_len, cap, n_spec + 1), T.int32),
@@ -165,14 +171,20 @@ def labels_kernel(n_spec: int):
             count = T.alloc_var(T.int64, init=ring_count[slot])
             total = T.alloc_var(T.int64, init=T.cast(total_len[slot], T.int64))
             anchor_pos = T.alloc_var(T.int64, init=ring_meta[slot, k, 0])
-            kept = (T.cast(k, T.int64) < T.min(count, T.cast(cap, T.int64))) & (
-                anchor_pos >= 0
-            ) & (anchor_pos < total)
             anchor = T.alloc_var(
                 T.int32,
                 init=all_tokens[
                     slot, T.min(T.max(anchor_pos, T.int64(0)), T.cast(max_len - 1, T.int64))
                 ],
+            )
+            # Held: inside the ring, inside the turn, and drafted from the token the
+            # turn committed at its anchor (a draft over any other context is not
+            # this turn's, whatever path made it).
+            kept = (
+                (T.cast(k, T.int64) < T.min(count, T.cast(cap, T.int64)))
+                & (anchor_pos >= 0)
+                & (anchor_pos < total)
+                & (T.cast(anchor, T.int64) == ring_meta[slot, k, 2])
             )
             if e < finished_len * cap:
                 ids_out[f, k, 0] = T.if_then_else(kept, anchor, 0)
@@ -219,7 +231,7 @@ def stats_kernel(n_spec: int):
     def stats(
         labels: T.Tensor((rows, n_spec), T.int32),
         drafts: T.Tensor((rows, n_spec), T.int32),
-        meta: T.Tensor((rows, 2), T.int64),
+        meta: T.Tensor((rows, _META), T.int64),
         replay: T.StridedTensor((pred_rows, n_spec), (pred_stride, 1), T.int64),
         forced: T.StridedTensor((pred_rows, n_spec), (pred_stride, 1), T.int64),
         out: T.Tensor((_STATS,), T.int64),
@@ -268,6 +280,7 @@ def stats_kernel(n_spec: int):
                     acc[5] = acc[5] + mismatches
                     acc[6] = acc[6] + active
                     acc[7] = acc[7] + T.int64(1)
+                    acc[8] = acc[8] + T.if_then_else(held, T.int64(0), T.int64(1))
                 for s in T.serial(_STATS):
                     out[s] = acc[s]
 
@@ -297,6 +310,7 @@ class TurnStats:
         "replay_mismatches",  # replayed drafts that differ from the step's
         "drafted",  # positions the steps drafted
         "kept",  # entries replayed
+        "unheld",  # entries the ring does not hold (see labels_kernel)
     )
 
     @classmethod
@@ -313,6 +327,8 @@ class DSparkTurnLearner:
         model: Any,
         table: torch.Tensor,
         draft_tokens: torch.Tensor,
+        input_ids: torch.Tensor,
+        anchor_idx: torch.Tensor,
         sample_idx_mapping: torch.Tensor,
         sample_pos: torch.Tensor,
         partial_values: torch.Tensor,
@@ -333,6 +349,8 @@ class DSparkTurnLearner:
         self.model = model
         self.table = table
         self.draft_tokens = draft_tokens
+        self.input_ids = input_ids
+        self.anchor_idx = anchor_idx
         self.sample_idx_mapping = sample_idx_mapping
         self.sample_pos = sample_pos
         self.partial_values = partial_values
@@ -358,7 +376,7 @@ class DSparkTurnLearner:
             (slots, cap, n, self.hidden_size), dtype=torch.bfloat16, device=device
         )
         self._ring_words = self.ring_hidden.view(torch.int64)
-        self.ring_meta = torch.full((slots, cap, 2), -1, dtype=torch.int64, device=device)
+        self.ring_meta = torch.full((slots, cap, _META), -1, dtype=torch.int64, device=device)
         self.ring_drafts = torch.zeros((slots, cap, n), dtype=torch.int32, device=device)
         self.ring_count = torch.zeros(slots, dtype=torch.int64, device=device)
         self.host_count = np.zeros(slots, dtype=np.int64)
@@ -426,6 +444,8 @@ class DSparkTurnLearner:
             self.sample_idx_mapping,
             self.sample_pos,
             self.draft_tokens,
+            self.input_ids,
+            self.anchor_idx,
             self._ring_words,
             self.ring_meta,
             self.ring_drafts,
